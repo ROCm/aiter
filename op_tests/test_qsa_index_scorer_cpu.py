@@ -1,4 +1,4 @@
-﻿# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """CPU contract tests for ``aiter.ops.qsa_index_scorer`` (no GPU, no device, no aiter import).
 
@@ -114,20 +114,20 @@ def aligned(shape, dtype, align=128, offset=0):
 
 
 def call_args(rows=64, requests=16, width=16384, columns=65536, fmt="bf16", pages=8,
-              qp64=True, cache_offset=0):
+              qp64=True, cache_offset=0, page=4):
     q = aligned((rows, 4, 128), torch.bfloat16)
     if fmt == "bf16":
-        cache, scale = aligned((pages, 4, 1, 128), torch.bfloat16, offset=cache_offset), None
+        cache, scale = aligned((pages, page, 1, 128), torch.bfloat16, offset=cache_offset), None
     else:
-        cache = aligned((pages, 4, 1, 128), torch.float8_e4m3fn, offset=cache_offset)
-        scale = torch.ones((pages, 4, 1), dtype=torch.float32)
+        cache = aligned((pages, page, 1, 128), torch.float8_e4m3fn, offset=cache_offset)
+        scale = torch.ones((pages, page, 1), dtype=torch.float32)
     pt = torch.zeros((requests, width), dtype=torch.int32)
     if rows <= requests:
         t2r = torch.arange(rows, dtype=torch.int32)
     else:
         t2r = (torch.arange(rows, dtype=torch.int32) * requests) // rows
     qp = torch.arange(rows, dtype=torch.int64 if qp64 else torch.int32)
-    cl = torch.full((requests,), 4 * width, dtype=torch.int32)
+    cl = torch.full((requests,), page * width, dtype=torch.int32)
     return [q, cache, pt, t2r, qp, cl, 4, None, columns, None, False, scale]
 
 
@@ -185,16 +185,24 @@ class ProfileFormat(unittest.TestCase):
             sha = hashlib.sha256(fh.read()).hexdigest()
         self.assertEqual(self.data["kernel"]["sha256"], sha,
                          "kernel changed: re-run gen_profile emit + GPU check")
-        self.assertEqual(sha, "bf49226206b999f948e8b1eb0605935157b3d291b0a0b243581897d8ca661b93",
-                         "kernel source differs from champion 82c4dec5 (ISA identity)")
-        self.assertEqual(self.data["kernel"]["git_rev"], "82c4dec5")
+        gen = _gen()
+        self.assertEqual(sha, gen.KERNEL_SHA256, "kernel source differs from the profiled kernel")
+        self.assertEqual(self.data["kernel"]["git_rev"], gen.KERNEL_GIT_REV)
+        # ROUND-PAGE16: page-4 evidence recorded on bf492262 carries over only by ISA identity
+        self.assertEqual(gen.PAGE4_EVIDENCE_KERNEL_SHA256,
+                         "bf49226206b999f948e8b1eb0605935157b3d291b0a0b243581897d8ca661b93")
 
     def test_rows(self):
         ksha = self.data["kernel"]["sha256"]
         for r in self.data["rows"]:
             self.assertEqual(r["sig"], PR.row_signature(r))
+            # R2E: prefill variants depend on rows (ktile bands); rows pin the default-env
+            # wrapper knobs (fp8 draft wg_waves 2) like the rules
+            vid, params = PR.expected_variant(r["cache_dtype"], r["regime"], r["columns"],
+                                              PR.page_of(r), rows=r["rows"]["min"])
             self.assertEqual((r["vid"], r["params"]),
-                             PR.expected_variant(r["cache_dtype"], r["regime"], r["columns"]))
+                             (vid, dict(params, **PR.default_knobs(r["cache_dtype"],
+                                                                   r["regime"]))))
             self.assertEqual(PR.regime_of(r["rows"]["min"], r["requests"]["min"]), r["regime"])
             self.assertIn(r["golden"]["status"], ("pass", "pending"))
             g = r["golden"]
@@ -204,7 +212,9 @@ class ProfileFormat(unittest.TestCase):
                 self.assertTrue(g.get("kernel_sha256"), r["cell"])
                 if g["kernel_sha256"] != ksha:
                     self.assertTrue(g.get("isa_identity"), r["cell"])
-                    self.assertEqual(r["cache_dtype"], "bf16", r["cell"])
+                    if r["cache_dtype"] != "bf16":   # fp8: GPU-restamped on bf492262 only
+                        self.assertEqual(g["kernel_sha256"], _gen().PAGE4_EVIDENCE_KERNEL_SHA256)
+                        self.assertIn("ROUND-PAGE16", g["isa_identity"], r["cell"])
             for key in ("arch", "cu", "cache_dtype", "columns", "table_width", "vid", "params",
                         "cell", "generated_by", "notes"):
                 self.assertIn(key, r)
@@ -215,10 +225,22 @@ class ProfileFormat(unittest.TestCase):
         old = "30c6213d492ad50a9e063456628737ca993060d73dfa4ead248558ba5abb121c"
         ksha = self.data["kernel"]["sha256"]
         n_bf16 = 0
+        p4sha = _gen().PAGE4_EVIDENCE_KERNEL_SHA256
+        pending_bf16 = {}
         for r in self.data["rows"]:
             g = r["golden"]
-            if g["status"] == "pass" and g["kernel_sha256"] == ksha:
+            if g["status"] == "pending" and "stale" in g:
+                # ROUND-R2E: evidence that no longer covers the routed build is kept as
+                # `stale` (never selected) with the reason the row went back to pending
+                self.assertEqual(g["stale"]["status"], "pass", r["cell"])
+                self.assertIn("ROUND-R2E", g["reason"], r["cell"])
+                if r["cache_dtype"] == "bf16":
+                    pending_bf16[r["cell"]] = g
+                continue
+            if g["status"] == "pass" and g["kernel_sha256"] in (ksha, p4sha):
                 self.assertTrue(g.get("checked"), r["cell"])         # restamped on GPU
+                if g["kernel_sha256"] != ksha:                        # ROUND-PAGE16 identity
+                    self.assertIn("ROUND-PAGE16", g["isa_identity"], r["cell"])
                 n_bf16 += r["cache_dtype"] == "bf16"
             elif r["cache_dtype"] == "fp8":
                 self.assertEqual(g["status"], "pending", r["cell"])  # never inherits old evidence
@@ -228,13 +250,41 @@ class ProfileFormat(unittest.TestCase):
                 self.assertEqual((g["kernel_sha256"], g["kernel_git_rev"]), (old, "a78c285c"))
                 self.assertIn("byte-identical", g["isa_identity"])
                 n_bf16 += 1
-        self.assertGreaterEqual(n_bf16, 9)
+        # R2E: the 2 bf16 c256 prefill rows re-route to lean ktile (their Phase-1 evidence is
+        # from kernel 30c6, off the ISA-identity chain); the 2 bf16 c65536 prefill rows stay
+        # r32_persist whose ISA changed on the R2C link -> all 4 pending until a GPU check
+        self.assertGreaterEqual(n_bf16, 7)
+        if pending_bf16:
+            self.assertLessEqual(set(pending_bf16), {
+                "prefill_bf16_r512q2_c65536_w16384", "prefill_bf16_r320q2_c65536_w16384",
+                "prefill_bf16_r64q2_c256_w64", "prefill_bf16_r272q1_c256_w64"})
+        for cell in ("prefill_bf16_r64q2_c256_w64", "prefill_bf16_r272q1_c256_w64"):
+            if cell in pending_bf16:
+                st = pending_bf16[cell]["stale"]
+                self.assertEqual((st["kernel_sha256"], st["kernel_git_rev"]), (old, "a78c285c"))
+                self.assertIn("30c6213d492a", pending_bf16[cell]["reason"])
+        for cell in ("prefill_bf16_r512q2_c65536_w16384", "prefill_bf16_r320q2_c65536_w16384"):
+            if cell in pending_bf16:
+                self.assertEqual(pending_bf16[cell]["stale"]["kernel_sha256"], p4sha)
+                self.assertIn("ISA changed", pending_bf16[cell]["reason"])
+        bf16 = {r["cell"]: r for r in self.data["rows"] if r["cache_dtype"] == "bf16"}
+        self.assertEqual((bf16["prefill_bf16_r64q2_c256_w64"]["vid"],
+                          bf16["prefill_bf16_r64q2_c256_w64"]["params"]),
+                         ("qsa.page4.r32_kt.v1", {"k_load": "tdm", "rows_per_block": 32,
+                                                  "kt_rows": 32, "col_tiles": 2, "lean": True}))
+        self.assertEqual(bf16["prefill_bf16_r512q2_c65536_w16384"]["vid"],
+                         "qsa.page4.r32_persist.v1")
         fp8 = {r["cell"]: r for r in self.data["rows"] if r["cache_dtype"] == "fp8"}
         self.assertEqual(fp8["decode_fp8_r64q16_c65536_w16384"]["params"],
                          {"k_load": "tdm", "wave_cols": 64, "barrier": False, "sched": "base",
                           "pk8": "intrin"})
+        # R2E: the default-env wrapper launches fp8 draft with wg_waves 2 (QSA_DRAFT_WG_WAVES
+        # auto) -> the row pins that knob (P.default_knobs), like the draft_fp8 rule
+        self.assertEqual(PR.default_knobs("fp8", "draft"), {"wg_waves": 2})
         self.assertEqual(fp8["draft_fp8_r16q16_c65536_w16384"]["params"],
-                         {"k_load": "tdm", "wave_cols": 32, "sched": "qpre", "pk8": "intrin"})
+                         {"k_load": "tdm", "wave_cols": 32, "sched": "qpre", "pk8": "intrin",
+                          "wg_waves": 2})
+        self.assertEqual(fp8["prefill_fp8_r512q2_c65536_w16384"]["vid"], "qsa.page4.r32_fp8.v1")
         # a pass on an older kernel without an ISA-identity record is rejected
         with _tmpdir() as td:
             d = json.loads(json.dumps(self.data)); d["profile"] = "qsa_bad_v1"
@@ -284,17 +334,32 @@ class ProfileFormat(unittest.TestCase):
             if self.data["generated_by"].get("mode") == "emit":
                 self.assertEqual(emitted, self.data)
             cap = os.path.join(td, "cap.json")
+            inside = {"cache_dtype": "bf16", "rows": 128, "requests": 32, "columns": 16384,
+                      "table_width": 16384}
+            outside = {"cache_dtype": "bf16", "rows": 16, "requests": 1, "columns": 4,
+                       "table_width": 16384}
             with open(cap, "w") as fh:
-                json.dump([{"cache_dtype": "bf16", "rows": 128, "requests": 32, "columns": 16384,
-                            "table_width": 16384}], fh)
+                json.dump({"plan": [inside, outside]}, fh)
             out2 = os.path.join(td, "qsa_extra_v1.json")
+            # default: a rule-admitted capture entry becomes a sample of that rule, no row
             self.assertEqual(gen.main(["emit", "--out", out2, "--plan-file", cap]), 0)
             prof = PR.load_profile(out2, use_cache=False)
-            new = [r for r in prof.rows if r.cell == "decode_bf16_r128q32_c16384_w16384"]
+            self.assertEqual(len(prof.rows), len(self.data["rows"]))
+            dec = next(r for r in prof.rules if r.id == "decode_bf16")
+            self.assertIn((128, 32, 16384, 16384), {PR.sample_key(s) for s in dec.raw["samples"]})
+            self.assertFalse(dec.verified)      # new samples -> rule pending until GPU check
+            self.assertEqual(gen.verify(out2, capture_plan=[inside, outside]), [])
+            self.assertTrue(gen.verify(out2))   # drift without the plan file
+            # --plan-rows: entries no rule admits become (pending) exact rows
+            out3 = os.path.join(td, "qsa_extra2_v1.json")
+            self.assertEqual(gen.main(["emit", "--out", out3, "--plan-file", cap, "--plan-rows"]), 0)
+            prof = PR.load_profile(out3, use_cache=False)
+            new = [r for r in prof.rows if r.cell == "decode_bf16_r16q1_c4_w16384"]
             self.assertEqual(len(new), 1)
             self.assertFalse(new[0].verified)   # captured rows start pending
+            self.assertFalse(any(r.cell.startswith("decode_bf16_r128q32") for r in prof.rows))
         with self.assertRaises(ValueError):
-            gen.make_row(dict(cache_dtype="bf16", rows=6, requests=1, columns=64,
+            gen.make_row(dict(cache_dtype="bf16", rows=0, requests=1, columns=64,
                               table_width=16))
 
     def test_check_restamp_cpu(self):
@@ -312,18 +377,38 @@ class ProfileFormat(unittest.TestCase):
             seen.append(row["cell"])
             return {"pass_": True, "decision": "ok", "vid": row["vid"]}
 
+        def fake_sample(rule, s, api, G, S, seed=0, profile=None):
+            seen.append(rule["id"])
+            out = {k: s[k] for k in ("rows", "requests", "columns", "table_width")}
+            return dict(out, pass_=True, decision="ok", vid=rule["vid"])
+
+        def fake_bucket(b, s, api, G, S, seed=0, profile=None):
+            seen.append(b["id"])
+            out = {k: s[k] for k in ("rows", "requests", "columns", "table_width")}
+            return dict(out, pass_=True, decision="ok", vid=b["vid"], bitwise_unpadded=True)
+
         props = types.SimpleNamespace(gcnArchName="gfx1250", multi_processor_count=256)
         with _tmpdir() as td:
             out = os.path.join(td, "qsa_page4_gfx1250_v1.json")
             with mock.patch.object(gen, "check_row", fake_row), \
+                    mock.patch.object(gen, "check_sample", fake_sample), \
+                    mock.patch.object(gen, "check_bucket_sample", fake_bucket), \
                     mock.patch.object(gen, "_golden_modules", lambda: (None, None)), \
                     mock.patch.object(torch.cuda, "get_device_properties", lambda i: props), \
                     mock.patch.dict(os.environ, {}), \
                     mock.patch.object(torch.cuda, "empty_cache", lambda: None):
                 self.assertEqual(gen.check(PROFILE_JSON, out, None), 0)
-            self.assertEqual(len(seen), len(self.data["rows"]))
+            n_samples = sum(len(r["samples"]) for r in self.data["rules"])
+            n_samples += sum(len(b["samples"]) for b in self.data.get("buckets") or [])
+            self.assertEqual(len(seen), len(self.data["rows"]) + n_samples)
             prof = PR.load_profile(out, use_cache=False)
+            self.assertTrue(prof.buckets and all(b.verified for b in prof.buckets))
             self.assertTrue(all(r.verified for r in prof.rows))
+            self.assertTrue(prof.rules and all(r.verified for r in prof.rules))
+            for r in prof.rules:
+                g = r.raw["golden"]
+                self.assertEqual((g["samples_n"], g["samples_failed"]), (len(r.raw["samples"]), 0))
+                self.assertEqual(g["kernel_sha256"], self.data["kernel"]["sha256"])
             for r in prof.rows:
                 g = r.raw["golden"]
                 self.assertEqual(g["kernel_sha256"], self.data["kernel"]["sha256"])
@@ -498,13 +583,57 @@ class AbiDrift(unittest.TestCase):
     def test_our_signatures(self):
         self._check_ours(API.qsa_paged_mqa_logits, ["logits", "visible_groups", "profile"])
         self._check_ours(API.eligibility, ["logits", "visible_groups", "profile"])
-        self._check_ours(API.decide, ["logits", "visible_groups", "profile", "allow_unverified"])
+        self._check_ours(API.decide, ["logits", "visible_groups", "profile", "allow_unverified",
+                                      "buckets"])
         self.assertIs(PKG.qsa_paged_mqa_logits, API.qsa_paged_mqa_logits)
+
+    def test_api_1_1_signatures(self):
+        """1.1 is additive: launch = (decision, <ATOM 12>, *, logits, visible_groups)."""
+        params = list(inspect.signature(API.launch).parameters.values())
+        self.assertEqual((params[0].name, params[0].kind),
+                         ("decision", inspect.Parameter.POSITIONAL_OR_KEYWORD))
+        self.assertIs(params[0].default, inspect.Parameter.empty)
+        lead = params[1:1 + len(API.ATOM_SCORER_SIGNATURE)]
+        self.assertEqual(tuple((p.name, p.default) for p in lead), API.ATOM_SCORER_SIGNATURE)
+        self.assertTrue(all(p.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD for p in lead))
+        rest = params[1 + len(lead):]
+        self.assertEqual([(p.name, p.kind, p.default) for p in rest],
+                         [("logits", inspect.Parameter.KEYWORD_ONLY, None),
+                          ("visible_groups", inspect.Parameter.KEYWORD_ONLY, None)])
+        sig = inspect.signature(API.prewarm)
+        self.assertEqual([(p.name, p.kind) for p in sig.parameters.values()],
+                         [("profile", inspect.Parameter.POSITIONAL_OR_KEYWORD),
+                          ("cache_dtypes", inspect.Parameter.KEYWORD_ONLY),
+                          ("pos_dtypes", inspect.Parameter.KEYWORD_ONLY),
+                          ("device", inspect.Parameter.KEYWORD_ONLY),
+                          # R2 (additive, keyword-only): scoping, persistent cache, jobs
+                          ("page_sizes", inspect.Parameter.KEYWORD_ONLY),
+                          ("compressed_k_cache", inspect.Parameter.KEYWORD_ONLY),
+                          ("compressed_k_scale", inspect.Parameter.KEYWORD_ONLY),
+                          ("cache_dir", inspect.Parameter.KEYWORD_ONLY),
+                          ("jobs", inspect.Parameter.KEYWORD_ONLY),
+                          ("compile_only", inspect.Parameter.KEYWORD_ONLY)])
+        self.assertEqual({k: v.default for k, v in sig.parameters.items()},
+                         {"profile": None, "cache_dtypes": ("bf16",),
+                          "pos_dtypes": (torch.int32, torch.int64), "device": None,
+                          "page_sizes": None, "compressed_k_cache": None,
+                          "compressed_k_scale": None, "cache_dir": None, "jobs": 1,
+                          "compile_only": False})
+        self.assertIs(PKG.launch, API.launch)
+        self.assertIs(PKG.prewarm, API.prewarm)
+        # Decision keeps its 1.0 public fields (the plan is private, not compared)
+        import dataclasses
+        self.assertEqual([f.name for f in dataclasses.fields(API.Decision)],
+                         ["ok", "reason", "detail", "profile", "cell", "vid", "columns", "_plan"])
 
     def test_reason_enum_frozen(self):
         self.assertEqual(tuple(PR.iter_reasons()), FREEZE_REASONS)
         self.assertEqual((PR.API_VERSION, PR.PROFILE_ENV, PR.DEFAULT_PROFILE),
-                         ("1.0", "AITER_QSA_INDEX_SCORER_PROFILE", "qsa_page4_gfx1250_v1"))
+                         ("1.1", "AITER_QSA_INDEX_SCORER_PROFILE", "qsa_page4_gfx1250_v1"))
+        # profiles stay compatible: major match, generated profiles record the 1.0 floor
+        self.assertEqual(PR.PROFILE_API_VERSION, "1.0")
+        with open(PROFILE_JSON, encoding="utf-8") as fh:
+            self.assertEqual(json.load(fh)["api_version"], "1.0")
 
     def test_kernel_module_api_kept(self):
         with open(PR.KERNEL_PATH, encoding="utf-8") as fh:
@@ -574,7 +703,9 @@ class Reasons(Env):
         self.assertReason(a, "cache_format_unsupported")
         self.assertReason(mut(1, fp8), "cache_format_unsupported")
         self.assertReason(mut(1, aligned((8, 4, 1, 128), torch.float16)), "cache_format_unsupported")
-        self.assertReason(mut(1, aligned((8, 16, 1, 128), torch.bfloat16)), "cache_shape_unsupported")
+        # ROUND-PAGE16 / R2: P = 8, 16 are supported geometries (page-8/16 rules); other P are not
+        self.assertReason(mut(1, aligned((8, 2, 1, 128), torch.bfloat16)), "cache_shape_unsupported")
+        self.assertReason(mut(1, aligned((8, 32, 1, 128), torch.bfloat16)), "cache_shape_unsupported")
         self.assertReason(mut(1, aligned((8, 4, 2, 128), torch.bfloat16)[:, :, :1]),
                           "cache_layout_unsupported")
         for off in (16, 64):
@@ -660,11 +791,12 @@ class Reasons(Env):
             self.assertReason(draft8, "route_mismatch", allow_unverified=True)
 
     def test_coverage_reasons(self):
-        self.assertReason(call_args(rows=6, requests=1), "rows_rule_uncovered")       # r16 tail
-        self.assertReason(call_args(rows=96, requests=24), "rows_rule_uncovered")     # no row
-        self.assertReason(call_args(rows=64, requests=16, width=8192, columns=32768),
-                          "table_width_uncovered")
-        self.assertReason(call_args(columns=4096), "columns_uncovered")
+        self.assertReason(call_args(rows=600, requests=600), "rows_rule_uncovered")   # > draft rule
+        self.assertReason(call_args(rows=2052, requests=513), "rows_rule_uncovered")  # > decode rule
+        self.assertReason(call_args(rows=64, requests=16, width=32768, columns=32768),
+                          "table_width_uncovered")                                    # > rule width
+        self.assertReason(call_args(columns=1000), "columns_uncovered")              # not pow2
+        self.assertReason(call_args(columns=32), "columns_uncovered")                # < 64
         self.assertTrue(self.decide(call_args(columns=None)).ok)   # full width = 65536 bucket
         # pending rows -> row_unverified, pass rows -> ok (holds before and after the
         # root's GPU `gen_profile check` restamps the profile)
@@ -700,6 +832,489 @@ class Reasons(Env):
 
 
 # ---------------------------------------------------------------------------
+def _gen():
+    spec = importlib.util.spec_from_file_location(
+        f"qsa_gen_profile_rules{uuid.uuid4().hex[:6]}", os.path.join(PKG_DIR, "gen_profile.py"))
+    gen = importlib.util.module_from_spec(spec)
+    with mock.patch.object(sys, "path", [PKG_DIR] + sys.path):
+        spec.loader.exec_module(gen)
+    return gen
+
+
+def _verified_rules(data):
+    """Copy of a profile with every rule stamped `pass` (as a GPU check would)."""
+    d = json.loads(json.dumps(data))
+    for r in d["rules"]:
+        r["golden"] = {"status": "pass", "kernel_sha256": d["kernel"]["sha256"],
+                       "samples_n": len(r["samples"]),
+                       "checked": [dict(s, **{"pass": True}) for s in r["samples"]]}
+    return d
+
+
+class Rules(Env):
+    """Schema-2 range rules: validation, precedence, bounds, reasons, route guard and the
+    Stage-3 captured plan (rules stamped pass in a temp copy = a mocked GPU check)."""
+
+    def setUp(self):
+        super().setUp()
+        with open(PROFILE_JSON, encoding="utf-8") as fh:
+            self.data = json.load(fh)
+        self._td = _tmpdir()
+        self.td = self._td.__enter__()
+        d = _verified_rules(self.data)
+        d["profile"] = "qsa_rules_v1"
+        self.vpath = os.path.join(self.td, "qsa_rules_v1.json")
+        with open(self.vpath, "w") as fh:
+            json.dump(d, fh)
+        self.vdata = d
+
+    def tearDown(self):
+        self._td.__exit__(None, None, None)
+        super().tearDown()
+
+    def write(self, d, name="qsa_bad_v1"):
+        d = json.loads(json.dumps(d)); d["profile"] = name
+        path = os.path.join(self.td, f"{name}.json")
+        with open(path, "w") as fh:
+            json.dump(d, fh)
+        return path
+
+    def test_committed_rules(self):
+        ids = {r["id"]: r for r in self.data["rules"]}
+        self.assertEqual(self.data["schema_version"], 2)
+        # ROUND-R2E route presets: bf16 lean ktile RB32 x C2 for columns <= 2048, persist
+        # above (4096..8192, wide 16384..65536 under the ATOM chunk bound)
+        p4 = {"draft_bf16", "decode_bf16", "tail_bf16", "prefill_bf16_kt",
+              "prefill_bf16_persist", "prefill_bf16_persist_wide"}
+        # fp8: lean+kconv ktile x C2 (rows <= 2048) / x C4 (rows 2049..16384) for columns <=
+        # 2048, r32 fp8 above (no persistent fp8 kernel)
+        f4 = {"draft_fp8", "decode_fp8", "tail_fp8", "prefill_fp8_kt", "prefill_fp8_kt_tall",
+              "prefill_fp8_r32_mid", "prefill_fp8_r32_wide"}
+        self.assertEqual(set(ids), {i + s for i in p4 | f4 for s in ("", "_p16", "_p8")})
+        gen = _gen()
+        ksha = self.data["kernel"]["sha256"]
+        # evidence carried to this kernel by the ISA-identity chain (GPU restamps on bf49 for
+        # page 4 bf16, on d438 for page 8/16 and fp8)
+        chain = (ksha, gen.PAGE4_EVIDENCE_KERNEL_SHA256, gen.R2_KERNEL_SHA256)
+        caps = {4: gen.capture_shapes(), 16: gen.capture_shapes_p16(), 8: gen.capture_shapes_p8()}
+        self.assertEqual([k[1:] for k in caps[4] if k[0] == "bf16"], gen.builtin_sample_shapes())
+        self.assertEqual([k[1:] for k in caps[16] if k[0] == "bf16"],
+                         gen.builtin_sample_shapes_p16())
+        for r in self.data["rules"]:
+            page = PR.page_of(r)
+            shapes = [(*k[1:5], k[5]) for k in caps[page] if k[0] == r["cache_dtype"]]
+            g = r["golden"]
+            self.assertIn(g["status"], ("pass", "pending"))
+            base = r["id"].rsplit("_p", 1)[0] if r["id"].endswith(("_p8", "_p16")) else r["id"]
+            if g["status"] == "pass":
+                self.assertIn(g["kernel_sha256"], chain, r["id"])
+                if g["kernel_sha256"] != ksha:
+                    self.assertTrue(g.get("isa_identity"), r["id"])
+                    # R2E re-routed / ISA-changed builds and the new fp8 draft wg_waves 2
+                    # launch carry no older evidence: pass only on a fresh GPU check
+                    self.assertNotIn(base, {"prefill_bf16_kt", "prefill_bf16_persist",
+                                            "prefill_bf16_persist_wide", "prefill_fp8_kt",
+                                            "prefill_fp8_kt_tall", "draft_fp8"}, r["id"])
+            elif "stale" in g:
+                self.assertIn("ROUND-R2E", g["reason"], r["id"])
+            # P8/P16 + fp8 non-prefill rules pass via the d438 GPU restamp chain
+            if base in {"draft_bf16", "decode_bf16", "tail_bf16", "decode_fp8", "tail_fp8",
+                        "prefill_fp8_r32_wide"}:
+                self.assertEqual(g["status"], "pass", r["id"])
+            # one variant per rule: the router at every column and at both row extremes;
+            # launch knobs = the default-env wrapper's (fp8 draft wg_waves 2)
+            R = PR.ProfileRule(r)
+            vb, kn = PR.split_knobs(r["vid"], r["params"])
+            self.assertEqual(kn, PR.default_knobs(r["cache_dtype"], r["regime"]), r["id"])
+            for c in PR.column_values(r["columns"]):
+                for rr in sorted({int(r["rows"]["min"]), R.rows_max_at(c)}):
+                    self.assertEqual((r["vid"], vb),
+                                     PR.expected_variant(r["cache_dtype"], r["regime"], c, page,
+                                                         rows=rr), (r["id"], c, rr))
+            # every bounds sample and every captured / exact-row / AgentX class the rule
+            # admits is a sample
+            keys = {PR.sample_key(s) for s in r["samples"]}
+            R = PR.ProfileRule(r)
+            for k in shapes:
+                self.assertEqual(R.admits(*k[:4]), tuple(k[:4]) in keys, (r["id"], k))
+            self.assertEqual(r["samples"], gen.rule_samples(r, shapes))
+        self.assertEqual(ids["draft_bf16"]["vid"], "qsa.page4.draft.v1")
+        self.assertEqual(ids["tail_bf16"]["vid"], "qsa.page4.r16.v1")
+        self.assertEqual(ids["prefill_bf16_persist"]["vid"], "qsa.page4.r32_persist.v1")
+        # ROUND-R2E prefill column / row bands
+        kt = ids["prefill_bf16_kt"]
+        self.assertEqual((kt["vid"], kt["params"], kt["columns"], kt["rows"]),
+                         ("qsa.page4.r32_kt.v1",
+                          {"k_load": "tdm", "rows_per_block": 32, "kt_rows": 32, "col_tiles": 2,
+                           "lean": True},
+                          {"pow2": {"min": 64, "max": PR.PREFILL_KT_MAX_COLUMNS}},
+                          {"min": 32, "max": PR.PREFILL_KT_MAX_ROWS}))
+        self.assertEqual(ids["prefill_bf16_persist"]["columns"],
+                         {"pow2": {"min": 4096, "max": 8192}})
+        fkt = {"k_load": "tdm", "rows_per_block": 32, "kt_rows": 32, "cvt": "fast",
+               "pk8": "intrin", "lean": True, "kconv": True}
+        for rid_, tiles, rows in (("prefill_fp8_kt", 2, {"min": 32, "max": 2048}),
+                                  ("prefill_fp8_kt_tall", 4, {"min": 2049, "max": 16384})):
+            r = ids[rid_]
+            self.assertEqual((r["vid"], r["params"], r["rows"], r["columns"]),
+                             ("qsa.page4.r32_kt_fp8.v1", dict(fkt, col_tiles=tiles), rows,
+                              {"pow2": {"min": 64, "max": 2048}}), rid_)
+        for rid_, cols in (("prefill_fp8_r32_mid", {"min": 4096, "max": 8192}),
+                           ("prefill_fp8_r32_wide", {"min": 16384, "max": 65536})):
+            self.assertEqual((ids[rid_]["vid"], ids[rid_]["columns"]),
+                             ("qsa.page4.r32_fp8.v1", {"pow2": cols}), rid_)
+        self.assertEqual(ids["prefill_fp8_r32_wide"]["rows_x_columns_max"], 2 ** 25)
+        self.assertEqual(ids["draft_fp8"]["params"],
+                         {"k_load": "tdm", "wave_cols": 32, "sched": "qpre", "pk8": "intrin",
+                          "wg_waves": 2})
+        self.assertEqual(ids["draft_bf16"]["params"], {"k_load": "tdm", "wave_cols": 32})
+        w = ids["prefill_bf16_persist_wide"]
+        self.assertEqual(w["vid"], "qsa.page4.r32_persist.v1")
+        self.assertEqual(w["rows_x_columns_max"], 2 ** 25)
+        # the rows bound is ATOM's select-loop chunk: rows_per_chunk = 128 MiB // (columns * 4)
+        R = PR.ProfileRule(w)
+        for c in PR.column_values(w["columns"]):
+            self.assertEqual(R.rows_max_at(c), (128 * 1024 * 1024) // (c * 4))
+        # every sample is inside the chunk bound; each column has its chunk-cap corner
+        for s in w["samples"]:
+            self.assertLessEqual(s["rows"] * s["columns"], 2 ** 25)
+        caps = {(s["rows"], s["columns"]) for s in w["samples"]}
+        self.assertTrue({(2048, 16384), (1024, 32768), (512, 65536)} <= caps)
+        # the profile-v1 exact bf16 prefill rows at 65536 columns are samples
+        keys = {PR.sample_key(s) for s in w["samples"]}
+        self.assertTrue({(512, 2, 65536, 16384), (320, 2, 65536, 16384)} <= keys)
+
+    def test_agentx_select_loop_coverage(self):
+        """Every scorer call ATOM's select loop issues for the AgentX recipe (bf16, table
+        width 16384, <= 16384 batched tokens, requests 1..32, rows chunked to 2^25 / columns,
+        pow2 columns 64..65536) resolves to a rule, and MTP3 decode / draft at CUDA-graph
+        sizes 1..32 (+ eager batches up to 512 requests) stays inside draft/decode."""
+        prof = PR.load_profile(self.vpath, use_cache=False)
+
+        def rid(rows, reqs, cols, width=16384):
+            m = PR.match(prof, arch="gfx1250", cu=256, cache_dtype="bf16", rows=rows,
+                         requests=reqs, columns=cols, table_width=width)
+            return m.row.id if m.ok and isinstance(m.row, PR.ProfileRule) else (
+                m.row.cell if m.ok else m.reason.value)
+
+        want = {"draft": "draft_bf16", "decode": "decode_bf16", "tail": "tail_bf16"}
+        for c in (64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536):
+            rpc = min(16384, (128 * 1024 * 1024) // (c * 4))
+            for q in (1, 2, 3, 7, 15, 16, 17, 31, 32):
+                rows_set = {1, 2, 3, 4, 5, 31, 32, 33, 32 * q - 1, 32 * q, 32 * q + 1,
+                            rpc // 2 - 1, rpc // 2, rpc - 1, rpc}
+                for r in sorted(x for x in rows_set if 1 <= x <= rpc):
+                    reg = PR.regime_of(r, q)
+                    got = rid(r, q, c)
+                    if reg == "prefill":
+                        exp = ("prefill_bf16_kt" if c <= 2048 else "prefill_bf16_persist"
+                               if c <= 8192 else "prefill_bf16_persist_wide")
+                    else:
+                        exp = want[reg]
+                    if got != exp:   # an exact row (precedence) is fine
+                        self.assertNotIn(got, [x.value for x in PR.Reason], (r, q, c, got))
+        # a call above the chunk cap is not admitted by the wide rule
+        self.assertEqual(rid(1024, 1, 65536), "columns_uncovered")
+        self.assertEqual(rid(4096, 1, 16384), "columns_uncovered")
+        # MTP3 verify (rows == 4*bs) and draft (rows == bs) at 65536 columns
+        for bs in list(range(1, 33)) + [64, 128, 256, 512]:
+            rows = 4 * bs
+            chunks = [min(512, rows - s) for s in range(0, rows, 512)]
+            for r in chunks:
+                self.assertIn(rid(r, bs, 65536), ("decode_bf16", "decode_bf16_r64q16_c65536_w16384",
+                                                  "draft_bf16"), (bs, r))
+            self.assertIn(rid(bs, bs, 65536), ("draft_bf16", "draft_bf16_r16q16_c65536_w16384"))
+
+    def test_pending_rules_are_never_selected(self):
+        prof = PR.load_profile(PR.DEFAULT_PROFILE)
+        if any(r.verified for r in prof.rules):
+            self.skipTest("rules already GPU-verified")
+        d = self.assertReason(call_args(rows=8, requests=8), "row_unverified")
+        self.assertEqual(d.cell, "rule:draft_bf16")
+        d = self.decide(call_args(rows=8, requests=8), allow_unverified=True)
+        self.assertTrue(d.ok, d)
+        self.assertEqual((d.cell, d.vid), ("rule:draft_bf16", "qsa.page4.draft.v1"))
+
+    def test_exact_rows_take_precedence(self):
+        d = self.decide(call_args(rows=16, requests=16), profile=self.vpath)
+        self.assertTrue(d.ok, d)
+        self.assertEqual(d.cell, "draft_bf16_r16q16_c65536_w16384")
+        d = self.decide(call_args(rows=64, requests=16), profile=self.vpath)
+        self.assertEqual(d.cell, "decode_bf16_r64q16_c65536_w16384")
+        # a pending exact row does not block a verified rule
+        dd = json.loads(json.dumps(self.vdata))
+        row = next(r for r in dd["rows"] if r["cell"] == "draft_bf16_r16q16_c65536_w16384")
+        row["golden"] = {"status": "pending"}
+        d = self.decide(call_args(rows=16, requests=16), profile=self.write(dd, "qsa_prec_v1"))
+        self.assertTrue(d.ok, d)
+        self.assertEqual(d.cell, "rule:draft_bf16")
+
+    def test_rule_bounds_and_reasons(self):
+        ok = [  # (kw, rule)
+            (dict(rows=1, requests=1, columns=64, width=16), "draft_bf16"),
+            (dict(rows=512, requests=512), "draft_bf16"),
+            (dict(rows=3, requests=500, columns=2048, width=1024), "draft_bf16"),
+            (dict(rows=4, requests=1, columns=512), "decode_bf16"),
+            (dict(rows=2048, requests=512, columns=64, width=16), "decode_bf16"),
+            (dict(rows=124, requests=4, columns=256), "decode_bf16"),
+            (dict(rows=2, requests=1), "tail_bf16"),
+            (dict(rows=4095, requests=512, columns=1024, width=256), "tail_bf16"),
+            (dict(rows=32, requests=1, columns=64, width=16), "prefill_bf16_kt"),
+            (dict(rows=16384, requests=32, columns=256), "prefill_bf16_kt"),
+            (dict(rows=4096, requests=2, columns=2048, width=512), "prefill_bf16_kt"),
+            (dict(rows=64, requests=1, columns=4096, width=1024), "prefill_bf16_persist"),
+            (dict(rows=8192, requests=1, columns=4096, width=1024), "prefill_bf16_persist"),
+            (dict(rows=16384, requests=32, columns=8192), "prefill_bf16_persist"),
+            (dict(rows=2048, requests=32, columns=16384), "prefill_bf16_persist_wide"),
+            (dict(rows=1024, requests=1, columns=16384, width=4096), "prefill_bf16_persist_wide"),
+            (dict(rows=1024, requests=32, columns=32768), "prefill_bf16_persist_wide"),
+            (dict(rows=512, requests=16, columns=65536), "prefill_bf16_persist_wide"),
+            (dict(rows=32, requests=1, columns=65536), "prefill_bf16_persist_wide"),
+            # fp8 (R2E): draft wg_waves 2; ktile C2 rows <= 2048, C4 above; r32 fp8 > 2048 cols
+            (dict(rows=8, requests=8, fmt="fp8"), "draft_fp8"),
+            (dict(rows=32, requests=1, columns=64, width=16, fmt="fp8"), "prefill_fp8_kt"),
+            (dict(rows=2048, requests=1, columns=2048, width=512, fmt="fp8"), "prefill_fp8_kt"),
+            (dict(rows=2080, requests=1, columns=256, width=64, fmt="fp8"),
+             "prefill_fp8_kt_tall"),
+            (dict(rows=16384, requests=32, columns=2048, width=512, fmt="fp8"),
+             "prefill_fp8_kt_tall"),
+            (dict(rows=64, requests=1, columns=4096, width=1024, fmt="fp8"),
+             "prefill_fp8_r32_mid"),
+            (dict(rows=512, requests=16, columns=65536, fmt="fp8"), "prefill_fp8_r32_wide"),
+        ]
+        for kw, rid in ok:
+            d = self.decide(call_args(**kw), profile=self.vpath)
+            self.assertTrue(d.ok, (kw, d))
+            self.assertEqual(d.cell, f"rule:{rid}", kw)
+        bad = [
+            (dict(rows=513, requests=513), "rows_rule_uncovered"),           # draft requests > 512
+            (dict(rows=2052, requests=513), "rows_rule_uncovered"),          # decode rows > 2048
+            (dict(rows=4097, requests=512), "rows_rule_uncovered"),          # tail rows > 4095
+            (dict(rows=16416, requests=1, columns=512), "rows_rule_uncovered"),  # prefill > 16384
+            (dict(rows=2112, requests=33, columns=512), "rows_rule_uncovered"),  # prefill q > 32
+            (dict(rows=8, requests=8, width=32768, columns=65536), "table_width_uncovered"),
+            (dict(rows=8, requests=8, width=8, columns=32), "table_width_uncovered"),
+            (dict(rows=64, requests=1, width=64, columns=256), "ok"),          # kt rule, tw 64
+            (dict(rows=64, requests=1, width=127, columns=512), "columns_uncovered"),  # 508 cols
+            (dict(rows=8, requests=8, columns=1000), "columns_uncovered"),     # not a power of two
+            (dict(rows=8, requests=8, columns=32), "columns_uncovered"),       # < 64
+            (dict(rows=4096, requests=1, columns=16384), "columns_uncovered"),  # > 2^25 chunk
+            (dict(rows=1028, requests=1, columns=32768), "columns_uncovered"),  # > 2^25 chunk
+            (dict(rows=516, requests=1, columns=65536), "columns_uncovered"),   # > 2^25 chunk
+            (dict(rows=1024, requests=1, columns=131072, width=32768), "table_width_uncovered"),
+            (dict(rows=16, requests=1, columns=4), "columns_uncovered"),       # captured class
+            (dict(rows=11, requests=1, columns=8), "columns_uncovered"),       # captured class
+        ]
+        for kw, reason in bad:
+            d = self.decide(call_args(**kw), profile=self.vpath)
+            if reason == "ok":
+                self.assertTrue(d.ok, (kw, d))
+            else:
+                self.assertFalse(d.ok, (kw, d))
+                self.assertEqual(d.reason.value, reason, (kw, d.detail))
+
+    def test_route_mismatch_guard(self):
+        args = call_args(rows=8, requests=8)
+        self.assertTrue(self.decide(args, profile=self.vpath).ok)
+        with mock.patch.object(K, "draft_route", lambda *a: ("raw", 64)):
+            d = self.assertReason(args, "route_mismatch", profile=self.vpath)
+            self.assertEqual(d.cell, "rule:draft_bf16")
+        # R2E: columns <= 2048 -> lean ktile rule; the legacy route table (persist >= 512
+        # columns) or a non-lean ktile is a different build
+        pre = call_args(rows=2048, requests=2, columns=512)
+        d = self.decide(pre, profile=self.vpath)
+        self.assertTrue(d.ok, d)
+        self.assertEqual((d.cell, d.vid), ("rule:prefill_bf16_kt", "qsa.page4.r32_kt.v1"))
+        with mock.patch.object(K, "PREFILL_ROUTE", None):
+            self.assertReason(pre, "route_mismatch", profile=self.vpath)
+        with mock.patch.object(K, "PREFILL_ROUTE", K.parse_prefill_route("*,*,*,*,*,kt32x2")):
+            self.assertReason(pre, "route_mismatch", profile=self.vpath)
+        per = call_args(rows=2048, requests=2, columns=4096, width=1024)
+        d = self.decide(per, profile=self.vpath)
+        self.assertEqual((d.ok, d.cell), (True, "rule:prefill_bf16_persist"), d)
+        with mock.patch.object(K, "TDM_PERSIST", False):
+            self.assertReason(per, "route_mismatch", profile=self.vpath)
+        # fp8 prefill: lean+kconv ktile x C2 (rows <= 2048); legacy table -> kernel_r32
+        pre8 = call_args(rows=2048, requests=2, columns=512, fmt="fp8")
+        d = self.decide(pre8, profile=self.vpath)
+        self.assertEqual((d.ok, d.cell), (True, "rule:prefill_fp8_kt"), d)
+        with mock.patch.object(K, "FP8_PREFILL_ROUTE", None):
+            self.assertReason(pre8, "route_mismatch", profile=self.vpath)
+        with mock.patch.object(K, "FP8_PREFILL_ROUTE",
+                               K.parse_fp8_prefill_route("*,*,*,*,*,kt32x4lk")):
+            self.assertReason(pre8, "route_mismatch", profile=self.vpath)
+        # fp8 draft: the rule pins wg_waves 2 (the plan launches the pinned knob, so an env
+        # back at the default 4 still serves it); a different non-default env knob mismatches
+        dr8 = call_args(rows=8, requests=8, fmt="fp8")
+        d = self.decide(dr8, profile=self.vpath)
+        self.assertEqual((d.ok, d.cell), (True, "rule:draft_fp8"), d)
+        self.assertEqual(API.predict_route(K, "fp8", 8, 8, 65536, 0x1000)[1]["wg_waves"], 2)
+        with mock.patch.object(K, "draft_wg_waves", lambda is_fp8: 4):
+            self.assertTrue(self.decide(dr8, profile=self.vpath).ok)
+        with mock.patch.object(K, "draft_wg_waves", lambda is_fp8: 1):
+            self.assertReason(dr8, "route_mismatch", profile=self.vpath)
+        tail = call_args(rows=13, requests=1, columns=512)
+        self.assertTrue(self.decide(tail, profile=self.vpath).ok)
+        with mock.patch.object(K, "R16_TDM_COLS", 64), \
+                mock.patch.object(K, "_resolve_bf16_k_load", lambda rpb, k=None: "raw"):
+            self.assertReason(tail, "route_mismatch", profile=self.vpath)
+
+    def test_stage3_captured_plan_coverage(self):
+        """Every Stage-3 captured class resolves to an exact row or a rule except the two
+        sub-tile column classes (columns 4 / 8 -> columns_uncovered)."""
+        gen = _gen()
+        by, unc = {}, []
+        for rows, reqs, cols, width in gen.STAGE3_CAPTURE:
+            d = self.decide(call_args(rows=rows, requests=reqs, columns=cols, width=width),
+                            profile=self.vpath)
+            if d.ok:
+                by[d.cell] = by.get(d.cell, 0) + 1
+            else:
+                unc.append(((rows, reqs, cols, width), d.reason.value))
+        self.assertEqual(len(gen.STAGE3_CAPTURE), 75)
+        self.assertEqual(sorted(unc), [((11, 1, 8, 16384), "columns_uncovered"),
+                                       ((16, 1, 4, 16384), "columns_uncovered")])
+        self.assertEqual(by, {"rule:draft_bf16": 15, "draft_bf16_r16q16_c65536_w16384": 1,
+                              "rule:decode_bf16": 4, "rule:tail_bf16": 10,
+                              # R2E: every captured prefill class with columns <= 2048 is
+                              # lean ktile; the one wider class stays persist
+                              "rule:prefill_bf16_kt": 42, "rule:prefill_bf16_persist": 1})
+        # the generator's coverage mode agrees (rules pending -> allow_unverified view)
+        cov = gen.coverage(self.data, [dict(cache_dtype="bf16", rows=r, requests=q, columns=c,
+                                            table_width=w) for r, q, c, w in gen.STAGE3_CAPTURE])
+        self.assertEqual(cov["by"], dict(by, **{"uncovered:columns_uncovered": 2}))
+
+    def test_rule_validation(self):
+        PR.load_profile(self.vpath, use_cache=False)
+        base = self.vdata
+        muts = []
+
+        def mut(fn):
+            d = json.loads(json.dumps(base)); fn(d); muts.append(d)
+
+        rid = {r["id"]: i for i, r in enumerate(base["rules"])}
+        P_ = rid["prefill_bf16_persist"]; D = rid["draft_bf16"]
+        mut(lambda d: d["rules"][D].update(vid="qsa.page4.decg.v1"))                # wrong variant
+        mut(lambda d: d["rules"][D]["params"].update(wave_cols=64))
+        mut(lambda d: d["rules"][P_]["columns"]["pow2"].update(min=256))             # splits variant
+        mut(lambda d: d["rules"][D].update(regime="decode"))                         # != relation
+        mut(lambda d: d["rules"][D].update(relation="sideways"))
+        mut(lambda d: d["rules"][D]["rows"].update(max=600))                         # sig mismatch
+        mut(lambda d: d["rules"][D].update(page_size=16))
+        mut(lambda d: d["rules"][D].update(divisor="1.0"))
+        mut(lambda d: d["rules"][D]["samples"].append(dict(rows=600, requests=600, columns=64,
+                                                           table_width=16)))       # outside
+        mut(lambda d: d["rules"][D]["samples"].append(dict(d["rules"][D]["samples"][0])))  # dup
+        mut(lambda d: d["rules"][D].update(samples=[]))
+        mut(lambda d: d["rules"][D]["golden"].pop("kernel_sha256"))                 # pass, no sha
+        mut(lambda d: d["rules"][D]["golden"]["checked"].pop())                      # sample unchecked
+        mut(lambda d: d["rules"][D]["golden"]["checked"][0].update(**{"pass": False}))
+        mut(lambda d: d["rules"][D]["golden"].update(kernel_sha256="0" * 64))       # old kernel
+        mut(lambda d: d["rules"].append(json.loads(json.dumps(d["rules"][D]))))      # duplicate id
+        mut(lambda d: d.update(schema_version=1))                                    # rules need v2
+
+        def too_big(d):     # 16384 x 65536 fp32 logits exceed int32 byte addressing
+            r = d["rules"][P_]
+            r["columns"] = {"pow2": {"min": 512, "max": 65536}}
+            r["sig"] = PR.rule_signature(r)
+        mut(too_big)
+        W = rid["prefill_bf16_persist_wide"]
+
+        def resig(fn):
+            def f(d):
+                fn(d["rules"][W])
+                d["rules"][W]["sig"] = PR.rule_signature(d["rules"][W])
+            return f
+        # wide rule spanning the r32 / persist split (columns 256 -> r32) is rejected
+        mut(resig(lambda r: r.update(columns={"pow2": {"min": 256, "max": 65536}},
+                                     table_width={"min": 64, "max": 16384})))
+        mut(resig(lambda r: r.update(rows_x_columns_max=0)))
+        mut(resig(lambda r: r.update(rows_x_columns_max="33554432")))
+        mut(resig(lambda r: r.update(rows_x_columns_max=31 * 65536)))  # no rows at 65536
+        # chunk bound lifted: 16384 rows x 65536 columns exceed int32 byte addressing
+        mut(resig(lambda r: (r.update(rows_x_columns_max=2 ** 30),
+                             r["rows"].update(max=16384))))
+        mut(lambda d: d["rules"][W].pop("rows_x_columns_max"))                      # sig mismatch
+        mut(lambda d: d["rules"][W].update(bogus_key=1))                             # unknown key
+        mut(lambda d: d["rules"][W]["samples"].append(dict(rows=1024, requests=1, columns=65536,
+                                                           table_width=16384)))  # above chunk
+        for i, d in enumerate(muts):
+            with self.assertRaises(PR.ProfileError, msg=str(i)) as cm:
+                PR.load_profile(self.write(d), use_cache=False)
+            self.assertEqual(cm.exception.reason, PR.Reason.PROFILE_INVALID)
+        # schema 1 (exact rows only) still loads
+        d = json.loads(json.dumps(base)); d["schema_version"] = 1; d.pop("rules")
+        prof = PR.load_profile(self.write(d, "qsa_v1schema_v1"), use_cache=False)
+        self.assertEqual(prof.rules, [])
+        d2 = self.decide(call_args(rows=8, requests=8), profile=prof.path)
+        self.assertEqual(d2.reason.value, "rows_rule_uncovered")
+
+    def test_check_plan_samples_and_merge(self):
+        """`check --plan-file` appends admitted plan shapes as rule samples (GPU mocked); a
+        rule passes only if every sample passes; merge_golden keeps verified evidence."""
+        gen = _gen()
+        extra = [dict(cache_dtype="bf16", rows=96, requests=24, columns=1024, table_width=4096),
+                 dict(cache_dtype="bf16", rows=16, requests=1, columns=4, table_width=16384)]
+        props = types.SimpleNamespace(gcnArchName="gfx1250", multi_processor_count=256)
+
+        def fake_sample(rule, s, api, G, S, seed=0, profile=None):
+            out = {k: s[k] for k in ("rows", "requests", "columns", "table_width")}
+            bad = rule["id"] == "tail_bf16" and s["rows"] == 4095
+            return dict(out, pass_=not bad, vid=rule["vid"])
+
+        out = os.path.join(self.td, "qsa_page4_gfx1250_v1.json")
+        with mock.patch.object(gen, "check_sample", fake_sample), \
+                mock.patch.object(gen, "_golden_modules", lambda: (None, None)), \
+                mock.patch.object(torch.cuda, "get_device_properties", lambda i: props), \
+                mock.patch.dict(os.environ, {}), \
+                mock.patch.object(torch.cuda, "empty_cache", lambda: None):
+            self.assertEqual(gen.check(PROFILE_JSON, out, None, extra, "rules"), 1)
+        with open(out, encoding="utf-8") as fh:
+            got = json.load(fh)
+        rules = {r["id"]: r for r in got["rules"]}
+        self.assertIn((96, 24, 1024, 4096),
+                      {PR.sample_key(s) for s in rules["decode_bf16"]["samples"]})
+        self.assertEqual(rules["decode_bf16"]["golden"]["status"], "pass")
+        self.assertEqual(rules["tail_bf16"]["golden"]["status"], "fail")
+        self.assertGreater(rules["tail_bf16"]["golden"]["samples_failed"], 0)
+        # rows untouched by --only rules
+        self.assertEqual(got["rows"], self.data["rows"])
+        prof = PR.load_profile(out, use_cache=False)
+        self.assertFalse(next(r for r in prof.rules if r.id == "tail_bf16").verified)
+        self.assertEqual(gen.verify(out, capture_plan=extra), [])
+        # re-emit with the same plan keeps the decode pass, nothing invents a pass
+        merged = gen.merge_golden(gen.build_profile(gen.builtin_plan(), capture_plan=extra), got)
+        m = {r["id"]: r for r in merged["rules"]}
+        self.assertEqual(m["decode_bf16"]["golden"]["status"], "pass")
+        self.assertEqual(m["tail_bf16"]["golden"]["status"], "fail")
+        # without the plan entry, the decode pass still covers the (smaller) sample set
+        merged = gen.merge_golden(gen.build_profile(gen.builtin_plan()), got)
+        PR.validate_profile(merged)
+        self.assertEqual({r["id"]: r for r in merged["rules"]}["decode_bf16"]["golden"]["status"],
+                         "pass")
+
+    def test_sample_fixture(self):
+        gen = _gen()
+        fx = gen.sample_fixture(dict(rows=512, requests=512, columns=65536, table_width=16384))
+        self.assertEqual(fx, {"max_ctx": 16 * 4095, "cache_pages": 512 * 4095, "layout": "draft"})
+        # every fixture's bf16 cache plane stays below the op's int32 byte-addressing guard
+        for reqs in (1, 16, 127, 128, 256, 512):
+            fx = gen.sample_fixture(dict(rows=reqs, requests=reqs, columns=65536,
+                                         table_width=16384))
+            self.assertLess(fx["cache_pages"] * 4 * 128 * 2, 2 ** 31)
+        self.assertEqual(gen.sample_fixture(dict(rows=64, requests=16, columns=65536,
+                                                 table_width=16384))["layout"], "decode")
+        fx = gen.sample_fixture(dict(rows=16383, requests=32, columns=512, table_width=16384))
+        self.assertEqual((fx["layout"], fx["max_ctx"]), ("even", 16 * 16384))
+        t2r, pos = gen._even_layout(16383, 32, 256)
+        self.assertEqual(t2r.numel(), 16383)
+        self.assertEqual(int(t2r.max()), 31)
+        self.assertTrue(bool((pos >= 0).all()) and bool((pos < 256).all()))
+        t2r, pos = gen._even_layout(3, 500, 1024)     # draft rows < requests: one row each
+        self.assertEqual(t2r.tolist(), [0, 1, 2])
+        self.assertEqual(pos.tolist(), [1023, 1023, 1023])
+
+
 class Router(Env):
     """Profile regimes / variants vs the kernel's own router (no duplicated truth)."""
 
@@ -714,17 +1329,46 @@ class Router(Env):
                     self.assertEqual(reg == "draft", draft, (rows, reqs))
                     self.assertEqual(reg == "decode", decg, (rows, reqs))
                     self.assertEqual(reg == "prefill", r32, (rows, reqs))
+                    # the r16 tail class is exactly "none of the three specialised kernels"
+                    self.assertEqual(reg == "tail", not (draft or decg or r32), (rows, reqs))
 
     def test_predict_route_matches_profile_variants(self):
         for dt in ("bf16", "fp8"):
-            for rows, reqs in ((16, 16), (64, 16), (512, 2), (320, 2), (4, 1), (64, 2)):
-                for cols in (64, 256, 1000, 32768, 65536):
+            for rows, reqs in ((16, 16), (64, 16), (512, 2), (320, 2), (4, 1), (64, 2),
+                               (6, 1), (50, 5), (23, 2), (4095, 512), (2048, 1), (2049, 1),
+                               (16384, 32)):
+                for cols in (64, 256, 1000, 2048, 4096, 8192, 32768, 65536):
                     reg = PR.regime_of(rows, reqs)
+                    vid, params = PR.expected_variant(dt, reg, cols, rows=rows)
+                    # + the default-env wrapper knobs (R2E: fp8 draft wg_waves 2)
                     self.assertEqual(API.predict_route(K, dt, rows, reqs, cols, 0x1000),
-                                     PR.expected_variant(dt, reg, cols), (dt, rows, reqs, cols))
+                                     (vid, dict(params, **PR.default_knobs(dt, reg))),
+                                     (dt, rows, reqs, cols))
+        # R2E route presets, spelled out
+        kt = {"k_load": "tdm", "rows_per_block": 32, "kt_rows": 32, "lean": True}
+        self.assertEqual(API.predict_route(K, "bf16", 512, 2, 2048, 0x1000),
+                         ("qsa.page4.r32_kt.v1", dict(kt, col_tiles=2)))
+        self.assertEqual(API.predict_route(K, "bf16", 512, 2, 4096, 0x1000)[0],
+                         "qsa.page4.r32_persist.v1")
+        f8 = dict(kt, cvt="fast", pk8="intrin", kconv=True)
+        self.assertEqual(API.predict_route(K, "fp8", 2048, 1, 1024, 0x1000),
+                         ("qsa.page4.r32_kt_fp8.v1", dict(f8, col_tiles=2)))
+        self.assertEqual(API.predict_route(K, "fp8", 2049, 1, 1024, 0x1000),
+                         ("qsa.page4.r32_kt_fp8.v1", dict(f8, col_tiles=4)))
+        self.assertEqual(API.predict_route(K, "fp8", 2048, 1, 4096, 0x1000),
+                         ("qsa.page4.r32_fp8.v1", {"k_load": "tdm", "rows_per_block": 32,
+                                                   "cvt": "fast", "pk8": "intrin"}))
+        self.assertEqual(API.predict_route(K, "fp8", 16, 16, 64, 0x1000)[1]["wg_waves"], 2)
+        self.assertNotIn("wg_waves", API.predict_route(K, "bf16", 16, 16, 64, 0x1000)[1])
+        # kernel-native 3-row decode groups: 'auto' slab 32 for both dtypes (4-row fp8: 64)
+        self.assertEqual(K.decode_group_route(48, 16, True, 0x1000, 3), 32)
+        self.assertEqual(K.decode_group_route(48, 16, False, 0x1000, 3), 32)
+        self.assertEqual(K.decode_group_route(64, 16, True, 0x1000), 64)
+        self.assertEqual(PR.expected_variant("fp8", "decode", 65536, group_rows=3)[1]["wave_cols"],
+                         32)
 
 
-class Dispatch(Env):
+class _Stubs(Env):
     """Real kernel wrapper; only _run / builders / stream lookup are intercepted."""
 
     def setUp(self):
@@ -734,6 +1378,8 @@ class Dispatch(Env):
         def mk(kind, cols_fn):
             def build(*a, **kw):
                 lk = _Launch(kind, cols_fn(*a, **kw))
+                # ROUND-R2B: real WMMA launchers carry rows_per_launch (= rows_per_block)
+                lk.rows_per_launch = a[1] if len(a) > 1 else kw.get("rows_per_block", 16)
                 lk.build_args = (a, kw)
                 self.kinds.append((kind, a, kw))
                 return lk
@@ -742,11 +1388,15 @@ class Dispatch(Env):
         def wmma_cols(divisor, rpb=16, k_load=None, **kw):
             if k_load == "persist":
                 return K.WMMA_COLS * K.TDM_PERSIST_CHUNKS
+            if k_load == "ktile":                  # R2E default prefill (<= 2048 columns)
+                return K.WMMA_COLS * kw["col_tiles"]
             return K.R16_TDM_COLS if (rpb == 16 and k_load == "tdm") else K.WMMA_COLS
 
         self._d = [mock.patch.object(K, "_run", lambda launch, *a: self.runs.append((launch, a))),
                    mock.patch.object(K, "_build_wmma_kernel", mk("wmma", wmma_cols)),
-                   mock.patch.object(K, "_build_wmma_fp8_kernel", mk("wmma_fp8", lambda *a, **k: 64)),
+                   mock.patch.object(K, "_build_wmma_fp8_kernel", mk(
+                       "wmma_fp8", lambda d, rpb=16, k_load=None, **k:
+                       K.WMMA_COLS * k["col_tiles"] if k_load == "ktile" else 64)),
                    mock.patch.object(K, "_build_draft_kernel", mk("draft", lambda *a, **k: 32)),
                    mock.patch.object(K, "_build_decode_group_kernel", mk("decg", lambda *a, **k: 32)),
                    mock.patch.object(K, "_build_kernel", mk("scalar", lambda *a, **k: 256)),
@@ -759,18 +1409,42 @@ class Dispatch(Env):
             p.stop()
         super().tearDown()
 
+
+class Dispatch(_Stubs):
+    """Every profiled row / rule sample launches its variant through the op."""
+
     @staticmethod
     def _vid(kind, a, kw):
+        vid, params = Dispatch._vid4(kind, a, kw)
+        page = kw.get("page_size", 4)
+        return vid.replace("qsa.page4.", f"qsa.page{page}."), params
+
+    @staticmethod
+    def _vid4(kind, a, kw):
         pk8 = "asm" if K._FP8_CVT_ASM else "intrin"
+        def ktile(p):     # R2E lean ktile builder keywords -> profile params
+            p.update(kt_rows=kw["kt_rows"], col_tiles=kw["col_tiles"])
+            for flag in ("lean", "kconv"):
+                if kw.get(flag):
+                    p[flag] = True
+            if kw.get("ipf"):
+                p["ipf"] = kw["ipf"]
+            return p
+
         if kind == "draft":
             p = {"k_load": a[2], "wave_cols": a[3]}
             if a[0]:
                 p.update(sched=K.draft_fp8_sched(), pk8=pk8)
+            if "wg_waves" in kw:                # launch knob (R2E: fp8 'auto' = 2)
+                p["wg_waves"] = kw["wg_waves"]
             return "qsa.page4.draft.v1", p
         if kind == "decg":
             p = {"k_load": "tdm", "wave_cols": a[2], "barrier": False}
             if a[0]:
                 p.update(sched=K.decg_fp8_sched(), pk8=pk8)
+            for knob, default in (("group_rows", 4), ("wg_waves", 4)):
+                if kw.get(knob, default) != default:
+                    p[knob] = kw[knob]
             return "qsa.page4.decg.v1", p
         if kind == "wmma":
             rpb, k_load = a[1], a[2]
@@ -778,9 +1452,14 @@ class Dispatch(Env):
                 return "qsa.page4.r32_persist.v1", {"k_load": "tdm", "rows_per_block": 32,
                                                     "persist_cols": K.TDM_PERSIST_CHUNKS,
                                                     "buffers": K.TDM_PERSIST_BUFFERS}
+            if k_load == "ktile":
+                return "qsa.page4.r32_kt.v1", ktile({"k_load": "tdm", "rows_per_block": 32})
             return f"qsa.page4.r{rpb}.v1", {"k_load": k_load, "rows_per_block": rpb}
         if kind == "wmma_fp8":
             rpb, k_load = a[1], a[2]
+            if k_load == "ktile":
+                return "qsa.page4.r32_kt_fp8.v1", ktile(
+                    {"k_load": "tdm", "rows_per_block": 32, "cvt": K._FP8_CVT, "pk8": pk8})
             if rpb == 32:
                 return "qsa.page4.r32_fp8.v1", {"k_load": k_load, "rows_per_block": 32,
                                                 "cvt": K._FP8_CVT, "pk8": pk8}
@@ -806,9 +1485,13 @@ class Dispatch(Env):
                 with self.assertRaises(API.QSAIndexScorerUnsupported):
                     API.qsa_paged_mqa_logits(*args, profile=self.profile)
                 self.assertEqual(self.runs, [], row.cell)
+                # the sweep path checks the row itself: unbucketed (buckets are ON by
+                # default since R2E and allow_unverified admits non-pass buckets)
                 (logits, vis), d = API.try_qsa_paged_mqa_logits(*args, profile=self.profile,
-                                                                allow_unverified=True)
+                                                                allow_unverified=True,
+                                                                buckets=False)
                 self.assertTrue(d.ok, row.cell)
+                self.assertEqual(d.cell, row.cell)
             self.assertEqual(len(self.kinds), 1, row.cell)
             self.assertEqual(len(self.runs), 1, row.cell)
             kind, a, kw = self.kinds[0]
@@ -824,10 +1507,50 @@ class Dispatch(Env):
             n += 1
         self.assertEqual(n, len(prof.rows))
         self.assertGreaterEqual(n, 20)
-        self.assertGreaterEqual(n_ver, 9)   # bf16 Phase-1 rows (ISA identity) + GPU-restamped
+        # GPU-restamped rows carried by ISA identity; R2E: the 4 bf16 prefill rows (ktile
+        # re-route / persist ISA change) and the 2 fp8 draft rows (wg_waves 2) are pending
+        self.assertEqual(n_ver, sum(r.verified for r in prof.rows))
+        self.assertGreaterEqual(n_ver, 14)
+
+    def test_rule_samples_dispatch_their_variant(self):
+        """Rule samples (allow_unverified sweep path) launch exactly the rule's variant."""
+        prof = PR.load_profile(PR.DEFAULT_PROFILE)
+        n = 0
+        for rule in prof.rules:
+            small = [s for s in rule.raw["samples"]
+                     if s["rows"] * s["columns"] <= 1 << 22 and s["requests"] * s["table_width"] <= 1 << 22]
+            self.assertTrue(small, rule.id)
+            if PR.page_of(rule.raw) not in API.kernel_page_sizes(K):
+                # R2: page 8 before the page-8 kernel: refused statically, nothing launched
+                s = small[0]
+                args = call_args(rows=s["rows"], requests=s["requests"], width=s["table_width"],
+                                 columns=s["columns"], fmt=rule.raw["cache_dtype"],
+                                 page=PR.page_of(rule.raw))
+                out, d = API.try_qsa_paged_mqa_logits(*args, profile=self.profile,
+                                                      allow_unverified=True, buckets=False)
+                self.assertIsNone(out)
+                self.assertEqual(d.reason, PR.Reason.CACHE_SHAPE, (rule.id, d))
+                continue
+            for s in small[:6]:
+                args = call_args(rows=s["rows"], requests=s["requests"], width=s["table_width"],
+                                 columns=s["columns"], fmt=rule.raw["cache_dtype"],
+                                 page=PR.page_of(rule.raw))
+                self.kinds.clear(); self.runs.clear()
+                (logits, vis), d = API.try_qsa_paged_mqa_logits(*args, profile=self.profile,
+                                                                allow_unverified=True,
+                                                                buckets=False)
+                self.assertTrue(d.ok, (rule.id, s, d))
+                # the rule itself, or an exact row (precedence) -- never a bucket / other rule
+                self.assertTrue(d.cell == f"rule:{rule.id}"
+                                or not d.cell.startswith(("rule:", "bucket:")), (rule.id, s, d))
+                kind, a, kw = self.kinds[0]
+                self.assertEqual(self._vid(kind, a, kw), (rule.vid, dict(rule.params)), (rule.id, s))
+                self.assertEqual(tuple(logits.shape), (s["rows"], s["columns"]))
+                n += 1
+        self.assertGreaterEqual(n, 20)
 
     def test_try_and_raise(self):
-        args = call_args(columns=4096)
+        args = call_args(columns=1000)
         with self.assertRaises(API.QSAIndexScorerUnsupported) as cm:
             API.qsa_paged_mqa_logits(*args, profile=self.profile)
         self.assertEqual(cm.exception.reason, PR.Reason.COLUMNS)
@@ -855,11 +1578,335 @@ class Dispatch(Env):
         self.assertEqual(o8.data_ptr(), lg8.data_ptr())
 
 
+def _pass_call_classes(prof, per_rule=3):
+    """(label, call_args kwargs) for every pass row and a few small samples per pass rule."""
+    out = []
+    for row in prof.rows:
+        if row.verified:
+            r = row.raw
+            out.append((row.cell, dict(rows=r["rows"]["min"], requests=r["requests"]["min"],
+                                       width=r["table_width"], columns=r["columns"],
+                                       fmt=r["cache_dtype"], page=PR.page_of(r))))
+    for rule in prof.rules:
+        if not rule.verified:
+            continue
+        small = [s for s in rule.raw["samples"]
+                 if s["rows"] * s["columns"] <= 1 << 22 and s["requests"] * s["table_width"] <= 1 << 22]
+        for s in small[:per_rule]:
+            # R2E: page-8/16 rules pass via the d438 restamp chain -> their own page size
+            out.append((rule.cell, dict(rows=s["rows"], requests=s["requests"],
+                                        width=s["table_width"], columns=s["columns"],
+                                        fmt=rule.raw["cache_dtype"],
+                                        page=PR.page_of(rule.raw))))
+    return out
+
+
+class Launch(_Stubs):
+    """API 1.1 ``launch``: same launch as the 1.0 path / kernel wrapper, no ``decide``."""
+
+    def _calls(self, fn):
+        self.kinds.clear(); self.runs.clear()
+        out = fn()
+        self.assertEqual(len(self.runs), 1)
+        return out, list(self.kinds), self.runs[0]
+
+    def _same_launch(self, ref, got, caller_ptrs, label):
+        (ref_out, _, (ref_l, ref_a)), (out, _, (l, a)) = ref, got
+        # same builder + same (args, kwargs) => same lru_cache entry / compiled function
+        self.assertEqual((ref_l.kind, ref_l.build_args), (l.kind, l.build_args), label)
+        self.assertEqual(len(ref_a), len(a), label)
+        g = next(i for i, x in enumerate(ref_a) if isinstance(x, int))   # grid_x position
+        outputs = range(g - 3, g)                                        # logits, visible, starts
+        for i, (x, y) in enumerate(zip(ref_a, a)):
+            self.assertIs(type(x), type(y), (label, i))
+            if isinstance(x, torch.Tensor):
+                self.assertEqual((tuple(x.shape), tuple(x.stride()), x.dtype, x.device),
+                                 (tuple(y.shape), tuple(y.stride()), y.dtype, y.device), (label, i))
+                if x.data_ptr() in caller_ptrs:
+                    self.assertEqual(x.data_ptr(), y.data_ptr(), (label, i))
+                elif i not in outputs:      # narrowed int64 metadata: fresh tensors, same values
+                    self.assertTrue(torch.equal(x, y), (label, i))
+            else:
+                self.assertEqual(x, y, (label, i))
+        self.assertEqual(tuple(ref_out[0].shape), tuple(out[0].shape), label)
+        self.assertEqual(tuple(ref_out[1].shape), tuple(out[1].shape), label)
+
+    def test_launch_matches_wrapper_and_op_for_every_pass_class(self):
+        prof = PR.load_profile(PR.DEFAULT_PROFILE)
+        classes = _pass_call_classes(prof)
+        self.assertGreaterEqual(len(classes), 20)
+        n = 0
+        for label, spec in classes:
+            for qp64 in (True, False):
+                for meta64 in (False, True):
+                    args = call_args(qp64=qp64, **spec)
+                    if meta64:
+                        args[2], args[3], args[5] = (args[2].long(), args[3].long(),
+                                                     args[5].long())
+                    rows, cols = spec["rows"], spec["columns"]
+                    lg = torch.empty(rows, cols)
+                    vg = torch.empty(rows, dtype=torch.int32)
+                    args[9] = torch.full((rows,), 7, dtype=torch.int32)
+                    caller = {t.data_ptr() for t in args if isinstance(t, torch.Tensor)}
+                    caller |= {lg.data_ptr(), vg.data_ptr()}
+                    d = self.decide(args, logits=lg, visible_groups=vg)
+                    self.assertTrue(d.ok, (label, d))
+                    a = args
+                    ref = self._calls(lambda: API._launch(
+                        None, a[0], a[1], a[2], a[3], a[4], a[5], a[7], a[8], a[9], a[11],
+                        lg, vg))
+                    op = self._calls(lambda: API.qsa_paged_mqa_logits(
+                        *a, logits=lg, visible_groups=vg, profile=self.profile))
+                    with mock.patch.object(API, "decide", side_effect=AssertionError("decide")), \
+                            mock.patch.object(PR, "match", side_effect=AssertionError("match")), \
+                            mock.patch.object(API, "_static_decision",
+                                              side_effect=AssertionError("static")), \
+                            mock.patch.object(K, "qsa_paged_mqa_logits_page4",
+                                              side_effect=AssertionError("wrapper")):
+                        got = self._calls(lambda: API.launch(d, *a, logits=lg, visible_groups=vg))
+                    self._same_launch(ref, got, caller, (label, qp64, meta64))
+                    self._same_launch(op, got, caller, (label, qp64, meta64, "op"))
+                    self.assertEqual(got[0][0].data_ptr(), lg.data_ptr())
+                    self.assertEqual(got[0][1].data_ptr(), vg.data_ptr())
+                    # pos64 specialization iff int64 positions
+                    self.assertEqual(got[1][-1][2].get("pos64", False), qp64, label)
+                    n += 1
+        self.assertGreaterEqual(n, 80)
+
+    def test_launch_allocates_outputs_like_the_wrapper(self):
+        # R2E: the bf16 r512q2 prefill row is pending (persist ISA changed); the fp8 one
+        # (r32 fp8 at 65536 columns) is a pass prefill row
+        for spec in (dict(rows=16, requests=16), dict(rows=64, requests=16),
+                     dict(rows=512, requests=2, width=16384, columns=65536, fmt="fp8")):
+            args = call_args(**spec)
+            d = self.decide(args)
+            self.assertTrue(d.ok, d)
+            ref = self._calls(lambda: API._launch(None, args[0], args[1], args[2], args[3],
+                                                  args[4], args[5], None, args[8], None,
+                                                  args[11], None, None))
+            with mock.patch.object(API, "decide", side_effect=AssertionError("decide")):
+                got = self._calls(lambda: API.launch(d, *args))
+            caller = {t.data_ptr() for t in args if isinstance(t, torch.Tensor)}
+            self._same_launch(ref, got, caller, spec)
+            logits, vis = got[0]
+            self.assertEqual((logits.dtype, tuple(logits.shape), vis.dtype, tuple(vis.shape)),
+                             (torch.float32, (spec["rows"], args[8]), torch.int32,
+                              (spec["rows"],)))
+
+    def test_plan_is_reused_and_builder_called_once_per_pos_dtype(self):
+        args = call_args(rows=64, requests=16)
+        d = self.decide(args)
+        for _ in range(3):
+            API.launch(d, *args)
+        self.assertEqual(len(self.runs), 3)
+        self.assertEqual(len(self.kinds), 1)            # built once (pos64)
+        args32 = call_args(rows=64, requests=16, qp64=False)
+        API.launch(d, *args32)
+        API.launch(d, *args32)
+        self.assertEqual(len(self.kinds), 2)            # + the int32-position build
+        self.assertEqual([kw.get("pos64", False) for _, _, kw in self.kinds], [True, False])
+
+    def test_guards(self):
+        args = call_args(rows=16, requests=16)
+        d = self.decide(args)
+        self.assertTrue(d.ok)
+        bad = self.decide(call_args(columns=1000))
+        with self.assertRaises(API.QSAIndexScorerUnsupported) as cm:
+            API.launch(bad, *args)
+        self.assertIs(cm.exception.decision, bad)
+        self.assertEqual(cm.exception.reason, PR.Reason.COLUMNS)
+        q32 = list(args)
+        q32[0] = args[0].float()
+        with self.assertRaises(API.QSAIndexScorerUnsupported) as cm:
+            API.launch(d, *q32)
+        self.assertEqual(cm.exception.reason, PR.Reason.Q_DTYPE)
+        for other in (call_args(rows=32, requests=16), call_args(rows=16, requests=16, width=8192),
+                      call_args(rows=16, requests=16, fmt="fp8")):
+            with self.assertRaises(API.QSAIndexScorerUnsupported) as cm:
+                API.launch(d, *other)
+            self.assertEqual(cm.exception.reason, PR.Reason.ROUTE_MISMATCH)
+        with self.assertRaises(API.QSAIndexScorerUnsupported) as cm:
+            API.launch(API.Decision(True, PR.Reason.OK, profile=self.profile), *args)
+        self.assertEqual(cm.exception.reason, PR.Reason.PROFILE_KERNEL_MISMATCH)
+        with self.assertRaises(API.QSAIndexScorerUnsupported):
+            API.launch(None, *args)
+        with mock.patch.object(API, "_KERNEL", types.SimpleNamespace()):   # kernel re-imported
+            with self.assertRaises(API.QSAIndexScorerUnsupported) as cm:
+                API.launch(d, *args)
+            self.assertEqual(cm.exception.reason, PR.Reason.PROFILE_KERNEL_MISMATCH)
+        PR.clear_cache()                                                   # profile reloaded
+        with self.assertRaises(API.QSAIndexScorerUnsupported) as cm:
+            API.launch(d, *args)
+        self.assertEqual(cm.exception.reason, PR.Reason.PROFILE_KERNEL_MISMATCH)
+        self.assertEqual(self.runs, [])
+        d2 = self.decide(args)                                             # fresh decide works
+        API.launch(d2, *args)
+        self.assertEqual(len(self.runs), 1)
+
+    def test_launch_reads_no_environment(self):
+        args = call_args(rows=64, requests=16)
+        d = self.decide(args)
+
+        class _NoEnv(dict):
+            def get(self, *a, **k):
+                raise AssertionError("env read")
+            __getitem__ = get
+
+        # R2: the first launch of a launcher through a decision may scope the persistent
+        # compile-cache directory (reads/sets FLYDSL_RUNTIME_CACHE_DIR once); every later
+        # launch reads no environment.
+        API.launch(d, *args)
+        with mock.patch.object(os, "environ", _NoEnv()):
+            API.launch(d, *args)
+            API.launch(d, *args)
+        self.assertEqual(len(self.runs), 3)
+
+    def test_try_uses_shared_path_without_inspect(self):
+        args = call_args(rows=16, requests=16)
+        with mock.patch.object(inspect, "signature", side_effect=AssertionError("inspect")):
+            (lg, vg), d = API.try_qsa_paged_mqa_logits(*args, profile=self.profile)
+        self.assertTrue(d.ok)
+        self.assertEqual(len(self.runs), 1)
+
+
+class Prewarm(_Stubs):
+    """API 1.1 ``prewarm``: every pass variant, both position dtypes, idempotent."""
+
+    def setUp(self):
+        super().setUp()
+        self._w = [mock.patch.dict(API._PREWARMED, clear=True),
+                   mock.patch.object(torch.cuda, "synchronize",
+                                     side_effect=AssertionError("cuda sync on cpu"))]
+        for p in self._w:
+            p.start()
+
+    def tearDown(self):
+        for p in reversed(self._w):
+            p.stop()
+        super().tearDown()
+
+    def _expected(self, dtypes, pos=("i32", "i64")):
+        prof = PR.load_profile(PR.DEFAULT_PROFILE)
+        tags = set()
+        for r in [*prof.rows, *prof.rules]:
+            if r.verified and r.raw["cache_dtype"] in dtypes:
+                for p in pos:
+                    tags.add(f"{r.vid}/{r.raw['cache_dtype']}/{p}")
+        return sorted(tags)
+
+    def _expected_builds(self, dtypes, pos=("i32", "i64")):
+        """Distinct (tag, params) builds: every pass row / rule / bucket variant (a pass
+        kernel-native group bucket adds its group_rows 3 decode-group build)."""
+        prof = PR.load_profile(PR.DEFAULT_PROFILE)
+        out = set()
+        for r in [*prof.rows, *prof.rules, *prof.buckets]:
+            if r.verified and r.raw["cache_dtype"] in dtypes:
+                for p in pos:
+                    out.add((f"{r.vid}/{r.raw['cache_dtype']}/{p}",
+                             tuple(sorted(dict(r.params).items()))))
+        return out
+
+    def test_variants_are_the_union_of_pass_rows_and_rules(self):
+        got = API.prewarm(self.profile, cache_dtypes=("bf16", "fp8"), device="cpu")
+        want = self._expected(("bf16", "fp8"))
+        self.assertEqual(got, want)
+        # R2E: page 4/8/16 x (bf16 draft/decg/r16 + fp8 decg/r16_fp8/r32_fp8) x 2 pos dtypes;
+        # pending: every bf16 prefill variant (ktile re-route / persist ISA change), fp8
+        # ktile and the fp8 draft wg_waves 2 build
+        self.assertEqual(len(want), 36)
+        self.assertFalse(any(v in t for t in want for v in
+                             (".r32_kt", ".r32_persist", ".draft.v1/fp8")))
+        builds = self._expected_builds(("bf16", "fp8"))
+        self.assertEqual(len(builds), 42)           # + 3 pages x 2 pos bf16 g3 decode groups
+        self.assertEqual(len(self.runs), len(builds))  # one private launch each (FlyDSL JIT)
+        built = {(k, a, tuple(sorted(kw.items()))) for k, a, kw in self.kinds}
+        self.assertEqual(len(built), len(builds))
+        vids = {Dispatch._vid(k, a, kw)[0] for k, a, kw in self.kinds}
+        self.assertEqual(vids, {t.split("/")[0] for t in want})
+        self.assertEqual(sum(kw.get("group_rows") == 3 for _, _, kw in self.kinds), 6)
+        # pending-only variants and fp8 are not built by default
+        self.kinds.clear(); self.runs.clear()
+        API._PREWARMED.clear()
+        self.assertEqual(API.prewarm(self.profile, device="cpu"), self._expected(("bf16",)))
+        self.assertTrue(all("/bf16/" in t for t in self._expected(("bf16",))))
+        self.assertEqual(len(self.runs), len(self._expected_builds(("bf16",))))
+        self.assertEqual(len(self.runs), 24)
+
+    def test_builds_exactly_what_real_calls_build(self):
+        """The builder (args, kwargs) of every pass call class == a prewarmed lru_cache key."""
+        API.prewarm(self.profile, cache_dtypes=("bf16", "fp8"), device="cpu")
+        warmed = {(k, a, tuple(sorted(kw.items()))) for k, a, kw in self.kinds}
+        prof = PR.load_profile(PR.DEFAULT_PROFILE)
+        for label, spec in _pass_call_classes(prof):
+            for qp64 in (True, False):
+                self.kinds.clear()
+                API.qsa_paged_mqa_logits(*call_args(qp64=qp64, **spec), profile=self.profile)
+                k, a, kw = self.kinds[-1]
+                self.assertIn((k, a, tuple(sorted(kw.items()))), warmed, (label, qp64))
+
+    def test_idempotent(self):
+        first = API.prewarm(self.profile, device="cpu")
+        n_runs, n_builds = len(self.runs), len(self.kinds)
+        self.assertEqual(API.prewarm(self.profile, device="cpu"), first)
+        self.assertEqual((len(self.runs), len(self.kinds)), (n_runs, n_builds))
+        # one entry per distinct build (tag + params: a g3 bucket shares the decg tag)
+        self.assertEqual(len(API._PREWARMED), n_builds)
+        self.assertEqual({(k[3], k[4]) for k in API._PREWARMED},
+                         self._expected_builds(("bf16",)))
+        self.assertEqual(sorted({k[3] for k in API._PREWARMED}), first)
+        self.assertTrue(all(v >= 0 for v in API._PREWARMED.values()))
+
+    def test_pos_dtypes(self):
+        got = API.prewarm(self.profile, pos_dtypes=(torch.int32,), device="cpu")
+        self.assertEqual(got, self._expected(("bf16",), ("i32",)))
+        self.assertTrue(all(kw.get("pos64", False) is False for _, _, kw in self.kinds))
+        n32 = len(self.kinds)
+        self.assertEqual(n32, len(self._expected_builds(("bf16",), ("i32",))))
+        got = API.prewarm(self.profile, pos_dtypes=(torch.int64,), device="cpu")
+        self.assertEqual(got, self._expected(("bf16",), ("i64",)))
+        # the int64 builds differ from the int32 ones by exactly pos64=True
+        k64 = self.kinds[n32:]
+        self.assertEqual(len(k64), n32)
+        self.assertTrue(all(kw.get("pos64") is True for _, _, kw in k64))
+        self.assertEqual(
+            sorted(repr((k, a, sorted(kw.items()))) for k, a, kw in self.kinds[:n32]),
+            sorted(repr((k, a, sorted((x, y) for x, y in kw.items() if x != "pos64")))
+                   for k, a, kw in k64))
+        with self.assertRaises(ValueError):
+            API.prewarm(self.profile, pos_dtypes=(torch.int16,), device="cpu")
+
+    def test_dummy_launch_is_private_and_routed(self):
+        API.prewarm(self.profile, cache_dtypes=("bf16", "fp8"), device="cpu")
+        self.assertEqual(len(self.runs), len(self.kinds))
+        for (launch, a), (kind, ba, kw) in zip(self.runs, self.kinds):
+            rows, columns = a[-6], a[-5]
+            vid, params = Dispatch._vid(kind, ba, kw)
+            if ".r32_persist." in vid or ".r32_fp8." in vid:
+                # R2E: persist / r32 fp8 are routed only above 2048 columns
+                self.assertEqual((rows, columns), (32, 4096), vid)
+            elif params.get("col_tiles") == 4:
+                self.assertEqual(rows, 2080, vid)    # fp8 ktile C4 = the rows > 2048 band
+            else:
+                self.assertLessEqual(rows, 32, vid)
+                self.assertLessEqual(columns, 512, vid)
+
+    def test_off_or_uncovered_device_builds_nothing(self):
+        with mock.patch.object(API, "_load_kernel", side_effect=AssertionError("kernel import")):
+            self.assertEqual(API.prewarm(None, device="cpu"), [])
+            self.assertEqual(API.prewarm("no_such_profile", device="cpu"), [])
+        with mock.patch.object(API, "_device_info", lambda dev: ("gfx950", 256)):
+            self.assertEqual(API.prewarm(self.profile, device="cpu"), [])
+        with mock.patch.object(API, "_ALLOWED_DEVICE_TYPES", ("cuda",)):
+            self.assertEqual(API.prewarm(self.profile, device="cpu"), [])
+        self.assertEqual((self.runs, self.kinds), ([], []))
+
+
 class Scripts(unittest.TestCase):
     def test_written_scripts_compile(self):
         for rel in ("op_tests/test_qsa_index_scorer.py",
                     "op_tests/op_benchmarks/qsa_index_scorer/perf_qsa_index_scorer.py",
                     "op_tests/op_benchmarks/qsa_index_scorer/isa_audit_qsa_index_scorer.py",
+                    "op_tests/op_benchmarks/qsa_index_scorer/zero_overhead_qsa_index_scorer.py",
                     "aiter/ops/qsa_index_scorer/gen_profile.py"):
             with open(os.path.join(ROOT, rel), encoding="utf-8") as fh:
                 compile(fh.read(), rel, "exec")

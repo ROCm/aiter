@@ -9,7 +9,7 @@ with the default profile and is compared against the **frozen golden**
 plus: ``visible_groups`` exact, no NaN, every element outside the mask
 bit-identical to the golden ``-inf``, ``row_starts`` zero-filled, caller
 outputs used in place, inputs untouched, int32 vs int64 metadata bit-identical,
-CUDA-graph replay bit-identical to eager, profile rows re-checked, and fused vs
+CUDA-graph replay bit-identical to eager, profile rows + range-rule samples re-checked, and fused vs
 the frozen ATOM native scorer on identical inputs (same comparator).
 
     QSA_GOLDEN_DIR=/work/task/MI455_QSA_INDEX_SCORER/golden_baseline \
@@ -196,6 +196,20 @@ def run_case(name, spec):
                                         d["compressed_k_scale"], profile=PROFILE)
     checks["int32_bitwise"] = bool(torch.equal(o32.view(torch.int32), out.view(torch.int32))
                                    and torch.equal(v32, vis))
+    # API 1.1: launch(decision) (no decide) and the kernel wrapper itself (pre-1.1 launch
+    # path) are bit-identical to the public op
+    ll = torch.full_like(lg, 777.0)
+    lv = torch.full_like(vg, -9)
+    lrs = torch.full_like(rs, 5)
+    lo, lvo = API.launch(dec, *args_of(d), 4, None, cols, lrs, False, d["compressed_k_scale"],
+                         logits=ll, visible_groups=lv)
+    wo, wv = API._launch(None, *args_of(d), None, cols, None, d["compressed_k_scale"], None, None)
+    torch.cuda.synchronize()
+    checks["launch_bitwise"] = bool(lo.data_ptr() == ll.data_ptr()
+                                    and torch.equal(lo.view(torch.int32), out.view(torch.int32))
+                                    and torch.equal(lvo, vis) and bool((lrs == 0).all()))
+    checks["wrapper_bitwise"] = bool(torch.equal(wo.view(torch.int32), out.view(torch.int32))
+                                     and torch.equal(wv, vis))
     # CUDA-graph capture/replay == eager, bitwise
     gl = torch.empty_like(out)
     gv = torch.empty_like(vis)
@@ -233,6 +247,29 @@ def run_profile_rows():
     return out
 
 
+def run_profile_rules(all_samples: bool = False):
+    """Re-check range rules through the public API: every sample with --all-rule-samples,
+    else per rule the first/last bounds sample + up to 4 evenly spaced captured samples."""
+    out = []
+    for rule in API.P.load_profile(PROFILE).data.get("rules") or []:
+        status = rule["golden"]["status"]
+        if status != "pass" and not ALLOW_UNVERIFIED:
+            continue
+        samples = rule["samples"]
+        if not all_samples:
+            b = [s for s in samples if s["source"] == "bounds"]
+            c = [s for s in samples if s["source"] != "bounds"]
+            c = [c[i * len(c) // 4] for i in range(min(4, len(c)))]
+            samples = ([b[0], b[-1]] if b else []) + c
+        for s in samples:
+            rec = GEN.check_sample(rule, s, API, G, S, profile=PROFILE)
+            out.append({"name": f"rule:{rule['id']}:r{s['rows']}q{s['requests']}c{s['columns']}"
+                                f"w{s['table_width']}", "passed": bool(rec.pop("pass_")),
+                        "profile_status": status, **rec})
+            torch.cuda.empty_cache()
+    return out
+
+
 def run_vs_atom():
     """Fused vs frozen ATOM native on identical inputs (prefill fp8: ATOM default aborts)."""
     import qsa_baseline as QB
@@ -262,6 +299,8 @@ def main(argv=None) -> int:
     ap.add_argument("-k", default="")
     ap.add_argument("--json")
     ap.add_argument("--skip-atom", action="store_true")
+    ap.add_argument("--all-rule-samples", action="store_true",
+                    help="re-check every range-rule sample (default: corners + 4 captured)")
     ap.add_argument("--allow-unverified", action="store_true",
                     help="serve + check pending profile rows too (before `gen_profile check` restamps)")
     a = ap.parse_args(argv)
@@ -285,6 +324,7 @@ def main(argv=None) -> int:
         torch.cuda.empty_cache()
     if not a.k:
         recs += run_profile_rows()
+        recs += run_profile_rules(a.all_rule_samples)
         if not a.skip_atom:
             recs += run_vs_atom()
     bad = [r["name"] for r in recs if not r["passed"]]

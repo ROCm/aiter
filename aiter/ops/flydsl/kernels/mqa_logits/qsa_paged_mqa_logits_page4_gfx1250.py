@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""QSA index scorer (paged MQA logits), compressed page = 4, gfx1250 â€” **v0 baseline**.
+"""QSA index scorer (paged MQA logits), compressed page = 4, gfx1250 Ã¢â‚¬â€ **v0 baseline**.
 
 Contract (frozen; see ``analysis/QSA_index_scorer_dtype_contract.md`` and
 ``golden_baseline/qsa_golden.py``)::
@@ -24,7 +24,7 @@ workgroup is one query row x ``THREADS`` consecutive columns; a page (4
 consecutive compressed columns, 1 KiB bf16 / 512 B fp8 + 16 B scale) is
 contiguous, so a thread's 4 page-mates are four independent 256 B / 128 B
 reads inside one contiguous 1 KiB / 512 B block.  Every thread re-reads its Q
-row and its key row from L1 â€” deliberately untuned.  See
+row and its key row from L1 Ã¢â‚¬â€ deliberately untuned.  See
 ``records/g2/v0-manifest.json`` for the first-look latency (exploratory, not
 evidence).
 
@@ -46,7 +46,7 @@ successfully: its first dispatch attempt on d07-2 wedged the device and left
 in dmesg (see ``records/g2/builder2-log.md``).  That address is *exactly* what a
 non-dropped ``base + 0x7FFFFFFF`` looks like: the page start is
 ``0x1ff000`` mod 2 MiB and the implied base ``0x16b76000000`` is 2 MiB aligned,
-i.e. a device allocation â€” so v0's masked stores were **not** being dropped by
+i.e. a device allocation Ã¢â‚¬â€ so v0's masked stores were **not** being dropped by
 the V# bounds check on this toolchain.  Three changes remove that dependency:
 
 1. every ``logits``/``visible_groups``/``row_starts`` store is now *predicated*
@@ -62,7 +62,7 @@ the V# bounds check on this toolchain.  Three changes remove that dependency:
    metadata.
 
 The V# extents stay: they are the second line of defence (loads zero-fill,
-stores drop) for anything that still slips through â€” but see the OOB_SELECT note
+stores drop) for anything that still slips through Ã¢â‚¬â€ but see the OOB_SELECT note
 in the access-layer block: on RDNA (gfx1250) the V# check is *not* the
 drop-everything net it is on CDNA, so it must never be the mechanism that keeps
 an address in bounds.
@@ -71,7 +71,7 @@ GPU-hang revision (G2 builder #3, 2026-10-31).  The ``6c272c3c`` build above was
 dispatched once, on d01-3 (single gfx1250, 256 CU): the launch itself returned
 (0.8 s), then ``torch.cuda.synchronize()`` never returned, the device stayed
 100 % busy, and ``dmesg`` showed ``MES(0, 0) failed to respond to
-msg=REMOVE_QUEUE`` / ``Failed to evict queue 1`` / ``Failed to quiesce KFD`` â€” a
+msg=REMOVE_QUEUE`` / ``Failed to evict queue 1`` / ``Failed to quiesce KFD`` Ã¢â‚¬â€ a
 firmware-level queue hang, no ``VM_PAGE_FAULT`` (so no address left its buffer:
 the address arithmetic is not the suspect).  The one layer of this file with no
 gfx1250 precedent in the tree is the global access layer (see that block), so
@@ -83,7 +83,7 @@ behind ``QSA_G2_ACCESS=cop`` for the bisect ladder
 observable at the op boundary changes: same planes, same extents, same byte
 addresses, same predicates, same values.
 
-Round C (opt-c, 2026-10-31): the **bf16** cache now runs on the matrix core â€”
+Round C (opt-c, 2026-10-31): the **bf16** cache now runs on the matrix core Ã¢â‚¬â€
 ``_build_wmma_kernel``, gfx1250 WMMA 16x16x32 bf16 -> f32, one wave = 4 query
 rows x 4 heads (M = 16) x 64 columns, Q fragments in VGPRs, K fragments loaded
 straight from the paged cache, request-dedup passes and an early -inf exit for
@@ -93,7 +93,7 @@ MFMA on gfx1250).  The **fp8** cache keeps the v0 scalar kernel unchanged, and
 ``QSA_BF16_PATH=scalar`` routes bf16 back to it.  Same public API, same
 outputs, same safety contract (predicated + clamped stores, i64 extents).
 
-Round G (opt-g, 2026-10-31): the **fp8** cache runs on the matrix core too â€”
+Round G (opt-g, 2026-10-31): the **fp8** cache runs on the matrix core too Ã¢â‚¬â€
 ``_build_wmma_fp8_kernel``: the bf16 WMMA kernel with B fragments built from
 E4M3 bytes converted *exactly* to bf16 in registers and the per-token fp32 scale
 applied after the GEMM (in the scalar fp8 kernel's order).  ``_build_wmma_kernel``
@@ -151,12 +151,33 @@ kernels the default: ``QSA_DRAFT_PATH=1`` (rows <= requests -> one-row-per-wave
 draft kernel, TDM K, 32-column wave slabs; ``0`` restores champion routing) and
 ``QSA_R16_NOBAR=1`` (barrier-free wave-private bf16 r16 TDM; ``0`` restores the
 barriered kernel). Both also have pos64 variants.
+ROUND-PAGE16: the index page P is a compile-time builder parameter
+(``page_size``, P in {4, 16}; KV block 16 -> 4, KV block 64 -> 16). The wrapper
+reads P from the cache shape ``[pages, P, 1, 128]`` (other P raise), column c
+reads ``page_table[req, c // P]`` row ``c % P`` and visibility still divides by
+the compress ratio 4. P = 4 builds pass no new keyword and keep every TDM site's
+code verbatim (``if P == 4`` trace-time branches): byte-identical ISA to bf492262.
+P = 16: every 8-row TDM gather group (32-bit indices: 8 rows per instruction,
+kernel-wiki mi400-tdm-programming) lies inside one 16-row page, so a page is two
+gathers sharing one SGPR page-table lookup each (P = 4: two lookups per gather);
+the padded LDS tiles (272 B / 144 B pitch, column c -> tile row c % tile) and
+hence the conflict-free WMMA B reads (mi400-pattern-lds-conflicts) are
+unchanged, as are TENSORcnt / barrier publication (mi400-tdm-sync). Raw and
+scalar paths use ``phys * P * row_bytes + (c % P) * row_bytes``.
+ROUND-R2: P = 8 (KV block 32): a page is 8 contiguous rows = exactly ONE 8-row
+TDM gather (32-bit indices, mi400-tdm-programming) fed by ONE page-table
+s_buffer_load (P = 4: two per gather, P = 16: one per half page); new ``else``
+(P = 8) branches only -- the P = 4 / P = 16 branches are verbatim (ISA identity
+vs 536667d5). Decode-group knobs ``group_rows`` (3 = MTP verify, 3 rows per
+request), ``row_mode`` (dedup / pad: padded rows get no stores) and
+``wg_waves`` (draft + decode group, short contexts); defaults unchanged.
 """
 
 from __future__ import annotations
 
 import math
 import os
+import re
 from functools import lru_cache
 
 import flydsl.compiler as flyc
@@ -167,6 +188,12 @@ from flydsl.expr import range_constexpr
 Vec = fx.Vector
 
 PAGE_SIZE = 4          # compressed rows per index-cache page (= KV block 16 / ratio 4)
+# ROUND-PAGE16: the index page P is a compile-time builder parameter. P = 4
+# (KV block 16) is the default and every P = 4 specialization is byte-identical
+# ISA to bf492262; P = 16 (KV block 64) is the second supported geometry.
+# The visibility divisor is the *compress ratio* (always 4), never P.
+COMPRESS_RATIO = 4
+SUPPORTED_PAGE_SIZES = (4, 8, 16)   # ROUND-R2: + P = 8 (KV block 32)
 NUM_HEADS = 4          # index heads
 HEAD_DIM = 128         # index head dim
 DIM_PER_STEP = 8       # head dims consumed per unrolled step (16 B of Q)
@@ -178,6 +205,14 @@ _NEG_INF = float("-inf")
 # instead of allowing it.
 _MIN_DESC_BYTES = 4
 _ELEM_BYTES = {fx.Int8: 1, fx.Int32: 4, fx.Float32: 4, fx.BFloat16: 2}
+
+
+def _check_page_size(page_size) -> int:
+    """Trace-time page geometry guard shared by every builder (ROUND-PAGE16)."""
+    p = int(page_size)
+    if p not in SUPPORTED_PAGE_SIZES:
+        raise ValueError(f"index page size must be one of {SUPPORTED_PAGE_SIZES}, got {page_size}")
+    return p
 
 
 def _imin(a, b):
@@ -203,7 +238,7 @@ def _imax(a, b):
 #                  BYTES, not elements") and the pinned-descriptor form of
 #                  ``.../moe_gemm_2stage/gfx9_fp8/gemm2_1x4.py:353-383``.
 #   cop            ``make_copy_atom(BufferCopy(nbytes*8), Int8)`` +
-#                  ``copy_atom_call`` through a per-access ``make_view`` â€” what
+#                  ``copy_atom_call`` through a per-access ``make_view`` Ã¢â‚¬â€ what
 #                  commit ``6c272c3c`` shipped, and what the first real dispatch
 #                  of this kernel hung the GPU with (``records/g2/
 #                  builder3-log.md``).  It is the only construct in this file
@@ -225,12 +260,12 @@ def _imax(a, b):
 #
 # Both layers keep the ``6c272c3c`` address guarantees: the descriptor extent is
 # the true plane size (i64, at least one dword), every offset is clamped in
-# bounds, and stores stay **predicated** â€” never steered at a sentinel byte
+# bounds, and stores stay **predicated** Ã¢â‚¬â€ never steered at a sentinel byte
 # offset.  That last point is not stylistic: on RDNA the V# OOB check is not the
 # drop-everything net it is on CDNA (``buffer_ops._get_buffer_flags`` sets
 # OOB_SELECT=2, "no bounds checking", for ``is_rdna_arch``, and gfx1250 is RDNA),
 # which is exactly what the d07-2 ``VM_PAGE_FAULT`` at ``base + 0x7FFFFFFF``
-# says.  See ``records/g2/builder2-log.md`` Â§2.
+# says.  See ``records/g2/builder2-log.md`` Ã‚Â§2.
 _ACCESS = os.environ.get("QSA_G2_ACCESS", "raw").strip().lower()
 if _ACCESS not in ("raw", "cop"):
     raise ValueError(f"QSA_G2_ACCESS must be 'raw' or 'cop', got {_ACCESS!r}")
@@ -256,7 +291,7 @@ def _plane(tensor, num_bytes):
 
     ``num_bytes`` is the descriptor's ``num_records``: loads past it are
     zero-filled and stores past it dropped by hardware that implements the
-    check (see the OOB_SELECT note above â€” treat it as a safety net, not as the
+    check (see the OOB_SELECT note above Ã¢â‚¬â€ treat it as a safety net, not as the
     mechanism that keeps stores in bounds in the first place).
 
     ``num_bytes`` must therefore be the *true* extent of the plane in bytes and
@@ -383,6 +418,171 @@ def _st_f32(ptr, byte_off, value):
     _st_scalar(ptr, byte_off, value, fx.Float32)
 
 
+# ---------------------------------------------------------------------------
+# ROUND-R2D: opt-in in-kernel phase timestamps (builder keyword ``trace=1|2``; the
+# default ``trace=0`` emits nothing, so every existing build is byte-identical).
+# ---------------------------------------------------------------------------
+# kernel-wiki mi400-scalar-pipeline §5: TIME = S_GET_SHADER_CYCLES_U64 (shader clock, ~8
+# cycle SALU read, deltas valid only WITHIN one wave); REALTIME = S_SENDMSG_RTN_B64
+# GET_REALTIME + S_WAIT_KMcnt (fixed-frequency, valid ACROSS waves/SIMDs; frequency not
+# adopted by the wiki -> the analyser derives the TIME/REALTIME ratio from the data).
+# HW_ID1/HW_ID2 via S_GETREG_B32 (mi400-occupancy-resources §16: WAVE_ID 4:0, SIMD_ID 9:8,
+# WGP_ID 13:10, SA_ID 16; S_GETREG waits XCNT==0, mi400-instruction-latency).
+# The record of one wave (TRACE_SLOTS x int64) is written to the bytes right AFTER the
+# logits plane: the caller passes a logits view of a larger zeroed allocation
+# (rows*columns fp32 + num_waves * TRACE_WAVE_BYTES). Every lane stores the same 8 bytes
+# (unpredicated, in-plane by construction). trace=2 additionally waits loadcnt/kmcnt 0
+# before the marks flagged `wait` (serialises the phases -> per-phase latency).
+TRACE_SLOTS = 16
+TRACE_WAVE_BYTES = TRACE_SLOTS * 8
+TRACE_MAGIC = (0x51534154, 0x52324431)            # 'QSAT', 'R2D1' (lo, hi dwords)
+TRACE_SLOT_NAMES = (
+    "rt_entry", "t_entry", "hw_id", "ident", "t_prologue", "t_guard", "t_tdm_issue",
+    "t_q_issue", "t_tdm_wait", "t_barrier", "t_compute_store", "t_store_drain",
+    "rt_exit", "t_exit", "rt_barrier", "magic",
+)
+
+
+def _tr_asm(ty_bits, asm):
+    from flydsl._mlir import ir
+    from flydsl._mlir.dialects import llvm
+    return llvm.inline_asm(ir.IntegerType.get_signless(ty_bits), [], asm, "=s",
+                           has_side_effects=True)
+
+
+def _tr_void(asm):
+    from flydsl._mlir.dialects import llvm
+    llvm.inline_asm(None, [], asm, "", has_side_effects=True)
+
+
+def _tr_time():
+    return _tr_asm(64, "s_get_shader_cycles_u64 $0")
+
+
+def _tr_realtime():
+    return _tr_asm(64, "s_sendmsg_rtn_b64 $0, sendmsg(MSG_RTN_GET_REALTIME)\n\ts_wait_kmcnt 0x0")
+
+
+def _tr_store_vec2(rsrc, byte_off, v2):
+    ir, aux = _raw()
+    fx.rocdl.raw_ptr_buffer_store(v2, rsrc, fx.Int32(byte_off).ir_value(),
+                                  fx.Int32(0).ir_value(), aux=aux)
+
+
+def _tr_store64(rsrc, byte_off, v64):
+    from flydsl._mlir import ir
+    from flydsl._mlir.dialects import llvm
+    _tr_store_vec2(rsrc, byte_off,
+                   llvm.bitcast(ir.VectorType.get([2], fx.Int32.ir_type), v64))
+
+
+def _tr_store_pair(rsrc, byte_off, lo, hi):
+    _tr_store_vec2(rsrc, byte_off,
+                   Vec.from_elements([fx.Int32(lo), fx.Int32(hi)], dtype=fx.Int32).ir_value())
+
+
+def _tr_begin(trs, level, LOGITS, rows, columns, grid_x, grid_y, waves, bx, by):
+    """Entry stamps (slots 0-3). ``trs`` is the builder's trace holder dict."""
+    if not level:
+        return
+    rt = _tr_realtime()
+    t = _tr_time()
+    hw1 = fx.Int32(_tr_asm(32, "s_getreg_b32 $0, hwreg(HW_REG_WAVE_HW_ID1)"))
+    hw2 = fx.Int32(_tr_asm(32, "s_getreg_b32 $0, hwreg(HW_REG_WAVE_HW_ID2)"))
+    wave_id = fx.Int32(fx.rocdl.wave_id())
+    lbytes = rows * columns * 4
+    nwaves = grid_x * grid_y * waves
+    rsrc = _plane(LOGITS, _plane_bytes(rows, 4, columns)
+                  + fx.Int64(nwaves) * fx.Int64(TRACE_WAVE_BYTES))
+    base = lbytes + ((by * grid_x + bx) * waves + wave_id) * TRACE_WAVE_BYTES
+    trs.update(rsrc=rsrc, base=base, level=int(level))
+    _tr_store64(rsrc, base, rt)
+    _tr_store64(rsrc, base + 8, t)
+    _tr_store_pair(rsrc, base + 16, hw1, hw2)
+    _tr_store_pair(rsrc, base + 24, bx, by | (wave_id << 20) | (fx.Int32(int(level)) << 28))
+
+
+def _tr_mark(trs, slot, wait=False):
+    """TIME stamp into ``slot`` (trace=2 + wait: loadcnt/kmcnt 0 first)."""
+    if not trs:
+        return
+    if wait and trs["level"] >= 2:
+        _tr_void("s_wait_loadcnt 0x0\n\ts_wait_kmcnt 0x0")
+    _tr_store64(trs["rsrc"], trs["base"] + slot * 8, _tr_time())
+
+
+def _tr_mark_rt(trs, slot):
+    if not trs:
+        return
+    _tr_store64(trs["rsrc"], trs["base"] + slot * 8, _tr_realtime())
+
+
+def _tr_end(trs):
+    """Store drain (slot 11), exit stamps (12, 13), magic (15)."""
+    if not trs:
+        return
+    _tr_void("s_wait_storecnt 0x0")
+    rsrc, base = trs["rsrc"], trs["base"]
+    _tr_store64(rsrc, base + 11 * 8, _tr_time())
+    _tr_store64(rsrc, base + 12 * 8, _tr_realtime())
+    _tr_store64(rsrc, base + 13 * 8, _tr_time())
+    _tr_store_pair(rsrc, base + 15 * 8, fx.Int32(TRACE_MAGIC[0]), fx.Int32(TRACE_MAGIC[1]))
+
+
+# ROUND-R2D ktile knobs (opt-in, route spellings kt<RB>x<C>[l][p<KB>]):
+#   lean=True  -> the full-block path issues ALL its SGPR loads (RB t2r guard rows, the
+#                 wave's 4 positions, ctx, every TDM page-table entry) as one batch before
+#                 any use (the 4c45af10 ISA serialises each s_buffer_load behind its own
+#                 s_wait_kmcnt 0: 16-32 dependent scalar round trips before the first TDM
+#                 issue), skips the per-lane metadata VMEM chain (t2r -> ctx) in that path
+#                 (vis = max(min(pos + 1, ctx), 0) / 4 with the block's request), publishes
+#                 the TDM slab with s_wait_tensorcnt + s_barrier (no workgroup fence: the
+#                 fenced gpu.barrier also waited storecnt 0 for the vis/row_starts stores),
+#                 and stores the logits of a slab that lies inside the column range under
+#                 one SGPR-uniform branch (no per-store EXEC branch + s_wait_xcnt 0).
+#                 Mixed / partial blocks keep the exact per-wave fallback.
+#   ipf=<KB>   -> S_PREFETCH_INST_PC_REL of the next <KB> KiB of code at kernel entry
+#                 (kernel-wiki mi400-scalar-pipeline §4.3: 1-32 x 128 B per instruction;
+#                 §4.6: s_wait_xcnt 0 before every s_prefetch on MI450/MI430).
+IPF_KB = (4, 8, 16, 32)
+
+
+def _r2d_check(trace, lean, ipf, ktile, trace_ok):
+    trace = int(trace)
+    if trace not in (0, 1, 2):
+        raise ValueError("trace must be 0, 1 or 2")
+    if trace and not (trace_ok or ktile):
+        raise ValueError("trace (ROUND-R2D) applies to r32 TDM / ktile builds only")
+    if (lean or ipf) and not ktile:
+        raise ValueError("lean / ipf (ROUND-R2D) apply to k_load='ktile' only")
+    if ipf and int(ipf) not in IPF_KB:
+        raise ValueError(f"ipf must be one of {IPF_KB} (KiB)")
+    return trace
+
+
+def _r2d_tag(lean, ipf):
+    return ("_lean" if lean else "") + (f"_ipf{int(ipf)}" if ipf else "")
+
+
+def _pin_sgprs(vals):
+    """Empty side-effecting inline asm reading `vals` as SGPR operands (ROUND-R2D lean)."""
+    from flydsl._mlir.dialects import llvm
+    vals = list(vals)
+    if not vals:
+        return
+    llvm.inline_asm(None, [fx.Int32(v).ir_value() for v in vals], "; r2d pin",
+                    ",".join(["s"] * len(vals)), has_side_effects=True)
+
+def _inst_prefetch(kb):
+    """Prefetch ``kb`` KiB of code starting at this point (4 KiB per instruction)."""
+    if not kb:
+        return
+    lines = ["s_wait_xcnt 0x0"]
+    for i in range(int(kb) // 4):
+        lines.append(f"s_prefetch_inst_pc_rel {i * 4096:#x}, null, 31")
+    _tr_void("\n\t".join(lines))
+
+
 # Exact E4M3 (e4m3fn) -> f32 for one byte code, in integer arithmetic.
 #
 # gfx1250 has no legal scalar/packed fp8->f32 convert: FlyDSL's
@@ -420,12 +620,14 @@ def _e4m3_byte_to_f32(b):
 # Kernel
 # ---------------------------------------------------------------------------
 @lru_cache(maxsize=None)
-def _build_kernel(is_fp8: bool, threads: int, divisor: float, pos64: bool = False):
-    """One specialization per (dtype, block size, score divisor[, int64 positions])."""
+def _build_kernel(is_fp8: bool, threads: int, divisor: float, pos64: bool = False,
+                  page_size: int = PAGE_SIZE):
+    """One specialization per (dtype, block size, score divisor[, int64 positions][, page])."""
     ld_pos, _, qp_bytes, qp_tag = _pos_loaders(pos64)
+    P = _check_page_size(page_size)
     key_row_bytes = HEAD_DIM if is_fp8 else HEAD_DIM * 2   # 128 B fp8 / 256 B bf16
     q_row_bytes = NUM_HEADS * HEAD_DIM * 2                 # 1024 B bf16
-    page_bytes = PAGE_SIZE * key_row_bytes                 # 512 B fp8 / 1024 B bf16
+    page_bytes = P * key_row_bytes                         # P=4: 512 B fp8 / 1024 B bf16
     k_dwords = 2 if is_fp8 else 4                          # dwords per 8 head dims
     k_bytes = k_dwords * 4                                 # 8 B fp8 / 16 B bf16
     steps = HEAD_DIM // DIM_PER_STEP                       # 16 steps of 8 dims
@@ -436,7 +638,7 @@ def _build_kernel(is_fp8: bool, threads: int, divisor: float, pos64: bool = Fals
     dtype_tag = "fp8" if is_fp8 else "bf16"
     kernel_name = (
         f"qsa_paged_mqa_logits_page4_gfx1250_{dtype_tag}"
-        f"_D{HEAD_DIM}_H{NUM_HEADS}_P{PAGE_SIZE}_t{threads}_flydsl"
+        f"_D{HEAD_DIM}_H{NUM_HEADS}_P{P}_t{threads}_flydsl"
     ) + qp_tag
 
     # The kernel body must not branch on this flag: an `if` over a closure
@@ -461,13 +663,13 @@ def _build_kernel(is_fp8: bool, threads: int, divisor: float, pos64: bool = Fals
         return vals
 
     def _ks_bytes_fp8(num_pages):
-        return _plane_bytes(num_pages, PAGE_SIZE * 4)
+        return _plane_bytes(num_pages, P * 4)
 
     def _ks_bytes_bf16(num_pages):   # no scale plane: a 4-byte dummy descriptor
         return fx.Int64(4)
 
     def _scale_fp8(ks_rsrc, phys, off):
-        return _ld_f32(ks_rsrc, (phys * PAGE_SIZE + off) * 4)
+        return _ld_f32(ks_rsrc, (phys * P + off) * 4)
 
     def _scale_bf16(ks_rsrc, phys, off):   # no scale: the dequant multiplier is 1
         return fx.Float32(1.0)
@@ -567,7 +769,7 @@ def _build_kernel(is_fp8: bool, threads: int, divisor: float, pos64: bool = Fals
         # min is monotone, so min(a, b) // 4 == min(a // 4, b // 4); clamping to
         # >= 0 first keeps the division on a non-negative operand.
         head = _imax(_imin(pos + 1, ctx), 0)
-        vis = head // PAGE_SIZE
+        vis = head // COMPRESS_RATIO
         vis = req_ok.select(vis, 0)
 
         # One thread per row writes the row metadata.  Predicated (not sentinel-
@@ -580,8 +782,8 @@ def _build_kernel(is_fp8: bool, threads: int, divisor: float, pos64: bool = Fals
 
         # --- column -> (logical page, row in page)
         col_ok = col < columns
-        logical = col // PAGE_SIZE
-        off = col % PAGE_SIZE
+        logical = col // P
+        off = col % P
         logical_ok = logical < width
         safe_logical = logical_ok.select(logical, 0)
         phys = _ld_i32(pt_rsrc, (safe_req * width + safe_logical) * 4)
@@ -693,7 +895,7 @@ def _build_kernel(is_fp8: bool, threads: int, divisor: float, pos64: bool = Fals
 #   * K = 128 head dims = 4 WMMA steps; Q fragments are loaded once per wave
 #     (8 x 16 B per lane) and kept in VGPRs; K fragments go straight from global
 #     (page-4 geometry: column c -> page_table[req, c // 4], row c % 4) into the
-#     B operand, 8 x 16 B per lane per tile â€” every K byte is loaded exactly once
+#     B operand, 8 x 16 B per lane per tile Ã¢â‚¬â€ every K byte is loaded exactly once
 #     per wave, so no LDS staging and no barriers are needed.
 #   * Rows of one wave may belong to up to 4 requests (draft: 1 row/request).
 #     Pass p handles the rows whose request equals row p's, and only if row p is
@@ -778,6 +980,143 @@ TDM_PERSIST = os.environ.get("QSA_BF16_PERSIST", "1").strip() == "1"
 TDM_PERSIST_CHUNKS = int(os.environ.get("QSA_PERSIST_COLS", "8").strip())
 TDM_PERSIST_BUFFERS = 2
 TDM_PERSIST_LDS_BYTES = TDM_PERSIST_BUFFERS * TDM_K_TILE_BYTES      # 34,816 B
+
+# ROUND-R2B: compile time of the persistent kernel. Its exact raw fallback (mixed /
+# partial row blocks only) was unrolled over persist_chunks x 2 M tiles x 4 passes x
+# 4 N tiles (~1,024 WMMAs, ~80% of the code, ~12 s cold compile). 'loop' (default)
+# runs the fallback's chunk loop as a runtime scf.for (unroll disabled); the hot
+# single-request path is unchanged (still unrolled + double-buffered). 'unroll'
+# restores the d438d2b3 persistent kernel byte-for-byte (same name / ISA) for GPU A/B.
+PERSIST_FALLBACKS = ("loop", "unroll")
+TDM_PERSIST_FALLBACK = os.environ.get("QSA_PERSIST_FALLBACK", "loop").strip().lower()
+if TDM_PERSIST_FALLBACK not in PERSIST_FALLBACKS:
+    raise ValueError("QSA_PERSIST_FALLBACK must be 'loop' or 'unroll'")
+
+# ROUND-R2B: K-stationary / Q-reuse r32 prefill ("kstat", builder opt-in or route table).
+# A workgroup owns a column slab of `col_tiles` 64-column K tiles, gathers them ONCE
+# into LDS (col_tiles x 17,408 B; one TDM issue per tile, no reload), then streams
+# `row_tiles` 32-row blocks through a runtime loop: each block's Q fragments are loaded
+# once and reused for every K tile of the slab (Q traffic / col_tiles), K is gathered
+# once per row_tiles blocks (K traffic / row_tiles). grid = ceil(columns / (64 C)) x
+# ceil(rows / (32 R)). Blocks that are mixed / partial / of another request than the
+# slab's K request (= the span's first row) take the exact r32 raw fallback.
+KSTAT_ROW_TILES = (1, 2, 4, 8)
+KSTAT_COL_TILES = (1, 2, 4)
+
+
+def kstat_grid(rows: int, columns: int, row_tiles: int, col_tiles: int) -> tuple[int, int]:
+    """Grid of the kstat kernel (pure arithmetic; CPU tests + op plans)."""
+    if row_tiles not in KSTAT_ROW_TILES or col_tiles not in KSTAT_COL_TILES:
+        raise ValueError(f"kstat row_tiles {row_tiles} / col_tiles {col_tiles} unsupported")
+    cw, rh = WMMA_COLS * col_tiles, 32 * row_tiles
+    return (int(columns) + cw - 1) // cw, (int(rows) + rh - 1) // rh
+
+
+# ROUND-R2C: "ktile" r32-routed prefill (builder k_load='ktile', route variant kt<RB>x<C>).
+# One wave per 4-row M tile (RB = 16 -> 4 waves = the native MFMA scorer's BMT=16 x BN=128
+# tiling at C = 2; RB = 32 -> 8 waves / 256 threads), every wave scores ALL 4C N tiles of the
+# workgroup's 64C-column slab from LDS (gathered once by TDM, 8-row gathers spread over the
+# waves). Full single-request blocks issue Q, the lane columns' page validity and the TDM
+# gathers before the one wait + barrier (the R2C 'early' order); other blocks take the exact
+# per-wave raw fallback (request-dedup passes). grid = ceil(cols / 64C) x ceil(rows / RB).
+KT_ROWS = (16, 32)
+KT_COL_TILES = (1, 2, 4)
+
+
+def kt_grid(rows: int, columns: int, kt_rows: int, col_tiles: int) -> tuple[int, int]:
+    """Grid of the ktile kernel (pure arithmetic; CPU tests + op plans)."""
+    if kt_rows not in KT_ROWS or col_tiles not in KT_COL_TILES:
+        raise ValueError(f"ktile rows {kt_rows} / col_tiles {col_tiles} unsupported")
+    cw = WMMA_COLS * col_tiles
+    return (int(columns) + cw - 1) // cw, (int(rows) + kt_rows - 1) // kt_rows
+
+
+# ROUND-R2B: data-driven bf16 r32 prefill route (rows >= 32 and rows >= 32 * requests,
+# TDM, 128 B aligned cache). QSA_PREFILL_ROUTE is a preset name or a rule list
+# "P,cmin,cmax,rmin,rmax,variant;..." (bounds inclusive, '*' = any; P in 4/8/16/'*');
+# variant = persist | tdm | kstat<R>x<C>. First match wins; no match -> tdm (r32).
+# 'legacy' is the d438d2b3 router: persist iff QSA_BF16_PERSIST=1 and
+# columns >= 64 * QSA_PERSIST_COLS. QSA_BF16_PERSIST=0 still vetoes persist everywhere.
+PREFILL_ROUTE_PRESETS = {
+    "legacy": None,
+    # R2B proposal (GPU sweep picks the thresholds): persist only for long columns,
+    # Q-reuse kstat below (prefill_bench c1024: persist 17.5-19.7 us vs r32 6.0/13.4).
+    "r2b": "*,4096,*,*,*,persist;*,*,*,2048,*,kstat2x2;*,*,*,*,*,kstat1x2",
+    # ROUND-R2E default: lean ktile RB32 x C2 for columns <= 2048 (GPU c1024: rows 1024
+    # 4.14-4.19 vs native 4.76; rows 4096 7.75-7.80 vs 12.2), persist above (long-column
+    # A/B pending: records/r2e/GPU_COMMANDS.md (d)).
+    "r2e": "*,*,2048,*,16384,kt32x2l;*,*,*,*,*,persist",
+    # ROUND-R2E alternative for the long-column A/B: lean ktile everywhere.
+    "kt_all": "*,*,*,*,*,kt32x2l",
+}
+#: ROUND-R2E: the default preset (was 'legacy' up to R2D 685b0f60).
+PREFILL_ROUTE_DEFAULT = "r2e"
+
+
+def _parse_route_variant(v: str):
+    v = v.strip().lower()
+    if v in ("persist", "tdm"):
+        return v, {}
+    m = re.fullmatch(r"kstat(\d+)x(\d+)(e?)", v)
+    if m and int(m[1]) in KSTAT_ROW_TILES and int(m[2]) in KSTAT_COL_TILES:
+        kw = {"row_tiles": int(m[1]), "col_tiles": int(m[2])}
+        if m[3]:                     # ROUND-R2C: page-table prefetch before the K wait
+            kw["early"] = True
+        return "kstat", kw
+    m = re.fullmatch(r"kt(\d+)x(\d+)(l?)(?:p(\d+))?", v)   # ROUND-R2C ktile (+R2D l / p<KB>)
+    if m and int(m[1]) in KT_ROWS and int(m[2]) in KT_COL_TILES:
+        kw = {"kt_rows": int(m[1]), "col_tiles": int(m[2])}
+        if m[3]:
+            kw["lean"] = True
+        if m[4]:
+            if int(m[4]) not in IPF_KB:
+                raise ValueError(f"QSA_PREFILL_ROUTE: ipf {m[4]} not in {IPF_KB}")
+            kw["ipf"] = int(m[4])
+        return "ktile", kw
+    raise ValueError(f"QSA_PREFILL_ROUTE: unknown variant {v!r}")
+
+
+def parse_prefill_route(spec: str):
+    """Rule tuples (page, cmin, cmax, rmin, rmax, k_load, kw) or None (= legacy)."""
+    spec = PREFILL_ROUTE_PRESETS.get(spec.strip().lower(), spec)
+    if spec is None:
+        return None
+    rules = []
+    for part in [p for p in spec.split(";") if p.strip()]:
+        f = [x.strip().lower() for x in part.split(",")]
+        if len(f) != 6:
+            raise ValueError(f"QSA_PREFILL_ROUTE rule {part!r}: need 6 fields")
+        page = None if f[0] == "*" else int(f[0])
+        if page is not None and page not in SUPPORTED_PAGE_SIZES:
+            raise ValueError(f"QSA_PREFILL_ROUTE rule {part!r}: page {page}")
+        b = [None if x == "*" else int(x) for x in f[1:5]]
+        rules.append((page, b[0], b[1], b[2], b[3]) + _parse_route_variant(f[5]))
+    return tuple(rules)
+
+
+PREFILL_ROUTE_SPEC = os.environ.get("QSA_PREFILL_ROUTE", PREFILL_ROUTE_DEFAULT).strip().lower()
+PREFILL_ROUTE = parse_prefill_route(PREFILL_ROUTE_SPEC)
+
+
+def prefill_bf16_route(rows: int, num_requests: int, columns: int, page_size: int = PAGE_SIZE,
+                       table=None):
+    """(k_load, builder keywords) of a guarded bf16 r32 TDM prefill call."""
+    table = PREFILL_ROUTE if table is None else table
+    if table is None or table == "legacy":
+        if TDM_PERSIST and int(columns) >= WMMA_COLS * TDM_PERSIST_CHUNKS:
+            return "persist", {}
+        return "tdm", {}
+    for page, cmin, cmax, rmin, rmax, k_load, kw in table:
+        if page is not None and page != int(page_size):
+            continue
+        if cmin is not None and int(columns) < cmin or cmax is not None and int(columns) > cmax:
+            continue
+        if rmin is not None and int(rows) < rmin or rmax is not None and int(rows) > rmax:
+            continue
+        if k_load == "persist" and not (TDM_PERSIST and int(columns) >= WMMA_COLS * 2):
+            continue
+        return k_load, dict(kw)
+    return "tdm", {}
 
 
 def persist_schedule(n_chunks: int):
@@ -873,7 +1212,7 @@ def _pos_loaders(pos64: bool):
     return _ld_pos_i32, _ld_uniform_pos_i32, 4, ""
 
 
-def _tdm_k_gather(KV, ptr, row_ids, num_pages, byte_off):
+def _tdm_k_gather(KV, ptr, row_ids, num_pages, byte_off, page_size=PAGE_SIZE):
     """Stock TDM gather API, adapting the Fly LDS pointer to memref extraction."""
     from flydsl._mlir.dialects import memref
     from flydsl.expr.rocdl import tdm_ops
@@ -893,7 +1232,7 @@ def _tdm_k_gather(KV, ptr, row_ids, num_pages, byte_off):
         desc = tdm_ops.make_tensor_gather_descriptor(
             global_ptr=KV, lds_memref=ptr, row_indices=row_ids,
             row_width=HEAD_DIM, tensor_dim0=HEAD_DIM,
-            tensor_dim1=(num_pages * PAGE_SIZE).ir_value(), stride=HEAD_DIM,
+            tensor_dim1=(num_pages * page_size).ir_value(), stride=HEAD_DIM,
             elem_bytes=2, index_size=32,
             pad_interval=TDM_PAD_INTERVAL_DWORDS * 2,
             pad_amount=TDM_PAD_AMOUNT_DWORDS * 2,
@@ -904,7 +1243,7 @@ def _tdm_k_gather(KV, ptr, row_ids, num_pages, byte_off):
     tdm_ops.tensor_load_gather(desc)
 
 
-def _tdm_fp8_k_gather(KV, ptr, row_ids, num_pages, byte_off):
+def _tdm_fp8_k_gather(KV, ptr, row_ids, num_pages, byte_off, page_size=PAGE_SIZE):
     """Stock TDM gather API, adapting the Fly LDS pointer to memref extraction."""
     from flydsl._mlir.dialects import memref
     from flydsl.expr.rocdl import tdm_ops
@@ -924,7 +1263,7 @@ def _tdm_fp8_k_gather(KV, ptr, row_ids, num_pages, byte_off):
         desc = tdm_ops.make_tensor_gather_descriptor(
             global_ptr=KV, lds_memref=ptr, row_indices=row_ids,
             row_width=HEAD_DIM, tensor_dim0=HEAD_DIM,
-            tensor_dim1=(num_pages * PAGE_SIZE).ir_value(), stride=HEAD_DIM,
+            tensor_dim1=(num_pages * page_size).ir_value(), stride=HEAD_DIM,
             elem_bytes=1, index_size=32,
             pad_interval=TDM_FP8_PAD_INTERVAL_DWORDS * 4,
             pad_amount=TDM_FP8_PAD_AMOUNT_DWORDS * 4,
@@ -933,6 +1272,48 @@ def _tdm_fp8_k_gather(KV, ptr, row_ids, num_pages, byte_off):
     finally:
         tdm_ops.memref_dialect = saved
     tdm_ops.tensor_load_gather(desc)
+
+
+# ROUND-PAGE16 TDM row-id plan. A 32-bit-index TDM gather moves at most 8 rows
+# (kernel-wiki mi400-tdm-programming: "32-bit (8 indices/instruction)"), and
+# every gather group of this file is 8 consecutive output columns starting at
+# a multiple of 8 (tile/slab origins are multiples of 32). P = 4: a group spans
+# two pages -> two s_buffer_load page lookups (the unchanged bf492262 code at
+# every call site). P = 16: a group lies inside ONE page (8 | 16), so a 16-row
+# page is moved by two 8-row gathers sharing ONE page-table lookup each:
+# rows phys * 16 + row0 + r, row0 = (group * 8) % 16 a trace-time constant.
+# The LDS destination layout (272 B / 144 B pitch, column c at row c % tile)
+# is unchanged, so WMMA B reads keep the TDM2 bank rotation.
+def tdm_group_plan(page_size: int, group_col: int):
+    """Trace-free mirror of one 8-row gather group (CPU tests and kernels).
+
+    ``group_col`` is the group's first column *relative to a page-aligned
+    origin* (a multiple of 8). Returns ``[(page_delta, [row_in_page...])]``:
+    the logical page offset of each page-table lookup and the rows it feeds.
+    """
+    P = _check_page_size(page_size)
+    if group_col % 8:
+        raise ValueError("TDM gather groups start at multiples of 8 columns")
+    if P == 4:
+        return [(group_col // 4 + page, list(range(4))) for page in range(2)]
+    return [(group_col // P, [group_col % P + r for r in range(8)])]   # P = 8: row0 = 0
+
+
+def _p16_row_ids(pt_rsrc, req, width, num_pages, logical, row0, req_ok=None, page_size=16):
+    """P >= 8 gather group: one SGPR page lookup feeding 8 row ids (see above).
+
+    ROUND-R2 P = 8 (KV block 32): ``page_size=8``, ``row0 = 0`` -- the 8-row
+    gather is exactly one page (rows ``phys * 8 + r``). P = 16 callers pass no
+    ``page_size`` (trace-identical to 536667d5).
+    """
+    logical_ok = logical < width
+    safe_logical = logical_ok.select(logical, 0)
+    phys = _ld_uniform_i32(pt_rsrc, (req * width + safe_logical) * 4)
+    valid = logical_ok & (phys >= 0) & (phys < num_pages)
+    if req_ok is not None:
+        valid = req_ok & valid
+    phys = valid.select(phys, 0)
+    return [phys * page_size + (row0 + r) for r in range(8)]
 
 
 class _RowMeta:
@@ -956,18 +1337,56 @@ class _Pass:
 
 @lru_cache(maxsize=None)
 def _build_wmma_kernel(divisor: float, rows_per_block: int = 16, k_load: str | None = None,
-                       persist_chunks: int | None = None, pos64: bool = False):
+                       persist_chunks: int | None = None, pos64: bool = False,
+                       page_size: int = PAGE_SIZE, persist_fallback: str | None = None,
+                       row_tiles: int = 1, col_tiles: int = 1, early: bool = False,
+                       kt_rows: int | None = None, trace: int = 0, lean: bool = False,
+                       ipf: int = 0):
     """bf16 WMMA specialization; r32 shares B across two M tiles per wave.
 
     ``k_load="persist"`` (wrapper opt-in only) builds the r32 persistent TDM
-    kernel looping over ``persist_chunks`` (default TDM_PERSIST_CHUNKS) tiles.
+    kernel looping over ``persist_chunks`` (default TDM_PERSIST_CHUNKS) tiles;
+    ``persist_fallback`` (ROUND-R2B, default QSA_PERSIST_FALLBACK) selects its raw
+    fallback form. ``k_load="kstat"`` (ROUND-R2B) builds the K-stationary / Q-reuse
+    r32 kernel (``row_tiles`` x ``col_tiles``, see KSTAT_*).
     ``pos64=True`` (ROUND-NATIVE64) reads query_positions as int64 (see
     ``_pos_loaders``); ``False`` is the unchanged int32 kernel.
     """
     ld_pos, ld_uniform_pos, qp_bytes, qp_tag = _pos_loaders(pos64)
+    P = _check_page_size(page_size)
     if rows_per_block not in (16, 32, 64):
         raise ValueError("bf16 WMMA rows_per_block must be 16, 32 or 64")
     persist = k_load == "persist"
+    kstat = k_load == "kstat"
+    ktile = k_load == "ktile"                 # ROUND-R2C
+    if ktile:
+        if rows_per_block != 32 or _ACCESS != "raw" or row_tiles != 1 or early:
+            raise ValueError("the ktile bf16 kernel is r32-routed TDM (raw access), "
+                             "row_tiles=1, early built in")
+        kt_grid(32, 64, kt_rows, col_tiles)               # validates the knobs
+        k_load = "tdm"
+    elif kt_rows is not None:
+        raise ValueError("kt_rows applies to k_load='ktile' only")
+    kt_waves = (int(kt_rows) // WMMA_ROWS_PER_WAVE) if ktile else WMMA_WAVES
+    kt_threads = kt_waves * WMMA_WAVE
+    fb_loop = False
+    if persist:
+        fb = TDM_PERSIST_FALLBACK if persist_fallback is None else str(persist_fallback)
+        if fb not in PERSIST_FALLBACKS:
+            raise ValueError("persist_fallback must be 'loop' or 'unroll'")
+        fb_loop = fb == "loop"
+    elif persist_fallback is not None:
+        raise ValueError("persist_fallback applies to k_load='persist' only")
+    if kstat:
+        if rows_per_block != 32 or _ACCESS != "raw":
+            raise ValueError("the kstat bf16 kernel is r32 TDM (raw access) only")
+        kstat_grid(32, 64, row_tiles, col_tiles)          # validates the knobs
+        k_load = "tdm"
+    elif (row_tiles, col_tiles) != (1, 1) and not ktile:
+        raise ValueError("row_tiles / col_tiles apply to k_load='kstat' only")
+    early = bool(early)
+    if early and not kstat:
+        raise ValueError("early (ROUND-R2C) applies to k_load='kstat' only")
     if persist:
         if rows_per_block != 32 or _ACCESS != "raw":
             raise ValueError("the persistent bf16 kernel is r32 TDM (raw access) only")
@@ -984,6 +1403,11 @@ def _build_wmma_kernel(divisor: float, rows_per_block: int = 16, k_load: str | N
     tdm_cols = R16_TDM_COLS if rows_per_block == 16 else WMMA_COLS
     tdm_tile_bytes = tdm_cols * TDM_K_ROW_BYTES      # 8,704 B (c32) / 17,408 B (c64)
     cols_per_block = tdm_cols if use_tdm else WMMA_COLS
+    # ROUND-R2D opt-in knobs (defaults emit nothing new): trace (phase timestamps),
+    # lean / ipf (ktile only; see _r2d_tag).
+    trace = _r2d_check(trace, lean, ipf, ktile,
+                       use_tdm and rows_per_block == 32 and not persist and not kstat)
+    trs = {}                        # trace holder (filled by _tr_begin at trace time)
 
     def _pair_storage_raw(KV, kv_rsrc):
         return kv_rsrc
@@ -1014,7 +1438,7 @@ def _build_wmma_kernel(divisor: float, rows_per_block: int = 16, k_load: str | N
             ctx = _ld_uniform_i32(cl_rsrc, safe_req * 4)
             pos = ld_uniform_pos(qp_rsrc, safe_row)
             head = _imax(_imin(pos + 1, ctx), 0)
-            vis = req_ok.select(head // PAGE_SIZE, 0)
+            vis = req_ok.select(head // COMPRESS_RATIO, 0)
             out.append(_RowMeta(row, row_ok, req, req_ok, safe_req, vis))
         return out
 
@@ -1034,7 +1458,7 @@ def _build_wmma_kernel(divisor: float, rows_per_block: int = 16, k_load: str | N
         for i in range_constexpr(WMMA_ROWS_PER_WAVE):
             owner = _ld_uniform_i32(t2r_rsrc, (t0 + i) * 4)
             pos = ld_uniform_pos(qp_rsrc, t0 + i)
-            vis = _imax(_imin(pos + 1, ctx), 0) // PAGE_SIZE
+            vis = _imax(_imin(pos + 1, ctx), 0) // COMPRESS_RATIO
             vmax = _imax(vmax, (owner == req).select(vis, 0))
         return active & (col0 < vmax)
 
@@ -1049,18 +1473,25 @@ def _build_wmma_kernel(divisor: float, rows_per_block: int = 16, k_load: str | N
         safe_req = req_ok.select(req, 0)
         for group in range_constexpr(tdm_cols // 8):
             local = group * 8
-            row_ids = []
-            for page in range_constexpr(2):
-                logical = (col0 + local) // PAGE_SIZE + page
-                logical_ok = logical < width
-                safe_logical = logical_ok.select(logical, 0)
-                phys = _ld_uniform_i32(pt_rsrc, (safe_req * width + safe_logical) * 4)
-                valid = req_ok & logical_ok & (phys >= 0) & (phys < num_pages)
-                phys = valid.select(phys, 0)
-                for row in range_constexpr(PAGE_SIZE):
-                    row_ids.append(phys * PAGE_SIZE + row)
+            if P == 4:
+                row_ids = []
+                for page in range_constexpr(2):
+                    logical = (col0 + local) // 4 + page
+                    logical_ok = logical < width
+                    safe_logical = logical_ok.select(logical, 0)
+                    phys = _ld_uniform_i32(pt_rsrc, (safe_req * width + safe_logical) * 4)
+                    valid = req_ok & logical_ok & (phys >= 0) & (phys < num_pages)
+                    phys = valid.select(phys, 0)
+                    for row in range_constexpr(4):
+                        row_ids.append(phys * 4 + row)
+            elif P == 16:   # P = 16: one page lookup per 8-row group (col0 % 32 == 0)
+                row_ids = _p16_row_ids(pt_rsrc, safe_req, width, num_pages,
+                                       col0 // 16 + local // 16, local % 16, req_ok)
+            else:   # P = 8: the 8-row group IS page col0/8 + group (one lookup)
+                row_ids = _p16_row_ids(pt_rsrc, safe_req, width, num_pages,
+                                       col0 // 8 + group, 0, req_ok, 8)
             byte_off = wave_id * tdm_tile_bytes + local * TDM_K_ROW_BYTES
-            _tdm_k_gather(KV, ptr, row_ids, num_pages, byte_off)
+            _tdm_k_gather(KV, ptr, row_ids, num_pages, byte_off, P)
 
     def _pair_stage_raw(KV, ptr, pt_rsrc, t2r_rsrc, rblk, col0, width, num_pages):
         pass
@@ -1073,17 +1504,24 @@ def _build_wmma_kernel(divisor: float, rows_per_block: int = 16, k_load: str | N
         req = _ld_uniform_i32(t2r_rsrc, rblk * 32 * 4)
         for group in range_constexpr(2):
             local = wave_id * 16 + group * 8
-            row_ids = []
-            for page in range_constexpr(2):
-                logical = (col0 + local) // PAGE_SIZE + page
-                logical_ok = logical < width
-                safe_logical = logical_ok.select(logical, 0)
-                phys = _ld_uniform_i32(pt_rsrc, (req * width + safe_logical) * 4)
-                valid = logical_ok & (phys >= 0) & (phys < num_pages)
-                phys = valid.select(phys, 0)
-                for row in range_constexpr(PAGE_SIZE):
-                    row_ids.append(phys * PAGE_SIZE + row)
-            _tdm_k_gather(KV, ptr, row_ids, num_pages, local * TDM_K_ROW_BYTES)
+            if P == 4:
+                row_ids = []
+                for page in range_constexpr(2):
+                    logical = (col0 + local) // 4 + page
+                    logical_ok = logical < width
+                    safe_logical = logical_ok.select(logical, 0)
+                    phys = _ld_uniform_i32(pt_rsrc, (req * width + safe_logical) * 4)
+                    valid = logical_ok & (phys >= 0) & (phys < num_pages)
+                    phys = valid.select(phys, 0)
+                    for row in range_constexpr(4):
+                        row_ids.append(phys * 4 + row)
+            elif P == 16:   # P = 16: wave w's 16 rows = page col0/16 + w; group = half page
+                row_ids = _p16_row_ids(pt_rsrc, req, width, num_pages,
+                                       col0 // 16 + wave_id, group * 8)
+            else:   # P = 8: wave w's 16 rows = pages col0/8 + 2w, +1; group = one page
+                row_ids = _p16_row_ids(pt_rsrc, req, width, num_pages,
+                                       col0 // 8 + wave_id * 2 + group, 0, None, 8)
+            _tdm_k_gather(KV, ptr, row_ids, num_pages, local * TDM_K_ROW_BYTES, P)
         fx.rocdl.tdm_ops.tensor_wait(0)
         # Completion on every producer, then rendezvous before cross-wave LDS
         # consumption. No branch depending on per-wave visibility surrounds it.
@@ -1120,7 +1558,7 @@ def _build_wmma_kernel(divisor: float, rows_per_block: int = 16, k_load: str | N
         v_max3 + v_readfirstlane; this single scalar load keeps it SALU-only.)
         """
         ctx = _ld_uniform_i32(cl_rsrc, req * 4)
-        return _imax(ctx, 0) // PAGE_SIZE
+        return _imax(ctx, 0) // COMPRESS_RATIO
 
     def _persist_issue_tdm(KV, ptr, pt_rsrc, req, col0, width, num_pages, buf):
         """`_pair_stage_tdm`'s two 8-row gathers per wave, into buffer `buf`,
@@ -1129,22 +1567,199 @@ def _build_wmma_kernel(divisor: float, rows_per_block: int = 16, k_load: str | N
         wave_id = fx.Int32(fx.rocdl.wave_id())
         for group in range_constexpr(2):
             local = wave_id * 16 + group * 8
+            if P == 4:
+                row_ids = []
+                for page in range_constexpr(2):
+                    logical = (col0 + local) // 4 + page
+                    logical_ok = logical < width
+                    safe_logical = logical_ok.select(logical, 0)
+                    phys = _ld_uniform_i32(pt_rsrc, (req * width + safe_logical) * 4)
+                    valid = logical_ok & (phys >= 0) & (phys < num_pages)
+                    phys = valid.select(phys, 0)
+                    for row in range_constexpr(4):
+                        row_ids.append(phys * 4 + row)
+            elif P == 16:   # P = 16: wave w's 16 rows = page col0/16 + w; group = half page
+                row_ids = _p16_row_ids(pt_rsrc, req, width, num_pages,
+                                       col0 // 16 + wave_id, group * 8)
+            else:   # P = 8: wave w's 16 rows = pages col0/8 + 2w, +1; group = one page
+                row_ids = _p16_row_ids(pt_rsrc, req, width, num_pages,
+                                       col0 // 8 + wave_id * 2 + group, 0, None, 8)
+            _tdm_k_gather(KV, ptr, row_ids, num_pages,
+                          buf * TDM_K_TILE_BYTES + local * TDM_K_ROW_BYTES, P)
+
+    def _persist_next(k):
+        """Trace-time stop of `range_constexpr(k + 1, stop)`: chunk k+1 if any."""
+        return min(k + 2, persist_chunks)
+
+    # ---- ROUND-R2B kstat helpers (only the kstat kernel calls these) -----------
+    def _kstat_storage_tdm():
+        # One allocator, col_tiles disjoint 17,408 B padded K tiles (read-only after
+        # the first publish): 17,408 / 34,816 / 69,632 B.
+        return fx.SharedAllocator(base_alignment=128, static=True).allocate(
+            fx.Array[fx.Int32, col_tiles * TDM_K_TILE_BYTES // 4, 128]
+        ).peek().ptr
+
+    def _kstat_slab_req(t2r_rsrc, cl_rsrc, row0, rows, num_requests):
+        """SGPR (kreq, kreq_ok, safe kreq, vis bound) of the span's first row."""
+        kreq = _ld_uniform_i32(t2r_rsrc, _imin(row0, rows - 1) * 4)
+        kreq_ok = (kreq >= 0) & (kreq < num_requests)
+        ksafe = kreq_ok.select(kreq, 0)
+        return kreq, kreq_ok, ksafe, _persist_block_vis(cl_rsrc, ksafe)
+
+    def _kstat_tile_ok(t2r_rsrc, base, rows, num_requests, kreq):
+        """Uniform: full single-request 32-row block whose request is the slab's."""
+        first = _ld_uniform_i32(t2r_rsrc, _imin(base, rows - 1) * 4)
+        return _r32_guard(t2r_rsrc, base, rows, num_requests) & (first == kreq)
+
+    # ---- ROUND-R2C kstat "early" (k_load='kstat', early=True) ------------------
+    # The reuse branch's `_tile_pair` loaded each lane column's page-table entry AFTER
+    # the TDM wait + barrier (one more dependent memory latency on the critical path:
+    # its only consumer is page_ok). Inside that branch every row of the block is of
+    # the slab's request (`_kstat_tile_ok`: r32 guard & first == kreq), so
+    # ppa.safe_req == kreq and ppa.req_ok holds: page_ok depends on the slab only and
+    # is loaded once per workgroup, before the wait, by the same expression with
+    # (ksafe, kreq_ok). Scores / masks / store offsets are unchanged.
+    def _kstat_page_pre(pt_rsrc, ksafe, kreq_ok, slab0, n_in, width, num_pages):
+        out = []
+        for ct in range_constexpr(col_tiles):
+            oks = []
+            for c in _lane_cols(slab0 + ct * WMMA_COLS, n_in):
+                logical = c // P
+                logical_ok = logical < width
+                safe_logical = logical_ok.select(logical, 0)
+                phys = _ld_i32(pt_rsrc, (ksafe * width + safe_logical) * 4)
+                oks.append(kreq_ok & logical_ok & (phys >= 0) & (phys < num_pages))
+            out.append(oks)
+        return out
+
+    def _kstat_page_none(pt_rsrc, ksafe, kreq_ok, slab0, n_in, width, num_pages):
+        return []                       # emits nothing (the b82ef05b kstat trace)
+
+    def _tile_pair_pre(atom, kbuf, qfa, qfb, c, kgrp):
+        """`_tile_pair` (TDM) without its page-table load: page_ok comes from the prefetch."""
+        k_base = _pair_base_tdm(None, None, c, kgrp)
+        acc_a = fx.make_rmem_tensor(8, fx.Float32)
+        acc_b = fx.make_rmem_tensor(8, fx.Float32)
+        acc_a.store(Vec.filled(8, 0.0, fx.Float32))
+        acc_b.store(Vec.filled(8, 0.0, fx.Float32))
+        for s in range_constexpr(WMMA_K_STEPS):
+            kf = _rmem8(_pair_frag_tdm(kbuf, k_base + s * kstep_bytes))
+            fx.gemm(atom, acc_a, _rmem8(qfa[s]), kf, acc_a)
+            fx.gemm(atom, acc_b, _rmem8(qfb[s]), kf, acc_b)
+        a = acc_a.load()
+        b = acc_b.load()
+        zero = fx.Float32(0.0)
+        scores = []
+        for acc in (a, b):
+            sa = (
+                (fx.Float32(acc[0]).maximumf(zero) + fx.Float32(acc[1]).maximumf(zero))
+                + (fx.Float32(acc[2]).maximumf(zero) + fx.Float32(acc[3]).maximumf(zero))
+            )
+            sb = (
+                (fx.Float32(acc[4]).maximumf(zero) + fx.Float32(acc[5]).maximumf(zero))
+                + (fx.Float32(acc[6]).maximumf(zero) + fx.Float32(acc[7]).maximumf(zero))
+            )
+            scores.append(sa * inv_divisor)
+            scores.append(sb * inv_divisor)
+        return scores
+
+    def _kstat_values_pre(atom, kbuf, pt_rsrc, qfa, qfb, ppa, ppb, cols, offsa, offsb,
+                          columns, width, num_pages, kpre, ct):
+        out = []
+        neg_inf = fx.Float32(_NEG_INF)
+        for nt in range_constexpr(WMMA_N_TILES):
+            c = cols[nt]
+            page_ok = kpre[ct][nt]
+            scores = _tile_pair_pre(atom, kbuf, qfa, qfb, c, ppa.kgrp)
+            for mi in range_constexpr(2):
+                pp = (ppa, ppb)[mi]
+                offs = (offsa, offsb)[mi]
+                col_ok = c < columns
+                va = (page_ok & (c < pp.vis_a)).select(scores[2 * mi], neg_inf)
+                vb = (page_ok & (c < pp.vis_b)).select(scores[2 * mi + 1], neg_inf)
+                out.append((pp.own_a & col_ok, offs[2 * nt], va))
+                out.append((pp.own_b & col_ok, offs[2 * nt + 1], vb))
+        return out
+
+    def _kstat_values_base(atom, kbuf, pt_rsrc, qfa, qfb, ppa, ppb, cols, offsa, offsb,
+                           columns, width, num_pages, kpre, ct):
+        return _pair_values(atom, kbuf, pt_rsrc, qfa, qfb, ppa, ppb,
+                            cols, offsa, offsb, columns, width, num_pages)
+
+    kstat_pre = _kstat_page_pre if early else _kstat_page_none
+    kstat_values = _kstat_values_pre if early else _kstat_values_base
+
+    # ---- ROUND-R2C ktile helpers (only kernel_kt calls these; see KT_ROWS) -------
+    def _kt_guard(t2r_rsrc, base, rows, num_requests):
+        """SGPR (request, ok): full kt_rows-row block, every row of one valid request."""
+        req = _ld_uniform_i32(t2r_rsrc, _imin(base, rows - 1) * 4)
+        ok = (base + kt_rows <= rows) & (req >= 0) & (req < num_requests)
+        for i in range_constexpr(1, kt_rows):
+            other = _ld_uniform_i32(t2r_rsrc, _imin(base + i, rows - 1) * 4)
+            ok = ok & (other == req)
+        return req, ok
+
+    def _kt_issue_w8(KV, ptr, pt_rsrc, req, col0, width, num_pages, buf):
+        """8 waves: wave w gathers the 64-column tile's columns col0 + 8w .. 8w + 7 into
+        buffer `buf` (one 8-row gather per wave; same row-id plan as every TDM site)."""
+        wave_id = fx.Int32(fx.rocdl.wave_id())
+        local = wave_id * 8
+        if P == 4:
             row_ids = []
             for page in range_constexpr(2):
-                logical = (col0 + local) // PAGE_SIZE + page
+                logical = (col0 + local) // 4 + page
                 logical_ok = logical < width
                 safe_logical = logical_ok.select(logical, 0)
                 phys = _ld_uniform_i32(pt_rsrc, (req * width + safe_logical) * 4)
                 valid = logical_ok & (phys >= 0) & (phys < num_pages)
                 phys = valid.select(phys, 0)
-                for row in range_constexpr(PAGE_SIZE):
-                    row_ids.append(phys * PAGE_SIZE + row)
-            _tdm_k_gather(KV, ptr, row_ids, num_pages,
-                          buf * TDM_K_TILE_BYTES + local * TDM_K_ROW_BYTES)
+                for row in range_constexpr(4):
+                    row_ids.append(phys * 4 + row)
+        elif P == 16:   # wave w's 8 rows = half (w % 2) of page col0/16 + w/2
+            row_ids = _p16_row_ids(pt_rsrc, req, width, num_pages,
+                                   col0 // 16 + wave_id // 2, (wave_id % 2) * 8)
+        else:           # P = 8: wave w's 8 rows = page col0/8 + w
+            row_ids = _p16_row_ids(pt_rsrc, req, width, num_pages,
+                                   col0 // 8 + wave_id, 0, None, 8)
+        _tdm_k_gather(KV, ptr, row_ids, num_pages,
+                      buf * TDM_K_TILE_BYTES + local * TDM_K_ROW_BYTES, P)
 
-    def _persist_next(k):
-        """Trace-time stop of `range_constexpr(k + 1, stop)`: chunk k+1 if any."""
-        return min(k + 2, persist_chunks)
+    kt_issue = _kt_issue_w8 if kt_waves == 8 else _persist_issue_tdm
+
+    def _kt_tile(atom, kbuf, qf, c, kgrp):
+        """One M16 tile x column c from the LDS slab: the lane's rows a/b scores."""
+        k_base = _pair_base_tdm(None, None, c, kgrp)
+        acc_t = fx.make_rmem_tensor(8, fx.Float32)
+        acc_t.store(Vec.filled(8, 0.0, fx.Float32))
+        for s in range_constexpr(WMMA_K_STEPS):
+            kf = _rmem8(_pair_frag_tdm(kbuf, k_base + s * kstep_bytes))
+            fx.gemm(atom, acc_t, _rmem8(qf[s]), kf, acc_t)
+        acc = acc_t.load()
+        zero = fx.Float32(0.0)
+        sa = (
+            (fx.Float32(acc[0]).maximumf(zero) + fx.Float32(acc[1]).maximumf(zero))
+            + (fx.Float32(acc[2]).maximumf(zero) + fx.Float32(acc[3]).maximumf(zero))
+        )
+        sb = (
+            (fx.Float32(acc[4]).maximumf(zero) + fx.Float32(acc[5]).maximumf(zero))
+            + (fx.Float32(acc[6]).maximumf(zero) + fx.Float32(acc[7]).maximumf(zero))
+        )
+        return sa * inv_divisor, sb * inv_divisor
+
+    def _kt_values(atom, kbuf, qf, pp, cols, offs, columns, oks):
+        """`_pass_values` (staged) with prefetched page validity `oks` per N tile."""
+        neg_inf = fx.Float32(_NEG_INF)
+        out = []
+        for nt in range_constexpr(len(cols)):
+            c = cols[nt]
+            page_ok = oks[nt]
+            sa, sb = _kt_tile(atom, kbuf, qf, c, pp.kgrp)
+            col_ok = c < columns
+            va = (page_ok & (c < pp.vis_a)).select(sa, neg_inf)
+            vb = (page_ok & (c < pp.vis_b)).select(sb, neg_inf)
+            out.append((pp.own_a & col_ok, offs[2 * nt], va))
+            out.append((pp.own_b & col_ok, offs[2 * nt + 1], vb))
+        return out
 
     # Round DRAFT/NOBAR (QSA_R16_NOBAR=1, default since ROUND-MERGE1; TDM r16 only): each wave
     # gathers into and reads only its own tile (byte offset wave_id * tile), so
@@ -1176,16 +1791,25 @@ def _build_wmma_kernel(divisor: float, rows_per_block: int = 16, k_load: str | N
     q_row_bytes = NUM_HEADS * HEAD_DIM * 2            # 1024 B
     head_bytes = HEAD_DIM * 2                         # 256 B
     key_row_bytes = HEAD_DIM * 2                      # 256 B
-    page_bytes = PAGE_SIZE * key_row_bytes            # 1024 B
+    page_bytes = P * key_row_bytes            # 1024 B
     kstep_bytes = WMMA_K * 2                          # 64 B of one row per WMMA step
     kernel_name = (
         f"qsa_paged_mqa_logits_page4_gfx1250_bf16_wmma"
-        f"_D{HEAD_DIM}_H{NUM_HEADS}_P{PAGE_SIZE}"
+        f"_D{HEAD_DIM}_H{NUM_HEADS}_P{P}"
         f"_r{rows_per_block}_c{cols_per_block}_flydsl"
         + ("_tdm" if use_tdm else "")
     )
     if persist:
         kernel_name = kernel_name + f"_persist{persist_chunks}"
+        if fb_loop:
+            kernel_name = kernel_name + "_fbl"
+    if kstat:
+        kernel_name = kernel_name + f"_kstat{row_tiles}x{col_tiles}" + ("e" if early else "")
+    if ktile:
+        kernel_name = kernel_name + f"_kt{kt_rows}x{col_tiles}"
+        kernel_name = kernel_name + _r2d_tag(lean, ipf)
+    if trace:
+        kernel_name = kernel_name + f"_trace{int(trace)}"
     if r16_nobar:
         kernel_name = kernel_name + "_nobar"
     kernel_name = kernel_name + qp_tag
@@ -1219,7 +1843,7 @@ def _build_wmma_kernel(divisor: float, rows_per_block: int = 16, k_load: str | N
             ctx = _ld_i32(cl_rsrc, safe_req * 4)
             pos = ld_pos(qp_rsrc, safe_row)
             head = _imax(_imin(pos + 1, ctx), 0)
-            vis = req_ok.select(head // PAGE_SIZE, 0)
+            vis = req_ok.select(head // COMPRESS_RATIO, 0)
             out.append(_RowMeta(row, row_ok, req, req_ok, safe_req, vis))
         return out
 
@@ -1275,8 +1899,8 @@ def _build_wmma_kernel(divisor: float, rows_per_block: int = 16, k_load: str | N
 
     def _tile(atom, kv_rsrc, pt_rsrc, qf, pp, c, kgrp, width, num_pages, staged=False):
         """Scores of the lane's rows a/b; staged is a trace-time Python bool."""
-        logical = c // PAGE_SIZE
-        off = c % PAGE_SIZE
+        logical = c // P
+        off = c % P
         logical_ok = logical < width
         safe_logical = logical_ok.select(logical, 0)
         phys = _ld_i32(pt_rsrc, (pp.safe_req * width + safe_logical) * 4)
@@ -1348,8 +1972,8 @@ def _build_wmma_kernel(divisor: float, rows_per_block: int = 16, k_load: str | N
 
     def _tile_pair(atom, kv_rsrc, pt_rsrc, qfa, qfb, pp, c, kgrp, width, num_pages):
         """Two independent M16 accumulators, one B gather per K step."""
-        logical = c // PAGE_SIZE
-        off = c % PAGE_SIZE
+        logical = c // P
+        off = c % P
         logical_ok = logical < width
         safe_logical = logical_ok.select(logical, 0)
         phys = _ld_i32(pt_rsrc, (pp.safe_req * width + safe_logical) * 4)
@@ -1498,6 +2122,8 @@ def _build_wmma_kernel(divisor: float, rows_per_block: int = 16, k_load: str | N
         kgrp = lane // WMMA_N           # k-half of the operands, row pair of C
         t0 = (rblk * WMMA_WAVES + wave) * (2 * WMMA_ROWS_PER_WAVE)
         col0 = chunk * WMMA_COLS
+        _tr_begin(trs, trace, LOGITS, rows, columns, (columns + WMMA_COLS - 1) // WMMA_COLS,
+                  (rows + 31) // 32, WMMA_WAVES, chunk, rblk)
 
         # One pinned descriptor per plane, true extents in i64 (see `_plane`).
         q_rsrc = _plane(Q, _plane_bytes(rows, q_row_bytes))
@@ -1521,6 +2147,7 @@ def _build_wmma_kernel(divisor: float, rows_per_block: int = 16, k_load: str | N
             if writer:
                 _st_i32(vis_rsrc, meta_off, my_vis)
                 _st_i32(rst_rsrc, meta_off, fx.Int32(0))
+        _tr_mark(trs, 4, True)
 
         atom = fx.make_mma_atom(fx.rocdl.WMMA(WMMA_N, WMMA_N, WMMA_K, fx.BFloat16, fx.Float32))
         cols = _lane_cols(col0, n_in)
@@ -1529,14 +2156,18 @@ def _build_wmma_kernel(divisor: float, rows_per_block: int = 16, k_load: str | N
         neg_inf = fx.Float32(_NEG_INF)
         kptr = pair_storage(KV, kv_rsrc)
         reuse = _r32_guard(t2r_rsrc, rblk * 32, rows, num_requests)
+        _tr_mark(trs, 5, True)
         if reuse:
             pair_stage(KV, kptr, pt_rsrc, t2r_rsrc, rblk, col0, width, num_pages)
+            _tr_mark(trs, 9)                # ROUND-R2D: stage = TDM issue + wait + barrier
+            _tr_mark_rt(trs, 14)
             ppa = plans[0][0]
             ppb = plans[1][0]
             vmax = _imax(ppa.vmax, ppb.vmax)
             if col0 < vmax:
                 qfa = _q_frags(q_rsrc, t0, rows, n_in, kgrp)
                 qfb = _q_frags(q_rsrc, t0 + WMMA_ROWS_PER_WAVE, rows, n_in, kgrp)
+                _tr_mark(trs, 7, True)
                 res = _pair_values(atom, kptr, pt_rsrc, qfa, qfb, ppa, ppb,
                                    cols, offs[0], offs[1], columns, width, num_pages)
                 for j1 in range_constexpr(4 * WMMA_N_TILES):
@@ -1548,6 +2179,7 @@ def _build_wmma_kernel(divisor: float, rows_per_block: int = 16, k_load: str | N
                     for j2 in range_constexpr(2 * WMMA_N_TILES):
                         if msk[j2][0]:
                             _st_f32(logits_rsrc, msk[j2][1], neg_inf)
+            _tr_mark(trs, 10)
         if reuse == 0:
             # Exact r16 per-M-tile path for mixed requests and incomplete blocks.
             for mi in range_constexpr(2):
@@ -1569,6 +2201,8 @@ def _build_wmma_kernel(divisor: float, rows_per_block: int = 16, k_load: str | N
                                 for j4 in range_constexpr(2 * WMMA_N_TILES):
                                     if masks[j4][0]:
                                         _st_f32(logits_rsrc, masks[j4][1], neg_inf)
+        _tr_mark(trs, 10)
+        _tr_end(trs)
 
     @flyc.kernel(name=kernel_name, known_block_size=[WMMA_THREADS, 1, 1])
     def kernel_r64(
@@ -1881,6 +2515,548 @@ def _build_wmma_kernel(divisor: float, rows_per_block: int = 16, k_load: str | N
                                             _st_f32(logits_rsrc, masks[j4][1], neg_inf)
 
     @flyc.kernel(name=kernel_name, known_block_size=[WMMA_THREADS, 1, 1])
+    def kernel_r32_persist_fbl(
+        Q, KV, PT, T2R, QP, CL, LOGITS, VIS, RST,
+        rows: fx.Int32, columns: fx.Int32, num_pages: fx.Int32,
+        num_requests: fx.Int32, width: fx.Int32,
+    ):
+        # ROUND-R2B: kernel_r32_persist with its raw fallback's chunk loop as a
+        # runtime scf.for (unroll disabled). The reuse path is verbatim.
+        tid = fx.Int32(fx.thread_idx.x)
+        chunk = fx.Int32(fx.block_idx.x)
+        rblk = fx.Int32(fx.block_idx.y)
+        wave = tid // WMMA_WAVE
+        lane = tid % WMMA_WAVE
+        n_in = lane % WMMA_N            # A: slot m / B, C: column n
+        kgrp = lane // WMMA_N           # k-half of the operands, row pair of C
+        t0 = (rblk * WMMA_WAVES + wave) * (2 * WMMA_ROWS_PER_WAVE)
+        span0 = chunk * (WMMA_COLS * persist_chunks)
+
+        q_rsrc = _plane(Q, _plane_bytes(rows, q_row_bytes))
+        kv_rsrc = _plane(KV, _plane_bytes(num_pages, page_bytes))
+        pt_rsrc = _plane(PT, _plane_bytes(num_requests, 4, width))
+        t2r_rsrc = _plane(T2R, _plane_bytes(rows, 4))
+        qp_rsrc = _plane(QP, _plane_bytes(rows, qp_bytes))
+        cl_rsrc = _plane(CL, _plane_bytes(num_requests, 4))
+        logits_rsrc = _plane(LOGITS, _plane_bytes(rows, 4, columns))
+        vis_rsrc = _plane(VIS, _plane_bytes(rows, 4))
+        rst_rsrc = _plane(RST, _plane_bytes(rows, 4))
+
+        metas = [_rows_meta(t2r_rsrc, qp_rsrc, cl_rsrc, t0 + mi * WMMA_ROWS_PER_WAVE,
+                            rows, num_requests) for mi in range_constexpr(2)]
+        plans = [_pass_plan(metas[mi], rows, kgrp) for mi in range_constexpr(2)]
+        for mi in range_constexpr(2):
+            my_vis = _pick_vis(lane, metas[mi])
+            my_row = t0 + mi * WMMA_ROWS_PER_WAVE + _imin(lane, WMMA_ROWS_PER_WAVE - 1)
+            meta_off = _imin(my_row, rows - 1) * 4
+            writer = (chunk == 0) & (lane < WMMA_ROWS_PER_WAVE) & (my_row < rows)
+            if writer:
+                _st_i32(vis_rsrc, meta_off, my_vis)
+                _st_i32(rst_rsrc, meta_off, fx.Int32(0))
+
+        atom = fx.make_mma_atom(fx.rocdl.WMMA(WMMA_N, WMMA_N, WMMA_K, fx.BFloat16, fx.Float32))
+        neg_inf = fx.Float32(_NEG_INF)
+        kbase = _persist_storage_tdm()
+        reuse = _r32_guard(t2r_rsrc, rblk * 32, rows, num_requests)
+        if reuse:
+            preq = _ld_uniform_i32(t2r_rsrc, rblk * 32 * 4)
+            bvis = _persist_block_vis(cl_rsrc, preq)
+            issue = [(span0 + k0 * WMMA_COLS < bvis) & (span0 + k0 * WMMA_COLS < columns)
+                     for k0 in range_constexpr(persist_chunks)]
+            ppa = plans[0][0]
+            ppb = plans[1][0]
+            vmax = _imax(ppa.vmax, ppb.vmax)
+            qfa = _q_frags(q_rsrc, t0, rows, n_in, kgrp)
+            qfb = _q_frags(q_rsrc, t0 + WMMA_ROWS_PER_WAVE, rows, n_in, kgrp)
+            if issue[0]:
+                _persist_issue_tdm(KV, kbase, pt_rsrc, preq, span0, width, num_pages, 0)
+            fx.rocdl.tdm_ops.tensor_wait(0)
+            fx.gpu.barrier()
+            for k in range_constexpr(persist_chunks):
+                for kn in range_constexpr(k + 1, _persist_next(k)):
+                    if issue[kn]:
+                        _persist_issue_tdm(KV, kbase, pt_rsrc, preq, span0 + kn * WMMA_COLS,
+                                           width, num_pages, kn % TDM_PERSIST_BUFFERS)
+                col0 = span0 + k * WMMA_COLS
+                cols = _lane_cols(col0, n_in)
+                offa = _store_offsets(t0, kgrp, cols, rows, columns)
+                offb = _store_offsets(t0 + WMMA_ROWS_PER_WAVE, kgrp, cols, rows, columns)
+                kbuf = kbase + (k % TDM_PERSIST_BUFFERS) * (TDM_K_TILE_BYTES // 4)
+                if col0 < vmax:
+                    res = _pair_values(atom, kbuf, pt_rsrc, qfa, qfb, ppa, ppb,
+                                       cols, offa, offb, columns, width, num_pages)
+                    for j1 in range_constexpr(4 * WMMA_N_TILES):
+                        if res[j1][0]:
+                            _st_f32(logits_rsrc, res[j1][1], res[j1][2])
+                if col0 >= vmax:
+                    for mi2 in range_constexpr(2):
+                        msk = _pass_masks(plans[mi2][0], cols, (offa, offb)[mi2], columns)
+                        for j2 in range_constexpr(2 * WMMA_N_TILES):
+                            if msk[j2][0]:
+                                _st_f32(logits_rsrc, msk[j2][1], neg_inf)
+                for kw in range_constexpr(k + 1, _persist_next(k)):
+                    fx.rocdl.tdm_ops.tensor_wait(0)
+                    fx.gpu.barrier()
+        if reuse == 0:
+            # Exact r16 per-M-tile raw path; the chunk loop is a runtime loop (R2B).
+            for kf in range(fx.Int32(0), fx.Int32(persist_chunks), fx.Int32(1), unroll=1):
+                fcol0 = span0 + fx.Int32(kf) * WMMA_COLS
+                fcols = _lane_cols(fcol0, n_in)
+                for fm in range_constexpr(2):
+                    subt0 = t0 + fm * WMMA_ROWS_PER_WAVE
+                    foffs = _store_offsets(subt0, kgrp, fcols, rows, columns)
+                    live = subt0 < rows
+                    if live:
+                        qf = _q_frags(q_rsrc, subt0, rows, n_in, kgrp)
+                        for p in range_constexpr(WMMA_PASSES):
+                            pp = plans[fm][p]
+                            if pp.active:
+                                if fcol0 < pp.vmax:
+                                    fallback = _pass_values(atom, kv_rsrc, pt_rsrc, qf, pp, fcols,
+                                                            foffs, columns, width, num_pages)
+                                    for j3 in range_constexpr(2 * WMMA_N_TILES):
+                                        if fallback[j3][0]:
+                                            _st_f32(logits_rsrc, fallback[j3][1], fallback[j3][2])
+                                if fcol0 >= pp.vmax:
+                                    masks = _pass_masks(pp, fcols, foffs, columns)
+                                    for j4 in range_constexpr(2 * WMMA_N_TILES):
+                                        if masks[j4][0]:
+                                            _st_f32(logits_rsrc, masks[j4][1], neg_inf)
+
+    @flyc.kernel(name=kernel_name, known_block_size=[WMMA_THREADS, 1, 1])
+    def kernel_r32_kstat(
+        Q, KV, PT, T2R, QP, CL, LOGITS, VIS, RST,
+        rows: fx.Int32, columns: fx.Int32, num_pages: fx.Int32,
+        num_requests: fx.Int32, width: fx.Int32,
+    ):
+        # ROUND-R2B: block (x, y) owns columns [x*64C, x*64C + 64C) and the R
+        # 32-row blocks y*R .. y*R + R - 1 (runtime loop, unroll disabled).
+        tid = fx.Int32(fx.thread_idx.x)
+        slab = fx.Int32(fx.block_idx.x)
+        rspan = fx.Int32(fx.block_idx.y)
+        wave = tid // WMMA_WAVE
+        lane = tid % WMMA_WAVE
+        n_in = lane % WMMA_N            # A: slot m / B, C: column n
+        kgrp = lane // WMMA_N           # k-half of the operands, row pair of C
+        slab0 = slab * (WMMA_COLS * col_tiles)
+
+        q_rsrc = _plane(Q, _plane_bytes(rows, q_row_bytes))
+        kv_rsrc = _plane(KV, _plane_bytes(num_pages, page_bytes))
+        pt_rsrc = _plane(PT, _plane_bytes(num_requests, 4, width))
+        t2r_rsrc = _plane(T2R, _plane_bytes(rows, 4))
+        qp_rsrc = _plane(QP, _plane_bytes(rows, qp_bytes))
+        cl_rsrc = _plane(CL, _plane_bytes(num_requests, 4))
+        logits_rsrc = _plane(LOGITS, _plane_bytes(rows, 4, columns))
+        vis_rsrc = _plane(VIS, _plane_bytes(rows, 4))
+        rst_rsrc = _plane(RST, _plane_bytes(rows, 4))
+
+        atom = fx.make_mma_atom(fx.rocdl.WMMA(WMMA_N, WMMA_N, WMMA_K, fx.BFloat16, fx.Float32))
+        neg_inf = fx.Float32(_NEG_INF)
+        kbase = _kstat_storage_tdm()
+        # The slab's K request (SGPR): one TDM issue per K tile for the whole span.
+        # Issue guards are SGPR-uniform and never surround a wait or a barrier.
+        kreq, kreq_ok, ksafe, kvis = _kstat_slab_req(t2r_rsrc, cl_rsrc, rspan * (32 * row_tiles),
+                                                     rows, num_requests)
+        kissue = [kreq_ok & (slab0 + ki * WMMA_COLS < kvis) & (slab0 + ki * WMMA_COLS < columns)
+                  for ki in range_constexpr(col_tiles)]
+        for ki2 in range_constexpr(col_tiles):
+            if kissue[ki2]:
+                _persist_issue_tdm(KV, kbase, pt_rsrc, ksafe, slab0 + ki2 * WMMA_COLS, width,
+                                   num_pages, ki2)
+        # ROUND-R2C early: the slab's page validity per lane column (no-op otherwise).
+        kpre = kstat_pre(pt_rsrc, ksafe, kreq_ok, slab0, n_in, width, num_pages)
+        for it in range(fx.Int32(0), fx.Int32(row_tiles), fx.Int32(1), unroll=1):
+            rb = rspan * row_tiles + fx.Int32(it)
+            t0 = (rb * WMMA_WAVES + wave) * (2 * WMMA_ROWS_PER_WAVE)
+            metas = [_rows_meta(t2r_rsrc, qp_rsrc, cl_rsrc, t0 + mi * WMMA_ROWS_PER_WAVE,
+                                rows, num_requests) for mi in range_constexpr(2)]
+            plans = [_pass_plan(metas[mi], rows, kgrp) for mi in range_constexpr(2)]
+            for mi in range_constexpr(2):
+                my_vis = _pick_vis(lane, metas[mi])
+                my_row = t0 + mi * WMMA_ROWS_PER_WAVE + _imin(lane, WMMA_ROWS_PER_WAVE - 1)
+                meta_off = _imin(my_row, rows - 1) * 4
+                writer = (slab == 0) & (lane < WMMA_ROWS_PER_WAVE) & (my_row < rows)
+                if writer:
+                    _st_i32(vis_rsrc, meta_off, my_vis)
+                    _st_i32(rst_rsrc, meta_off, fx.Int32(0))
+            reuse = _kstat_tile_ok(t2r_rsrc, rb * 32, rows, num_requests, kreq)
+            # Q of both M tiles is issued before the K publish so its latency overlaps
+            # the first (only) TDM wait; clamped rows keep every load in bounds.
+            qfa = _q_frags(q_rsrc, t0, rows, n_in, kgrp)
+            qfb = _q_frags(q_rsrc, t0 + WMMA_ROWS_PER_WAVE, rows, n_in, kgrp)
+            fx.rocdl.tdm_ops.tensor_wait(0)
+            fx.gpu.barrier()
+            if reuse:
+                ppa = plans[0][0]
+                ppb = plans[1][0]
+                vmax = _imax(ppa.vmax, ppb.vmax)
+                for ct in range_constexpr(col_tiles):
+                    col0 = slab0 + ct * WMMA_COLS
+                    cols = _lane_cols(col0, n_in)
+                    offa = _store_offsets(t0, kgrp, cols, rows, columns)
+                    offb = _store_offsets(t0 + WMMA_ROWS_PER_WAVE, kgrp, cols, rows, columns)
+                    kbuf = kbase + ct * (TDM_K_TILE_BYTES // 4)
+                    if col0 < vmax:
+                        res = kstat_values(atom, kbuf, pt_rsrc, qfa, qfb, ppa, ppb,
+                                           cols, offa, offb, columns, width, num_pages, kpre, ct)
+                        for j1 in range_constexpr(4 * WMMA_N_TILES):
+                            if res[j1][0]:
+                                _st_f32(logits_rsrc, res[j1][1], res[j1][2])
+                    if col0 >= vmax:
+                        for mi2 in range_constexpr(2):
+                            msk = _pass_masks(plans[mi2][0], cols, (offa, offb)[mi2], columns)
+                            for j2 in range_constexpr(2 * WMMA_N_TILES):
+                                if msk[j2][0]:
+                                    _st_f32(logits_rsrc, msk[j2][1], neg_inf)
+            if reuse == 0:
+                # Exact r16 per-M-tile raw path (mixed / partial / other-request blocks).
+                for kf in range(fx.Int32(0), fx.Int32(col_tiles), fx.Int32(1), unroll=1):
+                    fcol0 = slab0 + fx.Int32(kf) * WMMA_COLS
+                    fcols = _lane_cols(fcol0, n_in)
+                    for fm in range_constexpr(2):
+                        subt0 = t0 + fm * WMMA_ROWS_PER_WAVE
+                        foffs = _store_offsets(subt0, kgrp, fcols, rows, columns)
+                        live = subt0 < rows
+                        if live:
+                            qf = _q_frags(q_rsrc, subt0, rows, n_in, kgrp)
+                            for p in range_constexpr(WMMA_PASSES):
+                                pp = plans[fm][p]
+                                if pp.active:
+                                    if fcol0 < pp.vmax:
+                                        fallback = _pass_values(atom, kv_rsrc, pt_rsrc, qf, pp,
+                                                                fcols, foffs, columns, width,
+                                                                num_pages)
+                                        for j3 in range_constexpr(2 * WMMA_N_TILES):
+                                            if fallback[j3][0]:
+                                                _st_f32(logits_rsrc, fallback[j3][1],
+                                                        fallback[j3][2])
+                                    if fcol0 >= pp.vmax:
+                                        masks = _pass_masks(pp, fcols, foffs, columns)
+                                        for j4 in range_constexpr(2 * WMMA_N_TILES):
+                                            if masks[j4][0]:
+                                                _st_f32(logits_rsrc, masks[j4][1], neg_inf)
+
+    @flyc.kernel(name=kernel_name, known_block_size=[kt_threads, 1, 1])
+    def kernel_kt(
+        Q, KV, PT, T2R, QP, CL, LOGITS, VIS, RST,
+        rows: fx.Int32, columns: fx.Int32, num_pages: fx.Int32,
+        num_requests: fx.Int32, width: fx.Int32,
+    ):
+        # ROUND-R2C: block (x, y) owns columns [x*64C, x*64C + 64C) and rows
+        # [y*RB, y*RB + RB); wave w owns the M tile of rows y*RB + 4w .. +3.
+        _inst_prefetch(ipf)             # ROUND-R2D (ipf=0: nothing)
+        tid = fx.Int32(fx.thread_idx.x)
+        slab = fx.Int32(fx.block_idx.x)
+        rblk = fx.Int32(fx.block_idx.y)
+        wave = tid // WMMA_WAVE
+        lane = tid % WMMA_WAVE
+        n_in = lane % WMMA_N            # A: slot m / B, C: column n
+        kgrp = lane // WMMA_N           # k-half of the operands, row pair of C
+        slab0 = slab * (WMMA_COLS * col_tiles)
+        base = rblk * kt_rows
+        t0 = base + wave * WMMA_ROWS_PER_WAVE
+        _tr_begin(trs, trace, LOGITS, rows, columns,
+                  (columns + WMMA_COLS * col_tiles - 1) // (WMMA_COLS * col_tiles),
+                  (rows + kt_rows - 1) // kt_rows, kt_waves, slab, rblk)
+
+        q_rsrc = _plane(Q, _plane_bytes(rows, q_row_bytes))
+        kv_rsrc = _plane(KV, _plane_bytes(num_pages, page_bytes))
+        pt_rsrc = _plane(PT, _plane_bytes(num_requests, 4, width))
+        t2r_rsrc = _plane(T2R, _plane_bytes(rows, 4))
+        qp_rsrc = _plane(QP, _plane_bytes(rows, qp_bytes))
+        cl_rsrc = _plane(CL, _plane_bytes(num_requests, 4))
+        logits_rsrc = _plane(LOGITS, _plane_bytes(rows, 4, columns))
+        vis_rsrc = _plane(VIS, _plane_bytes(rows, 4))
+        rst_rsrc = _plane(RST, _plane_bytes(rows, 4))
+
+        meta = _rows_meta(t2r_rsrc, qp_rsrc, cl_rsrc, t0, rows, num_requests)
+        plans = _pass_plan(meta, rows, kgrp)
+        my_vis = _pick_vis(lane, meta)
+        my_row = t0 + _imin(lane, WMMA_ROWS_PER_WAVE - 1)
+        meta_off = _imin(my_row, rows - 1) * 4
+        writer = (slab == 0) & (lane < WMMA_ROWS_PER_WAVE) & (my_row < rows)
+        if writer:
+            _st_i32(vis_rsrc, meta_off, my_vis)
+            _st_i32(rst_rsrc, meta_off, fx.Int32(0))
+        _tr_mark(trs, 4, True)
+
+        atom = fx.make_mma_atom(fx.rocdl.WMMA(WMMA_N, WMMA_N, WMMA_K, fx.BFloat16, fx.Float32))
+        neg_inf = fx.Float32(_NEG_INF)
+        kbase = _kstat_storage_tdm()
+        kreq, full = _kt_guard(t2r_rsrc, base, rows, num_requests)
+        _tr_mark(trs, 5, True)
+        if full:
+            # Uniform branch: TDM issue (SGPR guards, no wait inside), then Q + page
+            # validity, then the single wait + barrier, then LDS-only scoring.
+            kvis = _persist_block_vis(cl_rsrc, kreq)
+            kissue = [(slab0 + ki * WMMA_COLS < kvis) & (slab0 + ki * WMMA_COLS < columns)
+                      for ki in range_constexpr(col_tiles)]
+            for ki2 in range_constexpr(col_tiles):
+                if kissue[ki2]:
+                    kt_issue(KV, kbase, pt_rsrc, kreq, slab0 + ki2 * WMMA_COLS, width,
+                             num_pages, ki2)
+            _tr_mark(trs, 6)
+            qf = _q_frags(q_rsrc, t0, rows, n_in, kgrp)
+            kpre = _kstat_page_pre(pt_rsrc, kreq, full, slab0, n_in, width, num_pages)
+            _tr_mark(trs, 7, True)
+            fx.rocdl.tdm_ops.tensor_wait(0)
+            _tr_mark(trs, 8)
+            fx.gpu.barrier()
+            _tr_mark(trs, 9)
+            _tr_mark_rt(trs, 14)
+            pf = plans[0]
+            for ct in range_constexpr(col_tiles):
+                col0 = slab0 + ct * WMMA_COLS
+                cols = _lane_cols(col0, n_in)
+                offs = _store_offsets(t0, kgrp, cols, rows, columns)
+                kbuf = kbase + ct * (TDM_K_TILE_BYTES // 4)
+                if col0 < pf.vmax:
+                    res = _kt_values(atom, kbuf, qf, pf, cols, offs, columns, kpre[ct])
+                    for j1 in range_constexpr(2 * WMMA_N_TILES):
+                        if res[j1][0]:
+                            _st_f32(logits_rsrc, res[j1][1], res[j1][2])
+                if col0 >= pf.vmax:
+                    msk = _pass_masks(pf, cols, offs, columns)
+                    for j2 in range_constexpr(2 * WMMA_N_TILES):
+                        if msk[j2][0]:
+                            _st_f32(logits_rsrc, msk[j2][1], neg_inf)
+            _tr_mark(trs, 10)
+        if full == 0:
+            # Exact per-wave raw path (mixed / partial / invalid-request blocks).
+            for kf in range(fx.Int32(0), fx.Int32(col_tiles), fx.Int32(1), unroll=1):
+                fcol0 = slab0 + fx.Int32(kf) * WMMA_COLS
+                fcols = _lane_cols(fcol0, n_in)
+                foffs = _store_offsets(t0, kgrp, fcols, rows, columns)
+                live = t0 < rows
+                if live:
+                    fqf = _q_frags(q_rsrc, t0, rows, n_in, kgrp)
+                    for p in range_constexpr(WMMA_PASSES):
+                        pp = plans[p]
+                        if pp.active:
+                            if fcol0 < pp.vmax:
+                                fallback = _pass_values(atom, kv_rsrc, pt_rsrc, fqf, pp,
+                                                        fcols, foffs, columns, width, num_pages)
+                                for j3 in range_constexpr(2 * WMMA_N_TILES):
+                                    if fallback[j3][0]:
+                                        _st_f32(logits_rsrc, fallback[j3][1], fallback[j3][2])
+                            if fcol0 >= pp.vmax:
+                                masks = _pass_masks(pp, fcols, foffs, columns)
+                                for j4 in range_constexpr(2 * WMMA_N_TILES):
+                                    if masks[j4][0]:
+                                        _st_f32(logits_rsrc, masks[j4][1], neg_inf)
+            _tr_mark(trs, 10)
+        _tr_end(trs)
+
+    # ---- ROUND-R2D lean ktile (k_load='ktile', lean=True; see _r2d_check) -------------
+    def _ktl_pre(t2r_rsrc, qp_rsrc, cl_rsrc, pt_rsrc, base, t0s, rows, columns,
+                 num_requests, slab0, width, num_pages, wave_id):
+        """ONE batch of SGPR loads for the full-block path, then the derived values.
+
+        Returns (full, safe request, vis[4] of the wave's rows, kissue[ct], gathers).
+        Offsets are clamped exactly like `_kt_guard` / `_rows_meta_uniform` /
+        `_kt_issue_w8` / `_persist_issue_tdm` (in-plane by construction); the TDM row ids
+        are the same expressions (valid -> phys, else page 0), so the gathers are identical.
+        """
+        # -- issue (no use in between) --
+        g = [_ld_uniform_i32(t2r_rsrc, _imin(base + i, rows - 1) * 4)
+             for i in range_constexpr(kt_rows)]
+        req0 = g[0]
+        req_ok = (req0 >= 0) & (req0 < num_requests)
+        safe = req_ok.select(req0, 0)
+        pos = [ld_uniform_pos(qp_rsrc, _imin(t0s + i, rows - 1))
+               for i in range_constexpr(WMMA_ROWS_PER_WAVE)]
+        ctx = _ld_uniform_i32(cl_rsrc, safe * 4)
+        gpw = 8 // kt_waves                       # 8-row gathers per wave per 64-col tile
+        span = WMMA_COLS // kt_waves              # columns per wave per 64-col tile
+        plan = []
+        for ct in range_constexpr(col_tiles):
+            for gi in range_constexpr(gpw):
+                local = wave_id * span + gi * 8
+                col = slab0 + ct * WMMA_COLS + local
+                ents = []
+                for page in range_constexpr(2 if P == 4 else 1):
+                    logical = col // P + page
+                    logical_ok = logical < width
+                    safe_logical = logical_ok.select(logical, 0)
+                    ents.append((logical_ok, _ld_uniform_i32(
+                        pt_rsrc, (safe * width + safe_logical) * 4)))
+                plan.append((ct, local, ents))
+        # -- use --
+        full = (base + kt_rows <= rows) & req_ok
+        for i in range_constexpr(1, kt_rows):
+            full = full & (g[i] == req0)
+        # Pin the batch before the (uniform) full branch: LLVM otherwise sinks the ctx /
+        # page-table loads into it and re-serialises them behind the ctx wait. An empty
+        # side-effecting asm reading the SGPRs needs them all landed (ONE s_wait_kmcnt);
+        # it emits no instruction and changes no value (ull = the kernel_kt guard).
+        _pin_sgprs(g + [ctx] + [phys for _ct, _local, _ents in plan for _lok, phys in _ents])
+        vis = [_imax(_imin(pos[i] + 1, ctx), 0) // COMPRESS_RATIO
+               for i in range_constexpr(WMMA_ROWS_PER_WAVE)]
+        kvis = _imax(ctx, 0) // COMPRESS_RATIO
+        kissue = [(slab0 + ct * WMMA_COLS < kvis) & (slab0 + ct * WMMA_COLS < columns)
+                  for ct in range_constexpr(col_tiles)]
+        gathers = []
+        for ct, local, ents in plan:
+            row_ids = []
+            for logical_ok, phys in ents:
+                valid = logical_ok & (phys >= 0) & (phys < num_pages)
+                phys = valid.select(phys, 0)
+                if P == 4:
+                    for row in range_constexpr(4):
+                        row_ids.append(phys * 4 + row)
+                else:
+                    row0 = local % 16 if P == 16 else 0
+                    for r in range_constexpr(8):
+                        row_ids.append(phys * P + (row0 + r))
+            gathers.append((ct, local, row_ids))
+        return full, safe, vis, kissue, gathers
+
+    def _ktl_issue(KV, kbase, gathers, ct, num_pages):
+        for gct, local, row_ids in gathers:
+            if gct == ct:
+                _tdm_k_gather(KV, kbase, row_ids, num_pages,
+                              ct * TDM_K_TILE_BYTES + local * TDM_K_ROW_BYTES, P)
+
+    def _ktl_rowvals(lane, kgrp, vis):
+        """(this lane's vis/rst value for lanes 0..3, vis_a, vis_b, vmax) from SGPR vis."""
+        v = vis[WMMA_ROWS_PER_WAVE - 1]
+        for i in range_constexpr(WMMA_ROWS_PER_WAVE - 2, -1, -1):
+            v = (lane == i).select(vis[i], v)
+        g0 = kgrp == 0
+        vmax = _imax(_imax(vis[0], vis[1]), _imax(vis[2], vis[3]))
+        return v, g0.select(vis[0], vis[2]), g0.select(vis[1], vis[3]), vmax
+
+    def _ktl_values(atom, kbuf, qf, kgrp, cols, offs, columns, oks, vis_a, vis_b):
+        """`_kt_values` of a full block (every row owned, ok = column in range)."""
+        neg_inf = fx.Float32(_NEG_INF)
+        out = []
+        for nt in range_constexpr(len(cols)):
+            c = cols[nt]
+            sa, sb = _kt_tile(atom, kbuf, qf, c, kgrp)
+            va = (oks[nt] & (c < vis_a)).select(sa, neg_inf)
+            vb = (oks[nt] & (c < vis_b)).select(sb, neg_inf)
+            out.append((c < columns, offs[2 * nt], va))
+            out.append((c < columns, offs[2 * nt + 1], vb))
+        return out
+
+    @flyc.kernel(name=kernel_name, known_block_size=[kt_threads, 1, 1])
+    def kernel_kt_lean(
+        Q, KV, PT, T2R, QP, CL, LOGITS, VIS, RST,
+        rows: fx.Int32, columns: fx.Int32, num_pages: fx.Int32,
+        num_requests: fx.Int32, width: fx.Int32,
+    ):
+        # ROUND-R2D: kernel_kt with the lean full-block path (see _r2d_check / _ktl_pre).
+        _inst_prefetch(ipf)
+        tid = fx.Int32(fx.thread_idx.x)
+        slab = fx.Int32(fx.block_idx.x)
+        rblk = fx.Int32(fx.block_idx.y)
+        wave_id = fx.Int32(fx.rocdl.wave_id())
+        lane = tid % WMMA_WAVE
+        n_in = lane % WMMA_N
+        kgrp = lane // WMMA_N
+        slab0 = slab * (WMMA_COLS * col_tiles)
+        base = rblk * kt_rows
+        t0s = base + wave_id * WMMA_ROWS_PER_WAVE
+        _tr_begin(trs, trace, LOGITS, rows, columns,
+                  (columns + WMMA_COLS * col_tiles - 1) // (WMMA_COLS * col_tiles),
+                  (rows + kt_rows - 1) // kt_rows, kt_waves, slab, rblk)
+
+        q_rsrc = _plane(Q, _plane_bytes(rows, q_row_bytes))
+        kv_rsrc = _plane(KV, _plane_bytes(num_pages, page_bytes))
+        pt_rsrc = _plane(PT, _plane_bytes(num_requests, 4, width))
+        t2r_rsrc = _plane(T2R, _plane_bytes(rows, 4))
+        qp_rsrc = _plane(QP, _plane_bytes(rows, qp_bytes))
+        cl_rsrc = _plane(CL, _plane_bytes(num_requests, 4))
+        logits_rsrc = _plane(LOGITS, _plane_bytes(rows, 4, columns))
+        vis_rsrc = _plane(VIS, _plane_bytes(rows, 4))
+        rst_rsrc = _plane(RST, _plane_bytes(rows, 4))
+        atom = fx.make_mma_atom(fx.rocdl.WMMA(WMMA_N, WMMA_N, WMMA_K, fx.BFloat16, fx.Float32))
+        neg_inf = fx.Float32(_NEG_INF)
+        kbase = _kstat_storage_tdm()
+        full, kreq, lvis, kissue, gathers = _ktl_pre(
+            t2r_rsrc, qp_rsrc, cl_rsrc, pt_rsrc, base, t0s, rows, columns, num_requests,
+            slab0, width, num_pages, wave_id)
+        _tr_mark(trs, 5, True)
+        if full:
+            for ki in range_constexpr(col_tiles):
+                if kissue[ki]:
+                    _ktl_issue(KV, kbase, gathers, ki, num_pages)
+            _tr_mark(trs, 6)
+            qf = _q_frags(q_rsrc, t0s, rows, n_in, kgrp)
+            kpre = _kstat_page_pre(pt_rsrc, kreq, full, slab0, n_in, width, num_pages)
+            lv, vis_a, vis_b, vmax = _ktl_rowvals(lane, kgrp, lvis)
+            lrow_off = _imin(t0s + _imin(lane, WMMA_ROWS_PER_WAVE - 1), rows - 1) * 4
+            lwriter = (slab == 0) & (lane < WMMA_ROWS_PER_WAVE)
+            if lwriter:
+                _st_i32(vis_rsrc, lrow_off, lv)
+                _st_i32(rst_rsrc, lrow_off, fx.Int32(0))
+            _tr_mark(trs, 7, True)
+            fx.rocdl.tdm_ops.tensor_wait(0)
+            _tr_mark(trs, 8)
+            fx.rocdl.s_barrier()          # TENSORcnt==0 => slab in LDS (mi400-tdm-sync)
+            _tr_mark(trs, 9)
+            _tr_mark_rt(trs, 14)
+            inside = slab0 + WMMA_COLS * col_tiles <= columns
+            for ct in range_constexpr(col_tiles):
+                col0 = slab0 + ct * WMMA_COLS
+                cols = _lane_cols(col0, n_in)
+                offs = _store_offsets(t0s, kgrp, cols, rows, columns)
+                kbuf = kbase + ct * (TDM_K_TILE_BYTES // 4)
+                if col0 < vmax:
+                    res = _ktl_values(atom, kbuf, qf, kgrp, cols, offs, columns, kpre[ct],
+                                      vis_a, vis_b)
+                    if inside:
+                        for j1 in range_constexpr(2 * WMMA_N_TILES):
+                            _st_f32(logits_rsrc, res[j1][1], res[j1][2])
+                    if inside == 0:
+                        for j2 in range_constexpr(2 * WMMA_N_TILES):
+                            if res[j2][0]:
+                                _st_f32(logits_rsrc, res[j2][1], res[j2][2])
+                if col0 >= vmax:
+                    if inside:
+                        for j3 in range_constexpr(2 * WMMA_N_TILES):
+                            _st_f32(logits_rsrc, offs[j3], neg_inf)
+                    if inside == 0:
+                        for j4 in range_constexpr(2 * WMMA_N_TILES):
+                            if cols[j4 // 2] < columns:
+                                _st_f32(logits_rsrc, offs[j4], neg_inf)
+            _tr_mark(trs, 10)
+        if full == 0:
+            # Exact kernel_kt per-wave raw path (mixed / partial / invalid-request blocks).
+            meta = _rows_meta(t2r_rsrc, qp_rsrc, cl_rsrc, t0s, rows, num_requests)
+            plans = _pass_plan(meta, rows, kgrp)
+            my_vis = _pick_vis(lane, meta)
+            my_row = t0s + _imin(lane, WMMA_ROWS_PER_WAVE - 1)
+            meta_off = _imin(my_row, rows - 1) * 4
+            writer = (slab == 0) & (lane < WMMA_ROWS_PER_WAVE) & (my_row < rows)
+            if writer:
+                _st_i32(vis_rsrc, meta_off, my_vis)
+                _st_i32(rst_rsrc, meta_off, fx.Int32(0))
+            for kf in range(fx.Int32(0), fx.Int32(col_tiles), fx.Int32(1), unroll=1):
+                fcol0 = slab0 + fx.Int32(kf) * WMMA_COLS
+                fcols = _lane_cols(fcol0, n_in)
+                foffs = _store_offsets(t0s, kgrp, fcols, rows, columns)
+                live = t0s < rows
+                if live:
+                    fqf = _q_frags(q_rsrc, t0s, rows, n_in, kgrp)
+                    for p in range_constexpr(WMMA_PASSES):
+                        pp = plans[p]
+                        if pp.active:
+                            if fcol0 < pp.vmax:
+                                fallback = _pass_values(atom, kv_rsrc, pt_rsrc, fqf, pp,
+                                                        fcols, foffs, columns, width, num_pages)
+                                for j5 in range_constexpr(2 * WMMA_N_TILES):
+                                    if fallback[j5][0]:
+                                        _st_f32(logits_rsrc, fallback[j5][1], fallback[j5][2])
+                            if fcol0 >= pp.vmax:
+                                masks = _pass_masks(pp, fcols, foffs, columns)
+                                for j6 in range_constexpr(2 * WMMA_N_TILES):
+                                    if masks[j6][0]:
+                                        _st_f32(logits_rsrc, masks[j6][1], neg_inf)
+            _tr_mark(trs, 10)
+        _tr_end(trs)
+
+    @flyc.kernel(name=kernel_name, known_block_size=[WMMA_THREADS, 1, 1])
     def kernel_tdm_r16_nobar(
         Q, KV, PT, T2R, QP, CL, LOGITS, VIS, RST,
         rows: fx.Int32, columns: fx.Int32, num_pages: fx.Int32,
@@ -1968,7 +3144,11 @@ def _build_wmma_kernel(divisor: float, rows_per_block: int = 16, k_load: str | N
     selected_kernel = ((kernel_tdm_r16 if use_tdm else kernel) if rows_per_block == 16
                        else (kernel_r64 if rows_per_block == 64 else kernel_r32))
     if persist:
-        selected_kernel = kernel_r32_persist
+        selected_kernel = kernel_r32_persist_fbl if fb_loop else kernel_r32_persist
+    if kstat:
+        selected_kernel = kernel_r32_kstat
+    if ktile:
+        selected_kernel = kernel_kt_lean if lean else kernel_kt
     if r16_nobar:
         selected_kernel = kernel_tdm_r16_nobar
 
@@ -1998,7 +3178,7 @@ def _build_wmma_kernel(divisor: float, rows_per_block: int = 16, k_load: str | N
             rows, columns, num_pages, num_requests, width,
         ).launch(
             grid=(fx.Int64(grid_x), fx.Int64(grid_y), 1),
-            block=(WMMA_THREADS, 1, 1),
+            block=(kt_threads, 1, 1),
             stream=stream,
         )
 
@@ -2009,6 +3189,20 @@ def _build_wmma_kernel(divisor: float, rows_per_block: int = 16, k_load: str | N
     if persist:
         # A persistent block spans persist_chunks 64-column tiles.
         launch.cols_per_block = cols_per_block * persist_chunks
+    # ROUND-R2B: rows one workgroup covers (grid.y = ceil(rows / rows_per_launch)).
+    launch.rows_per_launch = rows_per_block
+    if kstat:
+        launch.cols_per_block = cols_per_block * col_tiles
+        launch.rows_per_launch = 32 * row_tiles
+        launch.kstat = (row_tiles, col_tiles)
+        launch.early = early
+    if ktile:   # ROUND-R2C
+        launch.cols_per_block = WMMA_COLS * col_tiles
+        launch.rows_per_launch = kt_rows
+        launch.kt = (kt_rows, col_tiles)
+        launch.threads = kt_threads
+        launch.lean, launch.ipf = bool(lean), int(ipf)
+    launch.trace = trace
     return launch
 
 
@@ -2026,7 +3220,7 @@ def _build_wmma_kernel(divisor: float, rows_per_block: int = 16, k_load: str | N
 #      **exactly** (``_e4m3x4_to_bf16x2``); the A (Q) fragments are unchanged;
 #   2. after the 4 WMMA steps each head's f32 dot is multiplied by the
 #      column's fp32 scale ``scale[phys, c % 4]`` *before* ReLU, then the heads
-#      are summed and multiplied by ``1/divisor`` â€” the scalar fp8 kernel's
+#      are summed and multiplied by ``1/divisor`` Ã¢â‚¬â€ the scalar fp8 kernel's
 #      order of operations (``(acc_h * scale).maximumf(0)`` summed h = 0..3,
 #      then ``* inv_divisor``);
 #   3. the scale load uses the page-table path of the K load: ``phys`` is the
@@ -2059,6 +3253,100 @@ TDM_FP8_K_TILE_BYTES = WMMA_COLS * TDM_FP8_K_ROW_BYTES  # 9,216 B
 _FP8_K_LOAD = os.environ.get("QSA_FP8_K_LOAD", _BF16_K_LOAD).strip().lower()
 if _FP8_K_LOAD not in ("raw", "tdm", "auto"):
     raise ValueError(f"QSA_FP8_K_LOAD must be 'raw', 'tdm' or 'auto', got {_FP8_K_LOAD!r}")
+# ROUND-R2C: QSA_FP8_EARLY=1 routes fp8 r32 TDM prefill to kernel_r32_early (default 0:
+# the unchanged kernel_r32, byte-identical ISA).
+FP8_R32_EARLY = os.environ.get("QSA_FP8_EARLY", "0").strip() == "1"
+# ROUND-R2C: QSA_FP8_KT=<RB>x<C> (e.g. 16x2) routes fp8 r32 TDM prefill to the fp8 ktile
+# kernel (default "": off, the unchanged kernel_r32 / kernel_r32_early).
+_FP8_KT = os.environ.get("QSA_FP8_KT", "").strip().lower()
+FP8_KT = None
+if _FP8_KT:
+    _m = re.fullmatch(r"(\d+)x(\d+)", _FP8_KT)
+    if not _m:
+        raise ValueError("QSA_FP8_KT must be <rows>x<col_tiles>, e.g. 16x2")
+    FP8_KT = (int(_m[1]), int(_m[2]))
+
+# ROUND-R2E: data-driven fp8 r32 TDM prefill route (rows >= 32 and rows >= 32 * requests,
+# TDM, 128 B aligned cache, raw access). QSA_FP8_PREFILL_ROUTE is a preset name or a rule
+# list "P,cmin,cmax,rmin,rmax,variant;..." (bounds inclusive, '*' = any; P in 4/8/16/'*');
+# variant = tdm (kernel_r32) | early (kernel_r32_early) | kt<RB>x<C>[l][k][p<KB>] (fp8
+# ktile; l = lean, k = kconv, needs l). First match wins; no match -> tdm. The R2C env
+# switches QSA_FP8_KT / QSA_FP8_EARLY=1, when set, take precedence over the table.
+FP8_PREFILL_ROUTE_PRESETS = {
+    "legacy": None,                          # kernel_r32 everywhere (<= R2D 685b0f60)
+    # ROUND-R2E default (GPU c1024: rows 1024 kt32x2lk 4.23-4.25 vs native 5.22-5.24;
+    # rows 4096 kt32x4lk 8.14-8.36 vs 13.3-13.5); r32 fp8 above 2048 columns
+    # (long-column A/B pending: records/r2e/GPU_COMMANDS.md (d)).
+    "r2e": "*,*,2048,*,2048,kt32x2lk;*,*,2048,2049,16384,kt32x4lk",
+    # ROUND-R2E alternative for the long-column A/B: lean+kconv ktile everywhere.
+    "kt_all": "*,*,*,*,2048,kt32x2lk;*,*,*,2049,*,kt32x4lk",
+}
+FP8_PREFILL_ROUTE_DEFAULT = "r2e"
+
+
+def _parse_fp8_route_variant(v: str):
+    v = v.strip().lower()
+    if v in ("tdm", "early"):
+        return v, {}
+    m = re.fullmatch(r"kt(\d+)x(\d+)(l?)(k?)(?:p(\d+))?", v)
+    if m and int(m[1]) in KT_ROWS and int(m[2]) in KT_COL_TILES and (m[3] or not m[4]):
+        kw = {"kt_rows": int(m[1]), "col_tiles": int(m[2])}
+        if m[3]:
+            kw["lean"] = True
+        if m[4]:
+            kw["kconv"] = True
+        if m[5]:
+            if int(m[5]) not in IPF_KB:
+                raise ValueError(f"QSA_FP8_PREFILL_ROUTE: ipf {m[5]} not in {IPF_KB}")
+            kw["ipf"] = int(m[5])
+        return "ktile", kw
+    raise ValueError(f"QSA_FP8_PREFILL_ROUTE: unknown variant {v!r}")
+
+
+def parse_fp8_prefill_route(spec: str):
+    """Rule tuples (page, cmin, cmax, rmin, rmax, kind, kw) or None (= legacy)."""
+    spec = FP8_PREFILL_ROUTE_PRESETS.get(spec.strip().lower(), spec)
+    if spec is None:
+        return None
+    rules = []
+    for part in [p for p in spec.split(";") if p.strip()]:
+        f = [x.strip().lower() for x in part.split(",")]
+        if len(f) != 6:
+            raise ValueError(f"QSA_FP8_PREFILL_ROUTE rule {part!r}: need 6 fields")
+        page = None if f[0] == "*" else int(f[0])
+        if page is not None and page not in SUPPORTED_PAGE_SIZES:
+            raise ValueError(f"QSA_FP8_PREFILL_ROUTE rule {part!r}: page {page}")
+        b = [None if x == "*" else int(x) for x in f[1:5]]
+        rules.append((page, b[0], b[1], b[2], b[3]) + _parse_fp8_route_variant(f[5]))
+    return tuple(rules)
+
+
+FP8_PREFILL_ROUTE_SPEC = os.environ.get("QSA_FP8_PREFILL_ROUTE",
+                                        FP8_PREFILL_ROUTE_DEFAULT).strip().lower()
+FP8_PREFILL_ROUTE = parse_fp8_prefill_route(FP8_PREFILL_ROUTE_SPEC)
+
+
+def prefill_fp8_route(rows: int, num_requests: int, columns: int, page_size: int = PAGE_SIZE,
+                      table=None):
+    """(kind, builder keywords) of a guarded fp8 r32 TDM prefill call: kind 'tdm' (no
+    keyword), 'early' ({'early': True}) or 'ktile' (kt_rows / col_tiles [/ lean / kconv /
+    ipf]). QSA_FP8_KT / QSA_FP8_EARLY=1 (R2C env) win over the table."""
+    if FP8_KT is not None:
+        return "ktile", {"kt_rows": FP8_KT[0], "col_tiles": FP8_KT[1]}
+    if FP8_R32_EARLY:
+        return "early", {"early": True}
+    table = FP8_PREFILL_ROUTE if table is None else table
+    if table is None or table == "legacy":
+        return "tdm", {}
+    for page, cmin, cmax, rmin, rmax, kind, kw in table:
+        if page is not None and page != int(page_size):
+            continue
+        if cmin is not None and int(columns) < cmin or cmax is not None and int(columns) > cmax:
+            continue
+        if rmin is not None and int(rows) < rmin or rmax is not None and int(rows) > rmax:
+            continue
+        return kind, ({"early": True} if kind == "early" else dict(kw))
+    return "tdm", {}
 
 
 def _resolve_fp8_k_load(rows_per_block: int, k_load: str | None = None):
@@ -2082,7 +3370,7 @@ def _s32(v):
 #
 # gives the IEEE half whose sign/exponent/mantissa fields are E4M3's (4-bit
 # exponent in the low bits of f16's 5-bit field, 3 mantissa bits on top of
-# f16's 10), i.e. exactly ``E4M3(b) * 2**-8`` â€” for E4M3 normals (f16
+# f16's 10), i.e. exactly ``E4M3(b) * 2**-8`` Ã¢â‚¬â€ for E4M3 normals (f16
 # exponent 1..15) and E4M3 subnormals (f16 subnormals ``m * 2**-17``) alike,
 # and ``+-0`` for 0x00/0x80.  0x7F/0xFF become ``+-1.875`` (f16 exponent 15
 # is an ordinary exponent), i.e. ``+-480`` after the rescale, exactly what the
@@ -2097,7 +3385,7 @@ def _s32(v):
 # Exactness for all 256 codes, in every byte position of a dword, against the
 # scalar decoder is checked by ``_g2/test_fp8_wmma_cpu.py`` (pure-Python
 # mirror) and by ``_g2/trace_check_cpu.py`` (this source, executed).
-# Caveat: E4M3 subnormal codes are f16 *subnormals* before the ``* 256`` â€” this
+# Caveat: E4M3 subnormal codes are f16 *subnormals* before the ``* 256`` Ã¢â‚¬â€ this
 # relies on the default FP16 denormal mode (``FLOAT_DENORM_MODE_16_64``
 # = preserve, LLVM's AMDGPU default).  A flush-to-zero mode would turn those 14
 # codes (|v| <= 7 * 2**-9) into +-0; the root's GPU plan includes a bitwise
@@ -2176,7 +3464,7 @@ def _e4m3x8_to_bf16x4_asm(src0, src1):
 # build passed 22/22): every instruction of ``_e4m3x8_to_bf16x4_asm`` is an
 # inline asm statement, which LLVM's hazard recognizer does not treat as a VALU.
 # gfx1250 dense bf16 WMMA has *software-enforced* hazards (kernel-wiki
-# mi400-wmma-hazards §1.2 row B1): a VALU whose vdst overlaps the previous
+# mi400-wmma-hazards Â§1.2 row B1): a VALU whose vdst overlaps the previous
 # WMMA's Matrix A/B (WAR) or Matrix D (WAW), or that reads D (RAW), needs 4
 # V_NOPs or independent VALUs in between. Register allocation decided whether
 # the unpadded asm landed inside that window (w64: yes -> wrong results; w32 /
@@ -2241,8 +3529,23 @@ def _e4m3x8_to_bf16x4_fast(src0, src1):
 
 @lru_cache(maxsize=None)
 def _build_wmma_fp8_kernel(divisor: float, rows_per_block: int = 16, k_load: str | None = None,
-                           pos64: bool = False):
+                           pos64: bool = False,
+                           page_size: int = PAGE_SIZE, early: bool = False,
+                           kt_rows: int | None = None, col_tiles: int = 1, trace: int = 0,
+                           lean: bool = False, ipf: int = 0,
+                           kconv: bool = False):
     """fp8 WMMA specialization; r32 shares exact E4M3 B fragments across M tiles.
+
+    ``k_load="ktile"`` (ROUND-R2C, r32-routed TDM) builds the fp8 ``kernel_kt``: the bf16
+    ktile geometry (``kt_rows`` 16 | 32 -> 4 | 8 waves, one 4-row M tile per wave, all
+    4 x ``col_tiles`` N tiles from one E4M3 LDS slab) with Q, page validity and the
+    per-column scales issued before the single TDM wait + barrier.
+
+    ``early=True`` (ROUND-R2C, opt-in; r32 TDM only) builds ``kernel_r32_early``: the
+    full-block branch issues Q fragments, the lane columns' page-table entries and the
+    per-column fp32 scales BEFORE the TDM stage's wait + barrier (default r32 issues
+    all three after it: two more dependent latencies). Same values, same order of
+    floating-point operations, same stores.
 
     The r16 path is unchanged. Full, single-request r32 blocks reuse one K
     gather/conversion per step; mixes and tails use the exact r16 helpers.
@@ -2251,11 +3554,32 @@ def _build_wmma_fp8_kernel(divisor: float, rows_per_block: int = 16, k_load: str
     ``pos64=True`` (ROUND-NATIVE64) reads query_positions as int64.
     """
     ld_pos, _, qp_bytes, qp_tag = _pos_loaders(pos64)
+    P = _check_page_size(page_size)
     if rows_per_block not in (16, 32):
         raise ValueError("WMMA rows_per_block must be 16 or 32")
+    ktile = k_load == "ktile"                 # ROUND-R2C
+    if ktile:
+        if rows_per_block != 32 or _ACCESS != "raw" or early:
+            raise ValueError("the fp8 ktile kernel is r32-routed TDM (raw access) only")
+        kt_grid(32, 64, kt_rows, col_tiles)               # validates the knobs
+        k_load = "tdm"
+    elif kt_rows is not None or col_tiles != 1:
+        raise ValueError("kt_rows / col_tiles apply to k_load='ktile' only")
+    kt_waves = (int(kt_rows) // WMMA_ROWS_PER_WAVE) if ktile else WMMA_WAVES
+    kt_threads = kt_waves * WMMA_WAVE
     k_load = _resolve_fp8_k_load(rows_per_block, k_load)
     use_tdm = k_load == "tdm" and _ACCESS == "raw"
     guard_load = _ld_uniform_i32 if use_tdm else _ld_i32
+    early = bool(early)
+    if early and not (use_tdm and rows_per_block == 32):
+        raise ValueError("fp8 early (ROUND-R2C) is r32 TDM only")
+    # ROUND-R2D opt-in knobs (defaults emit nothing new): trace, lean / ipf (ktile only).
+    trace = _r2d_check(trace, lean, ipf, ktile, use_tdm and rows_per_block == 32 and not early)
+    if kconv and not (lean and use_tdm and _FP8_CVT == "fast"):
+        raise ValueError("kconv (ROUND-R2D) applies to the lean fp8 ktile (fast cvt) only")
+    kconv = bool(kconv)
+    trs = {}
+    ld_uniform_pos = _pos_loaders(pos64)[1]
 
     def _pair_storage_raw(KV, kv_rsrc):
         return kv_rsrc
@@ -2274,17 +3598,24 @@ def _build_wmma_fp8_kernel(divisor: float, rows_per_block: int = 16, k_load: str
         req = _ld_uniform_i32(t2r_rsrc, rblk * 32 * 4)
         for group in range_constexpr(2):
             local = wave_id * 16 + group * 8
-            row_ids = []
-            for page in range_constexpr(2):
-                logical = (col0 + local) // PAGE_SIZE + page
-                logical_ok = logical < width
-                safe_logical = logical_ok.select(logical, 0)
-                phys = _ld_uniform_i32(pt_rsrc, (req * width + safe_logical) * 4)
-                valid = logical_ok & (phys >= 0) & (phys < num_pages)
-                phys = valid.select(phys, 0)
-                for row in range_constexpr(PAGE_SIZE):
-                    row_ids.append(phys * PAGE_SIZE + row)
-            _tdm_fp8_k_gather(KV, ptr, row_ids, num_pages, local * TDM_FP8_K_ROW_BYTES)
+            if P == 4:
+                row_ids = []
+                for page in range_constexpr(2):
+                    logical = (col0 + local) // 4 + page
+                    logical_ok = logical < width
+                    safe_logical = logical_ok.select(logical, 0)
+                    phys = _ld_uniform_i32(pt_rsrc, (req * width + safe_logical) * 4)
+                    valid = logical_ok & (phys >= 0) & (phys < num_pages)
+                    phys = valid.select(phys, 0)
+                    for row in range_constexpr(4):
+                        row_ids.append(phys * 4 + row)
+            elif P == 16:   # P = 16: wave w's 16 rows = page col0/16 + w; group = half page
+                row_ids = _p16_row_ids(pt_rsrc, req, width, num_pages,
+                                       col0 // 16 + wave_id, group * 8)
+            else:   # P = 8: wave w's 16 rows = pages col0/8 + 2w, +1; group = one page
+                row_ids = _p16_row_ids(pt_rsrc, req, width, num_pages,
+                                       col0 // 8 + wave_id * 2 + group, 0, None, 8)
+            _tdm_fp8_k_gather(KV, ptr, row_ids, num_pages, local * TDM_FP8_K_ROW_BYTES, P)
         fx.rocdl.tdm_ops.tensor_wait(0)
         fx.gpu.barrier()  # producer completion + cross-wave consumer rendezvous
         # This one-shot tile is never overwritten; no LDS reuse loop exists.
@@ -2338,15 +3669,19 @@ def _build_wmma_fp8_kernel(divisor: float, rows_per_block: int = 16, k_load: str
     q_row_bytes = NUM_HEADS * HEAD_DIM * 2            # 1024 B
     head_bytes = HEAD_DIM * 2                         # 256 B
     key_row_bytes = HEAD_DIM                          # 128 B (E4M3)
-    page_bytes = PAGE_SIZE * key_row_bytes            # 512 B
+    page_bytes = P * key_row_bytes            # 512 B
     kstep_bytes = WMMA_K * 2                          # 64 B of one Q row per WMMA step
     kstep_k_bytes = WMMA_K                            # 32 B of one fp8 key row per step
     kernel_name = (
         f"qsa_paged_mqa_logits_page4_gfx1250_fp8_wmma"
-        f"_D{HEAD_DIM}_H{NUM_HEADS}_P{PAGE_SIZE}"
+        f"_D{HEAD_DIM}_H{NUM_HEADS}_P{P}"
         f"_r{rows_per_block}_c{WMMA_COLS}_flydsl"
         + ("_tdm" if use_tdm else "")
         + ("_cvtfast" + _CVT_ASM_TAG if fast_cvt else "")
+        + ("_early" if early else "")
+        + (f"_kt{kt_rows}x{col_tiles}" if ktile else "")
+        + _r2d_tag(lean, ipf) + ("_kc" if kconv else "")
+        + (f"_trace{trace}" if trace else "")
         + qp_tag
     )
 
@@ -2395,7 +3730,7 @@ def _build_wmma_fp8_kernel(divisor: float, rows_per_block: int = 16, k_load: str
             ctx = _ld_i32(cl_rsrc, safe_req * 4)
             pos = ld_pos(qp_rsrc, safe_row)
             head = _imax(_imin(pos + 1, ctx), 0)
-            vis = req_ok.select(head // PAGE_SIZE, 0)
+            vis = req_ok.select(head // COMPRESS_RATIO, 0)
             out.append(_RowMeta(row, row_ok, req, req_ok, safe_req, vis))
         return out
 
@@ -2451,8 +3786,8 @@ def _build_wmma_fp8_kernel(divisor: float, rows_per_block: int = 16, k_load: str
 
     def _tile(atom, kv_rsrc, ks_rsrc, pt_rsrc, qf, pp, c, kgrp, width, num_pages):
         """Scores of the lane's rows a/b at column c (one 16x16x128 WMMA tile)."""
-        logical = c // PAGE_SIZE
-        off = c % PAGE_SIZE
+        logical = c // P
+        off = c % P
         logical_ok = logical < width
         safe_logical = logical_ok.select(logical, 0)
         phys = _ld_i32(pt_rsrc, (pp.safe_req * width + safe_logical) * 4)
@@ -2462,7 +3797,7 @@ def _build_wmma_fp8_kernel(divisor: float, rows_per_block: int = 16, k_load: str
         kf = [_kfrag_fp8(kv_rsrc, k_base + s * kstep_k_bytes)
               for s in range_constexpr(WMMA_K_STEPS)]
         # per-token fp32 scale of column c: same masked phys as the K rows
-        scale = _ld_f32(ks_rsrc, (phys * PAGE_SIZE + off) * 4)
+        scale = _ld_f32(ks_rsrc, (phys * P + off) * 4)
         acc_t = fx.make_rmem_tensor(8, fx.Float32)
         acc_t.store(Vec.filled(8, 0.0, fx.Float32))
         for s in range_constexpr(WMMA_K_STEPS):
@@ -2522,15 +3857,15 @@ def _build_wmma_fp8_kernel(divisor: float, rows_per_block: int = 16, k_load: str
     def _tile_pair(atom, kv_rsrc, ks_rsrc, pt_rsrc, qfa, qfb, pp, c, kgrp, width,
                    num_pages):
         """Two M16 accumulators, one exact E4M3 gather/conversion per K step."""
-        logical = c // PAGE_SIZE
-        off = c % PAGE_SIZE
+        logical = c // P
+        off = c % P
         logical_ok = logical < width
         safe_logical = logical_ok.select(logical, 0)
         phys = _ld_i32(pt_rsrc, (pp.safe_req * width + safe_logical) * 4)
         page_ok = pp.req_ok & logical_ok & (phys >= 0) & (phys < num_pages)
         phys = page_ok.select(phys, 0)
         k_base = pair_base(phys, off, c, kgrp)
-        scale = _ld_f32(ks_rsrc, (phys * PAGE_SIZE + off) * 4)
+        scale = _ld_f32(ks_rsrc, (phys * P + off) * 4)
         acc_a = fx.make_rmem_tensor(8, fx.Float32)
         acc_b = fx.make_rmem_tensor(8, fx.Float32)
         acc_a.store(Vec.filled(8, 0.0, fx.Float32))
@@ -2579,6 +3914,166 @@ def _build_wmma_fp8_kernel(divisor: float, rows_per_block: int = 16, k_load: str
                 out.append((pp.own_b & col_ok, offs[2 * nt + 1], vb))
         return out
 
+    # ---- ROUND-R2C early helpers (kernel_r32_early only) ----------------------
+    def _page_scale_pre(pt_rsrc, ks_rsrc, pp, cols, width, num_pages):
+        """[(page_ok, scale)] per N tile: `_tile_pair`'s page-table + scale loads."""
+        out = []
+        for nt in range_constexpr(WMMA_N_TILES):
+            c = cols[nt]
+            logical = c // P
+            off = c % P
+            logical_ok = logical < width
+            safe_logical = logical_ok.select(logical, 0)
+            phys = _ld_i32(pt_rsrc, (pp.safe_req * width + safe_logical) * 4)
+            page_ok = pp.req_ok & logical_ok & (phys >= 0) & (phys < num_pages)
+            phys = page_ok.select(phys, 0)
+            out.append((page_ok, _ld_f32(ks_rsrc, (phys * P + off) * 4)))
+        return out
+
+    def _tile_pair_pre(atom, kptr, qfa, qfb, c, kgrp, scale):
+        """`_tile_pair` (TDM) with page_ok / scale prefetched: same WMMA + epilogue."""
+        k_base = pair_base(None, None, c, kgrp)
+        acc_a = fx.make_rmem_tensor(8, fx.Float32)
+        acc_b = fx.make_rmem_tensor(8, fx.Float32)
+        acc_a.store(Vec.filled(8, 0.0, fx.Float32))
+        acc_b.store(Vec.filled(8, 0.0, fx.Float32))
+        for s in range_constexpr(WMMA_K_STEPS):
+            kf = _rmem8(pair_frag(kptr, k_base + s * kstep_k_bytes, kgrp))
+            fx.gemm(atom, acc_a, _rmem8(qfa[s]), kf, acc_a)
+            fx.gemm(atom, acc_b, _rmem8(qfb[s]), kf, acc_b)
+        a = acc_a.load()
+        b = acc_b.load()
+        zero = fx.Float32(0.0)
+        scores = []
+        for acc in (a, b):
+            sa = (
+                (fx.Float32(acc[0]) * scale).maximumf(zero)
+                + (fx.Float32(acc[1]) * scale).maximumf(zero)
+                + (fx.Float32(acc[2]) * scale).maximumf(zero)
+                + (fx.Float32(acc[3]) * scale).maximumf(zero)
+            )
+            sb = (
+                (fx.Float32(acc[4]) * scale).maximumf(zero)
+                + (fx.Float32(acc[5]) * scale).maximumf(zero)
+                + (fx.Float32(acc[6]) * scale).maximumf(zero)
+                + (fx.Float32(acc[7]) * scale).maximumf(zero)
+            )
+            scores.append(sa * inv_divisor)
+            scores.append(sb * inv_divisor)
+        return scores
+
+    # ---- ROUND-R2C fp8 ktile helpers (kernel_kt only) ---------------------------
+    def _kt8_storage():
+        return fx.SharedAllocator(base_alignment=128, static=True).allocate(
+            fx.Array[fx.Int32, col_tiles * TDM_FP8_K_TILE_BYTES // 4, 128]
+        ).peek().ptr
+
+    def _kt8_guard(t2r_rsrc, base, rows, num_requests):
+        """SGPR (request, ok): full kt_rows-row block, every row of one valid request."""
+        req = _ld_uniform_i32(t2r_rsrc, _imin(base, rows - 1) * 4)
+        ok = (base + kt_rows <= rows) & (req >= 0) & (req < num_requests)
+        for i in range_constexpr(1, kt_rows):
+            other = _ld_uniform_i32(t2r_rsrc, _imin(base + i, rows - 1) * 4)
+            ok = ok & (other == req)
+        return req, ok
+
+    def _kt8_issue(KV, ptr, pt_rsrc, req, col0, width, num_pages, buf):
+        """kt_waves waves gather the 64-column E4M3 tile at col0 into buffer `buf`:
+        wave w owns columns col0 + w * (64 / waves) .. (8-row gathers, SGPR row ids)."""
+        wave_id = fx.Int32(fx.rocdl.wave_id())
+        per = WMMA_COLS // kt_waves                    # 16 (4 waves) or 8 (8 waves)
+        for group in range_constexpr(per // 8):
+            local = wave_id * per + group * 8
+            if P == 4:
+                row_ids = []
+                for page in range_constexpr(2):
+                    logical = (col0 + local) // 4 + page
+                    logical_ok = logical < width
+                    safe_logical = logical_ok.select(logical, 0)
+                    phys = _ld_uniform_i32(pt_rsrc, (req * width + safe_logical) * 4)
+                    valid = logical_ok & (phys >= 0) & (phys < num_pages)
+                    phys = valid.select(phys, 0)
+                    for row in range_constexpr(4):
+                        row_ids.append(phys * 4 + row)
+            elif P == 16:   # 8 | 16: the group is one half of page (col0 + local) / 16
+                row_ids = _p16_row_ids(pt_rsrc, req, width, num_pages,
+                                       (col0 + local) // 16, local % 16)
+            else:           # P = 8: the group IS page (col0 + local) / 8
+                row_ids = _p16_row_ids(pt_rsrc, req, width, num_pages,
+                                       (col0 + local) // 8, 0, None, 8)
+            _tdm_fp8_k_gather(KV, ptr, row_ids, num_pages,
+                              buf * TDM_FP8_K_TILE_BYTES + local * TDM_FP8_K_ROW_BYTES, P)
+
+    def _kt8_pre(pt_rsrc, ks_rsrc, req, req_ok, slab0, n_in, width, num_pages):
+        """[[(page_ok, scale)] per N tile] per K tile: `_tile_pair`'s page + scale loads."""
+        out = []
+        for ct in range_constexpr(col_tiles):
+            ps = []
+            for c in _lane_cols(slab0 + ct * WMMA_COLS, n_in):
+                logical = c // P
+                off = c % P
+                logical_ok = logical < width
+                safe_logical = logical_ok.select(logical, 0)
+                phys = _ld_i32(pt_rsrc, (req * width + safe_logical) * 4)
+                page_ok = req_ok & logical_ok & (phys >= 0) & (phys < num_pages)
+                phys = page_ok.select(phys, 0)
+                ps.append((page_ok, _ld_f32(ks_rsrc, (phys * P + off) * 4)))
+            out.append(ps)
+        return out
+
+    def _kt8_tile(atom, kbuf, qf, c, kgrp, scale):
+        k_base = pair_base(None, None, c, kgrp)
+        acc_t = fx.make_rmem_tensor(8, fx.Float32)
+        acc_t.store(Vec.filled(8, 0.0, fx.Float32))
+        for s in range_constexpr(WMMA_K_STEPS):
+            kf = _rmem8(pair_frag(kbuf, k_base + s * kstep_k_bytes, kgrp))
+            fx.gemm(atom, acc_t, _rmem8(qf[s]), kf, acc_t)
+        acc = acc_t.load()
+        zero = fx.Float32(0.0)
+        sa = (
+            (fx.Float32(acc[0]) * scale).maximumf(zero)
+            + (fx.Float32(acc[1]) * scale).maximumf(zero)
+            + (fx.Float32(acc[2]) * scale).maximumf(zero)
+            + (fx.Float32(acc[3]) * scale).maximumf(zero)
+        )
+        sb = (
+            (fx.Float32(acc[4]) * scale).maximumf(zero)
+            + (fx.Float32(acc[5]) * scale).maximumf(zero)
+            + (fx.Float32(acc[6]) * scale).maximumf(zero)
+            + (fx.Float32(acc[7]) * scale).maximumf(zero)
+        )
+        return sa * inv_divisor, sb * inv_divisor
+
+    def _kt8_values(atom, kbuf, qf, pp, cols, offs, columns, pre):
+        neg_inf = fx.Float32(_NEG_INF)
+        out = []
+        for nt in range_constexpr(WMMA_N_TILES):
+            c = cols[nt]
+            page_ok, scale = pre[nt]
+            sa, sb = _kt8_tile(atom, kbuf, qf, c, pp.kgrp, scale)
+            col_ok = c < columns
+            va = (page_ok & (c < pp.vis_a)).select(sa, neg_inf)
+            vb = (page_ok & (c < pp.vis_b)).select(sb, neg_inf)
+            out.append((pp.own_a & col_ok, offs[2 * nt], va))
+            out.append((pp.own_b & col_ok, offs[2 * nt + 1], vb))
+        return out
+    def _pair_values_pre(atom, kptr, qfa, qfb, ppa, ppb, cols, offsa, offsb, columns, pre):
+        out = []
+        neg_inf = fx.Float32(_NEG_INF)
+        for nt in range_constexpr(WMMA_N_TILES):
+            c = cols[nt]
+            page_ok, scale = pre[nt]
+            scores = _tile_pair_pre(atom, kptr, qfa, qfb, c, ppa.kgrp, scale)
+            for mi in range_constexpr(2):
+                pp = (ppa, ppb)[mi]
+                offs = (offsa, offsb)[mi]
+                col_ok = c < columns
+                va = (page_ok & (c < pp.vis_a)).select(scores[2 * mi], neg_inf)
+                vb = (page_ok & (c < pp.vis_b)).select(scores[2 * mi + 1], neg_inf)
+                out.append((pp.own_a & col_ok, offs[2 * nt], va))
+                out.append((pp.own_b & col_ok, offs[2 * nt + 1], vb))
+        return out
+
     @flyc.kernel(name=kernel_name, known_block_size=[WMMA_THREADS, 1, 1])
     def kernel(
         Q,           # uint8 view of [rows, 4, 128] bf16
@@ -2610,7 +4105,7 @@ def _build_wmma_fp8_kernel(divisor: float, rows_per_block: int = 16, k_load: str
         # One pinned descriptor per plane, true extents in i64 (see `_plane`).
         q_rsrc = _plane(Q, _plane_bytes(rows, q_row_bytes))
         kv_rsrc = _plane(KV, _plane_bytes(num_pages, page_bytes))
-        ks_rsrc = _plane(KS, _plane_bytes(num_pages, PAGE_SIZE * 4))
+        ks_rsrc = _plane(KS, _plane_bytes(num_pages, P * 4))
         pt_rsrc = _plane(PT, _plane_bytes(num_requests, 4, width))
         t2r_rsrc = _plane(T2R, _plane_bytes(rows, 4))
         qp_rsrc = _plane(QP, _plane_bytes(rows, qp_bytes))
@@ -2681,11 +4176,110 @@ def _build_wmma_fp8_kernel(divisor: float, rows_per_block: int = 16, k_load: str
         kgrp = lane // WMMA_N           # k-half of the operands, row pair of C
         t0 = (rblk * WMMA_WAVES + wave) * (2 * WMMA_ROWS_PER_WAVE)
         col0 = chunk * WMMA_COLS
+        _tr_begin(trs, trace, LOGITS, rows, columns, (columns + WMMA_COLS - 1) // WMMA_COLS,
+                  (rows + 31) // 32, WMMA_WAVES, chunk, rblk)
 
         # One pinned descriptor per plane, true extents in i64 (see `_plane`).
         q_rsrc = _plane(Q, _plane_bytes(rows, q_row_bytes))
         kv_rsrc = _plane(KV, _plane_bytes(num_pages, page_bytes))
-        ks_rsrc = _plane(KS, _plane_bytes(num_pages, PAGE_SIZE * 4))
+        ks_rsrc = _plane(KS, _plane_bytes(num_pages, P * 4))
+        pt_rsrc = _plane(PT, _plane_bytes(num_requests, 4, width))
+        t2r_rsrc = _plane(T2R, _plane_bytes(rows, 4))
+        qp_rsrc = _plane(QP, _plane_bytes(rows, qp_bytes))
+        cl_rsrc = _plane(CL, _plane_bytes(num_requests, 4))
+        logits_rsrc = _plane(LOGITS, _plane_bytes(rows, 4, columns))
+        vis_rsrc = _plane(VIS, _plane_bytes(rows, 4))
+        rst_rsrc = _plane(RST, _plane_bytes(rows, 4))
+
+        metas = [_rows_meta(t2r_rsrc, qp_rsrc, cl_rsrc, t0 + mi * WMMA_ROWS_PER_WAVE,
+                            rows, num_requests) for mi in range_constexpr(2)]
+        plans = [_pass_plan(metas[mi], rows, kgrp) for mi in range_constexpr(2)]
+        for mi in range_constexpr(2):
+            my_vis = _pick_vis(lane, metas[mi])
+            my_row = t0 + mi * WMMA_ROWS_PER_WAVE + _imin(lane, WMMA_ROWS_PER_WAVE - 1)
+            meta_off = _imin(my_row, rows - 1) * 4
+            writer = (chunk == 0) & (lane < WMMA_ROWS_PER_WAVE) & (my_row < rows)
+            if writer:
+                _st_i32(vis_rsrc, meta_off, my_vis)
+                _st_i32(rst_rsrc, meta_off, fx.Int32(0))
+        _tr_mark(trs, 4, True)
+
+        atom = fx.make_mma_atom(fx.rocdl.WMMA(WMMA_N, WMMA_N, WMMA_K, fx.BFloat16, fx.Float32))
+        cols = _lane_cols(col0, n_in)
+        offs = [_store_offsets(t0 + mi * WMMA_ROWS_PER_WAVE, kgrp, cols, rows, columns)
+                for mi in range_constexpr(2)]
+        neg_inf = fx.Float32(_NEG_INF)
+        kptr = pair_storage(KV, kv_rsrc)
+        reuse = _r32_guard(t2r_rsrc, rblk * 32, rows, num_requests)
+        _tr_mark(trs, 5, True)
+        if reuse:
+            pair_stage(KV, kptr, pt_rsrc, t2r_rsrc, rblk, col0, width, num_pages)
+            _tr_mark(trs, 9)                # ROUND-R2D: stage = TDM issue + wait + barrier
+            _tr_mark_rt(trs, 14)
+            ppa = plans[0][0]
+            ppb = plans[1][0]
+            vmax = _imax(ppa.vmax, ppb.vmax)
+            if col0 < vmax:
+                qfa = _q_frags(q_rsrc, t0, rows, n_in, kgrp)
+                qfb = _q_frags(q_rsrc, t0 + WMMA_ROWS_PER_WAVE, rows, n_in, kgrp)
+                _tr_mark(trs, 7, True)
+                res = _pair_values(atom, kptr, ks_rsrc, pt_rsrc, qfa, qfb, ppa, ppb,
+                                   cols, offs[0], offs[1], columns, width, num_pages)
+                for j1 in range_constexpr(4 * WMMA_N_TILES):
+                    if res[j1][0]:
+                        _st_f32(logits_rsrc, res[j1][1], res[j1][2])
+            if col0 >= vmax:
+                for mi in range_constexpr(2):
+                    msk = _pass_masks(plans[mi][0], cols, offs[mi], columns)
+                    for j2 in range_constexpr(2 * WMMA_N_TILES):
+                        if msk[j2][0]:
+                            _st_f32(logits_rsrc, msk[j2][1], neg_inf)
+            _tr_mark(trs, 10)
+        if reuse == 0:
+            # Exact r16 per-M-tile path for mixed requests and incomplete blocks.
+            for mi in range_constexpr(2):
+                subt0 = t0 + mi * WMMA_ROWS_PER_WAVE
+                live = subt0 < rows
+                if live:
+                    qf = _q_frags(q_rsrc, subt0, rows, n_in, kgrp)
+                    for p in range_constexpr(WMMA_PASSES):
+                        pp = plans[mi][p]
+                        if pp.active:
+                            if col0 < pp.vmax:
+                                fallback = _pass_values(atom, kv_rsrc, ks_rsrc, pt_rsrc, qf, pp,
+                                                        cols, offs[mi], columns, width, num_pages)
+                                for j3 in range_constexpr(2 * WMMA_N_TILES):
+                                    if fallback[j3][0]:
+                                        _st_f32(logits_rsrc, fallback[j3][1], fallback[j3][2])
+                            if col0 >= pp.vmax:
+                                masks = _pass_masks(pp, cols, offs[mi], columns)
+                                for j4 in range_constexpr(2 * WMMA_N_TILES):
+                                    if masks[j4][0]:
+                                        _st_f32(logits_rsrc, masks[j4][1], neg_inf)
+        _tr_mark(trs, 10)
+        _tr_end(trs)
+
+    @flyc.kernel(name=kernel_name, known_block_size=[WMMA_THREADS, 1, 1])
+    def kernel_r32_early(
+        Q, KV, KS, PT, T2R, QP, CL, LOGITS, VIS, RST,
+        rows: fx.Int32, columns: fx.Int32, num_pages: fx.Int32,
+        num_requests: fx.Int32, width: fx.Int32,
+    ):
+        # ROUND-R2C: kernel_r32 (TDM) with the full-block branch's Q fragments, page-table
+        # entries and per-column scales issued before the stage's tensor wait + barrier.
+        tid = fx.Int32(fx.thread_idx.x)
+        chunk = fx.Int32(fx.block_idx.x)
+        rblk = fx.Int32(fx.block_idx.y)
+        wave = tid // WMMA_WAVE
+        lane = tid % WMMA_WAVE
+        n_in = lane % WMMA_N            # A: slot m / B, C: column n
+        kgrp = lane // WMMA_N           # k-half of the operands, row pair of C
+        t0 = (rblk * WMMA_WAVES + wave) * (2 * WMMA_ROWS_PER_WAVE)
+        col0 = chunk * WMMA_COLS
+
+        q_rsrc = _plane(Q, _plane_bytes(rows, q_row_bytes))
+        kv_rsrc = _plane(KV, _plane_bytes(num_pages, page_bytes))
+        ks_rsrc = _plane(KS, _plane_bytes(num_pages, P * 4))
         pt_rsrc = _plane(PT, _plane_bytes(num_requests, 4, width))
         t2r_rsrc = _plane(T2R, _plane_bytes(rows, 4))
         qp_rsrc = _plane(QP, _plane_bytes(rows, qp_bytes))
@@ -2714,15 +4308,17 @@ def _build_wmma_fp8_kernel(divisor: float, rows_per_block: int = 16, k_load: str
         kptr = pair_storage(KV, kv_rsrc)
         reuse = _r32_guard(t2r_rsrc, rblk * 32, rows, num_requests)
         if reuse:
-            pair_stage(KV, kptr, pt_rsrc, t2r_rsrc, rblk, col0, width, num_pages)
             ppa = plans[0][0]
             ppb = plans[1][0]
             vmax = _imax(ppa.vmax, ppb.vmax)
+            # Issued before the TDM stage (clamped rows / masked pages: always in bounds).
+            qfa = _q_frags(q_rsrc, t0, rows, n_in, kgrp)
+            qfb = _q_frags(q_rsrc, t0 + WMMA_ROWS_PER_WAVE, rows, n_in, kgrp)
+            pre = _page_scale_pre(pt_rsrc, ks_rsrc, ppa, cols, width, num_pages)
+            pair_stage(KV, kptr, pt_rsrc, t2r_rsrc, rblk, col0, width, num_pages)
             if col0 < vmax:
-                qfa = _q_frags(q_rsrc, t0, rows, n_in, kgrp)
-                qfb = _q_frags(q_rsrc, t0 + WMMA_ROWS_PER_WAVE, rows, n_in, kgrp)
-                res = _pair_values(atom, kptr, ks_rsrc, pt_rsrc, qfa, qfb, ppa, ppb,
-                                   cols, offs[0], offs[1], columns, width, num_pages)
+                res = _pair_values_pre(atom, kptr, qfa, qfb, ppa, ppb, cols, offs[0], offs[1],
+                                       columns, pre)
                 for j1 in range_constexpr(4 * WMMA_N_TILES):
                     if res[j1][0]:
                         _st_f32(logits_rsrc, res[j1][1], res[j1][2])
@@ -2733,7 +4329,6 @@ def _build_wmma_fp8_kernel(divisor: float, rows_per_block: int = 16, k_load: str
                         if msk[j2][0]:
                             _st_f32(logits_rsrc, msk[j2][1], neg_inf)
         if reuse == 0:
-            # Exact r16 per-M-tile path for mixed requests and incomplete blocks.
             for mi in range_constexpr(2):
                 subt0 = t0 + mi * WMMA_ROWS_PER_WAVE
                 live = subt0 < rows
@@ -2754,8 +4349,396 @@ def _build_wmma_fp8_kernel(divisor: float, rows_per_block: int = 16, k_load: str
                                     if masks[j4][0]:
                                         _st_f32(logits_rsrc, masks[j4][1], neg_inf)
 
-    selected_kernel = kernel if rows_per_block == 16 else kernel_r32
+    @flyc.kernel(name=kernel_name, known_block_size=[kt_threads, 1, 1])
+    def kernel_kt(
+        Q, KV, KS, PT, T2R, QP, CL, LOGITS, VIS, RST,
+        rows: fx.Int32, columns: fx.Int32, num_pages: fx.Int32,
+        num_requests: fx.Int32, width: fx.Int32,
+    ):
+        # ROUND-R2C fp8 ktile: block (x, y) owns columns [x*64C, x*64C + 64C) and rows
+        # [y*RB, y*RB + RB); wave w owns the M tile of rows y*RB + 4w .. +3.
+        _inst_prefetch(ipf)             # ROUND-R2D (ipf=0: nothing)
+        tid = fx.Int32(fx.thread_idx.x)
+        slab = fx.Int32(fx.block_idx.x)
+        rblk = fx.Int32(fx.block_idx.y)
+        wave = tid // WMMA_WAVE
+        lane = tid % WMMA_WAVE
+        n_in = lane % WMMA_N
+        kgrp = lane // WMMA_N
+        slab0 = slab * (WMMA_COLS * col_tiles)
+        base = rblk * kt_rows
+        t0 = base + wave * WMMA_ROWS_PER_WAVE
+        _tr_begin(trs, trace, LOGITS, rows, columns,
+                  (columns + WMMA_COLS * col_tiles - 1) // (WMMA_COLS * col_tiles),
+                  (rows + kt_rows - 1) // kt_rows, kt_waves, slab, rblk)
 
+        q_rsrc = _plane(Q, _plane_bytes(rows, q_row_bytes))
+        kv_rsrc = _plane(KV, _plane_bytes(num_pages, page_bytes))
+        ks_rsrc = _plane(KS, _plane_bytes(num_pages, P * 4))
+        pt_rsrc = _plane(PT, _plane_bytes(num_requests, 4, width))
+        t2r_rsrc = _plane(T2R, _plane_bytes(rows, 4))
+        qp_rsrc = _plane(QP, _plane_bytes(rows, qp_bytes))
+        cl_rsrc = _plane(CL, _plane_bytes(num_requests, 4))
+        logits_rsrc = _plane(LOGITS, _plane_bytes(rows, 4, columns))
+        vis_rsrc = _plane(VIS, _plane_bytes(rows, 4))
+        rst_rsrc = _plane(RST, _plane_bytes(rows, 4))
+
+        meta = _rows_meta(t2r_rsrc, qp_rsrc, cl_rsrc, t0, rows, num_requests)
+        plans = _pass_plan(meta, rows, kgrp)
+        my_vis = _pick_vis(lane, meta)
+        my_row = t0 + _imin(lane, WMMA_ROWS_PER_WAVE - 1)
+        meta_off = _imin(my_row, rows - 1) * 4
+        writer = (slab == 0) & (lane < WMMA_ROWS_PER_WAVE) & (my_row < rows)
+        if writer:
+            _st_i32(vis_rsrc, meta_off, my_vis)
+            _st_i32(rst_rsrc, meta_off, fx.Int32(0))
+        _tr_mark(trs, 4, True)
+
+        atom = fx.make_mma_atom(fx.rocdl.WMMA(WMMA_N, WMMA_N, WMMA_K, fx.BFloat16, fx.Float32))
+        neg_inf = fx.Float32(_NEG_INF)
+        kbase = _kt8_storage()
+        kreq, full = _kt8_guard(t2r_rsrc, base, rows, num_requests)
+        _tr_mark(trs, 5, True)
+        if full:
+            kvis = _imax(_ld_uniform_i32(cl_rsrc, kreq * 4), 0) // COMPRESS_RATIO
+            kissue = [(slab0 + ki * WMMA_COLS < kvis) & (slab0 + ki * WMMA_COLS < columns)
+                      for ki in range_constexpr(col_tiles)]
+            for ki2 in range_constexpr(col_tiles):
+                if kissue[ki2]:
+                    _kt8_issue(KV, kbase, pt_rsrc, kreq, slab0 + ki2 * WMMA_COLS, width,
+                               num_pages, ki2)
+            _tr_mark(trs, 6)
+            qf = _q_frags(q_rsrc, t0, rows, n_in, kgrp)
+            kpre = _kt8_pre(pt_rsrc, ks_rsrc, kreq, full, slab0, n_in, width, num_pages)
+            _tr_mark(trs, 7, True)
+            fx.rocdl.tdm_ops.tensor_wait(0)
+            _tr_mark(trs, 8)
+            fx.gpu.barrier()
+            _tr_mark(trs, 9)
+            _tr_mark_rt(trs, 14)
+            pf = plans[0]
+            for ct in range_constexpr(col_tiles):
+                col0 = slab0 + ct * WMMA_COLS
+                cols = _lane_cols(col0, n_in)
+                offs = _store_offsets(t0, kgrp, cols, rows, columns)
+                kbuf = kbase + ct * (TDM_FP8_K_TILE_BYTES // 4)
+                if col0 < pf.vmax:
+                    res = _kt8_values(atom, kbuf, qf, pf, cols, offs, columns, kpre[ct])
+                    for j1 in range_constexpr(2 * WMMA_N_TILES):
+                        if res[j1][0]:
+                            _st_f32(logits_rsrc, res[j1][1], res[j1][2])
+                if col0 >= pf.vmax:
+                    msk = _pass_masks(pf, cols, offs, columns)
+                    for j2 in range_constexpr(2 * WMMA_N_TILES):
+                        if msk[j2][0]:
+                            _st_f32(logits_rsrc, msk[j2][1], neg_inf)
+            _tr_mark(trs, 10)
+        if full == 0:
+            for kf in range(fx.Int32(0), fx.Int32(col_tiles), fx.Int32(1), unroll=1):
+                fcol0 = slab0 + fx.Int32(kf) * WMMA_COLS
+                fcols = _lane_cols(fcol0, n_in)
+                foffs = _store_offsets(t0, kgrp, fcols, rows, columns)
+                live = t0 < rows
+                if live:
+                    fqf = _q_frags(q_rsrc, t0, rows, n_in, kgrp)
+                    for p in range_constexpr(WMMA_PASSES):
+                        pp = plans[p]
+                        if pp.active:
+                            if fcol0 < pp.vmax:
+                                fallback = _pass_values(atom, kv_rsrc, ks_rsrc, pt_rsrc, fqf, pp,
+                                                        fcols, foffs, columns, width, num_pages)
+                                for j3 in range_constexpr(2 * WMMA_N_TILES):
+                                    if fallback[j3][0]:
+                                        _st_f32(logits_rsrc, fallback[j3][1], fallback[j3][2])
+                            if fcol0 >= pp.vmax:
+                                masks = _pass_masks(pp, fcols, foffs, columns)
+                                for j4 in range_constexpr(2 * WMMA_N_TILES):
+                                    if masks[j4][0]:
+                                        _st_f32(logits_rsrc, masks[j4][1], neg_inf)
+            _tr_mark(trs, 10)
+        _tr_end(trs)
+
+    def _ktl_pre(t2r_rsrc, qp_rsrc, cl_rsrc, pt_rsrc, base, t0s, rows, columns,
+                 num_requests, slab0, width, num_pages, wave_id):
+        """ONE batch of SGPR loads for the full-block path, then the derived values.
+
+        Returns (full, safe request, vis[4] of the wave's rows, kissue[ct], gathers).
+        Offsets are clamped exactly like `_kt_guard` / `_rows_meta_uniform` /
+        `_kt_issue_w8` / `_persist_issue_tdm` (in-plane by construction); the TDM row ids
+        are the same expressions (valid -> phys, else page 0), so the gathers are identical.
+        """
+        # -- issue (no use in between) --
+        g = [_ld_uniform_i32(t2r_rsrc, _imin(base + i, rows - 1) * 4)
+             for i in range_constexpr(kt_rows)]
+        req0 = g[0]
+        req_ok = (req0 >= 0) & (req0 < num_requests)
+        safe = req_ok.select(req0, 0)
+        pos = [ld_uniform_pos(qp_rsrc, _imin(t0s + i, rows - 1))
+               for i in range_constexpr(WMMA_ROWS_PER_WAVE)]
+        ctx = _ld_uniform_i32(cl_rsrc, safe * 4)
+        gpw = 8 // kt_waves                       # 8-row gathers per wave per 64-col tile
+        span = WMMA_COLS // kt_waves              # columns per wave per 64-col tile
+        plan = []
+        for ct in range_constexpr(col_tiles):
+            for gi in range_constexpr(gpw):
+                local = wave_id * span + gi * 8
+                col = slab0 + ct * WMMA_COLS + local
+                ents = []
+                for page in range_constexpr(2 if P == 4 else 1):
+                    logical = col // P + page
+                    logical_ok = logical < width
+                    safe_logical = logical_ok.select(logical, 0)
+                    ents.append((logical_ok, _ld_uniform_i32(
+                        pt_rsrc, (safe * width + safe_logical) * 4)))
+                plan.append((ct, local, ents))
+        # -- use --
+        full = (base + kt_rows <= rows) & req_ok
+        for i in range_constexpr(1, kt_rows):
+            full = full & (g[i] == req0)
+        # Pin the batch before the (uniform) full branch: LLVM otherwise sinks the ctx /
+        # page-table loads into it and re-serialises them behind the ctx wait. An empty
+        # side-effecting asm reading the SGPRs needs them all landed (ONE s_wait_kmcnt);
+        # it emits no instruction and changes no value (ull = the kernel_kt guard).
+        _pin_sgprs(g + [ctx] + [phys for _ct, _local, _ents in plan for _lok, phys in _ents])
+        vis = [_imax(_imin(pos[i] + 1, ctx), 0) // COMPRESS_RATIO
+               for i in range_constexpr(WMMA_ROWS_PER_WAVE)]
+        kvis = _imax(ctx, 0) // COMPRESS_RATIO
+        kissue = [(slab0 + ct * WMMA_COLS < kvis) & (slab0 + ct * WMMA_COLS < columns)
+                  for ct in range_constexpr(col_tiles)]
+        gathers = []
+        for ct, local, ents in plan:
+            row_ids = []
+            for logical_ok, phys in ents:
+                valid = logical_ok & (phys >= 0) & (phys < num_pages)
+                phys = valid.select(phys, 0)
+                if P == 4:
+                    for row in range_constexpr(4):
+                        row_ids.append(phys * 4 + row)
+                else:
+                    row0 = local % 16 if P == 16 else 0
+                    for r in range_constexpr(8):
+                        row_ids.append(phys * P + (row0 + r))
+            gathers.append((ct, local, row_ids))
+        return full, safe, vis, kissue, gathers
+
+    def _ktl_rowvals(lane, kgrp, vis):
+        """(this lane's vis/rst value for lanes 0..3, vis_a, vis_b, vmax) from SGPR vis."""
+        v = vis[WMMA_ROWS_PER_WAVE - 1]
+        for i in range_constexpr(WMMA_ROWS_PER_WAVE - 2, -1, -1):
+            v = (lane == i).select(vis[i], v)
+        g0 = kgrp == 0
+        vmax = _imax(_imax(vis[0], vis[1]), _imax(vis[2], vis[3]))
+        return v, g0.select(vis[0], vis[2]), g0.select(vis[1], vis[3]), vmax
+
+    # ---- ROUND-R2D kconv (lean fp8 ktile, kconv=True): after the TDM publish every thread
+    # converts its 16-byte chunks of the E4M3 slab ONCE into a bf16 slab with the bf16 kt
+    # layout (272 B pitch), one more s_barrier, then the WMMA B fragments are plain bf16 LDS
+    # reads (the per-wave per-fragment pk8 conversion of kernel_kt disappears). Same exact
+    # converter (_e4m3x8_to_bf16x4_fast), same k positions, same epilogue (per-column scale
+    # per head before ReLU) -> identical scores.
+    def _ktl8_storage():
+        if not kconv:
+            return _kt8_storage()
+        return fx.SharedAllocator(base_alignment=128, static=True).allocate(
+            fx.Array[fx.Int32, col_tiles * (TDM_FP8_K_TILE_BYTES + TDM_K_TILE_BYTES) // 4, 128]
+        ).peek().ptr
+
+    def _ktl8_kbuf(kbase, ct):
+        if not kconv:
+            return kbase + ct * (TDM_FP8_K_TILE_BYTES // 4)
+        return kbase + (col_tiles * TDM_FP8_K_TILE_BYTES + ct * TDM_K_TILE_BYTES) // 4
+
+    def _kc_publish(kbase, tid):
+        if not kconv:
+            return
+        kb16 = kbase + (col_tiles * TDM_FP8_K_TILE_BYTES) // 4
+        for ct in range_constexpr(col_tiles):
+            for i in range_constexpr((WMMA_COLS * 8) // kt_threads):
+                j = tid + i * kt_threads
+                row = j // 8
+                q = j % 8
+                src = Vec(fx.ptr_load(
+                    kbase + (ct * TDM_FP8_K_TILE_BYTES + row * TDM_FP8_K_ROW_BYTES + q * 16) // 4,
+                    result_type=Vec.make_type(4, fx.Int32)))
+                c0 = _e4m3x8_to_bf16x4_fast(fx.Int32(src[0]), fx.Int32(src[1]))
+                c1 = _e4m3x8_to_bf16x4_fast(fx.Int32(src[2]), fx.Int32(src[3]))
+                dst = (ct * TDM_K_TILE_BYTES + row * TDM_K_ROW_BYTES + q * 32) // 4
+                fx.ptr_store(c0, kb16 + dst)
+                fx.ptr_store(c1, kb16 + dst + 4)
+        fx.rocdl.s_barrier()
+
+    def _kc_tile(atom, kbuf, qf, c, kgrp, scale):
+        """`_kt8_tile` reading the converted bf16 slab (bf16 kt fragment addresses)."""
+        k_base = (c % WMMA_COLS) * TDM_K_ROW_BYTES + kgrp * 16
+        acc_t = fx.make_rmem_tensor(8, fx.Float32)
+        acc_t.store(Vec.filled(8, 0.0, fx.Float32))
+        for s in range_constexpr(WMMA_K_STEPS):
+            off = k_base + s * (WMMA_K * 2)
+            lo = Vec(fx.ptr_load(kbuf + off // 4, result_type=Vec.make_type(4, fx.Int32)))
+            hi = Vec(fx.ptr_load(kbuf + (off + 32) // 4, result_type=Vec.make_type(4, fx.Int32)))
+            kf = _rmem8(lo.shuffle(hi, list(range(8))))
+            fx.gemm(atom, acc_t, _rmem8(qf[s]), kf, acc_t)
+        acc = acc_t.load()
+        zero = fx.Float32(0.0)
+        sa = (
+            (fx.Float32(acc[0]) * scale).maximumf(zero)
+            + (fx.Float32(acc[1]) * scale).maximumf(zero)
+            + (fx.Float32(acc[2]) * scale).maximumf(zero)
+            + (fx.Float32(acc[3]) * scale).maximumf(zero)
+        )
+        sb = (
+            (fx.Float32(acc[4]) * scale).maximumf(zero)
+            + (fx.Float32(acc[5]) * scale).maximumf(zero)
+            + (fx.Float32(acc[6]) * scale).maximumf(zero)
+            + (fx.Float32(acc[7]) * scale).maximumf(zero)
+        )
+        return sa * inv_divisor, sb * inv_divisor
+
+    ktl8_tile = _kc_tile if kconv else _kt8_tile
+    def _ktl8_values(atom, kbuf, qf, kgrp, cols, offs, columns, pre, vis_a, vis_b):
+        """`_kt8_values` of a full block (every row owned, ok = column in range)."""
+        neg_inf = fx.Float32(_NEG_INF)
+        out = []
+        for nt in range_constexpr(WMMA_N_TILES):
+            c = cols[nt]
+            page_ok, scale = pre[nt]
+            sa, sb = ktl8_tile(atom, kbuf, qf, c, kgrp, scale)
+            va = (page_ok & (c < vis_a)).select(sa, neg_inf)
+            vb = (page_ok & (c < vis_b)).select(sb, neg_inf)
+            out.append((c < columns, offs[2 * nt], va))
+            out.append((c < columns, offs[2 * nt + 1], vb))
+        return out
+
+    def _ktl8_issue(KV, kbase, gathers, ct, num_pages):
+        for gct, local, row_ids in gathers:
+            if gct == ct:
+                _tdm_fp8_k_gather(KV, kbase, row_ids, num_pages,
+                                  ct * TDM_FP8_K_TILE_BYTES + local * TDM_FP8_K_ROW_BYTES, P)
+
+    @flyc.kernel(name=kernel_name, known_block_size=[kt_threads, 1, 1])
+    def kernel_kt_lean(
+        Q, KV, KS, PT, T2R, QP, CL, LOGITS, VIS, RST,
+        rows: fx.Int32, columns: fx.Int32, num_pages: fx.Int32,
+        num_requests: fx.Int32, width: fx.Int32,
+    ):
+        # ROUND-R2D: fp8 kernel_kt with the lean full-block path (bf16 kernel_kt_lean).
+        _inst_prefetch(ipf)
+        tid = fx.Int32(fx.thread_idx.x)
+        slab = fx.Int32(fx.block_idx.x)
+        rblk = fx.Int32(fx.block_idx.y)
+        wave_id = fx.Int32(fx.rocdl.wave_id())
+        lane = tid % WMMA_WAVE
+        n_in = lane % WMMA_N
+        kgrp = lane // WMMA_N
+        slab0 = slab * (WMMA_COLS * col_tiles)
+        base = rblk * kt_rows
+        t0s = base + wave_id * WMMA_ROWS_PER_WAVE
+        _tr_begin(trs, trace, LOGITS, rows, columns,
+                  (columns + WMMA_COLS * col_tiles - 1) // (WMMA_COLS * col_tiles),
+                  (rows + kt_rows - 1) // kt_rows, kt_waves, slab, rblk)
+
+        q_rsrc = _plane(Q, _plane_bytes(rows, q_row_bytes))
+        kv_rsrc = _plane(KV, _plane_bytes(num_pages, page_bytes))
+        ks_rsrc = _plane(KS, _plane_bytes(num_pages, P * 4))
+        pt_rsrc = _plane(PT, _plane_bytes(num_requests, 4, width))
+        t2r_rsrc = _plane(T2R, _plane_bytes(rows, 4))
+        qp_rsrc = _plane(QP, _plane_bytes(rows, qp_bytes))
+        cl_rsrc = _plane(CL, _plane_bytes(num_requests, 4))
+        logits_rsrc = _plane(LOGITS, _plane_bytes(rows, 4, columns))
+        vis_rsrc = _plane(VIS, _plane_bytes(rows, 4))
+        rst_rsrc = _plane(RST, _plane_bytes(rows, 4))
+        atom = fx.make_mma_atom(fx.rocdl.WMMA(WMMA_N, WMMA_N, WMMA_K, fx.BFloat16, fx.Float32))
+        neg_inf = fx.Float32(_NEG_INF)
+        kbase = _ktl8_storage()
+        full, kreq, lvis, kissue, gathers = _ktl_pre(
+            t2r_rsrc, qp_rsrc, cl_rsrc, pt_rsrc, base, t0s, rows, columns, num_requests,
+            slab0, width, num_pages, wave_id)
+        _tr_mark(trs, 5, True)
+        if full:
+            for ki in range_constexpr(col_tiles):
+                if kissue[ki]:
+                    _ktl8_issue(KV, kbase, gathers, ki, num_pages)
+            _tr_mark(trs, 6)
+            qf = _q_frags(q_rsrc, t0s, rows, n_in, kgrp)
+            kpre = _kt8_pre(pt_rsrc, ks_rsrc, kreq, full, slab0, n_in, width, num_pages)
+            lv, vis_a, vis_b, vmax = _ktl_rowvals(lane, kgrp, lvis)
+            lrow_off = _imin(t0s + _imin(lane, WMMA_ROWS_PER_WAVE - 1), rows - 1) * 4
+            lwriter = (slab == 0) & (lane < WMMA_ROWS_PER_WAVE)
+            if lwriter:
+                _st_i32(vis_rsrc, lrow_off, lv)
+                _st_i32(rst_rsrc, lrow_off, fx.Int32(0))
+            _tr_mark(trs, 7, True)
+            fx.rocdl.tdm_ops.tensor_wait(0)
+            _tr_mark(trs, 8)
+            fx.rocdl.s_barrier()          # TENSORcnt==0 => slab in LDS (mi400-tdm-sync)
+            _tr_mark(trs, 9)
+            _tr_mark_rt(trs, 14)
+            _kc_publish(kbase, tid)       # ROUND-R2D kconv: E4M3 slab -> bf16 slab (else nothing)
+            inside = slab0 + WMMA_COLS * col_tiles <= columns
+            for ct in range_constexpr(col_tiles):
+                col0 = slab0 + ct * WMMA_COLS
+                cols = _lane_cols(col0, n_in)
+                offs = _store_offsets(t0s, kgrp, cols, rows, columns)
+                kbuf = _ktl8_kbuf(kbase, ct)
+                if col0 < vmax:
+                    res = _ktl8_values(atom, kbuf, qf, kgrp, cols, offs, columns, kpre[ct],
+                                       vis_a, vis_b)
+                    if inside:
+                        for j1 in range_constexpr(2 * WMMA_N_TILES):
+                            _st_f32(logits_rsrc, res[j1][1], res[j1][2])
+                    if inside == 0:
+                        for j2 in range_constexpr(2 * WMMA_N_TILES):
+                            if res[j2][0]:
+                                _st_f32(logits_rsrc, res[j2][1], res[j2][2])
+                if col0 >= vmax:
+                    if inside:
+                        for j3 in range_constexpr(2 * WMMA_N_TILES):
+                            _st_f32(logits_rsrc, offs[j3], neg_inf)
+                    if inside == 0:
+                        for j4 in range_constexpr(2 * WMMA_N_TILES):
+                            if cols[j4 // 2] < columns:
+                                _st_f32(logits_rsrc, offs[j4], neg_inf)
+            _tr_mark(trs, 10)
+        if full == 0:
+            # Exact fp8 kernel_kt per-wave raw path (mixed / partial / invalid requests).
+            meta = _rows_meta(t2r_rsrc, qp_rsrc, cl_rsrc, t0s, rows, num_requests)
+            plans = _pass_plan(meta, rows, kgrp)
+            my_vis = _pick_vis(lane, meta)
+            my_row = t0s + _imin(lane, WMMA_ROWS_PER_WAVE - 1)
+            meta_off = _imin(my_row, rows - 1) * 4
+            writer = (slab == 0) & (lane < WMMA_ROWS_PER_WAVE) & (my_row < rows)
+            if writer:
+                _st_i32(vis_rsrc, meta_off, my_vis)
+                _st_i32(rst_rsrc, meta_off, fx.Int32(0))
+            for kf in range(fx.Int32(0), fx.Int32(col_tiles), fx.Int32(1), unroll=1):
+                fcol0 = slab0 + fx.Int32(kf) * WMMA_COLS
+                fcols = _lane_cols(fcol0, n_in)
+                foffs = _store_offsets(t0s, kgrp, fcols, rows, columns)
+                live = t0s < rows
+                if live:
+                    fqf = _q_frags(q_rsrc, t0s, rows, n_in, kgrp)
+                    for p in range_constexpr(WMMA_PASSES):
+                        pp = plans[p]
+                        if pp.active:
+                            if fcol0 < pp.vmax:
+                                fallback = _pass_values(atom, kv_rsrc, ks_rsrc, pt_rsrc, fqf, pp,
+                                                        fcols, foffs, columns, width, num_pages)
+                                for j5 in range_constexpr(2 * WMMA_N_TILES):
+                                    if fallback[j5][0]:
+                                        _st_f32(logits_rsrc, fallback[j5][1], fallback[j5][2])
+                            if fcol0 >= pp.vmax:
+                                masks = _pass_masks(pp, fcols, foffs, columns)
+                                for j6 in range_constexpr(2 * WMMA_N_TILES):
+                                    if masks[j6][0]:
+                                        _st_f32(logits_rsrc, masks[j6][1], neg_inf)
+            _tr_mark(trs, 10)
+        _tr_end(trs)
+
+    selected_kernel = kernel if rows_per_block == 16 else kernel_r32
+    if early:
+        selected_kernel = kernel_r32_early
+    if ktile:
+        selected_kernel = kernel_kt_lean if lean else kernel_kt
     @flyc.jit
     def launch(
         Q,
@@ -2783,12 +4766,20 @@ def _build_wmma_fp8_kernel(divisor: float, rows_per_block: int = 16, k_load: str
             rows, columns, num_pages, num_requests, width,
         ).launch(
             grid=(fx.Int64(grid_x), fx.Int64(grid_y), 1),
-            block=(WMMA_THREADS, 1, 1),
+            block=(kt_threads, 1, 1),
             stream=stream,
         )
 
     launch.kernel_name = kernel_name
     launch.dtype_tag = "fp8_wmma"
+    launch.early = early
+    if ktile:   # ROUND-R2C
+        launch.cols_per_block = WMMA_COLS * col_tiles
+        launch.rows_per_launch = kt_rows
+        launch.kt = (kt_rows, col_tiles)
+        launch.threads = kt_threads
+        launch.lean, launch.ipf = bool(lean), int(ipf)
+    launch.trace = trace
     return launch
 
 
@@ -2860,7 +4851,7 @@ if _DRAFT_COLS not in ("auto", "32", "64"):
 #         a WMMA hazard window -> no conversion padding; no co-execution).
 #   kpipe qpre + software pipeline: tile t's WMMAs share a scheduling
 #         region with tile t+1's conversion (WMMA / VALU co-execution, kernel-wiki
-#         mi400-valu-coexec §2.2), separated by ``sched_barrier``s; conversion
+#         mi400-valu-coexec Â§2.2), separated by ``sched_barrier``s; conversion
 #         temps of tile t+1 are distinct from tile t's live A/B/D registers.
 #   base  5fb8740e order (Q loaded after ``s_wait_tensorcnt 0``).
 # Non-default get a ``_s<variant>`` tag. FP8PERF2 GPU c65536/c32768: qpre 18.4/11.6 kpipe 20.6/11.9
@@ -2869,6 +4860,25 @@ _DRAFT_FP8_SCHED = os.environ.get("QSA_DRAFT_FP8_SCHED", _DRAFT_FP8_SCHED_DEFAUL
 if _DRAFT_FP8_SCHED not in ("qpre", "kall", "kpipe", "base"):
     raise ValueError(
         f"QSA_DRAFT_FP8_SCHED must be 'qpre', 'kall', 'kpipe' or 'base', got {_DRAFT_FP8_SCHED!r}")
+
+
+# ROUND-R2 short contexts: waves (= wave_cols column slabs) per draft workgroup.
+# Default 4 (unchanged). At columns 1024 / w32 a row is 8 WGs x 4 waves; small C
+# then fills few CUs (grid = 8 x C) -- 2 / 1 give 2x / 4x more, smaller WGs.
+# ROUND-R2E: default 'auto' = per dtype (bf16 4, fp8 2: GPU fp8 single decode b16 wg2
+# 2.66-3.10 us vs native 3.0-3.17, wg4 1.02-1.04x); '4' / '2' / '1' force both dtypes.
+DRAFT_AUTO_WG_WAVES = {False: 4, True: 2}               # is_fp8 -> wg_waves
+_DRAFT_WG_WAVES_SPEC = os.environ.get("QSA_DRAFT_WG_WAVES", "auto").strip().lower()
+if _DRAFT_WG_WAVES_SPEC not in ("auto", "4", "2", "1"):
+    raise ValueError(f"QSA_DRAFT_WG_WAVES must be auto, 4, 2 or 1, got {_DRAFT_WG_WAVES_SPEC!r}")
+_DRAFT_WG_WAVES = None if _DRAFT_WG_WAVES_SPEC == "auto" else int(_DRAFT_WG_WAVES_SPEC)
+
+
+def draft_wg_waves(is_fp8: bool) -> int:
+    """Effective draft workgroup waves of the dtype (QSA_DRAFT_WG_WAVES, 'auto' default)."""
+    if _DRAFT_WG_WAVES is None:
+        return DRAFT_AUTO_WG_WAVES[bool(is_fp8)]
+    return _DRAFT_WG_WAVES
 
 
 def draft_fp8_sched() -> str:
@@ -2903,11 +4913,12 @@ def draft_route(rows: int, num_requests: int, is_fp8: bool, kv_ptr: int):
     return k_load, draft_wave_cols(k_load)
 
 
-def draft_grid(rows: int, columns: int, wave_cols: int) -> tuple[int, int]:
-    """grid.x = column spans of DRAFT_WAVES slabs, grid.y = one row per block."""
+def draft_grid(rows: int, columns: int, wave_cols: int,
+               wg_waves: int = DRAFT_WAVES) -> tuple[int, int]:
+    """grid.x = column spans of ``wg_waves`` slabs, grid.y = one row per block."""
     if wave_cols not in (32, 64):
         raise ValueError("draft wave_cols must be 32 or 64")
-    span = DRAFT_WAVES * wave_cols
+    span = int(wg_waves) * wave_cols
     return (int(columns) + span - 1) // span, int(rows)
 
 
@@ -2931,13 +4942,21 @@ def draft_store_plan(rows: int, columns: int, wave_cols: int):
 
 @lru_cache(maxsize=None)
 def _build_draft_kernel(is_fp8: bool, divisor: float, k_load: str = "tdm", wave_cols: int = 32,
-                        pos64: bool = False):
+                        pos64: bool = False, page_size: int = PAGE_SIZE,
+                        wg_waves: int = DRAFT_WAVES):
     """One-row-per-wave draft specialization (see the Round DRAFT block).
 
     ``pos64=True`` (ROUND-MERGE1) reads query_positions as int64 through the
     shared ``_pos_loaders`` seam (SGPR variant); ``False`` is the DRAFT kernel.
+    ROUND-R2 ``wg_waves`` 4 (default, trace-identical) | 2 | 1: wave column slabs
+    per workgroup (short contexts / small batches: more, smaller workgroups).
     """
     _, ld_uniform_pos, qp_bytes, qp_tag = _pos_loaders(pos64)
+    P = _check_page_size(page_size)
+    waves = int(wg_waves)
+    if waves not in _WG_WAVES:
+        raise ValueError(f"draft wg_waves must be one of {_WG_WAVES}")
+    threads = WMMA_WAVE * waves
     if k_load not in ("tdm", "raw"):
         raise ValueError("draft k_load must be 'tdm' or 'raw'")
     if wave_cols not in (32, 64):
@@ -2947,13 +4966,13 @@ def _build_draft_kernel(is_fp8: bool, divisor: float, k_load: str = "tdm", wave_
     use_tdm = k_load == "tdm"
     n_tiles = wave_cols // WMMA_N                     # 2 / 4 WMMA N tiles per wave
     n_pairs = wave_cols // WMMA_WAVE                  # 1 / 2 stores per lane
-    span = DRAFT_WAVES * wave_cols                    # columns per workgroup
+    span = waves * wave_cols                          # columns per workgroup
     inv_divisor = 1.0 / divisor
     q_row_bytes = NUM_HEADS * HEAD_DIM * 2            # 1024 B
     head_bytes = HEAD_DIM * 2                         # 256 B
     kstep_q = WMMA_K * 2                              # 64 B of a Q row per step
     key_row_bytes = HEAD_DIM if is_fp8 else HEAD_DIM * 2
-    page_bytes = PAGE_SIZE * key_row_bytes
+    page_bytes = P * key_row_bytes
     kstep_k = WMMA_K * (1 if is_fp8 else 2)           # 32 B fp8 / 64 B bf16
     pitch = TDM_FP8_K_ROW_BYTES if is_fp8 else TDM_K_ROW_BYTES   # 144 / 272 B
     tile_bytes = wave_cols * pitch                    # per wave
@@ -2965,9 +4984,10 @@ def _build_draft_kernel(is_fp8: bool, divisor: float, k_load: str = "tdm", wave_
                  else "")
     kernel_name = (
         f"qsa_paged_mqa_logits_page4_gfx1250_{dtag}_draft"
-        f"_D{HEAD_DIM}_H{NUM_HEADS}_P{PAGE_SIZE}_w{wave_cols}_flydsl"
+        f"_D{HEAD_DIM}_H{NUM_HEADS}_P{P}_w{wave_cols}_flydsl"
         + ("_tdm" if use_tdm else "_raw")
-    ) + qp_tag + (_CVT_ASM_TAG if is_fp8 else "") + sched_tag
+    ) + qp_tag + (_CVT_ASM_TAG if is_fp8 else "") + sched_tag + (
+        f"_wg{waves}" if waves != DRAFT_WAVES else "")
 
     def _frag(rsrc, byte_off):
         lo = _ld_vec(rsrc, byte_off, 4, fx.Int32)
@@ -2981,7 +5001,7 @@ def _build_draft_kernel(is_fp8: bool, divisor: float, k_load: str = "tdm", wave_
 
     def _storage_tdm(kv_rsrc):
         return fx.SharedAllocator(base_alignment=128, static=True).allocate(
-            fx.Array[fx.Int32, DRAFT_WAVES * tile_bytes // 4, 128]
+            fx.Array[fx.Int32, waves * tile_bytes // 4, 128]
         ).peek().ptr
 
     def _storage_raw(kv_rsrc):
@@ -2990,17 +5010,24 @@ def _build_draft_kernel(is_fp8: bool, divisor: float, k_load: str = "tdm", wave_
     def _stage_tdm(KV, storage, pt_rsrc, safe_req, req_ok, col0, width, num_pages, wave):
         # SGPR-only descriptors (wave_id, request, page table); wave-private tile.
         for group in range_constexpr(wave_cols // 8):
-            row_ids = []
-            for page in range_constexpr(2):
-                logical = col0 // PAGE_SIZE + group * 2 + page
-                logical_ok = logical < width
-                safe_logical = logical_ok.select(logical, 0)
-                phys = _ld_uniform_i32(pt_rsrc, (safe_req * width + safe_logical) * 4)
-                valid = req_ok & logical_ok & (phys >= 0) & (phys < num_pages)
-                phys = valid.select(phys, 0)
-                for r in range_constexpr(PAGE_SIZE):
-                    row_ids.append(phys * PAGE_SIZE + r)
-            gather(KV, storage, row_ids, num_pages, wave * tile_bytes + group * 8 * pitch)
+            if P == 4:
+                row_ids = []
+                for page in range_constexpr(2):
+                    logical = col0 // 4 + group * 2 + page
+                    logical_ok = logical < width
+                    safe_logical = logical_ok.select(logical, 0)
+                    phys = _ld_uniform_i32(pt_rsrc, (safe_req * width + safe_logical) * 4)
+                    valid = req_ok & logical_ok & (phys >= 0) & (phys < num_pages)
+                    phys = valid.select(phys, 0)
+                    for r in range_constexpr(4):
+                        row_ids.append(phys * 4 + r)
+            elif P == 16:   # P = 16: one page lookup per 8-row group (col0 % 32 == 0)
+                row_ids = _p16_row_ids(pt_rsrc, safe_req, width, num_pages,
+                                       col0 // 16 + group // 2, (group % 2) * 8, req_ok)
+            else:   # P = 8: the 8-row group IS page col0/8 + group (one lookup)
+                row_ids = _p16_row_ids(pt_rsrc, safe_req, width, num_pages,
+                                       col0 // 8 + group, 0, req_ok, 8)
+            gather(KV, storage, row_ids, num_pages, wave * tile_bytes + group * 8 * pitch, P)
 
     def _wait_tdm():
         # Same-wave consumer: data is in LDS once TENSORcnt reaches 0 (tensor
@@ -3050,7 +5077,7 @@ def _build_draft_kernel(is_fp8: bool, divisor: float, k_load: str = "tdm", wave_
         return Vec.from_elements(words, dtype=fx.Int32)
 
     def _ks_bytes_fp8(num_pages):
-        return _plane_bytes(num_pages, PAGE_SIZE * 4)
+        return _plane_bytes(num_pages, P * 4)
 
     def _ks_bytes_bf16(num_pages):
         return fx.Int64(4)
@@ -3063,7 +5090,7 @@ def _build_draft_kernel(is_fp8: bool, divisor: float, k_load: str = "tdm", wave_
 
     def _finish_fp8(acc, ks_rsrc, phys, off):
         zero = fx.Float32(0.0)
-        scale = _ld_f32(ks_rsrc, (phys * PAGE_SIZE + off) * 4)
+        scale = _ld_f32(ks_rsrc, (phys * P + off) * 4)
         s = ((acc[0] * scale).maximumf(zero) + (acc[1] * scale).maximumf(zero)
              + (acc[2] * scale).maximumf(zero) + (acc[3] * scale).maximumf(zero))
         return s * inv_divisor
@@ -3110,8 +5137,8 @@ def _build_draft_kernel(is_fp8: bool, divisor: float, k_load: str = "tdm", wave_
         """Page lookup + the WMMA_K_STEPS (converted) K fragments of N tile ``nt``."""
         local = nt * WMMA_N + n_in
         c = col0 + local
-        logical = c // PAGE_SIZE
-        off = c % PAGE_SIZE
+        logical = c // P
+        off = c % P
         logical_ok = logical < width
         safe_logical = logical_ok.select(logical, 0)
         phys = _ld_i32(pt_rsrc, (safe_req * width + safe_logical) * 4)
@@ -3173,11 +5200,11 @@ def _build_draft_kernel(is_fp8: bool, divisor: float, k_load: str = "tdm", wave_
             ok = g0.select(oks[2 * j], oks[2 * j + 1]) != 0
             phys = g0.select(physs[2 * j], physs[2 * j + 1])
             c = col0 + j * WMMA_WAVE + lane
-            score = finish(acc, ks_rsrc, phys, c % PAGE_SIZE)
+            score = finish(acc, ks_rsrc, phys, c % P)
             out.append((ok & (c < vis)).select(score, neg_inf))
         return out
 
-    @flyc.kernel(name=kernel_name, known_block_size=[WMMA_THREADS, 1, 1])
+    @flyc.kernel(name=kernel_name, known_block_size=[threads, 1, 1])
     def kernel(
         Q, KV, KS, PT, T2R, QP, CL, LOGITS, VIS, RST,
         rows: fx.Int32, columns: fx.Int32, num_pages: fx.Int32,
@@ -3208,7 +5235,7 @@ def _build_draft_kernel(is_fp8: bool, divisor: float, k_load: str = "tdm", wave_
         safe_req = req_ok.select(req, 0)
         ctx = _ld_uniform_i32(cl_rsrc, safe_req * 4)
         pos = ld_uniform_pos(qp_rsrc, safe_row)
-        vis = req_ok.select(_imax(_imin(pos + 1, ctx), 0) // PAGE_SIZE, 0)
+        vis = req_ok.select(_imax(_imin(pos + 1, ctx), 0) // COMPRESS_RATIO, 0)
         writer = (bx == 0) & (tid == 0) & (row < rows)
         if writer:
             _st_i32(vis_rsrc, safe_row * 4, vis)
@@ -3245,12 +5272,13 @@ def _build_draft_kernel(is_fp8: bool, divisor: float, k_load: str = "tdm", wave_
             rows, columns, num_pages, num_requests, width,
         ).launch(
             grid=(fx.Int64(grid_x), fx.Int64(grid_y), 1),
-            block=(WMMA_THREADS, 1, 1),
+            block=(threads, 1, 1),
             stream=stream,
         )
 
     launch.kernel_name = kernel_name
     launch.dtype_tag = f"{dtag}_draft"
+    launch.wg_waves = waves
     launch.cols_per_block = span
     launch.wave_cols = wave_cols
     launch.k_load = k_load
@@ -3319,6 +5347,9 @@ if _DECODE_GROUP_COLS not in ("auto", "32", "64"):
         f"QSA_DECODE_GROUP_COLS must be 'auto', '32' or '64', got {_DECODE_GROUP_COLS!r}")
 _DECODE_GROUP_COLS = None if _DECODE_GROUP_COLS == "auto" else int(_DECODE_GROUP_COLS)
 _DECODE_GROUP_AUTO_COLS = {False: 32, True: 64}          # is_fp8 -> wave_cols
+# ROUND-R2E: 'auto' slab of kernel-native 3-row groups (group_rows=3, MTP verify3):
+# fp8 w32 (GPU verify3 C8-C64 0.90-0.94x native; w64 1.05-1.15x; C>=192 w64 ~ w32).
+_DECODE_GROUP_AUTO_COLS_G3 = {False: 32, True: 32}       # is_fp8 -> wave_cols
 # ROUND-FP8PERF: decode-group fp8 tile schedule (intrinsic converter only).
 #   base  (default) 5fb8740e structure (per tile: convert, 4 WMMAs, epilogue;
 #         LLVM interleaves and pads the WMMA hazards with v_nop);
@@ -3336,7 +5367,86 @@ def decg_fp8_sched() -> str:
     return "base" if _FP8_CVT_ASM else _DECG_FP8_SCHED
 
 
-def decode_group_route(rows: int, num_requests: int, is_fp8: bool, kv_ptr: int):
+# ROUND-R2 decode-group knobs (builder keywords; defaults = 536667d5 kernel):
+#   group_rows 4 | 3   rows per group. 3 = MTP verify with 3 rows per request
+#                      (rows = 3C): each group is ONE request -> one pass, one K
+#                      slab gather per 3 rows (K traffic of the 4-row decode
+#                      group per request); WMMA M = 3 rows x 4 heads = 12 of 16
+#                      slots, slot row 3 (Q of the next group, clamped) is
+#                      computed but never stored. grid.y = ceil(rows / 3).
+#   row_mode  base     536667d5 plan (one pass if all 4 rows share a request,
+#                      else 4 single-row passes);
+#             dedup    request-dedup passes (pass p iff row p's request is new in
+#                      the group; it owns every row of that request): a 4-row
+#                      group straddling two 3-row requests costs 2 passes, not 4;
+#             pad      dedup + rows with an invalid token_to_request are PADDING:
+#                      no logits / visible_groups / row_starts stores at all
+#                      (op-level 3 -> 4 token padding with t2r = -1 on pad rows;
+#                      the real rows are bit-identical to the unpadded call).
+#   wg_waves  4 | 2 | 1  wave column slabs per workgroup (short contexts / small
+#                      C: more, smaller workgroups -> more CUs; span = waves*wc).
+# Env (wrapper only, default off): QSA_DECG_ROWS3=1 routes rows == 3*requests to
+# group_rows=3; QSA_DECG_MODE=dedup|pad; QSA_DECG_WG_WAVES=4|2|1.
+DECG_ROW_MODES = ("base", "dedup", "pad")
+_WG_WAVES = (4, 2, 1)
+
+
+def _env_choice(name, value, choices):
+    v = value.strip().lower()
+    if v not in choices:
+        raise ValueError(f"{name} must be one of {choices}, got {v!r}")
+    return v
+
+
+# Direct os.environ.get reads: the op profile pins every import-time switch.
+_DECG_ROWS3 = _env_choice("QSA_DECG_ROWS3", os.environ.get("QSA_DECG_ROWS3", "0"), ("0", "1")) == "1"
+_DECG_MODE = _env_choice("QSA_DECG_MODE", os.environ.get("QSA_DECG_MODE", "base"), DECG_ROW_MODES)
+_DECG_WG_WAVES = int(_env_choice("QSA_DECG_WG_WAVES", os.environ.get("QSA_DECG_WG_WAVES", "4"),
+                                 ("4", "2", "1")))
+
+
+def _check_decg_knobs(group_rows, row_mode, wg_waves):
+    g, mode, w = int(group_rows), str(row_mode), int(wg_waves)
+    if g not in (3, 4):
+        raise ValueError("decode-group group_rows must be 3 or 4")
+    if mode not in DECG_ROW_MODES:
+        raise ValueError(f"decode-group row_mode must be one of {DECG_ROW_MODES}")
+    if w not in _WG_WAVES:
+        raise ValueError(f"decode-group wg_waves must be one of {_WG_WAVES}")
+    if g != DECG_ROWS and mode == "base":
+        mode = "dedup"                      # 3-row groups always use the dedup plan
+    return g, mode, w
+
+
+def _decg_knob_tag(group_rows, row_mode, waves):
+    """Kernel-name suffix of the ROUND-R2 knobs ('' for the defaults)."""
+    return ((f"_g{group_rows}" if group_rows != DECG_ROWS else "")
+            + (f"_{row_mode}" if row_mode != "base" else "")
+            + (f"_wg{waves}" if waves != DECG_WAVES else ""))
+
+
+def decode_group_passes_x(reqs, real):
+    """Trace-free mirror of ``_group_plans_x`` (dedup / pad / 3-row groups).
+
+    ``reqs`` = raw request ids of the group's rows, ``real`` = stored rows.
+    Returns [(active, owned rows)] per pass p < len(reqs).
+    """
+    out = []
+    for p in range(len(reqs)):
+        active = real[p] and not any(real[q] and reqs[q] == reqs[p] for q in range(p))
+        own = [r for r in range(len(reqs)) if real[r] and reqs[r] == reqs[p]]
+        out.append((bool(active), own))
+    return out
+
+
+def decode_group_knobs(rows: int, num_requests: int):
+    """Wrapper defaults of the ROUND-R2 knobs: (group_rows, row_mode, wg_waves)."""
+    g = 3 if (_DECG_ROWS3 and int(rows) == 3 * int(num_requests)) else DECG_ROWS
+    return _check_decg_knobs(g, _DECG_MODE, _DECG_WG_WAVES)
+
+
+def decode_group_route(rows: int, num_requests: int, is_fp8: bool, kv_ptr: int,
+                       group_rows: int = DECG_ROWS):
     """Pure-Python routing of the decode row-group kernel: ``None`` or wave_cols.
 
     Only when QSA_DECODE_GROUP (default 'all') enables the dtype, raw access,
@@ -3353,7 +5463,7 @@ def decode_group_route(rows: int, num_requests: int, is_fp8: bool, kv_ptr: int):
     if _ACCESS != "raw" or (_FP8_PATH if is_fp8 else _BF16_PATH) != "wmma":
         return None
     rows, num_requests = int(rows), int(num_requests)
-    if rows <= num_requests or rows % DECG_ROWS:
+    if rows <= num_requests or rows % int(group_rows):
         return None
     rpb = wmma_rows_per_block(rows, num_requests) if is_fp8 else \
         wmma_bf16_rows_per_block(rows, num_requests)
@@ -3362,16 +5472,20 @@ def decode_group_route(rows: int, num_requests: int, is_fp8: bool, kv_ptr: int):
     if is_fp8 and _FP8_CVT_ASM:
         return 32                        # asm-converter fp8 w64 is GPU-incorrect
     if _DECODE_GROUP_COLS is None:
+        if int(group_rows) == 3:                       # ROUND-R2E
+            return _DECODE_GROUP_AUTO_COLS_G3[bool(is_fp8)]
         return _DECODE_GROUP_AUTO_COLS[bool(is_fp8)]
     return _DECODE_GROUP_COLS
 
 
-def decode_group_grid(rows: int, columns: int, wave_cols: int) -> tuple[int, int]:
-    """grid.x = column spans of DECG_WAVES slabs, grid.y = 4-row groups."""
+def decode_group_grid(rows: int, columns: int, wave_cols: int, group_rows: int = DECG_ROWS,
+                      wg_waves: int = DECG_WAVES) -> tuple[int, int]:
+    """grid.x = column spans of ``wg_waves`` slabs, grid.y = ``group_rows``-row groups."""
     if wave_cols not in (32, 64):
         raise ValueError("decode-group wave_cols must be 32 or 64")
-    span = DECG_WAVES * wave_cols
-    return (int(columns) + span - 1) // span, (int(rows) + DECG_ROWS - 1) // DECG_ROWS
+    span = int(wg_waves) * wave_cols
+    g = int(group_rows)
+    return (int(columns) + span - 1) // span, (int(rows) + g - 1) // g
 
 
 def decode_group_passes(reqs4, rows_ok4):
@@ -3419,9 +5533,22 @@ def decode_group_store_plan(rows: int, columns: int, wave_cols: int, t2r):
 
 @lru_cache(maxsize=None)
 def _build_decode_group_kernel(is_fp8: bool, divisor: float, wave_cols: int = 32,
-                               pos64: bool = False):
-    """Decode row-group specialization (see the Round DECG block)."""
+                               pos64: bool = False, page_size: int = PAGE_SIZE,
+                               group_rows: int = DECG_ROWS, row_mode: str = "base",
+                               wg_waves: int = DECG_WAVES):
+    """Decode row-group specialization (see the Round DECG / ROUND-R2 blocks).
+
+    ROUND-R2 knobs (defaults = the 536667d5 kernel, trace-identical):
+    ``group_rows`` 4 | 3 (rows per group; 3 = MTP verify with 3 rows per request,
+    the WMMA M slots of lane row 3 are never stored), ``row_mode`` 'base' |
+    'dedup' | 'pad' (see ``decode_group_passes_x``), ``wg_waves`` 4 | 2 | 1
+    (wave column slabs per workgroup).
+    """
     _, ld_uniform_pos, qp_bytes, qp_tag = _pos_loaders(pos64)
+    P = _check_page_size(page_size)
+    group_rows, row_mode, waves = _check_decg_knobs(group_rows, row_mode, wg_waves)
+    threads = WMMA_WAVE * waves
+    n_pass = group_rows
     if wave_cols not in (32, 64):
         raise ValueError("decode-group wave_cols must be 32 or 64")
     if is_fp8 and wave_cols == 64 and _FP8_CVT_ASM:
@@ -3430,13 +5557,13 @@ def _build_decode_group_kernel(is_fp8: bool, divisor: float, wave_cols: int = 32
     if _ACCESS != "raw":
         raise ValueError("the decode-group kernel requires QSA_G2_ACCESS=raw")
     n_tiles = wave_cols // WMMA_N                     # 2 / 4 WMMA N tiles per wave
-    span = DECG_WAVES * wave_cols                     # columns per workgroup
+    span = waves * wave_cols                          # columns per workgroup
     inv_divisor = 1.0 / divisor
     q_row_bytes = NUM_HEADS * HEAD_DIM * 2            # 1024 B
     head_bytes = HEAD_DIM * 2                         # 256 B
     kstep_q = WMMA_K * 2                              # 64 B of a Q row per step
     key_row_bytes = HEAD_DIM if is_fp8 else HEAD_DIM * 2
-    page_bytes = PAGE_SIZE * key_row_bytes
+    page_bytes = P * key_row_bytes
     kstep_k = WMMA_K * (1 if is_fp8 else 2)           # 32 B fp8 / 64 B bf16
     pitch = TDM_FP8_K_ROW_BYTES if is_fp8 else TDM_K_ROW_BYTES   # 144 / 272 B
     tile_bytes = wave_cols * pitch                    # per wave
@@ -3447,8 +5574,9 @@ def _build_decode_group_kernel(is_fp8: bool, divisor: float, wave_cols: int = 32
                  else "")
     kernel_name = (
         f"qsa_paged_mqa_logits_page4_gfx1250_{dtag}_decg"
-        f"_D{HEAD_DIM}_H{NUM_HEADS}_P{PAGE_SIZE}_w{wave_cols}_flydsl_tdm"
-    ) + qp_tag + (_CVT_ASM_TAG if is_fp8 else "") + sched_tag
+        f"_D{HEAD_DIM}_H{NUM_HEADS}_P{P}_w{wave_cols}_flydsl_tdm"
+    ) + qp_tag + (_CVT_ASM_TAG if is_fp8 else "") + sched_tag + _decg_knob_tag(
+        group_rows, row_mode, waves)
 
     def _i01(cond):
         return cond.select(fx.Int32(1), fx.Int32(0))
@@ -3465,7 +5593,7 @@ def _build_decode_group_kernel(is_fp8: bool, divisor: float, wave_cols: int = 32
 
     def _storage():
         return fx.SharedAllocator(base_alignment=128, static=True).allocate(
-            fx.Array[fx.Int32, DECG_WAVES * tile_bytes // 4, 128]
+            fx.Array[fx.Int32, waves * tile_bytes // 4, 128]
         ).peek().ptr
 
     def _group_meta(t2r_rsrc, qp_rsrc, cl_rsrc, t0, rows, num_requests):
@@ -3480,7 +5608,7 @@ def _build_decode_group_kernel(is_fp8: bool, divisor: float, wave_cols: int = 32
             safe_req = req_ok.select(req, 0)
             ctx = _ld_uniform_i32(cl_rsrc, safe_req * 4)
             pos = ld_uniform_pos(qp_rsrc, safe_row)
-            vis = req_ok.select(_imax(_imin(pos + 1, ctx), 0) // PAGE_SIZE, 0)
+            vis = req_ok.select(_imax(_imin(pos + 1, ctx), 0) // COMPRESS_RATIO, 0)
             out.append(_RowMeta(row, row_ok, req, req_ok, safe_req, vis))
         return out
 
@@ -3520,6 +5648,93 @@ def _build_decode_group_kernel(is_fp8: bool, divisor: float, wave_cols: int = 32
             v = (lane == i).select(meta[i].vis, v)
         return v
 
+    # ---- ROUND-R2 row modes (group_rows 3 or row_mode != 'base' only) --------
+    def _group_meta_x(t2r_rsrc, qp_rsrc, cl_rsrc, t0, rows, num_requests):
+        """SGPR metadata of the group's ``group_rows`` rows + ``real`` (stored rows).
+
+        real = row < min(rows, t0 + group_rows) [& valid request in 'pad' mode:
+        padded rows (token_to_request = -1 / out of range) get NO stores at all].
+        """
+        lim = _imin(rows, t0 + group_rows)
+        out = []
+        for i in range_constexpr(group_rows):
+            row = t0 + i
+            row_ok = row < lim
+            safe_row = _imin(row, rows - 1)
+            req = _ld_uniform_i32(t2r_rsrc, safe_row * 4)
+            req_ok = (req >= 0) & (req < num_requests)
+            safe_req = req_ok.select(req, 0)
+            ctx = _ld_uniform_i32(cl_rsrc, safe_req * 4)
+            pos = ld_uniform_pos(qp_rsrc, safe_row)
+            vis = req_ok.select(_imax(_imin(pos + 1, ctx), 0) // COMPRESS_RATIO, 0)
+            m = _RowMeta(row, row_ok, req, req_ok, safe_req, vis)
+            m.real = (row_ok & req_ok) if row_mode == "pad" else row_ok
+            out.append(m)
+        return out
+
+    def _group_plans_x(meta, kgrp):
+        """Request-dedup passes: pass p is active iff row p is real and no earlier
+        real row has its request; it owns every real row of that request
+        (each real row exactly once; one pass when the group is one request)."""
+        g0 = kgrp == 0
+        plans = []
+        for p in range_constexpr(group_rows):
+            mp = meta[p]
+            active = mp.real
+            for q in range_constexpr(p):
+                dup = meta[q].real & (meta[q].req == mp.req)
+                active = active & (dup == 0)
+            own, vmax = [], fx.Int32(0)
+            for r in range_constexpr(group_rows):
+                mine = meta[r].real & (meta[r].req == mp.req)
+                own.append(_i01(mine))
+                vmax = _imax(vmax, mine.select(meta[r].vis, 0))
+            while len(own) < DECG_ROWS:          # lane row 3 of a 3-row group: never stored
+                own.append(fx.Int32(0))
+            vis4 = [meta[r].vis if r < group_rows else fx.Int32(0) for r in range(DECG_ROWS)]
+            own_a = g0.select(own[0], own[2]) != 0
+            own_b = g0.select(own[1], own[3]) != 0
+            vis_a = g0.select(vis4[0], vis4[2])
+            vis_b = g0.select(vis4[1], vis4[3])
+            plans.append(_Pass(active, vmax, mp.safe_req, mp.req_ok,
+                               own_a, own_b, vis_a, vis_b, kgrp))
+        return plans
+
+    def _writer_x(lane, meta, bx, wave, my_row, rows):
+        """Row-metadata writer lanes: lane < group_rows of (bx 0, wave 0), real rows only."""
+        real = _i01(meta[group_rows - 1].real)
+        for i in range_constexpr(group_rows - 2, -1, -1):
+            real = (lane == i).select(_i01(meta[i].real), real)
+        return (bx == 0) & (wave == 0) & (lane < group_rows) & (my_row < rows) & (real != 0)
+
+    def _pick_vis_x(lane, meta):
+        v = meta[group_rows - 1].vis
+        for i in range_constexpr(group_rows - 2, -1, -1):
+            v = (lane == i).select(meta[i].vis, v)
+        return v
+
+    def _head_base(t2r_rsrc, qp_rsrc, cl_rsrc, t0, rows, num_requests, kgrp, lane, bx, wave):
+        """536667d5 kernel prologue, same op order: (plans, my_vis, meta_off, writer)."""
+        meta = _group_meta(t2r_rsrc, qp_rsrc, cl_rsrc, t0, rows, num_requests)
+        plans = _group_plans(meta, kgrp)
+        my_vis = _pick_vis(lane, meta)
+        my_row = t0 + _imin(lane, DECG_ROWS - 1)
+        meta_off = _imin(my_row, rows - 1) * 4
+        writer = (bx == 0) & (wave == 0) & (lane < DECG_ROWS) & (my_row < rows)
+        return plans, my_vis, meta_off, writer
+
+    def _head_x(t2r_rsrc, qp_rsrc, cl_rsrc, t0, rows, num_requests, kgrp, lane, bx, wave):
+        """ROUND-R2 dedup / pad / 3-row prologue."""
+        meta = _group_meta_x(t2r_rsrc, qp_rsrc, cl_rsrc, t0, rows, num_requests)
+        plans = _group_plans_x(meta, kgrp)
+        my_vis = _pick_vis_x(lane, meta)
+        my_row = t0 + _imin(lane, group_rows - 1)
+        meta_off = _imin(my_row, rows - 1) * 4
+        writer = _writer_x(lane, meta, bx, wave, my_row, rows)
+        return plans, my_vis, meta_off, writer
+
+    group_head = _head_base if row_mode == "base" else _head_x
+
     def _store_offsets(t0, kgrp, cols, rows, columns):
         """The r16 clamped byte offsets of the lane's rows a/b per tile column."""
         last = rows * columns - 1
@@ -3539,17 +5754,24 @@ def _build_decode_group_kernel(is_fp8: bool, divisor: float, wave_cols: int = 32
     def _issue(KV, storage, pt_rsrc, pp, col0, width, num_pages, wave):
         # SGPR-only descriptors (wave_id, pass request, page table); wave-private tile.
         for group in range_constexpr(wave_cols // 8):
-            row_ids = []
-            for page in range_constexpr(2):
-                logical = col0 // PAGE_SIZE + group * 2 + page
-                logical_ok = logical < width
-                safe_logical = logical_ok.select(logical, 0)
-                phys = _ld_uniform_i32(pt_rsrc, (pp.safe_req * width + safe_logical) * 4)
-                valid = pp.req_ok & logical_ok & (phys >= 0) & (phys < num_pages)
-                phys = valid.select(phys, 0)
-                for r in range_constexpr(PAGE_SIZE):
-                    row_ids.append(phys * PAGE_SIZE + r)
-            gather(KV, storage, row_ids, num_pages, wave * tile_bytes + group * 8 * pitch)
+            if P == 4:
+                row_ids = []
+                for page in range_constexpr(2):
+                    logical = col0 // 4 + group * 2 + page
+                    logical_ok = logical < width
+                    safe_logical = logical_ok.select(logical, 0)
+                    phys = _ld_uniform_i32(pt_rsrc, (pp.safe_req * width + safe_logical) * 4)
+                    valid = pp.req_ok & logical_ok & (phys >= 0) & (phys < num_pages)
+                    phys = valid.select(phys, 0)
+                    for r in range_constexpr(4):
+                        row_ids.append(phys * 4 + r)
+            elif P == 16:   # P = 16: one page lookup per 8-row group (col0 % 32 == 0)
+                row_ids = _p16_row_ids(pt_rsrc, pp.safe_req, width, num_pages,
+                                       col0 // 16 + group // 2, (group % 2) * 8, pp.req_ok)
+            else:   # P = 8: the 8-row group IS page col0/8 + group (one lookup)
+                row_ids = _p16_row_ids(pt_rsrc, pp.safe_req, width, num_pages,
+                                       col0 // 8 + group, 0, pp.req_ok, 8)
+            gather(KV, storage, row_ids, num_pages, wave * tile_bytes + group * 8 * pitch, P)
 
     def _tensor_done():
         # Same-wave consumer: data is in LDS once TENSORcnt reaches 0.
@@ -3577,7 +5799,7 @@ def _build_decode_group_kernel(is_fp8: bool, divisor: float, wave_cols: int = 32
         return Vec.from_elements(words, dtype=fx.Int32)
 
     def _scale_fp8(ks_rsrc, phys, off):
-        return _ld_f32(ks_rsrc, (phys * PAGE_SIZE + off) * 4)
+        return _ld_f32(ks_rsrc, (phys * P + off) * 4)
 
     def _scale_bf16(ks_rsrc, phys, off):
         return None
@@ -3595,7 +5817,7 @@ def _build_decode_group_kernel(is_fp8: bool, divisor: float, wave_cols: int = 32
         return s * inv_divisor
 
     def _ks_bytes_fp8(num_pages):
-        return _plane_bytes(num_pages, PAGE_SIZE * 4)
+        return _plane_bytes(num_pages, P * 4)
 
     def _ks_bytes_bf16(num_pages):
         return fx.Int64(4)
@@ -3615,8 +5837,8 @@ def _build_decode_group_kernel(is_fp8: bool, divisor: float, wave_cols: int = 32
         def _tile_k(nt):
             c = cols[nt]
             local = nt * WMMA_N + n_in
-            logical = c // PAGE_SIZE
-            off = c % PAGE_SIZE
+            logical = c // P
+            off = c % P
             logical_ok = logical < width
             safe_logical = logical_ok.select(logical, 0)
             phys = _ld_i32(pt_rsrc, (pp.safe_req * width + safe_logical) * 4)
@@ -3637,7 +5859,7 @@ def _build_decode_group_kernel(is_fp8: bool, divisor: float, wave_cols: int = 32
 
         if sched == "kpipe":
             # ROUND-FP8PERF: region t = WMMAs of tile t-1 + K conversion of tile t
-            # (co-execution, kernel-wiki mi400-valu-coexec §2.2), sched_barrier-fenced.
+            # (co-execution, kernel-wiki mi400-valu-coexec Â§2.2), sched_barrier-fenced.
             tiles, accs = [], []
             for nt in range_constexpr(n_tiles + 1):
                 if nt < n_tiles:
@@ -3670,7 +5892,7 @@ def _build_decode_group_kernel(is_fp8: bool, divisor: float, wave_cols: int = 32
             out.append((pp.own_b & col_ok, offs[2 * nt + 1]))
         return out
 
-    @flyc.kernel(name=kernel_name, known_block_size=[WMMA_THREADS, 1, 1])
+    @flyc.kernel(name=kernel_name, known_block_size=[threads, 1, 1])
     def kernel(
         Q, KV, KS, PT, T2R, QP, CL, LOGITS, VIS, RST,
         rows: fx.Int32, columns: fx.Int32, num_pages: fx.Int32,
@@ -3683,7 +5905,7 @@ def _build_decode_group_kernel(is_fp8: bool, divisor: float, wave_cols: int = 32
         lane = tid % WMMA_WAVE
         n_in = lane % WMMA_N
         kgrp = lane // WMMA_N
-        t0 = grp * DECG_ROWS
+        t0 = grp * group_rows
         col0 = bx * span + wave * wave_cols
         q_rsrc = _plane(Q, _plane_bytes(rows, q_row_bytes))
         kv_rsrc = _plane(KV, _plane_bytes(num_pages, page_bytes))
@@ -3695,12 +5917,10 @@ def _build_decode_group_kernel(is_fp8: bool, divisor: float, wave_cols: int = 32
         logits_rsrc = _plane(LOGITS, _plane_bytes(rows, 4, columns))
         vis_rsrc = _plane(VIS, _plane_bytes(rows, 4))
         rst_rsrc = _plane(RST, _plane_bytes(rows, 4))
-        meta = _group_meta(t2r_rsrc, qp_rsrc, cl_rsrc, t0, rows, num_requests)
-        plans = _group_plans(meta, kgrp)
-        my_vis = _pick_vis(lane, meta)
-        my_row = t0 + _imin(lane, DECG_ROWS - 1)
-        meta_off = _imin(my_row, rows - 1) * 4
-        writer = (bx == 0) & (wave == 0) & (lane < DECG_ROWS) & (my_row < rows)
+        # Trace-time row-mode selection lives outside the kernel AST (an `if` here
+        # would be lowered as a runtime branch); 'base' = the 536667d5 sequence.
+        plans, my_vis, meta_off, writer = group_head(t2r_rsrc, qp_rsrc, cl_rsrc, t0, rows,
+                                                     num_requests, kgrp, lane, bx, wave)
         if writer:
             _st_i32(vis_rsrc, meta_off, my_vis)
             _st_i32(rst_rsrc, meta_off, fx.Int32(0))
@@ -3710,7 +5930,7 @@ def _build_decode_group_kernel(is_fp8: bool, divisor: float, wave_cols: int = 32
         neg_inf = fx.Float32(_NEG_INF)
         storage = _storage()
         ksrc = storage + wave * (tile_bytes // 4)
-        for p in range_constexpr(DECG_ROWS):
+        for p in range_constexpr(n_pass):
             pp = plans[p]
             if pp.active:
                 if col0 < pp.vmax:
@@ -3741,7 +5961,7 @@ def _build_decode_group_kernel(is_fp8: bool, divisor: float, wave_cols: int = 32
             rows, columns, num_pages, num_requests, width,
         ).launch(
             grid=(fx.Int64(grid_x), fx.Int64(grid_y), 1),
-            block=(WMMA_THREADS, 1, 1),
+            block=(threads, 1, 1),
             stream=stream,
         )
 
@@ -3749,6 +5969,9 @@ def _build_decode_group_kernel(is_fp8: bool, divisor: float, wave_cols: int = 32
     launch.dtype_tag = f"{dtag}_decg"
     launch.cols_per_block = span
     launch.wave_cols = wave_cols
+    launch.group_rows = group_rows
+    launch.row_mode = row_mode
+    launch.wg_waves = waves
     return launch
 
 
@@ -3796,6 +6019,17 @@ def wmma_grid(rows: int, columns: int, rows_per_block: int = 16,
         (int(columns) + cols_per_block - 1) // cols_per_block,
         (int(rows) + rows_per_block - 1) // rows_per_block,
     )
+
+
+def wmma_launch_grid(rows: int, columns: int, launcher) -> tuple[int, int]:
+    """ROUND-R2B: grid of any bf16 WMMA launcher (kstat spans R x 32 rows, C x 64 cols)."""
+    kt = getattr(launcher, "kt", None)
+    if kt is not None:                                   # ROUND-R2C ktile
+        return kt_grid(rows, columns, kt[0], kt[1])
+    ks = getattr(launcher, "kstat", None)
+    if ks is not None:
+        return kstat_grid(rows, columns, ks[0], ks[1])
+    return wmma_grid(rows, columns, launcher.rows_per_launch, launcher.cols_per_block)
 
 
 _DUMMY_SCALE: dict = {}
@@ -4169,6 +6403,7 @@ def _qsa_pad_checked_dispatch(rows, columns, requests, width, pages, is_fp8,
 
 _POS64_KW = {"pos64": True}
 _NO_KW: dict = {}
+_PAGE_KW = {8: {"page_size": 8}, 16: {"page_size": 16}}   # builder keyword (P != 4 only)
 
 
 def _qp_pad_i32(query_positions, qp_arg, pos64):
@@ -4188,7 +6423,7 @@ def qsa_paged_mqa_logits_page4(
     token_to_request: torch.Tensor,
     query_positions: torch.Tensor,
     context_lens: torch.Tensor,
-    compress_ratio: int = PAGE_SIZE,
+    compress_ratio: int = COMPRESS_RATIO,
     divisor: float | None = None,
     max_columns: int | None = None,
     compressed_k_scale: torch.Tensor | None = None,
@@ -4196,14 +6431,17 @@ def qsa_paged_mqa_logits_page4(
     visible_groups: torch.Tensor | None = None,
     row_starts: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Paged MQA logits for the QSA index scorer, ``page = 4`` (gfx1250).
+    """Paged MQA logits for the QSA index scorer, index page P in {4, 8, 16} (gfx1250).
 
     Returns ``(logits [rows, columns] fp32, visible_groups [rows] int32)``.
     ``-inf`` is written for every column with ``c >= visible[t]`` and for every
-    column whose page-table entry is invalid.
+    column whose page-table entry is invalid. ROUND-PAGE16: P is read from the
+    cache shape ``[pages, P, 1, 128]`` (P = KV block / compress ratio 4: block
+    16 -> 4, block 32 -> 8, block 64 -> 16); any other P raises. Column c reads
+    ``page_table[req, c // P]`` row ``c % P``; visibility always divides by 4.
     """
-    if compress_ratio != PAGE_SIZE:
-        raise ValueError(f"compress_ratio must be {PAGE_SIZE}, got {compress_ratio}")
+    if compress_ratio != COMPRESS_RATIO:
+        raise ValueError(f"compress_ratio must be {COMPRESS_RATIO}, got {compress_ratio}")
     if q.dtype != torch.bfloat16:
         raise ValueError(f"q must be bfloat16, got {q.dtype}")
     if q.ndim != 3 or tuple(q.shape[1:]) != (NUM_HEADS, HEAD_DIM):
@@ -4214,13 +6452,17 @@ def qsa_paged_mqa_logits_page4(
     if rows == 0 or rows > MAX_GRID_Y:
         raise ValueError(f"rows must be in [1, {MAX_GRID_Y}], got {rows}")
 
-    if compressed_k_cache.ndim != 4 or tuple(compressed_k_cache.shape[1:]) != (
-        PAGE_SIZE, 1, HEAD_DIM,
-    ):
+    if (compressed_k_cache.ndim != 4
+            or int(compressed_k_cache.shape[1]) not in SUPPORTED_PAGE_SIZES
+            or tuple(compressed_k_cache.shape[2:]) != (1, HEAD_DIM)):
         raise ValueError(
-            "compressed_k_cache must be [pages, "
-            f"{PAGE_SIZE}, 1, {HEAD_DIM}], got {tuple(compressed_k_cache.shape)}"
+            f"compressed_k_cache must be [pages, P, 1, {HEAD_DIM}] with P in "
+            f"{SUPPORTED_PAGE_SIZES}, got {tuple(compressed_k_cache.shape)}"
         )
+    page = int(compressed_k_cache.shape[1])
+    # P = 4 passes no extra builder keyword: the very same lru_cache entries
+    # and byte-identical specializations as bf492262.
+    pg_kw = _NO_KW if page == PAGE_SIZE else _PAGE_KW[page]
     if not compressed_k_cache.is_contiguous():
         raise ValueError("compressed_k_cache must be contiguous")
     num_pages = int(compressed_k_cache.shape[0])
@@ -4234,14 +6476,14 @@ def qsa_paged_mqa_logits_page4(
         )
     if is_fp8:
         if compressed_k_scale is None:
-            raise ValueError("fp8 index cache requires its fp32 [pages, 4, 1] scale")
+            raise ValueError(f"fp8 index cache requires its fp32 [pages, {page}, 1] scale")
         if compressed_k_scale.dtype != torch.float32:
             raise ValueError(
                 f"compressed_k_scale must be float32, got {compressed_k_scale.dtype}"
             )
-        if tuple(compressed_k_scale.shape) != (num_pages, PAGE_SIZE, 1):
+        if tuple(compressed_k_scale.shape) != (num_pages, page, 1):
             raise ValueError(
-                f"compressed_k_scale must be {(num_pages, PAGE_SIZE, 1)}, got "
+                f"compressed_k_scale must be {(num_pages, page, 1)}, got "
                 f"{tuple(compressed_k_scale.shape)}"
             )
         if not compressed_k_scale.is_contiguous():
@@ -4262,7 +6504,7 @@ def qsa_paged_mqa_logits_page4(
         # num_records of 0 disables the bounds check entirely.
         raise ValueError("page_table must have at least one column (width >= 1)")
 
-    columns_full = width * PAGE_SIZE
+    columns_full = width * page
     if max_columns is None:
         columns = columns_full
     else:
@@ -4315,11 +6557,11 @@ def qsa_paged_mqa_logits_page4(
     # 2. every base address is aligned for the widest access the kernel issues
     #    from it (16 B dwordx4 K/Q loads, 4 B scalar metadata/scale/logits).
     kv_elem_bytes = 1 if is_fp8 else 2
-    page_bytes = PAGE_SIZE * HEAD_DIM * kv_elem_bytes
+    page_bytes = page * HEAD_DIM * kv_elem_bytes
     _check_plane("q", rows * NUM_HEADS * HEAD_DIM * 2)
     _check_plane("compressed_k_cache", num_pages * page_bytes)
     if is_fp8:
-        _check_plane("compressed_k_scale", num_pages * PAGE_SIZE * 4)
+        _check_plane("compressed_k_scale", num_pages * page * 4)
     _check_plane("page_table", num_requests * width * 4)
     _check_plane("token_to_request", rows * 4)
     _check_plane("query_positions", rows * 4)
@@ -4384,7 +6626,8 @@ def qsa_paged_mqa_logits_page4(
 
     # Native bucket routing is deliberately outside the original launch
     # branches, which remain verbatim (including the stock CPU AST gates).
-    if os.environ.get("QSA_PAD_BUCKET", "0").strip() == "1":
+    # ROUND-PAGE16: the opt-in bucket planner is P = 4 only (P = 16 runs exact).
+    if page == PAGE_SIZE and os.environ.get("QSA_PAD_BUCKET", "0").strip() == "1":
         if ((not is_fp8 and _BF16_PATH == "wmma") or
                 (is_fp8 and _FP8_PATH == "wmma")):
             # Import-time units + true-shape integers only: no planner, tensor
@@ -4432,11 +6675,15 @@ def qsa_paged_mqa_logits_page4(
     if _DRAFT_PATH:
         draft = draft_route(rows, num_requests, is_fp8, kv_u8.data_ptr())
         if draft is not None:
-            draft_launch = _build_draft_kernel(is_fp8, float(divisor), draft[0], draft[1], **qp_kw)
-            grid_x, grid_y = draft_grid(rows, columns, draft[1])
+            # ROUND-R2 QSA_DRAFT_WG_WAVES (4: no keyword, same lru entry; R2E 'auto' = per dtype).
+            dr_w = draft_wg_waves(is_fp8)
+            dr_kw = _NO_KW if dr_w == DRAFT_WAVES else {"wg_waves": dr_w}
+            draft_launch = _build_draft_kernel(is_fp8, float(divisor), draft[0], draft[1], **qp_kw,
+                                               **pg_kw, **dr_kw)
+            grid_x, grid_y = draft_grid(rows, columns, draft[1], dr_w)
             _run(
                 draft_launch, q_u8, kv_u8,
-                compressed_k_scale.view(num_pages, PAGE_SIZE, 1) if is_fp8 else _dummy_scale(dev),
+                compressed_k_scale.view(num_pages, page, 1) if is_fp8 else _dummy_scale(dev),
                 page_table_i32, t2r_i32, qp_i32, cl_i32, logits, vg_flat, rs_flat,
                 grid_x, grid_y, rows, columns, num_pages, num_requests, width, stream,
             )
@@ -4445,13 +6692,18 @@ def qsa_paged_mqa_logits_page4(
     # out): decode row-group kernel for rows > requests, rows % 4 == 0 (r16
     # regime). With '0' only this flag is read (previous c45b24e0 routing).
     if _DECODE_GROUP != "0":
-        decg = decode_group_route(rows, num_requests, is_fp8, kv_u8.data_ptr())
+        # ROUND-R2: knobs default to (4, 'base', 4) -> no keyword, same lru entry.
+        dg_rows, dg_mode, dg_waves = decode_group_knobs(rows, num_requests)
+        dg_kw = (_NO_KW if (dg_rows, dg_mode, dg_waves) == (DECG_ROWS, "base", DECG_WAVES)
+                 else {"group_rows": dg_rows, "row_mode": dg_mode, "wg_waves": dg_waves})
+        decg = decode_group_route(rows, num_requests, is_fp8, kv_u8.data_ptr(), dg_rows)
         if decg is not None:
-            decg_launch = _build_decode_group_kernel(is_fp8, float(divisor), decg, **qp_kw)
-            grid_x, grid_y = decode_group_grid(rows, columns, decg)
+            decg_launch = _build_decode_group_kernel(is_fp8, float(divisor), decg, **qp_kw,
+                                                     **pg_kw, **dg_kw)
+            grid_x, grid_y = decode_group_grid(rows, columns, decg, dg_rows, dg_waves)
             _run(
                 decg_launch, q_u8, kv_u8,
-                compressed_k_scale.view(num_pages, PAGE_SIZE, 1) if is_fp8 else _dummy_scale(dev),
+                compressed_k_scale.view(num_pages, page, 1) if is_fp8 else _dummy_scale(dev),
                 page_table_i32, t2r_i32, qp_i32, cl_i32, logits, vg_flat, rs_flat,
                 grid_x, grid_y, rows, columns, num_pages, num_requests, width, stream,
             )
@@ -4471,13 +6723,25 @@ def qsa_paged_mqa_logits_page4(
         # Round PERSIST (opt-in QSA_BF16_PERSIST=1): r32 TDM prefill with at
         # least one full persistent span loops TDM_PERSIST_CHUNKS tiles/block.
         # Mixed/partial row blocks keep the kernel's exact raw fallback.
-        if (rows_per_block == 32 and k_load == "tdm" and TDM_PERSIST and _ACCESS == "raw"
-                and columns >= WMMA_COLS * TDM_PERSIST_CHUNKS):
-            k_load = "persist"
+        # ROUND-R2B: the choice is the data-driven prefill route table (QSA_PREFILL_ROUTE;
+        # default 'legacy' == the condition above: persist iff columns >= 64 * chunks).
+        pf_kw = _NO_KW
+        if rows_per_block == 32 and k_load == "tdm" and _ACCESS == "raw":
+            k_load, pf_kw = prefill_bf16_route(rows, num_requests, columns, page)
+            if k_load == "ktile":
+                pf_kw = dict({"kt_rows": pf_kw["kt_rows"], "col_tiles": pf_kw["col_tiles"]},
+                             **({"lean": True} if pf_kw.get("lean") else {}),   # ROUND-R2D
+                             **({"ipf": pf_kw["ipf"]} if pf_kw.get("ipf") else {}))
+            elif k_load == "kstat":
+                pf_kw = dict({"row_tiles": pf_kw["row_tiles"], "col_tiles": pf_kw["col_tiles"]},
+                             **({"early": True} if pf_kw.get("early") else {}))
+            else:
+                pf_kw = _NO_KW
         # grid.x is bound to the actual specialization's column width (only a
         # forced-TDM r16 kernel may use 32 columns; every other one uses 64).
-        launch = _build_wmma_kernel(float(divisor), rows_per_block, k_load, **qp_kw)
-        grid_x, grid_y = wmma_grid(rows, columns, rows_per_block, launch.cols_per_block)
+        launch = _build_wmma_kernel(float(divisor), rows_per_block, k_load, **qp_kw, **pg_kw,
+                                    **pf_kw)
+        grid_x, grid_y = wmma_launch_grid(rows, columns, launch)
         _run(
             launch,
             q_u8,
@@ -4509,11 +6773,26 @@ def qsa_paged_mqa_logits_page4(
             rows_per_block = 16
             k_load = "raw"
         grid_x, grid_y = wmma_grid(rows, columns, rows_per_block)
+        e_kw = _NO_KW
+        if rows_per_block == 32 and k_load == "tdm" and _ACCESS == "raw":
+            # ROUND-R2E: data-driven fp8 prefill route (QSA_FP8_PREFILL_ROUTE; the R2C
+            # env switches QSA_FP8_KT / QSA_FP8_EARLY=1 take precedence, unchanged).
+            f_kind, f_kw = prefill_fp8_route(rows, num_requests, columns, page)
+            if f_kind == "early":
+                e_kw = {"early": True}
+            elif f_kind == "ktile":
+                k_load = "ktile"                               # ROUND-R2C fp8 ktile
+                e_kw = dict({"kt_rows": f_kw["kt_rows"], "col_tiles": f_kw["col_tiles"]},
+                            **({"lean": True} if f_kw.get("lean") else {}),
+                            **({"ipf": f_kw["ipf"]} if f_kw.get("ipf") else {}),
+                            **({"kconv": True} if f_kw.get("kconv") else {}))
+                grid_x, grid_y = kt_grid(rows, columns, f_kw["kt_rows"], f_kw["col_tiles"])
         _run(
-            _build_wmma_fp8_kernel(float(divisor), rows_per_block, k_load, **qp_kw),
+            _build_wmma_fp8_kernel(float(divisor), rows_per_block, k_load, **qp_kw, **pg_kw,
+                                   **e_kw),
             q_u8,
             kv_u8,
-            compressed_k_scale.view(num_pages, PAGE_SIZE, 1),
+            compressed_k_scale.view(num_pages, page, 1),
             page_table_i32,
             t2r_i32,
             qp_i32,
@@ -4535,8 +6814,8 @@ def qsa_paged_mqa_logits_page4(
     threads = THREADS
     grid_x = (columns + threads - 1) // threads
 
-    launcher = _build_kernel(is_fp8, threads, float(divisor), **qp_kw)
-    ks = compressed_k_scale.view(num_pages, PAGE_SIZE, 1) if is_fp8 else _dummy_scale(dev)
+    launcher = _build_kernel(is_fp8, threads, float(divisor), **qp_kw, **pg_kw)
+    ks = compressed_k_scale.view(num_pages, page, 1) if is_fp8 else _dummy_scale(dev)
     _run(
         launcher,
         q_u8,
