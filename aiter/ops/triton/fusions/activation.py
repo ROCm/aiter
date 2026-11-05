@@ -209,6 +209,9 @@ def act_mul_and_fp8_group_quant(
         QUANT_BLOCK_SIZE=group_size,
         DTYPE_MAX=DTYPE_MAX,
         DTYPE_MIN=-DTYPE_MAX,
+        NUM_WARPS=config.get("num_warps"),
+        WAVES_PER_EU=config.get("waves_per_eu"),
+        NUM_STAGES=config.get("num_stages"),
         **config,
     )
 

@@ -174,17 +174,17 @@ def test_act_mul_and_fp8_group_quant(M: int, N: int, activation: str):
     torch.testing.assert_close(out_q.float(), ref_q.float(), atol=2**-9, rtol=0.125)
 
 
-class _LaunchSpy:
-    def __init__(self, kernel):
-        self.kernel = kernel
+class _LaunchRecorder:
+    """Record the launch keyword arguments. It does not launch the kernel."""
+
+    def __init__(self):
         self.kwargs = None
 
     def __getitem__(self, grid):
-        def launch(*args, **kwargs):
+        def record(*args, **kwargs):
             self.kwargs = kwargs
-            return self.kernel[grid](*args, **kwargs)
 
-        return launch
+        return record
 
 
 @pytest.mark.parametrize("M", [1, 4097])
@@ -195,16 +195,21 @@ def test_act_mul_and_fp8_group_quant_launch(monkeypatch, M: int, N: int):
     configs = load_config_json(
         f"{config_dir}/DEFAULT.json", required=arch_info.get_arch() == "gfx942"
     )
-    spy = _LaunchSpy(activation_ops._act_mul_and_dynamic_fp8_group_quant_kernel)
+    recorder = _LaunchRecorder()
     monkeypatch.setattr(
-        activation_ops, "_act_mul_and_dynamic_fp8_group_quant_kernel", spy
+        activation_ops, "_act_mul_and_dynamic_fp8_group_quant_kernel", recorder
     )
     x = torch.randn((M, N), dtype=torch.bfloat16, device="cuda")
     act_mul_and_fp8_group_quant(x, "silu", group_size=128)
 
+    # The repr labels must hold the launch options, so a trace shows the config.
+    assert recorder.kwargs["NUM_WARPS"] == recorder.kwargs.get("num_warps")
+    assert recorder.kwargs["WAVES_PER_EU"] == recorder.kwargs.get("waves_per_eu")
+    assert recorder.kwargs["NUM_STAGES"] == recorder.kwargs.get("num_stages")
+
     if configs is None:
-        assert spy.kwargs["BLOCK_SIZE_N"] == 128
-        assert "num_warps" not in spy.kwargs
+        assert recorder.kwargs["BLOCK_SIZE_N"] == 128
+        assert "num_warps" not in recorder.kwargs
         return
     for key, value in select_leq_config(configs, M, prefix="M_LEQ_").items():
-        assert spy.kwargs[key] == value, key
+        assert recorder.kwargs[key] == value, key

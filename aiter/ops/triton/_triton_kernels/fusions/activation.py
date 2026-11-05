@@ -247,7 +247,15 @@ def _act_mul_and_dynamic_mxfp4_quant_kernel(
 
 _act_mul_and_dynamic_fp8_group_quant_repr = make_kernel_repr(
     "_act_mul_and_dynamic_fp8_group_quant_kernel",
-    ["ACTIVATION", "BLOCK_SIZE_N", "QUANT_BLOCK_SIZE", "EVEN_N"],
+    [
+        "ACTIVATION",
+        "BLOCK_SIZE_N",
+        "QUANT_BLOCK_SIZE",
+        "EVEN_N",
+        "NUM_WARPS",
+        "WAVES_PER_EU",
+        "NUM_STAGES",
+    ],
 )
 
 
@@ -275,6 +283,11 @@ def _act_mul_and_dynamic_fp8_group_quant_kernel(
     DTYPE_MAX: tl.constexpr,
     DTYPE_MIN: tl.constexpr,
     EVEN_N: tl.constexpr,
+    # The launch options are not specialization constants, so the repr cannot read
+    # them. These labels carry them into the kernel name in a trace.
+    NUM_WARPS: tl.constexpr,
+    WAVES_PER_EU: tl.constexpr,
+    NUM_STAGES: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
