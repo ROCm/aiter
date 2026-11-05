@@ -74,12 +74,19 @@ def test_bf16_g1u1_fmoe_rows_cover_padded_m_4096():
     assert row_4096[0]["kernelName2"]
 
 
-def test_moe_sorting_opus_dpp_scan_avoids_gfx1201_row_broadcast_controls():
+def test_moe_sorting_opus_dpp_scan_scopes_gfx1201_replacement():
     source = _OPUS_SORTING_SOURCE.read_text()
-    assert "#if defined(__GFX9__)" in source
-    assert source.index("0x142") > source.index("#if defined(__GFX9__)")
-    assert source.index("0x143") > source.index("#if defined(__GFX9__)")
-    assert "__builtin_amdgcn_ds_bpermute" in source
+    start = source.index("__device__ __forceinline__ int dpp_inclusive_scan_wave")
+    end = source.index("template <int NumCtas>", start)
+    helper = source[start:end]
+
+    assert "#if defined(__gfx1201__)" in helper
+    assert helper.index("__builtin_amdgcn_ds_bpermute") > helper.index(
+        "#if defined(__gfx1201__)"
+    )
+    assert helper.index("0x142") > helper.index("#else")
+    assert helper.index("0x143") > helper.index("#else")
+    assert "__builtin_amdgcn_ds_bpermute" in helper
 
 
 @pytest.mark.skipif(

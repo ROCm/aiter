@@ -130,17 +130,17 @@ __device__ __forceinline__ int dpp_inclusive_scan_wave(int value)
     value += tmp;
     tmp = __builtin_amdgcn_mov_dpp(value, 0x118, 0xF, 0xF, true);
     value += tmp;
-#if defined(__GFX9__)
-    tmp = __builtin_amdgcn_update_dpp(0, value, 0x142, 0xA, 0xF, true);
-    value += tmp;
-    tmp = __builtin_amdgcn_update_dpp(0, value, 0x143, 0xC, 0xF, true);
-    return value + tmp;
-#else
+#if defined(__gfx1201__)
     const int lane = threadIdx.x & 63;
     tmp = __builtin_amdgcn_ds_bpermute(((lane & 0x30) - 1) << 2, value);
     value += lane >= 16 ? tmp : 0;
     tmp = __builtin_amdgcn_ds_bpermute(((lane & 0x30) - 17) << 2, value);
     return value + (lane >= 32 ? tmp : 0);
+#else
+    tmp = __builtin_amdgcn_update_dpp(0, value, 0x142, 0xA, 0xF, true);
+    value += tmp;
+    tmp = __builtin_amdgcn_update_dpp(0, value, 0x143, 0xC, 0xF, true);
+    return value + tmp;
 #endif
 }
 
