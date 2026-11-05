@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import json
 import os
 import sys
 import unittest
@@ -174,6 +175,67 @@ class TestClusterLaunchBuildArchs(unittest.TestCase):
     def test_detected_strict_device_enables_cluster_launch(self):
         with mock.patch.dict(os.environ, {}, clear=True):
             self.assertTrue(self.core._cluster_launch_target(lambda: "gfx1250-strict"))
+
+
+class TestMegaMhcBuildTargets(unittest.TestCase):
+    """Source selection and host dispatch must agree for JIT and prebuild."""
+
+    def setUp(self):
+        from aiter.jit import core
+
+        self.core = core
+        self.modules = (
+            "module_mega_mhc_stream_h5120",
+            "module_mega_mhc_stream_h7168",
+            "module_mega_mhc_stream_generic",
+        )
+        with open(os.path.join(core.this_dir, "optCompilerConfig.json")) as f:
+            self.exclude = [name for name in json.load(f) if name not in self.modules]
+
+    def _check_recipes(self, enabled):
+        jit_args = [self.core.get_args_of_build(name) for name in self.modules]
+        prebuild_args, _ = self.core.get_args_of_build("all", exclude=self.exclude)
+        self.assertEqual({args["md_name"] for args in prebuild_args}, set(self.modules))
+        expected_sources = {"mega_mhc_pybind.cu", "mega_mhc.cu"}
+        if enabled:
+            expected_sources.add("mega_mhc_gfx1250.cu")
+        for args in jit_args + prebuild_args:
+            self.assertEqual(
+                {os.path.basename(src) for src in args["srcs"]}, expected_sources
+            )
+            self.assertIn(
+                f"-DAITER_MHC_GFX1250={int(enabled)}", args["flags_extra_hip"]
+            )
+
+    def test_explicit_targets_override_local_gpu(self):
+        cases = (
+            ("gfx950", False),
+            ("gfx942;gfx950", False),
+            ("gfx1250", True),
+            ("gfx1250-strict", True),
+            ("gfx1250;gfx950", True),
+            ("gfx950;gfx1250", True),
+            ("gfx1250-strict;gfx950", True),
+            (" gfx950 ; gfx1250-strict ", True),
+        )
+        for targets, enabled in cases:
+            with (
+                self.subTest(targets=targets),
+                mock.patch.dict(os.environ, {"GPU_ARCHS": targets}, clear=True),
+                mock.patch.object(self.core, "get_gfx", side_effect=AssertionError),
+            ):
+                self._check_recipes(enabled)
+
+    def test_native_targets_follow_detected_gpu(self):
+        for target in (None, "native", "", " "):
+            for detected in ("gfx950", "gfx1250", "gfx1250-strict"):
+                env = {} if target is None else {"GPU_ARCHS": target}
+                with (
+                    self.subTest(target=target, detected=detected),
+                    mock.patch.dict(os.environ, env, clear=True),
+                    mock.patch.object(self.core, "get_gfx", return_value=detected),
+                ):
+                    self._check_recipes(detected != "gfx950")
 
 
 class TestRuntimeArchitecture(unittest.TestCase):
