@@ -1122,12 +1122,15 @@ def _compress_gather_split_sparse_attn(
     HEAD_SIZE: tl.constexpr,
     STATE_WIDTH: tl.constexpr,
     COMPRESS_RATIO: tl.constexpr,
+    OVERLAP: tl.constexpr,
     NUM_SPLITS: tl.constexpr,
     HEAD_TILE: tl.constexpr,  # HEAD_SIZE // NUM_SPLITS
 ):
     """Stage 1: per-(token, head-split) compress gather, write to fp32 scratch
 
-    No-overlap gather (cr>=128) on rows [0, COMPRESS_RATIO)
+    Gathers ``(1 + OVERLAP) * COMPRESS_RATIO`` state rows; with overlap the
+    newer half of the window reads the second head-sized column block, matching
+    the single-pass kernel.
     """
     pid = tl.program_id(0)
     token_idx = pid // NUM_SPLITS
@@ -1141,10 +1144,11 @@ def _compress_gather_split_sparse_attn(
         return
     req_idx = tl.load(token_to_req_indices_ptr + token_idx)
 
-    start = position - COMPRESS_RATIO + 1
-    rows = tl.arange(0, COMPRESS_RATIO)
+    start = position - (1 + OVERLAP) * COMPRESS_RATIO + 1
+    rows = tl.arange(0, (1 + OVERLAP) * COMPRESS_RATIO)
     pos = start + rows
     mask_pos = pos >= 0
+    head_offset = (rows >= COMPRESS_RATIO).to(tl.int32) * HEAD_SIZE
     block_numbers = tl.load(
         block_table_ptr + req_idx * block_table_stride + pos // block_size,
         mask=mask_pos,
@@ -1157,6 +1161,7 @@ def _compress_gather_split_sparse_attn(
         state_cache_ptr
         + block_numbers * state_cache_stride0
         + block_offsets * state_cache_stride1
+        + head_offset
     )
     cmask = mask_pos[:, None]
 
