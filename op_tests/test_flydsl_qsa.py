@@ -2000,22 +2000,36 @@ def test_qsa_arch_allowlist(monkeypatch):
     """_qsa_arch accepts the live gfx942 and gfx950 tokens.
 
     ``get_gfx_runtime`` returns the bare arch. A longer token such as
-    gfx9420 raises, as does any other arch. The AOT compile context
-    substitutes the job arch for that lookup.
+    gfx9420 raises, as does any other arch. With ``AITER_AOT_REPLAY=1``,
+    the compile context substitutes device 0 for ``torch._C._cuda_getDevice``
+    and restores that lookup.
     """
+    import os
+
     from aiter.aot.flydsl.qsa_paged import _qsa_compile_device
     from aiter.ops.flydsl import qsa_paged as qsa_mod
 
     real_get_device = torch._C._cuda_getDevice
-    for arch, cu_num in (("gfx942", 304), ("gfx950", 256)):
-        with _qsa_compile_device(arch, cu_num):
-            got = qsa_mod._qsa_arch()
-            if torch._C._cuda_getDevice() != 0:
+    saved_replay = os.environ.get("AITER_AOT_REPLAY")
+    os.environ["AITER_AOT_REPLAY"] = "1"
+    try:
+        for arch, cu_num in (("gfx942", 304), ("gfx950", 256)):
+            with _qsa_compile_device(arch, cu_num):
+                if torch._C._cuda_getDevice() != 0:
+                    raise AssertionError(
+                        f"compile context {arch!r} still probes the current device"
+                    )
+            if torch._C._cuda_getDevice is not real_get_device:
                 raise AssertionError(
-                    f"compile context {arch!r} still probes the current device"
+                    f"compile context {arch!r} left the device lookup replaced"
                 )
-        if got != arch:
-            raise AssertionError(f"compile context {arch!r} resolved to {got!r}")
+    finally:
+        if saved_replay is None:
+            os.environ.pop("AITER_AOT_REPLAY", None)
+        else:
+            os.environ["AITER_AOT_REPLAY"] = saved_replay
+    if os.environ.get("AITER_AOT_REPLAY") != saved_replay:
+        raise AssertionError("compile context left AITER_AOT_REPLAY set")
     if torch._C._cuda_getDevice is not real_get_device:
         raise AssertionError("compile context left the device lookup replaced")
     for arch in ("gfx942", "gfx950"):
