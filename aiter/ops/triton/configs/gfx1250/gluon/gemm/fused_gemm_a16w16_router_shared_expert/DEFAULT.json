@@ -1,0 +1,42 @@
+{
+    "M_BOUNDS": [
+        192,
+        384
+    ],
+    "M_LEQ_192": {
+        "BLOCK_M": 16,
+        "BLOCK_N1": 64,
+        "BLOCK_K1": 256,
+        "NUM_BUFFERS1": 4,
+        "BLOCK_N2": 128,
+        "BLOCK_K2": 128,
+        "num_warps": 4,
+        "WARPS_N1": 4,
+        "WARPS_N2": 4,
+        "PROGRAMS_PER_CU": 1
+    },
+    "M_LEQ_384": {
+        "BLOCK_M": 32,
+        "BLOCK_N1": 64,
+        "BLOCK_K1": 256,
+        "NUM_BUFFERS1": 4,
+        "BLOCK_N2": 128,
+        "BLOCK_K2": 128,
+        "num_warps": 4,
+        "WARPS_N1": 2,
+        "WARPS_N2": 2,
+        "PROGRAMS_PER_CU": 1
+    },
+    "any": {
+        "BLOCK_M": 64,
+        "BLOCK_N1": 64,
+        "BLOCK_K1": 256,
+        "NUM_BUFFERS1": 4,
+        "BLOCK_N2": 64,
+        "BLOCK_K2": 128,
+        "num_warps": 4,
+        "WARPS_N1": 2,
+        "WARPS_N2": 2,
+        "PROGRAMS_PER_CU": 1
+    }
+}
