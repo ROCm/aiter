@@ -674,8 +674,6 @@ def run(csv_paths: list[str], *, edges: bool = True, check: bool = False) -> int
     # Keep rows whose tuned arch shares a requested target's kernel family,
     # retargeting each to the exact requested arch so it replays and compiles
     # for that identity (a gfx1250 row serves a gfx1250-strict build -> 0xeb).
-    from aiter.ops.flydsl.mxfp4_kname import _is_mxfp4_kname
-
     retargeted = []
     skipped = Counter()
     for job in jobs:
@@ -683,9 +681,10 @@ def run(csv_paths: list[str], *, edges: bool = True, check: bool = False) -> int
         if target is None:
             skipped[job_arch(job)] += 1
             continue
-        # gfx1250-strict disables F4 WMMA (A0 errata); mxfp4 rows are hollow
-        # on strict, so skip them and let A0 fall back to runtime JIT.
-        if is_strict_identity(target) and _is_mxfp4_kname(job.get("kernelName1") or ""):
+        # gfx1250-strict disables F4 WMMA (A0 errata); the fp4 mxfp4 rows are
+        # hollow on strict (fp8-activation a8w4 rows share the kernel name but
+        # are fine), so key on q_dtype_a. A0 falls back to runtime JIT.
+        if is_strict_identity(target) and _FP4 in str(job.get("q_dtype_a") or ""):
             skipped[job_arch(job)] += 1
             continue
         if targets and target != job_arch(job):
@@ -783,6 +782,11 @@ def main():
         kept = []
         for job in jobs:
             if resolve_target_arch(job_arch(job), {args.arch}) != args.arch:
+                continue
+            # gfx1250-strict disables F4 WMMA (A0 errata): mxfp4 rows hollow.
+            if is_strict_identity(args.arch) and _FP4 in str(
+                job.get("q_dtype_a") or ""
+            ):
                 continue
             if job_arch(job) != args.arch:
                 job = {**job, "gfx": args.arch}
