@@ -4176,10 +4176,10 @@ __global__ void __launch_bounds__(block_size) ar_ll128_unroll2(
 // but not in this one would otherwise keep stale data. A block always covers
 // the same kLamportWaveSize positions, so a block id's counter is the same on
 // every rank whatever the message size, and a launch is one round (no
-// grid-stride loop), which caps the message (see the run functions). A big
-// two-shot message launches more blocks than the GPU holds at once (32768 at
-// TP2 for 64MB); that is fine, as a block only waits for the blocks of the
-// same id on the other ranks, never for another block of its own launch.
+// grid-stride loop), which caps the message (see the run functions). A launch
+// may have more blocks than the GPU holds at once (up to 1024 at TP2 for a 2MB
+// two-shot); that is fine, as a block only waits for the blocks of the same id
+// on the other ranks, never for another block of its own launch.
 //
 // Sums run in fp32 in rank order 0..ngpus-1 and round once, so every rank gets
 // the same bits.
@@ -4194,10 +4194,12 @@ constexpr int kLamportMaxPacks  = 512 * 80; // positions per inbox slot (640KB o
 constexpr int kLamportWaveSize  = 64;       // positions per block, one per lane of a wave64
 constexpr int kLamportMaxBlocks = kLamportMaxPacks / kLamportWaveSize;
 
-// Largest two-shot message, the gfx9 custom AR default cutoff
-// (_DEFAULT_CAR_MAX_SIZE in custom_all_reduce.py). The one-shot keeps
+// Largest two-shot message: the largest the dispatch takes (2MB at TP2, see
+// CustomAllreduce::lamportKernel); TP4 / TP8 stop at 1MB there, the rest is
+// for the forced kernel in the tuning sweeps. The inboxes are sized from it,
+// so raising a dispatch cap past it means raising it too. The one-shot keeps
 // kLamportMaxPacks positions (640KB).
-constexpr int64_t kLamportTwoShotMaxBytes = 64ll << 20;
+constexpr int64_t kLamportTwoShotMaxBytes = 2ll << 20;
 
 // two-shot positions per chunk, i.e. per rank, of the largest message
 inline constexpr int64_t lamportTwoShotMaxPart(int ngpus)
@@ -4218,15 +4220,15 @@ inline constexpr int64_t lamportInboxBytes(int ngpus)
 }
 
 // One two-shot inbox: [kLamportBuffers][ngpus][lamportTwoShotMaxPart(ngpus)]
-// of 16B, 3 * kLamportTwoShotMaxBytes = 192MB for any ngpus.
+// of 16B, 3 * kLamportTwoShotMaxBytes = 6MB for any ngpus.
 inline constexpr int64_t lamportTwoShotInboxBytes(int ngpus)
 {
     return (int64_t)kLamportBuffers * ngpus * lamportTwoShotMaxPart(ngpus) * 16;
 }
 
 // A rank's lamport IPC buffer: the one-shot inbox, then the two-shot
-// reduce-scatter inbox and all-gather inbox (TP2 / TP4 / TP8: 387.75 / 391.5 /
-// 399MB).
+// reduce-scatter inbox and all-gather inbox (TP2 / TP4 / TP8: 15.75 / 19.5 /
+// 27MB).
 inline constexpr int64_t lamportBufferBytes(int ngpus)
 {
     return lamportInboxBytes(ngpus) + 2 * lamportTwoShotInboxBytes(ngpus);
@@ -5210,24 +5212,31 @@ class CustomAllreduce
     // elements, none keeps the original dispatch. Every rank must get the same
     // answer, so it depends only on the message and the group.
     //
-    // Ranges come from CUDA-graph sweeps on MI308X (gfx942), H 7168 / 8192,
-    // registered and copy-in capture (test_custom_allreduce_lamport.py);
-    // gfx950 starts from the same numbers until it is measured on MI355X.
-    // Lamport beat the original dispatch everywhere in these ranges, so it
-    // replaces LL / LL128 / 1-stage / 2-stage there; above the two-shot cap
-    // (64MB, the default custom AR cutoff) the original dispatch runs.
-    //   TP2        one-shot up to 128KB (8 tokens), then two-shot
-    //   TP4 / TP8  one-shot up to 64KB (4 tokens), then two-shot
-    // Two-shot over custom AR from 1MB to 64MB (POC sweep, H 7168 / 8192):
-    // TP2 1.01-1.10x, TP4 1.19-1.38x, TP8 1.12-1.37x.
+    // Ranges come from CUDA-graph sweeps (test_custom_allreduce_lamport.py,
+    // bf16, H 7168 / 8192, registered and copy-in capture) on MI308X (gfx942)
+    // and MI350X (gfx950). One set of ranges serves both archs, bounded by
+    // gfx950, where the original dispatch catches up on large messages:
+    //   TP2        one-shot up to 128KB (8 tokens), two-shot up to 2MB
+    //   TP4 / TP8  one-shot up to 64KB (4 tokens),  two-shot up to 1MB
+    // Registered input, lamport over the original dispatch inside the ranges:
+    //   gfx950  TP2 1.03-1.23x, TP4 1.00-1.39x, TP8 1.02-1.53x
+    //   gfx942  TP2 1.02-1.23x, TP4 1.04-1.46x, TP8 1.13-1.47x
+    // Just past them on gfx950 the original dispatch is as fast or faster
+    // (TP2 0.99x at 3.5MB, TP4 0.98x at 1.75MB, TP8 0.98x at 2MB) and stays
+    // so up to 64MB (TP8 down to 0.90x), so it runs there. Two-shot was still
+    // 1.01-1.27x faster above these caps on gfx942; that gain is given up.
+    // The forced kernels (lamportAllReduce) take up to oneShotMaxBytes()
+    // (640KB) and twoShotMaxBytes() (2MB), for the sweeps.
     LamportKernel lamportKernel(int64_t numel) const
     {
         if(!lamport_)
             return LamportKernel::none;
         const int64_t bytes  = numel * 2;
-        const int64_t two_shot_max = lamport_->twoShotMaxBytes();
         // one-shot in (0, one_shot_max], then two-shot in (one_shot_max, two_shot_max]
         const int64_t one_shot_max = world_size_ == 2 ? 128 * 1024 : 64 * 1024;
+        const int64_t two_shot_max =
+            std::min(world_size_ == 2 ? int64_t(2) << 20 : int64_t(1) << 20,
+                     lamport_->twoShotMaxBytes());
         if(bytes <= one_shot_max)
             return LamportKernel::one_shot;
         if(bytes <= two_shot_max && bytes % (16 * world_size_) == 0)

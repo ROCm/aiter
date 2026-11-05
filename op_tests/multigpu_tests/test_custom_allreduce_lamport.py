@@ -56,7 +56,11 @@ PACK_BYTES = 16
 # kLamportMaxPacks in custom_all_reduce.cuh: one-shot positions per inbox slot
 MAX_POSITIONS = 512 * 80
 # kLamportTwoShotMaxBytes in custom_all_reduce.cuh: largest two-shot message
-TWO_SHOT_MAX_BYTES = 64 << 20
+TWO_SHOT_MAX_BYTES = 2 << 20
+# default sweep: m doubles up to this, so every n gets one size past the
+# largest two-shot, enough to see the original dispatch take over (above that
+# it is the original dispatch only); larger sizes via -m / -s
+SWEEP_MAX_BYTES = 2 * TWO_SHOT_MAX_BYTES
 KERNELS = {1: "one_shot", 2: "two_shot"}
 CAPTURE_PATHS = ["registered", "copy_in"]
 SENTINEL = -1  # 0xffff as int16
@@ -85,9 +89,9 @@ def fitsKernel(kernel, tp, nbytes):
 
 
 def defaultMs(tp, n, dtype):
-    """1, 2, 4, ... up to the largest power of two within the two-shot cap."""
+    """1, 2, 4, ... up to the largest power of two within SWEEP_MAX_BYTES."""
     ms, m = [], 1
-    while m * n * dtype.itemsize <= twoShotMaxBytes(tp):
+    while m * n * dtype.itemsize <= SWEEP_MAX_BYTES:
         ms.append(m)
         m *= 2
     return ms
@@ -221,8 +225,8 @@ def testLamportAllReduce(
 def checkSizeChanges(ca, tp, rank, dtype):
     """Eager forced calls that shrink and regrow the message, per kernel, in
     positions per inbox slot: every block of the kernel's largest message, one
-    lane, partial blocks (65 is block 1 lane 0), and for the two-shot also its
-    old 640-block cap and one past it, so positions that sit out a round must
+    lane, partial blocks (65 is block 1 lane 0), and for the two-shot also half
+    its largest message and one past it, so positions that sit out a round must
     still be re-armed. Three passes cycle every buffer of every block."""
     pack_numel = PACK_BYTES // dtype.itemsize
     errs = []
@@ -235,8 +239,8 @@ def checkSizeChanges(ca, tp, rank, dtype):
             positions = [
                 top,
                 1,
-                MAX_POSITIONS,
-                MAX_POSITIONS + 1,
+                top // 2,
+                top // 2 + 1,
                 5120,
                 192,
                 65,
@@ -382,7 +386,7 @@ def main():
         type=int,
         nargs="*",
         default=None,
-        help="token counts, default 1, 2, 4, ... up to the two-shot cap of each tp and n",
+        help="token counts, default 1, 2, 4, ... up to 4MB for each n",
     )
     parser.add_argument(
         "-s",

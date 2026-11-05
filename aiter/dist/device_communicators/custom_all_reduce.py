@@ -1613,9 +1613,9 @@ class CustomAllreduce:
         On by default on the gfx9 archs in _LAMPORT_GFX with 2, 4 or 8 ranks;
         AITER_CUSTOM_AR_DISABLE_LAMPORT=1 keeps the original dispatch there.
         gfx1250 never gets here and never reads the env var. The size ranges
-        it covers (one-shot, then two-shot up to 64MB) are
+        it covers (one-shot, then two-shot up to 2MB at TP2, 1MB at TP4 / TP8) are
         CustomAllreduce::lamportKernel in custom_all_reduce.cuh. The buffer is
-        ops.lamportBufferSize, about 390-400MB of uncached IPC memory per rank.
+        ops.lamportBufferSize, 16-27MB of uncached IPC memory per rank.
         Every rank must agree: a rank that took the lamport kernel while a peer
         did not would hang both, so the verdict is AND-ed over the group.
         """
