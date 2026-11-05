@@ -192,10 +192,15 @@ def _reference(inp: VerifyInputs, num_tokens: int):
     a = inp.A_log.float().exp()[:, None]
     dt = inp.dt_bias.view(_H, _D)
     norm_w = inp.norm_weight.float()
+    # Padding follows the kernel: an index past any cache it addresses is padding.
+    slot_caches = (inp.state, inp.conv_state) + (inp.ring or ())
+    num_slots = min(t.shape[0] for t in slot_caches)
+    line_caches = (window,) if states is None else (window, states)
+    num_lines = min(t.shape[0] for t in line_caches)
     for b in range(batch):
         slot = int(inp.cache_indices[b])
         line = int(inp.inter_indices[b])
-        if not (0 <= slot < inp.state.shape[0] and 0 <= line < window.shape[0]):
+        if not (0 <= slot < num_slots and 0 <= line < num_lines):
             continue
         hist = inp.conv_state[slot].float().clone()  # [C, 3]
         h = inp.state[slot].float().clone()  # [H, V, K]
@@ -512,10 +517,11 @@ def test_kda_verify_slot_check_rejects_duplicate_live_indices(monkeypatch, ring)
     set_indices([-1, -1, 2, 2], [0, 0, -1, 3])
     _check(inp, 5)
 
-    for cache, inter, name, duplicate in (
-        ([3, -1, 0, 3], [0, 1, 2, 4], "cache_indices", 3),
-        ([1, 2, 3, 4], [5, 2, 2, -1], "intermediate_indices", 2),
-    ):
+    cases = [([1, 2, 3, 4], [5, 2, 2, -1], "intermediate_indices", 2)]
+    if ring:
+        # Only the ring is written per cache slot.
+        cases.append(([3, -1, 0, 3], [0, 1, 2, 4], "cache_indices", 3))
+    for cache, inter, name, duplicate in cases:
         set_indices(cache, inter)
         before = [t.clone() for t in _verify_writes(inp)]
         with pytest.raises(
@@ -526,6 +532,38 @@ def test_kda_verify_slot_check_rejects_duplicate_live_indices(monkeypatch, ring)
         # The check runs before launch, so no scratch is written.
         for written, original in zip(_verify_writes(inp), before):
             assert torch.equal(written, original)
+
+
+def test_kda_verify_snapshot_lets_live_sequences_share_a_cache_slot(monkeypatch):
+    """Without a ring the caches are only read, so a repeated live cache slot
+    is fine as long as every sequence has its own intermediate line."""
+    monkeypatch.setattr(linear_attention_kernels, "_KDA_SLOT_CHECK", True)
+    inp = _make_inputs(4, 5, torch.bfloat16, False)
+    inp.cache_indices.copy_(torch.tensor([3, 3, 1, 3], dtype=torch.int32))
+    inp.inter_indices.copy_(torch.tensor([0, 1, 2, 4], dtype=torch.int32))
+    _check(inp, 5)
+
+
+@pytest.mark.parametrize("ring", [False, True])
+def test_kda_verify_slot_check_treats_the_padding_slot_as_padding(monkeypatch, ring):
+    """Rows on AITER_KDA_DECODE_SLOT_CHECK_PADDING_SLOT are padding for both
+    uniqueness checks, so they may share their slot and their scratch line."""
+    monkeypatch.setattr(linear_attention_kernels, "_KDA_SLOT_CHECK", True)
+    monkeypatch.setattr(linear_attention_kernels, "_KDA_SLOT_CHECK_PADDING_SLOT", None)
+    inp = _make_inputs(4, 5, torch.bfloat16, ring)
+    # Rows 0 and 1 are DP-attention padding on the reserved slot 0.
+    inp.cache_indices.copy_(torch.tensor([0, 0, 1, 2], dtype=torch.int32))
+    inp.inter_indices.copy_(torch.tensor([3, 3, 4, 5], dtype=torch.int32))
+    with pytest.raises(ValueError, match="duplicated slots"):
+        _run(inp, 5)
+
+    monkeypatch.setattr(linear_attention_kernels, "_KDA_SLOT_CHECK_PADDING_SLOT", 0)
+    ref_out = _reference(inp, 5)[0]
+    out = _run(inp, 5)
+    torch.cuda.synchronize()
+    # The padding rows race on their shared scratch, so only check the live rows.
+    live = slice(2 * 5, 4 * 5)
+    _assert_close(ref_out[:, live], out[:, live], "output", **_OUT_TOL, max_bad=1e-3)
 
 
 def _reject_compile(monkeypatch):
@@ -550,8 +588,10 @@ def test_kda_verify_rejects_bad_arguments(monkeypatch):
         flydsl_kda_verify_with_f_b(
             **{**_kwargs(inp, 5), "intermediate_states": inp.inter_states.float()}
         )
-    with pytest.raises(ValueError, match="num_warps"):
-        _run(inp, 5, num_warps=16)
+    # A wave count must be an int: 8.0 equals 8 but is rejected.
+    for num_warps in (16, 8.0, True):
+        with pytest.raises(ValueError, match="num_warps"):
+            _run(inp, 5, num_warps=num_warps)
 
 
 def test_kda_verify_rejects_conv_weight_without_unit_stride(monkeypatch):

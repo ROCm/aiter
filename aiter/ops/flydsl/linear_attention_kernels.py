@@ -1822,12 +1822,15 @@ def flydsl_kda_verify_with_f_b(
 
     A sequence whose cache index or intermediate index is negative or out of
     range is padding: its output rows are zero and no cache is touched. Among
-    live sequences, ``cache_indices`` and ``intermediate_indices`` must each be
-    unique: a repeated ring slot or intermediate line is written by several
-    workgroups at once, with undefined results. Padding entries may repeat. The
-    kernel does not check this; set ``AITER_KDA_DECODE_SLOT_CHECK=1`` to raise
+    live sequences, ``intermediate_indices`` must be unique, and with
+    ``replay_ring`` so must ``cache_indices``: a repeated intermediate line or
+    ring slot is written by several workgroups at once, with undefined results.
+    Without a ring, ``conv_state`` and ``state`` are only read, so live
+    sequences may share a cache slot. Padding entries may repeat. The kernel
+    does not check this; set ``AITER_KDA_DECODE_SLOT_CHECK=1`` to raise
     ``ValueError`` on a repeat (it syncs with the host and is skipped during
-    CUDA graph capture).
+    CUDA graph capture). As in the decode check, a sequence on
+    ``AITER_KDA_DECODE_SLOT_CHECK_PADDING_SLOT`` counts as padding there.
 
     Every buffer the kernel writes needs dense, non-overlapping slots or lines,
     with padding between them allowed: ``intermediate_conv_window`` as
@@ -1989,7 +1992,7 @@ def flydsl_kda_verify_with_f_b(
         ),
     )
     num_inter_lines = intermediate_conv_window.shape[0]
-    num_slots = min(state.shape[0], conv_state.shape[0])
+    num_slots = _num_cache_slots(state, conv_state)
 
     dummy = state
     inter_state = dummy
@@ -2054,13 +2057,7 @@ def flydsl_kda_verify_with_f_b(
             device=device,
         )
         _check_dense_cache_slots("replay_ring.beta", ring_beta, ((ring_len, 1),))
-        num_slots = min(
-            num_slots,
-            raw_v.shape[0],
-            raw_k.shape[0],
-            ring_g.shape[0],
-            ring_beta.shape[0],
-        )
+        num_slots = min(num_slots, *(tensor.shape[0] for tensor in replay_ring))
         ring_tensors = (raw_v, raw_k, ring_g, ring_beta)
         ring_strides = (
             raw_v.stride(0),
@@ -2124,26 +2121,29 @@ def flydsl_kda_verify_with_f_b(
     )
     _check_i32_addressing("out", out, first_dim=1)
     _check_disjoint_rows("out", out, (1, 2), "token and head")
-    num_slots = min(num_slots, _INT32_MAX)
     num_inter_lines = min(num_inter_lines, _INT32_MAX)
     if _KDA_SLOT_CHECK:
         # Capture is per stream, so ask about the stream the kernel launches on.
         with torch.cuda.device(device):
             if not torch.cuda.is_current_stream_capturing():
                 # A sequence is live only when both indices are in range, as in
-                # the kernel; padding may repeat either index.
+                # the kernel; padding may repeat either index. A sequence on the
+                # reserved padding slot is padding too, as in the decode check.
+                masked_cache = _mask_padding_slot(cache_indices)
                 live = (
-                    (cache_indices >= 0)
-                    & (cache_indices < num_slots)
+                    (masked_cache >= 0)
+                    & (masked_cache < num_slots)
                     & (intermediate_indices >= 0)
                     & (intermediate_indices < num_inter_lines)
                 )
-                # The reserved padding slot may repeat, as in the decode check.
-                _check_unique_live_slots(
-                    _mask_padding_slot(torch.where(live, cache_indices, -1)),
-                    num_slots,
-                    "cache_indices",
-                )
+                # Only the ring is written per cache slot; a snapshot verify
+                # just reads conv_state and state there.
+                if replay_ring is not None:
+                    _check_unique_live_slots(
+                        torch.where(live, cache_indices, -1),
+                        num_slots,
+                        "cache_indices",
+                    )
                 _check_unique_live_slots(
                     torch.where(live, intermediate_indices, -1),
                     num_inter_lines,
@@ -2152,9 +2152,9 @@ def flydsl_kda_verify_with_f_b(
 
     if num_warps is None:
         num_warps = _kda_verify_num_warps(batch)
-    elif num_warps not in KDA_VERIFY_NUM_WARPS:
+    elif not isinstance(num_warps, int) or num_warps not in KDA_VERIFY_NUM_WARPS:
         raise ValueError(
-            f"`num_warps` must be one of {KDA_VERIFY_NUM_WARPS}, got {num_warps}."
+            f"`num_warps` must be an int in {KDA_VERIFY_NUM_WARPS}, got {num_warps!r}."
         )
     executable = create_kda_verify_kernel(
         float(norm_eps),
