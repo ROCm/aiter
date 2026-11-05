@@ -733,11 +733,6 @@ class Conv3dTuner(TunerCommon):
                         if patch_unsupported_gfx1250(kh, kw, sh, sw, sk, nb0):
                             continue
                         unroll = False  # the patch loop unrolls the taps
-                    if patch and nb0 == 2 and tk > CGP_ALIGN:
-                        # Two buffers with a wide K tile spill VGPRs on most
-                        # patch tiles (39 of 60 at tile_k=96 on the Wan2.1
-                        # layers), and a kernel with scratch faults on gfx1250.
-                        continue
                     nb = _clamp_num_buffers(
                         nb0,
                         tiles_per_split,
@@ -746,6 +741,11 @@ class Conv3dTuner(TunerCommon):
                         tile_k=tk,
                         patch=(kh, kw, dh, dw) if patch else None,
                     )
+                    if patch and nb == 2 and tk > CGP_ALIGN:
+                        # The only patch variants that spilled VGPRs on the
+                        # Wan2.1 hot layers (42 of 500), and one of them hit a
+                        # memory access fault on gfx1250.
+                        continue
                     # The clamp stops at 2 buffers; a wide K tile can still
                     # overflow LDS there.
                     if patch:

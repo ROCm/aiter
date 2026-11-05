@@ -221,7 +221,9 @@ python3 -m pytest op_tests/tuning_tests/test_config_shape_collision.py
 - **Description**: gfx1250 only. Time every tile, pipeline and K tile width
   without and/or with kH x kW patch reuse. `1` is skipped where the shape
   cannot take it (kH * kW == 1, H/W stride > 1, split-K) and runs without
-  main-loop unroll (the patch loop unrolls the taps of a group instead).
+  main-loop unroll (the patch loop unrolls the taps of a group instead). Patch
+  variants that run 2 buffers with `tile_k` > 32 are skipped: they spill VGPRs
+  on most tiles, and one of them hit a memory access fault on gfx1250.
 
 ### `--tiles_from` / `--tiles_topk`
 - **Type**: path / int
