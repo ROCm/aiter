@@ -15,7 +15,7 @@ from aiter.ops.triton.utils._triton import arch_info
 from op_tests.triton_tests.utils.pa_mqa_logits_mxfp4_ref import preshuffle_cache
 
 pytestmark = pytest.mark.skipif(
-    not arch_info.is_any_fp4_avail(),
+    not (arch_info.is_cdna4() or arch_info.is_sw_emulated_fp4_avail()),
     reason="paged MXFP4 MQA logits needs MXFP4 support",
 )
 # Elsewhere the Triton kernel runs: dense logits over a token-major cache

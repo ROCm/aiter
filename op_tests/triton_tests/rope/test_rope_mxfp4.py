@@ -253,7 +253,7 @@ def test_q_quant_matches_reference(num_tokens, num_heads, with_weights):
 @pytest.mark.parametrize("page_size", [64, 128])
 @pytest.mark.parametrize("preshuffle", [1, 0])
 @pytest.mark.skipif(
-    not arch_info.is_any_fp4_avail(),
+    not (arch_info.is_cdna4() or arch_info.is_sw_emulated_fp4_avail()),
     reason="paged MXFP4 MQA logits needs MXFP4 support",
 )
 def test_round_trip_through_logits(page_size, preshuffle):

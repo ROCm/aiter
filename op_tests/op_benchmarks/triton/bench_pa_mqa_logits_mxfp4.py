@@ -106,7 +106,7 @@ def build(
 
 def run_benchmark(args):
     assert (
-        arch_info.is_any_fp4_avail()
+        arch_info.is_cdna4() or arch_info.is_sw_emulated_fp4_avail()
     ), f"paged MXFP4 MQA logits needs MXFP4 support, {arch_info.get_arch()} has none"
     rows = []
     for heads in args.heads:

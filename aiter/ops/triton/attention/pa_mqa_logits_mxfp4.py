@@ -539,11 +539,13 @@ def paged_mxfp4_mqa_logits(
 
     """
     # The Gluon kernel is written for gfx950 (cdna4 buffer loads, async copies,
-    # mfma_scaled). Other archs with MXFP4 run the Triton kernel, which covers
-    # the dense launch over a token-major cache (preshuffle=0).
+    # mfma_scaled). Archs with software-emulated MXFP4, see
+    # is_sw_emulated_fp4_avail(), run the Triton kernel, which covers the dense
+    # launch over a token-major cache (preshuffle=0). Other archs with MXFP4
+    # need their own validation before they can run it.
     use_gluon = arch_info.is_cdna4()
     assert (
-        arch_info.is_any_fp4_avail()
+        arch_info.is_cdna4() or arch_info.is_sw_emulated_fp4_avail()
     ), f"paged MXFP4 MQA logits needs MXFP4 support, {arch_info.get_arch()} has none"
     assert scale_mode in (0, 1), "scale_mode must be 0 or 1"
 
