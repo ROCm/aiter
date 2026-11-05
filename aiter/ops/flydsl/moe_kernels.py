@@ -2788,6 +2788,7 @@ def flydsl_moe_topids_to_rows(
             current_stream_arg(),
         )
     else:
+        from aiter.jit.utils.build_targets import is_gfx1250_family
         from aiter.jit.utils.chip_info import get_gfx_runtime
         from aiter.ops.flydsl.kernels.moe_route_maps import (
             MAX_TP_ROUTE_BUCKETS,
@@ -2797,7 +2798,7 @@ def flydsl_moe_topids_to_rows(
         # Keep small calls and wave64 paths unchanged. Wider expert sets
         # require more routes to amortize their per-workgroup histogram sweeps.
         use_lds = (
-            get_gfx_runtime() == "gfx1250"
+            is_gfx1250_family(get_gfx_runtime())
             and 0 < int(E) <= MAX_TP_ROUTE_BUCKETS
             and numel >= tp_route_min_routes(int(E))
         )

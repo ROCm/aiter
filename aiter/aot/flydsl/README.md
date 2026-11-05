@@ -97,6 +97,14 @@ variant of the profile's bundle plan.
   is tuned per GPU model.
 - `quantize()` is replayed too: `preload_aot_bundles()` leaves it out, but
   fixed-slot `forward` and the per-stage benchmarks call it.
+- The MTPR 8192 jobs build the instance with `AITER_MEGA_SMALL_M=1` and
+  `AITER_MEGA_LARGE_M=1`. Where the runtime's eligibility checks accept the
+  profile (DeepSeek-V4-Pro EP8 a8w4), `preload_aot_bundles()` then also loads
+  the small-input kernel of every token bucket (MTPR 256 and 512) and the
+  large-input persistent kernel.
+- `--check` compiles nothing: with `FLYDSL_RUNTIME_RUN_ONLY=1`, any kernel the
+  replay reaches but the cache lacks fails the job, which tests that the runtime's
+  cache keys hit the artifacts the build produced.
 - Like the MoE replay, it runs in a process of its own, started with
   `GPU_ARCHS=gfx950` and `AITER_AOT_REPLAY=1`; both
   `python -m aiter.aot.flydsl.mega_moe` and `setup.py` start it that way. It

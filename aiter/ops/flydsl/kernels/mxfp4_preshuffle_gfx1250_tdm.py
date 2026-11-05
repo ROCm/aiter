@@ -317,8 +317,9 @@ def build_gemm_a8w4_tdm_task(
     - ``tile_meta`` (S1F, explicit_tile): a one-element list the caller fills
       with ``(expert, rows)`` (wave-uniform i32) before calling the body: the
       tile's expert and its valid rows (``min(tile_m, expert end - blk_m)``).
-      Replaces the psum reads (has_work, expert bisect, mn_oob), i.e. 10
-      dependent global loads per tile; the caller only names populated tiles.
+      Replaces the psum reads (has_work, expert lookup, mn_oob), i.e. three
+      dependent rounds of global loads per tile; the caller only names
+      populated tiles.
     - ``item_hooks`` (S1F): a one-element list holding a dict of callables the
       body calls on every wave: ``drain_start`` after the steady k-loop,
       before the drain fences; ``epi_start`` after the drain's last fence,
@@ -585,6 +586,21 @@ def build_gemm_a8w4_tdm_task(
         and (tile_m, tile_n, tile_k, m_warp, n_warp, num_buffers)
         == (64, 256, 256, 1, 4, 3)
         and callable(getattr(rocdl, "sched_vgpr", None))
+    )
+    # Ordinary short tiles share a K loop for full and partial expert tails.
+    # A single M wave makes the back-row WMMA guard workgroup-uniform.
+    ordinary_short_row_skip = bool(
+        a_is_fp4
+        and not a_preshuffled
+        and not persistent_workers
+        and not enable_ep_scatter
+        and k_waves == 1
+        and m_warp == 1
+        and n_warp == 4
+        and num_buffers in (2, 3)
+        and tile_m in (32, 64, 128)
+        and tile_n == 256
+        and tile_k in (128, 256)
     )
     # Plain native GEMM2 uses the same operand layout and K dependency
     # as fused GEMM1. Keep EP scatter on its existing output protocol.
@@ -994,30 +1010,39 @@ def build_gemm_a8w4_tdm_task(
                                 hi = go_right.select(hi, mid)
                         expert = lo
             else:
-                # psum is sorted, so the owning expert is the count of experts that
-                # end at or before blk_m. Every lane loads a strided slice in one
-                # round trip instead of a bisect's log2(E) dependent loads (the bulk
-                # of a decode tile's prologue latency).
-                psum_hits = fx.Int32(0)
-                for i in range_constexpr(ceildiv(n_experts, WAVE)):
-                    e_idx = lane + i * WAVE
-                    if const_expr((i + 1) * WAVE <= n_experts):
-                        end_e = tile_map[e_idx]
-                        psum_hits = psum_hits + (end_e <= blk_m).select(1, 0)
-                    else:
-                        e_ok = e_idx < n_experts
-                        end_e = tile_map[e_ok.select(e_idx, n_experts - 1)]
-                        psum_hits = psum_hits + (e_ok & (end_e <= blk_m)).select(1, 0)
-                for sh in range_constexpr(int.bit_length(WAVE) - 1):
-                    psum_hits = psum_hits + psum_hits.shuffle_xor(
-                        fx.Int32(1 << sh), fx.Int32(WAVE)
-                    )
-                expert = rocdl.readfirstlane(T.i32, psum_hits)
-                has_work = expert < n_experts
+                # One load rejects the padded tail (most tiles under EP), so those
+                # workgroups quit early without the expert lookup below.
+                has_work = blk_m < tile_map[n_experts - 1]
+
+                # Seed the result with the padding sentinel so it remains defined
+                # outside the dynamic branch and the existing main-body guard
+                # stays valid.
+                expert = blk_m * 0 + n_experts
+                if has_work:
+                    # psum is sorted, so the owning expert is the count of experts
+                    # ending at or before blk_m. Every lane loads a strided slice in
+                    # one round trip instead of a dependent log2(E) bisect.
+                    psum_hits = fx.Int32(0)
+                    for i in range_constexpr(ceildiv(n_experts, WAVE)):
+                        e_idx = lane + i * WAVE
+                        if const_expr((i + 1) * WAVE <= n_experts):
+                            end_e = tile_map[e_idx]
+                            psum_hits = psum_hits + (end_e <= blk_m).select(1, 0)
+                        else:
+                            e_ok = e_idx < n_experts
+                            end_e = tile_map[e_ok.select(e_idx, n_experts - 1)]
+                            psum_hits = psum_hits + (e_ok & (end_e <= blk_m)).select(
+                                1, 0
+                            )
+                    for sh in range_constexpr(int.bit_length(WAVE) - 1):
+                        psum_hits = psum_hits + psum_hits.shuffle_xor(
+                            fx.Int32(1 << sh), fx.Int32(WAVE)
+                        )
+                    expert = rocdl.readfirstlane(T.i32, psum_hits)
         if const_expr(m_align):
             # tile_map holds unpadded expert ends while experts start on
             # m_align boundaries; a tile narrower than m_align can start in the
-            # previous expert's padding, which the bisect hands to this expert.
+            # previous expert's padding, which the lookup hands to this expert.
             prev = (expert > 0).select(expert - 1, 0)
             start = (tile_map[prev] + (m_align - 1)) // m_align * m_align
             start = (expert > 0).select(start, 0)
@@ -1952,7 +1977,14 @@ def build_gemm_a8w4_tdm_task(
             sa_pairs if row_major_ascale or tdm_as_in_prologue else ceildiv(sa_pairs, 2)
         )
         SB_DS = ceildiv(sb_pairs, 2)
-        BS_DS = wmma_n_rep * DS_B + SB_DS + SA_DS
+        # Keep ordinary-input scheduling on the established IGLP count.
+        # Packed inputs use paired-read accounting; these hints do not replace
+        # the dependency waits generated for the actual LDS reads.
+        BS_DS = (
+            wmma_n_rep * DS_B + SB_DS + SA_DS
+            if a_preshuffled
+            else wmma_n_rep * 2 + sb_pairs + sa_pairs
+        )
         STATE_DS = wmma_m_rep * DS_A + BS_DS
 
         SB_WIDTH = max(2, sb_pairs)
@@ -2079,6 +2111,13 @@ def build_gemm_a8w4_tdm_task(
                         slot.b[i].store(load_b(lds_addr.b, i, ksl))
                 if const_expr(pinned_fp4_prefill):
                     load_scales()
+            if const_expr(ordinary_short_row_skip):
+                # Issue the complete operand group before the guarded MMA.
+                # A CFG split must not sink back-row LDS reads past front MMA.
+                rocdl.sched_dsrd(
+                    active_m_rep * DS_A + wmma_n_rep * DS_B + sb_pairs + sa_pairs
+                )
+                rocdl.sched_barrier(0)
             if const_expr(
                 interleaved_m_rows and active_m_rep == 8 and not explicit_vgpr_partition
             ):
@@ -2153,14 +2192,24 @@ def build_gemm_a8w4_tdm_task(
                 initialize_acc=initialize_acc,
             )
             if const_expr(len(BACK) > 0):
-                mma_rows(
-                    BACK,
-                    cur_rmem.a[front_wm:],
-                    cur_rmem.b,
-                    sa_k,
-                    sb_k,
-                    initialize_acc=initialize_acc,
-                )
+
+                def mma_back_rows():
+                    mma_rows(
+                        BACK,
+                        cur_rmem.a[front_wm:],
+                        cur_rmem.b,
+                        sa_k,
+                        sb_k,
+                        initialize_acc=initialize_acc,
+                    )
+
+                if const_expr(ordinary_short_row_skip):
+                    # One M wave gives every wave the same expert-end bound.
+                    # Keep the shared LDS/TDM loop and all dependency waits.
+                    if mn_oob > front_wm * M_ROW_STEP:
+                        mma_back_rows()
+                else:
+                    mma_back_rows()
             if const_expr(reuse_cur_rmem):
                 load_nxt_fn()
 
@@ -2744,8 +2793,8 @@ def build_gemm_a8w4_tdm_task(
             # wholly beyond the expert's live rows. Other row counts use the
             # complete original body, including ragged K and activation logic.
             if const_expr(narrow_stage1_row_skip):
-                if mn_oob <= 2 * M_ROW_STEP:
-                    run_mainloop(bool(interleaved_lds_load_on), m_reps=2)
+                if mn_oob <= front_wm * M_ROW_STEP:
+                    run_mainloop(bool(interleaved_lds_load_on), m_reps=front_wm)
                 else:
                     run_mainloop(bool(interleaved_lds_load_on))
             # Place the six/seven-row bodies together and emit the output tail once.
