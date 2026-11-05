@@ -78,6 +78,7 @@ from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.device_info import get_num_sms, get_num_xcds
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.tuned_config_utils import autotune_configs
+from aiter.utility.graph_alloc import persistent_alloc
 
 _LOGGER = AiterTritonLogger()
 
@@ -1192,11 +1193,13 @@ def _build_snapshots(
     """`snapshot_chunk_rows` as an int32 tensor on ``device``.
 
     Cached like `_build_segments`: every KDA layer of a forward asks with the
-    same key.
+    same key. A captured graph keeps reading the cached table, so it comes from
+    `persistent_alloc`: one first cached during a capture would otherwise take
+    the graph's private pool, and an address the capture freed.
     """
-    return torch.tensor(
-        snapshot_chunk_rows(seqs, C, targets), dtype=torch.int32, device=device
-    )
+    rows = snapshot_chunk_rows(seqs, C, targets)
+    with persistent_alloc(device):
+        return torch.tensor(rows, dtype=torch.int32, device=device)
 
 
 _prepare_fast = fast_launch(_flash_kda_prepare_kernel)

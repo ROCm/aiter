@@ -1485,6 +1485,47 @@ def test_paged_snapshots_match_dense(chunks_per_seg):
     assert torch.equal(from_cache, dense)
 
 
+def test_snapshot_table_survives_graph_replay():
+    """A graph captured after the table is cached stores the eager call's
+    snapshots on every replay, though the capture frees and rewrites scratch
+    first, and the cached table is not in the graph's pool."""
+    args = make_inputs(1, 512, 4)
+    targets = ((0, 128), (0, 320), (0, 480))
+    for _ in range(2):  # the first call of a new specialization autotunes
+        _o, _ht, ref = _snapshot_run(args, targets)
+    snaps = torch.full_like(ref, float("nan"))
+    seqs = ((0, 512),)
+    table = _flash_kda._build_snapshots(seqs, FLASH_KDA_CHUNK, targets, ref.device)
+    rows = snapshot_chunk_rows(seqs, FLASH_KDA_CHUNK, targets)
+
+    def forward():
+        flash_kda_fwd(
+            *args,
+            lower_bound=LOWER_BOUND,
+            output_final_state=True,
+            snapshot_targets=targets,
+            snapshot_out=snaps,
+        )
+
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        forward()
+    torch.cuda.current_stream().wait_stream(side)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        scratch = torch.empty(4 * table.numel(), device=device, dtype=torch.int32)
+        scratch.fill_(-7)
+        del scratch
+        forward()
+    for _ in range(3):
+        snaps.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(snaps, ref)
+        assert table.tolist() == rows
+
+
 def test_segment_layout_matches_the_snapshot_map():
     """A target at a segment's first token maps to that segment's first chunk."""
     lens = [300, 64, 0, 200]
