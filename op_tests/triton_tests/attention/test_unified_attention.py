@@ -746,6 +746,117 @@ def test_triton_unified_attn(
 
 # Query lengths that leave padded rows in the last query block (BLOCK_Q of 2/4/8),
 # on the 3D split-KV path (long KV) and the 2D path (KV <= 512).
+@pytest.mark.parametrize("path", ["2d", "3d"])
+@pytest.mark.parametrize("block_size", [16, 64, 256])
+@pytest.mark.parametrize("sliding_window", [None, 256])
+@pytest.mark.parametrize(
+    "seq_lens",
+    [[(1, 37)], [(1, 1328), (1, 37), (1, 523)], [(3, 1328), (7, 37), (1, 523)]],
+)
+@pytest.mark.parametrize(
+    "q_dtype, kv_dtype, out_dtype, use_sinks",
+    [
+        (torch.bfloat16, torch.bfloat16, torch.bfloat16, False),
+        (torch.bfloat16, e4m3_dtype, torch.bfloat16, True),
+        (e4m3_dtype, e4m3_dtype, e4m3_dtype, True),
+    ],
+)
+@torch.inference_mode()
+def test_triton_unified_attn_shuffled_tiles(
+    path,
+    block_size,
+    sliding_window,
+    seq_lens,
+    q_dtype,
+    kv_dtype,
+    out_dtype,
+    use_sinks,
+    monkeypatch,
+):
+    """Both grids read shuffled tiles within and across KV pages."""
+    monkeypatch.setattr(
+        sys.modules[unified_attention.__module__],
+        "use_2d_kernel",
+        lambda params, backend="triton": path == "2d",
+    )
+    (
+        query,
+        key_cache_orig,
+        value_cache_orig,
+        key_cache,
+        value_cache,
+        sinks,
+        output,
+        cu_query_lens,
+        kv_lens,
+        max_query_len,
+        max_kv_len,
+        scale,
+        window_size,
+        block_tables,
+        _quant_query,
+        _query_scales,
+        q_descale,
+        k_descale,
+        v_descale,
+        output_scale,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        num_blocks=512,
+        block_size=block_size,
+        head_size=64,
+        num_heads=(8, 1),
+        sliding_window=sliding_window,
+        q_dtype=q_dtype,
+        kv_dtype=kv_dtype,
+        out_dtype=out_dtype,
+        shuffled_kv_cache=True,
+        use_out_scale=True,
+    )
+    sinks = sinks if use_sinks else None
+    unified_attention(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=max_query_len,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window_size,
+        block_table=block_tables,
+        softcap=50.0,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        output_scale=output_scale,
+        sinks=sinks,
+        shuffled_kv_cache=True,
+        backend="triton",
+    )
+    expected = ref_paged_attn(
+        query=query,
+        key_cache=key_cache_orig,
+        value_cache=value_cache_orig,
+        query_lens=[q for q, _ in seq_lens],
+        kv_lens=[kv for _, kv in seq_lens],
+        block_tables=block_tables,
+        scale=scale,
+        out_dtype=out_dtype,
+        sliding_window=sliding_window,
+        soft_cap=50.0,
+        sinks=sinks,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        output_scale=output_scale,
+    )
+    atol, rtol = (1.5e-2, 1e-2) if kv_dtype == torch.bfloat16 else (1.5e-1, 1.5e-1)
+    torch.testing.assert_close(output.float(), expected.float(), atol=atol, rtol=rtol)
+
+
 @pytest.mark.parametrize(
     "num_heads, query_len, kv_len",
     [
