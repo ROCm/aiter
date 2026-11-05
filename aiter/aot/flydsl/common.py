@@ -462,6 +462,12 @@ def fail_build_on_missing_target_feature():
     import sys
     import threading
 
+    if os.environ.get("AITER_AOT_FEATURE_GUARD") == "1":
+        # An enclosing build already captures fd 2 (this process or a parent,
+        # via the inherited env); a second capture would double-handle it.
+        yield
+        return
+
     marker = b"requires target feature"
     r_fd, w_fd = os.pipe()
     real_err = os.dup(2)
@@ -483,12 +489,14 @@ def fail_build_on_missing_target_feature():
 
     t = threading.Thread(target=pump, daemon=True)
     t.start()
+    os.environ["AITER_AOT_FEATURE_GUARD"] = "1"
     sys.stderr.flush()
     os.dup2(w_fd, 2)
     os.close(w_fd)
     try:
         yield
     finally:
+        os.environ.pop("AITER_AOT_FEATURE_GUARD", None)
         sys.stderr.flush()
         os.dup2(real_err, 2)
         os.close(real_err)

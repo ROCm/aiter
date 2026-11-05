@@ -80,6 +80,7 @@ from aiter.aot.flydsl.common import (
     check_replay_process,
     collect_aot_jobs,
     cu_num_to_arch,
+    fail_build_on_missing_target_feature,
     get_max_workers,
     is_strict_identity,
     replay_env,
@@ -609,7 +610,8 @@ def main(module_name: str, description: str) -> None:
     print("=" * 72, flush=True)
 
     started = time.time()
-    failed_archs = run(module_name, jobs, argv, env=_child_env(module, csv_paths))
+    with fail_build_on_missing_target_feature():
+        failed_archs = run(module_name, jobs, argv, env=_child_env(module, csv_paths))
     print(f"\n  Total time:   {time.time() - started:.1f}s")
     if failed_archs:
         print("Some replays failed. Check output above for details.")
