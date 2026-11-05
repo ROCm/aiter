@@ -1036,6 +1036,10 @@ stable_cases = [
     (1, 256, 8, dtypes.bf16, "biased", False, "sixteen_way_tie", False),
     (1, 256, 8, dtypes.fp32, "biased", True, "thirty_two_way_tie", True),
     (1, 256, 8, dtypes.fp32, "biased", False, "thirty_two_way_tie", False),
+    # topk > 8 with n_cand == 16: the unrolled rank tier, serial renorm loop.
+    (1, 256, 16, dtypes.bf16, "biased", True, "sixteen_way_tie", False),
+    # EPL == 8 (E=512), the BALLOT_SLOTS boundary, with a 32-way tie.
+    (1, 512, 8, dtypes.fp32, "biased", True, "thirty_two_way_tie", False),
     (1, 256, 8, dtypes.bf16, "sigmoid", True, "random", False),
     (1, 256, 8, dtypes.bf16, "sigmoid", True, "sixteen_way_tie", False),
     (1, 256, 8, dtypes.bf16, "sigmoid", False, "sixteen_way_tie", False),
