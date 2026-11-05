@@ -18,6 +18,7 @@ from flydsl.expr import rocdl
 
 from .sparse_prefill_common import (
     _MAX_FLOOR,
+    HALF950,
     _buffer,
     _buffer_at,
     _buffer_words,
@@ -107,11 +108,6 @@ def _kv_rows(ids, wave, hk, slotted):
     return fx.Vector.from_elements(rows, fx.Int32)
 
 
-def _plus(immediate, offset):
-    """immediate (a Python int) + offset, a Python int or a runtime Int32."""
-    return immediate + offset if isinstance(offset, int) else offset + immediate
-
-
 def _shift(reads, offset):
     """A read plan [(slot, address, immediate)] moved by offset bytes: a static offset goes into the immediates, a
     runtime one into the addresses."""
@@ -122,13 +118,24 @@ def _shift(reads, offset):
     return [(slot, address + offset, immediate) for slot, address, immediate in reads]
 
 
-def _dma_word(lane, token, is_v, gfx950):
-    """Word of the token's 256-byte half row that the lane fetches; the LDS DMA stores it at word lane. The XOR is
-    the LDS swizzle: K chunks by _k_phase (gfx950: _k_phase950), V granules by _k_phase on gfx950 only.
-    """
-    if gfx950:
-        return lane ^ (_k_phase(token) * 2) if is_v else lane ^ (_k_phase950(token) * 4)
+def _dma_word(lane, token, is_v):
+    """Word of the token's 256-byte half row that the lane fetches (gfx942); the LDS DMA stores it at word lane. The
+    XOR is the K swizzle, chunks by _k_phase."""
     return lane if is_v else lane ^ (_k_phase(token) * 4)
+
+
+def _dma_chunk950(lane, token, is_v):
+    """16-byte chunk of the token's 256-byte half row that the lane fetches in a gfx950 x4 LDS DMA, which stores it
+    at chunk lane & 15 of that half row. The XOR is the LDS swizzle: K by _k_phase950, V by _k_phase.
+    """
+    return (lane & 15) ^ (_k_phase(token) if is_v else _k_phase950(token))
+
+
+def _dma_block950(wave, block):
+    """(first key, LDS byte offset) of the wave's x4 DMA block `block`: keys (wave & 3) * 16 +
+    4 * block + 0..3, dims half wave >> 2, half-major (_k_lds_address950)."""
+    first = (wave & 3) * 16 + block * 4
+    return first, (wave >> 2) * HALF950 + first * 256
 
 
 def _read_packet_g2s(
@@ -146,11 +153,9 @@ def _read_packet_g2s(
     tail_tile=None,
     reads=(),
     load=_load_lds,
-    gfx950=False,
-    lds_offset=0,
 ):
-    """LDS DMA of key (wave & 3) * 16 + packet, dims (wave >> 2) * 128 + 0..127, into storage at lds_offset (the
-    tile's stage).
+    """LDS DMA of key (wave & 3) * 16 + packet, dims (wave >> 2) * 128 + 0..127 (gfx942;
+    gfx950: _read_block_g2s950).
 
     The LDS reads (storage, address, immediate), issued with load, go just before it.
     """
@@ -162,7 +167,7 @@ def _read_packet_g2s(
     # descriptor (64-bit base), whose records end at the request's last token.
     slotted = limits is None
     token, _ = _copy_coordinates(wave, packet, 4)
-    voffset = _dma_word(lane, token, is_v, gfx950) * 4
+    voffset = _dma_word(lane, token, is_v) * 4
     step = (packet & 3) * hk * D * 2
     # The instruction offset also moves the LDS destination, which M0 takes back; M0 must stay
     # non-negative, otherwise (HK > 1) the step goes into VOFFSET.
@@ -192,13 +197,70 @@ def _read_packet_g2s(
     # Raw LDS DMA: BufferCopyLDS adds its own vmcnt wait; the pipeline waits itself.
     rocdl.raw_ptr_buffer_load_lds(
         resource,
-        fx.to_llvm_ptr(
-            fx.get_iter(storage) + (base_destination + _plus(immediate, lds_offset))
-        ),
+        fx.to_llvm_ptr(fx.get_iter(storage) + (base_destination + immediate)),
         4,
         fx.Int32(voffset),
         soffset,
         offset,
+    )
+    return data
+
+
+def _read_block_g2s950(
+    resource,
+    storage,
+    wave,
+    lane,
+    rows,
+    compact_len,
+    limit,
+    hk,
+    block,
+    is_v,
+    extent,
+    tail_tile=None,
+    reads=(),
+    load=_load_lds,
+    lds_offset=0,
+):
+    """gfx950 x4 LDS DMA of the wave's block `block`: keys (wave & 3) * 16 + 4 * block + 0..3,
+    dims (wave >> 2) * 128 + 0..127, into storage at lds_offset (the tile's stage).
+
+    buffer_load_dwordx4 ... lds writes 16 bytes per lane at M0 + 16 * lane (CDNA4 ISA 9.1.9):
+    lane l moves chunk _dma_chunk950 of key l >> 4's half row to its chunk l & 15, so the four
+    half rows are the 1 KiB at _dma_block950's offset. limit is limits[l >> 4] (None: slot
+    table). The LDS reads go just before it, as in _read_packet_g2s.
+    """
+    first, destination = _dma_block950(wave, block)
+    key = lane >> 4
+    token = first + key
+    row_bytes = hk * D * 2
+    voffset = key * row_bytes + _dma_chunk950(lane, token, is_v) * 16
+    if limit is None:
+        # The block's own descriptor, as in _read_packet_g2s.
+        base, final, partial, full = resource
+        block_id = rows[block]
+        records = (block_id == final).select(partial, full)
+        resource = rocdl.get_buffer_rsrc(
+            _buffer_at(base + fx.Int64(fx.Uint32(block_id)) * (4 * row_bytes), records)
+        )
+    else:
+        # _read_packet_g2s' SOFFSET min(row, limits[k]), per lane; with key k's row step it is
+        # at most the request's last key (limit), or k rows past the request start (limit 0),
+        # which the range check returns as 0. Below 4 GiB either way.
+        voffset = fx.Int32(_min(fx.Uint32(rows[block]), limit)) + voffset
+    if tail_tile is not None:
+        voffset = (tail_tile * BN + token < compact_len).select(
+            voffset, fx.Int32(extent)
+        )
+    data = [load(*read) for read in reads]
+    rocdl.raw_ptr_buffer_load_lds(
+        resource,
+        fx.to_llvm_ptr(fx.get_iter(storage) + (destination + lds_offset)),
+        16,
+        fx.Int32(voffset),
+        fx.Uint32(0),
+        0,
     )
     return data
 
@@ -227,7 +289,8 @@ def _apply_mask(scores, bits):
 def _shuffle_o_r2s2r(o_lo, o_hi, inv, storages, tid, gfx950=False):
     """O * inv as BF16 through LDS; returns the thread's eight 16-byte pieces of O rows.
 
-    Piece i of a half is the lane's dims 8i .. 8i + 7: output words n * 4 + i (gfx942), _o_piece950(i) (gfx950).
+    Piece i of a half is the lane's dims 8i .. 8i + 7: output words n * 4 + i (gfx942), _o_piece950(i, g) (gfx950,
+    lane group g).
     """
     # O rows 0-63 go to the K buffer, rows 64-127 to the V buffer.
     row = (tid >> 6) * 16 + (tid & 15)
@@ -237,10 +300,20 @@ def _shuffle_o_r2s2r(o_lo, o_hi, inv, storages, tid, gfx950=False):
         output = o_hi if half else o_lo
         for i in range(4):
             if gfx950:
-                values = fx.Vector.from_elements(
-                    [output[j] * inv for j in _o_piece950(i)], fx.Float32
+                # Both lane-group parities pack the same pairs (_o_piece950), so the
+                # select only reorders words.
+                words = [
+                    _pack_bf16_950(
+                        fx.Vector.from_elements(
+                            [output[j] * inv for j in _o_piece950(i, g)], fx.Float32
+                        )
+                    )
+                    for g in range(2)
+                ]
+                odd = ((tid >> 4) & 1) == 1
+                words = fx.Vector.from_elements(
+                    [odd.select(words[1][p], words[0][p]) for p in range(4)], fx.Uint32
                 )
-                words = _pack_bf16_950(values)
             else:
                 values = fx.Vector.from_elements(
                     [output[n * 4 + i] * inv for n in range(8)], fx.Float32
@@ -322,8 +395,9 @@ def _body(
     later row max + 1 only when that exceeds m + 7, rescaling O and l.
 
     GFX950 swaps the per-arch pieces (sparse_prefill_common's gfx950 part): half the MFMAs
-    (K32), 32 transposed V reads per half (two before each DMA packet), native BF16 and
-    the K/V swizzles of its LDS DMA and reads. Stages, waits and data flow are unchanged.
+    (K32), 32 transposed V reads per half (eight before each of its four x4 LDS DMA blocks),
+    native BF16, and the half-major K/V layout and swizzles of its LDS DMA and reads. Stages,
+    waits and data flow are unchanged.
 
     GFX950 also double-buffers K and V: tile t sits in stage t & 1 of k_lds / v_lds. Each
     stage end is a rendezvous of all eight waves; waves 4-7 reach rendezvous r one stage
@@ -399,6 +473,11 @@ def _body(
                 extent,
             )
         )
+    # gfx950 x4 DMA: each lane's own limits[lane >> 4] (_read_block_g2s950); slot tables none.
+    dma_limit = None
+    if fx.const_expr(GFX950 and not SLOTTED):
+        key_bytes = fx.Uint32(lane >> 4) * (HK * D * 2)
+        dma_limit = (limit > key_bytes).select(limit - key_bytes, fx.Uint32(0))
     scale = fx.Float32(SCALE * math.log2(math.e))
     compact_len = count * 4
     key_tiles = (compact_len + BN - 1) // BN
@@ -470,33 +549,52 @@ def _body(
         return v_lds, _shift(v_reads(v_s2r_base, half), offset), v_load
 
     def read_tile_g2s(resource, storage, rows, is_v, s2r, lgkm, tail_tile, offset):
-        # 16 LDS-DMA packets; the s2r plan's reads go in plan order, an equal share (one, or
-        # two on gfx950) just before each packet.
+        # 16 LDS-DMA packets (gfx950: 4 x4 blocks); the s2r plan's reads go in plan order, an
+        # equal share (one; gfx950: four K or eight V) just before each.
         reads, load = (), _load_lds
         if fx.const_expr(s2r is not None):
             reads, load = s2r[1], s2r[2]
-        share = len(reads) // 16
+        packets = (16, 4)[int(GFX950)]
+        share = len(reads) // packets
         parts = [None] * len(reads)
-        for packet in fx.range_constexpr(16):
+        for packet in fx.range_constexpr(packets):
             batch = reads[packet * share : (packet + 1) * share]
-            data = _read_packet_g2s(
-                resource,
-                storage,
-                wave,
-                lane,
-                rows,
-                compact_len,
-                limits,
-                HK,
-                packet,
-                is_v,
-                extent,
-                tail_tile,
-                [(s2r[0], address, immediate) for _, address, immediate in batch],
-                load,
-                GFX950,
-                offset,
-            )
+            issued = [(s2r[0], address, immediate) for _, address, immediate in batch]
+            if fx.const_expr(GFX950):
+                data = _read_block_g2s950(
+                    resource,
+                    storage,
+                    wave,
+                    lane,
+                    rows,
+                    compact_len,
+                    dma_limit,
+                    HK,
+                    packet,
+                    is_v,
+                    extent,
+                    tail_tile,
+                    issued,
+                    load,
+                    offset,
+                )
+            else:
+                data = _read_packet_g2s(
+                    resource,
+                    storage,
+                    wave,
+                    lane,
+                    rows,
+                    compact_len,
+                    limits,
+                    HK,
+                    packet,
+                    is_v,
+                    extent,
+                    tail_tile,
+                    issued,
+                    load,
+                )
             for i in fx.range_constexpr(share):
                 parts[batch[i][0]] = data[i]
         if fx.const_expr(s2r is None):

@@ -639,10 +639,14 @@ def _pv(
 #       and the S order (value i + 4m), so K3's masks are unchanged.
 #   PV: per V half, two K32 steps (keys 32s + 8g .. + 7: P values 8s .. 8s + 7) over eight
 #       16-dim groups n; the A operand of (s, n) is two ds_read_b64_tr_b16 of four keys.
-#       Output word 4n + i of a half is dim 32g + 4n + i.
-#   LDS: K rows keep 512 bytes with 16-byte chunks XORed by _k_phase950; V rows keep 512
-#       bytes with 8-byte granules XORed by _k_phase. Each XOR stays inside its 256-byte half
-#       (the LDS DMA writes half rows) and leaves the bits the read immediates move alone.
+#       Output word 4n + i of a half is dim 32g + 4(n ^ (g & 1)) + i (_v_tr_bases950).
+#   LDS: K and V are half-major: dims half h of key t at h * HALF950 + t * 256, so one
+#       16-byte (x4) LDS DMA writes four keys' half rows, 1 KiB. K 16-byte chunks are XORed by
+#       _k_phase950, V 16-byte chunks by _k_phase. Each XOR stays inside its 256-byte half row
+#       and leaves the bits the read immediates move alone.
+
+
+HALF950 = 64 * 256  # bytes of one dims half of a 64-key K or V tile in LDS
 
 
 def _k_phase950(token):
@@ -656,8 +660,9 @@ def _k_phase950(token):
 
 
 def _k_lds_address950(token, chunk):
-    """Byte address of 16-byte chunk `chunk` (0-31, dims 8 * chunk ..) of key `token`'s 512-byte row in k_lds."""
-    return token * 512 + (chunk ^ _k_phase950(token)) * 16
+    """Byte address of 16-byte chunk `chunk` (0-31, dims 8 * chunk ..) of key `token` in k_lds (half-major)."""
+    half, chunk = chunk >> 4, (chunk & 15) ^ _k_phase950(token)
+    return half * HALF950 + token * 256 + chunk * 16
 
 
 def _k_bases950(lane):
@@ -671,22 +676,27 @@ def _k_reads950(addresses, half, lower_first=False):
     """(slot, address, immediate) of one K half's 16 LDS reads (_k_reads' order and slots; read (n, k) is key
     key_row + 4n + 32 * half, dims 8g + 32k .. + 7); addresses = _k_bases950(lane)."""
     return [
-        (n * 8 + k, addresses[k & 3], half * 16384 + n * 2048 + (k >> 2) * 256)
+        (n * 8 + k, addresses[k & 3], half * 8192 + n * 1024 + (k >> 2) * HALF950)
         for n, k in _k_read_order(lower_first)
     ]
 
 
 def _v_lds_address950(token, granule):
-    """Byte address of 8-byte granule `granule` (0-63, dims 4 * granule .. + 3) of value `token`'s row in v_lds."""
-    return token * 512 + (granule ^ _k_phase(token)) * 8
+    """Byte address of 8-byte granule `granule` (0-63, dims 4 * granule .. + 3) of value `token` in v_lds (half-major;
+    the granule's 16-byte chunk XORed by _k_phase)."""
+    chunk = ((granule & 31) >> 1) ^ _k_phase(token)
+    return (granule >> 5) * HALF950 + token * 256 + chunk * 16 + (granule & 1) * 8
 
 
 def _v_tr_bases950(lane):
     """Per-lane addresses of a V half's eight 16-dim groups n for ds_read_b64_tr_b16: lane 16g + 4r + q reads key
-    8g + r, dims 32q + 4n .. + 3 (n's XOR is the address bits 3-5). Keys + 4h + 32s and dims + 128 go by immediate.
+    8g + r, dims 32q + 4(n ^ (q & 1)) .. + 3 (n's XOR is the address bits 3-5). The q & 1 term gives the lanes of a
+    32-lane group both 8-byte halves of the 16-byte chunks, so they cover the 64 banks once; output word 4n + i is
+    then dim 32g + 4(n ^ (g & 1)) + i (_o_piece950). Keys + 4h + 32s and dims + 128 go by immediate.
     """
+    q = lane & 3
     token = (lane >> 4) * 8 + ((lane & 15) >> 2)
-    base = _v_lds_address950(token, (lane & 3) * 8)
+    base = _v_lds_address950(token, q * 8 + (q & 1))
     return tuple(base ^ (n * 8) for n in range(8))
 
 
@@ -695,7 +705,7 @@ def _v_tr_reads950(bases, half):
     (keys 32s + 8g + 4h .. + 3); slot (s * 8 + n) * 2 + h, so PV step s needs the first 16 (s + 1).
     """
     return [
-        ((s * 8 + n) * 2 + h, bases[n], half * 256 + h * 2048 + s * 16384)
+        ((s * 8 + n) * 2 + h, bases[n], half * HALF950 + h * 1024 + s * 8192)
         for s in range(2)
         for n in range(8)
         for h in range(2)
@@ -774,9 +784,10 @@ def _pv950_words(step, n):
     return [(step * 8 + n) * 4 + i for i in range(4)]
 
 
-def _o_piece950(i):
-    """Output words of the lane's dims 8i .. 8i + 7 of a half (dim 32g + 4n + j is word 4n + j)."""
-    return [i * 8 + n for n in range(8)]
+def _o_piece950(i, g):
+    """Output words of the lane's dims 8i .. 8i + 7 of a half in lane group g (dim 32g + 4n + j is word
+    4(n ^ (g & 1)) + j, _v_tr_bases950)."""
+    return [i * 8 + (e ^ (g & 1) * 4) for e in range(8)]
 
 
 def _v_operands950(values, step, ready=None):
