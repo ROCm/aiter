@@ -152,6 +152,7 @@ else:
     from .ops.rope import *
     from .ops.topk import *
     from .ops.topk_plain import topk_plain  # noqa: F401
+    from .ops.qsa_index_scorer.op import qsa_paged_mqa_logits  # noqa: F401
 
     # topk_select requires the optional, Linux-only FlyDSL package.
     if sys.platform != "win32":

@@ -17,11 +17,14 @@ import sys
 def main(argv) -> int:
     req = json.loads(argv[1])
     import torch
-    torch.cuda.current_stream = lambda *a, **k: None     # never touch a device
+
+    torch.cuda.current_stream = lambda *a, **k: None  # never touch a device
     here = os.path.dirname(os.path.abspath(__file__))
     spec = importlib.util.spec_from_file_location(
-        "qsa_isc_prewarm_worker", os.path.join(here, "__init__.py"),
-        submodule_search_locations=[here])
+        "qsa_isc_prewarm_worker",
+        os.path.join(here, "__init__.py"),
+        submodule_search_locations=[here],
+    )
     pkg = importlib.util.module_from_spec(spec)
     sys.modules["qsa_isc_prewarm_worker"] = pkg
     spec.loader.exec_module(pkg)

@@ -20,8 +20,18 @@ import types
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 KERNEL_PATH = os.path.abspath(
-    os.path.join(_HERE, "..", "..", "..", "aiter", "ops", "flydsl", "kernels", "mqa_logits",
-                 "qsa_paged_mqa_logits_page4_gfx1250.py")
+    os.path.join(
+        _HERE,
+        "..",
+        "..",
+        "..",
+        "aiter",
+        "ops",
+        "flydsl",
+        "kernels",
+        "mqa_logits",
+        "qsa_paged_mqa_logits_page4_gfx1250.py",
+    )
 )
 
 
@@ -46,16 +56,34 @@ class _StubVector(_StubScalar):
 
 def _make_stub():
     expr = types.ModuleType("flydsl.expr")
-    for name in ("Int8", "Int16", "Int32", "Int64", "Uint8", "Uint32",
-                 "Float16", "Float32", "BFloat16", "Boolean", "Pointer"):
+    for name in (
+        "Int8",
+        "Int16",
+        "Int32",
+        "Int64",
+        "Uint8",
+        "Uint32",
+        "Float16",
+        "Float32",
+        "BFloat16",
+        "Boolean",
+        "Pointer",
+    ):
         setattr(expr, name, _StubScalar(name))
     expr.Vector = _StubVector("Vector")
     expr.range_constexpr = range
     expr.Tensor = _StubScalar("Tensor")
 
     rocdl = types.ModuleType("flydsl.expr.rocdl")
-    for name in ("make_buffer_ptr", "make_buffer_tensor", "get_buffer_rsrc",
-                 "BufferCopy", "BufferCopy32b", "BufferCopy64b", "BufferCopy128b"):
+    for name in (
+        "make_buffer_ptr",
+        "make_buffer_tensor",
+        "get_buffer_rsrc",
+        "BufferCopy",
+        "BufferCopy32b",
+        "BufferCopy64b",
+        "BufferCopy128b",
+    ):
         setattr(rocdl, name, _StubScalar(name))
     expr.rocdl = rocdl
 
@@ -69,22 +97,28 @@ def _make_stub():
     flydsl.expr = expr
     flydsl.compiler = compiler
     flydsl.__version__ = "stub"
-    return {"flydsl": flydsl, "flydsl.expr": expr, "flydsl.expr.rocdl": rocdl,
-            "flydsl.compiler": compiler,
-            "flydsl.compiler.protocol": compiler.protocol}
+    return {
+        "flydsl": flydsl,
+        "flydsl.expr": expr,
+        "flydsl.expr.rocdl": rocdl,
+        "flydsl.compiler": compiler,
+        "flydsl.compiler.protocol": compiler.protocol,
+    }
 
 
 def load_kernel_module(allow_stub=False):
     """Return ``(module, how)``; ``how`` says which import path was used."""
     if os.environ.get("QSA_IMPORT_PACKAGE") == "1":
-        from aiter.ops.flydsl.kernels.mqa_logits import (  # noqa: F401
+        from aiter.ops.flydsl.kernels.mqa_logits import (
             qsa_paged_mqa_logits_page4_gfx1250 as K,
         )
 
         return K, "package:aiter.ops.flydsl.kernels.mqa_logits"
 
     def _load(suffix):
-        spec = importlib.util.spec_from_file_location("qsa_page4_v0" + suffix, KERNEL_PATH)
+        spec = importlib.util.spec_from_file_location(
+            "qsa_page4_v0" + suffix, KERNEL_PATH
+        )
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
         return mod
@@ -101,5 +135,7 @@ def load_kernel_module(allow_stub=False):
         finally:
             for name in installed:
                 sys.modules.pop(name, None)
-        return mod, (f"file:{KERNEL_PATH} + stub flydsl "
-                     "(host-side wrapper only; no kernel can be built)")
+        return mod, (
+            f"file:{KERNEL_PATH} + stub flydsl "
+            "(host-side wrapper only; no kernel can be built)"
+        )

@@ -12,6 +12,7 @@
   variant is unchanged, buckets ON by default;
 * prewarm: the new default variants have a routed private geometry.
 """
+
 from __future__ import annotations
 
 import json
@@ -21,7 +22,7 @@ import unittest
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import test_qsa_index_scorer_cpu as base  # noqa: E402
+import test_qsa_index_scorer_cpu as base
 
 API, PR, K = base.API, base.PR, base.K
 SFX = {4: "", 8: "_p8", 16: "_p16"}
@@ -47,12 +48,16 @@ class KernelDefaults(unittest.TestCase):
                 for rows in (32, 1024, 4096, 16384):
                     self.assertEqual(K.prefill_bf16_route(rows, 1, cols, page, t), kt)
             for cols in (4096, 16384, 65536):
-                self.assertEqual(K.prefill_bf16_route(1024, 1, cols, page, t), ("persist", {}))
+                self.assertEqual(
+                    K.prefill_bf16_route(1024, 1, cols, page, t), ("persist", {})
+                )
         alt = K.parse_prefill_route("kt_all")
         self.assertEqual(K.prefill_bf16_route(512, 1, 65536, 4, alt), kt)
         self.assertIsNone(K.parse_prefill_route("legacy"))
         self.assertIsNone(K.parse_fp8_prefill_route("legacy"))
-        self.assertEqual(K.prefill_bf16_route(1024, 1, 1024, 4, "legacy"), ("persist", {}))
+        self.assertEqual(
+            K.prefill_bf16_route(1024, 1, 1024, 4, "legacy"), ("persist", {})
+        )
 
     def test_fp8_prefill_presets(self):
         self.assertEqual(K.FP8_PREFILL_ROUTE_DEFAULT, "r2e")
@@ -69,12 +74,18 @@ class KernelDefaults(unittest.TestCase):
                 self.assertEqual(K.prefill_fp8_route(2049, 1, cols, page, t), c4)
                 self.assertEqual(K.prefill_fp8_route(16384, 1, cols, page, t), c4)
             for cols in (4096, 16384, 65536):
-                self.assertEqual(K.prefill_fp8_route(1024, 1, cols, page, t), ("tdm", {}))
+                self.assertEqual(
+                    K.prefill_fp8_route(1024, 1, cols, page, t), ("tdm", {})
+                )
         alt = K.parse_fp8_prefill_route("kt_all")
         self.assertEqual(K.prefill_fp8_route(512, 1, 65536, 4, alt), c2)
         self.assertEqual(K.prefill_fp8_route(4096, 1, 4096, 4, alt), c4)
-        self.assertEqual(K.prefill_fp8_route(1024, 1, 1024, 4, "legacy"),   # table None = module default
-                         ("tdm", {}))
+        self.assertEqual(
+            K.prefill_fp8_route(
+                1024, 1, 1024, 4, "legacy"
+            ),  # table None = module default
+            ("tdm", {}),
+        )
         # spelling: k (kconv) needs l (lean); early / tdm
         self.assertEqual(K._parse_fp8_route_variant("early"), ("early", {}))
         with self.assertRaises(ValueError):
@@ -95,15 +106,28 @@ class KernelDefaults(unittest.TestCase):
         for fp8 in (False, True):
             self.assertEqual(K.decode_group_route(48, 16, fp8, 0x1000, 3), 32)
         self.assertEqual(K.decode_group_route(64, 16, False, 0x1000), 32)
-        self.assertEqual(K.decode_group_route(64, 16, True, 0x1000), 64)   # 4-row fp8 unchanged
+        self.assertEqual(
+            K.decode_group_route(64, 16, True, 0x1000), 64
+        )  # 4-row fp8 unchanged
 
     def test_profiles_mirror_kernel(self):
-        self.assertEqual(PR.KERNEL_ENV_DEFAULTS["QSA_PREFILL_ROUTE"], K.PREFILL_ROUTE_DEFAULT)
-        self.assertEqual(PR.KERNEL_ENV_DEFAULTS["QSA_FP8_PREFILL_ROUTE"], K.FP8_PREFILL_ROUTE_DEFAULT)
+        self.assertEqual(
+            PR.KERNEL_ENV_DEFAULTS["QSA_PREFILL_ROUTE"], K.PREFILL_ROUTE_DEFAULT
+        )
+        self.assertEqual(
+            PR.KERNEL_ENV_DEFAULTS["QSA_FP8_PREFILL_ROUTE"], K.FP8_PREFILL_ROUTE_DEFAULT
+        )
         self.assertEqual(PR.KERNEL_ENV_DEFAULTS["QSA_DRAFT_WG_WAVES"], "auto")
-        self.assertEqual(PR.DECG_G3_WAVE_COLS, {"bf16": K._DECODE_GROUP_AUTO_COLS_G3[False],
-                                                "fp8": K._DECODE_GROUP_AUTO_COLS_G3[True]})
-        self.assertEqual(PR.default_knobs("fp8", "draft"), {"wg_waves": K.draft_wg_waves(True)})
+        self.assertEqual(
+            PR.DECG_G3_WAVE_COLS,
+            {
+                "bf16": K._DECODE_GROUP_AUTO_COLS_G3[False],
+                "fp8": K._DECODE_GROUP_AUTO_COLS_G3[True],
+            },
+        )
+        self.assertEqual(
+            PR.default_knobs("fp8", "draft"), {"wg_waves": K.draft_wg_waves(True)}
+        )
         self.assertEqual(PR.default_knobs("bf16", "draft"), {})
 
 
@@ -117,17 +141,27 @@ class RouterDefaults(unittest.TestCase):
         for page in (4, 8, 16):
             pre = PR.variant_prefix(page)
             v, p = self._r("bf16", 1024, 1, 1024, page)
-            self.assertEqual((v, p["kt_rows"], p["col_tiles"], p.get("lean")),
-                             (pre + ".r32_kt.v1", 32, 2, True))
+            self.assertEqual(
+                (v, p["kt_rows"], p["col_tiles"], p.get("lean")),
+                (pre + ".r32_kt.v1", 32, 2, True),
+            )
             self.assertNotIn("ipf", p)
             v, p = self._r("fp8", 1024, 1, 1024, page)
-            self.assertEqual((v, p["col_tiles"], p.get("lean"), p.get("kconv")),
-                             (pre + ".r32_kt_fp8.v1", 2, True, True))
+            self.assertEqual(
+                (v, p["col_tiles"], p.get("lean"), p.get("kconv")),
+                (pre + ".r32_kt_fp8.v1", 2, True, True),
+            )
             v, p = self._r("fp8", 4096, 1, 1024, page)
-            self.assertEqual((v, p["col_tiles"], p.get("lean"), p.get("kconv")),
-                             (pre + ".r32_kt_fp8.v1", 4, True, True))
-            self.assertEqual(self._r("bf16", 1024, 1, 4096, page)[0], pre + ".r32_persist.v1")
-            self.assertEqual(self._r("fp8", 1024, 1, 4096, page)[0], pre + ".r32_fp8.v1")
+            self.assertEqual(
+                (v, p["col_tiles"], p.get("lean"), p.get("kconv")),
+                (pre + ".r32_kt_fp8.v1", 4, True, True),
+            )
+            self.assertEqual(
+                self._r("bf16", 1024, 1, 4096, page)[0], pre + ".r32_persist.v1"
+            )
+            self.assertEqual(
+                self._r("fp8", 1024, 1, 4096, page)[0], pre + ".r32_fp8.v1"
+            )
             v, p = self._r("fp8", 16, 16, 4096, page)
             self.assertEqual((v, p.get("wg_waves")), (pre + ".draft.v1", 2))
             v, p = self._r("bf16", 16, 16, 4096, page)
@@ -137,13 +171,27 @@ class RouterDefaults(unittest.TestCase):
         data = _profile()
         n = 0
         for r in data["rules"] + data["rows"]:
-            samples = r.get("samples") or [{"rows": r["rows"]["min"], "requests": r["requests"]["min"],
-                                            "columns": r["columns"]}]
+            samples = r.get("samples") or [
+                {
+                    "rows": r["rows"]["min"],
+                    "requests": r["requests"]["min"],
+                    "columns": r["columns"],
+                }
+            ]
             for s in samples:
-                got = API.predict_route(K, r["cache_dtype"], s["rows"], s["requests"], s["columns"],
-                                        0x1000, PR.page_of(r))
-                self.assertTrue(API._route_ok(*got, r["vid"], r["params"]),
-                                (r.get("id") or r.get("cell"), s, got))
+                got = API.predict_route(
+                    K,
+                    r["cache_dtype"],
+                    s["rows"],
+                    s["requests"],
+                    s["columns"],
+                    0x1000,
+                    PR.page_of(r),
+                )
+                self.assertTrue(
+                    API._route_ok(*got, r["vid"], r["params"]),
+                    (r.get("id") or r.get("cell"), s, got),
+                )
                 n += 1
         self.assertGreater(n, 2000)
 
@@ -157,30 +205,56 @@ class ProfileDefaults(unittest.TestCase):
     def test_kernel_and_chain(self):
         g = _gen()
         self.assertEqual(self.data["kernel"]["sha256"], g.KERNEL_SHA256)
-        self.assertEqual(g.ISA_IDENTITY_CHAIN[-2:], (g.R2D_KERNEL_SHA256, g.KERNEL_SHA256))
+        self.assertEqual(
+            g.ISA_IDENTITY_CHAIN[-2:], (g.R2D_KERNEL_SHA256, g.KERNEL_SHA256)
+        )
         self.assertEqual(self.data["kernel_env"]["QSA_PREFILL_ROUTE"], "r2e")
 
     def test_rules_pin_the_winners(self):
         for page, sfx in SFX.items():
             pre = PR.variant_prefix(page)
             kt = self.rules["prefill_bf16_kt" + sfx]
-            self.assertEqual((kt["vid"], kt["params"]["kt_rows"], kt["params"]["col_tiles"],
-                              kt["params"]["lean"]), (pre + ".r32_kt.v1", 32, 2, True))
+            self.assertEqual(
+                (
+                    kt["vid"],
+                    kt["params"]["kt_rows"],
+                    kt["params"]["col_tiles"],
+                    kt["params"]["lean"],
+                ),
+                (pre + ".r32_kt.v1", 32, 2, True),
+            )
             self.assertEqual(PR.column_values(kt["columns"])[-1], 2048)
-            self.assertEqual(PR.column_values(self.rules["prefill_bf16_persist" + sfx]["columns"])[0],
-                             4096)
-            f2, f4 = self.rules["prefill_fp8_kt" + sfx], self.rules["prefill_fp8_kt_tall" + sfx]
+            self.assertEqual(
+                PR.column_values(self.rules["prefill_bf16_persist" + sfx]["columns"])[
+                    0
+                ],
+                4096,
+            )
+            f2, f4 = (
+                self.rules["prefill_fp8_kt" + sfx],
+                self.rules["prefill_fp8_kt_tall" + sfx],
+            )
             for r, ct, rr in ((f2, 2, (32, 2048)), (f4, 4, (2049, 16384))):
                 self.assertEqual(r["vid"], pre + ".r32_kt_fp8.v1")
-                self.assertEqual((r["params"]["col_tiles"], r["params"]["lean"],
-                                  r["params"]["kconv"]), (ct, True, True))
+                self.assertEqual(
+                    (
+                        r["params"]["col_tiles"],
+                        r["params"]["lean"],
+                        r["params"]["kconv"],
+                    ),
+                    (ct, True, True),
+                )
                 self.assertEqual((r["rows"]["min"], r["rows"]["max"]), rr)
             self.assertEqual(self.rules["draft_fp8" + sfx]["params"]["wg_waves"], 2)
             self.assertNotIn("wg_waves", self.rules["draft_bf16" + sfx]["params"])
             g3 = self.buckets["verify3_g3_fp8" + sfx]
-            self.assertEqual((g3["params"]["wave_cols"], g3["params"]["group_rows"]), (32, 3))
+            self.assertEqual(
+                (g3["params"]["wave_cols"], g3["params"]["group_rows"]), (32, 3)
+            )
             b3 = self.buckets["verify3_g3_bf16" + sfx]
-            self.assertEqual((b3["params"]["wave_cols"], b3["params"]["group_rows"]), (32, 3))
+            self.assertEqual(
+                (b3["params"]["wave_cols"], b3["params"]["group_rows"]), (32, 3)
+            )
             self.assertNotIn("wg_waves", b3["params"])
         for e in self.data["rules"] + self.data["rows"] + self.data["buckets"]:
             self.assertNotIn("ipf", e["params"])
@@ -189,19 +263,41 @@ class ProfileDefaults(unittest.TestCase):
         """GPU gen_profile check on kernel 58051973 (a08-1): every row, rule and g3 bucket is
         ``pass`` with evidence on the profiled kernel itself; the staging / row-rounding
         buckets are routing-only ``fail`` (never selected)."""
-        st = {k: v["golden"]["status"] for k, v in {**self.rules, **self.buckets}.items()}
+        st = {
+            k: v["golden"]["status"] for k, v in {**self.rules, **self.buckets}.items()
+        }
         for sfx in SFX.values():
-            for rid in ("prefill_bf16_kt", "prefill_bf16_persist", "prefill_bf16_persist_wide",
-                        "draft_fp8", "prefill_fp8_kt", "prefill_fp8_kt_tall",
-                        "prefill_fp8_r32_mid", "verify3_g3_fp8", "draft_bf16", "decode_bf16",
-                        "tail_bf16", "decode_fp8", "tail_fp8", "prefill_fp8_r32_wide",
-                        "verify3_g3_bf16"):
+            for rid in (
+                "prefill_bf16_kt",
+                "prefill_bf16_persist",
+                "prefill_bf16_persist_wide",
+                "draft_fp8",
+                "prefill_fp8_kt",
+                "prefill_fp8_kt_tall",
+                "prefill_fp8_r32_mid",
+                "verify3_g3_fp8",
+                "draft_bf16",
+                "decode_bf16",
+                "tail_bf16",
+                "decode_fp8",
+                "tail_fp8",
+                "prefill_fp8_r32_wide",
+                "verify3_g3_bf16",
+            ):
                 self.assertEqual(st[rid + sfx], "pass", rid + sfx)
-            for rid in ("verify3_pad4_bf16", "tail_round4_bf16"):   # routing-only GPU 'fail'
+            for rid in (
+                "verify3_pad4_bf16",
+                "tail_round4_bf16",
+            ):  # routing-only GPU 'fail'
                 self.assertEqual(st[rid + sfx], "fail", rid + sfx)
-        self.assertEqual({v for k, v in st.items() if not k.startswith(("verify3_pad4",
-                                                                        "tail_round4"))},
-                         {"pass"})
+        self.assertEqual(
+            {
+                v
+                for k, v in st.items()
+                if not k.startswith(("verify3_pad4", "tail_round4"))
+            },
+            {"pass"},
+        )
         ksha = self.data["kernel"]["sha256"]
         for e in self.data["rules"] + self.data["buckets"] + self.data["rows"]:
             g = e["golden"]
@@ -231,10 +327,19 @@ class BucketsDefaultOn(unittest.TestCase):
         for dt in ("bf16", "fp8"):
             for page, sfx in SFX.items():
                 for C in (1, 8, 64, 448):
-                    bm = PR.match_bucket(prof, arch="gfx1250", cu=256, cache_dtype=dt, rows=3 * C,
-                                         requests=C, columns=1024, table_width=1024 // page,
-                                         allow_unverified=True, page_size=page,
-                                         native_group_rows=API.kernel_real_rows_per_group(K))
+                    bm = PR.match_bucket(
+                        prof,
+                        arch="gfx1250",
+                        cu=256,
+                        cache_dtype=dt,
+                        rows=3 * C,
+                        requests=C,
+                        columns=1024,
+                        table_width=1024 // page,
+                        allow_unverified=True,
+                        page_size=page,
+                        native_group_rows=API.kernel_real_rows_per_group(K),
+                    )
                     self.assertIsNotNone(bm, (dt, page, C))
                     self.assertEqual(bm.bucket.id, f"verify3_g3_{dt}{sfx}")
 
@@ -244,8 +349,9 @@ class PrewarmGeometry(unittest.TestCase):
         data = _profile()
         seen = set()
         for e in data["rules"] + data["buckets"]:
-            if e.get("kind") not in (None, "group") or (e.get("kind") == "group"
-                                                        and "group_rows" not in e["params"]):
+            if e.get("kind") not in (None, "group") or (
+                e.get("kind") == "group" and "group_rows" not in e["params"]
+            ):
                 continue
             vid, params = e["vid"], dict(e["params"])
             page = PR.page_of(e)
@@ -260,14 +366,30 @@ class PrewarmGeometry(unittest.TestCase):
             if page != 4:
                 width = max(1, width * 4 // page)
             cols = width * page
-            got = API.predict_route(K, e["cache_dtype"], rows if "group_rows" not in knobs
-                                    else 4 * reqs, reqs, cols, 0x1000, page)
+            got = API.predict_route(
+                K,
+                e["cache_dtype"],
+                rows if "group_rows" not in knobs else 4 * reqs,
+                reqs,
+                cols,
+                0x1000,
+                page,
+            )
             if "group_rows" in knobs:
-                got = (got[0], dict(got[1], wave_cols=K.decode_group_route(
-                    rows, reqs, e["cache_dtype"] == "fp8", 0x1000, 3)))
+                got = (
+                    got[0],
+                    dict(
+                        got[1],
+                        wave_cols=K.decode_group_route(
+                            rows, reqs, e["cache_dtype"] == "fp8", 0x1000, 3
+                        ),
+                    ),
+                )
             self.assertTrue(API._route_ok(*got, vid, params), (e["id"], got))
             seen.add(vid.split(".")[2])
-        self.assertTrue({"r32_kt", "r32_kt_fp8", "r32_persist", "r32_fp8", "draft", "decg"} <= seen)
+        self.assertTrue(
+            {"r32_kt", "r32_kt_fp8", "r32_persist", "r32_fp8", "draft", "decg"} <= seen
+        )
 
 
 if __name__ == "__main__":
