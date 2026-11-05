@@ -81,7 +81,9 @@ def _gemm_a16_w16_kernel(
     tl.assume(stride_ak > 0)
     tl.assume(stride_bk > 0)
     tl.assume(stride_bn > 0)
-    tl.assume(stride_ck > 0)
+    # Non-split calls have no partial-output buffer and pass a zero stride.
+    if NUM_KSPLIT > 1:
+        tl.assume(stride_ck > 0)
     tl.assume(stride_cm > 0)
     tl.assume(stride_cn > 0)
 
