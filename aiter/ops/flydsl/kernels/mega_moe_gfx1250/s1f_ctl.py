@@ -70,6 +70,8 @@ _DECODE_PLAN_OVERLAP_TOKENS = 128
 #: A step whose receive bound exceeds this runs the whole S1F=0 path (see
 #: _Stage1Fusion.step_off), so the widest prefill steps keep dispatch + GEMM1.
 _S1F_MAX_RECV = 4096
+#: The widest receive bound ``s1f_step_align`` narrows the tile for.
+_S1F_SNAP_MAX_RECV = int(os.environ.get("AITER_S1F_SNAP_MAX_RECV", "3584") or "3584")
 
 
 def read_s1f_mode() -> bool:
@@ -138,7 +140,7 @@ def blocking_reasons(config) -> list:
     inter = int(config.geometry.inter_dim)
     if 2 * inter > max_n_tiles * _S1F_TILE_N:
         reasons.append(f"inter_dim {inter} needs more than {max_n_tiles} n-tiles")
-    from .s1f_stage1 import _SCALE_PIECE, N_XCC, S1F_PRODUCERS
+    from .s1f_stage1 import _SCALE_PIECE
 
     if config.dispatch_scale_nbytes % _SCALE_PIECE:
         reasons.append(
@@ -151,16 +153,67 @@ def blocking_reasons(config) -> list:
         reasons.append(f"CU count unavailable ({exc})")
         return reasons
     model_dim = int(config.hidden_dim)
-    tiles = {
+    if not s1f_tiles(model_dim, cu):
+        reasons.append(f"no stage-1 variant for model_dim {model_dim} on {cu} CUs")
+    return reasons
+
+
+def s1f_tiles(model_dim: int, cu: int) -> set[int]:
+    """The stage-1 variants' tile_m that fit ``model_dim`` on ``cu`` CUs."""
+    from .s1f_stage1 import N_XCC, S1F_PRODUCERS
+
+    return {
         t
         for t, (nb, cpc) in _S1F_VARIANTS.items()
         if model_dim // _S1F_TILE_K >= nb
         and (cpc * cu) % N_XCC == 0
         and max(S1F_PRODUCERS) < cpc * cu
     }
-    if not tiles:
-        reasons.append(f"no stage-1 variant for model_dim {model_dim} on {cu} CUs")
-    return reasons
+
+
+def s1f_step_align(config, align_m: int, recv_bound: int | None) -> int:
+    """The compact alignment of a step the stage-1 kernel could take.
+
+    The grouped-GEMM CSV is tuned per GEMM, so the tile it names can fall
+    outside the stage-1 variants -- DSV4.1-Flash DEP4 decode at 513..1024
+    tokens per rank names 96 -- and such a step keeps dispatch and GEMM1 as
+    two launches. With ``AITER_S1F_SNAP_ALIGN=1`` such a step instead takes
+    the widest variant below that tile: bench_mega_moe measures the layer
+    5.9-6.6% faster at 576..832 tokens per rank (96 -> 64) with the same
+    output, and 3.1% at 896. The narrower tile loses from about 930 tokens
+    per rank (+8.7% at 1024), so the snap stops at ``AITER_S1F_SNAP_MAX_RECV``
+    (default 3584, i.e. 896 tokens per rank at EP4); wider steps keep the CSV
+    tile.
+    """
+    if os.environ.get("AITER_S1F_SNAP_ALIGN", "0") != "1" or recv_bound is None:
+        return int(align_m)
+    if int(recv_bound) > _S1F_SNAP_MAX_RECV:
+        return int(align_m)
+    if _S1F_MAX_RECV and int(recv_bound) > _S1F_MAX_RECV:
+        return int(align_m)
+    tiles = _snap_tiles(config)
+    if not tiles or int(align_m) in tiles:
+        return int(align_m)
+    below = [t for t in tiles if t < int(align_m)]
+    return max(below) if below else int(align_m)
+
+
+def _snap_tiles(config) -> set[int]:
+    """The variants a step of ``config`` may snap to; empty when the stage-1
+    kernel cannot run at all. Cached per config: every step asks."""
+    cache = _SNAP_TILES
+    key = id(config)
+    hit = cache.get(key)
+    if hit is not None and hit[0] is config:
+        return hit[1]
+    tiles: set[int] = set()
+    if config.stage1_fused and read_s1f_mode() and not blocking_reasons(config):
+        tiles = s1f_tiles(int(config.hidden_dim), _s1f_cu_num())
+    cache[key] = (config, tiles)
+    return tiles
+
+
+_SNAP_TILES: dict = {}
 
 
 def allocates_flags(config) -> bool:
@@ -210,18 +263,11 @@ class _Stage1Fusion:
             _fallback_warn(self, reasons)
             return
         from .compact_plan import compact_run_buffer_dwords
-        from .s1f_stage1 import N_XCC, S1F_PRODUCERS, s1f_ctl_words
+        from .s1f_stage1 import s1f_ctl_words
 
         device = self.d.res.total_recv.device
         self.cu = _s1f_cu_num()
-        model_dim = int(config.hidden_dim)
-        self.tiles = {
-            t
-            for t, (nb, cpc) in _S1F_VARIANTS.items()
-            if model_dim // _S1F_TILE_K >= nb
-            and (cpc * self.cu) % N_XCC == 0
-            and max(S1F_PRODUCERS) < cpc * self.cu
-        }
+        self.tiles = s1f_tiles(int(config.hidden_dim), self.cu)
         rows = int(self.d.compact.cap)
         self.tile_cap = (rows + _S1F_MIN_TILE_M - 1) // _S1F_MIN_TILE_M
         slots = self.d._PLAN_SLOTS

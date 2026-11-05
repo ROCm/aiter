@@ -26,6 +26,7 @@ from ..s1f_ctl import (
     _QUANT_FUSE_BLOCKS,
     _Stage1Fusion,
     allocates_flags,
+    s1f_step_align,
     tile_flag_nbytes,
 )
 from ..types import _from_gpu_ptr
@@ -124,7 +125,7 @@ def _compact_gemm_align_m(
     if row is not None:
         tile_m = _as_int(row.get("tile_m"), tile_m) or tile_m
         tile_m2 = _as_int(row.get("tile_m2"), tile_m) or tile_m
-    return max(int(tile_m), int(tile_m2))
+    return s1f_step_align(config, max(int(tile_m), int(tile_m2)), recv_bound)
 
 
 # The widest compact tile a grouped-GEMM CSV row names; bounds the compact
