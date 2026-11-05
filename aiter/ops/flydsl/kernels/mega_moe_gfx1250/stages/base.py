@@ -33,6 +33,11 @@ from ..types import Stage2ScatterContext, _from_gpu_ptr
 class Routing:
     token_count: int
     reverse_source_view: torch.Tensor
+    # LL128 combine only: this step's topk_ids (a route with no expert is never
+    # written, so the reduce must not wait for it) and the plan's generation
+    # word, which tags every line gemm2 writes.
+    topk_ids: torch.Tensor | None = None
+    gen: torch.Tensor | None = None
 
     @property
     def source_token_map(self) -> torch.Tensor:
@@ -341,7 +346,10 @@ class _Dispatch:
         # it stages them, so there is no repack here.
         return payload, scale_rows.data_ptr()
 
-    def _routing(self, token_count: int) -> Routing:
+    def _routing(self, token_count: int, topk_ids=None, gen=None) -> Routing:
         return Routing(
-            token_count=token_count, reverse_source_view=self._reverse_source
+            token_count=token_count,
+            reverse_source_view=self._reverse_source,
+            topk_ids=topk_ids,
+            gen=gen,
         )

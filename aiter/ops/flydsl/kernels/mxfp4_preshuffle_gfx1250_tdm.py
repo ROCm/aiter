@@ -29,6 +29,7 @@ from .gemm_common_gfx1250 import (
     workgroup_barrier,
 )
 from .kernels_common import ceildiv
+from .mega_moe_gfx1250 import ll128 as LL128
 from .mega_moe_gfx1250.tdm_gather_shim import (
     make_tensor_gather_descriptor,
     tensor_store_gather,
@@ -116,6 +117,9 @@ EP_SCALE_BLOCK = COMBINE_SCALE_BLOCK
 # GEMM2 has no activation, so one acc holds 8 f32 -> 2 wn subtiles per lane give
 # 16 values, and the two kgrp halves merge into the full 32-element MX block.
 WN_PER_MX_BLOCK_EP = 2
+#: gfx12 CPol SCOPE_SYS: an LL128 line has to reach the peer's memory, where the
+#: reduce reads it, not stop in this device's caches.
+_EP_SCOPE_SYS = 3 << 3
 
 
 def _pack_bytes_i32(byte_vals):
@@ -182,6 +186,7 @@ def build_gemm_a8w4_tdm_task(
     defer_c_wait=0,
     tdm_snop=0,
     k_waves=1,
+    ep_ll128=0,
 ):
     """Build the grouped contiguous-M a8w4 TDM GEMM tile body (``gemm_task``).
 
@@ -232,6 +237,10 @@ def build_gemm_a8w4_tdm_task(
       must drain tensorcnt and storecnt before reusing the arena or exiting.
     - ``tdm_snop``: ``s_nop 0`` after every TDM issue, so no branch or label
       directly follows one (a gfx1250 TDM hazard).
+    - ``ep_ll128`` (bf16 gather scatter): stage each row in the LL128 layout
+      (``mega_moe_gfx1250/ll128.py``), every 128 B line tagged with the
+      generation at ``m_tile_map[n_experts]``, and scatter it SCOPE_SYS, so
+      the combine reduce trusts a line by its tag instead of a barrier.
     """
     if tile_meta is not None or item_hooks is not None:
         assert explicit_tile and persistent_workers, "S1F hooks need explicit tiles"
@@ -364,6 +373,7 @@ def build_gemm_a8w4_tdm_task(
         rolled_drain,
         k_waves,
         m_align,
+        ep_ll128,
     )
     _ = cache_tag
     if enable_ep_scatter:
@@ -373,6 +383,15 @@ def build_gemm_a8w4_tdm_task(
             raise ValueError("enable_ep_scatter is incompatible with stage1_quant_out")
     if ep_quant_bits not in (0, 8, 4):
         raise ValueError(f"ep_quant_bits must be 0, 8 or 4, got {ep_quant_bits}")
+    ep_ll128 = int(bool(ep_ll128))
+    if ep_ll128 and not (enable_ep_scatter and not ep_quant_bits):
+        raise ValueError("ep_ll128 is the bf16 gather scatter only")
+    if ep_ll128 and k_waves > 1:
+        raise ValueError("ep_ll128 needs k_waves=1")
+    if ep_ll128 and tile_n % LL128.SEG_COLS:
+        raise ValueError(
+            f"ep_ll128 stages whole {LL128.SEG_COLS}-column segments, got tile_n={tile_n}"
+        )
     if ep_quant_bits:
         if not enable_ep_scatter:
             raise ValueError("ep_quant_bits requires enable_ep_scatter")
@@ -475,7 +494,11 @@ def build_gemm_a8w4_tdm_task(
         p = ((nbytes + 15) // 16) * 16
         return p + (16 if p % 32 == 0 else 0)
 
-    C_ROW_BYTES = tile_n * ep_quant_bits // 8 if ep_quant_bits else tile_n * 2
+    C_ROW_BYTES = (
+        tile_n * ep_quant_bits // 8
+        if ep_quant_bits
+        else (LL128.row_bytes(tile_n) if ep_ll128 else tile_n * 2)
+    )
     EP_SCALE_ROW_BYTES = tile_n // EP_SCALE_BLOCK
     _lds_row_bytes = _lds_pitch(C_ROW_BYTES)
     _lds_scale_row_bytes = _lds_pitch(EP_SCALE_ROW_BYTES) if ep_quant_bits else 0
@@ -485,7 +508,11 @@ def build_gemm_a8w4_tdm_task(
     C_STORE_B = (
         ((_ep_scale_lds_off + tile_m * _lds_scale_row_bytes + 127) // 128) * 128
         if ep_quant_bits
-        else ((tile_m * (tile_n + store_pad) * 2 + 127) // 128) * 128
+        else (
+            ((tile_m * _lds_row_bytes + 127) // 128) * 128
+            if ep_ll128
+            else ((tile_m * (tile_n + store_pad) * 2 + 127) // 128) * 128
+        )
     )
     AS_FULL_OFF = INPUT_LDS_B
     AS_FULL_B = ceildiv(AS_SUPERS * AS_FULL_INNER * 4, 128) * 128
@@ -544,6 +571,7 @@ def build_gemm_a8w4_tdm_task(
         f"_wpt{num_waves_per_tensor_tdm}" if num_waves_per_tensor_tdm != 2 else ""
     )
     _ep = "_epscatter" if enable_ep_scatter else ""
+    _ep = _ep + ("_ll128" if ep_ll128 else "")
     _mma_group = (
         f"_mg{sched_mma_group}"
         if sched_first_group == sched_mma_group
@@ -2029,7 +2057,9 @@ def build_gemm_a8w4_tdm_task(
                 if const_expr(enable_ep_scatter)
                 else (16 if not stage1_act else 0)
             )
-            STORE_PITCH = STORE_N + STORE_PAD
+            STORE_PITCH = (
+                _lds_row_bytes // 2 if const_expr(ep_ll128) else STORE_N + STORE_PAD
+            )
             neg_limit = fx.Float32(0.0) - f32_swiglu_limit
             is_swiglu = stage1_act == 2
             is_situv2 = stage1_act == 3
@@ -2432,9 +2462,28 @@ def build_gemm_a8w4_tdm_task(
                                 hv_i32 = hv.bitcast(fx.Int32).ir_value()
                                 lds_store_b128(
                                     stC_ep_idx,
-                                    (row_rel * STORE_PITCH + col_rel) * 2,
+                                    (
+                                        row_rel * _lds_row_bytes
+                                        + LL128.col_offset(col_rel)
+                                        if const_expr(ep_ll128)
+                                        else (row_rel * STORE_PITCH + col_rel) * 2
+                                    ),
                                     hv_i32,
                                 )
+                    if const_expr(ep_ll128):
+                        # Every line of every staged row carries this step's
+                        # generation; padding rows are tagged too but never
+                        # leave LDS (their scatter index is out of bounds).
+                        _ll_gen = fx.Int32(tile_map[n_experts])
+                        _ll_tag = Vec.from_elements([_ll_gen] * 4, fx.Int32).ir_value()
+                        _ll_lines = C_ROW_BYTES // LL128.LINE_B
+                        for _ll_i in range(fx.Int32(tid), tile_m * _ll_lines, block):
+                            lds_store_b128(
+                                stC_ep_idx,
+                                (_ll_i // _ll_lines) * _lds_row_bytes
+                                + LL128.tag_offset(_ll_i % _ll_lines),
+                                _ll_tag,
+                            )
 
             # -- Shared LDS -> global --
             # dscnt-only barrier: the store reads LDS, not the e8m0 scales still
@@ -2456,7 +2505,11 @@ def build_gemm_a8w4_tdm_task(
                 # Quantized rows are addressed in bytes, so a 4-bit element just
                 # halves the row length; the scale plane rides a second store.
                 elem_bytes = 1 if ep_quant_bits else 2
-                _row_elems = C_ROW_BYTES if ep_quant_bits else STORE_N
+                _row_elems = (
+                    C_ROW_BYTES
+                    if ep_quant_bits
+                    else (C_ROW_BYTES // 2 if ep_ll128 else STORE_N)
+                )
                 _lds_row_elems = _lds_row_bytes if ep_quant_bits else STORE_PITCH
                 _stride_elems = ep_slot_stride_bytes // elem_bytes
                 _GRP = SCATTER_GROUP_ROWS
@@ -2492,6 +2545,8 @@ def build_gemm_a8w4_tdm_task(
                     # is a multiple of tile_n, itself a multiple of the scale block,
                     # so the tile's scale run starts whole.
                     _gboff_s = n64 // _elem_div + blk_n64 // EP_SCALE_BLOCK
+                elif const_expr(ep_ll128):
+                    _gboff = blk_n // fx.Int32(LL128.SEG_COLS) * fx.Int32(LL128.SEG_B)
                 else:
                     _gboff = blk_n * elem_bytes
                 _passes = scatter_passes
@@ -2543,7 +2598,9 @@ def build_gemm_a8w4_tdm_task(
                         ),
                         global_byte_offset=_gboff,
                     )
-                    tensor_store_gather(desc)
+                    tensor_store_gather(
+                        desc, cache_policy=_EP_SCOPE_SYS if ep_ll128 else 0
+                    )
                     if const_expr(ep_quant_bits):
                         # Same rows and slot stride as the payload store; only the
                         # plane base and the row width differ.
@@ -2720,6 +2777,7 @@ def launch_gemm_a8w4_tdm(
     a_preshuffled: Constexpr[int] = 0,
     m_align: Constexpr[int] = 0,
     k_waves: Constexpr[int] = 1,
+    ep_ll128: Constexpr[int] = 0,
 ):
     """Launch the grouped contiguous-M a8w4 MoE GEMM for gfx1250.
 
@@ -2784,6 +2842,7 @@ def launch_gemm_a8w4_tdm(
         a_preshuffled=a_preshuffled,
         m_align=m_align,
         k_waves=k_waves,
+        ep_ll128=ep_ll128,
     )
 
     @flyc.kernel(name=_kname, known_block_size=[block, 1, 1])

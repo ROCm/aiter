@@ -373,6 +373,11 @@ class MegaMoEGfx1250:
                 hook = disp.fusion.gemm1
             elif disp.fusion.should_probe():
                 hook = disp.fusion.probe
+            ll128_for = getattr(ep._combine, "ll128_for", None)
+            if ll128_for is not None and ll128_for(disp._step.recv_bound, quant_bits):
+                # Same rule as S1F: the LL128 combine has no barrier, so the
+                # next layer's plan must come after this rank's reduce.
+                next_topk_ids = None
             step_kw = {"begin_step": False, "s1f": s1f}
         batch = ep.dispatch(
             hidden_states,

@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import functools
 import os
 
 import flydsl.expr as fx
@@ -99,6 +100,67 @@ def _select_num_waves_per_tensor_tdm(csv_num_waves: int) -> int:
 
 
 _BIAS_MODE = {torch.bfloat16: 1, torch.float32: 2, torch.float16: 3}
+# A gfx1250 CU's LDS, and the granule a workgroup's allocation rounds up to.
+_LDS_PER_CU = 320 * 1024
+_LDS_GRANULE = 2048
+
+
+@functools.cache
+def _resident_workers(spec: tuple, layout: tuple, ep_ll128: int) -> int:
+    """Persistent workers the whole device holds at once for this tile.
+
+    Bound by LDS (the tiles MegaMoE runs keep VGPRs well under it), so it
+    follows the tile and buffer count: a 16x512x128 b2 gemm2 fits 4 a CU, a
+    64x256x256 b3 one 2. ``spec`` / ``layout`` are the launcher's tuples,
+    persistent workers and k_waves left out of ``layout``.
+    """
+    from aiter.jit.utils.chip_info import get_cu_num
+
+    from .kernels.mxfp4_preshuffle_gfx1250_tdm import build_gemm_a8w4_tdm_task
+
+    names = [
+        "K",
+        "tile_m",
+        "tile_n",
+        "tile_k",
+        "m_warp",
+        "n_warp",
+        "out_is_f16",
+        "num_buffers",
+        "a_is_fp4",
+        "n_experts",
+        "stage1_act",
+        "has_bias",
+        "stage1_quant_out",
+        "quant_wmma_rep",
+        "cluster_n",
+        "cluster_m",
+        "next_stage_prefetch",
+        "num_waves_per_tensor_tdm",
+        "tdm_as_in_prologue",
+        "tdm_b_th",
+        "enable_ep_scatter",
+        "ep_arena_handle",
+        "ep_combine_input_offset",
+        "ep_slot_stride_bytes",
+        "ep_destination_stride",
+        "ep_world_size",
+        "ep_quant_bits",
+    ]
+    kw = dict(zip(names, spec))
+    (
+        kw["row_major_ascale"],
+        kw["a_row_stride_bytes"],
+        kw["a_scale_row_stride_bytes"],
+        kw["lds_soa_load_interleave"],
+        kw["rolled_drain"],
+        kw["a_preshuffled"],
+        kw["m_align"],
+    ) = layout
+    kw["ep_ll128"] = ep_ll128
+    _, _, _, _, lay = build_gemm_a8w4_tdm_task(persistent_workers=kw["cluster_n"], **kw)
+    lds = -(-int(lay["arena"]) // _LDS_GRANULE) * _LDS_GRANULE
+    return max(1, _LDS_PER_CU // lds) * int(get_cu_num())
 
 
 def flydsl_grouped_gemm_a8w4_masked(
@@ -223,8 +285,9 @@ def flydsl_grouped_gemm_a8w4_masked(
             os.environ.get("AITER_FLYDSL_PERSISTENT_WORKERS", persistent_workers),
         )
     )
-    if persistent_workers < 0:
-        raise ValueError("persistent_workers must be nonnegative")
+    # -1: as many workers as the device holds at once (sized below, once the
+    # tile's LDS is known).
+    auto_workers = persistent_workers < 0
     if persistent_workers:
         if cluster_m != 1:
             raise ValueError("persistent workers require cluster_m=1")
@@ -232,9 +295,10 @@ def flydsl_grouped_gemm_a8w4_masked(
             raise ValueError(
                 "persistent EP scatter requires an unquantized combine wire"
             )
-        persistent_workers = (
-            (persistent_workers + cluster_n - 1) // cluster_n * cluster_n
-        )
+        if not auto_workers:
+            persistent_workers = (
+                (persistent_workers + cluster_n - 1) // cluster_n * cluster_n
+            )
     # k_waves owns the grid: no clusters, no persistent workers, no As prologue.
     # Reject a config that asks for them rather than dropping them.
     if k_waves > 1 and (
@@ -298,6 +362,22 @@ def flydsl_grouped_gemm_a8w4_masked(
         int(stage2_scatter.world_size) if enable_ep_scatter else 0,
         int(stage2_scatter.combine_quant_bits) if enable_ep_scatter else 0,
     )
+    ep_ll128 = int(stage2_scatter.combine_ll128) if enable_ep_scatter else 0
+    if auto_workers:
+        workers = _resident_workers(
+            (*gemm_spec, *route_spec, *quant_spec, *tdm_spec, *ep_spec),
+            (
+                int(row_major_ascale),
+                int(a_row_stride_bytes),
+                int(a_scale_row_stride_bytes),
+                int(lds_soa_load_interleave),
+                rolled_drain,
+                int(a_preshuffled),
+                int(m_align),
+            ),
+            ep_ll128,
+        )
+        persistent_workers = (workers + cluster_n - 1) // cluster_n * cluster_n
     layout_spec = (
         int(row_major_ascale),
         int(a_row_stride_bytes),
@@ -308,6 +388,7 @@ def flydsl_grouped_gemm_a8w4_masked(
         int(a_preshuffled),
         int(m_align),
         k_waves,
+        ep_ll128,
     )
     _run_compiled(
         launch_gemm_a8w4_tdm,

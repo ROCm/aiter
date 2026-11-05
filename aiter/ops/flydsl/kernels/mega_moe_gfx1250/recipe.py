@@ -35,6 +35,25 @@ def read_dispatch_wire_env() -> str:
     return os.environ.get("MEGA_DISPATCH_WIRE") or "bf16"
 
 
+def read_combine_ll128_env() -> bool:
+    """$AITER_MEGA_COMBINE_LL128: bf16 combine steps scatter LL128 rows and
+    reduce them without the cross-device barrier. Off unless 1/true/True."""
+    return os.environ.get("AITER_MEGA_COMBINE_LL128", "0") in ("1", "true", "True")
+
+
+def read_ll128_tpr_lt_env() -> int:
+    """$AITER_MEGA_LL128_TPR_LT: LL128 runs a step only below this many tokens
+    a rank (the step's recv-token bound over world_size). Default 512: past it
+    the 25% wider rows cost gemm2 more than the barrier they save."""
+    return int(os.environ.get("AITER_MEGA_LL128_TPR_LT", "512"))
+
+
+def read_s2f_env() -> bool:
+    """$AITER_MEGA_S2F: LL128 steps run gemm2 and the combine reduce as one
+    persistent kernel (s2f_stage2.py). Off unless 1/true/True."""
+    return os.environ.get("AITER_MEGA_S2F", "0") in ("1", "true", "True")
+
+
 @dataclass(frozen=True)
 class _DispatchWire:
     """One DISPATCH wire. Per token at hidden 7168: bf16 14336 B, fp8 7168 + 256,
@@ -357,8 +376,36 @@ class MegaMoEConfig:
 
     recipe: MegaMoERecipe
     geometry: MegaMoEGeometry
+    # bf16 combine steps go out in the LL128 layout and are reduced without the
+    # cross-device barrier (ll128.py). Needs the compact plan, whose generation
+    # tags the lines and whose histogram exchange fences the next dispatch off
+    # what this combine still reads, and the tok*topk + k gather scatter.
+    combine_ll128: bool = field(default_factory=read_combine_ll128_env)
+    # A step runs LL128 only when its recv-token bound over world_size is below
+    # this; the bound is the same on every rank, so they all take one path.
+    ll128_tpr_lt: int = field(default_factory=read_ll128_tpr_lt_env)
+    # LL128 steps run gemm2 and the reduce as one kernel (s2f_stage2.py).
+    s2f: bool = field(default_factory=read_s2f_env)
 
     def __post_init__(self):
+        if self.s2f and not self.combine_ll128:
+            raise ValueError("AITER_MEGA_S2F needs AITER_MEGA_COMBINE_LL128=1")
+        if self.combine_ll128:
+            from .ll128 import fits as _ll128_fits
+
+            if not (
+                self.recipe.dispatch is DispatchKind.COMPACT
+                and self.recipe.combine is CombineKind.FUSED_SCATTER
+            ):
+                raise ValueError(
+                    "AITER_MEGA_COMBINE_LL128 requires dispatch=compact and "
+                    "combine=fused_scatter"
+                )
+            if not _ll128_fits(self.hidden_dim, self.combine_slot_stride_bytes):
+                raise ValueError(
+                    f"an LL128 row of hidden_dim={self.hidden_dim} does not fit "
+                    f"the {self.combine_slot_stride_bytes} B combine slot"
+                )
         if self.is_quant_dispatch_wire and self.hidden_dim % 32:
             raise ValueError(
                 "one e8m0 scale covers 32 features, so a quantizing dispatch "

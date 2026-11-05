@@ -97,6 +97,17 @@ class Stage2ScatterContext:
     # signature of ``flydsl_grouped_gemm_a8w4_masked``; it runs the fused
     # dispatch + GEMM1 stage-1 kernel instead. None keeps the default GEMM1.
     stage1_gemm1: object = None
+    # bf16 gather scatter only: rows go out in the LL128 layout (ll128.py),
+    # every line tagged with the plan's generation at compact_psum[epr], so the
+    # reduce needs no cross-device barrier.
+    combine_ll128: bool = False
+    # gemm2's persistent workers for this step, over the CSV's: -1 sizes the
+    # grid to the CTAs every CU holds at once, 0 keeps the CSV's.
+    gemm2_persistent_workers: int = 0
+    # S2F (AITER_MEGA_S2F=1, LL128 steps): a stand-in for the gemm2 launch with
+    # the signature of ``flydsl_grouped_gemm_a8w4_masked``; it runs gemm2 and
+    # the combine reduce as one kernel. None keeps the separate launches.
+    stage2_gemm2: object = None
 
     def __post_init__(self):
         if self.combine_quant_bits not in (0, 8, 4):

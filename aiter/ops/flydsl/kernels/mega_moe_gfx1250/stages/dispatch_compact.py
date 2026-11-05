@@ -320,8 +320,16 @@ class _CompactDispatch(_Dispatch):
         self._masked_ms = [
             torch.zeros(epr, dtype=torch.int32, device=device) for _ in slots
         ]
-        self._psums = [
-            torch.zeros(epr, dtype=torch.int32, device=device) for _ in slots
+        # The LL128 combine's generation word rides behind psum, so gemm2 finds
+        # it through the m-tile map it already takes.
+        psum_tail = 1 if config.combine_ll128 else 0
+        psum_full = [
+            torch.zeros(epr + psum_tail, dtype=torch.int32, device=device)
+            for _ in slots
+        ]
+        self._psums = [p[:epr] for p in psum_full]
+        self._gens = [
+            p[epr : epr + 1] if config.combine_ll128 else None for p in psum_full
         ]
         self._block_hists = [
             torch.empty(
@@ -571,7 +579,11 @@ class _CompactDispatch(_Dispatch):
             topk_ids=self._dummy_ids,
             scales=self.recv_scales,
             num_local_tokens=None,
-            routing=self._routing(token_count),
+            routing=self._routing(
+                token_count,
+                topk_ids=topk_ids if config.combine_ll128 else None,
+                gen=self._gens[slot],
+            ),
             layout=BatchLayout.EXPERT_GROUPED,
             grouping=ExpertGrouping(
                 masked_m=self._masked_ms[slot],
@@ -840,6 +852,7 @@ class _CompactDispatch(_Dispatch):
                 hist_stride=geo.hist_stride,
                 max_routes=geo.max_routes,
                 hist_pingpong=False,
+                emit_gen=config.combine_ll128,
                 **extra,
             )
             # Compiled now, without a launch, so a graph capture never has to.

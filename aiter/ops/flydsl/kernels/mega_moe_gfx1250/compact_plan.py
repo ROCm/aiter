@@ -278,6 +278,7 @@ def compile_tdm_compact_plan(
     s1f: bool = False,
     write_tok_map: bool = True,
     align_m: int | None = None,
+    emit_gen: bool = False,
 ):
     """Compile the compact-plan kernel. ``hist_stride`` is ``npes * row_dwords``.
 
@@ -337,6 +338,10 @@ def compile_tdm_compact_plan(
     ``align_m`` keeps its producers' ``tile_m``-row pieces and reads ``align_m
     // tile_m`` tile_info words (and flags) per GEMM1 m-tile.
 
+
+    ``emit_gen`` writes this plan's generation to ``psum[experts_per_rank]``:
+    the LL128 combine tags its lines with it, and every rank's plan steps it
+    once per dispatch, so the ranks agree on it.
     """
     if WAVE != 32:
         raise ValueError("compact plan requires gfx1250 wave32")
@@ -443,6 +448,9 @@ def compile_tdm_compact_plan(
         )
     if not write_tok_map:
         kernel_name += "_nm"
+    emit_gen = bool(emit_gen)
+    if emit_gen:
+        kernel_name += "_gen"
     # The send list is staged in LDS (one slot per route of this block) and
     # copied out coalesced: a per-route scattered store costs a cache line per
     # lane (~2.4 us at 7K routes on one CU). It needs only this rank's own
@@ -877,6 +885,8 @@ def compile_tdm_compact_plan(
 
             if tid == 0:
                 buffer_store(gen, rsrc_bar, 2)
+                if const_expr(emit_gen):
+                    buffer_store(gen, rsrc_psum, epr)
             if const_expr(hist_pingpong):
                 parity = gen & arith.constant(1)
                 hist_off = off_hist + parity * hist_stride * 4

@@ -24,8 +24,13 @@
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import mori.cco.device.flydsl as cco
-from flydsl.expr import arith, range_constexpr, tdm_ops
-from flydsl.expr.rocdl import cvt_scale_pk8_f32_fp4, cvt_scale_pk8_f32_fp8
+from flydsl._mlir.dialects import llvm as _llvm
+from flydsl.expr import arith, const_expr, range_constexpr, tdm_ops
+from flydsl.expr.rocdl import (
+    cvt_scale_pk8_f32_fp4,
+    cvt_scale_pk8_f32_fp8,
+    readfirstlane,
+)
 from flydsl.expr.typing import Int32, Int64, T
 from flydsl.expr.typing import Vector as Vec
 
@@ -40,6 +45,7 @@ from aiter.ops.flydsl.kernels.gemm_common_gfx1250 import (
     workgroup_barrier,
 )
 
+from . import ll128 as LL128
 from .config import (
     _WAVE_SIZE as WAVE,
 )
@@ -54,6 +60,40 @@ CHUNK_ELEMS = 256
 # Elements each lane reduces per round. On the MXFP8 wire 16 fp8 sit inside one
 # 32-element MX block, so a round needs exactly one scale byte.
 LANE_BYTES = 16
+# LL128 reduce: tiles load SCOPE_SYS, so a reload sees what a peer wrote since,
+# not a line this device still caches. A stale tile is not reloaded in a loop
+# (every waiting CTA would stream its whole tile from memory): one lane polls a
+# single stale line's tag (s_sleep LL_SLEEP for the first LL_FAST_POLLS polls,
+# LL_SLEEP_LONG after), then the tile is reloaded. The caps only turn a hang
+# into a trap: a peer can be seconds behind (its first call JIT-compiles), so a
+# line may take LL_RELOAD_CAP polls, a tile LL_TILE_RETRIES reloads.
+LL_SCOPE_SYS = 3 << 3
+LL_SLEEP = 2
+LL_SLEEP_LONG = 32
+LL_FAST_POLLS = 64
+LL_RELOAD_CAP = 1 << 26
+LL_TILE_RETRIES = 1 << 12
+
+
+@flyc.jit
+def ll_poll_sleep(n):
+    """Backoff between polls of a stale LL128 line: short while it is fresh
+    news, long once a peer is clearly behind."""
+    if n < fx.Int32(LL_FAST_POLLS):
+        fx.rocdl.s_sleep(LL_SLEEP)
+    else:
+        fx.rocdl.s_sleep(LL_SLEEP_LONG)
+
+
+def _trap():
+    _llvm.InlineAsmOp(
+        res=None,
+        operands_=[],
+        asm_string="s_trap 2",
+        constraints="",
+        has_side_effects=True,
+        is_align_stack=False,
+    )
 
 
 # The cross-device xdb barrier is combine's own, not shared with dispatch's: it
@@ -130,7 +170,7 @@ COMBINE_LDS_BUDGET = 160 * 1024
 
 
 def combine_reduce_lds_bytes(
-    *, experts_per_token, quant_bits, tokens_per_block, chunks_per_iter
+    *, experts_per_token, quant_bits, tokens_per_block, chunks_per_iter, ll128=False
 ):
     """LDS a (T, C) reduce tile needs, both sides double-buffered.
 
@@ -140,9 +180,12 @@ def combine_reduce_lds_bytes(
     chunk_bytes = CHUNK_ELEMS * quant_bits // 8 if quant_bits else CHUNK_ELEMS * 2
     if quant_bits:
         chunk_bytes += CHUNK_ELEMS // SCALE_BLOCK
+    if ll128:
+        chunk_bytes = LL128.SEG_B
     in_tile = tokens_per_block * experts_per_token * chunks_per_iter * chunk_bytes
     out_tile = tokens_per_block * chunks_per_iter * CHUNK_ELEMS * 2
-    return 2 * (in_tile + out_tile)
+    side = (tokens_per_block * experts_per_token * 4 + 48) if ll128 else 0
+    return 2 * (in_tile + out_tile) + side
 
 
 def _make_combine_fused_reduce(
@@ -155,6 +198,8 @@ def _make_combine_fused_reduce(
     quant_bits=0,
     tokens_per_block=2,
     chunks_per_iter=4,
+    ll128=False,
+    n_experts_total=0,
 ):
     """Stage B of the GEMM2-fused scatter combine: the per-token topk sum.
 
@@ -182,8 +227,20 @@ def _make_combine_fused_reduce(
     On an MX wire ``chunks_per_iter`` wants to cover as much of the hidden dim as
     it can: the scale plane contributes only C*8 bytes to a row, and anything
     under a cache line makes the second load fetch lines it mostly discards.
+
+    ``ll128`` (bf16, tok*topk + k layout) reads slots gemm2 wrote in the LL128
+    layout (ll128.py) and needs no ``_make_combine_fused_sync`` before it: each
+    tile is loaded SCOPE_SYS, and while any line of a live route still carries
+    an older tag than the plan's generation (``addr_gen``) the tile is reloaded.
+    A route whose expert is not in ``[0, n_experts_total)`` (``addr_topk_ids``)
+    was never written; it is neither waited for nor summed.
     """
     topk = experts_per_token
+    ll128 = bool(ll128)
+    if ll128 and quant_bits:
+        raise ValueError("ll128 reads the bf16 wire only")
+    if ll128 and n_experts_total <= 0:
+        raise ValueError("ll128 needs n_experts_total to tell live routes")
     lanes = warp_num_per_block * WAVE
     n_chunks = hidden_dim // CHUNK_ELEMS
     T_TOK = tokens_per_block
@@ -201,6 +258,8 @@ def _make_combine_fused_reduce(
     # scale rows, so each stays a plain strided 2D region one TDM can fill.
     ELEMS_PER_LANE = LANE_BYTES
     IN_CHUNK_BYTES = CHUNK_ELEMS * quant_bits // 8 if quant_bits else CHUNK_ELEMS * 2
+    if ll128:
+        IN_CHUNK_BYTES = LL128.SEG_B
     IN_ROWS = T_TOK * topk
     P_ROW_BYTES = C_CHK * IN_CHUNK_BYTES
     S_ROW_BYTES = C_CHK * (CHUNK_ELEMS // SCALE_BLOCK) if quant_bits else 0
@@ -238,6 +297,11 @@ def _make_combine_fused_reduce(
     IN_TILE_BYTES = IN_ROWS * (P_ROW_BYTES + S_ROW_BYTES)
     OUT_TILE_BYTES = T_TOK * OUT_ROW_BYTES
     LDS_BYTES = IN_BUFS * IN_TILE_BYTES + OUT_BUFS * OUT_TILE_BYTES
+    # LL128: per-row liveness, a zero granule pair dropped routes read, a flag.
+    LL_VROW_B = ((IN_ROWS * 4 + 15) // 16) * 16
+    LL_SIDE_B = LL_VROW_B + 48 if ll128 else 0
+    LL_LINES = C_CHK * LL128.SEG_LINES
+    LDS_BYTES += LL_SIDE_B
     if LDS_BYTES > COMBINE_LDS_BUDGET:
         raise ValueError(
             f"combine LDS tile is {LDS_BYTES} bytes, over the "
@@ -290,9 +354,28 @@ def _make_combine_fused_reduce(
         addr_comb_inp: Int64,
         addr_out: Int64,
         cur_rank_num_token: Int32,
+        addr_topk_ids: Int64,
+        addr_gen: Int64,
     ):
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
+        if const_expr(ll128):
+            rsrc_ids = create_buffer_resource_from_addr(addr_topk_ids)
+            ll_gen = fx.Int32(
+                readfirstlane(
+                    T.i32,
+                    arith.unwrap(
+                        fx.Int32(
+                            buffer_load(
+                                create_buffer_resource_from_addr(addr_gen),
+                                0,
+                                vec_width=1,
+                                dtype=T.i32,
+                            )
+                        )
+                    ),
+                )
+            )
 
         # These build MLIR layouts/atoms, so they only work inside the kernel
         # body where a Context is established.
@@ -306,6 +389,14 @@ def _make_combine_fused_reduce(
         smem = fx.SharedAllocator(static=False)
         in_base = smem.allocate(IN_BUFS * IN_TILE_BYTES)._ptr
         out_base = smem.allocate(OUT_BUFS * OUT_TILE_BYTES)._ptr
+        if const_expr(ll128):
+            # vrow[row]: route row of the tile is live; zero: 32 B dropped
+            # routes read instead of their slot; stale: the tile's tag verdict.
+            ll_vrow = fx.Int64(fx.ptrtoint(smem.allocate(LL_VROW_B, 16)._ptr))
+            ll_zero = fx.Int64(fx.ptrtoint(smem.allocate(32, 16)._ptr))
+            ll_stale = fx.Int64(fx.ptrtoint(smem.allocate(16, 16)._ptr))
+            if tid < 8:
+                comm_ops.store_i32_lds(ll_zero + fx.Int64(tid) * 4, fx.Int32(0))
 
         def ptr_to_idx(p):
             return fx.index_cast(T.index, fx.ptrtoint(p))
@@ -424,7 +515,7 @@ def _make_combine_fused_reduce(
                 inp_iter, g_off, (row_oob, P_ROW_BYTES), (slot_stride, 1)
             )
             atom_in, coord_in = fx.rocdl.cdna5.make_tiled_tdm_atom(
-                fx.rocdl.TensorLoad(),
+                fx.rocdl.TensorLoad(cache_modifier=LL_SCOPE_SYS if ll128 else 0),
                 gt_in,
                 fx.make_layout(IN_TILE, (P_ROW_BYTES, 1)),
                 IN_TILE,
@@ -506,6 +597,36 @@ def _make_combine_fused_reduce(
                                 ),
                                 e8m0,
                             )
+                elif const_expr(ll128):
+                    # The lane's two granules sit at their LL128 offsets in the
+                    # chunk's segment; a dead route reads the zero granules.
+                    g0 = fx.Int32(lane_elem[r]) // fx.Int32(LL128.GRANULE_ELEMS)
+                    zero_rel = fx.Int32(
+                        arith.trunci(
+                            T.i32,
+                            arith.unwrap(
+                                ll_zero - fx.Int64(fx.ptrtoint(in_buf_ptr(buf)))
+                            ),
+                        )
+                    )
+                    for k_slot in range_constexpr(topk):
+                        live = fx.Int32(
+                            comm_ops.load_i32_lds(
+                                ll_vrow
+                                + fx.Int64(fx.Int32(lane_tok[r]) * topk + k_slot) * 4
+                            )
+                        ) != fx.Int32(0)
+                        for j in range_constexpr(2):
+                            off = (
+                                fx.Int32(chunk_off)
+                                + k_slot * P_ROW_BYTES
+                                + LL128.granule_offset(g0 + fx.Int32(j))
+                            )
+                            raw = lds_load_b128(
+                                in_idx,
+                                fx.Int32(live.select(off, zero_rel + fx.Int32(j * 16))),
+                            )
+                            accs[j] = accs[j] + raw.bitcast(fx.BFloat16).to(fx.Float32)
                 else:
                     # No scale plane, so the lane's 16 elements are a plain
                     # 32-byte run: one b128 per accumulator.
@@ -558,6 +679,74 @@ def _make_combine_fused_reduce(
             )
             fx.copy(atom_out, tOs[None, 0], tOg[None, 0])
 
+        def ll_tile_stale(work, buf):
+            """LL128: mark the tile's live routes in vrow and return (uniform)
+            whether any of their lines still carries an older generation."""
+            tok0 = fx.Int32(tile_origin(work)[0])
+            tid_i = fx.Int32(tid)
+            in_lds = fx.Int64(fx.ptrtoint(in_buf_ptr(buf)))
+            if tid_i == fx.Int32(0):
+                comm_ops.store_i32_lds(ll_stale, fx.Int32(0))
+            for row in range(tid_i, IN_ROWS, lanes):
+                in_tok = tok0 + row // fx.Int32(topk) < cur_rank_num_token
+                e = fx.Int32(
+                    buffer_load(
+                        rsrc_ids,
+                        fx.Int32(in_tok.select(tok0 * topk + row, fx.Int32(0))),
+                        vec_width=1,
+                        dtype=T.i32,
+                    )
+                )
+                ok = in_tok & (e >= fx.Int32(0)) & (e < fx.Int32(n_experts_total))
+                comm_ops.store_i32_lds(
+                    ll_vrow + fx.Int64(row) * 4,
+                    fx.Int32(ok.select(fx.Int32(1), fx.Int32(0))),
+                )
+            workgroup_barrier()
+            for t in range(tid_i, IN_ROWS * LL_LINES, lanes):
+                row = t // fx.Int32(LL_LINES)
+                line = t % fx.Int32(LL_LINES)
+                if fx.Int32(comm_ops.load_i32_lds(ll_vrow + fx.Int64(row) * 4)) != 0:
+                    tag = fx.Int32(
+                        comm_ops.load_i32_lds(
+                            in_lds
+                            + fx.Int64(row * P_ROW_BYTES + LL128.tag_offset(line))
+                        )
+                    )
+                    if tag != ll_gen:
+                        comm_ops.store_i32_lds(ll_stale, t + fx.Int32(1))
+            workgroup_barrier()
+            return fx.Int32(
+                readfirstlane(
+                    T.i32, arith.unwrap(fx.Int32(comm_ops.load_i32_lds(ll_stale)))
+                )
+            )
+
+        def ll_wait_line(work, stale):
+            """Lane 0 polls the one stale line's tag in memory (128 B a poll,
+            not the tile) until it carries this step's generation."""
+            if fx.Int32(tid) == fx.Int32(0):
+                tok0, q0 = tile_origin(work)
+                t = stale - fx.Int32(1)
+                row = t // fx.Int32(LL_LINES)
+                line = t - row * fx.Int32(LL_LINES)
+                addr = (
+                    addr_comb_inp
+                    + (fx.Int64(tok0) * fx.Int64(topk) + fx.Int64(row))
+                    * fx.Int64(slot_stride)
+                    + fx.Int64(q0) * fx.Int64(IN_CHUNK_BYTES)
+                    + fx.Int64(LL128.tag_offset(line))
+                )
+                v = fx.Int32(comm_ops.load_i32_global_system(addr))
+                n = fx.Int32(0)
+                while (v != ll_gen) & (n < fx.Int32(LL_RELOAD_CAP)):
+                    ll_poll_sleep(n)
+                    v = fx.Int32(comm_ops.load_i32_global_system(addr))
+                    n = n + fx.Int32(1)
+                if v != ll_gen:
+                    _trap()
+            workgroup_barrier()
+
         # Prime buffer 0. bid < block_num, so work // block_num is the trip count
         # and its parity picks the buffer -- trip 0 reads what this load writes.
         issue_load(bid, 0, bid <= last_work)
@@ -584,6 +773,21 @@ def _make_combine_fused_reduce(
             # buffer about to be rewritten.
             tdm_ops.tensor_wait(WAIT_N)
             workgroup_barrier()
+            if const_expr(ll128):
+                # A prefetched tile may predate its lines: reload it (the
+                # prefetch of the next one is drained with it) until every
+                # live line carries this step's generation.
+                tries = fx.Int32(0)
+                stale = ll_tile_stale(work, buf)
+                while (stale != fx.Int32(0)) & (tries < fx.Int32(LL_TILE_RETRIES)):
+                    ll_wait_line(work, stale)
+                    issue_load(work, buf, work <= last_work)
+                    tdm_ops.tensor_wait(0)
+                    workgroup_barrier()
+                    stale = ll_tile_stale(work, buf)
+                    tries = tries + fx.Int32(1)
+                if stale != fx.Int32(0):
+                    _trap()
             reduce_tile(buf)
             workgroup_barrier()
             store_tile(work, buf)
@@ -594,12 +798,16 @@ def _make_combine_fused_reduce(
         addr_comb_inp: Int64,
         addr_out: Int64,
         cur_rank_num_token: Int32,
+        addr_topk_ids: Int64,
+        addr_gen: Int64,
         stream=fx.Stream(None),  # noqa: B008
     ):
         ep_combine_fused(
             addr_comb_inp,
             addr_out,
             cur_rank_num_token,
+            addr_topk_ids,
+            addr_gen,
         ).launch(
             grid=(block_num, 1, 1),
             block=[lanes, 1, 1],

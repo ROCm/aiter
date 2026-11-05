@@ -27,6 +27,7 @@ from aiter.ops.flydsl.kernels.mega_moe_gfx1250 import (
     recipe,
     transport,
 )
+from aiter.ops.flydsl.kernels.mega_moe_gfx1250 import ll128 as LL128
 from aiter.ops.flydsl.kernels.mega_moe_gfx1250 import mega_moe as MM
 from aiter.ops.flydsl.kernels.mega_moe_gfx1250.compact_plan import (
     compact_done_nbytes,
@@ -247,6 +248,40 @@ def _config(dispatch, combine, wire, wires, *geometry, rank=0):
         dispatch=dispatch, combine=combine, dispatch_wire=wire, combine_wires=wires
     )
     return MM.MegaMoEConfig(recipe=recipe, geometry=_geometry(*geometry, rank=rank))
+
+
+def test_ll128_layout():
+    # Every column of a row lands on a distinct granule inside its own segment,
+    # clear of the line tags, and the segments tile the row.
+    assert (LL128.SEG_LINES, LL128.SEG_B, LL128.TAG_OFF) == (5, 640, 112)
+    cols = 5120
+    seen = set()
+    for col in range(0, cols, LL128.GRANULE_ELEMS):
+        off = LL128.col_offset(col)
+        seg = col // LL128.SEG_COLS
+        assert seg * LL128.SEG_B <= off < (seg + 1) * LL128.SEG_B
+        assert off % LL128.LINE_B < LL128.TAG_OFF
+        seen.add(off)
+    assert len(seen) == cols // LL128.GRANULE_ELEMS
+    assert LL128.row_bytes(cols) == 20 * 640
+    assert LL128.tag_offset(LL128.SEG_LINES) == LL128.SEG_B + LL128.TAG_OFF
+    assert LL128.fits(5120, 16384) and not LL128.fits(7168, 16384)
+
+
+def test_combine_ll128_and_s2f_gates(monkeypatch):
+    monkeypatch.setenv("AITER_MEGA_COMBINE_LL128", "1")
+    shape = (4, 5120, 8, 16, 8)
+    cfg = _config(D.COMPACT, C.FUSED_SCATTER, "fp4", ("bf16",), *shape)
+    assert cfg.combine_ll128 and not cfg.s2f
+    with pytest.raises(ValueError, match="dispatch=compact"):
+        _config(D.MORI, C.FUSED_SCATTER, "bf16", ("bf16",), *shape)
+    with pytest.raises(ValueError, match="does not fit"):
+        _config(D.COMPACT, C.FUSED_SCATTER, "fp4", ("bf16",), 4, 7168, 8, 16, 8)
+    monkeypatch.setenv("AITER_MEGA_S2F", "1")
+    assert _config(D.COMPACT, C.FUSED_SCATTER, "fp4", ("bf16",), *shape).s2f
+    monkeypatch.setenv("AITER_MEGA_COMBINE_LL128", "0")
+    with pytest.raises(ValueError, match="AITER_MEGA_COMBINE_LL128=1"):
+        _config(D.COMPACT, C.FUSED_SCATTER, "fp4", ("bf16",), *shape)
 
 
 def _cases():

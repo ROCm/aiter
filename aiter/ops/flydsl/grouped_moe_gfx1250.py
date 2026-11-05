@@ -1327,7 +1327,14 @@ def _grouped_a8w4_tdm_moe(
     grouped_out = torch.empty((1, contiguous_m, model_dim), dtype=dtype, device=device)
     w2_u8 = _grouped_weight_uint8(w2)
     w2s_i32 = w2_scale.reshape(-1).view(torch.int32)
-    flydsl_grouped_gemm_a8w4_masked(
+    # Under S2F the compact context swaps in the fused gemm2 + combine reduce
+    # kernel with the same signature.
+    _stage2_gemm2 = getattr(stage2_scatter, "stage2_gemm2", None) if _compact else None
+    # The combine may size gemm2's persistent grid for this step (-1: auto).
+    _pw2 = int(getattr(stage2_scatter, "gemm2_persistent_workers", 0) or 0)
+    if _pw2:
+        persistent_workers2 = _pw2
+    (_stage2_gemm2 or flydsl_grouped_gemm_a8w4_masked)(
         grouped_out,
         a2_payload,
         w2_u8,
