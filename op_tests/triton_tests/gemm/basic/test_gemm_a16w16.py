@@ -177,6 +177,84 @@ def test_gemm_a16_w16_activation(
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-2)
 
 
+def _force_round_before_act(monkeypatch):
+    """Make the wrapper enable ROUND_BEFORE_ACT on any architecture.
+
+    Patch the wrapper's own binding, not arch_info.get_arch, because the second
+    one also feeds the cached config lookup.
+    """
+    import aiter.ops.triton.gemm.basic.gemm_a16w16 as gemm_module
+
+    monkeypatch.setattr(gemm_module, "get_arch", lambda: "gfx1151")
+
+
+# These operands put the accumulator at -98304 or +98304. Both values are
+# outside the fp16 range. The shape must stay in a NUM_KSPLIT == 1 config
+# bucket, or the kernel skips the fused epilogue.
+@pytest.mark.parametrize(
+    "dtype, x_value, expected",
+    [
+        # The first row fails without the lower bound. The other two rows show
+        # where the kernel must not apply a bound.
+        (torch.float16, -6.0, 0.0),
+        (torch.float16, 6.0, float("inf")),
+        (torch.bfloat16, 6.0, 98304.0),
+    ],
+    ids=["fp16_below_min", "fp16_above_max", "bf16_no_bound"],
+)
+@pytest.mark.parametrize("activation", ["gelu", "gelu_tanh", "silu"])
+def test_gemm_a16_w16_activation_round_before_act_bound(
+    monkeypatch, activation, dtype, x_value, expected
+):
+    """The rounding step must give the result that an fp32 epilogue gives.
+
+    A cast below the fp16 lower bound gives -inf, and gelu and silu make a NaN
+    from -inf. An fp32 epilogue stores an infinity above the upper bound, and
+    bf16 has the exponent range of fp32.
+    """
+    _skip_if_triton_on_gfx1250("triton")
+    _force_round_before_act(monkeypatch)
+
+    M, N, K = 64, 64, 4096
+    x = torch.full((M, K), x_value, dtype=dtype, device="cuda")
+    w = torch.full((N, K), 4.0, dtype=dtype, device="cuda")
+
+    out = gemm_a16w16(x, w, dtype=dtype, activation=activation)
+
+    assert not torch.isnan(out).any(), (
+        f"{activation} made {torch.isnan(out).sum().item()} NaN values from an "
+        f"accumulator of {x_value * 4.0 * K:.0f}"
+    )
+    # rtol stays loose enough for a different accumulation order on an MFMA
+    # architecture, and tight enough to see a bound that must not be there.
+    torch.testing.assert_close(
+        out, torch.full_like(out, expected), atol=1e-3, rtol=1e-6, equal_nan=False
+    )
+
+
+@pytest.mark.parametrize("activation", ["gelu", "gelu_tanh", "silu"])
+def test_gemm_a16_w16_activation_fp16_keeps_nan(monkeypatch, activation):
+    """ROUND_BEFORE_ACT must keep a NaN that the inputs put in the accumulator.
+
+    A bound that does not propagate NaN would make a finite value from it and
+    hide the bad input.
+    """
+    _skip_if_triton_on_gfx1250("triton")
+    _force_round_before_act(monkeypatch)
+
+    M, N, K = 64, 64, 512
+    x = torch.full((M, K), 1.0, dtype=torch.float16, device="cuda")
+    w = torch.full((N, K), 1.0, dtype=torch.float16, device="cuda")
+    x[0, 0] = float("nan")
+
+    out = gemm_a16w16(x, w, dtype=torch.float16, activation=activation)
+
+    assert torch.isnan(out[0]).all(), (
+        f"{activation} dropped the NaN of row 0; the rounding step must "
+        f"propagate it"
+    )
+
+
 @pytest.mark.parametrize("M, N, K", get_x_vals())
 @pytest.mark.parametrize("layout", ["TT", "NN", "NT"])
 @pytest.mark.parametrize("backend", ["triton", "gluon"])
