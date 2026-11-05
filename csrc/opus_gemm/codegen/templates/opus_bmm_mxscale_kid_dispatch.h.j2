@@ -1,0 +1,11 @@
+#pragma once
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
+// Auto-generated. Do not edit.
+#define GENERATE_BMM_MXSCALE_KID_DISPATCH_SIZE [[ size ]]
+#define GENERATE_BMM_MXSCALE_KID_DISPATCH(CTYPE) \
+[% for r in dispatch %]    [[ r ]],[% if not loop.last %]  \[% endif %]
+[% endfor %]
+#define GENERATE_BMM_MXSCALE_KID_GROUPS \
+[% for r in groups %]    [[ r ]],[% if not loop.last %]  \[% endif %]
+[% endfor %]

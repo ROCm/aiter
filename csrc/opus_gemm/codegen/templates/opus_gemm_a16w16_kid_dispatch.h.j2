@@ -1,0 +1,17 @@
+#pragma once
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
+//
+// Auto-generated. Do not edit. See gen_instances.py:gen_a16w16_kid_dispatch.
+//
+// Per-arch sorted flat arrays for strict kid dispatch.  Non-workspace tables
+// contain five-argument OpusA16W16Kernel pointers.  Workspace tables contain
+// six-argument OpusA16W16WorkspaceKernel pointers. Never combine them with
+// the five-argument table.
+[% for m in maps %]#define [[ m.macro ]]_SIZE [[ m.rows|length ]]
+[% if m.rows %]#define [[ m.macro ]][% if m.func_like %](CTYPE)[% endif %] \
+[% for r in m.rows %]    [[ r ]],[% if not loop.last %]  \[% endif %]
+[% endfor %]
+[% else %]#define [[ m.macro ]][% if m.func_like %](CTYPE)[% endif %]
+
+[% endif %][% endfor %]
