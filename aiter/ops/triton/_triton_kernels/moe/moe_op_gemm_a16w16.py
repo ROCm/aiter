@@ -111,17 +111,21 @@ def _moe_gemm_a16w16(
         offs_x_m = tl.load(GatherIndx + offs_x_m) // N_EXPTS_ACT
 
     offs_x_k = tl.arange(0, BLOCK_K)
-    XPtrs = X + offs_x_m.to(index_type)[:, None] * stride_x_m + offs_x_k[
-        None, :
-    ].to(index_type) * stride_x_k
+    XPtrs = (
+        X
+        + offs_x_m.to(index_type)[:, None] * stride_x_m
+        + offs_x_k[None, :].to(index_type) * stride_x_k
+    )
 
     offs_w_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_w_n = tl.max_contiguous(tl.multiple_of(offs_w_n % yN, BLOCK_N), BLOCK_N)
     offs_w_k = tl.arange(0, BLOCK_K)
     W += expt_id * stride_w_e
-    WPtrs = W + offs_w_n.to(index_type)[None, :] * stride_w_n + offs_w_k[
-        :, None
-    ].to(index_type) * stride_w_k
+    WPtrs = (
+        W
+        + offs_w_n.to(index_type)[None, :] * stride_w_n
+        + offs_w_k[:, None].to(index_type) * stride_w_k
+    )
     WPtrsUp = (
         W
         + (offs_w_n + yN).to(index_type)[None, :] * stride_w_n
@@ -148,11 +152,16 @@ def _moe_gemm_a16w16(
     if not EVEN_K:
         mask_k = offs_x_k < MASK_K_LIMIT
         x = tl.load(XPtrs, mask=mask_k[None, :], other=0.0)
-        w = tl.load(WPtrs, mask=mask_k[:, None], other=0.0, cache_modifier=W_CACHE_MODIFIER)
+        w = tl.load(
+            WPtrs, mask=mask_k[:, None], other=0.0, cache_modifier=W_CACHE_MODIFIER
+        )
         acc = tl.dot(x, w, acc=acc)
         if APPLY_SEPARATED_SILU:
             w_up = tl.load(
-                WPtrsUp, mask=mask_k[:, None], other=0.0, cache_modifier=W_CACHE_MODIFIER
+                WPtrsUp,
+                mask=mask_k[:, None],
+                other=0.0,
+                cache_modifier=W_CACHE_MODIFIER,
             )
             acc_up = tl.dot(x, w_up, acc=acc_up)
 
@@ -172,8 +181,10 @@ def _moe_gemm_a16w16(
 
     Y += start_m * stride_y_m
     offs_y_m = offs_m
-    YPtrs = Y + offs_y_m.to(index_type)[:, None] * stride_y_m + offs_y_n[
-        None, :
-    ].to(index_type) * stride_y_n
+    YPtrs = (
+        Y
+        + offs_y_m.to(index_type)[:, None] * stride_y_m
+        + offs_y_n[None, :].to(index_type) * stride_y_n
+    )
     mask = mask_m[:, None] & mask_n[None, :]
     tl.store(YPtrs, out, mask=mask)

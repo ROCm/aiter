@@ -6,6 +6,7 @@ import csv
 import os
 import statistics
 from contextlib import contextmanager
+from functools import partial
 from pathlib import Path
 
 import torch
@@ -182,19 +183,19 @@ def main():
         for tokens in _parse_m_values(args):
             hidden, w1, w2, topk_weight, topk_ids = _make_case(tokens)
             policy_selected = _bf16_g1u1_gfx1201_triton_policy_contains_m(tokens)
+            aiter_fn = partial(_aiter_call, hidden, w1, w2, topk_weight, topk_ids)
+            vllm_fn = partial(_vllm_call, hidden, w1, w2, topk_weight, topk_ids)
             with _triton_policy_enabled(True):
                 new_status, new_mean, new_median, new_error = _status_bench(
-                    lambda: _aiter_call(hidden, w1, w2, topk_weight, topk_ids),
+                    aiter_fn,
                     args.warmup,
                     args.iters,
                 )
                 new_out = (
-                    _aiter_call(hidden, w1, w2, topk_weight, topk_ids)
-                if args.check_reference and new_status == "ok"
-                else None
-            )
+                    aiter_fn() if args.check_reference and new_status == "ok" else None
+                )
             vllm_status, vllm_mean, vllm_median, vllm_error = _status_bench(
-                lambda: _vllm_call(hidden, w1, w2, topk_weight, topk_ids),
+                vllm_fn,
                 args.warmup,
                 args.iters,
             )
@@ -203,7 +204,7 @@ def main():
             else:
                 with _triton_policy_enabled(False):
                     orig_status, orig_mean, orig_median, orig_error = _status_bench(
-                        lambda: _aiter_call(hidden, w1, w2, topk_weight, topk_ids),
+                        aiter_fn,
                         args.warmup,
                         args.iters,
                     )

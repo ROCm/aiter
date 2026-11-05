@@ -1389,7 +1389,14 @@ def _bf16_g1u1_gfx1201_triton_disabled() -> bool:
     return os.environ.get(_BF16_G1U1_GFX1201_TRITON_DISABLE_ENV, "0") == "1"
 
 
-def _bf16_g1u1_gfx1201_triton_policy_contains_m(policy: dict, tokens: int) -> bool:
+def _bf16_g1u1_gfx1201_triton_policy_contains_m(
+    tokens: int, policy: dict | None = None
+) -> bool:
+    if policy is None:
+        try:
+            policy = _get_bf16_g1u1_gfx1201_triton_policy()
+        except (AssertionError, KeyError, OSError, RuntimeError, TypeError, ValueError):
+            return False
     for start, end in policy.get("m_ranges", ()):
         if int(start) <= tokens <= int(end):
             return True
@@ -1427,16 +1434,20 @@ def _can_use_bf16_g1u1_gfx1201_triton_large_m(
     gate_mode: str | GateMode | None = GateMode.SEPARATED.value,
     stage2_scatter: Stage2ScatterContext | None = None,
 ) -> bool:
+    if topk_ids.ndim != 2 or topk_weight.shape != topk_ids.shape:
+        return False
     tokens = topk_ids.shape[0]
-    policy = _get_bf16_g1u1_gfx1201_triton_policy()
     try:
+        policy = _get_bf16_g1u1_gfx1201_triton_policy()
         policy_arch = policy["arch"]
         policy_cu_num = int(policy["cu_num"])
         policy_model_dim = int(policy["model_dim"])
         policy_inter_dim = int(policy["inter_dim"])
         policy_num_experts = int(policy["num_experts"])
         policy_topk = int(policy["topk"])
-    except (KeyError, TypeError, ValueError):
+        runtime_arch = get_gfx_runtime()
+        runtime_cu_num = get_cu_num()
+    except (AssertionError, KeyError, OSError, RuntimeError, TypeError, ValueError):
         return False
     return (
         not _bf16_g1u1_gfx1201_triton_disabled()
@@ -1446,9 +1457,9 @@ def _can_use_bf16_g1u1_gfx1201_triton_large_m(
         and policy.get("quant_type") == "none"
         and policy.get("activation") == "silu"
         and policy.get("gate_mode") == GateMode.SEPARATED.value
-        and get_gfx_runtime() == policy_arch
-        and get_cu_num() == policy_cu_num
-        and _bf16_g1u1_gfx1201_triton_policy_contains_m(policy, tokens)
+        and runtime_arch == policy_arch
+        and runtime_cu_num == policy_cu_num
+        and _bf16_g1u1_gfx1201_triton_policy_contains_m(tokens, policy)
         and hidden_states.is_cuda
         and w1.is_cuda
         and w2.is_cuda

@@ -200,6 +200,14 @@ def test_large_m_gate_rejects_unsupported_modes(monkeypatch):
     assert not _large_m_gate(**case)
     monkeypatch.setattr(fused_moe_mod, "get_cu_num", lambda: 64)
 
+    monkeypatch.setattr(
+        fused_moe_mod,
+        "get_cu_num",
+        lambda: (_ for _ in ()).throw(AssertionError("mixed CUs")),
+    )
+    assert not _large_m_gate(**case)
+    monkeypatch.setattr(fused_moe_mod, "get_cu_num", lambda: 64)
+
     assert not _large_m_gate(**{**case, "quant_type": aiter.QuantType.per_Token})
     assert not _large_m_gate(**{**case, "is_g1u1": False})
     assert not _large_m_gate(**{**case, "expert_mask": torch.ones(256, device="cuda")})

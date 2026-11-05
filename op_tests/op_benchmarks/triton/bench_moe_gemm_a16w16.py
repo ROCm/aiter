@@ -2,6 +2,7 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
 from argparse import ArgumentParser, ArgumentTypeError
+from functools import partial
 
 import torch
 import triton
@@ -64,7 +65,7 @@ def benchmark(args):
     print(f"tokens,{metric_name}", flush=True)
     for tokens in args.tokens:
         hidden, w1, w2, topk_weight, topk_ids = _make_case(tokens, device)
-        fn = lambda: fused_moe_bf16_g1u1(hidden, w1, w2, topk_weight, topk_ids)
+        fn = partial(fused_moe_bf16_g1u1, hidden, w1, w2, topk_weight, topk_ids)
         ms = triton.testing.do_bench(fn, warmup=args.warmup, rep=args.rep)
         if args.metric == "time":
             value = ms

@@ -10,9 +10,7 @@ _topk_hist_repr = make_kernel_repr("moe_topk_align_hist", ["BLOCK"])
 _topk_prefix_repr = make_kernel_repr(
     "moe_topk_align_prefix", ["BLOCK_M", "NUM_EXPERTS"]
 )
-_topk_scatter_repr = make_kernel_repr(
-    "moe_topk_align_scatter", ["BLOCK_M", "BLOCK"]
-)
+_topk_scatter_repr = make_kernel_repr("moe_topk_align_scatter", ["BLOCK_M", "BLOCK"])
 
 
 @triton.jit(repr=_topk_hist_repr)
@@ -61,25 +59,6 @@ def _topk_prefix_kernel(
 
     block_offs = tl.arange(0, BLOCK_B)
     tl.store(BlockPidMap + block_offs, -1, mask=block_offs < MAX_BLOCKS)
-
-
-@triton.jit
-def _topk_blockmap_kernel(
-    TileOffsets,
-    BlockPidMap,
-    NUM_EXPERTS: tl.constexpr,
-    MAX_BLOCKS: tl.constexpr,
-    BLOCK_T: tl.constexpr,
-):
-    expert = tl.program_id(0)
-    offs = tl.arange(0, BLOCK_T)
-    tile_start = tl.load(TileOffsets + expert)
-    tile_end = tl.load(TileOffsets + expert + 1)
-    tile = tile_start + offs
-    mask = (expert < NUM_EXPERTS) & (tile < tile_end) & (tile < MAX_BLOCKS)
-    block_id = offs.to(tl.int32)
-    value = (block_id << 16) | expert
-    tl.store(BlockPidMap + tile, value, mask=mask)
 
 
 @triton.jit(repr=_topk_scatter_repr)
