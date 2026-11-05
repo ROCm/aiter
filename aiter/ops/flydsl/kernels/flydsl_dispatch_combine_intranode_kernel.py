@@ -151,13 +151,22 @@ def make_dispatch_kernel(
                 vec_width=1,
                 dtype=T.i32,
             )
-            dest_pe = dest_expert // experts_per_rank
+            # A negative or out-of-range expert id (padding / masked slot) is
+            # not dispatched and does not count as an earlier slot's rank (as
+            # mori): it takes the duplicate drop path below.
+            vld = (dest_expert >= 0).select(
+                dest_expert < npes * experts_per_rank, dest_expert >= 0
+            )
+            lane_vld = (lane_expert >= 0).select(
+                lane_expert < npes * experts_per_rank, lane_expert >= 0
+            )
+            dest_pe = vld.select(dest_expert // experts_per_rank, 0)
             lane_dest_pe = lane_expert // experts_per_rank
             # Drop lanes whose destPE duplicates an earlier k_slot (sentinel 64).
-            dup_per_lane = (lane_dest_pe == dest_pe).select(
+            dup_per_lane = lane_vld.select(lane_dest_pe == dest_pe, lane_vld).select(
                 (lane < k_slot).select(lane, 64), 64
             )
-            dup_ballot = ballot(T.i64, dup_per_lane < 64)
+            dup_ballot = vld.select(ballot(T.i64, dup_per_lane < 64), fx.Int64(1))
             is_dup = dup_ballot != 0
 
             dest_tok_lane0 = fx.Int32(0)
