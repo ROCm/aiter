@@ -1076,3 +1076,26 @@ def test_status_survives_a_provider_that_stops_answering(monkeypatch):
         assert "backend went away" in entry["op_versions"]
     finally:
         Rotting.broken = False
+
+
+def test_resetting_for_tests_keeps_the_ops_routed_by_importing_aiter(monkeypatch):
+    """Those belong to the process, not to whichever test ran first."""
+
+    monkeypatch.setattr(plugin, "_imported_routes", None)
+    production = plugin._RoutedOp(
+        plugin.Op("production.op", 1),
+        inspect.signature(lambda x: x),
+        lambda *a, **k: ((), {}),
+        {},
+    )
+    plugin._routed_ops["production.op"] = production
+
+    plugin._reset_for_testing()  # first call captures the import-time set
+    assert "production.op" in plugin._routed_ops
+
+    _route_add([])
+    assert "test.add" in plugin._routed_ops
+
+    plugin._reset_for_testing()
+    assert "production.op" in plugin._routed_ops, "import-time routes survive"
+    assert "test.add" not in plugin._routed_ops, "test routes do not"
