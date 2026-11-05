@@ -13,5 +13,5 @@ Q/SWA use FP8 with E8M0 scales, CSA uses NVFP4 with E4M3 scales, and output is B
 - Grid `(S,N,1)`, block `(128,1,1)`; S>1 uses cluster `(S,1,1)` and fused reduction.
   The API allocates FP32 workspaces `[N,S,65,512]` and `[N,S,64]` for S>1.
 - Code object `fused_mla_a8w4_qh64_1tg_16mx4_64nx1_sparse_np_v41.co`.
-- Symbol `mla_v41_fused_cs_v1`; 120-byte arguments, 327680-byte static LDS.
-- CO SHA256: `d601c98168d65a92187efc739a3ba4a21b054da986163e4ddffc7b67168d79ca`.
+- Symbol `fused_mla_a8w4_qh64_1tg_16mx4_64nx1_sparse_np_v41`; 120-byte arguments, 327680-byte static LDS.
+- CO SHA256: `225d56f343ec7d4cf2434983640afbdb6f0d28689d0a3d445e704e62ba0474fe`.
