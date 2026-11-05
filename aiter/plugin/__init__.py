@@ -90,7 +90,11 @@ class KernelProvider(Protocol):
     """
 
     name: str
-    op_versions: Mapping[str, Collection[int]]
+    # Either a mapping of op name to the contract versions served, or just the
+    # op names, which means whichever version is current. Most providers have
+    # nothing to say about versions and should not have to say it; the ones that
+    # span a contract change say so explicitly.
+    op_versions: Mapping[str, Collection[int]] | Collection[str]
 
     # Declare ``api_versions`` -- every provider API version this provider
     # supports -- so one wheel can cover several AITER releases. ``api_version``
@@ -216,6 +220,11 @@ _decision_counts: Counter[tuple[str, str, str, str | None]] = Counter()
 _decision_callbacks: list[Callable[[Decision], None]] = []
 _silenced_callbacks: set[int] = set()
 _warned: set[tuple[Any, ...]] = set()
+# (id(run), op name) -> the run itself when it takes the contract, False when
+# it does not. Holding the callable keeps its id from being reused by another
+# object after a collection. See _accepts_contract.
+_checked_runs: dict[tuple[int, str], Any] = {}
+_PROBE = object()
 _callback_errors = 0
 _route_log: dict[str, tuple[int, tuple[str, str | None, str | None]]] = {}
 _skipped_providers: tuple[_SkippedProvider, ...] = ()
@@ -331,10 +340,14 @@ def _config() -> _Config:
 def route(
     *,
     op: str,
-    version: int,
+    version: int = 1,
     supersedes: Mapping[int, str] = MappingProxyType({}),
 ) -> Callable[[Callable[_P, _R]], Callable[_P, _R]]:
     """Route an AITER op through a compatible provider before its native path.
+
+    ``version`` defaults to 1 and is worth writing only once it has moved: an
+    op whose contract has never changed says nothing about versions, and the
+    number appears exactly where it carries information.
 
     ``supersedes`` maps an older ``op_version`` still accepted for this contract
     to the release that stops accepting it. AITER owns the contract, so only
@@ -680,6 +693,40 @@ def _explained(
     )
 
 
+def _accepts_contract(run: Callable[..., Any], routed: _RoutedOp) -> bool:
+    """Whether ``run`` can take the shape dispatch is about to hand it.
+
+    A declared op version says a provider believes it implements this contract.
+    This checks it, which is the cheaper half of the same guarantee: a provider
+    built against an older shape is caught here even if it declared the current
+    version, or declared no version at all.
+
+    It catches shape, not meaning. A contract whose parameters are unchanged but
+    whose semantics moved is exactly what the version number is for, and nothing
+    here can see it.
+
+    Checked once per callable and remembered, so the hot path pays a dict
+    lookup. A ``*args, **kwargs`` forwarder binds anything and passes, which is
+    correct: it genuinely accepts the call.
+    """
+
+    positional, keyword_only = [], []
+    for parameter in routed.contract.parameters.values():
+        if parameter.kind is parameter.KEYWORD_ONLY:
+            keyword_only.append(parameter.name)
+        elif parameter.kind not in (parameter.VAR_POSITIONAL, parameter.VAR_KEYWORD):
+            positional.append(parameter.name)
+    try:
+        signature(run).bind(
+            *([_PROBE] * len(positional)), **{n: _PROBE for n in keyword_only}
+        )
+        return True
+    except TypeError:
+        return False
+    except Exception:  # noqa: BLE001 - a builtin has no signature to read
+        return True  # cannot be checked is not the same as wrong
+
+
 def _ask_provider(
     record: _ProviderRecord,
     op: Op,
@@ -711,6 +758,26 @@ def _ask_provider(
             getattr(candidate, "provider", type(candidate).__name__),
         )
         return None, "invalid-candidate"
+
+    # Checked once per (run, op) and remembered; the hot path is one lookup.
+    run = candidate.run
+    key = (id(run), op.name)
+    checked = _checked_runs.get(key)
+    if checked is None:
+        routed = _routed_ops.get(op.name)
+        checked = run if routed is None or _accepts_contract(run, routed) else False
+        _checked_runs[key] = checked
+    if checked is False:
+        # Handing it the call anyway is the failure worth preventing: the
+        # argument counts can line up by accident and an input is written as
+        # though it were an output, silently.
+        logger.warning(
+            "Provider %s offered %s for %s, which does not take this contract",
+            record.name,
+            candidate.kernel_id,
+            op.name,
+        )
+        return None, "contract-mismatch"
     return candidate, None
 
 
@@ -930,7 +997,13 @@ def _matched_version(
     """
 
     try:
-        declared = frozenset(record.provider.op_versions.get(op.name, ()))
+        served = record.provider.op_versions
+        if isinstance(served, Mapping):
+            declared = frozenset(served.get(op.name, ()))
+        elif op.name in served:
+            declared = frozenset({op.version})  # named without a version
+        else:
+            return None
     except Exception as error:  # noqa: BLE001 - providers are an isolation boundary
         logger.warning("Provider %s has invalid op_versions: %s", record.name, error)
         return None
@@ -1114,6 +1187,7 @@ def _reset_for_testing() -> None:
     _decision_callbacks.clear()
     _silenced_callbacks.clear()
     _warned.clear()
+    _checked_runs.clear()
     _route_log.clear()
     _callback_errors = 0
     with _provider_lock:
