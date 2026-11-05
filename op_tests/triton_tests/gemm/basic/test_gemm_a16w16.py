@@ -357,10 +357,14 @@ _GPTOSS_SHAPES = [
     (128, 2880),  # router
     (2560, 2880),  # TP2 QKV
     (2880, 2048),  # TP2 O
+    (201088, 2880),  # LM head, TP1
+    (100544, 2880),  # LM head, TP2 (partial last N tile)
 ]
 
 
-@pytest.mark.parametrize("N, K", _GPTOSS_SHAPES)
+@pytest.mark.parametrize(
+    "N, K", _GPTOSS_SHAPES[:5]
+)  # the LM heads are tuned for decode M only
 def test_gemm_a16w16_gfx1250_gptoss_96cu_lookup(N, K, monkeypatch):
     """Read configs/gfx1250/96cu. The arch is pinned because this only reads
     JSON: on an MI35X runner get_arch() is gfx950 and the gluon default there

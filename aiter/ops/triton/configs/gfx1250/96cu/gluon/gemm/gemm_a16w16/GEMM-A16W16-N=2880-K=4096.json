@@ -20,29 +20,29 @@
     "M_LEQ_1": {
         "BLOCK_M": 16,
         "BLOCK_N": 16,
-        "BLOCK_K": 512,
+        "BLOCK_K": 256,
         "NUM_BUFFERS": 6,
-        "num_warps": 2,
+        "num_warps": 1,
         "kernel_type": "bandwidth_bound",
         "waves_per_eu": 1
     },
     "M_LEQ_4": {
         "BLOCK_M": 16,
         "BLOCK_N": 16,
-        "BLOCK_K": 512,
-        "NUM_BUFFERS": 5,
-        "num_warps": 2,
+        "BLOCK_K": 256,
+        "NUM_BUFFERS": 6,
+        "num_warps": 1,
         "kernel_type": "bandwidth_bound",
         "waves_per_eu": 1
     },
     "M_LEQ_8": {
         "BLOCK_M": 16,
         "BLOCK_N": 16,
-        "BLOCK_K": 512,
-        "NUM_BUFFERS": 5,
-        "num_warps": 2,
+        "BLOCK_K": 256,
+        "NUM_BUFFERS": 6,
+        "num_warps": 1,
         "kernel_type": "bandwidth_bound",
-        "waves_per_eu": 1
+        "waves_per_eu": 2
     },
     "M_LEQ_16": {
         "BLOCK_M": 16,
@@ -54,31 +54,33 @@
         "waves_per_eu": 1
     },
     "M_LEQ_32": {
-        "BLOCK_M": 16,
+        "BLOCK_M": 32,
         "BLOCK_N": 32,
-        "BLOCK_K": 256,
-        "NUM_BUFFERS": 8,
-        "num_warps": 2,
+        "BLOCK_K": 512,
+        "NUM_BUFFERS": 4,
+        "num_warps": 4,
         "kernel_type": "compute_bound",
-        "waves_per_eu": 1
+        "waves_per_eu": 0,
+        "REGISTER_STORE": 2
     },
     "M_LEQ_64": {
-        "BLOCK_M": 32,
+        "BLOCK_M": 64,
         "BLOCK_N": 32,
         "BLOCK_K": 256,
-        "NUM_BUFFERS": 7,
+        "NUM_BUFFERS": 4,
         "num_warps": 4,
-        "kernel_type": "compute_bound",
-        "waves_per_eu": 6
+        "kernel_type": "bandwidth_bound",
+        "waves_per_eu": 2
     },
     "M_LEQ_128": {
-        "BLOCK_M": 32,
+        "BLOCK_M": 64,
         "BLOCK_N": 64,
         "BLOCK_K": 256,
-        "NUM_BUFFERS": 5,
+        "NUM_BUFFERS": 4,
         "num_warps": 4,
         "kernel_type": "compute_bound",
-        "waves_per_eu": 0
+        "waves_per_eu": 0,
+        "REGISTER_STORE": 2
     },
     "M_LEQ_256": {
         "BLOCK_M": 64,
