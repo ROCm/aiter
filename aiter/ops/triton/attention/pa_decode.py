@@ -5,6 +5,7 @@ import math
 
 import torch
 import triton
+import triton.language as tl
 
 from aiter.ops.triton._triton_kernels.attention.pa_decode import (
     _get_dispatch_config,
@@ -39,6 +40,7 @@ _LOGGER = AiterTritonLogger()
 _SEQ_PARTITION_SIZE = 1024  # HIP
 
 _KV_DTYPE_NAMES = {torch.bfloat16: "bf16", torch.float16: "fp16"}
+_TDM_COMPUTE_TYPES = {torch.bfloat16: tl.bfloat16, torch.float16: tl.float16}
 
 _TDM_HEAD_SIZES = (56, 64, 128)
 _TDM_PAGE_SIZE = 128
@@ -142,13 +144,18 @@ def _use_gqa_tdm(
     value_cache: torch.Tensor,
     output: torch.Tensor,
     alibi_slopes: torch.Tensor | None,
+    compute_type,
 ) -> bool:
-    """True when the config enables the gfx1250 TDM kernel and it supports this call."""
+    """True when the config enables the gfx1250 TDM kernel and it supports this call.
+
+    The TDM kernel computes in the KV dtype, so `compute_type` must be that dtype or None.
+    """
     return (
         dispatch is not None
         and dispatch.get("tdm_num_warps") is not None
         and _pa_decode_gqa_tdm_kernel is not None
         and alibi_slopes is None
+        and compute_type in (None, _TDM_COMPUTE_TYPES.get(query.dtype))
         and _gqa_tdm_supported(query, key_cache, value_cache, output)
     )
 
@@ -211,7 +218,9 @@ def paged_attention_decode(
     dispatch = None
     if k_scale.numel() == 1 and key_cache.dtype in _KV_DTYPE_NAMES:
         dispatch = _get_dispatch_config(_KV_DTYPE_NAMES[key_cache.dtype])
-    if _use_gqa_tdm(dispatch, query, key_cache, value_cache, output, alibi_slopes):
+    if _use_gqa_tdm(
+        dispatch, query, key_cache, value_cache, output, alibi_slopes, compute_type
+    ):
         k_scale_val = k_scale.item()
         v_scale_val = v_scale.item()
         # The TDM kernel does not rescale K or V.

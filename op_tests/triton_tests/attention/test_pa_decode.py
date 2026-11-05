@@ -854,6 +854,7 @@ def _tdm_dispatch_calls(
     kv=8,
     seqs=2,
     max_seq_len=1024,
+    compute_type=None,
 ):
     calls = []
     monkeypatch.setattr(pa_decode_mod, "_get_dispatch_config", lambda dtype: rule)
@@ -879,7 +880,7 @@ def _tdm_dispatch_calls(
         block_tables=None,
         attn_scale=1.0,
         max_seq_len=max_seq_len,
-        compute_type=None,
+        compute_type=compute_type,
         k_scale=torch.tensor([scale]),
         v_scale=torch.tensor([1.0]),
         alibi_slopes=alibi,
@@ -909,8 +910,9 @@ def test_dispatch_uses_tdm_when_enabled(monkeypatch):
         ({}, {"scale": 2.0}),
         ({}, {"alibi": torch.ones(32)}),
         ({}, {"head": 80}),
+        ({}, {"compute_type": tl.float32}),
     ],
-    ids=["disabled", "k_scale", "alibi", "head_size"],
+    ids=["disabled", "k_scale", "alibi", "head_size", "compute_type"],
 )
 def test_dispatch_skips_tdm_when_unsupported(rule_change, kwargs, monkeypatch):
     names, _ = _tdm_dispatch_calls(monkeypatch, {**_TDM_RULE, **rule_change}, **kwargs)

@@ -280,6 +280,8 @@ an arch that runs the GQA decode kernel needs the `v1_w_dot` entry.
   not add a key that `DEFAULT.json` does not have. The loader merges such a key
   anyway, and only the test rejects it.
 - Do not set `num_stages` to 3 or more on gfx1250. It can hang the GPU.
+- Keep `num_stages` at 1 in the gfx1250 PA decode `launch` table. A value of 2
+  gave a GPU memory fault in the page-16 GQA kernels on a 96-CU (DPX) part.
 
 ## Autotune
 
