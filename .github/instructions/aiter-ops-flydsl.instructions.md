@@ -68,8 +68,8 @@ These found real bugs in the same period:
   (not CPU), has the expected `stride(-1)`/`stride(0)`, alignment and length,
   and i32 offset products are widened before they can reach 2^31 bytes.
 - A cache of compiled FlyDSL handles (`_run_compiled`, `FastJitLauncher`) keys
-  everything that is not a runtime value: device, tensor rank and unit-stride
-  axis, constexprs and mode globals. A handle reused across devices fails to
+  everything that is not a runtime value: device, each tensor's dtype, rank and
+  unit-stride axis, constexprs and mode globals. A handle reused across devices fails to
   launch, and the error is only printed.
 - New tests are collected by CI (top-level `op_tests/test_*.py`, run as
   `python3 <file>`).

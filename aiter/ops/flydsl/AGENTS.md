@@ -24,7 +24,8 @@ version below.
   calls, its fast path does not fill in defaulted arguments, and a launch
   failure is printed, not raised. Any cache of handles (`_run_compiled`'s
   `specialization_key`, `FastJitLauncher`) must therefore key the device, each
-  tensor's rank and unit-stride axis, constexprs and mode globals. Verified on
+  tensor's dtype, rank and unit-stride axis, constexprs and mode globals (as
+  `kernels/topk/topk_launch.py:_launch_key` does for tensors). Verified on
   FlyDSL 0.4.0 and 0.4.1, MI355X: a handle reused on a view without the
   unit-stride axis it was compiled for writes outside the view, and one reused on
   another device does not launch.

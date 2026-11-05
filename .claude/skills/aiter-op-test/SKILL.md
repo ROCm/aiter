@@ -102,6 +102,8 @@ def test_op(b, m, n, k, dtype, layout):
         out, us = run_perftest(fn)
         err = checkAllclose(ref.to(dtypes.fp32), out.to(dtypes.fp32),
                             rtol=1e-2, atol=1e-2, msg=f"{name}: <op>")
+        # checkAllclose logs and returns the mismatch fraction; it does not raise.
+        assert err == 0, f"{name}: {err:.2%} of elements outside rtol/atol"
         ret[f"{name} us"] = us
         ret[f"{name} TFLOPS"] = flops / us / 1e6
         ret[f"{name} TB/s"] = nbytes / us / 1e6
@@ -286,13 +288,20 @@ reverted, or if the kernel read the wrong row, scale or stride?
   row, the 2^31-byte offset, a non-power-of-two tile count).
 - **Grade against an independent reference.** Compare with the fp32 torch
   reference, not with another aiter kernel or the kernel itself. Use a per-row
-  or per-element error with a tolerance justified by the dtype, not a cosine or
-  a batch-wide maximum that one corrupted row cannot move.
-- **Use the wrapper's own output allocation.** A test that pre-zeroes the output
-  passes even when the wrapper allocates with `torch.empty` and leaves rows
-  unwritten.
-- **Act on the comparison.** `checkAllclose` logs and returns a result; check it
-  so a mismatch fails the run.
+  or per-element error with a tolerance justified by the dtype. Avoid measures
+  that one corrupted row barely moves: a cosine similarity, a mean error, a
+  mismatch fraction under a loose `tol_err_ratio`, or a tolerance scaled by the
+  batch-wide maximum (an 8% tolerance on the global maximum could hide a zeroed
+  KV page, #4676). A maximum of per-element errors is fine.
+- **Expose unwritten output.** When the wrapper allocates the output, use that
+  allocation; a test that pre-zeroes its own buffer passes even when the wrapper
+  allocates with `torch.empty` and leaves rows unwritten. When the model passes a
+  preallocated buffer (see "Faithful to the real model call"), pass one with the
+  real layout filled with a sentinel such as NaN, not zeros, so unwritten
+  elements fail the comparison.
+- **Act on the comparison.** `checkAllclose` logs and returns the mismatch
+  fraction and does not raise; assert on it, as the template does, so a
+  mismatch fails the run.
 - **Inject configs.** A dispatch test passes a small config or monkeypatched
   lookup instead of depending on the contents of production tuned CSVs, which
   change under it.
