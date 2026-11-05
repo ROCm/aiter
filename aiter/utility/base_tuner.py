@@ -17,6 +17,7 @@ import torch
 from aiter import dtypes, logger
 from aiter.jit.utils.chip_info import get_gfx_runtime as _chip_get_gfx
 from aiter.jit.utils.chip_info import gfx_from_cu_num
+from aiter.utility.selection_policy import LATENCY, make_policy, use_policy
 
 INVALID_TIME = -1
 
@@ -74,6 +75,15 @@ class TunerCommon:
         torch.float8_e4m3fnuz: 1,
         torch.float8_e4m3fn: 1,
     }
+    # Opt in per tuner. A tuner that only ranks by latency must not stamp
+    # select=power, including ones whose post-pass keeps a kernel for its speed.
+    SUPPORTS_POWER_SELECT = False
+    # Every latency-or-power decision goes through this. ``--select`` sets it.
+    policy = LATENCY
+    # Columns that count as a real package-power measurement. MoE's tuned row
+    # uses ``watts`` (the stage-energy mean); stage columns stay on the profile.
+    POWER_WATT_COLUMNS = ("watts",)
+
     INVALID_TIME = -1  # op not support or error
 
     INF_TIME = float("inf")  # op time is too large
@@ -230,7 +240,7 @@ class TunerCommon:
             "--compare",
             action="store_true",
             required=False,
-            help="Run production-op benchmark before and after tuning, print compare results, and keep a compare candidate CSV.",
+            help="Run production-op benchmark before and after tuning, print compare results, and keep a compare candidate CSV. The report compares latency (e2e us) only.",
         )
         self.parser.add_argument(
             "--update_improved",
@@ -245,11 +255,207 @@ class TunerCommon:
             default=defaults.get("min_improvement_pct", 3.0),
             help="With --compare --update_improved, update tuned CSV only when a valid pre/post benchmark shows at least this percent improvement. Shapes with no valid pre-run baseline but passing post-run are still allowed to update.",
         )
+        self.parser.add_argument(
+            "--select",
+            default="latency",
+            help="How to pick the winner among kernels that pass errRatio. "
+            "'latency' (default) keeps the lowest us. "
+            "'power' (experimental; aliases: efficiency, power_efficiency) "
+            "ranks by package energy (us * PPT watts), measured from the GPU PPT "
+            "sysfs node (power1_input) over AITER_POWER_WINDOW_S seconds "
+            "(default 0.4) while the kernel launches back to back, on the "
+            "accurate pass only. It adds no latency "
+            "bound, and the score is an isolated replay under the clock and "
+            "power cap in effect, so the winner can change in another model "
+            "or power-management state. AITER_SELECT does not set this; it "
+            "only picks the tables dispatch loads at runtime. "
+            "PPT is the whole package, so the GPU should otherwise be idle. "
+            "Use --shape_grouped so every candidate for a shape is measured "
+            "on the same GPU. AITER_POWER_PATH overrides the hwmon file; "
+            "with more than one process it must contain {device}. "
+            "Each power row records select, perf_level, power_cap_w, and "
+            "sclk_max_mhz. When -o is a shipped table under aiter/configs/, "
+            "a power tune writes to aiter/configs/power_configs/ instead. "
+            "The fused-MoE tuner writes every surviving pair, ranked, to "
+            "--profile_file (-o2). In power mode that file is "
+            "<tune_file>.ranked.csv when -o2 is omitted.",
+        )
+
+    def _apply_select(self, args):
+        from aiter.utility.tune_result import normalize_select
+
+        select = normalize_select(getattr(args, "select", None))
+        if select not in ("latency", "power"):
+            self.parser.error(
+                f"unknown --select {getattr(args, 'select', None)!r}; use latency or power"
+            )
+        args.select = select
+        self.policy = make_policy(select)
+        if select == "power":
+            if not self.SUPPORTS_POWER_SELECT:
+                self.parser.error(
+                    f"--select power is not supported by {type(self).__name__}"
+                )
+            if getattr(args, "compare", False) and getattr(
+                args, "update_improved", False
+            ):
+                self.parser.error(
+                    "--compare --update_improved gates on latency only and "
+                    "cannot be combined with --select power"
+                )
+            self._redirect_power_output(args)
+        return select
+
+    def policy_for(self, args):
+        """The selection policy for this call; ``args.select`` wins when present."""
+        select = getattr(args, "select", None)
+        return self.policy if select is None else make_policy(select)
+
+    def _redirect_power_output(self, args):
+        """Send a power tune of a shipped table to aiter/configs/power_configs/.
+
+        Writing power rows into a shipped latency table would make the
+        model_configs/ shape merge rank one against the other. Any ``-o``
+        under ``aiter/configs/``, including an explicit ``model_configs/``
+        path, is redirected. A path outside that tree is left alone.
+        """
+        from aiter.jit.core import AITER_ROOT_DIR
+        from aiter.utility.tune_result import POWER_CONFIG_DIRNAME
+
+        tune_file = getattr(args, "tune_file", None)
+        if not tune_file:
+            return
+        first = os.path.abspath(self.get_out_file(tune_file))
+        configs_dir = os.path.abspath(os.path.join(AITER_ROOT_DIR, "aiter", "configs"))
+        power_dir = os.path.join(configs_dir, POWER_CONFIG_DIRNAME)
+        try:
+            shipped = os.path.commonpath([first, configs_dir]) == configs_dir
+        except ValueError:
+            shipped = False
+        if not shipped or os.path.dirname(first) == power_dir:
+            return
+        os.makedirs(power_dir, exist_ok=True)
+        args.tune_file = os.path.join(power_dir, os.path.basename(first))
+        logger.info(
+            f"select=power: writing to {args.tune_file} instead of the shipped "
+            f"table {first}. Load it with AITER_SELECT=power or the op's "
+            "AITER_CONFIG_* variable."
+        )
+
+    def power_metrics(self, df):
+        """Add ``tflops_per_w`` when both inputs exist and the column is absent.
+
+        MoE writes the column from stage energy (``us1*watts1 + us2*watts2``)
+        before this runs. Recomputing ``tflops / watts`` there would replace
+        that pair formula, so an existing column is kept.
+        """
+        if (
+            not isinstance(df, pd.DataFrame)
+            or df.empty
+            or "tflops_per_w" in df.columns
+            or not {"tflops", "watts"} <= set(df.columns)
+        ):
+            return df
+        import math
+
+        def positive(value) -> float | None:
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                return None
+            if math.isfinite(number) and number > 0:
+                return number
+            return None
+
+        df = df.copy()
+        tflops = pd.to_numeric(df["tflops"], errors="coerce")
+        watts = pd.to_numeric(df["watts"], errors="coerce")
+        per_w = []
+        for tflops_f, watts_f in zip(tflops, watts):
+            tflops_n = positive(tflops_f)
+            watts_n = positive(watts_f)
+            if tflops_n is None or watts_n is None:
+                per_w.append(float("nan"))
+            else:
+                per_w.append(round(tflops_n / watts_n, 6))
+        df["tflops_per_w"] = per_w
+        return df
+
+    def _rows_with_finite_watts(self, df):
+        import math
+
+        def finite_positive(value) -> bool:
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                return False
+            return math.isfinite(number) and number > 0
+
+        measured = pd.Series(False, index=df.index)
+        for column in self.POWER_WATT_COLUMNS:
+            if column not in df.columns:
+                continue
+            values = pd.to_numeric(df[column], errors="coerce")
+            measured = measured | values.map(finite_positive)
+        return measured
+
+    def _stamp_power_rows(self, results, args):
+        """Keep only rows whose power was measured and record their conditions.
+
+        A shape whose watts are missing was ranked by latency. Writing it to
+        ``power_configs/`` would let that latency pick override the shipped
+        row under ``AITER_SELECT=power``, so it is dropped and stays untuned
+        for the next power tune.
+        """
+        from aiter.utility.tune_result import POWER_ROW_COLUMNS, SELECT_COLUMN
+
+        if (
+            not isinstance(results, pd.DataFrame)
+            or not self.policy_for(args).measures_power
+        ):
+            return results
+        results = self.power_metrics(results)
+        measured = self._rows_with_finite_watts(results)
+        if not bool(measured.all()):
+            keys = [k for k in self.keys if k in results.columns]
+            skipped = results.loc[~measured, keys].to_dict("records")
+            logger.warning(
+                f"select=power: no finite package watts for {len(skipped)} "
+                f"shape(s); not writing them, so they stay untuned: {skipped}"
+            )
+            results = results[measured]
+        if results.empty:
+            return results
+        conditions = getattr(self, "_power_conditions", None)
+        if conditions is None:
+            from aiter.utility.package_power import tune_conditions
+
+            gpu_num = torch.cuda.device_count()
+            mp_num = int(getattr(args, "mp", gpu_num) or gpu_num)
+            if mp_num < 1 or mp_num > gpu_num:
+                mp_num = gpu_num
+            conditions = tune_conditions(range(mp_num))
+            self._power_conditions = conditions
+            logger.info(f"select=power: tune conditions {conditions}")
+        results = results.copy()
+        results[SELECT_COLUMN] = "power"
+        for name, value in conditions.items():
+            results[name] = value
+        # watts / tflops_per_w are power-tune columns. They stay off the
+        # latency CSV schema, which is the column list a latency tune writes.
+        power_columns = ("watts", "tflops_per_w") + POWER_ROW_COLUMNS
+        missing = [
+            c for c in power_columns if c in results.columns and c not in self.columns
+        ]
+        if missing:
+            self.columns = list(self.columns) + missing
+        return results
 
     def parse_args(self):
         args = self.parser.parse_args()
         if args.update_improved and not args.compare:
             self.parser.error("--update_improved requires --compare")
+        self._apply_select(args)
         return args
 
     @abstractmethod
@@ -313,7 +519,7 @@ class TunerCommon:
             merge_df["_tag"] = merge_df["_tag"].fillna("")
             dedup_keys = self.keys + ["_tag"]
         merge_df = (
-            merge_df.sort_values("us")
+            self.policy.sort_frame(merge_df)
             .drop_duplicates(subset=dedup_keys, keep="first")
             .reset_index(drop=True)
         )
@@ -437,6 +643,16 @@ class TunerCommon:
         if df_updates.empty:
             return df_old
         key_columns = self.keys
+        from aiter.utility.tune_result import POWER_ROW_COLUMNS
+
+        # Power columns exist only on power-tuned rows; a latency result frame
+        # without them stays valid.
+        optional = ("watts", "tflops_per_w") + POWER_ROW_COLUMNS
+        missing = [
+            c for c in self.columns if c in optional and c not in df_updates.columns
+        ]
+        if missing:
+            df_updates = df_updates.assign(**{c: pd.NA for c in missing})
         df_updates = df_updates.loc[:, self.columns]
         # Backfill columns present in the new results but missing from a legacy
         # tuned CSV (for example a newly added gfx key column), so that the
@@ -529,11 +745,17 @@ class TunerCommon:
 
     def post_process(self, rets, args, topk=-1, fast_mode=False):
         """post process, post process all results to return topk results"""
+        from aiter.utility.tune_result import TuneResult
+
         rets = list(rets)
+        policy = self.policy_for(args)
         if args.profile_file != "":
             if args.verbose:
                 logger.info(f"saving profile to {args.profile_file}")
-            profiledf = self.result_to_df(sorted(rets, key=itemgetter(0)))
+            profile_rets = sorted(rets, key=itemgetter(0))
+            profiledf = self.power_metrics(
+                policy.attach_columns(self.result_to_df(profile_rets), profile_rets)
+            )
             if os.path.exists(args.profile_file):
                 old_df = _read_csv(args.profile_file)
             else:
@@ -548,17 +770,19 @@ class TunerCommon:
         grouped_rets = defaultdict(list)
         bestConfigs = []
 
-        for info, us, max_err_ratio in rets:
-            grouped_rets[info[0]].append((info[1:], us, max_err_ratio))
+        for el in rets:
+            info, us, max_err_ratio = el
+            watts = getattr(el, "watts", float("nan"))
+            grouped_rets[info[0]].append((info[1:], us, max_err_ratio, watts))
 
         grouped_results = list(grouped_rets.items())
 
         for info_key, time_list in grouped_results:
             tol_err_ratio = args.errRatio
-            sorted_time = sorted(time_list, key=lambda x: x[1])
+            sorted_time = sorted(time_list, key=lambda x: policy.rank(x[1], x[3]))
             filtered_time = [
-                (info_ex, round(us, 4), max_err_ratio)
-                for info_ex, us, max_err_ratio in sorted_time
+                (info_ex, round(us, 4), max_err_ratio, watts)
+                for info_ex, us, max_err_ratio, watts in sorted_time
                 if max_err_ratio <= tol_err_ratio
                 and us != self.INVALID_TIME
                 and us != self.INF_TIME
@@ -573,14 +797,16 @@ class TunerCommon:
                 print(f"choose {effective_topk} kernels")
             self.topk = effective_topk
             best_config = [
-                ((info_key, *info_ex), us, max_err_ratio)
-                for info_ex, us, max_err_ratio in filtered_time[0:effective_topk]
+                TuneResult((info_key, *info_ex), us, max_err_ratio, watts)
+                for info_ex, us, max_err_ratio, watts in filtered_time[0:effective_topk]
             ]
             if not best_config:
                 logger.info(f"No kernel can be used for {info_key}")
-                best_config = [((info_key, *sorted_time[0][0]), self.INVALID_TIME, 1.0)]
+                best_config = [
+                    TuneResult((info_key, *sorted_time[0][0]), self.INVALID_TIME, 1.0)
+                ]
             bestConfigs.extend(best_config)
-        resultdf = self.result_to_df(bestConfigs)
+        resultdf = policy.attach_columns(self.result_to_df(bestConfigs), bestConfigs)
         return resultdf
 
     def _summary_shape_keys(self) -> "list[str]":
@@ -1061,6 +1287,7 @@ class TunerCommon:
 
         lines = [
             "============= Compare Report =============",
+            "Comparison is latency only (pre_us / post_us).",
             (
                 f"Total shapes: {total} | {verb}: {update_count + no_baseline_count} "
                 f"(improved: {update_count}, new: {no_baseline_count}) | Skipped: {skip_count}"
@@ -1404,6 +1631,17 @@ class TunerCommon:
 
     def run(self, args, fast_mode=False):
         """tuner run function"""
+        select = self._apply_select(args)
+        if select == "power":
+            logger.warning(
+                "select=power is experimental: ranking kernels that pass "
+                "errRatio by package energy (us * PPT watts) with no latency "
+                "bound. Keep the GPU otherwise idle."
+            )
+        with use_policy(self.policy):
+            return self._run_selected(args, fast_mode)
+
+    def _run_selected(self, args, fast_mode=False):
         self.pre_process(args)
 
         # Resolve --run_config: can be False, True (no file), or a file path string.
@@ -1514,6 +1752,7 @@ class TunerCommon:
                 all_results = self.tune(batch, self.tunedf, args)
                 if all_results:
                     results = self.post_process(all_results, args, topk)
+                    results = self._stamp_power_rows(results, args)
                     if args.compare:
                         batch_post_tune_results, batch_compare_plan = (
                             self._apply_compare_batch_results(
@@ -1595,6 +1834,10 @@ class TunerCommon:
 
 
 class GemmCommonTuner(TunerCommon):
+    # The accurate pass goes through mp_tuner.worker, which replays via
+    # run_perftest. a6w6 and mixed MXFP override this: their gain guard
+    # keeps a kernel only when it is faster.
+    SUPPORTS_POWER_SELECT = True
 
     ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
         **TunerCommon.ARG_DEFAULTS,
@@ -1691,22 +1934,22 @@ class GemmCommonTuner(TunerCommon):
                 kernelName = str(resolved)
             tflops, bw = self.calculate(el)
             key_dict = dict(zip(self.keys, keys))
-
+            metrics = {
+                "kernelId": [kernelId],
+                "splitK": [splitK],
+                "us": [time],
+                "kernelName": [kernelName],
+                "errRatio": [err_ratio],
+                "tflops": [tflops],
+                "bw": [bw],
+            }
+            extra, watt_text = self.policy.result_metrics(el, tflops)
+            metrics.update(extra)
             if len(results) == self.topk:
                 print(
-                    f"Tuning result for {str(key_dict).strip('{}')} is kernelId={kernelId} {kernelName} {splitK=}, {time}us, {err_ratio=}, {tflops=} TFLOPS, {bw=} GB/s"
+                    f"Tuning result for {str(key_dict).strip('{}')} is kernelId={kernelId} {kernelName} {splitK=}, {time}us, {err_ratio=}, {tflops=} TFLOPS, {bw=} GB/s{watt_text}"
                 )
-            key_dict.update(
-                {
-                    "kernelId": [kernelId],
-                    "splitK": [splitK],
-                    "us": [time],
-                    "kernelName": [kernelName],
-                    "errRatio": [err_ratio],
-                    "tflops": [tflops],
-                    "bw": [bw],
-                }
-            )
+            key_dict.update(metrics)
             rows.append(key_dict)
         # Build the frame once. Concatenating per row is O(n^2) in both time and
         # allocation: with -o2 (profile of every candidate) a 42-shape x ~600
