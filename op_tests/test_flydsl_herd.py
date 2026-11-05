@@ -9,12 +9,14 @@ import pytest
 import torch
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
-from aiter.ops.flydsl.grouped_moe_gfx1250 import (
-    _get_compiled_route_psum_herd,
-    herd_route_psum_remap,
+from aiter.ops.flydsl.herd_topk import (
+    herd_finalize_candidates,
+    herd_route_psum,
+    herd_topk_candidates,
 )
-from aiter.ops.flydsl.herd_topk import herd_finalize_candidates, herd_topk_candidates
 from aiter.ops.flydsl.kernels.herd_topk import build_herd_finalize_module
+from aiter.ops.flydsl.kernels.moe_herd_route_psum import build_herd_route_psum_module
+from aiter.ops.flydsl.kernels.tensor_shim import wave_size_of
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="requires an AMD GPU"
@@ -121,26 +123,28 @@ def test_route_skips_unrouted_pad_rows(valid):
 
 @pytest.mark.parametrize("experts,topk", [(128, 4), (256, 6), (512, 16)])
 def test_grouped_route_psum_reuses_kernel_across_batches(experts, topk):
-    if get_gfx_runtime() not in ("gfx950", "gfx1250"):
-        pytest.skip("requires gfx950 or gfx1250")
-    launch = _get_compiled_route_psum_herd(topk, False)
+    if get_gfx_runtime() != "gfx1250":
+        pytest.skip("the HERD route runs in the gfx1250 grouped MoE")
+    wave = wave_size_of(torch.cuda.current_device())
+    launch = build_herd_route_psum_module(topk, experts, False, wave)
     cache_keys = None
     for tokens in (1, 16, 32, 64, 128):
         ids, values = _candidates(tokens, experts, topk)
         kept, weights = _reference(ids, values, experts, 2.5)
-        counts, rows, psum, gather_weights = herd_route_psum_remap(
-            ids, values, experts, tokens, 32, 2.5
+        gather_weights, kept_ids, counts, rows, psum = herd_route_psum(
+            values, ids, experts, 32, 2.5
         )
         hist = torch.bincount(kept.flatten().long(), minlength=experts)
         padded = (hist + 31) // 32 * 32
         starts = padded.cumsum(0) - padded
+        torch.testing.assert_close(kept_ids, kept, rtol=0, atol=0)
         torch.testing.assert_close(counts.long(), hist, rtol=0, atol=0)
         torch.testing.assert_close(psum.long(), starts + hist, rtol=0, atol=0)
         torch.testing.assert_close(gather_weights, weights, rtol=2e-5, atol=1e-6)
         lower = starts[kept.long()]
         assert ((rows >= lower) & (rows < lower + hist[kept.long()])).all()
         assert rows.unique().numel() == tokens * topk
-        assert _get_compiled_route_psum_herd(topk, False) is launch
+        assert build_herd_route_psum_module(topk, experts, False, wave) is launch
         if cache_keys is None:
             cache_keys = tuple(launch._mem_cache)
             assert len(cache_keys) == 1
@@ -162,8 +166,8 @@ def _pad_candidates(ids, values, count, unrouted):
 def test_grouped_route_psum_skips_pad_rows(experts, topk, unrouted):
     """Rows past num_valid_rows stay out of the popularity and take no grouped
     row whatever their candidates hold; the count is read on device."""
-    if get_gfx_runtime() not in ("gfx950", "gfx1250"):
-        pytest.skip("requires gfx950 or gfx1250")
+    if get_gfx_runtime() != "gfx1250":
+        pytest.skip("the HERD route runs in the gfx1250 grouped MoE")
     from aiter.ops.flydsl.kernels.moe_route_maps import DROPPED_ROUTE_ROW
 
     tokens = 64
@@ -172,9 +176,10 @@ def test_grouped_route_psum_skips_pad_rows(experts, topk, unrouted):
     valid = torch.tensor([tokens], device="cuda", dtype=torch.int32)
 
     def run():
-        return herd_route_psum_remap(
-            cand_ids, cand_values, experts, tokens, 32, 2.5, num_valid_rows=valid
+        gather_weights, _, counts, rows, psum = herd_route_psum(
+            cand_values, cand_ids, experts, 32, 2.5, num_valid_rows=valid
         )
+        return counts, rows, psum, gather_weights
 
     run()
     stream = torch.cuda.Stream()
@@ -311,7 +316,7 @@ def test_legacy_herd_valid_rows_follow_graph_replay(monkeypatch):
 
 
 @pytest.mark.parametrize("gfx", ["gfx950", "gfx1250"])
-@pytest.mark.parametrize("tokens", [128, 129])
+@pytest.mark.parametrize("tokens", [128, 129, 1025])
 @pytest.mark.parametrize("experts,topk", [(128, 4), (896, 16)])
 def test_herd_topk_is_only_for_gfx1250(monkeypatch, gfx, tokens, experts, topk):
     from aiter import ActivationType, QuantType
@@ -320,7 +325,12 @@ def test_herd_topk_is_only_for_gfx1250(monkeypatch, gfx, tokens, experts, topk):
 
     moe = importlib.import_module("aiter.fused_moe")
     grouped = importlib.import_module("aiter.ops.flydsl.grouped_moe_gfx1250")
+    herd = importlib.import_module("aiter.ops.flydsl.herd_topk")
     monkeypatch.setattr(moe, "get_gfx", lambda: gfx)
+    finalize_calls = []
+    monkeypatch.setattr(
+        herd, "herd_finalize_candidates", lambda *args: finalize_calls.append(args)
+    )
     dim = 256
     ids, values = _candidates(tokens, experts, topk)
     hidden = torch.zeros(tokens, dim, device="cuda", dtype=torch.bfloat16)
@@ -333,53 +343,42 @@ def test_herd_topk_is_only_for_gfx1250(monkeypatch, gfx, tokens, experts, topk):
         return torch.zeros_like(hidden)
 
     monkeypatch.setattr(grouped, "grouped_gemm_gfx1250_a8w4", mock_grouped)
+
+    def run():
+        moe.fused_moe(
+            hidden,
+            w1,
+            w2,
+            values,
+            ids,
+            activation=ActivationType.Silu,
+            quant_type=QuantType.per_1x32,
+            quant_dtype_a=dtypes.fp8,
+            gate_mode=GateMode.INTERLEAVE.value,
+            herd_topk=topk,
+            herd_routed_scaling_factor=2.5,
+        )
+
     if gfx != "gfx1250":
         # Reject before candidate finalize or grouped MoE, at any expert count.
-        herd = importlib.import_module("aiter.ops.flydsl.herd_topk")
-        finalize_calls = []
-        monkeypatch.setattr(
-            herd, "herd_finalize_candidates", lambda *args: finalize_calls.append(args)
-        )
         with pytest.raises(ValueError, match="herd_topk is supported only on gfx1250"):
-            moe.fused_moe(
-                hidden,
-                w1,
-                w2,
-                values,
-                ids,
-                activation=ActivationType.Silu,
-                quant_type=QuantType.per_1x32,
-                quant_dtype_a=dtypes.fp8,
-                gate_mode=GateMode.INTERLEAVE.value,
-                herd_topk=topk,
-                herd_routed_scaling_factor=2.5,
-            )
+            run()
         assert not calls and not finalize_calls
         return
-    moe.fused_moe(
-        hidden,
-        w1,
-        w2,
-        values,
-        ids,
-        activation=ActivationType.Silu,
-        quant_type=QuantType.per_1x32,
-        quant_dtype_a=dtypes.fp8,
-        gate_mode=GateMode.INTERLEAVE.value,
-        herd_topk=topk,
-        herd_routed_scaling_factor=2.5,
-    )
+    if tokens > 1024:
+        # Past herd_route_psum's block; AITER_FLYDSL_HERD_MAX_M keeps HERD off.
+        with pytest.raises(ValueError, match="at most 1024 tokens"):
+            run()
+        assert not calls and not finalize_calls
+        return
+    run()
+    # The candidates reach the grouped MoE as they are, at any expert count:
+    # herd_route_psum drops them there.
     selected, weights, selected_topk = calls[-1]
-    if experts > grouped._FUSED_ROUTE_PSUM_MAX_EXPERTS:
-        # Too wide for the grouped MoE's fused drop: finalized before it.
-        expected_ids, expected_weights = _reference(ids, values, experts, 2.5)
-        assert selected_topk == 0
-        torch.testing.assert_close(selected, expected_ids, rtol=0, atol=0)
-        torch.testing.assert_close(weights, expected_weights, rtol=2e-5, atol=1e-6)
-    else:
-        assert selected_topk == topk
-        torch.testing.assert_close(selected, ids, rtol=0, atol=0)
-        torch.testing.assert_close(weights, values, rtol=0, atol=0)
+    assert not finalize_calls
+    assert selected_topk == topk
+    torch.testing.assert_close(selected, ids, rtol=0, atol=0)
+    torch.testing.assert_close(weights, values, rtol=0, atol=0)
 
 
 def _moe_weights(experts, dim, generator):
@@ -427,7 +426,7 @@ def _logits_diff(actual, expected):
 
 
 @pytest.mark.parametrize("tokens", [16, 128])
-# 128 experts drop inside the grouped MoE route; 896 are finalized before it.
+# Both drop inside the grouped MoE route, in herd_route_psum.
 @pytest.mark.parametrize("experts,topk", [(128, 4), (896, 16)])
 def test_fused_moe_outputs_match_router_drop(tokens, experts, topk):
     if get_gfx_runtime() not in ("gfx950", "gfx1250"):
@@ -542,6 +541,19 @@ def test_fused_moe_herd_skips_pad_rows(experts, topk, unrouted):
             expected = fused_moe(hidden[:count], w1, w2, weights, kept, **kwargs)
             error = _logits_diff(result[:count], expected)
             assert error < 1e-4, f"count={count}: HERD MoE logits_diff={error}"
+
+
+def test_herd_topk_rejects_k_routes():
+    if get_gfx_runtime() != "gfx1250":
+        pytest.skip("K+1 HERD candidates reach fused_moe only on gfx1250")
+    from aiter.fused_moe import fused_moe
+
+    generator = torch.Generator(device="cuda").manual_seed(7)
+    w1, w2, kwargs = _moe_weights(128, 512, generator)
+    hidden = torch.zeros(16, 512, device="cuda", dtype=torch.bfloat16)
+    ids, values = _candidates(16, 128, 4)
+    with pytest.raises(ValueError, match="K\\+1 candidate"):
+        fused_moe(hidden, w1, w2, values, ids, **kwargs, herd_topk=5)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32, torch.float16])

@@ -1530,6 +1530,13 @@ def _fused_moe_impl(
             raise ValueError(
                 "HERD routing requires unmasked routes and doweight_stage1=False"
             )
+        from aiter.ops.flydsl.kernels.moe_herd_route_psum import HERD_ROUTE_BLOCK
+
+        if M > HERD_ROUTE_BLOCK:
+            raise ValueError(
+                f"herd_topk takes at most {HERD_ROUTE_BLOCK} tokens, got {M}; "
+                "AITER_FLYDSL_HERD_MAX_M must not exceed it"
+            )
         topk = herd_topk
     E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
 
@@ -1568,25 +1575,6 @@ def _fused_moe_impl(
         output, (M, model_dim), dtype, hidden_states.device
     )
     _validate_output_buffer_no_overlap(output, hidden_states)
-    if herd_topk:
-        from aiter.ops.flydsl.grouped_moe_gfx1250 import (
-            _FUSED_ROUTE_PSUM_MAX_EXPERTS,
-        )
-        from aiter.ops.flydsl.herd_topk import herd_finalize_candidates
-
-        # The grouped MoE drops inside its one-workgroup route kernel, which
-        # keeps one LDS slot per expert; wider MoEs finish HERD here instead.
-        if E > _FUSED_ROUTE_PSUM_MAX_EXPERTS:
-            # Pad rows past num_local_tokens leave as ids -1, which the grouped
-            # MoE route skips like any other unrouted row.
-            topk_weight, topk_ids = herd_finalize_candidates(
-                topk_weight,
-                topk_ids,
-                E,
-                herd_routed_scaling_factor,
-                num_valid_rows=num_local_tokens,
-            )
-            herd_topk = 0
     quant_type = quant_remap.get(quant_type, quant_type)
     q_dtype_w = w1.dtype
     q_dtype_a = resolve_activation_dtype(
