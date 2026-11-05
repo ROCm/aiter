@@ -1091,7 +1091,7 @@ void get_pa_metadata_v1_2_device(const aiter_tensor_t& seqlens_qo_indptr, // [ba
             std::min<int64_t>(work_capacity / num_heads_k, 2 * (num_cu / num_heads_k - 1));
     const bool tile_layout_supported =
         topk < 0 && num_splits == num_cu && num_cu == 256 && dev_prop.warpSize == 64 &&
-        std::strncmp(dev_prop.gcnArchName, "gfx950", 6) == 0 && block_size == 16 &&
+        get_gpu_arch() == "gfx950" && block_size == 16 &&
         kv_granularity == 256 && max_seqlen_qo == 4 && ori_uni_seqlen_qo == 4 &&
         num_heads_per_head_k == 16 && num_heads_k == 1 && is_causal;
     if(fast_mode && num_batches > 0 && num_batches <= 64 &&

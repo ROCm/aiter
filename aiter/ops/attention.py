@@ -710,7 +710,7 @@ def pa_persistent_fwd(
             torch.cuda.get_device_properties(device).multi_processor_count,
         )
     reduce_fn = _attention_ps_reduce_asm if use_asm_reduce else pa_reduce_v1
-    reduce_kwargs = {"merge_waves": reduce_waves} if use_asm_reduce else {}
+    reduce_args = (reduce_waves,) if use_asm_reduce else ()
     reduce_fn(
         logits,
         splitLse,
@@ -720,7 +720,7 @@ def pa_persistent_fwd(
         max_qlen,
         output,
         final_lse,
-        **reduce_kwargs,
+        *reduce_args,
     )
 
     return logits, final_lse
