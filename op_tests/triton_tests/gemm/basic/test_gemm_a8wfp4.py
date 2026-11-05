@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import os
 from enum import Enum
 
 import pytest
@@ -9,6 +10,7 @@ import torch
 from aiter.ops.triton.gemm.basic.gemm_a8wfp4 import gemm_a8wfp4
 from aiter.ops.triton.utils import types
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.config_utils import resolve_config_dir
 
 # Debug
 DEBUG = False
@@ -345,8 +347,14 @@ def test_gemm_a8wfp4(M: int, N: int, K: int, CLEAR_GPUS=True):
     layout = "TN"  # Kernel will occasionally crash for layouts other than TN.
     out_dtype = torch.bfloat16
 
-    if not (arch_info.is_fp4_avail()):
+    if not arch_info.is_any_fp4_avail():
         pytest.skip("MXFP4 not supported on this architecture")
+
+    # Software-emulated FP4 archs run this family only where it has a config.
+    if arch_info.is_sw_emulated_fp4_avail() and not os.path.exists(
+        os.path.join(resolve_config_dir("gemm", "GEMM-A8WFP4"), "DEFAULT.json")
+    ):
+        pytest.skip(f"No GEMM-A8WFP4 config for {arch_info.get_arch()}.")
 
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
     torch.manual_seed(42)  # for reproducibility
