@@ -1242,6 +1242,57 @@ schedule_bank.initialized = False
 schedule_bank.func = None
 
 
+# Ring fragment that issues TDM copy k. A fragment is one refill (2 ds_load) plus the
+# wmma it feeds, so copies 0..2 land one per fragment and the last one trails further
+# back, where the stream has no issue of its own left to overlap.
+_TDM_TAP_FRAG = (0, 1, 2, 6)
+
+
+# sched_group_barrier masks. TDM sets TENSOR_CNT, which puts it in LDSDMA and NOT in
+# DS_READ, so it stays separable from ds_load_tr16.
+_SG_VALU, _SG_TDM = 0x002, 0x800
+# VALU run to place between consecutive TDM issues in the lagging half's softmax.
+_SG_HI_VALU_GAPS = (8, 8, 40)
+
+
+def _hi_tdm_pipeline(tensorcnt):
+    """Ask the scheduler to thread the lagging half's TDM issues through softmax's max
+    tree instead of leaving them clumped ahead of it. Advisory, unlike the leading half's
+    tap -- softmax has no hand-computed wait depth riding on the order here."""
+    if tensorcnt < 2:
+        # One group is not inert: any SCHED_GROUP_BARRIER hands the region to IGroupLP,
+        # which then schedules it bottom-up and reorders everything for no gain.
+        return []
+    groups = []
+    for k in range(tensorcnt):
+        groups.append((_SG_TDM, 1))
+        if k < tensorcnt - 1:
+            groups.append((_SG_VALU, _SG_HI_VALU_GAPS[min(k, len(_SG_HI_VALU_GAPS) - 1)]))
+    return groups
+
+
+def _tdm_tap(desc):
+    """How this descriptor should issue: ``(tap, issue_now)``, exactly one of them set.
+
+    ``tap`` spreads the copies across the ring per _TDM_TAP_FRAG, so a multi-issue batch
+    runs through the stream instead of clumping ahead of it; placement is by source
+    order, so the scheduler is not involved. A lone copy gets ``issue_now`` instead --
+    moving it past the gemm's s_setprio costs +0.3..+0.6% on the configs that have one.
+    """
+    if desc.tensorcnt < 2:
+        return None, desc.async_load
+    assert desc.tensorcnt <= len(_TDM_TAP_FRAG), (
+        f"{desc.tensorcnt} TDM copies but only {len(_TDM_TAP_FRAG)} tap slots"
+    )
+    at = {_TDM_TAP_FRAG[k]: k for k in range(desc.tensorcnt)}
+
+    def tap(i):
+        if i in at:
+            desc.async_load_one(at[i])
+
+    return tap, None
+
+
 def _attention_core_multi_kv_tiles(
     *,
     qk_hdim,
@@ -1704,6 +1755,8 @@ def _attention_core_multi_kv_tiles(
         if _is_lagging_softmax:
             kv_state_next = kv_policy.advance(prefetch_tile_idx)
             prefetch_desc.async_load()
+            for _mask, _count in _hi_tdm_pipeline(prefetch_desc.tensorcnt):
+                rocdl.sched_group_barrier(_mask, _count, 0)
             p_f32, m_new_list, d_new_list, o_resc = _softmax_phase(carry_prev, o_acc)
             # Head out BEFORE P is narrowed: it is ds_loads with no dependence on P, so
             # issuing it first puts the conversion in its shadow rather than behind it.
@@ -1738,7 +1791,9 @@ def _attention_core_multi_kv_tiles(
             rocdl.sched_barrier(0)
             _copy_fence(*_kv_drain, num_dscnt=_num_head_carry)
             pvqk_head = _pvqk_head()
-            prefetch_desc.async_load()
+            _tap, _issue_now = _tdm_tap(prefetch_desc)
+            if _issue_now is not None:
+                _issue_now()
             o_acc, s_list = _pv_qk_gemm(
                 v_emit=_v_emit,
                 k_emit=_k_emit,
@@ -1750,6 +1805,7 @@ def _attention_core_multi_kv_tiles(
                 warp_type=warp_type,
                 o_acc_list=o_acc,
                 head=pvqk_head,
+                tap=_tap,
             )
             _phase_barrier()
             # Ahead of softmax: nothing here consumes it, so the whole softmax covers

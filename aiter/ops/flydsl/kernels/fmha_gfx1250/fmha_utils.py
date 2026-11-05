@@ -287,9 +287,9 @@ def _ring_drive(
     are hoisted ABOVE the wmma, which is what keeps the ring from reintroducing the
     wmma->ds_load issue bubble a burst-everything prefetch avoids.
 
-    ``tap(i)`` is called once per fragment, after its refill and before its wmma, for a
-    caller that wants its own copies spread through the ring instead of clumped ahead of
-    it. Placement is by source order, so it costs the ring no fence or wait depth.
+    ``tap(i)`` is called at the head of fragment ``i`` for a caller that wants its own
+    copies spread through the ring instead of clumped ahead of it. Placement is by source
+    order, so it costs the ring no fence or wait depth.
 
     ``head`` optionally adopts an already-issued NP-deep prefetch (the PV case hoists it
     above softmax so the LDS latency hides under the softmax VALU). A tile of at most
@@ -363,6 +363,8 @@ def _ring_drive(
         held.append(tuple(vals) if vals else None)
 
     for i in range(num_frag):
+        if tap is not None:
+            tap(i)
         # The wait is placed before the refill, so it is measured against what is already
         # outstanding: everything issued past the end of this fragment may still be in
         # flight, and the refill below only adds younger loads.
@@ -370,8 +372,6 @@ def _ring_drive(
         _release(i)
         refilling = issued < num_ld
         _refill(starts[i + 1] + num_prefetch)
-        if tap is not None:
-            tap(i)
         parts = tuple(a[(starts[i] + k) % ring] for k in range(widths[i]))
         rocdl.sched_barrier(0)
         consume(i, *parts)
