@@ -2034,6 +2034,73 @@ def test_qsa_arch_allowlist(monkeypatch):
         raise AssertionError(f"{bad!r} was accepted")
 
 
+def test_qsa_support_gates_reject_other_archs(monkeypatch):
+    """Both support gates return a reason on gfx1100 and gfx90a.
+
+    ``_qsa_arch`` still raises ValueError, which is the launch path. The
+    gates report that same text and do not raise. gfx942 and gfx950 stay
+    supported. A ``RuntimeError`` from ``get_gfx_runtime`` is a missing
+    device: both gates return None, and ``_qsa_arch`` still raises. The
+    lookup is patched, so this does not need another GPU.
+    """
+    from aiter.ops.flydsl import qsa_paged as qsa_mod
+
+    q_index = torch.zeros(1, 4, 128, dtype=torch.bfloat16)
+    k_index = torch.zeros(1, 16, 1, 128, dtype=torch.bfloat16)
+    table = torch.zeros(1, 1, dtype=torch.int32)
+    q_gqa = torch.zeros(1, 16, 128, dtype=torch.bfloat16)
+    k_gqa = torch.zeros(1, 16, 1, 128, dtype=torch.bfloat16)
+    indices = torch.zeros(1, 8, dtype=torch.int32)
+
+    def indexer():
+        return qsa_mod.qsa_indexer_supported(q_index, k_index, table, (4,))
+
+    def gqa():
+        return flydsl_qsa_paged_gqa_supported(
+            q_gqa, k_gqa, torch.zeros_like(k_gqa), indices, table
+        )
+
+    for arch in ("gfx1100", "gfx90a"):
+        monkeypatch.setattr(qsa_mod, "get_gfx_runtime", lambda arch=arch: arch)
+        try:
+            qsa_mod._qsa_arch()
+        except ValueError as exc:
+            expected = str(exc)
+        else:
+            raise AssertionError(f"{arch!r} was accepted by _qsa_arch")
+        for name, gate in (("indexer", indexer), ("paged GQA", gqa)):
+            try:
+                reason = gate()
+            except Exception as exc:
+                raise AssertionError(f"{name} raised on {arch}: {exc}") from exc
+            if reason != expected:
+                raise AssertionError(f"{name} on {arch} returned {reason!r}")
+
+    for arch in ("gfx942", "gfx950"):
+        monkeypatch.setattr(qsa_mod, "get_gfx_runtime", lambda arch=arch: arch)
+        for name, gate in (("indexer", indexer), ("paged GQA", gqa)):
+            reason = gate()
+            if reason is not None:
+                raise AssertionError(f"{name} rejected {arch}: {reason!r}")
+
+    def _missing_device():
+        raise RuntimeError("no hip device")
+
+    monkeypatch.setattr(qsa_mod, "get_gfx_runtime", _missing_device)
+    for name, gate in (("indexer", indexer), ("paged GQA", gqa)):
+        try:
+            reason = gate()
+        except Exception as exc:
+            raise AssertionError(f"{name} raised with no device: {exc}") from exc
+        if reason is not None:
+            raise AssertionError(f"{name} treated a missing device as {reason!r}")
+    try:
+        qsa_mod._qsa_arch()
+    except RuntimeError:
+        return
+    raise AssertionError("launch arch lookup swallowed a missing device")
+
+
 def test_indexer_page_past_4gib():
     """A physical indexer page at byte offset 2^32 must not alias page 0.
 

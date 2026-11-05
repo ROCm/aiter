@@ -74,11 +74,35 @@ def _qsa_arch() -> str:
     """Live GPU arch, or raise when it is not gfx942 or gfx950.
 
     ``get_gfx_runtime`` ignores ``GPU_ARCHS`` and returns the bare token.
+    A missing device raises ``RuntimeError`` from that lookup. The public
+    launch calls this and still rejects a bad arch.
     """
     arch = get_gfx_runtime()
     if arch not in _SUPPORTED_ARCHS:
-        raise ValueError(f"QSA supports {', '.join(_SUPPORTED_ARCHS)}, got {arch}")
+        raise ValueError(_qsa_unsupported_arch_reason(arch))
     return arch
+
+
+def _qsa_unsupported_arch_reason(arch: str) -> str:
+    return f"QSA supports {', '.join(_SUPPORTED_ARCHS)}, got {arch}"
+
+
+def _qsa_support_arch() -> tuple[str | None, str | None]:
+    """(arch, reason) for a support gate. Does not raise.
+
+    ``("gfx942"|"gfx950", None)`` is supported. ``(None, reason)`` is any
+    other arch ``get_gfx_runtime`` returned. ``(None, None)`` is a missing
+    device: that lookup raised ``RuntimeError``, which stays separate from
+    an unsupported arch. AOT replay patches ``get_gfx_runtime``, so a job
+    arch is read here.
+    """
+    try:
+        arch = get_gfx_runtime()
+    except RuntimeError:
+        return None, None
+    if arch not in _SUPPORTED_ARCHS:
+        return None, _qsa_unsupported_arch_reason(arch)
+    return arch, None
 
 
 # GQA query ``(Hq, D)`` -> indexer head counts swept with it.
@@ -630,6 +654,8 @@ def qsa_indexer_supported(
 
     ``heads`` narrows the accepted indexer head count; pass ``(4,)`` to
     reject the 8-head variant. Every other check is the same either way.
+    gfx942 and gfx950 stay supported. Any other arch is a reason. When
+    ``get_gfx_runtime`` raises ``RuntimeError``, this still returns None.
     """
     if not heads or any(h not in _SCORE_HEADS for h in heads):
         raise ValueError(f"heads must be a non-empty subset of {_SCORE_HEADS}")
@@ -657,7 +683,10 @@ def qsa_indexer_supported(
         return (
             f"page_table must be int32 [n_req, n_pages], got {tuple(page_table.shape)}"
         )
-    return None
+    # Shape checks above still apply with no device. An unsupported arch is
+    # a reason here; the launch's _qsa_arch() raise is unchanged.
+    _, reason = _qsa_support_arch()
+    return reason
 
 
 def qsa_indexer_selection_supported(token_topk: int, compress_ratio: int) -> str | None:
@@ -917,10 +946,15 @@ def flydsl_qsa_paged_gqa_supported(
         return coverage
     # No device: the geometry checks above still apply, and a launch cannot
     # compile. AOT replay patches get_gfx_runtime, so this sees the job arch.
-    try:
-        use_k32 = _qsa_arch() == "gfx950"
-    except RuntimeError:
+    # RuntimeError from that lookup stays "no device" (None once the geometry
+    # is valid). Any other arch is a reason, before the LDS check, which only
+    # knows the gfx942 and gfx950 layouts.
+    arch, reason = _qsa_support_arch()
+    if reason is not None:
+        return reason
+    if arch is None:
         return None
+    use_k32 = arch == "gfx950"
     return _paged_gqa_lds_reason(
         _paged_gqa_lds_bytes(head_dim, block_n, block_threads, use_k32),
         use_k32,
