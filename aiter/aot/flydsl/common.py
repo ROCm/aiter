@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-import enum
 import json
 import multiprocessing
 import os
@@ -14,37 +13,14 @@ import tempfile
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
 from multiprocessing.connection import wait as wait_for_sentinels
 from typing import Any
 
+from aiter.jit.utils.build_targets import base_gfx_arch
+from aiter_worker_limits import configure_worker_subprocesses, get_worker_count_for
+
 _DEFAULT_KERNEL_TIMEOUT = 1200.0
-_DEFAULT_MAX_WORKERS = 64
 _DEFAULT_MAX_RETRIES = 2
-_DEFAULT_MEM_PER_WORKER_GB = 2.0
-_MAX_ERRORS_IN_MSG = 10
-
-
-class OpKind(enum.Enum):
-    """FlyDSL AOT kernel categories -- enum so typos at call sites become
-    construction errors instead of silently routing to the wrong code path."""
-
-    MOE = "moe"
-    MXFP4_MOE = "mxfp4_moe"
-    GEMM = "gemm"
-    GROUPED_MOE = "grouped_moe"
-    CHUNK_GDN_H = "chunk_gdn_h"
-
-
-@dataclass(frozen=True)
-class JobLabel:
-    """Diagnostic label attached to a submitted future."""
-
-    kind: OpKind
-    kernel_name: str
-
-    def __str__(self) -> str:
-        return f"{self.kind.name} {self.kernel_name}"
 
 
 _CU_NUM_TO_ARCH = {
@@ -130,66 +106,108 @@ def override_env(var_name: str, value: str | None) -> Iterator[None]:
             os.environ[var_name] = prev
 
 
-def _collect_aot_jobs_for(kind: OpKind) -> list[dict[str, Any]]:
-    """Load DEFAULT_CSVS + parse_csv for the named kind and return its
-    job list. Note: importing .gemm / .moe / .chunk_gdn_h here also
-    runs their module-level imports, which pull in FlyDSL (e.g.
-    ``flydsl.expr``). Job collection is therefore not free in the
-    parent process, just shifted once out of every child."""
-    if kind is OpKind.MOE:
-        from .moe import DEFAULT_CSVS, parse_csv
-    elif kind is OpKind.MXFP4_MOE:
-        from .mxfp4_moe import DEFAULT_CSVS, parse_csv
-    elif kind is OpKind.GEMM:
-        from .gemm import DEFAULT_CSVS, parse_csv
-    elif kind is OpKind.GROUPED_MOE:
-        from .grouped_moe import DEFAULT_CSVS, parse_csv
-    elif kind is OpKind.CHUNK_GDN_H:
-        from .chunk_gdn_h import DEFAULT_CSVS, parse_csv
-    else:
-        raise ValueError(f"unknown FlyDSL AOT kind: {kind!r}")
-    return collect_aot_jobs(DEFAULT_CSVS, parse_csv)
+def aot_target_archs() -> set[str] | None:
+    """The archs ``GPU_ARCHS`` names, as the wheel build sets it; ``None``
+    when it is unset or ``native``, meaning every arch the tables have."""
+    value = os.environ.get("GPU_ARCHS", "").strip()
+    if not value or value.lower() == "native":
+        return None
+    return {arch.strip() for arch in value.split(";") if arch.strip()}
 
 
-def _compile_one_config_for(kind: OpKind) -> Callable[..., dict[str, Any]]:
-    if kind is OpKind.MOE:
-        from .moe import compile_one_config
-    elif kind is OpKind.MXFP4_MOE:
-        from .mxfp4_moe import compile_one_config
-    elif kind is OpKind.GEMM:
-        from .gemm import compile_one_config
-    elif kind is OpKind.GROUPED_MOE:
-        from .grouped_moe import compile_one_config
-    elif kind is OpKind.CHUNK_GDN_H:
-        from .chunk_gdn_h import compile_one_config
-    elif kind is OpKind.GROUPED_MOE:
-        # grouped_moe AOT not wired up yet (no jobs are ever collected); keep a
-        # trivial stub so the dispatch is total.
-        return lambda **_kw: {}
-    else:
-        raise ValueError(f"unknown FlyDSL AOT kind: {kind!r}")
-    return compile_one_config
+def resolve_target_arch(job_arch: str, targets: set[str] | None) -> str | None:
+    """Exact requested target arch in the same kernel family as ``job_arch``, or
+    ``None`` when no requested target shares its family.
+
+    ``gfx1250-strict`` (MI450 A0) and ``gfx1250`` (B0) are one source/kernel
+    family, so a ``gfx1250``-tuned row is selected for a ``gfx1250-strict`` build
+    and **compiled for the exact requested target** (producing the strict
+    ``0xeb`` code object, not ``gfx1250`` ``0x49``). ``targets`` is ``None``
+    (GPU_ARCHS unset/native) keeps ``job_arch`` as-is.
+    """
+    if not targets:
+        return job_arch
+    fam = base_gfx_arch(job_arch)
+    for t in sorted(targets):
+        if base_gfx_arch(t) == fam:
+            return t
+    return None
+
+
+def assert_targets_covered(
+    targets: set[str] | None, available_archs, matched_archs, label: str
+) -> None:
+    """Raise when a requested arch's kernel family exists in the tuned data but
+    produced no job -- the strict-AOT filter bug that silently emitted an empty
+    wheel while reporting success (``GPU_ARCHS=gfx1250-strict`` -> 0 artifacts,
+    "succeeded"). A family genuinely absent from the tables (the op has no
+    kernels for that arch) is fine and not an error.
+    """
+    if not targets:
+        return
+    avail_fams = {base_gfx_arch(a) for a in available_archs}
+    matched_fams = {base_gfx_arch(a) for a in matched_archs}
+    dropped = sorted(
+        t
+        for t in targets
+        if base_gfx_arch(t) in avail_fams and base_gfx_arch(t) not in matched_fams
+    )
+    if dropped:
+        raise RuntimeError(
+            f"[aiter] {label}: tuned rows exist for {dropped}'s kernel family but "
+            f"none were selected for the requested target; refusing to emit a "
+            f"partial wheel (strict-AOT filter bug)"
+        )
+
+
+def replay_env(arch: str, workers: int | None = None) -> dict[str, str]:
+    """Environment of a process that replays the runtime for ``arch``. aiter
+    fixes some arch-dependent values at import (e.g. ``dtypes.fp8``), so the
+    process starts with ``GPU_ARCHS`` naming ``arch`` and with
+    ``AITER_AOT_REPLAY=1``, under which aiter's runtime arch queries answer
+    ``arch`` instead of probing a device. The GPUs stay hidden, and aiter is
+    imported in full rather than in AOT mode."""
+    env = dict(os.environ)
+    env.pop("AITER_AOT_IMPORT", None)
+    env.update(
+        GPU_ARCHS=arch,
+        AITER_AOT_REPLAY="1",
+        HIP_VISIBLE_DEVICES="-1",
+        ROCR_VISIBLE_DEVICES="-1",
+        CUDA_VISIBLE_DEVICES="-1",
+    )
+    if workers is not None:
+        env["AITER_MAX_JOBS"] = str(workers)
+    return env
+
+
+def check_replay_process(arch: str) -> None:
+    """Raise unless this process started with ``replay_env(arch)``, so that
+    what aiter fixed at import belongs to ``arch``."""
+    from aiter.utility import dtypes
+
+    if os.environ.get("AITER_AOT_REPLAY") != "1" or os.environ.get("GPU_ARCHS") != arch:
+        raise RuntimeError(
+            f"replaying {arch} needs AITER_AOT_REPLAY=1 and GPU_ARCHS={arch} set "
+            "before aiter is imported (see replay_env)"
+        )
+    expected = dtypes.defaultDtypes[arch]["fp8"]
+    if dtypes.fp8 is not expected:
+        raise RuntimeError(
+            f"aiter was imported for another arch: dtypes.fp8 is {dtypes.fp8}, "
+            f"{arch} needs {expected}"
+        )
 
 
 def _run_one_to_file(
     worker: Callable[..., dict[str, Any]], kwargs: dict[str, Any], out_path: str
 ) -> None:
+    configure_worker_subprocesses()
     result = worker(**kwargs)
     tmp_path = out_path + ".tmp"
     with open(tmp_path, "w") as f:
         json.dump(result, f)
     os.replace(tmp_path, out_path)
-
-
-def _affinity_aware_cpu_count() -> int:
-    """Number of CPUs this process may actually use (respects cgroup /
-    cpuset limits via ``sched_getaffinity``, unlike ``os.cpu_count()``).
-    Falls back to ``cpu_count`` and is clamped to >=1."""
-    try:
-        n = len(os.sched_getaffinity(0))
-    except (AttributeError, OSError):
-        n = os.cpu_count() or 0
-    return max(n, 1)
 
 
 def get_kernel_timeout() -> float:
@@ -216,39 +234,31 @@ def get_max_retries() -> int:
         ) from e
 
 
-def _memory_worker_cap(default_workers: int) -> int:
-    env = os.environ.get("AITER_FLYDSL_AOT_MEM_PER_WORKER_GB")
-    try:
-        per_gb = float(env) if env else _DEFAULT_MEM_PER_WORKER_GB
-    except ValueError as e:
-        raise ValueError(
-            f"AITER_FLYDSL_AOT_MEM_PER_WORKER_GB must be a number, got {env!r}"
-        ) from e
-    if per_gb <= 0:
-        return default_workers
-    try:
-        import psutil
-
-        avail_gb = psutil.virtual_memory().available / (1024**3)
-    except Exception:  # noqa: BLE001
-        return default_workers
-    return min(default_workers, max(1, int(avail_gb / per_gb)))
-
-
 def get_max_workers(num_jobs: int) -> int:
-    workers_env = os.environ.get("AITER_FLYDSL_AOT_WORKERS")
-    if workers_env is not None:
-        try:
-            max_workers = max(int(workers_env), 1)
-        except ValueError as e:
-            raise ValueError(
-                f"AITER_FLYDSL_AOT_WORKERS must be an integer, got {workers_env!r}"
-            ) from e
-    else:
-        max_workers = min(_affinity_aware_cpu_count(), _DEFAULT_MAX_WORKERS)
-        # Auto path only: also bound by memory so we never trip the OOM-killer.
-        max_workers = _memory_worker_cap(max_workers)
-    return min(max_workers, num_jobs)
+    return get_worker_count_for(num_jobs)
+
+
+def worker_waves(workers: int, jobs_per_arch: dict[str, int]) -> list[dict[str, int]]:
+    """The per-arch replay processes to run side by side, wave after wave, and
+    the workers each runs, such that no wave runs more than ``workers`` in all:
+    as many archs as the budget gives a worker each, the largest first, the
+    budget split among them by job count (largest remainder)."""
+    archs = sorted(jobs_per_arch, key=lambda arch: (-jobs_per_arch[arch], arch))
+    workers = max(1, workers)
+    waves = []
+    for start in range(0, len(archs), workers):
+        wave = archs[start : start + workers]
+        total = sum(jobs_per_arch[arch] for arch in wave)
+        extra = {
+            arch: (workers - len(wave)) * jobs_per_arch[arch] / total for arch in wave
+        }
+        shares = {arch: 1 + int(extra[arch]) for arch in wave}
+        rest = workers - sum(shares.values())
+        by_remainder = sorted(wave, key=lambda arch: int(extra[arch]) - extra[arch])
+        for arch in by_remainder[:rest]:
+            shares[arch] += 1
+        waves.append(shares)
+    return waves
 
 
 def _run_file_pool(
@@ -257,8 +267,9 @@ def _run_file_pool(
     kernel_timeout: float,
     max_retries: int,
     result_dir: str,
+    start_method: str = "fork",
 ) -> list[dict[str, Any] | None]:
-    ctx = multiprocessing.get_context("fork")
+    ctx = multiprocessing.get_context(start_method)
     n = len(specs)
     results: list[dict[str, Any] | None] = [None] * n
     attempts = [0] * n
@@ -329,8 +340,7 @@ def _run_file_pool(
                 result = None
         if result is None:
             label = specs[idx][2]
-            name = label.kernel_name if isinstance(label, JobLabel) else str(label)
-            result = {"kernel_name": name, "compile_time": None}
+            result = {"kernel_name": str(label), "compile_time": None}
         results[idx] = result
         note_done()
 
@@ -385,6 +395,8 @@ def _run_file_pool(
 def run_jobs_parallel(
     worker: Callable[..., dict[str, Any]],
     jobs: list[dict[str, Any]],
+    *,
+    start_method: str = "fork",
 ) -> list[dict[str, Any]]:
     if not jobs:
         return []
@@ -397,7 +409,12 @@ def run_jobs_parallel(
     try:
         specs = [(worker, job, str(job.get("kernel_name", "?"))) for job in jobs]
         raw = _run_file_pool(
-            specs, max_workers, get_kernel_timeout(), get_max_retries(), result_dir
+            specs,
+            max_workers,
+            get_kernel_timeout(),
+            get_max_retries(),
+            result_dir,
+            start_method,
         )
     finally:
         shutil.rmtree(result_dir, ignore_errors=True)
@@ -412,86 +429,38 @@ def run_jobs_parallel(
     return out
 
 
+# The FlyDSL AOT modules setup.py runs, each replaying the runtime of its ops.
+AOT_MODULES = (
+    "aiter.aot.flydsl.gemm",
+    "aiter.aot.flydsl.conv",
+    "aiter.aot.flydsl.chunk_gdn_h",
+    "aiter.aot.flydsl.fmha_fp8",
+    "aiter.aot.flydsl.pa_decode_plan",
+)
+
+
 def run_aot(cache_dir: str) -> None:
+    """Build the FlyDSL AOT cache of every module, as ``setup.py`` does. Each
+    replays aiter's runtime, which needs aiter fully imported for the target
+    arch, so each arch replays in a process of its own."""
     os.makedirs(cache_dir, exist_ok=True)
     os.environ["FLYDSL_RUNTIME_CACHE_DIR"] = cache_dir
 
-    all_jobs: list[tuple[OpKind, dict[str, Any]]] = []
-    for kind in OpKind:
-        for job in _collect_aot_jobs_for(kind):
-            all_jobs.append((kind, job))
+    from .mega_moe import run as run_mega_moe_replay
+    from .moe import DEFAULT_CSVS as MOE_CSVS
+    from .moe import run as run_moe_replay
+    from .replay import run_default
 
-    if not all_jobs:
-        print("[aiter] FlyDSL AOT: no kernels to compile, skipping")
-        return
-
-    max_workers = get_max_workers(len(all_jobs))
-
-    # Per-child result files live here -- recreated fresh so stale results
-    # from a previous (e.g. crashed) build can never be mistaken for this
-    # run's output.
-    result_dir = os.path.join(cache_dir, ".aot_results")
-    shutil.rmtree(result_dir, ignore_errors=True)
-    os.makedirs(result_dir, exist_ok=True)
-
-    print(
-        f"[aiter] FlyDSL AOT: {len(all_jobs)} kernels "
-        f"({'+'.join(k.name for k in OpKind)}), "
-        f"{max_workers} worker processes (cache: {cache_dir})"
-    )
-
-    # One uniform task per kernel: worker = the kind's compile_one_config.
-    specs = [
-        (
-            _compile_one_config_for(kind),
-            job,
-            JobLabel(kind=kind, kernel_name=str(job.get("kernel_name", "?"))),
-        )
-        for kind, job in all_jobs
-    ]
-
-    try:
-        raw = _run_file_pool(
-            specs,
-            max_workers,
-            get_kernel_timeout(),
-            get_max_retries(),
-            result_dir,
-        )
-
-        ok_by_kind: dict[OpKind, int] = {k: 0 for k in OpKind}
-        fail_by_kind: dict[OpKind, int] = {k: 0 for k in OpKind}
-        errors: list[str] = []
-        for (kind, _job), result, spec in zip(all_jobs, raw, specs):
-            label = spec[2]
-            if result is not None and result.get("compile_time") is not None:
-                ok_by_kind[kind] += 1
-            elif result is None:
-                # Died (crash/OOM) or timed out, even after retries.
-                fail_by_kind[kind] += 1
-                errors.append(f"FlyDSL {label} worker died or timed out")
-            else:
-                # Clean exit but no kernel (deterministic compile error).
-                fail_by_kind[kind] += 1
-                errors.append(f"FlyDSL {label} produced no kernel")
-
-        for kind in OpKind:
-            print(
-                f"[aiter] FlyDSL {kind.name} AOT: "
-                f"compiled {ok_by_kind[kind]} ok, {fail_by_kind[kind]} failed"
-            )
-        if errors:
-            seen: set[str] = set()
-            unique_errors = [e for e in errors if not (e in seen or seen.add(e))]
-            head = unique_errors[:_MAX_ERRORS_IN_MSG]
-            suffix = ""
-            if len(unique_errors) > _MAX_ERRORS_IN_MSG:
-                suffix = (
-                    f"; ... ({len(unique_errors) - _MAX_ERRORS_IN_MSG} more unique)"
-                )
-            tally = ", ".join(f"{k.name}: {fail_by_kind[k]} failed" for k in OpKind)
-            raise AssertionError(
-                f"[aiter] FlyDSL AOT failures ({tally}): " + "; ".join(head) + suffix
-            )
-    finally:
-        shutil.rmtree(result_dir, ignore_errors=True)
+    errors = []
+    moe_failed_archs = run_moe_replay([p for p in MOE_CSVS if os.path.isfile(p)])
+    if moe_failed_archs:
+        errors.append(f"FlyDSL MOE replay failed for {moe_failed_archs} arch(es)")
+    if run_mega_moe_replay():
+        errors.append("FlyDSL MEGA_MOE replay failed")
+    for module_name in AOT_MODULES:
+        failed_archs = run_default(module_name)
+        if failed_archs:
+            label = module_name.rsplit(".", 1)[-1].upper()
+            errors.append(f"FlyDSL {label} replay failed for {failed_archs} arch(es)")
+    if errors:
+        raise AssertionError(f"[aiter] FlyDSL AOT failures: {'; '.join(errors)}")

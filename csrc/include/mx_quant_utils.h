@@ -176,11 +176,33 @@ __device__ __forceinline__ float fp_f32_to_e8m0_scale(float amax)
 }
 
 // Block-scale result for an E8M0-quantised group: the stored 1-byte exponent plus
-// the f32 dequant scale (= 2^(byte-127)). Quantize data via ``* (1 / dq_scale)``;
+// the f32 dequant scale (= 2^(byte-127)). Quantize data via ``* inv_scale()``;
 // store ``byte`` into the block-scale buffer.
 struct E8m0BlockScale {
     uint8_t byte;
     float   dq_scale;
+
+    // Reciprocal of the dequant scale. `v_rcp_f32` -- neither a true divide nor
+    // an exponent flip:
+    //
+    //  * `1.0f / dq_scale` lowers to the full IEEE sequence (v_div_scale x2,
+    //    v_rcp, three v_fma, v_div_fmas, v_div_fixup, plus s_denorm_mode
+    //    toggles) to get the last ulp right on operands this never sees.
+    //  * The exponent flip `bit_cast((254u - byte) << 23)` drops the divide but
+    //    answers three of the 256 bytes wrong: byte 0 (dq_scale is +0.0, so the
+    //    reciprocal is +inf), byte 254 (needs the subnormal 2^-127, which no
+    //    exponent field encodes), and byte 255 (254-255 wraps unsigned, giving
+    //    -inf instead of +0). Present callers floor the group amax and cannot
+    //    reach those, but this is a public method on a shared struct.
+    //
+    // dq_scale is 2^(byte-127) by construction -- mantissa zero -- so the
+    // reciprocal is exactly representable and the hardware approximation lands
+    // on it. Checked on gfx1250 against `1.0f / dq_scale` for all 256 bytes:
+    // bit-identical except byte 254, where rcp flushes the subnormal to +0.
+    __device__ __forceinline__ float inv_scale() const
+    {
+        return __builtin_amdgcn_rcpf(dq_scale);
+    }
 };
 
 // One-shot E8M0 block scale: computes BOTH the storage byte and the f32 dequant

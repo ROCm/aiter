@@ -1,10 +1,29 @@
 import triton
 import triton.language as tl
 
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+
 PAD_SLOT_ID = -1
 
 
-@triton.jit()
+_causal_conv1d_fwd_kernel_repr = make_kernel_repr(
+    "_causal_conv1d_fwd_kernel",
+    [
+        "BLOCK_M",
+        "BLOCK_N",
+        "KERNEL_WIDTH",
+        "NP2_STATELEN",
+        "HAS_BIAS",
+        "SILU_ACTIVATION",
+        "HAS_INITIAL_STATES",
+        "HAS_CACHE",
+        "IS_CONTINUOUS_BATCHING",
+        "USE_PAD_SLOT",
+    ],
+)
+
+
+@triton.jit(repr=_causal_conv1d_fwd_kernel_repr)
 def _causal_conv1d_fwd_kernel(  # continuous batching
     # Pointers to matrices
     x_ptr,  # (dim, cu_seqlen) holding `batch` of actual sequences + padded sequences
@@ -368,7 +387,23 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
         tl.store(o_ptrs, acc, mask=mask_1d)
 
 
-@triton.jit()
+_causal_conv1d_update_kernel_repr = make_kernel_repr(
+    "_causal_conv1d_update_kernel",
+    [
+        "BLOCK_N",
+        "KERNEL_WIDTH",
+        "NP2_STATELEN",
+        "HAS_BIAS",
+        "SILU_ACTIVATION",
+        "IS_CONTINUOUS_BATCHING",
+        "IS_SPEC_DECODING",
+        "USE_PAD_SLOT",
+        "SAVE_INTERMEDIATE",
+    ],
+)
+
+
+@triton.jit(repr=_causal_conv1d_update_kernel_repr)
 def _causal_conv1d_update_kernel(
     # Pointers to matrices
     x_ptr,  # (batch, dim, seqlen)

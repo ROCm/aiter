@@ -41,6 +41,14 @@ def _gen_opus_moe_stage1_a8w4_fake_tensors(
     num_valid_ids: Tensor,
     out: Tensor,
     out_scale: Tensor,
+    topk: int,
+    block_m: int,
+    kernelName: str,
+    inter_dim_pad: int,
+    activation: int,
+    swiglu_limit: float,
+    situ_beta: float,
+    situ_linear_beta: float,
 ) -> Tensor:
     return out
 
@@ -87,7 +95,8 @@ def _make_out_scale(
     padded_rows = (sorted_size + 255) // 256 * 256
     scale_cols = inter_dim // _OPUS_MOE_STAGE1_A8W4_SCALE_GROUP
     padded_cols = (scale_cols + 7) // 8 * 8
-    return torch.zeros(
+    # Stage1 writes every valid-route scale, and Stage2 discards padding-route results.
+    return torch.empty(
         (padded_rows, padded_cols),
         dtype=torch.float8_e8m0fnu,
         device=sorted_token_ids.device,

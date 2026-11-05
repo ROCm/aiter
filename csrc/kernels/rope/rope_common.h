@@ -7630,6 +7630,29 @@ warp_rms_norm_(vec_t<T, VEC_SIZE>& input,
     }
 }
 
+// Weightless RMS normalization over one head (e.g. Gemma4 v_norm, has_weight=false):
+// same warp reduction as warp_rms_norm_ but no learned gamma multiply.
+template <typename T, int VEC_SIZE>
+__device__ __forceinline__ void
+warp_rms_norm_no_weight_(vec_t<T, VEC_SIZE>& input, float rms_dim, float rms_eps)
+{
+    float acc = 0.f;
+#pragma unroll
+    for(int i = 0; i < VEC_SIZE; ++i)
+    {
+        float v = (float)input[i];
+        acc += v * v;
+    }
+    // XOR butterfly leaves the same sum in every lane -- no extra broadcast needed.
+    acc        = block_utils::warp_reduce_sum<float>(acc);
+    auto s_val = rsqrtf(acc / rms_dim + rms_eps);
+#pragma unroll
+    for(int i = 0; i < VEC_SIZE; ++i)
+    {
+        input[i] = static_cast<T>((float)input[i] * s_val);
+    }
+}
+
 template <typename T, int VEC_SIZE, int HEAD_SIZE, bool IS_INTERLEAVED, int M>
 __device__ __forceinline__ void mrope_load_cos_sin_vec(vec_t<T, VEC_SIZE>& out,
                                                        const T* cos_sin,
@@ -7802,7 +7825,8 @@ template <typename T,
           bool IS_MROPE,
           bool IS_INTERLEAVED,
           int M,
-          typename KVT>
+          typename KVT,
+          bool HAS_Q_FP8 = false>
 __global__ void fused_mrope_rms_kv_kernel(const T* qkv,
                                           const T* q_w,
                                           const T* k_w,
@@ -7835,7 +7859,10 @@ __global__ void fused_mrope_rms_kv_kernel(const T* qkv,
                                           int64_t k_token_stride   = 0,
                                           int64_t k_head_stride    = 0,
                                           int64_t v_token_stride   = 0,
-                                          int64_t v_head_stride    = 0)
+                                          int64_t v_head_stride    = 0,
+                                          bool v_norm              = false,
+                                          KVT* q_out_fp8           = nullptr,
+                                          const float* per_tensor_q_scale = nullptr)
 {
     constexpr int VEC_SIZE        = HEAD_SIZE / WARP_SIZE;
     constexpr int HALF_HEAD_SIZE  = HEAD_SIZE / 2;
@@ -8036,6 +8063,19 @@ __global__ void fused_mrope_rms_kv_kernel(const T* qkv,
             T* q_ = &q_out[(static_cast<int64_t>(token_id) * num_heads_q + head_id_in_token) *
                            HEAD_SIZE];
             out_vec.store(q_ + access_id_in_head);
+            if constexpr(HAS_Q_FP8)
+            {
+                // Fold the Q -> fp8 quantization (static per-tensor scale) into the
+                // kernel epilogue, mirroring the K/V path, so the caller can skip a
+                // separate scaled_quant launch. The bf16 q_out above is still written
+                // for callers that consume it.
+                vec_t<KVT, VEC_SIZE> out_q_fp8_vec;
+                out_q_fp8_vec.from_(out_vec, *per_tensor_q_scale);
+                KVT* q_fp8_ =
+                    &q_out_fp8[(static_cast<int64_t>(token_id) * num_heads_q + head_id_in_token) *
+                               HEAD_SIZE];
+                out_q_fp8_vec.store(q_fp8_ + access_id_in_head);
+            }
         }
         else
         {
@@ -8092,6 +8132,11 @@ __global__ void fused_mrope_rms_kv_kernel(const T* qkv,
         vec_t<T, VEC_SIZE> out_vec;
         vec_t<KVT, VEC_SIZE> out_kv_vec;
         out_vec.load(qkv_ + access_id_in_head);
+        if(v_norm)
+        {
+            // Weightless V-norm (Gemma4 v_norm) before writing to the KV cache.
+            warp_rms_norm_no_weight_<T, VEC_SIZE>(out_vec, HEAD_SIZE, eps);
+        }
         out_kv_vec.from_(out_vec, per_tensor_v_scale);
         const int64_t slot_id = slot_mapping[token_id];
         if(slot_id < 0)
@@ -8336,9 +8381,12 @@ void fused_rope_rms_set_kv(const T* qkv,
                            int64_t k_token_stride   = 0,
                            int64_t k_head_stride    = 0,
                            int64_t v_token_stride   = 0,
-                           int64_t v_head_stride    = 0)
+                           int64_t v_head_stride    = 0,
+                           bool v_norm              = false,
+                           KVT* q_out_fp8           = nullptr,
+                           const float* per_tensor_q_scale = nullptr)
 {
-    AITER_CHECK(head_size == 64 || head_size == 128 || head_size == 256);
+    AITER_CHECK(head_size == 64 || head_size == 128 || head_size == 256 || head_size == 512);
     // po2_div/po2_mod in the paged and shuffle-layout address math assume these are
     // powers of two. Every vLLM block_size and every x = 16 / sizeof(elem) satisfies
     // it, but check rather than corrupt the cache silently if that ever changes.
@@ -8346,6 +8394,17 @@ void fused_rope_rms_set_kv(const T* qkv,
                 "block_size must be a power of 2, got ", block_size);
     AITER_CHECK(!use_shuffle_layout || (x > 0 && (x & (x - 1)) == 0),
                 "x must be a power of 2 when use_shuffle_layout is set, got ", x);
+    // The shuffle-layout K write is a single contiguous vec_t store of
+    // VEC_SIZE = head_size / WARP_SIZE elements, and get_shuffle_layout_k_base()
+    // assumes all of them land in one x-wide chunk (VEC_SIZE <= x). For
+    // head_size=512 at WARP_SIZE=32, VEC_SIZE=16 which exceeds x=8 for bf16/fp16
+    // caches (x = 16 / sizeof(elem)), so reject shuffle layout unless x >= VEC_SIZE.
+    // (Otherwise a single contiguous vec_t store can cross chunk boundaries and misaddress K.)
+    AITER_CHECK(!use_shuffle_layout || x >= head_size / WARP_SIZE,
+                "use_shuffle_layout requires x >= head_size / WARP_SIZE (",
+                head_size / WARP_SIZE,
+                "), got x=",
+                x);
     constexpr int THREAD_BLOCK_SIZE = 256;
     auto total_warps                = num_tokens * (num_heads_q + num_heads_k + num_heads_v);
     auto num_warps_per_block        = THREAD_BLOCK_SIZE / WARP_SIZE;
@@ -8353,10 +8412,11 @@ void fused_rope_rms_set_kv(const T* qkv,
     dim3 numBlocks((total_warps + num_warps_per_block - 1) / num_warps_per_block);
     std::array<int64_t, 1> mrope_section = {0};
 
-#define DISPATCH_NEOX(HEAD_SIZE)                                             \
+#define DISPATCH_NEOX(HEAD_SIZE, HAS_Q_FP8)                                  \
     if(is_neox_style)                                                        \
     {                                                                        \
-        fused_mrope_rms_kv_kernel<T, HEAD_SIZE, true, false, false, 1, KVT>  \
+        fused_mrope_rms_kv_kernel<T, HEAD_SIZE, true, false, false, 1, KVT,  \
+                                  HAS_Q_FP8>                                 \
             <<<numBlocks, threadsPerBlock, 0, stream>>>(qkv,                 \
                                                         q_w,                 \
                                                         k_w,                 \
@@ -8389,11 +8449,15 @@ void fused_rope_rms_set_kv(const T* qkv,
                                                         k_token_stride,      \
                                                         k_head_stride,       \
                                                         v_token_stride,      \
-                                                        v_head_stride);      \
+                                                        v_head_stride,       \
+                                                        v_norm,              \
+                                                        q_out_fp8,           \
+                                                        per_tensor_q_scale); \
     }                                                                        \
     else                                                                     \
     {                                                                        \
-        fused_mrope_rms_kv_kernel<T, HEAD_SIZE, false, false, false, 1, KVT> \
+        fused_mrope_rms_kv_kernel<T, HEAD_SIZE, false, false, false, 1, KVT, \
+                                  HAS_Q_FP8>                                 \
             <<<numBlocks, threadsPerBlock, 0, stream>>>(qkv,                 \
                                                         q_w,                 \
                                                         k_w,                 \
@@ -8426,14 +8490,31 @@ void fused_rope_rms_set_kv(const T* qkv,
                                                         k_token_stride,      \
                                                         k_head_stride,       \
                                                         v_token_stride,      \
-                                                        v_head_stride);      \
+                                                        v_head_stride,       \
+                                                        v_norm,              \
+                                                        q_out_fp8,           \
+                                                        per_tensor_q_scale); \
     }
 
-    switch(head_size)
+    if(q_out_fp8 != nullptr)
     {
-    case 64: DISPATCH_NEOX(64) break;
-    case 128: DISPATCH_NEOX(128) break;
-    case 256: DISPATCH_NEOX(256) break;
+        switch(head_size)
+        {
+        case 64: DISPATCH_NEOX(64, true) break;
+        case 128: DISPATCH_NEOX(128, true) break;
+        case 256: DISPATCH_NEOX(256, true) break;
+        case 512: DISPATCH_NEOX(512, true) break;
+        }
+    }
+    else
+    {
+        switch(head_size)
+        {
+        case 64: DISPATCH_NEOX(64, false) break;
+        case 128: DISPATCH_NEOX(128, false) break;
+        case 256: DISPATCH_NEOX(256, false) break;
+        case 512: DISPATCH_NEOX(512, false) break;
+        }
     }
 
 #undef DISPATCH_NEOX

@@ -4,7 +4,7 @@
 #include "rocm_ops.hpp"
 #include "sample.h"
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
 {
     SAMPLE_PYBIND;
 }

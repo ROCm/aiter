@@ -1,4 +1,3 @@
-import argparse
 import sys
 
 import torch
@@ -6,6 +5,9 @@ import triton
 
 from aiter.ops.triton.attention.hstu_attention import _AttentionFunction
 from aiter.ops.triton.utils.types import str_to_torch_dtype
+from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_parser,
+)
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,
     print_vgpr,
@@ -73,8 +75,6 @@ def run_benchmark(args):
         "time": "Time_(ms)",
         "bandwidth": "Bandwidth_(GB/s)",  # spaces break prettytable parsing
     }
-    line_names = [evaluation_metric_to_unit[args.metric]]
-    line_vals = line_names
     modes = [args.mode]
     if args.mode == "both":
         modes = ["fwd", "bwd"]
@@ -82,18 +82,25 @@ def run_benchmark(args):
     configs = []
     for mode in modes:
         metric = args.metric
-        # backward only support time metric
+        # backward only supports the time metric; force it (and the column
+        # label + ylabel) so the reported values are never mislabeled.
         if mode == "bwd":
             metric = "time"
+        if metric == "time":
             ylabel = "Time (ms)"
+        elif metric == "throughput":
+            ylabel = "Throughput (TFLOPS)"
+        else:
+            ylabel = "Bandwidth (GBs)"
 
+        unit = evaluation_metric_to_unit[metric]
         configs.append(
             triton.testing.Benchmark(
                 x_names=x_names,
                 x_vals=x_val_list,
                 line_arg="unit",
-                line_vals=line_vals,
-                line_names=line_names,
+                line_vals=[unit],
+                line_names=[unit],
                 styles=[("green", "-")],
                 ylabel=ylabel,
                 plot_name=get_caller_name_no_ext(),
@@ -120,7 +127,9 @@ def run_benchmark(args):
         ], "only fp16 or bf16 data types are supported!"
         dropout_pr = 0.0
         target_size: int = 20
-        sl_alpha: float = 2.0
+        # apply_SL clamps long sequences to ~N^(sl_alpha/2). sl_alpha=2.0 is
+        # effectively no clamp; 1.7 matches the HSTU length distribution.
+        sl_alpha: float = args.sl_alpha
         dtype = str_to_torch_dtype[type_str]
 
         invalid_attn_mask_type = "lower_triangular"
@@ -173,43 +182,94 @@ def run_benchmark(args):
             contextual_seq_len=0,
         )
 
-        def attn_fwd():
-            return _AttentionFunction.apply(
-                max_seq_len,
-                alpha,
-                q,
-                k,
-                v,
-                seq_offsets,
-                causal,
-                num_targets,
-                0,  # max_attn_len,
-                0,  # contextual_seq_len
-                True,  # sort_by_length,
+        provider = args.provider
+
+        if provider == "flydsl":
+            # FlyDSL: fwd returns O; bwd is a self-contained op returning
+            # (dq, dk, dv) (recomputes S internally, launches dV/dK/dQ). No
+            # autograd wrapper needed. Same alpha / inputs / FLOPs formula as the
+            # aiter_triton path for an apples-to-apples comparison.
+            from aiter.ops.flydsl.hstu_attention import (
+                flydsl_hstu_attention_bwd,
+                flydsl_hstu_attention_fwd,
             )
 
-        if mode == "fwd":
-            ms = triton.testing.do_bench(
-                attn_fwd,
-                warmup=25,
-                rep=100,
-            )
-        else:
-            q.requires_grad_(True)
-            k.requires_grad_(True)
-            v.requires_grad_(True)
+            if mode == "fwd":
 
-            o = attn_fwd()
-            do = torch.randn_like(o)
+                def run_fwd():
+                    return flydsl_hstu_attention_fwd(
+                        max_seq_len,
+                        alpha,
+                        q,
+                        k,
+                        v,
+                        seq_offsets,
+                        causal,
+                        num_targets,
+                        0,
+                        0,
+                    )
 
-            def attn_bwd():
-                return o.backward(do, retain_graph=True)
+                ms = triton.testing.do_bench(run_fwd, warmup=25, rep=100)
+            else:
+                do = torch.randn_like(v)
 
-            ms = triton.testing.do_bench(
-                attn_bwd,
-                warmup=25,
-                rep=100,
-            )
+                def run_bwd():
+                    return flydsl_hstu_attention_bwd(
+                        max_seq_len,
+                        alpha,
+                        q,
+                        k,
+                        v,
+                        do,
+                        seq_offsets,
+                        causal,
+                        num_targets,
+                        0,
+                        0,
+                        sort_by_length=args.sort_by_length,
+                    )
+
+                ms = triton.testing.do_bench(run_bwd, warmup=25, rep=100)
+        else:  # aiter_triton
+
+            def attn_fwd():
+                return _AttentionFunction.apply(
+                    max_seq_len,
+                    alpha,
+                    q,
+                    k,
+                    v,
+                    seq_offsets,
+                    causal,
+                    num_targets,
+                    0,  # max_attn_len,
+                    0,  # contextual_seq_len
+                    args.sort_by_length,  # sort_by_length
+                )
+
+            if mode == "fwd":
+                ms = triton.testing.do_bench(
+                    attn_fwd,
+                    warmup=25,
+                    rep=100,
+                )
+            else:
+                q.requires_grad_(True)
+                k.requires_grad_(True)
+                v.requires_grad_(True)
+
+                o = attn_fwd()
+                do = torch.randn_like(o)
+
+                def attn_bwd():
+                    return o.backward(do, retain_graph=True)
+
+                ms = triton.testing.do_bench(
+                    attn_bwd,
+                    warmup=25,
+                    rep=100,
+                )
 
         # Return exactly one scalar depending on which metric is active
         if metric == "time":
@@ -232,11 +292,7 @@ def run_benchmark(args):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        prog="Benchmark HSTU Attention",
-        allow_abbrev=False,
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
+    parser = get_parser(kernel_name="HSTU Attention")
     parser.add_argument(
         "--b",
         type=int,
@@ -281,11 +337,31 @@ def parse_args():
     )
 
     parser.add_argument(
-        "--metric",
+        "--provider",
         type=str,
-        choices=["time", "throughput", "bandwidth"],
-        default="throughput",
-        help="metric to plot",
+        choices=["aiter_triton", "flydsl"],
+        default="aiter_triton",
+        help="kernel implementation to benchmark",
+    )
+
+    parser.add_argument(
+        "--sl_alpha",
+        type=float,
+        default=2.0,
+        help=(
+            "apply_SL clamp exponent (~N^(sl_alpha/2)). 2.0 = near-unclamped "
+            "(heavy); 1.7 = HSTU deployment distribution."
+        ),
+    )
+
+    parser.add_argument(
+        "--sort_by_length",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable sort-by-length load balancing in the bwd (FlyDSL: group-aware "
+            "batch remap; AITER-Triton: its native sort_by_length). fwd unaffected."
+        ),
     )
 
     parser.add_argument(
@@ -307,7 +383,6 @@ def parse_args():
         default=False,
         help="Run user input info",
     )
-
     parser.add_argument(
         "-o", action="store_true", help="Write performance results to CSV file"
     )
@@ -320,7 +395,10 @@ def main():
     args = parse_args()
     if args.print_vgpr:
         print("Retrieving VGPR usage for Triton kernels...")
-        fun = lambda: run_benchmark(args)
+
+        def fun():
+            run_benchmark(args)
+
         print_vgpr(fun, get_caller_name_no_ext())
         return 0
     run_benchmark(args)

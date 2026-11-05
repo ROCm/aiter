@@ -97,6 +97,8 @@ def flydsl_a16w4_gemm1(
     the W-load cache modifier (0=cached, 2=nt), taken as-is (nt when unset).
 
     ``situ_beta``/``situ_linear_beta`` (SiTUv2 only) are runtime f32 scalars (nothing baked).
+    ``swiglu_limit`` is the SiLU / SwiGLU / SiTUv2 clamp bound; SiLU treats a
+    falsy or +inf limit as no clamp (``runtime_swiglu_limit``).
     """
     if k_batch != 1:
         raise NotImplementedError(f"a16w4 gemm1 only supports k_batch=1, got {k_batch}")
@@ -139,7 +141,7 @@ def flydsl_a16w4_gemm1(
         w_dtype=w_dtype,
         w_layout=w_layout,
         k_wave=k_wave,
-        use_k16="gfx95" not in str(get_rocm_arch()),
+        rocm_arch=str(get_rocm_arch()),
     )
     max_m_blocks = int(sorted_expert_ids.numel())
     grid = gemm1_a16w4_grid(BM, INTER=D_INTER, TILE_N=TILE_N, max_m_blocks=max_m_blocks)
@@ -198,6 +200,8 @@ def flydsl_a16w4_gemm2(
     xcd_swizzle=1,
     w_dtype="fp4",
     persist=None,
+    epilog="atomic",
+    use_valid_token_count=False,
     stream=None,
 ):
     """a16w4/a16wi4/a16w16 fused stage2 (down-proj). Consumes the bf16 [sorted_size,
@@ -245,7 +249,10 @@ def flydsl_a16w4_gemm2(
         waves_per_eu=waves_per_eu,
         w_dtype=w_dtype,
         persist=_persist,
-        use_k16="gfx95" not in str(get_rocm_arch()),
+        rocm_arch=str(get_rocm_arch()),
+        epilog=epilog,
+        topk=topk,
+        use_valid_token_count=use_valid_token_count,
     )
     grid = gemm2_a16w4_grid(
         BM, N_OUT=D_HIDDEN, TILE_N=TILE_N, max_m_blocks=max_m_blocks, persist=_persist

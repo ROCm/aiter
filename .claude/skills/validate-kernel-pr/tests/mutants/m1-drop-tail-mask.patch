@@ -1,0 +1,25 @@
+diff --git a/kernels/norm/softmax_kernel.py b/kernels/norm/softmax_kernel.py
+index b68a25a3..b1955770 100644
+--- a/kernels/norm/softmax_kernel.py
++++ b/kernels/norm/softmax_kernel.py
+@@ -231,14 +231,13 @@ def build_softmax_module(M: int, N: int, dtype_str: str = "f32"):
+                 idx = tid + base
+                 exp_val, is_valid = new_buffer[buf_idx]
+                 buf_idx += 1
+-                if idx < N:
+-                    norm_val = fx.Float32(exp_val) * inv_sum
++                norm_val = fx.Float32(exp_val) * inv_sum
++                out_e = norm_val
++                if const_expr(dtype_str == "f32"):
+                     out_e = norm_val
+-                    if const_expr(dtype_str == "f32"):
+-                        out_e = norm_val
+-                    else:
+-                        out_e = norm_val.to(elem_dtype)
+-                    _store_scalar(c_div, idx, out_e)
++                else:
++                    out_e = norm_val.to(elem_dtype)
++                _store_scalar(c_div, idx, out_e)
+ 
+     @flyc.jit
+     def launch_softmax(

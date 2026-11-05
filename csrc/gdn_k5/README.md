@@ -1,6 +1,6 @@
 # FlyDSL K5 opt BV Tune
 
-Model untuned/tuned CSVs live under `aiter/configs/model_configs/` (`qwen3_5_*_chunk_gdn_h_opt_{un,t}uned.csv`). Untuned tables are shape-only; `cu_num` lives in tuned rows. Newly tuned rows belong in the per-model tuned table, not in the canonical one. Prefill cases are in `op_tests/flydsl_tests/test_flydsl_linear_attention_prefill.py`.
+Model untuned/tuned CSVs live under `aiter/configs/model_configs/` (`qwen3_5_*_chunk_gdn_h_opt_{un,t}uned.csv`). Untuned tables are shape-only; `cu_num` lives in tuned rows. Newly tuned rows belong in the per-model tuned table, not in the canonical one. Prefill cases are in `op_tests/test_flydsl_linear_attention_prefill.py`.
 
 Two header-only files under `aiter/configs/` back the merge that `AITER_CONFIG_GDN_K5_OPT` performs (and that the opt AOT reads):
 

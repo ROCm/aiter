@@ -18,7 +18,7 @@ import triton.language as tl
 from torch import Tensor
 
 if TYPE_CHECKING:
-    from .iris import IrisCommContext
+    from aiter.ops.triton.comms.iris import IrisCommContext
 
 
 # If we got here, iris is available
@@ -210,7 +210,12 @@ def all_gather(
     M = M_shard * world_size
 
     logger.info(
-        f"Rank {cur_rank}/{world_size}: All-gather M_shard={M_shard}, N={N} -> M={M}"
+        "Rank %d/%d: All-gather M_shard=%d, N=%d -> M=%d",
+        cur_rank,
+        world_size,
+        M_shard,
+        N,
+        M,
     )
 
     # Allocate output buffer in IRIS shared memory
@@ -245,7 +250,7 @@ def all_gather(
     iris_ctx.barrier()
 
     logger.info(
-        f"Rank {cur_rank}: All-gather complete, output shape: {full_output.shape}"
+        "Rank %d: All-gather complete, output shape: %s", cur_rank, full_output.shape
     )
 
     return full_output

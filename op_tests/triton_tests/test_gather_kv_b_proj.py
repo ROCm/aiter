@@ -6,11 +6,11 @@ import random
 import pytest
 import torch
 
-from aiter import dtypes
+from aiter import dtypes, logger
 from aiter.ops.shuffle import shuffle_scale, shuffle_weight
 from aiter.ops.triton.gather_kv_b_proj import gather_kv_b_proj
 from aiter.ops.triton.utils._triton import arch_info
-from aiter.test_common import checkAllclose, run_perftest
+from aiter.test_common import assertAllclose, run_perftest
 from aiter.utility.fp4_utils import e8m0_to_f32, mxfp4_to_f32
 from op_tests.triton_tests.attention.test_mla import shuffle_kv_buffer
 from op_tests.triton_tests.quant.test_quant_mxfp4 import torch_dynamic_mxfp4_quant
@@ -173,15 +173,12 @@ def _make_kv_test_data(
     k_scale = torch.randn(1, device=device, dtype=torch.float32).abs()
 
     var_ratio = 0.2
-    context_lens = (
-        torch.randint(
-            int((1 - var_ratio) * avg_kv_length),
-            int(((1 + var_ratio)) * avg_kv_length) + 1,
-            (batch_size,),
-        )
-        .cuda()
-        .to(torch.int32)
-    )
+    context_lens = torch.randint(
+        int((1 - var_ratio) * avg_kv_length),
+        int(((1 + var_ratio)) * avg_kv_length) + 1,
+        (batch_size,),
+        device="cuda",
+    ).to(torch.int32)
     context_blocks = torch.div(
         context_lens + block_size - 1, block_size, rounding_mode="trunc"
     )
@@ -250,15 +247,12 @@ def test_gather_kv_b_proj(
 
     # Generate random kv_indptr and kv_indices
     var_ratio = 0.2
-    context_lens = (
-        torch.randint(
-            int((1 - var_ratio) * avg_kv_length),
-            int(((1 + var_ratio)) * avg_kv_length) + 1,
-            (batch_size,),
-        )
-        .cuda()
-        .to(torch.int32)
-    )
+    context_lens = torch.randint(
+        int((1 - var_ratio) * avg_kv_length),
+        int(((1 + var_ratio)) * avg_kv_length) + 1,
+        (batch_size,),
+        device="cuda",
+    ).to(torch.int32)
     context_blocks = torch.div(
         context_lens + block_size - 1, block_size, rounding_mode="trunc"
     )
@@ -333,8 +327,8 @@ def test_gather_kv_b_proj(
     )
 
     # Validate results
-    checkAllclose(k_ref, k_prefix, atol=1e-2, rtol=1e-2)
-    checkAllclose(v_ref, v_prefix, atol=1e-2, rtol=1e-2)
+    assertAllclose(k_ref, k_prefix, atol=1e-2, rtol=1e-2, msg="k")
+    assertAllclose(v_ref, v_prefix, atol=1e-2, rtol=1e-2, msg="v")
 
     if perf:
         _, elapsed_us = run_perftest(
@@ -358,10 +352,17 @@ def test_gather_kv_b_proj(
         )
         tflops = total_float_operations / elapsed_us * 1e-6
 
-        print(">>> Performance gather_kv_b_proj:")
-        print(
-            f">>>   batch {batch_size}, block_size {block_size}, tp_k_head_num {tp_k_head_num}, kv_c_dim {kv_c_dim}, qk_nope_head_dim {qk_nope_head_dim}, kv_length {avg_kv_length}\n"
-            f">>>       elapsed={elapsed_us:.2f}us, TFLOPS={tflops:.2f}"
+        logger.info(">>> Performance gather_kv_b_proj:")
+        logger.info(
+            ">>>   batch %d, block_size %d, tp_k_head_num %d, kv_c_dim %d, qk_nope_head_dim %d, kv_length %d\n>>>       elapsed=%.2fus, TFLOPS=%.2f",
+            batch_size,
+            block_size,
+            tp_k_head_num,
+            kv_c_dim,
+            qk_nope_head_dim,
+            avg_kv_length,
+            elapsed_us,
+            tflops,
         )
 
 
@@ -398,15 +399,12 @@ def test_gather_kv_b_proj_per_row_scale(
     k_scale = torch.randn(1, device=device, dtype=torch.float32).abs()
 
     var_ratio = 0.2
-    context_lens = (
-        torch.randint(
-            int((1 - var_ratio) * avg_kv_length),
-            int(((1 + var_ratio)) * avg_kv_length) + 1,
-            (batch_size,),
-        )
-        .cuda()
-        .to(torch.int32)
-    )
+    context_lens = torch.randint(
+        int((1 - var_ratio) * avg_kv_length),
+        int(((1 + var_ratio)) * avg_kv_length) + 1,
+        (batch_size,),
+        device="cuda",
+    ).to(torch.int32)
     context_blocks = torch.div(
         context_lens + block_size - 1, block_size, rounding_mode="trunc"
     )
@@ -477,8 +475,8 @@ def test_gather_kv_b_proj_per_row_scale(
         weight_preshuffle=weight_preshuffle,
     )
 
-    checkAllclose(k_ref, k_prefix, atol=1e-2, rtol=1e-2)
-    checkAllclose(v_ref, v_prefix, atol=1e-2, rtol=1e-2)
+    assertAllclose(k_ref, k_prefix, atol=1e-2, rtol=1e-2, msg="k")
+    assertAllclose(v_ref, v_prefix, atol=1e-2, rtol=1e-2, msg="v")
 
     if perf:
         _, elapsed_us = run_perftest(
@@ -502,10 +500,17 @@ def test_gather_kv_b_proj_per_row_scale(
         )
         tflops = total_float_operations / elapsed_us * 1e-6
 
-        print(">>> Performance gather_kv_b_proj_per_row_scale:")
-        print(
-            f">>>   batch {batch_size}, block_size {block_size}, tp_k_head_num {tp_k_head_num}, kv_c_dim {kv_c_dim}, qk_nope_head_dim {qk_nope_head_dim}, kv_length {avg_kv_length}\n"
-            f">>>       elapsed={elapsed_us:.2f}us, TFLOPS={tflops:.2f}"
+        logger.info(">>> Performance gather_kv_b_proj_per_row_scale:")
+        logger.info(
+            ">>>   batch %d, block_size %d, tp_k_head_num %d, kv_c_dim %d, qk_nope_head_dim %d, kv_length %d\n>>>       elapsed=%.2fus, TFLOPS=%.2f",
+            batch_size,
+            block_size,
+            tp_k_head_num,
+            kv_c_dim,
+            qk_nope_head_dim,
+            avg_kv_length,
+            elapsed_us,
+            tflops,
         )
 
 
@@ -551,15 +556,12 @@ def test_gather_kv_b_proj_bf16_weight(
     k_scale = torch.randn(1, device=device, dtype=torch.float32).abs()
 
     var_ratio = 0.2
-    context_lens = (
-        torch.randint(
-            int((1 - var_ratio) * avg_kv_length),
-            int(((1 + var_ratio)) * avg_kv_length) + 1,
-            (batch_size,),
-        )
-        .cuda()
-        .to(torch.int32)
-    )
+    context_lens = torch.randint(
+        int((1 - var_ratio) * avg_kv_length),
+        int(((1 + var_ratio)) * avg_kv_length) + 1,
+        (batch_size,),
+        device="cuda",
+    ).to(torch.int32)
     context_blocks = torch.div(
         context_lens + block_size - 1, block_size, rounding_mode="trunc"
     )
@@ -634,8 +636,8 @@ def test_gather_kv_b_proj_bf16_weight(
         weight_preshuffle=weight_preshuffle,
     )
 
-    checkAllclose(k_ref, k_prefix, atol=1e-2, rtol=1e-2)
-    checkAllclose(v_ref, v_prefix, atol=1e-2, rtol=1e-2)
+    assertAllclose(k_ref, k_prefix, atol=1e-2, rtol=1e-2, msg="k")
+    assertAllclose(v_ref, v_prefix, atol=1e-2, rtol=1e-2, msg="v")
 
     if perf:
         _, elapsed_us = run_perftest(
@@ -659,12 +661,18 @@ def test_gather_kv_b_proj_bf16_weight(
         )
         tflops = total_float_operations / elapsed_us * 1e-6
 
-        print(">>> Performance gather_kv_b_proj_bf16_weight:")
-        print(
-            f">>>   batch {batch_size}, block_size {block_size}, tp_k_head_num {tp_k_head_num}, "
-            f"kv_c_dim {kv_c_dim}, qk_nope_head_dim {qk_nope_head_dim}, kv_length {avg_kv_length}, "
-            f"scale_mode {scale_mode}\n"
-            f">>>       elapsed={elapsed_us:.2f}us, TFLOPS={tflops:.2f}"
+        logger.info(">>> Performance gather_kv_b_proj_bf16_weight:")
+        logger.info(
+            ">>>   batch %d, block_size %d, tp_k_head_num %d, kv_c_dim %d, qk_nope_head_dim %d, kv_length %d, scale_mode %s\n>>>       elapsed=%.2fus, TFLOPS=%.2f",
+            batch_size,
+            block_size,
+            tp_k_head_num,
+            kv_c_dim,
+            qk_nope_head_dim,
+            avg_kv_length,
+            scale_mode,
+            elapsed_us,
+            tflops,
         )
 
 
@@ -776,8 +784,8 @@ def test_gather_kv_b_proj_asymmetric_dims(
         weight_preshuffle=weight_preshuffle,
     )
 
-    checkAllclose(k_ref, k_prefix, atol=1e-2, rtol=1e-2)
-    checkAllclose(v_ref, v_prefix, atol=1e-2, rtol=1e-2)
+    assertAllclose(k_ref, k_prefix, atol=1e-2, rtol=1e-2, msg="k")
+    assertAllclose(v_ref, v_prefix, atol=1e-2, rtol=1e-2, msg="v")
 
 
 @pytest.mark.skipif(
@@ -868,8 +876,8 @@ def test_gather_kv_b_proj_mxfp4_weight(k_buffer_type, weight_preshuffle):
         weight_preshuffle=weight_preshuffle,
     )
 
-    checkAllclose(k_ref, k_prefix, atol=1e-1, rtol=1e-1)
-    checkAllclose(v_ref, v_prefix, atol=1e-1, rtol=1e-1)
+    assertAllclose(k_ref, k_prefix, atol=1e-1, rtol=1e-1, msg="k")
+    assertAllclose(v_ref, v_prefix, atol=1e-1, rtol=1e-1, msg="v")
 
 
 @pytest.mark.skipif(
@@ -963,8 +971,8 @@ def test_gather_kv_b_proj_mxfp4_oversized_kv_indices(weight_preshuffle):
         weight_preshuffle=weight_preshuffle,
     )
 
-    checkAllclose(k_ref, k_prefix, atol=1e-1, rtol=1e-1)
-    checkAllclose(v_ref, v_prefix, atol=1e-1, rtol=1e-1)
+    assertAllclose(k_ref, k_prefix, atol=1e-1, rtol=1e-1, msg="k")
+    assertAllclose(v_ref, v_prefix, atol=1e-1, rtol=1e-1, msg="v")
 
 
 @pytest.mark.parametrize(
@@ -1024,15 +1032,12 @@ def test_gather_kv_b_proj_shuffled_kv(
     k_scale = torch.randn(1, device=device, dtype=torch.float32).abs()
 
     var_ratio = 0.2
-    context_lens = (
-        torch.randint(
-            int((1 - var_ratio) * avg_kv_length),
-            int(((1 + var_ratio)) * avg_kv_length) + 1,
-            (batch_size,),
-        )
-        .cuda()
-        .to(torch.int32)
-    )
+    context_lens = torch.randint(
+        int((1 - var_ratio) * avg_kv_length),
+        int(((1 + var_ratio)) * avg_kv_length) + 1,
+        (batch_size,),
+        device="cuda",
+    ).to(torch.int32)
     context_blocks = torch.div(
         context_lens + block_size - 1, block_size, rounding_mode="trunc"
     )
@@ -1146,14 +1151,8 @@ def test_gather_kv_b_proj_shuffled_kv(
     # FP4 weight reconstruction carries more error than fp8/bf16 weight.
     atol = 1e-1 if is_mxfp4_weight else 1e-2
     rtol = 1e-1 if is_mxfp4_weight else 1e-2
-    # checkAllclose only logs; assert here so the test actually fails on a
-    # mismatch instead of silently passing.
-    for name, got, ref in (("k", k_prefix, k_ref), ("v", v_prefix, v_ref)):
-        checkAllclose(ref, got, atol=atol, rtol=rtol)
-        bad = (~torch.isclose(ref, got, atol=atol, rtol=rtol)).float().mean().item()
-        assert (
-            bad <= 1e-3
-        ), f"{name}: {bad:.3%} of elements exceed atol={atol} rtol={rtol}"
+    assertAllclose(k_ref, k_prefix, atol=atol, rtol=rtol, msg="k")
+    assertAllclose(v_ref, v_prefix, atol=atol, rtol=rtol, msg="v")
 
     if perf:
         _, elapsed_us = run_perftest(
@@ -1170,11 +1169,15 @@ def test_gather_kv_b_proj_shuffled_kv(
             weight_preshuffle=weight_preshuffle,
             shuffled_kv_cache=True,
         )
-        print(
-            f">>> Performance gather_kv_b_proj_shuffled_kv ({scale_mode}):\n"
-            f">>>   batch {batch_size}, block_size {block_size}, tp_k_head_num {tp_k_head_num}, "
-            f"kv_length {avg_kv_length}, ktype {k_buffer_type}\n"
-            f">>>       elapsed={elapsed_us:.2f}us"
+        logger.info(
+            ">>> Performance gather_kv_b_proj_shuffled_kv (%s):\n>>>   batch %d, block_size %d, tp_k_head_num %d, kv_length %d, ktype %s\n>>>       elapsed=%.2fus",
+            scale_mode,
+            batch_size,
+            block_size,
+            tp_k_head_num,
+            avg_kv_length,
+            k_buffer_type,
+            elapsed_us,
         )
 
 

@@ -14,7 +14,8 @@
 using MoeKernelMap = std::unordered_map<std::string, MoeKernel>;
 
 // Map aiter ActivationType (stage1) to the CK stage1 activation op value.
-// CK act values: gelu=0, silu=1, swiglu(OAI swiglu_oai)=3. Value 2 is reserved.
+// CK act values: gelu=0, silu=1, swiglu(OAI swiglu_oai)=3, gelu_tanh_and_mul=4.
+// Value 2 is reserved.
 static inline int map_activation_to_ck_stage1(int activation)
 {
     switch (static_cast<ActivationType>(activation))
@@ -25,6 +26,8 @@ static inline int map_activation_to_ck_stage1(int activation)
         return 0;
     case ActivationType::Swiglu:
         return 3;
+    case ActivationType::GeluTanh:
+        return 4;
     default:
         TORCH_CHECK(false, "Unsupported activation for ck_moe_stage1: ", activation);
         return -1;

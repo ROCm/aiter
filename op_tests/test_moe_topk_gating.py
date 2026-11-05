@@ -7,12 +7,16 @@ various configurations.
 
 Usage:
   python test_moe_topk_gating.py --num-experts 64,128 --topk 2,4,8 --dtype fp16
-  python test_moe_topk_gating.py --score-func softmax --topk 8
-  python test_moe_topk_gating.py --score-func sigmoid,softmax --num-tokens 64,1024
+  python test_moe_topk_gating.py --section softmax --topk 8
+  python test_moe_topk_gating.py --section sigmoid,softmax --num-tokens 64,1024
+  python test_moe_topk_gating.py --section ties,eplb
+  python test_moe_topk_gating.py --section biased-sigmoid --num-experts 896 \
+      --num-tokens 1,8,32,128 --topk 16 --dtype bf16
 """
 
 import argparse
 import itertools
+import math
 import os
 import sys
 
@@ -21,6 +25,7 @@ import torch
 
 import aiter
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.topk import biased_grouped_topk, biased_grouped_topk_hip
 from aiter.test_common import (
     benchmark,
     checkAllclose,
@@ -50,8 +55,32 @@ torch.set_default_device("cuda")
 _TIE_TOL = 1e-4
 
 _WEIGHT_TOL = 1e-4
+# sigmoid of a low-precision logit is computed in fp32 on both sides, but the
+# legacy launcher is allowed bf16/fp16 rounding on the stored weight.
+_SHARED_ATOL = {torch.float16: 2e-2, torch.bfloat16: 2e-2, torch.float32: 1e-4}
 
-SUPPORTED_GFX = ["gfx942", "gfx950"]
+
+def _renorm_err(topk_weights):
+    """Max |sum(weights) - 1| per row, with non-finite mapped to a failing value.
+
+    A NaN weight makes the raw error NaN, and `NaN > _WEIGHT_TOL` is false, so
+    reporting it unmapped would let invalid weights pass as success.
+    """
+    err = float((topk_weights.sum(-1) - 1.0).abs().max())
+    return err if math.isfinite(err) else float("inf")
+
+
+# EP world size assumed by the eplb section; experts are sharded contiguously,
+# so rank r owns [r * num_experts / _EPLB_EP_SIZE, (r + 1) * ...).
+_EPLB_EP_SIZE = 4
+
+# prefill_n expert counts that CI must hit for softmax. Not in the global
+# default: putting them there also ran sigmoid and nan, where E=640 bf16
+# already mismatches indices and the large-T smem fallback fails the
+# starved-row check (T=4096/16384 sit above the E=512/640 prefill_n gates).
+_SOFTMAX_PREFILL_N_EXPERTS = [512, 640]
+
+SUPPORTED_GFX = ["gfx942", "gfx950", "gfx1250"]
 
 
 def _selection_scores(
@@ -253,6 +282,69 @@ def _ref_selection_with_nan(gating_output, bias, score_func):
     return sel.masked_fill(exclude, float("-inf"))
 
 
+def _starved_rows_ok(num_experts, num_tokens, topk, score_func, dtype):
+    """Does a row the kernel cannot fill degrade the documented way?
+
+    Such a row cannot fill every slot, so the kernel elects a sentinel for the
+    remainder, and what that sentinel is worth decides how far the damage goes.
+    Reaching the renorm sum, it drops the sum to RENORM_SUM_FLOOR and rescales
+    the row's *valid* weights by ~1e20, so one starved row corrupts the experts
+    it did resolve. Keeping a weight of its own is worse: the slot becomes a
+    real routing decision for a token that has none to make.
+
+    Three poisoned rows. Rows 0 and 2 have no valid expert at all and must come
+    out all-zero. They reach that state by different routes -- a NaN is scrubbed
+    out of the selection score, a -Inf is already the bottom of it -- and since
+    masking an expert out with -Inf is a normal thing for a caller to do, both
+    are real inputs rather than one being a theoretical variant of the other.
+    Row 1 is short by exactly one slot and must weight precisely its valid
+    experts: an id set, so a sentinel that either takes a slot or duplicates a
+    real expert fails. Only weights are checked on the dead rows, because the
+    sentinel ids there are allowed to repeat -- a zero weight makes them inert.
+    Reuses the sweep's token count to keep the same dispatch path as the
+    measured case.
+    """
+    gating_output = _make_gating(num_experts, num_tokens, dtype)
+    gating_output[0, :] = float("nan")  # no valid expert at all
+    dead_rows = [0]
+    starved_row = 1 if (num_tokens > 1 and topk > 1) else None
+    valid_experts = []
+    if starved_row is not None:
+        # Short by one slot. Distinct logits, so no tie-break is involved.
+        valid_experts = [(5 + i) % num_experts for i in range(topk - 1)]
+        gating_output[starved_row, :] = float("nan")
+        for i, e in enumerate(valid_experts):
+            gating_output[starved_row, e] = 1.0 + 0.5 * i
+    if num_tokens > 2:
+        gating_output[2, :] = float("-inf")  # masked out rather than invalid
+        dead_rows.append(2)
+
+    topk_weights = torch.empty((num_tokens, topk), dtype=torch.float32, device="cuda")
+    topk_ids = torch.empty((num_tokens, topk), dtype=torch.int32, device="cuda")
+    aiter.topk_gating(
+        topk_weights,
+        topk_ids,
+        gating_output,
+        None,
+        need_renorm=score_func != "softmax",
+        routed_scaling_factor=2.5,
+        score_func=score_func,
+    )
+
+    if not topk_weights.isfinite().all().item():
+        return False
+    if ((topk_ids < 0) | (topk_ids >= num_experts)).any().item():
+        return False
+    for row in dead_rows:
+        if (topk_weights[row] != 0.0).any().item():
+            return False
+    if starved_row is not None:
+        held = topk_ids[starved_row][topk_weights[starved_row] != 0.0]
+        if sorted(held.tolist()) != sorted(valid_experts):
+            return False
+    return True
+
+
 # ---------------------------------------------------------------------------
 # topk_sigmoid (Llama4 routing, via topk_gating score_func="sigmoid")
 # ---------------------------------------------------------------------------
@@ -300,6 +392,63 @@ def bench_topk_sigmoid(num_experts, num_tokens, topk, dtype):
         ret[f"{name} idx_err"] = checkAllclose(
             ref_idx, ids, tol_err_ratio=0.01, msg=f"{name}: sigmoid indices"
         )
+    return ret
+
+
+@benchmark()
+def bench_biased_grouped_sigmoid(
+    num_experts, num_tokens, topk, dtype, renormalize=True, route_scale=1.0
+):
+    """Compare the gfx1250 caller-owned specialization with its HIP fallback."""
+    torch.random.manual_seed(0)
+    gating_output = _make_gating(num_experts, num_tokens, dtype)
+    correction_bias = (torch.randn(num_experts) * 0.1).to(torch.bfloat16)
+    triton_weights = torch.empty((num_tokens, topk), dtype=torch.float32)
+    triton_ids = torch.empty((num_tokens, topk), dtype=torch.int32)
+    hip_weights = torch.empty_like(triton_weights)
+    hip_ids = torch.empty_like(triton_ids)
+
+    def run_triton():
+        biased_grouped_topk(
+            gating_output,
+            correction_bias,
+            triton_weights,
+            triton_ids,
+            1,
+            1,
+            renormalize,
+            route_scale,
+        )
+        return triton_weights, triton_ids
+
+    def run_hip():
+        biased_grouped_topk_hip(
+            gating_output,
+            correction_bias,
+            hip_weights,
+            hip_ids,
+            1,
+            1,
+            renormalize,
+            route_scale,
+        )
+        return hip_weights, hip_ids
+
+    run_hip()
+    ref_weights = hip_weights.clone()
+    ref_ids = hip_ids.clone()
+    nbytes = (
+        num_tokens * num_experts * gating_output.element_size()
+        + num_experts * correction_bias.element_size()
+        + num_tokens * topk * 8
+    )
+    ret = {"gfx": get_gfx()}
+    for name, fn in {"triton": run_triton, "hip": run_hip}.items():
+        (weights, ids), us = run_perftest(fn)
+        ret[f"{name} us"] = us
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} weight_err"] = float((weights - ref_weights).abs().max())
+        ret[f"{name} id_err"] = float((ids != ref_ids).float().mean())
     return ret
 
 
@@ -524,6 +673,7 @@ def bench_topk_gating_nan(num_experts, num_tokens, topk, score_func, dtype):
     )
     nan_leak = bool(topk_weights.isnan().any().item())
     inf_leak = bool(topk_weights.isinf().any().item())
+    starved_ok = _starved_rows_ok(num_experts, num_tokens, topk, score_func, dtype)
 
     nbytes = (
         num_tokens * num_experts * gating_output.element_size()
@@ -535,12 +685,294 @@ def bench_topk_gating_nan(num_experts, num_tokens, topk, score_func, dtype):
     ret["fused err"] = n_mism / num_tokens
     ret["nan_leak"] = nan_leak
     ret["inf_leak"] = inf_leak
+    ret["starved ok"] = starved_ok
+    return ret
+
+
+@benchmark()
+def bench_topk_gating_ties(num_experts, num_tokens, topk, score_func, dtype):
+    """Exact-tie benchmark. The other cases build rows of distinct values, but
+    real gating output repeats, and lanes that disagree about which of two equal
+    experts won consume two selection slots while recording one.
+
+    Scored on dropped slots rather than set equality: any expert whose score
+    equals the reference's k-th pick is a valid choice, so the failure to catch
+    is picking one strictly below it.
+    """
+    torch.random.manual_seed(0)
+    # Quantise hard so each row holds many exactly-equal values.
+    gating_output = (torch.randn(num_tokens, num_experts, device="cuda") * 2).round()
+    gating_output = gating_output.to(dtype)
+
+    topk_weights = torch.empty((num_tokens, topk), dtype=torch.float32, device="cuda")
+    topk_ids = torch.empty((num_tokens, topk), dtype=torch.int32, device="cuda")
+
+    _, us = run_perftest(
+        aiter.topk_gating,
+        topk_weights,
+        topk_ids,
+        gating_output,
+        None,
+        need_renorm=True,
+        score_func=score_func,
+    )
+
+    g = gating_output.float()
+    if score_func == "softmax":
+        sel = torch.softmax(g, dim=-1)
+    elif score_func == "sigmoid":
+        sel = torch.sigmoid(g)
+    else:
+        sel = torch.nn.functional.softplus(g).sqrt()
+
+    kth = sel.topk(topk, dim=-1).values.amin(dim=-1, keepdim=True)
+    dropped = int(((kth - sel.gather(1, topk_ids.long())) > _TIE_TOL).any(dim=1).sum())
+    ids_sorted = topk_ids.sort(dim=-1).values
+    dup = int((ids_sorted.diff(dim=-1) == 0).any(dim=1).sum())
+
+    nbytes = (
+        num_tokens * num_experts * gating_output.element_size()
+        + num_tokens * topk * (4 + 4)
+    )
+    ret = {"gfx": get_gfx()}
+    ret["fused us"] = us
+    ret["fused TB/s"] = nbytes / us / 1e6
+    ret["fused err"] = dropped / num_tokens
+    ret["dup ids"] = dup
+    ret["renorm err"] = _renorm_err(topk_weights)
+    return ret
+
+
+# ---------------------------------------------------------------------------
+# EP load balance on fake-eplb balance-router logits
+# ---------------------------------------------------------------------------
+
+
+def _eplb_gating(num_experts, num_tokens, topk, ep_size, dtype, logit=10.0):
+    """Synthetic balance-router logits, as fake-eplb substitutes them.
+
+    A flat ring walks position p = t * topk + j across EP ranks, so consecutive
+    picks step the rank by one and rank load is even over the batch. The chosen
+    experts sit at +logit and everything else at -logit, which makes the top-K
+    set unique while every pair inside it -- and every pair outside -- ties
+    exactly. That is the densest tie pattern a router can hand the kernel.
+    """
+    experts_per_rank = num_experts // ep_size
+    p = torch.arange(num_tokens, device="cuda").unsqueeze(1) * topk + torch.arange(
+        topk, device="cuda"
+    ).unsqueeze(0)
+    expert_ids = (p % ep_size) * experts_per_rank + (p // ep_size) % experts_per_rank
+    gating_output = torch.full(
+        (num_tokens, num_experts), -logit, dtype=dtype, device="cuda"
+    )
+    gating_output.scatter_(1, expert_ids, logit)
+    return gating_output, expert_ids.to(torch.int32)
+
+
+@benchmark()
+def bench_topk_gating_eplb(
+    num_experts, num_tokens, topk, score_func, dtype, ep_size=_EPLB_EP_SIZE
+):
+    """EP load-balance benchmark on tie-dense balance-router logits.
+
+    The ties section perturbs otherwise-distinct rows; here every selected
+    expert ties with every other one, which is what turns a slot drop into a
+    routing collapse: retiring several tied experts while recording one frees
+    slots that refill from the rejected pool, and those sit low in the index
+    space, so the batch piles onto the first EP rank instead of spreading.
+
+    Scored on exact set equality -- unlike the ties section, the reference set
+    here is unambiguous, since every selected expert outscores every rejected
+    one -- plus the resulting EP rank load.
+    """
+    torch.random.manual_seed(0)
+    gating_output, i_ref = _eplb_gating(num_experts, num_tokens, topk, ep_size, dtype)
+
+    topk_weights = torch.empty((num_tokens, topk), dtype=torch.float32, device="cuda")
+    topk_ids = torch.empty((num_tokens, topk), dtype=torch.int32, device="cuda")
+
+    _, us = run_perftest(
+        aiter.topk_gating,
+        topk_weights,
+        topk_ids,
+        gating_output,
+        None,
+        need_renorm=True,
+        score_func=score_func,
+    )
+
+    ids_sorted = topk_ids.sort(dim=-1).values
+    mism = int((ids_sorted != i_ref.sort(dim=-1).values).any(dim=1).sum())
+    dup = int((ids_sorted.diff(dim=-1) == 0).any(dim=1).sum())
+
+    experts_per_rank = num_experts // ep_size
+
+    def max_rank_share(ids):
+        ranks = ids.reshape(-1).long() // experts_per_rank
+        counts = torch.bincount(ranks, minlength=ep_size)
+        return float(counts.max()) / ids.numel()
+
+    nbytes = (
+        num_tokens * num_experts * gating_output.element_size()
+        + num_tokens * topk * (4 + 4)
+    )
+    ret = {"gfx": get_gfx()}
+    ret["fused us"] = us
+    ret["fused TB/s"] = nbytes / us / 1e6
+    ret["fused err"] = mism / num_tokens
+    ret["dup ids"] = dup
+    ret["ep max share"] = max_rank_share(topk_ids)
+    ret["ref ep max share"] = max_rank_share(i_ref)
+    ret["renorm err"] = _renorm_err(topk_weights)
     return ret
 
 
 # ---------------------------------------------------------------------------
 # main() -- argparse + sweep, one table per score function
 # ---------------------------------------------------------------------------
+
+
+# Shared-expert suffix: (E, T, topk, num_shared, dtype, renormalize). The E=512
+# rows are the Qwen3.8 FSE launch across the prefill_n gate (T<=1024) and the
+# smem fallback above it. num_shared=1 rows also time the legacy launcher.
+_SHARED_CONFIGS = [
+    (512, T, 10, 1, torch.bfloat16, True) for T in (1, 4, 16, 64, 256, 1024, 2048, 4096)
+] + [
+    (64, 16, 8, 1, torch.bfloat16, True),
+    (128, 1, 8, 1, torch.float32, False),
+    (32, 3, 4, 2, torch.float32, True),
+]
+
+
+@benchmark()
+def bench_topk_gating_shared(
+    num_experts, num_tokens, topk, num_shared, dtype, renormalize
+):
+    """Softmax top-k over the routed prefix plus sigmoid on trailing shared
+    columns, in one launch.
+
+    The shared experts are appended after top-k. A large shared logit must not
+    enter the routed set, and the prefilled shared ids must stay put.
+    Candidates: topk_gating(num_shared_experts=...) and, for one shared expert,
+    the legacy topk_softmax fused-sigmoid launcher that vLLM calls today."""
+    torch.random.manual_seed(0)
+    routed = _make_gating(num_experts, num_tokens, dtype)
+    shared = torch.randn(num_tokens, num_shared, dtype=dtype, device="cuda")
+    shared[0, 0] = torch.tensor(40, dtype=dtype, device="cuda")
+    gating = torch.cat([routed, shared], dim=-1).contiguous()
+    width = topk + num_shared
+    shared_ids = torch.arange(
+        num_experts, num_experts + num_shared, device="cuda", dtype=torch.int32
+    )
+
+    def buffers():
+        ids = torch.full((num_tokens, width), -1, dtype=torch.int32, device="cuda")
+        ids[:, topk:] = shared_ids
+        weights = torch.empty((num_tokens, width), dtype=torch.float32, device="cuda")
+        return weights, ids
+
+    w_fused, ids_fused = buffers()
+    w_legacy, ids_legacy = buffers()
+    token_expert_indices = torch.empty(
+        (num_tokens, topk), dtype=torch.int32, device="cuda"
+    )
+
+    def run_fused():
+        aiter.topk_gating(
+            w_fused,
+            ids_fused[:, :topk],
+            gating,
+            None,
+            need_renorm=renormalize,
+            score_func="softmax",
+            num_shared_experts=num_shared,
+        )
+        return w_fused, ids_fused
+
+    def run_legacy():
+        aiter.topk_softmax(
+            w_legacy,
+            ids_legacy[:, :topk],
+            token_expert_indices,
+            gating,
+            renormalize,
+            num_shared,
+            "sigmoid",
+        )
+        return w_legacy, ids_legacy
+
+    candidates = {"fused": run_fused}
+    if num_shared == 1:
+        candidates["legacy"] = run_legacy
+
+    w_ref, i_ref = ref_softmax(
+        routed, torch.empty(0, device="cuda"), topk, 1.0, renormalize
+    )
+    sel = torch.softmax(routed.float(), dim=-1)
+    shared_ref = torch.sigmoid(shared.float())
+    ret = {"gfx": get_gfx()}
+    for name, fn in candidates.items():
+        (w, ids), us = run_perftest(fn)
+        n_mism = _count_routing_mismatches(
+            ids[:, :topk],
+            i_ref,
+            sel,
+            topk,
+            label=(
+                f"shared/{name} E={num_experts} T={num_tokens} k={topk} "
+                f"S={num_shared} {dtype} renorm={renormalize}"
+            ),
+        )
+        ret[f"{name} us"] = us
+        ret[f"{name} err"] = n_mism / num_tokens
+        ret[f"{name} max_weight_err"] = _max_weight_error(
+            w[:, :topk], ids[:, :topk], w_ref, i_ref
+        )
+        ret[f"{name} shared_err"] = float((w[:, topk:] - shared_ref).abs().max())
+        ret[f"{name} ids_kept"] = bool(
+            torch.equal(ids[:, topk:], shared_ids.expand_as(ids[:, topk:]))
+        )
+    return ret
+
+
+@benchmark()
+def bench_topk_gating_pad_rows(num_experts, num_tokens, topk, score_func, dtype):
+    """num_valid_rows: rows below the count must match an unmasked launch bit
+    for bit; rows at or past it must carry id -1 and weight 0. The count is
+    swept over none, some and all rows of the same launch."""
+    torch.random.manual_seed(0)
+    gating_output = _make_gating(num_experts, num_tokens, dtype)
+    bias = torch.randn(num_experts, dtype=torch.float32, device="cuda") * 0.1
+    need_renorm = score_func != "softmax"
+
+    def run(num_valid_rows):
+        weights = torch.full(
+            (num_tokens, topk), float("nan"), dtype=torch.float32, device="cuda"
+        )
+        ids = torch.full((num_tokens, topk), 7, dtype=torch.int32, device="cuda")
+        aiter.topk_gating(
+            weights,
+            ids,
+            gating_output,
+            bias,
+            need_renorm=need_renorm,
+            routed_scaling_factor=2.5,
+            score_func=score_func,
+            num_valid_rows=num_valid_rows,
+        )
+        return weights, ids
+
+    w_all, ids_all = run(None)
+    bad = 0
+    for n in sorted({0, num_tokens // 2, num_tokens}):
+        count = torch.tensor([n], dtype=torch.int32, device="cuda")
+        w, ids = run(count)
+        bad += not torch.equal(ids[:n], ids_all[:n])
+        bad += not torch.equal(w[:n].view(torch.int32), w_all[:n].view(torch.int32))
+        bad += not bool((ids[n:] == -1).all() and (w[n:] == 0).all())
+    count = torch.tensor([num_tokens // 2], dtype=torch.int32, device="cuda")
+    _, us = run_perftest(run, count)
+    return {"gfx": get_gfx(), "fused us": us, "pad bad": bad}
 
 
 def main():
@@ -556,7 +988,8 @@ def main():
         "--num-experts",
         type=str2tuple,
         default=[64, 128, 256, 384],
-        help="Comma-separated list of number of experts (default: 64,128,256,384)",
+        help="Comma-separated list of number of experts (default: 64,128,256,384). "
+        "The softmax section also sweeps 512,640 so CI hits those prefill_n paths.",
     )
     parser.add_argument(
         "--num-tokens",
@@ -579,10 +1012,26 @@ def main():
         help="Comma-separated list of dtypes: fp16, bf16, fp32 (default: fp16,bf16,fp32)",
     )
     parser.add_argument(
+        "--section",
         "--score-func",
+        dest="section",
         type=lambda s: [x.strip() for x in s.split(",")],
-        default=["sigmoid", "softplus", "softmax", "nan"],
-        help="Comma-separated list of sections to run: sigmoid,softplus,softmax,nan (default: all)",
+        default=[
+            "sigmoid",
+            "softplus",
+            "softmax",
+            "nan",
+            "ties",
+            "eplb",
+            "shared",
+            "pad-rows",
+        ],
+        help="Comma-separated list of sections to run: "
+        "sigmoid,biased-sigmoid,softplus,softmax,nan,ties,eplb,shared,pad-rows "
+        "(default: all except biased-sigmoid). "
+        "Sigmoid, softplus and softmax are named after score functions; nan, ties, "
+        "eplb and pad-rows "
+        "each sweep all score functions. --score-func is a deprecated alias.",
     )
     args = parser.parse_args()
 
@@ -593,12 +1042,12 @@ def main():
     num_tokens_list = to_list(args.num_tokens)
     topk_list = to_list(args.topk)
     dtype_list = to_list(args.dtype)
-    score_funcs = args.score_func
+    sections = args.section
 
     failed_sections: list[str] = []
 
     # -- topk_sigmoid --------------------------------------------------
-    if "sigmoid" in score_funcs:
+    if "sigmoid" in sections:
         sigmoid_dtypes = [d for d in dtype_list if d != torch.float32]
         sigmoid_configs = list(
             itertools.product(
@@ -616,8 +1065,36 @@ def main():
             print(errors.to_string(index=False))
             failed_sections.append("sigmoid")
 
+    # -- gfx1250 caller-owned biased sigmoid: Triton versus HIP -------------
+    if "biased-sigmoid" in sections:
+        biased_configs = list(
+            itertools.product(
+                [e for e in num_experts_list if e in (512, 768, 896, 900, 1024)],
+                num_tokens_list,
+                [k for k in topk_list if k in (4, 8, 16)],
+                [d for d in dtype_list if d == torch.bfloat16],
+                [False, True],
+            )
+        )
+        if not biased_configs:
+            raise ValueError(
+                "biased-sigmoid requires bf16, E in {512,768,896,900,1024}, "
+                "and K in {4,8,16}"
+            )
+        df = [bench_biased_grouped_sigmoid(*cfg) for cfg in biased_configs]
+        df = pd.DataFrame(df)
+        aiter.logger.info(
+            "biased_grouped_topk sigmoid summary (markdown):\n%s",
+            df.to_markdown(index=False),
+        )
+        errors = df[(df["triton weight_err"] > 2e-5) | (df["triton id_err"] != 0.0)]
+        if len(errors) > 0:
+            print(f"\nERROR: {len(errors)} biased-sigmoid config(s) mismatched HIP!")
+            print(errors.to_string(index=False))
+            failed_sections.append("biased-sigmoid")
+
     # -- topk_softplus ---------------------------------------------------
-    if "softplus" in score_funcs:
+    if "softplus" in sections:
         softplus_configs = list(
             itertools.product(num_experts_list, num_tokens_list, topk_list, dtype_list)
         )
@@ -635,10 +1112,13 @@ def main():
             failed_sections.append("softplus")
 
     # -- topk_softmax: topk_gating (fused) vs topk_softmax (vLLM) --------
-    if "softmax" in score_funcs:
+    if "softmax" in sections:
+        softmax_experts = list(
+            dict.fromkeys([*num_experts_list, *_SOFTMAX_PREFILL_N_EXPERTS])
+        )
         softmax_configs = list(
             itertools.product(
-                num_experts_list, num_tokens_list, topk_list, dtype_list, [False, True]
+                softmax_experts, num_tokens_list, topk_list, dtype_list, [False, True]
             )
         )
         df = [
@@ -661,7 +1141,7 @@ def main():
             failed_sections.append("softmax")
 
     # -- topk_gating NaN/Inf robustness -----------------------------------
-    if "nan" in score_funcs:
+    if "nan" in sections:
         nan_dtypes = [d for d in dtype_list if d != torch.float32]
         nan_configs = list(
             itertools.product(
@@ -678,13 +1158,128 @@ def main():
             "topk_gating NaN/Inf robustness summary (markdown):\n%s",
             df.to_markdown(index=False),
         )
-        errors = df[(df["fused err"] > 0) | (df["nan_leak"]) | (df["inf_leak"])]
+        errors = df[
+            (df["fused err"] > 0)
+            | (df["nan_leak"])
+            | (df["inf_leak"])
+            | (~df["starved ok"])
+        ]
         if len(errors) > 0:
             print(
-                f"\nERROR: {len(errors)} nan config(s) failed (err>0 or nan/inf leak)!"
+                f"\nERROR: {len(errors)} nan config(s) failed "
+                f"(err>0, nan/inf leak, or a mis-weighted starved row)!"
             )
             print(errors.to_string(index=False))
             failed_sections.append("nan")
+
+    # -- topk_gating exact-tie handling ------------------------------------
+    if "ties" in sections:
+        tie_configs = list(
+            itertools.product(
+                num_experts_list,
+                num_tokens_list,
+                topk_list,
+                ["sqrtsoftplus", "sigmoid", "softmax"],
+                dtype_list,
+            )
+        )
+        df = [bench_topk_gating_ties(*cfg) for cfg in tie_configs]
+        df = pd.DataFrame(df)
+        aiter.logger.info(
+            "topk_gating exact-tie summary (markdown):\n%s",
+            df.to_markdown(index=False),
+        )
+        errors = df[
+            (df["fused err"] > 0)
+            | (df["dup ids"] > 0)
+            | (df["renorm err"] > _WEIGHT_TOL)
+        ]
+        if len(errors) > 0:
+            print(f"\nERROR: {len(errors)} tie config(s) failed!")
+            print(errors.to_string(index=False))
+            failed_sections.append("ties")
+
+    # -- topk_gating EP load balance (fake-eplb balance logits) -------------
+    if "eplb" in sections:
+        eplb_configs = [
+            cfg
+            for cfg in itertools.product(
+                num_experts_list,
+                num_tokens_list,
+                topk_list,
+                ["sqrtsoftplus", "sigmoid", "softmax"],
+                dtype_list,
+            )
+            if cfg[0] % _EPLB_EP_SIZE == 0
+        ]
+        # Experts are sharded across ranks, so only counts divisible by the EP
+        # size can run. If the caller picked none that qualify (e.g. --section
+        # eplb --num-experts 2) there is nothing to measure, and an empty frame
+        # has none of the columns the checks below index.
+        if not eplb_configs:
+            print(
+                f"SKIP: eplb needs num_experts divisible by {_EPLB_EP_SIZE}, "
+                f"none of {num_experts_list} qualify"
+            )
+        else:
+            df = [bench_topk_gating_eplb(*cfg) for cfg in eplb_configs]
+            df = pd.DataFrame(df)
+            aiter.logger.info(
+                "topk_gating fake-eplb EP balance summary (markdown):\n%s",
+                df.to_markdown(index=False),
+            )
+            errors = df[
+                (df["fused err"] > 0)
+                | (df["dup ids"] > 0)
+                | (df["ep max share"] > df["ref ep max share"] + 0.05)
+                | (df["renorm err"] > _WEIGHT_TOL)
+            ]
+            if len(errors) > 0:
+                print(f"\nERROR: {len(errors)} eplb config(s) failed!")
+                print(errors.to_string(index=False))
+                failed_sections.append("eplb")
+
+    # -- shared-expert suffix: topk_gating vs the legacy fused-sigmoid launcher
+    if "shared" in sections:
+        df = pd.DataFrame([bench_topk_gating_shared(*cfg) for cfg in _SHARED_CONFIGS])
+        aiter.logger.info(
+            "topk_gating shared-expert summary (markdown):\n%s",
+            df.to_markdown(index=False),
+        )
+        errors = df[
+            (df["fused err"] > 0)
+            | (df["fused max_weight_err"] > _WEIGHT_TOL)
+            | (df["fused shared_err"] > df["dtype"].map(_SHARED_ATOL))
+            | (~df["fused ids_kept"])
+            | (df["legacy err"].fillna(0) > 0.01)
+            | (df["legacy max_weight_err"].fillna(0) > _WEIGHT_TOL)
+            | (~df["legacy ids_kept"].fillna(True).astype(bool))
+        ]
+        if len(errors) > 0:
+            print(f"\nERROR: {len(errors)} shared-expert config(s) failed!")
+            print(errors.to_string(index=False))
+            failed_sections.append("shared")
+
+    # -- num_valid_rows: pad rows routed to -1, real rows untouched ----------
+    if "pad-rows" in sections:
+        pad_configs = list(
+            itertools.product(
+                num_experts_list,
+                num_tokens_list,
+                topk_list,
+                ["sqrtsoftplus", "sigmoid", "softmax"],
+                dtype_list,
+            )
+        )
+        df = pd.DataFrame([bench_topk_gating_pad_rows(*cfg) for cfg in pad_configs])
+        aiter.logger.info(
+            "topk_gating pad-rows summary (markdown):\n%s", df.to_markdown(index=False)
+        )
+        errors = df[df["pad bad"] > 0]
+        if len(errors) > 0:
+            print(f"\nERROR: {len(errors)} pad-rows config(s) failed!")
+            print(errors.to_string(index=False))
+            failed_sections.append("pad-rows")
 
     if failed_sections:
         print(

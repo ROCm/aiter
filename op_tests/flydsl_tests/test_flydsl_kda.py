@@ -16,12 +16,8 @@ from __future__ import annotations
 import pytest
 import torch
 
-from aiter.ops.flydsl.utils import is_flydsl_available
-
 if not torch.cuda.is_available():
     pytest.skip("ROCm not available. Skipping GPU tests.", allow_module_level=True)
-if not is_flydsl_available():
-    pytest.skip("flydsl is not installed.", allow_module_level=True)
 
 fla_kda = pytest.importorskip("fla.ops.kda")
 

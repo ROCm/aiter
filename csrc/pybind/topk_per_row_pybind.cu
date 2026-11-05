@@ -4,7 +4,7 @@
 #include "topk_per_row.h"
 #include "aiter_stream.h"
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
 {
     TOP_K_PER_ROW_PYBIND;
 }

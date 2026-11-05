@@ -63,6 +63,8 @@ def get_x_vals():
     x_vals += [(2**i, 256, 7168) for i in range(5, 9)]  # DSR1 router GEMM
     # GPT-OSS-120B attention projections
     x_vals += [(2**i, 5120, 2880) for i in range(5, 9)]  # GPTOSS QKV input projection
+    x_vals += [(2048, 5120, 2880)]  # GPTOSS QKV @ M=2048
+    x_vals += [(8192, 5120, 2880)]  # GPTOSS QKV @ M=8192
     x_vals += [(2**i, 2880, 4096) for i in range(5, 9)]  # output projection
     x_vals += [(2**i, 128, 2880) for i in range(5, 9)]  # Router GEMM
     x_vals += [(v, 106496, 16384) for v in (256, 4096)]  # LL3 405B FC1
@@ -93,6 +95,29 @@ def test_gemm_a16_w16(M: int, N: int, K: int, backend, kernel_type):
     triton_out = gemm_a16w16(x, w, backend=backend, kernel_type=kernel_type)
 
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-2)
+
+
+# Output larger than 2**31 bytes (Wan2.2 FFN up-projection at 720p x 193 frames).
+@pytest.mark.parametrize("M, N, K", [(90000, 13824, 5120)])
+def test_gemm_a16_w16_large_output(M: int, N: int, K: int):
+    if not is_gluon_supported():
+        pytest.skip("Gluon not supported on this architecture")
+    assert M * N * 2 > 2**31
+
+    x, w, _, _, _ = generate_gemm_a16w16_inputs(
+        M, N, K, dtype=torch.bfloat16, output=False
+    )
+    # NaN-fill so any row the kernel never writes fails the comparison.
+    y = torch.full((M, N), float("nan"), dtype=torch.bfloat16, device="cuda")
+    gemm_a16w16(x, w, y=y, backend="gluon")
+
+    boundary_row = 2**31 // (N * 2)
+    for rows in (
+        slice(0, 1024),
+        slice(boundary_row - 512, boundary_row + 512),
+        slice(M - 1024, M),
+    ):
+        torch.testing.assert_close(y[rows], F.linear(x[rows], w), atol=1e-1, rtol=1e-2)
 
 
 # Smaller set for testing activations, setting the output tensor and dtype
@@ -212,5 +237,51 @@ def test_gemm_a16_w16_atomic_layout(M: int, N: int, K: int, layout):
 
     y = y.to(torch.float32).zero_()
     triton_out = gemm_a16w16_atomic(x, w, torch.float32, y).to(torch.bfloat16)
+
+    torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
+
+
+@pytest.mark.parametrize("M, N, K", get_fewer_x_vals())
+@pytest.mark.parametrize("strided", [False, True])
+def test_gemm_a16_w16_atomic_accumulate(M: int, N: int, K: int, strided):
+    """accumulate=True adds X @ W^T into y in place, like torch.addmm_."""
+    torch.cuda.empty_cache()
+
+    x, w, _, _out_dtype, _y = generate_gemm_a16w16_inputs(
+        M, N, K, torch.bfloat16, output=False
+    )
+    base = torch.randn((M, 2 * N if strided else N), dtype=torch.float32, device="cuda")
+    y = base[:, :N]
+    torch_out = torch.addmm(y, x.float(), w.float().T)
+
+    triton_out = gemm_a16w16_atomic(x, w, torch.float32, y, accumulate=True)
+
+    assert triton_out.data_ptr() == y.data_ptr()
+    torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
+
+
+@pytest.mark.parametrize("M, N, K", get_x_vals())
+@pytest.mark.parametrize("output", [True, False])
+@pytest.mark.parametrize("layout", ["TN", "TT"])
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
+def test_gemm_a16w16_persistent_output(M: int, N: int, K: int, layout, output, backend):
+    if backend == "gluon" and not is_gluon_supported():
+        pytest.skip("Gluon not supported on this architecture")
+    torch.cuda.empty_cache()
+
+    x, w, _, _out_dtype, y = generate_gemm_a16w16_inputs(
+        M, N, K, torch.bfloat16, layout=layout, output=output
+    )
+
+    torch_out = F.linear(x, w, bias=None)
+
+    if output:
+        triton_out = gemm_a16w16(
+            x, w, dtype=torch.bfloat16, y=y, backend=backend, persistent=True
+        )
+    else:
+        triton_out = gemm_a16w16(
+            x, w, dtype=torch.bfloat16, backend=backend, persistent=True
+        )
 
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
