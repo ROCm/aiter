@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""FlyDSL QSA public surface (SILOTIGER-1047).
+"""FlyDSL QSA public surface.
 
 ``qsa_indexer_block_ids`` writes indexer ``block_ids [M, 512]`` from paged
 compressed K. Rows up to 512 blocks use the fused emit kernel; longer rows
@@ -20,7 +20,7 @@ once the grid alone fills the machine. Softmax is online in log2 space and the
 split
 partials are FP32. Expand+tail and the sigmoid gate stay unfused.
 
-``qsa_layer`` is the ``qwen4_exp`` opt-in. It runs the indexer,
+``qsa_layer`` runs the indexer,
 ``qsa_expand_block_indices``, and sparse GQA. A rank-3 query pair missing
 from the measured table logs once. A query that is not rank 3 is not a
 table miss; the indexer or sparse GQA reports it. Sigmoid and partial
@@ -87,7 +87,7 @@ def _qsa_arch() -> str:
 # from ``_launch_config``, so a different KV-head count is a different grid.
 # M past 512 reuses the M=512 single-split config.
 _FLYDSL_DISPATCH_TABLE = {
-    (24, 256): (4, 8),  # Flash-Next / qwen4_exp, TP1
+    (24, 256): (4, 8),  # 24 query heads, 2 KV heads
     (12, 256): (4, 8),  # Flash-Next TP2: 12 query heads, 1 KV head
     (6, 256): (4, 8),  # Flash-Next TP4: 6 query heads, 1 KV head
     (3, 256): (4, 8),  # Flash-Next TP8: 3 query heads, 1 KV head

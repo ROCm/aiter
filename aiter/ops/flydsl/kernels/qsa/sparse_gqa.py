@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""FlyDSL QSA sparse paged GQA, shaped after the live AMD Triton kernel.
+"""FlyDSL QSA sparse paged GQA.
 
 One workgroup owns ``(row, kv_head, split)``.  Q is staged once, paged K/V
 are gathered in ``BLOCK_N`` tiles, QK and PV use BF16 MFMA, and online
@@ -120,7 +120,7 @@ def _launch_config(
         block_n, target_splits, threads = 16, 64, _DECODE_THREADS
     elif base_programs < 32:
         block_n, target_splits, threads = 16, 32, _DECODE_THREADS
-    # Prefill runs BN32 rather than AMD's BN64. Halving the tile halves the
+    # Prefill runs BN32. Halving the tile halves the
     # live gather and QK state, which drops the kernel from 204 to 122 VGPRs
     # and all but removes its instruction-issue stalls. Occupancy is not the
     # reason: the grid is unchanged, so the extra residency headroom BN32
@@ -316,10 +316,10 @@ def build_qsa_sparse_gqa_module(
     # 32 tokens * 4 elements * 2 B = 256 B apart, a round advances by
     # col_owners chunks, and an st64 unit is 512 B.
     v_round_st64 = col_owners * 256 // 512
-    # d+4 half of an 8-wide vector: 16*D elements, in st64 units. 16 at D=256
-    # (AMD's offset), 8 at D=128. A fixed +16 stores past the V tile at D=128.
+    # d+4 half of an 8-wide vector: 16*D elements, in st64 units. 16 at D=256,
+    # 8 at D=128. A fixed +16 stores past the V tile at D=128.
     v_half_st64 = head_dim // 16
-    # K LDS image, following the live AMD prefill lowering. A dim chunk is
+    # K LDS image. A dim chunk is
     # split three ways: ``owner`` picks one of the col_owners threads sharing
     # a token, and the rest splits into a quarter and a group whose radices
     # multiply to gather_rounds. One group slot holds a 16 B vector for every
@@ -573,7 +573,7 @@ def build_qsa_sparse_gqa_module(
             return fx.Vector(fx.memref_load_vec(pv_c))
 
         def amd_k_elem(n_tok, d0):
-            # Match the live AMD prefill K LDS lowering. Each lane owns one
+            # Prefill K LDS address. Each lane owns one
             # token and one 8xbf16 vector; D chunks are permuted in 4x4
             # groups while bits 5:6 of tid XOR the 128-bit bank address.
             d_chunk = div_nonneg(d0, Int32(8))
@@ -593,9 +593,9 @@ def build_qsa_sparse_gqa_module(
             return div_nonneg(byte_offset, Int32(2))
 
         def amd_decode_k_elem(n_tok, d0):
-            # Live AMD decode K (BN16, 8 KiB): one 16-byte unit per
+            # Decode K (BN16, 8 KiB): one 16-byte unit per
             # (token, D-chunk), token-major, rotated by ``i ^ (i >> 5)``.
-            # The published 0xe0 mask and the 0x80/+4096 second-round terms
+            # The 0xe0 mask and the 0x80/+4096 second-round terms
             # are that one rotation seen through a 256-thread gather; in
             # flattened form the image depends only on the tile, so any lane
             # count that tiles ``block_n`` fills the same LDS bytes.
@@ -603,10 +603,10 @@ def build_qsa_sparse_gqa_module(
             return (flat ^ div_nonneg(flat, Int32(block_n * 2))) * Int32(8)
 
         def amd_decode_v_pack(n_tok, d0):
-            # Live AMD decode V (BN16, 8 KiB): the same flattening at 8-byte
+            # Decode V (BN16, 8 KiB): the same flattening at 8-byte
             # granularity with the half-chunk as the fastest axis, rotated by
-            # ``i ^ (i >> 6)``. Reproduces the published ``A``, ``A^8``,
-            # ``(A^64)+4096``, ``(A^0x48)+4096`` quartet at 256 threads.
+            # ``i ^ (i >> 6)``. At 256 threads that rotation is the four
+            # addresses ``A``, ``A^8``, ``(A^64)+4096``, and ``(A^0x48)+4096``.
             d_chunk = div_nonneg(d0, Int32(8))
             half = div_nonneg(d0 % Int32(8), Int32(4))
             vflat = (d_chunk * Int32(block_n) + n_tok) * Int32(2) + half
@@ -791,7 +791,7 @@ def build_qsa_sparse_gqa_module(
             q_vec = fx.Vector(fx.memref_load_vec(q_frags[ks]))
             if const_expr(decode_tr_pv):
                 # Packed cndmask. The per-element f32 round-trip packed with
-                # v_perm; AMD zeros OOB heads at the load mask instead.
+                # v_perm, so out-of-range heads are zeroed here.
                 q_regs.append(
                     q_live.select(q_vec, fx.Vector.filled(qk_vec, 0.0, BFloat16))
                 )
@@ -1171,7 +1171,7 @@ def build_qsa_sparse_gqa_module(
             l_new = l_prev * alpha + p_sum
             h0 = lane_kg * Int32(4)
             if const_expr(decode_tr_pv):
-                # Decode matches live AMD's second dot: V is MFMA A and P is
+                # Decode's second dot: V is MFMA A and P is
                 # B, so output C is four D values on the head lane. Alpha is
                 # already scalar on that lane; no head gather is required.
                 alpha4 = fx.Vector.from_elements([alpha], Float32).broadcast_to(4)

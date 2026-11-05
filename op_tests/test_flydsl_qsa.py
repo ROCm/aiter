@@ -9,7 +9,7 @@ Two layers:
   * Perf sweep (``__main__``): ``bench_qsa_flash_next_indexer`` (decode ``M<=8``
     and a separate prefill table; HIP-graph select column for FlyDSL when
     the table is wider than 20000 columns and ``M<=64``),
-    ``bench_qsa_gluon_parity_indexer`` (H=8 emit; long-``L`` is H=8; the published
+    ``bench_qsa_gluon_parity_indexer`` (H=8 emit; long-``L`` is H=8; the
     page-size-8 point stays H=4),
     ``bench_qsa_flash_next_paged_gqa`` (decode ``M<=8`` and a separate prefill table;
     ``--gqa`` is one rank: 24,2 / 12,1 / 6,1 / 3,1),
@@ -26,7 +26,7 @@ Usage::
     HIP_VISIBLE_DEVICES=6 python3 op_tests/test_flydsl_qsa.py --cache-layout wide
 
 Perf rows default to cold weights (``--rotate 0``); pass ``--rotate 1`` to
-reproduce the older hot-cache 1047 tables. ``--pad-pages 0`` (the default)
+reuse one buffer set (hot cache). ``--pad-pages 0`` (the default)
 keeps each indexer block table packed to the context. A positive width zero-fills
 it out to that many pages, which is how vLLM sizes the table for
 ``max_model_len``. ``--cache-layout packed`` (the default) keeps each cache
@@ -83,9 +83,10 @@ from aiter.test_common import (
 # The kernels do not import this module. The Flash-Next and Gluon-parity
 # specs below are the shapes the tests build from.
 #
-# Authoritative math: Qwen3.8-Next tech report ?2.1 (QSA). The oracle may
-# materialize ``[M, n_blocks]`` scores. The FlyDSL indexer does the same on every
-# path except short-row emit: a private fp32 ``[M, n_columns]`` buffer,
+# The score is ``score_scale * sum_h ReLU(dot(q[h], k_bar[b]))`` for complete
+# blocks. The oracle may materialize ``[M, n_blocks]`` scores. The FlyDSL
+# indexer does the same on every path except short-row emit: a private fp32
+# ``[M, n_columns]`` buffer,
 # then top-512 block ids, and the scores are dropped. ``n_columns`` is
 # the page-table capacity (``page_table.shape[1] * page_size``), so a
 # padded ``max_model_len`` table pays full width. At compress ratio 4
@@ -95,17 +96,16 @@ from aiter.test_common import (
 # that buffer waits on 128k and 1M measurements. A caller may pass the
 # buffer in; it is not a returned intermediate.
 #
-# Tie-break (locked to the live AMD HIP selector ``top_k_per_row_decode``): among
-# equal finite scores, keep the **smaller block index**. Invalid / incomplete
-# blocks are ``-inf`` and never win. Selected ids are written in that sort order
-# (higher score first; ties already smaller-index-first). Remaining slots are
-# ``-1``.
+# Tie-break, same as ``top_k_per_row_decode``: among equal finite scores, keep
+# the **smaller block index**. Invalid / incomplete blocks are ``-inf`` and
+# never win. Selected ids are written in that sort order (higher score first;
+# ties already smaller-index-first). Remaining slots are ``-1``.
 #
-# Expand+tail matches vLLM ``_expand_qsa_indices_kernel`` (PR 53896 / vLLM main):
-# complete blocks expand to ``r`` tokens; the open group contributes at most
-# ``r-1`` tail tokens after the expanded prefix; padding is ``-1``.
+# Expand+tail: complete blocks expand to ``r`` tokens; the open group
+# contributes at most ``r-1`` tail tokens after the expanded prefix; padding
+# is ``-1``.
 #
-# Packed caches match live AMD ``qwen4_exp``: ``cache [n_pages, page_size, H, D]``
+# Packed caches are ``cache [n_pages, page_size, H, D]``
 # and ``block_table [n_req, n_pages]``. Indexer K is one compressed block per
 # logical slot; GQA K/V use uncompressed tokens.
 
@@ -150,11 +150,11 @@ class QsaGqaSpec:
 
 
 # Test fixtures. The kernels declare their own structural constants, so they
-# do not depend on a model registry. Flash-Next is the production shape.
-# Gluon-parity is the #4882 shape; its sparse GQA does not auto-dispatch on
-# Flash-Next (group 12, D=256).
+# do not depend on a model registry. Flash-Next is the production shape:
+# sparse GQA group 12 at D=256. Gluon-parity is the other shape: sparse GQA
+# group 5 at D=128.
 
-# Flash-Next / Qwen3.8-Flash-Next / qwen4_exp (SILOTIGER-1047).
+# Flash-Next.
 # Indexer in:  q [M, 4, 128] BF16, paged compressed k (1 KV head, D=128).
 # Indexer out: block_ids [M, 512], token indices [M, <=2051].
 # GQA in:      q [M, 24, 256] BF16, paged k/v [..., 2, 256], indices.
@@ -173,7 +173,7 @@ FLASH_NEXT_GQA = QsaGqaSpec(
     rope_dim=64,
 )
 
-# #4882 Gluon-parity shapes. Indexer H is 4 or 8, D=128.
+# Gluon-parity. Indexer H is 4 or 8, D=128.
 # Sparse GQA: D=128, group size 5, selection_width=2051 (Hq=10, Hk=2).
 GLUON_PARITY_INDEXER = QsaIndexerSpec(
     n_heads=4,
@@ -259,8 +259,8 @@ def qsa_topk_blocks(
 ) -> torch.Tensor:
     """Per-row top-``k`` block ids. Smaller index wins exact-score ties.
 
-    Incomplete / padded columns are ``-inf`` and are **not** selected (live AMD
-    ``top_k_per_row_decode`` only reads the first ``visible`` columns). Slots
+    Incomplete / padded columns are ``-inf`` and are **not** selected
+    (``top_k_per_row_decode`` only reads the first ``visible`` columns). Slots
     past the number of finite scores are ``-1``.
     """
     n_blocks = scores.shape[1]
@@ -762,10 +762,11 @@ def _time(fn, *args, rotate, **kwargs):
 
     ``rotate`` is ``run_perftest`` ``num_rotate_args``: ``0`` (the default)
     auto-sizes extra copies from L2 so each timed call sees cold weights,
-    ``1`` reuses one buffer set (hot; the older 1047 tables), ``N>1`` uses
+    ``1`` reuses one buffer set (hot), ``N>1`` uses
     that many copies. Cold is the default because hot reuse credits a
-    backend for inter-iteration L2 residency that serving never has -- on
-    ``M=8`` decode it flatters live AMD by ~36% and paged GQA by ~12%. Callers must
+    backend for inter-iteration L2 residency that a cold call does not have.
+    On ``M=8`` decode the hot number is about 36% lower for the selector and
+    12% lower for paged GQA than the cold number. Callers must
     pass paged caches as ``*args`` so deepcopy clones them -- a zero-arg
     closure cannot rotate closed-over tensors. HIP-graph replay is not
     combined with rotation.
@@ -810,7 +811,7 @@ def _time(fn, *args, rotate, **kwargs):
 
 
 def test_indexer_hand_checked_one_row():
-    """Tech report ?2.1: I_ib = sum_h ReLU(q[h] . k_bar[b]), complete blocks only.
+    """I_ib = sum_h ReLU(q[h] . k_bar[b]) for complete blocks only.
 
     One query at token position 6 (0-based) with r=4 and seq_len=8:
       visible = min((6+1)//4, 8//4) = 1  -> only block 0 (tokens 0..3).
@@ -4841,7 +4842,7 @@ def main():
         default=[0],
         help="run_perftest num_rotate_args (copies of timed tensors).\n"
         "0 = cold cache (default; auto-size copies from L2, matches serving).\n"
-        "1 = hot cache, one reused buffer set (older 1047 tables).\n"
+        "1 = hot cache, one reused buffer set.\n"
         "N>1 = that many copies.\n"
         "Same value on every named backend in a row. Not combined with HIP graphs.",
     )
