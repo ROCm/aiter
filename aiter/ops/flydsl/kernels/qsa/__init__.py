@@ -13,5 +13,4 @@
 The public entry points are ``aiter.ops.flydsl.qsa_sparse_decode`` (gfx950) and
 ``aiter.ops.flydsl.qsa_sparse_prefill`` (gfx942).
 Host dispatch for the indexer and sparse GQA lives in ``aiter.ops.flydsl.qsa_paged``.
-The fp32 reference lives in ``op_tests/qsa_ref.py``.
 """
