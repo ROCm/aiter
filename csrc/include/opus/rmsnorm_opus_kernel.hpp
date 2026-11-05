@@ -84,6 +84,15 @@ __device__ inline out_t quant_cast(float v)
         return opus::fp32_to_fp8(v);
 }
 
+// opus::sync_threads() is a bare s_barrier. On gfx1250 nothing then makes a wave wait for
+// its LDS stores before the barrier, so another wave can read s[] before they land.
+__device__ inline void lds_barrier()
+{
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup");
+    __builtin_amdgcn_s_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup");
+}
+
 // Per-row segmented LDS reduction; deterministic (all rows step the same strides).
 template <bool IS_MAX>
 __device__ inline float block_reduce(float v)
@@ -93,9 +102,9 @@ __device__ inline float block_reduce(float v)
     const int tpr  = opus::block_size_x();
     const int base = opus::thread_id_y() * tpr;
     // leading barrier: reuse of s[] across two reduces races on gfx942 without it
-    opus::sync_threads();
+    lds_barrier();
     s[base + lane] = v;
-    opus::sync_threads();
+    lds_barrier();
     for(int stride = tpr >> 1; stride > 0; stride >>= 1)
     {
         if(lane < stride)
@@ -103,7 +112,7 @@ __device__ inline float block_reduce(float v)
             float o        = s[base + lane + stride];
             s[base + lane] = IS_MAX ? fmaxf(s[base + lane], o) : s[base + lane] + o;
         }
-        opus::sync_threads();
+        lds_barrier();
     }
     return s[base];
 }

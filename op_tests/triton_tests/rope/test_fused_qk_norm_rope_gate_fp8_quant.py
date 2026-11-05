@@ -34,7 +34,7 @@ def _make_cos_sin_cache(tokens: int, device: torch.device) -> torch.Tensor:
         :, None
     ] * torch.exp(
         -torch.arange(half, dtype=torch.float32, device=device)[None, :]
-        * (torch.log(torch.tensor(10000.0, device=device)) / half)
+        * (torch.log(torch.tensor(10000.0, dtype=torch.float32, device=device)) / half)
     )
     return torch.cat((angles.cos(), angles.sin()), dim=-1).to(torch.bfloat16)
 
@@ -172,7 +172,7 @@ def _make_inputs(
     positions = torch.arange(total_tokens, dtype=torch.int64, device=device)
     cos_sin_cache = _make_cos_sin_cache(total_tokens, device)
     cu_seqlens = torch.tensor(
-        [0, *torch.tensor(lengths).cumsum(0).tolist()],
+        [0, *torch.tensor(lengths, device=device).cumsum(0).tolist()],
         dtype=torch.int32,
         device=device,
     )
@@ -628,20 +628,22 @@ def test_fused_qk_norm_rope_gate_fp8_quant_decode_prefix_multiple_suffix_sequenc
 
 
 def test_fused_qk_norm_rope_gate_fp8_quant_rejects_cpu_inputs():
-    # Pin CPU explicitly. The MI35X job's default device is CUDA by the time
-    # this runs, and torch.empty() would otherwise allocate on cuda:0. The
-    # device check is first, so those tensors then fail the later bf16 check.
+    # Pin CPU explicitly so the test does not depend on the process default
+    # device. The device check is first; CUDA tensors would pass it and fail
+    # a later check instead.
     cpu = torch.device("cpu")
-    q_gate = torch.empty(1, NUM_QUERY_HEADS * 2 * HEAD_DIM, device=cpu)
-    key = torch.empty(1, NUM_KV_HEADS * HEAD_DIM, device=cpu)
+    q_gate = torch.empty(
+        1, NUM_QUERY_HEADS * 2 * HEAD_DIM, dtype=torch.float32, device=cpu
+    )
+    key = torch.empty(1, NUM_KV_HEADS * HEAD_DIM, dtype=torch.float32, device=cpu)
     with pytest.raises(ValueError, match="requires a CUDA/HIP device"):
         fused_qk_norm_rope_gate_fp8_quant(
             q_gate,
             key,
             key,
-            torch.empty(HEAD_DIM, device=cpu),
-            torch.empty(HEAD_DIM, device=cpu),
-            torch.empty(1, ROTARY_DIM, device=cpu),
+            torch.empty(HEAD_DIM, dtype=torch.float32, device=cpu),
+            torch.empty(HEAD_DIM, dtype=torch.float32, device=cpu),
+            torch.empty(1, ROTARY_DIM, dtype=torch.float32, device=cpu),
             torch.zeros(1, dtype=torch.int64, device=cpu),
             torch.tensor([0, 1], dtype=torch.int32, device=cpu),
             num_actual_tokens=1,
@@ -671,7 +673,7 @@ def test_fused_qk_norm_rope_gate_fp8_quant_output_dtype():
 
 @requires_gfx950
 def test_fused_qk_norm_rope_gate_fp8_quant_rejects_fp16_inputs():
-    inputs = tuple(tensor.cuda() for tensor in _make_inputs([8]))
+    inputs = _make_inputs([8])
     inputs = tuple(
         tensor.to(torch.float16) if tensor.dtype == torch.bfloat16 else tensor
         for tensor in inputs
@@ -828,9 +830,9 @@ def test_fused_qk_norm_rope_gate_fp8_quant_bounds_padded_tokens():
 
 def test_flash_attn_varlen_rejects_descales_without_ck(monkeypatch):
     monkeypatch.setattr(mha_module, "ENABLE_CK", False)
-    q = torch.empty((1, 1, HEAD_DIM), dtype=FP8_DTYPE)
-    descale = torch.ones((1, 1), dtype=torch.float32)
-    cu_seqlens = torch.tensor([0, 1], dtype=torch.int32)
+    q = torch.empty((1, 1, HEAD_DIM), dtype=FP8_DTYPE, device="cuda")
+    descale = torch.ones((1, 1), dtype=torch.float32, device="cuda")
+    cu_seqlens = torch.tensor([0, 1], dtype=torch.int32, device="cuda")
     with pytest.raises(RuntimeError, match="requires ENABLE_CK=1"):
         mha_module.flash_attn_varlen_func(
             q,
@@ -847,9 +849,9 @@ def test_flash_attn_varlen_rejects_descales_without_ck(monkeypatch):
 
 
 def test_flash_attn_varlen_rejects_partial_descales():
-    q = torch.empty((1, 1, HEAD_DIM), dtype=FP8_DTYPE)
-    descale = torch.ones((1, 1), dtype=torch.float32)
-    cu_seqlens = torch.tensor([0, 1], dtype=torch.int32)
+    q = torch.empty((1, 1, HEAD_DIM), dtype=FP8_DTYPE, device="cuda")
+    descale = torch.ones((1, 1), dtype=torch.float32, device="cuda")
+    cu_seqlens = torch.tensor([0, 1], dtype=torch.int32, device="cuda")
     with pytest.raises(
         ValueError, match="requires q_descale, k_descale, and v_descale"
     ):

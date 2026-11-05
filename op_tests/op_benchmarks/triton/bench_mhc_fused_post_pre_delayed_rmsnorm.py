@@ -48,7 +48,9 @@ def _make_inputs(M, n, C, device="cuda"):
     base = torch.zeros(rows, dtype=torch.float32, device=device)
     pre = torch.rand(M, n, dtype=torch.float32, device=device)
     post = torch.rand(M, n, 1, dtype=torch.float32, device=device)
-    comb = torch.softmax(torch.randn(M, n, n, device=device), dim=-1)
+    comb = torch.softmax(
+        torch.randn(M, n, n, dtype=torch.float32, device=device), dim=-1
+    )
     w = torch.ones(C, dtype=torch.bfloat16, device=device)
     return residual, y, fn, scale, base, pre, post, comb, w
 

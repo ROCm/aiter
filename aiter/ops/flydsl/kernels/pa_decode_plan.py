@@ -12,6 +12,12 @@ import torch
 
 from .tensor_shim import _run_compiled, ptr_arg, ptr_buf_tensor
 
+DEFAULT_MAX_BATCH_SIZE = 4096
+# int32 slots per arrival counter: one 128-byte line per (sequence, KV head).
+ARRIVAL_COUNTER_STRIDE = 32
+# Two warp scans and one reduction use at most 512 bytes at 1024 wave32 threads.
+_PLAN_SCAN_LDS_BYTES = 512
+
 
 @cache
 def compile_pa_decode_plan(batch, capacity, max_parts, sliding_window, query_length):
@@ -92,7 +98,7 @@ def compile_pa_decode_plan(batch, capacity, max_parts, sliding_window, query_len
 
         # Spread packed task writes across all threads, including small batches
         # with many partitions. Upper-bound search skips repeated ends from empty
-        # rows and needs at most 16 KiB of LDS for the largest supported batch.
+        # rows and uses one LDS int32 per sequence (16 KiB at the default cap).
         for slot in range(tid, capacity, threads):
             if slot < total_tasks:
                 seq = fx.Int32(-1)
@@ -148,6 +154,11 @@ class PADecodePlan:
     ``work_info`` is [capacity, 4]: sequence, begin/end absolute 256-token tile,
     original context length. Tile ranges are half-open and cover the MTP union.
     ``reduce_info`` is [batch, 2]: first packed task, actual task count.
+    ``arrival_counters`` is [batch, num_kv_heads, ARRIVAL_COUNTER_STRIDE]
+    int32 and zero between decodes: gfx1250 decodes that merge partitions in
+    the tile kernel count finished tasks in slot 0 and the last one resets it,
+    so decodes running concurrently must not share a plan. ``None`` keeps the
+    shared reducer.
     """
 
     work_info: torch.Tensor
@@ -156,12 +167,18 @@ class PADecodePlan:
     max_partitions: int
     sliding_window: int = 0
     query_length: int = 1
+    max_batch_size: int = DEFAULT_MAX_BATCH_SIZE
+    arrival_counters: torch.Tensor | None = None
 
     @property
     def capacity(self) -> int:
         return self.work_info.shape[0]
 
     def validate(self, batch_size: int, num_kv_heads: int, device: torch.device):
+        if type(self.max_batch_size) is not int or self.max_batch_size < 1:
+            raise ValueError("plan max_batch_size must be a positive int")
+        if not 1 <= batch_size <= self.max_batch_size:
+            raise ValueError(f"plan supports batches in [1, {self.max_batch_size}]")
         if self.num_kv_heads != num_kv_heads:
             raise ValueError("plan KV head count does not match the cache")
         num_compute_units = torch.cuda.get_device_properties(
@@ -177,7 +194,16 @@ class PADecodePlan:
             raise ValueError("work_info must have shape [capacity, 4]")
         if not batch_size <= self.capacity <= batch_size * self.max_partitions:
             raise ValueError("plan capacity must be in [batch, batch * max_partitions]")
-        for tensor in (self.work_info, self.reduce_info):
+        metadata = [self.work_info, self.reduce_info]
+        if self.arrival_counters is not None:
+            counter_shape = (batch_size, num_kv_heads, ARRIVAL_COUNTER_STRIDE)
+            if self.arrival_counters.shape != counter_shape:
+                raise ValueError(
+                    "arrival_counters must have shape "
+                    "[batch_size, num_kv_heads, ARRIVAL_COUNTER_STRIDE]"
+                )
+            metadata.append(self.arrival_counters)
+        for tensor in metadata:
             if tensor.device != device or tensor.dtype != torch.int32:
                 raise ValueError("plan metadata must be int32 on the query device")
             if not tensor.is_contiguous():
@@ -189,6 +215,7 @@ def plan_pa_decode(
     num_kv_heads: int,
     *,
     max_partitions: int | None = None,
+    max_batch_size: int | None = None,
     workgroup_budget: int | None = None,
     sliding_window: int = 0,
     query_length: int = 1,
@@ -201,15 +228,17 @@ def plan_pa_decode(
 
     ``max_partitions`` is in [1, device CU count], defaulting to CU count;
     omitting it on refresh preserves the existing limit.
+    ``max_batch_size`` defaults to 4096 for a new plan and is retained on refresh.
+    Larger batches require four LDS bytes per sequence plus scan storage and
+    must fit the device's per-block shared-memory capacity.
 
     Lengths include MTP tokens. Positive windows include each query's position;
-    0 and -1 disable them. Plans cover the MTP window union: match the window
-    and query length when decoding or refreshing. Dense plans ignore query length.
+    nonpositive windows disable them. Plans cover the MTP window union: match
+    the window and query length when decoding or refreshing. Dense plans ignore
+    query length.
     """
     if not isinstance(sliding_window, int):
         raise TypeError("sliding_window must be an int")
-    if sliding_window < -1:
-        raise ValueError("sliding_window must be -1, 0, or positive")
     sliding_window = max(sliding_window, 0)
     if not isinstance(query_length, int):
         raise TypeError("query_length must be an int")
@@ -219,13 +248,27 @@ def plan_pa_decode(
         raise ValueError("context_lengths must be a CUDA int32 tensor")
     if context_lengths.ndim != 1 or not context_lengths.is_contiguous():
         raise ValueError("context_lengths must be a contiguous vector")
+    if max_batch_size is None:
+        max_batch_size = DEFAULT_MAX_BATCH_SIZE if plan is None else plan.max_batch_size
+    if type(max_batch_size) is not int:
+        raise TypeError("max_batch_size must be an int")
+    if max_batch_size < 1:
+        raise ValueError("max_batch_size must be positive")
     batch = context_lengths.numel()
-    if batch < 1 or batch > 4096:
-        raise ValueError("plan supports batches in [1, 4096]")
+    if batch < 1 or batch > max_batch_size:
+        raise ValueError(f"plan supports batches in [1, {max_batch_size}]")
     if num_kv_heads < 1:
         raise ValueError("num_kv_heads must be positive")
     dev = context_lengths.device
-    num_compute_units = torch.cuda.get_device_properties(dev).multi_processor_count
+    properties = torch.cuda.get_device_properties(dev)
+    num_compute_units = properties.multi_processor_count
+    task_end_bytes = (batch * 4 + 15) // 16 * 16
+    if task_end_bytes + _PLAN_SCAN_LDS_BYTES > properties.shared_memory_per_block:
+        raise ValueError(
+            f"batch={batch} exceeds planner LDS capacity: requires up to "
+            f"{task_end_bytes + _PLAN_SCAN_LDS_BYTES} bytes, device supports "
+            f"{properties.shared_memory_per_block} bytes per block"
+        )
     if max_partitions is None:
         max_partitions = num_compute_units if plan is None else plan.max_partitions
     if not 1 <= max_partitions <= num_compute_units:
@@ -246,12 +289,21 @@ def plan_pa_decode(
             max_partitions,
             sliding_window,
             query_length,
+            max_batch_size,
+            # Zeroed once here: every decode that counts arrivals resets them.
+            torch.zeros(
+                (batch, num_kv_heads, ARRIVAL_COUNTER_STRIDE),
+                dtype=torch.int32,
+                device=dev,
+            ),
         )
     else:
         if workgroup_budget is not None:
             raise ValueError("workgroup_budget is fixed when reusing a plan")
         if max_partitions != plan.max_partitions:
             raise ValueError("max_partitions must match the reused plan")
+        if max_batch_size != plan.max_batch_size:
+            raise ValueError("max_batch_size must match the reused plan")
         if sliding_window != plan.sliding_window:
             raise ValueError("sliding_window must match the reused plan")
         if sliding_window > 0 and query_length != plan.query_length:

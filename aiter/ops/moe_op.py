@@ -23,6 +23,7 @@ def _topk_softmax(
     need_renorm: bool,
     num_shared_experts: int = 0,
     shared_expert_scoring_func: str = "",
+    num_valid_rows: Tensor | None = None,
 ) -> None: ...
 
 
@@ -34,7 +35,12 @@ def topk_softmax(
     need_renorm: bool,
     num_shared_experts: int = 0,
     shared_expert_scoring_func: str = "",
+    num_valid_rows: Tensor | None = None,
 ) -> None:
+    """`num_valid_rows`: optional int32 device tensor whose first element is
+    the count of real rows. Rows at or past it are padding: their routed ids
+    are written -1 and their weights 0; shared columns are written as for any
+    row. Read on device, so a replayed CUDA graph follows each step's count."""
     # The softmax workspace is only touched on the non-power-of-2 / >256-expert
     # path, but is always allocated here (torch caching allocator) and passed in so
     # the C side stays torch-free. Size logic mirrors the original C implementation.
@@ -63,6 +69,7 @@ def topk_softmax(
         need_renorm,
         num_shared_experts,
         shared_expert_scoring_func,
+        num_valid_rows,
     )
 
 
@@ -79,6 +86,7 @@ def _topk_softmax_fused_shared_gate(
     gate_weight: Tensor,
     shared_expert_scale: float,
     shared_expert_base: int,
+    num_valid_rows: Tensor | None = None,
 ) -> None: ...
 
 
@@ -94,7 +102,9 @@ def topk_softmax_fused_shared_gate(
     gate_weight: Tensor,
     shared_expert_scale: float = 1.0,
     shared_expert_base: int = -1,
+    num_valid_rows: Tensor | None = None,
 ) -> None:
+    # `num_valid_rows`: as for `topk_softmax`.
     # Option A ("fuse-gate"): gating_output holds ONLY routed experts; the shared
     # logit is computed in-kernel as
     #   sigmoid(hidden_states @ gate_weight.T) * shared_expert_scale
@@ -114,6 +124,7 @@ def topk_softmax_fused_shared_gate(
         gate_weight,
         shared_expert_scale,
         shared_expert_base,
+        num_valid_rows,
     )
 
 
@@ -293,6 +304,12 @@ def fmoe_fp8_blockscale_g1u1(
     activation: int | None = ActivationType.Silu.value,
     block_size_M: int = 32,
 ) -> None: ...
+
+
+@compile_ops("module_moe_fmoe_asm", ffi_type="ctypes")
+def fmoe_fp8_blockscale_g1u1_has_kernel(
+    activation: int, xquant: bool, block_size_M: int, inter_dim: int, model_dim: int
+) -> int: ...
 
 
 @compile_ops("module_moe_fmoe_asm", ffi_type="ctypes")

@@ -67,6 +67,13 @@ RDNA_ARCHS = frozenset(
     }
 )
 FP8_ARCHS = frozenset({"gfx942", "gfx950", "gfx1200", "gfx1201"})
+# No fp8 WMMA or cvt instructions; Triton converts fp8 operands to fp16 in
+# software. Matches arch_info.is_sw_emulated_fp8_avail().
+SW_EMULATED_FP8_ARCHS = frozenset(
+    {"gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151"}
+)
+# FP8 through hardware or through software emulation.
+ANY_FP8_ARCHS = FP8_ARCHS | SW_EMULATED_FP8_ARCHS
 
 _RECOMMENDED_FP8_REPLACEMENTS: dict[str, dict[torch.dtype, torch.dtype]] = {
     "gfx942": {
@@ -95,6 +102,16 @@ class GpuArch:
     def supports_fp8(self) -> bool:
         """Check if this architecture supports FP8."""
         return self.name in FP8_ARCHS
+
+    @property
+    def supports_sw_emulated_fp8(self) -> bool:
+        """Check if this architecture runs FP8 through software emulation."""
+        return self.name in SW_EMULATED_FP8_ARCHS
+
+    @property
+    def supports_any_fp8(self) -> bool:
+        """Check if this architecture runs FP8, in hardware or by software emulation."""
+        return self.name in ANY_FP8_ARCHS
 
     def recommended_fp8_dtype(self, dtype: torch.dtype) -> torch.dtype:
         """Get the recommended FP8 dtype for this architecture.

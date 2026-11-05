@@ -10,7 +10,7 @@ import torch.nn.functional as F
 
 from aiter.ops.triton.gemm.basic.gemm_a16w16 import _is_gluon_available, gemm_a16w16
 from aiter.ops.triton.gemm.basic.gemm_a16w16_atomic import gemm_a16w16_atomic
-from aiter.ops.triton.utils import gemm_config_utils
+from aiter.ops.triton.utils import config_utils, gemm_config_utils
 from aiter.ops.triton.utils._triton import arch_info
 from op_tests.triton_tests.utils.types import str_to_torch_dtype
 
@@ -292,44 +292,68 @@ def test_gemm_a16w16_persistent_output(M: int, N: int, K: int, layout, output, b
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
 
 
-def _write_config(path, marker):
-    path.write_text(json.dumps({"any": {"marker": marker}}))
+def _write_family(family_dir, files):
+    family_dir.mkdir(parents=True, exist_ok=True)
+    for filename, marker in files.items():
+        (family_dir / filename).write_text(json.dumps({"any": {"marker": marker}}))
+
+
+@pytest.fixture
+def device_cu_num(monkeypatch):
+    # The device CU count is read once per process and the GEMM lookup is
+    # cached, so CU_NUM set inside a test would not change the tree.
+    def set_cu_num(cu_num):
+        monkeypatch.setattr(config_utils, "_CU_NUM", cu_num)
+        monkeypatch.setattr(config_utils, "_CU_NUM_READ", True)
+        gemm_config_utils._get_gemm_config_cached.cache_clear()
+
+    yield set_cu_num
+    gemm_config_utils._get_gemm_config_cached.cache_clear()
 
 
 @pytest.mark.parametrize(
-    "cu, B, expected",
+    "cu_num, B, N, expected",
     [
-        (192, None, "cu192"),
-        (256, None, "arch"),
-        (None, None, "arch"),
-        (192, 4, "b_cu192"),
-        (256, 4, "b_arch"),
+        (192, None, 64, "cu192_shape"),
+        (192, 4, 64, "cu192_shape"),
+        (192, None, 32, "cu192_default"),
+        (256, None, 64, "plain_shape"),
+        (256, 4, 64, "plain_b_shape"),
+        (None, None, 64, "plain_shape"),
+        (96, None, 64, "plain_shape"),
     ],
 )
-def test_gemm_config_cu_precedence(tmp_path, monkeypatch, cu, B, expected):
+def test_gemm_config_cu_tree(
+    tmp_path, monkeypatch, device_cu_num, cu_num, B, N, expected
+):
     name = "GEMM-A16W16"
-    _write_config(tmp_path / "DEFAULT.json", "default")
-    _write_config(tmp_path / f"{name}-N=64-K=128.json", "arch")
-    _write_config(tmp_path / f"{name}-N=64-K=128-CU=192.json", "cu192")
-    _write_config(tmp_path / f"{name}-B=4-N=64-K=128.json", "b_arch")
-    _write_config(tmp_path / f"{name}-B=4-N=64-K=128-CU=192.json", "b_cu192")
-    monkeypatch.setattr(
-        gemm_config_utils, "resolve_config_dir", lambda *a, **k: str(tmp_path)
+    family = "triton/gemm/gemm_a16w16"
+    _write_family(
+        tmp_path / "gfx1250" / family,
+        {
+            "DEFAULT.json": "plain_default",
+            f"{name}-N=64-K=128.json": "plain_shape",
+            f"{name}-B=4-N=64-K=128.json": "plain_b_shape",
+        },
     )
-    monkeypatch.setattr(gemm_config_utils.arch_info, "get_cu_count", lambda: cu)
-    gemm_config_utils._get_gemm_config_cached.cache_clear()
-    try:
-        config, is_tuned = gemm_config_utils.get_gemm_config(name, 1, 64, 128, B=B)
-    finally:
-        gemm_config_utils._get_gemm_config_cached.cache_clear()
+    _write_family(
+        tmp_path / "gfx1250" / "192cu" / family,
+        {
+            "DEFAULT.json": "cu192_default",
+            f"{name}-N=64-K=128.json": "cu192_shape",
+        },
+    )
+    _write_family(
+        tmp_path / "gfx1250" / "96cu" / family,
+        {f"{name}-N=64-K=128.json": "cu96_without_default"},
+    )
+    monkeypatch.setattr(config_utils, "AITER_TRITON_CONFIGS_PATH", str(tmp_path))
+    monkeypatch.setattr(config_utils.arch_info, "get_arch", lambda: "gfx1250")
+    device_cu_num(cu_num)
+
+    config, _ = gemm_config_utils.get_gemm_config(name, 1, N, 128, B=B)
 
     assert config["marker"] == expected
-    assert not is_tuned
-
-
-def test_get_cu_count_honors_cu_num(monkeypatch):
-    monkeypatch.setenv("CU_NUM", "192")
-    assert arch_info.get_cu_count() == 192
 
 
 _gemm_a16w16_module = importlib.import_module("aiter.ops.triton.gemm.basic.gemm_a16w16")
@@ -360,9 +384,11 @@ def _skip_unless_gfx1250():
         (2048, 128, 4096, True),
     ],
 )
-def test_gemm_a16w16_auto_backend_opt_in(monkeypatch, M, N, K, expect_triton):
+def test_gemm_a16w16_auto_backend_opt_in(
+    monkeypatch, device_cu_num, M, N, K, expect_triton
+):
     _skip_unless_gfx1250()
-    monkeypatch.setenv("CU_NUM", "256")
+    device_cu_num(256)
     spy = _TritonLaunchSpy(_gemm_a16w16_module._gemm_a16_w16_kernel)
     monkeypatch.setattr(_gemm_a16w16_module, "_gemm_a16_w16_kernel", spy)
     x, w, _, _, _ = generate_gemm_a16w16_inputs(M, N, K, torch.bfloat16, output=False)
@@ -377,9 +403,11 @@ def test_gemm_a16w16_auto_backend_opt_in(monkeypatch, M, N, K, expect_triton):
     "M, N, K",
     [(1, 4096, 1024), (16, 4096, 1024), (4096, 4096, 1024), (2048, 128, 4096)],
 )
-def test_gemm_a16w16_explicit_triton_on_opt_in_configs(monkeypatch, M, N, K):
+def test_gemm_a16w16_explicit_triton_on_opt_in_configs(
+    monkeypatch, device_cu_num, M, N, K
+):
     _skip_unless_gfx1250()
-    monkeypatch.setenv("CU_NUM", "256")
+    device_cu_num(256)
     spy = _TritonLaunchSpy(_gemm_a16w16_module._gemm_a16_w16_kernel)
     monkeypatch.setattr(_gemm_a16w16_module, "_gemm_a16_w16_kernel", spy)
     x, w, _, _, _ = generate_gemm_a16w16_inputs(M, N, K, torch.bfloat16, output=False)
@@ -390,9 +418,9 @@ def test_gemm_a16w16_explicit_triton_on_opt_in_configs(monkeypatch, M, N, K):
     assert spy.launches == 1
 
 
-def test_gemm_a16w16_persistent_ignores_opt_in(monkeypatch):
+def test_gemm_a16w16_persistent_ignores_opt_in(monkeypatch, device_cu_num):
     _skip_unless_gfx1250()
-    monkeypatch.setenv("CU_NUM", "256")
+    device_cu_num(256)
     requested = []
     real_get_gemm_config = _gemm_a16w16_module.get_gemm_config
 
