@@ -150,3 +150,121 @@ def test_rmsnorm_provider_serves_without_gpu(monkeypatch):
     decision = plugin.last_decision()
     assert decision.route == "provider"
     assert decision.provider == "aklr"
+
+
+_REFERENCE_PROVIDER = '''
+"""A reference provider for the two routed contracts.
+
+Deliberately minimal: it declares what the interface asks for, serves one
+contract, declines the other, and reports evidence it does not ask AITER to
+interpret. Everything here is what an out-of-tree provider would ship.
+"""
+
+import torch
+
+from aiter import plugin
+
+
+def _rms_norm(out, input, weight, epsilon, gemma_norm=False):
+    scale = torch.rsqrt(input.float().pow(2).mean(-1, keepdim=True) + epsilon)
+    out.copy_((input.float() * scale * weight.float()).to(out.dtype))
+
+
+class Provider:
+    name = "refprov"
+    api_versions = {plugin.API_VERSION}
+    op_versions = {"rmsnorm": {1}, "pertoken_quant": {1}}
+
+    def __init__(self):
+        self.candidate = plugin.KernelCandidate(
+            provider="refprov",
+            kernel_id="rms_norm_reference",
+            artifact_digest="sha256:0000",
+            qualification="https://example.invalid/evidence/rms_norm",
+            run=_rms_norm,
+        )
+
+    def select(self, op, args, kwargs):
+        if op.name != "rmsnorm":
+            return None  # declining is normal, and must be observable
+        out = args[0]
+        if out.shape[-1] % 2:
+            return None  # a per-call coverage decision, the shape it is for
+        return self.candidate
+
+
+instance = Provider()
+'''
+
+
+def _install_reference_provider(tmp_path, monkeypatch):
+    site = tmp_path / "site"
+    site.mkdir()
+    (site / "refprov_pkg.py").write_text(_REFERENCE_PROVIDER)
+    dist = site / "refprov-1.0.dist-info"
+    dist.mkdir()
+    (dist / "METADATA").write_text(
+        "Metadata-Version: 2.1\nName: refprov\nVersion: 1.0\n"
+    )
+    (dist / "entry_points.txt").write_text(
+        f"[{plugin.ENTRY_POINT_GROUP}]\nrefprov = refprov_pkg:instance\n"
+    )
+    monkeypatch.syspath_prepend(str(site))
+
+
+def test_an_installed_provider_serves_a_routed_contract(tmp_path, monkeypatch):
+    """The milestone's end state: a wheel, discovered, enabled, serving.
+
+    Nothing is monkeypatched into discovery -- the provider arrives through real
+    packaging metadata, the way one actually would.
+    """
+
+    _install_reference_provider(tmp_path, monkeypatch)
+    plugin.configure(enable=("refprov",), source="test")
+
+    out = torch.zeros(2, 8)
+    reference = torch.zeros(2, 8)
+    weight = torch.rand(8)
+    value = torch.rand(2, 8)
+
+    aiter.rmsnorm(out, value, weight, 1e-6)
+
+    decision = plugin.last_decision()
+    assert (decision.route, decision.provider) == ("provider", "refprov")
+    assert decision.kernel_id == "rms_norm_reference"
+    assert decision.artifact_digest == "sha256:0000"
+    assert decision.config_source == "configure:test"
+
+    # It computed the op, not merely claimed the route.
+    scale = torch.rsqrt(value.float().pow(2).mean(-1, keepdim=True) + 1e-6)
+    reference.copy_((value.float() * scale * weight.float()).to(reference.dtype))
+    torch.testing.assert_close(out, reference)
+
+    del tmp_path
+    plugin.configure(enable=(), source="test")
+
+
+def test_the_same_provider_declines_the_other_contract(tmp_path, monkeypatch):
+    """Declining is ordinary operation, and it has to be visible as such."""
+
+    _install_reference_provider(tmp_path, monkeypatch)
+    plugin.configure(enable=("refprov",), source="test")
+
+    aiter.pertoken_quant(torch.rand(4, 8))
+
+    decision = plugin.last_decision()
+    assert (decision.route, decision.reason) == ("native", "provider-declined")
+
+
+def test_a_per_call_decline_is_not_an_error(tmp_path, monkeypatch):
+    """Coverage is the provider's to judge, per call, and costs native only."""
+
+    _install_reference_provider(tmp_path, monkeypatch)
+    plugin.configure(enable=("refprov",), source="test")
+
+    explanation = plugin.explain(
+        "rmsnorm", torch.zeros(2, 7), torch.rand(2, 7), torch.rand(7), 1e-6
+    )
+
+    assert explanation.decision.reason == "provider-declined"
+    assert dict(explanation.declines) == {"refprov": "declined"}
