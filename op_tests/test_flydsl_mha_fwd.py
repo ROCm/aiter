@@ -322,8 +322,8 @@ def _build_paged(seqs_q, seqs_k, H_q, H_kv, d_qk, d_v, page_size, dtype, device)
     page list shows up too."""
     pages = [(sk + page_size - 1) // page_size for sk in seqs_k]
     num_blocks = sum(pages) + 8
-    k_pool = torch.randn((num_blocks, page_size, H_kv, d_qk), dtype=dtype, device=device)
-    v_pool = torch.randn((num_blocks, page_size, H_kv, d_v), dtype=dtype, device=device)
+    k_pool = _randn_as((num_blocks, page_size, H_kv, d_qk), dtype, device)
+    v_pool = _randn_as((num_blocks, page_size, H_kv, d_v), dtype, device)
     page_ids = torch.randperm(num_blocks, device=device).int()[: sum(pages)].contiguous()
     kv_indptr = torch.tensor(
         [0] + list(itertools.accumulate(pages)), dtype=dtypes.i32, device=device
@@ -354,7 +354,7 @@ def test_flydsl_mha_fwd_paged(
     """Paged KV: the pool is page-indexed, Q is ragged exactly as in thd."""
     device = "cuda"
     tot_q, tot_k = sum(seqs_q), sum(seqs_k)
-    q = torch.randn((tot_q, H_q, d_qk), dtype=dtype, device=device)
+    q = _randn_as((tot_q, H_q, d_qk), dtype, device)
     cu_q = torch.tensor(
         [0] + list(itertools.accumulate(seqs_q)), dtype=dtypes.i32, device=device
     )
@@ -1225,8 +1225,8 @@ def main():
         summarize("FlyDSL FMHA prefill thd summary", rows)
 
     if "paged" in args.layout:
-        # paged is a16w16 only, so the 8-bit dtypes in the sweep do not apply
-        paged_dtypes = [d for d in served_dtypes if d[0].itemsize == 2 and d[0] == d[1]]
+        # q and kv share one dtype here, so only the matched pairs of the sweep apply
+        paged_dtypes = [d for d in served_dtypes if d[0] == d[1]]
         rows = []
         for (
             (d_qk, d_v), shape, dtype, page_size, causal, lse, sink, window
