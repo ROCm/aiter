@@ -28,6 +28,7 @@ import torch.nn.functional as F
 
 from aiter import dtypes, logger
 from aiter.jit.core import AITER_CONFIG_CONV3D_BF16
+from aiter.jit.utils.chip_info import get_lds_capacity_bytes
 from aiter.ops.flydsl import flydsl_conv_implicit
 from aiter.ops.flydsl.conv3d_gfx1250 import (
     _clamp_num_buffers,
@@ -43,6 +44,7 @@ from aiter.ops.flydsl.conv3d_policy import (
 from aiter.ops.flydsl.conv3d_policy_gfx1250 import (
     get_flydsl_conv3d_configs_gfx1250,
     is_legal_tile_gfx1250,
+    lds_bytes_tap,
     tile_kernel_name_gfx1250,
 )
 from aiter.ops.flydsl.conv_kernels import (
@@ -63,6 +65,9 @@ from aiter.ops.flydsl.kernels.conv.conv3d_gfx950_utils import (
     make_conv_geometry,
     make_tile_config,
     out_extent,
+)
+from aiter.ops.flydsl.kernels.conv.conv3d_gfx1250_utils import (
+    tile_k_unsupported_gfx1250,
 )
 from aiter.ops.flydsl.kernels.conv.conv3d_im2col import (
     make_im2col_plan,
@@ -96,6 +101,21 @@ RUN_CONFIG_REPS = 3
 
 # gfx1250 (num_buffers, main_loop_unroll) every tile is timed with by default.
 DEFAULT_PIPELINES = ((2, False),)
+# gfx1250 K tile widths every tile is timed with by default.
+DEFAULT_TILE_KS = (32,)
+
+
+def _parse_tile_ks(text):
+    out = []
+    for item in filter(None, (s.strip() for s in str(text).split(","))):
+        tk = int(item)
+        if tk < 32 or tk % 32:
+            raise ValueError(f"tile_k must be a positive multiple of 32, got {item!r}")
+        if tk not in out:
+            out.append(tk)
+    if not out:
+        raise ValueError("--tile_ks needs at least one width")
+    return tuple(out)
 
 
 def _parse_pipelines(text):
@@ -205,6 +225,7 @@ def run_flydsl_conv3d_gfx1250(
     block_rows,
     num_buffers=2,
     main_loop_unroll=False,
+    tile_k=32,
 ):
     # Pin the final legal split-K recorded in the candidate metadata and CSV.
     del wgm
@@ -226,6 +247,7 @@ def run_flydsl_conv3d_gfx1250(
         out=out,
         num_buffers=num_buffers,
         main_loop_unroll=main_loop_unroll,
+        tile_k=tile_k,
     )
 
 
@@ -344,6 +366,15 @@ class Conv3dTuner(TunerCommon):
             help="gfx1250: comma list of num_buffers:main_loop_unroll pairs every "
             "tile is timed with, e.g. 2:0,3:0,3:1,4:0 (the gfx1250 GEMM tuner "
             "sweeps stages and main_loop_unroll the same way). Default 2:0.",
+        )
+        self.parser.add_argument(
+            "--tile_ks",
+            type=_parse_tile_ks,
+            default=DEFAULT_TILE_KS,
+            help="gfx1250: comma list of K tile widths (channels per K step, "
+            "multiples of 32) every tile and pipeline is timed with; a width "
+            "that does not divide a shape's padded channels is skipped there. "
+            "Default 32.",
         )
         self.parser.add_argument(
             "--tiles_from",
@@ -507,10 +538,12 @@ class Conv3dTuner(TunerCommon):
         run_kwargs=None,
         pipelines=DEFAULT_PIPELINES,
         tiles=None,
+        tile_ks=DEFAULT_TILE_KS,
     ):
         """Candidate tasks for one shape.
 
-        gfx1250 times every tile with each ``pipelines`` pair; ``tiles``, as
+        gfx1250 times every tile with each ``pipelines`` pair and each
+        ``tile_ks`` width that fits the shape; ``tiles``, as
         ``(tile_m, tile_n, wave_m, wave_n, block_rows)``, replaces the policy's
         tile candidates (see ``--tiles_from``).
         """
@@ -657,12 +690,22 @@ class Conv3dTuner(TunerCommon):
                 output_keys = ("out",)
                 # The runtime clamps num_buffers to LDS and the K-tile count;
                 # time and record the value that runs, once.
-                tiles_per_split = (crs // CGP_ALIGN) // max(1, sk)
                 variants = []
-                for nb, unroll in pipelines:
-                    nb = _clamp_num_buffers(nb, tiles_per_split, tile, block_rows)
-                    if (nb, unroll) not in variants:
-                        variants.append((nb, unroll))
+                for tk in tile_ks:
+                    if tile_k_unsupported_gfx1250(tk, cgp, sk) is not None:
+                        continue
+                    tiles_per_split = (crs // tk) // max(1, sk)
+                    for nb, unroll in pipelines:
+                        nb = _clamp_num_buffers(
+                            nb, tiles_per_split, tile, block_rows, tile_k=tk
+                        )
+                        # The clamp stops at 2 buffers; a wide K tile can
+                        # still overflow LDS there.
+                        lds = lds_bytes_tap(tile_m, tile_n, num_buffers=nb, tile_k=tk)
+                        if lds > get_lds_capacity_bytes():
+                            continue
+                        if (nb, unroll, tk) not in variants:
+                            variants.append((nb, unroll, tk))
             else:
                 base_name = tile_kernel_name(tile_m, tile_n, wave_m, wave_n, wgm) + (
                     f"_r{block_rows}" if block_rows > 1 else ""
@@ -670,14 +713,16 @@ class Conv3dTuner(TunerCommon):
                 gen, gen_args = generate_data, shape_args
                 fn, fn_keys = run_flydsl_conv3d, ["x", "weight", "bias"]
                 output_keys = None
-                variants = [(None, None)]
-            for nb, unroll in variants:
+                variants = [(None, None, None)]
+            for nb, unroll, tk in variants:
                 kname = base_name
                 fn_args = (fn_keys, params, tile, wgm, sk, block_rows)
                 if is_1250:
-                    fn_args = (*fn_args, nb, unroll)
+                    fn_args = (*fn_args, nb, unroll, tk)
                     if (nb, unroll) != (2, False):
                         kname += f"_b{nb}" + ("_u" if unroll else "")
+                    if tk != CGP_ALIGN:
+                        kname += f"_k{tk}"
                 info = (
                     keys,
                     tile_m,
@@ -689,6 +734,7 @@ class Conv3dTuner(TunerCommon):
                     block_rows,
                     nb,
                     unroll,
+                    tk,
                     kname,
                 )
                 tasks.append(
@@ -730,7 +776,7 @@ class Conv3dTuner(TunerCommon):
                         "sweeping the policy's candidates instead"
                     )
             shape_tasks = self._shape_tasks(
-                keys, args.max_configs, run_kwargs, args.pipelines, tiles
+                keys, args.max_configs, run_kwargs, args.pipelines, tiles, args.tile_ks
             )
             if not shape_tasks:
                 logger.warning(f"no legal candidate for {keys}")
@@ -814,6 +860,7 @@ class Conv3dTuner(TunerCommon):
                 block_rows,
                 num_buffers,
                 main_loop_unroll,
+                tile_k,
                 kernel_name,
             ) = info
             tflops, bw = self.calculate(el)
@@ -831,6 +878,7 @@ class Conv3dTuner(TunerCommon):
                     "main_loop_unroll": (
                         None if main_loop_unroll is None else int(main_loop_unroll)
                     ),
+                    "tile_k": tile_k,
                     "splitK": splitk,
                     "us": time,
                     "kernelName": kernel_name,
@@ -844,7 +892,8 @@ class Conv3dTuner(TunerCommon):
                     f"Tuning result for {str(dict(zip(self.keys, keys))).strip('{}')} "
                     f"is tile=({tile_m},{tile_n},{wave_m},{wave_n}) wgm={wgm} "
                     f"block_rows={block_rows} num_buffers={num_buffers} "
-                    f"main_loop_unroll={main_loop_unroll} splitK={splitk}, {time}us, "
+                    f"main_loop_unroll={main_loop_unroll} tile_k={tile_k} "
+                    f"splitK={splitk}, {time}us, "
                     f"{err_ratio=}, {tflops=} TFLOPS, {bw=} GB/s"
                 )
             rows.append(row)

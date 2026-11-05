@@ -93,7 +93,7 @@ python3 csrc/flydsl_conv3d/conv3d_tune.py -i $M/wan21_vae_bf16_untuned_conv3d.cs
 python3 csrc/flydsl_conv3d/conv3d_tune.py -i $M/wan21_vae_bf16_untuned_conv3d.csv \
   -o $M/wan21_vae_gfx1250_bf16_tuned_conv3d.csv \
   --tiles_from /tmp/wan_tiles_all.csv --tiles_topk 4 \
-  --pipelines 2:0,2:1,3:0,3:1,4:0,4:1
+  --pipelines 2:0,2:1,3:0,3:1,4:0,4:1 --tile_ks 32,64,96,128
 ```
 
    Write winners into the per-model file, never into
@@ -122,11 +122,13 @@ python3 csrc/flydsl_conv3d/conv3d_tune.py -i $M/wan21_vae_bf16_untuned_conv3d.cs
    comparable with another implementation's kernel-only numbers.
 
    gfx1250 rows also carry `block_r` (output rows of the R x C block),
-   `num_buffers` (LDS ring depth, i.e. prefetch distance) and
-   `main_loop_unroll` (two K tiles per `scf.for` trip). `num_buffers` is the
-   value that ran: the runtime clamps a request to the LDS capacity and the
-   K-tile count, and the tuner records the clamped value. Rows without the two
-   pipeline columns, or with empty cells, run 2 buffers and no unroll.
+   `num_buffers` (LDS ring depth, i.e. prefetch distance),
+   `main_loop_unroll` (two K tiles per `scf.for` trip) and `tile_k` (channels
+   per K tile, a multiple of 32 that divides C/groups padded to 32; one
+   `tensor_wait` + barrier per K tile). `num_buffers` is the value that ran:
+   the runtime clamps a request to the LDS capacity and the K-tile count, and
+   the tuner records the clamped value. Rows without these columns, or with
+   empty cells, run 2 buffers, no unroll and `tile_k=32`.
 
    `splitK` is **not** swept: `_resolve_splitk` derives it per candidate and the
    tuner pins that value so the column records what ran. Every row of both VAE
@@ -202,6 +204,13 @@ python3 -m pytest op_tests/tuning_tests/test_config_shape_collision.py
 - **Description**: gfx1250 only. Every tile candidate is timed once per pair,
   e.g. `3:1` is three LDS buffers with the main loop unrolled two K tiles per
   trip. Pairs that clamp to the same buffer count for a shape are timed once.
+
+### `--tile_ks`
+- **Type**: comma list of ints
+- **Default**: `32`
+- **Description**: gfx1250 only. K tile widths every tile and pipeline is timed
+  with. A width that does not divide the shape's padded C/groups is skipped
+  there, and so is a variant whose LDS would not fit even at 2 buffers.
 
 ### `--tiles_from` / `--tiles_topk`
 - **Type**: path / int

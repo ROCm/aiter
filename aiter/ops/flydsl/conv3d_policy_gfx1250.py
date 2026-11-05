@@ -63,8 +63,8 @@ def tile_kernel_name_gfx1250(tile_m, tile_n, wave_m, wave_n, block_rows):
     )
 
 
-def lds_bytes_tap(tile_m, tile_n, num_buffers=2):
-    lds_k = TILE_K + LDS_PAD
+def lds_bytes_tap(tile_m, tile_n, num_buffers=2, tile_k=TILE_K):
+    lds_k = (tile_k // TILE_K) * (TILE_K + LDS_PAD)
     a = num_buffers * (tile_m * lds_k + LDS_PAD)
     b = num_buffers * (tile_n * lds_k + LDS_PAD)
     return (a + b) * BF16_BYTES

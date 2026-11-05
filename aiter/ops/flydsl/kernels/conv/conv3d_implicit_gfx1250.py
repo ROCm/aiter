@@ -31,6 +31,7 @@ from .conv3d_gfx1250_utils import (
     CONV_COMPILE_HINTS,
     DEFAULT_BLOCK_ROWS,
     DEFAULT_TILE,
+    LDS_K_CHUNK,
     OOB_SENTINEL_ELEM,
     TILE_K,
     WAVE_SIZE,
@@ -82,6 +83,7 @@ class Conv3dImplicitParam1250(NamedTuple):
     dyn_hw: bool
     variant: str
     main_loop_unroll: bool
+    tile_k: int
 
 
 def make_conv3d_implicit_param_gfx1250(
@@ -110,6 +112,7 @@ def make_conv3d_implicit_param_gfx1250(
     dyn_hw=False,
     variant="bandwidth_bound",
     main_loop_unroll=False,
+    tile_k=TILE_K,
     **_ignored,
 ):
     del _ignored  # e.g. legacy patch_reuse from older call sites
@@ -141,6 +144,7 @@ def make_conv3d_implicit_param_gfx1250(
         dyn_hw=bool(dyn_hw),
         variant=variant,
         main_loop_unroll=bool(main_loop_unroll),
+        tile_k=int(tile_k),
     )
 
 
@@ -214,6 +218,7 @@ def _assert_shape_agnostic_gfx1250(param, cfg, kernel_grid, unit):
         True,
         param.variant,
         param.main_loop_unroll,
+        param.tile_k,
     )
     cgp = probe.c // probe.groups
     try:
@@ -267,7 +272,7 @@ def compile_conv3d_implicit_gfx1250(param: Conv3dImplicitParam1250):
     gpu_arch = str(get_hip_arch())
     assert gpu_arch.startswith("gfx1250"), f"Expected gfx1250, got {gpu_arch}"
 
-    cfg = make_tile_config_gfx1250(param.tile, param.block_rows)
+    cfg = make_tile_config_gfx1250(param.tile, param.block_rows, param.tile_k)
     cgp = param.c // param.groups
     assert cgp % CGP_ALIGN == 0, f"cgp={cgp} not multiple of {CGP_ALIGN}"
     assert param.k % param.groups == 0
@@ -316,7 +321,12 @@ def compile_conv3d_implicit_gfx1250(param: Conv3dImplicitParam1250):
     BLOCK_THREADS = cfg.block_threads
     num_warps = cfg.num_warps
     wmma_m_rep, wmma_n_rep = cfg.mi_m, cfg.mi_n
-    k_wmma_steps = 1
+    TK = cfg.tile_k
+    k_wmma_steps = TK // WMMA_K
+    # A wider K tile is tile_k / TILE_K channel chunks, each padded in LDS. TDM
+    # needs the global and LDS tiles to share their contiguous innermost run, so
+    # the global channel axis is split into (KC, TILE_K) as well.
+    KC = TK // TILE_K
     N_ACCS = wmma_m_rep * wmma_n_rep
     N_A_FRAGS = wmma_m_rep * k_wmma_steps
     N_B_FRAGS = wmma_n_rep * k_wmma_steps
@@ -329,7 +339,9 @@ def compile_conv3d_implicit_gfx1250(param: Conv3dImplicitParam1250):
     # BIG_OUT drops the buffer path; non-big uses this size for the descriptor.
     y_bytes = geom.npq * param.k * 4 if use_splitk else Y_ELEMS * BF16_BYTES
 
-    N_CC = cgp // TILE_K
+    assert cgp % TK == 0, f"tile_k={TK} does not divide cgp={cgp}"
+    assert TK == TILE_K or not use_splitk, "split-K runs tile_k=32 only"
+    N_CC = cgp // TK
     assert N_CC * param.kt * param.kh * param.kw == grid.k_tiles
 
     variant = param.variant
@@ -533,20 +545,39 @@ def compile_conv3d_implicit_gfx1250(param: Conv3dImplicitParam1250):
         # range, the tail is clamped by the view extent, and each round indexes
         # the K tile it needs. The LDS tile stride carries pad_interval/pad_amount.
         n_left = fx.Int32(fx.Int64(kernel_grid.kg) - fx.Int64(n_local))
+        if const_expr(KC == 1):
+            gB_layout = fx.make_layout((n_left, CRS), (CRS, 1))
+            b_tiler = (cfg.tile_n, TILE_K)
+            b_smem = fx.make_layout((cfg.tile_n, TILE_K), (lds_k, 1))
+            b_box = fx.make_layout(
+                ((cfg.tile_n, TILE_K), 1), ((lds_k, 1), cfg.tile_n * lds_k)
+            )
+            b_rest = (0, None)
+        else:
+            gB_layout = fx.make_layout(
+                (n_left, CRS // TILE_K, TILE_K), (CRS, TILE_K, 1)
+            )
+            b_tiler = (cfg.tile_n, KC, TILE_K)
+            b_smem = fx.make_layout((cfg.tile_n, KC, TILE_K), (lds_k, LDS_K_CHUNK, 1))
+            b_box = fx.make_layout(
+                ((cfg.tile_n, KC, TILE_K), 1),
+                ((lds_k, LDS_K_CHUNK, 1), cfg.tile_n * lds_k),
+            )
+            b_rest = (0, None, 0)
         gB = fx.Tensor(
             fx.make_view(
                 fx.add_offset(fx.get_iter(weight), fx.Int64(n_offset) * CRS),
-                fx.make_layout((n_left, CRS), (CRS, 1)),
+                gB_layout,
             )
         )
         atom_b, coord_b = fx.rocdl.cdna5.make_tiled_tdm_atom(
             fx.rocdl.TensorLoad(),
             gB,
-            fx.make_layout((cfg.tile_n, TILE_K), (lds_k, 1)),
-            (cfg.tile_n, TILE_K),
+            b_smem,
+            b_tiler,
             num_warps=num_warps,
         )
-        blk_b = fx.zipped_divide(coord_b, (cfg.tile_n, TILE_K))[None, (0, None)]
+        blk_b = fx.zipped_divide(coord_b, b_tiler)[None, b_rest]
 
         wave = fx.rocdl.wave_id()
         warp_layout = fx.make_layout(num_warps, 1)
@@ -575,45 +606,48 @@ def compile_conv3d_implicit_gfx1250(param: Conv3dImplicitParam1250):
             kt_i, kh_i, kw_i, cc = _decode_k(abs_k)
             tap_elems = (
                 (kt_i * param.dt * Hp + kh_i * param.dh) * Wp + kw_i * param.dw
-            ) * Cp + fx.Int64(cc) * TILE_K
+            ) * Cp + fx.Int64(cc) * TK
+            if const_expr(KC == 1):
+                gA_layout = fx.make_layout(
+                    (ho_left, wo_left, TILE_K), (row_stride, col_stride, 1)
+                )
+                a_tiler = (R, C, TILE_K)
+                a_box = fx.make_layout(
+                    ((R, C, TILE_K), 1),
+                    ((C * lds_k, lds_k, 1), R * C * lds_k),
+                )
+                a_rest = (0, 0, None)
+            else:
+                gA_layout = fx.make_layout(
+                    (ho_left, wo_left, KC, TILE_K),
+                    (row_stride, col_stride, TILE_K, 1),
+                )
+                a_tiler = (R, C, KC, TILE_K)
+                a_box = fx.make_layout(
+                    ((R, C, KC, TILE_K), 1),
+                    ((C * lds_k, lds_k, LDS_K_CHUNK, 1), R * C * lds_k),
+                )
+                a_rest = (0, 0, 0, None)
             gA = fx.Tensor(
                 fx.make_view(
-                    fx.add_offset(fx.get_iter(x), a_base + tap_elems),
-                    fx.make_layout(
-                        (ho_left, wo_left, TILE_K), (row_stride, col_stride, 1)
-                    ),
+                    fx.add_offset(fx.get_iter(x), a_base + tap_elems), gA_layout
                 )
             )
             atom_a, coord_a = fx.rocdl.cdna5.make_tiled_tdm_atom(
                 fx.rocdl.TensorLoad(),
                 gA,
-                fx.make_layout(
-                    ((R, C, TILE_K), 1),
-                    ((C * lds_k, lds_k, 1), R * C * lds_k),
-                ),
-                (R, C, TILE_K),
+                a_box,
+                a_tiler,
                 num_warps=num_warps,
             )
-            blk_a = fx.zipped_divide(coord_a, (R, C, TILE_K))[None, (0, 0, None)]
+            blk_a = fx.zipped_divide(coord_a, a_tiler)[None, a_rest]
             lds_a = fx.Tensor(
-                fx.make_view(
-                    fx.add_offset(big_a_mem, slot_a(buf_idx)),
-                    fx.make_layout(
-                        ((R, C, TILE_K), 1),
-                        ((C * lds_k, lds_k, 1), R * C * lds_k),
-                    ),
-                )
+                fx.make_view(fx.add_offset(big_a_mem, slot_a(buf_idx)), a_box)
             )
             # Partition mode 0 is the complete box; the singleton rest mode
             # lets the copy select this already-offset pipeline slot with 0.
             lds_b = fx.Tensor(
-                fx.make_view(
-                    fx.add_offset(big_b_mem, slot_b(buf_idx)),
-                    fx.make_layout(
-                        ((cfg.tile_n, TILE_K), 1),
-                        ((lds_k, 1), cfg.tile_n * lds_k),
-                    ),
-                )
+                fx.make_view(fx.add_offset(big_b_mem, slot_b(buf_idx)), b_box)
             )
             ts_a, tg_a = fx.rocdl.cdna5.tdm_partition(
                 atom_a, wave, warp_layout, lds_a, blk_a
@@ -718,6 +752,11 @@ def compile_conv3d_implicit_gfx1250(param: Conv3dImplicitParam1250):
             tdm_ops.tensor_wait(
                 0 if num_buffers == 2 else (num_buffers - 2) * _TDMS_PER_TILE
             )
+            # The next trip's TDM refills the slot this wave's last fragment
+            # reads came from, and s_barrier does not wait for LDS reads on
+            # gfx1250: land them first, or a fast wave's refill can race a slow
+            # wave's reads (seen as sporadic mismatches with tile_k=96).
+            rocdl.s_wait_dscnt(0)
             gpu.barrier()
             next_buf_i32 = (cidx + 1) % num_buffers
             if const_expr(variant == "compute_bound"):

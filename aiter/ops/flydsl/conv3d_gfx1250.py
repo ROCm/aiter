@@ -24,7 +24,9 @@ from aiter.ops.flydsl.kernels.conv.conv3d_gfx1250_utils import (
     DEFAULT_BLOCK_ROWS,
     DEFAULT_TILE,
     MAX_WAVES,
+    TILE_K,
     out_extent,
+    tile_k_unsupported_gfx1250,
 )
 from aiter.ops.flydsl.kernels.conv.conv3d_implicit_gfx1250 import (
     compile_conv3d_implicit_gfx1250,
@@ -184,7 +186,7 @@ def _warn_dropped_tile(tile):
     )
 
 
-def _clamp_num_buffers(num_buffers, tiles_per_split, tile, block_rows):
+def _clamp_num_buffers(num_buffers, tiles_per_split, tile, block_rows, tile_k=32):
     """Drop to a legal B that fits LDS and leaves a nonempty prologue."""
     from aiter.jit.utils.chip_info import get_lds_capacity_bytes
     from aiter.ops.flydsl.conv3d_policy_gfx1250 import lds_bytes_tap
@@ -193,7 +195,7 @@ def _clamp_num_buffers(num_buffers, tiles_per_split, tile, block_rows):
     lds_cap = get_lds_capacity_bytes()
     while b > 2 and (
         tiles_per_split < b - 1
-        or lds_bytes_tap(tile[0], tile[1], num_buffers=b) > lds_cap
+        or lds_bytes_tap(tile[0], tile[1], num_buffers=b, tile_k=tile_k) > lds_cap
     ):
         b -= 1
     if tiles_per_split < b - 1:
@@ -289,14 +291,17 @@ def run_conv3d_gfx1250(
     num_buffers=None,
     variant="bandwidth_bound",
     main_loop_unroll=None,
+    tile_k=None,
     packed_weight=None,  # (K, kT*kH*kW*cgp) from prepare_operands_gfx1250
     out=None,  # contiguous bf16 result in output_layout, written in place
     **_ignored,
 ):
     """Run gfx1250 FlyDSL conv3d (TDM+WMMA; optional split-K / dyn_hw / tuned tile).
 
-    ``num_buffers`` / ``main_loop_unroll`` left at None take the tuned row's
-    columns of the same name, else 2 buffers and no unroll.
+    ``num_buffers`` / ``main_loop_unroll`` / ``tile_k`` left at None take the
+    tuned row's columns of the same name, else 2 buffers, no unroll and 32
+    channels per K tile. A ``tile_k`` that cannot run here
+    (``tile_k_unsupported_gfx1250``) falls back to 32.
     """
     del _ignored, patch_reuse
     in_ndhwc = input_layout == "NDHWC"
@@ -471,11 +476,17 @@ def run_conv3d_gfx1250(
         num_buffers = tuned_pipe.get("num_buffers", 2)
     if main_loop_unroll is None:
         main_loop_unroll = tuned_pipe.get("main_loop_unroll", False)
+    if tile_k is None:
+        tile_k = tuned_pipe.get("tile_k", TILE_K)
+    if tile_k_unsupported_gfx1250(int(tile_k), cgp, sk) is not None:
+        tile_k = TILE_K
 
     # Match GEMM: B-1 K-tiles must fill the prologue; clamp against LDS too.
-    k_tiles = crs // 32  # TILE_K == CGP_ALIGN == 32
+    k_tiles = crs // tile_k
     tiles_per_split = k_tiles // max(1, sk)
-    nb = _clamp_num_buffers(num_buffers, tiles_per_split, chosen_tile, chosen_br)
+    nb = _clamp_num_buffers(
+        num_buffers, tiles_per_split, chosen_tile, chosen_br, tile_k=tile_k
+    )
 
     if sk > 1:
         y = torch.zeros((npq, k), device=x.device, dtype=torch.float32)
@@ -516,6 +527,7 @@ def run_conv3d_gfx1250(
         dyn_hw=dyn_hw,
         variant=variant,
         main_loop_unroll=main_loop_unroll,
+        tile_k=tile_k,
     )
     exe = compile_conv3d_implicit_gfx1250(param)
     launch_stream = torch.cuda.current_stream() if stream is None else stream

@@ -98,9 +98,10 @@ TUNED_DEVICE_COLUMNS = ("gfx", "cu_num")
 # Optional result column: output rows of a block's 2D patch (kH x kW reuse).
 # A table without it, or an empty cell, means 1 (consecutive rows).
 TUNED_BLOCK_ROWS_COLUMN = "block_r"
-# Optional gfx1250 result columns: the K loop's software pipeline. A table
-# without them, or an empty cell, leaves the runtime default.
-TUNED_PIPELINE_COLUMNS = ("num_buffers", "main_loop_unroll")
+# Optional gfx1250 result columns: the K loop's software pipeline and K tile
+# width. A table without them, or an empty cell, leaves the runtime default.
+TUNED_PIPELINE_COLUMNS = ("num_buffers", "main_loop_unroll", "tile_k")
+_TUNED_INT_PIPELINE_COLUMNS = ("num_buffers", "tile_k")
 
 # Result column, not part of the key. Empty cell means FlyDSL; other backends skipped.
 TUNED_LIBTYPE_COLUMN = "libtype"
@@ -129,7 +130,9 @@ def _parse_pipeline_columns(row) -> dict:
             continue
         if isinstance(raw, str) and raw.strip().lower() in ("", "null", "nan"):
             continue
-        out[col] = int(raw) if col == "num_buffers" else _parse_tuned_bool(raw)
+        out[col] = (
+            int(raw) if col in _TUNED_INT_PIPELINE_COLUMNS else _parse_tuned_bool(raw)
+        )
     return out
 
 

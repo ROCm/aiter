@@ -36,7 +36,10 @@ WMMA_N = 16
 WMMA_K = 32
 WAVE_SIZE = 32
 LDS_PAD = 8
+# Default K tile, and the channel chunk the LDS pads after: a K tile of
+# tile_k channels sits in LDS as tile_k / TILE_K chunks of TILE_K + LDS_PAD.
 TILE_K = WMMA_K
+LDS_K_CHUNK = TILE_K + LDS_PAD
 # Channels packed per K-tile (same as TILE_K for bf16 WMMA).
 CGP_ALIGN = TILE_K
 
@@ -66,6 +69,17 @@ def validate_launch_config_gfx1250(tile_m, tile_n, wave_m, wave_n, block_rows):
     return None
 
 
+def tile_k_unsupported_gfx1250(tile_k, cgp, splitk=1):
+    """Why ``tile_k`` cannot run with ``cgp`` channels per group, or None."""
+    if tile_k < TILE_K or tile_k % TILE_K:
+        return f"tile_k={tile_k} must be a positive multiple of {TILE_K}"
+    if cgp % tile_k:
+        return f"tile_k={tile_k} does not divide the padded channels cgp={cgp}"
+    if tile_k != TILE_K and splitk > 1:
+        return f"split-K runs tile_k={TILE_K} only"
+    return None
+
+
 class TileConfig1250(NamedTuple):
     tile_m: int
     tile_n: int
@@ -85,17 +99,18 @@ class TileConfig1250(NamedTuple):
     lds_b_elems_per_buf: int
 
 
-def make_tile_config_gfx1250(tile, block_rows):
+def make_tile_config_gfx1250(tile, block_rows, tile_k=TILE_K):
     tile_m, tile_n, wave_m, wave_n = tile
     invalid = validate_launch_config_gfx1250(tile_m, tile_n, wave_m, wave_n, block_rows)
     assert invalid is None, invalid
+    assert tile_k >= TILE_K and tile_k % TILE_K == 0, f"bad tile_k={tile_k}"
     block_threads = wave_m * wave_n * WAVE_SIZE
     cols = tile_m // block_rows
-    lds_k = TILE_K + LDS_PAD
+    lds_k = (tile_k // TILE_K) * LDS_K_CHUNK
     return TileConfig1250(
         tile_m=tile_m,
         tile_n=tile_n,
-        tile_k=TILE_K,
+        tile_k=tile_k,
         wave_m=wave_m,
         wave_n=wave_n,
         block_threads=block_threads,
@@ -367,11 +382,14 @@ def lane_bases_rowmajor(warp_base, reps, lds_stride, lane16, lane_kgrp):
 
 
 def load_wmma_frag(mem, base_idx, slot_off, ks, rep, bases, lds_stride, elem_ty):
-    """Load one 16-wide bf16 WMMA fragment (two vec8 halves) from padded LDS."""
+    """Load one 16-wide bf16 WMMA fragment (two vec8 halves) from padded LDS.
+
+    WMMA K step ``ks`` is the ``ks``-th padded TILE_K chunk of the row.
+    """
     vec8_ty = T.vec(8, elem_ty.ir_type)
     halves = []
     for k_half in range_constexpr(2):
-        off = bases[rep] + slot_off + (ks * WMMA_K + k_half * 16)
+        off = bases[rep] + slot_off + (ks * LDS_K_CHUNK + k_half * 16)
         halves.append(fx.ptr_load(fx.add_offset(mem, off), result_type=vec8_ty))
     return halves[0].shuffle(halves[1], list(range(16)))
 
