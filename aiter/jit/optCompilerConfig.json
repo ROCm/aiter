@@ -2041,11 +2041,14 @@
         "blob_gen_cmd": "''"
     },
     "module_mega_mhc_stream_h5120": {
-        "srcs": "[f'{AITER_CSRC_DIR}/pybind/mega_mhc_pybind.cu', f'{AITER_CSRC_DIR}/kernels/mega_mhc.cu'] + ([f'{AITER_CSRC_DIR}/kernels/mega_mhc_gfx1250.cu'] if set(_build_archs_from_env(get_gfx)) & {'gfx1250', 'gfx1250-strict'} else [])",
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/mega_mhc_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mega_mhc.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mega_mhc_gfx1250.cu'"
+        ],
         "flags_extra_cc": [],
         "flags_extra_hip": [
             "'-DMHC_HIDDEN=5120'",
-            "f'-DAITER_MHC_GFX1250={int(bool(set(_build_archs_from_env(get_gfx)) & {\"gfx1250\", \"gfx1250-strict\"}))}'",
             "f'-DOPUS_FP32_to_BF16_DEFAULT={int(os.environ.get(\"OPUS_FP32_to_BF16_DEFAULT\", 5))}'",
             "'-gline-tables-only'"
         ],
@@ -2056,11 +2059,14 @@
         "blob_gen_cmd": "''"
     },
     "module_mega_mhc_stream_h7168": {
-        "srcs": "[f'{AITER_CSRC_DIR}/pybind/mega_mhc_pybind.cu', f'{AITER_CSRC_DIR}/kernels/mega_mhc.cu'] + ([f'{AITER_CSRC_DIR}/kernels/mega_mhc_gfx1250.cu'] if set(_build_archs_from_env(get_gfx)) & {'gfx1250', 'gfx1250-strict'} else [])",
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/mega_mhc_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mega_mhc.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mega_mhc_gfx1250.cu'"
+        ],
         "flags_extra_cc": [],
         "flags_extra_hip": [
             "'-DMHC_HIDDEN=7168'",
-            "f'-DAITER_MHC_GFX1250={int(bool(set(_build_archs_from_env(get_gfx)) & {\"gfx1250\", \"gfx1250-strict\"}))}'",
             "f'-DOPUS_FP32_to_BF16_DEFAULT={int(os.environ.get(\"OPUS_FP32_to_BF16_DEFAULT\", 5))}'",
             "'-gline-tables-only'"
         ],
@@ -2071,11 +2077,14 @@
         "blob_gen_cmd": "''"
     },
     "module_mega_mhc_stream_generic": {
-        "srcs": "[f'{AITER_CSRC_DIR}/pybind/mega_mhc_pybind.cu', f'{AITER_CSRC_DIR}/kernels/mega_mhc.cu'] + ([f'{AITER_CSRC_DIR}/kernels/mega_mhc_gfx1250.cu'] if set(_build_archs_from_env(get_gfx)) & {'gfx1250', 'gfx1250-strict'} else [])",
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/mega_mhc_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mega_mhc.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mega_mhc_gfx1250.cu'"
+        ],
         "flags_extra_cc": [],
         "flags_extra_hip": [
             "'-DMHC_HIDDEN=0'",
-            "f'-DAITER_MHC_GFX1250={int(bool(set(_build_archs_from_env(get_gfx)) & {\"gfx1250\", \"gfx1250-strict\"}))}'",
             "f'-DOPUS_FP32_to_BF16_DEFAULT={int(os.environ.get(\"OPUS_FP32_to_BF16_DEFAULT\", 5))}'",
             "'-gline-tables-only'"
         ],
