@@ -442,6 +442,29 @@ def moe_shuffle_scale(
     )
 
 
+def moe_shuffle_weight_iod(
+    w13: torch.Tensor,
+    w13_scale: torch.Tensor,
+    experts_cnt: int | None = None,
+):
+    """IOD-placed copy of a shuffled stage-1 MoE weight (``AITER_MOE_LOC=1``).
+
+    Call once per layer at weight-load time, after ``moe_shuffle_weight`` /
+    ``moe_shuffle_scale`` of the gate_up weight (GUGU on gfx1250) and outside
+    CUDA graph capture. On MI455X it probes the IOD home of fresh pages and
+    re-lays ``w13`` and its scale so that each GEMM1 workgroup reads its own
+    IOD's memory; the grouped GEMM1 then picks the copy up by the tensors'
+    addresses. ``w13`` / ``w13_scale`` are left as they are and must stay
+    alive (other tilings read them). A no-op returning None unless
+    ``AITER_MOE_LOC=1`` on gfx1250.
+    """
+    from aiter.ops.flydsl import iod_locality
+
+    if not iod_locality.enabled():
+        return None
+    return iod_locality.place_w13(w13, w13_scale, experts_cnt)
+
+
 def shuffle_scale_a16w4(
     src: torch.Tensor, experts_cnt: int, gate_up: bool
 ) -> torch.Tensor:
