@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""FlyDSL QSA sparse paged GQA, shaped after the live AMD Triton kernel.
+"""FlyDSL QSA sparse paged GQA.
 
 One workgroup owns ``(row, kv_head, split)``.  Q is staged once, paged K/V
 are gathered in ``BLOCK_N`` tiles, QK and PV use BF16 MFMA, and online
@@ -46,12 +46,13 @@ from aiter.ops.flydsl.kernels.kernels_common import (
 )
 from aiter.ops.flydsl.kernels.tensor_shim import buf_base_i64, buf_copy_atom
 
-# 256 CUs on gfx950 times four BN32 prefill workgroups each. Unlike the decode
-# bands below this one does not move with head_dim: halving D halves the LDS
-# tile, so residency alone predicts eight, but 8 per CU measured slower than 4
-# at D=128 on every M from 16 to 512. Whatever sets this number, it is not the
-# LDS footprint, and it is the same number at both head widths.
-_PREFILL_WGS = 256 * 4
+# BN32 prefill workgroups per CU. Unlike the decode bands below, this does
+# not move with head_dim: halving D halves the LDS tile, so residency alone
+# predicts eight, but 8 per CU measured slower than 4 at D=128 on every M
+# from 16 to 512. Whatever sets this number, it is not the LDS footprint,
+# and it is the same number at both head widths. The launch multiplies it
+# by the device CU count, so 256 CUs on gfx950 still targets 1024 workgroups.
+_PREFILL_WGS_PER_CU = 4
 # Decode workgroup width. The BN16 LDS maps are expressed per (token, D-chunk)
 # rather than per lane, so this is free to move between 128 and 256. BN16 is a
 # single subtile, so qk_split never engages and every wave recomputes the whole
@@ -72,7 +73,8 @@ _TINY_SPLITS = 128
 # head_dim and not the query count. Each ladder is exact for its own D and
 # within ~1% on the other shapes, where the two split counts measured tied.
 # Note the 64-split ceilings are 12 and 16, not 12 and 24 -- the doubling is
-# the direction, not the law.
+# the direction, not the law. This ladder is the gfx950 fit. gfx942 uses it
+# unchanged until a sweep on that arch moves the ceilings.
 _NARROW_HEAD_DIM = 128
 _DECODE_BANDS_NARROW = (4, 16)
 _DECODE_BANDS_WIDE = (2, 12)
@@ -104,9 +106,15 @@ def _ds_write2st64_b64(addr, data0, data1, offset0=0, offset1=16):
 
 
 def _launch_config(
-    rows: int, n_sel: int, n_kv_heads: int, head_dim: int
+    rows: int, n_sel: int, n_kv_heads: int, head_dim: int, num_cus: int
 ) -> tuple[int, int, int]:
-    """Return ``(BLOCK_N, threads, splits)`` using the tuned policy."""
+    """Return ``(BLOCK_N, threads, splits)`` using the tuned policy.
+
+    ``num_cus`` sizes the prefill split target. The decode ladder does not
+    read it. Callers pass the count; this does not query the device.
+    """
+    if num_cus < 1:
+        raise ValueError(f"num_cus must be positive, got {num_cus}")
     base_programs = rows * n_kv_heads
     # Split bands follow head width: D<=128 uses (4, 16), and wider D uses
     # (2, 12). The launch takes 128 splits, then 64, then 32, as
@@ -120,7 +128,7 @@ def _launch_config(
         block_n, target_splits, threads = 16, 64, _DECODE_THREADS
     elif base_programs < 32:
         block_n, target_splits, threads = 16, 32, _DECODE_THREADS
-    # Prefill runs BN32 rather than AMD's BN64. Halving the tile halves the
+    # Prefill runs BN32. Halving the tile halves the
     # live gather and QK state, which drops the kernel from 204 to 122 VGPRs
     # and all but removes its instruction-issue stalls. Occupancy is not the
     # reason: the grid is unchanged, so the extra residency headroom BN32
@@ -128,11 +136,11 @@ def _launch_config(
     #
     # Split so the grid lands on four workgroups per CU. Past that point
     # splitting buys no extra parallelism and still pays merge and
-    # address-chase duplication. See ``_PREFILL_WGS``: four is measured, and
-    # it is not the LDS residency limit it was once read as.
+    # address-chase duplication. See ``_PREFILL_WGS_PER_CU``: four is
+    # measured, and it is not the LDS residency limit it was once read as.
     else:
         block_n, threads = 32, 128
-        target_splits = max(1, _PREFILL_WGS // base_programs)
+        target_splits = max(1, (_PREFILL_WGS_PER_CU * num_cus) // base_programs)
 
     tiles = max(1, ceildiv(n_sel, block_n))
     max_useful_splits = 1 << (tiles.bit_length() - 1)
@@ -182,13 +190,12 @@ def _paged_gqa_lds_bytes(
 ) -> int:
     """Bytes of the split kernel's ``SharedStorage``, including tail alignment.
 
-    The fields are the production struct (no test pad): KV, the score tile,
-    and one partial per wave. gfx950 prefill keeps K and V in separate
-    regions; gfx942 and gfx950 decode overlay them, and gfx942 pads each K
-    row by 8. ``dsl_size_of`` rounds the struct up to 16. The compiler's
-    ``group_segment`` size leaves that tail off (165896 where this reports
-    165904) and both device limits are multiples of 16, so the two sizes
-    reject the same shapes.
+    The fields are KV, the score tile, and one partial per wave. gfx950
+    prefill keeps K and V in separate regions; gfx942 and gfx950 decode
+    overlay them, and gfx942 pads each K row by 8. ``dsl_size_of`` rounds
+    the struct up to 16. The compiler's ``group_segment`` size leaves that
+    tail off (165896 where this reports 165904) and both device limits are
+    multiples of 16, so the two sizes reject the same shapes.
     """
     num_waves = block_threads // 64
     n_subtiles = block_n // 16
@@ -220,8 +227,7 @@ def _paged_gqa_lds_reason(lds_bytes: int, use_k32: bool) -> str | None:
     """Why this split tile does not fit in LDS, or None when it does.
 
     ``use_k32`` is the gfx950 layout. The overlay layout is gfx942, whose
-    workgroup LDS is 64 KiB. A test pad is not part of ``lds_bytes`` here;
-    the builder passes the struct it actually allocated.
+    workgroup LDS is 64 KiB.
     """
     arch = "gfx950" if use_k32 else "gfx942"
     capacity = get_lds_capacity_bytes(arch)
@@ -241,7 +247,6 @@ def build_qsa_sparse_gqa_module(
     n_splits: int,
     wide_cache: bool,
     kv_strides: tuple[int, int, int] | None = None,
-    lds_pad_elems: int = 0,
 ):
     if n_kv_heads < 1 or n_q_heads % n_kv_heads:
         raise ValueError(
@@ -316,10 +321,10 @@ def build_qsa_sparse_gqa_module(
     # 32 tokens * 4 elements * 2 B = 256 B apart, a round advances by
     # col_owners chunks, and an st64 unit is 512 B.
     v_round_st64 = col_owners * 256 // 512
-    # d+4 half of an 8-wide vector: 16*D elements, in st64 units. 16 at D=256
-    # (AMD's offset), 8 at D=128. A fixed +16 stores past the V tile at D=128.
+    # d+4 half of an 8-wide vector: 16*D elements, in st64 units. 16 at D=256,
+    # 8 at D=128. A fixed +16 stores past the V tile at D=128.
     v_half_st64 = head_dim // 16
-    # K LDS image, following the live AMD prefill lowering. A dim chunk is
+    # K LDS image. A dim chunk is
     # split three ways: ``owner`` picks one of the col_owners threads sharing
     # a token, and the rest splits into a quarter and a group whose radices
     # multiply to gather_rounds. One group slot holds a 16 B vector for every
@@ -361,20 +366,7 @@ def build_qsa_sparse_gqa_module(
             fx.make_layout(shape, (k_stride, 1)),
         )
 
-    # A test passes a pad larger than the kv tile so that symbol is not at
-    # byte 0. The production launch leaves it empty and keeps today's layout.
-    if lds_pad_elems < 0:
-        raise ValueError(f"lds_pad_elems must be >= 0, got {lds_pad_elems}")
-    if use_k32 and lds_pad_elems:
-
-        @fx.struct
-        class SharedStorage:
-            pad: fx.Array[BFloat16, lds_pad_elems, 16]
-            kv: fx.Array[BFloat16, block_n * head_dim + v_elem_off, 16]
-            scores: fx.Array[Float32, qk_score_slots, 16]
-            partial: fx.Array[Int32, num_waves, 4]
-
-    elif use_k32:
+    if use_k32:
 
         @fx.struct
         class SharedStorage:
@@ -390,16 +382,13 @@ def build_qsa_sparse_gqa_module(
             scores: fx.Array[Float32, qk_score_slots, 16]
             partial: fx.Array[Int32, num_waves, 4]
 
-    # The host estimate describes the unpadded struct. A test pad is a
-    # different allocation and is checked on its own size.
     lds_bytes = dsl_size_of(SharedStorage)
-    if not lds_pad_elems:
-        expected = _paged_gqa_lds_bytes(head_dim, block_n, block_threads, use_k32)
-        if lds_bytes != expected:
-            raise RuntimeError(
-                f"split shared storage is {lds_bytes} bytes, "
-                f"the host estimate is {expected}"
-            )
+    expected = _paged_gqa_lds_bytes(head_dim, block_n, block_threads, use_k32)
+    if lds_bytes != expected:
+        raise RuntimeError(
+            f"split shared storage is {lds_bytes} bytes, "
+            f"the host estimate is {expected}"
+        )
     lds_reason = _paged_gqa_lds_reason(lds_bytes, use_k32)
     if lds_reason is not None:
         raise ValueError(lds_reason)
@@ -421,7 +410,6 @@ def build_qsa_sparse_gqa_module(
             qkk=qk_k,
             wide=int(wide_cache),
             **({"kvs": "x".join(str(s) for s in kv_strides)} if strided_wide else {}),
-            **({"pad": lds_pad_elems} if lds_pad_elems else {}),
         ),
         known_block_size=[block_threads, 1, 1],
     )
@@ -511,18 +499,6 @@ def build_qsa_sparse_gqa_module(
             v_buf = fx.rocdl.make_buffer_tensor(v_cache)
 
         storage = fx.SharedAllocator().allocate(SharedStorage).peek()
-        # const_expr has to stay its own if: combined with the lane test,
-        # the pad body is still traced on the production launch, which has
-        # no pad field. A deletable store would drop the symbol.
-        if const_expr(lds_pad_elems):  # noqa: SIM102
-            if tid == zero:
-                llvm.inline_asm(
-                    ir.Type.parse("!llvm.void"),
-                    [Int32(fx.ptrtoint(storage.pad.ptr)).ir_value()],
-                    "ds_write_b32 $0, $0\n",
-                    "v,~{memory}",
-                    has_side_effects=True,
-                )
         k_arr = storage.kv
         score_arr = storage.scores
         score_copy = fx.make_copy_atom(fx.UniversalCopy128b(), Float32)
@@ -573,7 +549,7 @@ def build_qsa_sparse_gqa_module(
             return fx.Vector(fx.memref_load_vec(pv_c))
 
         def amd_k_elem(n_tok, d0):
-            # Match the live AMD prefill K LDS lowering. Each lane owns one
+            # Prefill K LDS address. Each lane owns one
             # token and one 8xbf16 vector; D chunks are permuted in 4x4
             # groups while bits 5:6 of tid XOR the 128-bit bank address.
             d_chunk = div_nonneg(d0, Int32(8))
@@ -593,9 +569,9 @@ def build_qsa_sparse_gqa_module(
             return div_nonneg(byte_offset, Int32(2))
 
         def amd_decode_k_elem(n_tok, d0):
-            # Live AMD decode K (BN16, 8 KiB): one 16-byte unit per
+            # Decode K (BN16, 8 KiB): one 16-byte unit per
             # (token, D-chunk), token-major, rotated by ``i ^ (i >> 5)``.
-            # The published 0xe0 mask and the 0x80/+4096 second-round terms
+            # The 0xe0 mask and the 0x80/+4096 second-round terms
             # are that one rotation seen through a 256-thread gather; in
             # flattened form the image depends only on the tile, so any lane
             # count that tiles ``block_n`` fills the same LDS bytes.
@@ -603,10 +579,10 @@ def build_qsa_sparse_gqa_module(
             return (flat ^ div_nonneg(flat, Int32(block_n * 2))) * Int32(8)
 
         def amd_decode_v_pack(n_tok, d0):
-            # Live AMD decode V (BN16, 8 KiB): the same flattening at 8-byte
+            # Decode V (BN16, 8 KiB): the same flattening at 8-byte
             # granularity with the half-chunk as the fastest axis, rotated by
-            # ``i ^ (i >> 6)``. Reproduces the published ``A``, ``A^8``,
-            # ``(A^64)+4096``, ``(A^0x48)+4096`` quartet at 256 threads.
+            # ``i ^ (i >> 6)``. At 256 threads that rotation is the four
+            # addresses ``A``, ``A^8``, ``(A^64)+4096``, and ``(A^0x48)+4096``.
             d_chunk = div_nonneg(d0, Int32(8))
             half = div_nonneg(d0 % Int32(8), Int32(4))
             vflat = (d_chunk * Int32(block_n) + n_tok) * Int32(2) + half
@@ -791,7 +767,7 @@ def build_qsa_sparse_gqa_module(
             q_vec = fx.Vector(fx.memref_load_vec(q_frags[ks]))
             if const_expr(decode_tr_pv):
                 # Packed cndmask. The per-element f32 round-trip packed with
-                # v_perm; AMD zeros OOB heads at the load mask instead.
+                # v_perm, so out-of-range heads are zeroed here.
                 q_regs.append(
                     q_live.select(q_vec, fx.Vector.filled(qk_vec, 0.0, BFloat16))
                 )
@@ -1171,7 +1147,7 @@ def build_qsa_sparse_gqa_module(
             l_new = l_prev * alpha + p_sum
             h0 = lane_kg * Int32(4)
             if const_expr(decode_tr_pv):
-                # Decode matches live AMD's second dot: V is MFMA A and P is
+                # Decode's second dot: V is MFMA A and P is
                 # B, so output C is four D values on the head lane. Alpha is
                 # already scalar on that lane; no head gather is required.
                 alpha4 = fx.Vector.from_elements([alpha], Float32).broadcast_to(4)
@@ -1184,24 +1160,6 @@ def build_qsa_sparse_gqa_module(
                     Float32,
                 )
             next_acc = []
-            # D=128 decode on gfx950 miscompiles the first unrolled 16x16x16
-            # PV MFMA under AMD clang 23.0.0git 46fcb339, HIP 7.14.60850,
-            # torch 2.12.0+rocm7.14.0, FlyDSL 0.4.0. That chunk is NaN or
-            # about 1e36 and every later chunk matches. One unused MFMA
-            # occupies the bad slot. Decode never reads this scratch; the
-            # store only keeps the call from being deleted.
-            # test_paged_gqa_d128_decode_matches_oracle fails if it is
-            # removed while this compiler stands. The scratch is the extra
-            # v_mfma_f32_16x16x16_bf16 in that kernel's ISA.
-            if const_expr(decode_tr_pv and head_dim == 128):
-                junk = pv_mfma(
-                    fx.Vector.filled(4, 0.0, BFloat16),
-                    p_vecs[0],
-                    fx.Vector(state[0]) * alpha4,
-                )
-                storage.partial.view(fx.make_layout(num_waves, 1))[wave] = junk[
-                    0
-                ].bitcast(Int32)
             for c in range_constexpr(out_chunks):
                 d = wave * Int32(head_dim // num_waves) + Int32(c * 16) + lane_m
                 acc4 = fx.Vector(state[c]) * alpha4

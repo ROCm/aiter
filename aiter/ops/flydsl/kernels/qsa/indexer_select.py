@@ -8,8 +8,7 @@ budget, packed past any missing page. ``build_qsa_pack_valid_blocks_module``
 does the same for a selector that keeps ``-inf`` columns.
 ``build_qsa_indexer_decode_scores_module`` and
 ``build_qsa_indexer_prefill_scores_module`` are the one-row and 16-row BF16
-MFMA scorers. ``build_qsa_indexer_active_columns_module`` reports the widest
-visible column count. Host dispatch and top-512 selection live in
+MFMA scorers. Host dispatch and top-512 selection live in
 ``aiter.ops.flydsl.qsa_paged``.
 
 Every shape these kernels serve shares one indexer contract. The scorers
@@ -45,9 +44,10 @@ _D = 128
 _R = 4
 _KV_HEADS = 1
 _STREAM_SELECT_MIN_COLUMNS = 32768
-# Above this many rows, qsa_paged selects the stable decode radix at any
-# width. The streaming selector is only a packed table at or above
-# _STREAM_SELECT_MIN_COLUMNS with no more rows than this.
+# Above this many rows, qsa_paged keeps the allocation width and selects
+# the stable decode radix. Decode at or below this many rows, on a table
+# wider than the one-workgroup cutoff, selects with the row-bounded radix
+# and does not read the widest row back to the host.
 _DECODE_MAX_ROWS = 64
 # Columns per workgroup of the 16-row scorer.
 _ROWS_BLOCK_N = 64
@@ -658,10 +658,10 @@ def build_qsa_indexer_prefill_scores_module(
 
     One wave per 16 columns, each over the whole head dim, so the four
     heads accumulate in registers and the wave writes its scores directly.
-    A row tile may span requests. Q is staged once per request; each
+    A row tile may span requests. Q is staged once per row tile; each
     request in the tile gathers its own K tiles and writes only its own
-    rows, so a request-major batch (vLLM's layout) gathers each K tile once
-    per request it touches. A workgroup walks ``tiles_per_wg`` consecutive
+    rows, so a request-major batch gathers each K tile once per request it
+    touches. A workgroup walks ``tiles_per_wg`` consecutive
     column tiles, a launch argument, so one Q staging serves several K tiles.
 
     ``fold_heads`` (4 heads only) puts 4 rows x 4 heads on the MFMA M axis
@@ -848,6 +848,37 @@ def build_qsa_indexer_prefill_scores_module(
 
         # As in the one-row scorer: skip tiles no row of this block can see.
         if tile0 * Int32(block_n) < tile_visible:
+            # Q is staged once per row tile and reused by every request and tile
+            # this workgroup scores: its mask is any live request, not this one.
+            # The fill stays a thread-linear copy of the whole (row, head, d)
+            # tile, eight bf16 at a time. partition_A is the MFMA A fragment each
+            # lane later reads from this LDS, so it does not name this store:
+            # storing through it would skip elements that fragment does not own
+            # and would retile the global load.
+            for qpart_q in range_constexpr(q_vectors_per_thread):
+                qlinear_q = tid + Int32(qpart_q * block_threads)
+                qrow_local_q = div_nonneg(qlinear_q, Int32(n_heads * vec_chunks))
+                qrem_q = qlinear_q - qrow_local_q * Int32(n_heads * vec_chunks)
+                qhead_q = div_nonneg(qrem_q, Int32(vec_chunks))
+                qd_chunk_q = qrem_q - qhead_q * Int32(vec_chunks)
+                qrow_q = row_tile * Int32(block_m) + qrow_local_q
+                qrow_live_q = qrow_q < rows
+                qsafe_row_q = qrow_live_q.select(qrow_q, zero)
+                qreq_live_q = req_lds[qrow_local_q] >= zero
+                qs_row_q = fx.logical_divide(
+                    fx.slice(q_buf, (qsafe_row_q, qhead_q, None)), vec_layout
+                )
+                qs_src_q = fx.slice(qs_row_q, (None, qd_chunk_q))
+                qs_frag_q = fx.make_fragment_like(qs_src_q)
+                fx.copy(g_copy, qs_src_q, qs_frag_q)
+                qs_vec_q = fx.Vector(fx.memref_load_vec(qs_frag_q))
+                qd0_q = qd_chunk_q * Int32(vec)
+                for iq_q in range_constexpr(vec):
+                    qv_q = qreq_live_q.select(qs_vec_q[iq_q].to(Float32), Float32(0.0))
+                    q_lds[qrow_local_q, qhead_q, qd0_q + Int32(iq_q)] = qv_q.to(
+                        BFloat16
+                    )
+            gpu.barrier()
             # Names assigned in this loop are its own: a name it shares with
             # the code above would become an scf.for iter_arg.
             for cur_req in range(req_lo, req_hi + one, one):
@@ -859,41 +890,6 @@ def build_qsa_indexer_prefill_scores_module(
                     )
                     req_visible = fx.max(v_r, req_visible)
                 if tile0 * Int32(block_n) < req_visible:
-                    # Q is staged once per request and reused by every tile
-                    # this workgroup scores; the first K gather's barrier
-                    # publishes it. The fill stays a thread-linear copy of
-                    # the whole (row, head, d) tile, eight bf16 at a time.
-                    # partition_A is the MFMA A fragment each lane later
-                    # reads from this LDS, so it does not name this store:
-                    # storing through it would skip elements that fragment
-                    # does not own and would retile the global load.
-                    for qpart_r in range_constexpr(q_vectors_per_thread):
-                        qlinear_r = tid + Int32(qpart_r * block_threads)
-                        qrow_local_r = div_nonneg(
-                            qlinear_r, Int32(n_heads * vec_chunks)
-                        )
-                        qrem_r = qlinear_r - qrow_local_r * Int32(n_heads * vec_chunks)
-                        qhead_r = div_nonneg(qrem_r, Int32(vec_chunks))
-                        qd_chunk_r = qrem_r - qhead_r * Int32(vec_chunks)
-                        qrow_r = row_tile * Int32(block_m) + qrow_local_r
-                        qrow_live_r = qrow_r < rows
-                        qsafe_row_r = qrow_live_r.select(qrow_r, zero)
-                        qreq_live_r = req_lds[qrow_local_r] >= zero
-                        qs_row_r = fx.logical_divide(
-                            fx.slice(q_buf, (qsafe_row_r, qhead_r, None)), vec_layout
-                        )
-                        qs_src_r = fx.slice(qs_row_r, (None, qd_chunk_r))
-                        qs_frag_r = fx.make_fragment_like(qs_src_r)
-                        fx.copy(g_copy, qs_src_r, qs_frag_r)
-                        qs_vec_r = fx.Vector(fx.memref_load_vec(qs_frag_r))
-                        qd0_r = qd_chunk_r * Int32(vec)
-                        for iq_r in range_constexpr(vec):
-                            qv_r = qreq_live_r.select(
-                                qs_vec_r[iq_r].to(Float32), Float32(0.0)
-                            )
-                            q_lds[qrow_local_r, qhead_r, qd0_r + Int32(iq_r)] = qv_r.to(
-                                BFloat16
-                            )
                     tile_end = div_nonneg(
                         req_visible + Int32(block_n - 1), Int32(block_n)
                     )
@@ -1085,59 +1081,3 @@ def build_qsa_indexer_prefill_scores_module(
         )
 
     return launch_qsa_indexer_prefill_scores
-
-
-def build_qsa_indexer_active_columns_module():
-    """One thread, the widest visible column count, matching the scorers."""
-
-    @flyc.kernel(
-        name="qsa_indexer_active_columns",
-        known_block_size=[1, 1, 1],
-    )
-    def qsa_indexer_active_columns_kernel(
-        token_to_req: fx.Tensor,
-        query_positions: fx.Tensor,
-        context_lens: fx.Tensor,
-        out: fx.Tensor,
-        n_columns: Int32,
-        n_req: Int32,
-        rows: Int32,
-    ):
-        zero = Int32(0)
-        one = Int32(1)
-        for _row, state in range(zero, rows, one, init=[zero]):
-            local = state[0]
-            row = Int32(_row)
-            req = token_to_req[row]
-            valid_req = (req >= zero) & (req < n_req)
-            safe_req = valid_req.select(req, zero)
-            qpos = query_positions[row]
-            slen = valid_req.select(context_lens[safe_req], zero)
-            visible = fx.min(_compressed_span(qpos, slen), n_columns)
-            visible = valid_req.select(visible, zero)
-            local = fx.max(visible, local)
-            results = yield [local]
-        out[zero] = results
-
-    @flyc.jit
-    def launch_qsa_indexer_active_columns(
-        token_to_req: fx.Tensor,
-        query_positions: fx.Tensor,
-        context_lens: fx.Tensor,
-        out: fx.Tensor,
-        n_columns: Int32,
-        n_req: Int32,
-        rows: Int32,
-        stream: fx.Stream,
-    ):
-        qsa_indexer_active_columns_kernel(
-            token_to_req,
-            query_positions,
-            context_lens,
-            out,
-            n_columns,
-            n_req,
-            rows,
-        ).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream)
-
-    return launch_qsa_indexer_active_columns
