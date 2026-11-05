@@ -1214,6 +1214,20 @@ def _raise_on_pybind11_abi_split(md_name, so_path, core_so_path, has_tensor_arg)
     )
 
 
+def _rebuild_targets_arch(arch):
+    """Whether a JIT build compiles device code for arch.
+
+    Reads the --offload-arch list build_module() passes. "native" lets clang
+    target every GPU on the node, the running one included; hipinfo on Windows
+    resolves it to the first arch it reports.
+    """
+    try:
+        targets = validate_and_update_archs()
+    except Exception:  # noqa: BLE001 the build reports a bad GPU_ARCHS itself
+        return True
+    return "native" in targets or arch in targets
+
+
 def _needs_arch_rebuild(md_name):
     # a prebuilt .so is a valid host extension on any GPU, so importing one
     # built for the wrong arch succeeds and only faults later at kernel launch.
@@ -1227,6 +1241,15 @@ def _needs_arch_rebuild(md_name):
     so_path = os.path.join(get_user_jit_dir(), f"{md_name}{JIT_LIB_EXT}")
     built = _so_offload_archs(so_path)
     if not built or cur in built:
+        return False
+    if not _rebuild_targets_arch(cur):
+        # A rebuild would miss the running arch too, so asking for one would
+        # only rebuild, then fail the reload with ModuleNotFoundError.
+        logger.warning(
+            f"[{md_name}] prebuilt .so targets {sorted(built)} but not the "
+            f"running arch {cur}, and a rebuild would not target it either; "
+            f"set GPU_ARCHS to include {cur}"
+        )
         return False
     logger.warning(
         f"[{md_name}] prebuilt .so targets {sorted(built)} but not the "

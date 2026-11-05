@@ -30,8 +30,12 @@ _CACHED = [
         "_gpu_info_output",
         "_gpu_info_archs",
         "_detect_native",
+        "_rocminfo_gpu_agents",
+        "get_gfx",
+        "get_gfx_custom_op_core",
         "get_gfx_runtime",
         "get_cu_num",
+        "get_asic_revision",
     )
 ]
 _MIXED_ROCMINFO = (
@@ -234,3 +238,42 @@ def test_uniform_arch_with_mixed_cu_counts_stays_per_device(
         current["device"] = device
         assert chip_info.get_gfx_runtime() == "gfx942"
         assert chip_info.get_cu_num() == devices[device].multi_processor_count
+
+
+def test_build_targets_pair_the_arch_with_its_own_cu_counts(
+    device1_selected_empty_tool, monkeypatch
+):
+    # get_gfx() builds for rocminfo's first arch (gfx950). With gfx942 device 1
+    # selected, its 304 CUs would match no gfx950 tuned row.
+    if chip_info.IS_WINDOWS:
+        pytest.skip("rocminfo-format output")
+    _fake_tool_output(monkeypatch, _MIXED_ROCMINFO)
+    current = {"device": 1}
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: current["device"])
+    assert chip_info.get_build_targets() == [("gfx950", 256), ("gfx950", 128)]
+    current["device"] = 0
+    assert chip_info.get_build_targets() == [("gfx950", 256)]
+    # CU_NUM still names the one count to build for.
+    current["device"] = 1
+    monkeypatch.setenv("CU_NUM", "304")
+    _clear_caches()
+    assert chip_info.get_build_targets() == [("gfx950", 304)]
+
+
+def test_asic_revision_follows_the_current_devices_arch(
+    device1_selected_empty_tool, monkeypatch
+):
+    if chip_info.IS_WINDOWS:
+        pytest.skip("rocminfo-format output")
+    _fake_tool_output(
+        monkeypatch,
+        _MIXED_ROCMINFO.replace(
+            "Device Type: GPU\nAgent 2", "Device Type: GPU\n  ASIC Revision: 1\nAgent 2"
+        )
+        + "  ASIC Revision: 0\n",
+    )
+    current = {"device": 0}
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: current["device"])
+    for device, revision in ((0, 1), (1, 0), (0, 1)):
+        current["device"] = device
+        assert chip_info.get_asic_revision() == revision

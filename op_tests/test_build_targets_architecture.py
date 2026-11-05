@@ -386,11 +386,14 @@ class TestCodeObjectRebuildGuard(unittest.TestCase):
 
         self.core = core
 
-    def _needs_rebuild(self, running_arch, built_archs):
+    def _needs_rebuild(self, running_arch, built_archs, build_archs=("native",)):
         with (
             mock.patch.object(self.core, "get_gfx_runtime", return_value=running_arch),
             mock.patch.object(
                 self.core, "_so_offload_archs", return_value=set(built_archs)
+            ),
+            mock.patch.object(
+                self.core, "validate_and_update_archs", return_value=list(build_archs)
             ),
         ):
             return self.core._needs_arch_rebuild("dummy_module")
@@ -410,6 +413,31 @@ class TestCodeObjectRebuildGuard(unittest.TestCase):
     def test_host_only_so_is_not_rebuilt(self):
         # empty offload set = host-only module; never force a rebuild.
         self.assertFalse(self._needs_rebuild("gfx1250-strict", set()))
+
+    def test_rebuild_only_when_it_would_target_the_running_arch(self):
+        # A rebuild that misses the running arch would fail the reload with
+        # ModuleNotFoundError, e.g. device 1 of a mixed node selected.
+        for build_archs, expected in (
+            (("native",), True),
+            (("gfx942", "gfx950"), True),
+            (("gfx950",), False),
+        ):
+            with self.subTest(build_archs=build_archs):
+                self.assertEqual(
+                    self._needs_rebuild("gfx942", {"gfx950"}, build_archs), expected
+                )
+
+    def test_windows_native_build_compares_against_hipinfo_arch(self):
+        # Windows resolves "native" to the first hipinfo arch itself, so a
+        # mixed node whose current device is another arch must not rebuild.
+        with (
+            mock.patch.dict(os.environ, {"GPU_ARCHS": "native"}),
+            mock.patch.object(self.core, "IS_WINDOWS", True),
+            mock.patch.object(self.core, "_detect_native", return_value=["gfx950"]),
+            mock.patch.object(self.core, "get_gfx_runtime", return_value="gfx942"),
+            mock.patch.object(self.core, "_so_offload_archs", return_value={"gfx950"}),
+        ):
+            self.assertFalse(self.core._needs_arch_rebuild("dummy_module"))
 
 
 if __name__ == "__main__":

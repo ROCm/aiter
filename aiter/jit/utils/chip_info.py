@@ -8,6 +8,7 @@ import subprocess
 import sys
 
 from build_targets import (
+    GFX_CU_NUMS_MAP,
     GFX_MAP,
     _parse_gpu_archs_env,
     filter_tune_df,
@@ -339,7 +340,6 @@ def _hipinfo_gpu_agents() -> list[tuple[str, int]]:
     return agents
 
 
-@functools.lru_cache(maxsize=1)
 def get_asic_revision() -> int:
     """Silicon stepping of this node's GPUs: 0=A0, 1=B0, 2=C0, ...
 
@@ -348,9 +348,14 @@ def get_asic_revision() -> int:
     can disagree. The lowest stepping is reported, so the asm gate on a
     mixed-stepping node fails closed. Raises when nothing can be read.
     hipinfo on Windows lists only the devices HIP_VISIBLE_DEVICES leaves.
+    Only agents of the current device's arch count, so it is cached per arch.
     """
+    return _asic_revision(get_gfx_runtime())
+
+
+@functools.cache
+def _asic_revision(arch: str) -> int:
     agents = _hipinfo_gpu_agents() if IS_WINDOWS else _rocminfo_gpu_agents()
-    arch = get_gfx_runtime()
     revs = [rev for name, rev in agents if name == arch]
     if not revs:
         raise RuntimeError(
@@ -364,6 +369,9 @@ def get_asic_revision() -> int:
             f"implausible ASIC Revision {rev} parsed from {_GPU_INFO_TOOL}"
         )
     return rev
+
+
+get_asic_revision.cache_clear = _asic_revision.cache_clear  # type: ignore[attr-defined]
 
 
 # Backfill map for legacy tuned configs that predate the `gfx` column.
@@ -529,7 +537,9 @@ def get_build_targets() -> list[tuple[str, int]]:
       2. GPU_ARCHS unset, empty/whitespace, or "native" -> call get_gfx()
          (GPU_ARCHS-aware; falls back to rocminfo/hipinfo when GPU_ARCHS is
          unset) and get_cu_num(), which correctly reflect partition mode and
-         binned variants.
+         binned variants. When the current device runs another arch than
+         get_gfx() (a mixed-arch node), every CU count GFX_CU_NUMS_MAP lists
+         for get_gfx() instead.
       3. Neither -> raise RuntimeError with a clear message.
     """
     gpu_archs = os.getenv("GPU_ARCHS")
@@ -540,12 +550,32 @@ def get_build_targets() -> list[tuple[str, int]]:
     try:
         # get_gfx() is intentional here -- this is a build-time path; get_gfx_runtime()
         # would fail in CI environments without a live GPU.
-        return [(get_gfx(), get_cu_num())]
+        gfx = get_gfx()
+        cu_num = get_cu_num()
     except Exception as e:
         raise RuntimeError(
             "No GPU detected and GPU_ARCHS is not set to an explicit target. "
             "Set GPU_ARCHS=gfx942 (or similar) to build without a GPU."
         ) from e
+    if int(os.getenv("CU_NUM", "0")) or not _current_device_runs_another_arch(gfx):
+        return [(gfx, cu_num)]
+    # A mixed-arch node whose current device is another GPU: get_cu_num() counts
+    # that GPU, so pairing it with gfx would match no tuned row. Target every
+    # count gfx ships with instead, as GPU_ARCHS=gfx would.
+    if gfx not in GFX_CU_NUMS_MAP:
+        raise RuntimeError(
+            f"The current device is not a {gfx}, so its CU count cannot stand in "
+            f"for one. Set GPU_ARCHS and CU_NUM to build for {gfx}."
+        )
+    return [(gfx, listed) for listed in GFX_CU_NUMS_MAP[gfx]]
+
+
+def _current_device_runs_another_arch(gfx: str) -> bool:
+    """True only when the current device is known to run another arch than gfx."""
+    try:
+        return get_gfx_runtime() != gfx
+    except Exception:  # noqa: BLE001 no live device to compare: trust get_cu_num()
+        return False
 
 
 def build_tune_dict(
