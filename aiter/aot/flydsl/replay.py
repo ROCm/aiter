@@ -74,12 +74,14 @@ from contextlib import AbstractContextManager, contextmanager
 from typing import Any
 
 from aiter.aot.flydsl.common import (
+    STRICT_ERRATA_TABLES,
     aot_target_archs,
     assert_targets_covered,
     check_replay_process,
     collect_aot_jobs,
     cu_num_to_arch,
     get_max_workers,
+    is_strict_identity,
     replay_env,
     resolve_target_arch,
     run_jobs_parallel,
@@ -579,6 +581,13 @@ def main(module_name: str, description: str) -> None:
         for job in jobs:
             cur = job_arch(job, _default_arch(module))
             if resolve_target_arch(cur, {args.arch}) != args.arch:
+                continue
+            # gfx1250-strict disables the WMMA features these tables need
+            # (A0 errata); compiled for strict they are hollow, so skip them.
+            if (
+                is_strict_identity(args.arch)
+                and job.get("table") in STRICT_ERRATA_TABLES
+            ):
                 continue
             if cur != args.arch:
                 job = {**job, "gfx": args.arch}

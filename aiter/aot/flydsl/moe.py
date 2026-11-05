@@ -73,6 +73,7 @@ from aiter.aot.flydsl.common import (
     cu_num_to_arch,
     dedupe_jobs,
     get_max_workers,
+    is_strict_identity,
     replay_env,
     resolve_target_arch,
     run_jobs_parallel,
@@ -673,11 +674,18 @@ def run(csv_paths: list[str], *, edges: bool = True, check: bool = False) -> int
     # Keep rows whose tuned arch shares a requested target's kernel family,
     # retargeting each to the exact requested arch so it replays and compiles
     # for that identity (a gfx1250 row serves a gfx1250-strict build -> 0xeb).
+    from aiter.ops.flydsl.mxfp4_kname import _is_mxfp4_kname
+
     retargeted = []
     skipped = Counter()
     for job in jobs:
         target = resolve_target_arch(job_arch(job), targets)
         if target is None:
+            skipped[job_arch(job)] += 1
+            continue
+        # gfx1250-strict disables F4 WMMA (A0 errata); mxfp4 rows are hollow
+        # on strict, so skip them and let A0 fall back to runtime JIT.
+        if is_strict_identity(target) and _is_mxfp4_kname(job.get("kernelName1") or ""):
             skipped[job_arch(job)] += 1
             continue
         if targets and target != job_arch(job):
