@@ -302,8 +302,8 @@ _LL128_MIXED_SIZES = {
 _LL_GFX1250_MIXED_SIZES = [32000, 32768, 512]
 
 # Back-to-back gfx1250 messages at TP4 and TP8 that alternate the LL two-shot
-# kernel (1.15 MB and 4.59 MB of fp32) with the one-shot LL (0.36 MB). Both
-# use the LL scratch and the per-block epochs. The 4.59 MB message runs
+# kernel (1.15 MB and 4.59 MB of fp32) with the one-shot LL (0.36 MB). Each
+# kernel keeps its own scratch and per-block epochs. The 4.59 MB message runs
 # the two-shot with 512-thread blocks instead of 256. fp32, so that the expected
 # bits depend on the order the ranks are summed in (see rank_order).
 _LL2S_GFX1250_MIXED_SIZES = [40 * 7168, 25 * 3584, 160 * 7168]

@@ -87,19 +87,21 @@ void dispose(fptr_t _fa)
     delete fa;
 }
 
-// Shared meta buffer = Signal struct + LL staging scratch appended after it.
-// The LL fast path derives each peer's scratch base as (peer meta) +
-// kLLScratchOffset, reusing the existing cross-rank meta exchange. The whole
-// region is zero-initialized by the caller (which also resets the LL flags).
-// Takes world_size because the LL scratch is sized by it. Reserving
-// kLLMaxRanks slots unconditionally made TP=2 pay for eight ranks' worth.
-// Groups above kLLMaxRanks are allgather-only and never route to LL, so they
-// get no scratch (it would be 1 GiB per rank at 64).
+// Shared meta buffer = Signal struct + LL staging scratch appended after it,
+// then the fused AR + RMSNorm shard and the LL two-shot's own scratch. The LL
+// fast path derives each peer's scratch base as (peer meta) + kLLScratchOffset,
+// the two-shot as + ar2sScratchOffset, reusing the existing cross-rank meta
+// exchange. The whole region is zero-initialized by the caller (which also
+// resets the LL flags). Takes world_size because the scratch is sized by it.
+// Reserving kLLMaxRanks slots unconditionally made TP=2 pay for eight ranks'
+// worth. Groups above kLLMaxRanks are allgather-only and never route to LL, so
+// they get no scratch (it would be 1 GiB per rank at 64).
 int64_t meta_size(int64_t world_size)
 {
     aiter::check_ngpus((int)world_size);
     size_t ll_bytes = world_size <= aiter::kLLMaxRanks
-                          ? aiter::llScratchBytes((int)world_size) + aiter::kArRmsShardBytes
+                          ? aiter::llScratchBytes((int)world_size) + aiter::kArRmsShardBytes +
+                                aiter::ar2sScratchBytes((int)world_size)
                           : 0;
     return (int64_t)(aiter::kLLScratchOffset + ll_bytes);
 }
