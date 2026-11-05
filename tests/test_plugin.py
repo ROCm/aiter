@@ -1071,3 +1071,26 @@ def test_the_environment_can_still_stop_an_enabled_provider(monkeypatch):
     plugin.reload_config()
 
     assert add(2, 3) == 5, "the kill switch outranks the framework default"
+
+
+def test_resetting_for_tests_keeps_the_ops_routed_by_importing_aiter(monkeypatch):
+    """Those belong to the process, not to whichever test ran first."""
+
+    monkeypatch.setattr(plugin, "_imported_routes", None)
+    production = plugin._RoutedOp(
+        plugin.Op("production.op", 1),
+        inspect.signature(lambda x: x),
+        lambda *a, **k: ((), {}),
+        {},
+    )
+    plugin._routed_ops["production.op"] = production
+
+    plugin._reset_for_testing()  # first call captures the import-time set
+    assert "production.op" in plugin._routed_ops
+
+    _route_add([])
+    assert "test.add" in plugin._routed_ops
+
+    plugin._reset_for_testing()
+    assert "production.op" in plugin._routed_ops, "import-time routes survive"
+    assert "test.add" not in plugin._routed_ops, "test routes do not"

@@ -209,6 +209,9 @@ class Explanation:
 
 
 _routed_ops: dict[str, _RoutedOp] = {}
+# Ops routed by importing aiter belong to the process, not to whichever test
+# runs first; see _reset_for_testing.
+_imported_routes: dict[str, _RoutedOp] | None = None
 _decision_counts: Counter[tuple[str, str, str, str | None]] = Counter()
 _decision_callbacks: list[Callable[[Decision], None]] = []
 _silenced_callbacks: set[int] = set()
@@ -1098,8 +1101,15 @@ def _entry_points() -> Sequence[metadata.EntryPoint]:
 
 def _reset_for_testing() -> None:
     global _provider_records, _config_snapshot, _eligible_cache, _framework_default
-    global _skipped_providers, _callback_errors
+    global _skipped_providers, _callback_errors, _imported_routes
+    if _imported_routes is None:
+        # Captured the first time this runs, which is before any test has
+        # routed an op of its own: everything here was registered by importing
+        # aiter. Clearing those would make status() and explain() report the
+        # production ops as unrouted for every test after the first.
+        _imported_routes = dict(_routed_ops)
     _routed_ops.clear()
+    _routed_ops.update(_imported_routes)
     _decision_counts.clear()
     _decision_callbacks.clear()
     _silenced_callbacks.clear()
