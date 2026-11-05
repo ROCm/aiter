@@ -1091,9 +1091,34 @@ _KDA_STATE_DTYPE_TAGS = {torch.float32: "f32", torch.bfloat16: "bf16"}
 _INT32_MAX = 2**31 - 1
 # Debug check that live KDA ``state_indices`` are unique. It copies the
 # duplicates to the host, a sync, so it is off by default and skipped while a
-# CUDA graph is being captured. Slot 0 is live, so it also flags SGLang's eager
-# DP-attention padding rows, which share the reserved scratch slot 0.
+# CUDA graph is being captured. Slot 0 is live, so by default it also flags
+# SGLang's eager DP-attention padding rows, which share the reserved scratch
+# slot 0; AITER_KDA_DECODE_SLOT_CHECK_PADDING_SLOT=0 lets that slot repeat.
 _KDA_SLOT_CHECK = os.environ.get("AITER_KDA_DECODE_SLOT_CHECK", "0") == "1"
+
+
+def _env_padding_slot(name: str) -> int | None:
+    value = os.environ.get(name, "").strip()
+    if not value:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        raise ValueError(f"{name} must be a slot index, got {value!r}.") from None
+
+
+# A slot the debug check treats as padding, like a negative index: the kernel
+# still decodes it, but the caller reserves it for rows whose results it drops.
+_KDA_SLOT_CHECK_PADDING_SLOT = _env_padding_slot(
+    "AITER_KDA_DECODE_SLOT_CHECK_PADDING_SLOT"
+)
+
+
+def _mask_padding_slot(state_indices: torch.Tensor) -> torch.Tensor:
+    """Map the opted-in padding slot to -1, so the slot check lets it repeat."""
+    if _KDA_SLOT_CHECK_PADDING_SLOT is None:
+        return state_indices
+    return torch.where(state_indices == _KDA_SLOT_CHECK_PADDING_SLOT, -1, state_indices)
 
 
 @functools.cache
@@ -1430,7 +1455,8 @@ def _validate_kda_inputs(
         with torch.cuda.device(device):
             if not torch.cuda.is_current_stream_capturing():
                 _check_unique_live_slots(
-                    state_indices, _num_cache_slots(state, conv_state)
+                    _mask_padding_slot(state_indices),
+                    _num_cache_slots(state, conv_state),
                 )
     return out
 
@@ -1479,9 +1505,10 @@ def flydsl_kda_decode(
     CUDA-graph padding rows are PAD_SLOT_ID (-1). Its eager DP-attention padding
     rows instead share the reserved scratch slot 0, which is only safe because no
     request owns that slot. Set ``AITER_KDA_DECODE_SLOT_CHECK=1`` to raise
-    ``ValueError`` on any duplicate live slot, including those shared slot-0
-    padding rows; the check syncs with the host and is skipped during graph
-    capture.
+    ``ValueError`` on any duplicate live slot; the check syncs with the host and
+    is skipped during graph capture. By default it also flags those shared
+    slot-0 padding rows; set ``AITER_KDA_DECODE_SLOT_CHECK_PADDING_SLOT=0`` to
+    let slot 0 repeat like a negative index (the kernel still decodes it).
     """
     if x.ndim != 2:
         raise ValueError(f"`x` must have rank 2, got rank {x.ndim}.")

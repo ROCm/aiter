@@ -1419,6 +1419,41 @@ def test_flydsl_kda_decode_slot_check_rejects_duplicate_live_slots(
 
 
 @_requires_kda
+def test_flydsl_kda_decode_slot_check_padding_slot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from aiter.ops.flydsl import linear_attention_kernels
+
+    monkeypatch.setattr(linear_attention_kernels, "_KDA_SLOT_CHECK", True)
+    inputs = _make_kda_inputs(batch=4)
+    # SGLang's eager DP-attention padding rows share its reserved slot 0.
+    inputs.state_indices.copy_(
+        torch.tensor([2, 0, 0, 1], dtype=torch.int32, device=_KDA_DEVICE)
+    )
+    with pytest.raises(ValueError, match=r"duplicated slots: \[0\]"):
+        _run_kda(inputs)
+
+    monkeypatch.setattr(linear_attention_kernels, "_KDA_SLOT_CHECK_PADDING_SLOT", 0)
+    _run_kda(inputs)
+    torch.cuda.synchronize()
+    # Other live slots still may not repeat.
+    inputs.state_indices.copy_(
+        torch.tensor([2, 0, 0, 2], dtype=torch.int32, device=_KDA_DEVICE)
+    )
+    with pytest.raises(ValueError, match=r"duplicated slots: \[2\]"):
+        _run_kda(inputs)
+
+    env = "AITER_KDA_DECODE_SLOT_CHECK_PADDING_SLOT"
+    monkeypatch.setenv(env, " 0 ")
+    assert linear_attention_kernels._env_padding_slot(env) == 0
+    monkeypatch.setenv(env, "")
+    assert linear_attention_kernels._env_padding_slot(env) is None
+    monkeypatch.setenv(env, "zero")
+    with pytest.raises(ValueError, match=f"{env} must be a slot index"):
+        linear_attention_kernels._env_padding_slot(env)
+
+
+@_requires_kda
 @pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("fused_f_b", [False, True])
 def test_flydsl_kda_decode_out_of_range_slots_do_not_modify_caches(
