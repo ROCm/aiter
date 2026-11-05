@@ -37,6 +37,13 @@ NETWORKS = {
         "topk": 6,
         "swiglu_limit": 10.0,
     },
+    "v41_flash": {
+        "model_dim": 5120,
+        "inter_dim": 2304,
+        "experts": 384,
+        "topk": 6,
+        "swiglu_limit": 10.0,
+    },
     "r1_v3": {
         "model_dim": 7168,
         "inter_dim": 2048,
@@ -123,6 +130,8 @@ def _make_inputs(
     force_fanout_boundary,
     inject_invalid_route,
     force_padding_boundary,
+    concentrate_experts=0,
+    zipf=0.0,
 ):
     generator = torch.Generator(device=device).manual_seed(seed + rank)
     x = torch.randn(
@@ -131,8 +140,46 @@ def _make_inputs(
     scores = torch.randn(
         (tokens, experts), dtype=torch.float32, device=device, generator=generator
     )
+    if zipf > 0:
+        # Zipf expert-popularity skew (realistic MoE load imbalance): bias scores
+        # by -zipf*ln(rank+1) over a seed-fixed permutation shared across ranks,
+        # so a few experts attract most tokens (spread across expert ids).
+        pgen = torch.Generator(device=device).manual_seed(seed)
+        perm = torch.randperm(experts, generator=pgen, device=device)
+        rank_of = torch.empty(experts, dtype=torch.float32, device=device)
+        rank_of[perm] = torch.arange(experts, dtype=torch.float32, device=device)
+        scores = scores + (-float(zipf) * torch.log(rank_of + 1.0))[None, :]
     values, ids = torch.topk(scores, topk, dim=-1)
-    if force_fanout_boundary or inject_invalid_route or force_padding_boundary:
+    if concentrate_experts:
+        # OOB repro: route every token's top-k slots to experts [0, topk) which
+        # all live on rank 0, so rank 0's route-major receive buffer must hold
+        # (sum of sender tokens) * topk rows -- the cross-rank skew the local
+        # payload-capacity guard cannot see.
+        ids = (
+            torch.arange(topk, dtype=torch.int64, device=device)
+            .expand(tokens, topk)
+            .clone()
+        )
+    small_pair_boundary = (
+        force_fanout_boundary
+        and not (inject_invalid_route or force_padding_boundary)
+        and 2 <= topk <= 8
+        and topk % 2 == 0
+        and topk // 2 <= dist.get_world_size()
+        and experts % dist.get_world_size() == 0
+    )
+    if small_pair_boundary:
+        # Distinct paired experts in multiple destinations force fanout rows
+        # and expert padding for the small-topk (e.g. DSv4.1) route format.
+        world = dist.get_world_size()
+        local_experts = experts // world
+        if local_experts < 2:
+            raise ValueError("paired fanout requires at least two local experts")
+        token = torch.arange(tokens, dtype=torch.int64, device=device)[:, None]
+        slot = torch.arange(topk, dtype=torch.int64, device=device)[None, :]
+        destination = (token + rank + slot // 2) % world
+        ids = destination * local_experts + local_experts - 2 + slot % 2
+    elif force_fanout_boundary or inject_invalid_route or force_padding_boundary:
         if topk != 16 or experts % dist.get_world_size():
             raise ValueError("fanout adversarial cases require topk=16 and EP")
         world = dist.get_world_size()
@@ -547,6 +594,8 @@ def main():
     parser.add_argument("--config-tokens", type=int, default=0)
     parser.add_argument("--unify-fields", default="")
     parser.add_argument("--burst-depth", type=int, default=0)
+    parser.add_argument("--concentrate-experts", type=int, default=0)
+    parser.add_argument("--zipf", type=float, default=0.0)
     parser.add_argument("--force-fanout-boundary", action="store_true")
     parser.add_argument("--inject-invalid-route", action="store_true")
     parser.add_argument("--force-padding-boundary", action="store_true")
@@ -620,6 +669,8 @@ def main():
             force_fanout_boundary=args.force_fanout_boundary,
             inject_invalid_route=args.inject_invalid_route,
             force_padding_boundary=args.force_padding_boundary,
+            concentrate_experts=args.concentrate_experts,
+            zipf=args.zipf,
         )
         ref_weights = w1_q, w1_ref_scale, w2_q, w2_ref_scale
         # MegaMoE's producer/consumer wire geometry is rank-invariant. A

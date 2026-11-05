@@ -1,0 +1,8 @@
+{
+    "M_LEQ_8191": {
+        "num_warps": 4
+    },
+    "any": {
+        "num_warps": 1
+    }
+}

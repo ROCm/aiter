@@ -22,9 +22,9 @@ def _projection_runtime():
     from .kernels.gather_kv_b_proj_gfx1250 import (
         launch_gather_kv_b_proj_8wave_gfx1250,
     )
-    from .kernels.tensor_shim import ptr_arg
+    from .kernels.tensor_shim import _run_compiled, ptr_arg
 
-    return launch_gather_kv_b_proj_8wave_gfx1250, ptr_arg, fx
+    return launch_gather_kv_b_proj_8wave_gfx1250, ptr_arg, fx, _run_compiled
 
 
 def _cluster_n(m: int, n_heads: int) -> int:
@@ -45,7 +45,7 @@ def _run_projection(
     cluster_n: int,
 ) -> None:
     """Launch the fixed-width indexed MLA WMMA kernel."""
-    launch_projection, ptr_arg, fx = _projection_runtime()
+    launch_projection, ptr_arg, fx, run_compiled = _projection_runtime()
 
     scale_is_ptr = activation_scale.device.type != "cpu"
     scale_ptr = activation_scale if scale_is_ptr else cache
@@ -62,7 +62,13 @@ def _run_projection(
         0.0 if scale_is_ptr else float(activation_scale),
         fx.Stream(torch.cuda.current_stream(device=cache.device)),
     )
-    launch_projection(*args, n_heads, int(scale_is_ptr), cluster_n)
+    projection_spec = (n_heads, int(scale_is_ptr), cluster_n)
+    run_compiled(
+        launch_projection,
+        *args,
+        *projection_spec,
+        specialization_key=projection_spec,
+    )
 
 
 def unsupported_reason(

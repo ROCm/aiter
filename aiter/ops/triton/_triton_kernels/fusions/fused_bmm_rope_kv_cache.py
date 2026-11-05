@@ -348,7 +348,7 @@ def _fused_fp4_bmm_rope_cat_and_cache_mla_kernel(
                 c_ptrs = (
                     c_ptr
                     + pid_head_i64 * stride_cb
-                    + pid_k * stride_ck
+                    + pid_k.to(tl.int64) * stride_ck
                     + offs_cm[:, None] * stride_cm
                     + offs_cn[None, :] * stride_cn
                 )
@@ -588,7 +588,7 @@ def _fused_fp4_bmm_reduce_kernel(
     c_in_ptrs = (
         c_in_ptr
         + pid_head * stride_c_in_b
-        + (offs_k[:, None, None] * stride_c_in_k)
+        + (offs_k[:, None, None].to(tl.int64) * stride_c_in_k)
         + (offs_m[None, :, None] * stride_c_in_m)
         + (offs_n[None, None, :] * stride_c_in_n)
     )
@@ -1036,6 +1036,21 @@ def _fused_fp8_bmm_rope_cat_and_cache_mla_kernel(
                     kv_cache_ptrs + (d_pe_offs + BLOCK_DK_nope) * kv_cache_stride_d,
                     k_pe_scaled,
                 )
+
+
+def _get_fp4_config(
+    M: int,
+    N: int,
+    K: int,
+):
+    # Own config family: the fused BMM + RoPE grid prefers different tiles
+    # than the standalone batched_gemm_a16wfp4 kernel.
+    return get_gemm_config(
+        "FUSED-FP4-BMM-ROPE-CAT-AND-CACHE-MLA",
+        M,
+        N,
+        2 * K,
+    )
 
 
 def _get_fp8_config(

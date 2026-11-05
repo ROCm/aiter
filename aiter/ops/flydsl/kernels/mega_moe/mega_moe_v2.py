@@ -17,7 +17,6 @@ from . import envs
 from .dispatch import DISPATCH_TABLE_SIZE, DispatchSlot
 from .mega_moe_config import (
     INDEXED_PAYLOAD_MIN_MTPR,
-    INDEXED_PAYLOAD_MIN_SBM,
     MegaMoEConfig,
     Stage1Config,
     build_mega_moe_bundle_plan,
@@ -606,10 +605,11 @@ class MegaMoEV2:
             raise ValueError("scales must be contiguous")
         if config is None:
             config = self._select_config(cur_tok).stage1
-        indexed_variant = (
-            self.mtpr >= INDEXED_PAYLOAD_MIN_MTPR
-            and config.sort_block_m >= INDEXED_PAYLOAD_MIN_SBM
-        )
+        # Every rank at the indexed-capable MTPR class uses the indexed payload
+        # (see mega_moe_stage1), so the route-major capacity guard below never
+        # fires there; it stays as a defensive check for a future route-major
+        # variant at this class.
+        indexed_variant = self.mtpr >= INDEXED_PAYLOAD_MIN_MTPR
         if self._s1_op.indexed_payload and not indexed_variant:
             route_rows = (
                 self.world_size * cur_tok * self.topk
