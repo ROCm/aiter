@@ -17,6 +17,26 @@ _SUPPORTED_CLUSTER_M = (1, 2, 4)
 _SUPPORTED_CLUSTER_N = (1, 2, 3, 4)
 
 
+def _gemm_launch_buffer_arg(tensor, dtype=None):
+    # Tensor launch dimensions use signed 32-bit integers. Preserve the
+    # existing flat Tensor ABI where it fits, and keep raw pointers for
+    # oversized buffers rather than truncating a dimension at the C boundary.
+    if not tensor.is_contiguous():
+        return ptr_arg(tensor, dtype)
+    view = tensor.view(-1)
+    if dtype is fx.Int32:
+        # Flatten before reinterpreting compact scales. Odd byte sizes or
+        # offsets cannot be represented by an Int32 Tensor, including unused
+        # optional buffers that alias the output.
+        itemsize = tensor.element_size()
+        if tensor.numel() * itemsize % 4 or tensor.storage_offset() * itemsize % 4:
+            return ptr_arg(tensor, dtype)
+        view = view.view(torch.int32)
+    if view.numel() <= 0x7FFFFFFF:
+        return view
+    return ptr_arg(tensor, dtype)
+
+
 def _select_bool_env(name: str, csv_value: int) -> int:
     """Select a strict 0/1 environment override or the CSV setting."""
     value = os.environ.get(name)
@@ -210,8 +230,7 @@ def flydsl_grouped_gemm_a8w4_masked(
     else:
         raise TypeError(f"bias must be bf16, fp32 or fp16, got {bias.dtype}")
     bias_ptr = ptr_arg(bias) if bias is not None else ptr_arg(a)
-    # These arguments only supply base addresses. Pass pointers below so large
-    # buffers do not cross the C ABI with signed 32-bit tensor dimensions.
+    # Optional arguments may reuse the output as an unused address placeholder.
     quant_scale_tensor = out if quant_scale is None else quant_scale
     out_dtype = fx.Float16 if out_is_f16 else fx.BFloat16
     if stage1_quant_out:
@@ -340,13 +359,22 @@ def flydsl_grouped_gemm_a8w4_masked(
         # Select by tile geometry and K pipeline length.
         explicit_vgpr_partition = 1
         launch_gemm_a8w4_tdm = get_gemm_a8w4_tdm_register_launcher(1)
+    out_arg = _gemm_launch_buffer_arg(out, out_dtype)
+    scale_a_arg = _gemm_launch_buffer_arg(a_scales, fx.Int32)
+    scale_b_arg = _gemm_launch_buffer_arg(w_scales, fx.Int32)
+    quant_scale_arg = _gemm_launch_buffer_arg(quant_scale_tensor)
+    ep_row_map_arg = _gemm_launch_buffer_arg(ep_row_map_tensor, fx.Int32)
+    tensor_arg_mask = tuple(
+        isinstance(arg, torch.Tensor)
+        for arg in (out_arg, scale_a_arg, scale_b_arg, quant_scale_arg, ep_row_map_arg)
+    )
     _run_compiled(
         launch_gemm_a8w4_tdm,
-        ptr_arg(out, out_dtype),
+        out_arg,
         ptr_arg(a),
         ptr_arg(w),
-        ptr_arg(a_scales, fx.Int32),
-        ptr_arg(w_scales, fx.Int32),
+        scale_a_arg,
+        scale_b_arg,
         contiguous_m,
         stream,
         N,
@@ -356,10 +384,10 @@ def flydsl_grouped_gemm_a8w4_masked(
         bias_ptr,
         float(swiglu_limit),
         *quant_spec,
-        ptr_arg(quant_scale_tensor),
+        quant_scale_arg,
         *tdm_spec,
         *ep_spec,
-        ptr_arg(ep_row_map_tensor, fx.Int32),
+        ep_row_map_arg,
         float(situ_beta),
         float(situ_linear_beta),
         *layout_spec,
@@ -374,6 +402,7 @@ def flydsl_grouped_gemm_a8w4_masked(
             layout_spec,
             explicit_vgpr_partition,
             int(quant_payload_preshuffled),
+            tensor_arg_mask,
         ),
     )
     return out

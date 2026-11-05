@@ -3379,11 +3379,11 @@ def build_gemm_a8w4_tdm_task(
 
 @flyc.jit
 def launch_gemm_a8w4_tdm(
-    arg_c: fx.Pointer,
+    arg_c,
     arg_a: fx.Pointer,
     arg_b: fx.Pointer,
-    arg_scale_a: fx.Pointer,
-    arg_scale_b: fx.Pointer,
+    arg_scale_a,
+    arg_scale_b,
     i32_m: fx.Int32,
     stream: fx.Stream,
     N: fx.Int32,
@@ -3404,7 +3404,7 @@ def launch_gemm_a8w4_tdm(
     f32_swiglu_limit: fx.Float32,
     stage1_quant_out: Constexpr[int] = 0,
     quant_wmma_rep: Constexpr[int] = 1,
-    arg_quant_scale: fx.Pointer = None,
+    arg_quant_scale=None,
     cluster_n: Constexpr[int] = 1,
     cluster_m: Constexpr[int] = 1,
     next_stage_prefetch: Constexpr[int] = 0,
@@ -3418,7 +3418,7 @@ def launch_gemm_a8w4_tdm(
     ep_destination_stride: Constexpr[int] = 0,
     ep_world_size: Constexpr[int] = 0,
     ep_quant_bits: Constexpr[int] = 0,
-    arg_ep_row_map: fx.Pointer = None,
+    arg_ep_row_map=None,
     f32_situ_beta: fx.Float32 = 1.0,
     f32_situ_linear_beta: fx.Float32 = 1.0,
     row_major_ascale: Constexpr[int] = 0,
@@ -3560,16 +3560,22 @@ def launch_gemm_a8w4_tdm(
         arg_ep_row_map = arg_c
     if arg_quant_scale is None:
         arg_quant_scale = arg_c
+
+    def kernel_pointer(value):
+        if const_expr(isinstance(value, fx.Pointer)):
+            return value
+        return fx.get_iter(value)
+
     kargs = (
-        arg_c,
+        kernel_pointer(arg_c),
         arg_a,
         arg_b,
-        arg_scale_a,
-        arg_scale_b,
+        kernel_pointer(arg_scale_a),
+        kernel_pointer(arg_scale_b),
         arg_m_tile_map,
         arg_bias,
-        arg_quant_scale,
-        arg_ep_row_map,
+        kernel_pointer(arg_quant_scale),
+        kernel_pointer(arg_ep_row_map),
         i32_m,
         N,
         f32_swiglu_limit,
