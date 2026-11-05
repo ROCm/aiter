@@ -85,6 +85,54 @@ def _store_tile(
 
 
 @gluon.jit
+def _store_tile_own_layout(vals, c_ptr, M, N, stride_cm, row0, col0):
+    """`_store_tile` in the layout `vals` already has."""
+    LAYOUT: gl.constexpr = vals.type.layout
+    _store_tile(vals, c_ptr, M, N, stride_cm, row0, col0, LAYOUT, "")
+
+
+@gluon.jit
+def _gated_silu_mul_store_lds(
+    acc,
+    h_ptr,
+    M,
+    stride_hm,
+    row0,
+    col0,
+    ROWS: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+):
+    """h[row0:, col0:] = silu(gate) * up of a gate / up interleaved fp32 tile
+    [BM, BN], through LDS: the tile goes to LDS as bf16 (gate and up round
+    to bf16 before the SiLU, as in gemm_a16w16_gated), then ROWS rows at a
+    time come back in a layout that holds each gate / up pair in one lane.
+    The accumulator dies at the LDS store instead of living through the
+    epilogue (a 256 x 256 tile otherwise spills)."""
+    BM: gl.constexpr = acc.shape[0]
+    BN: gl.constexpr = acc.shape[1]
+    HALF: gl.constexpr = BN // 2
+    SHARED_C: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+        [[BN, 8]], [BM, BN], [1, 0]
+    )
+    c_buffer = gl.allocate_shared_memory(
+        h_ptr.type.element_ty, shape=[BM, BN], layout=SHARED_C
+    )
+    c_buffer.store(acc.to(h_ptr.type.element_ty))
+    gl.barrier()
+    TPW_N: gl.constexpr = min(32, BN // 8)
+    LOAD: gl.constexpr = gl.BlockedLayout(
+        [1, 8], [32 // TPW_N, TPW_N], [NUM_WARPS, 1], [1, 0]
+    )
+    for r in gl.static_range(BM // ROWS):
+        v = c_buffer.slice(r * ROWS, ROWS, 0).load(LOAD).to(gl.float32)
+        gate, up = gl.split(gl.reshape(v, [ROWS, HALF, 2]))
+        hv = gate / (1.0 + gl.exp(-gate)) * up
+        _store_tile_own_layout(
+            hv, h_ptr, M, col0 + HALF, stride_hm, row0 + r * ROWS, col0
+        )
+
+
+@gluon.jit
 def _tdm_store_tile(vals, c_ptr, M, N, stride_cm, row0, col0):
     """bf16 store of a [BM, BN] tile at (row0, col0) through LDS by TDM: whole
     rows of any stride (the 257-wide logits), clipped at (M, N)."""
@@ -348,4 +396,189 @@ def _gemm_a16w16_router_shared_expert_kernel(
                 NUM_WARPS,
                 H_CACHE,
                 TIMEOUT_NS,
+            )
+
+
+# ---------------------------------------------------------------------------
+# Prefill: the router GEMM and the shared expert's gate_up GEMM as one
+# persistent GEMM over the (logically) concatenated weight [gate_up; router]:
+#   h      = silu(x @ Wg^T) * (x @ Wu^T)           [M, I]
+#   logits = x @ Wr^T                              [M, NR]
+# One launch, and the router tiles fill the rounds the gate_up tiles leave
+# (the separate router GEMM is a wave of its own). The down GEMM stays
+# separate. Three tile classes in one list, largest first:
+#   G  gate_up tiles, BLOCK_M1 x BLOCK_N1, SiLU-and-mul epilogue into h;
+#   R  router tiles over the first NR_MAIN rows, BLOCK_M2 x BLOCK_N2, bf16
+#      logits;
+#   T  the router rows past NR_MAIN (the shared-gate logit, zero rows up to
+#      NR_ROWS), BLOCK_M2 x BLOCK_NT.
+# Within a class the M blocks run fastest, so the N tiles of an M block land
+# on one XCD (programs go to XCDs round robin) and share its L2 copy of x.
+# Every tile runs the a16w16 K chain (one fp32 accumulator, K in order), so
+# h and the logits are bitwise those of gemm_a16w16_gated and the router GEMM.
+# ---------------------------------------------------------------------------
+
+_router_gate_up_repr = make_kernel_repr(
+    "_gemm_a16w16_router_gate_up_kernel",
+    [
+        "BLOCK_M1",
+        "BLOCK_N1",
+        "BLOCK_K1",
+        "NUM_BUFFERS1",
+        "BLOCK_M2",
+        "BLOCK_N2",
+        "BLOCK_K2",
+        "NUM_BUFFERS2",
+        "NUM_PROGRAMS",
+    ],
+)
+
+
+@gluon.jit(repr=_router_gate_up_repr)
+def _gemm_a16w16_router_gate_up_kernel(
+    x_ptr,
+    wr_ptr,
+    wgu_ptr,
+    logits_ptr,
+    h_ptr,
+    M,
+    stride_xm,
+    stride_lm,
+    stride_hm,
+    K: gl.constexpr,
+    NR: gl.constexpr,
+    NR_MAIN: gl.constexpr,
+    NR_ROWS: gl.constexpr,
+    NGU: gl.constexpr,
+    BLOCK_M1: gl.constexpr,
+    BLOCK_N1: gl.constexpr,
+    BLOCK_K1: gl.constexpr,
+    NUM_BUFFERS1: gl.constexpr,
+    BLOCK_M2: gl.constexpr,
+    BLOCK_N2: gl.constexpr,
+    BLOCK_K2: gl.constexpr,
+    NUM_BUFFERS2: gl.constexpr,
+    BLOCK_NT: gl.constexpr,
+    NUM_PROGRAMS: gl.constexpr,
+    H_ROWS: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+    SHARED_A1: gl.constexpr,
+    SHARED_B1: gl.constexpr,
+    WMMA1: gl.constexpr,
+    OP_A1: gl.constexpr,
+    OP_B1: gl.constexpr,
+    SHARED_A2: gl.constexpr,
+    SHARED_B2: gl.constexpr,
+    WMMA2: gl.constexpr,
+    OP_A2: gl.constexpr,
+    OP_B2: gl.constexpr,
+    SHARED_BT: gl.constexpr,
+    WMMAT: gl.constexpr,
+    OP_AT: gl.constexpr,
+    OP_BT: gl.constexpr,
+):
+    N_G: gl.constexpr = NGU // BLOCK_N1
+    N_R: gl.constexpr = NR_MAIN // BLOCK_N2
+    pid = gl.program_id(axis=0)
+    num_mb1 = gl.cdiv(M, BLOCK_M1)
+    num_mb2 = gl.cdiv(M, BLOCK_M2)
+    t_g = num_mb1 * N_G
+    t_r = t_g + num_mb2 * N_R
+    t_all = t_r + num_mb2
+    wt_ptr = wr_ptr + NR_MAIN * K
+
+    for t in range(pid, t_all, NUM_PROGRAMS):
+        if t < t_g:
+            mb = t % num_mb1
+            nb = t // num_mb1
+            acc_g = _compute_bound_accumulate(
+                x_ptr,
+                wgu_ptr,
+                M,
+                NGU,
+                K,
+                stride_xm,
+                1,
+                1,
+                K,
+                mb,
+                nb,
+                BLOCK_M1,
+                BLOCK_N1,
+                BLOCK_K1,
+                NUM_BUFFERS1,
+                "TN",
+                SHARED_A1,
+                SHARED_B1,
+                WMMA1,
+                OP_A1,
+                OP_B1,
+            )
+            _gated_silu_mul_store_lds(
+                acc_g,
+                h_ptr,
+                M,
+                stride_hm,
+                mb * BLOCK_M1,
+                nb * (BLOCK_N1 // 2),
+                H_ROWS,
+                NUM_WARPS,
+            )
+        elif t < t_r:
+            u = t - t_g
+            mb = u % num_mb2
+            nb = u // num_mb2
+            acc_r = _compute_bound_accumulate(
+                x_ptr,
+                wr_ptr,
+                M,
+                NR_MAIN,
+                K,
+                stride_xm,
+                1,
+                1,
+                K,
+                mb,
+                nb,
+                BLOCK_M2,
+                BLOCK_N2,
+                BLOCK_K2,
+                NUM_BUFFERS2,
+                "TN",
+                SHARED_A2,
+                SHARED_B2,
+                WMMA2,
+                OP_A2,
+                OP_B2,
+            )
+            _tdm_store_tile(
+                acc_r, logits_ptr, M, NR, stride_lm, mb * BLOCK_M2, nb * BLOCK_N2
+            )
+        else:
+            mb = t - t_r
+            acc_t = _compute_bound_accumulate(
+                x_ptr,
+                wt_ptr,
+                M,
+                NR_ROWS - NR_MAIN,
+                K,
+                stride_xm,
+                1,
+                1,
+                K,
+                mb,
+                0,
+                BLOCK_M2,
+                BLOCK_NT,
+                BLOCK_K2,
+                NUM_BUFFERS2,
+                "TN",
+                SHARED_A2,
+                SHARED_BT,
+                WMMAT,
+                OP_AT,
+                OP_BT,
+            )
+            _store_tile(
+                acc_t, logits_ptr, M, NR, stride_lm, mb * BLOCK_M2, NR_MAIN, WMMAT, ""
             )

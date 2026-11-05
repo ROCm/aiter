@@ -1,0 +1,80 @@
+{
+    "M_BOUNDS": [
+        1536,
+        3072,
+        5120,
+        7168,
+        9216,
+        18432
+    ],
+    "M_LEQ_1536": {
+        "MODE": "separate"
+    },
+    "M_LEQ_3072": {
+        "MODE": "fused",
+        "BLOCK_M1": 128,
+        "BLOCK_N1": 128,
+        "BLOCK_K1": 128,
+        "NUM_BUFFERS1": 4,
+        "BLOCK_M2": 128,
+        "BLOCK_N2": 128,
+        "BLOCK_K2": 128,
+        "NUM_BUFFERS2": 4,
+        "num_warps": 4,
+        "waves_per_eu": 1
+    },
+    "M_LEQ_5120": {
+        "MODE": "fused",
+        "BLOCK_M1": 128,
+        "BLOCK_N1": 256,
+        "BLOCK_K1": 64,
+        "NUM_BUFFERS1": 4,
+        "BLOCK_M2": 128,
+        "BLOCK_N2": 128,
+        "BLOCK_K2": 64,
+        "NUM_BUFFERS2": 4,
+        "num_warps": 8,
+        "WARPS_N1": 4,
+        "waves_per_eu": 1
+    },
+    "M_LEQ_7168": {
+        "MODE": "fused",
+        "BLOCK_M1": 256,
+        "BLOCK_N1": 128,
+        "BLOCK_K1": 128,
+        "NUM_BUFFERS1": 3,
+        "num_warps": 8,
+        "waves_per_eu": 1
+    },
+    "M_LEQ_9216": {
+        "MODE": "separate"
+    },
+    "M_LEQ_18432": {
+        "MODE": "fused",
+        "BLOCK_M1": 256,
+        "BLOCK_N1": 128,
+        "BLOCK_K1": 128,
+        "NUM_BUFFERS1": 3,
+        "num_warps": 8,
+        "waves_per_eu": 1
+    },
+    "any": {
+        "MODE": "split",
+        "ROUTER": {
+            "BLOCK_M": 256,
+            "BLOCK_N": 128,
+            "BLOCK_K": 128,
+            "NUM_BUFFERS": 3,
+            "num_warps": 4,
+            "waves_per_eu": 1
+        },
+        "GATE_UP": {
+            "BLOCK_M": 128,
+            "BLOCK_N": 128,
+            "BLOCK_K": 128,
+            "NUM_BUFFERS": 4,
+            "num_warps": 4,
+            "waves_per_eu": 1
+        }
+    }
+}
