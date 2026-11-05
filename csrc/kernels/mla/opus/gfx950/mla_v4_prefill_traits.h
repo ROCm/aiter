@@ -5,7 +5,7 @@
 
 #include <opus/dtypes.hpp>
 
-#include "../mla_v4_prefill_kargs.h"
+#include "../mla_prefill_kargs.h"
 
 using bf16_t = opus::dtypes::bf16;
 using fp16_t = opus::dtypes::fp16;

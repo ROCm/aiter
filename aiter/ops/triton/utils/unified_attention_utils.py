@@ -36,7 +36,8 @@ Tile size and number of splits (segments) are derived from the following paramet
 TILE_SIZE_MIN/MAX, and MIN_SEGMENTS/MAX_SEGMENTS/SEGMENTS_PER_CU, plus MFMA_DIM
 and the SPLIT_MIN_* floors; see compute_segment_params.
 SPLIT_PROGRAMS_PER_CU in a kv_split entry splits KV by each sequence's real length
-(bf16 Q, head size 64 only). See _length_aware_split.
+(bf16 Q, head size 64 only). The split also needs its other SPLIT_* keys in the
+kv_split, attn_3d and reduce entries; see _length_aware_split.
 """
 
 import copy
