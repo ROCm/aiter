@@ -45,6 +45,9 @@ from .kernels.fmha_gfx1250.fmha_fwd_prefill_a8w8_m32x8 import (
     flash_attn_batch_a8w8_m32x8 as flash_attn_batch_a8w8_gfx1250,
 )
 from .kernels.fmha_gfx1250.fmha_fwd_prefill_a8w8_m32x8 import (
+    flash_attn_paged_a8w8_m32x8 as flash_attn_paged_a8w8_gfx1250,
+)
+from .kernels.fmha_gfx1250.fmha_fwd_prefill_a8w8_m32x8 import (
     flash_attn_varlen_a8w8_m32x8 as flash_attn_varlen_a8w8_gfx1250,
 )
 from .kernels.fmha_gfx1250.fmha_fwd_prefill_a16w16_m32x8 import (
@@ -523,8 +526,6 @@ def flydsl_flash_attn_paged_fwd(
         return None
     if any(d is not None for d in (q_descale, k_descale, v_descale)):
         return None
-    if q.dtype in _A8W8_GFX1250_IN_DTYPES:
-        return None  # a8w8 paged is a later phase
     if any(t.stride(-1) != 1 for t in (q, k, v)):
         return None
     if (
@@ -536,7 +537,15 @@ def flydsl_flash_attn_paged_fwd(
         return None
     if softmax_scale is not None and not (0 < softmax_scale < float("inf")):
         return None
-    if not flash_attn_a16w16_gfx1250_supported(
+    # 8-bit Q/K/V go to the a8w8 sibling, which writes bf16 output; everything else to
+    # a16w16, whose output follows the input.
+    _is_b8 = q.dtype in _A8W8_GFX1250_IN_DTYPES
+    _supported = (
+        flash_attn_a8w8_gfx1250_supported
+        if _is_b8
+        else flash_attn_a16w16_gfx1250_supported
+    )
+    if not _supported(
         "paged",
         q,
         k,
@@ -560,11 +569,15 @@ def flydsl_flash_attn_paged_fwd(
         pages = kv_indptr[1:] - kv_indptr[:-1]
         max_seqlen_k = int(((pages - 1).clamp(min=0) * page_size + kv_last_page_lens).max())
 
+    _out_dtype = _A8W8_GFX1250_OUT_DTYPE if _is_b8 else q.dtype
     if out is None:
-        out = q.new_empty((*q.shape[:-1], v.shape[-1]), dtype=q.dtype)
+        out = q.new_empty((*q.shape[:-1], v.shape[-1]), dtype=_out_dtype)
     else:
-        _check_out(out, q, v.shape[-1])
-    return flash_attn_paged_a16w16_gfx1250(
+        _check_out(out, q, v.shape[-1], out_dtype=_out_dtype)
+    _entry = (
+        flash_attn_paged_a8w8_gfx1250 if _is_b8 else flash_attn_paged_a16w16_gfx1250
+    )
+    return _entry(
         q,
         k,
         v,

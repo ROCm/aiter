@@ -93,9 +93,8 @@ def _verify_dispatch(layout):
 
     # fmha_kernels imports the entries under aliases, and there are two families now
     # (a16w16 and the 8-bit a8w8 sibling), so watch whichever one this dtype routes to.
-    # paged has no a8w8 sibling yet, so only the a16w16 entry exists for it
     if layout == "paged":
-        names = ["flash_attn_paged_a16w16_gfx1250"]
+        names = [f"flash_attn_paged_{fam}_gfx1250" for fam in ("a16w16", "a8w8")]
     else:
         suffix = "varlen" if layout == "thd" else "batch"
         names = [
@@ -557,9 +556,9 @@ CASES = [
 # stay opt-in through -d.
 CASES += [dict(_c, dtype="bf8") for _c in CASES]
 
-# Paged KV, appended last so every id above keeps its number. a16w16 only (the gather
-# loader has no 8-bit sibling) and pow2 hdim only (192 would split K into two gather
-# segments against a single-segment V, so the halves disagree on tensorcnt).
+# Paged KV, appended last so every id above keeps its number. pow2 hdim only (192 would
+# split K into two gather segments against a single-segment V, so the halves disagree on
+# tensorcnt).
 _PAGED_BASE = [
     {"layout": "paged", "B": 1, "sq": 4096, "sk": 4096, "Hq": 8, "Hkv": 8,
      "causal": True, "desc": "4k causal, single batch"},
@@ -600,6 +599,10 @@ CASES += [
     for _p in (1, 16, 1024)
     for _c in _PAGED_LARGE
 ]
+# 8-bit paged, appended last so every id above keeps its number. The bf8 duplication
+# above runs before the paged blocks exist, so these would otherwise be bf16 only.
+CASES += [dict(_c, dtype="bf8") for _c in CASES if _c["layout"] == "paged"]
+
 for _i, _c in enumerate(CASES):
     _c["id"] = _i
 

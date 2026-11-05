@@ -3360,19 +3360,26 @@ def flash_attn_a8w8_m32x8_supported(
     sink=None,
     block_table=None,
     return_attn_probs=False,
+    kv_indptr=None,
+    kv_page_indices=None,
+    kv_last_page_lens=None,
 ) -> bool:
     """Can the m32x8 prefill kernel serve this configuration?
 
     Metadata only -- no allocation, compile or launch -- so a caller can gate before
     preparing buffers. The ARCH is the caller's business: dispatch on it first and call
-    this only on gfx1250. ``mode`` is "varlen" or "batch"; both are served by the same
-    kernel today, so it is accepted and ignored.
+    this only on gfx1250. ``mode`` is "varlen", "batch" or "paged": the first two share
+    one kernel, while "paged" adds the page-pool screens and reads the kv_* arguments.
 
     Per-call buffer validation (a caller-provided ``out``) stays with the entry points.
     """
-    del mode  # same gate for both layouts today
     qk_hdim, v_hdim = q.shape[-1], v.shape[-1]
     num_q, num_kv = q.shape[-2], k.shape[-2]
+    if mode == "paged":
+        if not _paged_layout_ok(k, v, kv_indptr, kv_page_indices, kv_last_page_lens):
+            return False
+    elif block_table is not None:
+        return False
     sink_ok = sink is None or (
         torch.is_tensor(sink) and sink.dtype == torch.float32 and sink.shape == (num_q,)
     )
@@ -3388,7 +3395,6 @@ def flash_attn_a8w8_m32x8_supported(
         and supports_gqa_ratio(num_q // max(num_kv, 1), v_hdim)
         and dropout_p == 0.0
         and (len(window_size) < 3 or window_size[2] == 0)
-        and block_table is None
         and bias is None
         and alibi_slopes is None
         and sink_ok
