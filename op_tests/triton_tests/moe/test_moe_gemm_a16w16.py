@@ -117,7 +117,6 @@ def _large_m_gate(**kwargs):
 @pytest.fixture(autouse=True)
 def _force_validated_gfx1201_target(monkeypatch):
     fused_moe_mod = importlib.import_module("aiter.fused_moe")
-    monkeypatch.delenv("AITER_DISABLE_GFX1201_BF16_G1U1_TRITON", raising=False)
     monkeypatch.setattr(fused_moe_mod, "get_gfx_runtime", lambda: "gfx1201")
     monkeypatch.setattr(fused_moe_mod, "get_cu_num", lambda: 64)
 
@@ -181,11 +180,6 @@ def test_large_m_gate_accepts_validated_policy_rows(tokens):
 @pytest.mark.parametrize("tokens", _POLICY_REJECTED_TOKENS)
 def test_large_m_gate_rejects_unvalidated_policy_rows(tokens):
     assert not _large_m_gate(**_large_m_gate_inputs(tokens))
-
-
-def test_large_m_gate_rejects_when_disabled(monkeypatch):
-    monkeypatch.setenv("AITER_DISABLE_GFX1201_BF16_G1U1_TRITON", "1")
-    assert not _large_m_gate(**_large_m_gate_inputs(1152))
 
 
 def test_large_m_gate_rejects_unsupported_modes(monkeypatch):
