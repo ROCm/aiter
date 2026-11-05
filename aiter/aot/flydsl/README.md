@@ -13,6 +13,7 @@ compiles them up front so the runtime JIT path hits the cache.
 | `chunk_gdn_h.py` | chunk-gdn-h opt (K5) kernels, by replaying `chunk_gated_delta_rule_fwd_h_flydsl_opt` |
 | `mega_moe.py` | MegaMoE A8W4 and A4W4 bundles of every deployment profile, by preloading `MegaMoEV2` itself (see below) |
 | `fmha_fp8.py` | gfx950 FP8 flash-attention forward, by replaying `flydsl_flash_attn_fp8_func` per head shape in `DEFAULT_SHAPES` |
+| `pa_decode_plan.py` | PA decode planner, every batch bucket, block size, window mode and context partition size up to each arch's LDS limit, by replaying `plan_pa_decode` (see below) |
 | `mxfp4_moe.py` | Not part of the AOT build; the MXFP4 tuner's `--fast-scan` precompiles its candidates with it |
 | `common.py` | Job collection, the deadlock-free fork pool, `run_aot` (what `setup.py` runs), and cache-hit checking logic |
 | `replay.py` | The shared driver of the replaying modules other than MoE/MegaMoE: per-arch processes, worker batches, size scans and bisection, `--check` |
@@ -101,12 +102,12 @@ variant of the profile's bundle plan.
   `python -m aiter.aot.flydsl.mega_moe` and `setup.py` start it that way. It
   is skipped when `GPU_ARCHS` names targets without gfx950.
 
-### How `gemm.py`, `conv.py`, `chunk_gdn_h.py` and `fmha_fp8.py` work
+### How `gemm.py`, `conv.py`, `chunk_gdn_h.py`, `fmha_fp8.py` and `pa_decode_plan.py` work
 
 They follow `moe.py`: none restates launch logic. Each turns a tuned row (or,
-for `fmha_fp8.py`, a configured head shape) into what a caller passes the op's
-public entry, as FakeTensors, and `replay.py` calls that entry inside
-`dry_run`. The runtime looks the row up, picks and parameterizes its kernels
+for `fmha_fp8.py` a configured head shape, for `pa_decode_plan.py` a planner
+bucket) into what a caller passes the op's public entry, as FakeTensors, and
+`replay.py` calls that entry inside `dry_run`. The runtime looks the row up, picks and parameterizes its kernels
 and launches them; every FlyDSL launch is compiled into the cache instead.
 
 - `gemm.py` replays one public entry per tuned table (`TABLES`):
@@ -141,6 +142,11 @@ and launches them; every FlyDSL launch is compiled into the cache instead.
   query length 5675 and key/value length 66157 splits 11 ways), so each
   launcher it can pick at all is replayed too, with its tile and split count
   pinned through the wrapper's own overrides.
+- `pa_decode_plan.py` replays `plan_pa_decode` at the largest batch of
+  each bucket, at each task capacity where the block size can change, with
+  and without a window, and at each context partition size of the arch.
+  Capacity stops at the batch times the CU count, so each arch replays with
+  the most CUs any of its devices has.
 - Ops with a Python body behind `torch_compile_guard` run that body under
   `dry_run(python_ops=True)`, so a replay can enter at a public op; C++ ops
   still dispatch to their fakes.
@@ -220,6 +226,21 @@ per rank, layout `varlen_cross` for the chunked-prefill serving path).
 python -m aiter.aot.flydsl.fmha_fp8
 # ad hoc shape, without editing DEFAULT_SHAPES
 python -m aiter.aot.flydsl.fmha_fp8 --shape 12:12:192:128
+```
+
+The PA decode planner compiles one kernel per batch bucket (1, 2, 4, ...,
+clipped to the arch's LDS), block size (64 to 1024 threads, from the plan's
+task capacity), dense/windowed mode and context partition size (128 and 256
+tokens on gfx1250, 256 elsewhere); batch, capacity, partition cap and window
+are passed at launch, and `max_batch_size` only bounds the batch.
+`run_aot` replays the whole set up to each arch's LDS limit (16256 on gfx942,
+40832 on gfx950, 81792 on gfx1250), so it serves every `max_batch_size`.
+
+```bash
+# every planner kernel up to each arch's LDS limit, as the wheel build does
+python -m aiter.aot.flydsl.pa_decode_plan
+# one arch
+GPU_ARCHS=gfx950 python -m aiter.aot.flydsl.pa_decode_plan
 ```
 
 The gfx1250 MoE build imports aiter, so it needs aiter's C++ core module. An

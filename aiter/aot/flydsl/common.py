@@ -16,6 +16,7 @@ from contextlib import contextmanager
 from multiprocessing.connection import wait as wait_for_sentinels
 from typing import Any
 
+from aiter.jit.utils.build_targets import base_gfx_arch
 from aiter_worker_limits import configure_worker_subprocesses, get_worker_count_for
 
 _DEFAULT_KERNEL_TIMEOUT = 1200.0
@@ -112,6 +113,51 @@ def aot_target_archs() -> set[str] | None:
     if not value or value.lower() == "native":
         return None
     return {arch.strip() for arch in value.split(";") if arch.strip()}
+
+
+def resolve_target_arch(job_arch: str, targets: set[str] | None) -> str | None:
+    """Exact requested target arch in the same kernel family as ``job_arch``, or
+    ``None`` when no requested target shares its family.
+
+    ``gfx1250-strict`` (MI450 A0) and ``gfx1250`` (B0) are one source/kernel
+    family, so a ``gfx1250``-tuned row is selected for a ``gfx1250-strict`` build
+    and **compiled for the exact requested target** (producing the strict
+    ``0xeb`` code object, not ``gfx1250`` ``0x49``). ``targets`` is ``None``
+    (GPU_ARCHS unset/native) keeps ``job_arch`` as-is.
+    """
+    if not targets:
+        return job_arch
+    fam = base_gfx_arch(job_arch)
+    for t in sorted(targets):
+        if base_gfx_arch(t) == fam:
+            return t
+    return None
+
+
+def assert_targets_covered(
+    targets: set[str] | None, available_archs, matched_archs, label: str
+) -> None:
+    """Raise when a requested arch's kernel family exists in the tuned data but
+    produced no job -- the strict-AOT filter bug that silently emitted an empty
+    wheel while reporting success (``GPU_ARCHS=gfx1250-strict`` -> 0 artifacts,
+    "succeeded"). A family genuinely absent from the tables (the op has no
+    kernels for that arch) is fine and not an error.
+    """
+    if not targets:
+        return
+    avail_fams = {base_gfx_arch(a) for a in available_archs}
+    matched_fams = {base_gfx_arch(a) for a in matched_archs}
+    dropped = sorted(
+        t
+        for t in targets
+        if base_gfx_arch(t) in avail_fams and base_gfx_arch(t) not in matched_fams
+    )
+    if dropped:
+        raise RuntimeError(
+            f"[aiter] {label}: tuned rows exist for {dropped}'s kernel family but "
+            f"none were selected for the requested target; refusing to emit a "
+            f"partial wheel (strict-AOT filter bug)"
+        )
 
 
 def replay_env(arch: str, workers: int | None = None) -> dict[str, str]:
@@ -389,6 +435,7 @@ AOT_MODULES = (
     "aiter.aot.flydsl.conv",
     "aiter.aot.flydsl.chunk_gdn_h",
     "aiter.aot.flydsl.fmha_fp8",
+    "aiter.aot.flydsl.pa_decode_plan",
 )
 
 
