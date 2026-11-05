@@ -1406,6 +1406,15 @@ def mla_decode_fwd(
         BLOCK_DV = triton.next_power_of_2(Lv)
         grid = (bs, nhead)
         extra_kargs = {"waves_per_eu": 4}
+        # bf16 128-head causal qlen > 1 runs the masked prefill kernel. It skips
+        # the splits past a query's last token, so stage 2 must skip them too.
+        masked_qh128_bf16 = (
+            get_gfx() in ("gfx942", "gfx950")
+            and nhead == 128
+            and max_seqlen_q > 1
+            and q.dtype == dtypes.bf16
+            and kv_buffer.dtype == dtypes.bf16
+        )
 
         has_final_lse = final_lse is not None
         final_lse_buf = (
@@ -1439,7 +1448,7 @@ def mla_decode_fwd(
             BLOCK_DV=BLOCK_DV,
             Lv=Lv,
             mgc=mgc,
-            CAUSAL_PER_QUERY=bool(kv_shuffled_flag and causal),
+            CAUSAL_PER_QUERY=bool(causal and (kv_shuffled_flag or masked_qh128_bf16)),
             # One (token, head) per CTA, no cross-lane reduction: the merge is
             # memory-latency bound, so max occupancy (num_warps=1) beats wider
             # tiles. Measured 1.7-1.9x over num_warps=4 on gfx950 decode shapes.

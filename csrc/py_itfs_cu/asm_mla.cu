@@ -264,6 +264,7 @@ struct MlaAsmDecodeCfg
     int gqa;
     int qseqlen;
     int ps;
+    int prefill; // 1: decode runs a prefill kernel from the CSV
     int causal;
     int lse;
     int cprr;
@@ -308,8 +309,15 @@ static MlaAsmDecodeCfg mla_asm_decode_remap(const std::string& arch_id,
     if(gqa_ratio == 128){
         config_max_seqlen_q = 0;
         sub_Q = 128;
-        if (q_type == "bf16" && kv_type == "bf16" && arch_id == "gfx942"){
-            ps = 0; // not use ps
+        if (q_type == "bf16" && kv_type == "bf16"){
+            if(arch_id == "gfx942")
+                ps = 0; // not use ps
+            // The decode kernel has no causal mask. Causal qlen > 1 runs the
+            // masked prefill build instead; it takes the same arguments.
+            if(!ps && causal && max_seqlen_q > 1){
+                c.prefill     = 1;
+                config_causal = 0;
+            }
         }
     }
     else if(gqa_ratio == 16){
@@ -610,7 +618,7 @@ MlaAsmDecodeCfg mla_asm_decode_config(const std::string& arch_id,
                                             kv_type,
                                             c.gqa,
                                             c.ps,
-                                            0,
+                                            c.prefill,
                                             c.causal,
                                             c.qseqlen,
                                             arch_id,
