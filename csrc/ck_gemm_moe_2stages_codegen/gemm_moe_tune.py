@@ -636,7 +636,6 @@ class FmoeTuner(TunerCommon):
         "config_env_name": "AITER_CONFIG_FMOE",
     }
 
-    # Columns of an untuned shape list that name a quantization dtype.
     def _clear_op_caches(self):
         import aiter.fused_moe as fmoe_module
 

@@ -39,7 +39,8 @@ GFX_MAP = {
 # Extend this table when adding support for new GPU targets.
 GFX_CU_NUM_MAP = {
     "gfx942": 304,  # MI300X (SPX, full GPU); MI300A (228) and MI308X (80) share
-    #                 gfx942 — build for those with an explicit CU_NUM override
+    #                 gfx942 — without a live GPU, build for those with an
+    #                 explicit CU_NUM override
     "gfx950": 256,  # MI350
     "gfx1100": 96,  # Radeon RX 7900 XTX
     "gfx1101": 60,  # Radeon RX 7800 XT

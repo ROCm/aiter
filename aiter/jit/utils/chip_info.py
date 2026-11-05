@@ -338,8 +338,8 @@ def get_build_targets() -> list[tuple[str, int]]:
 
     Priority:
       1. GPU_ARCHS set to an explicit non-empty target list -> delegate to
-         get_build_targets_env() (no GPU needed), then refine the cu_num of any
-         target matching the live GPU (see below).
+         get_build_targets_env() (no GPU needed), then add the live GPU's cu_num
+         for a target matching the live GPU's arch (see below).
       2. GPU_ARCHS unset, empty/whitespace, or "native" -> call get_gfx()
          (GPU_ARCHS-aware; falls back to rocminfo/hipinfo when GPU_ARCHS is
          unset) and get_cu_num(), which correctly reflect partition mode and
@@ -352,8 +352,11 @@ def get_build_targets() -> list[tuple[str, int]]:
     ('gfx942', 304), gen_instances then filters out every (gfx942, 228) tuned row,
     and dispatch fails at runtime with "not present in the compiled registry".
     So when the live GPU's arch matches a requested target and CU_NUM was not set
-    explicitly, prefer the live CU count. An explicit CU_NUM still wins, and
-    cross-compiling for an arch that is not the live GPU is unaffected.
+    explicitly, (live_gfx, live_cu) is added alongside the table default. The
+    default is kept rather than replaced: a multi-arch wheel built on an MI300A
+    host must still contain the (gfx942, 304) instances MI300X dispatches to.
+    An explicit CU_NUM still wins, and cross-compiling for an arch that is not
+    the live GPU is unaffected.
     """
     gpu_archs = os.getenv("GPU_ARCHS")
     gpu_archs_normalized = gpu_archs.strip() if gpu_archs is not None else ""
@@ -362,12 +365,12 @@ def get_build_targets() -> list[tuple[str, int]]:
         if os.getenv("CU_NUM"):
             return targets
         try:
-            live_gfx, live_cu = get_gfx_runtime(), get_cu_num()
+            live = (get_gfx_runtime(), get_cu_num())
         except Exception:  # noqa: BLE001  no live GPU: keep the table defaults
             return targets
-        return [
-            (gfx, live_cu if gfx == live_gfx else cu_num) for gfx, cu_num in targets
-        ]
+        if live not in targets and any(gfx == live[0] for gfx, _ in targets):
+            targets.append(live)
+        return targets
 
     try:
         # get_gfx() is intentional here -- this is a build-time path; get_gfx_runtime()

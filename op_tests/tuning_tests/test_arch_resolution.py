@@ -212,8 +212,20 @@ class TestBuildTargets(unittest.TestCase):
                 for p in patches:
                     p.stop()
 
-    def test_live_cu_count_wins_over_table_default(self):
-        self.assertEqual(self._targets(gpu_archs="gfx942"), [("gfx942", 228)])
+    def test_live_cu_count_added_next_to_table_default(self):
+        self.assertEqual(
+            self._targets(gpu_archs="gfx942"), [("gfx942", 304), ("gfx942", 228)]
+        )
+
+    def test_mi300a_build_host_keeps_mi300x_instances(self):
+        # A multi-arch wheel built on an MI300A host must still run on MI300X.
+        self.assertIn(("gfx942", 304), self._targets(gpu_archs="gfx942;gfx950"))
+
+    def test_live_cu_equal_to_default_is_not_duplicated(self):
+        self.assertEqual(
+            self._targets(gpu_archs="gfx942", live=("gfx942", 304)),
+            [("gfx942", 304)],
+        )
 
     def test_explicit_cu_num_overrides_live(self):
         self.assertEqual(
@@ -224,10 +236,10 @@ class TestBuildTargets(unittest.TestCase):
         # Building for an arch that is not the live GPU must not inherit its CUs.
         self.assertEqual(self._targets(gpu_archs="gfx950"), [("gfx950", 256)])
 
-    def test_multi_arch_refines_only_the_matching_target(self):
+    def test_multi_arch_adds_only_the_matching_target(self):
         self.assertEqual(
             self._targets(gpu_archs="gfx942;gfx950"),
-            [("gfx942", 228), ("gfx950", 256)],
+            [("gfx942", 304), ("gfx950", 256), ("gfx942", 228)],
         )
 
     def test_no_live_gpu_keeps_table_defaults(self):
@@ -235,10 +247,11 @@ class TestBuildTargets(unittest.TestCase):
             self._targets(gpu_archs="gfx942", live=None), [("gfx942", 304)]
         )
 
-    def test_mi308x_partition_also_refined(self):
+    def test_mi308x_partition_also_added(self):
         # Same mechanism protects MI308X and non-SPX MI300X partition modes.
         self.assertEqual(
-            self._targets(gpu_archs="gfx942", live=("gfx942", 80)), [("gfx942", 80)]
+            self._targets(gpu_archs="gfx942", live=("gfx942", 80)),
+            [("gfx942", 304), ("gfx942", 80)],
         )
 
 
