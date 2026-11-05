@@ -29,7 +29,10 @@ __global__ void sort_count_kernel_impl(
     const int end     = min(start + per_cta, total_pairs);
 
     for (int i = start + tid; i < end; i += THREADS_PER_CTA) {
-        atomicAdd(&local_count[topk_ids[i]], 1);
+        const int eid = topk_ids[i];
+        // An id outside [0, NE) (e.g. -1 for a pad row) is not a route.
+        if ((unsigned)eid < (unsigned)NE)
+            atomicAdd(&local_count[eid], 1);
     }
     __syncthreads();
 
@@ -126,6 +129,10 @@ __global__ void sort_place_pad_kernel_impl(
 
     for (int i = start + tid; i < end; i += THREADS_PER_CTA) {
         int eid = topk_ids[i];
+        if ((unsigned)eid >= (unsigned)NE) {
+            reverse_sorted[i] = -1;
+            continue;
+        }
         int sp  = atomicAdd(&local_offsets[eid], 1);
         int token_id = i / TOPK;
         int topk_id  = i % TOPK;

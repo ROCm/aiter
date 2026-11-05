@@ -4,6 +4,7 @@
 #include "aiter_ctypes_error.h"
 #include "asm_fp8gemm_blockscale_configs.hpp"
 #include <cmath>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <hip/hip_runtime.h>
@@ -65,6 +66,8 @@ static void validate_inputs(aiter_tensor_t* A, aiter_tensor_t* B, aiter_tensor_t
                 "MI308 A8W8 blockscale asm only support BFloat16 output now!");
     AITER_CHECK(A->dtype() == AITER_DTYPE_fp8 && B->dtype() == AITER_DTYPE_fp8,
                 "MI308 A8W8 blockscale asm requires FP8 input tensors!");
+    AITER_CHECK(out->stride(1) == 1,
+                "MI308 A8W8 blockscale asm requires a contiguous output inner dim!");
 
     int Ndim = B->size(0), Kdim = A->size(1);
 
@@ -271,7 +274,14 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     int Kdim = A->size(1);
     int stride_a = static_cast<int>(A->stride(0));
     int stride_b = static_cast<int>(B->stride(0));
-    int stride_c = static_cast<int>(out->stride(0)) * sizeof(uint16_t);
+    // A size-1 dim may carry any stride, so a single row is laid out as if contiguous.
+    int64_t row_stride = Mdim > 1 ? out->stride(0) : Ndim;
+    AITER_CHECK(row_stride >= Ndim,
+                __func__, " output rows overlap: row stride ", row_stride, " < N=", Ndim);
+    constexpr int64_t max_row_stride = std::numeric_limits<int>::max() / sizeof(uint16_t);
+    AITER_CHECK(row_stride <= max_row_stride, __func__, " output row stride ", row_stride,
+                " does not fit the kernel's int byte stride");
+    int stride_c = static_cast<int>(row_stride * sizeof(uint16_t));
     std::optional<int> opt_splitK = (splitK >= 0) ? std::optional<int>(splitK) : std::nullopt;
     std::optional<bool> opt_bpreshuffle =
         bpreshuffle ? std::optional<bool>(true) : std::optional<bool>(false);
@@ -325,7 +335,18 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
 
         // Step 3: Zero output buffer for atomic accumulation across splits.
         if (selectedsplitK > 1) {
-            HIP_CALL(hipMemsetAsync(out->ptr, 0, out->numel() * out->element_size(), stream));
+            // Split-K faults on output rows that are not 4-byte aligned.
+            AITER_CHECK(reinterpret_cast<uintptr_t>(out->ptr) % 4 == 0 && stride_c % 4 == 0,
+                        __func__, " split-K needs 4-byte aligned output rows, got ptr offset ",
+                        reinterpret_cast<uintptr_t>(out->ptr) % 4, " and row stride ",
+                        stride_c, " bytes");
+            size_t row_bytes = static_cast<size_t>(Ndim) * out->element_size();
+            if (static_cast<size_t>(stride_c) == row_bytes) {
+                HIP_CALL(hipMemsetAsync(out->ptr, 0, out->numel() * out->element_size(), stream));
+            } else {
+                // The kernel writes rows stride_c bytes apart, so clear only the M x N view.
+                HIP_CALL(hipMemset2DAsync(out->ptr, stride_c, 0, row_bytes, Mdim, stream));
+            }
         }
     }
 
