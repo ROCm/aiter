@@ -44,6 +44,7 @@ skip_tests=(
     "op_tests/multigpu_tests/bench_attention_a2a.py"
     "op_tests/multigpu_tests/test_mega_moe_tp.py"
     "op_tests/multigpu_tests/test_mega_moe_v2.py"
+    "op_tests/multigpu_tests/test_mega_moe_small_m.py"
     "op_tests/multigpu_tests/test_wide_ep_moe.py"
     "op_tests/multigpu_tests/test_dispatch_combine.py"
     "op_tests/multigpu_tests/test_communication.py"
@@ -53,6 +54,7 @@ skip_tests=(
     "op_tests/multigpu_tests/test_fused_ar_rms.py"
     "op_tests/multigpu_tests/triton_test/test_reduce_scatter_all_gather.py"
     "op_tests/multigpu_tests/triton_test/test_fused_rs_rmsnorm_quant_ag.py"
+    "op_tests/multigpu_tests/flydsl_allreduce_bench.py"
 )
 
 # When AITER_TEST is set, files are already the exact list for this shard (from artifact).
