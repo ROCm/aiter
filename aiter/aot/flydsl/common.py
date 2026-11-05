@@ -511,6 +511,35 @@ def fail_build_on_missing_target_feature():
         )
 
 
+_STRICT_ERRATA_KERNEL_GLOBS = ("*gemm_a4w4*", "*gemm_a8w8_ptpc*", "*mxfp4_tdm_fp4*")
+
+
+def assert_no_strict_errata_products(cache_dir: str) -> None:
+    """For a strict build, fail if the cache still holds an errata-family kernel.
+
+    The errata ops (F4 / fp8-16x16x128 WMMA) are gated off a gfx1250-strict build,
+    so its cache must contain none. A stale hollow object left by an earlier build
+    survives in the persisted FlyDSL cache, and the compile-time guard cannot see
+    it (a cache hit recompiles nothing and prints no diagnostic). Audit the cache
+    by kernel name instead -- cheap and immune to cache hits."""
+    import glob
+
+    targets = aot_target_archs()
+    if not targets or not any(is_strict_identity(t) for t in targets):
+        return
+    found: list[str] = []
+    for pattern in _STRICT_ERRATA_KERNEL_GLOBS:
+        found += glob.glob(os.path.join(cache_dir, "**", pattern), recursive=True)
+    if found:
+        names = sorted({os.path.basename(f) for f in found})
+        raise AssertionError(
+            f"[aiter] gfx1250-strict AOT cache holds {len(found)} errata-family "
+            "kernel object(s) that strict gates off -- likely stale hollow kernels "
+            "a cache hit left from an earlier build. Clear the FlyDSL cache before a "
+            f"strict wheel build. Offenders (first 3): {names[:3]}"
+        )
+
+
 def run_aot(cache_dir: str) -> None:
     """Build the FlyDSL AOT cache of every module, as ``setup.py`` does. Each
     replays aiter's runtime, which needs aiter fully imported for the target
@@ -539,3 +568,5 @@ def run_aot(cache_dir: str) -> None:
                 )
         if errors:
             raise AssertionError(f"[aiter] FlyDSL AOT failures: {'; '.join(errors)}")
+
+    assert_no_strict_errata_products(cache_dir)
