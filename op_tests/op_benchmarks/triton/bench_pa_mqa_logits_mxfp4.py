@@ -105,7 +105,9 @@ def build(
 
 
 def run_benchmark(args):
-    assert arch_info.get_arch() == "gfx950", "gfx950 only"
+    assert (
+        arch_info.is_any_fp4_avail()
+    ), f"paged MXFP4 MQA logits needs MXFP4 support, {arch_info.get_arch()} has none"
     rows = []
     for heads in args.heads:
         for batch, next_n, ctx in itertools.product(
@@ -238,6 +240,8 @@ if __name__ == "__main__":
     p.add_argument("--warmup", type=int, default=50)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--json", action="store_true")
-    p.set_defaults(preshuffle=True, clean_logits=True)
+    # A preshuffled cache needs the gfx950 Gluon kernel; elsewhere the Triton
+    # kernel reads a token-major cache.
+    p.set_defaults(preshuffle=arch_info.is_cdna4(), clean_logits=True)
     a = p.parse_args()
     run_benchmark(a)

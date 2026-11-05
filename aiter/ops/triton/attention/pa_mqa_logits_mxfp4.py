@@ -14,6 +14,9 @@ from aiter.ops.triton._gluon_kernels.gfx950.attention.pa_mqa_logits_mxfp4 import
     _pa_mqa_logits_mxfp4_sched_kernel,
     _prepare_candidates_kernel,
 )
+from aiter.ops.triton._triton_kernels.attention.pa_mqa_logits_mxfp4 import (
+    _pa_mqa_logits_mxfp4_kernel as _pa_mqa_logits_mxfp4_triton_kernel,
+)
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.device_info import get_num_sms
 
@@ -45,6 +48,8 @@ SCALE_MODE_WIDE = 1
 # DeepSeek-V4.1's two-level indexer groups the context in 8-token candidate
 # blocks, default
 CANDIDATE_BLOCK = 8
+# KV tile of the Triton kernel
+TRITON_BLOCK_KV = 64
 
 
 def mfma_nonk_dim(num_heads: int, head_size: int) -> int:
@@ -533,8 +538,13 @@ def paged_mxfp4_mqa_logits(
     own top-k.
 
     """
-    # Gluon kernel for gfx950 only for now
-    assert arch_info.get_arch() == "gfx950", "gfx950 only"
+    # The Gluon kernel is written for gfx950 (cdna4 buffer loads, async copies,
+    # mfma_scaled). Other archs with MXFP4 run the Triton kernel, which covers
+    # the dense launch over a token-major cache (preshuffle=0).
+    use_gluon = arch_info.is_cdna4()
+    assert (
+        arch_info.is_any_fp4_avail()
+    ), f"paged MXFP4 MQA logits needs MXFP4 support, {arch_info.get_arch()} has none"
     assert scale_mode in (0, 1), "scale_mode must be 0 or 1"
 
     varlen = query_start_loc is not None
@@ -630,6 +640,53 @@ def paged_mxfp4_mqa_logits(
         assert (
             max_model_len * 4 < 2**31
         ), f"max_model_len {max_model_len} exceeds what a buffer store can address"
+
+    if not use_gluon:
+        unsupported = {
+            "preshuffle": preshuffle,
+            "varlen (query_start_loc)": varlen,
+            "use_gather": use_gather or candidates is not None,
+            "schedule": schedule is not None,
+            "block scores": calc_block_scores or block_scores is not None,
+        }
+        named = [name for name, on in unsupported.items() if on]
+        if named:
+            raise NotImplementedError(
+                f"the Triton kernel for {arch_info.get_arch()} computes dense logits "
+                f"over a token-major cache; not supported: {', '.join(named)}"
+            )
+        assert num_heads >= 16, "tl.dot_scaled needs at least 16 heads"
+        assert logits.stride(1) == 1, "logits rows must be contiguous"
+        # dynamic only balances the Gluon kernel's work across sequences; this
+        # grid has one program per row and KV tile, so it is ignored.
+        grid = (total_rows, triton.cdiv(max_model_len, TRITON_BLOCK_KV))
+        _pa_mqa_logits_mxfp4_triton_kernel[grid](
+            q,
+            q_scales,
+            values,
+            scales,
+            weights,
+            context_lens,
+            row_ends,
+            block_table,
+            logits,
+            next_n,
+            q.stride(0),
+            q.stride(1),
+            q_scales.stride(0),
+            q_scales.stride(1),
+            weights.stride(0),
+            logits.stride(0),
+            block_table.stride(0),
+            kv_page_stride,
+            kvs_page_stride,
+            NUM_HEADS=num_heads,
+            HEAD_SIZE=head_size,
+            PAGE_SIZE=page_size,
+            BLOCK_KV=TRITON_BLOCK_KV,
+            HAS_ROW_ENDS=row_ends is not None,
+        )
+        return logits
 
     assert (
         use_gather or candidates is None

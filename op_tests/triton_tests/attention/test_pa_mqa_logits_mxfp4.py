@@ -15,9 +15,16 @@ from aiter.ops.triton.utils._triton import arch_info
 from op_tests.triton_tests.utils.pa_mqa_logits_mxfp4_ref import preshuffle_cache
 
 pytestmark = pytest.mark.skipif(
-    arch_info.get_arch() != "gfx950",
-    reason="paged MXFP4 MQA logits is gfx950 only",
+    not arch_info.is_any_fp4_avail(),
+    reason="paged MXFP4 MQA logits needs MXFP4 support",
 )
+# Elsewhere the Triton kernel runs: dense logits over a token-major cache
+GLUON = arch_info.is_cdna4()
+gluon_only = pytest.mark.skipif(
+    not GLUON,
+    reason="needs the Gluon kernel: preshuffle, gather, varlen, schedule, block scores",
+)
+PRESHUFFLE = 1 if GLUON else 0
 
 SCALE_GROUP = 32
 TOL = 1e-12
@@ -139,7 +146,7 @@ def _make_case(
     ctx_lens,
     page_size,
     page_offset=0,
-    preshuffle=1,
+    preshuffle=PRESHUFFLE,
     scale_mode=1,
 ):
     """The quantised inputs and the packed cache."""
@@ -210,7 +217,7 @@ def run_case(
     page_size,
     page_offset=0,
     check_inf=True,
-    preshuffle=1,
+    preshuffle=PRESHUFFLE,
     clean_logits=True,
     dynamic=0,
     row_ends=None,
@@ -294,6 +301,8 @@ SHAPES = [
 def test_shape(
     shape, num_heads, head_size, page_size, preshuffle, clean_logits, dynamic
 ):
+    if preshuffle and not GLUON:
+        pytest.skip("a preshuffled cache needs the Gluon kernel")
     torch.manual_seed(0)
     _, batch, next_n, ctx_lens = shape
     diff, inf_ok, _ = run_case(
@@ -396,6 +405,7 @@ def _identity_list(st, next_n, block):
     return torch.minimum(base.expand(rows, k), last).contiguous(), ends
 
 
+@gluon_only
 @pytest.mark.parametrize("shape", GATHER_SHAPES, ids=lambda s: s[0].replace(" ", "_"))
 @pytest.mark.parametrize("num_heads", [32, 64])
 @pytest.mark.parametrize("preshuffle", [1, 0])
@@ -428,6 +438,7 @@ def test_gather_identity(shape, num_heads, preshuffle, block):
     assert nd == 0, f"{nd} differing words"
 
 
+@gluon_only
 @pytest.mark.parametrize("num_heads", [32, 64])
 @pytest.mark.parametrize("preshuffle", [1, 0])
 def test_gather_scattered(num_heads, preshuffle):
@@ -469,6 +480,7 @@ def test_gather_scattered(num_heads, preshuffle):
     assert bool(torch.isinf(got[:, nb * block :]).all()), "tail is not -inf"
 
 
+@gluon_only
 def test_gather_needs_cu_ends():
     """row_ends is the gather's walk length, so it is not optional there."""
     torch.manual_seed(0)
@@ -478,6 +490,7 @@ def test_gather_needs_cu_ends():
         _gather_run(st, 32, 128, 1, 8, 1, pos, None)
 
 
+@gluon_only
 def test_gather_ignores_dynamic():
     """A gather launch does not build a device schedule: every row walks the
     same tile count, so there is no spread to even out. dynamic=1 set for the
@@ -500,6 +513,8 @@ def test_gather_ignores_dynamic():
 def test_addressing(gib, preshuffle):
     """A buffer op addresses through a 32-bit offset, so put the sequence at the
     top of a multi-gigabyte pool."""
+    if preshuffle and not GLUON:
+        pytest.skip("a preshuffled cache needs the Gluon kernel")
     torch.manual_seed(0)
     head_size, page_size, ctx = 128, 64, 8192
     page_bytes = page_size * (head_size // 2 + head_size // SCALE_GROUP)
@@ -639,6 +654,7 @@ BSCORE_SHAPES = [
 ]
 
 
+@gluon_only
 @pytest.mark.parametrize(
     "shape", BSCORE_SHAPES[:2], ids=lambda s: s[0].replace(" ", "_")
 )
@@ -663,6 +679,7 @@ def test_block_scores_knobs(shape, num_heads, dynamic, clean_logits):
     assert nd == 0, f"{nd} differing words"
 
 
+@gluon_only
 @pytest.mark.parametrize(
     "shape", BSCORE_SHAPES[:3], ids=lambda s: s[0].replace(" ", "_")
 )
@@ -691,6 +708,7 @@ def test_block_scores_leaves_logits_alone(shape, num_heads):
     assert nd == 0, f"{nd} differing words in the logits"
 
 
+@gluon_only
 def test_block_scores_rejects_gather():
     """The producer is dense and the consumers gather; no launch is both."""
     torch.manual_seed(0)
@@ -717,6 +735,7 @@ def test_block_scores_rejects_gather():
         )
 
 
+@gluon_only
 def test_block_scores_needs_room():
     """A score tensor too narrow for max_model_len is a caller error."""
     torch.manual_seed(0)
@@ -741,6 +760,7 @@ def test_block_scores_needs_room():
 # block maxima with no logits at all
 
 
+@gluon_only
 @pytest.mark.parametrize(
     "shape", BSCORE_SHAPES[:3], ids=lambda s: s[0].replace(" ", "_")
 )
@@ -766,6 +786,7 @@ def test_scores_only(shape, num_heads, block, preshuffle):
     assert nd == 0, f"{nd} differing words against the reference"
 
 
+@gluon_only
 @pytest.mark.parametrize(
     "shape", BSCORE_SHAPES[:4], ids=lambda s: s[0].replace(" ", "_")
 )
@@ -786,6 +807,7 @@ def test_scores_only_knobs(shape, num_heads, dynamic):
     assert nd == 0, f"{nd} differing words"
 
 
+@gluon_only
 @pytest.mark.parametrize("shape", ROW_ENDS_SHAPES, ids=lambda s: s[0].replace(" ", "_"))
 @pytest.mark.parametrize("kind", ["compressed", "padded"])
 def test_scores_only_row_ends(shape, kind):
@@ -804,6 +826,7 @@ def test_scores_only_row_ends(shape, kind):
     assert nd == 0, f"{nd} differing words"
 
 
+@gluon_only
 @pytest.mark.parametrize("block", [8, 16])
 def test_scores_only_nan(block):
     """A poisoned e8m0 byte must still propagate with the store gone."""
@@ -822,6 +845,7 @@ def test_scores_only_nan(block):
     assert nd == 0, f"{nd} differing words"
 
 
+@gluon_only
 def test_scores_only_allocates_no_logits():
     """The reason the mode exists: the [rows, ctx] tensor never happens.
 
@@ -861,6 +885,7 @@ def test_scores_only_allocates_no_logits():
     assert without < logits_bytes // 2, without
 
 
+@gluon_only
 @pytest.mark.parametrize(
     "want_logits,want_scores", [(True, False), (False, True), (True, True)]
 )
@@ -894,6 +919,7 @@ def test_outputs_allocates(want_logits, want_scores):
         assert not (scores == float("-inf")).all(1).any()
 
 
+@gluon_only
 def test_block_scores_rejects_logits_only():
     """A score tensor with nothing asked to write it is a caller error."""
     torch.manual_seed(0)
@@ -914,6 +940,7 @@ def test_block_scores_rejects_logits_only():
         )
 
 
+@gluon_only
 def test_scores_only_rejects_gather():
     """Mutual exclusion with the gather survives the third BSCORE value.
 
@@ -960,6 +987,7 @@ def _expand_ref(ids, ends, block):
     return pos, cu.to(torch.int32)
 
 
+@gluon_only
 @pytest.mark.parametrize("num_heads", [32, 64])
 @pytest.mark.parametrize("block", [8, 32])
 def test_candidate_gather(num_heads, block):
@@ -983,6 +1011,7 @@ def test_candidate_gather(num_heads, block):
     assert torch.equal(got["positions"].long(), pos_r) and torch.equal(cu, cu_r)
 
 
+@gluon_only
 @pytest.mark.parametrize("num_heads", [32, 64])
 def test_candidates_implicit(num_heads):
     """Handing the launch ids matches building the pool outside it."""
@@ -1044,12 +1073,13 @@ def test_strided_pages(num_heads, page_size, pad):
 
     args = (st["q4"], st["q4s"])
     rest = (st["weights"], st["cl"], st["block_table"], st["mml"])
-    ref = paged_mxfp4_mqa_logits(*args, cache, *rest)
-    got = paged_mxfp4_mqa_logits(*args, strided, *rest)
+    ref = paged_mxfp4_mqa_logits(*args, cache, *rest, preshuffle=PRESHUFFLE)
+    got = paged_mxfp4_mqa_logits(*args, strided, *rest, preshuffle=PRESHUFFLE)
     torch.cuda.synchronize()
     assert torch.equal(ref.view(torch.int32), got.view(torch.int32))
 
 
+@gluon_only
 @pytest.mark.parametrize("num_heads", [32, 64])
 @pytest.mark.parametrize("next_n", [1, 4])
 def test_scale_mode_0(num_heads, next_n):
@@ -1082,6 +1112,7 @@ def test_scale_mode_0(num_heads, next_n):
         assert torch.equal(a.view(torch.int32), b.view(torch.int32))
 
 
+@gluon_only
 @pytest.mark.parametrize("gib", [3, 5])
 def test_gather_far_pages(gib):
     """Pages past the buffer ops' 2 GiB reach, and past 4 GiB, walk the same as
@@ -1123,6 +1154,7 @@ def test_gather_far_pages(gib):
     assert torch.equal(out[0].view(torch.int32), out[1].view(torch.int32))
 
 
+@gluon_only
 def test_gather_rejects_a_pool_past_the_slot_reach():
     """Slots are int32: a pool holding more tokens is an assert, not a wrap."""
     rows, block, K = 2, 8, 32
@@ -1144,6 +1176,7 @@ VARLEN_SHAPES = [
 ]
 
 
+@gluon_only
 @pytest.mark.parametrize("shape", VARLEN_SHAPES, ids=lambda s: s[0].replace(" ", "_"))
 @pytest.mark.parametrize("num_heads", [32, 64])
 @pytest.mark.parametrize("page_size", [64, 128])
@@ -1188,6 +1221,7 @@ def test_varlen(shape, num_heads, page_size, plan_n, dyn):
     assert torch.equal(ref.view(torch.int32), got.view(torch.int32))
 
 
+@gluon_only
 @pytest.mark.parametrize(
     "shape",
     [(32, 1, [8192]), (128, 1, [4096]), (32, 6, [8192])],
