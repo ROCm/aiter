@@ -31,6 +31,7 @@ from aiter.ops.flydsl.kernels.buffer_ops import (
 from .communication_ops_utils import (
     atomic_add_global_at,
     fence_system_acquire,
+    load_i32_global_system,
     load_i64_global,
     store_i32_system,
     store_i64_global_system,
@@ -407,6 +408,241 @@ def make_dispatch_kernel(
     return ep_dispatch_intranode
 
 
+def make_dispatch_kernel_tokmajor(
+    *,
+    rank: int,
+    npes: int,
+    experts_per_rank: int,
+    experts_per_token: int,
+    hidden_dim: int,
+    hidden_elem_size: int,
+    max_tok_per_rank: int,
+    block_num: int,
+    warp_num_per_block: int,
+    scale_dim: int = 0,
+    scale_type_size: int = 0,
+    data_type=None,
+    max_recv: int | None = None,
+):
+    """Token-major intranode dispatch (same outputs / combine contract as
+    ``make_dispatch_kernel`` without StdMoE).
+
+    One warp per source token: the row (and its scales) is loaded once into
+    registers, the receive slot on every distinct destination is reserved in
+    parallel (lane j owns top-k slot j: one remote fetch-add per destination),
+    then the row is stored to each destination. Completion is an epoch flag per
+    (src, dst) -- no zeroing round trip and no remote polling -- and the
+    receiver takes its total from its own ``tok_off`` (the senders' fetch-adds
+    landed there before their flags).
+
+    Argument slots of ``make_dispatch_kernel`` are reused:
+      addr_dest_pe_ctr   -> i32[1] launch epoch (local)
+      addr_shmem_recv_num / addr_p2p_recv_num -> i32[npes] done flags (symmetric)
+    """
+    if max_recv is None:
+        max_recv = npes * max_tok_per_rank
+    _is_fp4 = data_type == torch.float4_e2m1fn_x2
+    nbytes = hidden_dim // 2 if _is_fp4 else hidden_dim * hidden_elem_size
+    assert nbytes % 16 == 0, "token row must be a multiple of 16 B"
+    n_chunks = nbytes // 16
+    n_full = n_chunks // 64
+    n_tail = n_chunks % 64
+    scale_bytes = scale_dim * scale_type_size
+    scale_n_i32 = (scale_bytes + 3) // 4 if scale_bytes > 0 else 0
+    enable_scales = scale_bytes > 0
+    assert scale_n_i32 <= 64, "scales wider than 256 B per row not supported"
+    K = experts_per_token
+    assert K <= 64
+    sentinel_val = npes * max_recv
+    n_tbl = 7
+    _lds_fields = {"tbl": fx.Array[fx.Int64, n_tbl * npes, 16]}
+    _SharedStorage = fx.struct(
+        type("_SharedStorageD2", (), {"__annotations__": _lds_fields})
+    )
+
+    @flyc.kernel(known_block_size=[warp_num_per_block * 64, 1, 1])
+    def ep_dispatch_intranode_tokmajor(
+        addr_inp_tok: fx.Int64,
+        addr_inp_idx: fx.Int64,
+        addr_inp_wts: fx.Int64,
+        addr_out_tok_map: fx.Int64,
+        addr_shmem_tok_off: fx.Int64,
+        addr_dest_pe_ctr: fx.Int64,
+        addr_disp_bar: fx.Int64,
+        addr_shmem_recv_num: fx.Int64,
+        addr_out_total_recv: fx.Int64,
+        addr_p2p_tok_off: fx.Int64,
+        addr_p2p_out_tok: fx.Int64,
+        addr_p2p_out_tok_id_to_src: fx.Int64,
+        addr_p2p_out_idx: fx.Int64,
+        addr_p2p_out_wts: fx.Int64,
+        addr_p2p_recv_num: fx.Int64,
+        addr_inp_scales: fx.Int64,
+        addr_p2p_out_scales: fx.Int64,
+        addr_shmem_tok: fx.Int64,
+        addr_shmem_idx: fx.Int64,
+        addr_shmem_tok_id_to_src: fx.Int64,
+        addr_out_packed_recv_x: fx.Int64,
+        addr_out_packed_recv_count: fx.Int64,
+        addr_out_packed_recv_src_info: fx.Int64,
+        addr_out_disp_tok_map: fx.Int64,
+        addr_disp_grid_bar: fx.Int64,
+        inp_cur_tok: fx.Int32,
+    ):
+        tid = fx.thread_idx.x
+        bid = fx.block_idx.x
+        lane = tid & 63
+        warp = tid >> 6
+        global_warp_id = bid * warp_num_per_block + warp
+        global_warp_num = block_num * warp_num_per_block
+
+        _lds = fx.SharedAllocator().allocate(_SharedStorage).peek()
+        _tbl = _lds.tbl.view(fx.make_layout(n_tbl * npes, 1))
+        # LDS p2p tables: 0 tok, 1 tis, 2 idx, 3 wts, 4 scales, 5 tok_off, 6 flags
+        _tbl_srcs = (
+            addr_p2p_out_tok,
+            addr_p2p_out_tok_id_to_src,
+            addr_p2p_out_idx,
+            addr_p2p_out_wts,
+            addr_p2p_out_scales,
+            addr_p2p_tok_off,
+            addr_p2p_recv_num,
+        )
+        if tid < npes:
+            for t_i in range_constexpr(n_tbl):
+                if const_expr(t_i != 4 or enable_scales):
+                    v = buffer_load(
+                        create_buffer_resource_from_addr(_tbl_srcs[t_i]),
+                        tid,
+                        vec_width=1,
+                        dtype=T.i64,
+                    )
+                    fx.memref_store(v, _tbl, t_i * npes + tid)
+        fx.barrier()
+
+        _r_idx = create_buffer_resource_from_addr(addr_inp_idx)
+        _r_wts = create_buffer_resource_from_addr(addr_inp_wts)
+        _r_tok_map = create_buffer_resource_from_addr(addr_out_tok_map)
+        _r_sc_in = create_buffer_resource_from_addr(addr_inp_scales)
+        k_lane = (lane < K).select(lane, 0)
+        tail_lane = (lane < n_tail).select(lane, 0)
+        sc_lane = (lane < scale_n_i32).select(lane, 0)
+
+        for tok in range(global_warp_id, inp_cur_tok, global_warp_num):
+            # payload first: its latency overlaps the routing work below
+            rsrc_src = create_buffer_resource_from_addr(
+                addr_inp_tok + fx.Int64(tok) * nbytes
+            )
+            vals = []
+            for j in range_constexpr(n_full):
+                vals.append(
+                    buffer_load(rsrc_src, (lane + j * 64) * 4, vec_width=4, dtype=T.i32)
+                )
+            if const_expr(n_tail > 0):
+                vals.append(
+                    buffer_load(
+                        rsrc_src,
+                        (tail_lane + n_full * 64) * 4,
+                        vec_width=4,
+                        dtype=T.i32,
+                    )
+                )
+            sc_val = fx.Int32(0)
+            if const_expr(enable_scales):
+                sc_val = buffer_load(
+                    _r_sc_in, tok * scale_n_i32 + sc_lane, vec_width=1, dtype=T.i32
+                )
+            my_e = buffer_load(_r_idx, tok * K + k_lane, vec_width=1, dtype=T.i32)
+            my_w = buffer_load(_r_wts, tok * K + k_lane, vec_width=1, dtype=T.i32)
+            # Negative / out-of-range expert ids (padding, masked slots) are not
+            # dispatched and do not take part in the per-rank dedup (as mori).
+            valid = (lane < K).select(
+                (my_e >= 0).select(my_e < npes * experts_per_rank, my_e >= 0),
+                lane < 0,
+            )
+            my_d = valid.select(my_e // experts_per_rank, -64 - lane)
+            # lane j < K is "first" if no lane i < j routes to the same rank
+            dup = valid.select(lane < 0, lane >= 0)
+            for j in range_constexpr(K - 1):
+                dj = readlane(T.i32, my_d, j)
+                dup = (lane > j).select((dj == my_d).select(lane >= 0, dup), dup)
+            is_first = dup.select(lane < 0, lane >= 0)
+            slot = fx.Int32(0)
+            if is_first:
+                slot = atomic_add_global_at(fx.memref_load(_tbl, 5 * npes + my_d), 1)
+            send = is_first.select(slot < max_recv, is_first)
+            if lane < K:
+                tm = send.select(my_d * max_recv + slot, sentinel_val)
+                buffer_store(tm, _r_tok_map, tok * K + lane)
+            send_i = send.select(1, 0)
+            src_enc = rank * max_tok_per_rank + tok
+            for j in range_constexpr(K):
+                if readlane(T.i32, send_i, j) != 0:
+                    dj = readlane(T.i32, my_d, j)
+                    sj = readlane(T.i32, slot, j)
+                    r_dst = create_buffer_resource_from_addr(
+                        fx.memref_load(_tbl, dj) + fx.Int64(sj) * nbytes
+                    )
+                    for jj in range_constexpr(n_full):
+                        buffer_store(vals[jj], r_dst, (lane + jj * 64) * 4)
+                    if const_expr(n_tail > 0):
+                        if lane < n_tail:
+                            buffer_store(vals[n_full], r_dst, (lane + n_full * 64) * 4)
+                    if const_expr(enable_scales):
+                        if lane < scale_n_i32:
+                            r_sc = create_buffer_resource_from_addr(
+                                fx.memref_load(_tbl, 4 * npes + dj)
+                                + fx.Int64(sj) * (scale_n_i32 * 4)
+                            )
+                            buffer_store(sc_val, r_sc, lane)
+                    if lane < K:
+                        r_ix = create_buffer_resource_from_addr(
+                            fx.memref_load(_tbl, 2 * npes + dj)
+                        )
+                        buffer_store(my_e, r_ix, sj * K + lane)
+                        r_wt = create_buffer_resource_from_addr(
+                            fx.memref_load(_tbl, 3 * npes + dj)
+                        )
+                        buffer_store(my_w, r_wt, sj * K + lane)
+                    if lane == 0:
+                        r_tis = create_buffer_resource_from_addr(
+                            fx.memref_load(_tbl, 1 * npes + dj)
+                        )
+                        buffer_store(src_enc, r_tis, sj)
+
+        # grid arrival (the data buffers are uncached; the block barrier's
+        # waitcnt orders this block's remote stores before the count, as in
+        # the StdMoE-free generic kernel)
+        fx.barrier()
+        if tid == 0:
+            atomic_add_global_at(addr_disp_bar, 1)
+
+        if global_warp_id == 0:
+            _r_ep = create_buffer_resource_from_addr(addr_dest_pe_ctr)
+            epoch = buffer_load(_r_ep, 0, vec_width=1, dtype=T.i32) + 1
+            if lane == 0:
+                wait_i32_until_equals(addr_disp_bar, block_num)
+                buffer_store(
+                    fx.Int32(0), create_buffer_resource_from_addr(addr_disp_bar), 0
+                )
+            if lane < npes:
+                fence_system_acquire()
+                flag_addr = fx.memref_load(_tbl, 6 * npes + lane) + fx.Int64(rank) * 4
+                store_i32_system(flag_addr, 0, epoch)
+                wait_i32_until_equals(addr_shmem_recv_num + fx.Int64(lane) * 4, epoch)
+                fence_system_acquire()
+            if lane == 0:
+                total = fx.Int32(load_i32_global_system(addr_shmem_tok_off))
+                total = (total < max_recv).select(total, max_recv)
+                buffer_store(
+                    total, create_buffer_resource_from_addr(addr_out_total_recv), 0
+                )
+                store_i32_system(addr_shmem_tok_off, 0, 0)
+                buffer_store(epoch, _r_ep, 0)
+
+    return ep_dispatch_intranode_tokmajor
+
+
 def make_combine_kernel(
     *,
     rank: int,
@@ -426,8 +662,15 @@ def make_combine_kernel(
     blockwise_fp8_transport: bool = False,
     max_recv: int | None = None,
     mask_topk_ids: bool = False,
+    fast_path: bool = False,
 ):
     """Build the intranode combine ``@flyc.kernel``.
+
+    ``fast_path`` (plain bf16/fp32 push combine: no zero_copy / skip_stage1 /
+    StdMoE / fp8 transport): Stage 1 loads the whole row before storing it and
+    Stage 3 reduces 16-byte vectors; slots with no contribution read a zeroed
+    row passed in ``addr_inp_packed_recv_x``. Same k order and f32 accumulation
+    as the generic path, so results are bitwise identical.
 
     Stages: 1) P2P-scatter token (and weight) contributions into peers'
     ``shmem_comb_inp``; 2) CrossDeviceBarrier; 3) local read + per-expert
@@ -455,6 +698,15 @@ def make_combine_kernel(
         raise ValueError("mask_topk_ids requires skip_stage1=True without zero_copy")
     _xfer_bf16_to_fp8 = fp8_direct_cast
     _transport_dtype = torch.float8_e4m3fn if _xfer_bf16_to_fp8 else data_type
+    if fast_path:
+        assert not (
+            zero_copy
+            or skip_stage1
+            or enable_std_moe
+            or fp8_direct_cast
+            or blockwise_fp8_transport
+        ), "fast_path is the plain push combine only"
+        assert hidden_elem_size in (2, 4), "fast_path: bf16 / fp32 rows"
 
     if max_recv is None:
         max_recv = npes * max_tok_per_rank
@@ -842,7 +1094,29 @@ def make_combine_kernel(
                 )  # inp_nbytes: bf16 under fp8_dc
                 rsrc_src = create_buffer_resource_from_addr(src_tok_addr)
                 rsrc_dst = create_buffer_resource_from_addr(dest_tok_addr)
-                if const_expr(_xfer_bf16_to_fp8):
+                if const_expr(fast_path):
+                    _nf = n_chunks // 64
+                    _nt = n_chunks % 64
+                    _row = []
+                    for jj in range_constexpr(_nf):
+                        _row.append(
+                            buffer_load(
+                                rsrc_src, (lane + jj * 64) * 4, vec_width=4, dtype=T.i32
+                            )
+                        )
+                    if const_expr(_nt > 0):
+                        _tl = (lane < _nt).select(lane, 0)
+                        _row.append(
+                            buffer_load(
+                                rsrc_src, (_tl + _nf * 64) * 4, vec_width=4, dtype=T.i32
+                            )
+                        )
+                    for jj in range_constexpr(_nf):
+                        buffer_store(_row[jj], rsrc_dst, (lane + jj * 64) * 4)
+                    if const_expr(_nt > 0):
+                        if lane < _nt:
+                            buffer_store(_row[_nf], rsrc_dst, (lane + _nf * 64) * 4)
+                elif const_expr(_xfer_bf16_to_fp8):
                     for elem_off in range(lane, n_i32, 64):
                         bf_pair = buffer_load(
                             rsrc_src, elem_off * 2, vec_width=2, dtype=T.i32
@@ -926,6 +1200,100 @@ def make_combine_kernel(
         n_elems = n_i32
         # Clamp denom to 1 when cur_rank_num_token == 0 (loop won't execute anyway).
         safe_token_count = (cur_rank_num_token == 0).select(1, cur_rank_num_token)
+
+        def _vec_stage3():
+            # 16 B per lane per k slot; partitions of a token are 16 B aligned.
+            n_ch = n_i32 // 4
+            v_wpt = (global_warp_num + safe_token_count - 1) // safe_token_count
+            v_wpt = (v_wpt > n_ch).select(n_ch, v_wpt)
+            ch_per_warp = (n_ch + v_wpt - 1) // v_wpt
+            v_total = cur_rank_num_token * v_wpt
+            for w_idx in range(global_warp_id, v_total, global_warp_num):
+                v_tok = w_idx // v_wpt
+                v_part = w_idx % v_wpt
+                c0 = v_part * ch_per_warp
+                c1 = c0 + ch_per_warp
+                c1 = (c1 > n_ch).select(n_ch, c1)
+                rs = []
+                for k_slot in range_constexpr(experts_per_token):
+                    enc_k = buffer_load(
+                        _rsrc_tok_map,
+                        v_tok * experts_per_token + k_slot,
+                        vec_width=1,
+                        dtype=T.i32,
+                    )
+                    if const_expr(_log2_max_recv is not None):
+                        pe_k = enc_k >> _log2_max_recv
+                    else:
+                        pe_k = enc_k // max_recv
+                    vld_k = pe_k < npes
+                    src_addr = vld_k.select(
+                        addr_shmem_tok
+                        + fx.Int64(pe_k * max_tok_per_rank + v_tok) * nbytes,
+                        addr_inp_packed_recv_x,
+                    )
+                    rs.append(
+                        create_buffer_resource_from_addr(wave_uniform_i64(src_addr))
+                    )
+                out_base = v_tok * n_i32
+                for c in range(c0 + lane, c1, 128):
+                    c_b = c + 64
+                    m_b = c_b < c1
+                    c_b_safe = m_b.select(c_b, c)
+                    va = []
+                    vb = []
+                    for k_slot in range_constexpr(experts_per_token):
+                        va.append(
+                            buffer_load(
+                                rs[k_slot],
+                                c * 4,
+                                vec_width=4,
+                                dtype=T.i32,
+                                cache_modifier=SLC_CACHE,
+                            )
+                        )
+                        vb.append(
+                            buffer_load(
+                                rs[k_slot],
+                                c_b_safe * 4,
+                                vec_width=4,
+                                dtype=T.i32,
+                                cache_modifier=SLC_CACHE,
+                            )
+                        )
+                    _sets = ((va, c, None), (vb, c_b_safe, m_b))
+                    for u in range_constexpr(2):
+                        vv, cc, mm = _sets[u]
+                        if const_expr(hidden_elem_size == 2):
+                            acc = vv[0].bitcast(fx.BFloat16).to(fx.Float32)
+                            for k_slot in range_constexpr(experts_per_token - 1):
+                                acc = acc + vv[k_slot + 1].bitcast(fx.BFloat16).to(
+                                    fx.Float32
+                                )
+                            res = acc.to(fx.BFloat16).bitcast(fx.Int32)
+                        else:
+                            acc = vv[0].bitcast(fx.Float32)
+                            for k_slot in range_constexpr(experts_per_token - 1):
+                                acc = acc + vv[k_slot + 1].bitcast(fx.Float32)
+                            res = acc.bitcast(fx.Int32)
+                        # no buffer_store(mask=): it redirects to offset
+                        # 0x7FFFFFFF, which is in range of an unbounded rsrc
+                        if const_expr(u == 0):
+                            buffer_store(
+                                res,
+                                rsrc_out,
+                                out_base + cc * 4,
+                                cache_modifier=SLC_CACHE,
+                            )
+                        else:
+                            if mm:
+                                buffer_store(
+                                    res,
+                                    rsrc_out,
+                                    out_base + cc * 4,
+                                    cache_modifier=SLC_CACHE,
+                                )
+
         warps_per_tok = (global_warp_num + safe_token_count - 1) // safe_token_count
         if const_expr(blockwise_fp8_transport):
             # Align warp partitions to the 32-value blockwise FP8 scale.
@@ -937,6 +1305,9 @@ def make_combine_kernel(
         else:
             hdim_per_warp = (n_elems + warps_per_tok - 1) // warps_per_tok
         s3_total_work = cur_rank_num_token * warps_per_tok
+        if const_expr(fast_path):
+            s3_total_work = s3_total_work * 0
+            _vec_stage3()
 
         for s3_work_idx in range(global_warp_id, s3_total_work, global_warp_num):
             tok_id = s3_work_idx // warps_per_tok
@@ -1178,25 +1549,49 @@ def make_dispatch_jit(
     scale_type_size=0,
     enable_std_moe=False,
     max_recv=None,
+    tokmajor=False,
 ):
     """Build the dispatch JIT launcher. ``max_recv`` (per-rank receive-slot cap
     for sentinel encoding) must match make_combine_jit."""
     hidden_elem_size = torch.tensor([], dtype=data_type).element_size()
-    kernel = make_dispatch_kernel(
-        rank=rank,
-        npes=npes,
-        experts_per_rank=experts_per_rank,
-        experts_per_token=experts_per_token,
-        hidden_dim=hidden_dim,
-        hidden_elem_size=hidden_elem_size,
-        max_tok_per_rank=max_tok_per_rank,
-        block_num=block_num,
-        warp_num_per_block=warp_num_per_block,
-        scale_dim=scale_dim,
-        scale_type_size=scale_type_size,
-        enable_std_moe=enable_std_moe,
-        data_type=data_type,
-        max_recv=max_recv,
+    if tokmajor:
+        assert not enable_std_moe
+        kernel = make_dispatch_kernel_tokmajor(
+            rank=rank,
+            npes=npes,
+            experts_per_rank=experts_per_rank,
+            experts_per_token=experts_per_token,
+            hidden_dim=hidden_dim,
+            hidden_elem_size=hidden_elem_size,
+            max_tok_per_rank=max_tok_per_rank,
+            block_num=block_num,
+            warp_num_per_block=warp_num_per_block,
+            scale_dim=scale_dim,
+            scale_type_size=scale_type_size,
+            data_type=data_type,
+            max_recv=max_recv,
+        )
+    else:
+        kernel = None
+    kernel = (
+        kernel
+        if kernel is not None
+        else make_dispatch_kernel(
+            rank=rank,
+            npes=npes,
+            experts_per_rank=experts_per_rank,
+            experts_per_token=experts_per_token,
+            hidden_dim=hidden_dim,
+            hidden_elem_size=hidden_elem_size,
+            max_tok_per_rank=max_tok_per_rank,
+            block_num=block_num,
+            warp_num_per_block=warp_num_per_block,
+            scale_dim=scale_dim,
+            scale_type_size=scale_type_size,
+            enable_std_moe=enable_std_moe,
+            data_type=data_type,
+            max_recv=max_recv,
+        )
     )
 
     @flyc.jit
@@ -1283,6 +1678,7 @@ def make_combine_jit(
     blockwise_fp8_transport: bool = False,
     max_recv=None,
     mask_topk_ids: bool = False,
+    fast_path: bool = False,
 ):
     """Build the JIT launcher for ``make_combine_kernel``. ``data_type`` is the
     external dtype (symmetric I/O); ``fp8_direct_cast`` enables bf16-external /
@@ -1308,6 +1704,7 @@ def make_combine_jit(
         blockwise_fp8_transport=blockwise_fp8_transport,
         max_recv=max_recv,
         mask_topk_ids=mask_topk_ids,
+        fast_path=fast_path,
     )
 
     @flyc.jit
