@@ -194,8 +194,9 @@ constexpr size_t llScratchBytes(int ngpus)
 
 // Byte offset of the LL scratch within the shared meta buffer: right after the
 // Signal struct, 128-byte aligned. The meta buffer (see meta_size()) is sized
-// kLLScratchOffset + llScratchBytes(world_size) + kArRmsShardBytes and
-// zero-initialized, which doubles as the LL flag reset (flag 0 == cleared line).
+// kLLScratchOffset + llScratchBytes(world_size) + kArRmsShardBytes +
+// ar2sScratchBytes(world_size) and zero-initialized, which doubles as the LL
+// flag reset (flag 0 == cleared line).
 constexpr size_t kLLScratchOffset =
     ((sizeof(Signal) + 127) / 128) * 128;
 
@@ -206,6 +207,34 @@ constexpr size_t kArRmsShardBytes = 16 * 1024 * 1024;
 constexpr size_t arRmsShardOffset(int ngpus)
 {
     return kLLScratchOffset + llScratchBytes(ngpus);
+}
+
+// The largest message the LL two-shot all-reduce (ar_2s_ll_gfx1250) takes at
+// each world size, from MI455X measurements, bf16 in a CUDA graph:
+// - TP8, two trays: ahead of RCCL at 8.39 MB (40.6 vs 44.3 us), behind at
+//   14.68 MB (59.1 vs 51.0 us).
+// - TP4, one tray: ahead of the one-shot pull up to 8.39 MB (29.1 vs 100.1 us).
+//   RCCL is not measured there yet.
+// 0 means the world size does not take the two-shot: TP2, and TP6, which is
+// not measured. This cap also sizes the two-shot's scratch (ar2sScratchBytes).
+constexpr size_t ar2sMaxBytes(int ngpus)
+{
+    return ngpus == 4 || ngpus == 8 ? (size_t)8 * 1024 * 1024 : 0;
+}
+
+// The LL two-shot's own scratch, after the AR + RMSNorm shard. It is apart from
+// the LL scratch, so a change to either kernel's layout, capacity or epochs
+// leaves the other alone. Two banks, each a reduce-scatter region and an
+// all-gather region of ar2sMaxBytes / 8 lines: 8 x ar2sMaxBytes a rank, i.e.
+// 64 MiB at TP4 and TP8, and nothing where the two-shot does not run.
+constexpr size_t ar2sRegionPk(int ngpus) { return ar2sMaxBytes(ngpus) / 8; }
+constexpr size_t ar2sScratchBytes(int ngpus)
+{
+    return (size_t)2 * 2 * ar2sRegionPk(ngpus) * sizeof(LLPackedMsg);
+}
+constexpr size_t ar2sScratchOffset(int ngpus)
+{
+    return arRmsShardOffset(ngpus) + kArRmsShardBytes;
 }
 
 // gfx1250 128-bit global load/store at *system* scope ("" == system). A single
@@ -375,13 +404,14 @@ __global__ void __launch_bounds__(512, 1) ar_ll_gfx1250(
 }
 
 // ---------------------------------------------------------------------------
-// LL two-shot all-reduce: reduce-scatter + all-gather over the LL scratch
+// LL two-shot all-reduce: reduce-scatter + all-gather over LL lines
 // ---------------------------------------------------------------------------
 // The input splits into ngpus chunks of chunk_pk 8-byte packets; rank c owns
-// chunk c. Same LL lines, scratch, banks and per-block epochs as ar_ll_gfx1250
-// (the two share block_flags, so epochs stay monotonic across both). In a bank,
-// the reduce-scatter slots s = 0..ngpus-1 take chunk_pk lines each, followed by
-// the all-gather slots: 2 * ngpus * chunk_pk <= ngpus * kLLPackCapacity.
+// chunk c. The same LL lines as ar_ll_gfx1250, in a scratch of its own
+// (ar2sScratchOffset) with epochs of its own (block_flags), double-banked by
+// epoch parity. In a bank, the reduce-scatter region holds slot s = 0..ngpus-1
+// of chunk_pk lines each, and the all-gather region, ar2sRegionPk lines on,
+// holds the same slots: ngpus * chunk_pk <= ar2sRegionPk(ngpus).
 //   1. send packet j of every other chunk c to rank c's reduce-scatter slot[rank]
 //   2. poll the ngpus - 1 contributions to the own chunk, reduce them with the
 //      own one in fp32 in rank order, write the own chunk of recvbuff and push
@@ -398,7 +428,7 @@ __global__ void __launch_bounds__(512, 1) ar_ll_gfx1250(
 // its sends before it polls, so all-resident blocks cannot deadlock.
 template <typename T, int ngpus>
 __global__ void __launch_bounds__(512) ar_2s_ll_gfx1250(
-    T* const* __restrict__ peer_scratch, // ngpus scratch bases (device table)
+    T* const* __restrict__ peer_scratch, // ngpus two-shot scratch bases (device table)
     T* __restrict__ recvbuff,
     const T* __restrict__ sendbuff,
     size_t chunk_pk,     // 8-byte packets per chunk = bytes / (8 * ngpus)
@@ -407,7 +437,7 @@ __global__ void __launch_bounds__(512) ar_2s_ll_gfx1250(
 {
     constexpr int LP = 8 / sizeof(T); // elements per 8-byte packet
     using PL         = typename opus::vector_t<T, LP>;
-    constexpr size_t slot = kLLPackCapacity;
+    constexpr size_t region = ar2sRegionPk(ngpus);
 
     __shared__ uint32_t s_flag;
     if(threadIdx.x == 0)
@@ -419,8 +449,8 @@ __global__ void __launch_bounds__(512) ar_2s_ll_gfx1250(
     }
     __syncthreads();
     const uint32_t flag   = s_flag;
-    const size_t   rsOff  = (size_t)(flag & 1u) * (size_t)ngpus * slot;
-    const size_t   agOff  = rsOff + (size_t)ngpus * chunk_pk;
+    const size_t   rsOff  = (size_t)(flag & 1u) * 2 * region;
+    const size_t   agOff  = rsOff + region;
     const size_t   stride = (size_t)gridDim.x * blockDim.x;
 
     const uint2* in = reinterpret_cast<const uint2*>(sendbuff);
@@ -1425,6 +1455,12 @@ public:
     void**    d_ll_peers_       = nullptr;
     uint32_t* d_ll_block_flags_ = nullptr;
 
+    // LL two-shot all-reduce, apart from the LL tables above: per-rank bases of
+    // its own scratch (peer meta base + ar2sScratchOffset) and its own per-block
+    // epochs. Built by ensure_2s_tables_(); null where it does not run.
+    void**    d_2s_peers_       = nullptr;
+    uint32_t* d_2s_block_flags_ = nullptr;
+
     // gfx1250: hipIpc is not available. Instead, each rank's Signal buffer
     // is a torch-shared tensor whose device pointer is exchanged via the
     // distributed store.  The constructor receives the remote pointers
@@ -1453,7 +1489,10 @@ public:
         // before capture) those runtime calls are illegal mid-capture and abort.
         // sg_.signals[] is populated above, so the peer scratch bases are ready.
         if(ll_enabled())
+        {
             ensure_ll_tables_();
+            ensure_2s_tables_();
+        }
     }
 
     // IPC transport overload (ROCm >= 7.15): hipIpc works on gfx1250, so peer
@@ -1492,7 +1531,10 @@ public:
         // hipMalloc/hipMemcpy/hipMemset out of the first LL allreduce, which may
         // land inside a CUDA-graph capture and abort. sg_.signals[] is ready.
         if(ll_enabled())
+        {
             ensure_ll_tables_();
+            ensure_2s_tables_();
+        }
     }
 
     char* open_ipc_handle(const void* ipc_handle)
@@ -1521,6 +1563,10 @@ public:
             (void)hipFree(d_ll_peers_);
         if(d_ll_block_flags_)
             (void)hipFree(d_ll_block_flags_);
+        if(d_2s_peers_)
+            (void)hipFree(d_2s_peers_);
+        if(d_2s_block_flags_)
+            (void)hipFree(d_2s_block_flags_);
     }
 
     // Whether allreduce of this size takes the LL kernel, which reads the input
@@ -1530,15 +1576,13 @@ public:
         return ll_enabled() && bytes <= kLLArMaxBytes && world_size_ <= kLLMaxRanks;
     }
 
-    // Whether allreduce of this size takes the LL two-shot kernel: four ranks
-    // or more, whole packets per chunk, its two regions within one bank of the
-    // LL scratch, and at least the size where it overtakes the one-shot LL.
+    // Whether allreduce of this size takes the LL two-shot kernel: from where it
+    // overtakes the one-shot LL up to its measured cap at this world size
+    // (ar2sMaxBytes, 0 where it does not run), in whole packets per chunk.
     bool use_2s_ll(size_t bytes) const
     {
-        const size_t max_bytes = (size_t)world_size_ * (kLLPackCapacity / 2) * 8;
-        return ll_enabled() && world_size_ >= 4 && world_size_ <= kLLMaxRanks &&
-               bytes >= kLL2sMinBytes && bytes <= max_bytes &&
-               bytes % (8 * (size_t)world_size_) == 0;
+        return ll_enabled() && world_size_ <= kLLMaxRanks && bytes >= kLL2sMinBytes &&
+               bytes <= ar2sMaxBytes(world_size_) && bytes % (8 * (size_t)world_size_) == 0;
     }
 
     // Whether allreduce of this size reads its input in place (no copy-in).
@@ -1594,6 +1638,24 @@ public:
         HIP_CALL(hipMemset(d_ll_block_flags_, 0, sizeof(uint32_t) * kMaxBlocks));
     }
 
+    // The LL two-shot's per-rank scratch table and per-block epoch, as
+    // ensure_ll_tables_() builds the LL ones; nothing at a world size it does not
+    // run at. Its scratch sits at + ar2sScratchOffset in the zero-initialized
+    // meta buffer.
+    void ensure_2s_tables_()
+    {
+        if(d_2s_peers_ || world_size_ > kLLMaxRanks || ar2sMaxBytes(world_size_) == 0)
+            return;
+        std::vector<void*> peers(world_size_);
+        for(int i = 0; i < world_size_; ++i)
+            peers[i] = reinterpret_cast<char*>(sg_.signals[i]) + ar2sScratchOffset(world_size_);
+        HIP_CALL(hipMalloc(&d_2s_peers_, sizeof(void*) * world_size_));
+        HIP_CALL(hipMemcpy(
+            d_2s_peers_, peers.data(), sizeof(void*) * world_size_, hipMemcpyHostToDevice));
+        HIP_CALL(hipMalloc(&d_2s_block_flags_, sizeof(uint32_t) * kMaxBlocks));
+        HIP_CALL(hipMemset(d_2s_block_flags_, 0, sizeof(uint32_t) * kMaxBlocks));
+    }
+
     // LL small-message all-reduce. Reads `input` locally, pushes to peer scratch,
     // reduces into `output`. numel is the element count; bytes must be a multiple
     // of 16 and <= kLLScratchCapBytes (guaranteed by the routing threshold).
@@ -1621,16 +1683,16 @@ public:
     template <typename T>
     void allreduce_2s_ll(hipStream_t stream, const T* input, T* output, int numel)
     {
-        ensure_ll_tables_();
+        ensure_2s_tables_();
         const size_t bytes    = (size_t)numel * sizeof(T);
         const size_t chunk_pk = bytes / (8 * (size_t)world_size_);
         const int threads = ll_threads_for(chunk_pk);
         const int blocks =
             std::max(1, std::min<int>(kMaxBlocks, (int)((chunk_pk + threads - 1) / threads)));
-        T* const* peers = reinterpret_cast<T* const*>(d_ll_peers_);
+        T* const* peers = reinterpret_cast<T* const*>(d_2s_peers_);
 #define LAUNCH_2S_LL(NG) \
         ar_2s_ll_gfx1250<T, NG><<<blocks, threads, 0, stream>>>( \
-            peers, output, input, chunk_pk, rank_, d_ll_block_flags_)
+            peers, output, input, chunk_pk, rank_, d_2s_block_flags_)
         DISPATCH_NGPUS_1250(world_size_, LAUNCH_2S_LL);
 #undef LAUNCH_2S_LL
     }
