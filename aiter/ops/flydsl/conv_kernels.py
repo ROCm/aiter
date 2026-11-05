@@ -98,6 +98,9 @@ TUNED_DEVICE_COLUMNS = ("gfx", "cu_num")
 # Optional result column: output rows of a block's 2D patch (kH x kW reuse).
 # A table without it, or an empty cell, means 1 (consecutive rows).
 TUNED_BLOCK_ROWS_COLUMN = "block_r"
+# Optional gfx1250 result columns: the K loop's software pipeline. A table
+# without them, or an empty cell, leaves the runtime default.
+TUNED_PIPELINE_COLUMNS = ("num_buffers", "main_loop_unroll")
 
 # Result column, not part of the key. Empty cell means FlyDSL; other backends skipped.
 TUNED_LIBTYPE_COLUMN = "libtype"
@@ -115,6 +118,19 @@ _MATMUL_FAST_PATH_INT_COLS = (
     "pad_h",
     "pad_w",
 )
+
+
+def _parse_pipeline_columns(row) -> dict:
+    """The ``TUNED_PIPELINE_COLUMNS`` a tuned row sets, parsed; empty cells skipped."""
+    out = {}
+    for col in TUNED_PIPELINE_COLUMNS:
+        raw = getattr(row, col, None)
+        if raw is None or (isinstance(raw, float) and math.isnan(raw)):
+            continue
+        if isinstance(raw, str) and raw.strip().lower() in ("", "null", "nan"):
+            continue
+        out[col] = int(raw) if col == "num_buffers" else _parse_tuned_bool(raw)
+    return out
 
 
 def _parse_tuned_bool(value) -> bool:
@@ -278,7 +294,11 @@ _TUNED_LOOKUP_LOGGED = set()
 
 @functools.lru_cache(maxsize=1)
 def _load_tuned_table():
-    """``{(gfx, cu_num, *shape): (tile, wgm, splitk, block_rows)}``. Empty dict on any failure."""
+    """``{(gfx, cu_num, *shape): (tile, wgm, splitk, block_rows, pipeline)}``.
+
+    ``pipeline`` holds the ``TUNED_PIPELINE_COLUMNS`` the row sets. Empty dict
+    on any failure.
+    """
     try:
         import pandas as pd
 
@@ -351,6 +371,7 @@ def _load_tuned_table():
                 int(row.wgm),
                 splitk,
                 block_rows,
+                _parse_pipeline_columns(row),
             )
         if skipped_libtypes:
             from aiter import logger
@@ -475,11 +496,11 @@ def _borrow_tuned_tile(dev, key):
     f = dict(zip(TUNED_KEY_COLUMNS, key))
     if not _tile_fills_device(want, f["K"], f["groups"], hit[0], dev[1]):
         return None
-    return (hit[0], hit[1], None, hit[3])
+    return (hit[0], hit[1], None, *hit[3:])
 
 
 def _lookup_tuned_tile(key, device):
-    """Tuned (tile, wgm, splitk, block_rows) for this device, or a borrowed same-layer row."""
+    """Tuned (tile, wgm, splitk, block_rows, pipeline) for this device, or a borrowed same-layer row."""
     del device
     if key is None:
         return None
@@ -1005,7 +1026,7 @@ def _conv3d_impl(
     else:
         hit = _lookup_tuned_tile(tuned_key, x.device)
         if hit is not None:
-            chosen_tile, chosen_wgm, tuned_splitk, chosen_block_rows = hit
+            chosen_tile, chosen_wgm, tuned_splitk, chosen_block_rows = hit[:4]
             if forced_wgm is not None:
                 chosen_wgm = forced_wgm
         else:

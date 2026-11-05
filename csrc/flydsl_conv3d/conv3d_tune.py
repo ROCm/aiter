@@ -30,6 +30,7 @@ from aiter import dtypes, logger
 from aiter.jit.core import AITER_CONFIG_CONV3D_BF16
 from aiter.ops.flydsl import flydsl_conv_implicit
 from aiter.ops.flydsl.conv3d_gfx1250 import (
+    _clamp_num_buffers,
     _resolve_splitk_gfx1250,
     prepare_operands_gfx1250,
     run_conv3d_gfx1250,
@@ -50,6 +51,7 @@ from aiter.ops.flydsl.conv_kernels import (
     TUNED_DEVICE_COLUMNS,
     TUNED_KEY_COLUMNS,
     TUNED_LIBTYPE_COLUMN,
+    TUNED_PIPELINE_COLUMNS,
     TUNED_RESULT_COLUMNS,
     _check_supported_arch,
     _implicit_param_from_problem,
@@ -80,6 +82,7 @@ RESULT_LIST = [
     TUNED_LIBTYPE_COLUMN,
     *TUNED_RESULT_COLUMNS,
     TUNED_BLOCK_ROWS_COLUMN,
+    *TUNED_PIPELINE_COLUMNS,
     "splitK",
     "us",
     "kernelName",
@@ -90,6 +93,24 @@ RESULT_LIST = [
 
 # Readings per shape in the compare benchmark; the gate keeps the fastest.
 RUN_CONFIG_REPS = 3
+
+# gfx1250 (num_buffers, main_loop_unroll) every tile is timed with by default.
+DEFAULT_PIPELINES = ((2, False),)
+
+
+def _parse_pipelines(text):
+    out = []
+    for item in filter(None, (s.strip() for s in str(text).split(","))):
+        nb, _, unroll = item.partition(":")
+        pair = (int(nb), unroll.strip() in ("1", "true", "True"))
+        if not 2 <= pair[0] <= 8:
+            raise ValueError(f"num_buffers must be in [2, 8], got {item!r}")
+        if pair not in out:
+            out.append(pair)
+    if not out:
+        raise ValueError("--pipelines needs at least one num_buffers:unroll pair")
+    return tuple(out)
+
 
 # Output-block widths swept for kH x kW reuse: each tile also runs with
 # block_rows = TILE_M / cols for every cols here that divides it (rows >= 2),
@@ -172,7 +193,18 @@ def generate_data_gfx1250(
 
 
 def run_flydsl_conv3d_gfx1250(
-    x_tune, w_tune, w_packed, bias, out, params, tile, wgm, splitk, block_rows
+    x_tune,
+    w_tune,
+    w_packed,
+    bias,
+    out,
+    params,
+    tile,
+    wgm,
+    splitk,
+    block_rows,
+    num_buffers=2,
+    main_loop_unroll=False,
 ):
     # Pin the final legal split-K recorded in the candidate metadata and CSV.
     del wgm
@@ -192,6 +224,8 @@ def run_flydsl_conv3d_gfx1250(
         output_layout="NDHWC",
         packed_weight=w_packed,
         out=out,
+        num_buffers=num_buffers,
+        main_loop_unroll=main_loop_unroll,
     )
 
 
@@ -242,6 +276,31 @@ def strict_compare(ref, res, msg="", printLog=False):
     return 1.0 if bad else 0.0
 
 
+def _top_tiles(profile_csv, topk):
+    """``{shape_key: [(tile_m, tile_n, wave_m, wave_n, block_rows), ...]}``.
+
+    The ``topk`` fastest distinct tiles per shape among a profile CSV's correct
+    (``err_ratio == 0``), timed gfx1250 rows.
+    """
+    df = pd.read_csv(profile_csv)
+    df.columns = df.columns.str.strip()
+    df = df[df["gfx"].astype(str).str.startswith("gfx1250")]
+    us = pd.to_numeric(df["us"], errors="coerce")
+    err = pd.to_numeric(df["err_ratio"], errors="coerce")
+    df = df[(us > 0) & (us < float("inf")) & (err == 0)].assign(_us=us)
+    out = {}
+    for row in df.sort_values("_us", kind="stable").itertuples(index=False):
+        key = _shape_key(tuple(getattr(row, c) for c in SHAPE_KEYS))
+        tile = tuple(
+            int(getattr(row, c))
+            for c in ("tile_m", "tile_n", "wave_m", "wave_n", TUNED_BLOCK_ROWS_COLUMN)
+        )
+        tiles = out.setdefault(key, [])
+        if tile not in tiles and len(tiles) < topk:
+            tiles.append(tile)
+    return out
+
+
 def _shape_key(row):
     """One row's shape identity, normalized so both CSVs hash the same way."""
     return tuple(
@@ -277,6 +336,27 @@ class Conv3dTuner(TunerCommon):
             help="cap on enumerated candidates per shape (baseline tiles and the "
             "tile the shape would borrow are always added on top, so the real "
             "count is slightly higher)",
+        )
+        self.parser.add_argument(
+            "--pipelines",
+            type=_parse_pipelines,
+            default=DEFAULT_PIPELINES,
+            help="gfx1250: comma list of num_buffers:main_loop_unroll pairs every "
+            "tile is timed with, e.g. 2:0,3:0,3:1,4:0 (the gfx1250 GEMM tuner "
+            "sweeps stages and main_loop_unroll the same way). Default 2:0.",
+        )
+        self.parser.add_argument(
+            "--tiles_from",
+            default="",
+            help="gfx1250: a profile CSV (-o2) of an earlier run; each shape then "
+            "sweeps --pipelines over only its --tiles_topk fastest correct tiles "
+            "there instead of the policy's candidates",
+        )
+        self.parser.add_argument(
+            "--tiles_topk",
+            type=int,
+            default=4,
+            help="tiles per shape taken from --tiles_from",
         )
 
     # -------------------------------------------------------------------
@@ -420,7 +500,20 @@ class Conv3dTuner(TunerCommon):
     # Tuning
     # -------------------------------------------------------------------
 
-    def _shape_tasks(self, keys, max_configs, run_kwargs=None):
+    def _shape_tasks(
+        self,
+        keys,
+        max_configs,
+        run_kwargs=None,
+        pipelines=DEFAULT_PIPELINES,
+        tiles=None,
+    ):
+        """Candidate tasks for one shape.
+
+        gfx1250 times every tile with each ``pipelines`` pair; ``tiles``, as
+        ``(tile_m, tile_n, wave_m, wave_n, block_rows)``, replaces the policy's
+        tile candidates (see ``--tiles_from``).
+        """
         from aiter.ops.flydsl.conv_kernels import _borrow_tuned_tile, _resolve_splitk
 
         kv = dict(zip(self.keys, keys))
@@ -501,7 +594,9 @@ class Conv3dTuner(TunerCommon):
             ]
             return min(sizes) if sizes else float("inf")
 
-        if is_1250:
+        if is_1250 and tiles is not None:
+            candidates = [(tm, tn, wm, wn, 1, br) for tm, tn, wm, wn, br in tiles]
+        elif is_1250:
             # The gfx1250 policy already sweeps block_rows per tile.
             candidates = get_flydsl_conv3d_configs_gfx1250(
                 m_gemm, n_gemm, groups, self.get_cu_num(), max_configs=max_configs
@@ -524,9 +619,13 @@ class Conv3dTuner(TunerCommon):
         # BASELINE_TILES covers the heuristic default but not a borrowed one: a
         # tile tuned at another resolution of this layer can fall outside this
         # npq's max_configs cut, and the runtime serves it until this row exists.
-        borrowed = _borrow_tuned_tile(
-            (gfx, self.get_cu_num()),
-            _shape_key(keys[len(TUNED_DEVICE_COLUMNS) :]),
+        borrowed = (
+            None
+            if tiles is not None
+            else _borrow_tuned_tile(
+                (gfx, self.get_cu_num()),
+                _shape_key(keys[len(TUNED_DEVICE_COLUMNS) :]),
+            )
         )
         if borrowed is not None:
             b = (*borrowed[0], borrowed[1], borrowed[3])
@@ -546,64 +645,93 @@ class Conv3dTuner(TunerCommon):
             # the value that ran and AOT compiles the artifact the runtime asks
             # for.
             sk = splitk_for(tile, block_rows)
-            if is_1250:
-                kname = tile_kernel_name_gfx1250(
-                    tile_m, tile_n, wave_m, wave_n, block_rows
-                )
-            else:
-                kname = tile_kernel_name(tile_m, tile_n, wave_m, wave_n, wgm) + (
-                    f"_r{block_rows}" if block_rows > 1 else ""
-                )
-            info = (
-                keys,
-                tile_m,
-                tile_n,
-                wave_m,
-                wave_n,
-                wgm,
-                sk,
-                block_rows,
-                kname,
-            )
             shape_args = (n, c, d, h, w, k, kt, kh, kw, groups, has_bias)
             if is_1250:
+                base_name = tile_kernel_name_gfx1250(
+                    tile_m, tile_n, wave_m, wave_n, block_rows
+                )
                 gen = generate_data_gfx1250
                 gen_args = (*shape_args, params["padding"], tuple(out_dhw))
                 fn = run_flydsl_conv3d_gfx1250
                 fn_keys = ["x_tune", "w_tune", "w_packed", "bias", "out"]
                 output_keys = ("out",)
+                # The runtime clamps num_buffers to LDS and the K-tile count;
+                # time and record the value that runs, once.
+                tiles_per_split = (crs // CGP_ALIGN) // max(1, sk)
+                variants = []
+                for nb, unroll in pipelines:
+                    nb = _clamp_num_buffers(nb, tiles_per_split, tile, block_rows)
+                    if (nb, unroll) not in variants:
+                        variants.append((nb, unroll))
             else:
+                base_name = tile_kernel_name(tile_m, tile_n, wave_m, wave_n, wgm) + (
+                    f"_r{block_rows}" if block_rows > 1 else ""
+                )
                 gen, gen_args = generate_data, shape_args
                 fn, fn_keys = run_flydsl_conv3d, ["x", "weight", "bias"]
                 output_keys = None
-            tasks.append(
-                (
-                    info,
-                    gen,
-                    gen_args,
-                    fn,
-                    (fn_keys, params, tile, wgm, sk, block_rows),
-                    dict(run_kwargs or {}),
-                    conv3d_ref,
-                    (["x", "weight", "bias"], params),
-                    {},
-                    None,
-                    RTOL,
-                    ATOL,
-                    strict_compare,
-                    None,  # max_abs_delta
-                    output_keys,
+                variants = [(None, None)]
+            for nb, unroll in variants:
+                kname = base_name
+                fn_args = (fn_keys, params, tile, wgm, sk, block_rows)
+                if is_1250:
+                    fn_args = (*fn_args, nb, unroll)
+                    if (nb, unroll) != (2, False):
+                        kname += f"_b{nb}" + ("_u" if unroll else "")
+                info = (
+                    keys,
+                    tile_m,
+                    tile_n,
+                    wave_m,
+                    wave_n,
+                    wgm,
+                    sk,
+                    block_rows,
+                    nb,
+                    unroll,
+                    kname,
                 )
-            )
+                tasks.append(
+                    (
+                        info,
+                        gen,
+                        gen_args,
+                        fn,
+                        fn_args,
+                        dict(run_kwargs or {}),
+                        conv3d_ref,
+                        (["x", "weight", "bias"], params),
+                        {},
+                        None,
+                        RTOL,
+                        ATOL,
+                        strict_compare,
+                        None,  # max_abs_delta
+                        output_keys,
+                    )
+                )
         return tasks
 
     def tune(self, untunedf, tunedf, args):
         run_kwargs = {"num_warmup": args.warmup, "num_iters": args.iters}
+        top_tiles = (
+            _top_tiles(args.tiles_from, args.tiles_topk) if args.tiles_from else {}
+        )
         tasks = []
         in_datas = []
         for _, row in untunedf.iterrows():
             keys = tuple(row[k] for k in self.keys)
-            shape_tasks = self._shape_tasks(keys, args.max_configs, run_kwargs)
+            tiles = None
+            if args.tiles_from:
+                tiles = top_tiles.get(_shape_key(keys[len(TUNED_DEVICE_COLUMNS) :]))
+                if not tiles:
+                    logger.warning(
+                        f"{keys} has no correct tile in {args.tiles_from}; "
+                        "sweeping the policy's candidates instead"
+                    )
+            shape_tasks = self._shape_tasks(
+                keys, args.max_configs, run_kwargs, args.pipelines, tiles
+            )
             if not shape_tasks:
                 logger.warning(f"no legal candidate for {keys}")
                 continue
@@ -684,6 +812,8 @@ class Conv3dTuner(TunerCommon):
                 wgm,
                 splitk,
                 block_rows,
+                num_buffers,
+                main_loop_unroll,
                 kernel_name,
             ) = info
             tflops, bw = self.calculate(el)
@@ -697,6 +827,10 @@ class Conv3dTuner(TunerCommon):
                     "wave_n": wave_n,
                     "wgm": wgm,
                     TUNED_BLOCK_ROWS_COLUMN: block_rows,
+                    "num_buffers": num_buffers,
+                    "main_loop_unroll": (
+                        None if main_loop_unroll is None else int(main_loop_unroll)
+                    ),
                     "splitK": splitk,
                     "us": time,
                     "kernelName": kernel_name,
@@ -709,7 +843,8 @@ class Conv3dTuner(TunerCommon):
                 print(
                     f"Tuning result for {str(dict(zip(self.keys, keys))).strip('{}')} "
                     f"is tile=({tile_m},{tile_n},{wave_m},{wave_n}) wgm={wgm} "
-                    f"block_rows={block_rows} splitK={splitk}, {time}us, "
+                    f"block_rows={block_rows} num_buffers={num_buffers} "
+                    f"main_loop_unroll={main_loop_unroll} splitK={splitk}, {time}us, "
                     f"{err_ratio=}, {tflops=} TFLOPS, {bw=} GB/s"
                 )
             rows.append(row)

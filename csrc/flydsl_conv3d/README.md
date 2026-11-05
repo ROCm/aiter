@@ -80,6 +80,22 @@ python3 csrc/flydsl_conv3d/conv3d_tune.py \
   -o aiter/configs/model_configs/qwenimage_vae_bf16_tuned_conv3d.csv
 ```
 
+   On gfx1250 the K loop's software pipeline is tuned too, the way the gfx1250
+   GEMM tuner sweeps `stages` and `main_loop_unroll`. Timing every tile with
+   every pipeline multiplies the GPU time, so do it in two passes: tiles at the
+   default pipeline, keeping every candidate (`-o2`), then the pipeline
+   variants on each shape's fastest tiles only:
+
+```bash
+M=aiter/configs/model_configs
+python3 csrc/flydsl_conv3d/conv3d_tune.py -i $M/wan21_vae_bf16_untuned_conv3d.csv \
+  -o /tmp/wan_tiles.csv -o2 /tmp/wan_tiles_all.csv
+python3 csrc/flydsl_conv3d/conv3d_tune.py -i $M/wan21_vae_bf16_untuned_conv3d.csv \
+  -o $M/wan21_vae_gfx1250_bf16_tuned_conv3d.csv \
+  --tiles_from /tmp/wan_tiles_all.csv --tiles_topk 4 \
+  --pipelines 2:0,2:1,3:0,3:1,4:0,4:1
+```
+
    Write winners into the per-model file, never into
    `aiter/configs/bf16_tuned_conv3d.csv`. That one and its untuned sibling ship
    header-only and back the merge `AITER_CONFIG_CONV3D_BF16` performs:
@@ -104,6 +120,13 @@ python3 csrc/flydsl_conv3d/conv3d_tune.py \
    VAEs. That is a constant per shape, so the ranking is unaffected, but the
    three columns are a floor rather than a kernel figure and are not
    comparable with another implementation's kernel-only numbers.
+
+   gfx1250 rows also carry `block_r` (output rows of the R x C block),
+   `num_buffers` (LDS ring depth, i.e. prefetch distance) and
+   `main_loop_unroll` (two K tiles per `scf.for` trip). `num_buffers` is the
+   value that ran: the runtime clamps a request to the LDS capacity and the
+   K-tile count, and the tuner records the clamped value. Rows without the two
+   pipeline columns, or with empty cells, run 2 buffers and no unroll.
 
    `splitK` is **not** swept: `_resolve_splitk` derives it per candidate and the
    tuner pins that value so the column records what ran. Every row of both VAE
@@ -172,6 +195,21 @@ python3 -m pytest op_tests/tuning_tests/test_config_shape_collision.py
   candidate table and heuristic ladder are unioned in on top of the cap, and so
   is the tile the shape would borrow from another tuned resolution of its layer,
   so the tuned pick can never come out worse than the shipped default.
+
+### `--pipelines`
+- **Type**: comma list of `num_buffers:main_loop_unroll`
+- **Default**: `2:0`
+- **Description**: gfx1250 only. Every tile candidate is timed once per pair,
+  e.g. `3:1` is three LDS buffers with the main loop unrolled two K tiles per
+  trip. Pairs that clamp to the same buffer count for a shape are timed once.
+
+### `--tiles_from` / `--tiles_topk`
+- **Type**: path / int
+- **Default**: none / 4
+- **Description**: gfx1250 only. Replace the policy's tile candidates with each
+  shape's `--tiles_topk` fastest correct tiles in a profile CSV written by an
+  earlier run's `-o2`. A shape the profile does not cover falls back to the
+  policy's candidates, with a warning.
 
 ## Common Options
 

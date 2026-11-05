@@ -286,14 +286,18 @@ def run_conv3d_gfx1250(
     patch_reuse=True,  # gfx950 API parity; ignored on gfx1250 (no patch path)
     splitk=None,
     wgm=None,  # accepted for API parity; unused on gfx1250
-    num_buffers=2,
+    num_buffers=None,
     variant="bandwidth_bound",
-    main_loop_unroll=False,
+    main_loop_unroll=None,
     packed_weight=None,  # (K, kT*kH*kW*cgp) from prepare_operands_gfx1250
     out=None,  # contiguous bf16 result in output_layout, written in place
     **_ignored,
 ):
-    """Run gfx1250 FlyDSL conv3d (TDM+WMMA; optional split-K / dyn_hw / tuned tile)."""
+    """Run gfx1250 FlyDSL conv3d (TDM+WMMA; optional split-K / dyn_hw / tuned tile).
+
+    ``num_buffers`` / ``main_loop_unroll`` left at None take the tuned row's
+    columns of the same name, else 2 buffers and no unroll.
+    """
     del _ignored, patch_reuse
     in_ndhwc = input_layout == "NDHWC"
     out_ndhwc = output_layout == "NDHWC"
@@ -372,6 +376,7 @@ def run_conv3d_gfx1250(
     # Tuned table lookup (gfx key separates gfx950 / gfx1250 rows).
     tuned_splitk = None
     tuned_br = None
+    tuned_pipe = {}
     if tile is not None:
         chosen_tile = tuple(tile)
         chosen_br = (
@@ -422,6 +427,7 @@ def run_conv3d_gfx1250(
             chosen_tile = hit[0]
             tuned_splitk = hit[2]
             tuned_br = hit[3] if len(hit) > 3 else None
+            tuned_pipe = hit[4] if len(hit) > 4 and hit[4] else {}
             chosen_br = (
                 max(1, int(block_rows))
                 if block_rows is not None
@@ -460,6 +466,11 @@ def run_conv3d_gfx1250(
     dyn_hw = _dyn_hw_ok_gfx1250(
         n, c_padded, d, h, w, k, npq, chosen_tile, chosen_br, ho, wo, groups
     )
+
+    if num_buffers is None:
+        num_buffers = tuned_pipe.get("num_buffers", 2)
+    if main_loop_unroll is None:
+        main_loop_unroll = tuned_pipe.get("main_loop_unroll", False)
 
     # Match GEMM: B-1 K-tiles must fill the prologue; clamp against LDS too.
     k_tiles = crs // 32  # TILE_K == CGP_ALIGN == 32
