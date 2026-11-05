@@ -658,7 +658,7 @@ def build_qsa_indexer_prefill_scores_module(
 
     One wave per 16 columns, each over the whole head dim, so the four
     heads accumulate in registers and the wave writes its scores directly.
-    A row tile may span requests. Q is staged once per request; each
+    A row tile may span requests. Q is staged once per row tile; each
     request in the tile gathers its own K tiles and writes only its own
     rows, so a request-major batch (vLLM's layout) gathers each K tile once
     per request it touches. A workgroup walks ``tiles_per_wg`` consecutive
@@ -848,6 +848,37 @@ def build_qsa_indexer_prefill_scores_module(
 
         # As in the one-row scorer: skip tiles no row of this block can see.
         if tile0 * Int32(block_n) < tile_visible:
+            # Q is staged once per row tile and reused by every request and tile
+            # this workgroup scores: its mask is any live request, not this one.
+            # The fill stays a thread-linear copy of the whole (row, head, d)
+            # tile, eight bf16 at a time. partition_A is the MFMA A fragment each
+            # lane later reads from this LDS, so it does not name this store:
+            # storing through it would skip elements that fragment does not own
+            # and would retile the global load.
+            for qpart_q in range_constexpr(q_vectors_per_thread):
+                qlinear_q = tid + Int32(qpart_q * block_threads)
+                qrow_local_q = div_nonneg(qlinear_q, Int32(n_heads * vec_chunks))
+                qrem_q = qlinear_q - qrow_local_q * Int32(n_heads * vec_chunks)
+                qhead_q = div_nonneg(qrem_q, Int32(vec_chunks))
+                qd_chunk_q = qrem_q - qhead_q * Int32(vec_chunks)
+                qrow_q = row_tile * Int32(block_m) + qrow_local_q
+                qrow_live_q = qrow_q < rows
+                qsafe_row_q = qrow_live_q.select(qrow_q, zero)
+                qreq_live_q = req_lds[qrow_local_q] >= zero
+                qs_row_q = fx.logical_divide(
+                    fx.slice(q_buf, (qsafe_row_q, qhead_q, None)), vec_layout
+                )
+                qs_src_q = fx.slice(qs_row_q, (None, qd_chunk_q))
+                qs_frag_q = fx.make_fragment_like(qs_src_q)
+                fx.copy(g_copy, qs_src_q, qs_frag_q)
+                qs_vec_q = fx.Vector(fx.memref_load_vec(qs_frag_q))
+                qd0_q = qd_chunk_q * Int32(vec)
+                for iq_q in range_constexpr(vec):
+                    qv_q = qreq_live_q.select(qs_vec_q[iq_q].to(Float32), Float32(0.0))
+                    q_lds[qrow_local_q, qhead_q, qd0_q + Int32(iq_q)] = qv_q.to(
+                        BFloat16
+                    )
+            gpu.barrier()
             # Names assigned in this loop are its own: a name it shares with
             # the code above would become an scf.for iter_arg.
             for cur_req in range(req_lo, req_hi + one, one):
@@ -859,41 +890,6 @@ def build_qsa_indexer_prefill_scores_module(
                     )
                     req_visible = fx.max(v_r, req_visible)
                 if tile0 * Int32(block_n) < req_visible:
-                    # Q is staged once per request and reused by every tile
-                    # this workgroup scores; the first K gather's barrier
-                    # publishes it. The fill stays a thread-linear copy of
-                    # the whole (row, head, d) tile, eight bf16 at a time.
-                    # partition_A is the MFMA A fragment each lane later
-                    # reads from this LDS, so it does not name this store:
-                    # storing through it would skip elements that fragment
-                    # does not own and would retile the global load.
-                    for qpart_r in range_constexpr(q_vectors_per_thread):
-                        qlinear_r = tid + Int32(qpart_r * block_threads)
-                        qrow_local_r = div_nonneg(
-                            qlinear_r, Int32(n_heads * vec_chunks)
-                        )
-                        qrem_r = qlinear_r - qrow_local_r * Int32(n_heads * vec_chunks)
-                        qhead_r = div_nonneg(qrem_r, Int32(vec_chunks))
-                        qd_chunk_r = qrem_r - qhead_r * Int32(vec_chunks)
-                        qrow_r = row_tile * Int32(block_m) + qrow_local_r
-                        qrow_live_r = qrow_r < rows
-                        qsafe_row_r = qrow_live_r.select(qrow_r, zero)
-                        qreq_live_r = req_lds[qrow_local_r] >= zero
-                        qs_row_r = fx.logical_divide(
-                            fx.slice(q_buf, (qsafe_row_r, qhead_r, None)), vec_layout
-                        )
-                        qs_src_r = fx.slice(qs_row_r, (None, qd_chunk_r))
-                        qs_frag_r = fx.make_fragment_like(qs_src_r)
-                        fx.copy(g_copy, qs_src_r, qs_frag_r)
-                        qs_vec_r = fx.Vector(fx.memref_load_vec(qs_frag_r))
-                        qd0_r = qd_chunk_r * Int32(vec)
-                        for iq_r in range_constexpr(vec):
-                            qv_r = qreq_live_r.select(
-                                qs_vec_r[iq_r].to(Float32), Float32(0.0)
-                            )
-                            q_lds[qrow_local_r, qhead_r, qd0_r + Int32(iq_r)] = qv_r.to(
-                                BFloat16
-                            )
                     tile_end = div_nonneg(
                         req_visible + Int32(block_n - 1), Int32(block_n)
                     )
