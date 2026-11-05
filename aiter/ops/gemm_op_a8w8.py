@@ -1055,6 +1055,14 @@ def gemm_a8w8_bpreshuffle_out(
 _BLOCKSCALE_TRITON_FALLBACK_MIN_M = {"gfx942": 2048, "gfx950": 384}
 
 
+@functools.lru_cache(maxsize=1024)
+def _warn_blockscale_split_k_row_not_bf16(n: int, k: int, dtype: torch.dtype):
+    logger.warning(
+        f"gemm_a8w8_blockscale N:{n}, K:{k} has split-K rows, which accumulate in "
+        f"the output dtype; {dtype} output runs them without split-K."
+    )
+
+
 def _blockscale_triton(
     XQ: Tensor,
     WQ: Tensor,
@@ -1272,7 +1280,8 @@ def gemm_a8w8_blockscale(
     Native E8M0 group32 scales (typed tensors or uint8 views) use
     AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_GROUP32;
     FP32 128x128 scales use AITER_CONFIG_GEMM_A8W8_BLOCKSCALE. Both tables are
-    queried through get_CKGEMM_config before choosing a fallback. Group32
+    queried through get_CKGEMM_config before choosing a fallback. A split-K CK
+    or CK-Tile row runs without split-K for output other than BF16. Group32
     currently supports libtype="triton", also its default on a config miss.
     Triton tile and split-K parameters come from its own tuning tables.
     For native group32 operands, split_k optionally overrides the positive
@@ -1331,6 +1340,9 @@ def gemm_a8w8_blockscale(
         # group32 row must fail instead of reinterpreting its E8M0 bytes.
         assert not is_group32, f"Unsupported libtype {libtype} for group32 GEMM"
         splitK = int(config.get("splitK", 0))
+        if splitK > 0 and dtype != dtypes.bf16 and libtype in ("ck", "cktile"):
+            _warn_blockscale_split_k_row_not_bf16(n, k, dtype)
+            splitK = 0
         kernelName = str(config.get("kernelName", ""))
         Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
         if libtype == "ck":
