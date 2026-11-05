@@ -178,81 +178,46 @@ class TestLegacyCuNumBackfill(unittest.TestCase):
 
 
 class TestBuildTargets(unittest.TestCase):
-    """GPU_ARCHS must not silently build for the wrong CU count.
+    """GPU_ARCHS must compile the (gfx942, 228) MI300A tuned rows.
 
-    GFX_CU_NUM_MAP holds one canonical cu_num per arch (gfx942 -> 304). Using it
-    verbatim on a 228-CU MI300A makes gen_instances filter out every
-    (gfx942, 228) tuned row, so the kernels are never compiled and dispatch
-    later fails with "not present in the compiled registry".
+    gen_instances keeps only the tuned rows whose (gfx, cu_num) is a build
+    target, so a missing 228 target leaves every MI300A row uncompiled and
+    dispatch later fails with "not present in the compiled registry". The
+    targets must not depend on the build host: a multi-arch wheel built on an
+    MI300A still has to carry the 304-CU instances MI300X dispatches to.
     """
 
-    def _targets(self, *, gpu_archs, cu_num=None, live=("gfx942", 228)):
+    def _targets(self, *, gpu_archs, cu_num=None):
         from aiter.jit.utils import chip_info
 
-        patches = []
-        if live is None:
-            patches.append(
-                mock.patch.object(
-                    chip_info, "get_gfx_runtime", side_effect=RuntimeError("no GPU")
-                )
-            )
-        else:
-            patches.append(
-                mock.patch.object(chip_info, "get_gfx_runtime", return_value=live[0])
-            )
-            patches.append(
-                mock.patch.object(chip_info, "get_cu_num", return_value=live[1])
-            )
-        with _EnvGuard(GPU_ARCHS=gpu_archs, CU_NUM=cu_num):
-            for p in patches:
-                p.start()
-            try:
-                return chip_info.get_build_targets()
-            finally:
-                for p in patches:
-                    p.stop()
+        with _EnvGuard(GPU_ARCHS=gpu_archs, CU_NUM=cu_num), mock.patch.object(
+            chip_info, "get_cu_num", side_effect=AssertionError("probed live GPU")
+        ):
+            return chip_info.get_build_targets()
 
-    def test_live_cu_count_added_next_to_table_default(self):
+    def test_gfx942_covers_every_sku(self):
+        targets = self._targets(gpu_archs="gfx942")
+        for cu in (304, 228, 80):  # MI300X, MI300A, MI308X
+            self.assertIn(("gfx942", cu), targets)
+
+    def test_multi_arch_wheel_keeps_mi300x_and_mi300a(self):
+        targets = self._targets(gpu_archs="gfx942;gfx950")
+        self.assertIn(("gfx942", 304), targets)
+        self.assertIn(("gfx942", 228), targets)
+        self.assertIn(("gfx950", 256), targets)
+
+    def test_explicit_cu_num_selects_mi300a_only(self):
         self.assertEqual(
-            self._targets(gpu_archs="gfx942"), [("gfx942", 304), ("gfx942", 228)]
+            self._targets(gpu_archs="gfx942", cu_num="228"), [("gfx942", 228)]
         )
 
-    def test_mi300a_build_host_keeps_mi300x_instances(self):
-        # A multi-arch wheel built on an MI300A host must still run on MI300X.
-        self.assertIn(("gfx942", 304), self._targets(gpu_archs="gfx942;gfx950"))
+    def test_native_build_uses_live_cu_count(self):
+        from aiter.jit.utils import chip_info
 
-    def test_live_cu_equal_to_default_is_not_duplicated(self):
-        self.assertEqual(
-            self._targets(gpu_archs="gfx942", live=("gfx942", 304)),
-            [("gfx942", 304)],
-        )
-
-    def test_explicit_cu_num_overrides_live(self):
-        self.assertEqual(
-            self._targets(gpu_archs="gfx942", cu_num="304"), [("gfx942", 304)]
-        )
-
-    def test_cross_compile_keeps_table_default(self):
-        # Building for an arch that is not the live GPU must not inherit its CUs.
-        self.assertEqual(self._targets(gpu_archs="gfx950"), [("gfx950", 256)])
-
-    def test_multi_arch_adds_only_the_matching_target(self):
-        self.assertEqual(
-            self._targets(gpu_archs="gfx942;gfx950"),
-            [("gfx942", 304), ("gfx950", 256), ("gfx942", 228)],
-        )
-
-    def test_no_live_gpu_keeps_table_defaults(self):
-        self.assertEqual(
-            self._targets(gpu_archs="gfx942", live=None), [("gfx942", 304)]
-        )
-
-    def test_mi308x_partition_also_added(self):
-        # Same mechanism protects MI308X and non-SPX MI300X partition modes.
-        self.assertEqual(
-            self._targets(gpu_archs="gfx942", live=("gfx942", 80)),
-            [("gfx942", 304), ("gfx942", 80)],
-        )
+        with _EnvGuard(GPU_ARCHS=None, CU_NUM=None), mock.patch.object(
+            chip_info, "get_gfx", return_value="gfx942"
+        ), mock.patch.object(chip_info, "get_cu_num", return_value=228):
+            self.assertEqual(chip_info.get_build_targets(), [("gfx942", 228)])
 
 
 class TestNormalizeFp8Dtype(unittest.TestCase):

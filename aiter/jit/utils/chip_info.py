@@ -28,6 +28,7 @@ IS_WINDOWS = sys.platform == "win32"
 # Windows ROCm ships `hipinfo` instead of `rocminfo`; the output formats differ,
 # so each has its own compute-unit parser below.
 _GPU_INFO_TOOL = "hipinfo" if IS_WINDOWS else "rocminfo"
+_GFX_ARCH_PATTERN = r"gfx[0-9a-z]+(?:-[0-9a-z]+)*"
 
 
 @functools.lru_cache(maxsize=1)
@@ -47,7 +48,15 @@ def _detect_native() -> list[str]:
     try:
         # rocminfo: "Name: gfx942"; hipinfo: "gcnArchName: gfx1200"
         for line in _gpu_info_output().splitlines():
-            match = re.search(r"\b(gfx\w+)\b", line, re.IGNORECASE)
+            # Preserve the exact ROCr-reported identity, including the
+            # gfx1250-strict (MI450 A0) variant. strict is mapped to the gfx1250
+            # kernel family only at explicitly validated dispatch sites, via
+            # base_gfx_arch()/is_gfx1250_family(); build artifacts, caches, tuned
+            # configs and prebuilt binaries stay keyed by the exact target.
+            # Folding here would make _needs_arch_rebuild() treat a strict .so as
+            # not covering a strict device and rebuild in a loop once ROCr
+            # reports gfx1250-strict.
+            match = re.search(rf"\b({_GFX_ARCH_PATTERN})\b", line, re.IGNORECASE)
             if match:
                 return [match.group(1).lower()]
     except Exception as e:
@@ -98,6 +107,7 @@ _LDS_CAPACITY_BYTES = {
     "gfx1200": 64 * 1024,
     "gfx1201": 64 * 1024,
     "gfx1250": 320 * 1024,
+    "gfx1250-strict": 320 * 1024,
 }
 
 
@@ -182,7 +192,7 @@ def _rocminfo_gpu_agents() -> list[tuple[str, int]]:
         key, value = m.group(1), m.group(2)
         if key == "Name" and name is None:
             # Agent names can carry target-id features ("gfx942:sramecc+").
-            m2 = re.search(r"\b(gfx\w+)\b", value, re.IGNORECASE)
+            m2 = re.search(rf"\b({_GFX_ARCH_PATTERN})\b", value, re.IGNORECASE)
             name = m2.group(1) if m2 else value
         elif key == "Device Type":
             kind = value
@@ -201,7 +211,9 @@ def _hipinfo_gpu_agents() -> list[tuple[str, int]]:
     for block in re.split(r"^device#", _gpu_info_output(), flags=re.MULTILINE)[1:]:
         # gcnArchName can carry target-id features ("gfx942:sramecc+").
         name = re.search(
-            r"^gcnArchName:\s*(gfx\w+)", block, re.MULTILINE | re.IGNORECASE
+            rf"^gcnArchName:\s*({_GFX_ARCH_PATTERN})",
+            block,
+            re.MULTILINE | re.IGNORECASE,
         )
         rev = re.search(
             r"^asicRevision:\s*(0[xX][0-9a-fA-F]+|\d+)", block, re.MULTILINE
@@ -338,39 +350,18 @@ def get_build_targets() -> list[tuple[str, int]]:
 
     Priority:
       1. GPU_ARCHS set to an explicit non-empty target list -> delegate to
-         get_build_targets_env() (no GPU needed), then add the live GPU's cu_num
-         for a target matching the live GPU's arch (see below).
+         get_build_targets_env() (no GPU needed), which pairs each arch with
+         every CU count in GFX_CU_NUMS_MAP unless CU_NUM is set.
       2. GPU_ARCHS unset, empty/whitespace, or "native" -> call get_gfx()
          (GPU_ARCHS-aware; falls back to rocminfo/hipinfo when GPU_ARCHS is
          unset) and get_cu_num(), which correctly reflect partition mode and
          binned variants.
       3. Neither -> raise RuntimeError with a clear message.
-
-    On the GPU_ARCHS path, GFX_CU_NUM_MAP supplies one canonical cu_num per arch
-    (gfx942 -> 304, the MI300X SPX value). That is wrong for every other gfx942
-    SKU and partition mode: on a 228-CU MI300A, `GPU_ARCHS=gfx942` alone yields
-    ('gfx942', 304), gen_instances then filters out every (gfx942, 228) tuned row,
-    and dispatch fails at runtime with "not present in the compiled registry".
-    So when the live GPU's arch matches a requested target and CU_NUM was not set
-    explicitly, (live_gfx, live_cu) is added alongside the table default. The
-    default is kept rather than replaced: a multi-arch wheel built on an MI300A
-    host must still contain the (gfx942, 304) instances MI300X dispatches to.
-    An explicit CU_NUM still wins, and cross-compiling for an arch that is not
-    the live GPU is unaffected.
     """
     gpu_archs = os.getenv("GPU_ARCHS")
     gpu_archs_normalized = gpu_archs.strip() if gpu_archs is not None else ""
     if gpu_archs_normalized and gpu_archs_normalized.lower() != "native":
-        targets = get_build_targets_env()
-        if os.getenv("CU_NUM"):
-            return targets
-        try:
-            live = (get_gfx_runtime(), get_cu_num())
-        except Exception:  # noqa: BLE001  no live GPU: keep the table defaults
-            return targets
-        if live not in targets and any(gfx == live[0] for gfx, _ in targets):
-            targets.append(live)
-        return targets
+        return get_build_targets_env()
 
     try:
         # get_gfx() is intentional here -- this is a build-time path; get_gfx_runtime()
@@ -691,7 +682,7 @@ def _get_device_name(device_id: int) -> str:
         if num_xcds == 4:
             return "MI350P"
         return "MI350"
-    elif gfx == "gfx1250":
+    elif gfx in ("gfx1250", "gfx1250-strict"):
         return "MI400"
     else:
         raise RuntimeError("Unsupported gfx")

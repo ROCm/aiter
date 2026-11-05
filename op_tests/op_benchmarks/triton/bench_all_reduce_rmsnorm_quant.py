@@ -12,10 +12,7 @@ import triton
 
 import aiter
 from aiter import logger, rmsnorm2d_fwd_with_add
-from aiter.dist.communication_op import (
-    tensor_model_parallel_all_reduce,
-    tensor_model_parallel_fused_allreduce_rmsnorm,
-)
+from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 from aiter.dist.parallel_state import get_tp_group, graph_capture
 from aiter.dist.utils import get_distributed_init_method, get_ip, get_open_port
 from aiter.ops.triton.comms.all_reduce import all_reduce_free, all_reduce_init
@@ -30,10 +27,9 @@ from op_tests.op_benchmarks.triton.utils.argparse import (
     get_rot_bufs_kwargs,
     override_parser_action,
 )
-from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    do_bench_aiter_triton_synced,
-    generate_rotating_buffers_pool,
-    get_caller_name_no_ext,
+from op_tests.op_benchmarks.triton.utils.benchmark_utils import get_caller_name_no_ext
+from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
+    RotatingBufferBench,
 )
 
 WORLD_SIZE = 4
@@ -55,6 +51,10 @@ def benchmark(args, rank, device, tp, inboxes, calls):
         ylabel="us",
         plot_name=get_caller_name_no_ext(),
         args={},
+    )
+
+    bencher = RotatingBufferBench.from_dict(
+        {**get_rot_bufs_kwargs(args), **get_do_bench_graph_kwargs(args)}
     )
 
     @triton.testing.perf_report([config])
@@ -82,8 +82,9 @@ def benchmark(args, rank, device, tp, inboxes, calls):
             ),
             "rccl": rccl,
             "car": car,
-            "car_fused": lambda x, res: tensor_model_parallel_fused_allreduce_rmsnorm(
-                x, res, weight, EPS, gemma_norm=True
+            # The fused CAR kernel itself: the dispatch runs 2 kernels at small sizes.
+            "car_fused": lambda x, res: ca.custom_fused_ar_rms(
+                x, res, weight, EPS, True, gemma_norm=True
             ),
         }
 
@@ -91,16 +92,9 @@ def benchmark(args, rank, device, tp, inboxes, calls):
             x = torch.randn(shape, dtype=torch.bfloat16, device=device)
             return x, torch.randn(shape, dtype=torch.bfloat16, device=device)
 
-        bufs = generate_rotating_buffers_pool(
-            [gen], [["x", "res"]], **get_rot_bufs_kwargs(args)
-        )
+        bencher.build_pool([gen], [["x", "res"]])
         with graph_capture():  # the CAR paths capture as they do in a model
-            ms = do_bench_aiter_triton_synced(
-                fns[provider],
-                bufs,
-                dist_group=tp.cpu_group,
-                **get_do_bench_graph_kwargs(args),
-            )
+            ms = bencher.bench_synced(fns[provider], dist_group=tp.cpu_group)
         per_rank = [None] * WORLD_SIZE
         dist.all_gather_object(per_rank, ms, group=tp.cpu_group)
         return max(per_rank) * 1e3

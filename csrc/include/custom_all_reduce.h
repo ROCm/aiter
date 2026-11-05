@@ -38,6 +38,12 @@ void all_reduce(fptr_t _fa,
                 bool open_fp8_quant,
                 int64_t reg_inp_ptr,
                 int64_t reg_inp_bytes);
+void all_reduce_residual(fptr_t _fa,
+                         const aiter_tensor_t& inp,
+                         const aiter_tensor_t& out,
+                         const aiter_tensor_t& residual,
+                         int64_t reg_inp_ptr,
+                         int64_t reg_inp_bytes);
 // reduce_scatter dispatcher. (m, n, k, split_dim) describe the canonical
 // shape the Python wrapper collapsed the input to:
 //   split_dim = 0 (kFirst): only `k` (= numel) used
@@ -80,7 +86,9 @@ void fused_allreduce_rmsnorm(fptr_t _fa,
                              int64_t reg_ptr,
                              int64_t reg_bytes,
                              bool use_1stage,
-                             bool gemma_norm = false);
+                             bool gemma_norm       = false,
+                             int64_t num_norm_rows = -1,
+                             bool skip_residual    = false);
 void fused_allreduce_rmsnorm_pad(fptr_t _fa,
                                  const aiter_tensor_t& inp,
                                  const aiter_tensor_t& res_inp,
@@ -159,6 +167,13 @@ void fused_qknorm_allreduce_rope(fptr_t _fa,
                                  int64_t reg_bytes);
 void dispose(fptr_t _fa);
 int64_t meta_size();
+int64_t lamportBufferSize(int64_t world_size);
+void initLamport(fptr_t _fa,
+                 int64_t self_ptr,
+                 const std::vector<int64_t>& ipc_handle_ptrs,
+                 const std::vector<int64_t>& offsets);
+int64_t lamportKernel(fptr_t _fa, int64_t numel);
+void lamportAllReduce(fptr_t _fa, const aiter_tensor_t& inp, const aiter_tensor_t& out, int64_t kernel);
 void register_input_buffer(fptr_t _fa,
                            int64_t self_ptr,
                            const std::vector<int64_t>& ipc_handle_ptrs,
