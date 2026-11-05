@@ -1244,3 +1244,104 @@ def test_resetting_for_tests_keeps_the_ops_routed_by_importing_aiter(monkeypatch
     plugin._reset_for_testing()
     assert "production.op" in plugin._routed_ops, "import-time routes survive"
     assert "test.add" not in plugin._routed_ops, "test routes do not"
+
+
+def test_an_op_whose_contract_never_moved_says_nothing_about_versions(monkeypatch):
+    """The number should appear where it carries information, not everywhere."""
+
+    provider = _Provider("aklr", _candidate("aklr"))
+    plugin.configure(enable=("aklr",), source="test")
+    monkeypatch.setattr(
+        plugin, "_entry_points", lambda: (_EntryPoint("aklr", provider),)
+    )
+
+    @plugin.route(op="test.add")  # no version=
+    def add(left: int, right: int = 1) -> int:
+        return left + right
+
+    assert add(2, 3) == 100
+    assert plugin.last_decision().op == plugin.Op("test.add", 1)
+
+
+def test_a_provider_may_name_ops_without_versions(monkeypatch):
+    """Naming an op means the current contract, which most providers mean."""
+
+    provider = _Provider("aklr", _candidate("aklr"))
+    provider.op_versions = {"test.add"}  # a set of names, not a mapping
+    plugin.configure(enable=("aklr",), source="test")
+    monkeypatch.setattr(
+        plugin, "_entry_points", lambda: (_EntryPoint("aklr", provider),)
+    )
+
+    assert _route_add([])(2, 3) == 100
+    assert plugin.last_decision().provider == "aklr"
+
+
+def test_naming_an_op_does_not_claim_the_ops_it_did_not_name(monkeypatch):
+    provider = _Provider("aklr", _candidate("aklr"))
+    provider.op_versions = {"something.else"}
+    plugin.configure(enable=("aklr",), source="test")
+    monkeypatch.setattr(
+        plugin, "_entry_points", lambda: (_EntryPoint("aklr", provider),)
+    )
+
+    assert _route_add([])(2, 3) == 5
+    assert provider.select_calls == 0
+
+
+def test_a_kernel_that_cannot_take_the_contract_is_refused(monkeypatch):
+    """The failure this prevents is silent, which is why it is worth a check.
+
+    Argument counts line up by accident often enough: a kernel written for a
+    write-out contract, handed a functional one, treats the input tensor as its
+    output buffer and corrupts it without raising.
+    """
+
+    warnings = []
+    monkeypatch.setattr(
+        plugin.logger, "warning", lambda fmt, *rest: warnings.append(fmt % rest)
+    )
+
+    def wrong_shape(out, left, right, extra):  # four parameters, wrong contract
+        out.append(left)
+
+    provider = _Provider(
+        "aklr",
+        plugin.KernelCandidate(
+            provider="aklr",
+            kernel_id="mismatched",
+            artifact_digest="sha256:abc",
+            run=wrong_shape,
+        ),
+    )
+    plugin.configure(enable=("aklr",), source="test")
+    monkeypatch.setattr(
+        plugin, "_entry_points", lambda: (_EntryPoint("aklr", provider),)
+    )
+    native_calls = []
+
+    assert _route_add(native_calls)(2, 3) == 5, "it falls back rather than running"
+    assert native_calls == [(2, 3)]
+    assert plugin.last_decision().reason == "contract-mismatch"
+    assert plugin.last_decision().provider == "aklr"
+    assert "does not take this contract" in warnings[0]
+
+
+def test_a_forwarding_kernel_is_accepted(monkeypatch):
+    """``*args, **kwargs`` genuinely accepts the call, so it must pass."""
+
+    provider = _Provider(
+        "aklr",
+        plugin.KernelCandidate(
+            provider="aklr",
+            kernel_id="forwarder",
+            artifact_digest="sha256:abc",
+            run=lambda *args, **kwargs: 100,
+        ),
+    )
+    plugin.configure(enable=("aklr",), source="test")
+    monkeypatch.setattr(
+        plugin, "_entry_points", lambda: (_EntryPoint("aklr", provider),)
+    )
+
+    assert _route_add([])(2, 3) == 100
