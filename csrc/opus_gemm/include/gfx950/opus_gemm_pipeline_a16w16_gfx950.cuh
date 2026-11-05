@@ -217,23 +217,25 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a16w16_kernel(opus
         if (xy >= limit) {
             // Swizzle covers new_xy ∈ [0, limit) contiguously. Within that,
             // (limit / tid_per_group) groups are full; the remainder lands in
-            // a partial last group covering (covered_cols) complete tn
-            // columns. The original fallback `xy/num_tiles_n` jumps row-major
-            // from xy without accounting for those holes, dropping the
-            // (partial_first_row..end, covered_cols..num_tiles_n) rectangle.
+            // a partial last group covering (covered_in_partial) tiles.
+            // This group may have fewer than W rows, so dividing by W loses
+            // the exact resume offset. The original fallback `xy/num_tiles_n`
+            // jumps row-major from xy without accounting for those holes,
+            // dropping the rest of that group.
             int full_groups = limit / tid_per_group;
-            int covered_cols = (limit - full_groups * tid_per_group) / W;
+            int covered_in_partial = limit - full_groups * tid_per_group;
             int partial_first_row = full_groups * W;
             int partial_row_extent = num_tiles_m - partial_first_row;
             if (partial_row_extent > W) partial_row_extent = W;
             int f = xy - limit;
             int remaining_in_partial =
                 (partial_row_extent > 0)
-                    ? (num_tiles_n - covered_cols) * partial_row_extent
+                    ? partial_row_extent * num_tiles_n - covered_in_partial
                     : 0;
             if (f < remaining_in_partial) {
-                tile_m_id = partial_first_row + (f % partial_row_extent);
-                tile_n_id = covered_cols + (f / partial_row_extent);
+                int idx = covered_in_partial + f;
+                tile_m_id = partial_first_row + (idx % partial_row_extent);
+                tile_n_id = idx / partial_row_extent;
             } else {
                 int g = f - remaining_in_partial;
                 tile_m_id = (partial_first_row + partial_row_extent) + g / num_tiles_n;

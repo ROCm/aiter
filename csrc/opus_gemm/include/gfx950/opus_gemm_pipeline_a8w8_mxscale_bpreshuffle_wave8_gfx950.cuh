@@ -400,22 +400,21 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
     int row = (wgid % num_tiles_m) * T::B_M;
     int col = (wgid / num_tiles_m) * T::B_N;
     // L2 rasterization, the mapping the reference flydsl kernel runs (its
-    // xcd_swizzle value is this band height, not a count of XCDs -- it assumes 8
-    // of those unconditionally, as here).
+    // xcd_swizzle value is this band height, not a count of XCDs).
     //
     // Two steps. First undo the dispatcher's round-robin over the XCDs, so an XCD
-    // owns a contiguous run of logical tiles instead of every 8th one; then walk
-    // that run in bands of XCD_WGM row tiles by every column tile, which makes the
-    // workgroups co-resident on an XCD share A rows as well as B columns. Only the
-    // second step is a reordering -- the first is what makes the second land on
-    // one XCD rather than being smeared across all eight.
+    // owns a contiguous run of logical tiles instead of every NUM_XCD-th one;
+    // then walk that run in bands of XCD_WGM row tiles by every column tile,
+    // which makes the workgroups co-resident on an XCD share A rows as well as B
+    // columns. Only the second step is a reordering -- the first is what makes
+    // the second land on one XCD rather than being smeared across all of them.
     //
     // block_id_x is the true dispatch order only when split_k == 1 (otherwise the
     // split_k workgroups of one tile are consecutive ids and sit on different
     // XCDs), so the swizzle is off for split-K. It also assumes gridDim.x is a
     // multiple of 8, or block_id_z shifts which XCD a tile lands on.
     if constexpr (XCD_WGM > 0) {
-        constexpr int NUM_XCD = 8;
+        constexpr int NUM_XCD = T::NUM_XCD;
         if (kargs.split_k == 1) {
             const int num_tiles_n = ceil_div(kargs.n, T::B_N);
             const int total = num_tiles_m * num_tiles_n;
