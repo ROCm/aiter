@@ -585,6 +585,7 @@ def fused_reference(total: torch.Tensor, residual, weight, eps: float = RMS_EPS)
     out = (acc * rstd * weight.float()).to(torch.bfloat16)
     return out, res_out
 
+
 FUSED_DEFAULT_LADDER_HIDDENS = (2048, 4096, 5120, 7168, 8192)
 # The payload an unbounded dispatch window is cut at.
 FUSED_WALK_TOP_BYTES = 64 << 20
@@ -604,9 +605,9 @@ def fused_ladder_cases(
     family: str, world_size: int, link: str, *, top_bytes: int = FUSED_WALK_TOP_BYTES
 ) -> list[FusedCase]:
     """Get the shapes and corresponding rungs from the shipped policy.
-    
-    For a given algorithm, the FamilyPolicy gives the windows inside which the 
-    algorithm is applied. From the policy ladders, we get what instance is applied on 
+
+    For a given algorithm, the FamilyPolicy gives the windows inside which the
+    algorithm is applied. From the policy ladders, we get what instance is applied on
     a given slice of this window.
     """
     from aiter.ops.flydsl import allreduce_policy as fp

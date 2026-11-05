@@ -553,9 +553,7 @@ def quick_reduce_row_block_for(
     if block is not None and atoms_per_row is not None:
         raise ValueError("pin block or atoms_per_row, not both")
     if atoms_per_row is None:
-        return quick_reduce_row_block_at(
-            hidden, world_size, block, wide_rows=wide_rows
-        )
+        return quick_reduce_row_block_at(hidden, world_size, block, wide_rows=wide_rows)
     opts = quick_reduce_row_block_options(hidden, world_size, wide_rows=wide_rows)
     if not opts:
         # Raises, naming why.
