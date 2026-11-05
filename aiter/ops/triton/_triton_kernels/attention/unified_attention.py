@@ -1155,6 +1155,7 @@ def reduce_segments(
     LENGTH_AWARE_SPLIT: tl.constexpr = False,  # bool, see seq_num_segments
     SEQ_BLOCK: tl.constexpr = 256,  # int, sequences per step over seq_lens
     LENGTH_AWARE_SEGMENT_BLOCK: tl.constexpr = 16,  # int, used slots merged per step
+    num_tokens=1,  # int, as passed to kernel_unified_attention_3d
     SLIDING_WINDOW: tl.constexpr = 0,  # int, the producer's; carves its window
 ):
     query_token_idx = tl.program_id(0)
@@ -1197,7 +1198,8 @@ def reduce_segments(
         # create masks for subsequent loads
         act_num_segments = cdiv_fn(window_tiles, tiles_per_segment)
     else:
-        tiles_per_segment = cdiv_fn(seq_len, num_segments * TILE_SIZE)
+        # at least 1: a zero-length sequence has no tiles, and then merges no segment
+        tiles_per_segment = tl.maximum(cdiv_fn(seq_len, num_segments * TILE_SIZE), 1)
         # create masks for subsequent loads
         act_num_segments = cdiv_fn(seq_len, tiles_per_segment * TILE_SIZE)
     single_tile: tl.constexpr = (
@@ -1225,15 +1227,16 @@ def reduce_segments(
         # slot-major partials (see kernel_unified_attention_3d), merged a block of
         # used slots at a time, so the cost follows the split, not the slot count
         segm_row = query_token_idx.to(tl.int64) * num_query_heads + query_head_idx
-        slot_stride = tl.num_programs(0).to(tl.int64) * num_query_heads
         offs_s = tl.arange(0, LENGTH_AWARE_SEGMENT_BLOCK)
+        # the 3D kernel writes at most NUM_SEGMENTS_PER_SEQ slots
+        act_num_segments = tl.minimum(act_num_segments, NUM_SEGMENTS_PER_SEQ)
         overall_max = float("-inf")
         overall_expsum = 0.0
         acc_sum = tl.zeros([D_TILE], dtype=tl.float32)
         for s0 in range(0, act_num_segments, LENGTH_AWARE_SEGMENT_BLOCK):
             segs = s0 + offs_s
             segm_mask = segs < act_num_segments
-            segm_offset = segs.to(tl.int64) * slot_stride + segm_row
+            segm_offset = segs.to(tl.int64) * num_tokens * num_query_heads + segm_row
             segm_max = tl.load(
                 segm_max_ptr + segm_offset, mask=segm_mask, other=float("-inf")
             )

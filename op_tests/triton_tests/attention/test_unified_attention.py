@@ -390,12 +390,16 @@ def _assert_request_rel_l2(output, ref_output, seq_lens, bound=2e-2):
 
     Long-KV outputs are small, so a fixed atol would pass all-zero rows.
     gfx950 measures ~0.0025; one dropped 64-token KV tile gives ~0.06.
+    A zero-length request (a padded slot) must give zero rows.
     """
     start = 0
     for q_len, kv_len in seq_lens:
         out_rows = output[start : start + q_len].float()
         ref_rows = ref_output[start : start + q_len].float()
         start += q_len
+        if kv_len == 0:
+            assert torch.equal(out_rows, torch.zeros_like(out_rows)), "kv_len 0"
+            continue
         rel_err = ((out_rows - ref_rows).norm() / ref_rows.norm()).item()
         assert rel_err < bound, f"kv_len {kv_len}: relative L2 error {rel_err:.4f}"
 
@@ -653,13 +657,16 @@ def test_triton_unified_attn_3d_long_kv(captured_max_seqlen_k: bool) -> None:
 
 
 def _length_aware_seq_lens(batch: str, query_len: int):
-    if batch in ("skewed", "skewed_300"):
+    if batch in ("skewed", "skewed_300", "skewed_empty"):
         # one long request among short ones, as a long-context draft batch; 300
         # requests take more than one step over seq_lens in the kernels
         rng = random.Random(7)
         short = [
-            rng.randint(200, 3000) for _ in range(31 if batch == "skewed" else 299)
+            rng.randint(200, 3000) for _ in range(299 if batch == "skewed_300" else 31)
         ]
+        if batch == "skewed_empty":
+            # padded slots of a CUDA graph batch have no KV
+            short = [0 if i % 8 == 0 else kv for i, kv in enumerate(short)]
         return [(query_len, 120_000)] + [(query_len, kv) for kv in short]
     return [(query_len, 8192)] * 32
 
@@ -673,7 +680,7 @@ def _length_aware_seq_lens(batch: str, query_len: int):
             ((8, 2), 1, False),
             ((8, 1), 1, True),  # GPT-OSS TP8 full-attention decode
         ]
-        for batch in ["skewed", "uniform"]
+        for batch in ["skewed", "uniform", "skewed_empty"]
     ]
     + [("skewed_300", (8, 2), 1, False, torch.int32)]
     # the widest verify query that still fits one block of the q >= 4 entry
@@ -745,6 +752,7 @@ def test_triton_unified_attn_3d_length_aware_split(
 
     monkeypatch.setattr(module, "_unified_attention_3d_triton", spy)
 
+    output.fill_(float("nan"))  # the reduce must write every row
     unified_attention(
         q=query,
         k=key_cache,
@@ -803,14 +811,19 @@ def test_triton_unified_attn_3d_length_aware_split_graph_replay() -> None:
     """A CUDA graph captured at the 1M bound splits by the seqused_k of each replay.
 
     A serving engine changes the lengths in place between replays, from a skewed
-    batch to a uniform one and back.
+    batch to a uniform one, to one with padded (zero-length) slots, and back.
     """
     if DEVICE_ARCH != "gfx950":
         pytest.skip("the length-aware kv_split entry is tuned for gfx950")
     torch.cuda.empty_cache()
     block_size, query_len = 128, 4
     skewed = _length_aware_seq_lens("skewed", query_len)
-    batches = [skewed, _length_aware_seq_lens("uniform", query_len), skewed]
+    batches = [
+        skewed,
+        _length_aware_seq_lens("uniform", query_len),
+        _length_aware_seq_lens("skewed_empty", query_len),
+        skewed,
+    ]
     max_blocks = max(triton.cdiv(kv, block_size) for b in batches for _, kv in b)
     (
         query,
@@ -876,7 +889,7 @@ def test_triton_unified_attn_3d_length_aware_split_graph_replay() -> None:
     for batch in batches:
         kv = [k for _, k in batch]
         kv_lens.copy_(torch.tensor(kv, dtype=kv_lens.dtype, device="cuda"))
-        output.zero_()
+        output.fill_(float("nan"))
         graph.replay()
         ref_output = ref_paged_attn(
             query=query,

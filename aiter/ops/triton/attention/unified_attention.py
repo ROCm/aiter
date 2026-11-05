@@ -877,6 +877,7 @@ def _reduce_segments_triton(
                 NUM_SEGMENTS,
                 max(split_segment_block_min, triton.next_power_of_2(even_share)),
             ),
+            "num_tokens": params.num_tokens,
         }
     v_head_size_padded = triton.next_power_of_2(params.head_size_v)
     num_d_blocks = triton.cdiv(
