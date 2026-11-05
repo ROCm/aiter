@@ -322,16 +322,16 @@ def _moe_prepare_unsorted_input(
     return topk_ids_i32, topk_weights_f32, topk_ids_i32, num_valid_ids, moe_buf
 
 
-def _atomic_moe_buf_output(output):
-    """Return ``output`` if it can stand in for the atomic moe_buf, else None.
+def _kernel_output(output):
+    """Return ``output`` if the MoE kernels may write it in place, else None.
 
-    Atomic GEMM2 accumulates with 4-byte atomics, so a buffer at an odd bf16
-    element faults the GPU queue; the caller then gets a fresh moe_buf and
-    _return_output copies back. The sorts zero moe_buf with 16-byte vector stores,
-    which need no more than that: on MI355X 4-, 8- and 12-byte-aligned outputs
-    run in place on the adaptive, Opus and aux-Opus sorts.
+    The kernels that write the caller's buffer cast it to a 16-byte vector type:
+    the CK, Opus, FlyDSL and adaptive sorts and the a4w4 stage1 zero moe_buf
+    with int4/dwordx4 stores, and the reduce epilogues store 16 bytes per lane.
+    Atomic GEMM2 adds 4-byte atomics, which fault at an odd bf16 element. Any
+    other buffer is replaced by a fresh one, and _return_output copies back.
     """
-    return None if output is None or output.data_ptr() % 4 else output
+    return None if output is None or output.data_ptr() % 16 else output
 
 
 def _adaptive_moe_sort(
@@ -349,7 +349,6 @@ def _adaptive_moe_sort(
     output=None,
     num_local_tokens=None,
 ):
-    output = _atomic_moe_buf_output(output)
     device = topk_ids.device
     M = topk_ids.shape[0]
     BM = block_size
@@ -421,12 +420,11 @@ def _adaptive_moe_sort(
 #
 #     path                                      in-place?  why?
 #     opus / ck / flydsl sort + accumulate      yes        sort kernel zeroes what it is handed
-#     ... + output not 4-byte aligned           no         atomic GEMM2 uses 4-byte atomics
-#     opus / ck / flydsl sort + reduce (non-EP) yes        buffer is born in fused_moe_2stages
+#     ... + reduce mode (non-EP)                yes        buffer is born in fused_moe_2stages
 #     FLAT 1stage (tuned flat=1/2)              no         kernel needs 8 spare bytes past the rows
 #     adaptive-aux sort (a4w4, atomic)          yes        output is the atomic moe_buf
-#     ... + output not 4-byte aligned           no         atomic GEMM2 uses 4-byte atomics
 #     grouped a4w4/a8w4 (gfx1250)               no         callee has no out param
+#     any path, output not 16-byte aligned      no         kernels store it as 16-byte vectors
 #
 # Not in-place => _return_output copies, so the contract holds either way;
 # only the saving is lost.
@@ -731,7 +729,6 @@ def _moe_sorting_impl(
     #    output_aux scatter, which writes every output row itself): caller owns
     #    the intermediate; allocate a placeholder here.
     # A caller buffer can stand in: the sort kernel zeroes what it is handed.
-    output = _atomic_moe_buf_output(output)
     if accumulate or (expert_mask is not None and not output_aux):
         moe_buf = (
             output
@@ -842,8 +839,7 @@ def _flydsl_moe_sorting(
     # stage2 reduce mode. The kernel no-ops its zero pass on an empty buffer
     # (moe_buf_elems == 0), so reduce mode skips zeroing the [M, model_dim]
     # buffer entirely — the caller owns the [M, topk, model_dim] intermediate.
-    # As in _moe_sorting_impl, a caller buffer can stand in if 4-byte aligned.
-    output = _atomic_moe_buf_output(output)
+    # As in _moe_sorting_impl, a caller buffer can stand in.
     if (expert_mask is not None) or accumulate:
         moe_buf = (
             output
@@ -900,6 +896,8 @@ def moe_sorting(
     accumulate=True,
     flat: AsmMoeMode | int = AsmMoeMode.SORTED,
     output_aux=False,
+    # [M, model_dim] buffer to use as moe_buf. The kernels store it as 16-byte
+    # vectors, so it must be 16-byte aligned; fused_moe passes _kernel_output's.
     output=None,
 ):
     asm_mode = AsmMoeMode(flat)
@@ -1670,7 +1668,9 @@ def _fused_moe_impl(
     _validate_output_buffer_metadata(
         output, (M, model_dim), dtype, hidden_states.device
     )
-    # Skip building the inputs when there is no output.
+    # The paths below hand the kernels kernel_output, which is output unless its
+    # alignment rules it out (then _return_output copies their result over).
+    kernel_output = None
     if output is not None:
         _validate_output_buffer_no_overlap(
             output,
@@ -1692,6 +1692,7 @@ def _fused_moe_impl(
             # FHMoE passes its shared-expert weights and scales through these.
             (_stage1_extra_args, _stage2_extra_args),
         )
+        kernel_output = _kernel_output(output)
     if herd_topk:
         from aiter.ops.flydsl.grouped_moe_gfx1250 import (
             _FUSED_ROUTE_PSUM_MAX_EXPERTS,
@@ -1769,7 +1770,7 @@ def _fused_moe_impl(
             stage2_scatter=stage2_scatter,
             herd_topk=herd_topk,
             herd_routed_scaling_factor=herd_routed_scaling_factor,
-            output=output,
+            output=kernel_output,
         )
 
     if grouped_a8w4_out is not None:
@@ -2074,7 +2075,7 @@ def _fused_moe_impl(
             None,
             None,
             accumulate=not runtime_stage2_reduce,
-            output=output,
+            output=kernel_output,
             herd_topk=herd_topk,
             herd_routed_scaling_factor=herd_routed_scaling_factor,
         )
@@ -2108,7 +2109,7 @@ def _fused_moe_impl(
             return_local_topk_ids=need_local_topk_ids,
             accumulate=_atomic and not runtime_stage2_reduce,
             output_aux=metadata.output_aux,
-            output=output,
+            output=kernel_output,
         )
         (
             sorted_ids,
@@ -2143,7 +2144,7 @@ def _fused_moe_impl(
         )
         local_topk_ids = None
     else:
-        sort_output = output if asm_mode.requires_host_sort else None
+        sort_output = kernel_output if asm_mode.requires_host_sort else None
         if asm_mode is AsmMoeMode.POST_REDUCE:
             # The reducer overwrites the final output, including masked rows.
             # An empty buffer also suppresses the sort's EP zero-fill.
@@ -2180,8 +2181,8 @@ def _fused_moe_impl(
             local_topk_ids = None
         if asm_mode is AsmMoeMode.POST_REDUCE:
             moe_buf = (
-                output
-                if output is not None
+                kernel_output
+                if kernel_output is not None
                 else torch.empty((M, model_dim), dtype=dtype, device=topk_ids.device)
             )
     _opus_a8w4.check_route_bucket_metadata(metadata, sorted_expert_ids, logger)
@@ -2262,7 +2263,7 @@ def _fused_moe_impl(
             _metadata_config_file=_metadata_config_file,
             _stage1_extra_args=_stage1_extra_args,
             _stage2_extra_args=_stage2_extra_args,
-            output=output,
+            output=kernel_output,
             _stage2_override=_stage2_override,
             routing_num_experts=global_E,
             prequantized_a1=prequantized_a1,

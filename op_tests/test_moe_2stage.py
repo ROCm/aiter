@@ -1562,11 +1562,11 @@ def test_adaptive_sort_output_in_place():
     """The a4w4 adaptive aux sort accumulates straight into the caller's output.
 
     Kimi-K3 A4W4 TP=8. test_fmoe hands fused_moe a NaN-filled output buffer and
-    checks it against the torch reference; here we also check that the buffer
-    reached the adaptive sort as its atomic moe_buf and was never copied into.
-    A buffer starting 2 bytes into its allocation is too underaligned for the
-    4-byte atomics of GEMM2, so it must take a fresh moe_buf and be copied into;
-    one starting 4 bytes in is aligned enough and stays in place.
+    checks it against the torch reference; here we also check that the adaptive
+    sort returned that buffer as its atomic moe_buf and it was never copied into.
+    The sort zeroes moe_buf with 16-byte stores, so a buffer starting 2 or 4
+    bytes into its allocation must take a fresh moe_buf and be copied into; one
+    starting 16 bytes in stays in place.
     """
     global AITER_MOE_NUM_EXPERT_ACTIVATED
     fm = aiter.fused_moe
@@ -1576,11 +1576,14 @@ def test_adaptive_sort_output_in_place():
     real_backend = fm._MOE_SORT_BACKEND
     # The parsed override can exceed token * topk at M=1 and make test_fmoe raise.
     real_n_act = AITER_MOE_NUM_EXPERT_ACTIVATED
-    adaptive_calls, copies = [], []
+    # One entry per adaptive sort: whether its moe_buf is the buffer it was handed.
+    in_place, copies = [], []
 
     def tracking_adaptive(*a, **kw):
-        adaptive_calls.append(kw.get("output") is not None)
-        return real_adaptive(*a, **kw)
+        ret = real_adaptive(*a, **kw)
+        output = kw.get("output")
+        in_place.append(output is not None and ret[4] is output)
+        return ret
 
     def tracking_return(ret, output):
         if output is not None and ret is not output:
@@ -1601,9 +1604,9 @@ def test_adaptive_sort_output_in_place():
         with override_env("AITER_SITUV2_A8W4", None), override_env(
             "AITER_SITUV2_A4W4", "1"
         ):
-            # output_offset is in bf16 elements: 1 is 2 bytes, 2 is 4 bytes.
-            for token, output_offset in ((1, 0), (4, 0), (1, 1), (1, 2)):
-                adaptive_calls.clear()
+            # output_offset is in bf16 elements: 1, 2 and 8 are 2, 4 and 16 bytes.
+            for token, output_offset in ((1, 0), (4, 0), (1, 1), (1, 2), (1, 8)):
+                in_place.clear()
                 copies.clear()
                 rows.append(
                     test_fmoe(
@@ -1623,13 +1626,14 @@ def test_adaptive_sort_output_in_place():
                         output_offset=output_offset,
                     )
                 )
-                assert (
-                    True in adaptive_calls
-                ), f"token={token}: output never reached the adaptive sort"
-                if output_offset % 2:
-                    assert copies, f"token={token}: underaligned output used in place"
+                case = f"token={token} output_offset={output_offset}"
+                assert in_place, f"{case}: the adaptive sort did not run"
+                if output_offset % 8:
+                    assert copies, f"{case}: underaligned output not copied into"
+                    assert not any(in_place), f"{case}: underaligned output in place"
                 else:
-                    assert not copies, f"token={token}: output was copied into"
+                    assert any(in_place), f"{case}: output is not the sort's moe_buf"
+                    assert not copies, f"{case}: output was copied into"
                 gc.collect()
                 torch.cuda.empty_cache()
     finally:
@@ -1721,17 +1725,50 @@ def test_output_buffer_contract():
     pool = torch.zeros((2 * token, model_dim), dtype=dtype)
     pool[:token] = hidden
     assert torch.equal(fused_moe(pool[:token], *args[1:], output=pool[token:]), ref)
-    # A view one bf16 element into its allocation is only 2-byte aligned, which
-    # the atomic GEMM2 cannot accumulate into (it faulted the GPU queue): such a
-    # buffer is still filled, through a fresh one and a copy.
+    # A view 1 or 2 bf16 elements into its allocation is only 2- or 4-byte
+    # aligned. The kernels store output as 16-byte vectors (and atomic GEMM2
+    # faulted the GPU queue on the 2-byte one), so such a buffer is filled through
+    # a fresh one and a copy, and one 8 elements (16 bytes) in is used in place.
+    # fused_moe_2stages, which writes output= itself in reduce mode, must see the
+    # same choice.
+    fm = aiter.fused_moe
+    real_return = fm._return_output
+    real_2stages = fm.fused_moe_2stages
+    copies, stage_outputs = [], []
+
+    def tracking_return(ret, output):
+        copies.append(ret is not output)
+        return real_return(ret, output)
+
+    def tracking_2stages(*a, **kw):
+        stage_outputs.append(kw.get("output"))
+        return real_2stages(*a, **kw)
+
+    for offset in (1, 2, 8):
+        offset_pool = torch.full(
+            (token * model_dim + offset,), float("nan"), dtype=dtype
+        )
+        buf = offset_pool[offset:].view(token, model_dim)
+        copies.clear()
+        stage_outputs.clear()
+        try:
+            fm._return_output = tracking_return
+            fm.fused_moe_2stages = tracking_2stages
+            assert fused_moe(*args, output=buf) is buf, f"{offset=}: buf not returned"
+        finally:
+            fm._return_output = real_return
+            fm.fused_moe_2stages = real_2stages
+        assert torch.equal(buf, ref), f"{offset=}: buf does not hold the result"
+        aligned = offset % 8 == 0
+        assert copies == [not aligned], f"{offset=}: copied into: {copies}"
+        assert len(stage_outputs) == 1 and stage_outputs[0] is (
+            buf if aligned else None
+        ), f"{offset=}: fused_moe_2stages got the wrong output"
+    # The same through the FlyDSL sort (AITER_USE_FLYDSL_MOE_SORTING=1), whose
+    # launcher raised on a 2-byte-aligned buffer. AITER_USE_CK_MOE_SORTING=1
+    # would take precedence, so it is forced off here too.
     odd_pool = torch.full((token * model_dim + 1,), float("nan"), dtype=dtype)
     odd = odd_pool[1:].view(token, model_dim)
-    assert fused_moe(*args, output=odd) is odd, "2-byte-aligned output not returned"
-    assert torch.equal(odd, ref), "2-byte-aligned output does not hold the result"
-    # The same through the FlyDSL sort (AITER_USE_FLYDSL_MOE_SORTING=1), whose
-    # launcher raised on such a buffer. AITER_USE_CK_MOE_SORTING=1 would take
-    # precedence, so it is forced off here too.
-    fm = aiter.fused_moe
     real_use_ck = fm._USE_CK_MOE_SORTING
     real_use_flydsl = fm._USE_FLYDSL_MOE_SORTING
     real_flydsl_sort = fm._flydsl_moe_sorting
@@ -1990,7 +2027,7 @@ test_route_workspace_token_capacity()
 if args.bm16_scale_boundary:
     test_bm16_tiled_scale_boundary()
 else:
-    # Kimi-K3 weights at three batch sizes; skip it for an explicit CLI quant
+    # Kimi-K3 weights at two batch sizes; skip it for an explicit CLI quant
     # sweep, like the tuned-CSV validation below.
     if args.quant is not None:
         aiter.logger.info("skipping adaptive-sort in-place output test for --quant")
