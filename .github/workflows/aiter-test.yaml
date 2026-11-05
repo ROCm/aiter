@@ -503,7 +503,9 @@ jobs:
           import json
           import os
 
-          runners = [("linux-aiter-mi35x-1", "MI35X")]
+          # Test AMD Container Toolkit via amd-container-runtime on the
+          # dedicated host-Docker runner.
+          runners = [("linux-aiter-mi35x-1-toolkit-test", "MI35X")]
           if os.environ["GITHUB_REF"] == "refs/heads/main":
               runners.append(("linux-aiter-oci-mi300x-1", "MI300X"))
 
@@ -770,21 +772,54 @@ jobs:
           echo "Docker login failed after 3 attempts, continuing anyway"
           exit 0
 
+      - name: Show AMD runtime GPU setup
+        if: ${{ startsWith(runner.name, 'linux-aiter-mi35x-1-toolkit-test-') }}
+        run: |
+          set -euxo pipefail
+
+          echo "=== Runner ==="
+          echo "RUNNER_NAME=${RUNNER_NAME:-}"
+          hostname -f 2>/dev/null || hostname
+
+          echo "=== Host Docker runtimes ==="
+          docker info --format 'ServerVersion={{.ServerVersion}} DefaultRuntime={{.DefaultRuntime}} Runtimes={{json .Runtimes}}'
+
+          echo "=== AMD Container Toolkit ==="
+          if command -v amd-ctk >/dev/null 2>&1; then
+            amd-ctk version
+            amd-ctk gpu list
+            amd-ctk cdi list
+          else
+            echo "amd-ctk is not installed in the runner container; host Docker runtime is checked via docker info above."
+          fi
+
+          echo "=== Host GPU visibility ==="
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi version || true
+            amd-smi list
+          else
+            echo "amd-smi is not installed in the runner container."
+          fi
+
       - name: Run the container
         run: |
           set -ex
           echo "Starting container: aiter_test"
 
-          if [ -f "/etc/podinfo/gha-render-devices" ]; then
+          if [[ "${RUNNER_NAME:-}" == linux-aiter-mi35x-1-toolkit-test* ]]; then
+            GPU_DOCKER_FLAGS="--runtime=amd -e AMD_VISIBLE_DEVICES=all"
+          elif [ -f "/etc/podinfo/gha-render-devices" ]; then
             DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
+            GPU_DOCKER_FLAGS="--device=/dev/kfd $DEVICE_FLAG"
           else
             DEVICE_FLAG="--device /dev/dri"
+            GPU_DOCKER_FLAGS="--device=/dev/kfd $DEVICE_FLAG"
           fi
 
           IMAGE_TAG=${{ env.DOCKER_IMAGE }}
 
           docker run -dt \
-          --device=/dev/kfd $DEVICE_FLAG \
+          $GPU_DOCKER_FLAGS \
           --shm-size=16G \
           --network=host \
           --group-add $(getent group render | cut -d: -f3) \
@@ -795,6 +830,31 @@ jobs:
           -w /workspace \
           --name aiter_test \
           $IMAGE_TAG
+
+      - name: Show AMD runtime container GPU injection
+        if: ${{ startsWith(runner.name, 'linux-aiter-mi35x-1-toolkit-test-') }}
+        run: |
+          set -euxo pipefail
+
+          echo "=== Docker inspect: runtime and env ==="
+          docker inspect \
+            --format 'Runtime={{.HostConfig.Runtime}} Devices={{json .HostConfig.Devices}} Env={{json .Config.Env}}' \
+            aiter_test
+
+          echo "=== Container device nodes ==="
+          docker exec aiter_test bash -lc 'ls -l /dev/kfd /dev/dri || true'
+
+          echo "=== Container AMD GPU visibility ==="
+          docker exec aiter_test bash -lc '
+            if command -v amd-smi >/dev/null 2>&1; then
+              amd-smi version || true
+              amd-smi list
+            else
+              echo "amd-smi not found in test container"
+            fi
+
+            python3 -c "import torch; count=torch.cuda.device_count(); print(f\"torch.cuda.is_available={torch.cuda.is_available()}\"); print(f\"torch.cuda.device_count={count}\"); [print(f\"torch.cuda.device[{idx}]={torch.cuda.get_device_name(idx)}\") for idx in range(count)]; raise SystemExit(\"No HIP devices visible through torch\") if count < 1 else None"
+          '
 
       - name: Check GPU visibility
         run: |
@@ -992,7 +1052,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
           missing=0
-          runners=(linux-aiter-mi35x-1)
+          runners=(linux-aiter-mi35x-1-toolkit-test)
           if [ "${GITHUB_REF}" = "refs/heads/main" ]; then
             runners+=(linux-aiter-oci-mi300x-1)
           fi
@@ -1307,7 +1367,7 @@ jobs:
         timeout-minutes: 15
         continue-on-error: true
         with:
-          pattern: standard-test-log-linux-aiter-mi35x-1-shard-*
+          pattern: standard-test-log-linux-aiter-mi35x-1-toolkit-test-shard-*
           path: /tmp/logs/
 
       - name: Locate current tuned_op_bench.csv
