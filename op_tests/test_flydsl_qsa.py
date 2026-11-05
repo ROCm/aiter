@@ -917,6 +917,61 @@ def test_compact_selector_keeps_column_order():
         raise AssertionError(f"compact selector column order mismatch, err={err}")
 
 
+def test_compact_selector_global_fallback_keeps_column_order():
+    """A wide tie past the compact limit stays on the full-row passes.
+
+    compact=True, one row wider than 20000, about 100 strictly larger
+    scores, and more than 4096 equal scores in the next bucket. The
+    candidate count is first_above plus that bucket, so it is past
+    4096 and the selector must take the global fallback. The selected
+    columns stay in column order, same reference as the compact path.
+    """
+    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
+        return
+    width = 32_768
+    rows = 1
+    device = torch.device("cuda")
+    scores = torch.zeros(rows, width, dtype=dtypes.fp32, device=device)
+    equal_cols = torch.arange(0, 5000 * 4, 4, device=device)
+    large_cols = torch.arange(20_000, 20_000 + 100 * 16, 16, device=device)
+    scores[0, equal_cols] = 1
+    scores[0, large_cols] = 2
+    order = torch.argsort(scores, dim=-1, descending=True, stable=True)
+    expect = order[:, :_K].sort(dim=-1).values.to(dtypes.i32)
+    indices = torch.full((rows, _K), -1, dtype=dtypes.i32, device=device)
+    row_lens = torch.full((rows,), width, dtype=dtypes.i32, device=device)
+    _run_compiled(
+        build_topk_per_row_decode_one_workgroup_module(
+            _K,
+            wave_size=get_warp_size(get_gfx()),
+            write_values=False,
+            compact=True,
+        ),
+        scores,
+        row_lens,
+        row_lens,
+        indices,
+        scores,
+        width,
+        1,
+        int(scores.stride(0)),
+        rows,
+        torch.cuda.current_stream(device),
+    )
+    torch.cuda.synchronize()
+    err = checkAllclose(
+        expect.to(dtypes.fp32),
+        indices.to(dtypes.fp32),
+        rtol=0,
+        atol=0,
+        msg="compact selector global fallback",
+    )
+    if err != 0:
+        raise AssertionError(
+            f"compact selector global fallback column order mismatch, err={err}"
+        )
+
+
 def test_incomplete_blocks_not_selected():
     r = 4
     q = torch.tensor([[[1.0, 0.0]]])
