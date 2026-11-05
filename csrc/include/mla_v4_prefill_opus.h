@@ -454,19 +454,72 @@ struct opus_mla_v4_prefill_a8w8_16mx1_16nx4_traits
     static constexpr int VEC_KV_NOPE = 16;
     static constexpr int VEC_KV_ROPE = 8;
     static constexpr int VEC_P    = 4;
-    static constexpr int VEC_TR_V = 4;
     static constexpr int VEC_O    = 4;
 
-    // Per-token row stride for the bf16 KV tile staged in LDS.
+#if defined(OPUS_MLA_V4_FP8_PV) || defined(OPUS_MLA_V4_DMA)
+    // V and P are staged in LDS as flat fp8 and P*V runs on the fp8 MFMA.
+    using D_V  = D_NOPE_;  // LDS V tile
+    using D_P  = D_NOPE_;  // cross-wave P exchange
+    using D_PV = D_NOPE_;  // P*V MFMA operands
+    // P <= 1 after the online-softmax max subtraction, so one constant exponent
+    // packs it into e4m3's range. Any gain up to 2^8 measures identical (a
+    // power-of-two scale only moves the underflow floor); 2^2 leaves headroom
+    // under the 448 limit should the running max ever be stale. Folded into
+    // the exp2 argument, so l_row carries it too and it cancels in O/l -- only
+    // the sink term has to be scaled to match.
+    static constexpr int P_PACK_LOG2 = 2;
+#elif defined(OPUS_MLA_V4_FP8_V_ONLY)
+    // Isolation build: fp8 V tile read back with ds_read_b64_tr_b8, converted
+    // to bf16 immediately after the read so P and the P*V MFMA stay exactly as
+    // they are. Exercises the new transposed-read layout and nothing else.
+    using D_V  = D_NOPE_;
+    using D_P  = D_ROPE_;
+    using D_PV = D_ROPE_;
+    static constexpr int P_PACK_LOG2 = 0;
+#else
+    using D_V  = D_ROPE_;
+    using D_P  = D_ROPE_;
+    using D_PV = D_ROPE_;
+    static constexpr int P_PACK_LOG2 = 0;
+#endif
+    // DS_READ_B64_TR moves 8 bytes/lane whatever the element width, so an fp8
+    // tile yields 8 elements per instruction instead of 4. LANE_LO_V halves to
+    // keep make_layout_rv's grp_n = W_N / (LANE_LO_V * VEC_TR_V) equal to 1.
+    static constexpr bool V_IS_FP8 = (sizeof(D_V) == 1);
+    static constexpr int VEC_TR_V  = V_IS_FP8 ? 8 : 4;
+    static constexpr int LANE_LO_V = V_IS_FP8 ? 2 : 4;
+    // Flat exponent the per-32-element MX block scales are collapsed onto for V.
+    // Tunable: the only knob trading V's dynamic range against underflow.
+    static constexpr int V_SCALE_LOG2 = 0;
+
+    // Per-token row stride for the KV tile staged in LDS, in D_V elements.
     static constexpr int SMEM_KV_PAD = 8;
     static constexpr int SMEM_KV_ROW = D_HEAD_SIZE + SMEM_KV_PAD;
 
-    // Shared memory: kernel uses three static buffers (KV tile, m/l, P).
+#if defined(OPUS_MLA_V4_DMA)
+    // DMA-staged tile. global_load_lds writes one wave-uniform, lane-contiguous
+    // 64 x 16 B = 1024 B block per instruction (M0 + lane*16), so the tile is a
+    // sequence of such chunks, each holding 8 rows x 128 B of one D slice, plus
+    // 32 B of padding so successive chunks start on different banks.
+    static constexpr int DMA_CHUNK_STRIDE = WARP_SIZE * 16 + 32;            // 1056
+    static constexpr int DMA_ROWS_PER_CHUNK = 8;
+    static constexpr int DMA_D_SLICES = D_NOPE_PADDED_SIZE / 128;           // 4
+    static constexpr int DMA_HALVES = KV_TILE_SIZE / (DMA_ROWS_PER_CHUNK * NUM_WARPS); // 2
+    static constexpr int SMEM_KV_BYTES = DMA_HALVES * DMA_D_SLICES * NUM_WARPS * DMA_CHUNK_STRIDE;
+    // Tile n+1 streams into one buffer while tile n is read from the other.
+    // 2 x 33 KB keeps two workgroups per CU inside 160 KB.
+    static constexpr int DMA_BUFFERS = 2;
+#else
+    static constexpr int SMEM_KV_BYTES = KV_TILE_SIZE * SMEM_KV_ROW * sizeof(D_V);
+    static constexpr int DMA_BUFFERS = 1;
+#endif
+
+    // Shared memory: kernel uses three static buffers (KV tiles, m/l, P).
     static constexpr size_t smem_size_bytes()
     {
-        return KV_TILE_SIZE * SMEM_KV_ROW * sizeof(D_ROPE)
+        return DMA_BUFFERS * SMEM_KV_BYTES
              + 2 * T_N * W_M * sizeof(D_ACC)
-             + T_N * W_M * W_N * sizeof(D_ROPE);
+             + T_N * W_M * W_N * sizeof(D_P);
     }
 };
 
@@ -2855,6 +2908,11 @@ __device__ void mla_v4_prefill_accum_le2_tiles(
         constexpr int mxscl_chunk = T::D_NOPE_SIZE / T::D_128B_NOPE_SIZE;
         constexpr int mxscl_col   = T::D_NOPE_SIZE % T::D_128B_NOPE_SIZE;
         auto v_k_mxscl = load<1>(s_k_nope, u_rk_mxscl + mxscl_col + sk_nope_slice(number<mxscl_chunk>{}));
+#if defined(OPUS_MLA_V4_DMA)
+        // Folded cache format: the KV scale is a unit 2^0 and the trailer bytes
+        // now hold RoPE, so the scale is materialised rather than read.
+        static_for<vector_traits<decltype(v_k_mxscl)>::size()>([&](auto i) { v_k_mxscl[i.value] = static_cast<D_NOPE>(127); });
+#endif
         v_k_mxscl[3] = (lane_id >= 32) ? static_cast<D_NOPE>(0) : v_k_mxscl[3];
         v_k_mxscl[7] = (lane_id >= 32) ? static_cast<D_NOPE>(0) : v_k_mxscl[7];
         v_k_nope[0] = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope);
@@ -3016,6 +3074,11 @@ __device__ void mla_v4_prefill_accum_pipelined(
 
     auto load_mxscl = [&](auto slot_off) {
         auto v_mxscl = load<1>(s_k_nope, u_rk_mxscl + mxscl_col + sk_nope_slice(number<mxscl_chunk>{}) + slot_off);
+#if defined(OPUS_MLA_V4_DMA)
+        // Folded cache format: the KV scale is a unit 2^0 and the trailer bytes
+        // now hold RoPE, so the scale is materialised rather than read.
+        static_for<vector_traits<decltype(v_mxscl)>::size()>([&](auto i) { v_mxscl[i.value] = static_cast<D_NOPE>(127); });
+#endif
         if (lane_id >= 32) {
             v_mxscl[3] = static_cast<D_NOPE>(0);
             v_mxscl[7] = static_cast<D_NOPE>(0);
@@ -3881,7 +3944,7 @@ __device__ inline auto make_layout_sk_rope(int warp_id, int lane_id) {
 template<class T>
 __device__ inline auto make_layout_rv(int warp_id, int lane_id) {
     constexpr int lane_per_grp = 16;
-    constexpr int lane_lo = 4;
+    constexpr int lane_lo = T::LANE_LO_V;
     constexpr int lane_hi = lane_per_grp / lane_lo;
 
     constexpr int num_grps = T::WARP_SIZE / lane_per_grp;
@@ -4124,8 +4187,10 @@ __device__ void mla_v4_prefill_accum_pipelined(
     // Cross-warp reduction / P-exchange scratch (m & l in fp32, P broadcast in bf16).
     auto s_m = make_smem(reinterpret_cast<D_ACC*>(smem_ml));
     auto s_l = make_smem(reinterpret_cast<D_ACC*>(smem_ml) + T::T_N * T::W_M);
-    auto s_p = make_smem(reinterpret_cast<D_ROPE*>(smem_p));
-    auto s_kv = make_smem(reinterpret_cast<D_ROPE*>(smem_kv));
+    using D_V = typename T::D_V;
+    using D_P = typename T::D_P;
+    auto s_p = make_smem(reinterpret_cast<D_P*>(smem_p));
+    auto s_kv = make_smem(reinterpret_cast<D_V*>(smem_kv));
 
     // Tiled MMA operators: NoPE QK^T (MXFP8), RoPE QK^T (bf16), PV (bf16).
     auto mma0_nope = make_tiled_mma<D_NOPE, D_NOPE, D_ACC>(
@@ -4138,7 +4203,8 @@ __device__ void mla_v4_prefill_accum_pipelined(
         seq<T::T_M, T::T_N, T::T_K>{},
         seq<T::W_M, T::W_N, T::W_K_ROPE>{},
         mfma_adaptor_swap_ab{});
-    auto mma1 = make_tiled_mma<D_ROPE, D_ROPE, D_ACC>(
+    using D_PV = typename T::D_PV;
+    auto mma1 = make_tiled_mma<D_PV, D_PV, D_ACC>(
         seq<T::GEMM1_E_M, T::GEMM1_E_N, T::GEMM1_E_K>{},
         seq<T::T_M, T::T_N, T::T_K>{},
         seq<T::W_M, T::W_N, T::W_K_ROPE>{},
@@ -4156,7 +4222,7 @@ __device__ void mla_v4_prefill_accum_pipelined(
     typename decltype(mma1)::vtype_b      v_v;
 
     constexpr index_t s_len = vector_traits<typename decltype(mma0_nope)::vtype_c>::size();
-    auto v_p_warps = reinterpret_cast<vector_t<D_ROPE, s_len>*>(&v_p);
+    auto v_p_warps = reinterpret_cast<vector_t<D_P, s_len>*>(&v_p);
 
     auto load_kv_page    = [&](int tile_idx) { return load(g_kv_indices, u_kv_indices, tile_idx * T::KV_TILE_SIZE)[0]; };
     auto kv_nope_offset  = [&](int token_idx) { return static_cast<int64_t>(token_idx) * kargs.stride_kv_nope_page; };
@@ -4213,34 +4279,241 @@ __device__ void mla_v4_prefill_accum_pipelined(
         // ──── GEMM0: S = Q·Kᵀ  (RoPE bf16) ────
         v_s = mma0_rope(v_q_rope, v_k_rope, v_s);
 
-        // ──── Stage bf16 KV into smem ────
+        // ──── Stage the V tile into smem ────
+#if defined(OPUS_MLA_V4_KV_PREBASED)
+        // The cache has been re-based upstream so its E8M0 scales depend only
+        // on the D block, with a unit exponent -- the stored fp8 *are* the real
+        // values. V therefore needs no conversion on the way to LDS, and P*V
+        // needs no scale: the dequantize/requantize pair below disappears
+        // entirely, along with the register staging it forced.
+        store<T::VEC_KV_NOPE>(
+            s_kv, reinterpret_cast<const vector_t<D_V, k_nope_vals>&>(v_k_nope), u_sk_nope);
+        {
+            // RoPE is still bf16 in the cache, so it keeps one convert.
+            using bf16x2_t = __attribute__((__vector_size__(2 * sizeof(short)))) short;
+            constexpr index_t k_rope_vals = vector_traits<decltype(v_k_rope)>::size();
+            vector_t<D_V, k_rope_vals> v_k_rope_fp8;
+            auto* dst = reinterpret_cast<u32_t*>(&v_k_rope_fp8);
+            auto* src = reinterpret_cast<const vector_t<D_ROPE, 2>*>(&v_k_rope);
+            static_for<k_rope_vals / 4>([&](auto d) {
+                bf16x2_t packed{};
+                packed = __builtin_amdgcn_cvt_scalef32_pk_fp8_bf16(
+                    packed, __builtin_bit_cast(bf16x2_t, src[d.value * 2 + 0]), 1.0f, false);
+                packed = __builtin_amdgcn_cvt_scalef32_pk_fp8_bf16(
+                    packed, __builtin_bit_cast(bf16x2_t, src[d.value * 2 + 1]), 1.0f, true);
+                dst[d.value] = __builtin_bit_cast(u32_t, packed);
+            });
+            store<T::VEC_KV_ROPE>(s_kv, v_k_rope_fp8, u_sk_rope + T::D_NOPE_SIZE);
+        }
+#elif defined(OPUS_MLA_V4_FP8_PV) || defined(OPUS_MLA_V4_FP8_V_ONLY)
+        constexpr float V_PACK = 1.0f / static_cast<float>(1 << T::V_SCALE_LOG2);
+        using bf16x2_t = __attribute__((__vector_size__(2 * sizeof(short)))) short;
+        auto pack_fp8 = [&](auto& dst_vec, const auto& src_vec, auto count) {
+            auto* dst = reinterpret_cast<u32_t*>(&dst_vec);
+            auto* src = reinterpret_cast<const vector_t<D_ROPE, 2>*>(&src_vec);
+            static_for<decltype(count)::value / 4>([&](auto d) {
+                bf16x2_t packed{};
+                packed = __builtin_amdgcn_cvt_scalef32_pk_fp8_bf16(
+                    packed, __builtin_bit_cast(bf16x2_t, src[d.value * 2 + 0]), V_PACK, false);
+                packed = __builtin_amdgcn_cvt_scalef32_pk_fp8_bf16(
+                    packed, __builtin_bit_cast(bf16x2_t, src[d.value * 2 + 1]), V_PACK, true);
+                dst[d.value] = __builtin_bit_cast(u32_t, packed);
+            });
+        };
+        constexpr index_t k_rope_vals = vector_traits<decltype(v_k_rope)>::size();
+        vector_t<D_V, k_nope_vals> v_k_nope_fp8;
+        vector_t<D_V, k_rope_vals> v_k_rope_fp8;
+        pack_fp8(v_k_nope_fp8, v_k_nope_bf16, number<k_nope_vals>{});
+        pack_fp8(v_k_rope_fp8, v_k_rope, number<k_rope_vals>{});
+        store<T::VEC_KV_NOPE>(s_kv, v_k_nope_fp8, u_sk_nope);
+        store<T::VEC_KV_ROPE>(s_kv, v_k_rope_fp8, u_sk_rope + T::D_NOPE_SIZE);
+#else
         store<T::VEC_KV_NOPE>(s_kv, v_k_nope_bf16, u_sk_nope);
         store<T::VEC_KV_ROPE>(s_kv, v_k_rope, u_sk_rope + T::D_NOPE_SIZE);
+#endif
 
         // ──── Cross-warp online softmax ────
         attn_mask_oob_score<T>(v_s, valid_kv_len, tile_idx, warp_id, lane_id);
         D_ACC row_max   = max(m_row, attn_row_max<T>(v_s, s_m, warp_id, lane_id) * temperature_scale);
         D_ACC rescale_m = __builtin_amdgcn_exp2f(m_row - row_max);
         m_row = row_max;
-        attn_row_scale_sub<T>(v_s, temperature_scale, row_max);
+        // Folding P_PACK_LOG2 into the exp2 argument scales P into e4m3's range
+        // for free. l_row picks up the same factor, so it cancels in O/l; only
+        // the sink term in the epilogue has to be scaled to match.
+        attn_row_scale_sub<T>(v_s, temperature_scale, row_max - D_ACC(T::P_PACK_LOG2));
         attn_exp2_slice<T, 0, s_len>(v_s);
         l_row *= rescale_m;
         l_row += attn_row_sum<T>(v_s, s_l, warp_id, lane_id);
         scale_output_tile<T>(v_o, rescale_m);
 
         // ──── Broadcast P across warps ────
-        auto v_p_seg = cast<D_ROPE>(v_s);
+#ifdef OPUS_MLA_V4_DUMP_V
+        // Debug: stamp every P element with the identity of the (warp, lane)
+        // that produced it, encoded as 2^(x/8)*(1+(x%8)/8) so it survives both
+        // bf16 and e4m3. After the gather each A-operand slot therefore names
+        // its source, which is what the P<->V K-order alignment needs.
+        if(tile_idx == 0 && block_id_x() == 0)
+        {
+            const int tag = warp_id * 16 + (lane_id % 16), te = tag / 8, tm = tag % 8;
+            const float tv = __builtin_amdgcn_exp2f((float)te) * (1.0f + (float)tm * 0.125f);
+            static_for<s_len>([&](auto i) { v_s[i.value] = tv; });
+        }
+#endif
+        auto v_p_seg = cast<D_P>(v_s);
         store<s_len>(s_p, v_p_seg, warp_id * T::W_M * T::W_N + lane_id * s_len);
         s_waitcnt_lgkmcnt(0_I);
         __builtin_amdgcn_s_barrier();
+#if defined(OPUS_MLA_V4_FP8_PV) || defined(OPUS_MLA_V4_FP8_V_ONLY)
+        // Derived from opus.hpp: mfma_adaptor_swap_ab issues mfma(B, A), so V
+        // is the hardware A operand and P is hardware B. B's fragment is
+        // [(grpn_b<p>), (rept_b<y>, grpk_b<p>, pack_b<y>)], i.e. lane L carries
+        // one head (n = L%16) and 8 KV (k = (L/16)*8 + slot) -- so each s_p
+        // entry is 4 KV, not 4 heads. tr_b8 hands P*V its K as 8-consecutive /
+        // stride-32 instead of tr_b16's 4-consecutive / stride-16, so slot
+        // i = 4w+j must carry KV = 32*(w/2) + 8*(L/16) + 4*(w%2) + j. P*V
+        // contracts over K, so relabelling P this way leaves the 33 KB V tile
+        // untouched; it is a gather offset change with no added traffic.
+        static_for<T::NUM_WARPS>([&](auto wv) {
+            constexpr int w = wv.value;
+            const int kv   = 32 * (w / 2) + 8 * (lane_id / 16) + 4 * (w % 2);
+            const int src_w = kv / 16, src_g = (kv % 16) / 4;
+            v_p_warps[w] = load<s_len>(
+                s_p, src_w * T::W_M * T::W_N + (src_g * 16 + (lane_id % 16)) * s_len);
+        });
+#else
         static_for<T::NUM_WARPS>([&](auto i) {
             v_p_warps[i.value] = load<s_len>(s_p, i.value * T::W_M * T::W_N + lane_id * s_len);
         });
+#endif
+#ifdef OPUS_MLA_V4_DUMP_V
+        if(tile_idx == 0 && block_id_x() == 0)
+        {
+            constexpr int NP = T::NUM_WARPS * s_len;
+            auto* dump = reinterpret_cast<typename T::D_OUT*>(kargs.out_ptr) + 32768;
+            auto* raw  = reinterpret_cast<const D_P*>(&v_p);
+            for(int i = 0; i < NP; ++i)
+            {
+                int tag;
+                if constexpr(sizeof(D_P) == 1)
+                {
+                    unsigned b = reinterpret_cast<const unsigned char*>(raw)[i];
+                    tag = (int)(((b >> 3) & 0xF) - 7) * 8 + (int)(b & 0x7);
+                }
+                else
+                {
+                    unsigned h = reinterpret_cast<const unsigned short*>(raw)[i];
+                    tag = (int)(((h >> 7) & 0xFF) - 127) * 8 + (int)((h >> 4) & 0x7);
+                }
+                dump[(warp_id * T::WARP_SIZE + lane_id) * NP + i] = (typename T::D_OUT)(float)tag;
+            }
+        }
+#endif
 
-        // ──── GEMM1: O = P·V  (bf16) ────
+        // ──── GEMM1: O = P·V ────
+#ifdef OPUS_MLA_V4_PAIRMAP
+        // Overwrite the staged tile so each KV row carries a value naming
+        // itself, before v_v is read, so the read below lands the pattern in
+        // the real operand along whichever path this build uses.
+        if(tile_idx == 0 && block_id_x() == 0)
+        {
+            __builtin_amdgcn_s_barrier();
+            for(int i = thread_id_x(); i < T::KV_TILE_SIZE * T::SMEM_KV_ROW; i += T::BLOCK_SIZE)
+            {
+                const int kv = i / T::SMEM_KV_ROW, e = kv / 8, m = kv % 8;
+                if constexpr(T::V_IS_FP8)
+                    reinterpret_cast<unsigned char*>(smem_kv)[i] = (unsigned char)(((e + 7) << 3) | m);
+                else
+                    reinterpret_cast<unsigned short*>(smem_kv)[i] = (unsigned short)(((e + 127) << 7) | (m << 4));
+            }
+            __builtin_amdgcn_s_barrier();
+        }
+#endif
+#ifdef OPUS_MLA_V4_FP8_V_ONLY
+        // Read the fp8 tile transposed, then widen to bf16 so the MFMA below is
+        // byte-for-byte the baseline's. V carries one flat exponent here, so the
+        // dequant scale is a constant rather than a per-block lookup.
+        {
+            auto v_v_fp8 = tr_load<T::VEC_TR_V>(s_kv, u_rv);
+            s_waitcnt_lgkmcnt(0_I);
+            constexpr index_t n_v = vector_traits<decltype(v_v)>::size();
+            auto* src = reinterpret_cast<const u32_t*>(&v_v_fp8);
+            auto* dst = reinterpret_cast<vector_t<D_ROPE, 2>*>(&v_v);
+            constexpr float V_UNPACK = static_cast<float>(1 << T::V_SCALE_LOG2);
+            static_for<n_v / 4>([&](auto d) {
+                dst[d.value * 2 + 0] = __builtin_amdgcn_cvt_scalef32_pk_bf16_fp8(src[d.value], V_UNPACK, false);
+                dst[d.value * 2 + 1] = __builtin_amdgcn_cvt_scalef32_pk_bf16_fp8(src[d.value], V_UNPACK, true);
+            });
+        }
+#else
         v_v = tr_load<T::VEC_TR_V>(s_kv, u_rv);
         s_waitcnt_lgkmcnt(0_I);
+#endif
+#ifdef OPUS_MLA_V4_DUMP_V
+        // Debug: overwrite the staged tile with a pattern whose value names its
+        // own KV row (row kv holds 2^(kv/8) * (1 + (kv%8)/8), exact in both
+        // e4m3 and bf16), read it back through the real tr_load path, and write
+        // the decoded row index per (lane, slot). Whatever ordering the MFMA
+        // actually receives is then directly visible on the host.
+        if(tile_idx == 0 && block_id_x() == 0)
+        {
+            __builtin_amdgcn_s_barrier();
+            for(int i = thread_id_x(); i < T::KV_TILE_SIZE * T::SMEM_KV_ROW; i += T::BLOCK_SIZE)
+            {
+                const int kv = i / T::SMEM_KV_ROW, e = kv / 8, m = kv % 8;
+                if constexpr(T::V_IS_FP8)
+                    reinterpret_cast<unsigned char*>(smem_kv)[i] = (unsigned char)(((e + 7) << 3) | m);
+                else
+                    reinterpret_cast<unsigned short*>(smem_kv)[i] = (unsigned short)(((e + 127) << 7) | (m << 4));
+            }
+            __builtin_amdgcn_s_barrier();
+            auto probe = tr_load<T::VEC_TR_V>(s_kv, u_rv);
+            s_waitcnt_lgkmcnt(0_I);
+            constexpr int NV = vector_traits<decltype(probe)>::size();
+            auto* dump = reinterpret_cast<typename T::D_OUT*>(kargs.out_ptr);
+            for(int i = 0; i < NV; ++i)
+            {
+                int kv;
+                if constexpr(T::V_IS_FP8)
+                {
+                    unsigned b = reinterpret_cast<const unsigned char*>(&probe)[i];
+                    kv = (int)(((b >> 3) & 0xF) - 7) * 8 + (int)(b & 0x7);
+                }
+                else
+                {
+                    unsigned h = reinterpret_cast<const unsigned short*>(&probe)[i];
+                    kv = (int)(((h >> 7) & 0xFF) - 127) * 8 + (int)((h >> 4) & 0x7);
+                }
+                dump[(warp_id * T::WARP_SIZE + lane_id) * NV + i] = (typename T::D_OUT)(float)kv;
+            }
+            __builtin_amdgcn_s_barrier();
+        }
+#endif
         __builtin_amdgcn_sched_barrier(0);
+#ifdef OPUS_MLA_V4_PAIRMAP
+        // Drive mma1 with a one-hot P: with A nonzero at a single slot, every
+        // output column receives exactly the V value that slot contracts
+        // against, so the accumulator names the KV. Sweeping the 16 A slots
+        // gives the A-slot <-> KV pairing outright, for whichever V ordering
+        // this build produces.
+        if(tile_idx == 0 && block_id_x() == 0 && warp_id == 0)
+        {
+            auto* dump = reinterpret_cast<typename T::D_OUT*>(kargs.out_ptr);
+            for(int h = 0; h < T::NUM_WARPS * s_len; ++h)
+            {
+                typename decltype(mma1)::vtype_a hot;
+                clear(hot);
+                if constexpr(sizeof(D_P) == 1)
+                    reinterpret_cast<unsigned char*>(&hot)[h] = 0x38;    // e4m3 1.0
+                else
+                    reinterpret_cast<unsigned short*>(&hot)[h] = 0x3F80; // bf16 1.0
+                typename decltype(mma1)::vtype_c acc;
+                clear(acc);
+                acc = mma1(hot, v_v, acc);
+                for(int e = 0; e < 4; ++e)
+                    dump[(h * T::WARP_SIZE + lane_id) * 4 + e] = (typename T::D_OUT)(float)acc[e];
+            }
+        }
+#endif
         attn_mask_oob_value<T>(v_v, valid_kv_len, tile_idx, lane_id);
         v_o = mma1(v_p, v_v, v_o);
         __builtin_amdgcn_s_barrier();
@@ -4249,7 +4522,229 @@ __device__ void mla_v4_prefill_accum_pipelined(
     }
 }
 
+#if defined(OPUS_MLA_V4_DMA)
+// LDS byte offset of (logical KV row t, D byte d) in the DMA-staged tile. Rows
+// inside a chunk sit 128 B apart -- one full bank period -- so the 16 B column
+// is XORed with the row; that is what lets the K read and the transposed V
+// read each cover all 32 banks exactly once.
+template<class T>
+__device__ inline int dma_tile_offset(int t, int d) {
+    const int h  = t / (T::DMA_ROWS_PER_CHUNK * T::NUM_WARPS);
+    const int wp = (t / T::DMA_ROWS_PER_CHUNK) % T::NUM_WARPS;
+    const int rw = t % T::DMA_ROWS_PER_CHUNK;
+    const int dr = d / 128, c = (d % 128) / 16, b = d % 16;
+    const int chunk = (h * T::DMA_D_SLICES + dr) * T::NUM_WARPS + wp;
+    return chunk * T::DMA_CHUNK_STRIDE + rw * 128 + ((c ^ rw) * 16) + b;
+}
+
+// DMA-staged variant. Expects a cache re-based upstream to a unit per-D-block
+// scale with RoPE folded into slots [448, 512) of the NoPE row
+// (aiter/ops/triton/mla_v4_kv_rescale.py), so each NoPE row is the complete
+// 512-wide fp8 row -- K for QK^T and V for P*V -- and one DMA stages all of it
+// without touching VGPRs.
+// K keeps the logical rows make_layout_kv_indices assigns and V keeps the
+// logical order the register-staged path delivers, so the score mask, P
+// exchange, P gather remap and value mask are all shared with that path.
+template<class Traits, class VQN, class VQR, class VO>
+__device__ void mla_v4_prefill_accum_dma(
+        opus_mla_v4_prefill_fp8_kargs kargs, const void* kv_nope_ptr, const void* kv_rope_ptr,
+        const int* kv_indices,
+        int page_idx_begin, int valid_kv_len, int num_kv_tiles,
+        char* smem_kv, char* smem_ml, char* smem_p,
+        VQN& v_q_nope, VQR& v_q_rope, int scale_q, VO& v_o,
+        typename Traits::D_ACC& m_row, typename Traits::D_ACC& l_row,
+        typename Traits::D_ACC temperature_scale) {
+    using namespace opus;
+    using T = opus::remove_cvref_t<Traits>;
+    using D_NOPE = typename T::D_NOPE;
+    using D_ROPE = typename T::D_ROPE;
+    using D_ACC  = typename T::D_ACC;
+    using D_V    = typename T::D_V;
+    using D_P    = typename T::D_P;
+    using D_PV   = typename T::D_PV;
+
+    int lane_id = thread_id_x() % T::WARP_SIZE;
+    asm volatile("" : "+v"(lane_id));  // break CSE
+    const int warp_id = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
+
+    // QK^T's RoPE comes from the folded fp8 copy in the tile (Q's is packed into
+    // v_q_nope by the caller), so neither bf16 RoPE input is read here.
+    (void)kv_rope_ptr;
+    (void)v_q_rope;
+
+    auto s_m  = make_smem(reinterpret_cast<D_ACC*>(smem_ml));
+    auto s_l  = make_smem(reinterpret_cast<D_ACC*>(smem_ml) + T::T_N * T::W_M);
+    auto s_p  = make_smem(reinterpret_cast<D_P*>(smem_p));
+    auto s_kv = make_smem(reinterpret_cast<D_V*>(smem_kv));
+
+    auto mma0_nope = make_tiled_mma<D_NOPE, D_NOPE, D_ACC>(
+        seq<T::GEMM0_E_M, T::GEMM0_E_N, T::GEMM0_NOPE_E_K>{},
+        seq<T::T_M, T::T_N, T::T_K>{},
+        seq<T::W_M, T::W_N, T::W_K_NOPE>{},
+        mfma_adaptor_swap_ab{});
+    auto mma1 = make_tiled_mma<D_PV, D_PV, D_ACC>(
+        seq<T::GEMM1_E_M, T::GEMM1_E_N, T::GEMM1_E_K>{},
+        seq<T::T_M, T::T_N, T::T_K>{},
+        seq<T::W_M, T::W_N, T::W_K_ROPE>{},
+        mfma_adaptor_swap_ab{});
+
+    typename decltype(mma0_nope)::vtype_c v_s;
+    typename decltype(mma1)::vtype_a      v_p;
+    typename decltype(mma1)::vtype_b      v_v;
+    vector_t<D_NOPE, T::GEMM0_NOPE_E_K * 2 * 16> v_k_nope;
+
+    constexpr index_t s_len = vector_traits<typename decltype(mma0_nope)::vtype_c>::size();
+    auto v_p_warps = reinterpret_cast<vector_t<D_P, s_len>*>(&v_p);
+    auto k16 = reinterpret_cast<vector_t<D_NOPE, 16>*>(&v_k_nope);
+    auto v8  = reinterpret_cast<vector_t<D_V, 8>*>(&v_v);
+
+    // Per-lane coordinates that are fixed across tiles.
+    const int l16 = lane_id % 16, grp = lane_id / 16;
+    const int k_row  = warp_id * 16 + l16;               // row fed to QK^T (as make_layout_kv_indices)
+    const int v_row0 = 8 * grp + l16 / 2;                // + 32*ek: row this lane supplies to tr_b8
+    const int v_d0   = warp_id * 128 + (l16 % 2) * 8;    // + 16*en: D byte it supplies
+
+    // DMA: wave w stages rows h*32 + w*8 + L/8; each lane fetches the logical
+    // column the XOR swizzle maps onto its fixed slot at M0 + lane*16.
+    constexpr int ROWS_PER_HALF = T::DMA_ROWS_PER_CHUNK * T::NUM_WARPS;
+    const int dma_rw  = lane_id / 8;
+    const int dma_col = ((lane_id % 8) ^ dma_rw) * 16;
+    const char* p_nope_bytes = reinterpret_cast<const char*>(kv_nope_ptr);
+    auto* lds_base = reinterpret_cast<OPUS_LDS_ADDR char*>(reinterpret_cast<__UINTPTR_TYPE__>(smem_kv));
+    auto dma_page = [&](int tile_idx, int h) {
+        const int idx = tile_idx * T::KV_TILE_SIZE + h * ROWS_PER_HALF + warp_id * T::DMA_ROWS_PER_CHUNK + dma_rw;
+        return idx < valid_kv_len ? kv_indices[page_idx_begin + idx] : 0;
+    };
+
+    // Unit KV scale after the upstream re-base: every E8M0 byte is 127.
+    constexpr int scale_k = 0x7F7F7F7F;
+
+    // DMA the raw fp8 rows of one tile straight into LDS buffer BUF. One
+    // address per half; the 128 B D slices ride in the instruction offset,
+    // which the hardware also adds to the LDS destination, so M0 backs it out.
+    auto issue_dma = [&](auto buf_v, const int* pages) {
+        constexpr int buf = decltype(buf_v)::value;
+        static_for<T::DMA_HALVES>([&](auto hv) {
+            constexpr int h = hv.value;
+            const char* row = p_nope_bytes + static_cast<int64_t>(pages[h]) * kargs.stride_kv_nope_page + dma_col;
+            static_for<T::DMA_D_SLICES>([&, row](auto drv) {
+                constexpr int dr = drv.value;
+                const unsigned int m0_val = __builtin_amdgcn_readfirstlane(static_cast<unsigned int>(
+                    reinterpret_cast<__UINTPTR_TYPE__>(
+                        lds_base + buf * T::SMEM_KV_BYTES - dr * 128
+                                 + ((h * T::DMA_D_SLICES + dr) * T::NUM_WARPS + warp_id) * T::DMA_CHUNK_STRIDE)));
+                asm volatile("s_mov_b32 m0, %0\n\ts_nop 0\n\tglobal_load_lds_dwordx4 %1, off offset:%2"
+                             :: "s"(m0_val), "v"(row), "i"(dr * 128) : "memory");
+            });
+        });
+    };
+
+    // This lane's LDS read offsets in buffer 0 at step 0. The XOR swizzle makes
+    // r (K) and en (V) non-additive, so each gets a base; buffer, K-step and
+    // KV-step are compile-time and fold into the ds_read immediate.
+    int k_base[2], v_base[T::GEMM1_E_N];
+    static_for<2>([&](auto r) { k_base[r.value] = dma_tile_offset<T>(k_row, r.value * 64 + grp * 16); });
+    static_for<T::GEMM1_E_N>([&](auto en) { v_base[en.value] = dma_tile_offset<T>(v_row0, v_d0 + 16 * en.value); });
+    constexpr int K_STEP_OFF = T::NUM_WARPS * T::DMA_CHUNK_STRIDE;                    // +128 D bytes
+    constexpr int V_STEP_OFF = T::DMA_D_SLICES * T::NUM_WARPS * T::DMA_CHUNK_STRIDE;  // +32 KV rows
+
+    // Prologue: tile 0 goes out first, then the page ids of tile 1. Every global
+    // load in the loop is issued one tile ahead of its use, so the single
+    // vmcnt(0) at the top of each tile retires work that has had a whole tile
+    // to land.
+    int dpage[T::DMA_HALVES];
+    static_for<T::DMA_HALVES>([&](auto h) { dpage[h.value] = dma_page(0, h.value); });
+    s_waitcnt_vmcnt(0_I);
+    if (num_kv_tiles > 0)
+        issue_dma(number<0>{}, dpage);
+    static_for<T::DMA_HALVES>([&](auto h) { dpage[h.value] = dma_page(1, h.value); });
+
+    // One tile on buffer CUR; unrolled for both buffers below so every LDS
+    // offset is compile-time apart from the per-lane bases.
+    auto tile_body = [&](int tile_idx, auto cur_v) {
+        constexpr int cur    = decltype(cur_v)::value;
+        constexpr int kv_off = cur * T::SMEM_KV_BYTES;
+
+        // Tile n has landed for every wave, and every wave is done reading tile
+        // n-1, whose buffer the next DMA overwrites: one barrier covers both.
+        s_waitcnt_vmcnt(0_I);
+        __builtin_amdgcn_s_barrier();
+        if (tile_idx + 1 < num_kv_tiles)
+            issue_dma(number<cur ^ 1>{}, dpage);
+        static_for<T::DMA_HALVES>([&](auto h) { dpage[h.value] = dma_page(tile_idx + 2, h.value); });
+
+        // ──── K NoPE from LDS, in the slot order mma0_nope expects ────
+        // slot = ek*32 + r*16 + vec  <->  D = ek*128 + r*64 + grp*16 + vec
+        static_for<T::GEMM0_NOPE_E_K>([&](auto ekv) {
+            static_for<2>([&](auto rv) {
+                constexpr int ek = ekv.value, r = rv.value;
+                k16[ek * 2 + r] = __builtin_bit_cast(vector_t<D_NOPE, 16>,
+                    load<16>(s_kv, k_base[r] + (kv_off + ek * K_STEP_OFF)));
+            });
+        });
+        s_waitcnt_lgkmcnt(0_I);
+
+        // ──── GEMM0: S = Q·Kᵀ, NoPE and RoPE in one scaled fp8 chain ────
+        clear(v_s);
+        static_for<T::GEMM0_NOPE_E_K>([&](auto ek) {
+            v_s = mma0_nope.step_k(ek, v_q_nope, v_k_nope, v_s, scale_q, scale_k, ek, ek);
+        });
+
+        // ──── Cross-warp online softmax ────
+        attn_mask_oob_score<T>(v_s, valid_kv_len, tile_idx, warp_id, lane_id);
+        D_ACC row_max   = max(m_row, attn_row_max<T>(v_s, s_m, warp_id, lane_id) * temperature_scale);
+        D_ACC rescale_m = __builtin_amdgcn_exp2f(m_row - row_max);
+        m_row = row_max;
+        attn_row_scale_sub<T>(v_s, temperature_scale, row_max - D_ACC(T::P_PACK_LOG2));
+        attn_exp2_slice<T, 0, s_len>(v_s);
+        l_row *= rescale_m;
+        l_row += attn_row_sum<T>(v_s, s_l, warp_id, lane_id);
+        scale_output_tile<T>(v_o, rescale_m);
+
+        // ──── Broadcast P, relabelled to tr_b8's K order (see the pipelined path) ────
+        auto v_p_seg = cast<D_P>(v_s);
+        store<s_len>(s_p, v_p_seg, warp_id * T::W_M * T::W_N + lane_id * s_len);
+        s_waitcnt_lgkmcnt(0_I);
+        __builtin_amdgcn_s_barrier();
+        static_for<T::NUM_WARPS>([&](auto wv) {
+            constexpr int w = wv.value;
+            const int kv    = 32 * (w / 2) + 8 * grp + 4 * (w % 2);
+            const int src_w = kv / 16, src_g = (kv % 16) / 4;
+            v_p_warps[w] = load<s_len>(s_p, src_w * T::W_M * T::W_N + (src_g * 16 + l16) * s_len);
+        });
+
+        // ──── V transposed from the same tile ────
+        // supplier (grp, l16) -> row 32*ek + 8*grp + l16/2, D = w*128 + 16*en + (l16%2)*8,
+        // so receiving lane l gets V[32*ek + 8*grp + j][w*128 + 16*en + l], j = 0..7.
+        static_for<T::GEMM1_E_N>([&](auto env) {
+            static_for<T::GEMM1_E_K>([&](auto ekv) {
+                constexpr int en = env.value, ek = ekv.value;
+                v8[en * T::GEMM1_E_K + ek] = __builtin_bit_cast(vector_t<D_V, 8>,
+                    s_kv.template tr_load<8>(v_base[en] + (kv_off + ek * V_STEP_OFF)));
+            });
+        });
+        s_waitcnt_lgkmcnt(0_I);
+        __builtin_amdgcn_sched_barrier(0);
+
+        attn_mask_oob_value<T>(v_v, valid_kv_len, tile_idx, lane_id);
+        v_o = mma1(v_p, v_v, v_o);
+    };
+
+    for (int tile_idx = 0; tile_idx < num_kv_tiles; tile_idx += 2) {
+        tile_body(tile_idx, number<0>{});
+        if (tile_idx + 1 < num_kv_tiles)
+            tile_body(tile_idx + 1, number<1>{});
+    }
+}
+#endif // OPUS_MLA_V4_DMA
+
 } // namespace opus_mla_v4_prefill_a8w8_16mx1_16nx4
+
+#if defined(OPUS_MLA_V4_DMA)
+#define OPUS_MLA_V4_FP8_ACCUM mla_v4_prefill_accum_dma
+#else
+#define OPUS_MLA_V4_FP8_ACCUM mla_v4_prefill_accum_pipelined
+#endif
 
 template<class Traits>
 __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void opus_mla_v4_prefill_a8w8_16mx1_16nx4_kernel(opus_mla_v4_prefill_fp8_kargs kargs) {
@@ -4269,9 +4764,16 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void opus_mla_v4_prefill_a8w
     const int64_t q_nope_gmem_offset = static_cast<int64_t>(q_token_idx) * kargs.stride_q_nope_n + static_cast<int64_t>(h_block_start) * kargs.stride_q_nope_h;
     const int64_t q_rope_gmem_offset = static_cast<int64_t>(q_token_idx) * kargs.stride_q_rope_n + static_cast<int64_t>(h_block_start) * kargs.stride_q_rope_h;
 
-    __shared__ char smem_kv[T::KV_TILE_SIZE * T::SMEM_KV_ROW * sizeof(D_ROPE)]; // for KV tiles
+    __shared__ __attribute__((aligned(16))) char smem_kv[T::DMA_BUFFERS * T::SMEM_KV_BYTES]; // for KV tiles
     __shared__ char smem_ml[2 * T::T_N * T::W_M * sizeof(D_ACC)];  // for inter-warp reduction
-    __shared__ char smem_p[T::T_N * T::W_M * T::W_N * sizeof(D_ROPE)]; // for combining P across warps before PV compute
+    __shared__ char smem_p[T::T_N * T::W_M * T::W_N * sizeof(typename T::D_P)]; // for combining P across warps before PV compute
+#ifdef OPUS_MLA_V4_LDS_BALLAST
+    // Measurement-only: inflate the LDS request to move the workgroups-per-CU
+    // limit without touching the pipeline, so occupancy can be priced on its own.
+    // The store must be volatile or the allocation is dead-code eliminated.
+    __shared__ char smem_ballast[OPUS_MLA_V4_LDS_BALLAST];
+    *(volatile char*)&smem_ballast[thread_id_x() % OPUS_MLA_V4_LDS_BALLAST] = 0;
+#endif
 
     constexpr D_ACC LOG2_E = 1.44269504089f;
     const D_ACC temperature_scale = kargs.softmax_scale * LOG2_E;
@@ -4294,7 +4796,43 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void opus_mla_v4_prefill_a8w
     // NoPE mx scales (fp8 E8M0, one per 32-elem K block).
     auto u_q_mxscl = make_layout_q_mxscl<T>(lane_id);
     auto v_q_mxscl = load<1>(g_q_nope, u_q_mxscl + T::D_NOPE_SIZE);
+#if defined(OPUS_MLA_V4_DMA)
+    // QK^T's RoPE runs inside the scaled NoPE MFMA, against the fp8 RoPE folded
+    // into K's slots [448, 512). Q's RoPE goes MXFP8 1x32 into the same slots of
+    // step 3: lane (head, group g) holds RoPE D [16g, 16g + 16), and K-blocks 2
+    // and 3 of the step -- RoPE blocks 0 and 1 -- take their scales from groups
+    // 2 and 3.
+    {
+        const int g = lane_id / T::W_M, head = lane_id % T::W_M;
+        vector_t<D_ROPE, 16> qr;
+        auto qr8 = reinterpret_cast<vector_t<D_ROPE, 8>*>(&qr);
+        qr8[0] = load<8>(g_q_rope, head * kargs.stride_q_rope_h + g * 16);
+        qr8[1] = load<8>(g_q_rope, head * kargs.stride_q_rope_h + g * 16 + 8);
+        auto qf = cast<D_ACC>(qr);
+        D_ACC amax = 0.0f;
+        static_for<16>([&](auto i) { amax = max(amax, __builtin_fabsf(qf[i.value])); });
+        amax = max(amax, __shfl_xor(amax, 16));  // groups 2b, 2b+1 share RoPE block b
+        // E8M0 placing the block max in (224, 448], as the NoPE quantizer does.
+        int e = 0;
+        if (amax > 0.0f) {
+            int k;
+            const float m = __builtin_frexpf(amax / 448.0f, &k);
+            e = (m == 0.5f) ? k - 1 : k;
+            if (amax * __builtin_ldexpf(1.0f, -e) > 448.0f)
+                ++e;
+            e = min(max(e, -127), 127);
+        }
+        const D_ACC inv = __builtin_ldexpf(1.0f, -e);
+        static_for<16>([&](auto i) { qf[i.value] *= inv; });
+        auto q8 = cast<D_NOPE>(qf);
+        static_for<16>([&](auto i) { v_q_nope[q_nope_vals + i.value] = q8[i.value]; });
+        const int e_blk0 = __shfl_xor(e, 32);  // group 2 supplies block 0, held by groups 0/1
+        if (g >= 2)
+            v_q_mxscl[3] = __builtin_bit_cast(D_NOPE, static_cast<unsigned char>((g == 2 ? e_blk0 : e) + 127));
+    }
+#else
     v_q_mxscl[3] = (lane_id >= 32) ? static_cast<D_NOPE>(0) : v_q_mxscl[3];
+#endif
     int scale_q = reinterpret_cast<int&>(v_q_mxscl);
 
     // Output accumulator and online-softmax state.
@@ -4310,7 +4848,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void opus_mla_v4_prefill_a8w
         const int valid_kv_len   = page_idx_end - page_idx_begin;
         const int num_kv_tiles   = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
 
-        mla_v4_prefill_accum_pipelined<Traits>(
+        OPUS_MLA_V4_FP8_ACCUM<Traits>(
             kargs, kargs.unified_kv_nope_ptr, kargs.unified_kv_rope_ptr, kargs.kv_indices_prefix,
             page_idx_begin, valid_kv_len, num_kv_tiles,
             smem_kv, smem_ml, smem_p,
@@ -4327,7 +4865,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void opus_mla_v4_prefill_a8w
         const int valid_kv_len   = page_idx_end - page_idx_begin;
         const int num_kv_tiles   = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
 
-        mla_v4_prefill_accum_pipelined<Traits>(
+        OPUS_MLA_V4_FP8_ACCUM<Traits>(
             kargs, kargs.kv_nope_ptr, kargs.kv_rope_ptr, kargs.kv_indices_extend,
             page_idx_begin, valid_kv_len, num_kv_tiles,
             smem_kv, smem_ml, smem_p,
@@ -4341,8 +4879,16 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void opus_mla_v4_prefill_a8w
     D_ACC sink_log2 = load(g_attn_sink, sink_head_idx)[0] * LOG2_E;
     D_ACC m_final = max(m_row, sink_log2);
     D_ACC alpha = __builtin_amdgcn_exp2f(m_row - m_final);
-    D_ACC l_final = l_row * alpha + __builtin_amdgcn_exp2f(sink_log2 - m_final);
+    // l_row carries P's pack factor, so the sink term is raised to match before
+    // the division cancels it; V's flat exponent is then restored on O.
+    D_ACC l_final = l_row * alpha
+                  + __builtin_amdgcn_exp2f(sink_log2 - m_final + D_ACC(T::P_PACK_LOG2));
     D_ACC o_scale = (l_final > D_ACC(0.0f)) ? (alpha / l_final) : D_ACC(0.0f);
+#ifdef OPUS_MLA_V4_FP8_PV
+    // Only the fp8 P*V path defers V's flat exponent to here; the V_ONLY build
+    // already restored it when widening back to bf16 after the transposed read.
+    o_scale *= D_ACC(1 << T::V_SCALE_LOG2);
+#endif
     scale_output_tile<T>(v_o, o_scale);
 
     using D_OUT = typename T::D_OUT;
@@ -4351,7 +4897,11 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void opus_mla_v4_prefill_a8w
     int warp_id = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
     auto u_o = make_layout_o<T>(warp_id, lane_id, kargs.stride_o_h);
     auto v_o_out = cast<D_OUT>(v_o);
-    store<T::VEC_O>(g_o, v_o_out, u_o);
+#if !defined(OPUS_MLA_V4_DUMP_V) && !defined(OPUS_MLA_V4_PAIRMAP)
+    store<T::VEC_O>(g_o, v_o_out, u_o);  // suppressed in dump mode: `out` carries the probe
+#else
+    (void)v_o_out; (void)g_o; (void)u_o;
+#endif
 }
 #endif
 
