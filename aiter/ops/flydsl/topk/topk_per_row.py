@@ -91,16 +91,15 @@ def _adaptive_capture(device: torch.device, stream_id: int) -> int | None:
 
 
 def _get_adaptive_control(
-    device: torch.device, stream_id: int, rows: int
+    device: torch.device, stream_id: int, rows: int, capture: int | None
 ) -> torch.Tensor:
     """The control buffer for `rows` rows on the current stream of `device`, zero when
-    the launch runs.
+    the launch runs. `capture` is `_adaptive_capture` of that stream.
 
     Eager buffers grow in powers of two and stay until
     `clear_topk_per_row_decode_workspace_cache()`.
     """
     need = _adaptive.decode_control_slots(rows)
-    capture = _adaptive_capture(device, stream_id)
     if capture is None:
         key = (device, stream_id)
         buf = _adaptive_control.get(key)
@@ -124,16 +123,16 @@ def _get_adaptive_control(
 
 
 def _get_adaptive_scratch(
-    device: torch.device, stream_id: int, slots: int
+    device: torch.device, stream_id: int, slots: int, capture: int | None
 ) -> torch.Tensor:
     """The compact candidate buffer, `slots` int32 or more, on the current stream of
-    `device`.
+    `device`. `capture` is `_adaptive_capture` of that stream.
 
     Eager buffers grow to the largest launch seen on their stream and stay until
     `clear_topk_per_row_decode_workspace_cache()`. A capture allocates from the
     graph's pool, so graphs replayed at once never share one.
     """
-    if _adaptive_capture(device, stream_id) is not None:
+    if capture is not None:
         return torch.empty(slots, device=device, dtype=torch.int32)
     key = (device, stream_id)
     buf = _adaptive_scratch.get(key)
@@ -457,6 +456,23 @@ def is_flydsl_top_k_per_row_decode_supported(
     )
 
 
+@lru_cache(maxsize=256)
+def _adaptive_plan(
+    rows: int, seq: int, k: int, ordered: bool, cu_count: int, packed: bool
+) -> tuple:
+    """The adaptive launcher, its scratch slots and its launch scalars (grid, parts,
+    parts_magic, short_max, compact_min) for one shape, so a call computes none of it.
+    """
+    cfg = _adaptive.decode_adaptive_config(
+        rows, seq, k, ordered=ordered, cu_count=cu_count
+    )
+    launcher = _adaptive.create_topk_per_row_decode_adaptive_kernel(
+        top_k=k, packed_rows=packed, **cfg.kw
+    )
+    launch = (cfg.grid, cfg.parts, cfg.parts_magic, cfg.short_max, cfg.compact_min)
+    return launcher, cfg.scratch_slots, launch
+
+
 def _run_adaptive(
     logits,
     next_n,
@@ -487,23 +503,18 @@ def _run_adaptive(
     """
     if cfg_width is None:
         cfg_width = width
+    packed = row_starts is not None
     # The gate's own count, so the band it admitted and the grid built here
     # describe the same card.
-    cfg = _adaptive.decode_adaptive_config(
-        rows,
-        cfg_width,
-        k,
-        ordered=stable,
-        cu_count=get_cu_num_device(logits.device.index),
+    launcher, scratch_slots, launch = _adaptive_plan(
+        rows, cfg_width, k, stable, get_cu_num_device(logits.device.index), packed
     )
-    packed = row_starts is not None
-    launcher = _adaptive.create_topk_per_row_decode_adaptive_kernel(
-        top_k=k, packed_rows=packed, **cfg.kw
-    )
-    control = _get_adaptive_control(logits.device, stream.cuda_stream, rows)
+    device, stream_id = logits.device, stream.cuda_stream
+    capture = _adaptive_capture(device, stream_id)
+    control = _get_adaptive_control(device, stream_id, rows, capture)
     scratch = (
-        _get_adaptive_scratch(logits.device, stream.cuda_stream, cfg.scratch_slots)
-        if cfg.scratch_slots
+        _get_adaptive_scratch(device, stream_id, scratch_slots, capture)
+        if scratch_slots
         else control  # unread without compact
     )
     _run_compiled(
@@ -520,11 +531,7 @@ def _run_adaptive(
         width,
         stride0,
         stride1,
-        cfg.grid,
-        cfg.parts,
-        cfg.parts_magic,
-        cfg.short_max,
-        cfg.compact_min,
+        *launch,
         stream,
     )
 
@@ -595,28 +602,24 @@ def _decode_with_backend(
     *,
     row_starts: torch.Tensor | None = None,
     plane_width: int | None = None,
+    validated: bool = False,
 ) -> None:
     """Run the decode on `backend`, which must be the gate's answer or None to ask it.
 
     A `default` answer still runs the single-launch kernel here, because this entry
-    point has no one-block dispatch below it.
+    point has no one-block dispatch below it. Pass `validated` only when
+    `is_flydsl_top_k_per_row_decode_supported` accepted these same arguments.
     """
-    _validate_flydsl_topk_call(
-        logits, next_n, seq_lens, indices, num_rows, stride0, stride1, k, values
-    )
+    if not validated:
+        _validate_flydsl_topk_call(
+            logits, next_n, seq_lens, indices, num_rows, stride0, stride1, k, values
+        )
 
     rows, width = logits.shape
     width = width if plane_width is None else plane_width
     if rows == 0:
         return
-    # The bare arch name: the selector keys its radix layout and LDS on it.
-    arch = get_gfx_runtime()
-    wave_size = get_warp_size(arch)
     stream = torch.cuda.current_stream(logits.device)
-    packed = row_starts is not None
-    full_rows = seq_lens is None
-    len_slot = row_len_slot(seq_lens, logits.device)
-    starts = row_starts if packed else len_slot
 
     if backend is None:
         # The tensor contract was enforced above, so only the shape is asked.
@@ -653,6 +656,14 @@ def _decode_with_backend(
             row_starts=row_starts,
         )
         return
+
+    # The bare arch name: the selector keys its radix layout and LDS on it.
+    arch = get_gfx_runtime()
+    wave_size = get_warp_size(arch)
+    packed = row_starts is not None
+    full_rows = seq_lens is None
+    len_slot = row_len_slot(seq_lens, logits.device)
+    starts = row_starts if packed else len_slot
 
     if width <= _ONE_WORKGROUP_MAX_ROW_WIDTH:
         launcher = build_topk_per_row_decode_one_workgroup_module(

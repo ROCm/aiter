@@ -1341,6 +1341,7 @@ def top_k_per_row_decode(
             values,
             backend,
             max_row_len,
+            validated=True,
         )
 
     # FlyDSL one-block outperforms HIP one-block on the remaining decode cases.
@@ -1445,6 +1446,7 @@ def _top_k_per_row_decode_packed(
         return flydsl_topk._decode_with_backend(
             view, next_n, seq_lens, indices, num_rows, 0, 1, k, stable, values,
             backend, max_row_len, row_starts=row_starts, plane_width=plane_width,
+            validated=True,
         )  # fmt: skip
     return flydsl_topk.flydsl_radix_topk_one_block(
         view,

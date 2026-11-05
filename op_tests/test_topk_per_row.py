@@ -1477,6 +1477,80 @@ def test_adaptive_scratch_two_streams(card):
     )
 
 
+def test_adaptive_plan(card):
+    """The cached plan holds what `decode_adaptive_config` and the kernel factory
+    give for the shape, on this card's CU count and on others."""
+    plan = flydsl_decode_host._adaptive_plan
+    plan.cache_clear()
+    cells = itertools.product(
+        sorted({card[1], 80, 256, 304}),
+        (1, 2, 3, 4, 7, 8, 16, 31, 32, 33, 64, 128, 256, 512),
+        (1024, 4096, 16384, 28416, 28417, 40960, 40961, 65536, 131072, 1 << 20),
+        (1024, 2048),
+        (False, True),
+        (False, True),
+    )
+    n = 0
+    for cu, rows, seq, k, ordered, packed in cells:
+        cfg = adaptive_kernel.decode_adaptive_config(
+            rows, seq, k, ordered=ordered, cu_count=cu
+        )
+        got = plan(rows, seq, k, ordered, cu, packed)
+        cell = f"cu={cu} rows={rows} seq={seq} k={k} ordered={ordered} packed={packed}"
+        assert got[0] is adaptive_kernel.create_topk_per_row_decode_adaptive_kernel(
+            top_k=k, packed_rows=packed, **cfg.kw
+        ), cell
+        assert got[1] == cfg.scratch_slots, cell
+        assert got[2] == (
+            cfg.grid,
+            cfg.parts,
+            cfg.parts_magic,
+            cfg.short_max,
+            cfg.compact_min,
+        ), cell
+        assert plan(rows, seq, k, ordered, cu, packed) is got, cell
+        n += 1
+    print(f"[adaptive_plan] PASS: {n} shapes")
+
+
+def test_decode_validated_once(card):
+    """The public call checks its tensors once, in the gate; a direct
+    `_decode_with_backend` still checks them and rejects a bad one."""
+    rows, width, top_k, stable = next(adaptive_band_cells(card))
+    torch.manual_seed(0)
+    logits = torch.randn(rows, width, device="cuda")
+    seq_lens = torch.full((rows,), width, dtype=torch.int32, device="cuda")
+    indices = torch.empty(rows, top_k, dtype=torch.int32, device="cuda")
+    call = (logits, 1, seq_lens, indices, rows, *logits.stride(), top_k, stable, None)
+    host = flydsl_decode_host
+    with mock.patch.object(
+        host, "_validate_flydsl_topk_call", wraps=host._validate_flydsl_topk_call
+    ) as validate:
+        assert topk.decode_backend_for_call(*call, max_row_len=width) == (
+            topk.BACKEND_ADAPTIVE
+        )
+        topk.top_k_per_row_decode(*call, max_row_len=width)
+        torch.cuda.synchronize()
+        assert validate.call_count == 0, "the public call checked its tensors again"
+        got = indices.long() if stable else indices.long().sort(dim=-1).values
+        want = stable_reference(logits, top_k)
+        assert torch.equal(got, want), "public adaptive call mismatch"
+        host._decode_with_backend(*call, topk.BACKEND_ADAPTIVE, width)
+        assert validate.call_count == 1, "a direct call skipped its tensor check"
+    wide = torch.empty(rows, top_k, dtype=torch.int64, device="cuda")
+    bad = (logits, 1, seq_lens, wide, rows, *logits.stride(), top_k, stable, None)
+    assert topk.decode_backend_for_call(*bad, max_row_len=width) == (
+        topk.BACKEND_DEFAULT
+    ), "the gate admitted int64 indices"
+    try:
+        host._decode_with_backend(*bad, topk.BACKEND_ADAPTIVE, width)
+    except (RuntimeError, TypeError, ValueError):
+        pass
+    else:
+        raise AssertionError("a direct call ran with int64 indices")
+    print(f"[decode_validated_once] PASS: rows={rows} width={width} k={top_k}")
+
+
 def test_adaptive_row_past_width(card):
     """A `seq_lens` entry past the buffer width reads the row to its width, as the
     other decode kernels do, and not into the outranking padding behind it."""
@@ -2629,6 +2703,8 @@ def run_adaptive():
     test_adaptive_scratch_reused(card)
     test_adaptive_scratch_poisoned(card)
     test_adaptive_scratch_two_streams(card)
+    test_adaptive_plan(card)
+    test_decode_validated_once(card)
     test_adaptive_row_past_width(card)
     test_adaptive_bound_below_rows(card)
     test_adaptive_nan_ranks_first(card)
