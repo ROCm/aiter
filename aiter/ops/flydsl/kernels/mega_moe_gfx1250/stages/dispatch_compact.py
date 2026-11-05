@@ -18,11 +18,11 @@ from ..config import (
     _COMPACT_ROUTE_UPTO,
     _DISPATCH_COMPACT,
     _WAVE_SIZE,
+    _compact_dispatch_schedule,
 )
 from ..dispatch_tdm import _make_dispatch_tdm, tdm_max_warps, tdm_stage_capacity
 from ..recipe import MegaMoEConfig
 from ..s1f_ctl import (
-    _DECODE_PLAN_OVERLAP_TOKENS,
     _QUANT_FUSE_BLOCKS,
     _Stage1Fusion,
     allocates_flags,
@@ -188,9 +188,9 @@ class _CompactDispatch(_Dispatch):
     expert and padded to the GEMM tile, the layout the grouped GEMM reads in
     place.
 
-    The plan needs only topk_ids, so it runs on a side stream ahead of the
-    dispatch. Two hist/done slots and local tok_map/psum buffers let the next
-    layer's plan overlap this layer's expert GEMM.
+    The plan runs on the caller's stream, in order. Two hist/done slots and
+    local tok_map/psum buffers let the next layer's plan be issued before this
+    layer's expert GEMM.
 
     Recv slots are reserved one atomic per (block, peer) and handed out
     block-local. The TDM staging arrays stand in for the HIP kernel's
@@ -211,18 +211,30 @@ class _CompactDispatch(_Dispatch):
         blocks_env = os.environ.get("AITER_TDM_COMPACT_BLOCKS")
         warps_env = os.environ.get("AITER_TDM_COMPACT_WARPS")
         if blocks_env is not None or warps_env is not None:
-            schedule = ((None, int(blocks_env or "64"), int(warps_env or "8")),)
-        else:
-            # Up to _COMPACT_ROUTE_UPTO tokens/rank the steps past 256 walk
-            # routes with _COMPACT_ROUTE_SPEC blocks/warps (see config.py).
-            upto = _COMPACT_ROUTE_UPTO
-            rb, rw = _COMPACT_ROUTE_SPEC
-            head = tuple(
-                e
-                for e in _DISPATCH_COMPACT
-                if e[0] is not None and e[0] < min(upto, 512)
+            route_parallel = os.environ.get(
+                "AITER_TDM_COMPACT_ROUTE_PARALLEL", "0"
+            ) in ("1", "true", "True")
+            schedule = (
+                (
+                    None,
+                    int(blocks_env or "64"),
+                    int(warps_env or "8"),
+                    route_parallel,
+                ),
             )
-            schedule = head + ((upto, rb, rw, True), _DISPATCH_COMPACT[-1])
+        else:
+            # EP2 top-6 and EP4 top-9 have their own tables. The generic table
+            # still gets the mid-size route overlay from config.py.
+            table = _compact_dispatch_schedule(config.world_size, config.topk)
+            if table is _DISPATCH_COMPACT:
+                upto = _COMPACT_ROUTE_UPTO
+                rb, rw = _COMPACT_ROUTE_SPEC
+                head = tuple(
+                    e for e in table if e[0] is not None and e[0] < min(upto, 512)
+                )
+                schedule = head + ((upto, rb, rw, True), table[-1])
+            else:
+                schedule = table
         super().__init__(config, schedule)
         self.compact = _CompactGeometry.of(config)
         self.scale_stride = _align_up(config.dispatch_scale_nbytes, 128)
@@ -345,9 +357,6 @@ class _CompactDispatch(_Dispatch):
         self._dummy_wts = torch.zeros(
             (1, config.topk), dtype=torch.float32, device=device
         )
-        self._plan_stream = torch.cuda.Stream()
-        self._plan_event = torch.cuda.Event()
-        self._prefetch_events = [torch.cuda.Event() for _ in slots]
         # Buffers the stage-1 plan variants capture, before any of them compile.
         self.fusion.arm()
         # Warm both hist/done slots and the capacity bucket: compiling inside
@@ -460,6 +469,10 @@ class _CompactDispatch(_Dispatch):
                     clear_route_counter=False,
                     compact_plan=True,
                     off_ep_rowmap=arena.offset("ep_rowmap"),
+                    # One payload per token per peer. The grouped GEMM scatters
+                    # those rows into expert order. The stage-1 kernel does not
+                    # launch this dispatch, so the flag stays off on that path.
+                    row_gather=True,
                     max_tok_slot_stride=config.max_tokens_per_rank * config.topk,
                     route_parallel=route_parallel,
                 )
@@ -505,18 +518,9 @@ class _CompactDispatch(_Dispatch):
                 f"recv_token_bound={recv_token_bound} needs {self._step.align_m}; "
                 "pass the bound the plan was started with"
             )
-        overlap_next = (
-            next_topk_ids is not None
-            and int(next_topk_ids.shape[0]) > 0
-            and token_count <= _DECODE_PLAN_OVERLAP_TOKENS
-        )
-        if overlap_next:
-            # Recorded before the payload copy so a decode prefetch can wait
-            # for routing without also waiting for that copy.
-            self._prefetch_events[self._slot].record(torch.cuda.current_stream())
         kernel = self._kernels[_pick(self.schedule, token_count)]
-        # Launch the plan before the quant so the two overlap, unless the plan
-        # itself is quantizing (then there is no second kernel to overlap).
+        # The plan quantizes the payload itself when the fused quant is on;
+        # otherwise the standalone quant follows it.
         fused_quant = self.fusion.wants_fused_quant(s1f)
         if not self._plan_pending:
             self._launch_plan(
@@ -536,7 +540,7 @@ class _CompactDispatch(_Dispatch):
             payload, scales_ptr, _ = self.fusion.quantize(
                 hidden_states, token_count, s1f
             )
-        self._wait_plan()
+        self._plan_pending = False
         slot, step = self._slot, self._step
         if s1f:
             self.fusion.stash(
@@ -581,17 +585,18 @@ class _CompactDispatch(_Dispatch):
                 recv_bound=step.recv_bound,
                 align_m=step.align_m,
                 rows=step.rows,
+                # The stage-1 kernel ships rows itself. Scattering the wire
+                # first would drop the stride that kernel requires.
+                row_gather=not s1f,
             ),
         )
         if next_topk_ids is not None and int(next_topk_ids.shape[0]) > 0:
             # Dispatch of this layer is queued, so tok_map[slot] is free once
             # it finishes. GEMM still reads psum/masked_m of this slot; the
-            # next plan writes the other slot. Prefill overlaps that plan with
-            # the GEMM only. Decode also overlaps it with this dispatch.
+            # next plan writes the other slot.
             nxt = 1 - slot
             count = int(next_topk_ids.shape[0])
             ahead = self._step_for(self._recv_bound(next_recv_token_bound))
-            ready = self._prefetch_events[slot] if overlap_next else None
             # tok_map follows the NEXT step's tile, then this step is restored:
             # GEMM1 still reads the alignment just dispatched.
             saved = self._step
@@ -603,14 +608,13 @@ class _CompactDispatch(_Dispatch):
                 count,
                 nxt,
                 ahead.align_m,
-                ready_event=ready,
                 tok_map=not drop_tok_map,
             )
             self._slot = nxt
         return batch
 
     def prefetch(self, topk_ids, recv_token_bound=None) -> None:
-        """Launch the plan for ``topk_ids`` on the side stream, into this step."""
+        """Launch the plan for ``topk_ids`` into this step, in stream order."""
         _check_recv_token_bound(self.config, "recv_token_bound", recv_token_bound)
         token_count = int(topk_ids.shape[0])
         self._step = self._step_for(self._recv_bound(recv_token_bound))
@@ -682,7 +686,7 @@ class _CompactDispatch(_Dispatch):
         count, so eager steps (prefill, or any width the warmup never ran)
         reached the JIT inside the serving loop (the first ~100 s of a c512
         run had 250-470 ms prefill steps). This walks every recv bound a
-        fused step can have (<= the S1F max recv, 4096), takes the
+        fused step can have (<= the S1F max recv), takes the
         alignments they map to, and one token count per distinct
         (waves, blocks), and compiles all variants (compile only, no launch).
         """
@@ -690,10 +694,9 @@ class _CompactDispatch(_Dispatch):
             return
         from ..compact_plan import compact_plan_blocks
         from ..s1f_ctl import _QUANT_FUSE_BLOCKS as _qfb
-        from ..s1f_ctl import _S1F_MAX_RECV as _lim
 
         config = self.config
-        limit = min(int(config.max_recv), int(_lim))
+        limit = min(int(config.max_recv), self.fusion.max_recv())
         saved = self._step
         bounds = sorted(set(range(16, limit + 1, 16)) | {1, limit})
         steps = {}
@@ -823,9 +826,9 @@ class _CompactDispatch(_Dispatch):
             # still padded to the step's GEMM1 tile (align_m).
             tile_m = align_m
             if plan_s1f:
-                from ..s1f_stage1 import FLAG_M
+                from ..s1f_stage1 import s1f_flag_m
 
-                tile_m = FLAG_M
+                tile_m = s1f_flag_m(align_m)
             launch = compile_tdm_compact_plan(
                 rank=config.rank,
                 npes=config.world_size,
@@ -883,7 +886,7 @@ class _CompactDispatch(_Dispatch):
                 int(quant_src_ptr),
                 int(wire_ptr),
             )
-        return args + (fx.Stream(self._plan_stream),)
+        return args + (fx.Stream(torch.cuda.current_stream()),)
 
     def _launch_plan(
         self,
@@ -894,44 +897,30 @@ class _CompactDispatch(_Dispatch):
         *,
         tok_map: bool = True,
         quant_src: torch.Tensor | None = None,
-        ready_event: torch.cuda.Event | None = None,
     ) -> None:
         plan_s1f = self.fusion.plan_mode(align_m) and not self.fusion.step_off()
         qb = _QUANT_FUSE_BLOCKS if plan_s1f and quant_src is not None else 0
-        plan_stream = self._plan_stream
-        if ready_event is None:
-            plan_stream.wait_stream(torch.cuda.current_stream())
-        else:
-            plan_stream.wait_event(ready_event)
         quant_ptr = 0 if quant_src is None else quant_src.data_ptr()
         wire_ptr = 0 if self.fusion.wire is None else self.fusion.wire.data_ptr()
-        with torch.cuda.stream(plan_stream):
-            _run_compiled(
-                self._plan_for(
-                    align_m,
-                    slot,
-                    token_count,
-                    tok_map=tok_map,
-                    quant_blocks=qb,
-                ),
-                *self._plan_args(
-                    topk_ids.data_ptr(),
-                    token_count,
-                    slot,
-                    plan_s1f=plan_s1f,
-                    quant_src_ptr=quant_ptr,
-                    wire_ptr=wire_ptr,
-                ),
-            )
-        self._plan_event.record(plan_stream)
+        _run_compiled(
+            self._plan_for(
+                align_m,
+                slot,
+                token_count,
+                tok_map=tok_map,
+                quant_blocks=qb,
+            ),
+            *self._plan_args(
+                topk_ids.data_ptr(),
+                token_count,
+                slot,
+                plan_s1f=plan_s1f,
+                quant_src_ptr=quant_ptr,
+                wire_ptr=wire_ptr,
+            ),
+        )
         self._plan_pending = True
         self._pending_align = align_m
-
-    def _wait_plan(self) -> None:
-        if not self._plan_pending:
-            return
-        torch.cuda.current_stream().wait_event(self._plan_event)
-        self._plan_pending = False
 
     def close(self) -> None:
         """Nothing to release: its kernels and buffers are not held by mori."""

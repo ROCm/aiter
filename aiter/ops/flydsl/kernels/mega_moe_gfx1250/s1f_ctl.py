@@ -45,6 +45,10 @@ _S1F_MIN_TILE_M = 16
 _S1F_TILE_N, _S1F_TILE_K = 256, 256
 #: Stage-1 variants by GEMM1 tile_m: (pipeline buffers, CTAs per CU).
 #:
+#: * 16 rows (decode): its own flag tile. Even 3 buffers take 112,384 B, so
+#:   three CTAs do not fit a CU; 4 buffers edge out 3 at tpr 8 / 64.
+#: * 32 rows (EP2 tpr 256 / 512): its own flag tile too, with the 16-row
+#:   layout; the tuned GEMM1 picks tile 32 there.
 #: * 64 rows: ~230 VGPRs, 133,632 B of arena, two CTAs per CU.
 #: * 128 rows: twice the accumulators (398 VGPRs, no spills) in 162,816 B.
 #:   Two still fit: 2 x 163,840 B is exactly the 320 KB of LDS and two waves
@@ -55,21 +59,40 @@ _S1F_TILE_N, _S1F_TILE_K = 256, 256
 #: Every worker CTA has to be resident at once -- the producers hand tiles to
 #: consumers inside one launch -- so a variant whose CTAs per CU exceeds what
 #: VGPRs and LDS allow would hang, not just run slow.
-_S1F_VARIANTS = {64: (3, 2), 128: (3, 2), 256: (3, 1)}
+_S1F_VARIANTS = {16: (4, 2), 32: (4, 2), 64: (3, 2), 128: (3, 2), 256: (3, 1)}
 #: m-tiles per group in the GEMM1 work order.
 _S1F_GROUP_M = 8
 #: Placeholder reason for the one step that probes the GEMM1 configuration.
 _S1F_PROBING = "probing the GEMM1 configuration"
-# Decode steps have too little expert GEMM to hide the compact plan if the plan
-# waits out dispatch first. At or below this token count the next layer's plan
-# starts before dispatch returns and overlaps both.
-_DECODE_PLAN_OVERLAP_TOKENS = 128
 # The S1F settings below (with S1F_BLOCK_RUNS in s1f_stage1.py and the compact
 # route schedule in config.py) come from DSV4.1-Flash DEP4 on MI455X, MLPerf
 # Endpoints agentic c512: +2.1% gen tok/s/GPU over S1F off.
 #: A step whose receive bound exceeds this runs the whole S1F=0 path (see
 #: _Stage1Fusion.step_off), so the widest prefill steps keep dispatch + GEMM1.
 _S1F_MAX_RECV = 4096
+#: Receive caps that differ from _S1F_MAX_RECV, by (world_size, topk).
+#: DSV4.1 Flash (top-6) runs stage-1 fused at every width on EP2 and EP4. At
+#: 8192 tokens/rank: 886 vs 959 us/layer on EP2, 900 vs 1063 on EP4. Top-7 is
+#: the same model with its shared expert fused: 1200 vs 1405 on EP2. Past
+#: 4096 tokens this compiles a few more plan widths (7 instead of 4 at 8192).
+_S1F_MAX_RECV_BY_SHAPE: dict = {
+    (2, 6): 1 << 30,
+    (4, 6): 1 << 30,
+    (2, 7): 1 << 30,
+    (4, 7): 1 << 30,
+}
+
+
+def s1f_max_recv(world_size: int, topk: int) -> int:
+    """Widest receive bound a step can have and still run the stage-1 kernel.
+
+    ``AITER_S1F_MAX_RECV`` overrides it for every shape; 0 removes the cap.
+    """
+    env = os.environ.get("AITER_S1F_MAX_RECV", "").strip()
+    if env:
+        cap = int(env)
+        return cap if cap > 0 else 1 << 30
+    return _S1F_MAX_RECV_BY_SHAPE.get((int(world_size), int(topk)), _S1F_MAX_RECV)
 
 
 def read_s1f_mode() -> bool:
@@ -270,7 +293,7 @@ class _Stage1Fusion:
 
     def tile_reasons(self, align_m: int) -> list:
         """Why a step aligned to ``align_m`` cannot run the stage-1 kernel."""
-        from .s1f_stage1 import FLAG_M
+        from .s1f_stage1 import s1f_flag_m
 
         reasons = []
         if int(align_m) not in _S1F_VARIANTS:
@@ -280,7 +303,7 @@ class _Stage1Fusion:
                 f"stage-1 tile {align_m} does not fit model_dim "
                 f"{self.d.config.hidden_dim} on {self.cu} CUs"
             )
-        elif int(align_m) > FLAG_M and self.d.config.world_size > 4:
+        elif int(align_m) > s1f_flag_m(align_m) and self.d.config.world_size > 4:
             reasons.append(
                 f"step tile_m {align_m} with {self.d.config.world_size} ranks > 4"
             )
@@ -299,10 +322,14 @@ class _Stage1Fusion:
     def _recv_too_big(self) -> bool:
         # The receive bound is identical on every rank.
         step = getattr(self.d, "_step", None)
-        return step is not None and int(step.recv_bound) > _S1F_MAX_RECV
+        return step is not None and int(step.recv_bound) > self.max_recv()
+
+    def max_recv(self) -> int:
+        config = self.d.config
+        return s1f_max_recv(config.world_size, config.topk)
 
     def step_off(self) -> bool:
-        """A step over _S1F_MAX_RECV runs exactly the S1F=0 path.
+        """A step over ``max_recv()`` runs exactly the S1F=0 path.
 
         Not only GEMM1: its compact plan keeps the S1F=0 key and width (one
         kernel per alignment and slot, instead of one per launch width, block
@@ -317,7 +344,7 @@ class _Stage1Fusion:
         reasons = self.tile_reasons(self.d._step.align_m)
         if self._recv_too_big():
             reasons = reasons + [
-                f"recv_bound {int(self.d._step.recv_bound)} > {_S1F_MAX_RECV}"
+                f"recv_bound {int(self.d._step.recv_bound)} > {self.max_recv()}"
             ]
         seen = self.g1_seen.get(self._g1_key())
         if seen is None:

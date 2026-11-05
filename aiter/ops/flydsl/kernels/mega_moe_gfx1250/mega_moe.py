@@ -327,11 +327,11 @@ class MegaMoEGfx1250:
         their own. Every rank must pass the same bound: on the compact dispatch
         it picks the row alignment all senders lay their rows out with.
 
-        ``next_topk_ids`` (and optional ``next_recv_token_bound``) start the next
-        layer's compact plan on a side stream after this dispatch, so it overlaps
-        the expert GEMM. The two plans use independent hist/done slots and local
-        tok_map/psum buffers. Omit them to keep the plan sequential. The next
-        forward has to pass the same bound the plan was started with.
+        ``next_topk_ids`` (and optional ``next_recv_token_bound``) issue the next
+        layer's compact plan right after this dispatch, on the same stream (the
+        plan never runs on a side stream). The two plans use independent
+        hist/done slots and local tok_map/psum buffers. The next forward has to
+        pass the same bound the plan was started with.
 
         ``combine_wire`` picks this step's combine wire out of the recipe's
         ``combine_wires``, so a caller can quantize the steps with enough tokens
@@ -582,7 +582,7 @@ class MegaMoEGfx1250:
         token_count: int | None = None,
     ) -> None:
         """Compile the compact plan this bound needs, before any graph capture.
-        ``token_count`` is unused: the bound alone picks the tile.
+        ``token_count`` sizes the plan grid; the bound picks the tile.
 
         The plan is compiled per tile alignment and the alignment follows the
         bound's token bucket, so a captured batch whose bucket never ran eagerly
@@ -597,12 +597,10 @@ class MegaMoEGfx1250:
         topk_ids: torch.Tensor,
         recv_token_bound: int | None = None,
     ) -> None:
-        """Launch ``tdm_compact_plan`` on a side stream into the current slot.
+        """Launch ``tdm_compact_plan`` into the current slot, in stream order.
 
-        The plan only needs ``topk_ids``, so the caller can hide the first
-        layer's plan behind RMSNorm. Later layers should pass ``next_topk_ids``
-        to ``forward`` so the plan overlaps the previous expert GEMM instead.
-        A no-op off the compact path.
+        The plan only needs ``topk_ids``, so the caller may issue it before the
+        first layer's RMSNorm. A no-op off the compact path.
         """
         self._ep.prefetch(topk_ids, recv_token_bound)
 
