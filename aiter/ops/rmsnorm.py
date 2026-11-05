@@ -407,6 +407,13 @@ def _use_hip_common(input: Tensor, use_model_sensitive_rmsnorm: int) -> bool:
     )
 
 
+# Routed here rather than on either public spelling or on a backend binding.
+# rms_norm and rmsnorm2d_fwd are two public names for one op and both call this
+# directly, so this is where the op begins; the HIP and opus choice is made
+# below it, so a provider sees the op rather than one backend's share of it.
+# Version 2: version 1 was the HIP binding's write-out contract, which is a
+# different shape, not an older spelling of this one.
+@_route(op="rmsnorm", version=2)
 def _rms_norm_fwd_dispatch(
     input, weight, epsilon, use_model_sensitive_rmsnorm
 ) -> Tensor:
@@ -642,7 +649,6 @@ def rmsnorm_quant(
     """
 
 
-@_route(op="rmsnorm", version=1)
 @compile_ops("module_rmsnorm_quant", develop=True)
 def rmsnorm(
     out: Tensor,

@@ -67,15 +67,21 @@ def _clean_plugin_state(monkeypatch):
 
 
 def test_routed_ops_register_the_public_contract():
-    assert aiter.rmsnorm.__aiter_plugin_op__ == plugin.Op("rmsnorm", 1)
+    # rmsnorm is routed where rms_norm and rmsnorm2d_fwd converge, so neither
+    # public spelling carries the marker and the low-level binding no longer
+    # does either -- the op is the contract, not any one function name.
+    assert "rmsnorm" in plugin.status()["routed_ops"]
+    assert not hasattr(aiter.rmsnorm, "__aiter_plugin_op__")
     assert aiter.pertoken_quant.__aiter_plugin_op__ == plugin.Op("pertoken_quant", 1)
-    assert list(signature(aiter.rmsnorm).parameters) == [
-        "out",
-        "input",
-        "weight",
-        "epsilon",
-        "gemma_norm",
-    ]
+    # Both public spellings still report their own signatures, which is what
+    # makes either of them routable at all.
+    for spelling in (aiter.rms_norm, aiter.rmsnorm2d_fwd):
+        assert list(signature(spelling).parameters) == [
+            "input",
+            "weight",
+            "epsilon",
+            "use_model_sensitive_rmsnorm",
+        ]
     assert list(signature(aiter.pertoken_quant).parameters) == [
         "x",
         "scale",
@@ -133,23 +139,23 @@ def test_pertoken_quant_provider_serves_when_enabled(monkeypatch):
     assert decision.kernel_id == "kernel-1"
 
 
-def test_rmsnorm_provider_serves_without_gpu(monkeypatch):
-    # A served call never reaches the native ROCm kernel, so CPU tensors are
-    # enough to prove the routed path: if native ran, it would fail on CPU.
-    provider = _Provider("aklr", _candidate("aklr"))
-    provider.op_versions = {"rmsnorm": {1}}
+def test_rmsnorm_provider_serves_through_either_public_spelling(monkeypatch):
+    """Routing the convergence point covers both names, not one of them."""
+
+    provider = _Provider("aklr", _candidate("aklr", torch.full((2, 4), 7.0)))
+    provider.op_versions = {"rmsnorm": {2}}
     plugin.configure(enable=("aklr",), source="test")
     monkeypatch.setattr(
         plugin, "_entry_points", lambda: (_EntryPoint("aklr", provider),)
     )
-    out = torch.zeros(2, 4)
 
-    aiter.rmsnorm(out, torch.rand(2, 4), torch.ones(4), 1e-6)
+    for spelling in (aiter.rms_norm, aiter.rmsnorm2d_fwd):
+        result = spelling(torch.rand(2, 4), torch.ones(4), 1e-6)
+        decision = plugin.last_decision()
+        assert (decision.route, decision.provider) == ("provider", "aklr")
+        assert torch.equal(result, torch.full((2, 4), 7.0))
 
-    assert provider.select_calls == 1
-    decision = plugin.last_decision()
-    assert decision.route == "provider"
-    assert decision.provider == "aklr"
+    assert provider.select_calls == 2
 
 
 _REFERENCE_PROVIDER = '''
@@ -165,9 +171,15 @@ import torch
 from aiter import plugin
 
 
-def _rms_norm(out, input, weight, epsilon, gemma_norm=False):
+def _rms_norm(input, weight, epsilon, use_model_sensitive_rmsnorm=0):
+    """Functional, because that is the shape of the routed contract.
+
+    The op is routed where both public spellings converge, above the backend
+    choice, and that layer allocates and returns rather than writing into a
+    caller's buffer.
+    """
     scale = torch.rsqrt(input.float().pow(2).mean(-1, keepdim=True) + epsilon)
-    out.copy_((input.float() * scale * weight.float()).to(out.dtype))
+    return (input.float() * scale * weight.float()).to(input.dtype)
 
 
 def _rms_norm_with_add(
@@ -192,7 +204,7 @@ class Provider:
     api_versions = {plugin.API_VERSION}
     # One release, two contracts. A provider need not cover an op family to
     # serve part of it.
-    op_versions = {"rmsnorm": {1}, "rmsnorm_with_add": {1}, "pertoken_quant": {1}}
+    op_versions = {"rmsnorm": {2}, "rmsnorm_with_add": {1}, "pertoken_quant": {1}}
 
     def __init__(self):
         self.kernels = {
@@ -216,7 +228,10 @@ class Provider:
         candidate = self.kernels.get(op.name)
         if candidate is None:
             return None  # declining is normal, and must be observable
-        if args[0].shape[-1] % 2:
+        # The first tensor argument differs by contract: the write-out shapes
+        # take the output first, the functional one takes the input.
+        shaped = args[0]
+        if shaped.shape[-1] % 2:
             return None  # a per-call coverage decision, the shape it is for
         return candidate
 
@@ -250,12 +265,10 @@ def test_an_installed_provider_serves_a_routed_contract(tmp_path, monkeypatch):
     _install_reference_provider(tmp_path, monkeypatch)
     plugin.configure(enable=("refprov",), source="test")
 
-    out = torch.zeros(2, 8)
-    reference = torch.zeros(2, 8)
     weight = torch.rand(8)
     value = torch.rand(2, 8)
 
-    aiter.rmsnorm(out, value, weight, 1e-6)
+    out = aiter.rmsnorm2d_fwd(value, weight, 1e-6)
 
     decision = plugin.last_decision()
     assert (decision.route, decision.provider) == ("provider", "refprov")
@@ -263,10 +276,12 @@ def test_an_installed_provider_serves_a_routed_contract(tmp_path, monkeypatch):
     assert decision.artifact_digest == "sha256:0000"
     assert decision.config_source == "configure:test"
 
-    # It computed the op, not merely claimed the route.
+    # It computed the op, not merely claimed the route. CPU tensors are proof
+    # enough on their own: the native path here is a ROCm kernel that would not
+    # run on them at all.
     scale = torch.rsqrt(value.float().pow(2).mean(-1, keepdim=True) + 1e-6)
-    reference.copy_((value.float() * scale * weight.float()).to(reference.dtype))
-    torch.testing.assert_close(out, reference)
+    expect = (value.float() * scale * weight.float()).to(out.dtype)
+    torch.testing.assert_close(out, expect)
 
     del tmp_path
     plugin.configure(enable=(), source="test")
@@ -333,7 +348,7 @@ def test_one_provider_serving_two_contracts_is_recorded_separately(
     _install_reference_provider(tmp_path, monkeypatch)
     plugin.configure(enable=("refprov",), source="test")
 
-    aiter.rmsnorm(torch.zeros(2, 8), torch.rand(2, 8), torch.rand(8), 1e-6)
+    aiter.rmsnorm2d_fwd(torch.rand(2, 8), torch.rand(8), 1e-6)
     aiter.rmsnorm2d_fwd_with_add(
         torch.zeros(2, 8),
         torch.rand(2, 8),
