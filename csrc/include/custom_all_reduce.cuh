@@ -26,6 +26,7 @@
 #include <iostream>
 #include <limits>
 #include <map>
+#include <memory>
 #include <string>
 #include <type_traits>
 #include <unordered_map>
@@ -4148,6 +4149,451 @@ __global__ void __launch_bounds__(block_size) ar_ll128_unroll2(
   ll128EpochEnd(graph_safe_flag, blockIdx.x, gridDim.x, LL128_MAX_BLOCK_NUM, flag);
 }
 
+// ===========================================================================
+// Lamport all-reduce: one-shot and two-shot wave split (2-byte dtypes, wave64)
+// ===========================================================================
+// Push-only, barrier-free all-reduce. Every rank writes its data straight into
+// its peers' inboxes (a separate uncached IPC buffer, see initLamport) and only
+// polls its own. The data is its own signal: an inbox starts as the 0xffff
+// sentinel (NaN in bf16 and fp16), real data never carries it
+// (lamportCanonicalize turns 0xffff into 0x7fff, also NaN), so a 16B slot has
+// arrived once none of its half-words is 0xffff. Half-words are checked one by
+// one, so a slot that lands in pieces is fine.
+//
+// Inbox: [kLamportBuffers][ngpus source ranks][positions] of 16B, with
+// kLamportMaxPacks positions for the one-shot and lamportTwoShotMaxPart(ngpus)
+// for each two-shot inbox. A rank only ever writes slot[its rank] of a peer's
+// inbox, so every position has one writer and one reader. The own slot is
+// never written.
+//
+// Rounds: every block has a rank-local round counter c in {0, 1, 2}; round c
+// uses buffer c and, at its end, re-arms buffer (c+2)%3 to the sentinel. No
+// rank finishes round c without every peer's round c data, so ranks are at
+// most one round apart, every peer's round c-1 data has been read when buffer
+// (c+2)%3 is re-armed, nobody writes it again before round c+2, and the kernel
+// boundary orders the re-arm before this rank's next sends. Every lane of a
+// launched block re-arms, even past the message: a position used last round
+// but not in this one would otherwise keep stale data. A block always covers
+// the same kLamportWaveSize positions, so a block id's counter is the same on
+// every rank whatever the message size, and a launch is one round (no
+// grid-stride loop), which caps the message (see the run functions). A launch
+// may have more blocks than the GPU holds at once (up to 1024 at TP2 for a 2MB
+// two-shot); that is fine, as a block only waits for the blocks of the same id
+// on the other ranks, never for another block of its own launch.
+//
+// Sums run in fp32 in rank order 0..ngpus-1 and round once, so every rank gets
+// the same bits.
+//
+// Wave split: a block is ngpus waves over the same kLamportWaveSize positions;
+// wave w talks to rank (rank + w) % ngpus only, so wave 0 is this rank, each
+// lane waits for one cross-GPU store instead of ngpus - 1, and a wave whose
+// data has arrived stops polling.
+// ===========================================================================
+constexpr int kLamportBuffers   = 3;
+constexpr int kLamportMaxPacks  = 512 * 80; // positions per inbox slot (640KB of 2-byte data)
+constexpr int kLamportWaveSize  = 64;       // positions per block, one per lane of a wave64
+constexpr int kLamportMaxBlocks = kLamportMaxPacks / kLamportWaveSize;
+
+// Largest two-shot message: the largest the dispatch takes (2MB at TP2, see
+// CustomAllreduce::lamportKernel); TP4 / TP8 stop at 1MB there, the rest is
+// for the forced kernel in the tuning sweeps. The inboxes are sized from it,
+// so raising a dispatch cap past it means raising it too. The one-shot keeps
+// kLamportMaxPacks positions (640KB).
+constexpr int64_t kLamportTwoShotMaxBytes = 2ll << 20;
+
+// two-shot positions per chunk, i.e. per rank, of the largest message
+inline constexpr int64_t lamportTwoShotMaxPart(int ngpus)
+{
+    return kLamportTwoShotMaxBytes / 16 / ngpus;
+}
+
+// two-shot round counters, one per block of the largest message
+inline constexpr int64_t lamportTwoShotMaxBlocks(int ngpus)
+{
+    return lamportTwoShotMaxPart(ngpus) / kLamportWaveSize;
+}
+
+// The one-shot inbox: [kLamportBuffers][ngpus][kLamportMaxPacks] of 16B.
+inline constexpr int64_t lamportInboxBytes(int ngpus)
+{
+    return (int64_t)kLamportBuffers * ngpus * kLamportMaxPacks * 16;
+}
+
+// One two-shot inbox: [kLamportBuffers][ngpus][lamportTwoShotMaxPart(ngpus)]
+// of 16B, 3 * kLamportTwoShotMaxBytes = 6MB for any ngpus.
+inline constexpr int64_t lamportTwoShotInboxBytes(int ngpus)
+{
+    return (int64_t)kLamportBuffers * ngpus * lamportTwoShotMaxPart(ngpus) * 16;
+}
+
+// A rank's lamport IPC buffer: the one-shot inbox, then the two-shot
+// reduce-scatter inbox and all-gather inbox (TP2 / TP4 / TP8: 15.75 / 19.5 /
+// 27MB).
+inline constexpr int64_t lamportBufferBytes(int ngpus)
+{
+    return lamportInboxBytes(ngpus) + 2 * lamportTwoShotInboxBytes(ngpus);
+}
+
+struct __align__(16) LamportPeers
+{
+    void* ptrs[8];
+};
+
+// bit 15 of every half-word of w that is the 0xffff sentinel
+DINLINE uint32_t lamportSentinelMask(uint32_t w)
+{
+    uint32_t x   = ~w;                                    // w_h == 0xffff <=> x_h == 0
+    uint32_t tmp = ((x & 0x7fff7fff) + 0x7fff7fff) | x;   // bit 15 = (x_h != 0), no carry out
+    return (tmp & 0x80008000) ^ 0x80008000;
+}
+
+// 0xffff -> 0x7fff, both NaN, so real data never looks like the sentinel
+DINLINE uint32_t lamportCanonicalize(uint32_t w) { return w ^ lamportSentinelMask(w); }
+
+// Spin on one 16B inbox slot until none of its half-words is the sentinel.
+template <typename V>
+DINLINE V lamportPollSlot(const V* slot_ptr)
+{
+    V slot_val;
+    uint32_t wait_mask;
+    do
+    {
+        // without the memory clobber the load is hoisted out of the loop
+        asm volatile("" ::: "memory");
+        slot_val  = __builtin_nontemporal_load(slot_ptr);
+        wait_mask = 0;
+#pragma unroll
+        for(int j = 0; j < 4; ++j)
+            wait_mask |= lamportSentinelMask(slot_val[j]);
+    } while(wait_mask != 0);
+    return slot_val;
+}
+
+/*
+ * One-shot: wave w loads the block's packs, pushes them into slot[rank] of the
+ * inbox of rank peer = (rank + w) % ngpus, polls slot[peer] of its own inbox
+ * and puts what it got into LDS by source rank. Wave 0 puts its own packs
+ * there. After one __syncthreads wave 0 sums in rank order and writes the
+ * output while the other waves re-arm their slot.
+ */
+template <typename T, int ngpus>
+__global__ void __launch_bounds__(ngpus * kLamportWaveSize, 1) lamportAllReduceWaveSplit(
+    const T* __restrict__ input,
+    T* __restrict__ result,
+    LamportPeers peers,
+    uint32_t* __restrict__ round_counter, // [kLamportMaxBlocks], rank-local
+    int rank,
+    int num_packs) // 16B packs in the message
+{
+    static_assert(sizeof(T) == 2, "sentinel 0xffff is only defined for 2-byte dtypes");
+    constexpr int pack_size        = 16 / sizeof(T);
+    constexpr int64_t buffer_packs = (int64_t)ngpus * kLamportMaxPacks;
+    using P        = typename opus::vector_t<T, pack_size>;
+    using A        = typename opus::vector_t<opus::fp32_t, pack_size>;
+    using ui32x4_t = __attribute__((__vector_size__(4 * sizeof(uint32_t)))) uint32_t;
+    union pack
+    {
+        P data;
+        ui32x4_t i;
+    };
+
+    __shared__ uint32_t s_round;
+    __shared__ P s_data[ngpus][kLamportWaveSize]; // by source rank
+    if(threadIdx.x == 0)
+        s_round = round_counter[blockIdx.x];
+    __syncthreads();
+    const uint32_t round = s_round;
+    const uint32_t rearm = (round + 2) % kLamportBuffers;
+
+    // wave-uniform, so the branches below are scalar and the pointers SGPRs
+    const int wave_id    = __builtin_amdgcn_readfirstlane(threadIdx.x / kLamportWaveSize);
+    const int lane_id    = threadIdx.x % kLamportWaveSize;
+    const int peer       = (rank + wave_id) % ngpus;
+    const int pack_id    = blockIdx.x * kLamportWaveSize + lane_id;
+    const bool is_active = pack_id < num_packs;
+
+    ui32x4_t* self_inbox = reinterpret_cast<ui32x4_t*>(peers.ptrs[rank]);
+    ui32x4_t* peer_inbox = reinterpret_cast<ui32x4_t*>(peers.ptrs[peer]);
+
+    if(is_active)
+    {
+        // every wave loads the same packs, the repeats mostly hit the cache
+        pack pack_val;
+        pack_val.data = *(reinterpret_cast<const P*>(input) + pack_id);
+#pragma unroll
+        for(int j = 0; j < 4; ++j)
+            pack_val.i[j] = lamportCanonicalize(pack_val.i[j]);
+
+        if(wave_id != 0)
+        {
+            __builtin_nontemporal_store(
+                pack_val.i,
+                peer_inbox + round * buffer_packs + rank * kLamportMaxPacks + pack_id);
+            pack_val.i = lamportPollSlot(self_inbox + round * buffer_packs +
+                                         peer * kLamportMaxPacks + pack_id);
+        }
+        s_data[peer][lane_id] = pack_val.data;
+    }
+    __syncthreads();
+
+    if(wave_id != 0)
+    {
+        // re-arm slot[peer] of last round's buffer, on every lane
+        const ui32x4_t sentinel{0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu};
+        __builtin_nontemporal_store(
+            sentinel, self_inbox + rearm * buffer_packs + peer * kLamportMaxPacks + pack_id);
+    }
+    else if(is_active)
+    {
+        A acc;
+#pragma unroll
+        for(int i = 0; i < ngpus; ++i)
+        {
+            const P rank_data = s_data[i][lane_id];
+#pragma unroll
+            for(int j = 0; j < pack_size; ++j)
+                acc[j] = i == 0 ? upcast_s(rank_data[j]) : acc[j] + upcast_s(rank_data[j]);
+        }
+        P out_val;
+#pragma unroll
+        for(int j = 0; j < pack_size; ++j)
+            out_val[j] = downcast_s<T>(acc[j]);
+        *(reinterpret_cast<P*>(result) + pack_id) = out_val;
+    }
+
+    if(threadIdx.x == 0)
+        round_counter[blockIdx.x] = (round + 1) % kLamportBuffers;
+}
+
+/*
+ * Two-shot: the message is ngpus chunks of `part` packs, chunk j is reduced on
+ * rank j. Position t = kLamportWaveSize * blockIdx.x + lane, t < part, stands
+ * for pack j * part + t of every chunk j, on every rank.
+ *   reduce-scatter: wave w loads pack t of chunk peer = (rank + w) % ngpus,
+ *     pushes it into slot[rank] of peer's rs inbox and polls slot[peer] of its
+ *     own, where peer put its copy of this rank's chunk. Wave 0 loads this
+ *     rank's chunk. All of it goes to LDS by source rank, one __syncthreads.
+ *   all-gather: every wave sums the LDS entries in rank order itself (same
+ *     bits in every wave, no second sync). Wave 0 writes this rank's chunk of
+ *     the output; wave w pushes the sum into slot[rank] of peer's ag inbox,
+ *     polls slot[peer] of its own and writes peer's chunk.
+ * peers.ptrs[i] is rank i's rs inbox, its ag inbox follows. Both inboxes use
+ * the block's one round counter. Ranks stay at most one round apart: nobody
+ * finishes round c without every peer's round c ag data. A rank may still be
+ * waiting for round c-1 ag data while a peer is in round c, but by then it has
+ * sent everything of round c-1, so the peer's re-arm at the end of round c is
+ * still safe.
+ */
+template <typename T, int ngpus>
+__global__ void __launch_bounds__(ngpus * kLamportWaveSize, 1) lamportAllReduceTwoShotWaveSplit(
+    const T* __restrict__ input,
+    T* __restrict__ result,
+    LamportPeers peers,
+    uint32_t* __restrict__ round_counter, // [lamportTwoShotMaxBlocks(ngpus)], rank-local
+    int rank,
+    int part) // packs per chunk, the message is ngpus * part packs
+{
+    static_assert(sizeof(T) == 2, "sentinel 0xffff is only defined for 2-byte dtypes");
+    constexpr int pack_size = 16 / sizeof(T);
+    // positions per inbox slot; packs from one buffer to the next, and from
+    // the rs inbox to the ag inbox
+    constexpr int64_t max_part     = lamportTwoShotMaxPart(ngpus);
+    constexpr int64_t buffer_packs = ngpus * max_part;
+    constexpr int64_t inbox_packs  = kLamportBuffers * buffer_packs;
+    using P        = typename opus::vector_t<T, pack_size>;
+    using A        = typename opus::vector_t<opus::fp32_t, pack_size>;
+    using ui32x4_t = __attribute__((__vector_size__(4 * sizeof(uint32_t)))) uint32_t;
+    union pack
+    {
+        P data;
+        ui32x4_t i;
+    };
+
+    __shared__ uint32_t s_round;
+    __shared__ P s_data[ngpus][kLamportWaveSize]; // by source rank
+    if(threadIdx.x == 0)
+        s_round = round_counter[blockIdx.x];
+    __syncthreads();
+    const uint32_t round = s_round;
+    const uint32_t rearm = (round + 2) % kLamportBuffers;
+
+    const int wave_id    = __builtin_amdgcn_readfirstlane(threadIdx.x / kLamportWaveSize);
+    const int lane_id    = threadIdx.x % kLamportWaveSize;
+    const int peer       = (rank + wave_id) % ngpus;
+    const int pos        = blockIdx.x * kLamportWaveSize + lane_id;
+    const bool is_active = pos < part;
+
+    ui32x4_t* self_inbox = reinterpret_cast<ui32x4_t*>(peers.ptrs[rank]);
+    ui32x4_t* peer_inbox = reinterpret_cast<ui32x4_t*>(peers.ptrs[peer]);
+    // this round's slot written in peer's inbox, and the one polled in mine
+    const int64_t send_off = round * buffer_packs + rank * max_part + pos;
+    const int64_t recv_off = round * buffer_packs + peer * max_part + pos;
+
+    // reduce-scatter
+    if(is_active)
+    {
+        pack pack_val;
+        pack_val.data = *(reinterpret_cast<const P*>(input) + (int64_t)peer * part + pos);
+#pragma unroll
+        for(int j = 0; j < 4; ++j)
+            pack_val.i[j] = lamportCanonicalize(pack_val.i[j]);
+
+        if(wave_id != 0)
+        {
+            __builtin_nontemporal_store(pack_val.i, peer_inbox + send_off);
+            pack_val.i = lamportPollSlot(self_inbox + recv_off);
+        }
+        s_data[peer][lane_id] = pack_val.data;
+    }
+    __syncthreads();
+
+    // all-gather
+    if(is_active)
+    {
+        A acc;
+#pragma unroll
+        for(int i = 0; i < ngpus; ++i)
+        {
+            const P rank_data = s_data[i][lane_id];
+#pragma unroll
+            for(int j = 0; j < pack_size; ++j)
+                acc[j] = i == 0 ? upcast_s(rank_data[j]) : acc[j] + upcast_s(rank_data[j]);
+        }
+        pack sum_val;
+#pragma unroll
+        for(int j = 0; j < pack_size; ++j)
+            sum_val.data[j] = downcast_s<T>(acc[j]);
+        // peers would take a 0xffff sum for "not arrived"; this rank's output
+        // uses the same canonical bits
+#pragma unroll
+        for(int j = 0; j < 4; ++j)
+            sum_val.i[j] = lamportCanonicalize(sum_val.i[j]);
+
+        if(wave_id == 0)
+        {
+            *(reinterpret_cast<P*>(result) + (int64_t)rank * part + pos) = sum_val.data;
+        }
+        else
+        {
+            __builtin_nontemporal_store(sum_val.i, peer_inbox + inbox_packs + send_off);
+            sum_val.i = lamportPollSlot(self_inbox + inbox_packs + recv_off);
+            *(reinterpret_cast<P*>(result) + (int64_t)peer * part + pos) = sum_val.data;
+        }
+    }
+
+    if(wave_id != 0)
+    {
+        // re-arm slot[peer] of last round's buffer in both inboxes, on every lane
+        const ui32x4_t sentinel{0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu};
+        const int64_t rearm_off = rearm * buffer_packs + peer * max_part + pos;
+        __builtin_nontemporal_store(sentinel, self_inbox + rearm_off);
+        __builtin_nontemporal_store(sentinel, self_inbox + inbox_packs + rearm_off);
+    }
+
+    if(threadIdx.x == 0)
+        round_counter[blockIdx.x] = (round + 1) % kLamportBuffers;
+}
+
+// What CustomAllreduce::allreduce() runs for a message; none keeps the
+// original dispatch (LL / LL128 / 1-stage / 2-stage).
+enum class LamportKernel : int
+{
+    none     = 0,
+    one_shot = 1, // lamportAllReduceWaveSplit
+    two_shot = 2, // lamportAllReduceTwoShotWaveSplit
+};
+
+// Device state of the lamport path, owned by CustomAllreduce (initLamport).
+// The one-shot and the two-shot have their own inboxes and round counters.
+struct LamportState
+{
+    LamportPeers one_shot_peers{};        // every rank's one-shot inbox
+    LamportPeers two_shot_peers{};        // every rank's rs inbox, its ag inbox follows
+    uint32_t* d_one_shot_round = nullptr; // [kLamportMaxBlocks], rank-local
+    uint32_t* d_two_shot_round = nullptr; // [lamportTwoShotMaxBlocks(world_size)], rank-local
+    int rank                   = 0;
+    int world_size             = 0;
+
+    ~LamportState()
+    {
+        if(d_one_shot_round)
+            (void)hipFree(d_one_shot_round);
+        if(d_two_shot_round)
+            (void)hipFree(d_two_shot_round);
+    }
+
+    // largest message of one launch, in bytes
+    static constexpr int64_t oneShotMaxBytes() { return (int64_t)kLamportMaxPacks * 16; }
+    static constexpr int64_t twoShotMaxBytes() { return kLamportTwoShotMaxBytes; }
+
+    // the message must be whole 16B packs, at most oneShotMaxBytes()
+    template <typename T>
+    void runOneShot(hipStream_t stream, const T* input, T* output, int64_t numel)
+    {
+        const int64_t bytes     = numel * (int64_t)sizeof(T);
+        const int64_t num_packs = bytes / 16;
+        if(bytes % 16 != 0 || num_packs > kLamportMaxPacks)
+            throw std::runtime_error("lamport one-shot: " + std::to_string(bytes) +
+                                     "B is not whole 16B packs within " +
+                                     std::to_string(oneShotMaxBytes()) + "B");
+        if(num_packs == 0)
+            return;
+        const int num_blocks = (int)((num_packs + kLamportWaveSize - 1) / kLamportWaveSize);
+        launch<T>(true, stream, input, output, num_blocks, (int)num_packs);
+    }
+
+    // the message must split into world_size chunks of whole 16B packs, at
+    // most twoShotMaxBytes()
+    template <typename T>
+    void runTwoShot(hipStream_t stream, const T* input, T* output, int64_t numel)
+    {
+        const int64_t bytes = numel * (int64_t)sizeof(T);
+        const int64_t part  = bytes / 16 / world_size;
+        if(bytes % (16 * world_size) != 0 || part > lamportTwoShotMaxPart(world_size))
+            throw std::runtime_error("lamport two-shot: " + std::to_string(bytes) +
+                                     "B is not " + std::to_string(world_size) +
+                                     " chunks of whole 16B packs within " +
+                                     std::to_string(twoShotMaxBytes()) + "B");
+        if(part == 0)
+            return;
+        const int num_blocks = (int)((part + kLamportWaveSize - 1) / kLamportWaveSize);
+        launch<T>(false, stream, input, output, num_blocks, (int)part);
+    }
+
+    private:
+    template <typename T>
+    void launch(bool is_one_shot,
+                hipStream_t stream,
+                const T* input,
+                T* output,
+                int num_blocks,
+                int count)
+    {
+#define LAUNCH_LAMPORT(NGPUS)                                                           \
+    case NGPUS:                                                                         \
+        if(is_one_shot)                                                                 \
+            lamportAllReduceWaveSplit<T, NGPUS>                                         \
+                <<<num_blocks, NGPUS * kLamportWaveSize, 0, stream>>>(                  \
+                    input, output, one_shot_peers, d_one_shot_round, rank, count);      \
+        else                                                                            \
+            lamportAllReduceTwoShotWaveSplit<T, NGPUS>                                  \
+                <<<num_blocks, NGPUS * kLamportWaveSize, 0, stream>>>(                  \
+                    input, output, two_shot_peers, d_two_shot_round, rank, count);      \
+        break;
+
+        switch(world_size)
+        {
+            LAUNCH_LAMPORT(2)
+            LAUNCH_LAMPORT(4)
+            LAUNCH_LAMPORT(8)
+        default:
+            throw std::runtime_error("lamport all-reduce supports 2, 4 or 8 ranks, not " +
+                                     std::to_string(world_size));
+        }
+#undef LAUNCH_LAMPORT
+    }
+};
+
 class CustomAllreduce
 {
     public:
@@ -4178,6 +4624,9 @@ class CustomAllreduce
     // (not during graph capture) so the LL kernels are graph-capture safe.
     uint32_t* d_ll_poc_block_flags_  = nullptr; // array[kMaxBlocks]
     uint32_t* d_ll128_unroll2_epoch_ = nullptr; // array[LL128_MAX_BLOCK_NUM]
+
+    // Lamport path of allreduce() (initLamport); null keeps the original dispatch.
+    std::unique_ptr<LamportState> lamport_;
 
     template <typename T>
     T* local_tmp_reduced_ptr() const
@@ -4725,6 +5174,96 @@ class CustomAllreduce
         return world_size_ == 8 && bytes > 512 * 4096 * 2 && is_gfx942;
     }
 
+    // -----------------------------------------------------------------------
+    // Lamport path of allreduce(). self_ptr is this rank's buffer of
+    // lamportBufferBytes(world_size_) bytes (uncached), handles/offsets every
+    // rank's IPC handle for theirs. The buffer is filled with the sentinel
+    // here, so the caller must barrier across ranks after this returns and
+    // before the first all-reduce: otherwise a fast peer's first round could be
+    // wiped by this memset. Must run outside graph capture.
+    // -----------------------------------------------------------------------
+    void initLamport(void* self_ptr, const hipIpcMemHandle_t* handles, const int64_t* offsets)
+    {
+        if(lamport_)
+            throw std::runtime_error("initLamport: already initialized");
+        if(world_size_ != 2 && world_size_ != 4 && world_size_ != 8)
+            throw std::invalid_argument("initLamport: world size must be 2, 4 or 8");
+        auto state        = std::make_unique<LamportState>();
+        state->rank       = rank_;
+        state->world_size = world_size_;
+        for(int i = 0; i < world_size_; i++)
+        {
+            char* base = i == rank_ ? static_cast<char*>(self_ptr)
+                                    : open_ipc_handle(&handles[i]) + offsets[i];
+            state->one_shot_peers.ptrs[i] = base;
+            state->two_shot_peers.ptrs[i] = base + lamportInboxBytes(world_size_);
+        }
+        HIP_CALL(hipMemset(self_ptr, 0xff, lamportBufferBytes(world_size_)));
+        HIP_CALL(hipMalloc((void**)&state->d_one_shot_round, sizeof(uint32_t) * kLamportMaxBlocks));
+        HIP_CALL(hipMemset(state->d_one_shot_round, 0, sizeof(uint32_t) * kLamportMaxBlocks));
+        const size_t two_shot_round_bytes = sizeof(uint32_t) * lamportTwoShotMaxBlocks(world_size_);
+        HIP_CALL(hipMalloc((void**)&state->d_two_shot_round, two_shot_round_bytes));
+        HIP_CALL(hipMemset(state->d_two_shot_round, 0, two_shot_round_bytes));
+        HIP_CALL(hipDeviceSynchronize());
+        lamport_ = std::move(state);
+    }
+
+    // Which lamport kernel allreduce() runs for a 2-byte message of numel
+    // elements, none keeps the original dispatch. Every rank must get the same
+    // answer, so it depends only on the message and the group.
+    //
+    // Ranges come from CUDA-graph sweeps (test_custom_allreduce_lamport.py,
+    // bf16, H 7168 / 8192, registered and copy-in capture) on MI308X (gfx942)
+    // and MI350X (gfx950). One set of ranges serves both archs, bounded by
+    // gfx950, where the original dispatch catches up on large messages:
+    //   TP2        one-shot up to 128KB (8 tokens), two-shot up to 2MB
+    //   TP4 / TP8  one-shot up to 64KB (4 tokens),  two-shot up to 1MB
+    // Registered input, lamport over the original dispatch inside the ranges:
+    //   gfx950  TP2 1.03-1.23x, TP4 1.00-1.39x, TP8 1.02-1.53x
+    //   gfx942  TP2 1.02-1.23x, TP4 1.04-1.46x, TP8 1.13-1.47x
+    // Just past them on gfx950 the original dispatch is as fast or faster
+    // (TP2 0.99x at 3.5MB, TP4 0.98x at 1.75MB, TP8 0.98x at 2MB) and stays
+    // so up to 64MB (TP8 down to 0.90x), so it runs there. Two-shot was still
+    // 1.01-1.27x faster above these caps on gfx942; that gain is given up.
+    // The forced kernels (lamportAllReduce) take up to oneShotMaxBytes()
+    // (640KB) and twoShotMaxBytes() (2MB), for the sweeps.
+    LamportKernel lamportKernel(int64_t numel) const
+    {
+        if(!lamport_)
+            return LamportKernel::none;
+        const int64_t bytes  = numel * 2;
+        // one-shot in (0, one_shot_max], then two-shot in (one_shot_max, two_shot_max]
+        const int64_t one_shot_max = world_size_ == 2 ? 128 * 1024 : 64 * 1024;
+        const int64_t two_shot_max =
+            std::min(world_size_ == 2 ? int64_t(2) << 20 : int64_t(1) << 20,
+                     lamport_->twoShotMaxBytes());
+        if(bytes <= one_shot_max)
+            return LamportKernel::one_shot;
+        if(bytes <= two_shot_max && bytes % (16 * world_size_) == 0)
+            return LamportKernel::two_shot;
+        return LamportKernel::none;
+    }
+
+    // The lamport kernel allreduce() runs for numel elements of elem_size
+    // bytes; all_reduce() in custom_all_reduce.cu asks it too, to skip the
+    // copy-in for exactly these messages.
+    LamportKernel lamportDispatch(int64_t numel, int64_t elem_size, bool use_new) const
+    {
+        return elem_size == 2 && use_new ? lamportKernel(numel) : LamportKernel::none;
+    }
+
+    // Runs one lamport kernel; LamportKernel::none does nothing.
+    template <typename T>
+    void runLamport(hipStream_t stream, const T* input, T* output, int64_t numel, LamportKernel kernel)
+    {
+        if(kernel != LamportKernel::none && !lamport_)
+            throw std::runtime_error("runLamport: initLamport was not called");
+        if(kernel == LamportKernel::one_shot)
+            lamport_->runOneShot<T>(stream, input, output, numel);
+        else if(kernel == LamportKernel::two_shot)
+            lamport_->runTwoShot<T>(stream, input, output, numel);
+    }
+
     template <typename T>
     void allreduce(hipStream_t stream,
                    T* input,
@@ -4748,6 +5287,20 @@ class CustomAllreduce
     if(block_limit > kMaxBlocks)
         throw std::runtime_error("max supported block limit is " + std::to_string(kMaxBlocks) +
                                  ". Got " + std::to_string(block_limit));
+
+    // Lamport one-shot / two-shot, ahead of every other path (see
+    // lamportKernel). It reads only this rank's input, so the registered input,
+    // the copy-in pool and an unregistered input all work, and it records no
+    // graph buffer.
+    if constexpr(sizeof(T) == 2)
+    {
+        const LamportKernel lamport_kernel = lamportDispatch(size, sizeof(T), use_new);
+        if(lamport_kernel != LamportKernel::none)
+        {
+            runLamport<T>(stream, input, output, size, lamport_kernel);
+            return;
+        }
+    }
 
     // -----------------------------------------------------------------------
     // LL / LL128 small-message fast path (gfx9). Routes small messages to the
@@ -5130,6 +5683,12 @@ template <typename T>
 void dispatchAllGather(
     hipStream_t stream, T* input, T* output, int size, int last_dim_size, int gather_dim)
 {
+    // Idle DP-attention groups can have empty shards. There is no payload to exchange,
+    // and launching zero blocks would leave an error for the next operator to report.
+    if(size == 0)
+    {
+        return;
+    }
     RankData* ptrs = get_buffer_RD(stream, input);
     auto d         = 16 / sizeof(T);
     dim3 block(512);

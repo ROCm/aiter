@@ -11,7 +11,7 @@ import torch
 from ..jit.core import compile_ops
 from ..jit.utils.chip_info import get_gfx, get_gfx_runtime
 from ..utility import dtypes
-from ..utility.graph_alloc import persistent_alloc
+from ..utility.graph_alloc import capture_scoped_cache, persistent_alloc
 
 
 # Raw binding: no argument validation, correction_bias must be a real tensor.
@@ -79,7 +79,7 @@ def _can_use_gfx1250_exact_sigmoid_topk(
     )
     if not input_ok or not bias_ok or not outputs_ok or not same_device:
         return False
-    return get_gfx_runtime() == "gfx1250"
+    return get_gfx_runtime() in ("gfx1250", "gfx1250-strict")
 
 
 def _gfx1250_exact_sigmoid_topk(
@@ -578,7 +578,7 @@ def _use_mulblocks(numRows: int, stride0: int) -> bool:
     )
 
 
-@functools.lru_cache(maxsize=16)
+@capture_scoped_cache
 def _get_topk_mb_workspace_keyed(
     device: torch.device, stream_id: int, size: int
 ) -> torch.Tensor:
