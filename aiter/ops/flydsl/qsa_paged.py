@@ -523,8 +523,8 @@ def qsa_indexer_score_and_select(
         scores = torch.empty(m, n_columns, dtype=torch.float32, device=q.device)
     row_lens = torch.empty(m, dtype=torch.int32, device=q.device)
     score_tiles = ceildiv(n_columns, score_block_n)
-    # numel() is the packed page. A vLLM layer view pads the page stride,
-    # so the bytes the descriptor has to cover are the span.
+    # numel() is the packed page. The page stride may be larger than the
+    # packed page, and the descriptor covers that span.
     wide_cache = span_bytes(k_cache) > (1 << 32)
     k_strides = tuple(int(s) for s in k_cache.stride()[:3]) if wide_cache else None
     if _indexer_uses_prefill_scorer(int(context_lens.shape[0]), m, n_heads, arch):
@@ -646,8 +646,8 @@ def qsa_indexer_score_and_select(
             _pack_missing_pages(out, page_table, token_to_req, context_lens, k_cache)
     else:
         # Import here so loading this module does not pull aiter.ops.enum.
-        # That import calls get_module("module_aiter_core") and fails the
-        # wheel's forked FlyDSL AOT workers.
+        # A compile-only process has not built module_aiter_core, and that
+        # import calls get_module.
         from aiter.ops.topk_select import topk_select
 
         topk_select(
@@ -687,9 +687,9 @@ def qsa_indexer_supported(
         return f"k_cache KV/D must be ({_KV_HEADS}, {_D}), got {k_cache.shape[2:]}"
     if k_cache.shape[1] < 1:
         return f"page_size must be positive, got {int(k_cache.shape[1])}"
-    # Read in place. vLLM's per-layer view keeps D contiguous and the token
-    # stride at D; the page stride is padded. The gather is a 16-byte load,
-    # so that stride has to be a multiple of 8 elements. A copy is not.
+    # Read in place. D is contiguous and the token stride is D; the page
+    # stride may be larger than the packed page. The gather is a 16-byte
+    # load, so that stride has to be a multiple of 8 elements. A copy is not.
     if k_cache.stride(3) != 1:
         return f"k_cache needs a unit D stride, got {k_cache.stride()}"
     if any(s % 8 for s in k_cache.stride()[:3]):
@@ -815,8 +815,8 @@ def _write_indexer_block_ids(
     if out is None:
         out = torch.empty(m, _K, dtype=torch.int32, device=q.device)
     q = q.contiguous()
-    # Leave k_cache strided. contiguous() would copy a vLLM layer view into
-    # every captured decode graph.
+    # Leave k_cache strided. contiguous() would copy it into every captured
+    # decode graph.
     page_table = page_table.contiguous()
     token_to_req = token_to_req.contiguous()
     query_positions = query_positions.contiguous()
@@ -999,8 +999,8 @@ def flydsl_qsa_paged_gqa_supported(
         return f"head_dim must be a multiple of 32, got {head_dim}"
     if page_size < 1:
         return f"page_size must be positive, got {page_size}"
-    # Paged caches are read in place. A K|V-interleaved view (vLLM's
-    # [pages, page_size, H, 2 * D] split in two) is fine; a copy is not.
+    # Paged caches are read in place. A K|V-interleaved view
+    # ([pages, page_size, H, 2 * D] split in two) is fine; a copy is not.
     if k_cache.stride(3) != 1 or v_cache.stride(3) != 1:
         return f"k_cache and v_cache need a unit D stride, got {k_cache.stride()}"
     if k_cache.stride() != v_cache.stride():

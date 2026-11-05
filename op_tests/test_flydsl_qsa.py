@@ -28,11 +28,11 @@ Usage::
 Perf rows default to cold weights (``--rotate 0``); pass ``--rotate 1`` to
 reuse one buffer set (hot cache). ``--pad-pages 0`` (the default)
 keeps each indexer block table packed to the context. A positive width zero-fills
-it out to that many pages, which is how vLLM sizes the table for
-``max_model_len``. ``--cache-layout packed`` (the default) keeps each cache
-contiguous. ``wide`` is vLLM's per-layer view: the same pages, with a page
-stride that puts the byte span just past 4 GiB, which is the compile the
-indexer and paged GQA use for a serving KV pool. Cold rotation copies the
+it out to that many pages, with zeros past the packed pages.
+``--cache-layout packed`` (the default) keeps each cache
+contiguous. ``wide`` keeps the same pages, with a page
+stride that puts the byte span just past 4 GiB, which selects the wide
+indexer and paged GQA compile. Cold rotation copies the
 live pages into those stride gaps, so each timed call keeps that compile
 and reads a different page address.
 """
@@ -528,13 +528,13 @@ _FOUR_GIB = 1 << 32
 def _widen_cache(cache: torch.Tensor) -> torch.Tensor:
     """The same pages, with a page stride that puts the span just past 4 GiB.
 
-    vLLM allocates one KV pool and hands each layer a strided view, so the
-    page stride covers every layer and the span is the pool. Allocating that
-    pool is unnecessary: a few pages and a stride that lands the last page
-    just past 4 GiB selects the same compile. A one-page cache gains an
-    unreferenced trailing page, because a size of 1 ignores its stride.
-    The parent holds the span and no more. Page stride is a multiple of 8
-    elements, which is the gather alignment the indexer and paged GQA already require.
+    The page stride may be larger than the packed page, and the descriptor
+    covers that span. Allocating every byte of the span is unnecessary: a
+    few pages and a stride that lands the last page just past 4 GiB selects
+    the wide compile. A one-page cache gains an unreferenced trailing page,
+    because a size of 1 ignores its stride. The parent holds the span and no
+    more. Page stride is a multiple of 8 elements, which is the gather
+    alignment the indexer and paged GQA already require.
     """
     if cache.ndim != 4:
         raise ValueError(
@@ -1493,8 +1493,8 @@ def test_indexer_prefill_rejects_invalid_visible_page():
 def test_indexer_table_padded_to_max_model_len():
     """A block table far wider than any request selects what the trimmed one does.
 
-    vLLM sizes the block table for max_model_len and zero-fills past each
-    request's pages, so the indexer sees tens of thousands of columns no row can see.
+    The table is sized to a padded width and zero-filled past each request's
+    pages, so the indexer sees tens of thousands of columns no row can see.
     The table here is 4096 pages of 16 wide, which also crosses into the
     streaming selector. Every request shares one packed cache and differs in
     its length. Covers the one-row scorer (decode) and the 16-row scorer
@@ -1693,8 +1693,8 @@ def test_indexer_row_tile_spanning_requests_gathers_each_requests_pages():
 def test_indexer_padded_decode_graph_capture():
     """Decode on a max_model_len table captures into a HIP graph and replays.
 
-    vLLM captures decode into full graphs, where the padded-table width
-    readback is not allowed. One live row is longer than the compact
+    The padded-table width readback is not allowed in that graph. One live
+    row is longer than the compact
     selector's minimum, so replay finishes the later radix passes from
     the first-pass candidates. Another row repeats one K vector: the
     top-512 cut sits inside a tie wider than that candidate buffer, so
@@ -2223,9 +2223,10 @@ def test_expand_rejects_out_that_cannot_hold_the_stores():
 def test_indexer_supported_padded_page_and_rejects_misaligned():
     """A padded page stride is in contract; a 16-byte gather that cannot align is not.
 
-    vLLM keeps D contiguous and the token stride at D, and pads the page
-    stride. ``numel()`` undercounts that view. A D stride other than 1, or a
-    page/token/head stride that is not a multiple of 8 elements, is rejected.
+    D is contiguous and the token stride is D, and the page stride may be
+    larger than the packed page. ``numel()`` undercounts that view. A D stride
+    other than 1, or a page/token/head stride that is not a multiple of 8
+    elements, is rejected.
     """
     page_size, d = 16, 128
     n_pages = 3
@@ -3038,7 +3039,7 @@ def test_paged_gqa_page_past_4gib():
 
 
 def _interleave_kv(k_cache, v_cache):
-    """vLLM's paged layout: one ``[pages, page_size, H, 2 * D]`` buffer, K|V."""
+    """One ``[pages, page_size, H, 2 * D]`` buffer, K|V along the last axis."""
     d = k_cache.shape[-1]
     kv = torch.cat((k_cache, v_cache), dim=-1)
     return kv[..., :d], kv[..., d:]
@@ -3873,8 +3874,8 @@ def _indexer_select(
 def _pad_index_table(index_table, pad_pages):
     """Zero-fill a one-request block table out to ``pad_pages``.
 
-    ``pad_pages <= 0`` leaves the packed table. A wider table is what vLLM
-    allocates for ``max_model_len``: real pages in front, zeros after them.
+    ``pad_pages <= 0`` leaves the packed table. A wider table is the padded
+    width: real pages in front, zeros after them.
     A pad narrower than the packed table is an error; the sweep skips that
     row before calling.
     """
@@ -5110,7 +5111,7 @@ def main():
         default=[0],
         help="Indexer block-table width in pages. 0 keeps the packed table.\n"
         "A positive value zero-fills every indexer column's table out to that\n"
-        "many pages, which is how vLLM sizes it for max_model_len. A row\n"
+        "many pages, with zeros past the packed pages. A row\n"
         "whose context already needs more pages is skipped. Examples:\n"
         "--pad-pages 4096 with page size 16 is 65536 columns;\n"
         "--page-size 392 --pad-pages 168 is the Flash-Next TP2 table\n"
@@ -5123,8 +5124,8 @@ def main():
         choices=["packed", "wide"],
         help="K and V cache layout. packed is one contiguous page after\n"
         "another and stays under 4 GiB. wide keeps those pages and inserts\n"
-        "a page stride so the byte span is just past 4 GiB, which is how\n"
-        "vLLM's per-layer view selects the wide indexer and paged GQA compile. A one-page\n"
+        "a page stride so the byte span is just past 4 GiB, which selects the\n"
+        "wide indexer and paged GQA compile. A one-page\n"
         "cache gains an unreferenced trailing page so the stride counts.\n"
         "Cold rotation copies the live pages into those gaps and keeps the\n"
         "span, so the wide compile stays selected. Pass both names to sweep them.",

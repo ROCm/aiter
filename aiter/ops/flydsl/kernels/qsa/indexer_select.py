@@ -660,8 +660,8 @@ def build_qsa_indexer_prefill_scores_module(
     heads accumulate in registers and the wave writes its scores directly.
     A row tile may span requests. Q is staged once per row tile; each
     request in the tile gathers its own K tiles and writes only its own
-    rows, so a request-major batch (vLLM's layout) gathers each K tile once
-    per request it touches. A workgroup walks ``tiles_per_wg`` consecutive
+    rows, so a request-major batch gathers each K tile once per request it
+    touches. A workgroup walks ``tiles_per_wg`` consecutive
     column tiles, a launch argument, so one Q staging serves several K tiles.
 
     ``fold_heads`` (4 heads only) puts 4 rows x 4 heads on the MFMA M axis
