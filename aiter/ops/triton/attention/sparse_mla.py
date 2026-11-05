@@ -4,6 +4,7 @@
 import math
 
 import torch
+import triton
 
 from aiter.ops.triton._gluon_kernels.gfx950.attention.sparse_mla import (
     _sparse_mla as _sparse_mla_gfx950,
@@ -11,9 +12,13 @@ from aiter.ops.triton._gluon_kernels.gfx950.attention.sparse_mla import (
 from aiter.ops.triton._gluon_kernels.gfx950.attention.sparse_mla import (
     _sparse_mla_reduce as _sparse_mla_reduce_gfx950,
 )
+from aiter.ops.triton._gluon_kernels.gfx950.attention.sparse_mla_fp8 import (
+    _sparse_mla_fp8,
+)
 from aiter.ops.triton.attention.pa_decode_sparse import (
     _PREFILL_MIN_ROWS,
     _as_int32_contiguous_1d,
+    _check_epilogue,
     _launch_splits,
     _staged_block_m,
 )
@@ -454,6 +459,240 @@ def _forward_paged(
     return res if isinstance(res, tuple) else (res, None)
 
 
+def _fp8_paged_map(cache, base_ptr, row):
+    """(row offset, block stride in rows, log2 block size) of a [nb, block, row]
+    fp8 cache read from base_ptr, slot s being row offset + (s // block) * stride
+    + s % block. None if _sparse_mla_fp8 cannot address it: an offset or page
+    pitch that is not whole rows, or a block size that is not a power of two."""
+    off = cache.data_ptr() - base_ptr
+    block = cache.shape[1]
+    if off % row or cache.stride(0) % row or block & (block - 1):
+        return None
+    return off // row, cache.stride(0) // row, block.bit_length() - 1
+
+
+def _fp8_plan(num_queries, num_heads, avg_topk, two_loops):
+    """(heads per program, split count) for _sparse_mla_fp8."""
+    num_cus = get_num_sms()
+    # 64 heads once that alone fills the CUs. Not for the two-loop kernel at 64
+    # heads: it spills there and 32 is faster.
+    if (
+        num_heads % 64 == 0
+        and num_queries * (num_heads // 64) >= num_cus
+        and not (two_loops and num_heads == 64)
+    ):
+        return 64, 1
+    # Short rows: fewer heads per program beats splitting, whose partials cost
+    # more than the extra gathers.
+    if math.ceil(avg_topk / 64) < 16:
+        for g in (32, 16, 8):
+            if num_heads % g == 0 and num_queries * (num_heads // g) >= num_cus // 2:
+                return g, 1
+    g = min(32, num_heads)
+    return g, _mla_num_splits(num_queries, num_heads // g, avg_topk)
+
+
+def _sparse_mla_fwd_gfx950_fp8(
+    q,
+    q_scale,
+    kv_buffer,
+    cache,
+    block_size,
+    kv_scale,
+    kv_indptr,
+    kv_indices,
+    softmax_scale,
+    out,
+    *,
+    kv_splits,
+    attn_sink,
+    return_lse,
+    extra_kv,
+    extra_kv_scale,
+    extra_indptr,
+    extra_indices,
+    inv_rope_positions,
+    inv_rope_cos_sin_cache,
+    out_mxfp8,
+):
+    """gfx950's kernel for a per-tensor fp8 cache with fp8 dots
+    (_gluon_kernels/gfx950/attention/sparse_mla_fp8.py) and, when split, the
+    generic merge. Returns (out, lse or None), or None if the kernel cannot
+    address the caches. cache and block_size come from _cache_pointers.
+
+    A flat pool is one list of row ids, a paged one maps slot ids to rows. With
+    extra_kv (SWA cache as kv_buffer, the compressed top-k cache as
+    extra_kv), both caches in one allocation under one scale are read as one list
+    in one loop, from the lower of the two; otherwise in two loops, each from its
+    own cache. Host metadata only (storage pointers, strides, scale identity):
+    safe under graph capture."""
+    C, H, row = q.shape
+    if cache.numel() == 0 or (extra_kv is not None and extra_kv.numel() == 0):
+        return None  # an empty key list still gathers row 0
+    kv, x_kv, x_ks = cache, None, None
+    main = extra = (None, None, 0)
+    if extra_kv is not None:
+        main_u8 = kv_buffer.view(torch.uint8)
+        x_u8 = extra_kv.view(torch.uint8)
+        one_alloc = (
+            main_u8.untyped_storage().data_ptr() == x_u8.untyped_storage().data_ptr()
+        )
+        one_scale = extra_kv_scale.data_ptr() == kv_scale.data_ptr()
+        # mapping tricks so both indices can read from the same kv pool, if it is shared
+        if one_alloc and one_scale:
+            # one u8 view over both caches, from the lower one: the base of both
+            lo = min(main_u8, x_u8, key=torch.Tensor.data_ptr)
+            end = max(t.data_ptr() + max_addressable_bytes(t) for t in (main_u8, x_u8))
+            kv = lo.new_empty(0).set_(
+                lo.untyped_storage(),
+                lo.data_ptr() - lo.untyped_storage().data_ptr(),
+                (end - lo.data_ptr(),),
+            )
+            main = _fp8_paged_map(main_u8, kv.data_ptr(), row)
+            extra = _fp8_paged_map(x_u8, kv.data_ptr(), row)
+        else:
+            kv, x_kv = main_u8, x_u8
+            main = _fp8_paged_map(main_u8, main_u8.data_ptr(), row)
+            extra = _fp8_paged_map(x_u8, x_u8.data_ptr(), row)
+            if not one_scale:
+                x_ks = extra_kv_scale
+    elif block_size > 1:
+        main = _fp8_paged_map(cache, cache.data_ptr(), row)
+    elif cache.stride(0) != row or cache.stride(1) != 1:
+        return None
+    if main is None or extra is None:
+        return None
+
+    _check_epilogue(q, out, inv_rope_positions, inv_rope_cos_sin_cache, out_mxfp8)
+    inv_rope = inv_rope_positions is not None
+    mxfp8 = out_mxfp8 is not None
+    # the output epilogue's arguments, shared with the merge
+    epilogue = {
+        "pos_ptr": inv_rope_positions,
+        "cos_sin_ptr": inv_rope_cos_sin_cache,
+        "cs_stride": inv_rope_cos_sin_cache.stride(0) if inv_rope else 0,
+        "out_scale_ptr": out_mxfp8[1] if mxfp8 else None,
+        "os_stride0": out_mxfp8[1].stride(0) if mxfp8 else 0,
+    }
+    if mxfp8:
+        out = out_mxfp8[0].view(C, H, 512)
+    else:
+        out = _check_out(out, q, 512)
+    lse = (
+        torch.empty((C, H), dtype=torch.float32, device=q.device)
+        if return_lse
+        else None
+    )
+
+    avg_topk = kv_indices.numel() / max(1, C)
+    if extra_kv is not None:
+        avg_topk += extra_indices.numel() / max(1, C)
+    block_h, num_splits = _fp8_plan(C, H, avg_topk, x_kv is not None)
+    if kv_splits is not None:
+        num_splits = max(1, int(kv_splits))
+    split = num_splits > 1
+    P = _launch_splits(num_splits)
+    if split:
+        part_m = torch.empty((C, P, H), dtype=torch.float32, device=q.device)
+        part_l = torch.empty_like(part_m)
+        part_acc = torch.empty((C, P, H, 512), dtype=torch.bfloat16, device=q.device)
+    else:
+        part_m = part_l = part_acc = None
+    # A row's head blocks run back to back on one XCD (Program.initialize), so
+    # the later blocks' gathers hit its L2.
+    head_blocks = H // block_h
+    xcds = get_num_xcds()
+    if head_blocks > 1:
+        grid = (triton.cdiv(C, xcds) * xcds * head_blocks, 1, P)
+    else:
+        grid = (C, 1, P)
+    # buffer loads take signed 32-bit offsets; a cache past them gathers in 64 bit
+    addr64 = any(
+        max_addressable_bytes(t) >= 2**31 - 1 for t in (kv, x_kv) if t is not None
+    )
+    q_bf16 = q.dtype == torch.bfloat16
+    rope = row - 512
+    _sparse_mla_fp8[grid](
+        q_ptr=q if q_bf16 else q.view(torch.uint8),
+        kv_ptr=kv,
+        out_ptr=None if split else out,
+        indptr_ptr=kv_indptr,
+        idx_ptr=kv_indices,
+        sink_ptr=attn_sink,
+        q_scale_ptr=None if q_bf16 else q_scale,
+        ks_ptr=kv_scale,
+        lse_ptr=None if split else lse,
+        part_m_ptr=part_m,
+        part_l_ptr=part_l,
+        part_acc_ptr=part_acc,
+        x_indptr_ptr=extra_indptr,
+        x_idx_ptr=extra_indices,
+        main_row0=main[0],
+        main_stride=main[1],
+        extra_row0=extra[0],
+        extra_stride=extra[1],
+        x_kv_ptr=x_kv,
+        x_ks_ptr=x_ks,
+        num_queries=C,
+        num_heads=H,
+        sm_scale=softmax_scale,
+        num_splits=num_splits,
+        q_stride0=q.stride(0),
+        q_stride1=q.stride(1),
+        out_stride0=out.stride(0),
+        out_stride1=out.stride(1),
+        BLOCK_H=block_h,
+        ROPE_TAIL=rope,
+        # how far (log2) a score may beat the running max before the max moves;
+        # most tiles then skip the accumulator rescale. 0 is the exact max.
+        LAZY_LOG2=8,
+        ADDR64=addr64,
+        MAIN_BLOCK_LOG2=main[2],
+        EXTRA_BLOCK_LOG2=extra[2],
+        HEAD_BLOCKS=head_blocks,
+        NUM_XCDS=xcds,
+        **epilogue,
+        # the RoPE tile needs key waves: 64 heads take 8 waves there
+        num_warps=8 if (rope and block_h == 64) else 4,
+        waves_per_eu=2,
+        # no AGPRs: Triton 3.9's LLVM infers it, 3.8's splits the budget in two
+        llvm_fn_attrs="amdgpu-agpr-alloc=0",
+        enable_fp_fusion=True,
+    )
+    if split:
+        _sparse_mla_reduce_gfx950[(C, H)](
+            part_m,
+            part_l,
+            part_acc,
+            attn_sink,
+            out,
+            out.stride(0),
+            out.stride(1),
+            part_m.stride(0),
+            part_m.stride(1),
+            part_acc.stride(0),
+            part_acc.stride(1),
+            part_acc.stride(2),
+            H,
+            HAS_SINK=attn_sink is not None,
+            HEAD_SIZE=512,
+            BLOCK_M=1,
+            NUM_SPLITS=P,
+            HEAD_ALIGNED=True,
+            ADAPTIVE_SPLITS=True,
+            lse_ptr=lse,
+            HAS_LSE=lse is not None,
+            **epilogue,
+            ROPE_DIM=64,
+            INV_ROPE=inv_rope,
+            OUT_MXFP8=mxfp8,
+            # a 2-split tile spans two warps; more would hold duplicate lanes
+            num_warps=min(4, P),
+            enable_fp_fusion=True,
+        )
+    return out, lse
+
+
 def sparse_mla_fwd(
     q: torch.Tensor,
     kv_buffer: torch.Tensor,
@@ -553,7 +792,8 @@ def sparse_mla_fwd(
                 tensor scale fp8 kv cache only; gfx950 only.
 
             q is adapted to the choice. bf16 q is quantized in the kernel
-            prologue, one scale per (query, head-block) tile; fp8 q is passed
+            prologue, one scale per (query, head-block) tile (per head on gfx950's
+            fp8_scalar kernel); fp8 q is passed
             straight through, and fp8 q under "bf16" dots is widened in-kernel.
 
         q_scale: scalar f32, required when q arrives already fp8 (the scale it
@@ -567,7 +807,7 @@ def sparse_mla_fwd(
             f32 (cos | sin). The trailing 64 lanes of each output row are
             rotated back (inverse GPT-J RoPE) before the store. DeepSeek-V4
             caches only (fp8_dsv4_mla, fp8_g64, the two-loop), whose rope lives
-            inside the row.
+            inside the row, and gfx950's 512-wide fp8_scalar with fp8 dots.
         out_mxfp8: (data [C, H * D] e4m3, scale [C, H * D // 32] uint8 E8M0) in
             place of out, for the same caches: the output is stored
             MXFP8-quantized, one scale per 32 lanes, and data viewed as
@@ -660,11 +900,6 @@ def sparse_mla_fwd(
             inv_rope_cos_sin_cache,
             out_mxfp8,
         )
-    if inv_rope_positions is not None or out_mxfp8 is not None:
-        raise ValueError(
-            "the inverse-RoPE / MXFP8 output epilogue needs a DeepSeek-V4 cache, "
-            f"got {fmt}"
-        )
     arch = arch_info.get_arch()
     assert arch in SUPPORTED_ARCHS, f"sparse_mla_fwd does not support {arch}"
     _check_fp8_arch(arch, fmt, q.dtype)
@@ -709,6 +944,54 @@ def sparse_mla_fwd(
     else:
         # The kernel still wants a live pointer for the compile-time-elided slot.
         attn_sink = torch.empty(1, device=q.device, dtype=torch.float32)
+
+    epilogue = inv_rope_positions is not None or out_mxfp8 is not None
+    # gfx950's fp8 kernel, where it can address the caches. -1 sentinels and
+    # skip_reduce run the generic one, and the epilogue needs the rope inside the
+    # row.
+
+    # Custom kernel for better performance
+    if (
+        arch == "gfx950"
+        and fmt == "fp8_scalar"
+        and fp8_dots
+        and not skip_reduce
+        and not has_invalid
+        and kv_lora_rank == 512
+        and qk_rope_head_dim in (0, 64)
+        and num_heads in (8, 16, 32, 64, 128)
+        and not (epilogue and qk_rope_head_dim)
+    ):
+        res = _sparse_mla_fwd_gfx950_fp8(
+            q,
+            q_scale,
+            kv_buffer,
+            cache,
+            block_size,
+            kv_scale,
+            kv_indptr,
+            kv_indices,
+            softmax_scale,
+            out,
+            kv_splits=kv_splits,
+            attn_sink=attn_sink if has_sink else None,
+            return_lse=return_lse,
+            extra_kv=extra_kv,
+            extra_kv_scale=extra_kv_scale,
+            extra_indptr=extra_indptr,
+            extra_indices=extra_indices,
+            inv_rope_positions=inv_rope_positions,
+            inv_rope_cos_sin_cache=inv_rope_cos_sin_cache,
+            out_mxfp8=out_mxfp8,
+        )
+        if res is not None:
+            return res
+    if epilogue:
+        raise ValueError(
+            "the inverse-RoPE / MXFP8 output epilogue needs a DeepSeek-V4 cache, "
+            "or a 512-wide fp8_scalar one with dot_precision='fp8' on gfx950, got "
+            f"{fmt}"
+        )
 
     # Tuned launch config (gfx950 / MI355). H < 16 runs natively at
     # BLOCK_M = next_pow2(H) instead of padding heads
@@ -909,6 +1192,7 @@ def sparse_mla_fwd(
         HAS_LSE=return_lse,
         num_warps=num_warps,
         waves_per_eu=waves_per_eu,
+        enable_fp_fusion=True,
     )
 
     if num_splits == 1:
@@ -942,5 +1226,6 @@ def sparse_mla_fwd(
         HAS_LSE=return_lse,
         # A 2-split tile spans two warps; more warps would hold duplicate lanes.
         num_warps=min(4, grid_splits),
+        enable_fp_fusion=True,
     )
     return out, (lse if return_lse else None)
