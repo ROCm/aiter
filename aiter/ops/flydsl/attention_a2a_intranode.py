@@ -407,6 +407,9 @@ class AttentionA2AIntraNodeOp:
                     f"{unsupported or 'BF16 return'}"
                 )
         self.valid_kv_len = valid_kv_len
+        from aiter.dist.device_communicators.all2all import ensure_mori_shmem
+
+        ensure_mori_shmem()
         if rank != ms.shmem_mype() or world_size != ms.shmem_npes():
             raise ValueError(
                 f"rank/world_size ({rank}/{world_size}) != MoRI "

@@ -117,6 +117,10 @@ class MoriShmemAllocator:
     def __init__(self, rank: int, world_size: int, device: torch.device):
         import mori.shmem as ms
 
+        from aiter.dist.device_communicators.all2all import ensure_mori_shmem
+
+        ensure_mori_shmem()
+
         self._ms = ms
         self.rank = rank
         self.world_size = world_size
