@@ -524,18 +524,24 @@ def _assert_matches_cprr_reference(out, lse, inputs, msq, cp_rank):
 
 
 @requires_gpu
-def test_native_96_head_fp8_cprr_decode_matches_reference():
+@pytest.mark.parametrize("backend", [MlaBackend.ASM, MlaBackend.OPUS])
+def test_native_96_head_fp8_cprr_decode_matches_reference(monkeypatch, backend):
     # Under round-robin CP, gfx950 runs 96 fp8 heads natively up to qlen 8 (the
-    # DCP verify of a DSpark block-7 draft); the shape tests above only check
-    # that it launches.
+    # DCP verify of a DSpark block-7 draft) on the asm route and, with
+    # AITER_MLA_USE_OPUS=1, on the OPUS a8w8 k32mx4 route; the shape tests above
+    # only check that it launches.
     if get_gfx() != "gfx950":
         pytest.skip("the native 96-head fp8 route is gfx950 only")
+    if backend is MlaBackend.OPUS:
+        monkeypatch.setenv("AITER_MLA_USE_OPUS", "1")
     cp_rank = 3
     for msq in (7, 8):
         support = get_mla_decode_shape_support(
             96, msq, dtypes.fp8, dtypes.fp8, return_lse=True, **_cp(True)
         )
-        assert support.native and support.supported, support
+        assert support.backend is backend, support
+        # OPUS has no availability table, so its support reads None.
+        assert support.native and support.supported is not False, support
         out, lse, inputs = _run_decode(96, msq, "fp8", True, cp_rank=cp_rank)
         _assert_matches_cprr_reference(out, lse, inputs, msq, cp_rank)
 
