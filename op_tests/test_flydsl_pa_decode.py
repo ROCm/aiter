@@ -1580,7 +1580,9 @@ def _check_unsupported_input(pa, arguments, options, plan, case, monkeypatch):
         options["context_partition_size"] = 512
     elif invalid == "partition-mismatch":
         # gfx1250 supports 128 and 256 tokens; restate the size the plan lacks.
-        options["context_partition_size"] = 384 - plan.context_partition_size
+        options["context_partition_size"] = (
+            128 if plan.context_partition_size == 256 else 256
+        )
     elif invalid == "vector16-k":
         key = torch.empty((1, 1, 8, 64, 16), dtype=query.dtype, device=query.device)
     elif invalid == "vector16-v":
