@@ -361,14 +361,29 @@ _GPTOSS_SHAPES = [
 
 
 @pytest.mark.parametrize("N, K", _GPTOSS_SHAPES)
-def test_gemm_a16w16_gfx1250_gptoss_96cu_lookup(N, K):
-    from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
+def test_gemm_a16w16_gfx1250_gptoss_96cu_lookup(N, K, monkeypatch):
+    """Read configs/gfx1250/96cu. The arch is pinned because this only reads
+    JSON: on an MI35X runner get_arch() is gfx950 and the gluon default there
+    does not exist."""
+    from aiter.ops.triton.utils import gemm_config_utils
+    from aiter.ops.triton.utils._triton import arch_info
 
-    for M in (4096, 8192, 16384, 32768):
-        config, tuned = get_gemm_config(
-            "GEMM-A16W16", M, N, K, backend="gluon", cu_num=96
-        )
-        assert tuned and config["kernel_type"] == "compute_bound", (M, N, K, config)
+    monkeypatch.setattr(arch_info, "get_arch", lambda: "gfx1250")
+    # The loader cache key does not include the arch.
+    gemm_config_utils._get_gemm_config_cached.cache_clear()
+    try:
+        for M in (4096, 8192, 16384, 32768):
+            config, tuned = gemm_config_utils.get_gemm_config(
+                "GEMM-A16W16", M, N, K, backend="gluon", cu_num=96
+            )
+            assert tuned and config["kernel_type"] == "compute_bound", (
+                M,
+                N,
+                K,
+                config,
+            )
+    finally:
+        gemm_config_utils._get_gemm_config_cached.cache_clear()
 
 
 @pytest.mark.parametrize("N, K", _GPTOSS_SHAPES)
