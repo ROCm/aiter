@@ -12,7 +12,7 @@ and the row phase one lane per row, so both are bounded by the block.
 Every global access is coalesced: the candidates are copied into LDS, each
 row's lane works out of LDS (rows are ``kp1`` words apart, an odd stride, so
 the lanes of a wave hit distinct banks), and the outputs are staged in LDS and
-copied out. The row phase picks the drop exactly as
+copied out. The row phase picks the drop with ``herd_topk._herd_drop``, as
 ``herd_topk.build_herd_finalize_module`` does, so routes and weights match it
 bit for bit; it orders the kept routes by expert id with a sorting network over
 ``id * 32 + candidate`` keys rather than by pairwise ranks.
@@ -25,6 +25,7 @@ import flydsl.expr as fx
 from flydsl.expr import Float32, Int32, const_expr, gpu, range_constexpr
 
 from aiter.jit.utils.chip_info import get_lds_capacity_bytes
+from aiter.ops.flydsl.kernels.herd_topk import _herd_drop
 from aiter.ops.flydsl.kernels.kernels_common import kernel_signature
 from aiter.ops.flydsl.kernels.moe_route_maps import DROPPED_ROUTE_ROW
 from aiter.ops.flydsl.kernels.tensor_shim import (
@@ -187,28 +188,7 @@ def build_herd_route_psum_module(
             ids = [s_ids[base + j] for j in range_constexpr(kp1)]
             values = [s_values[base + j] for j in range_constexpr(kp1)]
             pops = [popularity[ids[j]] for j in range_constexpr(kp1)]
-
-            drop = Int32(0)
-            drop_id = ids[0]
-            drop_value = values[0]
-            drop_pop = pops[0]
-            for j in range_constexpr(1, kp1):
-                take = (pops[j] < drop_pop) | (
-                    (pops[j] == drop_pop)
-                    & (
-                        (values[j] < drop_value)
-                        | ((values[j] == drop_value) & (ids[j] < drop_id))
-                    )
-                )
-                drop = take.select(Int32(j), drop)
-                drop_id = take.select(ids[j], drop_id)
-                drop_value = take.select(values[j], drop_value)
-                drop_pop = take.select(pops[j], drop_pop)
-
-            kept_sum = Float32(0.0)
-            for j in range_constexpr(kp1):
-                kept_sum = kept_sum + (drop != Int32(j)).select(values[j], Float32(0.0))
-            scale = routed_scaling_factor / fx.max(kept_sum, Float32(1e-20))
+            drop, drop_id, scale = _herd_drop(ids, values, pops, routed_scaling_factor)
 
             # Row ids are distinct, so the keys are too.
             keys = [(ids[j] << _KEY_SHIFT) | Int32(j) for j in range_constexpr(kp1)]
