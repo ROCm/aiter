@@ -225,6 +225,19 @@ flydsl='diff --git a/aiter/ops/flydsl/kernels/moe_gemm.py b/aiter/ops/flydsl/ker
 # is_kernel() skips FlyDSL, so flydsl-kernel is the only family that can carry A4 there.
 t "a FlyDSL kernel edit selects A4" \
   "$(rules_of "$flydsl" flydsl-kernel | grep -ow A4)" "A4"
+# Raw-pointer launches live in the wrappers (aiter/ops/flydsl/*.py), which derive `flydsl` but
+# not `flydsl-kernel`, so D14 and D13 must reach a wrapper-only diff through `flydsl`.
+flydsl_wrapper='diff --git a/aiter/ops/flydsl/qsa_sparse_decode.py b/aiter/ops/flydsl/qsa_sparse_decode.py
+--- a/aiter/ops/flydsl/qsa_sparse_decode.py
++++ b/aiter/ops/flydsl/qsa_sparse_decode.py
+@@ -1 +1 @@
+-    _run_compiled(exe, ptr_arg(q), ptr_arg(out), stream)
++    _run_compiled(exe, ptr_arg(q), ptr_arg(kv_indices), ptr_arg(out), stream)
+'
+t "a FlyDSL wrapper-only edit selects D14" \
+  "$(rules_of "$flydsl_wrapper" flydsl | grep -ow D14)" "D14"
+t "a FlyDSL wrapper-only edit selects D13" \
+  "$(rules_of "$flydsl_wrapper" flydsl | grep -ow D13)" "D13"
 
 # derive -> verdict -> card: a submodule path has no extension, so unless audit_card counts it
 # as a citation, a card that reports HK20 without the rule code (as SKILL.md requires) fails
