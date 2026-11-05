@@ -111,6 +111,11 @@ for file in "${sharded_files[@]}"; do
             # have no script entry point; direct execution would only import them.
             test_cmd=(timeout 60m python3 -m pytest -q "$file")
             ;;
+        op_tests/test_moe_cktile_stage1_splitk.py)
+            # The standalone benchmark omits selector and expected-error tests.
+            # Use pytest to run these alongside the numerical regression cases.
+            test_cmd=(timeout 60m python3 -m pytest -q "$file")
+            ;;
         op_tests/multigpu_tests/bench_mega_moe.py)
             {
                 echo "Running MegaMoE fused-scatter accuracy on 8 GPUs when supported"
