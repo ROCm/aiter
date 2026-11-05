@@ -7,7 +7,12 @@ import torch
 
 from .kernels.herd_topk import build_herd_finalize_module
 from .kernels.moe_herd_route_psum import HERD_ROUTE_BLOCK, build_herd_route_psum_module
-from .kernels.tensor_shim import _run_compiled, ptr_arg, wave_size_of
+from .kernels.tensor_shim import (
+    _run_compiled,
+    current_stream_arg,
+    ptr_arg,
+    wave_size_of,
+)
 from .kernels.topk.topk_per_row_small_k import build_topk_per_row_small_k_module
 
 _KIMI_K3_EXPERTS = 896
@@ -105,7 +110,7 @@ def herd_route_psum(
         rows,
         tile_m,
         float(routed_scaling_factor),
-        torch.cuda.current_stream(device),
+        current_stream_arg(),
     )
     return weights, ids, masked_m, topids_to_rows, psum
 
