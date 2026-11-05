@@ -40,7 +40,6 @@ from .gdr_decode import (
     _KDA_HEADS,
     _KDA_L2NORM_EPS,
     _KDA_OUTPUT_WAVES,
-    _KDA_PROJECTION_ITERS,
     _KDA_PROJECTION_VECTOR,
     _KDA_SCALE,
     _KDA_STATE_DTYPES,
@@ -60,14 +59,19 @@ from .tensor_shim import GTensor
 # Draft tokens per sequence the kernel unrolls. Eight covers DSpark block
 # sizes up to 7 plus the bonus token.
 KDA_VERIFY_MAX_TOKENS = 8
-KDA_VERIFY_NUM_WARPS = (4, 8, 16)
+# Waves per workgroup the kernel builds: 4 (32-row V groups) or 8 (64-row V
+# groups, one thread per Q/K/V channel). The wrapper's automatic policy picks
+# one of these by batch size.
+KDA_VERIFY_NUM_WARPS = (4, 8)
 # f_a is staged through LDS in 16-byte (8 x BF16) pieces, 16 per token.
 _F_A_VECTOR = 8
 _F_A_LANES = _KDA_DIM // _F_A_VECTOR
-_KDA_VERIFY_SPECIALIZATION_CACHE_SIZE = 32
 
 
-@functools.lru_cache(maxsize=_KDA_VERIFY_SPECIALIZATION_CACHE_SIZE)
+# Each entry holds a JIT launcher and its compiled module, which CUDA graphs
+# captured earlier may still launch, so specializations are not evicted under
+# normal use (sized like the KDA decode cache).
+@functools.lru_cache(maxsize=1024)
 def create_kda_verify_kernel(
     norm_eps: float,
     lower_bound: float,
@@ -82,8 +86,9 @@ def create_kda_verify_kernel(
     :data:`KDA_VERIFY_MAX_TOKENS`). ``state_dtype`` is the recurrent-state
     storage, ``"f32"`` or ``"bf16"``; snapshots use the same storage.
     ``cache_ring`` selects ReplaySSM ring writes instead of state snapshots.
-    ``num_warps`` (4, 8 or 16) splits the V rows of a head across more waves,
-    which shortens each serial step at the cost of fewer resident workgroups.
+    ``num_warps`` (one of :data:`KDA_VERIFY_NUM_WARPS`, 4 or 8) splits the V
+    rows of a head across more waves, which shortens each serial step at the
+    cost of fewer resident workgroups.
     """
     if state_dtype not in _KDA_STATE_DTYPES:
         raise ValueError(
@@ -101,7 +106,7 @@ def create_kda_verify_kernel(
     block_threads = num_warps * _KDA_WARP_SIZE
     v_group_tile = num_warps * _KDA_WARP_THREADS_V
     v_iters = _KDA_DIM // v_group_tile
-    # From 8 waves each Q/K/V channel gets its own thread; with 4 waves one
+    # With 8 waves each Q/K/V channel gets its own thread; with 4 waves one
     # thread convolves the head's Q, K and V channel.
     split_conv = block_threads >= 4 * _KDA_DIM
     f32_state = state_dtype == "f32"
@@ -336,9 +341,9 @@ def create_kda_verify_kernel(
             lo = list(range(_KDA_PROJECTION_VECTOR))
             hi = list(range(_KDA_PROJECTION_VECTOR, _F_A_VECTOR))
             for i in range_constexpr(_KDA_DIM // _F_A_VECTOR):
-                w = f_b_weight.vec_load(
-                    (f_b_base + i * _F_A_VECTOR,), _F_A_VECTOR
-                ).to(fx.Float32)
+                w = f_b_weight.vec_load((f_b_base + i * _F_A_VECTOR,), _F_A_VECTOR).to(
+                    fx.Float32
+                )
                 for step in range_constexpr(num_steps):
                     f_a_values = fx.ptr_load(
                         f_a_lds + step * _KDA_DIM + i * _F_A_VECTOR, vec_f_a
@@ -409,9 +414,7 @@ def create_kda_verify_kernel(
                 fx.ptr_store(value, lds + step * _KDA_DIM + local)
                 if const_expr(ring is not None):
                     ring.store(
-                        head * stride_ring_head
-                        + step * stride_ring_token
-                        + local,
+                        head * stride_ring_head + step * stride_ring_token + local,
                         value,
                     )
 
@@ -465,9 +468,9 @@ def create_kda_verify_kernel(
             )
 
         def recurrent_verify():
-            # Four waves split V into 32-row groups and eight-lane subgroups
-            # reduce K, as in the decode kernel; the state stays in registers
-            # across the steps.
+            # Each wave owns 8 V rows of every V group (32 rows with 4 waves,
+            # 64 with 8) and eight-lane subgroups reduce K, as in the decode
+            # kernel; the state stays in registers across the steps.
             k_vec_start = lane_k * values_per_thread_k
             global_v_start = warp * _KDA_WARP_THREADS_V + lane // _KDA_WARP_THREADS_K
             vec_bf16 = fx.Vector[fx.BFloat16, values_per_thread_k]

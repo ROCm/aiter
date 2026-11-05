@@ -1204,14 +1204,16 @@ def _num_cache_slots(state: torch.Tensor, conv_state: torch.Tensor) -> int:
     return min(state.shape[0], conv_state.shape[0], _INT32_MAX)
 
 
-def _check_unique_live_slots(state_indices: torch.Tensor, num_slots: int) -> None:
+def _check_unique_live_slots(
+    state_indices: torch.Tensor, num_slots: int, name: str = "state_indices"
+) -> None:
     """Reject a live slot that appears more than once in ``state_indices``."""
     live = state_indices[(state_indices >= 0) & (state_indices < num_slots)]
     slots, counts = torch.unique(live, return_counts=True)
     duplicates = slots[counts > 1].tolist()
     if duplicates:
         raise ValueError(
-            "`state_indices` must not repeat a live (non-negative, in-range) slot; "
+            f"`{name}` must not repeat a live (non-negative, in-range) slot; "
             f"duplicated slots: {duplicates[:8]}."
         )
 
@@ -1759,9 +1761,11 @@ def _check_slot_tensor(
 
 
 def _kda_verify_num_warps(batch: int) -> int:
-    # Measured on MI355X (cold L2, 5-8 tokens, snapshot and ring): 8 waves win
-    # up to batch 16 by shortening each step; from batch 24 the 4-wave kernel,
-    # with more resident workgroups, wins (by up to 40% with the ring).
+    # Batches up to 16 use 8 waves, which shorten each serial step; from batch
+    # 17 the 4-wave kernel keeps more workgroups resident. Measured on MI355X
+    # (cold L2, 5-8 tokens, BF16 state): 8 waves stay 6-9% faster through
+    # batch 21; from batch 22 (over 256 workgroups) 4 waves win by about 20%
+    # with the ring, while snapshots still favour 8 waves by 3-5%.
     return 8 if batch <= 16 else 4
 
 
@@ -1817,10 +1821,26 @@ def flydsl_kda_verify_with_f_b(
     ``intermediate_states`` and ``replay_ring`` must be given.
 
     A sequence whose cache index or intermediate index is negative or out of
-    range is padding: its output rows are zero and no cache is touched. Live
-    cache slots must be unique.
+    range is padding: its output rows are zero and no cache is touched. Among
+    live sequences, ``cache_indices`` and ``intermediate_indices`` must each be
+    unique: a repeated ring slot or intermediate line is written by several
+    workgroups at once, with undefined results. Padding entries may repeat. The
+    kernel does not check this; set ``AITER_KDA_DECODE_SLOT_CHECK=1`` to raise
+    ``ValueError`` on a repeat (it syncs with the host and is skipped during
+    CUDA graph capture).
 
-    ``num_warps`` overrides the per-workgroup wave count (4, 8 or 16).
+    Every buffer the kernel writes needs dense, non-overlapping slots or lines,
+    with padding between them allowed: ``intermediate_conv_window`` as
+    channel-major ``[lines, steps, 4608, 3]`` or SGLang's ``[lines, steps, 3,
+    4608]`` viewed through ``transpose(-1, -2)``, ``intermediate_states`` and
+    the ring tensors in their stated order, and ``out`` with non-overlapping
+    token and head rows. ``conv_state`` takes either conv layout; strides and
+    byte spans follow the int32 limits of :func:`flydsl_kda_decode`.
+
+    ``num_warps`` overrides the per-workgroup wave count, one of
+    ``flydsl_kda_verify_with_f_b.num_warps`` (4 or 8). Each value is a separate
+    specialization, compiled on first use; call once per value (batch 1
+    suffices) before CUDA graph capture to build them all.
     """
     if not isinstance(num_tokens, int) or not (
         1 <= num_tokens <= KDA_VERIFY_MAX_TOKENS
@@ -1830,9 +1850,7 @@ def flydsl_kda_verify_with_f_b(
             f"got {num_tokens!r}."
         )
     if (intermediate_states is None) == (replay_ring is None):
-        raise ValueError(
-            "Pass exactly one of `intermediate_states` and `replay_ring`."
-        )
+        raise ValueError("Pass exactly one of `intermediate_states` and `replay_ring`.")
     if cache_indices.ndim != 1:
         raise ValueError("`cache_indices` must have rank 1.")
     if not cache_indices.is_cuda:
@@ -1959,6 +1977,17 @@ def flydsl_kda_verify_with_f_b(
         dtype=torch.bfloat16,
         device=device,
     )
+    # Dense steps of a channel-major [4608, 3] window, or of SGLang's
+    # [3, 4608] window viewed through transpose(-1, -2).
+    window_step = _KDA_CONV_CHANNELS * (_KDA_CONV_WIDTH - 1)
+    _check_dense_cache_slots(
+        "intermediate_conv_window",
+        intermediate_conv_window,
+        (
+            (window_step, _KDA_CONV_WIDTH - 1, 1),
+            (window_step, 1, _KDA_CONV_CHANNELS),
+        ),
+    )
     num_inter_lines = intermediate_conv_window.shape[0]
     num_slots = min(state.shape[0], conv_state.shape[0])
 
@@ -1971,8 +2000,7 @@ def flydsl_kda_verify_with_f_b(
         if (
             intermediate_states.ndim != 5
             or intermediate_states.shape[1] < num_tokens
-            or tuple(intermediate_states.shape[2:])
-            != (_KDA_HEADS, _KDA_DIM, _KDA_DIM)
+            or tuple(intermediate_states.shape[2:]) != (_KDA_HEADS, _KDA_DIM, _KDA_DIM)
         ):
             raise ValueError(
                 "`intermediate_states` must have shape "
@@ -1985,7 +2013,11 @@ def flydsl_kda_verify_with_f_b(
             inner_shape=tuple(intermediate_states.shape[1:]),
             dtype=state.dtype,
             device=device,
-            inner_strides=(_KDA_HEADS * _KDA_DIM * _KDA_DIM, _KDA_DIM * _KDA_DIM, _KDA_DIM, 1),
+        )
+        _check_dense_cache_slots(
+            "intermediate_states",
+            intermediate_states,
+            ((_KDA_HEADS * _KDA_DIM * _KDA_DIM, _KDA_DIM * _KDA_DIM, _KDA_DIM, 1),),
         )
         num_inter_lines = min(num_inter_lines, intermediate_states.shape[0])
         inter_state = intermediate_states
@@ -2010,7 +2042,9 @@ def flydsl_kda_verify_with_f_b(
                 inner_shape=(_KDA_HEADS, ring_len, _KDA_DIM),
                 dtype=dtype,
                 device=device,
-                inner_strides=(_KDA_DIM, 1),
+            )
+            _check_dense_cache_slots(
+                f"replay_ring.{name}", tensor, ((ring_len * _KDA_DIM, _KDA_DIM, 1),)
             )
         _check_slot_tensor(
             "replay_ring.beta",
@@ -2018,8 +2052,8 @@ def flydsl_kda_verify_with_f_b(
             inner_shape=(_KDA_HEADS, ring_len),
             dtype=torch.float32,
             device=device,
-            inner_strides=(1,),
         )
+        _check_dense_cache_slots("replay_ring.beta", ring_beta, ((ring_len, 1),))
         num_slots = min(
             num_slots,
             raw_v.shape[0],
@@ -2070,6 +2104,10 @@ def flydsl_kda_verify_with_f_b(
         ("norm_weight", norm_weight, 0),
     ):
         _check_i32_addressing(name, tensor, first_dim=first_dim)
+    # Any strides work, but FlyDSL's layout-dynamic tensor argument needs one
+    # unit-stride axis.
+    if 1 not in conv_weight.stride():
+        raise ValueError("`conv_weight` must have an axis with stride 1.")
 
     if out is None:
         out = torch.empty(
@@ -2090,8 +2128,26 @@ def flydsl_kda_verify_with_f_b(
         raise ValueError("`out` must have non-overlapping token and head rows.")
     num_slots = min(num_slots, _INT32_MAX)
     num_inter_lines = min(num_inter_lines, _INT32_MAX)
-    if _KDA_SLOT_CHECK and not torch.cuda.is_current_stream_capturing():
-        _check_unique_live_slots(cache_indices, num_slots)
+    if _KDA_SLOT_CHECK:
+        # Capture is per stream, so ask about the stream the kernel launches on.
+        with torch.cuda.device(device):
+            if not torch.cuda.is_current_stream_capturing():
+                # A sequence is live only when both indices are in range, as in
+                # the kernel; padding may repeat either index.
+                live = (
+                    (cache_indices >= 0)
+                    & (cache_indices < num_slots)
+                    & (intermediate_indices >= 0)
+                    & (intermediate_indices < num_inter_lines)
+                )
+                _check_unique_live_slots(
+                    torch.where(live, cache_indices, -1), num_slots, "cache_indices"
+                )
+                _check_unique_live_slots(
+                    torch.where(live, intermediate_indices, -1),
+                    num_inter_lines,
+                    "intermediate_indices",
+                )
 
     if num_warps is None:
         num_warps = _kda_verify_num_warps(batch)
@@ -2160,6 +2216,9 @@ def flydsl_kda_verify_with_f_b(
 
 flydsl_kda_verify_with_f_b.state_dtypes = tuple(_KDA_STATE_DTYPE_TAGS)
 flydsl_kda_verify_with_f_b.max_tokens = KDA_VERIFY_MAX_TOKENS
+# Wave counts ``num_warps`` accepts, each its own compiled specialization, so a
+# caller can build every one (with a batch-1 call) before CUDA graph capture.
+flydsl_kda_verify_with_f_b.num_warps = KDA_VERIFY_NUM_WARPS
 flydsl_kda_verify_with_f_b.zeroes_invalid_output = True
 
 
