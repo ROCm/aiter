@@ -95,6 +95,7 @@ from .fmha_utils import (
     _kv_drain_depths,
     _lane_id,
     _load_seqlen_pair,
+    _paged_layout_ok,
     s_buffer_load,
     _load_sink_logit,
     _m_tile_idx,
@@ -1028,39 +1029,46 @@ def _attention_prologue(
             n_block=n_block,
         )
 
-    def _k_desc(slot, row0, valid):
+    def _k_desc(slot, row0, valid, page_indices=None):
         """K descriptor for one tile, addressed off the slot's low-half base. Pure until
-        ``.async_load()``; which transport it carries (async vs TDM) is the manager's
-        business, not this call site's."""
+        ``.async_load()``; which transport it carries (async, TDM or paged gather) is the
+        manager's business, not this call site's."""
         return k_mgr.load_descriptor(
             ptr_lds=_k_bufs_at(slot),
             ptr_src=ptr_K,
             stride_seq=stride_k_seq,
             stride_head=stride_k_head,
             head=kv_head,
-            row0=kv_start + row0,
+            row0=_kv_policy.row_base + row0,
             valid=valid,
             ctx=_kv_ctx,
+            **_kv_policy.desc_kwargs(page_indices),
         )
 
-    def _v_desc(slot, row0, valid):
+    def _v_desc(slot, row0, valid, page_indices=None):
         return v_mgr.load_descriptor(
             ptr_lds=_v_bufs_at(slot),
             ptr_src=ptr_V,
             stride_seq=stride_v_seq,
             stride_head=stride_v_head,
             head=kv_head,
-            row0=kv_start + row0,
+            row0=_kv_policy.row_base + row0,
             valid=valid,
             ctx=_kv_ctx,
+            **_kv_policy.desc_kwargs(page_indices),
         )
 
     # LO copies the K band, HI the V band, both of tile start into slot 1; HI owes one more,
     # V(start) into slot 0 for body start's dead PV. Built here because the address math is
     # pure; only the ``.async_load()``s go under the warp-type branch.
     _start_valid = _kv_valid(start_tile_idx)
-    k_start_desc = _k_desc(_k_lds_buf(_PHYSICAL_SLOT[1]), start_row0, _start_valid)
-    v_start_desc = _v_desc(_k_lds_buf(_PHYSICAL_SLOT[1]), start_row0, _start_valid)
+    _start_pages = _kv_policy.indices_for(start_tile_idx)
+    k_start_desc = _k_desc(
+        _k_lds_buf(_PHYSICAL_SLOT[1]), start_row0, _start_valid, _start_pages
+    )
+    v_start_desc = _v_desc(
+        _k_lds_buf(_PHYSICAL_SLOT[1]), start_row0, _start_valid, _start_pages
+    )
 
     # Per-half counter usage, off the descriptors' declared counts. A counter this half
     # never touches gets -1 ("do not wait on it"), NOT 0.
@@ -1376,6 +1384,11 @@ def _attention_core_multi_kv_tiles(
             rocdl.sched_barrier(0)
     _init = _init + _seed_head
 
+    _kv_state_idx = len(_init)
+    _init = _init + [
+        _raw(v) for v in kv_policy.init_state(start_tile_idx + fx.Int32(1))
+    ]
+
     # ========================================================================
     # Main KV loop -- SOFTWARE-PIPELINED by one tile. The loop variable ``u`` is the
     # SOFTMAX tile, and body tile_idx runs
@@ -1469,13 +1482,19 @@ def _attention_core_multi_kv_tiles(
         # to branch on.
         write_slot = slot_of[N_KV_PP - 1]
         prefetch_tile_idx = tile_idx + fx.Int32(1)
+        kv_state_prev = list(
+            state[_kv_state_idx : _kv_state_idx + kv_policy.num_state_slots]
+        )
         prefetch_row0 = _tile_row0(prefetch_tile_idx)
         prefetch_valid = _kv_valid(prefetch_tile_idx)
 
         # This half's descriptor for tile ``pf``'s K (LO) or V (HI) into the oldest slot.
         # Built up front: pure, so its address VALU overlaps the drain; only the copy
         # itself must stay after the barrier.
-        prefetch_desc = _get_kv_desc(write_slot, prefetch_row0, prefetch_valid)
+        prefetch_page_indices = kv_policy.indices(kv_state_prev)
+        prefetch_desc = _get_kv_desc(
+            write_slot, prefetch_row0, prefetch_valid, prefetch_page_indices
+        )
 
         def _k_emit(j):
             return k_mgr.load_one_to_reg(k_curr, j)
@@ -1613,6 +1632,7 @@ def _attention_core_multi_kv_tiles(
         # S^T = K(tile_idx) @ Q^T. sched_barrier fences the ring head out of the WMMA stream
         # (no wmma<-ds_load bubble); the ring itself issues the per-fragment s_wait_dscnt.
         if _is_lagging_softmax:
+            kv_state_next = kv_policy.advance(prefetch_tile_idx)
             prefetch_desc.async_load()
             p_f32, m_new_list, d_new_list, o_resc = _softmax_phase(carry_prev, o_acc)
             # Head out BEFORE P is narrowed: it is ds_loads with no dependence on P, so
@@ -1644,6 +1664,7 @@ def _attention_core_multi_kv_tiles(
             _copy_fence(*_kv_drain, num_dscnt=_num_head_carry)
             head_next = []
         else:
+            kv_state_next = kv_policy.advance(prefetch_tile_idx)
             _copy_fence(*_kv_drain, num_dscnt=_num_head_carry)
             pvqk_head = _pvqk_head()
             prefetch_desc.async_load()
@@ -1692,6 +1713,7 @@ def _attention_core_multi_kv_tiles(
             out += v_slots[i]
         out += [_raw(slot_of[i]) for i in rotation]
         out += [_raw(h) for h in head_next]
+        out += [_raw(v) for v in kv_state_next]
         return out
 
     # ---- Stream softmax tiles [start_tile_idx, num_tiles] through 3 sub-loops split by the
@@ -3076,6 +3098,136 @@ def _ensure_thd_kernel(
     _launch_fns[key] = _launch
 
 
+def _ensure_paged_kernel(
+    mask_left: bool,
+    mask_right: bool,
+    return_lse: bool,
+    has_sink: bool,
+    gqa_ratio: int,
+    page_size: int,
+    qk_hdim: int = DEFAULT_QK_HDIM,
+    v_hdim: int = DEFAULT_V_HDIM,
+    q_dtype_str: str = DEFAULT_DTYPE,
+    kv_dtype_str: str = DEFAULT_DTYPE,
+    num_q_tiles_per_wave: int = WMMA_ROW_PER_WAVE,
+):
+    key = (
+        "paged",
+        bool(mask_left),
+        bool(mask_right),
+        bool(return_lse),
+        bool(has_sink),
+        int(gqa_ratio),
+        int(qk_hdim),
+        int(v_hdim),
+        str(q_dtype_str),
+        str(kv_dtype_str),
+        int(num_q_tiles_per_wave),
+        int(page_size),
+    )
+    if key in _launch_fns:
+        return
+    kernel = build_fmha_fwd_prefill_a8w8_m32x8(
+        layout="paged",
+        page_size=page_size,
+        qk_hdim=qk_hdim,
+        v_hdim=v_hdim,
+        mask_left=mask_left,
+        mask_right=mask_right,
+        one_kv_tile=False,
+        return_lse=return_lse,
+        has_sink=has_sink,
+        gqa_ratio=gqa_ratio,
+        q_dtype_str=q_dtype_str,
+        kv_dtype_str=kv_dtype_str,
+        num_q_tiles_per_wave=num_q_tiles_per_wave,
+    )
+    block_m = _block_m(num_q_tiles_per_wave)
+
+    @flyc.jit
+    def _launch(
+        ptr_O: fx.Pointer,
+        ptr_Q: fx.Pointer,
+        ptr_K: fx.Pointer,
+        ptr_V: fx.Pointer,
+        ptr_LSE: fx.Pointer,
+        ptr_sink: fx.Pointer,
+        ptr_cu_seqlens_q: fx.Pointer,
+        ptr_kv_indptr: fx.Pointer,
+        ptr_kv_page_indices: fx.Pointer,
+        ptr_kv_last_page_lens: fx.Pointer,
+        softmax_scale: fx.Float32,
+        stride_q_seq: fx.Int32,
+        stride_k_seq: fx.Int32,
+        stride_v_seq: fx.Int32,
+        stride_o_seq: fx.Int32,
+        stride_q_head: fx.Int32,
+        stride_k_head: fx.Int32,
+        stride_v_head: fx.Int32,
+        stride_o_head: fx.Int32,
+        stride_lse_seq: fx.Int32,
+        stride_lse_head: fx.Int32,
+        window_left: fx.Int32,
+        window_right: fx.Int32,
+        max_seqlen_q: fx.Int32,
+        max_seqlen_k: fx.Int32,
+        num_page_entries: fx.Int32,
+        num_pool_rows: fx.Int32,
+        num_heads_kv: fx.Int32,
+        batch_size: fx.Int32,
+        stream: fx.Stream,
+    ):
+        # 3D grid: x = tiles over (seq, q_head_in_group) per kv-head,
+        #          y = kv_head, z = batch. block = 256 (8 waves x wave32).
+        grid_x = fx.Index(
+            fx.ceildiv(fx.Uint32(max_seqlen_q * gqa_ratio), fx.Uint32(block_m))
+        )
+        grid_y = fx.Index(num_heads_kv)
+        grid_z = fx.Index(batch_size)
+
+        launcher = kernel(
+            ptr_O,
+            ptr_Q,
+            ptr_K,
+            ptr_V,
+            ptr_LSE,
+            ptr_sink,
+            ptr_cu_seqlens_q,
+            ptr_kv_indptr,
+            ptr_kv_page_indices,
+            ptr_kv_last_page_lens,
+            softmax_scale,
+            stride_q_seq,
+            stride_k_seq,
+            stride_v_seq,
+            stride_o_seq,
+            stride_q_head,
+            stride_k_head,
+            stride_v_head,
+            stride_o_head,
+            stride_lse_seq,
+            stride_lse_head,
+            window_left,
+            window_right,
+            max_seqlen_q,
+            max_seqlen_k,
+            num_page_entries,
+            num_pool_rows,
+        )
+        launcher.launch(
+            grid=(grid_x, grid_y, grid_z),
+            block=(BLOCK_SIZE, 1, 1),
+            stream=stream,
+        )
+
+    _launch.compile_hints["llvm_options"] = {
+        "amdgpu-expert-scheduling-mode": ENABLE_SCHED_MODE2,
+        # "amdgpu-sched-strategy": "coexec",  # gfx1250 co-exec sched for warp specialization
+    }
+    _launch.compile_hints["waves_per_eu"] = 2
+    _launch_fns[key] = _launch
+
+
 def _ensure_bshd_kernel(
     mask_left: bool,
     mask_right: bool,
@@ -3410,6 +3562,218 @@ def flash_attn_varlen_a8w8_m32x8(
         window_right,
         max_seqlen_q,
         max_seqlen_k,
+        nheads_k,
+        batch,
+        torch.cuda.current_stream(),
+    )
+
+    if return_lse:
+        return out, lse
+    return out
+
+
+def flash_attn_paged_a8w8_m32x8(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    qo_indptr: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_page_indices: torch.Tensor,
+    kv_last_page_lens: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    softmax_scale=None,
+    causal=False,
+    window_size=(-1, -1),
+    out=None,
+    return_lse=False,
+    sink=None,
+    lse=None,
+    num_q_tiles_per_wave=None,
+):
+    """Host entry — PAGED KV, qk_hdim in {64,128,256} / v_hdim in {64,128,256}, bf16 or fp16.
+
+    ``k``/``v`` are the page pool, ``[num_blocks, page_size, nheads_k, hdim]`` (or
+    ``[num_blocks, nheads_k, hdim]`` at page size 1). ``qo_indptr`` gives this batch's Q
+    token ranges, as it does for THD; the KV side is the AITER page triple. ``page_size``
+    is compile-time, so one build serves one page size.
+
+    ``window_size`` is ``(left, right)`` sliding-window bounds, ``-1`` meaning infinite
+    on that side; ``causal`` forces ``right=0``. Only finiteness is baked into the kernel
+    (compile-time ``mask_left``/``mask_right``), so one variant serves any magnitude.
+    ``sink`` is an optional ``[nheads_q]`` fp32 per-head logit in the scaled-score domain,
+    its presence likewise compile-time. ``lse`` is an optional caller-provided
+    ``[nheads_q, total_q]`` fp32 buffer, allocated here when ``return_lse`` and None.
+    """
+    assert (
+        q.dtype in SUPPORTED_TORCH_DTYPES and k.dtype in SUPPORTED_TORCH_DTYPES
+    ), f"Expected 8-bit q/kv, got {q.dtype}/{k.dtype}"
+    assert (
+        k.dtype == q.dtype and v.dtype == q.dtype
+    ), f"q/k/v dtype must match, got {q.dtype}/{k.dtype}/{v.dtype}"
+    q_dtype_str = _TORCH_IN_DTYPES[q.dtype]
+    kv_dtype_str = _TORCH_IN_DTYPES[k.dtype]
+    qk_hdim = q.shape[-1]
+    assert (
+        qk_hdim in SUPPORTED_QK_HDIM
+    ), f"Expected qk_hdim in {SUPPORTED_QK_HDIM}, got {qk_hdim}"
+    v_hdim = v.shape[-1]
+    assert (
+        v_hdim in SUPPORTED_V_HDIM
+    ), f"Expected v_hdim in {SUPPORTED_V_HDIM}, got {v_hdim}"
+
+    total_q_tokens = q.shape[0]
+    batch = qo_indptr.shape[0] - 1
+    assert k.dim() == v.dim() and k.dim() in (3, 4), (
+        f"paged k/v must be [num_blocks, page_size, nheads_k, hdim] or "
+        f"[num_blocks, nheads_k, hdim]; got {tuple(k.shape)}"
+    )
+    page_size = 1 if k.dim() == 3 else k.shape[1]
+    assert (
+        page_size & (page_size - 1) == 0
+    ), f"page_size must be a power of two, got {page_size}"
+    # pages contiguous => row p*page_size + o is token o of page p; stride(-3) is the
+    # per-token stride at both ranks.
+    assert k.stride(0) == page_size * k.stride(-3) and v.stride(
+        0
+    ) == page_size * v.stride(-3), (
+        "paged k/v need contiguous pages (stride(0) == page_size * stride(-3))"
+    )
+    num_pool_rows = k.shape[0] * page_size
+    num_page_entries = kv_page_indices.numel()
+    # Token-row view: what the gather addresses, and one variant per page_size
+    # (dispatch specializes on rank, so 3-D and 4-D pools would not share one).
+    k = k.as_strided(
+        (num_pool_rows, k.shape[-2], k.shape[-1]),
+        (k.stride(-3), k.stride(-2), k.stride(-1)),
+    )
+    v = v.as_strided(
+        (num_pool_rows, v.shape[-2], v.shape[-1]),
+        (v.stride(-3), v.stride(-2), v.stride(-1)),
+    )
+    nheads_q = q.shape[1]
+    nheads_k = k.shape[-2]
+    assert (
+        nheads_q % nheads_k == 0
+    ), f"nheads_q={nheads_q} must be a multiple of nheads_k={nheads_k}"
+    gqa = nheads_q // nheads_k
+
+    has_sink = sink is not None
+    if has_sink:
+        assert sink.dtype == torch.float32, f"sink must be fp32, got {sink.dtype}"
+        assert (
+            sink.dim() == 1 and sink.shape[0] == nheads_q
+        ), f"sink must be [nheads_q={nheads_q}], got {tuple(sink.shape)}"
+    # ptr_sink is only read when has_sink; pass q as a valid placeholder otherwise.
+    sink_ptr = sink if has_sink else q
+
+    if softmax_scale is None:
+        softmax_scale = 1.0 / (q.shape[-1] ** 0.5)
+
+    # Sliding window: causal forces right=0. Finiteness (>=0) is compile-time
+    # (mask_left/mask_right); the magnitudes ride along as runtime Int32 args.
+    win_left, win_right = int(window_size[0]), int(window_size[1])
+    if causal:
+        win_right = 0
+    mask_left = win_left >= 0
+    mask_right = win_right >= 0
+    window_left = max(win_left, 0)
+    window_right = max(win_right, 0)
+
+    if out is None:
+        out = torch.empty(
+            (total_q_tokens, nheads_q, v_hdim), dtype=TORCH_O_DTYPE, device=q.device
+        )
+    if return_lse:
+        if lse is None:
+            # [nheads_q, total_q] is the aiter varlen LSE convention, what CK and the
+            # gfx1250 ASM varlen kernel both return. The kernel is stride-driven, so the
+            # layout lives entirely in the two strides below.
+            lse = torch.empty(
+                (nheads_q, total_q_tokens), dtype=torch.float32, device=q.device
+            )
+        lse_ptr = lse
+        stride_lse_seq = lse.stride(1)
+        stride_lse_head = lse.stride(0)
+    else:
+        lse_ptr = q
+        stride_lse_seq = 0
+        stride_lse_head = 0
+
+    # Q/K/V/O strides in ELEMENTS (TDM loaders consume them directly).
+    stride_q_seq = q.stride(0)
+    stride_k_seq = k.stride(-3)  # per-TOKEN stride in the pool
+    stride_v_seq = v.stride(-3)
+    stride_o_seq = out.stride(0)
+    stride_q_head = q.stride(1)
+    stride_k_head = k.stride(-2)
+    stride_v_head = v.stride(-2)
+    stride_o_head = out.stride(1)
+
+    if num_q_tiles_per_wave is None:
+        num_q_tiles_per_wave = _pick_num_q_tiles(
+            nheads_k, batch, max_seqlen_q, gqa, v_hdim
+        )
+    num_q_tiles_per_wave = int(num_q_tiles_per_wave)
+
+    _ensure_paged_kernel(
+        mask_left,
+        mask_right,
+        bool(return_lse),
+        has_sink,
+        gqa,
+        page_size,
+        qk_hdim=qk_hdim,
+        v_hdim=v_hdim,
+        q_dtype_str=q_dtype_str,
+        kv_dtype_str=kv_dtype_str,
+        num_q_tiles_per_wave=num_q_tiles_per_wave,
+    )
+
+    _run_compiled(
+        _launch_fns[
+            (
+                "paged",
+                mask_left,
+                mask_right,
+                bool(return_lse),
+                has_sink,
+                gqa,
+                qk_hdim,
+                v_hdim,
+                q_dtype_str,
+                kv_dtype_str,
+                num_q_tiles_per_wave,
+                page_size,
+            )
+        ],
+        out,
+        q,
+        k,
+        v,
+        lse_ptr,
+        sink_ptr,
+        qo_indptr,
+        kv_indptr,
+        kv_page_indices,
+        kv_last_page_lens,
+        softmax_scale,
+        stride_q_seq,
+        stride_k_seq,
+        stride_v_seq,
+        stride_o_seq,
+        stride_q_head,
+        stride_k_head,
+        stride_v_head,
+        stride_o_head,
+        stride_lse_seq,
+        stride_lse_head,
+        window_left,
+        window_right,
+        max_seqlen_q,
+        max_seqlen_k,
+        num_page_entries,
+        num_pool_rows,
         nheads_k,
         batch,
         torch.cuda.current_stream(),

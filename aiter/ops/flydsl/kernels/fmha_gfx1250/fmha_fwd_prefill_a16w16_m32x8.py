@@ -73,6 +73,7 @@ from .fmha_buffer_managers import (
     _ir,
 )
 from .fmha_utils import (
+    _paged_layout_ok,
     PagedSpec,
     _ContiguousKVPolicy,
     _PagedKVPolicy,
@@ -3321,26 +3322,6 @@ def _ensure_bshd_kernel(
     }
     _launch.compile_hints["waves_per_eu"] = 2
     _launch_fns[key] = _launch
-
-
-def _paged_layout_ok(k, v, kv_indptr, kv_page_indices, kv_last_page_lens):
-    """The page pool and its metadata, as the gather loader needs them."""
-    if k.dim() != v.dim() or k.dim() not in (3, 4):
-        return False
-    meta = (kv_indptr, kv_page_indices, kv_last_page_lens)
-    if any(t is None for t in meta) or any(t.dtype != torch.int32 for t in meta):
-        return False
-    if kv_page_indices.stride(-1) != 1:
-        return False
-    page_size = 1 if k.dim() == 3 else k.shape[1]
-    if page_size & (page_size - 1):
-        return False
-    # the token-row view the gather addresses only exists when pages are contiguous
-    if k.stride(0) != page_size * k.stride(-3) or v.stride(0) != page_size * v.stride(-3):
-        return False
-    if k.stride(-1) != 1 or v.stride(-1) != 1:
-        return False
-    return k.shape[0] * page_size < 2**31
 
 
 def flash_attn_a16w16_m32x8_supported(
