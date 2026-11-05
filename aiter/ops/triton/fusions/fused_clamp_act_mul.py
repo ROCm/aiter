@@ -25,6 +25,9 @@ _GLUON_SUPPORTED_ARCHS = (
     "gfx1250-strict",
 )
 _CONFIG_NAME = "FUSED_CLAMP_ACT_MUL"
+# The half width (N // 2) must be a positive multiple of this, and of
+# quant_block_size when quantizing. Callers that gate on it read it from here.
+N_HALF_MULTIPLE = 32
 
 
 def _is_gluon_available() -> bool:
@@ -220,8 +223,8 @@ def fused_clamp_act_mul(
     # but a quant group straddling n_half would take its scale over masked
     # lanes, so a quantized row holds whole groups.
     assert (
-        n_half >= 32 and n_half % 32 == 0
-    ), f"n_half ({n_half}) must be a multiple of 32"
+        n_half >= N_HALF_MULTIPLE and n_half % N_HALF_MULTIPLE == 0
+    ), f"n_half ({n_half}) must be a multiple of {N_HALF_MULTIPLE}"
     if HAS_QUANT:
         assert n_half % quant_block_size == 0, (
             f"n_half ({n_half}) must be a multiple of quant_block_size "
