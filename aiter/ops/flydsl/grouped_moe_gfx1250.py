@@ -284,6 +284,19 @@ def _find_grouped_config(
     return chosen
 
 
+_SPLITK_SEMAPHORES: dict = {}
+
+
+def _splitk_semaphore(device, tiles: int):
+    """Zeroed per-tile arrival counters; the split-K kernel resets them itself."""
+    key = (str(device), int(tiles))
+    sem = _SPLITK_SEMAPHORES.get(key)
+    if sem is None:
+        sem = torch.zeros(max(1, int(tiles)), dtype=torch.int32, device=device)
+        _SPLITK_SEMAPHORES[key] = sem
+    return sem
+
+
 def _use_grouped_gemm_enabled() -> bool:
     env_enabled = os.environ.get("AITER_USE_GROUPED_GEMM", "0") in _TRUTHY_ENV
     is_gfx1250 = get_gfx() in ("gfx1250", "gfx1250-strict")
@@ -697,6 +710,7 @@ def _grouped_a8w4_tdm_moe(
     persistent_workers2=0,
     k_waves1=1,
     k_waves2=1,
+    k_grid1=1,
     tiles_configured=False,
     persistent_contiguous_tasks2=0,
     packed_expert_map=0,
@@ -875,6 +889,11 @@ def _grouped_a8w4_tdm_moe(
         // int(tile_m2)
         * ((int(model_dim) + int(tile_n2) - 1) // int(tile_n2))
     )
+    k_grid1 = int(os.environ.get("AITER_TDM_K_GRID1") or k_grid1 or 1)
+    if k_grid1 > 1:
+        # Split-K workgroups cooperate through a semaphore, not a cluster.
+        cluster_m = cluster_n = 1
+        _stage1_task_cap *= k_grid1
     _stage1_single_task = (
         _sparse_routing
         and expert_mask is None
@@ -1335,6 +1354,19 @@ def _grouped_a8w4_tdm_moe(
     )
     _fuse_quant = not disable_gemm1_requant
     w1_u8 = _grouped_weight_uint8(w1)
+    _kg_kw = (
+        {
+            "k_grid": k_grid1,
+            "splitk_ws": torch.empty(
+                (k_grid1, contiguous_m, 2 * inter_dim), dtype=torch.float32, device=device
+            ),
+            "splitk_sem": _splitk_semaphore(
+                device, (contiguous_m // tile_m) * ((2 * inter_dim + tile_n - 1) // tile_n)
+            ),
+        }
+        if k_grid1 > 1
+        else {}
+    )
     w1s_i32 = w1_scale.reshape(-1).view(torch.int32)
 
     if _fuse_quant:
@@ -1408,6 +1440,7 @@ def _grouped_a8w4_tdm_moe(
             lds_soa_load_interleave=_g1_lds_interleave,
             rolled_drain=rolled_drain,
             k_waves=k_waves1,
+            **_kg_kw,
             row_major_ascale=int(_row_major_ascale),
             a_row_stride_bytes=_a1_wire_stride,
             a_scale_row_stride_bytes=_a1_wire_stride,
@@ -1461,6 +1494,7 @@ def _grouped_a8w4_tdm_moe(
             lds_soa_load_interleave=_g1_lds_interleave,
             rolled_drain=rolled_drain,
             k_waves=k_waves1,
+            **_kg_kw,
             row_major_ascale=int(_row_major_ascale),
             a_row_stride_bytes=_a1_wire_stride,
             a_scale_row_stride_bytes=_a1_wire_stride,
@@ -1626,6 +1660,7 @@ def _grouped_a8w4_tdm_moe(
                         row_major_ascale=int(_row_major_ascale),
                         rolled_drain=rolled_drain,
                         k_waves=k_waves1,
+                        **_kg_kw,
                         **_situ_kw,
                     ),
                 )
@@ -1681,6 +1716,7 @@ def _grouped_a8w4_tdm_moe(
                         row_major_ascale=int(_row_major_ascale),
                         rolled_drain=rolled_drain,
                         k_waves=k_waves1,
+                        **_kg_kw,
                         **_situ_kw,
                     ),
                 )
@@ -2097,6 +2133,7 @@ def grouped_gemm_gfx1250_a8w4(
             # (the model_configs/ merge fills a column an older table lacks with
             # 0) means unset, i.e. no split.
             _tdm_kw["k_waves1"] = max(1, _as_int(cfg_row.get("split_k1"), 1))
+            _tdm_kw["k_grid1"] = max(1, _as_int(cfg_row.get("k_grid1"), 1))
             _tdm_kw["k_waves2"] = max(1, _as_int(cfg_row.get("split_k2"), 1))
             # Follow the matched CSV bucket, including padded token counts
             # (for example, 6144 -> 8192), just like the other kernel knobs.
