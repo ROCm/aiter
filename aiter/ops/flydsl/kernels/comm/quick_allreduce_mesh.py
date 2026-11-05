@@ -6,7 +6,7 @@
 Topology of each lap: every rank pushes directly to all ``N-1`` peers, twice.
 
 INT4 nibble: [-8,+7], −1/8, 4 B/thread, 1152 B rank-tile. Scale is
-group-16 signed E4M3 in the 128 B region. Super-tile ST∈{1,8}; host
+group-16 signed E5M2 (bias 12) in the 128 B region. Super-tile ST∈{1,8}; host
 uses ST=1 when ``num_tiles ≤`` the occupancy-clamped persistent grid.
 Payload HBM is bf16; in-kernel math is packed fp16. Each rank owns
 ``ATOMS / world_size`` atoms of a tile (8 GPUs → 1, 4 → 2, 2 → 4); LDS
@@ -42,6 +42,7 @@ from ...allreduce_policy import (
     SUPPORTED_WORLDS,
 )
 from .quick_allreduce_codec import (
+    SCALE_CODEC_TAG,
     _clamp_fp16_overflow,
     _codec_dequant,
     _codec_load,
@@ -340,7 +341,7 @@ def make_quick_allreduce_mesh_kernel(
         # 64 B NT sectors of one rank-tile: (sector, lane-in-quad) -> i32
         # start of the dwordx4. Isolated NT store stays explicit.
         nt_own_layout = fx.make_layout((c.n_sectors, QUAD_LANES), (16, 4))
-        # Four group-16 E4M3 bytes share the i32 slot eight threads already own.
+        # Four group-16 scale bytes share the i32 slot eight threads already own.
         scale_slot, pair_in_slot = scale_slot_of(tid, block)
         wire_slot_layout = fx.make_layout(
             (PHASES, grid, world_size, super_tile),
@@ -506,7 +507,7 @@ def make_quick_allreduce_mesh_kernel(
 
             Lockstep stripes of up to 8 sectors cover the rank-tile: at the
             default block INT4 is 8+8+2 (16 nibble sectors then the 2-sector
-            E4M3 tail), fp16 is eight full stripes. ``sector_base`` is the first
+            scale tail), fp16 is eight full stripes. ``sector_base`` is the first
             sector of each stripe.
 
             One quad per (destination, sector) of a stripe; leftover quads sit
@@ -875,8 +876,8 @@ def make_quick_allreduce_mesh_kernel(
     # The inbox memory type and wire codec both change the emitted code, so
     # both have to be part of the symbol name -- two variants that differ only
     # in cache bits or wire format must not collide in the JIT cache.
-    tag = f"ws{world_size}_r{self_rank}_st{super_tile}_g{grid}_{inbox_memory}"
-    tag += f"_{codec}_b{block}" + epilogue.tag
+    tag = f"{SCALE_CODEC_TAG}_ws{world_size}_r{self_rank}_st{super_tile}_g{grid}"
+    tag += f"_{inbox_memory}_{codec}_b{block}" + epilogue.tag
     launcher = (
         launch_quick_allreduce_mesh_fused
         if epilogue.takes_operands

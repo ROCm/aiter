@@ -56,7 +56,7 @@ sentinel until the data of a peer arrives. The reader polls its slot until no
 
 The mesh is a two-shot all-reduce: a reduce-scatter lap, then an all-gather
 lap. In each lap, each rank pushes to all `N-1` peers. The wire format is INT4
-with one E4M3 scale for each group of 16 values. FP16 is also available for
+with one E5M2 scale for each group of 16 values. FP16 is also available for
 tests.
 
 ### Ring
@@ -70,13 +70,13 @@ This is better on PCIe, where each GPU has one shared x16 uplink.
 | Item | Mesh | Ring |
 |---|---|---|
 | Quantizations in the reduce-scatter lap | 1 | `N-1`, one at each hop |
-| Default reduce-scatter codec | INT4 | INT4, INT6 at TP8 |
+| Default reduce-scatter codec | INT4 | INT4 at TP2, INT6 from TP4 |
 | Writers for each inbox slot | `N-1` peers | 1, the ring predecessor |
 | LDS staging (TP8, block 256) | Packets for all destinations, 9216 B with INT4 | Packet for one destination, 1664 B with INT6 |
 
 The ring quantizes the running partial sum again at each hop. The maximum
 absolute value of the partial sum increases with each hop. For this reason,
-the ring needs INT6 on the reduce-scatter lap at TP8. The all-gather lap sends
+the ring needs INT6 on the reduce-scatter lap from TP4. The all-gather lap sends
 the received bytes without a change, so it adds only one quantization.
 
 After the all-gather, every rank holds the same bits. Each rank decodes every
@@ -90,10 +90,11 @@ fp16, for every wire format.
 
 * A magnitude above 65504 saturates to 65504. The `fp16` wire format is not
   lossless for bf16 values outside the fp16 range.
-* The group scale is an E4M3 byte with a largest magnitude of 480. A group
-  with an extremum above 480 clips at about 480, and NaN and Inf become finite
-  values. The ring requantizes the partial sum at each reduce-scatter hop, so a
-  sum of several values near 300 can also clip.
+* The group scale is an E5M2 byte (bias 12) spanning `[2**-12, 1.75 * 2**19]`,
+  so every fp16 extremum fits and no group clips below the fp16 limit above,
+  including the ring's requantized partial sums. NaN and Inf become finite
+  values. `SCALE_CODEC_TAG` is part of every kernel's launch name: bump it when
+  the codec changes, or a warm FlyDSL cache keeps loading old binaries.
 
 ## Inbox memory
 

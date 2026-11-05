@@ -63,7 +63,8 @@ if [[ "$TEST_TYPE" == "aiter" ]]; then
                 "$TEST_DIR/tuning_tests/test_fhmoe_tuner.py" \
                 "$TEST_DIR/tuning_tests/test_mixed_mxfp_tuning.py" \
                 "$TEST_DIR/flydsl_tests/test_flydsl_allreduce_policy.py" \
-                "$TEST_DIR/flydsl_tests/test_flydsl_quick_allreduce_codec.py"
+                "$TEST_DIR/flydsl_tests/test_flydsl_quick_allreduce_codec.py" \
+                "$TEST_DIR/flydsl_tests/test_gemm2_valid_token_count.py"
         } | LC_ALL=C sort -u
     )
 elif [[ "$TEST_TYPE" == "triton" ]]; then

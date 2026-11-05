@@ -40,6 +40,7 @@ from ...allreduce_policy import (
 )
 from .quick_allreduce_codec import (
     GROUP,
+    SCALE_CODEC_TAG,
     _clamp_fp16_overflow,
     _codec_dequant,
     _codec_load,
@@ -718,8 +719,8 @@ def make_quick_allreduce_ring_kernel(
     # policy, so both have to reach the symbol name -- variants that differ only
     # in a compile-time constant must not collide in the JIT cache.
     tag = (
-        f"ws{world_size}_r{rank}_st{super_tile}_g{grid}_{inbox_memory}"
-        f"_{rs_codec}_{ag_codec}"
+        f"{SCALE_CODEC_TAG}_ws{world_size}_r{rank}_st{super_tile}_g{grid}"
+        f"_{inbox_memory}_{rs_codec}_{ag_codec}"
     )
     tag += f"_b{block}" + epilogue.tag
     launcher = (
