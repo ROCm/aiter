@@ -47,7 +47,6 @@ _rms_norm_kernel_repr = make_kernel_repr(
     [
         "BLOCK_SIZE",
         "USE_BLOCKED",
-        "NUM_PRGMS",
     ],
 )
 
@@ -72,7 +71,6 @@ def _rms_norm_kernel(
     # Meta-parameters
     BLOCK_SIZE: tl.constexpr,
     USE_BLOCKED: tl.constexpr,
-    NUM_PRGMS: tl.constexpr,
 ):
     """
     Note: this is Triton jited function and not meant to be called directly. Call rms_norm function
@@ -87,11 +85,12 @@ def _rms_norm_kernel(
     """
     # Map the program id to the first row of input and output it should compute.
     row_start = tl.program_id(0)
+    program_stride = tl.num_programs(0)
     col_offsets = tl.arange(0, BLOCK_SIZE)
 
     if USE_BLOCKED:
         # Persistent loop for rows
-        for row_idx in tl.range(row_start, n_rows, NUM_PRGMS, num_stages=1):
+        for row_idx in tl.range(row_start, n_rows, program_stride, num_stages=1):
             row_input_ptr = input_ptr + row_idx * input_row_stride
             row_output_ptr = output_ptr + row_idx * output_row_stride
 
@@ -149,7 +148,7 @@ def _rms_norm_kernel(
 
     else:
         mask = col_offsets < n_cols
-        for row_idx in tl.range(row_start, n_rows, NUM_PRGMS, num_stages=2):
+        for row_idx in tl.range(row_start, n_rows, program_stride, num_stages=2):
             input_ptrs = input_ptr + row_idx * input_row_stride + col_offsets
             input_ptrs = tl.multiple_of(input_ptrs, (16,))
             row = tl.load(input_ptrs, mask=mask, other=0.0, cache_modifier=".cg").to(
@@ -180,7 +179,6 @@ _quant_rms_norm_kernel_repr = make_kernel_repr(
         "DUMP_INTERMEDIATE",
         "BLOCK_SIZE",
         "USE_BLOCKED",
-        "NUM_PRGMS",
     ],
 )
 
@@ -218,7 +216,6 @@ def _quant_rms_norm_kernel(
     DUMP_INTERMEDIATE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     USE_BLOCKED: tl.constexpr,
-    NUM_PRGMS: tl.constexpr,
 ):
     """
     Note: this is Triton jited function and not meant to be called directly. Call rmsnorm2d_fwd_with_smoothquant or
@@ -235,11 +232,12 @@ def _quant_rms_norm_kernel(
     """
     # Map the program id to the first row of input and output it should compute.
     row_start = tl.program_id(0)
+    program_stride = tl.num_programs(0)
     col_offsets = tl.arange(0, BLOCK_SIZE)
 
     if USE_BLOCKED:
         # Persistent loop for rows
-        for row_idx in tl.range(row_start, n_rows, NUM_PRGMS, num_stages=1):
+        for row_idx in tl.range(row_start, n_rows, program_stride, num_stages=1):
             row_input_ptr = input_ptr + row_idx * input_row_stride
             row_output_ptr = output_ptr + row_idx * output_row_stride
             row_aux_ptr = aux_ptr + row_idx * aux_row_stride
@@ -371,7 +369,7 @@ def _quant_rms_norm_kernel(
             tl.store(output_ptrs, output.to(output_ptr.dtype.element_ty), mask=mask)
     else:
         mask = col_offsets < n_cols
-        for row_idx in tl.range(row_start, n_rows, NUM_PRGMS, num_stages=2):
+        for row_idx in tl.range(row_start, n_rows, program_stride, num_stages=2):
             input_ptrs = input_ptr + row_idx * input_row_stride + col_offsets
             input_ptrs = tl.multiple_of(input_ptrs, (16,))
             row = tl.load(input_ptrs, mask=mask, other=0.0, cache_modifier=".cg").to(
@@ -421,7 +419,6 @@ _fused_add_rmsnorm_kernel_repr = make_kernel_repr(
     [
         "BLOCK_SIZE",
         "USE_BLOCKED",
-        "NUM_PRGMS",
     ],
 )
 
@@ -448,7 +445,6 @@ def _fused_add_rmsnorm_kernel(
     # Meta-parameters
     BLOCK_SIZE: tl.constexpr,
     USE_BLOCKED: tl.constexpr,
-    NUM_PRGMS: tl.constexpr,
 ):
     """
     Note: this is Triton jited function and not meant to be called directly. Call
@@ -466,11 +462,12 @@ def _fused_add_rmsnorm_kernel(
     """
     # Map the program id to the first row of input and output it should compute.
     row_start = tl.program_id(0)
+    program_stride = tl.num_programs(0)
     col_offsets = tl.arange(0, BLOCK_SIZE)
 
     if USE_BLOCKED:
         # Persistent loop for rows
-        for row_idx in tl.range(row_start, n_rows, NUM_PRGMS, num_stages=1):
+        for row_idx in tl.range(row_start, n_rows, program_stride, num_stages=1):
             row_input_ptr = input_ptr + row_idx * input_row_stride
             row_output_ptr = output_ptr + row_idx * output_row_stride
             row_res_in_ptr = res_in_ptr + row_idx * input_row_stride
@@ -546,7 +543,7 @@ def _fused_add_rmsnorm_kernel(
 
     else:
         mask = col_offsets < n_cols
-        for row_idx in tl.range(row_start, n_rows, NUM_PRGMS, num_stages=2):
+        for row_idx in tl.range(row_start, n_rows, program_stride, num_stages=2):
             input_ptrs = input_ptr + row_idx * input_row_stride + col_offsets
             input_ptrs = tl.multiple_of(input_ptrs, (16,))
             row = tl.load(input_ptrs, mask=mask, other=0.0, cache_modifier=".cg")
@@ -582,7 +579,6 @@ _quant_fused_add_rmsnorm_kernel_repr = make_kernel_repr(
         "IS_SMOOTH",
         "BLOCK_SIZE",
         "USE_BLOCKED",
-        "NUM_PRGMS",
     ],
 )
 
@@ -617,7 +613,6 @@ def _quant_fused_add_rmsnorm_kernel(
     # Meta-parameters
     BLOCK_SIZE: tl.constexpr,
     USE_BLOCKED: tl.constexpr,
-    NUM_PRGMS: tl.constexpr,
 ):
     """
     Note: this is Triton jited function and not meant to be called directly. Call
@@ -637,11 +632,12 @@ def _quant_fused_add_rmsnorm_kernel(
     """
     # Map the program id to the first row of input and output it should compute.
     row_start = tl.program_id(0)
+    program_stride = tl.num_programs(0)
     col_offsets = tl.arange(0, BLOCK_SIZE)
 
     if USE_BLOCKED:
         # Persistent loop for rows
-        for row_idx in tl.range(row_start, n_rows, NUM_PRGMS, num_stages=1):
+        for row_idx in tl.range(row_start, n_rows, program_stride, num_stages=1):
             row_input_ptr = input_ptr + row_idx * input_row_stride
             row_output_ptr = output_ptr + row_idx * output_row_stride
             row_res_in_ptr = res_in_ptr + row_idx * input_row_stride
@@ -773,7 +769,7 @@ def _quant_fused_add_rmsnorm_kernel(
 
     else:
         mask = col_offsets < n_cols
-        for row_idx in tl.range(row_start, n_rows, NUM_PRGMS, num_stages=2):
+        for row_idx in tl.range(row_start, n_rows, program_stride, num_stages=2):
             input_ptrs = input_ptr + row_idx * input_row_stride + col_offsets
             input_ptrs = tl.multiple_of(input_ptrs, (16,))
             row = tl.load(input_ptrs, mask=mask, other=0.0, cache_modifier=".cg")

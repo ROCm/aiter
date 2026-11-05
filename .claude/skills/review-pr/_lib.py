@@ -33,7 +33,12 @@ REQUIRED = [
     "rules.txt",
     "pr_meta.json",
 ]
-OPTIONAL = ["late_findings.txt"]
+# citations.txt rides here rather than in REQUIRED: it is advisory, and a run whose
+# worker died before writing a card has no citations to check -- absence is not a defect.
+# It must be collected, though: _publish.py reads it out of the report dir to decide what
+# may be anchored inline, and an uncollected verdict reads exactly like "never checked",
+# which anchors nothing.
+OPTIONAL = ["late_findings.txt", "citations.txt"]
 
 
 def read(p):
