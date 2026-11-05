@@ -165,13 +165,12 @@ class BucketProfile(unittest.TestCase):
             pad = self.data["buckets"][order.index(f"verify3_pad4_bf16{sfx}")]
             self.assertNotIn("group_rows", pad["params"])
             self.assertNotEqual(g3["sig"], pad["sig"])
-        # ROUND-R2E: bf16 g3 buckets keep their d438 GPU pass (carried by ISA identity);
-        # the staging / row-rounding buckets are routing-only 'fail' (GPU restamp); the fp8
-        # g3 buckets (slab 32 under the R2E 'auto' decode-group route) await the GPU check
+        # GPU restamp on kernel 58051973: the bf16 and fp8 g3 buckets pass; the staging /
+        # row-rounding buckets are routing-only 'fail' (never selected)
         want_status = {}
         for sfx in ("", "_p8", "_p16"):
             want_status.update({f"verify3_g3_bf16{sfx}": "pass", f"verify3_pad4_bf16{sfx}": "fail",
-                                f"tail_round4_bf16{sfx}": "fail", f"verify3_g3_fp8{sfx}": "pending"})
+                                f"tail_round4_bf16{sfx}": "fail", f"verify3_g3_fp8{sfx}": "pass"})
         for b in self.data["buckets"]:
             PR.validate_bucket(b, self.data["kernel"]["sha256"])
             self.assertEqual(b["golden"]["status"], want_status[b["id"]], b["id"])
@@ -557,34 +556,39 @@ class PrewarmR2(base._Stubs):
         cache = aligned((8, 4, 1, 128), torch.bfloat16)
         work = API.prewarm_plan(self.profile, compressed_k_cache=cache,
                                 pos_dtypes=(torch.int64,), kernel=K)
-        # page-4 bf16 pass variants (draft / decode-group / r16; prefill rules pending) + the
+        # page-4 bf16 pass variants (draft / decode-group / r16 / lean ktile / persist) + the
         # verified kernel-native g3 bucket's own group_rows=3 decode-group specialization
         self.assertEqual(sorted((w[0], dict(w[2]).get("group_rows", 4)) for w in work),
                          [("qsa.page4.decg.v1/bf16/i64", 3), ("qsa.page4.decg.v1/bf16/i64", 4),
                           ("qsa.page4.draft.v1/bf16/i64", 4),
-                          ("qsa.page4.r16.v1/bf16/i64", 4)])
+                          ("qsa.page4.r16.v1/bf16/i64", 4),
+                          ("qsa.page4.r32_kt.v1/bf16/i64", 4),
+                          ("qsa.page4.r32_persist.v1/bf16/i64", 4)])
         got = API.prewarm(self.profile, compressed_k_cache=cache, pos_dtypes=(torch.int64,),
                           device="cpu", cache_dir=self.td)
         self.assertEqual(got, sorted({w[0] for w in work}))   # tags: i64 only, page 4 only
-        self.assertEqual(len(self.runs), 4)                   # one launch per specialization
+        self.assertEqual(len(self.runs), 6)                   # one launch per specialization
         self.assertEqual(sorted((sorted(kw.items()) for _, _, kw in self.kinds)),
-                         sorted([[("pos64", True)]] * 3
+                         sorted([[("pos64", True)]] * 4
                                 + [sorted({"pos64": True, "group_rows": 3, "row_mode": "dedup",
-                                           "wg_waves": 4}.items())]))
-        # a page-16 cache: only page-16 variants (draft / decode / tail pass at page 16)
+                                           "wg_waves": 4}.items())]
+                                + [sorted({"pos64": True, "kt_rows": 32, "col_tiles": 2,
+                                           "lean": True}.items())]))
+        # a page-16 cache: only page-16 variants
         cache16 = aligned((8, 16, 1, 128), torch.bfloat16)
         got16 = API.prewarm(self.profile, compressed_k_cache=cache16, pos_dtypes=(torch.int64,),
                             device="cpu", cache_dir=self.td)
         self.assertEqual(got16, ["qsa.page16.decg.v1/bf16/i64", "qsa.page16.draft.v1/bf16/i64",
-                                 "qsa.page16.r16.v1/bf16/i64"])
-        # fp8 cache: only the fp8 pass variants (fp8 draft pins wg_waves 2 -> pending; the
-        # fp8 g3 bucket is pending)
+                                 "qsa.page16.r16.v1/bf16/i64", "qsa.page16.r32_kt.v1/bf16/i64",
+                                 "qsa.page16.r32_persist.v1/bf16/i64"])
+        # fp8 cache: only the fp8 pass variants
         c8 = aligned((8, 4, 1, 128), torch.float8_e4m3fn)
         got8 = API.prewarm(self.profile, compressed_k_cache=c8,
                            compressed_k_scale=torch.ones(8, 4, 1), pos_dtypes=(torch.int64,),
                            device="cpu", cache_dir=self.td)
-        self.assertEqual(got8, ["qsa.page4.decg.v1/fp8/i64", "qsa.page4.r16_fp8.v1/fp8/i64",
-                                "qsa.page4.r32_fp8.v1/fp8/i64"])
+        self.assertEqual(got8, ["qsa.page4.decg.v1/fp8/i64", "qsa.page4.draft.v1/fp8/i64",
+                                "qsa.page4.r16_fp8.v1/fp8/i64", "qsa.page4.r32_fp8.v1/fp8/i64",
+                                "qsa.page4.r32_kt_fp8.v1/fp8/i64"])
 
     def test_idempotent_and_stats(self):
         first = API.prewarm(self.profile, pos_dtypes=(torch.int64,), device="cpu",
@@ -676,8 +680,11 @@ class PrewarmR2(base._Stubs):
         # one variant per fresh process (cache-key history dependence), longest first
         self.assertEqual(len(bins), len(work))
         self.assertTrue(all(len(b) == 1 for b in bins))
-        self.assertIn("r32_persist", bins[0][0][0])
-        self.assertIn("r32_kt", bins[1][0][0])            # ROUND-R2E lean ktile next
+        kinds = [b[0][0].split("/")[0].split(".")[2] for b in bins]
+        n_persist = kinds.count("r32_persist")
+        self.assertGreaterEqual(n_persist, 1)
+        self.assertEqual(kinds[:n_persist], ["r32_persist"] * n_persist)
+        self.assertEqual(kinds[n_persist], "r32_kt")      # ROUND-R2E lean ktile next
         cost = [API._COMPILE_COST[b[0][0].split("/")[0].split(".")[2]] for b in bins]
         self.assertEqual(cost, sorted(cost, reverse=True))
 
@@ -690,8 +697,8 @@ class PrewarmR2(base._Stubs):
             got = API.prewarm(self.profile, pos_dtypes=(torch.int64,), compile_only=True,
                               cache_dir=self.td)
         work = API.prewarm_plan(self.profile, pos_dtypes=(torch.int64,), kernel=K)
-        # pages 4/8/16 x (draft, decode-group, decode-group g3 bucket, r16)
-        self.assertEqual(len(work), 12)
+        # pages 4/8/16 x (draft, decode-group, decode-group g3 bucket, r16, ktile, persist)
+        self.assertEqual(len(work), 18)
         self.assertEqual(got, sorted({w[0] for w in work}))
         self.assertEqual(self.runs, [])                     # nothing launched
         self.assertEqual(len(seen), len(work))
@@ -723,7 +730,7 @@ class PrewarmR2(base._Stubs):
 P8_RULES = tuple(r + "_p8" for r in ("draft_bf16", "decode_bf16", "tail_bf16", "prefill_bf16_kt",
                                      "prefill_bf16_persist", "prefill_bf16_persist_wide"))
 #: page-8 bf16 rules with a GPU pass (draft / decode / tail); the prefill rules are pending
-P8_PASS = tuple(r + "_p8" for r in ("draft_bf16", "decode_bf16", "tail_bf16"))
+P8_PASS = P8_RULES          # GPU restamp on kernel 58051973: every page-8 rule passes
 
 
 class Page8(_R2Env):
@@ -773,7 +780,7 @@ class Page8(_R2Env):
         self.assertTrue(m.ok and m.row.id == "decode_bf16_p8", m)       # GPU pass committed
         m = PR.match(committed, rows=64, requests=2, columns=1024, table_width=2048,
                      page_size=8, **kw)
-        self.assertEqual(m.reason, PR.Reason.ROW_UNVERIFIED)            # prefill: pending
+        self.assertTrue(m.ok and m.row.id == "prefill_bf16_kt_p8", m)   # prefill: GPU pass
         m = PR.match(committed, rows=64, requests=2, columns=1024, table_width=2048,
                      page_size=8, allow_unverified=True, **kw)
         self.assertTrue(m.ok and m.row.id == "prefill_bf16_kt_p8", m)
@@ -838,7 +845,7 @@ FP8_BF16_SLOT = {"draft_fp8": "draft_bf16", "decode_fp8": "decode_bf16", "tail_f
                  "prefill_fp8_r32_mid": "prefill_bf16_persist",
                  "prefill_fp8_r32_wide": "prefill_bf16_persist_wide"}
 #: fp8 rules with a GPU pass under the R2E router; the others await the GPU check
-FP8_PASS = ("decode_fp8", "tail_fp8", "prefill_fp8_r32_wide")
+FP8_PASS = FP8_RULES          # GPU restamp on kernel 58051973: every fp8 rule passes
 _SFX = {4: "", 8: "_p8", 16: "_p16"}
 
 
@@ -976,7 +983,7 @@ class Fp8Rules(_R2Env):
         for b in self.data["buckets"]:
             if b["cache_dtype"] == "fp8":
                 PR.validate_bucket(b, self.data["kernel"]["sha256"])
-                self.assertEqual(b["golden"]["status"], "pending")
+                self.assertEqual(b["golden"]["status"], "pass")
                 self.assertEqual(b["group"], {"real": 3, "padded": 4, "kernel_group_rows": 3})
                 self.assertEqual(b["vid"], PR.variant_prefix(PR.page_of(b)) + ".decg.v1")
                 # ROUND-R2E: decode_group_route(..., group_rows=3) 'auto' slab = 32 for fp8
@@ -1018,7 +1025,10 @@ class Fp8Rules(_R2Env):
                     self.assertTrue(m2.ok and m2.row.cell == f"rule:{hits[0]}", (page, grp, m2))
                 else:
                     self.assertEqual(m2.reason, PR.Reason.ROW_UNVERIFIED, (page, grp, m2))
-                self.assertIsNone(bm2, (page, grp))           # fp8 g3 bucket pending
+                if grp == "verify3":                          # fp8 g3 bucket: GPU pass
+                    self.assertEqual(bm2.bucket.id, "verify3_g3_fp8" + _SFX[page], (page, grp))
+                else:
+                    self.assertIsNone(bm2, (page, grp))
                 n += 1
         self.assertEqual(n, 3 * len(g.r2_matrix_shapes(4)))
         # once the GPU check passes every fp8 rule, all of them are served (no allow flag)
@@ -1093,10 +1103,10 @@ class Fp8Rules(_R2Env):
             self.assertEqual(p.exes[1][0].build_args,
                              ((True, float(API._DEFAULT_DIVISOR), 32),
                               dict(group_rows=3, row_mode="dedup", wg_waves=4, pos64=True)))
-        # the committed profile: fp8 g3 bucket pending -> never selected
+        # the committed profile: fp8 g3 bucket GPU pass -> selected
         args = _fp8_verify3_args(8)
         d = API.decide(*args, profile=self.profile)
-        self.assertTrue(d.ok and not str(d.cell).startswith("bucket:"), d)
+        self.assertTrue(d.ok and str(d.cell).startswith("bucket:verify3_g3_fp8>"), d)
 
 
 _POW2 = {"pow2": {"min": 64, "max": 65536}}

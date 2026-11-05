@@ -186,27 +186,32 @@ class ProfileDefaults(unittest.TestCase):
             self.assertNotIn("ipf", e["params"])
 
     def test_evidence_state(self):
-        """pass = unchanged variants (GPU evidence carried by ISA identity); pending = every
-        re-routed / re-pinned entry (GPU gen_profile check)."""
+        """GPU gen_profile check on kernel 58051973 (a08-1): every row, rule and g3 bucket is
+        ``pass`` with evidence on the profiled kernel itself; the staging / row-rounding
+        buckets are routing-only ``fail`` (never selected)."""
         st = {k: v["golden"]["status"] for k, v in {**self.rules, **self.buckets}.items()}
         for sfx in SFX.values():
             for rid in ("prefill_bf16_kt", "prefill_bf16_persist", "prefill_bf16_persist_wide",
                         "draft_fp8", "prefill_fp8_kt", "prefill_fp8_kt_tall",
-                        "prefill_fp8_r32_mid", "verify3_g3_fp8"):
-                self.assertEqual(st[rid + sfx], "pending", rid + sfx)
-            for rid in ("draft_bf16", "decode_bf16", "tail_bf16", "decode_fp8", "tail_fp8",
-                        "prefill_fp8_r32_wide", "verify3_g3_bf16"):
+                        "prefill_fp8_r32_mid", "verify3_g3_fp8", "draft_bf16", "decode_bf16",
+                        "tail_bf16", "decode_fp8", "tail_fp8", "prefill_fp8_r32_wide",
+                        "verify3_g3_bf16"):
                 self.assertEqual(st[rid + sfx], "pass", rid + sfx)
             for rid in ("verify3_pad4_bf16", "tail_round4_bf16"):   # routing-only GPU 'fail'
                 self.assertEqual(st[rid + sfx], "fail", rid + sfx)
+        self.assertEqual({v for k, v in st.items() if not k.startswith(("verify3_pad4",
+                                                                        "tail_round4"))},
+                         {"pass"})
         ksha = self.data["kernel"]["sha256"]
         for e in self.data["rules"] + self.data["buckets"] + self.data["rows"]:
             g = e["golden"]
             if g["status"] == "pass" and g["kernel_sha256"] != ksha:
-                self.assertIn("ROUND-R2E no-device gate", g["isa_identity"], e.get("id") or e["cell"])
+                # evidence carried from an older kernel needs a recorded ISA-identity proof
+                self.assertTrue(g.get("isa_identity"), e.get("id") or e["cell"])
         for r in self.data["rows"]:
+            self.assertEqual(r["golden"]["status"], "pass", r["cell"])
             if r["cache_dtype"] == "fp8" and r["regime"] == "draft":
-                self.assertEqual((r["params"].get("wg_waves"), r["golden"]["status"]), (2, "pending"))
+                self.assertEqual(r["params"].get("wg_waves"), 2)
 
 
 class BucketsDefaultOn(unittest.TestCase):
