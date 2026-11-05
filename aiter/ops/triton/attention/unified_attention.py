@@ -175,6 +175,25 @@ def _gfx950_split_params(params: _UAParams):
     return params._replace(num_2d_prgms=num_q_blocks * params.num_kv_heads)
 
 
+def _gfx950_tile_size(params: _UAParams, tile: int):
+    """Widen the KV tile for shuffled full attention once the batch fills the GPU.
+
+    The shuffled loader gathers per token, so it pays more per tile than the
+    dense one; a 128-key tile halves that once there are enough programs to
+    hide the longer chain. Below 128 query tokens, and for sliding windows,
+    the 64-key tile is faster. Measured for bf16 only.
+    """
+    if (
+        params.shuffled_kv_cache
+        and params.sliding_window == 0
+        and params.q_dtype == torch.bfloat16
+        and params.max_seqlen_q * params.num_queries_per_kv <= 128
+        and params.num_tokens >= 128
+    ):
+        return max(tile, 128)
+    return tile
+
+
 def _gfx950_split_grid(params: _UAParams):
     """Decode, and batches too small to fill the GPU, take the split grid."""
     if params.all_decode:
@@ -433,6 +452,8 @@ def unified_attention(
         # and keeps its tuned tile.
         if shuffled_kv_cache and not use_gluon_3d:
             TILE_SIZE = block_size
+        elif use_gluon_3d and DEVICE_ARCH == "gfx950":
+            TILE_SIZE = _gfx950_tile_size(params, config["TILE_SIZE"])
         else:
             TILE_SIZE = CONFIG_TILE_SIZE
 
@@ -1187,7 +1208,7 @@ def _unified_attention_2d_gfx950(params: _UAParams):
         params,
         config,
         BLOCK_M=BLOCK_M,
-        TILE_SIZE=config["TILE_SIZE"],
+        TILE_SIZE=_gfx950_tile_size(params, config["TILE_SIZE"]),
         num_warps=config["num_warps"],
     )
 
