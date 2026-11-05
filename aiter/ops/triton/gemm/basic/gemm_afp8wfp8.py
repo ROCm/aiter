@@ -20,26 +20,30 @@ from aiter.ops.triton._triton_kernels.gemm.basic.gemm_afp8wfp8 import (
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.gemm_config_utils import clamp_num_buffers
 from aiter.ops.triton.utils.logger import AiterTritonLogger
-from aiter.utility.graph_alloc import ROUTES_INSIDE_CAPTURE, persistent_alloc
+from aiter.utility.graph_alloc import (
+    ROUTES_INSIDE_CAPTURE,
+    capture_scoped_cache,
+    persistent_alloc,
+)
 
 # One arrival counter per output tile of a fused split-K launch.
 _SPLIT_COUNTERS = 1 << 16
-_split_counters_by_stream: dict[tuple[torch.device, int], torch.Tensor] = {}
+
+
+@capture_scoped_cache
+def _split_counters_keyed(device: torch.device, stream_id: int) -> torch.Tensor:
+    with persistent_alloc(device):
+        return torch.zeros(_SPLIT_COUNTERS, dtype=torch.int32, device=device)
 
 
 def _split_counters(device: torch.device) -> torch.Tensor | None:
     """Zeroed arrival counters per (device, stream), as for the a16w16 split-K
     semaphores; kernels re-zero what they use. None when a stream's first use
     falls inside a capture that cannot allocate outside the graph pool."""
-    key = (device, torch.cuda.current_stream(device).cuda_stream)
-    counters = _split_counters_by_stream.get(key)
-    if counters is None:
-        if not ROUTES_INSIDE_CAPTURE and torch.cuda.is_current_stream_capturing():
-            return None
-        with persistent_alloc(device):
-            counters = torch.zeros(_SPLIT_COUNTERS, dtype=torch.int32, device=device)
-        _split_counters_by_stream[key] = counters
-    return counters
+    stream_id = torch.cuda.current_stream(device).cuda_stream
+    if not ROUTES_INSIDE_CAPTURE and torch.cuda.is_current_stream_capturing():
+        return _split_counters_keyed.eager_cached(device, stream_id)
+    return _split_counters_keyed(device, stream_id)
 
 
 def _split_k_partition(k: int, splits: int, step: int) -> tuple[int, int]:
