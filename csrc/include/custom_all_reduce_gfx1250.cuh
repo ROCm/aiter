@@ -26,6 +26,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <string>
 #include <unordered_map>
@@ -206,7 +207,7 @@ constexpr size_t arRmsShardOffset(int ngpus)
 
 // gfx1250 128-bit global load/store at *system* scope ("" == system). A single
 // 16B transaction keeps a line's data and flags atomic w.r.t. a peer reader.
-#if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx1250__) &&                   \
+#if defined(__HIP_DEVICE_COMPILE__) && (defined(__gfx1250__) || defined(__gfx1250_strict__)) &&                   \
     __has_builtin(__builtin_amdgcn_global_store_b128) &&                         \
     __has_builtin(__builtin_amdgcn_global_load_b128)
 #define AITER_GFX1250_HAVE_B128 1
@@ -712,6 +713,101 @@ __global__ void __launch_bounds__(1024, 1) ar_rmsnorm_gfx1250(
     }
     if constexpr(!TWO_STAGE)
         end_sync<ngpus, true>(sg, self_sg, rank);
+}
+
+// LL all-gather: ar_ll_gfx1250's publish, then every peer's lines polled from
+// this rank's scratch together and written to their place in the output. Rank
+// r's packet pk of row y = pk / row_pk lands at output packet
+// (y * ngpus + r) * row_pk + pk % row_pk: row_pk = nPk gathers along dim 0,
+// the last dim's packets along the last dim. Shares ar_ll_gfx1250's epoch and
+// banks, so the two interleave freely. ALIGNED: input and output 8-byte
+// aligned; otherwise their packets move byte by byte (same protocol).
+template <typename T, int ngpus, bool ALIGNED>
+__global__ void __launch_bounds__(512, 1) ag_ll_gfx1250(
+    T* const* __restrict__ peer_scratch,
+    T* __restrict__ result,
+    const T* __restrict__ sendbuff,
+    uint32_t nPk,    // 8-byte packets a rank sends
+    uint32_t row_pk, // 8-byte packets of a gathered row
+    int rank,
+    uint32_t* __restrict__ block_flags)
+{
+    constexpr size_t slot = kLLPackCapacity;
+
+    __shared__ uint32_t s_flag;
+    if(threadIdx.x == 0)
+    {
+        uint32_t f = block_flags[blockIdx.x] + 1u;
+        if(f == 0u)
+            f = 2u;
+        s_flag = f;
+    }
+    __syncthreads();
+    const uint32_t flag        = s_flag;
+    const size_t   bankOffPkts = (size_t)(flag & 1u) * (size_t)ngpus * slot;
+
+    const uint32_t gtid   = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t stride = gridDim.x * blockDim.x;
+    const auto out_at     = [&](int r, uint32_t pk) {
+        const uint32_t y = pk / row_pk;
+        return ((size_t)y * ngpus + r) * row_pk + (pk - y * row_pk);
+    };
+    const auto load = [&](uint32_t pk) {
+        uint2 d;
+        if constexpr(ALIGNED)
+            d = reinterpret_cast<const uint2*>(sendbuff)[pk];
+        else
+            __builtin_memcpy(&d, reinterpret_cast<const uint8_t*>(sendbuff) + (size_t)pk * 8, 8);
+        return d;
+    };
+    const auto store = [&](size_t at, uint2 d) {
+        if constexpr(ALIGNED)
+            reinterpret_cast<uint2*>(result)[at] = d;
+        else
+            __builtin_memcpy(reinterpret_cast<uint8_t*>(result) + at * 8, &d, 8);
+    };
+
+    for(uint32_t pk = gtid; pk < nPk; pk += stride)
+    {
+        const uint2 d = load(pk);
+#pragma unroll
+        for(int r = 1; r < ngpus; ++r)
+        {
+            int          peer = (rank + r) % ngpus;
+            LLPackedMsg* dst  = reinterpret_cast<LLPackedMsg*>(peer_scratch[peer]) +
+                               bankOffPkts + (size_t)rank * slot;
+            ll_store_b128(reinterpret_cast<uint32_t*>(&dst[pk]), d.x, flag, d.y, flag);
+        }
+        store(out_at(rank, pk), d);
+    }
+
+    LLPackedMsg* myBase =
+        reinterpret_cast<LLPackedMsg*>(peer_scratch[rank]) + bankOffPkts;
+    for(uint32_t pk = gtid; pk < nPk; pk += stride)
+    {
+        uint32_t pending = ((1u << ngpus) - 1u) & ~(1u << rank);
+        while(pending)
+        {
+            uint32_t line[ngpus][4];
+#pragma unroll
+            for(int r = 0; r < ngpus; ++r)
+                if(pending & (1u << r))
+                    ll_load_b128(
+                        reinterpret_cast<const uint32_t*>(&myBase[(size_t)r * slot + pk]),
+                        line[r][0], line[r][1], line[r][2], line[r][3]);
+#pragma unroll
+            for(int r = 0; r < ngpus; ++r)
+                if((pending & (1u << r)) && line[r][1] == flag && line[r][3] == flag)
+                {
+                    store(out_at(r, pk), make_uint2(line[r][0], line[r][2]));
+                    pending &= ~(1u << r);
+                }
+        }
+    }
+
+    for(int e = blockIdx.x + threadIdx.x * gridDim.x; e < kMaxBlocks;
+        e += gridDim.x * blockDim.x)
+        block_flags[e] = flag;
 }
 
 // ---------------------------------------------------------------------------
@@ -1345,6 +1441,51 @@ public:
 #undef LAUNCH_LL
     }
 
+    // Whether an all-gather of `bytes` a rank takes ag_ll_gfx1250: whole 8-byte
+    // packets, a row's too along the last dim. The shape alone decides, so
+    // every rank of the collective takes the same protocol.
+    bool use_ll_ag(size_t bytes, size_t row_bytes) const
+    {
+        return use_ll(bytes) && bytes % 8 == 0 && row_bytes % 8 == 0;
+    }
+
+    // Whether ag_ll_gfx1250 may read this rank's input in place: clear of the
+    // output it writes while still publishing the input, or a dim-0 gather into
+    // the output's own slice (that slice is rewritten with the same bytes).
+    bool ll_ag_reads_in_place(const void* input, const void* output, size_t bytes, size_t row_bytes) const
+    {
+        const auto in  = reinterpret_cast<uintptr_t>(input);
+        const auto out = reinterpret_cast<uintptr_t>(output);
+        return out >= in + bytes || in >= out + bytes * world_size_ ||
+               (row_bytes == bytes && in == out + bytes * rank_);
+    }
+
+    // LL all-gather (see ag_ll_gfx1250); row_bytes == bytes gathers along dim 0.
+    template <typename T>
+    void allgather_ll(hipStream_t stream, const T* input, T* output, size_t bytes, size_t row_bytes)
+    {
+        ensure_ll_tables_();
+        const uint32_t nPk = bytes >> 3;
+        const int threads  = (bytes < 65536) ? 512 : 256;
+        int blocks = std::max(1, std::min<int>(kMaxBlocks, (int)((nPk + threads - 1) / threads)));
+
+        T* const* peers = reinterpret_cast<T* const*>(d_ll_peers_);
+        // a rank-local choice of kernel, not of protocol: both move the same packets
+        const bool aligned = (reinterpret_cast<uintptr_t>(input) & 7) == 0 &&
+                             (reinterpret_cast<uintptr_t>(output) & 7) == 0;
+#define LAUNCH_AG_LL(NG)                                                              \
+        if(aligned)                                                                   \
+            ag_ll_gfx1250<T, NG, true><<<blocks, threads, 0, stream>>>(               \
+                peers, output, input, nPk, (uint32_t)(row_bytes >> 3), rank_,         \
+                d_ll_block_flags_);                                                   \
+        else                                                                          \
+            ag_ll_gfx1250<T, NG, false><<<blocks, threads, 0, stream>>>(              \
+                peers, output, input, nPk, (uint32_t)(row_bytes >> 3), rank_,         \
+                d_ll_block_flags_)
+        DISPATCH_NGPUS_1250(world_size_, LAUNCH_AG_LL);
+#undef LAUNCH_AG_LL
+    }
+
     // gfx1250: return raw device pointers (no hipIpc handles).
     std::vector<int64_t> get_graph_buffer_ptrs()
     {
@@ -1537,12 +1678,46 @@ public:
         register_graph_buffers(ptrs_per_rank.data());
     }
 
+    // The allgather kernels index the output with int. allgather_scalar does it
+    // per element; vec, naive and lastdim do it per 16-byte pack. Each launcher
+    // takes the element count as int64_t and checks its own index range before
+    // narrowing, so the vectorized kernels take any output of up to INT_MAX
+    // packs (16 * INT_MAX bytes, about 32 GiB) whatever the dtype.
+    // _resolve_custom_sizes in custom_all_reduce.py caps
+    // AITER_CUSTOM_AG_MAX_SIZE at the same bound; keep the two in sync.
+    template <typename T>
+    int allgather_packs(int64_t numel, const char* who) const
+    {
+        constexpr int64_t d = 16 / sizeof(T);
+        if(numel % d != 0)
+            throw std::runtime_error(std::string(who) +
+                                     " requires input length to be multiple of " +
+                                     std::to_string(d));
+        const int64_t packs = numel / d;
+        if(packs * world_size_ > std::numeric_limits<int>::max())
+            throw std::runtime_error(
+                std::string(who) + ": output of " + std::to_string(packs * world_size_) +
+                " 16-byte packs (numel " + std::to_string(numel) + " x world_size " +
+                std::to_string(world_size_) + ") exceeds the int32 index range; "
+                "route this size through should_custom_ag / RCCL instead");
+        return static_cast<int>(packs);
+    }
+
     template <typename T>
     void allgather_scalar(hipStream_t stream,
                           T* input,
                           T* output,
-                          int size)
+                          int64_t numel)
     {
+        // Indexes the output per element, not per pack.
+        if(numel * world_size_ > std::numeric_limits<int>::max())
+            throw std::runtime_error(
+                "gfx1250 allgather_scalar: output element count " +
+                std::to_string(numel * world_size_) + " (numel " + std::to_string(numel) +
+                " x world_size " + std::to_string(world_size_) +
+                ") exceeds the int32 index range; route this size through "
+                "should_custom_ag / RCCL instead");
+        const int size       = static_cast<int>(numel);
         RankData* input_ptrs = get_buffer_RD(stream, input);
 
         constexpr int threads = 512;
@@ -1559,15 +1734,10 @@ public:
     void allgather_vec(hipStream_t stream,
                        T* input,
                        T* output,
-                       int size)
+                       int64_t numel)
     {
-        auto d = 16 / sizeof(T);
-        if(size % d != 0)
-            throw std::runtime_error(
-                "allgather_vec requires input length to be multiple of " + std::to_string(d));
-
+        const int size       = allgather_packs<T>(numel, "allgather_vec");
         RankData* input_ptrs = get_buffer_RD(stream, input);
-        size /= d;
 
         constexpr int threads = 256;
         int blocks = std::min(kMaxBlocks,
@@ -1583,15 +1753,10 @@ public:
     void allgather_naive(hipStream_t stream,
                          T* input,
                          T* output,
-                         int size)
+                         int64_t numel)
     {
-        auto d = 16 / sizeof(T);
-        if(size % d != 0)
-            throw std::runtime_error(
-                "allgather requires input length to be multiple of " + std::to_string(d));
-
+        const int size       = allgather_packs<T>(numel, "allgather");
         RankData* input_ptrs = get_buffer_RD(stream, input);
-        size /= d;
 
         constexpr int threads = 256;
         int blocks = std::min(kMaxBlocks,
@@ -1607,17 +1772,22 @@ public:
     void allgather_lastdim(hipStream_t stream,
                            T* input,
                            T* output,
-                           int size,
-                           int last_dim_size)
+                           int64_t numel,
+                           int64_t last_dim_size)
     {
         auto d = 16 / sizeof(T);
-        if(size % d != 0 || last_dim_size % d != 0)
+        if(last_dim_size % d != 0)
             throw std::runtime_error(
                 "allgather_lastdim requires input length and last_dim_size "
                 "to be multiples of " + std::to_string(d));
-
+        // The kernel takes the row length in elements and divides it by the
+        // pack size itself.
+        if(last_dim_size > std::numeric_limits<int>::max())
+            throw std::runtime_error("allgather_lastdim: last_dim_size " +
+                                     std::to_string(last_dim_size) +
+                                     " exceeds the int32 range");
+        const int size       = allgather_packs<T>(numel, "allgather_lastdim");
         RankData* input_ptrs = get_buffer_RD(stream, input);
-        size /= d;
 
         constexpr int threads = 512;
         constexpr int unroll  = 4;
@@ -1625,7 +1795,7 @@ public:
                               (size + threads * unroll - 1) / (threads * unroll));
 #define LAUNCH_AG_LAST(NG) \
         ag_gfx1250_lastdim<T, NG><<<blocks, threads, 0, stream>>>( \
-            input_ptrs, sg_, self_sg_, output, rank_, size, last_dim_size)
+            input_ptrs, sg_, self_sg_, output, rank_, size, static_cast<int>(last_dim_size))
         DISPATCH_AG_NGPUS_1250(world_size_, LAUNCH_AG_LAST);
 #undef LAUNCH_AG_LAST
     }

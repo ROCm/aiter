@@ -35,6 +35,7 @@ _LAZY_IMPORTS = {
         ".fp8_mqa_logits_kernels",
         "KERNEL_VARIANTS",
     ),
+    "OneShotAllReduce": (".one_shot_allreduce", "OneShotAllReduce"),
     "DenseGemmConfig": (".gemm_a16wfp4", "DenseGemmConfig"),
     "QuickAllReduceInt4": (".quick_allreduce_int4", "QuickAllReduceInt4"),
     "PreshuffledA16WFP4Weight": (
@@ -59,6 +60,7 @@ _LAZY_IMPORTS = {
         "flydsl_flash_attn_fp8_supported",
     ),
     "flydsl_flash_attn_func": (".fmha_kernels", "flydsl_flash_attn_func"),
+    "flydsl_fp8_quant": (".fp8_quant", "flydsl_fp8_quant"),
     "flydsl_fp8_mqa_logits": (
         ".fp8_mqa_logits_kernels",
         "flydsl_fp8_mqa_logits",
@@ -196,6 +198,7 @@ __all__ = [
     "DenseGemmConfig",
     "Fp4MqaPlan",
     "GateMode",
+    "OneShotAllReduce",
     "PreshuffledA16WFP4Weight",
     "QuickAllReduceInt4",
     "a16wfp4_shape_supported",
@@ -208,6 +211,7 @@ __all__ = [
     "flydsl_fp8_paged_mqa_logits",
     "flydsl_fp8_paged_mqa_logits_gfx950",
     "flydsl_fp8_paged_mqa_logits_gfx1250",
+    "flydsl_fp8_quant",
     "flydsl_gemm_a16wfp4",
     "flydsl_hgemm",
     "flydsl_hstu_attention",
