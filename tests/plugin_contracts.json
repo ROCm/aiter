@@ -6,10 +6,10 @@
     "version": 1
   },
   "rmsnorm": {
-    "fingerprint": "3190ea5beaa66c31",
-    "signature": "out:positional:Tensor, input:positional:Tensor, weight:positional:Tensor, epsilon:positional:float, gemma_norm:positional:bool=False, -> None",
+    "fingerprint": "86344aea2f2c16a8",
+    "signature": "input:positional, weight:positional, epsilon:positional, use_model_sensitive_rmsnorm:positional, -> Tensor",
     "source": "aiter/ops/rmsnorm.py",
-    "version": 1
+    "version": 2
   },
   "rmsnorm_with_add": {
     "fingerprint": "626b013bc0e5008f",
