@@ -3458,13 +3458,31 @@ def build_gemm_a8w4_tdm_task(
                 tdm_ops.tensor_wait(0)
             else:
 
-                def store_tile(gt, tile, lds_ptr, lds_row):
+                def store_tile(
+                    gt, tile, lds_ptr, lds_row, outer_bound, inner_bound, global_stride
+                ):
                     # A k_waves workgroup's tile belongs to group 0 alone.
                     if const_expr(k_waves > 1):
                         if k_group == 0:
-                            tiled_store(gt, tile, lds_ptr, lds_row)
+                            tiled_store(
+                                gt,
+                                tile,
+                                lds_ptr,
+                                lds_row,
+                                outer_bound,
+                                inner_bound,
+                                global_stride,
+                            )
                     else:
-                        tiled_store(gt, tile, lds_ptr, lds_row)
+                        tiled_store(
+                            gt,
+                            tile,
+                            lds_ptr,
+                            lds_row,
+                            outer_bound,
+                            inner_bound,
+                            global_stride,
+                        )
 
                 if const_expr(stage1_act):
                     out_divisor = 4 if is_fp4_quant else 2
