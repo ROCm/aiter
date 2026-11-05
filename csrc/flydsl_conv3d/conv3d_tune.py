@@ -18,6 +18,7 @@ pays a pre-transpose on top that no tile choice affects.
 """
 
 import functools
+import itertools
 import os
 import time
 from typing import Any, ClassVar
@@ -44,6 +45,7 @@ from aiter.ops.flydsl.conv3d_policy import (
 from aiter.ops.flydsl.conv3d_policy_gfx1250 import (
     get_flydsl_conv3d_configs_gfx1250,
     is_legal_tile_gfx1250,
+    lds_bytes_patch,
     lds_bytes_tap,
     tile_kernel_name_gfx1250,
 )
@@ -67,6 +69,7 @@ from aiter.ops.flydsl.kernels.conv.conv3d_gfx950_utils import (
     out_extent,
 )
 from aiter.ops.flydsl.kernels.conv.conv3d_gfx1250_utils import (
+    patch_unsupported_gfx1250,
     tile_k_unsupported_gfx1250,
 )
 from aiter.ops.flydsl.kernels.conv.conv3d_im2col import (
@@ -103,6 +106,20 @@ RUN_CONFIG_REPS = 3
 DEFAULT_PIPELINES = ((2, False),)
 # gfx1250 K tile widths every tile is timed with by default.
 DEFAULT_TILE_KS = (32,)
+# gfx1250 kH x kW patch reuse settings every tile is timed with by default.
+DEFAULT_PATCHES = (False,)
+
+
+def _parse_patches(text):
+    out = []
+    for item in filter(None, (s.strip() for s in str(text).split(","))):
+        if item not in ("0", "1"):
+            raise ValueError(f"--patches takes 0 and/or 1, got {item!r}")
+        if (item == "1") not in out:
+            out.append(item == "1")
+    if not out:
+        raise ValueError("--patches needs at least one of 0, 1")
+    return tuple(out)
 
 
 def _parse_tile_ks(text):
@@ -226,6 +243,7 @@ def run_flydsl_conv3d_gfx1250(
     num_buffers=2,
     main_loop_unroll=False,
     tile_k=32,
+    patch=False,
 ):
     # Pin the final legal split-K recorded in the candidate metadata and CSV.
     del wgm
@@ -248,6 +266,7 @@ def run_flydsl_conv3d_gfx1250(
         num_buffers=num_buffers,
         main_loop_unroll=main_loop_unroll,
         tile_k=tile_k,
+        patch_reuse=patch,
     )
 
 
@@ -375,6 +394,15 @@ class Conv3dTuner(TunerCommon):
             "multiples of 32) every tile and pipeline is timed with; a width "
             "that does not divide a shape's padded channels is skipped there. "
             "Default 32.",
+        )
+        self.parser.add_argument(
+            "--patches",
+            type=_parse_patches,
+            default=DEFAULT_PATCHES,
+            help="gfx1250: 0, 1 or 0,1 -- time every tile without and/or with "
+            "kH x kW patch reuse (one TDM input patch per (kT, channel) group "
+            "shared by all kH * kW taps); 1 is skipped where the shape cannot "
+            "take it (kH * kW == 1, H/W stride > 1, split-K). Default 0.",
         )
         self.parser.add_argument(
             "--tiles_from",
@@ -539,11 +567,12 @@ class Conv3dTuner(TunerCommon):
         pipelines=DEFAULT_PIPELINES,
         tiles=None,
         tile_ks=DEFAULT_TILE_KS,
+        patches=DEFAULT_PATCHES,
     ):
         """Candidate tasks for one shape.
 
-        gfx1250 times every tile with each ``pipelines`` pair and each
-        ``tile_ks`` width that fits the shape; ``tiles``, as
+        gfx1250 times every tile with each ``pipelines`` pair, each ``tile_ks``
+        width and each ``patches`` setting that fits the shape; ``tiles``, as
         ``(tile_m, tile_n, wave_m, wave_n, block_rows)``, replaces the policy's
         tile candidates (see ``--tiles_from``).
         """
@@ -690,22 +719,54 @@ class Conv3dTuner(TunerCommon):
                 output_keys = ("out",)
                 # The runtime clamps num_buffers to LDS and the K-tile count;
                 # time and record the value that runs, once.
+                sh, sw = params["stride"][1:]
+                dh, dw = params["dilation"][1:]
                 variants = []
-                for tk in tile_ks:
+                for tk, (nb0, unroll), patch in itertools.product(
+                    tile_ks, pipelines, patches
+                ):
                     if tile_k_unsupported_gfx1250(tk, cgp, sk) is not None:
                         continue
                     tiles_per_split = (crs // tk) // max(1, sk)
-                    for nb, unroll in pipelines:
-                        nb = _clamp_num_buffers(
-                            nb, tiles_per_split, tile, block_rows, tile_k=tk
-                        )
-                        # The clamp stops at 2 buffers; a wide K tile can
-                        # still overflow LDS there.
-                        lds = lds_bytes_tap(tile_m, tile_n, num_buffers=nb, tile_k=tk)
-                        if lds > get_lds_capacity_bytes():
+                    if patch:
+                        nb0 = min(nb0, kh * kw)
+                        if patch_unsupported_gfx1250(kh, kw, sh, sw, sk, nb0):
                             continue
-                        if (nb, unroll, tk) not in variants:
-                            variants.append((nb, unroll, tk))
+                        unroll = False  # the patch loop unrolls the taps
+                    if patch and nb0 == 2 and tk > CGP_ALIGN:
+                        # Two buffers with a wide K tile spill VGPRs on most
+                        # patch tiles (39 of 60 at tile_k=96 on the Wan2.1
+                        # layers), and a kernel with scratch faults on gfx1250.
+                        continue
+                    nb = _clamp_num_buffers(
+                        nb0,
+                        tiles_per_split,
+                        tile,
+                        block_rows,
+                        tile_k=tk,
+                        patch=(kh, kw, dh, dw) if patch else None,
+                    )
+                    # The clamp stops at 2 buffers; a wide K tile can still
+                    # overflow LDS there.
+                    if patch:
+                        lds = lds_bytes_patch(
+                            tile_m,
+                            tile_n,
+                            block_rows,
+                            kh,
+                            kw,
+                            dh,
+                            dw,
+                            num_buffers=nb,
+                            num_warps=wave_m * wave_n,
+                            tile_k=tk,
+                        )
+                    else:
+                        lds = lds_bytes_tap(tile_m, tile_n, num_buffers=nb, tile_k=tk)
+                    if lds > get_lds_capacity_bytes():
+                        continue
+                    if (nb, unroll, tk, patch) not in variants:
+                        variants.append((nb, unroll, tk, patch))
             else:
                 base_name = tile_kernel_name(tile_m, tile_n, wave_m, wave_n, wgm) + (
                     f"_r{block_rows}" if block_rows > 1 else ""
@@ -713,16 +774,18 @@ class Conv3dTuner(TunerCommon):
                 gen, gen_args = generate_data, shape_args
                 fn, fn_keys = run_flydsl_conv3d, ["x", "weight", "bias"]
                 output_keys = None
-                variants = [(None, None, None)]
-            for nb, unroll, tk in variants:
+                variants = [(None, None, None, None)]
+            for nb, unroll, tk, patch in variants:
                 kname = base_name
                 fn_args = (fn_keys, params, tile, wgm, sk, block_rows)
                 if is_1250:
-                    fn_args = (*fn_args, nb, unroll, tk)
+                    fn_args = (*fn_args, nb, unroll, tk, patch)
                     if (nb, unroll) != (2, False):
                         kname += f"_b{nb}" + ("_u" if unroll else "")
                     if tk != CGP_ALIGN:
                         kname += f"_k{tk}"
+                    if patch:
+                        kname += "_p"
                 info = (
                     keys,
                     tile_m,
@@ -735,6 +798,7 @@ class Conv3dTuner(TunerCommon):
                     nb,
                     unroll,
                     tk,
+                    patch,
                     kname,
                 )
                 tasks.append(
@@ -776,7 +840,13 @@ class Conv3dTuner(TunerCommon):
                         "sweeping the policy's candidates instead"
                     )
             shape_tasks = self._shape_tasks(
-                keys, args.max_configs, run_kwargs, args.pipelines, tiles, args.tile_ks
+                keys,
+                args.max_configs,
+                run_kwargs,
+                args.pipelines,
+                tiles,
+                args.tile_ks,
+                args.patches,
             )
             if not shape_tasks:
                 logger.warning(f"no legal candidate for {keys}")
@@ -861,6 +931,7 @@ class Conv3dTuner(TunerCommon):
                 num_buffers,
                 main_loop_unroll,
                 tile_k,
+                patch,
                 kernel_name,
             ) = info
             tflops, bw = self.calculate(el)
@@ -879,6 +950,7 @@ class Conv3dTuner(TunerCommon):
                         None if main_loop_unroll is None else int(main_loop_unroll)
                     ),
                     "tile_k": tile_k,
+                    "patch": None if patch is None else int(patch),
                     "splitK": splitk,
                     "us": time,
                     "kernelName": kernel_name,
@@ -893,6 +965,7 @@ class Conv3dTuner(TunerCommon):
                     f"is tile=({tile_m},{tile_n},{wave_m},{wave_n}) wgm={wgm} "
                     f"block_rows={block_rows} num_buffers={num_buffers} "
                     f"main_loop_unroll={main_loop_unroll} tile_k={tile_k} "
+                    f"patch={patch} "
                     f"splitK={splitk}, {time}us, "
                     f"{err_ratio=}, {tflops=} TFLOPS, {bw=} GB/s"
                 )

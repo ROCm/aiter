@@ -1174,19 +1174,24 @@ def _splitk_checks(dtype, xshape, wshape, padding, has_tail):
     return checks
 
 
-# --- gfx1250 K-loop pipeline and K tile --------------------------------------
-# Tuned gfx1250 rows set num_buffers / main_loop_unroll / tile_k, which the public
-# entry does not take, so these call the gfx1250 host directly. pipe_k96_b3_u_n3
-# is the small-tile tile_k=96 config that exposed the K-loop LDS read/refill race.
+# --- gfx1250 K-loop pipeline, K tile and kH x kW patch reuse -----------------
+# Tuned gfx1250 rows set num_buffers / main_loop_unroll / tile_k / patch, which
+# the public entry does not take, so these call the gfx1250 host directly.
+# pipe_k96_b3_u_n3 is the small-tile tile_k=96 config that exposed the K-loop
+# LDS read/refill race; the patch cases cover several (kt, cc) groups each.
 _PIPELINE_CASES = (
-    # case, x (NCDHW), weight, tile, block_rows, num_buffers, unroll, tile_k
-    ("pipe_k96_b3", (1, 96, 6, 18, 34), (96, 96, 3, 3, 3), (256, 96, 4, 1), 8, 3, False, 96),
-    ("pipe_k96_b3_u_n3", (1, 96, 6, 18, 34), (3, 96, 3, 3, 3), (32, 32, 2, 1), 2, 3, True, 96),
-    ("pipe_k64_b4_u", (1, 192, 6, 18, 34), (192, 192, 3, 3, 3), (96, 192, 2, 2), 2, 4, True, 64),
+    # case, x (NCDHW), weight, tile, block_rows, num_buffers, unroll, tile_k, patch
+    ("pipe_k96_b3", (1, 96, 6, 18, 34), (96, 96, 3, 3, 3), (256, 96, 4, 1), 8, 3, False, 96, False),
+    ("pipe_k96_b3_u_n3", (1, 96, 6, 18, 34), (3, 96, 3, 3, 3), (32, 32, 2, 1), 2, 3, True, 96, False),
+    ("pipe_k64_b4_u", (1, 192, 6, 18, 34), (192, 192, 3, 3, 3), (96, 192, 2, 2), 2, 4, True, 64, False),
+    ("patch_k96_b3", (1, 96, 6, 18, 34), (96, 96, 3, 3, 3), (256, 96, 4, 1), 8, 3, False, 96, True),
+    ("patch_k32_b4_2d", (1, 192, 1, 34, 66), (96, 192, 1, 3, 3), (256, 96, 4, 2), 16, 4, False, 32, True),
 )  # fmt: skip
 
 
-def _pipeline_case(dtype, case, xshape, wshape, tile, block_rows, nb, unroll, tile_k):
+def _pipeline_case(
+    dtype, case, xshape, wshape, tile, block_rows, nb, unroll, tile_k, use_patch
+):
     """Every checked call correct, and the compiled param is the one requested."""
     from aiter.ops.flydsl import conv3d_gfx1250
 
@@ -1208,17 +1213,25 @@ def _pipeline_case(dtype, case, xshape, wshape, tile, block_rows, nb, unroll, ti
             num_buffers=nb,
             main_loop_unroll=unroll,
             tile_k=tile_k,
+            patch_reuse=use_patch,
         )
 
     with patch.object(conv3d_gfx1250, "compile_conv3d_implicit_gfx1250", record):
         ret = correctness_runner(
             run, lambda out: _check_output(ref, out, case), torch.cuda.synchronize
         )
-    want = (tuple(tile), block_rows, nb, unroll, tile_k)
+    want = (tuple(tile), block_rows, nb, unroll, tile_k, use_patch)
     got = None
     if seen:
         p = seen[-1]
-        got = (tuple(p.tile), p.block_rows, p.num_buffers, p.main_loop_unroll, p.tile_k)
+        got = (
+            tuple(p.tile),
+            p.block_rows,
+            p.num_buffers,
+            p.main_loop_unroll,
+            p.tile_k,
+            p.patch,
+        )
     if got != want:
         ret["failure"] = "; ".join(
             filter(None, (ret["failure"], f"compiled {got}, requested {want}"))
@@ -1229,13 +1242,13 @@ def _pipeline_case(dtype, case, xshape, wshape, tile, block_rows, nb, unroll, ti
         "x": str(xshape),
         "weight": str(wshape),
         "host path": f"tile={want[0]}, block_rows={block_rows}, num_buffers={nb}, "
-        f"unroll={unroll}, tile_k={tile_k}",
+        f"unroll={unroll}, tile_k={tile_k}, patch={use_patch}",
         **ret,
     }
 
 
 def check_pipeline_gfx1250(dtype, mode="perf"):
-    """gfx1250-only: tuned pipeline / tile_k configs compile as asked and are exact."""
+    """gfx1250-only: tuned pipeline / tile_k / patch configs compile as asked and are exact."""
     if not get_gfx().startswith("gfx1250"):
         aiter.logger.info(
             "K-loop pipeline checks are gfx1250-specific; skipping on %s", get_gfx()

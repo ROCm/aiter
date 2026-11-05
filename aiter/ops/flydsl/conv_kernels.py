@@ -98,9 +98,10 @@ TUNED_DEVICE_COLUMNS = ("gfx", "cu_num")
 # Optional result column: output rows of a block's 2D patch (kH x kW reuse).
 # A table without it, or an empty cell, means 1 (consecutive rows).
 TUNED_BLOCK_ROWS_COLUMN = "block_r"
-# Optional gfx1250 result columns: the K loop's software pipeline and K tile
-# width. A table without them, or an empty cell, leaves the runtime default.
-TUNED_PIPELINE_COLUMNS = ("num_buffers", "main_loop_unroll", "tile_k")
+# Optional gfx1250 result columns: the K loop's software pipeline, K tile
+# width and kH x kW patch reuse. A table without them, or an empty cell, leaves
+# the runtime default.
+TUNED_PIPELINE_COLUMNS = ("num_buffers", "main_loop_unroll", "tile_k", "patch")
 _TUNED_INT_PIPELINE_COLUMNS = ("num_buffers", "tile_k")
 
 # Result column, not part of the key. Empty cell means FlyDSL; other backends skipped.
@@ -931,7 +932,9 @@ def _conv3d_impl(
             input_layout="NDHWC" if in_ndhwc else "NCDHW",
             output_layout=output_layout,
             block_rows=block_rows,
-            patch_reuse=patch_reuse,
+            # gfx950's patch_reuse=True only allows the reuse paths; on gfx1250
+            # the tuned row then decides, and False still forces the tap path.
+            patch_reuse=None if patch_reuse else False,
         )
 
     do = out_extent(d, pt, dt, kt, st)

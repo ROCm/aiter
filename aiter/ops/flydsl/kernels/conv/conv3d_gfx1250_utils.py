@@ -359,9 +359,48 @@ def unit_divisors_gfx1250(grid, geom):
     return (grid.wb == 1, grid.hb == 1, geom.do == 1)
 
 
-def make_shared_storage_gfx1250(elem_ty, cfg, num_buffers):
-    """LDS: num_buffers A tiles + num_buffers B tiles."""
-    a_elems = num_buffers * cfg.lds_a_elems_per_buf
+PATCH_STAGES = 2
+
+
+def patch_extent_gfx1250(block_rows, block_cols, kh, kw, dh, dw, num_warps=1):
+    """Rows/cols of the TDM patch an R x C output block reads (stride 1).
+
+    The TDM atom splits its outer (row) axis evenly over the issuing waves, so
+    rows are rounded up to a multiple of ``num_warps``; no tap reads the extra
+    rows.
+    """
+    rows = block_rows + (kh - 1) * dh
+    rows = -(-rows // num_warps) * num_warps
+    return rows, block_cols + (kw - 1) * dw
+
+
+def patch_stage_elems_gfx1250(
+    block_rows, block_cols, kh, kw, dh, dw, num_warps=1, tile_k=TILE_K
+):
+    rows, cols = patch_extent_gfx1250(block_rows, block_cols, kh, kw, dh, dw, num_warps)
+    return rows * cols * (tile_k // TILE_K) * LDS_K_CHUNK + LDS_PAD
+
+
+def patch_unsupported_gfx1250(kh, kw, sh, sw, splitk, num_buffers):
+    """Why the kH x kW patch path cannot run this conv, or None."""
+    if kh * kw < 2:
+        return "patch reuse needs kH * kW > 1"
+    if (sh, sw) != (1, 1):
+        return f"patch reuse needs unit H/W stride, got {(sh, sw)}"
+    if splitk > 1:
+        return "patch reuse walks whole (kt, cc) groups; split-K is ruled out"
+    if num_buffers > kh * kw:
+        # The next group's patch must enter the TDM queue ahead of its first B.
+        return f"num_buffers={num_buffers} prefetches a whole {kh * kw}-tap group"
+    return None
+
+
+def make_shared_storage_gfx1250(elem_ty, cfg, num_buffers, patch_stage_elems=None):
+    """LDS: num_buffers B tiles, plus num_buffers A tiles or PATCH_STAGES A patches."""
+    if patch_stage_elems is None:
+        a_elems = num_buffers * cfg.lds_a_elems_per_buf
+    else:
+        a_elems = PATCH_STAGES * patch_stage_elems
     b_elems = num_buffers * cfg.lds_b_elems_per_buf
 
     @fx.struct

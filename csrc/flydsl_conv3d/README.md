@@ -93,7 +93,7 @@ python3 csrc/flydsl_conv3d/conv3d_tune.py -i $M/wan21_vae_bf16_untuned_conv3d.cs
 python3 csrc/flydsl_conv3d/conv3d_tune.py -i $M/wan21_vae_bf16_untuned_conv3d.csv \
   -o $M/wan21_vae_gfx1250_bf16_tuned_conv3d.csv \
   --tiles_from /tmp/wan_tiles_all.csv --tiles_topk 4 \
-  --pipelines 2:0,2:1,3:0,3:1,4:0,4:1 --tile_ks 32,64,96,128
+  --pipelines 2:0,2:1,3:0,3:1,4:0,4:1 --tile_ks 32,64,96,128 --patches 0,1
 ```
 
    Write winners into the per-model file, never into
@@ -123,12 +123,15 @@ python3 csrc/flydsl_conv3d/conv3d_tune.py -i $M/wan21_vae_bf16_untuned_conv3d.cs
 
    gfx1250 rows also carry `block_r` (output rows of the R x C block),
    `num_buffers` (LDS ring depth, i.e. prefetch distance),
-   `main_loop_unroll` (two K tiles per `scf.for` trip) and `tile_k` (channels
+   `main_loop_unroll` (two K tiles per `scf.for` trip), `tile_k` (channels
    per K tile, a multiple of 32 that divides C/groups padded to 32; one
-   `tensor_wait` + barrier per K tile). `num_buffers` is the value that ran:
-   the runtime clamps a request to the LDS capacity and the K-tile count, and
-   the tuner records the clamped value. Rows without these columns, or with
-   empty cells, run 2 buffers, no unroll and `tile_k=32`.
+   `tensor_wait` + barrier per K tile) and `patch` (kH x kW input reuse: one
+   TDM patch of (R + kH - 1) x (C + kW - 1) pixels per (kT, channel) group,
+   read by all kH * kW taps). `num_buffers` is the value that ran: the runtime
+   clamps a request to the LDS capacity and the K-tile count (and, with
+   `patch`, to kH * kW), and the tuner records the clamped value. Rows without
+   these columns, or with empty cells, run 2 buffers, no unroll, `tile_k=32`
+   and no patch.
 
    `splitK` is **not** swept: `_resolve_splitk` derives it per candidate and the
    tuner pins that value so the column records what ran. Every row of both VAE
@@ -211,6 +214,14 @@ python3 -m pytest op_tests/tuning_tests/test_config_shape_collision.py
 - **Description**: gfx1250 only. K tile widths every tile and pipeline is timed
   with. A width that does not divide the shape's padded C/groups is skipped
   there, and so is a variant whose LDS would not fit even at 2 buffers.
+
+### `--patches`
+- **Type**: `0`, `1` or `0,1`
+- **Default**: `0`
+- **Description**: gfx1250 only. Time every tile, pipeline and K tile width
+  without and/or with kH x kW patch reuse. `1` is skipped where the shape
+  cannot take it (kH * kW == 1, H/W stride > 1, split-K) and runs without
+  main-loop unroll (the patch loop unrolls the taps of a group instead).
 
 ### `--tiles_from` / `--tiles_topk`
 - **Type**: path / int

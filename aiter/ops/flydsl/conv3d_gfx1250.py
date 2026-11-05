@@ -26,6 +26,7 @@ from aiter.ops.flydsl.kernels.conv.conv3d_gfx1250_utils import (
     MAX_WAVES,
     TILE_K,
     out_extent,
+    patch_unsupported_gfx1250,
     tile_k_unsupported_gfx1250,
 )
 from aiter.ops.flydsl.kernels.conv.conv3d_implicit_gfx1250 import (
@@ -186,21 +187,38 @@ def _warn_dropped_tile(tile):
     )
 
 
-def _clamp_num_buffers(num_buffers, tiles_per_split, tile, block_rows, tile_k=32):
-    """Drop to a legal B that fits LDS and leaves a nonempty prologue."""
+def _clamp_num_buffers(
+    num_buffers, tiles_per_split, tile, block_rows, tile_k=32, patch=None
+):
+    """Drop to a legal B that fits LDS and leaves a nonempty prologue.
+
+    ``patch`` is ``(kh, kw, dh, dw)`` on the kH x kW patch path, whose B ring
+    must prefetch less than one group's taps ahead.
+    """
     from aiter.jit.utils.chip_info import get_lds_capacity_bytes
-    from aiter.ops.flydsl.conv3d_policy_gfx1250 import lds_bytes_tap
+    from aiter.ops.flydsl.conv3d_policy_gfx1250 import lds_bytes_patch, lds_bytes_tap
+
+    def lds_bytes(b):
+        if patch is None:
+            return lds_bytes_tap(tile[0], tile[1], num_buffers=b, tile_k=tile_k)
+        return lds_bytes_patch(
+            tile[0],
+            tile[1],
+            block_rows,
+            *patch,
+            num_buffers=b,
+            num_warps=tile[2] * tile[3],
+            tile_k=tile_k,
+        )
 
     b = max(2, min(8, int(num_buffers)))
+    if patch is not None:
+        b = min(b, patch[0] * patch[1])
     lds_cap = get_lds_capacity_bytes()
-    while b > 2 and (
-        tiles_per_split < b - 1
-        or lds_bytes_tap(tile[0], tile[1], num_buffers=b, tile_k=tile_k) > lds_cap
-    ):
+    while b > 2 and (tiles_per_split < b - 1 or lds_bytes(b) > lds_cap):
         b -= 1
     if tiles_per_split < b - 1:
         b = max(2, tiles_per_split + 1)
-    del block_rows  # reserved for future LDS accounting that needs cfg
     return b
 
 
@@ -285,7 +303,7 @@ def run_conv3d_gfx1250(
     block_rows=None,
     input_layout="NCDHW",
     output_layout="NCDHW",
-    patch_reuse=True,  # gfx950 API parity; ignored on gfx1250 (no patch path)
+    patch_reuse=None,
     splitk=None,
     wgm=None,  # accepted for API parity; unused on gfx1250
     num_buffers=None,
@@ -298,12 +316,13 @@ def run_conv3d_gfx1250(
 ):
     """Run gfx1250 FlyDSL conv3d (TDM+WMMA; optional split-K / dyn_hw / tuned tile).
 
-    ``num_buffers`` / ``main_loop_unroll`` / ``tile_k`` left at None take the
-    tuned row's columns of the same name, else 2 buffers, no unroll and 32
-    channels per K tile. A ``tile_k`` that cannot run here
-    (``tile_k_unsupported_gfx1250``) falls back to 32.
+    ``num_buffers`` / ``main_loop_unroll`` / ``tile_k`` / ``patch_reuse`` left
+    at None take the tuned row's columns (``patch`` for ``patch_reuse``), else
+    2 buffers, no unroll, 32 channels per K tile and no patch. A ``tile_k`` that
+    cannot run here (``tile_k_unsupported_gfx1250``) falls back to 32; the patch
+    path is dropped where it cannot run (``patch_unsupported_gfx1250``).
     """
-    del _ignored, patch_reuse
+    del _ignored
     in_ndhwc = input_layout == "NDHWC"
     out_ndhwc = output_layout == "NDHWC"
     n, c, d, h, w = _shape_ncdhw(x, in_ndhwc)
@@ -480,12 +499,23 @@ def run_conv3d_gfx1250(
         tile_k = tuned_pipe.get("tile_k", TILE_K)
     if tile_k_unsupported_gfx1250(int(tile_k), cgp, sk) is not None:
         tile_k = TILE_K
+    if patch_reuse is None:
+        patch_reuse = tuned_pipe.get("patch", False)
+    use_patch = bool(patch_reuse) and (
+        patch_unsupported_gfx1250(kh, kw, sh, sw, sk, min(int(num_buffers), kh * kw))
+        is None
+    )
 
     # Match GEMM: B-1 K-tiles must fill the prologue; clamp against LDS too.
     k_tiles = crs // tile_k
     tiles_per_split = k_tiles // max(1, sk)
     nb = _clamp_num_buffers(
-        num_buffers, tiles_per_split, chosen_tile, chosen_br, tile_k=tile_k
+        num_buffers,
+        tiles_per_split,
+        chosen_tile,
+        chosen_br,
+        tile_k=tile_k,
+        patch=(kh, kw, dh, dw) if use_patch else None,
     )
 
     if sk > 1:
@@ -526,8 +556,9 @@ def run_conv3d_gfx1250(
         splitk=sk,
         dyn_hw=dyn_hw,
         variant=variant,
-        main_loop_unroll=main_loop_unroll,
+        main_loop_unroll=main_loop_unroll and not use_patch,
         tile_k=tile_k,
+        patch=use_patch,
     )
     exe = compile_conv3d_implicit_gfx1250(param)
     launch_stream = torch.cuda.current_stream() if stream is None else stream
