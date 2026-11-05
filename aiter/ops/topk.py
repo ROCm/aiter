@@ -876,7 +876,9 @@ def _top_k_per_row_prefill_sampled(
 
 
 @compile_ops("module_top_k_per_row_sampled")
-def topk_sampled_workspace_size(numRows: int, stride0: int, k: int) -> int: ...
+def topk_sampled_workspace_size(
+    numRows: int, stride0: int, k: int, device_id: int = -1
+) -> int: ...
 
 
 @compile_ops("module_top_k_per_row_sampled")
@@ -897,16 +899,18 @@ def _sampled_supports_cached(numRows: int, stride0: int, k: int, device: int) ->
     overhead looks like.
 
     Safe to cache: topk_sampled_supports is a pure function of the shape and of
-    the device's architecture, and the device is in the key. The shape half
-    computes sampled::params_for -> derive_shape_params, which reads no device
-    state (CU_COUNT is a constexpr in topk_shape.hip.hpp); the architecture half
-    declines every GPU that is not gfx950.
+    the device's architecture and CU count, and the device is in the key. The
+    shape half computes sampled::params_for -> derive_shape_params, which depends
+    on the device only through its CU count; the architecture half declines every
+    GPU that is not gfx950.
     """
     return bool(topk_sampled_supports(numRows, stride0, k, device))
 
 
 @functools.lru_cache(maxsize=1024)
-def _sampled_workspace_size_cached(numRows: int, stride0: int, k: int) -> int:
+def _sampled_workspace_size_cached(
+    numRows: int, stride0: int, k: int, device: int
+) -> int:
     """topk_sampled_workspace_size() memoised, for the same reason and the same
     measured cost: 4.80 us per call through the binding.
 
@@ -917,12 +921,11 @@ def _sampled_workspace_size_cached(numRows: int, stride0: int, k: int) -> int:
     of the call was the caller's CPU and the GPU work was entirely hidden behind
     it. Optimising the kernel there would have changed nothing.
 
-    Safe to cache for the same reason: it is a pure function of these three ints.
-    topk_sampled_workspace_size computes params_for -> derive_shape_params and then
-    ws_layout, none of which reads device state (CU_COUNT is a constexpr in
-    topk_shape.hip.hpp).
+    Safe to cache for the same reason: topk_sampled_workspace_size computes
+    params_for -> derive_shape_params and then ws_layout, which depend on the
+    device only through its CU count, and the device is in the key.
     """
-    return int(topk_sampled_workspace_size(numRows, stride0, k))
+    return int(topk_sampled_workspace_size(numRows, stride0, k, device))
 
 
 def _sampled_layout_error(
@@ -1003,7 +1006,8 @@ def _sampled_run(
     """The sampled launch on arguments already validated."""
     if workspace is None:
         workspace = get_topk_scratch_workspace(
-            logits.device, _sampled_workspace_size_cached(numRows, stride0, k)
+            logits.device,
+            _sampled_workspace_size_cached(numRows, stride0, k, logits.get_device()),
         )
     # The non-ragged kernels take every row to be stride0 wide. A row-strided
     # view -- a column slice of a wider tensor -- is narrower than its pitch, so
@@ -1086,7 +1090,7 @@ def top_k_per_row_prefill_sampled(
     (RowExtents in csrc/include/topk_sampled/topk_common.hip.hpp).
 
     `workspace` is optional: pass a buffer of at least
-    topk_sampled_workspace_size(numRows, stride0, k) bytes to own it yourself, or
+    topk_sampled_workspace_size(numRows, stride0, k, device_id) bytes to own it yourself, or
     leave it None to get the shared scratch buffer.
 
     Call topk_sampled_supports() first if you want to route around the shapes this
@@ -1114,7 +1118,7 @@ def top_k_per_row_prefill_sampled(
             "pass values=None"
         )
     if workspace is not None:
-        size = _sampled_workspace_size_cached(numRows, stride0, k)
+        size = _sampled_workspace_size_cached(numRows, stride0, k, logits.get_device())
         if workspace.device != logits.device or not workspace.is_contiguous():
             raise ValueError(
                 "top_k_per_row_prefill_sampled: workspace must be a contiguous "

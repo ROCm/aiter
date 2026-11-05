@@ -1405,7 +1405,7 @@ void get_mla_metadata_v1_2_device(const aiter_tensor_t& seqlens_qo_indptr, // [b
     params.fixed_over_head_num_blocks   = max(1, (16 + page_size - 1) / page_size);
     params.tail_done_threshold          = max_seqlen_qo;
 
-    params.num_xcd = (arch_id == "gfx950") ? 8 : 1;
+    params.num_xcd = (arch_id == "gfx950") ? static_cast<int32_t>(get_num_xcds_func()) : 1;
 
     const int32_t kPackedQoLenPerWg = head_plan.packed_qo_len_per_wg;
 

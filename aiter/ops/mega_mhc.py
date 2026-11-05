@@ -106,6 +106,16 @@ def _select_gfx1250_variant(tokens, cu):
     return "gfx1250_large", 1
 
 
+def _select_generic_variant(hidden, blocks, cu):
+    """The generic kernel at the largest split of H that gives each tile and split a CU."""
+    split = max(
+        k
+        for k in range(1, 21)
+        if hidden % (32 * k) == 0 and (k == 1 or max(blocks, 1) * k <= cu)
+    )
+    return "generic", split
+
+
 def mega_mhc_shuffle_fn(fn):
     """[H/32, stream, operand, lane, 8] BF16; the last operand packs hi/lo.
 
@@ -260,7 +270,10 @@ def prepare_mega_mhc(
 
     H=5120/7168 on gfx950 and gfx1250 uses the tuned stream kernels.
     Explicit split_k, other H and gfx942 select the portable generic kernel
-    with the same weight layout. The workspace also supports non-default
+    with the same weight layout. The tuned kernels up to T=2048 on gfx950 need
+    one CU per workgroup of a 256-CU grid, so on gfx950 parts with fewer CUs
+    those token counts also take the generic kernel, as do all distributed
+    kernels while a CU mask is set. The workspace also supports non-default
     Sinkhorn repeats via the generic path. It never receives or stores
     weights. Prepare before graph capture; pass the packed weight separately
     to each mega_mhc call.
@@ -294,12 +307,7 @@ def _prepare_scratch(device, tokens, hidden, split_k=None, *, reuse_scratch=True
         elif arch == "gfx1250" and hidden in _STREAM_HIDDEN_SIZES:
             variant, selected_split = _select_gfx1250_variant(tokens, cu)
         else:
-            variant = "generic"
-            selected_split = max(
-                k
-                for k in range(1, 21)
-                if hidden % (32 * k) == 0 and (k == 1 or max(blocks, 1) * k <= cu)
-            )
+            variant, selected_split = _select_generic_variant(hidden, blocks, cu)
         if split_k is not None:
             variant, selected_split = "generic", split_k
         distributed = variant in _DISTRIBUTED_VARIANTS
@@ -308,7 +316,8 @@ def _prepare_scratch(device, tokens, hidden, split_k=None, *, reuse_scratch=True
             for name in ("HSA_CU_MASK", "ROC_GLOBAL_CU_MASK")
         )
         if distributed and (masked or (arch != "gfx1250" and cu < 256)):
-            variant, selected_split, distributed = "generic", 1, False
+            variant, selected_split = _select_generic_variant(hidden, blocks, cu)
+            distributed = False
         tagged = variant in _TAGGED_VARIANTS
         split_k = selected_split
         if (
