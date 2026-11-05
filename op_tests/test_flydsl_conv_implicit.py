@@ -4,35 +4,66 @@
 
 """Correctness and perf for the FlyDSL implicit-GEMM convolution.
 
-Keyword surface plus Wan2.1 / Qwen-Image VAE shapes from the tuner's CSVs
-(`wan21_vae_bf16_untuned_conv3d.csv`, `qwenimage_vae_bf16_untuned_conv3d.csv`).
+No arguments: six representative Wan families (conv_in at real 368x544 for an
+exact production-tuned lookup check, the other five at compact 64x64), plus six
+required keyword regressions and seven unfiltered key/static checks. The exact
+check requires a device-matching FlyDSL row; explicit --wan-res overrides disable
+that requirement and apply the requested resolutions to all selected Wan families.
+Each CI case runs two warmups and ten direct calls, checking every output.
+No profiler, run_perftest, torch performance baseline, or fake throughput columns.
+
+Perf mode retains the full keyword/Wan2.1/Qwen-Image matrix and performance tables
+from the tuner's CSVs (wan21_vae_bf16_untuned_conv3d.csv and
+qwenimage_vae_bf16_untuned_conv3d.csv). Explicit cases replace the default subset;
+resolution overrides preserve selected families and never change perf defaults.
 
 Usage::
 
     python op_tests/test_flydsl_conv_implicit.py
+    python op_tests/test_flydsl_conv_implicit.py --mode perf
     python op_tests/test_flydsl_conv_implicit.py -c down_0_1 res_96_L0
-    python op_tests/test_flydsl_conv_implicit.py --wan-res 480x832 --wan-frames 17
-    python op_tests/test_flydsl_conv_implicit.py --qwen-res 1664x928
+    python op_tests/test_flydsl_conv_implicit.py -c conv_in --wan-res 368x544
+    python op_tests/test_flydsl_conv_implicit.py --mode perf --qwen-res 1664x928
 """
 
 import argparse
+import functools
 import itertools
+import time
+from contextlib import contextmanager
+from unittest.mock import patch
 
-import pandas as pd
-import torch
-import torch.nn.functional as F
 
-import aiter
-from aiter import dtypes
-from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.flydsl import conv_kernels, flydsl_conv_implicit
-from aiter.ops.flydsl.conv_kernels import SUPPORTED_GFX
-from aiter.test_common import benchmark, checkAllclose, run_perftest
+def _load_backend():
+    """Load GPU dependencies only after argument validation (including --help)."""
+    global pd, torch, F, aiter, dtypes, get_gfx
+    global conv_kernels, flydsl_conv_implicit, SUPPORTED_GFX, benchmark, run_perftest
+    import pandas as pd
+    import torch
+    import torch.nn.functional as F
+
+    import aiter
+    from aiter import dtypes
+    from aiter.jit.utils.chip_info import get_gfx
+    from aiter.ops.flydsl import conv_kernels, flydsl_conv_implicit
+    from aiter.ops.flydsl.conv_kernels import SUPPORTED_GFX
+    from aiter.test_common import benchmark, run_perftest
+
+
+def _perf_row(fn):
+    """Keep the existing benchmark row metadata without eager GPU imports."""
+
+    @functools.wraps(fn)
+    def wrapped(*args, **kwargs):
+        return benchmark()(fn)(*args, **kwargs)
+
+    return wrapped
+
 
 TOL = {"rtol": 2e-2, "atol": 2e-2}
 
-# CI runs this as a script: checkAllclose only raises on non-finite, so collect
-# flydsl mismatches and assert once at the end of main(). Bar is zero elements.
+# Collect strict failures and assert after the tables. No mismatched element is
+# accepted in either mode; CI also retains per-iteration failure details.
 ERR_TOL = 0.0
 _FAILED = []
 # SUPPORTED_GFX is the op's allow-list; skip rather than restating it.
@@ -49,7 +80,7 @@ def _levels(v, n=3):
 def parse_res(text):
     h, _, w = text.lower().partition("x")
     h, w = int(h), int(w)
-    if h % 8 or w % 8:
+    if h <= 0 or w <= 0 or h % 8 or w % 8:
         # Both VAEs downsample by 8. Off-multiple sizes still run, but the encoder
         # and decoder then land on different extents and the shape set stops
         # collapsing to one row per level, which these tables assume.
@@ -306,7 +337,15 @@ KW_CASES = [
     ("3d_1x1x1", 3, _X3, (48, 32, 1, 1, 1), {}, None, True),
     ("2d_3x3_pad1", 2, _X2, _W2, {"padding": 1}, None, False),
     ("2d_1x1", 2, _X2, (96, 96, 1, 1), {}, None, False),
-    ("2d_splitk2", 2, _X2, _W2, {"padding": 1, "splitk": 2}, {"padding": 1}, False),
+    (
+        "2d_splitk2",
+        2,
+        (1, 64, 16, 16),
+        (64, 64, 3, 3),
+        {"padding": 1, "tile": (32, 32, 1, 2), "splitk": 2},
+        {"padding": 1},
+        False,
+    ),
     ("1d_3_pad1", 1, (1, 32, 128), (64, 32, 3), {"padding": 1}, None, False),
     # Independent input/output layouts; torch has no such kwargs (ref_kw).
     (
@@ -452,6 +491,147 @@ _DUPE_CASES = sorted({c for c in ALL_CASES if ALL_CASES.count(c) > 1})
 assert not _DUPE_CASES, f"duplicate case labels: {_DUPE_CASES}"
 
 
+CI_WAN_CASES = (
+    "conv_in",
+    "down_0_1",
+    "resample_96",
+    "time_conv_192",
+    "wdec_up_192_L0",
+    "wdec_conv_out",
+)
+CI_KW_CASES = (
+    "2d_tile_256x96",
+    "2d_block_rows8_nhwc",
+    "3d_block_rows8_ndhwc",
+    "2d_block_rows8_dil_w2",
+    "2d_block_rows8_gated_s2",
+    "2d_splitk2",
+)
+CI_WARMUP = 2
+CI_ITERATIONS = 10
+
+
+def parse_args(argv=None):
+    """Pure configuration: explicit cases override the mode's default subset."""
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument(
+        "--mode",
+        choices=("ci", "perf"),
+        default="ci",
+        help="ci: representative correctness only; perf: full original matrix",
+    )
+    p.add_argument(
+        "-d",
+        "--dtype",
+        nargs="+",
+        default=["bf16"],
+        help="the kernel is bf16-only; other dtypes are warned and dropped",
+    )
+    p.add_argument(
+        "-c",
+        "--cases",
+        nargs="+",
+        choices=ALL_CASES,
+        metavar="CASE",
+        help="replace the default subset with these cases (including Qwen/KW); "
+        "key isolation and static reuse are always run",
+    )
+    p.add_argument(
+        "--wan-res",
+        nargs="+",
+        help="Wan HxW, positive multiples of 8; ci defaults to conv_in@368x544 "
+        "(exact tuned check) and five families@64x64; perf defaults to 480x832 "
+        "and 368x544; overrides disable the exact check and keep selected families",
+    )
+    p.add_argument(
+        "--wan-frames",
+        type=int,
+        nargs="+",
+        default=[81],
+        help="Wan clip lengths (4n+1, at least 5); only call counts change",
+    )
+    p.add_argument(
+        "--qwen-res",
+        nargs="+",
+        help="Qwen HxW; explicitly enables all Qwen families unless --cases is "
+        "given; defaults to 1024x1024 and 1328x1328 in perf or 64x64 in ci",
+    )
+    args = p.parse_args(argv)
+    explicit_qwen = args.qwen_res is not None
+    explicit_wan = args.wan_res is not None
+    args.wan_res_explicit = explicit_wan
+    if args.cases is None:
+        args.cases = (
+            list(ALL_CASES) if args.mode == "perf" else list(CI_KW_CASES + CI_WAN_CASES)
+        )
+        if args.mode == "ci" and explicit_qwen:
+            args.cases += [c[0] for c in qwen_vae_conv2d(64, 64)]
+    args.cases = list(dict.fromkeys(args.cases))
+    if args.wan_res is None:
+        args.wan_res = ["64x64"] if args.mode == "ci" else ["480x832", "368x544"]
+    if args.qwen_res is None:
+        args.qwen_res = ["64x64"] if args.mode == "ci" else ["1024x1024", "1328x1328"]
+    try:
+        for res in args.wan_res + args.qwen_res:
+            parse_res(res)
+    except ValueError as exc:
+        p.error(str(exc))
+    if any(f < 5 or (f - 1) % 4 for f in args.wan_frames):
+        p.error("--wan-frames must contain clip lengths 4n+1, at least 5")
+    if explicit_qwen and not any(c[0] in args.cases for c in qwen_vae_conv2d(64, 64)):
+        p.error("--qwen-res has no selected Qwen cases; include one with --cases")
+    wan_names = (
+        [c[0] for c in wan_vae_conv3d(64, 64, 5)]
+        + [c[0] for c in wan_vae_aux(64, 64, 5)]
+        + [c[0] for c in wan_vae_decode(64, 64, 5)]
+    )
+    if explicit_wan and not any(c in args.cases for c in wan_names):
+        p.error("--wan-res has no selected Wan cases; include one with --cases")
+    return args
+
+
+def correctness_runner(
+    fn, check, synchronize, warmup=CI_WARMUP, iterations=CI_ITERATIONS
+):
+    """Direct calls only: reuse a reference and check every measured invocation."""
+    if warmup < 0 or iterations < 1:
+        raise ValueError("warmup must be nonnegative and iterations positive")
+    start = time.perf_counter()
+    firstcall_ms = 0.0
+    for i in range(warmup):
+        before = time.perf_counter()
+        fn()
+        synchronize()
+        if i == 0:
+            firstcall_ms = (time.perf_counter() - before) * 1e3
+    errors = []
+    check_ms = 0.0
+    checked = 0
+    for i in range(iterations):
+        try:
+            out = fn()
+            synchronize()
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"iteration {i + 1}: {type(exc).__name__}: {exc}")
+            break
+        checked += 1
+        before = time.perf_counter()
+        try:
+            check(out)
+        except AssertionError as exc:
+            errors.append(f"iteration {i + 1}: {exc}")
+        check_ms += (time.perf_counter() - before) * 1e3
+    return {
+        "mode": "ci",
+        "warmup": warmup,
+        "iterations": checked,
+        "wall ms": (time.perf_counter() - start) * 1e3,
+        "firstcall ms": firstcall_ms,
+        "check ms": check_ms,
+        "failure": "; ".join(errors),
+    }
+
+
 def _ref(x, w, bias, rank, padding_mode="zeros", padding=0, **kw):
     """torch reference.
 
@@ -516,21 +696,170 @@ def _roofline(x, w, ref, rank):
     return m, n, k, 2 * m * n * k, nbytes
 
 
-@benchmark()
-def test_conv_implicit(case, rank, xshape, wshape, dtype, kw, ref_kw=None, bias=False):
+def _prepare(
+    rank, xshape, wshape, dtype, kw, ref_kw=None, bias=False, round_reference=True
+):
+    """Create data once; preserve key-isolation's unrounded fp32 reference."""
     torch.manual_seed(0)
     x = torch.randn(xshape, device="cuda", dtype=dtype)
     w = torch.randn(wshape, device="cuda", dtype=dtype)
     b = torch.randn(wshape[0], device="cuda", dtype=dtype) if bias else None
-
-    ref = _ref(x, w, b, rank, **(kw if ref_kw is None else ref_kw))
-    m, n, k, flops, nbytes = _roofline(x, w, ref, rank)
-
-    # The reference stays channels-first; only what the kernel is handed follows the
-    # swept layout, and a channels-last result is rotated back before the compare.
+    reference_kw = kw if ref_kw is None else ref_kw
+    if round_reference:
+        ref = _ref(x, w, b, rank, **reference_kw)
+    else:
+        ref = {1: F.conv1d, 2: F.conv2d, 3: F.conv3d}[rank](
+            x.float(), w.float(), None if b is None else b.float(), **reference_kw
+        )
     cl = _CHANNELS_LAST[rank]
     xk = _channels_last(x, rank) if kw.get("input_layout") == cl else x
-    out_cl = kw.get("output_layout") == cl
+    return x, w, b, ref, xk, kw.get("output_layout") == cl
+
+
+def _compare(ref, out, case):
+    """Zero mismatched elements, with an explicit finite check on both tensors."""
+    ref, out = ref.to(dtypes.fp32), out.to(dtypes.fp32)
+    assert ref.shape == out.shape, f"{case}: shape {out.shape} != {ref.shape}"
+    assert torch.isfinite(ref).all().item(), f"{case}: non-finite reference"
+    assert torch.isfinite(out).all().item(), f"{case}: non-finite output"
+    # Keep checkAllclose(ref, out)'s original relative-tolerance direction.
+    mismatches = int((~torch.isclose(ref, out, **TOL)).sum().item())
+    return mismatches / ref.numel()
+
+
+def _check_output(ref, out, case):
+    err = _compare(ref, out, case)
+    assert err == 0, f"{case}: {err:.8%} of elements outside {TOL}"
+
+
+def _assert_host_path(case, param):
+    """Inspect the actual runtime compile parameter, not a guessed case name."""
+    from aiter.ops.flydsl.kernels.conv.conv3d_gfx950_utils import (
+        make_conv_geometry,
+        make_launch_grid,
+        make_tile_config,
+    )
+    from aiter.ops.flydsl.kernels.conv.conv3d_im2col import make_im2col_plan
+
+    cfg = make_tile_config(param.tile)
+    geom = make_conv_geometry(param)
+    plan = make_im2col_plan(param, geom, cfg)
+    grid = make_launch_grid(param, geom, cfg, plan.out_block)
+    if case == "2d_splitk2":
+        assert (
+            param.splitk == 2 and grid.use_splitk and grid.splitk == 2
+        ), "splitk=2 must survive host resolution and reach the launch grid"
+        assert not plan.kw_reuse and not plan.kh_reuse
+    elif case == "2d_tile_256x96":
+        assert plan.kw_reuse and not plan.kh_reuse, "expected kW reuse"
+    elif case == "2d_block_rows8_gated_s2":
+        assert not plan.kh_reuse and not plan.kw_reuse, "stride 2 must gate reuse"
+    else:
+        assert plan.kh_reuse and not plan.kw_reuse, "expected kH x kW reuse"
+        assert plan.out_block == (8, 32), "expected an 8x32 output patch"
+    if case == "2d_block_rows8_static":
+        assert not param.dyn_hw, "static regression must use static input extents"
+    return (
+        f"kw_reuse={plan.kw_reuse}, kh_reuse={plan.kh_reuse}, "
+        f"splitk={grid.splitk}, use_splitk={grid.use_splitk}, dyn_hw={param.dyn_hw}"
+    )
+
+
+@contextmanager
+def _capture_host_path(case):
+    """Spy without replacing params or clearing/populating artificial cache keys."""
+    notes = []
+    if case not in CI_KW_CASES and case != "2d_block_rows8_static":
+        yield notes
+        return
+    compile_fn = conv_kernels.compile_conv3d_implicit
+
+    def checked_compile(param):
+        note = _assert_host_path(case, param)
+        if note not in notes:
+            notes.append(note)
+        return compile_fn(param)
+
+    with patch.object(conv_kernels, "compile_conv3d_implicit", checked_compile):
+        yield notes
+        assert notes, f"{case}: no implicit compile parameter was observed"
+
+
+@contextmanager
+def _capture_tuned_path(required):
+    """Observe exact production lookup and the compile parameter it selects."""
+    notes = []
+    if not required:
+        yield notes
+        return
+    log_fn = conv_kernels._log_tuned_lookup
+    compile_fn = conv_kernels.compile_conv3d_implicit
+    hits = []
+
+    def checked_lookup(table, dev, key, hit, borrowed=False):
+        assert hit is not None and not borrowed, (
+            f"production conv_in requires an exact tuned row for device={dev}; "
+            "use an explicit --wan-res override for generic correctness"
+        )
+        hits.append(hit)
+        note = f"exact tuned hit: device={dev}, tile={hit[0]}, wgm={hit[1]}"
+        if note not in notes:
+            notes.append(note)
+        log_fn(table, dev, key, hit, borrowed=borrowed)
+
+    def checked_compile(param):
+        assert hits and tuple(param.tile) == tuple(
+            hits[-1][0]
+        ), "compile parameter must use the tile returned by the exact lookup"
+        return compile_fn(param)
+
+    with patch.object(conv_kernels, "_log_tuned_lookup", checked_lookup), patch.object(
+        conv_kernels, "compile_conv3d_implicit", checked_compile
+    ):
+        yield notes
+        assert hits, "production conv_in did not perform a tuned lookup"
+
+
+def _ci_case(
+    case,
+    rank,
+    xshape,
+    wshape,
+    dtype,
+    kw,
+    ref_kw=None,
+    bias=False,
+    round_reference=True,
+    require_tuned=False,
+):
+    _, w, b, ref, xk, out_cl = _prepare(
+        rank, xshape, wshape, dtype, kw, ref_kw, bias, round_reference
+    )
+
+    def check(out):
+        if out_cl:
+            out = _channels_first(out, rank)
+        _check_output(ref, out, case)
+
+    with _capture_host_path(case) as notes, _capture_tuned_path(require_tuned) as tuned:
+        ret = correctness_runner(
+            lambda: flydsl_conv_implicit(xk, w, b, **kw),
+            check,
+            torch.cuda.synchronize,
+        )
+    return {
+        "case": case,
+        "x": str(xshape),
+        "weight": str(wshape),
+        "host path": "; ".join(notes + tuned) or "not asserted",
+        **ret,
+    }
+
+
+@_perf_row
+def test_conv_implicit(case, rank, xshape, wshape, dtype, kw, ref_kw=None, bias=False):
+    x, w, b, ref, xk, out_cl = _prepare(rank, xshape, wshape, dtype, kw, ref_kw, bias)
+    m, n, k, flops, nbytes = _roofline(x, w, ref, rank)
 
     # Keyword surface, so torch is the reference only. The model-shape sweeps below
     # are where it also runs as a candidate, because there MIOpen is the baseline.
@@ -538,15 +867,14 @@ def test_conv_implicit(case, rank, xshape, wshape, dtype, kw, ref_kw=None, bias=
 
     ret = {"gfx": get_gfx(), "M": m, "N": n, "K": k}
     for name, fn in candidates.items():
-        out, us = run_perftest(fn, num_rotate_args=1)
+        with _capture_host_path(case):
+            out, us = run_perftest(fn, num_rotate_args=1)
         if out_cl:
             out = _channels_first(out, rank)
         ret[f"{name} us"] = us
         ret[f"{name} TFLOPS"] = flops / us / 1e6
         ret[f"{name} TB/s"] = nbytes / us / 1e6
-        ret[f"{name} err"] = checkAllclose(
-            ref.to(dtypes.fp32), out.to(dtypes.fp32), msg=f"{case} {name}: ", **TOL
-        )
+        ret[f"{name} err"] = _compare(ref, out, f"{case} {name}")
     return ret
 
 
@@ -560,14 +888,9 @@ def _bench_vs_torch(
     patch replaces, so its number belongs in the table. ``per`` names the pass the
     call count belongs to, so a decode table does not claim to weight an encode.
     """
-    torch.manual_seed(0)
     rank = len(wshape) - 2
-    x = torch.randn(xshape, device="cuda", dtype=dtype)
-    w = torch.randn(wshape, device="cuda", dtype=dtype)
-    b = torch.randn(wshape[0], device="cuda", dtype=dtype)
-
     kw = {"stride": stride, "padding": padding}
-    ref = _ref(x, w, b, rank, **kw)
+    x, w, b, ref, _, _ = _prepare(rank, xshape, wshape, dtype, kw, bias=True)
     m, n, k, flops, nbytes = _roofline(x, w, ref, rank)
 
     torch_conv = {1: F.conv1d, 2: F.conv2d, 3: F.conv3d}[rank]
@@ -585,24 +908,22 @@ def _bench_vs_torch(
         # Weight the row by how often one pass runs this shape, so the column sums
         # to that bucket's share of the pass instead of to a single call.
         ret[f"{name} ms/{per}"] = us * calls / 1e3
-        ret[f"{name} err"] = checkAllclose(
-            ref.to(dtypes.fp32), out.to(dtypes.fp32), msg=f"{case} {name}: ", **TOL
-        )
+        ret[f"{name} err"] = _compare(ref, out, f"{case} {name}")
     return ret
 
 
-@benchmark()
+@_perf_row
 def test_wan_vae_conv3d(case, clip, xshape, wshape, dtype, calls):
     # WanCausalConv3d padded x itself, so padding=0 / stride=1.
     return _bench_vs_torch(case, xshape, wshape, dtype, calls)
 
 
-@benchmark()
+@_perf_row
 def test_wan_vae_aux(case, clip, bucket, xshape, wshape, stride, padding, dtype, calls):
     return _bench_vs_torch(case, xshape, wshape, dtype, calls, stride, padding)
 
 
-@benchmark()
+@_perf_row
 def test_wan_vae_decode(
     case, clip, bucket, xshape, wshape, stride, padding, dtype, calls
 ):
@@ -612,7 +933,7 @@ def test_wan_vae_decode(
     )
 
 
-@benchmark()
+@_perf_row
 def test_qwen_vae_conv2d(case, res, xshape, wshape, stride, padding, dtype, calls):
     # The T=1 rewrite hands conv2d the unpadded input and the module's spatial pad;
     # the resamplers instead get a pre-padded input at stride 2, so both are swept.
@@ -628,125 +949,349 @@ _KEY_ISOLATION_PAIRS = (
 )
 
 
-def test_artifact_key_isolation(dtype):
-    """One row per shape; a shape that borrowed another's artifact shows up here."""
+def _execute_ci(case, *args, **kwargs):
+    """Keep failures beside their case and continue to the final strict summary."""
+    start = time.perf_counter()
+    try:
+        return _ci_case(case, *args, **kwargs)
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "case": case,
+            "mode": "ci",
+            "iterations": 0,
+            "wall ms": (time.perf_counter() - start) * 1e3,
+            "failure": f"{type(exc).__name__}: {exc}",
+        }
+
+
+def test_artifact_key_isolation(dtype, mode="perf"):
+    """Preserve the six shapes and the original unrounded fp32 reference."""
     rows = []
     for axis, big, small in _KEY_ISOLATION_PAIRS:
         for which, xshape in (("larger", big), ("smaller", small)):
-            torch.manual_seed(0)
-            x = torch.randn(xshape, device="cuda", dtype=dtype)
-            w = torch.randn((32, xshape[1], 3, 3, 3), device="cuda", dtype=dtype)
             kw = {"stride": 2, "padding": 1}
-            out = flydsl_conv_implicit(x, w, **kw)
-            ref = F.conv3d(x.to(dtypes.fp32), w.to(dtypes.fp32), **kw)
+            wshape = (32, xshape[1], 3, 3, 3)
             case = f"{axis}_{which}_{'x'.join(str(v) for v in xshape[2:])}"
+            if mode == "ci":
+                rows.append(
+                    _execute_ci(
+                        case, 3, xshape, wshape, dtype, kw, round_reference=False
+                    )
+                )
+            else:
+                _, w, b, ref, xk, _ = _prepare(
+                    3, xshape, wshape, dtype, kw, round_reference=False
+                )
+                out = flydsl_conv_implicit(xk, w, b, **kw)
+                rows.append(
+                    {
+                        "case": case,
+                        "gfx": get_gfx(),
+                        "x": str(xshape),
+                        "flydsl err": _compare(ref, out, case),
+                    }
+                )
+    return rows
+
+
+def test_block_rows_static(dtype, mode="perf"):
+    """Force static extents for all calls, restoring the module switch on failure."""
+    kw = {"padding": 1, **_KH8}
+    case = "2d_block_rows8_static"
+    with patch.object(conv_kernels, "AITER_CONV3D_DYN_HW", 0):
+        if mode == "ci":
+            return [
+                _execute_ci(
+                    case,
+                    2,
+                    (1, 96, 37, 70),
+                    _W2,
+                    dtype,
+                    kw,
+                    ref_kw={"padding": 1},
+                    bias=True,
+                )
+            ]
+        _, w, b, ref, xk, _ = _prepare(
+            2, (1, 96, 37, 70), _W2, dtype, kw, ref_kw={"padding": 1}, bias=True
+        )
+        with _capture_host_path(case):
+            out = flydsl_conv_implicit(xk, w, b, **kw)
+    return [{"case": case, "gfx": get_gfx(), "flydsl err": _compare(ref, out, case)}]
+
+
+# --- gfx1250 split-K contract ----------------------------------------------
+# The tuned row, the public entry and the AOT job used to derive split-K
+# independently, so a row could record one value while the kernel ran another.
+# The 2d_splitk2 case pins the gfx950 half of that contract; this one pins the
+# gfx1250 backend, where an output-row tail must fall back to 1 and an explicit
+# incompatible request must be rejected instead of silently replaced.
+_SPLITK_TILE = (128, 64, 2, 2)
+_SPLITK_BLOCK_ROWS = 8
+_SPLITK_CASES = (
+    # case, x (NCDHW), weight, padding, has an output-row tail
+    ("splitk_no_tail", (1, 64, 1, 8, 768), (64, 64, 1, 3, 3), (0, 1, 1), False),
+    ("splitk_row_tail", (1, 64, 1, 3, 2048), (64, 64, 1, 3, 3), (0, 1, 1), True),
+)
+
+
+def _splitk_checks(dtype, xshape, wshape, padding, has_tail):
+    """Return (label, ok) pairs from the shared resolver and the compile hook."""
+    from aiter.jit.utils.chip_info import get_cu_num
+    from aiter.ops.flydsl import conv3d_gfx1250
+
+    n, c, d, h, w = xshape
+    k, _, kt, kh, kw = wshape
+    cgp = -(-c // 32) * 32
+    ho = h + 2 * padding[1] - kh + 1
+    wo = w + 2 * padding[2] - kw + 1
+    npq = n * (d + 2 * padding[0] - kt + 1) * ho * wo
+    crs = cgp * kt * kh * kw
+    num_cu = get_cu_num()
+
+    def resolve(splitk, explicit, npq=npq, crs=crs, k=k, ho=ho, wo=wo):
+        return conv3d_gfx1250._resolve_splitk_gfx1250(
+            splitk,
+            npq,
+            crs,
+            k,
+            None,
+            _SPLITK_TILE,
+            1,
+            _SPLITK_BLOCK_ROWS,
+            ho,
+            wo,
+            explicit=explicit,
+            num_cu=num_cu,
+        )
+
+    # Flat resolution before the tail gate; the tail cases are only exercised
+    # when this is above 1.
+    flat = conv_kernels._resolve_splitk(
+        None, npq, crs, k, None, _SPLITK_TILE, 1, num_cu=num_cu
+    )
+    checks = []
+    if not has_tail:
+        checks.append(("explicit_kept", resolve(2, True) == 2))
+    if flat > 1:
+        want = 1 if has_tail else flat
+        checks.append((f"auto_{want}", resolve(None, False) == want))
+    if has_tail:
+        try:
+            resolve(3, True)
+        except AssertionError:
+            checks.append(("explicit_tail_rejected", True))
+        else:
+            checks.append(("explicit_tail_rejected", False))
+
+    # End to end: the value the kernel is compiled with, through the public
+    # entry the models call.
+    torch.manual_seed(0)
+    x = torch.randn(xshape, device="cuda", dtype=dtype)
+    weight = torch.randn(wshape, device="cuda", dtype=dtype)
+    captured = []
+    original = conv3d_gfx1250.compile_conv3d_implicit_gfx1250
+
+    def record(param, captured=captured, original=original):
+        captured.append(param)
+        return original(param)
+
+    requested = 1 if has_tail else 2
+    conv3d_gfx1250.compile_conv3d_implicit_gfx1250 = record
+    try:
+        flydsl_conv_implicit(
+            x,
+            weight,
+            tile=_SPLITK_TILE,
+            block_rows=_SPLITK_BLOCK_ROWS,
+            padding=padding,
+            splitk=requested,
+        )
+    finally:
+        conv3d_gfx1250.compile_conv3d_implicit_gfx1250 = original
+    checks.append(
+        (
+            f"kernel_splitk_{requested}",
+            bool(captured) and captured[-1].splitk == requested,
+        )
+    )
+    if has_tail:
+        conv3d_gfx1250.compile_conv3d_implicit_gfx1250 = record
+        try:
+            flydsl_conv_implicit(
+                x,
+                weight,
+                tile=_SPLITK_TILE,
+                block_rows=_SPLITK_BLOCK_ROWS,
+                padding=padding,
+                splitk=3,
+            )
+        except AssertionError:
+            rejected = True
+        else:
+            rejected = False
+        finally:
+            conv3d_gfx1250.compile_conv3d_implicit_gfx1250 = original
+        checks.append(("kernel_explicit_tail_rejected", rejected))
+    return checks
+
+
+def check_splitk_contract(dtype, mode="perf"):
+    """gfx1250-only: a requested split-K must be the compiled split-K."""
+    if not get_gfx().startswith("gfx1250"):
+        # The shared resolver and the compile hook below belong to the gfx1250
+        # backend; gfx950 derives split-K inside _implicit_param_from_problem.
+        aiter.logger.info(
+            "split-K contract is gfx1250-specific; skipping on %s", get_gfx()
+        )
+        return []
+    rows = []
+    for case, xshape, wshape, padding, has_tail in _SPLITK_CASES:
+        start = time.perf_counter()
+        try:
+            checks = _splitk_checks(dtype, xshape, wshape, padding, has_tail)
+            failed = [label for label, ok in checks if not ok]
             rows.append(
                 {
                     "case": case,
                     "gfx": get_gfx(),
-                    "x": "x".join(str(v) for v in xshape),
-                    "flydsl err": checkAllclose(
-                        ref, out.to(dtypes.fp32), msg=f"{case}: ", **TOL
-                    ),
+                    "mode": mode,
+                    "iterations": len(checks),
+                    "wall ms": (time.perf_counter() - start) * 1e3,
+                    "checks": ",".join(label for label, _ in checks),
+                    "failure": ",".join(failed) or None,
+                }
+            )
+        except Exception as exc:  # noqa: BLE001
+            rows.append(
+                {
+                    "case": case,
+                    "mode": mode,
+                    "iterations": 0,
+                    "wall ms": (time.perf_counter() - start) * 1e3,
+                    "failure": f"{type(exc).__name__}: {exc}",
                 }
             )
     return rows
-
-
-def test_block_rows_static(dtype):
-    """kH x kW reuse on the per-shape (static-extent) path, not dyn_hw.
-
-    AITER_CONV3D_DYN_HW is read when the module loads; _dyn_hw_ok reads the
-    module global per call, so flipping it here selects the static artifact.
-    """
-    torch.manual_seed(0)
-    x = torch.randn((1, 96, 37, 70), device="cuda", dtype=dtype)
-    w = torch.randn(_W2, device="cuda", dtype=dtype)
-    b = torch.randn(_W2[0], device="cuda", dtype=dtype)
-    kw = {"padding": 1, **_KH8}
-    saved = conv_kernels.AITER_CONV3D_DYN_HW
-    conv_kernels.AITER_CONV3D_DYN_HW = 0
-    try:
-        out = flydsl_conv_implicit(x, w, b, **kw)
-    finally:
-        conv_kernels.AITER_CONV3D_DYN_HW = saved
-    ref = _ref(x, w, b, 2, padding=1)
-    case = "2d_block_rows8_static"
-    return [
-        {
-            "case": case,
-            "gfx": get_gfx(),
-            "flydsl err": checkAllclose(
-                ref.to(dtypes.fp32), out.to(dtypes.fp32), msg=f"{case}: ", **TOL
-            ),
-        }
-    ]
 
 
 def summarize(title, rows):
     if not rows:  # every case in this sweep was filtered out by --cases
         return
     for row in rows:
+        if row.get("failure"):
+            _FAILED.append(f"{title}: {row['case']} -- {row['failure']}")
         err = row.get("flydsl err")
         if err is not None and err > ERR_TOL:
             _FAILED.append(f"{title}: {row['case']} -- {err:.2%} of elements mismatch")
     aiter.logger.info("%s:\n%s", title, pd.DataFrame(rows).to_markdown(index=False))
 
 
-def main():
-    if get_gfx() not in SUPPORTED_GFX:
-        aiter.logger.warning(
-            "flydsl_conv_implicit unsupported on %s; skipping", get_gfx()
-        )
-        return
+def selected_model_cases(args):
+    """Build model rows with unchanged N/C/K/T/filter/stride/padding semantics."""
+    rows = []
+    for res, frames in itertools.product(args.wan_res, args.wan_frames):
+        h, w = parse_res(res)
+        clip = f"{res}@{frames}f"
+        for case, xs, ws, calls in wan_vae_conv3d(h, w, frames):
+            if case in args.cases:
+                case_clip = clip
+                if (
+                    args.mode == "ci"
+                    and not args.wan_res_explicit
+                    and case == "conv_in"
+                ):
+                    _, xs, ws, calls = wan_vae_conv3d(368, 544, frames)[0]
+                    case_clip = f"368x544@{frames}f (exact tuned check)"
+                rows.append(
+                    (
+                        case,
+                        3,
+                        xs,
+                        ws,
+                        {"stride": 1, "padding": 0},
+                        calls,
+                        "Wan encode",
+                        case_clip,
+                    )
+                )
+        for source, builder in (
+            ("Wan auxiliary", wan_vae_aux),
+            ("Wan decode", wan_vae_decode),
+        ):
+            for case, _, xs, ws, stride, pad, calls in builder(h, w, frames):
+                if case in args.cases:
+                    rows.append(
+                        (
+                            case,
+                            len(ws) - 2,
+                            xs,
+                            ws,
+                            {"stride": stride, "padding": pad},
+                            calls,
+                            source,
+                            clip,
+                        )
+                    )
+    for res in args.qwen_res:
+        for case, xs, ws, stride, pad, calls in qwen_vae_conv2d(*parse_res(res)):
+            if case in args.cases:
+                rows.append(
+                    (
+                        case,
+                        2,
+                        xs,
+                        ws,
+                        {"stride": stride, "padding": pad},
+                        calls,
+                        "Qwen",
+                        res,
+                    )
+                )
+    return rows
 
-    p = argparse.ArgumentParser()
-    p.add_argument(
-        "-d",
-        "--dtype",
-        type=dtypes.str2Dtype,
-        nargs="*",
-        default=[dtypes.bf16],
-        help="the kernel is bf16-only; anything else is dropped with a warning",
+
+def _run_ci(args, dtype):
+    start = time.perf_counter()
+    rows = [
+        _execute_ci(case, rank, xs, ws, dtype, kw, ref_kw, bias)
+        for case, rank, xs, ws, kw, ref_kw, bias in KW_CASES
+        if case in args.cases
+    ]
+    for case, rank, xs, ws, kw, calls, source, clip in selected_model_cases(args):
+        row = _execute_ci(
+            case,
+            rank,
+            xs,
+            ws,
+            dtype,
+            kw,
+            bias=True,
+            require_tuned=case == "conv_in" and not args.wan_res_explicit,
+        )
+        row.update({"source": source, "clip": clip, "calls/pass": calls})
+        rows.append(row)
+    rows += test_artifact_key_isolation(dtype, mode="ci")
+    rows += test_block_rows_static(dtype, mode="ci")
+    rows += check_splitk_contract(dtype, mode="ci")
+    summarize("FlyDSL convolution correctness (mode=ci)", rows)
+    aiter.logger.info(
+        "mode=ci executed cases=%d checked iterations=%d warmup/case=%d "
+        "iterations/case=%d wall=%.3fs failed cases=%d; no performance measurement",
+        len(rows),
+        sum(row["iterations"] for row in rows),
+        CI_WARMUP,
+        CI_ITERATIONS,
+        time.perf_counter() - start,
+        sum(bool(row.get("failure")) for row in rows),
     )
-    p.add_argument(
-        "-c",
-        "--cases",
-        type=str,
-        nargs="*",
-        choices=ALL_CASES,
-        default=ALL_CASES,
-        metavar="CASE",
-        help=f"case labels to run (default: all {len(ALL_CASES)}). "
-        "An unknown label is rejected with the full list.",
-    )
-    p.add_argument(
-        "--wan-res",
-        nargs="*",
-        default=["480x832", "368x544"],
-        help="Wan clip HxW, multiples of 8. 480x832 is what the integration report "
-        "benchmarks and 368x544 what its 8-GPU training run feeds the VAE; "
-        "wan21_vae_bf16_tuned_conv3d.csv holds both. Any other size runs the same "
-        "shapes on a tile borrowed from the nearer of the two.",
-    )
-    p.add_argument(
-        "--wan-frames",
-        type=int,
-        nargs="*",
-        default=[81],
-        help="Wan clip lengths. Only the call counts change with this -- the shapes "
-        "are the same at 17 and 81 frames.",
-    )
-    p.add_argument(
-        "--qwen-res",
-        nargs="*",
-        default=["1024x1024", "1328x1328"],
-        help="Qwen-Image HxW, multiples of 8. qwenimage_vae_bf16_tuned_conv3d.csv "
-        "holds both defaults; any other legal size (1664x928, ...) runs the same 16 "
-        "shapes at different extents, on a tile borrowed from the nearer default.",
-    )
-    args = p.parse_args()
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    _load_backend()
     _FAILED.clear()
+    args.dtype = [dtypes.str2Dtype(d) for d in args.dtype]
 
     # The kernel asserts bf16 on entry, so drop the rest here instead of letting a
     # sweep die halfway through.
@@ -755,10 +1300,28 @@ def main():
         if d != dtypes.bf16:
             aiter.logger.warning("flydsl_conv_implicit is bf16-only; skipping %s", d)
     if not sweep_dtypes:
+        raise ValueError("no supported dtype selected; convolution requires bf16")
+    if get_gfx() not in SUPPORTED_GFX:
+        aiter.logger.warning(
+            "mode=%s flydsl_conv_implicit unsupported on %s; skipped, "
+            "executed cases=0",
+            args.mode,
+            get_gfx(),
+        )
         return
 
-    for dtype in sweep_dtypes:
+    for dtype in dict.fromkeys(sweep_dtypes):
         name = str(dtype).split(".")[-1]
+        if args.mode == "ci":
+            aiter.logger.info(
+                "mode=ci representative correctness; Wan resolutions=%s; "
+                "conv_in exact production-tuned check=%s (368x544 when enabled)",
+                args.wan_res,
+                "conv_in" in args.cases and not args.wan_res_explicit,
+            )
+            _run_ci(args, dtype)
+            continue
+        aiter.logger.info("mode=perf full selected matrix with performance statistics")
 
         rows = [
             test_conv_implicit(case, rank, xs, ws, dtype, kw, ref_kw, bias)
@@ -826,6 +1389,12 @@ def main():
         summarize(
             f"kH x kW reuse on the static-extent path ({name})",
             test_block_rows_static(dtype),
+        )
+        # gfx1250-only: the resolved split-K is invisible to every numerical
+        # case, so it needs its own assertion.
+        summarize(
+            f"gfx1250 split-K contract, requested vs compiled ({name})",
+            check_splitk_contract(dtype),
         )
 
     # After the tables, so a failure is read next to the numbers that produced it.
