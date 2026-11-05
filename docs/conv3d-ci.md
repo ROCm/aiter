@@ -20,6 +20,21 @@ the complete model performance matrix or change shared sharding, timing helpers,
 or production kernels. The numerical bar remains zero mismatched elements at
 `rtol=atol=2e-2`; non-finite results fail.
 
+On gfx1250 the same command runs five more checks, 24 cases in all:
+
+- two split-K contract cases;
+- three K-loop pipeline cases (`tile_k` 96 and 64, `num_buffers` 3 and 4, main-loop
+  unroll, one of them a small-tile K=3 config).
+
+The pipeline cases call the gfx1250 host directly, because the public entry does
+not take those knobs, and also assert that the requested config is the compiled
+one. The host-path spies hook the gfx1250 compile entry there and check that the
+explicit tile, `block_rows` and split-K reach the compiled param; gfx1250 has no
+im2col reuse plan. Measured on one MI450X (gfx1250, 256 CU), 24/24 passed:
+
+- with an empty FlyDSL cache, 33 s for the case loop (FlyDSL compilation included);
+- warm, 2.5 s.
+
 The explicit performance entry point is:
 
 ```bash
