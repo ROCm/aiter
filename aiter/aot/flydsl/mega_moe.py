@@ -19,12 +19,20 @@ the MoE replay this one runs in a process of its own, started with
 ``GPU_ARCHS`` naming gfx950 and ``AITER_AOT_REPLAY=1``. It is skipped when
 ``GPU_ARCHS`` names targets without gfx950.
 
+The MTPR 8192 jobs build the instance with the opt-in small- and large-input
+paths turned on (``AITER_MEGA_SMALL_M`` / ``AITER_MEGA_LARGE_M``), so the
+profiles those paths support also get their kernels; the runtime's own
+eligibility checks decide which profiles that is.
+
 Usage:
     # Every profile the service ships (DeepSeek-V4-Pro and Kimi-K3)
     python -m aiter.aot.flydsl.mega_moe
 
     # One custom profile
     python -m aiter.aot.flydsl.mega_moe --experts-per-rank 48 --mtpr 8192
+
+    # Check that a cache holds every kernel of the same jobs (compiles nothing)
+    python -m aiter.aot.flydsl.mega_moe --experts-per-rank 48 --mtpr 8192 --check
 """
 
 from __future__ import annotations
@@ -76,6 +84,9 @@ TOPK = 6
 MODEL_DIM = 7168
 INTER_DIM = 3072
 SWIGLU_LIMIT = 10.0
+# Instances of this MTPR also build the opt-in small- and large-input paths.
+FUSED_PATHS_MTPR = 8192
+FUSED_PATHS_ENV = {"AITER_MEGA_SMALL_M": "1", "AITER_MEGA_LARGE_M": "1"}
 
 
 def default_jobs(
@@ -225,7 +236,12 @@ def compile_one_config(**job):
     started = time.time()
     try:
         device = torch.device("cuda", job["rank"])
-        with dry_run(ARCH, NUM_CU, name=DEVICE_NAME), _fake_shmem(device):
+        fused_paths = FUSED_PATHS_ENV if job["mtpr"] == FUSED_PATHS_MTPR else {}
+        with (
+            mock.patch.dict(os.environ, fused_paths),
+            dry_run(ARCH, NUM_CU, name=DEVICE_NAME),
+            _fake_shmem(device),
+        ):
             # Imported only now: without mori, its stand-in must be in place.
             from aiter.ops.flydsl.kernels.mega_moe.mega_moe_v2 import MegaMoEV2
 
@@ -293,7 +309,15 @@ def main():
         choices=DEFAULT_QUANTS,
         default=list(DEFAULT_QUANTS),
     )
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="compile nothing; fail on any kernel the replay needs but the cache lacks",
+    )
     args = parser.parse_args()
+    if args.check:
+        # Every launch the replay reaches must load from the cache instead of compiling.
+        os.environ["FLYDSL_RUNTIME_RUN_ONLY"] = "1"
     if os.environ.get("AITER_AOT_REPLAY") != "1":
         raise SystemExit(run(sys.argv[1:]))
     check_replay_process(ARCH)
@@ -328,7 +352,8 @@ def main():
     results = run_jobs_parallel(compile_one_config, jobs)
     failed = sum(result["compile_time"] is None for result in results)
     print(
-        f"[aiter] FlyDSL MegaMoE replay: {len(results) - failed} ok, {failed} failed",
+        f"[aiter] FlyDSL MegaMoE {'cache check' if args.check else 'replay'}: "
+        f"{len(results) - failed} ok, {failed} failed",
         flush=True,
     )
     raise SystemExit(1 if failed else 0)

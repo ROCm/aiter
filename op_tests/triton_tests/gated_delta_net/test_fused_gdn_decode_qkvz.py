@@ -35,6 +35,8 @@ FP8_MAX = 448.0
 #   128  -> _decode_group,       4 warps
 #   256  -> _decode_group,       8 warps
 _BATCHES = [1, 32, 64, 127, 128, 256]
+# The recurrent state pool may be fp32 or bf16; the update runs in fp32 either way.
+_STATE_DTYPES = [torch.float32, torch.bfloat16]
 
 
 def split_qkvz(projected_qkvz, num_k_heads, num_v_heads, head_k_dim, head_v_dim):
@@ -173,7 +175,14 @@ def ref_gdn_decode(
 
 
 def make_inputs(
-    batch, num_k_heads=4, head_dim=128, num_slots=None, width=4, seed=0, ratio=2
+    batch,
+    num_k_heads=4,
+    head_dim=128,
+    num_slots=None,
+    width=4,
+    seed=0,
+    ratio=2,
+    state_dtype=torch.float32,
 ):
     """Build a self-consistent input set for the Qwen3-Next GDN decode contract.
 
@@ -206,7 +215,7 @@ def make_inputs(
             head_dim,
             dtype=torch.float32,
             device=device,
-        ),
+        ).to(state_dtype),
         "ssm_state_indices": torch.arange(
             1, batch + 1, dtype=torch.int32, device=device
         ),
@@ -346,11 +355,12 @@ def test_reference_bf16_and_fp8_are_consistent():
 
 
 @pytest.mark.parametrize("batch", _BATCHES)
-def test_fused_gdn_decode_correctness(batch):
+@pytest.mark.parametrize("state_dtype", _STATE_DTYPES)
+def test_fused_gdn_decode_correctness(batch, state_dtype):
     fused_gdn_decode_qkvz = _import_op()
     _requires_gfx950()
 
-    inp = make_inputs(batch)
+    inp = make_inputs(batch, state_dtype=state_dtype)
     ref_inp = {
         k: (v.clone() if isinstance(v, torch.Tensor) else v) for k, v in inp.items()
     }
@@ -401,11 +411,14 @@ _RATIO_TOPOLOGIES = [(16, 3), (8, 1), (4, 4)]
 
 @pytest.mark.parametrize("batch", _RATIO_BATCHES)
 @pytest.mark.parametrize("num_k_heads,ratio", _RATIO_TOPOLOGIES)
-def test_fused_gdn_decode_correctness_ratio(batch, num_k_heads, ratio):
+@pytest.mark.parametrize("state_dtype", _STATE_DTYPES)
+def test_fused_gdn_decode_correctness_ratio(batch, num_k_heads, ratio, state_dtype):
     fused_gdn_decode_qkvz = _import_op()
     _requires_gfx950()
 
-    inp = make_inputs(batch, num_k_heads=num_k_heads, ratio=ratio)
+    inp = make_inputs(
+        batch, num_k_heads=num_k_heads, ratio=ratio, state_dtype=state_dtype
+    )
     ref_inp = {
         k: (v.clone() if isinstance(v, torch.Tensor) else v) for k, v in inp.items()
     }
@@ -446,14 +459,19 @@ def test_fused_gdn_decode_correctness_ratio(batch, num_k_heads, ratio):
 
 @pytest.mark.parametrize("batch", [1, 64])
 @pytest.mark.parametrize("num_k_heads,ratio", [(16, 3), (4, 2), (8, 1), (4, 4)])
-def test_fused_gdn_decode_correctness_flat_layout(batch, num_k_heads, ratio):
+@pytest.mark.parametrize("state_dtype", _STATE_DTYPES)
+def test_fused_gdn_decode_correctness_flat_layout(
+    batch, num_k_heads, ratio, state_dtype
+):
     """Flat ``[q_all | k_all | v_all | z_all]`` packing (Qwen3.5/3.8 checkpoints)
     must match the reference run on the equivalent interleaved packing; ratio 2
     takes the ratio-generic kernel here instead of the generated pair kernels."""
     fused_gdn_decode_qkvz = _import_op()
     _requires_gfx950()
 
-    inp = make_inputs(batch, num_k_heads=num_k_heads, ratio=ratio)
+    inp = make_inputs(
+        batch, num_k_heads=num_k_heads, ratio=ratio, state_dtype=state_dtype
+    )
     ref_inp = {
         k: (v.clone() if isinstance(v, torch.Tensor) else v) for k, v in inp.items()
     }
@@ -493,8 +511,9 @@ def test_fused_gdn_decode_correctness_flat_layout(batch, num_k_heads, ratio):
 @pytest.mark.parametrize(
     "num_k_heads,ratio,qkvz_layout", [(16, 3, "flat"), (4, 2, "interleaved")]
 )
+@pytest.mark.parametrize("state_dtype", _STATE_DTYPES)
 def test_fused_gdn_decode_slot_strided_state_pools(
-    batch, conv_layout, num_k_heads, ratio, qkvz_layout
+    batch, conv_layout, num_k_heads, ratio, qkvz_layout, state_dtype
 ):
     """Serving engines carve the conv and recurrent states of a block out of one
     page, so the state tensors are strided along the slot dimension, and store
@@ -504,7 +523,9 @@ def test_fused_gdn_decode_slot_strided_state_pools(
     fused_gdn_decode_qkvz = _import_op()
     _requires_gfx950()
 
-    inp = make_inputs(batch, num_k_heads=num_k_heads, ratio=ratio)
+    inp = make_inputs(
+        batch, num_k_heads=num_k_heads, ratio=ratio, state_dtype=state_dtype
+    )
     slots = inp["conv_state"].shape[0]
     channels, width = inp["conv_state"].shape[1:]
     vh, vd, kd = inp["ssm_state"].shape[1:]
@@ -513,7 +534,7 @@ def test_fused_gdn_decode_slot_strided_state_pools(
     )
     ssm_pool = torch.randn(
         slots, vh * vd * kd + 1024, dtype=torch.float32, device=device
-    )
+    ).to(state_dtype)
     if conv_layout == "channel_major":
         conv_view = conv_pool[:, : channels * width].unflatten(1, (channels, width))
     else:
@@ -571,8 +592,9 @@ def test_fused_gdn_decode_slot_strided_state_pools(
 @pytest.mark.parametrize(
     "num_k_heads,ratio,qkvz_layout", [(16, 3, "flat"), (4, 2, "interleaved")]
 )
+@pytest.mark.parametrize("state_dtype", _STATE_DTYPES)
 def test_fused_gdn_decode_query_start_loc_padding(
-    batch, num_k_heads, ratio, qkvz_layout
+    batch, num_k_heads, ratio, qkvz_layout, state_dtype
 ):
     """CUDA-graph replay pads the batch: rows past the real requests have an
     empty query segment but their slot index is the null block or a stale live
@@ -580,7 +602,9 @@ def test_fused_gdn_decode_query_start_loc_padding(
     fused_gdn_decode_qkvz = _import_op()
     _requires_gfx950()
 
-    inp = make_inputs(batch, num_k_heads=num_k_heads, ratio=ratio)
+    inp = make_inputs(
+        batch, num_k_heads=num_k_heads, ratio=ratio, state_dtype=state_dtype
+    )
     live = batch - 3
     # Padded rows alias live slots (worst case) and the null slot 0.
     idx = inp["ssm_state_indices"].clone()
