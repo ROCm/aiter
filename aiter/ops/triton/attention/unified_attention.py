@@ -40,8 +40,12 @@ try:
     from aiter.ops.triton._gluon_kernels.gfx1250.attention.unified_attention_reduce import (
         reduce_segments_gluon as _reduce_segments_kernel_gfx1250,
     )
+    from aiter.ops.triton._gluon_kernels.gfx1250.attention.unified_attention_reduce import (
+        reduce_segments_split_gluon as _reduce_segments_split_kernel_gfx1250,
+    )
 except:  # noqa: E722
     _reduce_segments_kernel_gfx1250 = None
+    _reduce_segments_split_kernel_gfx1250 = None
 
 # gfx950
 try:
@@ -101,6 +105,20 @@ _GFX12_TOKEN_SPLIT_MAX_KV = int(
 # from the live seqused_k on every CUDA-graph replay. 13 calls a Qwen3.5 MTP-3 decode
 # step (10 layers + 3 draft passes): 117 kernels become 13.
 _GFX12_TOKEN_SPLIT_FUSED = os.environ.get("AITER_GFX12_TOKEN_SPLIT_FUSED", "0") == "1"
+# Opt-in (or unified_attention(split_reduce=True)): the gfx1250 decode / spec-decode
+# reduce of a split wider than the in-wave gluon reduce takes (the token split's 128-256
+# segments) runs reduce_segments_split_gluon instead of the Triton reduce_segments:
+# one program per (query token, head), the sequence from the token without a search,
+# only the live segments read, their partials by TDM through double-buffered LDS.
+# Qwen3.5 c=1024 verify (340 tokens, 16 heads, d 256, 10k-150k-token contexts,
+# 128-segment grid, ~12 live): 21 -> 7.7 us. Not bitwise the Triton reduce (another
+# fp32 summation order): ~0.005% of the bf16 outputs one rounding step apart.
+_GFX12_SPLIT_REDUCE = os.environ.get("AITER_GFX12_SPLIT_REDUCE", "0") == "1"
+# (SB segments a step, NUM_BUF LDS buffers, num_warps) of reduce_segments_split_gluon
+_GFX12_SPLIT_REDUCE_CONFIG = tuple(
+    int(x)
+    for x in os.environ.get("AITER_GFX12_SPLIT_REDUCE_CONFIG", "8,2,1").split(",")
+)
 
 
 def gfx12_token_split_constants():
@@ -499,6 +517,9 @@ def unified_attention(
     # output_rows[r] (every token still attends and its KV is read as usual).
     output_gate: torch.Tensor | None = None,
     output_rows: torch.Tensor | None = None,
+    # gfx1250: the split-KV reduce of decode / spec-decode verify (equal_seqlen_q)
+    # through reduce_segments_split_gluon; None follows AITER_GFX12_SPLIT_REDUCE.
+    split_reduce: bool | None = None,
 ):
     assert causal, "Only causal attention is supported"
 
@@ -805,7 +826,25 @@ def unified_attention(
             and backend == "gluon"
             and not epilogue
         )
-        if use_gluon_reduce:
+        if split_reduce is None:
+            split_reduce = _GFX12_SPLIT_REDUCE
+        if (
+            split_reduce
+            and not use_gluon_reduce
+            and is_reduce_split_gluon_available(params, NUM_SEGMENTS, backend)
+        ):
+            _reduce_segments_split_gfx1250(
+                params._replace(out=final_out),
+                segm_output,
+                segm_max,
+                segm_expsum,
+                NUM_SEGMENTS,
+                TILE_SIZE,
+                segm_tiles=segm_tiles,
+                output_gate=output_gate,
+                output_rows=output_rows,
+            )
+        elif use_gluon_reduce:
             if DEVICE_ARCH == "gfx1250":
                 _reduce_segments_gfx1250(
                     params,
@@ -928,6 +967,23 @@ def is_reduce_gluon_available(params: _UAParams, NUM_SEGMENTS, backend: str):
         )
 
     return use_gluon and use_gluon_arch
+
+
+def is_reduce_split_gluon_available(params: _UAParams, NUM_SEGMENTS, backend: str):
+    """reduce_segments_split_gluon: gfx1250, every sequence the same query length
+    (decode or spec-decode verify), head size = value head size, a power of 2."""
+    _, _, num_warps = _GFX12_SPLIT_REDUCE_CONFIG
+    d = params.head_size_v
+    return (
+        DEVICE_ARCH == "gfx1250"
+        and backend == "gluon"
+        and _reduce_segments_split_kernel_gfx1250 is not None
+        and (params.all_decode or params.spec_decode)
+        and d == params.head_size
+        and d & (d - 1) == 0
+        and d % (32 * num_warps) == 0
+        and triton.next_power_of_2(NUM_SEGMENTS) == NUM_SEGMENTS
+    )
 
 
 def _unified_attention_2d_triton(params: _UAParams):
@@ -1465,6 +1521,50 @@ def _reduce_segments_gfx1250(
         num_warps=gluon_num_warps,
         **config,
         enable_fp_fusion=True,
+    )
+
+
+def _reduce_segments_split_gfx1250(
+    params: _UAParams,
+    segm_output,
+    segm_max,
+    segm_expsum,
+    NUM_SEGMENTS,
+    TILE_SIZE,
+    segm_tiles=None,
+    output_gate=None,
+    output_rows=None,
+):
+    num_rows = params.num_tokens if output_rows is None else output_rows.shape[0]
+    if num_rows == 0:
+        return
+    sb, num_buf, num_warps = _GFX12_SPLIT_REDUCE_CONFIG
+    _reduce_segments_split_kernel_gfx1250[(num_rows, params.num_query_heads)](
+        params.out,
+        segm_output,
+        segm_max,
+        segm_expsum,
+        params.seqused_k,
+        params.num_seqs,
+        segm_tiles,
+        params.output_scale,
+        output_gate,
+        output_gate.stride(0) if output_gate is not None else 0,
+        output_rows,
+        params.out.stride(0),
+        params.out.stride(1),
+        H=params.num_query_heads,
+        S=NUM_SEGMENTS,
+        D=params.head_size_v,
+        TILE_SIZE=TILE_SIZE,
+        SEQLEN_Q=1 if params.all_decode else int(params.max_seqlen_q),
+        SB=min(sb, NUM_SEGMENTS),
+        NUM_BUF=num_buf,
+        NUM_WARPS=num_warps,
+        IS_FP8_OUT=(params.out.dtype == e4m3_dtype),
+        FP8_MIN=torch.finfo(e4m3_dtype).min,
+        FP8_MAX=torch.finfo(e4m3_dtype).max,
+        num_warps=num_warps,
     )
 
 

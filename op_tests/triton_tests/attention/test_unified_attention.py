@@ -1569,3 +1569,121 @@ def test_gfx12_token_split_tiles_precomputed(batch, seed, block_size, monkeypatc
     monkeypatch.setattr(ua, "_gfx12_token_split_tiles_fused", computed)
     out = run(gfx12_token_split_tiles=(tiles, block_size, 1))
     assert torch.equal(out, ref)
+
+
+@pytest.mark.parametrize("gate, select", [(False, False), (True, False), (True, True)])
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        # MTP-3 verify rows, the token split's 128-segment grid, 2-40 live a sequence
+        [(4, 41000), (4, 9000), (4, 23456), (4, 130), (4, 65000), (4, 2049)] * 2,
+        # drafter decode, one row a sequence
+        [(1, 41000), (1, 9001), (1, 23456), (1, 3), (1, 65000), (1, 2049)] * 2,
+    ],
+)
+@torch.inference_mode()
+def test_unified_attn_split_reduce_k4v8(
+    seq_lens, gate: bool, select: bool, monkeypatch
+):
+    """reduce_segments_split_gluon (split_reduce=True) against the Triton
+    reduce_segments it replaces, on the 3D kernel's own partials under the gfx1250
+    token split (AITER_GFX12_TOKEN_SPLIT; MIN_TILES 16 / MAX_TILES 128 as Qwen3.5
+    runs it). Another fp32 summation order, so not bitwise: the bf16 outputs match
+    to within 2 ulps of the output (1e-6 of the values that differ), and the gate /
+    row-selection epilogue is bitwise the Triton reduce's epilogue applied to the
+    new reduce."""
+    if DEVICE_ARCH != "gfx1250":
+        pytest.skip("A8K4V8 runs on the gfx1250 Gluon kernels")
+    from op_tests.op_benchmarks.triton import bench_unified_attention as bench
+
+    module = sys.modules[unified_attention.__module__]
+    monkeypatch.setattr(module, "_GFX12_TOKEN_SPLIT", True)
+    monkeypatch.setattr(module, "_GFX12_TOKEN_SPLIT_MIN_TILES", 16)
+    monkeypatch.setattr(module, "_GFX12_TOKEN_SPLIT_MAX_TILES", 128)
+    monkeypatch.setattr(module, "use_2d_kernel", lambda params, backend="triton": False)
+    torch.manual_seed(0)
+    block_size, head_size, num_heads = 128, 256, (16, 2)
+    num_blocks = sum((k + block_size - 1) // block_size for _, k in seq_lens) + 16
+    inp = bench.make_inputs(
+        seq_lens=seq_lens,
+        num_heads=num_heads,
+        head_size_qk=head_size,
+        head_size_v=head_size,
+        block_size=block_size,
+        num_blocks=num_blocks,
+        fp8_q=True,
+        fp8_kv=True,
+        fp8_output=False,
+        out_scale_value=1.0,
+        nvfp4_kv=True,
+        nvfp4_v=False,
+    )
+    value_cache = shuffle_kv_cache(inp["k_fp8"], inp["v_fp8"])[1]
+    tokens = inp["q_fp8"].shape[0]
+    width = num_heads[0] * head_size
+    kw = {}
+    rows_out = tokens
+    if gate:
+        qkvg = 3 * torch.randn(
+            tokens, 2 * width + 512, dtype=torch.bfloat16, device="cuda"
+        )
+        kw["output_gate"] = qkvg[:, :width]
+    if select:
+        kw["output_rows"] = (inp["cu_query_lens"][1:] - 1).to(torch.int64)
+        rows_out = len(seq_lens)
+
+    def run(split_reduce):
+        out = torch.full(
+            (rows_out, num_heads[0], head_size),
+            float("nan"),
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        unified_attention(
+            q=inp["q_fp8"],
+            k=inp["k_nvfp4"],
+            v=value_cache,
+            out=out,
+            cu_seqlens_q=inp["cu_query_lens"],
+            seqused_k=inp["kv_lens"],
+            max_seqlen_q=inp["max_query_len"],
+            max_seqlen_k=inp["max_kv_len"],
+            softmax_scale=inp["scale"],
+            causal=True,
+            window_size=(-1, -1),
+            block_table=inp["block_tables"],
+            softcap=0,
+            q_descale=inp["q_descale"],
+            k_descale=inp["k_descale"],
+            v_descale=inp["v_descale"],
+            shuffled_kv_cache=True,
+            equal_seqlen_q=True,
+            backend="gluon",
+            split_reduce=split_reduce,
+            **kw,
+        )
+        return out
+
+    calls = []
+    kernel = module._reduce_segments_split_kernel_gfx1250
+
+    class _Spy:
+        def __getitem__(self, grid):
+            calls.append(grid)
+            return kernel[grid]
+
+    monkeypatch.setattr(module, "_reduce_segments_split_kernel_gfx1250", _Spy())
+    old = run(False)
+    assert not calls
+    new = run(True)
+    assert calls, "split_reduce=True did not take reduce_segments_split_gluon"
+    assert not new.isnan().any()
+    a, b = old.float(), new.float()
+    differ = a != b
+    # a different fp32 summation order flips the bf16 rounding of a few outputs
+    assert differ.float().mean().item() < 1e-3
+    assert torch.allclose(a, b, rtol=2 * 2**-8, atol=1e-5)
+    print(
+        f"split reduce vs Triton reduce: {int(differ.sum())}/{differ.numel()} outputs"
+        f" differ, max |diff| {(a - b).abs().max().item():.3g}"
+    )
