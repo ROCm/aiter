@@ -2139,73 +2139,9 @@ def gen_bmm_mxscale_mouter_tunable_instance(
     )
 
 
-# ---- pipeline (kids 150/158/151/152) ----
-# Dual bf16/fp32 traits (output dtype baked into the traits tuple slot 3),
-# non-splitk scale kargs, BLOCK_SIZE 512. Flags pick one of four scale kernels.
-_BMM_PIPELINE_LAUNCHER_BODY = r"""
-#if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
-// mmajor: O/Y are [M, batch, *] (dim0=M, dim1=batch); wo_a stays batch-major.
-// splitK must be 1 (checked by caller). Caller does dtype/arch/common checks.
-template <typename D_C>
-void
-@@NAME@@(
-    aiter_tensor_t &O,
-    aiter_tensor_t &wo_a,
-    aiter_tensor_t &Y,
-    aiter_tensor_t &x_scale,
-    aiter_tensor_t &w_scale,
-    std::optional<aiter_tensor_t> workspace,
-    int splitK)
-{
-  using Bf16Traits = @@NAME@@_Bf16Traits;
-  using Fp32Traits = @@NAME@@_Fp32Traits;
-  AITER_CHECK(splitK == 1, "@@NAME@@ requires splitK == 1");
-  AITER_CHECK(!workspace.has_value(), "@@NAME@@ does not use workspace");
-  const int M = O.size(0);
-  const int batch = O.size(1);
-  const int N = wo_a.size(1);
-  const int K = O.size(2);
-  // No M alignment requirement: the kernel bounds its A / sfa / C buffers to the
-  // tile's valid row window, so a partial trailing M tile is masked by buffer OOB.
-  AITER_CHECK(N % Bf16Traits::B_N == 0,
-              "@@NAME@@ requires N % ", Bf16Traits::B_N, " == 0, got ", N);
-  AITER_CHECK(K % Bf16Traits::B_K == 0,
-              "@@NAME@@ requires K % ", Bf16Traits::B_K, " == 0, got ", K);
-@@PRELOAD_CHECK@@
-  opus_gemm_scale_kargs_gfx950 kargs{};
-  kargs.ptr_a = O.data_ptr();
-  kargs.ptr_b = wo_a.data_ptr();
-  kargs.ptr_c = Y.data_ptr();
-  kargs.m = M;
-  kargs.n = N;
-  kargs.k = K;
-  kargs.batch = batch;
-  kargs.stride_a = (int)O.stride(0);
-  kargs.stride_b = (int)wo_a.stride(1);
-  kargs.stride_c = (int)Y.stride(0);
-  kargs.stride_a_batch = (int)O.stride(1);
-  kargs.stride_b_batch = (int)wo_a.stride(0);
-  kargs.stride_c_batch = (int)Y.stride(1);
-  kargs.ptr_sfa = x_scale.data_ptr();
-  kargs.ptr_sfb = w_scale.data_ptr();
-  kargs.stride_sfa = (int)x_scale.stride(0);
-  kargs.stride_sfa_batch = (int)x_scale.stride(1);
-  kargs.stride_sfb = (int)w_scale.stride(1);
-  kargs.stride_sfb_batch = (int)w_scale.stride(0);
-
-  const int num_tiles_m = (M + Bf16Traits::B_M - 1) / Bf16Traits::B_M;
-  const int num_tiles_n = N / Bf16Traits::B_N;
-  dim3 grid_main(num_tiles_m * num_tiles_n, 1, batch);
-  dim3 block_main(Bf16Traits::BLOCK_SIZE);
-  auto stream = aiter::getCurrentHIPStream();
-  if (Y.dtype() == AITER_DTYPE_bf16) {
-    @@KERNEL@@<Bf16Traits><<<grid_main, block_main, 0, stream>>>(kargs);
-  } else {
-    @@KERNEL@@<Fp32Traits><<<grid_main, block_main, 0, stream>>>(kargs);
-  }
-}
-#endif // launcher only on regular host pass
-"""
+# Body of the a8w8_mxscale BMM dual-traits (Bf16/Fp32) pipeline launcher lives
+# in codegen/templates/gfx950_bmm_mxscale_pipeline_launcher.cuh.j2, rendered via
+# render_template() in gen_bmm_mxscale_pipeline_instance.
 
 
 def _bmm_pipeline_dual_traits_alias(k, traits_name):
@@ -2253,10 +2189,11 @@ def gen_bmm_mxscale_pipeline_instance(
             f'              "{k.name} preloads the scale panel into LDS and '
             'so requires K <= ", Bf16Traits::SF_PRELOAD_K_MAX, ", got ", K);\n'
         )
-    launcher = (
-        _BMM_PIPELINE_LAUNCHER_BODY.replace("@@NAME@@", k.name)
-        .replace("@@KERNEL@@", real_kernel)
-        .replace("@@PRELOAD_CHECK@@", preload_check)
+    launcher = render_template(
+        "gfx950_bmm_mxscale_pipeline_launcher.cuh.j2",
+        name=k.name,
+        kernel=real_kernel,
+        preload_check=preload_check,
     )
 
     traits_aliases = _bmm_pipeline_dual_traits_alias(k, traits_name)
