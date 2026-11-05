@@ -19,7 +19,6 @@ from codegen.common import (
     _NOSPLIT,
     _SPLITK,
     get_arch_map,
-    open_if_changed,
     prune_unwritten,
     reset_written_paths,
     write_if_changed,
@@ -634,106 +633,68 @@ class opus_gemm_codegen:
 
     def gen_a16w16_kid_dispatch(self, kernels_dict):
         """Emit per-arch A16W16 direct and workspace launcher tables."""
-        HEADER = """#pragma once
-// SPDX-License-Identifier: MIT
-// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
-//
-// Auto-generated. Do not edit. See gen_instances.py:gen_a16w16_kid_dispatch.
-//
-// Per-arch sorted flat arrays for strict kid dispatch.  Non-workspace tables
-// contain five-argument OpusA16W16Kernel pointers.  Workspace tables contain
-// six-argument OpusA16W16WorkspaceKernel pointers. Never combine them with
-// the five-argument table.
-"""
-        NON_WORKSPACE_ENTRY = """\
-    {{ {kid}, &{kernel_name}<CTYPE> }},  \\
-"""
-        WORKSPACE_ENTRY = """\
-    {{ {kid}, &{kernel_name}<fp32_t> }},  \\
-"""
 
-        def _write_rows(f, macro_name, rows, entry, function_like=False):
-            f.write(f"#define {macro_name}_SIZE {len(rows)}\n")
-            macro_suffix = "(CTYPE)" if function_like else ""
-            if not rows:
-                f.write(f"#define {macro_name}{macro_suffix}\n\n")
-                return
-            f.write(f"#define {macro_name}{macro_suffix} \\\n")
-            for index, (kid, name) in enumerate(rows):
-                line = entry.format(
-                    kid=f"{{ {kid.cu_num}, {kid.kid} }}", kernel_name=name
-                )
-                if index == len(rows) - 1:
-                    line = line.rstrip().rstrip("\\").rstrip() + "\n"
-                f.write(line)
-            f.write("\n")
+        def _row(kid, name, ctype):
+            return "{ { %d, %d }, &%s<%s> }" % (kid.cu_num, kid.kid, name, ctype)
 
-        def _emit_non_workspace_map(f, arch, ctype):
+        def _collect(arch, negate_splitk, ctype):
             rows = []
             for kid, k in kernels_dict.items():
                 if not (
                     isinstance(kid, KernelKey)
                     and k.kernel_tag in A16W16_KID_DISPATCH_TAGS
                 ):
-                    continue
-                if kid.gfx != arch or k.kernel_tag in SPLITK_TAGS:
-                    continue
-                if ctype not in k.output_dtypes:
                     continue
                 if kid.gfx != arch:
                     continue
+                in_splitk = k.kernel_tag in SPLITK_TAGS
+                if in_splitk == negate_splitk:
+                    continue
+                if ctype not in k.output_dtypes:
+                    if not negate_splitk:
+                        raise ValueError(
+                            f"workspace kid {kid} ({k.name}) has no fp32_t host "
+                            "specialization"
+                        )
+                    continue
                 rows.append((kid, k.name))
             rows.sort(key=lambda r: r[0])
-            dtype_suffix = "BF16" if ctype == "bf16_t" else "FP32"
-            macro_name = (
-                "GENERATE_A16W16_NONWORKSPACE_KID_DISPATCH_"
-                f"{arch.upper()}_{dtype_suffix}"
+            return rows
+
+        maps = []
+        for arch in SPLITK_REDUCE_ARCHES:
+            for ctype in ("bf16_t", "fp32_t"):
+                rows = _collect(arch, True, ctype)
+                dtype_suffix = "BF16" if ctype == "bf16_t" else "FP32"
+                maps.append(
+                    {
+                        "macro": (
+                            "GENERATE_A16W16_NONWORKSPACE_KID_DISPATCH_"
+                            f"{arch.upper()}_{dtype_suffix}"
+                        ),
+                        "func_like": True,
+                        "rows": [_row(kid, name, "CTYPE") for kid, name in rows],
+                    }
+                )
+            ws_rows = _collect(arch, False, "fp32_t")
+            maps.append(
+                {
+                    "macro": f"GENERATE_A16W16_WORKSPACE_KID_DISPATCH_{arch.upper()}",
+                    "func_like": False,
+                    "rows": [_row(kid, name, "fp32_t") for kid, name in ws_rows],
+                }
             )
-            _write_rows(f, macro_name, rows, NON_WORKSPACE_ENTRY, function_like=True)
 
-        def _emit_workspace_map(f, arch):
-            rows = []
-            for kid, k in kernels_dict.items():
-                if not (
-                    isinstance(kid, KernelKey)
-                    and k.kernel_tag in A16W16_KID_DISPATCH_TAGS
-                ):
-                    continue
-                if kid.gfx != arch or k.kernel_tag not in SPLITK_TAGS:
-                    continue
-                if "fp32_t" not in k.output_dtypes:
-                    raise ValueError(
-                        f"workspace kid {kid} ({k.name}) has no fp32_t host "
-                        "specialization"
-                    )
-                rows.append((kid, k.name))
-            rows.sort(key=lambda r: r[0])
-            macro_name = f"GENERATE_A16W16_WORKSPACE_KID_DISPATCH_{arch.upper()}"
-            _write_rows(f, macro_name, rows, WORKSPACE_ENTRY)
-
-        with open_if_changed(
-            os.path.join(self.working_path, "opus_gemm_a16w16_kid_dispatch.h")
-        ) as f:
-            f.write(HEADER)
-            for arch in SPLITK_REDUCE_ARCHES:
-                _emit_non_workspace_map(f, arch, "bf16_t")
-                _emit_non_workspace_map(f, arch, "fp32_t")
-                _emit_workspace_map(f, arch)
+        write_if_changed(
+            os.path.join(self.working_path, "opus_gemm_a16w16_kid_dispatch.h"),
+            render_template("opus_gemm_a16w16_kid_dispatch.h.j2", maps=maps),
+        )
 
     def gen_a8w8_kid_dispatch(self, kernels_dict):
         """Emit sorted A8W8 launcher tables for each interface."""
-        header = """#pragma once
-// SPDX-License-Identifier: MIT
-// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
-//
-// Auto-generated. Do not edit. See gen_instances.py:gen_a8w8_kid_dispatch.
-//
-// Interfaces remain separate even when argument counts match. Missing kernels
-// use a size-0 table.
-"""
-        entry = """\
-    {{ {kid}, &{kernel_name}<{ctype}> }},  \\
-"""
+
+        def _row(kid, name, ctype):
+            return "{ { %d, %d }, &%s<%s> }" % (kid.cu_num, kid.kid, name, ctype)
 
         def _rows(arch, tags, ctype):
             rows = []
@@ -744,113 +705,66 @@ class opus_gemm_codegen:
                     continue
                 rows.append((kid, k.name))
             rows.sort(key=lambda row: row[0])
-            return rows
+            return [_row(kid, name, ctype) for kid, name in rows]
 
-        def _emit_map(f, macro_name, rows, ctype):
-            f.write(f"#define {macro_name}_SIZE {len(rows)}\n")
-            if not rows:
-                f.write(f"#define {macro_name}\n\n")
-                return
-            f.write(f"#define {macro_name} \\\n")
-            for index, (kid, name) in enumerate(rows):
-                line = entry.format(
-                    kid=f"{{ {kid.cu_num}, {kid.kid} }}", kernel_name=name, ctype=ctype
+        maps = [
+            {
+                "macro": "GENERATE_A8W8_NOSCALE_KID_DISPATCH_GFX950",
+                "func_like": False,
+                "rows": _rows("gfx950", {"a8w8"}, "fp32_t"),
+            },
+            {
+                "macro": "GENERATE_A8W8_BLOCKSCALE_KID_DISPATCH_GFX950",
+                "func_like": False,
+                "rows": _rows("gfx950", {"a8w8_scale"}, "fp32_t"),
+            },
+        ]
+        for arch in SPLITK_REDUCE_ARCHES:
+            for ctype, dtype_suffix in (("bf16_t", "BF16"), ("fp32_t", "FP32")):
+                maps.append(
+                    {
+                        "macro": (
+                            "GENERATE_A8W8_BLOCKSCALE_BPRESHUFFLE_KID_DISPATCH_"
+                            f"{arch.upper()}_{dtype_suffix}"
+                        ),
+                        "func_like": False,
+                        "rows": _rows(arch, A8W8_BPRESHUFFLE_TAGS, ctype),
+                    }
                 )
-                if index == len(rows) - 1:
-                    line = line.rstrip().rstrip("\\").rstrip() + "\n"
-                f.write(line)
-            f.write("\n")
 
-        with open_if_changed(
-            os.path.join(self.working_path, "opus_gemm_a8w8_kid_dispatch.h")
-        ) as f:
-            f.write(header)
-            _emit_map(
-                f,
-                "GENERATE_A8W8_NOSCALE_KID_DISPATCH_GFX950",
-                _rows("gfx950", {"a8w8"}, "fp32_t"),
-                "fp32_t",
-            )
-            _emit_map(
-                f,
-                "GENERATE_A8W8_BLOCKSCALE_KID_DISPATCH_GFX950",
-                _rows("gfx950", {"a8w8_scale"}, "fp32_t"),
-                "fp32_t",
-            )
-            for arch in SPLITK_REDUCE_ARCHES:
-                for ctype, dtype_suffix in (
-                    ("bf16_t", "BF16"),
-                    ("fp32_t", "FP32"),
-                ):
-                    macro_name = (
-                        "GENERATE_A8W8_BLOCKSCALE_BPRESHUFFLE_KID_DISPATCH_"
-                        f"{arch.upper()}_{dtype_suffix}"
-                    )
-                    _emit_map(
-                        f,
-                        macro_name,
-                        _rows(arch, A8W8_BPRESHUFFLE_TAGS, ctype),
-                        ctype,
-                    )
+        write_if_changed(
+            os.path.join(self.working_path, "opus_gemm_a8w8_kid_dispatch.h"),
+            render_template("opus_gemm_a8w8_kid_dispatch.h.j2", maps=maps),
+        )
 
     def gen_bmm_mxscale_kid_dispatch(self, kernels_dict):
         """Emit exact (CU, local kid) routes for gfx950 MXFP8 BMM launchers."""
-        header = """#pragma once
-// SPDX-License-Identifier: MIT
-// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
-// Auto-generated. Do not edit.
-"""
-        entry = """\
-    {{ {kid}, &{kernel_name}<CTYPE> }},  \\
-"""
-
-        # The scale-shape check runs before the kid is dispatched, and what shape
-        # is correct depends on the kid: GROUP_N and GROUP_K are 128 or 32. So
-        # the table below travels with the dispatch table rather than the check
-        # hardcoding 128, which is what rejected the first GROUP_K=32 launch.
-        group_entry = """\
-    {{ {kid}, {{ {group_n}, {group_k} }} }},  \\
-"""
-
         rows = sorted(
             (kid, instance.name, instance.GROUP_N, instance.GROUP_K)
             for kid, instance in kernels_dict.items()
             if kid.family == "a8w8_mxscale_bmm" and "fp32_t" in instance.output_dtypes
         )
-
-        def emit(f, macro, fmt, fields):
-            f.write(f"#define {macro} \\\n")
-            for index, row in enumerate(rows):
-                line = fmt.format(**fields(row))
-                if index == len(rows) - 1:
-                    line = line.rstrip().rstrip("\\").rstrip() + "\n"
-                f.write(line)
-            f.write("\n")
-
-        with open_if_changed(
-            os.path.join(self.working_path, "opus_bmm_mxscale_kid_dispatch.h")
-        ) as f:
-            f.write(header)
-            f.write(f"#define GENERATE_BMM_MXSCALE_KID_DISPATCH_SIZE {len(rows)}\n")
-            emit(
-                f,
-                "GENERATE_BMM_MXSCALE_KID_DISPATCH(CTYPE)",
-                entry,
-                lambda r: {
-                    "kid": f"{{ {r[0].cu_num}, {r[0].kid} }}",
-                    "kernel_name": r[1],
-                },
-            )
-            emit(
-                f,
-                "GENERATE_BMM_MXSCALE_KID_GROUPS",
-                group_entry,
-                lambda r: {
-                    "kid": f"{{ {r[0].cu_num}, {r[0].kid} }}",
-                    "group_n": r[2],
-                    "group_k": r[3],
-                },
-            )
+        dispatch = [
+            "{ { %d, %d }, &%s<CTYPE> }" % (kid.cu_num, kid.kid, name)
+            for kid, name, _gn, _gk in rows
+        ]
+        # The scale-shape check runs before the kid is dispatched, and what shape
+        # is correct depends on the kid: GROUP_N and GROUP_K are 128 or 32. So
+        # the table below travels with the dispatch table rather than the check
+        # hardcoding 128, which is what rejected the first GROUP_K=32 launch.
+        groups = [
+            "{ { %d, %d }, { %d, %d } }" % (kid.cu_num, kid.kid, gn, gk)
+            for kid, _name, gn, gk in rows
+        ]
+        write_if_changed(
+            os.path.join(self.working_path, "opus_bmm_mxscale_kid_dispatch.h"),
+            render_template(
+                "opus_bmm_mxscale_kid_dispatch.h.j2",
+                size=len(rows),
+                dispatch=dispatch,
+                groups=groups,
+            ),
+        )
 
     def gen_manifest_head(self, kernels_dict):
         # Forward declarations for every launcher symbol the dispatcher references.
