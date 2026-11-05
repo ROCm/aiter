@@ -337,6 +337,8 @@ class RunnerTests(unittest.TestCase):
         ), patch.object(
             script, "aiter", SimpleNamespace(logger=logger), create=True
         ), patch.object(
+            script, "get_gfx", lambda: "gfx950", create=True
+        ), patch.object(
             script, "summarize", lambda title, rows: tables.extend(rows)
         ):
             script._run_ci(script.parse_args([]), "fake_bf16")

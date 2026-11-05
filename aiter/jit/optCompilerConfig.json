@@ -717,9 +717,8 @@
             "f'{AITER_CSRC_DIR}/kernels/mla/opus/gfx950/mla_v41_prefill_a8w4_16mx1_16nx4.hpp'",
             "f'{AITER_CSRC_DIR}/kernels/mla/opus/gfx950/mla_v41_prefill_a8w8_16mx1_16nx4.hpp'",
             "f'{AITER_CSRC_DIR}/kernels/mla/opus/gfx950/mla_global_load.hpp'",
-            "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_v4_prefill_kargs.h'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_prefill_kargs.h'",
             "f'{AITER_CSRC_DIR}/kernels/mla/opus/gfx950/mla_v4_prefill_traits.h'",
-            "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_v41_prefill_kargs.h'",
             "f'{AITER_CSRC_DIR}/kernels/mla/opus/gfx950/mla_v41_prefill_traits.h'",
             "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_prefill_split.h'"
         ],
@@ -1491,6 +1490,22 @@
         "torch_exclude": "True",
         "blob_gen_cmd": [
             "f'{AITER_META_DIR}/hsa/codegen.py -m fmha_fwd_bf16_varlen --output_dir {{}}'"
+        ]
+    },
+    "module_fmha_fwd_fp8_varlen_asm": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_fmha_fwd_fp8_varlen.cu'"
+        ],
+        "flags_extra_cc": [
+            "'-DENABLE_CK=0'"
+        ],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": [
+            "f'{AITER_META_DIR}/hsa/codegen.py -m fmha_fwd_fp8_varlen --output_dir {{}}'"
         ]
     },
     "module_fmha_fwd_mxfp8_asm": {
