@@ -58,6 +58,7 @@ __all__ = [
     "load_i64_from_buffer",
     "load_i64_global",
     "load_v4i32_nt",
+    "memrealtime",
     "spin_until_eq_i32",
     "spin_until_ge_i32_agent",
     "spin_until_ge_i32_system",
@@ -86,6 +87,7 @@ __all__ = [
 _TAGGED_POLL_MAX = 12
 CACHE_DEVICE = 16
 CACHE_SYSTEM = 17
+DIAG_TICKS = 10 * 100_000_000
 
 
 def buffer_resource(address):
@@ -110,11 +112,48 @@ def _spin_tagged(load_all, pending):
     return values
 
 
-class TaggedMailbox:
-    """Transfer 32-bit values with an adjacent launch tag."""
+def memrealtime():
+    """Read the AMD 100 MHz device timer for bounded diagnostics."""
+    return fx.Int64(llvm.call_intrinsic(T.i64, "llvm.amdgcn.s.memrealtime", [], [], []))
 
-    def __init__(self, tag):
+
+@ASTRewriter.transform
+def _spin_tagged_bounded(load_all, pending, on_timeout):
+    """Poll for at most ``DIAG_TICKS`` and record a diagnostic on timeout."""
+    start = memrealtime()
+    values = load_all()
+    late = fx.Int32(0)
+    while pending(values) & (late == 0):
+        fx.rocdl.s_sleep(1)
+        values = load_all()
+        late = (memrealtime() - start > DIAG_TICKS).select(fx.Int32(1), fx.Int32(0))
+    if late != 0:
+        on_timeout()
+    return values
+
+
+class TaggedMailbox:
+    """Transfer naturally aligned 32-bit values with adjacent launch tags.
+
+    A payload and tag form one 8-byte pair and are written by one vector store.
+    ``pair_layout`` preserves this alignment; splitting or widening a pair would
+    remove the atomic hand-off that makes a separate release fence unnecessary.
+    """
+
+    def __init__(
+        self,
+        tag,
+        *,
+        debug=False,
+        epoch_addresses=None,
+        expected_epoch=None,
+        diagnostic=None,
+    ):
         self.tag = tag + 1
+        self.debug = debug
+        self.epoch_addresses = epoch_addresses
+        self.expected_epoch = expected_epoch
+        self.diagnostic = diagnostic
 
     def put(self, address, index, value):
         bits = (
@@ -171,7 +210,25 @@ class TaggedMailbox:
                 stale = stale | (values[index] != tag)
             return stale
 
-        values = _spin_tagged(load_all, pending)
+        if self.debug and self.epoch_addresses is not None:
+
+            def on_timeout():
+                missing = fx.Int32(0)
+                for rank, address in enumerate(self.epoch_addresses):
+                    seen = buffer_load_i32(address, 0, cache_modifier=CACHE_SYSTEM)
+                    missing = missing | (seen < self.expected_epoch).select(
+                        1 << rank, 0
+                    )
+                bo.buffer_store(
+                    missing,
+                    buffer_resource(self.diagnostic),
+                    2,
+                    cache_modifier=CACHE_DEVICE,
+                )
+
+            values = _spin_tagged_bounded(load_all, pending, on_timeout)
+        else:
+            values = _spin_tagged(load_all, pending)
         out, index = [], 0
         for _, _, count in specs:
             out.append([values[index + 2 * item] for item in range(count)])

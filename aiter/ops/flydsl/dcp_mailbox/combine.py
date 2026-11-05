@@ -22,13 +22,19 @@ from aiter.ops.flydsl.dcp_mailbox.common import (
     KernelAbi,
     bf2_f32,
     bf16_pair,
+    epoch_offset,
     key_tuple,
     pair_layout,
+    pair_span,
+)
+from aiter.ops.flydsl.dcp_mailbox.common import (
+    peer_bytes as peer_storage_bytes,
 )
 from aiter.ops.flydsl.dcp_mailbox.peer import PeerBuffer
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from aiter.ops.flydsl.kernels.communication_ops_utils import (
     CACHE_DEVICE,
+    CACHE_SYSTEM,
     TaggedMailbox,
     atomic_add_agent,
     buffer_load_i32,
@@ -58,17 +64,21 @@ class CombineBuild:
     seqs: int
     base_e: bool
     ret_lse: bool
+    debug: bool
 
 
 def peer_layout(ranks, max_tokens, heads, dim):
-    """One parity: bf16 pairs, then one LSE pair per slot."""
+    """One parity of 8-byte aligned bf16/LSE pairs.
+
+    The untagged per-rank epoch slots follow both parities in the allocation.
+    """
     slots = ranks * max_tokens * heads
     return pair_layout([("data", slots * dim // 2), ("lse", slots)])
 
 
 def peer_bytes(ranks, max_tokens, heads, dim):
     lay = peer_layout(ranks, max_tokens, heads, dim)
-    return 2 * max(o + n for o, n in lay.values())
+    return peer_storage_bytes(lay, ranks)
 
 
 ABI = KernelAbi(
@@ -175,6 +185,19 @@ def _poll_combine(
 
 
 @flyc.jit
+def _push_epoch(bid, tid, e, targets):
+    """Debug builds only: CTA 0 lane ``p`` publishes epoch ``e`` to peer ``p``."""
+    for dest in range_constexpr(len(targets)):
+        if (bid == 0) & (tid == dest):
+            bo.buffer_store(
+                e,
+                buffer_resource(targets[dest]),
+                0,
+                cache_modifier=CACHE_SYSTEM,
+            )
+
+
+@flyc.jit
 def _finish(tid, state, e, nblk):
     """The last CTA advances the epoch for the next launch."""
     gpu.barrier()
@@ -203,11 +226,12 @@ def build(key: CombineBuild):
     threads = d // 4
     nblk = key.tokens * hl
     lay = peer_layout(n, mt, hl, d)
-    half = peer_bytes(n, mt, hl, d) // 2
+    half = pair_span(lay)
     keyed = key_tuple(key)
     name = (
         f"aiter_dcp_lse_combine_t{key.tokens}_n{n}_h{hl}_d{d}_m{mt}"
         f"_s{key.seqs}_e{int(key.base_e)}_l{int(key.ret_lse)}"
+        f"_g{int(key.debug)}"
     )
 
     @flyc.kernel(name=name, known_block_size=[threads, 1, 1])
@@ -234,11 +258,27 @@ def build(key: CombineBuild):
         b = bid // hl
         lh = bid % hl
         e = wave_uniform_i32(buffer_load_i32(state, 0, cache_modifier=CACHE_DEVICE))
-        mb = TaggedMailbox((e % (1 << 22)) * TAG_SLOTS)
-        put, put_words, poll = mb.put, mb.put_words, mb.poll
         flip = fx.Int64(e % 2) * half
         bases = [load_i64_from_buffer(peers, source) for source in range(n)]
         own = load_i64_from_buffer(peers, rank)
+        epoch_base = epoch_offset(lay)
+        epoch_targets = [
+            tagged_peer_address(peer, epoch_base + rank * 4) for peer in bases
+        ]
+        own_epoch = tagged_peer_address(own, epoch_base)
+        epoch_sources = [
+            tagged_peer_address(own_epoch, source * 4) for source in range(n)
+        ]
+        if const_expr(key.debug):
+            _push_epoch(bid, tid, e, epoch_targets)
+        mb = TaggedMailbox(
+            (e % (1 << 22)) * TAG_SLOTS,
+            debug=key.debug,
+            epoch_addresses=epoch_sources,
+            expected_epoch=e,
+            diagnostic=state,
+        )
+        put, put_words, poll = mb.put, mb.put_words, mb.poll
         data = [
             tagged_shift(tagged_peer_address(p, lay["data"][0]), flip) for p in bases
         ]
@@ -350,26 +390,30 @@ def _jit(key, combine, nblk, threads, keyed):
 class CombineWorkspace:
     """Peer buffer and epoch for one (heads per rank, dim).
 
-    ``state`` is [epoch, CTAs done]. Every rank launches in the same order.
+    ``state`` is [epoch, CTAs done, missing-rank mask]. Every rank launches in
+    the same order. ``debug=True`` enables a bounded diagnostic poll.
     """
 
-    def __init__(self, group, device, heads, dim, max_tokens):
+    def __init__(self, group, device, heads, dim, max_tokens, debug=False):
         self.ranks = group.world_size
         self.rank = group.rank_in_group
         self.group = group.cpu_group
         self.device = device
+        self.debug = bool(debug)
         self.heads = heads
         self.dim = dim
         self.max_tokens = max_tokens
         nbytes = peer_bytes(self.ranks, max_tokens, heads, dim)
         self.peers = PeerBuffer(nbytes, self.group, self.rank, self.ranks, device)
-        self.state = torch.zeros(2, dtype=torch.int32, device=device)
+        self.state = torch.zeros(3, dtype=torch.int32, device=device)
 
     def close(self) -> None:
         """Synchronize outstanding work, then release peer memory."""
         if self.peers is None:
             return
         torch.cuda.synchronize(self.device)
+        dist.barrier(group=self.group)
+        self.peers.close_peers()
         dist.barrier(group=self.group)
         self.peers.close()
         self.peers = None
@@ -412,6 +456,8 @@ def dcp_lse_combine(
         raise ValueError("seq_lens and query_start_loc must be provided together")
     if res is None:
         res = out.new_empty((tokens, heads, dim))
+    if ws.debug:
+        ws.state[2].zero_()
     res_lse = torch.empty(
         (tokens, heads) if return_lse else (1,), device=out.device, dtype=torch.float32
     )
@@ -425,6 +471,7 @@ def dcp_lse_combine(
         seqs=seqs,
         base_e=base_e,
         ret_lse=return_lse,
+        debug=ws.debug,
     )
     build(key)(
         out.data_ptr(),
@@ -444,6 +491,11 @@ def dcp_lse_combine(
         ws.state.data_ptr(),
         stream=torch.cuda.current_stream(),
     )
+    if ws.debug:
+        torch.cuda.synchronize(out.device)
+        missing = int(ws.state[2].item())
+        if missing:
+            raise RuntimeError(f"DCP mailbox peers missing at epoch: 0x{missing:x}")
     if return_lse:
         return res, res_lse
     return res

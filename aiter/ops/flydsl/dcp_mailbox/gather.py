@@ -19,12 +19,17 @@ from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import Int32, Int64, T
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
-from aiter.ops.flydsl.dcp_mailbox.combine import TAG_SLOTS, _finish
+from aiter.ops.flydsl.dcp_mailbox.combine import TAG_SLOTS, _finish, _push_epoch
 from aiter.ops.flydsl.dcp_mailbox.common import (
     KernelAbi,
     bf2_f32,
+    epoch_offset,
     key_tuple,
     pair_layout,
+    pair_span,
+)
+from aiter.ops.flydsl.dcp_mailbox.common import (
+    peer_bytes as peer_storage_bytes,
 )
 from aiter.ops.flydsl.dcp_mailbox.peer import PeerBuffer
 from aiter.ops.flydsl.kernels import buffer_ops as bo
@@ -59,16 +64,20 @@ class GatherBuild:
     fold: int = 0
     qlen: int = 0
     phase: int = 0
+    debug: bool = False
 
 
 def peer_layout(ranks, max_tokens, heads, words):
-    """One parity: word pairs [src, token, head, words]."""
+    """One parity of naturally aligned word/tag pairs.
+
+    The untagged per-rank epoch slots follow both parities in the allocation.
+    """
     return pair_layout([("q", ranks * max_tokens * heads * words)])
 
 
 def peer_bytes(ranks, max_tokens, heads, words):
     lay = peer_layout(ranks, max_tokens, heads, words)
-    return 2 * max(o + n for o, n in lay.values())
+    return peer_storage_bytes(lay, ranks)
 
 
 ABI = KernelAbi(
@@ -96,11 +105,12 @@ def build(key: GatherBuild):
     assert key.nope % 8 == 0
     nblk = key.tokens * hl
     lay = peer_layout(n, mt, hl, w)
-    half = peer_bytes(n, mt, hl, w) // 2
+    half = pair_span(lay)
     keyed = key_tuple(key)
     name = (
         f"aiter_dcp_qgather_t{key.tokens}_n{n}_h{hl}_w{w}_p{key.pad_heads}"
         f"_m{mt}_q{key.nope}_f{key.fold}x{key.qlen}_s{key.phase}"
+        f"_g{int(key.debug)}"
     )
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
@@ -123,11 +133,27 @@ def build(key: GatherBuild):
         b = bid // hl
         lh = bid % hl
         e = wave_uniform_i32(buffer_load_i32(state, 0, cache_modifier=CACHE_DEVICE))
-        mb = TaggedMailbox((e % (1 << 22)) * TAG_SLOTS)
-        put_words, poll = mb.put_words, mb.poll
         flip = fx.Int64(e % 2) * half
         bases = [load_i64_from_buffer(peers, source) for source in range(n)]
         own = load_i64_from_buffer(peers, rank)
+        epoch_base = epoch_offset(lay)
+        epoch_targets = [
+            tagged_peer_address(peer, epoch_base + rank * 4) for peer in bases
+        ]
+        own_epoch = tagged_peer_address(own, epoch_base)
+        epoch_sources = [
+            tagged_peer_address(own_epoch, source * 4) for source in range(n)
+        ]
+        if const_expr(key.debug):
+            _push_epoch(bid, tid, e, epoch_targets)
+        mb = TaggedMailbox(
+            (e % (1 << 22)) * TAG_SLOTS,
+            debug=key.debug,
+            epoch_addresses=epoch_sources,
+            expected_epoch=e,
+            diagnostic=state,
+        )
+        put_words, poll = mb.put_words, mb.poll
         to = [
             tagged_shift(tagged_peer_address(peer, lay["q"][0]), flip) for peer in bases
         ]
@@ -242,13 +268,20 @@ def _jit(key, gather, nblk, keyed):
 
 
 class GatherWorkspace:
-    """Peer buffer, epoch, and the persistent gathered query."""
+    """Peer buffer, epoch, and the persistent gathered query.
 
-    def __init__(self, group, device, heads, dim, dtype, pad_heads, max_tokens):
+    ``state`` is [epoch, CTAs done, missing-rank mask]. ``debug=True`` enables
+    a bounded diagnostic poll.
+    """
+
+    def __init__(
+        self, group, device, heads, dim, dtype, pad_heads, max_tokens, debug=False
+    ):
         self.ranks = group.world_size
         self.rank = group.rank_in_group
         self.group = group.cpu_group
         self.device = device
+        self.debug = bool(debug)
         self.heads = heads
         self.dim = dim
         self.words = dim * torch.empty((), dtype=dtype).element_size() // 4
@@ -256,7 +289,7 @@ class GatherWorkspace:
         self.max_tokens = max_tokens
         nbytes = peer_bytes(self.ranks, max_tokens, heads, self.words)
         self.peers = PeerBuffer(nbytes, self.group, self.rank, self.ranks, device)
-        self.state = torch.zeros(2, dtype=torch.int32, device=device)
+        self.state = torch.zeros(3, dtype=torch.int32, device=device)
         self.gathered = torch.zeros(
             (max_tokens, pad_heads, dim), dtype=dtype, device=device
         )
@@ -279,6 +312,8 @@ class GatherWorkspace:
             return
         torch.cuda.synchronize(self.device)
         dist.barrier(group=self.group)
+        self.peers.close_peers()
+        dist.barrier(group=self.group)
         self.peers.close()
         self.peers = None
 
@@ -296,6 +331,8 @@ def _launch(ws, key, args):
         )
     if key.fold and (key.qlen <= 0 or key.tokens % key.qlen):
         raise ValueError("folded gather requires qlen > 0 and tokens divisible by qlen")
+    if ws.debug:
+        ws.state[2].zero_()
     out = ws.folded_buffer(key.fold) if key.fold else ws.gathered
     build(key)(
         *args,
@@ -307,6 +344,11 @@ def _launch(ws, key, args):
     )
     if key.phase == 1:
         return None
+    if ws.debug:
+        torch.cuda.synchronize(ws.device)
+        missing = int(ws.state[2].item())
+        if missing:
+            raise RuntimeError(f"DCP mailbox peers missing at epoch: 0x{missing:x}")
     if key.fold:
         physical = out[: key.tokens * key.fold].view(
             key.tokens // key.qlen, key.fold, key.qlen, 16, ws.dim
@@ -338,6 +380,7 @@ def dcp_query_gather(
         fold=0 if plan is None else plan.fold,
         qlen=0 if plan is None else plan.qlen,
         phase=phase,
+        debug=ws.debug,
     )
     args = (
         query.data_ptr(),
@@ -381,6 +424,7 @@ def dcp_quant_query_gather(
         fold=0 if plan is None else plan.fold,
         qlen=0 if plan is None else plan.qlen,
         phase=phase,
+        debug=ws.debug,
     )
     args = (
         nope.data_ptr(),
