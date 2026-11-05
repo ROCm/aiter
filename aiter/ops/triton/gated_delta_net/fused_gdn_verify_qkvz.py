@@ -88,6 +88,8 @@ def fused_gdn_verify_qkvz(
     norm_eps: float,
     out: torch.Tensor,
     pad_slot_id: int = PAD_SLOT_ID,
+    out_scale: torch.Tensor | None = None,
+    out_scale_rows: int | None = None,
 ) -> torch.Tensor:
     """One speculative-verify step of a Gated DeltaNet layer on ReplaySSM state.
 
@@ -124,6 +126,16 @@ def fused_gdn_verify_qkvz(
         out: ``[tokens, VH, V]`` bf16, contiguous. Receives ``norm(core) * silu(z)``.
         pad_slot_id: the slot value of a padded sequence. Padded sequences and
             sequences without tokens are not changed.
+        out_scale: MXFP8 output for the out projection (opt-in). With ``out`` a
+            float8_e4m3fn ``[tokens, VH, V]`` and ``out_scale`` a uint8 /
+            float8_e8m0fnu buffer of ``VH * tokens`` bytes, the op writes the gated
+            RMSNorm as fp8 values with one e8m0 scale per (token, value head),
+            bit-identical to the bf16 ``out`` followed by aiter's
+            ``per_group_quant_hip(group_size=128, transpose_scale=True,
+            scale_type=fp8_e8m0)``: the scale of token row m and head g is byte
+            ``g * tokens + m`` (view it as ``(tokens, VH)`` for the GEMM). Rows of
+            padded sequences are not written, as in the bf16 mode. Chunk-form
+            kernel only.
 
     Returns:
         ``out``.
@@ -162,6 +174,21 @@ def fused_gdn_verify_qkvz(
         v_heads,
         head_v_dim,
     ), "out must be a contiguous [tokens, VH, V]"
+    out_fp8 = out_scale is not None
+    # The GEMM reads the scale as [VH, rows] over ITS row count, which may exceed the rows this call stores
+    # (a padded batch): out_scale_rows sets that stride (default: out's rows).
+    scale_rows = out.shape[0] if out_scale_rows is None else out_scale_rows
+    if out_fp8:
+        assert scale_rows >= out.shape[0], "out_scale_rows must cover out's rows"
+        assert out.dtype == torch.float8_e4m3fn, "out_scale needs an fp8 e4m3 out"
+        assert head_v_dim == 128, "the fp8 out has one 128-column scale group per head"
+        assert (
+            out_scale.is_contiguous()
+            and out_scale.element_size() == 1
+            and out_scale.numel() >= v_heads * scale_rows
+        ), "out_scale must be a contiguous byte buffer of VH * out_scale_rows"
+    else:
+        assert out.dtype == torch.bfloat16, "out must be bf16 (or fp8 with out_scale)"
     assert (
         conv_weight.is_contiguous() and conv_weight.shape[1] == 4
     ), "conv_weight must be a contiguous [channels, 4]"
@@ -203,6 +230,15 @@ def fused_gdn_verify_qkvz(
         if os.environ.get("AITER_GDN_VERIFY_MATRIX", "0") == "1":
             chunk_kernel = _fused_gdn_verify_chunk_mat
         kernel, num_warps, tile_args = chunk_kernel, chunk_warps, {}
+    if out_fp8:
+        assert (
+            kernel is _fused_gdn_verify_chunk
+        ), "the fp8 out is implemented in the chunk-form kernel only"
+        tile_args = {
+            "OUT_FP8": True,
+            "OutScale": out_scale.view(torch.uint8),
+            "out_rows": scale_rows,
+        }
     kernel[(seqs * k_heads,)](
         query_start_loc,
         slot_idx,

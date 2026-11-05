@@ -612,6 +612,9 @@ def _fused_gdn_verify_chunk(
     NW: gl.constexpr,
     PAD_SLOT_ID: gl.constexpr,
     HAS_BIAS: gl.constexpr,
+    OUT_FP8: gl.constexpr = False,
+    OutScale=None,
+    out_rows=None,
 ):
     """The verify step with the window in chunk form.
 
@@ -967,11 +970,39 @@ def _fused_gdn_verify_chunk(
     core = core.to(gl.float32)
     rms = gl.rsqrt(gl.sum(core * core, 2) / V + eps)
     normalized = core * rms[:, :, None] * weight * _silu(z_gate.to(gl.float32))
-    gl.store(
-        Output + ((bos + wt3) * VH + whead3) * V + wv3,
-        normalized.to(gl.bfloat16),
-        mask=wlive,
-    )
+    if OUT_FP8:
+        # MXFP8 for the out projection: one e8m0 scale per (token, value head) -- a
+        # head is one 128-column group -- bit-identical to storing bf16 and running
+        # aiter's per_group_quant_hip(group_size=128, transpose_scale=True,
+        # scale_type=fp8_e8m0): the amax of the bf16-rounded row from the 1e-10
+        # floor (capped at 448 * 2^119), RoundUp ceil_pow2(amax / 448) as the e8m0
+        # exponent e, and RNE(x * 2^(127 - e)) to e4m3. The scale of (row m, group
+        # g) goes to OutScale[g * out_rows + m], the GEMM's transposed layout.
+        gl.static_assert(V == 128, "one value head is one 128-column scale group")
+        y = normalized.to(gl.bfloat16).to(gl.float32)
+        amax = gl.minimum(gl.maximum(gl.max(gl.abs(y), 2), 1.0e-10), 448.0 * 6.646139978924579e35)
+        bits = (amax * (1.0 / 448.0)).to(gl.uint32, bitcast=True)
+        expo = ((bits >> 23) & 0xFF).to(gl.int32)
+        expo = expo + (((bits & 0x7FFFFF) != 0) & (expo < 0xFF)).to(gl.int32)
+        inv = ((254 - gl.minimum(expo, 253)).to(gl.uint32) << 23).to(gl.float32, bitcast=True)
+        gl.store(
+            Output + ((bos + wt3) * VH + whead3) * V + wv3,
+            (y * inv[:, :, None]).to(gl.float8e4nv),
+            mask=wlive,
+        )
+        wt2 = wt[:, None]
+        whead2 = group * RATIO + wh[None, :]
+        gl.store(
+            OutScale + whead2 * out_rows + bos + wt2,
+            expo.to(gl.uint8),
+            mask=(wt2 < tokens) & (whead2 >= 0),
+        )
+    else:
+        gl.store(
+            Output + ((bos + wt3) * VH + whead3) * V + wv3,
+            normalized.to(gl.bfloat16),
+            mask=wlive,
+        )
     if flush & valid:
         # S0 = d C + K_rec^T diag(w) U_rec, one block of checkpoint rows at a time,
         # back into the LDS rows it came from and out by TDM. Last, so that no
