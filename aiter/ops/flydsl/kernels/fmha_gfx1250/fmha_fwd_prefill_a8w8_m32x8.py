@@ -71,6 +71,7 @@ from .fmha_buffer_managers import (
     _ir,
 )
 from .fmha_utils import (
+    _ContiguousKVPolicy,
     BLOCK_SIZE,
     DTYPE_MAP,
     LDS_CHUNK_BYTES,
@@ -972,6 +973,9 @@ def _attention_prologue(
         num_producer_warps=KV_PRODUCER_WARPS,
         lane_idx=lane_idx,
     )
+    _kv_policy = _ContiguousKVPolicy(
+        tile_row0=_tile_row0, kv_valid=_kv_valid, row_base=kv_start
+    )
 
     def _k_desc(slot, row0, valid):
         """K descriptor for one tile, addressed off the slot's low-half base. Pure until
@@ -1096,8 +1100,7 @@ def _attention_prologue(
         "num_tiles": num_tiles,
         "last_tile_idx": last_tile_idx,
         "start_tile_idx": start_tile_idx,
-        "tile_row0": _tile_row0,
-        "kv_valid": _kv_valid,
+        "kv_policy": _kv_policy,
         "kv_counts": kv_counts,
         "kv_drain": _kv_drain,
         "q_frags": q_frags,
@@ -1185,17 +1188,19 @@ def _attention_core_multi_kv_tiles(
     num_tiles = prologue["num_tiles"]
     last_tile_idx = prologue["last_tile_idx"]
     start_tile_idx = prologue["start_tile_idx"]
-    _tile_row0 = prologue["tile_row0"]
-    _kv_valid = prologue["kv_valid"]
+    kv_policy = prologue["kv_policy"]
+    _tile_row0 = kv_policy.tile_row0
+    _kv_valid = kv_policy.kv_valid
     _kv_drain = prologue["kv_drain"]
     q_frags = prologue["q_frags"]
     # 8-bit Q cannot carry the scale (no f8 multiply); softmax applies it to S.
     _s_scale = softmax_scale * fx.Float32(LOG2E)
 
-    def _get_kv_desc(slot, row0, valid):
+    def _get_kv_desc(slot, row0, valid, page_indices=None):
         """This half's BufferOpDescriptor for one tile: LO issues every K copy, HI every
-        V copy. Pure until ``.async_load()``; which transport it carries (async vs TDM) is
-        the manager's business, not this call site's."""
+        V copy. Pure until ``.async_load()``; which transport it carries (async, TDM or
+        paged gather) is the manager's business, not this call site's."""
+        _extra = kv_policy.desc_kwargs(page_indices)
         if warp_type.is_lo:
             return k_mgr.load_descriptor(
                 ptr_lds=_k_bufs_at(slot),
@@ -1203,9 +1208,10 @@ def _attention_core_multi_kv_tiles(
                 stride_seq=stride_k_seq,
                 stride_head=stride_k_head,
                 head=kv_head,
-                row0=kv_start + row0,
+                row0=kv_policy.row_base + row0,
                 valid=valid,
                 ctx=_kv_ctx,
+                **_extra,
             )
         return v_mgr.load_descriptor(
             ptr_lds=_v_bufs_at(slot),
@@ -1213,9 +1219,10 @@ def _attention_core_multi_kv_tiles(
             stride_seq=stride_v_seq,
             stride_head=stride_v_head,
             head=kv_head,
-            row0=kv_start + row0,
+            row0=kv_policy.row_base + row0,
             valid=valid,
             ctx=_kv_ctx,
+            **_extra,
         )
 
     # ---- Loop init: the online-softmax seed and the O accumulators, all iter_args.
