@@ -16,6 +16,14 @@
       "LAZY_RESCALE_THRESHOLD": 8.0,
       "llvm_fn_attrs": [["amdgpu-agpr-alloc", "0,0"]]
     },
+    "pe_wide": {
+      "BLOCK_M": 256,
+      "BLOCK_N": 32,
+      "waves_per_eu": 2,
+      "num_warps": 8,
+      "LAZY_RESCALE_THRESHOLD": 8.0,
+      "llvm_fn_attrs": [["amdgpu-agpr-alloc", "0,0"]]
+    },
     "fp8": {
       "BLOCK_M": 128,
       "BLOCK_N": 64,
@@ -37,6 +45,14 @@
       "BLOCK_N": 64,
       "waves_per_eu": 2,
       "num_warps": 8,
+      "LAZY_RESCALE_THRESHOLD": 8.0,
+      "llvm_fn_attrs": [["amdgpu-agpr-alloc", "0,0"]]
+    },
+    "causal_padded_head": {
+      "BLOCK_M": 256,
+      "BLOCK_N": 64,
+      "waves_per_eu": 2,
+      "num_warps": 8,
       "LAZY_RESCALE_THRESHOLD": 0.0,
       "llvm_fn_attrs": [["amdgpu-agpr-alloc", "0,0"]]
     },
@@ -46,7 +62,7 @@
       "BLOCK_N": 64,
       "waves_per_eu": 2,
       "num_warps": 4,
-      "LAZY_RESCALE_THRESHOLD": 0.0,
+      "LAZY_RESCALE_THRESHOLD": 8.0,
       "llvm_fn_attrs": [["amdgpu-agpr-alloc", "0,0"]]
     },
     "causal_short_padded_head": {
