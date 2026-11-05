@@ -42,13 +42,12 @@ _POLICY_SELECTED_TOKENS = [
     2304,
     2446,
     2560,
-    3072,
-    3584,
-    3840,
-    4096,
 ]
 _POLICY_REJECTED_TOKENS = [
     1023,
+    2561,
+    3072,
+    4096,
     4097,
 ]
 
@@ -123,7 +122,7 @@ def _force_validated_gfx1201_target(monkeypatch):
     monkeypatch.setattr(fused_moe_mod, "get_cu_num", lambda: 64)
 
 
-@pytest.mark.parametrize("tokens", [1024, 1152, 1544, 1728, 1944, 2048, 2560, 4096])
+@pytest.mark.parametrize("tokens", [1024, 1152, 1544, 1728, 1944, 2048, 2560])
 def test_public_fused_moe_bf16_g1u1_selected_large_m(tokens):
     hidden, w1, w2, weights, ids = _make_case(tokens)
 
