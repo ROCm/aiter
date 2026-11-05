@@ -6,11 +6,58 @@ Triton kernel to build the block-sparse LUT (kv_block_indices) from a 4D block
 attention mask without using nonzero or argsort.
 """
 
+import os
+
 import torch
 import triton
 import triton.language as tl
 
+from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.utils.config_utils import (
+    AITER_TRITON_CONFIGS_PATH,
+    load_config_json,
+    resolve_config_dir,
+)
+
+_CONFIG_NAME = "BLOCK_LUT"
+# Arches with no table of their own read gfx942's, as fav3_sage, the LUT's main consumer, does.
+_FALLBACK_ARCH = "gfx942"
+
+
+def _load_block_kb_bounds() -> dict[str, tuple[int, int]]:
+    """Every shipped BLOCK_LUT (BLOCK_KB_MIN, BLOCK_KB_MAX), keyed by architecture.
+
+    Read once, at import, for the reason fav3_sage reads its tables then: mha_v4 builds the LUT
+    inside torch.compile'd code, and Dynamo cannot trace the open() in load_config_json().
+    """
+    bounds = {}
+    for entry in sorted(os.scandir(AITER_TRITON_CONFIGS_PATH), key=lambda e: e.name):
+        if not entry.is_dir():
+            continue
+        cfg_dir = resolve_config_dir(
+            "attention", _CONFIG_NAME, backend="triton", arch=entry.name
+        )
+        table = load_config_json(f"{cfg_dir}/DEFAULT.json", required=False)
+        if table is None:
+            continue
+        low, high = table["BLOCK_KB_MIN"], table["BLOCK_KB_MAX"]
+        # tl.arange needs a power-of-two width, and clamping a power of two keeps one only when
+        # both bounds are powers of two.
+        assert all(b > 0 and b & (b - 1) == 0 for b in (low, high)) and low <= high, (
+            f"{cfg_dir}/DEFAULT.json: BLOCK_KB_MIN={low} and BLOCK_KB_MAX={high} must be "
+            "powers of two with BLOCK_KB_MIN <= BLOCK_KB_MAX"
+        )
+        bounds[entry.name] = (low, high)
+    assert _FALLBACK_ARCH in bounds, (
+        f"no {_CONFIG_NAME} table for the fallback architecture {_FALLBACK_ARCH!r}: expected "
+        f"{resolve_config_dir('attention', _CONFIG_NAME, backend='triton', arch=_FALLBACK_ARCH)}"
+        "/DEFAULT.json"
+    )
+    return bounds
+
+
+_BLOCK_KB_BOUNDS = _load_block_kb_bounds()
 
 _block_attn_mask_to_lut_kernel_repr = make_kernel_repr(
     "_block_attn_mask_to_lut_kernel",
@@ -94,13 +141,17 @@ def block_attn_mask_to_lut_kernel(
     length lut_count.sum().
 
     BLOCK_KB, the mask columns scanned per step, defaults to the row length
-    rounded up to a power of two and clamped to [128, 2048]: each step is a
-    serial cumsum, so a long row wants few steps, while a width past the row
-    wastes lanes.
+    rounded up to a power of two and clamped to the arch's BLOCK_KB_MIN and
+    BLOCK_KB_MAX from configs/<arch>/triton/attention/block_lut/DEFAULT.json:
+    each step is a serial cumsum, so a long row wants few steps, while a width
+    past the row wastes lanes. An explicit BLOCK_KB is used as given.
     """
     batch, num_heads, num_q_blocks, num_kv_blocks = block_attn_mask.shape
     if BLOCK_KB is None:
-        BLOCK_KB = min(2048, max(128, triton.next_power_of_2(num_kv_blocks)))
+        low, high = _BLOCK_KB_BOUNDS.get(
+            arch_info.get_arch(), _BLOCK_KB_BOUNDS[_FALLBACK_ARCH]
+        )
+        BLOCK_KB = min(high, max(low, triton.next_power_of_2(num_kv_blocks)))
     num_programs = batch * num_heads * num_q_blocks
 
     grid = (num_programs,)

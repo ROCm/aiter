@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from aiter import logger
+from aiter.ops.triton._triton_kernels.attention import block_lut
 from aiter.ops.triton.attention.fav3_sage import (
     fav3_sage_func,
     fav3_sage_wrapper_func,
@@ -203,23 +204,67 @@ def test_block_attn_mask_to_ragged_lut_metadata_dtype():
     )
 
 
-@pytest.mark.parametrize("num_kv_blocks", [1, 128, 129, 2048, 2049, 5000])
-def test_block_attn_mask_to_ragged_lut_default_width_matches_reference(num_kv_blocks):
-    """The default BLOCK_KB follows the row length, clamped to [128, 2048], so a row is one chunk
-    up to 2048 KV blocks and several past it. Every chunk's indices must land in order.
-    """
-    torch.manual_seed(0)
-    block_attn_mask = torch.rand((2, 3, 4, num_kv_blocks), device="cuda") < 0.3
+def _random_block_mask(shape):
+    return torch.rand(shape, device="cuda", dtype=torch.float32) < 0.3
 
-    kv_block_indices, lut_start, lut_count = block_attn_mask_to_ragged_lut(
-        block_attn_mask
-    )
 
-    rows = block_attn_mask.reshape(-1, num_kv_blocks)
+def _assert_lut_matches_mask(block_attn_mask, lut):
+    kv_block_indices, lut_start, lut_count = lut
+    rows = block_attn_mask.reshape(-1, block_attn_mask.shape[-1])
     torch.testing.assert_close(lut_count, rows.sum(dim=-1, dtype=torch.int32))
     for row, (start, count) in enumerate(zip(lut_start.tolist(), lut_count.tolist())):
         expected = rows[row].nonzero().flatten().to(torch.int32)
         torch.testing.assert_close(kv_block_indices[start : start + count], expected)
+
+
+@pytest.mark.parametrize("num_kv_blocks", [1, 128, 129, 2048, 2049, 5000])
+def test_block_attn_mask_to_ragged_lut_default_width_matches_reference(num_kv_blocks):
+    """The default BLOCK_KB follows the row length, clamped to the configured bounds (128 and 2048
+    on gfx942 and gfx950), so a row is one chunk up to the cap and several past it. Every chunk's
+    indices must land in order.
+    """
+    torch.manual_seed(0)
+    block_attn_mask = _random_block_mask((2, 3, 4, num_kv_blocks))
+
+    _assert_lut_matches_mask(
+        block_attn_mask, block_attn_mask_to_ragged_lut(block_attn_mask)
+    )
+
+
+@pytest.mark.parametrize(
+    "num_kv_blocks, BLOCK_KB, launched",
+    [
+        pytest.param(5, None, 16, id="default-floor"),
+        pytest.param(40, None, 64, id="default-row"),
+        pytest.param(200, None, 64, id="default-cap"),
+        pytest.param(200, 512, 512, id="explicit-past-cap"),
+        pytest.param(200, 8, 8, id="explicit-below-floor"),
+    ],
+)
+def test_block_attn_mask_to_ragged_lut_width_follows_config_unless_given(
+    monkeypatch, num_kv_blocks, BLOCK_KB, launched
+):
+    """The configured bounds shape only the default width; an explicit BLOCK_KB launches as given."""
+    kernel = block_lut._block_attn_mask_to_lut_kernel
+    widths = []
+
+    class RecordingKernel:
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                widths.append(kwargs["BLOCK_KB"])
+                return kernel[grid](*args, **kwargs)
+
+            return launch
+
+    monkeypatch.setattr(block_lut, "_block_attn_mask_to_lut_kernel", RecordingKernel())
+    monkeypatch.setitem(block_lut._BLOCK_KB_BOUNDS, arch_info.get_arch(), (16, 64))
+    torch.manual_seed(0)
+    block_attn_mask = _random_block_mask((1, 2, 3, num_kv_blocks))
+
+    lut = block_attn_mask_to_ragged_lut(block_attn_mask, BLOCK_KB=BLOCK_KB)
+
+    assert widths == [launched]
+    _assert_lut_matches_mask(block_attn_mask, lut)
 
 
 def test_tiebreak_keeps_its_own_reference_bound():
