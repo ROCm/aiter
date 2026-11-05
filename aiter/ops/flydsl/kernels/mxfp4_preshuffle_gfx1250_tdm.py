@@ -2111,6 +2111,13 @@ def build_gemm_a8w4_tdm_task(
                         slot.b[i].store(load_b(lds_addr.b, i, ksl))
                 if const_expr(pinned_fp4_prefill):
                     load_scales()
+            if const_expr(ordinary_short_row_skip):
+                # Issue the complete operand group before the guarded MMA.
+                # A CFG split must not sink back-row LDS reads past front MMA.
+                rocdl.sched_dsrd(
+                    active_m_rep * DS_A + wmma_n_rep * DS_B + sb_pairs + sa_pairs
+                )
+                rocdl.sched_barrier(0)
             if const_expr(
                 interleaved_m_rows and active_m_rep == 8 and not explicit_vgpr_partition
             ):
