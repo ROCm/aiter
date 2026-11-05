@@ -1203,22 +1203,21 @@ class AttentionProgram:
             query_mask_qk = gl.convert_layout(query_mask, cfg.qk_layout)
 
         # Split-KV: carve the sequence as reduce_segments does, so every query
-        # block of a sequence agrees on the split boundaries
+        # block of a sequence agrees on the split boundaries. A window carves
+        # its own tiles instead, and reduce_segments then merges every split.
         if NUM_SPLITS > 1:
-            seq_len = context_len + cur_batch_query_len
             if cfg.SLIDING_WINDOW > 0:
-                # only the window's tiles: no row sees a key before row 0's first
-                kv_lo = gl.maximum(context_len - cfg.SLIDING_WINDOW + 1, 0)
-                tile_lo = kv_lo // cfg.TILE_SIZE
-                seq_tiles = (seq_len + cfg.TILE_SIZE - 1) // cfg.TILE_SIZE
-                tiles_per_split = (seq_tiles - tile_lo + NUM_SPLITS - 1) // NUM_SPLITS
-                split_start = tile_lo + split_idx * tiles_per_split
+                tiles_per_split = (tile_end - tile_start + NUM_SPLITS - 1) // NUM_SPLITS
+                split_start = tile_start + split_idx * tiles_per_split
+                tile_end = gl.minimum(split_start + tiles_per_split, tile_end)
+                tile_start = split_start
             else:
                 split_len = NUM_SPLITS * cfg.TILE_SIZE
+                seq_len = context_len + cur_batch_query_len
                 tiles_per_split = (seq_len + split_len - 1) // split_len
                 split_start = split_idx * tiles_per_split
-            tile_end = gl.minimum(split_start + tiles_per_split, tile_end)
-            tile_start = gl.maximum(split_start, tile_start)
+                tile_end = gl.minimum(split_start + tiles_per_split, tile_end)
+                tile_start = gl.maximum(split_start, tile_start)
 
         safe_tile_end = gl.minimum(safe_tile_end, tile_end - 1)
         safe_tile_end = gl.maximum(safe_tile_end, tile_start)
@@ -1916,9 +1915,9 @@ def _unified_attention_gluon_kernel(
     )
 
     if NUM_SPLITS > 1 and pgm.tile_start >= pgm.tile_end:
-        # past this block's causal or window edge, but reduce_segments still
-        # reads it
-        if pgm.tile_start * TILE_SIZE < seq_len:
+        # past this block's causal edge, or any window split, but
+        # reduce_segments still reads it
+        if (pgm.tile_start * TILE_SIZE < seq_len) | (SLIDING_WINDOW > 0):
             empty_m = gl.zeros(
                 [BLOCK_M], dtype=gl.float32, layout=gl.SliceLayout(1, cfg.pv_layout)
             )

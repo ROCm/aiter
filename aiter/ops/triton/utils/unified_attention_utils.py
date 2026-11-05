@@ -203,12 +203,10 @@ def compute_segment_params(config: dict, params) -> dict:
     # tokens one segment must cover, so the split never outruns the context
     tile = triton.next_power_of_2(params.block_size)
     tile = max(tile_lo, tile if tile_hi is None else min(tile_hi, tile))
-    kv_len = params.max_seqlen_k
-    # a sliding-window split carves only the window: rows see at most
-    # window + q - 1 keys
-    if params.sliding_window > 0:
-        kv_len = min(kv_len, params.sliding_window + params.max_seqlen_q - 1)
-    limit = triton.cdiv(kv_len, tile)
+    keys = params.max_seqlen_k
+    if getattr(params, "sliding_window", 0) > 0:
+        keys = min(keys, params.sliding_window + params.max_seqlen_q)
+    limit = triton.cdiv(keys, tile)
     too_many_seqs = seqs_per_tile and params.num_seqs > seqs_per_tile * limit
     if cap is not None:
         limit = min(cap, limit)

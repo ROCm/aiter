@@ -175,17 +175,12 @@ def _gfx950_split_params(params: _UAParams):
     return params._replace(num_2d_prgms=num_q_blocks * params.num_kv_heads)
 
 
-_SW_SPLIT_MAX_Q = 16
-
-
 def _gfx950_split_grid(params: _UAParams):
     """Decode, and batches too small to fill the GPU, take the split grid."""
     if params.all_decode:
         return True
-    # the split carves only the window, so a full table splits like a trimmed one
-    if params.sliding_window > 0 and not (
-        params.max_seqlen_q <= _SW_SPLIT_MAX_Q
-        and params.max_seqlen_q * params.num_queries_per_kv <= 128
+    if params.sliding_window > 0 and (
+        params.max_seqlen_q * params.num_queries_per_kv > 128
     ):
         return False
     # unsplit, the 2d grid is faster
@@ -791,6 +786,7 @@ def _reduce_segments_triton(
         TILE_SIZE=TILE_SIZE,
         SLIDING_WINDOW=params.sliding_window,
         BLOCK_Q=None,
+        ALL_SEGMENTS=params.sliding_window > 0,
         **config,
         enable_fp_fusion=True,
     )

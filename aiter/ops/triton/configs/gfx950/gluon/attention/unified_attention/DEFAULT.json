@@ -230,7 +230,10 @@
     "SW": {
       "SEGMENTS_PER_CU": 2,
       "MFMA_DIM": 16,
-      "MAX_SEGMENTS": 1,
+      "MAX_SEGMENTS": 64,
+      "MIN_SEGMENTS": 1,
+      "SPLIT_MIN_TILES": 4,
+      "SPLIT_MIN_SHARE": 2,
       "SEGMENT_TILE_MIN": 64,
       "SEGMENT_TILE_MAX": 64,
       "TILE_SIZE_MIN": 64,
