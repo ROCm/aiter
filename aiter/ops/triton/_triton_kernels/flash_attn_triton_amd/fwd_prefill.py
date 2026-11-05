@@ -59,9 +59,9 @@ def get_fwd_prefill_configs(mode: AutotuneMode):
                 ),
             ]
         elif arch.is_rdna:
-            # gfx1151 (Strix Halo / RDNA3.5): tuned for the Qwen3-Omni
+            # gfx1150 / gfx1151 (RDNA3.5), tuned on gfx1151 for the Qwen3-Omni
             # ViT prefill shape (B=1, S=3200, H=16, head_dim=72, fp16).
-            if arch.name == "gfx1151":
+            if arch.name in ("gfx1150", "gfx1151"):
                 return [
                     triton.Config(
                         {
@@ -176,9 +176,9 @@ def get_fwd_prefill_configs(mode: AutotuneMode):
                     )
                 ]
         elif arch.is_rdna:
-            # gfx1151 (Strix Halo / RDNA3.5): tuned for the Qwen3-Omni
+            # gfx1150 / gfx1151 (RDNA3.5), tuned on gfx1151 for the Qwen3-Omni
             # ViT prefill shape (B=1, S=3200, H=16, head_dim=72, fp16).
-            if arch.name == "gfx1151":
+            if arch.name in ("gfx1150", "gfx1151"):
                 return [
                     triton.Config(
                         {

@@ -148,12 +148,12 @@ struct opus_mla_v4_prefill_a16w16_16mx1_16nx4_traits
     static constexpr int k_ds_read_insts = (GEMM0_E_N * GEMM0_E_K * W_N * W_K) / (WARP_SIZE * VEC_KV);
     static constexpr int v_ds_read_insts = (GEMM1_E_N * GEMM1_E_K * W_N * W_K) / (WARP_SIZE * VEC_TR_V);
 
-    // Kernel uses three static buffers (KV tile, m/l, P).
+    // The unsplit path exchanges P in fp32; split-K retains D_ATTN.
     static constexpr size_t smem_size_bytes()
     {
         return smem_kv_tile_elems * sizeof(D_ATTN)
              + 2 * T_N * W_M * sizeof(D_ACC)
-             + T_N * W_M * W_N * sizeof(D_ATTN);
+             + T_N * W_M * W_N * (SPLIT ? sizeof(D_ATTN) : sizeof(D_ACC));
     }
 };
 
