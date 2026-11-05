@@ -93,7 +93,8 @@ struct opus_gemm_bpreshuffle_pingpong_lds_traits {
     static constexpr int B_STAGE = smem_n_rep * (smem_linear_wave + smem_padding);
     static constexpr int NUM_STAGES = 2;
     static constexpr int MATRIX_LDS_BYTES = NUM_STAGES * (A_STAGE + B_STAGE);
-    static constexpr int MATRIX_VMEM_INSTRUCTIONS = B_M * B_K / (BLOCK_SIZE * VEC_A) + B_N * B_K / (BLOCK_SIZE * VEC_B);
+    static constexpr int MATRIX_VMEM_INSTRUCTIONS =
+        B_M * B_K / (BLOCK_SIZE * VEC_A) + B_N * B_K / (BLOCK_SIZE * VEC_B);
     static_assert(NUM_STAGES == 2);
 
     // Four M-repeat scales per A word; B packs its N128 scales into one word.
@@ -102,7 +103,8 @@ struct opus_gemm_bpreshuffle_pingpong_lds_traits {
     static constexpr int SFA_M_VECTORS = A_SCALE_PACKS * T_M * VEC_SF;
     static constexpr int SFA_K_COLUMNS_PER_WAVE = WARP_SIZE / SFA_M_VECTORS;
     static constexpr int SFA_K_COLUMNS_PER_PASS = NUM_WAVES * SFA_K_COLUMNS_PER_WAVE;
-    static constexpr int SFA_PASSES_PER_CACHE_PANEL = (SCALE_PANEL + SFA_K_COLUMNS_PER_PASS - 1) / SFA_K_COLUMNS_PER_PASS;
+    static constexpr int SFA_PASSES_PER_CACHE_PANEL =
+        (SCALE_PANEL + SFA_K_COLUMNS_PER_PASS - 1) / SFA_K_COLUMNS_PER_PASS;
     static constexpr int SFA_PANEL_PITCH = A_SCALE_PACKS * T_M * W_M * VEC_SF;
     static constexpr int SFA_BYTES = SFA_PANEL_PITCH * SCALE_PANEL;
     static constexpr int SFB_BYTES = SCALE_PANEL * sizeof(unsigned);

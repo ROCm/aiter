@@ -398,7 +398,9 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_pingpong_lds_body(
     const int row = block_m * T::B_M;
     const int col = block_n * T::B_N;
     const int batch_id = block_id_z();
-    using LoopCount = std::conditional_t<T::FRAGMENT_ARRAYS && T::E_M == 4 && T::SCALE_PANEL <= 32, unsigned, int>;
+    using LoopCount = std::conditional_t<
+        T::FRAGMENT_ARRAYS && T::E_M == 4 && T::SCALE_PANEL <= 32,
+        unsigned, int>;
     const LoopCount loops = static_cast<LoopCount>(kargs.k) / T::B_K;
 
     // Matrix and scale global-memory views.
@@ -464,15 +466,23 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_pingpong_lds_body(
     CFragments v_c{};
     if constexpr (!T::FRAGMENT_ARRAYS)
         clear(v_c);
-    if constexpr (!T::FRAGMENT_ARRAYS && T::E_M == 3 && T::SCALE_PANEL <= 32) {
+    // Keep accumulator live ranges explicit at their publication point.
+    auto preserve_accumulators = [&] {
         static_for<T::E_M * T::E_N>([&](auto c_i) {
             constexpr int ci = decltype(c_i)::value;
-            auto c = slice(v_c, number<ci * ELEM_C>{}, number<(ci + 1) * ELEM_C>{});
-            asm volatile("" : "+v"(c));
-            set_slice(v_c, c, number<ci * ELEM_C>{}, number<(ci + 1) * ELEM_C>{});
+            if constexpr (T::FRAGMENT_ARRAYS) {
+                auto c = v_c[ci];
+                asm volatile("" : "+v"(c));
+                v_c[ci] = c;
+            } else {
+                auto c = slice(v_c, number<ci * ELEM_C>{}, number<(ci + 1) * ELEM_C>{});
+                asm volatile("" : "+v"(c));
+                set_slice(v_c, c, number<ci * ELEM_C>{}, number<(ci + 1) * ELEM_C>{});
+            }
         });
-    }
-
+    };
+    if constexpr (!T::FRAGMENT_ARRAYS && T::E_M == 3 && T::SCALE_PANEL <= 32)
+        preserve_accumulators();
 
     // C output layout; BF16 fragments are first staged in LDS.
     const auto p_coord_c = opus::make_tuple(wave_id_m, lane_id % mma.grpn_c, wave_id_n, lane_id / mma.grpn_c);
@@ -661,7 +671,9 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_pingpong_lds_body(
                 if constexpr (!defer_next_stage_wait)
                     s_waitcnt_vmcnt(0_I);
                 opus::sync_threads();
-                if (tile_k + 2 < loops)
+                // Every advance precedes the final tile; K+2 reaches the loop
+                // end but never exceeds it, so equality identifies the tail.
+                if (tile_k + 2 != loops)
                     issue_matrix_prefetch(stage_i, tile_k + 2);
                 __builtin_amdgcn_sched_barrier(0);
             }
@@ -669,7 +681,7 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_pingpong_lds_body(
                 mma_scale_fragment(m_i, n_i);
                 if constexpr (m == T::E_M - 1) {
                     if constexpr (defer_next_stage_wait && decltype(n_i)::value == 0) {
-                        if (tile_k + 2 < loops)
+                        if (tile_k + 2 != loops)
                             s_waitcnt_vmcnt(number<T::MATRIX_VMEM_INSTRUCTIONS>{});
                         else
                             s_waitcnt_vmcnt(0_I);
@@ -756,23 +768,8 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_pingpong_lds_body(
     static_for<T::E_N>([&](auto n_i) { load_b_fragment(n_i, number<0>{}); });
     s_waitcnt_lgkmcnt(0_I);
 
-    if constexpr (T::FRAGMENT_ARRAYS && T::E_M == 4 && T::SCALE_PANEL <= 32) {
-        static_for<T::E_M * T::E_N>([&](auto c_i) {
-            auto c = v_c[decltype(c_i)::value];
-            asm volatile("" : "+v"(c));
-            v_c[decltype(c_i)::value] = c;
-        });
-    }
-
-    if constexpr (!T::FRAGMENT_ARRAYS && T::E_M == 4 && T::SCALE_PANEL <= 32) {
-        static_for<T::E_M * T::E_N>([&](auto c_i) {
-            constexpr int ci = decltype(c_i)::value;
-            auto c = slice(v_c, number<ci * ELEM_C>{}, number<(ci + 1) * ELEM_C>{});
-            asm volatile("" : "+v"(c));
-            set_slice(v_c, c, number<ci * ELEM_C>{}, number<(ci + 1) * ELEM_C>{});
-        });
-    }
-
+    if constexpr (T::E_M == 4 && T::SCALE_PANEL <= 32)
+        preserve_accumulators();
 
     // ===== Main loop =====
     // Alternate LDS tiles while the A fragment ring rolls across M repeats.
@@ -780,7 +777,7 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_pingpong_lds_body(
     for (int tile_k = 0; tile_k + 1 < loops; tile_k += T::LOOP_UNROLL) {
         advance_tile(number<0>{}, tile_k);
 
-        if (tile_k + 2 < loops)
+        if (tile_k + 2 != loops)
             advance_tile(number<1>{}, tile_k + 1);
     }
 

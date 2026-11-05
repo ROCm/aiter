@@ -1,5 +1,5 @@
 {
-  "updated_utc": "2026-11-05T14:45:45.796997+00:00",
+  "updated_utc": "2026-11-05T17:52:51.230944+00:00",
   "arch": "gfx950",
   "offload_arch": "gfx950",
   "inspection_llvm_bin": "/root/workspace/opus-pin-toolchain-49c41889-restore-20261028/build/bin",
@@ -1684,7 +1684,7 @@
       "pipeline": "prefetch_b_vgpr",
       "status": "ready",
       "artifact_present": true,
-      "co_sha256": "29eaee66259b268ac40ea9d76eb1c005a0a3d8866491787b96f6881f7cc057f7",
+      "co_sha256": "42089c270af031516726cf64e0520fbed2cafe79e6e1340871b37b6b2ed5b054",
       "device_flags": [
         "-fgpu-flush-denormals-to-zero",
         "-fno-offload-uniform-block",
@@ -1720,8 +1720,8 @@
       "agpr_count": 64,
       "private_segment_fixed_size": 0,
       "short_kernel": {
-        "vgpr_count": 256,
-        "sgpr_count": 45,
+        "vgpr_count": 284,
+        "sgpr_count": 54,
         "vgpr_spill_count": 0,
         "sgpr_spill_count": 0,
         "group_segment_fixed_size": 70656,
@@ -1732,9 +1732,11 @@
       "short_symbol": "opus_gemm_gfx950_b_vgpr_co_256x128x256x128_1x4_16x16x128_1x128x128_p4_bd1_pinA1C0_xcd0_contig0_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0__short",
       "short_max_k": 2048,
       "build_provenance": {
-        "record": "reports/opus_runtime_recovery_20261105/b_parameter_cleanup/final_codegen_summary.json",
-        "hip_clang_path": "/root/workspace/opus-pin-toolchain-49c41889-restore-20261028/build/bin",
-        "kind": "verified new-name B cleanup build"
+        "kind": "runtime scale-cache optimization; rebuilt from current source",
+        "llvm_bin": "/root/workspace/opus-pin-toolchain-49c41889-restore-20261028/build/bin",
+        "record": "reports/opus_runtime_recovery_20261105/runtime_parity_final_20261105/final_co/38.json",
+        "pipeline_sha256": "bfb7d2ba2af8e88920f9541d3a82f7625983ada5d0ff57c400cd444234552d14",
+        "traits_sha256": "7bff786e5868998e2a1a8d3bfdea1e64d9ee9bf1d27a5ce9a4a27af5670ee8b0"
       }
     },
     {
@@ -2385,7 +2387,7 @@
       "pipeline": "prefetch_b_vgpr_overlap",
       "status": "ready",
       "artifact_present": true,
-      "co_sha256": "6e30fec96d39f376ec11f224759fa41213e54df4db79d90ee38807199903d7f0",
+      "co_sha256": "e37622904d0628f6ad6aa49475aea133e38ef0c663a5039c5f6d6f5ddd4a824b",
       "device_flags": [
         "-fgpu-flush-denormals-to-zero",
         "-fno-offload-uniform-block",
@@ -2421,8 +2423,8 @@
       "agpr_count": 64,
       "private_segment_fixed_size": 0,
       "short_kernel": {
-        "vgpr_count": 256,
-        "sgpr_count": 45,
+        "vgpr_count": 284,
+        "sgpr_count": 54,
         "vgpr_spill_count": 0,
         "sgpr_spill_count": 0,
         "group_segment_fixed_size": 70656,
@@ -2433,9 +2435,11 @@
       "short_symbol": "opus_gemm_gfx950_b_vgpr_overlap_co_256x128x256x128_1x4_16x16x128_1x128x128_p4_bd1_pinA1C0_xcd0_contig0_ca0cb0_wg1_pub0_sa0_sb0_compact0_aheadauto_out0__short",
       "short_max_k": 2048,
       "build_provenance": {
-        "record": "reports/opus_runtime_recovery_20261105/b_parameter_cleanup/final_codegen_summary.json",
-        "hip_clang_path": "/root/workspace/opus-pin-toolchain-49c41889-restore-20261028/build/bin",
-        "kind": "verified new-name B cleanup build"
+        "kind": "runtime scale-cache optimization; rebuilt from current source",
+        "llvm_bin": "/root/workspace/opus-pin-toolchain-49c41889-restore-20261028/build/bin",
+        "record": "reports/opus_runtime_recovery_20261105/runtime_parity_final_20261105/final_co/50.json",
+        "pipeline_sha256": "bfb7d2ba2af8e88920f9541d3a82f7625983ada5d0ff57c400cd444234552d14",
+        "traits_sha256": "7bff786e5868998e2a1a8d3bfdea1e64d9ee9bf1d27a5ce9a4a27af5670ee8b0"
       }
     },
     {

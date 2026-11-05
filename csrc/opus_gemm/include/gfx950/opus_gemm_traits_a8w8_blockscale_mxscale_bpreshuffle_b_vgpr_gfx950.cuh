@@ -297,13 +297,50 @@ public:
     static constexpr int INITIAL_A = A_STAGES - 1;
     static constexpr int SCALE_K_TILES = T::SCALE_COLS / K_SLICES;
     static constexpr bool ROTATE_RING = T::ROTATE_B && !T::STATIC_B_RING;
+    // Align the B register ring with A stages and scale-cache phases.
+    static constexpr int PERIOD = []() constexpr {
+        if constexpr (ROTATE_RING) return 1;
+        constexpr int fragments = K_SLICES * NR;
+        int a = B_SLOTS, b = fragments;
+        while (b) {
+            const int r = a % b;
+            a = b;
+            b = r;
+        }
+        const int period = B_SLOTS / a;
+        if constexpr (MEMORY_HEAVY && (!Short || T::PIN_C)) {
+            a = A_STAGES;
+            b = period;
+            while (b) {
+                const int r = a % b;
+                a = b;
+                b = r;
+            }
+            const int cycle = A_STAGES / a * period;
+            // Align both rings when this keeps the unrolled matrix work bounded.
+            if (cycle * fragments * MR <= 256) return cycle;
+        }
+        return Short || MEMORY_HEAVY ? period : (period == 1 ? 2 : period);
+    }();
+    static constexpr int SCALE_PHASE_DIVISOR = []() constexpr {
+        int a = PERIOD, b = SCALE_K_TILES;
+        while (b) {
+            const int r = a % b;
+            a = b;
+            b = r;
+        }
+        return a;
+    }();
     static constexpr bool STAGED_A = NARROW_VGPR && (MR == 4 || MR == 6)
         && BN == 128 && NR == 2
         && (T::STAGES == 3 || (MR == 4 && T::STAGES == 4)) && WAVES_N == 4;
 
 
     // Compile-time eligibility; the pipeline checks the runtime K capacity.
-    static constexpr bool SMALL_SCALE_CACHE = Short && T::SCALE_COLS == 16 && T::PIN_A && !T::PIN_C && T::B_K == 128 && T::MR == 6 && T::NR == 4 && T::STAGES == 4 && WAVES_N == 4 && PublishM == 0;
+    static constexpr bool SMALL_SCALE_CACHE = Short && T::SCALE_COLS == 16
+        && PIN_A_ONLY && K_SLICES == 1
+        && ((MR == 6 && NR == 4 && T::STAGES == 4 && WAVES_N == 4 && PublishM == 0)
+            || (NR >= 4 && MR * NR >= 32));
 
     static constexpr bool PINNED_SCALE_CACHE = !Short && !SingleCache && T::B_K == 128 && T::STAGES == 4
         && WAVES_N == 4 && (T::B_M == 96 || T::B_M == 128)
