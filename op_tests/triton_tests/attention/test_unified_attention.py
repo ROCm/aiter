@@ -671,6 +671,30 @@ def _length_aware_seq_lens(batch: str, query_len: int):
     return [(query_len, 8192)] * 32
 
 
+def _length_aware_pages(page_counts):
+    """KV cache size and block table holding only the pages each request uses.
+
+    A cache of len(page_counts) x max(page_counts) pages gives every request the
+    long request's length (~37 GB of fp32 K/V for skewed_300). Each request gets
+    distinct random pages; the table entries past them are never read and name
+    random pages of the cache.
+    """
+    num_blocks = sum(page_counts) + 64  # spare pages no request owns
+    rng = torch.Generator(device="cuda").manual_seed(0)
+    block_tables = torch.randint(
+        num_blocks,
+        (len(page_counts), max(page_counts)),
+        generator=rng,
+        dtype=torch.int32,
+        device="cuda",
+    )
+    counts = torch.tensor(page_counts, device="cuda")
+    owned = torch.arange(block_tables.shape[1], device="cuda") < counts[:, None]
+    pages = torch.randperm(num_blocks, generator=rng, device="cuda")
+    block_tables[owned] = pages[: sum(page_counts)].to(torch.int32)
+    return num_blocks, block_tables
+
+
 @pytest.mark.parametrize(
     "batch, num_heads, max_query_len, option, seqused_k_dtype",
     [
@@ -713,7 +737,9 @@ def test_triton_unified_attn_3d_length_aware_split(
     torch.cuda.empty_cache()
     block_size = 128
     seq_lens = _length_aware_seq_lens(batch, max_query_len)
-    max_blocks = max(triton.cdiv(kv, block_size) for _, kv in seq_lens)
+    num_blocks, block_tables = _length_aware_pages(
+        [triton.cdiv(kv, block_size) for _, kv in seq_lens]
+    )
     shuffled_kv_cache = option == "shuffled_kv_cache"
     (
         query,
@@ -729,7 +755,7 @@ def test_triton_unified_attn_3d_length_aware_split(
         _,
         scale,
         window_size,
-        block_tables,
+        _,  # block_tables come from _length_aware_pages
         _,
         _,
         q_descale,
@@ -738,7 +764,7 @@ def test_triton_unified_attn_3d_length_aware_split(
         _,
     ) = generate_data(
         seq_lens=seq_lens,
-        num_blocks=max_blocks * len(seq_lens),
+        num_blocks=num_blocks,
         block_size=block_size,
         head_size=64,
         num_heads=num_heads,
@@ -844,7 +870,10 @@ def test_triton_unified_attn_3d_length_aware_split_graph_replay() -> None:
         _length_aware_seq_lens("skewed_empty", query_len),
         skewed,
     ]
-    max_blocks = max(triton.cdiv(kv, block_size) for b in batches for _, kv in b)
+    # each request keeps its pages across the replays
+    num_blocks, block_tables = _length_aware_pages(
+        [max(triton.cdiv(kv, block_size) for _, kv in r) for r in zip(*batches)]
+    )
     (
         query,
         key_cache,
@@ -859,7 +888,7 @@ def test_triton_unified_attn_3d_length_aware_split_graph_replay() -> None:
         _,
         scale,
         window_size,
-        block_tables,
+        _,  # block_tables come from _length_aware_pages
         _,
         _,
         q_descale,
@@ -868,7 +897,7 @@ def test_triton_unified_attn_3d_length_aware_split_graph_replay() -> None:
         _,
     ) = generate_data(
         seq_lens=skewed,
-        num_blocks=max_blocks * len(skewed),
+        num_blocks=num_blocks,
         block_size=block_size,
         head_size=64,
         num_heads=(8, 2),
