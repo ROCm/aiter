@@ -27,12 +27,33 @@ The ``prec`` axis picks both the input format and the backends that run:
 gluon kernel that takes both KV sources natively. ``asm`` needs ``H_Q == 128``.
 Both are gfx1250-only here and drop out of the sweep elsewhere.
 
+``a16w16`` (``v4_fp8``) is the path served today: the fp8 inputs dequantized to
+bf16 (not timed) and run through ``mla_sparse_prefill``. The fp8 ``opus`` output
+is also checked against it directly. On gfx950 the fp8 ``opus`` path converts the
+KV caches to the DMA layout on every call; ``opus_dma`` runs the same kernel on
+caches converted once up front (the kernel alone), and ``run_kv_dma_layout``
+checks that conversion on its own.
+
+``--mode`` picks the page table: ``topk`` (above), or the DeepSeek-V4.1-Flash
+selection -- top-k prefix rows plus a sliding window over the extend tokens,
+independent per token (``swa_rand``) or shared by groups of neighbouring tokens
+(``swa_clus``).
+
 Example CLI usage::
 
     PYTHONPATH=. python3 op_tests/test_mla_sparse_prefill.py
     PYTHONPATH=. python3 op_tests/test_mla_sparse_prefill.py --topk 256 2048
     PYTHONPATH=. python3 op_tests/test_mla_sparse_prefill.py --backend opus \\
         -n 1024 --h_q 128 --prec v4_fp8 --no-verify
+
+DeepSeek-V4.1-Flash prefill (16,384 tokens per chunk, 16 heads per rank at
+TP4, top-k 512 plus SWA 128) over a 131k-row prefix cache, and the
+L2-resident case where every token reads the same 512 + 128 rows::
+
+    PYTHONPATH=. python3 op_tests/test_mla_sparse_prefill.py -n 16384 --h_q 16 \\
+        --prec v4_fp8 --mode swa_clus swa_rand --total_pages 131072
+    PYTHONPATH=. python3 op_tests/test_mla_sparse_prefill.py -n 16384 --h_q 16 \\
+        --prec v4_fp8 --topk 0 --total_pages 512 --total_tokens 128
 """
 
 from __future__ import annotations
@@ -50,10 +71,12 @@ import torch
 from aiter.benchmark_data_init import DATA_DISTS, fill, make_generator
 from aiter.benchmark_reporting import print_json_table
 from aiter.ops.mla_sparse_prefill import (
+    fp8_kv_dma_layout_enabled,
     mla_sparse_prefill,
     mla_sparse_prefill_v4,
     mla_sparse_prefill_v41,
 )
+from aiter.ops.triton.mla_v4_kv_rescale import to_dma_kv_layout
 from aiter.test_common import (
     benchmark,
     checkAllclose,
@@ -342,6 +365,84 @@ def _poison_unreferenced(
         rope[dead] = math.nan
 
 
+# DeepSeek-V4.1-Flash prefill selection: each token reads its top-k rows of the
+# prefix cache plus a sliding window over the chunk's own tokens.
+_V41_TOPK = 512
+_V41_SWA = 128
+# swa_clus: each group of 64 neighbouring tokens shares 384 of its 512 top-k rows.
+_V41_GROUP = 64
+_V41_SHARED = 384
+
+
+def _topk_csr(
+    n: int, total_rows: int, *, clustered: bool, device: torch.device, seed: int = 0
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``_V41_TOPK`` prefix rows per token, in position order like a top-k."""
+    g = torch.Generator(device="cpu")
+    g.manual_seed(seed)
+    if clustered:
+        groups = (n + _V41_GROUP - 1) // _V41_GROUP
+        shared = torch.randint(0, total_rows, (groups, _V41_SHARED), generator=g)
+        own = torch.randint(0, total_rows, (n, _V41_TOPK - _V41_SHARED), generator=g)
+        rows = torch.cat([shared.repeat_interleave(_V41_GROUP, 0)[:n], own], dim=1)
+    else:
+        rows = torch.randint(0, total_rows, (n, _V41_TOPK), generator=g)
+    rows = torch.sort(rows, dim=1).values
+    indptr = torch.arange(0, (n + 1) * _V41_TOPK, _V41_TOPK, dtype=torch.int32)
+    return indptr.to(device), rows.flatten().to(torch.int32).to(device)
+
+
+def _swa_csr(
+    n: int, total_tokens: int, *, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sliding window: token t reads extend rows ``max(0, t - 127) .. t``."""
+    assert total_tokens >= n, "the window indexes the chunk's own tokens"
+    t = torch.arange(n, dtype=torch.int32)
+    lo = (t - (_V41_SWA - 1)).clamp(min=0)
+    indptr = torch.zeros(n + 1, dtype=torch.int32)
+    indptr[1:] = torch.cumsum(t - lo + 1, dim=0)
+    win = lo[:, None] + torch.arange(_V41_SWA, dtype=torch.int32)[None, :]
+    indices = win[win <= t[:, None]]
+    return indptr.to(device), indices.to(torch.int32).to(device)
+
+
+# topk: the page-table sampler above on both ranges. swa_rand / swa_clus: the V4.1
+# selection, top-k prefix rows (independent per token, or shared by groups of
+# neighbouring tokens) plus a sliding window.
+_MODES = ("topk", "swa_rand", "swa_clus")
+_V41_MODES = ("swa_rand", "swa_clus")
+
+
+def _ranges_csr(
+    n: int,
+    total_pages: int,
+    total_tokens: int,
+    topk: int,
+    mode: str,
+    *,
+    device: torch.device,
+    seed: int,
+):
+    """The prefix and extend CSRs, as ``(ip_p, ix_p, ip_e, ix_e)``."""
+    if mode in _V41_MODES:
+        ip_p, ix_p = _topk_csr(
+            n,
+            total_pages,
+            clustered=mode == "swa_clus",
+            device=device,
+            seed=seed * 2 + 1,
+        )
+        ip_e, ix_e = _swa_csr(n, total_tokens, device=device)
+        return ip_p, ix_p, ip_e, ix_e
+    ip_p, ix_p = _page_table_csr(
+        n, total_pages, topk, causal=False, device=device, seed=seed * 2 + 1
+    )
+    ip_e, ix_e = _page_table_csr(
+        n, total_tokens, topk, causal=True, device=device, seed=seed * 2 + 2
+    )
+    return ip_p, ix_p, ip_e, ix_e
+
+
 # ---------------------------------------------------------------------------
 # Input factory
 # ---------------------------------------------------------------------------
@@ -356,6 +457,7 @@ def _make_inputs(
     dtype: torch.dtype,
     *,
     topk: int = 1024,
+    mode: str = "topk",
     device: torch.device | str = "cuda",
     seed: int = 0,
     data_init: str = "norm",
@@ -377,11 +479,8 @@ def _make_inputs(
     ).to(dtype)
     attn_sink = fill((h,), data_init, gen, dtype=torch.float32, device=device) * 0.25
 
-    ip_p, ix_p = _page_table_csr(
-        n, total_pages, topk, causal=False, device=device, seed=seed * 2 + 1
-    )
-    ip_e, ix_e = _page_table_csr(
-        n, total_tokens, topk, causal=True, device=device, seed=seed * 2 + 2
+    ip_p, ix_p, ip_e, ix_e = _ranges_csr(
+        n, total_pages, total_tokens, topk, mode, device=device, seed=seed
     )
 
     _poison_unreferenced(total_pages, ix_p, bf16=unified_kv)
@@ -406,6 +505,7 @@ def _make_inputs_fp8(
     total_tokens: int,
     *,
     topk: int = 1024,
+    mode: str = "topk",
     device: torch.device | str = "cuda",
     seed: int = 0,
     data_init: str = "norm",
@@ -450,11 +550,8 @@ def _make_inputs_fp8(
 
     attn_sink = fill((h,), data_init, gen, dtype=torch.float32, device=device) * 0.25
 
-    ip_p, ix_p = _page_table_csr(
-        n, total_pages, topk, causal=False, device=device, seed=seed * 2 + 1
-    )
-    ip_e, ix_e = _page_table_csr(
-        n, total_tokens, topk, causal=True, device=device, seed=seed * 2 + 2
+    ip_p, ix_p, ip_e, ix_e = _ranges_csr(
+        n, total_pages, total_tokens, topk, mode, device=device, seed=seed
     )
 
     # The fp32 copies stay clean; the reference only reads rows that were named.
@@ -512,6 +609,7 @@ def _make_inputs_v41(
     total_tokens: int,
     *,
     topk: int = 1024,
+    mode: str = "topk",
     device: torch.device | str = "cuda",
     seed: int = 0,
     data_init: str = "norm",
@@ -542,11 +640,8 @@ def _make_inputs_v41(
 
     attn_sink = fill((h,), data_init, gen, dtype=torch.float32, device=device) * 0.25
 
-    ip_p, ix_p = _page_table_csr(
-        n, total_pages, topk, causal=False, device=device, seed=seed * 2 + 1
-    )
-    ip_e, ix_e = _page_table_csr(
-        n, total_tokens, topk, causal=True, device=device, seed=seed * 2 + 2
+    ip_p, ix_p, ip_e, ix_e = _ranges_csr(
+        n, total_pages, total_tokens, topk, mode, device=device, seed=seed
     )
 
     # 0xFF is NaN both as e4m3 and as E8M0; an NVFP4 row is NaN through its scales.
@@ -585,11 +680,11 @@ def _make_inputs_v41(
 # Backends
 # ---------------------------------------------------------------------------
 
-_BACKENDS = ("opus", "asm", "triton")
+_BACKENDS = ("opus", "opus_dma", "asm", "triton", "a16w16")
 
 _PREC_BACKENDS = {
     "bf16": ("opus", "triton"),
-    "v4_fp8": ("opus", "asm"),
+    "v4_fp8": ("opus", "opus_dma", "asm", "a16w16"),
     "v41_fp8": ("opus",),
     "v41_fp4": ("opus",),
 }
@@ -641,6 +736,7 @@ def run_mla_sparse_prefill(
     prec: str,
     *,
     topk: int = 1024,
+    mode: str = "topk",
     backends: tuple = _BACKENDS,
     seed: int = 0,
     data_init: str = "norm",
@@ -655,7 +751,7 @@ def run_mla_sparse_prefill(
     softmax_scale = 1.0 / math.sqrt(d)
     msg = (
         f"[N={n} H={h} D={d} total_pages={total_pages} total_tokens={total_tokens} "
-        f"prec={prec} topk={topk} data_init={data_init} seed={seed} "
+        f"prec={prec} mode={mode} topk={topk} data_init={data_init} seed={seed} "
         f"num_kv_splits={num_kv_splits}]"
     )
     wanted = [b for b in _PREC_BACKENDS[prec] if b in backends]
@@ -670,6 +766,7 @@ def run_mla_sparse_prefill(
             total_pages,
             total_tokens,
             topk=topk,
+            mode=mode,
             seed=seed,
             data_init=data_init,
             prefix_fp4=prec == "v41_fp4",
@@ -695,6 +792,7 @@ def run_mla_sparse_prefill(
             total_pages,
             total_tokens,
             topk=topk,
+            mode=mode,
             seed=seed,
             data_init=data_init,
         )
@@ -712,12 +810,61 @@ def run_mla_sparse_prefill(
                     ),
                 )
             )
+        if "opus_dma" in wanted and fp8_kv_dma_layout_enabled(_get_gpu_arch()):
+            # The kernel alone: caches converted once up front, as a KV writer
+            # emitting the DMA layout would leave them. ``opus`` converts per call.
+            dma_inputs = dict(
+                kernel_inputs,
+                unified_kv_nope=to_dma_kv_layout(
+                    kernel_inputs["unified_kv_nope"], kernel_inputs["unified_kv_rope"]
+                ),
+                kv_nope=to_dma_kv_layout(
+                    kernel_inputs["kv_nope"], kernel_inputs["kv_rope"]
+                ),
+            )
+            candidates.append(
+                (
+                    "opus_dma",
+                    lambda: mla_sparse_prefill_v4(
+                        **dma_inputs,
+                        softmax_scale=softmax_scale,
+                        num_kv_splits=num_kv_splits,
+                        backend="opus",
+                        kv_dma_layout=True,
+                    ),
+                )
+            )
         if "asm" in wanted and h == _ASM_HEADS and _get_gpu_arch() == "gfx1250":
             candidates.append(
                 (
                     "asm",
                     lambda: mla_sparse_prefill_v4(
                         **kernel_inputs, softmax_scale=softmax_scale, backend="asm"
+                    ),
+                )
+            )
+        if "a16w16" in wanted:
+            # The served path: KV dequantized to bf16 up front (outside the
+            # timed region), then the bf16 kernel on the same rows.
+            rf = data["ref"]
+            served_inputs = {
+                "q": rf["q_fp32"].to(torch.bfloat16),
+                "unified_kv": rf["ukv_fp32"].to(torch.bfloat16),
+                "kv": rf["kv_fp32"].to(torch.bfloat16),
+                "kv_indices_prefix": kernel_inputs["kv_indices_prefix"],
+                "kv_indptr_prefix": kernel_inputs["kv_indptr_prefix"],
+                "kv_indices_extend": kernel_inputs["kv_indices_extend"],
+                "kv_indptr_extend": kernel_inputs["kv_indptr_extend"],
+                "attn_sink": kernel_inputs["attn_sink"],
+            }
+            candidates.append(
+                (
+                    "a16w16",
+                    lambda: mla_sparse_prefill(
+                        **served_inputs,
+                        softmax_scale=softmax_scale,
+                        num_kv_splits=num_kv_splits,
+                        backend="opus",
                     ),
                 )
             )
@@ -730,6 +877,7 @@ def run_mla_sparse_prefill(
             total_tokens,
             _PREC_TO_DTYPE[prec],
             topk=topk,
+            mode=mode,
             seed=seed,
             data_init=data_init,
         )
@@ -769,10 +917,12 @@ def run_mla_sparse_prefill(
 
     ref = ref_fn(**ref_inputs, softmax_scale=softmax_scale) if verify else None
 
+    outs = {}
     for name, invoke in candidates:
         if verify:
+            outs[name] = invoke()
             err = checkAllclose(
-                invoke(),
+                outs[name],
                 ref,
                 rtol=_RTOL,
                 atol=_ATOL,
@@ -802,6 +952,73 @@ def run_mla_sparse_prefill(
                 tbps = nbytes / max(lat_us * 1e-6, 1e-12) / 1e12
                 row["asm TB/s"] = round(float(tbps), 2)
 
+    if "opus" in outs and "a16w16" in outs:
+        # fp8 against the served path on the same inputs, same tolerance.
+        err = checkAllclose(
+            outs["opus"],
+            outs["a16w16"],
+            rtol=_RTOL,
+            atol=_ATOL,
+            tol_err_ratio=_ERR_TOL,
+            msg=f"opus vs a16w16: {msg}",
+        )
+        row["opus vs a16w16 err"] = float(err)
+        assert err <= _ERR_TOL, (
+            f"opus vs a16w16: {msg} mismatch ratio {err:.3%} exceeds "
+            f"{_ERR_TOL:.1%} at rtol={_RTOL} atol={_ATOL}"
+        )
+
+    return row
+
+
+@benchmark()
+def run_kv_dma_layout(
+    rows: int,
+    *,
+    seed: int = 0,
+    data_init: str = "norm",
+    bench: bool = True,
+) -> dict | None:
+    """The KV conversion ``mla_sparse_prefill_v4`` runs on gfx950: NoPE re-based to
+    scale 2^0 and fp8 RoPE folded into slots [448, 512)."""
+    if _skip_if_unsupported(d=512):
+        return None
+    device = torch.device("cuda")
+    gen = make_generator(seed, device=device)
+    real = fill((rows, _FP8_D_NOPE), data_init, gen, dtype=torch.float32, device=device)
+    nope, deq = _quantize_nope(real * 0.5)
+    rope = (
+        fill((rows, _FP8_D_ROPE), data_init, gen, dtype=torch.float32, device=device)
+        * 0.5
+    ).to(torch.bfloat16)
+    nope_before = nope.view(torch.uint8).clone()
+
+    got = to_dma_kv_layout(nope, rope)
+    # The served row's real values, rounded once to e4m3 at scale 2^0.
+    ref = torch.cat([deq, rope.to(torch.float32)], dim=1).clamp(-448.0, 448.0)
+    ref = ref.to(torch.float8_e4m3fn)
+    err = checkAllclose(
+        got.to(torch.float32),
+        ref.to(torch.float32),
+        rtol=0,
+        atol=0,
+        msg=f"to_dma_kv_layout: [rows={rows} data_init={data_init} seed={seed}]",
+    )
+    assert (
+        err == 0
+    ), f"to_dma_kv_layout differs from the reference on {err:.3%} of values"
+    assert torch.equal(nope.view(torch.uint8), nope_before), "input cache was modified"
+
+    row = {"err": float(err)}
+    if bench:
+        _, lat_us = _profile_func(
+            lambda: to_dma_kv_layout(nope, rope), backend="triton"
+        )
+        nbytes = rows * (
+            2 * _FP8_D_NOPE_PADDED + 2 * _FP8_D_ROPE
+        )  # read row + RoPE, write row
+        row["us"] = round(float(lat_us), 2)
+        row["TB/s"] = round(nbytes / max(lat_us * 1e-6, 1e-12) / 1e12, 3)
     return row
 
 
@@ -846,6 +1063,71 @@ def test_mla_sparse_prefill(prec, n, h, total_pages, total_tokens, topk):
         verify=True,
         bench=False,
     )
+
+
+# The V4.1-Flash selection: top-k prefix rows plus a sliding window over the extend.
+_PYTEST_V41_CASES = [
+    # (N, H, total_pages, total_tokens)
+    (64, 16, 256, 256),
+    (256, 32, 1024, 256),
+    (256, 128, 2048, 2048),
+]
+
+
+@pytest.mark.parametrize("prec", ["bf16", "v4_fp8"])
+@pytest.mark.parametrize("mode", _V41_MODES)
+@pytest.mark.parametrize(
+    "n,h,total_pages,total_tokens",
+    _PYTEST_V41_CASES,
+    ids=lambda v: "x".join(map(str, v)) if isinstance(v, tuple) else str(v),
+)
+def test_mla_sparse_prefill_v41_selection(prec, mode, n, h, total_pages, total_tokens):
+    run_mla_sparse_prefill(
+        n=n,
+        h=h,
+        d=512,
+        total_pages=total_pages,
+        total_tokens=total_tokens,
+        prec=prec,
+        mode=mode,
+        seed=(hash((n, h, total_pages, total_tokens, prec, mode)) & 0xFFFF),
+        verify=True,
+        bench=False,
+    )
+
+
+# 65536 rows is large enough to expose a cross-warp read/write race in an
+# in-place conversion; 1 is below one 64-row block.
+@pytest.mark.parametrize("rows", [1, 512, 65536])
+def test_kv_dma_layout(rows):
+    run_kv_dma_layout(rows=rows, seed=rows, bench=False)
+
+
+# A heavy sink against 8 keys per token makes the sink's weight visible: split-K's
+# partial sums must be on the scale the reduce folds the sink against.
+def test_mla_sparse_prefill_v4_split_sink():
+    if _skip_if_unsupported(d=512):
+        return
+    data = _make_inputs_fp8(64, 16, 4096, 64, topk=8, seed=1)
+    kernel = dict(
+        data["kernel"], attn_sink=torch.full_like(data["kernel"]["attn_sink"], 3.0)
+    )
+    scale = 512**-0.5
+    whole, split = (
+        mla_sparse_prefill_v4(
+            **kernel, softmax_scale=scale, num_kv_splits=s, backend="opus"
+        )
+        for s in (1, 4)
+    )
+    err = checkAllclose(
+        split,
+        whole,
+        rtol=_RTOL,
+        atol=_ATOL,
+        tol_err_ratio=_ERR_TOL,
+        msg="v4 split-K vs unsplit, heavy sink",
+    )
+    assert err <= _ERR_TOL, f"split-K differs from unsplit on {err:.3%} of values"
 
 
 # Cover the unsplit cases not exercised by the common BF16/FP8 matrix.
@@ -1006,6 +1288,21 @@ parser.add_argument(
     help="rows each token draws from each range (default: [1024, 2048])",
 )
 parser.add_argument(
+    "--mode",
+    type=str,
+    nargs="*",
+    default=["topk"],
+    choices=list(_MODES),
+    help=(
+        "page table(s) to sweep (default: [topk]).\n"
+        "  topk    : --topk rows per token from each range, extend causal\n"
+        f"  swa_rand: {_V41_TOPK} random top-k prefix rows per token plus a\n"
+        f"            {_V41_SWA}-row sliding window over the extend tokens\n"
+        f"  swa_clus: as swa_rand, but each group of {_V41_GROUP} tokens shares\n"
+        f"            {_V41_SHARED} of its top-k rows"
+    ),
+)
+parser.add_argument(
     "--total_pages",
     type=int,
     nargs="*",
@@ -1077,8 +1374,9 @@ if __name__ == "__main__":
 
     rows = []
     # product varies its last argument fastest -> this is also the row order.
-    for prec, topk, h, n, total_pages, data_init, splits in itertools.product(
+    for prec, mode, topk, h, n, total_pages, data_init, splits in itertools.product(
         args.prec,
+        args.mode,
         args.topk,
         args.h_q,
         args.n_tokens,
@@ -1086,6 +1384,8 @@ if __name__ == "__main__":
         args.data_init,
         args.num_kv_splits,
     ):
+        if mode in _V41_MODES and topk != args.topk[0]:
+            continue  # the V4.1 selection fixes its own top-k
         total_tokens = args.total_tokens if args.total_tokens is not None else n
         row = run_mla_sparse_prefill(
             n=n,
@@ -1095,6 +1395,7 @@ if __name__ == "__main__":
             total_tokens=total_tokens,
             prec=prec,
             topk=topk,
+            mode=mode,
             backends=tuple(args.backend),
             seed=args.seed,
             data_init=data_init,
@@ -1115,12 +1416,34 @@ if __name__ == "__main__":
         # Column order otherwise follows whichever row first ran a backend.
         lead = [
             c
-            for c in ("prec", "topk", "data_init", "h", "n", "num_kv_splits")
+            for c in ("prec", "mode", "topk", "data_init", "h", "n", "num_kv_splits")
             if c in df.columns
         ]
         rest = [c for c in df.columns if c not in lead]
         metrics = [c for b in _BACKENDS for c in rest if c.startswith(f"{b} ")]
         df = df[lead + [c for c in rest if c not in metrics] + metrics]
         print_json_table("mla_sparse_prefill summary", df)
-        sys.exit(0)
+
+    if "v4_fp8" in args.prec:
+        # The conversion the fp8 path runs, at the prefix-cache sizes swept above.
+        layout_rows = sorted(
+            {
+                p if p > 0 else n
+                for p, n in itertools.product(args.total_pages, args.n_tokens)
+            }
+        )
+        layout = [
+            run_kv_dma_layout(
+                rows=r,
+                seed=args.seed,
+                data_init=args.data_init[0],
+                bench=not args.no_bench,
+            )
+            for r in layout_rows
+        ]
+        layout = [r for r in layout if r]
+        if layout:
+            df = pd.DataFrame(layout)
+            df = df.drop(columns=[c for c in ("bench", "seed") if c in df.columns])
+            print_json_table("kv dma layout summary", df)
     sys.exit(0)

@@ -10,7 +10,11 @@ New code should use :mod:`aiter.ops.mla_sparse_prefill`: ``mla_sparse_prefill`` 
 import torch
 
 from ..jit.utils.torch_guard import torch_compile_guard
-from .mla_sparse_prefill import _opus_sparse_prefill, _opus_sparse_prefill_v4
+from .mla_sparse_prefill import (
+    _opus_sparse_prefill,
+    _opus_sparse_prefill_v4,
+    fp8_kv_dma_layout_enabled,
+)
 from .opus.mla import (
     opus_mla_v4_prefill_a8w8_gfx950_fwd as pa_sparse_prefill_fp8_gfx950_opus_fwd,
 )
@@ -120,6 +124,7 @@ def _pa_sparse_prefill_fp8_opus_fake(
     attn_sink: torch.Tensor,
     softmax_scale: float,
     out: torch.Tensor | None = None,
+    kv_dma_layout: bool = False,
 ) -> torch.Tensor:
     if out is not None:
         return out
@@ -142,8 +147,10 @@ def pa_sparse_prefill_fp8_opus(
     attn_sink: torch.Tensor,
     softmax_scale: float,
     out: torch.Tensor | None = None,
+    kv_dma_layout: bool = False,
 ) -> torch.Tensor:
-    """:func:`aiter.ops.mla_sparse_prefill.mla_sparse_prefill_v4` on the opus backend."""
+    """:func:`aiter.ops.mla_sparse_prefill.mla_sparse_prefill_v4` on the opus backend,
+    ``kv_dma_layout`` included."""
     return _opus_sparse_prefill_v4(
         q_nope,
         q_rope,
@@ -158,10 +165,12 @@ def pa_sparse_prefill_fp8_opus(
         attn_sink,
         softmax_scale,
         out,
+        kv_dma_layout=kv_dma_layout,
     )
 
 
 __all__ = [
+    "fp8_kv_dma_layout_enabled",
     "pa_sparse_prefill_fp8_gfx950_opus_fwd",
     "pa_sparse_prefill_fp8_gfx1250_opus_fwd",
     "pa_sparse_prefill_fp8_opus",
