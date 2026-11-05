@@ -729,104 +729,20 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
     dim3 block({k.BLOCK_SIZE});
     {kernel_func}<{k.name}_Traits<D_C>><<<grid, block, 0, stream>>>(kargs);
 """
-    INSTANCE_IMPL = f"""{preamble}
-{host_tu_split}
-{traits_aliases}
-#if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
-template <typename D_C>
-void
-{k.name}(
-    aiter_tensor_t &XQ,
-    aiter_tensor_t &WQ,
-    aiter_tensor_t &x_scale,
-    aiter_tensor_t &w_scale,
-    aiter_tensor_t &Y)
-{{{{
-    AITER_CHECK((XQ.dim() == 2 || XQ.dim() == 3),
-        "opus_gemm_a8w8_blockscale_bpreshuffle_launch: XQ must be "
-        "[M,K] or [B,M,K]");
-    AITER_CHECK((WQ.dim() == 2 || WQ.dim() == 3),
-        "opus_gemm_a8w8_blockscale_bpreshuffle_launch: WQ must be "
-        "[N,K] or [B,N,K]");
-    AITER_CHECK((Y.dim() == 2 || Y.dim() == 3),
-        "opus_gemm_a8w8_blockscale_bpreshuffle_launch: Y must be "
-        "[M,N] or [B,M,N]");
-    AITER_CHECK(XQ.dtype() == AITER_DTYPE_fp8 && WQ.dtype() == AITER_DTYPE_fp8,
-        "opus_gemm_a8w8_blockscale_bpreshuffle_launch: expected fp8 XQ/WQ");
-    AITER_CHECK(Y.dtype() == AITER_DTYPE_bf16,
-        "opus_gemm_a8w8_blockscale_bpreshuffle_launch: expected bf16 Y");
-    AITER_CHECK(XQ.is_contiguous() && WQ.is_contiguous() && Y.is_contiguous(),
-        "opus_gemm_a8w8_blockscale_bpreshuffle_launch: expects contiguous "
-        "XQ/WQ/Y");
-
-    int batch = XQ.dim() == 3 ? XQ.size(0) : 1;
-    int M = XQ.dim() == 3 ? XQ.size(1) : XQ.size(0);
-    int K = XQ.dim() == 3 ? XQ.size(2) : XQ.size(1);
-    int N = WQ.dim() == 3 ? WQ.size(1) : WQ.size(0);
-    AITER_CHECK(batch == 1,
-        "opus_gemm_a8w8_blockscale_bpreshuffle_launch: gfx942 currently "
-        "supports batch=1 only");
-    AITER_CHECK((WQ.dim() == 2 || WQ.size(0) == batch) &&
-                    (Y.dim() == 2 || Y.size(0) == batch),
-        "opus_gemm_a8w8_blockscale_bpreshuffle_launch: batch dimensions "
-        "must match");
-    AITER_CHECK(WQ.size(WQ.dim() - 1) == K,
-        "opus_gemm_a8w8_blockscale_bpreshuffle_launch: WQ K dim must "
-        "match XQ K dim");
-    AITER_CHECK((Y.dim() == 3 ? Y.size(1) : Y.size(0)) == M &&
-                (Y.dim() == 3 ? Y.size(2) : Y.size(1)) == N,
-        "opus_gemm_a8w8_blockscale_bpreshuffle_launch: Y shape must be "
-        "[M,N] or [B,M,N]");
-    AITER_CHECK(N % {k.B_N} == 0 && K % {k.B_K} == 0,
-        "opus_gemm_a8w8_blockscale_bpreshuffle_launch: gfx942 requires "
-        "exact N/K tiles: N%",
-        {k.B_N}, "=0 K%", {k.B_K}, "=0");
-
-    int GROUP_N = {k.GROUP_N};
-    int GROUP_K = {k.GROUP_K};
-    int num_groups_n = N / GROUP_N;
-    int num_groups_k = K / GROUP_K;
-
-    const auto& xs = x_scale;
-    const auto& ws = w_scale;
-    AITER_CHECK(xs.dtype() == AITER_DTYPE_fp32 && ws.dtype() == AITER_DTYPE_fp32,
-        "opus_gemm_a8w8_blockscale_bpreshuffle_launch: expects fp32 scales");
-    AITER_CHECK(xs.is_contiguous() && ws.is_contiguous(),
-        "opus_gemm_a8w8_blockscale_bpreshuffle_launch: expects contiguous "
-        "scales");
-    AITER_CHECK(xs.device_id == XQ.device_id && ws.device_id == XQ.device_id,
-        "opus_gemm_a8w8_blockscale_bpreshuffle_launch: scales must be on "
-        "the XQ device");
-    AITER_CHECK(xs.dim() == 2 && xs.size(0) == M && xs.size(1) == num_groups_k,
-        "opus_gemm_a8w8_blockscale_bpreshuffle_launch: x_scale must use "
-        "the transposed storage contract with shape [M,K/128]");
-    AITER_CHECK(ws.dim() == 2 && ws.size(0) == num_groups_n && ws.size(1) == num_groups_k,
-        "opus_gemm_a8w8_blockscale_bpreshuffle_launch: w_scale must be "
-        "row-major [N/128,K/128]");
-
-    int num_tiles_m = (M + {k.B_M} - 1) / {k.B_M};
-    int num_tiles_n = N / {k.B_N};
-    auto stream = aiter::getCurrentHIPStream();
-
-    {kargs_name} kargs{{{{}}}};
-    kargs.ptr_a = XQ.data_ptr();
-    kargs.ptr_b = WQ.data_ptr();
-    kargs.ptr_c = Y.data_ptr();
-    kargs.m = M;
-    kargs.k = K;
-    kargs.stride_a = K;
-    kargs.stride_b = K;
-    kargs.stride_c = N;
-
-    kargs.ptr_sfa = xs.data_ptr();
-    kargs.ptr_sfb = ws.data_ptr();
-    kargs.stride_sfb = num_groups_k;
-
-{kernel_launch}
-
-}}}}
-#endif // launcher only on regular host pass
-"""
+    INSTANCE_IMPL = render_template(
+        "gfx942_a8w8_bpreshuffle_launcher.cuh.j2",
+        preamble=preamble,
+        host_tu_split=host_tu_split,
+        traits_aliases=traits_aliases,
+        name=k.name,
+        B_N=k.B_N,
+        B_K=k.B_K,
+        GROUP_N=k.GROUP_N,
+        GROUP_K=k.GROUP_K,
+        B_M=k.B_M,
+        kargs_name=kargs_name,
+        kernel_launch=kernel_launch,
+    )
     write_if_changed(os.path.join(cg.impl_path, f"{k.name}.cuh"), INSTANCE_IMPL)
     record_one_instantiation(
         cg,
