@@ -36,7 +36,7 @@ import functools
 import flydsl.expr as fx
 import torch
 from flydsl._mlir.dialects import llvm as llvm_dialect
-from flydsl.expr import gpu, rocdl
+from flydsl.expr import arith, gpu, rocdl
 from flydsl.expr.rocdl import tdm_ops
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
@@ -145,6 +145,50 @@ def s_buffer_load(ptr, offset, size, dtype=fx.Int32, *, num_records_bytes=None):
         out += raw if dtype is fx.Int32 else [v.bitcast(dtype) for v in raw]
         taken += width
     return out
+
+
+# ============================================================================
+# Float helpers for the softmax hot path. Shared by the a16w16 and a8w8 cores,
+# which ran identical private copies.
+# ============================================================================
+
+_FASTMATH = arith.FastMathFlags.fast
+# fast-math WITHOUT reassoc: LLVM's Reassociate pass otherwise re-linearizes the sum
+# tree back into a serial chain (max survives -- Reassociate ignores maxnum).
+_NO_REASSOC = (
+    arith.FastMathFlags.nnan
+    | arith.FastMathFlags.ninf
+    | arith.FastMathFlags.nsz
+    | arith.FastMathFlags.arcp
+    | arith.FastMathFlags.contract
+    | arith.FastMathFlags.afn
+)
+
+
+def fmax_fastmath(a, b):
+    return fx.maxnumf(a, b, fastmath=_FASTMATH)
+
+
+def fadd_fastmath(a, b):
+    return a.addf(b, fastmath=_FASTMATH)
+
+
+def fadd_no_reassoc(a, b):
+    return a.addf(b, fastmath=_NO_REASSOC)
+
+
+def fsub_fastmath(a, b):
+    with arith.fastmath(_FASTMATH):
+        return a - b
+
+
+def fmul_fastmath(a, b):
+    with arith.fastmath(_FASTMATH):
+        return a * b
+
+
+def exp2_fastmath(x):
+    return fx.exp2(x, fastmath="afn")
 
 
 def _bare_barrier():

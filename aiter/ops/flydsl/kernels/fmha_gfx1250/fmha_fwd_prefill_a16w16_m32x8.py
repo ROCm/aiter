@@ -73,6 +73,12 @@ from .fmha_buffer_managers import (
     _ir,
 )
 from .fmha_utils import (
+    exp2_fastmath,
+    fadd_fastmath,
+    fadd_no_reassoc,
+    fmax_fastmath,
+    fmul_fastmath,
+    fsub_fastmath,
     _paged_layout_ok,
     PagedSpec,
     _ContiguousKVPolicy,
@@ -196,7 +202,7 @@ N_BLOCK_WIDE_MAX_QK_HDIM = 128
 N_KV_PP = 3
 
 # Softmax runs in log2 units: LOG2E is folded into Q by the Q loader's bf16 multiply, so
-# the inner loop is a plain exp2(S' - m) and m/LSE live in the log2 domain.
+# the inner loop is a plain exp2_fastmath(S' - m) and m/LSE live in the log2 domain.
 
 # Deferred oaccu rescale (FAv4, hk_mla spec §9.1.1): corr == 1 when the running max does
 # not move, so keep m STALE while the row max stays within RESCALE_THRESHOLD natural
@@ -206,7 +212,7 @@ RESCALE_THRESHOLD = 8.0
 
 # Running-max seed: finite big-negative, not -inf, so a fully-masked row keeps m finite
 # and softmax's (m_prev - m_new) / fma(s, .., -m) never do -inf arithmetic (NaN).
-# exp2(big_neg - real) still underflows to 0. Masked scores themselves stay -inf.
+# exp2_fastmath(big_neg - real) still underflows to 0. Masked scores themselves stay -inf.
 BIG_NEG = -1.0e30
 
 # Compile-time Q/K/V loader select. False = V1 (cluster_load_async), True = V2 (TDM,
@@ -320,44 +326,9 @@ def _softmax(
     """
     num_kv_frags = n_block // WMMA_N
     f32 = T.f32
-    fast = arith.FastMathFlags.fast
     neg_inf = fx.Float32(float("-inf"))
     _defer = ENABLE_DEFER_RESCALE and RESCALE_THRESHOLD >= 0.0
 
-    def fmax(a, b):
-        return fx.maxnumf(a, b, fastmath=fast)
-
-    def fadd(a, b):
-        return a.addf(b, fastmath=fast)
-
-    # fast-math WITHOUT reassoc: LLVM's Reassociate pass otherwise re-linearizes the
-    # sum tree back into a serial chain (max survives — Reassociate ignores maxnum).
-    _fast_math = arith.FastMathFlags
-    _no_reassoc = (
-        _fast_math.nnan
-        | _fast_math.ninf
-        | _fast_math.nsz
-        | _fast_math.arcp
-        | _fast_math.contract
-        | _fast_math.afn
-    )
-
-    def fadd_t(a, b):
-        return a.addf(b, fastmath=_no_reassoc)
-
-    def fsub(a, b):
-        with arith.fastmath(fast):
-            return a - b
-
-    def fmul(a, b):
-        with arith.fastmath(fast):
-            return a * b
-
-    def fsub_inf(a, b):  # masked s is -inf and must stay -inf: no ninf fast-math here
-        return fx.Float32(arith.subf(_raw(a), _raw(b)))
-
-    def exp2(x):
-        return fx.exp2(x, fastmath="afn")
 
     # permlanex16 selectors: identity cross-16 gather (nibbles 0..15) => lane l<->l^16.
     sel_lo, sel_hi = _raw(fx.Int32(0x76543210)), _raw(fx.Int32(0xFEDCBA98))
@@ -423,23 +394,23 @@ def _softmax(
         s_masked_list.append(s_masked)
 
     # ---- Row max: balanced max-trees, interleaved across rows. ----
-    max3 = lambda a, b, c: fmax(fmax(a, b), c)
-    local_max_list = _tree_reduce_multi(s_masked_list, max3, fmax)
+    max3 = lambda a, b, c: fmax_fastmath(fmax_fastmath(a, b), c)
+    local_max_list = _tree_reduce_multi(s_masked_list, max3, fmax_fastmath)
 
     # ---- Per row: peer reduce + deferred-rescale decision + corr. ----
     m_new_list, corr_list = [], []
     rescale_masks = None if not _defer else []
     for r in range(num_q_tiles):
         m_prev, q_min = m_prev_list[r], q_min_list[r]
-        row_max = fmax(local_max_list[r], peer(local_max_list[r]))
-        m_full = fmax(m_prev, row_max)
+        row_max = fmax_fastmath(local_max_list[r], peer(local_max_list[r]))
+        m_full = fmax_fastmath(m_prev, row_max)
 
         # Deferred oaccu rescale: keep m STALE while the running max barely moves, so the
         # caller SKIPS the wide `o_acc *= corr`. The ballot promotes the test to
         # wave-uniform for that branch. `>` lowers to ordered OGT, so a fully-masked
         # lane's -inf - -inf = NaN compares false and never forces a rescale.
         if _defer:
-            need = fsub(row_max, m_prev) > fx.Float32(RESCALE_THRESHOLD * LOG2E)
+            need = fsub_fastmath(row_max, m_prev) > fx.Float32(RESCALE_THRESHOLD * LOG2E)
             # Select on the per-lane `need`, not the ballot: every lane owns its own q row
             # (the l<->l^16 pair agrees after the peer reduce), so staleness is per-lane
             # and the ballot is only the caller's branch condition. That leaves the branch
@@ -452,20 +423,21 @@ def _softmax(
 
         # log2-domain, so exp2 takes the difference directly. m is seeded to BIG_NEG
         # (finite), so a fully masked row keeps m_new = BIG_NEG -> corr = 1 and
-        # p = exp2(-inf) = 0, with no (-inf)-(-inf) anywhere and no clamp needed.
-        corr = exp2(fsub(m_prev, m_new))
+        # p = exp2_fastmath(-inf) = 0, with no (-inf)-(-inf) anywhere and no clamp needed.
+        corr = exp2_fastmath(fsub_fastmath(m_prev, m_new))
         m_new_list.append(m_new)
         corr_list.append(corr)
 
-    # ---- Pass 2: p = exp2(S - m_new), every row's subs before any exp. The subs pair
+    # ---- Pass 2: p = exp2_fastmath(S - m_new), every row's subs before any exp. The subs pair
     # into v_dual_sub_f32 against their row's shared m_new, and the exp run stays pure
     # TRANS -- the coexecution hazard is TRANS followed by non-TRANS VALU, so an
     # uninterrupted run needs none of the v_nop padding an interleaved one does. ----
+    # Raw subf, no ninf fast-math: masked s is -inf and must stay -inf.
     diff_list = [
-        [fsub_inf(sv, m_new_list[r]) for sv in s_masked_list[r]]
+        [fx.Float32(arith.subf(_raw(sv), _raw(m_new_list[r]))) for sv in s_masked_list[r]]
         for r in range(num_q_tiles)
     ]
-    p_flat_list = [[exp2(d) for d in diff] for diff in diff_list]
+    p_flat_list = [[exp2_fastmath(d) for d in diff] for diff in diff_list]
     p_list = [
         [
             fx.Vector.from_elements(
@@ -478,15 +450,15 @@ def _softmax(
 
     # ---- Row sum: interleaved balanced sum-trees. fadd_t drops reassoc so LLVM's
     # Reassociate does not re-linearize the tree into a serial chain. ----
-    add3 = lambda a, b, c: fadd_t(fadd_t(a, b), c)
-    local_sum_list = _tree_reduce_multi(p_flat_list, add3, fadd_t)
+    add3 = lambda a, b, c: fadd_no_reassoc(fadd_no_reassoc(a, b), c)
+    local_sum_list = _tree_reduce_multi(p_flat_list, add3, fadd_no_reassoc)
 
     d_new_list = []
     for r in range(num_q_tiles):
         d_new_list.append(
-            fadd(
-                fmul(corr_list[r], d_prev_list[r]),
-                fadd(local_sum_list[r], peer(local_sum_list[r])),
+            fadd_fastmath(
+                fmul_fastmath(corr_list[r], d_prev_list[r]),
+                fadd_fastmath(local_sum_list[r], peer(local_sum_list[r])),
             )
         )
     return p_list, m_new_list, d_new_list, corr_list, rescale_masks
@@ -1275,7 +1247,7 @@ def _attention_core_multi_kv_tiles(
 
     # ---- Loop init: the online-softmax seed and the O accumulators, all iter_args.
     #
-    # Seeding m=-inf, d=0, O=0 makes the first tile's corr = exp2(m_prev-m_new) = 0 zero
+    # Seeding m=-inf, d=0, O=0 makes the first tile's corr = exp2_fastmath(m_prev-m_new) = 0 zero
     # the (already-zero) O before its PV adds in — the standard flash seed.
     #
     # Attention sink (compile-time) is one extra ``exp(sink)`` term in the softmax denom.
