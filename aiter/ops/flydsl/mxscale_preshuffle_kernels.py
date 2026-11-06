@@ -26,6 +26,8 @@ import functools
 
 import torch
 
+from aiter.utility.graph_alloc import capture_scoped_cache, persistent_alloc
+
 # gemm_a8w8_mxfp8_bpreshuffle's gfx950 scales per w_scale block (row-major 1x32
 # x_scale; 1x32 or 32x32 w_scale), defined next to its tune pipelines;
 # re-exported for the runner and AOT.
@@ -34,6 +36,8 @@ from .gemm_tune.flydsl_gemm_mxscale_preshuffle_common import (
 )
 
 _OUT_DTYPE_STR = {torch.bfloat16: "bf16", torch.float16: "fp16"}
+# 256 CUs over 8 XCDs: the fused split-K l2_reduce grid's per-XCD budget.
+_GFX950_CUS_PER_XCD = 32
 
 
 @functools.cache
@@ -51,11 +55,41 @@ def _reduce_exe():
     import flydsl.compiler as flyc
 
     from .kernels.gemm.mxscale_preshuffle import launch_splitk_reduce
+    from .kernels.kernels_common import set_slp_vectorize_once_used
 
-    return flyc.jit(launch_splitk_reduce.func)
+    # flyc.jit(.func) starts with empty compile_hints, so the hint on
+    # launch_splitk_reduce itself never reaches this reduction.
+    return set_slp_vectorize_once_used(flyc.jit(launch_splitk_reduce.func), False)
 
 
-@functools.lru_cache(maxsize=1024)
+@functools.cache
+def _fused_splitk_workspace(
+    device: torch.device,
+    stream_id: int,
+    split_k: int,
+    M: int,
+    N: int,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    # Every split stores its whole partial before arriving, so this needs no
+    # initialization and is shared with captures. Never evicted: a captured
+    # graph may point at it.
+    del stream_id
+    with persistent_alloc(device):
+        return torch.empty((split_k, M, N), dtype=dtype, device=device)
+
+
+@capture_scoped_cache
+def _fused_splitk_semaphore(
+    device: torch.device, stream_id: int, num_tiles: int
+) -> torch.Tensor:
+    # Safe to reuse: launches on a stream are ordered and each tile's last
+    # arrival hands its counter back zeroed.
+    del stream_id
+    with persistent_alloc(device):
+        return torch.zeros((num_tiles,), dtype=torch.int32, device=device)
+
+
 def _fused_splitk_buffers(
     device: torch.device,
     stream_id: int,
@@ -67,10 +101,10 @@ def _fused_splitk_buffers(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Stream-private partials (BF16 for the coarse small-M path, FP32 for 1x32
     row scales) and per-output-tile arrival counters."""
-    del stream_id
-    workspace = torch.empty((split_k, M, N), dtype=dtype, device=device)
-    semaphore = torch.zeros((num_tiles,), dtype=torch.int32, device=device)
-    return workspace, semaphore
+    return (
+        _fused_splitk_workspace(device, stream_id, split_k, M, N, dtype),
+        _fused_splitk_semaphore(device, stream_id, num_tiles),
+    )
 
 
 def flydsl_mxscale_preshuffle_gemm(
@@ -94,32 +128,13 @@ def flydsl_mxscale_preshuffle_gemm(
     a_scale_layout: str,
     b_scale_layout: str,
     fused_split_k: bool = False,
+    prefetch: bool | int = False,
+    b_nt: bool = False,
+    l2_reduce: bool | None = None,
 ) -> torch.Tensor:
     """Run the gfx950 MXFP4/6/8 preshuffle GEMM. a8w8 = a_dtype="fp8", b_dtype="fp8".
 
     A is [M, K]; N is taken from Out ([M, N]); K from A. Returns Out.
-
-    split_k>1 splits the K reduction across grid.z: fp32 partial slabs and a
-    separate reduce kernel, or, with fused_split_k (row layouts, bf16 Out), an
-    in-kernel reduce by each output tile's last-arriving block -- the same FP32
-    numbers, a tunable (kernelName ``_fsk``). A mfma_tile coarse-block M<=16 tile
-    reduces BF16 partials in-kernel instead.
-
-    Each operand's scale is a block and a layout, always named by the caller (see
-    flydsl_gemm_mxscale_preshuffle_common.SCALE_LAYOUTS); a default would read one
-    contract's bytes as the other's:
-
-    * a_scale_block "1x32" | "1x128", b_scale_block "1x32" | "128x128" | "32x32".
-      The coarse blocks are a8w8-only; a 128x128 b_scale needs N%128==0.
-    * "row" (a8w8): the UNSHUFFLED E8M0 as quantized, staged by the kernel
-      itself: a 1x32 A [M, K//32] (no row padding) / B [N, K//32]; a 32x32 B
-      [N//32, K//32]; a 1x128 A the blockscale column-major bytes [K//128, M]
-      (a contiguous (M, K//128) tensor holding them, as bmm's transposed
-      x_scale); a 128x128 B [N//128, K//128].
-    * "mfma_tile": pre-shuffled into the MFMA operand order by the caller -- the
-      per-1x32 scales through ``shuffle_scale_a16w4``, the coarse 1x128 / 128x128
-      blocks in the compact broadcast layout the kernel reads (no aiter helper
-      builds those; no aiter op passes them). The op does NOT repack them.
     """
     from .gemm_tune.flydsl_gemm_mxscale_preshuffle_common import (
         SCALE_BLOCKS_A,
@@ -263,6 +278,23 @@ def flydsl_mxscale_preshuffle_gemm(
     gemm_exe = _gemm_exe(splitk_fused)
     # launch_gemm's Constexpr tail but fused_split_k, which each launch appends.
     spec = (*cfg, multi_row, *layouts)
+    if prefetch is True:
+        from .gemm_tune.flydsl_gemm_mxscale_preshuffle_common import prefetch_depth
+
+        N = int(Out.shape[-1])
+        depth = prefetch_depth(
+            int(tile_m), int(tile_n), int(tile_k), N, K, split_k, bool(b_nt)
+        )
+        if depth < 2:
+            raise ValueError(
+                f"no prefetch depth for tile {tile_m}x{tile_n}x{tile_k}, K={K}, "
+                f"split_k={split_k}"
+            )
+    else:
+        depth = max(1, int(prefetch))
+    if b_nt and depth < 2:
+        raise ValueError("b_nt streams the prefetch pipeline's B: needs prefetch")
+    pf_tail = (depth, bool(b_nt)) if depth > 1 else ()
     # Build each runtime pointer wrapper once per op.  The fused ABI carries two
     # additional pointer slots; re-wrapping Out (or the split workspace) for
     # those aliases measurably increases launch gaps on very short decode GEMMs.
@@ -285,7 +317,8 @@ def flydsl_mxscale_preshuffle_gemm(
             st,
             *spec,
             False,  # fused_split_k
-            specialization_key=(*spec, False),
+            *pf_tail,
+            specialization_key=(*spec, False, *pf_tail),
         )
         return Out
 
@@ -303,16 +336,18 @@ def flydsl_mxscale_preshuffle_gemm(
                     torch.float32 if fused_f32 else torch.bfloat16,
                 )
         else:
-            # Compile-only/AOT uses an fx.Stream placeholder and CPU/Fake tensors.
-            workspace, semaphore = _fused_splitk_buffers(
-                A.device,
-                0,
-                split_k,
-                M,
-                N,
-                num_tiles,
-                torch.float32 if fused_f32 else torch.bfloat16,
+            # Compile-only/AOT uses an fx.Stream placeholder and CPU/Fake tensors:
+            # nothing launches, so skip the HIP pool and capture lookups.
+            workspace = torch.empty(
+                (split_k, M, N),
+                dtype=torch.float32 if fused_f32 else torch.bfloat16,
+                device=A.device,
             )
+            semaphore = torch.zeros((num_tiles,), dtype=torch.int32, device=A.device)
+
+        if l2_reduce is None:
+            l2_reduce = -(-num_tiles // 8) * split_k <= _GFX950_CUS_PER_XCD
+        fused_tail = (depth, bool(b_nt), True) if fused_f32 and l2_reduce else pf_tail
         _run_compiled(
             gemm_exe,
             ptr_arg(workspace),
@@ -327,7 +362,8 @@ def flydsl_mxscale_preshuffle_gemm(
             st,
             *spec,
             fused_f32,  # fused_split_k
-            specialization_key=(*spec, fused_f32),
+            *fused_tail,
+            specialization_key=(*spec, fused_f32, *fused_tail),
         )
         return Out
 
@@ -348,7 +384,8 @@ def flydsl_mxscale_preshuffle_gemm(
         st,
         *spec,
         False,  # fused_split_k
-        specialization_key=(*spec, False),
+        *pf_tail,
+        specialization_key=(*spec, False, *pf_tail),
     )
     _run_compiled(
         _reduce_exe(),
@@ -387,12 +424,12 @@ def _heuristic_tile(a_dtype, b_dtype, M, N, K, scales):
 
     # scales: candidates_for's scale kwargs as sorted (name, value) pairs, which
     # keep the call hashable for the cache.
-    # tile_k=512 and _fsk are tuned-only options: the heuristic keeps its
+    # tile_k=512, _fsk and _pf are tuned-only options: the heuristic keeps its
     # untuned picks.
     cands = [
         ki
         for _, ki in candidates_for(a_dtype, b_dtype, M, N, K, **dict(scales))
-        if ki.tile_k <= 256 and not ki.fused_split_k
+        if ki.tile_k <= 256 and not ki.fused_split_k and not ki.prefetch
     ]
     if not cands:
         return None
@@ -429,8 +466,8 @@ def run_gemm_a8w8_mxfp8_gfx950(
     XQ [M, K] fp8 row-major; WQ [N, K] fp8, shuffle_weight(., (16, 16)).
     x_scale [M, K // 32] and w_scale e8m0, row-major and NOT shuffled (no row
     padding): the kernel stages them through LDS itself. w_scale is
-    [N, K // 32] for a 1x32 ``w_scale_block`` or [N // 32, K // 32] for 32x32
-    (bmm's); None reads the block off its shape. ``kernel_name`` is a tuned
+    [N, K // 32] for a 1x32 ``w_scale_block`` or [N // 32, K // 32] for 32x32;
+    None reads the block off its shape. ``kernel_name`` is a tuned
     row's mxpsh or 8-wave kernelName, else the heuristic picks an mxpsh tile.
     """
     from ..gemm_op_common import mxscale_w_scale_block
@@ -502,6 +539,8 @@ def run_gemm_a8w8_mxfp8_gfx950(
         xcd_swizzle=p["xcd_swizzle"],
         split_k=p["split_k"],
         fused_split_k=p["fused_split_k"],
+        prefetch=p["prefetch"],
+        b_nt=p["b_nt"],
         **dict(scales),
     )
 
