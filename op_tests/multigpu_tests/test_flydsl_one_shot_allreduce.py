@@ -379,6 +379,16 @@ FUSED_SPLIT_SCALES = (1e-2, 10.0)
 # shows in the output, so the share of bf16 lanes that differ by an ulp is the
 # measure. The cap holds with margin over the current fixed point (0.1-0.4%) and is far
 # below what the former 2**-16 gave (8-16%).
+# ``fused_split_poison``: the magnitude at which one element poisons a split
+# row. A case is ``(atoms, split, hiddens)`` and each hidden gives ``hidden / (512 * atoms)``
+# writers.
+SPLIT_POISON_CASES = (
+    (1, 2, (1024, 2048, 4096, 7168, 8192, 15360)),  # 2, 4, 8, 14, 16, 30 writers
+    (1, 7, (3584,)),  # 7 writers
+    (2, 2, (8192,)),  # 8 writers, with 1024 elements to a wave
+)
+# bf16 steps swept on each side of the first poisoning value.
+SPLIT_POISON_STEPS = 4
 SPLIT_EXCHANGE_SCALE = 1e-4
 SPLIT_EXCHANGE_MAX_ULP_LANES = 0.01
 SPLIT_EXCHANGE_SPLIT = 2
@@ -1844,6 +1854,104 @@ def _split_exchange_failures(eng, unsplit, rank, tp, m, hidden, device) -> list[
     return bad
 
 
+def _split_poison_first_bf16(hidden: int, atoms: int) -> int:
+    """The int16 bits of the smallest bf16 that poisons a split row alone.
+
+    A wave of ``512 * atoms`` elements adds its sum of squares to the row's
+    exchange word and poisons it at ``xchg_clamp_units`` or above. Where the
+    wave's other elements are zero, the sum is the square of one bf16, which is
+    exact, so the boundary is exact too. The clamp falls as the number of
+    writers, ``hidden / (512 * atoms)``, grows.
+    """
+    import math
+
+    from aiter.ops.flydsl.kernels.comm.quick_allreduce_fusions import (
+        XCHG_FIX_BITS,
+        xchg_clamp_units,
+    )
+
+    clamp = xchg_clamp_units(hidden // (512 * atoms)) * 2.0**-XCHG_FIX_BITS
+
+    def value(bits):
+        return float(torch.tensor(bits, dtype=torch.int16).view(torch.bfloat16))
+
+    bits = int(torch.tensor(math.sqrt(clamp)).to(torch.bfloat16).view(torch.int16))
+    while value(bits) ** 2 < clamp:
+        bits += 1
+    while value(bits - 1) ** 2 >= clamp:
+        bits -= 1
+    return bits
+
+
+def _split_poison_failures(
+    eng, unsplit, rank, tp, m, hidden, device, atoms
+) -> list[str]:
+    """Where a split row turns NaN, to the bf16 step.
+
+    The row's sum of squares goes through a fixed-point exchange with a bounded
+    range, so a wave whose partial is too large poisons the row, and every
+    workgroup of it decodes NaN for ``out``. The first ``2 * SPLIT_POISON_STEPS
+    + 1`` rows hold one element each, on consecutive bf16 values around the
+    first one that poisons (``_split_poison_first_bf16``), and zeros elsewhere,
+    so the wave's sum of squares is exactly the square of that element. The
+    last row is ordinary. Exactly the rows at or above the boundary must have an
+    all-NaN ``out`` and no row may be partly NaN, on every rank. Each row's
+    ``residual_out`` must stay bit-exact, since only the norm reads the
+    exchange, and the ordinary row must stay on the reference. The unsplit
+    build, which has no such limit, must give every row finite.
+
+    The elements alternate between the first and the last column, so the
+    first and the last workgroup of a row both get to poison it.
+    """
+    import torch.distributed as dist
+
+    steps = SPLIT_POISON_STEPS
+    assert m == 2 * steps + 2, f"{m} rows, expected {2 * steps + 2}"
+    bad = []
+    eng.preload(hidden)
+    unsplit.preload(hidden)
+    first = _split_poison_first_bf16(hidden, atoms)
+
+    parts, residual, weight = _fused_inputs(m, hidden, tp, device)
+    sweep = 2 * steps + 1
+    for p in (*parts, residual):
+        p[:sweep] = 0
+    bits = torch.arange(first - steps, first + steps + 1, dtype=torch.int16)
+    values = bits.view(torch.bfloat16).to(device)
+    for row in range(sweep):
+        residual[row, 0 if row % 2 else hidden - 1] = values[row]
+    inp = parts[rank].contiguous()
+    out, res_out = eng.allreduce_rmsnorm(inp, residual, weight, RMS_EPS)
+    out_unsplit, _ = unsplit.allreduce_rmsnorm(inp, residual, weight, RMS_EPS)
+    out_ref, res_ref = _fused_reference(parts, residual, weight, RMS_EPS)
+    torch.cuda.synchronize()
+
+    tag = f"{m}x{hidden} atoms={atoms} (first poisoning value {values[steps].item()})"
+    want = torch.zeros(m, dtype=torch.bool, device=device)
+    want[steps:sweep] = True
+    nan_rows = out.isnan().all(-1)
+    if not torch.equal(nan_rows, want) or int(out.isnan().sum()) != hidden * (
+        steps + 1
+    ):
+        bad.append(
+            f"{tag}: rows with an all-NaN out are {nan_rows.nonzero().flatten().tolist()}"
+            f" ({int(out.isnan().sum())} NaN lanes), expected rows "
+            f"{want.nonzero().flatten().tolist()}"
+        )
+    if _sqnr_db(out_ref[-1].float(), out[-1].float()) < SQNR_FLOOR_DB:
+        bad.append(f"{tag}: the ordinary row of out is not on the reference")
+    if not torch.equal(res_out.view(torch.int16), res_ref.view(torch.int16)):
+        bad.append(f"{tag}: residual_out differs from the reference")
+    if out_unsplit.isnan().any() or (
+        _sqnr_db(out_ref.float(), out_unsplit.float()) < SQNR_FLOOR_DB
+    ):
+        bad.append(f"{tag}: the unsplit build is not finite and on the reference")
+    r = _bits_agree(out.isnan().to(torch.bfloat16), tp, dist)
+    if r is not None:
+        bad.append(f"{tag}: the NaN rows on rank {r} differ from rank 0's")
+    return bad
+
+
 def _capture_ready_failures(rank, tp, hidden, device, dist) -> list[str]:
     """No rung is built or compiled inside a graph capture, whatever the warmup."""
     from flydsl.compiler import jit_function as jf
@@ -2234,7 +2342,12 @@ def _run_rank_fused(args, rank, device, dist) -> None:
         failures.extend(
             _capture_ready_failures(rank, args.tp, args.hiddens[0], device, dist)
         )
-    elif args.mode == "fused_split_exchange":
+    elif args.mode in ("fused_split_exchange", "fused_split_poison"):
+        check = (
+            _split_exchange_failures
+            if args.mode == "fused_split_exchange"
+            else functools.partial(_split_poison_failures, atoms=args.atoms)
+        )
         unsplit = OneShotAllReduceRMSNorm(
             group=dist.group.WORLD,
             device=device,
@@ -2244,9 +2357,7 @@ def _run_rank_fused(args, rank, device, dist) -> None:
             max_bytes=1 << 30,
         )
         for m, hidden in zip(args.tokens, args.hiddens, strict=True):
-            failures.append(
-                _split_exchange_failures(eng, unsplit, rank, args.tp, m, hidden, device)
-            )
+            failures.append(check(eng, unsplit, rank, args.tp, m, hidden, device))
         unsplit.close()
     else:
         for m, hidden in zip(args.tokens, args.hiddens, strict=True):
@@ -2657,6 +2768,24 @@ def test_one_shot_allreduce_rmsnorm_split_exchange(world_size):
     for rank, shapes in enumerate(ranks):
         for bad in shapes:
             assert not bad, f"tp={world_size}, rank {rank}: " + "; ".join(bad)
+
+
+@_graded_benchmark
+def test_one_shot_allreduce_rmsnorm_split_poison(world_size):
+    """The magnitude at which one element makes a split row NaN, to the bf16
+    step, for every clamp the writer count can give."""
+    rows = 2 * SPLIT_POISON_STEPS + 2
+    for atoms, split, hiddens in SPLIT_POISON_CASES:
+        ranks = _fused_spawn(
+            world_size,
+            [(rows, h) for h in hiddens],
+            mode="fused_split_poison",
+            atoms=atoms,
+            split=split,
+        )
+        for rank, shapes in enumerate(ranks):
+            for bad in shapes:
+                assert not bad, f"tp={world_size}, rank {rank}: " + "; ".join(bad)
 
 
 @_graded_benchmark
@@ -3087,6 +3216,7 @@ def _verify_fused(tps, extended: bool) -> None:
             ]
             + [test_one_shot_allreduce_rmsnorm_run_ahead(tp)]
             + [test_one_shot_allreduce_rmsnorm_alias(tp)]
+            + [test_one_shot_allreduce_rmsnorm_split_poison(tp)]
             + [test_fused_allreduce_rmsnorm_capture_ready(tp)]
             + [test_fused_allreduce_rmsnorm_prepare_fails(tp)]
         )
@@ -3682,6 +3812,7 @@ if __name__ == "__main__":
             "fused_run_ahead",
             "fused_fresh",
             "fused_split_exchange",
+            "fused_split_poison",
             "fused_capture_ready",
             "fused_alias",
         ),

@@ -196,10 +196,23 @@ sum is therefore a fixed-point number, not an fp32 one:
   share of lanes (under 1%). Ranks still agree bit for bit.
 * A wave partial that is not finite, or too large for the fixed point, makes the
   row's `out` NaN.
-* The largest sum of squares one wave may contribute depends on the writer
-  count `n = hidden / (512 * atoms)`. With 512 elements per wave that is an element 
-  RMS of about 510 and 360. It bounds a single large element as well: one element 
-  above about 11k (`n <= 15`) or 8k poisons the row even when the row's RMS is small.
+* Range: a wave of `512 * atoms` elements poisons its row when its sum of
+  squares reaches the limit below. `out` of that row is then NaN on every
+  rank. `residual_out` and other rows are not affected, and the unsplit build
+  has no limit. The limit falls with the writer count `n = hidden / (512 *
+  atoms)`:
+
+  | `n` | wave sum of squares | single element | first bf16 that poisons |
+  |---:|---:|---:|---:|
+  | 2-3 | 2**29 | 23170.5 | 23296 |
+  | 4-7 | 2**28 | 16384 | 16384 |
+  | 8-15 | 2**27 | 11585.2 | 11648 |
+  | 16-31 | 2**26 | 8192 | 8192 |
+
+  The element is a value of `residual_out`. Other elements of the wave lower
+  its limit. Leave `AITER_FLY_AR_FUSED_SPLIT` off where a row can reach these
+  values. `test_one_shot_allreduce_rmsnorm_split_poison` checks each boundary
+  to the bf16 step.
 * A split row takes at most 31 writers (5-bit arrival and poison counts), so
   hidden is limited to about 15.9k at `atoms=1` and 31.7k at `atoms=2`. A wider
   one has no split build and runs unsplit.
