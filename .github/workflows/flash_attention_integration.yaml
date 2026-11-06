@@ -17,6 +17,7 @@ on:
       - '.github/scripts/install_flash_attention.sh'
       - '.github/workflows/ci-config.yaml'
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
     branches: [main]
     paths:
       - 'aiter/ops/triton/_triton_kernels/flash_attn_triton_amd/**'
