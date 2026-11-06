@@ -545,9 +545,9 @@ def compile_gfx1250_pa_decode(
     ``merge_partitions`` plans keep packed partials and count arrivals per
     (sequence, KV head) in the plan's zeroed ``arrival_counters``. A positive
     ``cluster_merge`` P instead launches P CTAs per sequence as one workgroup
-    cluster: CTA i runs the sequence's task i when it has one, and the cluster
-    merges P-way after a cluster barrier. Every sequence must have at most P
-    tasks. In both modes a sequence's single task stores final rows directly,
+    cluster: a sequence with n tasks splits its tiles over its first min(n, P)
+    CTAs, as the planner splits them, and the cluster merges after a cluster
+    barrier. ``work`` then holds the context lengths. In both modes a sequence's single task stores final rows directly,
     and empty sequences clear their rows.
     ``merge_partitions`` partial storage must be eight-byte aligned for its
     device-scope atomic accesses; the host wrapper falls back for offset views.
@@ -688,7 +688,10 @@ def compile_gfx1250_pa_decode(
             if const_expr(t.cluster_merge):
                 # Keep both loads issued ahead of the first use.
                 fx.rocdl.sched_barrier(0)
-                first, count = fx.Int32(seq_tasks[0]), fx.Int32(seq_tasks[1])
+                # A sequence with more tasks than the cluster has CTAs splits
+                # its tiles over the cluster, in its first task slots.
+                first = fx.Int32(seq_tasks[0])
+                count = fx.min(fx.Int32(seq_tasks[1]), fx.Int32(t.cluster_merge))
                 task_slot = (part < count).select(first + part, fx.Int32(0))
             # Tiles of an int32 length, times at most 16 parts, fit Int32.
             length = fx.max(task_context, fx.Int32(0))
