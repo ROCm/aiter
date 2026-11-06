@@ -356,6 +356,9 @@ def _measure(
     fly.reduce_scatter(x2, out2)
     fly.all_gather(s2, full2)
     torch.cuda.synchronize()
+    # every comparison below is against out2 / full2, so the same NaN in them
+    # and in a later launch would pass
+    row["b2b_nonfinite"] = sum(not bool(torch.isfinite(t).all()) for t in (out2, full2))
     pairs = ((x, s, out, full), (x2, s2, out2, full2))
     bad = 0
     for slow in range(tp):
@@ -431,6 +434,7 @@ def _graph_replay(fly, rank: int, tp: int, device, gloo) -> dict:
             (full == _SENTINEL).all() and (shard == _SENTINEL).all()
         ),
         "replay_mismatches": 0,
+        "compile_capture_refused": None,
         # one value per replay and mode, none dropped by a max(): see
         # _assert_extras
         "replay_nmse": [],
@@ -474,7 +478,21 @@ def _graph_replay(fly, rank: int, tp: int, device, gloo) -> dict:
             _nmse(rs_out.float(), ref[rank * shard_rows : (rank + 1) * shard_rows]),
             _nmse(ag_out.float(), ref_ag),
         ]
+    res["compile_capture_refused"] = _compile_capture_refused(fly, x, s)
     return res
+
+
+def _compile_capture_refused(fly, full, shard) -> bool:
+    """``compile_sp`` inside a capture, on an engine that is ready, is refused
+    (it loads modules) before any vote, so every rank refuses alike, and the
+    engine stays ready."""
+    try:
+        with torch.cuda.graph(torch.cuda.CUDAGraph(), stream=torch.cuda.Stream()):
+            fly.compile_sp(full, shard)
+    except Exception as exc:  # noqa: BLE001 -- the text of the refusal is checked
+        text = _chain_text(exc)
+        return fly._sp_ready and "capture" in text and "compile_sp" in text
+    return False
 
 
 def _cold_capture_refused(fly, tp: int, device) -> bool:
@@ -667,12 +685,16 @@ def _run_rank(
     rows = []
     try:
         _check_refusals(fly, tp, device)
-        for ntok, hidden in zip(tokens, hiddens, strict=True):
+        for i, (ntok, hidden) in enumerate(zip(tokens, hiddens, strict=True)):
             fly.compile_sp(
                 torch.zeros((ntok, hidden), dtype=torch.bfloat16, device=device),
                 torch.zeros((ntok // tp, hidden), dtype=torch.bfloat16, device=device),
             )
             dist.barrier()
+            if i == 0:
+                # Ready now: these refusals come from the check every launch
+                # makes of its own tensors, not from the preflight's copy of it.
+                _check_refusals(fly, tp, device)
             for fill in fills:
                 row = _measure(
                     fly,
@@ -753,41 +775,47 @@ def _run_rank_extras(rank: int, tp: int, init_method: str) -> dict:
 
 def _check_residency_stub() -> None:
     """``_check_sp_residency`` against stub artifacts, without a device: a build
-    that fits fewer blocks per CU than the grid needs is refused, one that fits
-    as many passes. The needed counts are worked out by hand for 256 CUs."""
+    that fits fewer blocks per CU than the grid needs is refused, naming the
+    build, and one that fits as many passes. The needed counts are worked out
+    by hand for 256 and 512 CUs."""
     from aiter.ops.flydsl.quick_allreduce_int4 import _check_sp_residency
 
     def launch(*fits):
         return types.SimpleNamespace(
-            func=types.SimpleNamespace(__name__="launch_stub"),
+            func=types.SimpleNamespace(__name__="launch_residency_stub"),
             _mem_cache={
                 i: types.SimpleNamespace(max_blocks_per_cu=lambda n=n: n)
                 for i, n in enumerate(fits)
             },
         )
 
-    # (blocks per CU that each artifact fits, grid, whether it must pass)
+    # (blocks per CU that each artifact fits, grid, CUs, whether it must pass)
     cases = (
-        ((4,), 1024, True),  # needs 4
-        ((5,), 1024, True),
-        ((3,), 1024, False),
-        ((4, 3), 1024, False),  # every artifact counts
-        ((4,), 1025, False),  # one block over rounds up: needs 5
-        ((5,), 1025, True),
-        ((1,), 256, True),  # needs 1
-        ((1,), 257, False),  # needs 2
+        ((4,), 1024, 256, True),  # needs 4
+        ((5,), 1024, 256, True),
+        ((3,), 1024, 256, False),
+        ((4, 3), 1024, 256, False),  # every artifact counts, in either order
+        ((3, 4), 1024, 256, False),
+        ((4,), 1025, 256, False),  # one block over rounds up: needs 5
+        ((5,), 1025, 256, True),
+        ((1,), 256, 256, True),  # needs 1
+        ((1,), 257, 256, False),  # needs 2
+        ((2,), 1024, 512, True),  # needs 2
+        ((2,), 1025, 512, False),  # needs 3
     )
-    for fits, grid, passes in cases:
+    for fits, grid, cus, passes in cases:
         try:
-            _check_sp_residency(launch(*fits), grid, 256)
+            _check_sp_residency(launch(*fits), grid, cus)
         except RuntimeError as exc:
-            refused = "stub" in str(exc)
+            refused, named = True, "residency_stub" in str(exc)
         else:
-            refused = False
-        if refused == passes:
+            refused, named = False, True
+        if refused == passes or not named:
             raise AssertionError(
                 f"_check_sp_residency: artifacts fitting {fits} blocks per CU, "
-                f"grid {grid} on 256 CUs: {'refused' if refused else 'accepted'}"
+                f"grid {grid} on {cus} CUs: "
+                f"{'refused' if refused else 'accepted'}, "
+                f"{'naming' if named else 'not naming'} the build"
             )
 
 
@@ -795,9 +823,12 @@ def _run_rank_preflight(rank: int, tp: int, init_method: str) -> dict:
     """One rank's side of the single-phase preflight checks.
 
     Each case builds a fresh engine and makes rank 1 differ from the others;
-    the outcome of every rank's call is returned for ``_assert_preflight``. A
+    the outcome of every rank's call is returned for ``_assert_preflight``. No
+    case may reach a launch (a stub raises there), so a guard that fails shows
+    up as an error and not as a persistent kernel waiting on a peer. A
     preflight that does not vote leaves the others waiting on rank 1 in a gloo
-    collective; ``FLYDSL_QR_TIMEOUT`` ends the run (``_run_pool``).
+    collective, which ends at gloo's own timeout (30 minutes by default) or at
+    ``FLYDSL_QR_TIMEOUT`` (``_run_pool``), whichever comes first.
     """
     import torch.distributed as dist
 
@@ -823,7 +854,12 @@ def _run_rank_preflight(rank: int, tp: int, init_method: str) -> dict:
 
     def outcome(fly, call) -> dict:
         try:
-            call()
+            with mock.patch.object(
+                QuickAllReduceInt4,
+                "_launch_eng",
+                side_effect=AssertionError("a launch was reached"),
+            ):
+                call()
         except Exception as exc:  # noqa: BLE001 -- recorded, checked by the caller
             error, text = type(exc).__name__, str(exc)
         else:
@@ -870,11 +906,20 @@ def _run_rank_preflight(rank: int, tp: int, init_method: str) -> dict:
             ref = x.float().clone()
             dist.all_reduce(ref)
             eng = fly._by_cfg[(1, BLOCK)]
+            calls = residency.call_args_list
             res["retry"] = {
                 "ready": fly._sp_ready,
                 "nmse": _nmse(out.float(), ref[rank * shard_rows :][:shard_rows]),
-                "residency_args": [c.args[1:] for c in residency.call_args_list],
+                # (grid, CUs) of each check, and whether the checks were made on
+                # the reduce-scatter build and then the all-gather build
+                "residency_args": [c.args[1:] for c in calls],
+                "residency_builds": [
+                    c.args[0] is fly._sp_launch[mode]
+                    for c, mode in zip(calls, (host.MODE_RS, host.MODE_AG))
+                ],
                 "grid_and_cus": (eng.grid, fly._cu_count),
+                "cus_are_the_device_s": fly._cu_count
+                == torch.cuda.get_device_properties(device).multi_processor_count,
             }
             # Ready: the launches no longer vote.
             with mock.patch.object(
@@ -884,6 +929,20 @@ def _run_rank_preflight(rank: int, tp: int, init_method: str) -> dict:
                 fly.all_gather(out, full)
                 torch.cuda.synchronize()
             res["steady_votes"] = votes.call_count
+        # A build, or the residency check of one, that fails on rank 1 alone:
+        # only the vote can tell the others.
+        for case, name in (
+            ("build_local", "preload_launcher"),
+            ("residency_local", "_check_sp_residency"),
+        ):
+            with engine() as fly, ExitStack() as stack:
+                if odd:
+                    stack.enter_context(
+                        mock.patch.object(host, name, side_effect=RuntimeError(case))
+                    )
+                res[case] = outcome(
+                    fly, lambda: fly.compile_sp(zeros(rows), zeros(shard_rows))
+                )
         # Different modes as the first call: valid on its own rank.
         with engine() as fly:
             full, shard = zeros(rows), zeros(shard_rows)
@@ -930,6 +989,14 @@ def _assert_preflight(ranks, *, world_size) -> None:
                 else ("RuntimeError", "rank 1: ValueError")
             )
             fails += _preflight_failures(where, res, case, *args)
+        for case in ("build_local", "residency_local"):
+            # a failure on rank 1 alone: rank 1 raises it, the others name it
+            args = (
+                ("RuntimeError", case)
+                if rank == 1
+                else ("RuntimeError", f"rank 1: RuntimeError: {case}")
+            )
+            fails += _preflight_failures(where, res, case, *args)
         fails += _preflight_failures(where, res, "modes", "RuntimeError", "kind")
         retry = res["retry"]
         # written so that a NaN fails
@@ -942,6 +1009,13 @@ def _assert_preflight(ranks, *, world_size) -> None:
                 f"{where}: residency checked with {retry['residency_args']}, "
                 f"want both builds at {retry['grid_and_cus']}"
             )
+        if retry["residency_builds"] != [True, True]:
+            fails.append(
+                f"{where}: residency checks were not made on the reduce-scatter "
+                f"and then the all-gather build: {retry['residency_builds']}"
+            )
+        if not retry["cus_are_the_device_s"]:
+            fails.append(f"{where}: the CU count in use is not the device's")
         if res["steady_votes"]:
             fails.append(f"{where}: {res['steady_votes']} votes on ready launches")
     if fails:
@@ -1048,6 +1122,11 @@ def _assert_validity(ranks, *, world_size, label) -> dict:
                     f"{where}: {row['back_to_back_mismatches']} delayed "
                     "back-to-back outputs differ from their isolated result"
                 )
+            if row["b2b_nonfinite"]:
+                fails.append(
+                    f"{where}: {row['b2b_nonfinite']} of the two reference outputs "
+                    "of the back-to-back launches are not finite"
+                )
     if fails:
         raise AssertionError("; ".join(fails))
     return ranks[0][0]
@@ -1071,6 +1150,13 @@ def _assert_extras(ranks, *, world_size) -> None:
             bad = [v for v in graph["replay_nmse"] if not v <= NMSE_MAX]
             if bad:
                 fails.append(f"{where}: graph replay NMSE {bad} > {NMSE_MAX}")
+            if graph["compile_capture_refused"] is False:
+                fails.append(f"{where}: compile_sp inside a capture was not refused")
+            if len(graph["replay_nmse"]) != 2 * _GRAPH_REPLAYS:
+                fails.append(
+                    f"{where}: {len(graph['replay_nmse'])} graph replay NMSE values, "
+                    f"want {2 * _GRAPH_REPLAYS}"
+                )
         if not graph["compile_sp_untouched"]:
             fails.append(f"{where}: compile_sp wrote to its tensors")
         for name in ("interleave_pinned", "interleave_shipped"):

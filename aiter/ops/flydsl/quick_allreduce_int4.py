@@ -313,11 +313,15 @@ class QuickAllReduceInt4:
 
     Every launch, and every replay of a CUDA graph that captured one, of any
     mode (``allreduce``, ``allreduce_rmsnorm``, ``reduce_scatter``,
-    ``all_gather``) must run in one serialized device order on each rank: the
-    modes share the inbox slots and the colors, so launches in flight at once
-    can read each other's payloads. The same host call order on every rank is
-    not enough when the calls sit on independent streams; a switch of stream
-    needs an event dependency (``wait_event`` / ``wait_stream``).
+    ``all_gather``) must run in one serialized device order on each rank.
+    Launches through the same engine share its inbox slots and colors (the
+    single-phase modes use the ``super_tile=1`` engine at the default block,
+    as do the all-reduce sizes that the ladder gives that rung), so launches
+    in flight at once can read each other's payloads; one order for all
+    launches is the rule that holds for every ladder. The same host call order
+    on every rank is not enough when the calls sit on independent streams; a
+    switch of stream needs an event dependency (``wait_event`` /
+    ``wait_stream``).
     """
 
     def __init__(
@@ -1206,16 +1210,25 @@ class QuickAllReduceInt4:
         another size or mode, polls that peer's flags forever. So every rank
         catches whatever raises locally here (the engine and codec rules, the
         tensors, a build, the residency check) and the ranks vote on it through
-        ``self.group``, together with the call kind and the sizes, which are all
-        that can differ between ranks that get this far (the world size is the
-        group's, the grid the minimum over the ranks). If any rank failed or the
-        kinds or sizes differ, all raise: a failing rank its own exception, the
-        others a ``RuntimeError``.
+        ``self.group``, together with the call kind and the full size (the shard
+        size is fixed by it), which are all that can differ between ranks that
+        get this far (the world size is the group's, the grid the minimum over
+        the ranks). If any rank failed or the kinds or sizes differ, all raise:
+        a failing rank its own exception, the others a ``RuntimeError``.
 
         *kind* is ``"compile_sp"`` or the mode of the eager launch that runs
         this; *inp* and *out* are that call's tensors, checked as it checks
-        them (``compile_sp`` passes ``full`` and ``shard``).
+        them (``compile_sp`` passes ``full`` and ``shard``). It loads modules,
+        which a CUDA graph capture cannot do, so it is refused there before any
+        vote; every rank must be outside a capture.
         """
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                f"QuickAllReduceInt4: {kind} needs the single-phase preflight, "
+                "which loads kernels and agrees the configuration across ranks "
+                "and cannot run under CUDA graph capture; call "
+                "compile_sp(full, shard) on every rank before capture"
+            )
         self._sp_ready = False
         error = fingerprint = None
         try:
@@ -1229,11 +1242,7 @@ class QuickAllReduceInt4:
                     launch = self._sp_launcher(mode)
                     preload_launcher(launch, *args)
                     _check_sp_residency(launch, eng.grid, self._cu_count)
-            fingerprint = (
-                ("kind", kind),
-                ("full_bytes", full_bytes),
-                ("shard_bytes", full_bytes // self.world_size),
-            )
+            fingerprint = (("kind", kind), ("full_bytes", full_bytes))
         except Exception as exc:  # noqa: BLE001 -- shared with the peers below
             error = exc
         message = None if error is None else f"{type(error).__name__}: {error}"
@@ -1272,14 +1281,6 @@ class QuickAllReduceInt4:
         # either: it guards the all-reduce's small-message accuracy cost, and a
         # sequence-parallel caller picks this kernel for its layout.
         if not self._sp_ready:
-            if torch.cuda.is_current_stream_capturing():
-                raise RuntimeError(
-                    f"QuickAllReduceInt4: {mode} cannot be captured before "
-                    "compile_sp has passed on every rank: it compiles and loads "
-                    "the kernels and agrees the configuration across ranks, "
-                    "which cannot run under CUDA graph capture; call "
-                    "compile_sp(full, shard) on every rank first"
-                )
             self._sp_preflight(mode, inp, out)
         eng = self._sp_engine()
         full_bytes = self._check_sp_payload(mode, inp, out, eng.tile_bytes)
@@ -1342,7 +1343,10 @@ class QuickAllReduceInt4:
         the ranks compare the call kind and these sizes through ``group``. If
         any rank failed or they differ, every rank raises, the failing rank its
         own exception and the others a ``RuntimeError``, and no launch is
-        accepted until a preflight passes. Later shapes are checked on their
-        own rank only, so they must agree across ranks as well.
+        accepted until a preflight passes (a failed repeat call revokes an
+        earlier pass). The exception types differ between ranks, so do not
+        branch on the type. Later shapes are checked on their own rank only,
+        the checks that depend on addresses (overlap, alignment) included, so
+        they must agree across ranks as well. Refused under CUDA graph capture.
         """
         self._sp_preflight("compile_sp", full, shard)

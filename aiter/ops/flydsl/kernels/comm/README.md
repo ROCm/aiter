@@ -62,10 +62,13 @@ every block of their grids fits the device at once (the kernels are persistent
 and spin on their peers' flags), and agrees the call and the sizes across
 the ranks. If a rank fails or differs, every rank raises, where a rank
 that went on would poll its peers' flags forever. No launch is accepted until it
-has passed; the first eager call runs it. Later shapes must agree across ranks
-too. Launches and graph replays on one communicator, of every mode including the
-all-reduce, must run in one serialized device order: they share colors and
-inbox slots, so calls on independent streams need an event dependency.
+has passed; the first eager call runs it, and it cannot run under graph
+capture. Later shapes must agree across ranks too. Launches and graph replays
+on one communicator must run in one serialized device order. The single-phase
+modes, and the all-reduce sizes that the ladder gives the same `super_tile=1`
+engine, share that engine's colors and inbox slots, so calls on independent
+streams need an event dependency; one order for all launches holds for every
+ladder.
 
 ### Ring
 
