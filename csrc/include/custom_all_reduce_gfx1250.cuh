@@ -30,7 +30,9 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 // ---------------------------------------------------------------------------
@@ -848,6 +850,44 @@ constexpr int kLamportMaxClusterBlocks  = 16;
 // no faster at any row count (hidden 2048, TP2/TP4).
 constexpr int kLamportMinClusterRowPacks = 256;
 
+// The cluster path needs a toolchain that knows workgroup clusters: the device
+// side the gfx1250 cluster barrier and cluster memory scope, the host side the
+// cluster launch attribute (neither is in ROCm 7.2). This module is also built
+// for other archs and older ROCm, where the cluster kernel is compiled out and
+// every call takes the block-a-row path.
+#if defined(__HIP_DEVICE_COMPILE__) && (defined(__gfx1250__) || defined(__gfx1250_strict__)) &&                   \
+    __has_builtin(__builtin_amdgcn_s_cluster_barrier) && defined(__MEMORY_SCOPE_CLUSTR)
+#define AITER_GFX1250_HAVE_CLUSTER 1
+#else
+#define AITER_GFX1250_HAVE_CLUSTER 0
+#endif
+
+template <typename V, typename = void>
+struct lamport_has_cluster_dim : std::false_type
+{
+};
+template <typename V>
+struct lamport_has_cluster_dim<V, std::void_t<decltype(std::declval<V&>().clusterDim)>>
+    : std::true_type
+{
+};
+// hipLaunchAttributeValue::clusterDim comes with hipLaunchAttributeClusterDimension
+constexpr bool kLamportClusterLaunch = lamport_has_cluster_dim<hipLaunchAttributeValue>::value;
+
+// Make attr a cluster of x blocks. A template so that the cluster names are
+// dependent and only looked up where the HIP headers have them.
+template <typename Attr>
+inline void lamport_set_cluster_dim(Attr& attr, unsigned x)
+{
+    if constexpr(lamport_has_cluster_dim<decltype(Attr::val)>::value)
+    {
+        attr.id               = decltype(Attr::id)::hipLaunchAttributeClusterDimension;
+        attr.val.clusterDim.x = x;
+        attr.val.clusterDim.y = 1;
+        attr.val.clusterDim.z = 1;
+    }
+}
+
 // slot: the most 16B packs a call takes, a multiple of kLamportWave
 inline constexpr int64_t lamport_ar_rms_buffer_bytes(int ngpus, int64_t slot)
 {
@@ -997,6 +1037,7 @@ __global__ void __launch_bounds__(MAX_THREADS, 1) lamport_ar_rmsnorm_gfx1250(
     float inv_rms;
     if constexpr(CLUSTER)
     {
+#if AITER_GFX1250_HAVE_CLUSTER
         // the row is this cluster: publish a partial per wave, then every wave
         // folds the row's partials in wave order, as block_allreduce_f32 does
         float part = square_sum;
@@ -1019,6 +1060,11 @@ __global__ void __launch_bounds__(MAX_THREADS, 1) lamport_ar_rmsnorm_gfx1250(
         for(int g = 1; g < row_groups; ++g)
             total += __shfl(v, g);
         inv_rms = rsqrtf(total / hidden + eps);
+#else
+        // never launched: the host takes this path only with cluster launch
+        __builtin_trap();
+        inv_rms = 0.f;
+#endif
     }
     else
     {
@@ -1072,7 +1118,7 @@ struct LamportArRms
     // was faster (gfx1250, 256 CUs, rows 256+ at hidden 4096-8192).
     int cluster_threads(int64_t rows, int row_packs) const
     {
-        if(rows >= num_cus || row_packs <= kLamportMinClusterRowPacks)
+        if(!kLamportClusterLaunch || rows >= num_cus || row_packs <= kLamportMinClusterRowPacks)
             return 0;
         for(int bs = kLamportClusterMaxThreads; bs >= kLamportWave; bs /= 2)
         {
@@ -1098,8 +1144,7 @@ struct LamportArRms
             return;
         if(num_deps != 1)
             throw std::runtime_error("lamport allreduce rmsnorm: cannot find the captured node");
-        HIP_CALL(hipGraphKernelNodeSetAttribute(
-            deps[0], hipLaunchAttributeClusterDimension, &attr.val));
+        HIP_CALL(hipGraphKernelNodeSetAttribute(deps[0], attr.id, &attr.val));
     }
 
     template <typename T>
@@ -1140,13 +1185,10 @@ struct LamportArRms
         lamport_ar_rmsnorm_gfx1250<T, NG, kLamportRowMaxThreads, false>                     \
             <<<(int)rows, row_packs, 0, stream>>>(LAMPORT_RMS_ARGS);                        \
     }                                                                                       \
-    else                                                                                    \
+    else if constexpr(kLamportClusterLaunch)                                                \
     {                                                                                       \
         hipLaunchAttribute attr{};                                                          \
-        attr.id               = hipLaunchAttributeClusterDimension;                         \
-        attr.val.clusterDim.x = (unsigned)(row_packs / threads);                            \
-        attr.val.clusterDim.y = 1;                                                          \
-        attr.val.clusterDim.z = 1;                                                          \
+        lamport_set_cluster_dim(attr, (unsigned)(row_packs / threads));                     \
         hipLaunchConfig_t config{};                                                         \
         config.gridDim  = dim3((unsigned)(packs / threads));                                \
         config.blockDim = dim3(threads);                                                    \
