@@ -1244,11 +1244,14 @@ def _needs_arch_rebuild(md_name):
         return False
     if not _rebuild_targets_arch(cur):
         # A rebuild would miss the running arch too, and loading the .so would
-        # only fail later, at its first kernel launch.
+        # only fail later, at its first kernel launch. The .so may have just
+        # been built with this GPU_ARCHS, so name the setting, not a "prebuilt"
+        # file.
         raise RuntimeError(
-            f"[{md_name}] prebuilt .so targets {sorted(built)} but not the "
-            f"running arch {cur}, and a rebuild would not target it either; "
-            f"set GPU_ARCHS to include {cur} (or to native) and rebuild"
+            f"[{md_name}] {so_path} targets {sorted(built)} but not the "
+            f"running arch {cur}, and GPU_ARCHS="
+            f"{os.environ.get('GPU_ARCHS', 'native')!r} would not rebuild for "
+            f"it either; set GPU_ARCHS to include {cur} (or to native)"
         )
     logger.warning(
         f"[{md_name}] prebuilt .so targets {sorted(built)} but not the "
