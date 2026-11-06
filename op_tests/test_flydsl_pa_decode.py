@@ -247,7 +247,10 @@ def test_pa_decode_plan(
         (512, torch.bfloat16, False),
     ],
 )
-def test_pa_decode_reduce_split_groups(device, head_size, dtype, with_sinks):
+@pytest.mark.parametrize("output_offset", [0, 1])
+def test_pa_decode_reduce_split_groups(
+    device, head_size, dtype, with_sinks, output_offset
+):
     """Rungs split across partition groups match the single-group ladder bit for bit.
 
     Register-only CTAs (24 and 32 partition bounds) and the register branch of
@@ -294,7 +297,7 @@ def test_pa_decode_reduce_split_groups(device, head_size, dtype, with_sinks):
     def pairs_for(partitions):
         return head_size % 128 == 0 if partitions > 32 else head_size in (128, 256)
 
-    def run(partitions, groups):
+    def run(partitions, groups, store_pairs=False):
         pairs = pairs_for(partitions)
         compiled = compile_pa_decode_ps_reduce(
             architecture="gfx1250",
@@ -307,13 +310,15 @@ def test_pa_decode_reduce_split_groups(device, head_size, dtype, with_sinks):
             query_group_size=rows,
             pairs=pairs,
             parallel_groups=groups,
+            paired_output=store_pairs and pairs and output_offset == 0,
         )
-        out = torch.full(
-            (len(counts), 1, kv_heads, rows, head_size),
+        storage = torch.full(
+            (len(counts) * kv_heads * rows * head_size + output_offset,),
             float("nan"),
             dtype=dtype,
             device=device,
         )
+        out = storage[output_offset:].view(len(counts), 1, kv_heads, rows, head_size)
         pointer = fx.BFloat16 if dtype == torch.bfloat16 else fx.Float16
         _run_compiled(
             compiled["launch"],
@@ -358,7 +363,7 @@ def test_pa_decode_reduce_split_groups(device, head_size, dtype, with_sinks):
     for partitions, split in ((32, 4), (24, 4), (32, 2), (64, 16), (256, 4), (256, 16)):
         if split * head_size // (2 if pairs_for(partitions) else 1) // 32 > 32:
             continue
-        single, grouped = run(partitions, 1), run(partitions, split)
+        single, grouped = run(partitions, 1), run(partitions, split, store_pairs=True)
         register = [seq for seq, c in enumerate(counts) if c <= min(partitions, 32)]
         assert torch.equal(
             single[register].view(torch.int16), grouped[register].view(torch.int16)

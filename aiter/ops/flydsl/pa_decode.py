@@ -165,6 +165,21 @@ def launch_pa_decode_ps_reduce(
         pairs=pairs,
         parallel_groups=groups,
         num_xcds=num_xcds,
+        paired_output=bool(
+            arch in ("gfx1250", "gfx1250-strict")
+            and pairs
+            and output.dtype in (torch.bfloat16, torch.float16)
+            and output.data_ptr() % 4 == 0
+            and all(
+                stride % 2 == 0
+                for stride in (
+                    stride_output_bs,
+                    stride_output_len,
+                    stride_output_kv_head,
+                    stride_output_group_size,
+                )
+            )
+        ),
     )
     sink_ptr = (
         flyc.from_c_void_p(_flydsl_pointer_dtype(output.dtype), 0)
