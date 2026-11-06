@@ -817,6 +817,29 @@ def _grouped_a8w4_tdm_moe(
         and token_num * topk <= _FUSED_ROUTE_PSUM_MAX_NUMEL
         and int(E) <= _FUSED_ROUTE_PSUM_MAX_EXPERTS
     )
+    # Larger TP batches (prefill): one route launch, whose last workgroup
+    # builds masked_m/starts/psum, and the token-multidest A1 quant resolves
+    # each route's row. This replaces the counter fill, route and psum-remap
+    # launches; the compact-scale quant and other A1 paths keep them.
+    _route_in_quant = None
+    if (
+        not herd_topk
+        and not _compact
+        and not _is_ep
+        and not enable_ep_scatter
+        and not _fused_tp_route
+        and _tp_route_quant_takes_route(
+            hidden_states,
+            data_format=data_format,
+            a_preshuffled=a_preshuffled,
+            model_dim=model_dim,
+            wmma_rep=wmma_rep,
+            token_num=token_num,
+            topk=topk,
+            experts=E,
+        )
+    ):
+        _route_in_quant = tp_prefill_route_psum(topk_ids, E, _align_m)
     if _compact:
         _masked_m = stage2_scatter.compact_masked_m
         topids_to_rows = None
@@ -901,6 +924,8 @@ def _grouped_a8w4_tdm_moe(
                 ep_rowmap=ep_rowmap,
                 contiguous_expert_mask=_direct_ep_mask,
             )
+    elif _route_in_quant is not None:
+        _masked_m, topids_to_rows, _, _ = _route_in_quant
     elif not _fused_tp_route:
         _fuse_ep_route_quant = False
         if herd_topk:
@@ -958,6 +983,8 @@ def _grouped_a8w4_tdm_moe(
         _masked_m, topids_to_rows, psum = fused_route_psum_remap(
             topk_ids, E, max_m, _align_m
         )
+    elif _route_in_quant is not None:
+        psum = _route_in_quant[2]
     elif _fuse_psum_quant:
         # The remapper's scan and ep_rowmap scatter ride the quant kernel:
         # every workgroup re-derives the (E,) prefix in LDS, so this launch
@@ -1147,6 +1174,9 @@ def _grouped_a8w4_tdm_moe(
             slot_stride=int(stage2_scatter.max_tokens_per_rank) * int(topk),
         )
     else:
+        _route_rows = (
+            torch.empty_like(topids_to_rows) if _route_in_quant is not None else None
+        )
         a1_payload, a1_scale = flydsl_moe_fused_quant_preshuffle(
             hidden_states.reshape(1, token_num, _src_width),
             1,
@@ -1163,7 +1193,13 @@ def _grouped_a8w4_tdm_moe(
             ep_psum_params=ep_psum_params,
             row_major_scale=_row_major_a1,
             payload_preshuffled=a_preshuffled,
+            route_starts=None if _route_in_quant is None else _route_in_quant[3],
+            route_expert_bits=tp_route_expert_bits(E),
+            route_rows_out=_route_rows,
         )
+        if _route_rows is not None:
+            # The gather-reduce reads the rows the quant resolved.
+            topids_to_rows = _route_rows
         if _compact_ascale:
             a1_scale = flydsl_moe_scatter_preshuffle_scale(
                 _compact_ascale_buf,
@@ -2034,6 +2070,119 @@ def fused_route_psum_remap(
         current_stream_arg(),
     )
     return masked_m, topids_to_rows.view(token_num, topk), psum
+
+
+_TP_ROUTE_STATE_CACHE: dict[tuple[int, str], torch.Tensor] = {}
+
+
+def tp_route_state_buffer(E: int, device) -> torch.Tensor | None:
+    """Persistent ``(E + 1,)`` int32 TP route counts plus a ticket word.
+
+    ``moe_route_lds_psum_sc`` zeroes it at the end of every launch, so route
+    launches issued in order on one stream start from zero without a fill.
+    Allocated (zeroed) on first use outside graph capture; a capture that
+    finds none gets None, so no allocation is recorded into the graph.
+    """
+    key = (int(E), str(device))
+    buf = _TP_ROUTE_STATE_CACHE.get(key)
+    if buf is None:
+        if torch.cuda.is_current_stream_capturing():
+            return None
+        buf = torch.zeros(int(E) + 1, dtype=torch.int32, device=device)
+        _TP_ROUTE_STATE_CACHE[key] = buf
+    return buf
+
+
+def tp_route_expert_bits(E: int) -> int:
+    from aiter.ops.flydsl.kernels.moe_route_maps import (
+        tp_route_expert_bits as _bits,
+    )
+
+    return _bits(int(E))
+
+
+@functools.cache
+def _get_compiled_route_lds_psum(experts: int, self_clean: bool):
+    from aiter.ops.flydsl.kernels.moe_route_maps import (
+        build_moe_topids_to_rows_lds_psum_module,
+    )
+
+    return build_moe_topids_to_rows_lds_psum_module(int(experts), bool(self_clean))
+
+
+def _tp_route_quant_takes_route(
+    hidden_states,
+    *,
+    data_format,
+    a_preshuffled,
+    model_dim,
+    wmma_rep,
+    token_num,
+    topk,
+    experts,
+) -> bool:
+    """Whether the A1 quant is the token-multidest launch that can place rows.
+
+    Mirrors the quant dispatch: bf16 activations (not prequantized), no
+    A-preshuffle, and not the compact-scale pair, which needs a row -> token
+    map from the psum remap.
+    """
+    from aiter.ops.flydsl.kernels.moe_route_maps import TP_ROUTE_PSUM_MAX_EXPERTS
+    from aiter.ops.flydsl.moe_kernels import token_multidest_eligible
+
+    if int(experts) > TP_ROUTE_PSUM_MAX_EXPERTS or a_preshuffled:
+        return False
+    # A prequantized payload takes the scatter-only quant; with a bf16
+    # activation the dispatch ignores a1_scale.
+    if hidden_states.dtype != torch.bfloat16:
+        return False
+    if os.environ.get("AITER_FLYDSL_TOKEN_MULTIDEST_QUANT", "1") not in (
+        "1",
+        "true",
+        "True",
+    ):
+        return False
+    quant_mode = "fp4" if data_format == "fp4" else "fp8"
+    return token_multidest_eligible(token_num, topk) and not (
+        _use_fused_quant_preshuffle(model_dim, wmma_rep, quant_mode, token_num, topk)
+    )
+
+
+def tp_prefill_route_psum(topk_ids: torch.Tensor, experts: int, tile_m: int):
+    """One route launch that also writes masked_m, starts and psum.
+
+    Rows come back as ``(slot << tp_route_expert_bits(E)) | expert`` for
+    ``flydsl_moe_fused_quant_preshuffle(route_starts=...)``. Returns
+    ``(masked_m, rows, psum, starts)``. The counter is the self-cleaning
+    persistent one, or a filled scratch one on first use under capture.
+    """
+    device = topk_ids.device
+    token_num, topk = topk_ids.shape
+    numel = token_num * topk
+    experts = int(experts)
+    state = tp_route_state_buffer(experts, device)
+    self_clean = state is not None
+    if not self_clean:
+        state = torch.zeros(experts + 1, dtype=torch.int32, device=device)
+    rows = torch.empty(numel, dtype=torch.int32, device=device)
+    masked_m = torch.empty(experts, dtype=torch.int32, device=device)
+    starts = torch.empty(experts, dtype=torch.int32, device=device)
+    psum = torch.empty(experts, dtype=torch.int32, device=device)
+    grid = (numel + 255) // 256
+    _run_compiled(
+        _get_compiled_route_lds_psum(experts, self_clean),
+        ptr_arg(topk_ids.to(torch.int32).reshape(-1)),
+        ptr_arg(state),
+        ptr_arg(rows),
+        ptr_arg(masked_m),
+        ptr_arg(starts),
+        ptr_arg(psum),
+        int(numel),
+        int(tile_m),
+        int(grid),
+        current_stream_arg(),
+    )
+    return masked_m, rows.view(token_num, topk), psum, starts
 
 
 @functools.cache
