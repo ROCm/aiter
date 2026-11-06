@@ -64,7 +64,15 @@ def _check_tensor(name, value, shape, allowed_dtypes, device):
         )
 
 
-def _auto_v41_asm_splits(n: int, nnz: int) -> int:
+def _auto_v41_asm_splits(n: int, nnz: int, *, prefix_nnz: int | None = None) -> int:
+    if n == 0 or n > 64:
+        return 1
+    # Prefix cardinality estimates CSA topk without reading device data.
+    if prefix_nnz == n * 512:
+        return 1
+    if prefix_nnz == n * 1024:
+        return 4 if n <= 32 else 2
+
     # Import at call time: the public module also imports this backend.
     from .mla_sparse_prefill import _asm_v41_kv_splits
 
@@ -178,8 +186,9 @@ def _asm_sparse_prefill_v41(
             )
         require_gfx1250_asm("mla_sparse_prefill_v41")
         if splits is None:
-            nnz = kv_indices_prefix.numel() + kv_indices_extend.numel()
-            splits = _auto_v41_asm_splits(n, nnz)
+            prefix_nnz = kv_indices_prefix.numel()
+            nnz = prefix_nnz + kv_indices_extend.numel()
+            splits = _auto_v41_asm_splits(n, nnz, prefix_nnz=prefix_nnz)
         if attn_sink is None:
             attn_sink = torch.full((64,), -math.inf, dtype=torch.float32, device=device)
         partial_r = partial_lse = None

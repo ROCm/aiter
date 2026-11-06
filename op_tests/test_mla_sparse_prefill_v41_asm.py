@@ -161,12 +161,71 @@ def test_auto_split_matches_forced(monkeypatch, n, csa_rows):
     )
     inputs, expected = _case(n=n, csa_rows=csa_rows)
     nnz = inputs["kv_indices_prefix"].numel() + inputs["kv_indices_extend"].numel()
-    split = native_module._auto_v41_asm_splits(n, nnz)
+    split = native_module._auto_v41_asm_splits(
+        n, nnz, prefix_nnz=inputs["kv_indices_prefix"].numel()
+    )
     actual = _invoke(inputs, None)
     _check(actual, expected)
     forced = _invoke(inputs, split)
     assert selected == [split, split]
     assert torch.equal(actual, forced)
+
+
+@pytest.mark.parametrize(
+    "n,topk,expected",
+    [
+        (0, 512, 1),
+        (1, 512, 1),
+        (1, 1024, 4),
+        (31, 1024, 4),
+        (32, 512, 1),
+        (32, 1024, 4),
+        (33, 512, 1),
+        (33, 1024, 2),
+        (48, 1024, 2),
+        (63, 1024, 2),
+        (64, 512, 1),
+        (64, 1024, 2),
+        (65, 1024, 1),
+        (65, 4096, 1),
+        (96, 512, 1),
+        (192, 4096, 1),
+    ],
+)
+def test_auto_split_scalar_policy(monkeypatch, n, topk, expected):
+    native_module = importlib.import_module("aiter.ops.mla_sparse_prefill_v41_asm")
+
+    def unexpected_cu_query():
+        pytest.fail("the fixed scalar policy must not query CU count")
+
+    monkeypatch.setattr(native_module, "get_cu_num", unexpected_cu_query)
+    prefix_nnz = n * topk
+    extend_nnz = n * (n + 1) // 2 if n <= 128 else 128 * n - 8128
+    split = native_module._auto_v41_asm_splits(
+        n, prefix_nnz + extend_nnz, prefix_nnz=prefix_nnz
+    )
+    assert split == expected
+
+
+@pytest.mark.parametrize(
+    "n,topk,pass_prefix,expected",
+    [(8, 384, True, 1), (32, 2048, True, 5), (33, 1024, False, 3)],
+)
+def test_auto_split_scalar_fallback(monkeypatch, n, topk, pass_prefix, expected):
+    native_module = importlib.import_module("aiter.ops.mla_sparse_prefill_v41_asm")
+    queried = []
+
+    def cu_count():
+        queried.append(True)
+        return 256
+
+    monkeypatch.setattr(native_module, "get_cu_num", cu_count)
+    nnz = n * topk + n * (n + 1) // 2
+    kwargs = {"prefix_nnz": n * topk} if pass_prefix else {}
+    split = native_module._auto_v41_asm_splits(n, nnz, **kwargs)
+    # Frozen RR fallback at 256 CUs: c0=290, c1=.045, auto candidates 1..16.
+    assert split == expected
+    assert queried == [True]
 
 
 def test_zero_queries_does_not_launch(monkeypatch):

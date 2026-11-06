@@ -286,10 +286,8 @@ _KV_SPLIT_FIT = {
     ("gfx1250", "v41_a8w8_16mx4_64nx1"): _SplitFit(64, 64, 1, _CLUSTER_COUNT, 0, 0.05),
 }
 
-# Initial shape-based heuristic; not performance tuned for fused A8W4.
-_ASM_V41_INITIAL_SPLIT_FIT = _KV_SPLIT_FIT[
-    ("gfx1250", "v41_a8w8_16mx4_64nx1")
-]._replace(counts=tuple(range(2, 17)))
+# Fallback for prefix lengths outside the ASM short-query policy.
+_ASM_V41_INITIAL_SPLIT_FIT = _SplitFit(64, 64, 1, tuple(range(2, 17)), 290, 0.045)
 
 
 def _opus_split_fit(gfx: str, kernel: str, h: int) -> _SplitFit:
@@ -829,9 +827,11 @@ def mla_sparse_prefill_v41(
         if ``None``.
       num_kv_splits:     opus: as in :func:`mla_sparse_prefill`; on gfx1250,
         2, 4, 8 or 16 fold in the same launch. asm: an integer in [1, 16].
-        ``None`` uses an initial shape-based heuristic that is not performance
-        tuned for fused A8W4. asm fuses reduction in the same launch and
-        allocates workspace internally.
+        With ``None``, asm uses 1 split for N > 64. For N <= 64, an average of
+        512 prefix rows uses 1 split; 1024 prefix rows use 4 splits at N <= 32
+        and 2 otherwise. Other prefix lengths use the ASM fallback heuristic.
+        Extend rows do not count toward the prefix average. asm fuses reduction
+        in the same launch and allocates workspace internally.
       backend:           ``"asm"``, ``"opus"`` or ``None``. Default selects asm
         for a gfx1250 H64 NVFP4 prefix, otherwise opus.
 

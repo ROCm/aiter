@@ -840,7 +840,7 @@ def run_mla_sparse_prefill(
                         + n * h * d * 2
                     )
                     row["asm split"] = (
-                        _auto_v41_asm_splits(n, total_nnz)
+                        _auto_v41_asm_splits(n, total_nnz, prefix_nnz=prefix_nnz)
                         if num_kv_splits is None
                         else num_kv_splits
                     )
