@@ -31,6 +31,7 @@ from .mega_moe_config import (
     small_m_cu_supported,
 )
 from .mega_moe_stage2_aligned_pair import ALIGNED_PAIR_SCATTER_VEC
+from ..tensor_shim import torch_stream
 from .quant import per_1x32_mx_quant
 from .weights import check_bindable, contiguous_weights, weight_spec
 
@@ -1032,6 +1033,16 @@ class MegaMoEV2:
         if any(t.device != self.dev for t in (x_bf16, wts, topk_ids)):
             # A rank that faults on a foreign pointer would leave its peers waiting.
             raise ValueError(f"x_bf16, wts and topk_ids must be on {self.dev}")
+        # Every launch of the call -- quantization, prepare, Stage1, Stage2 and
+        # combine -- runs on the caller's stream.
+        with torch.cuda.stream(torch_stream(stream)):
+            return self._launch_route(
+                route, x_bf16, wts, topk_ids, slice_output, mask_invalid_slots
+            )
+
+    def _launch_route(self, route, x_bf16, wts, topk_ids, slice_output, mask_invalid_slots):
+        run_tokens = int(x_bf16.shape[0])
+        stream = None  # the current stream, set by _forward_route
         route, capacity = route
         if route == ROUTE_LARGE_M:
             return self._large_m.forward(
@@ -1050,11 +1061,7 @@ class MegaMoEV2:
             )
 
         config = self._select_config(run_tokens)
-        prepare_stream = stream
-        if prepare_stream is None:
-            prepare_stream = fx.Stream(torch.cuda.current_stream().cuda_stream)
-        elif hasattr(prepare_stream, "cuda_stream"):
-            prepare_stream = fx.Stream(prepare_stream.cuda_stream)
+        prepare_stream = fx.Stream(torch.cuda.current_stream().cuda_stream)
         self._run_compact_prepare(
             topk_ids,
             run_tokens,
@@ -1095,10 +1102,11 @@ class MegaMoEV2:
                 stream=stream,
                 slice_output=slice_output,
             )
-        return self._run_joint(
-            x_q, scales, wts, topk_ids, run_tokens, stream, slice_output,
-            mask_invalid_slots=mask_invalid_slots,
-        )
+        with torch.cuda.stream(torch_stream(stream)):
+            return self._run_joint(
+                x_q, scales, wts, topk_ids, run_tokens, None, slice_output,
+                mask_invalid_slots=mask_invalid_slots,
+            )
 
     forward_bf16 = forward
     __call__ = forward

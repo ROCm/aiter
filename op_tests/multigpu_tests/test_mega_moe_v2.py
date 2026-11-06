@@ -442,6 +442,7 @@ def _run_size(moe, x, weights, ids, ref_weights, args, rank, world, device):
         output = full_output[:tokens]
     _barrier()
     eager_output = output.clone()
+    _check_explicit_stream(moe, x, weights, ids, eager_output, device)
     rel_l2 = -1.0
     # Every rank must make the same decision before entering the reference
     # collectives; the reference itself pads variable token counts for gather.
@@ -557,6 +558,31 @@ def _same_binding(state, expected):
         a is b if isinstance(b, torch.Tensor) else a == b
         for a, b in zip(state, expected)
     )
+
+
+def _check_explicit_stream(moe, x, weights, ids, eager_output, device):
+    """Every launch of a call runs on the caller's stream, whatever its type."""
+    import flydsl.expr as fx
+
+    tokens = x.shape[0]
+    side = torch.cuda.Stream()
+    for handle in (side, fx.Stream(side.cuda_stream), side.cuda_stream):
+        # A zero-input call leaves other data in the quant and combine buffers.
+        moe(torch.zeros_like(x), weights, ids)
+        # Hold the caller's stream back: a launch left on the current stream
+        # would run first and read those buffers before this call fills them.
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            torch.cuda._sleep(50_000_000)
+        output = moe(x, weights, ids, stream=handle)[:tokens]
+        torch.cuda.synchronize()
+        if not _reduce_float(
+            torch.equal(output, eager_output), device, dist.ReduceOp.MIN
+        ):
+            raise AssertionError(
+                f"bs={tokens} stream={type(handle).__name__} changed the output"
+            )
+        _barrier()
 
 
 def _check_large_m_edges(

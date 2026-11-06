@@ -37,6 +37,7 @@ from ..kernels_common import ceildiv
 from ..mxfp4_gemm_common import _fabs_f32 as fabs_f32
 from ..mxfp4_gemm_common import lds_typed_ptr, lds_vec_load
 from ..tensor_shim import _preload_compiled, _run_compiled
+from ..tensor_shim import torch_stream as _torch_stream
 from .dispatch import _wave_inclusive_scan_i32, _wave_reduce_max_i32
 from .gemm1 import _LdsF32View
 from .gemm2 import _resolve_g2_knobs
@@ -1210,18 +1211,6 @@ def large_m_kernel_specs(
     )
     # fmt: on
     return s2_spec, c_spec
-
-
-def _torch_stream(stream):
-    """The torch stream for ``stream`` (None, a torch stream, an fx.Stream or a raw handle)."""
-    if stream is None:
-        return torch.cuda.current_stream()
-    if isinstance(stream, fx.Stream):
-        stream = 0 if stream.value is None else stream.value
-    if isinstance(stream, int):
-        # ExternalStream(0) would take a new pool stream instead of the null stream the kernel runs on.
-        return torch.cuda.default_stream() if stream == 0 else torch.cuda.ExternalStream(stream)
-    return stream
 
 
 def _wave_uniform_i64(addr):
