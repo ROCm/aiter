@@ -182,6 +182,7 @@ def compile_pa_decode_tile(
     cluster_merge: int = 0,
     packed_scale_heads: bool = False,
     cluster_task_stride: int = 0,
+    plan_tile_tokens: int = 256,
 ):
     """Select and cache a PA-decode kernel and launch wrapper.
 
@@ -269,7 +270,10 @@ def compile_pa_decode_tile(
             cluster_merge=cluster_merge,
             packed_scale_heads=packed_scale_heads,
             cluster_task_stride=cluster_task_stride,
+            plan_tile_tokens=plan_tile_tokens,
         )
+    if plan_tile_tokens != KV_COMPUTE_BLOCK:
+        raise ValueError("128-token work plans require gfx1250 tile kernels")
     if architecture not in ("gfx942", "gfx950"):
         raise NotImplementedError(f"PA decode does not support {architecture}")
     if cluster_merge:
@@ -546,6 +550,7 @@ def compile_gfx1250_pa_decode(
     cluster_merge=0,
     packed_scale_heads=False,
     cluster_task_stride=0,
+    plan_tile_tokens=256,
 ):
     """Compile a gfx1250 tile kernel; merging partitions writes final output.
 
@@ -558,6 +563,8 @@ def compile_gfx1250_pa_decode(
     and empty sequences clear their rows.
     ``merge_partitions`` partial storage must be eight-byte aligned for its
     device-scope atomic accesses; the host wrapper falls back for offset views.
+    ``plan_tile_tokens`` matches the plan's 128/256-token units; the value
+    participates in the kernel cache key and planned range conversion.
     ``cluster_task_stride`` selects optional [batch, stride, 8] records; it
     must cover the cluster, and ``work`` then points at those records. The
     default zero retains packed work_info plus reduce_info lookups.
@@ -583,7 +590,10 @@ def compile_gfx1250_pa_decode(
         cluster_merge,
         packed_scale_heads,
         cluster_task_stride,
+        plan_tile_tokens,
     )
+    if type(plan_tile_tokens) is not int or plan_tile_tokens not in (128, 256):
+        raise ValueError("plan_tile_tokens must be 128 or 256")
     if compute_dtype not in ("fp8", "bf16"):
         raise ValueError(f"Unsupported gfx1250 PA compute dtype: {compute_dtype}")
     if t.bf16 and per_token_kv:

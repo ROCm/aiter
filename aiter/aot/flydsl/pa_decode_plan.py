@@ -83,23 +83,25 @@ def replay(job: dict) -> None:
     batch, capacity = job["batch"], job["capacity"]
     # One KV head: the budget is the capacity, which the partition cap admits.
     lengths = torch.empty(batch, dtype=torch.int32, device="cuda")
-    plan = plan_pa_decode(
-        lengths,
-        1,
-        max_partitions=-(-capacity // batch),
-        max_batch_size=batch,
-        workgroup_budget=capacity,
-        sliding_window=int(job["windowed"]),
-    )
-    if plan.cluster_info is not None:
-        # Manually supplied plans may omit auxiliary records. Precompile the
-        # legacy refresh variant for the same batch and block-size bucket.
-        plan_pa_decode(
+    for tile_tokens in ((128, 256) if job["gfx"].startswith("gfx1250") else (256,)):
+        plan = plan_pa_decode(
             lengths,
             1,
-            plan=replace(plan, cluster_info=None),
+            max_partitions=-(-capacity // batch),
+            tile_tokens=tile_tokens,
+            max_batch_size=batch,
+            workgroup_budget=capacity,
             sliding_window=int(job["windowed"]),
         )
+        if plan.cluster_info is not None:
+            # Manually supplied plans may omit auxiliary records. Precompile the
+            # legacy refresh variant for the same batch and block-size bucket.
+            plan_pa_decode(
+                lengths,
+                1,
+                plan=replace(plan, cluster_info=None),
+                sliding_window=int(job["windowed"]),
+            )
 
 
 def describe(job: dict) -> str:

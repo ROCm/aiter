@@ -31,7 +31,9 @@ def _block_threads(capacity):
 
 
 @cache
-def compile_pa_decode_plan(max_batch, threads, windowed, cluster_tasks=False):
+def compile_pa_decode_plan(
+    max_batch, threads, windowed, cluster_tasks=False, tile_tokens=256
+):
     """Compile a batch bucket and block size for dense or windowed plans.
 
     Actual batch, task capacity, partition cap and window are runtime values.
@@ -50,8 +52,8 @@ def compile_pa_decode_plan(max_batch, threads, windowed, cluster_tasks=False):
         length = fx.max(fx.Int64(ctx), fx.Int64(0))
         first = fx.Int64(0)
         if windowed:
-            first = fx.max(length - fx.Int64(window), fx.Int64(0)) // 256
-        return first, (length + 255) // 256 - first
+            first = fx.max(length - fx.Int64(window), fx.Int64(0)) // tile_tokens
+        return first, (length + tile_tokens - 1) // tile_tokens - first
 
     def split(tiles, lower, upper, max_parts):
         """Return a row's task count from its cumulative slot bounds."""
@@ -259,7 +261,8 @@ class PADecodePlan:
     """Reusable GPU metadata; refresh it whenever context lengths change.
 
     ``work_info`` is [capacity, 4]: sequence, begin/end absolute 256-token tile,
-    original context length. Tile ranges are half-open and cover the MTP union.
+    original context length. Tile ranges use ``tile_tokens`` units, are half-open
+    and cover the MTP union.
     ``reduce_info`` is [batch, 2]: first packed task, actual task count.
     ``cluster_info``, when present, is [batch, min(max_partitions, 8), 8] with the
     first four work fields followed by first task, task count and two padding
@@ -284,6 +287,7 @@ class PADecodePlan:
     # Optional [batch, min(max_partitions, 8), 8] records for resident clusters.
     # Fields: sequence, begin/end tile, context length, first task, count, 0, 0.
     cluster_info: torch.Tensor | None = None
+    tile_tokens: int = 256
 
     @property
     def capacity(self) -> int:
@@ -313,6 +317,12 @@ class PADecodePlan:
             raise ValueError("work_info must have shape [capacity, 4]")
         if not batch_size <= self.capacity <= batch_size * self.max_partitions:
             raise ValueError("plan capacity must be in [batch, batch * max_partitions]")
+        if type(self.tile_tokens) is not int or self.tile_tokens not in (128, 256):
+            raise ValueError("plan tile_tokens must be 128 or 256")
+        if self.tile_tokens == 128 and torch.cuda.get_device_properties(
+            device
+        ).gcnArchName.split(":", 1)[0] not in ("gfx1250", "gfx1250-strict"):
+            raise ValueError("128-token plans require gfx1250")
         metadata = [self.work_info, self.reduce_info]
         if self.cluster_info is not None:
             if self.cluster_info.shape != (batch_size, min(self.max_partitions, 8), 8):
@@ -347,6 +357,7 @@ def plan_pa_decode(
     sliding_window: int = 0,
     query_length: int = 1,
     plan: PADecodePlan | None = None,
+    tile_tokens: int | None = None,
 ) -> PADecodePlan:
     """Build/refresh GPU work metadata on the current stream without readback.
 
@@ -355,6 +366,11 @@ def plan_pa_decode(
 
     ``max_partitions`` is in [1, device CU count], defaulting to CU count;
     omitting it on refresh preserves the existing limit.
+    ``tile_tokens`` selects 128/256-token metadata units. On gfx1250, new
+    single-query full-attention plans with batch <=3 and cap >=32 default to 128 to expose
+    more small-context tasks. Other new plans default to 256; refresh retains
+    the existing unit and must not change it. Explicit 128 requires gfx1250.
+    This changes task division, not scratch capacity or the partition cap.
     ``max_batch_size`` defaults to 4096 for a new plan and is retained on refresh.
     Kernels use batch buckets with upper bounds 1, 2, 4, ... clipped to the
     device's LDS capacity, independent of ``max_batch_size``. Each bucket
@@ -412,6 +428,30 @@ def plan_pa_decode(
         max_partitions = num_compute_units if plan is None else plan.max_partitions
     if not 1 <= max_partitions <= num_compute_units:
         raise ValueError(f"max_partitions must be in [1, {num_compute_units}]")
+    if tile_tokens is None:
+        tile_tokens = (
+            plan.tile_tokens
+            if plan is not None
+            else (
+                128
+                if properties.gcnArchName.split(":", 1)[0]
+                in ("gfx1250", "gfx1250-strict")
+                and batch <= 3
+                and query_length == 1
+                and max_partitions >= 32
+                and sliding_window == 0
+                else 256
+            )
+        )
+    if type(tile_tokens) is not int or tile_tokens not in (128, 256):
+        raise ValueError("tile_tokens must be 128 or 256")
+    if tile_tokens == 128 and properties.gcnArchName.split(":", 1)[0] not in (
+        "gfx1250",
+        "gfx1250-strict",
+    ):
+        raise ValueError("128-token plans require gfx1250")
+    if plan is not None and tile_tokens != plan.tile_tokens:
+        raise ValueError("tile_tokens must match the reused plan")
     if plan is None:
         if workgroup_budget is None:
             workgroup_budget = 2 * num_compute_units
@@ -435,6 +475,7 @@ def plan_pa_decode(
                 dtype=torch.int32,
                 device=dev,
             ),
+            tile_tokens=tile_tokens,
             cluster_info=(
                 torch.empty(
                     (batch, min(max_partitions, 8), 8), dtype=torch.int32, device=dev
@@ -467,6 +508,7 @@ def plan_pa_decode(
             _block_threads(plan.capacity),
             sliding_window > 0,
             plan.cluster_info is not None,
+            plan.tile_tokens,
         )
         _run_compiled(
             launch,

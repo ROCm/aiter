@@ -20,7 +20,7 @@ from .op_gemm import Gfx1250Gemm, PaDecodeGemm
 from .op_lds import Gfx1250Memory, PaDecodeKVLoader, PaDecodeLds, PaDecodeQueryLoader
 from .op_merge import Gfx1250PartitionMerge
 from .op_softmax import PaDecodeSoftmax
-from .traits import KV_COMPUTE_BLOCK, LOG2E, MFMA_MNK, MXFP4_P_EXP_SHIFT, WAVE
+from .traits import LOG2E, MFMA_MNK, MXFP4_P_EXP_SHIFT, WAVE
 
 
 class PaDecodePipeline:
@@ -808,8 +808,8 @@ class Gfx1250Bf16Pipeline:
             )
         state_stride = 2 + t.head_dim // 64
         begin, end = (
-            ctx.planned_start * KV_COMPUTE_BLOCK,
-            ctx.planned_end * KV_COMPUTE_BLOCK,
+            ctx.planned_start * t.plan_tile_tokens,
+            ctx.planned_end * t.plan_tile_tokens,
         )
         # Keep the Q loads ahead of the first page's table lookup.
         fx.rocdl.sched_barrier(0)
@@ -1207,8 +1207,8 @@ class Gfx1250Bf16WavePipeline:
         )
         self.mem.allocate()
         begin, end = (
-            ctx.planned_start * KV_COMPUTE_BLOCK,
-            ctx.planned_end * KV_COMPUTE_BLOCK,
+            ctx.planned_start * t.plan_tile_tokens,
+            ctx.planned_end * t.plan_tile_tokens,
         )
         self.mem.stage_bf16_page(begin, fx.Int32(0))
         # Wave 2 g + p takes tokens [64 p, 64 p + 64) of each page for tiles
@@ -1424,8 +1424,8 @@ class Gfx1250Bf16DecodePipeline(Gfx1250Bf16WavePipeline):
         )
         self.mem.allocate()
         begin, end = (
-            ctx.planned_start * KV_COMPUTE_BLOCK,
-            ctx.planned_end * KV_COMPUTE_BLOCK,
+            ctx.planned_start * t.plan_tile_tokens,
+            ctx.planned_end * t.plan_tile_tokens,
         )
         self.mem.stage_bf16_page(begin, fx.Int32(0))
         row = ctx.lane16
@@ -1851,8 +1851,8 @@ class Gfx1250WavePipeline:
         )
         self.mem.allocate()
         begin, end = (
-            ctx.planned_start * KV_COMPUTE_BLOCK,
-            ctx.planned_end * KV_COMPUTE_BLOCK,
+            ctx.planned_start * t.plan_tile_tokens,
+            ctx.planned_end * t.plan_tile_tokens,
         )
         # The first page's DMA overlaps Q staging; the regions are disjoint.
         self.mem.stage_kv(begin, fx.Int32(0))
@@ -1974,8 +1974,8 @@ class Gfx1250Pipeline:
         )
         self.mem.allocate()
         begin, end = (
-            ctx.planned_start * KV_COMPUTE_BLOCK,
-            ctx.planned_end * KV_COMPUTE_BLOCK,
+            ctx.planned_start * t.plan_tile_tokens,
+            ctx.planned_end * t.plan_tile_tokens,
         )
         # The first page's DMA overlaps Q staging; the regions are disjoint.
         self.mem.stage_kv(begin, fx.Int32(0))

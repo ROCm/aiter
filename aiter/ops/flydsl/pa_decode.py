@@ -438,7 +438,10 @@ def pa_decode(
     max_context_length: int | None = None,
     mask_unowned_kv: bool = True,
 ) -> None:
-    """Decode FP8 or BF16 K/V using 256-token compute tiles.
+    """Decode FP8 or BF16 K/V using reusable GPU work tiles.
+
+    ``context_partition_size=256`` is the legacy compatibility argument.
+    Work metadata records its own 128/256-token unit; scratch capacity is unchanged.
 
     Supports page sizes 16/64/128. BF16 head dimensions are multiples of 64
     up to 1024; FP8 supports 64 and multiples of 128 up to 1024.
@@ -926,13 +929,13 @@ def pa_decode(
     max_partitions = min(
         num_partitions,
         work_plan.capacity,
-        max(1, -(-schedule_context_length // KV_COMPUTE_BLOCK)),
+        max(1, -(-schedule_context_length // work_plan.tile_tokens)),
     )
     if sliding_window > 0:
         # Bound the unaligned MTP window without shrinking the reusable plan.
         window_tiles = (
-            sliding_window + query_length - 2 + KV_COMPUTE_BLOCK - 1
-        ) // KV_COMPUTE_BLOCK + 1
+            sliding_window + query_length - 2 + work_plan.tile_tokens - 1
+        ) // work_plan.tile_tokens + 1
         max_partitions = min(max_partitions, window_tiles)
     # gfx1250 tile kernels write final output for one-partition plans and for
     # plans with one task slot per sequence: single tasks store directly, and
@@ -1023,6 +1026,7 @@ def pa_decode(
             trans_k=trans_k,
             mask_unowned_kv=mask_unowned_kv,
             cluster_merge=cluster_merge,
+            plan_tile_tokens=work_plan.tile_tokens,
             cluster_task_stride=(
                 work_plan.cluster_task_stride if use_cluster_tasks else 0
             ),

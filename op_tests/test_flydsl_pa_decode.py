@@ -49,6 +49,7 @@ def device(monkeypatch):
         pytest.param(None, None, None, 0, 1, None, None, id="lds-limit"),
     ],
 )
+@pytest.mark.parametrize("tile_tokens", [128, 256])
 def test_pa_decode_plan(
     device,
     monkeypatch,
@@ -59,11 +60,14 @@ def test_pa_decode_plan(
     query_length,
     max_batch_size,
     bucket,
+    tile_tokens,
 ):
     """Packed tasks cover visible tiles, refresh in graphs and reuse batch buckets."""
     from aiter.ops.flydsl.kernels import pa_decode_plan as planner
 
     properties = torch.cuda.get_device_properties(device)
+    if tile_tokens == 128 and get_gfx_runtime() != "gfx1250":
+        pytest.skip("128-token plans require gfx1250")
     lds_limit = batch is None
     if lds_limit:
         lds_bytes = getattr(properties, "shared_memory_per_block", None)
@@ -88,8 +92,12 @@ def test_pa_decode_plan(
         work = plan.work_info.cpu().tolist()
         ranges = [
             (
-                max(max(ctx, 0) - query_length + 1 - window, 0) // 256 if window else 0,
-                (max(ctx, 0) + 255) // 256,
+                (
+                    max(max(ctx, 0) - query_length + 1 - window, 0) // plan.tile_tokens
+                    if window
+                    else 0
+                ),
+                (max(ctx, 0) + plan.tile_tokens - 1) // plan.tile_tokens,
             )
             for ctx in lengths
         ]
@@ -134,6 +142,7 @@ def test_pa_decode_plan(
     plan = planner.plan_pa_decode(
         context,
         2,
+        tile_tokens=tile_tokens,
         max_partitions=max_parts,
         max_batch_size=max_batch_size,
         workgroup_budget=budget,
@@ -168,6 +177,16 @@ def test_pa_decode_plan(
         check(plan, values)
         assert plan_pointers() == pointers
 
+    with pytest.raises(ValueError, match="tile_tokens must match"):
+        planner.plan_pa_decode(
+            context,
+            2,
+            plan=plan,
+            sliding_window=window,
+            query_length=query_length,
+            tile_tokens=384 - tile_tokens,
+        )
+
     if bucket > 1:
         # Change every runtime value inside the same batch/block-size bucket
         # and window mode.
@@ -193,6 +212,7 @@ def test_pa_decode_plan(
             other_context,
             2,
             max_partitions=other_parts,
+            tile_tokens=tile_tokens,
             max_batch_size=plan.max_batch_size,
             workgroup_budget=2 * other_capacity,
             sliding_window=other_window,
@@ -783,6 +803,19 @@ def _short_bound_pool(*, device):
 
 
 _COMMON_CASES = [
+    (
+        "fine-plan-window128",
+        {
+            "group_size": 16,
+            "query_length": 4,
+            "block_size": 128,
+            "max_partitions": 7,
+            "window": 257,
+            "tile_tokens": 128,
+            "sink_dtype": torch.float32,
+            "capture": True,
+        },
+    ),
     ("decode", {"block_size": 16, "max_partitions": 1}),
     (
         "window",
@@ -1709,6 +1742,7 @@ def _check_pipe_policy(pa, case, arch, compile_kwargs):
         schedule_kwargs.pop("cluster_merge", None)
         schedule_kwargs.pop("packed_scale_heads", None)
         schedule_kwargs.pop("cluster_task_stride", None)
+        schedule_kwargs.pop("plan_tile_tokens", None)
         pipe, staged = PaDecodeSchedule.select(**schedule_kwargs).cache_key[-2:]
         assert pipe == (arch == "gfx950")
         if pipe:
@@ -1784,6 +1818,8 @@ def test_pa_decode(case, device, monkeypatch):
     A case with ``invalid_input`` is an input the wrapper must refuse before any
     kernel compiles.
     """
+    if case.get("tile_tokens") == 128 and get_gfx_runtime() != "gfx1250":
+        pytest.skip("128-token plans require gfx1250")
     case = dict(
         {
             "query_length": 1,
@@ -1983,6 +2019,7 @@ def test_pa_decode(case, device, monkeypatch):
     plan = pa.plan_pa_decode(
         context,
         kv_heads,
+        tile_tokens=case.get("tile_tokens"),
         max_partitions=case["max_partitions"],
         workgroup_budget=case["budget"],
         query_length=query_length,

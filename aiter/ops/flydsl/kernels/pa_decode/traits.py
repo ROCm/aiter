@@ -837,6 +837,7 @@ class Gfx1250Traits:
     packed_scale_heads: bool = False
     # Number of aligned records per sequence in optional cluster_info.
     cluster_task_stride: int = 0
+    plan_tile_tokens: int = 256
 
     WAVE = 32
     NWARP = 4
