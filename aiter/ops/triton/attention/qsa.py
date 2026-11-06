@@ -412,6 +412,7 @@ def qsa_paged_mqa_logits(
             num_warps=num_warps,
         )
         return logits, visible_groups
+    # Fallback calls use the CUDA-core kernel.
     column_programs = min(
         triton.cdiv(columns, _SCORING_BLOCK_N), _SCORING_COLUMN_PROGRAMS
     )

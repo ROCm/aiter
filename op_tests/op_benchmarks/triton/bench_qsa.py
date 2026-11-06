@@ -49,9 +49,13 @@ def _quantize(values, fmt):
     if fmt == "bf16":
         return values, None
     pages, page, heads, dim = values.shape
-    vdim, vdtype, tail, sdtype = qsa_cache_row_layout(fmt, dim)
-    cache = torch.empty(pages, page, heads, vdim, dtype=vdtype, device="cuda")
-    scale = torch.empty(pages, page, heads, *tail, dtype=sdtype, device="cuda")
+    layout = qsa_cache_row_layout(fmt, dim)
+    cache = torch.empty(
+        pages, page, heads, layout.dim, dtype=layout.dtype, device="cuda"
+    )
+    scale = torch.empty(
+        pages, page, heads, *layout.scale_tail, dtype=layout.scale_dtype, device="cuda"
+    )
     slots = torch.arange(pages * page, device="cuda")
     qsa_store_quantized_rows(cache, scale, slots, values.view(-1, heads, dim))
     return cache, scale
@@ -59,9 +63,11 @@ def _quantize(values, fmt):
 
 def _row_bytes(fmt, dim):
     """Bytes of one cached row including its scale."""
-    vdim, vdtype, tail, sdtype = qsa_cache_row_layout(fmt, dim)
-    scale_bytes = 0 if tail is None else math.prod(tail) * sdtype.itemsize
-    return vdim * vdtype.itemsize + scale_bytes
+    layout = qsa_cache_row_layout(fmt, dim)
+    scale_bytes = 0
+    if layout.scale_tail is not None:
+        scale_bytes = math.prod(layout.scale_tail) * layout.scale_dtype.itemsize
+    return layout.dim * layout.dtype.itemsize + scale_bytes
 
 
 def _make_scenario(batch, tokens_per_seq, context_len, index_dtype, kv_dtype):
