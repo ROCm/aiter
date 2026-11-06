@@ -165,10 +165,23 @@ def _run(
     )
 
 
-def _copy_inputs(inp: VerifyInputs) -> VerifyInputs:
-    """Clone every tensor; dense layouts (e.g. transposed caches) keep their strides."""
+# Activations SGLang slices out of one wide in-projection, so they are not dense.
+_STRIDED_INPUTS = ("x", "f_a", "raw_beta", "output_gate")
 
-    def copy(value):
+
+def _copy_inputs(inp: VerifyInputs) -> VerifyInputs:
+    """Copy every tensor with its strides; clone() would compact the activations.
+
+    Caches stay clone()d: their dense layouts keep strides, and a copy of the
+    large-offset test's padded pools would repeat their multi-GiB gaps.
+    """
+
+    def copy(name, value):
+        if name in _STRIDED_INPUTS:
+            out = torch.empty_strided(
+                value.shape, value.stride(), dtype=value.dtype, device=value.device
+            )
+            return out.copy_(value)
         if isinstance(value, torch.Tensor):
             return value.clone()
         if isinstance(value, tuple):
@@ -176,7 +189,7 @@ def _copy_inputs(inp: VerifyInputs) -> VerifyInputs:
         return value
 
     return VerifyInputs(
-        **{f.name: copy(getattr(inp, f.name)) for f in dataclasses.fields(inp)}
+        **{f.name: copy(f.name, getattr(inp, f.name)) for f in dataclasses.fields(inp)}
     )
 
 
@@ -426,6 +439,9 @@ def test_kda_verify_graph_replay(state_dtype, ring):
     torch.cuda.synchronize()
 
     graph_inputs, eager_inputs = _copy_inputs(seed), _copy_inputs(seed)
+    for name in _STRIDED_INPUTS:
+        for inputs in (graph_inputs, eager_inputs):
+            assert getattr(inputs, name).stride() == getattr(seed, name).stride(), name
     out = torch.empty(
         (1, batch * num_tokens, _H, _D), dtype=torch.bfloat16, device=_DEVICE
     )
@@ -586,6 +602,37 @@ def test_kda_verify_slot_check_treats_the_padding_slot_as_padding(monkeypatch, r
     # The padding rows race on their shared scratch, so only check the live rows.
     live = slice(2 * 5, 4 * 5)
     _assert_close(ref_out[:, live], out[:, live], "output", **_OUT_TOL, max_bad=1e-3)
+
+
+@pytest.mark.parametrize("ring", [False, True])
+def test_kda_verify_slot_check_rejects_padding_on_a_live_line(monkeypatch, ring):
+    """A row on the padding slot still writes its line, so it may not share a
+    live sequence's line."""
+    _reject_compile(monkeypatch)
+    monkeypatch.setattr(linear_attention_kernels, "_KDA_SLOT_CHECK", True)
+    monkeypatch.setattr(linear_attention_kernels, "_KDA_SLOT_CHECK_PADDING_SLOT", 0)
+    inp = _make_inputs(3, 5, torch.bfloat16, ring)
+    inp.cache_indices.copy_(torch.tensor([0, 1, 2], dtype=torch.int32))
+    inp.inter_indices.copy_(torch.tensor([4, 4, 5], dtype=torch.int32))
+    with pytest.raises(
+        ValueError, match=r"line of a live sequence; shared lines: \[4\]"
+    ):
+        _run(inp, 5)
+
+
+@pytest.mark.parametrize(
+    "scratch, cache",
+    [("inter_states", "state"), ("window", "conv_state")],
+)
+def test_kda_verify_rejects_scratch_on_a_cache(monkeypatch, scratch, cache):
+    """Scratch over a cache would commit the verify early, so it is rejected."""
+    _reject_compile(monkeypatch)
+    inp = _make_inputs(2, 1, torch.bfloat16, False)
+    # One token: the scratch's own layout, laid over the cache's slots.
+    target = getattr(inp, scratch)
+    setattr(inp, scratch, getattr(inp, cache).as_strided(target.shape, target.stride()))
+    with pytest.raises(ValueError, match=f"must not overlap `{cache}`"):
+        _run(inp, 1)
 
 
 def _reject_compile(monkeypatch):

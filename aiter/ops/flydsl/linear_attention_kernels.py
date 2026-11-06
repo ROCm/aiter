@@ -1256,6 +1256,63 @@ def _check_disjoint_rows(
         span += (tensor.shape[dim] - 1) * tensor.stride(dim)
 
 
+def _slot_blocks(tensor: torch.Tensor) -> tuple[int, int, int, int]:
+    """Return (start, step, size, count): the byte blocks of each dim-0 slot.
+
+    Spans are conservative: a block covers every byte its slot can reach,
+    which is exact for the dense slots the callers have already checked.
+    """
+    es = tensor.element_size()
+    count = tensor.shape[0]
+    reach = sum((n - 1) * st for n, st in zip(tensor.shape[1:], tensor.stride()[1:]))
+    return tensor.data_ptr(), tensor.stride(0) * es, (reach + 1) * es, count
+
+
+def _blocks_overlap(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> bool:
+    """Whether two runs of evenly spaced byte blocks share a byte.
+
+    Exact when both runs step alike or one run is a single block: then some
+    k = j - i must put b's block j within a's block i. Other runs whose
+    overall spans meet count as overlapping.
+    """
+    (a0, a_step, a_size, na), (b0, b_step, b_size, nb) = a, b
+    if (
+        na == 0
+        or nb == 0
+        or a0 >= b0 + (nb - 1) * b_step + b_size
+        or b0 >= a0 + (na - 1) * a_step + a_size
+    ):
+        return False
+    if na > 1 and nb > 1 and a_step != b_step:
+        return True
+    step = a_step if na > 1 else b_step
+    if step <= 0 or (na == 1 and nb == 1):
+        return True
+    # Need -b_size < d + k * step < a_size for some k in [1 - na, nb - 1].
+    d = b0 - a0
+    k_low = max((-b_size - d) // step + 1, 1 - na)
+    k_high = min(-((d - a_size) // step) - 1, nb - 1)
+    return k_low <= k_high
+
+
+def _check_no_alias(
+    written: tuple[tuple[str, torch.Tensor | None], ...],
+    read: tuple[tuple[str, torch.Tensor], ...],
+) -> None:
+    """Reject a written buffer that shares a byte with a read-only cache.
+
+    A verify must leave the caches unchanged until the caller commits, so a
+    scratch or output store into a cache is an early commit. Buffers may
+    still interleave slots in one pool.
+    """
+    for w_name, w in written:
+        if w is None:
+            continue
+        for r_name, r in read:
+            if _blocks_overlap(_slot_blocks(w), _slot_blocks(r)):
+                raise ValueError(f"`{w_name}` must not overlap `{r_name}`.")
+
+
 def _check_i32_addressing(
     name: str,
     tensor: torch.Tensor,
@@ -1855,15 +1912,18 @@ def flydsl_kda_verify_with_f_b(
     does not check this; set ``AITER_KDA_DECODE_SLOT_CHECK=1`` to raise
     ``ValueError`` on a repeat (it syncs with the host and is skipped during
     CUDA graph capture). As in the decode check, a sequence on
-    ``AITER_KDA_DECODE_SLOT_CHECK_PADDING_SLOT`` counts as padding there.
+    ``AITER_KDA_DECODE_SLOT_CHECK_PADDING_SLOT`` counts as padding there. Its
+    indices are in range, so the kernel still writes its intermediate line,
+    and the check rejects that line when a live sequence uses it too.
 
     Every buffer the kernel writes needs dense, non-overlapping slots or lines,
     with padding between them allowed: ``intermediate_conv_window`` as
     channel-major ``[lines, steps, 4608, 3]`` or SGLang's ``[lines, steps, 3,
     4608]`` viewed through ``transpose(-1, -2)``, ``intermediate_states`` and
     the ring tensors in their stated order, and ``out`` with non-overlapping
-    token and head rows. ``conv_state`` takes either conv layout; strides and
-    byte spans follow the int32 limits of :func:`flydsl_kda_decode`.
+    token and head rows. No written buffer may overlap ``conv_state`` or
+    ``state``. ``conv_state`` takes either conv layout; strides and byte spans
+    follow the int32 limits of :func:`flydsl_kda_decode`.
 
     ``num_warps`` overrides the per-workgroup wave count, one of
     ``flydsl_kda_verify_with_f_b.num_warps`` (4 or 8); by default it follows
@@ -2147,21 +2207,30 @@ def flydsl_kda_verify_with_f_b(
     )
     _check_i32_addressing("out", out, first_dim=1)
     _check_disjoint_rows("out", out, (1, 2), "token and head")
+    _check_no_alias(
+        (
+            ("out", out),
+            ("intermediate_conv_window", intermediate_conv_window),
+            ("intermediate_states", intermediate_states),
+        )
+        + tuple((f"replay_ring[{i}]", t) for i, t in enumerate(replay_ring or ())),
+        (("conv_state", conv_state), ("state", state)),
+    )
     num_inter_lines = min(num_inter_lines, _INT32_MAX)
     if _KDA_SLOT_CHECK:
         # Capture is per stream, so ask about the stream the kernel launches on.
         with torch.cuda.device(device):
             if not torch.cuda.is_current_stream_capturing():
-                # A sequence is live only when both indices are in range, as in
-                # the kernel; padding may repeat either index. A sequence on the
-                # reserved padding slot is padding too, as in the decode check.
-                masked_cache = _mask_padding_slot(cache_indices)
-                live = (
-                    (masked_cache >= 0)
-                    & (masked_cache < num_slots)
+                # The kernel writes a row when both indices are in range. Such a
+                # row on the reserved padding slot is padding, as in the decode
+                # check; padding may repeat lines, but not share a live one.
+                writes = (
+                    (cache_indices >= 0)
+                    & (cache_indices < num_slots)
                     & (intermediate_indices >= 0)
                     & (intermediate_indices < num_inter_lines)
                 )
+                live = writes & (_mask_padding_slot(cache_indices) >= 0)
                 # Only the ring is written per cache slot; a snapshot verify
                 # just reads conv_state and state there.
                 if replay_ring is not None:
@@ -2175,6 +2244,15 @@ def flydsl_kda_verify_with_f_b(
                     num_inter_lines,
                     "intermediate_indices",
                 )
+                shared = torch.isin(
+                    intermediate_indices[live], intermediate_indices[writes & ~live]
+                )
+                if shared.any():
+                    raise ValueError(
+                        "`intermediate_indices` must not give a padding row the "
+                        "line of a live sequence; shared lines: "
+                        f"{intermediate_indices[live][shared][:8].tolist()}."
+                    )
 
     if num_warps is None:
         num_warps = _kda_verify_num_warps(batch, replay_ring is not None)
