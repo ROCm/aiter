@@ -21,7 +21,7 @@ import torch
 
 from aiter import ActivationType, QuantType, dtypes
 from aiter.fused_moe import fused_topk, moe_sorting, torch_moe_stage1, torch_moe_stage2
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.ops.flydsl.moe_kernels import (
     pick_flydsl_stage2_tile_k,
     resolve_flydsl_stage2_tile_k,
@@ -220,13 +220,15 @@ def test_flydsl_stage1_wrapper_preserves_scheduling(
     assert launch["persist_m"] == persist_m
 
 
-@pytest.mark.parametrize("token", [128, 32768])
+@pytest.mark.parametrize("grid_case", ["short", "wrap"])
 @_SKIP_GFX950_FLYDSL
-def test_flydsl_stage1_a8w4_live_grid_matches_standard(token):
+def test_flydsl_stage1_a8w4_live_grid_matches_standard(grid_case):
     """A CU-sized grid must cover both short and multi-iteration route lists."""
     from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage1
 
     model_dim, inter_dim, experts, topk, block_m = 512, 256, 8, 2, 64
+    cu_num = get_cu_num()
+    token = 128 if grid_case == "short" else cu_num * block_m // topk + 1
     data = _generate_a8w4_gui_data(
         token, model_dim, inter_dim, experts, topk, block_m, seed=37
     )
@@ -254,6 +256,7 @@ def test_flydsl_stage1_a8w4_live_grid_matches_standard(token):
     torch.cuda.synchronize()
 
     num_sorted = int(data["num_valid_ids"][0].item())
+    assert ((num_sorted + block_m - 1) // block_m > cu_num) == (grid_case == "wrap")
     sorted_ids = data["sorted_ids"][:num_sorted].to(torch.int64)
     token_ids = sorted_ids & 0xFFFFFF
     slot_ids = sorted_ids >> 24

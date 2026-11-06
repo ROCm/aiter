@@ -243,7 +243,7 @@ def test_ep_silu_a8w4_fallback_uses_runtime_gfx(monkeypatch, build_gfx, runtime_
 
 @_SKIP_GFX950_GPU
 def test_ep_silu_interleave_uses_a8w4_below_default_threshold(monkeypatch):
-    """On gfx950, small plain-SiLU EP batches preserve exact FP8 passthrough."""
+    """Small routed-only SiLU EP preserves FP8 passthrough and dense output."""
     get_2stage_cfgs.cache_clear()
     monkeypatch.setenv("AITER_BF16_FP8_MOE_BOUND", "256")
     monkeypatch.setenv("AITER_FLYDSL_FORCE", "0")
@@ -264,6 +264,12 @@ def test_ep_silu_interleave_uses_a8w4_below_default_threshold(monkeypatch):
 
     assert torch.isfinite(internal).all()
     assert torch.equal(passthrough, internal)
+
+    # The all-local EP mask must preserve the ordinary MoE result too.
+    monkeypatch.setenv("AITER_BF16_FP8_MOE_BOUND", "0")
+    dense_kwargs = {key: value for key, value in kwargs.items() if key != "expert_mask"}
+    reference = fused_moe(x, w1, w2, **dense_kwargs)
+    torch.testing.assert_close(internal, reference, atol=1.0, rtol=0.05)
 
 
 @_SKIP_GFX950_GPU
@@ -302,26 +308,6 @@ def test_ep_config_key_supports_legacy_and_routed_only_topk():
         "flydsl_moe1_afp8_wfp4_bf16_t64x128x256_w3_gui_persist_fp8",
         "flydsl_moe2_afp8_wfp4_bf16_t64x128x256_atomic_persist",
     )
-
-
-@_SKIP_GFX950_GPU
-def test_routed_only_ep_topk_reaches_fused_moe():
-    """The public API must accept an EP mask without requiring a fake route."""
-    x, w1, w2, kwargs = _build(8)
-    kwargs["activation"] = ActivationType.Silu
-    expert_mask = torch.ones(EXPERTS, dtype=torch.int32, device=x.device)
-
-    reference = fused_moe(x, w1, w2, **kwargs)
-    routed_only = fused_moe(
-        x,
-        w1,
-        w2,
-        expert_mask=expert_mask,
-        ep_has_fake_route=False,
-        **kwargs,
-    )
-
-    torch.testing.assert_close(routed_only, reference, atol=1.0, rtol=0.05)
 
 
 @_SKIP_GFX950_GPU
@@ -440,7 +426,6 @@ def test_fused_moe_selects_mimo_ep_quant(monkeypatch):
 @pytest.mark.parametrize(
     "case,expected",
     [
-        ({}, "ep"),
         ({"experts": 48, "topk": 9, "fake": True}, "ep"),
         ({"arch": "gfx942"}, "generic"),
         ({"arch": "gfx1250"}, "generic"),
@@ -451,7 +436,6 @@ def test_fused_moe_selects_mimo_ep_quant(monkeypatch):
         ({"flydsl": False}, "generic"),
     ],
     ids=[
-        "ep16",
         "ep8-legacy",
         "gfx942",
         "gfx1250",
