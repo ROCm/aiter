@@ -102,8 +102,12 @@ class ATileLoader:
                 128,
             )
 
-    def for_tile(self, tile_row_base_i32):
-        """Precompute LDS and tile-local global offsets for one M tile."""
+    def for_tile(self, tile_row_base_i32, valid_rows_i32=None):
+        """Precompute LDS and tile-local global offsets for one M tile.
+
+        ``valid_rows_i32`` clamps the tile descriptor's num_records, so padding
+        rows read back as zero without touching memory.
+        """
         if const_expr(self._indexed_input):
             input_iter = fx.get_iter(self._x_tensor)
             input_bytes = self._source_rows * self._row_bytes
@@ -119,17 +123,21 @@ class ATileLoader:
             input_view = fx.Tensor(
                 fx.make_view(tile_iter, fx.make_layout(input_bytes, 1))
             )
+        num_records = input_bytes
+        if valid_rows_i32 is not None:
+            assert not self._indexed_input
+            num_records = fx.Int32(valid_rows_i32) * fx.Int32(self._row_bytes)
         self._tile_rsrc = ptr_buf_tensor(
             fx.get_iter(input_view),
             fx.Int32,
             unit_elems=4,
-            num_records_bytes=input_bytes,
+            num_records_bytes=num_records,
         )
         if const_expr(self._async_copy):
             tile_buffer = fx.rocdl.make_buffer_tensor(
                 input_view,
                 max_size=False,
-                num_records_bytes=input_bytes,
+                num_records_bytes=num_records,
             )
             self._tile_dma = fx.logical_divide(
                 tile_buffer,
@@ -371,14 +379,21 @@ class BScaleLoader:
         lane = fx.thread_idx.x % 64
         self._lane_off = lane
 
-    def load_step(self, base_row_i32, kstep_i32):
+    def load_step(self, base_row_i32, kstep_i32, cache_modifier=0):
         base_group = base_row_i32 // fx.Int32(32)
         kterm = kstep_i32 * fx.Int32(64)
         lane = fx.Int32(self._lane_off)
         out = []
         for g in range_constexpr(self._n_groups):
             off = (base_group + fx.Int32(g)) * fx.Int32(self._row_stride) + kterm + lane
-            out.append(self._rsrc[off])
+            if const_expr(cache_modifier == 0):
+                out.append(self._rsrc[off])
+            else:
+                out.append(
+                    buf_copy_load(
+                        self._rsrc, off, fx.Int32, cache_modifier=cache_modifier
+                    )
+                )
         return out
 
 
