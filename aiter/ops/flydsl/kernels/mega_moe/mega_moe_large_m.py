@@ -41,7 +41,7 @@ from ..mxfp4_gemm_common import lds_typed_ptr, lds_vec_load
 from ..tensor_shim import _preload_compiled, _run_compiled, ptr_buf_tensor
 from ..tensor_shim import torch_stream as _torch_stream
 from .dispatch import _wave_inclusive_scan_i32, _wave_reduce_max_i32
-from .gemm1 import _LdsF32View
+from .gemm1 import _LdsF32View, build_fused_gemm1
 from .gemm2 import _resolve_g2_knobs
 from .mega_moe_config import LARGE_M_MTPRS, fused_layout_supported
 from .mega_moe_fused_gemm import (
@@ -51,7 +51,6 @@ from .mega_moe_fused_gemm import (
     _buffer_store,
     _make_buffer,
     _make_buffer_from_addr,
-    build_fused_gemm1,
     gemm2_compute_v2,
     issue_a_load_lds_dt,
     kStages,
@@ -1586,7 +1585,7 @@ def compile_mega_moe_stage1(
         _, _do_scheduled_tile = build_fused_gemm1(
             x_tensor=x, w_rsrc=w_rsrc,
             sw_rsrc=sw_rsrc, sx_rsrc=sx_rsrc, out_rsrc=out_rsrc, os_rsrc=os_rsrc,
-            trb_rsrc=trb_rsrc, expert_rsrc=expert_rsrc, out_tensor=out,
+            trb_rsrc=trb_rsrc, tib_rsrc=trb_rsrc, expert_rsrc=expert_rsrc, out_tensor=out,
             a_buf=a_buf, a_scale_lds=a_scale_lds, c_tile=c_tile,
             model_dim=model_dim, inter_dim=inter_dim, sort_block_m=sort_block_m,
             tile_n=tile_n, num_waves=NUM_WAVES, n_per_wave=n_per_wave, wave_id=wave_id,
@@ -1594,8 +1593,8 @@ def compile_mega_moe_stage1(
             total_threads=TOTAL_THREADS, k_iters=K_ITERS, a_lds_i32=a_lds_i32,
             n_tiles=N_TILES, expert_offset=fz_rank * fz_epr, b_cache_modifier=b_cache_modifier,
             swizzle_a=swizzle_a, pipe_weights=pipe_weights, mfma_amajor=mfma_amajor,
-            async_a_copy=async_a_copy, use_tile_resource=use_tile_resource,
-            swiglu_limit=swiglu_limit, out_cache_modifier=G1_OUT_CACHE,
+            async_a_copy=async_a_copy, use_tile_resource=use_tile_resource, indirect_input=False, evec=2,
+            swiglu_limit=swiglu_limit, out_cache_modifier=G1_OUT_CACHE, tile_zero=True,
         )
 
         if tid == fx.Int32(0):
