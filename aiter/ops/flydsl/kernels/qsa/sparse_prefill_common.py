@@ -82,23 +82,27 @@ PLATFORMS = {
         max_packed_kv_bytes=64 * 1024 * 1024,
         pack_tokens_per_row=32,
     ),
-    # MI355X, not a calibration: the MI308X values with every tile routed to the union kernel
-    # (union_ratio 1e30: K2 proposes union for every tile; route_margin 0.999999: K3 keeps
-    # every union tile), as kit-Q1 ran #6576 on gfx950.
+    # MI355X, decision-tuned: K3's route terms and route_margin were chosen on 91
+    # calibration layouts so that routed calls stay near the faster of all-union and
+    # host-gated all-direct (90 within 1.05x, worst 1.06x); they are not phase timings.
+    # union_ratio 1e30: K2 proposes union for every tile;
+    # route_all_or_none: K3 also weighs keeping every union tile against none when the union
+    # phase is throughput-bound.
     ("gfx950", 256): Platform(
-        union_fixed=10.0,
-        union_step=3.2,
-        row_step=0.7,
-        route_margin=0.999999,
-        direct_fixed=41.0,
-        pack_block=0.0041,
-        direct_cu_step=0.304,
+        union_fixed=345.2,
+        union_step=2.228,
+        row_step=8.528,
+        route_margin=0.0,
+        direct_fixed=0.001456,
+        pack_block=0.001067,
+        direct_cu_step=0.5711,
         union_ratio=1e30,
-        union_min_rows=384,
-        union_min_rows_per_head=64,
-        wide_tiles_per_cu=1.0,
+        union_min_rows=1536,
+        union_min_rows_per_head=0,
+        wide_tiles_per_cu=0.38095238095238093,
         max_packed_kv_bytes=64 * 1024 * 1024,
         pack_tokens_per_row=32,
+        route_all_or_none=True,
     ),
 }
 OVERRIDE = "AITER_QSA_PLATFORM"
