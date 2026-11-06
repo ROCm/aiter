@@ -121,6 +121,8 @@ def _run_all_gather_lastdim_add_case(
         assert not ca.should_custom_ag_lastdim_add(x.float()), msg
         assert not ca.should_custom_ag_lastdim_add(x[:, :4]), msg
         assert not ca.should_custom_ag_lastdim_add(x.view(-1)), msg
+        empty = ca.all_gather_lastdim_add(x[:0], add_b[:0])
+        assert empty.shape == (0, n * tp_size), msg
         flat = torch.empty(add_b.numel() + 1, dtype=dtype, device="cuda")
         misaligned = flat[1:].view(full)
         bad = {

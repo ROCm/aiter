@@ -2028,6 +2028,8 @@ class CustomAllreduce:
                 f"all_gather_lastdim_add expects contiguous {shape} add/out "
                 f"tensors with inp's dtype ({inp.dtype}) and device ({inp.device})"
             )
+        if inp.numel() == 0:
+            return out
         for t in (inp, add_b, add_c, out):
             assert (
                 t is None or t.data_ptr() % 16 == 0

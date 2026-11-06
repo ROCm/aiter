@@ -531,6 +531,8 @@ void all_gather_lastdim_add(fptr_t _fa,
     check_full(add_b, "add_b");
     if(add_c.has_value())
         check_full(*add_c, "add_c");
+    if(inp.numel() == 0)
+        return;
     if(out.data_ptr() == add_b.data_ptr() ||
        (add_c.has_value() && out.data_ptr() == add_c->data_ptr()))
         throw std::runtime_error("all_gather_lastdim_add: out must not alias add_b or add_c");
