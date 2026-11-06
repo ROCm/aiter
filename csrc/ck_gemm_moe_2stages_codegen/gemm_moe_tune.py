@@ -70,8 +70,10 @@ from aiter.ops.flydsl.moe_kernels import (
     flydsl_moe_stage1,
     flydsl_moe_stage2,
     get_flydsl_stage1_kernels,
+    get_flydsl_stage1_kernels_a16w16,
     get_flydsl_stage1_kernels_int4_bf16,
     get_flydsl_stage2_kernels,
+    get_flydsl_stage2_kernels_a16w16,
     get_flydsl_stage2_kernels_int4_bf16,
     get_flydsl_stage2_v2_kernels,
     runtime_swiglu_limit,
@@ -81,7 +83,11 @@ from aiter.ops.flydsl.mxfp4_kname import (
     _parse_mxfp4_g1_kname,
     parse_g2_kname_any,
 )
-from aiter.ops.quant import per_1x32_f8_scale_f8_quant, per_1x32_i4_quant
+from aiter.ops.quant import (
+    per_1x32_f8_scale_f8_quant,
+    per_1x32_i4_quant,
+    per_1x32_mx_quant_hip,
+)
 from aiter.ops.shuffle import (
     pack_int8_to_packed_int4,
     shuffle_scale,
@@ -2274,9 +2280,14 @@ class FmoeTuner(TunerCommon):
                 q_type == QuantType.per_1x32
                 and q_dtype_a in (dtypes.bf16, dtypes.fp16)
                 and q_dtype_w in (dtypes.fp4x2, dtypes.i4x2)
+            ) or (
+                q_type == QuantType.No
+                and q_dtype_a == dtypes.bf16
+                and q_dtype_w == dtypes.bf16
             ):
-                # a16w-mix (mxfp4 a16w4 / int4 a16wi4): the abf16 stage2 consumes the
-                # bf16 intermediate directly -- no inter-stage activation quant
+                # a16w-mix (mxfp4 a16w4 / int4 a16wi4 / bf16 a16w16): the abf16
+                # stage2 consumes the bf16 intermediate directly -- no inter-stage
+                # activation quant
                 # (a2_scale=None). The kernel wants it in SORTED [max_sorted, inter]
                 # layout; build that once here (untimed) so run_flydsl_stage2_out stays
                 # kernel-only. Without this a16wi4 falls through to the generic
@@ -3853,9 +3864,21 @@ class FmoeTuner(TunerCommon):
             doweight_stage1,
         ) = info
 
-        if q_type != QuantType.per_1x32 or q_dtype_w not in (
-            dtypes.fp4x2,
-            dtypes.fp8,
+        # a16w16: bf16 A x bf16 W on the a16w-mix port, the kernel the runtime
+        # selects for BF16 QuantType.No when swiglu_limit is active.
+        # Arch list matches fused_moe._A16WMIX_BF16_ARCHS: the port's
+        # non-gfx942 path is gfx950 MFMA; gfx90a does not compile.
+        is_a16w16 = (
+            q_type == QuantType.No
+            and dtype == dtypes.bf16
+            and q_dtype_a == dtypes.bf16
+            and q_dtype_w == dtypes.bf16
+            and act_type in (ActivationType.Silu, ActivationType.Swiglu)
+            and not doweight_stage1
+            and str(_gfx) in ("gfx942", "gfx950")
+        )
+        if not is_a16w16 and (
+            q_type != QuantType.per_1x32 or q_dtype_w not in (dtypes.fp4x2, dtypes.fp8)
         ):
             return tasks_flydsl
 
@@ -3873,12 +3896,26 @@ class FmoeTuner(TunerCommon):
         b_dtype_str = "fp8" if q_dtype_w == dtypes.fp8 else "fp4"
         out_dtype_str = "bf16" if dtype == dtypes.bf16 else "f16"
 
-        flydsl_s1_kernels = get_flydsl_stage1_kernels(
-            a_dtype_str, b_dtype_str, out_dtype_str
-        )
-        flydsl_s2_kernels = get_flydsl_stage2_kernels(
-            a_dtype_str, b_dtype_str, out_dtype_str
-        )
+        if is_a16w16:
+            b_dtype_str = "bf16"
+            # The a16w-mix port has no f16 output. AOT replay
+            # (aiter.aot.flydsl.moe._caller_inputs) only has a QuantType.No
+            # bf16×bf16 recipe; f16 names would break PREBUILD_KERNELS=1.
+            out_dtype_str = "bf16"
+            # The runtime wrapper passes waves_per_eu=None for registry entries
+            # without the key; run_flydsl_stage1_out would otherwise time wpe=3.
+            flydsl_s1_kernels = {
+                k: {**v, "waves_per_eu": None}
+                for k, v in get_flydsl_stage1_kernels_a16w16(out_dtype_str).items()
+            }
+            flydsl_s2_kernels = get_flydsl_stage2_kernels_a16w16(out_dtype_str)
+        else:
+            flydsl_s1_kernels = get_flydsl_stage1_kernels(
+                a_dtype_str, b_dtype_str, out_dtype_str
+            )
+            flydsl_s2_kernels = get_flydsl_stage2_kernels(
+                a_dtype_str, b_dtype_str, out_dtype_str
+            )
 
         for blockM in blockMs:
             # 16 included: a16w4/a8w4 emit t16 names, s1_tile_m drops the rest.
@@ -5696,6 +5733,17 @@ class FmoeTuner(TunerCommon):
                 & (profileDF["us"] != -1)
                 & (profileDF["err"] <= args.errRatio)
             ]
+            # a16w16 stage1 writes a SORTED intermediate that only the a16w16
+            # stage2 reads, and CK stage2 cannot read it; both share BF16
+            # QuantType.No keys, so dedup and pair them on separate sides.
+            profileDF["a16w16"] = (
+                profileDF["kernelName"]
+                .astype(str)
+                .str.startswith(
+                    ("flydsl_moe1_abf16_wbf16_", "flydsl_moe2_abf16_wbf16_")
+                )
+                .astype(int)
+            )
             # Dedup fused (_fp4/_fp8) and non-fused stage1 separately: the fairness
             # penalty below is applied only to non-fused, so dedup must not drop the
             # fused kernel by raw us before that penalty runs. Keep v2 and non-v2
@@ -5705,7 +5753,8 @@ class FmoeTuner(TunerCommon):
             )
             profileDF = policy.sort_frame(profileDF)
             profileDF = profileDF.drop_duplicates(
-                ["stage", "block_m", "flat", "nt", "v2", "_is_fused"], keep="first"
+                ["stage", "block_m", "flat", "nt", "v2", "a16w16", "_is_fused"],
+                keep="first",
             ).drop(columns=["_is_fused"])
             stage1_profileDF = profileDF[profileDF["stage"] == "stage1"].drop(
                 columns=["stage", "flat"]
@@ -5798,6 +5847,7 @@ class FmoeTuner(TunerCommon):
                     "block_m",
                     "nt",
                     "v2",
+                    "a16w16",
                 ],
                 how="inner",
             )
@@ -6236,6 +6286,8 @@ class FmoeTuner(TunerCommon):
             # dump already carries internal columns like stage/flat/ksplit.)
             if "v2" in profileDF.columns:
                 profileDF = profileDF.drop(columns=["v2"])
+            if "a16w16" in profileDF.columns:
+                profileDF = profileDF.drop(columns=["a16w16"])
             profileDF["us"] = round(profileDF["us1"] + profileDF["us2"], 4)
             results = profileDF.apply(
                 lambda row: self.calculate(
@@ -7280,19 +7332,25 @@ class Mxfp4FlydslTuner(FmoeTuner):
         k_wave=1,
         xcd_swizzle=0,
         num_waves=4,
+        a_dtype="fp4",
+        out_dtype="fp4",
     ):
-        # flydsl_mxmoe_g1_a4w4_<BM>x<BN>x<BK>[_f16in][_hpf][_nt]
+        # flydsl_mxmoe_g1_a{4,8}w4_<BM>x<BN>x<BK>[_f16in][_hpf][_nt][_fp8out]
         #   [_situv2|_swiglu][_kw<n>][_xcd<n>][_w2];
         # token order must match _parse_mxfp4_g1_kname in mxfp4_kname.py.
+        # The tuner only enumerates A4W4; A8W4 names serve the coupled tests.
         if prefetch_hidden and not inline_quant:
             raise ValueError("hidden prefetch requires inline quantization")
-        name = f"flydsl_mxmoe_g1_a4w4_{bm}x{bn}x{bk}"
+        a_bits = 8 if a_dtype == "fp8" else 4
+        name = f"flydsl_mxmoe_g1_a{a_bits}w4_{bm}x{bn}x{bk}"
         if inline_quant:
             name += "_f16in"
         if prefetch_hidden:
             name += "_hpf"
         if use_nt:
             name += "_nt"
+        if out_dtype == "fp8":
+            name += "_fp8out"
         if act == "situv2":
             name += "_situv2"
         elif act == "swiglu":
@@ -7502,7 +7560,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
         )
 
     @staticmethod
-    def _prepare_case(token, model_dim, inter_dim, expert, topk, dtype):
+    def _prepare_case(token, model_dim, inter_dim, expert, topk, dtype, a_dtype="fp4"):
         data = FmoeTuner.generate_data(
             token,
             model_dim,
@@ -7510,22 +7568,33 @@ class Mxfp4FlydslTuner(FmoeTuner):
             expert,
             topk,
             dtype,
-            dtypes.fp4x2,
+            dtypes.fp8 if a_dtype == "fp8" else dtypes.fp4x2,
             dtypes.fp4x2,
             QuantType.per_1x32,
             True,
             16,
             device="cuda",
         )
+        if a_dtype == "fp8":
+            # generate_data keeps BF16 A for the production reference; the
+            # coupled A8W4 pair is compared against actual MXFP8 A instead.
+            data["a1_qt"], data["a1_scale"] = per_1x32_mx_quant_hip(
+                data["input"],
+                quant_dtype=dtypes.fp8,
+                scale_type=dtypes.fp8_e8m0,
+                shuffle=False,
+            )
         # True a4w4 runs the SEPARATED gate/up layout (gemm1 interleave=False),
-        # so prepare weights/scales with is_guinterleave=False. The interleaved
-        # a16w4/a8w4 layout (is_guinterleave=True) fed to the separated port
-        # produces garbage. w2 (down-proj, no gate/up) is layout-invariant.
+        # so prepare weights/scales with is_guinterleave=False; a8w4 runs the
+        # interleaved layout (is_guinterleave=True). Feeding either layout to
+        # the other port produces garbage. w2 (down-proj, no gate/up) is
+        # layout-invariant.
+        interleave = a_dtype == "fp8"
         data["w1_a16"] = shuffle_weight(
-            data["w1_qt"], (16, 16), is_guinterleave=False, gate_up=True
+            data["w1_qt"], (16, 16), is_guinterleave=interleave, gate_up=True
         )
         data["w1s_a16"] = shuffle_scale(
-            data["w1_scale"], expert, is_guinterleave=False, gate_up=True
+            data["w1_scale"], expert, is_guinterleave=interleave, gate_up=True
         )
         data["w2_a16"] = shuffle_weight(
             data["w2_qt"], (16, 16), is_guinterleave=False, gate_up=False
@@ -7577,10 +7646,15 @@ class Mxfp4FlydslTuner(FmoeTuner):
         stage1_input = data["input"]
         stage1_scale = None
         # Keep the tuner aligned with the production fused_moe_2stages pipeline:
-        # BM16 quantizes inline; the other A4W4 variants consume the fused Opus
-        # prequant output.
+        # BM16 quantizes inline; the other variants consume the fused Opus
+        # prequant output in their GEMM1 activation precision.
         if BM != 16:
-            stage1_input, stage1_scale = aiter.fused_dynamic_mxfp4_quant_moe_sort(
+            quant = (
+                aiter.fused_dynamic_mxfp8_quant_moe_sort
+                if p1["a_dtype"] == "fp8"
+                else aiter.fused_dynamic_mxfp4_quant_moe_sort
+            )
+            stage1_input, stage1_scale = quant(
                 input=data["input"],
                 sorted_ids=sti,
                 num_valid_ids=nvi,
@@ -7603,6 +7677,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
             a1_scale=stage1_scale,
             w1_scale=data["w1s_a16"],
             kernelName1=kn1,
+            interleave=p1["a_dtype"] == "fp8",
             m_indices=m_indices,
             moe_buf=moe_buf,
             # _torch_ref runs SiTUv2 at run_torch_moe_stage1's default betas, so

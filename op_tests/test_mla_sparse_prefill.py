@@ -848,6 +848,119 @@ def test_mla_sparse_prefill(prec, n, h, total_pages, total_tokens, topk):
     )
 
 
+# Cover the unsplit cases not exercised by the common BF16/FP8 matrix.
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
+@pytest.mark.parametrize(
+    "total_pages,total_tokens,topk",
+    [
+        pytest.param(0, 129, 65, id="extend-only"),
+        pytest.param(129, 0, 65, id="prefix-only"),
+    ],
+)
+def test_opus_csr_boundaries(dtype, total_pages, total_tokens, topk):
+    _check_opus_csr_case(65, 24, total_pages, total_tokens, topk, dtype, 1)
+
+
+def _check_opus_csr_case(
+    n, h, total_pages, total_tokens, topk, dtype, num_kv_splits, has_sink=True
+):
+    if _get_gpu_arch() != "gfx950":
+        pytest.skip("the source-compiled OPUS paths require gfx950")
+    inputs = _make_inputs(
+        n=n,
+        h=h,
+        d=512,
+        total_pages=total_pages,
+        total_tokens=total_tokens,
+        dtype=dtype,
+        topk=topk,
+        seed=42,
+    )
+    softmax_scale = 1.0 / math.sqrt(512)
+    if not has_sink:
+        # An explicit -inf sink contributes zero to the unchanged FP32 reference.
+        inputs["attn_sink"].fill_(-math.inf)
+    expected = _ref_mla_sparse_prefill(**inputs, softmax_scale=softmax_scale)
+    if not has_sink:
+        inputs["attn_sink"] = None
+    actual = mla_sparse_prefill(
+        **inputs,
+        softmax_scale=softmax_scale,
+        num_kv_splits=num_kv_splits,
+        backend="opus",
+    )
+    err = checkAllclose(
+        actual, expected, rtol=_RTOL, atol=_ATOL, tol_err_ratio=_ERR_TOL
+    )
+    assert err <= _ERR_TOL
+    assert torch.isfinite(actual).all()
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
+def test_opus_csr_without_sink(dtype):
+    _check_opus_csr_case(65, 24, 129, 129, 65, dtype, 1, has_sink=False)
+
+
+@pytest.mark.parametrize("has_sink", [False, True], ids=["no-sink", "lower-sink"])
+def test_opus_csr_negative_logits(has_sink):
+    if _get_gpu_arch() != "gfx950":
+        pytest.skip("the source-compiled OPUS paths require gfx950")
+    inputs = _make_inputs(
+        n=1,
+        h=16,
+        d=512,
+        total_pages=1,
+        total_tokens=0,
+        dtype=torch.bfloat16,
+        topk=1,
+        seed=42,
+    )
+    inputs["q"].zero_()
+    inputs["q"][..., 0] = 2.0**60
+    # Make a zero-output defect visible in every element under the native oracle.
+    inputs["unified_kv"].fill_(-(2.0**60))
+    inputs["attn_sink"].fill_(-(2.0**125) if has_sink else -math.inf)
+    scale = 1.0 / math.sqrt(512)
+    expected = _ref_mla_sparse_prefill(**inputs, softmax_scale=scale)
+    if not has_sink:
+        inputs["attn_sink"] = None
+    actual = mla_sparse_prefill(
+        **inputs, softmax_scale=scale, num_kv_splits=1, backend="opus"
+    )
+    assert torch.isfinite(actual).all()
+    err = checkAllclose(
+        actual, expected, rtol=_RTOL, atol=_ATOL, tol_err_ratio=_ERR_TOL
+    )
+    assert err <= _ERR_TOL
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
+def test_opus_csr_one_key_scale_one(dtype):
+    if _get_gpu_arch() != "gfx950":
+        pytest.skip("the source-compiled OPUS paths require gfx950")
+    inputs = _make_inputs(
+        n=1,
+        h=24,
+        d=512,
+        total_pages=1,
+        total_tokens=0,
+        dtype=dtype,
+        topk=1,
+        seed=42,
+    )
+    inputs["attn_sink"].fill_(-math.inf)
+    expected = _ref_mla_sparse_prefill(**inputs, softmax_scale=1.0)
+    inputs["attn_sink"] = None
+    actual = mla_sparse_prefill(
+        **inputs, softmax_scale=1.0, num_kv_splits=1, backend="opus"
+    )
+    assert torch.isfinite(actual).all()
+    err = checkAllclose(
+        actual, expected, rtol=_RTOL, atol=_ATOL, tol_err_ratio=_ERR_TOL
+    )
+    assert err <= _ERR_TOL
+
+
 # ---------------------------------------------------------------------------
 # CLI (mirrors test_batch_prefill.py style).
 # ---------------------------------------------------------------------------

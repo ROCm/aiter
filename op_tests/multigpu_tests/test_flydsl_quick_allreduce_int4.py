@@ -20,11 +20,13 @@ sweep ends in a markdown table:
   ``AITER_FLY_AR_MESH_MAX_BYTES``.
 * ``test_quick_allreduce_int4_coverage`` -- the kernels those rows ran include
   every kernel the engine's own ``cfgs_for`` says the window selects.
-* ``test_quick_allreduce_int4_edge_inputs`` -- payloads that land on the E4M3
-  scale's edge cases, and degenerate groups that must stay finite.
+* ``test_quick_allreduce_int4_edge_inputs`` -- payloads that land on the group
+  scale's edge cases, sums above E4M3's old ceiling of 480 on every rank, and
+  degenerate groups that must stay finite.
 * ``test_quick_allreduce_int4_divisor`` -- the mesh's shared divisor at TP8: an
-  outlier fill that clips the E4M3 scale at divisor 1 must recover SQNR at
-  divisor 8, and a small-magnitude fill must keep full SQNR at the default.
+  outlier fill must reach the SQNR floor at divisor 1 (the E5M2 scale does not
+  clip it) and lose at most ``DIVISOR_MAX_LOSS_DB`` at divisor 8, and a
+  small-magnitude fill must keep full SQNR at the default.
 * ``test_quick_allreduce_transport`` -- the ``fp16`` wire format, a lossless
   passthrough, on an exactly representable input: the result must be
   bit-identical to the fp32 reference, which separates a chunk-addressing or
@@ -147,10 +149,11 @@ ALGORITHMS = ("mesh", "ring")
 #
 # The ring's reduce-scatter lap requantizes N-1 times where the mesh requantizes
 # once, and the partial sum it requantizes grows with the contributions folded
-# in, so on an all-INT4 wire the ring's SQNR degrades with N: 22.2 dB at TP2,
-# 18.7 at TP4, ~15 at TP8. Defaulting the ring's reduce-scatter lap to INT6 at
-# TP8 lifts it to ~21 dB, so anything below 18.0 is a regression, not a known
-# cost of the schedule.
+# in, so on an all-INT4 wire the ring's SQNR degrades with N: 17.9 dB at TP4
+# and 15.3 at TP8 with the E5M2 group scale (gfx950). Defaulting the
+# ring's reduce-scatter lap to INT6 from TP4 (RS_INT6_MIN_WORLD) lifts it to
+# ~21 dB, so anything below 18.0 is a regression, not a known cost of the
+# schedule.
 SQNR_MIN_DB = 18.0
 
 # INT4 at TP8 on the ring is still a supported configuration -- pinning both
@@ -211,15 +214,18 @@ LEGACY_SHAPES_PER_WORLD_SIZE = {
 }
 
 # (tp, algorithm, tokens, hidden, fill).
-# The divisor cases: ``outlier`` at this divisor against ``outlier`` at 1, and
-# the SQNR it must win back.
+# The divisor cases: ``outlier`` at this divisor against ``outlier`` at 1. With
+# the E5M2 group scale divisor 1 no longer clips, so the opt-in divisor has
+# nothing to recover and may cost at most this much.
 OUTLIER_DIVISOR = 8.0
-DIVISOR_RECOVERY_DB = 3.0
+DIVISOR_MAX_LOSS_DB = 1.0
 
 EDGE_CASES = (
     (2, "mesh", 16, 1024, "pos_underflow"),
     (2, "mesh", 16, 1024, "neg_underflow"),
     (2, "mesh", 16, 1024, "overflow_512"),
+    (2, "mesh", 16, 1024, "large_every_rank"),
+    (8, "ring", 512, 5120, "large_every_rank"),
     (2, "mesh", 16, 1024, "zeros"),
     (2, "mesh", 512, 5120, "degenerate"),
     (8, "ring", 512, 5120, "degenerate"),
@@ -229,6 +235,8 @@ EDGE_CASES = (
 # only: production leaves both laps at the per-world default.
 PINNED_CODEC_CASES = (
     (8, 512, 5120, "int4", "int4"),
+    # The ring's shipping default at TP8 (RS_INT6_MIN_WORLD), pinned as well.
+    (8, 512, 5120, "int6", "int4"),
     (8, 512, 5120, "fp16", "int4"),
     (8, 512, 5120, "int4", "fp16"),
 )
@@ -307,6 +315,7 @@ _FILLS = (
     "pos_underflow",
     "neg_underflow",
     "overflow_512",
+    "large_every_rank",
     "zeros",
 )
 
@@ -321,8 +330,8 @@ def _make_inp(
         std = {"normal": 0.1, "outlier": 100.0, "small": 0.005}[fill]
         src = torch.randn(shape, generator=gen, dtype=torch.float32) * std
     elif fill == "degenerate":
-        # Half the rows exactly zero, half far below the E4M3 magnitude floor
-        # of 2^-7. Both drive the group extremum to (or under) zero, which is
+        # Half the rows exactly zero, half far below the scale's magnitude
+        # floor (2^-12 for INT4, 2^-10 for INT6). Both drive the group extremum to (or under) zero, which is
         # where the encode reciprocal blows up.
         src = torch.randn(shape, generator=gen, dtype=torch.float32) * 0.1
         src[0::2] = 0.0
@@ -335,16 +344,23 @@ def _make_inp(
         # bit-identical to the fp32 reference regardless of accumulation order.
         # For the same reason, it cannot tell one accumulation order from another.
         src = torch.randint(-8, 8, shape, generator=gen).float() * (2.0**-4)
-    elif fill in ("pos_underflow", "neg_underflow", "overflow_512", "zeros"):
+    elif fill in (
+        "pos_underflow",
+        "neg_underflow",
+        "overflow_512",
+        "large_every_rank",
+        "zeros",
+    ):
         val = {
             "pos_underflow": 2.0**-8,
             "neg_underflow": -(2.0**-8),
-            # Drives the E4M3 scale above its largest exponent, which the
-            # encoder has to saturate. Only rank 0 carries the value: if every
-            # rank sent 512 the reduced sum would also saturate the INT4 group
-            # codec, and the case would fail on codec range rather than on
-            # scale encoding.
+            # Above E4M3's old largest scale (480) on rank 0 only, so only
+            # the first pack sees it.
             "overflow_512": 512.0 if rank == 0 else 0.0,
+            # Every partial and the reduced sum above 480: the E4M3 scale
+            # clipped both packs here (SQNR about 1 dB), and on the ring every
+            # requantized hop. MiniMax-M3 all-reduce outputs reach 6400-16800.
+            "large_every_rank": 2048.0,
             "zeros": 0.0,
         }[fill]
         return torch.full(shape, val, device=device, dtype=torch.bfloat16)
@@ -1534,8 +1550,10 @@ def test_quick_allreduce_int4_divisor(tokens, hidden, tp, fill, divisor):
     """The shared divisor on the shipping mesh engine; correctness only.
 
     ``small`` at the default divisor must keep the plain INT4 accuracy. An
-    ``outlier`` fill clips the E4M3 scale at divisor 1, so the same input at
-    ``divisor`` must recover SQNR; it is the divisor's reason to exist.
+    ``outlier`` fill used to clip the E4M3 scale at divisor 1, which the
+    divisor existed to recover. The E5M2 scale does not clip it, so divisor 1
+    must reach the SQNR floor and the opt-in divisor may cost at most
+    ``DIVISOR_MAX_LOSS_DB``.
     """
     key = _ship_key(tp, "mesh", None)
     nbytes = tokens * hidden * 2
@@ -1546,19 +1564,21 @@ def test_quick_allreduce_int4_divisor(tokens, hidden, tp, fill, divisor):
     ret["sqnr_vs_divisor1_db"] = None
     if fill == "outlier":
         base = _result(key, (tokens, hidden, fill, False, DEFAULT_DIVISOR))
-        ret["sqnr_vs_divisor1_db"] = ret["sqnr_db"] - min(r["sqnr_db"] for r in base)
-        if ret["sqnr_vs_divisor1_db"] < DIVISOR_RECOVERY_DB:
-            _check(
-                label,
-                [
-                    (
-                        f"SQNR {ret['sqnr_db']:.2f} dB is only "
-                        f"{ret['sqnr_vs_divisor1_db']:.2f} dB above divisor 1; "
-                        f"expected the E4M3 clip to be recovered by "
-                        f"{DIVISOR_RECOVERY_DB} dB"
-                    )
-                ],
+        base_db = min(r["sqnr_db"] for r in base)
+        ret["sqnr_vs_divisor1_db"] = ret["sqnr_db"] - base_db
+        fails = []
+        if base_db < SQNR_MIN_DB:
+            fails.append(
+                f"SQNR {base_db:.2f} dB at divisor 1 < {SQNR_MIN_DB}; "
+                "the group scale clips"
             )
+        if ret["sqnr_vs_divisor1_db"] < -DIVISOR_MAX_LOSS_DB:
+            fails.append(
+                f"SQNR {ret['sqnr_db']:.2f} dB is "
+                f"{-ret['sqnr_vs_divisor1_db']:.2f} dB below divisor 1; the "
+                f"opt-in divisor should cost at most {DIVISOR_MAX_LOSS_DB} dB"
+            )
+        _check(label, fails)
     # CLOSE_ATOL is calibrated to the 0.1-std fill, not to the outlier's 100.
     _check_sqnr(
         label,
