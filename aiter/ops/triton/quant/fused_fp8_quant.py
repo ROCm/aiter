@@ -3,7 +3,6 @@ from functools import cache
 import torch
 import triton
 
-import aiter
 from aiter.ops.triton._triton_kernels.common.activation import (
     _get_activation_from_str,
 )
@@ -21,7 +20,7 @@ from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 _LOGGER = AiterTritonLogger()
 
 
-fp8_dtype = aiter.dtypes.fp8
+fp8_dtype = get_fp8_e4m3_dtype()
 
 
 def fused_rms_fp8_per_tensor_static_quant(
