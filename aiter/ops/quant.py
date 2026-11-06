@@ -1428,9 +1428,11 @@ def rope_rotate_activation(
     rope_dim: int,
     out_scale: torch.Tensor | None = None,
     group_size: int | None = None,
-    scale_layout: str = "none",
+    scale_layout: str | bool | None = None,
     do_rotate_act: bool = True,
     round_rope: bool = False,
+    *,
+    shuffle_scale: bool | None = None,
 ) -> None:
     """Apply GPT-J style (interleaved) RoPE to trailing ``rope_dim``, then
     Hadamard-rotate, dispatching on ``out.dtype``:
@@ -1438,9 +1440,12 @@ def rope_rotate_activation(
     - bf16/fp16 ``out``: plain rope+hadamard in place (``scale`` ignored).
     - ``fp4x2`` ``out``: FP4-quantize into packed ``out`` + e8m0 ``scale``
       (``scale`` required; ``group_size`` defaults to 32). ``scale_layout``
-      selects ``"none"`` (the default, natural rows), ``"flydsl"`` (dsv4
-      preshuffle), or ``"opus"`` (gfx950 scales [T, 2, 32, H/16], requiring
-      H=32 or 64, D=128, group_size=32).
+      selects ``"none"`` (natural rows), ``"flydsl"`` (dsv4 preshuffle), or
+      ``"opus"`` (gfx950 scales [T, 2, 32, H/16], requiring H=32 or 64,
+      D=128, group_size=32). Omitting it preserves the legacy FlyDSL layout.
+      The legacy ``shuffle_scale`` keyword and positional bool are accepted:
+      True selects ``"flydsl"``, False selects ``"none"``. Do not supply both
+      ``scale_layout`` and ``shuffle_scale``.
     - ``fp8`` ``out``: per-(row, 1xGROUP) fp8-quantize into ``out`` + fp32
       ``scale`` (``scale`` required; ``group_size`` defaults to 128).
 
@@ -1451,6 +1456,16 @@ def rope_rotate_activation(
     """
     if out.dtype == dtypes.fp4x2:
         assert out_scale is not None, "fp4 rope_rotate_activation requires `out_scale`"
+        if shuffle_scale is not None:
+            if scale_layout is not None:
+                raise ValueError("pass only one of scale_layout and shuffle_scale")
+            if not isinstance(shuffle_scale, bool):
+                raise TypeError("shuffle_scale must be a bool")
+            scale_layout = shuffle_scale
+        if scale_layout is None:
+            scale_layout = "flydsl"
+        elif isinstance(scale_layout, bool):
+            scale_layout = "flydsl" if scale_layout else "none"
         if scale_layout not in ("none", "flydsl", "opus"):
             raise ValueError(
                 f"scale_layout must be none|flydsl|opus, got {scale_layout!r}"

@@ -2267,6 +2267,11 @@ def flydsl_fused_compress_attn_gfx1250(
     quant_mode = (
         quant_mode if quant_mode is not None else ("fp8_per_row" if quant else "none")
     )
+    quant_mode = {
+        "fp8": "fp8_per_row",
+        "per_row_fp8": "fp8_per_row",
+        "group_fp8": "fp8_group",
+    }.get(quant_mode, quant_mode)
     if quant_mode not in ("none", "fp8_per_row", "fp8_group", "fp4"):
         raise ValueError(f"unsupported gfx1250 quant_mode: {quant_mode!r}")
     quant = quant_mode != "none"

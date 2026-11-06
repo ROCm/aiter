@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""The fused RoPE writer's OPUS scale layout for V4 and V4.1."""
+"""Legacy fused RoPE query calls preserve their explicit FP4 layouts."""
 
 import pytest
 import torch
@@ -12,47 +12,53 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-@pytest.mark.parametrize("heads", [32, 64])
-@pytest.mark.parametrize("rotate", [False, True])
-@pytest.mark.parametrize("round_rope", [False, True])
-def test_opus_query_scales_match_natural_and_replay(heads, rotate, round_rope):
-    torch.manual_seed(321)
-    rows = 7
-    query = torch.randn(rows, heads, 128, device="cuda").bfloat16()
-    angles = torch.randn(32, 32, device="cuda")
-    cos, sin = angles.cos().bfloat16(), angles.sin().bfloat16()
-    positions = torch.tensor([3, 1, 7, 11, 2, 9, 0], device="cuda")
-    values = torch.empty(rows, heads, 64, device="cuda", dtype=torch.uint8)
-    scales = torch.empty(rows, 2, 32, heads // 16, device="cuda", dtype=torch.uint8)
-    ref_values = torch.empty_like(values)
-    natural = torch.empty(rows, heads, 4, device="cuda", dtype=torch.uint8)
-
-    def run(out, scale, layout):
+@pytest.mark.parametrize(
+    "style,shuffle",
+    [
+        ("default", True),
+        ("keyword", True),
+        ("keyword", False),
+        ("positional", True),
+        ("positional", False),
+    ],
+)
+def test_legacy_query_layout_matches_explicit(style, shuffle):
+    torch.manual_seed(322)
+    query = torch.randn(7, 64, 128, device="cuda").bfloat16()
+    angles = torch.randn(16, 32, device="cpu")
+    cos, sin = angles.cos().bfloat16().cuda(), angles.sin().bfloat16().cuda()
+    positions = torch.arange(7, device="cuda")
+    values = torch.empty(7, 64, 64, device="cuda", dtype=torch.uint8)
+    shape = (7, 1, 4, 16, 4) if shuffle else (7, 64, 4)
+    scales = torch.empty(shape, device="cuda", dtype=torch.uint8)
+    ref_values, ref_scales = torch.empty_like(values), torch.empty_like(scales)
+    common = (query, cos, sin, positions, 64)
+    rope_rotate_activation(
+        ref_values.view(dtypes.fp4x2),
+        *common,
+        out_scale=ref_scales,
+        scale_layout="flydsl" if shuffle else "none",
+        do_rotate_act=False,
+        round_rope=True,
+    )
+    if style == "positional":
         rope_rotate_activation(
-            out.view(dtypes.fp4x2),
-            query,
-            cos,
-            sin,
-            positions,
-            64,
-            out_scale=scale,
-            group_size=32,
-            scale_layout=layout,
-            do_rotate_act=rotate,
-            round_rope=round_rope,
+            values.view(dtypes.fp4x2), *common, scales, 32, shuffle, False, True
         )
+    else:
+        kwargs = {"shuffle_scale": shuffle} if style == "keyword" else {}
+        rope_rotate_activation(
+            values.view(dtypes.fp4x2),
+            *common,
+            out_scale=scales,
+            do_rotate_act=False,
+            round_rope=True,
+            **kwargs,
+        )
+    torch.testing.assert_close(values, ref_values, rtol=0, atol=0)
+    torch.testing.assert_close(scales, ref_scales, rtol=0, atol=0)
 
-    def check():
-        run(ref_values, natural, "none")
-        expected = natural.reshape(rows, heads // 32, 32, 2, 2).permute(0, 4, 2, 3, 1)
-        torch.testing.assert_close(values, ref_values, rtol=0, atol=0)
-        torch.testing.assert_close(scales.flatten(), expected.flatten(), rtol=0, atol=0)
 
-    run(values, scales, "opus")
-    check()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        run(values, scales, "opus")
-    query.normal_()
-    graph.replay()
-    check()
+if __name__ == "__main__":
+    # The standard op-test runner invokes each file as a script.
+    raise SystemExit(pytest.main([__file__, "-q"]))

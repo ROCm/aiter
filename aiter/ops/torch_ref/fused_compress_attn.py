@@ -113,8 +113,9 @@ def fused_compress_attn(
     when quantizing). Mirrors flydsl kernel's plan-driven dispatch.
 
     ``quant_mode`` ? {"none","fp8","fp4"} (default derived from ``quant``).
-    FP4 uses natural rows by default; fp4_gfx950_flydsl and
-    fp4_gfx950_opus select their respective packed data/scale layouts.
+    Legacy ``fp4`` honors ``preshuffle``; fp4_gfx950_flydsl and
+    fp4_gfx950_opus explicitly select their respective packed layouts.
+    For gfx1250, pass ``preshuffle=False`` as its wrapper does.
 
     ``group_quant=True`` selects the V4 nm-asm HCA fp8 layout instead of the
     single-kernel per-row quant: ``kv_cache`` [nb, k_per_block, head_dim] fp8 holds
@@ -136,11 +137,14 @@ def fused_compress_attn(
         if quant_mode is not None
         else ("fp8_group" if group_quant else ("fp8" if quant else "none"))
     )
-    if mode == "fp8_per_row":
-        mode = "fp8"
+    mode = {
+        "fp8_per_row": "fp8",
+        "per_row_fp8": "fp8",
+        "group_fp8": "fp8_group",
+    }.get(mode, mode)
     _fp4 = mode in ("fp4", "fp4_gfx950_flydsl", "fp4_gfx950_opus")
-    if _fp4:
-        preshuffle = mode != "fp4"
+    if mode in ("fp4_gfx950_flydsl", "fp4_gfx950_opus"):
+        preshuffle = True
     _fp8 = mode == "fp8"
     group_quant = mode == "fp8_group"  # normalize bool from the master mode
 

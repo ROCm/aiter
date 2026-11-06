@@ -9,11 +9,12 @@ wave64 on the gfx9 family (gfx942/gfx950) and wave32 on gfx1250 -- so we drive
 the public wrapper and never import an arch-specific kernel directly. gfx1250
 uses the linear FP8 layout, so ``preshuffle`` is forced off there.
 
-Three shape configs cover both models (they share compressor geometry; the
+The shape configs cover both models (they share compressor geometry; the
 model_dim difference 7168 vs 4096 is invisible to the kernel):
 
     CSA Main    : D=512, RD=64, ratio=4,   overlap=True,  BF16
     CSA Indexer : D=128, RD=64, ratio=4,   overlap=True,  FP8 + ue8m0 + preshuffle*
+    CSA FP4     : D=128, RD=64, ratio=4,   overlap=True,  FlyDSL / OPUS layouts
     HCA Main    : D=512, RD=64, ratio=128, overlap=False, BF16
     (*preshuffle only on wave64; gfx1250 forces it off.)
 
@@ -39,7 +40,7 @@ from aiter.ops.flydsl.kernels.fused_compress_attn_hca import flydsl_hca_compress
 from aiter.ops.torch_ref.fused_compress_attn import (
     fused_compress_attn as fused_compress_attn_reference,
 )
-from aiter.test_common import benchmark, checkAllclose, run_perftest
+from aiter.test_common import assertAllclose, benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
 
@@ -48,11 +49,12 @@ torch.set_default_device("cuda")
 SUPPORTED_GFX = ["gfx942", "gfx950", "gfx1250"]
 
 # (label, head_dim, rope_head_dim, ratio, overlap, quant_mode, use_ue8m0, preshuffle)
-# quant_mode ? {"none","fp8_per_row","fp8_group","fp4"}.
+# quant_mode: none | fp8_per_row | fp8_group | fp4 | fp4_gfx950_opus.
 SHAPES = [
     ("csa_main", 512, 64, 4, True, "none", False, False),
     ("csa_indexer", 128, 64, 4, True, "fp8_per_row", True, True),
     ("csa_indexer_fp4", 128, 64, 4, True, "fp4", True, True),
+    ("csa_indexer_fp4_opus", 128, 64, 4, True, "fp4_gfx950_opus", True, True),
     ("hca_main", 512, 64, 128, False, "none", False, False),
 ]
 K_PER_BLOCK = (
@@ -74,7 +76,7 @@ def _shape_by_label(label):
     raise KeyError(label)
 
 
-def _build_inputs(shape, bs, mtp, mode):
+def _build_inputs(shape, bs, mtp, mode, *, context_len=PREFILL_CONTEXT_LEN):
     """Build a synthetic plan + tensors for one (shape, bs, mtp, mode) case.
 
     ``mode`` ? {"decode", "prefill"}:
@@ -103,7 +105,7 @@ def _build_inputs(shape, bs, mtp, mode):
     kernel's plan-capacity > num_compress padding-bail path is exercised.
     """
     _label, D, RD, ratio, overlap, quant_mode, ue8m0, preshuffle = shape
-    quant = quant_mode in ("fp8_per_row", "fp8_group", "fp4")
+    quant = quant_mode in ("fp8_per_row", "fp8_group", "fp4", "fp4_gfx950_opus")
     if get_gfx() == "gfx1250":
         preshuffle = False  # gfx1250 (wave32) uses the linear FP8 layout
     dim_full = (2 if overlap else 1) * D
@@ -119,9 +121,9 @@ def _build_inputs(shape, bs, mtp, mode):
         num_valid_tokens = num_compress + extra_pad
         state_size = K_pool + mtp  # spec-decode ring size convention
     elif mode == "prefill":
-        num_per_seq = PREFILL_CONTEXT_LEN // ratio
+        num_per_seq = context_len // ratio
         num_compress = bs * num_per_seq
-        num_valid_tokens = bs * PREFILL_CONTEXT_LEN
+        num_valid_tokens = bs * context_len
         state_size = K_pool  # prefill: state size = pool window (no spec)
     else:
         raise ValueError(f"unknown mode {mode!r}")
@@ -154,10 +156,16 @@ def _build_inputs(shape, bs, mtp, mode):
     # cos / sin caches: cover all comp_pos values we'll use.
     max_comp_pos = num_per_seq * ratio
     max_pos = max(max_comp_pos + 1, 64)
-    inv_freq = 1.0 / (10000 ** (torch.arange(0, RD, 2, dtype=torch.float32) / RD))
-    freqs = torch.outer(torch.arange(max_pos, dtype=torch.float32), inv_freq)
-    cos_cache = freqs.cos().to(torch.bfloat16).contiguous()
-    sin_cache = freqs.sin().to(torch.bfloat16).contiguous()
+    # Generate the fixture on CPU; testing the compressor does not require
+    # HIPRTC's separate trigonometric JIT to be available in the environment.
+    inv_freq = 1.0 / (
+        10000 ** (torch.arange(0, RD, 2, dtype=torch.float32, device="cpu") / RD)
+    )
+    freqs = torch.outer(
+        torch.arange(max_pos, dtype=torch.float32, device="cpu"), inv_freq
+    )
+    cos_cache = freqs.cos().to(device=kv_in.device, dtype=torch.bfloat16).contiguous()
+    sin_cache = freqs.sin().to(device=kv_in.device, dtype=torch.bfloat16).contiguous()
 
     # Plan: [num_compress, 4] valid rows + [SENTINEL_PAD, 4] position=-1 rows.
     # Kernel must bail-skip the sentinel rows without touching kv_in or kv_cache.
@@ -170,7 +178,7 @@ def _build_inputs(shape, bs, mtp, mode):
                 window_len = K_pool // 2 if s == 0 else 0
             else:  # prefill
                 position_in_seq = (s + 1) * ratio - 1
-                ragged_id = b * PREFILL_CONTEXT_LEN + position_in_seq
+                ragged_id = b * context_len + position_in_seq
                 # window_len uses position_in_seq (not ragged_id) so the
                 # K-loop's input-phase reads stay within seq b's input
                 # range [b*seq_len, (b+1)*seq_len). Earlier source positions
@@ -188,6 +196,9 @@ def _build_inputs(shape, bs, mtp, mode):
     if quant_mode == "fp8_per_row":
         kv_cache = torch.zeros(total_blocks, K_PER_BLOCK, D, dtype=dtypes.fp8)
         cache_scale = torch.zeros(total_blocks, K_PER_BLOCK, dtype=torch.float32)
+    elif quant_mode == "fp4_gfx950_opus":
+        kv_cache = torch.zeros(total_blocks, 4, K_PER_BLOCK, 16, dtype=torch.uint8)
+        cache_scale = torch.zeros(total_blocks, 2, 32, 4, dtype=torch.uint8)
     elif quant_mode == "fp4":
         if get_gfx() == "gfx1250":
             # OPUS natural rows: 64 packed bytes + four e8m0 bytes for D=128.
@@ -253,9 +264,8 @@ def _build_inputs(shape, bs, mtp, mode):
     }
 
 
-def _run_kernel(inp, *, use_2kernel):
-    """Run kernel into ``inp['kv_cache']`` / ``inp['cache_scale']`` in place."""
-    common = {
+def _compress_common(inp):
+    return {
         "kv_in": inp["kv_in"],
         "score_in": inp["score_in"],
         "kv_state": inp["kv_state"],
@@ -274,6 +284,11 @@ def _run_kernel(inp, *, use_2kernel):
         "head_dim": inp["head_dim"],
         "rope_head_dim": inp["rope_head_dim"],
     }
+
+
+def _run_kernel(inp, *, use_2kernel=False, **extra):
+    """Run kernel into ``inp['kv_cache']`` / ``inp['cache_scale']`` in place."""
+    common = _compress_common(inp)
     if use_2kernel:
         flydsl_hca_compress_attn(**common)
     else:
@@ -285,15 +300,24 @@ def _run_kernel(inp, *, use_2kernel):
             cache_scale=inp["cache_scale"],
             use_ue8m0=inp["use_ue8m0"],
             preshuffle=inp["preshuffle"],
+            **extra,
         )
 
 
-def _check_fp4_cache(out_cache, out_scale, ref_cache, ref_scale, msg):
+def _check_fp4_cache(out_cache, out_scale, ref_cache, ref_scale, msg, *, opus=False):
     """Compare an FP4 (E2M1 data + e8m0 scale) paged cache against the reference:
     dequantize both (scale * E2M1 value) and allclose within tol; e8m0 scale
     bytes bit-exact. Returns the dequant err %. Shared by the shape sweep and the
     dedicated K-split coverage test."""
     from aiter.utility.fp4_utils import mxfp4_to_f32
+
+    if opus:
+        # Restore row/group order before applying scales to E2M1 groups.
+        nb = out_cache.shape[0]
+        out_cache = out_cache.permute(0, 2, 1, 3).contiguous()
+        ref_cache = ref_cache.permute(0, 2, 1, 3).contiguous()
+        out_scale = out_scale.reshape(nb, 2, 32, 2, 2).permute(0, 4, 2, 3, 1)
+        ref_scale = ref_scale.reshape(nb, 2, 32, 2, 2).permute(0, 4, 2, 3, 1)
 
     k_dq = mxfp4_to_f32(out_cache.reshape(-1, 16)) * (
         2.0 ** (out_scale.reshape(-1).to(torch.int32)[:, None].float() - 127.0)
@@ -301,7 +325,7 @@ def _check_fp4_cache(out_cache, out_scale, ref_cache, ref_scale, msg):
     r_dq = mxfp4_to_f32(ref_cache.reshape(-1, 16)) * (
         2.0 ** (ref_scale.reshape(-1).to(torch.int32)[:, None].float() - 127.0)
     )
-    err = checkAllclose(
+    err = assertAllclose(
         k_dq,
         r_dq,
         rtol=1e-2,
@@ -309,7 +333,7 @@ def _check_fp4_cache(out_cache, out_scale, ref_cache, ref_scale, msg):
         tol_err_ratio=0.05,
         msg=f"{msg} kv_cache(fp4 dequant)",
     )
-    checkAllclose(
+    assertAllclose(
         out_scale.to(torch.int32),
         ref_scale.to(torch.int32),
         rtol=0,
@@ -350,7 +374,9 @@ def test_flydsl_compress_attn(shape_label, bs, mtp, mode, path):
     """One case. ``mode`` ? {'decode','prefill'}, ``path`` ? {'single','2kernel'}."""
     shape = _shape_by_label(shape_label)
     _, D, RD, ratio, overlap, quant_mode, ue8m0, _preshuffle = shape
-    quant = quant_mode in ("fp8_per_row", "fp4")
+    if quant_mode == "fp4_gfx950_opus" and get_gfx() != "gfx950":
+        return {}
+    quant = quant_mode in ("fp8_per_row", "fp4", "fp4_gfx950_opus")
     use_2kernel = path == "2kernel"
     inp = _build_inputs(shape, bs, mtp, mode)
 
@@ -390,13 +416,14 @@ def test_flydsl_compress_attn(shape_label, bs, mtp, mode, path):
     )
 
     msg = f"{shape_label}/{mode}/{path} bs={bs} mtp={mtp}"
-    if quant_mode == "fp4":
+    if quant_mode in ("fp4", "fp4_gfx950_opus"):
         err = _check_fp4_cache(
             inp["kv_cache"],
             inp["cache_scale"],
             ref_inp["kv_cache"],
             ref_inp["cache_scale"],
             msg,
+            opus=quant_mode == "fp4_gfx950_opus",
         )
     elif quant:
         err = _check_fp8_cache(
@@ -733,14 +760,24 @@ def test_flydsl_csa_indexer_ksplit(shape_label, bs=2, mtp=0):
         return {}
     shape = _shape_by_label(shape_label)
     _, D, RD, ratio, overlap, quant_mode, ue8m0, _ = shape
+    if quant_mode == "fp4_gfx950_opus" and get_gfx() != "gfx950":
+        return {}
     assert quant_mode in (
         "fp8_per_row",
         "fp4",
+        "fp4_gfx950_opus",
     ), f"{shape_label} quant_mode={quant_mode!r} is not a quantized indexer shape"
 
     def _check(out_cache, out_scale, ref_cache, ref_scale, m):
-        if quant_mode == "fp4":
-            return _check_fp4_cache(out_cache, out_scale, ref_cache, ref_scale, m)
+        if quant_mode in ("fp4", "fp4_gfx950_opus"):
+            return _check_fp4_cache(
+                out_cache,
+                out_scale,
+                ref_cache,
+                ref_scale,
+                m,
+                opus=quant_mode == "fp4_gfx950_opus",
+            )
         return _check_fp8_cache(out_cache, out_scale, ref_cache, ref_scale, m)
 
     inp = _build_inputs(shape, bs, mtp, "decode")
@@ -845,6 +882,54 @@ def test_flydsl_csa_indexer_ksplit(shape_label, bs=2, mtp=0):
         "us_kernel": us_kernel,
         "err_pct": err,
     }
+
+
+@benchmark()
+def test_flydsl_opus_cache_permutation(waves):
+    """Both writers against natural Torch output, with no copied offset formula.
+
+    Two pages per sequence cover every slot (including 15/16 and 31/32) and
+    the 63/64 page boundary. Nonidentity page tables and untouched guard pages
+    catch writes to logical instead of physical pages and sentinel writes.
+    """
+    if get_gfx() != "gfx950":
+        return {}
+    inp = _build_inputs(
+        _shape_by_label("csa_indexer_fp4_opus"), 2, 0, "prefill", context_len=512
+    )
+    inp["block_tables"].copy_(torch.tensor([[5, 1], [6, 3]], dtype=torch.int32))
+    inp["kv_cache"].fill_(0x55)
+    inp["cache_scale"].fill_(127)
+    nb = inp["kv_cache"].shape[0]
+    ref = dict(inp)
+    ref["kv_cache"] = torch.full((nb, 64, 64), 0x55, dtype=torch.uint8)
+    natural_scale = torch.full((nb, 64, 4), 127, dtype=torch.uint8)
+    fused_compress_attn_reference(
+        **_compress_common(ref),
+        overlap=True,
+        quant_mode="fp4",
+        preshuffle=False,
+        cache_scale=natural_scale,
+    )
+    expected_data = ref["kv_cache"].reshape(nb, 64, 4, 16).permute(0, 2, 1, 3)
+    expected_scale = natural_scale.reshape(nb, 2, 32, 2, 2).permute(0, 4, 2, 3, 1)
+    expected_data = expected_data.contiguous()
+    expected_scale = expected_scale.contiguous().reshape(nb, 2, 32, 4)
+
+    _, us_kernel = run_perftest(_run_kernel, inp, k_split_num_waves=waves)
+    err = _check_fp4_cache(
+        inp["kv_cache"],
+        inp["cache_scale"],
+        expected_data,
+        expected_scale,
+        f"opus independent permutation NW={waves}",
+        opus=True,
+    )
+    # Every inactive byte must survive, not just stay within the FP4 tolerance.
+    for page in (0, 2, 4, 7):
+        assert torch.all(inp["kv_cache"][page] == 0x55)
+        assert torch.all(inp["cache_scale"][page] == 127)
+    return {"waves": waves, "us_kernel": us_kernel, "err_pct": err}
 
 
 def main():
@@ -982,11 +1067,21 @@ def main():
         "flydsl_csa_indexer_ksplit",
         [
             test_flydsl_csa_indexer_ksplit(shape_label, bs)
-            for shape_label in ("csa_indexer", "csa_indexer_fp4")
+            for shape_label in (
+                "csa_indexer",
+                "csa_indexer_fp4",
+                "csa_indexer_fp4_opus",
+            )
             if shape_label in args.shapes
             for bs in args.ksplit_bs
         ],
     )
+
+    if "csa_indexer_fp4_opus" in args.shapes:
+        summarize(
+            "flydsl_opus_cache_permutation",
+            [test_flydsl_opus_cache_permutation(waves) for waves in (1, 4)],
+        )
 
 
 if __name__ == "__main__":

@@ -2303,16 +2303,19 @@ def flydsl_fused_compress_attn(
       - ``"fp8_per_row"`` (alias ``"fp8"``) -> per-row FP8 with E8M0-rounded scale.
       - ``"fp8_group"`` -> group FP8 main-cache data with inline E8M0 scales
         and a separate BF16 RoPE cache.
-      - ``"fp4"`` -> natural FP4 E2M1 rows [NB, page, D/2] and
-        per-group(32) E8M0 scales [NB, page, D/32], without shuffle.
+      - ``"fp4"`` -> legacy FP4 mode: ``preshuffle=True`` (the default)
+        selects FlyDSL packing on gfx9; False selects natural E2M1 rows
+        [NB, page, D/2] and E8M0 scales [NB, page, D/32].
       - ``"fp4_gfx950_flydsl"`` -> packed KV [NB, D/128, 4, page, 16]
         and FlyDSL scales [NB, D/128, 4, page].
       - ``"fp4_gfx950_opus"`` -> packed KV [NB,4,64,16] and OPUS MFMA
         scales [NB,2,32,4], requiring D=128 and page=64 on gfx950.
 
-    FP4 modes determine both layouts independently of ``preshuffle``;
-    that legacy argument controls FP8 only. Single-wave and K-split writers
-    emit the selected layout directly. gfx1250 supports natural ``"fp4"``.
+    Explicit ``fp4_gfx950_*`` modes determine both layouts independently of
+    ``preshuffle``. The legacy ``fp4`` mode still honors that argument on gfx9;
+    gfx1250 always uses natural rows. The old ``per_row_fp8`` / ``group_fp8``
+    names remain aliases for ``fp8_per_row`` / ``fp8_group``. Single-wave and
+    K-split writers emit the selected layout directly.
 
     ``k_split_num_waves`` (BF16, FP8, or FP4 scatter): when set to NW > 1, routes
     to the multi-wave LDS K-split kernel (block = 64*NW, K split across NW waves,
@@ -2334,8 +2337,11 @@ def flydsl_fused_compress_attn(
     _mode = (
         quant_mode if quant_mode is not None else ("fp8_per_row" if quant else "none")
     )
-    if _mode == "fp8":
-        _mode = "fp8_per_row"  # back-compat alias
+    _mode = {
+        "fp8": "fp8_per_row",
+        "per_row_fp8": "fp8_per_row",
+        "group_fp8": "fp8_group",
+    }.get(_mode, _mode)
     if _mode not in (
         "none",
         "fp8_per_row",
@@ -2349,9 +2355,9 @@ def flydsl_fused_compress_attn(
         )
     _quant = _mode != "none"
     _fp4 = _mode in ("fp4", "fp4_gfx950_flydsl", "fp4_gfx950_opus")
-    if _fp4:
-        # The mode owns both data and scale layout; legacy preshuffle is FP8-only.
-        preshuffle = _mode != "fp4"
+    if _mode in ("fp4_gfx950_flydsl", "fp4_gfx950_opus"):
+        # Explicit layouts override the legacy flag; plain fp4 still honors it.
+        preshuffle = True
     if _mode == "fp4_gfx950_opus" and (head_dim != 128 or k_per_block != 64):
         raise ValueError("quant_mode=fp4_gfx950_opus requires D=128, page=64")
     # `_mode` (none|fp8_per_row|fp8_group|fp4|fp4_gfx950_flydsl|fp4_gfx950_opus) is the single selector passed
@@ -2509,14 +2515,25 @@ def flydsl_fused_compress_attn(
                 raise ValueError("fp4 quant requires uint8 e8m0 cache_scale")
             if cache_scale.shape[0] != kv_cache.shape[0]:
                 raise ValueError("fp4 cache_scale NB must match kv_cache NB")
-            if _mode == "fp4_gfx950_opus" and (
-                tuple(kv_cache.shape[1:]) != (4, 64, 16)
-                or tuple(cache_scale.shape[1:]) != (2, 32, 4)
+            if _mode == "fp4_gfx950_opus":
+                data_shape, scale_shape = (4, 64, 16), (2, 32, 4)
+            elif preshuffle:
+                data_shape = (head_dim // _FP4_K_TILE, 4, k_per_block, 16)
+                scale_shape = (head_dim // _FP4_K_TILE, 4, k_per_block)
+            else:
+                data_shape = (k_per_block, head_dim // 2)
+                scale_shape = (k_per_block, head_dim // _FP4_GROUP_SIZE)
+            # Equal byte counts do not imply equal layouts. Reject a cache view
+            # from a different mode before the kernel writes into it.
+            if (
+                tuple(kv_cache.shape[1:]) != data_shape
+                or tuple(cache_scale.shape[1:]) != scale_shape
                 or not kv_cache.is_contiguous()
                 or not cache_scale.is_contiguous()
             ):
                 raise ValueError(
-                    "OPUS requires packed KV [NB,4,64,16], scale [NB,2,32,4]"
+                    f"{_mode} with preshuffle={preshuffle} requires contiguous "
+                    f"FP4 KV [NB, {data_shape}], scale [NB, {scale_shape}]"
                 )
             if head_dim % _FP4_K_TILE != 0:
                 raise ValueError(f"fp4 requires head_dim%128==0, got {head_dim}")
