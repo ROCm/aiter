@@ -1977,10 +1977,13 @@ class LargeMRuntime:
     def __init__(self, *, rank: int, world_size: int, model_dim: int, inter_dim: int, experts: int, topk: int,
         quant: str, w1: torch.Tensor, w1_scale: torch.Tensor, w2: torch.Tensor, w2_scale: torch.Tensor,
         max_tok_per_rank: int, mega_scheme: str = "fixedslot", swiglu_limit: float = 0.0,
-        state_slots: int = 1, payload_arena=None, s1_output_arena=None):
+        state_slots: int = 1, payload_arena=None, s1_output_arena=None, combine_input=None,
+        quant_buffers=None):
     # fmt: on
-        """``payload_arena`` / ``s1_output_arena``: shared storage owned by MegaMoEV2
-        (see GroupMajorPayloadArena and stage1_output_buffers); None allocates."""
+        """``payload_arena`` / ``s1_output_arena`` / ``combine_input`` / ``quant_buffers``:
+        storage shared by the routes of one MegaMoEV2 (see GroupMajorPayloadArena,
+        stage1_output_buffers and FlyDSLDispatchCombineIntraNodeOp; the quant buffers are
+        the FP8 rows and E8M0 scales of max_tok_per_rank inputs); None allocates."""
         if quant != "a8w4":
             raise ValueError("LargeMRuntime currently supports quant='a8w4' only")
         if experts % world_size != 0:
@@ -2021,7 +2024,9 @@ class LargeMRuntime:
             gm_scheme=mega_scheme, gm_compact=self.GM_COMPACT, gm_indexed_payload=False,
             max_total_recv_tokens=self.world_size)
         # fmt: on
-        self.comb_op = FlyDSLDispatchCombineIntraNodeOp(self.comb_cfg, gm_payload_arena=payload_arena)
+        self.comb_op = FlyDSLDispatchCombineIntraNodeOp(
+            self.comb_cfg, gm_payload_arena=payload_arena, combine_input=combine_input
+        )
         self._s1_output_arena = s1_output_arena
         torch.cuda.synchronize()
         ms.shmem_barrier_all()
@@ -2033,8 +2038,12 @@ class LargeMRuntime:
         self.w2 = w2
         self.w2_scale = w2_scale
         self._build_fused_stage1(w1, w1_scale)
-        self._quant_x = torch.empty((self.mtpr, self.model_dim), dtype=torch.float8_e4m3fn, device=self.dev)
-        self._quant_scale = torch.empty((self.mtpr, self._s1_scale_dim), dtype=torch.uint8, device=self.dev)
+        if quant_buffers is None:
+            quant_buffers = (
+                torch.empty((self.mtpr, self.model_dim), dtype=torch.float8_e4m3fn, device=self.dev),
+                torch.empty((self.mtpr, self._s1_scale_dim), dtype=torch.uint8, device=self.dev),
+            )
+        self._quant_x, self._quant_scale = quant_buffers
         self._build_stage2_invariants()
         self._allocate_fused_counters()
         self.select_layer_state(0)

@@ -183,6 +183,9 @@ class MegaMoEV2:
                 state_slots=self.large_m_state_slots,
                 payload_arena=self._payload_arena,
                 s1_output_arena=self._s1_output_arena,
+                combine_input=self._shared_combine_input(),
+                # The large-input route quantizes its bf16 input into the staged quant buffers.
+                quant_buffers=(self._s1_quant_x, self._s1_quant_scale),
             )
         # Compatibility switch for set_large_m_enabled(); routing stays with the plan.
         self._large_m_excluded = False
@@ -208,6 +211,7 @@ class MegaMoEV2:
                     swiglu_limit=self.swiglu_limit,
                     payload_arena=self._payload_arena,
                     s1_output_arena=self._s1_output_arena,
+                    combine_input=self._shared_combine_input(),
                 )
                 for m in self._bundle_plan.small_m_mtprs
             ]
@@ -409,6 +413,16 @@ class MegaMoEV2:
             torch.zeros(out_bytes, dtype=torch.uint8, device=self.dev),
             torch.zeros(osd_bytes, dtype=torch.uint8, device=self.dev),
         )
+
+    def _shared_combine_input(self):
+        """The staged op's combine-input buffers, for the fused routes to view.
+
+        Every route writes a peer's combine input only after that peer has
+        entered the same call, and reads its own before that call ends, so one
+        copy sized for the instance capacity serves all routes.
+        """
+        comb_op = self.comb_op
+        return comb_op.shmem_comb_inp_tok, comb_op.shmem_comb_inp_wts
 
     def _build_fused_stage1(self, w1, w1_scale):
         from .mega_moe_prepare import (
