@@ -383,7 +383,7 @@ def test_fmoe(
         and WQDType == dtypes.fp4x2
     ):
         runtime_aq_dtype = _runtime_swiglu_mxfp4_q_dtype_a(
-            token, actType, gateMode, qType, AQDType, WQDType
+            token, actType, gateMode, qType, AQDType, WQDType, expert=E, inter_dim=inter_dim
         )
         if runtime_aq_dtype == dtypes.fp4x2:
             metadata = get_2stage_cfgs(
@@ -936,6 +936,8 @@ def _iter_csv_cases():
                 kwargs["qType"],
                 kwargs["AQDType"],
                 kwargs["WQDType"],
+                expert=kwargs["E"],
+                inter_dim=kwargs["inter_dim"],
             )
             runtime_mode = "Swiglu MXFP4"
         if expected_aq_dtype is not None and kwargs["AQDType"] != expected_aq_dtype:
@@ -1046,7 +1048,7 @@ def _runtime_situv2_mxfp4_q_dtype_a(q_type, wq_dtype):
 
 
 def _runtime_swiglu_mxfp4_q_dtype_a(
-    token, act_type, gate_mode, q_type, aq_dtype, wq_dtype
+    token, act_type, gate_mode, q_type, aq_dtype, wq_dtype, expert=None, inter_dim=None
 ):
     """Return the q_dtype_a that fused_moe will select for Swiglu MXFP4."""
     if act_type != aiter.ActivationType.Swiglu:
@@ -1058,6 +1060,10 @@ def _runtime_swiglu_mxfp4_q_dtype_a(
 
     gate_mode = GateMode(gate_mode)
     if gate_mode == GateMode.SEPARATED:
+        # Shapes measured numerically broken in the fp4-activation path
+        # regardless of token count -- see fused_moe._SWIGLU_MXFP4_A4W4_UNSAFE_SHAPES.
+        if (expert, inter_dim) in aiter.fused_moe._SWIGLU_MXFP4_A4W4_UNSAFE_SHAPES:
+            return dtypes.bf16
         bound = int(os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "256"))
         return dtypes.bf16 if token < bound else dtypes.fp4x2
 
