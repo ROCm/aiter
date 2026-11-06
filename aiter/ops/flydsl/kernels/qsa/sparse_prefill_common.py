@@ -30,6 +30,12 @@ import flydsl.expr as fx
 # for inline asm and target features
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
+
+# Raw rocdl ops, here and in the sparse_prefill kernels, that flydsl.expr.rocdl.__all__
+# (FlyDSL 0.4) has no stable form of: s_setprio; sched_barrier and sched_group_barrier with
+# VALU/TRANS masks (sched_mfma, sched_vmem, sched_dsrd and sched_dswr name only their
+# groups); ballot, readlane and readfirstlane; perm_b32, cvt_pk_bf16_f32; exp2 as a bare
+# v_exp_f32.
 from flydsl.expr import rocdl
 
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
@@ -754,9 +760,17 @@ def _load_lds_tr(storage, address, immediate=0):
     """ds_read_b64_tr_b16 at an LDS byte address; 2 words. Lane 4r + q of each 16-lane group reads four BF16 at its
     address; lane i then holds element i % 4 of lane 4r + i // 4's read as BF16 r = 0..3.
     """
-    ptr = fx.to_llvm_ptr(fx.get_iter(storage) + (fx.Int32(address) + immediate))
-    result = ir.VectorType.get([4], ir.IntegerType.get_signless(16))
-    return fx.Vector(rocdl.ds_read_tr16_b64(result, ptr).result).bitcast(fx.Int32)
+    pointer = fx.recast_iter(
+        fx.PointerType.get(fx.BFloat16.ir_type, fx.AddressSpace.Shared, 8),
+        fx.get_iter(storage) + (fx.Int32(address) + immediate),
+    )
+    data = fx.make_rmem_tensor(4, fx.BFloat16)
+    fx.copy(
+        fx.make_copy_atom(rocdl.cdna4.LDSReadTrans16_64b(), fx.BFloat16),
+        fx.make_view(pointer, fx.make_layout(4, 1)),
+        data,
+    )
+    return fx.Vector(data.load()).bitcast(fx.Int32)
 
 
 def _mfma32(a, b, c):

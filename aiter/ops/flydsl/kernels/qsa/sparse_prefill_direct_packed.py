@@ -667,11 +667,7 @@ def _body(
         _store_q950(storage, q, lane, 0)
         for t in range(fx.Int32(0), tiles950, fx.Int32(1)):
             vrows = [
-                fx.Int32(
-                    rocdl.ds_bpermute(
-                        fx.Int32.ir_type, (lane >> 4) * 16, fx.Int32(offset)
-                    )
-                )
+                fx.gpu.shuffle_idx(fx.Int32(offset), (lane >> 4) << 2, 64)
                 for offset in (offset0, offset1)
             ]
             rocdl.s_waitcnt(lgkmcnt=0)
