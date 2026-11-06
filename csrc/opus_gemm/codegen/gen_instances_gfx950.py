@@ -3199,10 +3199,24 @@ _BPRESHUFFLE_ARGUMENTS = r"""
 """
 
 
+_BPRESHUFFLE_HOST_TEMPLATE = """#if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
+{host_header}
+template<typename D_C>
+void {name}(aiter_tensor_t& XQ, aiter_tensor_t& WQ,
+              aiter_tensor_t& x_scale, aiter_tensor_t& w_scale, aiter_tensor_t& Y) {{
+    static_assert(std::is_same_v<D_C, opus::bf16_t>);
+{arguments}
+    {body}
+}}
+#endif
+"""
+
+
 def gen_mxscale_bpreshuffle_instance(
     cg,
     k,
     instance_impl_preamble,
+    instance_impl_host_tu_split,
     make_a8w8_bpreshuffle_host_decl,
     **_unused,
 ):
@@ -3248,29 +3262,18 @@ def gen_mxscale_bpreshuffle_instance(
             + " && ".join(conditions)
             + ', "CO tensor extent exceeds pipeline limits");'
         )
-        preamble = instance_impl_preamble(
-            '\n#include <climits>\n#include <type_traits>\n#include "gfx950/opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh"'
-        )
         kernel_select = f'static AiterAsmKernelFast& kernel = opus_gfx950_co::co_kernel("{symbol}", "{entry["image"]}");'
         if entry.get("short_symbol"):
             kernel_select = f"""static AiterAsmKernelFast& normal = opus_gfx950_co::co_kernel("{symbol}", "{entry['image']}");
     static AiterAsmKernelFast& short_k = opus_gfx950_co::co_kernel("{entry['short_symbol']}", "{entry['image']}");
     AiterAsmKernelFast& kernel = k <= {entry['short_max_k']} ? short_k : normal;"""
-        source = f"""{preamble}
-#if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
-#include "gfx950/opus_co_launch_gfx950.cuh"
-template<typename D_C>
-void {k.name}(aiter_tensor_t& XQ, aiter_tensor_t& WQ,
-              aiter_tensor_t& x_scale, aiter_tensor_t& w_scale, aiter_tensor_t& Y) {{
-    static_assert(std::is_same_v<D_C, opus::bf16_t>);
-{_BPRESHUFFLE_ARGUMENTS}
-    {grid_setup}
+        body = f"""{grid_setup}
     {kernel_select}
-    opus_co_launch_gfx950(kernel, grid, block, args, aiter::getCurrentHIPStream(), dynamic_lds);
-}}
-#endif
-"""
+    opus_co_launch_gfx950(kernel, grid, block, args, aiter::getCurrentHIPStream(), dynamic_lds);"""
+        extra_includes = '#include "gfx950/opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh"'
+        device_source = ""
         header = "gfx950/opus_co_launch_gfx950.cuh"
+        host_header = f'#include "{header}"'
     else:
         entry = k.bpreshuffle_entry
         kernel, alias = entry["kernel"], f"{k.name}_Traits"
@@ -3305,7 +3308,6 @@ void {k.name}(aiter_tensor_t& XQ, aiter_tensor_t& WQ,
         ]
         if k.max_k is not None:
             checks.append(f"k <= {k.max_k}")
-        checks.append(f"k / {k.B_K} >= 1")
         checks.append(f"2ULL * (m < {k.B_M} ? m : {k.B_M}) * n <= INT32_MAX")
         input_limit = min(2147483647, k.max_tensor_bytes)
         checks.extend(
@@ -3320,31 +3322,28 @@ void {k.name}(aiter_tensor_t& XQ, aiter_tensor_t& WQ,
             + " && ".join(checks)
             + ', "shape exceeds this pipeline configuration");'
         )
-        preamble = instance_impl_preamble(
-            '\n#include <climits>\n#include <type_traits>\n#include "opus_gemm_common.cuh"'
+        host_tu_split = instance_impl_host_tu_split(
+            traits_header, header, template_params, kernel, abi
         )
-        source = f"""{preamble}
-#include "{traits_header}"
-#ifdef OPUS_FUSED_HOST_TU
-template<class Traits{template_params}> __global__ void {kernel}({abi});
-#else
-#include "{header}"
-#endif
+        device_source = f"""{host_tu_split}
 struct {alias} : {entry["traits"]} {{}};
-#if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
-template<class D_C>
-void {k.name}(aiter_tensor_t& XQ, aiter_tensor_t& WQ,
-              aiter_tensor_t& x_scale, aiter_tensor_t& w_scale, aiter_tensor_t& Y) {{
-    static_assert(std::is_same_v<D_C, opus::bf16_t>);
-{_BPRESHUFFLE_ARGUMENTS}
-    {shape_check}
+"""
+        body = f"""{shape_check}
     using Traits = {alias};
     const unsigned tiles_m = (m + Traits::B_M - 1) / Traits::B_M;
     const unsigned tiles_n = n / Traits::B_N, tiles = tiles_m * tiles_n;
-    {launch}
-}}
-#endif
-"""
+    {launch}"""
+        extra_includes = '#include "opus_gemm_common.cuh"'
+        host_header = ""
+    preamble = instance_impl_preamble(
+        '\n#include <climits>\n#include <type_traits>\n' + extra_includes
+    )
+    source = f"{preamble}\n{device_source}" + _BPRESHUFFLE_HOST_TEMPLATE.format(
+        host_header=host_header,
+        name=k.name,
+        arguments=_BPRESHUFFLE_ARGUMENTS,
+        body=body,
+    )
     write_if_changed(os.path.join(cg.impl_path, f"{k.name}.cuh"), source)
     cg._kid_pipeline_header[k.name] = header
     cg._host_instantiations.append(

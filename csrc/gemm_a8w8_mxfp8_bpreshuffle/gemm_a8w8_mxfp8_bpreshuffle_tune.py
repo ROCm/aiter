@@ -35,8 +35,6 @@ On gfx1250 --mxscale_table times the mxfp8_128 kernels the 2-D dispatch runs
 (flydsl_gemm_mxfp8_128_bpreshuffle_wmma_common, row-major A) on 128x128
 shapes, and a row's kernelId is the kernel's id in that list.
 
-OPUS calculates a shape/resource range, benchmarks it once, and selects the
-fastest valid result. Legal COs and a low-LDS baseline per JIT tile are retained.
 """
 
 import math
@@ -110,17 +108,6 @@ def generate_data(m, n, k, seed, w_scale_block=W_SCALE_BLOCK, device="cuda"):
 
 def run_torch(x_deq, w_deq, dtype=dtypes.bf16):
     return F.linear(x_deq, w_deq).to(dtype)
-
-
-def opus_kernel_name(kid, *, cu_num):
-    from csrc.opus_gemm.opus_gemm_common import get_kernel_instance
-
-    instance = get_kernel_instance(
-        "gfx950", "a8w8_blockscale_bpreshuffle", int(kid), cu_num=cu_num
-    )
-    if instance is None:
-        raise ValueError(f"Unknown or unavailable OPUS MXFP8 bpreshuffle kid {kid}")
-    return instance.name
 
 
 _OPUS_B_DEFAULTS = (None,) * 4 + tuple(
@@ -272,36 +259,7 @@ def _opus_select_variants(geometry, kids, kernel_profiles, footprints, m, n, mod
     return selected
 
 
-def opus_seed_names(tunedf, *, gfx, cu_num):
-    """Return current OPUS kernel names for each matching 128x128 shape."""
-    columns = {"libtype", "gfx", "cu_num", "M", "N", "K", "w_scale_block", "kernelName"}
-    if tunedf is None or tunedf.empty or not columns.issubset(tunedf.columns):
-        return {}
-    numbers = tunedf[["cu_num", "M", "N", "K"]].apply(pd.to_numeric, errors="coerce")
-    shapes = numbers[["M", "N", "K"]]
-    selected = (
-        tunedf["libtype"].astype(str).str.strip().str.lower().eq("opus")
-        & tunedf["gfx"].astype(str).str.strip().eq(gfx)
-        & numbers["cu_num"].eq(cu_num)
-        & tunedf["w_scale_block"].astype(str).str.strip().eq("128x128")
-        & shapes.gt(0).all(axis=1)
-        & shapes.mod(1).eq(0).all(axis=1)
-    )
-    names = defaultdict(set)
-    for dimensions, value in zip(
-        shapes[selected].itertuples(index=False, name=None),
-        tunedf.loc[selected, "kernelName"],
-    ):
-        if pd.isna(value):
-            continue
-        name = str(value).strip()
-        if name and name.lower() not in ("nan", "none"):
-            shape = tuple(map(int, dimensions))
-            names[shape].add(name)
-    return {shape: tuple(sorted(values)) for shape, values in names.items()}
-
-
-def opus_candidates(m, n, k, *, cu_num, seed_names=()):
+def opus_candidates(m, n, k, *, cu_num):
     """Calculate tile ranges and variants from shape and cached kernel resources."""
     from csrc.opus_gemm.opus_gemm_common import candidate_kids_for_shape, get_registry
 
@@ -309,13 +267,8 @@ def opus_candidates(m, n, k, *, cu_num, seed_names=()):
     legal = candidate_kids_for_shape("gfx950", m, n, k, cu_num=cu_num)
     if not legal:
         return []
-    seed_names = frozenset(seed_names)
-    selected = {
-        kid
-        for kid in legal
-        if registry[kid].bpreshuffle_co is not None or registry[kid].name in seed_names
-    }
-    co_count = sum(registry[kid].bpreshuffle_co is not None for kid in legal)
+    selected = {kid for kid in legal if registry[kid].bpreshuffle_co is not None}
+    co_count = len(selected)
     groups, profiles, footprints = defaultdict(list), {}, {}
     for kid in legal:
         instance = registry[kid]
@@ -384,8 +337,13 @@ def opus_candidates(m, n, k, *, cu_num, seed_names=()):
                             if 3 * g[1] >= 2 * max_bm and 2 * g[2] >= max_bn
                         }
                         if grid < cu_grid
-                        else {largest}
+                        else {largest, min(full_a, key=lambda g: (costs[g], g))}
                     )
+                    if grid < cu_grid:
+                        supplied = [g for g in full_a if grids[g] >= cu_grid]
+                        if supplied:
+                            area = max(g[1] * g[2] for g in supplied)
+                            chosen.update(g for g in supplied if g[1] * g[2] == area)
                     waves = wm * wn
                     if native and waves != 4 and grid >= cu_grid * max(1, 4 / waves):
                         secondary.update(chosen)
@@ -453,9 +411,13 @@ def opus_candidates(m, n, k, *, cu_num, seed_names=()):
             mode = "primary"
         elif geometry in secondary:
             mode = "secondary"
-        selected.update(
-            _opus_select_variants(geometry, kids, profiles, footprints, m, n, mode)
+        variants = _opus_select_variants(
+            geometry, kids, profiles, footprints, m, n, mode
         )
+        if geometry[0] in ("prefetch_b_vgpr", "prefetch_b_vgpr_overlap"):
+            signatures = {profiles[kid] for kid in variants}
+            variants.update(kid for kid in kids if profiles[kid] in signatures)
+        selected.update(variants)
     print(
         f"[OPUS search] shape={(m, n, k)} legal={len(legal)} "
         f"primary={len(primary)} secondary={len(secondary)} "
@@ -645,18 +607,6 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
         self._mxscale_table = args.mxscale_table
         if args.libtype == "opus" and not self._mxscale_table:
             self.parser.error("OPUS tuning requires --mxscale_table")
-        self._opus_seed_names = {}
-        if (
-            self._mxscale_table
-            and args.libtype != "flydsl"
-            and self.get_gfx() == "gfx950"
-        ):
-            # Retuning removes requested shapes from tunedf; retain their names first.
-            self._opus_seed_names = opus_seed_names(
-                self.get_tuned_gemm_list(args.tune_file),
-                gfx=self.get_gfx(),
-                cu_num=self.get_cu_num(),
-            )
         super().pre_process(args)
 
     def _bmm_seeds_mxfp8(self):
@@ -774,20 +724,12 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
         seeds_nk, seed_pool = self._bmm_seeds_mxfp8() if self._bmm_1x32 else ({}, [])
         opus_by_shape = {}
         if gfx == "gfx950" and args.libtype != "flydsl" and self._mxscale_table:
-            opus_seeds = {
-                shape: set(names)
-                for shape, names in getattr(self, "_opus_seed_names", {}).items()
-            }
-            for shape, names in opus_seed_names(tunedf, gfx=gfx, cu_num=cu_num).items():
-                opus_seeds.setdefault(shape, set()).update(names)
             if args.libtype == "opus" and set(untunedf.w_scale_block) != {"128x128"}:
                 raise ValueError("OPUS supports A 1x128 / B 128x128 scales only")
             for row in untunedf.itertuples():
                 if row.w_scale_block == "128x128":
                     shape = (int(row.M), int(row.N), int(row.K))
-                    opus_by_shape[shape] = opus_candidates(
-                        *shape, cu_num=cu_num, seed_names=opus_seeds.get(shape, ())
-                    )
+                    opus_by_shape[shape] = opus_candidates(*shape, cu_num=cu_num)
                     if args.libtype == "opus" and not opus_by_shape[shape]:
                         raise ValueError(f"No OPUS candidate supports {shape}")
         for i in range(len(untunedf)):
@@ -831,8 +773,8 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
                     splits = parse_bmm_kernel_name(name)["splits"]
                     runs.append((KERNEL_ID_BASE_BMM + j, splits, name, run_bmm_flydsl))
             runs.extend(
-                (kid, 1, opus_kernel_name(kid, cu_num=cu_num), run_gemm_opus)
-                for kid, _ in opus
+                (kid, 1, instance.name, run_gemm_opus)
+                for kid, instance in opus
             )
             for kernel_id, split_k, name, run in runs:
                 is_opus = run is run_gemm_opus
@@ -895,8 +837,6 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
             keys, kernelId, splitK, kernelName, libtype = info
             if time in (self.INVALID_TIME, self.INF_TIME):
                 kernelName = "None"
-            elif libtype == "opus":
-                kernelName = opus_kernel_name(kernelId, cu_num=int(keys[1]))
             elif (
                 libtype == "flydsl"
                 and keys[0] == "gfx950"

@@ -2895,9 +2895,10 @@ def _bpreshuffle_name(config_name):
 def _load_gfx950_co_kernels(path, require_image=True):
     with open(path) as stream:
         document = json.load(stream)
+    defaults = document.get("defaults", {})
     entries = {}
     for record in document["gfx950"]:
-        entry = {**document.get("defaults", {}), **record}
+        entry = {**defaults, **record}
         kid = entry["kid"]
         if kid in entries:
             raise ValueError(f"Duplicate gfx950 CO kid {kid} in {path}")
@@ -2910,19 +2911,20 @@ def _load_gfx950_co_kernels(path, require_image=True):
             )
         entries[kid] = entry
     image_configs = {}
-    for kid, entry in sorted(entries.items()):
+    families = {
+        "pin_agpr": "4wave_pin_agpr_co",
+        "prefetch_b_vgpr": "b_vgpr_co",
+        "prefetch_b_vgpr_overlap": "b_vgpr_overlap_co",
+        "pingpong_lds": "m_repeat_co",
+    }
+    for entry in entries.values():
         fields = (
             (entry["block_size"], *entry["tile"]),
             entry["wave_layout"],
             (16, 16, 128),
             (1, 128, 128),
         )
-        family = {
-            "pin_agpr": "4wave_pin_agpr_co",
-            "prefetch_b_vgpr": "b_vgpr_co",
-            "prefetch_b_vgpr_overlap": "b_vgpr_overlap_co",
-            "pingpong_lds": "m_repeat_co",
-        }[entry["pipeline"]]
+        family = families[entry["pipeline"]]
         name = "_".join(
             ("opus_gemm", "gfx950", family)
             + tuple("x".join(map(str, values)) for values in fields)
@@ -2985,10 +2987,10 @@ def _bpreshuffle_jit_configs(*, bms=(32, 48, 64, 96, 128), bns=(64, 128),
         # Match the traits' packed-scale and per-CU LDS limits using the
         # runtime panel selected for this geometry, independently of K.
         try:
-            _bpreshuffle_b_scale_columns(bm, bn, block_k, wn, stages, wg)
+            scale_cols = _bpreshuffle_b_scale_columns(bm, bn, block_k, wn, stages, wg)
         except ValueError:
             continue
-        yield bm, bn, wn, stages, ahead, wg, ca, cb, output
+        yield bm, bn, wn, stages, ahead, wg, ca, cb, output, scale_cols
 
 
 def _bpreshuffle_cpp_traits(name, args):
@@ -3027,6 +3029,35 @@ def _register_bpreshuffle_jit(entry, bm, bn, bk, wm, wn, max_k, *,
         direct_only=True, pad_m=True, has_oob=True, max_k=max_k,
         max_tensor_bytes=2**63 - 1,
         bpreshuffle_entry=entry,
+    )
+
+
+def _register_bpreshuffle_b_jit(bk, config, publish=None):
+    bm, bn, wn, stages, ahead, wg, ca, cb, output, scale_cols = config
+    family = "b_vgpr" if publish is None else "b_vgpr_overlap"
+    pipeline = "prefetch_" + family
+    args = (bm, bn, stages, ahead, cb, True, scale_cols, wn, wg, ca)
+    if publish is not None:
+        args += (output, bk, False, False, False, publish)
+    elif bk == 128:
+        args += (output, bk, False, False, False)
+    elif output:
+        args += (output,)
+    entry = {
+        "pipeline": pipeline,
+        "kernel": _BP_ROOT + pipeline + "_bulk_panel_kernel",
+        "traits": _bpreshuffle_cpp_traits(_BP_ROOT + pipeline + "_traits", args),
+        "config_name": _bpreshuffle_jit_name(
+            family, bm, bn, bk, 1, wn,
+            _bpreshuffle_b_jit_suffix(stages, ahead, wg, ca, cb, output,
+                                     0 if publish is None else publish)),
+        "headers": ("gfx950/opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",),
+    }
+    if publish is not None:
+        entry["traits_header"] = "gfx950/opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh"
+    entry["m_align"] = 16
+    _register_bpreshuffle_jit(
+        entry, bm, bn, bk, 1, wn, None, wg=wg, ca=ca, cb=cb,
     )
 
 
@@ -3082,16 +3113,15 @@ def _bpreshuffle_m_repeat_jit_configs():
             yield bm, bn, wm, panel, gm, *caches, fragments, True, 8
 
     for bm, bn, wm in ((128, 128, 2), (256, 256, 4)):
-        for panel, caches, fragments in product(
-            (64, 128, 256), _BPRESHUFFLE_JIT_CACHES, (False, True)
-        ):
+        for panel in (64, 128, 256):
             if not _bpreshuffle_m_repeat_legal(bm, bn, wm, panel):
                 continue
             schedules = ((4, 8), (8, 8), (0, 16), (0, 32))
             if panel == 256:
                 schedules = ((0, 8), *schedules)
-            for gm, gn in schedules:
-                yield bm, bn, wm, panel, gm, *caches, fragments, False, gn
+            for caches, fragments in product(_BPRESHUFFLE_JIT_CACHES, (False, True)):
+                for gm, gn in schedules:
+                    yield bm, bn, wm, panel, gm, *caches, fragments, False, gn
 
     for bm, bn, wm, panel, policies in (
         (128, 128, 2, 64, (
@@ -3113,27 +3143,9 @@ def _bpreshuffle_m_repeat_jit_configs():
 
 
 _next_bpreshuffle_jit_kid = _bpreshuffle_jit_kid_base
-for _bk, (_bm, _bn, _wn, _stages, _ahead, _wg, _ca, _cb, _output) in _bpreshuffle_b_vgpr_jit_configs():
-    _scale_cols = _bpreshuffle_b_scale_columns(_bm, _bn, _bk, _wn, _stages, _wg)
-    _args = (_bm, _bn, _stages, _ahead, _cb, True, _scale_cols, _wn, _wg, _ca)
-    if _bk == 128:
-        _args += (_output, 128, False, False, False)
-    elif _output:
-        _args += (_output,)
-    _register_bpreshuffle_jit(
-        {
-            "pipeline": "prefetch_b_vgpr",
-            "kernel": _BP_ROOT + "prefetch_b_vgpr_bulk_panel_kernel",
-            "traits": _bpreshuffle_cpp_traits(_BP_ROOT + "prefetch_b_vgpr_traits", _args),
-            "config_name": _bpreshuffle_jit_name(
-                "b_vgpr", _bm, _bn, _bk, 1, _wn,
-                _bpreshuffle_b_jit_suffix(_stages, _ahead,
-                                         _wg, _ca, _cb, _output)),
-            "headers": ("gfx950/opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",),
-            "m_align": 16,
-        },
-        _bm, _bn, _bk, 1, _wn, None, wg=_wg, ca=_ca, cb=_cb,
-    )
+_bpreshuffle_b_configs = tuple(_bpreshuffle_b_vgpr_jit_configs())
+for _bk, _config in _bpreshuffle_b_configs:
+    _register_bpreshuffle_b_jit(_bk, _config)
 
 
 for (_bm, _bn, _wm, _panel, _gm, _ca, _cb,
@@ -3161,26 +3173,10 @@ for (_bm, _bn, _wm, _panel, _gm, _ca, _cb,
 
 # Reuse the legal B-VGPR geometry/schedule sweep, with every publication point
 # before the final M repeat. Both pin switches remain disabled.
-for (_bm, _bn, _wn, _stages, _ahead, _wg, _ca, _cb, _output) in _bpreshuffle_jit_configs():
-    for _publish in range(_bm // 16 - 1):
-        _scale_cols = _bpreshuffle_b_scale_columns(_bm, _bn, 256, _wn, _stages, _wg)
-        _args = (_bm, _bn, _stages, _ahead, _cb, True, _scale_cols, _wn, _wg, _ca,
-                 _output, 256, False, False, False, _publish)
-        _register_bpreshuffle_jit(
-            {
-                "pipeline": "prefetch_b_vgpr_overlap",
-                "kernel": _BP_ROOT + "prefetch_b_vgpr_overlap_bulk_panel_kernel",
-                "traits": _bpreshuffle_cpp_traits(_BP_ROOT + "prefetch_b_vgpr_overlap_traits", _args),
-                "config_name": _bpreshuffle_jit_name(
-                    "b_vgpr_overlap", _bm, _bn, 256, 1, _wn,
-                    _bpreshuffle_b_jit_suffix(_stages, _ahead,
-                                             _wg, _ca, _cb, _output, _publish)),
-                "headers": ("gfx950/opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",),
-                "traits_header": "gfx950/opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",
-                "m_align": 16,
-            },
-            _bm, _bn, 256, 1, _wn, None, wg=_wg, ca=_ca, cb=_cb,
-        )
+for _bk, _config in _bpreshuffle_b_configs:
+    if _bk == 256:
+        for _publish in range(_config[0] // 16 - 1):
+            _register_bpreshuffle_b_jit(_bk, _config, _publish)
 
 
 for _kid, _entry in gfx950_co_kernels_declared.items():
