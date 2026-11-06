@@ -15,6 +15,14 @@ _ROOT = pathlib.Path(__file__).resolve().parents[1]
 _SETUP = _ROOT / "setup.py"
 
 
+@pytest.fixture(autouse=True)
+def _outside_the_checkout(tmp_path, monkeypatch):
+    # _is_metadata_only builds a setuptools Distribution, which reads the
+    # pyproject.toml in the working directory and lets setuptools_scm write
+    # aiter/_version.py there; keep that out of the checkout under test.
+    monkeypatch.chdir(tmp_path)
+
+
 @pytest.fixture(scope="module")
 def is_metadata_only(tmp_path_factory):
     # Importing setup.py would run setup(); load only the classifier.
