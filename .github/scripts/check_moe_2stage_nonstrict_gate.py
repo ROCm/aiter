@@ -2,11 +2,11 @@
 """Gate the MoE 2-stage full-matrix CI run against a known allowlist of
 non-strict accuracy failures, instead of a bare count cap.
 """
+
 import argparse
 import csv
 import re
 import sys
-
 
 FIELDS = ["token", "qType", "actType", "AQDType", "WQDType", "failure_mode"]
 
@@ -15,7 +15,9 @@ def extract_failures(log_path):
     with open(log_path, errors="replace") as f:
         lines = f.readlines()
 
-    fail_idxs = [i for i, l in enumerate(lines) if "accuracy check failed (non-strict)" in l]
+    fail_idxs = [
+        i for i, l in enumerate(lines) if "accuracy check failed (non-strict)" in l
+    ]
     failures = []
     for idx in fail_idxs:
         start = None
@@ -24,8 +26,14 @@ def extract_failures(log_path):
                 start = j
                 break
         if start is None:
-            failures.append({"_line": idx + 1, "_raw": lines[idx].strip(), "_unparsed": True,
-                              "_reason": "no preceding test_fmoe( call found"})
+            failures.append(
+                {
+                    "_line": idx + 1,
+                    "_raw": lines[idx].strip(),
+                    "_unparsed": True,
+                    "_reason": "no preceding test_fmoe( call found",
+                }
+            )
             continue
         block = []
         for j in range(start, idx):
@@ -34,7 +42,7 @@ def extract_failures(log_path):
                 break
         text = "".join(block)
 
-        def grab(key):
+        def grab(key, text=text):
             m = re.search(rf"{key}\s*=\s*([^\n,]+)", text)
             return m.group(1).strip().rstrip(",") if m else "?"
 
@@ -52,7 +60,9 @@ def extract_failures(log_path):
 def load_allowlist(path):
     allowlist = set()
     with open(path, newline="") as f:
-        data_lines = (line for line in f if not line.lstrip().startswith("#") and line.strip())
+        data_lines = (
+            line for line in f if not line.lstrip().startswith("#") and line.strip()
+        )
         for row in csv.DictReader(data_lines):
             allowlist.add(tuple(row[k].strip() for k in FIELDS))
     return allowlist
@@ -79,8 +89,10 @@ def main():
         else:
             unexpected.append(f)
 
-    print(f"Observed {len(failures)} non-strict accuracy failures "
-          f"({len(known)} known, {len(unexpected)} unexpected).")
+    print(
+        f"Observed {len(failures)} non-strict accuracy failures "
+        f"({len(known)} known, {len(unexpected)} unexpected)."
+    )
 
     if unexpected:
         print("\nUnexpected non-strict accuracy failures (not in allowlist):")
