@@ -47,9 +47,11 @@ env:
 
 jobs:
   ci_config:
+    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.draft }}
     uses: ./.github/workflows/ci-config.yaml
 
   check-signal:
+    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.draft }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -65,6 +67,7 @@ jobs:
           GITHUB_SHA: ${{ github.sha }}
 
   prechecks:
+    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.draft }}
     runs-on: ubuntu-latest
     outputs:
       run_triton: ${{ steps.gate.outputs.run_triton }}
@@ -112,7 +115,7 @@ jobs:
   # Triton Backend
   # =============================================================================
   flash_attention_triton:
-    if: ${{ needs.prechecks.outputs.run_triton == 'true' }}
+    if: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.draft) && needs.prechecks.outputs.run_triton == 'true' }}
     name: Flash Attention - Triton / ${{ matrix.label }} (1 GPU)
     needs: [check-signal, prechecks, ci_config]
     runs-on: ${{ matrix.runner }}
@@ -527,7 +530,7 @@ jobs:
   # Windows Smoke Test
   # =============================================================================
   windows_smoke:
-    if: ${{ needs.prechecks.outputs.run_triton == 'true' }}
+    if: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.draft) && needs.prechecks.outputs.run_triton == 'true' }}
     name: Windows Smoke Test
     needs: [prechecks]
     runs-on: windows-latest
@@ -577,7 +580,7 @@ jobs:
 
   # AITER_TRITON_ONLY import contract (no C++ JIT, no GPU, no ROCm runtime).
   triton_only_smoke:
-    if: ${{ needs.prechecks.outputs.run_triton == 'true' }}
+    if: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.draft) && needs.prechecks.outputs.run_triton == 'true' }}
     name: Triton-only Smoke
     needs: [prechecks]
     runs-on: ubuntu-latest
