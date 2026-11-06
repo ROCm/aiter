@@ -1001,13 +1001,8 @@ def compile_chunk_gated_delta_h(
         # -- Epilogue -- acc_val is already f32x4 with element i at K offset i,
         # so the final state stores as one buffer_store_dwordx4.
         if const_expr(STORE_FINAL_STATE):
-            if const_expr(phase == PHASE_BUILD_MAP):
-                write_final = last_block == False
-            elif const_expr(BLOCK_ENTRY_SEED):
-                write_final = last_block
-            else:
-                write_final = fx.Int32(1) == 1
-            if write_final:
+
+            def _store_final_state():
                 for kb in range_constexpr(NUM_K_BLOCKS):
                     for slot in range_constexpr(N_REPEAT):
                         acc_val = fx.Vector(frag_h_accs[kb][None, None, slot].load())
@@ -1023,6 +1018,16 @@ def compile_chunk_gated_delta_h(
                             4,
                             state_num,
                         )
+
+            if const_expr(phase == PHASE_BUILD_MAP):
+                # ``== False`` keeps this a traced comparison; ``not`` would call bool().
+                if last_block == False:
+                    _store_final_state()
+            elif const_expr(BLOCK_ENTRY_SEED):
+                if last_block:
+                    _store_final_state()
+            else:
+                _store_final_state()
 
     @flyc.jit
     def launch_gdn_h(
