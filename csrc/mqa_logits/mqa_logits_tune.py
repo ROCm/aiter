@@ -11,6 +11,10 @@ reference, and writes the fastest correct one per shape::
         -o aiter/configs/model_configs/glm5_tuned_mqa_logits.csv
 
 ``--run_config <tuned.csv>`` times the production op on every tuned row.
+
+Candidates are timed with ``--clean_logits`` (default 0, as vLLM calls the op):
+the -inf fill outside each row's window is a separate cost on the Triton path,
+so a table tuned with it on can pick a kernel that is slower without it.
 """
 
 from __future__ import annotations
@@ -69,12 +73,17 @@ def _config_name(config) -> str:
     return "triton"
 
 
-def grade(ref: torch.Tensor, got: torch.Tensor) -> str | None:
-    """None if ``got`` matches ``ref``, else the reason it does not."""
-    ref_inf, got_inf = torch.isneginf(ref), torch.isneginf(got)
-    if not torch.equal(ref_inf, got_inf):
+def grade(ref: torch.Tensor, got: torch.Tensor, clean_logits: bool) -> str | None:
+    """None if ``got`` matches ``ref``, else the reason it does not.
+
+    Without ``clean_logits`` the values outside each row's window are
+    unspecified, so only the window is compared.
+    """
+    ref_inf = torch.isneginf(ref)
+    if clean_logits and not torch.equal(ref_inf, torch.isneginf(got)):
         return "-inf mask mismatch"
-    diff = _OP_TEST.calc_diff(ref.masked_fill(ref_inf, 0), got.masked_fill(got_inf, 0))
+    got = got.masked_fill(ref_inf, 0)
+    diff = _OP_TEST.calc_diff(ref.masked_fill(ref_inf, 0), got)
     if not diff < MAX_CALC_DIFF:
         return f"calc_diff {diff:.3g} >= {MAX_CALC_DIFF}"
     return None
@@ -114,6 +123,15 @@ class MqaLogitsTuner(TunerCommon):
             "aiter.mqa_logits backend tuner",
         )
 
+    def _setup_specific_arguments(self):
+        self.parser.add_argument(
+            "--clean_logits",
+            type=int,
+            default=0,
+            choices=[0, 1],
+            help="clean_logits the candidates are timed with (vLLM calls with 0)",
+        )
+
     def _clear_op_caches(self):
         mql.reload_tuned_table()
 
@@ -142,11 +160,11 @@ class MqaLogitsTuner(TunerCommon):
 
     def measure(self, config, inp, ref, args):
         """``(us, None)`` for a correct candidate, else ``(None, reason)``."""
-        launch = _launch_args(inp)
+        launch = (*_launch_args(inp), bool(args.clean_logits))
         seq_len_kv = inp["KV"].shape[0]
         try:
             out = mql.run_mqa_logits(config, *launch)
-            reason = grade(ref, out[:, :seq_len_kv])
+            reason = grade(ref, out[:, :seq_len_kv], bool(args.clean_logits))
             del out
             if reason is not None:
                 return None, reason
@@ -190,6 +208,7 @@ class MqaLogitsTuner(TunerCommon):
                         mql.run_mqa_logits,
                         configs[name],
                         *_launch_args(inp),
+                        bool(args.clean_logits),
                         warmup=args.warmup,
                         iters=args.iters,
                     )
@@ -251,6 +270,7 @@ class MqaLogitsTuner(TunerCommon):
                 us = time_us(
                     mql.mqa_logits,
                     *_launch_args(inp),
+                    bool(args.clean_logits),
                     warmup=args.warmup,
                     iters=args.iters,
                 )
