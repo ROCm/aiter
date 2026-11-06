@@ -221,6 +221,8 @@ def fused_gdn_decode_qkvz_supported(
         return False, f"packed ba layout mismatch: {tuple(projected_ba.shape)}"
     if projected_ba.dim() == 3 and projected_ba.dtype is not torch.float32:
         return False, "split-K ba partials must be fp32"
+    if projected_ba.dim() == 3 and projected_ba.shape[0] < 2:
+        return False, "split-K ba partials need at least 2 splits"
     if conv_state.shape[2] != _CONV_WIDTH - 1 or conv_weight.shape != (
         channels,
         _CONV_WIDTH,
