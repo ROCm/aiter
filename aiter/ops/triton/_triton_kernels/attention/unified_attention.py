@@ -887,7 +887,10 @@ def kernel_unified_attention_3d(
         v_dim_mask = offs_vd < V_HEAD_SIZE
     else:
         v_dim_mask = tl.full((1,), 1, dtype=tl.int1)
-    query_mask_0 = query_pos < cur_batch_query_len
+    # Rows past BLOCK_Q tokens belong to the next q block, which stores them.
+    query_mask_0 = (query_pos < cur_batch_query_len) & (
+        offs_m // num_queries_per_kv < BLOCK_Q
+    )
     query_mask_1 = query_offset_1 < num_query_heads
 
     # Q : (BLOCK_M, HEAD_SIZE_PADDED)

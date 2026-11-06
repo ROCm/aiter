@@ -2627,6 +2627,9 @@ void mega_mhc_bf16(aiter_tensor_t& residual_out,
                    bool res_preshuffle,
                    bool scale_row_major)
 {
+    // This host-side dispatch must match the sources selected for the build;
+    // __gfx1250__ is only defined during a gfx1250 device compilation pass.
+#if AITER_MHC_GFX1250
     {
         const HipDeviceGuard guard(residual.device_id);
         if(get_gpu_arch() == "gfx1250")
@@ -2665,6 +2668,7 @@ void mega_mhc_bf16(aiter_tensor_t& residual_out,
             return;
         }
     }
+#endif
     AITER_CHECK(!res_preshuffle, "Mega-MHC res_preshuffle requires gfx1250");
     auto launch = [&]<int H, int VARIANT, bool MXFP8>() {
         launch_mega_mhc<H, VARIANT, MXFP8>(residual_out,
