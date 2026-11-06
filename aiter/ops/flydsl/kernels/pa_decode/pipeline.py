@@ -1714,12 +1714,15 @@ class Gfx1250Pipeline:
             ctx.planned_end * KV_COMPUTE_BLOCK,
         )
         # Q loads overlap the table lookup and the first page's DMA issue;
-        # the LDS regions are disjoint.
-        if const_expr(t.q_tiles == t.m_tiles):
+        # the LDS regions are disjoint. Wider heads keep fewer Q registers live.
+        early_query = t.q_tiles == t.m_tiles and t.head_dim <= 256
+        if const_expr(early_query):
             q_tiles = self.mem.load_query()
         self.mem.stage_kv(begin, fx.Int32(0))
-        if const_expr(t.q_tiles == t.m_tiles):
+        if const_expr(early_query):
             self.mem.store_query(q_tiles)
+        elif const_expr(t.q_tiles == t.m_tiles):
+            self.mem.stage_query()
         # Per-M-tile state: maximum, denominator, then wave-owned D fragments.
         vh_count = t.head_dim // 64
         initial = []
