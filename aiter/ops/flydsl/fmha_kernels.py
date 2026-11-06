@@ -859,8 +859,6 @@ def flydsl_flash_attn_paged_fwd(
     # return wrong numbers, so each one falls through.
     if logits_soft_cap != 0.0 or block_table is not None or seqlen_k is not None:
         return None
-    if any(d is not None for d in (q_descale, k_descale, v_descale)):
-        return None
     if any(t.stride(-1) != 1 for t in (q, k, v)):
         return None
     if (
@@ -875,6 +873,13 @@ def flydsl_flash_attn_paged_fwd(
     # 8-bit Q/K/V go to the a8w8 sibling, which writes bf16 output; everything else to
     # a16w16, whose output follows the input.
     _is_b8 = q.dtype in _A8W8_GFX1250_IN_DTYPES
+    # a8w8 applies per-tensor fp32 descales (gfx950's contract); a16w16 has none,
+    # and a partial set is ambiguous, so both fall through.
+    _descales = (q_descale, k_descale, v_descale)
+    if any(d is not None for d in _descales) and not (
+        _is_b8 and all(_is_per_tensor_descale(d, q) for d in _descales)
+    ):
+        return None
     _supported = (
         flash_attn_a8w8_gfx1250_supported
         if _is_b8
@@ -912,6 +917,13 @@ def flydsl_flash_attn_paged_fwd(
     _entry = (
         flash_attn_paged_a8w8_gfx1250 if _is_b8 else flash_attn_paged_a16w16_gfx1250
     )
+    # a16w16 has no descale parameters at all; the gate above already guaranteed none
+    # were given in that case, so only the 8-bit entry is handed them.
+    _descale_kwargs = (
+        {"q_descale": q_descale, "k_descale": k_descale, "v_descale": v_descale}
+        if _is_b8
+        else {}
+    )
     return _entry(
         q,
         k,
@@ -928,6 +940,7 @@ def flydsl_flash_attn_paged_fwd(
         out=out,
         return_lse=return_lse,
         sink=sink,
+        **_descale_kwargs,
     )
 
 

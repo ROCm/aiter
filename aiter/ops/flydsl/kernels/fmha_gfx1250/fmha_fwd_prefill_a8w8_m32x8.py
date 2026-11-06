@@ -2504,6 +2504,9 @@ def build_fmha_fwd_prefill_a8w8_m32x8(
             ptr_V: fx.Pointer,
             ptr_LSE: fx.Pointer,
             ptr_sink: fx.Pointer,
+            ptr_q_descale: fx.Pointer,
+            ptr_k_descale: fx.Pointer,
+            ptr_v_descale: fx.Pointer,
             ptr_cu_seqlens_q: fx.Pointer,
             ptr_kv_indptr: fx.Pointer,
             ptr_kv_page_indices: fx.Pointer,
@@ -2560,6 +2563,17 @@ def build_fmha_fwd_prefill_a8w8_m32x8(
 
             # The grid is sized for max_seqlen_q, so in a ragged batch a short sequence
             # leaves whole WGs past its end with no row to compute AND none to zero.
+            # Per-tensor descales, as gfx950 does: q/k scale the fp32 logits (so they
+            # ride softmax_scale and reach the LSE through m), v scales O alone.
+            if const_expr(HAS_DESCALE):
+                _softmax_scale = softmax_scale * (
+                    _load_descale(ptr_q_descale) * _load_descale(ptr_k_descale)
+                )
+                _v_descale = _load_descale(ptr_v_descale)
+            else:
+                _softmax_scale = softmax_scale
+                _v_descale = None
+
             first_row = _m_tile_idx() * fx.Int32(_block_m(NUM_Q_TILES))
             tile_has_rows = first_row < q_len * fx.Int32(GQA_RATIO)
             # An empty batch must not enter the core: kv_len==0 would write O/0 = NaN.
@@ -2580,7 +2594,8 @@ def build_fmha_fwd_prefill_a8w8_m32x8(
                     "ptr_V": ptr_V,
                     "ptr_LSE": ptr_LSE,
                     "ptr_sink": ptr_sink,
-                    "softmax_scale": softmax_scale,
+                    "softmax_scale": _softmax_scale,
+                    "v_descale": _v_descale,
                     "stride_q_seq": stride_q_seq,
                     "stride_k_seq": stride_k_seq,
                     "stride_v_seq": stride_v_seq,
@@ -3131,6 +3146,7 @@ def _ensure_paged_kernel(
     mask_right: bool,
     return_lse: bool,
     has_sink: bool,
+    has_descale: bool,
     gqa_ratio: int,
     page_size: int,
     qk_hdim: int = DEFAULT_QK_HDIM,
@@ -3145,6 +3161,7 @@ def _ensure_paged_kernel(
         bool(mask_right),
         bool(return_lse),
         bool(has_sink),
+        bool(has_descale),
         int(gqa_ratio),
         int(qk_hdim),
         int(v_hdim),
@@ -3165,6 +3182,7 @@ def _ensure_paged_kernel(
         one_kv_tile=False,
         return_lse=return_lse,
         has_sink=has_sink,
+        has_descale=has_descale,
         gqa_ratio=gqa_ratio,
         q_dtype_str=q_dtype_str,
         kv_dtype_str=kv_dtype_str,
@@ -3180,6 +3198,9 @@ def _ensure_paged_kernel(
         ptr_V: fx.Pointer,
         ptr_LSE: fx.Pointer,
         ptr_sink: fx.Pointer,
+        ptr_q_descale: fx.Pointer,
+        ptr_k_descale: fx.Pointer,
+        ptr_v_descale: fx.Pointer,
         ptr_cu_seqlens_q: fx.Pointer,
         ptr_kv_indptr: fx.Pointer,
         ptr_kv_page_indices: fx.Pointer,
@@ -3220,6 +3241,9 @@ def _ensure_paged_kernel(
             ptr_V,
             ptr_LSE,
             ptr_sink,
+            ptr_q_descale,
+            ptr_k_descale,
+            ptr_v_descale,
             ptr_cu_seqlens_q,
             ptr_kv_indptr,
             ptr_kv_page_indices,
@@ -3658,6 +3682,9 @@ def flash_attn_paged_a8w8_m32x8(
     return_lse=False,
     sink=None,
     lse=None,
+    q_descale=None,
+    k_descale=None,
+    v_descale=None,
     num_q_tiles_per_wave=None,
 ):
     """Host entry — PAGED KV, qk_hdim in {64,128,256} / v_hdim in {64,128,256}, bf16 or fp16.
@@ -3736,6 +3763,22 @@ def flash_attn_paged_a8w8_m32x8(
     # ptr_sink is only read when has_sink; pass q as a valid placeholder otherwise.
     sink_ptr = sink if has_sink else q
 
+    # Per-tensor fp32 descales, all three or none, as gfx950 requires. Presence is
+    # compile-time; the pointers are always passed, with q as a placeholder when unused.
+    _descales = (q_descale, k_descale, v_descale)
+    has_descale = any(d is not None for d in _descales)
+    if has_descale:
+        assert all(
+            d is not None for d in _descales
+        ), "q/k/v_descale must be given together"
+        for _name, _d in zip(("q", "k", "v"), _descales):
+            assert (
+                torch.is_tensor(_d) and _d.dtype == torch.float32
+            ), f"{_name}_descale must be a float32 tensor, got {type(_d)}"
+            assert _d.numel() == 1, f"{_name}_descale must hold one element"
+            assert _d.device == q.device, f"{_name}_descale must be on {q.device}"
+    qd_ptr, kd_ptr, vd_ptr = _descales if has_descale else (q, q, q)
+
     if softmax_scale is None:
         softmax_scale = 1.0 / (q.shape[-1] ** 0.5)
 
@@ -3790,6 +3833,7 @@ def flash_attn_paged_a8w8_m32x8(
         mask_right,
         bool(return_lse),
         has_sink,
+        has_descale,
         gqa,
         page_size,
         qk_hdim=qk_hdim,
@@ -3807,6 +3851,7 @@ def flash_attn_paged_a8w8_m32x8(
                 mask_right,
                 bool(return_lse),
                 has_sink,
+                has_descale,
                 gqa,
                 qk_hdim,
                 v_hdim,
@@ -3822,6 +3867,9 @@ def flash_attn_paged_a8w8_m32x8(
         v,
         lse_ptr,
         sink_ptr,
+        qd_ptr,
+        kd_ptr,
+        vd_ptr,
         qo_indptr,
         kv_indptr,
         kv_page_indices,
