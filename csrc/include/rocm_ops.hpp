@@ -671,8 +671,9 @@ namespace py = pybind11;
           py::arg("reg_ptr"),                                                        \
           py::arg("reg_bytes"),                                                      \
           py::arg("use_1stage"),                                                     \
-          py::arg("bf16_out_ptr") = static_cast<int64_t>(0),                         \
-          py::arg("gemma_norm")   = false);                                          \
+          py::arg("bf16_out_ptr")    = static_cast<int64_t>(0),                      \
+          py::arg("gemma_norm")      = false,                                        \
+          py::arg("hadamard_rotate") = false);                                       \
     m.def("fused_qknorm_allreduce",                                                  \
           &aiter::fused_qknorm_allreduce,                                            \
           py::arg("_fa"),                                                            \
@@ -1698,7 +1699,8 @@ namespace py = pybind11;
           py::arg("shuffle_scale")   = true,                             \
           py::arg("num_rows")        = std::nullopt,                     \
           py::arg("num_rows_factor") = 1,                                \
-          py::arg("scale_layout_m32k4") = false);                        \
+          py::arg("scale_layout_m32k4") = false,                         \
+          py::arg("hadamard_rotate") = false);                           \
     m.def("mxfp8_ep_quant", &aiter::mxfp8_ep_quant,                       \
           py::arg("out"), py::arg("input"),                             \
           py::arg("scales"), py::arg("num_rows"));                      \
