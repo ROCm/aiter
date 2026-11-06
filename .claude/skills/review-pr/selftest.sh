@@ -184,6 +184,82 @@ printf 'Review (advisory): \342\232\240 NEEDS WORK\n\342\232\240 a reported find
 rc=0; python3 "$S/triage.py" independent "$tmp/independent.txt" "$tmp/card.md" >/dev/null 2>&1 || rc=$?
 t "a silent downgrade is rejected" "$rc" "1"
 
+echo "[design gate]"
+# Step 7.8's gate, driven like the independent gate above. The routing is the checkable
+# half -- the person is on the roster and not the author, the size is the PR's real size,
+# an over-bar PR routes a split -- and a routing gate that cannot go red is a rubber stamp,
+# so each rule gets its negative case here.
+design_gate() {  # <design.txt> <card.md> <reviewers.txt> <pr_meta.json> -> problem kinds, or "routed"
+  local d out rc; d=$(mktemp -d)
+  printf '%s\n' "$1" > "$d/design.txt"
+  printf '%s\n' "$2" > "$d/card.md"
+  printf '%s\n' "$3" > "$d/reviewers.txt"
+  printf '%s' "$4" > "$d/pr_meta.json"
+  out=$(python3 "$S/triage.py" design "$d/design.txt" "$d/card.md" \
+        "$d/reviewers.txt" "$d/pr_meta.json" 2>/dev/null); rc=$?
+  rm -rf "$d"
+  if [ "$rc" -eq 0 ]; then echo routed
+  else printf '%s\n' "$out" | grep -E '^[A-Z][A-Z -]+:' | sed 's/:.*//' | paste -sd, -; fi
+}
+dg_roster='# roster
+bob (git-log, aiter/fused_moe.py)
+carol
+alice'
+dg_meta_small='{"title":"fix the moe gate","author":{"login":"alice"},"files":[{"path":"aiter/fused_moe.py","additions":20,"deletions":5}]}'
+dg_meta_wide='{"title":"fix the moe gate","author":{"login":"alice"},"files":[{"path":"aiter/fused_moe.py","additions":20,"deletions":5},{"path":"aiter/mla.py","additions":3,"deletions":1}]}'
+dg_meta_big='{"title":"fix the moe gate","author":{"login":"alice"},"files":[{"path":"aiter/fused_moe.py","additions":1200,"deletions":0}]}'
+dg_design='DESIGN: route the expert through the per-expert gate rather than the shared one
+HUMAN: recommend bob review whether the per-expert gate in fused_moe.py holds at TP=8'
+dg_card='Review (advisory): NEEDS WORK
+Size: 25 lines / 1 files
+Design (advisory): route the expert through the per-expert gate rather than the shared one
+Human: recommend bob review whether the per-expert gate in fused_moe.py holds at TP=8'
+t "a routed design passes" "$(design_gate "$dg_design" "$dg_card" "$dg_roster" "$dg_meta_small")" "routed"
+t "a card with no Size line is rejected" \
+  "$(design_gate "$dg_design" "$(printf '%s\n' "$dg_card" | grep -v '^Size:')" "$dg_roster" "$dg_meta_small")" "UNREPORTED-SIZE"
+t "an empty design.txt is a skipped step" \
+  "$(design_gate '' "$dg_card" "$dg_roster" "$dg_meta_small")" "DESIGN MISSING"
+t "a size the PR does not have is rejected" \
+  "$(design_gate "$dg_design" "$dg_card" "$dg_roster" "$dg_meta_wide")" "SIZE-MISMATCH"
+t "an off-roster person is rejected" \
+  "$(design_gate 'DESIGN: route the expert through the per-expert gate rather than the shared one
+HUMAN: recommend dave review whether the per-expert gate in fused_moe.py holds at TP=8' \
+    'Review (advisory): NEEDS WORK
+Size: 25 lines / 1 files
+Design (advisory): route the expert through the per-expert gate rather than the shared one
+Human: recommend dave review whether the per-expert gate in fused_moe.py holds at TP=8' \
+    "$dg_roster" "$dg_meta_small")" "OFF-ROSTER"
+t "routing back to the PR author is rejected" \
+  "$(design_gate 'DESIGN: route the expert through the per-expert gate rather than the shared one
+HUMAN: recommend alice review whether the per-expert gate in fused_moe.py holds at TP=8' \
+    'Review (advisory): NEEDS WORK
+Size: 25 lines / 1 files
+Design (advisory): route the expert through the per-expert gate rather than the shared one
+Human: recommend alice review whether the per-expert gate in fused_moe.py holds at TP=8' \
+    "$dg_roster" "$dg_meta_small")" "SELF-ROUTED"
+t "a question about nothing in the PR is rejected" \
+  "$(design_gate 'DESIGN: route the expert through the per-expert gate rather than the shared one
+HUMAN: recommend bob review whether this overall approach makes sense at all' \
+    'Review (advisory): NEEDS WORK
+Size: 25 lines / 1 files
+Design (advisory): route the expert through the per-expert gate rather than the shared one
+Human: recommend bob review whether this overall approach makes sense at all' \
+    "$dg_roster" "$dg_meta_small")" "UNANCHORED"
+dg_split_card='Review (advisory): NEEDS WORK
+Size: 1200 lines / 1 files — over the review bar
+Design (advisory): SPLIT -- the gate change and the cache layout change are separable stacks
+Human: recommend bob review whether the fused_moe.py split keeps the gate change reviewable'
+t "an over-bar PR that routes its split passes" \
+  "$(design_gate 'DESIGN: SPLIT -- the gate change and the cache layout change are separable stacks
+HUMAN: recommend bob review whether the fused_moe.py split keeps the gate change reviewable' \
+    "$dg_split_card" "$dg_roster" "$dg_meta_big")" "routed"
+t "an over-bar PR without a split design is rejected" \
+  "$(design_gate "$dg_design" 'Review (advisory): NEEDS WORK
+Size: 1200 lines / 1 files — over the review bar
+Design (advisory): route the expert through the per-expert gate rather than the shared one
+Human: recommend bob review whether the per-expert gate in fused_moe.py holds at TP=8' \
+    "$dg_roster" "$dg_meta_big")" "UNSPLIT"
+
 echo "[derive]"
 # Families for a synthetic diff, run through the shipping parse() + derive().
 fams() {  # <diff text> -> space-separated family names
