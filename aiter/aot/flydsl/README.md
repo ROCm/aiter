@@ -96,8 +96,9 @@ variant of the profile's bundle plan.
   process group or mori install is needed.
 - The device reports itself as an MI355X, because the combine launch geometry
   is tuned per GPU model.
-- `quantize()` is replayed too: `preload_aot_bundles()` leaves it out, but
-  fixed-slot `forward` and the per-stage benchmarks call it.
+- The input quant kernel is replayed too (through `quantize()`):
+  `preload_aot_bundles()` leaves it out, but fixed-slot `forward`, `quantize()`
+  and the per-stage benchmarks launch it.
 - The instance builds every route of its plan. Where the layout supports the
   fused routes (DeepSeek-V4-Pro EP8 a8w4), `preload_aot_bundles()` also loads
   the small-input kernel of every token bucket of each reachable small-input

@@ -1209,14 +1209,20 @@ def build_mega_moe_bundle_plan(
 
 
 # Small- and large-input (fused) routes. Their kernels take the same config
-# types as the staged path, tuned on their own: the small-input kernel uses
-# fixed slots per token bucket, the large-input kernel one config per capacity.
+# types as the staged path, tuned on their own for the one layout they support
+# (fused_layout_supported): the small-input kernel per token bucket, the
+# large-input kernel one config per capacity.
+
+# Small-input token bucket from which the expert m-tile is 64 rows: at ~35+
+# rows per expert a 32-row tile splits every expert in two and streams its
+# weights twice.
+SMALL_M_BM64_MIN_BUCKET = 256
 
 
 def _small_m_stage1(bucket: int) -> Stage1Config:
     grid_mult = max(1, bucket // 4) if bucket <= 16 else 3
     return Stage1Config(
-        sort_block_m=32,
+        sort_block_m=64 if bucket >= SMALL_M_BM64_MIN_BUCKET else 32,
         tile_n=256 if bucket <= 8 else 128,
         num_waves=4,
         grid_mult=grid_mult,
@@ -1229,25 +1235,22 @@ def _small_m_stage1(bucket: int) -> Stage1Config:
     )
 
 
-def _small_m_stage2(bucket: int, model_dim: int) -> Stage2Config:
-    block_n = 256 if bucket in (1, 4, 64) or bucket >= 1024 else 128
-    if model_dim < 4096:
-        block_n = 128
-    persist = bucket >= 128
+def _small_m_stage2(bucket: int) -> Stage2Config:
+    # GEMM2 runs in the kernel's own grid (never persistent) with NT B loads.
     return Stage2Config(
-        block_m=32,
-        block_n=block_n,
-        persist=persist,
-        persist_cu=128 if bucket == 256 else 240 if persist else 0,
-        use_nt=bucket <= 128,
-        persist_strided=512 <= bucket <= 1024,
+        block_m=64 if bucket >= SMALL_M_BM64_MIN_BUCKET else 32,
+        block_n=256 if bucket in (1, 4, 64) or bucket >= 128 else 128,
+        persist=False,
+        persist_cu=0,
+        use_nt=True,
+        persist_strided=bucket == 512,
     )
 
 
-def _large_m_config(model_dim: int, inter_dim: int) -> MegaMoEConfig:
+def _large_m_config() -> MegaMoEConfig:
     stage1 = Stage1Config(
         sort_block_m=128,
-        tile_n=512 if inter_dim >= 2048 else 256,
+        tile_n=512,
         num_waves=8,
         grid_mult=1,
         num_dispatch_cu=96,
@@ -1260,7 +1263,7 @@ def _large_m_config(model_dim: int, inter_dim: int) -> MegaMoEConfig:
     )
     stage2 = Stage2Config(
         block_m=64,
-        block_n=128 if model_dim < 4096 else 256,
+        block_n=256,
         persist=True,
         persist_cu=240,
         use_nt=False,
@@ -1270,35 +1273,23 @@ def _large_m_config(model_dim: int, inter_dim: int) -> MegaMoEConfig:
 
 
 @cache
-def _fused_config(
-    bucket: int, mtpr: int, model_dim: int, inter_dim: int
-) -> MegaMoEConfig:
+def _fused_config(bucket: int, mtpr: int) -> MegaMoEConfig:
     if mtpr in LARGE_M_MTPRS:
-        return _large_m_config(model_dim, inter_dim)
-    stage1 = _small_m_stage1(bucket)
-    stage2 = _small_m_stage2(bucket, model_dim)
-    return MegaMoEConfig(stage1=stage1, stage2=stage2, p2p_quant="none")
+        return _large_m_config()
+    return MegaMoEConfig(
+        stage1=_small_m_stage1(bucket), stage2=_small_m_stage2(bucket), p2p_quant="none"
+    )
 
 
-def select_fused_config(
-    tokens: int,
-    mtpr: int,
-    *,
-    experts_per_rank: int = REFERENCE_EXPERTS_PER_RANK,
-    model_dim: int = 7168,
-    inter_dim: int = 3072,
-) -> MegaMoEConfig:
-    """Small-input (MTPR <= SMALL_M_MAX_MTPR) or large-input (MTPR in LARGE_M_MTPRS) config for ``tokens`` per rank."""
+def select_fused_config(tokens: int, mtpr: int) -> MegaMoEConfig:
+    """Small-input (MTPR <= SMALL_M_MAX_MTPR) or large-input (MTPR in LARGE_M_MTPRS)
+    config for ``tokens`` rows on a rank; an idle rank takes the 1-token config."""
     if mtpr <= 0 or mtpr & (mtpr - 1):
         raise ValueError(f"mtpr={mtpr} must be a positive power of two")
     if mtpr > SMALL_M_MAX_MTPR and mtpr not in LARGE_M_MTPRS:
         raise ValueError(f"no small- or large-input config for mtpr={mtpr}")
-    if tokens > mtpr:
-        raise ValueError(f"tokens={tokens} exceeds mtpr={mtpr}")
-    if experts_per_rank <= 0 or experts_per_rank > 64:
-        raise ValueError(f"experts_per_rank must be in [1, 64], got {experts_per_rank}")
-    if model_dim <= 0 or inter_dim <= 0:
-        raise ValueError(f"invalid model shape {model_dim}x{inter_dim}")
+    if not 0 <= tokens <= mtpr:
+        raise ValueError(f"tokens={tokens} must be in [0, {mtpr}]")
     return _fused_config(
-        nearest_token_bucket(tokens, FUSED_TOKEN_BUCKETS), mtpr, model_dim, inter_dim
+        nearest_token_bucket(max(tokens, 1), FUSED_TOKEN_BUCKETS), mtpr
     )

@@ -756,6 +756,15 @@ class FlyDSLDispatchCombineIntraNodeOp:
         self._fx_tis = self._fx_out_shmem_tok_id_to_src
         ms.shmem_barrier_all()
 
+    def combine_output(self, rows):
+        """The first ``rows`` rows of the combine output buffer, as [rows, token view dim]."""
+        cfg = self.cfg
+        return (
+            self.shmem_comb_out_tok.view(torch.int8)[: rows * cfg.combine_token_bytes]
+            .view(cfg.combine_dtype)
+            .view(rows, cfg.combine_token_view_dim)
+        )
+
     def load_tuning_config(self, path=None):
         """Build and attach the geometry tuning table for this op's shape."""
         self.cfg.tuning_table = build_geometry_tuning_table_for_config(self.cfg, path)

@@ -4,8 +4,10 @@
 
 One MegaMoEV2 built at MTPR 8192 with small-input runtimes next to it
 (small_m_mtprs, default 256 and 512). Checks accuracy against an fp32
-reference and the main path (uneven, idle, padded ranks), per-layer weight
-rebinding with interleaved main calls, CUDA graph replay, and paired timing.
+reference and the instance's staged route (uneven, idle, padded ranks),
+per-layer weight rebinding with interleaved staged calls, the large-input
+route's epoch wrap when the instance has one, CUDA graph replay, and paired
+timing against the staged route.
 
     torchrun --nproc-per-node 8 test_mega_moe_small_m.py
     # against a same-MTPR main path, timing only:
@@ -36,6 +38,10 @@ from test_mega_moe_v2 import (
 
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.kernels.mega_moe import MegaMoEV2
+from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import (
+    ROUTE_LARGE_M,
+    ROUTE_STAGED,
+)
 
 
 def _rel_l2(out, ref):
@@ -53,9 +59,13 @@ def _all_true(flag, device):
 
 
 def _main_forward(moe, x, w, ids):
-    """The instance's own route for its capacity, with the small-input route left out."""
-    route = moe._route(x.shape[0], None, small_m=False)
-    return moe._forward_route(route, x, w, ids)[: x.shape[0]]
+    """The staged route of the instance (the accuracy and timing reference)."""
+    return moe._forward_route((ROUTE_STAGED, moe.mtpr), x, w, ids)[: x.shape[0]]
+
+
+def _large_forward(moe, x, w, ids):
+    """The large-input route of the instance."""
+    return moe._forward_route((ROUTE_LARGE_M, moe.mtpr), x, w, ids)[: x.shape[0]]
 
 
 def _rank_case(tokens_per_rank, rank, x, w, ids, experts, pad_rows=0):
@@ -89,14 +99,14 @@ def _check_epoch_wrap_and_zero_rows(moe, bind, case, large_case, device):
         mism += 1
     if (
         moe._large_m is not None
-        and _main_forward(moe, empty_x, empty_w, empty_i).shape[0] != 0
+        and _large_forward(moe, empty_x, empty_w, empty_i).shape[0] != 0
     ):
         mism += 1
 
     xi, wi, ii, expect, real, mt = case
     large_expect = None
     if large_case is not None:
-        large_expect = _main_forward(moe, *large_case[:3])[: large_case[4]].clone()
+        large_expect = _large_forward(moe, *large_case[:3])[: large_case[4]].clone()
     for base in (2**31 - 2, 2**32 - 2):
         _barrier()
         for runtime in moe._small_m_runtimes:
@@ -114,7 +124,7 @@ def _check_epoch_wrap_and_zero_rows(moe, bind, case, large_case, device):
             out = moe.forward_small_m(xi, wi, ii, max_tokens=mt)[:real]
             mism += int((out != expect[:real]).any(dim=-1).sum().item())
             if large_expect is not None:
-                out = _main_forward(moe, *large_case[:3])[: large_case[4]]
+                out = _large_forward(moe, *large_case[:3])[: large_case[4]]
                 mism += int((out != large_expect).any(dim=-1).sum().item())
     total = torch.tensor(mism, device=device)
     dist.all_reduce(total)
@@ -491,7 +501,7 @@ def run(args):
             res = {}
             paths = [
                 (
-                    "main" if not large_m else "large_m",
+                    "staged",
                     lambda tx=tx, tw=tw, ti=ti: _main_forward(moe, tx, tw, ti),
                 )
             ]

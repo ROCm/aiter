@@ -59,12 +59,21 @@ from .mega_moe_fused_gemm import (
     store_at,
 )
 from .mega_moe_stage1 import _validate_dispatch_capacity, stage1_output_buffers
-from .mega_moe_stage2 import _fp8_scale_for_leader, _stage2_lds_bytes
+from .mega_moe_stage2 import (
+    _fp8_scale_for_leader,
+    _stage2_lds_bytes,
+    stage2_p2p_row_nbytes,
+)
 
 __all__ = ["LargeMRuntime"]
 from .quant import _get_launcher as _get_quant_launcher
 from .quant import per_1x32_mx_quant
-from .weights import check_bindable, contiguous_weights, weight_spec
+from .weights import (
+    check_bindable,
+    check_forward_inputs,
+    contiguous_weights,
+    weight_spec,
+)
 
 
 class DispatchSlot(IntEnum):
@@ -987,16 +996,6 @@ def p2p_scatter_epilog(lds_acc_base, accm, n_block_idx, wave, lane, *, N_OUT, BM
 
 
 
-_P2P_ROW_NBYTES = {"none": lambda n: n * 2, "fp8_blockwise_1x32": lambda n: n + n // 32}
-
-
-def stage2_p2p_row_nbytes(model_dim, p2p_quant_type):
-    """Receiver row stride for one (token, top-k slot) under the selected transport format."""
-    if p2p_quant_type not in _P2P_ROW_NBYTES:
-        raise ValueError(f"unsupported p2p_quant_type={p2p_quant_type!r}")
-    return int(_P2P_ROW_NBYTES[p2p_quant_type](int(model_dim)))
-
-
 # fmt: off
 def derive_stage2_emit_constants(*, model_dim, topk, rank, npes, max_tok, experts, BM, BN, BK, NW=4,
     a_dtype="fp8", recv_cap=None, comb_inp_nbytes=None, g2_bf16_lds=False, p2p_quant_type="none",
@@ -1011,8 +1010,6 @@ def derive_stage2_emit_constants(*, model_dim, topk, rank, npes, max_tok, expert
         raise ValueError(f"BM={BM} must be divisible by NW={NW} (A-load rows / scatter rows per wave)")
     if BN // 8 > 64:
         raise ValueError(f"BN={BN} exceeds one 64-lane scatter row (BN // 8 <= 64)")
-    if p2p_quant_type not in _P2P_ROW_NBYTES:
-        raise ValueError(f"unsupported p2p_quant_type={p2p_quant_type!r}")
     if p2p_quant_type == "fp8_blockwise_1x32" and g2_bf16_lds:
         raise ValueError("fp8_blockwise_1x32 requires f32 CShuffle input (g2_bf16_lds=False)")
     if (BN // NW) // 16 >= 2 and ((BN // NW) // 16) % 2 != 0:
@@ -1194,7 +1191,7 @@ def large_m_kernel_specs(
         stage2.b_hoist, stage2.ascale_prefetch, stage2.spatial_partition, False, False
     )
     # The P2P rows are FP8 with one E8M0 scale per 32 values.
-    row_nbytes = model_dim + model_dim // 32
+    row_nbytes = stage2_p2p_row_nbytes(model_dim, "fp8_blockwise_1x32")
     # fmt: off
     s2_spec = (
         ("model_dim", model_dim), ("topk", topk), ("rank", rank), ("npes", npes), ("max_tok", mtpr),
@@ -2239,13 +2236,7 @@ class LargeMRuntime:
         self.select_layer_state(layer_slot)
 
     def _select_config(self, tokens: int) -> MegaMoEConfig:
-        config = select_fused_config(
-            tokens,
-            self.mtpr,
-            experts_per_rank=self.epr,
-            model_dim=self.model_dim,
-            inter_dim=self.inter_dim,
-        )
+        config = select_fused_config(tokens, self.mtpr)
         self._active_config = config
         return config
 
@@ -2320,14 +2311,7 @@ class LargeMRuntime:
         # cross-rank wire protocol, so every rank selects the MTPR config.
         config = self._select_config(self.mtpr)
         self._run_fused_stage1(x, wts, scales, topk_ids, stream, config)
-        cfg = self.comb_cfg
-        out_tok = (
-            self.comb_op.shmem_comb_out_tok.view(torch.int8)[
-                : self.mtpr * cfg.combine_token_bytes
-            ]
-            .view(cfg.combine_dtype)
-            .view(self.mtpr, cfg.combine_token_view_dim)
-        )
+        out_tok = self.comb_op.combine_output(self.mtpr)
         return out_tok[:run_tokens] if slice_output else out_tok
 
     def _allocate_fused_counters(self):
@@ -2418,18 +2402,9 @@ class LargeMRuntime:
         )
 
     def forward(self, x_bf16, wts, topk_ids, *, stream=None, slice_output=True):
-        run_tokens = int(x_bf16.shape[0])
-        if run_tokens > self.mtpr:
-            raise ValueError(f"run_tokens={run_tokens} > max_tok_per_rank={self.mtpr}")
-        if x_bf16.dtype != torch.bfloat16 or not x_bf16.is_contiguous():
-            raise ValueError("x_bf16 must be contiguous bfloat16")
-        if wts.dtype != torch.float32 or not wts.is_contiguous():
-            raise ValueError("wts must be contiguous float32")
-        if topk_ids.dtype != torch.int32 or not topk_ids.is_contiguous():
-            raise ValueError("topk_ids must be contiguous int32")
-        if any(t.device != self.dev for t in (x_bf16, wts, topk_ids)):
-            # A rank that faults on a foreign pointer would leave its peers waiting.
-            raise ValueError(f"x_bf16, wts and topk_ids must be on {self.dev}")
+        run_tokens = check_forward_inputs(
+            x_bf16, wts, topk_ids, max_rows=self.mtpr, model_dim=self.model_dim, topk=self.topk, device=self.dev
+        )
         # The quant kernel runs on the launch stream, ahead of the persistent kernel
         # that reads its output, into the runtime's own buffers (no allocation).
         x_q = self._quant_x[:run_tokens]

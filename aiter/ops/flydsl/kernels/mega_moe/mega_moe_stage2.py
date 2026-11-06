@@ -286,6 +286,16 @@ def p2p_scatter_epilog(lds_acc_base, accm, n_block_idx, wave, lane, *, N_OUT, BM
             )
 
 
+_P2P_ROW_NBYTES = {"none": lambda n: n * 2, "fp8_blockwise_1x32": lambda n: n + n // 32}
+
+
+def stage2_p2p_row_nbytes(model_dim, p2p_quant_type):
+    """Receiver row stride for one (token, top-k slot) under the selected transport format."""
+    if p2p_quant_type not in _P2P_ROW_NBYTES:
+        raise ValueError(f"unsupported p2p_quant_type={p2p_quant_type!r}")
+    return int(_P2P_ROW_NBYTES[p2p_quant_type](int(model_dim)))
+
+
 def _stage2_lds_bytes(BM, BN, BK, a_dtype, aStages, g2_bf16_lds=False):
     is_f8 = a_dtype == "fp8"
     KH_TILE_A = BK // (1 if is_f8 else 2)

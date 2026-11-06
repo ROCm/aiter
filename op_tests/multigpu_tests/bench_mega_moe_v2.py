@@ -1,6 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Compare online-faithful Mori EP and MegaMoEV2 on a v4_pro A8W4 workload."""
+"""Compare online-faithful Mori EP and MegaMoEV2 on a v4_pro A8W4 workload.
+
+MegaMoEV2 is pinned to its staged route (the one the Stage1/Stage2 variants
+tune); the small- and large-input routes are measured by
+test_mega_moe_small_m.py and test_mega_moe_v2.py --expect-large-m.
+"""
 
 from __future__ import annotations
 

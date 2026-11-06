@@ -13,6 +13,9 @@ import pytest
 pytest.importorskip("flydsl", reason="MegaMoE is built with FlyDSL")
 pytest.importorskip("mori.shmem", reason="MegaMoE's runtime imports mori")
 
+import hashlib  # noqa: E402
+from dataclasses import astuple  # noqa: E402
+
 from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import (  # noqa: E402
     DEFAULT_SMALL_M_MTPRS,
     LARGE_M_MIN_TOKENS,
@@ -22,6 +25,7 @@ from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import (  # noqa: E402
     ROUTE_STAGED,
     TOKEN_BUCKETS,
     build_mega_moe_bundle_plan,
+    select_fused_config,
     fused_layout_supported,
     small_m_cu_supported,
     small_m_mtprs_for,
@@ -122,3 +126,56 @@ def test_large_m_capacity_validated():
         else:
             with pytest.raises(ValueError):
                 _plan(mtpr, large=True)
+
+
+# Every fused launch config, as recorded before the fused selector moved into
+# mega_moe_config: the move must not change one of them. On a mismatch the
+# assertion shows the current table.
+_FUSED_CASES = (
+    (256, 0),
+    (256, 1),
+    (256, 2),
+    (256, 3),
+    (256, 5),
+    (256, 16),
+    (256, 17),
+    (256, 100),
+    (256, 128),
+    (256, 200),
+    (256, 255),
+    (256, 256),
+    (512, 0),
+    (512, 1),
+    (512, 2),
+    (512, 3),
+    (512, 5),
+    (512, 16),
+    (512, 17),
+    (512, 100),
+    (512, 128),
+    (512, 200),
+    (512, 255),
+    (512, 256),
+    (512, 300),
+    (512, 511),
+    (512, 512),
+    (1024, 1024),
+    (2048, 2048),
+    (4096, 4096),
+    (8192, 8192),
+    (16384, 16384),
+)
+_FUSED_DIGEST = "f8cb680aa7ec3e668f98ed9a71a485c0bdbe703735cbf6477622cb4ae36b0666"
+
+
+def test_fused_configs_unchanged():
+    table = {}
+    for mtpr, tokens in _FUSED_CASES:
+        config = select_fused_config(tokens, mtpr)
+        table[(mtpr, tokens)] = (
+            astuple(config.stage1),
+            astuple(config.stage2),
+            config.p2p_quant,
+        )
+    digest = hashlib.sha256(repr(sorted(table.items())).encode()).hexdigest()
+    assert digest == _FUSED_DIGEST, table
