@@ -1,4 +1,16 @@
 {
+  "gemm_a8w8_blockscale": {
+    "fingerprint": "47ec95c460883544",
+    "signature": "XQ:positional:Tensor, WQ:positional:Tensor, x_scale:positional:Tensor, w_scale:positional:Tensor, dtype:positional:torch.dtype=dtypes.bf16, isBpreshuffled:positional:bool=False, split_k:positional:int | None=None, -> torch.Tensor",
+    "source": "aiter/ops/gemm_op_a8w8.py",
+    "version": 1
+  },
+  "gemm_a8w8_blockscale_bpreshuffle": {
+    "fingerprint": "dd8528ae4b58d9bb",
+    "signature": "XQ:positional:Tensor, WQ:positional:Tensor, x_scale:positional:Tensor, w_scale:positional:Tensor, dtype:positional:torch.dtype=dtypes.bf16, out:positional:Tensor | None=None, -> Tensor",
+    "source": "aiter/ops/gemm_op_a8w8.py",
+    "version": 1
+  },
   "pertoken_quant": {
     "fingerprint": "ffb84335bd354c41",
     "signature": "x:positional, scale:positional=None, x_scale:positional=None, scale_dtype:positional=dtypes.fp32, quant_dtype:positional=dtypes.i8, dtypeMax:positional=None",
