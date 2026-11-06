@@ -839,6 +839,7 @@ class Gfx1250Traits:
     cluster_task_stride: int = 0
     plan_tile_tokens: int = 256
     single_task_tile: bool = False
+    direct_context: bool = False
 
     WAVE = 32
     NWARP = 4

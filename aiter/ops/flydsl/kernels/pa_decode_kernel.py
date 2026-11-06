@@ -290,6 +290,10 @@ def compile_pa_decode_tile(
             cluster_task_stride=cluster_task_stride,
             plan_tile_tokens=plan_tile_tokens,
             single_task_tile=single_task_tile,
+            direct_context=direct_output
+            and num_partitions == 1
+            and sliding_window == 0
+            and num_seqs <= 4 * num_compute_units,
         )
     if plan_tile_tokens != KV_COMPUTE_BLOCK:
         raise ValueError("128-token work plans require gfx1250 tile kernels")
@@ -571,6 +575,7 @@ def compile_gfx1250_pa_decode(
     cluster_task_stride=0,
     plan_tile_tokens=256,
     single_task_tile=False,
+    direct_context=False,
 ):
     """Compile a gfx1250 tile kernel; merging partitions writes final output.
 
@@ -590,6 +595,9 @@ def compile_gfx1250_pa_decode(
     one KV buffer and skip its final reuse barrier; BF16 wave merge keeps two.
     ``plan_tile_tokens`` matches the plan's 128/256-token units; the value
     participates in the kernel cache key and planned range conversion.
+    ``direct_context`` replaces the work pointer with context lengths for
+    one-partition full-attention output; active CTAs derive their complete
+    tile range and empty CTAs clear output without reading packed metadata.
     ``cluster_task_stride`` selects optional [batch, stride, 8] records; it
     must cover the cluster, and ``work`` then points at those records. The
     default zero retains packed work_info plus reduce_info lookups.
@@ -617,9 +625,12 @@ def compile_gfx1250_pa_decode(
         cluster_task_stride,
         plan_tile_tokens,
         single_task_tile,
+        direct_context,
     )
     if type(plan_tile_tokens) is not int or plan_tile_tokens not in (128, 256):
         raise ValueError("plan_tile_tokens must be 128 or 256")
+    if direct_context and (not direct_output or sliding_window != 0):
+        raise ValueError("direct_context requires direct full-attention output")
     if compute_dtype not in ("fp8", "bf16"):
         raise ValueError(f"Unsupported gfx1250 PA compute dtype: {compute_dtype}")
     if t.bf16 and per_token_kv:
@@ -734,14 +745,26 @@ def compile_gfx1250_pa_decode(
             )
             first, count = fx.Int32(seq_tasks[0]), fx.Int32(seq_tasks[1])
             task_slot = (part < count).select(first + part, fx.Int32(0))
-        if const_expr(t.direct_output):
+        if const_expr(t.direct_output and not t.direct_context):
             # One task per nonempty sequence; reduce_info supplies its packed slot.
             info = fx.recast_iter(fx.Int32, pmax)
             count = fx.Int32(info[task_slot * 2 + 1])
             # A trailing empty sequence's start can equal capacity. Its dummy
             # task read must stay in bounds even though no compute consumes it.
             task_slot = (count > 0).select(fx.Int32(info[task_slot * 2]), fx.Int32(0))
-        if const_expr(t.cluster_task_stride):
+        if const_expr(t.direct_context):
+            # The one-partition full-attention path needs only this sequence's
+            # current length; no packed-task lookup or scratch offset is used.
+            length = fx.Int32(fx.recast_iter(fx.Int32, work)[task_slot])
+            count = fx.Int32(length > 0)
+            tiles = fx.Int32(
+                (fx.max(fx.Int64(length), fx.Int64(0)) + t.plan_tile_tokens - 1)
+                // t.plan_tile_tokens
+            )
+            task = fx.Vector.from_elements(
+                [task_slot, fx.Int32(0), tiles, length], dtype=fx.Int32
+            )
+        elif const_expr(t.cluster_task_stride):
             cluster_slot = fx.Uint32(gpu.block_id("x"))
             seq = fx.Int32(cluster_slot // t.cluster_merge)
             part = fx.Int32(cluster_slot % t.cluster_merge)

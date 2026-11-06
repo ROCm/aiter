@@ -884,6 +884,18 @@ _COMMON_CASES = [
             "sink_dtype": torch.float32,
         },
     ),
+    (
+        "direct-context-cap1",
+        {
+            "direct_context": True,
+            "pattern": "one_hot_token",
+            "group_size": 16,
+            "block_size": 16,
+            "lengths": (0, 1, 15, 16, 17, 127, 128, 129, 2048),
+            "max_partitions": 1,
+            "capture": True,
+        },
+    ),
 ]
 _FP8_CASES = _COMMON_CASES + [
     (
@@ -1749,11 +1761,12 @@ def _check_pipe_policy(pa, case, arch, compile_kwargs):
     from aiter.ops.flydsl.kernels.pa_decode.traits import PaDecodeSchedule
 
     assert compile_kwargs[-1]["wide_kv_addressing"] == case["wide"]
-    if case.get("single_page") and arch == "gfx1250":
+    if (case.get("single_page") or case.get("direct_context")) and arch == "gfx1250":
         from aiter.ops.flydsl.kernels import pa_decode_kernel as kernels
 
         selected = compile_kwargs[-1]
-        assert selected["plan_tile_tokens"] == 128
+        if case.get("single_page"):
+            assert selected["plan_tile_tokens"] == 128
         compiled = pa.compile_pa_decode_tile(**selected)
         traits = [
             t
@@ -1761,7 +1774,10 @@ def _check_pipe_policy(pa, case, arch, compile_kwargs):
             if entry is compiled
         ]
         assert len(traits) == 1
-        assert traits[0].single_task_tile and traits[0].buffers == 1
+        if case.get("single_page"):
+            assert traits[0].single_task_tile and traits[0].buffers == 1
+        if case.get("direct_context"):
+            assert traits[0].direct_context
     if case["cluster"] is not None:
         expected = case["cluster"] if arch == "gfx1250" else 0
         assert compile_kwargs[-1]["cluster_merge"] == expected

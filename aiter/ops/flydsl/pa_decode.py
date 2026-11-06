@@ -1151,7 +1151,17 @@ def pa_decode(
             int(query.stride(0)),
             int(query.stride(1)),
             ptr_arg(
-                (work_plan.cluster_info if use_cluster_tasks else work_plan.work_info),
+                (
+                    context_lengths
+                    if one_partition_output
+                    and sliding_window == 0
+                    and num_seqs <= 4 * num_compute_units
+                    else (
+                        work_plan.cluster_info
+                        if use_cluster_tasks
+                        else work_plan.work_info
+                    )
+                ),
                 fx.Int32,
             ),
             work_plan.capacity,
