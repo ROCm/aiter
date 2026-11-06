@@ -36,6 +36,7 @@ from .allreduce_host_shared import (
     _StEngine,
     _validate_ipc_process_group,
     check_payload,
+    check_tensors,
     check_world_size,
     kernel_symbol,
     launcher_loaded,
@@ -53,6 +54,7 @@ from .allreduce_policy import (
 )
 from .kernels.comm.allreduce_shared import (
     BLOCK,
+    MAX_PAYLOAD_BYTES,
     QUANT_MIN_PAYLOAD_BYTES,
     SUPPORTED_BLOCKS,
     WORLD,
@@ -64,6 +66,8 @@ from .kernels.comm.quick_allreduce_int4 import (
     DEFAULT_ATOMS,
     DEFAULT_DIVISOR,
     MESH_CODECS,
+    MODE_AG,
+    MODE_RS,
     SUPER_TILES,
     clamp_grid_cap,
     latency_max_tiles,
@@ -374,6 +378,8 @@ class QuickAllReduceInt4:
         self._norm_by_atoms = {}
         self._norm_build_kw = {}
         self._norm_launch = {}
+        # The single-phase builds ``_sp_launcher`` adds on first use, by mode.
+        self._sp_launch = {}
         # Row widths whose fused builds are all compiled and loaded.
         self._rmsnorm_hidden = set()
         try:
@@ -1099,3 +1105,120 @@ class QuickAllReduceInt4:
             live_bytes=live_bytes,
             divisor=divisor,
         )
+
+    def _sp_engine(self) -> _StEngine:
+        """The engine the single-phase modes run on: ``super_tile=1`` at the
+        default block, whose inbox and colors they share with the all-reduce."""
+        if self.algorithm != "mesh":
+            raise ValueError(
+                "reduce_scatter / all_gather need the mesh algorithm, got "
+                f"algorithm={self.algorithm!r}"
+            )
+        if self.inbox_memory != "uncached":
+            raise ValueError(
+                "reduce_scatter / all_gather are validated on the uncached inbox "
+                f"only, got inbox_memory={self.inbox_memory!r}"
+            )
+        eng = self._by_cfg.get((1, BLOCK))
+        if eng is None:
+            raise ValueError(
+                f"reduce_scatter / all_gather need a super_tile=1, block={BLOCK} "
+                f"engine, this object has {sorted(self._by_cfg)}"
+            )
+        return eng
+
+    def _sp_launcher(self, mode):
+        """Build of the ``super_tile=1`` engine for *mode*, made on first use."""
+        launch = self._sp_launch.get(mode)
+        if launch is None:
+            launch = self._algo.build(**self._build_kw[(1, BLOCK)], mode=mode)["launch"]
+            self._sp_launch[mode] = launch
+        return launch
+
+    def _check_sp_payload(self, mode, inp, out, tile_bytes: int) -> int:
+        """Validate a reduce-scatter / all-gather pair; return the full tensor's bytes."""
+        inp_ptr, out_ptr = check_tensors(
+            inp, out, device_index=self._device_index, owner="QuickAllReduceInt4"
+        )
+        inp_bytes = int(inp.numel()) * int(inp.element_size())
+        out_bytes = int(out.numel()) * int(out.element_size())
+        full_bytes, shard_bytes = (
+            (inp_bytes, out_bytes) if mode == MODE_RS else (out_bytes, inp_bytes)
+        )
+        if full_bytes != self.world_size * shard_bytes:
+            raise ValueError(
+                f"{mode}: the full tensor must be world_size={self.world_size} "
+                f"times the shard, got {full_bytes} and {shard_bytes} bytes"
+            )
+        if full_bytes == 0 or full_bytes % tile_bytes != 0:
+            raise ValueError(
+                f"{mode}: the full tensor must be a non-empty whole number of "
+                f"{tile_bytes}-byte tiles, got {full_bytes} bytes"
+            )
+        if full_bytes > MAX_PAYLOAD_BYTES:
+            raise ValueError(
+                "QuickAllReduceInt4 payload must not exceed the 4 GiB buffer window"
+            )
+        if max(inp_ptr, out_ptr) < min(inp_ptr + inp_bytes, out_ptr + out_bytes):
+            raise ValueError("QuickAllReduceInt4 requires non-overlapping input/output")
+        return full_bytes
+
+    def _run_sp(self, mode, inp, out, stream) -> None:
+        # No divisor: the single-phase builds take the default of 1, and the
+        # all-gather's dequant would scale by any other. No ``min_bytes`` floor
+        # either: it guards the all-reduce's small-message accuracy cost, and a
+        # sequence-parallel caller picks this kernel for its layout.
+        eng = self._sp_engine()
+        full_bytes = self._check_sp_payload(mode, inp, out, eng.tile_bytes)
+        launch = self._sp_launcher(mode)
+        if torch.cuda.is_current_stream_capturing() and not launcher_loaded(launch):
+            raise RuntimeError(
+                f"QuickAllReduceInt4: {mode} build {kernel_symbol(launch)} is not "
+                "loaded, and loading it cannot run under CUDA graph capture; "
+                "call compile_sp first"
+            )
+        self._launch_eng(eng, inp, out, stream, live_bytes=full_bytes, launch=launch)
+
+    def reduce_scatter(self, inp, out, stream=None):
+        """INT4 reduce-scatter: this rank's contiguous block of the sum.
+
+        ``inp`` is this rank's bf16 ``[T, H]`` partial and ``out`` the
+        ``[T / world_size, H]`` block ``[rank * T/W, (rank + 1) * T/W)`` of the
+        element-wise sum over ranks. Only byte sizes are checked: ``inp`` must
+        be ``world_size`` times ``out`` and a whole number of tiles
+        (``tile_bytes``, 32 KiB), so pass ``T`` divisible by ``world_size``.
+        Every partial, this rank's own included, goes through the INT4 codec,
+        so a row's value does not depend on which rank owns it (the all-reduce
+        adds its own share exactly). Shares the inbox and colors of
+        ``allreduce``; every rank must issue the same sequence of launches and
+        sizes. Needs the mesh algorithm, the uncached inbox and a
+        ``super_tile=1`` engine at the default block.
+        """
+        self._run_sp(MODE_RS, inp, out, stream)
+
+    def all_gather(self, inp, out, stream=None):
+        """INT4 all-gather of contiguous row blocks.
+
+        ``inp`` is this rank's bf16 ``[T / world_size, H]`` block and ``out``
+        the ``[T, H]`` concatenation of every rank's block, in rank order. This
+        rank's own block is round-tripped through the codec too, so every rank
+        holds bitwise-equal output. Same size, sequence and engine rules as
+        ``reduce_scatter``.
+        """
+        self._run_sp(MODE_AG, inp, out, stream)
+
+    def compile_sp(self, full, shard) -> None:
+        """JIT-compile ``reduce_scatter`` and ``all_gather`` and load them onto
+        the device, without launching either, so call it before CUDA graph
+        capture.
+
+        ``full`` is a ``[T, H]`` tensor and ``shard`` a ``[T / world_size, H]``
+        one; they are checked as ``reduce_scatter`` would check them and left
+        untouched. Local to this rank, like ``preload``.
+        """
+        eng = self._sp_engine()
+        self._check_sp_payload(MODE_RS, full, shard, eng.tile_bytes)
+        args = self._launch_args(eng, 0, 0, None, live_bytes=0, num_tiles=0)
+        with torch.cuda.device(self._device_index):
+            for mode in (MODE_RS, MODE_AG):
+                preload_launcher(self._sp_launcher(mode), *args)

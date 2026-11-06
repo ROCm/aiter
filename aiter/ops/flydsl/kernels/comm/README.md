@@ -47,6 +47,16 @@ lap. In each lap, each rank pushes to all `N-1` peers. The wire format is INT4
 with one E5M2 scale for each group of 16 values. FP16 is also available for
 tests.
 
+The mesh also runs one lap on its own, for sequence parallelism.
+`QuickAllReduceInt4.reduce_scatter(inp, out)` leaves each rank a contiguous
+block of rows of the sum, and `all_gather(inp, out)` concatenates the ranks'
+blocks. Both use INT4, `super_tile=1`, the 32 KiB tile (the payload is a whole
+number of tiles) and the all-reduce's inbox and colors. The reduce-scatter
+quantizes a rank's own partial too, which the all-reduce does not, so a row's
+value does not depend on which rank owns it. `compile_sp(full, shard)` loads
+both builds before CUDA graph capture. They are validated on the `uncached`
+inbox only.
+
 ### Ring
 
 The ring is also a two-shot all-reduce. The ranks make a cycle. In each step,
@@ -226,8 +236,8 @@ If the `AITER_CUSTOM_AR_*` window and the one-shot window do not overlap,
 
 ## Tests and benchmarks
 
-Two multi-GPU tests check and time the kernels. The `--scenario` option selects
-what a test does:
+Two multi-GPU tests check and time the all-reduce kernels. The `--scenario`
+option selects what a test does:
 
 - `verify` is the default. It checks correctness and times the FlyDSL kernels.
 - `bench` compares the FlyDSL kernels with the stock kernels on the same
@@ -237,6 +247,10 @@ what a test does:
 |---|---|---|
 | `op_tests/multigpu_tests/test_flydsl_one_shot_allreduce.py` | One-shot | `cdr` and `cdr_naive`, the `CustomAllreduce` kernels with `use_new` on and off, and `rccl` |
 | `op_tests/multigpu_tests/test_flydsl_quick_allreduce_int4.py` | Mesh and ring | `hip`, the HIP `QuickAllReduce` kernel at the INT4 regime |
+
+`op_tests/multigpu_tests/test_flydsl_quick_reduce_scatter_all_gather.py` checks
+and times `reduce_scatter` and `all_gather`. It takes `--tp` and `-s` but no
+`--scenario`.
 
 A test fails if the arch is not supported, or if a world size that you name
 with `--tp` needs more GPUs than the node has. The default sweep skips the world
