@@ -770,28 +770,48 @@ class FlyDSLDispatchCombineIntraNodeOp:
         self.cfg.tuning_table = build_geometry_tuning_table_for_config(self.cfg, path)
         return self.cfg.tuning_table
 
+    @staticmethod
+    def _legacy_token_bytes(cfg):
+        return (
+            cfg.hidden_dim * cfg.max_token_type_size
+            if cfg.max_token_type_size > 0
+            else 0
+        )
+
+    @classmethod
+    def combine_input_numel(cls, cfg):
+        """Elements of the (int16 token, float32 weight) combine input for ``cfg``."""
+        k = cfg.num_experts_per_token
+        mr_worst = cfg.max_recv
+        # Size combine input for both sender-major and fused dest_lid*topk layouts.
+        mr_worst_inp = max(mr_worst, cfg.max_num_inp_token_per_rank * k)
+        comb_tb = max(cfg.combine_token_bytes, cls._legacy_token_bytes(cfg))
+        return (mr_worst_inp * comb_tb + 1) // 2, mr_worst * k
+
+    @classmethod
+    def allocate_combine_input(cls, cfgs):
+        """A zeroed symmetric combine input large enough for every config in ``cfgs``,
+        for ops whose calls never overlap to share (``combine_input=``)."""
+        tok, wts = (max(n) for n in zip(*(cls.combine_input_numel(c) for c in cfgs)))
+        tok = mori_shmem_create_tensor((tok,), torch.int16)
+        wts = mori_shmem_create_tensor((wts,), torch.float32)
+        tok.zero_()
+        wts.zero_()
+        return tok, wts
+
     def _alloc_buffers(self):
         cfg = self.cfg
         npes = cfg.world_size
         k = cfg.num_experts_per_token
         mt = cfg.max_num_inp_token_per_rank
         mr = cfg.effective_max_recv
-        mr_worst = cfg.max_recv
 
-        # Size combine input for both sender-major and fused dest_lid*topk layouts.
-        mr_worst_inp = max(mr_worst, mt * k)
-
-        legacy_tb = (
-            cfg.hidden_dim * cfg.max_token_type_size
-            if cfg.max_token_type_size > 0
-            else 0
-        )
+        legacy_tb = self._legacy_token_bytes(cfg)
         disp_tb = max(cfg.dispatch_token_bytes, legacy_tb)
         comb_tb = max(cfg.combine_token_bytes, legacy_tb)
         tok_i16_mr = (mr * disp_tb + 1) // 2  # dispatch output (dispatch_dtype)
-        tok_i16_mr_worst = (
-            mr_worst_inp * comb_tb + 1
-        ) // 2  # combine input, worst-case (combine_dtype)
+        # combine input, worst-case (combine_dtype)
+        tok_i16_mr_worst, wts_mr_worst = self.combine_input_numel(cfg)
         tok_i16_mt = (mt * comb_tb + 1) // 2  # combine output (combine_dtype)
 
         self.shmem_disp_out_tok = mori_shmem_create_tensor((tok_i16_mr,), torch.int16)
@@ -807,16 +827,16 @@ class FlyDSLDispatchCombineIntraNodeOp:
                 (tok_i16_mr_worst,), torch.int16
             )
             self.shmem_comb_inp_wts = mori_shmem_create_tensor(
-                (mr_worst * k,), torch.float32
+                (wts_mr_worst,), torch.float32
             )
         else:
             tok, wts = self._shared_combine_input
-            if tok.numel() < tok_i16_mr_worst or wts.numel() < mr_worst * k:
+            if tok.numel() < tok_i16_mr_worst or wts.numel() < wts_mr_worst:
                 raise ValueError(
                     "the shared combine input is smaller than this op needs"
                 )
             self.shmem_comb_inp_tok = tok[:tok_i16_mr_worst]
-            self.shmem_comb_inp_wts = wts[: mr_worst * k]
+            self.shmem_comb_inp_wts = wts[:wts_mr_worst]
         self.shmem_comb_out_tok = mori_shmem_create_tensor((tok_i16_mt,), torch.int16)
         self.shmem_comb_out_wts = mori_shmem_create_tensor((mt * k,), torch.float32)
         self.shmem_xdev_bar_mem = mori_shmem_create_tensor((npes,), torch.int64)
