@@ -256,7 +256,7 @@ def _check_out(out, q, v_hdim, out_dtype=None):
     ), f"out shape {tuple(out.shape)} != expected {want} (v_hdim={v_hdim})"
 
 
-def _bshd_batch_stride_ok(t, seq_len):
+def _has_implicit_bshd_batch_stride(t, seq_len):
     """The BSHD kernels take no batch stride: they address batch b at
     ``b * seq_len * stride_seq``. A view whose own batch stride differs from that
     product (e.g. [S,B,H,D] storage permuted to [B,S,H,D]) reads the wrong rows, or
@@ -679,12 +679,12 @@ def flydsl_flash_attn_batch_fwd(
             return None
         if softmax_scale is not None and not (0 < softmax_scale < float("inf")):
             return None
-        if not all(_bshd_batch_stride_ok(t, t.shape[1]) for t in (q, k, v)):
+        if not all(_has_implicit_bshd_batch_stride(t, t.shape[1]) for t in (q, k, v)):
             return None
         if (
             out is not None
             and out.dim() == 4
-            and not _bshd_batch_stride_ok(out, out.shape[1])
+            and not _has_implicit_bshd_batch_stride(out, out.shape[1])
         ):
             return None
         _out_dtype = _A8W8_GFX1250_OUT_DTYPE if _is_b8 else q.dtype

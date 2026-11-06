@@ -79,7 +79,7 @@ from .fmha_utils import (
     fmax_fastmath,
     fmul_fastmath,
     fsub_fastmath,
-    _paged_layout_ok,
+    _is_paged_layout_supported,
     PagedSpec,
     _ContiguousKVPolicy,
     _PagedKVPolicy,
@@ -3329,11 +3329,13 @@ def flash_attn_a16w16_m32x8_supported(
     qk_hdim, v_hdim = q.shape[-1], v.shape[-1]
     num_q, num_kv = q.shape[-2], k.shape[-2]
     if mode == "paged":
-        if not _paged_layout_ok(k, v, kv_indptr, kv_page_indices, kv_last_page_lens):
+        if not _is_paged_layout_supported(
+            k, v, kv_indptr, kv_page_indices, kv_last_page_lens
+        ):
             return False
     elif block_table is not None:
         return False
-    sink_ok = sink is None or (
+    sink_supported = sink is None or (
         torch.is_tensor(sink) and sink.dtype == torch.float32 and sink.shape == (num_q,)
     )
     return (
@@ -3350,7 +3352,7 @@ def flash_attn_a16w16_m32x8_supported(
         and (len(window_size) < 3 or window_size[2] == 0)
         and bias is None
         and alibi_slopes is None
-        and sink_ok
+        and sink_supported
         and not return_attn_probs
     )
 

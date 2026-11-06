@@ -781,7 +781,7 @@ class _PagedKVPolicy:
         }
 
 
-def _paged_layout_ok(k, v, kv_indptr, kv_page_indices, kv_last_page_lens):
+def _is_paged_layout_supported(k, v, kv_indptr, kv_page_indices, kv_last_page_lens):
     """The page pool and its metadata, as the gather loader needs them."""
     if k.dim() != v.dim() or k.dim() not in (3, 4):
         return False
