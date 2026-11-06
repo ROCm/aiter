@@ -6,7 +6,7 @@ from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-from aiter.ops.triton.utils._triton.mha_kernel_utils import (
+from aiter.ops.triton._triton_kernels.common.mha_kernel_utils import (
     _compute_fp8_scaling_factors,
 )
 
@@ -32,7 +32,6 @@ def _attn_fwd_inner(
     seqlen_q,
     dropout_p,
     sd_ptr,
-    dm_ptr,
     philox_seed,
     philox_base,
     block_min,
@@ -168,10 +167,8 @@ def _attn_fwd_inner(
             keep = (
                 tl.rand(philox_seed, philox_base + sd_offs) > dropout_p
             )  # TODO: use tl.randint for better performance
-            gl.store(dm_ptr + sd_offs, keep.to(gl.float32), mask=p_mask)
-
-            # return scores with negative values for dropped vals
-            gl.store(sd_ptr + sd_offs, gl.where(keep, p, -p), mask=p_mask)
+            if RETURN_SCORES:
+                gl.store(sd_ptr + sd_offs, gl.where(keep, p, -p), mask=p_mask)
             p = gl.where(keep, p, 0.0)
         elif RETURN_SCORES:
             # NOTE: the returned score is not the same as the reference because we need to adjust as we find new maxes per block. We are not doing that
@@ -245,7 +242,6 @@ def _attn_fwd(
     out_ptr,
     alibi_slopes_ptr,
     s_dmask_ptr,
-    dropout_mask_ptr,
     softmax_lse_ptr,
     sink_ptr,
     stride_qz_in,
@@ -655,10 +651,8 @@ def _attn_fwd(
     else:
         sd_ptr = None
     if ENABLE_DROPOUT:
-        dm_ptr = dropout_mask_ptr + sd_base
         philox_base = philox_offset_base + sd_base
     else:
-        dm_ptr = None
         philox_base = 0
 
     # alibi slopes
@@ -730,7 +724,6 @@ def _attn_fwd(
                 seqlen_q,
                 dropout_p,
                 sd_ptr,
-                dm_ptr,
                 philox_seed,
                 philox_base,
                 block_min,
@@ -782,7 +775,6 @@ def _attn_fwd(
                 seqlen_q,
                 dropout_p,
                 sd_ptr,
-                dm_ptr,
                 philox_seed,
                 philox_base,
                 block_full_end,
@@ -833,7 +825,6 @@ def _attn_fwd(
             seqlen_q,
             dropout_p,
             sd_ptr,
-            dm_ptr,
             philox_seed,
             philox_base,
             block_last,
