@@ -442,7 +442,7 @@ def check_skinny_large_weight():
 
 
 # K-stagger/streaming regression geometries. The first two are Kimi-K3
-# row-major BF16 projection weights from AKLR; the rest exercise K wraps,
+# row-major BF16 projection shapes; the rest exercise K wraps,
 # short final split partitions, slice-K and HTI pipeline boundaries.
 # Same row schema as _TUNED.
 _MEMORY_TILES = [

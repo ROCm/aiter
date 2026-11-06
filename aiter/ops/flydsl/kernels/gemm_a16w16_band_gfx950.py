@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright © Advanced Micro Devices, Inc. All rights reserved.
+# Adapted from AMD-AGI/AKLR BF16 decode kernels (MIT), revision 551613c81ea1f232cadb72e6f4647f96152e67d4.
 
 """BF16 decode band-stream policy for gfx950.
 
-Adapted from AMD-AGI/AKLR (MIT), gemm_n18432_k1536 and gemm_n20480_k7168,
-revision 551613c81ea1f232cadb72e6f4647f96152e67d4. Each of 256 workgroups
+Each of 256 workgroups
 owns 64 line-aligned columns plus a strip grouped by XCD. A/B use staged
 LDS DMA, with successor fragment reads and DMA interleaved with MFMAs.
 B is streamed; A stays cached. No cross-workgroup reduction or scratch.
