@@ -39,7 +39,7 @@ from ..kernels_common import ceildiv
 from ..mxfp4_gemm_common import kStages, lds_typed_ptr
 from ..tensor_shim import _preload_compiled, _run_compiled, ptr_buf_tensor
 from ..tensor_shim import torch_stream as _torch_stream
-from .dispatch import _wave_inclusive_scan_i32, _wave_reduce_max_i32
+from .dispatch import _increment_i32, _wave_inclusive_scan_i32, _wave_reduce_max_i32
 from .gemm1 import _LdsF32View, build_fused_gemm1
 from .gemm2 import _resolve_g2_knobs, gemm2_compute_v2, issue_a_load_lds_dt
 from .mega_moe_config import (
@@ -128,12 +128,6 @@ class DispatchSlot(IntEnum):
 
 
 DISPATCH_TABLE_SIZE = max(DispatchSlot) + 1
-
-
-@flyc.jit
-def _increment_i32(rsrc, index):
-    value = load_at(rsrc, index, fx.Int32, 1)
-    store_at(value + fx.Int32(1), rsrc, index)
 
 
 @flyc.jit
@@ -452,7 +446,7 @@ def emit_dispatch_plan(
                     )
                     if source_boundary:
                         tile_index = base_tile + sender_prefix // fx.Int32(fz_tile_m)
-                        _increment_i32(AddrBuffer(a_tile_expected), tile_index)
+                        _increment_i32(ptr_buf_tensor(a_tile_expected, fx.Int32), tile_index)
                     for chunk_offset in range(
                         fx.Int32(payload_chunk_rows), source_count, payload_chunk_rows
                     ):
@@ -460,7 +454,7 @@ def emit_dispatch_plan(
                         boundary_unaligned = boundary % fx.Int32(fz_tile_m) != fx.Int32(0)
                         if boundary_unaligned:
                             tile_index = base_tile + boundary // fx.Int32(fz_tile_m)
-                            _increment_i32(AddrBuffer(a_tile_expected), tile_index)
+                            _increment_i32(ptr_buf_tensor(a_tile_expected, fx.Int32), tile_index)
                     sender_prefix = sender_prefix + source_count
                 # Peers read the expected counts for the ready queue from the symmetric copy; this rank's GEMM1
                 # waits read the local one.
