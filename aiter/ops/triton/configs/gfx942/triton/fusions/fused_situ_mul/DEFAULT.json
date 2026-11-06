@@ -1,0 +1,8 @@
+{
+    "any": {
+        "BLOCK_SIZE_M": 16,
+        "BLOCK_SIZE_N": 256,
+        "num_warps": 8,
+        "PROGRAMS_PER_CU": 4
+    }
+}
