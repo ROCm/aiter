@@ -1020,6 +1020,161 @@ def test_block_rows_static(dtype, mode="perf"):
     return [{"case": case, "gfx": get_gfx(), "flydsl err": _compare(ref, out, case)}]
 
 
+# --- gfx1250 split-K contract ----------------------------------------------
+# The tuned row, the public entry and the AOT job used to derive split-K
+# independently, so a row could record one value while the kernel ran another.
+# The 2d_splitk2 case pins the gfx950 half of that contract; this one pins the
+# gfx1250 backend, where an output-row tail must fall back to 1 and an explicit
+# incompatible request must be rejected instead of silently replaced.
+_SPLITK_TILE = (128, 64, 2, 2)
+_SPLITK_BLOCK_ROWS = 8
+_SPLITK_CASES = (
+    # case, x (NCDHW), weight, padding, has an output-row tail
+    ("splitk_no_tail", (1, 64, 1, 8, 768), (64, 64, 1, 3, 3), (0, 1, 1), False),
+    ("splitk_row_tail", (1, 64, 1, 3, 2048), (64, 64, 1, 3, 3), (0, 1, 1), True),
+)
+
+
+def _splitk_checks(dtype, xshape, wshape, padding, has_tail):
+    """Return (label, ok) pairs from the shared resolver and the compile hook."""
+    from aiter.jit.utils.chip_info import get_cu_num
+    from aiter.ops.flydsl import conv3d_gfx1250
+
+    n, c, d, h, w = xshape
+    k, _, kt, kh, kw = wshape
+    cgp = -(-c // 32) * 32
+    ho = h + 2 * padding[1] - kh + 1
+    wo = w + 2 * padding[2] - kw + 1
+    npq = n * (d + 2 * padding[0] - kt + 1) * ho * wo
+    crs = cgp * kt * kh * kw
+    num_cu = get_cu_num()
+
+    def resolve(splitk, explicit, npq=npq, crs=crs, k=k, ho=ho, wo=wo):
+        return conv3d_gfx1250._resolve_splitk_gfx1250(
+            splitk,
+            npq,
+            crs,
+            k,
+            None,
+            _SPLITK_TILE,
+            1,
+            _SPLITK_BLOCK_ROWS,
+            ho,
+            wo,
+            explicit=explicit,
+            num_cu=num_cu,
+        )
+
+    # Flat resolution before the tail gate; the tail cases are only exercised
+    # when this is above 1.
+    flat = conv_kernels._resolve_splitk(
+        None, npq, crs, k, None, _SPLITK_TILE, 1, num_cu=num_cu
+    )
+    checks = []
+    if not has_tail:
+        checks.append(("explicit_kept", resolve(2, True) == 2))
+    if flat > 1:
+        want = 1 if has_tail else flat
+        checks.append((f"auto_{want}", resolve(None, False) == want))
+    if has_tail:
+        try:
+            resolve(3, True)
+        except AssertionError:
+            checks.append(("explicit_tail_rejected", True))
+        else:
+            checks.append(("explicit_tail_rejected", False))
+
+    # End to end: the value the kernel is compiled with, through the public
+    # entry the models call.
+    torch.manual_seed(0)
+    x = torch.randn(xshape, device="cuda", dtype=dtype)
+    weight = torch.randn(wshape, device="cuda", dtype=dtype)
+    captured = []
+    original = conv3d_gfx1250.compile_conv3d_implicit_gfx1250
+
+    def record(param, captured=captured, original=original):
+        captured.append(param)
+        return original(param)
+
+    requested = 1 if has_tail else 2
+    conv3d_gfx1250.compile_conv3d_implicit_gfx1250 = record
+    try:
+        flydsl_conv_implicit(
+            x,
+            weight,
+            tile=_SPLITK_TILE,
+            block_rows=_SPLITK_BLOCK_ROWS,
+            padding=padding,
+            splitk=requested,
+        )
+    finally:
+        conv3d_gfx1250.compile_conv3d_implicit_gfx1250 = original
+    checks.append(
+        (
+            f"kernel_splitk_{requested}",
+            bool(captured) and captured[-1].splitk == requested,
+        )
+    )
+    if has_tail:
+        conv3d_gfx1250.compile_conv3d_implicit_gfx1250 = record
+        try:
+            flydsl_conv_implicit(
+                x,
+                weight,
+                tile=_SPLITK_TILE,
+                block_rows=_SPLITK_BLOCK_ROWS,
+                padding=padding,
+                splitk=3,
+            )
+        except AssertionError:
+            rejected = True
+        else:
+            rejected = False
+        finally:
+            conv3d_gfx1250.compile_conv3d_implicit_gfx1250 = original
+        checks.append(("kernel_explicit_tail_rejected", rejected))
+    return checks
+
+
+def check_splitk_contract(dtype, mode="perf"):
+    """gfx1250-only: a requested split-K must be the compiled split-K."""
+    if not get_gfx().startswith("gfx1250"):
+        # The shared resolver and the compile hook below belong to the gfx1250
+        # backend; gfx950 derives split-K inside _implicit_param_from_problem.
+        aiter.logger.info(
+            "split-K contract is gfx1250-specific; skipping on %s", get_gfx()
+        )
+        return []
+    rows = []
+    for case, xshape, wshape, padding, has_tail in _SPLITK_CASES:
+        start = time.perf_counter()
+        try:
+            checks = _splitk_checks(dtype, xshape, wshape, padding, has_tail)
+            failed = [label for label, ok in checks if not ok]
+            rows.append(
+                {
+                    "case": case,
+                    "gfx": get_gfx(),
+                    "mode": mode,
+                    "iterations": len(checks),
+                    "wall ms": (time.perf_counter() - start) * 1e3,
+                    "checks": ",".join(label for label, _ in checks),
+                    "failure": ",".join(failed) or None,
+                }
+            )
+        except Exception as exc:  # noqa: BLE001
+            rows.append(
+                {
+                    "case": case,
+                    "mode": mode,
+                    "iterations": 0,
+                    "wall ms": (time.perf_counter() - start) * 1e3,
+                    "failure": f"{type(exc).__name__}: {exc}",
+                }
+            )
+    return rows
+
+
 def summarize(title, rows):
     if not rows:  # every case in this sweep was filtered out by --cases
         return
@@ -1118,6 +1273,7 @@ def _run_ci(args, dtype):
         rows.append(row)
     rows += test_artifact_key_isolation(dtype, mode="ci")
     rows += test_block_rows_static(dtype, mode="ci")
+    rows += check_splitk_contract(dtype, mode="ci")
     summarize("FlyDSL convolution correctness (mode=ci)", rows)
     aiter.logger.info(
         "mode=ci executed cases=%d checked iterations=%d warmup/case=%d "
@@ -1233,6 +1389,12 @@ def main(argv=None):
         summarize(
             f"kH x kW reuse on the static-extent path ({name})",
             test_block_rows_static(dtype),
+        )
+        # gfx1250-only: the resolved split-K is invisible to every numerical
+        # case, so it needs its own assertion.
+        summarize(
+            f"gfx1250 split-K contract, requested vs compiled ({name})",
+            check_splitk_contract(dtype),
         )
 
     # After the tables, so a failure is read next to the numbers that produced it.
