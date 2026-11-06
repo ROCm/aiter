@@ -142,7 +142,8 @@
     "module_custom_all_reduce": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/custom_all_reduce_pybind.cu'",
-            "f'{AITER_CSRC_DIR}/kernels/custom_all_reduce.cu'"
+            "f'{AITER_CSRC_DIR}/kernels/custom_all_reduce.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/custom_all_reduce_ext.cu'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [
@@ -384,8 +385,8 @@
         "flags_extra_cc": [],
         "flags_extra_hip": [
             "'-mllvm --amdgpu-mfma-vgpr-form'",
-            "('-mllvm -amdgpu-expert-scheduling-mode' if (get_gfx() == 'gfx1250' or 'gfx1250' in os.environ.get('GPU_ARCHS', '')) else '')",
-            "('-mllvm -enable-post-misched=1' if (get_gfx() == 'gfx1250' or 'gfx1250' in os.environ.get('GPU_ARCHS', '')) else '')",
+            "('-mllvm -amdgpu-expert-scheduling-mode' if (get_gfx() in ('gfx1250', 'gfx1250-strict') or 'gfx1250' in os.environ.get('GPU_ARCHS', '')) else '')",
+            "('-mllvm -enable-post-misched=1' if (get_gfx() in ('gfx1250', 'gfx1250-strict') or 'gfx1250' in os.environ.get('GPU_ARCHS', '')) else '')",
             "f'-DOPUS_GEN_CO_DIR=\\\\\"{AITER_CSRC_DIR}/opus_gemm/gen_co\\\\\"'"
         ],
         "flags_extra_hip_per_source": {
@@ -709,14 +710,16 @@
     "module_mla_prefill_opus": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/kernels/mla/opus_mla_prefill_fwd.cu'",
-            "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_v4_prefill_a16w16_16mx1_16nx4.hpp'",
-            "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_v4_prefill_a16w16_16mx8_32nx1.hpp'",
-            "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_v4_prefill_a8w8_16mx1_16nx4.hpp'",
-            "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_v4_prefill_a8w8_16mx8_32nx1.hpp'",
-            "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_global_load.hpp'",
-            "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_v4_prefill_kargs.h'",
-            "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_v4_prefill_traits.h'",
-            "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_v41_prefill_kargs.h'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/opus/gfx950/mla_v4_prefill_a16w16_16mx1_16nx4.hpp'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/opus/gfx950/mla_v4_prefill_a16w16_16mx8_32nx1.hpp'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/opus/gfx950/mla_v4_prefill_a8w8_16mx1_16nx4.hpp'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/opus/gfx950/mla_v4_prefill_a8w8_16mx8_32nx1.hpp'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/opus/gfx950/mla_v41_prefill_a8w4_16mx1_16nx4.hpp'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/opus/gfx950/mla_v41_prefill_a8w8_16mx1_16nx4.hpp'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/opus/gfx950/mla_global_load.hpp'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_prefill_kargs.h'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/opus/gfx950/mla_v4_prefill_traits.h'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/opus/gfx950/mla_v41_prefill_traits.h'",
             "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_prefill_split.h'"
         ],
         "flags_extra_cc": [],
@@ -1489,6 +1492,22 @@
             "f'{AITER_META_DIR}/hsa/codegen.py -m fmha_fwd_bf16_varlen --output_dir {{}}'"
         ]
     },
+    "module_fmha_fwd_fp8_varlen_asm": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_fmha_fwd_fp8_varlen.cu'"
+        ],
+        "flags_extra_cc": [
+            "'-DENABLE_CK=0'"
+        ],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": [
+            "f'{AITER_META_DIR}/hsa/codegen.py -m fmha_fwd_fp8_varlen --output_dir {{}}'"
+        ]
+    },
     "module_fmha_fwd_mxfp8_asm": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_fmha_fwd_mxfp8.cu'"
@@ -1872,12 +1891,42 @@
         "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
+    "module_hipb_groupedgemm": {
+        "srcs": [
+            "f'{AITER_GRADLIB_DIR}/csrc/hipb_groupedgemm.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-U__CUDA_NO_HALF_OPERATORS__'",
+            "'-U__CUDA_NO_HALF_CONVERSIONS__'",
+            "'-ftemplate-depth=1024'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [
+            "f'{AITER_GRADLIB_DIR}/include/'"
+        ],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
     "module_top_k_per_row": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/kernels/topk_per_row_kernels.cu'",
             "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_topk_per_row_decode.cu'",
             "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_topk_per_row_prefill.cu'",
             "f'{AITER_CSRC_DIR}/pybind/topk_per_row_pybind.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": "''"
+    },
+    "module_top_k_per_row_sampled": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/kernels/topk_per_row_sampled_kernels.cu'",
+            "f'{AITER_CSRC_DIR}/pybind/topk_per_row_sampled_pybind.cu'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [],
@@ -1967,7 +2016,9 @@
             "f'{AITER_CSRC_DIR}/kernels/topk_per_row_kernels.cu'"
         ],
         "flags_extra_cc": [],
-        "flags_extra_hip": [],
+        "flags_extra_hip": [
+            "'-DTOPK_PER_ROW_PLAIN_KERNELS=1'"
+        ],
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
@@ -1992,6 +2043,7 @@
             "f'{AITER_CSRC_DIR}/pybind/fused_ar_mhc_post_pybind.cu'",
             "f'{AITER_CSRC_DIR}/kernels/fused_ar_mhc_post.cu'",
             "f'{AITER_CSRC_DIR}/kernels/custom_all_reduce.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/custom_all_reduce_ext.cu'",
             "f'{AITER_CSRC_DIR}/kernels/mhc_kernels.cu'"
         ],
         "flags_extra_cc": [],
@@ -2007,7 +2059,8 @@
     "module_mega_mhc_stream_h5120": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/mega_mhc_pybind.cu'",
-            "f'{AITER_CSRC_DIR}/kernels/mega_mhc.cu'"
+            "f'{AITER_CSRC_DIR}/kernels/mega_mhc.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mega_mhc_gfx1250.cu'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [
@@ -2024,7 +2077,8 @@
     "module_mega_mhc_stream_h7168": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/mega_mhc_pybind.cu'",
-            "f'{AITER_CSRC_DIR}/kernels/mega_mhc.cu'"
+            "f'{AITER_CSRC_DIR}/kernels/mega_mhc.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mega_mhc_gfx1250.cu'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [
@@ -2041,7 +2095,8 @@
     "module_mega_mhc_stream_generic": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/mega_mhc_pybind.cu'",
-            "f'{AITER_CSRC_DIR}/kernels/mega_mhc.cu'"
+            "f'{AITER_CSRC_DIR}/kernels/mega_mhc.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mega_mhc_gfx1250.cu'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [
@@ -2067,6 +2122,20 @@
         "verbose": "False",
         "torch_exclude": "True",
         "blob_gen_cmd": "''"
+    },
+    "module_mhc_seam_asm": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_mhc_seam.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": [
+            "f'{AITER_META_DIR}/hsa/codegen.py -m mhc_seam --output_dir {{}}'"
+        ]
     },
     "module_causal_conv1d_update": {
         "srcs": [
@@ -2168,11 +2237,11 @@
     "module_mla_decode_opus": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/kernels/mla/opus_mla_decode_fwd.cu'",
-            "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_decode_mxfp8_16mx8_32nx1.hpp'",
-            "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_decode_a8w8_16mx1_32nx4.hpp'",
-            "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_global_load.hpp'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/opus/gfx950/mla_decode_mxfp8_16mx8_32nx1.hpp'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/opus/gfx950/mla_decode_a8w8_16mx1_32nx4.hpp'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/opus/gfx950/mla_global_load.hpp'",
             "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_decode_kargs.h'",
-            "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_decode_traits.h'"
+            "f'{AITER_CSRC_DIR}/kernels/mla/opus/gfx950/mla_decode_traits.h'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [
