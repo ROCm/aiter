@@ -364,6 +364,14 @@ def test_gemm_a8wfp4(M: int, N: int, K: int, CLEAR_GPUS=True):
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
+    # quantize_to_fp4() builds an N x K x len(MXFP4_TABLE) float32 distance tensor.
+    quant_bytes = N * K * len(MXFP4_TABLE) * 4
+    if quant_bytes > torch.cuda.mem_get_info()[0]:
+        pytest.skip(
+            f"Reference FP4 quantization needs {quant_bytes / 2**30:.1f} GiB, "
+            "more than the free device memory."
+        )
+
     x, w, x_scales, w_scales, x_fp32, w_fp32, y = generate_gemm_a8wfp4_inputs(
         M, N, K, a_dtype, out_dtype, layout=layout, output=True
     )
