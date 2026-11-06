@@ -14,7 +14,7 @@ layout is a new dtype case, not a new entry.
   RoPE (NoPE fp8): asm on gfx1250 with H == 128 (opus if it declines), else opus.
 * :func:`mla_sparse_prefill_v41` -- v4.1: rows with separate ``[*, 16]`` E8M0 scales
   (q, kv fp8), the prefix source fp8 or NVFP4 with ``[*, 32]`` e4m3 scales: opus on gfx950,
-  and with an fp8 prefix on gfx1250.
+  and with an fp8 prefix on gfx1250; asm for H64 NVFP4 on gfx1250.
 
 ``backend`` forces one backend. A configuration no backend serves raises RuntimeError;
 a bad argument raises ValueError.
@@ -32,6 +32,7 @@ from ..jit.utils.asm_guard import require_gfx1250_asm
 from ..jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from ..jit.utils.torch_guard import torch_compile_guard
 from ..utility import dtypes
+from .mla_sparse_prefill_v41_asm import _asm_sparse_prefill_v41
 from .opus.mla import (
     opus_mla_v4_prefill_a8w8_gfx950_fwd,
     opus_mla_v4_prefill_a8w8_gfx1250_fwd,
@@ -285,6 +286,9 @@ _KV_SPLIT_FIT = {
     ("gfx1250", "v41_a8w8_16mx4_64nx1"): _SplitFit(64, 64, 1, _CLUSTER_COUNT, 0, 0.05),
 }
 
+# Fallback for prefix lengths outside the ASM short-query policy.
+_ASM_V41_INITIAL_SPLIT_FIT = _SplitFit(64, 64, 1, tuple(range(2, 17)), 290, 0.045)
+
 
 def _opus_split_fit(gfx: str, kernel: str, h: int) -> _SplitFit:
     """The split-K fit of the ``kernel`` (v4_a16w16, v4_a8w8, v41_a8w8, v41_a8w4) variant that
@@ -315,6 +319,10 @@ def _auto_kv_splits(fit: _SplitFit, n: int, h: int, nnz: int, cu_num: int) -> in
         return walk + (fit.c0 + fit.c1 * n * h * s if s > 1 else 0)
 
     return min([1, *(s for s in fit.counts if s <= max_splits)], key=cost)
+
+
+def _asm_v41_kv_splits(n: int, nnz: int, cu_num: int) -> int:
+    return _auto_kv_splits(_ASM_V41_INITIAL_SPLIT_FIT, n, 64, nnz, cu_num)
 
 
 def _kv_splits(
@@ -789,8 +797,13 @@ def mla_sparse_prefill_v41(
     or fp8_e8m0, one per 32 values). Same argument order as
     :func:`mla_sparse_prefill_v4`, with the RoPE tensors replaced by the scales.
     Supported (q, unified_kv, kv) dtypes: (fp8, fp8, fp8) on gfx950 and gfx1250, and
-    (fp8, fp4x2, fp8) on gfx950 with an NVFP4 prefix source: e2m1 pairs (fp4x2 or uint8,
-    the even value in the low nibble) with an e4m3 scale (fp8 or uint8) per 16 values.
+    (fp8, fp4x2, fp8) on gfx950 (opus) and gfx1250 H64 (asm), with an NVFP4
+    prefix source: e2m1 pairs (fp4x2 or uint8, the even value in the low nibble)
+    with an e4m3 scale (fp8 or uint8) per 16 values. The asm backend requires
+    contiguous, separate data and scale arrays; it does not unpack interleaved
+    288-byte CSA rows. Its fixed sink path requires softmax_scale to have the
+    same FP32 value as 1/sqrt(512). CSR indices define all visibility, including
+    causal masks.
 
     Args:
       q:                 ``[T, H, 512]`` query.
@@ -812,15 +825,29 @@ def mla_sparse_prefill_v41(
       softmax_scale:     float scalar applied to the QK^T scores.
       out:               Optional ``[T, H, 512]`` bf16 output buffer; allocated
         if ``None``.
-      num_kv_splits:     as in :func:`mla_sparse_prefill` (opus only); on gfx1250,
-        2, 4, 8 or 16 fold in the same launch.
-      backend:           ``"opus"`` or ``None``.
+      num_kv_splits:     opus: as in :func:`mla_sparse_prefill`; on gfx1250,
+        2, 4, 8 or 16 fold in the same launch. asm: an integer in [1, 16].
+        With ``None``, asm uses 1 split for N > 64. For N <= 64, an average of
+        512 prefix rows uses 1 split; 1024 prefix rows use 4 splits at N <= 32
+        and 2 otherwise. Other prefix lengths use the ASM fallback heuristic.
+        Extend rows do not count toward the prefix average. asm fuses reduction
+        in the same launch and allocates workspace internally.
+      backend:           ``"asm"``, ``"opus"`` or ``None``. Default selects asm
+        for a gfx1250 H64 NVFP4 prefix, otherwise opus.
 
     Returns:
       ``out`` (``[T, H, 512]`` bf16).
     """
-    _check_backend("mla_sparse_prefill_v41", backend, ("opus",))
-    return _opus_sparse_prefill_v41(
+    _check_backend("mla_sparse_prefill_v41", backend, ("asm", "opus"))
+    use_asm = backend == "asm" or (
+        backend is None
+        and q.dim() == 3
+        and q.size(1) == 64
+        and unified_kv.dtype in (torch.uint8, dtypes.fp4x2)
+        and get_gfx_runtime() == "gfx1250"
+    )
+    implementation = _asm_sparse_prefill_v41 if use_asm else _opus_sparse_prefill_v41
+    return implementation(
         q,
         q_scale,
         unified_kv,
