@@ -2327,6 +2327,37 @@ class CustomAllreduce:
         )
         return out, res_out
 
+    def should_lamport_ar_add(self, inp: torch.Tensor, other: torch.Tensor) -> bool:
+        """Whether lamport_ar_add takes this call (gfx1250, IPC transport).
+
+        Shapes, dtypes and the size cap only, so every rank decides the same;
+        the kernel waits for its peers, a rank taking another path would hang
+        them.
+        """
+        if self.disabled or self._lamport_max_bytes <= 0:
+            return False
+        nbytes = inp.numel() * inp.element_size()
+        return (
+            inp.dtype in (torch.float16, torch.bfloat16)
+            and other.dtype == inp.dtype
+            and other.shape == inp.shape
+            and inp.is_contiguous()
+            and other.is_contiguous()
+            and inp.data_ptr() % 16 == 0
+            and other.data_ptr() % 16 == 0
+            and nbytes % 16 == 0
+            and 0 < nbytes <= self._lamport_max_bytes
+        )
+
+    def lamport_ar_add(self, inp: torch.Tensor, other: torch.Tensor) -> torch.Tensor:
+        """Lamport one-shot all-reduce of inp + other on the AR + RMSNorm inbox,
+        with the bits of all-reducing the materialized sum. Needs no registered
+        input, so it runs the same eager and in a captured graph. Check
+        should_lamport_ar_add first."""
+        out = torch.empty_like(inp)
+        ops.allreduce_add_lamport_gfx1250(self._ptr, inp, other, out)
+        return out
+
     def should_fuse_ar_residual(self, inp: torch.Tensor) -> bool:
         """Whether custom_all_reduce_residual beats all-reduce + add here."""
         key = (_runtime_gfx(), self.world_size)

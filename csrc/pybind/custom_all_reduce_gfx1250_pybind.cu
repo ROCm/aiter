@@ -51,6 +51,8 @@ PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
     m.def("fused_allreduce_rmsnorm_lamport", &aiter::fused_allreduce_rmsnorm_lamport,
           py::arg("_fa"), py::arg("inp"), py::arg("res_inp"), py::arg("res_out"),
           py::arg("out"), py::arg("w"), py::arg("eps"), py::arg("gemma_norm") = false);
+    m.def("allreduce_add_lamport", &aiter::allreduce_add_lamport,
+          py::arg("_fa"), py::arg("inp"), py::arg("other"), py::arg("out"));
     m.def("dispose", &aiter::dispose, py::arg("_fa"));
     // Default is the max world size, so callers that omit it get a buffer safe
     // for every supported world size.

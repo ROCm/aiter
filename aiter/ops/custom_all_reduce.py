@@ -402,6 +402,17 @@ def fused_allreduce_rmsnorm_lamport_gfx1250(
 ) -> None: ...
 
 
+# Lamport one-shot all-reduce of inp + other, on the same inbox as the fused
+# AR + RMSNorm above (init_lamport_ar_rms_gfx1250).
+@compile_ops(GFX1250_MD_NAME, fc_name="allreduce_add_lamport", develop=True)
+def allreduce_add_lamport_gfx1250(
+    _fa: int,
+    inp: torch.Tensor,
+    other: torch.Tensor,
+    out: torch.Tensor,
+) -> None: ...
+
+
 @compile_ops(GFX1250_MD_NAME, fc_name="p2p_bw_test", develop=True)
 def p2p_bw_test_gfx1250(
     _fa: int,

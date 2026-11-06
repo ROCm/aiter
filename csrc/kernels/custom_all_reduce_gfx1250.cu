@@ -696,6 +696,39 @@ void fused_allreduce_rmsnorm_lamport(fptr_t _fa,
 #undef RUN_LAMPORT_RMS
 }
 
+void allreduce_add_lamport(fptr_t _fa,
+                           const aiter_tensor_t& inp,
+                           const aiter_tensor_t& other,
+                           const aiter_tensor_t& out)
+{
+    HipDeviceGuard device_guard(inp.device_id);
+    hipStream_t stream = aiter::getCurrentHIPStream();
+    auto fa            = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    for(const aiter_tensor_t* t : {&other, &out})
+        if(t->numel() != inp.numel() || t->dtype() != inp.dtype() || !t->is_contiguous() ||
+           t->device_id != inp.device_id)
+            throw std::runtime_error(
+                "allreduce_add_lamport requires matching contiguous other and out");
+    if(!inp.is_contiguous())
+        throw std::runtime_error("allreduce_add_lamport requires a contiguous input");
+
+#define RUN_LAMPORT_ADD(T)                                                     \
+    fa->allreduce_add_lamport<T>(stream,                                       \
+                                 reinterpret_cast<const T*>(inp.data_ptr()),   \
+                                 reinterpret_cast<const T*>(other.data_ptr()), \
+                                 reinterpret_cast<T*>(out.data_ptr()),         \
+                                 inp.numel())
+
+    switch(inp.dtype())
+    {
+    case AITER_DTYPE_fp16: RUN_LAMPORT_ADD(opus::fp16_t); break;
+    case AITER_DTYPE_bf16: RUN_LAMPORT_ADD(opus::bf16_t); break;
+    default:
+        throw std::runtime_error("allreduce_add_lamport only supports float16 and bfloat16");
+    }
+#undef RUN_LAMPORT_ADD
+}
+
 void fused_allreduce_rmsnorm_quant(fptr_t _fa,
                                    const aiter_tensor_t& inp,
                                    const aiter_tensor_t& res_inp,

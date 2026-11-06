@@ -233,6 +233,22 @@ class CudaCommunicator(DeviceCommunicatorBase):
             self.all2all_backend if value is not None else None
         )
 
+    def all_reduce_add(
+        self,
+        input_,
+        other,
+        use_new: bool = True,
+        ca_fp8_quant: bool = False,
+        prefill_support: bool = False,
+    ) -> torch.Tensor:
+        """all_reduce(input_ + other). gfx1250: the Lamport one-shot kernel adds
+        the pair as it sends, so the sum is never written; elsewhere the add
+        and then all_reduce."""
+        ca_comm = self.ca_comm
+        if ca_comm is not None and ca_comm.should_lamport_ar_add(input_, other):
+            return ca_comm.lamport_ar_add(input_, other)
+        return self.all_reduce(input_ + other, use_new, ca_fp8_quant, prefill_support)
+
     def all_reduce(
         self,
         input_,

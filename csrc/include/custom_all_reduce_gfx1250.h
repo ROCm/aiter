@@ -91,6 +91,11 @@ void fused_allreduce_rmsnorm_lamport(fptr_t _fa,
                                      const aiter_tensor_t& w,
                                      double eps,
                                      bool gemma_norm);
+// Lamport one-shot all-reduce of inp + other on the init_lamport_ar_rms inbox.
+void allreduce_add_lamport(fptr_t _fa,
+                           const aiter_tensor_t& inp,
+                           const aiter_tensor_t& other,
+                           const aiter_tensor_t& out);
 void p2p_bw_test(fptr_t _fa,
                   const aiter_tensor_t& inp,
                   const aiter_tensor_t& out,
