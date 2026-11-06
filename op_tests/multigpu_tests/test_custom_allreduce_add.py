@@ -35,18 +35,20 @@ KB = 1024
 # gfx950 aligned cutovers: plain LL 32 / 40 / 64 KB, fused LL 56 / 64 / 80 KB,
 # fused LL128 208 KB. Unaligned: plain LL 48 / 56 / 72 KB, plain LL128 96 KB,
 # fused LL 80 / 96 / 112 KB, fused LL128 384 KB, 1-stage 104 / 256 KB.
+# Lamport (bf16/fp16): one-shot 64 / 128 KB, two-shot (aligned) 1024 / 2048 KB;
+# with an addend it runs on the staged sum above fused LL at 24 / 48 KB.
 # Original limits: 1-stage 80 / 160 KB, TP4 LL128 128 KB. 16 / 48 / 112 B have
 # fewer 16-byte packs than ranks, which 2-stage can't split (fp32 bypasses LL).
 SIZES_BYTES = sorted(
     {16, 48, 112, 16 * KB, 32 * KB + 16, 1024 * KB + 16, 4096 * KB}
     | {
         cap * KB + off
-        for cap in (32, 40, 56, 64, 80, 160, 208, 256, 384, 1024)
+        for cap in (24, 32, 40, 48, 56, 64, 80, 160, 208, 256, 384, 1024, 2048)
         for off in (0, 128)
     }
     | {
         cap * KB + off
-        for cap in (48, 56, 72, 80, 96, 104, 112, 128, 160, 256, 384)
+        for cap in (24, 48, 56, 64, 72, 80, 96, 104, 112, 128, 160, 256, 384)
         for off in (-16, 16)
     }
 )

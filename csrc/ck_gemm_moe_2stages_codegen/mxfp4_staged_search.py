@@ -254,8 +254,6 @@ def _validate_gemm1_contract(
             "GEMM1 activation does not match the shape activation: "
             f"{parsed_gemm1['act']!r} != {expected_activation!r}"
         )
-    if parsed_gemm1["enable_bias"]:
-        raise ValueError("GEMM1 bias is unsupported by staged MXFP4 search")
 
 
 def _shape_activation(shape_row: Mapping[str, Any]) -> str:
