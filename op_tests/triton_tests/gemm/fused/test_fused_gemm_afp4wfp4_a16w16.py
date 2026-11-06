@@ -76,12 +76,17 @@ def run_triton(
 
 def get_x_vals():
 
+    m_vals = [1, 8, 32, 64, 128, 8192]
+    if arch_info.is_sw_emulated_fp4_avail():
+        # The preshuffled table there bounds M at 31: M < 32 must get a
+        # BLOCK_SIZE_M of 16 or less, or the wrapper's assert fails.
+        m_vals += [16, 17, 31]
     x_vals = [
         (m, n1, n2, k)
         for k in [1024, 8192, 7168]
         for n2 in [256, 512]
         for n1 in [256, 512]
-        for m in [1, 8, 32, 64, 128, 8192]
+        for m in m_vals
     ]
     return x_vals
 

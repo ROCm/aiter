@@ -171,23 +171,40 @@ def e8m0_to_f32(x):
     return x_f32
 
 
-def run_torch(x, w, x_scales, w_scales, dtype):
+def _run_torch_one_batch(x, w, x_scales, w_scales, dtype):
     # First convert the x and w inputs to f32.
-    x_f32 = mxfp4_to_f32(x)  # -> (B, M, K)
-    w_f32 = mxfp4_to_f32(w)  # -> (B, N, K)
+    x_f32 = mxfp4_to_f32(x)  # -> (1, M, K)
+    w_f32 = mxfp4_to_f32(w)  # -> (1, N, K)
     # Next convert the e8m0 scales to f32.
     x_scales = x_scales.repeat_interleave(SCALE_GROUP_SIZE, dim=-1).to(
         torch.float32
-    )  # -> (B, M, K)
+    )  # -> (1, M, K)
     x_scales_f32 = e8m0_to_f32(x_scales)
     x_f32 = x_f32 * x_scales_f32
     w_scales = w_scales.repeat_interleave(SCALE_GROUP_SIZE, dim=-1).to(
         torch.float32
-    )  # -> (B, N, K)
+    )  # -> (1, N, K)
     w_scales_f32 = e8m0_to_f32(w_scales)
     assert w_scales_f32.shape == w_scales.shape
     w_f32 = w_f32 * w_scales_f32
     return torch.bmm(x_f32, w_f32.transpose(1, 2)).to(dtype)
+
+
+def run_torch(x, w, x_scales, w_scales, dtype):
+    # One batch at a time: the f32 copies of the operands and scales are the
+    # memory peak, and for B=5, N=K=16384 they do not fit on a 16 GiB card
+    # when the whole batch is converted at once.
+    B, M, N = x.shape[0], x.shape[1], w.shape[1]
+    out = torch.empty((B, M, N), dtype=dtype, device=x.device)
+    for b in range(B):
+        out[b : b + 1] = _run_torch_one_batch(
+            x[b : b + 1],
+            w[b : b + 1],
+            x_scales[b : b + 1],
+            w_scales[b : b + 1],
+            dtype,
+        )
+    return out
 
 
 def _assert_close(torch_out, out):
