@@ -838,6 +838,7 @@ class Gfx1250Traits:
     # Number of aligned records per sequence in optional cluster_info.
     cluster_task_stride: int = 0
     plan_tile_tokens: int = 256
+    single_task_tile: bool = False
 
     WAVE = 32
     NWARP = 4
@@ -1041,6 +1042,18 @@ class Gfx1250Traits:
 
     @property
     def buffers(self):
+        if (
+            self.single_task_tile
+            and self.plan_tile_tokens == 128
+            and not self.bf16
+            and self.packed_lds
+            and self.TOKENS == 128
+            and self.m_tiles == 1
+            and self.sliding_window == 0
+        ):
+            # No subsequent page can overwrite this buffer. BF16 wave merge
+            # still needs its second buffer and does not select this case.
+            return 1
         if self.packed_lds:
             # Multi-tile 64-token chunks overlap gathered pages or windowed
             # staging just like the 128-token asynchronous page path.

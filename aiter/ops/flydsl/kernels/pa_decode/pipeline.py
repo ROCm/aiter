@@ -2346,7 +2346,11 @@ class Gfx1250Pipeline:
                 # barrier, which every wave reaches after these reads. The next
                 # iteration's barrier likewise retires them before a double
                 # buffer is reused; single-buffer staging still needs one here.
-                if const_expr(t.buffers == 1 and m + 1 == t.m_tiles):
+                if const_expr(
+                    t.buffers == 1
+                    and m + 1 == t.m_tiles
+                    and not (t.single_task_tile and t.plan_tile_tokens == t.TOKENS)
+                ):
                     gpu.barrier()
             if const_expr(t.buffers == 1):  # noqa: SIM102
                 if token_base + t.TOKENS < end:

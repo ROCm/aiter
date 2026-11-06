@@ -253,6 +253,24 @@ def compile_pa_decode_tile(
                 and sliding_window == 0
                 else 1
             )
+        # Capacity covers every row's upper tile bound, so each visible
+        # tile gets its own task even with empty/mixed rows.
+        tile_bound = (
+            max(1, -(-max_context_length // plan_tile_tokens))
+            if max_context_length is not None and max_context_length > 0
+            else 0
+        )
+        single_task_tile = bool(
+            tile_bound
+            and kv_dtype == "fp8"
+            and plan_tile_tokens == 128
+            and block_size == 128
+            and query_group_size == 16
+            and query_length == 1
+            and sliding_window == 0
+            and num_partitions >= tile_bound
+            and work_capacity >= num_seqs * tile_bound
+        )
         return compile_gfx1250_pa_decode(
             head_dim=head_dim,
             query_group_size=query_group_size,
@@ -271,6 +289,7 @@ def compile_pa_decode_tile(
             packed_scale_heads=packed_scale_heads,
             cluster_task_stride=cluster_task_stride,
             plan_tile_tokens=plan_tile_tokens,
+            single_task_tile=single_task_tile,
         )
     if plan_tile_tokens != KV_COMPUTE_BLOCK:
         raise ValueError("128-token work plans require gfx1250 tile kernels")
@@ -551,6 +570,7 @@ def compile_gfx1250_pa_decode(
     packed_scale_heads=False,
     cluster_task_stride=0,
     plan_tile_tokens=256,
+    single_task_tile=False,
 ):
     """Compile a gfx1250 tile kernel; merging partitions writes final output.
 
@@ -563,6 +583,11 @@ def compile_gfx1250_pa_decode(
     and empty sequences clear their rows.
     ``merge_partitions`` partial storage must be eight-byte aligned for its
     device-scope atomic accesses; the host wrapper falls back for offset views.
+    ``single_task_tile`` is internal: the standard planner must have enough
+    capacity and partition cap to give every tile its own task within the
+    validated context bound. Active tasks then end at start+1, while padding
+    still uses its original record bounds. Single-page packed FP8 can retain
+    one KV buffer and skip its final reuse barrier; BF16 wave merge keeps two.
     ``plan_tile_tokens`` matches the plan's 128/256-token units; the value
     participates in the kernel cache key and planned range conversion.
     ``cluster_task_stride`` selects optional [batch, stride, 8] records; it
@@ -591,6 +616,7 @@ def compile_gfx1250_pa_decode(
         packed_scale_heads,
         cluster_task_stride,
         plan_tile_tokens,
+        single_task_tile,
     )
     if type(plan_tile_tokens) is not int or plan_tile_tokens not in (128, 256):
         raise ValueError("plan_tile_tokens must be 128 or 256")
@@ -759,7 +785,11 @@ def compile_gfx1250_pa_decode(
                 sequences,
                 fx.Int32(task[0]),
                 fx.Int32(task[1]),
-                fx.Int32(task[2]),
+                (
+                    fx.Int32(task[1]) + 1
+                    if const_expr(t.single_task_tile)
+                    else fx.Int32(task[2])
+                ),
                 fx.Int32(task[3]),
             )
             # Packed partials are [KV heads, capacity, rows] by task slot.

@@ -882,6 +882,19 @@ _COMMON_CASES = [
 ]
 _FP8_CASES = _COMMON_CASES + [
     (
+        "single-page-plan128",
+        {
+            "group_size": 16,
+            "block_size": 128,
+            "lengths": (0, 1, 31, 127, 128, 129, 8192),
+            "max_partitions": 64,
+            "max_context": 8192,
+            "tile_tokens": 128,
+            "single_page": True,
+            "capture": True,
+        },
+    ),
+    (
         "cluster8-scale-head-padding",
         {
             "kv_heads": 2,
@@ -1731,6 +1744,19 @@ def _check_pipe_policy(pa, case, arch, compile_kwargs):
     from aiter.ops.flydsl.kernels.pa_decode.traits import PaDecodeSchedule
 
     assert compile_kwargs[-1]["wide_kv_addressing"] == case["wide"]
+    if case.get("single_page") and arch == "gfx1250":
+        from aiter.ops.flydsl.kernels import pa_decode_kernel as kernels
+
+        selected = compile_kwargs[-1]
+        assert selected["plan_tile_tokens"] == 128
+        compiled = pa.compile_pa_decode_tile(**selected)
+        traits = [
+            t
+            for t, entry in kernels._GFX1250_PA_DECODE_CACHE.items()
+            if entry is compiled
+        ]
+        assert len(traits) == 1
+        assert traits[0].single_task_tile and traits[0].buffers == 1
     if case["cluster"] is not None:
         expected = case["cluster"] if arch == "gfx1250" else 0
         assert compile_kwargs[-1]["cluster_merge"] == expected
