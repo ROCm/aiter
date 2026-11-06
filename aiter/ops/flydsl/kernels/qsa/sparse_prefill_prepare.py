@@ -65,7 +65,7 @@ class SparsePlan:
     num_tiles: int
     grid: int
     route_costs: tuple
-    route_model: tuple  # platform union_fixed, union_step, row_step, route_margin
+    route_model: tuple  # platform union_fixed, union_step, row_step, route_margin, route_all_or_none
     union_ratio: float
     routing: bool = True
     # Slot-table launches (K/V read from a token pool through kv_slots): K3 writes each union block's
@@ -857,7 +857,7 @@ def _route_cost(
     union_sum, union_max, direct_sum, direct_max, task_share, step, fixed, model
 ):
     # Separate multiplies and adds, as in the fitted model.
-    union_fixed, union_step, row_step, _ = model
+    union_fixed, union_step, row_step = model[:3]
     union = fx.Float32(union_fixed) + fx.Float32(union_step) * fx.max(
         fx.Float32(union_max), fx.Float32(union_sum) * task_share
     )
@@ -870,7 +870,7 @@ def _route_cost(
 
 def _route_choice(totals, limits, task_share, step, fixed, model):
     """The limit of the cheapest candidate; totals hold 4 sums per candidate."""
-    for j in range(LIMITS):
+    for j in range(len(limits)):
         cost = _route_cost(*totals[4 * j : 4 * j + 4], task_share, step, fixed, model)
         if j == 0:
             # Keeping every union tile wins ties and must be route_margin slower to lose.
@@ -914,7 +914,12 @@ def _route(
     ] + [fx.Int32(-1)]
     threshold = union_max
     # Only a union phase set by its longest task, not by throughput, gains from a shorter one.
-    if fx.Float32(union_max) > fx.Float32(union_sum) * TASK_SHARE:
+    # A throughput-bound one can still cost more than no union at all: a tile's union grows with
+    # how far its rows' selections spread, its direct work only with each row's top-k. So with
+    # route_all_or_none (ROUTE_MODEL[4]), K3 weighs keeping every union tile against none there.
+    longest = fx.Float32(union_max) > fx.Float32(union_sum) * TASK_SHARE
+    compare = True if fx.const_expr(ROUTE_MODEL[4]) else longest
+    if compare:
         kept_sum, kept_max = [zero] * LIMITS, [zero] * LIMITS
         direct_sum, direct_max = [zero] * LIMITS, [zero] * LIMITS
         for tile in range(tid, TILES, THREADS):
@@ -942,6 +947,16 @@ def _route(
         threshold = _route_choice(
             totals, limits, TASK_SHARE, DIRECT_STEP, DIRECT_FIXED, ROUTE_MODEL
         )
+        if fx.const_expr(ROUTE_MODEL[4]):
+            every_or_none = _route_choice(
+                totals[:4] + totals[-4:],
+                [limits[0], limits[-1]],
+                TASK_SHARE,
+                DIRECT_STEP,
+                DIRECT_FIXED,
+                ROUTE_MODEL,
+            )
+            threshold = longest.select(threshold, every_or_none)
     return threshold
 
 
@@ -1454,6 +1469,7 @@ def allocate_plan(
             config.union_step,
             config.row_step,
             config.route_margin,
+            config.route_all_or_none,
         ),
         union_ratio=config.union_ratio,
         slotted=slotted,

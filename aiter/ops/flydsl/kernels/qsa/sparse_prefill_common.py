@@ -60,6 +60,9 @@ class Platform:
     # Past that budget, direct still packs a context of at most this many tokens per query row
     # (packing copies the whole context each call).
     pack_tokens_per_row: int
+    # K3 also weighs keeping every union tile against none when the union phase is set by
+    # throughput (sparse_prefill_prepare.py _route); a compile-time switch of K3.
+    route_all_or_none: bool = False
 
 
 PLATFORMS = {
@@ -127,7 +130,9 @@ def platform() -> Platform:
             raise ValueError(
                 f"{OVERRIDE}: expected name=value with name in {sorted(names)}"
             )
-        values[name] = type(getattr(entry, name))(value)
+        kind = type(getattr(entry, name))
+        # bool("0") is True: a switch is written 0 or 1.
+        values[name] = bool(int(value)) if kind is bool else kind(value)
     entry = dataclasses.replace(entry, **values)
     values = dataclasses.astuple(entry)
     if not all(math.isfinite(v) and v >= 0 for v in values) or entry.route_margin >= 1:
