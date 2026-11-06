@@ -818,6 +818,19 @@ _COMMON_CASES = [
 ]
 _FP8_CASES = _COMMON_CASES + [
     (
+        "cluster8-scale-head-padding",
+        {
+            "kv_heads": 2,
+            "group_size": 8,
+            "block_size": 16,
+            "lengths": (0, 1, 33, 129, 257, 1027, 2048),
+            "max_partitions": 8,
+            "scale_head_padding": 8,
+            "cluster": 8,
+            "capture": True,
+        },
+    ),
+    (
         "packed-mtp4",
         {
             "query_length": 4,
@@ -1663,6 +1676,7 @@ def _check_pipe_policy(pa, case, arch, compile_kwargs):
         schedule_kwargs.pop("architecture", None)
         schedule_kwargs.pop("direct_output", None)
         schedule_kwargs.pop("cluster_merge", None)
+        schedule_kwargs.pop("packed_scale_heads", None)
         pipe, staged = PaDecodeSchedule.select(**schedule_kwargs).cache_key[-2:]
         assert pipe == (arch == "gfx950")
         if pipe:
@@ -1862,6 +1876,22 @@ def test_pa_decode(case, device, monkeypatch):
             quantize = pertoken_quant if mode == "per-token" else per_tensor_quant
             key, key_scale = quantize(key, quant_dtype=compute_type)
             value, value_scale = quantize(value, quant_dtype=compute_type)
+            if mode == "per-token" and case.get("scale_head_padding", 0):
+                # NaN padding makes an assumed packed head stride observable
+                # on KV head 1, while the token dimension remains contiguous.
+                def pad_scale_heads(scale):
+                    shape = scale.shape[:-1]
+                    padded = torch.full(
+                        (*shape[:-1], shape[-1] + case["scale_head_padding"]),
+                        float("nan"),
+                        dtype=scale.dtype,
+                        device=scale.device,
+                    )
+                    padded[..., : shape[-1]].copy_(scale.squeeze(-1))
+                    return padded[..., : shape[-1]].unsqueeze(-1)
+
+                key_scale = pad_scale_heads(key_scale)
+                value_scale = pad_scale_heads(value_scale)
         else:
             key, value = key.to(compute_type), value.to(compute_type)
             if mode == "python":

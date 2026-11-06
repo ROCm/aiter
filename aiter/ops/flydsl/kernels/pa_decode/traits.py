@@ -833,6 +833,8 @@ class Gfx1250Traits:
     merge_partitions: bool = False
     # Workgroups per sequence cluster that merges its partitions; 0 disables.
     cluster_merge: int = 0
+    # Validated per-token scales have head stride equal to block_size.
+    packed_scale_heads: bool = False
 
     WAVE = 32
     NWARP = 4
@@ -843,6 +845,16 @@ class Gfx1250Traits:
     def merged_output(self):
         # Tasks of multi-partition sequences merge partials in the tile kernel.
         return self.merge_partitions or self.cluster_merge > 0
+
+    @property
+    def compact_fp8_cluster(self):
+        # Cluster output needs neither sequence count nor arrival counters.
+        # Scalar scales omit head stride; packed token scales make it constant.
+        return (
+            not self.bf16
+            and self.cluster_merge > 0
+            and (not self.per_token_kv or self.packed_scale_heads)
+        )
 
     @property
     def bf16_packed(self):

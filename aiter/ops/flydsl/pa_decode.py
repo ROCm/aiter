@@ -1017,6 +1017,9 @@ def pa_decode(
             trans_k=trans_k,
             mask_unowned_kv=mask_unowned_kv,
             cluster_merge=cluster_merge,
+            packed_scale_heads=bool(
+                cluster_merge and per_token_kv and stride_ks_head == block_size
+            ),
         )
 
     total_rows = query_length * query_group_size
