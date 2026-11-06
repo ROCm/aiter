@@ -581,8 +581,7 @@ def _gluon_flash_attn_forward(
         KV_STRIDE_ALIGN=kv_stride_align,
         # fp8 keeps the per-tile scale: q is already fp8, so re-rounding q*scale back
         # into fp8 would throw away far more than the multiply costs.  So does fp16:
-        # q*scale can leave its range where the fp32 scores would not -- overflow
-        # for a large scale, underflow to zero for a small q times a small scale.
+        # q*scale can overflow it where the fp32 scores would not.
         SCALE_ON_Q=not IS_FP8 and q.dtype != torch.float16,
         **config,
         enable_fp_fusion=True,
