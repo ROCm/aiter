@@ -703,6 +703,20 @@ namespace py = pybind11;
           py::arg("reg_bytes"));                                                     \
     m.def("dispose", &aiter::dispose, py::arg("_fa"));                               \
     m.def("meta_size", &aiter::meta_size);                                           \
+    m.def("lamportBufferSize", &aiter::lamportBufferSize, py::arg("world_size"));    \
+    m.def("initLamport",                                                             \
+          &aiter::initLamport,                                                       \
+          py::arg("_fa"),                                                            \
+          py::arg("self_ptr"),                                                       \
+          py::arg("ipc_handle_ptrs"),                                                \
+          py::arg("offsets"));                                                       \
+    m.def("lamportKernel", &aiter::lamportKernel, py::arg("_fa"), py::arg("numel")); \
+    m.def("lamportAllReduce",                                                        \
+          &aiter::lamportAllReduce,                                                  \
+          py::arg("_fa"),                                                            \
+          py::arg("inp"),                                                            \
+          py::arg("out"),                                                            \
+          py::arg("kernel"));                                                        \
     m.def("register_input_buffer",                                                   \
           &aiter::register_input_buffer,                                             \
           py::arg("_fa"),                                                            \

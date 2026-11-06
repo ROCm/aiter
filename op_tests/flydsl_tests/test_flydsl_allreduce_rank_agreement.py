@@ -97,8 +97,8 @@ def _build(owner: str, group, rank: int):
     if owner == "oneshot":
         from aiter.dist.device_communicators.custom_all_reduce import (
             CustomAllreduce,
-            _resolve_car_max_size,
             _resolve_car_min_size,
+            _resolve_custom_sizes,
         )
 
         ca = CustomAllreduce.__new__(CustomAllreduce)
@@ -108,7 +108,7 @@ def _build(owner: str, group, rank: int):
         ca.world_size = WORLD
         ca.device = torch.device("cpu")
         ca.fully_connected = True
-        ca._car_max_size = _resolve_car_max_size(128 << 20)
+        ca._car_max_size = _resolve_custom_sizes(False, WORLD, 128 << 20).ar
         ca._car_min_size = _resolve_car_min_size()
         ca._fly_oneshot = None
         ca._fly_window = None
