@@ -580,8 +580,8 @@ def _attention_ps_reduce_asm(
 ) -> None:
     """Merge compatible PS-mode split-attention outputs and LSE on gfx950.
 
-    Partial output must be contiguous FP32 or BF16, and partial LSE must be
-    FP32, with compatible int32 reduction maps on the output device.
+    Partial output and partial LSE must be contiguous FP32 tensors, with
+    compatible int32 reduction maps on the output device.
     Output is BF16/FP16 [queries, heads,
     128]; optional final LSE is FP32. The producer must follow the same partial
     layout and LSE convention. No paged-KV or causal-mask inputs are consumed.
@@ -628,7 +628,6 @@ def pa_persistent_fwd(
     high_precision: int = 1,
     reduce_waves: int = 0,
     return_lse: bool = True,
-    partial_output: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Run persistent attention and merge only materialized partial outputs.
 
@@ -642,13 +641,8 @@ def pa_persistent_fwd(
     retain the original heuristic. No tuning or device-to-host readback occurs.
     return_lse=False skips final LSE allocation and computation and returns None
     for the second result. The default preserves the existing LSE output.
-    Split work defaults to FP32 partials and FP32 LSE. Metadata partial=-1
+    Split work always uses FP32 partials and FP32 LSE. Metadata partial=-1
     selects direct output in Q's dtype without materializing a partial or LSE.
-    partial_output optionally supplies the contiguous split-output buffer with
-    shape [reduce_partial_map.numel() * max_qlen, 1, nhead, v_head_dim]. Its dtype
-    selects FP32 or BF16 storage; omitted buffers default to FP32. BF16 storage
-    requires return_lse=False and retains FP32 split LSE. Metadata is independent
-    of storage dtype, and partial=-1 always selects direct output.
     """
     device = Q.device
     total_s, nhead, v_head_dim = output.shape
@@ -665,45 +659,13 @@ def pa_persistent_fwd(
         raise ValueError(
             "explicit reduce_waves requires the gfx950/page16/D128 ASM reducer"
         )
-    partial_shape = (reduce_partial_map.size(0) * max_qlen, 1, nhead, v_head_dim)
-    if partial_output is not None:
-        if not isinstance(partial_output, torch.Tensor):
-            raise TypeError("partial_output must be a tensor")
-        if (
-            partial_output.dtype not in (dtypes.fp32, dtypes.bf16)
-            or tuple(partial_output.shape) != partial_shape
-            or partial_output.device != device
-            or not partial_output.is_contiguous()
-        ):
-            raise ValueError(
-                "partial_output must be contiguous FP32/BF16 on Q's device "
-                f"with shape {partial_shape}"
-            )
-    use_bf16_partials = (
-        partial_output is not None and partial_output.dtype == dtypes.bf16
-    )
-    if use_bf16_partials and not (
-        use_asm_reduce
-        and not return_lse
-        and Q.dtype == dtypes.bf16
-        and output.dtype == dtypes.bf16
-        and max_qlen == 4
-        and nhead == 16
-        and K.shape[1] == 1
-        and K.dtype == dtypes.fp8
-        and V.dtype == dtypes.fp8
-        and quant_type == QuantType.per_Token
-        and mask == 1
-    ):
-        raise ValueError(
-            "BF16 partials require gfx950 BF16 Q4/GQA16 FP8 causal PA "
-            "and return_lse=False"
-        )
     if softmax_scale is None:
         softmax_scale = 1.0 / (v_head_dim**0.5)
-    logits = partial_output
-    if logits is None:
-        logits = torch.empty(partial_shape, dtype=dtypes.fp32, device=device)
+    logits = torch.empty(
+        (reduce_partial_map.size(0) * max_qlen, 1, nhead, v_head_dim),
+        dtype=dtypes.fp32,
+        device=device,
+    )
     splitLse = torch.empty(
         (reduce_partial_map.size(0) * max_qlen, 1, nhead, 1),
         dtype=dtypes.fp32,
@@ -757,13 +719,6 @@ def pa_persistent_fwd(
             kv_indices.numel(),
             torch.cuda.get_device_properties(device).multi_processor_count,
         )
-        if (
-            use_bf16_partials
-            and 4 <= batch_size <= 8
-            and torch.cuda.get_device_properties(device).multi_processor_count == 256
-            and kv_indices.numel() * 16 >= batch_size * 32768
-        ):
-            reduce_waves = 8
     reduce_fn = _attention_ps_reduce_asm if use_asm_reduce else pa_reduce_v1
     reduce_args = (reduce_waves,) if use_asm_reduce else ()
     reduce_fn(
