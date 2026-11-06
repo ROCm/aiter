@@ -39,6 +39,8 @@ from .sparse_prefill_common import (
     _buffer,
     _buffer_words,
     _exp,
+    _kv_extent,
+    _kv_offset,
     _lds_load,
     _lds_store,
     _maximum,
@@ -286,16 +288,12 @@ def _kv_resources(K, V, k0, kv_len, nk, hkv, hk, slotted, stride):
     pool (whose span the host keeps within unsigned 32-bit offsets). K/V rows sit stride
     elements apart: hk * 256 values, then a gap of padding."""
     rows, gap = nk if slotted else kv_len, stride - hk * 256
-    first = fx.Int64(0) if slotted else fx.Int64(k0) * hk
-    extent = (fx.Uint32(rows) * hk - hkv) * 512
-    if gap:
-        extent = extent + fx.Uint32(rows - 1) * (gap * 2)
+    first = fx.Int64(0) if slotted else fx.Int64(k0)
+    extent = _kv_extent(rows, hkv, hk, gap)
     layout = fx.make_layout(extent // 2, 1)
 
     def resource(tensor):
-        pointer = fx.get_iter(tensor) + (first + hkv) * 256
-        if gap and not slotted:
-            pointer = pointer + fx.Int64(k0) * gap
+        pointer = fx.get_iter(tensor) + _kv_offset(first, hkv, hk, gap)
         return _buffer(fx.make_view(pointer, layout), extent)
 
     return resource(K), resource(V), extent

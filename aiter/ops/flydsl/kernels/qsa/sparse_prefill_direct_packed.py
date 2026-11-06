@@ -25,6 +25,8 @@ from .sparse_prefill_common import (
     _buffer_store_words,
     _buffer_words,
     _exp,
+    _kv_extent,
+    _kv_offset,
     _load_lds,
     _maximum,
     _mfma,
@@ -143,20 +145,14 @@ def _pack_block(
         # give it its own 64-bit base, so the pool may exceed 4 GiB. kr/vr are the pool
         # addresses here.
         row = _uniform(fx.Int32(slots[_uniform(start)]))
-        base = (fx.Int64(row) * hk + _uniform(head)) * 512
-        if gap:
-            base = base + fx.Int64(row) * (gap * 2)
+        base = _kv_offset(fx.Int64(row), _uniform(head), hk, gap, 2)
         kr = _buffer_at(kr + base, 4 * row_bytes)
         vr = _buffer_at(vr + base, 4 * row_bytes)
-        offset = token * hk * 512 + dim * 2
-        if gap:
-            offset = offset + token * (gap * 2)
+        offset = _kv_offset(token, 0, hk, gap, 2, dim)
         source = valid.select(fx.Uint32(offset), fx.Uint32(4 * row_bytes))
     else:
         # Tokens past a request's end are masked by the direct kernel.
-        offset = fx.Uint32((start + token) * hk + head) * 512 + dim * 2
-        if gap:
-            offset = offset + fx.Uint32(start + token) * (gap * 2)
+        offset = _kv_offset(fx.Uint32(start + token), head, hk, gap, 2, dim)
         source = valid.select(offset, source_extent)
     key = _buffer_words(kr, source)
     target = (
@@ -211,9 +207,7 @@ def _pack_body(K, V, PK, PV, SOURCES, SLOTS, N, PACKED, HK, SLOTTED, KV_STRIDE):
     lane, half = tid & 63, (tid >> 6) & 1
     first = fx.block_idx.x * 8 + (tid >> 7)
     # K/V rows sit KV_STRIDE elements apart: HK * 256 values, then a gap of padding.
-    source_extent = fx.Uint32(N) * HK * 512
-    if fx.const_expr(KV_STRIDE != HK * 256):
-        source_extent = source_extent + fx.Uint32(N - 1) * ((KV_STRIDE - HK * 256) * 2)
+    source_extent = _kv_extent(N, 0, HK, KV_STRIDE - HK * 256)
     extent = fx.Uint32(PACKED) * 4 * HK * 512
     if fx.const_expr(SLOTTED):
         kr = fx.Int64(fx.ptrtoint(fx.get_iter(K)))
@@ -558,17 +552,18 @@ def _body(
         fx.Uint32((wave * H + (lane & 15)) * 512), qe
     )
     q = _load(qr, qoffset, lane)
-    extent = (fx.Uint32(kv_len) * HK - hkv) * 512
+    # Packed K/V: dense rows.
+    extent = _kv_extent(kv_len, hkv, HK, 0)
     kr = _buffer(
         fx.make_view(
-            fx.get_iter(K) + (fx.Int64(k0) * HK + hkv) * 256,
+            fx.get_iter(K) + _kv_offset(fx.Int64(k0), hkv, HK, 0),
             fx.make_layout(extent // 2, 1),
         ),
         extent,
     )
     vr = _buffer(
         fx.make_view(
-            fx.get_iter(V) + (fx.Int64(k0) * HK + hkv) * 256,
+            fx.get_iter(V) + _kv_offset(fx.Int64(k0), hkv, HK, 0),
             fx.make_layout(extent // 2, 1),
         ),
         extent,

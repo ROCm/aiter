@@ -328,6 +328,26 @@ def _buffer_at(address, size_bytes):
     return rocdl.make_buffer_ptr(pointer, num_records_bytes=size_bytes)
 
 
+# K/V rows: hk * 256 values (KV heads of 256 dims), then gap elements of padding.
+def _kv_extent(rows, hkv, hk, gap):
+    """Bytes from KV head hkv of the first of `rows` K/V rows to the end of the last."""
+    extent = (fx.Uint32(rows) * hk - hkv) * 512
+    if gap:
+        extent = extent + fx.Uint32(rows - 1) * (gap * 2)
+    return extent
+
+
+def _kv_offset(row, head, hk, gap, scale=1, dim=None):
+    """Element offset of dim `dim` (None: 0) of KV head `head` of K/V row `row`, times
+    scale (2: the byte offset), in row's integer type."""
+    offset = (row * hk + head) * (256 * scale)
+    if dim is not None:
+        offset = offset + dim * scale
+    if gap:
+        offset = offset + row * (gap * scale)
+    return offset
+
+
 def _buffer_words(buffer, offset, words=4):
     data = fx.make_rmem_tensor(4 * words, fx.Int8)
     fx.copy(

@@ -36,6 +36,8 @@ from .sparse_prefill_common import (
     _k_reads950,
     _k_swizzle950,
     _key_row,
+    _kv_extent,
+    _kv_offset,
     _lds_row950,
     _lds_words,
     _LdsQueue,
@@ -111,22 +113,11 @@ def _kv_rows(ids, wave, row_bytes, slotted):
     return fx.Vector.from_elements(rows, fx.Int32)
 
 
-def _request_extent(kv_len, hkv, hk, gap):
-    """Bytes from KV head hkv of a request's first K/V row to the end of its last; rows hold
-    hk * D values, then gap elements of padding."""
-    extent = (fx.Uint32(kv_len) * hk - hkv) * D * 2
-    if gap:
-        extent = extent + fx.Uint32(kv_len - 1) * (gap * 2)
-    return extent
-
-
 def _request_buffer(tensor, k0, hkv, hk, gap, extent):
     """Buffer pointer over KV head hkv of a request's K or V rows from row k0 (hk * D
     values, then gap elements of padding, a row); loads at or past extent return zero.
     """
-    pointer = fx.get_iter(tensor) + (fx.Int64(k0) * hk + hkv) * D
-    if gap:
-        pointer = pointer + fx.Int64(k0) * gap
+    pointer = fx.get_iter(tensor) + _kv_offset(fx.Int64(k0), hkv, hk, gap)
     return _buffer(fx.make_view(pointer, fx.make_layout(extent // 2, 1)), extent)
 
 
@@ -477,7 +468,7 @@ def _body(
         extent = fx.Uint32(4 * row_bytes)
         limits = None
     else:
-        extent = _request_extent(kv_len, hkv, HK, gap)
+        extent = _kv_extent(kv_len, hkv, HK, gap)
         limit = fx.Uint32(kv_len - 1) * row_bytes + (wave >> 2) * 256
         limits = tuple(
             (limit > k * row_bytes).select(limit - k * row_bytes, fx.Uint32(0))
