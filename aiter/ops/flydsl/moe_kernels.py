@@ -3362,6 +3362,7 @@ def _get_compiled_token_multidest_quant(
     quant_mode: str,
     tdm_hidden_chunks: int = 4,
     ksplit: int = 1,
+    route_expert_bits: int = 0,
 ):
     from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
         build_moe_token_multidest_quant_module,
@@ -3374,6 +3375,7 @@ def _get_compiled_token_multidest_quant(
         quant_mode=quant_mode,
         tdm_hidden_chunks=tdm_hidden_chunks,
         ksplit=ksplit,
+        route_expert_bits=route_expert_bits,
     )
 
 
@@ -3500,6 +3502,13 @@ def flydsl_moe_fused_quant_preshuffle(
     # row_major_ascale=1. Unsupported with A-preshuffled payloads or quantization.
     row_major_scale: bool = False,
     payload_preshuffled: bool = False,
+    # TP prefill route resolved here (token-multidest path only): rows are
+    # ``(slot << route_expert_bits) | expert`` from ``moe_route_lds_psum``, the
+    # destination is ``route_starts[expert] + slot``, and the resolved rows are
+    # written to ``route_rows_out`` (same shape as ``topids_to_rows``).
+    route_starts: torch.Tensor | None = None,
+    route_expert_bits: int = 0,
+    route_rows_out: torch.Tensor | None = None,
 ):
     """Fused grouped quant + e8m0 scale-preshuffle.
 
@@ -3663,6 +3672,17 @@ def flydsl_moe_fused_quant_preshuffle(
                 current_stream_arg(),
             )
             return out_payload, out_scale
+        route_in_quant = route_starts is not None
+        if route_in_quant and (
+            not use_token_multidest
+            or row_to_token is not None
+            or route_rows_out is None
+            or route_expert_bits <= 0
+        ):
+            raise ValueError(
+                "route_starts needs the token-multidest quant without a "
+                "row_to_token map, route_rows_out and route_expert_bits"
+            )
         if use_token_multidest:
             from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
                 token_multidest_ksplit,
@@ -3681,6 +3701,7 @@ def flydsl_moe_fused_quant_preshuffle(
                     feat_dim, wmma_rep, quant_mode, md_ksplit
                 ),
                 ksplit=md_ksplit,
+                route_expert_bits=int(route_expert_bits) if route_in_quant else 0,
             )
             token_grid = (token_num + warps_per_block - 1) // warps_per_block
             _dispatch_compiled(
@@ -3691,6 +3712,8 @@ def flydsl_moe_fused_quant_preshuffle(
                 ptr_arg(topids_to_rows_i32),
                 token_num,
                 token_grid,
+                ptr_arg(route_starts.reshape(-1) if route_in_quant else None),
+                ptr_arg(route_rows_out.reshape(-1) if route_in_quant else None),
                 current_stream_arg(),
             )
             return out_payload, out_scale

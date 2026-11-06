@@ -300,6 +300,197 @@ def build_moe_topids_to_rows_lds_module(n_buckets: int):
     return launch_topids_to_rows
 
 
+# Prefill rows for the quant-remapped route: a route kernel cannot know an
+# expert's contiguous start without the whole batch, so it writes
+# ``(slot << tp_route_expert_bits(E)) | expert`` and the quant kernel, which runs
+# after the start table exists, turns that into ``starts[expert] + slot``.
+TP_ROUTE_PSUM_MAX_EXPERTS = BLOCK_THREADS
+
+
+def tp_route_expert_bits(n_buckets: int) -> int:
+    return max(1, (int(n_buckets) - 1).bit_length())
+
+
+def build_moe_topids_to_rows_lds_psum_module(n_buckets: int, self_clean: bool):
+    """TP route with the expert prefix sum done by the last workgroup.
+
+    Same histogram and slot reservation as ``moe_route_lds``. After its global
+    reservations return, each workgroup takes a ticket on
+    ``counter[n_buckets]``; the one that draws the last ticket sees every
+    workgroup's final count and writes ``masked_m``, the tile-aligned exclusive
+    ``starts`` and ``psum``. The remap is left to the consumer (see
+    ``tp_route_expert_bits``), so neither a counter fill nor a psum launch is
+    needed besides this one.
+
+    With ``self_clean`` the last workgroup also zeroes the counts and the ticket
+    it read, so the persistent ``counter`` is zero again for the next call on
+    the same stream. Without it the caller zero-fills ``counter`` (E + 1 words).
+    """
+    if not 0 < n_buckets <= TP_ROUTE_PSUM_MAX_EXPERTS:
+        raise ValueError(f"route psum bucket count out of range: {n_buckets}")
+    capacity = tp_route_bucket_capacity(n_buckets)
+    expert_bits = tp_route_expert_bits(n_buckets)
+    wave_size = 32
+    num_waves = BLOCK_THREADS // wave_size
+    ticket_slot = num_waves
+
+    @fx.struct
+    class TpRoutePsumStorage:
+        cnt: fx.Array[fx.Int32, capacity, 16]
+        # [0, num_waves): scanned wave totals; [num_waves]: this block's ticket.
+        scan: fx.Array[fx.Int32, 2 * num_waves, 16]
+
+    from aiter.ops.flydsl.kernels.topk.topk_common import _warp_inclusive_prefix_i32
+
+    @flyc.kernel(
+        name=f"moe_route_lds_psum{'_sc' if self_clean else ''}",
+        known_block_size=[BLOCK_THREADS, 1, 1],
+    )
+    def route_kernel(
+        topk_ids: fx.Pointer,
+        counter: fx.Pointer,
+        topids_to_rows: fx.Pointer,
+        masked_m: fx.Pointer,
+        starts: fx.Pointer,
+        psum: fx.Pointer,
+        numel: Int32,
+        tile_m: Int32,
+        num_blocks: Int32,
+    ):
+        tid = fx.Uint32(fx.thread_idx.x)
+        route = fx.Uint32(fx.block_idx.x) * BLOCK_THREADS + tid
+        lds = fx.SharedAllocator().allocate(TpRoutePsumStorage).peek()
+        counts = lds.cnt.ptr
+        scan = lds.scan.ptr
+        in_expert = tid < fx.Uint32(n_buckets)
+        if in_expert:
+            counts[tid] = fx.Int32(0)
+        gpu.barrier()
+
+        in_range = route < fx.Uint32(numel)
+        expert = fx.Int32(-1)
+        if in_range:
+            expert = fx.Int32(ptr_buf_tensor(topk_ids)[route])
+        kept = (expert >= 0) & (expert < n_buckets)
+        local_rank = fx.Uint32(0)
+        if kept:
+            local_rank = fx.Uint32(
+                fx.atomic_add(
+                    counts + fx.Uint32(expert), fx.Int32(1), syncscope="workgroup"
+                )
+            )
+        gpu.barrier()
+
+        if in_expert:
+            count = counts[tid]
+            base = fx.Int32(0)
+            if count != 0:
+                base = fx.Int32(
+                    fx.atomic_add(_i32_ptr(counter) + tid, count, syncscope="agent")
+                )
+            counts[tid] = base
+        gpu.barrier()
+
+        # Every reservation of this block has returned, i.e. is performed at
+        # L2, before its ticket is drawn; the last ticket's reads below are
+        # atomics too, so no fence is needed.
+        if tid == 0:
+            scan[ticket_slot] = fx.Int32(
+                fx.atomic_add(
+                    _i32_ptr(counter) + n_buckets, fx.Int32(1), syncscope="agent"
+                )
+            )
+        if in_range:
+            row = fx.Int32(DROPPED_ROUTE_ROW)
+            if kept:
+                slot = fx.Uint32(counts[fx.Uint32(expert)]) + local_rank
+                row = fx.Int32((slot << expert_bits) | fx.Uint32(expert))
+            ptr_buf_tensor(topids_to_rows)[route] = row
+        gpu.barrier()
+
+        # Block-uniform: only the last workgroup builds the prefix.
+        if fx.Uint32(scan[ticket_slot]) == fx.Uint32(num_blocks) - 1:
+            m = fx.Int32(0)
+            if in_expert:
+                if const_expr(self_clean):
+                    m = fx.Int32(
+                        fx.atomic_xchg(
+                            _i32_ptr(counter) + tid, fx.Int32(0), syncscope="agent"
+                        )
+                    )
+                else:
+                    m = fx.Int32(
+                        fx.atomic_add(
+                            _i32_ptr(counter) + tid, fx.Int32(0), syncscope="agent"
+                        )
+                    )
+            tile_v = fx.Uint32(tile_m)
+            aligned = fx.Int32((fx.Uint32(m) + tile_v - 1) // tile_v * tile_v)
+            lane = fx.Int32(tid % wave_size)
+            wave = fx.Int32(tid // wave_size)
+            inclusive = _warp_inclusive_prefix_i32(aligned, lane, wave_size)
+            if lane == fx.Int32(wave_size - 1):
+                scan[wave] = inclusive
+            gpu.barrier()
+            if wave == fx.Int32(0):
+                active = lane < fx.Int32(num_waves)
+                safe_lane = active.select(lane, fx.Int32(0))
+                wave_total = active.select(scan[safe_lane], fx.Int32(0))
+                prefix = _warp_inclusive_prefix_i32(wave_total, lane, wave_size)
+                if active:
+                    scan[lane] = prefix
+            gpu.barrier()
+            prev_wave = (wave > fx.Int32(0)).select(wave - 1, fx.Int32(0))
+            cross = (wave > fx.Int32(0)).select(scan[prev_wave], fx.Int32(0))
+            start = inclusive + cross - aligned
+            if in_expert:
+                ptr_buf_tensor(masked_m)[tid] = m
+                ptr_buf_tensor(starts)[tid] = start
+                ptr_buf_tensor(psum)[tid] = start + m
+            if const_expr(self_clean):
+                if tid == 0:
+                    fx.atomic_xchg(
+                        _i32_ptr(counter) + n_buckets, fx.Int32(0), syncscope="agent"
+                    )
+
+    @flyc.jit
+    def launch_route_psum(
+        topk_ids: fx.Pointer,
+        counter: fx.Pointer,
+        topids_to_rows: fx.Pointer,
+        masked_m: fx.Pointer,
+        starts: fx.Pointer,
+        psum: fx.Pointer,
+        numel: fx.Int32,
+        tile_m: fx.Int32,
+        grid_blocks: fx.Int32,
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
+    ):
+        route_kernel(
+            topk_ids,
+            counter,
+            topids_to_rows,
+            masked_m,
+            starts,
+            psum,
+            numel,
+            tile_m,
+            grid_blocks,
+        ).launch(
+            grid=(fx.Int64(grid_blocks), 1, 1),
+            block=(BLOCK_THREADS, 1, 1),
+            stream=stream,
+        )
+
+    launch_route_psum.compile_hints = {
+        "llvm_options": {
+            "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
+            "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
+        },
+    }
+    return launch_route_psum
+
+
 def build_moe_topids_to_rows_g2l_module(weight_dtype="bf16"):
     """topids_to_rows with a fused EP global->local expert remap.
 
