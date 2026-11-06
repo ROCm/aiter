@@ -556,6 +556,40 @@ def test_selectors_reject_non_contiguous():
     assert not CustomAllreduce._should_fly_oneshot(ca, t, True, False)
 
 
+def test_quick_allreduce_int4_alias_matches_old_vllm_usage():
+    """vLLM builds ``QuickAllReduceInt4`` with no ``algorithm`` and calls
+    ``compile`` on it."""
+    from aiter.ops.flydsl import FlyQuickAllReduce, QuickAllReduceInt4
+
+    assert issubclass(QuickAllReduceInt4, FlyQuickAllReduce)
+    seen = {}
+
+    def fake_init(self, **kwargs):
+        seen.update(kwargs)
+
+    with mock.patch.object(FlyQuickAllReduce, "__init__", fake_init):
+        QuickAllReduceInt4(group="g", device="d", rank=1, world_size=2)
+        assert seen == {
+            "group": "g",
+            "device": "d",
+            "rank": 1,
+            "world_size": 2,
+            "algorithm": "mesh",
+        }
+        QuickAllReduceInt4(
+            group="g", device="d", rank=1, world_size=2, algorithm="ring"
+        )
+        assert seen["algorithm"] == "ring"
+
+        calls = []
+        with mock.patch.object(
+            FlyQuickAllReduce, "preload", lambda self: calls.append(self)
+        ):
+            eng = QuickAllReduceInt4(group="g", device="d", rank=0, world_size=2)
+            eng.compile(object(), object())
+        assert calls == [eng]
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
 

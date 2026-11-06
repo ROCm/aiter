@@ -36,6 +36,7 @@ _LAZY_IMPORTS = {
         "KERNEL_VARIANTS",
     ),
     "FlyQuickAllReduce": (".quick_allreduce", "FlyQuickAllReduce"),
+    "QuickAllReduceInt4": (".quick_allreduce", "QuickAllReduceInt4"),
     "OneShotAllReduce": (".one_shot_allreduce", "OneShotAllReduce"),
     "DenseGemmConfig": (".gemm_a16wfp4", "DenseGemmConfig"),
     "PreshuffledA16WFP4Weight": (
@@ -199,6 +200,7 @@ __all__ = [
     "GateMode",
     "OneShotAllReduce",
     "PreshuffledA16WFP4Weight",
+    "QuickAllReduceInt4",
     "a16wfp4_shape_supported",
     "compute_varqlen_windows",
     "flydsl_conv_implicit",
