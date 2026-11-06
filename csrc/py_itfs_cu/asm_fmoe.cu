@@ -169,16 +169,11 @@ class FMoeKernel
         args.ptr_O      = out->ptr;
         args.ptr_X      = input->ptr;
         args.ptr_GU     = w1->ptr;
-        // FLAT and EMSORT route directly from raw top-k ids and use the
-        // token-count kernarg.  Their XC[0] ABI is a token count, whereas
-        // num_valid_ids is the host-sorted assignment count (token_cnt * topk).
-        // EMSORT also sizes its leader O-zero sweep from XC[0], so handing it
-        // the assignment count makes that sweep run token_cnt*topk*dim*2 bytes
-        // past the end of out.
-        args.ptr_XC     = (this->flat_mode == AsmMoeMode::NO_SORT ||
-                       this->flat_mode == AsmMoeMode::EMSORT)
-                              ? nullptr
-                              : num_valid_ids->ptr;
+        // FLAT and EMSORT read XC[0] as the token count when this pointer is
+        // set. The unsorted path passes an empty tensor when the caller did
+        // not supply num_local_tokens, and that tensor's data pointer is null,
+        // so the shader keeps the kernarg token_cnt.
+        args.ptr_XC = num_valid_ids->ptr;
         args.ptr_D      = w2->ptr;
         if constexpr(I_elemSize == 1)
         {
