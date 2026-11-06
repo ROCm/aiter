@@ -9,6 +9,7 @@ then the row of ``AITER_CONFIG_JAGGED_DENSE_BMM`` keyed by
 live device from ``get_gfx_runtime()``, so ``GPU_ARCHS`` cannot select another
 arch's row. The skew path takes ``block_k`` and ``skew_xcd_c``/``skew_xcd_w``
 from the row; an empty skew cell falls back to the analytic skew XCD remap.
+One XCD and an empty XCD cell select an identity remap.
 """
 
 from __future__ import annotations
@@ -19,7 +20,7 @@ import pandas as pd
 import torch
 
 from aiter.jit.core import AITER_CONFIGS
-from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime, get_num_xcds
 
 from .kernels.jagged_dense_bmm_gen import (
     ARCH_TRAITS,
@@ -97,6 +98,7 @@ def resolve_config(
 ) -> dict:
     # Live arch, not GPU_ARCHS. A build-arch override must not load another
     # arch's winners onto this device.
+    n_xcds = int(get_num_xcds())
     key = (
         get_gfx_runtime(),
         get_cu_num(),
@@ -113,8 +115,14 @@ def resolve_config(
     if not uniform_seqlen:
         if row["skew_xcd_c"] is not None:
             cfg["xcd_c"], cfg["xcd_w"] = row["skew_xcd_c"], row["skew_xcd_w"]
+        elif n_xcds <= 1:
+            # No second XCD to spread work across. A filled skew cell above
+            # still applies; this is only the empty-cell fallback.
+            cfg["xcd_c"], cfg["xcd_w"] = 1, 1
         else:
             cfg["xcd_c"], cfg["xcd_w"] = _skew_compact_xcd(n_groups, reduction_k)
+    elif n_xcds <= 1 and cfg["xcd_c"] is None and cfg["xcd_w"] is None:
+        cfg["xcd_c"], cfg["xcd_w"] = 1, 1
     if xcd_c is not None:
         cfg["xcd_c"] = int(xcd_c)
     if xcd_w is not None:
