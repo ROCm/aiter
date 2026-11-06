@@ -1580,8 +1580,8 @@ def compile_mega_moe_stage1(
             out_rsrc = None
         else:
             out_nbytes = tokens * fx.Int32(inter_dim)
-            out_rsrc = _make_buffer(out, fx.Int16, max_size=False, num_records_bytes=out_nbytes)
-        os_rsrc = _make_buffer(out_scale, fx.Int8, max_size=False, num_records_bytes=os_nbytes)
+            out_rsrc = ptr_buf_tensor(fx.get_iter(out), fx.Int16, num_records_bytes=out_nbytes)
+        os_rsrc = ptr_buf_tensor(fx.get_iter(out_scale), fx.Int8, num_records_bytes=os_nbytes)
 
         _, _do_scheduled_tile = build_fused_gemm1(
             x_tensor=x, w_rsrc=w_rsrc,

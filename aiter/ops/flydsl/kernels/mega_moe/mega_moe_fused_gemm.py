@@ -39,6 +39,7 @@ from .gemm_util import (
     BScaleLoader,
     BWeightLoader,
     MfmaScaleGU,
+    SiluQuantEpilogue,
     TileScheduler,
     wait_lds_barrier,
 )
@@ -306,173 +307,6 @@ def _buffer_store(buffer, group_index, value, elem_ty, width=1, cache_modifier=0
     fragment = fx.make_rmem_tensor(width, elem_ty)
     fragment.store(Vec.from_elements([value], elem_ty) if width == 1 else Vec(value))
     fx.copy(atom, fragment, fx.slice(buffer, (None, group_index)))
-
-
-class SiluQuantEpilogue:
-    """SwiGLU followed by FP8 quantization and per-32 E8M0 output scales."""
-
-    # fmt: off
-    def __init__(self, *, out_rsrc, out_scale_rsrc, sorted_rsrc, tokens, inter_dim, m_repeat, num_acc_n,
-        sort_block_m, tile_n, num_waves, lds_out, swiglu_limit=0.0, always_valid=False, out_tensor=None,
-        out_cache_modifier=0):
-    # fmt: on
-        self._out_rsrc = out_rsrc
-        self._out_scale_rsrc = out_scale_rsrc
-        self._sorted_rsrc = sorted_rsrc
-        self._tokens = tokens
-        self._inter_dim = inter_dim
-        self._m_repeat = m_repeat
-        self._num_acc_n = num_acc_n
-        self._sort_block_m = sort_block_m
-        self._tile_n = tile_n
-        self._num_waves = num_waves
-        self._lds_out = lds_out
-        self._swiglu_limit = float(swiglu_limit)
-        self._always_valid = always_valid
-        self._out_tensor = out_tensor
-        # Default store cache policy; 17 (sc0|sc1) makes the outputs visible to other CUs' consumers.
-        self._out_cache_modifier = int(out_cache_modifier)
-        self._lane = fx.thread_idx.x % 64
-        self._sorted_scale_cols_i32 = (inter_dim // 32 + 7) // 8 * 8
-
-    def _silu(self, g):
-        emu = (g * fx.Float32(-1.4426950408889634)).exp2()
-        return g * (fx.Float32(1.0) / (fx.Float32(1.0) + emu))
-
-    def _combine(self, acc):
-        gui_n = self._num_acc_n // _PACK
-        out = []
-        for mi in range_constexpr(self._m_repeat):
-            for ni in range_constexpr(gui_n):
-                g_idx = mi * self._num_acc_n + ni * _PACK
-                out.append(self._silu_mul(acc[g_idx], acc[g_idx + 1]))
-        return out
-
-    def _silu_mul(self, gate_v4, up_v4):
-        gv = Vec(gate_v4)
-        uv = Vec(up_v4)
-        if self._swiglu_limit <= 0:
-            elems = [self._silu(gv[i]) * uv[i] for i in range_constexpr(4)]
-            return Vec.from_elements(elems, fx.Float32)
-        limit = fx.Float32(self._swiglu_limit)
-        elems = [
-            self._silu(-(-gv[i]).maximumf(-limit)) * fx.clampf(uv[i], -limit, limit)
-            for i in range_constexpr(4)
-        ]
-        return Vec.from_elements(elems, fx.Float32)
-
-    def store(self, acc, tile_i32, tile_row_base_i32, n_tile_base_i32, valid_rows_i32=None, store_cm=None):
-        """valid_rows_i32 drops padding-row output / scale stores (nobody reads them)."""
-        if store_cm is None:
-            store_cm = self._out_cache_modifier
-        combined = self._combine(acc)
-        n_per = len(combined) // self._m_repeat
-        if self._out_tensor is not None:
-            tile_iter = fx.add_offset(
-                fx.get_iter(self._out_tensor),
-                fx.Int64(tile_i32) * fx.Int64(self._sort_block_m * self._inter_dim),
-            )
-            tile_view = fx.Tensor(fx.make_view(tile_iter, fx.make_layout(1, 1)))
-            out_rsrc = _make_buffer(
-                tile_view,
-                fx.Int16,
-                max_size=False,
-                num_records_bytes=(fx.Int32(self._sort_block_m * self._inter_dim) if valid_rows_i32 is None
-                                   else valid_rows_i32 * fx.Int32(self._inter_dim)),
-            )
-        else:
-            out_rsrc = self._out_rsrc
-
-        tx = fx.thread_idx.x
-        wave = tx // fx.Int32(64)
-        lane = tx % fx.Int32(64)
-        l16 = lane % fx.Int32(16)
-        ld4 = (lane // fx.Int32(16)) * fx.Int32(4)
-        cs_tile_n = self._tile_n // 2
-        nwo = cs_tile_n // self._num_waves
-        cbase = wave * fx.Int32(nwo)
-        cptr = self._lds_out.ptr
-
-        for mi in range_constexpr(self._m_repeat):
-            for nj in range_constexpr(n_per):
-                v4 = Vec(combined[mi * n_per + nj])
-                col = cbase + fx.Int32(nj * 16) + l16
-                for ii in range_constexpr(4):
-                    row = fx.Int32(mi * 16) + ld4 + fx.Int32(ii)
-                    idx = row * fx.Int32(cs_tile_n) + col
-                    ptr = fx.add_offset(cptr, fx.make_int_tuple(idx))
-                    fx.ptr_store(Vec.from_elements([v4[ii]], fx.Float32), ptr)
-        gpu.barrier()
-
-        c64 = fx.Int32(64)
-        n32 = fx.Int32(self._sorted_scale_cols_i32 * 32)
-        NLANE = 32
-        EVEC = 2
-        rows_per_iter = self._num_waves * 64 // NLANE
-        mlane = tx // fx.Int32(NLANE)
-        nlane = tx % fx.Int32(NLANE)
-        m_reps = self._sort_block_m // rows_per_iter
-        n_reps = cs_tile_n // (NLANE * EVEC)
-        out_tile_base = n_tile_base_i32 // fx.Int32(2) - cbase
-
-        for mr in range_constexpr(m_reps):
-            row = fx.Int32(mr * rows_per_iter) + mlane
-            slot = tile_row_base_i32 + row
-            row_g = tile_i32 * fx.Int32(self._sort_block_m) + row
-            if const_expr(self._always_valid):
-                valid = fx.Boolean(True)
-                out_row_base = (
-                    row * fx.Int32(self._inter_dim)
-                    if self._out_tensor is not None
-                    else row_g * fx.Int32(self._inter_dim)
-                )
-            else:
-                tok = self._sorted_rsrc[slot]
-                valid = tok < fx.Int32(self._tokens)
-                out_row_base = slot * fx.Int32(self._inter_dim)
-            if const_expr(valid_rows_i32 is not None):
-                valid = valid & (row < valid_rows_i32)
-            for nr in range_constexpr(n_reps):
-                col0 = fx.Int32(nr * NLANE * EVEC) + nlane * fx.Int32(EVEC)
-                idx = row * fx.Int32(cs_tile_n) + col0
-                f32_iter = fx.recast_iter(fx.Float32, fx.add_offset(cptr, fx.make_int_tuple(idx)))
-                frag = fx.make_view(f32_iter, fx.make_layout(EVEC, 1)).load()
-                v0 = frag[0]
-                v1 = frag[1]
-                a0 = v0.maximumf(fx.Float32(0.0) - v0)
-                a1 = v1.maximumf(fx.Float32(0.0) - v1)
-                m = a0.maximumf(a1)
-                for off in (1, 2, 4, 8):
-                    m = m.maximumf(m.shuffle_xor(fx.Int32(off), c64))
-                max_rounded = (m.bitcast(fx.Int32) + fx.Int32(0x400000)) & fx.Int32(0xFF800000)
-                _e = (max_rounded >> fx.Int32(23)) - fx.Int32(8)
-                e8m0_v = (_e > fx.Int32(0)).select(_e, fx.Int32(0))
-                quant_scale = ((fx.Int32(254) - e8m0_v) << fx.Int32(23)).bitcast(fx.Float32)
-                gcol = out_tile_base + col0
-
-                scaled0 = v0 * quant_scale
-                scaled1 = v1 * quant_scale
-                packed = rocdl.cvt_pk_fp8_f32(T.i32, scaled0, scaled1, fx.Int32(0), 0)
-                short_raw = fx.Int32(packed).to(fx.Int16)
-                out_byte = out_row_base + gcol
-                out_byte = valid.select(out_byte, fx.Int32(0x40000000))
-                _buffer_store(out_rsrc, out_byte // fx.Int32(2), short_raw, fx.Int16, cache_modifier=store_cm)
-
-                col_s = gcol >> fx.Int32(5)
-                is_writer = (gcol & fx.Int32(31)) == fx.Int32(0)
-                if const_expr(valid_rows_i32 is not None):
-                    is_writer = is_writer & (row < valid_rows_i32)
-                d0 = row_g >> fx.Int32(5)
-                d1 = (row_g >> fx.Int32(4)) & fx.Int32(1)
-                d2 = row_g & fx.Int32(15)
-                d3 = col_s >> fx.Int32(3)
-                d4 = (col_s >> fx.Int32(2)) & fx.Int32(1)
-                d5 = col_s & fx.Int32(3)
-                byte_off = d0 * n32 + d3 * fx.Int32(256) + d5 * fx.Int32(64) + d2 * fx.Int32(4) + d4 * fx.Int32(2) + d1
-                byte_off = is_writer.select(byte_off, fx.Int32(0x40000000))
-                e8m0_i8 = e8m0_v.to(fx.Int8)
-                _buffer_store(self._out_scale_rsrc, byte_off, e8m0_i8, fx.Int8, cache_modifier=store_cm)
-        wait_lds_barrier()
 
 
 # fmt: off
@@ -847,7 +681,8 @@ def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
     epi = SiluQuantEpilogue(out_rsrc=out_rsrc, out_scale_rsrc=os_rsrc, sorted_rsrc=trb_rsrc, tokens=0,
         inter_dim=inter_dim, m_repeat=m_repeat, num_acc_n=num_acc_n, sort_block_m=sort_block_m, tile_n=tile_n,
         num_waves=num_waves, lds_out=c_tile, swiglu_limit=swiglu_limit, always_valid=True,
-        out_tensor=out_tensor if use_tile_resource else None, out_cache_modifier=out_cache_modifier)
+        out_tensor=out_tensor if use_tile_resource else None, evec=2,
+        out_cache_modifier=out_cache_modifier)
     # fmt: on
 
     def _decode(flat):
