@@ -84,7 +84,10 @@ def test_every_cached_scratch_comes_from_the_private_pool():
     is skipped, and it names any site that loses its persistent_alloc."""
     from aiter.ops.flydsl.gemm_a16w16_gfx1250 import _split_k_counters
     from aiter.ops.flydsl.gemm_kernels import _get_preshuffle_split_buffers
-    from aiter.ops.flydsl.kernels.gemm_a16w16_gfx950 import get_split_k_buffers
+    from aiter.ops.flydsl.kernels.gemm_a16w16_gfx950 import (
+        get_split_k_buffers,
+        get_split_k_workspace,
+    )
     from aiter.ops.flydsl.mxscale_preshuffle_kernels import _fused_splitk_buffers
     from aiter.ops.gemm_op_a8w8 import get_zero_bias_buf_keyed
     from aiter.ops.gemm_op_a16w16 import _get_semaphore_workspace_keyed
@@ -96,6 +99,7 @@ def test_every_cached_scratch_comes_from_the_private_pool():
     sites = {
         "preshuffle_split_k": _get_preshuffle_split_buffers(dev, s),
         "a16w16_gfx950": get_split_k_buffers(s, dev, 1),
+        "a16w16_gfx950_workspace": get_split_k_workspace(s, dev),
         "a16w16_gfx1250": _split_k_counters(dev, s),
         "mxscale_fused_split_k": _fused_splitk_buffers(dev, sid, 2, 16, 256, 4),
         "a16w16_asm": _get_semaphore_workspace_keyed(dev, sid),
@@ -328,3 +332,59 @@ def test_fused_split_k_gemm_whose_counters_are_first_used_inside_a_capture():
     for i, (x, out) in enumerate(zip(inputs, outs)):
         err = checkAllclose(ref(*x), out.float(), msg=f"graph {i}: ", printLog=False)
         assert err == 0, (i, err)
+
+
+def test_flydsl_split_k_workspace_survives_graph_replay():
+    from aiter.ops.flydsl.gemm_kernels import flydsl_hgemm
+
+    device = torch.device("cuda:0")
+    cases = (
+        (312, 6288, 7168, 320, 192, 7, 4, 4, "ft"),
+        (670, 3584, 7168, 256, 256, 4, 2, 4, "hti"),
+    )
+    for m, n, k, block_m, block_n, split_k, m_waves, n_waves, policy in cases:
+        stream = torch.cuda.Stream(device=device)
+        a = torch.randn((m, k), dtype=torch.bfloat16, device=device)
+        b = torch.randn((n, k), dtype=torch.bfloat16, device=device) / k**0.5
+        out = torch.empty((m, n), dtype=torch.bfloat16, device=device)
+
+        def launch(
+            a=a,
+            b=b,
+            out=out,
+            block_m=block_m,
+            block_n=block_n,
+            split_k=split_k,
+            m_waves=m_waves,
+            n_waves=n_waves,
+            policy=policy,
+        ):
+            return flydsl_hgemm(
+                a,
+                b,
+                out=out,
+                block_m=block_m,
+                block_n=block_n,
+                block_k=64,
+                stages=2,
+                split_k=split_k,
+                m_waves=m_waves,
+                n_waves=n_waves,
+                k_waves=1,
+                group_m=0,
+                policy=policy,
+                split_k_workspace=True,
+            )
+
+        with torch.cuda.stream(stream):
+            launch()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream):
+                launch()
+        graph.replay()
+        graph.replay()
+        torch.cuda.synchronize()
+
+        ref = torch.mm(a.float(), b.float().t())
+        error = (out.float() - ref).abs().max() / ref.abs().max().clamp(min=1e-8)
+        assert error.item() < 1e-2

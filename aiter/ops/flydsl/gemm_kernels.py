@@ -39,7 +39,7 @@ _HGEMM_KERNEL_RE = re.compile(
     r"a(?P<dtype>bf16|fp16|f16)_w(?P=dtype)"
     r"_(?P<out_dtype>bf16|fp16|f16|fp32)_"
     r"t(?P<block_m>\d+)x(?P<block_n>\d+)x(?P<block_k>\d+)"
-    r"x(?P<stages>\d+)_ks(?P<split_k>\d+)_"
+    r"x(?P<stages>\d+)_ks(?P<split_k>\d+)(?P<split_k_workspace>ws)?_"
     r"w(?P<m_waves>\d+)x(?P<n_waves>\d+)x(?P<k_waves>\d+)_"
     r"bias(?P<has_bias>[01])_ktail(?P<has_k_tail>[01])_"
     r"gm(?P<group_m>\d+)_p(?P<policy>ft|ht|hti|sk)_"
@@ -86,10 +86,12 @@ def flydsl_hgemm_kernel_name(
         policy = SKINNY_POLICY
     else:
         policy = "ht" if config["use_half_tile_interleaved"] else "ft"
+    # No marker means the atomic split-K reduction used by older tuned names.
+    workspace = "ws" if config.get("use_split_k_workspace") else ""
     name = (
         f"flydsl_hgemm_a{dtype_name}_w{dtype_name}_{out_dtype_name}_"
         f"t{config['block_m']}x{config['block_n']}x{config['block_k']}"
-        f"x{config['stages']}_ks{config['split_k']}_"
+        f"x{config['stages']}_ks{config['split_k']}{workspace}_"
         f"w{config['m_waves']}x{config['n_waves']}x{config['k_waves']}_"
         f"bias{int(has_bias)}_ktail0_gm{config['group_m']}_p{policy}_"
         f"{target_gfx or get_gfx()}"
@@ -133,6 +135,7 @@ def get_flydsl_hgemm_kernel_params(name: str) -> dict | None:
         "group_m": int(match.group("group_m")),
         "use_half_tile_interleaved": policy in ("ht", "hti"),
         "policy": policy,
+        "use_split_k_workspace": match.group("split_k_workspace") is not None,
         "has_bias": match.group("has_bias") == "1",
         "dtype": dtype,
         "out_dtype": out_dtype,
@@ -157,8 +160,13 @@ def flydsl_hgemm(
     policy: str = "ft",
     out_dtype: torch.dtype | None = None,
     stream: torch.cuda.Stream | None = None,
+    split_k_workspace: bool = False,
 ) -> torch.Tensor:
-    """Run the A16W16 kernel for this arch with AITER's ``B[N, K]`` convention."""
+    """Run the A16W16 kernel for this arch with AITER's ``B[N, K]`` convention.
+
+    ``split_k_workspace`` reduces BF16 split-K partials with a second kernel
+    instead of atomics (gfx950 only).
+    """
 
     if policy not in ("ft", "ht", "hti", SKINNY_POLICY):
         raise ValueError(f"Unsupported FlyDSL HGEMM policy: {policy!r}")
@@ -172,10 +180,17 @@ def flydsl_hgemm(
     if policy == SKINNY_POLICY:
         if gfx != "gfx950":
             raise RuntimeError("The FlyDSL skinny HGEMM policy supports gfx950 only")
-        if bias is not None or split_k != 1 or m_waves != 1 or n_waves != 1 or group_m:
+        if (
+            bias is not None
+            or split_k != 1
+            or split_k_workspace
+            or m_waves != 1
+            or n_waves != 1
+            or group_m
+        ):
             raise ValueError(
                 "The FlyDSL skinny HGEMM policy requires split_k=1, m_waves=1, "
-                "n_waves=1, group_m=0 and no bias"
+                "n_waves=1, group_m=0, no bias and no split-K workspace"
             )
         if out_dtype not in (None, a.dtype):
             raise ValueError("The FlyDSL skinny HGEMM policy writes the input dtype")
@@ -191,6 +206,10 @@ def flydsl_hgemm(
             stream=launch_stream,
         )
     if gfx in ("gfx1250", "gfx1250-strict"):
+        if split_k_workspace:
+            raise ValueError(
+                "The gfx1250 FlyDSL A16W16 kernel has no split-K workspace"
+            )
         if k_waves != 1:
             raise ValueError("The gfx1250 FlyDSL A16W16 kernel supports k_waves=1 only")
         with torch.cuda.stream(launch_stream):
@@ -232,6 +251,7 @@ def flydsl_hgemm(
         "k_waves": k_waves,
         "group_m": group_m,
         "use_half_tile_interleaved": policy in ("ht", "hti"),
+        "use_split_k_workspace": split_k_workspace,
     }
     return gemm_a16w16(
         a,

@@ -14,7 +14,9 @@ from .kernels.gemm_a16w16_gfx950 import (
     GEMM_A16W16_DTYPE_BF16,
     GEMM_A16W16_DTYPE_FP16,
     GEMM_A16W16_DTYPE_FP32,
+    SPLIT_K_WORKSPACE_MAX_ELEMS,
     make_gemm_a16w16_param_and_validate,
+    split_k_workspace_supported,
 )
 from .kernels.gemm_a16w16_kernel_gfx1250 import LDS_PAD_A, LDS_PAD_B
 
@@ -89,25 +91,98 @@ class GemmConfigPruner:
             return configs
         ious = [self._iou(config) for config in configs]
         keep_ratio = max(0.625, 1 - self.m / 160, 1 - 120 / self.m)
+        # Large-M tuning must retain wider N tiles for ragged model dimensions
+        # such as 2112 and 2880. Their 6-9% N padding can be cheaper than the
+        # poor MFMA efficiency of an exactly-dividing BN64 tile.
+        if self.m >= 4096:
+            keep_ratio = min(keep_ratio, 0.90)
         min_iou = max(ious) * keep_ratio
         num_cus = self.device_props.multi_processor_count
-        max_tiles = (
-            max(num_cus, min(self._tiles(config) for config in configs))
-            * self.max_tile_grid_ratio
-        )
+        # Hand-added tiles wider than the 256x256 grid must not tighten the limit.
+        grid_tiles = [
+            self._tiles(config)
+            for config in configs
+            if config["block_m"] <= 256 and config["block_n"] <= 256
+        ] or [self._tiles(config) for config in configs]
+        max_tiles = max(num_cus, min(grid_tiles)) * self.max_tile_grid_ratio
         kept = []
         for config, iou in zip(configs, ious):
             tiles = self._tiles(config)
+            validated_half_tile = (
+                config["use_half_tile_interleaved"]
+                and config["block_m"] == 256
+                and config["block_n"] == 256
+                and config["block_k"] == 64
+                and config["stages"] == 2
+                and config["split_k"] == 1
+                and config["m_waves"] == 2
+                and config["n_waves"] == 4
+                and config["k_waves"] == 1
+                and config["group_m"] in (0, 1, 2, 4, 8, 16)
+            )
+            validated_grouped_half_tile = (
+                config["use_half_tile_interleaved"]
+                and config["group_m"] == 4
+                and (
+                    config["block_m"],
+                    config["block_n"],
+                    config["block_k"],
+                    config["m_waves"],
+                    config["n_waves"],
+                )
+                == (192, 128, 128, 2, 4)
+            )
+            validated_half_tile_workspace = (
+                config["use_half_tile_interleaved"]
+                and config["block_m"] == 256
+                and config["block_n"] == 256
+                and config["block_k"] == 64
+                and config["stages"] == 2
+                and config["split_k"] > 1
+                and config["m_waves"] == 2
+                and config["n_waves"] == 4
+                and config["k_waves"] == 1
+                and config["group_m"] in (0, 4, 8, 16)
+                and config["split_k"] * self.m * self.n <= SPLIT_K_WORKSPACE_MAX_ELEMS
+            )
+            near_cu_rect = (
+                iou >= 0.90 and tiles * 4 >= num_cus * 3 and tiles * 4 <= num_cus * 5
+            )
             max_split_k = (
                 1
                 if tiles >= num_cus
                 else self._ceil_div(self.max_split_grid_rounds * num_cus, tiles)
             )
             if (
-                iou >= min_iou
+                (
+                    iou >= min_iou
+                    or near_cu_rect
+                    or validated_half_tile
+                    or validated_grouped_half_tile
+                    or validated_half_tile_workspace
+                )
                 and tiles <= max_tiles
                 and config["split_k"] <= max_split_k
-                and (config["group_m"] == 0 or (tiles >= num_cus and tiles % 8 == 0))
+                and (
+                    config["group_m"] == 0
+                    or validated_half_tile
+                    or validated_grouped_half_tile
+                    or validated_half_tile_workspace
+                    or (
+                        config["block_m"],
+                        config["block_n"],
+                        config["group_m"],
+                    )
+                    in (
+                        (320, 224, 2),
+                        (320, 224, 4),
+                        (320, 224, 16),
+                        (224, 320, 8),
+                        (160, 192, 16),
+                        (128, 128, 1),
+                    )
+                    or (tiles >= num_cus and tiles % 8 == 0)
+                )
             ):
                 kept.append(config)
 
@@ -203,6 +278,9 @@ def get_flydsl_a16w16_configs(
     dtype: torch.dtype,
     out_dtype: torch.dtype,
     has_bias: bool,
+    *,
+    use_large_gemm_fast_path: bool = True,
+    apply_policy_pruning: bool = True,
 ):
     """Generate and validate the shape-aware policy catalog used by tuning."""
 
@@ -220,7 +298,7 @@ def get_flydsl_a16w16_configs(
     split_k_candidates = [1]
     split_k_candidates.extend(split_k for split_k in range(2, 10) if k % split_k == 0)
     selections = {
-        "block_m": [16, 32, 48, 64, 80, 96, 128, 256],
+        "block_m": [16, 32, 48, 64, 80, 96, 128, 192, 208, 224, 256],
         "block_n": [16, 32, 64, 80, 96, 128, 256],
         "block_k": [64, 128, 256],
         "stages": list(range(2, 10)),
@@ -235,24 +313,197 @@ def get_flydsl_a16w16_configs(
         dict(zip(selections, combo))
         for combo in itertools.product(*selections.values())
     ]
-    device_props = torch.cuda.get_device_properties(torch.cuda.current_device())
-    configs = GemmConfigPruner(
-        m,
-        n,
-        k,
-        device_props,
-        2,
-    ).prune(configs)
-
-    in_dtype_id = (
-        GEMM_A16W16_DTYPE_FP16 if dtype == torch.float16 else GEMM_A16W16_DTYPE_BF16
+    for group_m in (1, 2, 8, 16):
+        configs.append(
+            {
+                "block_m": 256,
+                "block_n": 256,
+                "block_k": 64,
+                "stages": 2,
+                "split_k": 1,
+                "m_waves": 2,
+                "n_waves": 4,
+                "k_waves": 1,
+                "group_m": group_m,
+                "use_half_tile_interleaved": True,
+            }
+        )
+    for split_k in split_k_candidates[1:]:
+        if split_k * m * n <= SPLIT_K_WORKSPACE_MAX_ELEMS:
+            for group_m in (8, 16):
+                configs.append(
+                    {
+                        "block_m": 256,
+                        "block_n": 256,
+                        "block_k": 64,
+                        "stages": 2,
+                        "split_k": split_k,
+                        "m_waves": 2,
+                        "n_waves": 4,
+                        "k_waves": 1,
+                        "group_m": group_m,
+                        "use_half_tile_interleaved": True,
+                    }
+                )
+    if m <= 320 and k % 5 == 0:
+        configs.append(
+            {
+                "block_m": 320,
+                "block_n": 192,
+                "block_k": 64,
+                "stages": 2,
+                "split_k": 5,
+                "m_waves": 4,
+                "n_waves": 2,
+                "k_waves": 1,
+                "group_m": 0,
+                "use_half_tile_interleaved": False,
+            }
+        )
+    if k % 2 == 0 and 2 * m * n <= SPLIT_K_WORKSPACE_MAX_ELEMS:
+        configs.append(
+            {
+                "block_m": 320,
+                "block_n": 192,
+                "block_k": 64,
+                "stages": 2,
+                "split_k": 2,
+                "m_waves": 4,
+                "n_waves": 4,
+                "k_waves": 1,
+                "group_m": 0,
+                "use_half_tile_interleaved": False,
+            }
+        )
+    if k % 4 == 0 and 4 * m * n <= SPLIT_K_WORKSPACE_MAX_ELEMS:
+        configs.append(
+            {
+                "block_m": 320,
+                "block_n": 192,
+                "block_k": 64,
+                "stages": 2,
+                "split_k": 4,
+                "m_waves": 4,
+                "n_waves": 4,
+                "k_waves": 1,
+                "group_m": 0,
+                "use_half_tile_interleaved": False,
+            }
+        )
+    if 384 < m <= 400 and k % 4 == 0:
+        configs.append(
+            {
+                "block_m": 400,
+                "block_n": 128,
+                "block_k": 64,
+                "stages": 2,
+                "split_k": 4,
+                "m_waves": 5,
+                "n_waves": 2,
+                "k_waves": 1,
+                "group_m": 0,
+                "use_half_tile_interleaved": False,
+            }
+        )
+    if m <= 320 and k % 7 == 0:
+        configs.append(
+            {
+                "block_m": 320,
+                "block_n": 192,
+                "block_k": 64,
+                "stages": 2,
+                "split_k": 7,
+                "m_waves": 4,
+                "n_waves": 4,
+                "k_waves": 1,
+                "group_m": 0,
+                "use_half_tile_interleaved": False,
+            }
+        )
+    if k % 7 == 0 and 7 * m * n <= SPLIT_K_WORKSPACE_MAX_ELEMS:
+        for m_waves, n_waves in ((4, 2), (2, 4)):
+            configs.append(
+                {
+                    "block_m": 256,
+                    "block_n": 256,
+                    "block_k": 64,
+                    "stages": 2,
+                    "split_k": 7,
+                    "m_waves": m_waves,
+                    "n_waves": n_waves,
+                    "k_waves": 1,
+                    "group_m": 0,
+                    "use_half_tile_interleaved": False,
+                }
+            )
+    if 320 < m <= 384 and k % 7 == 0:
+        configs.append(
+            {
+                "block_m": 384,
+                "block_n": 192,
+                "block_k": 64,
+                "stages": 2,
+                "split_k": 7,
+                "m_waves": 8,
+                "n_waves": 1,
+                "k_waves": 1,
+                "group_m": 0,
+                "use_half_tile_interleaved": False,
+            }
+        )
+    for block_m, block_n, stages, m_waves, n_waves, group_m in (
+        (256, 192, 2, 4, 4, 0),
+        (288, 192, 2, 2, 4, 0),
+        (320, 224, 2, 4, 2, 0),
+        (320, 224, 2, 4, 2, 2),
+        (320, 224, 2, 4, 2, 4),
+        (320, 224, 2, 4, 2, 16),
+        (224, 320, 2, 2, 4, 8),
+        (224, 192, 3, 2, 6, 0),
+        (160, 192, 3, 2, 4, 16),
+        (192, 192, 3, 3, 4, 0),
+    ):
+        configs.append(
+            {
+                "block_m": block_m,
+                "block_n": block_n,
+                "block_k": 64,
+                "stages": stages,
+                "split_k": 1,
+                "m_waves": m_waves,
+                "n_waves": n_waves,
+                "k_waves": 1,
+                "group_m": group_m,
+                "use_half_tile_interleaved": False,
+            }
+        )
+    for m_waves, n_waves, k_waves in ((2, 2, 2), (4, 4, 1)):
+        configs.append(
+            {
+                "block_m": 128,
+                "block_n": 128,
+                "block_k": 64,
+                "stages": 3,
+                "split_k": 1,
+                "m_waves": m_waves,
+                "n_waves": n_waves,
+                "k_waves": k_waves,
+                "group_m": 1,
+                "use_half_tile_interleaved": False,
+            }
+        )
+    is_large_gemm = (
+        apply_policy_pruning
+        and use_large_gemm_fast_path
+        and m >= 4096
+        and n >= 4096
+        and k >= 4096
     )
-    out_dtype_id = GEMM_A16W16_DTYPE_FP32 if out_dtype == torch.float32 else in_dtype_id
-    valid_configs = []
-    is_large_gemm = m >= 4096 and n >= 4096 and k >= 4096
-    for config in configs:
-        if is_large_gemm:
-            if not (
+    if is_large_gemm:
+        configs = [
+            config
+            for config in configs
+            if (
                 config["use_half_tile_interleaved"]
                 and config["block_m"] == 256
                 and config["block_n"] == 256
@@ -262,12 +513,61 @@ def get_flydsl_a16w16_configs(
                 and config["m_waves"] == 2
                 and config["n_waves"] == 4
                 and config["k_waves"] == 1
-            ):
-                continue
-        elif not config["use_half_tile_interleaved"]:
+            )
+        ]
+    device_props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    if apply_policy_pruning and not is_large_gemm:
+        configs = GemmConfigPruner(
+            m,
+            n,
+            k,
+            device_props,
+            2,
+        ).prune(configs)
+
+    in_dtype_id = (
+        GEMM_A16W16_DTYPE_FP16 if dtype == torch.float16 else GEMM_A16W16_DTYPE_BF16
+    )
+    out_dtype_id = GEMM_A16W16_DTYPE_FP32 if out_dtype == torch.float32 else in_dtype_id
+    valid_configs = []
+    for config in configs:
+        # The small-BM half-tile path corrupts ragged-N output because its
+        # second N half uses a full-tile async-load layout. Keep ragged N on
+        # full-tile or BM>=128 policies until that kernel path is fixed.
+        if (
+            config["use_half_tile_interleaved"]
+            and config["block_m"] < 128
+            and n % config["block_n"] != 0
+        ):
+            continue
+        if (
+            apply_policy_pruning
+            and not is_large_gemm
+            and not config["use_half_tile_interleaved"]
+        ):
             mma_m_iters = config["block_m"] // config["m_waves"] // 16
             mma_n_iters = config["block_n"] // config["n_waves"] // 16
-            if mma_m_iters > 4 or mma_n_iters > 4:
+            if (mma_m_iters > 4 or mma_n_iters > 4) and (
+                (config["block_m"], config["block_n"])
+                not in (
+                    (208, 256),
+                    (224, 256),
+                    (320, 192),
+                    (256, 192),
+                    (288, 192),
+                    (320, 224),
+                    (224, 320),
+                    (224, 192),
+                    (160, 192),
+                    (192, 192),
+                    (384, 192),
+                    (256, 256),
+                    (400, 128),
+                )
+                # Past 64 accumulator tiles per wave the kernel spills to
+                # scratch, which can exhaust device memory at dispatch.
+                or mma_m_iters * mma_n_iters > 64
+            ):
                 continue
 
         validation_config = {
@@ -288,4 +588,15 @@ def get_flydsl_a16w16_configs(
             is not None
         ):
             valid_configs.append(config)
+            # Atomic and workspace reductions trade launch count for traffic;
+            # keep both so tuning picks the faster one per shape.
+            if split_k_workspace_supported(
+                m, n, config["split_k"], out_dtype_id, has_bias
+            ) and (
+                make_gemm_a16w16_param_and_validate(
+                    m, n, k, {**validation_config, "use_split_k_workspace": True}
+                )
+                is not None
+            ):
+                valid_configs.append({**config, "use_split_k_workspace": True})
     return valid_configs

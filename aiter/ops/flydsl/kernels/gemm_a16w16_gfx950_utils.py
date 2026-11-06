@@ -76,7 +76,9 @@ class BlockSwizzle:
         linear_id = pid
         intra_xcd = linear_id // num_xcds
         xcd = linear_id % num_xcds
-        wgid = xcd * (num_wg // num_xcds) + intra_xcd
+        xcd_wgid = xcd * (num_wg // num_xcds) + intra_xcd
+        use_xcd = (num_wg >= swizzle_threshold) & ((num_wg % num_xcds) == 0)
+        wgid = use_xcd.select(xcd_wgid, linear_id)
         group_m = self.GROUP_M
         wgid_per_group = group_m * num_pid_n
         group_id = wgid // wgid_per_group
@@ -86,11 +88,7 @@ class BlockSwizzle:
         group_size_m = (remaining_m < group_m).select(remaining_m, group_m)
         swizzled_n = intra_group // group_size_m
         swizzled_m = first_pid_m + (intra_group % group_size_m)
-        use_simple = (num_wg < swizzle_threshold) | ((num_wg % num_xcds) != 0)
-        return (
-            use_simple.select(simple_m, swizzled_m),
-            use_simple.select(simple_n, swizzled_n),
-        )
+        return swizzled_m, swizzled_n
 
 
 class SplitKProtocol:
