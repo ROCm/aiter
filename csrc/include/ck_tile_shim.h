@@ -106,32 +106,32 @@ struct gpu_timer
 {
     gpu_timer()
     {
-        hip_check_error(hipEventCreate(&start_evt));
-        hip_check_error(hipEventCreate(&stop_evt));
+        ::ck_tile::hip_check_error(hipEventCreate(&start_evt));
+        ::ck_tile::hip_check_error(hipEventCreate(&stop_evt));
     }
 
     ~gpu_timer() noexcept(false)
     {
-        hip_check_error(hipEventDestroy(start_evt));
-        hip_check_error(hipEventDestroy(stop_evt));
+        ::ck_tile::hip_check_error(hipEventDestroy(start_evt));
+        ::ck_tile::hip_check_error(hipEventDestroy(stop_evt));
     }
 
     void start(const hipStream_t& s)
     {
-        hip_check_error(hipStreamSynchronize(s));
-        hip_check_error(hipEventRecord(start_evt, s));
+        ::ck_tile::hip_check_error(hipStreamSynchronize(s));
+        ::ck_tile::hip_check_error(hipEventRecord(start_evt, s));
     }
 
     void stop(const hipStream_t& s)
     {
-        hip_check_error(hipEventRecord(stop_evt, s));
-        hip_check_error(hipEventSynchronize(stop_evt));
+        ::ck_tile::hip_check_error(hipEventRecord(stop_evt, s));
+        ::ck_tile::hip_check_error(hipEventSynchronize(stop_evt));
     }
 
     float duration() const
     {
         float ms = 0;
-        hip_check_error(hipEventElapsedTime(&ms, start_evt, stop_evt));
+        ::ck_tile::hip_check_error(hipEventElapsedTime(&ms, start_evt, stop_evt));
         return ms;
     }
 
@@ -145,13 +145,13 @@ struct cpu_timer
 
     void start(const hipStream_t& s)
     {
-        hip_check_error(hipStreamSynchronize(s));
+        ::ck_tile::hip_check_error(hipStreamSynchronize(s));
         start_tick = clock_t::now();
     }
 
     void stop(const hipStream_t& s)
     {
-        hip_check_error(hipStreamSynchronize(s));
+        ::ck_tile::hip_check_error(hipStreamSynchronize(s));
         stop_tick = clock_t::now();
     }
 
@@ -170,20 +170,20 @@ void launch_and_check(const stream_config& sc, Callables&&... callables)
 {
     if(!((static_cast<void>(callables(sc)), hipPeekAtLastError() == hipSuccess) && ...))
     {
-        hip_check_error(hipGetLastError());
+        ::ck_tile::hip_check_error(hipGetLastError());
     }
 }
 
 inline void flush_icache()
 {
     hipDeviceProp_t device_props;
-    hip_check_error(hipGetDeviceProperties(&device_props, 0));
+    ::ck_tile::hip_check_error(hipGetDeviceProperties(&device_props, 0));
 
     constexpr int32_t blocks_per_cu = 60;
     int32_t gpu_block3              = device_props.multiProcessorCount * blocks_per_cu;
 
     flush_cache<<<dim3(gpu_block3), dim3(64), 0, nullptr>>>();
-    hip_check_error(hipGetLastError());
+    ::ck_tile::hip_check_error(hipGetLastError());
 }
 
 template <typename TimerType, typename PreprocessFunc>
