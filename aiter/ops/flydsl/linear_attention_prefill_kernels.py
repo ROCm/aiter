@@ -17,7 +17,6 @@ import itertools
 import math
 import os
 import warnings
-from collections import OrderedDict
 from collections.abc import Sequence
 
 # NOTE: ``get_rocm_arch`` is side-effect-free and does NOT raise on
@@ -41,6 +40,7 @@ from ..triton._triton_kernels.gated_delta_net.utils import (
     prepare_rebased_cu_seqlens,
 )
 from .kernels.gdr_prefill import compile_gdn_prepare
+from .kernels.gdr_prefill.chunk_gated_delta_h import PHASE_BUILD_MAP, PHASE_EMIT
 from .kernels.tensor_shim import _run_compiled
 
 # log2(e); g pre-scaled by this constant lets the kernel use exp2(g) in
@@ -144,19 +144,15 @@ def _hipeq_varlen_host_metadata(chunk_offsets: torch.Tensor) -> tuple[int, int]:
 # -- Hidden-state host wrapper (K5 opt kernel) ---------------------------
 _OPT_MIN_FLYDSL_VERSION = "0.2.0"
 
-# gfx942 gate for SCHED_GFX942; normalize feature-suffixed arch strings first.
+# Arch gates: gfx942 enables SCHED_GFX942, gfx950 enables the blocked prefill
+# path. Normalize feature-suffixed arch strings first.
 _GFX_ARCH = get_rocm_arch().split(":")[0]
 _IS_GFX942 = _GFX_ARCH.startswith("gfx942")
+_IS_GFX950 = _GFX_ARCH.startswith("gfx950")
 
 # Host-path knobs. Heavy dtype/shape/device audit is off by default; set
 # ``AITER_K5_OPT_CHECK=1`` to enable it. k/w/u must still be contiguous.
 _OPT_BV_ENV = os.environ.get("FLYDSL_K5_OPT_BV")
-
-
-_IS_GFX950 = _GFX_ARCH.startswith("gfx950")
-
-
-_GDN_K5_TARGET_SEGMENTS = 8
 
 
 def _flydsl_run_only() -> bool:
@@ -195,12 +191,6 @@ def _require_contiguous(t: torch.Tensor, name: str) -> torch.Tensor:
     if not t.is_contiguous():
         raise ValueError(f"FlyDSL K5 opt: `{name}` must be contiguous")
     return t
-
-
-def _as_fp32_contig(t: torch.Tensor) -> torch.Tensor:
-    if t.dtype is not torch.float32:
-        t = t.float()
-    return t if t.is_contiguous() else t.contiguous()
 
 
 def _as_contiguous(t: torch.Tensor) -> torch.Tensor:
@@ -310,19 +300,6 @@ def _tuned_bv(
 _INT32_ATTR = "_flydsl_int32_view"
 _PROLOGUE_ATTR = "_flydsl_prologue_cache"
 _ADAPTIVE_K5_META_ATTR = "_aiter_gdn_k5_adaptive_meta"
-# Keeps dense offsets alive so the attr cache can hit; LRU-bounded.
-_DENSE_K5_OFFSETS_MAX = 32
-_DENSE_K5_OFFSETS = OrderedDict()
-# Serial K5 ~1.6 us/chunk of the longest sequence; blocked ~0.18 us/block/head
-# plus a ~25-chunk carry pass. gfx950 break-even is work ratio ~9; 6 leaves
-# margin and bounds scratch. Blocked loses on balanced two-sequence splits
-# under ~96 chunks ([4064,4065], [3000,5129]), wins from 97.
-_BLOCKED_MIN_CHUNKS = 96
-# Floor on per-sequence block size: keeps short sequences in a mixed batch from
-# fragmenting into many tiny blocks, so each sequence's partition depends only on
-# its own length.
-_BLOCKED_MIN_BLOCK_CHUNKS = 12
-_BLOCKED_MAX_WORK_PER_CHUNK = 6
 
 
 def _as_int32(t: torch.Tensor) -> torch.Tensor:
@@ -421,6 +398,40 @@ def _gdn_k5_sequence_lengths(cu_seqlens, T, prefill_metadata=None):
     return tuple(end - start for start, end in itertools.pairwise(bounds))
 
 
+# Chunk size the GDN K5 schedules are built for.
+_GDN_CHUNK_SIZE = 64
+# Target number of blocks per sequence; the per-sequence block size is the
+# sequence's chunk count divided by this.
+_GDN_K5_TARGET_SEGMENTS = 8
+# The blocked path needs at least this many chunks in the longest sequence.
+# Blocked loses on balanced two-sequence splits under ~96 chunks ([4064,4065],
+# [3000,5129]) and wins from 97.
+_BLOCKED_MIN_CHUNKS = 96
+# Floor on per-sequence block size: keeps short sequences in a mixed batch from
+# fragmenting into many tiny blocks, so each sequence's partition depends only on
+# its own length.
+_BLOCKED_MIN_BLOCK_CHUNKS = 12
+# Upper bound on (blocks x heads) per longest-sequence chunk. Serial K5 costs
+# ~1.6 us/chunk of the longest sequence; blocked ~0.18 us/block/head plus a
+# ~25-chunk carry pass. gfx950 break-even is work ratio ~9; 6 leaves margin and
+# bounds scratch.
+_BLOCKED_MAX_WORK_PER_CHUNK = 6
+
+
+@functools.lru_cache(maxsize=32)
+def _dense_k5_metadata(device, T, H):
+    """Gated schedule/metadata for dense input, one sequence ``[0, T]``."""
+    cu_seqlens = torch.tensor([0, T], device=device, dtype=torch.int32)
+    return _resolve_adaptive_k5_metadata(
+        cu_seqlens,
+        T,
+        device,
+        _GDN_K5_TARGET_SEGMENTS,
+        lengths=(T,),
+        num_heads=H,
+    )
+
+
 def _resolve_adaptive_k5_metadata(
     cu_seqlens, T, device, target_segments, *, lengths=None, num_heads=None
 ):
@@ -437,17 +448,8 @@ def _resolve_adaptive_k5_metadata(
     if lengths is not None:
         lengths = tuple(lengths)
     if cu_seqlens is None:
-        key = (device, T)
-        if key in _DENSE_K5_OFFSETS:
-            _DENSE_K5_OFFSETS.move_to_end(key)
-        else:
-            _DENSE_K5_OFFSETS[key] = torch.tensor(
-                [0, T], device=device, dtype=torch.int32
-            )
-            if len(_DENSE_K5_OFFSETS) > _DENSE_K5_OFFSETS_MAX:
-                _DENSE_K5_OFFSETS.popitem(last=False)
-        cu_seqlens = _DENSE_K5_OFFSETS[key]
-    cache_key = (64, 0, 0, T, target_segments, num_heads)
+        return _dense_k5_metadata(device, T, num_heads)
+    cache_key = (_GDN_CHUNK_SIZE, T, target_segments, num_heads)
     version = _tensor_version(cu_seqlens)
     cached = getattr(cu_seqlens, _ADAPTIVE_K5_META_ATTR, None)
     hit = (
@@ -485,14 +487,12 @@ def _resolve_adaptive_k5_metadata(
             triton.cdiv(count, size)
             for count, size in zip(chunk_counts, block_chunks_per_seq)
         )
-        if (
+        if not (
             all(length > 0 for length in lengths)
             and max(chunk_counts) >= _BLOCKED_MIN_CHUNKS
             and total_blocks * num_heads
             <= _BLOCKED_MAX_WORK_PER_CHUNK * max(chunk_counts)
         ):
-            pass
-        else:
             block_chunks_per_seq = None
     if block_chunks_per_seq is not None:
         metadata = build_gated_delta_rule_prefill_metadata(
@@ -546,13 +546,6 @@ def _resolve_snapshot_dtype(snapshot_dtype, input_dtype):
     return resolved
 
 
-def _tensor_num_xcds(t: torch.Tensor) -> int:
-    """XCD count (a device property: MI350P is gfx950 with 4, MI355X has 8).
-    ``get_num_xcds`` caches per device, honors an AOT replay's faked count, and
-    falls back to 1 (identity work-group order) when the query fails."""
-    return get_num_xcds(default=1)
-
-
 @functools.cache
 def _get_or_compile_opt(
     K,
@@ -575,7 +568,7 @@ def _get_or_compile_opt(
     g_head_major=False,
     bf16_convert_trunc=True,
     snapshot_bf16=True,
-    phase="emit",
+    phase=PHASE_EMIT,
     block_entry_seed=False,
     num_xcds=1,
 ):
@@ -968,13 +961,13 @@ def chunk_gated_delta_rule_fwd_h_flydsl_opt(
         and _IS_GFX950
         and not torch.cuda.is_current_stream_capturing()
     ):
-        target_segments = _GDN_K5_TARGET_SEGMENTS
-        # K5 requires its own blocks when shared metadata uses scalar sizing.
+        # Shared prefill metadata carries no per-sequence blocks, so build them
+        # from the host lengths.
         adaptive_metadata = _resolve_adaptive_k5_metadata(
             cu_seqlens,
             T_flat,
             k.device,
-            target_segments,
+            _GDN_K5_TARGET_SEGMENTS,
             # Dense input is one sequence; passing it spares the resolver a
             # device-to-host read of its placeholder cu_seqlens.
             lengths=(
@@ -993,7 +986,6 @@ def chunk_gated_delta_rule_fwd_h_flydsl_opt(
                 initial_state,
                 cu_seqlens=cu_seqlens,
                 prefill_metadata=adaptive_metadata,
-                target_segments=target_segments,
                 state_dtype=resolved_state_dtype,
             )
 
@@ -1028,6 +1020,8 @@ def chunk_gated_delta_rule_fwd_h_flydsl_opt(
     # SCHED_GFX942 is only enabled on gfx942; other arches (incl. gfx950) pass
     # False, keeping their emitted code byte-identical, and it joins the
     # lru_cache key as a distinct compiled product.
+    # The XCD count only reorders work-groups (each is still visited once), so a
+    # wrong count costs L2 locality only; the default of 8 picks a prebuilt AOT variant.
     launch_fn = _get_or_compile_opt(
         K,
         V,
@@ -1049,8 +1043,8 @@ def chunk_gated_delta_rule_fwd_h_flydsl_opt(
         g_head_major=g_head_major,
         bf16_convert_trunc=bf16_convert_trunc,
         snapshot_bf16=snapshot_bf16,
-        phase="emit",
-        num_xcds=_tensor_num_xcds(k),
+        phase=PHASE_EMIT,
+        num_xcds=get_num_xcds(),
     )
 
     dummy, int32_dummy = _placeholder_pair(k.device)
@@ -1129,8 +1123,8 @@ def _build_chunk_gdn_block_maps(
     *,
     prefill_metadata: GatedDeltaRulePrefillMetadata,
     bv: int = 64,
-    out: torch.Tensor | None = None,
-    stream=None,
+    out: torch.Tensor,
+    stream,
 ) -> torch.Tensor:
     """Build packed fp32 [Aᵀ,Cᵀ] maps with request-aligned blocks.
 
@@ -1149,16 +1143,17 @@ def _build_chunk_gdn_block_maps(
         raise ValueError("Block-map operands must be colocated bf16 tensors.")
     if g is not None and (g.shape != (1, H, T) or g.device != k.device):
         raise ValueError("Block-map g must be colocated head-major [1,H,T].")
+    if g is not None:
+        g = _require_contiguous(g, "g")
+        if g.dtype != torch.float32:
+            raise ValueError("Block-map g must be fp32.")
     k, w = _require_contiguous(k, "k"), _require_contiguous(w, "w")
+    u = _require_contiguous(u, "u")
     blocks = schedule.total_blocks
-    # The homogeneous basis state needs no stored u.
-    packed_u = u if u.is_contiguous() else u.contiguous()
+    # The first K columns of the map propagate the homogeneous basis state,
+    # which needs no stored u; the remaining V columns carry the real forcing.
     packed_v = K + V
-    maps = (
-        out
-        if out is not None
-        else torch.empty((blocks, H, packed_v, K), device=k.device, dtype=torch.float32)
-    )
+    maps = out
     dummy, int_dummy = _placeholder_pair(k.device)
     launch = _get_or_compile_opt(
         K,
@@ -1176,16 +1171,16 @@ def _build_chunk_gdn_block_maps(
         True,
         g_head_major=True,
         g_log2_scaled=True,
-        phase="build_map",
-        num_xcds=_tensor_num_xcds(k),
+        phase=PHASE_BUILD_MAP,
+        num_xcds=get_num_xcds(),
     )
     _run_compiled(
         launch,
         k,
-        packed_u,
+        u,
         w,
         dummy,
-        _as_fp32_contig(g) if g is not None else dummy,
+        g if g is not None else dummy,
         dummy,
         dummy,
         dummy,
@@ -1202,7 +1197,7 @@ def _build_chunk_gdn_block_maps(
         schedule.n_prefill,
         packed_v // bv,
         blocks * H,
-        stream if stream is not None else torch.cuda.current_stream(),
+        stream,
     )
     return maps
 
@@ -1226,8 +1221,8 @@ def _carry_chunk_gdn_block_maps(
     initial_state: torch.Tensor | None = None,
     *,
     prefill_metadata: GatedDeltaRulePrefillMetadata,
-    out: torch.Tensor | None = None,
-    stream=None,
+    out: torch.Tensor,
+    stream,
 ) -> torch.Tensor:
     """Scan request-local maps into fp32 [blocks,H,K,V] entries.
 
@@ -1256,18 +1251,14 @@ def _carry_chunk_gdn_block_maps(
                 "Carry initial_state must be colocated fp32/bf16 [N,H,V,K]."
             )
         initial_state = _require_contiguous(initial_state, "initial_state")
-    entry = (
-        out
-        if out is not None
-        else torch.empty((blocks, heads, K, V), device=maps.device, dtype=maps.dtype)
-    )
+    entry = out
     if blocks != schedule.total_blocks or schedule.block_prefix.device != maps.device:
         raise ValueError("Carry maps must match the block schedule.")
     launch = _get_or_compile_chunk_gdn_carry(
         heads,
         initial_state is not None,
         initial_state is not None and initial_state.dtype is torch.bfloat16,
-        _tensor_num_xcds(maps),
+        get_num_xcds(),
     )
     _run_compiled(
         launch,
@@ -1277,7 +1268,7 @@ def _carry_chunk_gdn_block_maps(
         schedule.block_prefix,
         blocks,
         requests,
-        stream if stream is not None else torch.cuda.current_stream(maps.device),
+        stream,
     )
     return entry
 
@@ -1291,39 +1282,24 @@ def _chunk_gated_delta_rule_fwd_h_blocked(
     *,
     cu_seqlens: torch.Tensor | None = None,
     prefill_metadata: GatedDeltaRulePrefillMetadata | None = None,
-    block_chunks: int = 64,
-    target_segments: int | None = None,
     state_dtype: torch.dtype = torch.float32,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Approximate serial recurrence with BF16-rounded maps and FP32 carry.
 
     Inputs use public k and head-major w/u, with log2-scaled head-major g.
-    Explicit metadata overrides target_segments; outputs include fp32 final state.
+    ``prefill_metadata`` must carry per-sequence blocks and no empty sequence.
+    The final state has dtype ``state_dtype``; h is bf16 and v_new matches u.
     """
     if k.ndim != 4 or k.shape[0] != 1:
         raise ValueError("Blocked emit requires packed [1,T,Hg,K] input.")
     _, T, Hg, K = k.shape
-    if prefill_metadata is None and target_segments is not None:
-        prefill_metadata = _resolve_adaptive_k5_metadata(
-            cu_seqlens, T, k.device, target_segments
-        )
-    elif prefill_metadata is None:
-        lengths = _gdn_k5_sequence_lengths(cu_seqlens, T)
-        if cu_seqlens is None:
-            cu_seqlens = torch.tensor([0, T], device=k.device, dtype=torch.int32)
-        prefill_metadata = build_gated_delta_rule_prefill_metadata(
-            lengths,
-            cu_seqlens=cu_seqlens,
-            block_chunks=block_chunks,
-            build_blocks=True,
-        )
-    elif cu_seqlens is not None:
+    if prefill_metadata is None:
+        raise ValueError("Blocked emit requires prefill_metadata.")
+    if 0 in prefill_metadata.layout.seq_lens_cpu:
+        raise ValueError("Blocked emit does not support empty sequences.")
+    if cu_seqlens is not None:
         prefill_metadata.layout.validate(cu_seqlens)
     schedule = prefill_metadata.get_chunk_schedule(64)
-    if schedule.block_chunks not in (0, block_chunks) and target_segments is None:
-        raise ValueError("Rebuild metadata for the requested block_chunks.")
-    if schedule.block_prefix.numel() == 0:
-        raise ValueError("Blocked emit needs metadata built with build_blocks=True.")
     if schedule.kernel_cu_seqlens.device != k.device:
         raise ValueError("Blocked metadata must be on the input device.")
     blocks = schedule.total_blocks
@@ -1335,12 +1311,11 @@ def _chunk_gated_delta_rule_fwd_h_blocked(
     # framework memory profiling sees it.
     maps_buf = torch.empty((blocks, H, K + V, K), device=k.device, dtype=torch.float32)
     entry_buf = torch.empty((blocks, H, K, V), device=k.device, dtype=torch.float32)
-    g32 = _as_fp32_contig(g) if g is not None else None
     maps = _build_chunk_gdn_block_maps(
         k,
         w,
         u,
-        g32,
+        g,
         prefill_metadata=prefill_metadata,
         bv=map_bv,
         out=maps_buf,
@@ -1379,7 +1354,7 @@ def _chunk_gated_delta_rule_fwd_h_blocked(
         g_log2_scaled=True,
         block_entry_seed=True,
         state_bf16=(state_dtype is torch.bfloat16),
-        num_xcds=_tensor_num_xcds(k),
+        num_xcds=get_num_xcds(),
     )
     _run_compiled(
         launch,
@@ -1387,7 +1362,7 @@ def _chunk_gated_delta_rule_fwd_h_blocked(
         u,
         w,
         v_new,
-        g32 if g32 is not None else dummy,
+        g if g is not None else dummy,
         dummy,
         h,
         entry,

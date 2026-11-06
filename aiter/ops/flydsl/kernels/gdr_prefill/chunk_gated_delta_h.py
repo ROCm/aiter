@@ -4,6 +4,9 @@
 """GDN K5 hidden-state recurrence for 64-token chunks.
 
 Uses bf16 MFMA and a [V, K] transpose buffer for public state stores.
+Serially over the NT chunks: store the h snapshot for K6, then
+    v_new = u - w @ h
+    h = h * exp(g_last) + k^T @ (v_new * exp(g_last - g))
 """
 
 import flydsl.compiler as flyc
@@ -68,6 +71,8 @@ def compile_chunk_gated_delta_h(
 ):
     """Compile GDN K5; BF16-rounded basis states approximate serial carry.
 
+    ``STATE_DTYPE_BF16`` puts ``h0`` / ``ht`` in bf16 (promote on load, demote
+    on store); the f32 accumulator and the LDS layouts are unchanged.
     FP32 snapshots require two half-BV LDS rounds.
     """
     if PHASE not in (PHASE_EMIT, PHASE_BUILD_MAP):
@@ -280,8 +285,9 @@ def compile_chunk_gated_delta_h(
             fx.make_layout((BV, (4, BT // 4)), (4, (1, BV * 4))),
         )
 
-        # Dual swizzles avoid store/read bank conflicts; partition_S misaddresses
-        # the nested layout, so use fx.slice.
+        # Two swizzles because the store touches K-row bits 3-5 and the MFMA A
+        # read touches bits 0-3; both must stay conflict-free. partition_S
+        # misaddresses the nested layout, so index with fx.slice.
         def _k_panel_view(kb, group):
             """k panel ``kb`` as (64, (group, BT/group)): same addresses either
             way -- group=4 is the MFMA A operand, group=2 the store pair."""
@@ -639,7 +645,9 @@ def compile_chunk_gated_delta_h(
             loop_nt = NT
         nt_idx = fx.Int64(loop_nt)
 
-        # Empty requests would prefetch beyond the input despite clamping.
+        # Skip the prologue for an empty sequence: bos == T_flat, so its clamped
+        # w/k address runs past the input. Skipping is correct since the loop
+        # then runs zero times.
         has_work = loop_nt > 0
         if has_work:
             _store_w_rows(_load_w_rows())

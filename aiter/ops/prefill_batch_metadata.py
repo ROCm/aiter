@@ -198,7 +198,6 @@ class GatedDeltaRuleChunkSchedule:
     grid: ChunkGrid
     chunk_offsets: torch.Tensor
     kernel_cu_seqlens: torch.Tensor
-    block_chunks: int
     block_seq_id: torch.Tensor
     block_chunk_base: torch.Tensor
     block_nchunks: torch.Tensor
@@ -413,9 +412,7 @@ def build_gated_delta_rule_prefill_metadata(
     chunk_size: int = 64,
     num_decodes: int = 0,
     num_decode_tokens: int = 0,
-    block_chunks: int = 64,
     block_chunks_per_seq: Sequence[int] | None = None,
-    build_blocks: bool = False,
 ) -> GatedDeltaRulePrefillMetadata:
     """Build reusable GDR prefill metadata on the ``cu_seqlens`` device."""
     if cu_seqlens.device.type == "cuda" and torch.cuda.is_current_stream_capturing():
@@ -451,13 +448,9 @@ def build_gated_delta_rule_prefill_metadata(
         kernel_cu_seqlens_cpu.append(kernel_cu_seqlens_cpu[-1] + length)
 
     # Only the blocked K5 path reads the block arrays; skip their build/upload.
-    build_blocks = build_blocks or block_chunks_per_seq is not None
+    build_blocks = block_chunks_per_seq is not None
     block_counts, total_blocks = (), 0
-    if not build_blocks:
-        pass
-    elif block_chunks_per_seq is None:
-        block_counts, total_blocks, _ = _chunk_counts(counts, block_chunks)
-    else:
+    if build_blocks:
         if len(block_chunks_per_seq) != len(prefill_lens):
             raise ValueError(
                 "`block_chunks_per_seq` must have one entry per prefill sequence."
@@ -477,11 +470,7 @@ def build_gated_delta_rule_prefill_metadata(
         zip(counts, block_counts, strict=False)
     ):
         block_seq_id_cpu.extend([sequence_id] * num_blocks)
-        seq_block_chunks = (
-            block_chunks
-            if block_chunks_per_seq is None
-            else block_chunks_per_seq[sequence_id]
-        )
+        seq_block_chunks = block_chunks_per_seq[sequence_id]
         for base in range(0, num_chunks, seq_block_chunks):
             block_chunk_base_cpu.append(base)
             block_nchunks_cpu.append(min(seq_block_chunks, num_chunks - base))
@@ -529,8 +518,6 @@ def build_gated_delta_rule_prefill_metadata(
         grid=grid,
         chunk_offsets=packed[chunk_ids_end:offsets_end],
         kernel_cu_seqlens=packed[source_cu_end:kernel_cu_end],
-        # Zero distinguishes per-sequence sizing from a uniform block size.
-        block_chunks=block_chunks if block_chunks_per_seq is None else 0,
         block_seq_id=packed[kernel_cu_end:block_seq_end],
         block_chunk_base=packed[block_seq_end:block_base_end],
         block_nchunks=packed[block_base_end:block_nchunks_end],

@@ -162,16 +162,14 @@ def compile_chunk_gdn_carry(
         blocks: fx.Int32,
         requests: fx.Int32,
     ):
-        tid = fx.Int32(gpu.thread_id("x"))
+        tid = fx.thread_idx.x
         # The GRID_V V-tiles of one (request, head) read the same packed A
         # maps; give them consecutive logical ids on one XCD (see gdn_h_kernel).
         if const_expr(NUM_XCDS > 1 and GRID_V > 1):
             xcd_cycle = fx.Int32(NUM_XCDS * GRID_V)
             grid_total = fx.Int32(GRID_V) * requests * fx.Int32(H)
             full = (grid_total // xcd_cycle) * xcd_cycle
-            xy = fx.Int32(gpu.block_id("x")) + fx.Int32(GRID_V) * fx.Int32(
-                gpu.block_id("y")
-            )
+            xy = fx.block_idx.x + fx.Int32(GRID_V) * fx.block_idx.y
             xcd = xy % fx.Int32(NUM_XCDS)
             local_id = xy // fx.Int32(NUM_XCDS)
             remapped = (
@@ -183,8 +181,8 @@ def compile_chunk_gdn_carry(
             tile_v = logical % fx.Int32(GRID_V)
             request_head = logical // fx.Int32(GRID_V)
         else:
-            tile_v = fx.Int32(gpu.block_id("x"))
-            request_head = fx.Int32(gpu.block_id("y"))
+            tile_v = fx.block_idx.x
+            request_head = fx.block_idx.y
         head = request_head % H
         request = request_head // H
         v_base = tile_v * BV
@@ -230,18 +228,17 @@ def compile_chunk_gdn_carry(
                 loaded_seed = loaded_seed.to(fx.Float32)
             seed = loaded_seed
         _store_c(lds_cp, state, seed, tid)
-        if first < end:
-            entry_first = fx.make_view(
-                fx.get_iter(fx.slice(entry, (first, 0, v_base, None))),
-                fx.make_layout((K, BV), (V, 1)),
-            )
-            _store_c(cp, entry_first, seed, tid)
+        # Every request owns at least one block (empty requests are rejected by
+        # the host wrapper), so the first entry always exists.
+        entry_first = fx.make_view(
+            fx.get_iter(fx.slice(entry, (first, 0, v_base, None))),
+            fx.make_layout((K, BV), (V, 1)),
+        )
+        _store_c(cp, entry_first, seed, tid)
         gpu.barrier()
 
-        # Empty requests still prefetch one map. When end == first + 1 the
-        # prefetched maps[end - 1] is uninitialized but never used (empty loop).
-        seed_block = (first < end).select(first, fx.Int32(0))
-        first_a = _prefetch_a(maps, seed_block, fx.Int32(0), tid)
+        # When end == first + 1 the loop is empty and this prefetch is unused.
+        first_a = _prefetch_a(maps, first, fx.Int32(0), tid)
         for block, carried_a in range(first, end - 1, fx.Int32(1), init=[first_a]):
             b = fx.Int32(block)
             parity = (b - first) % 2
