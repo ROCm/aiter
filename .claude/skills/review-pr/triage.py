@@ -2505,8 +2505,13 @@ SIZE_CARD = re.compile(r"^Size:\s*(.*)$", re.M)
 DESIGN_TXT = re.compile(r"^DESIGN:\s*(.*)$", re.M)
 HUMAN_TXT = re.compile(r"^HUMAN:\s*(.*)$", re.M)
 RECOMMEND = re.compile(r"^recommend\s+(.+?)\s+review\s+(.+)$", re.I)
-NONE_REASON = re.compile(r"^NONE\s+--\s*(.*)$", re.I)
-NA_REASON = re.compile(r"^N/A\s+--\s*(.*)$", re.I)
+# `--` (design.txt's house style, like refutations.txt) and the em-dash the card's header
+# block uses everywhere else (Validation/Perf) must both read: a worker following the card
+# template to the letter wrote `NONE — <reason>` and the gate reded DESIGN-DISAGREES on a
+# card that said exactly what design.txt said.
+DASH = r"(?:--|—|–)"
+NONE_REASON = re.compile(r"^NONE\s+" + DASH + r"\s*(.*)$", re.I)
+NA_REASON = re.compile(r"^N/A\s+" + DASH + r"\s*(.*)$", re.I)
 
 
 def size_stats(meta):

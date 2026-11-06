@@ -215,6 +215,19 @@ Size: 25 lines / 1 files
 Design (advisory): route the expert through the per-expert gate rather than the shared one
 Human: recommend bob review whether the per-expert gate in fused_moe.py holds at TP=8'
 t "a routed design passes" "$(design_gate "$dg_design" "$dg_card" "$dg_roster" "$dg_meta_small")" "routed"
+# The card's header block spells its separators with an em-dash (Validation/Perf style) while
+# design.txt's house style is `--` (refutations.txt style). A worker following the card
+# template to the letter wrote `NONE — <reason>` and reded DESIGN-DISAGREES on a card that
+# said exactly what design.txt said -- found by dry-running the documented formats, not by
+# reading the regex. Pin both spellings.
+t "a NONE design written in the card's em-dash style passes" \
+  "$(design_gate 'DESIGN: NONE -- a tooling-only change inside the existing skill layout
+HUMAN: N/A -- no design decision to route' \
+    'Review (advisory): NEEDS WORK
+Size: 25 lines / 1 files
+Design (advisory): NONE — a tooling-only change inside the existing skill layout
+Human: N/A — no design decision to route' \
+    "$dg_roster" "$dg_meta_small")" "routed"
 t "a card with no Size line is rejected" \
   "$(design_gate "$dg_design" "$(printf '%s\n' "$dg_card" | grep -v '^Size:')" "$dg_roster" "$dg_meta_small")" "UNREPORTED-SIZE"
 t "an empty design.txt is a skipped step" \
