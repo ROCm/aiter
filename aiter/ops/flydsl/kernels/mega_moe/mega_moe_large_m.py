@@ -43,16 +43,19 @@ from ..tensor_shim import torch_stream as _torch_stream
 from .dispatch import _wave_inclusive_scan_i32, _wave_reduce_max_i32
 from .gemm1 import _LdsF32View, build_fused_gemm1
 from .gemm2 import _resolve_g2_knobs, gemm2_compute_v2, issue_a_load_lds_dt
-from .mega_moe_config import LARGE_M_MTPRS, fused_layout_supported
+from .mega_moe_config import (
+    LARGE_M_MTPRS,
+    MegaMoEConfig,
+    fused_layout_supported,
+    select_fused_config,
+)
 from .mega_moe_fused_gemm import (
     AddrBuffer,
-    MegaMoEConfig,
     _buffer_load,
     _buffer_store,
     _make_buffer,
     _make_buffer_from_addr,
     load_at,
-    select_mega_moe_config,
     store_at,
 )
 from .mega_moe_stage1 import _validate_dispatch_capacity, stage1_output_buffers
@@ -2225,7 +2228,7 @@ class LargeMRuntime:
         self.select_layer_state(layer_slot)
 
     def _select_config(self, tokens: int) -> MegaMoEConfig:
-        config = select_mega_moe_config(
+        config = select_fused_config(
             tokens,
             self.mtpr,
             experts_per_rank=self.epr,

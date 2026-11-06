@@ -72,6 +72,8 @@ DEFAULT_SMALL_M_MTPRS = (256, 512)
 # uniform tokens) and its source-indexed payload needs 1.75 GiB per GPU where
 # the large-input route-major payload needs 10.5 GiB.
 LARGE_M_MTPRS = (1024, 2048, 4096, 8192, 16384)
+# The fused kernels have no 2-token variant: 2 tokens take the 1-token config.
+FUSED_TOKEN_BUCKETS = tuple(b for b in TOKEN_BUCKETS if b != 2)
 # Below this many rows per rank the staged (or small-input) path is faster than
 # the large-input kernel, whose geometry is fixed by its capacity.
 LARGE_M_MIN_TOKENS = SMALL_M_MAX_MTPR + 1
@@ -289,15 +291,15 @@ def small_m_mtprs_for(mtpr: int, mtprs=DEFAULT_SMALL_M_MTPRS) -> tuple[int, ...]
     return tuple(reachable)
 
 
-def nearest_token_bucket(tokens: int) -> int:
+def nearest_token_bucket(tokens: int, buckets=TOKEN_BUCKETS) -> int:
     if tokens <= 0:
         raise ValueError(f"tokens must be positive, got {tokens}")
-    index = bisect_left(TOKEN_BUCKETS, tokens)
+    index = bisect_left(buckets, tokens)
     if index == 0:
-        return TOKEN_BUCKETS[0]
-    if index == len(TOKEN_BUCKETS):
-        return TOKEN_BUCKETS[-1]
-    lower, upper = TOKEN_BUCKETS[index - 1], TOKEN_BUCKETS[index]
+        return buckets[0]
+    if index == len(buckets):
+        return buckets[-1]
+    lower, upper = buckets[index - 1], buckets[index]
     return upper if upper - tokens <= tokens - lower else lower
 
 
@@ -1203,4 +1205,100 @@ def build_mega_moe_bundle_plan(
         stage2_variants=tuple(stage2_variants),
         small_m_mtprs=small_m_mtprs_for(mtpr, small_m_mtprs) if small_m_mtprs else (),
         large_m=large_m,
+    )
+
+
+# Small- and large-input (fused) routes. Their kernels take the same config
+# types as the staged path, tuned on their own: the small-input kernel uses
+# fixed slots per token bucket, the large-input kernel one config per capacity.
+
+
+def _small_m_stage1(bucket: int) -> Stage1Config:
+    grid_mult = max(1, bucket // 4) if bucket <= 16 else 3
+    return Stage1Config(
+        sort_block_m=32,
+        tile_n=256 if bucket <= 8 else 128,
+        num_waves=4,
+        grid_mult=grid_mult,
+        num_dispatch_cu=_fixed_dispatch_cu(bucket),
+        mfma_amajor=False,
+        async_a_copy=False,
+        use_tile_resource=bucket <= 16,
+        b_nt=0 if bucket == 1 else 3,
+        waves_per_eu_hint=1 if bucket == 16 else 2,
+    )
+
+
+def _small_m_stage2(bucket: int, model_dim: int) -> Stage2Config:
+    block_n = 256 if bucket in (1, 4, 64) or bucket >= 1024 else 128
+    if model_dim < 4096:
+        block_n = 128
+    persist = bucket >= 128
+    return Stage2Config(
+        block_m=32,
+        block_n=block_n,
+        persist=persist,
+        persist_cu=128 if bucket == 256 else 240 if persist else 0,
+        use_nt=bucket <= 128,
+        persist_strided=512 <= bucket <= 1024,
+    )
+
+
+def _large_m_config(model_dim: int, inter_dim: int) -> MegaMoEConfig:
+    stage1 = Stage1Config(
+        sort_block_m=128,
+        tile_n=512 if inter_dim >= 2048 else 256,
+        num_waves=8,
+        grid_mult=1,
+        num_dispatch_cu=96,
+        mfma_amajor=True,
+        async_a_copy=True,
+        use_tile_resource=True,
+        b_nt=0,
+        work_shards=4,
+        payload_chunk_rows=384,
+    )
+    stage2 = Stage2Config(
+        block_m=64,
+        block_n=128 if model_dim < 4096 else 256,
+        persist=True,
+        persist_cu=240,
+        use_nt=False,
+        skew_cu=96,
+    )
+    return MegaMoEConfig(stage1=stage1, stage2=stage2, p2p_quant="fp8_blockwise_1x32")
+
+
+@cache
+def _fused_config(
+    bucket: int, mtpr: int, model_dim: int, inter_dim: int
+) -> MegaMoEConfig:
+    if mtpr in LARGE_M_MTPRS:
+        return _large_m_config(model_dim, inter_dim)
+    stage1 = _small_m_stage1(bucket)
+    stage2 = _small_m_stage2(bucket, model_dim)
+    return MegaMoEConfig(stage1=stage1, stage2=stage2, p2p_quant="none")
+
+
+def select_fused_config(
+    tokens: int,
+    mtpr: int,
+    *,
+    experts_per_rank: int = REFERENCE_EXPERTS_PER_RANK,
+    model_dim: int = 7168,
+    inter_dim: int = 3072,
+) -> MegaMoEConfig:
+    """Small-input (MTPR <= SMALL_M_MAX_MTPR) or large-input (MTPR in LARGE_M_MTPRS) config for ``tokens`` per rank."""
+    if mtpr <= 0 or mtpr & (mtpr - 1):
+        raise ValueError(f"mtpr={mtpr} must be a positive power of two")
+    if mtpr > SMALL_M_MAX_MTPR and mtpr not in LARGE_M_MTPRS:
+        raise ValueError(f"no small- or large-input config for mtpr={mtpr}")
+    if tokens > mtpr:
+        raise ValueError(f"tokens={tokens} exceeds mtpr={mtpr}")
+    if experts_per_rank <= 0 or experts_per_rank > 64:
+        raise ValueError(f"experts_per_rank must be in [1, 64], got {experts_per_rank}")
+    if model_dim <= 0 or inter_dim <= 0:
+        raise ValueError(f"invalid model shape {model_dim}x{inter_dim}")
+    return _fused_config(
+        nearest_token_bucket(tokens, FUSED_TOKEN_BUCKETS), mtpr, model_dim, inter_dim
     )
