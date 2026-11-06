@@ -7,6 +7,7 @@ Run with: python -m pytest -q op_tests/test_flydsl_pa_decode.py
 """
 
 import importlib.util
+from dataclasses import replace
 from functools import partial
 from itertools import product
 
@@ -116,6 +117,16 @@ def test_pa_decode_plan(
             prefix_tiles += tiles
         assert cursor <= plan.capacity
         assert all(record == [0, 0, 0, 0] for record in work[cursor:])
+        if plan.cluster_info is not None:
+            records = plan.cluster_info.cpu().tolist()
+            for seq, ((start, count), row_records) in enumerate(zip(info, records)):
+                for part, record in enumerate(row_records):
+                    assert record[0] == seq
+                    assert record[3:] == [lengths[seq], start, count, 0, 0]
+                    if part < count:
+                        assert record[:4] == work[start + part]
+                    else:
+                        assert record[1:3] == [0, 0]
 
     pattern = (-1, 0, 1, 255, 256, 257, 65537, 2**31 - 1)
     lengths = [pattern[i % len(pattern)] for i in range(batch)]
@@ -134,7 +145,15 @@ def test_pa_decode_plan(
     assert config[0] == bucket
     if max_batch_size is not None:
         assert plan.max_batch_size == max_batch_size
-    pointers = (plan.work_info.data_ptr(), plan.reduce_info.data_ptr())
+
+    def plan_pointers():
+        return (
+            plan.work_info.data_ptr(),
+            plan.reduce_info.data_ptr(),
+            plan.cluster_info.data_ptr() if plan.cluster_info is not None else None,
+        )
+
+    pointers = plan_pointers()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         refreshed = planner.plan_pa_decode(
@@ -147,7 +166,7 @@ def test_pa_decode_plan(
         context.copy_(torch.tensor(values, dtype=torch.int32, device=device))
         graph.replay()
         check(plan, values)
-        assert (plan.work_info.data_ptr(), plan.reduce_info.data_ptr()) == pointers
+        assert plan_pointers() == pointers
 
     if bucket > 1:
         # Change every runtime value inside the same batch/block-size bucket
@@ -182,8 +201,9 @@ def test_pa_decode_plan(
         assert other_plan.capacity == other_capacity
         check(other_plan, values)
         other_config, other_launch = calls[-1]
-        assert other_config == config
-        assert other_launch is launch
+        assert other_config[:3] == config[:3]
+        if other_config == config:
+            assert other_launch is launch
 
     if max_batch_size is not None:
         invalid_batch = batch + 1 if lds_limit else max_batch_size + 1
@@ -1677,6 +1697,7 @@ def _check_pipe_policy(pa, case, arch, compile_kwargs):
         schedule_kwargs.pop("direct_output", None)
         schedule_kwargs.pop("cluster_merge", None)
         schedule_kwargs.pop("packed_scale_heads", None)
+        schedule_kwargs.pop("cluster_task_stride", None)
         pipe, staged = PaDecodeSchedule.select(**schedule_kwargs).cache_key[-2:]
         assert pipe == (arch == "gfx950")
         if pipe:
@@ -2040,6 +2061,16 @@ def test_pa_decode(case, device, monkeypatch):
 
     launch()
     check()
+    if plan.cluster_info is not None and compile_kwargs[-1]["cluster_merge"]:
+        assert compile_kwargs[-1]["cluster_task_stride"] == plan.max_partitions
+        packed = output.clone()
+        original_plan = plan
+        plan = replace(plan, cluster_info=None)
+        launch()
+        check()
+        assert compile_kwargs[-1]["cluster_task_stride"] == 0
+        assert torch.equal(output, packed)
+        plan = original_plan
     if case["variants"]:
         # Plan-free, a one-partition plan and uint8 views of the same bytes are one
         # task; a strided output takes the reducer, and a context-0 row is zero-filled

@@ -181,6 +181,7 @@ def compile_pa_decode_tile(
     mask_unowned_kv: bool = True,
     cluster_merge: int = 0,
     packed_scale_heads: bool = False,
+    cluster_task_stride: int = 0,
 ):
     """Select and cache a PA-decode kernel and launch wrapper.
 
@@ -267,6 +268,7 @@ def compile_pa_decode_tile(
             merge_partitions=direct_output and num_partitions > 1,
             cluster_merge=cluster_merge,
             packed_scale_heads=packed_scale_heads,
+            cluster_task_stride=cluster_task_stride,
         )
     if architecture not in ("gfx942", "gfx950"):
         raise NotImplementedError(f"PA decode does not support {architecture}")
@@ -543,6 +545,7 @@ def compile_gfx1250_pa_decode(
     merge_partitions=False,
     cluster_merge=0,
     packed_scale_heads=False,
+    cluster_task_stride=0,
 ):
     """Compile a gfx1250 tile kernel; merging partitions writes final output.
 
@@ -555,6 +558,9 @@ def compile_gfx1250_pa_decode(
     and empty sequences clear their rows.
     ``merge_partitions`` partial storage must be eight-byte aligned for its
     device-scope atomic accesses; the host wrapper falls back for offset views.
+    ``cluster_task_stride`` selects optional [batch, stride, 8] records; it
+    must cover the cluster, and ``work`` then points at those records. The
+    default zero retains packed work_info plus reduce_info lookups.
     ``packed_scale_heads`` promises that per-token scale head stride equals
     ``block_size``; otherwise the FP8 cluster ABI retains the dynamic stride.
     """
@@ -576,6 +582,7 @@ def compile_gfx1250_pa_decode(
         merge_partitions,
         cluster_merge,
         packed_scale_heads,
+        cluster_task_stride,
     )
     if compute_dtype not in ("fp8", "bf16"):
         raise ValueError(f"Unsupported gfx1250 PA compute dtype: {compute_dtype}")
@@ -594,6 +601,12 @@ def compile_gfx1250_pa_decode(
         raise ValueError(
             f"cluster_merge must be in [2, {CLUSTER_PARTITIONS}] and excludes other "
             f"output modes and head_dim > {MERGE_HEAD_DIM}"
+        )
+    if cluster_task_stride and (
+        not cluster_merge or not cluster_merge <= cluster_task_stride <= 8
+    ):
+        raise ValueError(
+            "cluster_task_stride must cover an enabled cluster of at most 8"
         )
     if t.total_bytes > 327680:
         raise NotImplementedError(
@@ -672,7 +685,7 @@ def compile_gfx1250_pa_decode(
                     rows[offset] = t.q_dtype(0.0)
 
         task_slot = fx.Int32(gpu.block_id("x"))
-        if const_expr(t.cluster_merge):
+        if const_expr(t.cluster_merge and not t.cluster_task_stride):
             # Cluster s runs sequence s's tasks on its leading CTAs.
             # Hardware block IDs are unsigned; avoid signed floor-division
             # fixups before the dependent reduce_info read.
@@ -692,10 +705,24 @@ def compile_gfx1250_pa_decode(
             # A trailing empty sequence's start can equal capacity. Its dummy
             # task read must stay in bounds even though no compute consumes it.
             task_slot = (count > 0).select(fx.Int32(info[task_slot * 2]), fx.Int32(0))
-        task = fx.ptr_load(
-            fx.add_offset(fx.recast_iter(fx.Int32, work), task_slot * 4),
-            result_type=fx.Vector.make_type(4, fx.Int32),
-        )
+        if const_expr(t.cluster_task_stride):
+            cluster_slot = fx.Uint32(gpu.block_id("x"))
+            seq = fx.Int32(cluster_slot // t.cluster_merge)
+            part = fx.Int32(cluster_slot % t.cluster_merge)
+            task = fx.ptr_load(
+                fx.add_offset(
+                    fx.recast_iter(fx.Int32, work),
+                    (seq * t.cluster_task_stride + part) * 8,
+                ),
+                result_type=fx.Vector.make_type(8, fx.Int32),
+            )
+            first, count = fx.Int32(task[4]), fx.Int32(task[5])
+            task_slot = (part < count).select(first + part, fx.Int32(0))
+        else:
+            task = fx.ptr_load(
+                fx.add_offset(fx.recast_iter(fx.Int32, work), task_slot * 4),
+                result_type=fx.Vector.make_type(4, fx.Int32),
+            )
         active = fx.Int32(task[1]) < fx.Int32(task[2])
         if const_expr(t.direct_output):
             active = count > 0

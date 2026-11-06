@@ -835,6 +835,8 @@ class Gfx1250Traits:
     cluster_merge: int = 0
     # Validated per-token scales have head stride equal to block_size.
     packed_scale_heads: bool = False
+    # Number of aligned records per sequence in optional cluster_info.
+    cluster_task_stride: int = 0
 
     WAVE = 32
     NWARP = 4

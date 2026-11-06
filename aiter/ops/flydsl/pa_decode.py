@@ -1017,6 +1017,11 @@ def pa_decode(
             trans_k=trans_k,
             mask_unowned_kv=mask_unowned_kv,
             cluster_merge=cluster_merge,
+            cluster_task_stride=(
+                work_plan.max_partitions
+                if cluster_merge and work_plan.cluster_info is not None
+                else 0
+            ),
             packed_scale_heads=bool(
                 cluster_merge and per_token_kv and stride_ks_head == block_size
             ),
@@ -1122,7 +1127,14 @@ def pa_decode(
             stride_ks_head,
             int(query.stride(0)),
             int(query.stride(1)),
-            ptr_arg(work_plan.work_info, fx.Int32),
+            ptr_arg(
+                (
+                    work_plan.cluster_info
+                    if cluster_merge and work_plan.cluster_info is not None
+                    else work_plan.work_info
+                ),
+                fx.Int32,
+            ),
             work_plan.capacity,
             *merge_args,
             s,

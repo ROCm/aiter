@@ -54,19 +54,32 @@ def jobs_for_arch(arch: str) -> list[dict]:
         capacities = {min(max(step, batch), batch * cu_num) for step in _BLOCK_STEPS}
         for capacity in sorted(capacities):
             for windowed in (False, True):
-                jobs.append(
-                    {
-                        "kernel_name": (
-                            f"pa_decode_plan_b{batch}_c{capacity}"
-                            f"_{'window' if windowed else 'dense'}"
-                        ),
-                        "gfx": arch,
-                        "cu_num": cu_num,
-                        "batch": batch,
-                        "capacity": capacity,
-                        "windowed": windowed,
-                    }
-                )
+                job = {
+                    "kernel_name": (
+                        f"pa_decode_plan_b{batch}_c{capacity}"
+                        f"_{'window' if windowed else 'dense'}"
+                    ),
+                    "gfx": arch,
+                    "cu_num": cu_num,
+                    "batch": batch,
+                    "capacity": capacity,
+                    "windowed": windowed,
+                }
+                jobs.append(job)
+                # Resident cluster records add one planner variant per bucket,
+                # block size and window mode. Replay eligible caps explicitly.
+                if (
+                    arch == "gfx1250"
+                    and batch <= cu_num * 15 // 16
+                    and capacity <= batch * 8
+                ):
+                    jobs.append(
+                        {
+                            **job,
+                            "kernel_name": job["kernel_name"] + "_cluster",
+                            "cluster": True,
+                        }
+                    )
     return jobs
 
 
@@ -85,7 +98,11 @@ def replay(job: dict) -> None:
     plan_pa_decode(
         torch.empty(batch, dtype=torch.int32, device="cuda"),
         1,
-        max_partitions=-(-capacity // batch),
+        max_partitions=(
+            max(2, -(-capacity // batch))
+            if job.get("cluster")
+            else -(-capacity // batch)
+        ),
         max_batch_size=batch,
         workgroup_budget=capacity,
         sliding_window=int(job["windowed"]),
