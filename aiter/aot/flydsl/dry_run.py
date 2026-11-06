@@ -13,6 +13,7 @@ the runtime will look up. Any attempt to reach the GPU runtime raises.
 
 from __future__ import annotations
 
+import functools
 import os
 import sys
 from collections.abc import Iterator
@@ -113,6 +114,53 @@ def _torch_guard_modules() -> list:
     return modules
 
 
+@functools.cache
+def _mm_out_dtype_meta():
+    """The torch fallback of an untuned BF16 GEMM with an FP32 output calls
+    ``torch.mm(..., out_dtype=torch.float32)``. Before torch 2.10 the Meta
+    kernel of ``aten::mm`` takes no ``out_dtype``, so a FakeTensor fails on
+    ``mm.dtype`` and ``mm.dtype_out``; where it does, torch 2.10's is
+    registered in its place. Once per process: torch.library cannot hand an
+    overridden kernel back. Returns the registering library, if any."""
+    import torch
+    from torch._prims_common.wrappers import out_wrapper
+
+    if not hasattr(torch.ops.aten.mm, "dtype"):
+        return None
+    probe = torch.empty(1, 1, dtype=torch.bfloat16, device="meta")
+    try:
+        torch.ops.aten.mm.dtype(probe, probe, torch.float32)
+        return None
+    except TypeError:
+        pass
+
+    @out_wrapper(exact_dtype=True)
+    def meta_mm(a, b, out_dtype=None):
+        torch._check(a.dim() == 2, lambda: "a must be 2D")
+        torch._check(b.dim() == 2, lambda: "b must be 2D")
+        N, M1 = a.shape
+        M2, P = b.shape
+        torch._check(
+            M1 == M2,
+            lambda: f"a and b must have same reduction dim, but got [{N}, {M1}] X [{M2}, {P}].",
+        )
+        if out_dtype is not None:
+            torch._check(
+                out_dtype == a.dtype
+                or (
+                    out_dtype == torch.float32
+                    and a.dtype in (torch.float16, torch.bfloat16)
+                ),
+                lambda: "out_dtype must be the same as input dtype or fp32 for fp16/bf16 inputs",
+            )
+        return a.new_empty((N, P), dtype=a.dtype if out_dtype is None else out_dtype)
+
+    library = torch.library.Library("aten", "IMPL", "Meta")
+    for overload in ("mm.dtype", "mm.dtype_out"):
+        library.impl(overload, meta_mm, allow_override=True)
+    return library
+
+
 def _register_stream_stub() -> None:
     import flydsl.expr as fx
     from flydsl.compiler import JitArgumentRegistry
@@ -139,6 +187,7 @@ def dry_run(
     from aiter.utility import graph_alloc
 
     _register_stream_stub()
+    _mm_out_dtype_meta()
     stream = _Stream(torch.device("cuda", 0))
     properties = SimpleNamespace(
         name=name or arch, gcnArchName=arch, multi_processor_count=cu_num
@@ -158,13 +207,15 @@ def dry_run(
         )
 
     real_getitem = torch.Tensor.__getitem__
+    real_setitem = torch.Tensor.__setitem__
     real_contiguous = torch.Tensor.contiguous
+    real_copy = torch.Tensor.copy_
 
     # A handful of torch's Tensor methods take a device guard in their own
     # binding, before the call reaches the dispatcher and the fake with it.
-    # With the GPUs hidden that guard initializes HIP and raises, so the ones
-    # a replay's host code reaches stand in below. Every other op is bound
-    # straight to the dispatcher and needs nothing.
+    # With the GPUs hidden, or on a runner that has none, that guard reaches
+    # HIP and raises, so the ones a replay's host code reaches stand in below.
+    # Every other op is bound straight to the dispatcher and needs nothing.
 
     def getitem(tensor, index):
         """``tensor[index]``. Basic indexing is replayed on a meta tensor of
@@ -188,6 +239,28 @@ def dry_run(
             # without the guard.
             return torch.ops.aten.index(tensor, list(items))
         return real_getitem(tensor, index)
+
+    def setitem(tensor, index, value):
+        """``tensor[index] = value`` with basic indexing: the value is copied
+        into the view ``tensor[index]``, as the binding does."""
+        items = index if isinstance(index, tuple) else (index,)
+        if (
+            not isinstance(tensor, FakeTensor)
+            or tensor.device.type != "cuda"
+            or not all(isinstance(item, _VIEW_INDEX) for item in items)
+        ):
+            return real_setitem(tensor, index, value)
+        view = getitem(tensor, index)
+        if isinstance(value, torch.Tensor):
+            torch.ops.aten.copy_(view, value)
+        else:
+            torch.ops.aten.fill_(view, value)
+
+    def copy_(tensor, src, non_blocking=False):
+        """``tensor.copy_(src)``, whose binding takes the guard of ``tensor``."""
+        if not isinstance(tensor, FakeTensor) or tensor.device.type != "cuda":
+            return real_copy(tensor, src, non_blocking)
+        return torch.ops.aten.copy_(tensor, src, non_blocking)
 
     def contiguous(tensor, memory_format=torch.contiguous_format):
         """``tensor.contiguous()``, whose binding takes the guard only on the
@@ -238,7 +311,9 @@ def dry_run(
             (graph_alloc, "_capture_id", lambda _stream: None),
             (torch.Tensor, "data_ptr", data_ptr),
             (torch.Tensor, "__getitem__", getitem),
+            (torch.Tensor, "__setitem__", setitem),
             (torch.Tensor, "contiguous", contiguous),
+            (torch.Tensor, "copy_", copy_),
             (torch.Tensor, "record_stream", lambda *_a, **_k: None),
             (chip_info, "_detect_native", lambda: [arch]),
             (

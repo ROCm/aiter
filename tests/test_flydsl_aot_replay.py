@@ -130,6 +130,36 @@ def test_the_dry_run_builds_capture_scoped_scratch_without_asking_hip(monkeypatc
     assert calls == [device]
 
 
+def test_the_dry_run_writes_into_fake_tensors_without_asking_hip(monkeypatch):
+    """``Tensor.copy_`` and ``tensor[index] = value`` take a device guard in
+    their binding, which raises on a runner that has no GPU; shuffle_scale,
+    which the MoE replay's inputs go through, reaches both."""
+
+    def no_gpu(*_args, **_kwargs):
+        raise RuntimeError("HIP error: no ROCm-capable device is detected")
+
+    monkeypatch.setattr(torch.Tensor, "copy_", no_gpu)
+    monkeypatch.setattr(torch.Tensor, "__setitem__", no_gpu)
+    with dry_run("gfx950", 256):
+        padded = torch.empty(16, 16, dtype=torch.uint8, device="cuda")
+        padded[:4, :8] = torch.empty(4, 8, dtype=torch.uint8, device="cuda")
+        padded[4:, :] = 0
+        assert padded.copy_(torch.empty_like(padded)) is padded
+
+
+def test_the_dry_run_answers_an_fp32_mm_of_bf16_operands():
+    """An untuned BF16 GEMM with an FP32 output falls back to
+    ``torch.mm(..., out_dtype=torch.float32)``, whose Meta kernel takes no
+    ``out_dtype`` before torch 2.10."""
+    with dry_run("gfx950", 256):
+        a = torch.empty(1, 7168, dtype=torch.bfloat16, device="cuda")
+        w = torch.empty(896, 7168, dtype=torch.bfloat16, device="cuda")
+        out = torch.empty(1, 896, dtype=torch.float32, device="cuda")
+        result = torch.mm(a, w.t(), out_dtype=torch.float32)
+        assert (result.shape, result.dtype) == ((1, 896), torch.float32)
+        assert torch.mm(a, w.t(), out_dtype=torch.float32, out=out) is out
+
+
 def test_per_arch_replays_get_the_command_line(monkeypatch):
     argv = ["--shape", "12:12:192:128", "--check"]
     forwarded = []
