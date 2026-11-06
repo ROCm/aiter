@@ -533,8 +533,8 @@ def compile_mixed_moe_gemm1_common(
                 bx_persist, by = xcd_remap_grid(
                     bx_persist,
                     by,
-                    grid_y,
-                    grid_x,
+                    grid_m=grid_y,
+                    grid_n=grid_x,
                     xcd_swizzle=xcd_swizzle,
                     num_xcds=num_xcds,
                 )
@@ -3308,8 +3308,8 @@ def compile_mixed_moe_gemm2_common(
                 bx_persist, by_outer = xcd_remap_grid(
                     bx_persist,
                     by_outer,
-                    grid_y,
-                    grid_x,
+                    grid_m=grid_y,
+                    grid_n=grid_x,
                     xcd_swizzle=xcd_swizzle,
                     num_xcds=num_xcds,
                 )

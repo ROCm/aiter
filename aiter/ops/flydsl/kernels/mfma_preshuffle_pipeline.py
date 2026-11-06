@@ -391,10 +391,10 @@ def xcd_remap_bx_by(
 
 
 def xcd_remap_grid(bx, by, grid_m, grid_n, *, xcd_swizzle: int, num_xcds: int = 8):
-    """``xcd_remap_bx_by`` for a ``grid_m`` x ``grid_n`` launch whose sizes the
-    caller computes (either may be a DSL value). The remap is a permutation for
-    any workgroup count: the first ``num_wgs % num_xcds`` XCDs take one
-    workgroup more than the others."""
+    """The remap of ``xcd_remap_bx_by`` (``xcd_swizzle > 0``) for a ``grid_m`` x
+    ``grid_n`` launch whose sizes the caller computes (either may be a DSL
+    value). The remap is a permutation for any workgroup count: the first
+    ``num_wgs % num_xcds`` XCDs take one workgroup more than the others."""
     _linear_id = bx * grid_n + by
     _num_wgs = grid_n * grid_m
 
