@@ -44,7 +44,9 @@ the rounding order of the sum shows) and all zeros:
 ``rows * hidden * 2`` must be a whole number of 32 KiB tiles and ``rows`` a
 multiple of the world size; the default hidden 2560 needs rows % 32 == 0.
 Needs at least TP GPUs. Runs on gfx942/gfx950 at TP in {2, 4, 8}; other archs
-skip, and ``main()`` skips a world size when fewer GPUs are visible.
+skip. ``--tp`` names the world sizes, for the validity checks and the sweep
+alike; without it every size the visible GPUs can run is run and the others are
+skipped, and a named size that cannot run is an error.
 """
 
 from __future__ import annotations
@@ -56,22 +58,23 @@ import re
 import sys
 from contextlib import ExitStack, closing
 from functools import partial
-from multiprocessing import Pool, freeze_support, set_start_method
+from multiprocessing import freeze_support, get_context
 
-_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-if _REPO_ROOT not in sys.path:
-    sys.path.insert(0, _REPO_ROOT)
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.abspath(os.path.join(_HERE, "..", ".."))
+# The repo root for ``aiter``, this directory for ``flydsl_allreduce_bench``.
+# The ranks are spawned, so they re-import this file and need the same paths.
+for _path in (_REPO_ROOT, _HERE):
+    if _path not in sys.path:
+        sys.path.insert(0, _path)
 
+import flydsl_allreduce_bench as fab
 import pandas as pd
 import torch
 
 import aiter
 from aiter.dist.utils import get_distributed_init_method, get_ip, get_open_port
 from aiter.jit.utils.chip_info import get_gfx_runtime
-from aiter.test_common import benchmark, checkAllclose, run_perftest
-
-set_start_method("spawn", force=True)
-
 from aiter.ops.flydsl.kernels.comm.allreduce_shared import (
     BLOCK,
     DEFAULT_GRID_CAP,
@@ -80,6 +83,7 @@ from aiter.ops.flydsl.kernels.comm.allreduce_shared import (
     TILE_BYTES,
     TwoShotRung,
 )
+from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 try:
     ARCH = get_gfx_runtime()
@@ -416,7 +420,9 @@ def _graph_replay(fly, rank: int, tp: int, device, gloo) -> dict:
             (full == _SENTINEL).all() and (shard == _SENTINEL).all()
         ),
         "replay_mismatches": 0,
-        "replay_nmse": 0.0,
+        # one value per replay and mode, none dropped by a max(): see
+        # _assert_extras
+        "replay_nmse": [],
     }
     graph = torch.cuda.CUDAGraph()
     try:
@@ -453,11 +459,10 @@ def _graph_replay(fly, rank: int, tp: int, device, gloo) -> dict:
         ref = x.float().clone()
         dist.all_reduce(ref)
         ref_ag = torch.cat([p.float() for p in _gather(s, tp)])
-        res["replay_nmse"] = max(
-            res["replay_nmse"],
+        res["replay_nmse"] += [
             _nmse(rs_out.float(), ref[rank * shard_rows : (rank + 1) * shard_rows]),
             _nmse(ag_out.float(), ref_ag),
-        )
+        ]
     return res
 
 
@@ -546,6 +551,9 @@ def _interleave(fly, rank: int, tp: int, device, sp_rows: int) -> dict:
         getattr(fly, _OP_METHODS[op])(ins[-1], out)
         torch.cuda.synchronize()
         isolated.append(out)
+    # Every comparison below is against these outputs, so a kernel that writes
+    # the same NaN in the isolated and the back-to-back run would pass them.
+    nonfinite = sum(not bool(torch.isfinite(o).all()) for o in isolated)
     mismatches = 0
     for slow in range(tp):
         outs = [torch.empty_like(o) for o in isolated]
@@ -561,7 +569,11 @@ def _interleave(fly, rank: int, tp: int, device, sp_rows: int) -> dict:
         mismatches += sum(
             not torch.equal(_bits(o), _bits(iso)) for o, iso in zip(outs, isolated)
         )
-    return {"launches": len(ops) * tp, "mismatches": mismatches}
+    return {
+        "launches": len(ops) * tp,
+        "mismatches": mismatches,
+        "nonfinite": nonfinite,
+    }
 
 
 def _check_unsupported_engines(rank: int, tp: int, device, gloo) -> None:
@@ -737,7 +749,9 @@ def _run_pool(world_size, worker, **kwds):
         raise RuntimeError(f"QuickAllReduceInt4 needs {world_size} GPUs, have {n_gpu}")
     init_method = get_distributed_init_method(get_ip(), get_open_port())
     timeout = float(os.environ.get("FLYDSL_QR_TIMEOUT", "3600"))
-    pool = Pool(processes=world_size)
+    # A local spawn context: the ranks need spawn (CUDA), the process need not
+    # have its global start method changed for it.
+    pool = get_context("spawn").Pool(processes=world_size)
     try:
         results = [
             pool.apply_async(
@@ -844,9 +858,11 @@ def _assert_extras(ranks, *, world_size) -> None:
                     f"{where}: {graph['replay_mismatches']} graph replay outputs "
                     "differ from an eager run of the same inputs"
                 )
-            # written so that a NaN fails
-            if not graph["replay_nmse"] <= NMSE_MAX:
-                fails.append(f"{where}: graph replay NMSE {graph['replay_nmse']:.3e}")
+            # each value is tested on its own so that a NaN fails: max() skips a
+            # NaN, or returns it, by its position
+            bad = [v for v in graph["replay_nmse"] if not v <= NMSE_MAX]
+            if bad:
+                fails.append(f"{where}: graph replay NMSE {bad} > {NMSE_MAX}")
         if not graph["compile_sp_untouched"]:
             fails.append(f"{where}: compile_sp wrote to its tensors")
         for name in ("interleave_pinned", "interleave_shipped"):
@@ -854,6 +870,11 @@ def _assert_extras(ranks, *, world_size) -> None:
                 fails.append(
                     f"{where}: {name}: {res[name]['mismatches']} of "
                     f"{res[name]['launches']} outputs differ from their isolated result"
+                )
+            if res[name]["nonfinite"]:
+                fails.append(
+                    f"{where}: {name}: {res[name]['nonfinite']} isolated outputs "
+                    "are not finite"
                 )
         if not res["cold_capture_refused"]:
             fails.append(f"{where}: capture without compile_sp was not refused")
@@ -906,8 +927,10 @@ def main():
         "--tp",
         type=int,
         nargs="*",
-        default=[2],
-        help="world sizes (2, 4 or 8). Default 2.",
+        default=None,
+        help="World sizes to run (2, 4, 8). Default all, skipping sizes with\n"
+        "fewer visible GPUs. A size that is named but cannot run is an error.\n"
+        "    e.g.: --tp 2",
     )
     parser.add_argument(
         "-s",
@@ -920,14 +943,17 @@ def main():
     parser.add_argument("--grid-cap", type=int, default=DEFAULT_GRID_CAP)
     args = parser.parse_args()
 
-    for tp, pairs in _VALIDITY_SHAPES.items():
-        if n_gpu < tp:
-            aiter.logger.warning(
-                "needs %s GPUs, have %s; skipping validity tp=%s", tp, n_gpu, tp
-            )
-            continue
+    tps = fab.select_world_sizes(
+        args.tp or list(SUPPORTED_WORLDS),
+        explicit=bool(args.tp),
+        n_gpu=n_gpu,
+        supported=SUPPORTED_WORLDS,
+    )
+    for tp in tps:
         for grid_cap in (args.grid_cap, 64):
-            ranks = _spawn(tp, pairs, fills=_FILLS, time_it=False, grid_cap=grid_cap)
+            ranks = _spawn(
+                tp, _VALIDITY_SHAPES[tp], fills=_FILLS, time_it=False, grid_cap=grid_cap
+            )
             _assert_validity(
                 ranks,
                 world_size=tp,
@@ -936,10 +962,7 @@ def main():
         _assert_extras(_run_pool(tp, _run_rank_extras), world_size=tp)
 
     df = []
-    for tp, mnk in itertools.product(args.tp, args.mnk):
-        if tp not in SUPPORTED_WORLDS or n_gpu < tp:
-            aiter.logger.warning("skipping tp=%s (%s GPUs)", tp, n_gpu)
-            continue
+    for tp, mnk in itertools.product(tps, args.mnk):
         tokens, hidden = mnk
         if tokens % tp or (tokens * hidden * 2) % TILE_BYTES:
             aiter.logger.warning(
