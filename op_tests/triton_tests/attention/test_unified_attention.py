@@ -672,12 +672,9 @@ def _length_aware_seq_lens(batch: str, query_len: int):
 
 
 def _length_aware_pages(page_counts):
-    """KV cache size and block table holding only the pages each request uses.
+    """Return a KV cache size and block table with only the pages each request uses.
 
-    A cache of len(page_counts) x max(page_counts) pages gives every request the
-    long request's length (~37 GB of fp32 K/V for skewed_300). Each request gets
-    distinct random pages; the table entries past them are never read and name
-    random pages of the cache.
+    Each request gets its own random pages, so skewed_300 does not need ~37 GB of K/V.
     """
     num_blocks = sum(page_counts) + 64  # spare pages no request owns
     rng = torch.Generator(device="cuda").manual_seed(0)
