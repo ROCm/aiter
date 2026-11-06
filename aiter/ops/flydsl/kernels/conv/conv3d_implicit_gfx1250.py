@@ -1210,6 +1210,12 @@ def compile_conv3d_implicit_gfx1250(param: Conv3dImplicitParam1250):
         "amdgpu-expert-scheduling-mode": True,
         "unroll-threshold": 0,
     }
+    if use_patch and num_buffers == 2 and cfg.tile_k > TILE_K:
+        # These configs spill VGPRs. AMDGPUMarkLastScratchLoad tags reloads
+        # th:TH_LOAD_LU before the post-RA scheduler runs, and that scheduler
+        # may move an LU reload above another reload of the same slot; the
+        # later reload then reads stale scratch (bad bias offsets -> fault).
+        launch.compile_hints["llvm_options"]["disable-post-ra"] = True
 
     def _launch(y, x, weight, bias, stream=None):
         with CompilationContext.compile_hints(CONV_COMPILE_HINTS):

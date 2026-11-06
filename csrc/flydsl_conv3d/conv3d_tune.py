@@ -743,8 +743,9 @@ class Conv3dTuner(TunerCommon):
                     )
                     if patch and nb == 2 and tk > CGP_ALIGN:
                         # The only patch variants that spilled VGPRs on the
-                        # Wan2.1 hot layers (42 of 500), and one of them hit a
-                        # memory access fault on gfx1250.
+                        # Wan2.1 hot layers (42 of 500); spilling is slow, and
+                        # the kernel needs disable-post-ra for them to stay
+                        # correct (see compile_conv3d_implicit_gfx1250).
                         continue
                     # The clamp stops at 2 buffers; a wide K tile can still
                     # overflow LDS there.
