@@ -174,12 +174,12 @@ def _fold_plan(linear_layout, num_heads, block_kv, num_chains):
     )
 
 
-# ends and seq arrive as row slices, so their alignment moves; each is read once
-# per row
+# ends and seq can be row slices, so do not specialize on their alignment
 @triton.jit(do_not_specialize_on_alignment=["ends_ptr", "seq_ptr"])
 def _prepare_candidates_kernel(
     ids_ptr,
     ends_ptr,
+    ctx_ptr,
     bt_ptr,
     seq_ptr,
     pos_ptr,
@@ -187,9 +187,12 @@ def _prepare_candidates_kernel(
     slots_ptr,
     stride_ids,
     stride_bt,
+    # Not constexpr, so a new row count does not recompile. Triton folds the 1.
+    rows_per_seq,
     K: tl.constexpr,
     C: tl.constexpr,
     PAGE: tl.constexpr,
+    HAS_ENDS: tl.constexpr,
     HAS_SEQ: tl.constexpr,
 ):
     """Ranked block ids -> the walk's candidate list, one row per program.
@@ -201,7 +204,13 @@ def _prepare_candidates_kernel(
     row = tl.program_id(0).to(tl.int64)
     cols = tl.arange(0, K)
     ids = tl.load(ids_ptr + row * stride_ids + cols, cache_modifier=".cg")
-    end = tl.load(ends_ptr + row)
+    if HAS_ENDS:
+        end = tl.load(ends_ptr + row)
+    else:
+        # Same default as the logits kernel
+        n = (row % rows_per_seq).to(tl.int32)
+        ctx = tl.load(ctx_ptr + row // rows_per_seq)
+        end = tl.maximum(ctx - rows_per_seq + n + 1, 0)
     nblocks = (end + C - 1) // C
 
     ok = (ids >= 0) & (ids < nblocks)
@@ -217,11 +226,10 @@ def _prepare_candidates_kernel(
     tail = tl.minimum(C, end - max_id * C)
     tl.store(cu_ptr + row, tl.where(n_valid > 0, (n_valid - 1) * C + tail, 0))
 
-    # With seq the table holds a row per sequence rather than per query row
     if HAS_SEQ:
         bt_row = tl.load(seq_ptr + row).to(tl.int64)
     else:
-        bt_row = row
+        bt_row = row // rows_per_seq
     page = tl.load(bt_ptr + bt_row * stride_bt + pos // PAGE)
     tl.store(slots_ptr + row * K + cols, page * PAGE + pos % PAGE)
 

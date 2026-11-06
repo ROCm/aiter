@@ -273,16 +273,22 @@ def build_candidate_gather(
     block=CANDIDATE_BLOCK,
     kv_scale_cache=None,
     row_seq=None,
+    context_lens=None,
+    rows_per_seq=1,
 ):
     """Ranked block ids -> (gather, row_ends), in one launch.
 
     candidates:  [B * NEXT_N, K] int32 block ids, -1 padded, any order
-    ends:        [B * NEXT_N] int32 exclusive per-row key bound
-    block_table: [B * NEXT_N, MAX_BLOCKS] int32, one row per query row, or
-                 [S, MAX_BLOCKS], one row per sequence, with row_seq
-    row_seq:     [B * NEXT_N] int32, optional. The block_table row each query
-                 row reads, so rows of several sequences resolve together
-                 without a table row per query row
+    ends:        [B * NEXT_N] int32 exclusive per-row key bound. If None, it
+                 comes from context_lens
+    block_table: [B * NEXT_N, MAX_BLOCKS] int32, one row per query row. With
+                 row_seq or rows_per_seq, one row per sequence
+    row_seq:     [B * NEXT_N] int32, optional. The block_table row of each
+                 query row, so rows of several sequences can share a launch
+    context_lens: [B] int32, used only if ends is None. Row n of sequence b
+                 then ends at context_lens[b] - NEXT_N + n + 1
+    rows_per_seq: int, NEXT_N. Each sequence has this many consecutive rows.
+                 Do not use it with row_seq
 
     Returns the sorted block starts (positions) and the slot of each one
     (page * page_size + offset), which is all the walk reads, so a layer group
@@ -298,11 +304,20 @@ def build_candidate_gather(
         else (8 if k >= 2048 else 4)
     )
     assert block_table.stride(1) == 1
+    assert rows_per_seq >= 1 and rows % rows_per_seq == 0
     if row_seq is None:
-        assert block_table.shape[0] == rows
+        assert block_table.shape[0] * rows_per_seq == rows
     else:
+        assert rows_per_seq == 1, "use row_seq or rows_per_seq, not both"
         assert row_seq.dtype == torch.int32 and row_seq.shape == (rows,)
         assert row_seq.stride(0) == 1, "row_seq must be contiguous"
+    if ends is None:
+        assert context_lens is not None, "needs ends or context_lens"
+        assert row_seq is None, "derived ends need rows_per_seq, not row_seq"
+        assert context_lens.dtype == torch.int32 and context_lens.stride(0) == 1
+        assert context_lens.shape == (rows // rows_per_seq,)
+    else:
+        context_lens = None
     page_size = cache_strides(kv_cache, head_size, kv_scale_cache)[0]
     assert page_size % block == 0 and block <= mfma_nonk_dim(num_heads, head_size)
     assert (
@@ -315,6 +330,7 @@ def build_candidate_gather(
     _prepare_candidates_kernel[(rows,)](
         candidates,
         ends,
+        context_lens,
         block_table,
         row_seq,
         pos,
@@ -322,9 +338,11 @@ def build_candidate_gather(
         slots,
         candidates.stride(0),
         block_table.stride(0),
+        rows_per_seq,
         k,
         block,
         page_size,
+        HAS_ENDS=ends is not None,
         HAS_SEQ=row_seq is not None,
         num_warps=num_warps,
         enable_fp_fusion=True,
@@ -513,10 +531,9 @@ def paged_mxfp4_mqa_logits(
                     or context parallelism. build_schedule needs the same tensor.
                     Under gather it counts the row's valid candidate slots
     use_gather:     bool. Walk a candidate list rather than the context, so
-                    output column j holds candidate slot j. Rows are then
-                    independent: the walk reads a row's slots and row_ends, not
-                    block_table, and context_lens only has to be positive, so
-                    one [1, ROWS] launch can hold rows of several sequences
+                    output column j holds candidate slot j. The walk does not
+                    read block_table, and context_lens must only be positive,
+                    so one [1, ROWS] launch can hold rows of several sequences
     candidates:     [B * NEXT_N, K] int32 ranked block ids, resolved here, or
                     what build_candidate_gather returned, used as is. row_ends
                     is the per-row key bound for the first and the slot count
@@ -660,27 +677,17 @@ def paged_mxfp4_mqa_logits(
         else:
             # Resolved here for a single consumer. A layer group should call
             # build_candidate_gather once and pass what it returns.
-            n = torch.arange(next_n, device=q.device, dtype=torch.int32)
-            key_ends = (
-                row_ends
-                if row_ends is not None
-                else torch.clamp(
-                    context_lens.repeat_interleave(next_n)
-                    - next_n
-                    + n.repeat(batch)
-                    + 1,
-                    min=0,
-                )
-            )
             gather, row_ends = build_candidate_gather(
                 candidates,
-                key_ends,
-                block_table.repeat_interleave(next_n, 0).contiguous(),
+                row_ends,
+                block_table,
                 kv_cache,
                 num_heads,
                 head_size,
                 cand_block,
                 kv_scale_cache,
+                context_lens=context_lens,
+                rows_per_seq=next_n,
             )
     gather_on = 1 if gather is not None else 0
     gather_block = int(gather["block"]) if gather_on else 8
