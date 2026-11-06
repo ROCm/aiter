@@ -364,7 +364,7 @@ class MhaConfig:
     dotK: gl.constexpr
     dotP: gl.constexpr
     dotV: gl.constexpr
-    p_scale: gl.constexpr  # fp8: e8m0 A-scale of P@V, see `_fp8_p_shift`
+    p_scale: gl.constexpr  # fp8: layout of P@V's e8m0 A-scale, see `_FP8_P_LIFT`
     kt_shared: gl.constexpr
     v_shared: gl.constexpr
     kpe_shared: gl.constexpr
@@ -730,34 +730,34 @@ class ScoresOut:
 # 3. Per-tile math
 # ---------------------------------------------------------------------------
 
-# fp8 lifts P onto e4m3's range: exp2(s - m + P_LIFT) <= exp2(P_LIFT), with
-# log2(448) less a hair so exp2 rounding never carries P past e4m3's largest
-# value.  The row sum carries the same factor, so it cancels in acc / l; only the
-# LSE takes it back out.  `_fp8_p_shift` keeps the bound when m is not the tile's
-# max.
+# How fp8 handles P (exponents in log2 units).
+#
+# e4m3 has 3 mantissa bits and a max of 448, so P <= 1 would lose its small
+# values.
+#
+# Lift: P = exp2(s - m + P_LIFT), so the largest P is about 448 (P_LIFT is
+# log2(448) minus a margin).  l carries the same factor, which cancels in
+# acc / l; only the LSE subtracts it.
+#
+# Shift: m can lag below the tile max (lazy rescale) or sit far above it, so
+# each row uses m + shift, shift = ceil(tile_max - m), keeping its largest P
+# in 224..448.  The P@V MFMA's e8m0 A-scale and the row sum multiply by
+# 2**shift, so the shift cancels.
+#
+# Floor: shift >= -64, so a huge m (a 1e10 sink) or a fully masked row cannot
+# turn P into inf or NaN.
 _FP8_P_LIFT = gl.constexpr(8.8)
 
 
 @gluon.jit
 def _fp8_p_shift(tile_max, m):
-    """Whole log2 steps from `m` up to this tile's row max, for an fp8 P tile.
-
-    Taking exp2 against `m + shift` puts each row's largest P at the top of
-    e4m3's range whichever side of the tile `m` sits: above it (a tile well below
-    the running max would otherwise round its P into e4m3's subnormals, or to
-    zero) or, with lazy rescale, up to LAZY_THRESHOLD below it (P would overflow).
-    The P@V MFMA multiplies P back by 2**shift through its e8m0 A-scale, and the
-    row sum takes the same factor, so the shift costs no accumulator pass.
-    """
-    # The floor keeps a fully masked row (tile max -inf) finite: its P is then 0
-    # rather than exp2(-inf + inf).  A tile 2**-64 below the max adds nothing.
+    """The per-row shift described at `_FP8_P_LIFT`, floor included."""
     return gl.maximum(gl.ceil(tile_max - m), -64.0)
 
 
 @gluon.jit
 def _fp8_p_scale(cfg, unshift):
-    """`unshift = 2**p_shift` per row, as the e8m0 A-scale of the P@V MFMA.  A
-    positive power of two's fp32 exponent field is exactly its e8m0 encoding."""
+    """`unshift = 2**shift` as the P@V e8m0 A-scale."""
     e8m0 = (unshift.to(gl.int32, bitcast=True) >> 23).to(gl.uint8)
     e8m0 = gl.convert_layout(e8m0, gl.SliceLayout(1, cfg.p_scale))
     shape: gl.constexpr = [cfg.BLOCK_M, cfg.BLOCK_N // 32]
@@ -869,8 +869,7 @@ def _attn_softmax_pv(
 def _attn_softmax_pv_fp8(
     cfg, sd, acc, l_i, m_i, qk, v, qk_scale, offs_n, start_n, seqlen_k
 ):
-    """`_attn_softmax_pv` for e4m3: `qk` unscaled, P lifted by `_FP8_P_LIFT` and
-    shifted by `_fp8_p_shift`."""
+    """`_attn_softmax_pv` for e4m3: `qk` unscaled, P as in `_FP8_P_LIFT`'s note."""
     tile_max = gl.max(qk, 1) * qk_scale
     m_ij = gl.maximum(m_i, tile_max)
     p_shift = _fp8_p_shift(tile_max, m_ij)
@@ -967,14 +966,14 @@ def _sc_vec1(cfg, qk, m_run, qk_scale):
         tile_max = gl.reduce(qk, 1, _nan_max)
     else:
         tile_max = gl.reduce(qk, 1, _nan_max) * qk_scale
+    if cfg.IS_FP8:
+        # The shift's -64 floor, on the tile max (m_new >= m_run is unchanged).
+        tile_max = gl.maximum(tile_max, m_run - 64.0)
     m_new = gl.maximum(m_run, tile_max, propagate_nan=_NAN_ALL)
     if cfg.LAZY_THRESHOLD > 0:
         m_new = gl.where(m_new - m_run > cfg.LAZY_THRESHOLD, m_new, m_run)
     m_exp = m_new
     if cfg.IS_FP8:
-        # `_fp8_p_shift` without its clamp, which costs ~1% here: these tiles are
-        # unmasked, so the difference is finite.  A tile so far below the max
-        # that 2**shift underflows contributes nothing either way.
         p_shift = gl.ceil(tile_max - m_new)
         m_exp = m_new + p_shift
     if cfg.LAZY_THRESHOLD > 0 and qk.shape[1] >= 64:
@@ -1741,7 +1740,11 @@ def _attn_fwd(
     # Online-softmax state.  A sliding window can mask whole rows of a block; a
     # finite initial max keeps exp2(m_old - m_new) at 1 there instead of NaN.
     if ENABLE_SINK:
-        m_i_init = gl.load(sink_ptr + off_q_head).to(gl.float32) * RCP_LN2
+        # An fma with +0, not a product: fp fusion would contract a bare product
+        # into the first tile's exp2(m_old - m_new), whose alpha is then 2 to the
+        # product's rounding error instead of 1 -- 0 for a sink of 1e10, and l = 0.
+        sink = gl.load(sink_ptr + off_q_head).to(gl.float32)
+        m_i_init = gl.fma(sink, RCP_LN2, 0.0)
     elif SLIDING_WINDOW >= 0:
         m_i_init = -1.0e30
     else:
