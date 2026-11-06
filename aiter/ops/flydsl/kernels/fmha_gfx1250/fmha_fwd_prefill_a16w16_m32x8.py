@@ -60,16 +60,16 @@ from ..tensor_shim import _run_compiled
 # amdgpu-expert-scheduling-mode hint, set in _ensure_*_kernel) makes LLVM insert all
 # depctr covers itself for the plain intrinsics the kernel emits.
 from .fmha_buffer_managers import (
-    KManager16bPaged,
-    VManager16bPaged,
+    KManagerPaged,
+    VManagerPaged,
     ENABLE_SCHED_MODE2,
-    KManager16bV1,
-    KManager16bV2,
+    KManagerV1,
+    KManagerV2,
     ProducerCtx,
-    QManager16bV1,
-    QManager16bV2,
-    VManager16bV1,
-    VManager16bV2,
+    QManagerV1,
+    QManagerV2,
+    VManagerV1,
+    VManagerV2,
     _ir,
 )
 from .fmha_utils import (
@@ -494,7 +494,7 @@ def _pv_qk_gemm(
     ds_load_tr16_b128, two V-tiles (kv, kv+16) shuffled) and **B = P^T** (src_b, two
     softmax tiles p[2*k_tile_idx], p[2*k_tile_idx+1]). Contracts kv in ``num_contract_tiles = n_block//WMMA_K`` tiles and
     produces ``d_tiles = v_hdim//WMMA_M`` d-tiles on the M axis. Lane ``l`` element ``si``
-    of tile ``d_tile_idx`` holds O[q = l%16, d = d_tile_idx*WMMA_M + (l//16)*8 + si] -- the OManager16b
+    of tile ``d_tile_idx`` holds O[q = l%16, d = d_tile_idx*WMMA_M + (l//16)*8 + si] -- the OManager
     fragment layout.
 
     GEMM1, S^T = K @ Q^T: **K = A-operand**, **Q = B-operand**. Contracts d in
@@ -659,19 +659,19 @@ def _build_managers(
     if paged is not None:
         # Q is dense whatever the KV pool looks like; only K/V gather.
         return (
-            QManager16bV2(
+            QManagerV2(
                 qk_hdim=qk_hdim,
                 gqa_ratio=gqa_ratio,
                 num_waves=NUM_WAVES,
                 q_tiles_per_wave=num_q_tiles_per_wave,
                 elem_dtype=elem_dtype,
             ),
-            KManager16bPaged(
+            KManagerPaged(
                 qk_hdim=qk_hdim,
                 n_block=n_block,
                 elem_dtype=elem_dtype,
             ),
-            VManager16bPaged(
+            VManagerPaged(
                 v_hdim=v_hdim,
                 n_block=n_block,
                 elem_dtype=elem_dtype,
@@ -679,38 +679,38 @@ def _build_managers(
         )
     if USE_TDM_LOADER:
         return (
-            QManager16bV2(
+            QManagerV2(
                 qk_hdim=qk_hdim,
                 gqa_ratio=gqa_ratio,
                 num_waves=NUM_WAVES,
                 q_tiles_per_wave=num_q_tiles_per_wave,
                 elem_dtype=elem_dtype,
             ),
-            KManager16bV2(
+            KManagerV2(
                 qk_hdim=qk_hdim,
                 n_block=n_block,
                 elem_dtype=elem_dtype,
             ),
-            VManager16bV2(
+            VManagerV2(
                 v_hdim=v_hdim,
                 n_block=n_block,
                 elem_dtype=elem_dtype,
             ),
         )
     return (
-        QManager16bV1(
+        QManagerV1(
             qk_hdim=qk_hdim,
             gqa_ratio=gqa_ratio,
             num_waves=NUM_WAVES,
             q_tiles_per_wave=num_q_tiles_per_wave,
             elem_dtype=elem_dtype,
         ),
-        KManager16bV1(
+        KManagerV1(
             qk_hdim=qk_hdim,
             n_block=n_block,
             elem_dtype=elem_dtype,
         ),
-        VManager16bV1(
+        VManagerV1(
             v_hdim=v_hdim,
             n_block=n_block,
             elem_dtype=elem_dtype,
@@ -2111,7 +2111,7 @@ def _store_o_lse(
         # Normalize this q-tile's O by its running denom d, then reshape+store to VRAM.
         # o_final[d_tile_idx] lane l elem si = sum_kv P[q,kv] V[kv, d_tile_idx*16+(l//16)*8+si]
         # (unnormalized); divide by the per-query denom d (peer-consistent across the
-        # lane pair) to finish softmax. OManager16b masks rows with seq >= q_len.
+        # lane pair) to finish softmax. OManager masks rows with seq >= q_len.
         d_final = d_list[q_tile_idx]
         o_final = o_list[q_tile_idx]
         # Fully-masked row (d_final==0): 1/0=inf, o_final=0, 0*inf=NaN -> guard to O=0.
@@ -2370,8 +2370,8 @@ def kv_split_bytes(qk_hdim, v_hdim, n_block, elem_dtype):
     """Bytes one half of a 2-way-split K and V tile occupies, straight from the active
     managers -- n_block//KV_LDS_SPLITS rows of hdim*sizeof(elem) plus their per-row pad
     (16 B for K, 32 B for V)."""
-    k_cls = KManager16bV2 if USE_TDM_LOADER else KManager16bV1
-    v_cls = VManager16bV2 if USE_TDM_LOADER else VManager16bV1
+    k_cls = KManagerV2 if USE_TDM_LOADER else KManagerV1
+    v_cls = VManagerV2 if USE_TDM_LOADER else VManagerV1
     k_mgr = k_cls(
         qk_hdim=qk_hdim, n_block=n_block, elem_dtype=elem_dtype
     )

@@ -46,9 +46,9 @@ from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.jit.utils.chip_info import get_cu_num, get_lds_capacity_bytes
 
 from .fmha_buffer_managers import (
-    OManager16bV1,
-    OManager16bV2,
-    OManager16bV3,
+    OManagerV1,
+    OManagerV2,
+    OManagerV3,
     _ir,
     _lds_ptr_b128,
 )
@@ -514,7 +514,7 @@ def _o_manager(*, v_hdim, gqa_ratio, num_q_tiles_per_wave, elem_dtype):
     Two waves share a chunk at 0 and LDS_QO_BYTES, and the upper one must stop short of
     the next chunk -- that clearance is what keeps O off the V rows a dead carried ring
     head may still be reading."""
-    _o_manager_cls = {"v1": OManager16bV1, "v2": OManager16bV2, "v3": OManager16bV3}[
+    _o_manager_cls = {"v1": OManagerV1, "v2": OManagerV2, "v3": OManagerV3}[
         O_VARIANT
     ]
     o_mgr = _o_manager_cls(

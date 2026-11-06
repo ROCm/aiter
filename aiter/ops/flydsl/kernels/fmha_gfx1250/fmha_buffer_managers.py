@@ -1,35 +1,41 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""16-bit (bf16/fp16) Q/K/V staging managers for the gfx1250 MHA kernels.
+"""Q/K/V staging managers for the gfx1250 MHA kernels.
 
 Each manager owns the ``global -> LDS (async) -> VGPR (WMMA fragment)`` path for one
-16-bit-element operand (Q, K or V): the LDS layout, the global->LDS copy schedule and
-the fragment read. They are self-contained — a caller passes only the configuration it
+operand (Q, K or V): the LDS layout, the global->LDS copy schedule and the fragment
+read. They are self-contained — a caller passes only the configuration it
 already maintains (hdim, gqa_ratio, kv block width, wave count) through the constructor
 plus the runtime ``warp_idx``/``lane_idx``. Nothing here reads a tiling constant from
 the kernel; the facts intrinsic to the managed layout live below as private constants.
 
-The ``16b`` suffix names the element width: every swizzle here assumes a ``b128 == 8``
-element chunk. An 8-bit (fp8) variant would need its own manager family.
+Element width is a constructor parameter (``elem_dtype``), not a separate class family:
+``_width_params`` derives the three facts that scale with it -- bytes per element, the
+WMMA contraction depth (16x16x32 at 16-bit, 16x16x64 at 8-bit) and the elements in one
+b128 chunk -- and every swizzle below is written in those terms. Since the width is a
+trace-time constant, the one place the two genuinely diverge costs nothing in the IR:
+V's transpose read, where ``ds_load_tr16_b128`` crosses eight CONSECUTIVE lanes but
+``ds_load_tr8_b64`` crosses the strided set ``{b..b+3, b+8..b+11}``, so the lane formula
+differs. Everything else is arithmetic over ``elem_bytes``.
 
 Contents
 --------
-``QManager16bV1``  Q global->LDS->VGPR, ``cluster_load_async_to_lds_b128`` into a ring
+``QManagerV1``  Q global->LDS->VGPR, ``cluster_load_async_to_lds_b128`` into a ring
                    of ``lds_tiles`` slots shared by all waves.
-``QManager16bV2``  same fragments, but each wave TDM-copies its own rows into a private
+``QManagerV2``  same fragments, but each wave TDM-copies its own rows into a private
                    LDS region -- no ring and no cross-wave sync.
-``KManager16bV1``  K staging plus the ``ds_load_b128`` B-fragment read; the whole block's
+``KManagerV1``  K staging plus the ``ds_load_b128`` B-fragment read; the whole block's
                    addresses collapse to 2 base pointers plus compile-time immediates.
-``KManager16bV2``  K with the TDM transport (hardware OOB, row-major padded LDS). Inherits
+``KManagerV2``  K with the TDM transport (hardware OOB, row-major padded LDS). Inherits
                    V1 and overrides only ``load_descriptor``.
-``VManager16bV1``  V staging plus the **transpose** read: PV contracts over kv, so the
+``VManagerV1``  V staging plus the **transpose** read: PV contracts over kv, so the
                    fragment comes from ``ds_load_tr16_b128``, not K's natural load.
-``VManager16bV2``  V with the TDM transport; same inherit-and-override shape as K.
-``OManager16bV1``  O epilogue: fp32 accumulator -> bf16 -> LDS -> VGPR re-read ->
+``VManagerV2``  V with the TDM transport; same inherit-and-override shape as K.
+``OManagerV1``  O epilogue: fp32 accumulator -> ``elem_dtype`` -> LDS -> VGPR re-read ->
                    ``buffer_store``.
-``OManager16bV2``  O staged padded in LDS and written with ONE TDM store descriptor.
-``OManager16bV3``  O staged the same way but written per-b128 with
+``OManagerV2``  O staged padded in LDS and written with ONE TDM store descriptor.
+``OManagerV3``  O staged the same way but written per-b128 with
                    ``global_store_async_from_lds_b128``, so it addresses each packed row
                    itself and serves any gqa.
 
@@ -97,7 +103,7 @@ _DEFAULT_NUM_WAVES = 8
 _N_BLOCK_CHOICES = (32, 64, 128, 256)
 _DEFAULT_N_BLOCK = 64
 
-# O epilogue software pipeline (OManager16b, see its docstring). 64-col transpose
+# O epilogue software pipeline (OManager, see its docstring). 64-col transpose
 # units keep each coalesced global store a full 128B row; _O_INFLIGHT_UNITS units
 # stay resident in an LDS ring and overlap.
 _O_COLS_PER_TILE = 64
@@ -108,7 +114,7 @@ _O_DSCNT_MAX = 63  # s_wait_dscnt SIMM16[5:0]
 # 8 waves * 2 units * 2KB = 32KB.
 _O_LDS_BUDGET_BYTES = 32 * 1024
 
-# O staging (OManager16b): no padding -- an XOR swizzle on the 8-bf16 chunk index makes
+# O staging (OManager): no padding -- an XOR swizzle on the 8-bf16 chunk index makes
 # both the b128 store and b128 read bank-conflict-free. MI400 LDS = 64 banks x 4 B, so a
 # 16 B chunk spans one 4-bank group and bank_group(q, slot) = (q*G + slot) % 16 with
 # G = v_hdim/8 chunks per row. The store touches a fixed chunk-column across all 16
@@ -825,7 +831,7 @@ class _TdmGatherTransport:
 # ============================================================================
 
 
-class QManager16bV1:
+class QManagerV1:
     """Owns everything about Q: its LDS footprint and the global->LDS->VGPR load.
 
     The compute core only asks how much LDS to reserve (``get_lds_size_in_byte``) and
@@ -1094,10 +1100,10 @@ class QManager16bV1:
 # ============================================================================
 
 
-class KManager16bV1(_AsyncTransport):
+class KManagerV1(_AsyncTransport):
     """Owns K's LDS staging and the global->LDS->VGPR B-fragment load.
 
-    Unlike QManager16b there is no ring buffer here: the manager reports the size of ONE
+    Unlike QManager there is no ring buffer here: the manager reports the size of ONE
     ``n_block x qk_hdim`` K block and is not bound to a buffer -- the caller reserves as
     many ping-pong buffers as it wants, splits each as it wants, and passes the chosen
     bases (``ptr_lds``) into every method. The block is shared by all waves.
@@ -1108,7 +1114,7 @@ class KManager16bV1(_AsyncTransport):
     that is what lets the two transports share this class.
 
     The read API pulls 16x16 tiles; a ``col_idx``/``col_idx+16`` pair combines into one
-    16x32 WMMA B operand. ``KManager16bV2`` inherits all of it and swaps in TDM.
+    16x32 WMMA B operand. ``KManagerV2`` inherits all of it and swaps in TDM.
     """
 
     def __init__(
@@ -1230,7 +1236,7 @@ class KManager16bV1(_AsyncTransport):
 # ============================================================================
 
 
-class VManager16bV1(_AsyncTransport):
+class VManagerV1(_AsyncTransport):
     """Owns V's LDS staging and the global->LDS->VGPR **transpose** load.
 
     PV computes O^T = V^T @ P^T, so V is the WMMA A-operand ``V^T[d, kv]``. V is stored
@@ -1240,7 +1246,7 @@ class VManager16bV1(_AsyncTransport):
     transpose crossbar.
 
     The layout is K's, only with a WIDER pad (32 B) -- what the transpose fetch needs to
-    stay conflict-free where K's 16 B suffices. ``VManager16bV2`` inherits all of it and
+    stay conflict-free where K's 16 B suffices. ``VManagerV2`` inherits all of it and
     swaps in TDM.
     """
 
@@ -1274,7 +1280,7 @@ class VManager16bV1(_AsyncTransport):
         """LDS bytes for one ``n_block`` x ``v_hdim`` V block (one ping-pong buffer)."""
         return self.n_block * self.padded_row_bytes
 
-    # ``load_descriptor`` comes from the transport mixin; see ``KManager16bV1`` for the
+    # ``load_descriptor`` comes from the transport mixin; see ``KManagerV1`` for the
     # argument contract (``ptr_src`` is the V tensor here).
     def ds_load_ptrs(self, *, ptr_lds, lane_idx):
         """One per-lane transpose-load base pointer per LDS split; the crossbar fetch sits
@@ -1362,11 +1368,11 @@ class VManager16bV1(_AsyncTransport):
         ]
 
 
-class QManager16bV2:
+class QManagerV2:
     """Q loader (per-warp TDM + row-major padded LDS). No ring buffer: each wave TDM-copies
     ALL of its Q rows in one shot (``num_warps=1``) into its own private, disjoint LDS region,
     so there is no cross-wave sync, then reads them into fragments. Same fragment output as
-    ``QManager16bV1`` (scale folded), so the kernel switches V1<->V2 by swapping the class.
+    ``QManagerV1`` (scale folded), so the kernel switches V1<->V2 by swapping the class.
 
     A 3-D ``[num_seq, gqa_ratio, hdim]`` descriptor carries the GQA row-packing (packed row
     ``pr`` -> seq ``pr//gqa``, head ``kv_head*gqa + pr%gqa``), degenerating to
@@ -1498,7 +1504,7 @@ class QManager16bV2:
 
     def load_q_to_vgpr_part2(self, *, scale):
         """Read this wave's Q tile into WMMA B-fragments, ``scale`` folded (None leaves Q
-        raw). Returns one list of ``k_tiles`` fragments per q-tile, like ``QManager16bV1``.
+        raw). Returns one list of ``k_tiles`` fragments per q-tile, like ``QManagerV1``.
 
         Part1 issues TDM copies only; the caller drains them, since only it knows what it
         issued in between and the wait immediate may have to sit under a runtime branch.
@@ -1532,24 +1538,24 @@ class QManager16bV2:
         return q_frags_list
 
 
-class KManager16bV2(_TdmTransport, KManager16bV1):
+class KManagerV2(_TdmTransport, KManagerV1):
     """K loader, TDM transport. The LDS layout, the ds_load bases, the fragment plan and
-    the B-fragment reads are ``KManager16bV1``'s, inherited unchanged -- the ONLY
+    the B-fragment reads are ``KManagerV1``'s, inherited unchanged -- the ONLY
     difference is that ``load_descriptor`` returns a ``TdmCopyDescriptor`` (tensorcnt,
     hardware OOB, no per-lane address VALU) instead of an ``AsyncCopyDescriptor``."""
 
 
-class VManager16bV2(_TdmTransport, VManager16bV1):
-    """V loader, TDM transport. As ``KManager16bV2``: everything but the global->LDS copy
-    is ``VManager16bV1``'s, including the 32 B row pad and the transpose read."""
+class VManagerV2(_TdmTransport, VManagerV1):
+    """V loader, TDM transport. As ``KManagerV2``: everything but the global->LDS copy
+    is ``VManagerV1``'s, including the 32 B row pad and the transpose read."""
 
 
-class KManager16bPaged(_TdmGatherTransport, KManager16bV1):
+class KManagerPaged(_TdmGatherTransport, KManagerV1):
     """K loader, paged (TDM gather) transport. Same inherit-and-override shape as the V2
-    pair: only ``load_descriptor`` differs from ``KManager16bV2``."""
+    pair: only ``load_descriptor`` differs from ``KManagerV2``."""
 
 
-class VManager16bPaged(_TdmGatherTransport, VManager16bV1):
+class VManagerPaged(_TdmGatherTransport, VManagerV1):
     """V loader, paged (TDM gather) transport."""
 
 
@@ -1558,7 +1564,7 @@ class VManager16bPaged(_TdmGatherTransport, VManager16bV1):
 # ============================================================================
 
 
-class OManager16bV1:
+class OManagerV1:
     """Owns the O epilogue: fp32 WMMA accumulator -> bf16 -> global VRAM.
 
     PV leaves each wave's 16 x v_hdim tile in the accumulator layout: for d-tile ``k`` lane
@@ -1786,7 +1792,7 @@ class OManager16bV1:
             emit_read(u)
 
 
-class OManager16bV2:
+class OManagerV2:
     """O epilogue via TDM store: accumulator (fp32) -> bf16 -> contiguous private LDS -> global
     VRAM (per-warp ``tensor_store_from_lds``). No transpose re-read -- the TDM descriptor does
     the LDS->global reshape, and its extent drops rows ``seq >= q_len`` in hardware.
@@ -1973,7 +1979,7 @@ class OManager16bV2:
         fx.copy(atom, t_lds[None, 0], t_g[None, 0])  # src=shared, dst=global => store
 
 
-class OManager16bV3:
+class OManagerV3:
     """O writer: padded LDS ds_store + per-b128 ``global_store_async_from_lds_b128``, no TDM.
     Keeps V2's bank-conflict-free padded ds_store but dodges the TDM store's "padding ignored"
     limitation by addressing each b128 itself, and skips V1's VGPR re-read (the async store goes
