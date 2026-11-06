@@ -1,11 +1,20 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Benchmark compact-scale FP8 GEMM and its preshuffled weight path.
+"""Benchmark the FP8 GEMMs with compact e8m0 scales.
+
+Modes:
+  (default)               gemm_afp8wfp8, plain (non-preshuffled) weights.
+  --block128-preshuffle   gemm_afp8wfp8_block128_preshuffle, preshuffled weights
+                          and 128x128 weight scales (triton or gluon backend).
+  --preshuffle            gemm_afp8wfp8_preshuffle, the gfx1250 gluon MXFP8 GEMM
+                          (e4m3 x e4m3, 1x32 e8m0 scales); takes --x-preshuffled
+                          and --scale-layout.
 
 For the PR group32 sweep, use --shape-set group32 --x-scale-group-size 32
 --w-scale-group-size 32 32 --no-transpose-x-scale.
-Use --test to validate an FP64 reference before timing each shape.
+Use --test to validate an FP64 reference before timing each shape
+(default and --block128-preshuffle modes).
 """
 
 import csv
@@ -20,6 +29,7 @@ import triton
 from aiter.ops.shuffle import shuffle_weight
 from aiter.ops.triton.gemm.basic.gemm_afp8wfp8 import (
     gemm_afp8wfp8,
+    gemm_afp8wfp8_block128_preshuffle,
     gemm_afp8wfp8_preshuffle,
 )
 from aiter.ops.triton.utils._triton import arch_info
@@ -35,6 +45,10 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_shape_benchmark_object,
     print_vgpr,
 )
+from op_tests.triton_tests.gemm.basic.test_gemm_afp8wfp8 import (
+    preshuffle_generate_inputs,
+    preshuffle_prepare,
+)
 
 DTYPE_MAP = {
     "bf16": torch.bfloat16,
@@ -43,7 +57,7 @@ DTYPE_MAP = {
 }
 
 
-def generate_inputs(M, N, K, preshuffle, a_group, w_group, transpose):
+def generate_inputs(M, N, K, block128_preshuffle, a_group, w_group, transpose):
     x = torch.randn((M, K), device="cuda").to(torch.float8_e4m3fn)
     w = torch.randn((N, K), device="cuda").to(torch.float8_e4m3fn)
     xs = torch.randint(125, 130, (M, K // a_group), dtype=torch.uint8, device="cuda")
@@ -55,13 +69,19 @@ def generate_inputs(M, N, K, preshuffle, a_group, w_group, transpose):
         device="cuda",
     )
     xsk = xs.T.contiguous().reshape(xs.shape) if transpose else xs
-    wk = shuffle_weight(w.view(torch.uint8), layout=(16, 16)) if preshuffle else w
+    wk = (
+        shuffle_weight(w.view(torch.uint8), layout=(16, 16))
+        if block128_preshuffle
+        else w
+    )
     return x, w, wk, xs, xsk, ws
 
 
-def _generate_bench_inputs(M, N, K, preshuffle, a_group, w_group, transpose, dtype):
+def _generate_bench_inputs(
+    M, N, K, block128_preshuffle, a_group, w_group, transpose, dtype
+):
     x, w, w_kernel, xs, x_scales_kernel, w_scales = generate_inputs(
-        M, N, K, preshuffle, a_group, w_group, transpose
+        M, N, K, block128_preshuffle, a_group, w_group, transpose
     )
     y = torch.empty((M, N), dtype=dtype, device=x.device)
     return x, w, w_kernel, xs, x_scales_kernel, w_scales, y
@@ -73,7 +93,7 @@ def bench_gemm_fn(
     K: int,
     metric: str,
     dtype: torch.dtype,
-    preshuffle: bool,
+    block128_preshuffle: bool,
     backend: str | None,
     x_scale_group_size: int,
     transpose_x_scale: bool,
@@ -81,7 +101,7 @@ def bench_gemm_fn(
     test: bool = False,
 ):
     group_n, group_k = w_scale_group_size
-    if K % x_scale_group_size or K % group_k or (preshuffle and N % 128):
+    if K % x_scale_group_size or K % group_k or (block128_preshuffle and N % 128):
         warnings.warn(
             f"Skipping M={M} N={N} K={K}: incompatible scale groups or preshuffle alignment."
         )
@@ -89,30 +109,43 @@ def bench_gemm_fn(
 
     torch.manual_seed(0)
 
-    # weight kwarg name differs between kernels: "w" (plain) vs "w_shuffled" (preshuffle)
-    w_key = "w_shuffled" if preshuffle else "w"
+    # weight kwarg name differs between kernels: "w" (plain) vs "w_shuffled" (block128)
+    w_key = "w_shuffled" if block128_preshuffle else "w"
     kwargs = {
         "dtype": dtype,
         "x_scale_group_size": x_scale_group_size,
         "is_x_scale_transposed": transpose_x_scale,
     }
-    if preshuffle:
+    if block128_preshuffle:
         kernel_fn = functools.partial(
-            gemm_afp8wfp8_preshuffle, backend=backend, **kwargs
+            gemm_afp8wfp8_block128_preshuffle, backend=backend, **kwargs
         )
     else:
-        # Only the preshuffle wrapper has a gluon backend.
+        # Only the block128 preshuffle wrapper has a gluon backend.
         kernel_fn = functools.partial(
             gemm_afp8wfp8, w_scale_group_size=w_scale_group_size, **kwargs
         )
 
     if test:
         x, w, w_kernel, xs, x_scales_kernel, w_scales, y_ref = _generate_bench_inputs(
-            M, N, K, preshuffle, x_scale_group_size, w_scale_group_size,
-            transpose_x_scale, dtype,
+            M,
+            N,
+            K,
+            block128_preshuffle,
+            x_scale_group_size,
+            w_scale_group_size,
+            transpose_x_scale,
+            dtype,
         )
-        out = kernel_fn(**{"x": x, w_key: w_kernel, "x_scales": x_scales_kernel,
-                            "w_scales": w_scales, "y": y_ref})
+        out = kernel_fn(
+            **{
+                "x": x,
+                w_key: w_kernel,
+                "x_scales": x_scales_kernel,
+                "w_scales": w_scales,
+                "y": y_ref,
+            }
+        )
         a = x.double() * torch.exp2(xs.double() - 127).repeat_interleave(
             x_scale_group_size, 1
         )
@@ -131,8 +164,14 @@ def bench_gemm_fn(
 
     _p_gen = functools.partial(
         _generate_bench_inputs,
-        M, N, K, preshuffle, x_scale_group_size, w_scale_group_size,
-        transpose_x_scale, dtype,
+        M,
+        N,
+        K,
+        block128_preshuffle,
+        x_scale_group_size,
+        w_scale_group_size,
+        transpose_x_scale,
+        dtype,
     )
     # (x, w, w_kernel, xs, x_scales_kernel, w_scales, y); drop the raw/untransposed
     # tensors only needed for the --test reference check above
@@ -145,9 +184,10 @@ def bench_gemm_fn(
     # flops
     flops = 2.0 * M * N * K
     # memory transfer
-    mem_read = rot_bufs[0]["x"].numel() * rot_bufs[0]["x"].element_size() + rot_bufs[
-        0
-    ][w_key].numel() * rot_bufs[0][w_key].element_size()
+    mem_read = (
+        rot_bufs[0]["x"].numel() * rot_bufs[0]["x"].element_size()
+        + rot_bufs[0][w_key].numel() * rot_bufs[0][w_key].element_size()
+    )
     mem_read += (
         rot_bufs[0]["x_scales"].numel() * rot_bufs[0]["x_scales"].element_size()
         + rot_bufs[0]["w_scales"].numel() * rot_bufs[0]["w_scales"].element_size()
@@ -173,8 +213,10 @@ def bench_gemm_fn(
 def _bench_args(args):
     return {
         "dtype": DTYPE_MAP[args.dtype],
-        "preshuffle": args.preshuffle,
-        "backend": args.backend,
+        "block128_preshuffle": args.block128_preshuffle,
+        # The shared --backend option (get_parser) defaults to "auto": let the
+        # block128 wrapper pick gluon on gfx1250 and triton elsewhere.
+        "backend": None if args.backend == "auto" else args.backend,
         "x_scale_group_size": args.x_scale_group_size,
         "transpose_x_scale": args.transpose_x_scale,
         "w_scale_group_size": tuple(args.w_scale_group_size),
@@ -183,6 +225,9 @@ def _bench_args(args):
 
 
 def run_benchmark(args, defaults):
+    if args.preshuffle:
+        run_preshuffle_benchmark(args, defaults)
+        return
     if args.model:
         unsupported_args = ["layout"]
         for arg in unsupported_args:
@@ -256,22 +301,124 @@ def run_shape_benchmark(args):
     bench_gemm_afp8wfp8.run(save_path="." if args.o else None, print_data=True)
 
 
+def bench_gemm_preshuffle_fn(
+    M: int, N: int, K: int, metric: str, x_preshuffled: bool, scale_layout: str
+):
+    c_dtype = torch.bfloat16
+    x, w, xs, ws = preshuffle_generate_inputs(M, N, K)
+    # input preparation is not timed
+    x_k, w_k, xs_k, ws_k = preshuffle_prepare(x, w, xs, ws, scale_layout, x_preshuffled)
+    y = torch.empty((M, N), dtype=c_dtype, device=x.device)
+    flops = 2.0 * M * N * K
+    mem_read = x.numel() + w.numel() + xs_k.numel() + ws_k.numel()  # 1-byte elements
+    mem = mem_read + M * N * 2
+    ms = triton.testing.do_bench(
+        lambda: gemm_afp8wfp8_preshuffle(
+            x_k,
+            w_k,
+            xs_k,
+            ws_k,
+            c_dtype,
+            y,
+            x_preshuffled=x_preshuffled,
+            scale_layout=scale_layout,
+        ),
+        warmup=25,
+        rep=100,
+    )
+    if metric == "time":
+        return ms
+    if metric == "throughput":
+        return flops / ms * 1e-9  # TFLOPS
+    if metric == "bandwidth":
+        return mem / (ms * 1e-3) * 1e-9  # GB/s
+    raise ValueError("Unknown metric: " + metric)
+
+
+def run_preshuffle_model_benchmark(args):
+    benchmark = get_model_benchmark_object(
+        "GEMM MXFP8 x MXFP8 (1x32 scales) Benchmark", args
+    )
+
+    @triton.testing.perf_report([benchmark])
+    def bench_gemm_afp8wfp8_preshuffle(
+        M, hidden_dim, intermediate_dim, metric, layer, model_name=None, **kwargs
+    ):
+        if layer == "fc1":
+            N, K = (
+                intermediate_dim if args.no_glu else intermediate_dim * 2
+            ), hidden_dim
+            N = math.ceil(N / args.tp)
+        elif layer == "fc2":
+            N, K = hidden_dim, math.ceil(intermediate_dim / args.tp)
+        return bench_gemm_preshuffle_fn(
+            M, N, K, metric, args.x_preshuffled, args.scale_layout
+        )
+
+    bench_gemm_afp8wfp8_preshuffle.run(
+        save_path="." if args.o else None, print_data=True
+    )
+
+
+def run_preshuffle_shape_benchmark(args):
+    benchmark = get_shape_benchmark_object(
+        "GEMM MXFP8 x MXFP8 (1x32 scales) Benchmark", args
+    )
+
+    @triton.testing.perf_report([benchmark])
+    def bench_gemm_afp8wfp8_preshuffle(M, N, K, metric, model_name=None, **kwargs):
+        return bench_gemm_preshuffle_fn(
+            M, N, K, metric, args.x_preshuffled, args.scale_layout
+        )
+
+    bench_gemm_afp8wfp8_preshuffle.run(
+        save_path="." if args.o else None, print_data=True
+    )
+
+
+def run_preshuffle_benchmark(args, defaults):
+    assert not (args.shape and args.model) or not (
+        args.shape and args.M
+    ), "User can specify --shape or --model MODEL -M VAL exclusively"
+    if args.model:
+        run_preshuffle_model_benchmark(args)
+    else:
+        for arg in ("fc1", "fc2", "no_glu"):
+            if getattr(args, arg, None) != getattr(defaults, arg, None):
+                raise RuntimeError(
+                    f"Argument '{arg}' is not supported for benchmarking without the --model flag."
+                )
+        run_preshuffle_shape_benchmark(args)
+
+
 def parse_args(args: list[str] | None = None):
     parser = get_parser("AFP8 x WFP8 GEMM")
     parser = add_argparse_ff(parser)
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
         "--shuffle",
         "--preshuffle",
         action="store_true",
         dest="preshuffle",
-        help="Preshuffle the weight (layout=(16, 16)) and use gemm_afp8wfp8_preshuffle.",
+        help="Benchmark gemm_afp8wfp8_preshuffle, the gfx1250 gluon MXFP8 GEMM (1x32 e8m0 scales).",
+    )
+    mode.add_argument(
+        "--block128-shuffle",
+        "--block128-preshuffle",
+        action="store_true",
+        dest="block128_preshuffle",
+        help="Preshuffle the weight (layout=(16, 16)) and use gemm_afp8wfp8_block128_preshuffle.",
     )
     parser.add_argument(
-        "--backend",
-        type=str,
-        choices=["triton", "gluon"],
-        default=None,
-        help="Backend for the preshuffle kernel. Default auto-detects (gluon on gfx1250, else triton). Ignored without --shuffle.",
+        "--x-preshuffled",
+        action="store_true",
+        help="[--preshuffle] pass x through shuffle_weight (x_preshuffled=True); needs M % 16 == 0",
+    )
+    parser.add_argument(
+        "--scale-layout",
+        choices=["n32k4", "128row"],
+        default="n32k4",
+        help="[--preshuffle] scale layout of x and w scales (scale_layout=)",
     )
     parser.add_argument(
         "--dtype",
@@ -330,8 +477,27 @@ def parse_args(args: list[str] | None = None):
         parser.error("-tp must be positive")
     if tuple(parsed.w_scale_group_size) not in ((1, 32), (32, 32), (128, 128)):
         parser.error("Weight scale block must be 1 32, 32 32, or 128 128")
-    if parsed.preshuffle and tuple(parsed.w_scale_group_size) != (128, 128):
-        parser.error("Preshuffle requires 128x128 weight scales")
+    if parsed.block128_preshuffle and tuple(parsed.w_scale_group_size) != (128, 128):
+        parser.error("--block128-preshuffle requires 128x128 weight scales")
+    if not parsed.preshuffle and (
+        parsed.x_preshuffled or parsed.scale_layout != defaults.scale_layout
+    ):
+        parser.error("--x-preshuffled and --scale-layout require --preshuffle")
+    if parsed.preshuffle:
+        # The 1x32 bench takes neither these nor the group32 shape set.
+        for arg in (
+            "backend",
+            "dtype",
+            "x_scale_group_size",
+            "transpose_x_scale",
+            "w_scale_group_size",
+            "test",
+            "shape_set",
+        ):
+            if getattr(parsed, arg) != getattr(defaults, arg):
+                parser.error(
+                    f"--{arg.replace('_', '-')} is not supported with --preshuffle"
+                )
     return parsed, defaults
 
 

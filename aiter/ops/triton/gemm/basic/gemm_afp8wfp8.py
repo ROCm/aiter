@@ -3,7 +3,9 @@
 
 
 import copy
+import functools
 import math
+import os
 
 import torch
 import triton
@@ -18,6 +20,7 @@ from aiter.ops.triton._triton_kernels.gemm.basic.gemm_afp8wfp8 import (
     _get_config,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.config_utils import resolve_config_dir
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.utility.graph_alloc import ROUTES_INSIDE_CAPTURE, persistent_alloc
 
@@ -341,7 +344,7 @@ def gemm_afp8wfp8(
     return y
 
 
-def gemm_afp8wfp8_preshuffle(
+def gemm_afp8wfp8_block128_preshuffle(
     x: torch.Tensor,
     w_shuffled: torch.Tensor,
     x_scales: torch.Tensor,
@@ -356,9 +359,11 @@ def gemm_afp8wfp8_preshuffle(
     backend: str | None = None,
 ) -> torch.Tensor:
     """
-    Preshuffle variant of gemm_afp8wfp8. The weight tensor has already been
-    permuted via aiter.ops.shuffle.shuffle_weight(..., layout=(16, 16)). Scales
-    are left unshuffled in the compact 128x128 layout.
+    Block128 preshuffle variant of gemm_afp8wfp8: compact 128x128 weight
+    scales. The weight tensor has already been permuted via
+    aiter.ops.shuffle.shuffle_weight(..., layout=(16, 16)). Scales are left
+    unshuffled in the compact 128x128 layout. For 1x32 (MX) weight scales see
+    gemm_afp8wfp8_preshuffle.
 
     Uses the gluon backend automatically on supported architectures (gfx1250)
     and the triton backend everywhere else. Pass ``backend`` to force a choice.
@@ -416,7 +421,7 @@ def gemm_afp8wfp8_preshuffle(
 
     if config is None:
         config, _ = _get_config(
-            M, N, K, config_name="GEMM-AFP8WFP8_PRESHUFFLED", backend=backend
+            M, N, K, config_name="GEMM-AFP8WFP8_BLOCK128_PRESHUFFLED", backend=backend
         )
 
     # CTA-cluster (CGA) multicast, gluon only. CTAS_M x CTAS_N CTAs form one
@@ -470,19 +475,19 @@ def gemm_afp8wfp8_preshuffle(
     )
     if backend == "gluon":
         from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_mxfp8 import (
-            _PRESHUFFLE_KERNEL_MAP,
+            _BLOCK128_PRESHUFFLE_KERNEL_MAP,
         )
 
         kernel_type = config.pop("kernel_type", kernel_type)
-        assert kernel_type in _PRESHUFFLE_KERNEL_MAP, (
+        assert kernel_type in _BLOCK128_PRESHUFFLE_KERNEL_MAP, (
             f"Unknown kernel_type '{kernel_type}', must be one of "
-            f"{list(_PRESHUFFLE_KERNEL_MAP.keys())}"
+            f"{list(_BLOCK128_PRESHUFFLE_KERNEL_MAP.keys())}"
         )
         assert (
             num_ctas == 1 or kernel_type == "bandwidth_bound"
         ), f"CGA multicast is only wired into bandwidth_bound, got '{kernel_type}'"
         _LOGGER.info(
-            "GEMM_AFP8WFP8 PRESHUFFLE [gluon/gfx1250]: x=%s w=%s kernel=%s",
+            "GEMM_AFP8WFP8 BLOCK128 PRESHUFFLE [gluon/gfx1250]: x=%s w=%s kernel=%s",
             tuple(x.shape),
             tuple(w_view.shape),
             kernel_type,
@@ -500,7 +505,7 @@ def gemm_afp8wfp8_preshuffle(
         for i in range(int(math.log2(config["num_warps"] // 2))):
             warp_bases.append((1 << i, 0))
 
-        _PRESHUFFLE_KERNEL_MAP[kernel_type][grid](
+        _BLOCK128_PRESHUFFLE_KERNEL_MAP[kernel_type][grid](
             x,
             w_view,
             y if config["NUM_KSPLIT"] == 1 else y_pp,
@@ -616,12 +621,35 @@ def gemm_afp8wfp8_preshuffle(
 
 
 # gfx1250 gluon MXFP8 (1x32 e8m0 scales on both operands) scale layouts -> kernel SCALE_MODE
-_MX_SCALE_LAYOUTS = {"128row": 1, "n32k4": 2}
+_SCALE_LAYOUTS = {"128row": 1, "n32k4": 2}
 # (block_n, block_k) of the w scales: MX 1x32, or compact DeepSeek-style blocks
-_MX_W_SCALE_BLOCKS = ((1, 32), (32, 32), (128, 128))
+_W_SCALE_BLOCKS = ((1, 32), (32, 32), (128, 128))
+
+# Config families of gemm_afp8wfp8_preshuffle. The default (1x32) family is
+# GEMM-AFP8WFP8_PRESHUFFLED. GEMM-AFP8WFP8_BLOCK32_PRESHUFFLED is reserved for
+# 32x32 w-scale tuning of this kernel; until a DEFAULT.json for it exists on the
+# running arch, 32x32 reads the default family. 128x128 w scales also read the
+# default family: GEMM-AFP8WFP8_BLOCK128_PRESHUFFLED belongs to the other
+# kernel (gemm_afp8wfp8_block128_preshuffle) and has different config keys.
+_PRESHUFFLE_CONFIG = "GEMM-AFP8WFP8_PRESHUFFLED"
+_BLOCK32_PRESHUFFLE_CONFIG = "GEMM-AFP8WFP8_BLOCK32_PRESHUFFLED"
 
 
-def gemm_afp8wfp8_mx_preshuffle(
+@functools.cache
+def _has_default_config(cfg_dir: str) -> bool:
+    return os.path.isfile(f"{cfg_dir}/DEFAULT.json")
+
+
+def _preshuffle_config_name(w_block: tuple[int, int]) -> str:
+    # Same arch / backend resolution as get_gemm_config(..., backend="gluon").
+    if w_block == (32, 32) and _has_default_config(
+        resolve_config_dir("gemm", _BLOCK32_PRESHUFFLE_CONFIG, backend="gluon")
+    ):
+        return _BLOCK32_PRESHUFFLE_CONFIG
+    return _PRESHUFFLE_CONFIG
+
+
+def gemm_afp8wfp8_preshuffle(
     x: torch.Tensor,
     w: torch.Tensor,
     x_scales: torch.Tensor,
@@ -654,7 +682,8 @@ def gemm_afp8wfp8_mx_preshuffle(
         y (Optional[torch.Tensor]): preallocated (M, N) output.
         config (Optional[dict]): tuning keys (BLOCK_SIZE_M/N/K, num_warps, NUM_BUFFERS,
             num_ctas, GROUP_M, B2B_WMMA, NUM_KSUB, EPI_SPLIT); default from the
-            GEMM-AFP8WFP8_MX_PRESHUFFLED config files.
+            GEMM-AFP8WFP8_PRESHUFFLED config files (for 32x32 w scales,
+            GEMM-AFP8WFP8_BLOCK32_PRESHUFFLED once that family has a DEFAULT.json).
         x_preshuffled (bool): x is shuffle_weight(x) (16x16 byte shuffle, as w).
         scale_layout (str): layout of both x_scales and w_scales:
             "n32k4": aiter.ops.shuffle.shuffle_mxfp8fp4_scale, viewed as
@@ -680,23 +709,23 @@ def gemm_afp8wfp8_mx_preshuffle(
     from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 
     if not _is_gluon_available():
-        raise RuntimeError("gemm_afp8wfp8_mx_preshuffle is gfx1250 (gluon) only")
-    if scale_layout not in _MX_SCALE_LAYOUTS:
+        raise RuntimeError("gemm_afp8wfp8_preshuffle is gfx1250 (gluon) only")
+    if scale_layout not in _SCALE_LAYOUTS:
         raise ValueError(
-            f"scale_layout must be one of {list(_MX_SCALE_LAYOUTS)}, got {scale_layout!r}"
+            f"scale_layout must be one of {list(_SCALE_LAYOUTS)}, got {scale_layout!r}"
         )
-    scale_mode = _MX_SCALE_LAYOUTS[scale_layout]
+    scale_mode = _SCALE_LAYOUTS[scale_layout]
     if x_scale_group_size not in (32, 128):
         raise ValueError(
             f"x_scale_group_size must be 32 or 128, got {x_scale_group_size}"
         )
     w_block = tuple(w_scale_block_size)
-    if w_block not in _MX_W_SCALE_BLOCKS:
+    if w_block not in _W_SCALE_BLOCKS:
         raise ValueError(
-            f"w_scale_block_size must be one of {_MX_W_SCALE_BLOCKS}, got {w_block}"
+            f"w_scale_block_size must be one of {_W_SCALE_BLOCKS}, got {w_block}"
         )
-    a_fmt = x_format or _mx_fp8_format(x)
-    b_fmt = w_format or _mx_fp8_format(w)
+    a_fmt = x_format or _fp8_format(x)
+    b_fmt = w_format or _fp8_format(w)
     for f in (a_fmt, b_fmt):
         if f not in ("e4m3", "e5m2"):
             raise ValueError(f"fp8 format must be 'e4m3' or 'e5m2', got {f!r}")
@@ -710,7 +739,7 @@ def gemm_afp8wfp8_mx_preshuffle(
 
     if config is None:
         config, _ = get_gemm_config(
-            "GEMM-AFP8WFP8_MX_PRESHUFFLED",
+            _preshuffle_config_name(w_block),
             M,
             N,
             K,
@@ -749,10 +778,10 @@ def gemm_afp8wfp8_mx_preshuffle(
         # compact w scales: the kernel's coarse-block path is NUM_KSUB == 1
         config["NUM_KSUB"] = 1
 
-    from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_mxfp8_mx32 import (
+    from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_mxfp8 import (
+        _gemm_mxfp8_preshuffle_kernel,
         cluster_shape,
-        gemm_mxfp8_mx32_preshuffle_gfx1250,
-        get_gemm_afp8wfp8_mx_preshuffle_layouts,
+        get_gemm_afp8wfp8_preshuffle_layouts,
     )
 
     if y is None:
@@ -810,7 +839,7 @@ def gemm_afp8wfp8_mx_preshuffle(
     ):
         config["EPI_SPLIT"] = 1
 
-    layouts = get_gemm_afp8wfp8_mx_preshuffle_layouts(
+    layouts = get_gemm_afp8wfp8_preshuffle_layouts(
         config["num_warps"],
         config["BLOCK_SIZE_M"],
         config["BLOCK_SIZE_N"],
@@ -836,7 +865,7 @@ def gemm_afp8wfp8_mx_preshuffle(
     grid = (
         triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(N, config["BLOCK_SIZE_N"]),
     )
-    gemm_mxfp8_mx32_preshuffle_gfx1250[grid](
+    _gemm_mxfp8_preshuffle_kernel[grid](
         x_k,
         w_k,
         y,
@@ -869,7 +898,7 @@ def gemm_afp8wfp8_mx_preshuffle(
     return y
 
 
-def _mx_fp8_format(t: torch.Tensor) -> str:
+def _fp8_format(t: torch.Tensor) -> str:
     """'e4m3' / 'e5m2' from an fp8 tensor's dtype; uint8 views default to 'e4m3'."""
     if t.dtype == torch.float8_e5m2:
         return "e5m2"

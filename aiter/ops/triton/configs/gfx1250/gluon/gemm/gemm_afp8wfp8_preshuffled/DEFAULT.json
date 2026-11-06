@@ -1,18 +1,38 @@
 {
-    "any": {
-        "BLOCK_SIZE_M": 32,
-        "BLOCK_SIZE_N": 128,
-        "BLOCK_SIZE_K": 128,
-        "CTAS_M": 1,
-        "CTAS_N": 1,
-        "GROUP_SIZE_M": 1,
-        "NUM_KSPLIT": 1,
-        "num_warps": 4,
-        "waves_per_eu": 1,
-        "NUM_BUFFERS": 3,
-        "cache_modifier": null,
-        "B_SCALE_TDM": true,
-        "kernel_type": "bandwidth_bound",
-        "LOOP_UNROLL_FACTOR": 1
-    }
+  "M_LEQ_31": {
+    "BLOCK_SIZE_M": 16,
+    "BLOCK_SIZE_N": 128,
+    "BLOCK_SIZE_K": 128,
+    "num_warps": 4,
+    "NUM_BUFFERS": 3,
+    "num_ctas": 1,
+    "GROUP_M": 1,
+    "B2B_WMMA": 0,
+    "NUM_KSUB": 1,
+    "EPI_SPLIT": 1
+  },
+  "M_LEQ_256": {
+    "BLOCK_SIZE_M": 256,
+    "BLOCK_SIZE_N": 256,
+    "BLOCK_SIZE_K": 128,
+    "num_warps": 4,
+    "NUM_BUFFERS": 3,
+    "num_ctas": 1,
+    "GROUP_M": 1,
+    "B2B_WMMA": 1,
+    "NUM_KSUB": 1,
+    "EPI_SPLIT": 1
+  },
+  "any": {
+    "BLOCK_SIZE_M": 1024,
+    "BLOCK_SIZE_N": 1024,
+    "BLOCK_SIZE_K": 128,
+    "num_warps": 4,
+    "NUM_BUFFERS": 3,
+    "num_ctas": 16,
+    "GROUP_M": 8,
+    "B2B_WMMA": 1,
+    "NUM_KSUB": 1,
+    "EPI_SPLIT": 1
+  }
 }
