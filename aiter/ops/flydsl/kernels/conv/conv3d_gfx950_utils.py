@@ -12,6 +12,8 @@ import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import T
 
+from aiter.jit.utils.chip_info import get_num_xcds
+
 # One MFMA instruction's output tile, and how many accumulator values of it a
 # lane holds. gfx950's bf16 MFMA is 16x16x16 with 4 values per lane.
 MFMA_M = 16
@@ -845,6 +847,7 @@ class LaunchGrid(NamedTuple):
     tile_m: int
     row_chk: bool
     wgm: int
+    num_xcds: int
     # (rows, cols) when a block owns a 2D patch of output pixels (kH x kW
     # reuse), else None: M tiles are then N * Do * ceil(Ho/rows) * ceil(Wo/cols).
     out_block: object
@@ -925,6 +928,7 @@ def make_launch_grid(param, geom, cfg, out_block=None):
         # Chunked M already uses z, so a swizzle over x/y would reorder blocks
         # that are no longer adjacent in M. WGM only applies to the flat case.
         wgm=1 if m_chunks > 1 else max(1, int(param.wgm)),
+        num_xcds=get_num_xcds(),
         out_block=out_block,
         tile_n=tile_n,
         tiles_per_group=tiles_per_group,
@@ -949,12 +953,7 @@ class BlockCoords(NamedTuple):
     k_off: object
 
 
-# gfx950 parts deal a dispatch's workgroups round-robin over this many XCDs,
-# each behind its own L2.
-NUM_XCDS = 8
-
-
-def _xcd_contiguous(pid, total):
+def _xcd_contiguous(pid, total, num_xcds):
     """Renumber dispatch-order block ``pid`` of ``total`` so each XCD runs a contiguous range.
 
     Round-robin dealing puts consecutive M tiles, which share input rows, in
@@ -964,11 +963,11 @@ def _xcd_contiguous(pid, total):
     64-bit block coordinates cost VGPRs downstream, enough to drop a tile at
     the 256-VGPR edge to one wave per SIMD.
     """
-    per = (total + (NUM_XCDS - 1)) // NUM_XCDS
+    per = (total + (num_xcds - 1)) // num_xcds
     # XCDs that receive `per` blocks; the rest receive per - 1.
-    tall = total - (per - 1) * NUM_XCDS
-    xcd = pid % NUM_XCDS
-    local = pid // NUM_XCDS
+    tall = total - (per - 1) * num_xcds
+    xcd = pid % num_xcds
+    local = pid // num_xcds
     short = tall * per + (xcd - tall) * (per - 1) + local
     return (xcd < tall).select(xcd * per + local, short)
 
@@ -989,6 +988,7 @@ def block_coords(grid, grid_m=None):
                 fx.Int32(gpu.block_id("x"))
                 + fx.Int32(gpu.block_id("y")) * fx.Int32(grid_m),
                 fx.Int32(grid_m) * grid.grid_y,
+                grid.num_xcds,
             )
         )
         blocks_per_swizzle = fx.Int64(grid.wgm * grid.grid_y)
@@ -1000,7 +1000,9 @@ def block_coords(grid, grid_m=None):
         m_offset = (first_m + (local % swizzle_rows)) * grid.tile_m
         n_tile = local // swizzle_rows
     elif const_expr(grid.grid_y == 1):
-        m_offset = _xcd_contiguous(fx.Int32(gpu.block_id("x")), fx.Int32(grid_m))
+        m_offset = _xcd_contiguous(
+            fx.Int32(gpu.block_id("x")), fx.Int32(grid_m), grid.num_xcds
+        )
         m_offset = m_offset * grid.tile_m
         n_tile = fx.Int32(0)
     else:
@@ -1008,6 +1010,7 @@ def block_coords(grid, grid_m=None):
             fx.Int32(gpu.block_id("x"))
             + fx.Int32(gpu.block_id("y")) * fx.Int32(grid_m),
             fx.Int32(grid_m) * grid.grid_y,
+            grid.num_xcds,
         )
         # N fastest: an M tile's N tiles run back to back on one XCD, sharing
         # its A in that L2.

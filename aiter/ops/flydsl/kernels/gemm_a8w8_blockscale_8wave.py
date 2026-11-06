@@ -48,6 +48,7 @@ def compile_gemm_fp8_8wave(
     pid_swizzle=True,
     permlane_epilogue=True,
     preshuffle_b=False,
+    num_xcds=8,
 ):
     """Compile the half-M single-FIFO blockscale kernel with raw A/B DMA.
 
@@ -146,7 +147,7 @@ def compile_gemm_fp8_8wave(
         if const_expr(pid_swizzle):
             # Match launch grid; the restricted target prevents OCKL inlining.
             grid_mn = ceildiv(M, TILE_M) * num_pid_n
-            bid_x, bid_y = get_pids_950(fx.block_idx.x, M, grid_mn, 8, 4)
+            bid_x, bid_y = get_pids_950(fx.block_idx.x, M, grid_mn, num_xcds, 4)
         else:
             bid_x = fx.block_idx.x // num_pid_n
             bid_y = fx.block_idx.x % num_pid_n

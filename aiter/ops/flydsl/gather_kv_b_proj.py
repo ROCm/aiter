@@ -20,7 +20,7 @@ import torch
 from flydsl.runtime.device import get_rocm_arch
 from torch import Tensor
 
-from aiter.jit.utils.chip_info import get_cu_num, get_lds_capacity_bytes
+from aiter.jit.utils.chip_info import get_cu_num, get_lds_capacity_bytes, get_num_xcds
 
 from .kernels.gather_gemm_8wave import compile_gather_kv_b_proj_8w, lds_block_n
 from .kernels.tensor_shim import _run_compiled, ptr_arg
@@ -350,6 +350,7 @@ def compile_gather_kv_b_proj(
     head_tiles: int,
     waves_per_eu: int,
     xcd_swizzle: int,
+    num_xcds: int,
     weight_preshuffle: bool,
     per_row_scale: bool,
     wide_index: bool,
@@ -373,6 +374,7 @@ def compile_gather_kv_b_proj(
         head_tiles=int(head_tiles),
         waves_per_eu=int(waves_per_eu),
         xcd_swizzle=int(xcd_swizzle),
+        num_xcds=int(num_xcds),
         weight_preshuffle=bool(weight_preshuffle),
         per_row_scale=bool(per_row_scale),
         wide_index=bool(wide_index),
@@ -392,9 +394,6 @@ def _as_i8(t: Tensor) -> Tensor:
     return t.view(torch.int8) if "float8" in str(t.dtype) else t
 
 
-_NUM_XCDS = 8
-
-
 def _default_xcd(m_rows: int, block_m: int, head_tiles: int) -> int:
     """Pick xcd_swizzle -- the ``wgm`` of the XCD tile remap -- from the row count."""
     # The ladder below is calibrated for one tile per head. A split head puts
@@ -409,7 +408,7 @@ def _default_xcd(m_rows: int, block_m: int, head_tiles: int) -> int:
         return 2
     if num_pid_m <= 64:
         return 4
-    return _NUM_XCDS
+    return get_num_xcds()
 
 
 def gather_kv_b_proj_flydsl(
@@ -552,6 +551,7 @@ def gather_kv_b_proj_flydsl(
         head_tiles=int(head_tiles),
         waves_per_eu=int(waves_per_eu),
         xcd_swizzle=int(xcd_swizzle),
+        num_xcds=get_num_xcds(),
         weight_preshuffle=bool(weight_preshuffle),
         per_row_scale=bool(per_row_scale),
         # This cache's own extent, as its own compile-time variant. The two
