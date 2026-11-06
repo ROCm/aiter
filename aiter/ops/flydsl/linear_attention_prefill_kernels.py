@@ -26,7 +26,6 @@ from collections.abc import Sequence
 import torch
 import triton
 from flydsl.runtime.device import get_rocm_arch
-from flydsl.utils.env import runtime as flydsl_runtime_env
 
 from aiter.jit.core import AITER_CONFIGS
 from aiter.jit.utils.chip_info import get_num_xcds
@@ -153,10 +152,6 @@ _IS_GFX950 = _GFX_ARCH.startswith("gfx950")
 # Host-path knobs. Heavy dtype/shape/device audit is off by default; set
 # ``AITER_K5_OPT_CHECK=1`` to enable it. k/w/u must still be contiguous.
 _OPT_BV_ENV = os.environ.get("FLYDSL_K5_OPT_BV")
-
-
-def _flydsl_run_only() -> bool:
-    return flydsl_runtime_env.run_only
 
 
 def _opt_check() -> bool:

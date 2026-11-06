@@ -39,6 +39,7 @@ from unittest import mock
 
 import pandas as pd
 import torch
+from flydsl.utils.env import runtime as flydsl_runtime_env
 
 import aiter
 from aiter import dtypes
@@ -47,7 +48,6 @@ from aiter.ops.flydsl import linear_attention_prefill_kernels as _k5_mod
 from aiter.ops.flydsl.kernels.kernels_common import ceildiv
 from aiter.ops.flydsl.linear_attention_prefill_kernels import (
     _BLOCKED_MIN_CHUNKS,
-    _flydsl_run_only,
     chunk_gated_delta_rule_fwd_h_flydsl_opt,
 )
 from aiter.ops.prefill_batch_metadata import (
@@ -1087,7 +1087,7 @@ def main():
     )
     args = parser.parse_args()
 
-    if gfx == "gfx950" and not _flydsl_run_only():
+    if gfx == "gfx950" and not flydsl_runtime_env.run_only:
         df = pd.DataFrame(
             [
                 test_chunk_gdn_prefill_h_blocked(*row)
@@ -1103,7 +1103,7 @@ def main():
             "Skipping blocked dispatch cases: requires gfx950 and run-only disabled "
             "(gfx=%s, run_only=%s)",
             gfx,
-            _flydsl_run_only(),
+            flydsl_runtime_env.run_only,
         )
 
     for model in args.model:  # one table per model (Hv differs -> different shapes)
