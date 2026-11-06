@@ -5,9 +5,10 @@
 
 Owns every launch default. Picks a config in this order: explicit override,
 then the row of ``AITER_CONFIG_JAGGED_DENSE_BMM`` keyed by
-``(gfx, cu_num, K, N, tiles_log2)``, then the analytic default. The skew path
-takes ``block_k`` and ``skew_xcd_c``/``skew_xcd_w`` from the row; an empty skew
-cell falls back to the analytic skew XCD remap.
+``(gfx, cu_num, K, N, tiles_log2)``, then the analytic default. ``gfx`` is the
+live device from ``get_gfx_runtime()``, so ``GPU_ARCHS`` cannot select another
+arch's row. The skew path takes ``block_k`` and ``skew_xcd_c``/``skew_xcd_w``
+from the row; an empty skew cell falls back to the analytic skew XCD remap.
 """
 
 from __future__ import annotations
@@ -18,7 +19,7 @@ import pandas as pd
 import torch
 
 from aiter.jit.core import AITER_CONFIGS
-from aiter.jit.utils.chip_info import get_cu_num, get_gfx, get_gfx_runtime
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 
 from .kernels.jagged_dense_bmm_gen import (
     ARCH_TRAITS,
@@ -94,8 +95,10 @@ def resolve_config(
     xcd_w: int | None = None,
     block_k: int | None = None,
 ) -> dict:
+    # Live arch, not GPU_ARCHS. A build-arch override must not load another
+    # arch's winners onto this device.
     key = (
-        get_gfx(),
+        get_gfx_runtime(),
         get_cu_num(),
         reduction_k,
         output_n,
