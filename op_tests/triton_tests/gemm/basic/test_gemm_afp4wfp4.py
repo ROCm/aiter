@@ -11,13 +11,11 @@ from aiter.ops.triton._triton_kernels.gemm.basic.gemm_afp4wfp4 import (
     _get_config as _get_afp4wfp4_config,
 )
 from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import (
-    gemm_afp4wfp4 as triton_gemm_afp4wfp4,
-)
-from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import (
+    _block_k_without_masked_tail,
     gemm_afp4wfp4_preshuffle,
 )
 from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import (
-    _block_k_without_masked_tail,
+    gemm_afp4wfp4 as triton_gemm_afp4wfp4,
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.types import str_to_torch_dtype
