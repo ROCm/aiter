@@ -42,7 +42,7 @@ _BLOCK_STEPS = (64, 128, 256, 512, 1024)
 
 
 def jobs_for_arch(arch: str) -> list[dict]:
-    """A job per bucket, block-size step and window mode of ``arch``."""
+    """Cover cap-one planners plus every bucket/block/window specialization."""
     from aiter.jit.utils.chip_info import get_lds_capacity_bytes
     from aiter.ops.flydsl.kernels.pa_decode_plan import _lds_max_batch
 
@@ -52,7 +52,9 @@ def jobs_for_arch(arch: str) -> list[dict]:
     batches.append(max_batch)
     jobs = []
     for batch in batches:
-        capacities = {min(max(step, batch), batch * cu_num) for step in _BLOCK_STEPS}
+        capacities = {batch} | {
+            min(max(step, batch), batch * cu_num) for step in _BLOCK_STEPS
+        }
         for capacity in sorted(capacities):
             for windowed in (False, True):
                 job = {

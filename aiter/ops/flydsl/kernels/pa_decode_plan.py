@@ -32,19 +32,31 @@ def _block_threads(capacity):
 
 @cache
 def compile_pa_decode_plan(
-    max_batch, threads, windowed, cluster_tasks=False, tile_tokens=256
+    max_batch,
+    threads,
+    windowed,
+    cluster_tasks=False,
+    tile_tokens=256,
+    single_partition=False,
 ):
     """Compile a batch bucket and block size for dense or windowed plans.
 
     Bucket 1 uses a scan-free kernel: its task count is simply the minimum
     of visible tiles, capacity and partition cap. Other buckets retain scans.
     Actual batch, task capacity, partition cap and window are runtime values.
+    ``single_partition`` specializes a validated cap of one: a single
+    count scan compacts live rows and no tile-budget allocation is needed.
     ``cluster_tasks`` adds aligned records for small gfx1250 cluster plans.
     """
+    if single_partition and cluster_tasks:
+        raise ValueError("single-partition plans cannot have cluster records")
     if max_batch == 1:
         return _compile_single_sequence_plan(
             threads, windowed, cluster_tasks, tile_tokens
         )
+
+    if single_partition:
+        return _compile_single_partition_plan(max_batch, threads, windowed, tile_tokens)
 
     scan_tiles = fx.coop.BlockScan[fx.Int64, threads]
     scan_counts = fx.coop.BlockScan[fx.Int32, threads]
@@ -336,6 +348,107 @@ def _compile_single_sequence_plan(threads, windowed, cluster_tasks, tile_tokens)
     return launch
 
 
+@cache
+def _compile_single_partition_plan(max_batch, threads, windowed, tile_tokens):
+    """Compact live sequences with one count scan; no tile-budget division."""
+    scan = fx.coop.BlockScan[fx.Int32, threads]
+
+    def bounds(original, window):
+        length = fx.max(fx.Int64(original), fx.Int64(0))
+        first = fx.Int64(0)
+        if windowed:
+            first = fx.max(length - fx.Int64(window), fx.Int64(0)) // tile_tokens
+        end = (length + tile_tokens - 1) // tile_tokens
+        return fx.Int32(first), fx.Int32(end)
+
+    @flyc.kernel(known_block_size=[threads, 1, 1])
+    def pa_decode_single_partition_plan_kernel(
+        lengths_ptr: fx.Pointer,
+        work_ptr: fx.Pointer,
+        reduce_ptr: fx.Pointer,
+        batch: fx.Int32,
+        capacity: fx.Int32,
+        window: fx.Int32,
+    ):
+        tid = fx.thread_idx.x
+        lengths = fx.recast_iter(fx.Int32, lengths_ptr)
+        work = fx.recast_iter(fx.Int32, work_ptr)
+        reduce_info = fx.recast_iter(fx.Int32, reduce_ptr)
+        storage = fx.SharedAllocator().allocate(scan.SharedStorage).peek()
+        single = max_batch <= threads
+        if fx.const_expr(single):
+            row = fx.Int32(tid)
+            original = fx.Int32(0)
+            if row < batch:
+                original = fx.Int32(lengths[row])
+            first, end = bounds(original, window)
+            tasks = fx.Int32(end > first)
+        else:
+            rows = (batch + threads - 1) // threads
+            begin = fx.min(fx.Int32(tid) * rows, batch)
+            limit = fx.min(begin + rows, batch)
+            tasks = fx.Int32(0)
+            for seq in range(begin, limit):
+                first, end = bounds(lengths[seq], window)
+                tasks = tasks + fx.Int32(end > first)
+        start, total = scan.exclusive_with_aggregate(
+            tasks, fx.ReductionOp.ADD, storage=storage
+        )
+        if fx.const_expr(single):
+            if row < batch:
+                fx.ptr_store(
+                    fx.Vector.from_elements([start, tasks], dtype=fx.Int32),
+                    fx.add_offset(reduce_info, row * 2),
+                )
+                if tasks > 0:
+                    fx.ptr_store(
+                        fx.Vector.from_elements(
+                            [row, first, end, original], dtype=fx.Int32
+                        ),
+                        fx.add_offset(work, start * 4),
+                    )
+        else:
+            for seq in range(begin, limit):
+                original = fx.Int32(lengths[seq])
+                first, end = bounds(original, window)
+                count = fx.Int32(end > first)
+                fx.ptr_store(
+                    fx.Vector.from_elements([start, count], dtype=fx.Int32),
+                    fx.add_offset(reduce_info, seq * 2),
+                )
+                if count > 0:
+                    fx.ptr_store(
+                        fx.Vector.from_elements(
+                            [seq, first, end, original], dtype=fx.Int32
+                        ),
+                        fx.add_offset(work, start * 4),
+                    )
+                start = start + count
+        # Padding starts beyond every live store, including all-empty refreshes.
+        for slot in range(total + tid, capacity, threads):
+            fx.ptr_store(
+                fx.Vector.filled(4, 0, fx.Int32), fx.add_offset(work, slot * 4)
+            )
+
+    @flyc.jit
+    def launch(
+        lengths: fx.Pointer,
+        work: fx.Pointer,
+        reduce_info: fx.Pointer,
+        batch: fx.Int32,
+        capacity: fx.Int32,
+        max_parts: fx.Int32,
+        window: fx.Int32,
+        cluster_info: fx.Pointer,
+        stream: fx.Stream,
+    ):
+        pa_decode_single_partition_plan_kernel(
+            lengths, work, reduce_info, batch, capacity, window
+        ).launch(grid=(1, 1, 1), block=(threads, 1, 1), stream=stream)
+
+    return launch
+
+
 @dataclass(frozen=True)
 class PADecodePlan:
     """Reusable GPU metadata; refresh it whenever context lengths change.
@@ -589,6 +702,7 @@ def plan_pa_decode(
             sliding_window > 0,
             plan.cluster_info is not None,
             plan.tile_tokens,
+            plan.max_partitions == 1,
         )
         _run_compiled(
             launch,
