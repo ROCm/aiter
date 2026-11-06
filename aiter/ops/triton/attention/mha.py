@@ -101,7 +101,7 @@ def mha_set_impl(impl: Literal["default", "dao_ai"]):
     _MHA_IMPL = impl
 
 
-def _use_gluon_fwd(q, k, v, IS_FP8, config) -> bool:
+def _use_gluon_fwd(q, k, v, IS_FP8, config, sm_scale) -> bool:
     """Whether the gfx1250 gluon forward can serve this call.
 
     The kernel implements every forward feature of `_attn_fwd`: causal / varlen
@@ -127,7 +127,7 @@ def _use_gluon_fwd(q, k, v, IS_FP8, config) -> bool:
     # Each warp needs at least one 16-row WMMA M-tile.
     if config["BLOCK_M"] // 16 < config["num_warps"]:
         return False
-    return True
+    return sm_scale > 0
 
 
 _USE_INT64_STRIDES = True
@@ -835,7 +835,7 @@ def _flash_attn_forward(
 
         fwd_impl = (
             _gluon_gfx1250_attn_fwd
-            if _use_gluon_fwd(q, k, v, IS_FP8, config)
+            if _use_gluon_fwd(q, k, v, IS_FP8, config, softmax_scale)
             else _attn_fwd
         )
 
