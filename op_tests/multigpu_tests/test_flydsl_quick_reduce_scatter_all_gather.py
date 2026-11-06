@@ -35,7 +35,15 @@ the rounding order of the sum shows) and all zeros:
 * after ``compile_sp`` (which launches nothing and leaves its tensors alone)
   both modes capture into one CUDA graph, and every replay with new inputs
   equals an eager run of the same inputs bit for bit; capturing on an engine
-  that has not loaded its builds is refused;
+  that has not passed the preflight is refused;
+* ``compile_sp``, and the first eager call without it, is a collective
+  preflight: when one rank's tensors are invalid, or valid but of another size
+  or mode than its peers', every rank raises (the failing one its own
+  exception) and none hangs; the engine is then not ready and refuses a
+  capture, a retry on which the ranks agree passes the preflight, runs the
+  residency check of both builds and is correct, and launches on a ready engine
+  vote no more. The residency comparison is also run against stub artifacts,
+  without a device;
 * all-reduce, reduce-scatter and all-gather alternate on one engine in every
   ordered pair, with each rank slowed in turn, and every output equals the
   isolated result of its call bit for bit: once on a one-rung ST=1 engine at a
@@ -56,9 +64,11 @@ import itertools
 import os
 import re
 import sys
+import types
 from contextlib import ExitStack, closing
 from functools import partial
 from multiprocessing import freeze_support, get_context
+from unittest import mock
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.abspath(os.path.join(_HERE, "..", ".."))
@@ -220,15 +230,16 @@ def _expect_refused(call, pattern: str, label: str) -> None:
         raise AssertionError(f"{label}: accepted")
 
 
+def _zeros_rows(n_rows: int, dtype=torch.bfloat16, *, device) -> torch.Tensor:
+    """Zeros of *n_rows* rows at the refusal width."""
+    return torch.zeros((n_rows, _REFUSE_HIDDEN), dtype=dtype, device=device)
+
+
 def _check_refusals(fly, tp: int, device) -> None:
     """Malformed tensors raise ValueError before any launch (all ranks alike)."""
     rows = 32 * tp  # a whole number of tiles at hidden 2560
     shard_rows = rows // tp
-
-    def zeros(n_rows: int) -> torch.Tensor:
-        return torch.zeros(
-            (n_rows, _REFUSE_HIDDEN), dtype=torch.bfloat16, device=device
-        )
+    zeros = partial(_zeros_rows, device=device)
 
     full, shard = zeros(rows), zeros(shard_rows)
     big_shard = zeros(2 * shard_rows)  # the full tensor is not tp times this
@@ -467,9 +478,9 @@ def _graph_replay(fly, rank: int, tp: int, device, gloo) -> dict:
 
 
 def _cold_capture_refused(fly, tp: int, device) -> bool:
-    """A capture of a single-phase mode on an engine that has not loaded its
-    builds (no ``compile_sp``, no eager launch) is refused with a message that
-    names ``compile_sp``: loading cannot run under capture."""
+    """A capture of a single-phase mode on an engine that has not passed the
+    preflight (no ``compile_sp``, no eager launch) is refused with a message
+    that names ``compile_sp``: the preflight cannot run under capture."""
     full = torch.zeros(
         (_GRAPH_ROWS, _REFUSE_HIDDEN), dtype=torch.bfloat16, device=device
     )
@@ -740,6 +751,203 @@ def _run_rank_extras(rank: int, tp: int, init_method: str) -> dict:
     return res
 
 
+def _check_residency_stub() -> None:
+    """``_check_sp_residency`` against stub artifacts, without a device: a build
+    that fits fewer blocks per CU than the grid needs is refused, one that fits
+    as many passes. The needed counts are worked out by hand for 256 CUs."""
+    from aiter.ops.flydsl.quick_allreduce_int4 import _check_sp_residency
+
+    def launch(*fits):
+        return types.SimpleNamespace(
+            func=types.SimpleNamespace(__name__="launch_stub"),
+            _mem_cache={
+                i: types.SimpleNamespace(max_blocks_per_cu=lambda n=n: n)
+                for i, n in enumerate(fits)
+            },
+        )
+
+    # (blocks per CU that each artifact fits, grid, whether it must pass)
+    cases = (
+        ((4,), 1024, True),  # needs 4
+        ((5,), 1024, True),
+        ((3,), 1024, False),
+        ((4, 3), 1024, False),  # every artifact counts
+        ((4,), 1025, False),  # one block over rounds up: needs 5
+        ((5,), 1025, True),
+        ((1,), 256, True),  # needs 1
+        ((1,), 257, False),  # needs 2
+    )
+    for fits, grid, passes in cases:
+        try:
+            _check_sp_residency(launch(*fits), grid, 256)
+        except RuntimeError as exc:
+            refused = "stub" in str(exc)
+        else:
+            refused = False
+        if refused == passes:
+            raise AssertionError(
+                f"_check_sp_residency: artifacts fitting {fits} blocks per CU, "
+                f"grid {grid} on 256 CUs: {'refused' if refused else 'accepted'}"
+            )
+
+
+def _run_rank_preflight(rank: int, tp: int, init_method: str) -> dict:
+    """One rank's side of the single-phase preflight checks.
+
+    Each case builds a fresh engine and makes rank 1 differ from the others;
+    the outcome of every rank's call is returned for ``_assert_preflight``. A
+    preflight that does not vote leaves the others waiting on rank 1 in a gloo
+    collective; ``FLYDSL_QR_TIMEOUT`` ends the run (``_run_pool``).
+    """
+    import torch.distributed as dist
+
+    from aiter.ops.flydsl import QuickAllReduceInt4
+    from aiter.ops.flydsl import quick_allreduce_int4 as host
+
+    device, gloo = _init_rank(rank, tp, init_method)
+    odd = rank == 1
+    rows, shard_rows = 32 * tp, 32
+
+    def engine():
+        return closing(
+            QuickAllReduceInt4(
+                group=gloo,
+                device=device,
+                rank=rank,
+                world_size=tp,
+                ladder=_sp_ladder(_PINNED_CAP),
+            )
+        )
+
+    zeros = partial(_zeros_rows, device=device)
+
+    def outcome(fly, call) -> dict:
+        try:
+            call()
+        except Exception as exc:  # noqa: BLE001 -- recorded, checked by the caller
+            error, text = type(exc).__name__, str(exc)
+        else:
+            error, text = None, ""
+        return {"error": error, "text": text, "ready": fly._sp_ready}
+
+    res = {}
+    try:
+        # Valid on every rank, then valid on each but of another size on rank 1:
+        # only the comparison of the sizes can tell, and the engine, ready after
+        # the first call, must stop being ready.
+        with engine() as fly:
+            res["first"] = outcome(
+                fly, lambda: fly.compile_sp(zeros(rows), zeros(shard_rows))
+            )
+            rows_here = 2 * rows if odd else rows
+            res["sizes"] = outcome(
+                fly,
+                lambda: fly.compile_sp(zeros(rows_here), zeros(rows_here // tp)),
+            )
+            res["sizes"]["capture_refused"] = _cold_capture_refused(fly, tp, device)
+        # Tensors that rank 1 alone cannot launch: through compile_sp, and
+        # through the first eager call, which runs the same preflight.
+        dtype = torch.float16 if odd else torch.bfloat16
+        with engine() as fly:
+            res["compile_invalid"] = outcome(
+                fly, lambda: fly.compile_sp(zeros(rows, dtype), zeros(shard_rows))
+            )
+        with engine() as fly:
+            res["lazy_invalid"] = outcome(
+                fly, lambda: fly.reduce_scatter(zeros(rows, dtype), zeros(shard_rows))
+            )
+            # The same engine, all ranks agreeing: the call passes the preflight
+            # (which checks the residency of both builds) and is correct.
+            x = _make_inp(
+                rows, _REFUSE_HIDDEN, rank=rank, salt=40, fill="normal", device=device
+            )
+            out, full = zeros(shard_rows), zeros(rows)
+            with mock.patch.object(
+                host, "_check_sp_residency", wraps=host._check_sp_residency
+            ) as residency:
+                fly.reduce_scatter(x, out)
+                torch.cuda.synchronize()
+            ref = x.float().clone()
+            dist.all_reduce(ref)
+            eng = fly._by_cfg[(1, BLOCK)]
+            res["retry"] = {
+                "ready": fly._sp_ready,
+                "nmse": _nmse(out.float(), ref[rank * shard_rows :][:shard_rows]),
+                "residency_args": [c.args[1:] for c in residency.call_args_list],
+                "grid_and_cus": (eng.grid, fly._cu_count),
+            }
+            # Ready: the launches no longer vote.
+            with mock.patch.object(
+                dist, "all_gather_object", wraps=dist.all_gather_object
+            ) as votes:
+                fly.reduce_scatter(x, out)
+                fly.all_gather(out, full)
+                torch.cuda.synchronize()
+            res["steady_votes"] = votes.call_count
+        # Different modes as the first call: valid on its own rank.
+        with engine() as fly:
+            full, shard = zeros(rows), zeros(shard_rows)
+            call = (
+                (lambda: fly.all_gather(shard, full))
+                if odd
+                else (lambda: fly.reduce_scatter(full, shard))
+            )
+            res["modes"] = outcome(fly, call)
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
+    return res
+
+
+def _preflight_failures(where, res, case, error, needle) -> list[str]:
+    """What is wrong with the outcome of *case*: it must be *error*, naming
+    *needle*, and leave the engine not ready."""
+    got, fails = res[case], []
+    if got["error"] != error or needle not in got["text"]:
+        fails.append(
+            f"{where}: {case}: expected {error} naming {needle!r}, got "
+            f"{got['error']}: {got['text'][:240]}"
+        )
+    if got["ready"]:
+        fails.append(f"{where}: {case}: still ready after the failure")
+    return fails
+
+
+def _assert_preflight(ranks, *, world_size) -> None:
+    fails = []
+    for rank, res in enumerate(ranks):
+        where = f"tp={world_size} rank {rank}"
+        if res["first"]["error"] or not res["first"]["ready"]:
+            fails.append(f"{where}: a valid compile_sp did not pass: {res['first']}")
+        fails += _preflight_failures(where, res, "sizes", "RuntimeError", "full_bytes")
+        if not res["sizes"]["capture_refused"]:
+            fails.append(f"{where}: capture after a failed preflight was not refused")
+        for case in ("compile_invalid", "lazy_invalid"):
+            # rank 1 raises its own exception, the others name it
+            args = (
+                ("ValueError", "bf16")
+                if rank == 1
+                else ("RuntimeError", "rank 1: ValueError")
+            )
+            fails += _preflight_failures(where, res, case, *args)
+        fails += _preflight_failures(where, res, "modes", "RuntimeError", "kind")
+        retry = res["retry"]
+        # written so that a NaN fails
+        if not retry["nmse"] <= NMSE_MAX:
+            fails.append(f"{where}: retry NMSE {retry['nmse']}")
+        if not retry["ready"]:
+            fails.append(f"{where}: not ready after a preflight that passed")
+        if retry["residency_args"] != [retry["grid_and_cus"]] * 2:
+            fails.append(
+                f"{where}: residency checked with {retry['residency_args']}, "
+                f"want both builds at {retry['grid_and_cus']}"
+            )
+        if res["steady_votes"]:
+            fails.append(f"{where}: {res['steady_votes']} votes on ready launches")
+    if fails:
+        raise AssertionError("; ".join(fails))
+
+
 def _run_pool(world_size, worker, **kwds):
     """Run *worker* on every rank of a fresh spawn pool; its results by rank."""
     if world_size not in SUPPORTED_WORLDS:
@@ -949,6 +1157,7 @@ def main():
         n_gpu=n_gpu,
         supported=SUPPORTED_WORLDS,
     )
+    _check_residency_stub()
     for tp in tps:
         for grid_cap in (args.grid_cap, 64):
             ranks = _spawn(
@@ -960,6 +1169,7 @@ def main():
                 label=f"validity cap={grid_cap}",
             )
         _assert_extras(_run_pool(tp, _run_rank_extras), world_size=tp)
+        _assert_preflight(_run_pool(tp, _run_rank_preflight), world_size=tp)
 
     df = []
     for tp, mnk in itertools.product(tps, args.mnk):

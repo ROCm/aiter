@@ -53,9 +53,19 @@ block of rows of the sum, and `all_gather(inp, out)` concatenates the ranks'
 blocks. Both use INT4, `super_tile=1`, the 32 KiB tile (the payload is a whole
 number of tiles) and the all-reduce's inbox and colors. The reduce-scatter
 quantizes a rank's own partial too, which the all-reduce does not, so a row's
-value does not depend on which rank owns it. `compile_sp(full, shard)` loads
-both builds before CUDA graph capture. They are validated on the `uncached`
-inbox only.
+value does not depend on which rank owns it. They are validated on the
+`uncached` inbox only.
+
+`compile_sp(full, shard)` is a collective preflight: every rank calls it, with
+the same sizes, before CUDA graph capture. It loads both builds, checks that
+every block of their grids fits the device at once (the kernels are persistent
+and spin on their peers' flags), and agrees the call and the sizes across
+the ranks. If a rank fails or differs, every rank raises, where a rank
+that went on would poll its peers' flags forever. No launch is accepted until it
+has passed; the first eager call runs it. Later shapes must agree across ranks
+too. Launches and graph replays on one communicator, of every mode including the
+all-reduce, must run in one serialized device order: they share colors and
+inbox slots, so calls on independent streams need an event dependency.
 
 ### Ring
 
