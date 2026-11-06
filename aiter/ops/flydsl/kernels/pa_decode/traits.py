@@ -1003,6 +1003,12 @@ class Gfx1250Traits:
         return self.bf16_page128_packed and self.m_tiles == self.NWARP
 
     @property
+    def bf16_decode_wave(self):
+        # A single D128 query tile partitions each page across four waves;
+        # online softmax and P stay private until one final wave-state merge.
+        return self.bf16_page128_packed and self.head_dim == 128 and self.m_tiles == 1
+
+    @property
     def async_page(self):
         # Two packed buffers overlap page DMA and asynchronous per-token scale
         # copies with QK/softmax/PV. Windowed tiles keep synchronous staging.

@@ -903,6 +903,83 @@ _FP8_CASES = _COMMON_CASES + [
     ("mtp8-g8-page128", {"query_length": 8, "block_size": 128, "max_partitions": 7}),
 ]
 _BF16_CASES = _COMMON_CASES + [
+    # One query tile keeps four independent page-quarter states on gfx1250.
+    # Exercise token/page tails, padded query rows and every output mode.
+    *[
+        (
+            f"decode-wave-g{group}-direct",
+            {
+                "group_size": group,
+                "block_size": 128,
+                "lengths": (
+                    0,
+                    1,
+                    31,
+                    32,
+                    33,
+                    63,
+                    64,
+                    65,
+                    127,
+                    128,
+                    129,
+                    255,
+                    256,
+                    257,
+                    8193,
+                ),
+                "capture": True,
+            },
+        )
+        for group in (1, 8, 16)
+    ],
+    (
+        "decode-wave-cluster",
+        {
+            "group_size": 16,
+            "kv_heads": 2,
+            "block_size": 128,
+            "lengths": (0, 1, 33, 129, 257, 1027, 8193),
+            "max_partitions": 8,
+            "cluster": 8,
+            "capture": True,
+        },
+    ),
+    (
+        "decode-wave-merge",
+        {
+            "group_size": 16,
+            "block_size": 128,
+            "lengths": (0, 0, 1027, 8193),
+            "max_partitions": 4,
+            "budget": 1,
+            "capture": True,
+        },
+    ),
+    (
+        "decode-wave-reducer-fp16-query",
+        {
+            "group_size": 16,
+            "block_size": 128,
+            "query_dtype": torch.float16,
+            "lengths": (0, 1, 65, 1027, 8193),
+            "max_partitions": 7,
+            "sink_dtype": torch.float32,
+            "capture": True,
+        },
+    ),
+    (
+        "decode-wave-causal-window",
+        {
+            "query_length": 3,
+            "group_size": 4,
+            "block_size": 128,
+            "lengths": (0, 1, 31, 33, 65, 129, 257, 1027, 8193),
+            "window": 257,
+            "sink_dtype": torch.float32,
+            "capture": True,
+        },
+    ),
     (
         "mtp",
         {

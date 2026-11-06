@@ -1009,6 +1009,8 @@ class Gfx1250Bf16WavePipeline:
         # Bytes between eight-element chunks: K's eight dims span a page's
         # 128 tokens, V's eight tokens span the head. Both are 2048 at D128.
         self.k_chunk, self.v_chunk = 128 * 16, self.t.head_dim * 16
+        self.query_tiles = 1 if self.t.bf16_decode_wave else 2
+        self.token_tiles = 2 if self.t.bf16_decode_wave else 4
 
     @flyc.jit
     def _stage_next(self, token_base, begin, end, buffer):
@@ -1057,22 +1059,25 @@ class Gfx1250Bf16WavePipeline:
         kbase = (buffer == 0).select(bases[0][0], bases[0][1])
         vbase = (buffer == 0).select(bases[1][0], bases[1][1])
         tiles = [
-            [fx.Vector.filled(8, 0.0, fx.Float32) for _ in range_constexpr(4)]
-            for _ in range_constexpr(2)
+            [
+                fx.Vector.filled(8, 0.0, fx.Float32)
+                for _ in range_constexpr(self.token_tiles)
+            ]
+            for _ in range_constexpr(self.query_tiles)
         ]
-        for i in range_constexpr(4):
+        for i in range_constexpr(self.token_tiles):
             for d in range_constexpr(t.head_dim // 32):
                 k = self._operand(kbase, 4 * self.k_chunk * d + 256 * i, self.k_chunk)
-                for m in range_constexpr(2):
+                for m in range_constexpr(self.query_tiles):
                     tiles[m][i] = Gfx1250Gemm.mma(
                         k, q_operands[m][d], tiles[m][i], 32, True
                     )
         stride = 2 + t.head_dim // 16
         next_state, p_operands, outs = [], [], []
-        for m in range_constexpr(2):
+        for m in range_constexpr(self.query_tiles):
             limit = uppers[m] - token_base
             units = []
-            for i in range_constexpr(4):
+            for i in range_constexpr(self.token_tiles):
                 for r in range_constexpr(8):
                     value = tiles[m][i][r]
                     if const_expr(not fused):
@@ -1105,19 +1110,21 @@ class Gfx1250Bf16WavePipeline:
             if const_expr(fused):
                 exponent = fx.fma(
                     scores,
-                    fx.Vector.from_elements([scale], dtype=fx.Float32).broadcast_to(32),
+                    fx.Vector.from_elements([scale], dtype=fx.Float32).broadcast_to(
+                        self.token_tiles * 8
+                    ),
                     fx.Vector.from_elements(
                         [-fx.Float32(safe_max)], dtype=fx.Float32
-                    ).broadcast_to(32),
+                    ).broadcast_to(self.token_tiles * 8),
                 )
             else:
                 exponent = scores - fx.Vector.from_elements(
                     [fx.Float32(safe_max)], dtype=fx.Float32
-                ).broadcast_to(32)
+                ).broadcast_to(self.token_tiles * 8)
             probs = fx.Vector(fx.exp2(exponent, fastmath="afn"))
             pairs = [
                 fx.Vector.from_elements([probs[k], probs[k + 1]], dtype=fx.Float32)
-                for k in range_constexpr(0, 32, 2)
+                for k in range_constexpr(0, self.token_tiles * 8, 2)
             ]
             while len(pairs) > 1:
                 pairs = [
@@ -1131,7 +1138,7 @@ class Gfx1250Bf16WavePipeline:
                         [probs[16 * s + k] for k in range_constexpr(16)],
                         dtype=fx.Float32,
                     ).to(fx.BFloat16)
-                    for s in range_constexpr(2)
+                    for s in range_constexpr(self.token_tiles // 2)
                 ]
             )
             next_state.append([new_max, state[m * stride + 1] * corr + tile_sum])
@@ -1144,17 +1151,20 @@ class Gfx1250Bf16WavePipeline:
                 ]
             )
         for d in range_constexpr(t.head_dim // 16):
-            for s in range_constexpr(2):
+            for s in range_constexpr(self.token_tiles // 2):
                 v = self._operand(
                     vbase,
                     t.k_bytes + 4 * self.v_chunk * s + 256 * d,
                     self.v_chunk,
                 )
-                for m in range_constexpr(2):
+                for m in range_constexpr(self.query_tiles):
                     outs[m][d] = Gfx1250Gemm.mma(
                         v, p_operands[m][s], outs[m][d], 32, True
                     )
-        return next_state[0] + outs[0] + next_state[1] + outs[1]
+        result = []
+        for m in range_constexpr(self.query_tiles):
+            result.extend(next_state[m] + outs[m])
+        return result
 
     @flyc.jit
     def run(self):
@@ -1345,6 +1355,219 @@ class Gfx1250Bf16WavePipeline:
                 if const_expr(not direct):  # noqa: SIM102
                     if ctx.half == 0:
                         row_max = final[0] * fx.Float32(1.0 / LOG2E)
+                        if const_expr(t.merge_partitions):
+                            self.merge.publish(
+                                fx.add_offset(pmax, partial_row), row_max
+                            )
+                            self.merge.publish(fx.add_offset(psum, partial_row), denom)
+                        else:
+                            pmax[partial_row] = row_max
+                            psum[partial_row] = denom
+
+        if const_expr(t.merged_output):
+            if ctx.task_count == 1:
+                store(True)
+            else:
+                store(False)
+                if const_expr(t.merge_partitions):
+                    self.merge.arrive()
+        else:
+            store(t.direct_output)
+
+
+class Gfx1250Bf16DecodePipeline(Gfx1250Bf16WavePipeline):
+    """Four waves keep disjoint 32-token softmax states for one D128 Q tile.
+
+    Each wave forms P and accumulates all head dimensions in registers. The
+    unused page buffer merges those states once at the end, instead of
+    exchanging maxima and probabilities across waves on every page.
+    """
+
+    @flyc.jit
+    def run(self):
+        ctx, t = self.ctx, self.t
+        ctx.tid = fx.Int32(gpu.thread_id("x"))
+        ctx.warp, ctx.lane = ctx.tid // t.WAVE, ctx.tid % t.WAVE
+        ctx.lane16, ctx.half = ctx.lane % 16, ctx.lane // 16
+        ctx.kv_h = fx.Int32(gpu.block_id("y")) // t.query_splits
+        ctx.query_begin = (fx.Int32(gpu.block_id("y")) % t.query_splits) * (
+            t.query_length // t.query_splits
+        )
+        self.mem.allocate()
+        begin, end = (
+            ctx.planned_start * KV_COMPUTE_BLOCK,
+            ctx.planned_end * KV_COMPUTE_BLOCK,
+        )
+        self.mem.stage_bf16_page(begin, fx.Int32(0))
+        row = ctx.lane16
+        query = fx.recast_iter(t.q_dtype, ctx.query_ptr)
+        qbase = (
+            fx.Int64(ctx.planned_seq) * t.query_length
+            + ctx.query_begin
+            + row // t.query_group_size
+        ) * ctx.stride_q_row + (
+            ctx.kv_h * t.query_group_size + row % t.query_group_size
+        ) * ctx.stride_q_head
+        operands = []
+        for d in range_constexpr(t.head_dim // 32):
+            values = []
+            for j in range_constexpr(2):
+                fragment = fx.Vector.filled(8, 0.0, fx.BFloat16)
+                if row < t.rows:
+                    fragment = fx.Vector(
+                        fx.ptr_load(
+                            fx.add_offset(
+                                query, qbase + d * 32 + ctx.half * 8 + j * 16
+                            ),
+                            result_type=fx.Vector.make_type(8, t.q_dtype),
+                        )
+                    ).to(fx.BFloat16)
+                values.extend([fragment[i] for i in range_constexpr(8)])
+            operands.append(fx.Vector.from_elements(values, dtype=fx.BFloat16))
+        if begin + 128 < end:
+            self.mem.stage_bf16_page(begin + 128, fx.Int32(1))
+        unmasked_end = ctx.planned_context - t.query_length + ctx.query_begin + 1
+        upper = unmasked_end + row // t.query_group_size - 8 * ctx.half - 32 * ctx.warp
+        pages = (end - begin) // 128
+        split = (
+            begin
+            + fx.max(fx.min((unmasked_end - begin) // 128, pages), fx.Int32(0)) * 128
+        )
+        kbase = t.q_bytes + ctx.half * self.k_chunk + ctx.lane16 * 16 + ctx.warp * 512
+        vbase = (
+            t.q_bytes
+            + ctx.half * self.v_chunk
+            + ctx.lane16 * 16
+            + ctx.warp * 4 * self.v_chunk
+        )
+        bases = ((kbase, kbase + t.kv_stride), (vbase, vbase + t.kv_stride))
+        initial = [fx.Float32(float("-inf")), fx.Float32(0.0)]
+        initial.extend(
+            [
+                fx.Vector.filled(8, 0.0, fx.Float32)
+                for _ in range_constexpr(t.head_dim // 16)
+            ]
+        )
+        head, head_state = begin, initial
+        if const_expr(t.sliding_window > 0):
+            window_begin = (
+                ctx.planned_context
+                - t.query_length
+                + ctx.query_begin
+                + t.query_length // t.query_splits
+                - t.sliding_window
+            )
+            head = (
+                begin
+                + fx.max(
+                    fx.min((window_begin - begin + 127) // 128, pages), fx.Int32(0)
+                )
+                * 128
+            )
+            split = fx.max(split, head)
+            for token_i, state in range(begin, head, 128, init=initial):
+                next_state = self._page(
+                    fx.Int32(token_i),
+                    begin,
+                    end,
+                    state,
+                    [operands],
+                    [upper],
+                    bases,
+                    True,
+                )
+                head_state = yield next_state
+        for token_i, state in range(head, split, 128, init=head_state):
+            next_state = self._page(
+                fx.Int32(token_i), begin, end, state, [operands], [upper], bases, False
+            )
+            interior = yield next_state
+        for token_i, state in range(split, end, 128, init=interior):
+            next_state = self._page(
+                fx.Int32(token_i), begin, end, state, [operands], [upper], bases, True
+            )
+            final = yield next_state
+
+        # The other page buffer has no outstanding copies or readers now.
+        area = (1 - fx.max(pages - 1, fx.Int32(0)) % 2) * t.kv_stride
+        slot_bytes = (t.head_dim // 16) * t.WAVE * 32 + t.WAVE * 8
+        stats = (t.head_dim // 16) * t.WAVE * 32 + ctx.lane * 8
+        outgoing = area + ctx.warp * slot_bytes
+        for d in range_constexpr(t.head_dim // 16):
+            self.mem.store(
+                outgoing + (d * t.WAVE + ctx.lane) * 32, final[2 + d], fx.Float32
+            )
+        self.mem.store(
+            outgoing + stats,
+            fx.Vector.from_elements([final[0], final[1]], dtype=fx.Float32),
+            fx.Float32,
+        )
+        gpu.barrier()
+        states = [
+            self.mem.load(area + w * slot_bytes + stats, fx.Float32, 2)
+            for w in range_constexpr(t.NWARP)
+        ]
+        maximum = fx.Float32(float("-inf"))
+        for w in range_constexpr(t.NWARP):
+            maximum = fx.maxnumf(maximum, fx.Float32(states[w][0]))
+        safe_max = (maximum > fx.Float32(float("-inf"))).select(
+            maximum, fx.Float32(0.0)
+        )
+        weights = [
+            fx.Float32(fx.exp2(fx.Float32(states[w][0]) - safe_max, fastmath="afn"))
+            for w in range_constexpr(t.NWARP)
+        ]
+        denom = fx.Float32(0.0)
+        for w in range_constexpr(t.NWARP):
+            denom = denom + fx.Float32(states[w][1]) * weights[w]
+        inv = fx.Float32(rcp_f32((denom > 0.0).select(denom, fx.Float32(1.0))))
+        slot = fx.Int64(ctx.kv_h) * fx.Int64(ctx.capacity) + fx.Int64(ctx.task_slot)
+        output_row = ctx.query_begin * t.query_group_size + row
+        partial_row = slot * (t.rows * t.query_splits) + output_row
+
+        def store(direct):
+            pout = fx.recast_iter(
+                t.q_dtype,
+                ctx.output_ptr if t.merged_output and direct else ctx.pout_ptr,
+            )
+            pmax = fx.recast_iter(fx.Float32, ctx.pmax_ptr)
+            psum = fx.recast_iter(fx.Float32, ctx.psum_ptr)
+            if row < t.rows:
+                for j in range_constexpr(2):
+                    d = ctx.warp * 2 + j
+                    result = fx.Vector.filled(8, 0.0, fx.Float32)
+                    for w in range_constexpr(t.NWARP):
+                        result = result + self.mem.load(
+                            area + w * slot_bytes + (d * t.WAVE + ctx.lane) * 32,
+                            fx.Float32,
+                            8,
+                        ) * fx.Vector.from_elements(
+                            [weights[w]], dtype=fx.Float32
+                        ).broadcast_to(
+                            8
+                        )
+                    value = (
+                        result
+                        * fx.Vector.from_elements([inv], dtype=fx.Float32).broadcast_to(
+                            8
+                        )
+                    ).to(t.q_dtype)
+                    dim = ctx.warp * 32 + j * 16 + ctx.half * 8
+                    target = fx.add_offset(
+                        pout,
+                        (
+                            self.merge.output_offset(output_row, dim)
+                            if direct
+                            else partial_row * t.head_dim + dim
+                        ),
+                    )
+                    if const_expr(t.merge_partitions and not direct):
+                        self.merge.publish(target, value)
+                    else:
+                        fx.ptr_store(value, target)
+                if const_expr(not direct):  # noqa: SIM102
+                    if ctx.warp == 0 and ctx.half == 0:
+                        row_max = maximum * fx.Float32(1.0 / LOG2E)
                         if const_expr(t.merge_partitions):
                             self.merge.publish(
                                 fx.add_offset(pmax, partial_row), row_max

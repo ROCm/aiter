@@ -72,6 +72,7 @@ from .pa_decode.op_merge import (
     Gfx1250ClusterMerge,
 )
 from .pa_decode.pipeline import (
+    Gfx1250Bf16DecodePipeline,
     Gfx1250Bf16Pipeline,
     Gfx1250Bf16WavePipeline,
     Gfx1250Pipeline,
@@ -735,7 +736,9 @@ def compile_gfx1250_pa_decode(
             if const_expr(t.cluster_merge):
                 ctx.task_count = count
                 ctx.output_ptr = output
-            if const_expr(t.bf16_wave_query_tiles):
+            if const_expr(t.bf16_decode_wave):
+                Gfx1250Bf16DecodePipeline(ctx).run()
+            elif const_expr(t.bf16_wave_query_tiles):
                 Gfx1250Bf16WavePipeline(ctx).run()
             elif const_expr(t.bf16_page128_packed):
                 Gfx1250Bf16Pipeline(ctx).run()
@@ -828,7 +831,7 @@ def compile_gfx1250_pa_decode(
         )
 
     llvm_options = {}
-    if t.bf16_wave_query_tiles:
+    if t.bf16_wave_query_tiles or t.bf16_decode_wave:
         # Iterative ILP scheduling leaves fewer VGPR bank switches per page.
         llvm_options["amdgpu-sched-strategy"] = "iterative-ilp"
     if not t.merged_output:
