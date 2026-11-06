@@ -30,7 +30,6 @@ from .sparse_prefill_common import (
     _load_lds,
     _maximum,
     _mfma,
-    _mfma32,
     _min,
     _pack_bf16,
     _pack_bf16_950,
@@ -486,10 +485,11 @@ def _qk950(q, k0, k1):
     acc = [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(2)]
     for step, segment in QK950:
         words = _qk_words950(step)
-        acc[segment] = _mfma32(
+        acc[segment] = _mfma(
             fx.Vector.from_elements([keys[segment][i] for i in words], fx.Int32),
             fx.Vector.from_elements([q[i] for i in words], fx.Int32),
             acc[segment],
+            32,
         )
     return acc[0], acc[1]
 
@@ -506,7 +506,7 @@ def _pv950(p, values, output):
         a = fx.Vector.from_elements(
             [values[segment][word] for segment, word in _pv_words950(n)], fx.Int32
         )
-        acc.append(_mfma32(a, p, c))
+        acc.append(_mfma(a, p, c, 32))
     rocdl.s_setprio(0)
     return fx.Vector.from_elements(
         [acc[n][i] for n in range(8) for i in range(4)], fx.Float32

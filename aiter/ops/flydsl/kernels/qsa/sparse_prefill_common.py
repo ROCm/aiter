@@ -234,16 +234,19 @@ def _exp(value):
     return fx.Float32(rocdl.exp2(fx.Float32.ir_type, fx.Float32(value).ir_value()))
 
 
-def _mfma(a, b, c):
-    """One 16x16x16 BF16 MFMA on register vectors: a/b hold 4 BF16 bit patterns, c 4 FP32."""
-    frag_a = fx.make_rmem_tensor(4, fx.BFloat16)
-    frag_b = fx.make_rmem_tensor(4, fx.BFloat16)
+def _mfma(a, b, c, depth=16):
+    """One 16x16xdepth BF16 MFMA on register vectors (depth 32: gfx950): a/b hold
+    depth // 4 BF16 values, their bit patterns or their words, c 4 FP32."""
+    frags = []
+    for value in (a, b):
+        value = fx.Vector(value)
+        frag = fx.make_rmem_tensor(depth // 4, fx.BFloat16)
+        frag.store(value if value.dtype is fx.BFloat16 else value.bitcast(fx.BFloat16))
+        frags.append(frag)
     frag_c = fx.make_rmem_tensor(4, fx.Float32)
-    frag_a.store(fx.Vector(a).bitcast(fx.BFloat16))
-    frag_b.store(fx.Vector(b).bitcast(fx.BFloat16))
     frag_c.store(fx.Vector(c))
-    mma = fx.make_mma_atom(rocdl.MFMA(16, 16, 16, fx.BFloat16))
-    fx.gemm(mma, frag_c, frag_a, frag_b, frag_c)
+    mma = fx.make_mma_atom(rocdl.MFMA(16, 16, depth, fx.BFloat16))
+    fx.gemm(mma, frag_c, frags[0], frags[1], frag_c)
     return fx.Vector(frag_c.load())
 
 
@@ -799,21 +802,6 @@ def _load_lds_tr(storage, address, immediate=0):
     return fx.Vector(data.load()).bitcast(fx.Int32)
 
 
-def _mfma32(a, b, c):
-    """One 16x16x32 BF16 MFMA (gfx950) on register vectors: a/b hold 8 BF16 values (or their 4 words), c 4 FP32."""
-    frags = []
-    for value in (a, b):
-        value = fx.Vector(value)
-        frag = fx.make_rmem_tensor(8, fx.BFloat16)
-        frag.store(value.bitcast(fx.BFloat16) if value.dtype.width == 32 else value)
-        frags.append(frag)
-    frag_c = fx.make_rmem_tensor(4, fx.Float32)
-    frag_c.store(fx.Vector(c))
-    mma = fx.make_mma_atom(rocdl.MFMA(16, 16, 32, fx.BFloat16))
-    fx.gemm(mma, frag_c, frags[0], frags[1], frag_c)
-    return fx.Vector(frag_c.load())
-
-
 def _pack_bf16_950(values):
     """_pack_bf16 with v_cvt_pk_bf16_f32 (round to nearest even): element i in the low half."""
     values = fx.Vector(values)
@@ -889,7 +877,7 @@ def _pv950(
             a = fx.Vector.from_elements(
                 [raw[i] for i in _pv950_words(step, n)], fx.Int32
             )
-            acc[n] = _mfma32(a, b, acc[n])
+            acc[n] = _mfma(a, b, acc[n], 32)
         if center is not None:
             if step == 0:
                 new_max, ballot = _new_max(center)
