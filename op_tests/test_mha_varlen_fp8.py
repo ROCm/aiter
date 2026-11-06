@@ -16,7 +16,7 @@ from aiter.test_mha_common import (
     attention_ref,
     generate_qkv,
     generate_random_padding_mask,
-    unsupported_fp8_mha_head_pair,
+    run_fp8_mha_or_skip,
 )
 
 benchmark = {}
@@ -153,11 +153,6 @@ def test_flash_attn_varlen_output(
     local,
     return_lse=False,
 ):
-    skip = unsupported_fp8_mha_head_pair(
-        d, d_v, nheads, nheads_k, seqlen_q, varlen=True, return_lse=return_lse
-    )
-    if skip:
-        pytest.skip(skip)
     torch.random.manual_seed(0)
     torch.cuda.empty_cache()
     window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
@@ -215,21 +210,23 @@ def test_flash_attn_varlen_output(
     k_quant, k_descale = per_tensor_quant(k, quant_dtype=quant_dtype)
     v_quant, v_descale = per_tensor_quant(v, quant_dtype=quant_dtype)
 
-    quant_result, us_quant_fwd = run_ck(
-        q_quant,
-        k_quant,
-        v_quant,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        max_seqlen_q,
-        max_seqlen_k,
-        min_seqlen_q,
-        causal,
-        window_size,
-        q_descale,
-        k_descale,
-        v_descale,
-        return_lse,
+    quant_result, us_quant_fwd = run_fp8_mha_or_skip(
+        lambda: run_ck(
+            q_quant,
+            k_quant,
+            v_quant,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            min_seqlen_q,
+            causal,
+            window_size,
+            q_descale,
+            k_descale,
+            v_descale,
+            return_lse,
+        )
     )
     if return_lse:
         out, lse = quant_result
