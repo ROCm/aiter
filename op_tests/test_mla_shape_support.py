@@ -617,12 +617,11 @@ def test_decode_follows_the_planned_cp_mode(monkeypatch):
         )
         assert bool(folds) is folded, (plan_cprr, folds)
         _assert_matches_cprr_reference(out, lse, inputs, msq, cp_rank)
-    # A copy has no recorded mode: fail closed under CP, the default plan without.
+    # A copy has no recorded mode, so either plan could be wrong: fail closed.
     with pytest.raises(ValueError, match="no recorded is_cp_round_robin"):
         _run_decode(96, msq, "fp8", True, cp_rank=cp_rank, meta_view=torch.clone)
-    folds.clear()
-    _run_decode(96, msq, "fp8", True, plan_cprr=False, meta_view=torch.clone)
-    assert folds
+    with pytest.raises(ValueError, match="no recorded is_cp_round_robin"):
+        _run_decode(96, msq, "fp8", True, plan_cprr=False, meta_view=torch.clone)
     with pytest.raises(ValueError, match="is_cp_round_robin=True but g_kv_indptr"):
         _run_decode(96, msq, "fp8", True, plan_cprr=True)
 
@@ -630,8 +629,9 @@ def test_decode_follows_the_planned_cp_mode(monkeypatch):
 def test_planned_cp_mode_is_recorded_per_buffer(monkeypatch):
     # get_mla_metadata_v1 records is_cp_round_robin per work_metadata_ptrs buffer:
     # views see it and copy.deepcopy (the perf harness's rotated args) snapshots
-    # it; a clone, or another buffer carved from the same storage, has none; a
-    # failed replan forgets it, for every view of the buffer.
+    # it, for views of the snapshot too; a clone, a deep copy of a view, or
+    # another buffer carved from the same storage, has none; a failed replan
+    # forgets it, for every view of the buffer.
     monkeypatch.setattr(attention, "_get_mla_metadata_v1_impl", lambda *a, **k: None)
     workspace = torch.zeros(4, dtype=torch.uint64)
     wmd, other = workspace[:2], workspace[2:]
@@ -650,7 +650,9 @@ def test_planned_cp_mode_is_recorded_per_buffer(monkeypatch):
     assert _mla_planned_cp_round_robin(wmd[:]) is True
     assert _mla_planned_cp_round_robin(wmd.view(torch.int64)) is True
     assert _mla_planned_cp_round_robin(snapshot) is True
+    assert _mla_planned_cp_round_robin(snapshot[:]) is True
     assert _mla_planned_cp_round_robin(wmd.clone()) is None
+    assert _mla_planned_cp_round_robin(copy.deepcopy(wmd[:])) is None
     assert _mla_planned_cp_round_robin(other) is None
     plan(other, False)
     assert _mla_planned_cp_round_robin(other) is False
@@ -694,10 +696,14 @@ def test_decode_update_rejects_cp_metadata_only_where_cp_changes_the_head_plan()
             False,
             False,
         ]
-    for n, msq in shapes:
+    # A clone has no recorded mode, so it fails closed on the same shapes.
+    for (n, msq), clone in itertools.product(shapes, (False, True)):
         _, _, meta = _run_planner(bs, msq, n, qd, qd, cp_rank=0)
+        if clone:
+            meta = (meta[0].clone(), *meta[1:])
         qo, kv_indptr, last = _indptrs(bs, msq, cp_rank=0)
         rejected = _cp_changes_head_fold(n, msq)
+        why = "no recorded is_cp_round_robin" if clone else "is_cp_round_robin=True"
         try:
             decode_update_mla_metadata_v1(
                 *(qo, kv_indptr, last, n, 1, True, *meta),
@@ -707,9 +713,9 @@ def test_decode_update_rejects_cp_metadata_only_where_cp_changes_the_head_plan()
             )
             torch.cuda.synchronize()
         except ValueError as e:
-            assert rejected and "is_cp_round_robin=True" in str(e), (n, msq, e)
+            assert rejected and why in str(e), (n, msq, clone, e)
         else:
-            assert not rejected, (n, msq)
+            assert not rejected, (n, msq, clone)
 
 
 @requires_gpu

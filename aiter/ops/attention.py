@@ -2477,7 +2477,7 @@ def _get_mla_metadata_v1_impl(
             it. The mode is recorded with work_metadata_ptrs (views and deep copies
             keep it) and mla_decode_fwd runs the head plan it records. Where the mode
             changes the plan, mla_decode_fwd raises ValueError on a buffer without a
-            record (a clone) given g_kv_indptr, and on CP-planned metadata without it.
+            record (a clone), and on CP-planned metadata without g_kv_indptr.
         mla_version: MLA kernel version (default V32).
         dtype_q_nope / dtype_kv_nope: Q/KV NoPE dtypes. None -> bf16 (C++ default).
         dtype_q_rope / dtype_kv_rope: Q/KV RoPE dtypes. None -> the matching NoPE dtype.
@@ -2509,8 +2509,9 @@ class _MlaPlannedCp:
     """The is_cp_round_robin get_mla_metadata_v1 planned a work_metadata_ptrs with.
 
     One cell per buffer, kept on its storage (keyed by data pointer, so views
-    share it) and on the planned tensor (so copy.deepcopy snapshots it). A clone
-    or copy_ into another buffer has none: its mode reads as unknown (None).
+    share it) and on the planned tensor (so copy.deepcopy snapshots it, and a
+    view of the snapshot finds it on its base). A clone or copy_ into another
+    buffer has none: its mode reads as unknown (None).
     """
 
     def __init__(self) -> None:
@@ -2527,7 +2528,12 @@ def _mla_planned_cp_cell(
     cells = getattr(storage, _MLA_PLANNED_CP_ATTR, None)
     cell = None if cells is None else cells.get(work_metadata_ptrs.data_ptr())
     if not create:
-        return cell or getattr(work_metadata_ptrs, _MLA_PLANNED_CP_ATTR, None)
+        base = work_metadata_ptrs._base
+        return (
+            cell
+            or getattr(work_metadata_ptrs, _MLA_PLANNED_CP_ATTR, None)
+            or getattr(base, _MLA_PLANNED_CP_ATTR, None)
+        )
     if cells is None:
         cells = {}
         setattr(storage, _MLA_PLANNED_CP_ATTR, cells)
@@ -2817,9 +2823,10 @@ def decode_update_mla_metadata_v1(
     Update MLA metadata incrementally for decode steps where the batch
     composition has not changed. It will also convert qlen > 1 to qlen = 1.
     Every request's KV grows by 1 - num_reject_tokens (default 1) tokens.
-    The head plan is the one without round-robin CP, so it raises ValueError on
-    metadata get_mla_metadata_v1 planned with is_cp_round_robin=True where CP
-    changes that plan (96 fp8 heads at qlen 7 and 8 on gfx950).
+    The head plan is the one without round-robin CP, so where CP changes that
+    plan (96 fp8 heads at qlen 7 and 8 on gfx950) it raises ValueError on
+    metadata get_mla_metadata_v1 planned with is_cp_round_robin=True, and on
+    metadata with no recorded mode (a clone).
     """
     assert kv_granularity % page_size == 0
     assert num_heads_k == 1
@@ -2832,14 +2839,20 @@ def decode_update_mla_metadata_v1(
     head_plan = _mla_metadata_head_plan(
         *plan_args, fast_mode=True, intra_batch_mode=False
     )
-    if _mla_planned_cp_round_robin(work_metadata_ptrs):
+    planned_cprr = _mla_planned_cp_round_robin(work_metadata_ptrs)
+    if planned_cprr is not False:
         cp_plan = _mla_metadata_head_plan(
             *plan_args, fast_mode=True, intra_batch_mode=False, cp_round_robin=True
         )
         if _mla_head_fold(cp_plan) != _mla_head_fold(head_plan):
+            planned = (
+                "with no recorded is_cp_round_robin (a clone)"
+                if planned_cprr is None
+                else "with is_cp_round_robin=True"
+            )
             raise ValueError(
-                "decode_update_mla_metadata_v1 cannot update metadata planned with "
-                f"is_cp_round_robin=True for {num_heads_per_head_k} heads at "
+                "decode_update_mla_metadata_v1 cannot update metadata planned "
+                f"{planned} for {num_heads_per_head_k} heads at "
                 f"max_seqlen_qo={max_seqlen_qo}: CP changes its head plan "
                 f"({'x'.join(map(str, _mla_head_fold(cp_plan)))} planned vs "
                 f"{'x'.join(map(str, _mla_head_fold(head_plan)))} here). "

@@ -1469,10 +1469,8 @@ def mla_decode_fwd(
         )
         # Where round-robin CP changes the head plan (96 fp8 heads at qlen 7 and 8
         # on gfx950), the metadata's planned CP mode decides it, not g_kv_indptr.
-        # Unknown without CP is the default plan; unknown with CP fails closed.
+        # An unknown mode (a clone) fails closed: either plan could be wrong.
         planned_cprr = _mla_planned_cp_round_robin(work_meta_data)
-        if planned_cprr is None and not cp_launch:
-            planned_cprr = False
         if planned_cprr is not cp_launch:
             other, _ = _mla_decode_launch_plan(*plan_shape, not cp_launch, has_scales)
             if _mla_head_fold(other) != _mla_head_fold(head_plan):
