@@ -814,6 +814,23 @@ def _grouped_a8w4_tdm_moe(
         tile_n, n_warp, tile_k, tile_n2, n_warp2, tile_k2 = fitted
     wmma_rep = get_wmma_m_rep(tile_m, tile_n, m_warp, n_warp, "gemm1")
     wmma_rep2 = get_wmma_m_rep(tile_m2, tile_n2, m_warp2, n_warp2, "gemm2")
+    # Whether the A1 quant would take the compact-scale pair: the TP route
+    # gates and the quant dispatch below all ask, so evaluate it once a call.
+    _compact_quant_pair_memo = []
+
+    def _compact_quant_pair() -> bool:
+        if not _compact_quant_pair_memo:
+            _compact_quant_pair_memo.append(
+                _use_fused_quant_preshuffle(
+                    model_dim,
+                    wmma_rep,
+                    "fp4" if data_format == "fp4" else "fp8",
+                    token_num,
+                    topk,
+                )
+            )
+        return _compact_quant_pair_memo[0]
+
     _align_m = max(tile_m, tile_m2)
     # Both GEMMs walk the same contiguous layout, each with its own tile height,
     # so every expert must start on a row that is a multiple of both. Aligning to
@@ -890,13 +907,7 @@ def _grouped_a8w4_tdm_moe(
         and a1_scale is None
         and hidden_states.dtype == torch.bfloat16
         and not _a_preshuffle_requested
-        and not _use_fused_quant_preshuffle(
-            model_dim,
-            wmma_rep,
-            "fp4" if data_format == "fp4" else "fp8",
-            token_num,
-            topk,
-        )
+        and not _compact_quant_pair()
     )
     if _compact:
         _masked_m = stage2_scatter.compact_masked_m
@@ -1197,9 +1208,7 @@ def _grouped_a8w4_tdm_moe(
         and not _prequantized
         and not a_preshuffled
         and _ep_nvr is None
-        and _use_fused_quant_preshuffle(
-            model_dim, wmma_rep, _quant_mode, token_num, topk
-        )
+        and _compact_quant_pair()
     )
     _compact_ascale_buf = None
     _row_to_token = _apre_row_to_token
