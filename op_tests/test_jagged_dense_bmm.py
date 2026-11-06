@@ -5,13 +5,18 @@ from __future__ import annotations
 
 import argparse
 import itertools
+import os
+import tempfile
+from unittest import mock
 
 import pandas as pd
 import torch
 
 import aiter
 from aiter import dtypes
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.core import AITER_CONFIGS
+from aiter.jit.utils.chip_info import get_gfx, get_gfx_custom_op_core
+from aiter.ops.flydsl import jagged_dense_bmm_dispatch as jdbba_dispatch
 from aiter.ops.flydsl.jagged_dense_bmm_dispatch import jagged_dense_bmm_dispatched
 from aiter.ops.flydsl.kernels.jagged_dense_bmm_gen import _LAUNCHERS
 from aiter.test_common import (
@@ -259,8 +264,88 @@ def test_jdbba_seq_offsets_reuse(B, D, Kout, Mi, seed, dtype):
     }
 
 
+_SELECT_B, _SELECT_K, _SELECT_N, _SELECT_MI = 64, 256, 256, 2048
 # Fixed so a new length changes the grid without changing the launcher key.
 _REUSE_XCD = {"xcd_c": 32, "xcd_w": 8, "block_k": 64}
+
+
+def _clear_tuned_cache():
+    jdbba_dispatch._tuned_table.cache_clear()
+    AITER_CONFIGS.get_config_file.cache_clear()
+    get_gfx.cache_clear()
+    get_gfx_custom_op_core.cache_clear()
+
+
+def _selection_csv(path, tiles):
+    rows = (
+        f"gfx950,256,{_SELECT_K},{_SELECT_N},{tiles},48,24,64,120,16,1\n"
+        f"gfx942,304,{_SELECT_K},{_SELECT_N},{tiles},32,16,64,64,8,1\n"
+        f"gfx942,38,{_SELECT_K},{_SELECT_N},{tiles},9,9,64,9,9,1\n"
+    )
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(
+            "gfx,cu_num,K,N,tiles_log2,xcd_c,xcd_w,block_k,skew_xcd_c,skew_xcd_w,us\n"
+        )
+        fh.write(rows)
+
+
+@benchmark()
+def test_jdbba_config_selection(
+    arch, cu_num, num_xcds, regime, gpu_archs, xcd_c, xcd_w, expect_c, expect_w
+):
+    """The live arch owns the tuned row. One XCD with an empty cell is identity.
+
+    ``gpu_archs`` is written to ``GPU_ARCHS`` so a lookup that still calls
+    ``get_gfx()`` selects the other arch and fails. A filled cell still wins
+    over the one-XCD identity fallback. An explicit override still wins over both.
+    """
+    tiles = jdbba_dispatch.tiles_log2(
+        n_groups=_SELECT_B, output_n=_SELECT_N, max_seq_len=_SELECT_MI
+    )
+    prev = {
+        "AITER_CONFIG_JAGGED_DENSE_BMM": os.environ.get(
+            "AITER_CONFIG_JAGGED_DENSE_BMM"
+        ),
+        "GPU_ARCHS": os.environ.get("GPU_ARCHS"),
+        "FLYDSL_JAGGED_DENSE_BMM_ARCH": os.environ.get("FLYDSL_JAGGED_DENSE_BMM_ARCH"),
+    }
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "jagged_dense_bmm_tuned.csv")
+            _selection_csv(path, tiles)
+            os.environ["AITER_CONFIG_JAGGED_DENSE_BMM"] = path
+            os.environ["GPU_ARCHS"] = gpu_archs
+            # Retired per-op arch override. It must not choose a row.
+            os.environ["FLYDSL_JAGGED_DENSE_BMM_ARCH"] = "gfx90a"
+            _clear_tuned_cache()
+            with (
+                mock.patch.object(jdbba_dispatch, "get_gfx_runtime", return_value=arch),
+                mock.patch.object(jdbba_dispatch, "get_cu_num", return_value=cu_num),
+                mock.patch.object(
+                    jdbba_dispatch, "get_num_xcds", return_value=num_xcds
+                ),
+            ):
+                cfg = jdbba_dispatch.resolve_config(
+                    n_groups=_SELECT_B,
+                    reduction_k=_SELECT_K,
+                    output_n=_SELECT_N,
+                    max_seq_len=_SELECT_MI,
+                    uniform_seqlen=regime == "uniform",
+                    xcd_c=xcd_c,
+                    xcd_w=xcd_w,
+                )
+    finally:
+        for name, value in prev.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        _clear_tuned_cache()
+    assert (cfg["xcd_c"], cfg["xcd_w"]) == (expect_c, expect_w), (
+        f"{arch} cu={cu_num} xcds={num_xcds} {regime} selected "
+        f"{cfg['xcd_c']},{cfg['xcd_w']} instead of {expect_c},{expect_w}"
+    )
+    return {"xcd_c": cfg["xcd_c"], "xcd_w": cfg["xcd_w"], "block_k": cfg["block_k"]}
 
 
 @benchmark()
@@ -414,6 +499,21 @@ def main():
     )
     args = parser.parse_args()
     shapes = _expand_shapes(args.shapes, args.batch, parser)
+    rows = []
+    # gpu_archs names the other arch. xcd_c/xcd_w None means no explicit override.
+    for case in (
+        ("gfx950", 256, 8, "uniform", "gfx942", None, None, 48, 24),
+        ("gfx942", 304, 8, "uniform", "gfx950", None, None, 32, 16),
+        ("gfx950", 256, 8, "skew", "gfx942", None, None, 120, 16),
+        ("gfx950", 256, 1, "uniform", "gfx942", None, None, 48, 24),
+        ("gfx950", 256, 1, "skew", "gfx942", None, None, 120, 16),
+        ("gfx950", 38, 1, "uniform", "gfx942", None, None, 1, 1),
+        ("gfx950", 38, 1, "skew", "gfx942", None, None, 1, 1),
+        ("gfx942", 38, 1, "uniform", "gfx950", None, None, 9, 9),
+        ("gfx950", 38, 1, "uniform", "gfx942", 32, 8, 32, 8),
+    ):
+        rows.append(test_jdbba_config_selection(*case))
+    _summarize("jagged_dense_bmm config selection", rows)
     for shape in args.regression_shapes:
         if not isinstance(shape, tuple) or len(shape) != 4:
             parser.error(f"regression shape must be B,D,Kout,Mi; got {shape}")
