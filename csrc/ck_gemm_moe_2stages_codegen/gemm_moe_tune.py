@@ -128,10 +128,10 @@ if TYPE_CHECKING:
     from types import SimpleNamespace
 
     from csrc.ck_gemm_moe_2stages_codegen.mxfp4_staged_search import StagedSearchPlan
+from csrc.ck_gemm_moe_2stages_codegen import mxfp4_v2_tune_utils as _v2u
 from csrc.ck_gemm_moe_2stages_codegen.mxfp4_v2_tune_utils import (
     v2_stage1_sorted_ref as _v2_stage1_ref,
 )
-from csrc.ck_gemm_moe_2stages_codegen import mxfp4_v2_tune_utils as _v2u
 from csrc.opus_moe.opus_moe_common import (
     OPUS_A8W4_GFX950_DECODE_KERNEL_CONTRACT,
     get_opus_a8w4_stage2_kernels,
@@ -8329,8 +8329,8 @@ class Mxfp4FlydslTuner(FmoeTuner):
         whose time does not pick the winner."""
         from aiter.test_common import run_perftest
 
-        ne, h, e = int(row["expert"]), int(row["model_dim"]), int(row["inter_dim"])
-        token, topk = int(row["token"]), int(row["topk"])
+        ne, h = int(row["expert"]), int(row["model_dim"])
+        topk = int(row["topk"])
         dtype = dtypes.bf16
         kn1, kn2 = candidate["kernelName1"], candidate["kernelName2"]
         activation = {
@@ -8843,8 +8843,8 @@ class Mxfp4FlydslTuner(FmoeTuner):
     def _check_reference_pair(
         self, row: dict[str, Any], kn1: str, kn2: str, args: Any
     ) -> bool:
-        ne, h, e = int(row["expert"]), int(row["model_dim"]), int(row["inter_dim"])
-        token, topk = int(row["token"]), int(row["topk"])
+        ne, h = int(row["expert"]), int(row["model_dim"])
+        topk = int(row["topk"])
         activation = {
             "silu": ActivationType.Silu,
             "swiglu": ActivationType.Swiglu,
