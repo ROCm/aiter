@@ -26,6 +26,10 @@ _PLAN_SCAN_LDS_BYTES = 512
 # with 256-token partitions, and 128 tokens would only double the partition
 # bound that selects cluster merges, last-arriver output and the reducer.
 FINE_PARTITION_SLOTS = 16
+# Plans for several query tokens per sequence need more slots: MTP4 tasks cost
+# more per partition, and 128-token partitions paid off only up to three
+# sequences per 512 slots (170 each) at 8K, costing up to 10% at four (128).
+MULTI_QUERY_FINE_PARTITION_SLOTS = 160
 # A 128-token plan gives a sequence 256-token tasks when they number at most
 # this many but its 128-token partitions do not, so it still fits one
 # CLUSTER_PARTITIONS-workgroup cluster as in a 256-token plan.
@@ -37,10 +41,15 @@ def context_partition_sizes(architecture: str) -> tuple[int, ...]:
     return (128, 256) if architecture in ("gfx1250", "gfx1250-strict") else (256,)
 
 
-def default_context_partition_size(architecture: str, batch: int, capacity: int):
+def default_context_partition_size(
+    architecture: str, batch: int, capacity: int, query_length: int = 1
+):
     """Partition size of a new plan with ``capacity`` task slots for ``batch`` rows."""
     sizes = context_partition_sizes(architecture)
-    return sizes[0] if capacity >= FINE_PARTITION_SLOTS * batch else sizes[-1]
+    slots = (
+        MULTI_QUERY_FINE_PARTITION_SLOTS if query_length > 1 else (FINE_PARTITION_SLOTS)
+    )
+    return sizes[0] if capacity >= slots * batch else sizes[-1]
 
 
 def partition_bound(
@@ -82,12 +91,16 @@ def _block_threads(capacity):
 
 
 @cache
-def compile_pa_decode_plan(max_batch, threads, windowed, context_partition_size):
+def compile_pa_decode_plan(
+    max_batch, threads, windowed, context_partition_size, multi_query=False
+):
     """Compile a batch bucket, block size and partition size, dense or windowed.
 
     Actual batch, task capacity, partition cap and window are runtime values.
     The partition size stays a compile-time constant: a runtime shift measured
     up to 2% slower per refresh, and each architecture has at most two sizes.
+    ``multi_query`` marks plans for several query tokens per sequence; it only
+    specializes 128-token plans.
     """
     scan_tiles = fx.coop.BlockScan[fx.Int64, threads]
     scan_counts = fx.coop.BlockScan[fx.Int32, threads]
@@ -107,8 +120,9 @@ def compile_pa_decode_plan(max_batch, threads, windowed, context_partition_size)
         return first, (length + size - 1) // size - first
 
     pairing = context_partition_size < 256
+    busy_pairing = pairing and multi_query
 
-    def split(tiles, lower, upper, max_parts):
+    def split(tiles, lower, upper, max_parts, busy):
         """Return a row's task count from its cumulative slot bounds."""
         # Tiles of an int32 length fit Int32, so clamp the partition cap there.
         count = fx.min(
@@ -121,9 +135,15 @@ def compile_pa_decode_plan(max_batch, threads, windowed, context_partition_size)
             # split below then gives each task at most two partitions.
             tiles = fx.Int32(tiles)
             half = (tiles + 1) // 2
-            paired = ((count >= half) & (count < tiles)) | (
+            fits = count >= half
+            paired = (fits & (count < tiles)) | (
                 (tiles > PAIRED_PARTITION_LIMIT) & (half <= PAIRED_PARTITION_LIMIT)
             )
+            if busy_pairing:
+                # Multi-query tiles cost more per task: once pairs alone reach
+                # a quarter of the slots, single-partition tasks only add
+                # partials (BF16 MTP4 at 8K-32K ran 6-30% slower).
+                paired = paired | (busy & fits)
             count = paired.select(fx.min(count, half), count)
         return count
 
@@ -177,6 +197,7 @@ def compile_pa_decode_plan(max_batch, threads, windowed, context_partition_size)
             thread_tiles, fx.ReductionOp.ADD, storage=tile_storage
         )
         total = fx.max(total, fx.Int64(1))
+        busy = total * 2 >= fx.Int64(capacity)
         remaining = fx.Int64(
             capacity - reduce_rows(thread_rows, fx.ReductionOp.ADD, storage=row_storage)
         )
@@ -189,6 +210,7 @@ def compile_pa_decode_plan(max_batch, threads, windowed, context_partition_size)
                     cumulative * remaining // total,
                     (cumulative + thread_tiles) * remaining // total,
                     max_parts,
+                    busy,
                 )
         else:
             # Each row's lower bound is the previous row's upper bound.
@@ -198,7 +220,7 @@ def compile_pa_decode_plan(max_batch, threads, windowed, context_partition_size)
                 _, tiles = visible_tiles(lengths[seq], window)
                 cumulative = cumulative + tiles
                 upper = cumulative * remaining // total
-                count = split(tiles, lower, upper, max_parts)
+                count = split(tiles, lower, upper, max_parts, busy)
                 lower = upper
                 task_ends[seq] = count
                 thread_tasks = thread_tasks + count
@@ -304,6 +326,7 @@ class PADecodePlan:
                     properties.gcnArchName.split(":", 1)[0],
                     self.reduce_info.shape[0],
                     self.work_info.shape[0],
+                    self.query_length,
                 ),
             )
 
@@ -372,7 +395,9 @@ def plan_pa_decode(
     The budget counts task slots across KV heads before query splitting.
     ``context_partition_size`` is 128 or 256 tokens on gfx1250 and 256 on other
     targets. New gfx1250 plans default to 128 when they have at least
-    FINE_PARTITION_SLOTS task slots per sequence and to 256 otherwise.
+    FINE_PARTITION_SLOTS task slots per sequence, or
+    MULTI_QUERY_FINE_PARTITION_SLOTS with ``query_length > 1``, and to 256
+    otherwise. Pass the decode's ``query_length`` to dense plans as well.
     Omitting it on refresh preserves the existing partition size. A 128-token
     plan gives a sequence 256-token tasks when those already fill its slots
     or fit one cluster where 128-token tasks would not.
@@ -452,7 +477,7 @@ def plan_pa_decode(
         )
         if context_partition_size is None:
             context_partition_size = default_context_partition_size(
-                properties.gcnArchName.split(":", 1)[0], batch, capacity
+                properties.gcnArchName.split(":", 1)[0], batch, capacity, query_length
             )
         plan = PADecodePlan(
             torch.empty((capacity, 4), dtype=torch.int32, device=dev),
@@ -493,6 +518,9 @@ def plan_pa_decode(
             _block_threads(plan.capacity),
             sliding_window > 0,
             plan.context_partition_size,
+            # Only 128-token plans specialize on query tokens; dense refreshes
+            # may omit query_length, so read the plan's.
+            plan.context_partition_size < 256 and plan.query_length > 1,
         )
         _run_compiled(
             launch,

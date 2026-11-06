@@ -448,8 +448,8 @@ def pa_decode(
 
     The work plan sets the context partition size. Plans support 256 tokens on
     all targets and 128 tokens on gfx1250. New gfx1250 plans default to 128
-    when they have at least 16 task slots per sequence and to 256 otherwise;
-    gfx942/gfx950 plans use 256. ``context_partition_size`` may restate the
+    when they have at least 16 task slots per sequence (160 for several query
+    tokens) and to 256 otherwise; gfx942/gfx950 plans use 256. ``context_partition_size`` may restate the
     plan's size.
 
     Supports page sizes 16/64/128. BF16 head dimensions are multiples of 64

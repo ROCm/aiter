@@ -144,7 +144,8 @@ and launches them; every FlyDSL launch is compiled into the cache instead.
   pinned through the wrapper's own overrides.
 - `pa_decode_plan.py` replays `plan_pa_decode` at the largest batch of
   each bucket, at each task capacity where the block size can change, with
-  and without a window, and at each context partition size of the arch.
+  and without a window, at each context partition size of the arch, and for
+  128-token plans with one and with several query tokens.
   Capacity stops at the batch times the CU count, so each arch replays with
   the most CUs any of its devices has.
 - Ops with a Python body behind `torch_compile_guard` run that body under
@@ -231,8 +232,9 @@ python -m aiter.aot.flydsl.fmha_fp8 --shape 12:12:192:128
 The PA decode planner compiles one kernel per batch bucket (1, 2, 4, ...,
 clipped to the arch's LDS), block size (64 to 1024 threads, from the plan's
 task capacity), dense/windowed mode and context partition size (128 and 256
-tokens on gfx1250, 256 elsewhere); batch, capacity, partition cap and window
-are passed at launch, and `max_batch_size` only bounds the batch.
+tokens on gfx1250, 256 elsewhere), and for 128-token plans whether rows hold
+several query tokens; batch, capacity, partition cap and window are passed at
+launch, and `max_batch_size` only bounds the batch.
 `run_aot` replays the whole set up to each arch's LDS limit (16256 on gfx942,
 40832 on gfx950, 81792 on gfx1250), so it serves every `max_batch_size`.
 

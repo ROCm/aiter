@@ -45,8 +45,10 @@ def device(monkeypatch):
         (65, None, None, 0, 1, 100, 128),
         (100, None, None, 0, 1, 100, 128),
         (4097, None, None, 0, 1, 5000, 8192),
-        # 128 task slots per sequence: new gfx1250 plans take 128-token partitions.
+        # Slots per sequence at or above the thresholds: new gfx1250 plans take
+        # 128-token partitions (51 for one query token, 256 for MTP4).
         (5, None, None, 0, 1, None, 8),
+        (1, None, None, 8193, 4, None, 1),
         (3, None, None, 8193, 4, None, 4),
         pytest.param(None, None, None, 0, 1, None, None, id="lds-limit"),
     ],
@@ -117,8 +119,11 @@ def test_pa_decode_plan(
             extra -= prefix_tiles * remaining // total_tiles
             expected = min(int(tiles > 0) + extra, tiles, plan.max_partitions)
             half = (tiles + 1) // 2
+            busy = query_length > 1 and total_tiles * 2 >= plan.capacity
             if size < 256 and (
-                half <= expected < tiles or (tiles > limit and half <= limit)
+                half <= expected < tiles
+                or (tiles > limit and half <= limit)
+                or (busy and half <= expected)
             ):
                 # Pairs of partitions: they fill the slots or fit one cluster.
                 expected = min(expected, half)
@@ -149,14 +154,23 @@ def test_pa_decode_plan(
         query_length=query_length,
     )
     # New and hand-built plans pick the partition size from slots per sequence.
-    default = planner.default_context_partition_size(arch, batch, plan.capacity)
-    assert default == (
-        sizes[0] if plan.capacity >= planner.FINE_PARTITION_SLOTS * batch else 256
+    default = planner.default_context_partition_size(
+        arch, batch, plan.capacity, query_length
     )
+    slots = (
+        planner.MULTI_QUERY_FINE_PARTITION_SLOTS
+        if query_length > 1
+        else planner.FINE_PARTITION_SLOTS
+    )
+    assert default == (sizes[0] if plan.capacity >= slots * batch else 256)
     assert plan.context_partition_size == default
     assert (
         planner.PADecodePlan(
-            plan.work_info, plan.reduce_info, 2, plan.max_partitions
+            plan.work_info,
+            plan.reduce_info,
+            2,
+            plan.max_partitions,
+            query_length=query_length,
         ).context_partition_size
         == default
     )
@@ -179,7 +193,7 @@ def test_pa_decode_plan(
         )
         assert sized.context_partition_size == size
         check(sized, lengths)
-        assert calls[-1][0] == (*config[:3], size)
+        assert calls[-1][0] == (*config[:3], size, size < 256 and query_length > 1)
     if max_batch_size is not None:
         assert plan.max_batch_size == max_batch_size
     pointers = (plan.work_info.data_ptr(), plan.reduce_info.data_ptr())
@@ -216,6 +230,10 @@ def test_pa_decode_plan(
         other_parts = max(2, -(-other_capacity // other_batch))
         assert other_parts != plan.max_partitions
         other_window = window + 256 if window else 0
+        # 128-token plans also specialize on whether rows hold several queries.
+        other_query_length = query_length + 1
+        if plan.context_partition_size < 256 and query_length == 1:
+            other_query_length = 1
         values = [pattern[i % len(pattern)] for i in range(other_batch)]
         other_context = torch.tensor(values, dtype=torch.int32, device=device)
         other_plan = planner.plan_pa_decode(
@@ -226,7 +244,7 @@ def test_pa_decode_plan(
             workgroup_budget=2 * other_capacity,
             context_partition_size=plan.context_partition_size,
             sliding_window=other_window,
-            query_length=query_length + 1,
+            query_length=other_query_length,
         )
         assert other_plan.capacity == other_capacity
         check(other_plan, values)
