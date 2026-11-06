@@ -2033,6 +2033,8 @@ class LargeMRuntime:
         self.w2 = w2
         self.w2_scale = w2_scale
         self._build_fused_stage1(w1, w1_scale)
+        self._quant_x = torch.empty((self.mtpr, self.model_dim), dtype=torch.float8_e4m3fn, device=self.dev)
+        self._quant_scale = torch.empty((self.mtpr, self._s1_scale_dim), dtype=torch.uint8, device=self.dev)
         self._build_stage2_invariants()
         self._allocate_fused_counters()
         self.select_layer_state(0)
@@ -2419,9 +2421,13 @@ class LargeMRuntime:
         if any(t.device != self.dev for t in (x_bf16, wts, topk_ids)):
             # A rank that faults on a foreign pointer would leave its peers waiting.
             raise ValueError(f"x_bf16, wts and topk_ids must be on {self.dev}")
-        # The quant kernel runs on the launch stream, ahead of the persistent kernel.
-        with torch.cuda.stream(_torch_stream(stream)):
-            x_q, scales = self.quantize(x_bf16)
+        # The quant kernel runs on the launch stream, ahead of the persistent kernel
+        # that reads its output, into the runtime's own buffers (no allocation).
+        x_q = self._quant_x[:run_tokens]
+        scales = self._quant_scale[:run_tokens]
+        if run_tokens:
+            with torch.cuda.stream(_torch_stream(stream)):
+                per_1x32_mx_quant(x_bf16, quant_mode="fp8", out=(x_q, scales))
         return self._run_joint(x_q, scales, wts, topk_ids, run_tokens, stream, slice_output)
 
     def forward_prequant(self, x_q, scales, wts, topk_ids, *, stream=None, slice_output=True):

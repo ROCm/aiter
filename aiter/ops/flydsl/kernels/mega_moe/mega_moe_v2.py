@@ -1068,6 +1068,11 @@ class MegaMoEV2:
         ``max_tokens``: rows of this call on its largest EP rank, counting graph
         padding, passed identically on every rank; it selects the route. None
         plans for the instance capacity.
+
+        The output is a view of the route's combine buffer, valid until the next
+        call. ``slice_output=False`` returns the whole buffer: as many rows as
+        the route's capacity (the instance MTPR, or the small-input capacity the
+        route took), of which rows past this rank's own are undefined.
         """
         route = self._route(int(x_bf16.shape[0]), max_tokens)
         return self._forward_route(
@@ -1113,7 +1118,19 @@ class MegaMoEV2:
                 x_bf16, wts, topk_ids, stream=stream, slice_output=slice_output
             )
         if self._s1_fixed_slot:
-            x_q, scales = self.quantize(x_bf16)
+            # Into the instance's own buffers (compact prepare quantizes in place):
+            # a forward allocates nothing.
+            x_q = self._s1_quant_x[:run_tokens]
+            scales = self._s1_quant_scale[:run_tokens]
+            if run_tokens:
+                per_1x32_mx_quant(
+                    x_bf16,
+                    quant_mode=self._a_dtype,
+                    out=(
+                        x_q.view(torch.uint8) if self._a_dtype == "fp4" else x_q,
+                        scales,
+                    ),
+                )
             return self._run_joint(
                 x_q, scales, wts, topk_ids, run_tokens, stream, slice_output,
                 mask_invalid_slots=mask_invalid_slots,
