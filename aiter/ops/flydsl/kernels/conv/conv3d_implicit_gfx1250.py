@@ -392,6 +392,8 @@ def compile_conv3d_implicit_gfx1250(param: Conv3dImplicitParam1250):
         and param.k % 8 == 0
         and grid.kg % 8 == 0
     )
+    # The bias read only needs the 8 columns aligned and in or out together.
+    VEC_BIAS = not use_splitk and grid.kg % 8 == 0
 
     if const_expr(param.dyn_hw):
         extra_args = dyn_shape_values_gfx1250(param, geom, grid)
@@ -452,7 +454,7 @@ def compile_conv3d_implicit_gfx1250(param: Conv3dImplicitParam1250):
             bias_div = fx.logical_divide(bias_buf, fx.make_layout(1, 1))
             bias_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
             bias_reg = fx.make_rmem_tensor(1, fx.Float32)
-            if const_expr(VEC_EPILOGUE):
+            if const_expr(VEC_BIAS):
                 bias_quads = fx.logical_divide(bias_buf, fx.make_layout(4, 1))
                 bias4_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Float32)
 
@@ -478,7 +480,7 @@ def compile_conv3d_implicit_gfx1250(param: Conv3dImplicitParam1250):
 
         def store_accs(final_accs):
             k_out = param.k
-            if const_expr(apply_bias and VEC_EPILOGUE):
+            if const_expr(apply_bias and VEC_BIAS):
                 bias_vecs = [bias_for(wn) for wn in range_constexpr(wmma_n_rep)]
             for wm in range_constexpr(wmma_m_rep):
                 local_m = warp_m_base + wm * WMMA_M + lane16
@@ -489,7 +491,7 @@ def compile_conv3d_implicit_gfx1250(param: Conv3dImplicitParam1250):
                     col_off0 = warp_n_base + wn * WMMA_N + lane_kgrp * 8
                     col_base = n_offset + col_off0
                     acc = fx.Vector(final_accs[wm * wmma_n_rep + wn])
-                    if const_expr(apply_bias and VEC_EPILOGUE):
+                    if const_expr(apply_bias and VEC_BIAS):
                         acc = acc + bias_vecs[wn]
                     elif apply_bias:
                         bias_elems = []
