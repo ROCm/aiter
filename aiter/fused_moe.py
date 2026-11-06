@@ -12,6 +12,7 @@ import torch
 import aiter
 
 # from aiter import get_torch_quant as get_quant
+from aiter.utility.env_once import env_once
 from aiter import (
     ActivationType,
     QuantType,
@@ -956,7 +957,7 @@ def _stage2_uses_fp8_route_output(
 ) -> bool:
     """Return whether runtime reduce output uses packed FP8 value/scale rows."""
     if stage2_fp8 is None:
-        stage2_fp8 = os.environ.get("AITER_FLYDSL_STAGE2_FP8", "0") == "1"
+        stage2_fp8 = env_once("AITER_FLYDSL_STAGE2_FP8", "0") == "1"
     if not stage2_fp8 or return_per_slot:
         return False
     if not _stage2_honors_runtime_reduce_override(stage2):
@@ -1069,7 +1070,7 @@ def resolve_activation_dtype(
         and has_a1_scale
     ):
         q_dtype_a = dtypes.fp8
-    bf16_fp8_bound = int(os.environ.get("AITER_BF16_FP8_MOE_BOUND", "256"))
+    bf16_fp8_bound = int(env_once("AITER_BF16_FP8_MOE_BOUND", "256"))
     if quant_type == QuantType.per_1x32 and q_dtype_w == dtypes.i4x2:
         # a16wi4: bf16 activations, int4 weights with groupwise scale
         q_dtype_a = dtypes.bf16
@@ -1084,9 +1085,9 @@ def resolve_activation_dtype(
             # (kimik3_{a8w4,a4w4}_tuned_fmoe.csv). Tested before the INTERLEAVE
             # branch below, which would otherwise claim SiTUv2 and pick the
             # activation dtype itself.
-            if os.environ.get("AITER_SITUV2_A8W4", "0") == "1":
+            if env_once("AITER_SITUV2_A8W4", "0") == "1":
                 q_dtype_a = dtypes.fp8
-            elif os.environ.get("AITER_SITUV2_A4W4", "0") == "1":
+            elif env_once("AITER_SITUV2_A4W4", "0") == "1":
                 q_dtype_a = dtypes.fp4x2
             else:
                 q_dtype_a = dtypes.bf16
@@ -1105,7 +1106,7 @@ def resolve_activation_dtype(
             q_dtype_a = dtypes.fp4x2
 
     if gfx == "gfx1250":
-        if os.environ.get("AITER_FORCE_A8W4", "0") in ("1"):
+        if env_once("AITER_FORCE_A8W4", "0") in ("1"):
             q_dtype_a = dtypes.fp8
         else:
             q_dtype_a = dtypes.fp4x2

@@ -9,6 +9,7 @@ import re
 
 import torch
 
+from aiter.utility.env_once import clear_with_env_once, env_once
 from aiter.ops.flydsl.kernels.tensor_shim import (
     _run_compiled as _dispatch_compiled,
 )
@@ -125,9 +126,9 @@ def resolve_flydsl_stage2_mode(
 ) -> str:
     """Resolve runtime reduce overrides shared by sorting and stage 2."""
     if force_reduce is None:
-        force_reduce = os.environ.get("AITER_FLYDSL_FORCE_REDUCE", "0") == "1"
+        force_reduce = env_once("AITER_FLYDSL_FORCE_REDUCE", "0") == "1"
     if stage2_fp8 is None:
-        stage2_fp8 = os.environ.get("AITER_FLYDSL_STAGE2_FP8", "0") == "1"
+        stage2_fp8 = env_once("AITER_FLYDSL_STAGE2_FP8", "0") == "1"
     fp8_reduce = stage2_fp8 and b_dtype in ("fp4", "fp8") and not return_per_slot
     if force_reduce or fp8_reduce:
         return "reduce"
@@ -2224,7 +2225,7 @@ def _flydsl_moe_stage2_impl(
         (not accumulate)
         and (not return_per_slot)
         and use_mx_gemm
-        and os.environ.get("AITER_FLYDSL_STAGE2_FP8", "0") == "1"
+        and env_once("AITER_FLYDSL_STAGE2_FP8", "0") == "1"
     )
     _s2_gemm_out_dtype = "fp8" if _s2_fp8_inter else out_dtype
 
@@ -2623,7 +2624,7 @@ def flydsl_moe_topids_to_rows(
         from aiter.ops.flydsl.kernels.moe_route_maps import MAX_ROUTE_BUCKETS
 
         _use_lds_reduce = (
-            os.environ.get("AITER_FLYDSL_ROUTE_G2L_LDS", "1") in ("1", "true", "True")
+            env_once("AITER_FLYDSL_ROUTE_G2L_LDS", "1") in ("1", "true", "True")
             and int(E) <= MAX_ROUTE_BUCKETS
         )
         _ep_rowmap_ptr = ep_rowmap.reshape(-1) if ep_rowmap is not None else None
@@ -3724,3 +3725,8 @@ def flydsl_moe_fused_quant_preshuffle(
         current_stream_arg(),
     )
     return out_payload, out_scale
+
+
+# The token-multidest switch follows os.environ like the other per-call
+# switches here: a change made through it clears the cached value.
+clear_with_env_once(token_multidest_quant_enabled)
