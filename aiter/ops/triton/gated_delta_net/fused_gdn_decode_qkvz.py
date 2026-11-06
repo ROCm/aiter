@@ -33,6 +33,8 @@ import re
 
 import torch
 
+from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
+
 # The Gluon tile kernels are imported lazily, at each launch site below, rather
 # than here. This module has to stay importable on a build without
 # ``triton.experimental.gluon`` so that :func:`fused_gdn_decode_qkvz_supported`
@@ -76,6 +78,14 @@ def _uses_ratio_generic_kernel(
         or state_dtype is not torch.float32
         or strided_rows
     )
+
+
+@functools.cache
+def _ratio_launch_config(state_dtype: torch.dtype) -> dict:
+    """Launch config of the ratio-generic kernel for this state dtype."""
+    cfg_dir = resolve_config_dir("attention", "FUSED_GDN_DECODE_QKVZ", backend="gluon")
+    entry = "bf16_state" if state_dtype == torch.bfloat16 else "fp32_state"
+    return dict(load_config_json(f"{cfg_dir}/DEFAULT.json")[entry])
 
 
 def _strided_rows(projected_qkvz: torch.Tensor, projected_ba: torch.Tensor) -> bool:
@@ -487,10 +497,9 @@ def fused_gdn_decode_qkvz(
             _decode_group_ratio,
         )
 
-        # Row chunks in flight: 12 for an fp32 state (a whole ratio-3 group), 4 for a
-        # bf16 state.
-        num_buffers = 4 if ssm_state.dtype == torch.bfloat16 else 12
-        num_warps = 8
+        # Row chunks in flight (fp32 state: a whole ratio-3 group) and warps.
+        launch = _ratio_launch_config(ssm_state.dtype)
+        num_buffers, num_warps = launch["num_buffers"], launch["num_warps"]
         conv_width = 2 * head_k_dim + ratio * head_v_dim
         has_qsl = query_start_loc is not None
         _decode_group_ratio[(tokens * k_heads,)](
