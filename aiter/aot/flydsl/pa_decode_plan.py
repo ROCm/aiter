@@ -28,6 +28,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 
 from aiter.aot.flydsl import replay as _replay
 
@@ -66,20 +67,6 @@ def jobs_for_arch(arch: str) -> list[dict]:
                     "windowed": windowed,
                 }
                 jobs.append(job)
-                # Resident cluster records add one planner variant per bucket,
-                # block size and window mode. Replay eligible caps explicitly.
-                if (
-                    arch == "gfx1250"
-                    and batch <= cu_num * 15 // 16
-                    and capacity <= batch * 8
-                ):
-                    jobs.append(
-                        {
-                            **job,
-                            "kernel_name": job["kernel_name"] + "_cluster",
-                            "cluster": True,
-                        }
-                    )
     return jobs
 
 
@@ -95,18 +82,24 @@ def replay(job: dict) -> None:
 
     batch, capacity = job["batch"], job["capacity"]
     # One KV head: the budget is the capacity, which the partition cap admits.
-    plan_pa_decode(
-        torch.empty(batch, dtype=torch.int32, device="cuda"),
+    lengths = torch.empty(batch, dtype=torch.int32, device="cuda")
+    plan = plan_pa_decode(
+        lengths,
         1,
-        max_partitions=(
-            max(2, -(-capacity // batch))
-            if job.get("cluster")
-            else -(-capacity // batch)
-        ),
+        max_partitions=-(-capacity // batch),
         max_batch_size=batch,
         workgroup_budget=capacity,
         sliding_window=int(job["windowed"]),
     )
+    if plan.cluster_info is not None:
+        # Manually supplied plans may omit auxiliary records. Precompile the
+        # legacy refresh variant for the same batch and block-size bucket.
+        plan_pa_decode(
+            lengths,
+            1,
+            plan=replace(plan, cluster_info=None),
+            sliding_window=int(job["windowed"]),
+        )
 
 
 def describe(job: dict) -> str:

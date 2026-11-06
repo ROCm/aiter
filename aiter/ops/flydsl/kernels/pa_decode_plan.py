@@ -159,8 +159,9 @@ def compile_pa_decode_plan(max_batch, threads, windowed, cluster_tasks=False):
             # One aligned record per cluster CTA avoids a dependent lookup of
             # reduce_info followed by work_info in the attention kernel.
             records = fx.recast_iter(fx.Int32, cluster_ptr)
-            for index in range(tid, batch * max_parts, threads):
-                seq, part = index // max_parts, index % max_parts
+            cluster_parts = fx.min(max_parts, fx.Int32(8))
+            for index in range(tid, batch * cluster_parts, threads):
+                seq, part = index // cluster_parts, index % cluster_parts
                 start = fx.Int32(0)
                 if seq > 0:
                     start = task_ends[seq - 1]
@@ -206,17 +207,29 @@ def compile_pa_decode_plan(max_batch, threads, windowed, cluster_tasks=False):
                 work[slot * 4 + 1] = begin
                 work[slot * 4 + 2] = end
                 work[slot * 4 + 3] = ctx
-                if fx.const_expr(cluster_tasks):
+                if fx.const_expr(cluster_tasks):  # noqa: SIM102 -- constexpr scope
                     # Reuse the packed task's split arithmetic for active CTAs;
                     # the loop above only initializes idle records.
-                    record = fx.Vector.from_elements(
-                        [seq, begin, end, ctx, start, count, fx.Int32(0), fx.Int32(0)],
-                        dtype=fx.Int32,
-                    )
-                    fx.ptr_store(
-                        record,
-                        fx.add_offset(records, (fx.Int64(seq) * max_parts + part) * 8),
-                    )
+                    if part < cluster_parts:
+                        record = fx.Vector.from_elements(
+                            [
+                                seq,
+                                begin,
+                                end,
+                                ctx,
+                                start,
+                                count,
+                                fx.Int32(0),
+                                fx.Int32(0),
+                            ],
+                            dtype=fx.Int32,
+                        )
+                        fx.ptr_store(
+                            record,
+                            fx.add_offset(
+                                records, (fx.Int64(seq) * cluster_parts + part) * 8
+                            ),
+                        )
             else:
                 # Padding is disjoint from active records, even for empty batches.
                 for field in fx.range_constexpr(4):
@@ -248,9 +261,11 @@ class PADecodePlan:
     ``work_info`` is [capacity, 4]: sequence, begin/end absolute 256-token tile,
     original context length. Tile ranges are half-open and cover the MTP union.
     ``reduce_info`` is [batch, 2]: first packed task, actual task count.
-    ``cluster_info``, when present, is [batch, max_partitions, 8] with the
+    ``cluster_info``, when present, is [batch, min(max_partitions, 8), 8] with the
     first four work fields followed by first task, task count and two padding
     words. Idle CTAs have zero bounds. Refresh updates every record in place.
+    Wider plans keep only their first eight records per sequence, carrying
+    the actual task count; clusters wider than this stride use work_info.
     ``arrival_counters`` is [batch, num_kv_heads, ARRIVAL_COUNTER_STRIDE]
     int32 and zero between decodes: gfx1250 decodes that merge partitions in
     the tile kernel count finished tasks in slot 0 and the last one resets it,
@@ -266,13 +281,17 @@ class PADecodePlan:
     query_length: int = 1
     max_batch_size: int = DEFAULT_MAX_BATCH_SIZE
     arrival_counters: torch.Tensor | None = None
-    # Optional [batch, max_partitions, 8] records for resident gfx1250 clusters.
+    # Optional [batch, min(max_partitions, 8), 8] records for resident clusters.
     # Fields: sequence, begin/end tile, context length, first task, count, 0, 0.
     cluster_info: torch.Tensor | None = None
 
     @property
     def capacity(self) -> int:
         return self.work_info.shape[0]
+
+    @property
+    def cluster_task_stride(self) -> int:
+        return 0 if self.cluster_info is None else self.cluster_info.shape[1]
 
     def validate(self, batch_size: int, num_kv_heads: int, device: torch.device):
         if type(self.max_batch_size) is not int or self.max_batch_size < 1:
@@ -296,12 +315,12 @@ class PADecodePlan:
             raise ValueError("plan capacity must be in [batch, batch * max_partitions]")
         metadata = [self.work_info, self.reduce_info]
         if self.cluster_info is not None:
-            if self.cluster_info.shape != (batch_size, self.max_partitions, 8):
+            if self.cluster_info.shape != (batch_size, min(self.max_partitions, 8), 8):
                 raise ValueError(
-                    "cluster_info must have shape [batch, max_partitions, 8]"
+                    "cluster_info must have shape [batch, min(max_partitions, 8), 8]"
                 )
-            if not 2 <= self.max_partitions <= 8:
-                raise ValueError("cluster_info requires max_partitions in [2, 8]")
+            if self.max_partitions < 2:
+                raise ValueError("cluster_info requires max_partitions >= 2")
             metadata.append(self.cluster_info)
         if self.arrival_counters is not None:
             counter_shape = (batch_size, num_kv_heads, ARRIVAL_COUNTER_STRIDE)
@@ -417,9 +436,12 @@ def plan_pa_decode(
                 device=dev,
             ),
             cluster_info=(
-                torch.empty((batch, max_partitions, 8), dtype=torch.int32, device=dev)
-                if properties.gcnArchName.split(":", 1)[0] == "gfx1250"
-                and 2 <= max_partitions <= 8
+                torch.empty(
+                    (batch, min(max_partitions, 8), 8), dtype=torch.int32, device=dev
+                )
+                if properties.gcnArchName.split(":", 1)[0]
+                in ("gfx1250", "gfx1250-strict")
+                and max_partitions >= 2
                 and batch * num_kv_heads <= num_compute_units * 15 // 16
                 else None
             ),

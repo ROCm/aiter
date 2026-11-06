@@ -826,6 +826,17 @@ _COMMON_CASES = [
         },
     ),
     (
+        "cluster16-record-fallback",
+        {
+            "group_size": 16,
+            "block_size": 16,
+            "lengths": (8192,) * 6 + (0, 1, 257, 8191),
+            "max_partitions": 16,
+            "capture": True,
+            "cluster": 16,
+        },
+    ),
+    (
         "mtp4-g16-page128",
         {
             "query_length": 4,
@@ -2061,8 +2072,12 @@ def test_pa_decode(case, device, monkeypatch):
 
     launch()
     check()
-    if plan.cluster_info is not None and compile_kwargs[-1]["cluster_merge"]:
-        assert compile_kwargs[-1]["cluster_task_stride"] == plan.max_partitions
+    cluster_size = compile_kwargs[-1]["cluster_merge"]
+    use_records = (
+        plan.cluster_info is not None and 0 < cluster_size <= plan.cluster_task_stride
+    )
+    if use_records:
+        assert compile_kwargs[-1]["cluster_task_stride"] == plan.cluster_task_stride
         packed = output.clone()
         original_plan = plan
         plan = replace(plan, cluster_info=None)
@@ -2071,6 +2086,8 @@ def test_pa_decode(case, device, monkeypatch):
         assert compile_kwargs[-1]["cluster_task_stride"] == 0
         assert torch.equal(output, packed)
         plan = original_plan
+    elif cluster_size:
+        assert compile_kwargs[-1]["cluster_task_stride"] == 0
     if case["variants"]:
         # Plan-free, a one-partition plan and uint8 views of the same bytes are one
         # task; a strided output takes the reducer, and a context-0 row is zero-filled

@@ -984,6 +984,12 @@ def pa_decode(
         else 0
     )
 
+    use_cluster_tasks = bool(
+        cluster_merge
+        and work_plan.cluster_info is not None
+        and cluster_merge <= work_plan.cluster_task_stride
+    )
+
     # Bound byte offsets as well as element indices for 16-bit BF16 caches.
     cache_extent = max(
         key_cache.numel() * key_cache.element_size(),
@@ -1018,9 +1024,7 @@ def pa_decode(
             mask_unowned_kv=mask_unowned_kv,
             cluster_merge=cluster_merge,
             cluster_task_stride=(
-                work_plan.max_partitions
-                if cluster_merge and work_plan.cluster_info is not None
-                else 0
+                work_plan.cluster_task_stride if use_cluster_tasks else 0
             ),
             packed_scale_heads=bool(
                 cluster_merge and per_token_kv and stride_ks_head == block_size
@@ -1128,11 +1132,7 @@ def pa_decode(
             int(query.stride(0)),
             int(query.stride(1)),
             ptr_arg(
-                (
-                    work_plan.cluster_info
-                    if cluster_merge and work_plan.cluster_info is not None
-                    else work_plan.work_info
-                ),
+                (work_plan.cluster_info if use_cluster_tasks else work_plan.work_info),
                 fx.Int32,
             ),
             work_plan.capacity,
