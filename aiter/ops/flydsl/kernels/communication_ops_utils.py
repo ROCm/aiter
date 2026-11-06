@@ -37,6 +37,8 @@ __all__ = [
     "fence_release",
     "fence_system_acquire",
     "fence_system_release",
+    "hw_xcc_id",
+    "invalidate_l1",
     "load_i32_acquire",
     "load_i32_global_agent",
     "load_i32_global_system",
@@ -51,11 +53,13 @@ __all__ = [
     "spin_until_ge_i32_system",
     "spin_until_ge_i64",
     "spin_until_gt_i32",
+    "spin_until_shifted_eq_i64",
     "store_i32_global_agent_release",
     "store_i32_global_system_monotonic",
     "store_i32_global_system_release",
     "store_i32_lds",
     "store_i32_system",
+    "store_i64_global",
     "store_i64_global_system",
     "wait_i32_until_equals",
     "wait_i32_until_greater_than",
@@ -222,6 +226,18 @@ def spin_until_ge_i64(addr_i64, val, *, max_iters=0):
 
 
 @flyc.jit
+def spin_until_shifted_eq_i64(addr_i64, val, *, shift):
+    """Spin until an i64 flag shifted right by ``shift`` equals ``val``; returns the flag.
+
+    Unlike a ``>=`` wait it stays correct when the generation in the high bits wraps.
+    """
+    cur = fx.Int64(load_i64_acquire(addr_i64))
+    while (cur >> fx.Int64(shift)) != fx.Int64(val):
+        cur = fx.Int64(load_i64_acquire(addr_i64))
+    return cur
+
+
+@flyc.jit
 def spin_until_ge_i32_system(addr_i64, val, *, acquire=False, sleep=True):
     """Spin on a system-visible i32 flag until it reaches ``val``."""
     cur = fx.Int32(load_i32_global_system(addr_i64, acquire=acquire))
@@ -299,6 +315,32 @@ def store_i64_global_system(addr_i64, val):
         fx.Int64(val),
         memory_order=fx.AtomicOrdering.Release,
         syncscope="one-as",
+    )
+
+
+def store_i64_global(addr_i64, val):
+    """Plain (non-atomic) global i64 store to ``addr_i64``."""
+    fx.ptr_store(fx.Int64(val), _to_ptr_global(addr_i64, fx.Int64, 8))
+
+
+# FlyDSL has no wrapper for the two instructions below.
+def hw_xcc_id():
+    """Wave-uniform XCC (die) index of the executing wave."""
+    return fx.Int32(
+        llvm.InlineAsmOp(
+            T.i32,
+            [],
+            "s_getreg_b32 $0, hwreg(HW_REG_XCC_ID, 0, 4)",
+            "=s",
+            has_side_effects=True,
+        ).result
+    )
+
+
+def invalidate_l1():
+    """Invalidate this CU's vector L1 only (the XCD's L2 is untouched)."""
+    llvm.InlineAsmOp(
+        None, [], "buffer_inv sc0\ns_waitcnt vmcnt(0)", "", has_side_effects=True
     )
 
 

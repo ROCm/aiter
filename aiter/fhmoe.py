@@ -34,6 +34,7 @@ from aiter.fhmoe_contract import (
 from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.flydsl.moe_common import GateMode
+from aiter.presorted_moe import drop_presort_on_error
 
 
 def _validate_fhmoe_contract(
@@ -939,6 +940,7 @@ def fhmoe_fake(
     )
 
 
+@drop_presort_on_error
 def _fhmoe_impl(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
