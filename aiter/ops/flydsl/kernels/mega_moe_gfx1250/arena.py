@@ -83,6 +83,9 @@ _ARENA_REGION_ORDER = (
     "compact_hist",
     "compact_done",
     "comb_inp",
+    # Stage-1 flag tiles. Last, so every other region's offset stays put when
+    # AITER_MEGA_S1F is off and the region is absent.
+    "tile_flag",
 )
 # cco rounds each allocation up to its VMM granularity -- 2 MiB on the parts
 # MegaMoE runs on -- and, past 2 GiB, to 2 MiB again for the MR registration.
