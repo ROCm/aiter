@@ -13,7 +13,9 @@ import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.jagged_dense_bmm_dispatch import jagged_dense_bmm_dispatched
+from aiter.ops.flydsl.kernels.jagged_dense_bmm_gen import _LAUNCHERS
 from aiter.test_common import (
+    assertAllclose,
     benchmark,
     checkAllclose,
     run_perftest,
@@ -112,6 +114,11 @@ def _check(d, got, dtype, msg):
         atol=1e-2,
         msg=msg,
     )
+
+
+def _require(d, got, dtype, msg):
+    ref = run_torch(d["jagged"], d["dense"], d["bias"], d["seq_offsets"], d["N"], dtype)
+    return assertAllclose(ref.to(dtypes.fp32), got.to(dtypes.fp32), msg=msg)
 
 
 def _roofline(d, B, us):
@@ -252,6 +259,55 @@ def test_jdbba_seq_offsets_reuse(B, D, Kout, Mi, seed, dtype):
     }
 
 
+# Fixed so a new length changes the grid without changing the launcher key.
+_REUSE_XCD = {"xcd_c": 32, "xcd_w": 8, "block_k": 64}
+
+
+@benchmark()
+def test_jdbba_launcher_reuse(B, D, Kout, Mi, regime, dtype):
+    """A new length or batch reuses the compiled launcher and matches torch.
+
+    The XCD and ``block_k`` overrides hold the launcher key fixed, so a new
+    group count or packed length has to come from the launch grid.
+    """
+    uniform = regime == "uniform"
+    if uniform:
+        B2, Mi2 = B + 16, Mi + 64
+    else:
+        B2, Mi2 = B, Mi * 2
+    first = _build_inputs(B, D, Kout, Mi, regime, dtype)
+    second = _build_inputs(B2, D, Kout, Mi2, regime, dtype)
+    if uniform:
+        assert (B2, Mi2) != (B, Mi), "uniform reuse pair did not change the grid"
+    else:
+        assert second["L"] != first["L"], "skew reuse pair did not change L"
+
+    out = _nan_out(first["L"], first["N"], dtype)
+    _launch(first, out, B, Mi, uniform, **_REUSE_XCD)
+    err_prime = _require(first, out, dtype, f"launcher reuse prime ({regime})")
+    n_launchers = len(_LAUNCHERS)
+
+    out = _nan_out(second["L"], second["N"], dtype)
+    got, us = run_perftest(lambda: _launch(second, out, B2, Mi2, uniform, **_REUSE_XCD))
+    new_launchers = len(_LAUNCHERS) - n_launchers
+    assert new_launchers == 0, (
+        f"launcher cache grew by {new_launchers} for a new {regime} length"
+    )
+    err = _require(second, got, dtype, f"launcher reuse ({regime})")
+    tflops, tbps = _roofline(second, B2, us)
+    return {
+        "gfx": get_gfx(),
+        "B2": B2,
+        "Mi2": Mi2,
+        "L": second["L"],
+        "err prime": err_prime,
+        "flydsl us": us,
+        "flydsl TFLOPS": tflops,
+        "flydsl TB/s": tbps,
+        "flydsl err": err,
+    }
+
+
 def _summarize(name, rows):
     df = pd.DataFrame(rows)
     aiter.logger.info("%s summary (markdown):\n%s", name, df.to_markdown(index=False))
@@ -389,6 +445,13 @@ def main():
     ):
         rows.append(test_jdbba_seq_offsets_reuse(B, D, Kout, Mi, seed, dtype))
     _summarize("jagged_dense_bmm seq_offsets reuse", rows)
+
+    rows = []
+    for dtype, (B, D, Kout, Mi), regime in itertools.product(
+        args.dtype, args.regression_shapes, args.regime
+    ):
+        rows.append(test_jdbba_launcher_reuse(B, D, Kout, Mi, regime, dtype))
+    _summarize("jagged_dense_bmm launcher reuse", rows)
 
 
 if __name__ == "__main__":
