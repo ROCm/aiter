@@ -24,6 +24,10 @@ Two candidates:
     (2-4), equal/worse for large N (register pressure). Kept here as a validated
     alternative; NOT wired into production (the absolute win is <~1.3us on a
     ~1ms decode and it would need a second kernel + a per-N dispatch).
+  ``dchunk`` -- ``_fwd_kernel_stage2_dchunk``, what ``mla_decode_fwd_v4_nm`` runs
+    when num_seqs * num_heads <= 2048: ``vec`` with Lv split across a third grid
+    axis, so the tile shrinks to [MAX_KV_SPLITS, D_CHUNK] (no register pressure
+    at large N) and the CTA count grows by Lv / D_CHUNK.
 """
 
 import argparse
@@ -37,8 +41,8 @@ import triton.language as tl
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.mla import _fwd_kernel_stage2_asm
-from aiter.test_common import benchmark, checkAllclose, run_perftest
+from aiter.mla import _fwd_kernel_stage2_asm, _launch_stage2_dchunk
+from aiter.test_common import assertAllclose, benchmark, run_perftest
 
 torch.set_default_device("cuda")
 torch.manual_seed(0)
@@ -192,6 +196,7 @@ def test_stage2_merge(
 
     out_base = torch.empty((T, H, Lv), dtype=out_dtype)
     out_vec = torch.empty((T, H, Lv), dtype=out_dtype)
+    out_dchunk = torch.empty((T, H, Lv), dtype=out_dtype)
     max_kv_splits = 1 << (N - 1).bit_length()  # next_power_of_2(N)
 
     ref = run_torch(logits, attn_lse, num_valid, out_dtype)
@@ -257,6 +262,23 @@ def test_stage2_merge(
         )
         return out_vec
 
+    def run_dchunk():
+        _launch_stage2_dchunk(
+            logits,
+            attn_lse,
+            out_dchunk,
+            qo_indptr,
+            kv_indptr,
+            num_kv_splits_indptr,
+            valid_split_count,
+            T,
+            H,
+            N,
+            Lv,
+            MGC,
+        )
+        return out_dchunk
+
     # Merge reads N partial (V + lse) per (token, head), writes one V row.
     read_bytes = T * H * N * (Lv + 1) * 4
     write_bytes = T * H * Lv * out_base.element_size()
@@ -264,9 +286,9 @@ def test_stage2_merge(
     ref_fp32 = ref.to(dtypes.fp32)
 
     ret = {"gfx": get_gfx(), "warps": warps, "stages": stages, "wpe": wpe}
-    for name, fn in (("base", run_base), ("vec", run_vec)):
+    for name, fn in (("base", run_base), ("vec", run_vec), ("dchunk", run_dchunk)):
         o, us = run_perftest(fn)
-        err = checkAllclose(
+        err = assertAllclose(
             ref_fp32,
             o.to(dtypes.fp32),
             rtol=1e-2,
@@ -278,6 +300,77 @@ def test_stage2_merge(
         ret[f"{name} TB/s"] = (read_bytes + write_bytes) / us / 1e6
         ret[f"{name} err"] = err
     return ret
+
+
+def test_stage2_merge_empty_seq(num_heads=16, num_kv_splits=8):
+    """num_valid == 0 (kv_len == 0, valid_split_count == 0, or no splits in
+    num_kv_splits_indptr) must give O == 0 in both merges, not 0/0 = NaN. The
+    unread split slots hold NaN, like a never-written torch.empty buffer."""
+    T, H, N, Lv = 4, num_heads, num_kv_splits, V_HEAD_DIM
+    logits = torch.full((T, N, H, Lv), float("nan"), dtype=dtypes.fp32)
+    attn_lse = torch.full((T, N, H, 1), float("nan"), dtype=dtypes.fp32)
+    logits[0] = torch.randn((N, H, Lv), dtype=dtypes.fp32)
+    attn_lse[0] = torch.randn((N, H, 1), dtype=dtypes.fp32)
+    ref = run_torch(logits[:1], attn_lse[:1], N, dtypes.fp32)[0]
+
+    def indptr(lens):
+        return torch.tensor([0] + lens, dtype=dtypes.i32).cumsum(0).to(dtypes.i32)
+
+    # seq0 valid, seq1 kv_len == 0, seq2 valid_split_count == 0, seq3 no splits
+    qo_indptr = torch.arange(0, T + 1, dtype=dtypes.i32)
+    kv_indptr = indptr([N * MGC, 0, N * MGC, N * MGC])
+    num_kv_splits_indptr = indptr([N, N, N, 0])
+    valid_split_count = torch.tensor([N, N, 0, N], dtype=dtypes.i32)
+
+    out_dchunk = torch.full((T, H, Lv), 7.0, dtype=dtypes.bf16)
+    _launch_stage2_dchunk(
+        logits,
+        attn_lse,
+        out_dchunk,
+        qo_indptr,
+        kv_indptr,
+        num_kv_splits_indptr,
+        valid_split_count,
+        T,
+        H,
+        N,
+        Lv,
+        MGC,
+    )
+    out_base = torch.full((T, H, Lv), 7.0, dtype=dtypes.bf16)
+    _fwd_kernel_stage2_asm[(T, H)](
+        logits,
+        attn_lse,
+        out_base,
+        torch.empty((1,), dtype=dtypes.fp32),
+        qo_indptr,
+        kv_indptr,
+        None,
+        num_kv_splits_indptr,
+        valid_split_count,
+        attn_lse.stride(0),
+        attn_lse.stride(2),
+        attn_lse.stride(1),
+        out_base.stride(0),
+        out_base.stride(1),
+        0,
+        page_size=1,
+        KV_INDPTR_IS_PAGE_LEVEL=False,
+        MAYBE_FINAL_OUT=False,
+        HAS_FINAL_LSE=False,
+        USE_VALID_SPLIT_COUNT_REDUCE=1,
+        BATCH_NUM=T,
+        BLOCK_DV=triton.next_power_of_2(Lv),
+        Lv=Lv,
+        mgc=MGC,
+        num_warps=1,
+        num_stages=2,
+        waves_per_eu=4,
+    )
+    for name, o in (("dchunk", out_dchunk), ("base", out_base)):
+        assert torch.isfinite(o).all(), f"{name}: non-finite O for num_valid == 0"
+        assert bool((o[1:] == 0).all()), f"{name}: O != 0 for num_valid == 0"
+        assertAllclose(ref, o[0].float(), msg=f"{name} empty-seq batch seq0 ")
 
 
 def main():
@@ -337,6 +430,9 @@ def main():
         help="waves_per_eu occupancy hint",
     )
     args = parser.parse_args()
+
+    for heads in args.heads:
+        test_stage2_merge_empty_seq(heads)
 
     for dtype in args.dtype:
         df = []
