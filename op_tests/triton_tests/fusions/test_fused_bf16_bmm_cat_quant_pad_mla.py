@@ -217,10 +217,11 @@ def test_fused_bf16_bmm_rope_cat_quant_pad_cache_mla(
         generate_rope_cache_inputs(M)
     )
     # Positions far out of the cos/sin cache range, on the padding tokens and on
-    # token 0, which is never padding. A read of their rows faults, so the kernel
-    # must clamp them into the cache, as the reference does.
+    # tokens 0 and 2, which are never padding. A read of their rows faults, so the
+    # kernel must clamp them into the cache from both sides, as the reference does.
     positions[slot_mapping < 0] = 2**40
     positions[0] = 2**40
+    positions[2:3] = -(2**40)
     q_scale = torch.tensor(0.37, dtype=torch.float32, device="cuda")
     k_scale = torch.tensor(k_scale, dtype=torch.float32, device="cuda")
     fp8_max = fp8_quant_max()

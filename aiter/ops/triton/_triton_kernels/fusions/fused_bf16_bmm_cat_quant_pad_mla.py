@@ -74,7 +74,7 @@ def _rope_bf16_fma(
     contraction. Positions are clamped into the max_position rows of the cos/sin
     cache."""
     BLOCK_D_HALF: tl.constexpr = BLOCK_D // 2
-    offs_d = tl.arange(0, BLOCK_D)
+    offs_d = tl.arange(0, BLOCK_D).to(tl.int64)
     if IS_NEOX:
         is_a = offs_d < BLOCK_D_HALF
         offs_cs = offs_d % BLOCK_D_HALF
@@ -84,11 +84,10 @@ def _rope_bf16_fma(
         offs_cs = offs_d // 2
         x_rot = _get_gptj_rotated_x(x, is_a[None, :], BLOCK_M, BLOCK_D, BLOCK_D_HALF)
     pos = tl.minimum(tl.maximum(pos.to(tl.int64), 0), max_position - 1)
-    cs_ptrs = (
-        cos_sin_ptr + pos[:, None] * stride_cs_pos + offs_cs[None, :] * stride_cs_d
-    )
-    cos = tl.load(cs_ptrs).to(tl.float32)
-    sin = tl.load(cs_ptrs + BLOCK_D_HALF * stride_cs_d).to(tl.float32)
+    cs_rows = cos_sin_ptr + pos[:, None] * stride_cs_pos
+    cos = tl.load(cs_rows + offs_cs[None, :] * stride_cs_d).to(tl.float32)
+    sin = tl.load(cs_rows + (offs_cs + BLOCK_D_HALF)[None, :] * stride_cs_d)
+    sin = sin.to(tl.float32)
     # bf16 * bf16 is exact in fp32, so these match the FMAs bit for bit.
     xf = x.to(tl.float32)
     rf = x_rot.to(tl.float32)

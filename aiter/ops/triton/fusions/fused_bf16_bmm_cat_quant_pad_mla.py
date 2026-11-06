@@ -215,8 +215,10 @@ def fused_bf16_bmm_rope_cat_quant_pad_cache_mla(
 
     The RoPE is bf16 with the a*cos and a*sin products of each pair (a, b) kept
     exact, as a bf16 HIP RoPE that hipcc compiles with FMA contraction computes
-    it. The roped q_pe and k_pe are not written back. All tokens must be decode tokens. Tuned configs exist
-    only for gfx950. On other archs, pass config.
+    it. A RoPE computed in fp32 can give pe bytes one fp8 step away from this
+    op's. The roped q_pe and k_pe are not written back. All tokens must be
+    decode tokens. Tuned configs exist only for gfx950. On other archs, pass
+    config.
 
     Args:
         q_nope, w_uk_t, q_scale, num_padded_heads, out, fp8_max: As in
