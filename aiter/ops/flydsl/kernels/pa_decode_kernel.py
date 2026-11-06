@@ -592,7 +592,7 @@ def compile_gfx1250_pa_decode(
         cluster_merge,
         small_grid and compute_dtype == "bf16" and block_size == 16,
         wide_pages and compute_dtype == "fp8" and block_size == 128,
-        one_cta_grid and compute_dtype == "bf16" and block_size == 128,
+        one_cta_grid and compute_dtype == "bf16",
     )
     if compute_dtype not in ("fp8", "bf16"):
         raise ValueError(f"Unsupported gfx1250 PA compute dtype: {compute_dtype}")

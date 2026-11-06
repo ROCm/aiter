@@ -925,6 +925,15 @@ class Gfx1250Traits:
             return 64 * self.page16_pages
         if self.page128_pair or self.bf16_page128_pair:
             return 256
+        if (
+            self.bf16_page16_packed
+            and self.wide_bf16_page128
+            and self.head_dim == 128
+            and self.m_tiles == 1
+            and self.sliding_window == 0
+        ):
+            # One-CTA-per-CU grids stage four BF16 page16 pages per wave.
+            return 256
         return (
             128
             if self.bf16_page128_packed
