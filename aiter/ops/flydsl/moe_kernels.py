@@ -3183,6 +3183,21 @@ _TOKEN_MULTIDEST_MIN_TOKENS = 64
 _TOKEN_MULTIDEST_MAX_TOPK = 8
 
 
+@functools.cache
+def token_multidest_quant_enabled() -> bool:
+    """AITER_FLYDSL_TOKEN_MULTIDEST_QUANT (default on), read once per process.
+
+    The quant dispatch and the TP route gates that must agree with it ask on
+    every MoE call; a test that changes the variable calls
+    ``token_multidest_quant_enabled.cache_clear()``.
+    """
+    return os.environ.get("AITER_FLYDSL_TOKEN_MULTIDEST_QUANT", "1") in (
+        "1",
+        "true",
+        "True",
+    )
+
+
 def token_multidest_eligible(token_num: int, topk: int) -> bool:
     """Whether the routing takes the token-multidest quant path.
 
@@ -3242,6 +3257,29 @@ def _get_compiled_token_multidest_quant(
 
 
 @functools.cache
+def _get_compiled_token_multidest_tp_route_quant(
+    feat_dim: int,
+    wmma_rep: int,
+    topk: int,
+    quant_mode: str,
+    ksplit: int,
+    tp_route_slots: int,
+):
+    from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
+        build_moe_token_multidest_tp_route_quant_module,
+    )
+
+    return build_moe_token_multidest_tp_route_quant_module(
+        feat_dim=feat_dim,
+        wmma_rep=wmma_rep,
+        topk=topk,
+        quant_mode=quant_mode,
+        ksplit=ksplit,
+        tp_route_slots=tp_route_slots,
+    )
+
+
+@functools.cache
 def _get_compiled_apre_quant(
     feat_dim: int,
     wmma_rep: int,
@@ -3286,6 +3324,8 @@ def _get_compiled_fused_quant_preshuffle_route_ksplit(
     fuse_ep_psum: bool = False,
     row_major_scale: bool = False,
     payload_preshuffled: bool = False,
+    fuse_tp_route: bool = False,
+    tp_route_slots: int = 1,
 ):
     from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
         build_moe_fused_quant_preshuffle_route_ksplit_module,
@@ -3303,6 +3343,40 @@ def _get_compiled_fused_quant_preshuffle_route_ksplit(
         fuse_ep_psum=fuse_ep_psum,
         row_major_scale=row_major_scale,
         payload_preshuffled=payload_preshuffled,
+        fuse_tp_route=fuse_tp_route,
+        tp_route_slots=tp_route_slots,
+    )
+
+
+# Ids per thread every TP route-in-quant build loads: 8 x 256 threads cover the
+# 2048 routes the grouped MoE hands it (_FUSE_TP_ROUTE_QUANT_MAX_NUMEL), so one
+# build serves every batch instead of one per power-of-two bucket of routes.
+_TP_ROUTE_MIN_SLOTS = 8
+
+
+def _tp_route_slots(numel: int) -> int:
+    """Ids per thread of the 256-thread block: _TP_ROUTE_MIN_SLOTS, so the batch
+    is not part of the compile key, or the next power of two above it for a
+    larger call. Ids past numel load the last id and count nothing."""
+    slots = _TP_ROUTE_MIN_SLOTS
+    while slots * 256 < numel:
+        slots *= 2
+    return slots
+
+
+def _routeks_tp_route_args(tp_route_params: dict):
+    """Extra routeks operands for the TP route fusion: masked_m and psum out."""
+    return (
+        ptr_arg(tp_route_params["masked_m"].reshape(-1)),
+        ptr_arg(tp_route_params["psum"].reshape(-1)),
+        ptr_arg(None),
+        ptr_arg(None),
+        ptr_arg(None),
+        int(tp_route_params["experts"]),
+        int(tp_route_params["tile_m"]),
+        1,
+        1,
+        1,
     )
 
 
@@ -3364,6 +3438,9 @@ def flydsl_moe_fused_quant_preshuffle(
     # row_major_ascale=1. Unsupported with A-preshuffled payloads or quantization.
     row_major_scale: bool = False,
     payload_preshuffled: bool = False,
+    # TP route fused into the launch: {"topk_ids", "masked_m", "psum",
+    # "experts", "tile_m"}. topids_to_rows, masked_m and psum are then outputs.
+    tp_route_params: dict | None = None,
 ):
     """Fused grouped quant + e8m0 scale-preshuffle.
 
@@ -3371,6 +3448,12 @@ def flydsl_moe_fused_quant_preshuffle(
     payload_preshuffled is true, FP4 payload bytes follow the logical
     (M/16, K/128, 4, 16, 32) layout; each final 32-element span is 16 bytes.
     This mode requires logical K divisible by 1024, with 0 < K <= 16384.
+
+    ``tp_route_params`` replaces ``fused_route_psum_remap``: the quant kernel
+    (route-indexed, or token-multidest where that is the choice) derives each
+    route's contiguous row from ``topk_ids`` itself and writes
+    ``topids_to_rows`` (int32, ``(numel,)``), ``masked_m`` and ``psum`` along
+    with the payload. Rows within an expert follow route order.
     """
     if quant_mode not in ("fp4", "fp8"):
         raise NotImplementedError(
@@ -3469,6 +3552,44 @@ def flydsl_moe_fused_quant_preshuffle(
         grid_blocks = (numel + warps_per_block - 1) // warps_per_block
         remap_rows = row_starts is not None
         fuse_ep_psum = ep_psum_params is not None
+        fuse_tp_route = tp_route_params is not None
+        if fuse_tp_route:
+            from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
+                TP_ROUTE_MAX_EXPERTS,
+            )
+
+            tp_experts = int(tp_route_params["experts"])
+            if tp_experts > TP_ROUTE_MAX_EXPERTS:
+                raise ValueError(
+                    f"TP route fusion supports at most {TP_ROUTE_MAX_EXPERTS} "
+                    f"experts, got {tp_experts}"
+                )
+            if (
+                prequantized
+                or payload_preshuffled
+                or remap_rows
+                or fuse_ep_psum
+                or row_major_scale
+                or num_valid_routes is not None
+                or source_topk <= 0
+            ):
+                raise ValueError(
+                    "TP route fusion is the bf16 route path: it takes source_topk "
+                    "and no prequantized, A-preshuffle, remap, EP psum, row-major "
+                    "or num_valid_routes mode"
+                )
+            # The kernel writes the rows in place: the caller's tensor must be
+            # the int32 buffer itself, not a converted copy.
+            assert (
+                topids_to_rows.dtype == torch.int32 and topids_to_rows.is_contiguous()
+            ), "TP route fusion writes topids_to_rows: pass a contiguous int32 buffer"
+            tp_ids_i32 = (
+                tp_route_params["topk_ids"]
+                .to(device=device, dtype=torch.int32)
+                .reshape(-1)
+                .contiguous()
+            )
+            assert tp_ids_i32.numel() == numel
         if fuse_ep_psum:
             if int(ep_psum_params["experts"]) > 256:
                 raise ValueError(
@@ -3479,6 +3600,10 @@ def flydsl_moe_fused_quant_preshuffle(
             if route_max_m_arg <= 0:
                 raise ValueError("ep_psum_params.route_max_m must be positive")
             row_starts_i32 = masked_m
+        elif fuse_tp_route:
+            # The expert ids ride in the row_starts slot.
+            row_starts_i32 = tp_ids_i32
+            route_max_m_arg = 1
         elif remap_rows:
             row_starts_i32 = row_starts.to(device=device, dtype=torch.int32).reshape(-1)
             route_max_m_arg = int(route_max_m)
@@ -3495,12 +3620,52 @@ def flydsl_moe_fused_quant_preshuffle(
             and not payload_preshuffled
             and not remap_rows
             and not fuse_ep_psum
+            and not fuse_tp_route
             and num_valid_routes is None
             and 1 < int(source_topk) <= _TOKEN_MULTIDEST_MAX_TOPK
             and token_num >= _TOKEN_MULTIDEST_MIN_TOKENS
-            and os.environ.get("AITER_FLYDSL_TOKEN_MULTIDEST_QUANT", "1")
-            in ("1", "true", "True")
+            and token_multidest_quant_enabled()
         )
+        if fuse_tp_route and token_multidest_eligible(token_num, source_topk):
+            from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
+                token_multidest_ksplit,
+            )
+
+            md_ksplit = token_multidest_ksplit(
+                feat_dim, wmma_rep, quant_mode, token_num
+            )
+            # The batch the unfused quant would hand to token-multidest: keep
+            # that kernel, with the route folded in. Its K-split build is the
+            # only one without TDM staging, which the route fusion relies on.
+            if (
+                md_ksplit > 1
+                and row_to_token is None
+                and token_multidest_quant_enabled()
+            ):
+                launch = _get_compiled_token_multidest_tp_route_quant(
+                    feat_dim=feat_dim,
+                    wmma_rep=wmma_rep,
+                    topk=int(source_topk),
+                    quant_mode=quant_mode,
+                    ksplit=md_ksplit,
+                    tp_route_slots=_tp_route_slots(numel),
+                )
+                _dispatch_compiled(
+                    launch,
+                    ptr_arg(grouped_in.contiguous().view(-1)),
+                    ptr_arg(out_payload.view(-1)),
+                    ptr_arg(out_scale.view(-1)),
+                    ptr_arg(topids_to_rows_i32),
+                    token_num,
+                    ptr_arg(tp_ids_i32),
+                    ptr_arg(tp_route_params["masked_m"].reshape(-1)),
+                    ptr_arg(tp_route_params["psum"].reshape(-1)),
+                    tp_experts,
+                    int(tp_route_params["tile_m"]),
+                    (token_num + warps_per_block - 1) // warps_per_block,
+                    current_stream_arg(),
+                )
+                return out_payload, out_scale
         if use_token_multidest and row_to_token is not None:
             from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
                 token_multidest_tdm_chunks,
@@ -3635,6 +3800,8 @@ def flydsl_moe_fused_quant_preshuffle(
             fuse_ep_psum=fuse_ep_psum,
             row_major_scale=row_major_scale,
             payload_preshuffled=payload_preshuffled,
+            fuse_tp_route=fuse_tp_route,
+            tp_route_slots=_tp_route_slots(numel) if fuse_tp_route else 1,
         )
         # Dead-tail skip (EP dynamic token count): routes >= num_valid_routes are
         # padding rows of the dispatch buffer and are not gathered/quantized. When
@@ -3660,7 +3827,11 @@ def flydsl_moe_fused_quant_preshuffle(
             ptr_arg(
                 prequantized_scale.view(-1) if prequantized else out_scale.view(-1)
             ),
-            *_routeks_ep_psum_args(device, ep_psum_params),
+            *(
+                _routeks_tp_route_args(tp_route_params)
+                if fuse_tp_route
+                else _routeks_ep_psum_args(device, ep_psum_params)
+            ),
             grid_blocks,
             current_stream_arg(),
         )
