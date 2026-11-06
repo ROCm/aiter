@@ -837,6 +837,8 @@ class Gfx1250Traits:
     wide_bf16_page16: bool = False
     # Grids within two CTAs per CU stage two FP8 page128 pages per step.
     wide_fp8_page128: bool = False
+    # Grids within one CTA per CU stage two BF16 page128 pages per step.
+    wide_bf16_page128: bool = False
 
     WAVE = 32
     NWARP = 4
@@ -898,6 +900,18 @@ class Gfx1250Traits:
         )
 
     @property
+    def bf16_page128_pair(self):
+        # One D128 BF16 query tile over page128 caches on a one-CTA-per-CU
+        # grid stages two pages per softmax step.
+        return (
+            self.wide_bf16_page128
+            and self.bf16_page128_packed
+            and self.head_dim == 128
+            and self.m_tiles == 1
+            and self.sliding_window == 0
+        )
+
+    @property
     def page16_pages(self):
         # page16 pages each wave stages per softmax step (four lost accuracy
         # for no consistent gain).
@@ -909,7 +923,7 @@ class Gfx1250Traits:
         # Windowed rows retain 64-token normalization for FP8 accuracy.
         if self.page16_wide:
             return 64 * self.page16_pages
-        if self.page128_pair:
+        if self.page128_pair or self.bf16_page128_pair:
             return 256
         return (
             128

@@ -273,6 +273,7 @@ def compile_pa_decode_tile(
             # Wide page16 stages leave room for two CTAs per CU: larger
             # grids (sparse prefill) keep narrower stages.
             small_grid=grid_ctas <= 2 * num_compute_units,
+            one_cta_grid=grid_ctas <= num_compute_units,
             # Two-page FP8 steps pay off with one CTA per CU, or when CTAs
             # run several tiles; two-CTA grids of one-tile tasks lose overlap.
             wide_pages=grid_ctas <= num_compute_units
@@ -558,6 +559,7 @@ def compile_gfx1250_pa_decode(
     cluster_merge=0,
     small_grid=False,
     wide_pages=False,
+    one_cta_grid=False,
 ):
     """Compile a gfx1250 tile kernel; merging partitions writes final output.
 
@@ -590,6 +592,7 @@ def compile_gfx1250_pa_decode(
         cluster_merge,
         small_grid and compute_dtype == "bf16" and block_size == 16,
         wide_pages and compute_dtype == "fp8" and block_size == 128,
+        one_cta_grid and compute_dtype == "bf16" and block_size == 128,
     )
     if compute_dtype not in ("fp8", "bf16"):
         raise ValueError(f"Unsupported gfx1250 PA compute dtype: {compute_dtype}")

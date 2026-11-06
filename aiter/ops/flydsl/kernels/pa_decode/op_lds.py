@@ -1511,14 +1511,18 @@ class Gfx1250Memory:
         return fx.Vector.from_elements(words, dtype=fx.Int32).bitcast(fx.BFloat16)
 
     @flyc.jit
-    def stage_bf16_page(self, token_base, buffer):
-        """Gather a BF16 page without transposition; zero-fill its unwritten tail."""
+    def stage_bf16_page(self, token_base, buffer, slot=0):
+        """Gather a BF16 page without transposition; zero-fill its unwritten tail.
+
+        ``slot`` places the page within a multi-page step, 128 tokens apart.
+        """
         ctx, t = self.ctx, self.t
+        page_bytes = 128 * t.head_dim * 2
         safe = (token_base < ctx.planned_context).select(token_base, fx.Int32(0))
         table = fx.recast_iter(fx.Int32, ctx.block_tables_ptr)
         page = fx.Int32(table[ctx.planned_seq * ctx.max_blocks_per_seq + safe // 128])
         off = (fx.Int64(page) * ctx.n_kv + ctx.kv_h) * t.head_dim * 128
-        kv_off = t.q_bytes + buffer * t.kv_stride
+        kv_off = t.q_bytes + buffer * t.kv_stride + slot * page_bytes
         valid = fx.max(
             fx.Int32(0), fx.min(fx.Int32(128), ctx.planned_context - token_base)
         )

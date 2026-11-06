@@ -760,6 +760,11 @@ class Gfx1250Bf16Pipeline:
         self.merge = Gfx1250PartitionMerge(ctx, self.mem)
 
     @flyc.jit
+    def _stage(self, token_base, end, buffer, slot):
+        if token_base < end:
+            self.mem.stage_bf16_page(token_base, buffer, slot)
+
+    @flyc.jit
     def run(self):
         ctx, t = self.ctx, self.t
         ctx.tid = fx.Int32(gpu.thread_id("x"))
@@ -813,15 +818,20 @@ class Gfx1250Bf16Pipeline:
         )
         # Keep the Q loads ahead of the first page's table lookup.
         fx.rocdl.sched_barrier(0)
-        self.mem.stage_bf16_page(begin, fx.Int32(0))
-        for token_i, state in range(begin, end, 128, init=initial):
+        # Pages per softmax step; each keeps the one-page LDS layout.
+        step = t.TOKENS
+        pages = step // 128
+        page_bytes = 128 * t.head_dim * 2
+        for p in range_constexpr(pages):
+            self._stage(begin + p * 128, end, fx.Int32(0), p)
+        for token_i, state in range(begin, end, step, init=initial):
             token_base = fx.Int32(token_i)
-            buffer = ((token_base - begin) // 128) % 2
+            buffer = ((token_base - begin) // step) % 2
             tdm_ops.tensor_wait(0)
             gpu.barrier()
             kv_off = t.q_bytes + buffer * t.kv_stride
-            if token_base + 128 < end:
-                self.mem.stage_bf16_page(token_base + 128, 1 - buffer)
+            for p in range_constexpr(pages):
+                self._stage(token_base + step + p * 128, end, 1 - buffer, p)
             next_state = []
             for m in range_constexpr(t.m_tiles):
                 row = m * 16 + ctx.lane16
@@ -833,19 +843,21 @@ class Gfx1250Bf16Pipeline:
                     + 1
                 )
                 units = []
-                for n in range_constexpr(2):
+                for n in range_constexpr(step // 64):
                     scores = fx.Vector.filled(8, 0.0, fx.Float32)
+                    # Wave w's tokens of the step lie in page w // (4 // pages).
+                    wave_token = ctx.warp * (step // 4) + n * 16
                     for d in range_constexpr(t.head_dim // 32):
                         k = self.mem.bf16_k_operand(
-                            kv_off,
-                            ctx.warp * 32 + n * 16,
+                            kv_off + wave_token // 128 * page_bytes,
+                            wave_token % 128,
                             d * 32,
                             ctx.lane16,
                             ctx.half,
                         )
                         scores = Gfx1250Gemm.mma(k, q_operands[m][d], scores, 32, True)
                     for r in range_constexpr(8):
-                        token = token_base + ctx.warp * 32 + n * 16 + ctx.half * 8 + r
+                        token = token_base + wave_token + ctx.half * 8 + r
                         visible = (token < upper) & (row < t.rows)
                         if const_expr(t.sliding_window > 0):
                             visible = visible & (token >= upper - t.sliding_window)
@@ -879,7 +891,7 @@ class Gfx1250Bf16Pipeline:
                         scores
                         - fx.Vector.from_elements(
                             [safe_max], dtype=fx.Float32
-                        ).broadcast_to(16),
+                        ).broadcast_to(step // 8),
                         fastmath="afn",
                     )
                 )
@@ -891,14 +903,14 @@ class Gfx1250Bf16Pipeline:
                         tile_sum,
                         fx.Float32,
                     )
-                for n in range_constexpr(2):
+                for n in range_constexpr(step // 64):
                     p = fx.Vector.from_elements(
                         [probs[n * 8 + r] for r in range_constexpr(8)], dtype=fx.Float32
                     ).to(fx.BFloat16)
                     self.mem.store(
                         t.p_offset
                         + ctx.lane16 * t.v_stride
-                        + (ctx.warp * 32 + n * 16 + ctx.half * 8) * 2,
+                        + (ctx.warp * (step // 4) + n * 16 + ctx.half * 8) * 2,
                         p,
                         fx.BFloat16,
                     )
@@ -911,7 +923,7 @@ class Gfx1250Bf16Pipeline:
                     self.mem.operand(
                         t.p_offset + d * 64, t.v_stride, 32, ctx.lane16, ctx.half
                     )
-                    for d in range_constexpr(4)
+                    for d in range_constexpr(step // 32)
                 ]
                 for vh in range_constexpr(t.head_dim // 64):
                     # Rescale the running accumulator before PV's fused adds.
@@ -919,7 +931,7 @@ class Gfx1250Bf16Pipeline:
                         [corr],
                         dtype=fx.Float32,
                     ).broadcast_to(8)
-                    for d in range_constexpr(4):
+                    for d in range_constexpr(step // 32):
                         v = self.mem.bf16_v_operand(
                             kv_off + t.k_bytes,
                             vh * 64 + ctx.warp * 16,
