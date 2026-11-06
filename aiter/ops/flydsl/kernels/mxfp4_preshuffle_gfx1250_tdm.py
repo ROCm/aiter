@@ -17,7 +17,9 @@ from flydsl.expr.typing import Vector as Vec
 
 from aiter.utility.mx_types import MxDtypeInt as MxDtype
 
-from .buffer_ops import buffer_store, create_buffer_resource_from_addr
+from .buffer_ops import buffer_load, buffer_store, create_buffer_resource_from_addr
+from .communication_ops_utils import atomic_add_agent
+from .splitk_epilogue import CPOL_COHERENT
 from .gemm_common_gfx1250 import (
     batched_silu_swiglu,
     batched_situv2,
@@ -171,6 +173,7 @@ def build_gemm_a8w4_tdm_task(
     defer_c_wait=0,
     tdm_snop=0,
     k_waves=1,
+    k_grid=1,
     m_alignment=0,
     expert_tile_m=0,
     direct_expert_map=0,
@@ -325,6 +328,19 @@ def build_gemm_a8w4_tdm_task(
                 "resident-B, map-reuse or deferred-store-wait options"
             )
         K_TILES = K_TILES // k_waves
+    # Cross-workgroup split-K: grid z picks a K slice (combined with k_waves);
+    # each split parks fp32 partials, the last arrival sums them and alone keeps
+    # the tile, and the others blank their epilogue via mn_oob like k_waves does.
+    if k_grid > 1:
+        if K_TILES % k_grid or K % tile_k:
+            raise ValueError(f"k_grid={k_grid} must divide K tiles of K={K}/{tile_k}")
+        if cluster_m > 1 or cluster_n > 1 or explicit_tile:
+            raise ValueError("k_grid needs an unclustered grid")
+        if persistent_contiguous_chunks or reuse_resident_b or defer_output_store_wait:
+            raise ValueError("k_grid does not support contiguous/resident/deferred tasks")
+        if enable_ep_scatter or tdm_as_in_prologue or has_bias:
+            raise ValueError("k_grid does not support EP scatter, the As prologue or bias")
+        K_TILES = K_TILES // k_grid
     # Double buffering is sufficient: the carry reads the other LDS buffer
     # before the post-compute barrier permits reusing the current buffer.
     next_stage_on = 1 if (next_stage_prefetch and num_buffers >= 2) else 0
@@ -384,6 +400,7 @@ def build_gemm_a8w4_tdm_task(
         persistent_workers,
         rolled_drain,
         k_waves,
+        k_grid,
         m_align,
         ROW_ALIGNMENT,
         expert_tile_m,
@@ -666,6 +683,7 @@ def build_gemm_a8w4_tdm_task(
         f"{_reuse_map}{_defer_output_store_wait}"
         f"{_lds_n_partitions}{_packed_expert_map}"
         f"{_direct_expert_map}{_row_align}{_static_m}{_malign}{_kwaves}"
+        f"{f'_kg{k_grid}' if k_grid > 1 else ''}"
     )
 
     # Compile the static path directly, preserving its launch ABI and the
@@ -681,6 +699,7 @@ def build_gemm_a8w4_tdm_task(
     # The direct expert map is a kernel argument only when it is read, so the
     # default kernel ABI (and its preloaded kernarg prefix) is unchanged.
     expert_map_arg_type = fx.Pointer if direct_expert_map else Constexpr[int]
+    splitk_arg_type = fx.Pointer if k_grid > 1 else Constexpr[int]
     # N is compiled in for the grouped launcher; the S1F stage-1 kernel
     # (explicit_tile) passes a traced width, as on main.
     n_arg_type = fx.Int32 if explicit_tile else Constexpr[int]
@@ -711,6 +730,8 @@ def build_gemm_a8w4_tdm_task(
         schedule_rows: task_index_type,
         needs_persistent_fence: task_flag_type = 0,
         arg_m_expert_tile_map: expert_map_arg_type = 0,
+        arg_splitk_ws: splitk_arg_type = 0,
+        arg_splitk_sem: splitk_arg_type = 0,
     ):
         A_KROW = K // A_PACK
         Kp16 = (K // 2) * 16
@@ -726,6 +747,20 @@ def build_gemm_a8w4_tdm_task(
             # sees the same wave ids as an unsplit workgroup.
             k_group = wave // num_waves
             wave = wave % num_waves
+        # Persistent workers fold the split into the task id, split outermost.
+        kg_base_tasks = (
+            ceildiv(schedule_rows, tile_m) * ceildiv(i32_n, tile_n)
+            if k_grid > 1 and persistent_workers
+            else 1
+        )
+        k_split = (
+            (task_id // kg_base_tasks if persistent_workers else fx.block_idx.z)
+            if k_grid > 1
+            else 0
+        )
+        if const_expr(k_grid > 1 and persistent_workers):
+            bid_x = bid_x - k_split * kg_base_tasks
+        k_slice = k_split * k_waves + k_group if k_grid > 1 else k_group
         lane = tid % WAVE
         lane16 = lane % 16
         kgrp = lane // 16
@@ -1133,9 +1168,9 @@ def build_gemm_a8w4_tdm_task(
             cache_modifier=0,
             keep_resident=False,
         ):
-            if const_expr(k_waves > 1 and k_adv):
+            if const_expr((k_waves > 1 or k_grid > 1) and k_adv):
                 # This group's first k-tile, in the view's element units.
-                g_off = g_off + fx.Int64(k_group * K_TILES) * fx.Int64(
+                g_off = g_off + fx.Int64(k_slice * K_TILES) * fx.Int64(
                     k_adv // 4 if on_i32 else k_adv
                 )
             split_i = split_inner and len(wv) > 1
@@ -2295,6 +2330,114 @@ def build_gemm_a8w4_tdm_task(
                         )
                 mn_oob = (k_group == 0).select(mn_oob, mn_oob * 0)
 
+            if const_expr(k_grid > 1):
+                # Group-0 lanes hold the workgroup's sums; park them lane-major so
+                # each split finds its peers' values at its own offset.
+                if const_expr(k_waves == 1):
+                    pipeline_fence(outstanding=0)
+                KG_CHUNKS = WMMA_VECTOR_DWORDS // 4
+                KG_LANES = num_waves * WAVE
+                kg_tid = fx.Int32(tid % KG_LANES)
+                ws_tile_b = n_acc * KG_CHUNKS * KG_LANES * 16
+                tile_id = fx.Int64(
+                    (blk_m // tile_m) * ceildiv(i32_n, tile_n) + blk_n // tile_n
+                )
+                plane_b = fx.Int32(capacity_rows) * fx.Int32(i32_n * 4)
+                ws_rsrc = create_buffer_resource_from_addr(
+                    fx.Int64(fx.ptrtoint(arg_splitk_ws))
+                    + tile_id * ws_tile_b,
+                    num_records_bytes=fx.Int64(plane_b) * (k_grid - 1) + ws_tile_b,
+                )
+
+                def kg_off(idx, q):
+                    return ((idx * KG_CHUNKS + q) * KG_LANES + kg_tid) * 4
+
+                if k_group == 0:
+                    for idx in range_constexpr(n_acc):
+                        v = Vec(c_frags[idx].load())
+                        for q in range_constexpr(KG_CHUNKS):
+                            buffer_store(
+                                Vec.from_elements(
+                                    [v[q * 4 + i] for i in range_constexpr(4)],
+                                    fx.Float32,
+                                ).ir_value(),
+                                ws_rsrc,
+                                kg_off(idx, q),
+                                cache_modifier=CPOL_COHERENT,
+                                soffset_bytes=fx.Int32(k_split) * plane_b,
+                            )
+                # The store wait is the release; peers read with CPOL_COHERENT.
+                rocdl.s_wait_storecnt(0)
+                workgroup_barrier()
+                # Identify the reducing workgroup: the last split to arrive sums
+                # the partials.
+                sem_addr = (
+                    fx.Int64(fx.ptrtoint(arg_splitk_sem))
+                    + tile_id * 4
+                )
+                if fx.Int32(tid) == fx.Int32(0):
+                    arrival = fx.Int32(atomic_add_agent(sem_addr, fx.Int32(1)))
+                    lds_store_b32(stC_idx, 0, Vec.from_elements([arrival], fx.Int32))
+                workgroup_barrier()
+                kg_last = Vec(lds_load_b32(stC_idx, fx.Int32(0)))[0] == fx.Int32(
+                    k_grid - 1
+                )
+                workgroup_barrier()
+                # Only the reducer's group 0 reads, and only its peers' partials:
+                # every other read gets a zero-size resource, so it returns 0
+                # without touching memory and no value is defined under a branch.
+                # The reducer's own partial comes from registers, and the sum
+                # keeps split order so it does not depend on arrival order.
+                kg_reduce = kg_last & (k_group == 0) if k_waves > 1 else kg_last
+                ws_tile_base = (
+                    fx.Int64(fx.ptrtoint(arg_splitk_ws)) + tile_id * ws_tile_b
+                )
+                kg_own = []
+                kg_rsrcs = []
+                for s in range_constexpr(k_grid):
+                    own_s = fx.Int32(k_split) == fx.Int32(s)
+                    read_s = kg_reduce & (fx.Int32(k_split) != fx.Int32(s))
+                    kg_own.append(own_s)
+                    kg_rsrcs.append(
+                        create_buffer_resource_from_addr(
+                            ws_tile_base + fx.Int64(plane_b) * s,
+                            num_records_bytes=fx.Int64(
+                                read_s.select(fx.Int32(ws_tile_b), fx.Int32(0))
+                            ),
+                        )
+                    )
+                for idx in range_constexpr(n_acc):
+                    own = Vec(c_frags[idx].load())
+                    tot = []
+                    for q in range_constexpr(KG_CHUNKS):
+                        acc4 = None
+                        for s in range_constexpr(k_grid):
+                            peer = Vec(
+                                buffer_load(
+                                    kg_rsrcs[s],
+                                    kg_off(idx, q),
+                                    vec_width=4,
+                                    dtype=T.i32,
+                                    cache_modifier=CPOL_COHERENT,
+                                )
+                            ).bitcast(fx.Float32)
+                            part = [
+                                kg_own[s].select(own[q * 4 + i], peer[i])
+                                for i in range_constexpr(4)
+                            ]
+                            acc4 = (
+                                part
+                                if acc4 is None
+                                else [acc4[i] + part[i] for i in range_constexpr(4)]
+                            )
+                        tot += acc4
+                    c_frags[idx].store(Vec.from_elements(tot, fx.Float32).ir_value())
+                if kg_last:
+                    if fx.Int32(tid) == fx.Int32(0):
+                        # Undo with the same atomic so the next launch starts at 0.
+                        atomic_add_agent(sem_addr, fx.Int32(-k_grid))
+                mn_oob = kg_last.select(mn_oob, mn_oob * 0)
+
             accs = []
             output_fragments_per_acc = WMMA_N // 16
             for idx in range_constexpr(n_acc):
@@ -3033,6 +3176,9 @@ def launch_gemm_a8w4_tdm(
     lds_n_partitions: Constexpr[int] = 1,
     ds_first_n: Constexpr[int] = -1,  # -1: per-shape IGLP_PARAMS default
     mma_prio: Constexpr[int] = 0,
+    k_grid: Constexpr[int] = 1,
+    arg_splitk_ws: fx.Pointer = None,
+    arg_splitk_sem: fx.Pointer = None,
 ):
     """Launch the grouped contiguous-M a8w4 MoE GEMM for gfx1250.
 
@@ -3097,6 +3243,7 @@ def launch_gemm_a8w4_tdm(
         a_preshuffled=a_preshuffled,
         m_align=m_align,
         k_waves=k_waves,
+        k_grid=k_grid,
         m_alignment=m_alignment,
         expert_tile_m=expert_tile_m,
         direct_expert_map=direct_expert_map,
@@ -3134,6 +3281,8 @@ def launch_gemm_a8w4_tdm(
         f32_situ_beta: fx.Float32,
         f32_situ_linear_beta: fx.Float32,
         arg_m_expert_tile_map: fx.Pointer,
+        arg_splitk_ws: fx.Pointer,
+        arg_splitk_sem: fx.Pointer,
     ):
         def run_task(task_id, rows, needs_persistent_fence):
             # i32_m remains the allocation capacity: the scale buffer's
@@ -3157,6 +3306,8 @@ def launch_gemm_a8w4_tdm(
                 rows,
                 needs_persistent_fence,
                 arg_m_expert_tile_map if direct_expert_map else 0,
+                arg_splitk_ws if k_grid > 1 else 0,
+                arg_splitk_sem if k_grid > 1 else 0,
             )
 
         if const_expr(persistent_workers > 0):
@@ -3170,7 +3321,7 @@ def launch_gemm_a8w4_tdm(
             )
             tile_map = fx.recast_iter(map_ptr_type, arg_m_tile_map)
             rows = tile_map[n_experts - 1]
-            tasks = ceildiv(rows, tile_m) * ceildiv(i32_n, tile_n)
+            tasks = ceildiv(rows, tile_m) * ceildiv(i32_n, tile_n) * k_grid
             if const_expr(persistent_single_task):
                 if fx.block_idx.x < tasks:
                     run_task(fx.block_idx.x, rows, 0)
@@ -3203,6 +3354,10 @@ def launch_gemm_a8w4_tdm(
         arg_ep_row_map = arg_c
     if arg_quant_scale is None:
         arg_quant_scale = arg_c
+    if arg_splitk_ws is None:
+        arg_splitk_ws = arg_c
+    if arg_splitk_sem is None:
+        arg_splitk_sem = arg_c
     expert_map_ptr = (
         fx.get_iter(arg_m_expert_tile_map)
         if arg_m_expert_tile_map is not None
@@ -3231,18 +3386,20 @@ def launch_gemm_a8w4_tdm(
             else ((m_tiles + cluster_m - 1) // cluster_m) * n_tiles
         ),
         cluster_m,
-        1,
+        1 if persistent_workers else k_grid,
     )
-    if persistent_workers:
-        launch_kernel = kernel
-        launch_args = kargs + (expert_map_ptr,)
-    else:
-        # The static path launches gemm_task itself: its task coordinates are
-        # compile-time zeros and the expert map is an argument only when read.
-        launch_kernel = gemm_task
-        launch_args = kargs + (0, 0, 0) + (
-            (expert_map_ptr,) if direct_expert_map else (0,)
-        )
+    # Ternaries, not if/else: @flyc.jit does not let branch-local names escape.
+    # The static path launches gemm_task itself: its task coordinates are
+    # compile-time zeros and the expert map is an argument only when read.
+    launch_kernel = kernel if persistent_workers else gemm_task
+    launch_args = (
+        kargs + (expert_map_ptr, arg_splitk_ws, arg_splitk_sem)
+        if persistent_workers
+        else kargs
+        + (0, 0, 0)
+        + ((expert_map_ptr,) if direct_expert_map else (0,))
+        + ((arg_splitk_ws, arg_splitk_sem) if k_grid > 1 else ())
+    )
     if cluster_m > 1 or cluster_n > 1:
         # Geometry must reach BOTH the definition and the launch site, or the
         # cluster never forms and the TDM loads silently fall back to per-load.

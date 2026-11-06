@@ -143,6 +143,9 @@ def flydsl_grouped_gemm_a8w4_masked(
     rolled_drain=0,
     m_align=0,
     k_waves=1,
+    k_grid=1,
+    splitk_ws=None,
+    splitk_sem=None,
     persistent_contiguous_chunks=0,
     reuse_resident_b=0,
     defer_output_store_wait=0,
@@ -206,7 +209,16 @@ def flydsl_grouped_gemm_a8w4_masked(
             )
         if stage2_scatter is not None:
             raise ValueError(f"k_waves={k_waves} does not support the EP scatter")
-    num_buffers = min(num_buffers, max(1, k_tiles // k_waves))
+    k_grid = int(k_grid)
+    if k_grid > 1:
+        if K % tile_k or k_tiles % (k_waves * k_grid):
+            raise ValueError(
+                f"k_grid={k_grid} x k_waves={k_waves} must evenly split "
+                f"{k_tiles} K tiles (K={K}, tile_k={tile_k})"
+            )
+        if splitk_ws is None or splitk_sem is None:
+            raise ValueError("k_grid needs splitk_ws and a zeroed splitk_sem")
+    num_buffers = min(num_buffers, max(1, k_tiles // (k_waves * k_grid)))
     m_alignment = int(m_alignment or tile_m)
     if m_alignment % tile_m:
         raise ValueError(
@@ -395,6 +407,9 @@ def flydsl_grouped_gemm_a8w4_masked(
         *layout_spec,
         expert_tile_map_tensor,
         *moe_spec,
+        k_grid,
+        ptr_arg(splitk_ws if splitk_ws is not None else out),
+        ptr_arg(splitk_sem if splitk_sem is not None else out),
         specialization_key=(
             gemm_spec,
             route_spec,
@@ -403,6 +418,7 @@ def flydsl_grouped_gemm_a8w4_masked(
             ep_spec,
             layout_spec,
             moe_spec,
+            k_grid,
         ),
     )
     return out
