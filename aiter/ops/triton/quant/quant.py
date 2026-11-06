@@ -316,7 +316,9 @@ def dynamic_mxfp4_quant(
         )
 
     # Every gfx1250 input has a Gluon kernel; the call only validates `backend`.
-    if arch_info.get_arch() == "gfx1250" and _use_gluon(backend, True, "gfx1250"):
+    if arch_info.get_arch() in ("gfx1250", "gfx1250-strict") and _use_gluon(
+        backend, True, "gfx1250"
+    ):
         from aiter.ops.triton._gluon_kernels.gfx1250.quant.quant import (
             gluon_dynamic_mxfp4_quant_kernel_gfx1250,
         )
@@ -564,7 +566,7 @@ def dynamic_mxfp8_quant(
         assert scale.shape == (M, Ns), f"scale shape {scale.shape} != ({M},{Ns})"
         assert scale.dtype == torch.uint8
 
-    if arch_info.get_arch() == "gfx1250" and _use_gluon(
+    if arch_info.get_arch() in ("gfx1250", "gfx1250-strict") and _use_gluon(
         backend,
         x2d.dtype in (torch.bfloat16, torch.float16)
         and quant_dtype == torch.float8_e4m3fn,
