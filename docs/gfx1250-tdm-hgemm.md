@@ -39,74 +39,42 @@ the source behavior, not the rounding behavior of a single FP32 `linear` with
 fused bias. The policy does not support FP32 output, scaling or preshuffled W.
 Existing policies continue to serve their supported cases.
 
-## Reproduce tuning
+## Tune through AITER's standard GEMM tuner
 
-From the AITER repository in an environment with its FlyDSL dependency installed:
+The new `tdm` candidates are part of the existing `GemmA16W16Tuner`, alongside
+the existing backends. No separate TDM tuner or additional tuning CSV is shipped.
 
-    ROCBLAS_USE_HIPBLASLT=0 \
-    python -m csrc.gemm_a16w16.tune_gfx1250_tdm \
-      --all-bias --compile-workers 16 \
-      --output /tmp/gfx1250_tdm.csv --details /tmp/gfx1250_tdm_details
+For the existing MiniMax M3 gfx1250 BF16 entries, run from the repository root:
 
-Existing output files are not overwritten. To continue a stopped run, pass
-`--resume` with the same output, details path, seed, split mode and environment.
-Completed rows are reused only if their per-candidate JSON evidence and current
-source space match; interrupted shapes are rerun from the beginning.
+    config=aiter/configs/model_configs/minimax_m3_eagle_bf16_tuned_gemm.csv
+    python -m csrc.gemm_a16w16.gemm_a16w16_tune \
+  \
+      --input_file "$config" --tuned_file "$config" \
+  \
+      --all --libtype all --splitK --mp 3 --shape_grouped --batch 3 \
+  \
+      --compare --update_improved --min_improvement_pct 3
 
-This covers the source `tune_all` list of 19 `(M,N,K)` shapes, independently for
-bias off/on. `--shape M N K` selects one shape. `--no-split-k` restricts enumeration
-to the source non-split mode; otherwise the source's valid factors from 1 to 9
-and original pruning are used. No candidate-space reduction is added.
-`--shard I --shards N` divides the shape list; give each shard a different output
-and details path, and run GPU timing shards on different devices.
+Use the same input/output path: the standard tuner's `--all` selects existing
+rows for the current gfx/CU identity, retaining other architectures.
+The file name includes `eagle`, but this is the existing MiniMax BF16 table
+containing the gfx1250 entries. The separate `minimax_m3_mxfp4` table has no
+gfx1250 rows at the source base and is not extended by this retune.
 
-The normal AITER GEMM tuner also sees `tdm` candidates on gfx1250 for matching
-input/output dtypes, alongside its existing policies. The dedicated script above
-isolates the imported source space and checks its split-partial rounding semantics.
+`--compare --update_improved` uses the standard production-op before/after
+comparison and only updates qualifying rows. Failed candidates retain the
+standard tuner's rejection rules; there is no custom reference or timing path.
+`--libtype all` includes the backends available in the environment; hipBLASLt
+remains opt-in via the existing `--with-hipblaslt` option.
 
-Each candidate is compiled, run through AITER's `flydsl_hgemm`, and checked
-against a source-order reference on nonzero quantized random data.
-Compile/validation failures are recorded, not included as winners.
-Initial timing uses three graph samples of eight calls. The fastest eight
-candidates are remeasured with nine graph samples of twenty calls each; selection
-uses the median. A selected winner additionally passes a fresh normal-random
-input check with `atol=rtol=0.05`.
+To verify the resulting table through the standard production-op benchmark:
 
-The CSV uses AITER's existing BF16 GEMM schema; `kernelName` carries `ptdm`,
-the full tile/wave/group/split configuration and architecture. `solidx` is the
-source-space index and is informational for FlyDSL dispatch.
-`err_ratio=0` refers to exact equality on the quantized-data check, not bitwise
-equality to a fused FP32 reference for arbitrary inputs.
-JSON evidence includes every candidate and the finalist samples.
+    python -m csrc.gemm_a16w16.gemm_a16w16_tune \
+  \
+      --run_config "$config" --input_file "$config" --tuned_file "$config"
 
-**Timing scope:** graph-event GPU time at fixed input addresses, including the
-kernel's bias or cluster-reduction work. CPU dispatch, compilation, tensor
-allocation and input/reference generation are outside the timed graph.
-This is not an end-to-end application, cold-cache or rotating-input benchmark.
-Shared-device load and clocks can affect selection; rerun on the deployment
-device before treating a table as a performance baseline.
-
-## Load and verify a table
-
-The shipped opt-in table is
-`aiter/configs/gfx1250_tdm_bf16_tuned_gemm.csv` (19 shapes, bias off/on).
-See [measured results and validation](gfx1250-tdm-hgemm-results.md).
-
-Default AITER model tables are not replaced. Load a generated or shipped table explicitly,
-before importing AITER:
-
-    export AITER_CONFIG_GEMM_BF16=/tmp/gfx1250_tdm.csv
-    ROCBLAS_USE_HIPBLASLT=0 \
-    python -m csrc.gemm_a16w16.validate_tdm_csv
-
-The validator checks each row through `aiter.tuned_gemm.gemm_a16w16` and
-`gemm_a16w16_out`, asserts that dispatch retains `policy="tdm"`, and replays a
-captured graph after changing the inputs.
-
-Application usage after setting that environment variable:
-
-    from aiter.tuned_gemm import gemm_a16w16
-    out = gemm_a16w16(a, w, bias)
+Tune and benchmark on representative hardware/load before interpreting results
+as application-level gains. The source TDM rounding semantics above still apply.
 
 ## Regression tests
 
