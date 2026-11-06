@@ -37,12 +37,11 @@ _GFX = ("gfx942",)
 _N = 4
 # Last-level (Infinity) cache, which decides whether the staged collapse stays resident.
 _MALL_BYTES = 256 * 1024 * 1024
-# Split-K of the fused pass: the largest legal split that keeps the grid within
-# _SPLIT_TARGET_BLOCKS workgroups or _MAX_SPLITS splits, whichever allows more, preferring one
-# whose last round of workgroups is at least _MIN_ROUND_FILL full -- a nearly empty last round
-# costs most of a full one. Never more than _MAX_FOLD: each finish lane folds one partial per
-# split, one after another, and that chain outgrows what a fuller grid saves.
-_MIN_ROUND_FILL = 0.73
+# Split-K of the fused pass (_splits). A nearly empty last round of workgroups costs
+# most of a full one, so prefer a split that fills it to _MIN_ROUND_FILL. _MAX_FOLD caps
+# the split because each finish lane folds the partials one after another.
+# Not sensitive: any value from 0.53 to 0.84 picks the same splits at every benchmarked size.
+_MIN_ROUND_FILL = 0.7
 _SPLIT_TARGET_BLOCKS = 512
 _MAX_SPLITS = 8
 _MAX_FOLD = 64
