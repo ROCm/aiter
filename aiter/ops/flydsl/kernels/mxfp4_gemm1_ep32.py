@@ -75,9 +75,10 @@ def _situv2_4_25_mul_batch(gs, us):
 #     time, so VGPRs fit 3 waves/SIMD and LDS fits 3 workgroups.
 #   * Weights are loaded non-temporal (use_nt): after the tail fold no weight
 #     tile is read twice, and NT keeps the gathered activations resident in L2.
-#   * SiTUv2 with beta=4, linear_beta=25 uses a merged form with 2 exp2 and 1
-#     reciprocal per output (from the cx workspace's FASTSITU); this changes
-#     rounding (7 of 6.1M fp8 outputs differ by one step on the M=4096 dump).
+#   * SiTUv2 uses the generic kernel's activation, so real rows are bit-exact.
+#     The merged 2-exp2 + 1-rcp form (fast_situ, from the cx workspace's
+#     FASTSITU) saves ~0.5 us but changes rounding (7 of 6.1M fp8 outputs differ
+#     by one step on the M=4096 dump); it is kept but off.
 # Output layout matches the generic kernel;
 # padding rows hold zeros (or are left unwritten for folded tail blocks).
 EP32_G1_VARIANTS = {(64, True, False), (64, False, False)}
@@ -1748,7 +1749,7 @@ def compile_gemm1_ep32(
     skip_pad = True
     khalf_loop = 2
     epi32 = True
-    fast_situ = True  # SiTUv2 beta=4/25: 2 exp2 + 1 rcp per output (see _situv2_4_25_mul_batch)
+    fast_situ = False  # True: SiTUv2 beta=4/25 as 2 exp2 + 1 rcp (_situv2_4_25_mul_batch), not bit-exact
     kAStages_ = k_stages + 1
     lds_bytes = max(
         kAStages_ * (BM + 16) * KH_TILE + 3 * K_TILES_TOTAL * 256,
