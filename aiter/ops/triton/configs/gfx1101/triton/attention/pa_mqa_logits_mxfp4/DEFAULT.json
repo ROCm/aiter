@@ -1,3 +1,6 @@
 {
-  "BLOCK_KV": 64
+  "BLOCK_KV": 128,
+  "num_warps": 4,
+  "waves_per_eu": 0,
+  "num_stages": 1
 }
