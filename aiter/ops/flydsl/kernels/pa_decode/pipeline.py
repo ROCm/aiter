@@ -1794,6 +1794,34 @@ class Gfx1250Pipeline:
         self.merge = Gfx1250PartitionMerge(ctx, self.mem)
 
     @flyc.jit
+    def _wait_stage(self, token_base, begin, end):
+        """Wait for this step's stage.
+
+        The prologue issues the second stage right after the first, so step 0
+        leaves its copies in flight: same-wave TDM copies complete in order,
+        and asynchronous scale copies only accompany whole stages.
+        """
+        t = self.t
+        if const_expr(t.early_second_stage):
+            if (token_base == begin) & (begin + t.TOKENS < end):
+                tdm_ops.tensor_wait(t.stage_tdm_ops)
+                if const_expr(t.async_page or t.page16_async_scales or t.page16_wide):
+                    if begin + 2 * t.TOKENS <= self.ctx.planned_context:
+                        fx.rocdl.s_wait_asynccnt(t.stage_async_ops)
+                    else:
+                        fx.rocdl.s_wait_asynccnt(0)
+            else:
+                tdm_ops.tensor_wait(0)
+                if const_expr(t.async_page or t.page16_async_scales or t.page16_wide):
+                    fx.rocdl.s_wait_asynccnt(0)
+        elif const_expr(t.use_tdm):
+            tdm_ops.tensor_wait(0)
+            if const_expr(t.async_page or t.page16_async_scales):
+                fx.rocdl.s_wait_asynccnt(0)
+        else:
+            fx.rocdl.s_wait_asynccnt(0)
+
+    @flyc.jit
     def run(self):
         ctx, t = self.ctx, self.t
         ctx.tid = fx.Int32(gpu.thread_id("x"))
@@ -1814,6 +1842,9 @@ class Gfx1250Pipeline:
         if const_expr(early_query):
             q_tiles = self.mem.load_query()
         self.mem.stage_kv(begin, fx.Int32(0))
+        if const_expr(t.early_second_stage):  # noqa: SIM102
+            if begin + t.TOKENS < end:
+                self.mem.stage_kv(begin + t.TOKENS, fx.Int32(1))
         if const_expr(early_query):
             self.mem.store_query(q_tiles)
         elif const_expr(t.q_tiles == t.m_tiles):
@@ -1864,16 +1895,14 @@ class Gfx1250Pipeline:
         for token_i, state in range(begin, end, t.TOKENS, init=initial):
             token_base = fx.Int32(token_i)
             buffer = ((token_base - begin) // t.TOKENS) % t.buffers
-            if const_expr(t.use_tdm):
-                tdm_ops.tensor_wait(0)
-                if const_expr(t.async_page or t.page16_async_scales):
-                    fx.rocdl.s_wait_asynccnt(0)
-            else:
-                fx.rocdl.s_wait_asynccnt(0)
+            self._wait_stage(token_base, begin, end)
             gpu.barrier()
             kv_off = t.q_bytes + buffer * t.kv_stride
             if const_expr(t.buffers == 2):  # noqa: SIM102
-                if token_base + t.TOKENS < end:
+                # The prologue staged the second step.
+                if (token_base + t.TOKENS < end) & (
+                    (token_base != begin) if t.early_second_stage else True
+                ):
                     self.mem.stage_kv(token_base + t.TOKENS, 1 - buffer)
             vnorm = fx.Float32(1.0)
             vfactor = fx.Float32(1.0 if t.bf16 else 1.0 / t.FP8_MAX)

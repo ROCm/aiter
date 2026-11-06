@@ -843,6 +843,9 @@ class Gfx1250Traits:
     narrow_fp8_page16: bool = False
     # Sequences sharing one cluster of cluster_merge * cluster_seqs CTAs.
     cluster_seqs: int = 1
+    # Grids within one CTA per CU, where copy latency rather than bandwidth
+    # bounds a task.
+    latency_grid: bool = False
 
     WAVE = 32
     NWARP = 4
@@ -915,6 +918,41 @@ class Gfx1250Traits:
             and self.m_tiles == 1
             and self.sliding_window == 0
         )
+
+    @property
+    def early_second_stage(self):
+        # On latency-bound grids, double-buffered page16 steps issue the second
+        # stage in the prologue: short sparse tasks overlap both copies. Fuller
+        # grids and page128 pairs lose more to the earlier copy than they gain.
+        return (
+            self.latency_grid
+            and self.block_size == 16
+            and self.use_tdm
+            and self.buffers == 2
+            and (self.packed_lds or self.bf16_page16_packed)
+        )
+
+    @property
+    def stage_tdm_ops(self):
+        # TDM copies one wave issues for a whole stage; partial stages issue
+        # at least as many.
+        if self.page16_wide:
+            return 2 * self.page16_pages
+        if self.page128_pair:
+            return 4
+        if self.bf16_page16_packed:
+            return 2 * (self.TOKENS // 64)
+        return 2
+
+    @property
+    def stage_async_ops(self):
+        # Asynchronous scale copies a wave issues for a whole stage (wave 0
+        # alone for page128; others issue none). Partial stages issue none.
+        if not self.per_token_kv:
+            return 0
+        if self.page128_pair:
+            return 4
+        return 2
 
     @property
     def page16_pages(self):
