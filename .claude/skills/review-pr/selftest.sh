@@ -273,6 +273,33 @@ Design (advisory): route the expert through the per-expert gate rather than the 
 Human: recommend bob review whether the per-expert gate in fused_moe.py holds at TP=8' \
     "$dg_roster" "$dg_meta_big")" "UNSPLIT"
 
+echo "[reviewer roster]"
+# The roster is the design gate's ground truth, and two defects found by dry-running 10
+# over-bar PRs live here, not in the gate: copilot-pull-request-reviewer "reviews" PRs on
+# this repo and rode 3 of those 10 rosters (routing a design question to a bot reads as
+# routed and lands in a void), and a PR that is all brand-new files has no git-log
+# authors, so it routed nowhere exactly when it was newest. Drive the shipping roster
+# block against a fake PR and a fake worktree.
+roster_of() {  # <pr_meta.json> <worktree> -> the roster fetch.sh would write
+  { sed -n '/^  python3 - "\$WORK\/pr_meta.json" "\$TARGET_WT" <<.PYEOF./,/^PYEOF$/p' "$S/fetch.sh" \
+      | sed "1s|.*|python3 - \"$1\" \"$2\" <<'PYEOF'|"
+  } | bash
+}
+rr=$(mktemp -d)
+git -C "$rr" init -q . && git -C "$rr" config user.email carol@amd.com && git -C "$rr" config user.name Carol
+mkdir -p "$rr/sub" && echo x > "$rr/sub/existing.py" && git -C "$rr" add . && git -C "$rr" commit -qm one
+git -C "$rr" config user.email 1234+dave@users.noreply.github.com && git -C "$rr" config user.name "Dave D"
+echo y >> "$rr/sub/existing.py" && git -C "$rr" commit -qam two
+printf '%s' '{"author":{"login":"alice"},"reviews":[{"author":{"login":"copilot-pull-request-reviewer"}},{"author":{"login":"bob"}}],"files":[{"path":"sub/existing.py","additions":1,"deletions":0}]}' > "$rr/meta.json"
+t "a bot reviewer never reaches the roster" \
+  "$(roster_of "$rr/meta.json" "$rr" | grep -c copilot)" "0"
+t "the human reviewer and the path authors do" \
+  "$(roster_of "$rr/meta.json" "$rr" | grep -cE '^(bob|Carol|dave)$')" "3"
+printf '%s' '{"author":{"login":"alice"},"reviews":[],"files":[{"path":"sub/brand_new.py","additions":900,"deletions":0}]}' > "$rr/meta2.json"
+t "an all-new-file PR falls back to the parent dir's authors" \
+  "$(roster_of "$rr/meta2.json" "$rr" | grep -cE '^(Carol|dave)$')" "2"
+rm -rf "$rr"
+
 echo "[derive]"
 # Families for a synthetic diff, run through the shipping parse() + derive().
 fams() {  # <diff text> -> space-separated family names

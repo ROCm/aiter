@@ -985,22 +985,39 @@ author = a.get("login", "") if isinstance(a, dict) else str(a or "")
 seen, out = set(), []
 def add(name):
     name = (name or "").strip().lstrip("@")
+    # A routed design question lands in a bot's void: copilot-pull-request-reviewer
+    # "reviews" PRs on this repo, so it rides in through the reviews field and a roster
+    # that admits it green-lights routing the judgment to nobody. Same filter the
+    # inline-comment collector already uses.
     if name and name.lower() not in ("ghost", "invalid-email-address", author.lower()) \
-       and name.lower() not in seen and len(out) < 30:
+       and "copilot" not in name.lower() and "bot" not in name.lower() \
+       and "[bot]" not in name.lower() and name.lower() not in seen and len(out) < 30:
         seen.add(name.lower())
         out.append(name)
 for r in meta.get("reviews") or []:
     ra = r.get("author")
     add(ra.get("login") if isinstance(ra, dict) else str(ra or ""))
 paths = [f.get("path") for f in (meta.get("files") or []) if f.get("path")]
-if wt and os.path.isdir(wt) and paths:
+
+def log_authors(path_args):
     p = subprocess.run(
-        ["git", "-C", wt, "log", "--format=%an|%ae", "-n", "200", "--"] + paths,
+        ["git", "-C", wt, "log", "--format=%an|%ae", "-n", "200", "--"] + path_args,
         capture_output=True, text=True, check=False)
     for line in (p.stdout or "").splitlines():
         name, _, email = line.partition("|")
         m = re.match(r"(\d+\+)?([A-Za-z0-9-]+)@users\.noreply\.github\.com$", email.strip())
         add(m.group(2) if m else name.strip())
+
+if wt and os.path.isdir(wt) and paths:
+    log_authors(paths)
+    if not out:
+        # A brand-new file has no git-log authors, so a PR that is all new files routes
+        # nowhere exactly when it is newest (found on a 10-PR dry-run: two new kernel
+        # files, no reviews, empty roster). Widen to the parents -- the authors of the
+        # code this PR sits among are the next-best judges of its design.
+        parents = sorted({os.path.dirname(p) for p in paths if os.path.dirname(p)})
+        if parents:
+            log_authors(parents)
 for name in out:
     print(name)
 PYEOF
