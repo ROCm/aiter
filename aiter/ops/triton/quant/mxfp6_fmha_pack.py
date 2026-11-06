@@ -6,12 +6,18 @@ import numpy as np
 
 try:
     import torch
+
+    _HAVE_TORCH = True
+except ImportError:
+    _HAVE_TORCH = False
+
+try:
     import triton
     import triton.language as tl
 
     from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
-    _HAVE_TRITON = True
+    _HAVE_TRITON = _HAVE_TORCH
 except ImportError:
     _HAVE_TRITON = False
 
@@ -788,7 +794,7 @@ def _e2m3_encode_torch(y: "torch.Tensor") -> "torch.Tensor":
 
 def quantize_fp6_lastdim_torch(x: "torch.Tensor"):
     """Torch-compile-friendly last-dimension MXFP6 E2M3 quantization."""
-    assert _HAVE_TRITON, "torch unavailable"
+    assert _HAVE_TORCH, "torch unavailable"
     lead = list(x.shape[:-1])
     D = x.shape[-1]
     assert D % 32 == 0, D
@@ -865,7 +871,7 @@ def quantize_fp6_k_lds_order_torch(
     [b, h, nt*17408] buffer, scale uint8 [b, sk, h, 4] (ABI only; the kernel reads scales from the
     K tail)). If return_raw: (buf, sbuf) contiguous backing buffers (for a torch.library.custom_op
     caller that must rebuild the strided view outside the op)."""
-    assert _HAVE_TRITON, "torch unavailable"
+    assert _HAVE_TORCH, "torch unavailable"
     b, sk, h, d = k_thd.shape
     assert d == 128 and tile == 128, (d, sk, tile)
     nt = (sk + tile - 1) // tile  # ceil; the valid mask zeroes a partial tail tile
