@@ -109,6 +109,7 @@ def _check(
     with_bias=False,
     activation="silu",
     strided_ci=False,
+    pad_slot_id=PAD_SLOT_ID,
     seed=0,
 ):
     n_slots = n_slots or max(16, 2 * len(seqlens))
@@ -148,7 +149,7 @@ def _check(
         cache_indices=ci,
         has_initial_state=hi,
         activation=activation,
-        pad_slot_id=PAD_SLOT_ID,
+        pad_slot_id=pad_slot_id,
         block_m=8,
         preserve_input_dtype=preserve_input_dtype,
     )
@@ -292,6 +293,48 @@ def test_window_kernel_selection(monkeypatch, opt_out):
     # Archs without a window config (e.g. gfx942) use the 2D-tiled kernel
     has_config = conv_prefill.has_conv_config(conv_prefill._WINDOW_CONFIG_NAME)
     assert spy.launches == (0 if opt_out or not has_config else 1)
+
+
+def test_no_pad_slot_uses_2d_kernel(monkeypatch):
+    # pad_slot_id=None disables the slot comparison, which only the 2D-tiled kernel supports.
+    monkeypatch.setenv("AITER_CONV1D_SPLIT_QKV_WINDOW", "1")
+    spy = _LaunchSpy(conv_prefill._causal_conv1d_fwd_split_qkv_window_kernel)
+    monkeypatch.setattr(conv_prefill, "_causal_conv1d_fwd_split_qkv_window_kernel", spy)
+    _check([700, 33], [True, False], pad_slot_id=None)
+    assert spy.launches == 0
+
+
+@pytest.mark.parametrize(
+    "dim,halved",
+    [(192, True), (96, False)],  # BD halving, divisibility fallback
+)
+def test_window_block_d_dispatch(monkeypatch, dim, halved):
+    # 1025 tokens selects a config with BD > 64, which does not divide 192 or 96.
+    monkeypatch.setenv("AITER_CONV1D_SPLIT_QKV_WINDOW", "1")
+    if not conv_prefill.has_conv_config(conv_prefill._WINDOW_CONFIG_NAME):
+        pytest.skip("no window config on this arch")
+    seqlens = [1000, 2, 23]
+    base = conv_prefill.get_conv_config(conv_prefill._WINDOW_CONFIG_NAME, M=1025)
+    assert base["BD"] > 64 and dim % base["BD"] != 0
+    configs = []
+    window_config = conv_prefill._window_config
+
+    def record(*args):
+        config = window_config(*args)
+        configs.append(None if config is None else dict(config))
+        return config
+
+    monkeypatch.setattr(conv_prefill, "_window_config", record)
+    spy = _LaunchSpy(conv_prefill._causal_conv1d_fwd_split_qkv_window_kernel)
+    monkeypatch.setattr(conv_prefill, "_causal_conv1d_fwd_split_qkv_window_kernel", spy)
+    _check(seqlens, [True, False, True], k_dim=dim, v_dim=dim, row_extra=64)
+    assert spy.launches == (1 if halved else 0)
+    (config,) = configs
+    if halved:
+        assert dim % config["BD"] == 0 and config["BD"] < base["BD"]
+        assert config["R"] * config["BD"] == base["R"] * base["BD"]
+    else:
+        assert config is None
 
 
 def test_token_contiguous_x_uses_2d_kernel(monkeypatch):
