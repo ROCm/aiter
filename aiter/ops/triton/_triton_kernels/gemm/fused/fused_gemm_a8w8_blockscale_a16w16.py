@@ -171,7 +171,10 @@ def _fused_gemm_a8w8_blockscale_a16w16_kernel(
                 bias_fp8_vals = tl.load(bias_fp8_ptr + offs_b_fp8_n).to(dtype=acc_dtype)
                 accumulator_fp8 += bias_fp8_vals[None, :]
 
-            for k in range(pid_k * num_k_iter, (pid_k + 1) * num_k_iter):
+            # num_stages on the loop also pipelines the scale loads.
+            for k in tl.range(
+                pid_k * num_k_iter, (pid_k + 1) * num_k_iter, num_stages=2
+            ):
                 if EVEN_K:
                     a = tl.load(a_fp8_ptrs)
                     b = tl.load(b_fp8_ptrs, cache_modifier=cache_modifier)
@@ -191,7 +194,10 @@ def _fused_gemm_a8w8_blockscale_a16w16_kernel(
                 a_scale = tl.load(a_scale_ptrs)
                 b_scale = tl.load(b_scale_ptrs)
 
-                accumulator_fp8 += tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
+                # Use an explicit FMA. Triton 3.9 does not fuse mul and add by default.
+                accumulator_fp8 = tl.fma(
+                    tl.dot(a, b), a_scale[:, None] * b_scale[None, :], accumulator_fp8
+                )
 
                 a_fp8_ptrs += BLOCK_SIZE_K * stride_a_fp8_k
                 b_fp8_ptrs += BLOCK_SIZE_K * stride_b_fp8_k
