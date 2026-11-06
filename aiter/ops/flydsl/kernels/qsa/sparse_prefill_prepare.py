@@ -916,7 +916,8 @@ def _route(
     # Only a union phase set by its longest task, not by throughput, gains from a shorter one.
     # A throughput-bound one can still cost more than no union at all: a tile's union grows with
     # how far its rows' selections spread, its direct work only with each row's top-k. So with
-    # route_all_or_none (ROUTE_MODEL[4]), K3 weighs keeping every union tile against none there.
+    # route_all_or_none (ROUTE_MODEL[4]), sparse_prefill_order_masks weighs keeping every union
+    # tile against none there.
     longest = fx.Float32(union_max) > fx.Float32(union_sum) * TASK_SHARE
     compare = True if fx.const_expr(ROUTE_MODEL[4]) else longest
     if compare:

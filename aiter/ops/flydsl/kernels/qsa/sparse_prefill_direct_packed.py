@@ -16,6 +16,8 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import rocdl
 
+from aiter.jit.utils.chip_info import get_gfx_runtime
+
 from .sparse_prefill_common import (
     _MAX_FLOOR,
     _buffer,
@@ -35,7 +37,6 @@ from .sparse_prefill_common import (
     _target_features,
     _uniform,
     _write_address,
-    gfx950,
 )
 
 
@@ -931,7 +932,7 @@ def launch_args(inputs, prepared, out, tasks, stream):
         inputs.scale,
         inputs.topk,
         prepared.slotted,
-        gfx950(),
+        get_gfx_runtime() == "gfx950",
         inputs.kv_stride,
         stream,
     )

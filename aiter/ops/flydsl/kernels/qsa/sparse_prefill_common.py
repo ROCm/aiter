@@ -12,7 +12,8 @@ The second part holds raw-buffer operations, register pinning and pipeline
 barriers. The third part holds the BM128/BN64 MFMA, softmax and LDS pieces
 of the eight-wave staggered D256 pipeline that the union kernel runs; the fourth
 holds their gfx950 (CDNA4) forms: 16x16x32 MFMAs, ds_read_b64_tr_b16 V operands,
-v_cvt_pk_bf16_f32 and K/V LDS swizzles for 64 banks.
+v_cvt_pk_bf16_f32 and K/V LDS swizzles for 64 banks. On gfx950 the union kernel and the
+packed direct kernel take their gfx950 paths; the raw direct kernel runs as on gfx942.
 """
 
 import dataclasses
@@ -20,6 +21,8 @@ import functools
 import logging
 import math
 import os
+from collections.abc import Callable
+from typing import NamedTuple
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -62,8 +65,9 @@ class Platform:
     # Past that budget, direct still packs a context of at most this many tokens per query row
     # (packing copies the whole context each call).
     pack_tokens_per_row: int
-    # K3 also weighs keeping every union tile against none when the union phase is set by
-    # throughput (sparse_prefill_prepare.py _route); a compile-time switch of K3.
+    # sparse_prefill_order_masks also weighs keeping every union tile against none when the
+    # union phase is set by throughput (sparse_prefill_prepare.py _route); a compile-time
+    # switch of that kernel.
     route_all_or_none: bool = False
 
 
@@ -84,12 +88,13 @@ PLATFORMS = {
         max_packed_kv_bytes=64 * 1024 * 1024,
         pack_tokens_per_row=32,
     ),
-    # MI355X, decision-tuned: K3's route terms and route_margin were chosen on 91
-    # calibration layouts so that routed calls stay near the faster of all-union and
-    # host-gated all-direct (90 within 1.05x, worst 1.06x); they are not phase timings.
+    # MI355X, decision-tuned: the route terms and route_margin of sparse_prefill_order_masks
+    # were chosen on 91 calibration layouts so that routed calls stay near the faster of
+    # all-union and host-gated all-direct (90 within 1.05x, worst 1.06x); they are not phase
+    # timings.
     # union_ratio 1e30: K2 proposes union for every tile;
-    # route_all_or_none: K3 also weighs keeping every union tile against none when the union
-    # phase is throughput-bound.
+    # route_all_or_none: sparse_prefill_order_masks also weighs keeping every union tile
+    # against none when the union phase is throughput-bound.
     ("gfx950", 256): Platform(
         union_fixed=345.2,
         union_step=2.228,
@@ -144,14 +149,6 @@ def platform() -> Platform:
     if not all(math.isfinite(v) and v >= 0 for v in values) or entry.route_margin >= 1:
         raise ValueError(f"{OVERRIDE}: values must be finite, >= 0, route_margin < 1")
     return entry
-
-
-@functools.cache
-def gfx950() -> bool:
-    """CDNA4: the union kernel takes its gfx950 path (fourth part), and the packed direct
-    kernel its own (sparse_prefill_direct_packed's gfx950 part); the raw direct kernel
-    runs as on gfx942."""
-    return get_gfx_runtime() == "gfx950"
 
 
 # ---- Raw buffers, register pinning, pipeline barriers ----
@@ -461,7 +458,8 @@ def _exps(values, maximum):
 
 
 def _key_row(lane):
-    """Key of the lane's first K read: lane 16g + 4b + a reads keys a + 8b (+ 4n, + 32 per half), K3's mask order."""
+    """Key of the lane's first K read: lane 16g + 4b + a reads keys a + 8b (+ 4n, + 32 per
+    half), in the mask order of sparse_prefill_order_masks."""
     return (lane & 3) + ((lane & 12) << 1)
 
 
@@ -514,13 +512,20 @@ def _lds_words(parts):
     )
 
 
+class _ReadPlan(NamedTuple):
+    """LDS reads of one K or V operand, each issued with load from storage."""
+
+    storage: object
+    reads: list  # (slot, address, immediate) in issue order
+    load: Callable  # load(storage, address, immediate) -> words
+
+
 def _read_s2r(plan, queue):
-    """Issue a (storage, reads, load) plan; ready(n) waits until its first n reads have landed."""
-    storage, reads, load = plan
-    parts = [None] * len(reads)
-    for slot, address, immediate in reads:
-        parts[slot] = load(storage, address, immediate)
-    return _lds_words(parts), queue.issue(len(reads))
+    """Issue a _ReadPlan; ready(n) waits until its first n reads have landed."""
+    parts = [None] * len(plan.reads)
+    for slot, address, immediate in plan.reads:
+        parts[slot] = plan.load(plan.storage, address, immediate)
+    return _lds_words(parts), queue.issue(len(plan.reads))
 
 
 def _k_operands(words):
@@ -650,7 +655,8 @@ def _pv(
 # path, the BF16 conversion and the K/V LDS layouts change (g = lane >> 4 below).
 #   QK: per K half, two M tiles of eight v_mfma_f32_16x16x32_bf16; step s takes K read
 #       m * 8 + s and Q part s, both dims 32s + 8g .. + 7. The K reads keep gfx942's keys
-#       and the S order (value i + 4m), so K3's masks are unchanged.
+#       and the S order (value i + 4m), so the masks of sparse_prefill_order_masks are
+#       unchanged.
 #   PV: per V half, two K32 steps (keys 32s + 8g .. + 7: P values 8s .. 8s + 7) over eight
 #       16-dim groups n; the A operand of (s, n) is two ds_read_b64_tr_b16 of four keys.
 #       Output word 4n + i of a half is dim 32g + 4(n ^ (g & 1)) + i (_v_tr_bases950).

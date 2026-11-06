@@ -16,6 +16,8 @@ import flydsl.expr as fx
 import torch
 from flydsl.expr import rocdl
 
+from aiter.jit.utils.chip_info import get_gfx_runtime
+
 from .sparse_prefill_common import (
     _MAX_FLOOR,
     HALF950,
@@ -54,6 +56,7 @@ from .sparse_prefill_common import (
     _read_q_g2r,
     _read_q_words,
     _read_s2r,
+    _ReadPlan,
     _rescale,
     _schedule,
     _schedule_exps,
@@ -68,7 +71,6 @@ from .sparse_prefill_common import (
     _v_tr_bases950,
     _v_tr_reads950,
     _write_address,
-    gfx950,
 )
 
 __all__ = ["run"]
@@ -552,24 +554,28 @@ def _body(
 
     def k_s2r(half, lower_first=False, offset=0):
         """Read plan of K keys 32 * half .. 32 * half + 31 of the K stage at byte offset."""
-        return k_lds, _shift(k_reads(k_s2r_base, half, lower_first), offset), _load_lds
+        return _ReadPlan(
+            k_lds, _shift(k_reads(k_s2r_base, half, lower_first), offset), _load_lds
+        )
 
     def v_s2r(half, offset=0):
         """Read plan of V dims 128 * half .. 128 * half + 127 of the V stage at byte offset."""
-        return v_lds, _shift(v_reads(v_s2r_base, half), offset), v_load
+        return _ReadPlan(v_lds, _shift(v_reads(v_s2r_base, half), offset), v_load)
 
     def read_tile_g2s(resource, storage, rows, is_v, s2r, lgkm, tail_tile, offset):
         # 16 LDS-DMA packets (gfx950: 4 x4 blocks); the s2r plan's reads go in plan order, an
         # equal share (one; gfx950: four K or eight V) just before each.
         reads, load = (), _load_lds
         if fx.const_expr(s2r is not None):
-            reads, load = s2r[1], s2r[2]
+            reads, load = s2r.reads, s2r.load
         packets = (16, 4)[int(GFX950)]
         share = len(reads) // packets
         parts = [None] * len(reads)
         for packet in fx.range_constexpr(packets):
             batch = reads[packet * share : (packet + 1) * share]
-            issued = [(s2r[0], address, immediate) for _, address, immediate in batch]
+            issued = [
+                (s2r.storage, address, immediate) for _, address, immediate in batch
+            ]
             if fx.const_expr(GFX950):
                 data = _read_block_g2s950(
                     resource,
@@ -1021,7 +1027,7 @@ def _args(inputs, plan, out, stream):
         plan.grid,
         inputs.scale,
         plan.slotted,
-        gfx950(),
+        get_gfx_runtime() == "gfx950",
         inputs.kv_stride,
         stream,
     )
