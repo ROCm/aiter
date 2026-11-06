@@ -869,12 +869,25 @@ class Gfx1250Traits:
         return self.bf16_packed and self.block_size == 128
 
     @property
+    def page16_wide(self):
+        # One FP8 D128 query tile over page16 caches stages two pages per wave,
+        # halving the softmax exchanges per token.
+        return (
+            self.packed_lds
+            and self.block_size == 16
+            and self.head_dim == 128
+            and self.m_tiles == 1
+            and self.sliding_window == 0
+        )
+
+    @property
     def TOKENS(self):
         # Page-sized transfers amortize page/scale staging and softmax exchange.
         # Windowed rows retain 64-token normalization for FP8 accuracy.
         return (
             128
             if self.bf16_page128_packed
+            or self.page16_wide
             or (
                 self.packed_lds
                 and self.head_dim in (128, 256)

@@ -1222,6 +1222,9 @@ class Gfx1250Memory:
     @flyc.jit
     def stage_packed_tdm(self, token_base, kv_off, full_tile, cached_page=None):
         ctx, t = self.ctx, self.t
+        if const_expr(t.page16_wide):
+            self.stage_page16_pair(token_base, kv_off, full_tile)
+            return
         if const_expr(t.TOKENS == 128):
             self.stage_page_tdm(token_base, kv_off, full_tile, cached_page)
             return
@@ -1280,6 +1283,56 @@ class Gfx1250Memory:
                 (t.head_dim, 16),
                 (t.block_size, 1),
                 (None, None) if full_tile else (None, valid),
+                16,
+                16,
+            )
+
+    def page16_pair(self, token_base, full_tile):
+        """Wave w's two page16 indices of a 128-token stage: pages 2 w and 2 w + 1."""
+        ctx = self.ctx
+        table = fx.recast_iter(fx.Int32, ctx.block_tables_ptr)
+        pages = []
+        for j in range_constexpr(2):
+            absolute = token_base + (ctx.warp * 2 + j) * 16
+            safe = (
+                absolute
+                if full_tile
+                else (absolute < ctx.planned_context).select(absolute, fx.Int32(0))
+            )
+            pages.append(
+                fx.Int32(table[ctx.planned_seq * ctx.max_blocks_per_seq + safe // 16])
+            )
+        return pages
+
+    @flyc.jit
+    def stage_page16_pair(self, token_base, kv_off, full_tile):
+        """Each wave copies two whole page16 slices; LDS keeps them page-major."""
+        ctx, t = self.ctx, self.t
+        pages = self.page16_pair(token_base, full_tile)
+        for j in range_constexpr(2):
+            slot = ctx.warp * 2 + j
+            off = (fx.Int64(pages[j]) * ctx.n_kv + ctx.kv_h) * t.head_dim * 16
+            valid = fx.max(
+                fx.Int32(0),
+                fx.min(fx.Int32(16), ctx.planned_context - token_base - slot * 16),
+            )
+            self.tdm_copy(
+                ctx.key_cache_ptr,
+                off,
+                kv_off + slot * t.head_dim * 16,
+                (t.head_dim // 16, 256) if full_tile else (t.head_dim // 16, 16, 16),
+                (256, 1) if full_tile else (256, 16, 1),
+                (None, None) if full_tile else (None, valid, None),
+                16,
+                16,
+            )
+            self.tdm_copy(
+                ctx.value_cache_ptr,
+                off,
+                kv_off + t.k_bytes + slot * t.head_dim * 16,
+                (t.head_dim * 16,) if full_tile else (t.head_dim, 16),
+                (1,) if full_tile else (16 if t.trans_v else 16, 1),
+                (None,) if full_tile else (None, valid),
                 16,
                 16,
             )
@@ -1356,6 +1409,15 @@ class Gfx1250Memory:
 
     def packed_k_operand(self, kv_off, token_tile, dim_tile):
         ctx, t = self.ctx, self.t
+        if const_expr(t.page16_wide):
+            # Token tile n of wave w is page 2 w + n, stored page-major.
+            return self.packed_operand(
+                kv_off + (ctx.warp * 2 + token_tile) * t.head_dim * 16 + dim_tile * 128 * 16,
+                16,
+                128,
+                ctx.lane16,
+                ctx.half,
+            )
         if const_expr(t.TOKENS == 128):
             return self.page_k_operand(
                 kv_off + dim_tile * 128 * 128,
@@ -1618,7 +1680,9 @@ class Gfx1250Memory:
         kv_off = t.q_bytes + buffer * t.kv_stride
         table = fx.recast_iter(fx.Int32, ctx.block_tables_ptr)
         page = fx.Int32(0)
-        if const_expr(t.async_page or t.page16_async_scales):
+        if const_expr(
+            (t.async_page or t.page16_async_scales) and not t.page16_wide
+        ):
             page_absolute = token_base + (ctx.warp * 16 if t.page16_async_scales else 0)
             safe = (
                 page_absolute
@@ -1635,7 +1699,11 @@ class Gfx1250Memory:
                 token_base,
                 kv_off,
                 full_tile,
-                page if t.async_page or t.page16_async_scales else None,
+                (
+                    page
+                    if (t.async_page or t.page16_async_scales) and not t.page16_wide
+                    else None
+                ),
             )
         else:
             self.stage_vector_dma(token_base, kv_off)
@@ -1656,7 +1724,28 @@ class Gfx1250Memory:
                     (index + ctx.tid * 4) * 4,
                     kv_off + t.k_bytes + t.v_bytes + t.TOKENS * 4 + ctx.tid * 16,
                 )
-        elif const_expr(t.page16_async_scales and full_tile):
+        elif const_expr(t.page16_wide and t.per_token_kv and full_tile):
+            # Lanes 0-3 and 4-7 copy the wave's two pages, four scales each.
+            pages = self.page16_pair(token_base, True)
+            if ctx.lane < 8:
+                j = ctx.lane // 4
+                pair_page = (j == 0).select(pages[0], pages[1])
+                pair_index = (
+                    fx.Int64(pair_page) * ctx.stride_ks_block
+                    + ctx.kv_h * ctx.stride_ks_head
+                )
+                token = (ctx.warp * 2 + j) * 16 + (ctx.lane % 4) * 4
+                self.async_copy(
+                    fx.Int64(fx.ptrtoint(ctx.key_scale_ptr)),
+                    (pair_index + (ctx.lane % 4) * 4) * 4,
+                    kv_off + t.k_bytes + t.v_bytes + token * 4,
+                )
+                self.async_copy(
+                    fx.Int64(fx.ptrtoint(ctx.value_scale_ptr)),
+                    (pair_index + (ctx.lane % 4) * 4) * 4,
+                    kv_off + t.k_bytes + t.v_bytes + (t.TOKENS + token) * 4,
+                )
+        elif const_expr(t.page16_async_scales and full_tile and not t.page16_wide):
             index = fx.Int64(page) * ctx.stride_ks_block + ctx.kv_h * ctx.stride_ks_head
             if ctx.lane < 4:
                 token = ctx.warp * 16 + ctx.lane * 4
