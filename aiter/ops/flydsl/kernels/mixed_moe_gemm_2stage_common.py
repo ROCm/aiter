@@ -52,6 +52,7 @@ from .mfma_preshuffle_pipeline import (
     make_preshuffle_scale_layout,
     swizzle_xor16,
     tile_chunk_coord_i32,
+    xcd_remap_grid,
 )
 from .tensor_shim import ptr_rsrc
 
@@ -529,24 +530,14 @@ def compile_mixed_moe_gemm1_common(
                     )
                 persist_m_idx = persist_m
                 grid_y = (size_expert_ids_in + persist_m_idx - one) // persist_m_idx
-                linear_id = bx_persist * grid_x + by
-                num_workgroups = grid_x * grid_y
-                num_xcds_idx = num_xcds
-                workgroups_per_xcd = num_workgroups // num_xcds_idx
-                workgroup_id = (linear_id % num_xcds_idx) * workgroups_per_xcd + (
-                    linear_id // num_xcds_idx
+                bx_persist, by = xcd_remap_grid(
+                    bx_persist,
+                    by,
+                    grid_m=grid_y,
+                    grid_n=grid_x,
+                    xcd_swizzle=xcd_swizzle,
+                    num_xcds=num_xcds,
                 )
-                group_m = xcd_swizzle
-                workgroups_per_group = group_m * grid_x
-                group_id = workgroup_id // workgroups_per_group
-                first_m = group_id * group_m
-                remaining_m = grid_y - first_m
-                group_size_m = (fx.Index(remaining_m) < group_m).select(
-                    remaining_m, group_m
-                )
-                workgroup_in_group = workgroup_id % workgroups_per_group
-                bx_persist = first_m + (workgroup_in_group % group_size_m)
-                by = workgroup_in_group // group_size_m
 
             by_n = by * tile_n
 
@@ -3314,24 +3305,14 @@ def compile_mixed_moe_gemm2_common(
                 else:
                     persist_m_idx = persist_m
                     grid_y = (size_expert_ids_in + persist_m_idx - one) // persist_m_idx
-                linear_id = bx_persist * grid_x + by_outer
-                num_workgroups = grid_x * grid_y
-                num_xcds_idx = num_xcds
-                workgroups_per_xcd = num_workgroups // num_xcds_idx
-                workgroup_id = (linear_id % num_xcds_idx) * workgroups_per_xcd + (
-                    linear_id // num_xcds_idx
+                bx_persist, by_outer = xcd_remap_grid(
+                    bx_persist,
+                    by_outer,
+                    grid_m=grid_y,
+                    grid_n=grid_x,
+                    xcd_swizzle=xcd_swizzle,
+                    num_xcds=num_xcds,
                 )
-                group_m = xcd_swizzle
-                workgroups_per_group = group_m * grid_x
-                group_id = workgroup_id // workgroups_per_group
-                first_m = group_id * group_m
-                remaining_m = grid_y - first_m
-                group_size_m = (fx.Index(remaining_m) < group_m).select(
-                    remaining_m, group_m
-                )
-                workgroup_in_group = workgroup_id % workgroups_per_group
-                bx_persist = first_m + (workgroup_in_group % group_size_m)
-                by_outer = workgroup_in_group // group_size_m
 
             by = by_outer
 
