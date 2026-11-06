@@ -12,6 +12,7 @@
 #include "aiter_tensor.h"
 #include "mx_quant_utils.h"
 
+#include <hip/hip_bfloat16.h>
 #include <string>
 #include <vector>
 
@@ -350,6 +351,7 @@ __global__ void __launch_bounds__(kThreads) moe_sort_quant_kernel(
     int tokens,
     const int32_t* num_local_tokens)
 {
+#if defined(__gfx950__)
     // moe_buf is zeroed whole, so a row past the local-token count reads 0
     // rather than what the buffer held; only the local rows are sorted and
     // quantized, as moe_sorting_opus_fwd sorts them.
@@ -372,6 +374,11 @@ __global__ void __launch_bounds__(kThreads) moe_sort_quant_kernel(
         quantize_activations_compact<kSortQuantCtas - 1>(
             hidden_states, activation_quant, activation_scale_token, tokens);
     }
+#else
+    // The host restricts this fused kernel to gfx950. Its wave64 DPP scan
+    // contains CDNA broadcasts that cannot be compiled for gfx1250.
+    __builtin_trap();
+#endif
 }
 
 // The activation quantization above lowers to v_cvt_scalef32_pk_fp4_bf16, which

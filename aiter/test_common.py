@@ -57,9 +57,9 @@ def perftest(
 ):
     def decorator(func):
         def wrapper(*args, **kwargs):
+            gpu_id = torch.cuda.current_device()
             num = num_rotate_args
             if num < 1:
-                gpu_id = torch.cuda.current_device()
                 iter_used_memory, inputSize, _, _ = device_memory_profiling(
                     func, *args, **kwargs
                 )

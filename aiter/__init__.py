@@ -139,6 +139,7 @@ else:
     from .ops.custom_all_reduce import *
     from .ops.quick_all_reduce import *
     from .ops.moe_op import *
+    from .ops.moe_op_gfx1250 import *
     from .ops.moe_sorting import *
     from .ops.moe_sorting_opus import *
     from .ops.moe_mxfp4_aux import *

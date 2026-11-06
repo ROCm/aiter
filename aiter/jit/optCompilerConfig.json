@@ -528,6 +528,30 @@
         "torch_exclude": "True",
         "blob_gen_cmd": "f'{AITER_META_DIR}/hsa/codegen.py -m f4gemm --output_dir {{}}'"
     },
+    "module_moe_stage1_asm": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_moe_stage1.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": "f'{AITER_META_DIR}/hsa/codegen.py -m moe_stage1 --output_dir {{}}'"
+    },
+    "module_moe_stage2_asm": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_moe_stage2.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": "f'{AITER_META_DIR}/hsa/codegen.py -m moe_stage2 --output_dir {{}}'"
+    },
     "module_mxfp8fp4gemm_asm": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_mxfp8fp4gemm.cu'"
