@@ -576,15 +576,17 @@ def build_gemm_a8w4_tdm_task(
         and not explicit_vgpr_partition
         and callable(getattr(rocdl, "sched_vgpr", None))
     )
-    narrow_stage1_row_skip = bool(
+    narrow_native_row_skip = bool(
         a_is_fp4
         and a_preshuffled
         and not persistent_workers
         and not enable_ep_scatter
-        and stage1_act
-        and stage1_quant_out
-        and (tile_m, tile_n, tile_k, m_warp, n_warp, num_buffers)
-        == (64, 256, 256, 1, 4, 3)
+        and tile_m == 64
+        and m_warp == 1
+        and n_warp == 4
+        and num_buffers == 3
+        and tile_n in (256, 512)
+        and tile_k in (128, 256)
         and callable(getattr(rocdl, "sched_vgpr", None))
     )
     # Ordinary short tiles share a K loop for full and partial expert tails.
@@ -2007,7 +2009,18 @@ def build_gemm_a8w4_tdm_task(
                 fx.make_rmem_tensor(WMMA_VECTOR_DWORDS, fx.Int32)
                 for _ in range_constexpr(wmma_n_rep)
             ]
-            if const_expr(explicit_vgpr_partition):
+            # With SSA scheduling, one-k128 native FP4 tiles can keep
+            # A/B below small fixed C instead of reserving slots at v768+.
+            if const_expr(
+                explicit_vgpr_partition
+                and (
+                    not callable(getattr(rocdl, "sched_vgpr", None))
+                    or not (a_is_fp4 and a_preshuffled)
+                    or tile_k != WMMA_K
+                    or enable_ep_scatter
+                    or n_acc * WMMA_VECTOR_DWORDS > 256
+                )
+            ):
                 slot_width = wmma_m_rep * ACT_NDW + wmma_n_rep * WMMA_VECTOR_DWORDS
                 assert slot_width <= 128
                 slot_base = (
@@ -2792,7 +2805,7 @@ def build_gemm_a8w4_tdm_task(
             # full descriptor and output layouts while skipping only M16 rows
             # wholly beyond the expert's live rows. Other row counts use the
             # complete original body, including ragged K and activation logic.
-            if const_expr(narrow_stage1_row_skip):
+            if const_expr(narrow_native_row_skip):
                 if mn_oob <= front_wm * M_ROW_STEP:
                     run_mainloop(bool(interleaved_lds_load_on), m_reps=front_wm)
                 else:
