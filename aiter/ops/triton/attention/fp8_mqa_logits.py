@@ -67,8 +67,12 @@ FOLDED_REDUCTED_SUPPORT = _permute_accepts_constexpr_tuple()
 _GFX942_CU_LDS_BYTES = 64 * 1024
 
 
-def _gfx950_kv_splits(seq_len, seq_len_kv, block_m, num_warps, waves_per_eu):
+def _gfx950_kv_splits(
+    seq_len, seq_len_kv, block_m, num_warps, waves_per_eu, allow_split=True
+):
     """How many workgroups to put on one query row block's KV walk."""
+    if not allow_split:
+        return 1
     MIN_SPLIT_KV = 16384
     GFX950_SIMDS = 256 * 4
     SPLIT_ROUNDS = 8
@@ -229,6 +233,10 @@ def fp8_mqa_logits(
 
         num_buffers = 2
         USE_FOLDED_REDUCTION = FOLDED_REDUCTED_SUPPORT and num_heads > 16
+        # Without the folded head reduction, a call split over KV is not
+        # repeatable on gfx950 (the logits next to the split boundary change
+        # from run to run), so deterministic mode does not split it.
+        allow_split = not deterministic or USE_FOLDED_REDUCTION
         if arch == "gfx950":
             MIN_BLOCK_M2_WGS = 1024
 
@@ -245,7 +253,7 @@ def fp8_mqa_logits(
             # BLOCK_M=2 halves the grid, so it only pays once there are enough
             # rows to spare or the split puts the workgroups back.
             num_kv_splits = _gfx950_kv_splits(
-                seq_len, seq_len_kv, 2, num_warps, waves_per_eu
+                seq_len, seq_len_kv, 2, num_warps, waves_per_eu, allow_split
             )
             if (
                 not deterministic
@@ -260,14 +268,14 @@ def fp8_mqa_logits(
             else:
                 block_m = 1
                 num_kv_splits = _gfx950_kv_splits(
-                    seq_len, seq_len_kv, block_m, num_warps, waves_per_eu
+                    seq_len, seq_len_kv, block_m, num_warps, waves_per_eu, allow_split
                 )
             # Single warp to save barrier cycles
             if block_m == 1 and seq_len > 4096 and not deterministic:
                 num_warps = 1
                 block_kv = 32
                 num_kv_splits = _gfx950_kv_splits(
-                    seq_len, seq_len_kv, block_m, num_warps, waves_per_eu
+                    seq_len, seq_len_kv, block_m, num_warps, waves_per_eu, allow_split
                 )
             # 32x32x64 over 16x16x128: its output layout leaves only one head
             # bit in lanes, so the head sum needs one cross-lane step

@@ -254,7 +254,7 @@ def test_fp8_mqa_logits_nonzero_cu_start(
 
 
 @pytest.mark.parametrize("s_k", [8192, 32768])
-@pytest.mark.parametrize("num_heads", [32, 64])
+@pytest.mark.parametrize("num_heads", [16, 32, 64])
 @pytest.mark.parametrize("gluon", [True, False])
 @torch.inference_mode()
 def test_fp8_mqa_logits_deterministic_rows(s_k, num_heads, gluon, monkeypatch):
