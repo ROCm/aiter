@@ -2443,6 +2443,7 @@ def build_moe_token_multidest_quant_module(
     quant_mode: str = "fp4",
     tdm_hidden_chunks: int = _TOKEN_MULTIDEST_TDM_CHUNKS,
     ksplit: int = 1,
+    route_expert_bits: int = 0,
 ):
     """Quantize each token once and scatter the result to its ``topk`` routed rows.
 
@@ -2451,6 +2452,12 @@ def build_moe_token_multidest_quant_module(
     every destination. What it saves therefore grows with ``topk``, while what
     it costs -- one buffer descriptor per destination held live across the store
     pass -- grows with it too.
+
+    ``route_expert_bits`` > 0: ``topids_to_rows`` holds
+    ``(slot << route_expert_bits) | expert`` from ``moe_route_lds_psum``. The
+    kernel stores to ``row_starts[expert] + slot`` and the K-group-0 blocks
+    write those rows to ``final_rows`` for the gather-reduce, so no psum-remap
+    launch runs. Otherwise ``row_starts``/``final_rows`` are unread.
     """
     L = _quant_layout(feat_dim, quant_mode, wmma_rep)
     if not L.use_pk8:
@@ -2501,6 +2508,7 @@ def build_moe_token_multidest_quant_module(
         f"{'_scpk' if scale_pack_dwords else ''}"
         f"{f'_hidtdm{tdm_hidden_chunks}' if tdm_hidden_chunks else ''}"
         f"{f'_ks{ksplit}' if ksplit > 1 else ''}"
+        f"{f'_rr{route_expert_bits}' if route_expert_bits else ''}"
     )
 
     @flyc.kernel(name=module_name, known_block_size=[BLOCK_THREADS, 1, 1])
@@ -2510,6 +2518,8 @@ def build_moe_token_multidest_quant_module(
         grouped_scale: fx.Pointer,
         topids_to_rows: fx.Pointer,
         token_num: Int32,
+        row_starts: fx.Pointer,
+        final_rows: fx.Pointer,
     ):
         i32 = T.i32
         f32 = T.f32
@@ -2611,12 +2621,39 @@ def build_moe_token_multidest_quant_module(
             route0 = token_eff * fx.Int32(topk)
             # Scalar loads: the route is wave-uniform, and landing each row in
             # an SGPR is what keeps its destination descriptor uniform too.
-            rows, any_live = _token_multidest_live_rows(
-                [
-                    fx.Int32(buf_scalar_load(rows_t, route0 + fx.Int32(k)))
-                    for k in range_constexpr(topk)
+            raw_rows = [
+                fx.Int32(buf_scalar_load(rows_t, route0 + fx.Int32(k)))
+                for k in range_constexpr(topk)
+            ]
+            if const_expr(route_expert_bits):
+                starts_t = ptr_buf_tensor(row_starts)
+                final_t = ptr_buf_tensor(final_rows)
+                c_expert_mask = fx.Int32((1 << route_expert_bits) - 1)
+                lives = [raw >= c0_i32 for raw in raw_rows]
+                # All start loads go out before any is used.
+                route_starts = [
+                    fx.Int32(
+                        buf_scalar_load(starts_t, live.select(raw & c_expert_mask, 0))
+                    )
+                    for raw, live in zip(raw_rows, lives)
                 ]
-            )
+                raw_rows = [
+                    live.select(
+                        start + (raw >> fx.Int32(route_expert_bits)),
+                        fx.Int32(DROPPED_ROUTE_ROW),
+                    )
+                    for raw, live, start in zip(raw_rows, lives, route_starts)
+                ]
+                # One K group publishes the rows; the others only store to them.
+                writer = valid & (lane < fx.Uint32(topk))
+                if const_expr(ksplit > 1):
+                    writer = writer & (fx.Uint32(fx.block_idx.y) == c0_i32)
+                if writer:
+                    lane_row = raw_rows[0]
+                    for k in range_constexpr(1, topk):
+                        lane_row = (lane == fx.Uint32(k)).select(raw_rows[k], lane_row)
+                    final_t[route0 + lane] = lane_row
+            rows, any_live = _token_multidest_live_rows(raw_rows)
             token_live = valid & any_live
             pay_records = token_live.select(fx.Int32(payload_bytes_per_row), c0_i32)
             # Sign-extended to i64 by the descriptor builder, so stay under 2 GiB.
@@ -2705,10 +2742,18 @@ def build_moe_token_multidest_quant_module(
         topids_to_rows: fx.Pointer,
         token_num: fx.Int32,
         grid_blocks: fx.Int32,
+        row_starts: fx.Pointer,
+        final_rows: fx.Pointer,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         token_multidest_kernel(
-            hidden, grouped_payload, grouped_scale, topids_to_rows, token_num
+            hidden,
+            grouped_payload,
+            grouped_scale,
+            topids_to_rows,
+            token_num,
+            row_starts,
+            final_rows,
         ).launch(
             grid=(
                 fx.Int64(grid_blocks),
