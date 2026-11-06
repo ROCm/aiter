@@ -978,6 +978,14 @@ def pa_decode(
     # tiles among its CTAs, so a 32-partition bound (8K contexts at the
     # default cap) still merges on chip.
     cluster_size = min(max_partitions, CLUSTER_PARTITIONS)
+    # gfx1250 keeps 15 clusters resident per 16 CUs; batches with more
+    # sequences share each cluster between several of them.
+    cluster_seqs = 1
+    while (
+        -(-num_seqs // cluster_seqs) * num_kv_heads > num_compute_units * 15 // 16
+        and 2 * cluster_seqs * cluster_size <= CLUSTER_PARTITIONS
+    ):
+        cluster_seqs *= 2
     cluster_merge = (
         cluster_size
         if (
@@ -988,7 +996,8 @@ def pa_decode(
             and 2 <= max_partitions <= CLUSTER_GROUPED_PARTITIONS
             and num_seqs * cluster_size
             <= max(work_plan.capacity, -(-2 * num_compute_units // num_kv_heads))
-            and num_seqs * num_kv_heads <= num_compute_units * 15 // 16
+            and -(-num_seqs // cluster_seqs) * num_kv_heads
+            <= num_compute_units * 15 // 16
             and head_dim <= MERGE_HEAD_DIM
         )
         else 0
@@ -1027,6 +1036,7 @@ def pa_decode(
             trans_k=trans_k,
             mask_unowned_kv=mask_unowned_kv,
             cluster_merge=cluster_merge,
+            cluster_seqs=cluster_seqs,
         )
 
     total_rows = query_length * query_group_size

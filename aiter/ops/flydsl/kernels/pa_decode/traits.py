@@ -841,6 +841,8 @@ class Gfx1250Traits:
     wide_bf16_page128: bool = False
     # Grids beyond four CTAs per CU keep 64-token FP8 page16 steps.
     narrow_fp8_page16: bool = False
+    # Sequences sharing one cluster of cluster_merge * cluster_seqs CTAs.
+    cluster_seqs: int = 1
 
     WAVE = 32
     NWARP = 4

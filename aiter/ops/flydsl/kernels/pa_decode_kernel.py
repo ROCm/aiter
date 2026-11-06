@@ -179,6 +179,7 @@ def compile_pa_decode_tile(
     trans_k: bool = True,
     mask_unowned_kv: bool = True,
     cluster_merge: int = 0,
+    cluster_seqs: int = 1,
 ):
     """Select and cache a PA-decode kernel and launch wrapper.
 
@@ -252,7 +253,11 @@ def compile_pa_decode_tile(
         grid_sequences = (
             num_seqs
             if direct_output and num_partitions == 1
-            else num_seqs * cluster_merge if cluster_merge else work_capacity
+            else (
+                -(-num_seqs // cluster_seqs) * cluster_seqs * cluster_merge
+                if cluster_merge
+                else work_capacity
+            )
         )
         grid_ctas = grid_sequences * num_kv_heads * query_splits
         return compile_gfx1250_pa_decode(
@@ -270,6 +275,7 @@ def compile_pa_decode_tile(
             query_splits=query_splits,
             merge_partitions=direct_output and num_partitions > 1,
             cluster_merge=cluster_merge,
+            cluster_seqs=cluster_seqs,
             # Wide page16 stages leave room for two CTAs per CU: larger
             # grids (sparse prefill) keep narrower stages.
             small_grid=grid_ctas <= 2 * num_compute_units,
@@ -558,6 +564,7 @@ def compile_gfx1250_pa_decode(
     query_splits=1,
     merge_partitions=False,
     cluster_merge=0,
+    cluster_seqs=1,
     small_grid=False,
     wide_pages=False,
     one_cta_grid=False,
@@ -596,6 +603,7 @@ def compile_gfx1250_pa_decode(
         wide_pages and compute_dtype == "fp8" and block_size == 128,
         one_cta_grid and compute_dtype == "bf16",
         many_cta_grid and compute_dtype == "fp8" and block_size == 16,
+        cluster_seqs=cluster_seqs if cluster_merge else 1,
     )
     if compute_dtype not in ("fp8", "bf16"):
         raise ValueError(f"Unsupported gfx1250 PA compute dtype: {compute_dtype}")
@@ -701,6 +709,10 @@ def compile_gfx1250_pa_decode(
             # plan_pa_decode splits them: ``work`` holds the context lengths,
             # read alongside reduce_info instead of after it.
             seq, part = task_slot // t.cluster_merge, task_slot % t.cluster_merge
+            if const_expr(t.cluster_seqs > 1):
+                # The last cluster pads the grid past the batch.
+                present = seq < sequences
+                seq = present.select(seq, fx.Int32(0))
             # Scalar loads return out of order, so a use waits for every load
             # issued before it: issue both before either is used.
             task_context = fx.Int32(fx.recast_iter(fx.Int32, work)[seq])
@@ -713,6 +725,8 @@ def compile_gfx1250_pa_decode(
             # tiles over the cluster, in its first task slots.
             first = fx.Int32(seq_tasks[0])
             count = fx.min(fx.Int32(seq_tasks[1]), fx.Int32(t.cluster_merge))
+            if const_expr(t.cluster_seqs > 1):
+                count = present.select(count, fx.Int32(0))
             task_slot = (part < count).select(first + part, fx.Int32(0))
             # Tiles of an int32 length, times at most 16 parts, fit Int32.
             length = fx.max(task_context, fx.Int32(0))
@@ -806,7 +820,17 @@ def compile_gfx1250_pa_decode(
             if task_slot < sequences:  # noqa: SIM102
                 if fx.Int32(info[task_slot * 2 + 1]) == 0:
                     zero_output(task_slot, output)
-        if const_expr(t.cluster_merge):
+        if const_expr(t.cluster_merge and t.cluster_seqs > 1):
+            # Sequences sharing a cluster need not agree on their task counts:
+            # every CTA reaches the barrier, and only split sequences merge.
+            Gfx1250ClusterMerge(t, pmax, psum, pout, output, sq_row, sq_head).sync()
+            if count > 1:
+                Gfx1250ClusterMerge(t, pmax, psum, pout, output, sq_row, sq_head).merge(
+                    seq, part, first, count, capacity
+                )
+            elif (count == 0) & (part == 0) & present:
+                zero_output(seq, output)
+        elif const_expr(t.cluster_merge):
             # Every CTA of a cluster reaches its barrier exactly once.
             if count > 1:
                 merge = Gfx1250ClusterMerge(
@@ -846,7 +870,10 @@ def compile_gfx1250_pa_decode(
         if const_expr(t.direct_output):
             grid_x = sequences
         if const_expr(t.cluster_merge):
-            grid_x = sequences * t.cluster_merge
+            # Whole clusters of cluster_seqs sequences.
+            grid_x = ((sequences + t.cluster_seqs - 1) // t.cluster_seqs) * (
+                t.cluster_seqs * t.cluster_merge
+            )
         pa_decode_tile_kernel(
             work,
             table,
@@ -870,7 +897,7 @@ def compile_gfx1250_pa_decode(
             output,
             counters,
             value_attrs=(
-                {"rocdl.cluster_dims": f"{t.cluster_merge},1,1"}
+                {"rocdl.cluster_dims": f"{t.cluster_merge * t.cluster_seqs},1,1"}
                 if t.cluster_merge
                 else None
             ),
@@ -878,7 +905,9 @@ def compile_gfx1250_pa_decode(
             grid=(grid_x, kv_heads * t.query_splits, 1),
             block=(t.BLOCK_THREADS, 1, 1),
             stream=stream,
-            cluster=(t.cluster_merge, 1, 1) if t.cluster_merge else None,
+            cluster=(
+                (t.cluster_merge * t.cluster_seqs, 1, 1) if t.cluster_merge else None
+            ),
         )
 
     llvm_options = {}

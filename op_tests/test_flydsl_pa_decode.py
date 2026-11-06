@@ -816,6 +816,20 @@ _COMMON_CASES = [
             "sink_dtype": torch.float32,
         },
     ),
+    # More than 240 split sequences share two-sequence clusters on gfx1250;
+    # an odd batch pads the last cluster, and empty rows still meet the barrier.
+    (
+        "cluster2-shared",
+        {
+            "group_size": 16,
+            "block_size": 16,
+            "lengths": (512, 0, 300) * 81,
+            "max_partitions": 2,
+            "capture": True,
+            "cluster": 2,
+            "cluster_seqs": 2,
+        },
+    ),
 ]
 _FP8_CASES = _COMMON_CASES + [
     (
@@ -1581,12 +1595,15 @@ def _check_pipe_policy(pa, case, arch, compile_kwargs):
     if case["cluster"] is not None:
         expected = case["cluster"] if arch == "gfx1250" else 0
         assert compile_kwargs[-1]["cluster_merge"] == expected
+    if case["cluster_seqs"] is not None and arch == "gfx1250":
+        assert compile_kwargs[-1]["cluster_seqs"] == case["cluster_seqs"]
     if case["pipe"]:
         # The cache key ends with (D256_PIPE, staged page ids).
         schedule_kwargs = dict(compile_kwargs[-1])
         schedule_kwargs.pop("architecture", None)
         schedule_kwargs.pop("direct_output", None)
         schedule_kwargs.pop("cluster_merge", None)
+        schedule_kwargs.pop("cluster_seqs", None)
         pipe, staged = PaDecodeSchedule.select(**schedule_kwargs).cache_key[-2:]
         assert pipe == (arch == "gfx950")
         if pipe:
@@ -1698,6 +1715,7 @@ def _run_pa_decode_case(case, device, monkeypatch):
             "ref_mean_min": None,
             "variants": False,
             "cluster": None,
+            "cluster_seqs": None,
         },
         **case,
     )

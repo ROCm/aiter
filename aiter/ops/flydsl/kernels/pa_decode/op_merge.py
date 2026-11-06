@@ -261,9 +261,18 @@ class Gfx1250ClusterMerge:
     @flyc.jit
     def run(self, seq, part, first, count, capacity):
         """Publish this CTA's partials, then write rows ``part`` / P of the sequence."""
+        self.sync()
+        self.merge(seq, part, first, count, capacity)
+
+    def sync(self):
+        """Make every CTA's partials in the cluster visible to the others."""
         fx.memory_fence(syncscope="cluster", ordering=fx.AtomicOrdering.Release)
         cluster.cluster_barrier()
         fx.memory_fence(syncscope="cluster", ordering=fx.AtomicOrdering.Acquire)
+
+    @flyc.jit
+    def merge(self, seq, part, first, count, capacity):
+        """Write rows ``part`` / P of the sequence from its synced partials."""
         wave_begin = fx.Int32(fx.rocdl.wave_id()) * self.per_wave
         if wave_begin < self.share:
             self._merge_rows(seq, part * self.share, wave_begin, first, count, capacity)
