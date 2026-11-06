@@ -435,8 +435,10 @@ def _launch_signature(
         return None
     try:
         sigs = tuple(_tensor_signature(t) for t in tensors)
+        # The plan's fields, not its identity: a per-forward plan of the same
+        # shape (ATOM's sparse prefill builds one per forward) reuses the launch,
+        # which reads the plan's tensors and capacity at call time.
         plan = (
-            id(work_plan),
             work_plan.num_kv_heads,
             work_plan.max_partitions,
             work_plan.sliding_window,
