@@ -3,12 +3,9 @@
 import argparse
 import itertools
 import os
+from collections import defaultdict
 
-from gemm_moe_ck2stages_common import (
-    ACT_OP_MAP,
-    get_gemm1_kernels_list,
-    get_gemm2_kernels_list,
-)
+from gemm_moe_ck2stages_common import ACT_OP_MAP, get_gemm_kernel_tables
 
 STG_INSTANCE_IMPL = """// SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
@@ -50,7 +47,7 @@ gemm1_heuristic_dispatch_head = """#pragma once
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 #include "gemm_moe_ck2stages.h"
 
-MoeKernel moe_stage1_heuristic_dispatch(int block_m, int inter_dim, at::ScalarType x_dtype, at::ScalarType w_dtype, at::ScalarType y_dtype, int act_op, int quant, bool mul_routed_weight_stage, bool is_shuffled)
+MoeKernel moe_stage1_heuristic_dispatch(std::string_view gfx, int block_m, int inter_dim, at::ScalarType x_dtype, at::ScalarType w_dtype, at::ScalarType y_dtype, int act_op, int quant, bool mul_routed_weight_stage, bool is_shuffled)
 {{
 """
 
@@ -59,7 +56,7 @@ gemm2_heuristic_dispatch_head = """#pragma once
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 #include "gemm_moe_ck2stages.h"
 
-MoeKernel moe_stage2_heuristic_dispatch(int block_m, int inter_dim, at::ScalarType x_dtype, at::ScalarType w_dtype, at::ScalarType y_dtype, int act_op, int quant, bool mul_routed_weight_stage, bool is_shuffled)
+MoeKernel moe_stage2_heuristic_dispatch(std::string_view gfx, int block_m, int inter_dim, at::ScalarType x_dtype, at::ScalarType w_dtype, at::ScalarType y_dtype, int act_op, int quant, bool mul_routed_weight_stage, bool is_shuffled)
 {{
 """
 
@@ -830,6 +827,34 @@ heuristic_dispatch_dict = {
 }
 
 
+def arch_guard(archs, instance):
+    """Leave instance out of the device code of the archs not in archs."""
+    # hipcc defines __<arch>__, with "-" as "_", while compiling for arch.
+    defined = " || ".join(f"defined(__{arch.replace('-', '_')}__)" for arch in archs)
+    return f"#if !defined(__HIP_DEVICE_COMPILE__) || {defined}\n{instance}\n#endif\n"
+
+
+def arch_branch(archs, dispatch):
+    """Take a table's heuristic dispatch only on a device of one of archs."""
+    condition = " || ".join(f'gfx == "{arch}"' for arch in archs)
+    return f"\n    if ({condition})\n    {{{dispatch}    }}\n"
+
+
+def write_if_changed(path, text):
+    """Write text to path unless path already holds it.
+
+    JIT builds reuse the codegen directory and an instance's arch guard depends
+    on GPU_ARCHS, so an existing file can be stale. An unchanged file keeps its
+    mtime, so ninja doesn't recompile it.
+    """
+    if os.path.exists(path):
+        with open(path) as f:
+            if f.read() == text:
+                return
+    with open(path, "w") as f:
+        f.write(text)
+
+
 def generate_instance_and_lookUpTable_head(working_path):
     f_lookUpTable = os.path.join(working_path, "gemm_moe_ck2stages_lookup.h")
     if os.path.exists(f_lookUpTable):
@@ -897,26 +922,46 @@ class ck_moe_2stage_gemm_codegen:
         self.splitk = splitk
 
     def generate_instance_and_lookUpTable(self):
-        _, gemm1_kernel_list = get_gemm1_kernels_list(
+        tables = get_gemm_kernel_tables(
             self.a_dtype,
             self.b_dtype,
             self.c_dtype,
             self.nswizzle,
             self.quant_type,
             self.activation,
-            self.mul_routed_weight_stage == 1,
+            self.mul_routed_weight_stage,
             self.preshuffle,
             self.splitk,
         )
-        tag, gemm2_kernel_list = get_gemm2_kernels_list(
-            self.a_dtype,
-            self.b_dtype,
-            self.c_dtype,
-            self.nswizzle,
-            self.quant_type,
-            self.mul_routed_weight_stage == 2,
-            self.preshuffle,
-        )
+        # Archs with different tables each get their own: an instance is built
+        # only for the archs whose table has it, and each table is dispatched
+        # to only on its archs.
+        kernel_archs = defaultdict(set)
+        for archs, gemm1_kernel_list, gemm2_kernel_list in tables.values():
+            for kernel in [*gemm1_kernel_list.values(), *gemm2_kernel_list.values()]:
+                kernel_archs[kernel.name].update(archs)
+        all_archs = set().union(*kernel_archs.values())
+        instance_archs = {
+            name: used for name, used in kernel_archs.items() if used != all_archs
+        }
+        for tag, (archs, gemm1_kernel_list, gemm2_kernel_list) in tables.items():
+            self.generate_table(
+                tag,
+                gemm1_kernel_list,
+                gemm2_kernel_list,
+                instance_archs,
+                archs if len(tables) > 1 else None,
+            )
+
+    def generate_table(
+        self, tag, gemm1_kernel_list, gemm2_kernel_list, instance_archs, dispatch_archs
+    ):
+        """Write one kernel table's instances, lookup entries and dispatch.
+
+        instance_archs maps the kernels that only some tables have to the archs
+        to build them for; dispatch_archs is the table's archs when the module
+        has more than one table, else None.
+        """
         kernel_list = list(gemm1_kernel_list.values()) + list(
             gemm2_kernel_list.values()
         )
@@ -944,37 +989,37 @@ class ck_moe_2stage_gemm_codegen:
                 gemm1_fp32 = (
                     self.splitk and (kernel.stage == 1) and (quanttype == "_blockscale")
                 )
-                if not os.path.exists(f_instance):
-                    with open(f_instance, "a") as f_ins:
-                        stage_instance = STG_INSTANCE_IMPL.format(
-                            quanttype=quanttype,
-                            A0DataType=self.a_dtype,
-                            B0DataType=self.b_dtype,
-                            AccDataType="F32" if self.a_dtype != "I8" else "I32",
-                            EDataType="F32" if gemm1_fp32 else self.c_dtype,
-                            CDEElementOp=kernel.CDEElementOp,
-                            Nswizzle=str(self.nswizzle).lower(),
-                            Quant=self.quant_type,
-                            ActOP=(
-                                ACT_OP_MAP[self.activation] if kernel.stage == 1 else 0
-                            ),
-                            Stage=kernel.stage,
-                            BlockSize=kernel.BLOCK_SIZE,
-                            MPerBlock=kernel.MPerBlock,
-                            NPerBlock=kernel.NPerBlock,
-                            KPerBlock=kernel.KPerBlock,
-                            MWaves=kernel.MWaves,
-                            NWaves=kernel.NWaves,
-                            PipelineVer=kernel.GemmPipelineVersion,
-                            MulRoutedWeight=str(
-                                self.mul_routed_weight_stage == kernel.stage
-                            ).lower(),
-                        )
-                        if "FP4" in self.b_dtype:
-                            stage_instance = (
-                                "#ifndef __gfx942__\n" + stage_instance + "\n#endif\n"
-                            )
-                        f_ins.write(stage_instance)
+                stage_instance = STG_INSTANCE_IMPL.format(
+                    quanttype=quanttype,
+                    A0DataType=self.a_dtype,
+                    B0DataType=self.b_dtype,
+                    AccDataType="F32" if self.a_dtype != "I8" else "I32",
+                    EDataType="F32" if gemm1_fp32 else self.c_dtype,
+                    CDEElementOp=kernel.CDEElementOp,
+                    Nswizzle=str(self.nswizzle).lower(),
+                    Quant=self.quant_type,
+                    ActOP=ACT_OP_MAP[self.activation] if kernel.stage == 1 else 0,
+                    Stage=kernel.stage,
+                    BlockSize=kernel.BLOCK_SIZE,
+                    MPerBlock=kernel.MPerBlock,
+                    NPerBlock=kernel.NPerBlock,
+                    KPerBlock=kernel.KPerBlock,
+                    MWaves=kernel.MWaves,
+                    NWaves=kernel.NWaves,
+                    PipelineVer=kernel.GemmPipelineVersion,
+                    MulRoutedWeight=str(
+                        self.mul_routed_weight_stage == kernel.stage
+                    ).lower(),
+                )
+                if "FP4" in self.b_dtype:
+                    stage_instance = (
+                        "#ifndef __gfx942__\n" + stage_instance + "\n#endif\n"
+                    )
+                if kernel.name in instance_archs:
+                    stage_instance = arch_guard(
+                        sorted(instance_archs[kernel.name]), stage_instance
+                    )
+                write_if_changed(f_instance, stage_instance)
 
                 ## generate lookUpTable
                 lookup_ele = LOOKUP_template.format(
@@ -1021,6 +1066,10 @@ class ck_moe_2stage_gemm_codegen:
                 MulRoutedWeight=str(self.mul_routed_weight_stage == 1).lower(),
                 Preshuffle=str(self.preshuffle).lower(),
             )
+            if dispatch_archs:
+                gemm1_heuristic_dispatch_str = arch_branch(
+                    dispatch_archs, gemm1_heuristic_dispatch_str
+                )
             f_h.write(gemm1_heuristic_dispatch_str)
 
         f_gemm2_heuristic_dispatch = os.path.join(
@@ -1039,6 +1088,10 @@ class ck_moe_2stage_gemm_codegen:
                 MulRoutedWeight=str(self.mul_routed_weight_stage == 2).lower(),
                 Preshuffle=str(self.preshuffle).lower(),
             )
+            if dispatch_archs:
+                gemm2_heuristic_dispatch_str = arch_branch(
+                    dispatch_archs, gemm2_heuristic_dispatch_str
+                )
             f_h.write(gemm2_heuristic_dispatch_str)
 
 

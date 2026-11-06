@@ -15,7 +15,7 @@ else:
     )  # develop mode
 sys.path.insert(0, AITER_CORE_DIR)
 
-from chip_info import get_gfx
+from chip_info import get_gfx, get_gfx_list, get_gfx_runtime
 
 # CK stage1 activation op values. swiglu (OAI swiglu_oai) maps to CK act value 3;
 # gelutanh (gelu_tanh_and_mul) maps to CK act value 4; value 2 is intentionally
@@ -380,8 +380,9 @@ def get_gemm1_kernels_list(
     MulRoutedWeight: bool,
     preshuffle: bool = False,
     splitk: bool = False,
+    arch: str | None = None,
 ) -> list:
-    arch = get_gfx()
+    arch = arch or get_gfx()
     if (
         Adtype in bit16_list
         and Bdtype in bit16_list
@@ -458,8 +459,9 @@ def get_gemm2_kernels_list(
     QuantType: str,
     MulRoutedWeight: bool,
     preshuffle: bool = False,
+    arch: str | None = None,
 ) -> list:
-    arch = get_gfx()
+    arch = arch or get_gfx()
 
     if (
         Adtype in bit16_list
@@ -522,3 +524,50 @@ def get_gemm2_kernels_list(
             else:
                 kernel.CDEElementOp = "TypeCast"
     return tag, kernels_list
+
+
+def get_gemm_kernel_tables(
+    Adtype: str,
+    Bdtype: str,
+    Cdtype: str,
+    Nswizzle: bool,
+    QuantType: str,
+    ActOP: str,
+    mul_routed_weight_stage: int,
+    preshuffle: bool = False,
+    splitk: bool = False,
+) -> dict:
+    """The kernel tables of every arch the module is compiled for (GPU_ARCHS).
+
+    Returns {tag: (archs, gemm1 kernels, gemm2 kernels)}; archs whose kernel
+    lists have the same tag share one table.
+    """
+    # hipcc builds a "native" entry for this machine's GPU, but get_gfx_list()
+    # keeps it as is when GPU_ARCHS lists other archs too ("native;gfx950").
+    archs = [get_gfx_runtime() if arch == "native" else arch for arch in get_gfx_list()]
+    tables = {}
+    for arch in dict.fromkeys(archs):
+        _, gemm1_kernels = get_gemm1_kernels_list(
+            Adtype,
+            Bdtype,
+            Cdtype,
+            Nswizzle,
+            QuantType,
+            ActOP,
+            mul_routed_weight_stage == 1,
+            preshuffle,
+            splitk,
+            arch=arch,
+        )
+        tag, gemm2_kernels = get_gemm2_kernels_list(
+            Adtype,
+            Bdtype,
+            Cdtype,
+            Nswizzle,
+            QuantType,
+            mul_routed_weight_stage == 2,
+            preshuffle,
+            arch=arch,
+        )
+        tables.setdefault(tag, ([], gemm1_kernels, gemm2_kernels))[0].append(arch)
+    return tables
