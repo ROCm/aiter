@@ -201,7 +201,10 @@ def _blocked_job(**overrides):
     return {**job, **overrides}
 
 
-def _replayed_kernels(module, job):
+def _replayed_kernels(module, job, monkeypatch):
+    # A kernel's closure constants (NUM_XCDS) enter its identity through the
+    # cache manager key, which FlyDSL derives only with its cache enabled.
+    monkeypatch.setenv("FLYDSL_RUNTIME_ENABLE_CACHE", "1")
     with (
         dry_run("gfx950", job["cu_num"], python_ops=True, num_xcds=job.get("num_xcds")),
         replay.identified_kernels() as kernels,
@@ -210,11 +213,11 @@ def _replayed_kernels(module, job):
     return kernels
 
 
-def test_xcd_counts_are_distinct_kernels_and_jobs():
+def test_xcd_counts_are_distinct_kernels_and_jobs(monkeypatch):
     from aiter.aot.flydsl import chunk_gdn_blocked
 
-    four = _replayed_kernels(chunk_gdn_blocked, _blocked_job(num_xcds=4))
-    eight = _replayed_kernels(chunk_gdn_blocked, _blocked_job(num_xcds=8))
+    four = _replayed_kernels(chunk_gdn_blocked, _blocked_job(num_xcds=4), monkeypatch)
+    eight = _replayed_kernels(chunk_gdn_blocked, _blocked_job(num_xcds=8), monkeypatch)
     assert len(four) == len(eight) == 3
     assert not four & eight
     jobs = _blocked_jobs()
@@ -234,7 +237,7 @@ def test_replay_does_not_query_hip_for_the_xcd_count(monkeypatch):
 
     monkeypatch.setattr(chip_info, "_query_num_xccs", no_query)
     monkeypatch.setattr(chip_info, "get_current_hip_device", no_query)
-    assert len(_replayed_kernels(chunk_gdn_blocked, _blocked_job())) == 3
+    assert len(_replayed_kernels(chunk_gdn_blocked, _blocked_job(), monkeypatch)) == 3
 
 
 @pytest.mark.parametrize("is_varlen", [False, True])
@@ -248,13 +251,15 @@ def test_blocked_gate_reads_no_device_lengths(monkeypatch, is_varlen):
 
     monkeypatch.setattr(torch.Tensor, "tolist", read_back)
     monkeypatch.setattr(torch.Tensor, "item", read_back)
-    kernels = _replayed_kernels(chunk_gdn_blocked, _blocked_job(is_varlen=is_varlen))
+    kernels = _replayed_kernels(
+        chunk_gdn_blocked, _blocked_job(is_varlen=is_varlen), monkeypatch
+    )
     assert len(kernels) == 3
 
 
-def test_a_one_chunk_rule_job_stays_on_the_serial_path():
+def test_a_one_chunk_rule_job_stays_on_the_serial_path(monkeypatch):
     from aiter.aot.flydsl import chunk_gdn_h
 
     job = {**_blocked_job(), "kernel_name": "chunk_gdn_fwd_h_flydsl_opt", "m": 8192}
     del job["total_chunks"], job["max_seq_chunks"]
-    assert len(_replayed_kernels(chunk_gdn_h, job)) == 1
+    assert len(_replayed_kernels(chunk_gdn_h, job, monkeypatch)) == 1
