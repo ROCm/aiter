@@ -32,6 +32,7 @@ from ..flydsl_dispatch_combine_intranode_op import (
     FlyDSLDispatchCombineConfig,
     FlyDSLDispatchCombineIntraNodeOp,
     build_p2p_table,
+    group_major_capacity,
 )
 from ..kernels_common import ceildiv
 from ..mxfp4_gemm_common import _fabs_f32 as fabs_f32
@@ -57,7 +58,7 @@ from .mega_moe_fused_gemm import (
     select_mega_moe_config,
     store_at,
 )
-from .mega_moe_stage1 import _validate_dispatch_capacity
+from .mega_moe_stage1 import _validate_dispatch_capacity, stage1_output_buffers
 from .mega_moe_stage2 import _fp8_scale_for_leader, _stage2_lds_bytes
 
 __all__ = ["LargeMRuntime"]
@@ -1951,12 +1952,35 @@ def run_mega_moe_stage1(out, x, w, scale_x, scale_w, sorted_token_ids, expert_id
 class LargeMRuntime:
     """Non-indexed GEMM1 -> GEMM2 -> combine persistent pipeline."""
 
+    # Group-major dispatch layout of the fused kernel: compact, 128-row units, route-major payload.
+    GM_UNIT_SIZE = 128
+    GM_COMPACT = True
+
+    @classmethod
+    def payload_capacity(
+        cls, *, world_size, model_dim, experts, topk, max_tok_per_rank
+    ):
+        """group_major_capacity() of this runtime's dispatch, for a shared payload arena."""
+        return group_major_capacity(
+            world_size=world_size,
+            hidden_dim=model_dim,
+            max_tok_per_rank=max_tok_per_rank,
+            experts_per_rank=experts // world_size,
+            topk=topk,
+            data_type=torch.float8_e4m3fn,
+            unit_size=cls.GM_UNIT_SIZE,
+            scale_dim=model_dim // 32,
+            compact=cls.GM_COMPACT,
+        )
+
     # fmt: off
     def __init__(self, *, rank: int, world_size: int, model_dim: int, inter_dim: int, experts: int, topk: int,
         quant: str, w1: torch.Tensor, w1_scale: torch.Tensor, w2: torch.Tensor, w2_scale: torch.Tensor,
         max_tok_per_rank: int, mega_scheme: str = "fixedslot", swiglu_limit: float = 0.0,
-        state_slots: int = 1):
+        state_slots: int = 1, payload_arena=None, s1_output_arena=None):
     # fmt: on
+        """``payload_arena`` / ``s1_output_arena``: shared storage owned by MegaMoEV2
+        (see GroupMajorPayloadArena and stage1_output_buffers); None allocates."""
         if quant != "a8w4":
             raise ValueError("LargeMRuntime currently supports quant='a8w4' only")
         if experts % world_size != 0:
@@ -1993,11 +2017,12 @@ class LargeMRuntime:
             hidden_dim=self.model_dim, max_num_inp_token_per_rank=self.mtpr, num_experts_per_rank=self.epr,
             num_experts_per_token=self.topk, combine_dtype=torch.bfloat16,
             dispatch_dtype=torch.float8_e4m3fn, scale_dim=self._s1_scale_dim, scale_type_size=1,
-            enable_std_moe=False, enable_group_major=True, gm_unit_size=128,
-            gm_scheme=mega_scheme, gm_compact=True, gm_indexed_payload=False,
+            enable_std_moe=False, enable_group_major=True, gm_unit_size=self.GM_UNIT_SIZE,
+            gm_scheme=mega_scheme, gm_compact=self.GM_COMPACT, gm_indexed_payload=False,
             max_total_recv_tokens=self.world_size)
         # fmt: on
-        self.comb_op = FlyDSLDispatchCombineIntraNodeOp(self.comb_cfg)
+        self.comb_op = FlyDSLDispatchCombineIntraNodeOp(self.comb_cfg, gm_payload_arena=payload_arena)
+        self._s1_output_arena = s1_output_arena
         torch.cuda.synchronize()
         ms.shmem_barrier_all()
         # Contiguous copies of strided weights live as long as the runtime: a graph captured with
@@ -2056,12 +2081,9 @@ class LargeMRuntime:
         self._s1_rx = v["rx_em"]
         self._s1_scale_i32 = v["scale_em_i32"]
 
-        inter_dim = self.inter_dim
-        a2rows = self._s1_nvm
-        self._s1_out = torch.zeros((a2rows, inter_dim), dtype=torch.float8_e4m3fn, device=self.dev)
-        prows = ((a2rows + 255) // 256) * 256
-        pcols = (((inter_dim // 32) + 7) // 8) * 8
-        self._s1_osd = torch.zeros(prows * pcols + inter_dim, dtype=torch.uint8, device=self.dev)
+        self._s1_out, self._s1_osd = stage1_output_buffers(
+            self._s1_nvm, self.inter_dim, self.dev, arena=self._s1_output_arena
+        )
     def _allocate_dispatch_workspace(self, op, metadata_blocks):
         total_experts = self.world_size * self.epr
         workspace = {

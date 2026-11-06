@@ -14,7 +14,10 @@ from aiter.utility import dtypes
 from ..flydsl_dispatch_combine_intranode_op import (
     FlyDSLDispatchCombineConfig,
     FlyDSLDispatchCombineIntraNodeOp,
+    GroupMajorPayloadArena,
+    group_major_capacity,
 )
+from ..tensor_shim import torch_stream
 from . import envs
 from .dispatch import DISPATCH_TABLE_SIZE, DispatchSlot
 from .mega_moe_config import (
@@ -30,8 +33,8 @@ from .mega_moe_config import (
     fused_layout_supported,
     small_m_cu_supported,
 )
+from .mega_moe_stage1 import stage1_output_nbytes
 from .mega_moe_stage2_aligned_pair import ALIGNED_PAIR_SCATTER_VEC
-from ..tensor_shim import torch_stream
 from .quant import per_1x32_mx_quant
 from .weights import check_bindable, contiguous_weights, weight_spec
 
@@ -143,7 +146,10 @@ class MegaMoEV2:
             gm_indexed_payload=compact and self.mtpr >= INDEXED_PAYLOAD_MIN_MTPR,
             max_total_recv_tokens=self.world_size)
         # fmt: on
-        self.comb_op = FlyDSLDispatchCombineIntraNodeOp(self.comb_cfg)
+        self._build_route_arenas()
+        self.comb_op = FlyDSLDispatchCombineIntraNodeOp(
+            self.comb_cfg, gm_payload_arena=self._payload_arena
+        )
         torch.cuda.synchronize()
         ms.shmem_barrier_all()
         # Contiguous copies of strided weights live as long as the instance: a graph captured with
@@ -175,6 +181,8 @@ class MegaMoEV2:
                 mega_scheme=mega_scheme,
                 swiglu_limit=self.swiglu_limit,
                 state_slots=self.large_m_state_slots,
+                payload_arena=self._payload_arena,
+                s1_output_arena=self._s1_output_arena,
             )
         # Compatibility switch for set_large_m_enabled(); routing stays with the plan.
         self._large_m_excluded = False
@@ -198,6 +206,8 @@ class MegaMoEV2:
                     w2_scale=self.w2_scale,
                     max_tok_per_rank=m,
                     swiglu_limit=self.swiglu_limit,
+                    payload_arena=self._payload_arena,
+                    s1_output_arena=self._s1_output_arena,
                 )
                 for m in self._bundle_plan.small_m_mtprs
             ]
@@ -343,6 +353,63 @@ class MegaMoEV2:
         if self._large_m is not None:
             self._large_m.preload_aot_bundle()
 
+    def _build_route_arenas(self):
+        """One payload arena and one GEMM1-output arena for every route of the plan.
+
+        An instance has one call in flight, and every route rewrites or masks
+        this data before it reads it and finishes reading it before the closing
+        all-rank barrier of its call, so routes reuse one copy; each keeps its
+        own counters, epochs and flags. Sized for the largest route.
+        """
+        self._payload_arena = None
+        self._s1_output_arena = None
+        plan = self._bundle_plan
+        if not plan.small_m_mtprs and not plan.large_m:
+            return
+        cfg = self.comb_cfg
+        capacities = [
+            group_major_capacity(
+                world_size=self.world_size,
+                hidden_dim=self.model_dim,
+                max_tok_per_rank=self.mtpr,
+                experts_per_rank=self.epr,
+                topk=self.topk,
+                data_type=cfg.dispatch_dtype,
+                unit_size=cfg.gm_unit_size,
+                scale_dim=cfg.scale_dim,
+                scale_type_size=cfg.scale_type_size,
+                compact=cfg.gm_compact,
+                indexed_payload=cfg.gm_indexed_payload,
+            )
+        ]
+        fused = dict(
+            world_size=self.world_size,
+            model_dim=self.model_dim,
+            experts=self.experts,
+            topk=self.topk,
+        )
+        if plan.large_m:
+            from .mega_moe_large_m import LargeMRuntime
+
+            capacities.append(
+                LargeMRuntime.payload_capacity(max_tok_per_rank=self.mtpr, **fused)
+            )
+        if plan.small_m_mtprs:
+            from .mega_moe_small_m import SmallMRuntime
+
+            capacities += [
+                SmallMRuntime.payload_capacity(max_tok_per_rank=m, **fused)
+                for m in plan.small_m_mtprs
+            ]
+        self._payload_arena = GroupMajorPayloadArena(capacities)
+        out_bytes, osd_bytes = stage1_output_nbytes(
+            max(nvm for nvm, _, _, _ in capacities), self.inter_dim, self._a_dtype
+        )
+        self._s1_output_arena = (
+            torch.zeros(out_bytes, dtype=torch.uint8, device=self.dev),
+            torch.zeros(osd_bytes, dtype=torch.uint8, device=self.dev),
+        )
+
     def _build_fused_stage1(self, w1, w1_scale):
         from .mega_moe_prepare import (
             preload_mega_moe_prepare,
@@ -352,6 +419,7 @@ class MegaMoEV2:
             preload_mega_moe_stage1_bundle,
             run_mega_moe_stage1,
             run_mega_moe_stage1_bundle,
+            stage1_output_buffers,
         )
 
         self.sort_block_m = 32
@@ -417,21 +485,12 @@ class MegaMoEV2:
             else self._s1_scale_i32
         )
 
-        inter_dim = self.inter_dim
-        a2rows = self._s1_nvm
-        if self._a_dtype == "fp4":
-            self._s1_out = torch.zeros(
-                (a2rows, inter_dim // 2), dtype=torch.uint8, device=self.dev
-            ).view(torch.float4_e2m1fn_x2)
-            self._s1_out_kernel = self._s1_out.view(torch.uint8)
-        else:
-            self._s1_out = torch.zeros(
-                (a2rows, inter_dim), dtype=torch.float8_e4m3fn, device=self.dev
-            )
-            self._s1_out_kernel = self._s1_out
-        prows = ((a2rows + 255) // 256) * 256
-        pcols = (((inter_dim // 32) + 7) // 8) * 8
-        self._s1_osd = torch.zeros(prows * pcols + inter_dim, dtype=torch.uint8, device=self.dev)
+        self._s1_out, self._s1_osd = stage1_output_buffers(
+            self._s1_nvm, self.inter_dim, self.dev, self._a_dtype, self._s1_output_arena
+        )
+        self._s1_out_kernel = (
+            self._s1_out.view(torch.uint8) if self._a_dtype == "fp4" else self._s1_out
+        )
         if self._a_dtype == "fp4":
             self._s1_quant_x = torch.empty(
                 self.mtpr,
