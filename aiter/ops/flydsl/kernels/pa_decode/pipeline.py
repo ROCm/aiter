@@ -1586,9 +1586,11 @@ class Gfx1250WavePipeline:
             ctx.planned_start * KV_COMPUTE_BLOCK,
             ctx.planned_end * KV_COMPUTE_BLOCK,
         )
-        # The first page's DMA overlaps Q staging; the regions are disjoint.
+        # Q loads overlap the table lookup and the first page's DMA issue;
+        # the LDS regions are disjoint.
+        q_tiles = self.mem.load_query()
         self.mem.stage_kv(begin, fx.Int32(0))
-        self.mem.stage_query()
+        self.mem.store_query(q_tiles)
         row = ctx.warp * 16 + ctx.lane16
         gpu.barrier()
         q_operand = self.mem.operand(
@@ -1709,10 +1711,13 @@ class Gfx1250Pipeline:
             ctx.planned_start * KV_COMPUTE_BLOCK,
             ctx.planned_end * KV_COMPUTE_BLOCK,
         )
-        # The first page's DMA overlaps Q staging; the regions are disjoint.
+        # Q loads overlap the table lookup and the first page's DMA issue;
+        # the LDS regions are disjoint.
+        if const_expr(t.q_tiles == t.m_tiles):
+            q_tiles = self.mem.load_query()
         self.mem.stage_kv(begin, fx.Int32(0))
         if const_expr(t.q_tiles == t.m_tiles):
-            self.mem.stage_query()
+            self.mem.store_query(q_tiles)
         # Per-M-tile state: maximum, denominator, then wave-owned D fragments.
         vh_count = t.head_dim // 64
         initial = []

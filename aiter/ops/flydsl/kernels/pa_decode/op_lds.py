@@ -1746,13 +1746,22 @@ class Gfx1250Memory:
 
     @flyc.jit
     def stage_query(self, first_tile=0):
+        self.store_query(self.load_query(first_tile), first_tile)
+
+    @flyc.jit
+    def load_query(self, first_tile=0):
+        """Issue the global Q loads; ``store_query`` stages them.
+
+        Splitting the two lets the loads overlap the block-table lookup and
+        the first page's DMA issue.
+        """
         ctx, t = self.ctx, self.t
         query = fx.recast_iter(t.q_dtype, ctx.query_ptr)
         # Eight adjacent lanes stage each row, normalizing only for FP8.
         row, shard = ctx.tid // 8, ctx.tid % 8
+        tiles = []
         for m in range_constexpr(t.q_tiles):
             flat = (first_tile + m) * 16 + row
-            shared_row = m * 16 + row
             units = []
             for j in range_constexpr(t.head_dim // 64):
                 d = shard * (t.head_dim // 8) + j * 8
@@ -1767,15 +1776,25 @@ class Gfx1250Memory:
                     * ctx.stride_q_head
                     + d
                 )
-                values = fx.Vector.filled(8, 0.0, fx.Float32)
+                values = fx.Vector.filled(8, 0.0, t.q_dtype)
                 if flat < t.rows:
                     values = fx.Vector(
                         fx.ptr_load(
                             fx.add_offset(query, qoff),
                             result_type=fx.Vector.make_type(8, t.q_dtype),
                         )
-                    ).to(fx.Float32)
+                    )
                 units.append(values)
+            tiles.append(units)
+        return tiles
+
+    @flyc.jit
+    def store_query(self, tiles, first_tile=0):
+        ctx, t = self.ctx, self.t
+        row, shard = ctx.tid // 8, ctx.tid % 8
+        for m in range_constexpr(t.q_tiles):
+            shared_row = m * 16 + row
+            units = [unit.to(fx.Float32) for unit in tiles[m]]
             if const_expr(not t.bf16):
                 absmax = fx.Float32(0.0)
                 for j in range_constexpr(len(units)):
