@@ -1794,42 +1794,49 @@ class Gfx1250Pipeline:
                     self.mem.stage_kv(token_base + t.TOKENS, 1 - buffer)
             vnorm = fx.Float32(1.0)
             vfactor = fx.Float32(1.0 if t.bf16 else 1.0 / t.FP8_MAX)
-            page_ratio = None
-            if const_expr(t.page128_pair and t.per_token_kv):
-                # P normalizes each page by its own V scales, as one-page
-                # steps do; the second page's PV is rescaled to the first's.
+            # Two-page FP8 steps keep each half (waves 0-1, waves 2-3) a
+            # one-page step: its own maximum and V scales quantize its P, and
+            # the halves combine in FP32 with bounded weights.
+            split = t.page128_pair or t.page16_wide
+            half_vnorm = vnorm
+            half_ratios = (fx.Float32(1.0), fx.Float32(1.0))
+            if const_expr(split and t.per_token_kv):
                 scale_base = kv_off + t.k_bytes + t.v_bytes + t.TOKENS * 4
-                page_factors = []
-                for p in range_constexpr(2):
+                half_tokens = t.TOKENS // 2
+                factors = []
+                for h in range_constexpr(2):
                     vmax = fx.Float32(
                         self.mem.load(
-                            scale_base + (ctx.lane + 128 * p) * 4, fx.Float32
+                            scale_base + (ctx.lane + half_tokens * h) * 4, fx.Float32
                         )[0]
                     )
-                    for k in range_constexpr(1, 4):
+                    for k in range_constexpr(1, half_tokens // 32):
                         vmax = fx.maxnumf(
                             vmax,
                             fx.Float32(
                                 self.mem.load(
-                                    scale_base + (ctx.lane + 128 * p + 32 * k) * 4,
+                                    scale_base
+                                    + (ctx.lane + half_tokens * h + 32 * k) * 4,
                                     fx.Float32,
                                 )[0]
                             ),
                         )
                     for shift in (16, 8, 4, 2, 1):
                         vmax = fx.maxnumf(vmax, vmax.shuffle_xor(shift, t.WAVE))
-                    page_factors.append(vmax * fx.Float32(1.0 / t.FP8_MAX))
-                # Empty planned tails carry no new mass. Keep the prior scale
-                # so their zero V contribution preserves the output.
-                vfactor = (page_factors[0] > 0.0).select(
-                    page_factors[0], fx.Float32(state[-1])
-                )
-                second = (page_factors[1] > 0.0).select(page_factors[1], vfactor)
+                    factor = vmax * fx.Float32(1.0 / t.FP8_MAX)
+                    # Empty planned tails carry no new mass. Keep the prior
+                    # scale so their zero V contribution preserves the output.
+                    factors.append((factor > 0.0).select(factor, fx.Float32(state[-1])))
+                # The accumulator keeps the larger factor, so both halves'
+                # ratios stay at most one.
+                vfactor = fx.maxnumf(factors[0], factors[1])
                 vnorm = fx.Float32(rcp_f32(fx.maxnumf(vfactor, fx.Float32(1e-20))))
-                second_norm = fx.Float32(rcp_f32(fx.maxnumf(second, fx.Float32(1e-20))))
-                page_ratio = second * vnorm
-                # Waves 0-1 own page 0's tokens, waves 2-3 page 1's.
-                wave_vnorm = (ctx.warp < 2).select(vnorm, second_norm)
+                norms = [
+                    fx.Float32(rcp_f32(fx.maxnumf(f, fx.Float32(1e-20))))
+                    for f in factors
+                ]
+                half_vnorm = (ctx.warp < 2).select(norms[0], norms[1])
+                half_ratios = (factors[0] * vnorm, factors[1] * vnorm)
             elif const_expr(t.per_token_kv):
                 # Every wave reduces the tile's scales, avoiding a CTA barrier.
                 scale_base = kv_off + t.k_bytes + t.v_bytes + t.TOKENS * 4
@@ -1980,9 +1987,10 @@ class Gfx1250Pipeline:
                         fx.Float32,
                     )
                 gpu.barrier()
-                tile_max = self.mem.load(
+                maxima = self.mem.load(
                     t.stats_offset + ctx.lane16 * t.NWARP * 4, fx.Float32, t.NWARP
-                ).reduce(ReductionOp.MAX)
+                )
+                tile_max = maxima.reduce(ReductionOp.MAX)
                 old_max = state[m * state_stride]
                 new_max = fx.maxnumf(old_max, tile_max)
                 safe_max = (new_max > fx.Float32(float("-inf"))).select(
@@ -1991,11 +1999,30 @@ class Gfx1250Pipeline:
                 # Approximate exponentials avoid the library underflow fixup.
                 # Keep infinity semantics for masked rows and empty history.
                 corr = fx.Float32(fx.exp2(old_max - safe_max, fastmath="afn"))
+                p_max = safe_max
+                if const_expr(split):
+                    half_max = [
+                        fx.maxnumf(fx.Float32(maxima[0]), fx.Float32(maxima[1])),
+                        fx.maxnumf(fx.Float32(maxima[2]), fx.Float32(maxima[3])),
+                    ]
+                    # A fully masked half has no mass: weight zero, not inf * 0.
+                    half_weights = [
+                        (hm > fx.Float32(float("-inf"))).select(
+                            fx.Float32(fx.exp2(hm - safe_max, fastmath="afn")),
+                            fx.Float32(0.0),
+                        )
+                        for hm in half_max
+                    ]
+                    safe_half = [
+                        (hm > fx.Float32(float("-inf"))).select(hm, fx.Float32(0.0))
+                        for hm in half_max
+                    ]
+                    p_max = (ctx.warp < 2).select(safe_half[0], safe_half[1])
                 probs = fx.Vector(
                     fx.exp2(
                         scores
                         - fx.Vector.from_elements(
-                            [fx.Float32(safe_max)], dtype=fx.Float32
+                            [fx.Float32(p_max)], dtype=fx.Float32
                         ).broadcast_to(t.TOKENS // 8),
                         fastmath="afn",
                     )
@@ -2006,9 +2033,7 @@ class Gfx1250Pipeline:
                 for r in range_constexpr(t.TOKENS // 8):
                     if const_expr(t.per_token_kv):
                         vs = fx.Float32(vscales[r])
-                        pscale.append(
-                            probs[r] * vs * (wave_vnorm if t.page128_pair else vnorm)
-                        )
+                        pscale.append(probs[r] * vs * (half_vnorm if split else vnorm))
                     else:
                         pscale.append(
                             probs[r] * fx.Float32(1.0 if t.bf16 else t.FP8_MAX)
@@ -2034,11 +2059,11 @@ class Gfx1250Pipeline:
                         fx.Float32,
                     )
                 # Prefetch V operands before waiting for cross-wave P stores.
-                pv_k = 32 if t.bf16 else min(t.TOKENS, 128)
+                pv_k = 32 if t.bf16 else min(t.TOKENS // (2 if split else 1), 128)
                 if const_expr(t.fp8_multi_tile):
                     v_operands = page_v_operands
                 elif const_expr(t.packed_lds):
-                    v_operands = self.mem.page_v_operands(kv_off)
+                    v_operands = self.mem.page_v_operands(kv_off, pv_k)
                 elif const_expr(t.bf16_page16_packed):
                     v_operands = [
                         [
@@ -2071,9 +2096,19 @@ class Gfx1250Pipeline:
                         for vh in range_constexpr(vh_count)
                     ]
                 gpu.barrier()
-                denom = state[m * state_stride + 1] * corr + self.mem.load(
+                sums = self.mem.load(
                     t.stats_offset + 256 + ctx.lane16 * t.NWARP * 4, fx.Float32, t.NWARP
-                ).reduce(ReductionOp.ADD)
+                )
+                if const_expr(split):
+                    denom = (
+                        state[m * state_stride + 1] * corr
+                        + (fx.Float32(sums[0]) + fx.Float32(sums[1])) * half_weights[0]
+                        + (fx.Float32(sums[2]) + fx.Float32(sums[3])) * half_weights[1]
+                    )
+                else:
+                    denom = state[m * state_stride + 1] * corr + sums.reduce(
+                        ReductionOp.ADD
+                    )
                 next_state.extend([new_max, denom])
                 p_operands = [
                     self.mem.operand(
@@ -2096,20 +2131,21 @@ class Gfx1250Pipeline:
                         if t.packed_lds
                         else fx.Vector.filled(8, 0.0, fx.Float32)
                     )
-                    if const_expr(page_ratio is not None):
-                        out = Gfx1250Gemm.mma(
-                            v_operands[vh][0], p_operands[0], out, pv_k, t.bf16
-                        )
-                        second_out = Gfx1250Gemm.mma(
-                            v_operands[vh][1],
-                            p_operands[1],
-                            fx.Vector.filled(8, 0.0, fx.Float32),
-                            pv_k,
-                            t.bf16,
-                        )
-                        out = out + second_out * fx.Vector.from_elements(
-                            [page_ratio], dtype=fx.Float32
-                        ).broadcast_to(8)
+                    if const_expr(split):
+                        chunks = t.TOKENS // 2 // pv_k
+                        for h in range_constexpr(2):
+                            part = fx.Vector.filled(8, 0.0, fx.Float32)
+                            for d in range_constexpr(chunks):
+                                part = Gfx1250Gemm.mma(
+                                    v_operands[vh][h * chunks + d],
+                                    p_operands[h * chunks + d],
+                                    part,
+                                    pv_k,
+                                    t.bf16,
+                                )
+                            out = out + part * fx.Vector.from_elements(
+                                [half_weights[h] * half_ratios[h]], dtype=fx.Float32
+                            ).broadcast_to(8)
                     else:
                         for d in range_constexpr(t.TOKENS // pv_k):
                             out = Gfx1250Gemm.mma(

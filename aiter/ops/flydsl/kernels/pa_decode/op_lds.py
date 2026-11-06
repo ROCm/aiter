@@ -1462,10 +1462,10 @@ class Gfx1250Memory:
             words.extend([frag[i] for i in range_constexpr(4)])
         return fx.Vector.from_elements(words, dtype=fx.Int32)
 
-    def page_v_operands(self, kv_off):
+    def page_v_operands(self, kv_off, k=None):
         # At most K128 per operand; 128 tokens span eight 16-token groups.
         ctx, t = self.ctx, self.t
-        k = min(t.TOKENS, 128)
+        k = min(t.TOKENS, 128) if k is None else k
         return [
             [
                 self.packed_operand(

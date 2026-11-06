@@ -2149,3 +2149,94 @@ def test_pa_decode_unowned_kv_rows(
     assert torch.equal(poisoned, clean)
     if fill == "nan":
         assert torch.equal(run("zero", mask_unowned_kv=False), clean)
+
+
+@pytest.mark.parametrize("block_size", [16, 128])
+@pytest.mark.parametrize(
+    "case",
+    [
+        # Q = K = 0: uniform weights; the halves' V scales differ by 1e40. A
+        # shared accumulator scale from the first half overflows to inf.
+        pytest.param(((1.0, 1.0), (0.0, 0.0), (1e-8, 1e32)), id="v-scale-range"),
+        # The second half's logits dominate by 14 while only the first half has
+        # V mass: P must keep the first half's own maximum through FP8
+        # quantization, or its ~4e-4 probabilities round to zero.
+        pytest.param(((224.0, 0.0), (0.0, 14.0), (100.0, 1.0)), id="p-underflow"),
+    ],
+)
+def test_pa_decode_two_page_steps_keep_page_scales(block_size, case, device):
+    """gfx1250 FP8 steps that span two one-page steps stay page-local.
+
+    One step covers two page128 pages (256 tokens) or 128 tokens of page16
+    pages; each half of it gets one value, logit and per-token V scale.
+    """
+    if get_gfx_runtime() != "gfx1250":
+        pytest.skip("two-page FP8 softmax steps run on gfx1250")
+    pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    values, logits, value_scales = case
+    heads, dim, x = 16, 128, 16
+    length = 256 if block_size == 128 else 128
+    pages = length // block_size
+    half = pages // 2
+    fp8 = torch.float8_e4m3fn
+    query = torch.zeros(1, heads, dim, dtype=torch.bfloat16, device=device)
+    query[..., 0] = 1.0
+    key = torch.zeros(pages, 1, dim, block_size, device=device)
+    value = torch.zeros(pages, 1, block_size, dim, device=device)
+    key_scale = torch.ones(pages, 1, block_size, 1, device=device)
+    value_scale = torch.ones(pages, 1, block_size, 1, device=device)
+    for page in range(pages):
+        h = page // half
+        if logits[h]:
+            # q . k * dim**-0.5 = logit, with K at the FP8 maximum.
+            key[page, 0, 0] = 448.0
+            key_scale[page] = logits[h] / dim**-0.5 / 448.0
+        value[page] = values[h]
+        value_scale[page] = value_scales[h]
+    key_cache = (
+        key.reshape(pages, 1, dim // x, x, block_size)
+        .permute(0, 1, 2, 4, 3)
+        .contiguous()
+        .to(fp8)
+    )
+    value_cache = (
+        value.reshape(pages, 1, block_size // x, x, dim)
+        .permute(0, 1, 2, 4, 3)
+        .contiguous()
+        .to(fp8)
+    )
+    logical_key = (
+        key_cache.float().permute(0, 1, 3, 2, 4).reshape(-1, dim)
+        * key_scale.reshape(-1, 1)
+    ).double()
+    logical_value = (
+        value_cache.float().permute(0, 1, 2, 4, 3).reshape(-1, dim)
+        * value_scale.reshape(-1, 1)
+    ).double()
+    reference = (
+        torch.softmax(query[0].double() @ logical_key.T * dim**-0.5, -1) @ logical_value
+    )
+    table = torch.arange(pages, dtype=torch.int32, device=device)[None]
+    context = torch.tensor([length], dtype=torch.int32, device=device)
+    plan = pa.plan_pa_decode(context, 1, max_partitions=1)
+    output = torch.full_like(query, float("nan"))
+    pa.pa_decode(
+        output,
+        query,
+        key_cache,
+        value_cache,
+        context,
+        table,
+        dim**-0.5,
+        1,
+        compute_type=fp8,
+        key_scale=key_scale,
+        value_scale=value_scale,
+        work_plan=plan,
+        max_context_length=length,
+    )
+    output = output[0].double()
+    assert torch.isfinite(output).all()
+    torch.testing.assert_close(
+        output, reference, rtol=0.02, atol=0.02 * reference.abs().max().item()
+    )

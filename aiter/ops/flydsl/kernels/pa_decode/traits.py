@@ -839,6 +839,8 @@ class Gfx1250Traits:
     wide_fp8_page128: bool = False
     # Grids within one CTA per CU stage two BF16 page128 pages per step.
     wide_bf16_page128: bool = False
+    # Grids beyond four CTAs per CU keep 64-token FP8 page16 steps.
+    narrow_fp8_page16: bool = False
 
     WAVE = 32
     NWARP = 4
@@ -879,7 +881,8 @@ class Gfx1250Traits:
         # One FP8 D128 query tile over page16 caches stages two pages per wave,
         # halving the softmax exchanges per token.
         return (
-            self.packed_lds
+            not self.narrow_fp8_page16
+            and self.packed_lds
             and self.block_size == 16
             and self.head_dim == 128
             and self.m_tiles == 1
