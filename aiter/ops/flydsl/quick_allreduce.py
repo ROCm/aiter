@@ -662,13 +662,14 @@ class FlyQuickAllReduce:
 class QuickAllReduceInt4(FlyQuickAllReduce):
     """vLLM alias, which builds ``QuickAllReduceInt4(group=, device=, rank=,
     world_size=)`` and calls ``compile``, ``allreduce`` and ``close`` on it.
-    ``algorithm`` defaults to ``"mesh"``. Use ``FlyQuickAllReduce`` in new code
-     and remove this class once vLLM is updated to use the Aiter communication
-     dispatcher interface.
+    ``algorithm`` defaults to ``"mesh"``. ``min_bytes`` defaults to 0, as the
+    old class had no floor: vLLM picks the payloads it sends on its own. Use
+    ``FlyQuickAllReduce`` in new code and remove this class once vLLM is updated
+    to use the Aiter communication dispatcher interface.
     """
 
-    def __init__(self, *, algorithm: str = "mesh", **kwargs):
-        super().__init__(algorithm=algorithm, **kwargs)
+    def __init__(self, *, algorithm: str = "mesh", min_bytes: int | None = 0, **kwargs):
+        super().__init__(algorithm=algorithm, min_bytes=min_bytes, **kwargs)
 
     def compile(self, inp=None, out=None) -> None:
         """Old interface to JIT-compile and load the kernels. The arguments are ignored."""

@@ -558,7 +558,8 @@ def test_selectors_reject_non_contiguous():
 
 def test_quick_allreduce_int4_alias_matches_old_vllm_usage():
     """vLLM builds ``QuickAllReduceInt4`` with no ``algorithm`` and calls
-    ``compile`` on it."""
+    ``compile`` on it. The old class had no payload floor, so neither has the
+    alias by default."""
     from aiter.ops.flydsl import FlyQuickAllReduce, QuickAllReduceInt4
 
     assert issubclass(QuickAllReduceInt4, FlyQuickAllReduce)
@@ -575,11 +576,14 @@ def test_quick_allreduce_int4_alias_matches_old_vllm_usage():
             "rank": 1,
             "world_size": 2,
             "algorithm": "mesh",
+            "min_bytes": 0,
         }
         QuickAllReduceInt4(
             group="g", device="d", rank=1, world_size=2, algorithm="ring"
         )
         assert seen["algorithm"] == "ring"
+        QuickAllReduceInt4(group="g", device="d", rank=1, world_size=2, min_bytes=None)
+        assert seen["min_bytes"] is None
 
         calls = []
         with mock.patch.object(
