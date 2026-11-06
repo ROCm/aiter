@@ -31,6 +31,12 @@ token pool (past 4 GiB for the ``pool_4g`` cases) and read it in place through
 the slot table; the result must equal the packed call on the gathered rows bit
 for bit. The span limit cases must be rejected: one request whose K/V spans one
 token past 4 GiB - 1 MiB, or whose int32 slot table spans one entry past it.
+The strided cases store the same layouts' K/V as interleaved K|V records (one per
+token, as vLLM's QSA cache does) or as padded rows and read them in place, packed
+and through kv_slots (past 4 GiB for the ``pool_4g`` cases); the result must equal
+the call on the rows gathered into contiguous K/V bit for bit. K/V rows that are
+not 16-byte aligned, overlap, or differ in stride between K and V, and an
+interleaved request whose rows span past 4 GiB - 1 MiB, must be rejected.
 Cases needing more device memory than is free are skipped with a warning.
 Performance cases are single-request full prefills of 1k-32k tokens plus the
 12000-token serving prompt (T = 512); they are checked as well and are the only
@@ -69,7 +75,7 @@ from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
 
-SUPPORTED_GFX = ["gfx942"]
+SUPPORTED_GFX = ["gfx942", "gfx950"]
 HEAD_DIM = 256
 SCALE = HEAD_DIM**-0.5
 
@@ -125,10 +131,13 @@ PERF_CASES = {
     f"prefill_{tokens}": ((tokens,), (0,), 1, "correlated", 512)
     for tokens in (1024, 2048, 4096, 8192, 12000, 16384, 32768)
 }
+# The strided cases' HK2 union layout (last, so earlier cases keep their seeds).
+STRIDE_LAYOUTS = {"hk2_chunk_1024_ctx_8192": ((1024,), (7168,), 2, "shared", 512)}
 CASES = {
     **FUNCTIONAL_CASES,
     **PERF_CASES,
     **{name: shape for name, (shape, _) in CONSTANT_CASES.items()},
+    **STRIDE_LAYOUTS,
 }
 # name -> (captured union layout, layout whose first call then grows the scratch arena:
 # its packed KV outgrows the captured layout's)
@@ -162,6 +171,53 @@ SLOT_CASES = {
 SPAN_LIMIT_CASES = {
     "span_over_limit": ((2**32 - 2**20) // (HEAD_DIM * 2) + 1, False),
     "kv_slots_span_over_limit": ((2**32 - 2**20) // 4 + 1, True),
+}
+# name -> (layout, padding elements after each K/V row (None: one interleaved K|V record
+# per token, as vLLM's QSA cache stores them), pool rows (None: packed K/V; 0: twice the
+# pages needed), first pool page)
+POOL_4G_RECORDS = 4_500_000 // PAGE * PAGE  # 1 KiB HK1 records: a 4.29 GiB pool
+FIRST_PAGE_4G = 4_200_000 // PAGE  # pages from here on start past 4 GiB
+STRIDE_CASES = {
+    "interleaved_ragged_4": ("ragged_4", None, None, 0),
+    "interleaved_extend_64_ctx_70065": ("extend_64_ctx_70065", None, None, 0),
+    "interleaved_hk2_ragged": ("hk2_ragged", None, None, 0),
+    "interleaved_hk2_chunk_1024_ctx_8192": ("hk2_chunk_1024_ctx_8192", None, None, 0),
+    "padded_ragged_4": ("ragged_4", 8, None, 0),
+    "kv_slots_interleaved_ragged_4": ("ragged_4", None, 0, 1),
+    "kv_slots_interleaved_hk2_ragged": ("hk2_ragged", None, 0, 1),
+    "kv_slots_interleaved_hk2_chunk_1024_ctx_8192": (
+        "hk2_chunk_1024_ctx_8192",
+        None,
+        0,
+        1,
+    ),
+    "kv_slots_padded_extend_64_ctx_70065": ("extend_64_ctx_70065", 8, 0, 1),
+    "kv_slots_interleaved_pool_4g_extend_64_ctx_70065": (
+        "extend_64_ctx_70065",
+        None,
+        POOL_4G_RECORDS,
+        FIRST_PAGE_4G,
+    ),
+    "kv_slots_interleaved_pool_4g_chunk_1024_ctx_132096": (
+        "chunk_1024_ctx_132096",
+        None,
+        POOL_4G_RECORDS,
+        FIRST_PAGE_4G,
+    ),
+}
+# name -> (tokens of one HK1 request, row strides of K and V in elements, the rejection's
+# message): rows the kernels cannot read, and interleaved rows whose span passes
+# 4 GiB - 1 MiB although the request's K values alone would fit
+STRIDE_REJECT_CASES = {
+    "stride_not_16_byte_aligned": (4 * 512 + 3, HEAD_DIM + 4, HEAD_DIM + 4, "K/V rows"),
+    "stride_below_row": (4 * 512 + 3, HEAD_DIM - 8, HEAD_DIM - 8, "K/V rows"),
+    "k_v_strides_differ": (4 * 512 + 3, 2 * HEAD_DIM, 3 * HEAD_DIM, "K/V rows"),
+    "interleaved_span_over_limit": (
+        (2**32 - 2**20) // (4 * HEAD_DIM) + 1,
+        2 * HEAD_DIM,
+        2 * HEAD_DIM,
+        "byte span",
+    ),
 }
 
 # Sharing levels of real Qwen3.8 indexer selections at layers 3 and 47.
@@ -771,9 +827,10 @@ def test_qsa_graph_replay(case, heads):
     }
 
 
-def make_pool(k, v, query_lens, prefix_lens, pool_rows, first_page, generator):
-    """K/V token pools and int32 slots: each request's packed K/V rows scattered to
-    random PAGE-token pages from first_page on; every other pool row is NaN."""
+def make_slots(query_lens, prefix_lens, pool_rows, first_page, generator):
+    """int32 slots placing each request's tokens on random PAGE-token pages from
+    first_page on, and the pool's rows (pool_rows, or twice the pages needed if 0 or
+    None)."""
     lengths = [n + p for n, p in zip(query_lens, prefix_lens)]
     counts = [-(-n // PAGE) for n in lengths]
     pool_rows = pool_rows or (2 * sum(counts) + first_page) * PAGE
@@ -787,7 +844,15 @@ def make_pool(k, v, query_lens, prefix_lens, pool_rows, first_page, generator):
             pages[first : first + count][tokens // PAGE] * PAGE + tokens % PAGE
         )
         first += count
-    slots = torch.cat(slots).to(dtypes.i32)
+    return torch.cat(slots).to(dtypes.i32), pool_rows
+
+
+def make_pool(k, v, query_lens, prefix_lens, pool_rows, first_page, generator):
+    """K/V token pools and int32 slots: each request's packed K/V rows scattered to
+    random PAGE-token pages from first_page on; every other pool row is NaN."""
+    slots, pool_rows = make_slots(
+        query_lens, prefix_lens, pool_rows, first_page, generator
+    )
     pools = []
     for packed in (k, v):
         pool = torch.full(
@@ -869,6 +934,101 @@ def test_qsa_kv_slots(case, heads):
     return ret
 
 
+def make_rows(rows, kv_heads, padding):
+    """NaN-filled K and V views [rows, kv_heads, 256] with strided rows: the halves of one
+    interleaved K|V record per row (padding None), or rows of two buffers with padding
+    elements after their values."""
+    if padding is None:
+        records = torch.full(
+            (rows, 2, kv_heads, HEAD_DIM), float("nan"), dtype=dtypes.bf16
+        )
+        return records[:, 0], records[:, 1]
+    width = kv_heads * HEAD_DIM
+    return tuple(
+        torch.full((rows, width + padding), float("nan"), dtype=dtypes.bf16)[
+            :, :width
+        ].unflatten(1, (kv_heads, HEAD_DIM))
+        for _ in range(2)
+    )
+
+
+@benchmark()
+def test_qsa_strided_kv(case, heads):
+    """K/V read in place through strided row views (interleaved K|V records or padded
+    rows), packed or through kv_slots, against the call on the same rows gathered into
+    contiguous K/V; both match bit for bit."""
+    layout, padding, pool_rows, first_page = STRIDE_CASES[case]
+    query_lens, prefix_lens, kv_heads, *_ = CASES[layout]
+    generator = torch.Generator(device="cuda").manual_seed(
+        list(CASES).index(layout) * 16 + heads
+    )
+    q, k, v, indices = make_inputs(layout, heads, generator)
+    ref = run_torch(q, k, v, indices, query_lens, prefix_lens, SCALE)
+    if pool_rows is None:
+        slots, pool_rows = None, k.shape[0]
+        rows = torch.arange(pool_rows)
+    else:
+        slots, pool_rows = make_slots(
+            query_lens, prefix_lens, pool_rows, first_page, generator
+        )
+        rows = slots.long()
+    strided_k, strided_v = make_rows(pool_rows, kv_heads, padding)
+    strided_k[rows], strided_v[rows] = k, v
+    del k, v
+    kwargs = {
+        "query_lens": query_lens,
+        "prefix_lens": prefix_lens,
+        "softmax_scale": SCALE,
+    }
+
+    def gather(q, k, v, indices):
+        return qsa_sparse_prefill(q, k[rows], v[rows], indices, **kwargs)
+
+    candidates = {
+        "flydsl_gather": (gather, (q, strided_k, strided_v, indices), {}),
+        "flydsl_strided": (
+            qsa_sparse_prefill,
+            (q, strided_k, strided_v, indices),
+            {**kwargs, "kv_slots": slots},
+        ),
+    }
+    flops = 4 * heads * HEAD_DIM * int((indices >= 0).sum().item())
+    span = ((pool_rows - 1) * strided_k.stride(0) + kv_heads * HEAD_DIM) * 2
+    ret = {
+        "gfx": get_gfx(),
+        "rows": q.shape[0],
+        "kv_tokens": rows.numel(),
+        "kv_heads": kv_heads,
+        "row stride": strided_k.stride(0),
+        "K span GiB": span / 2**30,
+    }
+    outputs = {}
+    for name, (fn, args, kw) in candidates.items():
+        out, us = run_perftest(
+            fn, *args, **kw, num_rotate_args=10 if span < 2**30 else 1
+        )
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = flops / us / 1e6
+        ret[f"{name} err"] = checkAllclose(
+            ref,
+            out.to(dtypes.fp32),
+            rtol=2e-2,
+            atol=2e-2,
+            msg=f"{case} H{heads} {name}: out",
+        )
+        outputs[name] = out
+    assert ret["flydsl_strided err"] == 0, f"{case} H{heads}: strided K/V mismatch"
+    bitwise = checkAllclose(
+        outputs["flydsl_gather"],
+        outputs["flydsl_strided"],
+        rtol=0,
+        atol=0,
+        msg=f"{case} H{heads} flydsl_strided vs flydsl_gather: out",
+    )
+    assert bitwise == 0, f"{case} H{heads}: strided K/V differ from the gathered call"
+    return ret
+
+
 @benchmark()
 def test_qsa_span_limit(case, heads):
     """A request whose K/V or slot table spans more than 4 GiB - 1 MiB is rejected
@@ -908,12 +1068,52 @@ def test_qsa_span_limit(case, heads):
     }
 
 
+@benchmark()
+def test_qsa_stride_rejected(case, heads):
+    """K/V rows the kernels cannot read (not 16-byte aligned, overlapping, or K and V
+    strides differing), or interleaved rows spanning past 4 GiB - 1 MiB, are rejected
+    before any launch."""
+    tokens, k_stride, v_stride, expected = STRIDE_REJECT_CASES[case]
+    q = torch.zeros(1, heads, HEAD_DIM, dtype=dtypes.bf16)
+    k, v = (
+        torch.empty(tokens * stride + HEAD_DIM, dtype=dtypes.bf16).as_strided(
+            (tokens, 1, HEAD_DIM), (stride, HEAD_DIM, 1)
+        )
+        for stride in (k_stride, v_stride)
+    )
+    # A valid selection (blocks 0-511, then the causal tail), so that a missing check
+    # fails the assertion rather than faulting in a kernel.
+    indices = torch.full((1, 4 * 512 + 3), -1, dtype=dtypes.i32)
+    indices[0, : 4 * 512] = torch.arange(4 * 512)
+    indices[0, 4 * 512 : 4 * 512 + tokens % 4] = torch.arange(tokens // 4 * 4, tokens)
+    try:
+        qsa_sparse_prefill(q, k, v, indices, query_lens=(1,), prefix_lens=(tokens - 1,))
+        message = ""
+    except ValueError as error:
+        message = str(error)
+    rejected = expected in message
+    assert rejected, f"{case} H{heads}: strides {k_stride}/{v_stride} gave {message!r}"
+    return {
+        "gfx": get_gfx(),
+        "kv_tokens": tokens,
+        "k stride": k_stride,
+        "v stride": v_stride,
+        "rejected": rejected,
+    }
+
+
 def kv_bytes(case):
     """K/V bytes a case allocates, pools included (graph cases stay small)."""
     if case in SPAN_LIMIT_CASES:
         tokens, slotted = SPAN_LIMIT_CASES[case]
         return tokens * (4 if slotted else HEAD_DIM * 2)
-    layout, pool_rows, _ = SLOT_CASES.get(case, (case, None, None))
+    if case in STRIDE_REJECT_CASES:
+        tokens, k_stride, v_stride, _ = STRIDE_REJECT_CASES[case]
+        return tokens * (k_stride + v_stride) * 2
+    if case in STRIDE_CASES:
+        layout, _, pool_rows, _ = STRIDE_CASES[case]
+    else:
+        layout, pool_rows, _ = SLOT_CASES.get(case, (case, None, None))
     if layout not in CASES:
         return 0
     query_lens, prefix_lens, hk = CASES[layout][:3]
@@ -937,10 +1137,24 @@ def main():
         "--case",
         type=str,
         nargs="*",
-        choices=[*CASES, *GRAPH_CASES, *SLOT_CASES, *SPAN_LIMIT_CASES],
-        default=[*CASES, *GRAPH_CASES, *SLOT_CASES, *SPAN_LIMIT_CASES],
-        help="input layouts to run (functional, graph, kv_slots, span limit and "
-        "performance cases)",
+        choices=[
+            *CASES,
+            *GRAPH_CASES,
+            *SLOT_CASES,
+            *STRIDE_CASES,
+            *SPAN_LIMIT_CASES,
+            *STRIDE_REJECT_CASES,
+        ],
+        default=[
+            *CASES,
+            *GRAPH_CASES,
+            *SLOT_CASES,
+            *STRIDE_CASES,
+            *SPAN_LIMIT_CASES,
+            *STRIDE_REJECT_CASES,
+        ],
+        help="input layouts to run (functional, graph, kv_slots, strided, span limit, "
+        "stride rejection and performance cases)",
     )
     parser.add_argument(
         "-g",
@@ -952,12 +1166,14 @@ def main():
     )
     args = parser.parse_args()
 
-    layouts = {**GRAPH_CASES, **SLOT_CASES}
+    layouts = {**GRAPH_CASES, **SLOT_CASES, **STRIDE_CASES}
     for suite, cases, test in (
         ("functional", [*FUNCTIONAL_CASES, *CONSTANT_CASES], test_qsa_sparse_attention),
         ("graph", list(GRAPH_CASES), test_qsa_graph_replay),
         ("kv_slots", list(SLOT_CASES), test_qsa_kv_slots),
+        ("strided", list(STRIDE_CASES), test_qsa_strided_kv),
         ("span limit", list(SPAN_LIMIT_CASES), test_qsa_span_limit),
+        ("stride rejected", list(STRIDE_REJECT_CASES), test_qsa_stride_rejected),
         ("performance", list(PERF_CASES), test_qsa_sparse_attention),
     ):
         df = []
