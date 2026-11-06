@@ -589,7 +589,7 @@ class AttentionProgram:
         seq_len,
         q_block_local_idx,
         cur_batch_query_len,
-        segm_idx,
+        segm_tile_start,
         tiles_per_segment,
         scale: tl.constexpr,
         softcap,
@@ -656,14 +656,14 @@ class AttentionProgram:
             tile_start = tl.maximum(0, first_allowed_key // cfg.TILE_SIZE)
             tile_end = tl.minimum((last_allowed_key // cfg.TILE_SIZE) + 1, num_tiles)
 
-        # split-KV: reduce_segments rebuilds the same partition from seq_len
+        # split-KV: reduce_segments rebuilds the same partition (with a sliding
+        # window, of the window's tiles only; see split_window_tiles)
         if cfg.NUM_SEGMENTS_PER_SEQ > 1:
-            segm_tile_start = segm_idx * tiles_per_segment
             if cfg.SLIDING_WINDOW > 0:
                 tile_start = tl.maximum(tile_start, segm_tile_start)
             else:
                 tile_start = segm_tile_start
-            tile_end = tl.minimum((segm_idx + 1) * tiles_per_segment, tile_end)
+            tile_end = tl.minimum(segm_tile_start + tiles_per_segment, tile_end)
 
         # qk_scale = scale * RCP_LN2 (log_2 e) so that we can use exp2 later;
         # a local float keeps the product in fp32
@@ -761,7 +761,8 @@ class AttentionProgram:
             is_query_key = key_rel_pos >= 0 and key_rel_pos < self.qq_bias_stride_0
             qq_bias = tl.load(
                 self.qq_bias_row_ptrs + key_rel_pos[None, :],
-                mask=is_query_key[None, :],  # avoid OOB for context keys
+                # avoid OOB for context keys and for padded query rows
+                mask=self.query_mask_0[:, None] & is_query_key[None, :],
                 other=0.0,
             )
             # prescale w. RCP_LN2 for later exp2
@@ -1074,13 +1075,22 @@ def kernel_unified_attention(
         if q_block_local_idx * BLOCK_Q >= cur_batch_query_len:
             return
 
+    segm_tile_start = 0
     tiles_per_segment = 0
     if NUM_SEGMENTS_PER_SEQ > 1:
         # sequence len for this particular sequence
         seq_len = tl.load(seq_lens_ptr + seq_idx)
-        tiles_per_segment = cdiv_fn(seq_len, NUM_SEGMENTS_PER_SEQ * TILE_SIZE)
+        if SLIDING_WINDOW > 0:
+            tile_lo, window_tiles = split_window_tiles(
+                seq_len, cur_batch_query_len, TILE_SIZE, SLIDING_WINDOW
+            )
+            tiles_per_segment = cdiv_fn(window_tiles, NUM_SEGMENTS_PER_SEQ)
+            segm_tile_start = tile_lo + segm_idx * tiles_per_segment
+        else:
+            tiles_per_segment = cdiv_fn(seq_len, NUM_SEGMENTS_PER_SEQ * TILE_SIZE)
+            segm_tile_start = segm_idx * tiles_per_segment
         # This segment owns no tiles
-        if segm_idx * tiles_per_segment * TILE_SIZE >= seq_len:
+        if segm_tile_start * TILE_SIZE >= seq_len:
             return
 
     offs_m = tl.arange(0, BLOCK_M)
@@ -1109,7 +1119,10 @@ def kernel_unified_attention(
         v_dim_mask = offs_vd < V_HEAD_SIZE
     else:
         v_dim_mask = tl.full((1,), 1, dtype=tl.int1)
-    query_mask_0 = query_pos < cur_batch_query_len
+    # Rows past BLOCK_Q tokens belong to the next q block, which stores them.
+    query_mask_0 = (query_pos < cur_batch_query_len) & (
+        offs_m // num_queries_per_kv < BLOCK_Q
+    )
     query_mask_1 = query_offset_1 < num_query_heads
 
     # the 3d launch keeps Q cached for the other segments of the query block
@@ -1148,7 +1161,7 @@ def kernel_unified_attention(
         seq_len,
         q_block_local_idx,
         cur_batch_query_len,
-        segm_idx,
+        segm_tile_start,
         tiles_per_segment,
         scale,
         softcap,
