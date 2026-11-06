@@ -242,3 +242,41 @@ def test_legacy_mm_meta_is_restored_after_dry_run(raise_in_body):
             raise RuntimeError("end replay")
     with FakeTensorMode(), pytest.raises(TypeError, match="meta_mm"):
         mm()
+
+
+@pytest.mark.parametrize("with_out", [False, True])
+def test_mm_dtype_backport_runs_against_a_simulated_legacy_meta(monkeypatch, with_out):
+    # On a torch whose meta_mm takes out_dtype (CI's), the backport would never
+    # run. Simulate torch 2.9.1's two-argument meta_mm and its failure, so the
+    # backport is exercised, and restored, on every torch.
+    import torch._meta_registrations as meta_registrations
+    from torch._subclasses import fake_impls
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    def meta_mm(a, b):
+        raise TypeError("meta_mm() takes 2 positional arguments but 3 were given")
+
+    def legacy(fake_mode, func, *args, **kwargs):
+        return meta_mm(*args, **kwargs)
+
+    monkeypatch.setattr(meta_registrations, "meta_mm", meta_mm)
+    for overload in (torch.ops.aten.mm.dtype, torch.ops.aten.mm.dtype_out):
+        monkeypatch.setitem(fake_impls.op_implementations_dict, overload, legacy)
+    FakeTensorMode.cache_clear()
+
+    def mm():
+        a = torch.empty((1, 16), device="cuda", dtype=torch.bfloat16)
+        w = torch.empty((8, 16), device="cuda", dtype=torch.bfloat16)
+        out = torch.empty((1, 8), device="cuda", dtype=torch.float32)
+        kwargs = {"out": out} if with_out else {}
+        return torch.mm(a, w.t(), out_dtype=torch.float32, **kwargs), out
+
+    with FakeTensorMode(), pytest.raises(TypeError, match="meta_mm"):
+        mm()
+    with dry_run("gfx950", 256):
+        result, out = mm()
+        assert (result.shape, result.dtype) == ((1, 8), torch.float32)
+        if with_out:
+            assert result is out
+    with FakeTensorMode(), pytest.raises(TypeError, match="meta_mm"):
+        mm()
