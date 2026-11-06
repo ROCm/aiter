@@ -1072,11 +1072,6 @@ struct LamportArRms
     // was faster (gfx1250, 256 CUs, rows 256+ at hidden 4096-8192).
     int cluster_threads(int64_t rows, int row_packs) const
     {
-        if(const char* e = std::getenv("DBG_LAMPORT_BS")) // TEMP measurement hook
-        {
-            const int bs = std::atoi(e);
-            return bs > 0 && row_packs % bs == 0 && row_packs / bs >= 2 && row_packs / bs <= 16 ? bs : 0;
-        }
         if(rows >= num_cus || row_packs <= kLamportMinClusterRowPacks)
             return 0;
         for(int bs = kLamportClusterMaxThreads; bs >= kLamportWave; bs /= 2)
