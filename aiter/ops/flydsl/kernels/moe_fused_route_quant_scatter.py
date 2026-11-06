@@ -161,7 +161,9 @@ def _emit_tp_route(
     """Emit the TP route of ``moe_route_psum_fused`` inside one quant block.
 
     Every thread of the 256-thread block must reach this: it holds four
-    barriers. Each thread loads ``slots`` of the ``numel`` expert ids; the block
+    barriers. Each thread loads up to ``slots`` of the ``numel`` expert ids
+    (slots past ``numel`` are skipped at run time, the bound being uniform over
+    the block); the block
     counts every route into ``cnt`` and those before route ``first`` into
     ``pre``, keeps the ids of its own routes ``first .. first + n_own`` in
     ``own``, and leaves the tile-aligned exclusive prefix of the counts in
@@ -189,18 +191,39 @@ def _emit_tp_route(
     end = first + fx.Uint32(n_own)
     experts_i = fx.Int32(experts)
 
+    # Slot j > 0 only holds ids when numel > j * 256. That bound is the same
+    # in every thread of the block, so a smaller call branches past the slot's
+    # load and count: one build serves every numel up to slots * 256.
+    def _slot_id(j, i, in_range):
+        if j == 0:
+            return fx.Int32(ids_t[in_range.select(i, last)])
+        used = numel_u > fx.Uint32(j * BLOCK_THREADS)
+
+        @flyc.jit
+        def _load():
+            e = fx.Int32(-1)
+            if used:
+                e = fx.Int32(ids_t[in_range.select(i, last)])
+            return e
+
+        return used, _load()
+
     loaded = []
     for j in range_constexpr(slots):
         i = tid + fx.Uint32(j * BLOCK_THREADS)
         in_range = i < numel_u
-        loaded.append((i, in_range, fx.Int32(ids_t[in_range.select(i, last)])))
+        if j == 0:
+            loaded.append((None, i, in_range, _slot_id(j, i, in_range)))
+        else:
+            used, e = _slot_id(j, i, in_range)
+            loaded.append((used, i, in_range, e))
     prefetched = prefetch() if prefetch is not None else None
     cnt[tid] = c0
     pre[tid] = c0
     gpu.barrier()
 
     # Plain helper, so each runtime guard goes through a local @flyc.jit.
-    def _count_route(live, earlier, mine, e, slot):
+    def _count_route(used, live, earlier, mine, e, slot):
         @flyc.jit
         def _count():
             if live:
@@ -210,12 +233,26 @@ def _emit_tp_route(
             if mine:
                 own[slot] = e
 
-        _count()
+        @flyc.jit
+        def _count_if_used():
+            if used:
+                if live:
+                    fx.atomic_add(cnt + e, c1, syncscope="workgroup")
+                if earlier:
+                    fx.atomic_add(pre + e, c1, syncscope="workgroup")
+                if mine:
+                    own[slot] = e
 
-    for i, in_range, e in loaded:
+        if used is None:
+            _count()
+        else:
+            _count_if_used()
+
+    for used, i, in_range, e in loaded:
         # Padded and dropped routes carry -1: they claim no row.
         live = in_range & (e >= c0) & (e < experts_i)
         _count_route(
+            used,
             live,
             live & (i < first),
             in_range & (i >= first) & (i < end),
