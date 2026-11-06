@@ -393,9 +393,10 @@ def _rescale(o0, o1, row_sum, old_max, new_max, ballot):
 BM, BN, D, THREADS = 128, 64, 256, 512
 
 
-def _mma():
+def _mma(depth=16):
+    """Eight waves along the query rows, each 16x16xdepth BF16 MFMAs (depth 32: gfx950)."""
     return fx.make_tiled_mma(
-        fx.make_mma_atom(rocdl.MFMA(16, 16, 16, fx.BFloat16)),
+        fx.make_mma_atom(rocdl.MFMA(16, 16, depth, fx.BFloat16)),
         fx.make_layout((1, 8, 1), (1, 1, 0)),
     )
 
@@ -409,22 +410,22 @@ def _read_q_words(resource, offset, lane):
     return fx.Vector.from_elements([p[i] for p in parts for i in range(4)], fx.Int32)
 
 
-def _read_q_g2r(resource, offset, lane):
+def _read_q_g2r(resource, offset, lane, depth=16):
     words = _read_q_words(resource, offset, lane)
-    frag = _mma().make_fragment_B(
+    frag = _mma(depth).make_fragment_B(
         fx.make_rmem_tensor(fx.make_layout((BM, D), (1, BM)), fx.BFloat16)
     )
     frag.store(words.bitcast(fx.BFloat16))
     return frag
 
 
-def _qk(q, k):
-    mma = _mma()
+def _qk(q, k, depth=16, order="kmn"):
+    mma = _mma(depth)
     acc = mma.make_fragment_C(
         fx.make_rmem_tensor(fx.make_layout((32, BM), (1, 32)), fx.Float32)
     )
     acc.fill(0.0)
-    fx.gemm(mma, acc, k, q, acc, traversal_order="kmn")
+    fx.gemm(mma, acc, k, q, acc, traversal_order=order)
     return acc.load()
 
 
@@ -800,35 +801,18 @@ def _pack_bf16_950(values):
     )
 
 
-QK950 = tuple(
-    (step, m) for step in range(8) for m in range(2)
-)  # K32 QK MFMAs in issue order
-
-
-def _qk950_words(step, m):
-    """(K words, Q words) of QK MFMA (step, m): K read m * 8 + step, Q part step."""
-    return [(m * 8 + step) * 4 + i for i in range(4)], [step * 4 + i for i in range(4)]
-
-
 def _k_operands950(words):
-    # As _k_operands: MFMA-only uses leave the loads AV-class.
+    # As _k_operands, with the K32 operands: read m * 8 + s holds K step s of M tile m.
     _keep_vgpr(words)
     rocdl.sched_barrier(0)
-    return fx.Vector(words)
+    frag = fx.make_rmem_tensor(fx.make_layout((8, 8, 2), (1, 8, 64)), fx.BFloat16)
+    frag.store(words.bitcast(fx.BFloat16))
+    return fx.make_view(fx.get_iter(frag), fx.make_layout((8, 2, 8), (1, 64, 8)))
 
 
 def _qk950(q, k):
-    """S^T of 32 keys x 16 rows a wave, in _qk's order (value i + 4m of M tile m), from Q and K words."""
-    q, k = fx.Vector(q), fx.Vector(k)
-    acc = [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(2)]
-    for step, m in QK950:
-        k_words, q_words = _qk950_words(step, m)
-        acc[m] = _mfma32(
-            fx.Vector.from_elements([k[i] for i in k_words], fx.Int32),
-            fx.Vector.from_elements([q[i] for i in q_words], fx.Int32),
-            acc[m],
-        )
-    return _join(acc[0], acc[1])
+    """_qk with K32 MFMAs, issued a K step at a time (both M tiles of a step together)."""
+    return _qk(q, k, 32, "mkn")
 
 
 def _pv950_words(step, n):

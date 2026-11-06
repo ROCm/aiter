@@ -54,7 +54,6 @@ from .sparse_prefill_common import (
     _qk,
     _qk950,
     _read_q_g2r,
-    _read_q_words,
     _read_s2r,
     _ReadPlan,
     _rescale,
@@ -460,7 +459,7 @@ def _body(
     qoffset = valid_row.select(fx.Uint32((query * H * D + head * D) * 2), qextent)
     # Q stays in registers for all key tiles.
     if fx.const_expr(GFX950):
-        q = _read_q_words(gq, qoffset, lane)
+        q = _read_q_g2r(gq, qoffset, lane, 32)
     else:
         q = _read_q_g2r(gq, qoffset, lane)
     row_bytes, gap = KV_STRIDE * 2, KV_STRIDE - HK * D
