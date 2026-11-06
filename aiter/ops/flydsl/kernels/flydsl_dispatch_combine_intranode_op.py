@@ -647,8 +647,12 @@ class FlyDSLDispatchGroupMajorOp:
 
 
 class FlyDSLDispatchCombineIntraNodeOp:
-    def __init__(self, config, *, gm_payload_arena=None):
-        """``gm_payload_arena``: GroupMajorPayloadArena for the group-major op's payload."""
+    def __init__(self, config, *, gm_payload_arena=None, combine_input=None):
+        """``gm_payload_arena``: GroupMajorPayloadArena for the group-major op's payload.
+        ``combine_input``: (token int16, weight float32) symmetric combine-input buffers
+        of another op whose calls never overlap this op's, to view instead of allocating.
+        """
+        self._shared_combine_input = combine_input
         self.cfg = config
         self._check_config()
         if config.tuning_table is None:
@@ -789,12 +793,21 @@ class FlyDSLDispatchCombineIntraNodeOp:
         self.shmem_tok_off = mori_shmem_create_tensor((1,), torch.int32)
         self.shmem_recv_tok_num = mori_shmem_create_tensor((npes,), torch.int32)
         self.shmem_tok_id_to_src = mori_shmem_create_tensor((mr,), torch.int32)
-        self.shmem_comb_inp_tok = mori_shmem_create_tensor(
-            (tok_i16_mr_worst,), torch.int16
-        )
-        self.shmem_comb_inp_wts = mori_shmem_create_tensor(
-            (mr_worst * k,), torch.float32
-        )
+        if self._shared_combine_input is None:
+            self.shmem_comb_inp_tok = mori_shmem_create_tensor(
+                (tok_i16_mr_worst,), torch.int16
+            )
+            self.shmem_comb_inp_wts = mori_shmem_create_tensor(
+                (mr_worst * k,), torch.float32
+            )
+        else:
+            tok, wts = self._shared_combine_input
+            if tok.numel() < tok_i16_mr_worst or wts.numel() < mr_worst * k:
+                raise ValueError(
+                    "the shared combine input is smaller than this op needs"
+                )
+            self.shmem_comb_inp_tok = tok[:tok_i16_mr_worst]
+            self.shmem_comb_inp_wts = wts[: mr_worst * k]
         self.shmem_comb_out_tok = mori_shmem_create_tensor((tok_i16_mt,), torch.int16)
         self.shmem_comb_out_wts = mori_shmem_create_tensor((mt * k,), torch.float32)
         self.shmem_xdev_bar_mem = mori_shmem_create_tensor((npes,), torch.int64)

@@ -1482,10 +1482,12 @@ class SmallMRuntime:
     # fmt: off
     def __init__(self, *, rank: int, world_size: int, model_dim: int, inter_dim: int, experts: int, topk: int,
         quant: str, w1: torch.Tensor, w1_scale: torch.Tensor, w2: torch.Tensor, w2_scale: torch.Tensor,
-        max_tok_per_rank: int, swiglu_limit: float = 0.0, payload_arena=None, s1_output_arena=None):
+        max_tok_per_rank: int, swiglu_limit: float = 0.0, payload_arena=None, s1_output_arena=None,
+        combine_input=None):
     # fmt: on
-        """``payload_arena`` / ``s1_output_arena``: shared storage owned by MegaMoEV2
-        (see GroupMajorPayloadArena and stage1_output_buffers); None allocates."""
+        """``payload_arena`` / ``s1_output_arena`` / ``combine_input``: storage shared by
+        the routes of one MegaMoEV2 (see GroupMajorPayloadArena, stage1_output_buffers and
+        FlyDSLDispatchCombineIntraNodeOp); None allocates."""
         if quant != "a8w4":
             raise ValueError("SmallMRuntime currently supports quant='a8w4' only")
         if experts % world_size != 0:
@@ -1537,7 +1539,9 @@ class SmallMRuntime:
             enable_std_moe=False, enable_group_major=True, gm_unit_size=self.GM_UNIT_SIZE,
             gm_scheme="fixedslot", gm_compact=self.GM_COMPACT, max_total_recv_tokens=self.world_size)
         # fmt: on
-        self.comb_op = FlyDSLDispatchCombineIntraNodeOp(self.comb_cfg, gm_payload_arena=payload_arena)
+        self.comb_op = FlyDSLDispatchCombineIntraNodeOp(
+            self.comb_cfg, gm_payload_arena=payload_arena, combine_input=combine_input
+        )
         self._s1_output_arena = s1_output_arena
         torch.cuda.synchronize()
         ms.shmem_barrier_all()
