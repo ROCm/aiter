@@ -110,7 +110,7 @@ SPIN_SLEEP = 1
 # the only thing that needs it -- every other read of the histogram follows a
 # barrier, which has already made it visible.
 CACHE_BYPASS_L1_L2 = 17
-COUNTER_GROUPS = 7
+COUNTER_GROUPS = 8
 COUNTER_SLOTS = COUNTER_GROUPS * COUNTER_STRIDE
 # Counter groups. Each is one slot, except the ordered emit's, which hold one per part.
 # Parts of the row that have finished with its control slots; the last clears them.
@@ -122,6 +122,16 @@ COUNTER_PASS_DONE = 4
 # Per-workgroup selected/tied counts for ordered emit (reserved for both modes).
 COUNTER_ORDERED_ABOVE = 5
 COUNTER_ORDERED_EQUAL = 6
+# Bit p set once some workgroup owns part p. A workgroup claims its own part on
+# arrival; one still waiting on pass 0's merge takes one part nobody has claimed at
+# a time, and waits without a cap only once none is left, so that wait only ever
+# waits on parts some running workgroup owns.
+COUNTER_CLAIM = 7
+# Polls of pass 0's merge before a waiting part takes its first unclaimed one; a
+# part still unclaimed by then is taken to have no owner coming, so later takes
+# follow each other with one poll between. Taking one early is still correct, only
+# slower: the owner arriving late then idles.
+STEAL_GRACE = 32
 
 # Columns of `s_scan`: each wave's total, then its exclusive offset in the block.
 SCAN_TOTAL = 0
@@ -137,6 +147,16 @@ SMEM_META_EXIT = 4
 # than an SSA value because it is written by the region that knows the count and
 # read by the re-read loop, which that value would not dominate.
 SMEM_META_TOTAL = 5
+# The parts this workgroup owns, as a bitmask; 0 when it arrived to find its own
+# part taken.
+SMEM_META_OWNED = 6
+# tid 0's read of a merge wait's progress, so the whole workgroup leaves together.
+SMEM_META_POLL = 7
+# The parts a pass-0 wait just took over; free until the exit reuses the slot.
+SMEM_META_STOLEN = SMEM_META_EXIT
+# The parts still unclaimed when a pass-0 wait last tried to take one. Multi-part
+# rows only, so it shares slot 8 with the short tier.
+SMEM_META_FREE = 8
 
 # Compact candidate buffer, one region per row in `scratch`. Entry i is the pair
 # (column, twiddled key), so the later passes read a candidate without touching
@@ -472,7 +492,7 @@ def create_topk_per_row_decode_adaptive_kernel(
     # The short tier reads the row on every pass and never orders, so it can stop
     # after any pass whose boundary bucket falls whole.
     short_early_stop = bool(early_stop) and short_tier
-    meta_slots = SMEM_META_SLOTS if short_early_stop else 8
+    meta_slots = SMEM_META_SLOTS if short_early_stop else SMEM_META_FREE + 1
     # Rows below `compact_min` read the row rather than the candidate buffer:
     # ordered short rows at one part, and any row the bound overstates.
     short_rows_read_row = compact and tier_mode == "auto"
@@ -523,6 +543,9 @@ def create_topk_per_row_decode_adaptive_kernel(
 
     compact_cap = COMPACT_CAP_MULT * top_k if compact else 0
     scratch_row_slots = 2 * compact_cap
+    # `s_run` per part: a workgroup that takes over parts keeps each one's counts.
+    run_slots = 8 if compact else 6
+    run_parts = 1 if (single_workgroup or tier_mode == "short") else PARTS_CAP
 
     kernel_name = (
         f"topk_per_row_decode_adaptive_k{top_k}"
@@ -542,7 +565,7 @@ def create_topk_per_row_decode_adaptive_kernel(
         s_scan: fx.Array[fx.Int32, red_slots * 2, 16]
         s_meta: fx.Array[fx.Int32, meta_slots, 16]
         # 0..5 ordered emit carry / run bases; 6..7 compact append carry / overflow
-        s_run: fx.Array[fx.Int32, 8 if compact else 6, 16]
+        s_run: fx.Array[fx.Int32, run_parts * run_slots, 16]
         s_own_hist: fx.Array[fx.Int32, num_buckets if ordered else 1, 16]
 
     @flyc.kernel(name=kernel_name, known_block_size=[block_threads, 1, 1])
@@ -590,7 +613,7 @@ def create_topk_per_row_decode_adaptive_kernel(
         s_hist = lds.s_hist.view(fx.make_layout(num_buckets, 1))
         s_scan = lds.s_scan.view(fx.make_layout((red_slots, 2), (1, red_slots)))
         s_meta = lds.s_meta.view(fx.make_layout(meta_slots, 1))
-        s_run = lds.s_run.view(fx.make_layout(8 if compact else 6, 1))
+        s_runs = lds.s_run.view(fx.make_layout((run_parts, run_slots), (run_slots, 1)))
         s_own_hist = lds.s_own_hist.view(
             fx.make_layout(num_buckets if ordered else 1, 1)
         )
@@ -709,45 +732,147 @@ def create_topk_per_row_decode_adaptive_kernel(
                 volatile=True,
             )
 
-        def spin_until_ge(ptr, target):
+        def spin_until_ge(ptr, target, max_polls=None):
+            """Wait for `ptr` to reach `target`; given `max_polls`, give up after that
+            many and return whether it got there."""
             cur = c_zero
-            while cur < target:
-                rocdl.s_sleep(SPIN_SLEEP)
-                cur = ws_poll(ptr, fx.AtomicOrdering.Monotonic)
+            if const_expr(max_polls is None):
+                while cur < target:
+                    rocdl.s_sleep(SPIN_SLEEP)
+                    cur = ws_poll(ptr, fx.AtomicOrdering.Monotonic)
+            else:
+                polls = c_zero
+                while (cur < target) & (polls < fx.Int32(max_polls)):
+                    rocdl.s_sleep(SPIN_SLEEP)
+                    cur = ws_poll(ptr, fx.AtomicOrdering.Monotonic)
+                    polls = polls + c_one
             # The loop's monotonic observation only decides when to stop. This
             # acquire re-reads the same monotonically increasing token and pairs
             # with the last workgroup's release publish before any histogram
             # data is consumed.
             ws_poll(ptr, fx.AtomicOrdering.Acquire)
+            return cur >= target
 
-        def row_barrier(token):
+        # A subscript store inside a dynamic region goes through a helper, so the
+        # view is not taken for a result of that region.
+        def put(view, slot, value):
+            view[slot] = value
+
+        def put2(view, i, j, value):
+            view[i, j] = value
+
+        def bit_count(mask):
+            return fx.Int32(fx.math.ctpop(mask))
+
+        def owns(mask, p):
+            return (mask.shrui(p) & c_one) == c_one
+
+        def owned_mask():
+            return s_meta[SMEM_META_OWNED]
+
+        # Every part of the row; a shift by 32 would be poison, so it builds 2**P - 1
+        # from 2**(P-1).
+        full_mask = (((c_one << (active_parts - c_one)) - c_one) << c_one) | c_one
+
+        def arrive(weight, token_value):
+            """tid 0 only: count `weight` parts in; the last publishes the token."""
+            prev = fx.atomic_add(
+                counter_ptr(COUNTER_ARRIVALS),
+                weight,
+                syncscope=_AGENT,
+                ordering=fx.AtomicOrdering.AcqRel,
+            )
+            last = (prev + weight) == token_value * active_parts
+            if last:
+                fx.atomic_xchg(
+                    counter_ptr(COUNTER_PASS_DONE),
+                    token_value,
+                    syncscope=_AGENT,
+                    ordering=fx.AtomicOrdering.Release,
+                )
+            return last
+
+        def take_unclaimed(after):
+            """Own the lowest part no workgroup has claimed and run its pass 0.
+
+            Only pass 0's merge waits on a part that may not be running: a part is
+            claimed by the workgroup running it, and that merge completes only once
+            every part is claimed. One part per take spreads the parts left over
+            across every waiting workgroup instead of handing them all to the first.
+            Leaves SMEM_META_FREE at the parts unclaimed before the take; a lost race
+            takes nothing with some still free. `after(n)` runs on the part's
+            flushed histogram.
+            """
+            if tid == c_zero:
+                free = full_mask & ~ws_poll(
+                    counter_ptr(COUNTER_CLAIM), fx.AtomicOrdering.Monotonic
+                )
+                bit = free & (c_zero - free)
+                taken = c_zero
+                if bit != c_zero:
+                    prev = fx.atomic_or(
+                        counter_ptr(COUNTER_CLAIM), bit, syncscope=_AGENT
+                    )
+                    taken = ((prev & bit) == c_zero).select(bit, c_zero)
+                put(s_meta, SMEM_META_STOLEN, taken)
+                put(s_meta, SMEM_META_FREE, free)
+                put(s_meta, SMEM_META_OWNED, s_meta[SMEM_META_OWNED] | taken)
+            gpu.barrier()
+            taken = s_meta[SMEM_META_STOLEN]
+            if taken != c_zero:
+                clear_local_histogram(s_hist)
+                for p in range(c_zero, active_parts, c_one):
+                    if owns(taken, p):
+                        pass_scan(p, 0, c_zero)
+                flush_local_histogram(0)
+                after(c_one)
+            gpu.barrier()
+
+        def row_barrier(token, take=False):
             # Waves 1-15 do not drain their flush atomics before gpu.barrier(); peers
             # still see them because the barrier's workgroup release and tid 0's
             # agent-scope arrival are cumulative under the LLVM AMDGPU memory model.
             # The token doubles as the arrival count, so it may be a value the
             # row settles at runtime: skip a barrier and every later token has to
             # come down by one, or the last arrival never lands and the row hangs.
+            # Arrivals count parts, so a workgroup arrives once for each it owns.
             token_value = fx.Int32(token) if isinstance(token, int) else token
-            target_arrivals = token_value * active_parts
+            weight = bit_count(owned_mask())
             gpu.barrier()
             if tid == c_zero:
-                prev = fx.atomic_add(
-                    counter_ptr(COUNTER_ARRIVALS),
-                    c_one,
-                    syncscope=_AGENT,
-                    ordering=fx.AtomicOrdering.AcqRel,
-                )
-                last = (prev + c_one) == target_arrivals
-                if last:
-                    fx.atomic_xchg(
-                        counter_ptr(COUNTER_PASS_DONE),
-                        token_value,
-                        syncscope=_AGENT,
-                        ordering=fx.AtomicOrdering.Release,
-                    )
+                last = arrive(weight, token_value)
+                if const_expr(not take):
+                    if ~last:
+                        spin_until_ge(counter_ptr(COUNTER_PASS_DONE), token_value)
                 else:
-                    spin_until_ge(counter_ptr(COUNTER_PASS_DONE), token_value)
+                    done = last
+                    if ~last:
+                        done = spin_until_ge(
+                            counter_ptr(COUNTER_PASS_DONE), token_value, STEAL_GRACE
+                        )
+                    put(s_meta, SMEM_META_POLL, done.select(c_one, c_zero))
             gpu.barrier()
+            if const_expr(take):
+
+                def arrive_taken(n):
+                    if tid == c_zero:
+                        arrive(n, token_value)
+                    gpu.barrier()
+
+                # POLL: 0 still waiting, 1 merged. Once no part is left to take,
+                # every part has a running owner and the wait drops its cap.
+                while s_meta[SMEM_META_POLL] == c_zero:
+                    take_unclaimed(arrive_taken)
+                    if tid == c_zero:
+                        if s_meta[SMEM_META_FREE] == c_zero:
+                            spin_until_ge(counter_ptr(COUNTER_PASS_DONE), token_value)
+                            put(s_meta, SMEM_META_POLL, c_one)
+                        elif s_meta[SMEM_META_STOLEN] != c_zero:
+                            done = spin_until_ge(
+                                counter_ptr(COUNTER_PASS_DONE), token_value, 1
+                            )
+                            put(s_meta, SMEM_META_POLL, done.select(c_one, c_zero))
+                    gpu.barrier()
 
         def radix_twiddle_key(val):
             # Map larger fp32 values to smaller unsigned keys so ascending bucket
@@ -855,21 +980,31 @@ def create_topk_per_row_decode_adaptive_kernel(
             emit_find(meta, bin1, incl0, incl1, c1)
             gpu.barrier()
 
-        def certified_merge(pass_id: int, target_k, expected_total):
+        def certified_merge(pass_id: int, target_k, expected_total, take=False):
             """Merge without a row barrier, using the histogram's own total as proof.
 
             Re-reads the bins and re-runs the bucket scan until the scan's total
             equals the row's live cardinality.
 
             Waits without a cap, as `row_barrier` does: the total gets there once
-            every part of the row has flushed, which needs every part resident. A
-            cap would settle the digit from a partial histogram on a long stall.
+            every part of the row has flushed. A cap would settle the digit from a
+            partial histogram on a long stall. `take` lets pass 0's wait own the
+            parts nobody claimed, so the total never waits on a part not running.
             """
             load_global_histogram(s_hist, pass_id, coherent=True)
             choose_bucket_prefix(s_hist, s_meta, target_k)
             total = s_meta[SMEM_META_TOTAL]
+            polls = c_zero
             while total != expected_total:
                 rocdl.s_sleep(SPIN_SLEEP)
+                if const_expr(take):
+                    polls = polls + c_one
+                    if polls == fx.Int32(STEAL_GRACE):
+                        take_unclaimed(lambda n: None)
+                        # The next take follows on the next poll; none left, never.
+                        polls = (s_meta[SMEM_META_FREE] == c_zero).select(
+                            fx.Int32(STEAL_GRACE), fx.Int32(STEAL_GRACE - 1)
+                        )
                 load_global_histogram(s_hist, pass_id, coherent=True)
                 choose_bucket_prefix(s_hist, s_meta, target_k)
                 total = s_meta[SMEM_META_TOTAL]
@@ -982,7 +1117,7 @@ def create_topk_per_row_decode_adaptive_kernel(
                     # whole blocks, so the last tile of a part reaches past its run
                     # into the next part's columns, which would append and histogram
                     # them twice.
-                    in_run = col_i32 < run_col_hi
+                    in_run = col_i32 < geo.run_col_hi
                     val = vec[j]
                     key = radix_twiddle_key(val)
                     prefix = prefix_for_key(key, previous_start_bit)
@@ -999,7 +1134,7 @@ def create_topk_per_row_decode_adaptive_kernel(
                     keeps.append((col_i32, key, keep))
                     n_keep = n_keep + keep
 
-            carried = s_run[SMEM_RUN_COMPACT_COUNT]
+            carried = geo.run[SMEM_RUN_COMPACT_COUNT]
 
             def publish_next_carry(run, tile_total):
                 total = carried + tile_total
@@ -1008,16 +1143,16 @@ def create_topk_per_row_decode_adaptive_kernel(
                     run[SMEM_RUN_COMPACT_SPILLED] = c_one
 
             my_excl = block_exclusive_scan_i32(
-                s_scan, n_keep, wave0_last=(publish_next_carry, s_run)
+                s_scan, n_keep, wave0_last=(publish_next_carry, geo.run)
             )
 
             def store_candidate(cands, entry, col_i32, key):
                 cands[entry, COMPACT_COL] = col_i32
                 cands[entry, COMPACT_KEY] = key
 
-            slot = part_slice_base + carried + my_excl
+            slot = geo.part_slice_base + carried + my_excl
             for col_i32, key, keep in keeps:
-                if (keep == c_one) & (slot < part_slice_end):
+                if (keep == c_one) & (slot < geo.part_slice_end):
                     store_candidate(candidates, slot, col_i32, key)
                 slot = slot + keep
 
@@ -1128,6 +1263,14 @@ def create_topk_per_row_decode_adaptive_kernel(
             assert short_rows_read_row or not (
                 compact and key_mask is not None
             ), "early stop reads the row"
+            ordered_emit_bases(barrier_token)
+            for_each_owned(lambda p: ordered_emit_place(p, need, kth_bits, key_mask))
+
+        def ordered_emit_place(p, need, kth_bits, key_mask):
+            """Part `p`'s placement, from the bases `ordered_emit_bases` left it."""
+            point_at(p)
+            if tid == c_zero:
+                reset_tile_counts(geo.run)
             c_block_log2 = fx.Int32(int.bit_length(block_threads) - 1)
             # Trip count is uniform across workgroups; tail runs predicate columns away.
             row_steps_all = fx.Index(
@@ -1138,12 +1281,10 @@ def create_topk_per_row_decode_adaptive_kernel(
                 # A part that overflowed its slice has no usable buffer, so it falls
                 # back to its row and the buffer loop is skipped; a part that fits
                 # skips the row.
-                spilled = s_run[SMEM_RUN_COMPACT_SPILLED] == c_one
+                spilled = geo.run[SMEM_RUN_COMPACT_SPILLED] == c_one
                 steps_idx = spilled.select(fx.Int32(row_steps_all), c_zero)
                 steps_idx = fx.Index(steps_idx)
-            col_hi = run_col_hi
-            run_selected = s_run[SMEM_RUN_SELECTED]
-            run_tied = s_run[SMEM_RUN_TIED]
+            col_hi = geo.run_col_hi
 
             stages = ORDERED_STAGES
             c_stage_idx = fx.Index(stages)
@@ -1151,16 +1292,17 @@ def create_topk_per_row_decode_adaptive_kernel(
 
             def stage_col_base(step_i32, stage: int):
                 return (
-                    run_first_vblk + (step_i32 + fx.Int32(stage)) * c_block_i32 + tid
+                    geo.run_first_vblk
+                    + (step_i32 + fx.Int32(stage)) * c_block_i32
+                    + tid
                 ) * c_vec
 
             def stage_loads(step_i32):
                 bases = [stage_col_base(step_i32, s) for s in range_constexpr(stages)]
                 return bases, [load_row_vec(b) for b in bases]
 
-            base_selected, base_tied = ordered_emit_bases(
-                s_run, run_selected, run_tied, barrier_token
-            )
+            base_selected = geo.run[SMEM_RUN_PART_SELECTED]
+            base_tied = geo.run[SMEM_RUN_PART_TIED]
 
             # Phase 2: place.
             def place_tile(col_base, vec):
@@ -1168,7 +1310,7 @@ def create_topk_per_row_decode_adaptive_kernel(
                     col_base, vec, col_hi, kth_bits, key_mask
                 )
                 ordered_place(
-                    s_run, cols, n_selected, n_tied, base_selected, base_tied, need
+                    geo.run, cols, n_selected, n_tied, base_selected, base_tied, need
                 )
 
             if const_expr(not compact):
@@ -1195,49 +1337,67 @@ def create_topk_per_row_decode_adaptive_kernel(
                     place_tile(col_base, load_row_vec(col_base))
                     place_results = yield [place_state[0]]
 
-                count = s_run[SMEM_RUN_COMPACT_COUNT]
-                count_hi = part_slice_base + count
+                count = geo.run[SMEM_RUN_COMPACT_COUNT]
+                count_hi = geo.part_slice_base + count
                 c_tile = c_block_i32 * c_vec
                 buf_steps = spilled.select(c_zero, (count + c_tile - c_one) // c_tile)
                 for step_b, buf_state in range(
                     fx.Index(0), fx.Index(buf_steps), fx.Index(1), init=[c_zero]
                 ):
                     entry_base = (
-                        part_slice_base + (fx.Int32(step_b) * c_block_i32 + tid) * c_vec
+                        geo.part_slice_base
+                        + (fx.Int32(step_b) * c_block_i32 + tid) * c_vec
                     )
                     cols, n_selected, n_tied = compact_ordered_classify(
                         entry_base, count_hi, kth_bits
                     )
                     ordered_place(
-                        s_run, cols, n_selected, n_tied, base_selected, base_tied, need
+                        geo.run,
+                        cols,
+                        n_selected,
+                        n_tied,
+                        base_selected,
+                        base_tied,
+                        need,
                     )
                     yield [buf_state[0]]
 
         # A subscript store rebinds its view, so one nested in `if exchange` would
         # make `run` a result of that scf.if; storing through a helper keeps it out.
-        def publish_part_counts(ctrs, selected, tied):
-            ctrs[COUNTER_ORDERED_ABOVE, part] = selected
-            ctrs[COUNTER_ORDERED_EQUAL, part] = tied
+        def publish_part_counts(ctrs, runs, p):
+            ctrs[COUNTER_ORDERED_ABOVE, p] = runs[p, SMEM_RUN_SELECTED]
+            ctrs[COUNTER_ORDERED_EQUAL, p] = runs[p, SMEM_RUN_TIED]
 
-        def store_part_bases(run, selected_base, tied_base):
-            run[SMEM_RUN_PART_SELECTED] = selected_base
-            run[SMEM_RUN_PART_TIED] = tied_base
+        def publish_owned_counts(owned):
+            """tid 0 only: put every owned part's run counts where its peers read them."""
+            if owned == (c_one << part):
+                publish_part_counts(counters_buf, s_runs, part)
+            else:
+                for p in range(c_zero, active_parts, c_one):
+                    if owns(owned, p):
+                        publish_part_counts(counters_buf, s_runs, p)
 
-        def ordered_emit_bases(run, run_selected, run_tied, barrier_token):
-            """Exclusive scan of selected/tied counts over the parts before this one."""
+        def store_part_bases(runs, p, selected_base, tied_base):
+            runs[p, SMEM_RUN_PART_SELECTED] = selected_base
+            runs[p, SMEM_RUN_PART_TIED] = tied_base
+
+        def reset_tile_counts(run):
+            run[SMEM_RUN_TILE_SELECTED] = c_zero
+            run[SMEM_RUN_TILE_TIED] = c_zero
+
+        def ordered_emit_bases(barrier_token):
+            """Each owned part's exclusive scan of selected/tied over the parts before it."""
             # Single-workgroup rows skip the cross-part exchange; bases stay zero.
-            if tid == c_zero:
-                run[SMEM_RUN_TILE_SELECTED] = c_zero
-                run[SMEM_RUN_TILE_TIED] = c_zero
+            if tid == c_zero:  # noqa: SIM102 - device values, `and` cannot join them
                 if single_part_active:
-                    run[SMEM_RUN_PART_SELECTED] = c_zero
-                    run[SMEM_RUN_PART_TIED] = c_zero
+                    store_part_bases(s_runs, c_zero, c_zero, c_zero)
 
             exchange = ~single_part_active
 
             if exchange:
+                owned = owned_mask()
                 if tid == c_zero:
-                    publish_part_counts(counters_buf, run_selected, run_tied)
+                    publish_owned_counts(owned)
                 row_barrier(barrier_token)
                 if wave == c_zero:
                     in_runs = lane < active_parts
@@ -1250,15 +1410,14 @@ def create_topk_per_row_decode_adaptive_kernel(
                     )
                     selected_incl = wave_inclusive_scan_i32(peer_selected)
                     tied_incl = wave_inclusive_scan_i32(peer_tied)
-                    if lane == part:
+                    if in_runs & owns(owned, lane_safe):
                         store_part_bases(
-                            run, selected_incl - peer_selected, tied_incl - peer_tied
+                            s_runs,
+                            lane_safe,
+                            selected_incl - peer_selected,
+                            tied_incl - peer_tied,
                         )
             gpu.barrier()
-            return (
-                run[SMEM_RUN_PART_SELECTED],
-                run[SMEM_RUN_PART_TIED],
-            )
 
         def ordered_place(
             run, cols, n_selected, n_tied, base_selected, base_tied, need
@@ -1345,7 +1504,7 @@ def create_topk_per_row_decode_adaptive_kernel(
             spans = []
             for s in range_constexpr(stages):
                 vblk_i32 = fx.Int32(tile_vblk) + tid + fx.Int32(s * BLOCK_THREADS)
-                in_row = vblk_i32 < run_end_vblk
+                in_row = vblk_i32 < geo.run_end_vblk
                 spans.append(
                     (
                         in_row.select(vblk_i32 * c_vec, c_zero),
@@ -1354,17 +1513,18 @@ def create_topk_per_row_decode_adaptive_kernel(
                 )
             return spans
 
-        def unordered_emit(need, kth_bits):
+        def unordered_emit(p, need, kth_bits):
             """Row walk for the unordered emit, over a uniform number of tiles.
 
             The block scan inside is a barrier every thread must reach, so every
             thread runs the same tile count and `col_hi` predicates the tail away,
             as in `ordered_emit`.
             """
+            point_at(p)
             stages = ORDERED_STAGES
             for tile_vblk, place_state in range(
-                run_first_idx,
-                run_end_idx,
+                geo.run_first_idx,
+                geo.run_end_idx,
                 fx.Index(BLOCK_THREADS * stages),
                 init=[c_zero],
             ):
@@ -1382,34 +1542,47 @@ def create_topk_per_row_decode_adaptive_kernel(
                     cols = cols + stage_cols
                     n_selected = n_selected + stage_selected
                     n_tied = n_tied + stage_tied
-                unordered_place(s_run, cols, n_selected, n_tied, need)
+                unordered_place(geo.run, cols, n_selected, n_tied, need)
                 yield [place_state[0]]
 
-        global_vec_tid = part * c_block_i32 + tid
-        global_vec_tid_idx = fx.Index(global_vec_tid)
         vec_blocks_i32 = (row_len + c_vec - c_one).shrui(fx.Int32(LOAD_VEC_LOG2))
         vec_blocks_idx = fx.Index(vec_blocks_i32)
-
-        # One contiguous vec-block range per workgroup, walked by the emits and the
-        # ordered or multi-part row scans.
         vblks_per_run = div_parts(vec_blocks_i32 + active_parts - c_one)
-        run_first_vblk = part * vblks_per_run
-        run_last_vblk = run_first_vblk + vblks_per_run
-        run_end_vblk = (run_last_vblk < vec_blocks_i32).select(
-            run_last_vblk, vec_blocks_i32
-        )
-        run_end_col = run_end_vblk * c_vec
-        run_col_hi = (run_end_col < row_len).select(run_end_col, row_len)
-        run_first_idx = fx.Index(run_first_vblk)
-        run_end_idx = fx.Index(run_end_vblk)
-
         # Compact: each part appends only into its own equal slice of the candidate
         # buffer. Parts own ascending column runs, so slice order is column order and
         # the emit needs no cross-part compaction step -- each part reads back exactly
         # the slice it wrote.
         part_slice_cap = div_parts(fx.Int32(compact_cap)) if compact else c_zero
-        part_slice_base = part * part_slice_cap if compact else c_zero
-        part_slice_end = part_slice_base + part_slice_cap if compact else c_zero
+
+        class PartGeometry:
+            """Where one part's work lies. A workgroup that owns more than one part
+            points this at each in turn; every reader takes it at the time it runs,
+            so re-point it inside the region that uses it, never across one."""
+
+        geo = PartGeometry()
+
+        def point_at(p):
+            geo.part = p
+            geo.run = fx.slice(s_runs, (p, None))
+            geo.global_vec_tid = p * c_block_i32 + tid
+            geo.global_vec_tid_idx = fx.Index(geo.global_vec_tid)
+            # One contiguous vec-block range per part, walked by the emits and the
+            # ordered or multi-part row scans.
+            geo.run_first_vblk = p * vblks_per_run
+            run_last_vblk = geo.run_first_vblk + vblks_per_run
+            geo.run_end_vblk = (run_last_vblk < vec_blocks_i32).select(
+                run_last_vblk, vec_blocks_i32
+            )
+            run_end_col = geo.run_end_vblk * c_vec
+            geo.run_col_hi = (run_end_col < row_len).select(run_end_col, row_len)
+            geo.run_first_idx = fx.Index(geo.run_first_vblk)
+            geo.run_end_idx = fx.Index(geo.run_end_vblk)
+            geo.part_slice_base = p * part_slice_cap if compact else c_zero
+            geo.part_slice_end = (
+                geo.part_slice_base + part_slice_cap if compact else c_zero
+            )
+
+        point_at(part)
 
         def compact_ordered_classify(entry_base, count_hi, kth_bits):
             """Classify LOAD_VEC consecutive candidates against the settled kth key."""
@@ -1422,7 +1595,7 @@ def create_topk_per_row_decode_adaptive_kernel(
                 in_buf = entry < count_hi
                 # Clamp rather than predicate the load: out-of-slice entries would
                 # otherwise read a neighbouring part's candidates.
-                safe = in_buf.select(entry, part_slice_base)
+                safe = in_buf.select(entry, geo.part_slice_base)
                 col_i32 = candidates[safe, COMPACT_COL]
                 key = candidates[safe, COMPACT_KEY]
                 selected = in_buf.select(
@@ -1460,7 +1633,7 @@ def create_topk_per_row_decode_adaptive_kernel(
                 fx.Index(0), steps_idx, fx.Index(1), init=[c_zero]
             ):
                 col_base = (
-                    run_first_vblk * c_vec
+                    geo.run_first_vblk * c_vec
                     + (fx.Int32(step_b) * c_block_i32 + tid) * c_fill_span
                 )
                 vecs = [
@@ -1492,11 +1665,11 @@ def create_topk_per_row_decode_adaptive_kernel(
             that a part which spilled and a part which did not stay in lockstep at
             the barrier that follows.
             """
-            spilled = s_run[SMEM_RUN_COMPACT_SPILLED] == c_one
-            count = spilled.select(c_zero, s_run[SMEM_RUN_COMPACT_COUNT])
+            spilled = geo.run[SMEM_RUN_COMPACT_SPILLED] == c_one
+            count = spilled.select(c_zero, geo.run[SMEM_RUN_COMPACT_COUNT])
             for entry, rescan_state in range(
-                fx.Index(part_slice_base + tid),
-                fx.Index(part_slice_base + count),
+                fx.Index(geo.part_slice_base + tid),
+                fx.Index(geo.part_slice_base + count),
                 c_block_idx,
                 init=[c_zero],
             ):
@@ -1509,9 +1682,11 @@ def create_topk_per_row_decode_adaptive_kernel(
                     )
                 yield [rescan_state[0]]
 
-            row_stop = spilled.select(fx.Int32(run_end_idx), fx.Int32(run_first_idx))
+            row_stop = spilled.select(
+                fx.Int32(geo.run_end_idx), fx.Int32(geo.run_first_idx)
+            )
             for vblk, fallback_state in range(
-                run_first_idx + tid_idx,
+                geo.run_first_idx + tid_idx,
                 fx.Index(row_stop),
                 scan_run_stride_idx(),
                 init=[c_zero],
@@ -1522,7 +1697,7 @@ def create_topk_per_row_decode_adaptive_kernel(
                 yield [fallback_state[0]]
             gpu.barrier()
 
-        def compact_write_entries(local_k, kth_bits):
+        def compact_write_entries(p, local_k, kth_bits):
             """Unordered last-pass emit over this part's candidate slice.
 
             The buffer holds everything ranking at or above pass 0's digit, which is
@@ -1536,21 +1711,22 @@ def create_topk_per_row_decode_adaptive_kernel(
             row-uniform within a part, which is what keeps the two trip counts
             block-uniform even when one is zero.
             """
-            spilled = s_run[SMEM_RUN_COMPACT_SPILLED] == c_one
-            count = spilled.select(c_zero, s_run[SMEM_RUN_COMPACT_COUNT])
-            count_hi = part_slice_base + count
+            point_at(p)
+            spilled = geo.run[SMEM_RUN_COMPACT_SPILLED] == c_one
+            count = spilled.select(c_zero, geo.run[SMEM_RUN_COMPACT_COUNT])
+            count_hi = geo.part_slice_base + count
             c_tile = c_block_i32 * c_vec
             buf_steps = spilled.select(c_zero, (count + c_tile - c_one) // c_tile)
             for step_b, write_state in range(
                 fx.Index(0), fx.Index(buf_steps), fx.Index(1), init=[c_zero]
             ):
                 entry_base = (
-                    part_slice_base + (fx.Int32(step_b) * c_block_i32 + tid) * c_vec
+                    geo.part_slice_base + (fx.Int32(step_b) * c_block_i32 + tid) * c_vec
                 )
                 cols, n_selected, n_tied = compact_ordered_classify(
                     entry_base, count_hi, kth_bits
                 )
-                unordered_place(s_run, cols, n_selected, n_tied, local_k)
+                unordered_place(geo.run, cols, n_selected, n_tied, local_k)
                 yield [write_state[0]]
 
             c_block_log2 = fx.Int32(int.bit_length(block_threads) - 1)
@@ -1561,12 +1737,12 @@ def create_topk_per_row_decode_adaptive_kernel(
                 fx.Index(0), fx.Index(row_steps), fx.Index(1), init=[c_zero]
             ):
                 col_base = (
-                    run_first_vblk + fx.Int32(step_b) * c_block_i32 + tid
+                    geo.run_first_vblk + fx.Int32(step_b) * c_block_i32 + tid
                 ) * c_vec
                 cols, n_selected, n_tied = ordered_classify(
-                    col_base, load_row_vec(col_base), run_col_hi, kth_bits
+                    col_base, load_row_vec(col_base), geo.run_col_hi, kth_bits
                 )
-                unordered_place(s_run, cols, n_selected, n_tied, local_k)
+                unordered_place(geo.run, cols, n_selected, n_tied, local_k)
                 yield [fallback_state[0]]
 
         def early_classify(col_base, vec, col_hi, previous_start_bit: int, kth_bits):
@@ -1592,15 +1768,16 @@ def create_topk_per_row_decode_adaptive_kernel(
                 n_selected = n_selected + selected
             return cols, n_selected
 
-        def early_write_all(previous_start_bit: int, kth_bits, need):
+        def early_write_all(p, previous_start_bit: int, kth_bits, need):
             # Same tiled walk and block scan as `unordered_emit`, which is what
             # keeps the scan's barrier at a uniform trip count and costs one atomic
             # per tile rather than one per winner -- the winners are exactly top_k,
             # so a per-winner atomic would scale with k.
+            point_at(p)
             stages = ORDERED_STAGES
             for tile_vblk, place_state in range(
-                run_first_idx,
-                run_end_idx,
+                geo.run_first_idx,
+                geo.run_end_idx,
                 fx.Index(BLOCK_THREADS * stages),
                 init=[c_zero],
             ):
@@ -1614,35 +1791,77 @@ def create_topk_per_row_decode_adaptive_kernel(
                     )
                     cols = cols + stage_cols
                     n_selected = n_selected + stage_selected
-                unordered_place(s_run, cols, n_selected, c_zero, need)
+                unordered_place(geo.run, cols, n_selected, c_zero, need)
                 yield [place_state[0]]
 
+        def for_each_other(fn):
+            """`fn(p)` for every part this workgroup owns besides its own."""
+            if const_expr(run_parts > 1):
+                owned = owned_mask()
+                if owned != (c_one << part):
+                    for p in range(c_zero, active_parts, c_one):
+                        if owns(owned, p) & (p != part):
+                            fn(p)
+
+        def for_each_owned(fn):
+            fn(part)
+            for_each_other(fn)
+
         def scan_pass(
-            pass_id: int, current_k, current_bits, barrier_token: int, current_len
+            pass_id: int,
+            current_k,
+            current_bits,
+            barrier_token: int,
+            current_len,
+            scanned=False,
         ):
+            if const_expr(not scanned):
+                clear_local_histogram(s_hist)
+                pass_scan(part, pass_id, current_bits)
+            return finish_pass(
+                pass_id, current_k, current_bits, barrier_token, current_len
+            )
+
+        def pass_scan(p, pass_id: int, current_bits):
+            """Add part `p`'s histogram for this pass into s_hist."""
+            point_at(p)
             start_bit = max(32 - (pass_id + 1) * BITS_PER_PASS, 0)
             previous_start_bit = max(32 - pass_id * BITS_PER_PASS, 0)
 
-            clear_local_histogram(s_hist)
             if const_expr(compact and pass_id == compact_fill_pass):
                 if const_expr(short_rows_read_row):
                     # A short row keeps no buffer, as the host decides for a launch
                     # whose rows are all short: it marks itself spilled, which sends
                     # the rescans and the emit back to the row.
                     if row_len < compact_min:
-                        mark_compact_spilled(s_run)
+                        mark_compact_spilled(geo.run)
                         row_scan(pass_id, start_bit, previous_start_bit, current_bits)
                     else:
-                        compact_fill(s_run, start_bit, previous_start_bit, current_bits)
+                        compact_fill(
+                            geo.run, start_bit, previous_start_bit, current_bits
+                        )
                 else:
-                    compact_fill(s_run, start_bit, previous_start_bit, current_bits)
+                    compact_fill(geo.run, start_bit, previous_start_bit, current_bits)
             elif const_expr(compact and pass_id > compact_fill_pass):
                 compact_rescan(pass_id, start_bit, previous_start_bit, current_bits)
             else:
                 row_scan(pass_id, start_bit, previous_start_bit, current_bits)
-            return finish_pass(
-                pass_id, current_k, current_bits, barrier_token, current_len
-            )
+
+        def recount(p, pass_id: int, current_bits, chosen_bucket):
+            """Part `p`'s own run counts, when its histogram went out merged with others.
+
+            Reads only: the fill pass takes the row, since its buffer is written.
+            """
+            point_at(p)
+            start_bit = max(32 - (pass_id + 1) * BITS_PER_PASS, 0)
+            previous_start_bit = max(32 - pass_id * BITS_PER_PASS, 0)
+            clear_local_histogram(s_hist)
+            if const_expr(compact and pass_id > compact_fill_pass):
+                compact_rescan(pass_id, start_bit, previous_start_bit, current_bits)
+            else:
+                row_scan(pass_id, start_bit, previous_start_bit, current_bits)
+            save_own_histogram(s_own_hist)
+            accumulate_run_counts(geo.run, pass_id, chosen_bucket)
 
         def row_scan(
             pass_id: int, start_bit: int, previous_start_bit: int, current_bits
@@ -1651,8 +1870,10 @@ def create_topk_per_row_decode_adaptive_kernel(
             # Multi-part rows walk the same run the emit re-reads, so it hits this part's L2.
             walk_run = ordered or not (tier_mode == "short" or single_workgroup)
             scan_step_idx = scan_run_stride_idx if walk_run else active_stride_idx
-            scan_start_idx = run_first_idx + tid_idx if walk_run else global_vec_tid_idx
-            scan_stop_idx = run_end_idx if walk_run else vec_blocks_idx
+            scan_start_idx = (
+                geo.run_first_idx + tid_idx if walk_run else geo.global_vec_tid_idx
+            )
+            scan_stop_idx = geo.run_end_idx if walk_run else vec_blocks_idx
             if const_expr(walk_run and compact and not ordered):
                 # Unordered compact rows split in 4 or fewer parts measured slower
                 # walking runs on gfx950 and gfx942, so they keep the interleave.
@@ -1661,10 +1882,10 @@ def create_topk_per_row_decode_adaptive_kernel(
                     interleave.select(active_threads, c_block_i32)
                 )
                 scan_start_idx = fx.Index(
-                    interleave.select(global_vec_tid, run_first_vblk + tid)
+                    interleave.select(geo.global_vec_tid, geo.run_first_vblk + tid)
                 )
                 scan_stop_idx = fx.Index(
-                    interleave.select(vec_blocks_i32, run_end_vblk)
+                    interleave.select(vec_blocks_i32, geo.run_end_vblk)
                 )
             # Two loads in flight per step; the loop below takes the odd one out.
             unroll_limit_idx = scan_stop_idx - scan_step_idx()
@@ -1715,22 +1936,34 @@ def create_topk_per_row_decode_adaptive_kernel(
             if ~merged_locally:
                 if const_expr(ordered):
                     save_own_histogram(s_own_hist)
+                # Pass 0 is the only one entered owning just the part it started on.
+                if const_expr(pass_id > 0):
+                    for_each_other(lambda p: pass_scan(p, pass_id, current_bits))
                 flush_local_histogram(pass_id)
                 # A certified pass proves the merge finished instead of waiting to
                 # be told, so it takes neither the barrier nor the read-back after
                 # it -- certified_merge does its own, uncached.
                 if const_expr(certified):
-                    certified_merge(pass_id, current_k, current_len)
+                    certified_merge(
+                        pass_id,
+                        current_k,
+                        current_len,
+                        take=pass_id == 0,
+                    )
                 if const_expr(not certified):
-                    row_barrier(barrier_token)
+                    row_barrier(barrier_token, take=pass_id == 0)
                     load_global_histogram(s_hist, pass_id)
                     choose_bucket_prefix(s_hist, s_meta, current_k)
 
             chosen_bucket = s_meta[SMEM_META_THRESHOLD]
-            if const_expr(ordered):
-                accumulate_run_counts(s_run, pass_id, chosen_bucket)
             next_k = s_meta[SMEM_META_K]
             next_len = s_meta[SMEM_META_LEN]
+            if const_expr(ordered):
+                point_at(part)
+                accumulate_run_counts(geo.run, pass_id, chosen_bucket)
+                for_each_other(
+                    lambda p: recount(p, pass_id, current_bits, chosen_bucket)
+                )
             next_bits = current_bits | fx.Int32(chosen_bucket << start_bit)
             if const_expr(pass_id == num_passes - 1):
                 if const_expr(ordered_early_stop):
@@ -1738,9 +1971,11 @@ def create_topk_per_row_decode_adaptive_kernel(
                 elif const_expr(ordered):
                     ordered_emit(next_k, next_bits)
                 elif const_expr(compact and pass_id > compact_fill_pass):
-                    compact_write_entries(next_k, next_bits)
+                    for_each_owned(
+                        lambda p: compact_write_entries(p, next_k, next_bits)
+                    )
                 else:
-                    unordered_emit(next_k, next_bits)
+                    for_each_owned(lambda p: unordered_emit(p, next_k, next_bits))
             return next_k, next_len, next_bits
 
         def one_workgroup_short_tier():
@@ -1995,7 +2230,21 @@ def create_topk_per_row_decode_adaptive_kernel(
         else:
             persistent_active = (row_len > c_top_k) & (part < active_parts)
 
-        if persistent_active:
+        def claim_own_part(meta):
+            """tid 0 only: own this workgroup's part unless a waiting peer took it."""
+            my_bit = c_one << part
+            put(meta, SMEM_META_OWNED, my_bit)
+            if ~single_part_active:
+                prev = fx.atomic_or(
+                    counter_ptr(COUNTER_CLAIM), my_bit, syncscope=_AGENT
+                )
+                put(meta, SMEM_META_OWNED, owns(prev, part).select(c_zero, my_bit))
+
+        def select_row():
+            """Every pass and the emit, for the parts this workgroup owns.
+
+            Pass 0's scan of its own part has already run.
+            """
             local_k = c_top_k
             local_len = row_len
             kth_bits = c_zero
@@ -2012,6 +2261,7 @@ def create_topk_per_row_decode_adaptive_kernel(
                         kth_bits,
                         barrier_token_for(pass_id),
                         local_len,
+                        scanned=pass_id == 0,
                     )
                 last_pass = num_passes - 1
                 settled_bit = max(32 - last_pass * BITS_PER_PASS, 0)
@@ -2021,7 +2271,9 @@ def create_topk_per_row_decode_adaptive_kernel(
                     early = early & (row_len < compact_min)
                 if const_expr(not ordered):  # noqa: SIM102 - constexpr guard
                     if early:
-                        early_write_all(settled_bit, kth_bits, local_k)
+                        for_each_owned(
+                            lambda p: early_write_all(p, settled_bit, kth_bits, local_k)
+                        )
                 if ~early:
                     local_k, local_len, kth_bits = scan_pass(
                         last_pass,
@@ -2050,7 +2302,18 @@ def create_topk_per_row_decode_adaptive_kernel(
                         kth_bits,
                         barrier_token_for(pass_id),
                         local_len,
+                        scanned=pass_id == 0,
                     )
+
+        if persistent_active:
+            # The claim's result is waited on only by wave 0, while the rest scan.
+            if tid == c_zero:
+                claim_own_part(s_meta)
+            clear_local_histogram(s_hist)
+            pass_scan(part, 0, c_zero)
+            # Arriving to find its part taken, a workgroup only counts itself out.
+            if owned_mask() != c_zero:
+                select_row()
 
             # Leave the row's control slots zero for the next launch. A one-part
             # row touched only the emit's output counters. On a multi-part row the
