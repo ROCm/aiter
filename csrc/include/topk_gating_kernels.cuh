@@ -69,6 +69,29 @@ __device__ __forceinline__ void store_shared_expert_sigmoid(
     }
 }
 
+// Writes a pad row in full -- routed columns weight 0 and id -1, shared
+// columns as for any row -- and returns true, so a block holding one row can
+// return before selecting from a row nobody reads. Call it once the row's
+// loads are issued: checked first, the num_valid_rows read would serialize
+// ahead of them on every real row.
+template <typename DTYPE_I>
+__device__ __forceinline__ bool write_if_pad_row(const int* num_valid_rows,
+                                                 int row,
+                                                 const DTYPE_I* gating_row,
+                                                 float* weights_row,
+                                                 int* ids_row,
+                                                 int num_routed,
+                                                 int topk,
+                                                 int num_shared)
+{
+    if(!is_pad_row(num_valid_rows, row))
+        return false;
+    write_pad_row(weights_row, ids_row, topk, threadIdx.x, blockDim.x);
+    if(num_shared > 0 && threadIdx.x == 0)
+        store_shared_expert_sigmoid(gating_row, weights_row, num_routed, topk, num_shared);
+    return true;
+}
+
 // E=128 opt_n (TPW=4) wins on gfx942 but regresses on gfx950; gate to gfx942.
 // Cached: get_gpu_arch() re-queries the driver on every call.
 inline bool topk_gating_prefer_optn_e128()
@@ -328,6 +351,12 @@ __global__ void topk_gating_kernel_opt(
         vals[i] = fmaxf(vals[i], -INFINITY);
     }
 
+    if(write_if_pad_row(num_valid_rows, token_idx, input_ptr,
+                        topk_weights + token_idx * stride_tk,
+                        topk_ids + token_idx * stride_tk,
+                        NUM_EXPERTS, topk, num_shared_experts))
+        return;
+
     // Step 2: sort thread-local partition descending
     sort_network_desc<EPT>(vals, orig, idxs);
 
@@ -368,11 +397,10 @@ __global__ void topk_gating_kernel_opt(
     else
         sum = routed_scaling_factor;
 
-    const bool pad = is_pad_row(num_valid_rows, token_idx);
     if(static_cast<int>(threadIdx.x) < topk)
     {
-        topk_weights[token_idx * stride_tk + threadIdx.x] = pad ? 0.0f : topk_value * sum;
-        topk_ids[token_idx * stride_tk + threadIdx.x]     = pad ? -1 : topk_indice;
+        topk_weights[token_idx * stride_tk + threadIdx.x] = topk_value * sum;
+        topk_ids[token_idx * stride_tk + threadIdx.x]     = topk_indice;
     }
     if(num_shared_experts > 0 && threadIdx.x == 0)
     {
@@ -457,6 +485,12 @@ __global__ void topk_gating_kernel_opt_multiwave(
         vals[i] = fmaxf(vals[i], -INFINITY);
     }
 
+    if(write_if_pad_row(num_valid_rows, token_idx, input_ptr,
+                        topk_weights + token_idx * stride_tk,
+                        topk_ids + token_idx * stride_tk,
+                        NUM_EXPERTS, topk, num_shared_experts))
+        return;
+
     sort_network_desc<EPT>(vals, orig, idxs);
 
     // Phase 1: per-wave local top-k via serial within-wave argmax (no barrier).
@@ -521,12 +555,11 @@ __global__ void topk_gating_kernel_opt_multiwave(
     __syncthreads();
 
     // Phase 3: coalesced scaled write.
-    const bool pad = is_pad_row(num_valid_rows, token_idx);
     if(static_cast<int>(threadIdx.x) < topk)
     {
         const int t = static_cast<int>(threadIdx.x);
-        topk_weights[token_idx * stride_tk + t] = pad ? 0.0f : out_weight[t] * out_scale;
-        topk_ids[token_idx * stride_tk + t]     = pad ? -1 : out_idx[t];
+        topk_weights[token_idx * stride_tk + t] = out_weight[t] * out_scale;
+        topk_ids[token_idx * stride_tk + t]     = out_idx[t];
     }
     if(num_shared_experts > 0 && threadIdx.x == 0)
     {
@@ -1006,6 +1039,11 @@ __global__ void topk_gating_kernel(
         }
     }
     __syncthreads();
+    if(write_if_pad_row(num_valid_rows, token_idx, input_ptr,
+                        topk_weights + token_idx * stride_tk,
+                        topk_ids + token_idx * stride_tk,
+                        num_experts, topk, num_shared_experts))
+        return;
 
     // Softmax: normalize first, then add bias for topk selection.
     // scores[] after this block = softmax(x) + bias (biased for selection).
@@ -1088,11 +1126,10 @@ __global__ void topk_gating_kernel(
     else
         sum = routed_scaling_factor;
 
-    const bool pad = is_pad_row(num_valid_rows, token_idx);
     for(int k = threadIdx.x; k < topk; k += blockDim.x)
     {
-        topk_weights[token_idx * stride_tk + k] = pad ? 0.0f : topk_value * sum;
-        topk_ids[token_idx * stride_tk + k]     = pad ? -1 : topk_indice;
+        topk_weights[token_idx * stride_tk + k] = topk_value * sum;
+        topk_ids[token_idx * stride_tk + k]     = topk_indice;
     }
     if(num_shared_experts > 0 && threadIdx.x == 0)
     {

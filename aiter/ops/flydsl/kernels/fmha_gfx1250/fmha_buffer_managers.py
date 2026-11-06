@@ -190,7 +190,7 @@ def _async_load_to_lds(gptrs, lds_ptrs, *, cluster, imm_offs=None):
 #
 #   V1  ``cluster_load_async_to_lds_b128`` -- per-lane addresses, software OOB clamp,
 #       one b128 per lane per 8x32 write tile; bumps ``asynccnt``.
-#   V2  TDM (``fx.copy_atom_call`` on a ``make_tdm_atom`` view) -- one descriptor-driven
+#   V2  TDM (``fx.copy`` on a ``make_tiled_tdm_atom`` partition) -- one descriptor-driven
 #       copy per band, no per-lane address VALU (so far fewer address VGPRs), and the
 #       per-dim extent gives HARDWARE OOB zero-fill; bumps ``tensorcnt``.
 #
@@ -480,7 +480,7 @@ def _tdm_load_views(
         address_space=fx.AddressSpace.Shared,
         alignment=16,
     )
-    # wave_id % num_warps reproduces make_tdm_atom's implicit folding: surplus waves
+    # wave_id % num_warps reproduces make_tiled_tdm_atom's implicit folding: surplus waves
     # redo a share rather than addressing past the tile.
     warp_coord = fx.Int32(rocdl.wave_id()) % fx.Int32(num_warps)
     warp_layout = fx.make_layout(num_warps, 1)

@@ -40,7 +40,7 @@ from enum import IntEnum
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl.expr import arith, gpu, rocdl
+from flydsl.expr import arith, const_expr, gpu, rocdl
 
 # Q/K/V staging managers (own their LDS swizzles + async copy schedules). They are
 # self-contained: this kernel maintains its own arch constants below and passes the
@@ -286,6 +286,11 @@ _B8_WMMA = {
     (fx.Float8E5M2, fx.Float8E4M3FN): rocdl.wmma_f32_16x16x64_bf8_fp8,
     (fx.Float8E5M2, fx.Float8E5M2): rocdl.wmma_f32_16x16x64_bf8_bf8,
 }
+
+
+def _load_descale(ptr):
+    """One per-tensor fp32 descale. Uniform and loop-invariant, so it hoists."""
+    return fx.Float32(fx.ptr_load(fx.get_iter(ptr)))
 
 
 def _wmma(a, b, c, *, a_dtype, b_dtype):
@@ -1189,6 +1194,7 @@ def _attention_core_multi_kv_tiles(
     paged=None,  # consumed by the prologue; here only so one kwarg dict serves both
     q_dtype,  # compile-time Q fragment type; K/V are kv_dtype, P is P_DTYPE, O is O_DTYPE
     kv_dtype,  # compile-time K/V fragment type (may differ from q_dtype; both 8-bit)
+    v_descale=None,  # the epilogue's; here so one kwarg dict serves both
 ):
     """Layout-agnostic m32x8 compute, shared by the THD and BSHD kernel entries.
 
@@ -1847,6 +1853,7 @@ def _attention_core_one_kv_tile(
     q_dtype,
     kv_dtype,
     paged=None,  # never paged (paged uses the multi-tile core); here for one kwarg dict
+    v_descale=None,  # the epilogue's; here so one kwarg dict serves both
 ):
     """Whole-attention compute for a workgroup whose band fits in ONE KV tile.
 
@@ -2089,6 +2096,7 @@ def _attention_core_one_kv_tile(
 
 def _store_o_lse(
     *,
+    v_descale,
     o_mgr,
     m_list,
     d_list,
@@ -2129,6 +2137,8 @@ def _store_o_lse(
         inv_denom = (d_final > fx.Float32(0.0)).select(
             fx.Float32(1.0) / d_final, fx.Float32(0.0)
         )
+        if v_descale is not None:
+            inv_denom = inv_denom * v_descale
         inv_denom_vec = fx.Vector.from_elements([inv_denom], fx.Float32).broadcast_to(8)
         o_norm = [o_final[d_tile_idx] * inv_denom_vec for d_tile_idx in range(d_tiles)]
         if q_tile_idx > 0:
@@ -2196,6 +2206,7 @@ _EPILOGUE_KEYS = (
     "lse_num_records_bytes",
     "q_start",
     "q_len",
+    "v_descale",
 )
 
 
@@ -2217,6 +2228,7 @@ def _epi_state_zeros(*, num_q_tiles_per_wave, v_hdim):
 
 def _attention_epilogue(
     *,
+    v_descale,
     epi_state,
     rendezvous,  # compile-time: the multi core leaves KV copies in O's chunk
     warp_idx,
@@ -2252,6 +2264,7 @@ def _attention_epilogue(
         # copies; each half drained only its own, so the pair meets before the ds_writes.
         _bare_barrier()
     _store_o_lse(
+        v_descale=v_descale,
         o_mgr=_o_manager(
             v_hdim=v_hdim,
             gqa_ratio=gqa_ratio,
@@ -2428,6 +2441,7 @@ def build_fmha_fwd_prefill_a8w8_m32x8(
     one_kv_tile: bool = False,
     return_lse: bool = False,
     has_sink: bool = False,
+    has_descale: bool = False,
     gqa_ratio: int = 1,
     num_q_tiles_per_wave: int = WMMA_ROW_PER_WAVE,
     page_size: int | None = None,
@@ -2473,6 +2487,7 @@ def build_fmha_fwd_prefill_a8w8_m32x8(
         ), f"page_size must be a power of two, got {PAGE_SIZE}"
         assert not one_kv_tile, "paged uses the multi-tile core"
     LOG2_PAGE = None if PAGE_SIZE is None else PAGE_SIZE.bit_length() - 1
+    HAS_DESCALE = bool(has_descale)
     ONE_KV_TILE = bool(one_kv_tile)
     RET_LSE = bool(return_lse)
     HAS_SINK = bool(has_sink)
@@ -2670,6 +2685,9 @@ def build_fmha_fwd_prefill_a8w8_m32x8(
             ptr_V: fx.Pointer,
             ptr_LSE: fx.Pointer,
             ptr_sink: fx.Pointer,
+            ptr_q_descale: fx.Pointer,
+            ptr_k_descale: fx.Pointer,
+            ptr_v_descale: fx.Pointer,
             ptr_cu_seqlens_q: fx.Pointer,
             ptr_cu_seqlens_k: fx.Pointer,
             softmax_scale: fx.Float32,
@@ -2707,6 +2725,17 @@ def build_fmha_fwd_prefill_a8w8_m32x8(
                 + fx.Int64(1)
             ) * fx.Int64(4)
 
+            # Per-tensor descales, as gfx950 does: q/k scale the fp32 logits (so they
+            # ride softmax_scale and reach the LSE through m), v scales O alone.
+            if const_expr(HAS_DESCALE):
+                _softmax_scale = softmax_scale * (
+                    _load_descale(ptr_q_descale) * _load_descale(ptr_k_descale)
+                )
+                _v_descale = _load_descale(ptr_v_descale)
+            else:
+                _softmax_scale = softmax_scale
+                _v_descale = None
+
             # An empty batch must not enter the core: kv_len==0 would write O/0 = NaN.
             if (q_len > fx.Int32(0)) & (kv_len > fx.Int32(0)):
                 _core_kwargs = {
@@ -2725,7 +2754,8 @@ def build_fmha_fwd_prefill_a8w8_m32x8(
                     "ptr_V": ptr_V,
                     "ptr_LSE": ptr_LSE,
                     "ptr_sink": ptr_sink,
-                    "softmax_scale": softmax_scale,
+                    "softmax_scale": _softmax_scale,
+                    "v_descale": _v_descale,
                     "stride_q_seq": stride_q_seq,
                     "stride_k_seq": stride_k_seq,
                     "stride_v_seq": stride_v_seq,
@@ -2822,6 +2852,9 @@ def build_fmha_fwd_prefill_a8w8_m32x8(
         ptr_V: fx.Pointer,
         ptr_LSE: fx.Pointer,
         ptr_sink: fx.Pointer,
+        ptr_q_descale: fx.Pointer,
+        ptr_k_descale: fx.Pointer,
+        ptr_v_descale: fx.Pointer,
         softmax_scale: fx.Float32,
         stride_q_seq: fx.Int32,
         stride_k_seq: fx.Int32,
@@ -2851,6 +2884,16 @@ def build_fmha_fwd_prefill_a8w8_m32x8(
             4
         )
 
+        # Per-tensor descales, as in the thd entry.
+        if const_expr(HAS_DESCALE):
+            _softmax_scale = softmax_scale * (
+                _load_descale(ptr_q_descale) * _load_descale(ptr_k_descale)
+            )
+            _v_descale = _load_descale(ptr_v_descale)
+        else:
+            _softmax_scale = softmax_scale
+            _v_descale = None
+
         _core_kwargs = {
             "qk_hdim": QK_HDIM,
             "v_hdim": V_HDIM,
@@ -2867,7 +2910,8 @@ def build_fmha_fwd_prefill_a8w8_m32x8(
             "ptr_V": ptr_V,
             "ptr_LSE": ptr_LSE,
             "ptr_sink": ptr_sink,
-            "softmax_scale": softmax_scale,
+            "softmax_scale": _softmax_scale,
+            "v_descale": _v_descale,
             "stride_q_seq": stride_q_seq,
             "stride_k_seq": stride_k_seq,
             "stride_v_seq": stride_v_seq,
@@ -2958,6 +3002,7 @@ def _ensure_thd_kernel(
     one_kv_tile: bool,
     return_lse: bool,
     has_sink: bool,
+    has_descale: bool,
     gqa_ratio: int,
     qk_hdim: int = DEFAULT_QK_HDIM,
     v_hdim: int = DEFAULT_V_HDIM,
@@ -2971,6 +3016,7 @@ def _ensure_thd_kernel(
         bool(mask_right),
         bool(return_lse),
         bool(has_sink),
+        bool(has_descale),
         int(gqa_ratio),
         int(qk_hdim),
         int(v_hdim),
@@ -2990,6 +3036,7 @@ def _ensure_thd_kernel(
         one_kv_tile=one_kv_tile,
         return_lse=return_lse,
         has_sink=has_sink,
+        has_descale=has_descale,
         gqa_ratio=gqa_ratio,
         q_dtype_str=q_dtype_str,
         kv_dtype_str=kv_dtype_str,
@@ -3005,6 +3052,9 @@ def _ensure_thd_kernel(
         ptr_V: fx.Pointer,
         ptr_LSE: fx.Pointer,
         ptr_sink: fx.Pointer,
+        ptr_q_descale: fx.Pointer,
+        ptr_k_descale: fx.Pointer,
+        ptr_v_descale: fx.Pointer,
         ptr_cu_seqlens_q: fx.Pointer,
         ptr_cu_seqlens_k: fx.Pointer,
         softmax_scale: fx.Float32,
@@ -3041,6 +3091,9 @@ def _ensure_thd_kernel(
             ptr_V,
             ptr_LSE,
             ptr_sink,
+            ptr_q_descale,
+            ptr_k_descale,
+            ptr_v_descale,
             ptr_cu_seqlens_q,
             ptr_cu_seqlens_k,
             softmax_scale,
@@ -3209,6 +3262,7 @@ def _ensure_bshd_kernel(
     one_kv_tile: bool,
     return_lse: bool,
     has_sink: bool,
+    has_descale: bool,
     gqa_ratio: int,
     qk_hdim: int = DEFAULT_QK_HDIM,
     v_hdim: int = DEFAULT_V_HDIM,
@@ -3222,6 +3276,7 @@ def _ensure_bshd_kernel(
         bool(mask_right),
         bool(return_lse),
         bool(has_sink),
+        bool(has_descale),
         int(gqa_ratio),
         int(qk_hdim),
         int(v_hdim),
@@ -3241,6 +3296,7 @@ def _ensure_bshd_kernel(
         one_kv_tile=one_kv_tile,
         return_lse=return_lse,
         has_sink=has_sink,
+        has_descale=has_descale,
         gqa_ratio=gqa_ratio,
         q_dtype_str=q_dtype_str,
         kv_dtype_str=kv_dtype_str,
@@ -3256,6 +3312,9 @@ def _ensure_bshd_kernel(
         ptr_V: fx.Pointer,
         ptr_LSE: fx.Pointer,
         ptr_sink: fx.Pointer,
+        ptr_q_descale: fx.Pointer,
+        ptr_k_descale: fx.Pointer,
+        ptr_v_descale: fx.Pointer,
         softmax_scale: fx.Float32,
         stride_q_seq: fx.Int32,
         stride_k_seq: fx.Int32,
@@ -3291,6 +3350,9 @@ def _ensure_bshd_kernel(
             ptr_V,
             ptr_LSE,
             ptr_sink,
+            ptr_q_descale,
+            ptr_k_descale,
+            ptr_v_descale,
             softmax_scale,
             stride_q_seq,
             stride_k_seq,
@@ -3394,6 +3456,9 @@ def flash_attn_varlen_a8w8_m32x8(
     return_lse=False,
     sink=None,
     lse=None,
+    q_descale=None,
+    k_descale=None,
+    v_descale=None,
     num_q_tiles_per_wave=None,
 ):
     """Host entry — varlen THD, qk_hdim in {64,128,192,256} / v_hdim in {64,128,256}, fp8 or bf8.
@@ -3437,6 +3502,22 @@ def flash_attn_varlen_a8w8_m32x8(
         ), f"sink must be [nheads_q={nheads_q}], got {tuple(sink.shape)}"
     # ptr_sink is only read when has_sink; pass q as a valid placeholder otherwise.
     sink_ptr = sink if has_sink else q
+
+    # Per-tensor fp32 descales, all three or none, as gfx950 requires. Presence is
+    # compile-time; the pointers are always passed, with q as a placeholder when unused.
+    _descales = (q_descale, k_descale, v_descale)
+    has_descale = any(d is not None for d in _descales)
+    if has_descale:
+        assert all(
+            d is not None for d in _descales
+        ), "q/k/v_descale must be given together"
+        for _name, _d in zip(("q", "k", "v"), _descales):
+            assert (
+                torch.is_tensor(_d) and _d.dtype == torch.float32
+            ), f"{_name}_descale must be a float32 tensor, got {type(_d)}"
+            assert _d.numel() == 1, f"{_name}_descale must hold one element"
+            assert _d.device == q.device, f"{_name}_descale must be on {q.device}"
+    qd_ptr, kd_ptr, vd_ptr = _descales if has_descale else (q, q, q)
 
     if softmax_scale is None:
         softmax_scale = 1.0 / (q.shape[-1] ** 0.5)
@@ -3497,6 +3578,7 @@ def flash_attn_varlen_a8w8_m32x8(
         one_kv_tile,
         bool(return_lse),
         has_sink,
+        has_descale,
         gqa,
         qk_hdim=qk_hdim,
         v_hdim=v_hdim,
@@ -3513,6 +3595,7 @@ def flash_attn_varlen_a8w8_m32x8(
                 mask_right,
                 bool(return_lse),
                 has_sink,
+                has_descale,
                 gqa,
                 qk_hdim,
                 v_hdim,
@@ -3528,6 +3611,9 @@ def flash_attn_varlen_a8w8_m32x8(
         v,
         lse_ptr,
         sink_ptr,
+        qd_ptr,
+        kd_ptr,
+        vd_ptr,
         cu_seqlens_q,
         cu_seqlens_k,
         softmax_scale,
@@ -3778,6 +3864,9 @@ def flash_attn_batch_a8w8_m32x8(
     return_lse=False,
     sink=None,
     lse=None,
+    q_descale=None,
+    k_descale=None,
+    v_descale=None,
     num_q_tiles_per_wave=None,
 ):
     """Host entry — batched BSHD ``[B, S, H, D]``, qk_hdim in {64,128,192,256} / v_hdim in {64,128,256}, fp8 or bf8.
@@ -3819,6 +3908,22 @@ def flash_attn_batch_a8w8_m32x8(
         ), f"sink must be [nheads_q={nheads_q}], got {tuple(sink.shape)}"
     # ptr_sink is only read when has_sink; pass q as a valid placeholder otherwise.
     sink_ptr = sink if has_sink else q
+
+    # Per-tensor fp32 descales, all three or none, as gfx950 requires. Presence is
+    # compile-time; the pointers are always passed, with q as a placeholder when unused.
+    _descales = (q_descale, k_descale, v_descale)
+    has_descale = any(d is not None for d in _descales)
+    if has_descale:
+        assert all(
+            d is not None for d in _descales
+        ), "q/k/v_descale must be given together"
+        for _name, _d in zip(("q", "k", "v"), _descales):
+            assert (
+                torch.is_tensor(_d) and _d.dtype == torch.float32
+            ), f"{_name}_descale must be a float32 tensor, got {type(_d)}"
+            assert _d.numel() == 1, f"{_name}_descale must hold one element"
+            assert _d.device == q.device, f"{_name}_descale must be on {q.device}"
+    qd_ptr, kd_ptr, vd_ptr = _descales if has_descale else (q, q, q)
 
     if softmax_scale is None:
         softmax_scale = 1.0 / (q.shape[-1] ** 0.5)
@@ -3896,6 +4001,7 @@ def flash_attn_batch_a8w8_m32x8(
         one_kv_tile,
         bool(return_lse),
         has_sink,
+        has_descale,
         gqa,
         qk_hdim=qk_hdim,
         v_hdim=v_hdim,
@@ -3912,6 +4018,7 @@ def flash_attn_batch_a8w8_m32x8(
                 mask_right,
                 bool(return_lse),
                 has_sink,
+                has_descale,
                 gqa,
                 qk_hdim,
                 v_hdim,
@@ -3927,6 +4034,9 @@ def flash_attn_batch_a8w8_m32x8(
         v,
         lse_ptr,
         sink_ptr,
+        qd_ptr,
+        kd_ptr,
+        vd_ptr,
         softmax_scale,
         stride_q_seq,
         stride_k_seq,
