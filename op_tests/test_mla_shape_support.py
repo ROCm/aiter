@@ -98,6 +98,30 @@ def test_planner_verdict():
     assert _fold("gfx1250", "fp8", 64) == 4
 
 
+def test_gfx942_96_heads_stay_folded():
+    # gfx942 has no native qh96 kernel, so the gfx950-only native route must
+    # leave its plan alone: 96 heads fold x6 at every qlen, with or without
+    # round-robin CP, in its own fp8 (e4m3fnuz) and in bf16.
+    for t, cprr in itertools.product(
+        (torch.float8_e4m3fnuz, torch.bfloat16), (False, True)
+    ):
+        folds = []
+        for msq in (1, 2, 4, 6, 7, 8, 9):
+            s = get_mla_decode_shape_support(
+                96,
+                msq,
+                t,
+                t,
+                arch="gfx942",
+                enable_experimental=False,
+                flydsl_ps1=False,
+                **_cp(cprr),
+            )
+            assert s.planner_accepts, (t, cprr, msq)
+            folds.append((s.fold_factor, s.seqlen_fold))
+        assert folds == [(6, 1)] * 7, (t, cprr, folds)
+
+
 @pytest.mark.parametrize("batch_size,qlen", [(1, 1), (64, 1), (64, 2)])
 @pytest.mark.parametrize("is_sparse", [True, False])
 def test_qh64_metadata_capacity(monkeypatch, batch_size, qlen, is_sparse):
