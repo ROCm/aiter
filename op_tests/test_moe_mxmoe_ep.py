@@ -319,6 +319,7 @@ def test_ep_cli_a4w4_situv2_reference(tuned_rows, ep_mode, betas):
         stderr=subprocess.STDOUT,
         text=True,
         timeout=300,
+        check=False,
     )
     assert result.returncode == 0, result.stdout
     assert any(
@@ -539,14 +540,11 @@ def test_ep_mxmoe_a8w4_matches_quantized_reference(
 
     torch.manual_seed(0)
     w1 = _mxfp4(
-        torch.randn(
-            (LOCAL_ROUTED, 2 * A8W4_INTER_DIM, A8W4_MODEL_DIM), device="cuda"
-        )
+        torch.randn((LOCAL_ROUTED, 2 * A8W4_INTER_DIM, A8W4_MODEL_DIM), device="cuda")
         * 0.1
     )
     w2 = _mxfp4(
-        torch.randn((LOCAL_ROUTED, A8W4_MODEL_DIM, A8W4_INTER_DIM), device="cuda")
-        * 0.1
+        torch.randn((LOCAL_ROUTED, A8W4_MODEL_DIM, A8W4_INTER_DIM), device="cuda") * 0.1
     )
     x = torch.randn((rows, A8W4_MODEL_DIM), dtype=dtypes.bf16, device="cuda")
     ids, weights = _a8w4_routing(rows)
