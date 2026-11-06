@@ -65,6 +65,36 @@ from aiter.ops.shuffle import (
 
 logger = logging.getLogger(__name__)
 
+_DEFAULT_MOE_2STAGE_TOKENS = [
+    1,
+    3,
+    5,
+    16,
+    32,
+    64,
+    128,
+    256,
+    1024,
+    4096,
+    8192,
+    163840,
+]
+_STANDARD_MOE_2STAGE_TOKENS = [1, 16, 32, 64, 128, 256, 1024, 4096]
+
+# The default script behavior must keep the historical full sweep. CI can opt
+# into the reduced representative-token standard profile, while the explicit
+# "full" profile preserves the parsed CLI arguments unchanged.
+AITER_MOE_2STAGE_CI_PROFILE = os.environ.get(
+    "AITER_MOE_2STAGE_CI_PROFILE", "default"
+).lower()
+
+if AITER_MOE_2STAGE_CI_PROFILE == "standard":
+    logger.info("moe_2stage active CI profile: standard")
+elif AITER_MOE_2STAGE_CI_PROFILE == "full":
+    logger.info("moe_2stage active CI profile: full")
+else:
+    logger.info("moe_2stage active CI profile: default")
+
 torch.int4 = getattr(torch, "int4", torch.uint32)
 torch.set_default_device("cuda")
 AITER_MOE_EXPERT_BALANCE = (
@@ -635,20 +665,7 @@ parser.add_argument(
     "--tokenNum",
     type=int,
     nargs="*",
-    default=[
-        1,
-        3,
-        5,
-        16,
-        32,
-        64,
-        128,
-        256,
-        1024,
-        4096,
-        8192,
-        163840,
-    ],
+    default=_DEFAULT_MOE_2STAGE_TOKENS,
     help="""Number of tokens.
     e.g.: -t 1024""",
 )
@@ -801,6 +818,15 @@ parser.add_argument(
 
 args = parser.parse_args()
 
+ci_profile = os.environ.get("AITER_MOE_2STAGE_CI_PROFILE", "default").lower()
+if ci_profile == "standard":
+    # Standard CI keeps the representative-token sweep but must not disable the
+    # FlyDSL/Opus CSV validation path; that would silently weaken the check.
+    args.tokenNum = _STANDARD_MOE_2STAGE_TOKENS
+# Outside the "standard" profile, preserve whatever argparse already parsed:
+# the historical full-sweep default when "-t"/"--tokenNum" is omitted, or the
+# caller's explicit token selection otherwise. Neither "full" nor the unset/
+# "default" profile should discard an explicit "-t" override.
 
 l_quant = [l_quant[args.quant]] if args.quant is not None else l_quant
 
