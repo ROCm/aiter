@@ -204,3 +204,7 @@ class IpcHeap:
         for i, r in enumerate(ranks):
             dist.broadcast_object_list(all_data[i], src=r, group=group, device="cpu")
         return [all_data[i][0] for i in range(world_size)]
+
+
+# Backward-compatible name from before the rename; vLLM imports it.
+UncachedIpcHeap = IpcHeap
