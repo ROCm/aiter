@@ -37,6 +37,8 @@ def device(monkeypatch):
     "batch,max_parts,budget,window,query_length,max_batch_size,bucket",
     [
         (1, 1, 1, 0, 1, None, 1),
+        (1, 7, 160, 257, 4, None, 1),
+        (1, None, 512, 0, 1, None, 1),
         (6, 7, 160, 257, 4, None, 8),
         (63, 7, 160, 0, 1, None, 64),
         (65, 7, 512, 1, 4, None, 128),
@@ -171,7 +173,10 @@ def test_pa_decode_plan(
     assert refreshed is plan
     # All-empty replay must erase old active records, then mixed lengths must
     # rebuild them using the same buffers without stale padding or readback.
-    for values in ([0] * batch, list(reversed(lengths))):
+    replay_lengths = [[0] * batch, list(reversed(lengths))]
+    if batch == 1:
+        replay_lengths.extend([[length] for length in pattern])
+    for values in replay_lengths:
         context.copy_(torch.tensor(values, dtype=torch.int32, device=device))
         graph.replay()
         check(plan, values)

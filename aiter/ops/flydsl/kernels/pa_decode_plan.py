@@ -36,9 +36,16 @@ def compile_pa_decode_plan(
 ):
     """Compile a batch bucket and block size for dense or windowed plans.
 
+    Bucket 1 uses a scan-free kernel: its task count is simply the minimum
+    of visible tiles, capacity and partition cap. Other buckets retain scans.
     Actual batch, task capacity, partition cap and window are runtime values.
     ``cluster_tasks`` adds aligned records for small gfx1250 cluster plans.
     """
+    if max_batch == 1:
+        return _compile_single_sequence_plan(
+            threads, windowed, cluster_tasks, tile_tokens
+        )
+
     scan_tiles = fx.coop.BlockScan[fx.Int64, threads]
     scan_counts = fx.coop.BlockScan[fx.Int32, threads]
     reduce_rows = fx.coop.BlockReduce[fx.Int32, threads]
@@ -251,6 +258,79 @@ def compile_pa_decode_plan(
     ):
         pa_decode_plan_kernel(
             lengths, work, reduce_info, batch, capacity, max_parts, window, cluster_info
+        ).launch(grid=(1, 1, 1), block=(threads, 1, 1), stream=stream)
+
+    return launch
+
+
+@cache
+def _compile_single_sequence_plan(threads, windowed, cluster_tasks, tile_tokens):
+    """One sequence has no scan or proportional budget allocation."""
+
+    @flyc.kernel(known_block_size=[threads, 1, 1])
+    def pa_decode_single_sequence_plan_kernel(
+        lengths_ptr: fx.Pointer,
+        work_ptr: fx.Pointer,
+        reduce_ptr: fx.Pointer,
+        capacity: fx.Int32,
+        max_parts: fx.Int32,
+        window: fx.Int32,
+        cluster_ptr: fx.Pointer,
+    ):
+        tid = fx.thread_idx.x
+        original = fx.Int32(fx.recast_iter(fx.Int32, lengths_ptr)[0])
+        length = fx.max(fx.Int64(original), fx.Int64(0))
+        first = fx.Int64(0)
+        if fx.const_expr(windowed):
+            first = fx.max(length - fx.Int64(window), fx.Int64(0)) // tile_tokens
+        tiles = (length + tile_tokens - 1) // tile_tokens - first
+        count = fx.Int32(fx.min(tiles, fx.Int64(fx.min(capacity, max_parts))))
+        zero = fx.Int32(0)
+        if tid == 0:
+            fx.ptr_store(
+                fx.Vector.from_elements([zero, count], dtype=fx.Int32),
+                fx.recast_iter(fx.Int32, reduce_ptr),
+            )
+        work = fx.recast_iter(fx.Int32, work_ptr)
+        for slot in range(tid, capacity, threads):
+            record = fx.Vector.filled(4, 0, fx.Int32)
+            if slot < count:
+                begin = fx.Int32(first + fx.Int64(slot) * tiles // count)
+                end = fx.Int32(first + fx.Int64(slot + 1) * tiles // count)
+                record = fx.Vector.from_elements(
+                    [zero, begin, end, original], dtype=fx.Int32
+                )
+            fx.ptr_store(record, fx.add_offset(work, slot * 4))
+        if fx.const_expr(cluster_tasks):
+            stride = fx.min(max_parts, fx.Int32(8))
+            if tid < stride:
+                begin, end = zero, zero
+                if tid < count:
+                    begin = fx.Int32(first + fx.Int64(tid) * tiles // count)
+                    end = fx.Int32(first + fx.Int64(tid + 1) * tiles // count)
+                record = fx.Vector.from_elements(
+                    [zero, begin, end, original, zero, count, zero, zero],
+                    dtype=fx.Int32,
+                )
+                fx.ptr_store(
+                    record,
+                    fx.add_offset(fx.recast_iter(fx.Int32, cluster_ptr), tid * 8),
+                )
+
+    @flyc.jit
+    def launch(
+        lengths: fx.Pointer,
+        work: fx.Pointer,
+        reduce_info: fx.Pointer,
+        batch: fx.Int32,
+        capacity: fx.Int32,
+        max_parts: fx.Int32,
+        window: fx.Int32,
+        cluster_info: fx.Pointer,
+        stream: fx.Stream,
+    ):
+        pa_decode_single_sequence_plan_kernel(
+            lengths, work, reduce_info, capacity, max_parts, window, cluster_info
         ).launch(grid=(1, 1, 1), block=(threads, 1, 1), stream=stream)
 
     return launch
