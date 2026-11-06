@@ -284,6 +284,19 @@ def _find_grouped_config(
     return chosen
 
 
+_SPLITK_SEMAPHORES: dict = {}
+
+
+def _splitk_semaphore(device, tiles: int):
+    """Zeroed per-tile arrival counters; the split-K kernel resets them itself."""
+    key = (str(device), int(tiles))
+    sem = _SPLITK_SEMAPHORES.get(key)
+    if sem is None:
+        sem = torch.zeros(max(1, int(tiles)), dtype=torch.int32, device=device)
+        _SPLITK_SEMAPHORES[key] = sem
+    return sem
+
+
 def _use_grouped_gemm_enabled() -> bool:
     env_enabled = os.environ.get("AITER_USE_GROUPED_GEMM", "0") in _TRUTHY_ENV
     is_gfx1250 = get_gfx() in ("gfx1250", "gfx1250-strict")
@@ -671,14 +684,37 @@ def _grouped_a8w4_tdm_moe(
     next_stage_prefetch=0,
     tdm_as_in_prologue=0,
     tdm_b_th=0,
+    tdm_b_th2=None,
     lds_soa_load_interleave=0,
+    lds_soa_load_interleave2=None,
+    force_mid_compute=0,
+    force_mid_compute2=0,
+    linear_wg_map=0,
+    linear_wg_map2=0,
+    reuse_persistent_map_loads=0,
+    reuse_persistent_map_loads2=0,
+    defer_output_store_wait=0,
+    defer_output_store_wait2=0,
+    gather_fuse_token_iters=0,  # grid = tokens, less workgroups. compute bound perf
+    gather_setprio=0,  # sparse grids get scheduled quicker
+    gather_batch_loads=0,  # batches helps prefill overlap bandwidth latency
+    lds_n_partitions=1,
+    lds_n_partitions2=1,
+    ds_first_n=-1,  # -1: kernel's per-shape IGLP default
+    ds_first_n2=-1,
+    mma_prio=0,
+    mma_prio2=0,
     rolled_drain=0,
     a_preshuffle=0,
     persistent_workers=0,
     persistent_workers2=0,
     k_waves1=1,
     k_waves2=1,
+    k_grid1=1,
     tiles_configured=False,
+    persistent_contiguous_tasks2=0,
+    packed_expert_map=0,
+    reuse_resident_b2=0,
     data_format="a8w4",
     expert_mask=None,
     num_local_tokens=None,
@@ -724,6 +760,8 @@ def _grouped_a8w4_tdm_moe(
         tile_k2 = tile_k
     if num_buffers2 is None:
         num_buffers2 = num_buffers
+    if tdm_b_th2 is None:
+        tdm_b_th2 = tdm_b_th
     if waves_per_tensor_tdm2 is None:
         waves_per_tensor_tdm2 = waves_per_tensor_tdm
     if m_warp2 is None:
@@ -737,6 +775,45 @@ def _grouped_a8w4_tdm_moe(
         # gains once its scatter epilogue runs on a narrower tile_m2. Blank
         # keeps gemm2 on gemm1's width, i.e. the historical behaviour.
         cluster_n2 = cluster_n
+    lds_soa_load_interleave2 = (
+        lds_soa_load_interleave
+        if lds_soa_load_interleave2 is None
+        else lds_soa_load_interleave2
+    )
+    _g1_lds_interleave = int(lds_soa_load_interleave)
+    _g2_lds_interleave = int(lds_soa_load_interleave2)
+    if _g1_lds_interleave not in (0, 1) or _g2_lds_interleave not in (0, 1):
+        raise ValueError("stage-specific LDS SoA interleave values must be 0 or 1")
+    if any(
+        value not in (0, 1)  # check if policy on
+        for value in (
+            force_mid_compute,
+            force_mid_compute2,
+            linear_wg_map,
+            linear_wg_map2,
+            reuse_persistent_map_loads,
+            reuse_persistent_map_loads2,
+            defer_output_store_wait,
+            defer_output_store_wait2,
+            gather_fuse_token_iters,
+            gather_setprio,
+            gather_batch_loads,
+            mma_prio,
+            mma_prio2,
+            persistent_contiguous_tasks2,
+            packed_expert_map,
+            reuse_resident_b2,
+        )
+    ):
+        raise ValueError("stage-specific pipeline and task-map values must be 0 or 1")
+    valid_lds_n_partitions = (1, 2, 4, 8)
+    if (
+        lds_n_partitions not in valid_lds_n_partitions
+        or lds_n_partitions2 not in valid_lds_n_partitions
+    ):
+        raise ValueError("stage-specific LDS N partitions must be 1, 2, 4, or 8")
+    if ds_first_n < -1 or ds_first_n2 < -1:
+        raise ValueError("stage-specific DS-first values must be nonnegative or -1")
     if _compact:
         # The plan padded every expert's row count up to this alignment, and its
         # psum is what the GEMM binary-searches as its m-tile map. A tile wider
@@ -784,6 +861,53 @@ def _grouped_a8w4_tdm_moe(
     wmma_rep = get_wmma_m_rep(tile_m, tile_n, m_warp, n_warp, "gemm1")
     wmma_rep2 = get_wmma_m_rep(tile_m2, tile_n2, m_warp2, n_warp2, "gemm2")
     _align_m = max(tile_m, tile_m2)
+    # Alignment-gap suppression is useful in decode, with fewer activated experts.
+    # Heuristic to check for how dense the routing is to determine decode vs prefill.
+    _routed_rows = int(token_num) * int(topk)
+    _routing_density = (_routed_rows + int(E) - 1) // int(E)
+    _sparse_routing = _routing_density <= _align_m
+    _stage1_m_alignment = _align_m if _sparse_routing else tile_m
+    _stage2_m_alignment = _align_m if _sparse_routing else tile_m2
+    # Handling for decode routing activating fewer experts than prefill.
+    # Skips excess padding tiles to avoid computations treating padding as
+    # computable rows and loading dead/unnecessary resources
+    _direct_expert_map = expert_mask is None and not _compact
+    # check policy conditions
+    _packed_expert_map = _direct_expert_map and bool(packed_expert_map)
+    _stage2_contiguous_tasks = (
+        bool(persistent_contiguous_tasks2) and not _sparse_routing
+    )
+    _stage2_reuse_resident_b = _stage2_contiguous_tasks and bool(reuse_resident_b2)
+    _sparse_row_cap = min(int(E), _routed_rows) * _align_m
+    _stage1_task_cap = (
+        (_sparse_row_cap + int(tile_m) - 1)
+        // int(tile_m)
+        * ((2 * int(inter_dim) + int(tile_n) - 1) // int(tile_n))
+    )
+    _stage2_task_cap = (
+        (_sparse_row_cap + int(tile_m2) - 1)
+        // int(tile_m2)
+        * ((int(model_dim) + int(tile_n2) - 1) // int(tile_n2))
+    )
+    k_grid1 = max(1, int(k_grid1 or 1))
+    if k_grid1 > 1:
+        # Split-K workgroups cooperate through a semaphore, not a cluster.
+        cluster_m = cluster_n = 1
+        _stage1_task_cap *= k_grid1
+    _stage1_single_task = (
+        _sparse_routing
+        and expert_mask is None
+        and not _compact
+        and not enable_ep_scatter
+        and int(persistent_workers) >= _stage1_task_cap
+    )
+    _stage2_single_task = (
+        _sparse_routing
+        and expert_mask is None
+        and not _compact
+        and not enable_ep_scatter
+        and int(persistent_workers2) >= _stage2_task_cap
+    )
     # Both GEMMs walk the same contiguous layout, each with its own tile height,
     # so every expert must start on a row that is a multiple of both. Aligning to
     # the larger tile only achieves that when it is a multiple of the smaller one.
@@ -844,6 +968,7 @@ def _grouped_a8w4_tdm_moe(
         and not _compact
         and not _is_ep
         and not enable_ep_scatter
+        and not _packed_expert_map
         and token_num * topk <= _FUSED_ROUTE_PSUM_MAX_NUMEL
         and int(E) <= _FUSED_ROUTE_PSUM_MAX_EXPERTS
     )
@@ -978,6 +1103,7 @@ def _grouped_a8w4_tdm_moe(
         and os.environ.get("AITER_TDM_FUSE_PSUM_QUANT", "1") in ("1", "true", "True")
     )
     ep_psum_params = None
+    _m_expert_tile_map = None
     if _compact:
         psum = stage2_scatter.compact_psum
     elif _fuse_ep_route_quant:
@@ -985,8 +1111,20 @@ def _grouped_a8w4_tdm_moe(
     elif herd_psum is not None:
         psum = herd_psum
     elif _fused_tp_route:
-        _masked_m, topids_to_rows, psum = fused_route_psum_remap(
-            topk_ids, E, max_m, _align_m
+        # masked_m/starts are not read on this path; AITER_TDM_FUSED_ROUTE_EMIT_AUX=1
+        # writes them anyway for debugging.
+        emit_route_aux = os.environ.get("AITER_TDM_FUSED_ROUTE_EMIT_AUX", "0") in (
+            "1",
+            "true",
+            "True",
+        )
+        _masked_m, topids_to_rows, psum, _m_expert_tile_map = fused_route_psum_remap(
+            topk_ids,
+            E,
+            max_m,
+            _align_m,
+            expert_tile_m=min(tile_m, tile_m2),
+            emit_aux=emit_route_aux,
         )
     elif _fuse_psum_quant:
         # The remapper's scan and ep_rowmap scatter ride the quant kernel:
@@ -1012,18 +1150,22 @@ def _grouped_a8w4_tdm_moe(
         # _align_m, not tile_m: gemm2 may tile M more coarsely than gemm1, and a
         # start aligned only to tile_m would let a gemm2 tile cross an expert
         # boundary (see the divisibility check above).
-        _starts, psum, _ = contiguous_psum_remap(
+        _starts, psum, _, _m_expert_tile_map = contiguous_psum_remap(
             _masked_m,
             topids_to_rows,
             E,
             max_m,
             _align_m,
+            expert_tile_m=(min(tile_m, tile_m2) if _direct_expert_map else None),
+            packed_expert_map=_packed_expert_map,
             num_valid_routes=_ep_nvr,
             ep_scatter_params=ep_scatter_params,
             row_to_token=_apre_row_to_token,
             topk=int(topk),
         )
         psum = psum.to(torch.int32).contiguous()
+    if _compact or _fuse_ep_route_quant or _fuse_psum_quant:
+        _m_expert_tile_map = None
     # Turns the TDM GEMM2 epilogue into the fused P2P scatter-combine.
     _ep_gemm2_kwargs = (
         {
@@ -1212,6 +1354,22 @@ def _grouped_a8w4_tdm_moe(
     )
     _fuse_quant = not disable_gemm1_requant
     w1_u8 = _grouped_weight_uint8(w1)
+    _kg_kw = (
+        {
+            "k_grid": k_grid1,
+            "splitk_ws": torch.empty(
+                (k_grid1, contiguous_m, 2 * inter_dim),
+                dtype=torch.float32,
+                device=device,
+            ),
+            "splitk_sem": _splitk_semaphore(
+                device,
+                (contiguous_m // tile_m) * ((2 * inter_dim + tile_n - 1) // tile_n),
+            ),
+        }
+        if k_grid1 > 1
+        else {}
+    )
     w1s_i32 = w1_scale.reshape(-1).view(torch.int32)
 
     if _fuse_quant:
@@ -1260,19 +1418,32 @@ def _grouped_a8w4_tdm_moe(
             bias=_b1,
             swiglu_limit=sl,
             num_buffers=num_buffers,
+            force_mid_compute=force_mid_compute,
+            linear_wg_map=linear_wg_map,
+            reuse_persistent_map_loads=reuse_persistent_map_loads,
+            defer_output_store_wait=defer_output_store_wait,
+            lds_n_partitions=lds_n_partitions,
+            ds_first_n=ds_first_n,
+            mma_prio=mma_prio,
             stage1_quant_out=1,
             quant_scale=a2_scale,
             quant_wmma_rep=wmma_rep2,
             persistent_workers=persistent_workers,
+            persistent_single_task=int(_stage1_single_task),
+            m_alignment=_stage1_m_alignment,
+            m_expert_tile_map=_m_expert_tile_map,
+            expert_tile_m=min(tile_m, tile_m2),
+            packed_expert_map=int(_packed_expert_map),
             cluster_m=cluster_m,
             cluster_n=cluster_n,
             waves_per_tensor_tdm=waves_per_tensor_tdm,
             next_stage_prefetch=next_stage_prefetch,
             tdm_as_in_prologue=tdm_as_in_prologue,
             tdm_b_th=tdm_b_th,
-            lds_soa_load_interleave=lds_soa_load_interleave,
+            lds_soa_load_interleave=_g1_lds_interleave,
             rolled_drain=rolled_drain,
             k_waves=k_waves1,
+            **_kg_kw,
             row_major_ascale=int(_row_major_ascale),
             a_row_stride_bytes=_a1_wire_stride,
             a_scale_row_stride_bytes=_a1_wire_stride,
@@ -1304,16 +1475,29 @@ def _grouped_a8w4_tdm_moe(
             bias=_b1,
             swiglu_limit=sl,
             num_buffers=num_buffers,
+            force_mid_compute=force_mid_compute,
+            linear_wg_map=linear_wg_map,
+            reuse_persistent_map_loads=reuse_persistent_map_loads,
+            defer_output_store_wait=defer_output_store_wait,
+            lds_n_partitions=lds_n_partitions,
+            ds_first_n=ds_first_n,
+            mma_prio=mma_prio,
             persistent_workers=persistent_workers,
+            persistent_single_task=int(_stage1_single_task),
+            m_alignment=_stage1_m_alignment,
+            m_expert_tile_map=_m_expert_tile_map,
+            expert_tile_m=min(tile_m, tile_m2),
+            packed_expert_map=int(_packed_expert_map),
             cluster_m=cluster_m,
             cluster_n=cluster_n,
             waves_per_tensor_tdm=waves_per_tensor_tdm,
             next_stage_prefetch=next_stage_prefetch,
             tdm_as_in_prologue=tdm_as_in_prologue,
             tdm_b_th=tdm_b_th,
-            lds_soa_load_interleave=lds_soa_load_interleave,
+            lds_soa_load_interleave=_g1_lds_interleave,
             rolled_drain=rolled_drain,
             k_waves=k_waves1,
+            **_kg_kw,
             row_major_ascale=int(_row_major_ascale),
             a_row_stride_bytes=_a1_wire_stride,
             a_scale_row_stride_bytes=_a1_wire_stride,
@@ -1356,13 +1540,27 @@ def _grouped_a8w4_tdm_moe(
         bias=_b2,
         num_buffers=num_buffers2,
         persistent_workers=persistent_workers2,
+        persistent_single_task=int(_stage2_single_task),
+        force_mid_compute=force_mid_compute2,
+        linear_wg_map=linear_wg_map2,
+        persistent_contiguous_chunks=int(_stage2_contiguous_tasks),
+        reuse_resident_b=int(_stage2_reuse_resident_b),
+        reuse_persistent_map_loads=reuse_persistent_map_loads2,
+        defer_output_store_wait=defer_output_store_wait2,
+        lds_n_partitions=lds_n_partitions2,
+        ds_first_n=ds_first_n2,
+        mma_prio=mma_prio2,
+        m_alignment=_stage2_m_alignment,
+        m_expert_tile_map=_m_expert_tile_map,
+        expert_tile_m=min(tile_m, tile_m2),
+        packed_expert_map=int(_packed_expert_map),
         cluster_m=cluster_m2,
         cluster_n=cluster_n2,
         waves_per_tensor_tdm=waves_per_tensor_tdm2,
         next_stage_prefetch=next_stage_prefetch,
         tdm_as_in_prologue=tdm_as_in_prologue,
-        tdm_b_th=tdm_b_th,
-        lds_soa_load_interleave=lds_soa_load_interleave,
+        tdm_b_th=tdm_b_th2,
+        lds_soa_load_interleave=_g2_lds_interleave,
         rolled_drain=rolled_drain,
         k_waves=k_waves2,
         **_ep_gemm2_kwargs,
@@ -1439,20 +1637,33 @@ def _grouped_a8w4_tdm_moe(
                         bias=_b1,
                         swiglu_limit=sl,
                         num_buffers=num_buffers,
+                        force_mid_compute=force_mid_compute,
+                        linear_wg_map=linear_wg_map,
+                        reuse_persistent_map_loads=reuse_persistent_map_loads,
+                        defer_output_store_wait=defer_output_store_wait,
+                        lds_n_partitions=lds_n_partitions,
+                        ds_first_n=ds_first_n,
+                        mma_prio=mma_prio,
                         stage1_quant_out=1,
                         quant_scale=a2_scale,
                         quant_wmma_rep=wmma_rep2,
                         persistent_workers=persistent_workers,
+                        persistent_single_task=int(_stage1_single_task),
+                        m_alignment=_stage1_m_alignment,
+                        m_expert_tile_map=_m_expert_tile_map,
+                        expert_tile_m=min(tile_m, tile_m2),
+                        packed_expert_map=int(_packed_expert_map),
                         cluster_m=cluster_m,
                         cluster_n=cluster_n,
                         waves_per_tensor_tdm=waves_per_tensor_tdm,
                         next_stage_prefetch=next_stage_prefetch,
                         tdm_as_in_prologue=tdm_as_in_prologue,
                         tdm_b_th=tdm_b_th,
-                        lds_soa_load_interleave=lds_soa_load_interleave,
+                        lds_soa_load_interleave=_g1_lds_interleave,
                         row_major_ascale=int(_row_major_ascale),
                         rolled_drain=rolled_drain,
                         k_waves=k_waves1,
+                        **_kg_kw,
                         **_situ_kw,
                     ),
                 )
@@ -1485,17 +1696,30 @@ def _grouped_a8w4_tdm_moe(
                         bias=_b1,
                         swiglu_limit=sl,
                         num_buffers=num_buffers,
+                        force_mid_compute=force_mid_compute,
+                        linear_wg_map=linear_wg_map,
+                        reuse_persistent_map_loads=reuse_persistent_map_loads,
+                        defer_output_store_wait=defer_output_store_wait,
+                        lds_n_partitions=lds_n_partitions,
+                        ds_first_n=ds_first_n,
+                        mma_prio=mma_prio,
                         persistent_workers=persistent_workers,
+                        persistent_single_task=int(_stage1_single_task),
+                        m_alignment=_stage1_m_alignment,
+                        m_expert_tile_map=_m_expert_tile_map,
+                        expert_tile_m=min(tile_m, tile_m2),
+                        packed_expert_map=int(_packed_expert_map),
                         cluster_m=cluster_m,
                         cluster_n=cluster_n,
                         waves_per_tensor_tdm=waves_per_tensor_tdm,
                         next_stage_prefetch=next_stage_prefetch,
                         tdm_as_in_prologue=tdm_as_in_prologue,
                         tdm_b_th=tdm_b_th,
-                        lds_soa_load_interleave=lds_soa_load_interleave,
+                        lds_soa_load_interleave=_g1_lds_interleave,
                         row_major_ascale=int(_row_major_ascale),
                         rolled_drain=rolled_drain,
                         k_waves=k_waves1,
+                        **_kg_kw,
                         **_situ_kw,
                     ),
                 )
@@ -1527,13 +1751,27 @@ def _grouped_a8w4_tdm_moe(
                     bias=_b2,
                     num_buffers=num_buffers2,
                     persistent_workers=persistent_workers2,
+                    persistent_single_task=int(_stage2_single_task),
+                    force_mid_compute=force_mid_compute2,
+                    linear_wg_map=linear_wg_map2,
+                    persistent_contiguous_chunks=int(_stage2_contiguous_tasks),
+                    reuse_resident_b=int(_stage2_reuse_resident_b),
+                    reuse_persistent_map_loads=reuse_persistent_map_loads2,
+                    defer_output_store_wait=defer_output_store_wait2,
+                    lds_n_partitions=lds_n_partitions2,
+                    ds_first_n=ds_first_n2,
+                    mma_prio=mma_prio2,
+                    m_alignment=_stage2_m_alignment,
+                    m_expert_tile_map=_m_expert_tile_map,
+                    expert_tile_m=min(tile_m, tile_m2),
+                    packed_expert_map=int(_packed_expert_map),
                     cluster_m=cluster_m2,
                     cluster_n=cluster_n2,
                     waves_per_tensor_tdm=waves_per_tensor_tdm2,
                     next_stage_prefetch=next_stage_prefetch,
                     tdm_as_in_prologue=tdm_as_in_prologue,
-                    tdm_b_th=tdm_b_th,
-                    lds_soa_load_interleave=lds_soa_load_interleave,
+                    tdm_b_th=tdm_b_th2,
+                    lds_soa_load_interleave=_g2_lds_interleave,
                     rolled_drain=rolled_drain,
                     k_waves=k_waves2,
                 ),
@@ -1571,6 +1809,9 @@ def _grouped_a8w4_tdm_moe(
         gather_w,
         out=moe_out,
         num_valid_tokens=(_ep_nvt if _is_ep else None),
+        fuse_token_iters=bool(gather_fuse_token_iters),
+        setprio=bool(gather_setprio),
+        batch_loads=bool(gather_batch_loads),
     )
     return moe_out
 
@@ -1840,15 +2081,62 @@ def grouped_gemm_gfx1250_a8w4(
                 cfg_row.get("tdm_as_in_prologue"), 0
             )
             _tdm_kw["tdm_b_th"] = _as_int(cfg_row.get("tdm_b_th"), 0)
-            _tdm_kw["lds_soa_load_interleave"] = _as_int(
-                cfg_row.get("lds_soa_load_interleave"), 0
+            _tdm_kw["tdm_b_th2"] = _as_int(
+                cfg_row.get("tdm_b_th2"), _tdm_kw["tdm_b_th"]
             )
+            shared_lds_interleave = _as_int(cfg_row.get("lds_soa_load_interleave"), 0)
+            _tdm_kw["lds_soa_load_interleave"] = _as_int(
+                cfg_row.get("lds_soa_load_interleave1"), shared_lds_interleave
+            )
+            _tdm_kw["lds_soa_load_interleave2"] = _as_int(
+                cfg_row.get("lds_soa_load_interleave2"), shared_lds_interleave
+            )
+            _tdm_kw["force_mid_compute"] = _as_int(cfg_row.get("force_mid_compute1"), 0)
+            _tdm_kw["force_mid_compute2"] = _as_int(
+                cfg_row.get("force_mid_compute2"), 0
+            )
+            _tdm_kw["linear_wg_map"] = _as_int(cfg_row.get("linear_wg_map1"), 0)
+            _tdm_kw["linear_wg_map2"] = _as_int(cfg_row.get("linear_wg_map2"), 0)
+            _tdm_kw["reuse_persistent_map_loads"] = _as_int(
+                cfg_row.get("reuse_persistent_map_loads1"), 0
+            )
+            _tdm_kw["reuse_persistent_map_loads2"] = _as_int(
+                cfg_row.get("reuse_persistent_map_loads2"), 0
+            )
+            _tdm_kw["defer_output_store_wait"] = _as_int(
+                cfg_row.get("defer_output_store_wait1"), 0
+            )
+            _tdm_kw["defer_output_store_wait2"] = _as_int(
+                cfg_row.get("defer_output_store_wait2"), 0
+            )
+            _tdm_kw["gather_fuse_token_iters"] = _as_int(
+                cfg_row.get("gather_fuse_token_iters"), 0
+            )
+            _tdm_kw["gather_setprio"] = _as_int(
+                cfg_row.get("gather_setprio"),
+                int(token_num <= 128),
+            )
+            _tdm_kw["gather_batch_loads"] = _as_int(
+                cfg_row.get("gather_batch_loads"), int(token_num >= 8192)
+            )
+            _tdm_kw["lds_n_partitions"] = _as_int(cfg_row.get("lds_n_partitions1"), 1)
+            _tdm_kw["lds_n_partitions2"] = _as_int(cfg_row.get("lds_n_partitions2"), 1)
+            _tdm_kw["ds_first_n"] = _as_int(cfg_row.get("ds_first_n1"), -1)
+            _tdm_kw["ds_first_n2"] = _as_int(cfg_row.get("ds_first_n2"), -1)
+            _tdm_kw["mma_prio"] = _as_int(cfg_row.get("mma_prio1"), 0)
+            _tdm_kw["mma_prio2"] = _as_int(cfg_row.get("mma_prio2"), 0)
+            _tdm_kw["persistent_contiguous_tasks2"] = _as_int(
+                cfg_row.get("persistent_contiguous_tasks2"), 0
+            )
+            _tdm_kw["packed_expert_map"] = _as_int(cfg_row.get("packed_expert_map"), 0)
+            _tdm_kw["reuse_resident_b2"] = _as_int(cfg_row.get("reuse_resident_b2"), 0)
             _tdm_kw["rolled_drain"] = _as_int(cfg_row.get("rolled_drain"), 0)
             # split_k1/split_k2 split each GEMM's K across that many wave groups
             # inside one workgroup (k_waves); the grid stays the same. Blank or 0
             # (the model_configs/ merge fills a column an older table lacks with
             # 0) means unset, i.e. no split.
             _tdm_kw["k_waves1"] = max(1, _as_int(cfg_row.get("split_k1"), 1))
+            _tdm_kw["k_grid1"] = max(1, _as_int(cfg_row.get("k_grid1"), 1))
             _tdm_kw["k_waves2"] = max(1, _as_int(cfg_row.get("split_k2"), 1))
             # Follow the matched CSV bucket, including padded token counts
             # (for example, 6144 -> 8192), just like the other kernel knobs.
@@ -1882,6 +2170,8 @@ def grouped_gemm_gfx1250_a8w4(
         _ov_n2 = _tdm_env("AITER_TDM_TILE_N2")
         _ov_k2 = _tdm_env("AITER_TDM_TILE_K2")
         _ov_nb2 = _tdm_env("AITER_TDM_NUM_BUFFERS2")
+        _ov_bth1 = _tdm_env("AITER_TDM_B_TH1")
+        _ov_bth2 = _tdm_env("AITER_TDM_B_TH2")
         if any(
             v is not None
             for v in (_ov_m, _ov_n, _ov_k, _ov_nb, _ov_m2, _ov_n2, _ov_k2, _ov_nb2)
@@ -1907,6 +2197,10 @@ def grouped_gemm_gfx1250_a8w4(
             _tdm_kw["tile_n2"] = _ov_n2 if _ov_n2 is not None else _base_n
             _tdm_kw["tile_k2"] = _ov_k2 if _ov_k2 is not None else _base_k
             _tdm_kw["num_buffers2"] = _ov_nb2 if _ov_nb2 is not None else _base_nb
+        if _ov_bth1 is not None:
+            _tdm_kw["tdm_b_th"] = _ov_bth1
+        if _ov_bth2 is not None:
+            _tdm_kw["tdm_b_th2"] = _ov_bth2
 
         # Wave grid overrides, same stage1 -> stage2 fallback as the tiles above.
         _ov_mw = _tdm_env("AITER_TDM_M_WARP")
@@ -1975,6 +2269,11 @@ def _get_compiled_gather_reduce(
     split_k: int = 1,
     vec_dwords: int = 2,
     w_dtype: str = "f32",
+    block_threads: int = 256,
+    fuse_token_iters: bool = False,
+    setprio: bool = False,
+    batch_loads: bool = False,
+    wave_metadata: bool = False,
 ):
     """Compile and cache the one-pass MoE gather-reduce kernel."""
     from aiter.ops.flydsl.kernels.moe_gather_reduce import (
@@ -1982,7 +2281,17 @@ def _get_compiled_gather_reduce(
     )
 
     return build_moe_gather_reduce_module(
-        model_dim, topk, out_dtype, split_k, vec_dwords, w_dtype
+        model_dim,
+        topk,
+        out_dtype,
+        split_k,
+        vec_dwords,
+        w_dtype,
+        block_threads,
+        fuse_token_iters,
+        setprio,
+        batch_loads,
+        wave_metadata,
     )
 
 
@@ -2012,23 +2321,23 @@ def _get_compiled_contiguous_psum():
 
 
 @functools.cache
-def _get_compiled_contiguous_psum_remap():
+def _get_compiled_contiguous_psum_remap(packed_expert_map: bool = False):
     """Compile and cache the contiguous prefix-sum + row-remap kernel."""
     from aiter.ops.flydsl.kernels.moe_contiguous_psum import (
         build_moe_contiguous_psum_remap_module,
     )
 
-    return build_moe_contiguous_psum_remap_module()
+    return build_moe_contiguous_psum_remap_module(packed_expert_map)
 
 
 @functools.cache
-def _get_compiled_route_psum_fused():
+def _get_compiled_route_psum_fused(emit_aux: bool = True):
     """Compile and cache the single-TG fused route+atomic+psum+remap kernel."""
     from aiter.ops.flydsl.kernels.moe_contiguous_psum import (
         build_moe_route_psum_fused_module,
     )
 
-    return build_moe_route_psum_fused_module()
+    return build_moe_route_psum_fused_module(emit_aux)
 
 
 # One workgroup handles every route. NUMEL is advisory -- the route sweep is
@@ -2045,12 +2354,14 @@ def fused_route_psum_remap(
     experts: int,
     max_m: int,
     tile_m: int,
+    expert_tile_m: int | None = None,  # custom tile size for experts
+    emit_aux: bool = True,
 ):
     """Single-launch route+atomic+psum+remap for small token counts.
 
     Equivalent to ``flydsl_moe_topids_to_rows`` followed by
     ``contiguous_psum_remap``, but fused into one workgroup. Returns
-    (masked_m, topids_to_rows[token_num, topk], psum).
+    (masked_m, topids_to_rows[token_num, topk], psum, expert_tile_map).
     """
     device = topk_ids.device
     token_num, topk = topk_ids.shape
@@ -2067,10 +2378,20 @@ def fused_route_psum_remap(
             f"use flydsl_moe_topids_to_rows + contiguous_psum_remap instead"
         )
     topids_to_rows = torch.empty(numel, dtype=torch.int32, device=device)
-    masked_m = torch.empty(experts, dtype=torch.int32, device=device)
-    starts = torch.empty(experts, dtype=torch.int32, device=device)
+    masked_m = torch.empty(experts if emit_aux else 0, dtype=torch.int32, device=device)
+    starts = torch.empty(experts if emit_aux else 0, dtype=torch.int32, device=device)
     psum = torch.empty(experts, dtype=torch.int32, device=device)
-    launch = _get_compiled_route_psum_fused()
+    expert_tile_map = (
+        torch.empty(
+            (numel + experts * int(tile_m) + int(expert_tile_m) - 1)
+            // int(expert_tile_m),
+            dtype=torch.int32,
+            device=device,
+        )
+        if expert_tile_m is not None
+        else torch.empty(0, dtype=torch.int32, device=device)
+    )
+    launch = _get_compiled_route_psum_fused(emit_aux)
     _run_compiled(
         launch,
         ptr_arg(topk_ids.to(torch.int32).reshape(-1)),
@@ -2078,13 +2399,20 @@ def fused_route_psum_remap(
         ptr_arg(masked_m),
         ptr_arg(starts),
         ptr_arg(psum),
+        ptr_arg(expert_tile_map),
         int(numel),
         experts,
         int(max_m),
         int(tile_m),
+        int(expert_tile_m or tile_m),
         current_stream_arg(),
     )
-    return masked_m, topids_to_rows.view(token_num, topk), psum
+    return (
+        masked_m if emit_aux else None,
+        topids_to_rows.view(token_num, topk),
+        psum,
+        expert_tile_map if expert_tile_m is not None else None,
+    )
 
 
 @functools.cache
@@ -2196,6 +2524,8 @@ def contiguous_psum_remap(
     experts: int,
     route_max_m: int,
     tile_m: int,
+    expert_tile_m: int | None = None,
+    packed_expert_map: bool = False,
     num_valid_routes: torch.Tensor | None = None,
     ep_scatter_params: dict | None = None,
     row_to_token: torch.Tensor | None = None,
@@ -2214,6 +2544,16 @@ def contiguous_psum_remap(
     psum = torch.empty(experts, dtype=torch.int32, device=device)
     contiguous_m_t = torch.empty(1, dtype=torch.int32, device=device)
     topids_flat = topids_to_rows.reshape(-1)
+    expert_tile_map = (
+        torch.empty(
+            (int(topids_flat.numel()) + experts * int(tile_m) + int(expert_tile_m) - 1)
+            // int(expert_tile_m),
+            dtype=torch.int64 if packed_expert_map else torch.int32,
+            device=device,
+        )
+        if expert_tile_m is not None
+        else None
+    )
     # Only remap the valid routes; dead-tail rows are unwritten and must not be
     # used as a row index. Default (no truncation) covers every route.
     if num_valid_routes is None:
@@ -2255,14 +2595,14 @@ def contiguous_psum_remap(
             ptr_arg(row_to_token_i32),
             current_stream_arg(),
         )
-        return starts, psum, contiguous_m_t
+        return starts, psum, contiguous_m_t, None
     from aiter.ops.flydsl.kernels.moe_contiguous_psum import MAX_REMAP_EXPERTS
 
     assert experts <= MAX_REMAP_EXPERTS, (
         f"contiguous_psum_remap holds one start per expert in LDS: "
         f"experts={experts} exceeds MAX_REMAP_EXPERTS={MAX_REMAP_EXPERTS}"
     )
-    launch = _get_compiled_contiguous_psum_remap()
+    launch = _get_compiled_contiguous_psum_remap(bool(packed_expert_map))
     _run_compiled(
         launch,
         ptr_arg(masked_m_i32),
@@ -2270,16 +2610,22 @@ def contiguous_psum_remap(
         ptr_arg(starts),
         ptr_arg(psum),
         ptr_arg(contiguous_m_t),
+        ptr_arg(
+            expert_tile_map
+            if expert_tile_map is not None
+            else torch.empty(0, dtype=torch.int32, device=device)
+        ),
         int(topids_flat.numel()),
         experts,
         int(route_max_m),
         int(tile_m),
+        int(expert_tile_m or tile_m),
         ptr_arg(num_valid_routes_i32),
         ptr_arg(row_to_token_i32),
         int(topk),
         current_stream_arg(),
     )
-    return starts, psum, contiguous_m_t
+    return starts, psum, contiguous_m_t, expert_tile_map
 
 
 def build_route_maps(topk_ids: torch.Tensor, E: int, max_m: int):
@@ -2317,6 +2663,9 @@ def flydsl_moe_gather_reduce(
     num_valid_tokens: (
         torch.Tensor | None
     ) = None,  # (1,) int32; skip output tokens >= this (EP dead-tail)
+    fuse_token_iters: bool = False,
+    setprio: bool = False,
+    batch_loads: bool = False,
 ) -> torch.Tensor:
     """One-pass gather-reduce: out[t] = sum_k w[t,k] * grouped[topids_to_rows[t,k]].
 
@@ -2356,8 +2705,28 @@ def flydsl_moe_gather_reduce(
         )
 
     gather_vec = _choose_gather_reduce_vec(token_num, model_dim)
+    gather_threads = int(
+        os.environ.get(
+            "AITER_FLYDSL_GATHER_REDUCE_THREADS",
+            "512" if token_num >= 8192 else "256",
+        )
+    )
+    wave_metadata = os.environ.get(
+        "AITER_FLYDSL_GATHER_WAVE_METADATA",
+        "1" if token_num == 128 else "0",
+    ) in ("1", "true", "True")
     launch = _get_compiled_gather_reduce(
-        model_dim, topk, out_dtype, split_k, gather_vec, w_dtype
+        model_dim,
+        topk,
+        out_dtype,
+        split_k,
+        gather_vec,
+        w_dtype,
+        gather_threads,
+        bool(fuse_token_iters),
+        bool(setprio),
+        bool(batch_loads),
+        wave_metadata,
     )
     slice_stride_dw = E * max_m * (model_dim // 2)
     # Skip dead-tail output tokens whose route map is unwritten. Default (no
