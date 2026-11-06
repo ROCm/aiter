@@ -840,6 +840,21 @@ def arch_branch(archs, dispatch):
     return f"\n    if ({condition})\n    {{{dispatch}    }}\n"
 
 
+def write_if_changed(path, text):
+    """Write text to path unless path already holds it.
+
+    JIT builds reuse the codegen directory and an instance's arch guard depends
+    on GPU_ARCHS, so an existing file can be stale. An unchanged file keeps its
+    mtime, so ninja doesn't recompile it.
+    """
+    if os.path.exists(path):
+        with open(path) as f:
+            if f.read() == text:
+                return
+    with open(path, "w") as f:
+        f.write(text)
+
+
 def generate_instance_and_lookUpTable_head(working_path):
     f_lookUpTable = os.path.join(working_path, "gemm_moe_ck2stages_lookup.h")
     if os.path.exists(f_lookUpTable):
@@ -974,41 +989,37 @@ class ck_moe_2stage_gemm_codegen:
                 gemm1_fp32 = (
                     self.splitk and (kernel.stage == 1) and (quanttype == "_blockscale")
                 )
-                if not os.path.exists(f_instance):
-                    with open(f_instance, "a") as f_ins:
-                        stage_instance = STG_INSTANCE_IMPL.format(
-                            quanttype=quanttype,
-                            A0DataType=self.a_dtype,
-                            B0DataType=self.b_dtype,
-                            AccDataType="F32" if self.a_dtype != "I8" else "I32",
-                            EDataType="F32" if gemm1_fp32 else self.c_dtype,
-                            CDEElementOp=kernel.CDEElementOp,
-                            Nswizzle=str(self.nswizzle).lower(),
-                            Quant=self.quant_type,
-                            ActOP=(
-                                ACT_OP_MAP[self.activation] if kernel.stage == 1 else 0
-                            ),
-                            Stage=kernel.stage,
-                            BlockSize=kernel.BLOCK_SIZE,
-                            MPerBlock=kernel.MPerBlock,
-                            NPerBlock=kernel.NPerBlock,
-                            KPerBlock=kernel.KPerBlock,
-                            MWaves=kernel.MWaves,
-                            NWaves=kernel.NWaves,
-                            PipelineVer=kernel.GemmPipelineVersion,
-                            MulRoutedWeight=str(
-                                self.mul_routed_weight_stage == kernel.stage
-                            ).lower(),
-                        )
-                        if "FP4" in self.b_dtype:
-                            stage_instance = (
-                                "#ifndef __gfx942__\n" + stage_instance + "\n#endif\n"
-                            )
-                        if kernel.name in instance_archs:
-                            stage_instance = arch_guard(
-                                sorted(instance_archs[kernel.name]), stage_instance
-                            )
-                        f_ins.write(stage_instance)
+                stage_instance = STG_INSTANCE_IMPL.format(
+                    quanttype=quanttype,
+                    A0DataType=self.a_dtype,
+                    B0DataType=self.b_dtype,
+                    AccDataType="F32" if self.a_dtype != "I8" else "I32",
+                    EDataType="F32" if gemm1_fp32 else self.c_dtype,
+                    CDEElementOp=kernel.CDEElementOp,
+                    Nswizzle=str(self.nswizzle).lower(),
+                    Quant=self.quant_type,
+                    ActOP=ACT_OP_MAP[self.activation] if kernel.stage == 1 else 0,
+                    Stage=kernel.stage,
+                    BlockSize=kernel.BLOCK_SIZE,
+                    MPerBlock=kernel.MPerBlock,
+                    NPerBlock=kernel.NPerBlock,
+                    KPerBlock=kernel.KPerBlock,
+                    MWaves=kernel.MWaves,
+                    NWaves=kernel.NWaves,
+                    PipelineVer=kernel.GemmPipelineVersion,
+                    MulRoutedWeight=str(
+                        self.mul_routed_weight_stage == kernel.stage
+                    ).lower(),
+                )
+                if "FP4" in self.b_dtype:
+                    stage_instance = (
+                        "#ifndef __gfx942__\n" + stage_instance + "\n#endif\n"
+                    )
+                if kernel.name in instance_archs:
+                    stage_instance = arch_guard(
+                        sorted(instance_archs[kernel.name]), stage_instance
+                    )
+                write_if_changed(f_instance, stage_instance)
 
                 ## generate lookUpTable
                 lookup_ele = LOOKUP_template.format(

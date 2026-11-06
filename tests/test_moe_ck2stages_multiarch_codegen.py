@@ -35,7 +35,7 @@ HEADS = {
 
 
 def generate(out, args, gpu_archs):
-    out.mkdir(parents=True)
+    out.mkdir(parents=True, exist_ok=True)
     subprocess.run(
         [
             sys.executable,
@@ -99,6 +99,24 @@ def test_table_shared_by_all_archs_is_generated_as_for_one(tmp_path):
     )
     for file in files:
         assert (multi / file).read_text() == (single / file).read_text()
+
+
+def test_regenerating_in_a_used_directory_rewrites_only_changed_instances(tmp_path):
+    # A JIT build regenerates a module's sources where its last build left them.
+    args = CONFIGS["bf16"][0]
+    out = generate(tmp_path / "out", args, ";".join(ARCHS))
+    before = {
+        path.stem: (path.read_text(), path.stat().st_mtime_ns)
+        for path in (out / "instances").glob("*.cu")
+    }
+    generate(out, args, "gfx90a")
+    fresh = instances(generate(tmp_path / "fresh", args, "gfx90a"))
+    assert any(before[name][0] != text for name, text in fresh.items())
+    for name, text in fresh.items():
+        path = out / "instances" / f"{name}.cu"
+        assert path.read_text() == text, name
+        if before[name][0] == text:
+            assert path.stat().st_mtime_ns == before[name][1], name
 
 
 def test_native_entry_of_an_arch_list_is_the_build_gpu(monkeypatch):

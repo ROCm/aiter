@@ -160,6 +160,7 @@ void ck_moe_stage2(torch::Tensor &inter_states,      // [m, k], input token
                    bool is_shuffled = true)
 {
     // std::cerr << __FILE__ << ":" << __LINE__ << " ck_moe_stage2 called!" << nt << " " << block_m.value() << std::endl;
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(out));
     TORCH_CHECK(out.dtype() == at::ScalarType::BFloat16 || out.dtype() == at::ScalarType::Half,
                 "Out dtype only support BFloat16/Float16!")
 
