@@ -1874,8 +1874,10 @@ class Gfx1250Pipeline:
                         elif const_expr(t.packed_lds):
                             a = self.mem.packed_k_operand(kv_off, n, d)
                         elif const_expr(t.bf16_page16_packed):
+                            # Token tile n of the wave is its page n.
                             a = self.mem.bf16_k_operand(
-                                kv_off + ctx.warp * t.head_dim * 32,
+                                kv_off
+                                + (ctx.warp * (t.TOKENS // 64) + n) * t.head_dim * 32,
                                 0,
                                 d * qk_k,
                                 ctx.lane16,

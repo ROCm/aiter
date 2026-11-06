@@ -1166,58 +1166,69 @@ class Gfx1250Memory:
 
     @flyc.jit
     def stage_bf16_page16(self, token_base, kv_off, full_tile):
-        """Keep each wave's BF16 page packed and zero-fill invalid tokens."""
+        """Keep each wave's BF16 pages packed and zero-fill invalid tokens.
+
+        A stage of TOKENS tokens gives wave w pages TOKENS // 64 * w onward,
+        stored page-major.
+        """
         ctx, t = self.ctx, self.t
-        absolute = token_base + ctx.warp * 16
-        safe = (
-            absolute
-            if full_tile
-            else (absolute < ctx.planned_context).select(absolute, fx.Int32(0))
-        )
+        per_wave = t.TOKENS // 64
         table = fx.recast_iter(fx.Int32, ctx.block_tables_ptr)
-        page = fx.Int32(table[ctx.planned_seq * ctx.max_blocks_per_seq + safe // 16])
-        off = (fx.Int64(page) * ctx.n_kv + ctx.kv_h) * t.head_dim * 16
-        valid = fx.max(
-            fx.Int32(0), fx.min(fx.Int32(16), ctx.planned_context - absolute)
-        )
-        self.tdm_copy(
-            ctx.key_cache_ptr,
-            off,
-            kv_off + ctx.warp * t.head_dim * 32,
-            (t.head_dim // 8, 16, 8),
-            (128, 8, 1),
-            (None, None, None) if full_tile else (None, valid, None),
-            8,
-            8,
-        )
-        if const_expr(full_tile):
+        for j in range_constexpr(per_wave):
+            slot = ctx.warp * per_wave + j
+            absolute = token_base + slot * 16
+            safe = (
+                absolute
+                if full_tile
+                else (absolute < ctx.planned_context).select(absolute, fx.Int32(0))
+            )
+            page = fx.Int32(
+                table[ctx.planned_seq * ctx.max_blocks_per_seq + safe // 16]
+            )
+            off = (fx.Int64(page) * ctx.n_kv + ctx.kv_h) * t.head_dim * 16
+            valid = fx.max(
+                fx.Int32(0), fx.min(fx.Int32(16), ctx.planned_context - absolute)
+            )
             self.tdm_copy(
-                ctx.value_cache_ptr,
+                ctx.key_cache_ptr,
                 off,
-                kv_off + t.k_bytes + ctx.warp * t.head_dim * 32,
-                (t.head_dim * 16,),
-                (1,),
-                (None,),
+                kv_off + slot * t.head_dim * 32,
+                (t.head_dim // 8, 16, 8),
+                (128, 8, 1),
+                (None, None, None) if full_tile else (None, valid, None),
                 8,
                 8,
             )
-        else:
-            # V packs eight tokens per dimension; mask inside each chunk.
-            for chunk in range_constexpr(2):
-                count = fx.max(fx.Int32(0), fx.min(fx.Int32(8), valid - chunk * 8))
+            if const_expr(full_tile):
                 self.tdm_copy(
                     ctx.value_cache_ptr,
-                    off + chunk * t.head_dim * 8,
-                    kv_off
-                    + t.k_bytes
-                    + ctx.warp * t.head_dim * 32
-                    + chunk * t.head_dim * 16,
-                    (t.head_dim, 8),
-                    (8, 1),
-                    (None, count),
+                    off,
+                    kv_off + t.k_bytes + slot * t.head_dim * 32,
+                    (t.head_dim * 16,),
+                    (1,),
+                    (None,),
                     8,
                     8,
                 )
+            else:
+                # V packs eight tokens per dimension; mask inside each chunk.
+                for chunk in range_constexpr(2):
+                    count = fx.max(
+                        fx.Int32(0), fx.min(fx.Int32(8), valid - chunk * 8)
+                    )
+                    self.tdm_copy(
+                        ctx.value_cache_ptr,
+                        off + chunk * t.head_dim * 8,
+                        kv_off
+                        + t.k_bytes
+                        + slot * t.head_dim * 32
+                        + chunk * t.head_dim * 16,
+                        (t.head_dim, 8),
+                        (8, 1),
+                        (None, count),
+                        8,
+                        8,
+                    )
 
     @flyc.jit
     def stage_packed_tdm(self, token_base, kv_off, full_tile, cached_page=None):

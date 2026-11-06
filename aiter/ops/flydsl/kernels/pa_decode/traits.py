@@ -833,6 +833,8 @@ class Gfx1250Traits:
     merge_partitions: bool = False
     # Workgroups per sequence cluster that merges its partitions; 0 disables.
     cluster_merge: int = 0
+    # Grids within two CTAs per CU stage BF16 page16 pairs per wave.
+    wide_bf16_page16: bool = False
 
     WAVE = 32
     NWARP = 4
@@ -888,6 +890,13 @@ class Gfx1250Traits:
             128
             if self.bf16_page128_packed
             or self.page16_wide
+            or (
+                self.bf16_page16_packed
+                and self.wide_bf16_page16
+                and self.head_dim == 128
+                and self.m_tiles == 1
+                and self.sliding_window == 0
+            )
             or (
                 self.packed_lds
                 and self.head_dim in (128, 256)

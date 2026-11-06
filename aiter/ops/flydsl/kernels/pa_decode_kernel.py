@@ -264,6 +264,16 @@ def compile_pa_decode_tile(
             query_splits=query_splits,
             merge_partitions=direct_output and num_partitions > 1,
             cluster_merge=cluster_merge,
+            # 128-token BF16 page16 stages leave room for two CTAs per CU:
+            # larger grids (sparse prefill) keep 64-token stages.
+            wide_bf16_page16=(
+                num_seqs if direct_output and num_partitions == 1
+                else num_seqs * cluster_merge if cluster_merge
+                else work_capacity
+            )
+            * num_kv_heads
+            * query_splits
+            <= 2 * num_compute_units,
         )
     if architecture not in ("gfx942", "gfx950"):
         raise NotImplementedError(f"PA decode does not support {architecture}")
@@ -539,6 +549,7 @@ def compile_gfx1250_pa_decode(
     query_splits=1,
     merge_partitions=False,
     cluster_merge=0,
+    wide_bf16_page16=False,
 ):
     """Compile a gfx1250 tile kernel; merging partitions writes final output.
 
@@ -569,6 +580,7 @@ def compile_gfx1250_pa_decode(
         query_splits,
         merge_partitions,
         cluster_merge,
+        wide_bf16_page16 and compute_dtype == "bf16" and block_size == 16,
     )
     if compute_dtype not in ("fp8", "bf16"):
         raise ValueError(f"Unsupported gfx1250 PA compute dtype: {compute_dtype}")
