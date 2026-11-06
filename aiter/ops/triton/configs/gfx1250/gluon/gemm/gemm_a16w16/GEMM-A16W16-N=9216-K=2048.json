@@ -11,28 +11,28 @@
     },
     "M_LEQ_4": {
         "BLOCK_M": 16,
-        "BLOCK_N": 64,
-        "BLOCK_K": 128,
+        "BLOCK_N": 32,
+        "BLOCK_K": 256,
         "NUM_BUFFERS": 6,
-        "num_warps": 4,
+        "num_warps": 2,
         "kernel_type": "bandwidth_bound",
-        "waves_per_eu": 8
+        "waves_per_eu": 1
     },
     "M_LEQ_8": {
         "BLOCK_M": 16,
         "BLOCK_N": 64,
-        "BLOCK_K": 128,
-        "NUM_BUFFERS": 7,
-        "num_warps": 4,
-        "kernel_type": "bandwidth_bound",
-        "waves_per_eu": 8
+        "BLOCK_K": 256,
+        "NUM_BUFFERS": 5,
+        "num_warps": 2,
+        "kernel_type": "compute_bound",
+        "waves_per_eu": 1
     },
     "M_LEQ_16": {
         "BLOCK_M": 16,
         "BLOCK_N": 64,
-        "BLOCK_K": 128,
-        "NUM_BUFFERS": 7,
-        "num_warps": 4,
+        "BLOCK_K": 256,
+        "NUM_BUFFERS": 5,
+        "num_warps": 2,
         "kernel_type": "compute_bound",
         "waves_per_eu": 1
     },
