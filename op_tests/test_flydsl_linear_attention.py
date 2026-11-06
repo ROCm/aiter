@@ -22,7 +22,7 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 
 import aiter
 from aiter import dtypes
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
 from aiter.ops.flydsl.kernels.gdn_decode_verify import (
     create_gdn_decode_verify_kernel,
 )
@@ -2251,9 +2251,15 @@ def main():
         "FlyDSL GDR decode summary (markdown):\n%s", df.to_markdown(index=False)
     )
 
-    # get_gfx() follows GPU_ARCHS, which the table's gfx column reports; the
-    # device check alone would run (and mislabel) the sweep for another target.
-    if get_gfx() in KDA_DECODE_GFX and is_flydsl_kda_decode_supported():
+    # get_gfx() follows GPU_ARCHS, which the table's gfx column reports; with
+    # two supported arches it must also be the GPU the sweep times, or a gfx950
+    # run under GPU_ARCHS=gfx942 (or the reverse) would be labeled wrongly.
+    gfx = get_gfx()
+    if (
+        gfx in KDA_DECODE_GFX
+        and gfx == get_gfx_runtime()
+        and is_flydsl_kda_decode_supported()
+    ):
         rows = [
             test_flydsl_kda_decode(batch, conv_layout, state_dtype)
             for state_dtype, conv_layout, batch in itertools.product(
