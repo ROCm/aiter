@@ -1447,22 +1447,8 @@ class AttentionProgram:
         output_stride_0,
         output_stride_1,
         USE_TDM: gl.constexpr = False,
-        g_smem=None,
     ):
-        """Store the normalized [BLOCK_M, HEAD_SIZE] tile (BLOCK_Q tokens x NUM_QUERIES_PER_KV heads, the PV
-        accumulator layout). With g_smem (issue_gate_load's gate tile, the same rows), the Qwen3-Next /
-        Qwen3.5 output gate first: out * sigmoid(gate) with the unfused gate kernel's roundings, the
-        attention rounded to the output dtype, the sigmoid to the gate dtype, the product to the output dtype."""
         casted_out = out.to(self.output_ptr.dtype.element_ty)
-        if g_smem is not None:
-            gate = g_smem.reshape([self.cfg.BLOCK_M, self.cfg.HEAD_SIZE]).load(
-                layout=self.cfg.pv_layout
-            )
-            g = gate.to(gl.float32)
-            g = (1.0 / (1.0 + gl.exp(-g))).to(gate.dtype).to(gl.float32)
-            casted_out = (casted_out.to(gl.float32) * g).to(
-                self.output_ptr.dtype.element_ty
-            )
 
         if USE_TDM and self.cfg.ARCH_NAME == "gfx1250":
             STORE_COLS: gl.constexpr = self.cfg.NUM_QUERIES_PER_KV * self.cfg.HEAD_SIZE
@@ -1536,7 +1522,7 @@ class AttentionProgram:
         cur_batch_query_len,
     ):
         """TDM-load this program's [BLOCK_Q, NUM_QUERIES_PER_KV * HEAD_SIZE] output-gate tile into LDS
-        (rows past the sequence read as zero), for store_output's gate. Issued before the attention loop, so
+        (rows past the sequence read as zero), for store_output_gated. Issued before the attention loop, so
         its latency hides under it; the loop's TDM waits count from the newest ops, so this older load only
         completes earlier than they require."""
         cfg = self.cfg
@@ -1545,7 +1531,7 @@ class AttentionProgram:
             vec=1, per_phase=1, max_phase=1, order=[1, 0]
         )
         g_smem = gl.allocate_shared_memory(
-            gate_ptr.dtype.element_ty, [cfg.BLOCK_Q, COLS], layout=g_layout
+            gate_ptr.dtype.element_ty, [cfg.BLOCK_Q, COLS // 128, 128], layout=g_layout
         )
         g_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
             base=gate_ptr
@@ -1559,9 +1545,55 @@ class AttentionProgram:
         gl.amd.gfx1250.tdm.async_load(
             g_desc,
             [(q_block_local_idx * cfg.BLOCK_Q).to(gl.int32), 0],
-            g_smem,
+            g_smem.reinterpret(gate_ptr.dtype.element_ty, [cfg.BLOCK_Q, COLS], g_layout),
         )
         return g_smem
+
+    @gluon.jit
+    def store_output_gated(
+        self,
+        out,
+        g_smem,
+        q_block_local_idx,
+        cur_batch_in_all_start_index,
+        kv_head_idx,
+        cur_batch_query_len,
+        output_stride_0,
+    ):
+        """The Qwen3-Next / Qwen3.5 attention output gate: out = bf16(attention) * sigmoid(gate), with the
+        roundings of the unfused gate kernel (the sigmoid to the gate dtype, the product to the output dtype).
+
+        The program's output is its BLOCK_Q tokens x the GQA group's NUM_QUERIES_PER_KV * HEAD_SIZE contiguous
+        columns. The accumulator is staged in LDS in the output dtype; a loop over the program's tokens then
+        reads one token's row and its gate row (g_smem, from issue_gate_load) in a row-major layout and stores
+        16-byte runs. The loop keeps the code and the live registers to one token row."""
+        cfg = self.cfg
+        GROUP: gl.constexpr = 128
+        COLS: gl.constexpr = cfg.NUM_QUERIES_PER_KV * cfg.HEAD_SIZE
+        NG: gl.constexpr = COLS // GROUP
+        epi: gl.constexpr = gl.BlockedLayout([1, 8], [2, 16], [gl.num_warps(), 1], [1, 0])
+        offs_g = gl.arange(0, NG, layout=gl.SliceLayout(1, epi))
+        offs_c = gl.arange(0, GROUP, layout=gl.SliceLayout(0, epi))
+        cols = kv_head_idx * COLS + offs_g[:, None] * GROUP + offs_c[None, :]
+        # the tokens of this program that exist (the last query block may be partial)
+        n_tok = gl.minimum(cur_batch_query_len - q_block_local_idx * cfg.BLOCK_Q, cfg.BLOCK_Q)
+        token0 = (cur_batch_in_all_start_index + q_block_local_idx * cfg.BLOCK_Q).to(gl.int64)
+        out_ty: gl.constexpr = self.output_ptr.dtype.element_ty
+
+        o_smem_layout: gl.constexpr = gl.SwizzledSharedLayout(
+            vec=1, per_phase=1, max_phase=1, order=[1, 0]
+        )
+        # one [groups, 128] row per token; the accumulator's [BLOCK_M, HEAD_SIZE] rows are the same bytes
+        o_smem = gl.allocate_shared_memory(out_ty, [cfg.BLOCK_Q, NG, GROUP], layout=o_smem_layout)
+        o_smem.reinterpret(out_ty, [cfg.BLOCK_M, cfg.HEAD_SIZE], o_smem_layout).store(out.to(out_ty))
+
+        for t in range(n_tok):
+            y = o_smem.index(t).load(layout=epi)
+            gate = g_smem.index(t).load(layout=epi)
+            g = gate.to(gl.float32)
+            g = (1.0 / (1.0 + gl.exp(-g))).to(gate.dtype).to(gl.float32)
+            y = (y.to(gl.float32) * g).to(out_ty)
+            gl.store(self.output_ptr + (token0 + t) * output_stride_0 + cols, y)
 
     @gluon.jit
     def store_output_split(
@@ -2908,8 +2940,16 @@ def _unified_attention_gluon_kernel_2d(
     if GATE:
         gl.static_assert(not output_ptr.dtype.is_fp8(), "the output gate takes a bf16 / fp16 output")
         gl.amd.gfx1250.tdm.async_wait(0)
-    else:
-        g_smem = None
+        pgm.store_output_gated(
+            acc,
+            g_smem,
+            q_block_local_idx,
+            cur_batch_in_all_start_index,
+            kv_head_idx,
+            cur_batch_query_len,
+            output_stride_0,
+        )
+        return
 
     if output_ptr.dtype.is_fp8():
         acc = gl.minimum(acc, FP8_MAX)
@@ -2924,5 +2964,4 @@ def _unified_attention_gluon_kernel_2d(
         output_stride_0,
         output_stride_1,
         USE_TDM=USE_TDM_STORE,
-        g_smem=g_smem,
     )
