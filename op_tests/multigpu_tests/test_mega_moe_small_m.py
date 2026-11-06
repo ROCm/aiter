@@ -7,9 +7,9 @@ One MegaMoEV2 built at MTPR 8192 with small-input runtimes next to it
 reference and the main path (uneven, idle, padded ranks), per-layer weight
 rebinding with interleaved main calls, CUDA graph replay, and paired timing.
 
-    AITER_MEGA_SMALL_M=1 torchrun --nproc-per-node 8 test_mega_moe_small_m.py
+    torchrun --nproc-per-node 8 test_mega_moe_small_m.py
     # against a same-MTPR main path, timing only:
-    AITER_MEGA_SMALL_M=1 torchrun --nproc-per-node 8 test_mega_moe_small_m.py \
+    torchrun --nproc-per-node 8 test_mega_moe_small_m.py \
         --mtpr 256 --time-only --time-bs 140,168,196,224,252
 """
 
@@ -53,7 +53,9 @@ def _all_true(flag, device):
 
 
 def _main_forward(moe, x, w, ids):
-    return moe(x, w, ids)[: x.shape[0]]
+    """The instance's own route for its capacity, with the small-input route left out."""
+    route = moe._route(x.shape[0], None, small_m=False)
+    return moe._forward_route(route, x, w, ids)[: x.shape[0]]
 
 
 def _rank_case(tokens_per_rank, rank, x, w, ids, experts, pad_rows=0):
@@ -85,13 +87,16 @@ def _check_epoch_wrap_and_zero_rows(moe, bind, case, large_case, device):
     empty_i = torch.empty((0, case[2].shape[1]), dtype=case[2].dtype, device=device)
     if moe.forward_small_m(empty_x, empty_w, empty_i, max_tokens=0).shape[0] != 0:
         mism += 1
-    if moe._large_m is not None and moe(empty_x, empty_w, empty_i).shape[0] != 0:
+    if (
+        moe._large_m is not None
+        and _main_forward(moe, empty_x, empty_w, empty_i).shape[0] != 0
+    ):
         mism += 1
 
     xi, wi, ii, expect, real, mt = case
     large_expect = None
     if large_case is not None:
-        large_expect = moe(*large_case[:3])[: large_case[4]].clone()
+        large_expect = _main_forward(moe, *large_case[:3])[: large_case[4]].clone()
     for base in (2**31 - 2, 2**32 - 2):
         _barrier()
         for runtime in moe._small_m_runtimes:
@@ -109,7 +114,7 @@ def _check_epoch_wrap_and_zero_rows(moe, bind, case, large_case, device):
             out = moe.forward_small_m(xi, wi, ii, max_tokens=mt)[:real]
             mism += int((out != expect[:real]).any(dim=-1).sum().item())
             if large_expect is not None:
-                out = moe(*large_case[:3])[: large_case[4]]
+                out = _main_forward(moe, *large_case[:3])[: large_case[4]]
                 mism += int((out != large_expect).any(dim=-1).sum().item())
     total = torch.tensor(mism, device=device)
     dist.all_reduce(total)
@@ -148,7 +153,8 @@ def run(args):
         )
         if moe.small_m_mtpr != max(args.small_m_mtprs):
             raise AssertionError(
-                f"small-input path not enabled (small_m_mtpr={moe.small_m_mtpr}); set AITER_MEGA_SMALL_M=1"
+                f"small-input route not built (small_m_mtpr={moe.small_m_mtpr}); "
+                "it needs the EP8 DeepSeek-V4 a8w4 layout on an 8-XCD gfx950"
             )
         large_m = moe._large_m is not None
         if rank == 0:
@@ -486,7 +492,7 @@ def run(args):
             paths = [
                 (
                     "main" if not large_m else "large_m",
-                    lambda tx=tx, tw=tw, ti=ti: moe(tx, tw, ti),
+                    lambda tx=tx, tw=tw, ti=ti: _main_forward(moe, tx, tw, ti),
                 )
             ]
             if n <= moe.small_m_mtpr:

@@ -575,11 +575,11 @@ def _check_large_m_edges(
     """Large-input path: explicit stream, rank-local mask and the SiLU-only gate."""
     import flydsl.expr as fx
 
-    from aiter.ops.flydsl.kernels.mega_moe.mega_moe_large_m import _torch_stream
-    from aiter.ops.flydsl.kernels.mega_moe.mega_moe_v2 import (
-        large_m_eligible,
-        small_m_eligible,
+    from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import (
+        fused_layout_supported,
+        small_m_cu_supported,
     )
+    from aiter.ops.flydsl.kernels.mega_moe.mega_moe_large_m import _torch_stream
 
     tokens = x.shape[0]
     # A zero-input call first, so a quant buffer reused on the current stream holds other data.
@@ -698,15 +698,12 @@ def _check_large_m_edges(
         "quant": "a8w4",
         "swiglu_limit": 10.0,
     }
-    if not large_m_eligible(enabled=True, max_tok_per_rank=8192, **layout) or (
-        large_m_eligible(enabled=True, max_tok_per_rank=8192, act="situv2", **layout)
-        or small_m_eligible(enabled=True, num_cu=256, act="situv2", **layout)
+    if not fused_layout_supported(**layout) or fused_layout_supported(
+        act="situv2", **layout
     ):
         raise AssertionError("the large/small-input paths must be gated to SiLU")
     # The small-input kernel shards its work over 8 XCDs: a 4-XCD (128-CU) part is not eligible.
-    if not small_m_eligible(enabled=True, num_cu=256, **layout) or small_m_eligible(
-        enabled=True, num_cu=128, **layout
-    ):
+    if not small_m_cu_supported(256) or small_m_cu_supported(128):
         raise AssertionError("the small-input path must be gated to 8-XCD parts")
     if rank == 0:
         print(
@@ -1169,6 +1166,9 @@ def main():
                     fanout_masks=fanout_masks,
                     stage2_p2p_quant=args.stage2_p2p_quant,
                     large_m_state_slots=args.large_m_state_slots,
+                    # Pin the plan: the staged route unless --expect-large-m.
+                    large_m_enabled=args.expect_large_m,
+                    small_m_mtprs=(),
                     **network,
                 )
             moe = shared_moe

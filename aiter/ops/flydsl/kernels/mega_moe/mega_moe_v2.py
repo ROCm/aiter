@@ -2,7 +2,6 @@
 # Copyright (c) 2025 FlyDSL Project Contributors
 """MegaMoE v2 fused dispatch, GEMM1, GEMM2, and combine implementation."""
 
-import os
 from dataclasses import replace
 
 import flydsl.expr as fx
@@ -19,97 +18,23 @@ from ..flydsl_dispatch_combine_intranode_op import (
 from . import envs
 from .dispatch import DISPATCH_TABLE_SIZE, DispatchSlot
 from .mega_moe_config import (
+    DEFAULT_SMALL_M_MTPRS,
     INDEXED_PAYLOAD_MIN_MTPR,
+    LARGE_M_MTPRS,
+    ROUTE_LARGE_M,
+    ROUTE_SMALL_M,
     MegaMoEConfig,
     Stage1Config,
     build_mega_moe_bundle_plan,
     fixed_stage1_epoch_slot_count,
+    fused_layout_supported,
+    small_m_cu_supported,
 )
 from .mega_moe_stage2_aligned_pair import ALIGNED_PAIR_SCATTER_VEC
 from .quant import per_1x32_mx_quant
 from .weights import check_bindable, contiguous_weights, weight_spec
 
 __all__ = ["MegaMoEV2"]
-
-
-def _small_m_mtprs(mtprs) -> tuple[int, ...]:
-    """Small-input runtime MTPRs; each is an independent single-kernel instance."""
-    mtprs = sorted({int(m) for m in mtprs})
-    if not mtprs:
-        raise ValueError("small_m_mtprs must not be empty")
-    for m in mtprs:
-        if m <= 0 or m & (m - 1) or m > 512:
-            raise ValueError(f"small_m_mtprs: {m} must be a power of two <= 512")
-    return tuple(mtprs)
-
-
-def large_m_eligible(
-    *,
-    enabled: bool,
-    arch: str,
-    world_size: int,
-    model_dim: int,
-    inter_dim: int,
-    experts: int,
-    topk: int,
-    quant: str,
-    max_tok_per_rank: int,
-    swiglu_limit: float,
-    fanout_masks: tuple[int, ...] = (),
-    act: str = "silu",
-) -> bool:
-    """Whether the large-input path supports this layout (EP8 DeepSeek-V4 a8w4)."""
-    return (
-        enabled
-        and arch.split(":", 1)[0] == "gfx950"
-        and world_size == 8
-        and model_dim == 7168
-        and inter_dim == 3072
-        and experts == 384
-        and experts // world_size == 48
-        and topk == 6
-        and quant == "a8w4"
-        and max_tok_per_rank == 8192
-        and swiglu_limit == 10.0
-        and act == "silu"
-        and not fanout_masks
-    )
-
-
-def small_m_eligible(
-    *,
-    enabled: bool,
-    arch: str,
-    num_cu: int,
-    world_size: int,
-    model_dim: int,
-    inter_dim: int,
-    experts: int,
-    topk: int,
-    quant: str,
-    swiglu_limit: float,
-    fanout_masks: tuple[int, ...] = (),
-    act: str = "silu",
-) -> bool:
-    """Whether the small-input path supports this layout (EP8 DeepSeek-V4 a8w4).
-
-    The kernel splits its work across 8 XCDs by XCC id, so it needs the 8-XCD
-    (256-CU) gfx950 parts; a 4-XCD part would leave half the work unclaimed.
-    """
-    return (
-        enabled
-        and arch.split(":", 1)[0] == "gfx950"
-        and num_cu == 256
-        and world_size == 8
-        and model_dim == 7168
-        and inter_dim == 3072
-        and experts == 384
-        and topk == 6
-        and quant == "a8w4"
-        and swiglu_limit == 10.0
-        and act == "silu"
-        and not fanout_masks
-    )
 
 
 class MegaMoEV2:
@@ -125,7 +50,7 @@ class MegaMoEV2:
         swiglu_limit: float = 0.0, fanout_masks: tuple[int, ...] = (),
         act: str = "silu", situ_beta: float = 1.0, situ_linear_beta: float = 1.0,
         large_m_state_slots: int = 1, large_m_enabled: bool | None = None,
-        small_m_mtprs: tuple[int, ...] = (256, 512)):
+        small_m_mtprs: tuple[int, ...] = DEFAULT_SMALL_M_MTPRS):
     # fmt: on
         if quant not in ("a4w4", "a8w4"):
             raise ValueError("MegaMoEV2 quant must be 'a4w4' or 'a8w4'")
@@ -161,6 +86,28 @@ class MegaMoEV2:
             raise ValueError(f"MegaMoEV2 act must be 'silu' or 'situv2', got {self.act!r}")
         if self.act == "situv2" and (self.situ_beta <= 0.0 or self.situ_linear_beta <= 0.0):
             raise ValueError("situv2 requires positive situ_beta / situ_linear_beta")
+        self._initial_fanout_masks = tuple(int(mask) for mask in fanout_masks)
+        if self._initial_fanout_masks and len(self._initial_fanout_masks) != self.world_size:
+            raise ValueError("fanout_masks must contain one mask per destination")
+        if self.swiglu_limit < 0:
+            raise ValueError("swiglu_limit must be non-negative")
+        self.dev = torch.device("cuda", rank)
+        # The fused routes are built whenever this layout supports them; the plan then picks
+        # one route per call (see MegaMoEBundlePlan.route_for). small_m_mtprs=() or
+        # large_m_enabled=False leaves a route out.
+        fused = fused_layout_supported(
+            arch=get_gfx_runtime(),
+            world_size=self.world_size,
+            model_dim=self.model_dim,
+            inter_dim=self.inter_dim,
+            experts=self.experts,
+            topk=self.topk,
+            quant=quant,
+            swiglu_limit=self.swiglu_limit,
+            act=self.act,
+            fanout_masks=self._initial_fanout_masks,
+        )
+        num_cu = torch.cuda.get_device_properties(self.dev).multi_processor_count
         self._bundle_plan = build_mega_moe_bundle_plan(
             self.mtpr,
             a_dtype=self._a_dtype,
@@ -169,14 +116,14 @@ class MegaMoEV2:
             model_dim=self.model_dim,
             inter_dim=self.inter_dim,
             world_size=self.world_size,
+            small_m_mtprs=(
+                tuple(small_m_mtprs) if fused and small_m_cu_supported(num_cu) else ()
+            ),
+            large_m=(
+                fused and large_m_enabled is not False and self.mtpr in LARGE_M_MTPRS
+            ),
         )
         self._active_bundle_entry = None
-        self._initial_fanout_masks = tuple(int(mask) for mask in fanout_masks)
-        if self._initial_fanout_masks and len(self._initial_fanout_masks) != self.world_size:
-            raise ValueError("fanout_masks must contain one mask per destination")
-        if self.swiglu_limit < 0:
-            raise ValueError("swiglu_limit must be non-negative")
-        self.dev = torch.device("cuda", rank)
         self.max_recv = self.world_size * self.mtpr
         compact = not self._bundle_plan.fixed_slot_dispatch
         # Compact Stage1 always uses the deterministic runtime fanout protocol.
@@ -208,63 +155,30 @@ class MegaMoEV2:
         self._build_fused_stage1(w1, w1_scale)
         self._build_fused_stage2()
         self._large_m = None
-        device_arch = get_gfx_runtime()
-        enable_large_m = (
-            envs.AITER_MEGA_LARGE_M
-            if large_m_enabled is None
-            else bool(large_m_enabled)
-        )
-        if large_m_eligible(
-            enabled=enable_large_m,
-            arch=device_arch,
-            world_size=self.world_size,
-            model_dim=self.model_dim,
-            inter_dim=self.inter_dim,
-            experts=self.experts,
-            topk=self.topk,
-            quant=quant,
-            max_tok_per_rank=self.mtpr,
-            swiglu_limit=self.swiglu_limit,
-            fanout_masks=self._initial_fanout_masks,
-            act=self.act,
-        ):
-            large_m_args = {
-                "rank": self.rank,
-                "world_size": self.world_size,
-                "model_dim": self.model_dim,
-                "inter_dim": self.inter_dim,
-                "experts": self.experts,
-                "topk": self.topk,
-                "quant": quant,
-                "w1": w1,
-                "w1_scale": w1_scale,
-                "w2": self.w2,
-                "w2_scale": self.w2_scale,
-                "max_tok_per_rank": self.mtpr,
-                "mega_scheme": mega_scheme,
-                "swiglu_limit": self.swiglu_limit,
-                "state_slots": self.large_m_state_slots,
-            }
+        if self._bundle_plan.large_m:
             from .mega_moe_large_m import LargeMRuntime
 
-            self._large_m = LargeMRuntime(**large_m_args)
-        self._large_m_on = self._large_m is not None
-        self._small_m = None
+            self._large_m = LargeMRuntime(
+                rank=self.rank,
+                world_size=self.world_size,
+                model_dim=self.model_dim,
+                inter_dim=self.inter_dim,
+                experts=self.experts,
+                topk=self.topk,
+                quant=quant,
+                w1=w1,
+                w1_scale=w1_scale,
+                w2=self.w2,
+                w2_scale=self.w2_scale,
+                max_tok_per_rank=self.mtpr,
+                mega_scheme=mega_scheme,
+                swiglu_limit=self.swiglu_limit,
+                state_slots=self.large_m_state_slots,
+            )
+        # Compatibility switch for set_large_m_enabled(); routing stays with the plan.
+        self._large_m_excluded = False
         self._small_m_runtimes = []
-        if small_m_eligible(
-            enabled=envs.AITER_MEGA_SMALL_M,
-            arch=device_arch,
-            num_cu=torch.cuda.get_device_properties(self.dev).multi_processor_count,
-            world_size=self.world_size,
-            model_dim=self.model_dim,
-            inter_dim=self.inter_dim,
-            experts=self.experts,
-            topk=self.topk,
-            quant=quant,
-            swiglu_limit=self.swiglu_limit,
-            fanout_masks=self._initial_fanout_masks,
-            act=self.act,
-        ):
+        if self._bundle_plan.small_m_mtprs:
             from .mega_moe_small_m import SmallMRuntime
 
             # Own buffers and protocol state; weights are shared by pointer.
@@ -284,60 +198,112 @@ class MegaMoEV2:
                     max_tok_per_rank=m,
                     swiglu_limit=self.swiglu_limit,
                 )
-                for m in _small_m_mtprs(small_m_mtprs)
+                for m in self._bundle_plan.small_m_mtprs
             ]
-            self._small_m = self._small_m_runtimes[-1]
         if envs.AITER_MEGA_MOE_PRELOAD:
             self.preload_aot_bundles()
 
     @property
     def small_m_mtpr(self) -> int:
-        """Largest per-rank token count forward_small_m accepts (0 when disabled)."""
-        return self._small_m.mtpr if self._small_m is not None else 0
+        """Largest max_tokens the small-input route serves (0 when not built)."""
+        return self._bundle_plan.small_m_mtprs[-1] if self._small_m_runtimes else 0
 
     def forward_small_m(self, x_bf16, wts, topk_ids, *, max_tokens, stream=None, slice_output=True):
-        """Run the small-input single kernel.
+        """forward() for a call the small-input route must serve; kept for existing callers.
 
-        The caller must make the same main/small-input choice on every EP rank for a
-        given call: the two paths share no protocol state. ``max_tokens`` is the
-        max row count of this call over all EP ranks and picks the runtime; it must
-        be the same on every rank (the runtimes share no protocol state either), so
-        it has no per-rank default. ``topk_ids`` may contain -1 (skipped, contributing zero).
+        ``topk_ids`` may contain -1 (skipped, contributing zero).
         """
-        if self._small_m is None:
-            raise RuntimeError("small-input path is not enabled (set AITER_MEGA_SMALL_M=1)")
-        need = int(max_tokens)
-        if need < int(x_bf16.shape[0]):
-            raise ValueError(f"max_tokens={need} is below this rank's {int(x_bf16.shape[0])} rows")
-        runtime = next((r for r in self._small_m_runtimes if r.mtpr >= need), None)
-        if runtime is None:
-            raise ValueError(f"{need} tokens exceed the largest small-input mtpr {self._small_m.mtpr}")
-        return runtime.forward(
-            x_bf16, wts, topk_ids, stream=stream, slice_output=slice_output
+        if not self._small_m_runtimes:
+            raise RuntimeError("this instance has no small-input route")
+        if int(max_tokens) > self.small_m_mtpr:
+            raise ValueError(f"{max_tokens} tokens exceed the largest small-input mtpr {self.small_m_mtpr}")
+        return self.forward(
+            x_bf16, wts, topk_ids, stream=stream, slice_output=slice_output,
+            mask_invalid_slots=True, max_tokens=max_tokens,
         )
 
     @property
     def large_m_available(self) -> bool:
-        """Whether this instance built the large-input path."""
+        """Whether this instance built the large-input route."""
         return self._large_m is not None
 
     def set_large_m_enabled(self, enabled: bool) -> None:
-        """Send the following forward calls to the large-input path (True) or the main path (False).
+        """Allow (True, the default) or exclude (False) the large-input route.
 
-        The two paths share no protocol state, so every EP rank must make the same
-        choice for a call. On by default when the path is available.
+        A test aid kept for existing callers: the plan still picks the route, so
+        every rank must make the same choice before a call.
         """
         if enabled and self._large_m is None:
-            raise RuntimeError("the large-input path is not available (set AITER_MEGA_LARGE_M=1)")
-        self._large_m_on = bool(enabled)
+            raise RuntimeError("this instance has no large-input route")
+        self._large_m_excluded = not enabled
 
-    def _get_large_m(self):
-        """The large-input runtime when it is enabled, else None (main path).
+    def _route(self, run_tokens, max_tokens, *, small_m=True):
+        """(route, capacity) of this call; see MegaMoEBundlePlan.route_for.
 
-        The choice depends on no per-rank input (token count, mask), so every rank takes the
-        same path. The large-input combine always skips invalid (-1) top-k slots.
+        ``max_tokens`` is the call's row count on its largest EP rank (counting
+        graph padding), identical on every rank. Without it the plan assumes the
+        instance capacity, never this rank's own row count.
         """
-        return self._large_m if self._large_m_on else None
+        if max_tokens is None:
+            max_tokens = self.mtpr
+        max_tokens = int(max_tokens)
+        if not run_tokens <= max_tokens <= self.mtpr:
+            raise ValueError(
+                f"max_tokens={max_tokens} must be in [{run_tokens} (this rank's rows), {self.mtpr}]"
+            )
+        return self._bundle_plan.route_for(
+            max_tokens, small_m=small_m, large_m=not self._large_m_excluded
+        )
+
+    def _fused_runtimes(self):
+        # Weights are first bound while __init__ is still building the routes.
+        large_m = getattr(self, "_large_m", None)
+        if large_m is not None:
+            yield large_m
+        yield from getattr(self, "_small_m_runtimes", ())
+
+    # Weight attributes: assigning one rebinds it on every route. Callers may set
+    # these directly between calls (ATOM does, per layer); bind_weights() checks
+    # the binding first.
+    @property
+    def _s1_w1(self):
+        return self._bound_w1
+
+    @_s1_w1.setter
+    def _s1_w1(self, value):
+        self._bound_w1 = value
+        for runtime in self._fused_runtimes():
+            runtime._s1_w1 = value
+
+    @property
+    def _s1_w1_scale(self):
+        return self._bound_w1_scale
+
+    @_s1_w1_scale.setter
+    def _s1_w1_scale(self, value):
+        self._bound_w1_scale = value
+        for runtime in self._fused_runtimes():
+            runtime._s1_w1_scale = value
+
+    @property
+    def w2(self):
+        return self._bound_w2
+
+    @w2.setter
+    def w2(self, value):
+        self._bound_w2 = value
+        for runtime in self._fused_runtimes():
+            runtime.w2 = value
+
+    @property
+    def w2_scale(self):
+        return self._bound_w2_scale
+
+    @w2_scale.setter
+    def w2_scale(self, value):
+        self._bound_w2_scale = value
+        for runtime in self._fused_runtimes():
+            runtime.w2_scale = value
 
     def select_layer_state(self, layer_slot: int) -> None:
         """Select the large-input protocol state for a shared operator layer."""
@@ -350,18 +316,13 @@ class MegaMoEV2:
         # Everything that can refuse runs before any binding changes, so a refusal leaves the main,
         # small- and large-input paths on the previous weights together.
         check_bindable(weights, self._weight_spec)
-        w1_bytes, w1_scale_bytes = w1.view(torch.uint8), w1_scale.view(torch.uint8)
         for runtime in self._small_m_runtimes:
             runtime.w2_dispatch_table(w2, w2_scale)
-        self._s1_w1 = w1_bytes
-        self._s1_w1_scale = w1_scale_bytes
+        # The setters bind the small- and large-input routes too.
+        self._s1_w1 = w1.view(torch.uint8)
+        self._s1_w1_scale = w1_scale.view(torch.uint8)
         self.w2 = w2
         self.w2_scale = w2_scale
-        # The runtimes were built from the same weights, so they take the same tensors.
-        if self._large_m is not None:
-            self._large_m.bind_weights(*weights)
-        for runtime in self._small_m_runtimes:
-            runtime.bind_weights(*weights)
 
     def bind_layer(self, layer_slot: int, w1, w1_scale, w2, w2_scale) -> None:
         """Bind a stable layer slot and its weights without resetting state; a refused
@@ -397,9 +358,7 @@ class MegaMoEV2:
         # by default so production keeps today's descriptors; turn it on while
         # sweeping configurations, where an indexing mistake would otherwise
         # page-fault and can leave a GPU needing a privileged reset.
-        self._s1_bounds_check = (
-            os.environ.get("AITER_MEGA_MOE_BOUNDS_CHECK", "0") == "1"
-        )
+        self._s1_bounds_check = envs.AITER_MEGA_MOE_BOUNDS_CHECK
         self._s1_w1 = w1.contiguous().view(torch.uint8)
         self._s1_w1_scale = w1_scale.contiguous().view(torch.uint8)
         op = self.comb_op._gm
@@ -1039,10 +998,28 @@ class MegaMoEV2:
         return out_tok[:run_tokens] if slice_output else out_tok
 
     def forward(
-        self, x_bf16, wts, topk_ids, *, stream=None, slice_output=True, mask_invalid_slots=None
+        self, x_bf16, wts, topk_ids, *, stream=None, slice_output=True, mask_invalid_slots=None,
+        max_tokens=None,
     ):
         """``mask_invalid_slots``: ids may contain -1 (skipped, contributing zero).
-        None defers to AITER_MEGA_COMBINE_MASK (default off)."""
+        None defers to AITER_MEGA_COMBINE_MASK (default off); the small- and
+        large-input routes always skip -1 slots.
+
+        ``max_tokens``: rows of this call on its largest EP rank, counting graph
+        padding, passed identically on every rank; it selects the route. None
+        plans for the instance capacity.
+        """
+        route = self._route(int(x_bf16.shape[0]), max_tokens)
+        return self._forward_route(
+            route, x_bf16, wts, topk_ids, stream=stream, slice_output=slice_output,
+            mask_invalid_slots=mask_invalid_slots,
+        )
+
+    def _forward_route(
+        self, route, x_bf16, wts, topk_ids, *, stream=None, slice_output=True, mask_invalid_slots=None
+    ):
+        """forward() on a given (route, capacity); tests pin a route through this,
+        identically on every rank."""
         run_tokens = int(x_bf16.shape[0])
         if run_tokens > self.mtpr:
             raise ValueError(f"run_tokens={run_tokens} > max_tok_per_rank={self.mtpr}")
@@ -1055,14 +1032,15 @@ class MegaMoEV2:
         if any(t.device != self.dev for t in (x_bf16, wts, topk_ids)):
             # A rank that faults on a foreign pointer would leave its peers waiting.
             raise ValueError(f"x_bf16, wts and topk_ids must be on {self.dev}")
-        large_m = self._get_large_m()
-        if large_m is not None:
-            return large_m.forward(
-                x_bf16,
-                wts,
-                topk_ids,
-                stream=stream,
-                slice_output=slice_output,
+        route, capacity = route
+        if route == ROUTE_LARGE_M:
+            return self._large_m.forward(
+                x_bf16, wts, topk_ids, stream=stream, slice_output=slice_output
+            )
+        if route == ROUTE_SMALL_M:
+            runtime = self._small_m_runtimes[self._bundle_plan.small_m_mtprs.index(capacity)]
+            return runtime.forward(
+                x_bf16, wts, topk_ids, stream=stream, slice_output=slice_output
             )
         if self._s1_fixed_slot:
             x_q, scales = self.quantize(x_bf16)
@@ -1100,14 +1078,16 @@ class MegaMoEV2:
         )
 
     def forward_prequant(
-        self, x_q, scales, wts, topk_ids, *, stream=None, slice_output=True, mask_invalid_slots=None
+        self, x_q, scales, wts, topk_ids, *, stream=None, slice_output=True, mask_invalid_slots=None,
+        max_tokens=None,
     ):
+        """forward() on input quantized by quantize(); the small-input route takes bf16 only."""
         run_tokens = int(x_q.shape[0])
         if run_tokens > self.mtpr:
             raise ValueError(f"run_tokens={run_tokens} > max_tok_per_rank={self.mtpr}")
-        large_m = self._get_large_m()
-        if large_m is not None:
-            return large_m.forward_prequant(
+        route, _ = self._route(run_tokens, max_tokens, small_m=False)
+        if route == ROUTE_LARGE_M:
+            return self._large_m.forward_prequant(
                 x_q,
                 scales,
                 wts,

@@ -345,6 +345,9 @@ def main():
         w2_scale=w2_scale,
         max_tok_per_rank=args.mtpr,
         swiglu_limit=SWIGLU_LIMIT,
+        # The Stage1/Stage2 variants below tune the staged route; pin the plan to it.
+        large_m_enabled=False,
+        small_m_mtprs=(),
     )
     default_select_config = mega._select_config
     variant_select_config = None

@@ -33,6 +33,7 @@ from ..mxfp4_gemm_common import lds_typed_ptr, lds_vec_load
 from ..tensor_shim import _preload_compiled, _run_compiled
 from .dispatch import _wave_inclusive_scan_i32, _wave_reduce_max_i32
 from .gemm1 import _LdsF32View
+from .mega_moe_config import fused_layout_supported, small_m_cu_supported
 from .mega_moe_fused_gemm import (
     SMALL_M_FIXED_SLOT_MAX_MTPR,
     TOKEN_BUCKETS,
@@ -1482,15 +1483,15 @@ class SmallMRuntime:
         if self.swiglu_limit < 0:
             raise ValueError("swiglu_limit must be non-negative")
         self.dev = torch.device("cuda", rank)
-        from .mega_moe_v2 import small_m_eligible
-
         # Built directly, the runtime checks the layout MegaMoEV2 gates it to (the kernel splits its
         # work over 8 XCDs and bakes in the EP8 DeepSeek-V4 shape), instead of failing at compile.
-        if not small_m_eligible(
-            enabled=True, arch=get_gfx_runtime(),
-            num_cu=torch.cuda.get_device_properties(self.dev).multi_processor_count,
-            world_size=self.world_size, model_dim=self.model_dim, inter_dim=self.inter_dim,
-            experts=self.experts, topk=self.topk, quant=quant, swiglu_limit=self.swiglu_limit,
+        if not (
+            fused_layout_supported(
+                arch=get_gfx_runtime(), world_size=self.world_size, model_dim=self.model_dim,
+                inter_dim=self.inter_dim, experts=self.experts, topk=self.topk, quant=quant,
+                swiglu_limit=self.swiglu_limit,
+            )
+            and small_m_cu_supported(torch.cuda.get_device_properties(self.dev).multi_processor_count)
         ):
             raise ValueError("SmallMRuntime supports the EP8 DeepSeek-V4 a8w4 layout on 8-XCD gfx950 only")
         # The combine reducers run at the end of the kernel on a fully resident grid, so they are not bounded by
@@ -1718,6 +1719,8 @@ class SmallMRuntime:
             stream = fx.Stream(torch.cuda.current_stream().cuda_stream)
         elif hasattr(stream, "cuda_stream"):
             stream = fx.Stream(stream.cuda_stream)
+        # Weights may have been reassigned since the last call (see MegaMoEV2's weight attributes).
+        self._s1_disp = self.w2_dispatch_table(self.w2, self.w2_scale)
         # Ranks may use different token buckets in one call; an idle rank uses the 1-token bucket.
         config = self._select_config(max(run_tokens, 1))
         self._launch(config, run_tokens, x_bf16, topk_ids, wts, stream)
