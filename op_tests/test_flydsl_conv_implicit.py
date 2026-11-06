@@ -1178,19 +1178,32 @@ def _splitk_checks(dtype, xshape, wshape, padding, has_tail):
 # Tuned gfx1250 rows set num_buffers / main_loop_unroll / tile_k / patch, which
 # the public entry does not take, so these call the gfx1250 host directly.
 # pipe_k96_b3_u_n3 is the small-tile tile_k=96 config that exposed the K-loop
-# LDS read/refill race; the patch cases cover several (kt, cc) groups each.
+# LDS read/refill race; the patch cases cover several (kt, cc) groups each. The
+# NDHWC cases take the vectorized epilogue, epi_ndhwc_tail with a channel tail.
 _PIPELINE_CASES = (
-    # case, x (NCDHW), weight, tile, block_rows, num_buffers, unroll, tile_k, patch
+    # case, x (NCDHW), weight, tile, block_rows, num_buffers, unroll, tile_k, patch[, layout]
     ("pipe_k96_b3", (1, 96, 6, 18, 34), (96, 96, 3, 3, 3), (256, 96, 4, 1), 8, 3, False, 96, False),
     ("pipe_k96_b3_u_n3", (1, 96, 6, 18, 34), (3, 96, 3, 3, 3), (32, 32, 2, 1), 2, 3, True, 96, False),
     ("pipe_k64_b4_u", (1, 192, 6, 18, 34), (192, 192, 3, 3, 3), (96, 192, 2, 2), 2, 4, True, 64, False),
     ("patch_k96_b3", (1, 96, 6, 18, 34), (96, 96, 3, 3, 3), (256, 96, 4, 1), 8, 3, False, 96, True),
     ("patch_k32_b4_2d", (1, 192, 1, 34, 66), (96, 192, 1, 3, 3), (256, 96, 4, 2), 16, 4, False, 32, True),
+    ("epi_ndhwc_tail", (1, 64, 4, 18, 34), (96, 64, 3, 3, 3), (128, 64, 2, 2), 8, 2, False, 32, False, "NDHWC"),
+    ("epi_ndhwc_patch", (1, 96, 6, 18, 34), (96, 96, 3, 3, 3), (256, 96, 4, 1), 8, 3, False, 96, True, "NDHWC"),
 )  # fmt: skip
 
 
 def _pipeline_case(
-    dtype, case, xshape, wshape, tile, block_rows, nb, unroll, tile_k, use_patch
+    dtype,
+    case,
+    xshape,
+    wshape,
+    tile,
+    block_rows,
+    nb,
+    unroll,
+    tile_k,
+    use_patch,
+    layout="NCDHW",
 ):
     """Every checked call correct, and the compiled param is the one requested."""
     from aiter.ops.flydsl import conv3d_gfx1250
@@ -1214,12 +1227,16 @@ def _pipeline_case(
             main_loop_unroll=unroll,
             tile_k=tile_k,
             patch_reuse=use_patch,
+            output_layout=layout,
         )
 
+    def check(out):
+        if layout == "NDHWC":
+            out = out.permute(0, 4, 1, 2, 3)
+        return _check_output(ref, out, case)
+
     with patch.object(conv3d_gfx1250, "compile_conv3d_implicit_gfx1250", record):
-        ret = correctness_runner(
-            run, lambda out: _check_output(ref, out, case), torch.cuda.synchronize
-        )
+        ret = correctness_runner(run, check, torch.cuda.synchronize)
     want = (tuple(tile), block_rows, nb, unroll, tile_k, use_patch)
     got = None
     if seen:
@@ -1242,7 +1259,7 @@ def _pipeline_case(
         "x": str(xshape),
         "weight": str(wshape),
         "host path": f"tile={want[0]}, block_rows={block_rows}, num_buffers={nb}, "
-        f"unroll={unroll}, tile_k={tile_k}, patch={use_patch}",
+        f"unroll={unroll}, tile_k={tile_k}, patch={use_patch}, out={layout}",
         **ret,
     }
 

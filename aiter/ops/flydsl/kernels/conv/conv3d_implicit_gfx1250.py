@@ -382,6 +382,16 @@ def compile_conv3d_implicit_gfx1250(param: Conv3dImplicitParam1250):
 
     variant = param.variant
     main_loop_unroll = param.main_loop_unroll
+    # A lane's 8 accumulator columns are 8 consecutive NDHWC channels; with K and
+    # the per-group K multiples of 8 they are 16-byte aligned and wholly in or
+    # out of a channel tail, so they go out as one store (bias as two loads).
+    VEC_EPILOGUE = (
+        param.out_ndhwc
+        and not use_splitk
+        and not big_out
+        and param.k % 8 == 0
+        and grid.kg % 8 == 0
+    )
 
     if const_expr(param.dyn_hw):
         extra_args = dyn_shape_values_gfx1250(param, geom, grid)
@@ -433,18 +443,43 @@ def compile_conv3d_implicit_gfx1250(param: Conv3dImplicitParam1250):
                 fx.make_layout(1, 1),
             )
             st1_atom = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), elem_ty)
+            st8_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), elem_ty)
             y_rsrc = big_st_ptr_ty = None
 
         apply_bias = const_expr(param.has_bias and not use_splitk)
         if apply_bias:
-            bias_div = fx.logical_divide(
-                fx.rocdl.make_buffer_tensor(bias), fx.make_layout(1, 1)
-            )
+            bias_buf = fx.rocdl.make_buffer_tensor(bias)
+            bias_div = fx.logical_divide(bias_buf, fx.make_layout(1, 1))
             bias_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
             bias_reg = fx.make_rmem_tensor(1, fx.Float32)
+            if const_expr(VEC_EPILOGUE):
+                bias_quads = fx.logical_divide(bias_buf, fx.make_layout(4, 1))
+                bias4_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Float32)
+
+        def bias_for(wn):
+            """This lane's 8 bias values of WMMA column block wn (two dwordx4 loads)."""
+            col_off0 = warp_n_base + wn * WMMA_N + lane_kgrp * 8
+            col_base = fx.Int32(n_offset + col_off0)
+            if const_expr(kernel_grid.n_tail):
+                in_grp = fx.Int64(n_local) + col_off0 < fx.Int64(kernel_grid.kg)
+                col_base = in_grp.select(col_base, fx.Int32(0))
+            elems = []
+            for half in range_constexpr(2):
+                r = fx.make_rmem_tensor(4, fx.Float32)
+                fx.copy(
+                    bias4_atom,
+                    fx.slice(bias_quads, (None, col_base // 4 + half)),
+                    r,
+                )
+                v = fx.Vector(r.load())
+                for i in range_constexpr(4):
+                    elems.append(v[i])
+            return fx.Vector.from_elements(elems, fx.Float32)
 
         def store_accs(final_accs):
             k_out = param.k
+            if const_expr(apply_bias and VEC_EPILOGUE):
+                bias_vecs = [bias_for(wn) for wn in range_constexpr(wmma_n_rep)]
             for wm in range_constexpr(wmma_m_rep):
                 local_m = warp_m_base + wm * WMMA_M + lane16
                 oh = oh0 + local_m // C
@@ -454,7 +489,9 @@ def compile_conv3d_implicit_gfx1250(param: Conv3dImplicitParam1250):
                     col_off0 = warp_n_base + wn * WMMA_N + lane_kgrp * 8
                     col_base = n_offset + col_off0
                     acc = fx.Vector(final_accs[wm * wmma_n_rep + wn])
-                    if apply_bias:
+                    if const_expr(apply_bias and VEC_EPILOGUE):
+                        acc = acc + bias_vecs[wn]
+                    elif apply_bias:
                         bias_elems = []
                         for e in range_constexpr(8):
                             col_i = fx.Int32(col_base + e)
@@ -489,6 +526,27 @@ def compile_conv3d_implicit_gfx1250(param: Conv3dImplicitParam1250):
                         continue
 
                     h_vec = acc.to(elem_ty)
+                    if const_expr(VEC_EPILOGUE):
+                        # 8 consecutive NDHWC channels, 16-byte aligned: one store.
+                        off = (
+                            ((n_idx * do_v + ot) * ho_v + oh) * wo_v * k_out
+                            + ow * k_out
+                            + col_base
+                        )
+                        valid = row_ok
+                        if const_expr(kernel_grid.n_tail):
+                            valid = valid & (
+                                fx.Int64(n_local) + col_off0 < fx.Int64(kernel_grid.kg)
+                            )
+                        routed = valid.select(
+                            fx.Int32(off), fx.Int32(OOB_SENTINEL_ELEM)
+                        )
+                        fx.copy(
+                            st8_atom,
+                            rmem_vec(h_vec, 8, elem_ty),
+                            fx.slice(y_div, (None, routed)),
+                        )
+                        continue
                     for e in range_constexpr(8):
                         col = col_base + e
                         if const_expr(kernel_grid.n_tail):
