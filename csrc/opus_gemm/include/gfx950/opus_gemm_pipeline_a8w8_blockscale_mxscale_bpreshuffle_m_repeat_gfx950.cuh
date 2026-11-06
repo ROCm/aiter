@@ -664,7 +664,11 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_pingpong_lds_body(
         read_scales(tile_k + 1, v_sfa_next, v_sfb_next);
         static_for<T::E_M>([&](auto m_i) {
             constexpr int m = decltype(m_i)::value;
-            s_waitcnt_lgkmcnt(0_I);
+            // A ring groups become ready together; release waits for all final
+            // current-tile reads before its LDS slot is reused.
+            if constexpr (m == T::E_M - T::A_RING ||
+                (m < T::E_M - T::A_RING && m % T::A_RING == 0))
+                s_waitcnt_lgkmcnt(0_I);
             if constexpr (m == T::E_M - T::A_RING) {
                 // All current A fragments are resident; release the LDS slot
                 // while the final register fragments still have MFMA consumers.
@@ -703,7 +707,8 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_pingpong_lds_body(
     auto finish_tile = [&](auto stage_i) {
         static_for<T::E_M>([&](auto m_i) {
             constexpr int m = decltype(m_i)::value;
-            s_waitcnt_lgkmcnt(0_I);
+            if constexpr (m % T::A_RING == 0)
+                s_waitcnt_lgkmcnt(0_I);
             static_for<T::E_N>([&](auto n_i) { mma_scale_fragment(m_i, n_i); });
             if constexpr (m + T::A_RING < T::E_M)
                 load_a_fragment(number<m + T::A_RING>{}, stage_i);
@@ -737,7 +742,7 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_pingpong_lds_body(
     // ===== Prologue =====
     // Publish scales and the first matrix tile, then prefetch K+1.
     if constexpr ((((!T::FRAGMENT_ARRAYS && (T::E_M == 3 || T::E_M == 4))
-        || (T::FRAGMENT_ARRAYS && T::E_M == 2)) && T::SCALE_PANEL <= 32)
+        || T::E_M <= 2) && T::SCALE_PANEL <= 32)
         || (!T::FRAGMENT_ARRAYS && T::E_M == 4 && T::E_N == 4 && T::SCALE_PANEL == 64 && T::T_M == 2)) {
         // Publish scales while the first matrix tile is still in flight.
         load_sfa_panel(0);

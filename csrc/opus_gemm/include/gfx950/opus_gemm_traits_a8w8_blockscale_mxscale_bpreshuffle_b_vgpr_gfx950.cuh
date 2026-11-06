@@ -59,6 +59,7 @@ struct opus_gemm_blockscale_mxscale_bpreshuffle_prefetch_b_vgpr_traits {
     static constexpr bool CONTIGUOUS = Contiguous;
     static constexpr bool PIN_A = PinA;
     static constexpr bool PIN_C = PinC;
+    static constexpr int C_AGPR_BASE = PinA ? 128 : 0;
 
     // Bound pinned fragments to the supported AGPR ranges.
     static_assert(!PinA || (B_K / 128) * MR * 8 <= 128);
@@ -213,6 +214,8 @@ public:
     static constexpr bool PARTIAL_A = NORMAL_PINNED_PARTIAL || NORMAL_PIN_A_PARTIAL
         || SHORT_PIN_A_PARTIAL || SHORT_PIN_AC_PARTIAL || SHORT_PIN_C_PARTIAL;
     static constexpr int A_READ_LEAD = []() constexpr {
+        if constexpr (SHORT_A_LEAD_THREE && PIN_A_ONLY && WAVES_N == 4
+            && PublishM < 0 && T::SCALE_COLS <= 4) return 2;
         if constexpr (NORMAL_PIN_C_LEAD_THREE) return 3;
         if constexpr (NORMAL_PINNED_PARTIAL || NORMAL_PIN_A_PARTIAL) return 4;
         if constexpr (SHORT_A_LEAD_THREE || PublishM >= 0) return 3;
@@ -247,6 +250,8 @@ public:
         return PublishM;
     }();
     static constexpr int B_AHEAD = []() constexpr {
+        if constexpr (!Short && PIN_C_ONLY && !MEMORY_HEAVY)
+            return T::B_AHEAD < 3 ? T::B_AHEAD : 3;
         // Four B slots match early A publication and the rotating K256 ring.
         if constexpr (SingleCache && !Short && !T::ROTATE_B && !STREAM_A
             && BM == 64 && BN == 128 && BK == 256 && WAVES_N == 2
@@ -339,7 +344,7 @@ public:
     // Compile-time eligibility; the pipeline checks the runtime K capacity.
     static constexpr bool SMALL_SCALE_CACHE = Short && T::SCALE_COLS == 16
         && PIN_A_ONLY && K_SLICES == 1
-        && ((MR == 6 && NR == 4 && T::STAGES == 4 && WAVES_N == 4 && PublishM == 0)
+        && ((MR == 6 && NR == 4 && T::STAGES == 4 && WAVES_N == 4 && PublishM <= 0)
             || (NR >= 4 && MR * NR >= 32));
 
     static constexpr bool PINNED_SCALE_CACHE = !Short && !SingleCache && T::B_K == 128 && T::STAGES == 4
@@ -385,7 +390,7 @@ public:
         && K_SLICES == 1 && (MR == 4 || (MR == 8 && PublishM < 0)) && NR == 2 && WAVES_N == 4 && T::STAGES == 4;
     static constexpr bool SHORT_SMALL_SCALE_OUTPUT = Short && T::STORE_CACHE == 2
         && K_SLICES == 1 && T::STAGES == 4 && WAVES_N == 4
-        && ((PublishM >= 0 && T::SCALE_COLS <= 4 && T::PIN_A && !T::PIN_C && MR == 6 && NR == 4)
+        && ((PublishM >= 0 && T::PIN_A && !T::PIN_C && MR == 6 && NR == 4)
             || (!T::PIN_A && T::PIN_C && MR == 8 && NR == 4));
     static constexpr int C_STORE_CACHE = (SHORT_COALESCED_OUTPUT || SHORT_SMALL_SCALE_OUTPUT) ? 17 : T::STORE_CACHE;
     static constexpr bool ZERO_UNUSED_B_PREFETCH = Short && MEMORY_HEAVY && (MR <= 4 || (T::PIN_A && MR == 8 && K_SLICES == 1 && T::STAGES == 4 && PublishM < 0)) && NR <= 2 && !T::PIN_C;

@@ -398,6 +398,13 @@ __device__ __forceinline__ void bulk_panel_body(opus_gemm_blockscale_mxscale_bpr
     using namespace opus;
 
     using T = opus::remove_cvref_t<Traits>;
+    if constexpr (!Short && !T::PIN_A && !T::PIN_C) {
+        using ShortT = opus_gemm_bpreshuffle_b_short_traits<T>;
+        if (args.k <= ShortT::SCALE_COLS * T::GROUP_K) {
+            bulk_panel_body<ShortT, PublishM, true, false, ArenaTraits>(args);
+            return;
+        }
+    }
     using Index = unsigned;
     constexpr int WaveColumns = T::T_N;
     using Schedule = opus_gemm_bpreshuffle_b_schedule<T, PublishM, Short, SingleCache>;
@@ -423,6 +430,14 @@ __device__ __forceinline__ void bulk_panel_body(opus_gemm_blockscale_mxscale_bpr
         }
     }
 
+    // A checked single-panel capacity is a range of runtime K values.
+    if constexpr (!Short && !SingleCache && !T::PIN_A && !T::PIN_C) {
+        if (args.k > 0 && args.k / T::GROUP_K <= T::SCALE_COLS) {
+            bulk_panel_body<T, PublishM, false, true, ArenaTraits>(args);
+            return;
+        }
+    }
+
     // Tile geometry and the schedule derived by traits.
     constexpr int BM = T::B_M;
     constexpr int BN = T::B_N;
@@ -444,6 +459,8 @@ __device__ __forceinline__ void bulk_panel_body(opus_gemm_blockscale_mxscale_bpr
     constexpr int SCALE_K_TILES = Schedule::SCALE_K_TILES;
     constexpr bool ROTATE_RING = Schedule::ROTATE_RING;
     constexpr bool STAGED_A = Schedule::STAGED_A;
+    constexpr bool UNROLL_CACHE = !Short && SingleCache && !T::PIN_A && !T::PIN_C
+        && SCALE_K_TILES * KS * NR * MR <= 1024;
 
     const int M = args.m;
     const int N = args.n;
@@ -451,6 +468,11 @@ __device__ __forceinline__ void bulk_panel_body(opus_gemm_blockscale_mxscale_bpr
     const unsigned K = args.k;
     const unsigned P = K / BK;
     const unsigned SC = K / T::GROUP_K;
+    if constexpr (SingleCache) __builtin_assume(P <= SCALE_K_TILES);
+    if constexpr (!Short && !T::PIN_A && !T::PIN_C) {
+        using ShortT = opus_gemm_bpreshuffle_b_short_traits<T>;
+        __builtin_assume(P > ShortT::SCALE_COLS / KS);
+    }
     if constexpr (Short)
         if (SC > T::SCALE_COLS) return;
     const int stride_a = T::CONTIGUOUS ? K : args.stride_a;
@@ -476,7 +498,11 @@ __device__ __forceinline__ void bulk_panel_body(opus_gemm_blockscale_mxscale_bpr
             return;
     const int row = M <= BM ? 0 : (tile / gn) * BM;
     const int col = M <= BM ? tile * BN : (tile % gn) * BN;
-    const int valid_rows = M % BM == 0 ? BM : (M <= BM ? M : (row == (gm - 1) * BM ? M % BM : BM));
+    // The live rows are the remaining rows, capped by this tile.
+    const int valid_rows = (Short && T::PIN_A && !T::PIN_C && KS == 1
+        && NR >= 4 && PublishM < 0 && T::SCALE_COLS <= 4)
+        ? (M - row < BM ? M - row : BM)
+        : (M % BM == 0 ? BM : (M <= BM ? M : (row == (gm - 1) * BM ? M % BM : BM)));
 
     constexpr int F = KS * NR;
     constexpr int MAX_ROWS = BM;
@@ -660,7 +686,7 @@ __device__ __forceinline__ void bulk_panel_body(opus_gemm_blockscale_mxscale_bpr
             constexpr int last = decltype(count(number<INITIAL_A>{}))::value;
             if constexpr (last_panel) {
                 s_waitcnt_vmcnt(number<(first > 63 ? 63 : first)>{});
-            } else if constexpr ((Short && T::PIN_C) || !tail || (steady == first && first == last)) {
+            } else if constexpr (UNROLL_CACHE || (Short && T::PIN_C) || !tail || (steady == first && first == last)) {
                 s_waitcnt_vmcnt(number<(steady > 63 ? 63 : steady)>{});
             } else {
                 if (remaining > INITIAL_A)
@@ -778,17 +804,17 @@ __device__ __forceinline__ void bulk_panel_body(opus_gemm_blockscale_mxscale_bpr
             });
 
             if constexpr (!last_panel && fragment == 0 && PublishM < 0)
-                if ((Short && T::PIN_C) || !tail || remaining > INITIAL_A)
+                if (UNROLL_CACHE || (Short && T::PIN_C) || !tail || remaining > INITIAL_A)
                     issue_a(!ROTATE_RING && PERIOD % NB == 0 ? (phase + NB - 1) % NB
-                        : (t + NB - 1) % NB, t + NB - 1, Short && T::PIN_C && tail);
+                        : (t + NB - 1) % NB, t + NB - 1, (UNROLL_CACHE || (Short && T::PIN_C)) && tail);
 
             auto compute_b = [&](auto bank_i) {
                 static_for<MR>([&](auto mi) {
                     constexpr int m = decltype(mi)::value;
                     constexpr int ci = m * NR + n;
                     if constexpr (T::PIN_C) {
-                        [[clang::amdgpu_pin_agpr(128 + ci * 4)]] r_c[ci] = r_c[ci];
-                        [[clang::amdgpu_pin_agpr(128 + ci * 4)]]
+                        [[clang::amdgpu_pin_agpr(T::C_AGPR_BASE + ci * 4)]] r_c[ci] = r_c[ci];
+                        [[clang::amdgpu_pin_agpr(T::C_AGPR_BASE + ci * 4)]]
                         r_c[ci] = Base{}(r_a[STREAM_A ? 0 : ks][m], r_b[decltype(bank_i)::value], r_c[ci],
                             static_cast<int>(r_sfa[ks][m / T::VEC_SF]), static_cast<int>(r_sfb[ks]), number<m % T::VEC_SF>{}, number<n / 8>{});
                     } else {
@@ -806,9 +832,9 @@ __device__ __forceinline__ void bulk_panel_body(opus_gemm_blockscale_mxscale_bpr
                         __builtin_amdgcn_sched_barrier(0);
                     }
                     if constexpr (!last_panel && fragment == 0 && m == PUBLISH_A)
-                        if ((Short && T::PIN_C) || !tail || remaining > INITIAL_A)
+                        if (UNROLL_CACHE || (Short && T::PIN_C) || !tail || remaining > INITIAL_A)
                             issue_a(!ROTATE_RING && PERIOD % NB == 0 ? (phase + NB - 1) % NB
-                        : (t + NB - 1) % NB, t + NB - 1, Short && T::PIN_C && tail);
+                        : (t + NB - 1) % NB, t + NB - 1, (UNROLL_CACHE || (Short && T::PIN_C)) && tail);
                 });
             };
             compute_b(number<(ROTATE_RING ? fragment : absolute) % BS>{});
@@ -836,7 +862,23 @@ __device__ __forceinline__ void bulk_panel_body(opus_gemm_blockscale_mxscale_bpr
     });
     publish_sfa_panel(0);
     // Main loop.
-    if constexpr (Short && T::PIN_C && PERIOD == 1 && INITIAL_A == 1) {
+    if constexpr (UNROLL_CACHE) {
+        auto consume_cache = [&]<int Tile>(auto&& self) {
+            if (Tile + 1 >= P) return;
+            consume_panel(Tile, number<Tile>{}, number<1>{});
+            if constexpr (Tile + 1 < SCALE_K_TILES)
+                self.template operator()<Tile + 1>(self);
+        };
+        consume_cache.template operator()<0>(consume_cache);
+        // The existing ring period selects one drain state for runtime P-1.
+        const unsigned final_tile = P - 1;
+        const unsigned final_phase = (final_tile - INITIAL_A) % PERIOD;
+        static_for<PERIOD>([&](auto phase_i) {
+            constexpr int phase = INITIAL_A + decltype(phase_i)::value;
+            if (final_phase == decltype(phase_i)::value)
+                consume_panel(final_tile, number<phase>{}, number<2>{});
+        });
+    } else if constexpr (Short && T::PIN_C && PERIOD == 1 && INITIAL_A == 1) {
         consume_panel(0, number<0>{}, number<1>{});
         if (P > 1) {
 #pragma nounroll
@@ -917,7 +959,14 @@ __device__ __forceinline__ void bulk_panel_body(opus_gemm_blockscale_mxscale_bpr
         drain.template operator()<0>(drain);
     }
 
+    if constexpr (UNROLL_CACHE) s_waitcnt_vmcnt(0_I);
     constexpr int C_STORE_CACHE = Schedule::C_STORE_CACHE;
+    // Only extend the existing short overlap policy when C fits gfx950 L2.
+    // Preserve the four-column cache route and streaming output beyond L2.
+    constexpr bool OUTPUT_CACHE_WORKING_SET = Short && T::SCALE_COLS > 4
+        && Schedule::SHORT_SMALL_SCALE_OUTPUT && T::PIN_A && !T::PIN_C;
+    constexpr unsigned long long OUTPUT_L2_BYTES = 8ULL * 4 * 1024 * 1024;
+    const bool output_fits_l2 = static_cast<unsigned long long>(M) * N * sizeof(bf16_t) <= OUTPUT_L2_BYTES;
     // Output writeback.
     // Pack BF16 directly or reuse LDS for contiguous stripes.
     if constexpr (T::OUTPUT == 2) {
@@ -952,31 +1001,34 @@ __device__ __forceinline__ void bulk_panel_body(opus_gemm_blockscale_mxscale_bpr
                     output[i] = load<8>(s_c, u_sc_copy.offsets[i]);
             });
             __builtin_amdgcn_sched_barrier(0);
-            if constexpr (Short && T::PIN_A && !T::PIN_C && KS == 1
-                && (NR >= 4 || ((MR == 4 || MR == 8) && NR == 2 && T::STAGES == 4))) {
-                constexpr int OUTPUT_GROUP = NR == 2 ? 2 : 8;
-                static_for<(CHUNKS + OUTPUT_GROUP - 1) / OUTPUT_GROUP>([&](auto group_i) {
-                    constexpr int begin = decltype(group_i)::value * OUTPUT_GROUP;
-                    constexpr int copies = CHUNKS - begin < OUTPUT_GROUP ? CHUNKS - begin : OUTPUT_GROUP;
-                    s_waitcnt_lgkmcnt(number<CHUNKS - begin - copies>{});
-                    static_for<copies>([&](auto copy_i) {
-                        constexpr int i = begin + decltype(copy_i)::value;
-                        const int index = i * T::BLOCK_SIZE + thread_id;
-                        const int rr = index / (BN / 8);
-                        if (rr < PART_ROWS && part * C_ROWS + rr < valid_rows)
+            constexpr bool GROUPED_OUTPUT = (Short && T::PIN_A && !T::PIN_C && KS == 1
+                && (NR >= 4 || ((MR == 4 || MR == 8) && NR == 2 && T::STAGES == 4)))
+                || (!Short && !T::PIN_A && !T::PIN_C && CHUNKS <= 4);
+            constexpr bool DESCRIPTOR_BOUNDED_OUTPUT = Short && GROUPED_OUTPUT
+                && PublishM < 0 && NR >= 4;
+            // The C resource descriptor already discards rows beyond valid_rows.
+            constexpr int OUTPUT_GROUP = GROUPED_OUTPUT
+                ? (!Short || NR == 2 ? 2 : (PublishM < 0 ? 4 : 8)) : CHUNKS;
+            static_for<(CHUNKS + OUTPUT_GROUP - 1) / OUTPUT_GROUP>([&](auto group_i) {
+                constexpr int begin = decltype(group_i)::value * OUTPUT_GROUP;
+                constexpr int copies = CHUNKS - begin < OUTPUT_GROUP ? CHUNKS - begin : OUTPUT_GROUP;
+                s_waitcnt_lgkmcnt(number<CHUNKS - begin - copies>{});
+                static_for<copies>([&](auto copy_i) {
+                    constexpr int i = begin + decltype(copy_i)::value;
+                    const int index = i * T::BLOCK_SIZE + thread_id;
+                    const int rr = index / (BN / 8);
+                    if (rr < PART_ROWS && (DESCRIPTOR_BOUNDED_OUTPUT || part * C_ROWS + rr < valid_rows)) {
+                        if constexpr (OUTPUT_CACHE_WORKING_SET) {
+                            if (output_fits_l2)
+                                store<8>(g_c, output[i], part * C_ROWS * stride_c + u_gc_copy.offsets[i], 0, number<17>{});
+                            else
+                                store<8>(g_c, output[i], part * C_ROWS * stride_c + u_gc_copy.offsets[i], 0, number<T::STORE_CACHE>{});
+                        } else {
                             store<8>(g_c, output[i], part * C_ROWS * stride_c + u_gc_copy.offsets[i], 0, number<C_STORE_CACHE>{});
-                    });
+                        }
+                    }
                 });
-            } else {
-            s_waitcnt_lgkmcnt(0_I);
-            static_for<CHUNKS>([&](auto ii) {
-                constexpr int i = decltype(ii)::value;
-                const int index = i * T::BLOCK_SIZE + thread_id;
-                const int rr = index / (BN / 8);
-                if (rr < PART_ROWS && part * C_ROWS + rr < valid_rows)
-                    store<8>(g_c, output[i], part * C_ROWS * stride_c + u_gc_copy.offsets[i], 0, number<C_STORE_CACHE>{});
             });
-            }
         });
     }
     s_waitcnt_vmcnt(0_I);

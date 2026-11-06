@@ -2891,7 +2891,7 @@
         "-mllvm",
         "-amdgpu-function-calls=false",
         "-mllvm",
-        "-enable-post-misched=0"
+        "-enable-post-misched=1"
       ],
       "wide_output": true,
       "max_k": null,
