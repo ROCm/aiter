@@ -662,7 +662,7 @@ class FlyQuickAllReduce:
 class QuickAllReduceInt4(FlyQuickAllReduce):
     """vLLM alias, which builds ``QuickAllReduceInt4(group=, device=, rank=,
     world_size=)`` and calls ``compile``, ``allreduce`` and ``close`` on it.
-    ``algorithm`` defaults to ``"mesh"``. Use ``FlyQuickAllReduce`` in new code 
+    ``algorithm`` defaults to ``"mesh"``. Use ``FlyQuickAllReduce`` in new code
      and remove this class once vLLM is updated to use the Aiter communication
      dispatcher interface.
     """

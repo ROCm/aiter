@@ -3501,6 +3501,7 @@ def test_quick_allreduce_first_call_in_capture(tp):
         "min_sqnr_db": min((row["sqnr_db"] for row in rows0), default=float("nan")),
     }
 
+
 ZERO_BYTES_TIMEOUT_S = 300
 ZERO_BYTES_HIDDENS = (4096, 2880)
 # The plain engine's payload after the empty call.
