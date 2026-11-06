@@ -2029,7 +2029,10 @@ _FUSE_TP_ROUTE_QUANT_MAX_EXPERTS = 256
 _FUSE_TP_ROUTE_QUANT_MAX_NUMEL = _FUSED_ROUTE_PSUM_MAX_NUMEL
 
 
+@functools.cache
 def _fuse_tp_route_quant_enabled() -> bool:
+    """AITER_TDM_FUSE_TP_ROUTE_QUANT (default on), read once per process; a
+    test that changes it calls ``_fuse_tp_route_quant_enabled.cache_clear()``."""
     return os.environ.get("AITER_TDM_FUSE_TP_ROUTE_QUANT", "1") in (
         "1",
         "true",

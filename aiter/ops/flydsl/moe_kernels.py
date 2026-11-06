@@ -3183,6 +3183,21 @@ _TOKEN_MULTIDEST_MIN_TOKENS = 64
 _TOKEN_MULTIDEST_MAX_TOPK = 8
 
 
+@functools.cache
+def token_multidest_quant_enabled() -> bool:
+    """AITER_FLYDSL_TOKEN_MULTIDEST_QUANT (default on), read once per process.
+
+    The quant dispatch and the TP route gates that must agree with it ask on
+    every MoE call; a test that changes the variable calls
+    ``token_multidest_quant_enabled.cache_clear()``.
+    """
+    return os.environ.get("AITER_FLYDSL_TOKEN_MULTIDEST_QUANT", "1") in (
+        "1",
+        "true",
+        "True",
+    )
+
+
 def token_multidest_eligible(token_num: int, topk: int) -> bool:
     """Whether the routing takes the token-multidest quant path.
 
@@ -3601,8 +3616,7 @@ def flydsl_moe_fused_quant_preshuffle(
             and num_valid_routes is None
             and 1 < int(source_topk) <= _TOKEN_MULTIDEST_MAX_TOPK
             and token_num >= _TOKEN_MULTIDEST_MIN_TOKENS
-            and os.environ.get("AITER_FLYDSL_TOKEN_MULTIDEST_QUANT", "1")
-            in ("1", "true", "True")
+            and token_multidest_quant_enabled()
         )
         if fuse_tp_route and token_multidest_eligible(token_num, source_topk):
             from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
@@ -3618,8 +3632,7 @@ def flydsl_moe_fused_quant_preshuffle(
             if (
                 md_ksplit > 1
                 and row_to_token is None
-                and os.environ.get("AITER_FLYDSL_TOKEN_MULTIDEST_QUANT", "1")
-                in ("1", "true", "True")
+                and token_multidest_quant_enabled()
             ):
                 launch = _get_compiled_token_multidest_tp_route_quant(
                     feat_dim=feat_dim,

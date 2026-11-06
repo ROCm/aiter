@@ -17,6 +17,15 @@ from aiter.ops.flydsl.kernels.moe_route_maps import DROPPED_ROUTE_ROW
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, ptr_arg
 
 
+@pytest.fixture(autouse=True)
+def _fresh_env_switches():
+    # AITER_TDM_FUSE_TP_ROUTE_QUANT is read once per process: tests that set it
+    # clear the cached value, and none leaks into the next test.
+    gm._fuse_tp_route_quant_enabled.cache_clear()
+    yield
+    gm._fuse_tp_route_quant_enabled.cache_clear()
+
+
 @pytest.fixture
 def fixed():
     if not torch.cuda.is_available():
@@ -108,6 +117,7 @@ def test_route_reference_and_replay(experts, numel, pattern, fixed):
 def test_public_moe_padding_matches_split(fmt, valid, fuse_quant, monkeypatch, fixed):
     # fuse_quant=1 folds this route into the activation quant launch.
     monkeypatch.setenv("AITER_TDM_FUSE_TP_ROUTE_QUANT", fuse_quant)
+    gm._fuse_tp_route_quant_enabled.cache_clear()
     spec = importlib.util.spec_from_file_location(
         "_route_safety_moe_reference",
         W / "op_tests/flydsl_tests/test_flydsl_grouped_gemm.py",
