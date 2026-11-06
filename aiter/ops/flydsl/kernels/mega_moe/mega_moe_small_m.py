@@ -32,6 +32,7 @@ from ..mxfp4_gemm_common import _fabs_f32 as fabs_f32
 from ..mxfp4_gemm_common import lds_typed_ptr, lds_vec_load
 from ..tensor_shim import _preload_compiled, _run_compiled
 from .dispatch import _wave_inclusive_scan_i32, _wave_reduce_max_i32
+from .gemm1 import _LdsF32View
 from .mega_moe_fused_gemm import (
     SMALL_M_FIXED_SLOT_MAX_MTPR,
     TOKEN_BUCKETS,
@@ -39,7 +40,6 @@ from .mega_moe_fused_gemm import (
     MegaMoEConfig,
     _buffer_load,
     _buffer_store,
-    _LdsF32View,
     _make_buffer,
     _make_buffer_from_addr,
     build_fused_gemm1,

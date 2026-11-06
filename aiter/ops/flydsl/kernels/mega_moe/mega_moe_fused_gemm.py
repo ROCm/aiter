@@ -11,8 +11,6 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import (
-    Float4E2M1FN,
-    Float8E4M3FN,
     Float32,
     Int32,
     T,
@@ -32,6 +30,9 @@ from ..mxfp4_gemm_common import (
     lds_vec_load,
 )
 from ..tensor_shim import _fx_value_elem, buf_copy_load, buf_copy_store, ptr_buf_tensor
+from .gemm2 import mma_one_j, scale_mma_atoms, scale_view
+from .gemm_util import _PACK, wait_lds_barrier
+from .mega_moe_config import REFERENCE_EXPERTS_PER_RANK, _fixed_dispatch_cu
 
 TOKEN_BUCKETS = (
     1,
@@ -54,8 +55,6 @@ TOKEN_BUCKETS = (
 SMALL_M_FIXED_SLOT_MAX_MTPR = 512
 # The large-input path runs on an instance of this MTPR only.
 LARGE_M_MTPR = 8192
-REFERENCE_EXPERTS_PER_RANK = 48
-EXPERT_CONFIG_GRANULARITY = 64
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,41 +123,14 @@ def nearest_token_bucket(tokens: int) -> int:
     return upper if upper - tokens <= tokens - lower else lower
 
 
-def expert_config_class(experts_per_rank: int) -> int:
-    return (
-        (experts_per_rank + EXPERT_CONFIG_GRANULARITY - 1)
-        // EXPERT_CONFIG_GRANULARITY
-        * EXPERT_CONFIG_GRANULARITY
-    )
-
-
-def _scale_dispatch_cu(dispatch_cu: int, experts_per_rank: int) -> int:
-    expert_waves = (experts_per_rank + 63) // 64
-    return min(224, dispatch_cu * expert_waves)
-
-
-def _fixed_dispatch_cu(bucket: int) -> int:
-    if bucket <= 1:
-        return 64
-    if bucket <= 8:
-        return 128
-    if bucket <= 16:
-        return 96
-    if bucket <= 32:
-        return 128
-    return min(224, 16 * (bucket.bit_length() + 7))
-
-
-def _select_fixed_stage1(bucket: int, experts_per_rank: int) -> Stage1Config:
+def _select_fixed_stage1(bucket: int) -> Stage1Config:
     grid_mult = max(1, bucket // 4) if bucket <= 16 else 3
     return Stage1Config(
         sort_block_m=32,
         tile_n=256 if bucket <= 8 else 128,
         num_waves=4,
         grid_mult=grid_mult,
-        num_dispatch_cu=_scale_dispatch_cu(
-            _fixed_dispatch_cu(bucket), experts_per_rank
-        ),
+        num_dispatch_cu=_fixed_dispatch_cu(bucket),
         mfma_amajor=False,
         async_a_copy=False,
         use_tile_resource=bucket <= 16,
@@ -182,15 +154,13 @@ def _select_fixed_stage2(bucket: int, model_dim: int) -> Stage2Config:
     )
 
 
-def _large_config(
-    experts_per_rank: int, model_dim: int, inter_dim: int
-) -> MegaMoEConfig:
+def _large_config(model_dim: int, inter_dim: int) -> MegaMoEConfig:
     stage1 = Stage1Config(
         sort_block_m=128,
         tile_n=512 if inter_dim >= 2048 else 256,
         num_waves=8,
         grid_mult=1,
-        num_dispatch_cu=_scale_dispatch_cu(96, experts_per_rank),
+        num_dispatch_cu=96,
         mfma_amajor=True,
         async_a_copy=True,
         use_tile_resource=True,
@@ -211,11 +181,11 @@ def _large_config(
 
 @cache
 def _select_config(
-    bucket: int, mtpr: int, experts_per_rank: int, model_dim: int, inter_dim: int
+    bucket: int, mtpr: int, model_dim: int, inter_dim: int
 ) -> MegaMoEConfig:
     if mtpr == LARGE_M_MTPR:
-        return _large_config(experts_per_rank, model_dim, inter_dim)
-    stage1 = _select_fixed_stage1(bucket, experts_per_rank)
+        return _large_config(model_dim, inter_dim)
+    stage1 = _select_fixed_stage1(bucket)
     stage2 = _select_fixed_stage2(bucket, model_dim)
     return MegaMoEConfig(stage1=stage1, stage2=stage2, p2p_quant="none")
 
@@ -242,13 +212,9 @@ def select_mega_moe_config(
     return _select_config(
         nearest_token_bucket(tokens),
         mtpr,
-        expert_config_class(experts_per_rank),
         model_dim,
         inter_dim,
     )
-
-
-_PACK = 2  # fp4 micro-scale pack (per-32 E8M0): pack_M = pack_N = pack_K = 2
 
 
 class AddrBuffer(NamedTuple):
@@ -328,13 +294,6 @@ def _buffer_store(buffer, group_index, value, elem_ty, width=1, cache_modifier=0
     fragment = fx.make_rmem_tensor(width, elem_ty)
     fragment.store(Vec.from_elements([value], elem_ty) if width == 1 else Vec(value))
     fx.copy(atom, fragment, fx.slice(buffer, (None, group_index)))
-
-
-def wait_lds_barrier(vmcnt=63):
-    """Drain LDS writes and optionally older VMEM while preserving newer loads."""
-    waitcnt = (vmcnt & 0xF) | ((vmcnt & 0x30) << 10) | (7 << 4)
-    fx.rocdl.s_waitcnt(waitcnt)
-    fx.barrier()
 
 
 class TileScheduler:
@@ -1005,11 +964,6 @@ class SiluQuantEpilogue:
         wait_lds_barrier()
 
 
-class _LdsF32View:
-    def __init__(self, ptr):
-        self.ptr = ptr
-
-
 # fmt: off
 @flyc.jit
 def do_tile(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_scale, a_scale, mfma, epi, a_buf,
@@ -1414,75 +1368,6 @@ def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
 
     return expert_of_flat, do_scheduled_tile
 
-
-def scale_view(
-    arg_scale, base_dw, K_TILES_TOTAL, k0_stride_dw=64, num_records_bytes=None
-):
-    """View one e8m0 scale word, optionally bounded to the real buffer extent."""
-    base_dw = rocdl.readfirstlane(T.i32, base_dw)
-    i32_ptr_ty = fx.PointerType.get(
-        T.i32, address_space=fx.AddressSpace.Global, alignment=4
-    )
-    off_i64 = fx.Int64(base_dw)
-    base_iter = fx.inttoptr(i32_ptr_ty, fx.Int64(arg_scale) + off_i64 * fx.Int64(4))
-    shape = (4, 16, K_TILES_TOTAL, 1)
-    stride = (16, 1, k0_stride_dw, 1)
-    view = fx.Tensor(fx.make_view(base_iter, fx.make_layout(shape, stride)))
-    if num_records_bytes is not None:
-        return fx.rocdl.make_buffer_tensor(view, num_records_bytes=num_records_bytes)
-    return fx.rocdl.make_buffer_tensor(view, max_size=False)
-
-
-def scale_mma_atoms(a_dtype):
-    """16 (opselA,opselB) scaled-MFMA atoms; A elem is fp8/fp4, B is fp4."""
-    elem_a = Float8E4M3FN if a_dtype == "fp8" else Float4E2M1FN
-    return {
-        (osa, osb): fx.make_mma_atom(
-            fx.rocdl.cdna4.MFMA_Scale(
-                16, 16, 128, elem_a, Float4E2M1FN, opsel_a=osa, opsel_b=osb
-            )
-        )
-        for osa in range(4)
-        for osb in range(4)
-    }
-
-
-def mma_one_j(
-    J,
-    in_b,
-    sa,
-    sb,
-    bq_frags_kt,
-    a_frags,
-    c_frags,
-    atoms,
-    i0=0,
-    single_rg=False,
-    rg_off=0,
-    k_halves=2,
-):
-    """Run one scaled-MFMA cluster over a 32-row A-scale group."""
-    if const_expr(single_rg):
-        steps = tuple(
-            (2 * k + rg_off, k, i0, bq_frags_kt[J][k]) for k in range(k_halves)
-        )
-    else:
-        steps = tuple(
-            (2 * k + im, k, i0 + im, bq_frags_kt[J][k])
-            for k in range(k_halves)
-            for im in range(2)
-        )
-    for osa, k, i, bJ in steps:
-        osb = 2 * k + in_b
-        fx.gemm(
-            atoms[(osa, osb)],
-            c_frags[i][J],
-            a_frags[i][k],
-            bJ,
-            c_frags[i][J],
-            scale_a=sa,
-            scale_b=sb,
-        )
 
 
 def issue_a_load_lds_dt(
@@ -2051,57 +1936,3 @@ def gemm2_compute_v2(
         [c_frags[i][J].load() for J in range(numAccN)] for i in range(kMChunks)
     ]
     return accm_vecs, m_row, n_block_idx, N_OUT_rt
-
-
-def _spart_output_tile_index(block_1d_id, M0, N0, group_num, m01):
-    """Map a 1D block ID to a spatially local output tile."""
-    gn = fx.Int32(group_num)
-    n0 = fx.Int32(N0)
-    m01c = fx.Int32(m01)
-
-    # group_size = ceil(M0*N0 / GroupNum); big_group_num = GroupNum - (group_size*GroupNum - M0*N0)
-    mn = M0 * n0
-    group_size = (mn + gn - fx.Int32(1)) // gn
-    big_group_num = gn - (group_size * gn - mn)
-
-    group_id_y = block_1d_id // gn
-    group_id_x = block_1d_id - group_id_y * gn
-
-    # remap = group_id_x < big_group_num ? gx*gs + gy : gx*gs + big - gx + gy
-    remap_a = group_id_x * group_size + group_id_y
-    remap_b = group_id_x * group_size + big_group_num - group_id_x + group_id_y
-    remap = (group_id_x < big_group_num).select(remap_a, remap_b)
-
-    idx_M0 = remap // n0
-    idx_N0 = remap - idx_M0 * n0
-
-    # M0_tmp = M0 / M01 ; M0_mod_M01 = M0 - M0_tmp*M01 ; M01_adapt = (idx_M0 < M0 - M0_mod) ? M01 : M0_mod
-    M0_tmp = M0 // m01c
-    M0_mod = M0 - M0_tmp * m01c
-    M01_adapt = (idx_M0 < (M0 - M0_mod)).select(m01c, M0_mod)
-
-    idx_M00 = idx_M0 // m01c
-    idx_M01 = idx_M0 - idx_M00 * m01c
-    idx_local = idx_N0 + idx_M01 * n0
-
-    N_out = idx_local // M01_adapt
-    loc_mod = idx_local - N_out * M01_adapt
-
-    m_block_idx = loc_mod + idx_M00 * m01c
-    n_block_idx = N_out
-    return m_block_idx, n_block_idx
-
-
-def _resolve_g2_knobs(g2_bhoist, g2_ascale_pf, g2_spart, g2_bf16_lds, use_reduce):
-    """Resolve explicit GEMM2 knobs against deterministic defaults."""
-    g2_bhoist = True if g2_bhoist is None else bool(g2_bhoist)
-    g2_ascale_pf = True if g2_ascale_pf is None else bool(g2_ascale_pf)
-    g2_spart = 402 if g2_spart is None else int(g2_spart)
-    g2_group_num = g2_spart // 100 if g2_spart > 0 else 0
-    g2_m01 = g2_spart % 100 if g2_spart > 0 else 0
-    if g2_spart > 0 and (g2_group_num < 1 or g2_m01 < 1):
-        raise AssertionError(
-            f"g2_spart={g2_spart} must encode GroupNum>=1,M01>=1 as GroupNum*100+M01 (e.g. 402)"
-        )
-    g2_bf16_lds = (True if g2_bf16_lds is None else bool(g2_bf16_lds)) and use_reduce
-    return g2_bhoist, g2_ascale_pf, g2_spart, g2_group_num, g2_m01, g2_bf16_lds
