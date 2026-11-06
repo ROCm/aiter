@@ -57,7 +57,7 @@ def batched_gemm_afp4wfp4(
         tuple(w.shape),
     )
 
-    assert arch_info.is_fp4_avail(), "MXFP4 is not available on your device"
+    assert arch_info.is_any_fp4_avail(), "MXFP4 is not available on your device"
 
     w = w.transpose(1, 2)
     Bx, M, K = x.shape
