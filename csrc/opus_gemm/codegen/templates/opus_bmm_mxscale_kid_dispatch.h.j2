@@ -4,8 +4,8 @@
 // Auto-generated. Do not edit.
 #define GENERATE_BMM_MXSCALE_KID_DISPATCH_SIZE [[ size ]]
 #define GENERATE_BMM_MXSCALE_KID_DISPATCH(CTYPE) \
-[% for r in dispatch %]    [[ r ]],[% if not loop.last %]  \[% endif %]
+[% for cu_num, kid, name in dispatch %]    { { [[ cu_num ]], [[ kid ]] }, &[[ name ]]<CTYPE> },[% if not loop.last %]  \[% endif %]
 [% endfor %]
 #define GENERATE_BMM_MXSCALE_KID_GROUPS \
-[% for r in groups %]    [[ r ]],[% if not loop.last %]  \[% endif %]
+[% for cu_num, kid, gn, gk in groups %]    { { [[ cu_num ]], [[ kid ]] }, { [[ gn ]], [[ gk ]] } },[% if not loop.last %]  \[% endif %]
 [% endfor %]

@@ -7,9 +7,9 @@
 // Interfaces remain separate even when argument counts match. Missing kernels
 // use a size-0 table.
 [% for m in maps %]#define [[ m.macro ]]_SIZE [[ m.rows|length ]]
-[% if m.rows %]#define [[ m.macro ]][% if m.func_like %](CTYPE)[% endif %] \
-[% for r in m.rows %]    [[ r ]],[% if not loop.last %]  \[% endif %]
+#define [[ m.macro ]][% if m.func_like %](CTYPE)[% endif %][% if m.rows +%] \
+[% for cu_num, kid, name, ctype in m.rows %]    { { [[ cu_num ]], [[ kid ]] }, &[[ name ]]<[[ ctype ]]> },[% if not loop.last %]  \[% endif %]
 [% endfor %]
-[% else %]#define [[ m.macro ]][% if m.func_like %](CTYPE)[% endif %]
-
-[% endif %][% endfor %]
+[%- else %]
+[% endif %]
+[% endfor -%]

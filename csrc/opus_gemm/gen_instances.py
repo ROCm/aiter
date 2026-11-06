@@ -626,9 +626,6 @@ class opus_gemm_codegen:
     def gen_a16w16_kid_dispatch(self, kernels_dict):
         """Emit per-arch A16W16 direct and workspace launcher tables."""
 
-        def _row(kid, name, ctype):
-            return "{ { %d, %d }, &%s<%s> }" % (kid.cu_num, kid.kid, name, ctype)
-
         def _collect(arch, negate_splitk, ctype):
             rows = []
             for kid, k in kernels_dict.items():
@@ -665,7 +662,9 @@ class opus_gemm_codegen:
                             f"{arch.upper()}_{dtype_suffix}"
                         ),
                         "func_like": True,
-                        "rows": [_row(kid, name, "CTYPE") for kid, name in rows],
+                        "rows": [
+                            (kid.cu_num, kid.kid, name, "CTYPE") for kid, name in rows
+                        ],
                     }
                 )
             ws_rows = _collect(arch, False, "fp32_t")
@@ -673,7 +672,9 @@ class opus_gemm_codegen:
                 {
                     "macro": f"GENERATE_A16W16_WORKSPACE_KID_DISPATCH_{arch.upper()}",
                     "func_like": False,
-                    "rows": [_row(kid, name, "fp32_t") for kid, name in ws_rows],
+                    "rows": [
+                        (kid.cu_num, kid.kid, name, "fp32_t") for kid, name in ws_rows
+                    ],
                 }
             )
 
@@ -685,9 +686,6 @@ class opus_gemm_codegen:
     def gen_a8w8_kid_dispatch(self, kernels_dict):
         """Emit sorted A8W8 launcher tables for each interface."""
 
-        def _row(kid, name, ctype):
-            return "{ { %d, %d }, &%s<%s> }" % (kid.cu_num, kid.kid, name, ctype)
-
         def _rows(arch, tags, ctype):
             rows = []
             for kid, k in kernels_dict.items():
@@ -697,7 +695,7 @@ class opus_gemm_codegen:
                     continue
                 rows.append((kid, k.name))
             rows.sort(key=lambda row: row[0])
-            return [_row(kid, name, ctype) for kid, name in rows]
+            return [(kid.cu_num, kid.kid, name, ctype) for kid, name in rows]
 
         maps = [
             {
@@ -736,18 +734,12 @@ class opus_gemm_codegen:
             for kid, instance in kernels_dict.items()
             if kid.family == "a8w8_mxscale_bmm" and "fp32_t" in instance.output_dtypes
         )
-        dispatch = [
-            "{ { %d, %d }, &%s<CTYPE> }" % (kid.cu_num, kid.kid, name)
-            for kid, name, _gn, _gk in rows
-        ]
+        dispatch = [(kid.cu_num, kid.kid, name) for kid, name, _gn, _gk in rows]
         # The scale-shape check runs before the kid is dispatched, and what shape
         # is correct depends on the kid: GROUP_N and GROUP_K are 128 or 32. So
         # the table below travels with the dispatch table rather than the check
         # hardcoding 128, which is what rejected the first GROUP_K=32 launch.
-        groups = [
-            "{ { %d, %d }, { %d, %d } }" % (kid.cu_num, kid.kid, gn, gk)
-            for kid, _name, gn, gk in rows
-        ]
+        groups = [(kid.cu_num, kid.kid, gn, gk) for kid, _name, gn, gk in rows]
         write_if_changed(
             os.path.join(self.working_path, "opus_bmm_mxscale_kid_dispatch.h"),
             render_template(
