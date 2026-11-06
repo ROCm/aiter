@@ -1161,12 +1161,17 @@ def _run_moe_reduction(
     fp8_pitch_align=None,
     *,
     streaming_loads=False,
+    skip_dropped=False,
 ):
-    """Topk reduction epilogue for stage2 reduce mode."""
+    """Topk reduction epilogue for stage2 reduce mode.
+
+    skip_dropped: leave out slots whose topk_ids are negative (dropped routes),
+    whose rows of target the stage-2 GEMM never writes.
+    """
     use_mask = expert_mask is not None
-    if use_mask and topk_ids is None:
+    if (use_mask or skip_dropped) and topk_ids is None:
         raise ValueError(
-            "topk_ids is required when expert_mask is provided for reduce mode"
+            "topk_ids is required when expert_mask or skip_dropped is set for reduce mode"
         )
     # Map torch dtype -> compile_moe_reduction dtype_str
     if out.dtype == torch.float16:
@@ -1181,7 +1186,7 @@ def _run_moe_reduction(
     if _reduce_dtype_str is None:
         # Unsupported dtype for the masked kernel -- fall back to torch.sum.
         # This drops the EP mask, so only valid for non-EP runs.
-        if use_mask:
+        if use_mask or skip_dropped:
             raise NotImplementedError(
                 f"Masked moe reduction not supported for dtype {out.dtype}"
             )
@@ -1208,13 +1213,17 @@ def _run_moe_reduction(
         )
     else:
         X = target.view(token_num, topk, model_dim)
-    if use_mask:
-        em = expert_mask.to(torch.int32).contiguous()
-        tk = topk_ids.to(torch.int32).contiguous()
-    else:
-        # Placeholders; kernel ignores them when use_mask=False (and for fp8).
-        em = torch.empty(0, device=out.device, dtype=torch.int32)
-        tk = torch.empty(0, device=out.device, dtype=torch.int32)
+    em = (
+        expert_mask.to(torch.int32).contiguous()
+        if use_mask
+        # Placeholder; the kernel ignores it when use_mask=False.
+        else torch.empty(0, device=out.device, dtype=torch.int32)
+    )
+    tk = (
+        topk_ids.to(torch.int32).contiguous()
+        if use_mask or skip_dropped
+        else torch.empty(0, device=out.device, dtype=torch.int32)
+    )
     # Set when stage2 deferred the route-weight multiply to this reduction.
     use_weight = topk_weights is not None
     tw = (
@@ -1232,6 +1241,7 @@ def _run_moe_reduction(
         dtype_str=_reduce_dtype_str,
         use_mask=use_mask,
         num_experts=num_experts,
+        skip_dropped=skip_dropped,
         out_dtype_str=out_dtype_str,
         use_weight=use_weight,
         scale_blk=fp8_scale_blk if is_fp8 else None,
@@ -2148,6 +2158,7 @@ def _flydsl_moe_stage2_impl(
     return_per_slot: bool = False,
     expert_mask: torch.Tensor | None = None,
     topk_ids: torch.Tensor | None = None,
+    skip_dropped_routes: bool = False,
     use_valid_token_count: bool = False,
     _compile_kernel=compile_flydsl_moe_stage2,
     _build_mx_args=_s2_args_fp4,
@@ -2236,6 +2247,7 @@ def _flydsl_moe_stage2_impl(
                 model_dim,
                 expert_mask,
                 topk_ids,
+                skip_dropped=skip_dropped_routes,
             )
         return out
 
@@ -2441,6 +2453,7 @@ def _flydsl_moe_stage2_impl(
             is_fp8=_s2_fp8_inter,
             fp8_scale_blk=_S2_LEGACY_FP8_SCALE_BLK,
             fp8_pitch_align=_S2_LEGACY_FP8_PITCH_ALIGN,
+            skip_dropped=skip_dropped_routes,
         )
     return out
 
@@ -2477,6 +2490,7 @@ def flydsl_moe_stage2(
     return_per_slot: bool = False,
     expert_mask: torch.Tensor | None = None,
     topk_ids: torch.Tensor | None = None,
+    skip_dropped_routes: bool = False,
     use_valid_token_count: bool = False,
 ) -> torch.Tensor:
     """Down-projection GEMM (MOE stage2). Supports atomic/reduce modes.
@@ -2500,6 +2514,8 @@ def flydsl_moe_stage2(
         ``valid = expert_mask[topk_ids[t, k]] != 0`` and only sums valid
         slots. expert_mask is [num_experts] i32, topk_ids is [token_num, topk] i32.
 
+    skip_dropped_routes: with mode="reduce", leave out slots whose topk_ids are
+        negative (dropped routes), whose per-slot rows the GEMM never writes.
     use_valid_token_count: atomic a16w-mix only; bound scatter rows by
         num_valid_ids[1] (the sort's real token count) when out is padded.
     """
@@ -2534,6 +2550,7 @@ def flydsl_moe_stage2(
         return_per_slot=return_per_slot,
         expert_mask=expert_mask,
         topk_ids=topk_ids,
+        skip_dropped_routes=skip_dropped_routes,
         use_valid_token_count=use_valid_token_count,
     )
 
