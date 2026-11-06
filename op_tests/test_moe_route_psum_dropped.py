@@ -104,7 +104,10 @@ def test_route_reference_and_replay(experts, numel, pattern, fixed):
 
 @pytest.mark.parametrize("fmt", ["a4w4", "a8w4"])
 @pytest.mark.parametrize("valid", [0, 7, 16])
-def test_public_moe_padding_matches_split(fmt, valid, monkeypatch, fixed):
+@pytest.mark.parametrize("fuse_quant", ["0", "1"])
+def test_public_moe_padding_matches_split(fmt, valid, fuse_quant, monkeypatch, fixed):
+    # fuse_quant=1 folds this route into the activation quant launch.
+    monkeypatch.setenv("AITER_TDM_FUSE_TP_ROUTE_QUANT", fuse_quant)
     spec = importlib.util.spec_from_file_location(
         "_route_safety_moe_reference",
         W / "op_tests/flydsl_tests/test_flydsl_grouped_gemm.py",
@@ -158,7 +161,10 @@ def test_public_moe_padding_matches_split(fmt, valid, monkeypatch, fixed):
 
         monkeypatch.setattr(gm, "fused_route_psum_remap", counted_route)
         got = fm.fused_moe(*a, **kw)
-        assert route_calls, "Public call must exercise the fused route"
+        if fuse_quant == "1":
+            assert not route_calls, "The quant launch must own the fused route"
+        else:
+            assert route_calls, "Public call must exercise the fused route"
         assert torch.isfinite(got).all() and (got[valid:] == 0).all()
         torch.testing.assert_close(got, expected, rtol=0, atol=0)
         if valid:

@@ -83,6 +83,7 @@ from aiter.ops.flydsl.kernels.tensor_shim import (
     ptr_buf_tensor,
 )
 from aiter.ops.flydsl.kernels.tensor_shim import _to_raw as _raw
+from aiter.ops.flydsl.kernels.topk.topk_common import _warp_inclusive_prefix_i32
 from aiter.utility.mx_types import (
     MX_DEFAULT_ROUND_MODE as _ROUND_MODE,
 )
@@ -114,6 +115,182 @@ class _EpPsumScanStorage:
 
     lds0: fx.Array[fx.Int32, BLOCK_THREADS, 16]
     lds1: fx.Array[fx.Int32, BLOCK_THREADS, 16]
+
+
+# Widest expert count the in-block TP route serves: one counter per thread.
+TP_ROUTE_MAX_EXPERTS = BLOCK_THREADS
+# Most routes one quant block owns: a token-multidest block of 8 tokens, topk 8.
+TP_ROUTE_MAX_OWN = 64
+
+
+@fx.struct
+class _TpRouteStorage:
+    """Per-block copy of the TP route that ``moe_route_psum_fused`` computed.
+
+    Every workgroup counts all routes into ``cnt`` and, into ``pre``, only those
+    before its own first route; it keeps its own routes' expert ids in ``own``.
+    ``start`` takes the tile-aligned exclusive prefix of ``cnt`` and
+    ``wave_tot`` the per-wave totals of that scan. A route's row is then
+    ``start[e] + pre[e]`` plus its rank among the block's earlier routes to
+    ``e``: route order within each expert, the same in every block, with no
+    cross-block wait.
+    """
+
+    cnt: fx.Array[fx.Int32, TP_ROUTE_MAX_EXPERTS, 16]
+    pre: fx.Array[fx.Int32, TP_ROUTE_MAX_EXPERTS, 16]
+    start: fx.Array[fx.Int32, TP_ROUTE_MAX_EXPERTS, 16]
+    wave_tot: fx.Array[fx.Int32, BLOCK_THREADS // 32, 16]
+    own: fx.Array[fx.Int32, TP_ROUTE_MAX_OWN, 16]
+
+
+def _emit_tp_route(
+    *,
+    tid,
+    ids,
+    numel,
+    experts,
+    tile_m,
+    first,
+    n_own,
+    slots,
+    writer,
+    masked_m,
+    psum_out,
+    prefetch=None,
+):
+    """Emit the TP route of ``moe_route_psum_fused`` inside one quant block.
+
+    Every thread of the 256-thread block must reach this: it holds four
+    barriers. Each thread loads ``slots`` of the ``numel`` expert ids; the block
+    counts every route into ``cnt`` and those before route ``first`` into
+    ``pre``, keeps the ids of its own routes ``first .. first + n_own`` in
+    ``own``, and leaves the tile-aligned exclusive prefix of the counts in
+    ``start``. Where ``writer`` holds it also stores ``masked_m`` and ``psum``
+    (start + count). Ids outside ``[0, experts)`` are not counted.
+
+    ``prefetch`` is called once the id loads are issued and before the first
+    barrier, which waits on every outstanding load: a caller issues its hidden
+    loads there to overlap them with the route. Returns
+    ``(start, pre, own, prefetched)``.
+    """
+    c0 = fx.Int32(0)
+    c1 = fx.Int32(1)
+    wave_size = 32
+    num_waves = BLOCK_THREADS // wave_size
+    tp = fx.SharedAllocator().allocate(_TpRouteStorage).peek()
+    cnt = tp.cnt.ptr
+    pre = tp.pre.ptr
+    start = tp.start.ptr
+    wave_tot = tp.wave_tot.ptr
+    own = tp.own.ptr
+    ids_t = ptr_buf_tensor(ids)
+    numel_u = fx.Uint32(numel)
+    last = numel_u - 1
+    end = first + fx.Uint32(n_own)
+    experts_i = fx.Int32(experts)
+
+    loaded = []
+    for j in range_constexpr(slots):
+        i = tid + fx.Uint32(j * BLOCK_THREADS)
+        in_range = i < numel_u
+        loaded.append((i, in_range, fx.Int32(ids_t[in_range.select(i, last)])))
+    prefetched = prefetch() if prefetch is not None else None
+    cnt[tid] = c0
+    pre[tid] = c0
+    gpu.barrier()
+
+    # Plain helper, so each runtime guard goes through a local @flyc.jit.
+    def _count_route(live, earlier, mine, e, slot):
+        @flyc.jit
+        def _count():
+            if live:
+                fx.atomic_add(cnt + e, c1, syncscope="workgroup")
+            if earlier:
+                fx.atomic_add(pre + e, c1, syncscope="workgroup")
+            if mine:
+                own[slot] = e
+
+        _count()
+
+    for i, in_range, e in loaded:
+        # Padded and dropped routes carry -1: they claim no row.
+        live = in_range & (e >= c0) & (e < experts_i)
+        _count_route(
+            live,
+            live & (i < first),
+            in_range & (i >= first) & (i < end),
+            e,
+            i - first,
+        )
+    gpu.barrier()
+
+    tile = fx.Uint32(tile_m)
+    m = fx.Uint32(cnt[tid])
+    aligned = fx.Int32((m + tile - 1) // tile * tile)
+    lane = fx.Int32(tid % wave_size)
+    wave = fx.Int32(tid // wave_size)
+    incl = _warp_inclusive_prefix_i32(aligned, lane, wave_size)
+    last_lane = lane == fx.Int32(wave_size - 1)
+
+    @flyc.jit
+    def _publish_wave_total():
+        if last_lane:
+            wave_tot[wave] = incl
+
+    _publish_wave_total()
+    gpu.barrier()
+    first_wave = wave == c0
+
+    @flyc.jit
+    def _scan_wave_totals():
+        if first_wave:
+            active = lane < fx.Int32(num_waves)
+            total = active.select(wave_tot[active.select(lane, c0)], c0)
+            total = _warp_inclusive_prefix_i32(total, lane, wave_size)
+            if active:
+                wave_tot[lane] = total
+
+    _scan_wave_totals()
+    gpu.barrier()
+    has_prev = wave > c0
+    cross = has_prev.select(wave_tot[has_prev.select(wave - 1, c0)], c0)
+    excl = incl + cross - aligned
+    start[tid] = excl
+    store = writer & (tid < fx.Uint32(experts))
+
+    @flyc.jit
+    def _store_counts():
+        if store:
+            ptr_buf_tensor(masked_m)[tid] = fx.Int32(m)
+            ptr_buf_tensor(psum_out)[tid] = excl + fx.Int32(m)
+
+    _store_counts()
+    gpu.barrier()
+    return start, pre, own, prefetched
+
+
+def _emit_hidden_prefetch(c, hidden_base, row, mx_group_base, n_iters):
+    """The hidden dwordx4 loads ``_emit_quant_block_loop`` would issue, early.
+
+    Same row, offsets and descriptor as the loop's own pk8 loads for
+    iterations ``0 .. n_iters``; hand the result in as ``hidden_preloaded``.
+    """
+    rsrc = buffer_ops.create_buffer_resource_from_addr(
+        hidden_base + fx.Uint64(row) * c.feat_bytes_per_row,
+        num_records_bytes=c.feat_bytes_per_row,
+    )
+    loads = []
+    for it in range_constexpr(n_iters):
+        mx_block = (mx_group_base + fx.Int32(it)) * fx.Int32(
+            c.mx_blocks_per_wave_iter
+        ) + c.block_in_wave
+        col_base = mx_block * fx.Int32(32) + c.lane_in_block * c.c_elems_per_lane
+        loads.append(
+            buffer_ops.buffer_load(
+                rsrc, (fx.Int32(0) + col_base) >> fx.Int32(1), vec_width=4, dtype=T.i32
+            )
+        )
+    return loads
 
 
 # Nominal extent of a live destination descriptor; a dead one gets 0 instead.
@@ -397,8 +574,13 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
     chunk_prefetch = getattr(c, "chunk_prefetch", None)
     hidden_lds_load = getattr(c, "hidden_lds_load", None)
 
+    hidden_preloaded = getattr(c, "hidden_preloaded", None)
+
     def _emit_hidden_load(it):
         """This iteration's 8 bf16 (one aligned dwordx4)."""
+        if const_expr(hidden_preloaded is not None):
+            # Issued by the caller ahead of its route work, same address.
+            return hidden_preloaded[it]
         col_base = (
             _mx_block_of(it) * fx.Int32(32) + c.lane_in_block * c.c_elems_per_lane
         )
@@ -1614,6 +1796,8 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
     fuse_ep_psum: bool = False,
     row_major_scale: bool = False,
     payload_preshuffled: bool = False,
+    fuse_tp_route: bool = False,
+    tp_route_slots: int = 1,
 ):
     """Route-indexed grouped quant+preshuffle.
 
@@ -1631,8 +1815,32 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
     the scale preshuffle and drops only the quant -- the preshuffle cannot move
     to the sender, because its destination is a function of the grouped row THIS
     rank assigns, which no sender knows.
+
+    ``fuse_tp_route`` folds the TP route (``moe_route_psum_fused``) into this
+    launch: ``row_starts`` then carries the ``(numel,)`` expert ids, and
+    ``topids_to_rows``, ``masked_m`` and ``psum_out`` become outputs. Every
+    workgroup re-derives the per-expert counts and their tile-aligned prefix in
+    LDS from all the ids, so no workgroup waits on another. Rows within an
+    expert follow route order. Ids outside ``[0, experts)`` keep
+    ``DROPPED_ROUTE_ROW`` and claim no row. ``tp_route_slots`` is how many ids
+    each of the 256 threads loads: ``numel`` must not exceed ``256 *
+    tp_route_slots``.
     """
     L = _quant_layout(feat_dim, quant_mode, wmma_rep)
+    if fuse_tp_route and tp_route_slots < 1:
+        raise ValueError(f"tp_route_slots must be >= 1, got {tp_route_slots}")
+    if fuse_tp_route and (
+        source_topk <= 0
+        or prequantized
+        or remap_rows
+        or fuse_ep_psum
+        or row_major_scale
+        or payload_preshuffled
+    ):
+        raise ValueError(
+            "fuse_tp_route is the bf16 TP route path: it needs source_topk and "
+            "takes no prequantized, remap, EP psum, row-major or A-preshuffle mode"
+        )
     if payload_preshuffled and (quant_mode != "fp4" or feat_dim % 128):
         raise ValueError("preshuffled payload requires MXFP4 and K divisible by 128")
     if not L.use_pk8:
@@ -1680,7 +1888,11 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
 
     source_tag = f"srctk{source_topk}" if source_topk > 0 else "srcrow"
     remap_tag = "_remap" if remap_rows or fuse_ep_psum else ""
-    psum_tag = "_eppsum" if fuse_ep_psum else ""
+    psum_tag = (
+        "_eppsum"
+        if fuse_ep_psum
+        else (f"_tproute{tp_route_slots}" if fuse_tp_route else "")
+    )
     ksplit_tag = "" if ksplit else "_noKS"
     # In the name because it changes what the kernel READS, not just how fast:
     # two builds with the same feat_dim/quant_mode are not interchangeable.
@@ -1702,14 +1914,14 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
         grouped_in: fx.Pointer,  # flat grouped activations
         grouped_payload: fx.Pointer,
         grouped_scale: fx.Pointer,
-        topids_to_rows: fx.Pointer,  # (numel,) int32 global rows
-        row_starts: fx.Pointer,  # (E,) int32, read iff remap_rows
+        topids_to_rows: fx.Pointer,  # (numel,) int32 global rows (written iff fuse_tp_route)
+        row_starts: fx.Pointer,  # (E,) int32 iff remap_rows; (numel,) expert ids iff fuse_tp_route
         route_max_m: Int32,  # masked route stride, read iff remap_rows
         numel: Int32,
         num_valid_routes: fx.Pointer,  # (1,) int32: routes >= this are dead-tail padding (EP dynamic token count); skip
         src_scale: fx.Pointer,  # (tokens, src_scale_bytes_per_row) e8m0, read iff prequantized
-        masked_m: fx.Pointer,  # (E,) int32, read iff fuse_ep_psum
-        psum_out: fx.Pointer,  # (E,) int32, written iff fuse_ep_psum
+        masked_m: fx.Pointer,  # (E,) int32, read iff fuse_ep_psum, written iff fuse_tp_route
+        psum_out: fx.Pointer,  # (E,) int32, written iff fuse_ep_psum or fuse_tp_route
         gather_w: fx.Pointer,  # (numel,) bf16, read iff fuse_ep_psum
         tis: fx.Pointer,  # (recv_cap,) i32, read iff fuse_ep_psum
         ep_rowmap: fx.Pointer,  # (cap_rows+1, 2) i32, written iff fuse_ep_psum
@@ -1804,6 +2016,65 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
                         p_p[tid] = start + fx.Int32(m_p[tid])
                 gpu.barrier()
 
+        tp_pre = None
+        tp_start = None
+        tp_own = None
+        tp_hidden = None
+        if const_expr(fuse_tp_route):
+            # The TP route of moe_route_psum_fused, redone by every workgroup.
+            # Each block reads every id; numel is capped by the caller and the
+            # ids sit in L2.
+            tp_prefetch = None
+            if const_expr(ksplit):
+                # A route's source row is known before its grouped row is, so
+                # the lane's one hidden load goes out ahead of the route work.
+                # Past the last route it reads the last route's row.
+                tp_warp = fx.Uint32(rocdl.readfirstlane(i32, fx.Uint32(tid // c_wave)))
+                tp_lane_w = tid - tp_warp * c_wave
+                tp_route = fx.Uint32(bid * fx.Int32(warps_per_block) + tp_warp)
+                tp_route = (tp_route < fx.Uint32(numel)).select(
+                    tp_route, fx.Uint32(numel) - 1
+                )
+                if const_expr(source_topk_is_pow2):
+                    tp_src_row = tp_route >> c_source_topk_shift
+                else:
+                    tp_src_row = fx.Uint32(tp_route) // fx.Uint32(c_source_topk)
+                tp_block_in_wave = fx.Uint32(tp_lane_w) // fx.Uint32(c_lanes_per_block)
+                tp_pf = SimpleNamespace(
+                    feat_bytes_per_row=src_bytes_per_row,
+                    mx_blocks_per_wave_iter=mx_blocks_per_wave_iter,
+                    block_in_wave=tp_block_in_wave,
+                    lane_in_block=tp_lane_w - tp_block_in_wave * c_lanes_per_block,
+                    c_elems_per_lane=c_elems_per_lane,
+                )
+
+                def tp_prefetch():
+                    return _emit_hidden_prefetch(
+                        tp_pf,
+                        fx.Int64(ptrtoint(grouped_in)),
+                        tp_src_row,
+                        fx.Uint32(fx.block_idx.y),
+                        1,
+                    )
+
+            tp_writer = bid == 0
+            if const_expr(ksplit):
+                tp_writer = tp_writer & (fx.Uint32(fx.block_idx.y) == 0)
+            tp_start, tp_pre, tp_own, tp_hidden = _emit_tp_route(
+                tid=tid,
+                ids=row_starts,
+                numel=numel,
+                experts=experts,
+                tile_m=tile_m,
+                first=bid * fx.Uint32(warps_per_block),
+                n_own=warps_per_block,
+                slots=tp_route_slots,
+                writer=tp_writer,
+                masked_m=masked_m,
+                psum_out=psum_out,
+                prefetch=tp_prefetch,
+            )
+
         # One warp owns one route, so tid // wave is wave-invariant -- but the
         # backend cannot see that. readfirstlane says it, which keeps `route`
         # (and the row and destination descriptor derived from it) uniform;
@@ -1824,10 +2095,35 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
         # route's payload. Dead-tail routes default to the same sentinel, so one
         # predicate covers both.
         row_raw = fx.Int32(DROPPED_ROUTE_ROW)
-        if route_in_range:
-            # Scalar (SMEM) load: `route` is wave-uniform, and landing the row in
-            # an SGPR is what makes the per-row destination descriptor uniform.
-            row_raw = fx.Int32(buf_scalar_load(rows_t, route))
+        if const_expr(fuse_tp_route):
+            if route_in_range:
+                # The expert id is wave-uniform; readfirstlane keeps it, and the
+                # row built from it, in SGPRs like the loaded row it replaces.
+                tp_e_w = fx.Int32(rocdl.readfirstlane(i32, tp_own[warp_in_block]))
+                tp_live = (tp_e_w >= c0_i32) & (tp_e_w < fx.Int32(experts))
+                tp_e_idx = tp_live.select(tp_e_w, c0_i32)
+                # Rank among this block's earlier routes to the same expert.
+                tp_rank = fx.Int32(tp_pre[tp_e_idx])
+                for tp_l in range_constexpr(warps_per_block - 1):
+                    tp_hit = (fx.Uint32(tp_l) < warp_in_block) & (
+                        fx.Int32(tp_own[tp_l]) == tp_e_w
+                    )
+                    tp_rank = tp_rank + tp_hit.select(c1_i32, c0_i32)
+                tp_row = fx.Int32(
+                    rocdl.readfirstlane(i32, fx.Int32(tp_start[tp_e_idx]) + tp_rank)
+                )
+                row_raw = tp_live.select(tp_row, fx.Int32(DROPPED_ROUTE_ROW))
+                tp_store = lane == c0_i32
+                if const_expr(ksplit):
+                    tp_store = tp_store & (fx.Uint32(fx.block_idx.y) == 0)
+                if tp_store:
+                    rows_t[route] = row_raw
+        else:
+            if route_in_range:
+                # Scalar (SMEM) load: `route` is wave-uniform, and landing the row
+                # in an SGPR is what makes the per-row destination descriptor
+                # uniform.
+                row_raw = fx.Int32(buf_scalar_load(rows_t, route))
         row_is_mapped = row_raw >= 0
         if row_is_mapped:
             row = fx.Uint32(row_raw)
@@ -1948,6 +2244,7 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
                 lane=lane,
                 wmma_rep=wmma_rep,
                 row_major_scale=row_major_scale,
+                hidden_preloaded=tp_hidden,
             )
             if const_expr(ksplit):
                 k_group_val = fx.Uint32(fx.block_idx.y)
@@ -2392,6 +2689,260 @@ def build_moe_token_multidest_quant_module(
         },
     }
     return launch_token_multidest
+
+
+def build_moe_token_multidest_tp_route_quant_module(
+    feat_dim: int,
+    wmma_rep: int,
+    topk: int,
+    quant_mode: str = "fp4",
+    ksplit: int = 2,
+    tp_route_slots: int = 1,
+):
+    """Token-multidest quant with the TP route folded in.
+
+    The K-split build of :func:`build_moe_token_multidest_quant_module` (no TDM
+    staging), plus the route ``moe_route_psum_fused`` runs today: each block
+    re-derives the per-expert counts and tile-aligned starts in LDS from all
+    ``topk_ids`` and gives its tokens' routes their rows in route order within
+    each expert. It writes ``topids_to_rows`` (y == 0 blocks), ``masked_m`` and
+    ``psum`` (block 0, 0) beside the payload and scale, so no other launch has
+    to build them. Ids outside ``[0, experts)`` keep ``DROPPED_ROUTE_ROW``.
+    """
+    L = _quant_layout(feat_dim, quant_mode, wmma_rep)
+    if not L.use_pk8:
+        raise NotImplementedError("token multidest quant requires gfx1250 pk8")
+    if ksplit < 2:
+        raise ValueError("the TP route fusion uses the K-split build (ksplit >= 2)")
+    if L.warps_per_block * topk > TP_ROUTE_MAX_OWN:
+        raise ValueError(
+            f"a block owns {L.warps_per_block * topk} routes, over {TP_ROUTE_MAX_OWN}"
+        )
+    if tp_route_slots < 1:
+        raise ValueError(f"tp_route_slots must be >= 1, got {tp_route_slots}")
+    wave_size = L.wave_size
+    warps_per_block = L.warps_per_block
+    lanes_per_mx_block = L.lanes_per_mx_block
+    payload_bytes_per_row = L.payload_bytes_per_row
+    rows_per_tile = L.rows_per_tile
+    dst_scale_dwords_per_row = L.dst_scale_dwords_per_row
+    row_iters = L.block_iters
+    if row_iters % ksplit:
+        raise ValueError(
+            f"ksplit={ksplit} must divide the row's {row_iters} wave iterations"
+        )
+    block_iters = row_iters // ksplit
+    n_own = warps_per_block * topk
+    scale_pack_dwords = lanes_per_mx_block == 4
+    module_name = (
+        f"moe_token_multidest_quant_k{topk}_fd{feat_dim}_r{wmma_rep}"
+        f"_{quant_mode}_{L.native_tag}"
+        f"{'_scpk' if scale_pack_dwords else ''}"
+        f"_ks{ksplit}_tproute{tp_route_slots}"
+    )
+
+    @flyc.kernel(name=module_name, known_block_size=[BLOCK_THREADS, 1, 1])
+    def token_multidest_tp_route_kernel(
+        hidden: fx.Pointer,
+        grouped_payload: fx.Pointer,
+        grouped_scale: fx.Pointer,
+        topids_to_rows: fx.Pointer,  # (token_num * topk,) int32 out
+        token_num: Int32,
+        topk_ids: fx.Pointer,  # (token_num * topk,) int32 in
+        masked_m: fx.Pointer,  # (experts,) int32 out
+        psum_out: fx.Pointer,  # (experts,) int32 out
+        experts: Int32,
+        tile_m: Int32,
+    ):
+        i32 = T.i32
+        f32 = T.f32
+
+        c0_i32 = fx.Int32(0)
+        c1_i32 = fx.Int32(1)
+        c4_i32 = fx.Int32(4)
+        c16_i32 = fx.Int32(16)
+        c23_i32 = fx.Int32(23)
+        c254_i32 = fx.Int32(254)
+        c0_f32 = fx.Float32(0.0)
+
+        c_wave = fx.Int32(wave_size)
+        c_payload_bytes_per_block = fx.Int32(L.payload_bytes_per_block)
+        c_payload_bytes_per_lane = fx.Int32(L.payload_bytes_per_lane)
+        c_dst_scale_dwords_per_row = fx.Int32(dst_scale_dwords_per_row)
+        c_wmma_rep = fx.Int32(wmma_rep)
+        c_rows_per_tile = fx.Int32(rows_per_tile)
+        c_lanes_per_block = fx.Int32(lanes_per_mx_block)
+        c_elems_per_lane = fx.Int32(L.elems_per_lane)
+
+        tid = fx.Uint32(fx.thread_idx.x)
+        bid = fx.Uint32(fx.block_idx.x)
+        warp_in_block = fx.Uint32(rocdl.readfirstlane(i32, fx.Uint32(tid // c_wave)))
+        lane = tid - warp_in_block * c_wave
+        token0 = bid * fx.Int32(warps_per_block)
+        token = token0 + warp_in_block
+        valid = token < fx.Uint32(token_num)
+        token_eff = valid.select(token, fx.Uint32(c0_i32))
+        block_in_wave = lane // fx.Uint32(c_lanes_per_block)
+        lane_in_block = lane - block_in_wave * c_lanes_per_block
+        mx_group_base = fx.Uint32(fx.block_idx.y) * fx.Int32(block_iters)
+        hidden_base = fx.Int64(ptrtoint(hidden))
+        pf = SimpleNamespace(
+            feat_bytes_per_row=feat_dim * 2,
+            mx_blocks_per_wave_iter=L.mx_blocks_per_wave_iter,
+            block_in_wave=block_in_wave,
+            lane_in_block=lane_in_block,
+            c_elems_per_lane=c_elems_per_lane,
+        )
+        k0 = fx.Uint32(fx.block_idx.y) == 0
+        start, pre, own, hidden_loads = _emit_tp_route(
+            tid=tid,
+            ids=topk_ids,
+            numel=token_num * fx.Int32(topk),
+            experts=experts,
+            tile_m=tile_m,
+            first=fx.Uint32(token0) * fx.Uint32(topk),
+            n_own=n_own,
+            slots=tp_route_slots,
+            writer=(bid == 0) & k0,
+            masked_m=masked_m,
+            psum_out=psum_out,
+            prefetch=lambda: _emit_hidden_prefetch(
+                pf, hidden_base, token_eff, mx_group_base, block_iters
+            ),
+        )
+
+        # Each route's rank among the block's earlier routes to its expert:
+        # lanes hold the block's ids, one ballot per 32 of them.
+        own_lanes = [
+            fx.Int32(own[lane + fx.Uint32(32 * h)])
+            for h in range_constexpr((n_own + wave_size - 1) // wave_size)
+        ]
+        raw_rows = []
+        for k in range_constexpr(topk):
+            pos = warp_in_block * fx.Uint32(topk) + fx.Uint32(k)
+            e = fx.Int32(rocdl.readfirstlane(i32, fx.Int32(own[pos])))
+            live = valid & (e >= c0_i32) & (e < fx.Int32(experts))
+            e_idx = live.select(e, c0_i32)
+            rank = fx.Int32(pre[e_idx])
+            for h, ids_h in enumerate(own_lanes):
+                hit = ((lane + fx.Uint32(32 * h)) < pos) & (ids_h == e)
+                rank = rank + fx.Int32(fx.ctpop(fx.Int32(rocdl.ballot(i32, hit))))
+            row = fx.Int32(rocdl.readfirstlane(i32, fx.Int32(start[e_idx]) + rank))
+            raw_rows.append(live.select(row, fx.Int32(DROPPED_ROUTE_ROW)))
+        rows_t = ptr_buf_tensor(topids_to_rows)
+        if valid & k0 & (lane == c0_i32):
+            route0 = token * fx.Uint32(topk)
+            for k in range_constexpr(topk):
+                rows_t[route0 + fx.Uint32(k)] = raw_rows[k]
+
+        rows, any_live = _token_multidest_live_rows(raw_rows)
+        token_live = valid & any_live
+        pay_records = token_live.select(fx.Int32(payload_bytes_per_row), c0_i32)
+        scale_records = token_live.select(fx.Int32(_SCALE_RSRC_MAX_BYTES), c0_i32)
+        scales = [
+            _token_multidest_scale_base(
+                row, c_rows_per_tile, c_dst_scale_dwords_per_row, c16_i32
+            )
+            for row in rows
+        ]
+        qc = SimpleNamespace(
+            i32=i32,
+            f32=f32,
+            block_iters=block_iters,
+            payload_base=fx.Int64(ptrtoint(grouped_payload)),
+            payload_bytes_per_row=payload_bytes_per_row,
+            hidden_base=hidden_base,
+            feat_bytes_per_row=feat_dim * 2,
+            feat_row_i32=token_eff,
+            payload_num_records=pay_records,
+            prequantized=False,
+            payload_dwords_per_lane=L.payload_bytes_per_lane // 4,
+            src_scale_base=fx.Int64(0),
+            src_scale_bytes_per_row=0,
+            mx_blocks_per_wave_iter=L.mx_blocks_per_wave_iter,
+            mx_blocks_per_row=L.mx_blocks_per_row,
+            amax_shuffle_dists=L.amax_shuffle_dists,
+            is_fp8=L.is_fp8,
+            use_native=L.use_native,
+            use_pk8=L.use_pk8,
+            mx_dtype=L.mx_dtype,
+            c0_i32=c0_i32,
+            c1_i32=c1_i32,
+            c4_i32=c4_i32,
+            c23_i32=c23_i32,
+            c254_i32=c254_i32,
+            c0_f32=c0_f32,
+            c_wave=c_wave,
+            c_elems_per_lane=c_elems_per_lane,
+            c_payload_bytes_per_block=c_payload_bytes_per_block,
+            c_payload_bytes_per_lane=c_payload_bytes_per_lane,
+            c_wmma_rep=c_wmma_rep,
+            block_in_wave=block_in_wave,
+            lane_in_block=lane_in_block,
+            is_block_lead=lane_in_block == c0_i32,
+            payload_dests=[SimpleNamespace(payload_row_i32=row) for row in rows],
+            dests=[
+                SimpleNamespace(payload_row_i32=row, scale_row_dword_base=sc)
+                for row, sc in zip(rows, scales)
+            ],
+            scale_t=ptr_buf_tensor(
+                grouped_scale, fx.Int8, num_records_bytes=scale_records
+            ),
+            scale_rsrc=buffer_ops.create_buffer_resource_from_addr(
+                fx.Int64(ptrtoint(grouped_scale)),
+                num_records_bytes=scale_records,
+            ),
+            scale_pack_dwords=scale_pack_dwords,
+            hidden_chunks=1,
+            chunk_prefetch=None,
+            hidden_lds_load=None,
+            hidden_lds_idx=None,
+            hidden_lds_row_off=c0_i32,
+            hidden_slot_bytes=0,
+            mx_group_base=mx_group_base,
+            hidden_preloaded=hidden_loads,
+        )
+        _emit_quant_block_loop(qc)
+
+    @flyc.jit
+    def launch_token_multidest_tp_route(
+        hidden: fx.Pointer,
+        grouped_payload: fx.Pointer,
+        grouped_scale: fx.Pointer,
+        topids_to_rows: fx.Pointer,
+        token_num: fx.Int32,
+        topk_ids: fx.Pointer,
+        masked_m: fx.Pointer,
+        psum_out: fx.Pointer,
+        experts: fx.Int32,
+        tile_m: fx.Int32,
+        grid_blocks: fx.Int32,
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
+    ):
+        token_multidest_tp_route_kernel(
+            hidden,
+            grouped_payload,
+            grouped_scale,
+            topids_to_rows,
+            token_num,
+            topk_ids,
+            masked_m,
+            psum_out,
+            experts,
+            tile_m,
+        ).launch(
+            grid=(fx.Int64(grid_blocks), fx.Int64(ksplit), 1),
+            block=(BLOCK_THREADS, 1, 1),
+            stream=stream,
+        )
+
+    launch_token_multidest_tp_route.compile_hints = {
+        "llvm_options": {
+            "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
+            "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
+        },
+    }
+    return launch_token_multidest_tp_route
 
 
 def fused_quant_preshuffle_supported(
