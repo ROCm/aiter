@@ -61,7 +61,7 @@ from .tensor_shim import GTensor
 KDA_VERIFY_MAX_TOKENS = 8
 # Waves per workgroup the kernel builds: 4 (32-row V groups) or 8 (64-row V
 # groups, one thread per Q/K/V channel). The wrapper's automatic policy picks
-# one of these by batch size.
+# one of these from the batch, the ring or snapshot mode and the CU count.
 KDA_VERIFY_NUM_WARPS = (4, 8)
 # f_a is staged through LDS in 16-byte (8 x BF16) pieces, 16 per token.
 _F_A_VECTOR = 8

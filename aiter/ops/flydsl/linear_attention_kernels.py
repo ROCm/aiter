@@ -1760,13 +1760,38 @@ def _check_slot_tensor(
     _check_i32_addressing(name, tensor, first_dim=1)
 
 
-def _kda_verify_num_warps(batch: int) -> int:
-    # Batches up to 16 use 8 waves, which shorten each serial step; from batch
-    # 17 the 4-wave kernel keeps more workgroups resident. Measured on MI355X
-    # (cold L2, 5-8 tokens, BF16 state): 8 waves stay 6-9% faster through
-    # batch 21; from batch 22 (over 256 workgroups) 4 waves win by about 20%
-    # with the ring, while snapshots still favour 8 waves by 3-5%.
-    return 8 if batch <= 16 else 4
+def _kda_verify_num_warps(batch: int, ring: bool) -> int:
+    """Waves per workgroup (4 or 8) the verify launches for ``batch`` sequences.
+
+    The grid has one workgroup per sequence and head. 8 waves shorten each
+    serial step but run one workgroup per CU, against two for 4 waves, so once
+    the grid outgrows the CUs the 8-wave launch needs a second round.
+
+    Measured on MI355X (256 CUs; cold L2/MALL; BF16 state; 5, 6 and 8 tokens;
+    median of 3 passes of 6 rounds, passes agreeing to 0.6% median and 1.4%
+    p90), 4-wave over 8-wave time:
+
+        batch (workgroups)   ring        snapshot
+        1-21 (12-252)        1.07-1.12   1.05-1.13
+        22-26 (264-312)      0.78-0.80   0.99-1.05
+        27-32 (324-384)      0.78-0.79   0.97-1.02
+        40-128 (480-1536)    0.62-0.79   0.89-0.99
+
+    Past one workgroup per CU (batch 22), ring times grow 60-70% with 8 waves
+    against about 20% with 4, so the ring takes 8 waves up to one workgroup
+    per CU. Snapshot times grow about 25% with either, so snapshots keep 8
+    waves up to 5/4 of a workgroup per CU (batch 26 on 256 CUs); their
+    crossover is batch 28-30, and the rule stays within 2% of the faster
+    choice around it. Scaling by the CU count makes a partitioned GPU switch
+    earlier. With FP32 state the ring crossover is the same, while snapshots
+    show no consistent winner past batch 14 (within 5% either way), where this
+    rule does as well as a fixed batch-16 cutoff on average.
+    """
+    workgroups = batch * _KDA_HEADS
+    cus = get_num_sms()
+    if ring:
+        return 8 if workgroups <= cus else 4
+    return 8 if 4 * workgroups <= 5 * cus else 4
 
 
 def flydsl_kda_verify_with_f_b(
@@ -1841,9 +1866,10 @@ def flydsl_kda_verify_with_f_b(
     byte spans follow the int32 limits of :func:`flydsl_kda_decode`.
 
     ``num_warps`` overrides the per-workgroup wave count, one of
-    ``flydsl_kda_verify_with_f_b.num_warps`` (4 or 8). Each value is a separate
-    specialization, compiled on first use; call once per value (batch 1
-    suffices) before CUDA graph capture to build them all.
+    ``flydsl_kda_verify_with_f_b.num_warps`` (4 or 8); by default it follows
+    the batch, the ring or snapshot mode and the CU count. Each value is a
+    separate specialization, compiled on first use; call once per value (batch
+    1 suffices) before CUDA graph capture to build them all.
     """
     if not isinstance(num_tokens, int) or not (
         1 <= num_tokens <= KDA_VERIFY_MAX_TOKENS
@@ -2151,7 +2177,7 @@ def flydsl_kda_verify_with_f_b(
                 )
 
     if num_warps is None:
-        num_warps = _kda_verify_num_warps(batch)
+        num_warps = _kda_verify_num_warps(batch, replay_ring is not None)
     elif not isinstance(num_warps, int) or num_warps not in KDA_VERIFY_NUM_WARPS:
         raise ValueError(
             f"`num_warps` must be an int in {KDA_VERIFY_NUM_WARPS}, got {num_warps!r}."

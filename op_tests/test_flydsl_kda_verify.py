@@ -302,13 +302,35 @@ def test_kda_verify_matches_reference(batch, num_tokens, state_dtype, ring, num_
     )
 
 
-def test_kda_verify_advertises_num_warps():
-    """The tag lists exactly the wave counts the automatic policy picks, so a
-    caller that pre-builds each one before graph capture covers every batch."""
+@pytest.mark.parametrize("cus", [256, 80, 32, 8])
+def test_kda_verify_advertises_num_warps(monkeypatch, cus):
+    """The tag lists every wave count the automatic policy picks, so a caller
+    that pre-builds each one before graph capture covers every batch."""
+    monkeypatch.setattr(linear_attention_kernels, "get_num_sms", lambda: cus)
     picks = {
-        linear_attention_kernels._kda_verify_num_warps(batch) for batch in range(1, 257)
+        linear_attention_kernels._kda_verify_num_warps(batch, ring)
+        for batch in range(1, 257)
+        for ring in (False, True)
     }
-    assert picks == set(flydsl_kda_verify_with_f_b.num_warps)
+    assert picks <= set(flydsl_kda_verify_with_f_b.num_warps)
+    if cus >= _H:
+        assert picks == set(flydsl_kda_verify_with_f_b.num_warps)
+
+
+# (CUs, ring, last batch on 8 waves): with 12 workgroups per sequence, the
+# ring keeps 8 waves while workgroups <= CUs, snapshots while workgroups <=
+# 5/4 of the CUs. 256 is a full MI355X, 32 one CPX partition of it.
+@pytest.mark.parametrize(
+    "cus, ring, last_8_wave_batch",
+    [(256, True, 21), (256, False, 26), (32, True, 2), (32, False, 3)],
+)
+def test_kda_verify_num_warps_crossover(monkeypatch, cus, ring, last_8_wave_batch):
+    monkeypatch.setattr(linear_attention_kernels, "get_num_sms", lambda: cus)
+    picks = [
+        linear_attention_kernels._kda_verify_num_warps(batch, ring)
+        for batch in range(1, 257)
+    ]
+    assert picks == [8] * last_8_wave_batch + [4] * (256 - last_8_wave_batch)
 
 
 def test_kda_verify_channel_major_conv_and_longer_scratch():
