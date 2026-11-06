@@ -763,6 +763,23 @@ def _grouped_a8w4_tdm_moe(
                 )
     wmma_rep = get_wmma_m_rep(tile_m, tile_n, m_warp, n_warp, "gemm1")
     wmma_rep2 = get_wmma_m_rep(tile_m2, tile_n2, m_warp2, n_warp2, "gemm2")
+    # Whether the A1 quant would take the compact-scale pair: the TP route
+    # gates and the quant dispatch below all ask, so evaluate it once a call.
+    _compact_quant_pair_memo = []
+
+    def _compact_quant_pair() -> bool:
+        if not _compact_quant_pair_memo:
+            _compact_quant_pair_memo.append(
+                _use_fused_quant_preshuffle(
+                    model_dim,
+                    wmma_rep,
+                    "fp4" if data_format == "fp4" else "fp8",
+                    token_num,
+                    topk,
+                )
+            )
+        return _compact_quant_pair_memo[0]
+
     _align_m = max(tile_m, tile_m2)
     # Both GEMMs walk the same contiguous layout, each with its own tile height,
     # so every expert must start on a row that is a multiple of both. Aligning to
@@ -837,6 +854,7 @@ def _grouped_a8w4_tdm_moe(
             token_num=token_num,
             topk=topk,
             experts=E,
+            compact_quant_pair=_compact_quant_pair,
         )
     ):
         _route_in_quant = tp_prefill_route_psum(topk_ids, E, _align_m)
@@ -1127,9 +1145,7 @@ def _grouped_a8w4_tdm_moe(
         and not _prequantized
         and not a_preshuffled
         and _ep_nvr is None
-        and _use_fused_quant_preshuffle(
-            model_dim, wmma_rep, _quant_mode, token_num, topk
-        )
+        and _compact_quant_pair()
     )
     _compact_ascale_buf = None
     _row_to_token = _apre_row_to_token
@@ -2120,12 +2136,14 @@ def _tp_route_quant_takes_route(
     token_num,
     topk,
     experts,
+    compact_quant_pair=None,
 ) -> bool:
     """Whether the A1 quant is the token-multidest launch that can place rows.
 
     Mirrors the quant dispatch: bf16 activations (not prequantized), no
     A-preshuffle, and not the compact-scale pair, which needs a row -> token
-    map from the psum remap.
+    map from the psum remap. ``compact_quant_pair`` is the caller's
+    once-a-call ``_use_fused_quant_preshuffle`` answer, as a callable.
     """
     from aiter.ops.flydsl.kernels.moe_route_maps import TP_ROUTE_PSUM_MAX_EXPERTS
     from aiter.ops.flydsl.moe_kernels import (
@@ -2141,9 +2159,13 @@ def _tp_route_quant_takes_route(
         return False
     if not token_multidest_quant_enabled():
         return False
+    if not token_multidest_eligible(token_num, topk):
+        return False
+    if compact_quant_pair is not None:
+        return not compact_quant_pair()
     quant_mode = "fp4" if data_format == "fp4" else "fp8"
-    return token_multidest_eligible(token_num, topk) and not (
-        _use_fused_quant_preshuffle(model_dim, wmma_rep, quant_mode, token_num, topk)
+    return not _use_fused_quant_preshuffle(
+        model_dim, wmma_rep, quant_mode, token_num, topk
     )
 
 
