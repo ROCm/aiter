@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import functools
+import importlib
+import sys
 
 import pytest
 import torch
@@ -422,33 +424,41 @@ class _LaunchCount:
         return self.kernel[grid]
 
 
-@pytest.fixture
-def gluon_launches(monkeypatch):
+def _install_launch_counters(monkeypatch):
     from aiter.ops.triton._gluon_kernels.gfx950.gemm.basic import (
         gemm_afp4wfp4 as default_module,
-    )
-    from aiter.ops.triton._gluon_kernels.gfx950.gemm.basic import (
-        gemm_afp4wfp4_pingpong as pingpong_module,
     )
 
     launches = {
         "default": _LaunchCount(default_module._gemm_afp4wfp4_kernel),
-        "pingpong": _LaunchCount(pingpong_module._gemm_afp4wfp4_pingpong_kernel),
+        "pingpong": _LaunchCount(None),
     }
     monkeypatch.setattr(default_module, "_gemm_afp4wfp4_kernel", launches["default"])
-    monkeypatch.setattr(
-        pingpong_module, "_gemm_afp4wfp4_pingpong_kernel", launches["pingpong"]
-    )
+    # Only a validated Triton build can import the ping-pong kernel module.
+    if gemm_afp4wfp4_module._pingpong_compiler_ok():
+        from aiter.ops.triton._gluon_kernels.gfx950.gemm.basic import (
+            gemm_afp4wfp4_pingpong as pingpong_module,
+        )
+
+        launches["pingpong"].kernel = pingpong_module._gemm_afp4wfp4_pingpong_kernel
+        monkeypatch.setattr(
+            pingpong_module, "_gemm_afp4wfp4_pingpong_kernel", launches["pingpong"]
+        )
     return launches
 
 
-def _skip_unless_pingpong():
+@pytest.fixture
+def gluon_launches(monkeypatch):
     if DEVICE_ARCH != "gfx950":
-        pytest.skip("The ping-pong kernel is for gfx950 only.")
-    if not gemm_afp4wfp4_module._pingpong_compiler_ok():
-        pytest.skip("The ping-pong kernel is not validated on this Triton build.")
-    if gemm_afp4wfp4_module.get_num_xcds() != 8:
-        pytest.skip("The ping-pong kernel is not validated in partition modes.")
+        pytest.skip("The gfx950 Gluon kernels need gfx950.")
+    return _install_launch_counters(monkeypatch)
+
+
+def _skip_unless_pingpong():
+    # The same check as the wrapper's dispatch: arch, Triton build and XCD count.
+    reason = gemm_afp4wfp4_module._pingpong_env_unsupported()
+    if reason is not None:
+        pytest.skip(f"The ping-pong kernel cannot run here: {reason}.")
 
 
 def _pingpong_inputs(M, N, K):
@@ -547,7 +557,7 @@ def test_gemm_afp4wfp4_pingpong_selection(monkeypatch):
     monkeypatch.setattr(gemm_afp4wfp4_module, "get_num_xcds", lambda default=8: 4)
     assert reason() == "partition mode"
     monkeypatch.setattr(gemm_afp4wfp4_module, "_pingpong_compiler_ok", lambda: False)
-    assert reason() == "Triton version not validated"
+    assert reason() == "Triton build not validated"
     monkeypatch.setattr(arch_info, "get_arch", lambda: "gfx1250")
     assert reason() == "arch"
 
@@ -588,3 +598,64 @@ def test_gemm_afp4wfp4_gluon_pingpong_compile(gluon_launches):
 
     assert gluon_launches["pingpong"].count == 2
     assert torch.equal(compiled, eager)
+
+
+class _BlockImport:
+    """Fails the import of one module, as on a Triton build without its Gluon APIs."""
+
+    def __init__(self, name):
+        self.name = name
+
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == self.name:
+            raise ImportError(f"{fullname} is blocked by the test")
+
+
+def test_gemm_afp4wfp4_gluon_unvalidated_triton_build(monkeypatch):
+    # On a Triton build that is not validated, the launch counters and the
+    # compute_bound dispatch must not import the ping-pong module.
+    if DEVICE_ARCH != "gfx950":
+        pytest.skip("The gfx950 Gluon kernels need gfx950.")
+    name = "aiter.ops.triton._gluon_kernels.gfx950.gemm.basic.gemm_afp4wfp4_pingpong"
+    package = importlib.import_module(name.rsplit(".", 1)[0])
+    monkeypatch.setattr(gemm_afp4wfp4_module, "_pingpong_compiler_ok", lambda: False)
+    monkeypatch.delitem(sys.modules, name, raising=False)
+    monkeypatch.delattr(package, name.rsplit(".", 1)[1], raising=False)
+    monkeypatch.setattr(sys, "meta_path", [_BlockImport(name), *sys.meta_path])
+    launches = _install_launch_counters(monkeypatch)
+    x, w, x_scales, w_scales, config = _pingpong_inputs(256, 256, 512)
+
+    out = triton_gemm_afp4wfp4(
+        x, w, x_scales, w_scales, torch.bfloat16, config=config, backend="gluon"
+    )
+
+    assert name not in sys.modules
+    assert launches["default"].count == 1
+    assert launches["pingpong"].count == 0
+    torch.testing.assert_close(
+        out, run_torch(x, w, x_scales, w_scales, torch.bfloat16), atol=1e-2, rtol=0
+    )
+
+
+def test_gemm_afp4wfp4_pingpong_unknown_xcd_count(monkeypatch, gluon_launches):
+    _skip_unless_pingpong()
+
+    def no_chip_info(default=8):  # device_info.get_num_xcds without chip_info
+        if default is None:
+            raise RuntimeError("chip_info cannot be imported")
+        return default
+
+    monkeypatch.setattr(gemm_afp4wfp4_module, "get_num_xcds", no_chip_info)
+    with pytest.raises(pytest.skip.Exception):
+        _skip_unless_pingpong()
+    x, w, x_scales, w_scales, config = _pingpong_inputs(256, 256, 512)
+
+    out = triton_gemm_afp4wfp4(
+        x, w, x_scales, w_scales, torch.bfloat16, config=config, backend="gluon"
+    )
+
+    assert gluon_launches["pingpong"].count == 0
+    assert gluon_launches["default"].count == 1
+    torch.testing.assert_close(
+        out, run_torch(x, w, x_scales, w_scales, torch.bfloat16), atol=1e-2, rtol=0
+    )
