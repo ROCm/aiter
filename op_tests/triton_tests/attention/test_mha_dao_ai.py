@@ -2,10 +2,13 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import contextlib
+from functools import partial
+from unittest.mock import Mock
 
 import pytest
 import torch
 
+from aiter.ops.triton.attention import mha
 from aiter.ops.triton.attention.mha import (
     flash_attn_func,
     flash_attn_varlen_func,
@@ -120,6 +123,10 @@ def test_mha_dao_ai(
     dtype=torch.bfloat16,
 ):
     """Test dao_ai impl dispatch for fwd/bwd x varlen against PyTorch reference."""
+    dense = partial(flash_attn_func, implementation="dao_ai")
+    varlen = partial(flash_attn_varlen_func, implementation="dao_ai")
+    # Per-call selection must win over the process default, including in backward.
+    mha_set_impl("default")
     torch.cuda.empty_cache()
     torch.manual_seed(20)
 
@@ -178,7 +185,7 @@ def test_mha_dao_ai(
         v_unpad.requires_grad_(BWD)
 
         with torch.set_grad_enabled(BWD):
-            triton_out = flash_attn_varlen_func(
+            triton_out = varlen(
                 q_unpad,
                 k_unpad,
                 v_unpad,
@@ -193,9 +200,7 @@ def test_mha_dao_ai(
         query_padding_mask = None
         key_padding_mask = None
         with torch.set_grad_enabled(BWD):
-            triton_out = flash_attn_func(
-                q, k, v, causal=CAUSAL, window_size=WINDOW_SIZE
-            )
+            triton_out = dense(q, k, v, causal=CAUSAL, window_size=WINDOW_SIZE)
 
     # Reference + tolerances. For backward, attention_ref_with_tol derives each
     # tensor's atol from the fp32-vs-bf16 reference gap (upstream FA pattern, as in
@@ -303,6 +308,145 @@ def test_mha_dao_ai_dropout_scores(dao_ai_impl, causal, window_size):
     )
     torch.testing.assert_close(out, ref_out, atol=1e-2, rtol=1e-2)
     torch.testing.assert_close(lse, ref_lse.float(), atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize(
+    "default, implementation, message",
+    [
+        ("dao_ai", None, "not supported by the dao_ai"),
+        ("default", "dao_ai", "not supported by the dao_ai"),
+        ("default", "unknown", "Unknown MHA implementation"),
+    ],
+)
+def test_mha_dao_ai_mxfp8_selector(default, implementation, message):
+    """MXFP8 resolves the selector before its forward: the dao_ai default and an
+    unknown selector are refused like an explicit dao_ai."""
+    q = torch.randn(1, 128, 4, 64, device="cuda", dtype=torch.bfloat16)
+    scale = torch.ones(1, device="cuda", dtype=torch.float32)
+    mha_set_impl(default)
+    try:
+        with pytest.raises(ValueError, match=message):
+            flash_attn_func(
+                q,
+                q,
+                q,
+                q_mx_scale=scale,
+                k_mx_scale=scale,
+                v_mx_scale=scale,
+                implementation=implementation,
+            )
+    finally:
+        mha_set_impl("default")
+
+
+@pytest.mark.parametrize("varlen", [False, True])
+@pytest.mark.parametrize("causal", [False, True])
+def test_mha_dao_ai_dropout_backward(varlen, causal):
+    """Backward with dropout keeps the forward's RNG state: gradients match a
+    reference that applies the dropout mask the forward returned."""
+    mha_set_impl("default")
+    torch.manual_seed(20)
+    batch, seqlen, heads, head_sz, dropout_p = 2, 96, 4, 64, 0.17
+    q, k, v = (
+        torch.randn(
+            batch,
+            seqlen,
+            heads,
+            head_sz,
+            device="cuda",
+            dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+        for _ in range(3)
+    )
+    query_padding_mask = key_padding_mask = None
+    if varlen:
+        query_padding_mask = generate_random_padding_mask(seqlen, batch, "cuda")
+        key_padding_mask = generate_random_padding_mask(seqlen, batch, "cuda")
+        (
+            q_unpad,
+            k_unpad,
+            v_unpad,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            q,
+            k,
+            v,
+            output_pad_fn,
+            dq_pad_fn,
+            dk_pad_fn,
+        ) = generate_qkv(q, k, v, query_padding_mask, key_padding_mask, kvpacked=False)
+        inputs = tuple(x.requires_grad_() for x in (q_unpad, k_unpad, v_unpad))
+        out, _, scores = flash_attn_varlen_func(
+            *inputs,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            dropout_p=dropout_p,
+            causal=causal,
+            return_lse=True,
+            return_attn_probs=True,
+            implementation="dao_ai",
+        )
+        out = output_pad_fn(out)
+    else:
+        inputs = (q, k, v)
+        out, _, scores = flash_attn_func(
+            *inputs,
+            dropout_p=dropout_p,
+            causal=causal,
+            return_lse=True,
+            return_attn_probs=True,
+            implementation="dao_ai",
+        )
+
+    do = torch.randn_like(out)
+    grads = torch.autograd.grad(out, inputs, do)
+    if varlen:
+        grads = (dq_pad_fn(grads[0]), dk_pad_fn(grads[1]), dk_pad_fn(grads[2]))
+
+    # The varlen mask covers the longest real sequence; pad it to seqlen as dropped.
+    scores = scores[:, :, :seqlen, :seqlen]
+    pad = (0, seqlen - scores.shape[3], 0, seqlen - scores.shape[2])
+    dropout_mask = torch.nn.functional.pad(scores, pad, value=-1.0) >= 0
+
+    def reference(mask, upcast=True):
+        """Output and gradients of the reference with this dropout mask."""
+        q_, k_, v_ = (x.detach().clone().requires_grad_() for x in (q, k, v))
+        ref, _, _ = attention_ref(
+            q_,
+            k_,
+            v_,
+            query_padding_mask,
+            key_padding_mask,
+            dropout_p=dropout_p,
+            dropout_mask=mask,
+            causal=causal,
+            upcast=upcast,
+            reorder_ops=not upcast,
+        )
+        return (ref, *torch.autograd.grad(ref, (q_, k_, v_), do))
+
+    # FA's criterion: error against fp32 at most 2x (output) or 3x (gradients) PyTorch's.
+    ref = reference(dropout_mask)
+    bound = [
+        factor * (pt - r).abs().max().item()
+        for factor, pt, r in zip(
+            (2, 3, 3, 3), reference(dropout_mask, upcast=False), ref
+        )
+    ]
+    errors = [(got - r).abs().max().item() for got, r in zip((out, *grads), ref)]
+    for name, err, limit in zip(("out", "dq", "dk", "dv"), errors, bound):
+        assert err <= limit, f"dao_ai dropout {name} error {err} > {limit}"
+
+    # The bound rejects gradients from another dropout pattern, such as a backward that
+    # lost the forward's RNG state.
+    wrong = reference(torch.roll(dropout_mask, shifts=1, dims=-1))
+    wrong_errors = [(got - r).abs().max().item() for got, r in zip(grads, wrong[1:])]
+    assert any(err > limit for err, limit in zip(wrong_errors, bound[1:]))
 
 
 @pytest.mark.parametrize("default_device", ["cpu", "cuda"])
@@ -456,3 +600,152 @@ def test_mha_dao_ai_varlen_graph(dao_ai_impl, mha_type, default_device):
     assert not torch.isnan(out_graph).any(), "Graph replay produced NaN"
     diff = (out_eager - out_graph).abs().max().item()
     assert diff < 1e-5, f"Graph replay vs eager max diff {diff:.6e} exceeds 1e-5"
+
+
+@pytest.mark.parametrize(
+    "default, implementation, message",
+    [
+        ("dao_ai", None, "not supported by the dao_ai"),
+        ("default", "dao_ai", "not supported by the dao_ai"),
+        ("default", "unknown", "Unknown MHA implementation"),
+    ],
+)
+def test_mha_dao_ai_block_scale_selector(default, implementation, message):
+    """Block-scale FP8 resolves the selector before its forward: the dao_ai default
+    and an unknown selector are refused like an explicit dao_ai."""
+    q = torch.randn(1, 128, 4, 64, device="cuda", dtype=torch.bfloat16)
+    descale = torch.ones(1, 4, 2, device="cuda", dtype=torch.float32)
+    mha_set_impl(default)
+    try:
+        with pytest.raises(ValueError, match=message):
+            flash_attn_func(
+                q,
+                q,
+                q,
+                q_block_descale=descale,
+                k_block_descale=descale,
+                v_scale=torch.ones(1, device="cuda", dtype=torch.float32),
+                implementation=implementation,
+            )
+    finally:
+        mha_set_impl("default")
+
+
+@pytest.mark.parametrize("head_size", [53, 64])
+def test_mha_dao_ai_backward_keeps_forward_implementation(monkeypatch, head_size):
+    """Each forward's backward uses that forward's implementation, even after
+    mha_set_impl changes the default between them."""
+    dao_bwd = Mock(wraps=mha.flash_attn_2.bwd)
+    default_bwd = Mock(wraps=mha.flash_attn_onekernel_backward)
+    monkeypatch.setattr(mha.flash_attn_2, "bwd", dao_bwd)
+    monkeypatch.setattr(mha, "flash_attn_onekernel_backward", default_bwd)
+    q, k, v = (
+        torch.randn(
+            2, 8, 4, head_size, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        for _ in range(3)
+    )
+    try:
+        mha_set_impl("dao_ai")
+        dao_out = flash_attn_func(q, k, v, deterministic=True)
+        default_out = flash_attn_func(q, k, v, implementation="default")
+
+        mha_set_impl("default")
+        torch.autograd.grad(dao_out, (q, k, v), torch.ones_like(dao_out))
+        assert dao_bwd.call_count == 1 and dao_bwd.call_args.kwargs["deterministic"]
+        assert default_bwd.call_count == 0
+
+        mha_set_impl("dao_ai")
+        grads = torch.autograd.grad(
+            default_out, (q, k, v), torch.ones_like(default_out)
+        )
+        assert default_bwd.call_count == 1 and dao_bwd.call_count == 1
+        assert [g.shape for g in grads] == [q.shape, k.shape, v.shape]
+    finally:
+        mha_set_impl("default")
+
+
+@pytest.mark.parametrize("head_size", [53, 64])
+def test_mha_dao_ai_varlen_backward_keeps_forward_implementation(
+    monkeypatch, head_size
+):
+    """The varlen form of test_mha_dao_ai_backward_keeps_forward_implementation."""
+    dao_bwd = Mock(wraps=mha.flash_attn_2.varlen_bwd)
+    default_bwd = Mock(wraps=mha.flash_attn_onekernel_backward)
+    monkeypatch.setattr(mha.flash_attn_2, "varlen_bwd", dao_bwd)
+    monkeypatch.setattr(mha, "flash_attn_onekernel_backward", default_bwd)
+    q, k, v = (
+        torch.randn(
+            16, 4, head_size, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        for _ in range(3)
+    )
+    cu_seqlens = torch.tensor([0, 8, 16], device="cuda", dtype=torch.int32)
+    try:
+        mha_set_impl("dao_ai")
+        dao_out = flash_attn_varlen_func(
+            q, k, v, cu_seqlens, cu_seqlens, 8, 8, deterministic=True
+        )
+        default_out = flash_attn_varlen_func(
+            q, k, v, cu_seqlens, cu_seqlens, 8, 8, implementation="default"
+        )
+
+        mha_set_impl("default")
+        torch.autograd.grad(dao_out, (q, k, v), torch.ones_like(dao_out))
+        assert dao_bwd.call_count == 1 and dao_bwd.call_args.kwargs["deterministic"]
+        assert default_bwd.call_count == 0
+
+        mha_set_impl("dao_ai")
+        grads = torch.autograd.grad(
+            default_out, (q, k, v), torch.ones_like(default_out)
+        )
+        assert default_bwd.call_count == 1 and dao_bwd.call_count == 1
+        assert [g.shape for g in grads] == [q.shape, k.shape, v.shape]
+    finally:
+        mha_set_impl("default")
+
+
+def test_mha_dao_ai_unknown_implementation_fails_before_forward(monkeypatch):
+    forward = Mock(wraps=mha._flash_attn_forward)
+    monkeypatch.setattr(mha, "_flash_attn_forward", forward)
+    q, k, v = (
+        torch.randn(16, 4, 64, device="cuda", dtype=torch.bfloat16) for _ in range(3)
+    )
+    cu_seqlens = torch.tensor([0, 8, 16], device="cuda", dtype=torch.int32)
+
+    with pytest.raises(ValueError, match="Unknown MHA implementation"):
+        flash_attn_func(q[None], k[None], v[None], implementation="unknown")
+    with pytest.raises(ValueError, match="Unknown MHA implementation"):
+        flash_attn_varlen_func(
+            q, k, v, cu_seqlens, cu_seqlens, 8, 8, implementation="unknown"
+        )
+    forward.assert_not_called()
+
+    with pytest.raises(ValueError, match="Unknown MHA implementation"):
+        mha_set_impl("unknown")
+    assert mha._MHA_IMPL == "default"
+
+
+@pytest.mark.parametrize("argument", ["block_table", "out"])
+def test_mha_dao_ai_varlen_refuses_ignored_buffers(monkeypatch, argument):
+    forward = Mock(wraps=mha._flash_attn_forward)
+    monkeypatch.setattr(mha, "_flash_attn_forward", forward)
+    q, k, v = (
+        torch.randn(16, 4, 64, device="cuda", dtype=torch.bfloat16) for _ in range(3)
+    )
+    cu_seqlens = torch.tensor([0, 8, 16], device="cuda", dtype=torch.int32)
+    buffer = torch.zeros(1, device="cuda", dtype=torch.int32)
+
+    with pytest.raises(NotImplementedError):
+        flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_seqlens,
+            cu_seqlens,
+            8,
+            8,
+            implementation="dao_ai",
+            **{argument: buffer},
+        )
+    forward.assert_not_called()
