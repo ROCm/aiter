@@ -120,16 +120,14 @@ def _request_extent(kv_len, hkv, hk, gap):
     return extent
 
 
-def _request_resource(tensor, k0, hkv, hk, gap, extent):
-    """Buffer resource over KV head hkv of a request's K or V rows from row k0 (hk * D
+def _request_buffer(tensor, k0, hkv, hk, gap, extent):
+    """Buffer pointer over KV head hkv of a request's K or V rows from row k0 (hk * D
     values, then gap elements of padding, a row); loads at or past extent return zero.
     """
     pointer = fx.get_iter(tensor) + (fx.Int64(k0) * hk + hkv) * D
     if gap:
         pointer = pointer + fx.Int64(k0) * gap
-    return rocdl.get_buffer_rsrc(
-        _buffer(fx.make_view(pointer, fx.make_layout(extent // 2, 1)), extent)
-    )
+    return _buffer(fx.make_view(pointer, fx.make_layout(extent // 2, 1)), extent)
 
 
 def _shift(reads, offset):
@@ -264,8 +262,8 @@ def _read_block_g2s950(
         base, final, partial, full = resource
         block_id = rows[block]
         records = (block_id == final).select(partial, full)
-        resource = rocdl.get_buffer_rsrc(
-            _buffer_at(base + fx.Int64(fx.Uint32(block_id)) * (4 * row_bytes), records)
+        resource = _buffer_at(
+            base + fx.Int64(fx.Uint32(block_id)) * (4 * row_bytes), records
         )
     else:
         # _read_packet_g2s' SOFFSET min(row, limits[k]), per lane; with key k's row step it is
@@ -277,13 +275,12 @@ def _read_block_g2s950(
             voffset, fx.Int32(extent)
         )
     data = [load(*read) for read in reads]
-    rocdl.raw_ptr_buffer_load_lds(
-        resource,
-        fx.to_llvm_ptr(fx.get_iter(storage) + (destination + lds_offset)),
-        16,
-        fx.Int32(voffset),
-        fx.Uint32(0),
-        0,
+    fx.copy(
+        fx.make_copy_atom(rocdl.BufferCopyLDS128b(), fx.Int8),
+        fx.make_view(resource + fx.Int32(voffset), fx.make_layout(16, 1)),
+        fx.make_view(
+            fx.get_iter(storage) + (destination + lds_offset), fx.make_layout(16, 1)
+        ),
     )
     return data
 
@@ -483,8 +480,11 @@ def _body(
             (limit > k * row_bytes).select(limit - k * row_bytes, fx.Uint32(0))
             for k in range(4)
         )
-        gk = _request_resource(K, k0, hkv, HK, gap, extent)
-        gv = _request_resource(V, k0, hkv, HK, gap, extent)
+        gk = _request_buffer(K, k0, hkv, HK, gap, extent)
+        gv = _request_buffer(V, k0, hkv, HK, gap, extent)
+        if fx.const_expr(not GFX950):
+            # _read_packet_g2s' raw LDS DMA takes the buffer resources.
+            gk, gv = rocdl.get_buffer_rsrc(gk), rocdl.get_buffer_rsrc(gv)
     # gfx950 x4 DMA: each lane's own limits[lane >> 4] (_read_block_g2s950); slot tables none.
     dma_limit = None
     if fx.const_expr(GFX950 and not SLOTTED):

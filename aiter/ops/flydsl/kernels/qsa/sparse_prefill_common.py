@@ -98,7 +98,7 @@ PLATFORMS = {
     # were chosen on 91 calibration layouts so that routed calls stay near the faster of
     # all-union and host-gated all-direct (90 within 1.05x, worst 1.06x); they are not phase
     # timings.
-    # union_ratio 1e30: K2 proposes union for every tile;
+    # union_ratio 1e30: sparse_prefill_compact proposes union for every tile;
     # route_all_or_none: sparse_prefill_order_masks also weighs keeping every union tile
     # against none when the union phase is throughput-bound.
     ("gfx950", 256): Platform(
