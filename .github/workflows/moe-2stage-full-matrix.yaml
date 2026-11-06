@@ -58,10 +58,13 @@ jobs:
             $DOCKER_IMAGE
 
       - name: Build Aiter (no Triton needed for this suite)
+        env:
+          GPU_ARCH_LIST: "gfx942;gfx950"
+          AITER_PREBUILD_MAX_JOBS: "64"
         run: |
           set -ex
           docker exec -w /workspace moe_2stage_full_matrix \
-            bash -lc "BUILD_TRITON=0 ./.github/scripts/build_aiter_triton.sh"
+            bash -lc "BUILD_TRITON=0 PREBUILD_KERNELS=1 GPU_ARCHS='$GPU_ARCH_LIST' MAX_JOBS='$AITER_PREBUILD_MAX_JOBS' ./.github/scripts/build_aiter_triton.sh"
 
       - name: Run full MoE 2-stage matrix
         run: |
@@ -77,18 +80,16 @@ jobs:
               failed=false
           fi
 
-          # Known baseline: 12 pre-existing mxfp4 per_1x32 non-strict accuracy
-          # warnings (7 bf16-activation, 5 fp4-activation; see PR #7330/#7341
-          # discussion, main run 41552231943). These are tracked separately
-          # and are not caused by this CI-scoping change. Only flag a
-          # regression if the observed count exceeds the known baseline.
-          KNOWN_NONSTRICT_ACCURACY_FAILURES=12
-          nonstrict_failures=$(grep -c "accuracy check failed (non-strict)" full_matrix.log || true)
-          if [[ "$nonstrict_failures" -gt "$KNOWN_NONSTRICT_ACCURACY_FAILURES" ]]; then
-              status="❌ Failed (non-strict accuracy regressions: ${nonstrict_failures} > baseline ${KNOWN_NONSTRICT_ACCURACY_FAILURES})"
+          if ! python3 .github/scripts/check_moe_2stage_nonstrict_gate.py \
+              --log full_matrix.log \
+              --allowlist .github/scripts/moe_2stage_known_nonstrict_failures.csv; then
+              status="❌ Failed (unexpected non-strict accuracy failures not in known allowlist)"
               failed=true
-          elif [[ "$nonstrict_failures" -gt 0 ]]; then
-              status="${status} (⚠️ ${nonstrict_failures} known non-strict accuracy warnings, within baseline of ${KNOWN_NONSTRICT_ACCURACY_FAILURES})"
+          else
+              nonstrict_count=$(grep -c "accuracy check failed (non-strict)" full_matrix.log || true)
+              if [[ "$nonstrict_count" -gt 0 ]]; then
+                  status="${status} (⚠️ ${nonstrict_count} known non-strict accuracy warnings, all matched against allowlist)"
+              fi
           fi
 
           end_time_ns=$(date +%s%N)
