@@ -714,8 +714,6 @@ def _compute_MN_tile(
         "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
         "NEED_M_MASK": lambda args: args["M"] % args["BLOCK_SIZE_M"] != 0,
         "NEED_N_MASK": lambda args: args["N"] % args["BLOCK_SIZE_N"] != 0,
-        "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
-        * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
 )
 @gluon.jit
@@ -758,7 +756,6 @@ def _gemm_a8w8_blockscale_kernel(
     EVEN_K: gl.constexpr,
     NEED_M_MASK: gl.constexpr,
     NEED_N_MASK: gl.constexpr,
-    GRID_MN: gl.constexpr,
     NUM_WARPS: gl.constexpr,
     cache_modifier: gl.constexpr,
 ):
@@ -796,7 +793,7 @@ def _gemm_a8w8_blockscale_kernel(
     num_pid_n = gl.cdiv(N, BLOCK_SIZE_N)
 
     if NUM_KSPLIT == 1:
-        remap_xcd(pid, GRID_MN)
+        remap_xcd(pid, num_pid_m * num_pid_n)
         pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
     else:
         pid_m = pid // num_pid_n

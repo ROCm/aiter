@@ -28,8 +28,6 @@ _fused_gemm_afp4wfp4_split_cat_repr = make_kernel_repr(
 @triton.heuristics(
     {
         "EVEN_K": lambda args: args["K"] % (args["BLOCK_SIZE_K"] // 2) == 0,
-        "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
-        * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
 )
 @triton.jit(repr=_fused_gemm_afp4wfp4_split_cat_repr)
@@ -80,7 +78,6 @@ def _fused_gemm_afp4wfp4_split_cat(
     NUM_KSPLIT: tl.constexpr,
     SPLITK_BLOCK_SIZE: tl.constexpr,
     EVEN_K: tl.constexpr,
-    GRID_MN: tl.constexpr,
     cache_modifier: tl.constexpr,
     NUM_XCDS: tl.constexpr,
 ):
@@ -104,6 +101,7 @@ def _fused_gemm_afp4wfp4_split_cat(
     # -----------------------------------------------------------
     # Map program ids `pid` to the block of C it should compute.
     # This is done in a grouped ordering to promote L2 data reuse.
+    GRID_MN = tl.cdiv(M, BLOCK_SIZE_M) * tl.cdiv(N, BLOCK_SIZE_N)
     pid_unified = tl.program_id(axis=0)
     # remap so that XCDs get continous chunks of pids (of CHUNK_SIZE).
     pid_unified = remap_xcd(pid_unified, GRID_MN * NUM_KSPLIT, NUM_XCDS=NUM_XCDS)
@@ -289,8 +287,6 @@ _fused_gemm_afp4wfp4_preshuffle_split_cat_repr = make_kernel_repr(
 @triton.heuristics(
     {
         "EVEN_K": lambda args: args["K"] % (args["BLOCK_SIZE_K"] // 2) == 0,
-        "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
-        * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
 )
 @triton.jit(repr=_fused_gemm_afp4wfp4_preshuffle_split_cat_repr)
@@ -341,7 +337,6 @@ def _fused_gemm_afp4wfp4_preshuffle_split_cat(
     NUM_KSPLIT: tl.constexpr,
     SPLITK_BLOCK_SIZE: tl.constexpr,
     EVEN_K: tl.constexpr,
-    GRID_MN: tl.constexpr,
     cache_modifier: tl.constexpr,
     NUM_XCDS: tl.constexpr,
 ):
@@ -365,6 +360,7 @@ def _fused_gemm_afp4wfp4_preshuffle_split_cat(
     # -----------------------------------------------------------
     # Map program ids `pid` to the block of C it should compute.
     # This is done in a grouped ordering to promote L2 data reuse.
+    GRID_MN = tl.cdiv(M, BLOCK_SIZE_M) * tl.cdiv(N, BLOCK_SIZE_N)
     pid_unified = tl.program_id(axis=0)
     # remap so that XCDs get continous chunks of pids (of CHUNK_SIZE).
     pid_unified = remap_xcd(pid_unified, GRID_MN * NUM_KSPLIT, NUM_XCDS=NUM_XCDS)

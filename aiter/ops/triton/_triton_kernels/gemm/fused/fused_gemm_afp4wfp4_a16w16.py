@@ -33,10 +33,6 @@ _fused_gemm_afp4wfp4_a16w16_repr = make_kernel_repr(
         "EVEN_K": lambda args: (args["K"] % (args["BLOCK_SIZE_K"] // 2) == 0)
         and (args["SPLITK_BLOCK_SIZE"] % args["BLOCK_SIZE_K"] == 0)
         and (args["K"] % (args["SPLITK_BLOCK_SIZE"] // 2) == 0),
-        "GRID_MN_FP4": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
-        * triton.cdiv(args["N_fp4"], args["BLOCK_SIZE_N"]),
-        "GRID_MN_BF16": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
-        * triton.cdiv(args["N_bf16"], args["BLOCK_SIZE_N"]),
     }
 )
 @triton.jit(repr=_fused_gemm_afp4wfp4_a16w16_repr)
@@ -89,8 +85,6 @@ def _fused_gemm_afp4wfp4_a16w16_kernel(
     num_stages: tl.constexpr,
     waves_per_eu: tl.constexpr,
     matrix_instr_nonkdim: tl.constexpr,
-    GRID_MN_FP4: tl.constexpr,
-    GRID_MN_BF16: tl.constexpr,
     SKIP_REDUCE: tl.constexpr,
     cache_modifier: tl.constexpr,
     NUM_XCDS: tl.constexpr,
@@ -116,7 +110,9 @@ def _fused_gemm_afp4wfp4_a16w16_kernel(
     tl.assume(stride_c_bf16_n > 0)
 
     SCALE_GROUP_SIZE: tl.constexpr = 32
-    GRID_MN: tl.constexpr = GRID_MN_FP4 + GRID_MN_BF16
+    GRID_MN = tl.cdiv(M, BLOCK_SIZE_M) * (
+        tl.cdiv(N_fp4, BLOCK_SIZE_N) + tl.cdiv(N_bf16, BLOCK_SIZE_N)
+    )
 
     pid_unified = tl.program_id(axis=0)
     pid_unified = remap_xcd(pid_unified, GRID_MN * NUM_KSPLIT, NUM_XCDS=NUM_XCDS)
@@ -334,10 +330,6 @@ _fused_gemm_afp4wfp4_preshuffle_a16w16_repr = make_kernel_repr(
         "EVEN_K": lambda args: (args["K"] % (args["BLOCK_SIZE_K"] // 2) == 0)
         and (args["SPLITK_BLOCK_SIZE"] % args["BLOCK_SIZE_K"] == 0)
         and (args["K"] % (args["SPLITK_BLOCK_SIZE"] // 2) == 0),
-        "GRID_MN_FP4": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
-        * triton.cdiv(args["N_fp4"], args["BLOCK_SIZE_N"]),
-        "GRID_MN_BF16": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
-        * triton.cdiv(args["N_bf16"], args["BLOCK_SIZE_N"]),
     }
 )
 @triton.jit(repr=_fused_gemm_afp4wfp4_preshuffle_a16w16_repr)
@@ -390,8 +382,6 @@ def _fused_gemm_afp4wfp4_preshuffle_a16w16_kernel(
     num_stages: tl.constexpr,
     waves_per_eu: tl.constexpr,
     matrix_instr_nonkdim: tl.constexpr,
-    GRID_MN_FP4: tl.constexpr,
-    GRID_MN_BF16: tl.constexpr,
     SKIP_REDUCE: tl.constexpr,
     cache_modifier: tl.constexpr,
     NUM_XCDS: tl.constexpr,
@@ -417,7 +407,9 @@ def _fused_gemm_afp4wfp4_preshuffle_a16w16_kernel(
     tl.assume(stride_c_bf16_n > 0)
 
     SCALE_GROUP_SIZE: tl.constexpr = 32
-    GRID_MN: tl.constexpr = GRID_MN_FP4 + GRID_MN_BF16
+    GRID_MN = tl.cdiv(M, BLOCK_SIZE_M) * (
+        tl.cdiv(N_fp4, BLOCK_SIZE_N) + tl.cdiv(N_bf16, BLOCK_SIZE_N)
+    )
 
     pid_unified = tl.program_id(axis=0)
     pid_unified = remap_xcd(pid_unified, GRID_MN * NUM_KSPLIT, NUM_XCDS=NUM_XCDS)

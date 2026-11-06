@@ -21,7 +21,6 @@ _gemm_a8wfp4_repr = make_kernel_repr(
         "NUM_KSPLIT",
         "SPLITK_BLOCK_SIZE",
         "EVEN_K",
-        "GRID_MN",
         "RAW_MASKED_LOADS",
         "cache_modifier",
     ],
@@ -33,8 +32,6 @@ _gemm_a8wfp4_repr = make_kernel_repr(
         "EVEN_K": lambda args: (args["K"] % (args["BLOCK_SIZE_K"] // 2) == 0)
         and (args["SPLITK_BLOCK_SIZE"] % args["BLOCK_SIZE_K"] == 0)
         and (args["K"] % (args["SPLITK_BLOCK_SIZE"] // 2) == 0),
-        "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
-        * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
 )
 @triton.jit(repr=_gemm_a8wfp4_repr)
@@ -66,7 +63,6 @@ def _gemm_a8wfp4_kernel(
     NUM_KSPLIT: tl.constexpr,
     SPLITK_BLOCK_SIZE: tl.constexpr,
     EVEN_K: tl.constexpr,
-    GRID_MN: tl.constexpr,
     RAW_MASKED_LOADS: tl.constexpr,
     cache_modifier: tl.constexpr,
 ):
@@ -99,7 +95,7 @@ def _gemm_a8wfp4_kernel(
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
 
     if NUM_KSPLIT == 1:
-        remap_xcd(pid, GRID_MN)
+        remap_xcd(pid, num_pid_m * num_pid_n)
 
         pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
     else:
