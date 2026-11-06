@@ -58,6 +58,20 @@ V4_EPLB_EXPERTS_PER_RANKS = (52, 56)
 MAX_FANOUT_SEGMENTS = 1024
 MAX_FANOUT_EXPERTS_PER_RANK = 256
 P2P_QUANT_AUTO = "auto"
+# Execution routes of one MegaMoEV2 instance. Every EP rank must take the same
+# route for a call, so a route is chosen from EP-wide inputs only (the plan and
+# the call's max_tokens), never from a rank's own row count.
+ROUTE_STAGED = "staged"
+ROUTE_SMALL_M = "small_m"
+ROUTE_LARGE_M = "large_m"
+# Single-kernel small-input runtimes: power-of-two capacities up to this bound.
+SMALL_M_MAX_MTPR = 512
+DEFAULT_SMALL_M_MTPRS = (256, 512)
+# Instance capacities the large-input persistent kernel is built for.
+LARGE_M_MTPRS = (8192,)
+# Below this many rows per rank the staged (or small-input) path is faster than
+# the large-input kernel, whose geometry is fixed by its capacity.
+LARGE_M_MIN_TOKENS = SMALL_M_MAX_MTPR + 1
 P2P_QUANT_NONE = "none"
 P2P_QUANT_FP8_BLOCKWISE = "fp8_blockwise_1x32"
 SUPPORTED_P2P_QUANT_MODES = (P2P_QUANT_NONE, P2P_QUANT_FP8_BLOCKWISE)
@@ -182,6 +196,27 @@ class MegaMoEBundlePlan:
     entries: tuple[MegaMoEBundleEntry, ...]
     stage1_variants: tuple[Stage1Config, ...]
     stage2_variants: tuple[Stage2BundleKey, ...]
+    # Fused routes this instance builds: small-input capacities and the large-input kernel.
+    small_m_mtprs: tuple[int, ...] = ()
+    large_m: bool = False
+
+    def route_for(
+        self, max_tokens: int, *, small_m: bool = True, large_m: bool = True
+    ) -> tuple[str, int]:
+        """(route, capacity) of a call whose largest EP rank has ``max_tokens`` rows.
+
+        Every rank passes the same ``max_tokens``, so every rank takes the same
+        route. ``small_m`` / ``large_m`` exclude a route the caller cannot use.
+        """
+        if not 0 <= max_tokens <= self.mtpr:
+            raise ValueError(f"max_tokens={max_tokens} must be in [0, {self.mtpr}]")
+        if small_m:
+            for capacity in self.small_m_mtprs:
+                if max_tokens <= capacity:
+                    return ROUTE_SMALL_M, capacity
+        if large_m and self.large_m and max_tokens >= LARGE_M_MIN_TOKENS:
+            return ROUTE_LARGE_M, self.mtpr
+        return ROUTE_STAGED, self.mtpr
 
     def entry_for_tokens(self, tokens: int) -> MegaMoEBundleEntry:
         if tokens < 0 or tokens > self.mtpr:
@@ -196,6 +231,59 @@ class MegaMoEBundlePlan:
         raise ValueError(
             f"token bucket {bucket} is not present in the mtpr={self.mtpr} bundle"
         )
+
+
+def fused_layout_supported(
+    *,
+    arch: str,
+    world_size: int,
+    model_dim: int,
+    inter_dim: int,
+    experts: int,
+    topk: int,
+    quant: str,
+    swiglu_limit: float,
+    act: str = "silu",
+    fanout_masks: tuple[int, ...] = (),
+) -> bool:
+    """Whether the small- and large-input fused kernels support this layout.
+
+    Both bake in the EP8 DeepSeek-V4 a8w4 shape on gfx950.
+    """
+    return (
+        arch.split(":", 1)[0] == "gfx950"
+        and world_size == 8
+        and model_dim == V4_MODEL_DIM
+        and inter_dim == V4_INTER_DIM
+        and experts == world_size * REFERENCE_EXPERTS_PER_RANK
+        and topk == 6
+        and quant == "a8w4"
+        and swiglu_limit == 10.0
+        and act == "silu"
+        and not fanout_masks
+    )
+
+
+def small_m_cu_supported(num_cu: int) -> bool:
+    """The small-input kernel splits its work over 8 XCDs by XCC id (256-CU parts)."""
+    return num_cu == 256
+
+
+def small_m_mtprs_for(mtpr: int, mtprs=DEFAULT_SMALL_M_MTPRS) -> tuple[int, ...]:
+    """Small-input capacities an instance of capacity ``mtpr`` can reach.
+
+    A call picks the smallest capacity >= its max_tokens, so capacities above
+    the first one that covers ``mtpr`` are never used.
+    """
+    mtprs = sorted({int(m) for m in mtprs})
+    for m in mtprs:
+        if m <= 0 or m & (m - 1) or m > SMALL_M_MAX_MTPR:
+            raise ValueError(
+                f"small_m_mtprs: {m} must be a power of two <= {SMALL_M_MAX_MTPR}"
+            )
+    reachable = [m for m in mtprs if m < mtpr]
+    reachable += [m for m in mtprs if m >= mtpr][:1]
+    return tuple(reachable)
 
 
 def nearest_token_bucket(tokens: int) -> int:
@@ -1045,10 +1133,20 @@ def build_mega_moe_bundle_plan(
     model_dim: int = 7168,
     inter_dim: int = 3072,
     world_size: int = 8,
+    small_m_mtprs: tuple[int, ...] = (),
+    large_m: bool = False,
 ) -> MegaMoEBundlePlan:
-    """Deduplicate variants while keeping Stage1/Stage2 selection atomic."""
+    """Deduplicate variants while keeping Stage1/Stage2 selection atomic.
+
+    ``small_m_mtprs`` / ``large_m`` add the fused routes; the caller has checked
+    the layout supports them (:func:`fused_layout_supported`).
+    """
     if mtpr <= 0 or mtpr & (mtpr - 1):
         raise ValueError(f"mtpr={mtpr} must be a positive power of two")
+    if large_m and mtpr not in LARGE_M_MTPRS:
+        raise ValueError(
+            f"the large-input kernel supports mtpr in {LARGE_M_MTPRS}, got {mtpr}"
+        )
     buckets = tuple(bucket for bucket in TOKEN_BUCKETS if bucket <= mtpr)
     if not buckets or buckets[-1] != mtpr:
         raise ValueError(f"mtpr={mtpr} has no exact token bucket")
@@ -1100,4 +1198,6 @@ def build_mega_moe_bundle_plan(
         entries=tuple(entries),
         stage1_variants=tuple(stage1_variants),
         stage2_variants=tuple(stage2_variants),
+        small_m_mtprs=small_m_mtprs_for(mtpr, small_m_mtprs) if small_m_mtprs else (),
+        large_m=large_m,
     )

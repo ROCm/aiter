@@ -40,6 +40,7 @@ from ..tensor_shim import _preload_compiled, _run_compiled
 from .dispatch import _wave_inclusive_scan_i32, _wave_reduce_max_i32
 from .gemm1 import _LdsF32View
 from .gemm2 import _resolve_g2_knobs
+from .mega_moe_config import LARGE_M_MTPRS, fused_layout_supported
 from .mega_moe_fused_gemm import (
     AddrBuffer,
     MegaMoEConfig,
@@ -1973,21 +1974,13 @@ class LargeMRuntime:
             raise ValueError(f"experts={experts} must be divisible by world_size={world_size}")
         if max_tok_per_rank <= 0 or max_tok_per_rank & (max_tok_per_rank - 1):
             raise ValueError(f"max_tok_per_rank={max_tok_per_rank} must be a power of two")
-        arch = get_gfx_runtime()
-        shape = (
-            world_size,
-            model_dim,
-            inter_dim,
-            experts,
-            experts // world_size,
-            topk,
-            max_tok_per_rank,
-            float(swiglu_limit),
-        )
-        if arch != "gfx950" or shape != (8, 7168, 3072, 384, 48, 6, 8192, 10.0):
+        if not fused_layout_supported(
+            arch=get_gfx_runtime(), world_size=world_size, model_dim=model_dim, inter_dim=inter_dim,
+            experts=experts, topk=topk, quant=quant, swiglu_limit=float(swiglu_limit),
+        ) or max_tok_per_rank not in LARGE_M_MTPRS:
             raise ValueError(
-                "the large-input path requires gfx950, EP8, 7168x3072, "
-                "384 experts/EPR48, topk6, max_tok_per_rank 8192, and swiglu_limit=10"
+                "the large-input path requires the EP8 DeepSeek-V4 a8w4 layout on gfx950 "
+                f"(7168x3072, 384 experts, topk6, swiglu_limit=10) and max_tok_per_rank in {LARGE_M_MTPRS}"
             )
         self.rank = int(rank)
         self.world_size = int(world_size)
