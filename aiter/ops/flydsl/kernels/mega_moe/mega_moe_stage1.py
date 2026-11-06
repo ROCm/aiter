@@ -6,6 +6,7 @@ import functools
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+import torch
 from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
@@ -56,6 +57,33 @@ def _validate_fixed_slot_geometry(
     required_cap = ((npes * max_tokens_per_rank + tile_m - 1) // tile_m) * tile_m
     if npes != 8 or experts_per_rank != 48 or cap != required_cap:
         raise ValueError("fixed-slot dispatch requires the direct EP8/EPR48 layout")
+
+
+def stage1_output_nbytes(rows, inter_dim, a_dtype="fp8"):
+    """Bytes of the GEMM1 output for ``rows`` routed rows and of its scale buffer."""
+    out = rows * (inter_dim // 2 if a_dtype == "fp4" else inter_dim)
+    prows = (rows + 255) // 256 * 256
+    pcols = ((inter_dim // 32) + 7) // 8 * 8
+    return out, prows * pcols + inter_dim
+
+
+def stage1_output_buffers(rows, inter_dim, device, a_dtype="fp8", arena=None):
+    """GEMM1 output ``[rows, inter_dim]`` (FP8, or packed FP4) and its scale buffer.
+
+    ``arena``: (output bytes, scale bytes) uint8 tensors to view instead of
+    allocating, shared by routes whose calls never overlap.
+    """
+    out_bytes, osd_bytes = stage1_output_nbytes(rows, inter_dim, a_dtype)
+    if arena is None:
+        out = torch.zeros(out_bytes, dtype=torch.uint8, device=device)
+        osd = torch.zeros(osd_bytes, dtype=torch.uint8, device=device)
+    else:
+        if out_bytes > arena[0].numel() or osd_bytes > arena[1].numel():
+            raise ValueError("the Stage1 output arena is smaller than this route needs")
+        out, osd = arena[0][:out_bytes], arena[1][:osd_bytes]
+    out = out.view(rows, out_bytes // rows)
+    out = out.view(torch.float4_e2m1fn_x2 if a_dtype == "fp4" else torch.float8_e4m3fn)
+    return out, osd
 
 
 def _validate_dispatch_capacity(
