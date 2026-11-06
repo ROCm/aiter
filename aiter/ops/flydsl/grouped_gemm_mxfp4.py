@@ -147,6 +147,7 @@ def flydsl_grouped_gemm_a8w4_masked(
     persistent_workers=0,
     rolled_drain=0,
     m_align=0,
+    k_waves=1,
 ):
     """Launch a contiguous-M grouped GEMM, optionally with persistent workers.
 
@@ -185,7 +186,20 @@ def flydsl_grouped_gemm_a8w4_masked(
         if float(situ_linear_beta) <= 0.0:
             raise ValueError(f"situ_linear_beta must be > 0, got {situ_linear_beta!r}")
     k_tiles = (K + tile_k - 1) // tile_k
-    num_buffers = min(num_buffers, max(1, k_tiles))
+    k_waves = int(k_waves)
+    if k_waves < 1:
+        raise ValueError(f"k_waves (CSV split_k1/split_k2) must be >= 1, got {k_waves}")
+    if k_waves > 1:
+        # Each wave group runs the full pipeline on its own K slice, so the
+        # slices must be whole and equal; an EP scatter epilogue cannot be split.
+        if K % tile_k or k_tiles % k_waves:
+            raise ValueError(
+                f"k_waves={k_waves} must evenly split the K tiles "
+                f"(K={K}, tile_k={tile_k}, {k_tiles} tiles)"
+            )
+        if stage2_scatter is not None:
+            raise ValueError(f"k_waves={k_waves} does not support the EP scatter")
+    num_buffers = min(num_buffers, max(1, k_tiles // k_waves))
     if bias is None:
         has_bias = 0
     elif bias.dtype in _BIAS_MODE:
@@ -220,6 +234,16 @@ def flydsl_grouped_gemm_a8w4_masked(
             )
         persistent_workers = (
             (persistent_workers + cluster_n - 1) // cluster_n * cluster_n
+        )
+    # k_waves owns the grid: no clusters, no persistent workers, no As prologue.
+    # Reject a config that asks for them rather than dropping them.
+    if k_waves > 1 and (
+        cluster_n > 1 or cluster_m > 1 or persistent_workers or tdm_as_in_prologue
+    ):
+        raise ValueError(
+            f"k_waves={k_waves} needs a plain grid, got cluster_n={cluster_n} "
+            f"cluster_m={cluster_m} persistent_workers={persistent_workers} "
+            f"tdm_as_in_prologue={tdm_as_in_prologue}"
         )
     waves_per_tensor_tdm = _select_num_waves_per_tensor_tdm(waves_per_tensor_tdm)
     rolled_drain = int(rolled_drain)
@@ -283,6 +307,7 @@ def flydsl_grouped_gemm_a8w4_masked(
         rolled_drain,
         int(a_preshuffled),
         int(m_align),
+        k_waves,
     )
     _run_compiled(
         launch_gemm_a8w4_tdm,
