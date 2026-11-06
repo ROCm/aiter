@@ -1190,6 +1190,11 @@ def fused_moe(
     clamp_shared: bool = True,
     herd_topk: int = 0,
     herd_routed_scaling_factor: float = 1.0,
+    # Block Hadamard size for the SwiGLU output. 0 leaves it unchanged. The
+    # second-GEMM weights of an online-rotated MXFP4 checkpoint were quantized
+    # after this rotation, so the activation has to be rotated before stage 2
+    # quantizes or consumes it. See aiter.ops.hadamard.
+    inter_hadamard: int = 0,
 ):
     """Run fused MoE, dispatching to FHMoE when shared-expert tensors are present.
 
@@ -1203,6 +1208,11 @@ def fused_moe(
     ``swiglu_limit``. Clamped and unclamped stage-1 kernels have distinct AOT
     cache identities, so deployments changing this setting must rebuild their
     FlyDSL AOT cache.
+
+    ``inter_hadamard`` rotates the bf16 SwiGLU output between the two GEMMs by
+    a block Hadamard of that size. It is 0 by default. The 1-stage kernel,
+    FHMoE, and a stage 1 that quantizes inside the kernel do not expose that
+    tensor and raise instead of skipping the rotation.
 
     """
     has_shared_expert = (
@@ -1230,6 +1240,8 @@ def fused_moe(
             unsupported.append("quant_dtype_a")
         if quant_dtype_a2 is not None:
             unsupported.append("quant_dtype_a2")
+        if inter_hadamard:
+            unsupported.append("inter_hadamard")
         # The MXFP8 path does not consume caller-prequantized activations and
         # requires an explicit preshuffle marker. Preserve the existing DSV4
         # MXFP4 path, which accepts activation scales and trusts its layout.
@@ -1336,6 +1348,7 @@ def fused_moe(
         quant_dtype_a2=quant_dtype_a2,
         herd_topk=herd_topk,
         herd_routed_scaling_factor=herd_routed_scaling_factor,
+        inter_hadamard=inter_hadamard,
     )
 
 
@@ -1380,6 +1393,7 @@ def fused_moe_fake(
     quant_dtype_a2: torch.dtype | None = None,
     herd_topk: int = 0,
     herd_routed_scaling_factor: float = 1.0,
+    inter_hadamard: int = 0,
 ) -> torch.Tensor:
     device = topk_ids.device
     M, _topk = topk_ids.shape
@@ -1443,6 +1457,7 @@ def fused_moe_(
     quant_dtype_a2: torch.dtype | None = None,
     herd_topk: int = 0,
     herd_routed_scaling_factor: float = 1.0,
+    inter_hadamard: int = 0,
 ) -> torch.Tensor:
     stage2_scatter = None
     if ep_source_token_map is not None:
@@ -1488,6 +1503,7 @@ def fused_moe_(
         quant_dtype_a2=quant_dtype_a2,
         herd_topk=herd_topk,
         herd_routed_scaling_factor=herd_routed_scaling_factor,
+        inter_hadamard=inter_hadamard,
     )
 
 
@@ -1524,6 +1540,7 @@ def _fused_moe_impl(
     quant_dtype_a2: torch.dtype | None = None,
     herd_topk: int = 0,
     herd_routed_scaling_factor: float = 1.0,
+    inter_hadamard: int = 0,
     *,
     _q_dtype_a: torch.dtype | None = None,
     _metadata_transform: Callable | None = None,
@@ -1678,6 +1695,11 @@ def _fused_moe_impl(
         )
 
     if grouped_a8w4_out is not None:
+        if inter_hadamard:
+            raise NotImplementedError(
+                f"inter_hadamard={inter_hadamard} needs the 2-stage path; the "
+                "grouped GEMM never exposes the SwiGLU output."
+            )
         return _return_output(grouped_a8w4_out, output)
     if herd_topk and get_gfx() == "gfx1250":
         raise ValueError(
@@ -2183,6 +2205,11 @@ def _fused_moe_impl(
     _opus_a8w4.check_route_bucket_metadata(metadata, sorted_expert_ids, logger)
 
     if metadata.run_1stage:
+        if inter_hadamard:
+            raise NotImplementedError(
+                f"inter_hadamard={inter_hadamard} needs the 2-stage path; the "
+                "1-stage kernel never exposes the SwiGLU output."
+            )
         if _stage2_override is not None:
             raise RuntimeError("_stage2_override requires a two-stage MoE config")
         _stage1_call = functools.partial(
@@ -2263,6 +2290,7 @@ def _fused_moe_impl(
             routing_num_experts=global_E,
             prequantized_a1=prequantized_a1,
             prequantized_a1_scale=prequantized_a1_scale,
+            inter_hadamard=inter_hadamard,
         )
         return _return_output(ret, output)
 
@@ -5458,6 +5486,7 @@ def fused_moe_2stages(
     routing_num_experts: int | None = None,
     prequantized_a1: torch.Tensor | None = None,
     prequantized_a1_scale: torch.Tensor | None = None,
+    inter_hadamard: int = 0,
 ):
     quant_func = get_quant(quant_type)
     gate_mode = GateMode(gate_mode)
@@ -5763,6 +5792,24 @@ def fused_moe_2stages(
     if kernel_bench_callable is not None:
         kernel_bench_callable.append(("stage1", _stage1_call))
     a2 = _stage1_call()
+    if inter_hadamard:
+        # Stage 2 weights were quantized in the rotated basis, so the SwiGLU
+        # output has to be rotated before it is quantized or consumed in bf16.
+        if (
+            metadata.fuse_quant
+            or isinstance(a2, tuple)
+            or a2.dtype not in (dtypes.bf16, dtypes.fp16)
+            or a2.shape[-1] != inter_dim
+        ):
+            raise NotImplementedError(
+                f"inter_hadamard={inter_hadamard} needs the bf16 SwiGLU output "
+                f"of stage 1, got fuse_quant={metadata.fuse_quant!r}, "
+                f"{type(a2).__name__} {getattr(a2, 'dtype', None)} "
+                f"{tuple(getattr(a2, 'shape', ()))}."
+            )
+        from aiter.ops.hadamard import block_hadamard_rotate
+
+        a2 = block_hadamard_rotate(a2, inter_hadamard)
     if isinstance(a2, tuple) and (
         stage1_func is _mxfp4_a4w4_stage1_fw
         or metadata.skip_inter_quant
