@@ -796,6 +796,37 @@ def test_fused_gdn_decode_supported_rejects_cpu_optional_operands():
         assert not ok and "device" in reason, kwargs.keys()
 
 
+@pytest.mark.parametrize("num_ksplit", [0, 1])
+def test_fused_gdn_decode_supported_rejects_fewer_than_two_ba_partials(num_ksplit):
+    """A split-K GEMM with one split returns the reduced bf16 output, so fp32
+    partials with fewer than 2 splits are not valid input."""
+    _import_op()
+    _requires_gfx950()
+    from aiter.ops.triton.gated_delta_net.fused_gdn_decode_qkvz import (
+        fused_gdn_decode_qkvz_supported,
+    )
+
+    ops = to_flat_layout(make_inputs(4, num_k_heads=16, ratio=3))
+    ops["projected_ba"] = _split_k_partials(ops["projected_ba"], 2)[:num_ksplit]
+    args = [
+        ops[k]
+        for k in (
+            "projected_qkvz",
+            "projected_ba",
+            "conv_state",
+            "ssm_state",
+            "ssm_state_indices",
+            "conv_weight",
+            "conv_bias",
+            "A_log",
+            "dt_bias",
+            "norm_weight",
+        )
+    ]
+    ok, reason = fused_gdn_decode_qkvz_supported(*args, qkvz_layout="flat")
+    assert not ok and "at least 2 splits" in reason
+
+
 def test_fused_gdn_decode_preallocated_out():
     """``out=`` writes the normalised output into the caller's buffer in place
     (a slice of a larger activation buffer) and returns that same tensor."""
