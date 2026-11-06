@@ -1550,8 +1550,8 @@ def test_presorted_moe_hook():
     presorted, and "own err" (diff vs the own sort on the timed routing) for both
     presorted calls. Its eager summed kernel time does not rank the two presorted
     calls (a GPU idle gap before GEMM1 skews it); graph replay does. Then the
-    contract: a reused-address moe_buf is zeroed, a 2-byte-aligned output is
-    copied back while a 4-byte-aligned one is used in place, and a registration
+    contract: a reused-address moe_buf is zeroed, a 2- or 4-byte-aligned output
+    is copied back while a 16-byte-aligned one is used in place, and a registration
     that does not match the call is ignored and still consumed, so it never
     leaks into a later call, even when fused_moe exits before sorting.
     """
