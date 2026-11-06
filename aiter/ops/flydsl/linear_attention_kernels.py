@@ -1082,9 +1082,11 @@ def flydsl_gdr_mtp_sglang(
 
 
 # Fused KDA decode: the gated delta rule with a per-channel decay, fixed to
-# the gfx950 Kimi-K3 TP8 layout (_KDA_HEADS=12 local heads, _KDA_DIM=128 state,
+# the Kimi-K3 TP8 layout (_KDA_HEADS=12 local heads, _KDA_DIM=128 state,
 # both imported from the kernel so the two cannot disagree).
 _KDA_CONV_CHANNELS = 3 * _KDA_HEADS * _KDA_DIM
+# Validated on both; tuned on gfx950.
+_KDA_SUPPORTED_ARCHS = ("gfx942", "gfx950")
 _KDA_CONV_WIDTH = 4
 # Recurrent-state storage the KDA kernels accept, mapped to the tag that keys
 # kernels/gdr_decode.py's _KDA_STATE_DTYPES; the recurrence computes in FP32.
@@ -1125,7 +1127,7 @@ def _mask_padding_slot(state_indices: torch.Tensor) -> torch.Tensor:
 def is_flydsl_kda_decode_supported(
     device: torch.device | str | int | None = None,
 ) -> bool:
-    """Return whether ``device`` can run this gfx950-only specialization."""
+    """Return whether ``device`` can run this gfx942/gfx950 specialization."""
     if not torch.cuda.is_available():
         return False
     try:
@@ -1147,8 +1149,9 @@ def is_flydsl_kda_decode_supported(
         if not 0 <= index < torch.cuda.device_count():
             return False
         # FlyDSL builds for GDR_GPU_ARCH (FLYDSL_GPU_ARCH or the first GPU), so
-        # the GPU and the build target must both be gfx950.
-        return get_gfx_runtime() == "gfx950" and GDR_GPU_ARCH == "gfx950"
+        # the GPU must be a supported arch and match the build target.
+        arch = get_gfx_runtime()
+        return arch in _KDA_SUPPORTED_ARCHS and GDR_GPU_ARCH == arch
     except (AssertionError, KeyError, RuntimeError, TypeError, ValueError):
         return False
 
@@ -1291,7 +1294,7 @@ def _validate_kda_inputs(
 ) -> torch.Tensor:
     """Validate operands shared by both explicit KDA specializations."""
     if not is_flydsl_kda_decode_supported(device):
-        raise RuntimeError(f"`{api_name}` requires a gfx950 GPU.")
+        raise RuntimeError(f"`{api_name}` requires a gfx942 or gfx950 GPU.")
     if batch <= 0:
         raise ValueError(f"`{batch_source}` must have a non-empty batch dimension.")
     if batch * _KDA_HEADS > _INT32_MAX:
@@ -1474,7 +1477,7 @@ def flydsl_kda_decode(
 ) -> torch.Tensor:
     """Fuse width-4 Q/K/V convolution, FP32 KDA updates, and BF16 output gating.
 
-    Requires gfx950, 12 heads, and 128-dim state (Kimi-K3 TP8). Check
+    Requires gfx942 or gfx950, 12 heads, and 128-dim state (Kimi-K3 TP8). Check
     :func:`is_flydsl_kda_decode_supported` before dispatch.
     ``state`` may be stored as FP32 or BF16. The recurrence always computes
     in FP32: a BF16 state is widened on load and rounded to nearest-even BF16
