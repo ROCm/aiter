@@ -4,6 +4,8 @@ import math
 import torch
 import triton
 
+from aiter.ops.triton._triton_kernels.gemm.basic.gemm_afp4wfp4 import _get_config
+from aiter.ops.triton.gemm.basic import gemm_afp4wfp4 as gemm_afp4wfp4_module
 from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import (
     gemm_afp4wfp4 as triton_gemm_afp4wfp4,
 )
@@ -40,6 +42,7 @@ def bench_gemm_fn(
     layout: str,
     preshuffle: bool,
     gluon: bool,
+    compute_bound: bool = False,
 ):
     c_dtype = torch.bfloat16
 
@@ -64,7 +67,24 @@ def bench_gemm_fn(
 
     rot_bufs = bencher.build_pool([_p_gen], [_out_vals_keys])
 
-    if preshuffle:
+    if compute_bound:
+        if preshuffle:
+            raise ValueError("--compute-bound does not support --preshuffle")
+        # Explicit config: the gfx950 Gluon compute_bound (ping-pong) kernel.
+        config, _ = _get_config(M, N, K // 2, backend="gluon")
+        config["kernel_type"] = "compute_bound"
+        b = rot_bufs[0]
+        reason = gemm_afp4wfp4_module._pingpong_unsupported(
+            b["x"], b["w"], b["x_scales"], b["w_scales"], b["y"], c_dtype, config
+        )
+        if reason is not None:
+            raise RuntimeError(
+                f"compute_bound kernel cannot run M={M} N={N} K={K}: {reason}"
+            )
+        kernel_fn = functools.partial(
+            triton_gemm_afp4wfp4, dtype=c_dtype, config=config, backend="gluon"
+        )
+    elif preshuffle:
         kernel_fn = functools.partial(gemm_afp4wfp4_preshuffle, dtype=c_dtype)
     elif gluon:
         kernel_fn = functools.partial(
@@ -160,6 +180,7 @@ def run_model_benchmark(args):
             args.layout,
             args.preshuffle,
             args.gluon,
+            args.compute_bound,
         )
 
     bench_gemm_afp4wfp4.run(save_path="." if args.o else None, print_data=True)
@@ -183,6 +204,7 @@ def run_shape_benchmark(args):
             args.layout,
             args.preshuffle,
             args.gluon,
+            args.compute_bound,
         )
 
     bench_gemm_afp4wfp4.run(save_path="." if args.o else None, print_data=True)
@@ -202,6 +224,12 @@ def parse_args(args: list[str] | None = None):
         "--gluon",
         action="store_true",
         help="Use Gluon non-preshuffle kernel (ignored if --shuffle/--preshuffle is set).",
+    )
+    parser.add_argument(
+        "--compute-bound",
+        action="store_true",
+        help="Use the gfx950 Gluon compute_bound kernel through an explicit config "
+        '(kernel_type="compute_bound"). Fails if the inputs cannot use it.',
     )
     return get_ff_args(parser, args=args)
 
