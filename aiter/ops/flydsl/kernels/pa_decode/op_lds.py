@@ -1213,9 +1213,7 @@ class Gfx1250Memory:
             else:
                 # V packs eight tokens per dimension; mask inside each chunk.
                 for chunk in range_constexpr(2):
-                    count = fx.max(
-                        fx.Int32(0), fx.min(fx.Int32(8), valid - chunk * 8)
-                    )
+                    count = fx.max(fx.Int32(0), fx.min(fx.Int32(8), valid - chunk * 8))
                     self.tdm_copy(
                         ctx.value_cache_ptr,
                         off + chunk * t.head_dim * 8,
@@ -1342,7 +1340,8 @@ class Gfx1250Memory:
                 off,
                 kv_off + t.k_bytes + slot * t.head_dim * 16,
                 (t.head_dim * 16,) if full_tile else (t.head_dim, 16),
-                (1,) if full_tile else (16 if t.trans_v else 16, 1),
+                # Both V layouts store a page16 slice as [D][16 tokens].
+                (1,) if full_tile else (16, 1),
                 (None,) if full_tile else (None, valid),
                 16,
                 16,
@@ -1783,9 +1782,7 @@ class Gfx1250Memory:
         kv_off = t.q_bytes + buffer * t.kv_stride
         table = fx.recast_iter(fx.Int32, ctx.block_tables_ptr)
         page = fx.Int32(0)
-        if const_expr(
-            (t.async_page or t.page16_async_scales) and not t.page16_wide
-        ):
+        if const_expr((t.async_page or t.page16_async_scales) and not t.page16_wide):
             page_absolute = token_base + (ctx.warp * 16 if t.page16_async_scales else 0)
             safe = (
                 page_absolute

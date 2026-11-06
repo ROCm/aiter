@@ -1802,7 +1802,9 @@ class Gfx1250Pipeline:
                 page_factors = []
                 for p in range_constexpr(2):
                     vmax = fx.Float32(
-                        self.mem.load(scale_base + (ctx.lane + 128 * p) * 4, fx.Float32)[0]
+                        self.mem.load(
+                            scale_base + (ctx.lane + 128 * p) * 4, fx.Float32
+                        )[0]
                     )
                     for k in range_constexpr(1, 4):
                         vmax = fx.maxnumf(
@@ -1831,14 +1833,16 @@ class Gfx1250Pipeline:
             elif const_expr(t.per_token_kv):
                 # Every wave reduces the tile's scales, avoiding a CTA barrier.
                 scale_base = kv_off + t.k_bytes + t.v_bytes + t.TOKENS * 4
-                vmax = fx.Float32(self.mem.load(scale_base + ctx.lane * 4, fx.Float32)[0])
+                vmax = fx.Float32(
+                    self.mem.load(scale_base + ctx.lane * 4, fx.Float32)[0]
+                )
                 for k in range_constexpr(1, t.TOKENS // 32):
                     vmax = fx.maxnumf(
                         vmax,
                         fx.Float32(
-                            self.mem.load(scale_base + (ctx.lane + 32 * k) * 4, fx.Float32)[
-                                0
-                            ]
+                            self.mem.load(
+                                scale_base + (ctx.lane + 32 * k) * 4, fx.Float32
+                            )[0]
                         ),
                     )
                 for shift in (16, 8, 4, 2, 1):

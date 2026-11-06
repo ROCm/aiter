@@ -1131,9 +1131,7 @@ def pa_decode(
             int(query.stride(1)),
             # Cluster grids derive their tiles from the context lengths.
             ptr_arg(
-                (
-                    context_lengths if cluster_merge else work_plan.work_info
-                ),
+                (context_lengths if cluster_merge else work_plan.work_info),
                 fx.Int32,
             ),
             work_plan.capacity,
