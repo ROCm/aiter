@@ -1458,7 +1458,8 @@ def rope_rotate_activation(
     - bf16/fp16 ``out``: plain rope+hadamard in place (``scale`` ignored).
     - ``fp4x2`` ``out``: FP4-quantize into packed ``out`` + e8m0 ``scale``
       (``scale`` required; ``group_size`` defaults to 32). ``shuffle_scale``
-      selects the dsv4 preshuffled scale layout.
+      selects the dsv4 preshuffled scale layout. ``cos`` / ``sin`` may be
+      fp32 here, for a RoPE that reads its angles in fp32.
     - ``fp8`` ``out``: per-(row, 1xGROUP) fp8-quantize into ``out`` + fp32
       ``scale`` (``scale`` required; ``group_size`` defaults to 128).
 

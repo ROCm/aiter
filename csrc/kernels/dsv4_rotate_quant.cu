@@ -517,12 +517,17 @@ void rotate_activation(aiter_tensor_t& out,
 }
 
 
-template <typename DTYPE_I, typename DTYPE_O, bool do_rotate_act, int dim, int vec_size = 16>
+template <typename DTYPE_I,
+          typename DTYPE_O,
+          bool do_rotate_act,
+          int dim,
+          int vec_size    = 16,
+          typename DTYPE_F = DTYPE_I>
 __global__ void rope_hadamard_rotate_activation_fp4quant_kernel(DTYPE_O* __restrict__ out,
                                                                         opus::e8m0_t* __restrict__ scale,
                                                                         DTYPE_I const* __restrict__ input,
-                                                                        DTYPE_I const* __restrict__ cos,
-                                                                        DTYPE_I const* __restrict__ sin,
+                                                                        DTYPE_F const* __restrict__ cos,
+                                                                        DTYPE_F const* __restrict__ sin,
                                                                         int64_t const* __restrict__ positions,
                                                                         const int32_t m,
                                                                         const int32_t head_num,
@@ -541,7 +546,7 @@ __global__ void rope_hadamard_rotate_activation_fp4quant_kernel(DTYPE_O* __restr
 
     using halfxvec_t  = opus::vector_t<DTYPE_I, vec_size>;
     using floatxvec_t = opus::vector_t<float, vec_size>;
-    using freqxvec_t  = opus::vector_t<DTYPE_I, vec_size / 2>;
+    using freqxvec_t  = opus::vector_t<DTYPE_F, vec_size / 2>;
     using DTYPE_O_STORE = std::conditional_t<std::is_same_v<DTYPE_O, opus::fp4_t>, uint8_t, DTYPE_O>;
 
     const int32_t log2_head_num = __builtin_ctz(static_cast<uint32_t>(head_num));
@@ -567,8 +572,8 @@ __global__ void rope_hadamard_rotate_activation_fp4quant_kernel(DTYPE_O* __restr
     if(col_offset >= rope_start)
     {
         const int64_t position = positions[token_id];
-        DTYPE_I const* cos_ptr = cos + position * rope_half;
-        DTYPE_I const* sin_ptr = sin + position * rope_half;
+        DTYPE_F const* cos_ptr = cos + position * rope_half;
+        DTYPE_F const* sin_ptr = sin + position * rope_half;
         const int freq_offset = (col_offset - rope_start) / 2;
         freqxvec_t c_vec      = *reinterpret_cast<freqxvec_t const*>(cos_ptr + freq_offset);
         freqxvec_t s_vec      = *reinterpret_cast<freqxvec_t const*>(sin_ptr + freq_offset);
@@ -581,8 +586,16 @@ __global__ void rope_hadamard_rotate_activation_fp4quant_kernel(DTYPE_O* __restr
             const float y  = static_cast<float>(a[odd]);
             const float c  = static_cast<float>(c_vec[i]);
             const float s  = static_cast<float>(s_vec[i]);
-            af[even]       = x * c - y * s;
-            af[odd]        = y * c + x * s;
+            {
+                // each product rounded on its own, as a complex multiply in
+                // separate steps does: with fp32 cos / sin a fused
+                // multiply-add rounds differently and can flip round_rope's
+                // rounding (16-bit cos / sin times a 16-bit input is exact
+                // either way)
+#pragma clang fp contract(off)
+                af[even] = x * c - y * s;
+                af[odd]  = y * c + x * s;
+            }
             // round_rope: the rotated value as the input dtype holds it, as a
             // RoPE that writes its output back (a bf16 model's) leaves it
             if(round_rope)
@@ -695,7 +708,7 @@ __global__ void rope_hadamard_rotate_activation_fp4quant_kernel(DTYPE_O* __restr
     }
 }
 
-#define ROPE_ROTATE_ACTIVATION_FP4QUANT_KERNEL_IMPL_(dim, do_rotate_act, fp4quant, vec_size, name) \
+#define ROPE_ROTATE_ACTIVATION_FP4QUANT_KERNEL_IMPL_(dim, do_rotate_act, fp4quant, freq_fp32, vec_size, name) \
     AITER_CHECK(vec_size * block_size % dim == 0, "vec_size * block_size must be divisible by dim"); \
     AITER_CHECK(rope_dim % vec_size == 0, "rope_dim must be divisible by vec_size");              \
     const int32_t m_block = vec_size * WARP_SIZE / dim;                                            \
@@ -704,22 +717,34 @@ __global__ void rope_hadamard_rotate_activation_fp4quant_kernel(DTYPE_O* __restr
                                             [&] {                                                  \
                                                 using DTYPE_I = typename aiter::hip2opus<scalar_t>::type; \
                                                 using DTYPE_O = std::conditional_t<fp4quant, opus::fp4_t, DTYPE_I>; \
-                                                rope_hadamard_rotate_activation_fp4quant_kernel<DTYPE_I, DTYPE_O, do_rotate_act, dim, vec_size> \
+                                                using DTYPE_F = std::conditional_t<freq_fp32, float, DTYPE_I>; \
+                                                rope_hadamard_rotate_activation_fp4quant_kernel<DTYPE_I, DTYPE_O, do_rotate_act, dim, vec_size, DTYPE_F> \
                                                     <<<grid, dim3(block_size), 0, stream>>>(       \
                                                         reinterpret_cast<DTYPE_O*>(out.data_ptr()), \
                                                         reinterpret_cast<opus::e8m0_t*>(scale_ptr), \
                                                         reinterpret_cast<DTYPE_I const*>(input.data_ptr()), \
-                                                        reinterpret_cast<DTYPE_I const*>(cos.data_ptr()), \
-                                                        reinterpret_cast<DTYPE_I const*>(sin.data_ptr()), \
+                                                        reinterpret_cast<DTYPE_F const*>(cos.data_ptr()), \
+                                                        reinterpret_cast<DTYPE_F const*>(sin.data_ptr()), \
                                                         reinterpret_cast<int64_t const*>(positions.data_ptr()), \
                                                         m, head_num, rope_dim, stride, out_stride, shuffle_scale, group_size, round_rope); \
                                             });
 
-#define ROPE_ROTATE_ACTIVATION_FP4QUANT_KERNEL_IMPL(dim, fp4quant, vec_size, name) \
+#define ROPE_ROTATE_ACTIVATION_FP4QUANT_KERNEL_IMPL_F(dim, fp4quant, freq_fp32, vec_size, name) \
     if (do_rotate_act) { \
-        ROPE_ROTATE_ACTIVATION_FP4QUANT_KERNEL_IMPL_(dim, true, fp4quant, vec_size, name); \
+        ROPE_ROTATE_ACTIVATION_FP4QUANT_KERNEL_IMPL_(dim, true, fp4quant, freq_fp32, vec_size, name); \
     } else { \
-        ROPE_ROTATE_ACTIVATION_FP4QUANT_KERNEL_IMPL_(dim, false, fp4quant, vec_size, name); \
+        ROPE_ROTATE_ACTIVATION_FP4QUANT_KERNEL_IMPL_(dim, false, fp4quant, freq_fp32, vec_size, name); \
+    }
+
+#define ROPE_ROTATE_ACTIVATION_FP4QUANT_KERNEL_IMPL(dim, fp4quant, vec_size, name) \
+    ROPE_ROTATE_ACTIVATION_FP4QUANT_KERNEL_IMPL_F(dim, fp4quant, false, vec_size, name)
+
+// fp4 output: cos / sin in the input dtype or in fp32
+#define ROPE_ROTATE_ACTIVATION_FP4QUANT_KERNEL_IMPL_FP4(dim, vec_size, name) \
+    if (freq_fp32) { \
+        ROPE_ROTATE_ACTIVATION_FP4QUANT_KERNEL_IMPL_F(dim, true, true, vec_size, name); \
+    } else { \
+        ROPE_ROTATE_ACTIVATION_FP4QUANT_KERNEL_IMPL_F(dim, true, false, vec_size, name); \
     }
 
 void rope_rotate_activation_fp4quant(aiter_tensor_t& out,
@@ -741,8 +766,10 @@ void rope_rotate_activation_fp4quant(aiter_tensor_t& out,
     AITER_CHECK(input.dim() >= 2, "input must have at least 2 dims [..., head_num, dim]");
     AITER_CHECK(out.numel() * 2 == input.numel(), "out must contain packed fp4 pairs");
     AITER_CHECK(out.dtype() == AITER_DTYPE_fp4x2, "out dtype must be fp4x2");
-    AITER_CHECK(cos.dtype() == input.dtype() && sin.dtype() == input.dtype(),
-                "cos/sin dtype must match input dtype");
+    AITER_CHECK(cos.dtype() == sin.dtype() &&
+                    (cos.dtype() == input.dtype() || cos.dtype() == AITER_DTYPE_fp32),
+                "cos/sin dtype must match each other and be the input dtype or fp32");
+    const bool freq_fp32 = cos.dtype() == AITER_DTYPE_fp32;
     AITER_CHECK(positions.dtype() == AITER_DTYPE_i64, "positions must be int64");
 
     const int32_t dim      = input.size(-1);
@@ -795,22 +822,22 @@ void rope_rotate_activation_fp4quant(aiter_tensor_t& out,
     auto scale_ptr = reinterpret_cast<opus::e8m0_t*>(scale.data_ptr());
     if(dim == 128)
     {
-        ROPE_ROTATE_ACTIVATION_FP4QUANT_KERNEL_IMPL(128, true, 16,
+        ROPE_ROTATE_ACTIVATION_FP4QUANT_KERNEL_IMPL_FP4(128, 16,
             "rope_rotate_activation_fp4quant");
     }
     else if(dim == 256)
     {
-        ROPE_ROTATE_ACTIVATION_FP4QUANT_KERNEL_IMPL(256, true, 16,
+        ROPE_ROTATE_ACTIVATION_FP4QUANT_KERNEL_IMPL_FP4(256, 16,
             "rope_rotate_activation_fp4quant");
     }
     else if(dim == 512)
     {
-        ROPE_ROTATE_ACTIVATION_FP4QUANT_KERNEL_IMPL(512, true, 16,
+        ROPE_ROTATE_ACTIVATION_FP4QUANT_KERNEL_IMPL_FP4(512, 16,
             "rope_rotate_activation_fp4quant");
     }
     else if(dim == 1024)
     {
-        ROPE_ROTATE_ACTIVATION_FP4QUANT_KERNEL_IMPL(1024, true, 32,
+        ROPE_ROTATE_ACTIVATION_FP4QUANT_KERNEL_IMPL_FP4(1024, 32,
             "rope_rotate_activation_fp4quant");
     }
     else

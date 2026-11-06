@@ -108,10 +108,13 @@ def rope_torch(
     rope_dim: int,
 ):
     x = x.float()
-    rope = x[..., -rope_dim:]
-    rope_complex = torch.view_as_complex(rope.float().unflatten(-1, (-1, 2)))
-    freqs = torch.complex(cos[positions].float(), sin[positions].float())
-    rope_out = torch.view_as_real(rope_complex * freqs.view(-1, 1, rope_dim // 2))
+    pairs = x[..., -rope_dim:].unflatten(-1, (-1, 2))
+    re, im = pairs[..., 0], pairs[..., 1]
+    c = cos[positions].float().view(-1, 1, rope_dim // 2)
+    s = sin[positions].float().view(-1, 1, rope_dim // 2)
+    # each product rounded on its own (no fused multiply-add), as the kernel
+    # computes them
+    rope_out = torch.stack([re * c - im * s, im * c + re * s], dim=-1)
     x[..., -rope_dim:] = rope_out.flatten(-2)
     return x
 
@@ -263,11 +266,12 @@ def test_rotate_fp4quant(M, head_num, N, dtype=torch.bfloat16, shuffle_scale=Fal
 
 @benchmark()
 def test_rope_fp4quant_round_rope(
-    M, head_num, N, dtype=torch.bfloat16, shuffle_scale=True
+    M, head_num, N, dtype=torch.bfloat16, shuffle_scale=True, fp32_freqs=False
 ):
     """RoPE alone (no Hadamard) with round_rope: the rotated values rounded to
     the input dtype before the FP4 quant, as a model whose RoPE writes its
-    output back in that dtype (DeepSeek-V4.1's index query) quantizes them."""
+    output back in that dtype (DeepSeek-V4.1's index query) quantizes them.
+    fp32_freqs: cos / sin in fp32, as that model's RoPE reads its angles."""
     if get_gfx() == "gfx942":
         aiter.logger.info("gfx942 is not supported")
         return {}
@@ -276,8 +280,9 @@ def test_rope_fp4quant_round_rope(
     x = torch.randn((M, head_num, N), dtype=dtype, device="cuda")
     positions = torch.randint(0, max_pos, (M,), dtype=torch.int64, device="cuda")
     freqs = torch.randn((max_pos, rope_dim // 2), dtype=torch.float32, device="cuda")
-    cos = torch.cos(freqs).to(dtype)
-    sin = torch.sin(freqs).to(dtype)
+    freq_dtype = torch.float32 if fp32_freqs else dtype
+    cos = torch.cos(freqs).to(freq_dtype)
+    sin = torch.sin(freqs).to(freq_dtype)
     rotated = rope_torch(x.clone(), cos, sin, positions, rope_dim).to(dtype)
     y_ref, scale_ref = fp4_act_quant(rotated.float(), 32)
     if shuffle_scale:
@@ -308,6 +313,7 @@ def test_rope_fp4quant_round_rope(
     )
     return {
         "op": "rope_round_fp4quant",
+        "fp32_freqs": fp32_freqs,
         "head_num": head_num,
         "shuffle_scale": shuffle_scale,
         "err": err,
@@ -317,7 +323,7 @@ def test_rope_fp4quant_round_rope(
 
 @benchmark()
 def test_rope_rotate_fp4quant(
-    M, head_num, N, dtype=torch.bfloat16, shuffle_scale=False
+    M, head_num, N, dtype=torch.bfloat16, shuffle_scale=False, fp32_freqs=False
 ):
     if get_gfx() == "gfx942":
         aiter.logger.info("gfx942 is not supported")
@@ -327,8 +333,9 @@ def test_rope_rotate_fp4quant(
     x = torch.randn((M, head_num, N), dtype=dtype, device="cuda")
     positions = torch.randint(0, max_pos, (M,), dtype=torch.int64, device="cuda")
     freqs = torch.randn((max_pos, rope_dim // 2), dtype=torch.float32, device="cuda")
-    cos = torch.cos(freqs).to(dtype)
-    sin = torch.sin(freqs).to(dtype)
+    freq_dtype = torch.float32 if fp32_freqs else dtype
+    cos = torch.cos(freqs).to(freq_dtype)
+    sin = torch.sin(freqs).to(freq_dtype)
     y_ref, scale_ref = rope_rotate_fp4quant_torch(
         x.clone(),
         cos,
@@ -368,6 +375,7 @@ def test_rope_rotate_fp4quant(
     )
     ret = {}
     ret["op"] = "rope_rotate"
+    ret["fp32_freqs"] = fp32_freqs
     ret["head_num"] = head_num
     ret["rope_dim"] = rope_dim
     ret["shuffle_scale"] = shuffle_scale
@@ -635,6 +643,13 @@ parser.add_argument(
     (round_rope; no Hadamard). Default: False.""",
 )
 parser.add_argument(
+    "--fp32-freqs",
+    dest="fp32_freqs",
+    action="store_true",
+    help="""cos / sin in fp32 rather than the input dtype (--rope and
+    --round-rope). Default: False.""",
+)
+parser.add_argument(
     "--norm_cache",
     action="store_true",
     help="""rmsnorm + rope + fp4 kvcache. Default: False.""",
@@ -671,7 +686,12 @@ for dtype in args.dtype:
                     ret = test_rope_rotate_fp8quant(m, head_num, dim, dtype=dtype)
                 elif args.round_rope:
                     ret = test_rope_fp4quant_round_rope(
-                        m, head_num, dim, dtype=dtype, shuffle_scale=args.shuffle_scale
+                        m,
+                        head_num,
+                        dim,
+                        dtype=dtype,
+                        shuffle_scale=args.shuffle_scale,
+                        fp32_freqs=args.fp32_freqs,
                     )
                 elif args.norm_cache:
                     ret = test_rmsnorm_rope_rotate_fp4quant_kvcache(
@@ -689,6 +709,7 @@ for dtype in args.dtype:
                         dim,
                         dtype=dtype,
                         shuffle_scale=args.shuffle_scale,
+                        fp32_freqs=args.fp32_freqs,
                     )
                 else:
                     ret = test_rotate_fp4quant(
