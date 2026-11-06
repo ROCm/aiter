@@ -15,6 +15,7 @@ import torch
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.runtime.device import get_rocm_arch
 
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.triton.utils.device_info import get_num_sms
 
 from .kernels.gdn_decode_verify import create_gdn_decode_verify_kernel
@@ -1121,15 +1122,6 @@ def _mask_padding_slot(state_indices: torch.Tensor) -> torch.Tensor:
     return torch.where(state_indices == _KDA_SLOT_CHECK_PADDING_SLOT, -1, state_indices)
 
 
-@functools.cache
-def _is_kda_device_supported(index: int) -> bool:
-    """Memoized: ``get_device_properties`` costs tens of microseconds per call."""
-    arch = torch.cuda.get_device_properties(index).gcnArchName.split(":")[0]
-    # FlyDSL builds for GDR_GPU_ARCH (FLYDSL_GPU_ARCH or the first GPU), so the
-    # device and the build target must both be gfx950.
-    return arch == "gfx950" and GDR_GPU_ARCH == "gfx950"
-
-
 def is_flydsl_kda_decode_supported(
     device: torch.device | str | int | None = None,
 ) -> bool:
@@ -1154,7 +1146,9 @@ def is_flydsl_kda_decode_supported(
             )
         if not 0 <= index < torch.cuda.device_count():
             return False
-        return _is_kda_device_supported(index)
+        # FlyDSL builds for GDR_GPU_ARCH (FLYDSL_GPU_ARCH or the first GPU), so
+        # the GPU and the build target must both be gfx950.
+        return get_gfx_runtime() == "gfx950" and GDR_GPU_ARCH == "gfx950"
     except (AssertionError, KeyError, RuntimeError, TypeError, ValueError):
         return False
 
