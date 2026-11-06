@@ -718,9 +718,7 @@ class PaDecodeTraits:
         )
         # Scale before masking to avoid -inf * 0 and a second mask. NHD is
         # faster with the scale folded into exp2.
-        M1_SCALE_BEFORE_MASK = (
-            PER_TOKEN_M1 or (D256_PIPE and not nhd_layout) or PV_BF16
-        )
+        M1_SCALE_BEFORE_MASK = PER_TOKEN_M1 or (D256_PIPE and not nhd_layout) or PV_BF16
         # The d256 pipe gives each M-tile a private P and Lsum slot so one barrier
         # publishes all of them.
         P_BUFFERS = (

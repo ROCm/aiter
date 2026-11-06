@@ -687,7 +687,9 @@ class PaDecodePipeline:
             ]
         v_masks = self.kv.tail_masks(tile_valid) if const_expr(mask_tail) else None
         if const_expr(
-            not mask_tail and self.traits.block_size >= 64 and not self.traits.nhd_layout
+            not mask_tail
+            and self.traits.block_size >= 64
+            and not self.traits.nhd_layout
         ):
             # Without the tail-mask branch, the scheduler sinks page64/128 V
             # loads next to their PV MFMAs and exposes their latency.
