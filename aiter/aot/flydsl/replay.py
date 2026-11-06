@@ -74,12 +74,17 @@ from contextlib import AbstractContextManager, contextmanager
 from typing import Any
 
 from aiter.aot.flydsl.common import (
+    STRICT_ERRATA_TABLES,
     aot_target_archs,
+    assert_targets_covered,
     check_replay_process,
     collect_aot_jobs,
     cu_num_to_arch,
+    fail_build_on_missing_target_feature,
     get_max_workers,
+    is_strict_identity,
     replay_env,
+    resolve_target_arch,
     run_jobs_parallel,
     worker_waves,
 )
@@ -455,13 +460,25 @@ def run(
     module = importlib.import_module(module_name)
     arch_of = Counter(job_arch(job, _default_arch(module)) for job in jobs)
     targets = aot_target_archs()
+    # Map each tuned arch to the exact requested target in its kernel family
+    # (gfx1250 -> gfx1250-strict for a strict build), so a gfx1250-tuned row is
+    # replayed and compiled for the exact strict target (ELF mach 0xeb, not
+    # gfx1250 0x49). A tuned arch whose family GPU_ARCHS does not request is
+    # skipped; a requested family present in the tables but dropped is a hard
+    # error (an empty/partial wheel reported as success).
+    resolved = {arch: resolve_target_arch(arch, targets) for arch in arch_of}
     for arch, count in sorted(arch_of.items()):
-        if targets and arch not in targets:
+        if resolved[arch] is None:
             print(
                 f"  [SKIP] {count} {module.LABEL} jobs for {arch}, which GPU_ARCHS omits"
             )
-    archs = sorted(arch for arch in arch_of if not targets or arch in targets)
-    total = sum(arch_of[arch] for arch in archs)
+    target_of: Counter = Counter()
+    for arch, count in arch_of.items():
+        if resolved[arch] is not None:
+            target_of[resolved[arch]] += count
+    archs = sorted(target_of)
+    assert_targets_covered(targets, list(arch_of), archs, f"FlyDSL {module.LABEL} AOT")
+    total = sum(target_of.values())
     print(
         f"[aiter] FlyDSL {module.LABEL} replay: {total} jobs, "
         f"archs {', '.join(archs) or '-'}",
@@ -470,7 +487,7 @@ def run(
     if not archs:
         return 0
     failed = 0
-    waves = worker_waves(get_max_workers(total), {a: arch_of[a] for a in archs})
+    waves = worker_waves(get_max_workers(total), dict(target_of))
     for wave in waves:
         replays = []
         for arch, share in wave.items():
@@ -558,9 +575,25 @@ def main(module_name: str, description: str) -> None:
     jobs = _jobs(module, csv_paths, args)
 
     if args.arch:
-        jobs = [
-            job for job in jobs if job_arch(job, _default_arch(module)) == args.arch
-        ]
+        # args.arch is the exact requested target; keep rows whose tuned arch
+        # shares its family and retarget each so it compiles for that arch
+        # (a gfx1250 row -> gfx1250-strict -> 0xeb).
+        kept = []
+        for job in jobs:
+            cur = job_arch(job, _default_arch(module))
+            if resolve_target_arch(cur, {args.arch}) != args.arch:
+                continue
+            # gfx1250-strict disables the WMMA features these tables need
+            # (A0 errata); compiled for strict they are hollow, so skip them.
+            if (
+                is_strict_identity(args.arch)
+                and job.get("table") in STRICT_ERRATA_TABLES
+            ):
+                continue
+            if cur != args.arch:
+                job = {**job, "gfx": args.arch}
+            kept.append(job)
+        jobs = kept
         failed = jobs and replay_arch(module_name, jobs, args.arch, module.LABEL)
         sys.exit(1 if failed else 0)
 
@@ -577,7 +610,8 @@ def main(module_name: str, description: str) -> None:
     print("=" * 72, flush=True)
 
     started = time.time()
-    failed_archs = run(module_name, jobs, argv, env=_child_env(module, csv_paths))
+    with fail_build_on_missing_target_feature():
+        failed_archs = run(module_name, jobs, argv, env=_child_env(module, csv_paths))
     print(f"\n  Total time:   {time.time() - started:.1f}s")
     if failed_archs:
         print("Some replays failed. Check output above for details.")
