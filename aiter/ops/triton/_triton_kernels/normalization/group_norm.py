@@ -22,13 +22,27 @@ def _group_norm_load(
 
 
 @triton.jit
-def _group_norm_ref(x_ptr, t_ptr, base, n, g, C, CPG, HAS_TEMB: tl.constexpr):
-    """First element of the group. The statistics are of x - ref, so a large
-    mean does not cost precision."""
-    ref = tl.load(x_ptr + base).to(tl.float32)
-    if HAS_TEMB:
-        ref += tl.load(t_ptr + n.to(tl.int64) * C + g * CPG).to(tl.float32)
-    return ref
+def _group_norm_ref(
+    x_ptr,
+    t_ptr,
+    base,
+    n,
+    g,
+    C,
+    HW,
+    CPG,
+    GS,
+    HAS_TEMB: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Mean of the first block of the group. The statistics are of x - ref, so a
+    large mean or one outlier does not cost precision."""
+    idx = tl.arange(0, BLOCK)
+    mask = idx < GS
+    x = _group_norm_load(x_ptr, t_ptr, base, n, g, C, HW, CPG, idx, mask, HAS_TEMB)
+    # Scale first, so a large magnitude overflows fp32 at a higher value.
+    inv_n = 1.0 / tl.minimum(GS, BLOCK).to(tl.float32)
+    return tl.sum(x * inv_n)
 
 
 @triton.jit
@@ -105,8 +119,8 @@ def _group_norm_stats_kernel(
 ):
     """Partial statistics of chunk s of group (n, g): part[(n * G + g) * S + s].
 
-    It also stores ref. When out is x, another program can write over x's first
-    element of the group.
+    It also stores ref. When out is x, another program can write over the first
+    block of the group.
     """
     pid = tl.program_id(0)
     s = tl.program_id(1)
@@ -116,7 +130,9 @@ def _group_norm_stats_kernel(
     base = n.to(tl.int64) * C * HW + g * CPG * HW
     start = s.to(tl.int64) * CHUNK
     end = tl.minimum(start + CHUNK, GS)
-    ref = _group_norm_ref(x_ptr, t_ptr, base, n, g, C, CPG, HAS_TEMB)
+    # Every program of this group must get the same ref. The merge adds the
+    # partial statistics around one center.
+    ref = _group_norm_ref(x_ptr, t_ptr, base, n, g, C, HW, CPG, GS, HAS_TEMB, BLOCK)
     mean, m2, count = _group_norm_chunk_stats(
         x_ptr, t_ptr, base, n, g, C, HW, CPG, start, end, ref, HAS_TEMB, BLOCK
     )
@@ -170,8 +186,8 @@ def _group_norm_apply_kernel(
     """y = act(group_norm(x + temb) * weight + bias) for chunk s of group (n, g).
 
     With INLINE_STATS the program owns the full group. If not, it merges the
-    partial statistics, which include ref: when out is x, that element of x can
-    already hold a result.
+    partial statistics, which include ref: when out is x, those elements of x
+    can already hold results.
     """
     pid = tl.program_id(0)
     s = tl.program_id(1)
@@ -181,7 +197,7 @@ def _group_norm_apply_kernel(
     base = n.to(tl.int64) * C * HW + g * CPG * HW
 
     if INLINE_STATS:
-        ref = _group_norm_ref(x_ptr, t_ptr, base, n, g, C, CPG, HAS_TEMB)
+        ref = _group_norm_ref(x_ptr, t_ptr, base, n, g, C, HW, CPG, GS, HAS_TEMB, BLOCK)
         mean, m2, count = _group_norm_chunk_stats(
             x_ptr, t_ptr, base, n, g, C, HW, CPG, 0, GS, ref, HAS_TEMB, BLOCK
         )

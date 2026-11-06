@@ -51,7 +51,8 @@ def group_norm(
     - activation: optional activation after the affine ("silu", "gelu",
       "gelu_tanh", "relu", ...). An unknown name raises KeyError.
     - out: optional output with the shape and dtype of x. out can be x, for an
-      in-place update. out must be x, or must not overlap x.
+      in-place update. out must not partly overlap x, and must not overlap
+      temb, weight or bias.
 
     The statistics are computed in fp32. The output is rounded to the dtype of x
     once, after the activation. The statistics overflow in fp32 when the spread
@@ -90,6 +91,24 @@ def group_norm(
         assert (
             out.shape == x.shape and out.dtype == x.dtype and out.is_contiguous()
         ), "out must be contiguous, with the shape and dtype of x"
+        # The apply kernel reads x, temb, weight and bias after it writes out.
+        # An overlap lets a write change what a later read sees. A meta or
+        # traced tensor has no address, so skip the check for it.
+        lo = out.data_ptr()
+        if lo:
+            hi = lo + out.numel() * out.element_size()
+            for name, p in (
+                ("x", x),
+                ("temb", temb),
+                ("weight", weight),
+                ("bias", bias),
+            ):
+                if p is None or (name == "x" and p.data_ptr() == lo):
+                    continue
+                p_lo = p.data_ptr()
+                assert (
+                    p_lo + p.numel() * p.element_size() <= lo or p_lo >= hi
+                ), f"out must not overlap {name}"
 
     # Resolve the activation before the early return, so that a bad name is
     # rejected for an empty input too.

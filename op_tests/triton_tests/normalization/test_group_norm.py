@@ -87,6 +87,31 @@ def test_group_norm_out_parameter():
     )
 
 
+def test_group_norm_rejects_overlapping_out():
+    """out may alias x exactly, but it must not partly overlap any input."""
+    shape, C = (2, 64, 8, 8), 64
+    n = 2 * C * 8 * 8
+    buf = torch.randn(n + 64, dtype=torch.float16, device="cuda")
+    x = buf[64:].view(shape)
+    out = buf[:n].view(shape)  # a shifted window of the same storage
+    with pytest.raises(AssertionError, match="must not overlap x"):
+        group_norm(x, 32, out=out)
+    alias = x
+    x = torch.randn(shape, dtype=torch.float16, device="cuda")
+    with pytest.raises(AssertionError, match="must not overlap weight"):
+        group_norm(x, 32, weight=buf[:C], out=out)
+    with pytest.raises(AssertionError, match="must not overlap bias"):
+        group_norm(x, 32, bias=buf[:C], out=out)
+    with pytest.raises(AssertionError, match="must not overlap temb"):
+        group_norm(x, 32, temb=buf[: 2 * C].view(2, C), out=out)
+    # Inputs after the end of out are accepted.
+    got = group_norm(x, 32, weight=buf[n:], bias=buf[n:], out=out)
+    assert got.data_ptr() == out.data_ptr()
+    # The same view, aliased exactly, is accepted. This call is last, because
+    # it writes over the part of buf that the calls above read.
+    assert group_norm(alias, 32, out=alias).data_ptr() == alias.data_ptr()
+
+
 def test_group_norm_rejects_bad_inputs():
     x, weight, bias, _ = generate_group_norm_inputs(
         (2, 64, 8, 8), 32, torch.float16, True, False
@@ -138,6 +163,20 @@ def test_group_norm_overflow_in_merge():
     torch.testing.assert_close(got.double(), want, atol=1e-4, rtol=1e-4)
 
 
+def test_group_norm_large_magnitude():
+    """A group with a huge magnitude and no spread, against fp64.
+
+    ref is a mean of one block. A sum of that block before the division
+    overflows fp32 here, and the output is then all NaN.
+    """
+    for dtype, tol in [(torch.float32, 1e-4), (torch.bfloat16, 5e-2)]:
+        x = torch.full((1, 1024, 1, 1), 1e36, dtype=dtype, device="cuda")
+        got = group_norm(x, 1, eps=1e-5)
+        assert got.isfinite().all(), f"{dtype} gives a non-finite output"
+        want = F.group_norm(x.double(), 1, eps=1e-5)
+        torch.testing.assert_close(got.double(), want, atol=tol, rtol=tol)
+
+
 def test_group_norm_rejects_bad_activation():
     """A bad activation name is rejected, for an empty input too."""
     for shape in [(2, 64, 8, 8), (0, 64, 8, 8)]:
@@ -159,8 +198,9 @@ def test_group_norm_empty_activation():
 def test_group_norm_outlier_in_group():
     """One outlier element in an otherwise-uniform group, against fp64.
 
-    The outlier stays at index 0, where ref is, and its value is not a power of
-    two. At another index, or at 10000.0, an unstable reduction also passes.
+    The outlier stays at index 0, in the block that ref averages, and its value
+    is not a power of two. At another index, or at 10000.0, an unstable
+    reduction also passes.
     """
     x = torch.zeros(1, 1, 32768, dtype=torch.float32, device="cuda")
     x[0, 0, 0] = 12345.67
@@ -180,6 +220,19 @@ def test_group_norm_outlier_in_group_split():
     got = group_norm(x, 1, eps=1e-5)
     want = F.group_norm(x.double(), 1, eps=1e-5)
     torch.testing.assert_close(got.double(), want, atol=1e-4, rtol=1e-4)
+
+
+def test_group_norm_outlier_ref_precision():
+    """A far outlier must not become the center of the statistics.
+
+    The tolerance is 10x tighter than the other tests. With the first element
+    of the group as ref, this group fails it by 6x.
+    """
+    x = torch.zeros(1, 1, 1 << 20, dtype=torch.float32, device="cuda")
+    x[0, 0, 0] = 1234567.8
+    got = group_norm(x, 1, eps=1e-5)
+    want = F.group_norm(x.double(), 1, eps=1e-5)
+    torch.testing.assert_close(got.double(), want, atol=1e-5, rtol=1e-5)
 
 
 def test_group_norm_inplace_split():
