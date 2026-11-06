@@ -24,6 +24,51 @@ token; it cannot publish a later generation on behalf of the earlier build.
 These checks detect overlapping codegen; they do not replace the module lock
 or protect against external edits that bypass the generation markers.
 
+## Build lock compatibility
+
+On POSIX systems, `FileBaton` keeps an exclusive kernel `flock` on the lock
+inode throughout the build. A killed process releases that flock; a paused
+process keeps it. Recovery prepares a replacement lock and atomically replaces
+the stale inode while holding the `.steal` recovery guard. There is no heartbeat
+timeout and no absent-path interval during replacement. `wait()` returns `True`
+when the lock path is absent, even if an old or inaccessible `.steal` file
+remains; it returns `False` after recovery so the caller retries the build.
+
+The cache filesystem must support hard links, atomic replacement within one
+directory, and advisory locks visible to **every** cache participant. Shared
+NFS caches need working distributed locking (NFSv3 with NLM or NFSv4 locking).
+Do not share a cache across hosts with `nolock` or `local_lock=flock|all`:
+node-local flock can make a live remote holder look dead. Use a separate local
+cache per host when distributed locking cannot be guaranteed. Configure the
+cache root with `AITER_JIT_DIR`. Windows retains exclusive file creation and
+same-host PID liveness checks; it does not import `fcntl` or use the POSIX
+publication protocol.
+
+Hard links publish a fully permissioned and already locked inode, avoiding a
+crash window that could leave an inaccessible public lock under a restrictive
+umask. Filesystems without hard-link support are unsupported by this POSIX
+protocol; use a cache filesystem that supplies these operations. A silent
+fallback to direct file creation would reintroduce that crash window.
+
+New `.steal` files carry a protocol marker and are reusable after their owner
+exits because the kernel releases the guard flock. Pre-protocol guards carry
+no owner identity or liveness signal. They still block stale recovery and
+POSIX release: age alone cannot distinguish an abandoned guard from a paused
+old process that may resume its removal operation. Drain all builders sharing
+the cache before removing such a legacy guard. An absent build-lock path does
+not require this cleanup for `wait()` to finish. Avoid mixing old and new lock
+implementations in an active shared cache during an upgrade.
+
+A killed publisher can leave private `.<lock-name>.*.tmp` files. They do not
+block the canonical lock, but can accumulate. Remove these aliases only after
+draining cache users; a temporary filename's age does not prove its publisher
+is dead. Normal completion and ordinary publication failures remove their
+temporary files.
+
+The CPU-only regression suite runs without importing PyTorch:
+`python op_tests/test_file_baton.py`. POSIX lifetime-lock tests run on Linux;
+completion and legacy Windows acquisition/recovery tests also run on Windows.
+
 ## Opus compiled-kid metadata
 
 The tuner reads `{bd_dir}/compiled_kids_opus.json`. Normal runtime dispatch
