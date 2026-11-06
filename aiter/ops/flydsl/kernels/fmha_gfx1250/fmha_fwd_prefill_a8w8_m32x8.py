@@ -41,10 +41,6 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 from flydsl.expr import const_expr, gpu, rocdl
-
-# Q/K/V staging managers (own their LDS swizzles + async copy schedules). They are
-# self-contained: this kernel maintains its own arch constants below and passes the
-# config each manager needs through its constructor.
 from flydsl.expr.rocdl import tdm_ops
 from flydsl.expr.typing import T
 from flydsl.expr.utils.arith import _to_raw as _raw
@@ -55,6 +51,10 @@ from aiter.ops.flydsl.kernels import buffer_ops
 from ..kernels_common import LOG2E
 from ..tensor_shim import _run_compiled
 
+# Q/K/V staging managers (own their LDS swizzles + async copy schedules). They are
+# self-contained: this kernel maintains its own arch constants below and passes the
+# config each manager needs through its constructor.
+#
 # Single source of truth for gfx1250 Expert Scheduling Mode 2 (DEP_MODE=2). Lives
 # in fmha_buffer_managers. Under mode 2 the LLVM setreg (via the
 # amdgpu-expert-scheduling-mode hint, set in _ensure_*_kernel) makes LLVM insert all
@@ -73,15 +73,6 @@ from .fmha_buffer_managers import (
     _ir,
 )
 from .fmha_utils import (
-    exp2_fastmath,
-    fadd_fastmath,
-    fadd_no_reassoc,
-    fmax_fastmath,
-    fmul_fastmath,
-    fsub_fastmath,
-    _ContiguousKVPolicy,
-    _PagedKVPolicy,
-    PagedSpec,
     BLOCK_SIZE,
     DTYPE_MAP,
     LDS_CHUNK_BYTES,
@@ -90,25 +81,27 @@ from .fmha_utils import (
     NUM_WAVES,
     WAVE_SIZE,
     WMMA_M,
+    PagedSpec,
     _alloc_lds,
     _bare_barrier,
     _block_m,
     _concat,
+    _ContiguousKVPolicy,
     _copy_fence,
     _copy_wait,
     _epi_state,
+    _is_paged_layout_supported,
     _keepalive,
     _kv_drain_depths,
     _lane_id,
     _load_seqlen_pair,
-    _is_paged_layout_supported,
-    s_buffer_load,
     _load_sink_logit,
     _m_tile_idx,
     _o_manager,
     _o_pack,
     _o_unpack,
     _packed_tile_indices,
+    _PagedKVPolicy,
     _pick_num_q_tiles,
     _ring_drive,
     _ring_num_prefetch,
@@ -116,6 +109,13 @@ from .fmha_utils import (
     _warp_id,
     _wg_kv_span,
     _zero_slot,
+    exp2_fastmath,
+    fadd_fastmath,
+    fadd_no_reassoc,
+    fmax_fastmath,
+    fmul_fastmath,
+    fsub_fastmath,
+    s_buffer_load,
     schedule_bank,
     supports_gqa_ratio,
 )

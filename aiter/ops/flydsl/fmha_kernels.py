@@ -57,6 +57,8 @@ from .kernels.fmha_gfx1250.fmha_fwd_prefill_a16w16_m32x8 import (
 )
 from .kernels.fmha_gfx1250.fmha_fwd_prefill_a16w16_m32x8 import (
     flash_attn_batch_m32x8 as flash_attn_batch_a16w16_gfx1250,
+)
+from .kernels.fmha_gfx1250.fmha_fwd_prefill_a16w16_m32x8 import (
     flash_attn_paged_m32x8 as flash_attn_paged_a16w16_gfx1250,
 )
 from .kernels.fmha_gfx1250.fmha_fwd_prefill_a16w16_m32x8 import (

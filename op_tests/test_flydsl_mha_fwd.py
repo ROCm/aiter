@@ -33,10 +33,10 @@ import torch
 
 import aiter
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.flydsl.fmha_kernels import flydsl_flash_attn_paged_fwd
 from aiter.ops.flydsl.kernels.fmha_gfx1250.fmha_fwd_prefill_a8w8_m32x8 import (
     flash_attn_a8w8_m32x8_supported,
 )
-from aiter.ops.flydsl.fmha_kernels import flydsl_flash_attn_paged_fwd
 from aiter.ops.flydsl.kernels.fmha_gfx1250.fmha_fwd_prefill_a16w16_m32x8 import (
     flash_attn_a16w16_m32x8_supported,
     supports_gqa_ratio,

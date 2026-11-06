@@ -42,8 +42,8 @@ from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import _to_raw as _raw
 
-from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.jit.utils.chip_info import get_cu_num, get_lds_capacity_bytes
+from aiter.ops.flydsl.kernels import buffer_ops
 
 from .fmha_buffer_managers import (
     OManagerV1,
@@ -648,11 +648,11 @@ class PagedSpec:
     """The paged KV pool as the entry sees it; ``page_size`` compile-time, rest runtime."""
 
     __slots__ = (
-        "ptr_page_indices",
         "num_page_entries",
+        "num_pool_rows",
         "page_base",
         "page_size",
-        "num_pool_rows",
+        "ptr_page_indices",
     )
 
     def __init__(
