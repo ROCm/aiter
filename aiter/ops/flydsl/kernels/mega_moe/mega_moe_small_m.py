@@ -35,18 +35,21 @@ from ..tensor_shim import _preload_compiled, _run_compiled, ptr_buf_tensor
 from .dispatch import _wave_inclusive_scan_i32, _wave_reduce_max_i32
 from .gemm1 import _LdsF32View, build_fused_gemm1
 from .gemm2 import gemm2_compute_v2, issue_a_load_lds_dt
-from .mega_moe_config import fused_layout_supported, small_m_cu_supported
-from .mega_moe_fused_gemm import (
-    SMALL_M_FIXED_SLOT_MAX_MTPR,
-    TOKEN_BUCKETS,
-    AddrBuffer,
+from .mega_moe_config import (
+    FUSED_TOKEN_BUCKETS,
+    SMALL_M_MAX_MTPR,
     MegaMoEConfig,
+    fused_layout_supported,
+    nearest_token_bucket,
+    select_fused_config,
+    small_m_cu_supported,
+)
+from .mega_moe_fused_gemm import (
+    AddrBuffer,
     _buffer_load,
     _buffer_store,
     _make_buffer_from_addr,
     load_at,
-    nearest_token_bucket,
-    select_mega_moe_config,
     store_at,
 )
 from .mega_moe_stage1 import _validate_dispatch_capacity, stage1_output_buffers
@@ -1422,7 +1425,7 @@ def small_m_config(
     tokens: int, mtpr: int, *, experts_per_rank: int, model_dim: int, inter_dim: int
 ):
     """The kernel config of a small-input call with ``tokens`` rows on an ``mtpr`` runtime."""
-    config = select_mega_moe_config(
+    config = select_fused_config(
         tokens,
         mtpr,
         experts_per_rank=experts_per_rank,
@@ -1437,7 +1440,7 @@ def small_m_config(
                 config.stage2, block_n=256, persist=False, persist_cu=0, use_nt=True
             ),
         )
-    if nearest_token_bucket(max(tokens, 1)) >= _BM64_MIN_BUCKET:
+    if nearest_token_bucket(max(tokens, 1), FUSED_TOKEN_BUCKETS) >= _BM64_MIN_BUCKET:
         # 64-row expert tiles: at ~35+ rows per expert a 32-row tile splits every expert in two and streams its
         # weights twice.
         config = replace(
@@ -1489,8 +1492,8 @@ class SmallMRuntime:
             raise ValueError(f"experts={experts} must be divisible by world_size={world_size}")
         if max_tok_per_rank <= 0 or max_tok_per_rank & (max_tok_per_rank - 1):
             raise ValueError(f"max_tok_per_rank={max_tok_per_rank} must be a power of two")
-        if max_tok_per_rank > SMALL_M_FIXED_SLOT_MAX_MTPR:
-            raise ValueError(f"max_tok_per_rank={max_tok_per_rank} > {SMALL_M_FIXED_SLOT_MAX_MTPR}")
+        if max_tok_per_rank > SMALL_M_MAX_MTPR:
+            raise ValueError(f"max_tok_per_rank={max_tok_per_rank} > {SMALL_M_MAX_MTPR}")
         self.rank = int(rank)
         self.world_size = int(world_size)
         self.model_dim = int(model_dim)
@@ -1705,7 +1708,7 @@ class SmallMRuntime:
         stream = fx.Stream(torch.cuda.current_stream().cuda_stream)
         x_bf16, wts, topk_ids = self._idle_inputs
         seen = set()
-        for bucket in (b for b in TOKEN_BUCKETS if b <= self.mtpr):
+        for bucket in (b for b in FUSED_TOKEN_BUCKETS if b <= self.mtpr):
             config = self._select_config(bucket)
             if (config.stage1, config.stage2) in seen:
                 continue
