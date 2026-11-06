@@ -31,23 +31,36 @@ LABEL = "CHUNK_GDN_BLOCKED"
 AOT_ARCH_DEFAULT = "gfx950"
 DEFAULT_CSVS = [AITER_CONFIGS.AITER_CONFIG_GDN_K5_OPT_FILE]
 _KERNEL_NAME = "chunk_gdn_blocked"
-_CU_NUM = 256
-# XCD counts of gfx950 parts (MI350P: 4, MI355X: 8). Set on each job, since the
-# blocked kernels are gfx950-only and the count is part of their cache key.
-_NUM_XCDS = (4, 8)
+# gfx950 parts as (XCDs, CUs): MI355X 8 / 256, MI350P 4 / 128. replay forks each
+# job per entry (see ``_with_xcd_variants``); the XCD count is part of the cache
+# key of the blocked kernels.
+XCD_VARIANTS = {"gfx950": ((8, 256), (4, 128))}
 _MIN_CHUNKS = 128
 
 
 def _chunks(H: int) -> int:
     """Chunks of the one sequence a job replays. With block size
-    s = max(12, ceil(L / 8)) there are at most 8 blocks, so the gate
-    (H * blocks <= 6 * L, L >= 96) holds from L = ceil(8H / 6)."""
-    return max(_MIN_CHUNKS, -(-8 * H // 6))
+    s = max(_BLOCKED_MIN_BLOCK_CHUNKS, ceil(L / _GDN_K5_TARGET_SEGMENTS)) there
+    are at most _GDN_K5_TARGET_SEGMENTS blocks, so the gate
+    (H * blocks <= _BLOCKED_MAX_WORK_PER_CHUNK * L, L >= _BLOCKED_MIN_CHUNKS)
+    holds from L = ceil(_GDN_K5_TARGET_SEGMENTS * H / _BLOCKED_MAX_WORK_PER_CHUNK)."""
+    # Lazy: the runtime module needs FlyDSL, which the AOT collector may not load.
+    from aiter.ops.flydsl.linear_attention_prefill_kernels import (
+        _BLOCKED_MAX_WORK_PER_CHUNK,
+        _BLOCKED_MIN_CHUNKS,
+        _GDN_K5_TARGET_SEGMENTS,
+    )
+
+    return max(
+        _MIN_CHUNKS,
+        _BLOCKED_MIN_CHUNKS,
+        -(-_GDN_K5_TARGET_SEGMENTS * H // _BLOCKED_MAX_WORK_PER_CHUNK),
+    )
 
 
 def parse_csv(csv_path: str) -> list[dict]:
     """One job per eligible ``(H, Hg)`` pair of the table and variant of the
-    kernels (initial state, state dtype, XCD count). Rows qualify by shape and
+    kernels (initial state, state dtype); XCD variants are added by replay. Rows qualify by shape and
     dtype only: the blocked gate does not consult the table, so the arch a row
     was tuned for does not matter."""
     pairs = set()
@@ -65,8 +78,8 @@ def parse_csv(csv_path: str) -> list[dict]:
             if dtype == "torch.bfloat16" and (K, V, BT) == (128, 128, 64):
                 pairs.add(pair)
     jobs = []
-    for (H, Hg), use_h0, state_bf16, num_xcds in itertools.product(
-        sorted(pairs), (False, True), (False, True), _NUM_XCDS
+    for (H, Hg), use_h0, state_bf16 in itertools.product(
+        sorted(pairs), (False, True), (False, True)
     ):
         chunks = _chunks(H)
         jobs.append(
@@ -74,7 +87,6 @@ def parse_csv(csv_path: str) -> list[dict]:
                 "kernel_name": _KERNEL_NAME,
                 "dtype": "torch.bfloat16",
                 "gfx": AOT_ARCH_DEFAULT,
-                "cu_num": _CU_NUM,
                 "K": 128,
                 "V": 128,
                 "BT": 64,
@@ -89,7 +101,6 @@ def parse_csv(csv_path: str) -> list[dict]:
                 "use_state_indices": False,
                 "total_chunks": chunks,
                 "max_seq_chunks": chunks,
-                "num_xcds": num_xcds,
             }
         )
     return jobs
@@ -104,7 +115,7 @@ def describe(job: dict) -> str:
     flags = " ".join(name for name in ("use_h0", "state_bf16") if job[name])
     return (
         f"chunk_gdn_blocked H={job['H']} Hg={job['Hg']} "
-        f"chunks={job['total_chunks']} {flags} num_xcds={job['num_xcds']}"
+        f"chunks={job['total_chunks']} {flags} num_xcds={job.get('num_xcds')}"
     )
 
 

@@ -541,7 +541,9 @@ def _jobs(module: Any, csv_paths: list[str], args: argparse.Namespace | None) ->
 def _with_xcd_variants(module: Any, jobs: list[dict]) -> list[dict]:
     """Fork each job that names no ``num_xcds`` once per XCD count its arch has
     in ``module.XCD_VARIANTS`` (arch -> counts). The count is a compile-time
-    kernel kwarg, so every part variant is its own cache entry and job."""
+    kernel kwarg, so every part variant is its own cache entry and job. An entry
+    may be an ``(xcds, cu_num)`` pair when the CU count of the part also varies;
+    the job's ``cu_num`` is then set from it."""
     variants = getattr(module, "XCD_VARIANTS", None)
     if not variants:
         return jobs
@@ -552,7 +554,12 @@ def _with_xcd_variants(module: Any, jobs: list[dict]) -> list[dict]:
         if "num_xcds" in job or not counts:
             out.append(job)
         else:
-            out.extend({**job, "num_xcds": n} for n in counts)
+            for variant in counts:
+                if isinstance(variant, tuple):
+                    xcds, cu_num = variant
+                    out.append({**job, "num_xcds": xcds, "cu_num": cu_num})
+                else:
+                    out.append({**job, "num_xcds": variant})
     return out
 
 

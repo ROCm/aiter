@@ -184,7 +184,11 @@ def _blocked_jobs():
     from aiter.aot.flydsl import chunk_gdn_blocked
     from aiter.aot.flydsl.common import collect_aot_jobs
 
-    return collect_aot_jobs(chunk_gdn_blocked.DEFAULT_CSVS, chunk_gdn_blocked.parse_csv)
+    # The XCD/CU variants come from XCD_VARIANTS through replay's fork.
+    return replay._with_xcd_variants(
+        chunk_gdn_blocked,
+        collect_aot_jobs(chunk_gdn_blocked.DEFAULT_CSVS, chunk_gdn_blocked.parse_csv),
+    )
 
 
 def _blocked_job(**overrides):
@@ -206,13 +210,6 @@ def _replayed_kernels(module, job):
     return kernels
 
 
-def test_an_eligible_blocked_job_requests_the_three_blocked_kernels():
-    from aiter.aot.flydsl import chunk_gdn_blocked
-
-    kernels = _replayed_kernels(chunk_gdn_blocked, _blocked_job())
-    assert len(kernels) == 3  # build_map, carry, emit
-
-
 def test_xcd_counts_are_distinct_kernels_and_jobs():
     from aiter.aot.flydsl import chunk_gdn_blocked
 
@@ -221,7 +218,7 @@ def test_xcd_counts_are_distinct_kernels_and_jobs():
     assert len(four) == len(eight) == 3
     assert not four & eight
     jobs = _blocked_jobs()
-    assert {j["num_xcds"] for j in jobs} == {4, 8}
+    assert {(j["num_xcds"], j["cu_num"]) for j in jobs} == {(4, 128), (8, 256)}
     assert len({tuple(sorted(j.items())) for j in jobs}) == len(jobs)
     assert chunk_gdn_blocked.describe(jobs[0]) != chunk_gdn_blocked.describe(
         {**jobs[0], "num_xcds": 12 - jobs[0]["num_xcds"]}

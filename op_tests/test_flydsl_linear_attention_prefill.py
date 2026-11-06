@@ -35,6 +35,7 @@ import itertools
 import math
 import zlib
 from dataclasses import dataclass
+from unittest import mock
 
 import pandas as pd
 import torch
@@ -694,11 +695,6 @@ def test_chunk_gdn_prefill_h_blocked(context_lens, mode, state_dtype, init_state
         "use_exp2": True,
     }
 
-    candidates = {
-        "flydsl": lambda: chunk_gated_delta_rule_fwd_h_flydsl_opt(
-            k, w_c, u_c, g=g_log2, g_head_major=True, **common
-        ),
-    }
     total_chunks = sum(ceildiv(length, case.BT) for length in context_lens)
     flops = 4 * total_chunks * case.BT * case.H * case.K * case.V
     nbytes = sum(
@@ -716,56 +712,53 @@ def test_chunk_gdn_prefill_h_blocked(context_lens, mode, state_dtype, init_state
     expect_blocked = all(n > 0 for n in context_lens) and (
         ceildiv(max(context_lens), case.BT) >= _BLOCKED_MIN_CHUNKS
     )
-    for name, fn in candidates.items():
-        blocked_calls = []
-        orig_blocked = _k5_mod._chunk_gated_delta_rule_fwd_h_blocked
-
-        def spy(*args, _calls=blocked_calls, _orig=orig_blocked, **kwargs):
-            _calls.append(1)
-            return _orig(*args, **kwargs)
-
-        _k5_mod._chunk_gated_delta_rule_fwd_h_blocked = spy
-        try:
-            (h, vn, fs), us = run_perftest(fn)
-        finally:
-            _k5_mod._chunk_gated_delta_rule_fwd_h_blocked = orig_blocked
-        assert bool(blocked_calls) == expect_blocked, (
-            f"{tag}: expected {'blocked' if expect_blocked else 'serial'} path, "
-            f"got {'blocked' if blocked_calls else 'serial'}"
+    with mock.patch.object(
+        _k5_mod,
+        "_chunk_gated_delta_rule_fwd_h_blocked",
+        wraps=_k5_mod._chunk_gated_delta_rule_fwd_h_blocked,
+    ) as blocked:
+        (h, vn, fs), us = run_perftest(
+            lambda: chunk_gated_delta_rule_fwd_h_flydsl_opt(
+                k, w_c, u_c, g=g_log2, g_head_major=True, **common
+            )
         )
-        # Mismatches above the allowed ratio raise; err is the mismatch ratio.
-        err = max(
-            assertAllclose(
-                ref_h.to(dtypes.fp32),
-                h.to(dtypes.fp32),
-                rtol=2e-2,
-                atol=2e-2,
-                msg=f"{tag}: K5 h snapshots",
-            ),
-            assertAllclose(
-                ref_vn.to(dtypes.fp32),
-                _normalize_opt_v_new(vn).to(dtypes.fp32),
-                rtol=2e-2,
-                atol=2e-2,
-                msg=f"{tag}: K5 v_new",
-            ),
-            assertAllclose(
-                ref_fs.to(dtypes.fp32),
-                fs.to(dtypes.fp32),
-                rtol=2e-2,
-                atol=2e-2,
-                msg=f"{tag}: K5 final_state",
-            ),
-        )
-        if 0 in context_lens and h0 is not None:
-            empty_idx = context_lens.index(0)
-            assert torch.equal(
-                fs[empty_idx], h0[empty_idx]
-            ), f"{tag}: empty-sequence final state must equal initial state"
-        ret[f"{name} us"] = us
-        ret[f"{name} TFLOPS"] = flops / us / 1e6
-        ret[f"{name} TB/s"] = nbytes / us / 1e6
-        ret[f"{name} err"] = err
+    assert (blocked.call_count > 0) == expect_blocked, (
+        f"{tag}: expected {'blocked' if expect_blocked else 'serial'} path, "
+        f"got {'blocked' if blocked.call_count else 'serial'}"
+    )
+    # Mismatches above the allowed ratio raise; err is the mismatch ratio.
+    err = max(
+        assertAllclose(
+            ref_h.to(dtypes.fp32),
+            h.to(dtypes.fp32),
+            rtol=2e-2,
+            atol=2e-2,
+            msg=f"{tag}: K5 h snapshots",
+        ),
+        assertAllclose(
+            ref_vn.to(dtypes.fp32),
+            _normalize_opt_v_new(vn).to(dtypes.fp32),
+            rtol=2e-2,
+            atol=2e-2,
+            msg=f"{tag}: K5 v_new",
+        ),
+        assertAllclose(
+            ref_fs.to(dtypes.fp32),
+            fs.to(dtypes.fp32),
+            rtol=2e-2,
+            atol=2e-2,
+            msg=f"{tag}: K5 final_state",
+        ),
+    )
+    if 0 in context_lens and h0 is not None:
+        empty_idx = context_lens.index(0)
+        assert torch.equal(
+            fs[empty_idx], h0[empty_idx]
+        ), f"{tag}: empty-sequence final state must equal initial state"
+    ret["flydsl us"] = us
+    ret["flydsl TFLOPS"] = flops / us / 1e6
+    ret["flydsl TB/s"] = nbytes / us / 1e6
+    ret["flydsl err"] = err
     return ret
 
 
