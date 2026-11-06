@@ -20,7 +20,6 @@ from aiter.jit.utils.chip_info import get_gfx_runtime
 
 from .sparse_prefill_common import (
     _MAX_FLOOR,
-    HALF950,
     _buffer,
     _buffer_at,
     _buffer_words,
@@ -33,10 +32,11 @@ from .sparse_prefill_common import (
     _k_operands,
     _k_operands950,
     _k_phase,
-    _k_phase950,
     _k_reads,
     _k_reads950,
+    _k_swizzle950,
     _key_row,
+    _lds_row950,
     _lds_words,
     _LdsQueue,
     _load_lds,
@@ -68,6 +68,7 @@ from .sparse_prefill_common import (
     _v_operands,
     _v_operands950,
     _v_reads,
+    _v_swizzle950,
     _v_tr_bases950,
     _v_tr_reads950,
     _write_address,
@@ -150,16 +151,16 @@ def _dma_word(lane, token, is_v):
 
 def _dma_chunk950(lane, token, is_v):
     """16-byte chunk of the token's 256-byte half row that the lane fetches in a gfx950 x4 LDS DMA, which stores it
-    at chunk lane & 15 of that half row. The XOR is the LDS swizzle: K by _k_phase950, V by _k_phase.
+    at position lane & 15 of that half row: the LDS swizzle of that position (its own inverse).
     """
-    return (lane & 15) ^ (_k_phase(token) if is_v else _k_phase950(token))
+    return (_v_swizzle950 if is_v else _k_swizzle950)(token, lane & 15)
 
 
 def _dma_block950(wave, block):
     """(first key, LDS byte offset) of the wave's x4 DMA block `block`: keys (wave & 3) * 16 +
-    4 * block + 0..3, dims half wave >> 2, half-major (_k_lds_address950)."""
+    4 * block + 0..3, dims half wave >> 2."""
     first = (wave & 3) * 16 + block * 4
-    return first, (wave >> 2) * HALF950 + first * 256
+    return first, _lds_row950(first, wave >> 2)
 
 
 def _read_packet_g2s(

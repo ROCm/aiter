@@ -660,10 +660,11 @@ def _pv(
 #   PV: per V half, two K32 steps (keys 32s + 8g .. + 7: P values 8s .. 8s + 7) over eight
 #       16-dim groups n; the A operand of (s, n) is two ds_read_b64_tr_b16 of four keys.
 #       Output word 4n + i of a half is dim 32g + 4(n ^ (g & 1)) + i (_v_tr_bases950).
-#   LDS: K and V are half-major: dims half h of key t at h * HALF950 + t * 256, so one
-#       16-byte (x4) LDS DMA writes four keys' half rows, 1 KiB. K 16-byte chunks are XORed by
-#       _k_phase950, V 16-byte chunks by _k_phase. Each XOR stays inside its 256-byte half row
-#       and leaves the bits the read immediates move alone.
+#   LDS: K and V are half-major: dims half h of key t at _lds_row950(t, h), so one 16-byte
+#       (x4) LDS DMA writes four keys' half rows, 1 KiB. The 16-byte chunks of a half row are
+#       swizzled by _k_swizzle950 (K) and _v_swizzle950 (V); the DMA (sparse_prefill_union)
+#       and the reads below take their addresses from these. Each swizzle stays inside its
+#       256-byte half row and leaves the bits the read immediates move alone.
 
 
 HALF950 = 64 * 256  # bytes of one dims half of a 64-key K or V tile in LDS
@@ -679,10 +680,28 @@ def _k_phase950(token):
     return a0 | (a0 ^ a1 ^ b0 ^ b1) * 2 | a1 * 4 | b0 * 8
 
 
+def _k_swizzle950(token, chunk):
+    """K LDS swizzle: position of 16-byte chunk `chunk` (0-15) in key `token`'s half row. An XOR, so its own inverse:
+    position p holds chunk _k_swizzle950(token, p)."""
+    return chunk ^ _k_phase950(token)
+
+
+def _v_swizzle950(token, chunk):
+    """V LDS swizzle: _k_swizzle950 with the chunks XORed by _k_phase. In BF16 elements of (key, (dim, dims half)),
+    it is Swizzle<2,3,4> o Swizzle<1,5,5> over the layout (64,(128,2)):(128,(1,8192)) of _lds_row950's rows.
+    """
+    return chunk ^ _k_phase(token)
+
+
+def _lds_row950(token, half):
+    """Byte address of dims half `half` of key `token` in a half-major K or V tile."""
+    return half * HALF950 + token * 256
+
+
 def _k_lds_address950(token, chunk):
-    """Byte address of 16-byte chunk `chunk` (0-31, dims 8 * chunk ..) of key `token` in k_lds (half-major)."""
-    half, chunk = chunk >> 4, (chunk & 15) ^ _k_phase950(token)
-    return half * HALF950 + token * 256 + chunk * 16
+    """Byte address of 16-byte chunk `chunk` (0-31, dims 8 * chunk ..) of key `token` in k_lds."""
+    half, chunk = chunk >> 4, _k_swizzle950(token, chunk & 15)
+    return _lds_row950(token, half) + chunk * 16
 
 
 def _k_bases950(lane):
@@ -696,16 +715,15 @@ def _k_reads950(addresses, half, lower_first=False):
     """(slot, address, immediate) of one K half's 16 LDS reads (_k_reads' order and slots; read (n, k) is key
     key_row + 4n + 32 * half, dims 8g + 32k .. + 7); addresses = _k_bases950(lane)."""
     return [
-        (n * 8 + k, addresses[k & 3], half * 8192 + n * 1024 + (k >> 2) * HALF950)
+        (n * 8 + k, addresses[k & 3], _lds_row950(half * 32 + n * 4, k >> 2))
         for n, k in _k_read_order(lower_first)
     ]
 
 
 def _v_lds_address950(token, granule):
-    """Byte address of 8-byte granule `granule` (0-63, dims 4 * granule .. + 3) of value `token` in v_lds (half-major;
-    the granule's 16-byte chunk XORed by _k_phase)."""
-    chunk = ((granule & 31) >> 1) ^ _k_phase(token)
-    return (granule >> 5) * HALF950 + token * 256 + chunk * 16 + (granule & 1) * 8
+    """Byte address of 8-byte granule `granule` (0-63, dims 4 * granule .. + 3) of value `token` in v_lds."""
+    chunk = _v_swizzle950(token, (granule & 31) >> 1)
+    return _lds_row950(token, granule >> 5) + chunk * 16 + (granule & 1) * 8
 
 
 def _v_tr_bases950(lane):
@@ -725,7 +743,7 @@ def _v_tr_reads950(bases, half):
     (keys 32s + 8g + 4h .. + 3); slot (s * 8 + n) * 2 + h, so PV step s needs the first 16 (s + 1).
     """
     return [
-        ((s * 8 + n) * 2 + h, bases[n], half * HALF950 + h * 1024 + s * 8192)
+        ((s * 8 + n) * 2 + h, bases[n], _lds_row950(s * 32 + h * 4, half))
         for s in range(2)
         for n in range(8)
         for h in range(2)
