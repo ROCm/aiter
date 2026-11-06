@@ -88,7 +88,11 @@ device before treating a table as a performance baseline.
 
 ## Load and verify a table
 
-Default AITER model tables are not replaced. Load a generated table explicitly,
+The shipped opt-in table is
+`aiter/configs/gfx1250_tdm_bf16_tuned_gemm.csv` (19 shapes, bias off/on).
+See [measured results and validation](gfx1250-tdm-hgemm-results.md).
+
+Default AITER model tables are not replaced. Load a generated or shipped table explicitly,
 before importing AITER:
 
     export AITER_CONFIG_GEMM_BF16=/tmp/gfx1250_tdm.csv
