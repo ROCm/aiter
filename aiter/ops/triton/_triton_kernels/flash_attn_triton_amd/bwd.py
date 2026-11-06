@@ -3471,11 +3471,17 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
             seqlen_k = k_end - k_start
 
     # Resolve the sequence bases once; inner loops only select a query head.
-    Q += bid * stride_qb + q_start * stride_qm
-    DO += bid * stride_dob + q_start * stride_dom
-    DQ += bid * stride_dqb + q_start * stride_dqm
-    M += bid * stride_lse_b + q_start * stride_lse_m
-    Delta += bid * stride_delta_b + q_start * stride_delta_m
+    # Varlen instead folds the sequence offset into each per-head offset below:
+    # with the bases hoisted, LLVM's InlineSpiller clobbers the low half of the
+    # spilled Q pointer on gfx942 (llvm/llvm-project#226689). The workaround
+    # only perturbs register allocation, so keep the varlen expressions exactly
+    # as written, and drop it once Triton's LLVM has that fix.
+    if not IS_VARLEN:
+        Q += bid * stride_qb + q_start * stride_qm
+        DO += bid * stride_dob + q_start * stride_dom
+        DQ += bid * stride_dqb + q_start * stride_dqm
+        M += bid * stride_lse_b + q_start * stride_lse_m
+        Delta += bid * stride_delta_b + q_start * stride_delta_m
 
     delta_qk = seqlen_q - seqlen_k
     if DEBUG_TRITON:
@@ -3576,13 +3582,33 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
                     print(f"residue_m = {residue_m}")
 
             # offset input and output tensor by batch and Q/K heads
-            adj_q = hqid * stride_qh
+            adj_q = (
+                (bid * stride_qb + hqid * stride_qh + q_start * stride_qm)
+                if IS_VARLEN
+                else hqid * stride_qh
+            )
             Q_ptr = Q + adj_q
-            adj_do = hqid * stride_doh
+            adj_do = (
+                (bid * stride_dob + hqid * stride_doh + q_start * stride_dom)
+                if IS_VARLEN
+                else hqid * stride_doh
+            )
             DO_ptr = DO + adj_do
-            adj_delta = hqid * stride_delta_h
+            adj_delta = (
+                (
+                    bid * stride_delta_b
+                    + hqid * stride_delta_h
+                    + q_start * stride_delta_m
+                )
+                if IS_VARLEN
+                else hqid * stride_delta_h
+            )
             Delta_ptr = Delta + adj_delta
-            adj_m = hqid * stride_lse_h
+            adj_m = (
+                (bid * stride_lse_b + hqid * stride_lse_h + q_start * stride_lse_m)
+                if IS_VARLEN
+                else hqid * stride_lse_h
+            )
             M_ptr = M + adj_m
 
             if USE_ALIBI:
@@ -3795,11 +3821,31 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
             if DEBUG_TRITON:
                 print(f"delta_qk: {delta_qk}; end_n: {end_n}")
             # offset input and output tensor by batch and Q/K heads
-            adj_q = hqid * stride_qh
-            adj_do = hqid * stride_doh
-            adj_delta = hqid * stride_delta_h
+            adj_q = (
+                (bid * stride_qb + hqid * stride_qh + q_start * stride_qm)
+                if IS_VARLEN
+                else hqid * stride_qh
+            )
+            adj_do = (
+                (bid * stride_dob + hqid * stride_doh + q_start * stride_dom)
+                if IS_VARLEN
+                else hqid * stride_doh
+            )
+            adj_delta = (
+                (
+                    bid * stride_delta_b
+                    + hqid * stride_delta_h
+                    + q_start * stride_delta_m
+                )
+                if IS_VARLEN
+                else hqid * stride_delta_h
+            )
             Delta_ptr = Delta + adj_delta
-            adj_m = hqid * stride_lse_h
+            adj_m = (
+                (bid * stride_lse_b + hqid * stride_lse_h + q_start * stride_lse_m)
+                if IS_VARLEN
+                else hqid * stride_lse_h
+            )
             M_ptr = M + adj_m
 
             if USE_ALIBI:
@@ -3963,7 +4009,11 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
                 DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
             )
             # Write back dQ.
-            adj_dq = hqid * stride_dqh
+            adj_dq = (
+                (bid * stride_dqb + hqid * stride_dqh + q_start * stride_dqm)
+                if IS_VARLEN
+                else hqid * stride_dqh
+            )
             offs_dq = offs_m[:, None] * stride_dqm + offs_d_qk[None, :] * stride_dqd
             dq *= sm_scale
             tl.store(DQ + adj_dq + offs_dq, dq, mask=mask_q)
