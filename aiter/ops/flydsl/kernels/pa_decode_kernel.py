@@ -641,6 +641,7 @@ def compile_gfx1250_pa_decode(
         counters: fx.Pointer,
         quantized_output: fx.Pointer,
         output_scale: fx.Pointer,
+        quant_rows: fx.Int32,
     ):
         _ = tag
 
@@ -673,23 +674,45 @@ def compile_gfx1250_pa_decode(
                     )
                     rows[offset] = t.q_dtype(0.0)
 
+        def pad_output(row):
+            # A padded token-bucket row past the sequences: FP8 zero bytes and a
+            # unit descale. Called, not inlined, so the runtime branches that
+            # use it do not carry ``quant`` as branch state.
+            quant.store_pad(row, sq_row, sq_head)
+
         task_slot = fx.Int32(gpu.block_id("x"))
         if const_expr(t.cluster_merge):
             # Cluster s runs sequence s's tasks on its leading CTAs.
             seq, part = task_slot // t.cluster_merge, task_slot % t.cluster_merge
+            plan_seq = seq
+            if const_expr(t.quant_output):
+                # Clusters past the sequences write padded FP8 rows (below);
+                # they read sequence 0's entry and run no task.
+                pad_cluster = seq >= sequences
+                plan_seq = pad_cluster.select(fx.Int32(0), seq)
             seq_tasks = fx.ptr_load(
-                fx.add_offset(fx.recast_iter(fx.Int32, reduce_info), seq * 2),
+                fx.add_offset(fx.recast_iter(fx.Int32, reduce_info), plan_seq * 2),
                 result_type=fx.Vector.make_type(2, fx.Int32),
             )
             first, count = fx.Int32(seq_tasks[0]), fx.Int32(seq_tasks[1])
+            if const_expr(t.quant_output):
+                count = pad_cluster.select(fx.Int32(0), count)
             task_slot = (part < count).select(first + part, fx.Int32(0))
         if const_expr(t.direct_output):
             # One task per nonempty sequence; reduce_info supplies its packed slot.
             info = fx.recast_iter(fx.Int32, pmax)
-            count = fx.Int32(info[task_slot * 2 + 1])
+            if const_expr(t.quant_output):
+                # CTAs past the sequences write the padded FP8 rows (below);
+                # they read sequence 0's entry and run no task.
+                pad_cta = task_slot >= sequences
+                plan_slot = pad_cta.select(fx.Int32(0), task_slot)
+                count = pad_cta.select(fx.Int32(0), fx.Int32(info[plan_slot * 2 + 1]))
+            else:
+                plan_slot = task_slot
+                count = fx.Int32(info[task_slot * 2 + 1])
             # A trailing empty sequence's start can equal capacity. Its dummy
             # task read must stay in bounds even though no compute consumes it.
-            task_slot = (count > 0).select(fx.Int32(info[task_slot * 2]), fx.Int32(0))
+            task_slot = (count > 0).select(fx.Int32(info[plan_slot * 2]), fx.Int32(0))
         task = fx.ptr_load(
             fx.add_offset(fx.recast_iter(fx.Int32, work), task_slot * 4),
             result_type=fx.Vector.make_type(4, fx.Int32),
@@ -751,7 +774,14 @@ def compile_gfx1250_pa_decode(
             else:
                 Gfx1250Pipeline(ctx).run()
         elif const_expr(t.direct_output):
-            zero_output(gpu.block_id("x"), pout)
+            if const_expr(t.quant_output):
+                block = fx.Int32(gpu.block_id("x"))
+                if block < sequences:
+                    zero_output(gpu.block_id("x"), pout)
+                else:
+                    pad_output(block)
+            else:
+                zero_output(gpu.block_id("x"), pout)
         if const_expr(t.merge_partitions):
             # Empty sequences own no task. Capacity >= batch gives each one the
             # CTA at its index, which clears its rows.
@@ -773,6 +803,13 @@ def compile_gfx1250_pa_decode(
                     quant if t.quant_output else None,
                 )
                 merge.run(seq, part, first, count, capacity)
+            elif const_expr(t.quant_output):
+                if seq >= sequences:
+                    row = sequences + (seq - sequences) * t.cluster_merge + part
+                    if row < quant_rows:
+                        pad_output(row)
+                elif (count == 0) & (part == 0):
+                    zero_output(seq, output)
             elif (count == 0) & (part == 0):
                 zero_output(seq, output)
 
@@ -801,14 +838,24 @@ def compile_gfx1250_pa_decode(
         counters: fx.Pointer,
         quantized_output: fx.Pointer,
         output_scale: fx.Pointer,
+        quant_rows: fx.Int32,
         stream: fx.Stream,
     ):
         _ = tag
         grid_x = capacity
         if const_expr(t.direct_output):
             grid_x = sequences
+            if const_expr(t.quant_output):
+                # One CTA per padded FP8 row past the sequences.
+                grid_x = quant_rows
         if const_expr(t.cluster_merge):
             grid_x = sequences * t.cluster_merge
+            if const_expr(t.quant_output):
+                # One cluster per 8 padded FP8 rows past the sequences.
+                grid_x = (
+                    sequences
+                    + (quant_rows - sequences + t.cluster_merge - 1) // t.cluster_merge
+                ) * t.cluster_merge
         pa_decode_tile_kernel(
             work,
             table,
@@ -833,6 +880,7 @@ def compile_gfx1250_pa_decode(
             counters,
             quantized_output,
             output_scale,
+            quant_rows,
             value_attrs=(
                 {"rocdl.cluster_dims": f"{t.cluster_merge},1,1"}
                 if t.cluster_merge

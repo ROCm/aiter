@@ -528,6 +528,28 @@ class Gfx1250OutputQuant:
         _cluster_sync()
 
     @flyc.jit
+    def store_pad(self, token, stride_row, stride_head):
+        """A padded token past the query's: FP8 zeros and a unit descale, so a
+        consumer of the whole padded height reads inert finite rows."""
+        t, scales = self.t, self.scales
+        per_thread = t.rows * t.head_dim // t.BLOCK_THREADS
+        tid = fx.Int32(gpu.thread_id("x"))
+        first = tid * per_thread
+        offset = (
+            fx.Int64(token) * stride_row
+            + (first // t.head_dim) * stride_head
+            + first % t.head_dim
+        )
+        target = fx.recast_iter(
+            fx.PointerType.get(fx.Int32.ir_type, fx.AddressSpace.Global, 4),
+            fx.add_offset(self.quantized, offset),
+        )
+        zeros = [fx.Int32(0).ir_value() for _ in range_constexpr(per_thread // 4)]
+        fx.ptr_store(fx.Vector.from_elements(zeros, dtype=fx.Int32), target)
+        if tid == 0:
+            scales[token] = fx.Float32(1.0)
+
+    @flyc.jit
     def store_zero(self, token, stride_row, stride_head):
         """An empty token: zero values and scale, quantized like any token."""
         t, scales = self.t, self.scales
