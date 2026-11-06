@@ -3156,7 +3156,11 @@ def _flash_attn_varlen_forward(
         # The ASM kernel writes packed lse (total_q, nheads, 1); the varlen API
         # convention (mha_varlen_fwd) is (nheads, total_q).  Reshape so callers
         # and the autograd backward see a consistent layout regardless of path.
-        softmax_lse = lse_asm.squeeze(-1).transpose(0, 1).contiguous()
+        # Only a caller that asked for the LSE (the backward saves it only then)
+        # gets it packed; otherwise the kernel's scratch is returned as a view.
+        softmax_lse = lse_asm.squeeze(-1).transpose(0, 1)
+        if return_lse:
+            softmax_lse = softmax_lse.contiguous()
         S_dmask = torch.empty((0,), dtype=torch.float32, device=q.device)
         rng_state = torch.empty((2,), dtype=torch.int64, device=q.device)
     elif can_impl_fmha_v3_fwd():
