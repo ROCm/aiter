@@ -518,6 +518,7 @@ def per_1x32_mx_quant_hip(
     num_rows_factor=1,
     scale_type=None,
     scale_layout_m32k4: bool = False,
+    hadamard_rotate=False,
 ):
     """1x32 per-group MX dynamic quant (HIP).
 
@@ -543,16 +544,27 @@ def per_1x32_mx_quant_hip(
     pad rows 0x7F, ``shuffle`` ignored, ``n % 128 == 0``. fp8 output takes this
     layout through ``per_group_quant_hip(scale_layout_m32k4=True)``.
 
+    ``hadamard_rotate=True`` (fp4x2 only) quantizes ``x`` rotated per group,
+    i.e. ``x.view(m, n // 32, 32) @ (scipy.linalg.hadamard(32) / sqrt(32))``
+    computed in fp32 and rounded to ``x.dtype``. The rotation is orthogonal, so
+    a weight rotated the same way gives ``(x H)(w H)^T = x w^T``.
+
     The legacy ``per_1x32_f4_quant_hip`` is kept as a thin wrapper for
     backward compatibility.
     """
     m, n = x.shape
     assert n % 32 == 0, f"n={n} must be divisible by 32"
+    assert (
+        not hadamard_rotate or quant_dtype == dtypes.fp4x2
+    ), "hadamard_rotate is fp4x2-only"
     device = x.device
     if scale_layout_m32k4:
         assert (
             quant_dtype == dtypes.fp4x2 and num_rows is None and scale is None
         ), "scale_layout_m32k4 here needs fp4x2 output, no num_rows and no static scale"
+        assert (
+            not hadamard_rotate
+        ), "hadamard_rotate does not support scale_layout_m32k4"
         scale = torch.empty(
             ((m + 31) // 32 * 32, n // 32), dtype=torch.uint8, device=device
         ).view(dtypes.fp8_e8m0)
@@ -638,6 +650,7 @@ def per_1x32_mx_quant_hip(
         shuffle_scale=shuffle,
         num_rows=num_rows,
         num_rows_factor=num_rows_factor,
+        hadamard_rotate=hadamard_rotate,
     )
     return y, scale
 
@@ -649,6 +662,7 @@ def per_1x32_f4_quant_hip(
     shuffle=False,
     num_rows: torch.Tensor | None = None,
     num_rows_factor=1,
+    hadamard_rotate=False,
 ):
     """Backward-compat fp4-only wrapper around :func:`per_1x32_mx_quant_hip`.
 
@@ -667,6 +681,7 @@ def per_1x32_f4_quant_hip(
         shuffle=shuffle,
         num_rows=num_rows,
         num_rows_factor=num_rows_factor,
+        hadamard_rotate=hadamard_rotate,
     )
 
 
@@ -820,6 +835,7 @@ def dynamic_per_group_scaled_quant(
     num_rows: torch.Tensor | None = None,
     num_rows_factor: int = 1,
     scale_layout_m32k4: bool = False,
+    hadamard_rotate: bool = False,
 ) -> None:
     """Dtype-aware per-group dynamic quant.
 
@@ -842,6 +858,10 @@ def dynamic_per_group_scaled_quant(
     i.e. the bytes of :func:`aiter.ops.shuffle.shuffle_mxfp8fp4_scale`:
     ``scales`` must hold ``(pad32(M), K // 32)`` bytes, the pad rows are written
     as 0x7F, and ``shuffle_scale`` is ignored.
+
+    ``hadamard_rotate=True`` (fp4x2 output, ``group_size == 32``) rotates each
+    group by the normalized 32-point Sylvester Hadamard matrix before
+    quantizing it; see :func:`per_1x32_mx_quant_hip`.
     """
 
 

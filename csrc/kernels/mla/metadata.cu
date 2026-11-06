@@ -227,6 +227,7 @@ get_mla_decode_head_plan_v1(const int64_t num_heads_k,
                                                      static_cast<int32_t>(uni_seqlen_qo),
                                                      q_dtype,
                                                      kv_dtype,
+                                                     static_cast<int32_t>(page_size),
                                                      fast_mode,
                                                      intra_batch_mode,
                                                      flags);

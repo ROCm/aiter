@@ -11,7 +11,8 @@ import torch
 
 import aiter
 from aiter import dtypes
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx, get_num_xcds
+from aiter.ops.triton.utils.device_info import get_num_sms
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
@@ -102,6 +103,60 @@ def check_asm_decode_rejects_unsupported_widths():
             ),
             output=torch.empty((batch_size, nhead, 512), dtype=torch.bfloat16),
         )
+
+
+def check_bf16_gqa32_merges_only_written_splits() -> None:
+    """bf16 gqa32 decode with more KV splits than a row's KV fills: stage 2 must
+    merge only the splits stage 1 wrote. The split buffers come from torch.empty,
+    so they are pre-filled with NaN to make an unwritten split visible."""
+    batch_size, nhead, num_kv_splits = 260, 32, 5
+    kv_lora_rank, qk_rope_head_dim = 512, 64
+    qk_head_dim = kv_lora_rank + qk_rope_head_dim
+    # 17-63 tokens per row: one or two 32-token tiles, never all 5 splits.
+    kv_lens = torch.randint(17, 64, (batch_size,), dtype=torch.int)
+    qo_indptr = torch.arange(batch_size + 1, dtype=torch.int)
+    kv_indptr = torch.zeros(batch_size + 1, dtype=torch.int)
+    kv_indptr[1:] = torch.cumsum(kv_lens, dim=0)
+    total_kv = int(kv_indptr[-1])
+    kv_indices = torch.randperm(total_kv, dtype=torch.int)
+    kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
+    q = torch.randn((batch_size, nhead, qk_head_dim), dtype=torch.bfloat16)
+    kv_buffer = torch.randn((total_kv, 1, 1, qk_head_dim), dtype=torch.bfloat16)
+    sm_scale = 1.0 / qk_head_dim**0.5
+
+    ref, _ = torch_mla_extend(
+        q,
+        kv_buffer.view(total_kv, 1, qk_head_dim),
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        sm_scale,
+        kv_lora_rank,
+        qk_rope_head_dim,
+        torch.bfloat16,
+    )
+
+    for shape in (
+        (batch_size, num_kv_splits, nhead, kv_lora_rank),
+        (batch_size, num_kv_splits, nhead, 1),
+    ):
+        torch.full(shape, float("nan"), dtype=torch.float)
+    out = torch.empty((batch_size, nhead, kv_lora_rank), dtype=torch.bfloat16)
+    aiter.mla.mla_decode_fwd(
+        q,
+        kv_buffer,
+        out,
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        kv_last_page_lens,
+        1,
+        sm_scale=sm_scale,
+        num_kv_splits=num_kv_splits,
+    )
+    assert torch.isfinite(out).all(), "merged a split that stage 1 never wrote"
+    checkAllclose(ref.float(), out.float(), msg="bf16 gqa32 short-KV multi-split")
+    cal_diff(ref, out, "bf16 gqa32 short-KV multi-split")
 
 
 def cal_diff(
@@ -748,7 +803,6 @@ def test_mla(
 
     # Gluon MLA decode test
     # Example: -c 16384 -b 64 128 -n 64,1 128,1 -d bf16 -kvd bf16
-    NUM_XCDS_GFX950 = 8
     BLOCK_H_GLUON = 64
     if (
         get_gfx() == "gfx950"
@@ -761,12 +815,14 @@ def test_mla(
         and batch_size in (64, 128, 256)
         and page_size == 1
     ):
+        # Match the wrapper's device-dependent split count.
+        num_xcds = get_num_xcds()
         base_grid = (
-            NUM_XCDS_GFX950
+            num_xcds
             * ((nhead + BLOCK_H_GLUON - 1) // BLOCK_H_GLUON)
-            * (batch_size // NUM_XCDS_GFX950)
+            * (batch_size // num_xcds)
         )
-        splits_needed = max(1, (256 + base_grid - 1) // base_grid)
+        splits_needed = max(1, (get_num_sms() + base_grid - 1) // base_grid)
         # Round up to a power of two: 1 << (n - 1).bit_length() for n >= 1.
         num_kv_splits = 1 << (splits_needed - 1).bit_length()
         # PIPELINE_STAGES=3, BLOCK_N=64 -> 192; mirror wrapper's bound.
@@ -1006,6 +1062,8 @@ def main():
     if get_gfx() in ("gfx942", "gfx950"):
         check_asm_decode_rejects_unsupported_widths()
         aiter.logger.info("mla_decode_stage1_asm_fwd width checks: passed")
+        check_bf16_gqa32_merges_only_written_splits()
+        aiter.logger.info("bf16 gqa32 short-KV multi-split merge: passed")
 
     for nhead, decode_qlen in args.nhead:
         df = []

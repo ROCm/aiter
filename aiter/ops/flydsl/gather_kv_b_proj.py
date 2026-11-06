@@ -190,7 +190,7 @@ def _unsupported_reason(
         return f"k_buffer last dim must be {KV_ROW_ELEMS}, got {k_buffer.shape[2]}"
 
     arch = _arch_of(k_buffer.device.index)
-    if arch == "gfx1250":
+    if arch in ("gfx1250", "gfx1250-strict"):
         from .gather_kv_b_proj_gfx1250 import unsupported_reason
 
         return unsupported_reason(
@@ -481,7 +481,7 @@ def gather_kv_b_proj_flydsl(
     if reason is not None:
         _raise(reason)
 
-    if _arch_of(k_buffer.device.index) == "gfx1250":
+    if _arch_of(k_buffer.device.index) in ("gfx1250", "gfx1250-strict"):
         from .gather_kv_b_proj_gfx1250 import gather_kv_b_proj_flydsl_gfx1250
 
         return gather_kv_b_proj_flydsl_gfx1250(

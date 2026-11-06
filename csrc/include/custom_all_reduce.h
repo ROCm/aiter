@@ -140,7 +140,8 @@ void fused_allreduce_rmsnorm_mxfp4_quant(fptr_t _fa,
                                          int64_t reg_bytes,
                                          bool use_1stage,
                                          int64_t bf16_out_ptr = 0,
-                                         bool gemma_norm      = false);
+                                         bool gemma_norm      = false,
+                                         bool hadamard_rotate = false);
 void fused_qknorm_allreduce(fptr_t _fa,
                             const aiter_tensor_t& qkv_in,
                             const aiter_tensor_t& q_w,
@@ -167,6 +168,13 @@ void fused_qknorm_allreduce_rope(fptr_t _fa,
                                  int64_t reg_bytes);
 void dispose(fptr_t _fa);
 int64_t meta_size();
+int64_t lamportBufferSize(int64_t world_size);
+void initLamport(fptr_t _fa,
+                 int64_t self_ptr,
+                 const std::vector<int64_t>& ipc_handle_ptrs,
+                 const std::vector<int64_t>& offsets);
+int64_t lamportKernel(fptr_t _fa, int64_t numel);
+void lamportAllReduce(fptr_t _fa, const aiter_tensor_t& inp, const aiter_tensor_t& out, int64_t kernel);
 void register_input_buffer(fptr_t _fa,
                            int64_t self_ptr,
                            const std::vector<int64_t>& ipc_handle_ptrs,

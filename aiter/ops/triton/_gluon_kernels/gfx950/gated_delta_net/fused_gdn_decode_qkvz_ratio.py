@@ -173,7 +173,8 @@ def _decode_group_ratio(
 ):
     """One program per (token, key-head group). Rows with an empty ``QueryStartLoc``
     segment (``HAS_QSL``) or ``PAD_SLOT_ID`` are padded and skipped; ``conv_*_stride``
-    / ``ssm_slot_stride`` are the element strides of the (possibly paged) pools."""
+    / ``ssm_slot_stride`` are the element strides of the (possibly paged) pools.
+    ``State`` is fp32 or bf16; the update runs in fp32 and is stored in its dtype."""
     gl.static_assert(VH == RATIO * KH, "VH must be RATIO * KH")
     gl.static_assert(RATIO >= 1, "RATIO must be positive")
     gl.static_assert(K % (KL * KS) == 0, "KL lanes x KS elements must tile K")
@@ -206,7 +207,9 @@ def _decode_group_ratio(
     states = ()
     for h in gl.static_range(RATIO):
         states = states + (
-            gl.amd.cdna3.buffer_load(state_base + h * V * K, state_offset, cache=".cg"),
+            gl.amd.cdna3.buffer_load(
+                state_base + h * V * K, state_offset, cache=".cg"
+            ).to(gl.float32),
         )
     bs = ()
     as_ = ()
@@ -274,7 +277,10 @@ def _decode_group_ratio(
         value = conv_shared.slice(2 * K + h * V, V).load(gl.SliceLayout(1, tile_layout))
         updated, out = _update(states[h], q, key, value, decay, beta)
         gl.amd.cdna3.buffer_store(
-            updated, state_base + h * V * K, state_offset, cache=".wt"
+            updated.to(State.dtype.element_ty),
+            state_base + h * V * K,
+            state_offset,
+            cache=".wt",
         )
         outs = outs + (out,)
     # Phase 3: per-head gated RMSNorm (+ FP8) from registers.

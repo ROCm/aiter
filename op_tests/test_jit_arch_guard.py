@@ -23,13 +23,20 @@ def _restore_jit_dir(orig):
 def test_parse_offload_archs():
     blob = (
         b"\x00ELF junk hipv4-amdgcn-amd-amdhsa--gfx942 more "
-        b"hipv4-amdgcn-amd-amdhsa--gfx950 host__amdhsa--gfx1201 tail"
+        b"hipv4-amdgcn-amd-amdhsa--gfx950 "
+        b"hipv4-amdgcn-amd-amdhsa--gfx1250-strict "
+        b"host__amdhsa--gfx1201 tail"
     )
     with tempfile.NamedTemporaryFile(suffix=".so", delete=False) as f:
         f.write(blob)
         path = f.name
     try:
-        assert _so_offload_archs(path) == {"gfx942", "gfx950", "gfx1201"}
+        assert _so_offload_archs(path) == {
+            "gfx942",
+            "gfx950",
+            "gfx1201",
+            "gfx1250-strict",
+        }
     finally:
         os.remove(path)
 
@@ -46,6 +53,43 @@ def test_parse_host_only_is_empty():
 
 def test_missing_file_is_empty():
     assert _so_offload_archs("/no/such/module.so") == set()
+
+
+def test_parse_offload_archs_keeps_full_target_ids():
+    """Target-id features, the strict suffix, and ROCm generic targets.
+
+    The parser stops at the ':' that starts a feature list, but it must keep
+    every hyphenated part of the processor name itself.  Truncating at the
+    first hyphen reported gfx1250-strict as gfx1250 (the bug this guard
+    exists to prevent) and gfx9-4-generic as gfx9, which never matches a
+    running arch and so rebuilt the module on every import.
+    """
+    cases = {
+        b"amdhsa--gfx90a:sramecc+:xnack-": "gfx90a",
+        b"amdhsa--gfx1250-strict": "gfx1250-strict",
+        b"amdhsa--gfx1250-strict:xnack-": "gfx1250-strict",
+        b"amdhsa--gfx9-4-generic": "gfx9-4-generic",
+    }
+    for blob, expected in cases.items():
+        with tempfile.NamedTemporaryFile(suffix=".so", delete=False) as f:
+            f.write(b"\x00ELF junk hipv4-amdgcn-amd-" + blob + b"\x00tail")
+            path = f.name
+        try:
+            assert _so_offload_archs(path) == {expected}, blob
+        finally:
+            os.remove(path)
+
+
+def test_validate_strict_build_target():
+    old = os.environ.get("GPU_ARCHS")
+    try:
+        os.environ["GPU_ARCHS"] = "gfx1250-strict"
+        assert core.validate_and_update_archs() == ["gfx1250-strict"]
+    finally:
+        if old is None:
+            os.environ.pop("GPU_ARCHS", None)
+        else:
+            os.environ["GPU_ARCHS"] = old
 
 
 def test_needs_arch_rebuild():
@@ -67,6 +111,17 @@ def test_needs_arch_rebuild():
             # Running on a covered arch -> no rebuild.
             core.get_gfx_runtime = lambda: "gfx942"
             assert core._needs_arch_rebuild("module_dummy") is False
+
+            # gfx1250 and gfx1250-strict are intentionally incompatible.
+            with open(so_path, "wb") as f:
+                f.write(b"hipv4-amdgcn-amd-amdhsa--gfx1250-strict")
+            core.get_gfx_runtime = lambda: "gfx1250"
+            assert core._needs_arch_rebuild("module_dummy") is True
+
+            with open(so_path, "wb") as f:
+                f.write(b"hipv4-amdgcn-amd-amdhsa--gfx1250")
+            core.get_gfx_runtime = lambda: "gfx1250-strict"
+            assert core._needs_arch_rebuild("module_dummy") is True
 
             # Unknown build archs (no manifest, no .so) -> no rebuild.
             assert core._needs_arch_rebuild("module_unknown") is False

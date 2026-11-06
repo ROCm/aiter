@@ -48,7 +48,16 @@ def barrier_before_teardown():
 
 
 def _run_allgather_case(
-    rankID, tp_size, case_idx, shape, dtype, withGraph, use_custom, dim, graphs
+    rankID,
+    tp_size,
+    case_idx,
+    shape,
+    dtype,
+    withGraph,
+    use_custom,
+    dim,
+    graphs,
+    rank_offset=False,
 ):
     """All-gather one case on an initialized rank and check it against the
     concatenation of every rank's input along ``dim``.
@@ -59,7 +68,9 @@ def _run_allgather_case(
     buffers are appended to ``graphs`` and must outlive the whole sweep:
     custom collectives cache the peer IPC address of every captured buffer by
     its local pointer, so freeing one and capturing a later case at the same
-    address would replay with stale peer pointers.
+    address would replay with stale peer pointers. ``rank_offset``: the odd
+    ranks gather a view one element into its storage, so the ranks' inputs
+    differ in alignment while every rank must pick the same protocol.
     """
     if rankID == 0:
         print(f"run perf test, use custom allgather {use_custom}")
@@ -69,6 +80,9 @@ def _run_allgather_case(
         for _ in range(tp_size)
     ]
     x = inputs[rankID]
+    if rank_offset and rankID % 2:
+        storage = torch.empty(x.numel() + 1, dtype=dtype, device="cuda")
+        x = storage[1:].view(shape).copy_(x)
     ref = torch.cat(inputs, dim)
 
     if withGraph:
@@ -142,6 +156,7 @@ def allgather_sweep(
             case["use_custom"],
             case["dim"],
             graphs,
+            case.get("rank_offset", False),
         )
         for case_idx, case in enumerate(cases)
     ]
@@ -267,6 +282,7 @@ def allgather_perftest(tp_size, pp_size, cases, dtype, withGraph=False):
                 "withGraph": withGraph,
                 "use_custom": case["use_custom"],
                 "dim": case["dim"],
+                "rank_offset": case.get("rank_offset", False),
                 "min_us": min(all_us),
                 "max_us": max(all_us),
                 "err": max(results[i]["err"] for results in per_rank),
@@ -299,6 +315,11 @@ l_shape = [
     # dim=0 path: size = 65*7168/8 = 58240, NOT a multiple of 256*4 = 1024 ->
     # naive_unroll4 kernel drops the tail.
     (65, 7168),
+    # gfx1250 LL all-gather: a decode step's LM-head logits at TP4 (MiniMax-M3
+    # vocab 200064 -> 50016 a rank, 12 rows), 1.2 MB a rank; rows of 4 bf16
+    # are whole 8-byte packets but not 16-byte ones.
+    (12, 50016),
+    (12, 4),
 ]
 
 parser = argparse.ArgumentParser(description="config input of test")
@@ -349,6 +370,13 @@ if __name__ == "__main__":
         for dim in l_dim
         for use_custom in [False, True]
     ]
+    # the odd ranks' inputs one element into their storage: 16 bf16 a rank and
+    # the LM-head logits, both under the LL threshold
+    cases += [
+        {"shape": shape, "dim": dim, "use_custom": True, "rank_offset": True}
+        for shape in [(16,), (12, 50016)]
+        for dim in l_dim
+    ]
     df = []
     for dtype in l_dtype:
         df.extend(allgather_perftest(tp_size, 1, cases, dtype, withGraph=False))
@@ -360,6 +388,7 @@ if __name__ == "__main__":
         "withGraph",
         "use_custom",
         "dim",
+        "rank_offset",
         "min_us",
         "max_us",
         "err",

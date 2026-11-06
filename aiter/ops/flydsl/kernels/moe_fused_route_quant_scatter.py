@@ -154,7 +154,10 @@ _NATIVE_SCALED_CVT_ARCHS = ("gfx950",)
 # fp4 (i32, 8 nibbles) / fp8 (v2i32, 8 e4m3 bytes), dividing by the e8m0 exponent
 # carried in the f32 scale. We emit them via inline asm so they do not depend on
 # the MLIR rocdl op lowering.
-_PK8_BF16_ARCHS = ("gfx1250",)
+_PK8_BF16_ARCHS = (
+    "gfx1250",
+    "gfx1250-strict",
+)
 
 
 def _arch_has_pk8(arch: str) -> bool:

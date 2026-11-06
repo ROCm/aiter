@@ -14,7 +14,8 @@ template<int BlockM = opus_moe::kStage2A8W4DecodeDefaultBlockM,
          int CachectlBOverride = 0,
          int CachectlWScaleOverride = 0,
          int PairSlots = 1,
-         int SteadyPairSlots = PairSlots>
+         int SteadyPairSlots = PairSlots,
+         int SortBlockM = BlockM>
 struct OpusMoeStage2A8W4DecodeShape
 {
     // Atomic vs MXFP8 route-out is a structural compile-time choice.
@@ -43,7 +44,8 @@ struct OpusMoeStage2A8W4DecodeShape
     static constexpr int THREADS_K = opus::get_warp_size() / MMA_M;
     static constexpr int T_M = IS_BM32_BN256 ? 2 : 1;
 
-    static constexpr int ROUTE_M_STRIDE = B_M;
+    // One tile must not combine sorted blocks belonging to different experts.
+    static constexpr int ROUTE_M_STRIDE = SortBlockM < B_M ? SortBlockM : B_M;
     // route_out XCD swizzle (gfx950=8 XCDs).
     static constexpr int NUM_XCD = DIRECT_ATOMIC_OUT ? 1 : 8;
     static constexpr int SWIZZLE_W = 2;
@@ -108,4 +110,6 @@ struct OpusMoeStage2A8W4DecodeShape
     static_assert(B_N % (T_N * MMA_N) == 0);
     static_assert(PAIR_SLOTS == 1 || PAIR_SLOTS == 2);
     static_assert(STEADY_PAIR_SLOTS >= 1 && STEADY_PAIR_SLOTS <= PAIR_SLOTS);
+    static_assert(SortBlockM > 0 && (SortBlockM & (SortBlockM - 1)) == 0);
+    static_assert(B_M % ROUTE_M_STRIDE == 0);
 };

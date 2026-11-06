@@ -235,6 +235,11 @@ AITER_CONFIG_CONV3D_BF16 = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/bf16_tuned_conv3d.csv",
 )
 
+AITER_CONFIG_MQA_LOGITS = os.getenv(
+    "AITER_CONFIG_MQA_LOGITS",
+    f"{AITER_ROOT_DIR}/aiter/configs/tuned_mqa_logits.csv",
+)
+
 # K5 opt BV tuned config. Per-model tuned rows live under model_configs/
 # (qwen3_5_*_chunk_gdn_h_opt_tuned.csv) and get merged into this canonical file by
 # get_config_file. It ships header-only: with no per-model table present
@@ -266,6 +271,26 @@ AITER_CONFIG_MEGA_MOE_TP_BIGM = os.getenv(
     "AITER_CONFIG_MEGA_MOE_TP_BIGM",
     f"{AITER_ROOT_DIR}/aiter/configs/mega_moe_tp_bigm_tuned.csv",
 )
+
+AITER_CONFIG_PAGED_MQA_LOGITS = os.getenv(
+    "AITER_CONFIG_PAGED_MQA_LOGITS",
+    f"{AITER_ROOT_DIR}/aiter/configs/paged_mqa_logits_tuned.csv",
+)
+
+
+def _runtime_power_selection() -> bool:
+    """True when a running ``import aiter`` asked for power tables (AITER_SELECT).
+
+    setup.py loads this file as ``jit.core`` and evaluates config properties
+    while building the wheel. Importing ``aiter.utility`` from that copy runs
+    ``aiter/__init__.py`` and requests ``module_aiter_core`` before the build
+    has registered it. Power selection only changes which CSV rows dispatch
+    reads, so the prebuild keeps the latency tables and the latency dedup.
+    """
+    raw = os.environ.get("AITER_SELECT", "latency").strip().lower()
+    if raw not in {"power", "efficiency", "power_efficiency"}:
+        return False
+    return "aiter" in sys.modules
 
 
 class AITER_CONFIG:
@@ -420,6 +445,14 @@ class AITER_CONFIG:
         )
 
     @property
+    def AITER_CONFIG_MQA_LOGITS_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_MQA_LOGITS",
+            AITER_CONFIG_MQA_LOGITS,
+            "tuned_mqa_logits",
+        )
+
+    @property
     def AITER_CONFIG_GDN_K5_OPT_FILE(self):
         return self.get_config_file(
             "AITER_CONFIG_GDN_K5_OPT",
@@ -453,6 +486,14 @@ class AITER_CONFIG:
             "AITER_CONFIG_MEGA_MOE_TP_BIGM",
             AITER_CONFIG_MEGA_MOE_TP_BIGM,
             "mega_moe_tp_bigm_tuned",
+        )
+
+    @property
+    def AITER_CONFIG_PAGED_MQA_LOGITS_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_PAGED_MQA_LOGITS",
+            AITER_CONFIG_PAGED_MQA_LOGITS,
+            "paged_mqa_logits_tuned",
         )
 
     @property
@@ -492,31 +533,7 @@ class AITER_CONFIG:
         if has_tag:
             merge_df["_tag"] = merge_df["_tag"].fillna("")
 
-        ## get keys from untuned file to drop_duplicates
-        # Turn the tuned-file base name into its untuned sibling by rewriting the
-        # LAST "tuned" token (handles both mid-string names like
-        # "a8w8_tuned_gemm" and trailing ones like "..._mxscale_tuned").
-        untuned_name = "untuned".join(merge_name.rsplit("tuned", 1))
-        untuned_path = f"{AITER_ROOT_DIR}/aiter/configs/{untuned_name}.csv"
-        if not os.path.exists(untuned_path):
-            logger.warning(
-                f"Untuned config file not found: {untuned_path}. "
-                "Skipping duplicate-shape check."
-            )
-            return
-
-        untunedf = pd.read_csv(untuned_path)
-        keys = untunedf.columns.to_list()
-        if "cu_num" not in keys:
-            keys.append("cu_num")
-        if "gfx" in merge_df.columns and "gfx" not in keys:
-            keys.append("gfx")
-        dedup_keys = keys + ["_tag"] if has_tag else keys
-        # Only key on columns actually present in the merged frame. Most
-        # families carry cu_num, but some (e.g. the mxscale batched-GEMM
-        # table) key on gfx and never carry cu_num; keeping a missing column
-        # in the subset would raise inside pandas' duplicated().
-        dedup_keys = [k for k in dedup_keys if k in merge_df.columns]
+        dedup_keys = self._shape_dedup_keys(merge_df, merge_name)
         if not dedup_keys:
             return
 
@@ -542,6 +559,27 @@ class AITER_CONFIG:
             f"to their paths, separated by '{os.pathsep}'; this also skips the "
             f"model_configs/ scan.\n"
         )
+        # A latency table has no ``select`` column, and power_merge_conflict
+        # would return None. Skip the import in that case. setup.py loads this
+        # module as ``jit.core`` before the aiter package exists; importing
+        # ``aiter.utility`` from there runs aiter/__init__.py while
+        # module_aiter_core is still being registered.
+        conflict = None
+        if "select" in dup_rows.columns and "aiter" in sys.modules:
+            from aiter.utility.power_configs import power_merge_conflict
+
+            conflict = power_merge_conflict(dup_rows, dedup_keys)
+        if conflict:
+            # Ranking these rows against each other would compare watts from
+            # different clocks or caps, or energy against latency. Keep every
+            # source file as it is and let the user choose the table.
+            raise RuntimeError(
+                dup_header
+                + conflict
+                + "No config file was rewritten.\n"
+                + env_hint
+                + f"Duplicate rows:\n{dup_rows.to_string(index=False)}"
+            )
         if "us" not in merge_df.columns:
             raise RuntimeError(
                 dup_header + "No 'us' column to determine best performing entry. "
@@ -550,15 +588,26 @@ class AITER_CONFIG:
                 + f"Duplicate rows:\n{dup_rows.to_string(index=False)}"
             )
 
-        # Auto-dedup: globally determine best row (lowest 'us') per shape. One
-        # unparseable us cell (e.g. nan) leaves the column textual in
-        # `comparable`, where "10.5" sorts before "9.5", so coerce it alone.
-        us = pd.to_numeric(merge_df["us"], errors="coerce")
+        # Auto-dedup: keep the preferred row per shape. Latency mode uses the
+        # lowest 'us'. AITER_SELECT=power uses the shared energy rank when a
+        # power tune wrote watts. One unparseable cell (e.g. nan) leaves a
+        # column textual in `comparable`, where "10.5" sorts before "9.5", so
+        # coerce the ranking columns alone.
+        ranked = comparable.assign(us=pd.to_numeric(merge_df["us"], errors="coerce"))
+        power_rank = _runtime_power_selection() and (
+            "watts" in merge_df.columns or "tflops_per_w" in merge_df.columns
+        )
+        if power_rank:
+            from aiter.utility.tune_result import sort_frame_for_selection
+
+            for column in ("watts", "tflops_per_w"):
+                if column in merge_df.columns:
+                    ranked[column] = pd.to_numeric(merge_df[column], errors="coerce")
+            ranked = sort_frame_for_selection(ranked, True)
+        else:
+            ranked = ranked.sort_values("us", kind="stable")
         best_row_index = set(
-            comparable.assign(us=us)
-            .sort_values("us", kind="stable")
-            .drop_duplicates(subset=dedup_keys, keep="first")
-            .index
+            ranked.drop_duplicates(subset=dedup_keys, keep="first").index
         )
 
         saved_files = []
@@ -585,14 +634,15 @@ class AITER_CONFIG:
                 saved_files.append(
                     f"  {src_path}: {len(src_df)} -> {len(new_src_df)} rows"
                 )
+        kept = "lowest package energy (us * watts)" if power_rank else "lowest 'us'"
         if failed_files:
             outcome = (
-                "Resolved by keeping best performing (lowest 'us') for each key, "
+                f"Resolved by keeping best performing ({kept}) for each key, "
                 "but not every source config file could be rewritten.\n"
             )
         else:
             outcome = (
-                "Auto-resolved by keeping best performing (lowest 'us') for each "
+                f"Auto-resolved by keeping best performing ({kept}) for each "
                 "key and saved back to source config files.\n"
             )
         saved_info = "\n".join(saved_files) if saved_files else "  (no files updated)"
@@ -609,6 +659,38 @@ class AITER_CONFIG:
             + f"Duplicate rows:\n{dup_rows.to_string(index=False)}\n"
             f"Updated files:\n{saved_info}" + failed_info
         )
+
+    @staticmethod
+    def _shape_dedup_keys(merge_df, merge_name: str):
+        """Shape key columns for a tuned family, or None if they cannot be found."""
+        import pandas as pd
+
+        ## get keys from untuned file to drop_duplicates
+        # Turn the tuned-file base name into its untuned sibling by rewriting the
+        # LAST "tuned" token (handles both mid-string names like
+        # "a8w8_tuned_gemm" and trailing ones like "..._mxscale_tuned").
+        untuned_name = "untuned".join(merge_name.rsplit("tuned", 1))
+        untuned_path = f"{AITER_ROOT_DIR}/aiter/configs/{untuned_name}.csv"
+        if not os.path.exists(untuned_path):
+            logger.warning(
+                f"Untuned config file not found: {untuned_path}. "
+                "Skipping duplicate-shape check."
+            )
+            return None
+
+        untunedf = pd.read_csv(untuned_path)
+        keys = untunedf.columns.to_list()
+        if "cu_num" not in keys:
+            keys.append("cu_num")
+        if "gfx" in merge_df.columns and "gfx" not in keys:
+            keys.append("gfx")
+        if "_tag" in merge_df.columns:
+            keys.append("_tag")
+        # Only key on columns actually present in the merged frame. Most
+        # families carry cu_num, but some (e.g. the mxscale batched-GEMM
+        # table) key on gfx and never carry cu_num; keeping a missing column
+        # in the subset would raise inside pandas' duplicated().
+        return [k for k in keys if k in merge_df.columns] or None
 
     def update_config_files(
         self, file_path: str, merge_name: str, env_name: str | None = None
@@ -751,6 +833,16 @@ class AITER_CONFIG:
                 config_file = self.update_config_files(
                     tuned_files, tuned_file_name, env_name
                 )
+            # Overlay only at runtime. The wheel build evaluates these
+            # properties from ``jit.core`` with the aiter package not yet
+            # imported, and apply_power_overlay is a no-op unless
+            # AITER_SELECT asks for power.
+            if _runtime_power_selection():
+                from aiter.utility.power_configs import apply_power_overlay
+
+                config_file = apply_power_overlay(
+                    self, config_file, tuned_file_name, env_name
+                )
         else:
             config_file = self.update_config_files(
                 config_env_file, tuned_file_name, env_name
@@ -807,7 +899,7 @@ os.environ["AITER_ASM_DIR"] = AITER_ASM_DIR
 # directory setup.py deletes when it is done). Only an import-time value knows
 # where the files ended up after install. The C++ loader prefers this env var
 # over the macro. The CO loader resolves the current HIP device's ASIC Revision:
-# A0 uses this root's gfx1250-a0 directory, B0+ uses gfx1250. A direct profile
+# A0 uses this root's gfx1250-strict directory, B0+ uses gfx1250. A direct profile
 # override is accepted only when the ELF processor matches the detected stepping.
 OPUS_GEN_CO_DIR = f"{AITER_CSRC_DIR}/opus_gemm/gen_co"
 os.environ.setdefault("OPUS_GEN_CO_DIR", OPUS_GEN_CO_DIR)
@@ -879,8 +971,8 @@ def validate_and_update_archs():
         "gfx1200",
         "gfx1201",
         "gfx1250",
+        "gfx1250-strict",
         "gfx950",
-        "gfx1250",
     ]
 
     # Validate if each element in archs is in allowed_archs
@@ -1057,7 +1149,7 @@ def _so_offload_archs(so_path):
         with open(so_path, "rb") as f, mmap.mmap(
             f.fileno(), 0, access=mmap.ACCESS_READ
         ) as mm:
-            for m in re.finditer(rb"amdhsa--(gfx[0-9a-z]+)", mm):
+            for m in re.finditer(rb"amdhsa--(gfx[0-9a-z]+(?:-[0-9a-z]+)*)", mm):
                 archs.add(m.group(1).decode())
     except (OSError, ValueError, OverflowError):
         pass
@@ -1229,54 +1321,21 @@ def clone_3rdparty(third_party: str) -> None:
                     ]
                 )
             else:
-                # Save current git config value for advice.detachedHead, set to false
-                prev_detached_head = None
-                try:
-                    try:
-                        prev_detached_head = subprocess.check_output(
-                            ["git", "config", "--get", "advice.detachedHead"], text=True
-                        ).strip()
-                    except subprocess.CalledProcessError:
-                        prev_detached_head = None  # not set before
-                    # Set to false before clone
-                    subprocess.call(
-                        ["git", "config", "--global", "advice.detachedHead", "false"]
-                    )
-
-                    subprocess.call(
-                        [
-                            "git",
-                            "clone",
-                            "-q",
-                            f"--revision={third_party_info['commit']}",
-                            "--depth=1",
-                            "--recurse-submodules",
-                            third_party_info["url"],
-                            dir_path,
-                        ]
-                    )
-                finally:
-                    # Restore config after clone
-                    if prev_detached_head is not None:
-                        subprocess.call(
-                            [
-                                "git",
-                                "config",
-                                "--global",
-                                "advice.detachedHead",
-                                prev_detached_head,
-                            ]
-                        )
-                    else:
-                        subprocess.call(
-                            [
-                                "git",
-                                "config",
-                                "--global",
-                                "--unset",
-                                "advice.detachedHead",
-                            ]
-                        )
+                # Keep the detached-HEAD advice setting local to this clone.
+                subprocess.call(
+                    [
+                        "git",
+                        "-c",
+                        "advice.detachedHead=false",
+                        "clone",
+                        "-q",
+                        f"--revision={third_party_info['commit']}",
+                        "--depth=1",
+                        "--recurse-submodules",
+                        third_party_info["url"],
+                        dir_path,
+                    ]
+                )
 
     if third_party == "HipKittens":
         dir_path = HIP_KITTENS_DIR
@@ -1309,6 +1368,36 @@ def clear_build(md_name):
         shutil.rmtree(path, ignore_errors=True)
 
 
+def _build_archs_from_env(detect_gfx) -> list[str]:
+    """Architectures this build targets, from GPU_ARCHS with a native fallback.
+
+    Mirrors aiter/ops/opus/_arch.py: an unset, empty, blank or "native"
+    GPU_ARCHS falls back to the detected arch and never raises.  Routing the
+    value through build_targets._parse_gpu_archs_env instead would turn a
+    Dockerfile's `ENV GPU_ARCHS=` into a RuntimeError on every JIT build.
+    """
+    gpu_archs_env = os.environ.get("GPU_ARCHS", "native").strip()
+    explicit = [
+        a.strip()
+        for a in gpu_archs_env.split(";")
+        if a.strip() and a.strip().lower() != "native"
+    ]
+    return explicit or [detect_gfx()]
+
+
+def _targets_gfx1250(detect_gfx) -> bool:
+    """True when any targeted arch is gfx1250 or gfx1250-strict."""
+    return any(
+        arch in ("gfx1250", "gfx1250-strict")
+        for arch in _build_archs_from_env(detect_gfx)
+    )
+
+
+def _cluster_launch_target(detect_gfx) -> bool:
+    """True when any targeted arch wants -DAITER_ENABLE_CLUSTER_LAUNCH."""
+    return _targets_gfx1250(detect_gfx)
+
+
 def build_module(
     md_name,
     srcs,
@@ -1330,6 +1419,21 @@ def build_module(
     lock_path = f"{bd_dir}/lock_{md_name}"
     startTS = time.perf_counter()
     target_name = f"{md_name}{JIT_LIB_EXT}" if not is_standalone else md_name
+
+    if md_name.startswith("module_mega_mhc_stream_"):
+        # Keep source selection and host dispatch in sync for JIT and prebuild.
+        mhc_gfx1250 = any(
+            arch in ("gfx1250", "gfx1250-strict")
+            for arch in _build_archs_from_env(get_gfx)
+        )
+        if not mhc_gfx1250:
+            srcs = [
+                src for src in srcs if os.path.basename(src) != "mega_mhc_gfx1250.cu"
+            ]
+        flags_extra_hip = [
+            *flags_extra_hip,
+            f"-DAITER_MHC_GFX1250={int(mhc_gfx1250)}",
+        ]
 
     for tp in third_party:
         clone_3rdparty(tp)
@@ -1406,6 +1510,10 @@ def build_module(
             ]
         if hip_version > Version("6.2.41133"):
             flags_hip += ["-mllvm -amdgpu-coerce-illegal-types=1"]
+        # Starting with ROCm 10.1 (HIP 7.16), LLVM won't inline across differing target features,
+        # as in CK-tile's target("no-packed-fp32-ops") kentry. This flag restores the inlining.
+        if hip_version >= Version("7.16"):
+            flags_hip += ["-mllvm -ignore-tti-inline-compatible=true"]
         if get_gfx() != "gfx942" and int(os.getenv("AITER_FP4x2", "1")) > 0:
             flags_hip += ["-D__Float4_e2m1fn_x2"]
         # Cluster launch is a HOST-side API question (hipDrvLaunchKernelEx +
@@ -1415,10 +1523,13 @@ def build_module(
         # get_gfx() alone reads the LAST entry of a multi-arch GPU_ARCHS, which
         # left "gfx1250;gfx942" building gfx1250 kernels whose cluster launch
         # path was compiled out (AiterAsmKernelFast then rejects them at launch).
-        if (
-            get_gfx() == "gfx1250" or "gfx1250" in os.environ.get("GPU_ARCHS", "")
-        ) and hip_version >= Version("7.0.0"):
+        if _cluster_launch_target(get_gfx) and hip_version >= Version("7.0.0"):
             flags_hip += ["-DAITER_ENABLE_CLUSTER_LAUNCH"]
+        # CK's CMakeLists forces the unified ck_tile framework off for any build that
+        # targets gfx1250, which it does not support yet; the JIT bypasses that CMake.
+        # It has to be a whole-TU define so the host and device passes agree.
+        if _targets_gfx1250(get_gfx):
+            flags_hip += ["-DUSE_NEW_UNIFIED_FRAMEWORK=0"]
 
         if not torch_exclude:
             import torch
@@ -1882,17 +1993,6 @@ def _ctypes_call(func, fc_name, md_name):
 
     from ..utility.dtypes import aiter_tensor_t, torch_to_aiter
 
-    # Avoid constructing a Python Stream object on every ctypes invocation.
-    # Keep the public API fallback for torch versions without the private raw
-    # stream getter, and preserve the first tensor's device selection.
-    raw_stream = getattr(torch._C, "_cuda_getCurrentRawStream", None)
-    if raw_stream is None:
-
-        def raw_stream(device_index):
-            return torch.cuda.current_stream(device_index).cuda_stream
-
-    current_device = torch.cuda.current_device
-
     _cache = {}
     _arg_checked = False
     _sig = inspect.signature(func)
@@ -2127,6 +2227,12 @@ def _ctypes_call(func, fc_name, md_name):
             else:  # _ARG_BOOL
                 add_arg(1 if value else 0)
 
+        # The same stream/device getters as the develop pybind path (no Python
+        # Stream object per call), read per call so an AOT dry run can swap
+        # them; the first tensor's device still selects the stream.
+        _, _, raw_stream, current_device = (
+            _pybind_develop_hooks_cache or _pybind_develop_hooks()
+        )
         if tensor_device is None:
             tensor_device = current_device()
         c_args.append(ctypes.c_void_p(raw_stream(tensor_device)))
@@ -2178,8 +2284,8 @@ def _pybind_develop_hooks():
         raw_stream = getattr(torch._C, "_cuda_getCurrentRawStream", None)
         if raw_stream is None:
 
-            def raw_stream(_device_index):
-                return torch.cuda.current_stream().cuda_stream
+            def raw_stream(device_index):
+                return torch.cuda.current_stream(device_index).cuda_stream
 
         _pybind_develop_hooks_cache = (
             torch_to_aiter_pybind,

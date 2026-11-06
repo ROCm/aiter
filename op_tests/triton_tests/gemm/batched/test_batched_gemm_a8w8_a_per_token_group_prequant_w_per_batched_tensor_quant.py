@@ -98,6 +98,7 @@ def run_triton(
     transpose_bm=False,
     transpose_bm_in=False,
     backend=None,
+    y_scale_out=None,
 ):
     return batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
         x,
@@ -110,6 +111,7 @@ def run_triton(
         transpose_bm=transpose_bm,
         transpose_bm_in=transpose_bm_in,
         backend=backend,
+        y_scale_out=y_scale_out,
     )
 
 
@@ -168,6 +170,7 @@ def get_x_vals():
     return x_vals
 
 
+@pytest.mark.parametrize("y_per_token_quant", [False, True])
 @pytest.mark.parametrize("backend", [None, "triton", "gluon"])
 @pytest.mark.parametrize(
     "dtype, b, m, n, k, group_size, has_bias, output, transpose_bm",
@@ -183,9 +186,23 @@ def get_x_vals():
     ],
 )
 def test_batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
-    dtype, b, m, n, k, group_size, has_bias, output, transpose_bm, backend
+    dtype,
+    b,
+    m,
+    n,
+    k,
+    group_size,
+    has_bias,
+    output,
+    transpose_bm,
+    backend,
+    y_per_token_quant,
 ):
     skip_if_gluon_unavailable(backend)
+    if y_per_token_quant and (has_bias or not output or not transpose_bm):
+        pytest.skip("y_scale_out needs a pre-allocated YQ, transpose_bm and no bias")
+    if y_per_token_quant and backend == "gluon":
+        pytest.skip("gluon backend does not support y_scale_out")
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
 
     dtype = str_to_torch_dtype[dtype]
@@ -193,6 +210,10 @@ def test_batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant
         b, m, n, k, dtype, has_bias, output, transpose_bm=transpose_bm
     )
     skip_if_gluon_unsupported(backend, x, weight, bias)
+    y_scale = None
+    if y_per_token_quant:
+        y = torch.empty((m, b, n), dtype=e4m3_type, device=x.device)
+        y_scale = torch.empty((m, 1), dtype=torch.float32, device=x.device)
     a = run_torch(x, weight, w_scale, bias, dtype, transpose_bm)
     b = run_triton(
         x,
@@ -204,7 +225,10 @@ def test_batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant
         y=y,
         transpose_bm=transpose_bm,
         backend=backend,
+        y_scale_out=y_scale,
     )
+    if y_per_token_quant:
+        b = b.float() * y_scale[:, :, None]
 
     triton.testing.assert_close(a, b, atol=0.1, rtol=0.1)
 

@@ -628,7 +628,7 @@ def build_one(k, args, llvm_bin, workdir):
 
 def _default_co_output_dir(arch, offload_arch):
     if offload_arch == "gfx1250-strict":
-        return os.path.join(_HERE, arch + "-a0")
+        return os.path.join(_HERE, arch + "-strict")
     return os.path.join(_HERE, "named_reg", arch)
 
 
@@ -654,7 +654,7 @@ def main():
         "--arch",
         default="gfx1250",
         choices=("gfx1250",),
-        help="logical runtime architecture (A0 images use an -a0 storage suffix)",
+        help="logical runtime architecture (A0 images use a -strict storage suffix)",
     )
     p.add_argument(
         "--offload-arch",
@@ -678,7 +678,7 @@ def main():
         "--out-dir",
         default="",
         help="default: <this dir>/named_reg/<arch>; with gfx1250-strict: "
-        "<this dir>/<arch>-a0. Pass an explicit output for production rebuilds",
+        "<this dir>/<arch>-strict. Pass an explicit output for production rebuilds",
     )
     p.add_argument(
         "--no-asm",
@@ -776,7 +776,7 @@ def main():
         "arch": args.arch,
         "offload_arch": args.offload_arch,
         "target_profile": (
-            "a0-strict" if args.offload_arch == "gfx1250-strict" else "regular"
+            "strict" if args.offload_arch == "gfx1250-strict" else "regular"
         ),
         "hipcc": args.hipcc,
         "device_clang": ver,

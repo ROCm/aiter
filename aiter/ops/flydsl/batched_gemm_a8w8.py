@@ -21,6 +21,7 @@ from collections.abc import Callable
 
 from torch import Tensor
 
+from aiter.jit.utils.build_targets import base_gfx_arch
 from aiter.jit.utils.chip_info import get_gfx
 
 from ..gemm_op_common import mxscale_w_scale_block
@@ -47,6 +48,8 @@ _RUNNERS = {
 
 @functools.cache
 def _runner(gfx: str, w_scale_block: str, x_scale_transposed: bool) -> Callable | None:
+    # A0 bring-up: the gfx1250 runners serve gfx1250-strict too.
+    gfx = base_gfx_arch(gfx)
     entry = _RUNNERS.get((gfx, w_scale_block, x_scale_transposed))
     if entry is None:
         return None

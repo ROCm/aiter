@@ -37,6 +37,13 @@ NETWORKS = {
         "topk": 6,
         "swiglu_limit": 10.0,
     },
+    "v41_flash": {
+        "model_dim": 5120,
+        "inter_dim": 2304,
+        "experts": 384,
+        "topk": 6,
+        "swiglu_limit": 10.0,
+    },
     "r1_v3": {
         "model_dim": 7168,
         "inter_dim": 2048,
@@ -153,7 +160,26 @@ def _make_inputs(
             .expand(tokens, topk)
             .clone()
         )
-    if force_fanout_boundary or inject_invalid_route or force_padding_boundary:
+    small_pair_boundary = (
+        force_fanout_boundary
+        and not (inject_invalid_route or force_padding_boundary)
+        and 2 <= topk <= 8
+        and topk % 2 == 0
+        and topk // 2 <= dist.get_world_size()
+        and experts % dist.get_world_size() == 0
+    )
+    if small_pair_boundary:
+        # Distinct paired experts in multiple destinations force fanout rows
+        # and expert padding for the small-topk (e.g. DSv4.1) route format.
+        world = dist.get_world_size()
+        local_experts = experts // world
+        if local_experts < 2:
+            raise ValueError("paired fanout requires at least two local experts")
+        token = torch.arange(tokens, dtype=torch.int64, device=device)[:, None]
+        slot = torch.arange(topk, dtype=torch.int64, device=device)[None, :]
+        destination = (token + rank + slot // 2) % world
+        ids = destination * local_experts + local_experts - 2 + slot % 2
+    elif force_fanout_boundary or inject_invalid_route or force_padding_boundary:
         if topk != 16 or experts % dist.get_world_size():
             raise ValueError("fanout adversarial cases require topk=16 and EP")
         world = dist.get_world_size()
@@ -356,8 +382,53 @@ def _time_graph(fn, device, iters):
 
 def _run_size(moe, x, weights, ids, ref_weights, args, rank, world, device):
     tokens = x.shape[0]
+    main_output = None
+    if args.compare_main:
+        if not args.expect_large_m:
+            raise ValueError("--compare-main requires --expect-large-m")
+        moe.set_large_m_enabled(False)
+        try:
+            main_output = moe(x, weights, ids)[:tokens].clone()
+        finally:
+            moe.set_large_m_enabled(True)
+        _barrier()
     output = moe(x, weights, ids)[:tokens]
-    if moe._active_config.stage2.aligned_pair:
+    if args.expect_large_m:
+        runtime = moe._large_m
+        if runtime is None:
+            raise AssertionError("large-M path was requested but did not activate")
+        if runtime._s1_op.indexed_payload:
+            raise AssertionError("large-M path must use a non-indexed payload")
+        config = runtime._active_config
+        if (
+            config.stage1.num_waves != 8
+            or config.stage2.block_m != 64
+            or config.stage2.block_n * (config.stage1.num_waves // 4) != 512
+        ):
+            raise AssertionError("large-M path did not select its NW8/BN512 emitter")
+        if rank == 0:
+            print(
+                "[LARGE-M] active=PASS payload=non-indexed "
+                "emitter=NW8/BN512 bf16_launches=2",
+                flush=True,
+            )
+    if main_output is not None:
+        error_sq = torch.sum((output.float() - main_output.float()) ** 2)
+        reference_sq = torch.sum(main_output.float() ** 2)
+        dist.all_reduce(error_sq)
+        dist.all_reduce(reference_sq)
+        main_rel_l2 = float(torch.sqrt(error_sq / reference_sq))
+        if main_rel_l2 >= args.rtol:
+            raise AssertionError(
+                f"large-M vs main relL2={main_rel_l2:.6f} exceeds {args.rtol}"
+            )
+        if rank == 0:
+            print(
+                f"[LARGE-M] main_relL2={main_rel_l2:.6f} PASS",
+                flush=True,
+            )
+    active_config = getattr(moe, "_active_config", None)
+    if active_config is not None and active_config.stage2.aligned_pair:
         aligned_output = output.clone()
         full_output = moe(x, weights, ids, slice_output=False)
         expected_shape = (moe.mtpr, moe.model_dim)
@@ -395,6 +466,36 @@ def _run_size(moe, x, weights, ids, ref_weights, args, rank, world, device):
         rel_l2 = _rel_l2(output, reference)
         if rel_l2 >= args.rtol:
             raise AssertionError(f"bs={tokens} relL2={rel_l2:.6f} exceeds {args.rtol}")
+    if args.expect_large_m:
+        _check_large_m_edges(
+            moe,
+            x,
+            weights,
+            ids,
+            eager_output,
+            ref_weights,
+            args,
+            rank,
+            world,
+            device,
+            0 < int(token_max.item()) <= args.accuracy_max_bs,
+        )
+    if args.smoke_only:
+        if args.layer_stress_cycles:
+            _run_layer_slot_stress(
+                moe,
+                x,
+                weights,
+                ids,
+                args.large_m_state_slots,
+                args.layer_stress_cycles,
+                rank,
+            )
+        if args.route_switch_rounds:
+            _run_skewed_route_switch(
+                moe, x, weights, ids, args.route_switch_rounds, args.seed, rank, world
+            )
+        return
 
     x_q, scale = moe.quantize(x)
     state = {}
@@ -436,6 +537,185 @@ def _run_size(moe, x, weights, ids, ref_weights, args, rank, world, device):
         )
     if args.pad_tail_rows:
         _check_pad_tail(moe, x, weights, ids, ref_weights, args, rank, world, device)
+
+
+def _binding_state(moe):
+    """Every bound weight view, dispatch table and layer slot of the operator and its runtimes."""
+    state = [moe._s1_w1, moe._s1_w1_scale, moe.w2, moe.w2_scale]
+    if moe._large_m is not None:
+        large = moe._large_m
+        state += [large._s1_w1, large._s1_w1_scale, large.w2, large.w2_scale]
+        state.append(large._active_layer_slot)
+    for runtime in moe._small_m_runtimes:
+        state += [runtime._s1_w1, runtime._s1_w1_scale, runtime.w2, runtime.w2_scale]
+        state.append(runtime._s1_disp)
+    return state
+
+
+def _same_binding(state, expected):
+    return len(state) == len(expected) and all(
+        a is b if isinstance(b, torch.Tensor) else a == b
+        for a, b in zip(state, expected)
+    )
+
+
+def _check_large_m_edges(
+    moe,
+    x,
+    weights,
+    ids,
+    eager_output,
+    ref_weights,
+    args,
+    rank,
+    world,
+    device,
+    check_mask,
+):
+    """Large-input path: explicit stream, rank-local mask and the SiLU-only gate."""
+    import flydsl.expr as fx
+
+    from aiter.ops.flydsl.kernels.mega_moe.mega_moe_large_m import _torch_stream
+    from aiter.ops.flydsl.kernels.mega_moe.mega_moe_v2 import (
+        large_m_eligible,
+        small_m_eligible,
+    )
+
+    tokens = x.shape[0]
+    # A zero-input call first, so a quant buffer reused on the current stream holds other data.
+    moe(torch.zeros_like(x), weights, ids)
+    # Only the side stream waits for the inputs; the current stream is held back,
+    # so work left on it would run after the kernel.
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    torch.cuda._sleep(50_000_000)
+    output = moe(x, weights, ids, stream=side)[:tokens]
+    torch.cuda.synchronize()
+    stream_exact = torch.equal(output, eager_output)
+    if not _reduce_float(stream_exact, device, dist.ReduceOp.MIN):
+        raise AssertionError(f"bs={tokens} explicit stream changed the output")
+    _barrier()
+
+    if check_mask:
+        # Rank 0 alone masks a third of its slots; the path choice must not depend on it.
+        masked_ids = ids.clone()
+        mask = rank == 0
+        if mask:
+            gen = torch.Generator(device=device).manual_seed(args.seed + 17)
+            drop = torch.rand(ids.shape, generator=gen, device=device) < 1 / 3
+            masked_ids[drop] = -1
+        output = moe(x, weights, masked_ids, mask_invalid_slots=mask)[:tokens].clone()
+        _barrier()
+        reference = _reference(
+            x,
+            weights,
+            masked_ids,
+            ref_weights,
+            rank,
+            world,
+            moe.model_dim,
+            moe.inter_dim,
+            moe.experts,
+            moe.swiglu_limit,
+            moe.act,
+            moe.situ_beta,
+            moe.situ_linear_beta,
+        )
+        rel_l2 = _rel_l2(output, reference)
+        if rel_l2 >= args.rtol:
+            raise AssertionError(f"bs={tokens} rank-local mask relL2={rel_l2:.6f}")
+
+    # Launches keep the bound pointers (a captured graph replays them): a copy made for a
+    # strided weight would be freed after the call, so bind_weights refuses one, as it refuses
+    # weights of another layout or an out-of-range slot. A refusal changes no binding anywhere.
+    bound = _binding_state(moe)
+    w1, w1_scale, w2, w2_scale = moe._s1_w1, moe._s1_w1_scale, moe.w2, moe.w2_scale
+    large = moe._large_m
+    refusals = [
+        (
+            "strided",
+            lambda: moe.bind_weights(w1, w1_scale, w2.transpose(-1, -2), w2_scale),
+        ),
+        ("layout", lambda: moe.bind_weights(w1, w1_scale, w2.flatten(), w2_scale)),
+        ("slot", lambda: moe.bind_layer(1 << 20, w1, w1_scale, w2.clone(), w2_scale)),
+        (
+            "runtime_slot",
+            lambda: large.bind_layer(1 << 20, w1, w1_scale, w2.clone(), w2_scale),
+        ),
+    ]
+    # Strided weights for another slot need two slots (--large-m-state-slots); one slot checks the range only.
+    other_slot = (large._active_layer_slot + 1) % large.state_slots
+    if other_slot != large._active_layer_slot:
+        refusals.append(
+            (
+                "runtime_strided",
+                lambda: large.bind_layer(
+                    other_slot, w1, w1_scale, w2.transpose(-1, -2), w2_scale
+                ),
+            )
+        )
+    for label, refused in refusals:
+        try:
+            refused()
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"a {label} binding was accepted")
+        if not _same_binding(_binding_state(moe), bound):
+            raise AssertionError(f"a refused {label} binding changed the bound state")
+    slot_refusal = "PASS" if len(refusals) == 5 else "RANGE-ONLY"
+    # A null stream handle is the default stream, not a new one the persistent kernel never waits on.
+    if any(
+        _torch_stream(s) != torch.cuda.default_stream() for s in (0, fx.Stream(None))
+    ):
+        raise AssertionError("a null stream handle did not map to the default stream")
+    null_output = moe(x, weights, ids, stream=fx.Stream(None))[:tokens]
+    torch.cuda.synchronize()
+    if not _reduce_float(
+        torch.equal(null_output, eager_output), device, dist.ReduceOp.MIN
+    ):
+        raise AssertionError(f"bs={tokens} the null stream changed the output")
+    # Stage1 reads scales as E8M0 bytes: another 1-byte dtype is refused before any launch.
+    x_q, x_scale = moe.quantize(x)
+    for label, stage1 in (
+        ("main", lambda s: moe._run_fused_stage1(x_q, weights, s, ids)),
+        ("large", lambda s: moe._large_m.forward_prequant(x_q, s, weights, ids)),
+    ):
+        try:
+            stage1(x_scale.view(torch.float8_e4m3fn))
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"{label} Stage1 accepted float8_e4m3fn scales")
+
+    layout = {
+        "arch": "gfx950",
+        "world_size": 8,
+        "model_dim": 7168,
+        "inter_dim": 3072,
+        "experts": 384,
+        "topk": 6,
+        "quant": "a8w4",
+        "swiglu_limit": 10.0,
+    }
+    if not large_m_eligible(enabled=True, max_tok_per_rank=8192, **layout) or (
+        large_m_eligible(enabled=True, max_tok_per_rank=8192, act="situv2", **layout)
+        or small_m_eligible(enabled=True, num_cu=256, act="situv2", **layout)
+    ):
+        raise AssertionError("the large/small-input paths must be gated to SiLU")
+    # The small-input kernel shards its work over 8 XCDs: a 4-XCD (128-CU) part is not eligible.
+    if not small_m_eligible(enabled=True, num_cu=256, **layout) or small_m_eligible(
+        enabled=True, num_cu=128, **layout
+    ):
+        raise AssertionError("the small-input path must be gated to 8-XCD parts")
+    if rank == 0:
+        print(
+            f"[LARGE-M] bs={tokens} explicit_stream=PASS "
+            f"rank_local_mask={'PASS' if check_mask else 'SKIP'} silu_gate=PASS "
+            f"strided_weights=PASS xcd_gate=PASS slot_refusal={slot_refusal} "
+            "scale_dtype=PASS null_stream=PASS",
+            flush=True,
+        )
 
 
 def _check_pad_tail(moe, x, weights, ids, ref_weights, args, rank, world, device):
@@ -504,6 +784,202 @@ def _run_burst(moe, x, weights, ids, depth, rank):
     torch.cuda.synchronize()
     if rank == 0:
         print(f"[BURST] completed={depth}/{depth}", flush=True)
+
+
+def _run_layer_slot_stress(moe, x, weights, ids, slots, cycles, rank):
+    """Alternate routes and weight pointers across model-layer slots."""
+    if slots < 61 or cycles <= 8:
+        raise ValueError("layer-slot stress requires at least 61 slots and 9 cycles")
+    if moe._large_m is None:
+        raise AssertionError("layer-slot stress requires the large-M path")
+    if moe._large_m.state_slots < slots:
+        raise AssertionError("large-M state arena is smaller than the stress")
+
+    w1_a, sw1_a = moe._s1_w1, moe._s1_w1_scale
+    w2_a, sw2_a = moe.w2, moe.w2_scale
+    # Layer B has its own pointers and doubles W2 (E8M0 exponent + 1), so a call that ran
+    # on the other layer's weights changes the output.
+    w1_b, sw1_b = w1_a.clone(), sw1_a.clone()
+    w2_b = w2_a.clone()
+    exponent = sw2_a.view(torch.uint8)
+    sw2_b = torch.where(exponent < 254, exponent + 1, exponent).view(sw2_a.dtype)
+    route_row = torch.arange(ids.shape[0], dtype=torch.int32, device=ids.device)[
+        :, None
+    ]
+    route_slot = torch.arange(moe.topk, dtype=torch.int32, device=ids.device)[None, :]
+    ids_b = (
+        (route_row * moe.topk + route_slot + rank * (moe.experts // moe.world_size))
+        .remainder(moe.experts)
+        .contiguous()
+    )
+    weights_b = weights.flip(0).contiguous()
+    tokens = x.shape[0]
+    # A few slots per cycle, covering both layers, are checked against the main path on the same
+    # binding: the large-M path matches it bit for bit.
+    checked_slots = {0, 1, slots - 1}
+    checked = 0
+
+    for cycle in range(cycles):
+        for slot in range(slots):
+            if (cycle + slot) & 1:
+                bound = w1_b, sw1_b, w2_b, sw2_b
+                route_weights, route_ids = weights_b, ids_b
+            else:
+                bound = w1_a, sw1_a, w2_a, sw2_a
+                route_weights = weights
+                route_ids = (
+                    (ids + cycle * 37 + slot * 11).remainder(moe.experts).contiguous()
+                )
+            moe.bind_layer(slot, *bound)
+            output = moe(x, route_weights, route_ids)[:tokens]
+            if slot not in checked_slots:
+                continue
+            output = output.clone()
+            moe.set_large_m_enabled(False)
+            try:
+                reference = moe(x, route_weights, route_ids)[:tokens].clone()
+            finally:
+                moe.set_large_m_enabled(True)
+            mismatched = (output != reference).any(dim=-1).sum().to(torch.int64)
+            finite = torch.isfinite(output).all().to(torch.int64)
+            dist.all_reduce(mismatched)
+            dist.all_reduce(finite, op=dist.ReduceOp.MIN)
+            if int(mismatched.item()) or not int(finite.item()):
+                raise AssertionError(
+                    f"layer cycle={cycle} slot={slot}: {int(mismatched.item())} rows "
+                    "differ from the main path on the same binding"
+                )
+            checked += 1
+    # The doubled W2 must change the result, or the comparisons above could not see a stale binding.
+    moe.bind_layer(0, w1_a, sw1_a, w2_a, sw2_a)
+    out_a = moe(x, weights, ids)[:tokens].clone()
+    moe.bind_layer(0, w1_b, sw1_b, w2_b, sw2_b)
+    out_b = moe(x, weights, ids)[:tokens].clone()
+    differ = (out_a != out_b).any().to(torch.int64)
+    dist.all_reduce(differ, op=dist.ReduceOp.MAX)
+    if not int(differ.item()):
+        raise AssertionError("layer B weights do not change the output")
+    moe.bind_layer(0, w1_a, sw1_a, w2_a, sw2_a)
+    _barrier()
+    if rank == 0:
+        print(
+            f"[LARGE-M-LAYERS] slots={slots} cycles={cycles} "
+            f"calls={slots * cycles} main_checks={checked} route_mutation=PASS "
+            "weight_rebind=PASS",
+            flush=True,
+        )
+
+
+def _skewed_route(tokens, experts, topk, hot_experts, round_idx, seed, rank, device):
+    """Send three of every four rows to each hot expert; weights ignore the bias."""
+    generator = torch.Generator(device=device).manual_seed(
+        seed + 7919 * (round_idx + 1) + rank
+    )
+    scores = torch.randn(
+        (tokens, experts), dtype=torch.float32, device=device, generator=generator
+    )
+    rows = torch.arange(tokens, device=device)
+    bias = torch.zeros_like(scores)
+    hot_rows = ((rows + round_idx) % 4 != 0)[:, None]
+    bias[:, hot_experts] = hot_rows * 1.0e4
+    ids = torch.topk(scores + bias, topk, dim=-1).indices
+    weights = scores.gather(1, ids).softmax(dim=-1)
+    return weights.contiguous(), ids.to(torch.int32).contiguous()
+
+
+def _pair_order_hazard_producers(moe, ids, world):
+    """Count producers that copy payload for a destination but skip grouping.
+
+    Mirrors mega_moe_large_m._configure_payload_geometry: a destination
+    whose hottest local expert exceeds four payload chunks gets more than four
+    producers, which moves some payload producers past the grouping set.
+    """
+    stage1 = moe._large_m._active_config.stage1
+    if stage1.num_dispatch_cu <= 32:
+        return 0
+    local_experts = moe.experts // world
+    counts = torch.bincount(ids[ids >= 0].long(), minlength=moe.experts)
+    max_blocks = stage1.num_dispatch_cu // world
+    producers = [
+        min(max(-(-int(count) // stage1.payload_chunk_rows), 4), max_blocks)
+        for count in counts.view(world, local_experts).amax(dim=1).tolist()
+    ]
+    grouped = sum(producers)
+    return sum(
+        1
+        for slot in range(grouped, stage1.num_dispatch_cu)
+        if slot // world < producers[slot % world]
+    )
+
+
+def _run_skewed_route_switch(moe, x, weights, ids, rounds, seed, rank, world):
+    """Change a skewed route between large-M launches and compare to main.
+
+    Uniform routes keep four producers per destination, so they never reach
+    the producers that skip adaptive grouping; a stale pair order there only
+    shows up when the route differs from the previous launch.
+    """
+    if moe._large_m is None:
+        raise AssertionError("skewed route switch requires the large-M path")
+    tokens = x.shape[0]
+    local_experts = moe.experts // world
+    moe(x, weights, ids)
+    moe(x, weights, ids)
+    _barrier()
+    worst = 0.0
+    failures = []
+    for round_idx in range(rounds):
+        # Like a captured batch: one source rank saturates five
+        # destinations while its peers stay near uniform.
+        hot_experts = [
+            ((rank + round_idx + 3 * hot) % world) * local_experts
+            + (round_idx * 7 + hot) % local_experts
+            for hot in range(min(5, moe.topk))
+            if rank == round_idx % world
+        ]
+        route_weights, route_ids = _skewed_route(
+            tokens, moe.experts, moe.topk, hot_experts, round_idx, seed, rank, x.device
+        )
+        hazard = torch.tensor(
+            _pair_order_hazard_producers(moe, route_ids, world),
+            dtype=torch.int32,
+            device=x.device,
+        )
+        dist.all_reduce(hazard)
+        if not int(hazard.item()):
+            raise AssertionError("skewed route did not exceed four payload producers")
+        moe.set_large_m_enabled(False)
+        try:
+            main_output = moe(x, route_weights, route_ids)[:tokens].clone()
+        finally:
+            moe.set_large_m_enabled(True)
+        _barrier()
+        output = moe(x, route_weights, route_ids)[:tokens].float()
+        mismatched = (output != main_output.float()).any(dim=-1).sum().to(torch.int64)
+        error_sq = torch.sum((output - main_output.float()) ** 2)
+        reference_sq = torch.sum(main_output.float() ** 2)
+        for value in (mismatched, error_sq, reference_sq):
+            dist.all_reduce(value)
+        rel_l2 = float(torch.sqrt(error_sq / reference_sq))
+        worst = max(worst, rel_l2)
+        # Same kernels and inputs make the large-M path match main bit-for-bit; a stale pair
+        # order corrupts whole rows, sometimes only a few per launch.
+        if int(mismatched.item()):
+            failures.append(
+                f"round={round_idx} hazard_producers={int(hazard.item())} "
+                f"mismatched_rows={int(mismatched.item())} main_relL2={rel_l2:.6f}"
+            )
+    if failures:
+        raise AssertionError(
+            f"skewed route switch failed {len(failures)}/{rounds} rounds: "
+            + "; ".join(failures)
+        )
+    if rank == 0:
+        print(
+            f"[LARGE-M-ROUTE-SWITCH] rounds={rounds} "
+            f"mismatched_rows=0 max_main_relL2={worst:.6f} PASS",
+            flush=True,
+        )
 
 
 def _install_config_policy(moe, config_tokens, unify_fields):
@@ -580,7 +1056,16 @@ def main():
         help="Also route each rank's last N rows to -1 (whole rows) and check "
         "forward(mask_invalid_slots=True) returns them as zeros",
     )
+    parser.add_argument("--expect-large-m", action="store_true")
+    parser.add_argument("--compare-main", action="store_true")
+    parser.add_argument("--smoke-only", action="store_true")
+    # Two by default, so the edge checks can bind another slot.
+    parser.add_argument("--large-m-state-slots", type=int, default=2)
+    parser.add_argument("--layer-stress-cycles", type=int, default=0)
+    parser.add_argument("--route-switch-rounds", type=int, default=0)
     args = parser.parse_args()
+    if args.route_switch_rounds and not (args.expect_large_m and args.smoke_only):
+        raise ValueError("--route-switch-rounds requires --expect-large-m --smoke-only")
     if (
         sum(
             (
@@ -683,6 +1168,7 @@ def main():
                     max_tok_per_rank=max_tok_per_rank,
                     fanout_masks=fanout_masks,
                     stage2_p2p_quant=args.stage2_p2p_quant,
+                    large_m_state_slots=args.large_m_state_slots,
                     **network,
                 )
             moe = shared_moe

@@ -34,6 +34,7 @@ from opus_gemm_common import (
     a16w16_flatmm_splitk_kernels_list,
     a16w16_kernels_list,
     a16w16_mono_tile_kernels_list,
+    base_gfx_arch,
     default_compiled_keys,
     get_registry,
     gfx942_a8w8_kernels_list,
@@ -46,15 +47,29 @@ from opus_gemm_common import (
 )
 
 
+def _registry_arch(gfx: str) -> str:
+    """Kernel-family name used for every target this script returns.
+
+    gfx1250-strict (MI450 A0) shares the gfx1250 kernel family, as in
+    chip_info._detect_native. The targets feed only the registry lookups, the
+    route selection, KernelKey/compiled_kids and the OPUS_BUILD_HAS_* macros,
+    which all key on the family; hipcc still gets --offload-arch=gfx1250-strict
+    from GPU_ARCHS.
+    """
+    return base_gfx_arch(gfx)
+
+
 def _build_targets_standalone(explicit_targets=()):
     if explicit_targets:
         targets = []
         for value in explicit_targets:
             gfx, cu = value.split("/")
-            targets.append((gfx.split(":", 1)[0].strip().lower(), int(cu)))
+            targets.append(
+                (_registry_arch(gfx.split(":", 1)[0].strip().lower()), int(cu))
+            )
         return sorted(set(targets))
     explicit_arches = [
-        gfx.strip().lower()
+        _registry_arch(gfx.strip().lower())
         for gfx in os.getenv("GPU_ARCHS", "native").split(";")
         if gfx.strip() and gfx.strip().lower() != "native"
     ]
@@ -64,7 +79,7 @@ def _build_targets_standalone(explicit_targets=()):
                 (gfx, cu)
                 for gfx in explicit_arches
                 for arches in KERNEL_REGISTRY.values()
-                for cu in arches.get(gfx, {})
+                for cu in arches.get(_registry_arch(gfx), {})
             }
         )
     import importlib.util
@@ -82,12 +97,12 @@ def _build_targets_standalone(explicit_targets=()):
     )
     mod = importlib.util.module_from_spec(mod_spec)
     mod_spec.loader.exec_module(mod)
-    targets = set(mod.get_build_targets())
+    targets = {(_registry_arch(gfx), cu) for gfx, cu in mod.get_build_targets()}
     for gfx, _cu in tuple(targets):
         targets.update(
             (gfx, cu)
             for arches in KERNEL_REGISTRY.values()
-            for cu in arches.get(gfx, {})
+            for cu in arches.get(_registry_arch(gfx), {})
         )
     return sorted(targets)
 
@@ -1380,7 +1395,7 @@ if __name__ == "__main__":
         KernelKey(family, gfx, cu, kid): instance
         for gfx, cu in targets
         for family, arches in KERNEL_REGISTRY.items()
-        if gfx in arches
+        if _registry_arch(gfx) in arches
         for kid, instance in get_registry(family, gfx, cu).items()
     }
     csv_keys = set()
@@ -1452,7 +1467,9 @@ if __name__ == "__main__":
         parser.error(
             f"requested local kernels are unavailable: {sorted(key.encode() for key in missing)}"
         )
-    target_arches = {gfx for gfx, cu in targets}
+    # OPUS_BUILD_HAS_* tells C which kernel family is compiled; A0 compiles
+    # the gfx1250 family, so emit GFX1250 (not an invalid hyphenated STRICT name).
+    target_arches = {_registry_arch(gfx) for gfx, cu in targets}
     Path(args.working_path).mkdir(parents=True, exist_ok=True)
     write_if_changed(
         os.path.join(args.working_path, "opus_build_archs.h"),

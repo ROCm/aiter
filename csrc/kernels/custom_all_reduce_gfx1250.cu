@@ -323,17 +323,11 @@ static void _all_gather(fptr_t _fa, void* inp, void* out,
     hipStream_t stream = aiter::getCurrentHIPStream();
     auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
 
-    // The allgather kernels index their output with int, and that index scales
-    // with world_size. Checked here while numel is still int64_t, which covers
-    // all four kernels plus the narrowing below. Needed because all_gather_reg
-    // and custom_all_gather never consult should_custom_ag.
-    const int64_t out_numel = numel * fa->world_size_;
-    if(out_numel > std::numeric_limits<int>::max())
-        throw std::runtime_error(
-            "gfx1250 allgather: output element count " + std::to_string(out_numel) +
-            " (numel " + std::to_string(numel) + " x world_size " +
-            std::to_string(fa->world_size_) + ") exceeds the int32 index range; "
-            "route this size through should_custom_ag / RCCL instead");
+    // numel stays int64_t down to the launchers. Each checks the int32 index
+    // range of its own kernel (per element for allgather_scalar, per 16-byte
+    // pack for the others; see allgather_packs) before narrowing. Needed
+    // because all_gather_reg and custom_all_gather never consult
+    // should_custom_ag.
 
 #define AG_DISPATCH_DIM0(T)                                         \
     do {                                                            \
@@ -463,6 +457,29 @@ void all_gather(fptr_t _fa,
 
     void* actual_inp = inp.data_ptr();
     void* actual_out = out.data_ptr();
+
+    // the LL kernel reads the input in place: no registered copy, unless the
+    // gather would overwrite the input before publishing it
+    auto fa                = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    const size_t row_bytes = dim != 0 ? last_dim_size * inp.element_size() : data_bytes;
+    if(fa->use_ll_ag(data_bytes, row_bytes))
+    {
+        if(!fa->ll_ag_reads_in_place(actual_inp, actual_out, data_bytes, row_bytes))
+        {
+            if(reg_inp_ptr == 0 || data_bytes > reg_inp_bytes)
+                throw std::runtime_error(
+                    "gfx1250 LL all-gather: the output overlaps a registered input");
+            HIP_CALL(hipMemcpyAsync((void*)reg_inp_ptr, actual_inp, data_bytes,
+                                    hipMemcpyDeviceToDevice, stream));
+            actual_inp = (void*)reg_inp_ptr;
+        }
+        fa->allgather_ll<uint8_t>(stream,
+                                  reinterpret_cast<const uint8_t*>(actual_inp),
+                                  reinterpret_cast<uint8_t*>(actual_out),
+                                  data_bytes,
+                                  row_bytes);
+        return;
+    }
 
     if(reg_inp_ptr != 0)
     {

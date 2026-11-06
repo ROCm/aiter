@@ -2934,6 +2934,7 @@ def ref_masked_attention_with_sink(
     window_left,
     sink_size,
     sink_ptr_value,
+    window_right=0,
 ):
     """
     Reference attention with StreamLLM sink semantics.
@@ -2943,6 +2944,7 @@ def ref_masked_attention_with_sink(
         key:            [seqlen_k, num_heads, head_dim]
         value:          [seqlen_k, num_heads, head_dim]
         window_left:    left window size (-1 = infinite)
+        window_right:   right window size (-1 = infinite, 0 = causal)
         sink_size:      number of KV tokens at start always attended
         sink_ptr_value: per-head float tensor [num_heads] or None.
                         When not None, a virtual sink token with this scaled
@@ -2952,7 +2954,8 @@ def ref_masked_attention_with_sink(
     Valid KV range for query at absolute position abs_q = seqlen_k - seqlen_q + i_q:
         k < sink_size   (sink region, always valid)
         OR
-        abs_q - window_left <= k <= abs_q   (window region, window_left=-1 means k >= 0)
+        abs_q - window_left <= k <= abs_q + window_right
+        (negative window bounds are unlimited)
     """
     head_dim = query.shape[2]
     seqlen_q = query.shape[0]
@@ -2968,7 +2971,7 @@ def ref_masked_attention_with_sink(
     i_q = torch.arange(seqlen_q, device=query.device).unsqueeze(1)  # [sq, 1]
     i_k = torch.arange(seqlen_k, device=query.device).unsqueeze(0)  # [1, sk]
     abs_q = seqlen_k - seqlen_q + i_q  # [sq, 1]
-    k_end = abs_q  # causal boundary
+    k_end = seqlen_k - 1 if window_right < 0 else abs_q + window_right
     if window_left < 0:
         k_start_window = torch.zeros_like(abs_q)
     else:
@@ -3941,6 +3944,69 @@ def test_batch_prefill_virtual_sink(qo_len, window_left, with_sink):
     torch.testing.assert_close(out, torch.cat(expected), rtol=rtol, atol=atol)
 
 
+_FULL_ATTENTION_CASES = [
+    (False, (-1, -1)),
+    (False, (100, -1)),
+    (False, (-1, 100)),
+    (False, (100, 100)),
+    (True, (-1, -1)),
+    (True, (2, -1)),
+]
+
+
+@pytest.mark.parametrize("qo_len", [1, 4])
+@pytest.mark.parametrize("with_sink", [False, True])
+@pytest.mark.parametrize("causal,window", _FULL_ATTENTION_CASES)
+def test_batch_prefill_full_attention(qo_len, with_sink, causal, window):
+    torch.manual_seed(42)
+    kv_lens, num_heads, num_kv_heads, head_dim = (37, 100), 8, 2, 128
+    q = torch.randn(
+        (2 * qo_len, num_heads, head_dim), dtype=torch.bfloat16, device="cuda"
+    )
+    k = torch.randn(
+        (sum(kv_lens), num_kv_heads, head_dim), dtype=q.dtype, device=q.device
+    )
+    v = torch.randn_like(k)
+    sink = (
+        torch.linspace(-1.0, 3.0, num_heads, dtype=torch.float32, device=q.device)
+        if with_sink
+        else None
+    )
+    indices = torch.randperm(sum(kv_lens), device=q.device).to(torch.int32)
+    out = aiter.mha_batch_prefill_func(
+        q,
+        k,
+        v,
+        torch.tensor([0, qo_len, 2 * qo_len], dtype=torch.int32, device=q.device),
+        torch.tensor([0, kv_lens[0], sum(kv_lens)], dtype=torch.int32, device=q.device),
+        indices,
+        max_seqlen_q=qo_len,
+        max_seqlen_k=max(kv_lens),
+        causal=causal,
+        window_size=window,
+        sink_size=2,
+        sink_ptr=sink,
+    )
+    expected = []
+    offset = 0
+    for i, kv_len in enumerate(kv_lens):
+        pages = indices[offset : offset + kv_len].long()
+        expected.append(
+            ref_masked_attention_with_sink(
+                q[i * qo_len : (i + 1) * qo_len],
+                k[pages].repeat_interleave(num_heads // num_kv_heads, dim=1),
+                v[pages].repeat_interleave(num_heads // num_kv_heads, dim=1),
+                window[0],
+                2,
+                sink,
+                window_right=0 if causal else window[1],
+            )
+        )
+        offset += kv_len
+    rtol, atol = get_tolerances(q.dtype)
+    torch.testing.assert_close(out, torch.cat(expected), rtol=rtol, atol=atol)
+
+
 # CI runs `python3 test_batch_prefill.py` (no pytest), so the __main__ block
 # above only executes the non-sink scenarios. Add a small representative sweep
 # of the StreamLLM sink scenarios here so they actually exercise in CI.
@@ -3971,3 +4037,8 @@ if __name__ == "__main__":
 
     for case in _VIRTUAL_SINK_CASES:
         test_batch_prefill_virtual_sink(*case)
+
+    for qo_len, with_sink, (causal, window) in itertools.product(
+        [1, 4], [False, True], _FULL_ATTENTION_CASES
+    ):
+        test_batch_prefill_full_attention(qo_len, with_sink, causal, window)

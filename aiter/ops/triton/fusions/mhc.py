@@ -554,7 +554,7 @@ def _mhc_post_pre_gluon_supported(
     h_post=None,
     h_res=None,
 ) -> bool:
-    if get_arch() != "gfx1250":
+    if get_arch() not in ("gfx1250", "gfx1250-strict"):
         return False
     C = layer_input.size(1)
     K = n * C

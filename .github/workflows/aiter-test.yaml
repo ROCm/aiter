@@ -152,7 +152,7 @@ jobs:
     if: >-
       needs.detect_aiter_test_scope.outputs.run_tests == 'true' ||
       needs.detect_aiter_test_scope.outputs.run_multigpu_tests == 'true'
-    runs-on: build-only-aiter
+    runs-on: ${{ matrix.build_enabled && 'build-only-aiter' || 'ubuntu-latest' }}
     needs: [detect_aiter_test_scope, check-signal, ci_config]
     permissions:
       id-token: write
@@ -871,6 +871,14 @@ jobs:
           workspace_jit.mkdir(parents=True, exist_ok=True)
           for kernel in kernels:
               copy2(kernel, workspace_jit / kernel.name)
+
+          # Source imports discover FlyDSL AOT entries under their own jit dir.
+          # Reuse the wheel's cache instead of JIT-compiling the CSV sweep again.
+          installed_cache = installed_jit / "flydsl_cache"
+          workspace_cache = workspace_jit / "flydsl_cache"
+          if installed_cache.is_dir() and not workspace_cache.exists():
+              workspace_cache.symlink_to(installed_cache, target_is_directory=True)
+              print(f"Linked FlyDSL AOT cache from {installed_cache} to {workspace_cache}")
 
           print(
               f"Synced {len(kernels)} prebuilt kernels from {installed_jit} "

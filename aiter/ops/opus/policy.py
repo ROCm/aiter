@@ -30,6 +30,7 @@ from csrc.opus_gemm.opus_gemm_common import (
 )
 
 from ...jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG
+from ...jit.utils.build_targets import base_gfx_arch
 from ...jit.utils.chip_info import get_cu_num
 from ...jit.utils.chip_info import get_gfx_runtime as get_gfx
 from ..gemm_op_common import (
@@ -766,6 +767,9 @@ def lookup_mxscale_bmm_config(
     if cu_num is None:
         cu_num = get_cu_num()
     tuned = _load_mxscale_bmm_tuned(libtype, bpreshuffle)
+    # A0 bring-up: reuse gfx1250 family tuned rows when strict has none.
+    if base_gfx_arch(gfx) != gfx and gfx not in {key[0] for key in tuned}:
+        gfx = base_gfx_arch(gfx)
     row, padded_m = None, m
     for gl in (None, 0, 1):
         padded_m = m if gl is None else get_padded_m(m, n, k, gl)

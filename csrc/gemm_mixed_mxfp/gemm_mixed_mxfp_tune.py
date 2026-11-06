@@ -439,6 +439,9 @@ def benchmark_candidate_gain(
 
 
 class GemmMixedMxfpTuner(GemmCommonTuner):
+    # Same latency-only gain guard as a6w6.
+    SUPPORTS_POWER_SELECT = False
+
     ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
         **GemmCommonTuner.ARG_DEFAULTS,
         "min_gain_pct": 0.5,

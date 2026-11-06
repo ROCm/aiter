@@ -115,6 +115,39 @@ CASE_SETS = {
             "ps": [True],
         },
     ],
+    "ps_long_query_accuracy": [
+        # query_length > 4 on one KV head. The PS launch spreads the query
+        # tokens over the grid, so the query tile does not grow: (16, 1) and
+        # (64, 1) give each program one token, and (8, 1) packs two tokens
+        # into each 16-row tile.
+        {
+            "num_heads": [(8, 1), (16, 1), (64, 1)],
+            "compute_quant": [FP8, BF16],
+            "trans_v": [False],
+            "kv_varlen": [False],
+            "quant_mode": ["per_token"],
+            "block_size": [16],
+            "head_size": [128],
+            "query_length": [5, 8],
+            # Batch 16 gets several splits. These lengths put each split
+            # boundary on a 256-token partition boundary.
+            "batch_size": [16],
+            "context_length": [2048, 8192],
+            "use_sinks": [False],
+            "sliding_window": [0, 128],
+            "ps": [True],
+        },
+        # One context partition: ps=False also selects the PS kernel, and the
+        # kernel stores the output directly. Ragged lengths of at most 256
+        # tokens keep one partition. Short sequences need the kv_varlen
+        # tolerance, because the kernel rounds the probabilities to bf16.
+        {
+            "num_heads": [(8, 1), (16, 1)],
+            "kv_varlen": [True],
+            "context_length": [256],
+            "ps": [False],
+        },
+    ],
     "sliding_window_accuracy": [
         {
             "num_heads": [(64, 8), (16, 1)],
@@ -1270,6 +1303,7 @@ def test_ps_recommended_splits_match_reference(kv_heads, lengths):
     [
         "normal_accuracy",
         "ps_accuracy",
+        "ps_long_query_accuracy",
         "sliding_window_accuracy",
         "sliding_window_performance",
     ],
@@ -1280,6 +1314,65 @@ def test_multi_case_set(case_set_name):
     normal_performance runs only from the command line and from the AOT test.
     """
     run_case_set(case_set_name)
+
+
+@pytest.mark.parametrize(
+    "num_heads, ps, sliding_window, block_size, query_length",
+    [
+        # More than one KV head: the PS kernel holds every query token in one tile.
+        pytest.param((64, 8), True, 0, 16, 8, id="ps_multi_kv_head"),
+        # The non-PS kernels hold every query token in one tile.
+        pytest.param((8, 1), False, 0, 16, 8, id="non_ps"),
+        # PS hands sliding-window 1024-token blocks to the non-PS kernel.
+        pytest.param((8, 1), True, 128, 1024, 8, id="ps_sliding_window_block_1024"),
+        # One query token per program, but the group alone is 128 rows.
+        pytest.param((128, 1), True, 0, 16, 2, id="ps_one_kv_head_group_128"),
+        # Each query token sees sliding_window - query_length keys: none here.
+        pytest.param((8, 1), True, 8, 16, 8, id="ps_one_kv_head_window_8"),
+    ],
+)
+def test_unsupported_query_shape_is_rejected(
+    num_heads, ps, sliding_window, block_size, query_length
+):
+    """Reject unsupported query shapes before launch.
+
+    Kernels that hold every query token in one tile take at most 4 tokens. No
+    kernel takes a tile over 64 rows. The single-KV-head PS kernel needs a
+    sliding window that is longer than the query.
+    """
+    num_query_heads, num_kv_heads = num_heads
+    head_size = 128
+    dtype = torch.bfloat16
+    device = "cuda"
+    query = torch.randn(
+        query_length, num_query_heads, head_size, dtype=dtype, device=device
+    )
+    output = torch.empty_like(query)
+    x = 16 // query.element_size()
+    key_cache = torch.randn(
+        1, num_kv_heads, head_size // x, block_size, x, dtype=dtype, device=device
+    )
+    value_cache = torch.randn(
+        1, num_kv_heads, head_size, block_size, dtype=dtype, device=device
+    )
+    context_lengths = torch.tensor([query_length], dtype=torch.int32, device=device)
+    block_tables = torch.zeros(1, 1, dtype=torch.int32, device=device)
+
+    with pytest.raises(AssertionError, match="query"):
+        pa_decode_gluon(
+            output,
+            query,
+            key_cache,
+            value_cache,
+            context_lengths,
+            block_tables,
+            softmax_scale=head_size**-0.5,
+            query_length=query_length,
+            max_context_partition_num=2,
+            compute_type=dtype,
+            sliding_window=sliding_window,
+            ps=ps,
+        )
 
 
 if __name__ == "__main__":
@@ -1296,7 +1389,7 @@ if __name__ == "__main__":
         "-n", "--num_heads", type=dtypes.str2tuple, help="Query and KV heads: 8,1"
     )
     parser.add_argument(
-        "-q", "--query_length", type=int, choices=[1, 2, 3, 4], help="Query length"
+        "-q", "--query_length", type=int, choices=range(1, 9), help="Query length"
     )
     parser.add_argument("-c", "--context_length", type=int, help="Context length")
     parser.add_argument("-b", "--batch_size", type=int, help="Batch size")

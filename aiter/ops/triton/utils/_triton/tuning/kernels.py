@@ -23,7 +23,7 @@ torch / aiter / op_tests are imported inside the functions only.
 To add a kernel, copy the nearest function below, change its inputs and launch, and register
 it with its config family and where its gluon path exists:
 
-    @kernel("GEMM-FOO", gluon_archs=("gfx1250",), gluon_default_archs=("gfx1250",))
+    @kernel("GEMM-FOO", gluon_archs=("gfx1250", "gfx1250-strict",), gluon_default_archs=("gfx1250", "gfx1250-strict",))
     def gemm_foo(shape, backend):
         import torch
 
@@ -43,6 +43,7 @@ it with its config family and where its gluon path exists:
 """
 
 import argparse
+import math
 import os
 import sys
 from collections.abc import Callable
@@ -209,8 +210,14 @@ def add_splitk_block_size(config, K):
 @kernel(
     "BATCHED_GEMM-A16W16",
     dims=("B", "M", "N", "K"),
-    gluon_archs=("gfx1250",),
-    gluon_default_archs=("gfx1250",),
+    gluon_archs=(
+        "gfx1250",
+        "gfx1250-strict",
+    ),
+    gluon_default_archs=(
+        "gfx1250",
+        "gfx1250-strict",
+    ),
     gluon_ignored_keys=("GROUP_SIZE_M", "matrix_instr_nonkdim"),
 )
 def batched_gemm_bf16(shape, backend):
@@ -253,9 +260,64 @@ def batched_gemm_bf16(shape, backend):
 
 
 @kernel(
+    "FUSED-BF16-BMM-CAT-QUANT-PAD-MLA",
+    dims=("B", "M", "N", "K"),
+    backend_kwarg=False,
+)
+def fused_bf16_bmm_cat_quant_pad_mla(shape, backend):
+    """B: query heads per rank, N: kv_lora_rank, K: qk_nope_head_dim."""
+    import torch
+
+    from aiter.ops.triton.fusions.fused_bf16_bmm_cat_quant_pad_mla import (
+        fused_bf16_bmm_cat_quant_pad_mla as fused,
+    )
+    from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
+    from op_tests.triton_tests.fusions.test_fused_bf16_bmm_cat_quant_pad_mla import (
+        generate_inputs,
+        vllm_fp8_max,
+    )
+
+    B, M, N, K = shape["B"], shape["M"], shape["N"], shape["K"]
+    q_nope, w_uk_t, q_pe = generate_inputs(M, B, kv_lora=N, d_nope=K)
+    q_scale = torch.ones((), dtype=torch.float32, device="cuda")
+    # a multiple of 16 heads for the asm MLA decode, and of B for the wrapper
+    padded_heads = math.lcm(B, 16)
+    out = torch.empty(
+        (M, padded_heads, N + q_pe.shape[-1]),
+        dtype=get_fp8_e4m3_dtype(),
+        device="cuda",
+    )
+    fp8_max = vllm_fp8_max()
+
+    def call(config, q_nope, w_uk_t, q_pe, q_scale, out):
+        return fused(
+            q_nope,
+            w_uk_t,
+            q_pe,
+            q_scale,
+            padded_heads,
+            out=out,
+            fp8_max=fp8_max,
+            config=config,
+        )
+
+    def should_skip(config):
+        block_sizes = (config[f"BLOCK_SIZE_{d}"] for d in "MNK")
+        return min(block_sizes) < 16  # tl.dot needs 16-wide tiles
+
+    return call, (q_nope, w_uk_t, q_pe, q_scale, out), should_skip
+
+
+@kernel(
     "GEMM-A16W16",
-    gluon_archs=("gfx1250",),
-    gluon_default_archs=("gfx1250",),
+    gluon_archs=(
+        "gfx1250",
+        "gfx1250-strict",
+    ),
+    gluon_default_archs=(
+        "gfx1250",
+        "gfx1250-strict",
+    ),
     gluon_ignored_keys=("persistent",),
 )
 def gemm_a16w16(shape, backend):
@@ -296,7 +358,15 @@ def gemm_a16w16(shape, backend):
 
 
 @kernel(
-    "GEMM-A16W16-PERSISTENT", gluon_archs=("gfx1250",), gluon_default_archs=("gfx1250",)
+    "GEMM-A16W16-PERSISTENT",
+    gluon_archs=(
+        "gfx1250",
+        "gfx1250-strict",
+    ),
+    gluon_default_archs=(
+        "gfx1250",
+        "gfx1250-strict",
+    ),
 )
 def gemm_a16w16_persistent(shape, backend):
     import torch
@@ -531,8 +601,11 @@ def gemm_a8w8(shape, backend):
 @kernel(
     "GEMM-A8W8_BLOCKSCALE",
     bits=(8, 8),
-    gluon_archs=("gfx950", "gfx1250"),
-    gluon_default_archs=("gfx1250",),
+    gluon_archs=("gfx950", "gfx1250", "gfx1250-strict"),
+    gluon_default_archs=(
+        "gfx1250",
+        "gfx1250-strict",
+    ),
     gluon_candidates={
         "num_stages": [2, 3, 4, 6]
     },  # gfx950 gluon reads it as NUM_STAGES, at least 2
@@ -585,8 +658,14 @@ def gemm_a8w8_blockscale(shape, backend):
 @kernel(
     "GEMM-A8W8_BLOCKSCALE_PRESHUFFLED",
     bits=(8, 8),
-    gluon_archs=("gfx1250",),
-    gluon_default_archs=("gfx1250",),
+    gluon_archs=(
+        "gfx1250",
+        "gfx1250-strict",
+    ),
+    gluon_default_archs=(
+        "gfx1250",
+        "gfx1250-strict",
+    ),
 )
 def gemm_a8w8_blockscale_preshuffle(shape, backend):
     import torch
@@ -755,8 +834,14 @@ def mxfp4_cta_split(config):
     "GEMM-AFP4WFP4_PRESHUFFLED",
     bits=(4, 4),
     cta_split=mxfp4_cta_split,
-    gluon_archs=("gfx1250",),
-    gluon_default_archs=("gfx1250",),
+    gluon_archs=(
+        "gfx1250",
+        "gfx1250-strict",
+    ),
+    gluon_default_archs=(
+        "gfx1250",
+        "gfx1250-strict",
+    ),
     backend_kwarg=False,
     bounds=(4, 8, 16, 31, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192),
 )
@@ -816,8 +901,14 @@ def gemm_afp4wfp4_preshuffle(shape, backend):
 @kernel(
     "GEMM-AFP8WFP8_PRESHUFFLED",
     bits=(8, 8),
-    gluon_archs=("gfx1250",),
-    gluon_default_archs=("gfx1250",),
+    gluon_archs=(
+        "gfx1250",
+        "gfx1250-strict",
+    ),
+    gluon_default_archs=(
+        "gfx1250",
+        "gfx1250-strict",
+    ),
 )
 def gemm_afp8wfp8_preshuffle(shape, backend):
     import torch

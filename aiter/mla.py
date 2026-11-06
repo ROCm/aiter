@@ -290,7 +290,7 @@ def _fwd_kernel_stage2_asm(
 
 
 @functools.lru_cache
-def get_meta_param(
+def _get_num_kv_splits(
     num_kv_splits,
     bs,
     total_kv,
@@ -326,7 +326,7 @@ def get_meta_param(
         # Take the max so either path applies; for V3 callers (tg_factor=1) the
         # gfx1250 auto-rule still kicks in, and for v4 callers the explicit
         # tg_factor governs.
-        is_gfx1250 = get_gfx() == "gfx1250"
+        is_gfx1250 = get_gfx() in ("gfx1250", "gfx1250-strict")
         wg_per_split = 2 if nhead == 128 and is_gfx1250 else 1
         bs_occ = bs * max(tg_factor, wg_per_split)
         if ignore_total_kv:
@@ -379,6 +379,38 @@ def get_meta_param(
                 int(abs(total_kv / bs - max_seqlen_q) // min_block_n) + 1,
             )
 
+    return num_kv_splits
+
+
+def get_meta_param(
+    num_kv_splits,
+    bs,
+    total_kv,
+    nhead,
+    max_seqlen_q,
+    dtype,
+    tg_factor=1,
+    ignore_total_kv=0,
+):
+    """Pick the split count and build the matching uniform split indptr.
+
+    Only the split count is cached: an indptr returned from the cache is
+    captured into a CUDA graph as a bare pointer with no producing kernel, so
+    replay reads recycled storage once the entry is evicted. Eviction is
+    routine, since `total_kv` is part of the key and moves almost every decode
+    step. Rebuilding the indptr per call records `torch.arange` into the graph,
+    so every replay re-initialises the buffer.
+    """
+    num_kv_splits = _get_num_kv_splits(
+        num_kv_splits,
+        bs,
+        total_kv,
+        nhead,
+        max_seqlen_q,
+        dtype,
+        tg_factor,
+        ignore_total_kv,
+    )
     num_kv_splits_indptr = torch.arange(
         0, (bs + 1) * num_kv_splits, num_kv_splits, dtype=torch.int, device="cuda"
     )
@@ -689,7 +721,7 @@ def _mla_scale_on_device(scale, q: torch.Tensor, name: str) -> torch.Tensor:
 
 def _check_mla_qh128_inputs(q, kv, out, seq_lens, page_table, lse):
     """Validate the public contract without reading any GPU tensor contents."""
-    if get_gfx() != "gfx1250":
+    if get_gfx() not in ("gfx1250", "gfx1250-strict"):
         raise RuntimeError("kv_shuffled MLA ASM requires gfx1250")
     if not isinstance(q, torch.Tensor) or not q.is_cuda:
         raise RuntimeError("Q must be a GPU tensor")
@@ -817,7 +849,7 @@ def _mla_decode_fwd_kv_shuffled(
 
 def _check_mla_qh64_shuffled_inputs(q, kv, out, qo, indptr, indices, last, splits):
     """Check the packed CSR contract without synchronizing GPU metadata."""
-    if get_gfx() != "gfx1250":
+    if get_gfx() not in ("gfx1250", "gfx1250-strict"):
         raise RuntimeError("kv_shuffled QH64 requires gfx1250")
     if not isinstance(q, torch.Tensor) or not q.is_cuda:
         raise ValueError("Q must be a GPU tensor")
@@ -1243,6 +1275,17 @@ def mla_decode_fwd(
             and (max_seqlen_q == 1 or kv_shuffled_flag)
         ):
             mgc = 64
+        # gfx950 bf16 gqa32 kernel (qh16_m16x4_n32x1) deals SUB_KV=32 tiles to splits
+        # round-robin and skips splits without a tile, so only the first
+        # cdiv(kv, 32) splits are written. gfx942's gqa32 kernel uses 16-token tiles.
+        if (
+            nhead == 32
+            and q.dtype == dtypes.bf16
+            and kv_buffer.dtype == dtypes.bf16
+            and max_seqlen_q == 1
+            and get_gfx() == "gfx950"
+        ):
+            mgc = 32
 
         # QH64's BF16 direct-output epilogue does not write LSE. Request FP32
         # partials and merge even a single split when the caller needs LSE.
@@ -1251,7 +1294,7 @@ def mla_decode_fwd(
             and num_kv_splits == 1
             and nhead == 64
             and (max_seqlen_q == 1 or kv_shuffled_flag)
-            and get_gfx() == "gfx1250"
+            and get_gfx() in ("gfx1250", "gfx1250-strict")
             and q.dtype == dtypes.fp8
             and kv_buffer.dtype == dtypes.fp8
         )

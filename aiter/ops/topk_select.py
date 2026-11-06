@@ -77,7 +77,7 @@ from aiter.ops.topk_plain import (
 
 __all__ = ["topk_select", "topk_select_backend"]
 
-_SUPPORTED_GFX = ("gfx942", "gfx950", "gfx1250")
+_SUPPORTED_GFX = ("gfx942", "gfx950", "gfx1250", "gfx1250-strict")
 
 _PLAIN_MAX_K = 2048
 # Where plain's module builds. Its kernels are wave64 code -- for gfx1250 the
