@@ -1162,6 +1162,9 @@ def _fused_gdn_verify_chunk_mat(
     PAD_SLOT_ID: gl.constexpr,
     HAS_BIAS: gl.constexpr,
     UNROLL_HEADS: gl.constexpr = False,
+    SPLIT: gl.constexpr = 1,
+    Tickets=None,
+    TICKET_SEM: gl.constexpr = "release",
 ):
     """The verify step of _fused_gdn_verify_chunk with the window in matrix form.
 
@@ -1174,7 +1177,11 @@ def _fused_gdn_verify_chunk_mat(
 
     A thread holds a (value head, column) pair with the token matrices whole. The
     heads and the checkpoint row blocks run as loops over plain views of the LDS."""
-    gl.static_assert(VH == RATIO * KH, "VH must be RATIO * KH")
+    # SPLIT programs share a key head, RATIO value heads each (RATIO * SPLIT in
+    # the group): the q|k side runs in each, and the last to arrive writes the
+    # q|k conv window (an atomic ticket, after every program has read it).
+    gl.static_assert(VH == RATIO * KH * SPLIT, "VH must be RATIO * SPLIT * KH")
+    gl.static_assert(SPLIT == triton.next_power_of_2(SPLIT), "SPLIT: a power of 2")
     gl.static_assert(K == V, "the record tiles share one column index")
     gl.static_assert(RATIO == triton.next_power_of_2(RATIO), "RATIO: a power of 2")
     gl.static_assert(CAP >= 2 * T_MAX, "the records must hold two windows")
@@ -1185,8 +1192,9 @@ def _fused_gdn_verify_chunk_mat(
     RB: gl.constexpr = 32  # checkpoint rows per block of the flush product
     NB: gl.constexpr = K // RB
     seq_group = gl.program_id(0)
-    seq = seq_group // KH
-    group = seq_group % KH
+    seq = seq_group // (KH * SPLIT)
+    group = seq_group % (KH * SPLIT)  # of RATIO value heads
+    kgroup = group // SPLIT  # the key head
     bos = gl.load(QueryStartLoc + seq)
     tokens = gl.load(QueryStartLoc + seq + 1) - bos
     slot = gl.load(SlotIdx + seq)
@@ -1269,7 +1277,7 @@ def _fused_gdn_verify_chunk_mat(
     # Phase 1 loads: the conv operands (q|k channels, then the heads' v channels).
     conv_layout: gl.constexpr = gl.BlockedLayout([1], [32], [NW], [0])
     cq = gl.arange(0, 2 * K, layout=conv_layout)
-    qk_channel = gl.where(cq < K, group * K + cq, KH * K + group * K + cq - K)
+    qk_channel = gl.where(cq < K, kgroup * K + cq, KH * K + kgroup * K + cq - K)
     cv = gl.arange(0, RATIO * V, layout=conv_layout)
     v_channel = 2 * KH * K + group * RATIO * V + cv
     qk_ops = _conv_operands(
@@ -1428,6 +1436,21 @@ def _fused_gdn_verify_chunk_mat(
         False,
         True,
     )
+    if SPLIT > 1:
+        # Every lane has used its conv inputs (the window is in LDS): one ticket
+        # per (conv slot, key head), the resource it guards. The owner's store
+        # depends on the returned ticket, so it follows every program's reads.
+        gl.barrier()
+        lane = gl.arange(0, 32 * NW, layout=conv_layout)
+        ticket = gl.atomic_add(
+            Tickets + conv_slot * KH + kgroup + lane * 0,
+            gl.full([32 * NW], 1, gl.int32, layout=conv_layout),
+            mask=(lane == 0) & valid,
+            sem=TICKET_SEM,
+            scope="gpu",
+        )
+        ticket = gl.max(gl.where(lane == 0, ticket, 0), 0)
+        qk_owner = (ticket & (SPLIT - 1)) == SPLIT - 1
     norm_layout: gl.constexpr = _row_layout(T_P2, NW)
     conv_rows = conv_qk.reinterpret(gl.bfloat16, [T_P2, 2 * K], rows_shared)
     q_rows = conv_rows.slice(0, K, dim=1).load(norm_layout).to(gl.float32)
@@ -1607,7 +1630,16 @@ def _fused_gdn_verify_chunk_mat(
             layout=rows_shared,
         )
         gl.amd.gfx1250.tdm.async_store(k_desc, [0, 0], keys_lds)
-    _conv_state_store(qk_ops, T_MAX, valid, tokens, conv_width_stride)
+    if SPLIT > 1:
+        _conv_state_store(
+            qk_ops,
+            T_MAX,
+            valid & qk_owner,
+            gl.where(qk_owner, tokens, 0),
+            conv_width_stride,
+        )
+    else:
+        _conv_state_store(qk_ops, T_MAX, valid, tokens, conv_width_stride)
     _conv_state_store(v_ops, T_MAX, valid, tokens, conv_width_stride)
     gl.store(
         RecordG

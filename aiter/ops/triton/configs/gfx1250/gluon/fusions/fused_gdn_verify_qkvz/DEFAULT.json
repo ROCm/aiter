@@ -3,6 +3,8 @@
         "num_warps": 16,
         "KL": 16,
         "KS": 8,
-        "chunk_num_warps": 4
+        "chunk_num_warps": 4,
+        "split_num_warps": 4,
+        "split_max_seqs": 8
     }
 }

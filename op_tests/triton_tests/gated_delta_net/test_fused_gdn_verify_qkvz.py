@@ -25,18 +25,28 @@ SHAPES = [(4, 8), (16, 32), (8, 8), (4, 12), (4, 16)]
 
 @pytest.fixture(
     autouse=True,
-    params=["chunk", "matrix", "matrix_8_waves", "matrix_8_waves_unroll"],
+    params=[
+        "chunk",
+        "matrix",
+        "matrix_8_waves",
+        "matrix_8_waves_unroll",
+        "matrix_8_waves_split",
+    ],
 )
 def kernel_variant(request, monkeypatch):
     """Each test runs on the chunk kernel and on its matrix form (the
     AITER_GDN_VERIFY_MATRIX experiment), at the config's waves and at 8 waves, and
-    on the matrix form with its head products unrolled (AITER_GDN_VERIFY_UNROLL)."""
+    on the matrix form with its head products unrolled (AITER_GDN_VERIFY_UNROLL)
+    and with the value heads of a key head over two programs
+    (AITER_GDN_VERIFY_SPLIT=2)."""
     if request.param != "chunk":
         monkeypatch.setenv("AITER_GDN_VERIFY_MATRIX", "1")
     if request.param.startswith("matrix_8_waves"):
         monkeypatch.setenv("AITER_GDN_VERIFY_CHUNK_WARPS", "8")
     if request.param.endswith("_unroll"):
         monkeypatch.setenv("AITER_GDN_VERIFY_UNROLL", "1")
+    if request.param.endswith("_split"):
+        monkeypatch.setenv("AITER_GDN_VERIFY_SPLIT", "2")
     return request.param
 
 

@@ -64,6 +64,30 @@ def _chunk_kernel_fits(head_k_dim, head_v_dim, ratio, max_query_len, cap, num_wa
     )
 
 
+# The split form's tickets, one int32 counter per (conv slot, key head) for each
+# split, never reset: each call adds SPLIT to the counters of its live sequences,
+# so ticket % SPLIT == SPLIT - 1 marks the last program of the group to arrive.
+_TICKETS: dict = {}
+_TICKET_COUNT = 1 << 16
+
+
+def _split_tickets(count, split, device):
+    """The ticket counters, or None when they cannot be made (in a graph capture)."""
+    if count > _TICKET_COUNT:
+        return None
+    tickets = _TICKETS.get((device, split))
+    if tickets is None:
+        if torch.cuda.is_current_stream_capturing():
+            # Not in a graph's pool: the counters must outlive every graph.
+            _LOGGER.info(
+                "FUSED_GDN_VERIFY_QKVZ: split form skipped, first call in a capture"
+            )
+            return None
+        tickets = torch.zeros(_TICKET_COUNT, dtype=torch.int32, device=device)
+        _TICKETS[(device, split)] = tickets
+    return tickets
+
+
 def fused_gdn_verify_qkvz(
     projected_qkvz: torch.Tensor,
     projected_ba: torch.Tensor,
@@ -215,6 +239,7 @@ def fused_gdn_verify_qkvz(
     num_warps, kl, ks = config["num_warps"], config["KL"], config["KS"]
     # The chunk-form kernel where it fits, else the token-loop kernel.
     kernel, tile_args = _fused_gdn_verify, {"KL": kl, "KS": ks}
+    grid_split = 1
     # AITER_GDN_VERIFY_CHUNK_WARPS overrides the chunk kernel's waves,
     # AITER_GDN_VERIFY_COMPACT=1 selects its compact form and
     # AITER_GDN_VERIFY_MATRIX=1 its matrix form (experiments, off by default).
@@ -237,6 +262,28 @@ def fused_gdn_verify_qkvz(
             and os.environ.get("AITER_GDN_VERIFY_UNROLL", "0") == "1"
         ):
             tile_args = {"UNROLL_HEADS": True}
+        # AITER_GDN_VERIFY_SPLIT=2: the matrix form with the value heads of a key
+        # head over that many programs, at up to the config's split_max_seqs
+        # sequences and with its split_num_warps waves (an experiment, off by
+        # default). The q|k side runs in each program of the group.
+        split = int(os.environ.get("AITER_GDN_VERIFY_SPLIT", "1"))
+        split_warps = config.get("split_num_warps", num_warps)
+        if (
+            kernel is _fused_gdn_verify_chunk_mat
+            and split > 1
+            and ratio % split == 0
+            and split & (split - 1) == 0
+            and seqs <= config.get("split_max_seqs", 0)
+            and _chunk_kernel_fits(
+                head_k_dim, head_v_dim, ratio // split, max_query_len, cap, split_warps
+            )
+        ):
+            tickets = _split_tickets(
+                conv_state.shape[0] * k_heads, split, checkpoint.device
+            )
+            if tickets is not None:
+                tile_args = {**tile_args, "SPLIT": split, "Tickets": tickets}
+                grid_split, num_warps = split, split_warps
     if out_fp8:
         assert (
             kernel is _fused_gdn_verify_chunk
@@ -246,7 +293,7 @@ def fused_gdn_verify_qkvz(
             "OutScale": out_scale.view(torch.uint8),
             "out_rows": scale_rows,
         }
-    kernel[(seqs * k_heads,)](
+    kernel[(seqs * k_heads * grid_split,)](
         query_start_loc,
         slot_idx,
         conv_state_indices,
@@ -288,7 +335,7 @@ def fused_gdn_verify_qkvz(
         VH=v_heads,
         K=head_k_dim,
         V=head_v_dim,
-        RATIO=ratio,
+        RATIO=ratio // grid_split,
         T_MAX=max_query_len,
         CAP=cap,
         NW=num_warps,
