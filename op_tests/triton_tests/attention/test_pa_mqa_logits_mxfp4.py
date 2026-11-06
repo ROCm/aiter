@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+import os
+
 import pytest
 import torch
 
@@ -12,12 +14,25 @@ from aiter.ops.triton.attention.pa_mqa_logits_mxfp4 import (
     paged_mxfp4_mqa_logits,
 )
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.config_utils import resolve_config_dir
 from op_tests.triton_tests.utils.pa_mqa_logits_mxfp4_ref import preshuffle_cache
 
-pytestmark = pytest.mark.skipif(
-    not (arch_info.is_cdna4() or arch_info.is_sw_emulated_fp4_avail()),
-    reason="paged MXFP4 MQA logits needs MXFP4 support",
-)
+pytestmark = [
+    pytest.mark.skipif(
+        not (arch_info.is_cdna4() or arch_info.is_sw_emulated_fp4_avail()),
+        reason="paged MXFP4 MQA logits needs MXFP4 support",
+    ),
+    # Software-emulated FP4 archs run the Triton kernel only where it has a config.
+    pytest.mark.skipif(
+        arch_info.is_sw_emulated_fp4_avail()
+        and not os.path.exists(
+            os.path.join(
+                resolve_config_dir("attention", "PA-MQA-LOGITS-MXFP4"), "DEFAULT.json"
+            )
+        ),
+        reason=f"no PA-MQA-LOGITS-MXFP4 config for {arch_info.get_arch()}",
+    ),
+]
 # Elsewhere the Triton kernel runs: dense logits over a token-major cache
 GLUON = arch_info.is_cdna4()
 gluon_only = pytest.mark.skipif(
@@ -545,6 +560,76 @@ def test_addressing(gib, preshuffle):
         pytest.skip("out of memory")
     assert diff <= TOL, f"residual {diff:.3e} at {real:.1f} GiB"
     assert inf_ok, "the -inf pattern does not match the reference"
+
+
+triton_only = pytest.mark.skipif(GLUON, reason="checks the Triton kernel")
+
+
+@triton_only
+def test_q_far_batches():
+    """q offsets past 2**31 elements must not wrap: with a 2**30 batch stride
+    the third batch starts at element 2**31."""
+    free, _ = torch.cuda.mem_get_info()
+    if free < 4 * 2**30:
+        pytest.skip("needs about 4 GiB free")
+    torch.manual_seed(0)
+    batch, stride_b = 3, 2**30
+    st = _make_case(batch, 1, 32, 128, [256, 512, 384], 64)
+    q4 = st["q4"]
+    pool = torch.zeros(
+        (batch - 1) * stride_b + q4[0].numel(), dtype=torch.uint8, device="cuda"
+    )
+    far = pool.as_strided(q4.shape, (stride_b,) + q4.stride()[1:])
+    far.copy_(q4)
+    args = (st["q4s"], st["cache"], st["weights"], st["cl"], st["block_table"])
+    want = paged_mxfp4_mqa_logits(q4, *args, st["mml"], preshuffle=0)
+    got = paged_mxfp4_mqa_logits(far, *args, st["mml"], preshuffle=0)
+    torch.cuda.synchronize()
+    assert torch.equal(got, want), "a far batch of q read the wrong bytes"
+
+
+@triton_only
+def test_context_past_max_model_len():
+    """A context longer than max_model_len writes only the row's columns."""
+    torch.manual_seed(0)
+    mml, sentinel = 32, 7.0
+    st = _make_case(1, 1, 32, 128, [2 * mml], mml)
+    wide = torch.full((1, 4 * mml), sentinel, dtype=torch.float32, device="cuda")
+    paged_mxfp4_mqa_logits(
+        st["q4"],
+        st["q4s"],
+        st["cache"],
+        st["weights"],
+        st["cl"],
+        st["block_table"],
+        mml,
+        out_logits=wide[:, :mml],
+        preshuffle=0,
+    )
+    torch.cuda.synchronize()
+    assert bool((wide[:, mml:] == sentinel).all()), "wrote past max_model_len"
+
+
+@triton_only
+def test_triton_rejects_before_allocating():
+    """An unsupported launch raises before it allocates a logits tensor."""
+    torch.manual_seed(0)
+    st = _make_case(1, 1, 32, 128, [64], 64)
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    before = torch.cuda.max_memory_allocated()
+    with pytest.raises(NotImplementedError):
+        paged_mxfp4_mqa_logits(
+            st["q4"],
+            st["q4s"],
+            st["cache"],
+            st["weights"],
+            st["cl"],
+            st["block_table"],
+            1 << 22,  # a 16 MiB logits row
+            preshuffle=1,
+        )
+    assert torch.cuda.max_memory_allocated() - before < 1 << 20
 
 
 # block maxima

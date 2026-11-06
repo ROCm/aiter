@@ -33,6 +33,7 @@ def _pa_mqa_logits_mxfp4_kernel(
     block_table_ptr,
     logits_ptr,
     next_n,
+    max_model_len,
     stride_q_b,
     stride_q_n,
     stride_qs_b,
@@ -48,13 +49,20 @@ def _pa_mqa_logits_mxfp4_kernel(
     BLOCK_KV: tl.constexpr,
     HAS_ROW_ENDS: tl.constexpr,
 ):
-    # One program per (query row, KV tile), all heads at once
-    row = tl.program_id(0)
+    # One program per (query row, KV tile), all heads at once. The row is
+    # int64 so the batch, token and row offsets below cannot wrap.
+    row = tl.program_id(0).to(tl.int64)
     pid_kv = tl.program_id(1)
     pid_b = row // next_n
     pid_n = row % next_n
 
     context_length = tl.load(context_lens_ptr + pid_b)
+    # A logits row has max_model_len columns. A longer context must not
+    # read the block table or write past the row.
+    n_cols = tl.minimum(context_length, max_model_len)
+    # A tile past the context writes nothing, so it skips the loads and dot.
+    if pid_kv * BLOCK_KV >= n_cols:
+        return
     if HAS_ROW_ENDS:
         row_end = tl.minimum(tl.load(row_ends_ptr + row), context_length)
     else:
@@ -80,7 +88,7 @@ def _pa_mqa_logits_mxfp4_kernel(
     scale_weight = tl.load(weights_ptr + row * stride_w_s + offs_h)
 
     offs_kv = pid_kv * BLOCK_KV + tl.arange(0, BLOCK_KV)
-    mask_kv = offs_kv < context_length
+    mask_kv = offs_kv < n_cols
     page = tl.load(
         block_table_ptr + pid_b * stride_blk_b + offs_kv // PAGE_SIZE,
         mask=mask_kv,
@@ -112,7 +120,7 @@ def _pa_mqa_logits_mxfp4_kernel(
     logits = tl.sum(o, axis=0)
     logits = tl.where(offs_kv < row_end, logits, float("-inf"))
     tl.store(
-        logits_ptr + row.to(tl.int64) * stride_logits_s + offs_kv,
+        logits_ptr + row * stride_logits_s + offs_kv,
         logits,
         mask=mask_kv,
     )

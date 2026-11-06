@@ -18,6 +18,7 @@ from aiter.ops.triton._triton_kernels.attention.pa_mqa_logits_mxfp4 import (
     _pa_mqa_logits_mxfp4_kernel as _pa_mqa_logits_mxfp4_triton_kernel,
 )
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
 from aiter.ops.triton.utils.device_info import get_num_sms
 
 SCALE_GROUP = 32
@@ -48,8 +49,14 @@ SCALE_MODE_WIDE = 1
 # DeepSeek-V4.1's two-level indexer groups the context in 8-token candidate
 # blocks, default
 CANDIDATE_BLOCK = 8
-# KV tile of the Triton kernel
-TRITON_BLOCK_KV = 64
+
+
+def _triton_config() -> dict:
+    """Launch parameters of the Triton kernel on this arch: BLOCK_KV, the KV
+    tile, and any compiler options. Archs without a DEFAULT.json are not
+    tuned for it yet, and the load raises FileNotFoundError."""
+    cfg_dir = resolve_config_dir("attention", "PA-MQA-LOGITS-MXFP4", backend="triton")
+    return load_config_json(f"{cfg_dir}/DEFAULT.json")
 
 
 def mfma_nonk_dim(num_heads: int, head_size: int) -> int:
@@ -621,6 +628,23 @@ def paged_mxfp4_mqa_logits(
         calc_block_scores or block_scores is None
     ), "block_scores is inapplicable with calc_block_scores off"
 
+    # Reject what the Triton kernel cannot do before any output is allocated
+    if not use_gluon:
+        unsupported = {
+            "preshuffle": preshuffle,
+            "varlen (query_start_loc)": varlen,
+            "use_gather": use_gather or candidates is not None,
+            "schedule": schedule is not None,
+            "block scores": calc_block_scores or block_scores is not None,
+        }
+        named = [name for name, on in unsupported.items() if on]
+        if named:
+            raise NotImplementedError(
+                f"the Triton kernel for {arch_info.get_arch()} computes dense logits "
+                f"over a token-major cache; not supported: {', '.join(named)}"
+            )
+        assert num_heads >= 16, "tl.dot_scaled needs at least 16 heads"
+
     def _alloc(cols):
         # clean_logits picks the fill for both outputs: the walk leaves the
         # columns past the context untouched either way.
@@ -644,24 +668,11 @@ def paged_mxfp4_mqa_logits(
         ), f"max_model_len {max_model_len} exceeds what a buffer store can address"
 
     if not use_gluon:
-        unsupported = {
-            "preshuffle": preshuffle,
-            "varlen (query_start_loc)": varlen,
-            "use_gather": use_gather or candidates is not None,
-            "schedule": schedule is not None,
-            "block scores": calc_block_scores or block_scores is not None,
-        }
-        named = [name for name, on in unsupported.items() if on]
-        if named:
-            raise NotImplementedError(
-                f"the Triton kernel for {arch_info.get_arch()} computes dense logits "
-                f"over a token-major cache; not supported: {', '.join(named)}"
-            )
-        assert num_heads >= 16, "tl.dot_scaled needs at least 16 heads"
         assert logits.stride(1) == 1, "logits rows must be contiguous"
+        config = _triton_config()
         # dynamic only balances the Gluon kernel's work across sequences; this
         # grid has one program per row and KV tile, so it is ignored.
-        grid = (total_rows, triton.cdiv(max_model_len, TRITON_BLOCK_KV))
+        grid = (total_rows, triton.cdiv(max_model_len, config["BLOCK_KV"]))
         _pa_mqa_logits_mxfp4_triton_kernel[grid](
             q,
             q_scales,
@@ -673,6 +684,7 @@ def paged_mxfp4_mqa_logits(
             block_table,
             logits,
             next_n,
+            max_model_len,
             q.stride(0),
             q.stride(1),
             q_scales.stride(0),
@@ -685,8 +697,8 @@ def paged_mxfp4_mqa_logits(
             NUM_HEADS=num_heads,
             HEAD_SIZE=head_size,
             PAGE_SIZE=page_size,
-            BLOCK_KV=TRITON_BLOCK_KV,
             HAS_ROW_ENDS=row_ends is not None,
+            **config,
         )
         return logits
 
