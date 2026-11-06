@@ -185,18 +185,19 @@ def prepare(
     slotted = inputs.kv_slots is not None
     pack_bytes = int(blocks.sum()) * 4 * hk * 1024
     # Pack while PK+PV fit the budget, or while the context has at most pack_tokens_per_row
-    # tokens per query row. PK/PV, and without a slot table all of K/V, take unsigned 32-bit
-    # byte offsets in the pack kernel (a slot table gives each source block a 64-bit base).
-    addressed = int(blocks.sum()) * 4
+    # tokens per query row. PK/PV, and without a slot table all of K/V (rows kv_stride
+    # elements apart), take unsigned 32-bit byte offsets in the pack kernel (a slot table
+    # gives each source block a 64-bit base).
+    addressed = int(blocks.sum()) * 4 * hk * 512
     if not slotted:
-        addressed = max(addressed, int(lengths.sum()))
+        addressed = max(addressed, int(lengths.sum()) * inputs.kv_stride * 2)
     packed = (
         pack_bytes <= config.max_packed_kv_bytes
         or (
             int(blocks.sum()) * 4 <= config.pack_tokens_per_row * int(q_lens.sum())
             and pack_bytes <= MAX_ROW_PACKED_KV_BYTES
         )
-    ) and addressed * hk * 512 < 2**32
+    ) and addressed < 2**32
     waves = 1 if packed else 4
     k_starts, p_starts = np.cumsum(lengths) - lengths, np.cumsum(blocks) - blocks
     counts = -(-q_lens // waves)
@@ -268,27 +269,36 @@ def _source_token(cached_blocks, n, visible, tail_start, topk):
     return token, n < width
 
 
-def _source_offset(cached_blocks, n, visible, extent, hk, topk, tail_start):
+def _source_offset(cached_blocks, n, visible, extent, row_bytes, topk, tail_start):
     token, valid = _source_token(cached_blocks, n, visible, tail_start, topk)
-    return valid.select(fx.Uint32(token) * (hk * 256 * 2), extent)
+    return valid.select(fx.Uint32(token) * row_bytes, extent)
 
 
-def _source_row(cached_blocks, n, visible, fallback, hk, topk, tail_start):
+def _source_row(cached_blocks, n, visible, fallback, row_bytes, topk, tail_start):
     # Global loads have no range check: positions past the selection read the request's
     # first row (K masked, V weighted 0) instead of an out-of-range offset.
     token, valid = _source_token(cached_blocks, n, visible, tail_start, topk)
     return valid.select(token, fx.Int32(fallback))
 
 
-def _kv_resources(K, V, k0, kv_len, nk, hkv, hk, slotted):
+def _kv_resources(K, V, k0, kv_len, nk, hkv, hk, slotted, stride):
     """(K, V buffers, byte extent) over the request in packed K/V, or the whole slot-table
-    pool (whose span the host keeps within unsigned 32-bit offsets)."""
+    pool (whose span the host keeps within unsigned 32-bit offsets). K/V rows sit stride
+    elements apart: hk * 256 values, then a gap of padding."""
+    rows, gap = nk if slotted else kv_len, stride - hk * 256
     first = fx.Int64(0) if slotted else fx.Int64(k0) * hk
-    extent = (fx.Uint32(nk if slotted else kv_len) * hk - hkv) * 512
+    extent = (fx.Uint32(rows) * hk - hkv) * 512
+    if gap:
+        extent = extent + fx.Uint32(rows - 1) * (gap * 2)
     layout = fx.make_layout(extent // 2, 1)
-    kr = _buffer(fx.make_view(fx.get_iter(K) + (first + hkv) * 256, layout), extent)
-    vr = _buffer(fx.make_view(fx.get_iter(V) + (first + hkv) * 256, layout), extent)
-    return kr, vr, extent
+
+    def resource(tensor):
+        pointer = fx.get_iter(tensor) + (first + hkv) * 256
+        if gap and not slotted:
+            pointer = pointer + fx.Int64(k0) * gap
+        return _buffer(fx.make_view(pointer, layout), extent)
+
+    return resource(K), resource(V), extent
 
 
 def _pool_bases(K, V, hkv):
@@ -303,7 +313,17 @@ def _pool_bases(K, V, hkv):
 
 
 def _load_v_global(
-    resource, source_base, tile, segment, half, lane, visible, extent, hk, bn, topk
+    resource,
+    source_base,
+    tile,
+    segment,
+    half,
+    lane,
+    visible,
+    extent,
+    row_bytes,
+    bn,
+    topk,
 ):
     first = tile * bn + segment * 16 + (lane >> 4) * 4
     complete = _min(visible >> 2, fx.Int32(topk))
@@ -311,13 +331,13 @@ def _load_v_global(
     base = fx.Uint32(source_base) + (lane & 15) * 16 + half * 256
     parts = []
     for r in range(4):
-        offset = (first + r < width).select(base + r * (hk * 256 * 2), extent)
+        offset = (first + r < width).select(base + r * row_bytes, extent)
         parts.append(_buffer_words(resource, offset))
     return fx.Vector.from_elements([p[i] for p in parts for i in range(4)], fx.Int32)
 
 
 def _load_v_rows(
-    base, source_row, tile, segment, half, lane, visible, fallback, hk, bn, topk
+    base, source_row, tile, segment, half, lane, visible, fallback, row_bytes, bn, topk
 ):
     first = tile * bn + segment * 16 + (lane >> 4) * 4
     complete = _min(visible >> 2, fx.Int32(topk))
@@ -326,7 +346,7 @@ def _load_v_rows(
     parts = []
     for r in range(4):
         row = (first + r < width).select(source_row + r, fx.Int32(fallback))
-        parts.append(_global_words(base + fx.Int64(row) * (hk * 512) + lane_bytes))
+        parts.append(_global_words(base + fx.Int64(row) * row_bytes + lane_bytes))
     return fx.Vector.from_elements([p[i] for p in parts for i in range(4)], fx.Int32)
 
 
@@ -354,9 +374,12 @@ def _body(
     TOPK: fx.Constexpr[int],
     SLOTTED: fx.Constexpr[bool],
     WIDE: fx.Constexpr[bool],
+    KV_STRIDE: fx.Constexpr[int],
 ):
     load, qk, pv = _load, _qk_pair, _pv
-    load_key = functools.partial(_wide_key, row_bytes=HK * 512) if WIDE else _load_key
+    # K/V rows sit KV_STRIDE elements apart (HK * 256 when dense).
+    row_bytes = KV_STRIDE * 2
+    load_key = functools.partial(_wide_key, row_bytes=row_bytes) if WIDE else _load_key
     source_offset, load_v, output_fn, enabled = (
         _source_row if WIDE else _source_offset,
         _load_v_rows if WIDE else _load_v_global,
@@ -392,7 +415,9 @@ def _body(
     if fx.const_expr(WIDE):
         kr, vr, invalid = _pool_bases(K, V, hkv)
     else:
-        kr, vr, invalid = _kv_resources(K, V, k0, kv_len, NK, hkv, HK, SLOTTED)
+        kr, vr, invalid = _kv_resources(
+            K, V, k0, kv_len, NK, hkv, HK, SLOTTED, KV_STRIDE
+        )
     row = _min(first + wave, fx.Int32(NQ - 1))
     blocks = rocdl.make_buffer_tensor(BLOCKS)
     maximum, total = fx.Float32(_MAX_FLOOR), fx.Float32(0.0)
@@ -428,7 +453,7 @@ def _body(
             _lds_store(table + (chunk + 1) * 256, pools[chunk + 1] >> 2)
         cached_blocks, tail_start = pools[0] >> 2, pool_tail
     initial = source_offset(
-        cached_blocks, lane >> 2, visible, invalid, HK, TOPK, tail_start
+        cached_blocks, lane >> 2, visible, invalid, row_bytes, TOPK, tail_start
     )
     initial = valid_wave.select(initial, invalid)
     kval = load_key(kr, initial, lane)
@@ -438,7 +463,7 @@ def _body(
         _min(fx.Int32(16), (((count + 15) >> 4) - 1) * 16) + (lane >> 2),
         visible,
         invalid,
-        HK,
+        row_bytes,
         TOPK,
         tail_start,
     )
@@ -465,8 +490,12 @@ def _body(
             )
         rocdl.s_waitcnt(lgkmcnt=0)
         rocdl.sched_barrier(0)
-        values0 = load_v(vr, v_rows[0], t, 0, 0, lane, visible, invalid, HK, BN, TOPK)
-        values1 = load_v(vr, v_rows[0], t, 0, 1, lane, visible, invalid, HK, BN, TOPK)
+        values0 = load_v(
+            vr, v_rows[0], t, 0, 0, lane, visible, invalid, row_bytes, BN, TOPK
+        )
+        values1 = load_v(
+            vr, v_rows[0], t, 0, 1, lane, visible, invalid, row_bytes, BN, TOPK
+        )
         if fx.const_expr(SLOTTED):
             if ((t + 1) & 7) == 0:
                 chunk = _min((t + 1) >> 3, fx.Int32(TOPK // 64 - 1))
@@ -521,7 +550,7 @@ def _body(
             following + (lane >> 2),
             visible,
             invalid,
-            HK,
+            row_bytes,
             TOPK,
             tail_start,
         )
@@ -530,7 +559,7 @@ def _body(
             following1 + (lane >> 2),
             visible,
             invalid,
-            HK,
+            row_bytes,
             TOPK,
             tail_start,
         )
@@ -543,10 +572,10 @@ def _body(
             )
         ).bitcast(fx.Int16)
         next_values0 = load_v(
-            vr, v_rows[1], t, 1, 0, lane, visible, invalid, HK, BN, TOPK
+            vr, v_rows[1], t, 1, 0, lane, visible, invalid, row_bytes, BN, TOPK
         )
         next_values1 = load_v(
-            vr, v_rows[1], t, 1, 1, lane, visible, invalid, HK, BN, TOPK
+            vr, v_rows[1], t, 1, 1, lane, visible, invalid, row_bytes, BN, TOPK
         )
         rocdl.sched_barrier(0)
         o0 = pv(p0, values0, o0, fx.Float32(1.0))
@@ -617,6 +646,7 @@ def _kernel(
     TOPK: fx.Constexpr[int],
     SLOTTED: fx.Constexpr[bool],
     WIDE: fx.Constexpr[bool],
+    KV_STRIDE: fx.Constexpr[int],
 ):
     body = _body
     if fx.const_expr(GATED):
@@ -648,6 +678,7 @@ def _kernel(
                 TOPK,
                 SLOTTED,
                 WIDE,
+                KV_STRIDE,
             )
     else:
         body(
@@ -673,6 +704,7 @@ def _kernel(
             TOPK,
             SLOTTED,
             WIDE,
+            KV_STRIDE,
         )
 
 
@@ -701,6 +733,7 @@ def _launch(
     TOPK: fx.Constexpr[int],
     SLOTTED: fx.Constexpr[bool],
     WIDE: fx.Constexpr[bool],
+    KV_STRIDE: fx.Constexpr[int],
     stream: fx.Stream,
 ):
     if TASKS > 0:
@@ -728,6 +761,7 @@ def _launch(
             TOPK,
             SLOTTED,
             WIDE,
+            KV_STRIDE,
             value_attrs={"llvm.target_features": _target_features()},
         ).launch(grid=(TASKS, 1, 1), block=(THREADS, 1, 1), stream=stream)
 
@@ -770,6 +804,7 @@ def _bound(inputs, prepared, out, stream):
         inputs.topk,
         prepared.slotted,
         prepared.wide,
+        inputs.kv_stride,
         stream,
     )
     key = (
@@ -780,6 +815,7 @@ def _bound(inputs, prepared, out, stream):
         inputs.scale,
         inputs.topk,
         prepared.slotted,
+        inputs.kv_stride,
     )
     compiled = _COMPILED.get((*key, prepared.wide))
     if compiled is None:

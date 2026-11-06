@@ -124,6 +124,7 @@ def _pack_block(
     lane,
     packed,
     hk,
+    stride,
     source_extent,
     extent,
     slots,
@@ -134,22 +135,28 @@ def _pack_block(
     start = fx.Int32(sources[_min(block, packed - 1)])
     token, chunk = lane >> 4, lane & 15
     dim = half * 128 + chunk * 8
+    # K/V rows sit stride elements apart: hk * 256 values, then a gap of padding.
+    row_bytes, gap = stride * 2, stride - hk * 256
     if slotted:
         # A wave packs one block, four consecutive pool rows from the slot table's first:
         # give it its own 64-bit base, so the pool may exceed 4 GiB. kr/vr are the pool
         # addresses here.
         row = _uniform(fx.Int32(slots[_uniform(start)]))
         base = (fx.Int64(row) * hk + _uniform(head)) * 512
-        kr = _buffer_at(kr + base, 4 * hk * 512)
-        vr = _buffer_at(vr + base, 4 * hk * 512)
-        source = valid.select(
-            fx.Uint32(token * hk * 512 + dim * 2), fx.Uint32(4 * hk * 512)
-        )
+        if gap:
+            base = base + fx.Int64(row) * (gap * 2)
+        kr = _buffer_at(kr + base, 4 * row_bytes)
+        vr = _buffer_at(vr + base, 4 * row_bytes)
+        offset = token * hk * 512 + dim * 2
+        if gap:
+            offset = offset + token * (gap * 2)
+        source = valid.select(fx.Uint32(offset), fx.Uint32(4 * row_bytes))
     else:
         # Tokens past a request's end are masked by the direct kernel.
-        source = valid.select(
-            fx.Uint32((start + token) * hk + head) * 512 + dim * 2, source_extent
-        )
+        offset = fx.Uint32((start + token) * hk + head) * 512 + dim * 2
+        if gap:
+            offset = offset + fx.Uint32(start + token) * (gap * 2)
+        source = valid.select(offset, source_extent)
     key = _buffer_words(kr, source)
     target = (
         fx.Uint32(
@@ -198,11 +205,14 @@ def _pack_block(
 
 
 @flyc.jit
-def _pack_body(K, V, PK, PV, SOURCES, SLOTS, N, PACKED, HK, SLOTTED):
+def _pack_body(K, V, PK, PV, SOURCES, SLOTS, N, PACKED, HK, SLOTTED, KV_STRIDE):
     tid = fx.thread_idx.x
     lane, half = tid & 63, (tid >> 6) & 1
     first = fx.block_idx.x * 8 + (tid >> 7)
+    # K/V rows sit KV_STRIDE elements apart: HK * 256 values, then a gap of padding.
     source_extent = fx.Uint32(N) * HK * 512
+    if fx.const_expr(KV_STRIDE != HK * 256):
+        source_extent = source_extent + fx.Uint32(N - 1) * ((KV_STRIDE - HK * 256) * 2)
     extent = fx.Uint32(PACKED) * 4 * HK * 512
     if fx.const_expr(SLOTTED):
         kr = fx.Int64(fx.ptrtoint(fx.get_iter(K)))
@@ -223,6 +233,7 @@ def _pack_body(K, V, PK, PV, SOURCES, SLOTS, N, PACKED, HK, SLOTTED):
             lane,
             PACKED,
             HK,
+            KV_STRIDE,
             source_extent,
             extent,
             slots,
@@ -242,8 +253,9 @@ def _pack(
     PACKED: fx.Int32,
     HK: fx.Constexpr[int],
     SLOTTED: fx.Constexpr[bool],
+    KV_STRIDE: fx.Constexpr[int],
 ):
-    _pack_body(K, V, PK, PV, SOURCES, SLOTS, N, PACKED, HK, SLOTTED)
+    _pack_body(K, V, PK, PV, SOURCES, SLOTS, N, PACKED, HK, SLOTTED, KV_STRIDE)
 
 
 @flyc.kernel(name="sparse_prefill_pack_kv_gated_bf16_d256")
@@ -259,9 +271,10 @@ def _pack_gated(
     PACKED: fx.Int32,
     HK: fx.Constexpr[int],
     SLOTTED: fx.Constexpr[bool],
+    KV_STRIDE: fx.Constexpr[int],
 ):
     if _uniform(DIRECT_FLAG[0]) != 0:
-        _pack_body(K, V, PK, PV, SOURCES, SLOTS, N, PACKED, HK, SLOTTED)
+        _pack_body(K, V, PK, PV, SOURCES, SLOTS, N, PACKED, HK, SLOTTED, KV_STRIDE)
 
 
 def _key_offset(cached, n, visible, extent, hk, topk):
@@ -830,17 +843,31 @@ def _launch(
     TOPK: fx.Constexpr[int],
     SLOTTED: fx.Constexpr[bool],
     GFX950: fx.Constexpr[bool],
+    KV_STRIDE: fx.Constexpr[int],
     stream: fx.Stream,
 ):
     if TASKS > 0:
         if fx.const_expr(GATED):
             _pack_gated(
-                K, V, PK, PV, SOURCES, SLOTS, DIRECT_FLAG, NK, PACKED, HK, SLOTTED
+                K,
+                V,
+                PK,
+                PV,
+                SOURCES,
+                SLOTS,
+                DIRECT_FLAG,
+                NK,
+                PACKED,
+                HK,
+                SLOTTED,
+                KV_STRIDE,
             ).launch(
                 grid=((PACKED * HK + 7) // 8, 1, 1), block=(256, 1, 1), stream=stream
             )
         else:
-            _pack(K, V, PK, PV, SOURCES, SLOTS, NK, PACKED, HK, SLOTTED).launch(
+            _pack(
+                K, V, PK, PV, SOURCES, SLOTS, NK, PACKED, HK, SLOTTED, KV_STRIDE
+            ).launch(
                 grid=((PACKED * HK + 7) // 8, 1, 1), block=(256, 1, 1), stream=stream
             )
         kernel = _kernel(
@@ -905,6 +932,7 @@ def launch_args(inputs, prepared, out, tasks, stream):
         inputs.topk,
         prepared.slotted,
         gfx950(),
+        inputs.kv_stride,
         stream,
     )
 

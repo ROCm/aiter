@@ -95,17 +95,39 @@ def _read_ids_g2r(blocks, tile, count, offset):
     return _buffer_words(_buffer(view, (count - tile * 16) * 4), offset, 1)[0]
 
 
-def _kv_rows(ids, wave, hk, slotted):
-    """SOFFSET rows of the wave's four blocks for the K/V DMA: lanes 0..3 hold their ids.
+def _kv_rows(ids, wave, row_bytes, slotted):
+    """SOFFSET rows of the wave's four blocks for the K/V DMA (K/V rows row_bytes apart):
+    lanes 0..3 hold their ids.
 
     With a slot table the ids are pool blocks, kept as is for per-block descriptors."""
     rows = []
     for slot in range(4):
         block = fx.Uint32(rocdl.readlane(fx.Int32.ir_type, ids, slot))
         if not slotted:
-            block = block * (4 * hk * D * 2) + (wave >> 2) * 256
+            block = block * (4 * row_bytes) + (wave >> 2) * 256
         rows.append(fx.Int32(block))
     return fx.Vector.from_elements(rows, fx.Int32)
+
+
+def _request_extent(kv_len, hkv, hk, gap):
+    """Bytes from KV head hkv of a request's first K/V row to the end of its last; rows hold
+    hk * D values, then gap elements of padding."""
+    extent = (fx.Uint32(kv_len) * hk - hkv) * D * 2
+    if gap:
+        extent = extent + fx.Uint32(kv_len - 1) * (gap * 2)
+    return extent
+
+
+def _request_resource(tensor, k0, hkv, hk, gap, extent):
+    """Buffer resource over KV head hkv of a request's K or V rows from row k0 (hk * D
+    values, then gap elements of padding, a row); loads at or past extent return zero.
+    """
+    pointer = fx.get_iter(tensor) + (fx.Int64(k0) * hk + hkv) * D
+    if gap:
+        pointer = pointer + fx.Int64(k0) * gap
+    return rocdl.get_buffer_rsrc(
+        _buffer(fx.make_view(pointer, fx.make_layout(extent // 2, 1)), extent)
+    )
 
 
 def _shift(reads, offset):
@@ -146,7 +168,7 @@ def _read_packet_g2s(
     rows,
     compact_len,
     limits,
-    hk,
+    row_bytes,
     packet,
     is_v,
     extent,
@@ -168,7 +190,7 @@ def _read_packet_g2s(
     slotted = limits is None
     token, _ = _copy_coordinates(wave, packet, 4)
     voffset = _dma_word(lane, token, is_v) * 4
-    step = (packet & 3) * hk * D * 2
+    step = (packet & 3) * row_bytes
     # The instruction offset also moves the LDS destination, which M0 takes back; M0 must stay
     # non-negative, otherwise (HK > 1) the step goes into VOFFSET.
     destination_offset = packet * 512
@@ -187,7 +209,7 @@ def _read_packet_g2s(
         block = rows[packet // 4]
         records = (block == final).select(partial, full)
         resource = rocdl.get_buffer_rsrc(
-            _buffer_at(base + fx.Int64(fx.Uint32(block)) * (4 * hk * D * 2), records)
+            _buffer_at(base + fx.Int64(fx.Uint32(block)) * (4 * row_bytes), records)
         )
         soffset = fx.Uint32(0)
     else:
@@ -214,7 +236,7 @@ def _read_block_g2s950(
     rows,
     compact_len,
     limit,
-    hk,
+    row_bytes,
     block,
     is_v,
     extent,
@@ -234,7 +256,6 @@ def _read_block_g2s950(
     first, destination = _dma_block950(wave, block)
     key = lane >> 4
     token = first + key
-    row_bytes = hk * D * 2
     voffset = key * row_bytes + _dma_chunk950(lane, token, is_v) * 16
     if limit is None:
         # The block's own descriptor, as in _read_packet_g2s.
@@ -381,6 +402,7 @@ def _body(
     STAGGER: fx.Constexpr[bool],
     SLOTTED: fx.Constexpr[bool],
     GFX950: fx.Constexpr[bool],
+    KV_STRIDE: fx.Constexpr[int],
 ):
     """One task: 128 (query, head) rows of a union tile over its compact key list.
 
@@ -405,6 +427,9 @@ def _body(
     rendezvous 1 for waves 4-7; phase: stage s ends at r = (s + lag) % 8; epilogue: stage k
     at r = k + lag). With two stages the rendezvous in DROPPED_*950 order no LDS producer and
     consumer (module comment), and keep only their compiler fences.
+
+    K/V rows sit KV_STRIDE elements apart: HK * D values, then a gap of padding (e.g. the
+    V half of an interleaved K|V record per token); only padded rows compile its terms.
     """
     slices = (BQ * GP + 127) // 128
     tile_id, hkv = work // (HK * slices), work % HK
@@ -435,10 +460,11 @@ def _body(
         q = _read_q_words(gq, qoffset, lane)
     else:
         q = _read_q_g2r(gq, qoffset, lane)
+    row_bytes, gap = KV_STRIDE * 2, KV_STRIDE - HK * D
     if fx.const_expr(SLOTTED):
         # BLOCKS holds K3's pool blocks: each gets a descriptor from the pool's base (no 4 GiB
         # limit); TAILS holds the final partial block's first pool row (-1: none).
-        row_bytes, half = HK * D * 2, (wave >> 2) * 256
+        half = (wave >> 2) * 256
         tail = _uniform(TAILS[tile_id])
         final = (tail >= 0).select(tail >> 2, fx.Int32(-1))
         partial = (kv_len & 3) * row_bytes - half
@@ -449,34 +475,18 @@ def _body(
         extent = fx.Uint32(4 * row_bytes)
         limits = None
     else:
-        extent = (fx.Uint32(kv_len) * HK - hkv) * D * 2
-        limit = fx.Uint32(kv_len - 1) * (HK * D * 2) + (wave >> 2) * 256
+        extent = _request_extent(kv_len, hkv, HK, gap)
+        limit = fx.Uint32(kv_len - 1) * row_bytes + (wave >> 2) * 256
         limits = tuple(
-            (limit > k * HK * D * 2).select(limit - k * HK * D * 2, fx.Uint32(0))
+            (limit > k * row_bytes).select(limit - k * row_bytes, fx.Uint32(0))
             for k in range(4)
         )
-        gk = rocdl.get_buffer_rsrc(
-            _buffer(
-                fx.make_view(
-                    fx.get_iter(K) + (fx.Int64(k0) * HK + hkv) * D,
-                    fx.make_layout(extent // 2, 1),
-                ),
-                extent,
-            )
-        )
-        gv = rocdl.get_buffer_rsrc(
-            _buffer(
-                fx.make_view(
-                    fx.get_iter(V) + (fx.Int64(k0) * HK + hkv) * D,
-                    fx.make_layout(extent // 2, 1),
-                ),
-                extent,
-            )
-        )
+        gk = _request_resource(K, k0, hkv, HK, gap, extent)
+        gv = _request_resource(V, k0, hkv, HK, gap, extent)
     # gfx950 x4 DMA: each lane's own limits[lane >> 4] (_read_block_g2s950); slot tables none.
     dma_limit = None
     if fx.const_expr(GFX950 and not SLOTTED):
-        key_bytes = fx.Uint32(lane >> 4) * (HK * D * 2)
+        key_bytes = fx.Uint32(lane >> 4) * row_bytes
         dma_limit = (limit > key_bytes).select(limit - key_bytes, fx.Uint32(0))
     scale = fx.Float32(SCALE * math.log2(math.e))
     compact_len = count * 4
@@ -538,7 +548,7 @@ def _body(
         return _read_mask_g2r(mask_resource, tile, mask_offset, BQ)
 
     def kv_rows(ids):
-        return _kv_rows(ids, wave, HK, SLOTTED)
+        return _kv_rows(ids, wave, row_bytes, SLOTTED)
 
     def k_s2r(half, lower_first=False, offset=0):
         """Read plan of K keys 32 * half .. 32 * half + 31 of the K stage at byte offset."""
@@ -569,7 +579,7 @@ def _body(
                     rows,
                     compact_len,
                     dma_limit,
-                    HK,
+                    row_bytes,
                     packet,
                     is_v,
                     extent,
@@ -587,7 +597,7 @@ def _body(
                     rows,
                     compact_len,
                     limits,
-                    HK,
+                    row_bytes,
                     packet,
                     is_v,
                     extent,
@@ -847,6 +857,7 @@ def _kernel(
     SCALE: fx.Constexpr[float],
     SLOTTED: fx.Constexpr[bool],
     GFX950: fx.Constexpr[bool],
+    KV_STRIDE: fx.Constexpr[int],
 ):
     body = _body
     allocator = fx.SharedAllocator()
@@ -891,6 +902,7 @@ def _kernel(
                     True,
                     SLOTTED,
                     GFX950,
+                    KV_STRIDE,
                 )
             else:
                 body(
@@ -916,6 +928,7 @@ def _kernel(
                     False,
                     SLOTTED,
                     GFX950,
+                    KV_STRIDE,
                 )
         work = work + GRID
 
@@ -944,6 +957,7 @@ def _launch(
     SCALE: fx.Constexpr[float],
     SLOTTED: fx.Constexpr[bool],
     GFX950: fx.Constexpr[bool],
+    KV_STRIDE: fx.Constexpr[int],
     stream: fx.Stream,
 ):
     if GRID > 0:
@@ -970,6 +984,7 @@ def _launch(
             SCALE,
             SLOTTED,
             GFX950,
+            KV_STRIDE,
             value_attrs={
                 "rocdl.waves_per_eu": 2,
                 "llvm.target_features": _target_features(),
@@ -1007,6 +1022,7 @@ def _args(inputs, plan, out, stream):
         inputs.scale,
         plan.slotted,
         gfx950(),
+        inputs.kv_stride,
         stream,
     )
 
@@ -1021,6 +1037,7 @@ def _compiled(inputs, args, stream):
         args[19],
         args[20],
         args[21],
+        args[22],
     )
     compiled = _COMPILED.get(key)
     if compiled is None:
@@ -1028,7 +1045,7 @@ def _compiled(inputs, args, stream):
             raise RuntimeError("Warm the QSA specialization before graph capture")
         with torch.cuda.device(inputs.q.device), torch.cuda.stream(stream):
             compiled = _COMPILED[key] = flyc.compile(
-                _launch, *args[:18], 0, *args[19:22], stream
+                _launch, *args[:18], 0, *args[19:23], stream
             )
     return compiled
 
