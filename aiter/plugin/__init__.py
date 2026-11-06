@@ -245,8 +245,22 @@ _last_decision: ContextVar[Decision | None] = ContextVar(
 
 
 def last_decision() -> Decision | None:
-    """Return the last routing decision in the current execution context."""
+    """The last routing decision in this execution context, or ``None``.
 
+    ``None`` under ``AITER_PLUGINS=0``: with the feature off there are no
+    decisions to report, and the one recorded before it was turned off
+    describes a world that no longer holds. Answering with it would be worse
+    than answering with nothing, because nothing about it says it is stale.
+
+    The check is here rather than on the dispatch path on purpose. The kill
+    switch exists to cost nothing, and clearing the record on every call would
+    tax a few million of them to make a handful of reads correct; this way the
+    read pays, and reads are rare.
+    """
+
+    snapshot = _config_snapshot
+    if snapshot is not None and snapshot.kill_switch:
+        return None
     return _last_decision.get()
 
 

@@ -1195,3 +1195,28 @@ def test_a_forwarding_kernel_is_accepted(monkeypatch):
     )
 
     assert _route_add([])(2, 3) == 100
+
+
+def test_the_kill_switch_hides_a_decision_taken_before_it(monkeypatch):
+    """Not just "this call decided nothing" -- nothing is being decided."""
+
+    provider = _Provider("aklr", _candidate("aklr"))
+    plugin.configure(enable=("aklr",), source="test")
+    monkeypatch.setattr(
+        plugin, "_entry_points", lambda: (_EntryPoint("aklr", provider),)
+    )
+    add = _route_add([])
+
+    assert add(2, 3) == 100
+    assert plugin.last_decision().provider == "aklr"
+
+    # Turned off without calling anything afterwards: the record is still
+    # there, and it now describes a world that does not hold.
+    monkeypatch.setenv("AITER_PLUGINS", "0")
+    plugin.reload_config()
+
+    assert plugin.last_decision() is None
+
+    monkeypatch.delenv("AITER_PLUGINS")
+    plugin.reload_config()
+    assert plugin.last_decision().provider == "aklr", "and it was not destroyed"
