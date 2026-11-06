@@ -34,19 +34,11 @@ _gemm_afp4wfp4_pingpong_repr = make_kernel_repr(
     ],
 )
 
-_HALF = 128  # quadrant edge: rows of A_top / A_bot, columns of B_left / B_right
-_TILE_KB = 128  # bytes of K per K step (256 fp4)
-_SCALE_ROWS = 256
-_SCALE_GROUPS = 8
-_DMA_VEC_BYTES = 16
-
 
 @gluon.constexpr_function
 def _d2l_layout(padded, num_warps, vec_bytes, warp_size=64):
-    """DMA offsets layout for a PaddedSharedLayout destination (same recipe as
-    Triton's CoalesceAsyncCopy.cpp): the padded layout's offset
-    bases, in order, go to registers (one 16-B run per lane), lanes (64 lanes
-    write one contiguous LDS run), warps, and then to more registers."""
+    """Direct-to-LDS copy layout for a padded LDS destination, as in Triton's
+    CoalesceAsyncCopy: one 16-B run per lane, one contiguous LDS run per wave."""
     bases = [list(b) for b in padded.offset_bases]
     rank = len(padded.shape)
     nv = int(math.log2(vec_bytes))
@@ -86,7 +78,7 @@ def _dot_layout(operand_index, num_warps):
 @gluon.constexpr_function
 def _half_smem_layout(operand_index, num_warps):
     """Padded LDS layout of one A half [128, 128 B] or one B half [128 B, 128]."""
-    shape = [_HALF, _TILE_KB] if operand_index == 0 else [_TILE_KB, _HALF]
+    shape = [128, 128]
     return cdna4.compute_efficient_padded_shared_layout(
         _dot_layout(operand_index, num_warps), shape, gl.uint8, is_k_contig=True
     )
@@ -95,14 +87,14 @@ def _half_smem_layout(operand_index, num_warps):
 @gluon.constexpr_function
 def _half_dma_layout(operand_index, num_warps):
     return _d2l_layout(
-        _half_smem_layout(operand_index, num_warps), num_warps, _DMA_VEC_BYTES
+        _half_smem_layout(operand_index, num_warps), num_warps, vec_bytes=16
     )
 
 
 @gluon.constexpr_function
 def _scale_layout(operand_index, num_warps, rows):
     return cdna4.get_mfma_scale_layout(
-        _dot_layout(operand_index, num_warps), [rows, _SCALE_GROUPS]
+        _dot_layout(operand_index, num_warps), [rows, 8]  # 8 scales per 256-K step
     )
 
 

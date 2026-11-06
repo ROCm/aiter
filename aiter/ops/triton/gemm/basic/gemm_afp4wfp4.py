@@ -3,7 +3,7 @@
 
 
 import functools
-import re
+import importlib.metadata
 
 import torch
 import triton
@@ -44,24 +44,35 @@ _GLUON_DEFAULT_ARCHS = (
     "gfx1250-strict",
 )
 
-# The gfx950 ping-pong kernel ("compute_bound") is validated only with these
-# Triton versions and on the full device (8 XCDs, no partition mode).
-_PINGPONG_TRITON_VERSIONS = ((3, 8),)
-_PINGPONG_NUM_XCDS = 8
-
 
 @functools.cache
 def _pingpong_compiler_ok() -> bool:
+    # The ping-pong schedule depends on compiler scheduling and synchronization, so
+    # only the Triton builds it was validated on are allowed (exact package version).
+    validated = ("3.8.0+amd.rocm7.2.0.git7cb7b059", "3.8.0+gitc8305ccc")
     try:
         from triton.experimental.gluon.language.amd import (  # noqa: F401
             warp_pipeline_stage,
         )
-    except ImportError:
+
+        return importlib.metadata.version("triton") in validated
+    except ImportError:  # also importlib.metadata.PackageNotFoundError
         return False
-    version = re.match(r"(\d+)\.(\d+)", triton.__version__)
-    return bool(version) and tuple(map(int, version.groups())) in (
-        _PINGPONG_TRITON_VERSIONS
-    )
+
+
+def _pingpong_env_unsupported():
+    """Return why this device or Triton build cannot run the ping-pong kernel, or None."""
+    if arch_info.get_arch() != "gfx950":
+        return "arch"
+    if not _pingpong_compiler_ok():
+        return "Triton build not validated"
+    try:
+        num_xcds = get_num_xcds(default=None)
+    except (RuntimeError, OSError):
+        return "unknown XCD count"
+    if num_xcds != 8:  # validated on the full device only, not in partition modes
+        return "partition mode"
+    return None
 
 
 def _pingpong_unsupported(x, w, x_scales, w_scales, y, dtype, config):
@@ -71,16 +82,9 @@ def _pingpong_unsupported(x, w, x_scales, w_scales, y, dtype, config):
     contiguous x and w, scales contiguous along M and N, a bf16 y, 16-byte aligned
     tensors below 2 GiB and a 256x256x256 tile with 8 warps and no split-K.
     """
-    if arch_info.get_arch() != "gfx950":
-        return "arch"
-    if not _pingpong_compiler_ok():
-        return "Triton version not validated"
-    try:
-        num_xcds = get_num_xcds(default=None)
-    except RuntimeError:
-        return "unknown XCD count"
-    if num_xcds != _PINGPONG_NUM_XCDS:
-        return "partition mode"
+    reason = _pingpong_env_unsupported()
+    if reason is not None:
+        return reason
     blocks = (config["BLOCK_SIZE_M"], config["BLOCK_SIZE_N"], config["BLOCK_SIZE_K"])
     if (
         blocks != (256, 256, 256)
