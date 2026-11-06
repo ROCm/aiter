@@ -5,15 +5,22 @@ from __future__ import annotations
 
 import argparse
 import itertools
+import os
+import tempfile
+from unittest import mock
 
 import pandas as pd
 import torch
 
 import aiter
 from aiter import dtypes
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.core import AITER_CONFIGS
+from aiter.jit.utils.chip_info import get_gfx, get_gfx_custom_op_core
+from aiter.ops.flydsl import jagged_dense_bmm_dispatch as jdbba_dispatch
 from aiter.ops.flydsl.jagged_dense_bmm_dispatch import jagged_dense_bmm_dispatched
+from aiter.ops.flydsl.kernels.jagged_dense_bmm_gen import _LAUNCHERS
 from aiter.test_common import (
+    assertAllclose,
     benchmark,
     checkAllclose,
     run_perftest,
@@ -112,6 +119,11 @@ def _check(d, got, dtype, msg):
         atol=1e-2,
         msg=msg,
     )
+
+
+def _require(d, got, dtype, msg):
+    ref = run_torch(d["jagged"], d["dense"], d["bias"], d["seq_offsets"], d["N"], dtype)
+    return assertAllclose(ref.to(dtypes.fp32), got.to(dtypes.fp32), msg=msg)
 
 
 def _roofline(d, B, us):
@@ -252,6 +264,119 @@ def test_jdbba_seq_offsets_reuse(B, D, Kout, Mi, seed, dtype):
     }
 
 
+_SELECT_B, _SELECT_K, _SELECT_N, _SELECT_MI = 64, 256, 256, 2048
+_PINNED_LAUNCHER_KEY = {"xcd_c": 32, "xcd_w": 8, "block_k": 64}
+
+
+def _clear_tuned_cache():
+    jdbba_dispatch._tuned_table.cache_clear()
+    AITER_CONFIGS.get_config_file.cache_clear()
+    get_gfx.cache_clear()
+    get_gfx_custom_op_core.cache_clear()
+
+
+def _selection_csv(path, tiles):
+    rows = (
+        f"gfx950,256,{_SELECT_K},{_SELECT_N},{tiles},48,24,64,120,16,1\n"
+        f"gfx942,304,{_SELECT_K},{_SELECT_N},{tiles},32,16,64,64,8,1\n"
+        f"gfx942,38,{_SELECT_K},{_SELECT_N},{tiles},9,9,64,9,9,1\n"
+    )
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(
+            "gfx,cu_num,K,N,tiles_log2,xcd_c,xcd_w,block_k,skew_xcd_c,skew_xcd_w,us\n"
+        )
+        fh.write(rows)
+
+
+@benchmark()
+def test_jdbba_config_selection(
+    arch, cu_num, regime, decoy_gpu_archs, xcd_c, xcd_w, expect_c, expect_w
+):
+    tiles = jdbba_dispatch.tiles_log2(
+        n_groups=_SELECT_B, output_n=_SELECT_N, max_seq_len=_SELECT_MI
+    )
+    prev = {
+        "AITER_CONFIG_JAGGED_DENSE_BMM": os.environ.get(
+            "AITER_CONFIG_JAGGED_DENSE_BMM"
+        ),
+        "GPU_ARCHS": os.environ.get("GPU_ARCHS"),
+    }
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "jagged_dense_bmm_tuned.csv")
+            _selection_csv(path, tiles)
+            os.environ["AITER_CONFIG_JAGGED_DENSE_BMM"] = path
+            os.environ["GPU_ARCHS"] = decoy_gpu_archs
+            _clear_tuned_cache()
+            with (
+                mock.patch.object(jdbba_dispatch, "get_gfx_runtime", return_value=arch),
+                mock.patch.object(jdbba_dispatch, "get_cu_num", return_value=cu_num),
+            ):
+                cfg = jdbba_dispatch.resolve_config(
+                    n_groups=_SELECT_B,
+                    reduction_k=_SELECT_K,
+                    output_n=_SELECT_N,
+                    max_seq_len=_SELECT_MI,
+                    uniform_seqlen=regime == "uniform",
+                    xcd_c=xcd_c,
+                    xcd_w=xcd_w,
+                )
+    finally:
+        for name, value in prev.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        _clear_tuned_cache()
+    assert (cfg["xcd_c"], cfg["xcd_w"]) == (expect_c, expect_w), (
+        f"{arch} cu={cu_num} {regime} selected "
+        f"{cfg['xcd_c']},{cfg['xcd_w']} instead of {expect_c},{expect_w}"
+    )
+    return {"xcd_c": cfg["xcd_c"], "xcd_w": cfg["xcd_w"], "block_k": cfg["block_k"]}
+
+
+@benchmark()
+def test_jdbba_launcher_reuse(B, D, Kout, Mi, regime, dtype):
+    uniform = regime == "uniform"
+    if uniform:
+        B2, Mi2 = B + 16, Mi + 64
+    else:
+        B2, Mi2 = B, Mi * 2
+    first = _build_inputs(B, D, Kout, Mi, regime, dtype)
+    second = _build_inputs(B2, D, Kout, Mi2, regime, dtype)
+    if uniform:
+        assert (B2, Mi2) != (B, Mi), "uniform reuse pair did not change the grid"
+    else:
+        assert second["L"] != first["L"], "skew reuse pair did not change L"
+
+    out = _nan_out(first["L"], first["N"], dtype)
+    _launch(first, out, B, Mi, uniform, **_PINNED_LAUNCHER_KEY)
+    err_prime = _require(first, out, dtype, f"launcher reuse prime ({regime})")
+    n_launchers = len(_LAUNCHERS)
+
+    out = _nan_out(second["L"], second["N"], dtype)
+    got, us = run_perftest(
+        lambda: _launch(second, out, B2, Mi2, uniform, **_PINNED_LAUNCHER_KEY)
+    )
+    new_launchers = len(_LAUNCHERS) - n_launchers
+    assert (
+        new_launchers == 0
+    ), f"launcher cache grew by {new_launchers} for a new {regime} length"
+    err = _require(second, got, dtype, f"launcher reuse ({regime})")
+    tflops, tbps = _roofline(second, B2, us)
+    return {
+        "gfx": get_gfx(),
+        "B2": B2,
+        "Mi2": Mi2,
+        "L": second["L"],
+        "err prime": err_prime,
+        "flydsl us": us,
+        "flydsl TFLOPS": tflops,
+        "flydsl TB/s": tbps,
+        "flydsl err": err,
+    }
+
+
 def _summarize(name, rows):
     df = pd.DataFrame(rows)
     aiter.logger.info("%s summary (markdown):\n%s", name, df.to_markdown(index=False))
@@ -358,6 +483,26 @@ def main():
     )
     args = parser.parse_args()
     shapes = _expand_shapes(args.shapes, args.batch, parser)
+    rows = []
+    fields = (
+        "arch",
+        "cu_num",
+        "regime",
+        "decoy_gpu_archs",
+        "xcd_c",
+        "xcd_w",
+        "expect_c",
+        "expect_w",
+    )
+    for case in (
+        ("gfx950", 256, "uniform", "gfx942", None, None, 48, 24),
+        ("gfx942", 304, "uniform", "gfx950", None, None, 32, 16),
+        ("gfx950", 256, "skew", "gfx942", None, None, 120, 16),
+        ("gfx942", 38, "uniform", "gfx950", None, None, 9, 9),
+        ("gfx950", 38, "uniform", "gfx942", 32, 8, 32, 8),
+    ):
+        rows.append(test_jdbba_config_selection(**dict(zip(fields, case))))
+    _summarize("jagged_dense_bmm config selection", rows)
     for shape in args.regression_shapes:
         if not isinstance(shape, tuple) or len(shape) != 4:
             parser.error(f"regression shape must be B,D,Kout,Mi; got {shape}")
@@ -389,6 +534,13 @@ def main():
     ):
         rows.append(test_jdbba_seq_offsets_reuse(B, D, Kout, Mi, seed, dtype))
     _summarize("jagged_dense_bmm seq_offsets reuse", rows)
+
+    rows = []
+    for dtype, (B, D, Kout, Mi), regime in itertools.product(
+        args.dtype, args.regression_shapes, args.regime
+    ):
+        rows.append(test_jdbba_launcher_reuse(B, D, Kout, Mi, regime, dtype))
+    _summarize("jagged_dense_bmm launcher reuse", rows)
 
 
 if __name__ == "__main__":
