@@ -1,14 +1,6 @@
 # Known pre-existing non-strict accuracy failures for test_moe_2stage.py's
-# full-profile matrix (mxfp4 per_1x32/Swiglu/bf16-act/fp4-weight), MI35X
-# (gfx950), full default token sweep. Source: main run 41552231943, job
-# 125695520646; see PR #7330/#7341 discussion.
-#
-# failure_mode: "numeric" (err/logits_diff threshold) or "nan" (output
-# contains NaN) -- tracked separately so a NaN regression at an allowlisted
-# config isn't silently absorbed by its numeric-drift entry.
-#
-# Any failure not matching one of these (token, qType, actType, AQDType,
-# WQDType, failure_mode) tuples fails the job as unexpected.
+# full-profile matrix (mxfp4 per_1x32/Swiglu), MI35X (gfx950), full default
+# token sweep. 
 token,qType,actType,AQDType,WQDType,failure_mode
 1,QuantType.per_1x32,ActivationType.Swiglu,torch.bfloat16,torch.float4_e2m1fn_x2,numeric
 3,QuantType.per_1x32,ActivationType.Swiglu,torch.bfloat16,torch.float4_e2m1fn_x2,numeric

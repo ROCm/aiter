@@ -1,15 +1,6 @@
 #!/usr/bin/env python3
 """Gate the MoE 2-stage full-matrix CI run against a known allowlist of
 non-strict accuracy failures, instead of a bare count cap.
-
-A count cap (e.g. "fail only if failures > 12") cannot tell a known
-pre-existing failure apart from a brand-new one that happens to keep the
-total under the cap -- a new failure could silently displace a known one.
-This script instead extracts the (token, qType, actType, AQDType, WQDType)
-signature preceding each "accuracy check failed (non-strict)" line and
-requires every observed signature to appear in the allowlist. Any
-unexpected signature (new config, or a known config with a changed
-error magnitude bucket) fails the job.
 """
 import argparse
 import csv
@@ -33,7 +24,8 @@ def extract_failures(log_path):
                 start = j
                 break
         if start is None:
-            failures.append({"_line": idx + 1, "_raw": lines[idx].strip(), "_unparsed": True})
+            failures.append({"_line": idx + 1, "_raw": lines[idx].strip(), "_unparsed": True,
+                              "_reason": "no preceding test_fmoe( call found"})
             continue
         block = []
         for j in range(start, idx):
@@ -94,7 +86,8 @@ def main():
         print("\nUnexpected non-strict accuracy failures (not in allowlist):")
         for f in unexpected:
             if f["_unparsed"]:
-                print(f"  line {f['_line']}: (could not parse config) {f['_raw']}")
+                reason = f.get("_reason", "could not parse config")
+                print(f"  line {f['_line']}: ({reason}) {f['_raw']}")
             else:
                 sig_str = ", ".join(f"{k}={f[k]}" for k in FIELDS)
                 print(f"  line {f['_line']}: {sig_str} -> {f['_raw']}")
