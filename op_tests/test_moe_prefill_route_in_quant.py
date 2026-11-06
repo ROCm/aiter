@@ -107,6 +107,9 @@ def _moe_args(tokens):
     path = Path(__file__).parent / "flydsl_tests/test_flydsl_grouped_gemm.py"
     spec = importlib.util.spec_from_file_location("_route_in_quant_ref", path)
     ref = importlib.util.module_from_spec(spec)
+    # The reference module sets the default device to cuda when it loads: take
+    # the caller's default first, so it is the one restored below.
+    default = torch.get_default_device()
     spec.loader.exec_module(ref)
     captured = []
     ref.fused_moe = lambda *a, **k: captured.append((a, k)) or torch.zeros(
@@ -115,7 +118,6 @@ def _moe_args(tokens):
     ref._torch_moe_ref = lambda hidden, *a, **k: torch.zeros(
         hidden.shape, dtype=torch.bfloat16, device="cuda"
     )
-    default = torch.get_default_device()
     torch.set_default_device("cuda")
     try:
         ref._run_grouped_via_fused_moe(
