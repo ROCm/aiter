@@ -209,8 +209,9 @@ def flydsl_hgemm(
     benefit from caching. Both options default off.
     ``policy="bs"`` selects the BF16 band-stream decode kernel for the
     validated 256-CU gfx950 M/N/K and configuration catalog. It requires
-    contiguous A/B, no bias, split_k=1 and BF16 output; unsupported inputs
-    raise rather than silently selecting a different kernel.
+    no bias, split_k=1 and BF16 output. As on the legacy FT path, strided
+    A/B are made contiguous before launch. Other unsupported inputs raise
+    rather than silently selecting a different kernel.
     """
 
     if policy not in ("ft", "ht", "hti", SKINNY_POLICY, "bs"):
@@ -225,6 +226,14 @@ def flydsl_hgemm(
     _validate_k_stagger(k_stagger, gfx, policy)
     _validate_b_non_temporal(b_non_temporal, gfx, policy)
     if policy == "bs":
+        # A tuned row can serve strided inputs too. Preserve the legacy
+        # public HGEMM normalization; only the device kernel requires
+        # contiguous A/B. Copies must precede its launch on the same stream.
+        with torch.cuda.stream(launch_stream):
+            if not a.is_contiguous():
+                a = a.contiguous()
+            if not b.is_contiguous():
+                b = b.contiguous()
         return gemm_a16w16_band(
             a,
             b,

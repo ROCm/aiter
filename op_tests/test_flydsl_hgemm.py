@@ -671,6 +671,58 @@ def test_hgemm_band(m, n, k, dtype):
     return ret
 
 
+@benchmark()
+def test_hgemm_tuned_strides(m, n, k, dtype, layout):
+    from aiter.tuned_gemm import gemm_a16w16_out
+
+    torch.manual_seed(SEED)
+    if layout[0] == "t":
+        a = torch.empty((k, m), dtype=dtype, device="cuda").uniform_(-1, 1).t()
+    else:
+        a = torch.empty((m, k * 2), dtype=dtype, device="cuda").uniform_(-1, 1)[:, ::2]
+    if layout[1] == "t":
+        w = torch.empty((k, n), dtype=dtype, device="cuda").uniform_(-1, 1).t()
+    else:
+        w = torch.empty((n, k * 2), dtype=dtype, device="cuda").uniform_(-1, 1)[:, ::2]
+    out = torch.empty((m, n), dtype=dtype, device="cuda")
+    ref = run_torch(a, w, dtype)
+
+    def launch():
+        gemm_a16w16_out(a, w, out, otype=dtype)
+        return out
+
+    ret = {"gfx": get_gfx()}
+    candidates = {"tuned_strided": launch}
+    flops = 2 * m * n * k
+    # Logical bytes; normalization adds physical traffic not counted here.
+    nbytes = (m * k + n * k + m * n) * a.element_size()
+    for name, fn in candidates.items():
+        y, us = run_perftest(fn)
+        err = checkAllclose(ref.float(), y.float(), rtol=1e-2, atol=1e-2, msg=name)
+        assert err == 0, f"{name}: {err} mismatches"
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = flops / us / 1e6
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = err
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        launch()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            launch()
+        a.neg_()
+        out.fill_(float("nan"))
+        graph.replay()
+    torch.cuda.current_stream().wait_stream(stream)
+    ref = run_torch(a, w, dtype)
+    err = checkAllclose(
+        ref.float(), out.float(), rtol=1e-2, atol=1e-2, msg="strided graph"
+    )
+    assert err == 0, f"strided graph mismatch {err}"
+    return ret
+
+
 def check_band_rejects():
     config = band_stream_config(16, 18432, 1536)
     config.pop("use_half_tile_interleaved")
@@ -837,6 +889,15 @@ def main():
                     if (m, n, k) in wanted
                 ],
             )
+    summarize(
+        "tuned HGEMM strided inputs",
+        [
+            test_hgemm_tuned_strides(m, n, k, dtypes.bf16, layout)
+            for (m, n, k), layout in itertools.product(
+                ((16, 18432, 1536), (112, 20480, 7168)), ("ss", "st", "ts", "tt")
+            )
+        ],
+    )
     check_band_rejects()
     check_hgemm_memory_options()
     check_skinny_rejects()
