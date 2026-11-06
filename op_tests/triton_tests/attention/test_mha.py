@@ -2,10 +2,15 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 
+import math
+
 import pytest
 import torch
 
 from aiter import logger
+from aiter.ops.triton._gluon_kernels.gfx950.attention.mha import (
+    _get_config as _get_gluon_config,
+)
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_2
 from aiter.ops.triton.attention.mha import (
     flash_attn_func,
@@ -301,6 +306,128 @@ def test_mha_varlen_fp8_gluon(
     )
 
     _fp8_assert_close(gluon_out, torch_out.to(gluon_out.dtype))
+
+
+# Short K (fewer than 8 key tiles) runs the one-tile loop; long K, the pipeline.
+@pytest.mark.parametrize("SEQLEN_Q, SEQLEN_K", [(128, 128), (300, 1100)])
+@pytest.mark.parametrize("HEAD_SZ", [53, 64, 96, 128])
+@pytest.mark.parametrize("CAUSAL", [True, False])
+def test_mha_fp32_gluon(SEQLEN_Q: int, SEQLEN_K: int, HEAD_SZ: int, CAUSAL: bool):
+    """fp32 inputs on the fp32 MFMA path, padded heads included."""
+    skip_if_gluon_unsupported("gluon")
+
+    torch.manual_seed(21)
+    q = torch.randn((2, SEQLEN_Q, 4, HEAD_SZ), device="cuda")
+    k = torch.randn((2, SEQLEN_K, 2, HEAD_SZ), device="cuda")
+    v = torch.randn_like(k)
+
+    gluon_out, gluon_lse = flash_attn_func(
+        q, k, v, causal=CAUSAL, return_lse=True, backend="gluon"
+    )
+    torch_out, _, torch_lse = attention_ref(q, k, v, causal=CAUSAL)
+
+    torch.testing.assert_close(gluon_out, torch_out, atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(gluon_lse, torch_lse, atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.parametrize("HEAD_SZ", [53, 128])
+@pytest.mark.parametrize("CAUSAL", [True, False])
+def test_mha_varlen_fp32_gluon(HEAD_SZ: int, CAUSAL: bool):
+    """Packed fp32 sequences, one-tile and pipelined lengths in one launch."""
+    skip_if_gluon_unsupported("gluon")
+
+    torch.manual_seed(22)
+    seqlens_q, seqlens_k = [300, 77, 129], [1100, 513, 129]
+    cu_seqlens_q = torch.tensor([0] + seqlens_q, device="cuda").cumsum(0).int()
+    cu_seqlens_k = torch.tensor([0] + seqlens_k, device="cuda").cumsum(0).int()
+    q = torch.randn((sum(seqlens_q), 4, HEAD_SZ), device="cuda")
+    k = torch.randn((sum(seqlens_k), 2, HEAD_SZ), device="cuda")
+    v = torch.randn_like(k)
+
+    gluon_out, gluon_lse = flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max(seqlens_q),
+        max(seqlens_k),
+        causal=CAUSAL,
+        return_lse=True,
+        backend="gluon",
+    )
+
+    for b in range(len(seqlens_q)):
+        rows = slice(cu_seqlens_q[b], cu_seqlens_q[b + 1])
+        keys = slice(cu_seqlens_k[b], cu_seqlens_k[b + 1])
+        torch_out, _, torch_lse = attention_ref(
+            q[None, rows], k[None, keys], v[None, keys], causal=CAUSAL
+        )
+        torch.testing.assert_close(gluon_out[rows], torch_out[0], atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(
+            gluon_lse[rows], torch_lse[0].T, atol=1e-4, rtol=1e-4
+        )
+
+
+@pytest.mark.parametrize("DTYPE", ["bf16", "fp16", "fp8"])
+@pytest.mark.parametrize("HEAD_SZ", [64, 128])
+@pytest.mark.parametrize("CAUSAL", [True, False])
+@pytest.mark.parametrize("JUMP", ["below", "at", "above"])
+def test_mha_gluon_lazy_rescale_threshold(
+    DTYPE: str, HEAD_SZ: int, CAUSAL: bool, JUMP: str
+):
+    """Row-max jumps just below, exactly at and just above the lazy-rescale
+    threshold, on keys long enough for the pipelined K loop."""
+    skip_if_gluon_unsupported("gluon")
+    SEQLEN_Q, SEQLEN_K, PLATEAU = 256, 2048, 512
+
+    is_fp8 = DTYPE == "fp8"
+    threshold = _get_gluon_config(
+        is_fp8=is_fp8, causal=CAUSAL, v_head_dim=HEAD_SZ, seqlen_k=SEQLEN_K
+    )["LAZY_RESCALE_THRESHOLD"]
+    assert threshold > 0, "this shape must select a lazy-rescale config"
+    jump = threshold + {"below": -1.0, "at": 0.0, "above": 1.0}[JUMP]
+
+    # softmax_scale = ln 2 and Q = e_0 make each score, in log2 units, K[..., 0]:
+    # four plateaus of keys, each `jump` above the one before.  Every level is
+    # exact in bf16, fp16 and e4m3, so "at" lands on the threshold exactly.
+    torch.manual_seed(23)
+    q = torch.zeros((1, SEQLEN_Q, 2, HEAD_SZ), device="cuda")
+    q[..., 0] = 1
+    k = torch.randn((1, SEQLEN_K, 2, HEAD_SZ), device="cuda")
+    k[..., 0] = (torch.arange(SEQLEN_K, device="cuda") // PLATEAU * jump)[:, None]
+    v = torch.randn_like(k)
+    kwargs = {}
+    if is_fp8:
+        fp8_dtype = get_fp8_e4m3_dtype()
+        q, k, v = q.to(fp8_dtype), k.to(fp8_dtype), v.to(fp8_dtype)
+        descale = torch.ones((1, 2), device="cuda")
+        kwargs = {"q_descale": descale, "k_descale": descale, "v_descale": descale}
+    else:
+        dtype = torch.bfloat16 if DTYPE == "bf16" else torch.float16
+        q, k, v = q.to(dtype), k.to(dtype), v.to(dtype)
+
+    gluon_out, gluon_lse = flash_attn_func(
+        q,
+        k,
+        v,
+        softmax_scale=math.log(2.0),
+        causal=CAUSAL,
+        return_lse=True,
+        backend="gluon",
+        **kwargs,
+    )
+    # attention_ref scales by 1/sqrt(HEAD_SZ); fold in ln 2 instead.
+    torch_out, _, torch_lse = attention_ref(
+        q.float() * (math.log(2.0) * HEAD_SZ**0.5),
+        k.float(),
+        v.float(),
+        causal=CAUSAL,
+    )
+
+    tol = {"bf16": 1e-2, "fp16": 2e-3, "fp8": 3e-2}[DTYPE]
+    torch.testing.assert_close(gluon_out.float(), torch_out, atol=tol, rtol=tol)
+    torch.testing.assert_close(gluon_lse, torch_lse, atol=1e-3, rtol=1e-4)
 
 
 @pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (8, 1)])
