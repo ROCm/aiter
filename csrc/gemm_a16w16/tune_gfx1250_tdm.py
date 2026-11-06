@@ -9,6 +9,7 @@ import argparse
 import csv
 import json
 import multiprocessing as mp
+import os
 import statistics
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
@@ -61,6 +62,7 @@ FIELDS = (
 def _compile_init():
     import os
 
+    os.environ.pop("FLYDSL_RUNTIME_RUN_ONLY", None)
     os.environ["COMPILE_ONLY"] = "1"
     os.environ["ARCH"] = "gfx1250"
     torch.set_num_threads(1)
@@ -186,14 +188,29 @@ def tune_shape(shape, use_bias, args):
             records.append(record)
             continue
         try:
-            _run(a, w, out, bias, cfg)
+            # Fail on a mismatched precompile/runtime identity instead of
+            # silently recompiling thousands of candidates in this process.
+            previous_run_only = os.environ.get("FLYDSL_RUNTIME_RUN_ONLY")
+            os.environ["FLYDSL_RUNTIME_RUN_ONLY"] = "1"
+            try:
+                _run(a, w, out, bias, cfg)
+            finally:
+                if previous_run_only is None:
+                    os.environ.pop("FLYDSL_RUNTIME_RUN_ONLY", None)
+                else:
+                    os.environ["FLYDSL_RUNTIME_RUN_ONLY"] = previous_run_only
             torch.cuda.synchronize()
             torch.testing.assert_close(out, refs[cfg["split_k"]], atol=0, rtol=0)
             samples = _time(lambda cfg=cfg: _run(a, w, out, bias, cfg), 8, 3)
             med = statistics.median(samples)
             record.update(us=med, samples_us=samples, correct=True)
             candidates.append((med, i))
-        except Exception as exc:  # noqa: BLE001 - persist per-candidate failures
+        except Exception as exc:
+            if "no usable AOT cache" in str(exc):
+                raise RuntimeError(
+                    "precompile cache mismatch; do not edit kernel/dependency "
+                    "sources while tuning; restart with --resume"
+                ) from exc
             record["error"] = f"{type(exc).__name__}: {exc}"
         records.append(record)
         if i % 100 == 0:
