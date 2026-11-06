@@ -1243,14 +1243,13 @@ def _needs_arch_rebuild(md_name):
     if not built or cur in built:
         return False
     if not _rebuild_targets_arch(cur):
-        # A rebuild would miss the running arch too, so asking for one would
-        # only rebuild, then fail the reload with ModuleNotFoundError.
-        logger.warning(
+        # A rebuild would miss the running arch too, and loading the .so would
+        # only fail later, at its first kernel launch.
+        raise RuntimeError(
             f"[{md_name}] prebuilt .so targets {sorted(built)} but not the "
             f"running arch {cur}, and a rebuild would not target it either; "
-            f"set GPU_ARCHS to include {cur}"
+            f"set GPU_ARCHS to include {cur} (or to native) and rebuild"
         )
-        return False
     logger.warning(
         f"[{md_name}] prebuilt .so targets {sorted(built)} but not the "
         f"running arch {cur}; rebuilding for {cur}"

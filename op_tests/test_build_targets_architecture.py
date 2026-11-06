@@ -415,29 +415,26 @@ class TestCodeObjectRebuildGuard(unittest.TestCase):
         self.assertFalse(self._needs_rebuild("gfx1250-strict", set()))
 
     def test_rebuild_only_when_it_would_target_the_running_arch(self):
-        # A rebuild that misses the running arch would fail the reload with
-        # ModuleNotFoundError, e.g. device 1 of a mixed node selected.
-        for build_archs, expected in (
-            (("native",), True),
-            (("gfx942", "gfx950"), True),
-            (("gfx950",), False),
-        ):
+        for build_archs in (("native",), ("gfx942", "gfx950")):
             with self.subTest(build_archs=build_archs):
-                self.assertEqual(
-                    self._needs_rebuild("gfx942", {"gfx950"}, build_archs), expected
-                )
+                self.assertTrue(self._needs_rebuild("gfx942", {"gfx950"}, build_archs))
+        # Neither the .so nor a rebuild covers the running arch: fail at load,
+        # not at the first kernel launch.
+        with self.assertRaisesRegex(RuntimeError, "set GPU_ARCHS to include gfx942"):
+            self._needs_rebuild("gfx942", {"gfx950"}, ("gfx950",))
 
     def test_windows_native_build_compares_against_hipinfo_arch(self):
         # Windows resolves "native" to the first hipinfo arch itself, so a
-        # mixed node whose current device is another arch must not rebuild.
+        # rebuild there cannot cover a current device of another arch.
         with (
             mock.patch.dict(os.environ, {"GPU_ARCHS": "native"}),
             mock.patch.object(self.core, "IS_WINDOWS", True),
             mock.patch.object(self.core, "_detect_native", return_value=["gfx950"]),
             mock.patch.object(self.core, "get_gfx_runtime", return_value="gfx942"),
             mock.patch.object(self.core, "_so_offload_archs", return_value={"gfx950"}),
+            self.assertRaisesRegex(RuntimeError, "set GPU_ARCHS to include gfx942"),
         ):
-            self.assertFalse(self.core._needs_arch_rebuild("dummy_module"))
+            self.core._needs_arch_rebuild("dummy_module")
 
 
 if __name__ == "__main__":
