@@ -584,7 +584,7 @@ def test_triton_unified_attn_3d_long_kv(captured_max_seqlen_k: bool) -> None:
 
     max_seqlen_k is the real maximum (20000) or the 1M bound a CUDA graph captures.
     """
-    if DEVICE_ARCH not in ("gfx950", "gfx1250"):
+    if DEVICE_ARCH not in ("gfx942", "gfx950", "gfx1250"):
         pytest.skip(f"skip {DEVICE_ARCH}")
     torch.cuda.empty_cache()
     seq_lens = [(4, 20000), (4, 9000), (4, 300), (4, 13000)]
@@ -692,6 +692,20 @@ def _length_aware_pages(page_counts):
     return num_blocks, block_tables
 
 
+def _use_gfx950_length_aware_split(monkeypatch) -> None:
+    """Run the gfx950 length-aware kv_split entry on gfx942 and gfx950.
+
+    Only gfx950 tunes the entry, but its kernels are plain Triton, so gfx942
+    pins the gfx950 tables to check the split there too.
+    """
+    if DEVICE_ARCH not in ("gfx942", "gfx950"):
+        pytest.skip("the length-aware kv_split entry is checked on gfx942/gfx950")
+    if DEVICE_ARCH != "gfx950":
+        module = sys.modules[unified_attention.__module__]
+        gfx950_config = functools.partial(get_unified_attention_config, arch="gfx950")
+        monkeypatch.setattr(module, "get_unified_attention_config", gfx950_config)
+
+
 @pytest.mark.parametrize(
     "batch, num_heads, max_query_len, option, seqused_k_dtype",
     [
@@ -729,8 +743,7 @@ def test_triton_unified_attn_3d_length_aware_split(
     count only knows the batch size; each sequence must take its own share of
     the segments from seqused_k, and the reduce must merge exactly those.
     """
-    if DEVICE_ARCH != "gfx950":
-        pytest.skip("the length-aware kv_split entry is tuned for gfx950")
+    _use_gfx950_length_aware_split(monkeypatch)
     torch.cuda.empty_cache()
     block_size = 128
     seq_lens = _length_aware_seq_lens(batch, max_query_len)
@@ -850,14 +863,13 @@ def test_triton_unified_attn_3d_length_aware_split(
 
 
 @torch.inference_mode()
-def test_triton_unified_attn_3d_length_aware_split_graph_replay() -> None:
+def test_triton_unified_attn_3d_length_aware_split_graph_replay(monkeypatch) -> None:
     """A CUDA graph captured at the 1M bound splits by the seqused_k of each replay.
 
     A serving engine changes the lengths in place between replays, from a skewed
     batch to a uniform one, to one with padded (zero-length) slots, and back.
     """
-    if DEVICE_ARCH != "gfx950":
-        pytest.skip("the length-aware kv_split entry is tuned for gfx950")
+    _use_gfx950_length_aware_split(monkeypatch)
     torch.cuda.empty_cache()
     block_size, query_len = 128, 4
     skewed = _length_aware_seq_lens("skewed", query_len)
