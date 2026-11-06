@@ -32,10 +32,12 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 
 # Raw rocdl ops, here and in the sparse_prefill kernels, that flydsl.expr.rocdl.__all__
-# (FlyDSL 0.4) has no stable form of: s_setprio; sched_barrier and sched_group_barrier with
-# VALU/TRANS masks (sched_mfma, sched_vmem, sched_dsrd and sched_dswr name only their
-# groups); ballot, readlane and readfirstlane; perm_b32, cvt_pk_bf16_f32; exp2 as a bare
-# v_exp_f32.
+# (FlyDSL 0.4) has no stable form of: s_setprio and s_barrier; sched_barrier, and
+# sched_group_barrier with mask_mfma or VALU/TRANS masks (sched_mfma, sched_vmem, sched_dsrd
+# and sched_dswr name only their groups); ballot, readlane, readfirstlane, mbcnt_lo/hi,
+# update_dpp and ds_bpermute; perm_b32 and cvt_pk_bf16_f32; exp2 as a bare v_exp_f32;
+# raw_ptr_buffer_load (the union's membership bits) and gfx942's LDS DMA
+# raw_ptr_buffer_load_lds.
 from flydsl.expr import rocdl
 
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
@@ -96,8 +98,8 @@ PLATFORMS = {
     ),
     # MI355X, decision-tuned: the route terms and route_margin of sparse_prefill_order_masks
     # were chosen on 91 calibration layouts so that routed calls stay near the faster of
-    # all-union and host-gated all-direct (90 within 1.05x, worst 1.06x); they are not phase
-    # timings.
+    # all-union and all-direct under a union plan (90 within 1.05x, worst 1.06x); they are not
+    # phase timings.
     # union_ratio 1e30: sparse_prefill_compact proposes union for every tile;
     # route_all_or_none: sparse_prefill_order_masks also weighs keeping every union tile
     # against none when the union phase is throughput-bound.
@@ -112,7 +114,7 @@ PLATFORMS = {
         union_ratio=1e30,
         union_min_rows=1536,
         union_min_rows_per_head=0,
-        wide_tiles_per_cu=0.38095238095238093,
+        wide_tiles_per_cu=8 / 21,  # BQ21 from 2048 rows, BQ42 from 4096 (256 CUs)
         max_packed_kv_bytes=64 * 1024 * 1024,
         pack_tokens_per_row=32,
         route_all_or_none=True,
@@ -148,8 +150,9 @@ def platform() -> Platform:
                 f"{OVERRIDE}: expected name=value with name in {sorted(names)}"
             )
         kind = type(getattr(entry, name))
-        # bool("0") is True: a switch is written 0 or 1.
-        values[name] = bool(int(value)) if kind is bool else kind(value)
+        if kind is bool and value not in ("0", "1"):
+            raise ValueError(f"{OVERRIDE}: {name} is a switch, written 0 or 1")
+        values[name] = value == "1" if kind is bool else kind(value)
     entry = dataclasses.replace(entry, **values)
     values = dataclasses.astuple(entry)
     if not all(math.isfinite(v) and v >= 0 for v in values) or entry.route_margin >= 1:
@@ -658,8 +661,10 @@ def _pv(
 
 # ---- gfx950 (CDNA4): K32 MFMAs, transposed V reads, native BF16, 64-bank swizzles ----
 #
-# The union pipeline keeps its stages, waits and data flow; the MFMA shape, the V operand
-# path, the BF16 conversion and the K/V LDS layouts change (g = lane >> 4 below).
+# The union pipeline keeps its stages and data flow (lgkmcnt waits capped at 15, the
+# rendezvous its double buffer makes redundant dropped: sparse_prefill_union._body); the
+# MFMA shape, the V operand path, the BF16 conversion and the K/V LDS layouts change
+# (g = lane >> 4 below).
 #   QK: per K half, two M tiles of eight v_mfma_f32_16x16x32_bf16; step s takes K read
 #       m * 8 + s and Q part s, both dims 32s + 8g .. + 7. The K reads keep gfx942's keys
 #       and the S order (value i + 4m), so the masks of sparse_prefill_order_masks are
@@ -694,7 +699,7 @@ def _k_swizzle950(token, chunk):
 
 
 def _v_swizzle950(token, chunk):
-    """V LDS swizzle: _k_swizzle950 with the chunks XORed by _k_phase. In BF16 elements of (key, (dim, dims half)),
+    """V LDS swizzle: the chunk XORed with gfx942's K phase _k_phase (K uses _k_phase950). In BF16 elements of (key, (dim, dims half)),
     it is Swizzle<2,3,4> o Swizzle<1,5,5> over the layout (64,(128,2)):(128,(1,8192)) of _lds_row950's rows.
     """
     return chunk ^ _k_phase(token)
@@ -767,7 +772,7 @@ def _load_lds_tr(storage, address, immediate=0):
     )
     data = fx.make_rmem_tensor(4, fx.BFloat16)
     fx.copy(
-        fx.make_copy_atom(rocdl.cdna4.LDSReadTrans16_64b(), fx.BFloat16),
+        fx.make_copy_atom(rocdl.cdna4.LDSReadTrans(16, 64), fx.BFloat16),
         fx.make_view(pointer, fx.make_layout(4, 1)),
         data,
     )

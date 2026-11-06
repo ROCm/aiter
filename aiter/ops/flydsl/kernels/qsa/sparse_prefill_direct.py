@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Block-native gfx942 QSA sparse attention, without cross-query union construction.
+"""Block-native QSA sparse attention (gfx942, gfx950), without cross-query union construction.
 
 Layouts whose packed PK/PV scratch fits the platform's packed-KV budget, or whose
 context has at most pack_tokens_per_row tokens per query row, use the private

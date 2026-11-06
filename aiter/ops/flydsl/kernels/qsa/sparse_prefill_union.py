@@ -98,8 +98,8 @@ def _read_ids_g2r(blocks, tile, count, offset):
 
 
 def _kv_rows(ids, wave, row_bytes, slotted):
-    """SOFFSET rows of the wave's four blocks for the K/V DMA (K/V rows row_bytes apart):
-    lanes 0..3 hold their ids.
+    """Row offsets of the wave's four blocks for the K/V DMA (K/V rows row_bytes apart; the
+    DMA's SOFFSET on gfx942, added to its VOFFSET on gfx950): lanes 0..3 hold their ids.
 
     With a slot table the ids are pool blocks, kept as is for per-block descriptors."""
     rows = []
@@ -216,7 +216,8 @@ def _read_packet_g2s(
         row, limit = fx.Uint32(rows[packet // 4]), limits[packet & 3]
         soffset = _min(row, limit)
     data = [load(*read) for read in reads]
-    # Raw LDS DMA: BufferCopyLDS adds its own vmcnt wait; the pipeline waits itself.
+    # Raw LDS DMA; the pipeline places the vmcnt waits. (BufferCopyLDS32b compiles to the
+    # same code: the compiler's wait before the LDS reads falls where the pipeline's does.)
     rocdl.raw_ptr_buffer_load_lds(
         resource,
         fx.to_llvm_ptr(fx.get_iter(storage) + (base_destination + immediate)),
@@ -267,8 +268,9 @@ def _read_block_g2s950(
         )
     else:
         # _read_packet_g2s' SOFFSET min(row, limits[k]), per lane; with key k's row step it is
-        # at most the request's last key (limit), or k rows past the request start (limit 0),
-        # which the range check returns as 0. Below 4 GiB either way.
+        # at most the request's last key (limit), or k rows past the request start (limit 0):
+        # the range check returns 0 past the request's end, and with k + 1 tokens that row is
+        # the last key. Below 4 GiB either way.
         voffset = fx.Int32(_min(fx.Uint32(rows[block]), limit)) + voffset
     if tail_tile is not None:
         voffset = (tail_tile * BN + token < compact_len).select(
@@ -417,8 +419,9 @@ def _body(
 
     GFX950 swaps the per-arch pieces (sparse_prefill_common's gfx950 part): half the MFMAs
     (K32), 32 transposed V reads per half (eight before each of its four x4 LDS DMA blocks),
-    native BF16, and the half-major K/V layout and swizzles of its LDS DMA and reads. Stages,
-    waits and data flow are unchanged.
+    native BF16, and the half-major K/V layout and swizzles of its LDS DMA and reads. Stages
+    and data flow are unchanged; lgkmcnt waits are capped at 15, and the double buffer below
+    drops the rendezvous it makes redundant.
 
     GFX950 also double-buffers K and V: tile t sits in stage t & 1 of k_lds / v_lds. Each
     stage end is a rendezvous of all eight waves; waves 4-7 reach rendezvous r one stage
