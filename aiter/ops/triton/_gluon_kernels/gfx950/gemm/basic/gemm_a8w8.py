@@ -74,7 +74,8 @@ def _gemm_a8w8_kernel(
     num_pid_m = gl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = gl.cdiv(N, BLOCK_SIZE_N)
 
-    pid = remap_xcd(pid, num_pid_m * num_pid_n, NUM_XCDS)
+    grid_mn = num_pid_m * num_pid_n
+    pid = remap_xcd(pid, grid_mn, NUM_XCDS)
 
     pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M)
 
@@ -349,7 +350,8 @@ def _gemm_a8w8_preshuffled_kernel(
     num_pid_m = gl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = gl.cdiv(N, BLOCK_SIZE_N)
 
-    pid = remap_xcd(pid, num_pid_m * num_pid_n, NUM_XCDS)
+    grid_mn = num_pid_m * num_pid_n
+    pid = remap_xcd(pid, grid_mn, NUM_XCDS)
 
     pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M)
 

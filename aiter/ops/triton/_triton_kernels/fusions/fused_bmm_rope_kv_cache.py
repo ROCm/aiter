@@ -242,15 +242,16 @@ def _fused_fp4_bmm_rope_cat_and_cache_mla_kernel(
             c_scale = 1
         c_scale_rcprl = (1 / c_scale).to(tl.float32)
 
-        pid_head = pid // (NUM_KSPLIT * num_pid_m * num_pid_n)
-        pid_unified = pid % (NUM_KSPLIT * num_pid_m * num_pid_n)
+        grid_mn = num_pid_m * num_pid_n
+        pid_head = pid // (NUM_KSPLIT * grid_mn)
+        pid_unified = pid % (NUM_KSPLIT * grid_mn)
         pid_k = pid_unified % NUM_KSPLIT
         pid_tile = pid_unified // NUM_KSPLIT
 
         pid_head_i64 = tl.cast(pid_head, tl.int64)
 
         if NUM_KSPLIT == 1:
-            # remap_xcd(pid_tile, num_pid_m * num_pid_n)
+            # remap_xcd(pid_tile, grid_mn)
             pid_m, pid_n = pid_grid(
                 pid_tile, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M
             )

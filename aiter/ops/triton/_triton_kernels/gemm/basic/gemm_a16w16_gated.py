@@ -73,7 +73,8 @@ def _gemm_a16_w16_gated_kernel(
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
 
-    remap_xcd(pid, num_pid_m * num_pid_n)
+    grid_mn = num_pid_m * num_pid_n
+    remap_xcd(pid, grid_mn)
 
     pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
 

@@ -81,7 +81,8 @@ def _gemm_a16_w16_atomic_kernel(
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
 
     if NUM_KSPLIT == 1:
-        pid = remap_xcd(pid, num_pid_m * num_pid_n, NUM_XCDS=NUM_XCDS)
+        grid_mn = num_pid_m * num_pid_n
+        pid = remap_xcd(pid, grid_mn, NUM_XCDS=NUM_XCDS)
         pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
     else:
         pid_m = pid // num_pid_n

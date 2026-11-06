@@ -110,19 +110,17 @@ def _fused_gemm_afp4wfp4_a16w16_kernel(
     tl.assume(stride_c_bf16_n > 0)
 
     SCALE_GROUP_SIZE: tl.constexpr = 32
-    GRID_MN = tl.cdiv(M, BLOCK_SIZE_M) * (
-        tl.cdiv(N_fp4, BLOCK_SIZE_N) + tl.cdiv(N_bf16, BLOCK_SIZE_N)
-    )
-
-    pid_unified = tl.program_id(axis=0)
-    pid_unified = remap_xcd(pid_unified, GRID_MN * NUM_KSPLIT, NUM_XCDS=NUM_XCDS)
-
-    pid_k = pid_unified % NUM_KSPLIT
-    pid = pid_unified // NUM_KSPLIT
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n_fp4 = tl.cdiv(N_fp4, BLOCK_SIZE_N)
     num_pid_n_bf16 = tl.cdiv(N_bf16, BLOCK_SIZE_N)
     num_pid_n = num_pid_n_fp4 + num_pid_n_bf16
+    grid_mn = num_pid_m * num_pid_n
+
+    pid_unified = tl.program_id(axis=0)
+    pid_unified = remap_xcd(pid_unified, grid_mn * NUM_KSPLIT, NUM_XCDS=NUM_XCDS)
+
+    pid_k = pid_unified % NUM_KSPLIT
+    pid = pid_unified // NUM_KSPLIT
 
     if NUM_KSPLIT == 1:
         pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
@@ -407,19 +405,17 @@ def _fused_gemm_afp4wfp4_preshuffle_a16w16_kernel(
     tl.assume(stride_c_bf16_n > 0)
 
     SCALE_GROUP_SIZE: tl.constexpr = 32
-    GRID_MN = tl.cdiv(M, BLOCK_SIZE_M) * (
-        tl.cdiv(N_fp4, BLOCK_SIZE_N) + tl.cdiv(N_bf16, BLOCK_SIZE_N)
-    )
-
-    pid_unified = tl.program_id(axis=0)
-    pid_unified = remap_xcd(pid_unified, GRID_MN * NUM_KSPLIT, NUM_XCDS=NUM_XCDS)
-
-    pid_k = pid_unified % NUM_KSPLIT
-    pid = pid_unified // NUM_KSPLIT
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n_fp4 = tl.cdiv(N_fp4, BLOCK_SIZE_N)
     num_pid_n_bf16 = tl.cdiv(N_bf16, BLOCK_SIZE_N)
     num_pid_n = num_pid_n_fp4 + num_pid_n_bf16
+    grid_mn = num_pid_m * num_pid_n
+
+    pid_unified = tl.program_id(axis=0)
+    pid_unified = remap_xcd(pid_unified, grid_mn * NUM_KSPLIT, NUM_XCDS=NUM_XCDS)
+
+    pid_k = pid_unified % NUM_KSPLIT
+    pid = pid_unified // NUM_KSPLIT
 
     if NUM_KSPLIT == 1:
         pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
