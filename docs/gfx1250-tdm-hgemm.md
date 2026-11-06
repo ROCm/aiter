@@ -48,11 +48,8 @@ For the existing MiniMax M3 gfx1250 BF16 entries, run from the repository root:
 
     config=aiter/configs/model_configs/minimax_m3_eagle_bf16_tuned_gemm.csv
     python -m csrc.gemm_a16w16.gemm_a16w16_tune \
-  \
       --input_file "$config" --tuned_file "$config" \
-  \
       --all --libtype all --splitK --mp 3 --shape_grouped --batch 3 \
-  \
       --compare --update_improved --min_improvement_pct 3
 
 Use the same input/output path: the standard tuner's `--all` selects existing
@@ -70,7 +67,6 @@ remains opt-in via the existing `--with-hipblaslt` option.
 To verify the resulting table through the standard production-op benchmark:
 
     python -m csrc.gemm_a16w16.gemm_a16w16_tune \
-  \
       --run_config "$config" --input_file "$config" --tuned_file "$config"
 
 Tune and benchmark on representative hardware/load before interpreting results
