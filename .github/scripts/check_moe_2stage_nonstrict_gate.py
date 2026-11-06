@@ -8,7 +8,33 @@ import csv
 import re
 import sys
 
-FIELDS = ["token", "qType", "actType", "AQDType", "WQDType", "failure_mode"]
+FIELDS = [
+    "token",
+    "qType",
+    "actType",
+    "AQDType",
+    "WQDType",
+    "activation_bucket",
+    "failure_mode",
+]
+
+# The fused_moe dispatcher's actual intermediate-activation dtype switches
+# bf16->fp4 at larger token counts. This is NOT present in test_fmoe()'s
+# logged call signature (its AQDType parameter stays constant across the
+# whole sweep), so it can't be regex-extracted like the other fields.
+# Verified manually against the known baseline log (main run 41552231943,
+# job 125695520646): bf16 for token <= 128, fp4 once the dispatcher
+# switches at token >= 256.
+_BF16_ACTIVATION_TOKENS = {"1", "3", "5", "16", "32", "64", "128"}
+_FP4_ACTIVATION_TOKENS = {"256", "1024", "4096", "8192", "163840"}
+
+
+def activation_bucket_for_token(token):
+    if token in _BF16_ACTIVATION_TOKENS:
+        return "bf16"
+    if token in _FP4_ACTIVATION_TOKENS:
+        return "fp4"
+    return "?"
 
 
 def extract_failures(log_path):
@@ -48,7 +74,10 @@ def extract_failures(log_path):
 
         raw = lines[idx].strip()
         failure_mode = "nan" if "output contains NaN" in raw else "numeric"
-        sig = {k: grab(k) for k in FIELDS if k != "failure_mode"}
+        sig = {
+            k: grab(k) for k in FIELDS if k not in ("failure_mode", "activation_bucket")
+        }
+        sig["activation_bucket"] = activation_bucket_for_token(sig["token"])
         sig["failure_mode"] = failure_mode
         sig["_line"] = idx + 1
         sig["_raw"] = raw
