@@ -773,8 +773,7 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
                     splits = parse_bmm_kernel_name(name)["splits"]
                     runs.append((KERNEL_ID_BASE_BMM + j, splits, name, run_bmm_flydsl))
             runs.extend(
-                (kid, 1, instance.name, run_gemm_opus)
-                for kid, instance in opus
+                (kid, 1, instance.name, run_gemm_opus) for kid, instance in opus
             )
             for kernel_id, split_k, name, run in runs:
                 is_opus = run is run_gemm_opus

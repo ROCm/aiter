@@ -395,9 +395,7 @@ def build_one_gfx950(entry, args, llvm_bin, workdir):
                 _GFX950_STUB_TEMPLATE.format(
                     traits_header=entry.get(
                         "traits_header",
-                        entry["pipeline_header"].replace(
-                            "_pipeline_", "_traits_", 1
-                        ),
+                        entry["pipeline_header"].replace("_pipeline_", "_traits_", 1),
                     ),
                     pipeline_header=entry["pipeline_header"],
                     traits_type=traits_type,
@@ -713,9 +711,7 @@ def build_one(k, args, llvm_bin, workdir):
             _compile(args, llvm_bin, device_flags, stub_path, out, extra)
         except subprocess.CalledProcessError as error:
             sys.stderr.write((error.stdout or "") + (error.stderr or ""))
-            raise SystemExit(
-                f"build_co: hipcc failed for {symbol} ({what})"
-            ) from None
+            raise SystemExit(f"build_co: hipcc failed for {symbol} ({what})") from None
 
     print(f"[build_co] compiling {symbol}")
     run_compile(["--genco"], out_path, "genco")

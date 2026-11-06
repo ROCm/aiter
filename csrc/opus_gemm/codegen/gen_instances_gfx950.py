@@ -3336,7 +3336,7 @@ struct {alias} : {entry["traits"]} {{}};
         extra_includes = '#include "opus_gemm_common.cuh"'
         host_header = ""
     preamble = instance_impl_preamble(
-        '\n#include <climits>\n#include <type_traits>\n' + extra_includes
+        "\n#include <climits>\n#include <type_traits>\n" + extra_includes
     )
     source = f"{preamble}\n{device_source}" + _BPRESHUFFLE_HOST_TEMPLATE.format(
         host_header=host_header,
