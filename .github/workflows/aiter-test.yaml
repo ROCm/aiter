@@ -23,6 +23,64 @@ env:
   AITER_PREBUILD_MAX_JOBS: "64"
 
 jobs:
+  amd-runtime-smoke:
+    name: AMD Runtime Smoke Test
+    if: ${{ github.event_name == 'pull_request' && !github.event.pull_request.draft }}
+    runs-on: linux-aiter-mi35x-1-toolkit-test
+    timeout-minutes: 20
+    steps:
+      - name: Show host Docker and AMD runtime setup
+        run: |
+          set -euxo pipefail
+
+          echo "=== Runner ==="
+          echo "RUNNER_NAME=${RUNNER_NAME:-}"
+          hostname -f 2>/dev/null || hostname
+
+          echo "=== Host Docker runtimes ==="
+          docker info --format 'ServerVersion={{.ServerVersion}} DefaultRuntime={{.DefaultRuntime}} Runtimes={{json .Runtimes}}'
+
+          echo "=== Host AMD tools ==="
+          if command -v amd-ctk >/dev/null 2>&1; then
+            amd-ctk version
+            amd-ctk gpu list
+            amd-ctk cdi list
+          else
+            echo "amd-ctk not installed in the runner container; checking host Docker runtime via docker info."
+          fi
+
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi version || true
+            amd-smi list
+          else
+            echo "amd-smi not installed in the runner container."
+          fi
+
+      - name: Run AMD runtime smoke container
+        run: |
+          set -euxo pipefail
+
+          image=rocm/rocm-terminal:latest
+          docker pull "${image}"
+
+          docker run --rm \
+            --runtime=amd \
+            -e AMD_VISIBLE_DEVICES=all \
+            --name amd_runtime_smoke \
+            "${image}" \
+            bash -lc '
+              set -euxo pipefail
+              echo "=== Runtime environment ==="
+              env | sort | grep -E "^(AMD|ROCR|HIP|CUDA)_|VISIBLE_DEVICES" || true
+
+              echo "=== Device nodes ==="
+              ls -l /dev/kfd /dev/dri
+
+              echo "=== amd-smi ==="
+              amd-smi version || true
+              amd-smi list
+            '
+
   detect_aiter_test_scope:
     name: Detect Aiter Test Scope
     runs-on: ubuntu-latest
