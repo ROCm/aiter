@@ -42,13 +42,10 @@ Constraints:
   - control must be all zero at launch, and is left all zero on exit: the last part
     out of each row clears the row. Allocate it zeroed once and reuse it only on
     the same stream; a launch that does not finish leaves it dirty.
-  - The row barrier spins (s_sleep), so a row's active parts must be co-resident.
-    This is a regular launch, not a cooperative one, which FlyDSL does not offer.
-    A multi-part launch stays within one workgroup per CU, and rows are independent
-    and flattened x-fastest, so the earliest rows finish and free CUs for the rest.
-    That relies on in-order dispatch rather than a guarantee: a row stalls only
-    while other work leaves fewer free slots than it has parts. Do not reorder the
-    grid.
+  - The row barrier spins (s_sleep) in a regular launch, not a cooperative one,
+    which FlyDSL does not offer. A part still waiting at pass 0's merge takes over
+    the parts no workgroup has started, so a row never waits on a workgroup that
+    is not resident; other work holding the CUs only delays it.
 """
 
 import math
@@ -276,8 +273,8 @@ def decode_adaptive_grid(
     """The launch width, from the batch size and the width the row wants.
 
     A narrowed width is odd so each row starts on the next XCD while its parts stay
-    contiguous. Do not reorder the grid: a row's parts must be co-resident to clear
-    the spin barrier, and overshooting `cu_count` leaves them spinning. Always pass
+    contiguous. Overshooting `cu_count` leaves parts for a waiting peer to take
+    over, which is correct but slower. Always pass
     `seq`; without it a short row past 32 rows takes a split it should not.
     """
     widest = min(32, cu_count // max(1, rows))
