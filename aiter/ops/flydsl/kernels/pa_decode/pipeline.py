@@ -1995,7 +1995,16 @@ class Gfx1250Pipeline:
         state_stride = 2 + vh_count
         if const_expr(t.packed_lds):
             initial.append(fx.Float32(1.0))
-        resident_q = (
+        resident_bf16_q = (
+            t.bf16_page16_packed
+            and t.head_dim == 128
+            and t.m_tiles == 1
+            and t.query_group_size == 16
+            and t.query_length == 1
+            and t.sliding_window == 0
+            and not t.merged_output
+        )
+        resident_q = resident_bf16_q or (
             not t.bf16
             and (t.head_dim == 128 or t.packed_lds)
             and (t.m_tiles == 1 or t.fp8_multi_tile)
@@ -2007,23 +2016,26 @@ class Gfx1250Pipeline:
                 q_operands.append(
                     [
                         self.mem.operand(
-                            m * 16 * t.q_stride + d * 128,
+                            m * 16 * t.q_stride + d * (64 if t.bf16 else 128),
                             t.q_stride,
-                            128,
+                            32 if t.bf16 else 128,
                             ctx.lane16,
                             ctx.half,
                         )
-                        for d in range_constexpr(t.head_dim // 128)
+                        for d in range_constexpr(t.head_dim // (32 if t.bf16 else 128))
                     ]
                 )
-                q_scales.append(
-                    fx.Float32(
-                        self.mem.load(
-                            (m * 16 + ctx.lane16) * t.q_stride + t.head_dim,
-                            fx.Float32,
-                        )[0]
+                if const_expr(t.bf16):
+                    q_scales.append(fx.Float32(1.0))
+                else:
+                    q_scales.append(
+                        fx.Float32(
+                            self.mem.load(
+                                (m * 16 + ctx.lane16) * t.q_stride + t.head_dim,
+                                fx.Float32,
+                            )[0]
+                        )
                     )
-                )
         for token_i, state in range(begin, end, t.TOKENS, init=initial):
             token_base = fx.Int32(token_i)
             buffer = ((token_base - begin) // t.TOKENS) % t.buffers
