@@ -314,11 +314,12 @@ class QuickAllReduceInt4:
     Every launch, and every replay of a CUDA graph that captured one, of any
     mode (``allreduce``, ``allreduce_rmsnorm``, ``reduce_scatter``,
     ``all_gather``) must run in one serialized device order on each rank.
-    Launches through the same engine share its inbox slots and colors (the
+    Launches through the same engine share its inbox slots and colors: the
     single-phase modes use the ``super_tile=1`` engine at the default block,
-    as do the all-reduce sizes that the ladder gives that rung), so launches
-    in flight at once can read each other's payloads; one order for all
-    launches is the rule that holds for every ladder. The same host call order
+    and the all-reduce and the fused RMSNorm use it for the sizes whose rung
+    selects it (or falls back to it). Launches in flight at once can read each
+    other's payloads; one order for all launches is the rule that holds for
+    every ladder. The same host call order
     on every rank is not enough when the calls sit on independent streams; a
     switch of stream needs an event dependency (``wait_event`` /
     ``wait_stream``).
@@ -1147,7 +1148,8 @@ class QuickAllReduceInt4:
 
     def _sp_engine(self) -> _StEngine:
         """The engine the single-phase modes run on: ``super_tile=1`` at the
-        default block, whose inbox and colors they share with the all-reduce."""
+        default block, whose inbox and colors they share with the all-reduce
+        launches that select the same engine."""
         if self.algorithm != "mesh":
             raise ValueError(
                 "reduce_scatter / all_gather need the mesh algorithm, got "
@@ -1303,8 +1305,8 @@ class QuickAllReduceInt4:
         (``tile_bytes``, 32 KiB), so pass ``T`` divisible by ``world_size``.
         Every partial, this rank's own included, goes through the INT4 codec,
         so a row's value does not depend on which rank owns it (the all-reduce
-        adds its own share exactly). Shares the inbox and colors of
-        ``allreduce``; every rank must issue the same sequence of launches and
+        adds its own share exactly). Shares the inbox slots and colors with the
+        all-reduce launches that go through the same engine; every rank must issue the same sequence of launches and
         sizes, and every launch and graph replay on this communicator must run
         in one serialized device order (see the class docstring). Needs the
         mesh algorithm, the uncached inbox and a ``super_tile=1`` engine at the

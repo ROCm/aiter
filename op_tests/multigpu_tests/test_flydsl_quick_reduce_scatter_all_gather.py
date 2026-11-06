@@ -38,12 +38,17 @@ the rounding order of the sum shows) and all zeros:
   that has not passed the preflight is refused;
 * ``compile_sp``, and the first eager call without it, is a collective
   preflight: when one rank's tensors are invalid, or valid but of another size
-  or mode than its peers', every rank raises (the failing one its own
-  exception) and none hangs; the engine is then not ready and refuses a
-  capture, a retry on which the ranks agree passes the preflight, runs the
-  residency check of both builds and is correct, and launches on a ready engine
-  vote no more. The residency comparison is also run against stub artifacts,
-  without a device;
+  or mode than its peers', or a build or its residency check fails on one rank
+  only, every rank raises (the failing one its own exception) and none reaches
+  a launch; the engine is then not ready and refuses a capture, a retry on
+  which the ranks agree passes the preflight, runs the residency check on the
+  reduce-scatter build and then the all-gather build, and is correct, and
+  launches on a ready engine vote no more; ``compile_sp`` inside a capture is
+  refused before any vote or module load and leaves a ready engine ready. The
+  residency comparison is also run against stub artifacts, without a device;
+* the refusals above also hold on an engine that has passed the preflight, where
+  each launch's own check of its tensors refuses them, and none of them reaches a
+  launch;
 * all-reduce, reduce-scatter and all-gather alternate on one engine in every
   ordered pair, with each rank slowed in turn, and every output equals the
   isolated result of its call bit for bit: once on a one-rung ST=1 engine at a
@@ -230,6 +235,20 @@ def _expect_refused(call, pattern: str, label: str) -> None:
         raise AssertionError(f"{label}: accepted")
 
 
+def _no_launch(fly):
+    """Any launch through *fly* raises: a call that must be refused would
+    otherwise launch a persistent kernel on invalid tensors, or against peers
+    that do not, and show up as a fault or a hang instead of an assertion."""
+    return mock.patch.object(
+        type(fly), "_launch_eng", side_effect=AssertionError("a launch was reached")
+    )
+
+
+def _nonfinite(*tensors: torch.Tensor) -> int:
+    """How many of *tensors* hold a NaN or an inf."""
+    return sum(not bool(torch.isfinite(t).all()) for t in tensors)
+
+
 def _zeros_rows(n_rows: int, dtype=torch.bfloat16, *, device) -> torch.Tensor:
     """Zeros of *n_rows* rows at the refusal width."""
     return torch.zeros((n_rows, _REFUSE_HIDDEN), dtype=dtype, device=device)
@@ -281,8 +300,9 @@ def _check_refusals(fly, tp: int, device) -> None:
         ("rs misaligned input", lambda: fly.reduce_scatter(skewed, shard), align),
         ("ag misaligned output", lambda: fly.all_gather(shard, skewed), align),
     )
-    for label, call, pattern in cases:
-        _expect_refused(call, pattern, label)
+    with _no_launch(fly):
+        for label, call, pattern in cases:
+            _expect_refused(call, pattern, label)
 
 
 def _measure(
@@ -356,9 +376,9 @@ def _measure(
     fly.reduce_scatter(x2, out2)
     fly.all_gather(s2, full2)
     torch.cuda.synchronize()
-    # every comparison below is against out2 / full2, so the same NaN in them
-    # and in a later launch would pass
-    row["b2b_nonfinite"] = sum(not bool(torch.isfinite(t).all()) for t in (out2, full2))
+    # the odd launches below are compared with out2 / full2, so the same NaN in
+    # them and in a later launch would pass
+    row["b2b_nonfinite"] = _nonfinite(out2, full2)
     pairs = ((x, s, out, full), (x2, s2, out2, full2))
     bad = 0
     for slow in range(tp):
@@ -484,14 +504,27 @@ def _graph_replay(fly, rank: int, tp: int, device, gloo) -> dict:
 
 def _compile_capture_refused(fly, full, shard) -> bool:
     """``compile_sp`` inside a capture, on an engine that is ready, is refused
-    (it loads modules) before any vote, so every rank refuses alike, and the
-    engine stays ready."""
-    try:
-        with torch.cuda.graph(torch.cuda.CUDAGraph(), stream=torch.cuda.Stream()):
-            fly.compile_sp(full, shard)
-    except Exception as exc:  # noqa: BLE001 -- the text of the refusal is checked
-        text = _chain_text(exc)
-        return fly._sp_ready and "capture" in text and "compile_sp" in text
+    before any vote and any module load (it needs both, which a capture cannot
+    do), so every rank refuses alike, and the engine stays ready."""
+    import torch.distributed as dist
+
+    from aiter.ops.flydsl import quick_allreduce_int4 as host
+
+    with ExitStack() as stack:
+        votes = stack.enter_context(mock.patch.object(dist, "all_gather_object"))
+        loads = stack.enter_context(mock.patch.object(host, "preload_launcher"))
+        try:
+            with torch.cuda.graph(torch.cuda.CUDAGraph(), stream=torch.cuda.Stream()):
+                fly.compile_sp(full, shard)
+        except Exception as exc:  # noqa: BLE001 -- the text of the refusal is checked
+            text = _chain_text(exc)
+            return (
+                fly._sp_ready
+                and not votes.called
+                and not loads.called
+                and "capture" in text
+                and "compile_sp" in text
+            )
     return False
 
 
@@ -582,7 +615,7 @@ def _interleave(fly, rank: int, tp: int, device, sp_rows: int) -> dict:
         isolated.append(out)
     # Every comparison below is against these outputs, so a kernel that writes
     # the same NaN in the isolated and the back-to-back run would pass them.
-    nonfinite = sum(not bool(torch.isfinite(o).all()) for o in isolated)
+    nonfinite = _nonfinite(*isolated)
     mismatches = 0
     for slow in range(tp):
         outs = [torch.empty_like(o) for o in isolated]
@@ -628,7 +661,7 @@ def _check_unsupported_engines(rank: int, tp: int, device, gloo) -> None:
             QuickAllReduceInt4(
                 group=gloo, device=device, rank=rank, world_size=tp, **kw
             )
-        ) as fly:
+        ) as fly, _no_launch(fly):
             for name, call in (
                 ("reduce_scatter", partial(fly.reduce_scatter, full, shard)),
                 ("all_gather", partial(fly.all_gather, shard, full)),
@@ -823,10 +856,11 @@ def _run_rank_preflight(rank: int, tp: int, init_method: str) -> dict:
     """One rank's side of the single-phase preflight checks.
 
     Each case builds a fresh engine and makes rank 1 differ from the others;
-    the outcome of every rank's call is returned for ``_assert_preflight``. No
-    case may reach a launch (a stub raises there), so a guard that fails shows
-    up as an error and not as a persistent kernel waiting on a peer. A
-    preflight that does not vote leaves the others waiting on rank 1 in a gloo
+    the outcome of every rank's call is returned for ``_assert_preflight``. The
+    cases that must fail run with a stub that raises at any launch, so a guard
+    that fails shows up as an error and not as a persistent kernel waiting on a
+    peer; only the retry and the steady-state calls launch. A preflight that
+    does not vote leaves the others waiting on rank 1 in a gloo
     collective, which ends at gloo's own timeout (30 minutes by default) or at
     ``FLYDSL_QR_TIMEOUT`` (``_run_pool``), whichever comes first.
     """
@@ -854,11 +888,7 @@ def _run_rank_preflight(rank: int, tp: int, init_method: str) -> dict:
 
     def outcome(fly, call) -> dict:
         try:
-            with mock.patch.object(
-                QuickAllReduceInt4,
-                "_launch_eng",
-                side_effect=AssertionError("a launch was reached"),
-            ):
+            with _no_launch(fly):
                 call()
         except Exception as exc:  # noqa: BLE001 -- recorded, checked by the caller
             error, text = type(exc).__name__, str(exc)
@@ -918,7 +948,7 @@ def _run_rank_preflight(rank: int, tp: int, init_method: str) -> dict:
                     for c, mode in zip(calls, (host.MODE_RS, host.MODE_AG))
                 ],
                 "grid_and_cus": (eng.grid, fly._cu_count),
-                "cus_are_the_device_s": fly._cu_count
+                "cu_count_matches_device": fly._cu_count
                 == torch.cuda.get_device_properties(device).multi_processor_count,
             }
             # Ready: the launches no longer vote.
@@ -1014,7 +1044,7 @@ def _assert_preflight(ranks, *, world_size) -> None:
                 f"{where}: residency checks were not made on the reduce-scatter "
                 f"and then the all-gather build: {retry['residency_builds']}"
             )
-        if not retry["cus_are_the_device_s"]:
+        if not retry["cu_count_matches_device"]:
             fails.append(f"{where}: the CU count in use is not the device's")
         if res["steady_votes"]:
             fails.append(f"{where}: {res['steady_votes']} votes on ready launches")
@@ -1134,12 +1164,15 @@ def _assert_validity(ranks, *, world_size, label) -> dict:
 
 def _assert_extras(ranks, *, world_size) -> None:
     fails = []
+    # a rank whose peer failed to capture never replays: only the capture error
+    # is reported then
+    any_capture_error = any(res["graph"]["capture_error"] for res in ranks)
     for rank, res in enumerate(ranks):
         where = f"tp={world_size} rank {rank}"
         graph = res["graph"]
         if graph["capture_error"]:
             fails.append(f"{where}: graph capture failed: {graph['capture_error']}")
-        else:
+        elif not any_capture_error:
             if graph["replay_mismatches"]:
                 fails.append(
                     f"{where}: {graph['replay_mismatches']} graph replay outputs "
@@ -1150,7 +1183,7 @@ def _assert_extras(ranks, *, world_size) -> None:
             bad = [v for v in graph["replay_nmse"] if not v <= NMSE_MAX]
             if bad:
                 fails.append(f"{where}: graph replay NMSE {bad} > {NMSE_MAX}")
-            if graph["compile_capture_refused"] is False:
+            if not graph["compile_capture_refused"]:
                 fails.append(f"{where}: compile_sp inside a capture was not refused")
             if len(graph["replay_nmse"]) != 2 * _GRAPH_REPLAYS:
                 fails.append(

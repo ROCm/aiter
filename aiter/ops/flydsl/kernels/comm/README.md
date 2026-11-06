@@ -51,7 +51,8 @@ The mesh also runs one lap on its own, for sequence parallelism.
 `QuickAllReduceInt4.reduce_scatter(inp, out)` leaves each rank a contiguous
 block of rows of the sum, and `all_gather(inp, out)` concatenates the ranks'
 blocks. Both use INT4, `super_tile=1`, the 32 KiB tile (the payload is a whole
-number of tiles) and the all-reduce's inbox and colors. The reduce-scatter
+number of tiles) and the inbox and colors of the all-reduce's `super_tile=1`
+engine. The reduce-scatter
 quantizes a rank's own partial too, which the all-reduce does not, so a row's
 value does not depend on which rank owns it. They are validated on the
 `uncached` inbox only.
