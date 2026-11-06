@@ -10,14 +10,15 @@ the e8m0 block scales, optionally already in the CK layout that
 the weights, so this runs on the activation of every rotated projection.
 Unfused, it is a Hadamard matmul followed by a separate quant pass.
 
-One thread owns one RS-wide block, so the FWHT runs in registers with no
-cross-lane traffic, and the RS/32 MXFP4 groups of a block never straddle
-threads.
+One thread owns one 32-element MXFP4 group: it runs the first five FWHT
+stages in registers, and the RS/32 adjacent lanes of a block finish the
+remaining stages with lane shuffles. Each group's scale is then local to its
+thread.
 """
 
 # Do not add `from __future__ import annotations`: flydsl detects runtime
 # parameters from the annotation objects, and a stringified `fx.Int32` would
-# make `num_blocks` a compile-time constant (one JIT compile per M).
+# make `num_groups` a compile-time constant (one JIT compile per M).
 
 import math
 from functools import cache
@@ -37,8 +38,8 @@ from .tensor_shim import _run_compiled, ptr_arg
 
 MX_GROUP = 32  # elements per e8m0 scale
 VEC = 8  # bf16 per 128-bit load
-# One wave per CTA. On MI350X wider CTAs were no faster over 72 (RS, K, M)
-# shapes up to M=16384 and up to 31% slower at RS=128.
+# One wave per CTA. Over 36 (RS, K, M) shapes on MI350X, 128/256/512 threads
+# were at most 4% faster at any shape and up to 29% slower at others.
 BLOCK = 64
 SUPPORTED_RS = (32, 64, 128)
 
@@ -52,6 +53,19 @@ def _fwht(vals):
             for i in range(len(vals))
         ]
         h *= 2
+    return vals
+
+
+def _fwht_across_lanes(vals, lanes, lane):
+    """The FWHT stages that span `lanes` adjacent lanes: stage s pairs a lane
+    with lane ^ s; the lower lane keeps a + b and the upper one a - b, the same
+    pairing _fwht uses in registers."""
+    s = 1
+    while s < lanes:
+        upper = (lane & s) != 0
+        pairs = [(v, v.shuffle_xor(s, 64)) for v in vals]
+        vals = [upper.select(p - v, v + p) for v, p in pairs]
+        s *= 2
     return vals
 
 
@@ -78,12 +92,10 @@ def _ck_scale_offset(row, col, padded_cols):
 
 @cache
 def _build_rot_quant(K: int, RS: int, shuffle_scales: bool):
-    groups = RS // MX_GROUP  # e8m0 scales per thread
-    words = RS // 8  # packed fp4 i32 words per thread
-    blocks_per_row = K // RS
+    lanes = RS // MX_GROUP  # lanes sharing one RS block
     scale_cols = K // MX_GROUP
     padded_scale_cols = (scale_cols + 7) // 8 * 8
-    # When 1/sqrt(RS) is a power of two (RS=64) it is applied to each group's
+    # When 1/sqrt(RS) is a power of two (RS=64) it is applied to the group's
     # amax and to the conversion exponent instead of to every element. Scaling
     # by a power of two is exact, so the scales and fp4 bytes are unchanged.
     half_log2 = 0.5 * math.log2(RS)
@@ -95,91 +107,83 @@ def _build_rot_quant(K: int, RS: int, shuffle_scales: bool):
         x: fx.Pointer,
         xq: fx.Pointer,
         xs: fx.Pointer,
-        num_blocks: fx.Int32,
+        num_groups: fx.Int32,
     ):
-        blk = fx.block_idx.x * BLOCK + fx.thread_idx.x
+        grp = fx.block_idx.x * BLOCK + fx.thread_idx.x
 
-        # Buffer views bounded by num_blocks: threads past the end load zeros
+        # Buffer views bounded by num_groups: threads past the end load zeros
         # and their fp4 and row-major scale stores are dropped by the descriptor.
         def _thread_slice(ptr, width, atom_width):
-            view = fx.make_view(ptr, fx.make_layout(num_blocks * width, 1))
+            view = fx.make_view(ptr, fx.make_layout(num_groups * width, 1))
             buf = fx.rocdl.make_buffer_tensor(view, max_size=False)
             row = fx.slice(
-                fx.logical_divide(buf, fx.make_layout(width, 1)), (None, blk)
+                fx.logical_divide(buf, fx.make_layout(width, 1)), (None, grp)
             )
             return fx.logical_divide(row, fx.make_layout(atom_width, 1))
 
-        x_blk = _thread_slice(x, RS, VEC)
-        xq_blk = _thread_slice(xq, words, 4)
-        copy128 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
-        x_frag = fx.make_fragment_like(x_blk)
-        fx.copy(copy128, x_blk, x_frag)
+        x_grp = _thread_slice(x, MX_GROUP, VEC)
+        xq_grp = _thread_slice(xq, MX_GROUP // 8, 4)
+        x_frag = fx.make_fragment_like(x_grp)
+        fx.copy(
+            fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16), x_grp, x_frag
+        )
         x_vec = x_frag.load()
-        vals = _fwht([x_vec[i].to(fx.Float32) for i in range_constexpr(RS)])
+        vals = _fwht([x_vec[i].to(fx.Float32) for i in range_constexpr(MX_GROUP)])
+        vals = _fwht_across_lanes(vals, lanes, fx.thread_idx.x)
         if const_expr(fold):
             vals = [v.to(fx.BFloat16).to(fx.Float32) for v in vals]
         else:
             vals = [(v * norm).to(fx.BFloat16).to(fx.Float32) for v in vals]
 
-        packed_words = []
-        scales = []
-        for g in range_constexpr(groups):
-            grp = vals[g * MX_GROUP : (g + 1) * MX_GROUP]
-            amax = _amax(grp)
-            if const_expr(fold):
-                amax = amax * norm
-            e8m0 = fx.Int32(
-                emit_mx_e8m0_scale(
-                    amax, mode=MX_DEFAULT_ROUND_MODE, dtype=MxDtypeInt.FP4_E2M1
-                )
+        amax = _amax(vals)
+        if const_expr(fold):
+            amax = amax * norm
+        e8m0 = fx.Int32(
+            emit_mx_e8m0_scale(
+                amax, mode=MX_DEFAULT_ROUND_MODE, dtype=MxDtypeInt.FP4_E2M1
             )
-            scales.append(e8m0.to(fx.Int8))
-            # Scale for the unnormalized values; min keeps a NaN group in range.
-            exp = fx.min(e8m0 + fold, 255) if const_expr(fold) else e8m0
-            scale = (exp << 23).bitcast(fx.Float32)
-            for w in range_constexpr(MX_GROUP // 8):
-                packed = fx.Int32(0)
-                for p in range_constexpr(4):
-                    packed = fx.rocdl.cvt_scalef32_pk_fp4_f32(
-                        T.i32,
-                        packed,
-                        grp[w * 8 + 2 * p],
-                        grp[w * 8 + 2 * p + 1],
-                        scale,
-                        p,
-                    )
-                packed_words.append(fx.Int32(packed))
-
-        xq_frag = fx.make_fragment_like(xq_blk)
+        )
+        # Scale for the unnormalized values; min keeps a NaN group in range.
+        exp = fx.min(e8m0 + fold, 255) if const_expr(fold) else e8m0
+        scale = (exp << 23).bitcast(fx.Float32)
+        packed_words = []
+        for w in range_constexpr(MX_GROUP // 8):
+            packed = fx.Int32(0)
+            for p in range_constexpr(4):
+                packed = fx.rocdl.cvt_scalef32_pk_fp4_f32(
+                    T.i32,
+                    packed,
+                    vals[w * 8 + 2 * p],
+                    vals[w * 8 + 2 * p + 1],
+                    scale,
+                    p,
+                )
+            packed_words.append(fx.Int32(packed))
+        xq_frag = fx.make_fragment_like(xq_grp)
         xq_frag.store(fx.Vector.from_elements(packed_words, fx.Int32))
-        fx.copy(fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Int32), xq_frag, xq_blk)
+        fx.copy(fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Int32), xq_frag, xq_grp)
 
         if const_expr(shuffle_scales):
-            # Byte scatter with no contiguous run per thread, so plain indexed
-            # stores rather than a copy atom.
-            if blk < num_blocks:
-                row = blk // blocks_per_row
-                col_block = blk % blocks_per_row
-                for g in range_constexpr(groups):
-                    col = col_block * groups + g
-                    xs[_ck_scale_offset(row, col, padded_scale_cols)] = scales[g]
+            # Byte scatter, so a plain indexed store rather than a copy atom.
+            if grp < num_groups:
+                row = grp // scale_cols
+                col = grp % scale_cols
+                xs[_ck_scale_offset(row, col, padded_scale_cols)] = e8m0.to(fx.Int8)
                 if const_expr(  # noqa: SIM102 - preserve DSL staging
                     padded_scale_cols > scale_cols
                 ):
                     # Pad columns get e8m0 1.0, as written by shuffle_scale,
                     # rather than whatever the allocation held.
-                    if col_block == blocks_per_row - 1:
-                        for col in range_constexpr(scale_cols, padded_scale_cols):
-                            off = _ck_scale_offset(row, col, padded_scale_cols)
+                    if col == scale_cols - 1:
+                        for pad in range_constexpr(scale_cols, padded_scale_cols):
+                            off = _ck_scale_offset(row, pad, padded_scale_cols)
                             xs[off] = fx.Int8(0x7F)
         else:
-            xs_blk = _thread_slice(xs, groups, groups)
-            xs_frag = fx.make_fragment_like(xs_blk)
-            xs_frag.store(fx.Vector.from_elements(scales, fx.Int8))
+            xs_grp = _thread_slice(xs, 1, 1)
+            xs_frag = fx.make_fragment_like(xs_grp)
+            xs_frag.store(fx.Vector.from_elements([e8m0.to(fx.Int8)], fx.Int8))
             fx.copy(
-                fx.make_copy_atom(fx.rocdl.BufferCopy(8 * groups), fx.Int8),
-                xs_frag,
-                xs_blk,
+                fx.make_copy_atom(fx.rocdl.BufferCopy8b(), fx.Int8), xs_frag, xs_grp
             )
 
     @flyc.jit
@@ -187,17 +191,16 @@ def _build_rot_quant(K: int, RS: int, shuffle_scales: bool):
         x: fx.Pointer,
         xq: fx.Pointer,
         xs: fx.Pointer,
-        num_blocks: fx.Int32,
+        num_groups: fx.Int32,
         grid_x: fx.Int32,
         stream: fx.Stream,
     ):
-        rot_quant_kernel(x, xq, xs, num_blocks).launch(
+        rot_quant_kernel(x, xq, xs, num_groups).launch(
             grid=(grid_x, 1, 1), block=(BLOCK, 1, 1), stream=stream
         )
 
     # SLP packs the butterflies into v_pk_add_f32, and the moves its aligned
-    # register pairs need made the kernel up to 25% slower on MI350X; where it
-    # helped (RS=64), small edits elsewhere flipped it into a loss.
+    # register pairs need cost up to 24% on MI350X; its best case was 6%.
     launch.compile_hints.setdefault("llvm_options", {})["vectorize-slp"] = False
     return launch
 
@@ -251,14 +254,14 @@ def flydsl_rot_quant(x: torch.Tensor, RS: int = 64, shuffle_scales: bool = False
     if M == 0:
         return xq, xs
 
-    num_blocks = M * (K // RS)
+    num_groups = M * (K // MX_GROUP)
     _run_compiled(
         _build_rot_quant(K, RS, shuffle_scales),
         ptr_arg(x, fx.BFloat16),
         ptr_arg(xq, fx.Int32),
         ptr_arg(xs, fx.Int8),
-        num_blocks,
-        (num_blocks + BLOCK - 1) // BLOCK,
+        num_groups,
+        (num_groups + BLOCK - 1) // BLOCK,
         torch.cuda.current_stream(x.device),
     )
     return xq, xs
