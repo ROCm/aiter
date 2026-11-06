@@ -10,8 +10,9 @@ import torch
 
 import aiter
 from aiter import dtypes, gemm_a4w4
+from aiter.fused_moe import moe_sorting
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.flydsl import flydsl_rot_quant
+from aiter.ops.flydsl import flydsl_rot_quant, flydsl_rot_quant_moe_sort
 from aiter.ops.quant import per_1x32_f4_quant, per_1x32_f4_quant_hip
 from aiter.ops.shuffle import shuffle_scale, shuffle_weight
 from aiter.test_common import assertAllclose, benchmark, run_perftest
@@ -25,6 +26,7 @@ SUPPORTED_GFX = ["gfx950"]
 # it reads past K, so its result depends on the padding. The gemm check stays
 # within N >= 256 and K % 256 == 0.
 GEMM_MIN_N = 256
+MOE_BLOCK_M = 32
 
 
 def run_torch(x, rs, shuffle):
@@ -43,11 +45,28 @@ def run_torch(x, rs, shuffle):
     return xq.view(torch.uint8), xs.view(torch.uint8)
 
 
+def run_torch_moe_sort(x, rs, sorted_ids, num_valid_ids):
+    """run_torch, with each valid route's scales copied to its sorted row and
+    swizzled as mxfp4_moe_sort_fwd lays them out. Also returns those rows."""
+    m, k = x.shape
+    xq, xs = run_torch(x, rs, False)
+    valid = int(num_valid_ids[0])
+    token = (sorted_ids[:valid] & 0xFFFFFF).long()
+    rows = torch.arange(valid)[token < m]
+    sorted_rows = (sorted_ids.shape[0] + 31) // 32 * 32
+    cols = (k // 32 + 7) // 8 * 8
+    sorted_xs = torch.zeros(((sorted_rows + 255) // 256 * 256, cols), dtype=torch.uint8)
+    sorted_xs[rows, : k // 32] = xs[token[token < m]]
+    return xq, shuffle_scale(sorted_xs).view(-1, cols)[:sorted_rows], rows
+
+
 def scale_mask(shape, rows, cols, shuffle):
     """True on the scales of `rows` x first `cols` columns, in either layout."""
-    mask = torch.zeros(shape, dtype=torch.uint8)
+    mask = torch.zeros(((shape[0] + 255) // 256 * 256, shape[1]), dtype=torch.uint8)
     mask[rows, :cols] = 1
-    return (shuffle_scale(mask).view(shape) if shuffle else mask) != 0
+    if shuffle:
+        mask = shuffle_scale(mask).view(-1, shape[1])
+    return mask[: shape[0]] != 0
 
 
 def dequant(xq, xs):
@@ -55,24 +74,33 @@ def dequant(xq, xs):
     return vals * fp4_utils.e8m0_to_f32(xs.repeat_interleave(32, dim=1))
 
 
-@benchmark()
-def test_rot_quant(m, k, rs, shuffle):
+ZERO_ROW, TINY_ROW, NAN_ROW = 1, 3, 5
+
+
+def make_input(m, k):
     x = torch.randn((m, k), dtype=dtypes.bf16)
     # Outlier channels in every other row drive groups to the top of the e2m1
     # range, where the e8m0 rounding and the saturation decide the result.
     x[::2, ::37] *= 64
     # Rows 1, 3 and 5 when present: a zero row (a padded token), a row far
     # below the HIP amax floor, and a NaN whose groups must get e8m0 NaN (255).
-    zero_row, tiny_row, nan_row = 1, 3, 5
-    x[zero_row : zero_row + 1] = 0
-    x[tiny_row : tiny_row + 1] *= 1e-30
-    x[nan_row : nan_row + 1, 7] = float("nan")
+    # e2m1 has no NaN, so the bytes packed for a NaN group are arbitrary and
+    # only its scale is compared.
+    x[ZERO_ROW : ZERO_ROW + 1] = 0
+    x[TINY_ROW : TINY_ROW + 1] *= 1e-30
+    x[NAN_ROW : NAN_ROW + 1, 7] = float("nan")
+    return x
+
+
+@benchmark()
+def test_rot_quant(m, k, rs, shuffle):
+    x = make_input(m, k)
+    zero_row, tiny_row, nan_row = ZERO_ROW, TINY_ROW, NAN_ROW
     rows = torch.arange(m)
     ref_q, ref_s = run_torch(x, rs, shuffle)
 
-    # e2m1 has no NaN, so the bytes packed for a NaN group are arbitrary; only
-    # its scale is compared. The padding columns of the CK layout are compared
-    # too, the padding rows are uninitialized.
+    # The padding columns of the CK layout are compared too, the padding rows
+    # are uninitialized.
     candidates = {
         "flydsl": (
             lambda: flydsl_rot_quant(x, rs, shuffle_scales=shuffle),
@@ -154,6 +182,47 @@ def test_rot_quant_gemm_a4w4(m, n, k, rs):
     }
 
 
+@benchmark()
+def test_rot_quant_moe_sort(m, k, rs, experts, topk):
+    """The MoE stage-1 input: scales sorted by moe_sorting's sorted_ids. Only
+    the valid routes' rows are defined, so only they are compared."""
+    x = make_input(m, k)
+    ids = torch.rand((m, experts)).topk(topk, dim=1).indices.to(dtypes.i32)
+    sorted_ids, _, _, num_valid_ids, _ = moe_sorting(
+        ids, torch.rand((m, topk)), experts, k, dtypes.bf16, MOE_BLOCK_M
+    )
+    ref_q, ref_s, live_rows = run_torch_moe_sort(x, rs, sorted_ids, num_valid_ids)
+    (xq, xs), us = run_perftest(
+        flydsl_rot_quant_moe_sort, x, sorted_ids, num_valid_ids, topk, MOE_BLOCK_M, rs
+    )
+    err = assertAllclose(
+        ref_q.to(dtypes.fp32),
+        xq.view(torch.uint8).to(dtypes.fp32),
+        rtol=0,
+        atol=0,
+        tol_err_ratio=0,
+        mask=(torch.arange(m) != NAN_ROW).unsqueeze(1),
+        msg="flydsl: fp4",
+    )
+    assertAllclose(
+        ref_s.to(dtypes.fp32),
+        xs.view(torch.uint8).to(dtypes.fp32),
+        rtol=0,
+        atol=0,
+        tol_err_ratio=0,
+        mask=scale_mask(ref_s.shape, live_rows, k // 32, True),
+        msg="flydsl: sorted e8m0",
+    )
+    nbytes = m * k * x.element_size() + m * k // 2 + m * topk * k // 32
+    return {
+        "gfx": get_gfx(),
+        "us": us,
+        "TFLOPS": m * k * int(math.log2(rs)) / us / 1e6,
+        "TB/s": nbytes / us / 1e6,
+        "err": err,
+    }
+
+
 def test_rot_quant_rejects_bad_input():
     """Each of these would otherwise be read as contiguous bf16 and quantized
     to plausible-looking garbage."""
@@ -227,6 +296,24 @@ def main():
         help=f"""N of the gemm_a4w4 check, at least {GEMM_MIN_N}.
     e.g.: -n 4096""",
     )
+    parser.add_argument(
+        "-e",
+        "--experts",
+        type=int,
+        nargs="*",
+        default=[128],
+        help="""Experts of the MoE check.
+    e.g.: -e 128""",
+    )
+    parser.add_argument(
+        "-t",
+        "--topk",
+        type=int,
+        nargs="*",
+        default=[8],
+        help="""Routing top-k of the MoE check.
+    e.g.: -t 8""",
+    )
     args = parser.parse_args()
 
     df = [
@@ -247,6 +334,18 @@ def main():
     ]
     aiter.logger.info(
         "rot_quant + gemm_a4w4 summary (markdown):\n%s",
+        pd.DataFrame(df).to_markdown(index=False),
+    )
+
+    df = [
+        test_rot_quant_moe_sort(m, k, rs, experts, topk)
+        for rs, k, experts, topk, m in itertools.product(
+            args.rs, args.k, args.experts, args.topk, args.m
+        )
+        if k % rs == 0 and topk <= experts
+    ]
+    aiter.logger.info(
+        "rot_quant_moe_sort summary (markdown):\n%s",
         pd.DataFrame(df).to_markdown(index=False),
     )
 
