@@ -306,6 +306,10 @@ def prepare_pa_decode_plan(
         if not isinstance(sliding_window, int):
             raise TypeError("sliding_window must be an int")
         num_kv_heads, block_size, layout = _cache_geometry(key_cache)
+        if num_kv_heads < 1:
+            raise ValueError(
+                f"key_cache must contain at least one KV head, got {num_kv_heads}"
+            )
         head_dim = query.shape[-1]
         query_group_size = query.shape[1] // num_kv_heads
         kv_dtype = str(key_cache.dtype)
