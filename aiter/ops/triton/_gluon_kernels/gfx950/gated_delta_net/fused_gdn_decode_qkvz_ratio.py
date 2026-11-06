@@ -39,15 +39,15 @@ def _conv_loads(
 ):
     """Inputs of the width-four causal conv step, one channel per lane. Loads are
     unmasked (padding lanes carry a clamped, valid channel)."""
-    x = gl.load(Projection + projection_offset).to(gl.float32)
+    x = gl.load(Projection + projection_offset)
     history_ptr = State + slot * conv_slot_stride + channel * conv_channel_stride
-    h0 = gl.load(history_ptr).to(gl.float32)
-    h1 = gl.load(history_ptr + conv_width_stride).to(gl.float32)
-    h2 = gl.load(history_ptr + 2 * conv_width_stride).to(gl.float32)
-    w0 = gl.load(Weight + channel * 4).to(gl.float32)
-    w1 = gl.load(Weight + channel * 4 + 1).to(gl.float32)
-    w2 = gl.load(Weight + channel * 4 + 2).to(gl.float32)
-    w3 = gl.load(Weight + channel * 4 + 3).to(gl.float32)
+    h0 = gl.load(history_ptr)
+    h1 = gl.load(history_ptr + conv_width_stride)
+    h2 = gl.load(history_ptr + 2 * conv_width_stride)
+    w0 = gl.load(Weight + channel * 4)
+    w1 = gl.load(Weight + channel * 4 + 1)
+    w2 = gl.load(Weight + channel * 4 + 2)
+    w3 = gl.load(Weight + channel * 4 + 3)
     acc = gl.load(Bias + channel).to(gl.float32)
     return x, history_ptr, h0, h1, h2, w0, w1, w2, w3, acc
 
@@ -59,10 +59,14 @@ def _conv_finish(
     """Conv step on the inputs from _conv_loads. Only the history shift is masked,
     so a padding lane never races the channel's owner; also returns the shifted-in
     values, for a caller that stores the masked-off lanes later."""
-    acc = gl.fma(h0, w0, acc)
-    acc = gl.fma(h1, w1, acc)
-    acc = gl.fma(h2, w2, acc)
-    acc = gl.fma(x, w3, acc)
+    # bf16 tap products summed in fp32, as the unfused conv kernel.
+    acc = (
+        (h0 * w0).to(gl.float32)
+        + (h1 * w1).to(gl.float32)
+        + (h2 * w2).to(gl.float32)
+        + (x * w3).to(gl.float32)
+        + acc
+    )
     activated = _silu(acc)
     gl.store(history_ptr, h1.to(gl.bfloat16), mask=live)
     gl.store(history_ptr + conv_width_stride, h2.to(gl.bfloat16), mask=live)
@@ -113,7 +117,7 @@ def _gating(
 @gluon.jit
 def _dynamics(b, a, a_log, bias):
     decay = _exp(-_exp(a_log) * softplus(a + bias))
-    beta = _sigmoid(b).to(gl.bfloat16).to(gl.float32)
+    beta = _sigmoid(b)
     return decay, beta
 
 
@@ -172,11 +176,9 @@ def _epilogue(
         0.0,
     )
     rms = _inverse_rms(core, V, eps, False)
+    gate = gate.to(gl.float32)
     normalized = (
-        core
-        * rms[:, None]
-        * weight.to(gl.float32)[None, :]
-        * _silu(gate.to(gl.float32))
+        (core * rms[:, None] * weight.to(gl.float32)[None, :]) * (gate * _sigmoid(gate))
     ).to(gl.bfloat16)
     out_offset = (row + head)[:, None] * V + col[None, :]
     gl.store(Output + out_offset, normalized, mask=live)
