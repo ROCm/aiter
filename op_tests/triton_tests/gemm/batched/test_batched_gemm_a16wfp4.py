@@ -1,6 +1,9 @@
 import pytest
 import torch
 
+from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_a16wfp4 import (
+    _get_config,
+)
 from aiter.ops.triton.gemm.batched.batched_gemm_a16wfp4 import (
     batched_gemm_a16wfp4,
 )
@@ -202,6 +205,47 @@ def test_batched_gemm_a16wfp4(B: int, M: int, N: int, K: int, layout, dtype):
     batched_gemm_a16wfp4(x, w, w_scales, dtype, out, transpose_bm=False, prequant=True)
 
     torch.testing.assert_close(torch_out, out)
+
+
+# K = 320 is not a multiple of the BLOCK_SIZE_K (256) that the gfx950 table gives for
+# these shapes, so the second and last K block is masked. With as many K blocks as
+# pipeline stages, no earlier iteration has written the LDS buffer that block uses.
+@pytest.mark.parametrize("M", [16, 32])
+def test_batched_gemm_a16wfp4_masked_k_tail_ignores_stale_lds(M: int):
+    """The masked K tail must read `other`, not LDS left behind by an earlier kernel."""
+    if not (arch_info.is_fp4_avail()):
+        pytest.skip("MXFP4 not supported on this architecture")
+
+    B, N, K, dtype = 4, 512, 320, torch.bfloat16
+    config, _ = _get_config(M, N, K // 2)
+    # Same config on an even K (no masked lanes) with all-0xFF weights: e8m0 NaN
+    # scales fill the LDS buffers that the masked tail of the real GEMM maps to.
+    Bp, Mp, Kp = 16, 512, 3 * config["BLOCK_SIZE_K"]
+    nan_x = torch.ones((Bp, Mp, Kp), dtype=dtype, device="cuda")
+    nan_w = torch.full((Bp, N, Kp // 2), 0xFF, dtype=torch.uint8, device="cuda")
+    nan_w_scales = torch.full(
+        (Bp, Kp // SCALE_GROUP_SIZE, N), 0xFF, dtype=torch.uint8, device="cuda"
+    ).transpose(1, 2)
+    nan_out = torch.empty((Bp, Mp, N), dtype=dtype, device="cuda")
+    x, w, _x_scales, w_scales, out = generate_batched_gemm_a16wfp4_inputs(
+        B, M, N, K, dtype, layout="TN", output=True
+    )
+    torch_out = run_torch(x, w, w_scales, dtype).to(dtype)
+    for _ in range(3):
+        batched_gemm_a16wfp4(
+            nan_x,
+            nan_w,
+            nan_w_scales,
+            dtype,
+            nan_out,
+            config=dict(config),
+            transpose_bm=False,
+            prequant=True,
+        )
+        batched_gemm_a16wfp4(
+            x, w, w_scales, dtype, out, transpose_bm=False, prequant=True
+        )
+        torch.testing.assert_close(torch_out, out)
 
 
 def test_batched_gemm_a16wfp4_fake_honors_transpose_bm():
