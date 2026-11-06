@@ -39,7 +39,8 @@ from .mxfp4_gemm_common import (
     num_n_blocks_for,
 )
 
-NUM_CU = 256
+# The persistent grid's CU cap is baked into the launcher.
+DEFAULT_NUM_CU = 256
 
 
 def aq_bytes_for(max_m, k):
@@ -87,6 +88,8 @@ def compile_gemm2_a4w4_port(
     BN=256,
     BK=256,
     xcd_swizzle=0,
+    num_xcds: int = 8,
+    num_cu: int = DEFAULT_NUM_CU,
     use_valid_token_count=False,
 ):
     # use_valid_token_count (atomic only): bound scatter rows by min(cumsum[1], M);
@@ -127,6 +130,12 @@ def compile_gemm2_a4w4_port(
     _tag = f"ne{NE}_h{N_OUT}_i{_K}{_rtag}_bm{BM}{'_nt' if use_nt else ''}_{_epi_tag}"
     if xcd_swizzle > 0:
         _tag += f"_xcd{xcd_swizzle}"
+    # Round-robin uses num_xcds even when xcd_swizzle is zero.
+    if num_xcds != 8:
+        _tag += f"_nxcd{num_xcds}"
+    # Only the persistent epilogs cap the grid, so only they vary with the count.
+    if _persistent and num_cu != DEFAULT_NUM_CU:
+        _tag += f"_cu{num_cu}"
     if use_valid_token_count:
         _tag += "_valid_tokens"
     _name = f"gemm2_a4w4_port_{_tag}"
@@ -221,7 +230,7 @@ def compile_gemm2_a4w4_port(
             bound = total_m_blocks * fx.Int32(_num_n_blocks)
             grid_nb = fx.Int32(gpu.grid_dim.x)
 
-            _NXCD = 8
+            _NXCD = num_xcds
             _xq = _udiv(bound, _NXCD)
             _xr = _umod(bound, _NXCD)
             _SW = xcd_swizzle
@@ -287,8 +296,8 @@ def compile_gemm2_a4w4_port(
     ):
         if const_expr(_persistent):
             tw = i32_max_m_blocks * fx.Int32(_num_n_blocks)
-            persist = tw > NUM_CU * 4
-            grid_x = fx.Int64(persist.select(fx.Int32(NUM_CU), tw))
+            persist = tw > num_cu * 4
+            grid_x = fx.Int64(persist.select(fx.Int32(num_cu), tw))
         else:
             grid_x = fx.Int64(i32_max_m_blocks * _num_n_blocks)
         gemm2_kernel(
