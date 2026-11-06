@@ -1065,6 +1065,17 @@ def reduce_segments(
     else:
         v_dim_mask = tl.full((1,), 1, dtype=tl.int1)
 
+    if gate_ptr is not None:
+        # issued before the segment loads, so its latency hides under them
+        gate = tl.load(
+            gate_ptr
+            + query_token_idx.to(tl.int64) * gate_stride_0
+            + query_head_idx * V_HEAD_SIZE
+            + offs_vd,
+            mask=v_dim_mask,
+            other=0.0,
+        )
+
     if single_tile:
         # load segment maxima
         segm_offset = (
@@ -1154,14 +1165,6 @@ def reduce_segments(
 
     result = acc.to(output_ptr.type.element_ty)
     if gate_ptr is not None:
-        gate = tl.load(
-            gate_ptr
-            + query_token_idx.to(tl.int64) * gate_stride_0
-            + query_head_idx * V_HEAD_SIZE
-            + offs_vd,
-            mask=v_dim_mask,
-            other=0.0,
-        )
         gate = tl.sigmoid(gate.to(tl.float32)).to(gate.dtype).to(tl.float32)
         result = (result.to(tl.float32) * gate).to(output_ptr.type.element_ty)
 

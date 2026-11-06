@@ -114,6 +114,15 @@ _GFX12_TOKEN_SPLIT_FUSED = os.environ.get("AITER_GFX12_TOKEN_SPLIT_FUSED", "0") 
 # 128-segment grid, ~12 live): 21 -> 7.7 us. Not bitwise the Triton reduce (another
 # fp32 summation order): ~0.005% of the bf16 outputs one rounding step apart.
 _GFX12_SPLIT_REDUCE = os.environ.get("AITER_GFX12_SPLIT_REDUCE", "0") == "1"
+# gfx1250: the output gate inside the 2d kernel's epilogue (its gate tile TDM-loaded
+# before the attention loop) from this longest context on; below it, and with
+# AITER_UA2D_FUSED_EPILOGUE=0, the gate is the separate attention_output_gate_rows
+# launch after the 2d kernel. Short prefills (478-8192 new tokens, no prefix) measured
+# 2-6 us slower with the gate in the epilogue than with the separate launch.
+_UA2D_FUSED_EPILOGUE = os.environ.get("AITER_UA2D_FUSED_EPILOGUE", "1") == "1"
+_UA2D_FUSED_EPILOGUE_MIN_KV = int(
+    os.environ.get("AITER_UA2D_FUSED_EPILOGUE_MIN_KV", "16384")
+)
 # (SB segments a step, NUM_BUF LDS buffers, num_warps) of reduce_segments_split_gluon
 _GFX12_SPLIT_REDUCE_CONFIG = tuple(
     int(x)
@@ -704,16 +713,25 @@ def unified_attention(
         # The gfx1250 Gluon 2d kernel only handles bf16/fp8 q+kv (with optional
         # sinks / output_scale / shuffled_kv_cache)
         use_gluon_2d = is_2d_gluon_available(params, backend)
+        # the gate in the gfx1250 2d kernel's own epilogue (no row selection)
+        fused_2d_gate = (
+            output_gate is not None
+            and use_gluon_2d
+            and DEVICE_ARCH == "gfx1250"
+            and _2d_gate_fusable(params, output_rows)
+        )
         if use_gluon_2d:
             if DEVICE_ARCH == "gfx1250":
-                _unified_attention_2d_gfx1250(params)
+                _unified_attention_2d_gfx1250(
+                    params, output_gate=output_gate if fused_2d_gate else None
+                )
             elif DEVICE_ARCH == "gfx950":
                 _unified_attention_2d_gfx950(params)
             else:
                 assert False, f"No gluon subwrapper for {DEVICE_ARCH}"
         else:
             _unified_attention_2d_triton(params)
-        if epilogue:
+        if epilogue and not fused_2d_gate:
             _output_epilogue(out, final_out, output_gate, output_rows)
     else:
         use_gluon_3d = is_3d_gluon_available(params, backend)
@@ -872,6 +890,21 @@ def unified_attention(
     return final_out
 
 
+def _2d_gate_fusable(params: _UAParams, output_rows) -> bool:
+    """Whether the gfx1250 2d kernel applies the output gate in its epilogue: every row
+    (no row selection), a power-of-2 GQA group whose output columns split into
+    128-column groups, and a context from _UA2D_FUSED_EPILOGUE_MIN_KV on."""
+    nq = params.num_queries_per_kv
+    return (
+        output_rows is None
+        and _UA2D_FUSED_EPILOGUE
+        and int(params.max_seqlen_k) >= _UA2D_FUSED_EPILOGUE_MIN_KV
+        and nq & (nq - 1) == 0
+        and (nq * params.head_size_v) % 256 == 0
+        and params.head_size == params.head_size_v
+    )
+
+
 def _output_epilogue(out, final_out, output_gate, output_rows):
     """The output epilogue of reduce_segments for an attention that ends without it:
     final_out[r] = out[rows[r]] * sigmoid(gate[rows[r]]), in one launch."""
@@ -891,6 +924,8 @@ def _output_epilogue(out, final_out, output_gate, output_rows):
         WIDTH=width,
         BLOCK=block,
         num_warps=4,
+        # the roundings of the production _gated_pointwise_kernel, which runs unfused
+        enable_fp_fusion=False,
     )
 
 
@@ -1226,7 +1261,7 @@ _reduce_segments_{arch}(
 """
 
 
-def _unified_attention_2d_gfx1250(params: _UAParams):
+def _unified_attention_2d_gfx1250(params: _UAParams, output_gate=None):
     """
     Internal wrapper for the gfx1250 gluon kernel.
 
@@ -1357,6 +1392,9 @@ def _unified_attention_2d_gfx1250(params: _UAParams):
         query_scales_ptr=params.q_scales,
         query_scales_stride_0=params.q_scales.stride(0) if params.q_scales is not None else 0,
         query_scales_stride_1=params.q_scales.stride(1) if params.q_scales is not None else 0,
+        gate_ptr=output_gate,
+        gate_stride_0=output_gate.stride(0) if output_gate is not None else 0,
+        GATE=output_gate is not None,
         enable_fp_fusion=True,
     )
 

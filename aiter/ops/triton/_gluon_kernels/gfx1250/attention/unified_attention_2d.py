@@ -1447,8 +1447,22 @@ class AttentionProgram:
         output_stride_0,
         output_stride_1,
         USE_TDM: gl.constexpr = False,
+        g_smem=None,
     ):
+        """Store the normalized [BLOCK_M, HEAD_SIZE] tile (BLOCK_Q tokens x NUM_QUERIES_PER_KV heads, the PV
+        accumulator layout). With g_smem (issue_gate_load's gate tile, the same rows), the Qwen3-Next /
+        Qwen3.5 output gate first: out * sigmoid(gate) with the unfused gate kernel's roundings, the
+        attention rounded to the output dtype, the sigmoid to the gate dtype, the product to the output dtype."""
         casted_out = out.to(self.output_ptr.dtype.element_ty)
+        if g_smem is not None:
+            gate = g_smem.reshape([self.cfg.BLOCK_M, self.cfg.HEAD_SIZE]).load(
+                layout=self.cfg.pv_layout
+            )
+            g = gate.to(gl.float32)
+            g = (1.0 / (1.0 + gl.exp(-g))).to(gate.dtype).to(gl.float32)
+            casted_out = (casted_out.to(gl.float32) * g).to(
+                self.output_ptr.dtype.element_ty
+            )
 
         if USE_TDM and self.cfg.ARCH_NAME == "gfx1250":
             STORE_COLS: gl.constexpr = self.cfg.NUM_QUERIES_PER_KV * self.cfg.HEAD_SIZE
@@ -1510,6 +1524,44 @@ class AttentionProgram:
                 )
             else:
                 gl.store(self.output_ptr + o_offs, casted_out, mask=o_mask)
+
+    @gluon.jit
+    def issue_gate_load(
+        self,
+        gate_ptr,
+        gate_stride_0,
+        q_block_local_idx,
+        cur_batch_in_all_start_index,
+        kv_head_idx,
+        cur_batch_query_len,
+    ):
+        """TDM-load this program's [BLOCK_Q, NUM_QUERIES_PER_KV * HEAD_SIZE] output-gate tile into LDS
+        (rows past the sequence read as zero), for store_output's gate. Issued before the attention loop, so
+        its latency hides under it; the loop's TDM waits count from the newest ops, so this older load only
+        completes earlier than they require."""
+        cfg = self.cfg
+        COLS: gl.constexpr = cfg.NUM_QUERIES_PER_KV * cfg.HEAD_SIZE
+        g_layout: gl.constexpr = gl.SwizzledSharedLayout(
+            vec=1, per_phase=1, max_phase=1, order=[1, 0]
+        )
+        g_smem = gl.allocate_shared_memory(
+            gate_ptr.dtype.element_ty, [cfg.BLOCK_Q, COLS], layout=g_layout
+        )
+        g_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=gate_ptr
+            + cur_batch_in_all_start_index.to(gl.int64) * gate_stride_0
+            + kv_head_idx * COLS,
+            shape=[cur_batch_query_len, COLS],
+            strides=[gate_stride_0, 1],
+            block_shape=[cfg.BLOCK_Q, COLS],
+            layout=g_layout,
+        )
+        gl.amd.gfx1250.tdm.async_load(
+            g_desc,
+            [(q_block_local_idx * cfg.BLOCK_Q).to(gl.int32), 0],
+            g_smem,
+        )
+        return g_smem
 
     @gluon.jit
     def store_output_split(
@@ -2430,6 +2482,7 @@ unified_attention_gluon_kernel_2d_repr = make_kernel_repr(
         "Q_NVFP4",
         "KV_NVFP4",
         "V_NVFP4",
+        "GATE",
         "num_warps",
         "waves_per_eu",
     ],
@@ -2506,6 +2559,11 @@ def _unified_attention_gluon_kernel_2d(
     query_scales_ptr=None,  # Q_NVFP4: [num_tokens, num_query_heads, head_size // 16]
     query_scales_stride_0=0,
     query_scales_stride_1=0,
+    # Qwen3-Next / Qwen3.5 output gate (GATE): out * sigmoid(gate), gate [num_tokens, num_query_heads *
+    # head_size] with row stride gate_stride_0 (e.g. a column slice of the QKV-gate projection)
+    gate_ptr=None,
+    gate_stride_0=0,
+    GATE: gl.constexpr = False,
 ):
     NUM_WARPS: gl.constexpr = gl.num_warps()
     kv_head_idx = gl.program_id(0)
@@ -2703,6 +2761,16 @@ def _unified_attention_gluon_kernel_2d(
         q_scales,
     )
 
+    if GATE:
+        g_smem = pgm.issue_gate_load(
+            gate_ptr,
+            gate_stride_0,
+            q_block_local_idx,
+            cur_batch_in_all_start_index,
+            kv_head_idx,
+            cur_batch_query_len,
+        )
+
     # This split owns no tiles (more splits than active tiles). The partial
     # buffers are pre-filled with neutral values (M=-inf, L=0, acc=0) so the
     # later reduction simply ignores it.
@@ -2837,6 +2905,12 @@ def _unified_attention_gluon_kernel_2d(
     # Normalize and store output
     l_recip = pgm.out_scale / L[:, None]
     acc = acc * l_recip
+    if GATE:
+        gl.static_assert(not output_ptr.dtype.is_fp8(), "the output gate takes a bf16 / fp16 output")
+        gl.amd.gfx1250.tdm.async_wait(0)
+    else:
+        g_smem = None
+
     if output_ptr.dtype.is_fp8():
         acc = gl.minimum(acc, FP8_MAX)
         acc = gl.maximum(acc, FP8_MIN)
@@ -2850,4 +2924,5 @@ def _unified_attention_gluon_kernel_2d(
         output_stride_0,
         output_stride_1,
         USE_TDM=USE_TDM_STORE,
+        g_smem=g_smem,
     )
