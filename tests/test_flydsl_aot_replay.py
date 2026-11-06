@@ -178,3 +178,86 @@ def test_a4w4_csv_rows_reach_flydsl_through_public_replay(monkeypatch):
                 assert kernels, job
     finally:
         get_GEMM_config.cache_clear()
+
+
+def _blocked_jobs():
+    from aiter.aot.flydsl import chunk_gdn_blocked
+    from aiter.aot.flydsl.common import collect_aot_jobs
+
+    return collect_aot_jobs(chunk_gdn_blocked.DEFAULT_CSVS, chunk_gdn_blocked.parse_csv)
+
+
+def _blocked_job(**overrides):
+
+    job = next(
+        j
+        for j in _blocked_jobs()
+        if j["use_h0"] and not j["state_bf16"] and j["num_xcds"] == 8
+    )
+    return {**job, **overrides}
+
+
+def _replayed_kernels(module, job):
+    with (
+        dry_run("gfx950", job["cu_num"], python_ops=True, num_xcds=job.get("num_xcds")),
+        replay.identified_kernels() as kernels,
+    ):
+        module.replay(job)
+    return kernels
+
+
+def test_an_eligible_blocked_job_requests_the_three_blocked_kernels():
+    from aiter.aot.flydsl import chunk_gdn_blocked
+
+    kernels = _replayed_kernels(chunk_gdn_blocked, _blocked_job())
+    assert len(kernels) == 3  # build_map, carry, emit
+
+
+def test_xcd_counts_are_distinct_kernels_and_jobs():
+    from aiter.aot.flydsl import chunk_gdn_blocked
+
+    four = _replayed_kernels(chunk_gdn_blocked, _blocked_job(num_xcds=4))
+    eight = _replayed_kernels(chunk_gdn_blocked, _blocked_job(num_xcds=8))
+    assert len(four) == len(eight) == 3
+    assert not four & eight
+    jobs = _blocked_jobs()
+    assert {j["num_xcds"] for j in jobs} == {4, 8}
+    assert len({tuple(sorted(j.items())) for j in jobs}) == len(jobs)
+    assert chunk_gdn_blocked.describe(jobs[0]) != chunk_gdn_blocked.describe(
+        {**jobs[0], "num_xcds": 12 - jobs[0]["num_xcds"]}
+    )
+
+
+def test_replay_does_not_query_hip_for_the_xcd_count(monkeypatch):
+    from aiter.aot.flydsl import chunk_gdn_blocked
+    from aiter.jit.utils import chip_info
+
+    def no_query(*_a, **_k):
+        raise AssertionError("live HIP XCD query during replay")
+
+    monkeypatch.setattr(chip_info, "_query_num_xccs", no_query)
+    monkeypatch.setattr(chip_info, "get_current_hip_device", no_query)
+    assert len(_replayed_kernels(chunk_gdn_blocked, _blocked_job())) == 3
+
+
+@pytest.mark.parametrize("is_varlen", [False, True])
+def test_blocked_gate_reads_no_device_lengths(monkeypatch, is_varlen):
+    """Dense input is one sequence of T tokens and varlen carries host lengths;
+    neither may copy cu_seqlens back from the device."""
+    from aiter.aot.flydsl import chunk_gdn_blocked
+
+    def read_back(*_a, **_k):
+        raise AssertionError("device-to-host read")
+
+    monkeypatch.setattr(torch.Tensor, "tolist", read_back)
+    monkeypatch.setattr(torch.Tensor, "item", read_back)
+    kernels = _replayed_kernels(chunk_gdn_blocked, _blocked_job(is_varlen=is_varlen))
+    assert len(kernels) == 3
+
+
+def test_a_one_chunk_rule_job_stays_on_the_serial_path():
+    from aiter.aot.flydsl import chunk_gdn_h
+
+    job = {**_blocked_job(), "kernel_name": "chunk_gdn_fwd_h_flydsl_opt", "m": 8192}
+    del job["total_chunks"], job["max_seq_chunks"]
+    assert len(_replayed_kernels(chunk_gdn_h, job)) == 1

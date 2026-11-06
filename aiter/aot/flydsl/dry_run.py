@@ -123,9 +123,16 @@ def _register_stream_stub() -> None:
 
 @contextmanager
 def dry_run(
-    arch: str, cu_num: int, name: str | None = None, *, python_ops: bool = False
+    arch: str,
+    cu_num: int,
+    name: str | None = None,
+    *,
+    python_ops: bool = False,
+    num_xcds: int | None = None,
 ) -> Iterator[None]:
-    """Make the current process look like an ``arch`` GPU with ``cu_num`` CUs.
+    """Make the current process look like an ``arch`` GPU with ``cu_num`` CUs
+    and, when given, ``num_xcds`` XCDs (read through ``chip_info.get_num_xcds``;
+    the count is a device property, not derivable from the arch).
     ``name`` is the device name host code reads, e.g. to pick a per-GPU-model
     tuning table; it defaults to ``arch``. With ``python_ops``, aiter's
     registered ops that have a Python body run it instead of their fake, so a
@@ -210,6 +217,8 @@ def dry_run(
         "GPU_ARCHS": arch,
         "CU_NUM": str(cu_num),
     }
+    if num_xcds:
+        env["AITER_NUM_XCDS"] = str(num_xcds)
     with ExitStack() as stack:
         stack.enter_context(mock.patch.dict(os.environ, env))
         for function in cached:

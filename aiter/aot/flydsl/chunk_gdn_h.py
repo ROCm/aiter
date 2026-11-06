@@ -41,6 +41,11 @@ _DTYPES = ("torch.bfloat16", "torch.float16")
 # widest BV, as the work per CU only grows.
 _MAX_SEQUENCES = 8192
 _G_HEAD_MAJOR = (False, True)
+# XCD counts of the parts of each arch (MI300X: 8, MI350P: 4, MI355X: 8; MI300A
+# partitions vary). NUM_XCDS is a kernel kwarg and so part of the cache key; the
+# runtime reads it from the device, so each count is its own job, which replay
+# forks from the rows below and replays on a device profile of that count.
+XCD_VARIANTS = {"gfx942": (4, 8), "gfx950": (4, 8)}
 
 
 def _bool(value: str | None, default: bool) -> bool:
@@ -181,9 +186,10 @@ def describe(job: dict) -> str:
         )
         if job[name]
     )
+    xcds = f" num_xcds={job['num_xcds']}" if job.get("num_xcds") else ""
     return (
         f"chunk_gdn_h_opt K={job['K']} V={job['V']} BT={job['BT']} H={job['H']} "
-        f"Hg={job['Hg']} {job['dtype']} {batch} {flags}"
+        f"Hg={job['Hg']} {job['dtype']} {batch} {flags}{xcds}"
     )
 
 

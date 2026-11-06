@@ -194,7 +194,12 @@ def replay_job(
     started = time.time()
     with requested_kernels() as kernels:
         try:
-            with dry_run(arch, int(job.get("cu_num") or 0), python_ops=True):
+            with dry_run(
+                arch,
+                int(job.get("cu_num") or 0),
+                python_ops=True,
+                num_xcds=job.get("num_xcds"),
+            ):
                 module.replay(job)
             result["compile_time"] = time.time() - started
         except NotImplementedError as error:
@@ -296,7 +301,12 @@ def _kernel_sets(module: Any, job: dict, sizes: range) -> dict:
     # The runtime warns at every untuned size, and a scan visits thousands.
     logger.setLevel(logging.ERROR)
     try:
-        with dry_run(arch, int(job.get("cu_num") or 0), python_ops=True):
+        with dry_run(
+            arch,
+            int(job.get("cu_num") or 0),
+            python_ops=True,
+            num_xcds=job.get("num_xcds"),
+        ):
             for size in sizes:
                 with identified_kernels() as kernels:
                     try:
@@ -522,8 +532,28 @@ def _jobs(module: Any, csv_paths: list[str], args: argparse.Namespace | None) ->
     the defaults), else ``parse_csv`` over every path."""
     collect = getattr(module, "collect_jobs", None)
     if collect is not None:
-        return collect(csv_paths, args)
-    return collect_aot_jobs(csv_paths, module.parse_csv)
+        jobs = collect(csv_paths, args)
+    else:
+        jobs = collect_aot_jobs(csv_paths, module.parse_csv)
+    return _with_xcd_variants(module, jobs)
+
+
+def _with_xcd_variants(module: Any, jobs: list[dict]) -> list[dict]:
+    """Fork each job that names no ``num_xcds`` once per XCD count its arch has
+    in ``module.XCD_VARIANTS`` (arch -> counts). The count is a compile-time
+    kernel kwarg, so every part variant is its own cache entry and job."""
+    variants = getattr(module, "XCD_VARIANTS", None)
+    if not variants:
+        return jobs
+    default = _default_arch(module)
+    out = []
+    for job in jobs:
+        counts = variants.get(job_arch(job, default))
+        if "num_xcds" in job or not counts:
+            out.append(job)
+        else:
+            out.extend({**job, "num_xcds": n} for n in counts)
+    return out
 
 
 def _child_env(module: Any, csv_paths: list[str]) -> dict[str, str] | None:

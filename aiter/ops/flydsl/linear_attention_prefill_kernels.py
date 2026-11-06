@@ -30,6 +30,7 @@ from flydsl.runtime.device import get_rocm_arch
 from flydsl.utils.env import runtime as flydsl_runtime_env
 
 from aiter.jit.core import AITER_CONFIGS
+from aiter.jit.utils.chip_info import get_num_xcds
 from aiter.ops.prefill_batch_metadata import PrefillBatchLayout, _tensor_version
 
 from ..triton._triton_kernels.gated_delta_net.utils import (
@@ -545,34 +546,11 @@ def _resolve_snapshot_dtype(snapshot_dtype, input_dtype):
     return resolved
 
 
-# hipDeviceAttributeNumberOfXccs from hip_runtime_api.h (ROCm 7.x). The XCD
-# count is a device property (MI350P is gfx950 with 4, MI355X has 8), so it is
-# queried rather than derived from the arch.
-_HIP_ATTR_NUM_XCCS = 10018
-
-
-@functools.cache
-def _device_num_xcds(device_index: int) -> int:
-    """XCD count of a HIP device; 1 (identity work-group order) if unknown."""
-    try:
-        import ctypes
-
-        from aiter.dist.device_communicators.vmm_allocator import load_hip_runtime
-
-        value = ctypes.c_int(0)
-        err = load_hip_runtime().hipDeviceGetAttribute(
-            ctypes.byref(value), _HIP_ATTR_NUM_XCCS, int(device_index)
-        )
-        if err == 0 and value.value in (1, 2, 4, 8):
-            return value.value
-    except (ImportError, OSError, AttributeError, RuntimeError):
-        pass
-    return 1
-
-
 def _tensor_num_xcds(t: torch.Tensor) -> int:
-    index = t.device.index
-    return _device_num_xcds(torch.cuda.current_device() if index is None else index)
+    """XCD count (a device property: MI350P is gfx950 with 4, MI355X has 8).
+    ``get_num_xcds`` caches per device, honors an AOT replay's faked count, and
+    falls back to 1 (identity work-group order) when the query fails."""
+    return get_num_xcds(default=1)
 
 
 @functools.cache
@@ -997,10 +975,12 @@ def chunk_gated_delta_rule_fwd_h_flydsl_opt(
             T_flat,
             k.device,
             target_segments,
+            # Dense input is one sequence; passing it spares the resolver a
+            # device-to-host read of its placeholder cu_seqlens.
             lengths=(
                 prefill_metadata.layout.seq_lens_cpu
                 if prefill_metadata is not None
-                else None
+                else (T_flat,) if cu_seqlens is None else None
             ),
             num_heads=H,
         )
