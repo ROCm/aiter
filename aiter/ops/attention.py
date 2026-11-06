@@ -2164,7 +2164,10 @@ def _mla_legacy_max_qo_tiles_per_batch(
             )
         )
         or (
-            get_gfx() in ("gfx942", "gfx950")
+            # Sparse sizing returns before the shared head plan is applied.
+            # Reserve four PS1 QH16 tiles there; dense sizing already covers the
+            # fold through the plan, so keep its smaller legacy estimate.
+            (get_gfx() == "gfx950" or (get_gfx() == "gfx942" and not is_sparse))
             and num_head_qo == 64
             and q_dtype == dtypes.fp8
             and kv_dtype == dtypes.fp8
