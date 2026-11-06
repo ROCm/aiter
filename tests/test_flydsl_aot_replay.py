@@ -178,3 +178,67 @@ def test_a4w4_csv_rows_reach_flydsl_through_public_replay(monkeypatch):
                 assert kernels, job
     finally:
         get_GEMM_config.cache_clear()
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("with_out", [False, True])
+def test_mm_fallback_with_fp32_output_under_dry_run(dtype, with_out):
+    # The smallest M probed for kimik3_bf16_tuned_gemm has no tuned config
+    # and reaches torch.mm with out_dtype, whose torch 2.9.1 meta is broken.
+    with dry_run("gfx950", 256):
+        a = torch.empty((1, 7168), device="cuda", dtype=dtype)
+        w = torch.empty((896, 7168), device="cuda", dtype=dtype)
+        out = torch.empty((1, 896), device="cuda", dtype=torch.float32)
+        result = torch.mm(
+            a, w.t(), out_dtype=torch.float32, **({"out": out} if with_out else {})
+        )
+        assert result.shape == (1, 896)
+        assert result.dtype == torch.float32
+        assert result.device == a.device
+        if with_out:
+            assert result is out
+
+
+def test_mm_fallback_still_checks_shape_and_output_dtype():
+    with dry_run("gfx950", 256):
+        a = torch.empty((1, 16), device="cuda", dtype=torch.bfloat16)
+        w = torch.empty((8, 16), device="cuda", dtype=torch.bfloat16)
+        with pytest.raises(RuntimeError, match="same reduction dim"):
+            torch.mm(a, w, out_dtype=torch.float32)
+        with pytest.raises(RuntimeError, match="out_dtype"):
+            torch.mm(a, w.t(), out_dtype=torch.float64)
+
+
+@pytest.mark.parametrize("raise_in_body", [False, True])
+def test_legacy_mm_meta_is_restored_after_dry_run(raise_in_body):
+    import inspect
+
+    from torch._meta_registrations import meta_mm
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    if (
+        not hasattr(torch.ops.aten.mm, "dtype")
+        or "out_dtype" in inspect.signature(meta_mm).parameters
+    ):
+        pytest.skip("torch already has out_dtype meta support")
+
+    def mm():
+        a = torch.empty((1, 16), device="cuda", dtype=torch.bfloat16)
+        w = torch.empty((8, 16), device="cuda", dtype=torch.bfloat16)
+        return torch.mm(a, w.t(), out_dtype=torch.float32)
+
+    with FakeTensorMode(), pytest.raises(TypeError, match="meta_mm"):
+        mm()
+    from contextlib import nullcontext
+
+    expected = (
+        pytest.raises(RuntimeError, match="end replay")
+        if raise_in_body
+        else nullcontext()
+    )
+    with expected, dry_run("gfx950", 256):
+        assert mm().dtype == torch.float32
+        if raise_in_body:
+            raise RuntimeError("end replay")
+    with FakeTensorMode(), pytest.raises(TypeError, match="meta_mm"):
+        mm()
