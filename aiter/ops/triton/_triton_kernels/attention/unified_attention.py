@@ -725,24 +725,20 @@ class AttentionProgram:
 
     @triton.jit
     def causal_mask(self, seq_offset):
-        return seq_offset[None, :] < self.context_len + self.query_pos[:, None] + 1
+        # distance of each key behind its query; negative keys are in the future
+        key_dist = self.context_len + self.query_pos[:, None] - seq_offset[None, :]
+        if self.cfg.SLIDING_WINDOW > 0:
+            # one unsigned compare covers both 0 <= key_dist and key_dist < window
+            return key_dist.to(tl.uint32, bitcast=True) < self.cfg.SLIDING_WINDOW
+        return key_dist >= 0
 
     @triton.jit
     def apply_mask_qk(self, S, seq_offset, seq_mask):
-        S = tl.where(
+        return tl.where(
             self.query_mask_1[:, None] & self.query_mask_0[:, None] & seq_mask,
             S,
             float("-inf"),
         )
-
-        if self.cfg.SLIDING_WINDOW > 0:
-            S = tl.where(
-                (self.context_len + self.query_pos[:, None] - seq_offset)
-                < self.cfg.SLIDING_WINDOW,
-                S,
-                float("-inf"),
-            )
-        return S
 
     @triton.jit
     def apply_score_bias(self, S, seq_offset):
