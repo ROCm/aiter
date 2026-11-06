@@ -15,8 +15,8 @@ from ..jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from ..jit.utils.torch_guard import torch_compile_guard
 
 
-@compile_ops("module_mhc", develop=True)
-def mhc_pre_gemm_sqrsum(
+@compile_ops("module_mhc", fc_name="mhc_pre_gemm_sqrsum", develop=True)
+def _mhc_pre_gemm_sqrsum_hip(
     out: Tensor,
     sqrsum: Tensor,
     x: Tensor,
@@ -24,6 +24,30 @@ def mhc_pre_gemm_sqrsum(
     tile_k: int = 128,  # 64 or 128
     w_preshuffle_bf16: int = 0,  # 1: fn is pre-packed BF16 hi/lo from mhc_shuffle_fn
 ) -> None: ...
+
+
+def mhc_pre_gemm_sqrsum(
+    out: Tensor,
+    sqrsum: Tensor,
+    x: Tensor,
+    fn: Tensor,
+    tile_k: int = 128,
+    w_preshuffle_bf16: int = 0,
+) -> None:
+    # FlyDSL serves the 1024-wide K split on gfx950. HIP keeps every other request.
+    if (
+        tile_k == MHC_FNRES_KS
+        and get_gfx_runtime() == "gfx950"
+        and x.dtype == dtypes.bf16
+        and fn.size(0) == 24
+        and fn.size(1) % MHC_FNRES_KS == 0
+        and out.size(0) == fn.size(1) // MHC_FNRES_KS
+    ):
+        from .flydsl.mhc_pre_gemm_kernels import flydsl_mhc_pre_gemm_sqrsum
+
+        flydsl_mhc_pre_gemm_sqrsum(out, sqrsum, x, fn, bool(w_preshuffle_bf16))
+        return
+    _mhc_pre_gemm_sqrsum_hip(out, sqrsum, x, fn, tile_k, w_preshuffle_bf16)
 
 
 def mhc_fn_kb(arch: str | None = None) -> int:
@@ -352,14 +376,28 @@ def mhc_res_unshuffle(shuffled: torch.Tensor, ks: int | None = None) -> torch.Te
     return mhc_res_unshuffle_flydsl(shuffled, ks)
 
 
+# K slice per split for the FlyDSL pre GEMM on gfx950 (KS in flydsl/kernels/mhc_pre_gemm.py).
+MHC_FNRES_KS = 1024
+
+
 @functools.lru_cache(maxsize=1024)
 def get_mhc_pre_splitk(
-    m: int, hc_hidden_size: int, w_preshuffle_bf16: bool = False
+    m: int,
+    hc_hidden_size: int,
+    w_preshuffle_bf16: bool = False,
+    hc_mult3: int | None = None,
 ) -> tuple[int, int]:
     prefetch_stages = 2
     tile_m = 16 * 4
     num_cu = get_cu_num()
     arch = get_gfx_runtime()
+    if (
+        arch == "gfx950"
+        and hc_mult3 == 24
+        and m >= 2048
+        and hc_hidden_size % MHC_FNRES_KS == 0
+    ):
+        return hc_hidden_size // MHC_FNRES_KS, MHC_FNRES_KS
     # Vector LDS weight reads shorten the gfx1250 BF16 loop. More split-K
     # workgroups improve latency hiding for large M without changing FP32 tuning.
     prefill_tg_factor = (
@@ -707,11 +745,11 @@ def mhc_pre(
     packed_config = bool(w_preshuffle_bf16) and hc_mult == 4 and hc_mult3 == 24
     if large_m_splitk:
         selected_splitk, selected_tile_k = get_mhc_pre_splitk_large_m(
-            m, hc_hidden_size, w_preshuffle_bf16=packed_config
+            m, hc_hidden_size, w_preshuffle_bf16=packed_config, hc_mult3=hc_mult3
         )
     else:
         selected_splitk, selected_tile_k = get_mhc_pre_splitk(
-            m, hc_hidden_size, w_preshuffle_bf16=packed_config
+            m, hc_hidden_size, w_preshuffle_bf16=packed_config, hc_mult3=hc_mult3
         )
     device = residual.device
     out_pad = torch.empty(
@@ -800,12 +838,17 @@ def mhc_post(
 
 
 def get_mhc_pre_splitk_large_m(
-    m: int, hc_hidden_size: int, w_preshuffle_bf16: bool = False
+    m: int,
+    hc_hidden_size: int,
+    w_preshuffle_bf16: bool = False,
+    hc_mult3: int | None = None,
 ) -> tuple[int, int]:
     """Split-K policy for gfx950 large-M post_pre kernel (M > 1024)."""
     if get_gfx_runtime() == "gfx950" and m >= 8192 and hc_hidden_size % (8 * 64) == 0:
         return 8, 64
-    return get_mhc_pre_splitk(m, hc_hidden_size, w_preshuffle_bf16=w_preshuffle_bf16)
+    return get_mhc_pre_splitk(
+        m, hc_hidden_size, w_preshuffle_bf16=w_preshuffle_bf16, hc_mult3=hc_mult3
+    )
 
 
 @compile_ops("module_mhc", develop=True)
