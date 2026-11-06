@@ -137,15 +137,6 @@ def _mori():
     return Communicator, CCODevCommRequirements, GDA_CONNECTION_NONE
 
 
-def sdma_available() -> bool:
-    """Whether MORI CCO imports on this rank (SdmaComm agrees on it across the group)."""
-    try:
-        _mori()
-    except ImportError:
-        return False
-    return True
-
-
 def sdma_bitcode() -> str:
     """MORI's CCO device bitcode (code object version 6), which the big-M kernel links."""
     with _mori_env():

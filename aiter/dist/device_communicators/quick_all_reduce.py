@@ -11,7 +11,6 @@ import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 import aiter as ops
-from aiter.ops.quick_reduce_scatter import qr_reduce_scatter
 
 from ..parallel_state import in_the_same_node_as
 from .flydsl_utils import (
@@ -115,9 +114,6 @@ class QuickAllReduce:
         (torch.bfloat16, 4): [8 * MB, 64 * MB, 64 * MB, 16 * MB, 16 * MB],
         (torch.bfloat16, 8): [16 * MB, 2048 * MB, 2048 * MB, 2048 * MB, 2048 * MB],
     }
-    # MiniMax-M3 SP4 on gfx950: INT4 beat the BF16 custom reduce-scatter by 19%
-    # at 24 MiB but only 2% at 6 MiB, too little for another lossy step.
-    _QRS_MIN_SIZE: ClassVar[int] = 24 * MB
 
     def __init__(self, group: ProcessGroup, device: int | str | torch.device) -> None:
         """
@@ -149,7 +145,6 @@ class QuickAllReduce:
         self._route_selection_logged = False
         arch = _qr_rocm_arch()
         self._is_gfx1250 = "gfx1250" in arch
-        self._is_gfx950 = "gfx950" in arch
         if not qr_rocm_arch_available(arch):
             logger.debug(
                 "Custom quick allreduce is only supported on ROCm "
@@ -550,39 +545,6 @@ class QuickAllReduce:
         ops.qr_all_reduce(
             self._ptr, inp, out, self.qr_quant_level.value, self.use_fp16_kernels
         )
-        return out
-
-    def should_quick_reduce_scatter(self, inp: torch.Tensor) -> bool:
-        """Whether quick_reduce_scatter takes ``inp``: TP4 INT4 on gfx950, large
-        contiguous fp16/bf16 inputs split along dim 0."""
-        if (
-            self.disabled
-            or not self._is_gfx950
-            or self.world_size != 4
-            or self.qr_quant_level != QuickReduceRegime.INT4
-        ):
-            return False
-        if inp.dtype not in self._SUPPORTED_DTYPES or not inp.is_cuda:
-            return False
-        if not inp.is_contiguous() or inp.dim() == 0:
-            return False
-        if inp.shape[0] % self.world_size:
-            return False
-        inp_size = inp.numel() * inp.element_size()
-        return (
-            self._QRS_MIN_SIZE <= inp_size <= self.qr_max_size
-            and inp_size % (16 * self.world_size) == 0
-        )
-
-    def quick_reduce_scatter(
-        self, inp: torch.Tensor, *, out: torch.Tensor | None = None
-    ) -> torch.Tensor:
-        """This rank's dim-0 shard of the group sum of ``inp``. Lossy: every rank's
-        shard contribution is INT4-quantized once (should_quick_reduce_scatter
-        admits only inputs large enough to pay for it)."""
-        if out is None:
-            out = inp.new_empty((inp.shape[0] // self.world_size, *inp.shape[1:]))
-        qr_reduce_scatter(self._ptr, inp, out, bool(self.use_fp16_kernels))
         return out
 
     def should_quick_allreduce_rmsnorm(

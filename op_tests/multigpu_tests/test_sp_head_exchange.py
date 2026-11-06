@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """SP4 head-exchange layout, graph replay, and vector alignment contracts;
-the SP4 all-to-all and INT4 quick reduce-scatter."""
+the SP4 all-to-all."""
 
 import resource
 import socket
@@ -102,15 +102,21 @@ def _worker(rank, port, invalid_source):
     graph = torch.cuda.CUDAGraph()
     with ca.capture(), torch.cuda.graph(graph, stream=stream):
         out = ca.head_exchange(x)
+    # The pool still holds the staged x: the replay must read x itself.
+    x.add_(1)
     graph.replay()
-    torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
+    torch.testing.assert_close(out.cpu(), expected + 1, rtol=0, atol=0)
+    solo = CustomAllreduce(dist.new_subgroups(1)[0], torch.device("cuda", rank))
+    assert solo.disabled and not solo.should_head_exchange(x)
+    with pytest.raises(RuntimeError, match="head_exchange needs"):
+        solo.head_exchange(x)
     torch.cuda.synchronize()
     dist.barrier()
     ca.close()
     dist.destroy_process_group()
 
 
-def _collectives_worker(rank, port):
+def _all_to_all_worker(rank, port):
     from aiter.dist.parallel_state import (
         destroy_distributed_environment,
         destroy_model_parallel,
@@ -150,18 +156,6 @@ def _collectives_worker(rank, port):
         graph.replay()
         torch.testing.assert_close(recv, expected(seed), rtol=0, atol=0)
 
-    qr = comm.qr_comm
-    assert qr is not None and not qr.disabled
-    assert not qr.should_quick_reduce_scatter(part(rank, 0, (4096, 1024)))
-    assert not qr.should_quick_reduce_scatter(part(rank, 0, (4097, 3072)))
-    parts = [part(r, 4, (4096, 3072)) for r in range(4)]  # 24 MiB each
-    assert qr.should_quick_reduce_scatter(parts[rank])
-    out = qr.quick_reduce_scatter(parts[rank])
-    ref = sum(p.float() for p in parts)[rank * 1024 : (rank + 1) * 1024]
-    # Lossy (INT4 steps of max / 8 per 32 values); a wrong or missing shard is off > 50%.
-    assert out.shape == ref.shape
-    assert ((out.float() - ref).norm() / ref.norm()).item() < 0.15
-
     torch.cuda.synchronize()
     destroy_model_parallel()
     destroy_distributed_environment()
@@ -179,11 +173,9 @@ def _sp4_port():
         return sock.getsockname()[1]
 
 
-def test_sp_all_to_all_and_quick_reduce_scatter(monkeypatch):
+def test_sp_all_to_all():
     port = _sp4_port()
-    monkeypatch.setenv("AITER_QUICK_REDUCE_QUANTIZATION", "INT4")
-    monkeypatch.setenv("AITER_QUICK_REDUCE_MAX_SIZE_BYTES_MB", "64")
-    mp.spawn(_collectives_worker, args=(port,), nprocs=4, join=True)
+    mp.spawn(_all_to_all_worker, args=(port,), nprocs=4, join=True)
 
 
 @pytest.mark.parametrize("invalid_source", [None, "staged", "registered"])

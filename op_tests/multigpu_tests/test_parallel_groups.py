@@ -144,7 +144,9 @@ def _worker(
     # graph_capture() must arm the PCP group's custom all-reduce too.
     pcp_ca = getattr(pcp_grp.device_communicator, "ca_comm", None)
     with graph_capture():
-        group_info["pcp_capturing"] = pcp_ca is None or pcp_ca._IS_CAPTURING
+        group_info["pcp_capturing"] = pcp_size == 1 or (
+            pcp_ca is not None and pcp_ca._IS_CAPTURING
+        )
 
     x = all_inputs[rank].to(device)
 

@@ -2645,6 +2645,12 @@ class CustomAllreduce:
         """
         from aiter.ops.sp_head_exchange import sp_head_exchange
 
+        # The op casts the handle to the pre-gfx1250 communicator.
+        if self.disabled or self._is_gfx1250:
+            raise RuntimeError(
+                "head_exchange needs an enabled custom allreduce on the "
+                "pre-gfx1250 kernel; check should_head_exchange first"
+            )
         out = torch.empty(
             (inp.shape[0] // 4, inp.shape[1] * 4), dtype=inp.dtype, device=inp.device
         )
