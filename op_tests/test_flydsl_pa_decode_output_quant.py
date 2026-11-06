@@ -208,6 +208,16 @@ def test_sparse_pa_output_quant_matches_separate_kernel(
         assert selected["cluster_merge"] == 0
         assert selected["direct_output"] is True
 
+    # A repeated call with the same signature takes the validated launch
+    # (no dispatch); the split fallback keeps the checked path.
+    calls = len(compile_calls)
+    output.fill_(float("nan"))
+    output_fp8.view(torch.uint8).fill_(0x7F)
+    output_scale.fill_(float("nan"))
+    launch(quantized=True)
+    check()
+    assert len(compile_calls) == (calls + 1 if mode == "split" else calls)
+
     # Replay must read new query values and must not retain scale/max scratch.
     capture_stream = torch.cuda.Stream()
     capture_stream.wait_stream(torch.cuda.current_stream())
