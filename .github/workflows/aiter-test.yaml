@@ -21,6 +21,8 @@ env:
   GPU_ARCH_LIST: "gfx942;gfx950"
   AITER_WHEEL_ARTIFACT_NAME: aiter-whl-${{ github.run_id }}
   AITER_PREBUILD_MAX_JOBS: "64"
+  # Measured at 1.9GB after a cold build plus two incremental ones.
+  AITER_CCACHE_MAXSIZE: "6G"
 
 jobs:
   detect_aiter_test_scope:
@@ -214,6 +216,24 @@ jobs:
           fi
           echo "CK commit: $(git -C 3rdparty/composable_kernel rev-parse HEAD)"
 
+      - name: Restore compiler cache
+        # The wheel cache above is keyed on the commit, so it only ever helps a
+        # re-run of the same SHA: every new commit rebuilds all ~140 modules for
+        # both arches from scratch. This cache is keyed on the SHA too, but its
+        # restore-keys fall back to whatever the previous build left, which is
+        # what makes it useful across commits.
+        if: ${{ matrix.build_enabled && steps.restore_aiter_wheel.outputs.cache-hit != 'true' }}
+        id: restore_ccache
+        continue-on-error: true
+        uses: actions/cache/restore@v4
+        env:
+          SEGMENT_DOWNLOAD_TIMEOUT_MINS: 15
+        with:
+          path: .ccache
+          key: ${{ runner.os }}-aiter-ccache-py${{ matrix.python_version }}-${{ env.GPU_ARCH_LIST }}-${{ github.event.pull_request.head.sha || github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-aiter-ccache-py${{ matrix.python_version }}-${{ env.GPU_ARCH_LIST }}-
+
       - name: Docker login
         if: ${{ matrix.build_enabled && steps.restore_aiter_wheel.outputs.cache-hit != 'true' && (!github.event.pull_request || !github.event.pull_request.head.repo.fork) }}
         env:
@@ -241,6 +261,9 @@ jobs:
             --network=host \
             -e AITER_PREBUILD_MAX_JOBS="${{ env.AITER_PREBUILD_MAX_JOBS }}" \
             -e AITER_RUNNER_NAME="${RUNNER_NAME:-unknown}" \
+            -e CCACHE_DIR=/workspace/.ccache \
+            -e CCACHE_MAXSIZE="${{ env.AITER_CCACHE_MAXSIZE }}" \
+            -e CCACHE_COMPILERCHECK=content \
             -v "${{ github.workspace }}:/workspace" \
             -w /workspace \
             ${{ matrix.docker_image }} \
@@ -250,6 +273,19 @@ jobs:
               git -C /workspace rev-parse HEAD >/dev/null &&
               shopt -s nullglob &&
               rm -rf dist build aiter_meta ./*.egg-info &&
+              # aiter/jit/utils/cpp_extension.py reads ROCM_HOME before it falls
+              # back to `which hipcc`, so a shim earlier on PATH routes the HIP
+              # compiles through ccache without the toolchain lookup deriving a
+              # bogus ROCm root from the shim path.
+              { command -v ccache >/dev/null 2>&1 ||
+                { apt-get update -qq && apt-get install -y -qq ccache; }; } &&
+              mkdir -p /tmp/ccache-shim &&
+              printf "#!/bin/sh\nexec ccache /opt/rocm/bin/hipcc \"\$@\"\n" \
+                > /tmp/ccache-shim/hipcc &&
+              chmod +x /tmp/ccache-shim/hipcc &&
+              export PATH=/tmp/ccache-shim:$PATH &&
+              export ROCM_HOME=/opt/rocm &&
+              ccache --zero-stats >/dev/null &&
               pip install -r requirements.txt &&
               pip install --upgrade pandas pyzmq einops numpy==1.26.2 &&
               pip install --upgrade "pybind11>=3.0.1" &&
@@ -275,6 +311,7 @@ jobs:
                 exit "${build_status}"
               fi
               ls -lh dist/*.whl
+              ccache --show-stats
             '
 
       - name: Summarize Aiter prebuild
@@ -346,6 +383,16 @@ jobs:
         with:
           path: aiter_wheels
           key: ${{ runner.os }}-aiter-wheel-${{ github.event.pull_request.head.sha || github.sha }}-py${{ matrix.python_version }}
+
+      - name: Save compiler cache
+        # Saved even when the build failed: a failed run still populated most of
+        # the cache, and throwing that away would make the retry pay full price.
+        if: ${{ always() && matrix.build_enabled && steps.restore_aiter_wheel.outputs.cache-hit != 'true' && steps.restore_ccache.outcome == 'success' }}
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: .ccache
+          key: ${{ runner.os }}-aiter-ccache-py${{ matrix.python_version }}-${{ env.GPU_ARCH_LIST }}-${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Upload wheel as artifact
         if: ${{ matrix.build_enabled }}
