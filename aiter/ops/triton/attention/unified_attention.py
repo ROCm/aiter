@@ -43,9 +43,13 @@ try:
     from aiter.ops.triton._gluon_kernels.gfx1250.attention.unified_attention_reduce import (
         reduce_segments_split_gluon as _reduce_segments_split_kernel_gfx1250,
     )
+    from aiter.ops.triton._gluon_kernels.gfx1250.attention.unified_attention_reduce import (
+        reduce_segments_split_oneshot_gluon as _reduce_segments_split_oneshot_kernel_gfx1250,
+    )
 except:  # noqa: E722
     _reduce_segments_kernel_gfx1250 = None
     _reduce_segments_split_kernel_gfx1250 = None
+    _reduce_segments_split_oneshot_kernel_gfx1250 = None
 
 # gfx950
 try:
@@ -116,6 +120,21 @@ _UA2D_FUSED_EPILOGUE = os.environ.get("AITER_UA2D_FUSED_EPILOGUE", "1") == "1"
 _UA2D_FUSED_EPILOGUE_MIN_KV = int(
     os.environ.get("AITER_UA2D_FUSED_EPILOGUE_MIN_KV", "16384")
 )
+# Opt-in (or unified_attention(split_reduce_oneshot=True)), with the split reduce:
+# reduce_segments_split_oneshot_gluon in its place, bitwise the same output. Its loads
+# (the first CHUNK segments' partials, the statistics, the output gate) are all in
+# flight at once instead of a chain of dependent round trips.
+_GFX12_SPLIT_REDUCE_ONESHOT = (
+    os.environ.get("AITER_GFX12_SPLIT_REDUCE_ONESHOT", "0") == "1"
+)
+# (CHUNK segments a pass loads, SPEC of them before the context length, num_warps)
+_GFX12_SPLIT_REDUCE_ONESHOT_CONFIG = tuple(
+    int(x)
+    for x in os.environ.get("AITER_GFX12_SPLIT_REDUCE_ONESHOT_CONFIG", "64,32,2").split(
+        ","
+    )
+)
+
 
 DEVICE_ARCH = arch_info.get_arch()
 IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250", "gfx1250-strict")
@@ -458,6 +477,9 @@ def unified_attention(
     # gfx1250: the split-KV reduce of decode / spec-decode verify (equal_seqlen_q)
     # through reduce_segments_split_gluon; None follows AITER_GFX12_SPLIT_REDUCE.
     split_reduce: bool | None = None,
+    # with the split reduce: reduce_segments_split_oneshot_gluon (bitwise the same
+    # output, its loads in one round trip); None follows AITER_GFX12_SPLIT_REDUCE_ONESHOT.
+    split_reduce_oneshot: bool | None = None,
 ):
     assert causal, "Only causal attention is supported"
 
@@ -778,6 +800,8 @@ def unified_attention(
         )
         if split_reduce is None:
             split_reduce = _GFX12_SPLIT_REDUCE
+        if split_reduce_oneshot is None:
+            split_reduce_oneshot = _GFX12_SPLIT_REDUCE_ONESHOT
         if (
             split_reduce
             and not use_gluon_reduce
@@ -793,6 +817,7 @@ def unified_attention(
                 segm_tiles=segm_tiles,
                 output_gate=output_gate,
                 output_rows=output_rows,
+                oneshot=split_reduce_oneshot,
             )
         elif use_gluon_reduce:
             if DEVICE_ARCH in ("gfx1250", "gfx1250-strict"):
@@ -1526,11 +1551,48 @@ def _reduce_segments_split_gfx1250(
     segm_tiles=None,
     output_gate=None,
     output_rows=None,
+    oneshot=False,
 ):
     num_rows = params.num_tokens if output_rows is None else output_rows.shape[0]
     if num_rows == 0:
         return
     sb, num_buf, num_warps = _GFX12_SPLIT_REDUCE_CONFIG
+    sb = min(sb, NUM_SEGMENTS)
+    if oneshot and _reduce_segments_split_oneshot_kernel_gfx1250 is not None:
+        chunk, spec, oneshot_warps = _GFX12_SPLIT_REDUCE_ONESHOT_CONFIG
+        chunk = max(sb, min(chunk, NUM_SEGMENTS) // sb * sb)
+        if params.head_size_v % (32 * oneshot_warps) == 0:
+            _reduce_segments_split_oneshot_kernel_gfx1250[
+                (num_rows, params.num_query_heads)
+            ](
+                params.out,
+                segm_output,
+                segm_max,
+                segm_expsum,
+                params.seqused_k,
+                params.num_seqs,
+                segm_tiles,
+                params.output_scale,
+                output_gate,
+                output_gate.stride(0) if output_gate is not None else 0,
+                output_rows,
+                params.out.stride(0),
+                params.out.stride(1),
+                H=params.num_query_heads,
+                S=NUM_SEGMENTS,
+                D=params.head_size_v,
+                TILE_SIZE=TILE_SIZE,
+                SEQLEN_Q=1 if params.all_decode else int(params.max_seqlen_q),
+                SB=sb,
+                CHUNK=chunk,
+                SPEC=min(spec, chunk) // sb * sb,
+                NUM_WARPS=oneshot_warps,
+                IS_FP8_OUT=(params.out.dtype == e4m3_dtype),
+                FP8_MIN=torch.finfo(e4m3_dtype).min,
+                FP8_MAX=torch.finfo(e4m3_dtype).max,
+                num_warps=oneshot_warps,
+            )
+            return
     _reduce_segments_split_kernel_gfx1250[(num_rows, params.num_query_heads)](
         params.out,
         segm_output,
@@ -1550,7 +1612,7 @@ def _reduce_segments_split_gfx1250(
         D=params.head_size_v,
         TILE_SIZE=TILE_SIZE,
         SEQLEN_Q=1 if params.all_decode else int(params.max_seqlen_q),
-        SB=min(sb, NUM_SEGMENTS),
+        SB=sb,
         NUM_BUF=num_buf,
         NUM_WARPS=num_warps,
         IS_FP8_OUT=(params.out.dtype == e4m3_dtype),

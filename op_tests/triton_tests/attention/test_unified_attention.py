@@ -2183,3 +2183,121 @@ def test_unified_attn_split_reduce_k4v8(
         f"split reduce vs Triton reduce: {int(differ.sum())}/{differ.numel()} outputs"
         f" differ, max |diff| {(a - b).abs().max().item():.3g}"
     )
+
+
+@pytest.mark.parametrize("gate, select", [(False, False), (True, False), (True, True)])
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        # MTP-3 verify rows at the agentic contexts: 1-37 live segments of the token
+        # split's 128 (one pass), and 69 / 128 live (two and four passes)
+        [(4, 35000), (4, 9000), (4, 74000), (4, 130), (4, 56000), (4, 2049)],
+        [(4, 140000), (4, 262000), (4, 65536), (4, 65537)],
+        # drafter decode, one row a sequence, and a zero-length pad sequence
+        [(1, 41000), (1, 9001), (1, 23456), (1, 3), (1, 65000), (1, 2048), (1, 0)],
+    ],
+)
+@pytest.mark.parametrize("config", [None, (64, 0, 2), (64, 64, 1), (32, 16, 4)])
+@torch.inference_mode()
+def test_unified_attn_split_reduce_oneshot_k4v8(
+    seq_lens, config, gate: bool, select: bool, monkeypatch
+):
+    """reduce_segments_split_oneshot_gluon (split_reduce_oneshot=True) is bitwise
+    reduce_segments_split_gluon (the same statistics reduction, the same merge steps in
+    the same order), on the 3D kernel's own partials under the gfx1250 token split, with
+    and without the gate / row-selection epilogue, speculative or not, over one or
+    several LDS passes."""
+    if DEVICE_ARCH != "gfx1250":
+        pytest.skip("A8K4V8 runs on the gfx1250 Gluon kernels")
+    from op_tests.op_benchmarks.triton import bench_unified_attention as bench
+
+    module = sys.modules[unified_attention.__module__]
+    monkeypatch.setattr(module, "_GFX12_UA_SPLIT_REBALANCE_MIN_TILES", 16)
+    monkeypatch.setattr(module, "_GFX12_UA_SPLIT_REBALANCE_MAX_TILES", 128)
+    monkeypatch.setattr(module, "use_2d_kernel", lambda params, backend="triton": False)
+    if config is not None:
+        monkeypatch.setattr(module, "_GFX12_SPLIT_REDUCE_ONESHOT_CONFIG", config)
+    torch.manual_seed(0)
+    block_size, head_size, num_heads = 128, 256, (16, 2)
+    num_blocks = sum((k + block_size - 1) // block_size for _, k in seq_lens) + 16
+    inp = bench.make_inputs(
+        seq_lens=seq_lens,
+        num_heads=num_heads,
+        head_size_qk=head_size,
+        head_size_v=head_size,
+        block_size=block_size,
+        num_blocks=num_blocks,
+        fp8_q=True,
+        fp8_kv=True,
+        fp8_output=False,
+        out_scale_value=1.0,
+        nvfp4_kv=True,
+        nvfp4_ref=False,
+        nvfp4_v=False,
+    )
+    value_cache = shuffle_kv_cache(inp["k_fp8"], inp["v_fp8"])[1]
+    tokens = inp["q_fp8"].shape[0]
+    width = num_heads[0] * head_size
+    kw = {}
+    rows_out = tokens
+    if gate:
+        qkvg = 3 * torch.randn(
+            tokens, 2 * width + 512, dtype=torch.bfloat16, device="cuda"
+        )
+        kw["output_gate"] = qkvg[:, :width]
+    if select:
+        kw["output_rows"] = (inp["cu_query_lens"][1:] - 1).to(torch.int64)
+        rows_out = len(seq_lens)
+
+    def run(oneshot):
+        out = torch.full(
+            (rows_out, num_heads[0], head_size),
+            float("nan"),
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        unified_attention(
+            q=inp["q_fp8"],
+            k=inp["k_nvfp4"],
+            v=value_cache,
+            out=out,
+            cu_seqlens_q=inp["cu_query_lens"],
+            seqused_k=inp["kv_lens"],
+            max_seqlen_q=inp["max_query_len"],
+            max_seqlen_k=inp["max_kv_len"],
+            softmax_scale=inp["scale"],
+            causal=True,
+            window_size=(-1, -1),
+            block_table=inp["block_tables"],
+            softcap=0,
+            q_descale=inp["q_descale"],
+            k_descale=inp["k_descale"],
+            v_descale=inp["v_descale"],
+            shuffled_kv_cache=True,
+            equal_seqlen_q=True,
+            backend="gluon",
+            split_reduce=True,
+            split_reduce_oneshot=oneshot,
+            **kw,
+        )
+        return out
+
+    calls = []
+    kernel = module._reduce_segments_split_oneshot_kernel_gfx1250
+
+    class _Spy:
+        def __getitem__(self, grid):
+            calls.append(grid)
+            return kernel[grid]
+
+    monkeypatch.setattr(module, "_reduce_segments_split_oneshot_kernel_gfx1250", _Spy())
+    old = run(False)
+    assert not calls
+    new = run(True)
+    assert calls, "split_reduce_oneshot=True did not take the one-shot reduce"
+    # a zero-length (pad) sequence's rows are NaN either way
+    live = torch.tensor(
+        [k > 0 for q, k in seq_lens for _ in range(1 if select else q)], device="cuda"
+    )
+    assert not new[live].isnan().any()
+    assert torch.equal(old[live].view(torch.int16), new[live].view(torch.int16))
