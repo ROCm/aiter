@@ -4,7 +4,8 @@
 """MegaMoEV2 large-input path: dispatch, GEMM1, GEMM2 and combine fused into one persistent kernel.
 
 Quant runs as a separate kernel. Dispatch plans each destination's rows and publishes them per tile;
-GEMM2 work waits only for the GEMM1 tile that feeds it. Used on an instance of 8192 tokens per rank.
+GEMM2 work waits only for the GEMM1 tile that feeds it. Used on instances whose capacity is in
+mega_moe_config.LARGE_M_MTPRS.
 """
 
 import functools
