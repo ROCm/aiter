@@ -154,10 +154,10 @@ def _batched_gemm_bf16_kernel(
     # Note: If you're attempting to cast strides to int64 to prevent integer overflow, use `tl.cast` instead of `.to()`.
     # See https://github.com/ROCm/aiter/pull/597 for rationale
     if TILE_MAJOR:
-        batch_off = tl.cast(batch_id, tl.int64)
-        a_ptr += batch_off * tl.cast(stride_ab, tl.int64)
-        b_ptr += batch_off * tl.cast(stride_bb, tl.int64)
-        c_ptr += batch_off * tl.cast(stride_cb, tl.int64)
+        batch_id = tl.cast(batch_id, tl.int64)
+        a_ptr += batch_id * tl.cast(stride_ab, tl.int64)
+        b_ptr += batch_id * tl.cast(stride_bb, tl.int64)
+        c_ptr += batch_id * tl.cast(stride_cb, tl.int64)
     else:
         batch_id = tl.cast(batch_id, tl.int64)
         stride_ab = tl.cast(stride_ab, tl.int64)

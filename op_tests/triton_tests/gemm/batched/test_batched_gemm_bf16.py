@@ -89,13 +89,25 @@ def run_triton(
 e5m2_type, e4m3_type = get_fp8_dtypes()
 
 
+# MLA projections: q_nope x W_UK (N=512, K=128) and o x W_UV (N=128, K=512).
+# On gfx1151, M=64 takes the unmasked store. M=1 and M=65 take the masked one.
+MLA_SHAPES = [
+    (1, 512, 128),
+    (64, 512, 128),
+    (65, 512, 128),
+    (1, 128, 512),
+    (64, 128, 512),
+    (65, 128, 512),
+]
+
+
 @pytest.mark.parametrize(
     "dtype, b, m, n, k, output",
     [
         (dtype, b, *shape, output)
         for dtype in ["bf16"]
         for b in [4, 8, 16]
-        for shape in get_shapes(max_size=16384 * 1024 * 4096)
+        for shape in get_shapes(max_size=16384 * 1024 * 4096) + MLA_SHAPES
         for output in [True, False]
     ],
 )
@@ -125,7 +137,7 @@ def test_batched_gemm_bf16(dtype, b, m, n, k, output, backend, kernel_type):
         (dtype, b, *shape, layout, output)
         for dtype in ["bf16"]
         for b in [4, 8, 16]
-        for shape in get_shapes(max_size=16384 * 1024 * 4096)
+        for shape in get_shapes(max_size=16384 * 1024 * 4096) + MLA_SHAPES
         for output in [True, False]
         for layout in ["TT", "NN", "NT"]
     ],
