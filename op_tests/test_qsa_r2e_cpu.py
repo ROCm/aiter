@@ -26,6 +26,16 @@ import test_qsa_index_scorer_cpu as base
 
 API, PR, K = base.API, base.PR, base.K
 SFX = {4: "", 8: "_p8", 16: "_p16"}
+#: RULES-REQUESTS: prefill rules whose request bound was widened 1..32 -> 1..512 (x SFX)
+RULES_REQUESTS_WIDENED = (
+    "prefill_bf16_kt",
+    "prefill_bf16_persist",
+    "prefill_bf16_persist_wide",
+    "prefill_fp8_kt",
+    "prefill_fp8_kt_tall",
+    "prefill_fp8_r32_mid",
+    "prefill_fp8_r32_wide",
+)
 
 
 def _gen():
@@ -268,22 +278,21 @@ class ProfileDefaults(unittest.TestCase):
         st = {
             k: v["golden"]["status"] for k, v in {**self.rules, **self.buckets}.items()
         }
+        # RULES-REQUESTS: the prefill rules' request bound 32 -> 512 (new sig + many-request
+        # samples) -> 'pending' until the GPU gen_profile check restamps them
+        widened = {rid + sfx for rid in RULES_REQUESTS_WIDENED for sfx in SFX.values()}
+        for rid in sorted(widened):
+            self.assertIn(st[rid], ("pending", "pass"), rid)
+            st.pop(rid)
         for sfx in SFX.values():
             for rid in (
-                "prefill_bf16_kt",
-                "prefill_bf16_persist",
-                "prefill_bf16_persist_wide",
                 "draft_fp8",
-                "prefill_fp8_kt",
-                "prefill_fp8_kt_tall",
-                "prefill_fp8_r32_mid",
                 "verify3_g3_fp8",
                 "draft_bf16",
                 "decode_bf16",
                 "tail_bf16",
                 "decode_fp8",
                 "tail_fp8",
-                "prefill_fp8_r32_wide",
                 "verify3_g3_bf16",
             ):
                 self.assertEqual(st[rid + sfx], "pass", rid + sfx)

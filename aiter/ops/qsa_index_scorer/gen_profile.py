@@ -380,10 +380,19 @@ _POW2_ALL = {"pow2": {"min": 64, "max": 65536}}
 #: ATOM ``qsa_select_paged_tokens``: ``rows_per_chunk = logits_workspace_bytes // (columns * 4)``
 #: with ``DEFAULT_LOGITS_WORKSPACE_BYTES = 128 MiB`` -> rows * columns <= 2^25 per scorer call.
 ATOM_CHUNK_ROWS_X_COLUMNS = (128 * 1024 * 1024) // 4
+#: RULES-REQUESTS: request bound of the prefill rules (was 32). Mixed prefill+decode steps
+#: (ATOM, decode concurrency up to max-num-seqs 448) issue prefill-regime calls with many
+#: requests (e.g. rows 16384 / requests 53, rows 13600 / requests 63). The prefill kernels
+#: (r32 TDM, persist, ktile lean / lean+kconv, r32 fp8) have no request-count limit: grid =
+#: (column tiles, row blocks), LDS fixed per specialization, per-block SGPR request guard
+#: (one request per row block, else the exact per-wave fallback with <= 4 passes = one per
+#: row of the wave's M tile); requests only size the page-table / context_lens planes.
+#: rows <= 16384 and rows >= 32*requests already imply requests <= 512.
+PREFILL_MAX_REQUESTS = 512
 #: Rule spec (bf16: the Stage-3 Qwen3.8-Flash-Next e2e index cache). Bounds are the
 #: CUDA-graph decode batches (<= 512 requests), ATOM's prefill chunks (<= 16384 rows,
-#: <= 32 requests), columns from one WMMA tile (64) to the e2e width (65536), table
-#: width up to the e2e 16384; every rule maps to exactly one kernel variant.
+#: <= PREFILL_MAX_REQUESTS requests), columns from one WMMA tile (64) to the e2e width
+#: (65536), table width up to the e2e 16384; every rule maps to exactly one kernel variant.
 RULE_SPEC: list[dict] = [
     {
         "id": "draft_bf16",
@@ -422,7 +431,7 @@ RULE_SPEC: list[dict] = [
         "cache_dtype": "bf16",
         "relation": "rows>=32*requests",
         "rows": {"min": 32, "max": 16384},
-        "requests": {"min": 1, "max": 32},
+        "requests": {"min": 1, "max": PREFILL_MAX_REQUESTS},
         "columns": {"pow2": {"min": 64, "max": P.PREFILL_KT_MAX_COLUMNS}},
         "table_width": {"min": 16, "max": 16384},
         "notes": "lean ktile r32 kernel RB32 x C2 (columns <= 2048; route preset r2e)",
@@ -432,7 +441,7 @@ RULE_SPEC: list[dict] = [
         "cache_dtype": "bf16",
         "relation": "rows>=32*requests",
         "rows": {"min": 32, "max": 16384},
-        "requests": {"min": 1, "max": 32},
+        "requests": {"min": 1, "max": PREFILL_MAX_REQUESTS},
         "columns": {"pow2": {"min": 2 * P.PREFILL_KT_MAX_COLUMNS, "max": 8192}},
         "table_width": {"min": 128, "max": 16384},
         "notes": "persistent r32 kernel (columns 4096..8192; 16384 x 8192 fp32 logits fit int32)",
@@ -442,7 +451,7 @@ RULE_SPEC: list[dict] = [
         "cache_dtype": "bf16",
         "relation": "rows>=32*requests",
         "rows": {"min": 32, "max": 2048},
-        "requests": {"min": 1, "max": 32},
+        "requests": {"min": 1, "max": PREFILL_MAX_REQUESTS},
         "columns": {"pow2": {"min": 16384, "max": 65536}},
         "table_width": {"min": 4096, "max": 16384},
         "rows_x_columns_max": ATOM_CHUNK_ROWS_X_COLUMNS,
@@ -631,13 +640,56 @@ def r2_matrix_shapes(page: int) -> list[tuple[int, int, int, int, str]]:
     return list(dict.fromkeys(out))
 
 
+#: RULES-REQUESTS: e2e width (table_width) of each index page size (block 16 / 32 / 64).
+_E2E_WIDTH_OF = {4: 16384, 8: 8192, 16: 4096}
+#: The two uncovered prefill-regime calls of the ATOM e2e (a08-1, block 16 / 32, decode
+#: concurrency 8..448 at ctx 4096): mixed prefill+decode steps (rows, requests, columns).
+E2E_MIXED_STEP_CALLS = ((16384, 53, 1024), (13600, 63, 1024))
+
+
+def manyreq_shapes(page: int) -> list[tuple]:
+    """RULES-REQUESTS sample sources of the prefill rules at ``page`` (both dtypes):
+    ``(dt, rows, requests, columns, table_width, source, layout)``. ``layout`` 'even'
+    = rows split evenly over the requests (:func:`_even_layout`); 'mixed' = mixed
+    prefill+decode step (:func:`_mixed_layout`: most requests 1..4 rows, every 8th long).
+    Columns 1024 = ctx 4096 (the e2e), 4096 / 8192 (persist, r32 fp8 mid), 16384 (wide:
+    rows <= 2048 -> requests <= 64); table width = the e2e width or ctx 4096's own."""
+    W, tws = _E2E_WIDTH_OF[int(page)], 1024 // int(page)
+    k: list[tuple] = []
+    for r, q, c in E2E_MIXED_STEP_CALLS:  # the observed calls, mixed layout
+        k += [(r, q, c, W, "e2e_mixed", "mixed"), (r, q, c, tws, "e2e_mixed", "mixed")]
+    for q in (48, 64, 128, 256, 448, 512):  # many requests, full 16384-row step
+        k.append((16384, q, 1024, tws, "manyreq", "even"))
+    for q in (48, 64, 128, 448):  # rows == 32 * requests (every row block uniform)
+        k.append((32 * q, q, 1024, W, "manyreq", "even"))
+    for q in (48, 64, 128, 256, 448):  # mixed steps, rows = 16384 - requests
+        k.append((16384 - q, q, 1024, W, "manyreq_mixed", "mixed"))
+    k += [  # fp8 ktile C2 band (rows <= 2048) with many requests
+        (2000, 48, 1024, tws, "manyreq_mixed", "mixed"),
+        (2047, 63, 1024, tws, "manyreq_mixed", "mixed"),
+    ]
+    k += [  # persist / r32 fp8 mid columns
+        (16384, 448, 4096, W, "manyreq", "even"),
+        (16384, 512, 8192, W, "manyreq", "even"),
+        (16000, 300, 4096, W, "manyreq_mixed", "mixed"),
+        (12000, 128, 8192, W, "manyreq_mixed", "mixed"),
+    ]
+    k += [  # wide columns (rows <= 2^25 / columns)
+        (2048, 64, 16384, W, "manyreq", "even"),
+        (2000, 60, 16384, W, "manyreq_mixed", "mixed"),
+    ]
+    return [(dt, *e) for dt in P.CACHE_DTYPES for e in k]
+
+
 def capture_shapes_p8(plan: list[dict] | None = None) -> list[tuple]:
-    """Page-8 sample sources: the R2 intake matrix (bf16 and fp8) + page-8 plan entries."""
+    """Page-8 sample sources: the R2 intake matrix (bf16 and fp8) + page-8 plan entries
+    (+ RULES-REQUESTS many-request prefill shapes)."""
     out = [
         (dt, r, q, c, w, "intake_r2")
         for dt in P.CACHE_DTYPES
         for (r, q, c, w, _g) in r2_matrix_shapes(PAGE8)
     ]
+    out += manyreq_shapes(PAGE8)
     for e in plan or []:
         if P.page_of(e) == PAGE8:
             out.append(
@@ -1087,7 +1139,15 @@ def rule_samples(rule: dict, extra: list[tuple] = ()) -> list[dict]:
     R = P.ProfileRule(rule)
     rq = []
     rr, qq = rule["rows"], rule["requests"]
-    for q in (int(qq["min"]), int(qq["max"]), _mid(qq)):
+    qs = [int(qq["min"]), int(qq["max"]), _mid(qq)]
+    if rule["relation"] == "rows>=32*requests":
+        # RULES-REQUESTS: rows >= 32*requests caps the feasible requests at rows.max // 32
+        # (the request corners above may be infeasible): add that cap, its midpoint and
+        # the pre-widening corners 16 / 32 (requests.max was 32).
+        qcap = min(int(qq["max"]), int(rr["max"]) // 32)
+        qs += [qcap, max(int(qq["min"]), qcap // 2), 32, 16]
+    qs = [q for q in dict.fromkeys(qs) if int(qq["min"]) <= q <= int(qq["max"])]
+    for q in qs:
         for r in (int(rr["min"]), int(rr["max"]), _mid(rr)):
             s = _snap_rows(rule, r, q)
             if s is not None and (s, q) not in rq:
@@ -1110,7 +1170,7 @@ def rule_samples(rule: dict, extra: list[tuple] = ()) -> list[dict]:
     ]
     out, seen = [], set()
 
-    def add(k, src):
+    def add(k, src, layout=None):
         if k not in seen and R.admits(*k) and k[0] * k[2] * 4 <= P.MAX_PLANE_BYTES:
             seen.add(k)
             out.append(
@@ -1122,6 +1182,9 @@ def rule_samples(rule: dict, extra: list[tuple] = ()) -> list[dict]:
                     "source": src,
                 }
             )
+            # RULES-REQUESTS: 'mixed' samples say so (absent = the shape's default layout)
+            if layout == "mixed":
+                out[-1]["layout"] = layout
 
     if "rows_x_columns_max" not in rule:
         for r, q in rq:
@@ -1142,13 +1205,21 @@ def rule_samples(rule: dict, extra: list[tuple] = ()) -> list[dict]:
                     ),
                 }
             )
-            for q in (int(qq["min"]), int(qq["max"]), _mid(qq)):
+            qs_c = list(qs)
+            if rule["relation"] == "rows>=32*requests":  # RULES-REQUESTS: per column
+                qcap_c = min(int(qq["max"]), hi_c // 32)
+                qs_c += [qcap_c, max(int(qq["min"]), qcap_c // 2)]
+            for q in dict.fromkeys(qs_c):
                 for r in (int(rr["min"]), hi_c, mid_c):
                     s = _snap_rows(rule, r, q, hi_c)
                     if s is not None:
                         add((s, q, c, w), "bounds")
     for k in extra:
-        add(tuple(int(x) for x in k[:4]), k[4] if len(k) > 4 else "capture")
+        add(
+            tuple(int(x) for x in k[:4]),
+            k[4] if len(k) > 4 else "capture",
+            k[5] if len(k) > 5 else None,
+        )
     return out
 
 
@@ -1207,6 +1278,7 @@ def capture_shapes_p16(plan: list[dict] | None = None) -> list[tuple]:
     + page-16 plan entries."""
     out = [(STAGE3_CAPTURE_DTYPE, *k) for k in builtin_sample_shapes_p16()]
     out += fp8_intake_shapes(PAGE16)
+    out += manyreq_shapes(PAGE16)  # RULES-REQUESTS
     for e in plan or []:
         if P.page_of(e) == PAGE16:
             out.append(
@@ -1239,6 +1311,7 @@ def capture_shapes(plan: list[dict] | None = None) -> list[tuple]:
         for e in builtin_plan()
         if e["cache_dtype"] == "fp8"
     ]
+    out += manyreq_shapes(P.PAGE_SIZE)  # RULES-REQUESTS
     for e in plan or []:
         if P.page_of(e) != P.PAGE_SIZE:
             continue
@@ -1388,7 +1461,8 @@ def build_profile(
             "rules": "RULE_SPEC (bounds corners/mid x Stage-3 ATOM capture, exact "
             "bf16 rows and AgentX recipe samples) at P 4/16/8; "
             "RULE_SPEC_FP8 (bounds corners/mid x R2 intake matrix, exact "
-            "fp8 rows) at P 4/8/16",
+            "fp8 rows) at P 4/8/16; prefill rules + many-request / mixed "
+            "prefill+decode step samples (RULES-REQUESTS)",
             "evidence": PHASE1_SOURCE,
             "evidence_policy": EVIDENCE_NOTE,
             "note": "exact rows take precedence over range rules; pending rows "
@@ -1727,7 +1801,52 @@ def sample_fixture(s: dict) -> dict:
     pages_per_req = min(width, sample_max_pages(page) // reqs)
     max_ctx = tokens_per_page(page) * pages_per_req
     layout = "draft" if rows == reqs else "decode" if rows == 4 * reqs else "even"
+    if s.get("layout") == "mixed" and layout == "even":  # RULES-REQUESTS
+        layout = "mixed"
     return {"max_ctx": max_ctx, "cache_pages": reqs * pages_per_req, "layout": layout}
+
+
+def mixed_counts(rows: int, reqs: int) -> list[int]:
+    """RULES-REQUESTS rows per request of a mixed prefill+decode step: every 8th request
+    (``max(1, reqs // 8)`` of them, evenly spaced, the last one included) is a long
+    prefill chunk sharing the remaining rows evenly; every other request is a decode
+    request with 1, 2, 3, 4, 1, ... rows. Needs ``rows >= 4 * reqs`` (every long >= 1).
+    """
+    rows, reqs = int(rows), int(reqs)
+    n_long = max(1, reqs // 8)
+    long_ids = {(k + 1) * reqs // n_long - 1 for k in range(n_long)}
+    counts = [0 if i in long_ids else 1 + i % 4 for i in range(reqs)]
+    rest = rows - sum(counts)
+    if rest < n_long:
+        raise ValueError(
+            f"mixed layout needs more rows than {rows} for {reqs} requests"
+        )
+    for j, i in enumerate(sorted(long_ids)):
+        counts[i] = rest // n_long + (j < rest % n_long)
+    return counts
+
+
+def _counts_layout(counts: list[int], ctx: int):
+    """(token_to_request, query_positions): request i's ``counts[i]`` consecutive rows end
+    at ``ctx`` (positions wrap mod ctx, never negative)."""
+    import torch
+
+    t2r = torch.cat(
+        [torch.full((n,), i, dtype=torch.int32) for i, n in enumerate(counts) if n]
+    )
+    pos = torch.cat(
+        [
+            torch.remainder(torch.arange(n, dtype=torch.int64) + (ctx - n), ctx)
+            for n in counts
+            if n
+        ]
+    )
+    return t2r, pos
+
+
+def _mixed_layout(rows: int, reqs: int, ctx: int):
+    """RULES-REQUESTS mixed prefill+decode step layout (:func:`mixed_counts`)."""
+    return _counts_layout(mixed_counts(rows, reqs), ctx)
 
 
 def _even_layout(rows: int, reqs: int, ctx: int):
@@ -1869,7 +1988,7 @@ def _golden_run(
     profile = profile or os.environ.get("QSA_PROFILE_PATH") or P.DEFAULT_PROFILE
     case = S.make_case(
         name,
-        layout if layout != "even" else "prefill",
+        layout if layout in ("draft", "decode") else "prefill",
         rows=rows,
         requests=reqs,
         max_ctx=max_ctx,
@@ -1879,8 +1998,10 @@ def _golden_run(
         page_size=int(page_size),
     )
     d = G.build_case(case, device="cuda", seed=seed)
-    if layout == "even":
-        t2r, pos = _even_layout(rows, reqs, max_ctx)
+    if layout in ("even", "mixed"):
+        t2r, pos = (_mixed_layout if layout == "mixed" else _even_layout)(
+            rows, reqs, max_ctx
+        )
         d["token_to_request"] = t2r.to(device="cuda", dtype=d["token_to_request"].dtype)
         d["query_positions"] = pos.to(device="cuda", dtype=d["query_positions"].dtype)
     rs = torch.full((rows,), 7, dtype=torch.int32, device="cuda")

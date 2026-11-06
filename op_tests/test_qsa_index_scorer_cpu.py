@@ -1274,6 +1274,19 @@ class Reasons(Env):
 
 
 # ---------------------------------------------------------------------------
+def _rules_requests_pending() -> bool:
+    """RULES-REQUESTS: the 21 prefill rules (requests 1..32 -> 1..512) are ``pending`` in
+    the committed profile until the GPU ``gen_profile check`` restamps them."""
+    with open(PROFILE_JSON, encoding="utf-8") as fh:
+        rules = json.load(fh)["rules"]
+    return any(
+        r["regime"] == "prefill" and r["golden"]["status"] == "pending" for r in rules
+    )
+
+
+RR_PENDING = _rules_requests_pending()
+
+
 def _gen():
     spec = importlib.util.spec_from_file_location(
         f"qsa_gen_profile_rules{uuid.uuid4().hex[:6]}",
@@ -1378,15 +1391,19 @@ class Rules(Env):
             16: gen.capture_shapes_p16(),
             8: gen.capture_shapes_p8(),
         }
-        self.assertEqual(
-            [k[1:] for k in caps[4] if k[0] == "bf16"], gen.builtin_sample_shapes()
-        )
-        self.assertEqual(
-            [k[1:] for k in caps[16] if k[0] == "bf16"], gen.builtin_sample_shapes_p16()
-        )
+        # RULES-REQUESTS: + the many-request / mixed-step prefill sources (7-tuples)
+        rr_src = {4: gen.manyreq_shapes(4), 16: gen.manyreq_shapes(16)}
+        for page, want in (
+            (4, gen.builtin_sample_shapes()),
+            (16, gen.builtin_sample_shapes_p16()),
+        ):
+            got = [k for k in caps[page] if k[0] == "bf16"]
+            rr = [k for k in rr_src[page] if k[0] == "bf16"]
+            self.assertEqual([k[1:] for k in got if k not in rr], want)
+            self.assertTrue(all(k in got for k in rr))
         for r in self.data["rules"]:
             page = PR.page_of(r)
-            shapes = [(*k[1:5], k[5]) for k in caps[page] if k[0] == r["cache_dtype"]]
+            shapes = [k[1:] for k in caps[page] if k[0] == r["cache_dtype"]]
             g = r["golden"]
             self.assertIn(g["status"], ("pass", "pending"))
             base = (
@@ -1424,7 +1441,7 @@ class Rules(Env):
                 "decode_fp8",
                 "tail_fp8",
                 "prefill_fp8_r32_wide",
-            }:
+            } and not (RR_PENDING and r["regime"] == "prefill"):
                 self.assertEqual(g["status"], "pass", r["id"])
             # one variant per rule: the router at every column and at both row extremes;
             # launch knobs = the default-env wrapper's (fp8 draft wg_waves 2)
@@ -1668,6 +1685,9 @@ class Rules(Env):
                 "prefill_bf16_kt",
             ),
             ({"rows": 16384, "requests": 32, "columns": 256}, "prefill_bf16_kt"),
+            # RULES-REQUESTS: prefill requests 1..512 (mixed prefill+decode steps)
+            ({"rows": 2112, "requests": 33, "columns": 512}, "prefill_bf16_kt"),
+            ({"rows": 16384, "requests": 512, "columns": 1024}, "prefill_bf16_kt"),
             (
                 {"rows": 4096, "requests": 2, "columns": 2048, "width": 512},
                 "prefill_bf16_kt",
@@ -1774,9 +1794,9 @@ class Rules(Env):
                 "rows_rule_uncovered",
             ),  # prefill > 16384
             (
-                {"rows": 2112, "requests": 33, "columns": 512},
+                {"rows": 16384, "requests": 513, "columns": 512},
                 "rows_rule_uncovered",
-            ),  # prefill q > 32
+            ),  # rows < 32*requests (not prefill) and above the decode / tail bands
             (
                 {"rows": 8, "requests": 8, "width": 32768, "columns": 65536},
                 "table_width_uncovered",
@@ -2850,17 +2870,23 @@ class Prewarm(_Stubs):
         # GPU restamp on kernel 58051973: every row and rule passes -> page 4/8/16 x (bf16
         # draft/decg/r16/r32_kt/r32_persist + fp8 draft/decg/r16_fp8/r32_kt_fp8/r32_fp8)
         # x 2 pos dtypes
-        self.assertEqual(len(want), 60)
+        # RULES-REQUESTS: while the widened prefill rules are pending, their r32_kt /
+        # r32_persist / r32_kt_fp8 variants (3 pages x 2 pos dtypes each) are not prewarmed
+        self.assertEqual(len(want), 42 if RR_PENDING else 60)
         self.assertTrue(
             all(
                 any(v in t for t in want)
-                for v in (".r32_kt.", ".r32_persist.", ".draft.v1/fp8", ".r32_kt_fp8.")
+                for v in (
+                    (".draft.v1/fp8",)
+                    if RR_PENDING
+                    else (".r32_kt.", ".r32_persist.", ".draft.v1/fp8", ".r32_kt_fp8.")
+                )
             )
         )
         builds = self._expected_builds(("bf16", "fp8"))
         # + fp8 ktile C4 (rows > 2048) and the pass g3 decode-group buckets (bf16 + fp8),
         # 3 pages x 2 pos dtypes each
-        self.assertEqual(len(builds), 78)
+        self.assertEqual(len(builds), 54 if RR_PENDING else 78)
         self.assertEqual(
             len(self.runs), len(builds)
         )  # one private launch each (FlyDSL JIT)
@@ -2878,7 +2904,7 @@ class Prewarm(_Stubs):
         )
         self.assertTrue(all("/bf16/" in t for t in self._expected(("bf16",))))
         self.assertEqual(len(self.runs), len(self._expected_builds(("bf16",))))
-        self.assertEqual(len(self.runs), 36)
+        self.assertEqual(len(self.runs), 28 if RR_PENDING else 36)
 
     def test_builds_exactly_what_real_calls_build(self):
         """The builder (args, kwargs) of every pass call class == a prewarmed lru_cache key."""

@@ -87,7 +87,8 @@ every import-time `QSA_*` switch (`kernel_env`). GPU-stamped by `gen_profile che
 `58051973626d598b36b0c51c4ac89a8830fa05b3a8f78d9628aeadd436c1f0ad`, which differs from the pinned
 source only by black/ruff formatting (no-device ISA-identity gate: all 276 default and routable
 builds byte-identical, recorded per entry in `isa_identity`)
-(frozen golden, criterion above): **rows 20/20, range rules 39/39, buckets 6/12 pass**;
+(frozen golden, criterion above): **rows 20/20, range rules 39/39, buckets 6/12 pass**
+(before RULES-REQUESTS; now 18/39 rules pass + the 21 widened prefill rules `pending`, below);
 the 6 `fail` buckets are the `verify3_pad4_*` / `tail_round4_*` staging buckets, which are
 routing-only and never selected (only `pass` entries ever serve). Rules per page P ∈ {4, 8, 16}
 and dtype ∈ {bf16, fp8}: `draft` (rows ≤ requests), `decode` (decode band), `tail`,
@@ -95,6 +96,15 @@ and dtype ∈ {bf16, fp8}: `draft` (rows ≤ requests), `decode` (decode band), 
 `prefill_*_persist` / `prefill_fp8_r32_mid` (4096–8192 columns), `*_wide` (16384–65536
 columns, rows × columns ≤ 2^25). Buckets: `verify3_g3_{bf16,fp8}[_p8|_p16]` (MTP verify, 3 rows
 per request, one kernel-native 3-row decode-group launch, zero copy).
+
+RULES-REQUESTS: the 21 prefill rules (`rows ≥ 32·requests`) admit requests 1..512 (was 1..32;
+rows ≤ 16384 already implies ≤ 512), so mixed prefill+decode steps with many requests (e2e:
+rows 16384 / 53 requests, rows 13600 / 63 requests) stay on the fused kernels instead of
+`rows_rule_uncovered`. The prefill kernels have no request-count limit (grid = column tiles ×
+row blocks, fixed LDS, per-block request guard with the exact per-wave fallback). New samples:
+many requests (48..512) and mixed per-request row counts (sample `layout: mixed`: most requests
+1–4 rows, every 8th a long chunk). These 21 rules are `pending` until the GPU `gen_profile check`
+(`records/integration/rules-requests/GPU_COMMANDS.md`); pending rules are never selected.
 
 Runtime refusals (→ native with that reason): kernel source sha ≠ profiled
 (`profile_kernel_mismatch`), any `QSA_*` switch ≠ `kernel_env` (`kernel_env_mismatch`),

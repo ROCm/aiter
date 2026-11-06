@@ -774,9 +774,15 @@ class PrewarmR2(base._Stubs):
                 "qsa.page16.decg.v1/bf16/i64",
                 "qsa.page16.draft.v1/bf16/i64",
                 "qsa.page16.r16.v1/bf16/i64",
-                "qsa.page16.r32_kt.v1/bf16/i64",
-                "qsa.page16.r32_persist.v1/bf16/i64",
-            ],
+            ]
+            + (
+                []
+                if base.RR_PENDING  # RULES-REQUESTS: prefill rules pending
+                else [
+                    "qsa.page16.r32_kt.v1/bf16/i64",
+                    "qsa.page16.r32_persist.v1/bf16/i64",
+                ]
+            ),
         )
         # fp8 cache: only the fp8 pass variants
         c8 = aligned((8, 4, 1, 128), torch.float8_e4m3fn)
@@ -795,8 +801,8 @@ class PrewarmR2(base._Stubs):
                 "qsa.page4.draft.v1/fp8/i64",
                 "qsa.page4.r16_fp8.v1/fp8/i64",
                 "qsa.page4.r32_fp8.v1/fp8/i64",
-                "qsa.page4.r32_kt_fp8.v1/fp8/i64",
-            ],
+            ]
+            + ([] if base.RR_PENDING else ["qsa.page4.r32_kt_fp8.v1/fp8/i64"]),
         )
 
     def test_idempotent_and_stats(self):
@@ -942,7 +948,9 @@ class PrewarmR2(base._Stubs):
             )
         work = API.prewarm_plan(self.profile, pos_dtypes=(torch.int64,), kernel=K)
         # pages 4/8/16 x (draft, decode-group, decode-group g3 bucket, r16, ktile, persist)
-        self.assertEqual(len(work), 18)
+        # (RULES-REQUESTS: ktile / persist only once the widened prefill rules pass;
+        # page-4 ktile / persist exact rows keep 2 of them)
+        self.assertEqual(len(work), 14 if base.RR_PENDING else 18)
         self.assertEqual(got, sorted({w[0] for w in work}))
         self.assertEqual(self.runs, [])  # nothing launched
         self.assertEqual(len(seen), len(work))
@@ -1007,7 +1015,9 @@ P8_RULES = tuple(
     )
 )
 #: page-8 bf16 rules with a GPU pass (draft / decode / tail); the prefill rules are pending
-P8_PASS = P8_RULES  # GPU restamp on kernel 58051973: every page-8 rule passes
+P8_PASS = tuple(  # GPU restamp on kernel 58051973: every page-8 rule passes
+    r for r in P8_RULES if not (base.RR_PENDING and r.startswith("prefill_"))
+)  # RULES-REQUESTS: the widened prefill rules are pending until the GPU check
 
 
 class Page8(_R2Env):
@@ -1111,9 +1121,12 @@ class Page8(_R2Env):
             page_size=8,
             **kw,
         )
-        self.assertTrue(
-            m.ok and m.row.id == "prefill_bf16_kt_p8", m
-        )  # prefill: GPU pass
+        if base.RR_PENDING:  # RULES-REQUESTS: widened prefill rule pending
+            self.assertEqual(m.reason, PR.Reason.ROW_UNVERIFIED, m)
+        else:
+            self.assertTrue(
+                m.ok and m.row.id == "prefill_bf16_kt_p8", m
+            )  # prefill: GPU pass
         m = PR.match(
             committed,
             rows=64,
@@ -1216,7 +1229,9 @@ FP8_BF16_SLOT = {
     "prefill_fp8_r32_wide": "prefill_bf16_persist_wide",
 }
 #: fp8 rules with a GPU pass under the R2E router; the others await the GPU check
-FP8_PASS = FP8_RULES  # GPU restamp on kernel 58051973: every fp8 rule passes
+FP8_PASS = tuple(  # GPU restamp on kernel 58051973: every fp8 rule passes
+    r for r in FP8_RULES if not (base.RR_PENDING and r.startswith("prefill_"))
+)  # RULES-REQUESTS: the widened prefill rules are pending until the GPU check
 _SFX = {4: "", 8: "_p8", 16: "_p16"}
 
 
