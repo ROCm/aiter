@@ -16,7 +16,6 @@ from flydsl.expr import range_constexpr, rocdl
 from flydsl.expr.typing import Int8, T
 from flydsl.runtime.device import get_rocm_arch
 
-from ..mxfp4_gemm_common import _fabs_f32 as fabs_f32
 from ..mxfp4_gemm_common import lds_typed_ptr, lds_vec_load
 from ..tensor_shim import (
     _preload_compiled,
@@ -31,7 +30,7 @@ from .gemm2 import (
     kStages,
 )
 from .mega_moe_stage2 import (
-    _fp8_scale_for_leader,
+    _fp8_quant_1x32,
     _stage2_lds_bytes,
 )
 
@@ -132,51 +131,10 @@ def _pair_routewise_half_scatter(lds_a, lds_b, n_block_idx, wave, lane, *,
             fx.Float32(values_raw[q]) * weight
             for q in range_constexpr(ALIGNED_PAIR_SCATTER_VEC)
         ]
-        local_max = fabs_f32(values[0])
-        for q in range_constexpr(1, ALIGNED_PAIR_SCATTER_VEC):
-            local_max = local_max.maximumf(fabs_f32(values[q]))
-        max_bits = local_max.bitcast(fx.Int32)
-        for xor_lane in (1, 2):
-            if xor_lane < 32 // ALIGNED_PAIR_SCATTER_VEC:
-                remote_bits = rocdl.ds_bpermute(
-                    T.i32,
-                    (lane ^ fx.Int32(xor_lane)) * fx.Int32(4),
-                    max_bits,
-                )
-                local_max = local_max.maximumf(
-                    fx.Int32(remote_bits).bitcast(fx.Float32)
-                )
-                max_bits = local_max.bitcast(fx.Int32)
         scale_group_lanes = 32 // ALIGNED_PAIR_SCATTER_VEC
-        leader_lane = lane & fx.Int32(~(scale_group_lanes - 1))
-        scale_leader = active & (
-            (half_lane & fx.Int32(scale_group_lanes - 1)) == fx.Int32(0)
+        e8m0, payload, scale_leader = _fp8_quant_1x32(
+            values, lane, group_lane=half_lane, leader_gate=active
         )
-        leader_e8m0 = _fp8_scale_for_leader(scale_leader, local_max)
-        e8m0 = fx.Int32(
-            rocdl.ds_bpermute(
-                T.i32,
-                leader_lane * fx.Int32(4),
-                leader_e8m0,
-            )
-        )
-        block_scale = (e8m0 << 23).bitcast(fx.Float32)
-        packed_ty = T.vec(2, T.i16)
-        packed_words = []
-        for word in range_constexpr(ALIGNED_PAIR_SCATTER_VEC // 4):
-            packed_word = fx.full(2, 0, fx.Int16).ir_value()
-            for pair in range_constexpr(2):
-                value = word * 4 + pair * 2
-                packed_word = rocdl.cvt_scalef32_pk_fp8_f32(
-                    packed_ty,
-                    packed_word,
-                    values[value].ir_value(),
-                    values[value + 1].ir_value(),
-                    block_scale.ir_value(),
-                    pair,
-                )
-            packed_words.append(fx.Vector(packed_word).bitcast(fx.Int32)[0])
-        payload = fx.Vector.from_elements(packed_words, fx.Int32)
         payload_off = (valid & active).select(
             row_base + n_block_idx * fx.Int32(BN) + col,
             fx.Int32(comb_inp_nbytes),
