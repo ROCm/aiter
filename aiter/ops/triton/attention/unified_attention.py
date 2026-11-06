@@ -206,11 +206,12 @@ def _gfx950_tile_size(params: _UAParams, tile: int):
     one program per CU for decode, and on the 2d grid past one program per CU
     dense or two shuffled. Short queries on the split grid keep winning at any
     program count. Sliding windows keep the 64-key tile. Measured for bf16
-    only.
+    and head size 64 only; at head 256 the wider tile is slower.
     """
     if (
         params.sliding_window > 0
         or params.q_dtype != torch.bfloat16
+        or params.head_size > 64
         or params.max_seqlen_q * params.num_queries_per_kv > 128
     ):
         return tile
