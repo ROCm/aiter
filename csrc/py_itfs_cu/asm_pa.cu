@@ -466,8 +466,18 @@ void pa_ps_fwd(aiter_tensor_t* Q,            //   [num_seqs, num_heads, head_siz
     }
 
     CFG* config_map = &cfg_pa_asm; // only one config csv in hsa/<arch>/pa, now
-    static SynchronizedCache<std::string_view, AiterAsmKernel> impl_ptr_map;
+    static SynchronizedCache<std::string, AiterAsmKernel> impl_ptr_map;
     std::string arch_id = get_gpu_arch();
+    const bool bf16_partial = splitData && splitData->dtype() == AITER_DTYPE_bf16;
+    AITER_CHECK(!splitData || splitData->dtype() == AITER_DTYPE_fp32 || bf16_partial,
+                __func__, ": split partial output must be FP32 or BF16");
+    AITER_CHECK(!bf16_partial ||
+                    (arch_id == "gfx950" && q_type == "bf16" && kv_type == "fp8" &&
+                     block_size == 16 && gqa_ratio == 16 && num_kv_heads == 1 &&
+                     max_qlen == 4 && mask == 1 && quant_type == 2),
+                __func__, ": BF16 partials require the Q4/GQA16 PA specialization");
+    if(bf16_partial)
+        args.GQA |= uint32_t{1} << 31;
     std::string kernelName = (kernelName_ != nullptr) ? std::string(kernelName_) :
         get_heuristic_kernel(q_type, kv_type, gqa, mtp, msk, hp, block_size, arch_id, ps, qTile, quant_type, config_map);
     if(kernelName.empty())
@@ -482,11 +492,11 @@ void pa_ps_fwd(aiter_tensor_t* Q,            //   [num_seqs, num_heads, head_siz
     if(it != config_map->end())
     {
         const auto& cfg     = it->second;
-        const char* name    = cfg.knl_name.c_str();
-        const char* co_name = cfg.co_name.c_str();
+        std::string name = cfg.knl_name;
+        std::string co_name = cfg.co_name;
 
         impl_ptr =
-            &impl_ptr_map.get_or_create(name, [&]() { return AiterAsmKernel(name, co_name); });
+            &impl_ptr_map.get_or_create(name, [&]() { return AiterAsmKernel(name.c_str(), co_name.c_str()); });
         if(cfg.ps)
         {
             gdx = get_num_cu_func();

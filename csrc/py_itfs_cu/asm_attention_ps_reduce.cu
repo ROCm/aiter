@@ -83,10 +83,11 @@ void attention_ps_reduce(aiter_tensor_t* partial_output,
                 __func__, ": output must be BF16 or FP16");
     AITER_CHECK(partial_output->dim() >= 3 && partial_output->size(-1) == 128 &&
                     partial_output->size(-2) == final_output->size(1) &&
-                    partial_output->dtype() == AITER_DTYPE_fp32 &&
+                    (partial_output->dtype() == AITER_DTYPE_fp32 ||
+                     partial_output->dtype() == AITER_DTYPE_bf16) &&
                     partial_lse->dtype() == AITER_DTYPE_fp32 &&
                     partial_output->numel() / 128 == partial_lse->numel(),
-                __func__, ": partial output/LSE must have matching packed FP32 layouts");
+                __func__, ": partial output/LSE must have matching packed layouts and FP32 LSE");
     AITER_CHECK(reduce_indptr->dtype() == AITER_DTYPE_i32 && reduce_indptr->dim() == 1 &&
                     reduce_indptr->size(0) >= 1 &&
                     reduce_final_map->dtype() == AITER_DTYPE_i32 &&
@@ -141,6 +142,8 @@ void attention_ps_reduce(aiter_tensor_t* partial_output,
     args.reduce_partial_map = reduce_partial_map->data_ptr();
     args.final_lse = final_lse ? final_lse->data_ptr() : nullptr;
     args.num_heads = static_cast<uint32_t>(num_heads);
+    if(partial_output->dtype() == AITER_DTYPE_bf16)
+        args.num_heads |= uint32_t{1} << 31;
     args.num_tiles = static_cast<uint32_t>(num_tiles);
     args.output_query_stride_bytes = static_cast<uint32_t>(query_stride * 2);
     args.output_head_stride_bytes = static_cast<uint32_t>(head_stride * 2);

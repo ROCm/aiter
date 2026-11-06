@@ -381,16 +381,29 @@ void kn_get_pa_metadata_v1_2_wave(PaMetadataV1KernelParameter params)
     const int32_t total_tiles = max(__shfl(tile_prefix, wave_size - 1), 1);
     const int32_t average = total_tiles / workers;
     const int32_t remainder = total_tiles - average * workers;
+    const bool sequence_partitions = NumHeads == 1 && Workers == 256 &&
+        (params.num_batches == 4 || params.num_batches == 8) &&
+        params.qhead_granularity == 16 && total_tiles >= workers &&
+        __all(!active || (qo_length == 4 && tiles > 0));
     const int32_t first_worker = pa_metadata_v1_2_worker32(tiles_before, average, remainder, workers);
     const int32_t last_worker = pa_metadata_v1_2_worker32(max(tile_prefix - 1, 0), average, remainder, workers);
-    const int32_t parts = tiles > 0 ? last_worker - first_worker + 1 : 0;
+    const int32_t extra = workers - params.num_batches;
+    const int32_t parts = sequence_partitions
+        ? min(tiles, 1 + static_cast<int32_t>(static_cast<int64_t>(tile_prefix) * extra / total_tiles -
+                                             static_cast<int64_t>(tiles_before) * extra / total_tiles))
+        : (tiles > 0 ? last_worker - first_worker + 1 : 0);
     const int32_t task_prefix = pa_metadata_v1_2_prefix_sum32(parts);
     const int32_t total_tasks = __shfl(task_prefix, wave_size - 1);
     const int32_t reductions = parts > 1 ? parts : 0;
-    const int32_t reduce_prefix = pa_metadata_v1_2_prefix_sum32(reductions);
-    const int32_t partial_prefix = pa_metadata_v1_2_prefix_sum32(reductions * qo_length);
-    const int32_t group_prefix = pa_metadata_v1_2_prefix_sum32(reductions > 0);
-    const int32_t groups = __shfl(group_prefix, wave_size - 1);
+    const uint64_t lane_mask = ~uint64_t{0} >> (wave_size - lane - 1);
+    const uint64_t single_parts = __ballot(parts == 1);
+    const uint64_t reduce_groups = __ballot(reductions > 0);
+    const int32_t reduce_prefix = task_prefix - __popcll(single_parts & lane_mask);
+    const int32_t partial_prefix = __all(!active || qo_length == 4)
+        ? reduce_prefix * 4
+        : pa_metadata_v1_2_prefix_sum32(reductions * qo_length);
+    const int32_t group_prefix = __popcll(reduce_groups & lane_mask);
+    const int32_t groups = __popcll(reduce_groups);
     const int32_t total_reduce = __shfl(reduce_prefix, wave_size - 1);
     if(thread == 0)
     {
@@ -422,9 +435,12 @@ void kn_get_pa_metadata_v1_2_wave(PaMetadataV1KernelParameter params)
         const int32_t worker = __shfl(first_worker, source_lane) + part;
         const int32_t sequence_begin = __shfl(tiles_before, source_lane);
         const int32_t sequence_end = __shfl(tile_prefix, source_lane);
-        const int32_t begin = max(sequence_begin, worker * average + min(worker, remainder));
-        const int32_t end = min(sequence_end,
-            (worker + 1) * average + min(worker + 1, remainder));
+        const int32_t begin = sequence_partitions
+            ? sequence_begin + static_cast<int64_t>(part) * (sequence_end - sequence_begin) / max(sequence_parts, 1)
+            : max(sequence_begin, worker * average + min(worker, remainder));
+        const int32_t end = sequence_partitions
+            ? sequence_begin + static_cast<int64_t>(part + 1) * (sequence_end - sequence_begin) / max(sequence_parts, 1)
+            : min(sequence_end, (worker + 1) * average + min(worker + 1, remainder));
         const int32_t query_begin = __shfl(qo_start, source_lane);
         const int32_t query_end = __shfl(qo_end, source_lane);
         const int32_t partials_before = __shfl(partial_prefix - reductions * qo_length, source_lane);
@@ -453,6 +469,12 @@ void kn_get_pa_metadata_v1_2_wave(PaMetadataV1KernelParameter params)
                 works[head * total_tasks + task] = work;
             }
         }
+    }
+    if(sequence_partitions)
+    {
+        if(thread < workers)
+            params.p_work_indptr[thread] = min(thread, total_tasks);
+        return;
     }
     const int32_t local_worker = thread % workers;
     const int32_t tile_start = local_worker * average + min(local_worker, remainder);
@@ -1098,8 +1120,8 @@ void get_pa_metadata_v1_2_device(const aiter_tensor_t& seqlens_qo_indptr, // [ba
        tile_layout_supported && buffers_fit)
     {
         const int32_t threads = std::min(kPaMetadataSharedMaxBatches,
-            std::max(dev_prop.warpSize, next_power_of_two(std::max(num_batches,
-                static_cast<int32_t>(work_capacity / num_heads_k)))));
+            ((std::max(num_batches, static_cast<int32_t>(work_capacity / num_heads_k)) +
+              dev_prop.warpSize - 1) / dev_prop.warpSize) * dev_prop.warpSize);
         kn_get_pa_metadata_v1_2_wave<256, 1>
             <<<threads / dev_prop.warpSize, dev_prop.warpSize, 0, stream>>>(params);
         HIP_CALL_LAUNCH(hipGetLastError());
