@@ -35,6 +35,7 @@ def device():
     return torch.device("cuda")
 
 
+@pytest.mark.parametrize("pad", [0, 37])
 @pytest.mark.parametrize("store_output", [True, False])
 @pytest.mark.parametrize(
     "mode,rows,max_partitions,mixed",
@@ -54,8 +55,10 @@ def device():
     ],
 )
 def test_sparse_pa_output_quant_matches_separate_kernel(
-    device, monkeypatch, mode, rows, max_partitions, mixed, store_output
+    device, monkeypatch, mode, rows, max_partitions, mixed, store_output, pad
 ):
+    """``pad`` extra FP8 rows (a token bucket padded past the scheduled rows)
+    must come out as zero bytes with a unit descale from the same call."""
     pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
     torch.manual_seed(393)
     page, head_dim, max_context = 16, 128, 2048
@@ -114,8 +117,10 @@ def test_sparse_pa_output_quant_matches_separate_kernel(
     }
     reference_output = torch.empty_like(query)
     output = torch.empty_like(query)
-    output_fp8 = torch.empty_like(query, dtype=dtypes.fp8)
-    output_scale = torch.empty((query.shape[0], 1), dtype=torch.float32, device=device)
+    output_fp8 = torch.empty(
+        (rows + pad, 16, head_dim), dtype=dtypes.fp8, device=device
+    )
+    output_scale = torch.empty((rows + pad, 1), dtype=torch.float32, device=device)
 
     compile_calls = []
     compile_tile = pa.compile_pa_decode_tile
@@ -144,6 +149,7 @@ def test_sparse_pa_output_quant_matches_separate_kernel(
                     "quantized_output": output_fp8,
                     "output_scale": output_scale,
                     "store_output": store_output,
+                    **({"quantized_pad_rows": pad} if pad else {}),
                 }
                 if quantized
                 else {}
@@ -164,20 +170,25 @@ def test_sparse_pa_output_quant_matches_separate_kernel(
             reference_output.view(reference_output.shape[0], -1),
             quant_dtype=dtypes.fp8,
         )
-        assert torch.equal(output_scale, ref_scale)
+        assert torch.equal(output_scale[:rows], ref_scale)
         assert torch.equal(
-            output_fp8.view(torch.uint8),
-            ref_fp8.view_as(output_fp8).view(torch.uint8),
+            output_fp8[:rows].view(torch.uint8),
+            ref_fp8.view_as(output_fp8[:rows]).view(torch.uint8),
         )
         torch.testing.assert_close(
-            output_fp8.float().view(output.shape[0], -1) * output_scale,
+            output_fp8[:rows].float().view(output.shape[0], -1) * output_scale[:rows],
             ref_fp8.float() * ref_scale,
             rtol=0,
             atol=0,
         )
+        # Padded rows: FP8 zero bytes and a unit descale.
+        assert (output_fp8[rows:].view(torch.uint8) == 0).all()
+        assert (output_scale[rows:] == 1.0).all()
 
     launch(quantized=False)
     output.fill_(float("nan"))
+    output_fp8.view(torch.uint8).fill_(0x7F)
+    output_scale.fill_(float("nan"))
     launch(quantized=True)
     check()
     selected = compile_calls[-1]
