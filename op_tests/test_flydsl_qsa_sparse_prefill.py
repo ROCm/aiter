@@ -19,10 +19,11 @@ more KV heads. Functional cases cover one row, a short extend and chunked
 prefill against long cached contexts (one whose packed KV exceeds the direct
 kernel's 64 MiB budget, one packed by the per-row rule, one only raw direct
 reads), nine 1M-token requests whose packed K/V exceed 4 GiB (the last, a
-1024-row chunk, starts at 4 GiB), one request whose K and V each span the
-4 GiB - 1 MiB limit (raw direct and union), ragged batches with an empty request,
-HK > 1 (HK = 16 with over 4096 tasks to route), T = 256/768/1024 selections and
-constant Q/K whose logits sit near +1e11 on the union path (``large_logits``).
+1024-row chunk, starts at 4 GiB), requests whose K and V each span the
+4 GiB - 1 MiB limit (raw direct, and union with gated raw direct at 768 rows on
+gfx942 and 1536 rows on gfx950), ragged batches with an empty request, HK > 1
+(HK = 16 with over 4096 tasks to route), T = 256/768/1024 selections and constant
+Q/K whose logits sit near +1e11 on the union path (``large_logits``).
 Each graph case captures a layout on its own stream, replays it after rewriting
 its indices in place, then again after another layout grows the stream's scratch
 arena, which must keep the captured scratch allocated. The
@@ -31,18 +32,26 @@ token pool (past 4 GiB for the ``pool_4g`` cases) and read it in place through
 the slot table; the result must equal the packed call on the gathered rows bit
 for bit. The span limit cases must be rejected: one request whose K/V spans one
 token past 4 GiB - 1 MiB, or whose int32 slot table spans one entry past it.
-The strided cases store the same layouts' K/V as interleaved K|V records (one per
-token, as vLLM's QSA cache does) or as padded rows and read them in place, packed
-and through kv_slots (past 4 GiB for the ``pool_4g`` cases); the result must equal
-the call on the rows gathered into contiguous K/V bit for bit. The 2048-row graph,
-kv_slots and strided cases clear gfx950's 1536-row union gate (and gfx942's). The
-summaries report the union tiles of each call (``union tiles``); on gfx950, whose
-entry proposes union for every tile, those cases must run some. The
-max stride cases read a short request through K/V rows 2**28 - 8 elements apart,
-the largest stride accepted, packed and through kv_slots (past 4 GiB for ``wide``).
-K/V rows that are not 16-byte aligned, overlap, differ in stride between K and V,
-or sit 2**28 elements or more apart, and an interleaved request whose rows span
-past 4 GiB - 1 MiB, must be rejected.
+On gfx950 the strided cases store the same layouts' K/V as interleaved K|V
+records (one per token, as vLLM's QSA cache does) or as padded rows and read them
+in place, packed and through kv_slots (past 4 GiB for the ``pool_4g`` cases); the
+result must equal the call on the rows gathered into contiguous K/V bit for bit.
+Elsewhere strided rows must be rejected. The UNION_LAYOUTS and RAW_DIRECT_LAYOUTS
+cases (1536 rows or more) clear gfx950's 1536-row union gate (and gfx942's). The
+summaries report the union tiles of each call (``union tiles``) and how its direct
+side read K/V (``direct``); on gfx950, whose entry proposes union for every tile,
+the UNION_LAYOUTS cases must run some, and the 1536-row request at the
+4 GiB - 1 MiB limit must build a union plan whose direct side reads the raw K/V.
+The route cases run that request with each route forced (AITER_QSA_PLATFORM):
+every proposed tile on union (gfx950 proposes every tile), then none proposed (every
+tile on gated raw direct). The max stride cases read a request through K/V rows
+2**28 - 8 elements apart, the largest stride accepted: packed and through kv_slots
+(past 4 GiB for ``wide``), on packed direct and on raw direct, and a 1536-row
+request on union tiles (its blocks all read the same four pool rows). K/V rows
+that are not 16-byte aligned, overlap, differ in stride between K and V, or sit
+2**28 elements or more apart, K/V heads or dims that are not dense, a
+non-contiguous Q, and an interleaved request whose rows span past 4 GiB - 1 MiB,
+must be rejected.
 Cases needing more device memory than is free are skipped with a warning.
 Performance cases are single-request full prefills of 1k-32k tokens plus the
 12000-token serving prompt (T = 512); they are checked as well and are the only
@@ -62,8 +71,10 @@ Usage:
 """
 
 import argparse
+import contextlib
 import itertools
 import math
+import os
 
 import numpy as np
 import pandas as pd
@@ -74,8 +85,9 @@ import triton.language as tl
 
 import aiter
 from aiter import dtypes
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
 from aiter.ops.flydsl import qsa_sparse_prefill as flydsl_prefill
+from aiter.ops.flydsl.kernels.qsa import sparse_prefill_common
 from aiter.ops.qsa import qsa_sparse_prefill
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
@@ -87,18 +99,22 @@ SCALE = HEAD_DIM**-0.5
 
 # name -> (query_lens, prefix_lens, kv_heads, selection, blocks per row T)
 FUNCTIONAL_CASES = {
-    # Below the union row threshold: direct only (packed, raw, HK2 with an empty request).
+    # Below both archs' union row thresholds: direct only (packed, raw, HK2 with an
+    # empty request).
     "one_row": ((1,), (0,), 1, "shared", 512),
     "extend_17_ctx_30017": ((17,), (30000,), 1, "random", 512),
     "extend_64_ctx_70065": ((64,), (70001,), 1, "random", 512),
     "hk2_ragged": ((7, 0, 9), (0, 5, 3000), 2, "shared", 512),
-    # Union + packed direct; random rows route every tile direct, 4096 rows pack per row.
+    # On gfx942 (union from 384 rows): union + packed direct; random rows route every
+    # tile direct, 4096 rows pack per row. Below gfx950's 1536 rows: direct only.
     "ragged_4": ((300, 129, 1001, 63), (0, 517, 4093, 12345), 1, "shared", 512),
     "chunk_1024_ctx_31024_random": ((1024,), (30000,), 1, "random", 512),
     "chunk_4096_ctx_131072": ((4096,), (126976,), 1, "shared", 512),
-    # Union + gated raw direct over a windowed K2.
+    # gfx942: union + gated raw direct over a windowed K2 (gfx950:
+    # chunk_1536_ctx_8386560).
     "chunk_1024_ctx_132096": ((1024,), (131072,), 1, "shared", 512),
-    # Packed K/V over 4 GiB: the 1024-row request starts at 4 GiB (union, 4 K2 windows).
+    # Packed K/V over 4 GiB: the 1024-row request starts at 4 GiB (union on gfx942, 4 K2
+    # windows).
     "batch_9_ctx_1048576": (
         (2,) * 8 + (1024,),
         (2**20 - 2,) * 8 + (2**20 - 1024,),
@@ -106,7 +122,7 @@ FUNCTIONAL_CASES = {
         "shared",
         512,
     ),
-    # One request at the 4 GiB - 1 MiB K/V limit, by raw direct and by union.
+    # One request at the 4 GiB - 1 MiB K/V limit, by raw direct and (gfx942) by union.
     "extend_64_ctx_8386560": (
         (64,),
         ((2**32 - 2**20) // (HEAD_DIM * 2) - 64,),
@@ -145,14 +161,50 @@ STRIDE_LAYOUTS = {
     "chunk_2048_ctx_30720": ((2048,), (28672,), 1, "shared", 512),
     "hk2_chunk_2048_ctx_8192": ((2048,), (6144,), 2, "shared", 512),
 }
+# Functional layouts over gfx950's 1536-row union gate (last, as above): ragged
+# requests, and one request at the 4 GiB - 1 MiB K/V limit whose direct side reads the
+# raw K/V.
+UNION_CASES = {
+    "ragged_4_rows_2986": (
+        (600, 258, 2002, 126),
+        (0, 517, 4093, 12345),
+        1,
+        "shared",
+        512,
+    ),
+    "chunk_1536_ctx_8386560": (
+        (1536,),
+        ((2**32 - 2**20) // (HEAD_DIM * 2) - 1536,),
+        1,
+        "shared",
+        512,
+    ),
+}
 CASES = {
     **FUNCTIONAL_CASES,
     **PERF_CASES,
     **{name: shape for name, (shape, _) in CONSTANT_CASES.items()},
     **STRIDE_LAYOUTS,
+    **UNION_CASES,
 }
-# Layouts whose calls must keep union tiles on gfx950 (gfx942's route is reported only).
-UNION_LAYOUTS = {"chunk_2048_ctx_30720", "hk2_chunk_2048_ctx_8192"}
+# Layouts whose calls must keep union tiles on gfx950, and those that must build a union
+# plan there whose direct side reads the raw K/V (gated raw direct); gfx942's route is
+# reported only.
+UNION_LAYOUTS = {
+    "chunk_2048_ctx_30720",
+    "hk2_chunk_2048_ctx_8192",
+    "ragged_4_rows_2986",
+}
+RAW_DIRECT_LAYOUTS = {"chunk_1536_ctx_8386560"}
+# name -> (RAW_DIRECT_LAYOUTS layout, route forced through AITER_QSA_PLATFORM): every
+# proposed tile kept on union (no union cost), or none proposed (every tile on gated raw
+# direct).
+FORCED_ROUTES = {"union": "union_fixed=0,union_step=0", "direct": "union_ratio=0"}
+ROUTE_CASES = {
+    f"route_{route}_{layout}": (layout, route)
+    for layout in sorted(RAW_DIRECT_LAYOUTS)
+    for route in FORCED_ROUTES
+}
 # name -> (captured layout, layout whose first call then grows the scratch arena: its
 # packed KV outgrows the captured layout's)
 GRAPH_CASES = {
@@ -243,33 +295,108 @@ STRIDE_CASES = {
         POOL_4G_RECORDS,
         FIRST_PAGE_4G,
     ),
+    "interleaved_ragged_4_rows_2986": ("ragged_4_rows_2986", None, None, 0),
+    "kv_slots_interleaved_ragged_4_rows_2986": ("ragged_4_rows_2986", None, 0, 1),
 }
 # The wrapper's bound on the K/V row stride (elements): strides below it are accepted.
 KV_STRIDE_LIMIT = 2**28
-# name -> (tokens of one HK1 request, row strides of K and V in elements, the rejection's
-# message): rows the kernels cannot read, and interleaved rows whose span passes
-# 4 GiB - 1 MiB although the request's K values alone would fit
+# name -> (tokens of one request, KV heads, K and V (row, head, dim) strides in
+# elements, Q's element step along dims (2: not contiguous), the rejection's message):
+# K/V or Q the kernels cannot read, and interleaved rows whose span passes
+# 4 GiB - 1 MiB although the request's K values alone would fit. The K/V messages are
+# the row check's own, so that off gfx950 the strided-row rejection cannot stand in.
+DENSE = (HEAD_DIM, HEAD_DIM, 1)
+ROWS = "dense [heads, 256]"
 STRIDE_REJECT_CASES = {
-    "stride_over_limit": (2, KV_STRIDE_LIMIT, KV_STRIDE_LIMIT, "K/V rows"),
-    "stride_not_16_byte_aligned": (4 * 512 + 3, HEAD_DIM + 4, HEAD_DIM + 4, "K/V rows"),
-    "stride_below_row": (4 * 512 + 3, HEAD_DIM - 8, HEAD_DIM - 8, "K/V rows"),
-    "k_v_strides_differ": (4 * 512 + 3, 2 * HEAD_DIM, 3 * HEAD_DIM, "K/V rows"),
+    "stride_over_limit": (
+        2,
+        1,
+        (KV_STRIDE_LIMIT, HEAD_DIM, 1),
+        (KV_STRIDE_LIMIT, HEAD_DIM, 1),
+        1,
+        ROWS,
+    ),
+    "stride_not_16_byte_aligned": (
+        4 * 512 + 3,
+        1,
+        (HEAD_DIM + 4, HEAD_DIM, 1),
+        (HEAD_DIM + 4, HEAD_DIM, 1),
+        1,
+        ROWS,
+    ),
+    "stride_below_row": (
+        4 * 512 + 3,
+        1,
+        (HEAD_DIM - 8, HEAD_DIM, 1),
+        (HEAD_DIM - 8, HEAD_DIM, 1),
+        1,
+        ROWS,
+    ),
+    "k_v_strides_differ": (
+        4 * 512 + 3,
+        1,
+        (2 * HEAD_DIM, HEAD_DIM, 1),
+        (3 * HEAD_DIM, HEAD_DIM, 1),
+        1,
+        ROWS,
+    ),
+    # Per-head K|V records: each head's values 512 elements apart.
+    "heads_not_dense": (
+        4 * 512 + 3,
+        2,
+        (4 * HEAD_DIM, 2 * HEAD_DIM, 1),
+        (4 * HEAD_DIM, 2 * HEAD_DIM, 1),
+        1,
+        ROWS,
+    ),
+    "dims_strided": (
+        4 * 512 + 3,
+        1,
+        (2 * HEAD_DIM, HEAD_DIM, 2),
+        (2 * HEAD_DIM, HEAD_DIM, 2),
+        1,
+        ROWS,
+    ),
+    # Dense K, strided V; and two heads whose values overlap, rows HK x 256 apart.
+    "v_strided_k_dense": (
+        4 * 512 + 3,
+        1,
+        DENSE,
+        (2 * HEAD_DIM, HEAD_DIM, 1),
+        1,
+        ROWS,
+    ),
+    "heads_overlap": (
+        4 * 512 + 3,
+        2,
+        (2 * HEAD_DIM, HEAD_DIM // 2, 1),
+        (2 * HEAD_DIM, HEAD_DIM // 2, 1),
+        1,
+        ROWS,
+    ),
+    "q_not_contiguous": (4 * 512 + 3, 1, DENSE, DENSE, 2, "Q must be contiguous"),
     "interleaved_span_over_limit": (
         (2**32 - 2**20) // (4 * HEAD_DIM) + 1,
-        2 * HEAD_DIM,
-        2 * HEAD_DIM,
+        1,
+        (2 * HEAD_DIM, HEAD_DIM, 1),
+        (2 * HEAD_DIM, HEAD_DIM, 1),
+        1,
         "byte span",
     ),
 }
-# name -> (K/V view rows KV_STRIDE_LIMIT - 8 elements apart, the view row of the 4-token
-# request's first token, kv_slots): the packed request's 4 rows (1.5 GiB); pool rows 4-7
-# of a 3.5 GiB view; pool rows 8-11 of a 5.5 GiB view, which direct reads with 64-bit
-# (wide) loads
+# name -> (K/V view rows KV_STRIDE_LIMIT - 8 elements apart, the first of the four view
+# rows holding K/V, kv_slots, wide, query rows of the one request): a 2-row request over
+# 4 tokens in the packed request's 4 rows (1.5 GiB); in pool rows 4-7 of a 3.5 GiB view;
+# in pool rows 8-11 of a 5.5 GiB view, which raw direct reads with 64-bit (wide) loads;
+# and a 1536-row prefill (gfx950's union gate) whose four-token blocks all read pool
+# rows 4-7. These requests pack; RAW_DIRECT makes direct read the raw K/V instead.
 MAX_STRIDE_CASES = {
-    "max_stride": (4, 0, False),
-    "kv_slots_max_stride": (8, 4, True),
-    "kv_slots_wide_max_stride": (12, 8, True),
+    "max_stride": (4, 0, False, False, 2),
+    "kv_slots_max_stride": (8, 4, True, False, 2),
+    "kv_slots_wide_max_stride": (12, 8, True, True, 2),
+    "kv_slots_union_max_stride": (8, 4, True, False, 1536),
 }
+RAW_DIRECT = "max_packed_kv_bytes=0,pack_tokens_per_row=0"
 
 # Sharing levels of real Qwen3.8 indexer selections at layers 3 and 47.
 CORRELATED_PROFILES = (
@@ -802,22 +929,73 @@ def test_qsa_sparse_attention(case, heads):
         ret[f"{name} err"] = err
     # The SGLang kernels are only the baseline: FlyDSL alone must pass the check.
     assert ret["flydsl err"] == 0, f"{case} H{heads}: mismatch {ret['flydsl err']}"
+    check_union(ret, case, f"{case} H{heads}")
     return ret
 
 
-def union_tiles():
-    """Query tiles the latest call ran on the union kernel: the route of
-    sparse_prefill_order_masks writes 1 per union tile to the plan's active array (0
-    without a union plan)."""
-    plan = next(reversed(flydsl_prefill._workspaces.values())).union
-    return 0 if plan is None else int((plan.active != 0).sum().item())
+def latest_workspace():
+    """The plans of the latest call (the workspace cache keeps it last)."""
+    return next(reversed(flydsl_prefill._workspaces.values()))
+
+
+def direct_path(plan):
+    """How the direct side of a call reads K/V: packed by the pack kernel, or the raw
+    K/V (64-bit loads past 4 GiB: wide)."""
+    if plan.packed_key is not None:
+        return "packed"
+    return "raw wide" if plan.wide else "raw"
 
 
 def check_union(ret, layout, label):
-    """Report union_tiles() in ret; on gfx950 a UNION_LAYOUTS call must have run some."""
-    ret["union tiles"] = union_tiles()
-    if layout in UNION_LAYOUTS and get_gfx() == "gfx950":
+    """Report the latest call's union tiles (the route of sparse_prefill_order_masks
+    writes 1 per union tile to the union plan's active array) and direct path in ret. On
+    gfx950 a UNION_LAYOUTS call must have run union tiles, and a RAW_DIRECT_LAYOUTS call
+    must have had a union plan whose direct side reads the raw K/V."""
+    workspace = latest_workspace()
+    plan = workspace.union
+    ret["union tiles"] = 0 if plan is None else int((plan.active != 0).sum().item())
+    ret["direct"] = direct_path(workspace.direct)
+    if get_gfx_runtime() != "gfx950":
+        return
+    if layout in UNION_LAYOUTS:
         assert ret["union tiles"] > 0, f"{label}: no union tile ran"
+    if layout in RAW_DIRECT_LAYOUTS:
+        assert workspace.direct.gated and ret["direct"].startswith(
+            "raw"
+        ), f"{label}: direct {ret['direct']}, gated {workspace.direct.gated}"
+
+
+@contextlib.contextmanager
+def platform_entry(override):
+    """Calls inside run with AITER_QSA_PLATFORM = override. The entry is cached, and so
+    are the plans built from it: both are dropped on entry and on exit."""
+    previous = os.environ.get(sparse_prefill_common.OVERRIDE)
+
+    def reset():
+        sparse_prefill_common.platform.cache_clear()
+        flydsl_prefill._workspaces.clear()
+
+    os.environ[sparse_prefill_common.OVERRIDE] = override
+    reset()
+    try:
+        yield
+    finally:
+        if previous is None:
+            del os.environ[sparse_prefill_common.OVERRIDE]
+        else:
+            os.environ[sparse_prefill_common.OVERRIDE] = previous
+        reset()
+
+
+def rejected_off_gfx950(label, *args, **kwargs):
+    """Strided K/V rows are validated on gfx950 only: elsewhere the call must raise."""
+    try:
+        qsa_sparse_prefill(*args, **kwargs)
+        message = ""
+    except ValueError as error:
+        message = str(error)
+    assert "gfx950 only" in message, f"{label}: strided K/V gave {message!r}"
+    return {"gfx": get_gfx(), "rejected off gfx950": True}
 
 
 def released(pointer):
@@ -1000,9 +1178,9 @@ def test_qsa_kv_slots(case, heads):
 
 
 def make_rows(rows, kv_heads, padding):
-    """NaN-filled K and V views [rows, kv_heads, 256] with strided rows: the halves of one
-    interleaved K|V record per row (padding None), or rows of two buffers with padding
-    elements after their values."""
+    """NaN-filled K and V views [rows, kv_heads, 256] with strided rows: the halves of
+    one interleaved K|V record per row (padding None), or rows of two buffers with
+    padding elements after their values."""
     if padding is None:
         records = torch.full(
             (rows, 2, kv_heads, HEAD_DIM), float("nan"), dtype=dtypes.bf16
@@ -1028,7 +1206,9 @@ def test_qsa_strided_kv(case, heads):
         list(CASES).index(layout) * 16 + heads
     )
     q, k, v, indices = make_inputs(layout, heads, generator)
-    ref = run_torch(q, k, v, indices, query_lens, prefix_lens, SCALE)
+    ref = None
+    if get_gfx_runtime() == "gfx950":
+        ref = run_torch(q, k, v, indices, query_lens, prefix_lens, SCALE)
     if pool_rows is None:
         slots, pool_rows = None, k.shape[0]
         rows = torch.arange(pool_rows)
@@ -1045,6 +1225,16 @@ def test_qsa_strided_kv(case, heads):
         "prefix_lens": prefix_lens,
         "softmax_scale": SCALE,
     }
+    if get_gfx_runtime() != "gfx950":
+        return rejected_off_gfx950(
+            f"{case} H{heads}",
+            q,
+            strided_k,
+            strided_v,
+            indices,
+            **kwargs,
+            kv_slots=slots,
+        )
 
     def gather(q, k, v, indices):
         return qsa_sparse_prefill(q, k[rows], v[rows], indices, **kwargs)
@@ -1103,8 +1293,8 @@ def test_qsa_strided_kv(case, heads):
 
 def last_row_selection(tokens):
     """A valid T = 512 selection of the last row of a tokens-token request (its first
-    min(tokens // 4, 512) blocks, then the causal tail), so that a missing check fails the
-    rejection's assertion rather than faulting in a kernel."""
+    min(tokens // 4, 512) blocks, then the causal tail), so that a missing check fails
+    the rejection's assertion rather than faulting in a kernel."""
     blocks = min(tokens // 4, 512)
     indices = torch.full((1, 4 * 512 + 3), -1, dtype=dtypes.i32)
     indices[0, : 4 * blocks] = torch.arange(4 * blocks)
@@ -1151,16 +1341,22 @@ def test_qsa_span_limit(case, heads):
 
 @benchmark()
 def test_qsa_stride_rejected(case, heads):
-    """K/V rows the kernels cannot read (not 16-byte aligned, overlapping, K and V
-    strides differing, or KV_STRIDE_LIMIT elements or more apart), or interleaved rows
-    spanning past 4 GiB - 1 MiB, are rejected before any launch."""
-    tokens, k_stride, v_stride, expected = STRIDE_REJECT_CASES[case]
-    q = torch.zeros(1, heads, HEAD_DIM, dtype=dtypes.bf16)
+    """K/V the kernels cannot read (rows not 16-byte aligned, overlapping, with K and V
+    strides differing or KV_STRIDE_LIMIT elements or more apart; heads not dense; a
+    strided last dim), a non-contiguous Q, or interleaved rows spanning past
+    4 GiB - 1 MiB, are rejected before any launch."""
+    tokens, kv_heads, k_strides, v_strides, q_step, expected = STRIDE_REJECT_CASES[case]
+    q = torch.zeros(1, heads * kv_heads, HEAD_DIM * q_step, dtype=dtypes.bf16)
+    q = q[..., ::q_step]
     k, v = (
-        torch.empty(tokens * stride + HEAD_DIM, dtype=dtypes.bf16).as_strided(
-            (tokens, 1, HEAD_DIM), (stride, HEAD_DIM, 1)
-        )
-        for stride in (k_stride, v_stride)
+        torch.empty(
+            sum(
+                (n - 1) * step for n, step in zip((tokens, kv_heads, HEAD_DIM), strides)
+            )
+            + 1,
+            dtype=dtypes.bf16,
+        ).as_strided((tokens, kv_heads, HEAD_DIM), strides)
+        for strides in (k_strides, v_strides)
     )
     indices = last_row_selection(tokens)
     try:
@@ -1169,27 +1365,32 @@ def test_qsa_stride_rejected(case, heads):
     except ValueError as error:
         message = str(error)
     rejected = expected in message
-    assert rejected, f"{case} H{heads}: strides {k_stride}/{v_stride} gave {message!r}"
+    strides = f"K/V {k.stride()}/{v.stride()}, Q {q.stride()}"
+    assert rejected, f"{case} H{heads}: {strides} gave {message!r}"
     return {
         "gfx": get_gfx(),
         "kv_tokens": tokens,
-        "k stride": k_stride,
-        "v stride": v_stride,
+        "k strides": k_strides,
+        "v strides": v_strides,
+        "q contiguous": q.is_contiguous(),
         "rejected": rejected,
     }
 
 
 @benchmark()
 def test_qsa_max_stride(case, heads):
-    """A 4-token request read in place through K/V rows KV_STRIDE_LIMIT - 8 elements
-    apart, the largest stride accepted (packed rows, or pool rows through kv_slots), against
-    the call on the same rows in contiguous K/V; both match bit for bit. The other view
-    rows are NaN."""
-    view_rows, first, slotted = MAX_STRIDE_CASES[case]
-    query_lens, prefix_lens = (2,), (2,)
+    """A request read in place through K/V rows KV_STRIDE_LIMIT - 8 elements apart, the
+    largest stride accepted (packed rows, or pool rows through kv_slots), by packed
+    direct and by raw direct (RAW_DIRECT), against the call on the same rows in
+    contiguous K/V; both match bit for bit. Token t reads view row first + t % 4; the
+    other view rows are NaN. The 1536-row request runs with every tile forced onto union
+    (FORCED_ROUTES) and must run union tiles."""
+    view_rows, first, slotted, wide, rows = MAX_STRIDE_CASES[case]
+    tokens = max(rows, 4)
+    query_lens, prefix_lens = (rows,), (tokens - rows,)
     generator = torch.Generator(device="cuda").manual_seed(heads)
-    q = torch.randn(2, heads, HEAD_DIM, generator=generator, dtype=dtypes.bf16)
-    k, v = (
+    q = torch.randn(rows, heads, HEAD_DIM, generator=generator, dtype=dtypes.bf16)
+    k4, v4 = (
         torch.randn(4, 1, HEAD_DIM, generator=generator, dtype=dtypes.bf16)
         for _ in range(2)
     )
@@ -1201,49 +1402,111 @@ def test_qsa_max_stride(case, heads):
         ).as_strided((view_rows, 1, HEAD_DIM), (stride, HEAD_DIM, 1))
         for _ in range(2)
     )
-    rows = torch.arange(first, first + 4)
-    strided_k[rows], strided_v[rows] = k, v
+    strided_k[first : first + 4], strided_v[first : first + 4] = k4, v4
+    k, v = k4[torch.arange(tokens) % 4], v4[torch.arange(tokens) % 4]
     kwargs = {
         "query_lens": query_lens,
         "prefix_lens": prefix_lens,
         "softmax_scale": SCALE,
     }
-    slots = rows.to(dtypes.i32) if slotted else None
-    out = qsa_sparse_prefill(q, strided_k, strided_v, indices, kv_slots=slots, **kwargs)
-    err = checkAllclose(
-        run_torch(q, k, v, indices, query_lens, prefix_lens, SCALE),
-        out.to(dtypes.fp32),
-        rtol=2e-2,
-        atol=2e-2,
-        msg=f"{case} H{heads} flydsl_strided: out",
-    )
-    bitwise = checkAllclose(
-        qsa_sparse_prefill(q, k, v, indices, **kwargs),
-        out,
-        rtol=0,
-        atol=0,
-        msg=f"{case} H{heads} flydsl_strided vs contiguous: out",
-    )
-    assert err == 0 and bitwise == 0, f"{case} H{heads}: mismatch {err}, {bitwise}"
-    return {
+    slots = (first + torch.arange(tokens) % 4).to(dtypes.i32) if slotted else None
+    if get_gfx_runtime() != "gfx950":
+        return rejected_off_gfx950(
+            f"{case} H{heads}",
+            q,
+            strided_k,
+            strided_v,
+            indices,
+            kv_slots=slots,
+            **kwargs,
+        )
+    ref = run_torch(q, k, v, indices, query_lens, prefix_lens, SCALE)
+    ret = {
         "gfx": get_gfx(),
+        "rows": rows,
         "row stride": stride,
         "K span GiB": strided_k.untyped_storage().nbytes() / 2**30,
         "kv_slots": slotted,
-        "flydsl_strided err": err,
     }
+    union = [FORCED_ROUTES["union"]] if rows >= 1536 else []
+    for override, expected in (
+        ([], "packed"),
+        ([RAW_DIRECT], "raw wide" if wide else "raw"),
+    ):
+        with platform_entry(",".join(override + union)):
+            out = qsa_sparse_prefill(
+                q, strided_k, strided_v, indices, kv_slots=slots, **kwargs
+            )
+            check_union(ret, case, f"{case} H{heads}")
+            contiguous = qsa_sparse_prefill(q, k, v, indices, **kwargs)
+        label = f"{case} H{heads} flydsl_strided {ret['direct']}"
+        err = checkAllclose(
+            ref, out.to(dtypes.fp32), rtol=2e-2, atol=2e-2, msg=f"{label}: out"
+        )
+        bitwise = checkAllclose(
+            contiguous, out, rtol=0, atol=0, msg=f"{label} vs contiguous: out"
+        )
+        assert ret["direct"] == expected, f"{label}: expected direct {expected}"
+        if union:
+            assert ret["union tiles"] > 0, f"{label}: no union tile ran"
+        assert err == 0 and bitwise == 0, f"{label}: mismatch {err}, {bitwise}"
+        ret[f"{expected} err"] = err
+        ret[f"{expected} union tiles"] = ret.pop("union tiles")
+    del ret["direct"]
+    return ret
+
+
+@benchmark()
+def test_qsa_route(case, heads):
+    """A RAW_DIRECT_LAYOUTS layout with its route forced (FORCED_ROUTES), against the
+    reference: on gfx950 the union route must run union tiles, and the direct route must
+    run every tile on gated raw direct (gfx942 reports the route only)."""
+    layout, route = ROUTE_CASES[case]
+    query_lens, prefix_lens, *_ = CASES[layout]
+    generator = torch.Generator(device="cuda").manual_seed(
+        list(CASES).index(layout) * 16 + heads
+    )
+    q, k, v, indices = make_inputs(layout, heads, generator)
+    ref = run_torch(q, k, v, indices, query_lens, prefix_lens, SCALE)
+    label = f"{case} H{heads}"
+    ret = {"gfx": get_gfx(), "rows": q.shape[0], "route": route}
+    with platform_entry(FORCED_ROUTES[route]):
+        out = qsa_sparse_prefill(
+            q,
+            k,
+            v,
+            indices,
+            query_lens=query_lens,
+            prefix_lens=prefix_lens,
+            softmax_scale=SCALE,
+        )
+        check_union(ret, layout, label)
+        tiles = latest_workspace().union.num_tiles
+    ret["tiles"] = tiles
+    ret["flydsl err"] = checkAllclose(
+        ref, out.to(dtypes.fp32), rtol=2e-2, atol=2e-2, msg=f"{label}: out"
+    )
+    assert ret["flydsl err"] == 0, f"{label}: mismatch {ret['flydsl err']}"
+    if get_gfx_runtime() == "gfx950":
+        if route == "union":
+            assert ret["union tiles"] > 0, f"{label}: no union tile ran"
+        else:
+            assert ret["union tiles"] == 0, f"{label}: {ret['union tiles']} union tiles"
+    return ret
 
 
 def kv_bytes(case):
     """K/V bytes a case allocates, pools included (graph cases stay small)."""
     if case in MAX_STRIDE_CASES:
         return 2 * MAX_STRIDE_CASES[case][0] * KV_STRIDE_LIMIT * 2
+    if case in ROUTE_CASES:
+        case = ROUTE_CASES[case][0]
     if case in SPAN_LIMIT_CASES:
         tokens, slotted = SPAN_LIMIT_CASES[case]
         return tokens * (4 if slotted else HEAD_DIM * 2)
     if case in STRIDE_REJECT_CASES:
-        tokens, k_stride, v_stride, _ = STRIDE_REJECT_CASES[case]
-        return tokens * (k_stride + v_stride) * 2
+        tokens, _, k_strides, v_strides, *_ = STRIDE_REJECT_CASES[case]
+        return tokens * (k_strides[0] + v_strides[0]) * 2
     if case in STRIDE_CASES:
         layout, _, pool_rows, _ = STRIDE_CASES[case]
     else:
@@ -1273,6 +1536,7 @@ def main():
         nargs="*",
         choices=[
             *CASES,
+            *ROUTE_CASES,
             *GRAPH_CASES,
             *SLOT_CASES,
             *STRIDE_CASES,
@@ -1282,6 +1546,7 @@ def main():
         ],
         default=[
             *CASES,
+            *ROUTE_CASES,
             *GRAPH_CASES,
             *SLOT_CASES,
             *STRIDE_CASES,
@@ -1289,8 +1554,8 @@ def main():
             *STRIDE_REJECT_CASES,
             *MAX_STRIDE_CASES,
         ],
-        help="input layouts to run (functional, graph, kv_slots, strided, span limit, "
-        "stride rejection, max stride and performance cases)",
+        help="input layouts to run (functional, route, graph, kv_slots, strided, span "
+        "limit, stride rejection, max stride and performance cases)",
     )
     parser.add_argument(
         "-g",
@@ -1302,9 +1567,14 @@ def main():
     )
     args = parser.parse_args()
 
-    layouts = {**GRAPH_CASES, **SLOT_CASES, **STRIDE_CASES}
+    layouts = {**ROUTE_CASES, **GRAPH_CASES, **SLOT_CASES, **STRIDE_CASES}
     for suite, cases, test in (
-        ("functional", [*FUNCTIONAL_CASES, *CONSTANT_CASES], test_qsa_sparse_attention),
+        (
+            "functional",
+            [*FUNCTIONAL_CASES, *CONSTANT_CASES, *UNION_CASES],
+            test_qsa_sparse_attention,
+        ),
+        ("route", list(ROUTE_CASES), test_qsa_route),
         ("graph", list(GRAPH_CASES), test_qsa_graph_replay),
         ("kv_slots", list(SLOT_CASES), test_qsa_kv_slots),
         ("strided", list(STRIDE_CASES), test_qsa_strided_kv),
