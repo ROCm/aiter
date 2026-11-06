@@ -199,6 +199,7 @@ def compute_segment_params(config: dict, params) -> dict:
     min_share = config.pop("SPLIT_MIN_SHARE", 0)
     fit_budget = config.pop("SPLIT_FIT_BUDGET", False)
     seqs_per_tile = config.pop("SPLIT_SEQS_PER_TILE", 0)
+    seg_min_tiles = config.pop("SPLIT_SEG_MIN_TILES", 0)
 
     # tokens one segment must cover, so the split never outruns the context
     tile = triton.next_power_of_2(params.block_size)
@@ -222,6 +223,13 @@ def compute_segment_params(config: dict, params) -> dict:
     share = triton.cdiv(budget, prgms)
     if fit_budget:
         share = 1 << ((budget // prgms).bit_length() - 1) if budget >= prgms else 0
+        if seg_min_tiles and share * seg_min_tiles > limit:
+            # Segments shorter than seg_min_tiles only pay while the batch
+            # leaves at least half of the GPU idle.
+            half = budget // 2 // prgms
+            half = 1 << (half.bit_length() - 1) if half else 0
+            longest = 1 << (max(1, limit // seg_min_tiles).bit_length() - 1)
+            share = max(longest, half)
     if limit <= min_tiles or share < min_share or too_many_seqs:
         segments = 1
     else:

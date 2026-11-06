@@ -1,5 +1,6 @@
 # The kernels in this file are adapted from vLLM:
 # https://github.com/vllm-project/vllm/blob/main/vllm/attention/ops/triton_unified_attention.py
+import os
 from typing import NamedTuple
 
 import torch
@@ -172,6 +173,9 @@ def _gfx950_split_params(params: _UAParams):
         block_m = max(block_m, triton.next_power_of_2(q_rows))
     block_q = block_m // params.num_queries_per_kv
     num_q_blocks = params.num_tokens // block_q + params.num_seqs
+    if params.max_seqlen_q <= block_q:
+        # the launch shrinks to one query block per sequence (ONE_Q_BLOCK)
+        num_q_blocks = params.num_seqs
     return params._replace(num_2d_prgms=num_q_blocks * params.num_kv_heads)
 
 
@@ -1114,11 +1118,26 @@ def _unified_attention_gfx950(
     BLOCK_Q = BLOCK_M // params.num_queries_per_kv
     assert BLOCK_Q >= 1
 
+    # every sequence fits one query block: launch exactly one per sequence.
+    # This trusts max_seqlen_q. An underestimate drops query rows.
+    one_q_block = not params.all_decode and params.max_seqlen_q <= BLOCK_Q
+    if one_q_block and os.environ.get("AITER_UNIFIED_ATTN_CHECK_SEQLENS") == "1":
+        # Reading the lengths syncs the device, so the check stays opt-in.
+        starts = params.cu_seqlens_q[: params.num_seqs + 1]
+        longest = int((starts[1:] - starts[:-1]).max().item())
+        assert longest <= BLOCK_Q, (
+            f"max_seqlen_q={params.max_seqlen_q} fits one query block of "
+            f"{BLOCK_Q}, but a sequence has {longest} query tokens; those "
+            "rows would be dropped"
+        )
     if params.all_decode:
         total_query_blocks = params.num_seqs
         grid = (total_query_blocks, params.num_kv_heads)
     else:
-        total_query_blocks = params.num_tokens // BLOCK_Q + params.num_seqs
+        if one_q_block:
+            total_query_blocks = params.num_seqs
+        else:
+            total_query_blocks = params.num_tokens // BLOCK_Q + params.num_seqs
         grid = (params.num_kv_heads, total_query_blocks)
     if NUM_SEGMENTS > 1:
         grid = grid + (NUM_SEGMENTS,)
@@ -1185,6 +1204,7 @@ def _unified_attention_gfx950(
         USE_STORE_BUFFER_OP=USE_STORE_BUFFER_OP,
         num_warps=num_warps,
         ALL_DECODE=params.all_decode,
+        ONE_Q_BLOCK=one_q_block,
         CAUSAL=params.causal,
         # useful for debugging when needed
         REMOVE_INDIRECT_ACCESS=False,

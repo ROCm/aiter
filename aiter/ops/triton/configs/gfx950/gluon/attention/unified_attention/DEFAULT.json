@@ -219,7 +219,8 @@
     "SW_GEQ_256.Q_GEQ_2": {
       "SEGMENTS_PER_CU": 1,
       "SPLIT_FIT_BUDGET": true,
-      "SPLIT_SEQS_PER_TILE": 1.5,
+      "SPLIT_SEQS_PER_TILE": 2,
+      "SPLIT_SEG_MIN_TILES": 4,
       "MFMA_DIM": 16,
       "SPLIT_MIN_TILES": 4,
       "SEGMENT_TILE_MIN": 64,

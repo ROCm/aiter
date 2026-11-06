@@ -1752,6 +1752,7 @@ def _unified_attention_gluon_kernel(
     USE_LOAD_BUFFER_OP: gl.constexpr = False,
     USE_STORE_BUFFER_OP: gl.constexpr = False,
     ALL_DECODE: gl.constexpr = False,
+    ONE_Q_BLOCK: gl.constexpr = False,
     FP8_MIN: gl.constexpr = float8_info.min,
     FP8_MAX: gl.constexpr = float8_info.max,
     CAUSAL: gl.constexpr = True,
@@ -1817,15 +1818,22 @@ def _unified_attention_gluon_kernel(
         output_stride_1 = output_stride_1.to(gl.int64)
 
     if not ALL_DECODE:
-        seq_idx = find_seq_idx(
-            query_start_len_ptr, q_block_global_idx, num_seqs, cfg.BLOCK_Q
-        )
+        if ONE_Q_BLOCK:
+            # the grid holds one query block per sequence, no search needed
+            seq_idx = gl.program_id(1)
+        else:
+            seq_idx = find_seq_idx(
+                query_start_len_ptr, q_block_global_idx, num_seqs, cfg.BLOCK_Q
+            )
 
         cur_batch_in_all_start_index = gl.load(query_start_len_ptr + seq_idx).to(
             gl.int32
         )
-        q_block_start_idx = cur_batch_in_all_start_index // cfg.BLOCK_Q + seq_idx
-        q_block_local_idx = q_block_global_idx - q_block_start_idx
+        if ONE_Q_BLOCK:
+            q_block_local_idx: gl.int32 = 0
+        else:
+            q_block_start_idx = cur_batch_in_all_start_index // cfg.BLOCK_Q + seq_idx
+            q_block_local_idx = q_block_global_idx - q_block_start_idx
 
         cur_batch_in_all_stop_index = gl.load(query_start_len_ptr + seq_idx + 1).to(
             gl.int32
