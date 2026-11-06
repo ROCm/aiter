@@ -1782,28 +1782,49 @@ class Gfx1250Pipeline:
                     self.mem.stage_kv(token_base + t.TOKENS, 1 - buffer)
             vnorm = fx.Float32(1.0)
             vfactor = fx.Float32(1.0 if t.bf16 else 1.0 / t.FP8_MAX)
-            if const_expr(t.per_token_kv):
+            page_ratio = None
+            if const_expr(t.page128_pair and t.per_token_kv):
+                # P normalizes each page by its own V scales, as one-page
+                # steps do; the second page's PV is rescaled to the first's.
+                scale_base = kv_off + t.k_bytes + t.v_bytes + t.TOKENS * 4
+                page_factors = []
+                for p in range_constexpr(2):
+                    vmax = fx.Float32(
+                        self.mem.load(scale_base + (ctx.lane + 128 * p) * 4, fx.Float32)[0]
+                    )
+                    for k in range_constexpr(1, 4):
+                        vmax = fx.maxnumf(
+                            vmax,
+                            fx.Float32(
+                                self.mem.load(
+                                    scale_base + (ctx.lane + 128 * p + 32 * k) * 4,
+                                    fx.Float32,
+                                )[0]
+                            ),
+                        )
+                    for shift in (16, 8, 4, 2, 1):
+                        vmax = fx.maxnumf(vmax, vmax.shuffle_xor(shift, t.WAVE))
+                    page_factors.append(vmax * fx.Float32(1.0 / t.FP8_MAX))
+                # Empty planned tails carry no new mass. Keep the prior scale
+                # so their zero V contribution preserves the output.
+                vfactor = (page_factors[0] > 0.0).select(
+                    page_factors[0], fx.Float32(state[-1])
+                )
+                second = (page_factors[1] > 0.0).select(page_factors[1], vfactor)
+                vnorm = fx.Float32(rcp_f32(fx.maxnumf(vfactor, fx.Float32(1e-20))))
+                second_norm = fx.Float32(rcp_f32(fx.maxnumf(second, fx.Float32(1e-20))))
+                page_ratio = second * vnorm
+                # Waves 0-1 own page 0's tokens, waves 2-3 page 1's.
+                wave_vnorm = (ctx.warp < 2).select(vnorm, second_norm)
+            elif const_expr(t.per_token_kv):
                 # Every wave reduces the tile's scales, avoiding a CTA barrier.
                 scale_base = kv_off + t.k_bytes + t.v_bytes + t.TOKENS * 4
-                vmax = fx.maxnumf(
-                    fx.Float32(self.mem.load(scale_base + ctx.lane * 4, fx.Float32)[0]),
-                    fx.Float32(
-                        self.mem.load(scale_base + (ctx.lane + 32) * 4, fx.Float32)[0]
-                    ),
-                )
-                if const_expr(t.TOKENS == 128):
+                vmax = fx.Float32(self.mem.load(scale_base + ctx.lane * 4, fx.Float32)[0])
+                for k in range_constexpr(1, t.TOKENS // 32):
                     vmax = fx.maxnumf(
                         vmax,
                         fx.Float32(
-                            self.mem.load(scale_base + (ctx.lane + 64) * 4, fx.Float32)[
-                                0
-                            ]
-                        ),
-                    )
-                    vmax = fx.maxnumf(
-                        vmax,
-                        fx.Float32(
-                            self.mem.load(scale_base + (ctx.lane + 96) * 4, fx.Float32)[
+                            self.mem.load(scale_base + (ctx.lane + 32 * k) * 4, fx.Float32)[
                                 0
                             ]
                         ),
@@ -1969,7 +1990,9 @@ class Gfx1250Pipeline:
                 for r in range_constexpr(t.TOKENS // 8):
                     if const_expr(t.per_token_kv):
                         vs = fx.Float32(vscales[r])
-                        pscale.append(probs[r] * vs * vnorm)
+                        pscale.append(
+                            probs[r] * vs * (wave_vnorm if t.page128_pair else vnorm)
+                        )
                     else:
                         pscale.append(
                             probs[r] * fx.Float32(1.0 if t.bf16 else t.FP8_MAX)
@@ -1995,7 +2018,7 @@ class Gfx1250Pipeline:
                         fx.Float32,
                     )
                 # Prefetch V operands before waiting for cross-wave P stores.
-                pv_k = 32 if t.bf16 else t.TOKENS
+                pv_k = 32 if t.bf16 else min(t.TOKENS, 128)
                 if const_expr(t.fp8_multi_tile):
                     v_operands = page_v_operands
                 elif const_expr(t.packed_lds):
@@ -2057,10 +2080,25 @@ class Gfx1250Pipeline:
                         if t.packed_lds
                         else fx.Vector.filled(8, 0.0, fx.Float32)
                     )
-                    for d in range_constexpr(t.TOKENS // pv_k):
+                    if const_expr(page_ratio is not None):
                         out = Gfx1250Gemm.mma(
-                            v_operands[vh][d], p_operands[d], out, pv_k, t.bf16
+                            v_operands[vh][0], p_operands[0], out, pv_k, t.bf16
                         )
+                        second_out = Gfx1250Gemm.mma(
+                            v_operands[vh][1],
+                            p_operands[1],
+                            fx.Vector.filled(8, 0.0, fx.Float32),
+                            pv_k,
+                            t.bf16,
+                        )
+                        out = out + second_out * fx.Vector.from_elements(
+                            [page_ratio], dtype=fx.Float32
+                        ).broadcast_to(8)
+                    else:
+                        for d in range_constexpr(t.TOKENS // pv_k):
+                            out = Gfx1250Gemm.mma(
+                                v_operands[vh][d], p_operands[d], out, pv_k, t.bf16
+                            )
                     if const_expr(t.packed_lds):
                         next_state.append(out)
                     else:
