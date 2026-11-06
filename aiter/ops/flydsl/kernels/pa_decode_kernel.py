@@ -1125,6 +1125,14 @@ def compile_gfx1250_pa_decode(
     if t.bf16_wave_query_tiles or t.bf16_decode_wave:
         # Iterative ILP scheduling leaves fewer VGPR bank switches per page.
         llvm_options["amdgpu-sched-strategy"] = "iterative-ilp"
+    if (
+        not t.bf16
+        and t.head_dim == 128
+        and t.block_size == 128
+        and t.m_tiles == 1
+        and t.sliding_window == 0
+    ):
+        llvm_options["amdgpu-sched-strategy"] = "max-ilp"
     if not t.merged_output or t.bf16 or t.compact_fp8_cluster:
         # The compact merge ABIs fit completely. Other FP8 merges retain
         # explicit loads rather than a slower partial preload.
