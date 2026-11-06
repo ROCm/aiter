@@ -5,10 +5,14 @@ import triton.language as tl
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
-from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton._gluon_kernels.gfx1250.attention.mha_fp8 import (
+    concat_subtile,
+    fast_maximum,
+)
 from aiter.ops.triton._triton_kernels.common.mha_kernel_utils import (
     _compute_fp8_scaling_factors,
 )
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 
 @gluon.jit
@@ -156,9 +160,9 @@ def _attn_fwd_inner(
                 offs_m[:, None] * stride_sd_m
                 + (start_n + offs_n)[None, :] * stride_sd_n
             )
-            p_mask = (offs_m < seqlen_q)[:, None] & (
-                (start_n + offs_n) < seqlen_k
-            )[None, :]
+            p_mask = (offs_m < seqlen_q)[:, None] & ((start_n + offs_n) < seqlen_k)[
+                None, :
+            ]
 
         if ENABLE_DROPOUT:
             # NOTE: the philox offset is derived from `start_n`, so the RNG
@@ -212,6 +216,289 @@ def _attn_fwd_inner(
         buf = 1 - buf
 
     return acc, l_i, m_i, buf
+
+
+@gluon.jit
+def tdm_load(desc, buffer, write_idx, BLOCK_N):
+    gl.amd.gfx1250.tdm.async_load(
+        desc,
+        [write_idx * BLOCK_N, 0],
+        buffer.index(write_idx % 2),
+    )
+    return desc
+
+
+@gluon.jit
+def local_load_k(buffer, read_idx, sub_idx: gl.constexpr, BLOCK_N, layout):
+    k = (
+        buffer.index(read_idx % 2)
+        .slice(sub_idx * (BLOCK_N // 2), BLOCK_N // 2, dim=0)
+        .permute((1, 0))
+        .load(layout=layout)
+    )
+    return k
+
+
+@gluon.jit
+def local_load_v(buffer, read_idx, sub_idx: gl.constexpr, HEAD_DIM_POW2, layout):
+    v = (
+        buffer.index(read_idx % 2)
+        .slice(sub_idx * (HEAD_DIM_POW2 // 2), HEAD_DIM_POW2 // 2, dim=1)
+        .load(layout=layout)
+    )
+    return v
+
+
+@gluon.jit
+def apply_mask(
+    qk,
+    subtile: gl.constexpr,
+    tile_n,
+    offs_m,
+    SEQLEN_Q,
+    SEQLEN_K,
+    BLOCK_N,
+    LAYOUT,
+    CAUSAL,
+):
+    offs_n = (
+        tile_n * BLOCK_N
+        + subtile * (BLOCK_N // 2)
+        + gl.arange(0, BLOCK_N // 2, layout=gl.SliceLayout(0, LAYOUT))
+    )
+    mask = offs_n[None, :] < SEQLEN_K
+    if CAUSAL:
+        mask_causal = offs_m[:, None] >= (offs_n + SEQLEN_Q - SEQLEN_K)[None, :]
+        mask = mask & mask_causal
+    qk = tl.where(mask, qk, float("-inf"))
+    return qk
+
+
+@gluon.jit
+def _attn_fwd_subtiled(
+    q,
+    m_i,
+    l_i,
+    k_desc,
+    v_desc,
+    k_buffer,
+    v_buffer,
+    offs_m,
+    SEQLEN_Q,
+    SEQLEN_K,
+    num_n_iter,
+    num_n_iter_unmasked,
+    qk_scale,
+    CAUSAL: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    HEAD_DIM_POW2: gl.constexpr,
+    LAYOUT: gl.constexpr,
+    DOT_LAYOUT_K: gl.constexpr,
+    DOT_LAYOUT_P: gl.constexpr,
+    DOT_LAYOUT_V: gl.constexpr,
+):
+    qk_zeros = gl.zeros((BLOCK_M, BLOCK_N // 2), dtype=gl.float32, layout=LAYOUT)
+    acc0 = gl.zeros((BLOCK_M, HEAD_DIM_POW2 // 2), dtype=gl.float32, layout=LAYOUT)
+    acc1 = gl.zeros((BLOCK_M, HEAD_DIM_POW2 // 2), dtype=gl.float32, layout=LAYOUT)
+
+    read_idx_k = 0
+    read_idx_v = 0
+    write_idx_k = 0
+    write_idx_v = 0
+
+    k_desc = tdm_load(k_desc, k_buffer, write_idx_k, BLOCK_N)
+    write_idx_k += 1
+
+    k_desc = tdm_load(k_desc, k_buffer, write_idx_k, BLOCK_N)
+    write_idx_k += 1
+
+    v_desc = tdm_load(v_desc, v_buffer, write_idx_v, BLOCK_N)
+    write_idx_v += 1
+
+    gl.amd.gfx1250.tdm.async_wait(2)
+    k0 = local_load_k(k_buffer, read_idx_k, 0, BLOCK_N, layout=DOT_LAYOUT_K)
+    k1 = local_load_k(k_buffer, read_idx_k, 1, BLOCK_N, layout=DOT_LAYOUT_K)
+    read_idx_k += 1
+
+    gl.barrier()
+    k_desc = tdm_load(k_desc, k_buffer, write_idx_k, BLOCK_N)
+    write_idx_k += 1
+
+    qk0 = gl.amd.gfx1250.wmma(q, k0, qk_zeros)
+    qk1 = gl.amd.gfx1250.wmma(q, k1, qk_zeros)
+    if num_n_iter_unmasked == 0:
+        qk0 = apply_mask(
+            qk0,
+            0,
+            0,
+            offs_m,
+            SEQLEN_Q,
+            SEQLEN_K,
+            BLOCK_N,
+            LAYOUT,
+            CAUSAL,
+        )
+        qk1 = apply_mask(
+            qk1,
+            1,
+            0,
+            offs_m,
+            SEQLEN_Q,
+            SEQLEN_K,
+            BLOCK_N,
+            LAYOUT,
+            CAUSAL,
+        )
+    qk = concat_subtile(qk0, qk1)
+    m_ij = fast_maximum(m_i, gl.reduce(qk, 1, fast_maximum) * qk_scale)
+    qk0_shifted = gl.fma(qk0, qk_scale, -m_ij[:, None])
+    qk1_shifted = gl.fma(qk1, qk_scale, -m_ij[:, None])
+    p0 = gl.exp2(qk0_shifted)
+    gl.amd.gfx1250.tdm.async_wait(2)
+    k0 = local_load_k(k_buffer, read_idx_k, 0, BLOCK_N, layout=DOT_LAYOUT_K)
+
+    num_iter_unmasked = gl.maximum(
+        gl.minimum(num_n_iter_unmasked - 1, num_n_iter - 1), 0
+    )
+    for _ in range(num_iter_unmasked):
+
+        gl.barrier()
+        with gl.amd.warp_pipeline_stage("stage0"):
+            qk0 = gl.amd.gfx1250.wmma(q, k0, qk_zeros)
+            k1 = local_load_k(k_buffer, read_idx_k, 1, BLOCK_N, layout=DOT_LAYOUT_K)
+            read_idx_k += 1
+            p1 = gl.exp2(qk1_shifted)
+            alpha = gl.exp2(m_i - m_ij)
+            m_i = m_ij
+            acc0 = acc0 * alpha[:, None]
+            acc1 = acc1 * alpha[:, None]
+            v_desc = tdm_load(v_desc, v_buffer, write_idx_v, BLOCK_N)
+            write_idx_v += 1
+
+        gl.amd.gfx1250.tdm.async_wait(2)
+        with gl.amd.warp_pipeline_stage("stage1"):
+            qk1 = gl.amd.gfx1250.wmma(q, k1, qk_zeros)
+            v0 = local_load_v(
+                v_buffer, read_idx_v, 0, HEAD_DIM_POW2, layout=DOT_LAYOUT_V
+            )
+            p = concat_subtile(p0, p1)
+            l_ij = gl.sum(p, 1)
+            l_i = gl.fma(l_i, alpha, l_ij)
+            p_cast = p.to(v0.dtype, fp_downcast_rounding="rtz")
+            p_cast = gl.convert_layout(p_cast, layout=DOT_LAYOUT_P)
+
+        gl.barrier()
+        with gl.amd.warp_pipeline_stage("stage2"):
+            acc0 = gl.amd.gfx1250.wmma(p_cast, v0, acc0)
+            v1 = local_load_v(
+                v_buffer, read_idx_v, 1, HEAD_DIM_POW2, layout=DOT_LAYOUT_V
+            )
+            read_idx_v += 1
+            qk = concat_subtile(qk0, qk1)
+            m_ij = gl.reduce(qk, 1, fast_maximum) * qk_scale
+            k_desc = tdm_load(k_desc, k_buffer, write_idx_k, BLOCK_N)
+            write_idx_k += 1
+
+        gl.amd.gfx1250.tdm.async_wait(2)
+        with gl.amd.warp_pipeline_stage("stage3"):
+            acc1 = gl.amd.gfx1250.wmma(p_cast, v1, acc1)
+            k0 = local_load_k(k_buffer, read_idx_k, 0, BLOCK_N, layout=DOT_LAYOUT_K)
+            m_ij = fast_maximum(m_i, m_ij)
+            qk0_shifted = gl.fma(qk0, qk_scale, -m_ij[:, None])
+            qk1_shifted = gl.fma(qk1, qk_scale, -m_ij[:, None])
+            p0 = gl.exp2(qk0_shifted)
+
+    for _ in range(num_n_iter - 1 - num_iter_unmasked):
+
+        gl.barrier()
+        with gl.amd.warp_pipeline_stage("stage0"):
+            qk0 = gl.amd.gfx1250.wmma(q, k0, qk_zeros)
+            k1 = local_load_k(k_buffer, read_idx_k, 1, BLOCK_N, layout=DOT_LAYOUT_K)
+            read_idx_k += 1
+            p1 = gl.exp2(qk1_shifted)
+            alpha = gl.exp2(m_i - m_ij)
+            m_i = m_ij
+            acc0 = acc0 * alpha[:, None]
+            acc1 = acc1 * alpha[:, None]
+            v_desc = tdm_load(v_desc, v_buffer, write_idx_v, BLOCK_N)
+            write_idx_v += 1
+
+        gl.amd.gfx1250.tdm.async_wait(2)
+        with gl.amd.warp_pipeline_stage("stage1"):
+            qk1 = gl.amd.gfx1250.wmma(q, k1, qk_zeros)
+            v0 = local_load_v(
+                v_buffer, read_idx_v, 0, HEAD_DIM_POW2, layout=DOT_LAYOUT_V
+            )
+            p = concat_subtile(p0, p1)
+            l_ij = gl.sum(p, 1)
+            l_i = gl.fma(l_i, alpha, l_ij)
+            p_cast = p.to(v0.dtype, fp_downcast_rounding="rtz")
+            p_cast = gl.convert_layout(p_cast, layout=DOT_LAYOUT_P)
+
+        gl.barrier()
+        with gl.amd.warp_pipeline_stage("stage2"):
+            acc0 = gl.amd.gfx1250.wmma(p_cast, v0, acc0)
+            v1 = local_load_v(
+                v_buffer, read_idx_v, 1, HEAD_DIM_POW2, layout=DOT_LAYOUT_V
+            )
+            read_idx_v += 1
+            qk0 = apply_mask(
+                qk0,
+                0,
+                read_idx_v,
+                offs_m,
+                SEQLEN_Q,
+                SEQLEN_K,
+                BLOCK_N,
+                LAYOUT,
+                CAUSAL,
+            )
+            qk1 = apply_mask(
+                qk1,
+                1,
+                read_idx_v,
+                offs_m,
+                SEQLEN_Q,
+                SEQLEN_K,
+                BLOCK_N,
+                LAYOUT,
+                CAUSAL,
+            )
+            qk = concat_subtile(qk0, qk1)
+            m_ij = gl.reduce(qk, 1, fast_maximum) * qk_scale
+            k_desc = tdm_load(k_desc, k_buffer, write_idx_k, BLOCK_N)
+            write_idx_k += 1
+
+        gl.amd.gfx1250.tdm.async_wait(2)
+        with gl.amd.warp_pipeline_stage("stage3"):
+            acc1 = gl.amd.gfx1250.wmma(p_cast, v1, acc1)
+            k0 = local_load_k(k_buffer, read_idx_k, 0, BLOCK_N, layout=DOT_LAYOUT_K)
+            m_ij = fast_maximum(m_i, m_ij)
+            qk0_shifted = gl.fma(qk0, qk_scale, -m_ij[:, None])
+            qk1_shifted = gl.fma(qk1, qk_scale, -m_ij[:, None])
+            p0 = gl.exp2(qk0_shifted)
+
+    p1 = gl.exp2(qk1_shifted)
+    alpha = gl.exp2(m_i - m_ij)
+    m_i = m_ij
+    acc0 = acc0 * alpha[:, None]
+    acc1 = acc1 * alpha[:, None]
+
+    p = concat_subtile(p0, p1)
+    l_ij = gl.sum(p, 1)
+    l_i = gl.fma(l_i, alpha, l_ij)
+
+    gl.amd.gfx1250.tdm.async_wait(0)
+    v0 = local_load_v(v_buffer, read_idx_v, 0, HEAD_DIM_POW2, layout=DOT_LAYOUT_V)
+    p_cast = p.to(v0.dtype, fp_downcast_rounding="rtz")
+    p_cast = gl.convert_layout(p_cast, layout=DOT_LAYOUT_P)
+    acc0 = gl.amd.gfx1250.wmma(p_cast, v0, acc0)
+    v1 = local_load_v(v_buffer, read_idx_v, 1, HEAD_DIM_POW2, layout=DOT_LAYOUT_V)
+    acc1 = gl.amd.gfx1250.wmma(p_cast, v1, acc1)
+
+    acc = concat_subtile(acc0, acc1)
+    return acc, l_i, m_i
 
 
 _attn_fwd_repr = make_kernel_repr(
@@ -316,6 +603,13 @@ def _attn_fwd(
     off_k_head = off_q_head // GRP_SZ
 
     HAS_PE: gl.constexpr = BLOCK_DMODEL_PE > 0
+    SUBTILED: gl.constexpr = (
+        not (IS_FP8 or ENABLE_DROPOUT or RETURN_SCORES or HAS_PE)
+        and SLIDING_WINDOW == 0
+        and alibi_slopes_ptr is None
+        and BLOCK_N >= 32
+        and BLOCK_DMODEL_POW2 >= 32
+    )
 
     # Non-pow2 head dim: Q is zero-masked at the load, K/V are zero-filled by
     # the TDM descriptor bound, and the O store drops the trailing columns.
@@ -532,9 +826,7 @@ def _attn_fwd(
                     + offs_m * stride_lse_m
                 )
                 lse_mask = offs_m < SEQLEN_Q
-                lse = gl.full(
-                    [BLOCK_M], 0.0, gl.float32, gl.SliceLayout(1, PV_LAYOUT)
-                )
+                lse = gl.full([BLOCK_M], 0.0, gl.float32, gl.SliceLayout(1, PV_LAYOUT))
                 gl.store(softmax_lse_ptr + offs_lse, lse, mask=lse_mask)
 
             return
@@ -630,9 +922,7 @@ def _attn_fwd(
     m_i = gl.full(
         [BLOCK_M], m_i_value, dtype=gl.float32, layout=gl.SliceLayout(1, PV_LAYOUT)
     )
-    l_i = gl.full(
-        [BLOCK_M], 1.0, dtype=gl.float32, layout=gl.SliceLayout(1, PV_LAYOUT)
-    )
+    l_i = gl.full([BLOCK_M], 1.0, dtype=gl.float32, layout=gl.SliceLayout(1, PV_LAYOUT))
     acc = gl.zeros([BLOCK_M, BLOCK_DMODEL_POW2], dtype=gl.float32, layout=PV_LAYOUT)
 
     if IS_FP8:
@@ -698,68 +988,144 @@ def _attn_fwd(
     block_full_end = gl.minimum(block_min + n_full_blocks * BLOCK_N, block_last)
     block_max = n_blocks * BLOCK_N
 
-    # Prime the pipeline. Issue order [K, K_PE, V] must match the loop body's.
-    gl.amd.gfx1250.tdm.async_load(k_desc, [block_min, 0], k_smem.index(0))
-    if HAS_PE:
-        gl.amd.gfx1250.tdm.async_load(k_pe_desc, [block_min, 0], k_pe_smem.index(0))
-    gl.amd.gfx1250.tdm.async_load(v_desc, [block_min, 0], v_smem.index(0))
-    buf: gl.int32 = 0
-
-    # n_blocks == 0 only for a zero-length KV sequence (varlen); fall through
-    # so the epilogue emits out=0 / lse=-inf.
-    if n_blocks > 0:
-        if block_full_end > block_min:
-            acc, l_i, m_i, buf = _attn_fwd_inner(
-                acc,
-                l_i,
-                m_i,
+    if SUBTILED:
+        if n_blocks > 0:
+            acc, l_i, m_i = _attn_fwd_subtiled(
                 q,
-                q_pe,
+                m_i,
+                l_i,
                 k_desc,
-                k_pe_desc,
                 v_desc,
-                stride_sd_m,
-                stride_sd_n,
-                seqlen_k,
-                seqlen_q,
-                dropout_p,
-                sd_ptr,
-                philox_seed,
-                philox_base,
-                block_min,
-                block_full_end,
-                alibi_slope,
-                descale_q,
-                descale_k,
-                descale_v,
+                k_smem,
+                v_smem,
                 offs_m,
-                offs_n_mma,
+                seqlen_q,
+                seqlen_k,
+                n_blocks,
+                n_full_blocks,
+                sm_scale * 1.4426950408889634,
+                IS_CAUSAL,
                 BLOCK_M,
                 BLOCK_N,
                 BLOCK_DMODEL_POW2,
-                BLOCK_DMODEL_PE,
-                sm_scale,
-                IS_CAUSAL=False,
-                MASK_STEPS=False,
-                ENABLE_DROPOUT=ENABLE_DROPOUT,
-                RETURN_SCORES=RETURN_SCORES,
-                IS_FP8=IS_FP8,
-                FP8_MAX=FP8_MAX,
-                SLIDING_WINDOW=SLIDING_WINDOW,
-                k_smem=k_smem,
-                k_pe_smem=k_pe_smem,
-                v_smem=v_smem,
-                buf=buf,
-                LAST=False,
-                QK_LAYOUT=QK_LAYOUT,
-                PV_LAYOUT=PV_LAYOUT,
-                q_layout=q_layout,
-                k_layout=k_layout,
-                p_layout=p_layout,
-                v_layout=v_layout,
+                PV_LAYOUT,
+                k_layout,
+                p_layout,
+                v_layout,
             )
+    else:
+        # Prime the pipeline. Issue order [K, K_PE, V] must match the loop body's.
+        gl.amd.gfx1250.tdm.async_load(k_desc, [block_min, 0], k_smem.index(0))
+        if HAS_PE:
+            gl.amd.gfx1250.tdm.async_load(k_pe_desc, [block_min, 0], k_pe_smem.index(0))
+        gl.amd.gfx1250.tdm.async_load(v_desc, [block_min, 0], v_smem.index(0))
+        buf: gl.int32 = 0
 
-        if block_last > block_full_end:
+        # n_blocks == 0 only for a zero-length KV sequence (varlen); fall through
+        # so the epilogue emits out=0 / lse=-inf.
+        if n_blocks > 0:
+            if block_full_end > block_min:
+                acc, l_i, m_i, buf = _attn_fwd_inner(
+                    acc,
+                    l_i,
+                    m_i,
+                    q,
+                    q_pe,
+                    k_desc,
+                    k_pe_desc,
+                    v_desc,
+                    stride_sd_m,
+                    stride_sd_n,
+                    seqlen_k,
+                    seqlen_q,
+                    dropout_p,
+                    sd_ptr,
+                    philox_seed,
+                    philox_base,
+                    block_min,
+                    block_full_end,
+                    alibi_slope,
+                    descale_q,
+                    descale_k,
+                    descale_v,
+                    offs_m,
+                    offs_n_mma,
+                    BLOCK_M,
+                    BLOCK_N,
+                    BLOCK_DMODEL_POW2,
+                    BLOCK_DMODEL_PE,
+                    sm_scale,
+                    IS_CAUSAL=False,
+                    MASK_STEPS=False,
+                    ENABLE_DROPOUT=ENABLE_DROPOUT,
+                    RETURN_SCORES=RETURN_SCORES,
+                    IS_FP8=IS_FP8,
+                    FP8_MAX=FP8_MAX,
+                    SLIDING_WINDOW=SLIDING_WINDOW,
+                    k_smem=k_smem,
+                    k_pe_smem=k_pe_smem,
+                    v_smem=v_smem,
+                    buf=buf,
+                    LAST=False,
+                    QK_LAYOUT=QK_LAYOUT,
+                    PV_LAYOUT=PV_LAYOUT,
+                    q_layout=q_layout,
+                    k_layout=k_layout,
+                    p_layout=p_layout,
+                    v_layout=v_layout,
+                )
+
+            if block_last > block_full_end:
+                acc, l_i, m_i, buf = _attn_fwd_inner(
+                    acc,
+                    l_i,
+                    m_i,
+                    q,
+                    q_pe,
+                    k_desc,
+                    k_pe_desc,
+                    v_desc,
+                    stride_sd_m,
+                    stride_sd_n,
+                    seqlen_k,
+                    seqlen_q,
+                    dropout_p,
+                    sd_ptr,
+                    philox_seed,
+                    philox_base,
+                    block_full_end,
+                    block_last,
+                    alibi_slope,
+                    descale_q,
+                    descale_k,
+                    descale_v,
+                    offs_m,
+                    offs_n_mma,
+                    BLOCK_M,
+                    BLOCK_N,
+                    BLOCK_DMODEL_POW2,
+                    BLOCK_DMODEL_PE,
+                    sm_scale,
+                    IS_CAUSAL=IS_CAUSAL,
+                    MASK_STEPS=True,
+                    ENABLE_DROPOUT=ENABLE_DROPOUT,
+                    RETURN_SCORES=RETURN_SCORES,
+                    IS_FP8=IS_FP8,
+                    FP8_MAX=FP8_MAX,
+                    SLIDING_WINDOW=SLIDING_WINDOW,
+                    k_smem=k_smem,
+                    k_pe_smem=k_pe_smem,
+                    v_smem=v_smem,
+                    buf=buf,
+                    LAST=False,
+                    QK_LAYOUT=QK_LAYOUT,
+                    PV_LAYOUT=PV_LAYOUT,
+                    q_layout=q_layout,
+                    k_layout=k_layout,
+                    p_layout=p_layout,
+                    v_layout=v_layout,
+                )
+
             acc, l_i, m_i, buf = _attn_fwd_inner(
                 acc,
                 l_i,
@@ -777,8 +1143,8 @@ def _attn_fwd(
                 sd_ptr,
                 philox_seed,
                 philox_base,
-                block_full_end,
                 block_last,
+                block_max,
                 alibi_slope,
                 descale_q,
                 descale_k,
@@ -801,7 +1167,7 @@ def _attn_fwd(
                 k_pe_smem=k_pe_smem,
                 v_smem=v_smem,
                 buf=buf,
-                LAST=False,
+                LAST=True,
                 QK_LAYOUT=QK_LAYOUT,
                 PV_LAYOUT=PV_LAYOUT,
                 q_layout=q_layout,
@@ -809,56 +1175,6 @@ def _attn_fwd(
                 p_layout=p_layout,
                 v_layout=v_layout,
             )
-
-        acc, l_i, m_i, buf = _attn_fwd_inner(
-            acc,
-            l_i,
-            m_i,
-            q,
-            q_pe,
-            k_desc,
-            k_pe_desc,
-            v_desc,
-            stride_sd_m,
-            stride_sd_n,
-            seqlen_k,
-            seqlen_q,
-            dropout_p,
-            sd_ptr,
-            philox_seed,
-            philox_base,
-            block_last,
-            block_max,
-            alibi_slope,
-            descale_q,
-            descale_k,
-            descale_v,
-            offs_m,
-            offs_n_mma,
-            BLOCK_M,
-            BLOCK_N,
-            BLOCK_DMODEL_POW2,
-            BLOCK_DMODEL_PE,
-            sm_scale,
-            IS_CAUSAL=IS_CAUSAL,
-            MASK_STEPS=True,
-            ENABLE_DROPOUT=ENABLE_DROPOUT,
-            RETURN_SCORES=RETURN_SCORES,
-            IS_FP8=IS_FP8,
-            FP8_MAX=FP8_MAX,
-            SLIDING_WINDOW=SLIDING_WINDOW,
-            k_smem=k_smem,
-            k_pe_smem=k_pe_smem,
-            v_smem=v_smem,
-            buf=buf,
-            LAST=True,
-            QK_LAYOUT=QK_LAYOUT,
-            PV_LAYOUT=PV_LAYOUT,
-            q_layout=q_layout,
-            k_layout=k_layout,
-            p_layout=p_layout,
-            v_layout=v_layout,
-        )
 
     gl.amd.gfx1250.tdm.async_wait(0)
 
