@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import ctypes
+import os
 
 
 class UncachedIpcHeap:
@@ -14,6 +15,9 @@ class UncachedIpcHeap:
 
     _HIP_IPC_HANDLE_BYTES = 64
     _HIP_IPC_MEM_LAZY_ENABLE_PEER_ACCESS = 0x1
+    # hipExtMallocWithFlags modes.
+    _HIP_DEVICE_MALLOC_DEFAULT = 0x0
+    _HIP_DEVICE_MALLOC_FINEGRAINED = 0x1
     _HIP_DEVICE_MALLOC_UNCACHED = 0x3
     _HIP_MEMCPY_HOST_TO_DEVICE = 1
     _hip = None
@@ -23,9 +27,21 @@ class UncachedIpcHeap:
     def _load_hip(cls):
         if cls._hip is not None:
             return cls._hip
-        from aiter.dist.device_communicators.vmm_allocator import load_hip_runtime
+        # Reuse the runtime torch already loaded. load_hip_runtime() tries the
+        # unversioned soname first, which in split rocm-sdk layouts resolves to
+        # a second copy of the runtime.
+        for name in ("libamdhip64.so.7", "libamdhip64.so.6"):
+            try:
+                cls._hip = ctypes.CDLL(name, mode=os.RTLD_NOLOAD)
+                break
+            except OSError:
+                continue
+        if cls._hip is None:
+            from aiter.dist.device_communicators.vmm_allocator import (
+                load_hip_runtime,
+            )
 
-        cls._hip = load_hip_runtime()
+            cls._hip = load_hip_runtime()
 
         class hipIpcMemHandle_t(ctypes.Structure):
             _fields_ = [("reserved", ctypes.c_byte * cls._HIP_IPC_HANDLE_BYTES)]
@@ -61,6 +77,8 @@ class UncachedIpcHeap:
             ctypes.c_int,
             ctypes.c_size_t,
         ]
+        cls._hip.hipDeviceSynchronize.restype = ctypes.c_int
+        cls._hip.hipDeviceSynchronize.argtypes = []
         cls._hip.hipMemcpy.restype = ctypes.c_int
         cls._hip.hipMemcpy.argtypes = [
             ctypes.c_void_p,
@@ -113,7 +131,18 @@ class UncachedIpcHeap:
         cls._hip_check(err, what="hipIpcCloseMemHandle")
 
     @classmethod
-    def alloc_uncached(cls, size: int) -> int:
+    def alloc(cls, size: int, flags: int | None = None, fill: int = 0) -> int:
+        """Device allocation with every byte set to *fill*, IPC-shareable, in the
+        given memory mode.
+
+        *flags* is a ``hipExtMallocWithFlags`` mode; ``None`` means uncached.
+        Only uncached and fine-grained are used in practice -- coarse-grained
+        (``_HIP_DEVICE_MALLOC_DEFAULT``) additionally requires the kernel's
+        payload loads to bypass L2 (``sc0 sc1`` rather than the current ``nt``,
+        which is only a hint) and buys nothing over fine-grained on PCIe.
+        """
+        if flags is None:
+            flags = cls._HIP_DEVICE_MALLOC_UNCACHED
         # hipIpcGetMemHandle on uncached allocs < 2 MiB requires a whole
         # number of 4 KiB pages. Kernel layout still uses the unrounded size.
         if size < 1:
@@ -125,12 +154,21 @@ class UncachedIpcHeap:
         err = hip.hipExtMallocWithFlags(
             ctypes.byref(buf),
             ctypes.c_size_t(size),
-            ctypes.c_uint(cls._HIP_DEVICE_MALLOC_UNCACHED),
+            ctypes.c_uint(int(flags)),
         )
-        cls._hip_check(err, what="hipExtMallocWithFlags")
-        err = hip.hipMemset(buf, 0, ctypes.c_size_t(size))
+        cls._hip_check(err, what=f"hipExtMallocWithFlags(flags={int(flags):#x})")
+        err = hip.hipMemset(buf, int(fill), ctypes.c_size_t(size))
         cls._hip_check(err, what="hipMemset")
+        # hipMemset may return before the fill has landed. A peer writes into
+        # this buffer as soon as it has the IPC handle, and a fill landing after
+        # such a write would erase it.
+        err = hip.hipDeviceSynchronize()
+        cls._hip_check(err, what="hipDeviceSynchronize")
         return int(buf.value)
+
+    @classmethod
+    def alloc_uncached(cls, size: int) -> int:
+        return cls.alloc(size, cls._HIP_DEVICE_MALLOC_UNCACHED)
 
     @classmethod
     def copy_host_to_device(cls, dst_ptr: int, src, nbytes: int) -> None:

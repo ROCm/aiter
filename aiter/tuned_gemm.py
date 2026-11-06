@@ -25,6 +25,7 @@ from torch import Tensor
 
 from aiter import dtypes, gemm_a16w16_asm, hipb_create_extension, hipb_mm, logger
 from aiter.jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG
+from aiter.jit.utils.build_targets import base_gfx_arch
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.gemm_op_common import get_padded_m
@@ -130,6 +131,14 @@ def get_GEMM_A16W16_tuned_config(
     padded_M = M
     config = None
     gfx = get_gfx() if gfx is None else gfx
+    # A0 bring-up: a gfx1250-strict build has no tuned rows of its own; reuse
+    # the gfx1250 family rows for coverage (perf parity is a later follow-up).
+    # An exact strict row still wins when one exists; the guard keeps the scan
+    # off the normal (non-strict) runtime path entirely.
+    if base_gfx_arch(gfx) != gfx and gfx not in {
+        k[0] for k in cfg if isinstance(k, tuple) and k
+    }:
+        gfx = base_gfx_arch(gfx)
     warned_invalid_opus = set()
     for gl in [None, 0, 1]:
         padded_M = M if gl is None else get_padded_m(M, N, K, gl)
@@ -671,13 +680,19 @@ def flydsl_gemm(
     ), "FlyDSL hgemm does not support scaling yet."
     flydsl_gemm_kernels = _get_flydsl_gemm_kernels()
     flydsl_config = _flydsl_hgemm_kernel_params(config["kernelName"])
+    skinny = flydsl_config["policy"] == flydsl_gemm_kernels.SKINNY_POLICY
     fused_bias = None
     if (
-        bias is not None
+        not skinny
+        and bias is not None
         and (otype is None or otype == inp.dtype)
         and bias.dtype == inp.dtype
     ):
         fused_bias = bias
+    if skinny:
+        policy = flydsl_gemm_kernels.SKINNY_POLICY
+    else:
+        policy = "ht" if flydsl_config["use_half_tile_interleaved"] else "ft"
     result = flydsl_gemm_kernels.flydsl_hgemm(
         inp,
         weights,
@@ -692,8 +707,8 @@ def flydsl_gemm(
         k_waves=flydsl_config["k_waves"],
         stages=flydsl_config["stages"],
         group_m=flydsl_config["group_m"],
-        policy=("ht" if flydsl_config["use_half_tile_interleaved"] else "ft"),
-        out_dtype=otype,
+        policy=policy,
+        out_dtype=None if skinny else otype,
     )
 
     if bias is not None and fused_bias is None:

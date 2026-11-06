@@ -36,17 +36,15 @@ def prepare_h16_sign(
     float32 on ``reference.device``; ``reference`` supplies only the device.
     The default size is 16. A reshape or contiguous copy may be returned.
 
-    Value validation is cached on the original tensor's PyTorch version;
+    Successful eager validation is cached on the original tensor's version;
     version-tracked mutations trigger validation on the next Python call.
     Tensors without a version counter (e.g. inference tensors) are checked on
     every call. Outside capture, the value check synchronizes via ``item()``.
 
-    For optional GPU graph capture, validate or warm up the consuming wrapper
-    before capture and keep the signs unchanged. An uncached check during
-    capture uses ``torch._assert_async`` if available, otherwise raises.
-    Graph replay does not rerun Python or the version-cache check; only checks
-    recorded during capture replay, so replay must not be relied on to
-    revalidate changed signs.
+    During optional GPU graph capture, every call records a value check with
+    ``torch._assert_async``, even after cached eager validation. Graph replay
+    runs the recorded GPU check, not the Python version-cache check.
+    Capture requires ``torch._assert_async``; warmup does not replace it.
 
     Example: ``sign = prepare_h16_sign(sign, x)`` before passing ``sign`` to
     ``fused_quant_transpose_hadamard_mxfp4(x, sign)`` (and before capture).
@@ -70,26 +68,62 @@ def prepare_h16_sign(
         version = sign_vector._version
     except (AttributeError, RuntimeError):
         version = None
+    capturing = False
+    if reference.device.type == "cuda":
+        with torch.cuda.device(reference.device):
+            capturing = torch.cuda.is_current_stream_capturing()
     if (
-        version is None
+        capturing
+        or version is None
         or getattr(sign_vector, _SIGN_VALIDATED_VERSION, None) != version
     ):
         valid = torch.all(
             torch.isfinite(sign_vector) & ((sign_vector == 1) | (sign_vector == -1))
         )
         message = "sign_vector entries must be finite and equal to +1 or -1"
-        capturing = False
-        if reference.device.type == "cuda":
-            with torch.cuda.device(reference.device):
-                capturing = torch.cuda.is_current_stream_capturing()
         if capturing:
             assert_async = getattr(torch, "_assert_async", None)
             if assert_async is None:
-                raise RuntimeError("sign_vector must be validated before graph capture")
+                raise RuntimeError("GPU graph capture requires torch._assert_async")
             assert_async(valid, message)
         elif not valid.item():
             raise ValueError(message)
-        if version is not None:
+        if not capturing and version is not None:
             setattr(sign_vector, _SIGN_VALIDATED_VERSION, version)
 
     return sign_vector.reshape(-1).contiguous()
+
+
+def reserve_mxfp4_philox_streams(
+    elements: int,
+    enabled_streams: tuple[bool, ...],
+    philox_seed: int | None,
+    philox_offset: int,
+) -> tuple[int, tuple[int, ...]]:
+    """Validate Philox metadata and reserve adjacent counters for active streams."""
+    if not any(enabled_streams):
+        if philox_seed is not None or philox_offset != 0:
+            raise ValueError(
+                "Philox arguments are only valid when stochastic rounding is enabled"
+            )
+        return 0, (0,) * len(enabled_streams)
+    if philox_seed is None:
+        raise ValueError("philox_seed is required when stochastic rounding is enabled")
+    if type(philox_seed) is not int or type(philox_offset) is not int:
+        raise TypeError("philox_seed and philox_offset must be integers")
+    maximum = (1 << 63) - 1
+    if not 0 <= philox_seed <= maximum:
+        raise ValueError("philox_seed must be in [0, 2**63 - 1]")
+    counters = elements // 8
+    reserved = sum(enabled_streams) * counters
+    if not 0 <= philox_offset <= maximum - reserved + 1:
+        raise ValueError(
+            "philox_offset must be non-negative and leave room for enabled layouts"
+        )
+    offsets = []
+    next_offset = philox_offset
+    for enabled in enabled_streams:
+        offsets.append(next_offset if enabled else 0)
+        if enabled:
+            next_offset += counters
+    return philox_seed, tuple(offsets)
