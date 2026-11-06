@@ -1844,10 +1844,10 @@ def cmdGenFunc_mha_batch_prefill(
     causal = is_causal
     if max_seqlen_q == 1 and alibi_slopes is None and sink_ptr is None:
         causal = False
-        if window_size_left >= max_seqlen_k:
-            window_size_left = -1
-        if window_size_right >= max_seqlen_k:
-            window_size_right = -1
+    if window_size_left >= max_seqlen_k:
+        window_size_left = -1
+    if window_size_right >= max_seqlen_k:
+        window_size_right = -1
     md_name = "mha_batch_prefill"
     filter_fwd = "*"  # get_fwd_blobs()
     if q.dtype == torch.float16:
@@ -1874,7 +1874,13 @@ def cmdGenFunc_mha_batch_prefill(
     else:
         md_name += "_alibi"
         filter_fwd += "_alibi*"
-    if not causal and window_size_left == -1 and window_size_right == -1:
+    has_mask = (
+        causal
+        or window_size_left != -1
+        or window_size_right != -1
+        or sink_ptr is not None
+    )
+    if not has_mask:
         md_name += "_nmask"
         filter_fwd += "_nmask*"
     else:
@@ -1903,11 +1909,7 @@ def cmdGenFunc_mha_batch_prefill(
         # PERTENSOR: per-tensor quantization
         md_name += "_pertensor"
         filter_fwd += "_pertensor*"
-    # Sink only applies when there is a causal/window mask; full attention
-    # (window_size_left==-1 and window_size_right==-1) ignores sink_size.
-    has_effective_sink = (sink_size > 0 or sink_ptr is not None) and (
-        causal or not (window_size_left == -1 and window_size_right == -1)
-    )
+    has_effective_sink = sink_ptr is not None or (sink_size > 0 and has_mask)
     if has_effective_sink:
         md_name += "_sink"
         filter_fwd += "_sink*"
@@ -2823,7 +2825,8 @@ def _flash_attn_backward(
 
     _, seqlen_q, nhead_q, hdim_q = q.shape
     _, seqlen_k, nhead_k, hdim_v = v.shape
-    swa = (window_size_left > 0) or (window_size_right > 0)
+    # a left size of 0 is a window too, it keeps only the diagonal
+    swa = (window_size_left >= 0) or (window_size_right > 0)
 
     # only 1 block when sk <= 256, thus deterministic
     is_950_1block = (
@@ -2840,12 +2843,16 @@ def _flash_attn_backward(
         ret &= bias is None
         ret &= dbias is None
         ret &= dropout_p == 0.0
+        # the v3 kernels take no sink, so d_sink would be left unwritten
+        ret &= sink is None and d_sink is None
         ret &= not deterministic or is_950_1block
         ret &= nhead_q % nhead_k == 0
         ret &= (
-            (hdim_q > 64 and hdim_q <= 128) or (hdim_q == 192 and hdim_v == 128)
+            (hdim_q > 64 and hdim_q <= 128 and hdim_q == hdim_v)
+            or (hdim_q == 192 and hdim_v == 128)
         ) and hdim_q % 8 == 0
-        ret &= not swa
+        # sliding window kernels are hd128 only
+        ret &= not swa or hdim_q <= 128
         return ret
 
     def can_impl_fmha_v3_bwd_gfx1250():
@@ -3739,13 +3746,17 @@ def _flash_attn_varlen_backward(
         # ret &= bias is None
         # ret &= dbias is None
         ret &= dropout_p == 0.0
+        # the v3 kernels take no sink, so d_sink would be left unwritten
+        ret &= sink is None and d_sink is None
         ret &= deterministic == False
         ret &= hdim_q == hdim_v
         ret &= nhead_q % nhead_k == 0
         ret &= (hdim_q > 64 and hdim_q <= 128 and hdim_q % 8 == 0) or hdim_q == 256
-        ret &= not swa
+        # sliding window kernels are hd128 only
+        ret &= not swa or hdim_q <= 128
         if hdim_q == 256:
             ret &= not causal
+            ret &= window_size_left == -1 and window_size_right == -1
             ret &= nhead_q == nhead_k
             ret &= q.dtype == dtypes.bf16
 
