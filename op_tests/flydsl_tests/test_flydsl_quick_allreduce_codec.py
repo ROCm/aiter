@@ -145,18 +145,22 @@ def make_codec_roundtrip_kernel(
                     )
 
         def _row_via_memory(row):
-            words, scale_word, leader = _codec_quant(codec, _load_atom(row), lane, tid)
+            words, scale_word, leader, is_e5 = _codec_quant(
+                codec, _load_atom(row), lane, tid
+            )
             _write_packet(words, scale_word, leader)
             rocdl.s_waitcnt(lgkmcnt=0)
             gpu.barrier()
             words_in, word_in = _codec_load(codec, _get, tid, scale_slot)
-            scale = _scale_from_word(codec, word_in, pair_in_slot)
+            scale = _scale_from_word(codec, word_in, pair_in_slot, is_e5)
             _store_atom(row, _codec_dequant(codec, words_in, scale, tid))
             gpu.barrier()
 
         def _row_in_registers(row):
-            words, scale_word, _leader = _codec_quant(codec, _load_atom(row), lane, tid)
-            scale = _scale_from_word(codec, scale_word, pair_in_slot)
+            words, scale_word, _leader, is_e5 = _codec_quant(
+                codec, _load_atom(row), lane, tid
+            )
+            scale = _scale_from_word(codec, scale_word, pair_in_slot, is_e5)
             _store_atom(row, _codec_dequant(codec, words, scale, tid))
 
         n_block_rows = (num_rows - bid + n_blocks - fx.Int32(1)) // n_blocks
@@ -528,8 +532,7 @@ def test_ring_codec_defaults_widen_from_tp4(world_size, expected):
 def test_mesh_is_int4_at_every_world_size(world_size):
     """The mesh has no separable lap, so the per-N default must not leak into it.
 
-    It also has no INT6 kernel at all, which is why the TP8 reduce-scatter
-    default narrows back to INT4 here rather than raising.
+    Adding an opt-in INT6 mesh must not change production's INT4 default.
     """
     assert _resolve("mesh", world_size) == ("int4", "int4")
 
@@ -568,6 +571,11 @@ def test_one_lap_can_be_pinned_without_disturbing_the_other():
     assert _resolve("ring", 8, ag="int4") == ("int6", "int4")
 
 
+def test_mesh_int6_is_opt_in():
+    assert _resolve("mesh", 8, rs="int6") == ("int6", "int6")
+    assert _resolve("mesh", 8, ag="int6") == ("int6", "int6")
+
+
 def test_explicit_codec_the_schedule_cannot_build_raises():
     """Naming a codec the schedule has no kernel for is a programming error.
 
@@ -576,4 +584,4 @@ def test_explicit_codec_the_schedule_cannot_build_raises():
     a caller never believes it pinned a wire format it did not get.
     """
     with pytest.raises(ValueError, match="rs_codec"):
-        _resolve("mesh", 8, rs="int6")
+        _resolve("mesh", 8, rs="int8")
