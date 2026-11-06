@@ -64,7 +64,7 @@ def _cp(cp_round_robin):
     )
 
 
-def _fold(arch, d, n, msq=1, cp_round_robin=False):
+def _fold(arch, d, n, msq=1, page_size=1, cp_round_robin=False):
     t = torch.float8_e4m3fn if d == "fp8" else torch.bfloat16
     s = get_mla_decode_shape_support(
         n,
@@ -74,6 +74,7 @@ def _fold(arch, d, n, msq=1, cp_round_robin=False):
         arch=arch,
         enable_experimental=False,
         flydsl_ps1=False,
+        page_size=page_size,
         **_cp(cp_round_robin),
     )
     return s.fold_factor if s.planner_accepts else None
@@ -88,9 +89,44 @@ def test_planner_verdict():
     assert cprr == [1, 1, 1, 6]
     assert _fold("gfx950", "fp8", 24) is None
     assert [_fold("gfx950", "bf16", n) for n in (40, 48, 144)] == [1, 1, 1]
-    assert _fold("gfx942", "fp8", 64) == 1 and _fold("gfx942", "fp8", 64, 2) == 4
+    # gfx942 native qh64 fp8 (PR #3188) is only valid at page_size=64; page_size=1
+    # folds to the qh16 kernel (otherwise the native kernel OOB-faults).
+    assert _fold("gfx942", "fp8", 64, page_size=64) == 1
+    assert _fold("gfx942", "fp8", 64, page_size=1) == 4
+    assert _fold("gfx942", "fp8", 64, 2) == 4
     assert _fold("gfx942", "bf16", 128) == 8
     assert _fold("gfx1250", "fp8", 64) == 4
+
+
+@pytest.mark.parametrize("batch_size,qlen", [(1, 1), (64, 1), (64, 2)])
+@pytest.mark.parametrize("is_sparse", [True, False])
+def test_qh64_metadata_capacity(monkeypatch, batch_size, qlen, is_sparse):
+    # Sizing has no page_size argument: cover the PS1 four-way head fold even
+    # when callers also use these buffers for the native PS64 path.
+    monkeypatch.setattr(attention, "get_gfx", lambda: "gfx942")
+    monkeypatch.setattr(attention, "_mla_resolve_arch", lambda arch: "gfx942")
+    monkeypatch.setattr(attention, "get_mla_decode_fwd_max_splits", lambda *args: 304)
+    monkeypatch.delenv("AITER_ENABLE_EXPERIMENTAL", raising=False)
+    monkeypatch.delenv("AITER_MLA_DECODE_PS1_FLYDSL", raising=False)
+    attention._mla_metadata_info_v1_cached.cache_clear()
+    try:
+        info = aiter.get_mla_metadata_info_v1(
+            batch_size, qlen, 64, dtypes.fp8, dtypes.fp8, is_sparse=is_sparse
+        )
+        # Sparse treats each query as a separate tile. Dense Q1/Q2 packs each
+        # 16-head group into one 128-element query/head tile.
+        tiles = batch_size * (qlen if is_sparse else 1) * 4
+        assert info[3][0] >= tiles + 1  # reduce_indptr
+        assert info[4][0][0] >= tiles  # reduce_final_map
+        assert info[2][0][0] >= tiles + 304 - 1  # work_info_set
+        split_tiles = min(tiles + 304 - 1, 2 * (304 - 1))
+        assert info[5][0] >= split_tiles  # reduce_partial_map
+        if not is_sparse and qlen == 1:
+            # The shared folded plan already bounds dense split storage; do not
+            # multiply that global split budget by the legacy four head tiles.
+            assert info[5][0] == split_tiles
+    finally:
+        attention._mla_metadata_info_v1_cached.cache_clear()
 
 
 def _asm_status(arch, heads, qlen, lse):
