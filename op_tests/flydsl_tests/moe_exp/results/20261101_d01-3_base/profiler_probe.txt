@@ -1,0 +1,8 @@
+# 2026-11-01 21:24:11 UTC, boot 2026-11-01 08:28:39 UTC, MEC CP_MEC1 2430 (d798bf71)
+# gpu-lock python -I op_tests/flydsl_tests/moe_exp/profiler_probe.py
+trial 0: 0 device events (expect 256)
+trial 1: 0 device events (expect 256)
+trial 2: 0 device events (expect 256)
+# Same boot, 21:22 UTC: ~/gfx1250/.venv/bin/rocprofv3 --kernel-trace on 128 torch copies of 128 MiB
+# recorded all 129 kernels (128 x __amd_rocclr_copyBuffer, median 23.90 us), so only the torch
+# profiler (Kineto/roctracer) path loses kernel records.
