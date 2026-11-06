@@ -506,6 +506,113 @@ def test_fused_gdn_decode_correctness_flat_layout(
     )
 
 
+def _split_k_partials(projected_ba, num_ksplit):
+    """fp32 partials whose sum is exactly the bf16 projection."""
+    torch.manual_seed(1)
+    rest = torch.randn(
+        (num_ksplit - 1, *projected_ba.shape), device=projected_ba.device
+    )
+    return torch.cat([rest, (projected_ba.float() - rest.sum(0))[None]])
+
+
+@pytest.mark.parametrize("batch", [1, 4, 64])
+@pytest.mark.parametrize("num_k_heads,ratio", [(16, 3), (4, 2)])
+@pytest.mark.parametrize("state_dtype", _STATE_DTYPES)
+@pytest.mark.parametrize("num_ksplit", [2, 8, 20])
+@pytest.mark.parametrize("qkvz_layout", ["interleaved", "flat"])
+def test_fused_gdn_decode_ba_partials(
+    batch, num_k_heads, ratio, state_dtype, num_ksplit, qkvz_layout
+):
+    """Split-K partials of ``projected_ba`` ([KS, T, 2*VH] fp32) give the result of
+    the bf16 projection they sum to."""
+    fused_gdn_decode_qkvz = _import_op()
+    _requires_gfx950()
+
+    inp = make_inputs(
+        batch, num_k_heads=num_k_heads, ratio=ratio, state_dtype=state_dtype
+    )
+    ref_inp = {
+        k: (v.clone() if isinstance(v, torch.Tensor) else v) for k, v in inp.items()
+    }
+    ref_norm, _, _ = ref_gdn_decode(**ref_inp, quant_dtype=None)
+    if qkvz_layout == "flat":
+        inp = to_flat_layout(inp)
+    out, _, _ = fused_gdn_decode_qkvz(
+        inp["projected_qkvz"],
+        _split_k_partials(inp["projected_ba"], num_ksplit),
+        inp["conv_state"],
+        inp["ssm_state"],
+        inp["ssm_state_indices"],
+        inp["conv_weight"],
+        inp["conv_bias"],
+        inp["A_log"],
+        inp["dt_bias"],
+        inp["norm_weight"],
+        scale=inp["scale"],
+        norm_eps=inp["norm_eps"],
+        quant_dtype=None,
+        qkvz_layout=qkvz_layout,
+    )
+    torch.testing.assert_close(out.float(), ref_norm.float(), atol=ATOL, rtol=ATOL)
+    torch.testing.assert_close(
+        inp["ssm_state"], ref_inp["ssm_state"], atol=ATOL, rtol=ATOL
+    )
+
+
+@pytest.mark.parametrize("batch", [2, 64])
+@pytest.mark.parametrize(
+    "num_k_heads,ratio,qkvz_layout", [(16, 3, "flat"), (4, 2, "interleaved")]
+)
+@pytest.mark.parametrize("state_dtype", _STATE_DTYPES)
+def test_fused_gdn_decode_row_strided_projections(
+    batch, num_k_heads, ratio, qkvz_layout, state_dtype
+):
+    """qkvz and ba as column views of one [T, qkvz + ba] buffer (one GEMM that
+    produces both) must match the reference; ratio 2 interleaved takes the
+    ratio-generic kernel here instead of the generated pair kernels."""
+    fused_gdn_decode_qkvz = _import_op()
+    _requires_gfx950()
+
+    inp = make_inputs(
+        batch, num_k_heads=num_k_heads, ratio=ratio, state_dtype=state_dtype
+    )
+    ref_inp = {
+        k: (v.clone() if isinstance(v, torch.Tensor) else v) for k, v in inp.items()
+    }
+    ref_norm, _, _ = ref_gdn_decode(**ref_inp, quant_dtype=None)
+    run = to_flat_layout(inp) if qkvz_layout == "flat" else inp
+    qkvz_dim = run["projected_qkvz"].shape[1]
+    fused = torch.cat([run["projected_qkvz"], run["projected_ba"]], dim=1)
+    qkvz, ba = fused.split([qkvz_dim, fused.shape[1] - qkvz_dim], dim=1)
+    assert not qkvz.is_contiguous() and not ba.is_contiguous()
+    out, _, _ = fused_gdn_decode_qkvz(
+        qkvz,
+        ba,
+        run["conv_state"],
+        run["ssm_state"],
+        run["ssm_state_indices"],
+        run["conv_weight"],
+        run["conv_bias"],
+        run["A_log"],
+        run["dt_bias"],
+        run["norm_weight"],
+        scale=run["scale"],
+        norm_eps=run["norm_eps"],
+        quant_dtype=None,
+        qkvz_layout=qkvz_layout,
+    )
+    torch.testing.assert_close(out.float(), ref_norm.float(), atol=ATOL, rtol=ATOL)
+    torch.testing.assert_close(
+        run["ssm_state"].float(), ref_inp["ssm_state"].float(), atol=ATOL, rtol=ATOL
+    )
+    torch.testing.assert_close(
+        run["conv_state"].float(),
+        ref_inp["conv_state"].float(),
+        atol=ATOL,
+        rtol=ATOL,
+    )
+
+
 @pytest.mark.parametrize("batch", [1, 64])
 @pytest.mark.parametrize("conv_layout", ["channel_major", "width_major"])
 @pytest.mark.parametrize(
@@ -687,6 +794,37 @@ def test_fused_gdn_decode_supported_rejects_cpu_optional_operands():
             *args, qkvz_layout="flat", **kwargs
         )
         assert not ok and "device" in reason, kwargs.keys()
+
+
+@pytest.mark.parametrize("num_ksplit", [0, 1])
+def test_fused_gdn_decode_supported_rejects_fewer_than_two_ba_partials(num_ksplit):
+    """A split-K GEMM with one split returns the reduced bf16 output, so fp32
+    partials with fewer than 2 splits are not valid input."""
+    _import_op()
+    _requires_gfx950()
+    from aiter.ops.triton.gated_delta_net.fused_gdn_decode_qkvz import (
+        fused_gdn_decode_qkvz_supported,
+    )
+
+    ops = to_flat_layout(make_inputs(4, num_k_heads=16, ratio=3))
+    ops["projected_ba"] = _split_k_partials(ops["projected_ba"], 2)[:num_ksplit]
+    args = [
+        ops[k]
+        for k in (
+            "projected_qkvz",
+            "projected_ba",
+            "conv_state",
+            "ssm_state",
+            "ssm_state_indices",
+            "conv_weight",
+            "conv_bias",
+            "A_log",
+            "dt_bias",
+            "norm_weight",
+        )
+    ]
+    ok, reason = fused_gdn_decode_qkvz_supported(*args, qkvz_layout="flat")
+    assert not ok and "at least 2 splits" in reason
 
 
 def test_fused_gdn_decode_preallocated_out():
