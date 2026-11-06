@@ -2514,6 +2514,21 @@ def test_output_buffer_contract():
         fm._USE_FLYDSL_MOE_SORTING = real_use_flydsl
         fm._flydsl_moe_sorting = real_flydsl_sort
 
+    # Called directly, moe_sorting has no copy-back, so it rejects an output its
+    # 16-byte stores cannot write instead of faulting in the kernel.
+    for offset in (1, 2, 8):
+        offset_pool = torch.zeros((token * model_dim + offset,), dtype=dtype)
+        sort_out = offset_pool[offset:].view(token, model_dim)
+        try:
+            moe_buf = fm.moe_sorting(
+                topk_ids, topk_weights, E, model_dim, dtype, output=sort_out
+            )[4]
+        except ValueError:
+            assert offset % 8, f"{offset=}: a 16-byte-aligned output was rejected"
+        else:
+            assert not offset % 8, f"{offset=}: an underaligned output was accepted"
+            assert moe_buf is sort_out, f"{offset=}: moe_buf is not the output"
+
     check_overlap = aiter.fused_moe._validate_output_buffer_no_overlap
     # A strided scale view reaches past its logical nbytes: scale_pool[::2] holds
     # 8 rows (16 KiB) yet its expert 7 row starts at byte 28672, and the kernels

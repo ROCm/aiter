@@ -904,6 +904,12 @@ def moe_sorting(
     # vectors, so it must be 16-byte aligned; fused_moe passes _kernel_output's.
     output=None,
 ):
+    if output is not None and output.data_ptr() % 16:
+        # Fail here rather than fault or corrupt memory in the kernel's store.
+        raise ValueError(
+            "moe_sorting(output=) must be 16-byte aligned, got data_ptr "
+            f"{output.data_ptr():#x}; pass _kernel_output(output) and copy back"
+        )
     asm_mode = AsmMoeMode(flat)
     if (
         not _USE_CK_MOE_SORTING
