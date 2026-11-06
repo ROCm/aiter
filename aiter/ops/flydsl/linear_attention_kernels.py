@@ -1945,7 +1945,9 @@ def flydsl_kda_verify_with_f_b(
     batch = cache_indices.shape[0]
     tokens = batch * num_tokens
     if not is_flydsl_kda_decode_supported(device):
-        raise RuntimeError("`flydsl_kda_verify_with_f_b` requires a gfx950 GPU.")
+        raise RuntimeError(
+            "`flydsl_kda_verify_with_f_b` requires a gfx942 or gfx950 GPU."
+        )
     if batch <= 0:
         raise ValueError("`cache_indices` must have a non-empty batch dimension.")
     if batch * _KDA_HEADS > _INT32_MAX:

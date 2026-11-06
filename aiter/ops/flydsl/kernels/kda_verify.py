@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Kimi-K3 KDA target verify (speculative MTP) for gfx950.
+"""Kimi-K3 KDA target verify (speculative MTP) for gfx942 and gfx950.
 
 One workgroup owns one (sequence, head) pair and walks the sequence's
 ``num_tokens`` draft tokens. Per token it runs the same chain as the fused KDA
@@ -80,7 +80,7 @@ def create_kda_verify_kernel(
     cache_ring: bool,
     num_warps: int = 4,
 ):
-    """Build the gfx950 Kimi-K3 KDA verify specialization.
+    """Build the Kimi-K3 KDA verify specialization (gfx942/gfx950).
 
     ``num_tokens`` is the fixed draft-token count per sequence (1 to
     :data:`KDA_VERIFY_MAX_TOKENS`). ``state_dtype`` is the recurrent-state
@@ -140,7 +140,7 @@ def create_kda_verify_kernel(
         ]
 
     @flyc.kernel(
-        name=f"kda_verify_fused_projection_bf16_gfx950{name_suffix}",
+        name=f"kda_verify_fused_projection_bf16{name_suffix}",
         known_block_size=[block_threads, 1, 1],
     )
     def kernel(

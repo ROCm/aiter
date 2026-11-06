@@ -26,10 +26,10 @@ from aiter.ops.flydsl.linear_attention_kernels import (
 )
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
-SUPPORTED_GFX = ["gfx950"]
+SUPPORTED_GFX = ["gfx942", "gfx950"]
 
 pytestmark = pytest.mark.skipif(
-    not is_flydsl_kda_decode_supported(), reason="requires a gfx950 GPU"
+    not is_flydsl_kda_decode_supported(), reason="requires a gfx942 or gfx950 GPU"
 )
 
 _H = 12
