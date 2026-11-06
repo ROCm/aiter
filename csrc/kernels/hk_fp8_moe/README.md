@@ -52,9 +52,12 @@ AITER JIT-builds `module_hk_fp8_moe` on first use. HipKittens headers come from 
 when set; otherwise AITER fetches the pinned revision and updates an older clean managed checkout.
 A modified managed checkout fails with an actionable error; an explicit `HIP_KITTENS_DIR` is never
 rewritten. Bundled headers without Git metadata are preserved; AITER fetches a verifiable checkout
-in the JIT cache instead. The module is experimental and excluded from aggregate prebuilds unless
+in the JIT cache instead. Managed Git commands trust only the exact checkout path for that command,
+and reject tracked or untracked changes even at the expected pin. A checkout-specific lock is shared
+across JIT directories and symlink aliases; waiting builders revalidate the checkout after acquiring it.
+The module is experimental and excluded from aggregate prebuilds unless
 `AITER_ENABLE_EXPERIMENTAL=1`. Device implementations are guarded for gfx950; the host entrypoint
-rejects unsupported devices before launching kernels.
+rejects unsupported devices before launching kernels, caching architecture properties per device.
 
 Run from the repository root on gfx950:
 
@@ -64,9 +67,12 @@ python3 op_tests/test_hk_fp8_moe.py --routing-only
 python3 op_tests/test_hk_fp8_moe_codegen.py
 ```
 
-The default suite checks an FP32 reference and reports timings for 1 to 16384 tokens, top-k 8 and 9,
-and SwiGLU limits 0, 1, and 10. The limit-1 cases assert that clamping changes the FP32 reference
-by more than twice the error tolerance, so bypassing the clamp cannot pass. Top-k 9 includes a
+The default suite reports timings and compares against a quantization-aware FP32 reference for
+1 to 16384 tokens, top-k 8 and 9, and SwiGLU limits 0, 1, and 10. The reference independently models
+both power-of-two 1x128 E4M3 activation rounds and BF16 stores. The arithmetic residual must stay
+below 0.01 relative L2; quantization displacement and total error against the original ideal FP32
+reference are reported separately. The limit-1 cases require a clamp effect above 0.12 relative L2,
+so bypassing the clamp cannot pass. Top-k 9 includes a
 shared expert selected by every token. Graph replay uses an active limit of 1 and checks changed
 inputs with random, concentrated, bank-aliasing, partially invalid,
 and all-invalid routing around block boundaries. Both top-k values also cover 1, 304, 305, and 1024
@@ -103,13 +109,22 @@ avoid instructions that touch pinned registers except for the four explicit HipK
 LDS operand reads, scaled FP8 MFMA, accumulator reads, and accumulator writes. Their
 compiler-selected address, scale, and copy operands must still be below v128. Other inline assembly
 is checked too, including BF16 conversion. Decimal and hexadecimal register notation are recognized.
-Every GEMM must have zero VGPR spills, zero private-segment bytes, no dynamic stack, and no scratch
+Every GEMM must report `.agpr_count: 256` and `.vgpr_count: 512` in its kernel descriptor;
+missing or reduced allocations fail the build. It must also have zero VGPR spills,
+zero private-segment bytes, no dynamic stack, and no scratch
 instructions. SGPR-to-VGPR lane spills are allowed only within the checked temporary registers.
 
 CPU regression coverage for the audit and dependency upgrades runs with:
 
 ```bash
 python3 -S op_tests/test_hk_fp8_moe_build.py
+python3 -S op_tests/test_hk_fp8_moe_checkout.py
+```
+
+The independent reference also has CPU-only regressions requiring PyTorch:
+
+```bash
+python3 -m unittest op_tests.test_hk_fp8_moe_reference
 ```
 
 To check saved assembly without PyTorch, a GPU, or the HIP compiler:
@@ -125,7 +140,8 @@ python op_tests/op_benchmarks/bench_hk_fp8_moe.py --output /tmp/hk-moe-benchmark
 ```
 
 The benchmark compares complete MoE calls with AITER's checked-in GLM-5.3-Flash tuning and its
-default heuristic. It uses identical inputs and weights, checks an FP32 reference, and records dispatch
+default heuristic. It retains the original common ideal FP32 reference across differing quantization
+schemes. It uses identical inputs and weights and records dispatch
 metadata and 21 alternating timing samples for each implementation. Timings use warm HIP graphs
 with ten calls per replay; routing, quantization, both GEMMs and weighted combination are included.
 Weight preparation, router top-k and compilation are excluded.

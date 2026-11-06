@@ -1299,6 +1299,19 @@ __global__ void build_gather_tables(const int* __restrict__ tok,
 // Host launch and workspace.
 
 namespace {
+bool is_gfx950_device()
+{
+    static SynchronizedCache<int, bool> cache;
+    int device = -1;
+    HIP_CALL(hipGetDevice(&device));
+    return cache.get_or_create(device, [device]() {
+        hipDeviceProp_t properties{};
+        HIP_CALL(hipGetDeviceProperties(&properties, device));
+        const std::string arch = properties.gcnArchName;
+        return arch.substr(0, arch.find(':')) == "gfx950";
+    });
+}
+
 constexpr int D = 4096, I = 1024, KB1 = D / 128, KB2 = I / 128, TM = 256;
 inline size_t align256(size_t x) { return (x + 255) & ~size_t(255); }
 // Only nonempty experts need padding; at most min(E, T*S) can receive a selection.
@@ -1475,7 +1488,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(aiter_hk_fp8_moe_fwd,
                 "hk_fp8_moe: expert count must be in [1, 1024]");
     if(num_tokens == 0)
         return;
-    AITER_CHECK(get_gpu_arch() == "gfx950", "hk_fp8_moe: requires gfx950");
+    AITER_CHECK(is_gfx950_device(), "hk_fp8_moe: requires gfx950");
     const int T = num_tokens, S = topk, E = num_experts;
     Workspace ws;
     AITER_CHECK(workspace_bytes >= 0 && carve(reinterpret_cast<char*>(workspace), T, S, E, &ws) <=

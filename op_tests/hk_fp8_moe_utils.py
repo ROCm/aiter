@@ -1,12 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Inputs and FP32 reference shared by HK MoE tests and benchmarks."""
+"""Inputs and FP32 references shared by HK MoE tests and benchmarks."""
 
 import torch
-
-from aiter.benchmark_data_init import make_generator
-from aiter.ops.hk_fp8_moe import HIDDEN, INTER
 
 FP8 = torch.float8_e4m3fn
 
@@ -29,21 +26,56 @@ def dequant(q, s):
     return (b * s.view(E, n // 128, 1, k // 128, 1)).view(E, n, k)
 
 
-def reference(x, W13, W2, tw, ids, limit):
-    out = torch.zeros(x.shape[0], HIDDEN, device=x.device)
+def activation_roundtrip(x):
+    """FP32 values after the kernel's power-of-two 1x128 E4M3 quantization.
+
+    Both ``quant_tok16_block`` and ``epilogue_silu_quant`` choose
+    ``2**ceil(log2(max(amax, 1e-10) / 448))`` independently for each row/block.
+    PyTorch's E4M3 cast provides round-to-nearest-even, including subnormals.
+    This oracle uses no HK kernel, packed scale format, or shuffled weights.
+    """
+    blocks = x.float().reshape(*x.shape[:-1], x.shape[-1] // 128, 128)
+    scale = torch.exp2(
+        torch.ceil(
+            torch.log2(blocks.abs().amax(-1, keepdim=True).clamp_min(1e-10) / 448.0)
+        )
+    )
+    return ((blocks / scale).to(FP8).float() * scale).reshape(x.shape)
+
+
+def reference(x, W13, W2, tw, ids, limit, *, quantized=False):
+    """FP32 MoE oracle with optional HK activation quantization/storage rounds.
+
+    The default is the original ideal-activation FP32 reference. Benchmarks
+    retain that common reference when comparing different quantization schemes.
+    ``quantized=True`` independently models the HK kernel's two FP8 activation
+    rounds, BF16 expert outputs, and BF16 final output. GEMMs, SwiGLU, and routed
+    accumulation still use PyTorch FP32 arithmetic, exposing kernel arithmetic,
+    routing, and clamp defects separately from expected quantization error.
+    """
+    out = torch.zeros(x.shape[0], W2.shape[1], device=x.device)
+    inputs = activation_roundtrip(x) if quantized else x.float()
     for e in torch.unique(ids).tolist():
         if e < 0 or e >= W13.shape[0]:
             continue
         tok, slot = (ids == e).nonzero(as_tuple=True)
-        g, u = (x[tok].float() @ W13[e].t()).chunk(2, dim=-1)
+        g, u = (inputs[tok] @ W13[e].t()).chunk(2, dim=-1)
         if limit > 0:
             g, u = g.clamp(max=limit), u.clamp(-limit, limit)
         act = torch.nn.functional.silu(g) * u
-        out.index_add_(0, tok, act @ W2[e].t() * tw[tok, slot, None])
-    return out
+        if quantized:
+            act = activation_roundtrip(act)
+        expert_out = act @ W2[e].t()
+        if quantized:
+            expert_out = expert_out.to(torch.bfloat16).float()
+        out.index_add_(0, tok, expert_out * tw[tok, slot, None])
+    return out.to(torch.bfloat16).float() if quantized else out
 
 
 def make_weights(E):
+    from aiter.benchmark_data_init import make_generator
+    from aiter.ops.hk_fp8_moe import HIDDEN, INTER
+
     gen = make_generator(0)
     w13, s13 = requant_pow2(
         torch.randn(E, 2 * INTER, HIDDEN, device="cuda", generator=gen) * 0.02
@@ -55,6 +87,9 @@ def make_weights(E):
 
 
 def make_routing(T, E, topk=None):
+    from aiter.benchmark_data_init import make_generator
+    from aiter.ops.hk_fp8_moe import HIDDEN
+
     gen = make_generator(T)
     x = torch.randn(T, HIDDEN, dtype=torch.bfloat16, device="cuda", generator=gen)
     shared = topk is None and E == 289

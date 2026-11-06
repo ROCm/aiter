@@ -24,8 +24,10 @@ audit = load("hk_fp8_moe_codegen")
 third_party = load("third_party")
 
 
-def assembly(instructions, **metadata):
+def assembly(instructions, *, metadata_by_variant=None, **metadata):
     fields = {
+        "agpr_count": "256",
+        "vgpr_count": "512",
         "vgpr_spill_count": "0",
         "private_segment_fixed_size": "0",
         "uses_dynamic_stack": "false",
@@ -34,13 +36,14 @@ def assembly(instructions, **metadata):
     for variant in range(4):
         name = f"_Z15moe_gemm_kernel_variant{variant}"
         kernels.append(f"{name}:\n{instructions}\n.Lfunc_end{variant}:\n")
-        record = f"  - .agpr_count: 256\n    .name: {name}\n"
-        record += "".join(
+        values = fields | (metadata_by_variant or {}).get(variant, {})
+        record = "".join(
             f"    .{key}: {value}\n"
-            for key, value in fields.items()
+            for key, value in values.items()
             if value is not None
         )
-        records.append(record)
+        record += f"    .name: {name}\n"
+        records.append("  - " + record[4:])
     return "".join(kernels) + "amdhsa.kernels:\n" + "".join(records)
 
 
@@ -109,6 +112,59 @@ v_writelane_b32 v127, s0, 0"""))
                     ValueError, key
                 ):
                     self.check(assembly("v_mov_b32 v0, 0", **{key: actual}))
+
+    def test_missing_or_unsafe_register_allocation(self):
+        for key, expected, smaller in (
+            ("agpr_count", "256", "128"),
+            ("vgpr_count", "512", "256"),
+        ):
+            for actual in (None, smaller, "invalid", expected + " trailing"):
+                for variant in range(4):
+                    with (
+                        self.subTest(key=key, value=actual, variant=variant),
+                        self.assertRaisesRegex(ValueError, key),
+                    ):
+                        self.check(
+                            assembly(
+                                "v_mov_b32 v0, 0",
+                                metadata_by_variant={variant: {key: actual}},
+                            )
+                        )
+
+    def test_allocation_fields_must_be_unique_and_kernel_level(self):
+        for key, expected in (("agpr_count", "256"), ("vgpr_count", "512")):
+            text = assembly("v_mov_b32 v0, 0")
+            text = text.replace(
+                f".{key}: {expected}\n",
+                f".{key}: {expected}\n    .{key}: {expected}\n",
+                1,
+            )
+            with (
+                self.subTest(key=key, kind="duplicate"),
+                self.assertRaisesRegex(ValueError, key),
+            ):
+                self.check(text)
+            text = assembly("v_mov_b32 v0, 0", **{key: None})
+            text = text.replace(
+                "    .name:",
+                f"    .args:\n      - .{key}: {expected}\n    .name:",
+            )
+            with (
+                self.subTest(key=key, kind="nested"),
+                self.assertRaisesRegex(ValueError, key),
+            ):
+                self.check(text)
+
+    def test_kernel_metadata_name_must_be_unique(self):
+        text = assembly("v_mov_b32 v0, 0")
+        with self.assertRaisesRegex(ValueError, "duplicate kernel metadata"):
+            self.check(text + "  - " + text.split("  - ", 1)[1].split("  - ")[0])
+
+    def test_nested_argument_name_is_ignored(self):
+        text = assembly("v_mov_b32 v0, 0")
+        self.check(
+            text.replace("    .name:", "    .args:\n      - .name: input\n    .name:")
+        )
 
     def test_wrong_kernel_count_and_malformed_markers(self):
         for text in (
@@ -196,7 +252,7 @@ class TestDependencyCheckout(unittest.TestCase):
             self.ensure(self.new, user_override=True)
 
     def test_failed_fetch_does_not_publish_cache(self):
-        with self.assertRaises(subprocess.CalledProcessError):
+        with self.assertRaisesRegex(RuntimeError, "HIP_KITTENS_DIR"):
             self.ensure("0" * 40)
         self.assertFalse(self.cache.exists())
 

@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Correctness + perf for the HipKittens block-FP8 grouped MoE against an fp32 torch reference.
+"""Correctness + perf for the HipKittens block-FP8 grouped MoE against FP32 torch references.
 
 Random experts with power-of-two 128x128 block scales (the kernel's contract), top-8 routed or top-9 with the shared
 expert fused as expert 288, with and without the SwiGLU clamp. Token counts cover the small-batch variant that skips
 all-padding tile halves (< ~5k tokens) and the large-batch one.
+The correctness oracle includes the specified FP8/BF16 rounds; displacement from the ideal FP32
+reference is reported separately so expected activation quantization cannot consume the kernel error budget.
 """
 
 import argparse
@@ -19,13 +21,27 @@ from aiter.ops.shuffle import shuffle_weight
 from aiter.test_common import perftest
 from op_tests.hk_fp8_moe_utils import dequant, make_routing, make_weights, reference
 
-# power-of-two activation scales on top of the shared fp8 weights
-TOL = 0.06
+# Residual against independently quantized FP32 arithmetic, not total FP8 error.
+# Allows MFMA accumulation / fast SiLU differences and nearby FP8/BF16 rounding
+# boundaries, with six times less slack than the former ideal-reference check.
+TOL = 0.01
+# Keep a strong clamp signal independently of the tighter arithmetic tolerance.
+MIN_CLAMP_EFFECT = 0.12
 
 
 @perftest()
 def run(x, ids, tw, w13, s13, w2, s2, limit):
     return hk_fp8_moe(x, ids, tw, w13, s13, w2, s2, swiglu_limit=limit)
+
+
+def reference_errors(out, x, W13, W2, tw, ids, limit):
+    ref = reference(x, W13, W2, tw, ids, limit, quantized=True)
+    ideal = reference(x, W13, W2, tw, ids, limit)
+    residual = ((out.float() - ref).norm() / ref.norm().clamp_min(1e-12)).item()
+    ideal_norm = ideal.norm().clamp_min(1e-12)
+    quantization = ((ref - ideal).norm() / ideal_norm).item()
+    total = ((out.float() - ideal).norm() / ideal_norm).item()
+    return ref, residual, quantization, total
 
 
 def test_case(T, E, limit, weights):
@@ -42,23 +58,24 @@ def test_case(T, E, limit, weights):
         limit,
     )
     rows = torch.arange(0, T, max(1, T // 256), device="cuda")
-    ref = reference(
-        x[rows], dequant(w13, s13), dequant(w2, s2), tw[rows], ids[rows], limit
+    W13, W2 = dequant(w13, s13), dequant(w2, s2)
+    ref, err, quantization, total = reference_errors(
+        out[rows], x[rows], W13, W2, tw[rows], ids[rows], limit
     )
-    err = ((out[rows].float() - ref).norm() / ref.norm()).item()
     ok = err < TOL and torch.isfinite(out).all().item()
     if limit == 1.0:
         unclamped = reference(
-            x[rows], dequant(w13, s13), dequant(w2, s2), tw[rows], ids[rows], 0.0
+            x[rows], W13, W2, tw[rows], ids[rows], 0.0, quantized=True
         )
-        # A disabled clamp must fail this case even within the FP8 error tolerance.
+        # A disabled clamp must remain far outside the arithmetic error budget.
         clamp_effect = ((unclamped - ref).norm() / ref.norm()).item()
-        ok = ok and clamp_effect > 2 * TOL
+        ok = ok and clamp_effect > MIN_CLAMP_EFFECT
         aiter.logger.info(
             f"hk_fp8_moe active clamp relative effect: {clamp_effect:.4f}"
         )
     aiter.logger.info(
-        f"hk_fp8_moe T={T:6d} experts={E} topk={ids.shape[1]} limit={limit:4.1f}: rel err {err:.4f} "
+        f"hk_fp8_moe T={T:6d} experts={E} topk={ids.shape[1]} limit={limit:4.1f}: "
+        f"residual {err:.4f} quantization {quantization:.4f} total {total:.4f} "
         f"{us:8.1f} us  {'ok' if ok else 'FAIL'}"
     )
     return ok
@@ -113,10 +130,9 @@ def test_routing_replay(weights, topk=None):
             graph.replay()
             first = out.clone()
             graph.replay()
-            ref = reference(x[rows], W13, W2, tw[rows], ids[rows], 1.0)
-            err = (
-                (out[rows].float() - ref).norm() / ref.norm().clamp_min(1e-12)
-            ).item()
+            _, err, quantization, total = reference_errors(
+                out[rows], x[rows], W13, W2, tw[rows], ids[rows], 1.0
+            )
             passed = (
                 err < TOL
                 and torch.isfinite(out).all().item()
@@ -125,7 +141,8 @@ def test_routing_replay(weights, topk=None):
             ok = ok and passed
             aiter.logger.info(
                 f"hk_fp8_moe routing replay T={T} E={E} topk={selections} {routing}: "
-                f"rel err {err:.4f} {'ok' if passed else 'FAIL'}"
+                f"residual {err:.4f} quantization {quantization:.4f} total {total:.4f} "
+                f"{'ok' if passed else 'FAIL'}"
             )
     return ok
 

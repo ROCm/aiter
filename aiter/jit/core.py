@@ -1252,9 +1252,9 @@ rebuilded_list = []
 
 
 def clone_3rdparty(third_party: str) -> None:
-    def MainFunc():
-        from third_party import ensure_pinned_checkout
+    from third_party import checkout_lock_path, ensure_pinned_checkout
 
+    def MainFunc():
         ensure_pinned_checkout(
             dir_path,
             third_party_info["url"],
@@ -1273,8 +1273,13 @@ def clone_3rdparty(third_party: str) -> None:
         pass
 
     if "third_party_info" in locals():
-        lock_path = f"{bd_dir}/lock_3rdparty_clone_{third_party}"
-        mp_lock(lockPath=lock_path, MainFunc=MainFunc)
+        if "HIP_KITTENS_DIR" in os.environ:
+            # Overrides are read-only inputs and need no checkout mutation lock.
+            MainFunc()
+            return
+        lock_path = checkout_lock_path(dir_path)
+        os.makedirs(os.path.dirname(lock_path), mode=0o700, exist_ok=True)
+        mp_lock(lockPath=lock_path, MainFunc=MainFunc, build_after_wait=True)
 
 
 def rm_module(md_name):

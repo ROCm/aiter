@@ -7,7 +7,8 @@ Compiler instructions must avoid v128-v255 and all AGPRs: these registers hold
 HipKittens ART tiles. Only explicit tile instruction forms are exempt; their
 compiler-selected operands must still avoid pinned registers. Scratch is forbidden. This
 check supplements runtime correctness tests; zero spills alone do not prove that
-the compiler avoids pinned registers. With no arguments, build and audit on
+the compiler avoids pinned registers. Every GEMM descriptor must retain 256 AGPRs
+and the full 512-register vector allocation. With no arguments, build and audit on
 gfx950; --build-dir and --assembly need neither a PyTorch import nor a GPU.
 """
 

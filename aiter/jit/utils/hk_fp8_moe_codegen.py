@@ -119,9 +119,16 @@ def check_assembly(path: Path) -> None:
         raise ValueError(f"expected four GEMM variants, found {len(kernels)}")
     metadata = {}
     for block in re.split(r"^  - ", source, flags=re.MULTILINE)[1:]:
-        name = re.search(r"^\s+\.name:\s*(\S+)", block, re.MULTILINE)
-        if name:
-            metadata[name.group(1)] = block
+        # Restore the first field's indentation after removing the list marker.
+        # Only kernel-level fields count; nested argument metadata cannot supply
+        # a kernel's name or register allocation.
+        block = "    " + block
+        names = re.findall(r"^    \.name:[ \t]*(.*)$", block, re.MULTILINE)
+        if len(names) == 1:
+            name = names[0].strip()
+            if name in metadata:
+                raise ValueError(f"{name}: duplicate kernel metadata")
+            metadata[name] = block
     for match in kernels:
         name = match.group(1)
         end = source.find(".Lfunc_end", match.end())
@@ -159,15 +166,18 @@ def check_assembly(path: Path) -> None:
                 f"{name}: {len(bad)} unsafe register/scratch instructions; examples: {bad[:3]}"
             )
         block = metadata.get(name, "")
+        # Pinned inline assembly requires these full descriptor allocations.
         # SGPR-to-VGPR lane spills are allowed only within the checked temporary
         # registers. Memory-backed spills and dynamic stacks are never allowed.
         for key, expected in (
+            ("agpr_count", "256"),
+            ("vgpr_count", "512"),
             ("vgpr_spill_count", "0"),
             ("private_segment_fixed_size", "0"),
             ("uses_dynamic_stack", "false"),
         ):
-            value = re.search(rf"^\s+\.{key}:\s*(\S+)", block, re.MULTILINE)
-            if value is None or value.group(1) != expected:
+            values = re.findall(rf"^    \.{key}:[ \t]*(.*)$", block, re.MULTILINE)
+            if [value.strip() for value in values] != [expected]:
                 raise ValueError(f"{name}: missing or unsafe {key} metadata")
         print(f"OK {name}: pinned registers and zero scratch verified")
     print(
