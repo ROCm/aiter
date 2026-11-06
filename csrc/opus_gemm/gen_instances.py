@@ -4,7 +4,6 @@ import argparse
 import glob
 import json
 import os
-import sys
 from pathlib import Path
 
 import pandas as pd
@@ -18,6 +17,7 @@ from codegen.common import (
     _GFX942_A16W16_TAGS,
     _NOSPLIT,
     _SPLITK,
+    add_aiter_utils_to_sys_path,
     get_arch_map,
     open_if_changed,
     prune_unwritten,
@@ -84,14 +84,9 @@ def _build_targets_standalone(explicit_targets=()):
         )
     import importlib.util
 
-    spec = importlib.util.find_spec("aiter")  # locates, does not execute
-    if spec is None or not spec.submodule_search_locations:
+    utils_dir = add_aiter_utils_to_sys_path()
+    if utils_dir is None:
         raise ImportError("aiter package not found")
-    utils_dir = os.path.join(
-        next(iter(spec.submodule_search_locations)), "jit", "utils"
-    )
-    if utils_dir not in sys.path:
-        sys.path.insert(0, utils_dir)
     mod_spec = importlib.util.spec_from_file_location(
         "_opus_chip_info", os.path.join(utils_dir, "chip_info.py")
     )

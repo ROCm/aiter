@@ -10,6 +10,7 @@ manifests are the single source of truth for kid -> launcher mapping.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import shutil
 import sys
 from pathlib import Path
@@ -138,11 +139,15 @@ def _cpp_name_suffix(name: str) -> str:
 
 
 def build_num_xcd() -> int:
-    try:
-        from aiter.jit.utils.build_targets import build_num_xcds
-    except ImportError:
+    spec = importlib.util.find_spec("aiter")  # locates, does not execute
+    if spec is None or not spec.submodule_search_locations:
         return 8  # Standalone codegen without aiter.
-    return build_num_xcds("gfx950")
+    utils_dir = str(Path(next(iter(spec.submodule_search_locations))) / "jit" / "utils")
+    if utils_dir not in sys.path:
+        sys.path.insert(0, utils_dir)
+    import build_targets
+
+    return build_targets.build_num_xcds("gfx950")
 
 
 def _stage2_a8w4_traits_alias(kid: int) -> str:

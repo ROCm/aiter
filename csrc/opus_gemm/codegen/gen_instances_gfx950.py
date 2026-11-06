@@ -8,6 +8,7 @@ from opus_gemm_common import OpusGemmInstance
 
 from codegen.common import (
     WARP_SIZE,
+    add_aiter_utils_to_sys_path,
     register_arch_map,
     register_emit,
     splitk_workspace_type,
@@ -16,11 +17,11 @@ from codegen.common import (
 
 
 def build_num_xcd():
-    try:
-        from aiter.jit.utils.build_targets import build_num_xcds
-    except ImportError:
+    if add_aiter_utils_to_sys_path() is None:
         return 8  # Standalone codegen without aiter.
-    return build_num_xcds("gfx950")
+    import build_targets
+
+    return build_targets.build_num_xcds("gfx950")
 
 
 # ---------------- gfx950 arch-override maps ----------------
