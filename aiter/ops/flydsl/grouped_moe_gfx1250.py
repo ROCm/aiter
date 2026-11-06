@@ -1358,10 +1358,13 @@ def _grouped_a8w4_tdm_moe(
         {
             "k_grid": k_grid1,
             "splitk_ws": torch.empty(
-                (k_grid1, contiguous_m, 2 * inter_dim), dtype=torch.float32, device=device
+                (k_grid1, contiguous_m, 2 * inter_dim),
+                dtype=torch.float32,
+                device=device,
             ),
             "splitk_sem": _splitk_semaphore(
-                device, (contiguous_m // tile_m) * ((2 * inter_dim + tile_n - 1) // tile_n)
+                device,
+                (contiguous_m // tile_m) * ((2 * inter_dim + tile_n - 1) // tile_n),
             ),
         }
         if k_grid1 > 1

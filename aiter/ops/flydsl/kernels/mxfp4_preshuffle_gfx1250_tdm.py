@@ -19,7 +19,6 @@ from aiter.utility.mx_types import MxDtypeInt as MxDtype
 
 from .buffer_ops import buffer_load, buffer_store, create_buffer_resource_from_addr
 from .communication_ops_utils import atomic_add_agent
-from .splitk_epilogue import CPOL_COHERENT
 from .gemm_common_gfx1250 import (
     batched_silu_swiglu,
     batched_situv2,
@@ -42,6 +41,7 @@ from .quant_utils import (
     emit_cvt_scalef32_pk8_fp4_f32,
     emit_cvt_scalef32_pk8_fp8_f32,
 )
+from .splitk_epilogue import CPOL_COHERENT
 from .tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
@@ -337,9 +337,13 @@ def build_gemm_a8w4_tdm_task(
         if cluster_m > 1 or cluster_n > 1 or explicit_tile:
             raise ValueError("k_grid needs an unclustered grid")
         if persistent_contiguous_chunks or reuse_resident_b or defer_output_store_wait:
-            raise ValueError("k_grid does not support contiguous/resident/deferred tasks")
+            raise ValueError(
+                "k_grid does not support contiguous/resident/deferred tasks"
+            )
         if enable_ep_scatter or tdm_as_in_prologue or has_bias:
-            raise ValueError("k_grid does not support EP scatter, the As prologue or bias")
+            raise ValueError(
+                "k_grid does not support EP scatter, the As prologue or bias"
+            )
         K_TILES = K_TILES // k_grid
     # Double buffering is sufficient: the carry reads the other LDS buffer
     # before the post-compute barrier permits reusing the current buffer.
@@ -885,9 +889,7 @@ def build_gemm_a8w4_tdm_task(
                     expert_map = fx.recast_iter(i32_ptr, arg_m_expert_tile_map)
                     if has_work:
                         expert = expert_map[blk_m // expert_tile_m]
-                        expert_safe = (expert < n_experts).select(
-                            expert, n_experts - 1
-                        )
+                        expert_safe = (expert < n_experts).select(expert, n_experts - 1)
                         expert_end = tile_map[expert_safe]
                         has_work = blk_m < expert_end
             else:
@@ -950,9 +952,7 @@ def build_gemm_a8w4_tdm_task(
             # min(tile_m, end - blk_m): every use compares a row < tile_m with
             # it or clamps a TDM extent to the tile, so the clip is exact.
             mn_oob = fx.Int32(tile_meta[0][1])
-        elif const_expr(
-            direct_expert_map and (reuse_map_loads or packed_expert_map)
-        ):
+        elif const_expr(direct_expert_map and (reuse_map_loads or packed_expert_map)):
             mn_oob = expert_end - blk_m
         else:
             mn_oob = (
@@ -2344,8 +2344,7 @@ def build_gemm_a8w4_tdm_task(
                 )
                 plane_b = fx.Int32(capacity_rows) * fx.Int32(i32_n * 4)
                 ws_rsrc = create_buffer_resource_from_addr(
-                    fx.Int64(fx.ptrtoint(arg_splitk_ws))
-                    + tile_id * ws_tile_b,
+                    fx.Int64(fx.ptrtoint(arg_splitk_ws)) + tile_id * ws_tile_b,
                     num_records_bytes=fx.Int64(plane_b) * (k_grid - 1) + ws_tile_b,
                 )
 
@@ -2371,10 +2370,7 @@ def build_gemm_a8w4_tdm_task(
                 workgroup_barrier()
                 # Identify the reducing workgroup: the last split to arrive sums
                 # the partials.
-                sem_addr = (
-                    fx.Int64(fx.ptrtoint(arg_splitk_sem))
-                    + tile_id * 4
-                )
+                sem_addr = fx.Int64(fx.ptrtoint(arg_splitk_sem)) + tile_id * 4
                 if fx.Int32(tid) == fx.Int32(0):
                     arrival = fx.Int32(atomic_add_agent(sem_addr, fx.Int32(1)))
                     lds_store_b32(stC_idx, 0, Vec.from_elements([arrival], fx.Int32))
@@ -2432,7 +2428,7 @@ def build_gemm_a8w4_tdm_task(
                             )
                         tot += acc4
                     c_frags[idx].store(Vec.from_elements(tot, fx.Float32).ir_value())
-                if kg_last:
+                if kg_last:  # noqa: SIM102 - traced condition
                     if fx.Int32(tid) == fx.Int32(0):
                         # Undo with the same atomic so the next launch starts at 0.
                         atomic_add_agent(sem_addr, fx.Int32(-k_grid))
