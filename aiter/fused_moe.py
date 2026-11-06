@@ -136,6 +136,17 @@ def _aux_uses_opus(output_aux, block_size, routed_rows=None, num_experts=None):
 
 _ACT_TYPE_DISABLED_KEY = "__ignore__"
 _SWIGLU_MXFP4_BF16_BOUND = int(os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "256"))
+# (expert, inter_dim) shapes where the Swiglu MXFP4 FP4-activation (A4W4) path
+# above _SWIGLU_MXFP4_BF16_BOUND tokens is measured numerically broken, not
+# just slower. MiniMax-M3-MXFP4 TP8 (fused shared expert: 128 routed + 1
+# shared = 129, inter_dim=512 per-rank) via aiter's own test_fmoe harness:
+# logits_diff ~2e-5 (correct) at token<256, jumping to ~0.073 (project's own
+# correctness bound is 0.01) at token>=256 -- exactly where this dispatch
+# switches activations to fp4x2. The bound mechanism predates MiniMax-M3 and
+# was validated against GPT-OSS's shapes, not this one; stay on bf16
+# activations here regardless of token count until the A4W4 kernel itself is
+# fixed for this shape.
+_SWIGLU_MXFP4_A4W4_UNSAFE_SHAPES = {(129, 512)}
 _MOE_A8W4_BYPASS_QUANT = os.environ.get("AITER_MOE_A8W4_BYPASS_QUANT", "0") == "1"
 # (num_experts, topk) pairs the HIP kernel is instantiated for; must stay in
 # sync with AITER_MXFP4_SORT_QUANT_ROUTES in moe_sorting_opus_kernels.cu.
@@ -1068,6 +1079,8 @@ def resolve_activation_dtype(
     has_a1_scale: bool = False,
     gfx: str | None = None,
     gate_up_interleave: bool | None = None,
+    expert: int | None = None,
+    inter_dim: int | None = None,
 ) -> torch.dtype | None:
     """The activation dtype fused_moe() quantizes its input to.
 
@@ -1082,6 +1095,11 @@ def resolve_activation_dtype(
 
     `q_dtype_w` is `w1.dtype`; `hidden_dtype` / `has_a1_scale` only matter for
     the per_1x128 fp8 passthrough.
+
+    `expert` / `inter_dim` gate the Swiglu MXFP4 BF16->FP4 activation switch
+    (see `_SWIGLU_MXFP4_A4W4_UNSAFE_SHAPES`) against shapes measured to be
+    numerically broken in that path. Omit them only when the caller cannot
+    know the shape yet (matches the `M is None` deferral above).
     """
     quant_type = QuantType(quant_type)
     quant_type = quant_remap.get(quant_type, quant_type)
@@ -1120,9 +1138,12 @@ def resolve_activation_dtype(
             else:
                 q_dtype_a = dtypes.bf16
         elif activation == ActivationType.Swiglu and gate_mode == GateMode.SEPARATED:
-            q_dtype_a = _bound_split(
-                M, _SWIGLU_MXFP4_BF16_BOUND, dtypes.bf16, dtypes.fp4x2
-            )
+            if (expert, inter_dim) in _SWIGLU_MXFP4_A4W4_UNSAFE_SHAPES:
+                q_dtype_a = dtypes.bf16
+            else:
+                q_dtype_a = _bound_split(
+                    M, _SWIGLU_MXFP4_BF16_BOUND, dtypes.bf16, dtypes.fp4x2
+                )
         elif activation == ActivationType.Relu2:
             q_dtype_a = dtypes.bf16
         elif activation == ActivationType.Swiglu or gate_mode == GateMode.INTERLEAVE:
@@ -1619,6 +1640,8 @@ def _fused_moe_impl(
         hidden_dtype=hidden_states.dtype,
         has_a1_scale=a1_scale is not None,
         gate_up_interleave=getattr(w1, "gate_up_interleave", None),
+        expert=E,
+        inter_dim=inter_dim,
     )
 
     if quant_dtype_a is not None:
