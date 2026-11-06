@@ -72,6 +72,7 @@ from .pa_decode.op_merge import (
     Gfx1250ClusterMerge,
 )
 from .pa_decode.pipeline import (
+    Gfx1250Bf16DecodePipeline,
     Gfx1250Bf16Pipeline,
     Gfx1250Bf16WavePipeline,
     Gfx1250Pipeline,
@@ -179,6 +180,9 @@ def compile_pa_decode_tile(
     trans_k: bool = True,
     mask_unowned_kv: bool = True,
     cluster_merge: int = 0,
+    packed_scale_heads: bool = False,
+    cluster_task_stride: int = 0,
+    plan_tile_tokens: int = 256,
 ):
     """Select and cache a PA-decode kernel and launch wrapper.
 
@@ -249,6 +253,24 @@ def compile_pa_decode_tile(
                 and sliding_window == 0
                 else 1
             )
+        # Capacity covers every row's upper tile bound, so each visible
+        # tile gets its own task even with empty/mixed rows.
+        tile_bound = (
+            max(1, -(-max_context_length // plan_tile_tokens))
+            if max_context_length is not None and max_context_length > 0
+            else 0
+        )
+        single_task_tile = bool(
+            tile_bound
+            and kv_dtype == "fp8"
+            and plan_tile_tokens == 128
+            and block_size == 128
+            and query_group_size == 16
+            and query_length == 1
+            and sliding_window == 0
+            and num_partitions >= tile_bound
+            and work_capacity >= num_seqs * tile_bound
+        )
         return compile_gfx1250_pa_decode(
             head_dim=head_dim,
             query_group_size=query_group_size,
@@ -264,7 +286,27 @@ def compile_pa_decode_tile(
             query_splits=query_splits,
             merge_partitions=direct_output and num_partitions > 1,
             cluster_merge=cluster_merge,
+            packed_scale_heads=packed_scale_heads,
+            cluster_task_stride=cluster_task_stride,
+            plan_tile_tokens=plan_tile_tokens,
+            single_task_tile=single_task_tile,
+            single_kv_head=(
+                num_kv_heads == 1
+                and head_dim == 128
+                and block_size == 16
+                and query_group_size == 16
+                and query_length == 1
+                and sliding_window == 0
+                and not direct_output
+                and not cluster_merge
+            ),
+            direct_context=direct_output
+            and num_partitions == 1
+            and sliding_window == 0
+            and num_seqs <= 4 * num_compute_units,
         )
+    if plan_tile_tokens != KV_COMPUTE_BLOCK:
+        raise ValueError("128-token work plans require gfx1250 tile kernels")
     if architecture not in ("gfx942", "gfx950"):
         raise NotImplementedError(f"PA decode does not support {architecture}")
     if cluster_merge:
@@ -539,6 +581,12 @@ def compile_gfx1250_pa_decode(
     query_splits=1,
     merge_partitions=False,
     cluster_merge=0,
+    packed_scale_heads=False,
+    cluster_task_stride=0,
+    plan_tile_tokens=256,
+    single_task_tile=False,
+    direct_context=False,
+    single_kv_head=False,
 ):
     """Compile a gfx1250 tile kernel; merging partitions writes final output.
 
@@ -551,6 +599,23 @@ def compile_gfx1250_pa_decode(
     and empty sequences clear their rows.
     ``merge_partitions`` partial storage must be eight-byte aligned for its
     device-scope atomic accesses; the host wrapper falls back for offset views.
+    ``single_task_tile`` is internal: the standard planner must have enough
+    capacity and partition cap to give every tile its own task within the
+    validated context bound. Active tasks then end at start+1, while padding
+    still uses its original record bounds. Single-page packed FP8 can retain
+    one KV buffer and skip its final reuse barrier; BF16 wave merge keeps two.
+    ``plan_tile_tokens`` matches the plan's 128/256-token units; the value
+    participates in the kernel cache key and planned range conversion.
+    ``single_kv_head`` requires a one-head launch; KV indexing and head
+    strides then fold to constants while query-split indexing stays dynamic.
+    ``direct_context`` replaces the work pointer with context lengths for
+    one-partition full-attention output; active CTAs derive their complete
+    tile range and empty CTAs clear output without reading packed metadata.
+    ``cluster_task_stride`` selects optional [batch, stride, 8] records; it
+    must cover the cluster, and ``work`` then points at those records. The
+    default zero retains packed work_info plus reduce_info lookups.
+    ``packed_scale_heads`` promises that per-token scale head stride equals
+    ``block_size``; otherwise the FP8 cluster ABI retains the dynamic stride.
     """
     if query_splits not in (1, 2, 4) or query_length % query_splits:
         raise ValueError("query_splits must be 1, 2, or 4 and divide query_length")
@@ -569,7 +634,17 @@ def compile_gfx1250_pa_decode(
         query_splits,
         merge_partitions,
         cluster_merge,
+        packed_scale_heads,
+        cluster_task_stride,
+        plan_tile_tokens,
+        single_task_tile,
+        direct_context,
+        single_kv_head,
     )
+    if type(plan_tile_tokens) is not int or plan_tile_tokens not in (128, 256):
+        raise ValueError("plan_tile_tokens must be 128 or 256")
+    if direct_context and (not direct_output or sliding_window != 0):
+        raise ValueError("direct_context requires direct full-attention output")
     if compute_dtype not in ("fp8", "bf16"):
         raise ValueError(f"Unsupported gfx1250 PA compute dtype: {compute_dtype}")
     if t.bf16 and per_token_kv:
@@ -587,6 +662,12 @@ def compile_gfx1250_pa_decode(
         raise ValueError(
             f"cluster_merge must be in [2, {CLUSTER_PARTITIONS}] and excludes other "
             f"output modes and head_dim > {MERGE_HEAD_DIM}"
+        )
+    if cluster_task_stride and (
+        not cluster_merge or not cluster_merge <= cluster_task_stride <= 8
+    ):
+        raise ValueError(
+            "cluster_task_stride must cover an enabled cluster of at most 8"
         )
     if t.total_bytes > 327680:
         raise NotImplementedError(
@@ -616,11 +697,8 @@ def compile_gfx1250_pa_decode(
         cluster_merge=cluster_merge,
     )
 
-    # Every argument that reducer-fed and direct-output kernels read fits in
-    # the 30 user SGPRs (120 bytes) that preload kernel arguments, ahead of
-    # the merge-only arguments.
-    @flyc.kernel(name=kernel_name, known_block_size=(t.BLOCK_THREADS, 1, 1))
-    def pa_decode_tile_kernel(
+    @flyc.jit
+    def run_tile(
         work: fx.Pointer,
         table: fx.Pointer,
         query: fx.Pointer,
@@ -644,6 +722,8 @@ def compile_gfx1250_pa_decode(
         counters: fx.Pointer,
     ):
         _ = tag
+        if const_expr(t.single_kv_head):
+            kv_heads = fx.Int32(1)
 
         def zero_output(seq, dst):
             # Empty sequences have no attention mass; clear this CTA's rows.
@@ -668,26 +748,56 @@ def compile_gfx1250_pa_decode(
                     rows[offset] = t.q_dtype(0.0)
 
         task_slot = fx.Int32(gpu.block_id("x"))
-        if const_expr(t.cluster_merge):
+        if const_expr(t.cluster_merge and not t.cluster_task_stride):
             # Cluster s runs sequence s's tasks on its leading CTAs.
-            seq, part = task_slot // t.cluster_merge, task_slot % t.cluster_merge
+            # Hardware block IDs are unsigned; avoid signed floor-division
+            # fixups before the dependent reduce_info read.
+            cluster_slot = fx.Uint32(gpu.block_id("x"))
+            seq = fx.Int32(cluster_slot // t.cluster_merge)
+            part = fx.Int32(cluster_slot % t.cluster_merge)
             seq_tasks = fx.ptr_load(
                 fx.add_offset(fx.recast_iter(fx.Int32, reduce_info), seq * 2),
                 result_type=fx.Vector.make_type(2, fx.Int32),
             )
             first, count = fx.Int32(seq_tasks[0]), fx.Int32(seq_tasks[1])
             task_slot = (part < count).select(first + part, fx.Int32(0))
-        if const_expr(t.direct_output):
+        if const_expr(t.direct_output and not t.direct_context):
             # One task per nonempty sequence; reduce_info supplies its packed slot.
             info = fx.recast_iter(fx.Int32, pmax)
             count = fx.Int32(info[task_slot * 2 + 1])
             # A trailing empty sequence's start can equal capacity. Its dummy
             # task read must stay in bounds even though no compute consumes it.
             task_slot = (count > 0).select(fx.Int32(info[task_slot * 2]), fx.Int32(0))
-        task = fx.ptr_load(
-            fx.add_offset(fx.recast_iter(fx.Int32, work), task_slot * 4),
-            result_type=fx.Vector.make_type(4, fx.Int32),
-        )
+        if const_expr(t.direct_context):
+            # The one-partition full-attention path needs only this sequence's
+            # current length; no packed-task lookup or scratch offset is used.
+            length = fx.Int32(fx.recast_iter(fx.Int32, work)[task_slot])
+            count = fx.Int32(length > 0)
+            tiles = fx.Int32(
+                (fx.max(fx.Int64(length), fx.Int64(0)) + t.plan_tile_tokens - 1)
+                // t.plan_tile_tokens
+            )
+            task = fx.Vector.from_elements(
+                [task_slot, fx.Int32(0), tiles, length], dtype=fx.Int32
+            )
+        elif const_expr(t.cluster_task_stride):
+            cluster_slot = fx.Uint32(gpu.block_id("x"))
+            seq = fx.Int32(cluster_slot // t.cluster_merge)
+            part = fx.Int32(cluster_slot % t.cluster_merge)
+            task = fx.ptr_load(
+                fx.add_offset(
+                    fx.recast_iter(fx.Int32, work),
+                    (seq * t.cluster_task_stride + part) * 8,
+                ),
+                result_type=fx.Vector.make_type(8, fx.Int32),
+            )
+            first, count = fx.Int32(task[4]), fx.Int32(task[5])
+            task_slot = (part < count).select(first + part, fx.Int32(0))
+        else:
+            task = fx.ptr_load(
+                fx.add_offset(fx.recast_iter(fx.Int32, work), task_slot * 4),
+                result_type=fx.Vector.make_type(4, fx.Int32),
+            )
         active = fx.Int32(task[1]) < fx.Int32(task[2])
         if const_expr(t.direct_output):
             active = count > 0
@@ -714,7 +824,11 @@ def compile_gfx1250_pa_decode(
                 sequences,
                 fx.Int32(task[0]),
                 fx.Int32(task[1]),
-                fx.Int32(task[2]),
+                (
+                    fx.Int32(task[1]) + 1
+                    if const_expr(t.single_task_tile)
+                    else fx.Int32(task[2])
+                ),
                 fx.Int32(task[3]),
             )
             # Packed partials are [KV heads, capacity, rows] by task slot.
@@ -735,7 +849,9 @@ def compile_gfx1250_pa_decode(
             if const_expr(t.cluster_merge):
                 ctx.task_count = count
                 ctx.output_ptr = output
-            if const_expr(t.bf16_wave_query_tiles):
+            if const_expr(t.bf16_decode_wave):
+                Gfx1250Bf16DecodePipeline(ctx).run()
+            elif const_expr(t.bf16_wave_query_tiles):
                 Gfx1250Bf16WavePipeline(ctx).run()
             elif const_expr(t.bf16_page128_packed):
                 Gfx1250Bf16Pipeline(ctx).run()
@@ -761,6 +877,162 @@ def compile_gfx1250_pa_decode(
                 merge.run(seq, part, first, count, capacity)
             elif (count == 0) & (part == 0):
                 zero_output(seq, output)
+
+    if t.bf16:
+        # BF16 needs no FP8 scale pointers or strides. Omitting those 24
+        # bytes keeps every used argument in one compact preload window.
+        @flyc.kernel(name=kernel_name, known_block_size=(t.BLOCK_THREADS, 1, 1))
+        def pa_decode_tile_kernel(
+            work: fx.Pointer,
+            table: fx.Pointer,
+            query: fx.Pointer,
+            key: fx.Pointer,
+            value: fx.Pointer,
+            pmax: fx.Pointer,
+            psum: fx.Pointer,
+            pout: fx.Pointer,
+            max_blocks: fx.Int32,
+            sq_row: fx.Int32,
+            sq_head: fx.Int32,
+            sequences: fx.Int32,
+            capacity: fx.Int32,
+            kv_heads: fx.Int32,
+            reduce_info: fx.Pointer,
+            output: fx.Pointer,
+            counters: fx.Pointer,
+        ):
+            _ = tag
+            null_scale = fx.inttoptr(
+                fx.PointerType.get(fx.Float32.ir_type, fx.AddressSpace.Global, 4),
+                fx.Int64(0),
+            )
+            run_tile(
+                work,
+                table,
+                query,
+                key,
+                value,
+                pmax,
+                psum,
+                pout,
+                null_scale,
+                null_scale,
+                max_blocks,
+                fx.Int32(0),
+                fx.Int32(0),
+                sq_row,
+                sq_head,
+                sequences,
+                capacity,
+                kv_heads,
+                reduce_info,
+                output,
+                counters,
+            )
+
+    elif t.compact_fp8_cluster:
+        # Cluster-only FP8 drops sequence count, arrival counters and the
+        # known scale-head stride. All remaining arguments fit in 120 bytes.
+        @flyc.kernel(name=kernel_name, known_block_size=(t.BLOCK_THREADS, 1, 1))
+        def pa_decode_tile_kernel(
+            work: fx.Pointer,
+            table: fx.Pointer,
+            query: fx.Pointer,
+            key: fx.Pointer,
+            value: fx.Pointer,
+            pmax: fx.Pointer,
+            psum: fx.Pointer,
+            pout: fx.Pointer,
+            ks: fx.Pointer,
+            vs: fx.Pointer,
+            max_blocks: fx.Int32,
+            sk_block: fx.Int32,
+            sq_row: fx.Int32,
+            sq_head: fx.Int32,
+            capacity: fx.Int32,
+            kv_heads: fx.Int32,
+            reduce_info: fx.Pointer,
+            output: fx.Pointer,
+        ):
+            _ = tag
+            null_counter = fx.inttoptr(
+                fx.PointerType.get(fx.Int32.ir_type, fx.AddressSpace.Global, 4),
+                fx.Int64(0),
+            )
+            run_tile(
+                work,
+                table,
+                query,
+                key,
+                value,
+                pmax,
+                psum,
+                pout,
+                ks,
+                vs,
+                max_blocks,
+                sk_block,
+                fx.Int32(t.block_size if t.per_token_kv else 0),
+                sq_row,
+                sq_head,
+                fx.Int32(0),
+                capacity,
+                kv_heads,
+                reduce_info,
+                output,
+                null_counter,
+            )
+
+    else:
+        # Reducer-fed and direct-output arguments already fit in 120 bytes.
+        @flyc.kernel(name=kernel_name, known_block_size=(t.BLOCK_THREADS, 1, 1))
+        def pa_decode_tile_kernel(
+            work: fx.Pointer,
+            table: fx.Pointer,
+            query: fx.Pointer,
+            key: fx.Pointer,
+            value: fx.Pointer,
+            pmax: fx.Pointer,
+            psum: fx.Pointer,
+            pout: fx.Pointer,
+            ks: fx.Pointer,
+            vs: fx.Pointer,
+            max_blocks: fx.Int32,
+            sk_block: fx.Int32,
+            sk_head: fx.Int32,
+            sq_row: fx.Int32,
+            sq_head: fx.Int32,
+            sequences: fx.Int32,
+            capacity: fx.Int32,
+            kv_heads: fx.Int32,
+            reduce_info: fx.Pointer,
+            output: fx.Pointer,
+            counters: fx.Pointer,
+        ):
+            _ = tag
+            run_tile(
+                work,
+                table,
+                query,
+                key,
+                value,
+                pmax,
+                psum,
+                pout,
+                ks,
+                vs,
+                max_blocks,
+                sk_block,
+                sk_head,
+                sq_row,
+                sq_head,
+                sequences,
+                capacity,
+                kv_heads,
+                reduce_info,
+                output,
+                counters,
+            )
 
     @flyc.jit
     def launch(
@@ -793,28 +1065,50 @@ def compile_gfx1250_pa_decode(
             grid_x = sequences
         if const_expr(t.cluster_merge):
             grid_x = sequences * t.cluster_merge
+        tile_args = (work, table, query, key, value, pmax, psum, pout)
+        if const_expr(t.bf16):
+            tile_args += (
+                max_blocks,
+                sq_row,
+                sq_head,
+                sequences,
+                capacity,
+                kv_heads,
+                reduce_info,
+                output,
+                counters,
+            )
+        elif const_expr(t.compact_fp8_cluster):
+            tile_args += (
+                ks,
+                vs,
+                max_blocks,
+                sk_block,
+                sq_row,
+                sq_head,
+                capacity,
+                kv_heads,
+                reduce_info,
+                output,
+            )
+        else:
+            tile_args += (
+                ks,
+                vs,
+                max_blocks,
+                sk_block,
+                sk_head,
+                sq_row,
+                sq_head,
+                sequences,
+                capacity,
+                kv_heads,
+                reduce_info,
+                output,
+                counters,
+            )
         pa_decode_tile_kernel(
-            work,
-            table,
-            query,
-            key,
-            value,
-            pmax,
-            psum,
-            pout,
-            ks,
-            vs,
-            max_blocks,
-            sk_block,
-            sk_head,
-            sq_row,
-            sq_head,
-            sequences,
-            capacity,
-            kv_heads,
-            reduce_info,
-            output,
-            counters,
+            *tile_args,
             value_attrs=(
                 {"rocdl.cluster_dims": f"{t.cluster_merge},1,1"}
                 if t.cluster_merge
@@ -828,13 +1122,20 @@ def compile_gfx1250_pa_decode(
         )
 
     llvm_options = {}
-    if t.bf16_wave_query_tiles:
+    if t.bf16_wave_query_tiles or t.bf16_decode_wave:
         # Iterative ILP scheduling leaves fewer VGPR bank switches per page.
         llvm_options["amdgpu-sched-strategy"] = "iterative-ilp"
-    if not t.merged_output:
-        # Argument loads that a preload leaves behind are slower than those of
-        # an unpreloaded kernel (cluster merges ran 2-6% slower), so merging
-        # kernels, whose arguments do not all fit, keep loading them.
+    if (
+        not t.bf16
+        and t.head_dim == 128
+        and t.block_size == 128
+        and t.m_tiles == 1
+        and t.sliding_window == 0
+    ):
+        llvm_options["amdgpu-sched-strategy"] = "max-ilp"
+    if not t.merged_output or t.bf16 or t.compact_fp8_cluster:
+        # The compact merge ABIs fit completely. Other FP8 merges retain
+        # explicit loads rather than a slower partial preload.
         llvm_options["amdgpu-kernarg-preload"] = AITER_FLYDSL_KERNARG_PRELOAD
         llvm_options["amdgpu-kernarg-preload-count"] = (
             AITER_FLYDSL_KERNARG_PRELOAD_COUNT

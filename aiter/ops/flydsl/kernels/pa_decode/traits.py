@@ -833,6 +833,14 @@ class Gfx1250Traits:
     merge_partitions: bool = False
     # Workgroups per sequence cluster that merges its partitions; 0 disables.
     cluster_merge: int = 0
+    # Validated per-token scales have head stride equal to block_size.
+    packed_scale_heads: bool = False
+    # Number of aligned records per sequence in optional cluster_info.
+    cluster_task_stride: int = 0
+    plan_tile_tokens: int = 256
+    single_task_tile: bool = False
+    direct_context: bool = False
+    single_kv_head: bool = False
 
     WAVE = 32
     NWARP = 4
@@ -843,6 +851,16 @@ class Gfx1250Traits:
     def merged_output(self):
         # Tasks of multi-partition sequences merge partials in the tile kernel.
         return self.merge_partitions or self.cluster_merge > 0
+
+    @property
+    def compact_fp8_cluster(self):
+        # Cluster output needs neither sequence count nor arrival counters.
+        # Scalar scales omit head stride; packed token scales make it constant.
+        return (
+            not self.bf16
+            and self.cluster_merge > 0
+            and (not self.per_token_kv or self.packed_scale_heads)
+        )
 
     @property
     def bf16_packed(self):
@@ -1003,6 +1021,12 @@ class Gfx1250Traits:
         return self.bf16_page128_packed and self.m_tiles == self.NWARP
 
     @property
+    def bf16_decode_wave(self):
+        # A single D128 query tile partitions each page across four waves;
+        # online softmax and P stay private until one final wave-state merge.
+        return self.bf16_page128_packed and self.head_dim == 128 and self.m_tiles == 1
+
+    @property
     def async_page(self):
         # Two packed buffers overlap page DMA and asynchronous per-token scale
         # copies with QK/softmax/PV. Windowed tiles keep synchronous staging.
@@ -1020,6 +1044,18 @@ class Gfx1250Traits:
 
     @property
     def buffers(self):
+        if (
+            self.single_task_tile
+            and self.plan_tile_tokens == 128
+            and not self.bf16
+            and self.packed_lds
+            and self.TOKENS == 128
+            and self.m_tiles == 1
+            and self.sliding_window == 0
+        ):
+            # No subsequent page can overwrite this buffer. BF16 wave merge
+            # still needs its second buffer and does not select this case.
+            return 1
         if self.packed_lds:
             # Multi-tile 64-token chunks overlap gathered pages or windowed
             # staging just like the 128-token asynchronous page path.

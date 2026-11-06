@@ -57,6 +57,7 @@ def compile_pa_decode_ps_reduce(
     pairs: bool = False,
     parallel_groups: int = 1,
     num_xcds: int = 0,
+    paired_output: bool = False,
 ):
     """Build PA decode's partitioned-softmax reducer.
 
@@ -79,6 +80,8 @@ def compile_pa_decode_ps_reduce(
 
     ``pairs`` gives each lane two adjacent bf16/f16 elements (D % 128 == 0, a
     four-byte aligned base and even strides); output stores stay scalar.
+    ``paired_output`` requires dword-aligned output and even row strides,
+    permitting one dword store for each pair without changing rounding.
     ``num_xcds`` > 0 launches a 1-D grid that gives each XCD a contiguous run
     of CTAs; the launch then needs ``rows_magic`` and ``seq_magic`` =
     ceil(2**30 / d) for d = rows and rows * KV heads, valid while
@@ -108,6 +111,8 @@ def compile_pa_decode_ps_reduce(
         raise ValueError(f"query_group_size must be positive, got {query_group_size}")
     if pairs and (head_size % 128 or logits_dtype_str not in ("bf16", "f16")):
         raise ValueError("pairs requires D % 128 == 0 and bf16/f16 logits")
+    if paired_output and (not pairs or output_dtype_str not in ("bf16", "f16")):
+        raise ValueError("paired_output requires pairs and 16-bit output")
     elems = 2 if pairs else 1
     group_waves = head_size // elems // wave
     dual = partitions > register_partitions
@@ -184,6 +189,8 @@ def compile_pa_decode_ps_reduce(
         kernel_name += f"_g{groups}"
     if num_xcds:
         kernel_name += f"_xcd{num_xcds}"
+    if paired_output:
+        kernel_name += "_store2"
 
     @flyc.kernel(name=kernel_name, known_block_size=block)
     def pa_decode_reduce_kernel(
@@ -312,9 +319,15 @@ def compile_pa_decode_ps_reduce(
             return fx.Float32(value)
 
         def _store(acc, unit):
-            # Output rows need only element alignment, so pairs store scalars.
+            # Generic outputs use element alignment; proven rows store one dword.
             offset = output_base + unit * fx.Int32(elems)
-            if fx.const_expr(pairs):
+            if fx.const_expr(paired_output):
+                pointer = fx.recast_iter(
+                    fx.PointerType.get(output_dtype.ir_type, fx.AddressSpace.Global, 4),
+                    fx.add_offset(output, offset),
+                )
+                fx.ptr_store(acc.to(output_dtype), pointer)
+            elif fx.const_expr(pairs):
                 output[offset] = acc[0].to(output_dtype)
                 output[offset + fx.Int32(1)] = acc[1].to(output_dtype)
             else:
