@@ -307,7 +307,9 @@ def run_flydsl_gemm_bf16(
         k_waves=config["k_waves"],
         stages=config["stages"],
         group_m=config["group_m"],
-        policy="ht" if config["use_half_tile_interleaved"] else "ft",
+        policy=config.get(
+            "policy", "ht" if config["use_half_tile_interleaved"] else "ft"
+        ),
         out_dtype=otype,
     )
     if bias is not None and fused_bias is None:

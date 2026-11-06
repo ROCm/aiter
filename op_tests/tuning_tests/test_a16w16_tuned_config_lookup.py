@@ -78,6 +78,8 @@ class TestGfx1250FlydslCandidates(unittest.TestCase):
             multi_processor_count=256,
             warp_size=32,
             max_threads_per_multi_processor=2048,
+            shared_memory_per_block=320 * 1024,
+            shared_memory_per_multiprocessor=320 * 1024,
         )
         with (
             mock.patch.object(policy, "get_gfx", lambda: "gfx1250"),
@@ -91,6 +93,29 @@ class TestGfx1250FlydslCandidates(unittest.TestCase):
                 self.assertTrue(configs, (m, n, k))
                 for config in configs:
                     self.assertEqual(config["k_waves"], 1)
+                    if config.get("policy") == "tdm":
+                        from aiter.ops.flydsl.kernels.gemm_a16w16_tdm_gfx1250 import (
+                            validate_gemm_gfx1250_config,
+                        )
+
+                        validate_gemm_gfx1250_config(
+                            m,
+                            n,
+                            k,
+                            config["block_m"],
+                            config["block_n"],
+                            config["block_k"],
+                            config["stages"],
+                            config["m_waves"],
+                            config["n_waves"],
+                            config["group_m"],
+                            2,
+                            16,
+                            16,
+                            32,
+                            True,
+                            config["split_k"],
+                        )
                     lds = policy.gfx1250_lds_bytes(
                         config["block_m"],
                         config["block_n"],
@@ -98,7 +123,8 @@ class TestGfx1250FlydslCandidates(unittest.TestCase):
                         config["stages"],
                         config["split_k"],
                     )
-                    self.assertLessEqual(lds, 320 * 1024)
+                    if config.get("policy") != "tdm":
+                        self.assertLessEqual(lds, 320 * 1024)
                     k_tiles = -(-(k // config["split_k"]) // config["block_k"])
                     self.assertGreaterEqual(k_tiles, config["stages"] - 1)
                     for target_gfx in ("gfx1250", "gfx1250-strict"):

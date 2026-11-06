@@ -211,7 +211,12 @@ def get_flydsl_a16w16_configs(
     if out_dtype not in (dtype, torch.float32):
         return []
     if get_gfx() in ("gfx1250", "gfx1250-strict"):
-        return _gfx1250_configs(m, n, k)
+        configs = _gfx1250_configs(m, n, k)
+        if out_dtype == dtype:
+            from .gemm_a16w16_tdm_policy import get_gfx1250_tdm_configs
+
+            configs += get_gfx1250_tdm_configs(m, n, k, dtype)
+        return configs
     if make_gemm_a16w16_param_and_validate is None:
         return []
     if get_gfx() != "gfx950":
