@@ -150,6 +150,10 @@ def _gemm_afp4wfp4_kernel(
             # Load scales, masking OOB when K is not aligned to BLOCK_SIZE_K.
             # OOB scales could contain 0xFF (NaN in e8m0) which propagates
             # through dot_scaled even when the corresponding data is zero.
+            # Masked scales are 0, not 127: the data there is 0, so any finite
+            # scale works, and on gfx950 the pipelined loop's async copies to LDS
+            # fill masked-off lanes only with 0. With 127 those lanes keep stale
+            # LDS, which can hold 0xFF.
             if EVEN_K:
                 a_scales = tl.load(a_scale_ptrs)
                 b_scales = tl.load(b_scale_ptrs, cache_modifier=cache_modifier)
@@ -157,11 +161,11 @@ def _gemm_afp4wfp4_kernel(
                 scale_mask = offs_scale_k[None, :] < (
                     2 * K // SCALE_GROUP_SIZE - k * (BLOCK_SIZE_K // SCALE_GROUP_SIZE)
                 )
-                a_scales = tl.load(a_scale_ptrs, mask=scale_mask, other=127)
+                a_scales = tl.load(a_scale_ptrs, mask=scale_mask, other=0)
                 b_scales = tl.load(
                     b_scale_ptrs,
                     mask=scale_mask,
-                    other=127,
+                    other=0,
                     cache_modifier=cache_modifier,
                 )
 
@@ -365,6 +369,7 @@ def _gemm_afp4wfp4_kernel_preshuffle_scales(
             # Load scales, masking OOB when K is not aligned to BLOCK_SIZE_K.
             # OOB scales could contain 0xFF (NaN in e8m0) which propagates
             # through dot_scaled even when the corresponding data is zero.
+            # Masked scales are 0, not 127: see _gemm_afp4wfp4_kernel.
             if EVEN_K:
                 if BLOCK_SIZE_M < 32:
                     a_scales = tl.load(a_scale_ptrs)
@@ -406,10 +411,10 @@ def _gemm_afp4wfp4_kernel_preshuffle_scales(
                         2 * K // SCALE_GROUP_SIZE
                         - k * (BLOCK_SIZE_K // SCALE_GROUP_SIZE)
                     )
-                    a_scales = tl.load(a_scale_ptrs, mask=a_scale_mask, other=127)
+                    a_scales = tl.load(a_scale_ptrs, mask=a_scale_mask, other=0)
                 else:
                     a_scales = (
-                        tl.load(a_scale_ptrs, mask=shuffled_scale_mask, other=127)
+                        tl.load(a_scale_ptrs, mask=shuffled_scale_mask, other=0)
                         .reshape(
                             BLOCK_SIZE_M // 32,
                             BLOCK_SIZE_K // SCALE_GROUP_SIZE // 8,
@@ -426,7 +431,7 @@ def _gemm_afp4wfp4_kernel_preshuffle_scales(
                     tl.load(
                         b_scale_ptrs,
                         mask=shuffled_scale_mask,
-                        other=127,
+                        other=0,
                         cache_modifier=cache_modifier,
                     )
                     .reshape(

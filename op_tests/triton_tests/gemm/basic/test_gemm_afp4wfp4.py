@@ -288,6 +288,38 @@ def test_gemm_afp4_wfp4(
         triton.testing.assert_close(torch_out, triton_out)
 
 
+# K is not a multiple of the default config's BLOCK_SIZE_K for these decode shapes
+# (Qwen3.8-27B MXFP4 projections at TP4/TP8), so the last K block is masked.
+@pytest.mark.parametrize(
+    "M, N, K", [(8, 5120, 768), (16, 5120, 2176), (24, 5120, 2176), (32, 5120, 1536)]
+)
+def test_gemm_afp4_wfp4_masked_k_tail_ignores_stale_lds(M: int, N: int, K: int):
+    """The masked K tail must read `other`, not LDS left behind by an earlier kernel."""
+    dtype = torch.bfloat16
+    config, _ = _get_afp4wfp4_config(M, N, K // 2)
+    # Same config on an even K (no masked lanes) with all-0xFF operands: e8m0 NaN
+    # scales fill the LDS buffers that the masked tail of the real GEMM maps to.
+    Kp, Mp = 3 * config["BLOCK_SIZE_K"], 512
+    nan_x = torch.full((Mp, Kp // 2), 0xFF, dtype=torch.uint8, device="cuda")
+    nan_w = torch.full((N, Kp // 2), 0xFF, dtype=torch.uint8, device="cuda")
+    nan_x_scales = torch.full(
+        (Kp // SCALE_GROUP_SIZE, Mp), 0xFF, dtype=torch.uint8, device="cuda"
+    ).T
+    nan_w_scales = torch.full(
+        (Kp // SCALE_GROUP_SIZE, N), 0xFF, dtype=torch.uint8, device="cuda"
+    ).T
+    x, w, _, x_scales, w_scales, _, _, _, y = generate_gemm_afp4wfp4_inputs(
+        M, N, K, dtype
+    )
+    torch_out = run_torch(x, w, x_scales, w_scales, dtype).to(dtype)
+    for _ in range(3):
+        triton_gemm_afp4wfp4(
+            nan_x, nan_w, nan_x_scales, nan_w_scales, dtype, config=dict(config)
+        )
+        triton_out = triton_gemm_afp4wfp4(x, w, x_scales, w_scales, dtype, y)
+        triton.testing.assert_close(torch_out, triton_out)
+
+
 @pytest.mark.parametrize("M, N, K", [(1, 10240, 8192), (64, 8192, 28672)])
 def test_gemm_afp4_wfp4_preshuffle_splitk(M: int, N: int, K: int):
     if UNSHUFFLED_TRITON_ONLY:
