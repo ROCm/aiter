@@ -261,6 +261,16 @@ def _load_modules_from_config():
 
 
 def get_exclude_ops():
+    """Return the JIT modules a PREBUILD_KERNELS build skips.
+
+    0: no prebuild, every module is JIT-built at first use.
+    1: all but _tune and MHA; keeps fmha_v3 fwd and six mha_varlen_fwd variants.
+    2: all but _tune and _bwd (inference).
+    3: module_fmha_v3* only.
+    4: all but _tune, plus the level 1 mha_varlen_fwd variants. Like 1 and 2,
+       MoE ck2stages covers only tuned shapes, and other gen_func variants
+       (mha fwd/bwd, binary op dtypes) still JIT.
+    """
     all_modules = _load_modules_from_config()
     exclude_ops = []
 
@@ -288,7 +298,7 @@ def get_exclude_ops():
             if not module.startswith("module_fmha_v3"):
                 exclude_ops.append(module)
         else:
-            # Default behavior: exclude tunes
+            # Default and level 4: exclude tunes
             if "_tune" in module:
                 exclude_ops.append(module)
 
@@ -340,7 +350,7 @@ if PREBUILD_KERNELS != 0:
                     }
                 )
 
-        if PREBUILD_KERNELS == 1 and ENABLE_CK:
+        if PREBUILD_KERNELS in (1, 4) and ENABLE_CK:
             extra_args_build = []
 
             req_md_names = [
