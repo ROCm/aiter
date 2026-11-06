@@ -60,6 +60,11 @@ class PaDecodePipeline:
         gpu.barrier()
         if const_expr(not self.traits.MXFP4):
             v_page_pf0 = self.kv.read_v_pages()
+        if const_expr(self.traits.D256_PIPE and not self.traits.PAGE16_VPIPE):
+            # Retire every wave's first page-ID read before the early next-tile
+            # publication can overwrite the shared broadcast. Later iterations
+            # already retire these reads at the softmax publication barrier.
+            gpu.barrier()
         q_ops_all = self.query.load_operands()
         self.softmax.init_mask()
         self.ctx.init_causal_offsets()
@@ -532,13 +537,28 @@ class PaDecodePipeline:
         l_prev = [
             ostate[self.traits.l_slot(m)] for m in range_constexpr(self.traits.M_TILES)
         ]
+        phys_vec1_early = v_page_cur
+        if (
+            const_expr(self.traits.D256_PIPE and not self.traits.PAGE16_VPIPE)
+            and tt1 < self.ctx.part_end
+        ):
+            # Hide the following page-table lookup under QK.  Publishing the
+            # same IDs for V also removes the pipe's second table lookup.
+            phys_vec1_early = self.kv.fetch_v_pages(tt1)
         frag_Ss = [
             self.gemm.qk(k_cur, q_ops_all, m)
             for m in range_constexpr(self.traits.M_TILES)
         ]
         k_next = k_cur
         if const_expr(not self.traits.single_tile_plan) and tt1 < self.ctx.part_end:
-            if const_expr(self.traits.REUSE_KV_PAGES):
+            if const_expr(self.traits.D256_PIPE and not self.traits.PAGE16_VPIPE):
+                phys_vec1 = phys_vec1_early
+                if const_expr(self.traits.per_token_kv):
+                    self.kv.stage_scales(
+                        phys_vec1, self.kv.scale_buffer_offset(tt1), tt1
+                    )
+                k_next = self.kv.load_k_from_pages(phys_vec1)
+            elif const_expr(self.traits.REUSE_KV_PAGES):
                 # Stage scales before K so scale waits cannot drain K;
                 # page16 defers K until the P barrier.
                 phys_vec1 = self.kv.fetch_v_pages(tt1)
