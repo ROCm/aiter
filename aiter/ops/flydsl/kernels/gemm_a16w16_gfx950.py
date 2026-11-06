@@ -5,10 +5,10 @@ import functools
 from dataclasses import dataclass
 from typing import Any
 
-from flydsl._mlir import ir
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
+from flydsl._mlir import ir
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.runtime.device import get_rocm_arch
 
@@ -140,7 +140,7 @@ def make_gemm_a16w16_gfx950_param(
     if not isinstance(k_stagger, int) or isinstance(k_stagger, bool) or k_stagger < 0:
         raise ValueError("k_stagger must be a non-negative integer")
     if not isinstance(b_non_temporal, bool):
-        raise ValueError("b_non_temporal must be a bool")
+        raise TypeError("b_non_temporal must be a bool")
     if group_m < 0:
         raise ValueError("group_m must be non-negative")
     in_dbytes = 2

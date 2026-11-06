@@ -17,6 +17,7 @@ Run:
 """
 
 import argparse
+import itertools
 
 import pandas as pd
 import torch
@@ -25,6 +26,11 @@ import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl import flydsl_hgemm
+from aiter.ops.flydsl.gemm_a16w16_band import band_stream_config
+from aiter.ops.flydsl.gemm_kernels import (
+    flydsl_hgemm_kernel_name,
+    get_flydsl_hgemm_kernel_params,
+)
 from aiter.test_common import (
     benchmark,
     checkAllclose,
@@ -435,6 +441,307 @@ def check_skinny_large_weight():
     torch.cuda.empty_cache()
 
 
+# K-stagger/streaming regression geometries. The first two are Kimi-K3
+# row-major BF16 projection weights from AKLR; the rest exercise K wraps,
+# short final split partitions, slice-K and HTI pipeline boundaries.
+# Same row schema as _TUNED.
+_MEMORY_TILES = [
+    (16, 18432, 1536, 16, 96, 64, 6, 1, 1, 2, 1, 0, False),
+    (32, 18432, 1536, 32, 96, 64, 4, 1, 2, 2, 1, 0, False),
+    (19, 120, 128, 32, 64, 64, 3, 1, 2, 2, 1, 0, False),
+    (19, 120, 1088, 32, 64, 64, 2, 9, 2, 2, 1, 0, False),
+    (33, 136, 448, 32, 64, 64, 3, 1, 2, 2, 1, 0, False),
+    (35, 136, 1344, 32, 64, 64, 3, 3, 2, 2, 1, 0, False),
+    (32, 128, 640, 32, 64, 128, 3, 1, 2, 2, 2, 0, False),
+    (65, 264, 768, 32, 64, 64, 5, 1, 2, 2, 1, 4, False),
+    (513, 520, 128, 128, 128, 64, 2, 1, 2, 4, 1, 4, True),
+    (257, 264, 768, 128, 128, 64, 2, 3, 2, 4, 1, 4, True),
+    (512, 512, 640, 128, 128, 64, 2, 1, 2, 4, 1, 4, True),
+]
+
+
+@benchmark()
+def test_hgemm_memory(
+    m, n, k, dtype, out_dtype, policy, split_k, k_stagger, b_non_temporal
+):
+    tile = next(
+        tile
+        for rm, rn, rk, rp, rs, tile in map(_unpack, _MEMORY_TILES)
+        if (rm, rn, rk, rp, rs) == (m, n, k, policy, split_k)
+    )
+    kwargs = {
+        key: value for key, value in tile.items() if key != "use_half_tile_interleaved"
+    }
+    kwargs.update(policy=policy, out_dtype=out_dtype)
+    torch.manual_seed(SEED)
+    a = torch.empty((m, k), dtype=dtype, device="cuda").uniform_(-1, 1)
+    w = torch.empty((n, k), dtype=dtype, device="cuda").uniform_(-1, 1)
+    bias = torch.empty((n,), dtype=dtype, device="cuda").uniform_(-1, 1)
+    ref = (a.float() @ w.float().t() + bias.float()).to(out_dtype)
+    # Contiguous model-owned output, with guards before and after the view.
+    guard = torch.full((m * n + 32,), 8192, dtype=out_dtype, device="cuda")
+    out = guard[16:-16].view(m, n)
+    base_out = torch.empty_like(out)
+    candidates = {
+        "flydsl_base": lambda: flydsl_hgemm(a, w, out=base_out, bias=bias, **kwargs),
+        "flydsl_memory": lambda: flydsl_hgemm(
+            a,
+            w,
+            out=out,
+            bias=bias,
+            k_stagger=k_stagger,
+            b_non_temporal=b_non_temporal,
+            **kwargs,
+        ),
+    }
+    flops = 2 * m * n * k
+    nbytes = (m * k + n * k + n) * a.element_size() + m * n * out.element_size()
+    atol, rtol = _atol_rtol(k, split_k, tile["k_waves"], dtype)
+    ret = {"gfx": get_gfx()}
+    for name, fn in candidates.items():
+        y, us = run_perftest(fn)
+        err = checkAllclose(
+            ref.float(), y.float(), rtol=rtol, atol=atol, msg=f"{name}: hgemm memory"
+        )
+        assert err == 0, f"{name}: {err} elements outside the reference tolerance"
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = flops / us / 1e6
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = err
+    assert torch.all(guard[:16] == 8192) and torch.all(
+        guard[-16:] == 8192
+    ), "output guard overwritten"
+
+    # Exact binary fractions expose missing/repeated K tiles without depending
+    # on a relaxed BF16 split-K tolerance. Check repeated dirty-output launches.
+    a.copy_(torch.randint(-2, 3, a.shape, device=a.device).to(dtype) / 8)
+    w.copy_(torch.randint(-2, 3, w.shape, device=w.device).to(dtype) / 8)
+    bias.copy_(torch.randint(-2, 3, bias.shape, device=bias.device).to(dtype) / 8)
+    exact = (a.float() @ w.float().t() + bias.float()).to(out_dtype)
+    for _ in range(3):
+        out.fill_(8192)
+        y = candidates["flydsl_memory"]()
+        err = checkAllclose(
+            exact.float(),
+            y.float(),
+            rtol=0,
+            atol=0,
+            msg="K tile coverage",
+            tol_err_ratio=0,
+        )
+        assert err == 0, f"K tile coverage mismatch: {err}"
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        candidates["flydsl_memory"]()
+    a.neg_()
+    out.fill_(8192)
+    graph.replay()
+    exact = (a.float() @ w.float().t() + bias.float()).to(out_dtype)
+    err = checkAllclose(
+        exact.float(),
+        out.float(),
+        rtol=0,
+        atol=0,
+        msg="changed-input graph",
+        tol_err_ratio=0,
+    )
+    assert err == 0, f"graph replay mismatch: {err}"
+    return ret
+
+
+# Kimi-K3 tuned rows and M values that reach them through padding.
+_TUNED_MEMORY_MNK = [
+    (m, n, k)
+    for m, (n, k) in itertools.product(
+        (12, 16, 24, 32, 48, 64, 112, 120, 128),
+        ((18432, 1536), (20480, 7168)),
+    )
+]
+
+
+@benchmark()
+def test_hgemm_tuned_memory(m, n, k, dtype):
+    from aiter.tuned_gemm import gemm_a16w16_out
+
+    torch.manual_seed(SEED)
+    a = torch.empty((m, k), dtype=dtype, device="cuda").uniform_(-1, 1)
+    w = torch.empty((n, k), dtype=dtype, device="cuda").uniform_(-1, 1)
+    out = torch.empty((m, n), dtype=dtype, device="cuda")
+    ref = run_torch(a, w, dtype)
+
+    # Follow the actual tuned lookup, including M padding, rather than
+    # launching a hand-selected tile that the model might never use.
+    def launch():
+        gemm_a16w16_out(a, w, out, otype=dtype)
+        return out
+
+    candidates = {"aiter_tuned": launch}
+    ret = {"gfx": get_gfx()}
+    flops = 2 * m * n * k
+    nbytes = (m * k + n * k + m * n) * a.element_size()
+    for name, fn in candidates.items():
+        y, us = run_perftest(fn)
+        err = checkAllclose(ref.float(), y.float(), rtol=1e-2, atol=1e-2, msg=name)
+        assert err == 0, f"{name}: tuned memory row mismatch {err}"
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = flops / us / 1e6
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = err
+    return ret
+
+
+_BAND_MNK = [
+    (m, n, k)
+    for m, (n, k) in itertools.product(
+        (
+            1,
+            7,
+            8,
+            12,
+            16,
+            21,
+            24,
+            32,
+            35,
+            40,
+            48,
+            49,
+            56,
+            64,
+            80,
+            96,
+            98,
+            112,
+            120,
+            128,
+        ),
+        ((18432, 1536), (20480, 7168)),
+    )
+]
+
+
+@benchmark()
+def test_hgemm_band(m, n, k, dtype):
+    config = band_stream_config(m, n, k)
+    config.pop("use_half_tile_interleaved")
+    torch.manual_seed(SEED)
+    a = torch.empty((m, k), dtype=dtype, device="cuda").uniform_(-1, 1)
+    w = torch.empty((n, k), dtype=dtype, device="cuda").uniform_(-1, 1)
+    ref = run_torch(a, w, dtype)
+    guard = torch.full((m * n + 32,), 8192, dtype=dtype, device="cuda")
+    out = guard[16:-16].view(m, n)
+    candidates = {"flydsl_band": lambda: flydsl_hgemm(a, w, out=out, **config)}
+    ret = {"gfx": get_gfx()}
+    flops = 2 * m * n * k
+    nbytes = (m * k + n * k + m * n) * a.element_size()
+    for name, fn in candidates.items():
+        y, us = run_perftest(fn)
+        err = checkAllclose(ref.float(), y.float(), rtol=1e-2, atol=1e-2, msg=name)
+        assert err == 0, f"{name}: mismatch {err}"
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = flops / us / 1e6
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = err
+    golden = out.clone()
+    for _ in range(10):
+        out.fill_(float("nan"))
+        candidates["flydsl_band"]()
+        assert torch.equal(out, golden), "band-stream is not deterministic"
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        candidates["flydsl_band"]()
+    a.neg_()
+    ref = run_torch(a, w, dtype)
+    for _ in range(10):
+        out.fill_(float("nan"))
+        graph.replay()
+        err = checkAllclose(
+            ref.float(),
+            out.float(),
+            rtol=1e-2,
+            atol=1e-2,
+            msg="band graph",
+            printLog=False,
+        )
+        assert err == 0, f"band graph mismatch {err}"
+    assert torch.all(guard[:16] == 8192) and torch.all(
+        guard[-16:] == 8192
+    ), "band output overrun"
+    return ret
+
+
+def check_band_rejects():
+    config = band_stream_config(16, 18432, 1536)
+    config.pop("use_half_tile_interleaved")
+    a = torch.zeros((16, 1536), dtype=dtypes.bf16, device="cuda")
+    w = torch.zeros((18432, 1536), dtype=dtypes.bf16, device="cuda")
+    for override in (
+        {"split_k": 2},
+        {"k_waves": 2},
+        {"group_m": 4},
+        {"b_non_temporal": False},
+        {"out_dtype": dtypes.fp32},
+        {"bias": torch.zeros(18432, device="cuda", dtype=dtypes.bf16)},
+    ):
+        try:
+            flydsl_hgemm(a, w, **(config | override))
+        except ValueError:
+            continue
+        raise AssertionError(f"band-stream accepted {override}")
+    for x, weight in (
+        (a.half(), w.half()),
+        (a[:, ::2], w[:, ::2]),
+        (a, w[:1024]),
+        (a.cpu(), w.cpu()),
+    ):
+        try:
+            flydsl_hgemm(x, weight, **config)
+        except (ValueError, RuntimeError):
+            continue
+        raise AssertionError("band-stream accepted unsupported tensors")
+    aiter.logger.info("band-stream rejects unsupported input/configurations")
+
+
+def check_hgemm_memory_options():
+    """Legacy names, tuning options and unsupported architectures stay explicit."""
+    config = _unpack(_MEMORY_TILES[0])[-1]
+
+    def name(cfg, gfx="gfx950"):
+        return flydsl_hgemm_kernel_name(
+            dtype=dtypes.bf16,
+            out_dtype=dtypes.bf16,
+            config=cfg,
+            has_bias=False,
+            target_gfx=gfx,
+        )
+
+    legacy = name(config)
+    for stagger, nt in itertools.product((0, 1, 3, 127), (False, True)):
+        cfg = dict(config, k_stagger=stagger, b_non_temporal=nt)
+        encoded = name(cfg)
+        parsed = get_flydsl_hgemm_kernel_params(encoded)
+        assert {key: parsed[key] for key in cfg} == cfg, encoded
+        if stagger == 0 and not nt:
+            assert encoded == legacy
+    for cfg, gfx in [
+        (dict(config, k_stagger=-1), "gfx950"),
+        (dict(config, k_stagger=1.5), "gfx950"),
+        (dict(config, k_stagger=True), "gfx950"),
+        (dict(config, b_non_temporal=1), "gfx950"),
+        (dict(config, k_stagger=1), "gfx1250"),
+        (dict(config, b_non_temporal=True), "gfx1250"),
+        (dict(config, k_stagger=1, policy="sk"), "gfx950"),
+        (dict(config, b_non_temporal=True, policy="sk"), "gfx950"),
+    ]:
+        try:
+            name(cfg, gfx)
+        except (ValueError, TypeError):
+            continue
+        raise AssertionError(f"accepted unsupported memory config: {cfg}, {gfx}")
+    aiter.logger.info("hgemm memory-option names and rejection checks passed")
+
+
 def summarize(title, rows):
     df = pd.DataFrame(rows)
     if df.empty:
@@ -467,10 +774,21 @@ def main():
         "--mnk",
         type=dtypes.str2tuple,
         nargs="*",
-        default=_default_mnk() + _CONCURRENT_COPY_MNK,
+        default=_default_mnk()
+        + _CONCURRENT_COPY_MNK
+        + [row[:3] for row in _MEMORY_TILES]
+        + _TUNED_MEMORY_MNK
+        + _BAND_MNK,
         help="""Shape of mnk.
         e.g.:   -s 128,4096,4096
                 --mnk 32,384,7168""",
+    )
+    parser.add_argument("--k-stagger", type=int, nargs="*", default=[1, 3, 127])
+    parser.add_argument(
+        "--b-non-temporal", type=dtypes.str2bool, nargs="*", default=[False, True]
+    )
+    parser.add_argument(
+        "--out-dtype", type=dtypes.str2Dtype, nargs="*", default="bf16,fp32,"
     )
     args = parser.parse_args()
     wanted = set(args.mnk)
@@ -488,6 +806,39 @@ def main():
             if (m, n, k) in wanted
         ]
         summarize(f"flydsl_hgemm {dtype} with a concurrent copy", rows)
+    for dtype, out_dtype in itertools.product(args.dtype, args.out_dtype):
+        if out_dtype not in (dtype, dtypes.fp32):
+            continue
+        rows = [
+            test_hgemm_memory(m, n, k, dtype, out_dtype, policy, split_k, stagger, nt)
+            for (m, n, k, policy, split_k, _), stagger, nt in itertools.product(
+                map(_unpack, _MEMORY_TILES), args.k_stagger, args.b_non_temporal
+            )
+            if (m, n, k) in wanted
+        ]
+        summarize(f"flydsl_hgemm memory {dtype} -> {out_dtype}", rows)
+    for dtype in args.dtype:
+        if dtype == dtypes.bf16:
+            summarize(
+                f"tuned hgemm memory {dtype}",
+                [
+                    test_hgemm_tuned_memory(m, n, k, dtype)
+                    for m, n, k in _TUNED_MEMORY_MNK
+                    if (m, n, k) in wanted
+                ],
+            )
+    for dtype in args.dtype:
+        if dtype == dtypes.bf16:
+            summarize(
+                "band-stream HGEMM",
+                [
+                    test_hgemm_band(m, n, k, dtype)
+                    for m, n, k in _BAND_MNK
+                    if (m, n, k) in wanted
+                ],
+            )
+    check_band_rejects()
+    check_hgemm_memory_options()
     check_skinny_rejects()
     check_skinny_large_weight()
 

@@ -16,6 +16,7 @@ from aiter import logger
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.utility.graph_alloc import capture_scoped_cache, persistent_alloc
 
+from .gemm_a16w16_band import band_stream_name_supported, gemm_a16w16_band
 from .gemm_a16w16_gfx1250 import gemm_a16w16 as gemm_a16w16_gfx1250
 from .kernels.gemm_a16w16_gfx950 import (
     SPLIT_K_SEMAPHORE_MAX_LEN,
@@ -42,7 +43,7 @@ _HGEMM_KERNEL_RE = re.compile(
     r"x(?P<stages>\d+)_ks(?P<split_k>\d+)_"
     r"w(?P<m_waves>\d+)x(?P<n_waves>\d+)x(?P<k_waves>\d+)_"
     r"bias(?P<has_bias>[01])_ktail(?P<has_k_tail>[01])_"
-    r"gm(?P<group_m>\d+)(?:_stg(?P<k_stagger>\d+))?(?P<b_non_temporal>_bnt)?_p(?P<policy>ft|ht|hti|sk)_"
+    r"gm(?P<group_m>\d+)(?:_stg(?P<k_stagger>\d+))?(?P<b_non_temporal>_bnt)?_p(?P<policy>ft|ht|hti|sk|bs)_"
     r"(?P<target_gfx>gfx[0-9a-z]+(?:-[0-9a-z]+)*)$"
 )
 
@@ -82,8 +83,8 @@ def flydsl_hgemm_kernel_name(
             f"Unsupported output dtype {out_dtype_name} for input {dtype_name}"
         )
 
-    if config.get("policy") == SKINNY_POLICY:
-        policy = SKINNY_POLICY
+    if config.get("policy") in (SKINNY_POLICY, "bs"):
+        policy = config["policy"]
     else:
         policy = "ht" if config["use_half_tile_interleaved"] else "ft"
     k_stagger = config.get("k_stagger", 0)
@@ -101,6 +102,8 @@ def flydsl_hgemm_kernel_name(
         f"bias{int(has_bias)}_ktail0_gm{config['group_m']}{stagger_suffix}{memory_suffix}_p{policy}_"
         f"{gfx}"
     )
+    if policy == "bs" and get_flydsl_hgemm_kernel_params(name) is None:
+        raise ValueError("unsupported band-stream kernel configuration")
     return name
 
 
@@ -134,7 +137,7 @@ def get_flydsl_hgemm_kernel_params(name: str) -> dict | None:
     ):
         return None
 
-    return {
+    params = {
         "block_m": int(match.group("block_m")),
         "block_n": int(match.group("block_n")),
         "block_k": int(match.group("block_k")),
@@ -154,19 +157,23 @@ def get_flydsl_hgemm_kernel_params(name: str) -> dict | None:
         "target_gfx": match.group("target_gfx"),
     }
 
+    if policy == "bs" and not band_stream_name_supported(params):
+        return None
+    return params
+
 
 def _validate_k_stagger(k_stagger, gfx, policy):
     if not isinstance(k_stagger, int) or isinstance(k_stagger, bool) or k_stagger < 0:
         raise ValueError("k_stagger must be a non-negative integer")
     if k_stagger and (gfx != "gfx950" or policy == SKINNY_POLICY):
-        raise ValueError("k_stagger supports gfx950 ft/ht/hti policies only")
+        raise ValueError("k_stagger supports gfx950 ft/ht/hti/bs policies only")
 
 
 def _validate_b_non_temporal(value, gfx, policy):
     if not isinstance(value, bool):
-        raise ValueError("b_non_temporal must be a bool")
+        raise TypeError("b_non_temporal must be a bool")
     if value and (gfx != "gfx950" or policy == SKINNY_POLICY):
-        raise ValueError("b_non_temporal supports gfx950 ft/ht/hti policies only")
+        raise ValueError("b_non_temporal supports gfx950 ft/ht/hti/bs policies only")
 
 
 def flydsl_hgemm(
@@ -200,9 +207,13 @@ def flydsl_hgemm(
     ``b_non_temporal`` streams B's async loads with the non-temporal cache
     hint. It is independent of k_stagger; tune both, since shared B can
     benefit from caching. Both options default off.
+    ``policy="bs"`` selects the BF16 band-stream decode kernel for the
+    validated 256-CU gfx950 M/N/K and configuration catalog. It requires
+    contiguous A/B, no bias, split_k=1 and BF16 output; unsupported inputs
+    raise rather than silently selecting a different kernel.
     """
 
-    if policy not in ("ft", "ht", "hti", SKINNY_POLICY):
+    if policy not in ("ft", "ht", "hti", SKINNY_POLICY, "bs"):
         raise ValueError(f"Unsupported FlyDSL HGEMM policy: {policy!r}")
     launch_stream = (
         torch.cuda.current_stream(device=a.device) if stream is None else stream
@@ -213,6 +224,28 @@ def flydsl_hgemm(
     gfx = get_gfx()
     _validate_k_stagger(k_stagger, gfx, policy)
     _validate_b_non_temporal(b_non_temporal, gfx, policy)
+    if policy == "bs":
+        return gemm_a16w16_band(
+            a,
+            b,
+            out,
+            bias,
+            out_dtype,
+            launch_stream,
+            {
+                "block_m": block_m,
+                "block_n": block_n,
+                "block_k": block_k,
+                "stages": stages,
+                "split_k": split_k,
+                "m_waves": m_waves,
+                "n_waves": n_waves,
+                "k_waves": k_waves,
+                "group_m": group_m,
+                "k_stagger": k_stagger,
+                "b_non_temporal": b_non_temporal,
+            },
+        )
     if policy == SKINNY_POLICY:
         if gfx != "gfx950":
             raise RuntimeError("The FlyDSL skinny HGEMM policy supports gfx950 only")

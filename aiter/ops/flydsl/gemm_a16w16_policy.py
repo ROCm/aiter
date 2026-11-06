@@ -10,6 +10,7 @@ import torch
 
 from aiter.jit.utils.chip_info import get_gfx, get_lds_capacity_bytes
 
+from .gemm_a16w16_band import band_stream_config
 from .kernels.gemm_a16w16_gfx950 import (
     GEMM_A16W16_DTYPE_BF16,
     GEMM_A16W16_DTYPE_FP16,
@@ -17,6 +18,7 @@ from .kernels.gemm_a16w16_gfx950 import (
     make_gemm_a16w16_param_and_validate,
 )
 from .kernels.gemm_a16w16_kernel_gfx1250 import LDS_PAD_A, LDS_PAD_B
+from .kernels.gemm_a16w16_skinny_gfx950 import skinny_config_error
 
 __all__ = ["GemmConfigPruner", "get_flydsl_a16w16_configs"]
 
@@ -268,7 +270,10 @@ def get_flydsl_a16w16_configs(
         elif not config["use_half_tile_interleaved"]:
             mma_m_iters = config["block_m"] // config["m_waves"] // 16
             mma_n_iters = config["block_n"] // config["n_waves"] // 16
-            if mma_m_iters > 4 or mma_n_iters > 4:
+            # Decode tiles can stream a wider N panel per wave. The old
+            # four-repeat cutoff excluded 128x96 / 4x1-wave candidates.
+            max_n_iters = 8 if m <= 128 and m <= config["block_m"] else 4
+            if mma_m_iters > 4 or mma_n_iters > max_n_iters:
                 continue
 
         validation_config = {
@@ -299,4 +304,34 @@ def get_flydsl_a16w16_configs(
                     for nt in (False, True)
                     if stride or nt
                 )
-    return valid_configs + memory_configs
+    skinny_configs = []
+    if dtype == out_dtype == torch.bfloat16 and not has_bias and 0 < m <= 128:
+        # The public wrapper and tuned-name parser already support skinny,
+        # but the tuner previously generated only FT/HTI candidates.
+        block_m = -(-m // 8) * 8
+        for block_n, block_k, stages, k_waves in itertools.product(
+            (16, 24, 32, 48, 64, 72, 80, 96), (32, 64, 128), (2, 3, 4, 6), (2, 4, 8)
+        ):
+            if skinny_config_error(n, k, block_m, block_n, block_k, stages, k_waves):
+                continue
+            skinny_configs.append(
+                {
+                    "block_m": block_m,
+                    "block_n": block_n,
+                    "block_k": block_k,
+                    "stages": stages,
+                    "split_k": 1,
+                    "m_waves": 1,
+                    "n_waves": 1,
+                    "k_waves": k_waves,
+                    "group_m": 0,
+                    "use_half_tile_interleaved": False,
+                    "policy": "sk",
+                }
+            )
+    band_configs = []
+    if dtype == out_dtype == torch.bfloat16 and not has_bias:
+        config = band_stream_config(m, n, k)
+        if config is not None and device_props.multi_processor_count == 256:
+            band_configs.append(config)
+    return valid_configs + memory_configs + skinny_configs + band_configs
