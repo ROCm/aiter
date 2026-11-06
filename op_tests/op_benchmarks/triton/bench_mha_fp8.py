@@ -13,6 +13,9 @@ Usage:
     python bench_mha_fp8.py --seqlen_q 1024 --seqlen_k 8192 --causal  # bottom-right causal
     python bench_mha_fp8.py --q_heads 32 --k_heads 8  # grouped query attention
     python bench_mha_fp8.py --rep 100
+    python bench_mha_fp8.py --variant mla_varlen --q_heads 24 --batch 4 --seqlen_q 2048 --causal
+        # MLA prefill: q [B * SQ, HQ, 192], k [B * SK, HK, 128] + k_pe [B * SK, 1, 64],
+        # v [B * SK, HK, 128], packed varlen sequences
 """
 
 import argparse
@@ -20,7 +23,7 @@ import argparse
 import torch
 import triton
 
-from aiter.ops.triton.attention.mha_fp8 import mha_fwd
+from aiter.ops.triton.attention.mha_fp8 import mha_fwd, mha_fwd_mla_varlen
 
 FP8_DTYPE = torch.float8_e4m3fn
 FP8_MAX = 448.0
@@ -70,9 +73,55 @@ def bench_case(b, hq, hk, sq, sk, d, causal, rep, device):
     }
 
 
+def num_pairs(sq, sk, causal):
+    """(query, key) pairs one sequence computes under the bottom-right causal mask."""
+    if causal and sk > sq:
+        return sq * sk - sq * (sq - 1) / 2
+    if causal:
+        return sq * sk / 2
+    return sq * sk
+
+
+def bench_mla_varlen_case(b, hq, hk, sq, sk, causal, rep, device):
+    """mha_fwd_mla_varlen on b sequences of sq queries and sk keys."""
+    d, d_pe, dv = 128, 64, 128
+    q = torch.randn((b * sq, hq, d + d_pe), device=device, dtype=torch.float32)
+    q = q.to(FP8_DTYPE)
+    # k and v are views of one buffer and k_pe a view of the latent, as in vLLM.
+    kv = torch.randn((b * sk, hk, d + dv), device=device, dtype=torch.float32)
+    k, v = kv.to(FP8_DTYPE).split([d, dv], dim=-1)
+    latent = torch.randn((b * sk, 512 + d_pe), device=device, dtype=torch.float32)
+    k_pe = latent.to(FP8_DTYPE)[:, 512:].unsqueeze(1)
+    cu_q = torch.arange(0, b + 1, device=device, dtype=torch.int32) * sq
+    cu_k = torch.arange(0, b + 1, device=device, dtype=torch.int32) * sk
+    o = torch.empty((b * sq, hq, dv), device=device, dtype=torch.bfloat16)
+
+    def run():
+        mha_fwd_mla_varlen(q, k, v, k_pe, cu_q, cu_k, sq, sk, causal=causal, out=o)
+
+    ms = triton.testing.do_bench_cudagraph(run, rep=rep)
+    flops = 2.0 * b * hq * num_pairs(sq, sk, causal) * (d + d_pe + dv)
+    num_bytes = (
+        b * sq * hq * (d + d_pe)
+        + b * sk * (hk * (d + dv) + d_pe)
+        + 2 * b * sq * hq * dv
+    )
+    return {
+        "us": ms * 1e3,
+        "tflops": flops * 1e-12 / (ms * 1e-3),
+        "tbps": num_bytes * 1e-12 / (ms * 1e-3),
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument(
+        "--variant",
+        choices=("default", "mla_varlen"),
+        default="default",
+        help="default: mha_fwd on [B, H, S, D]; mla_varlen: mha_fwd_mla_varlen",
     )
     parser.add_argument("--batch", type=int, default=1)
     parser.add_argument("--q_heads", type=int, default=32, help="number of query heads")
@@ -111,6 +160,27 @@ def main():
     assert (
         not args.causal or seqlen_k >= args.seqlen_q
     ), f"--causal requires --seqlen_k ({seqlen_k}) >= --seqlen_q ({args.seqlen_q})"
+
+    if args.variant == "mla_varlen":
+        print("MHA fwd fp8, variant mla_varlen (qk 128 + 64 PE, v 128)")
+        print(
+            f"{'B':>4} {'HQ':>4} {'HK':>4} {'SQ':>7} {'SK':>7} {'us':>10} {'TFLOP/s':>10} {'TB/s':>9}"
+        )
+        r = bench_mla_varlen_case(
+            args.batch,
+            args.q_heads,
+            k_heads,
+            args.seqlen_q,
+            seqlen_k,
+            args.causal,
+            args.rep,
+            device,
+        )
+        print(
+            f"{args.batch:>4} {args.q_heads:>4} {k_heads:>4} {args.seqlen_q:>7} {seqlen_k:>7} "
+            f"{r['us']:>10.2f} {r['tflops']:>10.2f} {r['tbps']:>9.2f}"
+        )
+        return
 
     print("MHA fwd fp8")
     print(
