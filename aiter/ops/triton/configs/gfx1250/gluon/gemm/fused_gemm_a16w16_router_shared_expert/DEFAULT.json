@@ -3,6 +3,7 @@
         8,
         12,
         32,
+        80,
         192,
         384
     ],
@@ -40,6 +41,18 @@
         "num_warps": 2,
         "WARPS_N1": 2,
         "WARPS_N2": 2,
+        "PROGRAMS_PER_CU": 1
+    },
+    "M_LEQ_80": {
+        "BLOCK_M": 16,
+        "BLOCK_N1": 64,
+        "BLOCK_K1": 256,
+        "NUM_BUFFERS1": 6,
+        "BLOCK_N2": 64,
+        "BLOCK_K2": 128,
+        "num_warps": 4,
+        "WARPS_N1": 4,
+        "WARPS_N2": 4,
         "PROGRAMS_PER_CU": 1
     },
     "M_LEQ_192": {
