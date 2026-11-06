@@ -434,6 +434,7 @@ def pa_decode(
     max_context_length: int | None = None,
     mask_unowned_kv: bool = True,
     store_output: bool = True,
+    quantized_pad_rows: int = 0,
 ) -> None:
     """Decode FP8 or BF16 K/V using 256-token compute tiles.
 
@@ -469,7 +470,10 @@ def pa_decode(
     that omit both tensors retain the existing output and dispatch unchanged.
     With the quantized output, ``store_output=False`` skips the BF16/FP16
     store: ``output`` then only fixes the layout and its contents are left
-    unspecified.
+    unspecified. ``quantized_pad_rows`` extra rows of ``quantized_output`` and
+    ``output_scale`` past the query rows (a token bucket padded past the
+    scheduled tokens) are written as FP8 zeros with a unit descale by the same
+    launch, so a consumer of the whole bucket reads finite, inert rows.
 
     MTP lengths include the query tokens and use dense causal masking.
     Independently selected sparse queries need separate table rows and
@@ -566,6 +570,14 @@ def pa_decode(
         )
     if not (store_output or quant_output):
         raise ValueError("store_output=False requires quantized_output")
+    if (
+        isinstance(quantized_pad_rows, bool)
+        or not isinstance(quantized_pad_rows, int)
+        or quantized_pad_rows < 0
+    ):
+        raise ValueError("quantized_pad_rows must be a nonnegative int")
+    if quantized_pad_rows and not quant_output:
+        raise ValueError("quantized_pad_rows requires quantized_output")
     if query_scale is not None:
         raise NotImplementedError(
             "pa_decode does not support externally quantized FP8 queries"
@@ -804,17 +816,22 @@ def pa_decode(
                 "quantized PA output requires query_length=1, one KV head, "
                 "GQA=16, head_dim=128, page16, no sinks and no sliding window"
             )
-        if quantized_output.shape != output.shape:
+        expected_quant_shape = (
+            output.shape[0] + quantized_pad_rows,
+            *output.shape[1:],
+        )
+        if tuple(quantized_output.shape) != expected_quant_shape:
             raise ValueError(
-                "quantized_output shape must match output, "
-                f"got {tuple(quantized_output.shape)} vs {tuple(output.shape)}"
+                "quantized_output shape must be output's plus quantized_pad_rows "
+                f"rows, got {tuple(quantized_output.shape)} vs "
+                f"{expected_quant_shape}"
             )
         if quantized_output.dtype != dtypes.fp8:
             raise TypeError(
                 f"quantized_output must use OCP FP8 ({dtypes.fp8}), "
                 f"got {quantized_output.dtype}"
             )
-        expected_scale_shape = (total_q_rows, 1)
+        expected_scale_shape = (total_q_rows + quantized_pad_rows, 1)
         if output_scale.shape != expected_scale_shape:
             raise ValueError(
                 f"output_scale shape {tuple(output_scale.shape)} must be "
@@ -1074,6 +1091,7 @@ def pa_decode(
     quant_after_output = quant_output and not (
         one_partition_output or cluster_merge == 8
     )
+    padded_quantized = (quantized_output, output_scale)
     if quant_after_output:
         quant_output = False
         if not store_output:
@@ -1194,6 +1212,8 @@ def pa_decode(
                 if quant_output
                 else flyc.from_c_void_p(fx.Float32, 0)
             ),
+            # Rows of the FP8 output, padded ones included.
+            int(total_q_rows + quantized_pad_rows) if quant_output else int(num_seqs),
         )
     with torch.cuda.device(dev):
         s = torch.cuda.current_stream(dev)
@@ -1265,6 +1285,12 @@ def pa_decode(
             from ..quant import dynamic_per_token_scaled_quant
 
             rows = output.shape[0]
+            quantized_output, output_scale = padded_quantized
             dynamic_per_token_scaled_quant(
-                quantized_output.view(rows, -1), output.view(rows, -1), output_scale
+                quantized_output[:rows].view(rows, -1),
+                output.view(rows, -1),
+                output_scale[:rows],
             )
+            if quantized_pad_rows:
+                quantized_output[rows:].zero_()
+                output_scale[rows:].fill_(1.0)
