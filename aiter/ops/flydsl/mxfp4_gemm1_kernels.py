@@ -33,10 +33,14 @@ def _get_compiled_mxfp4_gemm1_port(
     native_scale_layout=False,
     num_waves=4,
     k_wave=1,
+    ep32=False,
 ):
-    from .kernels.mxfp4_gemm1 import compile_gemm1_a4w4_port
+    if ep32:
+        from .kernels.mxfp4_gemm1_ep32 import compile_gemm1_ep32 as compile_gemm1
+    else:
+        from .kernels.mxfp4_gemm1 import compile_gemm1_a4w4_port as compile_gemm1
 
-    return compile_gemm1_a4w4_port(
+    return compile_gemm1(
         BM,
         use_nt,
         inline_quant,
@@ -231,27 +235,33 @@ def flydsl_mxfp4_gemm1(
     stream=None,
     num_waves=4,
     k_wave=1,
+    ep32=False,
 ):
-    """Launch GEMM1; v2 output keeps payload rows in expert-sorted order."""
-    _assert_supported(
-        D_HIDDEN=D_HIDDEN,
-        D_INTER=D_INTER,
-        BM=BM,
-        use_nt=use_nt,
-        inline_quant=inline_quant,
-        prefetch_hidden=prefetch_hidden,
-        BN=BN,
-        BK=BK,
-        a_dtype=a_dtype,
-        out_dtype=out_dtype,
-        act=act,
-        situ_beta=situ_beta,
-        situ_linear_beta=situ_linear_beta,
-        swiglu_limit=swiglu_limit,
-        num_waves=num_waves,
-        native_scale_layout=native_scale_layout,
-        k_wave=k_wave,
-    )
+    """Launch GEMM1; v2 output keeps payload rows in expert-sorted order.
+
+    ep32 selects the dedicated EP32 A8W4 kernel, which validates its own
+    configuration at compile time.
+    """
+    if not ep32:
+        _assert_supported(
+            D_HIDDEN=D_HIDDEN,
+            D_INTER=D_INTER,
+            BM=BM,
+            use_nt=use_nt,
+            inline_quant=inline_quant,
+            prefetch_hidden=prefetch_hidden,
+            BN=BN,
+            BK=BK,
+            a_dtype=a_dtype,
+            out_dtype=out_dtype,
+            act=act,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
+            swiglu_limit=swiglu_limit,
+            num_waves=num_waves,
+            native_scale_layout=native_scale_layout,
+            k_wave=k_wave,
+        )
     from .kernels.mxfp4_gemm1 import gemm1_grid
 
     launch = _get_compiled_mxfp4_gemm1_port(
@@ -276,6 +286,7 @@ def flydsl_mxfp4_gemm1(
         native_scale_layout,
         num_waves,
         k_wave,
+        ep32,
     )
     grid = gemm1_grid(n_tokens, BM, NE=NE, TOPK=topk, INTER=D_INTER, BN=BN)
     _moe_kernels._run_compiled(
