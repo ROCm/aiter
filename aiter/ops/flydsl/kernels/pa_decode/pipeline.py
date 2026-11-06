@@ -1171,7 +1171,6 @@ class Gfx1250Bf16WavePipeline:
             ctx.planned_start * KV_COMPUTE_BLOCK,
             ctx.planned_end * KV_COMPUTE_BLOCK,
         )
-        self.mem.stage_bf16_page(begin, fx.Int32(0))
         # Wave 2 g + p takes tokens [64 p, 64 p + 64) of each page for tiles
         # 2 g and 2 g + 1. Its slot 0 holds tile 2 g + p, the one it stores.
         part = ctx.warp % 2
@@ -1210,6 +1209,9 @@ class Gfx1250Bf16WavePipeline:
             uppers.append(
                 unmasked_end + row // t.query_group_size - 8 * ctx.half - 64 * part
             )
+        # Keep the Q loads ahead of the first page's table lookup.
+        fx.rocdl.sched_barrier(0)
+        self.mem.stage_bf16_page(begin, fx.Int32(0))
         # After the query loads, which the first page's QK waits for too.
         if begin + 128 < end:
             self.mem.stage_bf16_page(begin + 128, fx.Int32(1))
