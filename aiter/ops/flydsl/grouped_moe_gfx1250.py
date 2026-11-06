@@ -817,6 +817,26 @@ def _grouped_a8w4_tdm_moe(
         and token_num * topk <= _FUSED_ROUTE_PSUM_MAX_NUMEL
         and int(E) <= _FUSED_ROUTE_PSUM_MAX_EXPERTS
     )
+    # ...and that route then rides the activation quant: each quant workgroup
+    # re-derives the counts and prefix in LDS, so the route launch disappears
+    # without a grid-wide wait. bf16 in, no A-preshuffle, and not the batches
+    # that take the compact-scale quant pair.
+    _fuse_tp_route_quant = (
+        _fused_tp_route
+        and _fuse_tp_route_quant_enabled()
+        and int(E) <= _FUSE_TP_ROUTE_QUANT_MAX_EXPERTS
+        and token_num * topk <= _FUSE_TP_ROUTE_QUANT_MAX_NUMEL
+        and a1_scale is None
+        and hidden_states.dtype == torch.bfloat16
+        and not _a_preshuffle_requested
+        and not _use_fused_quant_preshuffle(
+            model_dim,
+            wmma_rep,
+            "fp4" if data_format == "fp4" else "fp8",
+            token_num,
+            topk,
+        )
+    )
     if _compact:
         _masked_m = stage2_scatter.compact_masked_m
         topids_to_rows = None
@@ -948,12 +968,27 @@ def _grouped_a8w4_tdm_moe(
         and os.environ.get("AITER_TDM_FUSE_PSUM_QUANT", "1") in ("1", "true", "True")
     )
     ep_psum_params = None
+    tp_route_params = None
     if _compact:
         psum = stage2_scatter.compact_psum
     elif _fuse_ep_route_quant:
         psum = None
     elif herd_psum is not None:
         psum = herd_psum
+    elif _fuse_tp_route_quant:
+        # Written by the quant launch below, which owns the route.
+        _masked_m = torch.empty(int(E), dtype=torch.int32, device=device)
+        psum = torch.empty(int(E), dtype=torch.int32, device=device)
+        topids_to_rows = torch.empty(
+            (token_num, topk), dtype=torch.int32, device=device
+        )
+        tp_route_params = {
+            "topk_ids": topk_ids,
+            "masked_m": _masked_m,
+            "psum": psum,
+            "experts": int(E),
+            "tile_m": int(_align_m),
+        }
     elif _fused_tp_route:
         _masked_m, topids_to_rows, psum = fused_route_psum_remap(
             topk_ids, E, max_m, _align_m
@@ -1163,6 +1198,7 @@ def _grouped_a8w4_tdm_moe(
             ep_psum_params=ep_psum_params,
             row_major_scale=_row_major_a1,
             payload_preshuffled=a_preshuffled,
+            tp_route_params=tp_route_params,
         )
         if _compact_ascale:
             a1_scale = flydsl_moe_scatter_preshuffle_scale(
@@ -1987,6 +2023,18 @@ def _get_compiled_route_psum_fused():
 # are both one slot per lane.
 _FUSED_ROUTE_PSUM_MAX_NUMEL = 2048
 _FUSED_ROUTE_PSUM_MAX_EXPERTS = 512
+# The route fused into the quant launch: one LDS counter per thread of the
+# 256-thread quant block, and every quant workgroup reads all ids.
+_FUSE_TP_ROUTE_QUANT_MAX_EXPERTS = 256
+_FUSE_TP_ROUTE_QUANT_MAX_NUMEL = _FUSED_ROUTE_PSUM_MAX_NUMEL
+
+
+def _fuse_tp_route_quant_enabled() -> bool:
+    return os.environ.get("AITER_TDM_FUSE_TP_ROUTE_QUANT", "1") in (
+        "1",
+        "true",
+        "True",
+    )
 
 
 def fused_route_psum_remap(
