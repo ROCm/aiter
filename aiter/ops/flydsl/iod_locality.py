@@ -6,7 +6,7 @@
 A 16 KiB granule at ``addr`` is homed on IOD domain
 ``a14 ^ a17 ^ a20 ^ phase[addr >> 21]``; the per-2 MiB-page phase is
 physical, so it is probed once per allocation (``kernels/iod_loc_probe``).
-Workgroup b runs on domain ``((b + 3) % 8) >= 4``.
+Workgroup b runs on domain ``((b + 3) % 8) >= 4`` when the whole grid runs.
 
 ``place_w13`` (``aiter.ops.shuffle.moe_shuffle_weight_iod``, at weight-load
 time) re-lays the preshuffled W1 ([E, N/16, K/2*16] bytes) and its
@@ -68,7 +68,15 @@ def _place(w, w_scales, E, N, K, tile_n, tile_k):
     raw = torch.empty((npg + 2) * PAGE, dtype=torch.uint8, device=w.device)
     off = (-raw.data_ptr()) % PAGE
     buf = raw[off : off + (npg + 1) * PAGE]
-    phase, weak = _probe(buf[PAGE:])
+    phase, weak, agree = _probe(buf[PAGE:])
+    if phase is None:
+        logger.warning(
+            "[iod_locality] workgroup classes off the IOD domain formula "
+            "(agreement %s); W1 %s stays unplaced",
+            np.round(agree, 2).tolist(),
+            tuple(w.shape),
+        )
+        return None
     ph = torch.from_numpy(np.append(phase, phase[-1]).astype(np.int32))
     buf[: ph.numel() * 4].copy_(ph.view(torch.uint8))
 
@@ -94,11 +102,12 @@ def _place(w, w_scales, E, N, K, tile_n, tile_k):
     torch.cuda.synchronize()
     buf._iod_raw = raw
     logger.info(
-        "[iod_locality] placed W1 %s: %.3f GB, %d pages, weak %d",
+        "[iod_locality] placed W1 %s: %.3f GB, %d pages, weak %d, class agreement >= %.3f",
         tuple(w.shape),
         buf.numel() / 1e9,
         npg,
         weak,
+        agree.min(),
     )
     return buf
 
@@ -125,7 +134,8 @@ def place_w13(w13: torch.Tensor, w13_scale: torch.Tensor, experts_cnt=None):
     ``moe_shuffle_scale`` (GUGU, gate_up), which stay valid and in use: tilings
     other than 256 x 256 keep reading them. Call once per layer at weight-load
     time, outside CUDA graph capture. Returns the placed buffer, or None when
-    the shape has no placed layout.
+    the shape has no placed layout or the probe finds pages whose IOD home
+    does not follow the address formula.
     """
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError("IOD placement must run before CUDA graph capture")
@@ -141,6 +151,8 @@ def place_w13(w13: torch.Tensor, w13_scale: torch.Tensor, experts_cnt=None):
     if hit is not None:
         return hit[0]
     buf = _place(w, sc, E, N, K, PLACED_TILE_N, PLACED_TILE_K)
+    if buf is None:
+        return None
     # Holding the sources keeps their addresses, the key, from being reused.
     _PLACED[key] = (buf, w, sc, N, K)
     return buf
