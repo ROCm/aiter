@@ -2194,10 +2194,13 @@ template <typename scalar_t, typename cache_t, bool IS_NEOX>
     float f32_cos = static_cast<float>(cos);
     float f32_sin = static_cast<float>(sin);
     if constexpr (std::is_same_v<cache_t, opus::fp8_t>) {
-        arr_out[x_index] = opus::cast<cache_t>(
-                (f32_x * f32_cos - f32_y * f32_sin) * inv_scale);
-        arr_out[y_index] = opus::cast<cache_t>(
-                (f32_y * f32_cos + f32_x * f32_sin) * inv_scale);
+        // Saturate like the nope part; a bare cast turns a value past the fp8 range into NaN.
+        const auto rot = aiter::scaled_cast<opus::fp8_t>(
+            fp32x2_t{f32_x * f32_cos - f32_y * f32_sin,
+                     f32_y * f32_cos + f32_x * f32_sin},
+            inv_scale);
+        arr_out[x_index] = rot[0];
+        arr_out[y_index] = rot[1];
     } else {
         arr_out[x_index] = opus::cast<cache_t>((f32_x * f32_cos - f32_y * f32_sin));
         arr_out[y_index] = opus::cast<cache_t>((f32_y * f32_cos + f32_x * f32_sin));

@@ -318,16 +318,25 @@ def make_q_nope(
     raise ValueError(f"Unsupported q_nope_layout: {q_nope_layout}")
 
 
-def check_fused_rope_fp8_saturates(device: str, kv_lora_rank: int, is_neox: bool):
+def check_fused_rope_fp8_saturates(
+    device: str,
+    kv_lora_rank: int,
+    is_neox: bool,
+    tokens: int = 4,
+    heads: int = 16,
+    kv_heads: int | None = None,
+    dtype: torch.dtype = dtypes.bf16,
+):
     """FP8 q_out and KV cache clamp to the fp8 range in the rope part as in the
-    nope part; a bare cast turned rope values past it into NaN. kv_lora_rank 512
-    runs the head-grouped kernel; other ranks run the per-head and general ones."""
-    tokens, heads = 4, 16
+    nope part; a bare cast turned rope values past it into NaN. The shape picks
+    the kernel (see FUSED_ROPE_FP8_SATURATE_CASES); kv_heads=None passes 2-D
+    kv_c/k_pe (decode), an int passes [tokens, kv_heads, ...] (prefill/GQA)."""
     fp8_max = torch.finfo(dtypes.fp8).max
-    q_nope = torch.randn(tokens, heads, kv_lora_rank, dtype=dtypes.bf16, device=device)
-    q_pe = torch.randn(tokens, heads, 64, dtype=dtypes.bf16, device=device)
-    kv_c = torch.randn(tokens, kv_lora_rank, dtype=dtypes.bf16, device=device)
-    k_pe = torch.randn(tokens, 64, dtype=dtypes.bf16, device=device)
+    kv_shape = (tokens,) if kv_heads is None else (tokens, kv_heads)
+    q_nope = torch.randn(tokens, heads, kv_lora_rank, dtype=dtype, device=device)
+    q_pe = torch.randn(tokens, heads, 64, dtype=dtype, device=device)
+    kv_c = torch.randn(*kv_shape, kv_lora_rank, dtype=dtype, device=device)
+    k_pe = torch.randn(*kv_shape, 64, dtype=dtype, device=device)
     for t in (q_nope, q_pe, kv_c, k_pe):
         # Both ends of the row, so the rope part's x and y lanes both saturate
         # in the neox (halves) and GPT-J (interleaved) layouts.
@@ -335,15 +344,17 @@ def check_fused_rope_fp8_saturates(device: str, kv_lora_rank: int, is_neox: bool
             t.view(-1, t.shape[-1])[:, cols] = sign * 4 * fp8_max
         t.view(-1, t.shape[-1])[:, -2:] = -4 * fp8_max
     kv_cache = torch.zeros(
-        tokens, 1, kv_lora_rank + 64, dtype=dtypes.fp8, device=device
+        tokens, 1, kv_heads or 1, kv_lora_rank + 64, dtype=dtypes.fp8, device=device
     )
+    if kv_heads is None:
+        kv_cache = kv_cache.view(tokens, 1, kv_lora_rank + 64)
     q_out = torch.empty(
         tokens, heads, kv_lora_rank + 64, dtype=dtypes.fp8, device=device
     )
     one = torch.ones(1, dtype=torch.float32, device=device)
     # One identity rope row: rope leaves the values as they are.
-    cos = torch.ones(1, 32, dtype=dtypes.bf16, device=device)
-    sin = torch.zeros(1, 32, dtype=dtypes.bf16, device=device)
+    cos = torch.ones(1, 32, dtype=dtype, device=device)
+    sin = torch.zeros(1, 32, dtype=dtype, device=device)
     aiter.fused_qk_rope_concat_and_cache_mla(
         q_nope,
         q_pe,
@@ -365,9 +376,24 @@ def check_fused_rope_fp8_saturates(device: str, kv_lora_rank: int, is_neox: bool
     expect_k = torch.cat((kv_c, k_pe), -1).float().clamp(-fp8_max, fp8_max)
     torch.testing.assert_close(q_out.float(), expect_q.to(dtypes.fp8).float())
     torch.testing.assert_close(
-        kv_cache.view(tokens, kv_lora_rank + 64).float(),
-        expect_k.to(dtypes.fp8).float(),
+        kv_cache.view(expect_k.shape).float(), expect_k.to(dtypes.fp8).float()
     )
+
+
+# (kv_lora_rank, tokens, heads, kv_heads, dtype) -> the kernel the host dispatch
+# in fused_qk_rope_concat_and_cache_mla picks for it.
+FUSED_ROPE_FP8_SATURATE_CASES = {
+    "head-grouped (HPT)": (512, 4, 16, None, dtypes.bf16),
+    "per-head decode, rank 256": (256, 4, 16, None, dtypes.bf16),
+    "per-head decode, rank 128": (128, 4, 16, None, dtypes.bf16),
+    # FP32 input rules out HPT and 256 tokens the per-head kernel, so this is
+    # the optimized decode kernel, whose K rope goes through
+    # apply_token_rotary_embedding.
+    "optimized decode": (512, 256, 8, None, torch.float32),
+    "general decode": (256, 256, 16, None, dtypes.bf16),
+    "optimized prefill": (512, 4, 16, 2, dtypes.bf16),
+    "general prefill": (256, 4, 16, 2, dtypes.bf16),
+}
 
 
 @benchmark()
@@ -869,9 +895,20 @@ if "normal" in args.case:
 
 
 if "fused_qk" in args.case:
-    for kv_lora_rank in (512, 256, 128):
+    for case, (
+        rank,
+        tokens,
+        heads,
+        kv_heads,
+        dtype,
+    ) in FUSED_ROPE_FP8_SATURATE_CASES.items():
         for is_neox in (True, False):
-            check_fused_rope_fp8_saturates(args.device, kv_lora_rank, is_neox)
+            try:
+                check_fused_rope_fp8_saturates(
+                    args.device, rank, is_neox, tokens, heads, kv_heads, dtype
+                )
+            except AssertionError as e:
+                raise AssertionError(f"{case}, {is_neox=}: {e}") from e
     df = []
     for num_token in args.token:
         num_blocks = num_token // args.block_size
