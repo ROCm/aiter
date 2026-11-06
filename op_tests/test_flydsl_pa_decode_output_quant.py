@@ -60,6 +60,9 @@ def test_sparse_pa_output_quant_matches_separate_kernel(
     """``pad`` extra FP8 rows (a token bucket padded past the scheduled rows)
     must come out as zero bytes with a unit descale from the same call."""
     pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    # Launches recorded by earlier cases of the same shape would skip the
+    # checked path this test inspects: start from an empty table.
+    monkeypatch.setattr(pa, "_VALIDATED_LAUNCHES", {})
     torch.manual_seed(393)
     page, head_dim, max_context = 16, 128, 2048
     pages = max_context // page
@@ -210,6 +213,25 @@ def test_sparse_pa_output_quant_matches_separate_kernel(
 
     # A repeated call with the same signature takes the validated launch
     # (no dispatch); the split fallback keeps the checked path.
+    calls = len(compile_calls)
+    output.fill_(float("nan"))
+    output_fp8.view(torch.uint8).fill_(0x7F)
+    output_scale.fill_(float("nan"))
+    launch(quantized=True)
+    check()
+    assert len(compile_calls) == (calls + 1 if mode == "split" else calls)
+
+    # Another plan with the same fields (the next forward's plan) takes the
+    # same recorded launch: the key holds the plan's fields, not its identity.
+    first_plan = plan  # alive, so the new plan cannot reuse its id
+    plan = pa.plan_pa_decode(
+        context,
+        1,
+        max_partitions=max_partitions,
+        max_batch_size=max_batch_size,
+        query_length=1,
+    )
+    assert plan is not first_plan
     calls = len(compile_calls)
     output.fill_(float("nan"))
     output_fp8.view(torch.uint8).fill_(0x7F)
