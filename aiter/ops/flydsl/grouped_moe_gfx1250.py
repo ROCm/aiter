@@ -17,6 +17,7 @@ import threading
 import flydsl.expr as fx
 import torch
 
+from aiter.utility.env_once import env_once
 from aiter import ActivationType, QuantType, dtypes, logger
 from aiter.jit.utils.build_targets import base_gfx_arch
 from aiter.jit.utils.chip_info import get_gfx
@@ -231,7 +232,7 @@ def _find_grouped_config(
     if ep_specific:
         matches = ep_specific
     if not matches:
-        if os.environ.get("AITER_GROUPED_DEBUG", "0") not in (
+        if env_once("AITER_GROUPED_DEBUG", "0") not in (
             "",
             "0",
             "false",
@@ -290,7 +291,7 @@ def _find_grouped_config(
 
 
 def _use_grouped_gemm_enabled() -> bool:
-    env_enabled = os.environ.get("AITER_USE_GROUPED_GEMM", "0") in _TRUTHY_ENV
+    env_enabled = env_once("AITER_USE_GROUPED_GEMM", "0") in _TRUTHY_ENV
     is_gfx1250 = get_gfx() in ("gfx1250", "gfx1250-strict")
     return env_enabled or is_gfx1250
 
@@ -400,7 +401,7 @@ def _compact_scale_min_tokens(wmma_rep: int) -> int:
     default = (
         _COMPACT_MIN_TOKENS_NARROW_STRIDE if wmma_rep == 1 else _COMPACT_MIN_TOKENS
     )
-    raw = os.environ.get("AITER_FLYDSL_COMPACT_SCALE_MIN_TOKENS")
+    raw = env_once("AITER_FLYDSL_COMPACT_SCALE_MIN_TOKENS")
     if raw is None:
         return default
     try:
@@ -444,7 +445,7 @@ def _use_fused_quant_preshuffle(
         return True
     # A valid explicit threshold is a tuning override, not an automatic
     # policy choice. Keep its existing power to force compact scales.
-    threshold = os.environ.get("AITER_FLYDSL_COMPACT_SCALE_MIN_TOKENS")
+    threshold = env_once("AITER_FLYDSL_COMPACT_SCALE_MIN_TOKENS")
     if threshold is not None:
         try:
             int(threshold)
@@ -549,7 +550,7 @@ def _build_g2l_lut(
     n = expert_mask.numel()
     # nvr is only folded in when both the dynamic-token scalar and topk are known.
     _want_nvr = nvt is not None and topk is not None
-    if os.environ.get("AITER_G2L_TORCH", "0") not in _TRUTHY_ENV and n <= _G2L_MAX_N:
+    if env_once("AITER_G2L_TORCH", "0") not in _TRUTHY_ENV and n <= _G2L_MAX_N:
         try:
             mask = (
                 expert_mask.to(device=device, dtype=torch.int32)
@@ -574,7 +575,7 @@ def _build_g2l_lut(
                 max_experts=512 if n <= 512 else 1024,
                 clear_counter=not (
                     _flydsl_dispatch_context() is not None
-                    and os.environ.get("AITER_TDM_DIRECT_EP_MASK", "1")
+                    and env_once("AITER_TDM_DIRECT_EP_MASK", "1")
                     in ("1", "true", "True")
                 ),
             )
@@ -957,7 +958,7 @@ def _grouped_a8w4_tdm_moe(
             # device=cuda) would allocate a CPU tensor and cudaMemcpy it, which
             # capture rejects unless pinned.
             _ep_nvt = torch.full((1,), int(token_num), dtype=torch.int32, device=device)
-        _direct_ep_mask = _flydsl_dispatch_context() is not None and os.environ.get(
+        _direct_ep_mask = _flydsl_dispatch_context() is not None and env_once(
             "AITER_TDM_DIRECT_EP_MASK", "1"
         ) in (
             "1",
@@ -976,7 +977,7 @@ def _grouped_a8w4_tdm_moe(
                 torch.uint8,
                 dtypes.fp4x2,
             )
-            and os.environ.get("AITER_TDM_FUSE_ROUTE_QUANT", "0")
+            and env_once("AITER_TDM_FUSE_ROUTE_QUANT", "0")
             in ("1", "true", "True")
         )
         if _fuse_ep_route_quant:
@@ -1072,7 +1073,7 @@ def _grouped_a8w4_tdm_moe(
         and int(E) <= 256
         and dtype in (torch.bfloat16, dtypes.bf16)
         and _flydsl_dispatch_context() is not None
-        and os.environ.get("AITER_TDM_FUSE_PSUM_QUANT", "1") in ("1", "true", "True")
+        and env_once("AITER_TDM_FUSE_PSUM_QUANT", "1") in ("1", "true", "True")
     )
     ep_psum_params = None
     tp_route_params = None
@@ -1223,7 +1224,7 @@ def _grouped_a8w4_tdm_moe(
     # (measured: gemm1 +18%, net +9us/layer at 4k tokens), and on tiny decode
     # batches (<~1k tokens) the small-M gemm1 regresses too. Gate on both so
     # prefill and ramp steps keep the original interleaved store untouched.
-    _rm_min_tokens = int(os.environ.get("AITER_TDM_ROW_MAJOR_A1_MIN_TOKENS", "1024"))
+    _rm_min_tokens = int(env_once("AITER_TDM_ROW_MAJOR_A1_MIN_TOKENS", "1024"))
     _row_major_a1 = (
         _prequantized
         and not a_preshuffled
@@ -1232,7 +1233,7 @@ def _grouped_a8w4_tdm_moe(
         and ep_psum_params is None
         and int(tile_m) >= 256
         and int(token_num) >= _rm_min_tokens
-        and os.environ.get("AITER_TDM_ROW_MAJOR_A1_SCALE", "1") in ("1", "true", "True")
+        and env_once("AITER_TDM_ROW_MAJOR_A1_SCALE", "1") in ("1", "true", "True")
     )
     _row_major_ascale = (_compact and _prequantized) or _row_major_a1
     # Local quant instead writes one compact row-major row per token and rebuilds
@@ -1330,7 +1331,7 @@ def _grouped_a8w4_tdm_moe(
     # kernel epilogue, eliminating the standalone
     # flydsl_moe_fused_quant_preshuffle call between gemm1 and gemm2.
     disable_gemm1_requant = _as_bool(
-        os.environ.get("AITER_FLYDSL_DISABLE_GEMM1_REQUANT"), False
+        env_once("AITER_FLYDSL_DISABLE_GEMM1_REQUANT"), False
     )
     _fuse_quant = not disable_gemm1_requant
     w1_u8 = _grouped_weight_uint8(w1)
@@ -1745,7 +1746,7 @@ def grouped_gemm_gfx1250_a8w4(
 
     # Read once per call (still honours a runtime change of the variable): when
     # it is off -- always, in serving -- no debug message is formatted at all.
-    _dbg_on = os.environ.get("AITER_GROUPED_DEBUG", "0") not in (
+    _dbg_on = env_once("AITER_GROUPED_DEBUG", "0") not in (
         "",
         "0",
         "false",
@@ -1806,7 +1807,7 @@ def grouped_gemm_gfx1250_a8w4(
     if not _use_grouped_gemm_enabled():
         _grouped_dbg("AITER_USE_GROUPED_GEMM not enabled; skip grouped mode")
         return None
-    if os.environ.get("AITER_DISABLE_GROUPED_A8W4", "0") == "1":
+    if env_once("AITER_DISABLE_GROUPED_A8W4", "0") == "1":
         _grouped_dbg("AITER_DISABLE_GROUPED_A8W4 enabled; skip grouped mode")
         return None
     _is_ep = expert_mask is not None
@@ -1847,10 +1848,10 @@ def grouped_gemm_gfx1250_a8w4(
     # lazily so the native-arch path skips the four env reads).
     if get_gfx() not in ("gfx1250", "gfx1250-strict"):
         _gfx_env = ";".join(
-            str(os.environ.get(k, "")).lower()
+            str(env_once(k, "")).lower()
             for k in ("GPU_ARCHS", "TARGET_ARCH", "AITER_GPU_ARCHS")
         )
-        _force_gfx1250 = os.environ.get("AITER_FORCE_GFX1250", "0") in _TRUTHY_ENV
+        _force_gfx1250 = env_once("AITER_FORCE_GFX1250", "0") in _TRUTHY_ENV
         if "gfx1250" not in _gfx_env and not _force_gfx1250:
             return None
 
@@ -1993,7 +1994,7 @@ def grouped_gemm_gfx1250_a8w4(
         # _NUM_BUFFERS2) to sweep the felix TDM batched GEMM tiles, and
         # AITER_TDM_M_WARP / _N_WARP (+ *_M_WARP2/_N_WARP2) to sweep the wave grid.
         def _tdm_env(name):
-            v = os.environ.get(name)
+            v = env_once(name)
             return int(v) if (v is not None and v != "") else None
 
         _ov_m = _tdm_env("AITER_TDM_TILE_M")
