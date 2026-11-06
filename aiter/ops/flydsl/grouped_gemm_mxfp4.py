@@ -174,7 +174,14 @@ def flydsl_grouped_gemm_a8w4_masked(
             "preshuffled MXFP4 quant output requires N divisible by 256 "
             "and tile_n divisible by 64"
         )
-    from .kernels.mxfp4_preshuffle_gfx1250_tdm import launch_gemm_a8w4_tdm
+    from flydsl.expr import rocdl
+
+    from .kernels.mxfp4_preshuffle_gfx1250_tdm import (
+        SUPPORT_EXPLICIT_VGPR_PARTITION,
+        get_gemm_a8w4_tdm_register_launcher,
+        is_explicit_vgpr_partition_available,
+        launch_gemm_a8w4_tdm,
+    )
 
     if stream is None:
         stream = torch.cuda.current_stream()
@@ -283,6 +290,31 @@ def flydsl_grouped_gemm_a8w4_masked(
         rolled_drain,
         int(a_preshuffled),
     )
+    explicit_vgpr_partition = int(SUPPORT_EXPLICIT_VGPR_PARTITION)
+    if (a_is_fp4 and a_preshuffled and not persistent_workers
+            and tile_m == 64 and m_warp == 1 and n_warp == 4
+            and num_buffers == 3
+            and (tile_n, tile_k) in ((256, 256), (512, 128))):
+        # The narrow-N tile fits the automatic allocation without spilling;
+        # high fixed registers unnecessarily restrict its wave residency.
+        # The wide-N tile needs the larger register budget to avoid scratch
+        # spills. Tune the tile, independently of expert count or routing.
+        explicit_vgpr_partition = int(
+            tile_n == 512 and is_explicit_vgpr_partition_available()
+        )
+        launch_gemm_a8w4_tdm = get_gemm_a8w4_tdm_register_launcher(
+            explicit_vgpr_partition
+        )
+    elif (a_is_fp4 and a_preshuffled and not persistent_workers
+            and not enable_ep_scatter and not stage1_act and not stage1_quant_out
+            and (tile_m, tile_n, tile_k, m_warp, n_warp, num_buffers)
+                == (256, 256, 256, 2, 2, 4)
+            and cluster_m == 1
+            and callable(getattr(rocdl, "sched_vgpr", None))):
+        # The new allocator's automatic layout is slower for this output tile.
+        # Use its explicit SSA placement under either global register policy.
+        explicit_vgpr_partition = 1
+        launch_gemm_a8w4_tdm = get_gemm_a8w4_tdm_register_launcher(1)
     _run_compiled(
         launch_gemm_a8w4_tdm,
         out.view(-1),
@@ -306,6 +338,7 @@ def flydsl_grouped_gemm_a8w4_masked(
         float(situ_beta),
         float(situ_linear_beta),
         *layout_spec,
+        explicit_vgpr_partition,
         specialization_key=(
             gemm_spec,
             route_spec,
@@ -313,6 +346,7 @@ def flydsl_grouped_gemm_a8w4_masked(
             tdm_spec,
             ep_spec,
             layout_spec,
+            explicit_vgpr_partition,
         ),
     )
     return out
