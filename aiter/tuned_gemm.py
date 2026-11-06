@@ -707,6 +707,8 @@ def flydsl_gemm(
         k_waves=flydsl_config["k_waves"],
         stages=flydsl_config["stages"],
         group_m=flydsl_config["group_m"],
+        k_stagger=flydsl_config["k_stagger"],
+        b_non_temporal=flydsl_config["b_non_temporal"],
         policy=policy,
         out_dtype=None if skinny else otype,
     )

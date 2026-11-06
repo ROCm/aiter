@@ -42,7 +42,7 @@ _HGEMM_KERNEL_RE = re.compile(
     r"x(?P<stages>\d+)_ks(?P<split_k>\d+)_"
     r"w(?P<m_waves>\d+)x(?P<n_waves>\d+)x(?P<k_waves>\d+)_"
     r"bias(?P<has_bias>[01])_ktail(?P<has_k_tail>[01])_"
-    r"gm(?P<group_m>\d+)_p(?P<policy>ft|ht|hti|sk)_"
+    r"gm(?P<group_m>\d+)(?:_stg(?P<k_stagger>\d+))?(?P<b_non_temporal>_bnt)?_p(?P<policy>ft|ht|hti|sk)_"
     r"(?P<target_gfx>gfx[0-9a-z]+(?:-[0-9a-z]+)*)$"
 )
 
@@ -86,13 +86,20 @@ def flydsl_hgemm_kernel_name(
         policy = SKINNY_POLICY
     else:
         policy = "ht" if config["use_half_tile_interleaved"] else "ft"
+    k_stagger = config.get("k_stagger", 0)
+    gfx = target_gfx or get_gfx()
+    _validate_k_stagger(k_stagger, gfx, policy)
+    b_non_temporal = config.get("b_non_temporal", False)
+    _validate_b_non_temporal(b_non_temporal, gfx, policy)
+    stagger_suffix = f"_stg{k_stagger}" if k_stagger else ""
+    memory_suffix = "_bnt" if b_non_temporal else ""
     name = (
         f"flydsl_hgemm_a{dtype_name}_w{dtype_name}_{out_dtype_name}_"
         f"t{config['block_m']}x{config['block_n']}x{config['block_k']}"
         f"x{config['stages']}_ks{config['split_k']}_"
         f"w{config['m_waves']}x{config['n_waves']}x{config['k_waves']}_"
-        f"bias{int(has_bias)}_ktail0_gm{config['group_m']}_p{policy}_"
-        f"{target_gfx or get_gfx()}"
+        f"bias{int(has_bias)}_ktail0_gm{config['group_m']}{stagger_suffix}{memory_suffix}_p{policy}_"
+        f"{gfx}"
     )
     return name
 
@@ -109,6 +116,12 @@ def get_flydsl_hgemm_kernel_params(name: str) -> dict | None:
     if out_dtype not in (dtype, "fp32"):
         return None
     policy = match.group("policy")
+    k_stagger = int(match.group("k_stagger") or 0)
+    b_non_temporal = match.group("b_non_temporal") is not None
+    if (k_stagger or b_non_temporal) and (
+        match.group("target_gfx") != "gfx950" or policy == SKINNY_POLICY
+    ):
+        return None
     if policy == SKINNY_POLICY and (
         dtype != "bf16"
         or out_dtype != "bf16"
@@ -131,6 +144,8 @@ def get_flydsl_hgemm_kernel_params(name: str) -> dict | None:
         "n_waves": int(match.group("n_waves")),
         "k_waves": int(match.group("k_waves")),
         "group_m": int(match.group("group_m")),
+        "k_stagger": k_stagger,
+        "b_non_temporal": b_non_temporal,
         "use_half_tile_interleaved": policy in ("ht", "hti"),
         "policy": policy,
         "has_bias": match.group("has_bias") == "1",
@@ -138,6 +153,20 @@ def get_flydsl_hgemm_kernel_params(name: str) -> dict | None:
         "out_dtype": out_dtype,
         "target_gfx": match.group("target_gfx"),
     }
+
+
+def _validate_k_stagger(k_stagger, gfx, policy):
+    if not isinstance(k_stagger, int) or isinstance(k_stagger, bool) or k_stagger < 0:
+        raise ValueError("k_stagger must be a non-negative integer")
+    if k_stagger and (gfx != "gfx950" or policy == SKINNY_POLICY):
+        raise ValueError("k_stagger supports gfx950 ft/ht/hti policies only")
+
+
+def _validate_b_non_temporal(value, gfx, policy):
+    if not isinstance(value, bool):
+        raise ValueError("b_non_temporal must be a bool")
+    if value and (gfx != "gfx950" or policy == SKINNY_POLICY):
+        raise ValueError("b_non_temporal supports gfx950 ft/ht/hti policies only")
 
 
 def flydsl_hgemm(
@@ -157,8 +186,21 @@ def flydsl_hgemm(
     policy: str = "ft",
     out_dtype: torch.dtype | None = None,
     stream: torch.cuda.Stream | None = None,
+    k_stagger: int = 0,
+    b_non_temporal: bool = False,
 ) -> torch.Tensor:
-    """Run the A16W16 kernel for this arch with AITER's ``B[N, K]`` convention."""
+    """Run the A16W16 kernel with AITER's ``B[N, K]`` convention.
+
+    On gfx950 ft/ht/hti, ``k_stagger`` rotates each workgroup's K traversal
+    by ``(block_idx.x * k_stagger) % partition_k_tiles`` tiles, within its
+    split-K partition. Zero preserves the original traversal. Tune this
+    per shape: spreading concurrent reads can help streaming GEMMs but can
+    hurt cache reuse. Rotation changes floating-point summation order, not
+    accumulation precision or the split-K reduction protocol.
+    ``b_non_temporal`` streams B's async loads with the non-temporal cache
+    hint. It is independent of k_stagger; tune both, since shared B can
+    benefit from caching. Both options default off.
+    """
 
     if policy not in ("ft", "ht", "hti", SKINNY_POLICY):
         raise ValueError(f"Unsupported FlyDSL HGEMM policy: {policy!r}")
@@ -169,6 +211,8 @@ def flydsl_hgemm(
         raise ValueError(f"`stream` must be on {a.device}, got {launch_stream.device}")
 
     gfx = get_gfx()
+    _validate_k_stagger(k_stagger, gfx, policy)
+    _validate_b_non_temporal(b_non_temporal, gfx, policy)
     if policy == SKINNY_POLICY:
         if gfx != "gfx950":
             raise RuntimeError("The FlyDSL skinny HGEMM policy supports gfx950 only")
@@ -231,6 +275,8 @@ def flydsl_hgemm(
         "n_waves": n_waves,
         "k_waves": k_waves,
         "group_m": group_m,
+        "k_stagger": k_stagger,
+        "b_non_temporal": b_non_temporal,
         "use_half_tile_interleaved": policy in ("ht", "hti"),
     }
     return gemm_a16w16(

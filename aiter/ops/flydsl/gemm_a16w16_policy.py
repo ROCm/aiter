@@ -249,6 +249,7 @@ def get_flydsl_a16w16_configs(
     )
     out_dtype_id = GEMM_A16W16_DTYPE_FP32 if out_dtype == torch.float32 else in_dtype_id
     valid_configs = []
+    memory_configs = []
     is_large_gemm = m >= 4096 and n >= 4096 and k >= 4096
     for config in configs:
         if is_large_gemm:
@@ -288,4 +289,14 @@ def get_flydsl_a16w16_configs(
             is not None
         ):
             valid_configs.append(config)
-    return valid_configs
+            # Stagger is a measured option, never a global default. At small
+            # M, a single row tile streams B; preserve the original catalog
+            # and let tuning race stagger and B cache policy against the original.
+            if m <= 128 and m <= config["block_m"]:
+                memory_configs.extend(
+                    {**config, "k_stagger": stride, "b_non_temporal": nt}
+                    for stride in (0, 1, 3)
+                    for nt in (False, True)
+                    if stride or nt
+                )
+    return valid_configs + memory_configs

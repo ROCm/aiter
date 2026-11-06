@@ -307,6 +307,8 @@ def run_flydsl_gemm_bf16(
         k_waves=config["k_waves"],
         stages=config["stages"],
         group_m=config["group_m"],
+        k_stagger=config.get("k_stagger", 0),
+        b_non_temporal=config.get("b_non_temporal", False),
         policy="ht" if config["use_half_tile_interleaved"] else "ft",
         out_dtype=otype,
     )
