@@ -180,22 +180,35 @@ def _gfx950_split_params(params: _UAParams):
 
 
 def _gfx950_tile_size(params: _UAParams, tile: int):
-    """Widen the KV tile for shuffled full attention once the batch fills the GPU.
+    """Widen the KV tile to 128 for full attention when each program walks a
+    long KV run and the grid leaves room on the CUs.
 
-    The shuffled loader gathers per token, so it pays more per tile than the
-    dense one; a 128-key tile halves that once there are enough programs to
-    hide the longer chain. Below 128 query tokens, and for sliding windows,
-    the 64-key tile is faster. Measured for bf16 only.
+    With 16-token pages both loaders gather per token for a 64-key tile, so a
+    program pays a fixed cost per tile; a 128-key tile halves the tile count.
+    That only pays off over a long run (>= 2048 keys per program) and while
+    the wider tile's doubled LDS does not cost co-residency: past one program
+    per CU for decode, and on the 2d grid past one program per CU dense or two
+    shuffled. Sliding windows keep the 64-key tile. Measured for bf16 only.
     """
     if (
-        params.shuffled_kv_cache
-        and params.sliding_window == 0
-        and params.q_dtype == torch.bfloat16
-        and params.max_seqlen_q * params.num_queries_per_kv <= 128
-        and params.num_tokens >= 128
+        params.sliding_window > 0
+        or params.q_dtype != torch.bfloat16
+        or params.max_seqlen_q * params.num_queries_per_kv > 128
     ):
-        return max(tile, 128)
-    return tile
+        return tile
+    num_segments = get_unified_attention_config(
+        "kv_split", _gfx950_split_params(params), backend="gluon"
+    )["NUM_SEGMENTS"]
+    if params.max_seqlen_k < 2048 * num_segments:
+        return tile
+    programs = params.num_seqs * params.num_kv_heads * num_segments
+    if params.all_decode:
+        wide = programs <= params.num_sms
+    elif params.shuffled_kv_cache:
+        wide = programs < 2 * params.num_sms
+    else:
+        wide = programs < params.num_sms
+    return max(tile, 128) if wide else tile
 
 
 def _gfx950_split_grid(params: _UAParams):
