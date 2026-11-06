@@ -224,14 +224,20 @@ class Provider:
             ),
         }
 
+    # Which argument carries the hidden size, per contract. Reading args[0] for
+    # both would work today by coincidence -- the functional contract takes the
+    # input first and the write-out one takes the output -- and would break
+    # silently the first time a contract's parameter order changed. A provider
+    # reads each contract on its own terms.
+    _normalized_over = {"rmsnorm": 0, "rmsnorm_with_add": 1}
+
     def select(self, op, args, kwargs):
         candidate = self.kernels.get(op.name)
         if candidate is None:
             return None  # declining is normal, and must be observable
-        # The first tensor argument differs by contract: the write-out shapes
-        # take the output first, the functional one takes the input.
-        shaped = args[0]
-        if shaped.shape[-1] % 2:
+
+        hidden = args[self._normalized_over[op.name]].shape[-1]
+        if hidden % 2:
             return None  # a per-call coverage decision, the shape it is for
         return candidate
 
