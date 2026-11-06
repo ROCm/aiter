@@ -2206,15 +2206,17 @@ def flydsl_kda_verify_with_f_b(
     )
     _check_i32_addressing("out", out, first_dim=1)
     _check_disjoint_rows("out", out, (1, 2), "token and head")
-    _check_no_alias(
-        (
-            ("out", out),
-            ("intermediate_conv_window", intermediate_conv_window),
-            ("intermediate_states", intermediate_states),
-        )
-        + tuple((f"replay_ring[{i}]", t) for i, t in enumerate(replay_ring or ())),
-        (("conv_state", conv_state), ("state", state)),
-    )
+    written = (
+        ("out", out),
+        ("intermediate_conv_window", intermediate_conv_window),
+        ("intermediate_states", intermediate_states),
+    ) + tuple((f"replay_ring[{i}]", t) for i, t in enumerate(replay_ring or ()))
+    _check_no_alias(written, (("conv_state", conv_state), ("state", state)))
+    # The written buffers must not share a byte with each other either: raw_v
+    # and raw_k over one ring would let the K store overwrite the V store.
+    for i, (name, tensor) in enumerate(written[:-1]):
+        if tensor is not None:
+            _check_no_alias(written[i + 1 :], ((name, tensor),))
     num_inter_lines = min(num_inter_lines, _INT32_MAX)
     if _KDA_SLOT_CHECK:
         # Capture is per stream, so ask about the stream the kernel launches on.

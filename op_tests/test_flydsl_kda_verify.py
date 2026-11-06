@@ -635,6 +635,20 @@ def test_kda_verify_rejects_scratch_on_a_cache(monkeypatch, scratch, cache):
         _run(inp, 1)
 
 
+@pytest.mark.parametrize("written, other", [(1, 0), (3, 2)], ids=["k-v", "beta-g"])
+def test_kda_verify_rejects_ring_buffers_that_overlap(monkeypatch, written, other):
+    """Two ring buffers over one allocation would overwrite each other's stores."""
+    _reject_compile(monkeypatch)
+    inp = _make_inputs(2, 5, torch.bfloat16, True)
+    ring = list(inp.ring)
+    target = ring[written]
+    # Same dtype, so the target's own layout lands on the other's first bytes.
+    ring[written] = ring[other].as_strided(target.shape, target.stride())
+    inp.ring = tuple(ring)
+    with pytest.raises(ValueError, match="must not overlap `replay_ring"):
+        _run(inp, 5)
+
+
 def _reject_compile(monkeypatch):
     def unexpected_compile(*args, **kwargs):
         pytest.fail("Invalid arguments must be rejected before kernel compilation.")
