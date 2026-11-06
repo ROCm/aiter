@@ -826,6 +826,67 @@ def test_triton_unified_attn_qq_bias_padded_query_rows(
     )
 
 
+@pytest.mark.parametrize("seq_lens", [[(448, 1344)], [(400, 1200)]])
+@torch.inference_mode()
+def test_triton_unified_attn_3d_padded_query_rows_deterministic(
+    seq_lens: list[tuple[int, int]],
+) -> None:
+    """Split-KV prefill gives the same output on each run. With 3 query heads
+    for each KV head, BLOCK_M has rows past BLOCK_Q tokens. These rows must not
+    store the segment stats of the next q block."""
+    (
+        query,
+        _key_cache_orig,
+        _value_cache_orig,
+        key_cache,
+        value_cache,
+        _sinks,
+        output,
+        cu_query_lens,
+        kv_lens,
+        max_query_len,
+        max_kv_len,
+        scale,
+        window_size,
+        block_tables,
+        *_,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        num_blocks=64,
+        block_size=64,
+        head_size=64,
+        num_heads=(12, 4),
+        device="cuda",
+    )
+
+    def run() -> torch.Tensor:
+        out = torch.empty_like(output)
+        unified_attention(
+            q=query,
+            k=key_cache,
+            v=value_cache,
+            out=out,
+            cu_seqlens_q=cu_query_lens,
+            seqused_k=kv_lens,
+            max_seqlen_q=max_query_len,
+            max_seqlen_k=max_kv_len,
+            softmax_scale=scale,
+            causal=True,
+            window_size=window_size,
+            block_table=block_tables,
+            softcap=0,
+            q_descale=None,
+            k_descale=None,
+            v_descale=None,
+            backend="triton",
+        )
+        return out
+
+    expected = run()
+    for _ in range(20):
+        assert torch.equal(run(), expected)
+
+
 @pytest.mark.parametrize(
     "seq_lens, num_heads, block_size, sliding_window",
     [
