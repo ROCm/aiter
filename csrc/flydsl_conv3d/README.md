@@ -223,9 +223,10 @@ python3 -m pytest op_tests/tuning_tests/test_config_shape_collision.py
   cannot take it (kH * kW == 1, H/W stride > 1, split-K) and runs without
   main-loop unroll (the patch loop unrolls the taps of a group instead). Patch
   variants that run 2 buffers with `tile_k` > 32 are skipped: they spill VGPRs
-  on most tiles, and one of them faulted on gfx1250 because LLVM's post-RA
-  scheduler moved a last-use scratch reload above another reload of the same
-  spill slot, which then read stale data.
+  on most tiles. The kernel compiles those configs with post-RA scheduling
+  off: otherwise LLVM's post-RA scheduler can move a last-use scratch reload
+  above another reload of the same spill slot, which then reads stale data
+  (one of them faulted on gfx1250 that way).
 
 ### `--tiles_from` / `--tiles_topk`
 - **Type**: path / int
