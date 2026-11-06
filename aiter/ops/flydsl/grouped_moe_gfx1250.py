@@ -17,6 +17,7 @@ import threading
 import flydsl.expr as fx
 import torch
 
+from aiter.utility.env_once import env_once
 from aiter import ActivationType, QuantType, dtypes, logger
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.kernels.mega_moe_gfx1250.types import Stage2ScatterContext
@@ -225,7 +226,7 @@ def _find_grouped_config(
     if ep_specific:
         matches = ep_specific
     if not matches:
-        if os.environ.get("AITER_GROUPED_DEBUG", "0") not in (
+        if env_once("AITER_GROUPED_DEBUG", "0") not in (
             "",
             "0",
             "false",
@@ -284,7 +285,7 @@ def _find_grouped_config(
 
 
 def _use_grouped_gemm_enabled() -> bool:
-    env_enabled = os.environ.get("AITER_USE_GROUPED_GEMM", "0") in _TRUTHY_ENV
+    env_enabled = env_once("AITER_USE_GROUPED_GEMM", "0") in _TRUTHY_ENV
     is_gfx1250 = get_gfx() == "gfx1250"
     return env_enabled or is_gfx1250
 
@@ -394,7 +395,7 @@ def _compact_scale_min_tokens(wmma_rep: int) -> int:
     default = (
         _COMPACT_MIN_TOKENS_NARROW_STRIDE if wmma_rep == 1 else _COMPACT_MIN_TOKENS
     )
-    raw = os.environ.get("AITER_FLYDSL_COMPACT_SCALE_MIN_TOKENS")
+    raw = env_once("AITER_FLYDSL_COMPACT_SCALE_MIN_TOKENS")
     if raw is None:
         return default
     try:
@@ -438,7 +439,7 @@ def _use_fused_quant_preshuffle(
         return True
     # A valid explicit threshold is a tuning override, not an automatic
     # policy choice. Keep its existing power to force compact scales.
-    threshold = os.environ.get("AITER_FLYDSL_COMPACT_SCALE_MIN_TOKENS")
+    threshold = env_once("AITER_FLYDSL_COMPACT_SCALE_MIN_TOKENS")
     if threshold is not None:
         try:
             int(threshold)
@@ -543,7 +544,7 @@ def _build_g2l_lut(
     n = expert_mask.numel()
     # nvr is only folded in when both the dynamic-token scalar and topk are known.
     _want_nvr = nvt is not None and topk is not None
-    if os.environ.get("AITER_G2L_TORCH", "0") not in _TRUTHY_ENV and n <= _G2L_MAX_N:
+    if env_once("AITER_G2L_TORCH", "0") not in _TRUTHY_ENV and n <= _G2L_MAX_N:
         try:
             mask = (
                 expert_mask.to(device=device, dtype=torch.int32)
@@ -568,7 +569,7 @@ def _build_g2l_lut(
                 max_experts=512 if n <= 512 else 1024,
                 clear_counter=not (
                     _flydsl_dispatch_context() is not None
-                    and os.environ.get("AITER_TDM_DIRECT_EP_MASK", "1")
+                    and env_once("AITER_TDM_DIRECT_EP_MASK", "1")
                     in ("1", "true", "True")
                 ),
             )
@@ -763,6 +764,23 @@ def _grouped_a8w4_tdm_moe(
                 )
     wmma_rep = get_wmma_m_rep(tile_m, tile_n, m_warp, n_warp, "gemm1")
     wmma_rep2 = get_wmma_m_rep(tile_m2, tile_n2, m_warp2, n_warp2, "gemm2")
+    # Whether the A1 quant would take the compact-scale pair: the TP route
+    # gates and the quant dispatch below all ask, so evaluate it once a call.
+    _compact_quant_pair_memo = []
+
+    def _compact_quant_pair() -> bool:
+        if not _compact_quant_pair_memo:
+            _compact_quant_pair_memo.append(
+                _use_fused_quant_preshuffle(
+                    model_dim,
+                    wmma_rep,
+                    "fp4" if data_format == "fp4" else "fp8",
+                    token_num,
+                    topk,
+                )
+            )
+        return _compact_quant_pair_memo[0]
+
     _align_m = max(tile_m, tile_m2)
     # Both GEMMs walk the same contiguous layout, each with its own tile height,
     # so every expert must start on a row that is a multiple of both. Aligning to
@@ -817,6 +835,38 @@ def _grouped_a8w4_tdm_moe(
         and token_num * topk <= _FUSED_ROUTE_PSUM_MAX_NUMEL
         and int(E) <= _FUSED_ROUTE_PSUM_MAX_EXPERTS
     )
+    # The prefill route below keeps a persistent counter it can only allocate
+    # outside graph capture. Every eager TP call allocates it, whatever its
+    # size (decode warm-up and the memory-profile run come before any capture),
+    # so a token graph recorded before any eager prefill still records the
+    # self-cleaning route rather than the filled-scratch fallback. Once it
+    # exists this is one dict lookup.
+    if not herd_topk and not _compact and not _is_ep and not enable_ep_scatter:
+        tp_route_state_buffer(E, device)
+    # Larger TP batches (prefill): one route launch, whose last workgroup
+    # builds masked_m/starts/psum, and the token-multidest A1 quant resolves
+    # each route's row. This replaces the counter fill, route and psum-remap
+    # launches; the compact-scale quant and other A1 paths keep them.
+    _route_in_quant = None
+    if (
+        not herd_topk
+        and not _compact
+        and not _is_ep
+        and not enable_ep_scatter
+        and not _fused_tp_route
+        and _tp_route_quant_takes_route(
+            hidden_states,
+            data_format=data_format,
+            a_preshuffled=a_preshuffled,
+            model_dim=model_dim,
+            wmma_rep=wmma_rep,
+            token_num=token_num,
+            topk=topk,
+            experts=E,
+            compact_quant_pair=_compact_quant_pair,
+        )
+    ):
+        _route_in_quant = tp_prefill_route_psum(topk_ids, E, _align_m)
     if _compact:
         _masked_m = stage2_scatter.compact_masked_m
         topids_to_rows = None
@@ -833,7 +883,7 @@ def _grouped_a8w4_tdm_moe(
             # device=cuda) would allocate a CPU tensor and cudaMemcpy it, which
             # capture rejects unless pinned.
             _ep_nvt = torch.full((1,), int(token_num), dtype=torch.int32, device=device)
-        _direct_ep_mask = _flydsl_dispatch_context() is not None and os.environ.get(
+        _direct_ep_mask = _flydsl_dispatch_context() is not None and env_once(
             "AITER_TDM_DIRECT_EP_MASK", "1"
         ) in (
             "1",
@@ -852,7 +902,7 @@ def _grouped_a8w4_tdm_moe(
                 torch.uint8,
                 dtypes.fp4x2,
             )
-            and os.environ.get("AITER_TDM_FUSE_ROUTE_QUANT", "0")
+            and env_once("AITER_TDM_FUSE_ROUTE_QUANT", "0")
             in ("1", "true", "True")
         )
         if _fuse_ep_route_quant:
@@ -901,6 +951,8 @@ def _grouped_a8w4_tdm_moe(
                 ep_rowmap=ep_rowmap,
                 contiguous_expert_mask=_direct_ep_mask,
             )
+    elif _route_in_quant is not None:
+        _masked_m, topids_to_rows, _, _ = _route_in_quant
     elif not _fused_tp_route:
         _fuse_ep_route_quant = False
         if herd_topk:
@@ -945,7 +997,7 @@ def _grouped_a8w4_tdm_moe(
         and int(E) <= 256
         and dtype in (torch.bfloat16, dtypes.bf16)
         and _flydsl_dispatch_context() is not None
-        and os.environ.get("AITER_TDM_FUSE_PSUM_QUANT", "1") in ("1", "true", "True")
+        and env_once("AITER_TDM_FUSE_PSUM_QUANT", "1") in ("1", "true", "True")
     )
     ep_psum_params = None
     if _compact:
@@ -958,6 +1010,8 @@ def _grouped_a8w4_tdm_moe(
         _masked_m, topids_to_rows, psum = fused_route_psum_remap(
             topk_ids, E, max_m, _align_m
         )
+    elif _route_in_quant is not None:
+        psum = _route_in_quant[2]
     elif _fuse_psum_quant:
         # The remapper's scan and ep_rowmap scatter ride the quant kernel:
         # every workgroup re-derives the (E,) prefix in LDS, so this launch
@@ -1079,7 +1133,7 @@ def _grouped_a8w4_tdm_moe(
     # (measured: gemm1 +18%, net +9us/layer at 4k tokens), and on tiny decode
     # batches (<~1k tokens) the small-M gemm1 regresses too. Gate on both so
     # prefill and ramp steps keep the original interleaved store untouched.
-    _rm_min_tokens = int(os.environ.get("AITER_TDM_ROW_MAJOR_A1_MIN_TOKENS", "1024"))
+    _rm_min_tokens = int(env_once("AITER_TDM_ROW_MAJOR_A1_MIN_TOKENS", "1024"))
     _row_major_a1 = (
         _prequantized
         and not a_preshuffled
@@ -1088,7 +1142,7 @@ def _grouped_a8w4_tdm_moe(
         and ep_psum_params is None
         and int(tile_m) >= 256
         and int(token_num) >= _rm_min_tokens
-        and os.environ.get("AITER_TDM_ROW_MAJOR_A1_SCALE", "1") in ("1", "true", "True")
+        and env_once("AITER_TDM_ROW_MAJOR_A1_SCALE", "1") in ("1", "true", "True")
     )
     _row_major_ascale = (_compact and _prequantized) or _row_major_a1
     # Local quant instead writes one compact row-major row per token and rebuilds
@@ -1100,9 +1154,7 @@ def _grouped_a8w4_tdm_moe(
         and not _prequantized
         and not a_preshuffled
         and _ep_nvr is None
-        and _use_fused_quant_preshuffle(
-            model_dim, wmma_rep, _quant_mode, token_num, topk
-        )
+        and _compact_quant_pair()
     )
     _compact_ascale_buf = None
     _row_to_token = _apre_row_to_token
@@ -1147,6 +1199,9 @@ def _grouped_a8w4_tdm_moe(
             slot_stride=int(stage2_scatter.max_tokens_per_rank) * int(topk),
         )
     else:
+        _route_rows = (
+            torch.empty_like(topids_to_rows) if _route_in_quant is not None else None
+        )
         a1_payload, a1_scale = flydsl_moe_fused_quant_preshuffle(
             hidden_states.reshape(1, token_num, _src_width),
             1,
@@ -1163,7 +1218,13 @@ def _grouped_a8w4_tdm_moe(
             ep_psum_params=ep_psum_params,
             row_major_scale=_row_major_a1,
             payload_preshuffled=a_preshuffled,
+            route_starts=None if _route_in_quant is None else _route_in_quant[3],
+            route_expert_bits=tp_route_expert_bits(E),
+            route_rows_out=_route_rows,
         )
+        if _route_rows is not None:
+            # The gather-reduce reads the rows the quant resolved.
+            topids_to_rows = _route_rows
         if _compact_ascale:
             a1_scale = flydsl_moe_scatter_preshuffle_scale(
                 _compact_ascale_buf,
@@ -1178,7 +1239,7 @@ def _grouped_a8w4_tdm_moe(
     # kernel epilogue, eliminating the standalone
     # flydsl_moe_fused_quant_preshuffle call between gemm1 and gemm2.
     disable_gemm1_requant = _as_bool(
-        os.environ.get("AITER_FLYDSL_DISABLE_GEMM1_REQUANT"), False
+        env_once("AITER_FLYDSL_DISABLE_GEMM1_REQUANT"), False
     )
     _fuse_quant = not disable_gemm1_requant
     w1_u8 = _grouped_weight_uint8(w1)
@@ -1584,7 +1645,7 @@ def grouped_gemm_gfx1250_a8w4(
 
     # Read once per call (still honours a runtime change of the variable): when
     # it is off -- always, in serving -- no debug message is formatted at all.
-    _dbg_on = os.environ.get("AITER_GROUPED_DEBUG", "0") not in (
+    _dbg_on = env_once("AITER_GROUPED_DEBUG", "0") not in (
         "",
         "0",
         "false",
@@ -1645,7 +1706,7 @@ def grouped_gemm_gfx1250_a8w4(
     if not _use_grouped_gemm_enabled():
         _grouped_dbg("AITER_USE_GROUPED_GEMM not enabled; skip grouped mode")
         return None
-    if os.environ.get("AITER_DISABLE_GROUPED_A8W4", "0") == "1":
+    if env_once("AITER_DISABLE_GROUPED_A8W4", "0") == "1":
         _grouped_dbg("AITER_DISABLE_GROUPED_A8W4 enabled; skip grouped mode")
         return None
     _is_ep = expert_mask is not None
@@ -1686,10 +1747,10 @@ def grouped_gemm_gfx1250_a8w4(
     # lazily so the native-arch path skips the four env reads).
     if get_gfx() != "gfx1250":
         _gfx_env = ";".join(
-            str(os.environ.get(k, "")).lower()
+            str(env_once(k, "")).lower()
             for k in ("GPU_ARCHS", "TARGET_ARCH", "AITER_GPU_ARCHS")
         )
-        _force_gfx1250 = os.environ.get("AITER_FORCE_GFX1250", "0") in _TRUTHY_ENV
+        _force_gfx1250 = env_once("AITER_FORCE_GFX1250", "0") in _TRUTHY_ENV
         if "gfx1250" not in _gfx_env and not _force_gfx1250:
             return None
 
@@ -1826,7 +1887,7 @@ def grouped_gemm_gfx1250_a8w4(
         # _NUM_BUFFERS2) to sweep the felix TDM batched GEMM tiles, and
         # AITER_TDM_M_WARP / _N_WARP (+ *_M_WARP2/_N_WARP2) to sweep the wave grid.
         def _tdm_env(name):
-            v = os.environ.get(name)
+            v = env_once(name)
             return int(v) if (v is not None and v != "") else None
 
         _ov_m = _tdm_env("AITER_TDM_TILE_M")
@@ -2034,6 +2095,125 @@ def fused_route_psum_remap(
         current_stream_arg(),
     )
     return masked_m, topids_to_rows.view(token_num, topk), psum
+
+
+_TP_ROUTE_STATE_CACHE: dict[tuple[int, str], torch.Tensor] = {}
+
+
+def tp_route_state_buffer(E: int, device) -> torch.Tensor | None:
+    """Persistent ``(E + 1,)`` int32 TP route counts plus a ticket word.
+
+    ``moe_route_lds_psum_sc`` zeroes it at the end of every launch, so route
+    launches issued in order on one stream start from zero without a fill.
+    Allocated (zeroed) by the first eager TP grouped-MoE call of any size; a
+    capture that finds none gets None, so no allocation is recorded into the
+    graph (the route then uses a filled scratch counter).
+    """
+    key = (int(E), str(device))
+    buf = _TP_ROUTE_STATE_CACHE.get(key)
+    if buf is None:
+        if torch.cuda.is_current_stream_capturing():
+            return None
+        buf = torch.zeros(int(E) + 1, dtype=torch.int32, device=device)
+        _TP_ROUTE_STATE_CACHE[key] = buf
+    return buf
+
+
+def tp_route_expert_bits(E: int) -> int:
+    from aiter.ops.flydsl.kernels.moe_route_maps import (
+        tp_route_expert_bits as _bits,
+    )
+
+    return _bits(int(E))
+
+
+@functools.cache
+def _get_compiled_route_lds_psum(experts: int, self_clean: bool):
+    from aiter.ops.flydsl.kernels.moe_route_maps import (
+        build_moe_topids_to_rows_lds_psum_module,
+    )
+
+    return build_moe_topids_to_rows_lds_psum_module(int(experts), bool(self_clean))
+
+
+def _tp_route_quant_takes_route(
+    hidden_states,
+    *,
+    data_format,
+    a_preshuffled,
+    model_dim,
+    wmma_rep,
+    token_num,
+    topk,
+    experts,
+    compact_quant_pair=None,
+) -> bool:
+    """Whether the A1 quant is the token-multidest launch that can place rows.
+
+    Mirrors the quant dispatch: bf16 activations (not prequantized), no
+    A-preshuffle, and not the compact-scale pair, which needs a row -> token
+    map from the psum remap. ``compact_quant_pair`` is the caller's
+    once-a-call ``_use_fused_quant_preshuffle`` answer, as a callable.
+    """
+    from aiter.ops.flydsl.kernels.moe_route_maps import TP_ROUTE_PSUM_MAX_EXPERTS
+    from aiter.ops.flydsl.moe_kernels import (
+        token_multidest_eligible,
+        token_multidest_quant_enabled,
+    )
+
+    if int(experts) > TP_ROUTE_PSUM_MAX_EXPERTS or a_preshuffled:
+        return False
+    # A prequantized payload takes the scatter-only quant; with a bf16
+    # activation the dispatch ignores a1_scale.
+    if hidden_states.dtype != torch.bfloat16:
+        return False
+    if not token_multidest_quant_enabled():
+        return False
+    if not token_multidest_eligible(token_num, topk):
+        return False
+    if compact_quant_pair is not None:
+        return not compact_quant_pair()
+    quant_mode = "fp4" if data_format == "fp4" else "fp8"
+    return not _use_fused_quant_preshuffle(
+        model_dim, wmma_rep, quant_mode, token_num, topk
+    )
+
+
+def tp_prefill_route_psum(topk_ids: torch.Tensor, experts: int, tile_m: int):
+    """One route launch that also writes masked_m, starts and psum.
+
+    Rows come back as ``(slot << tp_route_expert_bits(E)) | expert`` for
+    ``flydsl_moe_fused_quant_preshuffle(route_starts=...)``. Returns
+    ``(masked_m, rows, psum, starts)``. The counter is the self-cleaning
+    persistent one, or a filled scratch one on first use under capture.
+    """
+    device = topk_ids.device
+    token_num, topk = topk_ids.shape
+    numel = token_num * topk
+    experts = int(experts)
+    state = tp_route_state_buffer(experts, device)
+    self_clean = state is not None
+    if not self_clean:
+        state = torch.zeros(experts + 1, dtype=torch.int32, device=device)
+    rows = torch.empty(numel, dtype=torch.int32, device=device)
+    masked_m = torch.empty(experts, dtype=torch.int32, device=device)
+    starts = torch.empty(experts, dtype=torch.int32, device=device)
+    psum = torch.empty(experts, dtype=torch.int32, device=device)
+    grid = (numel + 255) // 256
+    _run_compiled(
+        _get_compiled_route_lds_psum(experts, self_clean),
+        ptr_arg(topk_ids.to(torch.int32).reshape(-1)),
+        ptr_arg(state),
+        ptr_arg(rows),
+        ptr_arg(masked_m),
+        ptr_arg(starts),
+        ptr_arg(psum),
+        int(numel),
+        int(tile_m),
+        int(grid),
+        current_stream_arg(),
+    )
+    return masked_m, rows.view(token_num, topk), psum, starts
 
 
 @functools.cache

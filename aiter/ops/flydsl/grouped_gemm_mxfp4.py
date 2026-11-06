@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import os
+from aiter.utility.env_once import env_once
 
 import torch
 
@@ -50,7 +51,7 @@ def _launch_address(tensor: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
 
 def _select_bool_env(name: str, csv_value: int) -> int:
     """Select a strict 0/1 environment override or the CSV setting."""
-    value = os.environ.get(name)
+    value = env_once(name)
     if value is None:
         return int(bool(csv_value))
     value = value.strip()
@@ -61,7 +62,7 @@ def _select_bool_env(name: str, csv_value: int) -> int:
 
 def _select_tdm_b_th(csv_tdm_b_th: int) -> int:
     """Selects the B-only TDM temporal hint."""
-    value = os.environ.get("AITER_TDM_B_TH")
+    value = env_once("AITER_TDM_B_TH")
     temporal_hint = int(csv_tdm_b_th) if value is None else int(value.strip())
     if not 0 <= temporal_hint <= 6:
         raise ValueError("AITER_TDM_B_TH must be between 0 and 6")
@@ -70,7 +71,7 @@ def _select_tdm_b_th(csv_tdm_b_th: int) -> int:
 
 def _select_cluster_n(n_tiles: int, csv_cluster_n: int) -> int:
     """Selects the environment override or CSV cluster degree."""
-    env_cluster_n = os.environ.get("AITER_FLYDSL_MXFP4_CLUSTER_N")
+    env_cluster_n = env_once("AITER_FLYDSL_MXFP4_CLUSTER_N")
     try:
         if env_cluster_n is not None:
             requested_cluster_n = int(env_cluster_n)
@@ -87,7 +88,7 @@ def _select_cluster_n(n_tiles: int, csv_cluster_n: int) -> int:
 
 def _select_cluster_m(csv_cluster_m: int, cluster_n: int, stage1_act: int) -> int:
     """Selects the M cluster degree, preserving the legacy automatic policy."""
-    env_cluster_m = os.environ.get("AITER_FLYDSL_MXFP4_CLUSTER_M")
+    env_cluster_m = env_once("AITER_FLYDSL_MXFP4_CLUSTER_M")
     try:
         requested_cluster_m = (
             int(env_cluster_m) if env_cluster_m is not None else int(csv_cluster_m)
@@ -116,7 +117,7 @@ def _select_num_waves_per_tensor_tdm(csv_num_waves: int) -> int:
         return csv_num_waves
 
     try:
-        num_waves = int(os.environ.get("AITER_FLYDSL_NUM_WAVES_PER_TENSOR_TDM", "2"))
+        num_waves = int(env_once("AITER_FLYDSL_NUM_WAVES_PER_TENSOR_TDM", "2"))
     except ValueError as exc:
         raise ValueError(
             "AITER_FLYDSL_NUM_WAVES_PER_TENSOR_TDM must be 1, 2, or 4"
@@ -234,9 +235,9 @@ def flydsl_grouped_gemm_a8w4_masked(
     cluster_m = _select_cluster_m(cluster_m, cluster_n, stage1_act)
     stage = 1 if stage1_act else 2
     persistent_workers = int(
-        os.environ.get(
+        env_once(
             f"AITER_FLYDSL_PERSISTENT_WORKERS{stage}",
-            os.environ.get("AITER_FLYDSL_PERSISTENT_WORKERS", persistent_workers),
+            env_once("AITER_FLYDSL_PERSISTENT_WORKERS", persistent_workers),
         )
     )
     if persistent_workers < 0:

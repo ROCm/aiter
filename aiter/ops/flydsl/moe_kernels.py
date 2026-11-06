@@ -9,6 +9,7 @@ import re
 
 import torch
 
+from aiter.utility.env_once import clear_with_env_once, env_once
 from aiter.ops.flydsl.kernels.tensor_shim import (
     _run_compiled as _dispatch_compiled,
 )
@@ -125,9 +126,9 @@ def resolve_flydsl_stage2_mode(
 ) -> str:
     """Resolve runtime reduce overrides shared by sorting and stage 2."""
     if force_reduce is None:
-        force_reduce = os.environ.get("AITER_FLYDSL_FORCE_REDUCE", "0") == "1"
+        force_reduce = env_once("AITER_FLYDSL_FORCE_REDUCE", "0") == "1"
     if stage2_fp8 is None:
-        stage2_fp8 = os.environ.get("AITER_FLYDSL_STAGE2_FP8", "0") == "1"
+        stage2_fp8 = env_once("AITER_FLYDSL_STAGE2_FP8", "0") == "1"
     fp8_reduce = stage2_fp8 and b_dtype in ("fp4", "fp8") and not return_per_slot
     if force_reduce or fp8_reduce:
         return "reduce"
@@ -2224,7 +2225,7 @@ def _flydsl_moe_stage2_impl(
         (not accumulate)
         and (not return_per_slot)
         and use_mx_gemm
-        and os.environ.get("AITER_FLYDSL_STAGE2_FP8", "0") == "1"
+        and env_once("AITER_FLYDSL_STAGE2_FP8", "0") == "1"
     )
     _s2_gemm_out_dtype = "fp8" if _s2_fp8_inter else out_dtype
 
@@ -2623,7 +2624,7 @@ def flydsl_moe_topids_to_rows(
         from aiter.ops.flydsl.kernels.moe_route_maps import MAX_ROUTE_BUCKETS
 
         _use_lds_reduce = (
-            os.environ.get("AITER_FLYDSL_ROUTE_G2L_LDS", "1") in ("1", "true", "True")
+            env_once("AITER_FLYDSL_ROUTE_G2L_LDS", "1") in ("1", "true", "True")
             and int(E) <= MAX_ROUTE_BUCKETS
         )
         _ep_rowmap_ptr = ep_rowmap.reshape(-1) if ep_rowmap is not None else None
@@ -3183,6 +3184,21 @@ _TOKEN_MULTIDEST_MIN_TOKENS = 64
 _TOKEN_MULTIDEST_MAX_TOPK = 8
 
 
+@functools.cache
+def token_multidest_quant_enabled() -> bool:
+    """AITER_FLYDSL_TOKEN_MULTIDEST_QUANT (default on), read once per process.
+
+    The quant dispatch and the TP route gates that must agree with it ask on
+    every MoE call; a test that changes the variable calls
+    ``token_multidest_quant_enabled.cache_clear()``.
+    """
+    return os.environ.get("AITER_FLYDSL_TOKEN_MULTIDEST_QUANT", "1") in (
+        "1",
+        "true",
+        "True",
+    )
+
+
 def token_multidest_eligible(token_num: int, topk: int) -> bool:
     """Whether the routing takes the token-multidest quant path.
 
@@ -3226,6 +3242,7 @@ def _get_compiled_token_multidest_quant(
     quant_mode: str,
     tdm_hidden_chunks: int = 4,
     ksplit: int = 1,
+    route_expert_bits: int = 0,
 ):
     from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
         build_moe_token_multidest_quant_module,
@@ -3238,6 +3255,7 @@ def _get_compiled_token_multidest_quant(
         quant_mode=quant_mode,
         tdm_hidden_chunks=tdm_hidden_chunks,
         ksplit=ksplit,
+        route_expert_bits=route_expert_bits,
     )
 
 
@@ -3364,6 +3382,13 @@ def flydsl_moe_fused_quant_preshuffle(
     # row_major_ascale=1. Unsupported with A-preshuffled payloads or quantization.
     row_major_scale: bool = False,
     payload_preshuffled: bool = False,
+    # TP prefill route resolved here (token-multidest path only): rows are
+    # ``(slot << route_expert_bits) | expert`` from ``moe_route_lds_psum``, the
+    # destination is ``route_starts[expert] + slot``, and the resolved rows are
+    # written to ``route_rows_out`` (same shape as ``topids_to_rows``).
+    route_starts: torch.Tensor | None = None,
+    route_expert_bits: int = 0,
+    route_rows_out: torch.Tensor | None = None,
 ):
     """Fused grouped quant + e8m0 scale-preshuffle.
 
@@ -3498,8 +3523,7 @@ def flydsl_moe_fused_quant_preshuffle(
             and num_valid_routes is None
             and 1 < int(source_topk) <= _TOKEN_MULTIDEST_MAX_TOPK
             and token_num >= _TOKEN_MULTIDEST_MIN_TOKENS
-            and os.environ.get("AITER_FLYDSL_TOKEN_MULTIDEST_QUANT", "1")
-            in ("1", "true", "True")
+            and token_multidest_quant_enabled()
         )
         if use_token_multidest and row_to_token is not None:
             from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
@@ -3527,6 +3551,17 @@ def flydsl_moe_fused_quant_preshuffle(
                 current_stream_arg(),
             )
             return out_payload, out_scale
+        route_in_quant = route_starts is not None
+        if route_in_quant and (
+            not use_token_multidest
+            or row_to_token is not None
+            or route_rows_out is None
+            or route_expert_bits <= 0
+        ):
+            raise ValueError(
+                "route_starts needs the token-multidest quant without a "
+                "row_to_token map, route_rows_out and route_expert_bits"
+            )
         if use_token_multidest:
             from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
                 token_multidest_ksplit,
@@ -3545,6 +3580,7 @@ def flydsl_moe_fused_quant_preshuffle(
                     feat_dim, wmma_rep, quant_mode, md_ksplit
                 ),
                 ksplit=md_ksplit,
+                route_expert_bits=int(route_expert_bits) if route_in_quant else 0,
             )
             token_grid = (token_num + warps_per_block - 1) // warps_per_block
             _dispatch_compiled(
@@ -3555,6 +3591,8 @@ def flydsl_moe_fused_quant_preshuffle(
                 ptr_arg(topids_to_rows_i32),
                 token_num,
                 token_grid,
+                ptr_arg(route_starts.reshape(-1) if route_in_quant else None),
+                ptr_arg(route_rows_out.reshape(-1) if route_in_quant else None),
                 current_stream_arg(),
             )
             return out_payload, out_scale
@@ -3687,3 +3725,8 @@ def flydsl_moe_fused_quant_preshuffle(
         current_stream_arg(),
     )
     return out_payload, out_scale
+
+
+# The token-multidest switch follows os.environ like the other per-call
+# switches here: a change made through it clears the cached value.
+clear_with_env_once(token_multidest_quant_enabled)
