@@ -43,7 +43,9 @@ MAX_ROW_PACKED_KV_BYTES = 1 << 30  # PK+PV bytes of the pack_tokens_per_row rule
 
 @dataclasses.dataclass(frozen=True)
 class Platform:
-    """Calibrated per GPU; the route-model terms are microseconds."""
+    """Calibrated per GPU. The route-model terms are microseconds where an entry says
+    they are phase timings (gfx942); a decision-tuned entry (gfx950) gives weights
+    chosen for the route they produce, not timings."""
 
     union_fixed: float  # fixed cost of the union phase
     union_step: float  # per N64 step of the slowest union CTA
@@ -396,7 +398,8 @@ def _mma():
 
 
 def _read_q_words(resource, offset, lane):
-    """Q words of the lane: part k (words 4k .. 4k + 3) holds dims 32k + 8 * (lane >> 4) .. + 7."""
+    """Q words of the lane: four-word load k holds the eight BF16 dims from
+    32k + 8 * (lane >> 4) on; offsets are in bytes."""
     parts = [
         _buffer_words(resource, offset + (lane >> 4) * 16 + k * 64) for k in range(8)
     ]

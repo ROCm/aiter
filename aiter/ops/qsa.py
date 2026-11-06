@@ -207,7 +207,7 @@ def qsa_sparse_prefill(
     kv_slots: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Sparse prefill/extend attention over packed K/V, or a token pool read through
-    kv_slots; FlyDSL on gfx942 only.
+    kv_slots; FlyDSL on gfx942 and gfx950.
 
     See ``aiter.ops.flydsl.qsa_sparse_prefill.flydsl_qsa_sparse_prefill``.
     """

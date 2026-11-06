@@ -38,6 +38,9 @@ __all__ = ["flydsl_qsa_sparse_prefill"]
 # Kernels use unsigned 32-bit buffer byte offsets; the 1 MiB margin keeps out-of-range
 # sentinels plus their lane offsets from wrapping.
 _MAX_SPAN = 2**32 - 2**20
+# Kernels form a four-row K/V block's extent and offsets (up to 4 x a row's bytes) as
+# 32-bit values: a row stride below 2**28 elements keeps them below 2**31.
+_MAX_KV_STRIDE = 2**28
 
 
 def _union_min_rows(group):
@@ -51,8 +54,9 @@ def _aligned(nbytes):
 
 def _kv_stride(tensor):
     """Elements between the rows of K or V [rows, heads, 256], or None unless every row
-    holds dense [heads, 256] values, 16-byte aligned, before the next row starts. Size-1
-    dims have no stride of their own (torch's contiguity rule): one row is dense."""
+    holds dense [heads, 256] values, 16-byte aligned, before the next row starts, and
+    the next row starts fewer than _MAX_KV_STRIDE elements on. Size-1 dims have no
+    stride of their own (torch's contiguity rule): one row is dense."""
     rows, heads, dim = tensor.shape
     stride = tensor.stride(0) if rows > 1 else heads * dim
     if (
@@ -60,6 +64,7 @@ def _kv_stride(tensor):
         or (heads > 1 and tensor.stride(1) != dim)
         or stride < heads * dim
         or stride % 8
+        or stride >= _MAX_KV_STRIDE
     ):
         return None
     return stride
@@ -274,15 +279,17 @@ def flydsl_qsa_sparse_prefill(
     satisfy this), and the result is the same as for K/V packed by those slots. A
     pool may exceed 4 GiB (raw direct then uses 64-bit loads); slot values are not
     validated. K/V may be strided views: every row holds dense [HK, 256] values and
-    rows sit one 16-byte aligned stride >= HK x 256 elements apart, the same for K and
-    V (e.g. the halves of one interleaved K|V record per token, read in place). Hot
+    rows sit one 16-byte aligned stride >= HK x 256 and < 2**28 elements apart, the
+    same for K and V (e.g. the halves of one interleaved K|V record per token, read in
+    place). Hot
     calls rebuild the selection: per-layout plans share one private
     per-stream scratch arena. out is optional and must not overlap Q/K/V, indices or
     kv_slots. Warm the same stream and layout before graph capture. Captured
     workspaces stay pinned for graph pointer lifetime and share their stream's
     scratch: do not replay them concurrently with each other or with that stream's
-    calls. Each kernel variant compiles on its first use: a few seconds with empty
-    FlyDSL caches. One GPU per process (TP uses separate workers).
+    calls. Each kernel variant compiles on its first use, a few seconds with empty
+    FlyDSL caches; none is prebuilt (PREBUILD_KERNELS / AOT do not cover QSA). One GPU
+    per process (TP uses separate workers).
     """
     global _device
     if q.ndim != 3 or k.ndim != 3 or v.ndim != 3:
@@ -352,7 +359,7 @@ def flydsl_qsa_sparse_prefill(
     if stride is None or _kv_stride(v) != stride:
         raise ValueError(
             "K/V rows must hold dense [heads, 256] values one 16-byte aligned stride "
-            ">= heads x 256 apart, the same for K and V"
+            ">= heads x 256 and < 2**28 elements apart, the same for K and V"
         )
     if q.shape[1] // k.shape[1] > 16:
         raise ValueError("At most 16 Q heads per KV head fit the direct fallback wave")
