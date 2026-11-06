@@ -15,6 +15,7 @@ import pytest
 
 CODEGEN = Path(__file__).resolve().parents[1] / "csrc" / "ck_gemm_moe_2stages_codegen"
 sys.path.insert(0, str(CODEGEN))
+import gemm_moe_ck2stages_common as common
 import gen_instances
 from gemm_moe_ck2stages_common import get_gemm1_kernels_list, get_gemm2_kernels_list
 
@@ -98,3 +99,11 @@ def test_table_shared_by_all_archs_is_generated_as_for_one(tmp_path):
     )
     for file in files:
         assert (multi / file).read_text() == (single / file).read_text()
+
+
+def test_native_entry_of_an_arch_list_is_the_build_gpu(monkeypatch):
+    # GPU_ARCHS="native;gfx950" builds for this machine's GPU and for gfx950.
+    monkeypatch.setattr(common, "get_gfx_list", lambda: ["native", "gfx950"])
+    monkeypatch.setattr(common, "get_gfx_runtime", lambda: "gfx942")
+    tables = common.get_gemm_kernel_tables("B16", "B16", "B16", False, 0, "silu", 2)
+    assert [archs for archs, _, _ in tables.values()] == [["gfx942"], ["gfx950"]]

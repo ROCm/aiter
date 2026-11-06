@@ -15,7 +15,7 @@ else:
     )  # develop mode
 sys.path.insert(0, AITER_CORE_DIR)
 
-from chip_info import get_gfx, get_gfx_list
+from chip_info import get_gfx, get_gfx_list, get_gfx_runtime
 
 # CK stage1 activation op values. swiglu (OAI swiglu_oai) maps to CK act value 3;
 # gelutanh (gelu_tanh_and_mul) maps to CK act value 4; value 2 is intentionally
@@ -542,8 +542,11 @@ def get_gemm_kernel_tables(
     Returns {tag: (archs, gemm1 kernels, gemm2 kernels)}; archs whose kernel
     lists have the same tag share one table.
     """
+    # hipcc builds a "native" entry for this machine's GPU, but get_gfx_list()
+    # keeps it as is when GPU_ARCHS lists other archs too ("native;gfx950").
+    archs = [get_gfx_runtime() if arch == "native" else arch for arch in get_gfx_list()]
     tables = {}
-    for arch in dict.fromkeys(get_gfx_list()):
+    for arch in dict.fromkeys(archs):
         _, gemm1_kernels = get_gemm1_kernels_list(
             Adtype,
             Bdtype,
