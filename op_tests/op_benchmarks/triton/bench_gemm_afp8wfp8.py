@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Benchmark compact-scale FP8 GEMM and its preshuffled weight path.
+"""Benchmark compact-scale FP8 GEMM and its block128 preshuffled weight path
+(--block128-preshuffle: gemm_afp8wfp8_block128_preshuffle).
 
 For the PR group32 sweep, use --shape-set group32 --x-scale-group-size 32
 --w-scale-group-size 32 32 --no-transpose-x-scale --cudagraph.
@@ -19,7 +20,7 @@ import triton
 from aiter.ops.shuffle import shuffle_weight
 from aiter.ops.triton.gemm.basic.gemm_afp8wfp8 import (
     gemm_afp8wfp8,
-    gemm_afp8wfp8_preshuffle,
+    gemm_afp8wfp8_block128_preshuffle,
 )
 from aiter.ops.triton.utils._triton import arch_info
 from op_tests.op_benchmarks.triton.utils.argparse import (
@@ -40,7 +41,7 @@ DTYPE_MAP = {
 }
 
 
-def generate_inputs(M, N, K, preshuffle, a_group, w_group, transpose):
+def generate_inputs(M, N, K, block128_preshuffle, a_group, w_group, transpose):
     x = torch.randn((M, K), device="cuda", dtype=torch.float32).to(torch.float8_e4m3fn)
     w = torch.randn((N, K), device="cuda", dtype=torch.float32).to(torch.float8_e4m3fn)
     xs = torch.randint(125, 130, (M, K // a_group), dtype=torch.uint8, device="cuda")
@@ -52,7 +53,11 @@ def generate_inputs(M, N, K, preshuffle, a_group, w_group, transpose):
         device="cuda",
     )
     xsk = xs.T.contiguous().reshape(xs.shape) if transpose else xs
-    wk = shuffle_weight(w.view(torch.uint8), layout=(16, 16)) if preshuffle else w
+    wk = (
+        shuffle_weight(w.view(torch.uint8), layout=(16, 16))
+        if block128_preshuffle
+        else w
+    )
     return x, w, wk, xs, xsk, ws
 
 
@@ -62,7 +67,7 @@ def bench_gemm_fn(
     K: int,
     metric: str,
     dtype: torch.dtype,
-    preshuffle: bool,
+    block128_preshuffle: bool,
     backend: str | None,
     x_scale_group_size: int,
     transpose_x_scale: bool,
@@ -71,7 +76,7 @@ def bench_gemm_fn(
     test: bool = False,
 ):
     group_n, group_k = w_scale_group_size
-    if K % x_scale_group_size or K % group_k or (preshuffle and N % 128):
+    if K % x_scale_group_size or K % group_k or (block128_preshuffle and N % 128):
         warnings.warn(
             f"Skipping M={M} N={N} K={K}: incompatible scale groups or preshuffle alignment."
         )
@@ -79,7 +84,13 @@ def bench_gemm_fn(
 
     torch.manual_seed(0)
     x, w, w_kernel, xs, x_scales_kernel, w_scales = generate_inputs(
-        M, N, K, preshuffle, x_scale_group_size, w_scale_group_size, transpose_x_scale
+        M,
+        N,
+        K,
+        block128_preshuffle,
+        x_scale_group_size,
+        w_scale_group_size,
+        transpose_x_scale,
     )
     y = torch.empty((M, N), dtype=dtype, device=x.device)
 
@@ -100,12 +111,12 @@ def bench_gemm_fn(
         "x_scale_group_size": x_scale_group_size,
         "is_x_scale_transposed": transpose_x_scale,
     }
-    if preshuffle:
-        fn = lambda: gemm_afp8wfp8_preshuffle(
+    if block128_preshuffle:
+        fn = lambda: gemm_afp8wfp8_block128_preshuffle(
             x, w_kernel, x_scales_kernel, w_scales, backend=backend, **kwargs
         )
     else:
-        # Only the preshuffle wrapper has a gluon backend.
+        # Only the block128 preshuffle wrapper has a gluon backend.
         fn = lambda: gemm_afp8wfp8(
             x,
             w_kernel,
@@ -154,7 +165,7 @@ def bench_gemm_fn(
 def _bench_args(args):
     return {
         "dtype": DTYPE_MAP[args.dtype],
-        "preshuffle": args.preshuffle,
+        "block128_preshuffle": args.block128_preshuffle,
         "backend": args.backend,
         "x_scale_group_size": args.x_scale_group_size,
         "transpose_x_scale": args.transpose_x_scale,
@@ -242,11 +253,11 @@ def parse_args(args: list[str] | None = None):
     parser = get_parser("AFP8 x WFP8 GEMM")
     parser = add_argparse_ff(parser)
     parser.add_argument(
-        "--shuffle",
-        "--preshuffle",
+        "--block128-shuffle",
+        "--block128-preshuffle",
         action="store_true",
-        dest="preshuffle",
-        help="Preshuffle the weight (layout=(16, 16)) and use gemm_afp8wfp8_preshuffle.",
+        dest="block128_preshuffle",
+        help="Preshuffle the weight (layout=(16, 16)) and use gemm_afp8wfp8_block128_preshuffle.",
     )
     parser.add_argument(
         "--dtype",
@@ -311,8 +322,8 @@ def parse_args(args: list[str] | None = None):
         parser.error("-tp must be positive")
     if tuple(parsed.w_scale_group_size) not in ((1, 32), (32, 32), (128, 128)):
         parser.error("Weight scale block must be 1 32, 32 32, or 128 128")
-    if parsed.preshuffle and tuple(parsed.w_scale_group_size) != (128, 128):
-        parser.error("Preshuffle requires 128x128 weight scales")
+    if parsed.block128_preshuffle and tuple(parsed.w_scale_group_size) != (128, 128):
+        parser.error("--block128-preshuffle requires 128x128 weight scales")
     return parsed, defaults
 
 

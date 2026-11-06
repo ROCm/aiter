@@ -88,6 +88,44 @@ def _split_tickets(count, split, device):
     return tickets
 
 
+def _chunk_warps(seqs: int) -> int:
+    """The chunk kernel's waves (AITER_GDN_VERIFY_CHUNK_WARPS overrides), 0 for none."""
+    return int(os.environ.get("AITER_GDN_VERIFY_CHUNK_WARPS", "0")) or _get_config(
+        seqs
+    ).get("chunk_num_warps", 0)
+
+
+def fused_gdn_verify_mx32_supported(
+    checkpoint: torch.Tensor,
+    conv_state: torch.Tensor,
+    record_k: torch.Tensor,
+    max_query_len: int,
+    seqs: int,
+) -> bool:
+    """Whether ``fused_gdn_verify_qkvz(..., out_scale=...)`` (the 1x32 MXFP8 output) takes
+    this shape: it runs on ``_fused_gdn_verify_chunk`` only (not the token loop, nor the
+    experimental compact / matrix forms). Host-side only; nothing is launched."""
+    _, v_heads, head_k_dim, head_v_dim = checkpoint.shape
+    if head_v_dim % 32 or (v_heads * head_v_dim) % 128:
+        return False
+    if os.environ.get("AITER_GDN_VERIFY_COMPACT", "0") == "1":
+        return False
+    if os.environ.get("AITER_GDN_VERIFY_MATRIX", "0") == "1":
+        return False
+    if seqs == 0:
+        return True
+    k_heads = (conv_state.shape[1] - v_heads * head_v_dim) // (2 * head_k_dim)
+    warps = _chunk_warps(seqs)
+    return bool(warps) and _chunk_kernel_fits(
+        head_k_dim,
+        head_v_dim,
+        v_heads // k_heads,
+        max_query_len,
+        record_k.shape[2],
+        warps,
+    )
+
+
 def fused_gdn_verify_qkvz(
     projected_qkvz: torch.Tensor,
     projected_ba: torch.Tensor,
@@ -150,16 +188,19 @@ def fused_gdn_verify_qkvz(
         out: ``[tokens, VH, V]`` bf16, contiguous. Receives ``norm(core) * silu(z)``.
         pad_slot_id: the slot value of a padded sequence. Padded sequences and
             sequences without tokens are not changed.
-        out_scale: MXFP8 output for the out projection (opt-in). With ``out`` a
-            float8_e4m3fn ``[tokens, VH, V]`` and ``out_scale`` a uint8 /
-            float8_e8m0fnu buffer of ``VH * tokens`` bytes, the op writes the gated
-            RMSNorm as fp8 values with one e8m0 scale per (token, value head),
-            bit-identical to the bf16 ``out`` followed by aiter's
-            ``per_group_quant_hip(group_size=128, transpose_scale=True,
-            scale_type=fp8_e8m0)``: the scale of token row m and head g is byte
-            ``g * tokens + m`` (view it as ``(tokens, VH)`` for the GEMM). Rows of
-            padded sequences are not written, as in the bf16 mode. Chunk-form
-            kernel only.
+        out_scale: 1x32 MXFP8 output for the out projection (opt-in). With ``out`` a
+            float8_e4m3fn ``[tokens, VH, V]`` and ``out_scale`` a contiguous uint8 buffer
+            of ``pad32(R) * VH * V / 32`` bytes, ``R = out_scale_rows`` (default: tokens;
+            the out projection GEMM's rows, which may exceed the rows written here), the
+            op writes the gated RMSNorm as fp8 values with one e8m0 scale per 32 columns,
+            in the 1x32 GEMM's x-scale layout: n32k4 for ``R >= 32`` (byte of row m,
+            group g at ``(m // 32) * VH * V + (g // 4) * 128 + (m % 32) * 4 + g % 4``),
+            row-major ``(R, VH * V / 32)`` below. Bit-identical to the bf16 ``out``
+            followed by the standalone quant (per_group_quant_hip(group_size=32,
+            scale_type=fp8_e8m0, scale_layout_m32k4=True), or per_1x32_mx_quant_hip for
+            ``R < 32``). Rows of padded sequences, rows past ``tokens`` and the n32k4 pad
+            rows are not written. Chunk-form kernel only: check
+            ``fused_gdn_verify_mx32_supported`` first.
 
     Returns:
         ``out``.
@@ -198,21 +239,17 @@ def fused_gdn_verify_qkvz(
         v_heads,
         head_v_dim,
     ), "out must be a contiguous [tokens, VH, V]"
-    out_fp8 = out_scale is not None
-    # The GEMM reads the scale as [VH, rows] over ITS row count, which may exceed the rows this call stores
-    # (a padded batch): out_scale_rows sets that stride (default: out's rows).
+    mx32 = out_scale is not None
     scale_rows = out.shape[0] if out_scale_rows is None else out_scale_rows
-    if out_fp8:
-        assert scale_rows >= out.shape[0], "out_scale_rows must cover out's rows"
+    if mx32:
         assert out.dtype == torch.float8_e4m3fn, "out_scale needs an fp8 e4m3 out"
-        assert head_v_dim == 128, "the fp8 out has one 128-column scale group per head"
+        assert scale_rows >= out.shape[0], "out_scale_rows must cover out's rows"
         assert (
             out_scale.is_contiguous()
-            and out_scale.element_size() == 1
-            and out_scale.numel() >= v_heads * scale_rows
-        ), "out_scale must be a contiguous byte buffer of VH * out_scale_rows"
-    else:
-        assert out.dtype == torch.bfloat16, "out must be bf16 (or fp8 with out_scale)"
+            and out_scale.dtype == torch.uint8
+            and out_scale.numel()
+            == (scale_rows + 31) // 32 * 32 * (v_heads * head_v_dim // 32)
+        ), "out_scale must be a contiguous uint8 buffer of pad32(rows) * VH * V / 32"
     assert (
         conv_weight.is_contiguous() and conv_weight.shape[1] == 4
     ), "conv_weight must be a contiguous [channels, 4]"
@@ -243,9 +280,7 @@ def fused_gdn_verify_qkvz(
     # AITER_GDN_VERIFY_CHUNK_WARPS overrides the chunk kernel's waves,
     # AITER_GDN_VERIFY_COMPACT=1 selects its compact form and
     # AITER_GDN_VERIFY_MATRIX=1 its matrix form (experiments, off by default).
-    chunk_warps = int(
-        os.environ.get("AITER_GDN_VERIFY_CHUNK_WARPS", "0")
-    ) or config.get("chunk_num_warps", 0)
+    chunk_warps = _chunk_warps(seqs)
     if chunk_warps and _chunk_kernel_fits(
         head_k_dim, head_v_dim, ratio, max_query_len, cap, chunk_warps
     ):
@@ -284,15 +319,13 @@ def fused_gdn_verify_qkvz(
             if tickets is not None:
                 tile_args = {**tile_args, "SPLIT": split, "Tickets": tickets}
                 grid_split, num_warps = split, split_warps
-    if out_fp8:
-        assert (
-            kernel is _fused_gdn_verify_chunk
-        ), "the fp8 out is implemented in the chunk-form kernel only"
-        tile_args = {
-            "OUT_FP8": True,
-            "OutScale": out_scale.view(torch.uint8),
-            "out_rows": scale_rows,
-        }
+    if mx32:
+        if kernel is not _fused_gdn_verify_chunk:
+            raise ValueError(
+                "the 1x32 MXFP8 out is implemented in the chunk-form kernel only "
+                "(fused_gdn_verify_mx32_supported)"
+            )
+        tile_args = {"OUT_MX32": True, "N32K4": scale_rows >= 32, "OutScale": out_scale}
     kernel[(seqs * k_heads * grid_split,)](
         query_start_loc,
         slot_idx,

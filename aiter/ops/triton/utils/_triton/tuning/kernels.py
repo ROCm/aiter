@@ -787,16 +787,16 @@ def gemm_afp4wfp4_preshuffle(shape, backend):
 
 
 @kernel(
-    "GEMM-AFP8WFP8_PRESHUFFLED",
+    "GEMM-AFP8WFP8_BLOCK128_PRESHUFFLED",
     bits=(8, 8),
     gluon_archs=("gfx1250",),
     gluon_default_archs=("gfx1250",),
 )
-def gemm_afp8wfp8_preshuffle(shape, backend):
+def gemm_afp8wfp8_block128_preshuffle(shape, backend):
     import torch
 
     from aiter.ops.triton.gemm.basic.gemm_afp8wfp8 import (
-        gemm_afp8wfp8_preshuffle as gemm,
+        gemm_afp8wfp8_block128_preshuffle as gemm,
     )
     from aiter.ops.triton.utils.gemm_config_utils import compute_splitk_params
     from op_tests.triton_tests.gemm.basic.test_gemm_afp8wfp8 import generate_inputs

@@ -15,17 +15,20 @@ import torch
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops import gemm_op_a8w8
 from aiter.ops.gemm_op_a8w8 import gemm_a8w8_blockscale
-from aiter.ops.shuffle import shuffle_weight
+from aiter.ops.shuffle import shuffle_mxfp8fp4_scale, shuffle_weight
 from aiter.ops.triton.gemm.basic import gemm_afp8wfp8 as afp8wfp8_op
 from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale_group32 import (
     gemm_a8w8_blockscale_group32,
 )
 from aiter.ops.triton.gemm.basic.gemm_afp8wfp8 import (
+    _is_gluon_available,
     gemm_afp8wfp8,
+    gemm_afp8wfp8_block128_preshuffle,
     gemm_afp8wfp8_preshuffle,
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
+from aiter.ops.triton.utils.shuffle import shuffle_scale_gemm_128row
 from aiter.test_common import checkAllclose
 
 SCALE_GROUP_SIZE = 32  # A: 1x32 e8m0 scale group
@@ -212,7 +215,7 @@ def test_gemm_afp8wfp8(
 
 
 def _gluon_available() -> bool:
-    """The gluon MXFP8 preshuffle kernel is gfx1250-only."""
+    """The gluon MXFP8 block128 preshuffle kernel is gfx1250-only."""
     try:
         return "gfx1250" in arch_info.get_arch()
     except Exception:  # noqa: BLE001
@@ -223,7 +226,7 @@ def _gluon_available() -> bool:
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("backend", ["triton", "gluon"])
 @pytest.mark.parametrize("x_scale_group_size, transpose_x_scale", SCALE_MODES)
-def test_gemm_afp8wfp8_preshuffle(
+def test_gemm_afp8wfp8_block128_preshuffle(
     M: int,
     N: int,
     K: int,
@@ -239,7 +242,7 @@ def test_gemm_afp8wfp8_preshuffle(
         pytest.skip("Preshuffle requires N % 16 == 0 and K % 32 == 0")
     if backend == "gluon":
         if not _gluon_available():
-            pytest.skip("Gluon MXFP8 preshuffle requires gfx1250")
+            pytest.skip("Gluon MXFP8 block128 preshuffle requires gfx1250")
         # The gluon kernel tiles K with the [16, 16, 128] wmma shape.
         if K % 128 != 0 or N % 128 != 0:
             pytest.skip("Gluon kernel requires N % 128 == 0 and K % 128 == 0")
@@ -257,7 +260,7 @@ def test_gemm_afp8wfp8_preshuffle(
     torch_out = run_torch_gemm_afp8wfp8(
         x_fp8, w_fp8, x_scales, w_scales, dtype, x_scale_group_size
     )
-    out = gemm_afp8wfp8_preshuffle(
+    out = gemm_afp8wfp8_block128_preshuffle(
         x_fp8,
         w_kernel,
         x_scales_kernel,
@@ -274,7 +277,7 @@ def test_gemm_afp8wfp8_preshuffle(
         atol=1e-2,
         rtol=1e-2,
         msg=(
-            f"afp8wfp8 preshuffle [{backend}] M={M} N={N} K={K} "
+            f"afp8wfp8 block128 preshuffle [{backend}] M={M} N={N} K={K} "
             f"gs={x_scale_group_size} T={transpose_x_scale} "
         ),
         catastrophic_check=True,
@@ -284,7 +287,9 @@ def test_gemm_afp8wfp8_preshuffle(
 
 @pytest.mark.parametrize("ragged", [False, True])
 @pytest.mark.parametrize("ctas_m, ctas_n", [(2, 1), (1, 2), (2, 2), (4, 1), (1, 4)])
-def test_gluon_preshuffle_cga_multicast(ctas_m: int, ctas_n: int, ragged: bool):
+def test_gluon_block128_preshuffle_cga_multicast(
+    ctas_m: int, ctas_n: int, ragged: bool
+):
     """CTA-cluster (CGA) operand multicast reproduces the single-CTA result.
 
     BLOCK_SIZE_M / BLOCK_SIZE_N become the cluster tile, so a CTAS_M x CTAS_N
@@ -294,7 +299,7 @@ def test_gluon_preshuffle_cga_multicast(ctas_m: int, ctas_n: int, ragged: bool):
     byte or the order it is accumulated in.
     """
     if not _gluon_available():
-        pytest.skip("Gluon MXFP8 preshuffle CGA multicast requires gfx1250")
+        pytest.skip("Gluon MXFP8 block128 preshuffle CGA multicast requires gfx1250")
 
     from triton._C.libtriton.gluon_ir import make_cga_layout
 
@@ -311,7 +316,7 @@ def test_gluon_preshuffle_cga_multicast(ctas_m: int, ctas_n: int, ragged: bool):
     torch.manual_seed(0)
     x_scale_group_size, transpose_x_scale = 128, True
     config, _ = get_gemm_config(
-        "GEMM-AFP8WFP8_PRESHUFFLED", 1024, 1024, 1536, backend="gluon"
+        "GEMM-AFP8WFP8_BLOCK128_PRESHUFFLED", 1024, 1024, 1536, backend="gluon"
     )
     # Enough tiles that the cluster grid has more than one entry in both dims.
     M = config["BLOCK_SIZE_M"] * ctas_m * 2
@@ -337,7 +342,7 @@ def test_gluon_preshuffle_cga_multicast(ctas_m: int, ctas_n: int, ragged: bool):
     def run(cm, cn):
         cfg = copy.deepcopy(config)
         cfg["CTAS_M"], cfg["CTAS_N"] = cm, cn
-        return gemm_afp8wfp8_preshuffle(
+        return gemm_afp8wfp8_block128_preshuffle(
             x_fp8,
             w_kernel,
             x_scales_kernel,
@@ -360,7 +365,7 @@ def test_gluon_preshuffle_cga_multicast(ctas_m: int, ctas_n: int, ragged: bool):
 @pytest.mark.parametrize("M, N, K", get_shapes())
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("x_scale_group_size, transpose_x_scale", SCALE_MODES)
-def test_gemm_afp8wfp8_preshuffle_gluon_matches_triton(
+def test_gemm_afp8wfp8_block128_preshuffle_gluon_matches_triton(
     M: int,
     N: int,
     K: int,
@@ -374,7 +379,7 @@ def test_gemm_afp8wfp8_preshuffle_gluon_matches_triton(
     if not arch_info.is_fp8_avail():
         pytest.skip("MXFP8 GEMM requires FP8-capable arch")
     if not _gluon_available():
-        pytest.skip("Gluon MXFP8 preshuffle requires gfx1250")
+        pytest.skip("Gluon MXFP8 block128 preshuffle requires gfx1250")
     if K % 128 != 0 or N % 128 != 0:
         pytest.skip("Gluon kernel requires N % 128 == 0 and K % 128 == 0")
     torch.cuda.empty_cache()
@@ -393,10 +398,10 @@ def test_gemm_afp8wfp8_preshuffle_gluon_matches_triton(
         "x_scale_group_size": x_scale_group_size,
         "is_x_scale_transposed": transpose_x_scale,
     }
-    triton_out = gemm_afp8wfp8_preshuffle(
+    triton_out = gemm_afp8wfp8_block128_preshuffle(
         x_fp8, w_kernel, x_scales_kernel, w_scales, backend="triton", **kwargs
     )
-    gluon_out = gemm_afp8wfp8_preshuffle(
+    gluon_out = gemm_afp8wfp8_block128_preshuffle(
         x_fp8, w_kernel, x_scales_kernel, w_scales, backend="gluon", **kwargs
     )
 
@@ -1053,3 +1058,329 @@ def test_fused_split_k_concurrent_streams(variant):
     torch.cuda.synchronize()
     for want, got in zip(expected, outputs):
         assert all(torch.equal(want, y) for y in got)
+
+
+# ---------------------------------------------------------------------------
+# gemm_afp8wfp8_preshuffle: the gfx1250 gluon MXFP8 GEMM (e4m3 x e4m3, 1x32 e8m0
+# scales on both operands; also 1x128 x and 32x32 / 128x128 w scales).
+# ---------------------------------------------------------------------------
+
+PRESHUFFLE_SCALE_GROUP = 32
+
+# Applied per test, not as a module pytestmark, since the rest of this file
+# covers other arches.
+_requires_gluon_preshuffle = pytest.mark.skipif(
+    not _is_gluon_available(),
+    reason="gemm_afp8wfp8_preshuffle is gfx1250 (gluon) only",
+)
+
+
+def preshuffle_generate_inputs(M, N, K, seed=0):
+    """e4m3 x/w in [-2, 2) and e8m0 scales in [2^-3, 2^1]; returns raw tensors."""
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    x = (torch.rand((M, K), device="cuda", generator=g) * 4 - 2).to(torch.float8_e4m3fn)
+    w = (torch.rand((N, K), device="cuda", generator=g) * 4 - 2).to(torch.float8_e4m3fn)
+    xs = torch.randint(
+        124,
+        129,
+        (M, K // PRESHUFFLE_SCALE_GROUP),
+        dtype=torch.uint8,
+        device="cuda",
+        generator=g,
+    )
+    ws = torch.randint(
+        124,
+        129,
+        (N, K // PRESHUFFLE_SCALE_GROUP),
+        dtype=torch.uint8,
+        device="cuda",
+        generator=g,
+    )
+    return x, w, xs, ws
+
+
+def preshuffle_layout_scales(s, scale_layout):
+    if scale_layout == "128row":
+        return shuffle_scale_gemm_128row(s)
+    return shuffle_mxfp8fp4_scale(s.contiguous()).view(
+        -1, s.shape[1] * PRESHUFFLE_SCALE_GROUP
+    )
+
+
+def preshuffle_prepare(x, w, xs, ws, scale_layout, x_preshuffled):
+    """Kernel-side inputs: preshuffled w (N // 16, K * 16), optional preshuffled x, laid-out scales."""
+    M, K = x.shape
+    N = w.shape[0]
+    w_k = shuffle_weight(w.view(torch.uint8)).reshape(N // 16, K * 16)
+    x_k = shuffle_weight(x.view(torch.uint8)) if x_preshuffled else x
+    # x scales of a CTA with fewer than 32 rows are read un-shuffled (row-major)
+    xs_k = xs.contiguous() if M < 32 else preshuffle_layout_scales(xs, scale_layout)
+    return x_k, w_k, xs_k, preshuffle_layout_scales(ws, scale_layout)
+
+
+def preshuffle_reference(x, w, xs, ws):
+    xd = x.float() * torch.exp2(xs.float() - 127).repeat_interleave(
+        PRESHUFFLE_SCALE_GROUP, 1
+    )
+    wd = w.float() * torch.exp2(ws.float() - 127).repeat_interleave(
+        PRESHUFFLE_SCALE_GROUP, 1
+    )
+    return xd @ wd.T
+
+
+def preshuffle_check(y, ref):
+    err = ((y.float() - ref).norm() / ref.norm()).item()
+    assert err < 1e-2, f"rel_l2 {err:.3e}"
+    # elementwise: within a couple of bf16 ULPs of the value range
+    tol = 2e-2 * ref.abs().max().item()
+    assert (y.float() - ref).abs().max().item() <= tol
+
+
+PRESHUFFLE_SHAPES = [
+    (1, 1024, 256),
+    (16, 4096, 1024),
+    (31, 7168, 512),
+    (32, 1024, 1024),
+    (150, 2112, 1024),
+    (256, 8192, 2048),
+    (1024, 1024, 1024),
+    (2048, 7168, 4096),
+    (4096, 4096, 4096),
+    (8192, 8192, 1024),
+]
+
+
+@_requires_gluon_preshuffle
+@pytest.mark.parametrize("M, N, K", PRESHUFFLE_SHAPES)
+@pytest.mark.parametrize("scale_layout", ["n32k4", "128row"])
+@pytest.mark.parametrize("x_preshuffled", [False, True])
+def test_gemm_afp8wfp8_preshuffle(M, N, K, scale_layout, x_preshuffled):
+    if x_preshuffled and M % 16:
+        pytest.skip("x_preshuffled needs M % 16 == 0")
+    x, w, xs, ws = preshuffle_generate_inputs(M, N, K)
+    x_k, w_k, xs_k, ws_k = preshuffle_prepare(x, w, xs, ws, scale_layout, x_preshuffled)
+    y = gemm_afp8wfp8_preshuffle(
+        x_k,
+        w_k,
+        xs_k,
+        ws_k,
+        torch.bfloat16,
+        x_preshuffled=x_preshuffled,
+        scale_layout=scale_layout,
+    )
+    preshuffle_check(y, preshuffle_reference(x, w, xs, ws))
+
+
+PRESHUFFLE_CLUSTER_CONFIG = dict(
+    BLOCK_SIZE_M=1024,
+    BLOCK_SIZE_N=1024,
+    BLOCK_SIZE_K=128,
+    num_warps=4,
+    NUM_BUFFERS=3,
+    num_ctas=16,
+    GROUP_M=8,
+    B2B_WMMA=1,
+    NUM_KSUB=1,
+    EPI_SPLIT=1,
+)
+
+
+@_requires_gluon_preshuffle
+@pytest.mark.parametrize("EPI_SPLIT", [1, 2])
+@pytest.mark.parametrize("x_preshuffled", [False, True])
+def test_gemm_afp8wfp8_preshuffle_cluster_config(EPI_SPLIT, x_preshuffled):
+    """Explicit 16-CTA cluster config, incl. the sliced epilogue and a ragged N."""
+    M, N, K = 2048, 3072, 2048
+    x, w, xs, ws = preshuffle_generate_inputs(M, N, K, seed=1)
+    x_k, w_k, xs_k, ws_k = preshuffle_prepare(x, w, xs, ws, "n32k4", x_preshuffled)
+    y = gemm_afp8wfp8_preshuffle(
+        x_k,
+        w_k,
+        xs_k,
+        ws_k,
+        torch.bfloat16,
+        config=dict(PRESHUFFLE_CLUSTER_CONFIG, EPI_SPLIT=EPI_SPLIT),
+        x_preshuffled=x_preshuffled,
+    )
+    preshuffle_check(y, preshuffle_reference(x, w, xs, ws))
+
+
+@_requires_gluon_preshuffle
+def test_gemm_afp8wfp8_preshuffle_rejects_layout_config_keys():
+    x, w, xs, ws = preshuffle_generate_inputs(256, 256, 256)
+    x_k, w_k, xs_k, ws_k = preshuffle_prepare(x, w, xs, ws, "n32k4", False)
+    with pytest.raises(ValueError):
+        gemm_afp8wfp8_preshuffle(
+            x_k, w_k, xs_k, ws_k, config=dict(PRESHUFFLE_CLUSTER_CONFIG, SCALE_MODE=2)
+        )
+
+
+# --- fp8 element formats and coarser e8m0 scale granularities ------------------------
+
+PRESHUFFLE_FP8_DTYPES = {"e4m3": torch.float8_e4m3fn, "e5m2": torch.float8_e5m2}
+
+
+def preshuffle_generate_inputs_fmt(M, N, K, a_fmt, b_fmt, x_group, w_block, seed=0):
+    """fp8 x/w of the given formats, x scales per (1, x_group), w scales per w_block."""
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    x = (torch.rand((M, K), device="cuda", generator=g) * 4 - 2).to(
+        PRESHUFFLE_FP8_DTYPES[a_fmt]
+    )
+    w = (torch.rand((N, K), device="cuda", generator=g) * 4 - 2).to(
+        PRESHUFFLE_FP8_DTYPES[b_fmt]
+    )
+    xs = torch.randint(
+        124, 129, (M, K // x_group), dtype=torch.uint8, device="cuda", generator=g
+    )
+    bn, bk = w_block
+    ws = torch.randint(
+        124, 129, (-(-N // bn), K // bk), dtype=torch.uint8, device="cuda", generator=g
+    )
+    return x, w, xs, ws
+
+
+def preshuffle_reference_fmt(x, w, xs, ws, x_group, w_block):
+    N = w.shape[0]
+    bn, bk = w_block
+    xd = x.float() * torch.exp2(xs.float() - 127).repeat_interleave(x_group, 1)
+    wsd = (
+        torch.exp2(ws.float() - 127)
+        .repeat_interleave(bn, 0)[:N]
+        .repeat_interleave(bk, 1)
+    )
+    return xd @ (w.float() * wsd).T
+
+
+def preshuffle_run_fmt(
+    M, N, K, a_fmt, b_fmt, x_group, w_block, scale_layout="n32k4", x_preshuffled=False
+):
+    x, w, xs, ws = preshuffle_generate_inputs_fmt(
+        M, N, K, a_fmt, b_fmt, x_group, w_block
+    )
+    if x_group == 128:
+        xs_k = xs.T.contiguous()  # compact column-major (K // 128, M)
+    elif M < 32:
+        xs_k = xs.contiguous()
+    else:
+        xs_k = preshuffle_layout_scales(xs, scale_layout)
+    # MX 1x32 w scales are laid out; coarse blocks go in compact, as in the checkpoint
+    ws_k = preshuffle_layout_scales(ws, scale_layout) if w_block == (1, 32) else ws
+    w_k = shuffle_weight(w.view(torch.uint8)).reshape(N // 16, K * 16).view(w.dtype)
+    x_k = shuffle_weight(x.view(torch.uint8)).view(x.dtype) if x_preshuffled else x
+    y = gemm_afp8wfp8_preshuffle(
+        x_k,
+        w_k,
+        xs_k,
+        ws_k,
+        torch.bfloat16,
+        x_preshuffled=x_preshuffled,
+        scale_layout=scale_layout,
+        x_scale_group_size=x_group,
+        w_scale_block_size=w_block,
+    )
+    preshuffle_check(y, preshuffle_reference_fmt(x, w, xs, ws, x_group, w_block))
+
+
+@_requires_gluon_preshuffle
+@pytest.mark.parametrize(
+    "a_fmt, b_fmt",
+    [("e4m3", "e4m3"), ("e5m2", "e5m2"), ("e4m3", "e5m2"), ("e5m2", "e4m3")],
+)
+@pytest.mark.parametrize(
+    "M",
+    [
+        1,
+        7,
+        16,
+        31,
+        32,
+        61,
+        64,
+        127,
+        128,
+        192,
+        256,
+        511,
+        512,
+        1000,
+        1024,
+        1536,
+        2048,
+        3072,
+        8193,
+        16384,
+    ],
+)
+@pytest.mark.parametrize(
+    "N, K",
+    [
+        (4096, 1024),
+        (2112, 2048),
+        (4096, 2048),
+        (9216, 2048),
+        (12352, 2048),
+        (2048, 4096),
+    ],
+)
+def test_gemm_afp8wfp8_preshuffle_formats(M, N, K, a_fmt, b_fmt):
+    preshuffle_run_fmt(M, N, K, a_fmt, b_fmt, 32, (1, 32))
+
+
+@_requires_gluon_preshuffle
+@pytest.mark.parametrize("w_block", [(1, 32), (32, 32), (128, 128)])
+@pytest.mark.parametrize(
+    "M, N, K",
+    [
+        (1, 1024, 256),
+        (31, 7168, 512),
+        (150, 2112, 1024),
+        (256, 8192, 2048),
+        (4096, 4096, 4096),
+    ],
+)
+@pytest.mark.parametrize("x_preshuffled", [False, True])
+def test_gemm_afp8wfp8_preshuffle_x1x128(M, N, K, w_block, x_preshuffled):
+    """DeepSeek-V3.1-style UE8M0: 1x128 x scales (compact column-major) x coarse w scales."""
+    if x_preshuffled and M % 16:
+        pytest.skip("x_preshuffled needs M % 16 == 0")
+    preshuffle_run_fmt(
+        M, N, K, "e4m3", "e4m3", 128, w_block, x_preshuffled=x_preshuffled
+    )
+
+
+@_requires_gluon_preshuffle
+@pytest.mark.parametrize("w_block", [(32, 32), (128, 128)])
+@pytest.mark.parametrize("scale_layout", ["n32k4", "128row"])
+@pytest.mark.parametrize("M, N, K", [(31, 1024, 1024), (2048, 7168, 4096)])
+def test_gemm_afp8wfp8_preshuffle_w_blocks(M, N, K, w_block, scale_layout):
+    preshuffle_run_fmt(M, N, K, "e4m3", "e4m3", 32, w_block, scale_layout=scale_layout)
+
+
+@_requires_gluon_preshuffle
+def test_gemm_afp8wfp8_preshuffle_rejects_bad_args():
+    x, w, xs, ws = preshuffle_generate_inputs_fmt(
+        256, 256, 256, "e4m3", "e4m3", 128, (128, 128)
+    )
+    w_k = shuffle_weight(w.view(torch.uint8)).reshape(16, 256 * 16)
+    xs_k = xs.T.contiguous()
+    with pytest.raises(ValueError):
+        gemm_afp8wfp8_preshuffle(
+            x, w_k, xs_k, ws, x_scale_group_size=64, w_scale_block_size=(128, 128)
+        )
+    with pytest.raises(AssertionError):  # 1x128 x scales must be (K // 128, M)
+        gemm_afp8wfp8_preshuffle(
+            x, w_k, xs, ws, x_scale_group_size=128, w_scale_block_size=(128, 128)
+        )
+    with pytest.raises(ValueError):  # unsupported w block
+        gemm_afp8wfp8_preshuffle(
+            x, w_k, xs_k, ws, x_scale_group_size=128, w_scale_block_size=(64, 64)
+        )
+    with pytest.raises(ValueError):  # compact w scales of the wrong shape
+        gemm_afp8wfp8_preshuffle(
+            x,
+            w_k,
+            xs_k,
+            ws.T.contiguous()[:1],
+            x_scale_group_size=128,
+            w_scale_block_size=(128, 128),
+        )

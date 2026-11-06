@@ -34,12 +34,6 @@ def mxscale_w_scale_block(w_scale_shape: tuple[int, ...], n: int, k: int) -> str
     n_blocks, k_blocks = w_scale_shape[-2], w_scale_shape[-1]
     block = f"{n // n_blocks}x{k // k_blocks}"
     if n % n_blocks or k % k_blocks or block not in MXSCALE_W_SCALE_BLOCKS:
-        # A partial last block (e.g. N=12352 with 128-row blocks: 97 scale rows)
-        # is still that block when ceil(N / rows) and ceil(K / cols) match.
-        for cand in MXSCALE_W_SCALE_BLOCKS:
-            rows, cols = map(int, cand.split("x"))
-            if -(-n // rows) == n_blocks and -(-k // cols) == k_blocks:
-                return cand
         raise ValueError(
             f"w_scale {tuple(w_scale_shape)} is no {MXSCALE_W_SCALE_BLOCKS} block "
             f"of a {n} x {k} weight"

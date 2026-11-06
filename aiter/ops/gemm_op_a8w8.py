@@ -1216,7 +1216,7 @@ def gemm_a8w8_blockscale_bpreshuffle(
             m, n, k, mxscale_w_scale_block(tuple(w_scale.shape), n, k)
         )
         # A tuned triton/gluon row wins over flydsl on the SAME mxfp8_128
-        # operands: gemm_afp8wfp8_preshuffle consumes the e8m0 scales natively
+        # operands: gemm_afp8wfp8_block128_preshuffle consumes the e8m0 scales natively
         # (wmma_scaled on gluon / dot_scaled on triton), so unlike the fp32
         # blockscale path further down there is no scale widening, and the (N, K)
         # shuffled weight + column-major x_scale layout is a direct fit.
@@ -1224,7 +1224,7 @@ def gemm_a8w8_blockscale_bpreshuffle(
         # triton-tuned shape does not require FlyDSL to be installed.
         if config is not None and config["libtype"] == "triton":
             from aiter.ops.triton.gemm.basic.gemm_afp8wfp8 import (
-                gemm_afp8wfp8_preshuffle as _gemm_afp8wfp8_preshuffle_triton,
+                gemm_afp8wfp8_block128_preshuffle as _gemm_afp8wfp8_block128_preshuffle_triton,
             )
 
             # Same convention as the fp32 blockscale triton branch below:
@@ -1232,7 +1232,7 @@ def gemm_a8w8_blockscale_bpreshuffle(
             # anything else -> None (auto gluon->triton detection).
             kernelName = str(config.get("kernelName", ""))
             backend = kernelName if kernelName in ("triton", "gluon") else None
-            return _gemm_afp8wfp8_preshuffle_triton(
+            return _gemm_afp8wfp8_block128_preshuffle_triton(
                 XQ,
                 WQ,
                 # wmma_scaled/dot_scaled take uint8-typed scale operands; e8m0 is

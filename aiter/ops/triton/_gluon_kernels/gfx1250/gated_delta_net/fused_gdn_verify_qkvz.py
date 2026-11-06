@@ -612,9 +612,9 @@ def _fused_gdn_verify_chunk(
     NW: gl.constexpr,
     PAD_SLOT_ID: gl.constexpr,
     HAS_BIAS: gl.constexpr,
-    OUT_FP8: gl.constexpr = False,
+    OUT_MX32: gl.constexpr = False,
+    N32K4: gl.constexpr = False,
     OutScale=None,
-    out_rows=None,
 ):
     """The verify step with the window in chunk form.
 
@@ -970,32 +970,52 @@ def _fused_gdn_verify_chunk(
     core = core.to(gl.float32)
     rms = gl.rsqrt(gl.sum(core * core, 2) / V + eps)
     normalized = core * rms[:, :, None] * weight * _silu(z_gate.to(gl.float32))
-    if OUT_FP8:
-        # MXFP8 for the out projection: one e8m0 scale per (token, value head) -- a
-        # head is one 128-column group -- bit-identical to storing bf16 and running
-        # aiter's per_group_quant_hip(group_size=128, transpose_scale=True,
-        # scale_type=fp8_e8m0): the amax of the bf16-rounded row from the 1e-10
-        # floor (capped at 448 * 2^119), RoundUp ceil_pow2(amax / 448) as the e8m0
-        # exponent e, and RNE(x * 2^(127 - e)) to e4m3. The scale of (row m, group
-        # g) goes to OutScale[g * out_rows + m], the GEMM's transposed layout.
-        gl.static_assert(V == 128, "one value head is one 128-column scale group")
+    if OUT_MX32:
+        # 1x32 MXFP8 for the out projection: fp8 e4m3 values and one e8m0 scale per 32
+        # columns (four per value head), bit-identical to storing bf16 and running the
+        # standalone 1x32 quant (per_group_quant_hip(group_size=32, fp8_e8m0,
+        # scale_layout_m32k4=True) for >= 32 GEMM rows, per_1x32_mx_quant_hip below):
+        # amax of the bf16-rounded group from the 1e-10 floor (capped at 448 * 2^119),
+        # RoundUp ceil_pow2(amax / 448) as the e8m0 byte e, RNE(x * 2^(127 - e)) to e4m3.
+        # The scale of (row m, group g) of the [rows, VH * V] GEMM input goes to
+        #   N32K4: OutScale[(m // 32) * VH * V + (g // 4) * 128 + (m % 32) * 4 + g % 4]
+        #   else:  OutScale[m * (VH * V // 32) + g]
+        gl.static_assert(V % 32 == 0, "whole 32-column groups per value head")
+        KG: gl.constexpr = VH * V // 32
         y = normalized.to(gl.bfloat16).to(gl.float32)
-        amax = gl.minimum(gl.maximum(gl.max(gl.abs(y), 2), 1.0e-10), 448.0 * 6.646139978924579e35)
-        bits = (amax * (1.0 / 448.0)).to(gl.uint32, bitcast=True)
-        expo = ((bits >> 23) & 0xFF).to(gl.int32)
-        expo = expo + (((bits & 0x7FFFFF) != 0) & (expo < 0xFF)).to(gl.int32)
-        inv = ((254 - gl.minimum(expo, 253)).to(gl.uint32) << 23).to(gl.float32, bitcast=True)
-        gl.store(
-            Output + ((bos + wt3) * VH + whead3) * V + wv3,
-            (y * inv[:, :, None]).to(gl.float8e4nv),
-            mask=wlive,
-        )
+        ay = gl.abs(y)
+        grp = wv3 // 32
+        inv_full = gl.zeros([T_P2, RATIO, V], gl.float32, layout=win_layout)
         wt2 = wt[:, None]
         whead2 = group * RATIO + wh[None, :]
+        m2 = bos + wt2
+        live2 = (wt2 < tokens) & (whead2 >= 0)
+        for j in gl.static_range(V // 32):
+            amax = gl.max(gl.where(grp == j, ay, 0.0), 2)
+            amax = gl.minimum(gl.maximum(amax, 1.0e-10), 448.0 * 6.646139978924579e35)
+            bits = (amax * (1.0 / 448.0)).to(gl.uint32, bitcast=True)
+            expo = ((bits >> 23) & 0xFF).to(gl.int32)
+            expo = expo + (((bits & 0x7FFFFF) != 0) & (expo < 0xFF)).to(gl.int32)
+            inv = ((254 - gl.minimum(expo, 253)).to(gl.uint32) << 23).to(
+                gl.float32, bitcast=True
+            )
+            inv_full = gl.where(grp == j, inv[:, :, None], inv_full)
+            gcol = whead2 * (V // 32) + j
+            if N32K4:
+                s_off = (
+                    (m2 // 32) * (KG * 32)
+                    + (gcol // 4) * 128
+                    + (m2 % 32) * 4
+                    + gcol % 4
+                )
+            else:
+                s_off = m2 * KG + gcol
+            gl.store(OutScale + s_off, expo.to(gl.uint8), mask=live2)
+        q8 = gl.minimum(gl.maximum(y * inv_full, -448.0), 448.0)
         gl.store(
-            OutScale + whead2 * out_rows + bos + wt2,
-            expo.to(gl.uint8),
-            mask=(wt2 < tokens) & (whead2 >= 0),
+            Output + ((bos + wt3) * VH + whead3) * V + wv3,
+            q8.to(gl.float8e4nv),
+            mask=wlive,
         )
     else:
         gl.store(
