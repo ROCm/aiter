@@ -470,7 +470,8 @@ def _pack_fn(
 
     Keyed on the tensor object, dropped when it dies, and stamped with its address and
     version counter: an in-place update repacks, a write through fn.data is missed. A
-    repack copies into the buffer captured graphs hold, so a shape change raises.
+    repack copies into the buffer captured graphs hold, so a shape change raises. fn must
+    outlive any graph that captured its pack.
 
     Packing is eager only, runs outside inference mode and autograd, and is waited for
     so no other stream reads it half written. A call that finds an entry records its
