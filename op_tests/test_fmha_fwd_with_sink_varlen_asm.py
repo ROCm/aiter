@@ -1,9 +1,15 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Correctness + perf tests for fmha_fwd_with_sink_varlen_asm (BF16 ASM, gfx1250).
+"""Correctness + perf tests for the gfx1250 varlen ASM forward kernels:
+fmha_fwd_with_sink_varlen_asm (BF16) and fmha_fwd_fp8_varlen_asm (FP8 D192x128).
 
-Public API:  aiter.flash_attn_varlen_func          (the path the model calls)
-Ops layer:   aiter.fmha_fwd_with_sink_varlen_asm    (low-level, packed/varlen)
+BF16  public API:  aiter.flash_attn_varlen_func          (the path the model calls)
+      ops layer:   aiter.fmha_fwd_with_sink_varlen_asm    (low-level, packed/varlen)
+FP8   public API:  aiter.flash_attn_varlen_fp8_pertensor_func,
+                   aiter.flash_attn_varlen_func(..., q/k/v_descale=...)
+      ops layer:   aiter.fmha_fwd_fp8_varlen_asm          (per-tensor fp32 descales,
+                   qk 192 / v 128, bf16 output; its tables and tolerances are in
+                   the FP8 section below; --dtype picks bf16 / fp8)
 
 Built to the aiter op-test standard (see .claude/skills/aiter-op-test): mirror
 test_quant.py — @benchmark + run_perftest candidate loop, a torch reference,
@@ -30,7 +36,8 @@ per-sequence kv_seqlen that is a multiple of 256.  D192x128 has no such
 constraint (sub_K=128 with the border mask compiled in).
 
 Strided inputs: D192x128 takes q/k/v/out views (e.g. v = kv[..., 128:]); they are
-checked against the reference and bit-for-bit against contiguous inputs.
+checked against the reference and bit-for-bit against contiguous inputs (BF16 and
+FP8 alike).
 """
 
 import argparse
@@ -42,7 +49,7 @@ import pandas as pd
 import torch
 
 import aiter
-from aiter import dtypes
+from aiter import dtypes, per_tensor_quant
 from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
@@ -318,11 +325,20 @@ def test_fmha_fwd_with_sink_varlen_asm(
     return ret
 
 
+def _nan_buffer(shape, dtype):
+    """NaN-filled buffer, so a read outside the view shows up (fp8: 0x7f, the
+    e4m3fn NaN)."""
+    if dtype == dtypes.fp8:
+        return torch.full(shape, 0x7F, dtype=torch.uint8).view(dtype)
+    return torch.full(shape, float("nan"), dtype=dtype)
+
+
 def _as_view(x, head_pad=0, token_pad=0, base_off=0):
-    """Strided copy of `x` in a NaN buffer; odd pads/offset give 2-byte-aligned rows."""
+    """Strided copy of `x` in a NaN buffer; odd pads/offset give rows aligned
+    only to the element size (2 B for bf16, 1 B for fp8)."""
     t, h, d = x.shape
     row = h * (d + head_pad) + token_pad
-    buf = torch.full((base_off + t * row,), float("nan"), dtype=x.dtype)
+    buf = _nan_buffer((base_off + t * row,), x.dtype)
     view = buf.as_strided((t, h, d), (row, d + head_pad, 1), base_off)
     view.copy_(x)
     return view
@@ -334,12 +350,13 @@ def _strided_inputs(layout, q, k, v):
     hk, dv = k.size(1), v.size(2)
     if layout == "kv_split":
         # DeepSeek-style: v is the second half of a [.., k_nope | v] projection.
-        kv = torch.full((t, hk, dv + dv), float("nan"), dtype=v.dtype)
+        kv = _nan_buffer((v.size(0), hk, dv + dv), v.dtype)
         kv[..., dv:] = v
         return q, k, kv[..., dv:]
     if layout == "fused_qkv":
         # One row per token holds every q, k and v head back to back.
-        row = torch.full((t, hq * dq + hk * dq + hk * dv), float("nan"), dtype=q.dtype)
+        assert k.size(0) == t, "fused_qkv needs equal q and k token counts"
+        row = _nan_buffer((t, hq * dq + hk * dq + hk * dv), q.dtype)
         qv = row[:, : hq * dq].view(t, hq, dq)
         kvv = row[:, hq * dq : hq * dq + hk * dq].view(t, hk, dq)
         vv = row[:, hq * dq + hk * dq :].view(t, hk, dv)
@@ -354,7 +371,7 @@ def _strided_inputs(layout, q, k, v):
             _as_view(v, head_pad=128),
         )
     if layout == "odd":
-        # Odd-element strides and offsets: rows start only 2-byte aligned.
+        # Odd-element strides and offsets: rows start only element-size aligned.
         return (
             _as_view(q, head_pad=1, token_pad=3),
             _as_view(k, head_pad=1, token_pad=1),
@@ -531,6 +548,93 @@ def test_fmha_fwd_with_sink_varlen_asm_unsupported_stride(case, is_causal):
     }
 
 
+# Attention options _select_gfx1250_fmha_fwd_varlen_asm checks the same way for
+# both kernels.  The gate tests use one sequence of 2 query and 2 key tokens, so
+# max_seqlen_k is 2.  name -> (gate arguments, accepted)
+_ASM_GATE_OPTION_CASES = {
+    "causal": ({"causal": True}, True),
+    "causal, right window 0": ({"causal": True, "window_size_right": 0}, True),
+    "left window >= max_seqlen_k": ({"window_size_left": 2}, True),
+    "non-causal, right window 0": ({"window_size_right": 0}, False),
+    "sliding window": ({"window_size_left": 1}, False),
+    "sink tokens": ({"sink_size": 1}, False),
+    "dropout": ({"dropout_p": 0.1}, False),
+    "soft-cap": ({"logits_soft_cap": 30.0}, False),
+    "no query rows": ({"max_seqlen_q": 0}, False),
+}
+
+
+def _asm_gate_args(case):
+    """Attention-option arguments of the gate for `case`: non-causal plain
+    attention unless the case says otherwise."""
+    args = {
+        "causal": False,
+        "max_seqlen_q": 2,
+        "max_seqlen_k": 2,
+        "window_size_left": -1,
+        "window_size_right": -1,
+        "sink_size": 0,
+        "dropout_p": 0.0,
+        "logits_soft_cap": 0.0,
+        "bias": None,
+        "alibi_slopes": None,
+        "block_table": None,
+        "cu_seqlens_q_padded": None,
+        "cu_seqlens_k_padded": None,
+        "return_softmax": False,
+    }
+    args.update(_ASM_GATE_OPTION_CASES.get(case, ({}, None))[0])
+    return args
+
+
+# name -> served by the bf16 kernel (_select_gfx1250_fmha_fwd_varlen_asm)
+_BF16_GATE_CASES = {
+    "D192x128": True,
+    "D128": True,
+    "D64 with sink logits": True,
+    "D64 without sink logits": False,
+    "D128 with sink logits": False,
+    "D192x128 with sink logits": False,
+    "head dim 256": False,
+    "fp32 descales": False,
+    "zero kv heads": False,
+    **{c: ok for c, (_, ok) in _ASM_GATE_OPTION_CASES.items()},
+}
+
+
+@benchmark()
+def test_fmha_fwd_with_sink_varlen_asm_gate(case):
+    """The gate every dispatch site asks must pick the bf16 kernel for exactly what
+    it serves.  Option cases use D192x128.  Not timed: nothing is launched."""
+    if case.startswith("D64"):
+        d, dv = 64, 64
+    elif case.startswith("D128"):
+        d, dv = 128, 128
+    elif case == "head dim 256":
+        d, dv = 256, 256
+    else:
+        d, dv = 192, 128
+    q, k, v, _ = make_varlen_packed([2], 4, 4, d, dv)
+    if case == "zero kv heads":
+        k, v = k[:, :0], v[:, :0]
+    sink = torch.zeros(4, dtype=dtypes.fp32) if "with sink" in case else None
+    descale = torch.ones(1, dtype=dtypes.fp32) if case == "fp32 descales" else None
+    mha = aiter.ops.mha
+    routed = mha._GFX1250_VARLEN_ASM_BF16 == mha._select_gfx1250_fmha_fwd_varlen_asm(
+        q,
+        k,
+        v,
+        None,
+        sink_ptr=sink,
+        q_descale=descale,
+        k_descale=descale,
+        v_descale=descale,
+        **_asm_gate_args(case),
+    )
+    assert routed == _BF16_GATE_CASES[case], f"{case}: gate returned {routed}"
+    return {"gfx": get_gfx(), "routed to asm": routed}
+
+
 _STRIDED_LAYOUTS = [
     "kv_split",
     "fused_qkv",
@@ -584,6 +688,708 @@ def test_fmha_fwd_with_sink_varlen_asm_perf(
     return ret
 
 
+# ---------------------------------------------------------------------------
+# FP8 D192x128 (fmha_fwd_fp8_varlen_asm): fp8 e4m3fn q/k/v with per-tensor
+# fp32 descales, bf16 output.
+#
+# Candidates (all must reach the ASM kernel and agree bit for bit):
+#   public -> aiter.flash_attn_varlen_fp8_pertensor_func
+#   varlen -> aiter.flash_attn_varlen_func(..., q/k/v_descale=...)  (with LSE)
+#   ops    -> aiter.fmha_fwd_fp8_varlen_asm
+#
+# Reference: fp32 on the dequantized fp8 inputs, emulating the kernel's online
+# softmax block by block (as the poc host's pemu=2): keys in blocks of the
+# kernel's KV tile, query rows in groups of one wave; the first block, or a block
+# whose max exceeds the running max by more than FP8_TAU (exp2 units) in any row
+# of the group, moves the whole group's max and rescales; P = exp(S - running max)
+# is rounded to e4m3 and the row sum is the sum of the rounded P (so is the LSE).
+# What is left between kernel and reference is the summation order and the
+# reduced precision of S inside the fp8 WMMA, which now and then puts a P on the
+# other side of an e4m3 rounding boundary.
+#   * O: an element is "bad" past FP8_ATOL + FP8_RTOL * |ref|.  One such flip can
+#     shift a whole row with few visible keys, so the check counts rows (a token
+#     of a head) holding bad elements and allows a few per thousand; a layout /
+#     mask / rescale bug breaks whole 16-row tiles or every head.
+#   * cos >= FP8_COS_MIN over the whole output.
+#   * LSE: within FP8_LSE_EMU_TOL of the emulated one, for all but as many rows as
+#     O may have bad ones (a flipped P moves the sum of a short row); rows that see
+#     no key are -inf.  The distance to the exact log-sum-exp is only reported:
+#     it is the rounding of P, which has no fixed bound -- P far below the row's
+#     max fall into e4m3's subnormal range or round to zero, and a row whose
+#     weight sits mostly in such P keeps a correspondingly smaller sum.
+# ---------------------------------------------------------------------------
+
+try:  # FlyDSL's gfx1250 fp8 kernel, a reference point in the fp8 perf table
+    from aiter.ops.flydsl.fmha_kernels import flydsl_flash_attn_varlen_fwd
+except Exception:  # noqa: BLE001 -- optional; the table just goes without it
+    flydsl_flash_attn_varlen_fwd = None
+
+FP8_ATOL, FP8_RTOL = 4e-2, 1e-2
+FP8_COS_MIN = 0.9999
+FP8_COS_MIN_EXACT = 0.999  # against the exact softmax: the rounding of P alone moves O
+FP8_LSE_EMU_TOL = 1e-2
+FP8_TAU = 8.0  # the kernel's lazy-rescale threshold (log2 units)
+_FP8_VIAS = ["public", "varlen", "ops"]
+
+
+def _cu(seqlens):
+    return torch.tensor(
+        [0] + torch.tensor(seqlens).cumsum(0).tolist(), dtype=dtypes.i32
+    )
+
+
+def _quant(x):
+    """Per-tensor fp8 quantization; an empty tensor (no keys at all) gets descale 1."""
+    if x.numel() == 0:
+        return x.to(dtypes.fp8), torch.ones(1, dtype=dtypes.fp32)
+    return per_tensor_quant(x, quant_dtype=dtypes.fp8)
+
+
+def make_fp8_varlen(seqlens_q, seqlens_k, hq, hk, seed=0):
+    """Packed fp8 q/k/v quantized from randn with per-tensor descales."""
+    torch.manual_seed(seed)
+    tq, tk = sum(seqlens_q), sum(seqlens_k)
+    q8, qd = _quant(torch.randn(tq, hq, 192, dtype=dtypes.bf16))
+    k8, kd = _quant(torch.randn(tk, hk, 192, dtype=dtypes.bf16))
+    v8, vd = _quant(torch.randn(tk, hk, 128, dtype=dtypes.bf16))
+    return q8, k8, v8, qd, kd, vd, _cu(seqlens_q), _cu(seqlens_k)
+
+
+def _emulate_block(s, scale_log2e, causal_vis, vf):
+    """Kernel-order online softmax for one sequence: s (h, sq, sk) natural-log
+    scores with -inf masked, vf (h, sk, d) values.  Returns O (sq, h, d), LSE of
+    the rounded P (h, sq)."""
+    h, sq, sk = s.shape
+    g = (sq + 63) // 64
+    pad = g * 64 - sq
+    s = torch.nn.functional.pad(s, (0, 0, 0, pad), value=float("-inf"))
+    m = torch.full((h, g * 64), float("-inf"))
+    l = torch.zeros(h, g * 64)
+    o = torch.zeros(h, g * 64, vf.size(-1))
+    tau = FP8_TAU * math.log(2.0)  # FP8_TAU (exp2 units) as natural log
+    for k0 in range(0, sk, 64):
+        sb = s[:, :, k0 : k0 + 64]
+        bm = sb.amax(-1)
+        exceed = (bm > m + tau) & torch.isfinite(bm)
+        upd = (
+            exceed.view(h, g, 64)
+            .any(-1, keepdim=True)
+            .expand(h, g, 64)
+            .reshape(h, g * 64)
+        )
+        if k0 == 0:
+            upd = torch.ones_like(upd)
+        m_new = torch.where(upd, torch.maximum(m, bm), m)
+        alpha = torch.exp(m - m_new).nan_to_num(0.0)
+        alpha = torch.where(torch.isfinite(m), alpha, torch.zeros_like(alpha))
+        l, o = l * alpha, o * alpha[..., None]
+        m = m_new
+        p = torch.exp(sb - m[..., None]).nan_to_num(0.0)
+        p = (
+            torch.where(torch.isfinite(m)[..., None], p, torch.zeros_like(p))
+            .to(dtypes.fp8)
+            .float()
+        )
+        l = l + p.sum(-1)
+        o = o + torch.einsum("hqk,hkd->hqd", p, vf[:, k0 : k0 + 64])
+    o = (o / l[..., None]).nan_to_num(0.0)
+    lse = torch.where(l > 0, m + torch.log(l), torch.full_like(l, float("-inf")))
+    return o[:, :sq].transpose(0, 1), lse[:, :sq]
+
+
+def run_torch_fp8(q8, k8, v8, qd, kd, vd, cu_q, cu_k, *, is_causal, exact=False):
+    """Reference on the dequantized inputs: out (total_q, hq, 128) fp32, lse
+    (total_q, hq) fp32, and the exact LSE (total_q, hq).  Bottom-right causal;
+    rows without keys get O = 0, LSE = -inf.  Emulates the kernel's online softmax
+    (see above); exact=True gives the exact softmax instead (O and LSE)."""
+    total_q, hq, d = q8.shape
+    hk = k8.size(1)
+    scale = 1.0 / math.sqrt(d)
+    out = torch.zeros(total_q, hq, v8.size(-1), dtype=dtypes.fp32)
+    lse = torch.full((total_q, hq), float("-inf"), dtype=dtypes.fp32)
+    lse_exact = torch.full((total_q, hq), float("-inf"), dtype=dtypes.fp32)
+    cuq, cuk = cu_q.tolist(), cu_k.tolist()
+    for b in range(len(cuq) - 1):
+        q0, q1, k0, k1 = cuq[b], cuq[b + 1], cuk[b], cuk[b + 1]
+        sq, sk = q1 - q0, k1 - k0
+        if sq == 0 or sk == 0:
+            continue
+        qf = q8[q0:q1].float() * qd
+        kf = (k8[k0:k1].float() * kd).repeat_interleave(hq // hk, dim=1)
+        vf = (v8[k0:k1].float() * vd).repeat_interleave(hq // hk, dim=1)
+        s = torch.einsum("qhd,khd->hqk", qf, kf) * scale
+        if is_causal:
+            row = torch.arange(sq)[:, None]
+            col = torch.arange(sk)[None, :]
+            s = s.masked_fill((col > row + (sk - sq))[None], float("-inf"))
+        le = torch.logsumexp(s, dim=-1)  # (hq, sq)
+        lse_exact[q0:q1] = le.transpose(0, 1)
+        if exact:
+            p = torch.exp(s - le.unsqueeze(-1)).nan_to_num(0.0)
+            out[q0:q1] = torch.einsum("hqk,khd->qhd", p, vf)
+            lse[q0:q1] = le.transpose(0, 1)
+        else:
+            ob, lb = _emulate_block(s, scale, None, vf.transpose(0, 1))
+            out[q0:q1] = ob
+            lse[q0:q1] = lb.transpose(0, 1)
+    return out, lse, lse_exact
+
+
+def run_kernel_fp8(q8, k8, v8, qd, kd, vd, cu_q, cu_k, max_q, max_k, *, is_causal, via):
+    """Returns (out, lse (total_q, nheads)); lse is None for `public`, which
+    does not return it."""
+    scale = 1.0 / math.sqrt(q8.size(-1))
+    if via == "public":
+        out = aiter.flash_attn_varlen_fp8_pertensor_func(
+            q8,
+            k8,
+            v8,
+            qd,
+            kd,
+            vd,
+            cu_q,
+            cu_k,
+            max_q,
+            max_k,
+            causal=is_causal,
+            softmax_scale=scale,
+        )
+        return out, None
+    if via == "varlen":
+        r = aiter.flash_attn_varlen_func(
+            q8,
+            k8,
+            v8,
+            cu_q,
+            cu_k,
+            max_q,
+            max_k,
+            softmax_scale=scale,
+            causal=is_causal,
+            return_lse=True,
+            q_descale=qd,
+            k_descale=kd,
+            v_descale=vd,
+        )
+        return r[0], r[1].transpose(0, 1)
+    if via == "ops":
+        out, lse = aiter.fmha_fwd_fp8_varlen_asm(
+            q8,
+            k8,
+            v8,
+            qd,
+            kd,
+            vd,
+            cu_q,
+            cu_k,
+            max_q,
+            max_k,
+            softmax_scale=scale,
+            is_causal=is_causal,
+            return_lse=True,
+        )
+        return out, lse.squeeze(-1)
+    raise ValueError(f"unknown via={via!r}")
+
+
+def _fp8_asm_calls(fn):
+    """Run fn() with a spy on the fp8 ctypes entry; returns the number of launches."""
+    mha = aiter.ops.mha
+    asm = mha._fmha_fwd_fp8_varlen_asm
+    calls = []
+
+    def spy(*args, **kwargs):
+        calls.append(1)
+        return asm(*args, **kwargs)
+
+    mha._fmha_fwd_fp8_varlen_asm = spy
+    try:
+        fn()
+    finally:
+        mha._fmha_fwd_fp8_varlen_asm = asm
+    return len(calls)
+
+
+def _fp8_flops_bytes(seqlens_q, seqlens_k, hq, hk, is_causal):
+    """2 GEMMs over the visible (q, k) pairs (bottom-right causal); fp8 q/k/v
+    read once, bf16 O and fp32 LSE written once."""
+
+    def pairs(sq, sk):
+        if not is_causal:
+            return sq * sk
+        if sk >= sq:
+            return sq * (sk - sq) + sq * (sq + 1) / 2
+        return sk * (sk + 1) / 2
+
+    flops = sum(
+        2.0 * hq * pairs(a, b) * (192 + 128) for a, b in zip(seqlens_q, seqlens_k)
+    )
+    tq, tk = sum(seqlens_q), sum(seqlens_k)
+    nbytes = tq * hq * 192 + tk * hk * (192 + 128) + tq * hq * (128 * 2 + 4)
+    return flops, nbytes
+
+
+def check_fp8_against_ref(out, lse, ref, msg, exact=False):
+    """Asserts the fp8 tolerances above against ref = (O, emulated LSE, exact LSE);
+    returns the error summary columns.  exact: ref's O is the exact softmax (cos
+    against FP8_COS_MIN_EXACT, as the rounding of P alone moves O from it) and
+    there is no emulated LSE to check."""
+    o, r = out.float(), ref[0]
+    assert not o.isnan().any(), f"{msg}: NaN in output"
+    bad = (o - r).abs() > FP8_ATOL + FP8_RTOL * r.abs()
+    rows = bad.shape[0] * bad.shape[1]
+    bad_rows = int(bad.any(dim=-1).sum().item())
+    if r.abs().max() == 0:  # no row sees a key: the output must be exactly 0
+        cos = 1.0 if o.abs().max() == 0 else 0.0
+    else:
+        cos = torch.nn.functional.cosine_similarity(
+            o.flatten(), r.flatten(), dim=0
+        ).item()
+    res = {"max_abs": (o - r).abs().max().item(), "bad rows": bad_rows, "cos": cos}
+    assert bad_rows <= max(4, rows // 1000), f"{msg}: {bad_rows} of {rows} rows off"
+    assert cos >= (FP8_COS_MIN_EXACT if exact else FP8_COS_MIN), f"{msg}: cos {cos}"
+    if lse is not None:
+        fin = torch.isfinite(ref[2])
+        assert torch.equal(torch.isfinite(lse), fin), f"{msg}: LSE finite mask differs"
+        # a row that sees no key must merge with weight 0: -inf, never NaN / +inf
+        assert bool(
+            (lse[~fin] == float("-inf")).all()
+        ), f"{msg}: LSE of a row without keys is not -inf"
+        # distance to the exact log-sum-exp: reported, not checked (see above)
+        res["lse err"] = (
+            (lse[fin] - ref[2][fin]).abs().max().item() if fin.any() else 0.0
+        )
+        if exact:
+            return res
+        d = (lse[fin] - ref[1][fin]).abs()
+        off = int((d > FP8_LSE_EMU_TOL).sum().item())
+        assert off <= max(
+            4, rows // 1000
+        ), f"{msg}: LSE of {off} rows off from the emulated one (max {d.max().item()})"
+        res["lse vs emu"] = d.max().item() if fin.any() else 0.0
+        res["lse rows off"] = off
+    return res
+
+
+def _record_fp8(ret, name, fn, ref, flops, nbytes, msg):
+    """Time one candidate and add its us / TFLOPS / TB/s / err columns."""
+    (out, lse), us = run_perftest(fn)
+    ret[f"{name} us"] = us
+    ret[f"{name} TFLOPS"] = flops / us / 1e6
+    ret[f"{name} TB/s"] = nbytes / us / 1e6
+    ret[f"{name} err"] = checkAllclose(
+        ref[0], out.to(dtypes.fp32), rtol=FP8_RTOL, atol=FP8_ATOL, msg=f"{msg} {name}"
+    )
+    return out, lse
+
+
+@benchmark()
+def test_fmha_fwd_fp8_varlen_asm(hq, hk, seqlens_q, seqlens_k, is_causal, layout):
+    """FP8 D192x128: every entry point on dense or strided q/k/v vs the reference;
+    the strided runs must match the dense one bit for bit."""
+    q8, k8, v8, qd, kd, vd, cu_q, cu_k = make_fp8_varlen(seqlens_q, seqlens_k, hq, hk)
+    max_q, max_k = max(seqlens_q), max(seqlens_k)
+    ref = run_torch_fp8(q8, k8, v8, qd, kd, vd, cu_q, cu_k, is_causal=is_causal)
+    dense = run_kernel_fp8(
+        q8, k8, v8, qd, kd, vd, cu_q, cu_k, max_q, max_k, is_causal=is_causal, via="ops"
+    )
+    if layout != "dense":
+        q8, k8, v8 = _strided_inputs(layout, q8, k8, v8)
+    flops, nbytes = _fp8_flops_bytes(seqlens_q, seqlens_k, hq, hk, is_causal)
+    msg = f"fp8 hq={hq} hk={hk} q={seqlens_q} k={seqlens_k} c={is_causal} {layout}"
+
+    candidates = {
+        via: functools.partial(
+            run_kernel_fp8,
+            q8,
+            k8,
+            v8,
+            qd,
+            kd,
+            vd,
+            cu_q,
+            cu_k,
+            max_q,
+            max_k,
+            is_causal=is_causal,
+            via=via,
+        )
+        for via in _FP8_VIAS
+    }
+    ret = {"gfx": get_gfx()}
+    for name, fn in candidates.items():
+        assert _fp8_asm_calls(fn) == 1, f"{msg} via={name}: not one ASM launch"
+        for _ in range(
+            _STRIDED_REPEATS
+        ):  # an intermittent race shows up as one differing run
+            out, lse = fn()
+            assert torch.equal(out, dense[0]), f"{msg} via={name}: O differs from dense"
+            assert lse is None or torch.equal(
+                lse, dense[1]
+            ), f"{msg} via={name}: LSE differs"
+        _record_fp8(ret, name, fn, ref, flops, nbytes, msg)
+    ret.update(check_fp8_against_ref(*dense, ref, msg))
+    return ret
+
+
+def merge_attn_states(o_a, lse_a, o_b, lse_b):
+    """Combine two partial attentions over disjoint key sets (vLLM
+    merge_attn_states math, fp32).  o: (t, h, d); lse: (t, h)."""
+    m = torch.maximum(lse_a, lse_b)
+    m = torch.where(torch.isfinite(m), m, torch.zeros_like(m))
+    w_a, w_b = torch.exp(lse_a - m), torch.exp(lse_b - m)
+    s = w_a + w_b
+    o = (o_a.float() * w_a[..., None] + o_b.float() * w_b[..., None]) / s[..., None]
+    return o.nan_to_num(0.0), m + torch.log(s)
+
+
+def _gather_tokens(x, cu, lo, hi):
+    """Pack tokens [start + lo[b], start + hi[b]) of every sequence of x."""
+    idx = [torch.arange(s + a, s + b) for s, a, b in zip(cu.tolist()[:-1], lo, hi)]
+    return x.index_select(0, torch.cat(idx).to(torch.long))
+
+
+def _kernel_part(q8, k8, v8, qd, kd, vd, cu_q, cu_k, max_q, max_k, causal):
+    return run_kernel_fp8(
+        q8, k8, v8, qd, kd, vd, cu_q, cu_k, max_q, max_k, is_causal=causal, via="ops"
+    )
+
+
+def _reference_part(q8, k8, v8, qd, kd, vd, cu_q, cu_k, max_q, max_k, causal):
+    o, lse, _ = run_torch_fp8(q8, k8, v8, qd, kd, vd, cu_q, cu_k, is_causal=causal)
+    return o, lse
+
+
+def run_chunked_fp8(
+    q8,
+    k8,
+    v8,
+    qd,
+    kd,
+    vd,
+    cu_q,
+    cu_k,
+    prefix_lens,
+    chunk_lens,
+    n_ctx,
+    part=_kernel_part,
+):
+    """MLA-style chunked prefill: the cached prefix in n_ctx non-causal pieces
+    plus the new tokens causally over themselves, merged with their LSEs.  A
+    piece may hold no key of a sequence; that partial result is O = 0, LSE = -inf.
+    part=_reference_part runs the same steps on the reference."""
+    max_q = max(chunk_lens)
+    ends = [p + c for p, c in zip(prefix_lens, chunk_lens)]
+    o, lse = part(
+        q8,
+        _gather_tokens(k8, cu_k, prefix_lens, ends),
+        _gather_tokens(v8, cu_k, prefix_lens, ends),
+        qd,
+        kd,
+        vd,
+        cu_q,
+        cu_q,
+        max_q,
+        max_q,
+        True,
+    )
+    for i in range(n_ctx):
+        lo = [p * i // n_ctx for p in prefix_lens]
+        hi = [p * (i + 1) // n_ctx for p in prefix_lens]
+        lens = [b - a for a, b in zip(lo, hi)]
+        o_p, lse_p = part(
+            q8,
+            _gather_tokens(k8, cu_k, lo, hi),
+            _gather_tokens(v8, cu_k, lo, hi),
+            qd,
+            kd,
+            vd,
+            cu_q,
+            _cu(lens),
+            max_q,
+            max(max(lens), 1),
+            False,
+        )
+        o, lse = merge_attn_states(o, lse, o_p, lse_p)
+    if part is _kernel_part:
+        o = o.to(dtypes.bf16)  # the model keeps the merged output in bf16
+    return o, lse
+
+
+@benchmark()
+def test_fmha_fwd_fp8_varlen_asm_chunked(hq, hk, prefix_lens, chunk_lens, n_ctx):
+    """FP8 chunked prefill: one causal call (one_call) vs prefix pieces + new tokens
+    merged by LSE (merged, the merge in torch so its us is not a kernel time).
+    exact-prefix (a check, not a candidate) merges the kernel's new-token part with
+    an exact fp32 prefix part, as when the other part comes from an exact-LSE backend.
+    References: one_call against the emulated one-call softmax, merged against the
+    same pieces and merge done on the reference, exact-prefix against the exact
+    softmax."""
+    seqlens_k = [p + c for p, c in zip(prefix_lens, chunk_lens)]
+    args = make_fp8_varlen(chunk_lens, seqlens_k, hq, hk)
+    q8, k8, v8, qd, kd, vd, cu_q, cu_k = args
+    ref_one = run_torch_fp8(*args, is_causal=True)
+    ref_exact = run_torch_fp8(*args, is_causal=True, exact=True)
+    ref_merged = (
+        *run_chunked_fp8(*args, prefix_lens, chunk_lens, n_ctx, part=_reference_part),
+        ref_one[2],
+    )
+    refs = {"one_call": ref_one, "merged": ref_merged}
+    flops, nbytes = _fp8_flops_bytes(chunk_lens, seqlens_k, hq, hk, True)
+    msg = f"fp8 chunked hq={hq} prefix={prefix_lens} chunk={chunk_lens} n_ctx={n_ctx}"
+
+    candidates = {
+        "one_call": functools.partial(
+            run_kernel_fp8,
+            *args,
+            max(chunk_lens),
+            max(seqlens_k),
+            is_causal=True,
+            via="ops",
+        ),
+        "merged": functools.partial(
+            run_chunked_fp8, *args, prefix_lens, chunk_lens, n_ctx
+        ),
+    }
+    ret = {"gfx": get_gfx()}
+    res = {}
+    for name, fn in candidates.items():
+        res[name] = _record_fp8(ret, name, fn, refs[name], flops, nbytes, msg)
+        for key, val in check_fp8_against_ref(
+            *res[name], refs[name], f"{msg} {name}"
+        ).items():
+            ret[f"{name} {key}"] = val
+    ret["merged vs one_call max_abs"] = (
+        (res["merged"][0].float() - res["one_call"][0].float()).abs().max().item()
+    )
+
+    zeros = [0] * len(prefix_lens)
+    o_new, lse_new = run_kernel_fp8(
+        q8,
+        _gather_tokens(k8, cu_k, prefix_lens, seqlens_k),
+        _gather_tokens(v8, cu_k, prefix_lens, seqlens_k),
+        qd,
+        kd,
+        vd,
+        cu_q,
+        cu_q,
+        max(chunk_lens),
+        max(chunk_lens),
+        is_causal=True,
+        via="ops",
+    )
+    o_pre, lse_pre, _ = run_torch_fp8(
+        q8,
+        _gather_tokens(k8, cu_k, zeros, prefix_lens),
+        _gather_tokens(v8, cu_k, zeros, prefix_lens),
+        qd,
+        kd,
+        vd,
+        cu_q,
+        _cu(prefix_lens),
+        is_causal=False,
+        exact=True,
+    )
+    mixed = merge_attn_states(o_new, lse_new, o_pre, lse_pre)
+    for key, val in check_fp8_against_ref(
+        *mixed, ref_exact, f"{msg} exact-prefix", exact=True
+    ).items():
+        ret[f"exact-prefix {key}"] = val
+    return ret
+
+
+# name -> served by the fp8 kernel (_select_gfx1250_fmha_fwd_varlen_asm)
+_FP8_GATE_CASES = {
+    "supported": True,
+    "per-head descale": False,
+    "fp64 descale": False,
+    "no descale": False,
+    "head dim 128": False,
+    "bf16 q": False,
+    "k token stride 2^24 B": False,
+    "fp32 out": False,
+    "sink logits": False,
+    "descale on cpu": False,
+    "zero kv heads": False,
+    **{c: ok for c, (_, ok) in _ASM_GATE_OPTION_CASES.items()},
+}
+
+
+@benchmark()
+def test_fmha_fwd_fp8_varlen_asm_gate(case):
+    """The gate every dispatch site asks must pick the fp8 kernel for exactly what
+    it serves.  Not timed: nothing is launched."""
+    q8, k8, v8, qd, kd, vd, _, _ = make_fp8_varlen([2], [2], 4, 4)
+    out, sink = None, None
+    if case == "per-head descale":
+        qd = qd.expand(4).contiguous()
+    elif case == "fp64 descale":
+        qd = qd.double()
+    elif case == "no descale":
+        qd = None
+    elif case == "head dim 128":
+        q8, k8 = q8[..., :128], k8[..., :128]
+    elif case == "bf16 q":
+        q8 = q8.to(dtypes.bf16)
+    elif case == "k token stride 2^24 B":
+        far = torch.empty((1 << 24) + 4 * 192, dtype=k8.dtype)
+        k8 = far.as_strided(k8.shape, (1 << 24, 192, 1))
+    elif case == "fp32 out":
+        out = torch.empty(2, 4, 128, dtype=dtypes.fp32)
+    elif case == "sink logits":
+        sink = torch.zeros(4, dtype=dtypes.fp32)
+    elif case == "descale on cpu":
+        qd = qd.cpu()
+    elif case == "zero kv heads":
+        k8, v8 = k8[:, :0], v8[:, :0]
+    mha = aiter.ops.mha
+    routed = mha._GFX1250_VARLEN_ASM_FP8 == mha._select_gfx1250_fmha_fwd_varlen_asm(
+        q8,
+        k8,
+        v8,
+        out,
+        sink_ptr=sink,
+        q_descale=qd,
+        k_descale=kd,
+        v_descale=vd,
+        **_asm_gate_args(case),
+    )
+    assert routed == _FP8_GATE_CASES[case], f"{case}: gate returned {routed}"
+    return {"gfx": get_gfx(), "routed to asm": routed}
+
+
+# name -> the C++ entry's error for a direct call with that operand
+_FP8_OPS_REFUSED_CASES = {
+    "descale on cpu": "must be on the same GPU as q",
+    "zero kv heads": "head counts must be positive",
+}
+
+
+@benchmark()
+def test_fmha_fwd_fp8_varlen_asm_ops_refused(case):
+    """A direct call with an operand the kernel cannot use must be refused by the
+    C++ entry rather than launched.  Not timed: nothing is launched."""
+    q8, k8, v8, qd, kd, vd, cu_q, cu_k = make_fp8_varlen([2], [2], 4, 4)
+    if case == "descale on cpu":
+        qd = qd.cpu()
+    elif case == "zero kv heads":
+        k8, v8 = k8[:, :0], v8[:, :0]
+    try:
+        aiter.fmha_fwd_fp8_varlen_asm(q8, k8, v8, qd, kd, vd, cu_q, cu_k, 2, 2)
+        refused = False
+    except RuntimeError as e:
+        refused = _FP8_OPS_REFUSED_CASES[case] in str(e)
+    assert refused, f"{case}: the C++ entry did not refuse it"
+    return {"gfx": get_gfx(), "ops refused": refused}
+
+
+@benchmark()
+def test_fmha_fwd_fp8_varlen_asm_perf(batch, seqlen_q, seqlen_k, hq, hk, is_causal):
+    """FP8 perf only (the O(s^2) reference is infeasible at these lengths).
+
+    fp8 asm is the kernel under test (public entry point).  For comparison:
+    bf16 asm -- aiter.flash_attn_varlen_func on the same values in bf16 (the bf16
+    D192x128 ASM on gfx1250); flydsl fp8 -- FlyDSL's gfx1250 fp8 kernel on the same
+    fp8 values and descales.  TFLOPS use the same FLOP count for all three; TB/s
+    the fp8 traffic."""
+    seqlens_q, seqlens_k = [seqlen_q] * batch, [seqlen_k] * batch
+    args = make_fp8_varlen(seqlens_q, seqlens_k, hq, hk)
+    q8, k8, v8, qd, kd, vd, cu_q, cu_k = args
+    scale = 1.0 / math.sqrt(192)
+    flops, nbytes = _fp8_flops_bytes(seqlens_q, seqlens_k, hq, hk, is_causal)
+    q16, k16, v16 = (
+        (x.float() * d).to(dtypes.bf16) for x, d in ((q8, qd), (k8, kd), (v8, vd))
+    )
+    candidates = {
+        "fp8 asm": functools.partial(
+            run_kernel_fp8, *args, seqlen_q, seqlen_k, is_causal=is_causal, via="public"
+        ),
+        "bf16 asm": functools.partial(
+            aiter.flash_attn_varlen_func,
+            q16,
+            k16,
+            v16,
+            cu_q,
+            cu_k,
+            seqlen_q,
+            seqlen_k,
+            softmax_scale=scale,
+            causal=is_causal,
+        ),
+    }
+    if flydsl_flash_attn_varlen_fwd is not None:
+        fly = functools.partial(
+            flydsl_flash_attn_varlen_fwd,
+            q8,
+            k8,
+            v8,
+            cu_q,
+            cu_k,
+            seqlen_q,
+            seqlen_k,
+            softmax_scale=scale,
+            causal=is_causal,
+            q_descale=qd,
+            k_descale=kd,
+            v_descale=vd,
+        )
+        if fly() is not None:  # None: FlyDSL does not take this configuration
+            candidates["flydsl fp8"] = fly
+    ret = {"gfx": get_gfx()}
+    assert (
+        _fp8_asm_calls(candidates["fp8 asm"]) == 1
+    ), "fp8 asm did not reach the ASM kernel"
+    for name, fn in candidates.items():
+        _, us = run_perftest(fn)
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = flops / us / 1e6
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+    return ret
+
+
+# (hq, hk, seqlens_q, seqlens_k): one sequence, GQA, q < k (chunked prefill),
+# q > k (causal rows that see no key), mixed varlen, short sequences.
+_FP8_CORRECTNESS_SHAPES = [
+    (16, 16, [1024], [1024]),
+    (16, 4, [1000], [1000]),
+    (8, 8, [768], [2048]),
+    (8, 8, [300], [65]),
+    (16, 4, [77, 513, 256], [130, 1000, 65]),
+    (8, 2, [1, 64, 255, 257], [1, 64, 255, 257]),
+    (32, 32, [2048, 2048], [2048, 2048]),
+    (
+        8,
+        2,
+        [64, 300],
+        [0, 0],
+    ),  # no keys at all (a chunked-prefill piece no sequence reaches)
+    (8, 8, [0, 512, 77], [100, 512, 0]),  # a sequence without queries, one without keys
+]
+# dense plus the strided layouts above (fused_qkv needs equal q and k lengths)
+_FP8_LAYOUTS = ["dense"] + _STRIDED_LAYOUTS
+# (hq, hk, prefix_lens, chunk_lens, n_ctx); prefix 0 leaves a sequence without
+# keys in every prefix piece
+_FP8_CHUNKED_SHAPES = [
+    (16, 16, [2048], [512], 1),
+    (16, 16, [3000], [1000], 3),
+    (8, 2, [1000, 4096, 77], [300, 1024, 129], 2),
+    (8, 2, [0, 1500, 77], [256, 300, 129], 2),
+    (8, 2, [0, 0], [256, 129], 1),  # the prefix piece holds no key of any sequence
+    (16, 16, [6144], [2048], 2),
+]
+# (batch, seqlen_q, seqlen_k, hq, hk); 96 heads with long sequences is the target
+# (1 x 12288 / 14336 the typical shape), the rest for reference
+_FP8_PERF_SHAPES = [
+    (1, 12288, 14336, 96, 96),
+    (1, 16384, 16384, 96, 96),
+    (1, 2048, 14336, 96, 96),
+    (1, 16384, 16384, 32, 32),
+    (1, 16384, 16384, 64, 4),
+    (4, 4096, 4096, 128, 128),
+    (12, 1024, 1024, 128, 128),
+]
+
+
 def summarize(name, rows):
     aiter.logger.info(
         "fmha_fwd_with_sink_varlen_asm %s summary (markdown):\n%s",
@@ -628,76 +1434,130 @@ def main():
         nargs="*",
         choices=["randn", "const0.25"],
         default=["randn", "const0.25"],
-        help="q/k/v init pattern(s) (default: randn const0.25)",
+        help="q/k/v init pattern(s) (default: randn const0.25); bf16 only",
+    )
+    parser.add_argument(
+        "--dtype",
+        type=str,
+        nargs="*",
+        choices=["bf16", "fp8"],
+        default=["bf16", "fp8"],
+        help="q/k/v dtype(s): bf16 (fmha_fwd_with_sink_varlen_asm) and/or fp8\n"
+        "(fmha_fwd_fp8_varlen_asm, D192x128 only) (default: bf16 fp8)",
     )
     args = parser.parse_args()
     causal_modes = [bool(c) for c in args.causal]
 
-    # ---- correctness + perf table ----
-    df = []
-    for hdim_q, hdim_v, hq, hk, seqlens in _CORRECTNESS_SHAPES:
-        if hdim_q not in args.head_dim:
-            continue
-        for is_causal, init in itertools.product(causal_modes, args.init):
-            if not is_causal and not _kv_alignment_ok(hdim_q, seqlens):
+    if "bf16" in args.dtype:
+        # ---- correctness + perf table ----
+        df = []
+        for hdim_q, hdim_v, hq, hk, seqlens in _CORRECTNESS_SHAPES:
+            if hdim_q not in args.head_dim:
                 continue
-            df.append(
-                test_fmha_fwd_with_sink_varlen_asm(
-                    hdim_q, hdim_v, hq, hk, seqlens, is_causal, init
+            for is_causal, init in itertools.product(causal_modes, args.init):
+                if not is_causal and not _kv_alignment_ok(hdim_q, seqlens):
+                    continue
+                df.append(
+                    test_fmha_fwd_with_sink_varlen_asm(
+                        hdim_q, hdim_v, hq, hk, seqlens, is_causal, init
+                    )
                 )
-            )
-    df = pd.DataFrame(df)
-    aiter.logger.info(
-        "fmha_fwd_with_sink_varlen_asm correctness summary (markdown):\n%s",
-        df.to_markdown(index=False),
-    )
-
-    # ---- D192x128 strided q/k/v/out ----
-    if 192 in args.head_dim:
-        summarize(
-            "D192x128 strided q/k/v",
-            [
-                test_fmha_fwd_with_sink_varlen_asm_strided(hq, hk, seqlens, c, layout)
-                for (hq, hk, seqlens), c, layout in itertools.product(
-                    _STRIDED_SHAPES, causal_modes, _STRIDED_LAYOUTS
-                )
-            ],
+        df = pd.DataFrame(df)
+        aiter.logger.info(
+            "fmha_fwd_with_sink_varlen_asm correctness summary (markdown):\n%s",
+            df.to_markdown(index=False),
         )
         summarize(
-            "D192x128 strided out",
-            [
-                test_fmha_fwd_with_sink_varlen_asm_strided_out(hq, hk, seqlens, c, w)
-                for (hq, hk, seqlens), c, w in itertools.product(
-                    _STRIDED_SHAPES, causal_modes, _STRIDED_OUT_WIDTHS
-                )
-            ],
-        )
-        summarize(
-            "D192x128 unsupported stride",
-            [
-                test_fmha_fwd_with_sink_varlen_asm_unsupported_stride(case, c)
-                for case, c in itertools.product(
-                    ["k token stride 2^24 B", "k/v head stride 0"], causal_modes
-                )
-            ],
+            "bf16 gate",
+            [test_fmha_fwd_with_sink_varlen_asm_gate(c) for c in _BF16_GATE_CASES],
         )
 
-    # ---- perf-only table (large shapes; ref infeasible) ----
-    df = []
-    for hdim_q, hdim_v, hq, hk, seqlens in _VARLEN_PERF_SHAPES:
-        if hdim_q not in args.head_dim:
-            continue
-        for is_causal, init in itertools.product(causal_modes, args.init):
-            df.append(
-                test_fmha_fwd_with_sink_varlen_asm_perf(
-                    hdim_q, hdim_v, hq, hk, seqlens, is_causal, init
-                )
+        # ---- D192x128 strided q/k/v/out ----
+        if 192 in args.head_dim:
+            summarize(
+                "D192x128 strided q/k/v",
+                [
+                    test_fmha_fwd_with_sink_varlen_asm_strided(
+                        hq, hk, seqlens, c, layout
+                    )
+                    for (hq, hk, seqlens), c, layout in itertools.product(
+                        _STRIDED_SHAPES, causal_modes, _STRIDED_LAYOUTS
+                    )
+                ],
             )
-    df = pd.DataFrame(df)
-    aiter.logger.info(
-        "fmha_fwd_with_sink_varlen_asm perf summary (markdown):\n%s",
-        df.to_markdown(index=False),
-    )
+            summarize(
+                "D192x128 strided out",
+                [
+                    test_fmha_fwd_with_sink_varlen_asm_strided_out(
+                        hq, hk, seqlens, c, w
+                    )
+                    for (hq, hk, seqlens), c, w in itertools.product(
+                        _STRIDED_SHAPES, causal_modes, _STRIDED_OUT_WIDTHS
+                    )
+                ],
+            )
+            summarize(
+                "D192x128 unsupported stride",
+                [
+                    test_fmha_fwd_with_sink_varlen_asm_unsupported_stride(case, c)
+                    for case, c in itertools.product(
+                        ["k token stride 2^24 B", "k/v head stride 0"], causal_modes
+                    )
+                ],
+            )
+
+        # ---- perf-only table (large shapes; ref infeasible) ----
+        df = []
+        for hdim_q, hdim_v, hq, hk, seqlens in _VARLEN_PERF_SHAPES:
+            if hdim_q not in args.head_dim:
+                continue
+            for is_causal, init in itertools.product(causal_modes, args.init):
+                df.append(
+                    test_fmha_fwd_with_sink_varlen_asm_perf(
+                        hdim_q, hdim_v, hq, hk, seqlens, is_causal, init
+                    )
+                )
+        df = pd.DataFrame(df)
+        aiter.logger.info(
+            "fmha_fwd_with_sink_varlen_asm perf summary (markdown):\n%s",
+            df.to_markdown(index=False),
+        )
+
+    # ---- FP8 D192x128 (fmha_fwd_fp8_varlen_asm) ----
+    if "fp8" in args.dtype and 192 in args.head_dim:
+        summarize(
+            "fp8 D192x128",
+            [
+                test_fmha_fwd_fp8_varlen_asm(hq, hk, sq, sk, c, layout)
+                for (hq, hk, sq, sk), c, layout in itertools.product(
+                    _FP8_CORRECTNESS_SHAPES, causal_modes, _FP8_LAYOUTS
+                )
+                if layout != "fused_qkv" or sq == sk  # one row holds q, k and v
+            ],
+        )
+        if True in causal_modes:  # chunked prefill is causal
+            summarize(
+                "fp8 D192x128 chunked prefill",
+                [test_fmha_fwd_fp8_varlen_asm_chunked(*s) for s in _FP8_CHUNKED_SHAPES],
+            )
+        summarize(
+            "fp8 D192x128 gate",
+            [test_fmha_fwd_fp8_varlen_asm_gate(c) for c in _FP8_GATE_CASES],
+        )
+        summarize(
+            "fp8 D192x128 ops refused",
+            [
+                test_fmha_fwd_fp8_varlen_asm_ops_refused(c)
+                for c in _FP8_OPS_REFUSED_CASES
+            ],
+        )
+        summarize(
+            "fp8 D192x128 perf",
+            [
+                test_fmha_fwd_fp8_varlen_asm_perf(*s, c)
+                for s, c in itertools.product(_FP8_PERF_SHAPES, causal_modes)
+            ],
+        )
 
 
 if __name__ == "__main__":

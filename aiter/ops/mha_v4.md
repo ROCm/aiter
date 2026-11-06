@@ -5,23 +5,25 @@ dispatch metadata. Unsupported recipes fail instead of falling back to another a
 
 ## Scope
 
-- Contiguous BF16 BSHD inputs with head dimension 128.
+- Contiguous BF16 BSHD inputs with head dimension 128, or 256 for dense MXFP4 and MXFP6 on GFX950.
 - BF16 BSHD output.
 - Dense and sorted block-sparse inference.
-- GFX950 LDS-staged sparse recipes support up to 8,192 KV tiles per sequence.
+- Each sparse row declares the KV tiles per sequence it can traverse (`lut_max`);
+  the launcher refuses longer sequences instead of overrunning a staged LUT.
 - Grouped-query ratios `1, 2, 4, 8, 16`.
 - Per-batch key lengths via `seqlens_k`, on every dense GFX950 row. Entries clamp to the padded
-  key extent, and a null pointer lets one object serve dense and varlen. Sorted sparse rejects it
-  (it relies on the padded key length to skip the border mask), and so does GFX942.
-- Log-sum-exp via `return_lse`, on the dense GFX950 rows. Sorted sparse rejects it, and so does
-  GFX942 until its exported value is measured. The value is the log-sum-exp of the *quantized*
-  scores, so its error tracks the row max at each format's score precision (~0.001 nats for
-  BF16 Q/K, 36 for MXFP6, 153 for MXFP4, against 1418 nats of range): safe for merging
-  same-recipe ring chunks, wrong as an absolute quantity or across mixed recipes.
+  key extent, and a null pointer lets one object serve dense and varlen. Sorted sparse and GFX942
+  reject it.
+- Log-sum-exp via `return_lse` on GFX950, wherever the selected manifest row declares `lse`, which
+  today is every dense and every sparse row. GFX942 rejects it until its exported value is measured.
+  The value is the log-sum-exp of the *quantized* scores, so its error tracks the row max at each
+  format's score precision (~0.001 nats for BF16 Q/K, 36 for MXFP6, 153 for MXFP4, against 1418
+  nats of range): safe for merging same-recipe ring chunks, wrong as an absolute quantity or across
+  mixed recipes.
 - No backward, dropout, RNG state, causal, or Q-side varlen support yet.
 
-Supported recipes. Every recipe is available in both dense and sorted-sparse mode with the same
-V packing and scale modes.
+Supported GFX950 recipes. Every recipe is available in both dense and sorted-sparse mode with the
+same V packing and scale modes.
 
 | Q/K | V | Modes |
 |---|---|---|
@@ -36,7 +38,12 @@ V packing and scale modes.
 | MXFP6 | MXFP4 | dense, sparse |
 | MXFP4 | MXFP4 | dense, sparse |
 
+GFX942 ships per-tensor FP8/FP8 and INT8/FP8 in both modes.
+
 MXFP4 Q/K requires MXFP4 V. The FP8-V variant is retired.
+
+Head dimension 256 exists only for all-MXFP4 and all-MXFP6 Q/K/V, dense, on GFX950. Every other
+recipe, sorted sparse, and GFX942 reject it.
 
 ## Ownership
 
@@ -44,7 +51,8 @@ MXFP4 Q/K requires MXFP4 V. The FP8-V variant is retired.
 
 - `AttentionFormat`, `AttentionScaleMode`, and `AttentionPack`;
 - raw recipe selection and validation;
-- dense/sparse manifest dispatch;
+- dense/sparse manifest dispatch and the geometry queries (`mha_v4_block_tile`,
+  `mha_v4_block_tiles`, `mha_v4_kv_tile`, `mha_v4_operands`);
 - `mha_v4` and `mha_v4_packed`;
 - final launch wrappers that rebuild packed views.
 
@@ -129,6 +137,14 @@ calling `mha_v4_packed`.
 MXFP4 V uses E2M1 values with one E8M0 scale per `(channel, 32-token)` block. Each 128-token tile
 contributes 8,192 data bytes and 512 scale bytes. The data buffer includes 64 bytes of launch slack.
 
+At head dimension 256 the MXFP4 producers run the hd128 kernels on a `[B, S, 2H, 128]` view, so
+each tile carries twice the data and scale bytes and the slack doubles to 128 bytes. The Hadamard
+acts on each 128-wide half independently, which keeps it orthogonal and Q.K^T unchanged.
+
+hd256 MXFP6 reuses the hd128 MXFP6 producers the same way, then byte-gathers each pair of 128-token
+hd128 K/V records into two 64-token hd256 records: K 13,312 bytes (row stride 208) with its K-scale
+tail inside the record, V 12,288 bytes (row stride 192), V scales 1,024 bytes per 128 tokens.
+
 `AttentionPack.DEFAULT` is the canonical V token order. `AttentionPack.V_FOR_FP6_P` selects the V
 token order that FP6-P and FP4-P consumers require, and a row's packing no longer depends on the
 mode: dense and sparse rows for the same recipe select the same pack. Numeric format and consumer
@@ -140,13 +156,22 @@ Changing a custom op's output shape or packed layout requires a versioned custom
 
 Raw callers pass an optional boolean `block_mask`:
 
-- gfx950 geometry: 256 query tokens by 128 KV tokens;
-- gfx942 geometry: 256 query tokens by 64 KV tokens;
-- shape `[B, H, Qtiles, KVtiles]` or `[B, Qtiles, KVtiles]` with head broadcast.
+- shape `[B, H, Qtiles, KVtiles]` or `[B, Qtiles, KVtiles]` with head broadcast;
+- geometry `block_tile`, defaulting to the recipe's own: on gfx950 256x64 for BF16 and BF16/FP8
+  Q/K and 256x128 for the rest, on gfx942 256x64 throughout;
+- gfx950 also ships 64x64 sparse rows for FP8, INT8/FP8, BF16, BF16/FP8, MXFP8, FP8/MXFP6,
+  MXFP6, MXFP6/MXFP4, MXFP4 (the MX V rows in FP6-P order) and MXFP6/FP8.
+
+The geometry is a property of the manifest row, so the rows no longer agree on one KV tile per
+arch. Ask `mha_v4_block_tile(mha_v4_operands(...), mode)` or `mha_v4_block_tiles(...)` with the
+operands being launched; `mha_v4_kv_tile()` without operands raises where the rows disagree rather
+than returning a tile the mask may not match.
 
 Packed callers pass all or none of the int32 LUT triple: `kv_block_indices`, `lut_start`, and
-`lut_count`. LUT/work-table rows are per query head, including under GQA. Dense uses manifest
-`mode=0`; sorted sparse uses `mode=1` and a separate launcher/code object.
+`lut_count`, plus `block_tile` for a non-default geometry. LUT/work-table rows are per query head,
+including under GQA. Dense uses manifest `mode=0`; sorted sparse uses `mode=1` and a separate
+launcher/code object. A row declaring `ragged_kv` accepts a key length that is not a multiple of
+its KV tile; the others refuse it.
 
 An empty sparse row is valid and writes a zero output tile. Set `AITER_MHA_V4_VALIDATE_LUT=1` for
 device-side start/count/index validation; it synchronizes and is disabled by default.
@@ -167,15 +192,16 @@ of the same code object may remain exact where determinism is part of the test.
 
 ## Validation
 
-Run `pytest op_tests/test_mha_v4.py` for entrypoint changes. Quantizer/layout changes additionally
+Run `python3 op_tests/test_mha_v4.py` and `python3 op_tests/test_mha_v4_sparse.py` for entrypoint
+changes; CI runs them as scripts, not under pytest. Quantizer/layout changes additionally
 require byte-level checks at aligned and ragged sequence lengths, eager/fullgraph parity, allocator
 churn, and downstream-consumer coverage. Kernel performance changes require the relevant retained
 model captures and balanced multi-GPU target-shape benchmarks.
 
-`_LSE_CAPABLE_QV` and `_VARLEN_CAPABLE_QV` are claims about the deployed objects, and both are keyed
-on `(q_format, v_format)` alone -- a new object for an already-claimed pair inherits the claim
-without being rebuilt, and answers stay plausible because the feature is simply ignored. The suite
-disassembles every claimed row rather than trusting the table.
+`_VARLEN_CAPABLE_QV` is a claim about the deployed dense objects, keyed on `(q_format, v_format)`
+alone -- a new object for an already-claimed pair inherits the claim without being rebuilt, and
+answers stay plausible because the feature is simply ignored. The suite disassembles every claimed
+row rather than trusting the table. LSE is claimed per row instead, by the manifest's `lse` column.
 
 Key implementation locations:
 
