@@ -228,6 +228,41 @@ def test_xcd_counts_are_distinct_kernels_and_jobs(monkeypatch):
     )
 
 
+def _gdn_h_row_jobs():
+    from aiter.aot.flydsl import chunk_gdn_h
+    from aiter.aot.flydsl.common import collect_aot_jobs
+
+    return chunk_gdn_h, collect_aot_jobs(
+        chunk_gdn_h.DEFAULT_CSVS, chunk_gdn_h.parse_csv
+    )
+
+
+def test_gdn_h_rows_fork_to_the_part_they_were_tuned_on():
+    module, rows = _gdn_h_row_jobs()
+    forked = replay._with_xcd_variants(module, rows)
+    assert rows and len(forked) == len(rows)
+    assert {(j["num_xcds"], j["cu_num"]) for j in forked} == {(4, 80)}
+
+
+def test_gdn_h_row_parts_are_in_the_device_table():
+    _, rows = _gdn_h_row_jobs()
+    for gfx, cu_num in {(j["gfx"], j["cu_num"]) for j in rows}:
+        assert cu_num in {cus for _, cus in replay.DEVICE_PARTS[gfx]}, (gfx, cu_num)
+
+
+def test_device_parts_match_build_target_cu_counts():
+    from aiter.jit.utils.build_targets import GFX_CU_NUMS_MAP
+
+    for gfx, parts in replay.DEVICE_PARTS.items():
+        assert tuple(cus for _, cus in parts) == GFX_CU_NUMS_MAP[gfx]
+
+
+def test_unknown_cu_num_raises():
+    module, rows = _gdn_h_row_jobs()
+    with pytest.raises(ValueError, match="cu_num=77"):
+        replay._with_xcd_variants(module, [{**rows[0], "cu_num": 77}])
+
+
 def test_replay_does_not_query_hip_for_the_xcd_count(monkeypatch):
     from aiter.aot.flydsl import chunk_gdn_blocked
     from aiter.jit.utils import chip_info

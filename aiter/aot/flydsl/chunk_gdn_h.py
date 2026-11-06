@@ -41,11 +41,10 @@ _DTYPES = ("torch.bfloat16", "torch.float16")
 # widest BV, as the work per CU only grows.
 _MAX_SEQUENCES = 8192
 _G_HEAD_MAJOR = (False, True)
-# XCD counts of the parts of each arch (MI300X: 8, MI350P: 4, MI355X: 8; MI300A
-# partitions vary). NUM_XCDS is a kernel kwarg and so part of the cache key; the
-# runtime reads it from the device, so each count is its own job, which replay
-# forks from the rows below and replays on a device profile of that count.
-XCD_VARIANTS = {"gfx942": (4, 8), "gfx950": (4, 8)}
+# Arches whose tuned rows replay forks by XCD count (``replay.DEVICE_PARTS``).
+# NUM_XCDS is a kernel kwarg and so part of the cache key; each row forks only to
+# the part with its (gfx, cu_num), so a row serves the one part it was tuned on.
+XCD_VARIANTS = ("gfx942", "gfx950")
 
 
 def _bool(value: str | None, default: bool) -> bool:

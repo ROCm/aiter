@@ -538,28 +538,56 @@ def _jobs(module: Any, csv_paths: list[str], args: argparse.Namespace | None) ->
     return _with_xcd_variants(module, jobs)
 
 
+# Real parts per arch as (XCDs, CUs). The XCD count is a compile-time kernel kwarg
+# (part of the cache key) that the runtime reads from the device, and a tuned row
+# is looked up by (gfx, cu_num), so a part is identified by both. Sources: the
+# GPU hardware specifications of rocm.docs.amd.com (CU counts; 38 CUs per XCD on
+# gfx942, 32 on gfx950) and ROCm/aiter PR #6327 (MI308X has 4 XCDs). The CU counts
+# match ``GFX_CU_NUMS_MAP`` in aiter/jit/utils/build_targets.py (cross-checked by
+# tests/test_flydsl_aot_replay.py).
+DEVICE_PARTS = {
+    "gfx942": (
+        (8, 304),  # MI300X, MI325X
+        (6, 228),  # MI300A
+        (4, 80),  # MI308X
+    ),
+    "gfx950": (
+        (8, 256),  # MI350X, MI355X
+        (4, 128),  # MI350P
+    ),
+}
+
+
 def _with_xcd_variants(module: Any, jobs: list[dict]) -> list[dict]:
-    """Fork each job that names no ``num_xcds`` once per XCD count its arch has
-    in ``module.XCD_VARIANTS`` (arch -> counts). The count is a compile-time
-    kernel kwarg, so every part variant is its own cache entry and job. An entry
-    may be an ``(xcds, cu_num)`` pair when the CU count of the part also varies;
-    the job's ``cu_num`` is then set from it."""
-    variants = getattr(module, "XCD_VARIANTS", None)
-    if not variants:
+    """Fork each job that names no ``num_xcds`` into one job per real part of
+    its arch (``DEVICE_PARTS``), for the arches in ``module.XCD_VARIANTS``. The
+    count is a compile-time kernel kwarg, so every part is its own cache entry.
+
+    A job carrying a ``cu_num`` (a tuned row) forks only to the parts with that
+    CU count, and a cu_num that no part has raises rather than replaying with
+    whatever XCD count the host reports. A job without one forks to every part
+    of the arch and takes its ``cu_num`` from it."""
+    arches = getattr(module, "XCD_VARIANTS", None)
+    if not arches:
         return jobs
     default = _default_arch(module)
     out = []
     for job in jobs:
-        counts = variants.get(job_arch(job, default))
-        if "num_xcds" in job or not counts:
+        arch = job_arch(job, default)
+        if "num_xcds" in job or arch not in arches:
             out.append(job)
-        else:
-            for variant in counts:
-                if isinstance(variant, tuple):
-                    xcds, cu_num = variant
-                    out.append({**job, "num_xcds": xcds, "cu_num": cu_num})
-                else:
-                    out.append({**job, "num_xcds": variant})
+            continue
+        parts = DEVICE_PARTS[arch]
+        cu_num = int(job.get("cu_num") or 0)
+        if cu_num:
+            parts = tuple(p for p in parts if p[1] == cu_num)
+            if not parts:
+                raise ValueError(
+                    f"no part of {arch} with cu_num={cu_num} in replay.DEVICE_PARTS; "
+                    "add it there with its XCD count"
+                )
+        for xcds, cus in parts:
+            out.append({**job, "num_xcds": xcds, "cu_num": cus})
     return out
 
 

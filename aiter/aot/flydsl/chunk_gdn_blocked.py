@@ -31,10 +31,10 @@ LABEL = "CHUNK_GDN_BLOCKED"
 AOT_ARCH_DEFAULT = "gfx950"
 DEFAULT_CSVS = [AITER_CONFIGS.AITER_CONFIG_GDN_K5_OPT_FILE]
 _KERNEL_NAME = "chunk_gdn_blocked"
-# gfx950 parts as (XCDs, CUs): MI355X 8 / 256, MI350P 4 / 128. replay forks each
-# job per entry (see ``_with_xcd_variants``); the XCD count is part of the cache
-# key of the blocked kernels.
-XCD_VARIANTS = {"gfx950": ((8, 256), (4, 128))}
+# The blocked path is gfx950-only and not tied to a tuned row's CU count, so
+# replay forks each job to every gfx950 part (``replay.DEVICE_PARTS``); the XCD
+# count is part of the cache key of the blocked kernels.
+XCD_VARIANTS = ("gfx950",)
 _MIN_CHUNKS = 128
 
 
