@@ -24,6 +24,15 @@ mk = importlib.import_module("aiter.ops.flydsl.moe_kernels")
 FUSE_ENV = "AITER_TDM_FUSE_TP_ROUTE_QUANT"
 
 
+@pytest.fixture(autouse=True)
+def _fresh_env_switches():
+    # AITER_TDM_FUSE_TP_ROUTE_QUANT is read once per process: tests that set it
+    # clear the cached value, and none leaks into the next test.
+    gm._fuse_tp_route_quant_enabled.cache_clear()
+    yield
+    gm._fuse_tp_route_quant_enabled.cache_clear()
+
+
 @pytest.fixture
 def gfx1250():
     if not torch.cuda.is_available():
@@ -198,6 +207,7 @@ def test_public_moe_fused_route_bitwise(tokens, monkeypatch, gfx1250):
         ref.fused_moe = capture
         experts = 17
         monkeypatch.setenv(FUSE_ENV, "0")
+        gm._fuse_tp_route_quant_enabled.cache_clear()
         ref._run_grouped_via_fused_moe(
             experts=experts,
             tokens=tokens,
@@ -225,6 +235,7 @@ def test_public_moe_fused_route_bitwise(tokens, monkeypatch, gfx1250):
         assert route_calls, "the split path must run the route launch"
         route_calls.clear()
         monkeypatch.setenv(FUSE_ENV, "1")
+        gm._fuse_tp_route_quant_enabled.cache_clear()
         fused = fm.fused_moe(*a, **kw)
         assert not route_calls, "the fused path must not run the route launch"
         assert torch.equal(fused, split)
@@ -241,7 +252,9 @@ def test_public_moe_fused_route_bitwise(tokens, monkeypatch, gfx1250):
             a[0].neg_()
             graph.replay()
             monkeypatch.setenv(FUSE_ENV, "0")
+            gm._fuse_tp_route_quant_enabled.cache_clear()
             torch.testing.assert_close(out, fm.fused_moe(*a, **kw), rtol=0, atol=0)
             monkeypatch.setenv(FUSE_ENV, "1")
+            gm._fuse_tp_route_quant_enabled.cache_clear()
     finally:
         torch.set_default_device(default)
