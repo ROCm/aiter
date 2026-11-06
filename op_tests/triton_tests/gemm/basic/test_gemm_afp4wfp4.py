@@ -16,6 +16,9 @@ from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import (
 from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import (
     gemm_afp4wfp4_preshuffle,
 )
+from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import (
+    _block_k_without_masked_tail,
+)
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.types import str_to_torch_dtype
 
@@ -286,6 +289,55 @@ def test_gemm_afp4_wfp4(
         )
     else:
         triton.testing.assert_close(torch_out, triton_out)
+
+
+# With BLOCK_SIZE_K 1024, K = 1280, 1536 and 1792 give a K loop of two iterations
+# with a masked last iteration. On gfx950 that pipelined loop gave NaN when M was a
+# multiple of 16. The wrapper now uses a BLOCK_SIZE_K that divides K for that loop.
+@pytest.mark.parametrize("M", [15, 16, 32, 48])
+@pytest.mark.parametrize("N, K", [(6144, 1280), (6144, 1536), (6144, 1792)])
+def test_gemm_afp4_wfp4_two_k_iterations(M: int, N: int, K: int):
+    dtype = torch.bfloat16
+    (
+        x,
+        w,
+        w_triton,
+        x_scales,
+        w_scales,
+        x_scales_triton,
+        w_scales_triton,
+        _out_dtype,
+        y,
+    ) = generate_gemm_afp4wfp4_inputs(M, N, K, dtype, layout="TN", output=True)
+
+    torch_out = run_torch(x, w, x_scales, w_scales, dtype).to(dtype)
+    triton_out = triton_gemm_afp4wfp4(
+        x, w_triton, x_scales_triton, w_scales_triton, dtype, y
+    )
+
+    assert torch.isfinite(triton_out).all(), f"non-finite output, {M=} {N=} {K=}"
+    if UNSHUFFLED_TRITON_ONLY:
+        torch.testing.assert_close(
+            triton_out, torch_out, atol=1e-2, rtol=torch.finfo(dtype).eps
+        )
+    else:
+        torch.testing.assert_close(triton_out, torch_out, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize(
+    "k, block_k, expected",
+    [
+        (1536, 1024, 512),
+        (1280, 1024, 256),
+        (1792, 1024, 256),
+        (2560, 1024, 1024),
+        (3072, 1024, 1024),
+        (1536, 512, 512),
+        (1024, 1024, 1024),
+    ],
+)
+def test_block_k_without_masked_tail(k: int, block_k: int, expected: int):
+    assert _block_k_without_masked_tail(k, block_k) == expected
 
 
 @pytest.mark.parametrize("M, N, K", [(1, 10240, 8192), (64, 8192, 28672)])
