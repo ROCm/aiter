@@ -598,6 +598,159 @@ def test_moe_sorting_flydsl_cuda_graph_capture(
     )
 
 
+def _compare_moe_sorting_outputs_exact(ref, out, topk, num_rows):
+    """Exact (rtol=atol=0) compare over the consumed prefix of one sort.
+
+    sorted_ids are packed (slot << 24 | token) ints. The default tolerance in
+    _compare_moe_sorting_outputs accepts a wrong token index once slot >= 1,
+    so a wrong route is only caught by an exact compare. Padding slots must
+    carry weight 0; run_torch_moe_sorting leaves them uninitialised, so the
+    reference is zeroed there before the compare.
+    """
+    ref_ids, ref_weights, ref_expert_ids, ref_num_valid = ref
+    ids, weights, expert_ids, num_valid, _moe_buf = out
+    n = int(ref_num_valid[0].item())
+    num_blocks = n // BLOCK_SIZE_M
+    padding = ref_ids[:n] == (topk << 24 | num_rows)
+    pairs = {
+        "num_valid_ids": (ref_num_valid, num_valid),
+        "sorted_ids": (ref_ids[:n], ids[:n]),
+        "sorted_weights": (ref_weights[:n].masked_fill(padding, 0), weights[:n]),
+        "sorted_expert_ids": (ref_expert_ids[:num_blocks], expert_ids[:num_blocks]),
+    }
+    return {
+        name: checkAllclose(a, b, rtol=0, atol=0, msg=name, printLog=False)
+        for name, (a, b) in pairs.items()
+    }
+
+
+def test_moe_sorting_flydsl_concurrent_graph_replay(
+    dtype,
+    token,
+    model_dim,
+    E,
+    topk,
+    num_calls=8,
+    num_replays=10,
+    max_attempts=20,
+):
+    """Replay two CUDA graphs of FlyDSL sorts on two streams behind one gate.
+
+    Regression test for the per-device workspace cache that
+    flydsl_moe_sorting_fwd used to keep: every multiphase sort (token above
+    the oneshot limit, e.g. token >= 17 for E=385/topk=7) captured into any
+    graph got the same scratch buffer, so two graphs replayed on different
+    streams could overwrite each other's mesh and expert counts and return
+    wrong sorted_ids / sorted_weights / sorted_expert_ids / num_valid_ids.
+    Each captured sort must exactly match the torch reference of its own
+    inputs.
+
+    Each attempt enqueues a spin kernel on the current stream, records a gate
+    event after it, makes both replay streams wait on that event and only
+    then launches both graphs. If the event is still pending when it is
+    checked after both launches, both graphs were queued behind the same
+    unfinished dependency, so neither could start before the other was
+    queued. Only such held attempts count towards num_replays; otherwise the
+    spin is doubled. A completed event at that check does not show the
+    opposite (the gate may complete after both launches); it only leaves the
+    attempt unconfirmed. The gate makes both graphs eligible to run at the
+    same time; it cannot force the GPU to interleave them. If fewer than
+    num_replays attempts are held within max_attempts, the test raises
+    instead of passing, because it could not confirm the precondition of
+    the concurrent replay it checks.
+
+    Returns (attempts, final spin cycles), or None for a oneshot shape.
+    """
+    from aiter.ops.flydsl.kernels.moe_sorting_kernel import (
+        moe_sorting_get_workspace_size,
+    )
+
+    if moe_sorting_get_workspace_size(token, E, topk, BLOCK_SIZE_M) == 0:
+        return None  # oneshot path: no workspace, so nothing is shared
+    set_moe_sorting_backend("flydsl")
+
+    cases = []
+    for _ in range(2):  # two independent routings, one per graph
+        topk_ids, topk_weights, _, _ = _build_moe_sorting_inputs(
+            token,
+            model_dim,
+            E,
+            topk,
+            dtype,
+            has_expert_mask=False,
+            padding_extra=0,
+        )
+        ref = run_torch_moe_sorting(topk_ids, topk_weights, E, BLOCK_SIZE_M)
+        cases.append((topk_ids, topk_weights, ref))
+
+    graphs = []
+    captured_outs = []
+    for topk_ids, topk_weights, _ in cases:
+
+        def run(topk_ids=topk_ids, topk_weights=topk_weights):
+            return moe_sorting(
+                topk_ids, topk_weights, E, model_dim, dtype, BLOCK_SIZE_M
+            )
+
+        # Warm-up on a side stream so the FlyDSL JIT compiles before capture.
+        warmup_stream = torch.cuda.Stream()
+        warmup_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(warmup_stream):
+            run()
+        torch.cuda.current_stream().wait_stream(warmup_stream)
+        torch.cuda.synchronize()
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            # Keep the captured outputs referenced for the graph's lifetime.
+            captured_outs.append([run() for _ in range(num_calls)])
+        graphs.append(graph)
+    torch.cuda.synchronize()
+
+    streams = [torch.cuda.Stream() for _ in graphs]
+    gate = torch.cuda.Event()
+    spin_cycles = 1 << 18
+    held_replays = 0
+    attempt = 0
+    while held_replays < num_replays:
+        if attempt == max_attempts:
+            raise RuntimeError(
+                "moe_sorting concurrent graph replay: gate not confirmed pending "
+                f"(token={token}, E={E}, topk={topk}): the gate event was found "
+                "pending at the check after both graph launches in only "
+                f"{held_replays} of {max_attempts} attempts, {num_replays} are "
+                f"required (last spin {spin_cycles} cycles). The test could not "
+                "confirm that both graphs were queued behind the pending gate; "
+                "no sorting mismatch was found. Rerun on an idle GPU."
+            )
+        attempt += 1
+        torch.cuda.synchronize()
+        torch.cuda._sleep(spin_cycles)  # keeps the gate pending while both queue
+        gate.record()
+        for stream, graph in zip(streams, graphs):
+            stream.wait_event(gate)
+            with torch.cuda.stream(stream):
+                graph.replay()
+        held = not gate.query()
+        if held:
+            held_replays += 1
+        else:
+            # Not confirmed: the gate had completed by the time it was
+            # checked (before or after the launches); spin longer.
+            spin_cycles = min(spin_cycles * 2, 1 << 24)
+        torch.cuda.synchronize()
+        for g, ((_, _, ref), outs) in enumerate(zip(cases, captured_outs)):
+            for call, out in enumerate(outs):
+                errs = _compare_moe_sorting_outputs_exact(ref, out, topk, token)
+                bad = {k: v for k, v in errs.items() if v}
+                assert not bad, (
+                    "FlyDSL moe_sorting mismatch under concurrent graph replay "
+                    f"(token={token}, E={E}, topk={topk}, attempt={attempt}, "
+                    f"gate_held={held}, graph={g}, call={call}): {bad}"
+                )
+    return attempt, spin_cycles
+
+
 def test_moe_sorting_invalid_topk_ids():
     """Exercise every invalid-ID sorting path against the torch reference."""
     if get_gfx() not in SUPPORTED_GFX:
@@ -979,6 +1132,22 @@ def main():
                     has_expert_mask=expert_mask,
                 )
         aiter.logger.info("moe_sorting FlyDSL cuda-graph capture/replay: all passed")
+
+        replay_stats = []
+        for m in args.m:
+            for E, topk in model_configs:
+                stats = test_moe_sorting_flydsl_concurrent_graph_replay(
+                    dtype, m, args.model_dim, E, topk
+                )
+                if stats is not None:
+                    replay_stats.append(stats)
+        aiter.logger.info(
+            "moe_sorting FlyDSL concurrent graph replay: all passed "
+            "(%d cases, %d attempts, max spin %d cycles)",
+            len(replay_stats),
+            sum(attempts for attempts, _ in replay_stats),
+            max((spin for _, spin in replay_stats), default=0),
+        )
 
         if args.decode_graph:
             decode_rows = []
