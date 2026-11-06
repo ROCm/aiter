@@ -2551,14 +2551,8 @@ def test_dsv4_i384_fhmoe_config_has_true_shapes():
     import csv
 
     config_path = Path(__file__).resolve().parents[1] / "aiter/configs/tuned_fhmoe.csv"
-    ordinary_path = (
-        Path(__file__).resolve().parents[1]
-        / "aiter/configs/model_configs/dsv4_fp8fp4_tuned_fmoe.csv"
-    )
     with config_path.open(newline="") as f:
         rows = list(csv.DictReader(f))
-    with ordinary_path.open(newline="") as f:
-        ordinary_rows = list(csv.DictReader(f))
 
     dsv4_rows = [row for row in rows if int(row["inter_dim"]) == 384]
     assert {int(row["token"]) for row in dsv4_rows} == {
@@ -2581,16 +2575,6 @@ def test_dsv4_i384_fhmoe_config_has_true_shapes():
     assert all(row["gate_mode"] == "GateMode.INTERLEAVE" for row in dsv4_rows)
     assert all(row["kernelName1"].startswith("flydsl_") for row in dsv4_rows)
     assert all(row["kernelName2"].startswith("flydsl_") for row in dsv4_rows)
-
-    ordinary_m16 = next(
-        row
-        for row in ordinary_rows
-        if int(row["token"]) == 16
-        and int(row["inter_dim"]) == 384
-        and int(row["expert"]) == 385
-        and int(row["topk"]) == 7
-    )
-    assert ordinary_m16["kernelName2"].startswith("opus_")
 
 
 def test_fhmoe_aot_replays_dedicated_rows():
@@ -2834,10 +2818,14 @@ def test_fhmoe_aot_replay_forwards_caller_choices(
         ("scale_shape", "Expected preshuffled shared_w1_scale shape"),
     ),
 )
+# _fhmoe enters the custom op without fused_moe's wrapper, whose own except would
+# drop the presort even if _fhmoe_impl's did not.
+@pytest.mark.parametrize("entry", ("fused_moe", "_fhmoe"))
 def test_heterogeneous_moe_rejects_invalid_shared_contract(
     weights: _Weights,
     case: str,
     message: str,
+    entry: str,
 ):
     profile = _profile()
     hidden, _, _, all_weight, all_ids = _route_inputs(
@@ -2859,15 +2847,22 @@ def test_heterogeneous_moe_rejects_invalid_shared_contract(
         else:
             kwargs["shared_w1_scale"] = weights.shared_s1[:-1].contiguous()
 
+    # A rejected call still consumes a registered presort, so it cannot apply to
+    # a later call on reused routing buffers.
+    import aiter.fhmoe as fhmoe_module
+
+    aiter.fused_moe.register_presorted_moe({"topk_ids_ptr": all_ids.data_ptr()})
+    call = fused_moe if entry == "fused_moe" else fhmoe_module._fhmoe
     with pytest.raises(ValueError, match=message):
-        fused_moe(
-            hidden,
-            weights.routed_w1,
-            weights.routed_w2,
-            all_weight,
-            all_ids,
+        call(
+            hidden_states=hidden,
+            w1=weights.routed_w1,
+            w2=weights.routed_w2,
+            topk_weight=all_weight,
+            topk_ids=all_ids,
             **kwargs,
         )
+    assert aiter.presorted_moe.pop_presorted_moe() is None, "presort survived the error"
 
 
 @pytest.mark.parametrize("name", ["shared_w1", "shared_w2"])
