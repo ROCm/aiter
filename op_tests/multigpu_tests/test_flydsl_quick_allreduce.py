@@ -134,6 +134,7 @@ import dataclasses
 import itertools
 import json
 import math
+import multiprocessing
 import os
 import re
 import sys
@@ -2199,11 +2200,11 @@ def _run_rank_fused(
     return rows
 
 
-def _spawn_ranks(worker, world_size: int, **kwds):
+def _spawn_ranks(worker, world_size: int, *, timeout: float | None = None, **kwds):
     """*worker* once per rank in a spawn pool, with ``rank``, ``tp`` and
     ``init_method`` added to *kwds*. Returns each rank's result."""
     init_method = get_distributed_init_method(get_ip(), get_open_port())
-    timeout = float(os.environ.get("FLYDSL_QR_TIMEOUT", "3600"))
+    timeout = float(os.environ.get("FLYDSL_QR_TIMEOUT", str(timeout or 3600)))
     pool = get_context("spawn").Pool(processes=world_size)
     try:
         futs = [
@@ -3500,6 +3501,132 @@ def test_quick_allreduce_first_call_in_capture(tp):
         "min_sqnr_db": min((row["sqnr_db"] for row in rows0), default=float("nan")),
     }
 
+ZERO_BYTES_TIMEOUT_S = 300
+ZERO_BYTES_HIDDENS = (4096, 2880)
+# The plain engine's payload after the empty call.
+ZERO_BYTES_PLAIN_SHAPE = (8, 1024)
+
+
+def _run_rank_zero_bytes(
+    rank: int, tp: int, init_method: str, algorithm: str, operation: str
+) -> dict:
+    """One rank of the zero-byte spawn: an empty payload through the mesh or ring.
+
+    A call before the empty one and another after must give the same bits, so
+    the empty call cannot have left the engine in a different state on one rank.
+    """
+    import torch.distributed as dist
+
+    from aiter.ops.flydsl.quick_allreduce import (
+        FlyQuickAllReduce,
+        FlyQuickAllReduceRMSNorm,
+    )
+
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+    dist.init_process_group(
+        backend="nccl",
+        init_method=init_method,
+        world_size=tp,
+        rank=rank,
+        device_id=device,
+    )
+    gloo = dist.new_group(backend="gloo")
+    fused = operation == "ar_rmsnorm"
+    engine = FlyQuickAllReduceRMSNorm if fused else FlyQuickAllReduce
+    eng = engine(
+        group=gloo, device=device, rank=rank, world_size=tp, algorithm=algorithm
+    )
+    # The floor is a speed policy, not a correctness limit.
+    eng.min_bytes = 0
+    tokens = ZERO_BYTES_PLAIN_SHAPE[0]
+
+    def normal_call(hidden: int):
+        """The tensors of one ordinary call, a new set each time it is called."""
+        if fused:
+            inp, residual, weight = _fused_inputs(tokens, hidden, rank, device)
+            return eng.allreduce_rmsnorm(inp, residual, weight, RMS_EPS)
+        inp = _run_ahead_part(0, rank, tokens, hidden, device)
+        out = torch.empty_like(inp)
+        eng.allreduce(inp, out)
+        return (out,)
+
+    rows = []
+    try:
+        for hidden in ZERO_BYTES_HIDDENS if fused else (ZERO_BYTES_PLAIN_SHAPE[1],):
+            if fused:
+                eng.preload(hidden)
+            before = normal_call(hidden)
+            torch.cuda.synchronize()
+
+            empty = torch.empty(0, hidden, dtype=dtypes.bf16, device=device)
+            if fused:
+                ones = torch.ones(hidden, dtype=dtypes.bf16, device=device)
+                got = eng.allreduce_rmsnorm(empty, empty, ones, RMS_EPS)
+            else:
+                out = torch.empty_like(empty)
+                eng.allreduce(empty, out)
+                got = (out,)
+            torch.cuda.synchronize()
+
+            after = normal_call(hidden)
+            torch.cuda.synchronize()
+            rows.append(
+                {
+                    "hidden": hidden,
+                    "shapes": [tuple(t.shape) for t in got],
+                    "after_differs": not all(
+                        torch.equal(b, a) for b, a in zip(before, after)
+                    ),
+                }
+            )
+    finally:
+        eng.close()
+        dist.destroy_process_group()
+    return {"rows": rows}
+
+
+@benchmark()
+def test_quick_allreduce_zero_bytes(tp, algorithm, operation):
+    """An empty payload through the mesh or ring, plain or fused: no launch, no
+    fault, and the engine gives the same bits after it as before. The fused
+    spawn covers a native and a padded hidden dim."""
+    try:
+        ranks = _spawn_ranks(
+            _run_rank_zero_bytes,
+            tp,
+            timeout=ZERO_BYTES_TIMEOUT_S,
+            algorithm=algorithm,
+            operation=operation,
+        )
+    except multiprocessing.TimeoutError:
+        ranks = None
+    fails = []
+    if ranks is None:
+        fails.append(
+            "timed out: a rank most likely faulted on a kernel launched with no "
+            "rows (see the memory fault in the log)"
+        )
+    else:
+        for rank, r in enumerate(ranks):
+            for row in r["rows"]:
+                want = (0, row["hidden"])
+                if any(shape != want for shape in row["shapes"]):
+                    fails.append(
+                        f"rank {rank} hidden={row['hidden']}: an empty call "
+                        f"returned shapes {row['shapes']}, not {want}"
+                    )
+                if row["after_differs"]:
+                    fails.append(
+                        f"rank {rank} hidden={row['hidden']}: the call after the "
+                        "empty one differs from the one before it"
+                    )
+    _check(f"tp={tp} {algorithm} {operation} zero bytes", fails)
+    return {
+        "gfx": ARCH,
+        "hiddens": [row["hidden"] for row in ranks[0]["rows"]] if ranks else [],
+    }
+
 
 def _summarize(name: str, rows: list[dict]) -> None:
     if rows:
@@ -3645,6 +3772,14 @@ def _verify(args, tps, algos, dts, link) -> None:
         ],
     )
     _summarize(
+        "flydsl quick allreduce zero bytes",
+        [
+            test_quick_allreduce_zero_bytes(tp, algorithm, "ar")
+            for tp, algorithm in itertools.product(tps, algos)
+            if _ships(tp, algorithm, link)
+        ],
+    )
+    _summarize(
         "flydsl quick allreduce INT4 edge inputs",
         [
             test_quick_allreduce_int4_edge_inputs(tokens, hidden, tp, algorithm, fill)
@@ -3768,6 +3903,13 @@ def _verify_fused(tps, algos, extended: bool) -> None:
             if extended and mesh
             for case in _FUSED_LOW_LATENCY_CASES
             if _wide_row_case(case[1], tp)
+        ],
+    )
+    _summarize(
+        "flydsl quick allreduce rmsnorm zero bytes",
+        [
+            test_quick_allreduce_zero_bytes(tp, algorithm, "ar_rmsnorm")
+            for tp, algorithm in itertools.product(tps, algos)
         ],
     )
     _summarize(

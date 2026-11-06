@@ -303,6 +303,8 @@ class OneShotAllReduce:
         live_bytes = check_payload(
             inp, out, device_index=self._device_index, owner="OneShotAllReduce"
         )
+        if live_bytes == 0:
+            return
         if not self.is_beneficial(live_bytes):
             raise ValueError(
                 f"OneShotAllReduce got a {live_bytes} B payload, above the "
@@ -770,6 +772,10 @@ class OneShotAllReduceRMSNorm:
         if residual_out is None:
             residual_out = torch.empty_like(residual_in)
         hidden, live_bytes = self._check(inp, residual_in, weight, out, residual_out)
+        if live_bytes == 0:
+            # Nothing to reduce. A launch has at least one block, which would
+            # run tile 0 of a tensor with no storage.
+            return out, residual_out
         if not self.is_beneficial(live_bytes):
             raise ValueError(
                 f"OneShotAllReduceRMSNorm got a {live_bytes} B payload, above the "

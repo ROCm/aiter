@@ -122,6 +122,7 @@ import functools
 import inspect
 import itertools
 import json
+import multiprocessing
 import os
 import re
 import subprocess
@@ -317,6 +318,9 @@ SQNR_FLOOR_DB = 45.0
 # spawn instead of leaving it to CI's per-file timeout. A full default run of
 # either FlyDSL all-reduce test takes a few minutes, JIT included.
 SPAWN_TIMEOUT_S = 600
+
+ZERO_BYTES_TIMEOUT_S = 300
+ZERO_BYTES_HIDDENS = (4096, 2880)
 
 # ``--operation``: the plain all-reduce, or all-reduce + residual add + RMSNorm.
 OPERATIONS = ("ar", "ar_rmsnorm")
@@ -982,7 +986,82 @@ def _capture_first_rank(rank: int, tp: int, init_method: str) -> dict:
     return res
 
 
-def _spawn(target, world_size: int, **kwds) -> list:
+def _send_non_zero_message(eng, rank: int, tp: int, device, hidden: int, fused: bool):
+    """Run normal non-zero message right after the empty one: the empty call must
+    leave the engine's state (colours, inboxes) as it found it."""
+    if not fused:
+        parts = _parts(1, hidden, tp, 777, device)
+        out = torch.zeros_like(parts[rank])
+        eng.allreduce(parts[rank].contiguous(), out)
+        torch.cuda.synchronize()
+        exact = _rank_order_sum(parts)
+        return int((out.view(torch.int16) != exact.view(torch.int16)).sum())
+    parts, residual, weight = _fused_inputs(1, hidden, tp, device)
+    out, res_out = eng.allreduce_rmsnorm(
+        parts[rank].contiguous(), residual, weight, RMS_EPS
+    )
+    torch.cuda.synchronize()
+    out_ref, res_ref = _fused_reference(parts, residual, weight, RMS_EPS)
+    return int((res_out.view(torch.int16) != res_ref.view(torch.int16)).sum()) + (
+        _sqnr_db(out_ref.float(), out.float()) < SQNR_FLOOR_DB
+    )
+
+
+def _zero_bytes_rank(rank: int, tp: int, init_method: str, operation: str) -> dict:
+    """One rank of the zero-byte engine spawn.
+
+    Each empty call is followed by a normal one, which
+    has to be bit-exact, so an empty call cannot leave the engine in a
+    different state on one rank.
+    """
+    from aiter.ops.flydsl.one_shot_allreduce import OneShotAllReduceRMSNorm
+
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+    group = _init_dist(rank, tp, init_method, stock=False)
+    cpu_group = group.cpu_group
+    fused = operation == "ar_rmsnorm"
+    eng = (
+        OneShotAllReduceRMSNorm(
+            group=cpu_group,
+            device=device,
+            rank=rank,
+            world_size=tp,
+            max_bytes=1 << 30,
+        )
+        if fused
+        else _engine(rank, tp, cpu_group, device, {})
+    )
+    rows = []
+    try:
+        for hidden in ZERO_BYTES_HIDDENS if fused else (ROW,):
+            if fused:
+                eng.preload(hidden)
+            empty = torch.empty(0, hidden, dtype=torch.bfloat16, device=device)
+            if fused:
+                weight = torch.ones(hidden, dtype=torch.bfloat16, device=device)
+                out, res_out = eng.allreduce_rmsnorm(empty, empty, weight, RMS_EPS)
+                shapes = (tuple(out.shape), tuple(res_out.shape))
+            else:
+                out = torch.empty_like(empty)
+                eng.allreduce(empty, out)
+                shapes = (tuple(out.shape),)
+            torch.cuda.synchronize()
+            rows.append(
+                {
+                    "hidden": hidden,
+                    "shapes": shapes,
+                    "mismatches_after_zero_bytes_call": _send_non_zero_message(
+                        eng, rank, tp, device, hidden, fused
+                    ),
+                }
+            )
+    finally:
+        _teardown(eng, cpu_group)
+    return {"rows": rows}
+
+
+def _spawn(target, world_size: int, *, timeout: float | None = None, **kwds) -> list:
     """*target* on every rank of a new spawn, with *kwds* and the rendezvous."""
     if world_size not in SUPPORTED_WORLDS:
         raise ValueError(f"unsupported world_size={world_size}")
@@ -1003,7 +1082,9 @@ def _spawn(target, world_size: int, **kwds) -> list:
         ]
         # A bench spawn times every candidate at every shape: it may need far
         # longer than a verify spawn on a cold JIT cache.
-        timeout = float(os.environ.get("FLYDSL_QR_TIMEOUT", str(SPAWN_TIMEOUT_S)))
+        timeout = float(
+            os.environ.get("FLYDSL_QR_TIMEOUT", str(timeout or SPAWN_TIMEOUT_S))
+        )
         ranks = [fut.get(timeout=timeout) for fut in results]
     except Exception:
         pool.terminate()
@@ -2846,6 +2927,46 @@ def test_one_shot_allreduce_first_call_in_capture(tp):
     }
 
 
+@benchmark()
+def test_one_shot_allreduce_zero_bytes(tp, operation):
+    """An empty payload through the engine: no launch, no fault, and the engine
+    works after it. The fused spawn covers a native and a padded hidden dim; only
+    the padded build reads and writes at ``data_ptr() == 0`` without the early
+    return."""
+    try:
+        ranks = _spawn(
+            _zero_bytes_rank, tp, timeout=ZERO_BYTES_TIMEOUT_S, operation=operation
+        )
+    except multiprocessing.TimeoutError:
+        # A rank that launched on the empty tensor faulted, and its peers wait.
+        ranks = None
+    fails = []
+    if ranks is None:
+        fails.append(
+            "timed out: a rank most likely faulted on a kernel launched with no "
+            "rows (see the memory fault in the log)"
+        )
+    else:
+        for rank, r in enumerate(ranks):
+            for row in r["rows"]:
+                want = (0, row["hidden"])
+                if any(shape != want for shape in row["shapes"]):
+                    fails.append(
+                        f"rank {rank} hidden={row['hidden']}: an empty call "
+                        f"returned shapes {row['shapes']}, not {want}"
+                    )
+                if row["mismatches_after_zero_bytes_call"]:
+                    fails.append(
+                        f"rank {rank} hidden={row['hidden']}: the call after the "
+                        f"empty one was wrong ({row['mismatches_after_zero_bytes_call']} bad)"
+                    )
+    _check(f"tp={tp} {operation} zero bytes", fails)
+    return {
+        "gfx": ARCH,
+        "hiddens": [row["hidden"] for row in ranks[0]["rows"]] if ranks else [],
+    }
+
+
 def _summarize(name: str, rows: list[dict]) -> None:
     if rows:
         df = pd.DataFrame(rows).drop(columns=list(KNOBS), errors="ignore")
@@ -2920,6 +3041,10 @@ def _verify(args, tps, dts, configs, given, link) -> None:
             "flydsl one-shot allreduce first call in capture",
             [test_one_shot_allreduce_first_call_in_capture(tp) for tp in tps],
         )
+        _summarize(
+            "flydsl one-shot allreduce zero bytes",
+            [test_one_shot_allreduce_zero_bytes(tp, "ar") for tp in tps],
+        )
 
 
 def _verify_fused(tps, extended: bool) -> None:
@@ -2979,6 +3104,10 @@ def _verify_fused(tps, extended: bool) -> None:
                 + [test_one_shot_allreduce_rmsnorm_split_exchange(tp)]
             )
         _summarize(f"fused allreduce + rmsnorm tp={tp}", rows)
+    _summarize(
+        "fused allreduce + rmsnorm zero bytes",
+        [test_one_shot_allreduce_zero_bytes(tp, "ar_rmsnorm") for tp in tps],
+    )
     _summarize(
         "fused allreduce + rmsnorm production dispatch",
         [

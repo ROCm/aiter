@@ -637,6 +637,8 @@ class FlyQuickAllReduce:
         live_bytes = check_payload(
             inp, out, device_index=self._device_index, owner="FlyQuickAllReduce"
         )
+        if live_bytes == 0:
+            return
         if not self.is_beneficial(live_bytes):
             raise ValueError(
                 f"FlyQuickAllReduce.allreduce got a {live_bytes} B payload, "
@@ -1415,6 +1417,8 @@ class FlyQuickAllReduceRMSNorm:
         hidden, live_bytes = self._check(inp, residual_in, weight, out, residual_out)
         if mxfp4 is not None:
             self._check_mxfp4(*mxfp4, hidden, live_bytes)
+        if live_bytes == 0:
+            return out, residual_out
         if not self.is_beneficial(live_bytes):
             raise ValueError(
                 f"FlyQuickAllReduceRMSNorm got a {live_bytes} B payload, below "
