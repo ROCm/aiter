@@ -49,6 +49,15 @@ old = _previous_wrapper()
 
 
 @pytest.fixture(autouse=True)
+def _fresh_env_switches():
+    # The quant dispatch reads AITER_FLYDSL_TOKEN_MULTIDEST_QUANT once per
+    # process; tests that set it clear the cached value, here and after them.
+    mk.token_multidest_quant_enabled.cache_clear()
+    yield
+    mk.token_multidest_quant_enabled.cache_clear()
+
+
+@pytest.fixture(autouse=True)
 def _gpu_contract(request):
     if request.node.name.startswith("test_host_"):
         return
@@ -134,6 +143,7 @@ def test_all_quant_paths(mode, fd, rep, kind, monkeypatch):
             monkeypatch.setenv("AITER_FLYDSL_TOKEN_MULTIDEST_QUANT", "0")
         else:
             monkeypatch.setenv("AITER_FLYDSL_TOKEN_MULTIDEST_QUANT", "1")
+        mk.token_multidest_quant_enabled.cache_clear()
     if kind == "prequant":
         # Use actual base quantizer to create matching packed bytes/e8m0 scale rows.
         # A rep1 scale layout is still interleaved; explicitly invert its torch layout.
