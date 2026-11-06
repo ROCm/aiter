@@ -10,9 +10,12 @@ from dataclasses import dataclass
 import flydsl.expr as fx
 from flydsl.runtime.device import get_rocm_arch
 
+from ..kernels_common import ceildiv
+
 MFMA_MNK = 16  # M=N=16; query rows are padded to M-tiles.
 # One i64 operand pack/lane covers K32, including in K128 layouts.
 FP8_PACK_K = 32
+FP8_RESIDUAL_TOKENS = 2 * MFMA_MNK
 BF16_PACK_K = 16
 BF16_KV_SUPPORTED_ARCHS = ("gfx942", "gfx950")
 WAVE = 64
@@ -100,6 +103,33 @@ def _bf16_lds_bytes(head_dim, query_rows, block_size):
 
 
 @dataclass(frozen=True)
+class PaDecodeTilePolicy:
+    """Compile-time arithmetic and residual storage for one execution variant."""
+
+    single_tile: bool
+    qk_chunks: int
+    pv_packs: int
+    residual_tokens: int
+
+    @classmethod
+    def select(cls, traits, token_bound=None):
+        """Use token_bound only for the caller-guarded asymmetric FP8 path."""
+        # Compact residuals cover the first 16 or 32 keys. Windowed keys
+        # can occur anywhere, so small windows use a full residual plane.
+        compact = token_bound is not None and token_bound <= FP8_RESIDUAL_TOKENS
+        return cls(
+            single_tile=traits.single_tile_plan or compact,
+            qk_chunks=token_bound // MFMA_MNK if compact else traits.NCHUNK,
+            pv_packs=token_bound // 8 if compact else traits.NVOPS,
+            residual_tokens=(
+                token_bound
+                if compact
+                else traits.TILE_TOK if traits.FP8_WINDOW_RESIDUAL else 0
+            ),
+        )
+
+
+@dataclass(frozen=True)
 class PaDecodeSchedule:
     """Select the cache key without constructing the full kernel layout."""
 
@@ -112,6 +142,7 @@ class PaDecodeSchedule:
         cls,
         *,
         head_dim: int,
+        value_dim: int | None = None,
         query_group_size: int,
         block_size: int,
         num_seqs: int,
@@ -143,6 +174,7 @@ class PaDecodeSchedule:
             raise NotImplementedError("Non-transposed key cache is not implemented")
         arch = str(get_rocm_arch()).split(":", 1)[0]
         is_gfx950 = "gfx95" in arch
+        value_dim = head_dim if value_dim is None else value_dim
         if kv_dtype not in ("fp8", "bf16", "mxfp4"):
             raise ValueError(f"Unsupported PA KV dtype {kv_dtype!r}")
         is_bf16_kv = kv_dtype == "bf16"
@@ -166,9 +198,22 @@ class PaDecodeSchedule:
                 raise ValueError("BF16 KV requires a vectorized-5D value cache")
         elif query_dtype == "fp8":
             raise ValueError("An FP8 query needs MXFP4 KV")
+        asymmetric_value = value_dim != head_dim
+        if asymmetric_value and not (
+            arch in ("gfx942", "gfx950")
+            and kv_dtype in ("bf16", "fp8")
+            and head_dim == 192
+            and value_dim == 128
+            and sliding_window >= 0
+        ):
+            raise ValueError(
+                "asymmetric V requires gfx942/gfx950 D192/V128 and a normalized "
+                "nonnegative sliding window"
+            )
         IS_BF16 = query_dtype == "bf16"
         TUNED_SHAPE = (
-            kv_dtype == "fp8"
+            not asymmetric_value
+            and kv_dtype == "fp8"
             and is_gfx950
             and head_dim == 128
             and block_size in (16, 128)
@@ -176,6 +221,7 @@ class PaDecodeSchedule:
         TUNED_PER_TOKEN = TUNED_SHAPE and IS_BF16 and per_token_kv
         # Scalar KV scheduling also supports FP16 queries and multiple query rows.
         TUNED_SCALAR = TUNED_SHAPE and trans_v and not per_token_kv
+        TUNED_BF16_SWA = is_bf16_kv and query_length <= 8 and sliding_window > 0
 
         partition_workgroups = num_seqs * num_kv_heads * num_partitions
         assert query_length >= 1, f"query_length must be >= 1, got {query_length}"
@@ -214,7 +260,83 @@ class PaDecodeSchedule:
                 else query_length
             )
             query_splits = 1
-            if (
+            if TUNED_BF16_SWA:
+                # Planned tasks may own multiple KV tiles under a small budget.
+                kv_tiles = window_tiles
+                if max_context_length is not None:
+                    kv_tiles = min(
+                        kv_tiles,
+                        max(1, ceildiv(max_context_length, KV_COMPUTE_BLOCK)),
+                    )
+                tasks_per_seq = min(
+                    num_partitions, max(1, work_capacity // num_seqs), kv_tiles
+                )
+                tiles_per_task = ceildiv(kv_tiles, tasks_per_seq)
+                active_tasks = min(
+                    split_workgroups, num_seqs * num_kv_heads * tasks_per_seq
+                )
+                # Include fixed CTA overhead and the cost of repeated wide KV
+                # loads. A 256 KiB floor retains the small-head work policy.
+                work_bytes = max(
+                    256 * 1024, KV_COMPUTE_BLOCK * (head_dim + value_dim) * 2
+                )
+                cu_work_bytes = num_compute_units * 256 * 1024
+                active_work_bytes = active_tasks * work_bytes
+                tile_work_bytes = active_work_bytes * tiles_per_task
+                candidates = [
+                    splits
+                    for splits in range(1, query_length + 1)
+                    if query_length % splits == 0
+                    and _bf16_lds_bytes(
+                        head_dim,
+                        query_length // splits * query_group_size,
+                        block_size,
+                    )
+                    <= BF16_LDS_LIMIT_BYTES
+                ]
+                if candidates:
+                    query_splits = candidates[0]
+                    # Prefer full M-tiles; smaller query groups can share a CTA.
+                    row_tiles = ceildiv(query_length * query_group_size, MFMA_MNK)
+                    for splits in reversed(candidates):
+                        budget = (2 if splits == query_length else 3) * cu_work_bytes
+                        if splits <= row_tiles and splits * tile_work_bytes <= budget:
+                            query_splits = splits
+                            break
+                    # Increase only to another valid divisor. On gfx942 a
+                    # near-full unsplit grid avoids unnecessary repeated KV work.
+                    for splits in candidates:
+                        if splits < query_splits:
+                            continue
+                        query_splits = splits
+                        if splits * active_work_bytes >= cu_work_bytes:
+                            break
+                        if (
+                            arch == "gfx942"
+                            and splits == 1
+                            and 4 * active_tasks >= 3 * num_compute_units
+                        ):
+                            break
+                # The common BF16 resource check below reports an impossible
+                # one-query group when no candidate fits the LDS limit.
+            elif asymmetric_value:
+                # Include serial KV work when a small partition budget gives
+                # each task many tiles. Two M-tiles then amortize K/V loads.
+                kv_work = split_workgroups
+                if sliding_window == 0 and max_context_length is not None:
+                    kv_work = num_seqs * num_kv_heads * max(1, context_tiles)
+                target_rows = MFMA_MNK * (
+                    2 if sliding_window == 0 and kv_work >= 2 * num_compute_units else 1
+                )
+                queries_per_cta = max(1, target_rows // query_group_size)
+                query_splits = max(1, ceildiv(query_length, queries_per_cta))
+                # Preserve CTA parallelism and choose only divisors of Qlen.
+                while query_length % query_splits or (
+                    query_splits < query_length
+                    and query_splits * split_workgroups < num_compute_units
+                ):
+                    query_splits += 1
+            elif (
                 TUNED_PER_TOKEN
                 and (num_kv_heads == 1 or sliding_window == 0)
                 and query_length in (2, 4)
@@ -251,10 +373,15 @@ class PaDecodeSchedule:
                         f"even with one query position per CTA: head_dim={head_dim}, "
                         f"query_group_size={query_group_size}"
                     )
-        if is_bf16_kv:
+        if is_bf16_kv or asymmetric_value:
             assert query_splits >= 1, "query_splits must be positive"
         else:
-            assert query_splits in (1, 2, 4), "query_splits must be one of 1, 2, 4"
+            assert query_splits in (
+                1,
+                2,
+                4,
+                8,
+            ), "query_splits must be one of 1, 2, 4, 8"
         assert query_length % query_splits == 0, "query_splits must divide query_length"
         if is_bf16_kv:
             lds_bytes = _bf16_lds_bytes(
@@ -356,6 +483,7 @@ class PaDecodeSchedule:
         )
         cache_key = (
             head_dim,
+            value_dim,
             query_group_size,
             block_size,
             num_partitions,
@@ -397,6 +525,7 @@ class PaDecodeTraits:
 
     # Selected specialization and query shape.
     head_dim: int
+    value_dim: int
     query_group_size: int
     block_size: int
     softmax_scale: float
@@ -429,6 +558,7 @@ class PaDecodeTraits:
     QP_ELEM_BYTES: int
     Q_ABSMAX_F32: bool
     UNIQUE_SCALE_STAGING: bool
+    FP8_WINDOW_RESIDUAL: bool
     WIDE_FP8_MFMA: bool
     PACKS_PER_MFMA: int
     MTP4_FUSED: bool
@@ -501,6 +631,7 @@ class PaDecodeTraits:
         cache_key = schedule.cache_key
         (
             head_dim,
+            value_dim,
             query_group_size,
             block_size,
             _num_partitions,
@@ -529,21 +660,27 @@ class PaDecodeTraits:
         PV_BF16 = is_bf16_kv or MXFP4
         IS_BF16 = query_dtype in ("bf16", "fp8")
         TUNED_SHAPE = (
-            kv_dtype == "fp8"
+            value_dim == head_dim
+            and kv_dtype == "fp8"
             and is_gfx950
             and head_dim == 128
             and block_size in (16, 128)
         )
         TUNED_PER_TOKEN = TUNED_SHAPE and IS_BF16 and per_token_kv
         TUNED_SCALAR = TUNED_SHAPE and trans_v and not per_token_kv
+        ASYMMETRIC_FP8 = value_dim != head_dim and kv_dtype == "fp8"
+        # Very small windows need a second FP8 probability term even in long contexts.
+        FP8_WINDOW_RESIDUAL = (
+            ASYMMETRIC_FP8 and 0 < sliding_window <= FP8_RESIDUAL_TOKENS
+        )
         QUERIES_PER_CTA = query_length // query_splits
         TOTAL_ROWS = query_length * query_group_size
 
         buffer_plan_output = (
             is_gfx950
-            and head_dim == 128
+            and value_dim == 128
             and IS_BF16
-            and 0 < TOTAL_ROWS * head_dim * 2 <= 0x7FFFFFFF
+            and 0 < TOTAL_ROWS * value_dim * 2 <= 0x7FFFFFFF
         )
         # Larger windows have identical visibility for int32 context lengths.
         sliding_window = min(sliding_window, 2**31 - 1)
@@ -596,7 +733,7 @@ class PaDecodeTraits:
         PER_TOKEN_WIDE = (
             TUNED_PER_TOKEN and query_length in (3, 4) and query_group_size == 16
         )
-        WIDE_FP8_MFMA = PER_TOKEN_WIDE or D256_PIPE
+        WIDE_FP8_MFMA = PER_TOKEN_WIDE or D256_PIPE or (is_gfx950 and ASYMMETRIC_FP8)
         PACK_K = BF16_PACK_K if PV_BF16 else FP8_PACK_K
         MFMA_K = 128 if WIDE_FP8_MFMA else PACK_K
         PACKS_PER_MFMA = MFMA_K // PACK_K
@@ -634,8 +771,8 @@ class PaDecodeTraits:
         PAGES_PER_CHUNK = (TOK_PER_WARP + block_size - 1) // block_size
         KV_EXTENT = (1 << 42) if wide_kv_addressing else (1 << 30)
         assert (
-            head_dim % (NWARP * MFMA_MNK) == 0
-        ), "head_dim must split across the 4 warps for PV"
+            value_dim % (NWARP * MFMA_MNK) == 0
+        ), "value_dim must split across the 4 warps for PV"
 
         # Four 16-element QK loads form each 64-element fetch group.
         RGROUP_QUARTERS = 4
@@ -645,7 +782,11 @@ class PaDecodeTraits:
             QKHE_LOOP >= 1
         ), f"head_dim {head_dim} must be at least {RGROUP_QUARTERS * QK_CHUNK_ELEMS}"
         # QK operand-pack count, not the number of MFMA instructions.
-        N_SUBCHUNKS = head_dim // PACK_K
+        N_SUBCHUNKS = (
+            ((head_dim + MFMA_K - 1) // MFMA_K) * PACKS_PER_MFMA
+            if WIDE_FP8_MFMA
+            else head_dim // PACK_K
+        )
         assert N_SUBCHUNKS % PACKS_PER_MFMA == 0, "QK packs must fill whole MFMA atoms"
         assert TILE_TOK % MFMA_K == 0, "PV tokens must fill whole MFMA atoms"
 
@@ -653,21 +794,18 @@ class PaDecodeTraits:
         NQCHUNK = 16
         QCHUNK = (
             head_dim // NQCHUNK
-        )  # f16 elements per lane's load chunk (8 for head_dim=128, 4 for head_dim=64)
-        # Loads are at most 128 bits; larger chunks must not leave an unloaded tail.
-        assert PV_BF16 or QCHUNK <= 8 or QCHUNK % 8 == 0, (
-            f"head_dim {head_dim} is unsupported: head_dim//{NQCHUNK} ({QCHUNK}) must "
-            f"be <= 8 or a multiple of 8"
-        )
+        )  # 16-bit query elements per lane (8 for D128, 4 for D64, 12 for D192).
+        # Multiples of 64 give four-element lane chunks. Use 64-bit loads
+        # when the chunk does not divide into full 128-bit loads.
         QLOAD_UNIT = min(8, QCHUNK) if QCHUNK % 8 == 0 or QCHUNK <= 8 else 4
         N_QLOADS = QCHUNK // QLOAD_UNIT
 
-        VHE_CHUNKS = head_dim // (
+        VHE_CHUNKS = value_dim // (
             NWARP * MFMA_MNK
-        )  # 2 for head_dim=128, 1 for head_dim=64
+        )  # 2 for value_dim=128, 1 for value_dim=64
         if MXFP4:
             VHE_CHUNKS = head_dim // MFMA_MNK
-        VHE_SIZE = head_dim // VHE_CHUNKS
+        VHE_SIZE = value_dim // VHE_CHUNKS
         OP_ELEMS = MFMA_ACC_ELEMS  # PV C-fragment elements/lane/chunk
         # BF16 has sixteen K16 packs; FP8 has eight K32 or two K128 instructions.
         NVOPS = TILE_TOK // PACK_K
@@ -692,6 +830,11 @@ class PaDecodeTraits:
         sP_off = 0
         # Padding avoids 32-bank conflicts while preserving ds_read_b128 alignment.
         SP_ROW_BYTES = TILE_TOK * QP_ELEM_BYTES + 16
+        if FP8_WINDOW_RESIDUAL:
+            SP_ROW_BYTES += TILE_TOK
+        elif ASYMMETRIC_FP8:
+            # Keep 16 bytes of bank padding after the compact residual range.
+            SP_ROW_BYTES += FP8_RESIDUAL_TOKENS
         sP_bytes = P_BUFFERS * MFMA_MNK * SP_ROW_BYTES
         sQscale_off = max(sQ_bytes, sP_bytes)
         sQscale_bytes = 0 if is_bf16_kv else ROWS_PADDED * f32
@@ -731,6 +874,7 @@ class PaDecodeTraits:
         return cls(
             cache_key=cache_key,
             head_dim=head_dim,
+            value_dim=value_dim,
             query_group_size=query_group_size,
             block_size=block_size,
             softmax_scale=softmax_scale,
@@ -761,6 +905,7 @@ class PaDecodeTraits:
             QP_ELEM_BYTES=QP_ELEM_BYTES,
             Q_ABSMAX_F32=Q_ABSMAX_F32,
             UNIQUE_SCALE_STAGING=UNIQUE_SCALE_STAGING,
+            FP8_WINDOW_RESIDUAL=FP8_WINDOW_RESIDUAL,
             WIDE_FP8_MFMA=WIDE_FP8_MFMA,
             PACKS_PER_MFMA=PACKS_PER_MFMA,
             MTP4_FUSED=MTP4_FUSED,

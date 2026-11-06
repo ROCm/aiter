@@ -37,13 +37,13 @@ Logical layouts (not preshuffled):
 
 * ``query``        [num_seqs * query_length, num_q_heads, head_dim]  f16/bf16
 * ``key_cache``    [num_blocks, num_kv_heads, head_dim//x, block_size, x]
-* ``value_cache``  [num_blocks, num_kv_heads, block_size//x, head_dim, x] (trans_v)
-                   or [num_blocks, num_kv_heads, head_dim, block_size] (FP8 plain)
+* ``value_cache``  [num_blocks, num_kv_heads, block_size//x, value_dim, x] (trans_v)
+                   or [num_blocks, num_kv_heads, value_dim, block_size] (FP8 plain)
                    where x=16 for FP8 and x=8 for BF16
 * ``block_tables`` [num_seqs, max_blocks_per_seq]  int32
 * ``work_info``    [capacity, 4]  int32 sequence/tile bounds/context length
 * ``pmax``, ``psum`` [num_kv_heads, capacity, query_length * query_group_size] f32
-* ``pout``         [num_kv_heads, capacity, query_length * query_group_size, head_dim]
+* ``pout``         [num_kv_heads, capacity, query_length * query_group_size, value_dim]
                    same dtype as query; normalized partition output
 * K/V scales      [1] per-tensor or [num_blocks, num_kv_heads, block_size] per-token
 
@@ -60,6 +60,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import const_expr, gpu, range_constexpr
+from flydsl.runtime.device import check_smem_capacity
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
 
@@ -157,6 +158,7 @@ def compile_pa_decode_tile(
     *,
     architecture: str | None = None,
     head_dim: int,
+    value_dim: int | None = None,
     query_group_size: int,
     block_size: int,
     num_seqs: int,
@@ -235,6 +237,8 @@ def compile_pa_decode_tile(
         raise NotImplementedError("Non-transposed key cache is not implemented")
     architecture = (architecture or get_gfx_runtime()).split(":", 1)[0]
     if architecture in ("gfx1250", "gfx1250-strict"):
+        if value_dim not in (None, head_dim):
+            raise NotImplementedError("asymmetric value width requires gfx942/gfx950")
         if query_splits is None:
             # Split the measured spilling BF16 specialization into one Q tile
             # per CTA. Other shapes retain fused queries and their KV reuse.
@@ -273,6 +277,7 @@ def compile_pa_decode_tile(
         raise NotImplementedError("direct_output requires gfx1250 or MXFP4")
     schedule = PaDecodeSchedule.select(
         head_dim=head_dim,
+        value_dim=value_dim,
         query_group_size=query_group_size,
         block_size=block_size,
         num_seqs=num_seqs,
@@ -300,6 +305,7 @@ def compile_pa_decode_tile(
         return cached
 
     traits = PaDecodeTraits.create(schedule)
+    check_smem_capacity(traits.total_bytes, architecture)
     # As in fmha_gfx950, expose scalar specialization data to FlyDSL's closure
     # cache walker: it cannot inspect the fields of a captured traits object.
     _pa_decode_cache_tag = (traits.cache_key, implementation_cache_tag())
@@ -313,7 +319,7 @@ def compile_pa_decode_tile(
         # Packed partials: [KV heads, capacity, query rows].
         pmax_ptr: fx.Pointer,  # Natural-log row max.
         psum_ptr: fx.Pointer,  # Row sum.
-        pout_ptr: fx.Pointer,  # Adds head_dim; Q_DTYPE normalized O_p/l_p.
+        pout_ptr: fx.Pointer,  # Adds value_dim; Q_DTYPE normalized O_p/l_p.
         query_ptr: fx.Pointer,
         key_cache_ptr: fx.Pointer,
         value_cache_ptr: fx.Pointer,
