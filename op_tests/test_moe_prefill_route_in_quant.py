@@ -219,3 +219,44 @@ def test_first_use_under_capture_fills(monkeypatch):
     graph.replay()
     torch.cuda.synchronize()
     assert torch.equal(out, expect)
+
+
+def test_capture_after_small_eager_call_self_cleans(monkeypatch):
+    """A token graph recorded before any eager prefill: the counter that an
+    eager decode-size call allocated keeps the capture on the self-cleaning
+    route, without the fill."""
+    require_gfx1250()
+    tokens, small = 2048, 16
+    args, kwargs = _moe_args(tokens)
+    s_args, s_kwargs = _moe_args(small)
+    hidden = (torch.randn(tokens, MODEL_DIM, device="cuda") * 0.5).bfloat16()
+    ids, w = make_ids(tokens, 11)
+    expect = _moe(args, kwargs, hidden, ids, w)  # compiles; allocates the counter
+    torch.cuda.synchronize()
+    monkeypatch.setattr(gm, "_TP_ROUTE_STATE_CACHE", {})
+    # An eager decode-size call takes the small-batch route, not this one.
+    s_hidden = (torch.randn(small, MODEL_DIM, device="cuda") * 0.5).bfloat16()
+    s_ids, s_w = make_ids(small, 12)
+    _moe(s_args, s_kwargs, s_hidden, s_ids, s_w)
+    torch.cuda.synchronize()
+    assert len(gm._TP_ROUTE_STATE_CACHE) == 1 and state_is_zero()
+    builds = []
+    getter = gm._get_compiled_route_lds_psum
+
+    def spy(experts, self_clean):
+        builds.append(self_clean)
+        return getter(experts, self_clean)
+
+    monkeypatch.setattr(gm, "_get_compiled_route_lds_psum", spy)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        out = _moe(args, kwargs, hidden, ids, w)
+    torch.cuda.current_stream().wait_stream(stream)
+    assert builds == [True]
+    for _ in range(2):
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(out, expect)
+        assert state_is_zero()

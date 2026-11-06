@@ -909,6 +909,14 @@ def _grouped_a8w4_tdm_moe(
         and not _a_preshuffle_requested
         and not _compact_quant_pair()
     )
+    # The prefill route below keeps a persistent counter it can only allocate
+    # outside graph capture. Every eager TP call allocates it, whatever its
+    # size (decode warm-up and the memory-profile run come before any capture),
+    # so a token graph recorded before any eager prefill still records the
+    # self-cleaning route rather than the filled-scratch fallback. Once it
+    # exists this is one dict lookup.
+    if not herd_topk and not _compact and not _is_ep and not enable_ep_scatter:
+        tp_route_state_buffer(E, device)
     # Larger TP batches (prefill): one route launch, whose last workgroup
     # builds masked_m/starts/psum, and the token-multidest A1 quant resolves
     # each route's row. This replaces the counter fill, route and psum-remap
@@ -2224,8 +2232,9 @@ def tp_route_state_buffer(E: int, device) -> torch.Tensor | None:
 
     ``moe_route_lds_psum_sc`` zeroes it at the end of every launch, so route
     launches issued in order on one stream start from zero without a fill.
-    Allocated (zeroed) on first use outside graph capture; a capture that
-    finds none gets None, so no allocation is recorded into the graph.
+    Allocated (zeroed) by the first eager TP grouped-MoE call of any size; a
+    capture that finds none gets None, so no allocation is recorded into the
+    graph (the route then uses a filled scratch counter).
     """
     key = (int(E), str(device))
     buf = _TP_ROUTE_STATE_CACHE.get(key)
