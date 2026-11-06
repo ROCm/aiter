@@ -691,7 +691,8 @@ class SiluQuantEpilogue:
     # fmt: off
     def __init__(self, *, out_rsrc, out_scale_rsrc, sorted_rsrc, tokens, inter_dim, m_repeat, num_acc_n,
         sort_block_m, tile_n, num_waves, lds_out, evec, swiglu_limit=0.0, always_valid=False,
-        out_tensor=None, out_dtype="fp8", act="silu", situ_beta=1.0, situ_linear_beta=1.0):
+        out_tensor=None, out_dtype="fp8", act="silu", situ_beta=1.0, situ_linear_beta=1.0,
+        out_cache_modifier=0):
     # fmt: on
         self._out_rsrc = out_rsrc
         self._out_scale_rsrc = out_scale_rsrc
@@ -727,6 +728,9 @@ class SiluQuantEpilogue:
         # so the default AITER_MEGA_S1_EPI_EVEC=8 never routes FP4 to the FP8
         # store path (which would write FP8 words into the Int8 FP4 buffer).
         self._evec = 2 if self._is_fp4 else evec
+        # Default store cache policy; 17 (sc0|sc1) makes the outputs visible to
+        # consumers on other CUs of the same kernel.
+        self._out_cache_modifier = int(out_cache_modifier)
         self._lane = fx.thread_idx.x % 64
         self._sorted_scale_cols_i32 = (inter_dim // 32 + 7) // 8 * 8
 
@@ -803,20 +807,31 @@ class SiluQuantEpilogue:
             out_row_base = slot * fx.Int32(self._inter_dim)
         return row_g, valid, out_row_base
 
-    def store(self, acc, tile_i32, tile_row_base_i32, n_tile_base_i32):
+    def store(self, acc, tile_i32, tile_row_base_i32, n_tile_base_i32, valid_rows_i32=None, store_cm=None):
+        """Quantize and store one tile.
+
+        ``valid_rows_i32`` drops the output and scale stores of padding rows;
+        ``store_cm`` overrides the constructor's store cache policy.
+        """
+        if store_cm is None:
+            store_cm = self._out_cache_modifier
         combined = self._combine(acc)
         n_per = len(combined) // self._m_repeat
+        out_elem = fx.Int8 if const_expr(self._is_fp4) else fx.Int16
         if self._out_tensor is not None:
             tile_iter = fx.add_offset(
                 fx.get_iter(self._out_tensor),
                 fx.Int64(tile_i32) * fx.Int64(self._sort_block_m * self._out_row_bytes),
             )
             tile_view = fx.Tensor(fx.make_view(tile_iter, fx.make_layout(1, 1)))
-            out_elem = fx.Int8 if const_expr(self._is_fp4) else fx.Int16
             out_rsrc = ptr_buf_tensor(
                 fx.get_iter(tile_view),
                 out_elem,
-                num_records_bytes=self._sort_block_m * self._out_row_bytes,
+                num_records_bytes=(
+                    self._sort_block_m * self._out_row_bytes
+                    if valid_rows_i32 is None
+                    else valid_rows_i32 * fx.Int32(self._out_row_bytes)
+                ),
             )
         else:
             out_rsrc = self._out_rsrc
@@ -843,6 +858,7 @@ class SiluQuantEpilogue:
         gpu.barrier()
 
         if const_expr(self._evec == 8):
+            assert valid_rows_i32 is None and store_cm == 0
             self._store_quant_vec8(tile_i32, tile_row_base_i32, n_tile_base_i32, cbase, cptr, cs_tile_n)
             return
 
@@ -872,6 +888,8 @@ class SiluQuantEpilogue:
                 tok = self._sorted_rsrc[slot]
                 valid = tok < fx.Int32(self._tokens)
                 out_row_base = slot * fx.Int32(self._out_row_bytes)
+            if const_expr(valid_rows_i32 is not None):
+                valid = valid & (row < valid_rows_i32)
             for nr in range_constexpr(n_reps):
                 col0 = fx.Int32(nr * NLANE * EVEC) + nlane * fx.Int32(EVEC)
                 idx = row * fx.Int32(cs_tile_n) + col0
@@ -909,13 +927,16 @@ class SiluQuantEpilogue:
                     payload = fx.Int32(packed).to(fx.Int16)
                     out_byte = out_row_base + gcol
                 out_byte = valid.select(out_byte, fx.Int32(0x40000000))
-                if const_expr(self._is_fp4):
-                    out_rsrc[out_byte] = payload
+                out_index = out_byte if const_expr(self._is_fp4) else out_byte // fx.Int32(2)
+                if const_expr(store_cm == 0):
+                    out_rsrc[out_index] = payload
                 else:
-                    out_rsrc[out_byte // fx.Int32(2)] = payload
+                    buf_copy_store(out_rsrc, out_index, payload, out_elem, cache_modifier=store_cm)
 
                 col_s = gcol >> fx.Int32(5)
                 is_writer = (gcol & fx.Int32(31)) == fx.Int32(0)
+                if const_expr(valid_rows_i32 is not None):
+                    is_writer = is_writer & (row < valid_rows_i32)
                 d0 = row_g >> fx.Int32(5)
                 d1 = (row_g >> fx.Int32(4)) & fx.Int32(1)
                 d2 = row_g & fx.Int32(15)
@@ -925,7 +946,10 @@ class SiluQuantEpilogue:
                 byte_off = d0 * n32 + d3 * fx.Int32(256) + d5 * fx.Int32(64) + d2 * fx.Int32(4) + d4 * fx.Int32(2) + d1
                 byte_off = is_writer.select(byte_off, fx.Int32(0x40000000))
                 e8m0_i8 = e8m0_v.to(fx.Int8)
-                self._out_scale_rsrc[byte_off] = e8m0_i8
+                if const_expr(store_cm == 0):
+                    self._out_scale_rsrc[byte_off] = e8m0_i8
+                else:
+                    buf_copy_store(self._out_scale_rsrc, byte_off, e8m0_i8, fx.Int8, cache_modifier=store_cm)
         wait_lds_barrier()
 
     def _store_quant_vec8(self, tile_i32, tile_row_base_i32, n_tile_base_i32, cbase, cptr, cs_tile_n):
