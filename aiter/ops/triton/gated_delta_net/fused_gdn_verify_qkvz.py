@@ -230,6 +230,13 @@ def fused_gdn_verify_qkvz(
         if os.environ.get("AITER_GDN_VERIFY_MATRIX", "0") == "1":
             chunk_kernel = _fused_gdn_verify_chunk_mat
         kernel, num_warps, tile_args = chunk_kernel, chunk_warps, {}
+        # AITER_GDN_VERIFY_UNROLL=1: the matrix form with its products of the
+        # heads unrolled (the same bits; an experiment, off by default).
+        if (
+            kernel is _fused_gdn_verify_chunk_mat
+            and os.environ.get("AITER_GDN_VERIFY_UNROLL", "0") == "1"
+        ):
+            tile_args = {"UNROLL_HEADS": True}
     if out_fp8:
         assert (
             kernel is _fused_gdn_verify_chunk

@@ -1161,6 +1161,7 @@ def _fused_gdn_verify_chunk_mat(
     NW: gl.constexpr,
     PAD_SLOT_ID: gl.constexpr,
     HAS_BIAS: gl.constexpr,
+    UNROLL_HEADS: gl.constexpr = False,
 ):
     """The verify step of _fused_gdn_verify_chunk with the window in matrix form.
 
@@ -1459,22 +1460,42 @@ def _fused_gdn_verify_chunk_mat(
         gl.zeros([16, 16], gl.float32, mma32),
     )
     xx_lds = gl.allocate_shared_memory(gl.float32, [16, 16], rows_shared, xx)
-    for h in range(RATIO):
-        _project_head(
-            xh_lds,
-            xm_lds,
-            xl_lds,
-            ckpt_heads.index(h),
-            kr_heads.index(h),
-            ur_heads.index(h),
-            w_lds.index(h),
-            d_lds.index(h),
-            p_lds.index(h),
-            K,
-            V,
-            CAP_P2,
-            NW,
-        )
+    if UNROLL_HEADS:
+        # The heads unrolled, so that their WMMA chains (and the Gram's) interleave;
+        # each product sums in the same order, so the results are the loop's bits.
+        for hu in gl.static_range(RATIO):
+            _project_head(
+                xh_lds,
+                xm_lds,
+                xl_lds,
+                ckpt_heads.index(hu),
+                kr_heads.index(hu),
+                ur_heads.index(hu),
+                w_lds.index(hu),
+                d_lds.index(hu),
+                p_lds.index(hu),
+                K,
+                V,
+                CAP_P2,
+                NW,
+            )
+    else:
+        for h in range(RATIO):
+            _project_head(
+                xh_lds,
+                xm_lds,
+                xl_lds,
+                ckpt_heads.index(h),
+                kr_heads.index(h),
+                ur_heads.index(h),
+                w_lds.index(h),
+                d_lds.index(h),
+                p_lds.index(h),
+                K,
+                V,
+                CAP_P2,
+                NW,
+            )
     if flush & valid:
         # S0 = d C + K_rec^T diag(w) U_rec, one head and one block of checkpoint rows
         # at a time, back into the LDS rows it came from and out by TDM. Right after
