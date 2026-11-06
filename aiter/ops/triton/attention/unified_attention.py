@@ -1776,3 +1776,10 @@ def _unified_attention_3d_gfx950(
         partial_m=segm_max if split else None,
         partial_l=segm_expsum if split else None,
     )
+
+
+# AITER_UA_FAST_LAUNCH=1: record-and-replay host fast path (see unified_attention_utils.py).
+if __import__("os").environ.get("AITER_UA_FAST_LAUNCH", "1") == "1":
+    from aiter.ops.triton.utils.unified_attention_utils import wrap_fast_launch
+
+    unified_attention = wrap_fast_launch(unified_attention)
