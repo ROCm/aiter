@@ -45,8 +45,8 @@ pytestmark = pytest.mark.skipif(
 )
 # The packed decode/verify kernel is tuned and validated on gfx950 only.
 GDN_VARLEN_GFX = ["gfx950"]
-# The fused KDA decode kernel is a gfx950-only specialization.
-KDA_DECODE_GFX = ["gfx950"]
+# The fused KDA decode kernel is validated on gfx942 and gfx950.
+KDA_DECODE_GFX = ["gfx942", "gfx950"]
 _gdn_varlen_only = pytest.mark.skipif(
     get_gfx() not in GDN_VARLEN_GFX,
     reason="FlyDSL GDN packed decode/verify is validated on gfx950 only",
@@ -523,10 +523,10 @@ def test_flydsl_gdr_decode_invalid_indices_zero_output_without_state_write():
     )
 
 
-# Fused KDA decode is fixed to the gfx950 Kimi-K3 TP8 layout.
+# Fused KDA decode is fixed to the Kimi-K3 TP8 layout.
 _requires_kda = pytest.mark.skipif(
     not is_flydsl_kda_decode_supported(),
-    reason="FlyDSL KDA decode requires gfx950",
+    reason="FlyDSL KDA decode requires gfx942 or gfx950",
 )
 _KDA_DEVICE = torch.device("cuda")
 _KDA_HEADS = 12
@@ -1090,11 +1090,14 @@ def test_flydsl_kda_decode_supported_checks_arch_and_build_target(
     assert is_flydsl_kda_decode_supported(torch.device("cuda"))
     assert not is_flydsl_kda_decode_supported(torch.cuda.device_count())
     with monkeypatch.context() as patch:
-        patch.setattr(linear_attention_kernels, "get_gfx_runtime", lambda: "gfx942")
+        # An arch outside the supported set.
+        patch.setattr(linear_attention_kernels, "get_gfx_runtime", lambda: "gfx90a")
         assert not is_flydsl_kda_decode_supported(device)
     with monkeypatch.context() as patch:
-        # A gfx950 GPU, but FlyDSL builds for another arch.
-        patch.setattr(linear_attention_kernels, "GDR_GPU_ARCH", "gfx942")
+        # A supported GPU, but FlyDSL builds for the other supported arch.
+        build = linear_attention_kernels.GDR_GPU_ARCH
+        other = "gfx950" if build == "gfx942" else "gfx942"
+        patch.setattr(linear_attention_kernels, "GDR_GPU_ARCH", other)
         assert not is_flydsl_kda_decode_supported(device)
 
 
@@ -1305,10 +1308,10 @@ def test_flydsl_kda_decode_kernel_names_identify_state_dtype() -> None:
     # FP32-state names are unchanged; a profile can tell the BF16-state build
     # apart by its suffix.
     expected = {
-        (False, "f32"): "kda_decode_bf16_gfx950",
-        (True, "f32"): "kda_decode_fused_projection_bf16_gfx950",
-        (False, "bf16"): "kda_decode_bf16_gfx950_bf16state",
-        (True, "bf16"): "kda_decode_fused_projection_bf16_gfx950_bf16state",
+        (False, "f32"): "kda_decode_bf16",
+        (True, "f32"): "kda_decode_fused_projection_bf16",
+        (False, "bf16"): "kda_decode_bf16_bf16state",
+        (True, "bf16"): "kda_decode_fused_projection_bf16_bf16state",
     }
     f_a, f_b_weight, base_inputs = _make_kda_fb_inputs(batch=1)
     for (fused_f_b, state_dtype), name in expected.items():

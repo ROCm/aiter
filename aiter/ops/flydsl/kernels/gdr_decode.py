@@ -1335,7 +1335,7 @@ def create_vk_gdr_mtp_kernel(
 
 # Kimi Delta Attention (KDA) decode: the gated delta rule with a per-channel
 # decay, fused with the Q/K/V causal convolution and the gated RMSNorm.
-# Fixed to the gfx950 Kimi-K3 TP8 layout: 12 local heads, 128-dim state.
+# Fixed to the Kimi-K3 TP8 layout: 12 local heads, 128-dim state.
 _KDA_HEADS = 12
 _KDA_DIM = 128
 _KDA_SCALE = _KDA_DIM**-0.5
@@ -1387,7 +1387,7 @@ def _kda_vector_sum(vec):
 def create_kda_decode_kernel(
     norm_eps: float, lower_bound: float, fuse_f_b: bool, state_dtype: str
 ):
-    """Build the fixed gfx950 BF16 KDA decode specialization.
+    """Build the fixed BF16 KDA decode specialization (gfx942/gfx950).
 
     With ``fuse_f_b``, the kernel computes the head-local ``f_b`` projection
     instead of reading a precomputed raw gate from global memory.
@@ -1723,7 +1723,7 @@ def create_kda_decode_kernel(
     if fuse_f_b:
 
         @flyc.kernel(
-            name=f"kda_decode_fused_projection_bf16_gfx950{name_suffix}",
+            name=f"kda_decode_fused_projection_bf16{name_suffix}",
             known_block_size=[_KDA_BLOCK_THREADS, 1, 1],
         )
         def kernel(
@@ -1864,7 +1864,7 @@ def create_kda_decode_kernel(
     else:
 
         @flyc.kernel(
-            name=f"kda_decode_bf16_gfx950{name_suffix}",
+            name=f"kda_decode_bf16{name_suffix}",
             known_block_size=[_KDA_BLOCK_THREADS, 1, 1],
         )
         def kernel(
