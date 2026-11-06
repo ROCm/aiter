@@ -26,7 +26,9 @@ writeback; each CTA then writes its share of the sequence's rows.
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr
+from flydsl.expr import math as fmath
 from flydsl.expr.rocdl import SyncScope, cluster
+from flydsl.expr.typing import ReductionOp, T
 
 from ..pa_decode_plan import ARRIVAL_COUNTER_STRIDE
 from ..utils import rcp_f32
@@ -242,21 +244,37 @@ class Gfx1250PartitionMerge:
                     fx.ptr_store(acc.to(t.q_dtype), target)
 
 
+def _cluster_sync():
+    """Publish global stores to the cluster and observe the other CTAs' stores."""
+    fx.memory_fence(syncscope="cluster", ordering=fx.AtomicOrdering.Release)
+    cluster.cluster_barrier()
+    fx.memory_fence(syncscope="cluster", ordering=fx.AtomicOrdering.Acquire)
+
+
 class Gfx1250ClusterMerge:
     """Merge one (sequence, KV head) across the CTAs of its cluster.
 
     The sequence's ``count`` tasks occupy the first CTAs of its cluster of
     ``t.cluster_merge``, so ``count`` and the barrier are cluster-uniform; the
     other CTAs only merge. Partials sit at packed slots from ``first`` on.
+    With ``quant`` each merging wave owns one row of the token and quantizes
+    it after a second cluster barrier, which the other waves also reach.
     """
 
-    def __init__(self, t, pmax, psum, pout, output, stride_q_row, stride_q_head):
+    def __init__(
+        self, t, pmax, psum, pout, output, stride_q_row, stride_q_head, quant=None
+    ):
         self.t = t
         self.pmax, self.psum, self.pout, self.output = pmax, psum, pout, output
         self.stride_q_row, self.stride_q_head = stride_q_row, stride_q_head
         # Each CTA writes ``share`` rows of its query split, ``per_wave`` per wave.
         self.share = -(-t.rows // t.cluster_merge)
         self.per_wave = -(-self.share // t.NWARP)
+        self.quant = quant
+        if quant is not None and (
+            self.per_wave != 1 or self.share * t.cluster_merge != t.rows
+        ):
+            raise ValueError("quantized cluster merges need one row per wave")
 
     @flyc.jit
     def run(self, seq, part, first, count, capacity):
@@ -265,8 +283,18 @@ class Gfx1250ClusterMerge:
         cluster.cluster_barrier()
         fx.memory_fence(syncscope="cluster", ordering=fx.AtomicOrdering.Acquire)
         wave_begin = fx.Int32(fx.rocdl.wave_id()) * self.per_wave
-        if wave_begin < self.share:
-            self._merge_rows(seq, part * self.share, wave_begin, first, count, capacity)
+        if const_expr(self.quant is None):
+            if wave_begin < self.share:
+                self._merge_rows(
+                    seq, part * self.share, wave_begin, first, count, capacity
+                )
+        else:
+            if wave_begin < self.share:
+                self._merge_rows(
+                    seq, part * self.share, wave_begin, first, count, capacity
+                )
+            else:
+                self.quant.sync()
 
     @flyc.jit
     def _merge_rows(self, seq, share_begin, wave_begin, first, count, capacity):
@@ -344,19 +372,200 @@ class Gfx1250ClusterMerge:
             for i in members:
                 acc = _combine(t, values[i - begin], weights[i])
                 row = load_rows[i]
-                target = fx.recast_iter(
-                    vector,
-                    fx.add_offset(
-                        output,
-                        (fx.Int64(seq) * t.query_length + row // t.query_group_size)
-                        * self.stride_q_row
-                        + (kv_h * t.query_group_size + row % t.query_group_size)
-                        * self.stride_q_head
-                        + lane_elem,
-                    ),
+                offset = (
+                    (fx.Int64(seq) * t.query_length + row // t.query_group_size)
+                    * self.stride_q_row
+                    + (kv_h * t.query_group_size + row % t.query_group_size)
+                    * self.stride_q_head
+                    + lane_elem
                 )
-                if const_expr(share % per_wave or t.rows % t.cluster_merge):
-                    if (local[i] < share) & (row_ids[i] < t.rows):
-                        fx.ptr_store(acc.to(t.q_dtype), target)
+                if const_expr(self.quant is not None):
+                    # The first partition's maxima of the token's rows; this
+                    # wave alone read its row's entry, before merging it.
+                    self.quant.store_cluster(
+                        seq,
+                        row,
+                        lane,
+                        fx.add_offset(pmax, fx.Int64(first_slot) * rows),
+                        acc.to(t.q_dtype),
+                        offset,
+                        fx.recast_iter(vector, output),
+                    )
                 else:
-                    fx.ptr_store(acc.to(t.q_dtype), target)
+                    target = fx.recast_iter(vector, fx.add_offset(output, offset))
+                    if const_expr(share % per_wave or t.rows % t.cluster_merge):
+                        if (local[i] < share) & (row_ids[i] < t.rows):
+                            fx.ptr_store(acc.to(t.q_dtype), target)
+                    else:
+                        fx.ptr_store(acc.to(t.q_dtype), target)
+
+
+class Gfx1250OutputQuant:
+    """Per-token OCP FP8 output of MiniMax-M3's sparse PA from registers.
+
+    The optional PA interface targets one KV head, one query token per
+    sequence, GQA 16 and D128, so a token is 16 x 128 = 2048 values. Owners
+    round their final values to the output dtype in registers, so the FP8
+    bytes and descale equal the separate per-token quant of the stored output.
+
+    * A direct CTA (or a cluster's only task) holds the whole token: wave
+      maxima meet in a 16-byte LDS slot behind the epilogue's one barrier.
+    * A cluster merge splits the token's 16 rows over its CTAs, one row per
+      wave. Each wave reuses the first partition's ``pmax`` entry of its row,
+      which only that wave has read, for the row maximum; one cluster barrier
+      publishes the 16 maxima.
+
+    The BF16/FP16 output is written only when the caller keeps it.
+    """
+
+    def __init__(self, t, quantized_output, output_scale):
+        self.t = t
+        self.quantized = fx.recast_iter(fx.Uint8, quantized_output)
+        self.scales = fx.recast_iter(fx.Float32, output_scale)
+
+    def _wave_max(self, value):
+        for shift in (16, 8, 4, 2, 1):
+            value = fx.maxnumf(
+                value, value.shuffle_xor(fx.Int32(shift), fx.Int32(self.t.WAVE))
+            )
+        return value
+
+    def _lane_max(self, values):
+        lane_max = fx.Float32(0.0)
+        for value in values:
+            lane_max = fx.maxnumf(
+                lane_max, fmath.absf(value.to(fx.Float32)).reduce(ReductionOp.MAX)
+            )
+        return lane_max
+
+    def _store_fp8(self, values, offset, inv_scale):
+        """Store output-dtype values as FP8 at element (= byte) ``offset``."""
+        t = self.t
+        floats = values.to(fx.Float32)
+        words = []
+        for base in range_constexpr(0, floats.numel, 4):
+            word = fx.Int32(0).ir_value()
+            for half in range_constexpr(2):
+                pair = []
+                for j in range_constexpr(2):
+                    # The separate kernel's multiply and +-448 saturation.
+                    value = fx.Float32(floats[base + 2 * half + j]) * inv_scale
+                    value = fx.maxnumf(value, fx.Float32(-t.FP8_MAX))
+                    value = fx.minnumf(value, fx.Float32(t.FP8_MAX))
+                    pair.append(value.ir_value())
+                word = fx.rocdl.cvt_pk_fp8_f32(T.i32, pair[0], pair[1], word, half)
+            words.append(word)
+        target = fx.recast_iter(
+            fx.PointerType.get(fx.Int32.ir_type, fx.AddressSpace.Global, 4),
+            fx.add_offset(self.quantized, offset),
+        )
+        fx.ptr_store(fx.Vector.from_elements(words, dtype=fx.Int32), target)
+
+    @flyc.jit
+    def _finish(self, token, leader, token_max, values, offsets, output, keep):
+        # Local names keep the guarded stores' operands SSA values.
+        t, scales = self.t, self.scales
+        scale = token_max * fx.Float32(1.0 / t.FP8_MAX)
+        inv_scale = fx.Float32(rcp_f32(scale))
+        if leader:
+            scales[token] = scale
+        for i in range_constexpr(len(values)):
+            if const_expr(keep):
+                fx.ptr_store(values[i], fx.add_offset(output, offsets[i]))
+            self._store_fp8(values[i], offsets[i], inv_scale)
+
+    @flyc.jit
+    def store_cta(self, mem, token, warp, lane, values, offsets, output):
+        """Write a token whose values all live in this CTA's registers."""
+        t = self.t
+        wave_max = fx.Vector.from_elements(
+            [self._wave_max(self._lane_max(values))], dtype=fx.Float32
+        )
+        slot = mem.pointer(t.quant_offset + warp * 4, fx.Float32)
+        if lane == 0:
+            fx.ptr_store(wave_max, slot)
+        # A workgroup barrier does not wait for global stores, so the kept
+        # output drains while the waves exchange their maxima.
+        if const_expr(t.store_output):
+            for i in range_constexpr(len(values)):
+                fx.ptr_store(values[i], fx.add_offset(output, offsets[i]))
+        # The epilogue's only barrier.
+        gpu.barrier()
+        token_max = mem.load(t.quant_offset, fx.Float32, t.NWARP).reduce(
+            ReductionOp.MAX
+        )
+        self._finish(
+            token, (warp == 0) & (lane == 0), token_max, values, offsets, output, False
+        )
+
+    @flyc.jit
+    def store_cluster(self, token, row, lane, row_maxima, value, offset, output):
+        """Write one row of a token that the cluster's CTAs merged together.
+
+        ``row_maxima`` holds 16 floats that only the owner of each row has
+        read before; every wave of the cluster must call this or ``sync``.
+        """
+        t = self.t
+        row_max = self._wave_max(self._lane_max([value]))
+        if lane == 0:
+            row_maxima[row] = row_max
+        _cluster_sync()
+        token_max = self._wave_max(fx.Float32(row_maxima[lane % t.rows]))
+        # The cluster release waits for every store, so the kept output
+        # follows the barrier.
+        self._finish(
+            token,
+            (row == 0) & (lane == 0),
+            token_max,
+            [value],
+            [offset],
+            output,
+            t.store_output,
+        )
+
+    def sync(self):
+        """The cluster barrier of ``store_cluster`` for waves without a row."""
+        _cluster_sync()
+
+    @flyc.jit
+    def store_pad(self, token, stride_row, stride_head):
+        """A padded token past the query's: FP8 zeros and a unit descale, so a
+        consumer of the whole padded height reads inert finite rows."""
+        t, scales = self.t, self.scales
+        per_thread = t.rows * t.head_dim // t.BLOCK_THREADS
+        tid = fx.Int32(gpu.thread_id("x"))
+        first = tid * per_thread
+        offset = (
+            fx.Int64(token) * stride_row
+            + (first // t.head_dim) * stride_head
+            + first % t.head_dim
+        )
+        target = fx.recast_iter(
+            fx.PointerType.get(fx.Int32.ir_type, fx.AddressSpace.Global, 4),
+            fx.add_offset(self.quantized, offset),
+        )
+        zeros = [fx.Int32(0).ir_value() for _ in range_constexpr(per_thread // 4)]
+        fx.ptr_store(fx.Vector.from_elements(zeros, dtype=fx.Int32), target)
+        if tid == 0:
+            scales[token] = fx.Float32(1.0)
+
+    @flyc.jit
+    def store_zero(self, token, stride_row, stride_head):
+        """An empty token: zero values and scale, quantized like any token."""
+        t, scales = self.t, self.scales
+        per_thread = t.rows * t.head_dim // t.BLOCK_THREADS
+        tid = fx.Int32(gpu.thread_id("x"))
+        first = tid * per_thread
+        offset = (
+            fx.Int64(token) * stride_row
+            + (first // t.head_dim) * stride_head
+            + first % t.head_dim
+        )
+        scale = fx.Float32(0.0) * fx.Float32(1.0 / t.FP8_MAX)
+        self._store_fp8(
+            fx.Vector.filled(per_thread, 0.0, t.q_dtype),
+            offset,
+            fx.Float32(rcp_f32(scale)),
+        )
+        if tid == 0:
+            scales[token] = scale

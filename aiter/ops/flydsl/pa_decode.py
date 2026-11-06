@@ -188,6 +188,52 @@ def launch_pa_decode_ps_reduce(
     )
 
 
+# Validated launches of the tile kernel that writes the final output (direct or
+# cluster merge, no reducer, no fallback quant), keyed by everything the checks
+# and the dispatch below read except tensor addresses (`_launch_signature`). A
+# repeated call with the same signature skips the checks and the dispatch and
+# only re-reads the addresses. Bounded: a full table is cleared.
+_VALIDATED_LAUNCHES: dict = {}
+_VALIDATED_LAUNCHES_MAX = 1024
+
+
+def _tensor_signature(t):
+    if t is None:
+        return None
+    if type(t) is not torch.Tensor:
+        raise TypeError
+    return (t.shape, t.stride(), t.dtype, t.get_device())
+
+
+def _launch_signature(
+    tensors,
+    scalars,
+    work_plan,
+):
+    """Hashable key of a call, or None when it must take the checked path
+    (non-tensor or subclass operands, a plan of another type)."""
+    if type(work_plan) is not PADecodePlan:
+        return None
+    try:
+        sigs = tuple(_tensor_signature(t) for t in tensors)
+        # The plan's fields, not its identity: a per-forward plan of the same
+        # shape (ATOM's sparse prefill builds one per forward) reuses the launch,
+        # which reads the plan's tensors and capacity at call time.
+        plan = (
+            work_plan.num_kv_heads,
+            work_plan.max_partitions,
+            work_plan.sliding_window,
+            work_plan.query_length,
+            work_plan.max_batch_size,
+            _tensor_signature(work_plan.work_info),
+            _tensor_signature(work_plan.reduce_info),
+            _tensor_signature(work_plan.arrival_counters),
+        )
+    except TypeError:
+        return None
+    return (sigs, scalars, plan, torch.cuda.current_device())
+
+
 def pa_decode(
     output: torch.Tensor,  # [num_seqs * query_length, num_query_heads, head_size]
     query: torch.Tensor,  # [num_seqs * query_length, num_query_heads, head_size]
@@ -206,12 +252,16 @@ def pa_decode(
     exp_sums: torch.Tensor = None,  # [num_kv_heads, capacity, query_length * query_group_size]
     max_logits: torch.Tensor = None,  # [num_kv_heads, capacity, query_length * query_group_size]
     temporary_output: torch.Tensor = None,  # [num_kv_heads, capacity, query_length * query_group_size, head_size]
+    quantized_output: torch.Tensor = None,  # optional FP8, same shape/strides as output
+    output_scale: torch.Tensor = None,  # optional FP32 [num_seqs * query_length, 1]
     alibi_slopes: torch.Tensor = None,
     sinks: torch.Tensor = None,
     sliding_window: int = 0,
     work_plan: PADecodePlan,
     max_context_length: int | None = None,
     mask_unowned_kv: bool = True,
+    store_output: bool = True,
+    quantized_pad_rows: int = 0,
 ) -> None:
     """Decode FP8 or BF16 K/V using 256-token compute tiles.
 
@@ -236,6 +286,21 @@ def pa_decode(
     into separate query CTAs. Q/K and V/output
     head dimensions must match.
     ALiBi and externally quantized queries are unsupported.
+
+    ``quantized_output`` and ``output_scale`` opt into the MiniMax-M3 sparse
+    output epilogue. They must be supplied together. The epilogue writes OCP
+    FP8 in the same logical layout as ``output`` and one contiguous FP32
+    descale per flattened query token, shape ``[num_seqs * query_length, 1]``;
+    dequantization is ``quantized_output.float() * output_scale``. It is
+    intentionally limited to gfx1250 page16 sparse PA, query_length=1, one KV
+    head, GQA16, head_dim=128, and the direct or cluster8 output modes. Calls
+    that omit both tensors retain the existing output and dispatch unchanged.
+    With the quantized output, ``store_output=False`` skips the BF16/FP16
+    store: ``output`` then only fixes the layout and its contents are left
+    unspecified. ``quantized_pad_rows`` extra rows of ``quantized_output`` and
+    ``output_scale`` past the query rows (a token bucket padded past the
+    scheduled tokens) are written as FP8 zeros with a unit descale by the same
+    launch, so a consumer of the whole bucket reads finite, inert rows.
 
     MTP lengths include the query tokens and use dense causal masking.
     Independently selected sparse queries need separate table rows and
@@ -289,6 +354,68 @@ def pa_decode(
     0 <= context_lengths[i] <= block_tables.shape[1] * block_size and used
     block indices in [0, min(key_cache.shape[0], value_cache.shape[0])).
     """
+    scale_tensors = (
+        key_scale if isinstance(key_scale, torch.Tensor) else None,
+        value_scale if isinstance(value_scale, torch.Tensor) else None,
+    )
+    launch_key = _launch_signature(
+        (
+            output,
+            query,
+            key_cache,
+            value_cache,
+            context_lengths,
+            block_tables,
+            *scale_tensors,
+            exp_sums,
+            max_logits,
+            temporary_output,
+            quantized_output,
+            output_scale,
+        ),
+        (
+            softmax_scale,
+            query_length,
+            context_partition_size,
+            compute_type,
+            query_scale is None,
+            alibi_slopes is None,
+            sinks is None,
+            key_scale is None or scale_tensors[0] is not None,
+            value_scale is None or scale_tensors[1] is not None,
+            sliding_window,
+            max_context_length,
+            mask_unowned_kv,
+            store_output,
+            quantized_pad_rows,
+            # The direct merge path requires 8-byte aligned partials.
+            (
+                temporary_output.data_ptr() % 8
+                if isinstance(temporary_output, torch.Tensor)
+                else None
+            ),
+        ),
+        work_plan,
+    )
+    if launch_key is not None:
+        launch = _VALIDATED_LAUNCHES.get(launch_key)
+        if launch is not None:
+            launch(
+                output,
+                query,
+                key_cache,
+                value_cache,
+                block_tables,
+                *scale_tensors,
+                max_logits,
+                exp_sums,
+                temporary_output,
+                work_plan,
+                quantized_output,
+                output_scale,
+            )
+            return
+
     if not isinstance(work_plan, PADecodePlan):
         raise TypeError("work_plan must be a PADecodePlan")
     if context_partition_size != KV_COMPUTE_BLOCK:
@@ -296,6 +423,26 @@ def pa_decode(
             "pa_decode only supports context_partition_size=256, "
             f"got {context_partition_size}"
         )
+    quant_output = quantized_output is not None or output_scale is not None
+    if (quantized_output is None) != (output_scale is None):
+        raise ValueError(
+            "quantized_output and output_scale must either both be provided or both "
+            "be None"
+        )
+    if not isinstance(store_output, bool):
+        raise TypeError(
+            f"store_output must be a bool, got {type(store_output).__name__}"
+        )
+    if not (store_output or quant_output):
+        raise ValueError("store_output=False requires quantized_output")
+    if (
+        isinstance(quantized_pad_rows, bool)
+        or not isinstance(quantized_pad_rows, int)
+        or quantized_pad_rows < 0
+    ):
+        raise ValueError("quantized_pad_rows must be a nonnegative int")
+    if quantized_pad_rows and not quant_output:
+        raise ValueError("quantized_pad_rows requires quantized_output")
     if query_scale is not None:
         raise NotImplementedError(
             "pa_decode does not support externally quantized FP8 queries"
@@ -323,6 +470,15 @@ def pa_decode(
             raise TypeError(
                 f"{name} must be a torch.Tensor, got {type(tensor).__name__}"
             )
+    if quant_output:
+        for name, tensor in (
+            ("quantized_output", quantized_output),
+            ("output_scale", output_scale),
+        ):
+            if not isinstance(tensor, torch.Tensor):
+                raise TypeError(
+                    f"{name} must be a torch.Tensor, got {type(tensor).__name__}"
+                )
 
     expected_ranks = (
         ("output", output, (3,)),
@@ -473,6 +629,60 @@ def pa_decode(
             "pa_decode requires output.dtype == query.dtype, "
             f"got {output.dtype} vs {query.dtype}"
         )
+    if quant_output:
+        if arch != "gfx1250":
+            raise NotImplementedError("quantized PA output requires gfx1250")
+        if (
+            query_length != 1
+            or num_kv_heads != 1
+            or query_group_size != 16
+            or head_dim != 128
+            or block_size != 16
+            or sinks is not None
+            or sliding_window != 0
+        ):
+            raise NotImplementedError(
+                "quantized PA output requires query_length=1, one KV head, "
+                "GQA=16, head_dim=128, page16, no sinks and no sliding window"
+            )
+        expected_quant_shape = (
+            output.shape[0] + quantized_pad_rows,
+            *output.shape[1:],
+        )
+        if tuple(quantized_output.shape) != expected_quant_shape:
+            raise ValueError(
+                "quantized_output shape must be output's plus quantized_pad_rows "
+                f"rows, got {tuple(quantized_output.shape)} vs "
+                f"{expected_quant_shape}"
+            )
+        if quantized_output.dtype != dtypes.fp8:
+            raise TypeError(
+                f"quantized_output must use OCP FP8 ({dtypes.fp8}), "
+                f"got {quantized_output.dtype}"
+            )
+        expected_scale_shape = (total_q_rows + quantized_pad_rows, 1)
+        if output_scale.shape != expected_scale_shape:
+            raise ValueError(
+                f"output_scale shape {tuple(output_scale.shape)} must be "
+                f"{expected_scale_shape}"
+            )
+        if output_scale.dtype != torch.float32:
+            raise TypeError(f"output_scale must be float32, got {output_scale.dtype}")
+        if quantized_output.stride() != output.stride():
+            raise ValueError(
+                "quantized_output strides must match output, "
+                f"got {quantized_output.stride()} vs {output.stride()}"
+            )
+        if not (
+            query.is_contiguous()
+            and output.is_contiguous()
+            and quantized_output.is_contiguous()
+        ):
+            raise ValueError(
+                "quantized PA output requires contiguous query/output tensors"
+            )
+        if not output_scale.is_contiguous():
+            raise ValueError("output_scale must be contiguous")
 
     if key_cache.dtype != expected_kv_dtype:
         raise TypeError(
@@ -520,6 +730,16 @@ def pa_decode(
                 f"{name} must be on the same device as query ({dev}), "
                 f"got {tensor.device}"
             )
+    if quant_output:
+        for name, tensor in (
+            ("quantized_output", quantized_output),
+            ("output_scale", output_scale),
+        ):
+            if tensor.device != dev:
+                raise ValueError(
+                    f"{name} must be on the same device as query ({dev}), "
+                    f"got {tensor.device}"
+                )
     for name, tensor in (
         ("key_cache", key_cache),
         ("value_cache", value_cache),
@@ -693,6 +913,19 @@ def pa_decode(
         )
         else 0
     )
+    # The quant epilogue exists only in the one-partition direct output and the
+    # cluster-of-8 merge. Any other output mode the plan picks (it depends on the
+    # batch and context) writes the BF16 output as usual and quantizes it after
+    # with the standalone per-token kernel, which is exactly the unfused path.
+    quant_after_output = quant_output and not (
+        one_partition_output or cluster_merge == 8
+    )
+    padded_quantized = (quantized_output, output_scale)
+    if quant_after_output:
+        quant_output = False
+        if not store_output:
+            # Keep the caller's BF16 buffer untouched, as the fused path does.
+            output = torch.empty_like(output)
 
     # Bound byte offsets as well as element indices for 16-bit BF16 caches.
     cache_extent = max(
@@ -727,6 +960,11 @@ def pa_decode(
             trans_k=trans_k,
             mask_unowned_kv=mask_unowned_kv,
             cluster_merge=cluster_merge,
+            **(
+                {"quant_output": True, "store_output": store_output}
+                if quant_output
+                else {}
+            ),
         )
 
     total_rows = query_length * query_group_size
@@ -782,6 +1020,40 @@ def pa_decode(
             )
         if not tensor.is_contiguous():
             raise ValueError(f"{name} must be contiguous")
+    if (
+        launch_key is not None
+        and arch == "gfx1250"
+        and (direct_output or cluster_merge)
+        and not quant_after_output
+        and exp_sums is not None
+        and max_logits is not None
+        and temporary_output is not None
+        and (is_bf16_kv or all(t is not None for t in scale_tensors))
+        and dev.index == torch.cuda.current_device()
+    ):
+        if len(_VALIDATED_LAUNCHES) >= _VALIDATED_LAUNCHES_MAX:
+            _VALIDATED_LAUNCHES.clear()
+        _VALIDATED_LAUNCHES[launch_key] = _validated_launch(
+            compiled["launch"],
+            one_partition_output=one_partition_output,
+            merged=direct_output and not one_partition_output,
+            quant_output=quant_output,
+            is_bf16_kv=is_bf16_kv,
+            ints=(
+                int(max_blocks_per_seq),
+                int(num_seqs),
+                int(num_kv_heads),
+                stride_ks_block,
+                stride_ks_head,
+                int(query.stride(0)),
+                int(query.stride(1)),
+            ),
+            quant_rows=(
+                int(total_q_rows + quantized_pad_rows)
+                if quant_output
+                else int(num_seqs)
+            ),
+        )
     merge_args = ()
     if arch == "gfx1250":
         merged = direct_output and not one_partition_output
@@ -793,6 +1065,18 @@ def pa_decode(
                 if merged
                 else flyc.from_c_void_p(fx.Int32, 0)
             ),
+            (
+                ptr_arg(quantized_output, _flydsl_pointer_dtype(quantized_output.dtype))
+                if quant_output
+                else flyc.from_c_void_p(fx.Float8E4M3FN, 0)
+            ),
+            (
+                ptr_arg(output_scale, fx.Float32)
+                if quant_output
+                else flyc.from_c_void_p(fx.Float32, 0)
+            ),
+            # Rows of the FP8 output, padded ones included.
+            int(total_q_rows + quantized_pad_rows) if quant_output else int(num_seqs),
         )
     with torch.cuda.device(dev):
         s = torch.cuda.current_stream(dev)
@@ -834,30 +1118,111 @@ def pa_decode(
             *merge_args,
             s,
         )
-        if direct_output or cluster_merge:
-            return
-        output_5d = output.reshape(
-            num_seqs, query_length, num_kv_heads, query_group_size, head_dim
+        if not (direct_output or cluster_merge):
+            output_5d = output.reshape(
+                num_seqs, query_length, num_kv_heads, query_group_size, head_dim
+            )
+            launch_pa_decode_ps_reduce(
+                output_5d,
+                psum,
+                pmax,
+                pout,
+                sinks,
+                output_5d.stride(0),
+                output_5d.stride(1),
+                output_5d.stride(2),
+                output_5d.stride(3),
+                pmax.stride(0),
+                pmax.stride(1),
+                pout.stride(0),
+                pout.stride(1),
+                pout.stride(2),
+                query_seq_len=query_length,
+                query_group_size=query_group_size,
+                head_size=head_dim,
+                max_partitions=max_partitions,
+                stream=s,
+                reduce_info=work_plan.reduce_info,
+            )
+        if quant_after_output:
+            from ..quant import dynamic_per_token_scaled_quant
+
+            rows = output.shape[0]
+            quantized_output, output_scale = padded_quantized
+            dynamic_per_token_scaled_quant(
+                quantized_output[:rows].view(rows, -1),
+                output.view(rows, -1),
+                output_scale[:rows],
+            )
+            if quantized_pad_rows:
+                quantized_output[rows:].zero_()
+                output_scale[rows:].fill_(1.0)
+
+
+def _validated_launch(
+    launch_fn,
+    *,
+    one_partition_output,
+    merged,
+    quant_output,
+    is_bf16_kv,
+    ints,
+    quant_rows,
+):
+    """The gfx1250 tile launch of a checked call (``pa_decode`` builds the same
+    arguments in the same order), taking only the operands' addresses."""
+    null_i32 = flyc.from_c_void_p(fx.Int32, 0)
+    null_f32 = flyc.from_c_void_p(fx.Float32, 0)
+    null_fp8 = flyc.from_c_void_p(fx.Float8E4M3FN, 0)
+
+    def launch(
+        output,
+        query,
+        key_cache,
+        value_cache,
+        block_tables,
+        key_scale,
+        value_scale,
+        pmax,
+        psum,
+        pout,
+        work_plan,
+        quantized_output,
+        output_scale,
+    ):
+        out_dtype = _flydsl_pointer_dtype(output.dtype)
+        _run_compiled(
+            launch_fn,
+            (
+                ptr_arg(work_plan.reduce_info, fx.Float32)
+                if one_partition_output
+                else ptr_arg(pmax, fx.Float32)
+            ),
+            ptr_arg(psum, fx.Float32),
+            ptr_arg(
+                output if one_partition_output else pout,
+                _flydsl_pointer_dtype(pout.dtype),
+            ),
+            ptr_arg(query, _flydsl_pointer_dtype(query.dtype)),
+            ptr_arg(key_cache, _flydsl_pointer_dtype(key_cache.dtype)),
+            ptr_arg(value_cache, _flydsl_pointer_dtype(value_cache.dtype)),
+            ptr_arg(block_tables, fx.Int32),
+            null_f32 if is_bf16_kv else ptr_arg(key_scale, fx.Float32),
+            null_f32 if is_bf16_kv else ptr_arg(value_scale, fx.Float32),
+            *ints,
+            ptr_arg(work_plan.work_info, fx.Int32),
+            work_plan.capacity,
+            ptr_arg(output, out_dtype),
+            ptr_arg(work_plan.reduce_info, fx.Int32),
+            ptr_arg(work_plan.arrival_counters, fx.Int32) if merged else null_i32,
+            (
+                ptr_arg(quantized_output, _flydsl_pointer_dtype(quantized_output.dtype))
+                if quant_output
+                else null_fp8
+            ),
+            ptr_arg(output_scale, fx.Float32) if quant_output else null_f32,
+            quant_rows,
+            torch.cuda.current_stream(),
         )
-        launch_pa_decode_ps_reduce(
-            output_5d,
-            psum,
-            pmax,
-            pout,
-            sinks,
-            output_5d.stride(0),
-            output_5d.stride(1),
-            output_5d.stride(2),
-            output_5d.stride(3),
-            pmax.stride(0),
-            pmax.stride(1),
-            pout.stride(0),
-            pout.stride(1),
-            pout.stride(2),
-            query_seq_len=query_length,
-            query_group_size=query_group_size,
-            head_size=head_dim,
-            max_partitions=max_partitions,
-            stream=s,
-            reduce_info=work_plan.reduce_info,
-        )
+
+    return launch
