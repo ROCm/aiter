@@ -8,6 +8,7 @@ import flydsl.expr as fx
 import mori.shmem as ms
 import torch
 
+from aiter import logger
 from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.utility import dtypes
 
@@ -223,6 +224,15 @@ class MegaMoEV2:
                 )
                 for m in self._bundle_plan.small_m_mtprs
             ]
+        if self.rank == 0:
+            plan = self._bundle_plan
+            logger.info(
+                "MegaMoEV2 mtpr=%d experts=%d topk=%d: staged route (%s)%s%s",
+                self.mtpr, self.experts, self.topk,
+                "fixed-slot" if self._s1_fixed_slot else "compact",
+                f", small-input capacities {plan.small_m_mtprs}" if plan.small_m_mtprs else "",
+                ", large-input route" if plan.large_m else "",
+            )
         if envs.AITER_MEGA_MOE_PRELOAD:
             self.preload_aot_bundles()
 
