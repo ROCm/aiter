@@ -229,8 +229,10 @@ def test_mhc_seam(T, H, mode):
 
     args, kw, ref = _call_kwargs(mode, T, H)
     ops = _seam_ops(T, H)
-    # The ASM seam always applies the post block.
-    if mode != "no_post" and mhc_fused_post_pre_delayed_asm_supported(H, 4):
+    # Timed only. The ASM seam always applies the post block and, unlike Mega-mHC and
+    # the Triton seam, computes the gates from the bf16-truncated residual_out, so it
+    # misses the shared reference; test_mhc_seam.py checks its outputs.
+    if T and mode != "no_post" and mhc_fused_post_pre_delayed_asm_supported(H, 4):
         ops["asm_seam"] = _asm_seam
     ret = {"gfx": get_gfx()}
     for name, op in ops.items():
@@ -248,14 +250,15 @@ def test_mhc_seam(T, H, mode):
         ret[f"{name} graph us"] = _graph_us(op, args, kw, T)
         out, us = run_perftest(_with_fn(op, args[1]), args[0], *args[2:], **kw)
         ret[f"{name} kernel us"] = us
-        ret[f"{name} err"] = check_outputs(name, out, ref, "bf16", mode)
+        if name != "asm_seam":
+            ret[f"{name} err"] = check_outputs(name, out, ref, "bf16", mode)
     if T:
         ret["flydsl graph err"] = _graph_err(
             lambda: flydsl_mhc_seam(*args, **kw), ref, mode
         )
     if "triton_seam graph us" in ret and T:
         ret["graph speedup"] = ret["triton_seam graph us"] / ret["flydsl graph us"]
-    if "asm_seam" in ops and T:
+    if "asm_seam" in ops:
         ret["vs asm"] = ret["asm_seam graph us"] / ret["flydsl graph us"]
     return ret
 
