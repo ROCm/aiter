@@ -67,8 +67,11 @@ ROUTE_LARGE_M = "large_m"
 # Single-kernel small-input runtimes: power-of-two capacities up to this bound.
 SMALL_M_MAX_MTPR = 512
 DEFAULT_SMALL_M_MTPRS = (256, 512)
-# Instance capacities the large-input persistent kernel is built for.
-LARGE_M_MTPRS = (8192,)
+# Instance capacities the large-input persistent kernel is built for. At 32768
+# the staged path stays: it is faster there (large-input E2E +11.7% at 32768
+# uniform tokens) and its source-indexed payload needs 1.75 GiB per GPU where
+# the large-input route-major payload needs 10.5 GiB.
+LARGE_M_MTPRS = (1024, 2048, 4096, 8192, 16384)
 # Below this many rows per rank the staged (or small-input) path is faster than
 # the large-input kernel, whose geometry is fixed by its capacity.
 LARGE_M_MIN_TOKENS = SMALL_M_MAX_MTPR + 1

@@ -32,7 +32,11 @@ from ..mxfp4_gemm_common import (
 from ..tensor_shim import _fx_value_elem, buf_copy_load, buf_copy_store, ptr_buf_tensor
 from .gemm2 import mma_one_j, scale_mma_atoms, scale_view
 from .gemm_util import _PACK, wait_lds_barrier
-from .mega_moe_config import REFERENCE_EXPERTS_PER_RANK, _fixed_dispatch_cu
+from .mega_moe_config import (
+    LARGE_M_MTPRS,
+    REFERENCE_EXPERTS_PER_RANK,
+    _fixed_dispatch_cu,
+)
 
 TOKEN_BUCKETS = (
     1,
@@ -53,8 +57,6 @@ TOKEN_BUCKETS = (
 )
 # The small-input single kernel keeps fixed slots up to this MTPR (past it the main path is faster).
 SMALL_M_FIXED_SLOT_MAX_MTPR = 512
-# The large-input path runs on an instance of this MTPR only.
-LARGE_M_MTPR = 8192
 
 
 @dataclass(frozen=True, slots=True)
@@ -183,7 +185,7 @@ def _large_config(model_dim: int, inter_dim: int) -> MegaMoEConfig:
 def _select_config(
     bucket: int, mtpr: int, model_dim: int, inter_dim: int
 ) -> MegaMoEConfig:
-    if mtpr == LARGE_M_MTPR:
+    if mtpr in LARGE_M_MTPRS:
         return _large_config(model_dim, inter_dim)
     stage1 = _select_fixed_stage1(bucket)
     stage2 = _select_fixed_stage2(bucket, model_dim)
@@ -198,10 +200,10 @@ def select_mega_moe_config(
     model_dim: int = 7168,
     inter_dim: int = 3072,
 ) -> MegaMoEConfig:
-    """Small-input (fixed-slot, MTPR <= 512) or large-input (MTPR 8192) config for ``tokens`` per rank."""
+    """Small-input (fixed-slot, MTPR <= 512) or large-input (MTPR in LARGE_M_MTPRS) config for ``tokens`` per rank."""
     if mtpr <= 0 or mtpr & (mtpr - 1):
         raise ValueError(f"mtpr={mtpr} must be a positive power of two")
-    if mtpr > SMALL_M_FIXED_SLOT_MAX_MTPR and mtpr != LARGE_M_MTPR:
+    if mtpr > SMALL_M_FIXED_SLOT_MAX_MTPR and mtpr not in LARGE_M_MTPRS:
         raise ValueError(f"no small- or large-input config for mtpr={mtpr}")
     if tokens > mtpr:
         raise ValueError(f"tokens={tokens} exceeds mtpr={mtpr}")
