@@ -34,7 +34,14 @@ from aiter.fused_moe_registry import (
     FusedMoeRequest,
     resolve_fused_moe_impl,
 )
-from aiter.jit.core import AITER_CONFIGS, AITER_CSRC_DIR, PY, bd_dir, mp_lock
+from aiter.jit.core import (
+    AITER_CONFIGS,
+    AITER_CSRC_DIR,
+    AITER_ROOT_DIR,
+    PY,
+    bd_dir,
+    mp_lock,
+)
 from aiter.jit.utils.chip_info import (
     get_cu_num,
     get_gfx,
@@ -85,6 +92,42 @@ def _get_flydsl_moe_kernels():
 
 
 BLOCK_SIZE_M = 32
+# CK swiglustep_and_mul clamps gate/up at this value; it is a compile-time constant in CK.
+CK_SWIGLUSTEP_LIMIT = 7.0
+# Quant types whose CK 2-stage stage1 has a clamped SiLU epilogue. They use the
+# non-blockscale gridwise_moe_gemm and have no split-K. When CK has
+# RuntimeSwigluLimit (rocm-libraries#13490) they clamp before SiLU at any finite
+# limit (silu_and_mul); otherwise only swiglustep at exactly
+# CK_SWIGLUSTEP_LIMIT, after SiLU.
+CK_SWIGLUSTEP_QUANT_TYPES = (QuantType.per_Token, QuantType.per_Tensor)
+# Shipped gfx942 tile choices for clamped per_Token / per_Tensor. Separate from
+# tuned_fmoe.csv so an unclamped call does not pick up a CK row in place of ASM.
+PLAIN_SWIGLU_LIMIT_CSV = (
+    f"{AITER_ROOT_DIR}/aiter/configs/model_configs/"
+    "a8w8_plain_tuned_swiglu_limit_fmoe_gfx942.csv"
+)
+
+
+def _finite_swiglu_limit(swiglu_limit):
+    """Return the clamp bound, or None when no clamp is requested.
+
+    Only a finite positive limit clamps. None, 0.0 and +inf mean no clamp,
+    the same as ``_swiglu_limit_is_active`` and ``runtime_swiglu_limit``:
+    vLLM's ROCm adapter sends 0.0 when the config limit is unset.
+    """
+    if swiglu_limit is None:
+        return None
+    value = float(swiglu_limit)
+    if not math.isfinite(value) or value <= 0.0:
+        return None
+    return value
+
+
+def swiglu_limit_tag(swiglu_limit):
+    """`_tag` value of tuned fmoe rows that were tuned with this swiglu_limit."""
+    bound = _finite_swiglu_limit(swiglu_limit)
+    return f"swiglu_limit={bound:g}" if bound is not None else ""
+
 
 _USE_CK_MOE_SORTING = os.environ.get("AITER_USE_CK_MOE_SORTING", "0") == "1"
 _USE_FLYDSL_MOE_SORTING = os.environ.get("AITER_USE_FLYDSL_MOE_SORTING", "0") == "1"
@@ -1205,6 +1248,7 @@ def fused_moe(
     FlyDSL AOT cache.
 
     """
+    swiglu_limit = _finite_swiglu_limit(swiglu_limit)
     has_shared_expert = (
         any(
             tensor is not None
@@ -2185,6 +2229,14 @@ def _fused_moe_impl(
     if metadata.run_1stage:
         if _stage2_override is not None:
             raise RuntimeError("_stage2_override requires a two-stage MoE config")
+        if (
+            _finite_swiglu_limit(swiglu_limit) is not None
+            and quant_type in CK_SWIGLUSTEP_QUANT_TYPES
+        ):
+            raise NotImplementedError(
+                f"1-stage MoE cannot apply swiglu_limit={swiglu_limit!r} for "
+                f"{quant_type}; the ASM 1-stage kernel has no clamp."
+            )
         _stage1_call = functools.partial(
             metadata.stage1,
             hidden_states,
@@ -2521,6 +2573,7 @@ def get_ksplit(token, topk, expert, inter_dim, model_dim):
 
 cfg_2stages = None
 cfg_2stages_by_file = {}
+cfg_2stages_by_limit_tag = {}
 
 # Itanium symbols encode the activation (`_silu_` / `_gelu_` / `_situv2_`).
 # SiLU and GELU are the same length, so swapping the tag keeps the mangled
@@ -4067,6 +4120,7 @@ def get_2stage_cfgs(
 ):
     gate_mode = GateMode(gate_mode)
     cktile_mxfp4_unsafe = q_dtype_w == dtypes.fp4x2 and inter_dim % 256 != 0
+    swiglu_limit = _finite_swiglu_limit(swiglu_limit)
     flydsl_can_take_over = _can_reroute_mxfp4_to_flydsl(
         model_dim=model_dim,
         inter_dim=inter_dim,
@@ -4145,12 +4199,15 @@ def get_2stage_cfgs(
             df.loc[bad, "gfx"] = df.loc[bad, "cu_num"].map(gfx_from_cu_num)
         return df
 
-    def get_cfg_2stages(tune_file):
+    def get_cfg_2stages(tune_file, tag=None):
         import pandas as pd
 
         df = pd.read_csv(tune_file)
         df = _ensure_gfx_column(df)
-        if "_tag" in df.columns:
+        if tag is not None:
+            tags = df["_tag"] if "_tag" in df.columns else pd.Series("", index=df.index)
+            df = df[tags.fillna("").astype(str) == tag]
+        elif "_tag" in df.columns:
             df = df[df["_tag"].fillna("") != "flydsl_fallback"]
 
         # Primary dict: keep original act_type for exact-match lookup.
@@ -4295,6 +4352,43 @@ def get_2stage_cfgs(
         return result
 
     cfg = _lookup_cfg(active_cfg_2stages)
+    limit_tag = swiglu_limit_tag(swiglu_limit)
+    limit_tune_file = os.environ.get("AITER_CONFIG_FMOE_SWIGLU_LIMIT", "")
+    # "0" / "off" keeps the untuned CK heuristic. Unset loads the shipped
+    # per_Token / per_Tensor file when it exists.
+    if limit_tune_file in ("0", "off"):
+        limit_tune_file = ""
+    elif (
+        not limit_tune_file
+        and q_type in CK_SWIGLUSTEP_QUANT_TYPES
+        and os.path.isfile(PLAIN_SWIGLU_LIMIT_CSV)
+    ):
+        limit_tune_file = PLAIN_SWIGLU_LIMIT_CSV
+    if (
+        limit_tag
+        and limit_tune_file
+        and config_file is None
+        and q_type in CK_SWIGLUSTEP_QUANT_TYPES
+        and activation == ActivationType.Silu
+    ):
+        # Rows tuned by gemm_moe_tune.py --swiglu_limit, tagged with the limit.
+        limit_tags = [limit_tag]
+        if (
+            swiglu_limit != CK_SWIGLUSTEP_LIMIT
+            and aiter.ck_moe_has_runtime_swiglu_limit()
+        ):
+            # The runtime-limit kernel takes the bound as an argument, so a tile
+            # tuned at 7.0 is valid at any limit.
+            limit_tags.append(swiglu_limit_tag(CK_SWIGLUSTEP_LIMIT))
+        for tag in limit_tags:
+            limit_cfgs = cfg_2stages_by_limit_tag.get((limit_tune_file, tag))
+            if limit_cfgs is None:
+                limit_cfgs = get_cfg_2stages(limit_tune_file, tag=tag)
+                cfg_2stages_by_limit_tag[(limit_tune_file, tag)] = limit_cfgs
+            limit_cfg = _lookup_cfg(limit_cfgs)
+            if limit_cfg is not None:
+                cfg = limit_cfg
+                break
     if (
         cfg is None
         and config_file is None
@@ -4425,7 +4519,7 @@ def get_2stage_cfgs(
             reject_reason = (
                 f"activation {configured_act!r} does not match runtime {expected_act!r}"
             )
-        elif swiglu_limit and expected_act not in ("silu", "swiglu"):
+        elif swiglu_limit is not None and expected_act not in ("silu", "swiglu"):
             reject_reason = (
                 f"MXMOE cannot apply swiglu_limit={swiglu_limit!r} to "
                 f"activation {expected_act!r}"
@@ -4516,6 +4610,48 @@ def get_2stage_cfgs(
                     f"[fused_moe] Opus stage2 config unsupported ({opus_reason}); "
                     "using default heuristics"
                 )
+
+    # per_Token / per_Tensor SiLU clamps only on CK 2-stage. ASM 1-stage and the
+    # gfx942 FlyDSL whole-graph SiLU epilogue ignore the limit.
+    clamp_plain = (
+        swiglu_limit is not None
+        and q_type in CK_SWIGLUSTEP_QUANT_TYPES
+        and activation == ActivationType.Silu
+    )
+    if clamp_plain:
+        if (
+            not aiter.ck_moe_has_runtime_swiglu_limit()
+            and swiglu_limit != CK_SWIGLUSTEP_LIMIT
+        ):
+            raise NotImplementedError(
+                f"fused_moe cannot apply swiglu_limit={swiglu_limit!r} for {q_type} "
+                "SiLU: the CK headers have no RuntimeSwigluLimit "
+                "(rocm-libraries#13490), so the only clamped kernel is CK "
+                f"swiglustep_and_mul, whose limit is fixed at {CK_SWIGLUSTEP_LIMIT}."
+            )
+        if q_dtype_w != dtypes.fp8 or q_dtype_a != dtypes.fp8:
+            raise NotImplementedError(
+                f"fused_moe cannot apply swiglu_limit={swiglu_limit!r} for {q_type} "
+                f"SiLU with weight dtype {q_dtype_w} / activation dtype {q_dtype_a}; "
+                "clamped CK instances are only wired for fp8."
+            )
+        if inter_dim % 128 != 0:
+            raise NotImplementedError(
+                f"fused_moe cannot apply swiglu_limit={swiglu_limit!r} for {q_type} "
+                f"SiLU at inter_dim={inter_dim}; it is not a multiple of 128, which "
+                "routes to the unclamped ASM 1-stage kernel."
+            )
+        if cfg is not None and (
+            cfg.get("run_1stage", False)
+            or "ck2stages" not in str(cfg.get("kernelName1", ""))
+        ):
+            logger.warning(
+                f"[fused_moe] discarding tuned config {cfg.get('kernelName1')!r} "
+                f"for {keys}: it cannot apply swiglu_limit={swiglu_limit!r}; "
+                "using default heuristics"
+            )
+            cfg = None
+            kn1 = ""
 
     bypass_tuned_config = int(os.environ.get("AITER_BYPASS_TUNE_CONFIG", "0"))
     kernel_name1 = kn1 if cfg is not None else ""
@@ -4632,6 +4768,12 @@ def get_2stage_cfgs(
                 run_1stage = token > 16 or inter_dim % 128 != 0
             elif q_type != QuantType.per_1x32:
                 run_1stage = token < 256
+            run_1stage = run_1stage and not clamp_plain
+        # Measurement only. Unset, this changes nothing. Set, the untuned
+        # heuristic stays on CK 2-stage so a run can price CK against ASM
+        # 1-stage without a swiglu_limit (the clamp forces CK on its own).
+        if os.environ.get("AITER_MOE_FORCE_CK2STAGE") == "1":
+            run_1stage = False
 
         block_m = (
             BLOCK_SIZE_M
@@ -5475,6 +5617,7 @@ def fused_moe_2stages(
             else torch.empty((token_num, model_dim), dtype=dtype, device=device)
         )
     is_shuffled = getattr(w1, "is_shuffled", False) or getattr(w2, "is_shuffled", False)
+    swiglu_limit = _finite_swiglu_limit(swiglu_limit)
     config_situ_beta, config_situ_linear_beta, normalized_swiglu_limit = (
         _normalize_mxfp4_activation_params(activation, beta, linear_beta, swiglu_limit)
     )
@@ -5687,6 +5830,11 @@ def fused_moe_2stages(
         extra_stage1_args["swiglu_limit"] = swiglu_limit
     elif stage1_func is _mxfp4_a4w4_stage1_fw:
         extra_stage1_args["swiglu_limit"] = normalized_swiglu_limit
+    elif (
+        stage1_func in (ck_moe_stage1, asm_stage1)
+        and quant_type in CK_SWIGLUSTEP_QUANT_TYPES
+    ):
+        extra_stage1_args["swiglu_limit"] = swiglu_limit
     if stage1_func is _flydsl_stage1_wrapper and metadata.skip_inter_quant:
         extra_stage1_args["v2_output_layout"] = True
     if stage1_func is _flydsl_stage1_wrapper:
@@ -5931,7 +6079,16 @@ def asm_stage1(
     a1_scale=None,
     w1_scale=None,
     sorted_weights=None,
+    swiglu_limit=None,
 ):
+    if (
+        _finite_swiglu_limit(swiglu_limit) is not None
+        and activation == ActivationType.Silu
+    ):
+        raise NotImplementedError(
+            f"ASM MoE stage1 cannot apply swiglu_limit={swiglu_limit!r}; "
+            "its SiLU epilogue does not clamp."
+        )
     dtype = dtypes.bf16  # out.dtype, asm only support bf16
     if quant_type != QuantType.per_1x128:
         out = out.view(dtype)
@@ -6372,9 +6529,39 @@ def ck_moe_stage1(
     splitk=1,
     use_non_temporal_load=False,
     dtype=None,
+    swiglu_limit=None,
 ):
     token_num = hidden_states.shape[0]
     is_splitk = quant_type == QuantType.per_1x128 and splitk > 1
+    swiglustep = False
+    runtime_limit = None
+    swiglu_limit = _finite_swiglu_limit(swiglu_limit)
+    if swiglu_limit is not None and activation == ActivationType.Silu and not is_splitk:
+        w1_dtype = getattr(w1, "dtype", None)
+        if (
+            quant_type in CK_SWIGLUSTEP_QUANT_TYPES
+            and w1_dtype == dtypes.fp8
+            and aiter.ck_moe_has_runtime_swiglu_limit()
+        ):
+            # silu_and_mul with RuntimeSwigluLimit: clamp gate/up, then SiLU.
+            runtime_limit = swiglu_limit
+            if kernelName:
+                kernelName = kernelName.replace("_silu_", "_silulimit_")
+        elif (
+            quant_type not in CK_SWIGLUSTEP_QUANT_TYPES
+            or swiglu_limit != CK_SWIGLUSTEP_LIMIT
+            or w1_dtype != dtypes.fp8
+        ):
+            raise NotImplementedError(
+                f"CK MoE stage1 cannot apply swiglu_limit={swiglu_limit!r} for "
+                f"{quant_type} with weight dtype {w1_dtype}; only fp8 per_Token / "
+                f"per_Tensor has a clamped CK epilogue (swiglustep_and_mul at "
+                f"{CK_SWIGLUSTEP_LIMIT}, or any limit with RuntimeSwigluLimit)."
+            )
+        else:
+            swiglustep = True
+            if kernelName:
+                kernelName = kernelName.replace("_silu_", "_swiglustep_")
     if is_splitk:
         # CK kernel zeros this buffer via hipMemsetAsync when KBatch > 1
         sorted_size = min(token_num * topk * block_m, sorted_token_ids.shape[0])
@@ -6402,6 +6589,8 @@ def ck_moe_stage1(
         splitk if is_splitk else 0,
         use_non_temporal_load,
         out.dtype,
+        swiglustep=swiglustep,
+        swiglu_limit=runtime_limit,
     )
     if is_splitk:
         valid_out = tmp_out[: token_num * topk, :]
