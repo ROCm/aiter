@@ -50,6 +50,63 @@ def _fp8_scale_for_leader(is_leader, local_max):
     return e8m0
 
 
+def _fp8_quant_1x32(vals, lane, group_lane=None, leader_gate=None):
+    """Quantize this lane's ``vals`` to FP8 with one E8M0 scale per 32-wide lane group.
+
+    The ``32 // len(vals)`` adjacent lanes of a group share the |max|; the group's
+    leader (``group_lane``, default ``lane``, a multiple of the group size, and
+    ``leader_gate`` if given) derives the scale and broadcasts it.  Returns the E8M0
+    scale, the packed FP8 words and the leader predicate.
+    """
+    scatter_vec = len(vals)
+    local_max = fabs_f32(vals[0])
+    for q in range_constexpr(1, scatter_vec):
+        local_max = local_max.maximumf(fabs_f32(vals[q]))
+    max_bits = local_max.bitcast(fx.Int32)
+    for xor_lane in (1, 2):
+        if xor_lane < 32 // scatter_vec:
+            remote_bits = rocdl.ds_bpermute(
+                T.i32,
+                (lane ^ fx.Int32(xor_lane)) * fx.Int32(4),
+                max_bits,
+            )
+            remote_max = fx.Int32(remote_bits).bitcast(fx.Float32)
+            local_max = local_max.maximumf(remote_max)
+            max_bits = local_max.bitcast(fx.Int32)
+    scale_group_lanes = 32 // scatter_vec
+    leader_lane = lane & fx.Int32(~(scale_group_lanes - 1))
+    if group_lane is None:
+        group_lane = lane
+    is_leader = (group_lane & fx.Int32(scale_group_lanes - 1)) == fx.Int32(0)
+    if leader_gate is not None:
+        is_leader = leader_gate & is_leader
+    leader_e8m0 = _fp8_scale_for_leader(is_leader, local_max)
+    e8m0 = fx.Int32(
+        rocdl.ds_bpermute(
+            T.i32,
+            leader_lane * fx.Int32(4),
+            leader_e8m0,
+        )
+    )
+    block_scale = (e8m0 << 23).bitcast(fx.Float32)
+    pk_ty = T.vec(2, T.i16)
+    packed_words = []
+    for word in range_constexpr(scatter_vec // 4):
+        packed_word = fx.full(2, 0, fx.Int16).ir_value()
+        for pair in range_constexpr(2):
+            value = word * 4 + pair * 2
+            packed_word = rocdl.cvt_scalef32_pk_fp8_f32(
+                pk_ty,
+                packed_word,
+                vals[value].ir_value(),
+                vals[value + 1].ir_value(),
+                block_scale.ir_value(),
+                pair,
+            )
+        packed_words.append(fx.Vector(packed_word).bitcast(fx.Int32)[0])
+    return e8m0, fx.Vector.from_elements(packed_words, fx.Int32), is_leader
+
+
 # fmt: off
 def p2p_scatter_epilog(lds_acc_base, accm, n_block_idx, wave, lane, *, N_OUT, BM, BN, npes, topk,
     log2_max_tok, mask_max_tok, recv_cap, comb_inp_nbytes, lds_packed_off, lds_weight_off,
@@ -212,55 +269,8 @@ def p2p_scatter_epilog(lds_acc_base, accm, n_block_idx, wave, lane, *, N_OUT, BM
             vals = [
                 weighted_v8[i] for i in range_constexpr(scatter_vec)
             ]
-            local_max = fabs_f32(vals[0])
-            for q in range_constexpr(1, scatter_vec):
-                local_max = local_max.maximumf(fabs_f32(vals[q]))
-            max_bits = local_max.bitcast(fx.Int32)
-            for xor_lane in (1, 2):
-                if xor_lane < 32 // scatter_vec:
-                    remote_bits = rocdl.ds_bpermute(
-                        T.i32,
-                        (lane ^ fx.Int32(xor_lane)) * fx.Int32(4),
-                        max_bits,
-                    )
-                    remote_max = fx.Int32(remote_bits).bitcast(fx.Float32)
-                    local_max = local_max.maximumf(remote_max)
-                    max_bits = local_max.bitcast(fx.Int32)
             scale_group_lanes = 32 // scatter_vec
-            leader_lane = lane & fx.Int32(~(scale_group_lanes - 1))
-            is_scale_leader = (
-                lane & fx.Int32(scale_group_lanes - 1)
-            ) == fx.Int32(0)
-            leader_e8m0 = _fp8_scale_for_leader(is_scale_leader, local_max)
-            e8m0 = fx.Int32(
-                rocdl.ds_bpermute(
-                    T.i32,
-                    leader_lane * fx.Int32(4),
-                    leader_e8m0,
-                )
-            )
-            block_scale = (e8m0 << 23).bitcast(fx.Float32)
-            pk_ty = T.vec(2, T.i16)
-            packed_words = []
-            for word in range_constexpr(scatter_vec // 4):
-                packed_word = fx.full(2, 0, fx.Int16).ir_value()
-                for pair in range_constexpr(2):
-                    value = word * 4 + pair * 2
-                    packed_word = rocdl.cvt_scalef32_pk_fp8_f32(
-                        pk_ty,
-                        packed_word,
-                        vals[value].ir_value(),
-                        vals[value + 1].ir_value(),
-                        block_scale.ir_value(),
-                        pair,
-                    )
-                packed_words.append(
-                    fx.Vector(packed_word).bitcast(fx.Int32)[0]
-                )
-            payload = fx.Vector.from_elements(
-                packed_words,
-                fx.Int32,
-            )
+            e8m0, payload, is_scale_leader = _fp8_quant_1x32(vals, lane)
             scale_leader = active & is_scale_leader
             payload_off = (valid & active).select(
                 row_off + col,
