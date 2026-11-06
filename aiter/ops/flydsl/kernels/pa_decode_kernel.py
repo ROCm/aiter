@@ -668,31 +668,25 @@ def compile_gfx1250_pa_decode(
                     rows[offset] = t.q_dtype(0.0)
 
         task_slot = fx.Int32(gpu.block_id("x"))
-        if const_expr(t.cluster_merge or t.direct_output):
-            # These grids index sequences, so a CTA's tiles follow from the
-            # context length and task count exactly as plan_pa_decode splits
-            # them. ``work`` holds the context lengths: reading them alongside
-            # reduce_info saves the dependent work-record load.
-            seq, part = task_slot, fx.Int32(0)
-            if const_expr(t.cluster_merge):
-                # Cluster s runs sequence s's tasks on its leading CTAs.
-                seq, part = task_slot // t.cluster_merge, task_slot % t.cluster_merge
-            # Issue both loads before either is used: scalar loads return out
-            # of order, so a use waits for every load issued before it.
+        if const_expr(t.cluster_merge):
+            # Cluster s runs sequence s's tasks on its leading CTAs. Their
+            # tiles follow from the context length and task count exactly as
+            # plan_pa_decode splits them: ``work`` holds the context lengths,
+            # read alongside reduce_info instead of after it.
+            seq, part = task_slot // t.cluster_merge, task_slot % t.cluster_merge
+            # Scalar loads return out of order, so a use waits for every load
+            # issued before it: issue both before either is used.
             task_context = fx.Int32(fx.recast_iter(fx.Int32, work)[seq])
-            if const_expr(t.cluster_merge):
-                seq_tasks = fx.ptr_load(
-                    fx.add_offset(fx.recast_iter(fx.Int32, reduce_info), seq * 2),
-                    result_type=fx.Vector.make_type(2, fx.Int32),
-                )
-            if const_expr(t.cluster_merge):
-                # Keep both loads issued ahead of the first use.
-                fx.rocdl.sched_barrier(0)
-                # A sequence with more tasks than the cluster has CTAs splits
-                # its tiles over the cluster, in its first task slots.
-                first = fx.Int32(seq_tasks[0])
-                count = fx.min(fx.Int32(seq_tasks[1]), fx.Int32(t.cluster_merge))
-                task_slot = (part < count).select(first + part, fx.Int32(0))
+            seq_tasks = fx.ptr_load(
+                fx.add_offset(fx.recast_iter(fx.Int32, reduce_info), seq * 2),
+                result_type=fx.Vector.make_type(2, fx.Int32),
+            )
+            fx.rocdl.sched_barrier(0)
+            # A sequence with more tasks than the cluster has CTAs splits its
+            # tiles over the cluster, in its first task slots.
+            first = fx.Int32(seq_tasks[0])
+            count = fx.min(fx.Int32(seq_tasks[1]), fx.Int32(t.cluster_merge))
+            task_slot = (part < count).select(first + part, fx.Int32(0))
             # Tiles of an int32 length, times at most 16 parts, fit Int32.
             length = fx.max(task_context, fx.Int32(0))
             first_tile = fx.Int32(0)
@@ -704,17 +698,21 @@ def compile_gfx1250_pa_decode(
                 + fx.Int32(length % KV_COMPUTE_BLOCK != 0)
                 - first_tile
             )
+            parts = fx.max(count, fx.Int32(1))
             task_seq = seq
-            if const_expr(t.direct_output):
-                # One-partition plans give every nonempty sequence one task.
-                count = fx.Int32(tiles > 0)
-                task_begin, task_end = first_tile, first_tile + tiles
-            else:
-                parts = fx.max(count, fx.Int32(1))
-                task_begin = first_tile + part * tiles // parts
-                task_end = first_tile + (part + 1) * tiles // parts
+            task_begin = first_tile + part * tiles // parts
+            task_end = first_tile + (part + 1) * tiles // parts
             active = part < count
         else:
+            if const_expr(t.direct_output):
+                # One task per nonempty sequence; reduce_info supplies its slot.
+                info = fx.recast_iter(fx.Int32, pmax)
+                count = fx.Int32(info[task_slot * 2 + 1])
+                # A trailing empty sequence's start can equal capacity. Its dummy
+                # task read must stay in bounds even though no compute consumes it.
+                task_slot = (count > 0).select(
+                    fx.Int32(info[task_slot * 2]), fx.Int32(0)
+                )
             task = fx.ptr_load(
                 fx.add_offset(fx.recast_iter(fx.Int32, work), task_slot * 4),
                 result_type=fx.Vector.make_type(4, fx.Int32),
@@ -722,6 +720,8 @@ def compile_gfx1250_pa_decode(
             task_seq, task_begin = fx.Int32(task[0]), fx.Int32(task[1])
             task_end, task_context = fx.Int32(task[2]), fx.Int32(task[3])
             active = task_begin < task_end
+            if const_expr(t.direct_output):
+                active = count > 0
         if active:
             ctx = PaDecodeContext(
                 t,

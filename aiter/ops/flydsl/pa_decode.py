@@ -1129,12 +1129,10 @@ def pa_decode(
             stride_ks_head,
             int(query.stride(0)),
             int(query.stride(1)),
-            # Sequence-indexed grids derive their tiles from the lengths.
+            # Cluster grids derive their tiles from the context lengths.
             ptr_arg(
                 (
-                    context_lengths
-                    if one_partition_output or cluster_merge
-                    else work_plan.work_info
+                    context_lengths if cluster_merge else work_plan.work_info
                 ),
                 fx.Int32,
             ),
