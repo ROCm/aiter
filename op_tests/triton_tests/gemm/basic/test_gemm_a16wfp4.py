@@ -1,3 +1,5 @@
+import os
+
 import pytest
 import torch
 
@@ -7,6 +9,7 @@ from aiter.ops.triton.gemm.basic.gemm_a16wfp4 import (
     gemm_a16wfp4_preshuffle,
 )
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.config_utils import resolve_config_dir
 from aiter.ops.triton.utils.shuffle import shuffle_scale_gemm
 
 # Note this is specified by the HW and cannot be changed.
@@ -154,8 +157,19 @@ def test_gemm_a16wfp4(
     shuffle: bool,
     skip_reduce: bool,
 ):
-    if not (arch_info.is_fp4_avail()):
+    if not arch_info.is_any_fp4_avail():
         pytest.skip("MXFP4 not supported on this architecture")
+
+    # Software-emulated FP4 archs run this family only where it has a config.
+    if arch_info.is_sw_emulated_fp4_avail() and not os.path.exists(
+        os.path.join(resolve_config_dir("gemm", "GEMM-A16WFP4"), "DEFAULT.json")
+    ):
+        pytest.skip(f"No GEMM-A16WFP4 config for {arch_info.get_arch()}.")
+
+    # Mirrors the arch gate in gemm_a16wfp4_preshuffle(): archs with software-emulated
+    # FP4 run only the unshuffled path.
+    if arch_info.is_sw_emulated_fp4_avail() and shuffle:
+        pytest.skip(f"Only the unshuffled path is supported on {arch_info.get_arch()}.")
 
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
 
@@ -210,4 +224,10 @@ def test_gemm_a16wfp4(
 
     torch_out = run_torch(x, w, w_scales, dtype).to(dtype)
 
-    torch.testing.assert_close(torch_out, y)
+    if arch_info.is_sw_emulated_fp4_avail():
+        # Same tolerance as test_gemm_afp4wfp4.py on these archs: the emulated
+        # dot_scaled result can differ from the reference by one ULP of the
+        # output dtype after rounding.
+        torch.testing.assert_close(torch_out, y, atol=1e-2, rtol=torch.finfo(dtype).eps)
+    else:
+        torch.testing.assert_close(torch_out, y)
