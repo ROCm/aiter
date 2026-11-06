@@ -593,74 +593,73 @@ def _body(
     rocdl.s_waitcnt(vmcnt=0)
     rocdl.sched_barrier(0)
     next_cached = cached
-    if fx.const_expr(GFX950):
-        # The gfx950 loop after this one takes the tiles; this one then runs none, and
-        # MLIR removes it.
-        tiles950, tiles = tiles, fx.Int32(0)
-    for t in range(fx.Int32(0), tiles, fx.Int32(1)):
-        vrow0 = fx.Int32(
-            rocdl.ds_bpermute(fx.Int32.ir_type, (lane >> 4) * 16, fx.Int32(offset0))
-        )
-        vrow1 = fx.Int32(
-            rocdl.ds_bpermute(fx.Int32.ir_type, (lane >> 4) * 16, fx.Int32(offset1))
-        )
-        rocdl.s_waitcnt(lgkmcnt=0)
-        rocdl.sched_barrier(0)
-        values0 = _value_load(vr, vrow0, t, 0, 0, lane, visible, HK, TOPK)
-        values1 = _value_load(vr, vrow0, t, 0, 1, lane, visible, HK, TOPK)
-        if ((t + 1) & 7) == 0:
-            chunk = _min((t + 1) >> 3, fx.Int32(TOPK // 64 - 1)) * 64
-            next_cached = fx.Int32(blocks[row * TOPK + chunk + lane])
-        rocdl.sched_barrier(0)
-        # The next index-cache load is younger than V0. vmcnt(8) is
-        # conservative on those boundary iterations and still releases K.
-        rocdl.s_waitcnt(vmcnt=8)
-        rocdl.sched_barrier(0)
-        scores0, scores1 = _qk(q, kval0, kval1)
-        updated, probabilities, total, o0, o1 = _softmax(
-            scores0, scores1, count, t, lane, scale, maximum, total, o0, o1
-        )
-        rocdl.s_waitcnt(lgkmcnt=0)
-        rocdl.sched_barrier(0)
-        rocdl.s_waitcnt(vmcnt=0)
-        rocdl.sched_barrier(0)
-        if ((t + 1) & 7) == 0:
-            cached = next_cached
-        following0 = _min((t + 1) * 32, (((count + 15) >> 4) - 1) * 16)
-        following1 = _min((t + 1) * 32 + 16, (((count + 15) >> 4) - 1) * 16)
-        offset0 = _key_offset(
-            cached, following0 + (lane & 15), visible, extent, HK, TOPK
-        )
-        offset1 = _key_offset(
-            cached, following1 + (lane & 15), visible, extent, HK, TOPK
-        )
-        p0 = _pack_bf16(
-            fx.Vector.from_elements([probabilities[i] for i in range(4)], fx.Float32)
-        ).bitcast(fx.Int16)
-        p1 = _pack_bf16(
-            fx.Vector.from_elements(
-                [probabilities[4 + i] for i in range(4)], fx.Float32
+    if fx.const_expr(not GFX950):
+        for t in range(fx.Int32(0), tiles, fx.Int32(1)):
+            vrow0 = fx.Int32(
+                rocdl.ds_bpermute(fx.Int32.ir_type, (lane >> 4) * 16, fx.Int32(offset0))
             )
-        ).bitcast(fx.Int16)
-        next_values0 = _value_load(vr, vrow1, t, 1, 0, lane, visible, HK, TOPK)
-        next_values1 = _value_load(vr, vrow1, t, 1, 1, lane, visible, HK, TOPK)
-        rocdl.sched_barrier(0)
-        o0 = _pv(p0, values0, o0)
-        rocdl.sched_barrier(0)
-        kval0 = _key_load(kr, offset0, lane, HK)
-        rocdl.sched_barrier(0)
-        o1 = _pv(p0, values1, o1)
-        rocdl.sched_barrier(0)
-        kval1 = _key_load(kr, offset1, lane, HK)
-        rocdl.sched_barrier(0)
-        rocdl.s_waitcnt(vmcnt=16)
-        rocdl.sched_barrier(0)
-        o0 = _pv(p1, next_values0, o0)
-        o1 = _pv(p1, next_values1, o1)
-        maximum = updated
-    if fx.const_expr(GFX950):
+            vrow1 = fx.Int32(
+                rocdl.ds_bpermute(fx.Int32.ir_type, (lane >> 4) * 16, fx.Int32(offset1))
+            )
+            rocdl.s_waitcnt(lgkmcnt=0)
+            rocdl.sched_barrier(0)
+            values0 = _value_load(vr, vrow0, t, 0, 0, lane, visible, HK, TOPK)
+            values1 = _value_load(vr, vrow0, t, 0, 1, lane, visible, HK, TOPK)
+            if ((t + 1) & 7) == 0:
+                chunk = _min((t + 1) >> 3, fx.Int32(TOPK // 64 - 1)) * 64
+                next_cached = fx.Int32(blocks[row * TOPK + chunk + lane])
+            rocdl.sched_barrier(0)
+            # The next index-cache load is younger than V0. vmcnt(8) is
+            # conservative on those boundary iterations and still releases K.
+            rocdl.s_waitcnt(vmcnt=8)
+            rocdl.sched_barrier(0)
+            scores0, scores1 = _qk(q, kval0, kval1)
+            updated, probabilities, total, o0, o1 = _softmax(
+                scores0, scores1, count, t, lane, scale, maximum, total, o0, o1
+            )
+            rocdl.s_waitcnt(lgkmcnt=0)
+            rocdl.sched_barrier(0)
+            rocdl.s_waitcnt(vmcnt=0)
+            rocdl.sched_barrier(0)
+            if ((t + 1) & 7) == 0:
+                cached = next_cached
+            following0 = _min((t + 1) * 32, (((count + 15) >> 4) - 1) * 16)
+            following1 = _min((t + 1) * 32 + 16, (((count + 15) >> 4) - 1) * 16)
+            offset0 = _key_offset(
+                cached, following0 + (lane & 15), visible, extent, HK, TOPK
+            )
+            offset1 = _key_offset(
+                cached, following1 + (lane & 15), visible, extent, HK, TOPK
+            )
+            p0 = _pack_bf16(
+                fx.Vector.from_elements(
+                    [probabilities[i] for i in range(4)], fx.Float32
+                )
+            ).bitcast(fx.Int16)
+            p1 = _pack_bf16(
+                fx.Vector.from_elements(
+                    [probabilities[4 + i] for i in range(4)], fx.Float32
+                )
+            ).bitcast(fx.Int16)
+            next_values0 = _value_load(vr, vrow1, t, 1, 0, lane, visible, HK, TOPK)
+            next_values1 = _value_load(vr, vrow1, t, 1, 1, lane, visible, HK, TOPK)
+            rocdl.sched_barrier(0)
+            o0 = _pv(p0, values0, o0)
+            rocdl.sched_barrier(0)
+            kval0 = _key_load(kr, offset0, lane, HK)
+            rocdl.sched_barrier(0)
+            o1 = _pv(p0, values1, o1)
+            rocdl.sched_barrier(0)
+            kval1 = _key_load(kr, offset1, lane, HK)
+            rocdl.sched_barrier(0)
+            rocdl.s_waitcnt(vmcnt=16)
+            rocdl.sched_barrier(0)
+            o0 = _pv(p1, next_values0, o0)
+            o1 = _pv(p1, next_values1, o1)
+            maximum = updated
+    else:
         _store_q950(storage, q, lane, 0)
-        for t in range(fx.Int32(0), tiles950, fx.Int32(1)):
+        for t in range(fx.Int32(0), tiles, fx.Int32(1)):
             vrows = [
                 fx.gpu.shuffle_idx(fx.Int32(offset), (lane >> 4) << 2, 64)
                 for offset in (offset0, offset1)
