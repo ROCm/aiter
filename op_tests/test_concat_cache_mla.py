@@ -7,6 +7,7 @@ import torch
 
 import aiter
 from aiter import dtypes
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.test_common import benchmark, checkAllclose, perftest, run_perftest
 
 # torch.set_printoptions(threshold=torch.inf)
@@ -379,6 +380,10 @@ def check_fused_rope_fp8_saturates(
         kv_cache.view(expect_k.shape).float(), expect_k.to(dtypes.fp8).float()
     )
 
+
+# Arches with a packed fp8 convert in fp32_to_fp8_scaled_x2 (aiter_opus_plus.h);
+# elsewhere (RDNA3/3.5) it is a compile-only stub that returns zeros.
+FP8_CVT_GFX = ("gfx942", "gfx950", "gfx1200", "gfx1201", "gfx1250")
 
 # (kv_lora_rank, tokens, heads, kv_heads, dtype) -> the kernel the host dispatch
 # in fused_qk_rope_concat_and_cache_mla picks for it.
@@ -895,20 +900,27 @@ def main():
         aiter.logger.info("concat_and_cache_mla summary (markdown):\n%s", df_md)
 
     if "fused_qk" in args.case:
-        for case, (
-            rank,
-            tokens,
-            heads,
-            kv_heads,
-            dtype,
-        ) in FUSED_ROPE_FP8_SATURATE_CASES.items():
-            for is_neox in (True, False):
-                try:
-                    check_fused_rope_fp8_saturates(
-                        args.device, rank, is_neox, tokens, heads, kv_heads, dtype
-                    )
-                except AssertionError as e:
-                    raise AssertionError(f"{case}, {is_neox=}: {e}") from e
+        # The check writes fp8 to both q_out and the KV cache, so it needs both
+        # dtype filters to include fp8 and an arch that converts to fp8.
+        if (
+            "fp8" in args.kv_dtype
+            and "fp8" in args.q_dtype
+            and get_gfx() in FP8_CVT_GFX
+        ):
+            for case, (
+                rank,
+                tokens,
+                heads,
+                kv_heads,
+                dtype,
+            ) in FUSED_ROPE_FP8_SATURATE_CASES.items():
+                for is_neox in (True, False):
+                    try:
+                        check_fused_rope_fp8_saturates(
+                            args.device, rank, is_neox, tokens, heads, kv_heads, dtype
+                        )
+                    except AssertionError as e:
+                        raise AssertionError(f"{case}, {is_neox=}: {e}") from e
         df = []
         for num_token in args.token:
             num_blocks = num_token // args.block_size
