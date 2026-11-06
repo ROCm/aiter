@@ -110,12 +110,17 @@ def issue_a_load_lds_dt(
     KH_TILE_A,
     K_BYTES,
     BM=32,
+    valid_rows=None,
+    NW=4,
 ):
-    """Load one A tile through a tile-local descriptor so allocations may span the 4 GiB buffer ABI."""
+    """Load one A tile through a tile-local descriptor so allocations may span the 4 GiB buffer ABI.
+
+    ``valid_rows`` bounds the descriptor to the tile's real rows (the rest read as zero).
+    """
     lanes_per_row = KH_TILE_A // 16  # 8 (fp4) / 16 (fp8)
     rows_per_call = 64 // lanes_per_row  # 8 (fp4) / 4 (fp8)
     a_lane_row = lane // lanes_per_row
-    rows_per_wave = BM // 4  # rows each wave loads (BM32: 8, BM64: 16)
+    rows_per_wave = BM // NW  # rows each wave loads (NW4: BM32 8, BM64 16; NW8: BM64 8)
     # BM16 fp4: partial-wave round-robin (waves 2,3 re-load, harmless); BM>=32 byte-identical per-wave blocks.
     partial_wave_gather = rows_per_wave < rows_per_call
     if const_expr(partial_wave_gather):
@@ -136,7 +141,8 @@ def issue_a_load_lds_dt(
         align=16,
         elem_bytes=4,
         fold=False,
-        num_records_bytes=fx.Int64(BM) * fx.Int64(K_BYTES),
+        num_records_bytes=fx.Int64(BM if valid_rows is None else valid_rows)
+        * fx.Int64(K_BYTES),
     )
     for g in range_constexpr(n_row_groups):
         lds_row = gather_base_row + g * rows_per_call
@@ -188,8 +194,16 @@ def gemm2_compute_v2(
     explicit_m_row=None,
     explicit_n_block=None,
     explicit_expert=None,
+    valid_rows=None,
+    NW=4,
+    early_b_load=False,
 ):
-    """Run GEMM2, optionally using an explicitly selected expert row/tile."""
+    """Run GEMM2, optionally using an explicitly selected expert row/tile.
+
+    ``NW`` is the CTA wave count, ``valid_rows`` bounds the A tile loads to the
+    tile's real rows, and ``early_b_load`` (1-stage B path) issues each K-tile's
+    B and A-scale loads before the barrier and the next A-tile DMA.
+    """
     assert aStages == (4 if g2_deep_a_pipeline else kStages + 1)
     assert not g2_deep_a_pipeline or g2_b2stage
     # SBM is the sort padding unit; BM is the compute tile and must divide SBM.
@@ -198,7 +212,7 @@ def gemm2_compute_v2(
     kMChunks = BM // 16  # 16-row MFMA row-groups
     kHalves = BK // 128  # 16x16x128 MFMA K-steps per K-tile
     tilesPerScaleChunk = 256 // BK  # K-tiles sharing one 256-K E8M0 word
-    numAccN = (BN // 4) // 16  # 16-column MFMA subblocks per wave
+    numAccN = (BN // NW) // 16  # 16-column MFMA subblocks per wave
     nPairs = max(1, numAccN // 2)  # one B-scale per two 16-column subblocks
     # BM16: single 16-row block owning a 32-row scale chunk (chunk==m_block_idx, rg0-only).
     is_bm16 = BM < 32
@@ -278,6 +292,8 @@ def gemm2_compute_v2(
             KH_TILE_A,
             K_BYTES,
             BM=BM,
+            valid_rows=valid_rows,
+            NW=NW,
         )
 
     def issue_a_ds_read(slot):
@@ -368,12 +384,12 @@ def gemm2_compute_v2(
     bq_base_dw = [
         rocdl.readfirstlane(
             T.i32,
-            (e * N_OUT_rt + n_block_idx * BN + wave * (BN // 4) + j * 16) * KH4,
+            (e * N_OUT_rt + n_block_idx * BN + wave * (BN // NW) + j * 16) * KH4,
         )
         for j in range_constexpr(numAccN)
     ]
 
-    mni_base = n_block_idx * (BN // 16 // 2) + wave * (BN // 64 // 2)
+    mni_base = n_block_idx * (BN // 16 // 2) + wave * (BN // (16 * NW) // 2)
     bscale_views = [
         scale_view(
             arg_bscale,
@@ -400,7 +416,7 @@ def gemm2_compute_v2(
                 )
                 load_mask = None
                 if const_expr(has_pad):
-                    col = n_block_idx * BN + wave * (BN // 4) + j * 16
+                    col = n_block_idx * BN + wave * (BN // NW) + j * 16
                     load_mask = (col < N_real) & (
                         kt_rt * fx.Int32(kHalves) + fx.Int32(half) < halves_real
                     )
@@ -520,8 +536,8 @@ def gemm2_compute_v2(
                 n += 1
         return n
 
-    if const_expr(BM == 64 and BN == 256 and not g2_b2stage):
-        # BM64/BN256 uses the 1-stage B path unconditionally.
+    if const_expr(BM == 64 and BN // NW == 64 and not g2_b2stage):
+        # BM64 with a 64-column per-wave slab (NW4 BN256 / NW8 BN512) uses the 1-stage B path.
         for kt_iv, state in range(
             fx.Int32(0),
             K_TILES_RT,
@@ -530,13 +546,19 @@ def gemm2_compute_v2(
         ):
             store_c_carry(state)
             kt_rt = fx.Int32(kt_iv)
+            if const_expr(early_b_load):
+                # Issue this K-tile's B and A-scale loads before the barrier and the next A-tile DMA:
+                # vmcnt retires in issue order, so waiting for them leaves that DMA in flight.
+                bqf, bsf = stream_b_tile(kt_rt)
+                sa = load_a_scale_tile(kt_rt)
             gpu.barrier()
             issue_a_ds_read(kt_rt % fx.Int32(aStages))
             nxt = kt_rt + fx.Int32(kStages)
             if nxt < K_TILES_RT:
                 issue_a_load_lds(nxt % fx.Int32(aStages), nxt)
-            bqf, bsf = stream_b_tile(kt_rt)
-            sa = load_a_scale_tile(kt_rt)
+            if const_expr(not early_b_load):
+                bqf, bsf = stream_b_tile(kt_rt)
+                sa = load_a_scale_tile(kt_rt)
             mfma_cluster(bqf, bsf, sa, kt_rt)
             results = yield load_c_carry()
         store_c_carry(results)
