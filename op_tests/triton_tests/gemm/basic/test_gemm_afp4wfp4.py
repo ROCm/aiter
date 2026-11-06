@@ -10,6 +10,7 @@ from aiter.ops.shuffle import shuffle_scale, shuffle_weight
 from aiter.ops.triton._triton_kernels.gemm.basic.gemm_afp4wfp4 import (
     _get_config as _get_afp4wfp4_config,
 )
+from aiter.ops.triton.gemm.basic import gemm_afp4wfp4 as gemm_afp4wfp4_module
 from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import (
     gemm_afp4wfp4 as triton_gemm_afp4wfp4,
 )
@@ -391,3 +392,199 @@ def test_gemm_mxfp4_preshuffled_gfx1250(
     )
 
     triton.testing.assert_close(torch_out, triton_out)
+
+
+# gfx950 Gluon ping-pong kernel (config kernel_type "compute_bound"). The shapes have
+# partial M and N tiles, one K step and odd numbers of K steps.
+PINGPONG_SHAPES = [
+    (16, 256, 256),
+    (128, 3072, 1536),
+    (512, 3072, 1536),
+    (256, 256, 512),
+    (512, 768, 1024),
+    (1024, 1024, 4096),
+    (256, 256, 768),
+    (256, 256, 1280),
+    (272, 528, 1024),
+    (48, 304, 2816),
+]
+
+
+class _LaunchCount:
+    """Counts the launches of a Gluon kernel and runs the kernel."""
+
+    def __init__(self, kernel):
+        self.kernel = kernel
+        self.count = 0
+
+    def __getitem__(self, grid):
+        self.count += 1
+        return self.kernel[grid]
+
+
+@pytest.fixture
+def gluon_launches(monkeypatch):
+    from aiter.ops.triton._gluon_kernels.gfx950.gemm.basic import (
+        gemm_afp4wfp4 as default_module,
+    )
+    from aiter.ops.triton._gluon_kernels.gfx950.gemm.basic import (
+        gemm_afp4wfp4_pingpong as pingpong_module,
+    )
+
+    launches = {
+        "default": _LaunchCount(default_module._gemm_afp4wfp4_kernel),
+        "pingpong": _LaunchCount(pingpong_module._gemm_afp4wfp4_pingpong_kernel),
+    }
+    monkeypatch.setattr(default_module, "_gemm_afp4wfp4_kernel", launches["default"])
+    monkeypatch.setattr(
+        pingpong_module, "_gemm_afp4wfp4_pingpong_kernel", launches["pingpong"]
+    )
+    return launches
+
+
+def _skip_unless_pingpong():
+    if DEVICE_ARCH != "gfx950":
+        pytest.skip("The ping-pong kernel is for gfx950 only.")
+    if not gemm_afp4wfp4_module._pingpong_compiler_ok():
+        pytest.skip("The ping-pong kernel is not validated on this Triton build.")
+    if gemm_afp4wfp4_module.get_num_xcds() != 8:
+        pytest.skip("The ping-pong kernel is not validated in partition modes.")
+
+
+def _pingpong_inputs(M, N, K):
+    x, w, _, x_scales, w_scales, _, _, _, _ = generate_gemm_afp4wfp4_inputs(
+        M, N, K, torch.bfloat16, output=False
+    )
+    config, _ = _get_afp4wfp4_config(M, N, K // 2, backend="gluon")
+    config["kernel_type"] = "compute_bound"
+    return x, w, x_scales, w_scales, config
+
+
+@pytest.mark.parametrize("M, N, K", PINGPONG_SHAPES)
+def test_gemm_afp4wfp4_gluon_pingpong(M, N, K, gluon_launches):
+    _skip_unless_pingpong()
+    x, w, x_scales, w_scales, config = _pingpong_inputs(M, N, K)
+    torch_out = run_torch(x, w, x_scales, w_scales, torch.bfloat16)
+
+    # A NaN-filled y with a padded row stride: every element must be written in place.
+    y_pad = torch.full((M, N + 16), float("nan"), dtype=torch.bfloat16, device="cuda")
+    y = y_pad[:, :N]
+    out = triton_gemm_afp4wfp4(
+        x, w, x_scales, w_scales, torch.bfloat16, y, config=config, backend="gluon"
+    )
+    again = triton_gemm_afp4wfp4(
+        x, w, x_scales, w_scales, torch.bfloat16, config=config, backend="gluon"
+    )
+
+    assert gluon_launches["pingpong"].count == 2, "the ping-pong kernel did not run"
+    assert gluon_launches["default"].count == 0
+    assert out.data_ptr() == y.data_ptr()
+    assert not torch.isnan(out).any(), "output has unwritten elements"
+    assert torch.isnan(y_pad[:, N:]).all(), "the kernel wrote outside y"
+    torch.testing.assert_close(out, torch_out, atol=1e-2, rtol=0)
+    assert torch.equal(out, again), "two runs differ"
+
+
+@pytest.mark.parametrize(
+    "M, N, K, case",
+    [
+        (256, 256, 288, "K % 256 != 0"),
+        (304, 512, 512, "fp16 output"),
+        (256, 256, 512, "row-major scales"),
+        (300, 512, 512, "M % 16 != 0"),
+    ],
+)
+def test_gemm_afp4wfp4_gluon_pingpong_fallback(M, N, K, case, gluon_launches):
+    _skip_unless_pingpong()
+    x, w, x_scales, w_scales, config = _pingpong_inputs(M, N, K)
+    dtype = torch.float16 if case == "fp16 output" else torch.bfloat16
+    if case == "row-major scales":
+        x_scales = x_scales.contiguous()
+    torch_out = run_torch(x, w, x_scales, w_scales, dtype)
+
+    out = triton_gemm_afp4wfp4(
+        x, w, x_scales, w_scales, dtype, config=config, backend="gluon"
+    )
+
+    assert gluon_launches["pingpong"].count == 0
+    assert gluon_launches["default"].count == 1
+    torch.testing.assert_close(out, torch_out, atol=1e-2, rtol=0)
+
+
+def test_gemm_afp4wfp4_pingpong_selection(monkeypatch):
+    _skip_unless_pingpong()
+    M, N, K = 256, 256, 512
+    x, w, x_scales, w_scales, config = _pingpong_inputs(M, N, K)
+
+    def reason(**changes):
+        args = {
+            "x": x,
+            "w": w,
+            "x_scales": x_scales,
+            "w_scales": w_scales,
+            "y": None,
+            "dtype": torch.bfloat16,
+            "config": config,
+        }
+        args.update(changes)
+        return gemm_afp4wfp4_module._pingpong_unsupported(**args)
+
+    padded_x = torch.zeros((M, K // 2 + 16), dtype=torch.uint8, device="cuda")
+    misaligned_x = torch.zeros(M * K // 2 + 16, dtype=torch.uint8, device="cuda")
+    misaligned_x = misaligned_x[1 : 1 + M * K // 2].view(M, K // 2)
+
+    assert reason() is None
+    assert reason(dtype=torch.float16) == "output dtype or shape"
+    assert (
+        reason(x_scales=x_scales.contiguous()) == "scales not contiguous along M and N"
+    )
+    assert reason(x=padded_x[:, : K // 2]) == "x or w not contiguous"
+    assert reason(x=misaligned_x) == "alignment"
+    assert reason(config=dict(config, NUM_KSPLIT=2)) == "config"
+    assert reason(config=dict(config, BLOCK_SIZE_M=128)) == "config"
+    assert reason(config=dict(config, num_warps=4)) == "config"
+
+    monkeypatch.setattr(gemm_afp4wfp4_module, "get_num_xcds", lambda default=8: 4)
+    assert reason() == "partition mode"
+    monkeypatch.setattr(gemm_afp4wfp4_module, "_pingpong_compiler_ok", lambda: False)
+    assert reason() == "Triton version not validated"
+    monkeypatch.setattr(arch_info, "get_arch", lambda: "gfx1250")
+    assert reason() == "arch"
+
+
+def test_gemm_afp4wfp4_gluon_default_unchanged(gluon_launches):
+    if DEVICE_ARCH != "gfx950":
+        pytest.skip("The gfx950 Gluon kernels need gfx950.")
+    M, N, K = 256, 256, 512
+    x, w, x_scales, w_scales, config = _pingpong_inputs(M, N, K)
+    torch_out = run_torch(x, w, x_scales, w_scales, torch.bfloat16)
+
+    # No kernel_type: the default Gluon kernel. kernel_type with backend="triton": Triton.
+    gluon_out = triton_gemm_afp4wfp4(
+        x, w, x_scales, w_scales, torch.bfloat16, backend="gluon"
+    )
+    triton_out = triton_gemm_afp4wfp4(
+        x, w, x_scales, w_scales, torch.bfloat16, config=config, backend="triton"
+    )
+
+    assert gluon_launches["default"].count == 1
+    assert gluon_launches["pingpong"].count == 0
+    torch.testing.assert_close(gluon_out, torch_out, atol=1e-2, rtol=0)
+    torch.testing.assert_close(triton_out, torch_out, atol=1e-2, rtol=0)
+
+
+def test_gemm_afp4wfp4_gluon_pingpong_compile(gluon_launches):
+    _skip_unless_pingpong()
+    M, N, K = 256, 256, 512
+    x, w, x_scales, w_scales, config = _pingpong_inputs(M, N, K)
+    fn = functools.partial(
+        triton_gemm_afp4wfp4, dtype=torch.bfloat16, config=config, backend="gluon"
+    )
+
+    # The wrapper serializes its config with json.dumps, which is a graph break, so the
+    # test does not use fullgraph=True.
+    eager = fn(x, w, x_scales, w_scales)
+    compiled = torch.compile(fn)(x, w, x_scales, w_scales)
+
+    assert gluon_launches["pingpong"].count == 2
+    assert torch.equal(compiled, eager)
