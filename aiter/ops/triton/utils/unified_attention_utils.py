@@ -200,6 +200,9 @@ def compute_segment_params(config: dict, params) -> dict:
     fit_budget = config.pop("SPLIT_FIT_BUDGET", False)
     seqs_per_tile = config.pop("SPLIT_SEQS_PER_TILE", 0)
     seg_min_tiles = config.pop("SPLIT_SEG_MIN_TILES", 0)
+    wave_slots = config.pop("SPLIT_WAVE_SLOTS_PER_CU", 0)
+    seg_overhead = config.pop("SPLIT_SEG_OVERHEAD_TILES", 0)
+    partial_cost = config.pop("SPLIT_PARTIAL_COST", 0.0)
 
     # tokens one segment must cover, so the split never outruns the context
     tile = triton.next_power_of_2(params.block_size)
@@ -207,10 +210,42 @@ def compute_segment_params(config: dict, params) -> dict:
     keys = params.max_seqlen_k
     if getattr(params, "sliding_window", 0) > 0:
         keys = min(keys, params.sliding_window + params.max_seqlen_q)
-    limit = triton.cdiv(keys, tile)
+    tiles = triton.cdiv(keys, tile)
+    limit = tiles
     too_many_seqs = seqs_per_tile and params.num_seqs > seqs_per_tile * limit
     if cap is not None:
         limit = min(cap, limit)
+
+    q_rows = params.max_seqlen_q * params.num_queries_per_kv
+    if wave_slots and mfma_dim and q_rows <= 128:
+        # One block covers each sequence, so the split grid holds num_seqs *
+        # num_kv_heads programs per segment, each of next_pow2(q_rows) //
+        # mfma_dim waves, and wave_slots waves fill a CU. Programs past one
+        # machine-full wait for another round, so a split costs whole rounds
+        # of (tiles per segment + a fixed per-program overhead), plus its
+        # partials, which grow with the program count. Segments keep at least
+        # seg_min_tiles tiles, and once the unsplit grid fills the machine
+        # twice a split only adds rounds.
+        waves = max(1, triton.next_power_of_2(q_rows) // mfma_dim)
+        load = params.num_seqs * params.num_kv_heads * waves
+        slots = params.num_sms * wave_slots
+        segments = 1
+        best = float(triton.cdiv(load, slots) * (tiles + seg_overhead))
+        split = 2
+        while (
+            limit > min_tiles
+            and not too_many_seqs
+            and split <= limit
+            and tiles >= split * seg_min_tiles
+            and load < 2 * slots
+        ):
+            cost = triton.cdiv(load * split, slots) * (tiles / split + seg_overhead)
+            cost += partial_cost * load * split / slots
+            if cost < best:
+                segments, best = split, cost
+            split *= 2
+        config["NUM_SEGMENTS"] = segments
+        return config
 
     budget = params.num_sms * per_cu
     prgms = max(1, params.num_2d_prgms)

@@ -179,16 +179,34 @@ def _gfx950_split_params(params: _UAParams):
     return params._replace(num_2d_prgms=num_q_blocks * params.num_kv_heads)
 
 
+def _gfx950_short_query(params: _UAParams):
+    """Short bf16 queries that the split grid launches as one block per sequence.
+
+    The split grid sizes BLOCK_M to the query group, so each sequence is one
+    query block with no masked rows, where the 2d grid's BLOCK_M 128 leaves
+    half of them empty. Measured for head size 64 only.
+    """
+    return (
+        not params.all_decode
+        and params.q_dtype == torch.bfloat16
+        and params.head_size <= 64
+        and params.max_seqlen_q * params.num_queries_per_kv <= 128
+    )
+
+
 def _gfx950_tile_size(params: _UAParams, tile: int):
     """Widen the KV tile to 128 for full attention when each program walks a
     long KV run and the grid leaves room on the CUs.
 
     With 16-token pages both loaders gather per token for a 64-key tile, so a
     program pays a fixed cost per tile; a 128-key tile halves the tile count.
-    That only pays off over a long run (>= 2048 keys per program) and while
-    the wider tile's doubled LDS does not cost co-residency: past one program
-    per CU for decode, and on the 2d grid past one program per CU dense or two
-    shuffled. Sliding windows keep the 64-key tile. Measured for bf16 only.
+    That only pays off over a long run (>= 2048 keys per program, 1536 for
+    short queries on the split grid; shorter runs lose the deeper prologue)
+    and while the wider tile's doubled LDS does not cost co-residency: past
+    one program per CU for decode, and on the 2d grid past one program per CU
+    dense or two shuffled. Short queries on the split grid keep winning at any
+    program count. Sliding windows keep the 64-key tile. Measured for bf16
+    only.
     """
     if (
         params.sliding_window > 0
@@ -199,11 +217,14 @@ def _gfx950_tile_size(params: _UAParams, tile: int):
     num_segments = get_unified_attention_config(
         "kv_split", _gfx950_split_params(params), backend="gluon"
     )["NUM_SEGMENTS"]
-    if params.max_seqlen_k < 2048 * num_segments:
+    min_keys = 1536 if _gfx950_short_query(params) else 2048
+    if params.max_seqlen_k < min_keys * num_segments:
         return tile
     programs = params.num_seqs * params.num_kv_heads * num_segments
     if params.all_decode:
         wide = programs <= params.num_sms
+    elif _gfx950_short_query(params):
+        wide = True
     elif params.shuffled_kv_cache:
         wide = programs < 2 * params.num_sms
     else:
@@ -214,6 +235,9 @@ def _gfx950_tile_size(params: _UAParams, tile: int):
 def _gfx950_split_grid(params: _UAParams):
     """Decode, and batches too small to fill the GPU, take the split grid."""
     if params.all_decode:
+        return True
+    if _gfx950_short_query(params):
+        # the split grid beats the 2d one (BLOCK_M 128) even unsplit
         return True
     if params.sliding_window > 0 and (
         params.max_seqlen_q * params.num_queries_per_kv > 128
