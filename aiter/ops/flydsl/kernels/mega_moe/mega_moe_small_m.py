@@ -30,10 +30,11 @@ from ..flydsl_dispatch_combine_intranode_op import (
 )
 from ..kernels_common import ceildiv
 from ..mxfp4_gemm_common import _fabs_f32 as fabs_f32
-from ..mxfp4_gemm_common import lds_typed_ptr, lds_vec_load
+from ..mxfp4_gemm_common import kStages, lds_typed_ptr, lds_vec_load
 from ..tensor_shim import _preload_compiled, _run_compiled, ptr_buf_tensor
 from .dispatch import _wave_inclusive_scan_i32, _wave_reduce_max_i32
 from .gemm1 import _LdsF32View, build_fused_gemm1
+from .gemm2 import gemm2_compute_v2, issue_a_load_lds_dt
 from .mega_moe_config import fused_layout_supported, small_m_cu_supported
 from .mega_moe_fused_gemm import (
     SMALL_M_FIXED_SLOT_MAX_MTPR,
@@ -43,9 +44,6 @@ from .mega_moe_fused_gemm import (
     _buffer_load,
     _buffer_store,
     _make_buffer_from_addr,
-    gemm2_compute_v2,
-    issue_a_load_lds_dt,
-    kStages,
     load_at,
     nearest_token_bucket,
     select_mega_moe_config,
