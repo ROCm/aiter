@@ -42,7 +42,7 @@ _HGEMM_KERNEL_RE = re.compile(
     r"x(?P<stages>\d+)_ks(?P<split_k>\d+)_"
     r"w(?P<m_waves>\d+)x(?P<n_waves>\d+)x(?P<k_waves>\d+)_"
     r"bias(?P<has_bias>[01])_ktail(?P<has_k_tail>[01])_"
-    r"gm(?P<group_m>\d+)_p(?P<policy>ft|ht|hti|sk)_"
+    r"gm(?P<group_m>\d+)_p(?P<policy>ft|ht|hti|sk|tdm)_"
     r"(?P<target_gfx>gfx[0-9a-z]+(?:-[0-9a-z]+)*)$"
 )
 
@@ -82,8 +82,8 @@ def flydsl_hgemm_kernel_name(
             f"Unsupported output dtype {out_dtype_name} for input {dtype_name}"
         )
 
-    if config.get("policy") == SKINNY_POLICY:
-        policy = SKINNY_POLICY
+    if config.get("policy") in (SKINNY_POLICY, "tdm"):
+        policy = config["policy"]
     else:
         policy = "ht" if config["use_half_tile_interleaved"] else "ft"
     name = (
@@ -118,6 +118,13 @@ def get_flydsl_hgemm_kernel_params(name: str) -> dict | None:
         or match.group("has_bias") != "0"
         or match.group("group_m") != "0"
         or match.group("target_gfx") != "gfx950"
+    ):
+        return None
+
+    if policy == "tdm" and (
+        match.group("target_gfx") not in ("gfx1250", "gfx1250-strict")
+        or out_dtype != dtype
+        or match.group("k_waves") != "1"
     ):
         return None
 
@@ -160,7 +167,7 @@ def flydsl_hgemm(
 ) -> torch.Tensor:
     """Run the A16W16 kernel for this arch with AITER's ``B[N, K]`` convention."""
 
-    if policy not in ("ft", "ht", "hti", SKINNY_POLICY):
+    if policy not in ("ft", "ht", "hti", SKINNY_POLICY, "tdm"):
         raise ValueError(f"Unsupported FlyDSL HGEMM policy: {policy!r}")
     launch_stream = (
         torch.cuda.current_stream(device=a.device) if stream is None else stream
@@ -169,6 +176,30 @@ def flydsl_hgemm(
         raise ValueError(f"`stream` must be on {a.device}, got {launch_stream.device}")
 
     gfx = get_gfx()
+    if policy == "tdm":
+        if gfx not in ("gfx1250", "gfx1250-strict"):
+            raise ValueError("The TDM HGEMM policy requires gfx1250")
+        if k_waves != 1 or out_dtype not in (None, a.dtype):
+            raise ValueError(
+                "The TDM HGEMM policy requires k_waves=1 and output=input dtype"
+            )
+        from .kernels.gemm_a16w16_tdm_gfx1250 import gemm_a16w16_tdm
+
+        return gemm_a16w16_tdm(
+            a,
+            b,
+            out,
+            bias,
+            block_m=block_m,
+            block_n=block_n,
+            block_k=block_k,
+            stages=stages,
+            split_k=split_k,
+            m_waves=m_waves,
+            n_waves=n_waves,
+            group_m=group_m,
+            stream=launch_stream,
+        )
     if policy == SKINNY_POLICY:
         if gfx != "gfx950":
             raise RuntimeError("The FlyDSL skinny HGEMM policy supports gfx950 only")
