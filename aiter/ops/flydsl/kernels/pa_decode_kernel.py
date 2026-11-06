@@ -748,6 +748,10 @@ def compile_gfx1250_pa_decode(
         else:
             if const_expr(t.direct_output):
                 # One task per nonempty sequence; reduce_info supplies its slot.
+                # Later sequences start first: sparse prefill rows grow with
+                # their position, so the longest tasks no longer form a tail.
+                task_slot = sequences - 1 - task_slot
+                direct_seq = task_slot
                 info = fx.recast_iter(fx.Int32, pmax)
                 count = fx.Int32(info[task_slot * 2 + 1])
                 # A trailing empty sequence's start can equal capacity. Its dummy
@@ -813,7 +817,7 @@ def compile_gfx1250_pa_decode(
             else:
                 Gfx1250Pipeline(ctx).run()
         elif const_expr(t.direct_output):
-            zero_output(gpu.block_id("x"), pout)
+            zero_output(direct_seq, pout)
         if const_expr(t.merge_partitions):
             # Empty sequences own no task. Capacity >= batch gives each one the
             # CTA at its index, which clears its rows.
