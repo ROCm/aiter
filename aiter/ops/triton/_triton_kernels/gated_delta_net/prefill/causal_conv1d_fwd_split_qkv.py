@@ -10,10 +10,7 @@ Host-side launch wrappers live in the public namespace
 import triton
 import triton.language as tl
 
-from aiter.ops.triton._triton_kernels.common.activation import (
-    _silu_exp2,
-    _silu_exp2_fast,
-)
+from aiter.ops.triton._triton_kernels.common.activation import _silu_exp2_fast
 from aiter.ops.triton._triton_kernels.common.pid_preprocessing import remap_xcd
 from aiter.ops.triton._triton_kernels.common.segment_tile import _lower_bound
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
@@ -308,7 +305,7 @@ def _causal_conv1d_fwd_split_qkv_kernel(
             col2 = matrix_x
 
         if SILU_ACTIVATION:
-            acc = _silu_exp2(acc)
+            acc = acc / (1 + tl.exp(-acc))
 
         global_token_idx = sequence_start_index + token_offset + idx_token
         mask_feat = (idx_token < segment_len) & (idx_feats < dim)

@@ -201,7 +201,7 @@ def causal_conv1d_split_qkv_triton_tile_fn(
     Channel-contiguous x with conv width 4 runs the sliding-window kernel (tuned config; block_m, block_n,
     num_warps and metadata unused). AITER_CONV1D_SPLIT_QKV_WINDOW=0 turns it off.
     """
-    window_config = _window_config(x, weight, conv_states, k_dim, v_dim)
+    window_config = _window_config(x, weight, conv_states, k_dim, v_dim, pad_slot_id)
     if window_config is not None:
         return _causal_conv1d_split_qkv_window(
             window_config,
@@ -338,8 +338,8 @@ def causal_conv1d_split_qkv_triton_tile_fn(
         key.stride(0),
         value.stride(1),
         value.stride(0),
-        0,  # stride_block_m (APC only)
-        pad_slot_id,
+        0,  # stride_block_m
+        PAD_SLOT_ID if pad_slot_id is None else pad_slot_id,
         HAS_BIAS=bias is not None,
         KERNEL_WIDTH=width,
         SILU_ACTIVATION=activation in ["silu", "swish"],
@@ -367,12 +367,13 @@ def _warp_size() -> int:
     return triton.runtime.driver.active.get_current_target().warp_size
 
 
-def _window_config(x, weight, conv_states, k_dim, v_dim) -> dict | None:
+def _window_config(x, weight, conv_states, k_dim, v_dim, pad_slot_id) -> dict | None:
     """Window kernel config, or None if it does not apply"""
     dim, cu_seqlen = x.shape
     if (
         os.environ.get("AITER_CONV1D_SPLIT_QKV_WINDOW", "1") == "0"
         or not has_conv_config(_WINDOW_CONFIG_NAME)
+        or pad_slot_id is None
         or weight.dim() != 2
         or weight.shape[1] != 4
         # Taps are loaded as contiguous [dim, 4] rows
