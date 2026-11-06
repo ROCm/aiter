@@ -8,21 +8,11 @@ from opus_gemm_common import OpusGemmInstance
 
 from codegen.common import (
     WARP_SIZE,
-    add_aiter_utils_to_sys_path,
     register_arch_map,
     register_emit,
     splitk_workspace_type,
     write_if_changed,
 )
-
-
-def build_num_xcd():
-    if add_aiter_utils_to_sys_path() is None:
-        return 8  # Standalone codegen without aiter.
-    import build_targets
-
-    return build_targets.build_num_xcds("gfx950")
-
 
 # ---------------- gfx950 arch-override maps ----------------
 
@@ -710,7 +700,7 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
     {has_oob_str},
     {k.cachectl_a},
     {k.cachectl_b},
-    {build_num_xcd()}>;
+    {cg.num_xcd}>;
 """
 
     min_k = 2 * k.B_K
@@ -728,7 +718,7 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
 
     grid_setup = f"""
     const int NUM_CU = get_device_cu_num();
-    constexpr int NUM_XCD = {build_num_xcd()};
+    constexpr int NUM_XCD = {cg.num_xcd};
     const int num_tiles_m = (M + {k.B_M} - 1) / {k.B_M};
     const int num_tiles_n = (N + {k.B_N} - 1) / {k.B_N};
     int split_m = std::max(1, (NUM_CU + num_tiles_n - 1) / num_tiles_n);
@@ -1082,7 +1072,7 @@ def gen_noscale_instance_gfx950(
         cachectl_extra = f",\n    {k.cachectl_a}, {k.cachectl_b}"
     traits_alias_tail = f",\n    {has_oob_str}"
     if is_a16w16_split_barrier:
-        traits_alias_tail += f",\n    {build_num_xcd()}"
+        traits_alias_tail += f",\n    {cg.num_xcd}"
         traits_aliases = f"""
 template <typename D_C>
 using {k.name}_TraitsNoBias = {traits_name}<{k.BLOCK_SIZE},
@@ -1946,7 +1936,7 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
     opus::seq<{k.VEC_A}, {k.VEC_B}, {k.VEC_C}>,
     opus::seq<{k.GROUP_M}, {k.GROUP_N}, {k.GROUP_K}>,
     {k.WG_PER_CU},
-    {build_num_xcd()}{ring_arg}>;
+    {cg.num_xcd}{ring_arg}>;
 """
 
     preamble = instance_impl_preamble('\n#include "opus_gemm_common.cuh"')
@@ -2250,7 +2240,7 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
     opus::seq<{k.VEC_A}, {k.VEC_B}, {k.VEC_C}>,
     opus::seq<{k.GROUP_M}, {k.GROUP_N}, {k.GROUP_K}>,
     {k.WG_PER_CU},
-    {build_num_xcd()}>;
+    {cg.num_xcd}>;
 """
 
     preamble = instance_impl_preamble()
@@ -2264,7 +2254,7 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
 
     launcher = (
         _BMM_MXSCALE_MINTERLEAVE_LAUNCHER_BODY.replace("@@NAME@@", k.name)
-        .replace("@@NUM_XCD@@", str(build_num_xcd()))
+        .replace("@@NUM_XCD@@", str(cg.num_xcd))
         .replace("@@KERNEL@@", kernel_func)
         .replace("@@SKIP@@", "true" if k.skip_scale_wait else "false")
     )
@@ -2308,7 +2298,7 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
     _dev("fp32", "float")
 
 
-def _bmm_specialized_traits_alias(k, traits_name, da, db):
+def _bmm_specialized_traits_alias(k, traits_name, da, db, num_xcd):
     """Non-templated traits alias shared by all a8w8_mxscale BMM specialized
     pipelines (fp32 workspace slot, unsigned char e8m0 scale slot)."""
     return f"""
@@ -2318,7 +2308,7 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
     opus::seq<{k.VEC_A}, {k.VEC_B}, {k.VEC_C}>,
     opus::seq<{k.GROUP_M}, {k.GROUP_N}, {k.GROUP_K}>,
     {k.WG_PER_CU},
-    {build_num_xcd()}>;
+    {num_xcd}>;
 """
 
 
@@ -2354,10 +2344,12 @@ def _emit_bmm_specialized(
             f"using {k.name}_Traits = {traits_name}<"
             f"{k.B_M}, {k.B_N}, {k.B_K}, {k.T_M}, {k.T_N}, {k.num_slots}, "
             f"{str(k.cachectl_b == 2).lower()}, {str(k.early_b).lower()}, "
-            f"{build_num_xcd()}>;"
+            f"{cg.num_xcd}>;"
         )
     else:
-        traits_aliases = _bmm_specialized_traits_alias(k, traits_name, da, db)
+        traits_aliases = _bmm_specialized_traits_alias(
+            k, traits_name, da, db, cg.num_xcd
+        )
     INSTANCE_IMPL = f"{preamble}\n{host_tu_split}\n{traits_aliases}\n{launcher}"
     write_if_changed(os.path.join(cg.impl_path, f"{k.name}.cuh"), INSTANCE_IMPL)
 
@@ -2808,7 +2800,7 @@ def gen_bmm_mxscale_mouter_instance(
     _, tpl, fn = kargs_template_vars(k.kernel_tag, kargs_name)
     launcher = (
         _BMM_MOUTER_LAUNCHER_BODY.replace("@@NAME@@", k.name)
-        .replace("@@NUM_XCD@@", str(build_num_xcd()))
+        .replace("@@NUM_XCD@@", str(cg.num_xcd))
         .replace("@@KERNEL@@", kernel_func)
         .replace("@@SSW@@", _cppbool(k.skip_scale_wait))
     )
@@ -2848,7 +2840,7 @@ def gen_bmm_mxscale_mouter_tunable_instance(
     _, tpl, fn = kargs_template_vars(k.kernel_tag, kargs_name)
     launcher = (
         _BMM_MOUTER_TUNABLE_LAUNCHER_BODY.replace("@@NAME@@", k.name)
-        .replace("@@NUM_XCD@@", str(build_num_xcd()))
+        .replace("@@NUM_XCD@@", str(cg.num_xcd))
         .replace("@@KERNEL@@", kernel_func)
         .replace("@@SSW@@", _cppbool(k.skip_scale_wait))
     )
