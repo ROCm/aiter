@@ -118,6 +118,9 @@ def dry_run(arch: str, cu_num: int, name: str | None = None) -> Iterator[None]:
             (torch.cuda, "Stream", _Stream),
             (torch.cuda, "Event", _Event),
             (torch.cuda, "current_device", lambda: 0),
+            # Nothing is captured: host code that defers an allocation while a
+            # graph records (the TP prefill route's persistent counter) asks.
+            (torch.cuda, "is_current_stream_capturing", lambda: False),
             # current_stream_arg reads the raw stream handle past current_stream.
             (tensor_shim, "_get_current_raw_stream", lambda _device: 0),
             (torch.cuda, "get_device_properties", lambda *_a, **_k: properties),
