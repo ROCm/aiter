@@ -302,6 +302,15 @@ _AR_RESIDUAL_MAX_BYTES = {
 }
 
 
+# On the gfx9 archs in _LAMPORT_GFX, all_reduce takes the lamport one-shot /
+# two-shot kernels for the sizes in CustomAllreduce::lamportKernel unless this
+# is set; every rank must match. Read only there: gfx1250 has no lamport path
+# and ignores it.
+_DISABLE_LAMPORT_ENV = "AITER_CUSTOM_AR_DISABLE_LAMPORT"
+# Archs the lamport kernels run on (wave64, uncached inboxes + nontemporal ops).
+_LAMPORT_GFX = ("gfx942", "gfx950")
+
+
 @functools.cache
 def _runtime_gfx() -> str | None:
     """The live GPU arch, or None if unknown (never fused)."""
@@ -1257,6 +1266,8 @@ class CustomAllreduce:
         """
         self._IS_CAPTURING = False
         self.disabled = True
+        # Whether all_reduce may take the lamport kernels (_initLamport).
+        self.lamport_enabled = False
         self._register_for_capturing = False
         self._register_for_capturing_init = False
         self._register_for_capturing_requested = False
@@ -1928,7 +1939,23 @@ class CustomAllreduce:
         )
         if self._is_gfx1250:
             self._init_lamport_ar_rms(world_size)
+        else:
+            self._initLamport(world_size)
 
+    # TODO: the lamport init is one per arch, each with one lamport op for now:
+    #   gfx9    -> _initLamport          lamport all_reduce
+    #   gfx1250 -> _init_lamport_ar_rms  lamport fused AR + RMSNorm
+    # gfx9 is getting lamport AR + RMSNorm and gfx1250 lamport all_reduce, so
+    # each arch's init will set up both ops. Keeping one init per arch is fine
+    # (memory type, IPC mapping and C++ state already differ per arch), as is
+    # sharing one init. Either way, when the second op lands on an arch:
+    #   - both ops create the pool "lamport" today: give the second op its own
+    #     key, or let both ops share one inbox,
+    #   - keep each op's on/off and size switch, agreed across ranks:
+    #     AITER_CUSTOM_AR_DISABLE_LAMPORT / self.lamport_enabled for all_reduce,
+    #     AITER_CUSTOM_AR_LAMPORT_RMS_MAX_SIZE / self._lamport_max_bytes for
+    #     AR + RMSNorm,
+    #   - name the init after the arch, not the op.
     def _init_lamport_ar_rms(self, world_size: int):
         """Set up the Lamport fused AR + RMSNorm inbox (IPC transport only).
 
@@ -1951,6 +1978,59 @@ class CustomAllreduce:
             "(inbox %d bytes per rank)",
             max_bytes,
             size,
+        )
+
+    # TODO: the gfx9 lamport init, lamport all_reduce only for now; it also
+    # sets up lamport AR + RMSNorm once gfx9 has it, see the TODO above
+    # _init_lamport_ar_rms.
+    def _initLamport(self, world_size: int):
+        """Set up the lamport one-shot / two-shot path of all_reduce.
+
+        On by default on the gfx9 archs in _LAMPORT_GFX with 2, 4 or 8 ranks;
+        AITER_CUSTOM_AR_DISABLE_LAMPORT=1 keeps the original dispatch there.
+        gfx1250 never gets here and never reads the env var. The size ranges
+        it covers (one-shot, then two-shot up to 2MB at TP2, 1MB at TP4 / TP8) are
+        CustomAllreduce::lamportKernel in custom_all_reduce.cuh. The buffer is
+        ops.lamportBufferSize, 16-27MB of uncached IPC memory per rank.
+        Every rank must agree: a rank that took the lamport kernel while a peer
+        did not would hang both, so the verdict is AND-ed over the group.
+        """
+        # arch first, so the env var is only read on a lamport arch
+        wanted = (
+            _runtime_gfx() in _LAMPORT_GFX
+            and world_size in (2, 4, 8)
+            and not env_flag(_DISABLE_LAMPORT_ENV)
+        )
+        if not self._all_reduce_and(wanted):
+            if wanted:
+                logger.warning(
+                    "Custom allreduce lamport path is off: another rank has it "
+                    "disabled (%s, arch or world size).",
+                    _DISABLE_LAMPORT_ENV,
+                )
+            return
+        # Uncached for the same reason as the meta buffer; >= 2 MB (coarse
+        # grained) so the IPC handle always exports, see the comment above.
+        _COARSE_GRAIN = 2 * 1024 * 1024
+        size = ops.lamportBufferSize(world_size)
+        size = (size + _COARSE_GRAIN - 1) // _COARSE_GRAIN * _COARSE_GRAIN
+        self._pool.create("lamport", size, uncached=True)
+        handles, offsets = self._pool.get_ipc_meta("lamport")
+        ops.initLamport(
+            self._ptr,
+            self._pool["lamport"].data_ptr,
+            [h.data_ptr() for h in handles],
+            offsets,
+        )
+        # initLamport fills this rank's inboxes with the sentinel; every rank
+        # must be done before any rank sends its first round.
+        torch.cuda.synchronize(self.device)
+        dist.barrier(group=self.group)
+        self.lamport_enabled = True
+        logger.info(
+            "Custom allreduce lamport path on (%d MiB buffer); set %s=1 to disable",
+            size >> 20,
+            _DISABLE_LAMPORT_ENV,
         )
 
     @property

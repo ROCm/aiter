@@ -224,6 +224,29 @@ def meta_size() -> int: ...
 
 
 @compile_ops("module_custom_all_reduce", develop=True)
+def lamportBufferSize(world_size: int) -> int: ...
+
+
+@compile_ops("module_custom_all_reduce", develop=True)
+def initLamport(
+    _fa: int,
+    self_ptr: int,
+    ipc_handle_ptrs: list[int],
+    offsets: list[int],
+) -> None: ...
+
+
+@compile_ops("module_custom_all_reduce", develop=True)
+def lamportKernel(_fa: int, numel: int) -> int: ...
+
+
+@compile_ops("module_custom_all_reduce", develop=True)
+def lamportAllReduce(
+    _fa: int, inp: torch.Tensor, out: torch.Tensor, kernel: int
+) -> None: ...
+
+
+@compile_ops("module_custom_all_reduce", develop=True)
 def register_input_buffer(
     _fa: int, self_ptr: int, ipc_handle_ptrs: list[int], offsets: list[int]
 ) -> None: ...
