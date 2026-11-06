@@ -633,3 +633,56 @@ def test_fused_clamp_act_mul_mx_partial_width(M, n_half, swiglu_limit, backend):
         deq.view(M, n_half), ref.view(M, n_half), atol=1e-6, rtol=0.13
     )
     assert torch.all(out[0, :32].float() == 0)
+
+
+@pytest.mark.parametrize("M", [1, 8, 97])
+@pytest.mark.parametrize("n_half", [32, 64])
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
+def test_fused_clamp_act_mul_narrow_rows_unquantized(M, n_half, backend):
+    """Rows narrower than the default quant group (128) with no quant: the
+    kernel must not need the unused group to fit the tile."""
+    _check_backend(backend)
+    torch.manual_seed(n_half + M)
+    inp = torch.randn(M, 2 * n_half, device="cuda", dtype=torch.bfloat16)
+    out = fused_clamp_act_mul(
+        inp, swiglu_limit=0.0, activation="silu", dtype_quant=None, backend=backend
+    )
+    assert out.shape == (M, n_half) and out.dtype == inp.dtype
+    ref = _torch_reference(inp, 0.0, None, None)
+    torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("M", [1, 8, 97])
+@pytest.mark.parametrize("n_half, quant_block_size", [(384, 256), (576, 128)])
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
+def test_fused_clamp_act_mul_partial_last_group(M, n_half, quant_block_size, backend):
+    """FP8 with fp32 scales where the last group is partial: 384 / 256 (accepted
+    before N_HALF_MULTIPLE) and 576 / 128. The columns past n_half read as zero,
+    so the last group's scale is the amax of its real columns."""
+    _check_backend(backend)
+    torch.manual_seed(n_half + quant_block_size + M)
+    dtype_quant = aiter.dtypes.fp8
+    inp = torch.randn(M, 2 * n_half, device="cuda", dtype=torch.bfloat16) * 4
+    out, scale = fused_clamp_act_mul(
+        inp,
+        swiglu_limit=0.0,
+        activation="silu",
+        dtype_quant=dtype_quant,
+        quant_block_size=quant_block_size,
+        backend=backend,
+    )
+    groups = -(-n_half // quant_block_size)
+    assert out.shape == (M, n_half) and scale.shape == (M, groups)
+
+    gate, up = inp.float().chunk(2, dim=-1)
+    y = F.silu(gate) * up
+    padded = F.pad(y, (0, groups * quant_block_size - n_half))
+    amax = padded.view(M, groups, quant_block_size).abs().amax(dim=-1)
+    torch.testing.assert_close(
+        scale, amax / torch.finfo(dtype_quant).max, rtol=1e-2, atol=1e-12
+    )
+    group_amax = amax.repeat_interleave(quant_block_size, dim=-1)[:, :n_half]
+    deq = out.float() * scale.repeat_interleave(quant_block_size, dim=-1)[:, :n_half]
+    # E4M3 keeps 3 mantissa bits: a correct value sits within 2 ** -4 of its
+    # group's amax; a scale taken over the wrong columns is far outside it.
+    assert ((deq - y).abs() <= group_amax * 2.0**-4 + 1e-6).all()
