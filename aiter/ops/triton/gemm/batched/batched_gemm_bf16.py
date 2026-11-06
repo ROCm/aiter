@@ -295,7 +295,11 @@ def batched_gemm_bf16(
         # all batches, which is slow when the GEMM is store-bound (small K).
         out = YQ if num_ksplit == 1 else y_pp
         tile_major = get_arch() == "gfx1151" and _fits_int32_per_batch(XQ, WQ, out)
-        even_mn = M % config["BLOCK_SIZE_M"] == 0 and N % config["BLOCK_SIZE_N"] == 0
+        # Only the TILE_MAJOR path reads EVEN_MN. Keep it False otherwise. Other
+        # architectures then compile only one variant for each M and N shape.
+        even_mn = tile_major and (
+            M % config["BLOCK_SIZE_M"] == 0 and N % config["BLOCK_SIZE_N"] == 0
+        )
         if tile_major:
             grid = lambda META: (
                 META["NUM_KSPLIT"]
