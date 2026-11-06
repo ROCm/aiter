@@ -29,8 +29,7 @@ from ..flydsl_dispatch_combine_intranode_op import (
     group_major_capacity,
 )
 from ..kernels_common import ceildiv
-from ..mxfp4_gemm_common import _fabs_f32 as fabs_f32
-from ..mxfp4_gemm_common import kStages, lds_typed_ptr, lds_vec_load
+from ..mxfp4_gemm_common import kStages, lds_typed_ptr
 from ..tensor_shim import _preload_compiled, _run_compiled, ptr_buf_tensor
 from .dispatch import _wave_inclusive_scan_i32, _wave_reduce_max_i32
 from .gemm1 import _LdsF32View, build_fused_gemm1
@@ -52,7 +51,7 @@ from .mega_moe_fused_gemm import (
     store_at,
 )
 from .mega_moe_stage1 import _validate_dispatch_capacity, stage1_output_buffers
-from .mega_moe_stage2 import _fp8_scale_for_leader, _stage2_lds_bytes
+from .mega_moe_stage2 import _stage2_lds_bytes, p2p_scatter_epilog
 from .weights import (
     check_bindable,
     check_forward_inputs,
@@ -419,222 +418,6 @@ def emit_direct_fixed_slot_finalize(
     fx.barrier()
 
 
-# fmt: off
-def p2p_scatter_epilog(lds_acc_base, accm, n_block_idx, wave, lane, *, N_OUT, BM, BN, npes, topk,
-    log2_max_tok, mask_max_tok, recv_cap, comb_inp_nbytes, lds_packed_off, lds_weight_off,
-    lds_peer_off, g2_bf16_lds=False, p2p_quant_type="none", store_cm=2, fp8_rows=None):
-# fmt: on
-    """CShuffle one GEMM2 tile into weighted BF16 rows and scatter them to peers.
-
-    ``store_cm`` is the cache policy of the BF16 row stores (2 = NT).
-    ``p2p_quant_type="dynamic"``: the wave-uniform ``fp8_rows`` picks FP8 (1x32 E8M0) or BF16 rows at run time;
-    both use the BF16 row stride.
-    """
-    kMChunks = BM // 16
-    numAccN = (BN // 4) // 16
-    wave_n = BN // 4
-    lane_div_16 = lane // 16
-    lane_mod_16 = lane % 16
-    lds_base_fptr = lds_typed_ptr(lds_acc_base, T.f32)
-    lds_base_bf16 = (
-        lds_typed_ptr(lds_acc_base, T.bf16, align=2)
-        if const_expr(g2_bf16_lds)
-        else None
-    )
-
-    dynamic = p2p_quant_type == "dynamic"
-    quant_fp8 = p2p_quant_type == "fp8_blockwise_1x32"
-    if p2p_quant_type not in ("none", "fp8_blockwise_1x32", "dynamic"):
-        raise ValueError(f"unsupported p2p_quant_type={p2p_quant_type!r}")
-    assert not (dynamic and g2_bf16_lds)
-    token_nbytes = N_OUT + N_OUT // 32 if quant_fp8 else N_OUT * 2
-
-    fx.barrier()
-
-    for i in range_constexpr(kMChunks):
-        row_base = fx.Int32(i * 16) + lane_div_16 * 4
-        if const_expr(g2_bf16_lds):
-            w_row = [
-                fx.ptr_load(
-                    lds_typed_ptr(
-                        fx.Int32(lds_weight_off) + (row_base + v) * fx.Int32(4),
-                        T.f32,
-                        align=4,
-                    )
-                )
-                for v in range_constexpr(4)
-            ]
-        for J in range_constexpr(numAccN):
-            col = wave * fx.Int32(wave_n) + J * 16 + lane_mod_16
-            vec = fx.Vector(accm[i][J])
-            for v in range_constexpr(4):
-                idx = (row_base + v) * BN + col
-                if const_expr(g2_bf16_lds):
-                    lds_base_bf16[idx] = fx.BFloat16(fx.Float32(vec[v]) * fx.Float32(w_row[v]))
-                else:
-                    lds_base_fptr[idx] = fx.Float32(vec[v])
-
-    fx.barrier()
-
-    for row_iter in range_constexpr(BM // 4):
-        row = wave + fx.Int32(row_iter * 4)
-        row_byte_off = row * fx.Int32(4)
-        p = fx.ptr_load(
-            lds_typed_ptr(fx.Int32(lds_packed_off) + row_byte_off, T.i32, align=4)
-        )
-        if const_expr(not g2_bf16_lds):
-            weight = fx.ptr_load(
-                lds_typed_ptr(fx.Int32(lds_weight_off) + row_byte_off, T.f32, align=4)
-            )
-        p = rocdl.readfirstlane(T.i32, p.ir_value())
-        if const_expr(not g2_bf16_lds):
-            weight = rocdl.readfirstlane(T.f32, weight.ir_value())
-        t = p & fx.Int32(0x00FFFFFF)
-        s = p >> fx.Int32(24)
-        dest_pe = t >> fx.Int32(log2_max_tok)
-        dest_lid = t & fx.Int32(mask_max_tok)
-        valid = (t < fx.Int32(recv_cap)) & (s < fx.Int32(topk)) & (dest_pe < fx.Int32(npes))
-        dest_pe_safe = valid.select(dest_pe, fx.Int32(0))
-        peer_base = fx.ptr_load(
-            lds_typed_ptr(
-                fx.Int32(lds_peer_off) + dest_pe_safe * fx.Int32(8),
-                T.i64,
-                align=8,
-            )
-        )
-        peer_base = rocdl.readfirstlane(T.i64, peer_base.ir_value())
-        rsrc_dst = AddrBuffer(peer_base, comb_inp_nbytes)
-        slot = dest_lid * fx.Int32(topk) + s
-        row_base = slot * fx.Int32(token_nbytes)
-
-        # Inactive lanes read safe LDS and issue a bounded OOB store.
-        active = lane < fx.Int32(BN // 8)
-        col = active.select(lane * fx.Int32(8), fx.Int32(0))
-        idx0 = row * fx.Int32(BN) + col
-        if const_expr(g2_bf16_lds):
-            pk = fx.Vector(
-                lds_vec_load(
-                    lds_acc_base,
-                    idx0 * fx.Int32(2),
-                    fx.Vector.make_type(8, fx.BFloat16),
-                    fx.BFloat16,
-                    align=16,
-                )
-            )
-        else:
-            v8 = fx.Vector(
-                lds_vec_load(
-                    lds_acc_base,
-                    idx0 * fx.Int32(4),
-                    fx.Vector.make_type(8, fx.Float32),
-                    fx.Float32,
-                    align=16,
-                )
-            )
-            weighted_v8 = fx.Vector.from_elements([v8[i] * weight for i in range_constexpr(8)], fx.Float32)
-
-        def _store_fp8():
-            row_off = row_base + n_block_idx * fx.Int32(BN)
-            vals = [fx.Float32(weighted_v8[i]) for i in range_constexpr(8)]
-            local_max = fabs_f32(vals[0])
-            for q in range_constexpr(1, 8):
-                local_max = local_max.maximumf(fabs_f32(vals[q]))
-            max_bits = local_max.bitcast(fx.Int32)
-            for xor_lane in (1, 2):
-                remote_bits = rocdl.ds_bpermute(
-                    T.i32,
-                    (lane ^ fx.Int32(xor_lane)) * fx.Int32(4),
-                    max_bits,
-                )
-                remote_max = fx.Int32(remote_bits).bitcast(fx.Float32)
-                local_max = local_max.maximumf(remote_max)
-                max_bits = local_max.bitcast(fx.Int32)
-            leader_lane = lane & fx.Int32(~3)
-            is_scale_leader = (lane & fx.Int32(3)) == fx.Int32(0)
-            leader_e8m0 = _fp8_scale_for_leader(is_scale_leader, local_max)
-            e8m0 = fx.Int32(
-                rocdl.ds_bpermute(
-                    T.i32,
-                    leader_lane * fx.Int32(4),
-                    leader_e8m0,
-                )
-            )
-            block_scale = (e8m0 << fx.Int32(23)).bitcast(fx.Float32)
-            pk_ty = T.vec(2, T.i16)
-            packed_lo = fx.Vector.filled(2, 0, fx.Int16).ir_value()
-            packed_hi = fx.Vector.filled(2, 0, fx.Int16).ir_value()
-            for pair in range_constexpr(4):
-                if pair < 2:
-                    packed_lo = rocdl.cvt_scalef32_pk_fp8_f32(
-                        pk_ty,
-                        packed_lo,
-                        vals[pair * 2].ir_value(),
-                        vals[pair * 2 + 1].ir_value(),
-                        block_scale.ir_value(),
-                        pair,
-                    )
-                else:
-                    packed_hi = rocdl.cvt_scalef32_pk_fp8_f32(
-                        pk_ty,
-                        packed_hi,
-                        vals[pair * 2].ir_value(),
-                        vals[pair * 2 + 1].ir_value(),
-                        block_scale.ir_value(),
-                        pair - 2,
-                    )
-            payload = fx.Vector.from_elements(
-                [
-                    fx.Vector(packed_lo).bitcast(fx.Int32)[0],
-                    fx.Vector(packed_hi).bitcast(fx.Int32)[0],
-                ],
-                fx.Int32,
-            )
-            scale_leader = active & ((lane & fx.Int32(3)) == fx.Int32(0))
-            payload_off = (valid & active).select(
-                row_off + col,
-                fx.Int32(comb_inp_nbytes),
-            )
-            # Adjacent active lanes issue contiguous 8-byte stores without ds_bpermute gathers.
-            store_at(payload.ir_value(), rsrc_dst, payload_off, 2, offset_is_bytes=True)
-
-            @flyc.jit
-            def store_scale_if_leader():
-                if scale_leader:
-                    scale_off = valid.select(
-                        row_base
-                        + fx.Int32(N_OUT)
-                        + n_block_idx * fx.Int32(BN // 32)
-                        + lane // fx.Int32(4),
-                        fx.Int32(comb_inp_nbytes),
-                    )
-                    store_at(e8m0.to(fx.Int8), rsrc_dst, scale_off, 2, offset_is_bytes=True)
-
-            store_scale_if_leader()
-
-        def _store_bf16(pk):
-            row_off = row_base + n_block_idx * fx.Int32(BN * 2)
-            off = (valid & active).select(
-                row_off + col * fx.Int32(2),
-                fx.Int32(comb_inp_nbytes),
-            )
-            store_at(pk.ir_value(), rsrc_dst, off, store_cm, offset_is_bytes=True)
-
-        if const_expr(dynamic):
-
-            @flyc.jit
-            def store_dynamic():
-                if fp8_rows != fx.Int32(0):
-                    _store_fp8()
-                else:
-                    _store_bf16(weighted_v8.to(fx.BFloat16))
-
-            store_dynamic()
-        elif const_expr(quant_fp8):
-            _store_fp8()
-        else:
-            _store_bf16(pk if const_expr(g2_bf16_lds) else weighted_v8.to(fx.BFloat16))
-
-
 def make_fused_combine_tail(*, lds_fc_off, reducers, npes, rank, topk, total_experts, experts_per_rank, N_OUT,
     flag_is_value=False, l1_acquire=False, row_format=False):
     """Combine after this WG's P2P scatter: grid ticket, cross-device flag, reduce by the last WGs.
@@ -841,7 +624,7 @@ def make_g2_tile_runner(*, BM, BN, BK, SBM, use_nt, INTER_MAX, a_dtype, g2_bhois
             topk=topk, log2_max_tok=log2_max_tok, mask_max_tok=max_tok - 1, recv_cap=recv_cap,
             comb_inp_nbytes=comb_inp_nbytes, lds_packed_off=lay["packed"], lds_weight_off=lay["weight"],
             lds_peer_off=lay["peer"], g2_bf16_lds=False, p2p_quant_type=p2p_quant_type, store_cm=store_cm,
-            fp8_rows=i32_fp8_rows)
+            fp8_store_cm=2, fp8_rows=i32_fp8_rows, elem_view_stores=True)
         # fmt: on
 
     return g2_tile, lay

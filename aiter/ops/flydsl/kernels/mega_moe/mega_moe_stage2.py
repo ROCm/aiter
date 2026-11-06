@@ -29,6 +29,7 @@ from .gemm2 import (
     issue_a_load_lds_dt,
     kStages,
 )
+from .mega_moe_fused_gemm import AddrBuffer, store_at
 
 _BUFFER_OFFSET_ABI_BYTES = 1 << 31
 
@@ -52,12 +53,22 @@ def _fp8_scale_for_leader(is_leader, local_max):
 # fmt: off
 def p2p_scatter_epilog(lds_acc_base, accm, n_block_idx, wave, lane, *, N_OUT, BM, BN, npes, topk,
     log2_max_tok, mask_max_tok, recv_cap, comb_inp_nbytes, lds_packed_off, lds_weight_off,
-    lds_peer_off, g2_bf16_lds=False, p2p_quant_type="none", scatter_vec=8):
+    lds_peer_off, g2_bf16_lds=False, p2p_quant_type="none", scatter_vec=8, NW=4, store_cm=2,
+    fp8_store_cm=None, fp8_rows=None, elem_view_stores=False):
 # fmt: on
-    """CShuffle one GEMM2 tile into weighted BF16 rows and scatter them to peers."""
+    """CShuffle one GEMM2 tile into weighted BF16 rows and scatter them to peers.
+
+    ``NW`` is the wave count: each wave owns ``BN // NW`` accumulator columns and
+    scatters rows ``wave + row_iter * NW``.  ``store_cm`` is the cache policy of the
+    BF16 row stores (2 = NT) and ``fp8_store_cm`` (default ``store_cm``) that of the
+    FP8 payload and scale stores.  ``p2p_quant_type="dynamic"``: the wave-uniform
+    ``fp8_rows`` picks FP8 (1x32 E8M0) or BF16 rows at run time; both use the BF16
+    row stride.  ``elem_view_stores`` addresses the peer stores through
+    ``store_at``'s element-stride view, as the fused kernels do.
+    """
     kMChunks = BM // 16
-    numAccN = (BN // 4) // 16
-    wave_n = BN // 4
+    numAccN = (BN // NW) // 16
+    wave_n = BN // NW
     lane_div_16 = lane // 16
     lane_mod_16 = lane % 16
     lds_base_fptr = lds_typed_ptr(lds_acc_base, T.f32)
@@ -67,11 +78,40 @@ def p2p_scatter_epilog(lds_acc_base, accm, n_block_idx, wave, lane, *, N_OUT, BM
         else None
     )
 
+    dynamic = p2p_quant_type == "dynamic"
     quant_fp8 = p2p_quant_type == "fp8_blockwise_1x32"
-    if p2p_quant_type not in ("none", "fp8_blockwise_1x32"):
+    if p2p_quant_type not in ("none", "fp8_blockwise_1x32", "dynamic"):
         raise ValueError(f"unsupported p2p_quant_type={p2p_quant_type!r}")
+    assert not (dynamic and g2_bf16_lds)
+    if fp8_store_cm is None:
+        fp8_store_cm = store_cm
     out_elem_bytes = 1 if quant_fp8 else 2
     token_nbytes = N_OUT + N_OUT // 32 if quant_fp8 else N_OUT * out_elem_bytes
+
+    def store_peer(peer_base, byte_off, value, elem, unit_elems, cache_modifier):
+        if const_expr(elem_view_stores):
+            store_at(
+                value.ir_value() if const_expr(unit_elems > 1) else value,
+                AddrBuffer(peer_base, comb_inp_nbytes),
+                byte_off,
+                cache_modifier,
+                offset_is_bytes=True,
+            )
+        else:
+            unit_bytes = unit_elems * (elem.width // 8)
+            buf_copy_store(
+                ptr_buf_tensor(
+                    peer_base,
+                    elem,
+                    unit_elems=unit_elems,
+                    num_records_bytes=comb_inp_nbytes,
+                ),
+                byte_off if const_expr(unit_bytes == 1) else byte_off // fx.Int32(unit_bytes),
+                value,
+                elem,
+                unit_elems=unit_elems,
+                cache_modifier=cache_modifier,
+            )
 
     fx.barrier()
 
@@ -100,8 +140,8 @@ def p2p_scatter_epilog(lds_acc_base, accm, n_block_idx, wave, lane, *, N_OUT, BM
 
     fx.barrier()
 
-    for row_iter in range_constexpr(BM // 4):
-        row = wave + fx.Int32(row_iter * 4)
+    for row_iter in range_constexpr(BM // NW):
+        row = wave + fx.Int32(row_iter * NW)
         row_byte_off = row * fx.Int32(4)
         p = fx.ptr_load(
             lds_typed_ptr(fx.Int32(lds_packed_off) + row_byte_off, T.i32, align=4)
@@ -134,7 +174,8 @@ def p2p_scatter_epilog(lds_acc_base, accm, n_block_idx, wave, lane, *, N_OUT, BM
         peer_base = rocdl.readfirstlane(T.i64, peer_base.ir_value())
         slot = dest_lid * fx.Int32(topk) + s
         row_base = slot * fx.Int32(token_nbytes)
-        row_off = row_base + n_block_idx * fx.Int32(BN * out_elem_bytes)
+        if const_expr(not dynamic):
+            row_off = row_base + n_block_idx * fx.Int32(BN * out_elem_bytes)
 
         # Inactive lanes read safe LDS and issue a bounded OOB store.
         active = lane < fx.Int32(BN // scatter_vec)
@@ -164,9 +205,10 @@ def p2p_scatter_epilog(lds_acc_base, accm, n_block_idx, wave, lane, *, N_OUT, BM
                 [v8[i] * weight for i in range_constexpr(scatter_vec)],
                 fx.Float32,
             )
-            if const_expr(not quant_fp8):
+            if const_expr(not quant_fp8 and not dynamic):
                 pk = weighted_v8.to(fx.BFloat16)
-        if const_expr(quant_fp8):
+
+        def store_fp8(row_off):
             vals = [
                 weighted_v8[i] for i in range_constexpr(scatter_vec)
             ]
@@ -225,21 +267,7 @@ def p2p_scatter_epilog(lds_acc_base, accm, n_block_idx, wave, lane, *, N_OUT, BM
                 fx.Int32(comb_inp_nbytes),
             )
             # Adjacent active lanes issue contiguous 8-byte stores without ds_bpermute gathers.
-            payload_words = scatter_vec // 4
-            payload_buf = ptr_buf_tensor(
-                peer_base,
-                fx.Int32,
-                unit_elems=payload_words,
-                num_records_bytes=comb_inp_nbytes,
-            )
-            buf_copy_store(
-                payload_buf,
-                payload_off // fx.Int32(scatter_vec),
-                payload,
-                fx.Int32,
-                unit_elems=payload_words,
-                cache_modifier=2,
-            )
+            store_peer(peer_base, payload_off, payload, fx.Int32, scatter_vec // 4, fp8_store_cm)
 
             @flyc.jit
             def store_scale_if_leader():
@@ -251,39 +279,31 @@ def p2p_scatter_epilog(lds_acc_base, accm, n_block_idx, wave, lane, *, N_OUT, BM
                         + lane // fx.Int32(scale_group_lanes),
                         fx.Int32(comb_inp_nbytes),
                     )
-                    scale_buf = ptr_buf_tensor(
-                        peer_base,
-                        fx.Int8,
-                        num_records_bytes=comb_inp_nbytes,
-                    )
-                    buf_copy_store(
-                        scale_buf,
-                        scale_off,
-                        e8m0.to(fx.Int8),
-                        fx.Int8,
-                        cache_modifier=2,
-                    )
+                    store_peer(peer_base, scale_off, e8m0.to(fx.Int8), fx.Int8, 1, fp8_store_cm)
 
             store_scale_if_leader()
-        else:
+
+        def store_bf16(row_off, pk):
             off = (valid & active).select(
-                row_off + col * fx.Int32(out_elem_bytes),
+                row_off + col * fx.Int32(2),
                 fx.Int32(comb_inp_nbytes),
             )
-            output_buf = ptr_buf_tensor(
-                peer_base,
-                fx.BFloat16,
-                unit_elems=scatter_vec,
-                num_records_bytes=comb_inp_nbytes,
-            )
-            buf_copy_store(
-                output_buf,
-                off // fx.Int32(scatter_vec * 2),
-                pk,
-                fx.BFloat16,
-                unit_elems=scatter_vec,
-                cache_modifier=2,
-            )
+            store_peer(peer_base, off, pk, fx.BFloat16, scatter_vec, store_cm)
+
+        if const_expr(dynamic):
+
+            @flyc.jit
+            def store_dynamic():
+                if fp8_rows != fx.Int32(0):
+                    store_fp8(row_base + n_block_idx * fx.Int32(BN))
+                else:
+                    store_bf16(row_base + n_block_idx * fx.Int32(BN * 2), weighted_v8.to(fx.BFloat16))
+
+            store_dynamic()
+        elif const_expr(quant_fp8):
+            store_fp8(row_off)
+        else:
+            store_bf16(row_off, pk)
 
 
 _P2P_ROW_NBYTES = {"none": lambda n: n * 2, "fp8_blockwise_1x32": lambda n: n + n // 32}
