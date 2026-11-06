@@ -270,10 +270,7 @@ def prepare_mega_mhc(
 
     H=5120/7168 on gfx950 and gfx1250 uses the tuned stream kernels.
     Explicit split_k, other H and gfx942 select the portable generic kernel
-    with the same weight layout. The tuned kernels up to T=2048 on gfx950 need
-    one CU per workgroup of a 256-CU grid, so on gfx950 parts with fewer CUs
-    those token counts also take the generic kernel, as do all distributed
-    kernels while a CU mask is set. The workspace also supports non-default
+    with the same weight layout. The workspace also supports non-default
     Sinkhorn repeats via the generic path. It never receives or stores
     weights. Prepare before graph capture; pass the packed weight separately
     to each mega_mhc call.
