@@ -4,6 +4,7 @@
 """QSA operators for index scoring, selection and sparse paged GQA."""
 
 import functools
+from typing import NamedTuple
 
 import torch
 import triton
@@ -31,24 +32,32 @@ _FMT_BF16, _FMT_FP8, _FMT_FP4 = 0, 1, 2
 QSA_CACHE_FORMATS = ("bf16", "fp8", "fp4")
 
 
-def qsa_cache_row_layout(fmt: str, head_dim: int):
-    """`(value dim, value dtype, scale tail, scale dtype)` of one cached row.
+class QSARowLayout(NamedTuple):
+    """One cached row: `dim` values of `dtype`, and a scale of shape
+    `scale_tail` after the row's own axes (None when unquantized)."""
 
-    The scale tail is the per-row scale shape after the row's own axes, None
-    when the row is stored unquantized. `"bf16"` stands for every unquantized
-    cache; FP16 / FP32 caches also use the `stacked_decode.bf16` tile.
-    """
+    dim: int
+    dtype: torch.dtype
+    scale_tail: tuple[int, ...] | None
+    scale_dtype: torch.dtype | None
+
+
+def qsa_cache_row_layout(fmt: str, head_dim: int) -> QSARowLayout:
+    """Layout of one cached row. `"bf16"` stands for every unquantized cache;
+    FP16 / FP32 caches also use the `stacked_decode.bf16` tile."""
     if fmt == "bf16":
-        return head_dim, torch.bfloat16, None, None
+        return QSARowLayout(head_dim, torch.bfloat16, None, None)
     if fmt == "fp8":
         if FP8_MAX is None:
             raise ValueError("FP8 QSA rows need a GPU with an FP8 dtype")
-        return head_dim, FP8_DTYPE, (), torch.float32
+        return QSARowLayout(head_dim, FP8_DTYPE, (), torch.float32)
     if fmt == "fp4":
         # The FP4 kernels index the packed bytes with tl.arange(0, head_dim / 2).
         if head_dim < FP4_GROUP or head_dim & (head_dim - 1):
             raise ValueError(f"FP4 rows need a power-of-two head_dim >= {FP4_GROUP}")
-        return head_dim // 2, torch.uint8, (head_dim // FP4_GROUP,), torch.uint8
+        return QSARowLayout(
+            head_dim // 2, torch.uint8, (head_dim // FP4_GROUP,), torch.uint8
+        )
     raise ValueError(f"unsupported QSA cache format {fmt!r}")
 
 
@@ -89,14 +98,14 @@ def _check_scale_plane(
 ) -> None:
     """Raise unless `scale` is the scale plane of a `fmt` cache, as laid out by
     `qsa_cache_row_layout`."""
-    _, _, tail, scale_dtype = qsa_cache_row_layout(QSA_CACHE_FORMATS[fmt], head_dim)
+    layout = qsa_cache_row_layout(QSA_CACHE_FORMATS[fmt], head_dim)
     if (
-        scale.shape != (*cache.shape[:3], *tail)
-        or scale.dtype != scale_dtype
-        or (tail and scale.stride(-1) != 1)
+        scale.shape != (*cache.shape[:3], *layout.scale_tail)
+        or scale.dtype != layout.scale_dtype
+        or (layout.scale_tail and scale.stride(-1) != 1)
     ):
         raise ValueError(
-            f"{name} must be the {scale_dtype} [pages, page, heads(, groups)] "
+            f"{name} must be the {layout.scale_dtype} [pages, page, heads(, groups)] "
             "plane of the cache"
         )
 
@@ -146,7 +155,6 @@ def qsa_store_quantized_rows(
         *flat.stride()[:2],
         *flat_scale.stride()[:2],
         *values.stride()[:2],
-        rows,
         flat.shape[0],
     )
     if fmt == _FMT_FP8:
@@ -404,7 +412,6 @@ def qsa_paged_mqa_logits(
             num_warps=num_warps,
         )
         return logits, visible_groups
-    # Fallback calls use the CUDA-core kernel.
     column_programs = min(
         triton.cdiv(columns, _SCORING_BLOCK_N), _SCORING_COLUMN_PROGRAMS
     )
@@ -605,8 +612,8 @@ def qsa_sparse_paged_gqa(
         q,
         k_cache,
         v_cache,
-        k_scale if kv_fp8 else None,
-        v_scale if kv_fp8 else None,
+        k_scale,
+        v_scale,
         logical_indices,
         block_table,
         token_to_request,

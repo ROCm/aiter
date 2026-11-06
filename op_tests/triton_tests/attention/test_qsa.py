@@ -202,20 +202,31 @@ def test_qsa_mfma_scorer_matches_vector_path(rows):
 # -- quantized caches and the stacked decode scorer -----------------------
 
 
+def _planes(fmt, pages, page_size=4, heads=2, dim=256):
+    """Zeroed cache and scale planes of `fmt` (no scale when unquantized)."""
+    from aiter.ops.qsa import qsa_cache_row_layout
+
+    layout = qsa_cache_row_layout(fmt, dim)
+    shape = (pages, page_size, heads)
+    cache = torch.zeros(*shape, layout.dim, device="cuda", dtype=layout.dtype)
+    if layout.scale_tail is None:
+        return cache, None
+    scale_shape = (*shape, *layout.scale_tail)
+    return cache, torch.zeros(scale_shape, device="cuda", dtype=layout.scale_dtype)
+
+
 def _store(fmt, values, page_rows):
     """Write `values` `[rows, heads, dim]` into a fresh paged cache of `fmt`."""
-    from aiter.ops.qsa import qsa_cache_row_layout, qsa_store_quantized_rows
+    from aiter.ops.qsa import qsa_store_quantized_rows
 
     rows, heads, dim = values.shape
-    pages = -(-rows // page_rows)
-    vdim, vdtype, tail, sdtype = qsa_cache_row_layout(fmt, dim)
-    cache = torch.zeros(pages, page_rows, heads, vdim, device="cuda", dtype=vdtype)
-    if tail is None:
+    cache, scale = _planes(fmt, -(-rows // page_rows), page_rows, heads, dim)
+    if scale is None:
         cache.view(-1, heads, dim)[:rows] = values
-        return cache, None
-    scale = torch.zeros(pages, page_rows, heads, *tail, device="cuda", dtype=sdtype)
-    slots = torch.arange(rows, device="cuda")
-    qsa_store_quantized_rows(cache, scale, slots, values)
+    else:
+        qsa_store_quantized_rows(
+            cache, scale, torch.arange(rows, device="cuda"), values
+        )
     return cache, scale
 
 
@@ -343,15 +354,6 @@ def test_qsa_fp4_writer_caps_the_scale_for_the_fp16_decode():
     )
 
 
-def _planes(fmt, pages, page_size=4):
-    """Zeroed cache and scale planes for 2 heads of head_dim 256."""
-    from aiter.ops.qsa import qsa_cache_row_layout
-
-    vdim, vdtype, tail, sdtype = qsa_cache_row_layout(fmt, 256)
-    cache = torch.zeros(pages, page_size, 2, vdim, device="cuda", dtype=vdtype)
-    return cache, torch.zeros(pages, page_size, 2, *tail, device="cuda", dtype=sdtype)
-
-
 def test_qsa_writer_rejects_bad_slots_and_planes():
     from aiter.ops.qsa import FP8_DTYPE, qsa_store_quantized_rows
 
@@ -447,7 +449,7 @@ def test_qsa_fp4_rows_need_a_power_of_two_head_dim():
 
     with pytest.raises(ValueError, match="power-of-two"):
         qsa_cache_row_layout("fp4", 96)
-    assert qsa_cache_row_layout("fp8", 96)[0] == 96
+    assert qsa_cache_row_layout("fp8", 96).dim == 96
     values = torch.randn(4, 1, 96, dtype=torch.float32, device="cuda").bfloat16()
     cache = torch.zeros(1, 4, 1, 48, dtype=torch.uint8, device="cuda")
     scale = torch.zeros(1, 4, 1, 3, dtype=torch.uint8, device="cuda")
@@ -910,7 +912,7 @@ def test_qsa_imports_without_a_gpu():
         "import aiter.ops.qsa as qsa\n"
         "import aiter.ops.triton.attention.qsa\n"
         "assert qsa.FP8_MAX is None\n"
-        "assert qsa.qsa_cache_row_layout('fp4', 128)[0] == 64\n"
+        "assert qsa.qsa_cache_row_layout('fp4', 128).dim == 64\n"
     )
     done = subprocess.run(
         [sys.executable, "-c", code],

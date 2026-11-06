@@ -164,10 +164,10 @@ _SELECT_SHAPES = [
 ]
 
 
-def bench_select(args, scoring_only=False):
+def bench_select(args):
     unit = "ms" if args.metric == "time" else "GB/s"
-    name = "logits" if scoring_only else "select"
-    fn_name = "qsa_paged_mqa_logits" if scoring_only else "qsa_select_paged_tokens"
+    name = "logits" if args.op == "logits" else "select"
+    fn_name = "qsa_paged_mqa_logits" if name == "logits" else "qsa_select_paged_tokens"
 
     config = triton.testing.Benchmark(
         x_names=["batch", "tokens_per_seq", "context_len"],
@@ -206,7 +206,7 @@ def bench_select(args, scoring_only=False):
             RATIO,
             **kwargs,
         )
-        if scoring_only:
+        if name == "logits":
             fn = lambda: qsa_paged_mqa_logits(
                 s["index_q"],
                 s["compressed"],
@@ -226,7 +226,7 @@ def bench_select(args, scoring_only=False):
             + columns * _row_bytes(args.index_dtype, INDEX_DIM)
             + rows * columns * 4  # fp32 logits
         )
-        if not scoring_only:
+        if name == "select":
             mem += (
                 rows * min(BUDGET // RATIO, columns) * 4  # int32 selected groups
                 + rows * (BUDGET + RATIO - 1) * 4  # int32 expanded output
@@ -367,11 +367,8 @@ def main():
     args = parse_args()
     torch.manual_seed(0)
 
-    if args.op in ("select", "all"):
+    if args.op in ("select", "logits", "all"):
         bench_select(args)
-
-    if args.op == "logits":
-        bench_select(args, scoring_only=True)
 
     if args.op in ("gqa", "all"):
         bench_gqa(args)
