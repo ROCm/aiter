@@ -255,8 +255,8 @@ def compile_one_config(**job):
                 **_weights(job, device),
             )
             moe.preload_aot_bundles()
-            # preload_aot_bundles() leaves out quantize(), which fixed-slot
-            # forward and the per-stage benchmarks call.
+            # preload_aot_bundles() leaves out the input quant kernel, which
+            # fixed-slot forward, quantize() and the per-stage benchmarks launch.
             moe.quantize(
                 torch.empty((2, job["model_dim"]), dtype=torch.bfloat16, device=device)
             )

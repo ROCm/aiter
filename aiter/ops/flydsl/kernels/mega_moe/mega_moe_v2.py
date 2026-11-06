@@ -36,7 +36,12 @@ from .mega_moe_config import (
 from .mega_moe_stage1 import stage1_output_nbytes
 from .mega_moe_stage2_aligned_pair import ALIGNED_PAIR_SCATTER_VEC
 from .quant import per_1x32_mx_quant
-from .weights import check_bindable, contiguous_weights, weight_spec
+from .weights import (
+    check_bindable,
+    check_forward_inputs,
+    contiguous_weights,
+    weight_spec,
+)
 
 __all__ = ["MegaMoEV2"]
 
@@ -193,7 +198,8 @@ class MegaMoEV2:
         if self._bundle_plan.small_m_mtprs:
             from .mega_moe_small_m import SmallMRuntime
 
-            # Own buffers and protocol state; weights are shared by pointer.
+            # Own protocol state and combine output; payload, GEMM1-output and
+            # combine-input storage come from the shared arenas; weights are shared by pointer.
             self._small_m_runtimes = [
                 SmallMRuntime(
                     rank=self.rank,
@@ -319,6 +325,11 @@ class MegaMoEV2:
         self._bound_w2_scale = value
         for runtime in self._fused_runtimes():
             runtime.w2_scale = value
+        # Build the small-input W2 dispatch table now, outside a graph capture, so
+        # a capture that follows a direct assignment finds it.
+        if not torch.cuda.is_current_stream_capturing():
+            for runtime in getattr(self, "_small_m_runtimes", ()):
+                runtime.w2_dispatch_table(self.w2, value)
 
     def select_layer_state(self, layer_slot: int) -> None:
         """Select the large-input protocol state for a shared operator layer."""
@@ -1063,12 +1074,7 @@ class MegaMoEV2:
         ret = result
         out_tok = ret[0] if isinstance(ret, (tuple, list)) else ret
         if out_tok is None:
-            cfg = self.comb_cfg
-            out_tok = (
-                self.comb_op.shmem_comb_out_tok.view(torch.int8)[: self.mtpr * cfg.combine_token_bytes]
-                .view(cfg.combine_dtype)
-                .view(self.mtpr, cfg.combine_token_view_dim)
-            )
+            out_tok = self.comb_op.combine_output(self.mtpr)
         return out_tok[:run_tokens] if slice_output else out_tok
 
     def forward(
@@ -1099,18 +1105,10 @@ class MegaMoEV2:
     ):
         """forward() on a given (route, capacity); tests pin a route through this,
         identically on every rank."""
-        run_tokens = int(x_bf16.shape[0])
-        if run_tokens > self.mtpr:
-            raise ValueError(f"run_tokens={run_tokens} > max_tok_per_rank={self.mtpr}")
-        if x_bf16.dtype != torch.bfloat16 or not x_bf16.is_contiguous():
-            raise ValueError("x_bf16 must be contiguous bfloat16")
-        if wts.dtype != torch.float32 or not wts.is_contiguous():
-            raise ValueError("wts must be contiguous float32")
-        if topk_ids.dtype != torch.int32 or not topk_ids.is_contiguous():
-            raise ValueError("topk_ids must be contiguous int32")
-        if any(t.device != self.dev for t in (x_bf16, wts, topk_ids)):
-            # A rank that faults on a foreign pointer would leave its peers waiting.
-            raise ValueError(f"x_bf16, wts and topk_ids must be on {self.dev}")
+        check_forward_inputs(
+            x_bf16, wts, topk_ids, max_rows=self.mtpr, model_dim=self.model_dim,
+            topk=self.topk, device=self.dev,
+        )
         # Every launch of the call -- quantization, prepare, Stage1, Stage2 and
         # combine -- runs on the caller's stream.
         with torch.cuda.stream(torch_stream(stream)):
@@ -1178,7 +1176,13 @@ class MegaMoEV2:
         self, x_q, scales, wts, topk_ids, *, stream=None, slice_output=True, mask_invalid_slots=None,
         max_tokens=None,
     ):
-        """forward() on input quantized by quantize(); the small-input route takes bf16 only."""
+        """forward() on input quantized by quantize().
+
+        The small-input route takes bf16 input only, so this entry plans among the
+        staged and large-input routes: for a max_tokens the small-input route would
+        serve, forward() and forward_prequant() take different routes (and every
+        rank must use the same entry for a call).
+        """
         run_tokens = int(x_q.shape[0])
         if run_tokens > self.mtpr:
             raise ValueError(f"run_tokens={run_tokens} > max_tok_per_rank={self.mtpr}")
@@ -1205,6 +1209,7 @@ class MegaMoEV2:
         from .mega_moe_stage2 import (
             preload_mega_moe_stage2,
             run_mega_moe_stage2,
+            stage2_p2p_row_nbytes,
         )
         from .mega_moe_stage2_aligned_pair import (
             preload_mega_moe_stage2_aligned_pair,
@@ -1229,11 +1234,7 @@ class MegaMoEV2:
         self._g2_residual_done = torch.cuda.Event()
         self._g2_invariants_by_quant = {}
         for p2p_quant in ("none", "fp8_blockwise_1x32"):
-            p2p_row_nbytes = (
-                int(comb_cfg.hidden_dim) + int(comb_cfg.hidden_dim) // 32
-                if p2p_quant == "fp8_blockwise_1x32"
-                else int(comb_cfg.hidden_dim) * 2
-            )
+            p2p_row_nbytes = stage2_p2p_row_nbytes(comb_cfg.hidden_dim, p2p_quant)
             self._g2_invariants_by_quant[p2p_quant] = {
                 "model_dim": int(comb_cfg.hidden_dim), "inter_dim": int(self.inter_dim),
                 "experts": int(comb_cfg.num_experts_per_rank), "topk": int(k), "rank": int(comb_cfg.rank),

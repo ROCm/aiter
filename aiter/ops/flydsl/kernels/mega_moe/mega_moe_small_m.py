@@ -3,12 +3,12 @@
 # ruff: noqa: B023, SIM102
 """MegaMoEV2 small-input path: quant, dispatch, GEMM1, GEMM2 and combine fused into one kernel.
 
-Dispatch writes each routed token straight into its expert's fixed slot on the destination rank; the
-runtime owns its buffers and protocol state and serves up to 512 tokens per rank.
+Dispatch writes each routed token straight into its expert's fixed slot on the destination rank. The
+runtime serves up to 512 tokens per rank and owns its protocol state and combine output; inside
+MegaMoEV2 its payload, GEMM1-output and combine-input storage are views of the instance's shared arenas.
 """
 
 import functools
-from dataclasses import replace
 from enum import IntEnum
 
 import flydsl.compiler as flyc
@@ -40,7 +40,6 @@ from .mega_moe_config import (
     SMALL_M_MAX_MTPR,
     MegaMoEConfig,
     fused_layout_supported,
-    nearest_token_bucket,
     select_fused_config,
     small_m_cu_supported,
 )
@@ -54,7 +53,12 @@ from .mega_moe_fused_gemm import (
 )
 from .mega_moe_stage1 import _validate_dispatch_capacity, stage1_output_buffers
 from .mega_moe_stage2 import _fp8_scale_for_leader, _stage2_lds_bytes
-from .weights import check_bindable, contiguous_weights, weight_spec
+from .weights import (
+    check_bindable,
+    check_forward_inputs,
+    contiguous_weights,
+    weight_spec,
+)
 
 __all__ = ["SmallMRuntime"]
 
@@ -1404,8 +1408,6 @@ def run_mega_moe_stage1(out, x, w, scale_x, scale_w, sorted_token_ids, expert_id
 
 # Combine reducer CTAs of the single kernel.
 _COMBINE_REDUCERS = 256
-# Token bucket from which the expert m-tile is 64 rows instead of 32.
-_BM64_MIN_BUCKET = 256
 # Routed rows a rank receives (before tile padding) from which the streaming GEMM1 / GEMM2 bodies give way to
 # cached-weight ones, whose experts then span enough m-tiles to reuse their weights. Measured: cached loads
 # cost uniform routing at 384 tokens (2304 rows) and gain from 448 (2688).
@@ -1419,36 +1421,6 @@ _HOT_EXPERT_MIN_ROWS = 256
 # Bits of the plan word's low half that carry the two decisions above (num_valid < 2^29).
 _PLAN_CACHED_W_BIT = 29
 _PLAN_FP8_ROWS_BIT = 30
-
-
-def small_m_config(
-    tokens: int, mtpr: int, *, experts_per_rank: int, model_dim: int, inter_dim: int
-):
-    """The kernel config of a small-input call with ``tokens`` rows on an ``mtpr`` runtime."""
-    config = select_fused_config(
-        tokens,
-        mtpr,
-        experts_per_rank=experts_per_rank,
-        model_dim=model_dim,
-        inter_dim=inter_dim,
-    )
-    if config.stage2.persist:
-        # Buckets >= 128 select a persistent GEMM2; the kernel runs GEMM2 in its own grid with NT B loads.
-        config = replace(
-            config,
-            stage2=replace(
-                config.stage2, block_n=256, persist=False, persist_cu=0, use_nt=True
-            ),
-        )
-    if nearest_token_bucket(max(tokens, 1), FUSED_TOKEN_BUCKETS) >= _BM64_MIN_BUCKET:
-        # 64-row expert tiles: at ~35+ rows per expert a 32-row tile splits every expert in two and streams its
-        # weights twice.
-        config = replace(
-            config,
-            stage1=replace(config.stage1, sort_block_m=64),
-            stage2=replace(config.stage2, block_m=64),
-        )
-    return config
 
 
 class SmallMRuntime:
@@ -1676,9 +1648,7 @@ class SmallMRuntime:
         self._s1_disp = disp
 
     def _select_config(self, tokens: int) -> MegaMoEConfig:
-        config = small_m_config(
-            tokens, self.mtpr, experts_per_rank=self.epr, model_dim=self.model_dim, inter_dim=self.inter_dim
-        )
+        config = select_fused_config(tokens, self.mtpr)
         self._active_config = config
         return config
 
@@ -1720,24 +1690,9 @@ class SmallMRuntime:
             self._launch(config, 1, x_bf16, topk_ids, wts, stream, preload=True)
 
     def forward(self, x_bf16, wts, topk_ids, *, stream=None, slice_output=True):
-        run_tokens = int(x_bf16.shape[0])
-        if run_tokens > self.mtpr:
-            raise ValueError(f"run_tokens={run_tokens} > max_tok_per_rank={self.mtpr}")
-        if x_bf16.dtype != torch.bfloat16 or not x_bf16.is_contiguous():
-            raise ValueError("x_bf16 must be contiguous bfloat16")
-        if tuple(x_bf16.shape) != (run_tokens, self.model_dim):
-            raise ValueError(f"x_bf16 must have shape ({run_tokens}, {self.model_dim})")
-        if wts.dtype != torch.float32 or not wts.is_contiguous():
-            raise ValueError("wts must be contiguous float32")
-        if tuple(wts.shape) != (run_tokens, self.topk):
-            raise ValueError(f"wts must have shape ({run_tokens}, {self.topk})")
-        if topk_ids.dtype != torch.int32 or not topk_ids.is_contiguous():
-            raise ValueError("topk_ids must be contiguous int32")
-        if tuple(topk_ids.shape) != (run_tokens, self.topk):
-            raise ValueError(f"topk_ids must have shape ({run_tokens}, {self.topk})")
-        if any(t.device != self.dev for t in (x_bf16, wts, topk_ids)):
-            # A rank that faults on a foreign pointer would leave its peers waiting.
-            raise ValueError(f"x_bf16, wts and topk_ids must be on {self.dev}")
+        run_tokens = check_forward_inputs(
+            x_bf16, wts, topk_ids, max_rows=self.mtpr, model_dim=self.model_dim, topk=self.topk, device=self.dev
+        )
         if run_tokens == 0:
             x_bf16, wts, topk_ids = self._idle_inputs
         if stream is None:
@@ -1749,12 +1704,7 @@ class SmallMRuntime:
         # Ranks may use different token buckets in one call; an idle rank uses the 1-token bucket.
         config = self._select_config(max(run_tokens, 1))
         self._launch(config, run_tokens, x_bf16, topk_ids, wts, stream)
-        cfg = self.comb_cfg
-        out_tok = (
-            self.comb_op.shmem_comb_out_tok.view(torch.int8)[: self.mtpr * cfg.combine_token_bytes]
-            .view(cfg.combine_dtype)
-            .view(self.mtpr, cfg.combine_token_view_dim)
-        )
+        out_tok = self.comb_op.combine_output(self.mtpr)
         return out_tok[:run_tokens] if slice_output else out_tok
 
     __call__ = forward
