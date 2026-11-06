@@ -2153,6 +2153,71 @@ def supports_stage2_overrides(metadata: "MOEMetadata") -> bool:
     return _stage2_override_kind(metadata.stage2) is not None
 
 
+def _scaled_dim(dim: int, cols: int, ref_cols: int) -> int:
+    """The logical width of a tensor of ``cols`` stored columns, given that
+    ``ref_cols`` stored columns of the same dtype hold ``dim`` elements."""
+    if (dim * cols) % ref_cols:
+        raise ValueError(
+            f"{cols} stored columns do not hold whole elements "
+            f"({ref_cols} hold {dim})"
+        )
+    return dim * cols // ref_cols
+
+
+def _check_stage2_operands(
+    inputs: "MoeStage2Inputs",
+    w2: torch.Tensor | None,
+    w2_scale: torch.Tensor | None,
+    a2: torch.Tensor | None,
+    a2_scale: torch.Tensor | None,
+) -> None:
+    """Raise ``ValueError`` unless the replacing stage 2 operands have the
+    dtype and rows of the ones they replace: ``a2`` the same routes (or sorted
+    slots), ``w2`` the same experts, and a GEMM reduction dim that matches.
+    Only the scales' row counts are checked: the shuffled E8M0 layout pads
+    rows and groups."""
+    old_a2, old_a2_scale = inputs.a2, inputs.a2_scale
+    old_w2 = inputs._args[1]
+    new_a2 = old_a2 if a2 is None else a2
+    new_w2 = old_w2 if w2 is None else w2
+
+    def fail(msg: str) -> None:
+        raise ValueError(f"fused_moe_stage2: {msg}")
+
+    for name, new, old in (("a2", a2, old_a2), ("w2", w2, old_w2)):
+        if new is not None and (new.dtype != old.dtype or new.dim() != old.dim()):
+            fail(
+                f"{name} is a {new.dim()}-d {new.dtype} tensor; the one it "
+                f"replaces is a {old.dim()}-d {old.dtype} tensor"
+            )
+    if a2 is not None and a2.shape[:-1] != old_a2.shape[:-1]:
+        fail(
+            f"a2 has rows {tuple(a2.shape[:-1])}, stage 1 produced "
+            f"{tuple(old_a2.shape[:-1])}"
+        )
+    if w2 is not None and w2.shape[0] != old_w2.shape[0]:
+        fail(f"w2 has {w2.shape[0]} experts, stage 1 ran {old_w2.shape[0]}")
+    # w2's last dim and a2's are the GEMM's reduction dim, each in its dtype's
+    # packing: they must grow or shrink together.
+    if new_w2.shape[-1] * old_a2.shape[-1] != new_a2.shape[-1] * old_w2.shape[-1]:
+        fail(
+            f"w2 last dim {new_w2.shape[-1]} does not match a2 last dim "
+            f"{new_a2.shape[-1]} (stage 1: {old_w2.shape[-1]} and "
+            f"{old_a2.shape[-1]})"
+        )
+    if a2 is not None and a2.shape[-1] != old_a2.shape[-1] and a2_scale is None:
+        fail("an a2 of another width needs its a2_scale")
+    if w2 is not None and w2.shape != old_w2.shape and w2_scale is None:
+        fail("a w2 of another shape needs its w2_scale")
+    if a2_scale is not None and (
+        old_a2_scale is None or a2_scale.shape[0] != old_a2_scale.shape[0]
+    ):
+        fail(
+            f"a2_scale has {a2_scale.shape[0]} rows, stage 1 produced "
+            f"{None if old_a2_scale is None else old_a2_scale.shape[0]}"
+        )
+
+
 def _capture_stage2(*, ordinary_stage2, stage2_args, stage2_kwargs):
     return ordinary_stage2, stage2_args, stage2_kwargs
 
@@ -2248,6 +2313,11 @@ def fused_moe_stage2(
       layout, any number of output rows ``model_dim``) instead.
     * ``a2`` / ``a2_scale``: run it on this intermediate (same layout and
       rows, any width) instead, e.g. ``inputs.a2`` gathered across ranks.
+
+    A replacing operand must have the dtype and rows of the one it replaces
+    (``a2`` the same routes or sorted slots, ``w2`` the same experts), the
+    last dims of ``w2`` and ``a2`` must still match, and an operand of another
+    shape needs its scale; otherwise this raises ``ValueError``.
     """
     stage2 = inputs._stage2
     w1, w2_, sorted_ids, sorted_expert_ids, num_valid_ids, moe_buf, topk = inputs._args
@@ -2261,13 +2331,18 @@ def fused_moe_stage2(
                 f"stage2 {stage2} does not support per_slot or replaced "
                 "operands; see supports_stage2_overrides"
             )
+        _check_stage2_operands(inputs, w2, w2_scale, a2, a2_scale)
         if w2_scale is not None:
             kwargs["w2_scale"] = w2_scale.view(dtypes.fp8_e8m0)
-        # The v2 kernel takes the GEMM shape from these; v1 from the operands.
-        if w2 is not None:
+        # The v2 kernel takes the GEMM shape from its config; v1 from the
+        # operands.
+        config = getattr(stage2, "keywords", {})
+        if w2 is not None and "model_dim" in config:
             kwargs["model_dim"] = w2.shape[1]
-        if a2 is not None:
-            kwargs["inter_dim"] = a2.shape[-1] * 2
+        if a2 is not None and "inter_dim" in config:
+            kwargs["inter_dim"] = _scaled_dim(
+                config["inter_dim"], a2.shape[-1], inputs.a2.shape[-1]
+            )
     token_num, dtype, device = moe_buf.shape[0], moe_buf.dtype, moe_buf.device
     model_dim = w2_.shape[1]
     if per_slot:

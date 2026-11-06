@@ -188,6 +188,39 @@ def test_replaced_a2(experts):
     assert not out.any()
 
 
+def test_rejected_operand_mismatch(experts):
+    """Replacing operands whose rows, dtype or widths do not fit stage 1's
+    raise ValueError before any kernel runs."""
+    token = 2048
+    if not supports_stage2_overrides(_repeated_input_config(token)):
+        pytest.skip("no FlyDSL MXFP4 stage2 for this shape")
+    x, topk_weights, topk_ids = _routes(token)
+    inputs = fused_moe_stage1(
+        x,
+        topk_weight=topk_weights,
+        topk_ids=topk_ids,
+        config_shape=(token * TOPK, 1),
+        **_kwargs(experts),
+    )
+    a2, a2_scale = inputs.a2, inputs.a2_scale
+    (w2, w2_scale), _ = experts["w2_rows"]
+    a2_u8 = a2.view(torch.uint8)
+    wide_a2 = torch.cat((a2_u8, a2_u8), dim=-1).view(a2.dtype)
+    cases = {
+        "a2 rows": {"a2": a2[:-1]},
+        "a2 dtype": {"a2": a2.view(torch.int8)},
+        "a2 width without a2_scale": {"a2": wide_a2},
+        "a2_scale rows": {"a2_scale": a2_scale[:-32]},
+        "w2 experts": {"w2": w2[:-1], "w2_scale": w2_scale},
+        "w2 without w2_scale": {"w2": w2},
+        "w2 and a2 widths": {"w2": w2[..., :-16], "w2_scale": w2_scale},
+    }
+    for name, overrides in cases.items():
+        with pytest.raises(ValueError):
+            fused_moe_stage2(inputs, per_slot=True, **overrides)
+            pytest.fail(f"{name}: accepted")
+
+
 def _cat_scale_columns(scales: list[torch.Tensor]) -> torch.Tensor:
     """Concatenate shuffled E8M0 scales [rows, groups] along groups: each
     32-row band stores its 32 x 8 tiles contiguously in group order."""
