@@ -883,18 +883,17 @@ class AttentionProgram:
 @triton.jit
 def initial_row_max(cfg, sink_ptr, query_offset_1, query_mask_1, segm_idx):
     M = tl.full([cfg.BLOCK_M], float("-inf"), dtype=tl.float32)
-    if cfg.USE_SINKS:
-        # only the first segment counts the sink
-        if cfg.NUM_SEGMENTS_PER_SEQ == 1 or segm_idx == 0:
-            # Prescale with RCP_LN2, needed for exp2
-            M = (
-                tl.load(
-                    sink_ptr + query_offset_1,
-                    mask=query_mask_1,
-                    other=float("-inf"),
-                ).to(dtype=tl.float32)
-                * cfg.RCP_LN2
-            )
+    # only the first segment counts the sink
+    if cfg.USE_SINKS and (cfg.NUM_SEGMENTS_PER_SEQ == 1 or segm_idx == 0):
+        # Prescale with RCP_LN2, needed for exp2
+        M = (
+            tl.load(
+                sink_ptr + query_offset_1,
+                mask=query_mask_1,
+                other=float("-inf"),
+            ).to(dtype=tl.float32)
+            * cfg.RCP_LN2
+        )
     return M
 
 
