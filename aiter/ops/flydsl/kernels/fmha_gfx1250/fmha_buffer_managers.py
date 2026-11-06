@@ -421,7 +421,9 @@ def _async_band_descriptor(
         ) * elem_bytes
         gptr = create_llvm_ptr(base_i64 + fx.Int64(g_base), address_space=1)
         lds_ptr = create_llvm_ptr(
-            lds_base + band_row * fx.Int32(padded_row_bytes) + chunk * fx.Int32(_CHUNK_BYTES),
+            lds_base
+            + band_row * fx.Int32(padded_row_bytes)
+            + chunk * fx.Int32(_CHUNK_BYTES),
             address_space=3,
         )
         for c in fx.range_constexpr(hdim // _WR_TILE_HD):
@@ -604,7 +606,9 @@ def _tdm_gather_band_descriptor(
         num_producer_warps=ctx.num_producer_warps,
     )
     _assert_multiple("band rows", num_rows, gather_rows)
-    assert page_size & (page_size - 1) == 0, f"page_size {page_size} is not a power of two"
+    assert (
+        page_size & (page_size - 1) == 0
+    ), f"page_size {page_size} is not a power of two"
     rows_left = fx.max(valid - band_r0, fx.Int32(0))
 
     # A page contributes page_size CONSECUTIVE pool rows, so once a page covers at least
@@ -1137,7 +1141,9 @@ class KManagerV1(_AsyncTransport):
         self.qk_hdim = qk_hdim  # compile-time
         self.n_block = n_block  # compile-time
         self.pad_elems = _AB_PAD_BYTES // self.elem_bytes
-        self.padded_row_elems = qk_hdim + self.pad_elems  # padded LDS row stride (elems)
+        self.padded_row_elems = (
+            qk_hdim + self.pad_elems
+        )  # padded LDS row stride (elems)
         self.padded_row_bytes = self.padded_row_elems * self.elem_bytes
 
     @property
@@ -1524,7 +1530,8 @@ class QManagerV2:
         for qt in range(self.q_tiles_per_wave):
             for tile in range(self.k_tiles):
                 imm_lo = (
-                    qt * _WMMA_M * self.padded_row_bytes + tile * self.wmma_k * self.elem_bytes
+                    qt * _WMMA_M * self.padded_row_bytes
+                    + tile * self.wmma_k * self.elem_bytes
                 )
                 imm_hi = imm_lo + 2 * _CHUNK_BYTES  # next group: 32 B either width
                 p_lo = base if imm_lo == 0 else fx.add_offset(base, imm_lo)
@@ -1949,7 +1956,11 @@ class OManagerV2:
             )
             gbase = fx.add_offset(fx.get_iter(ptr_O), off)
             tile = (num_seq, heads_per_tile, self.padded_row_elems)
-            lds_strides = (heads_per_tile * self.padded_row_elems, self.padded_row_elems, 1)
+            lds_strides = (
+                heads_per_tile * self.padded_row_elems,
+                self.padded_row_elems,
+                1,
+            )
             g_view = fx.Tensor(
                 fx.make_view(
                     gbase,

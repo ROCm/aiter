@@ -329,7 +329,6 @@ def _softmax(
     neg_inf = fx.Float32(float("-inf"))
     _defer = ENABLE_DEFER_RESCALE and RESCALE_THRESHOLD >= 0.0
 
-
     # permlanex16 selectors: identity cross-16 gather (nibbles 0..15) => lane l<->l^16.
     sel_lo, sel_hi = _raw(fx.Int32(0x76543210)), _raw(fx.Int32(0xFEDCBA98))
 
@@ -410,7 +409,9 @@ def _softmax(
         # wave-uniform for that branch. `>` lowers to ordered OGT, so a fully-masked
         # lane's -inf - -inf = NaN compares false and never forces a rescale.
         if _defer:
-            need = fsub_fastmath(row_max, m_prev) > fx.Float32(RESCALE_THRESHOLD * LOG2E)
+            need = fsub_fastmath(row_max, m_prev) > fx.Float32(
+                RESCALE_THRESHOLD * LOG2E
+            )
             # Select on the per-lane `need`, not the ballot: every lane owns its own q row
             # (the l<->l^16 pair agrees after the peer reduce), so staleness is per-lane
             # and the ballot is only the caller's branch condition. That leaves the branch
@@ -434,7 +435,10 @@ def _softmax(
     # uninterrupted run needs none of the v_nop padding an interleaved one does. ----
     # Raw subf, no ninf fast-math: masked s is -inf and must stay -inf.
     diff_list = [
-        [fx.Float32(arith.subf(_raw(sv), _raw(m_new_list[r]))) for sv in s_masked_list[r]]
+        [
+            fx.Float32(arith.subf(_raw(sv), _raw(m_new_list[r])))
+            for sv in s_masked_list[r]
+        ]
         for r in range(num_q_tiles)
     ]
     p_flat_list = [[exp2_fastmath(d) for d in diff] for diff in diff_list]
@@ -718,7 +722,6 @@ def _build_managers(
     )
 
 
-
 def _attention_prologue(
     *,
     qk_hdim,
@@ -902,7 +905,6 @@ def _attention_prologue(
 
     def _kv_valid(t):
         return (t < last_tile_idx).select(fx.Int32(n_block), tail_valid)
-
 
     # ---- Prologue. All K/V address arithmetic is pure (no memory op until
     # ``.async_load()``), so it is hoisted into the Q global-load shadow and the copies
@@ -1107,7 +1109,9 @@ def _hi_tdm_pipeline(tensorcnt):
     for k in range(tensorcnt):
         groups.append((_SG_TDM, 1))
         if k < tensorcnt - 1:
-            groups.append((_SG_VALU, _SG_HI_VALU_GAPS[min(k, len(_SG_HI_VALU_GAPS) - 1)]))
+            groups.append(
+                (_SG_VALU, _SG_HI_VALU_GAPS[min(k, len(_SG_HI_VALU_GAPS) - 1)])
+            )
     return groups
 
 
@@ -1121,9 +1125,9 @@ def _tdm_tap(desc):
     """
     if desc.tensorcnt < 2:
         return None, desc.async_load
-    assert desc.tensorcnt <= len(_TDM_TAP_FRAG), (
-        f"{desc.tensorcnt} TDM copies but only {len(_TDM_TAP_FRAG)} tap slots"
-    )
+    assert desc.tensorcnt <= len(
+        _TDM_TAP_FRAG
+    ), f"{desc.tensorcnt} TDM copies but only {len(_TDM_TAP_FRAG)} tap slots"
     at = {_TDM_TAP_FRAG[k]: k for k in range(desc.tensorcnt)}
 
     def tap(i):
@@ -1288,7 +1292,9 @@ def _attention_core_multi_kv_tiles(
             + [_raw(fx.full(8 * d_tiles, 0.0, fx.Float32))]
             + [
                 _raw(
-                    fx.full(8, float("-inf") if _is_lagging_softmax else 0.0, fx.Float32)
+                    fx.full(
+                        8, float("-inf") if _is_lagging_softmax else 0.0, fx.Float32
+                    )
                 )
                 for _ in range(num_kv_frags)
             ]
@@ -2372,12 +2378,8 @@ def kv_split_bytes(qk_hdim, v_hdim, n_block, elem_dtype):
     (16 B for K, 32 B for V)."""
     k_cls = KManagerV2 if USE_TDM_LOADER else KManagerV1
     v_cls = VManagerV2 if USE_TDM_LOADER else VManagerV1
-    k_mgr = k_cls(
-        qk_hdim=qk_hdim, n_block=n_block, elem_dtype=elem_dtype
-    )
-    v_mgr = v_cls(
-        v_hdim=v_hdim, n_block=n_block, elem_dtype=elem_dtype
-    )
+    k_mgr = k_cls(qk_hdim=qk_hdim, n_block=n_block, elem_dtype=elem_dtype)
+    v_mgr = v_cls(v_hdim=v_hdim, n_block=n_block, elem_dtype=elem_dtype)
     return (
         k_mgr.get_lds_size_in_byte() // KV_LDS_SPLITS,
         v_mgr.get_lds_size_in_byte() // KV_LDS_SPLITS,
@@ -3589,9 +3591,9 @@ def flash_attn_paged_m32x8(
     # per-token stride at both ranks.
     assert k.stride(0) == page_size * k.stride(-3) and v.stride(
         0
-    ) == page_size * v.stride(-3), (
-        "paged k/v need contiguous pages (stride(0) == page_size * stride(-3))"
-    )
+    ) == page_size * v.stride(
+        -3
+    ), "paged k/v need contiguous pages (stride(0) == page_size * stride(-3))"
     num_pool_rows = k.shape[0] * page_size
     num_page_entries = kv_page_indices.numel()
     # Token-row view: what the gather addresses, and one variant per page_size
@@ -3733,7 +3735,6 @@ def flash_attn_paged_m32x8(
     if return_lse:
         return out, lse
     return out
-
 
 
 def flash_attn_batch_m32x8(

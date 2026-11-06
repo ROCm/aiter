@@ -377,7 +377,6 @@ def _softmax(
     neg_inf = fx.Float32(float("-inf"))
     _defer = ENABLE_DEFER_RESCALE and RESCALE_THRESHOLD >= 0.0
 
-
     # permlanex16 selectors: identity cross-16 gather (nibbles 0..15) => lane l<->l^16.
     sel_lo, sel_hi = _raw(fx.Int32(0x76543210)), _raw(fx.Int32(0xFEDCBA98))
 
@@ -462,7 +461,9 @@ def _softmax(
         # wave-uniform for that branch. `>` lowers to ordered OGT, so a fully-masked
         # lane's -inf - -inf = NaN compares false and never forces a rescale.
         if _defer:
-            need = fsub_fastmath(row_max, m_prev) > fx.Float32(RESCALE_THRESHOLD * LOG2E)
+            need = fsub_fastmath(row_max, m_prev) > fx.Float32(
+                RESCALE_THRESHOLD * LOG2E
+            )
             # Select on the per-lane `need`, not the ballot: every lane owns its own q row
             # (the l<->l^16 pair agrees after the peer reduce), so staleness is per-lane
             # and the ballot is only the caller's branch condition. That leaves the branch
@@ -2395,12 +2396,8 @@ def kv_split_bytes(qk_hdim, v_hdim, n_block, kv_dtype):
     (16 B for K, 32 B for V)."""
     k_cls = KManagerV2 if USE_TDM_LOADER else KManagerV1
     v_cls = VManagerV2 if USE_TDM_LOADER else VManagerV1
-    k_mgr = k_cls(
-        qk_hdim=qk_hdim, n_block=n_block, elem_dtype=kv_dtype
-    )
-    v_mgr = v_cls(
-        v_hdim=v_hdim, n_block=n_block, elem_dtype=kv_dtype
-    )
+    k_mgr = k_cls(qk_hdim=qk_hdim, n_block=n_block, elem_dtype=kv_dtype)
+    v_mgr = v_cls(v_hdim=v_hdim, n_block=n_block, elem_dtype=kv_dtype)
     return (
         k_mgr.get_lds_size_in_byte() // KV_LDS_SPLITS,
         v_mgr.get_lds_size_in_byte() // KV_LDS_SPLITS,
@@ -3732,9 +3729,9 @@ def flash_attn_paged_a8w8_m32x8(
     # per-token stride at both ranks.
     assert k.stride(0) == page_size * k.stride(-3) and v.stride(
         0
-    ) == page_size * v.stride(-3), (
-        "paged k/v need contiguous pages (stride(0) == page_size * stride(-3))"
-    )
+    ) == page_size * v.stride(
+        -3
+    ), "paged k/v need contiguous pages (stride(0) == page_size * stride(-3))"
     num_pool_rows = k.shape[0] * page_size
     num_page_entries = kv_page_indices.numel()
     # Token-row view: what the gather addresses, and one variant per page_size

@@ -278,9 +278,11 @@ def run_perf(case, warmup, repeat, fix_init=None):
         k = _randn((num_blocks, page, Hkv, d_qk), dtype, device, fix_init)
         v = _randn((num_blocks, page, Hkv, d_v), dtype, device, fix_init)
         # permuted, so a kernel that assumes sequential pages shows up here
-        page_ids = torch.randperm(num_blocks, device=device).int()[
-            : pages_per_seq * B
-        ].contiguous()
+        page_ids = (
+            torch.randperm(num_blocks, device=device)
+            .int()[: pages_per_seq * B]
+            .contiguous()
+        )
         cu_q = torch.arange(0, (B + 1) * sq, sq, dtype=torch.int32, device=device)
         kv_indptr = torch.arange(
             0, (B + 1) * pages_per_seq, pages_per_seq, dtype=torch.int32, device=device
@@ -560,16 +562,56 @@ CASES += [dict(_c, dtype="bf8") for _c in CASES]
 # split K into two gather segments against a single-segment V, so the halves disagree on
 # tensorcnt).
 _PAGED_BASE = [
-    {"layout": "paged", "B": 1, "sq": 4096, "sk": 4096, "Hq": 8, "Hkv": 8,
-     "causal": True, "desc": "4k causal, single batch"},
-    {"layout": "paged", "B": 4, "sq": 4096, "sk": 4096, "Hq": 8, "Hkv": 8,
-     "causal": True, "desc": "4k causal, multi-batch (paged analogue of case 10)"},
-    {"layout": "paged", "B": 4, "sq": 4096, "sk": 4096, "Hq": 16, "Hkv": 2,
-     "causal": True, "desc": "4k causal, GQA 8x"},
-    {"layout": "paged", "B": 1, "sq": 897, "sk": 4097, "Hq": 8, "Hkv": 8,
-     "causal": True, "desc": "odd sq!=sk, causal (chunked-prefill-like)"},
-    {"layout": "paged", "B": 2, "sq": 2048, "sk": 2048, "Hq": 8, "Hkv": 8,
-     "causal": False, "desc": "2k non-causal"},
+    {
+        "layout": "paged",
+        "B": 1,
+        "sq": 4096,
+        "sk": 4096,
+        "Hq": 8,
+        "Hkv": 8,
+        "causal": True,
+        "desc": "4k causal, single batch",
+    },
+    {
+        "layout": "paged",
+        "B": 4,
+        "sq": 4096,
+        "sk": 4096,
+        "Hq": 8,
+        "Hkv": 8,
+        "causal": True,
+        "desc": "4k causal, multi-batch (paged analogue of case 10)",
+    },
+    {
+        "layout": "paged",
+        "B": 4,
+        "sq": 4096,
+        "sk": 4096,
+        "Hq": 16,
+        "Hkv": 2,
+        "causal": True,
+        "desc": "4k causal, GQA 8x",
+    },
+    {
+        "layout": "paged",
+        "B": 1,
+        "sq": 897,
+        "sk": 4097,
+        "Hq": 8,
+        "Hkv": 8,
+        "causal": True,
+        "desc": "odd sq!=sk, causal (chunked-prefill-like)",
+    },
+    {
+        "layout": "paged",
+        "B": 2,
+        "sq": 2048,
+        "sk": 2048,
+        "Hq": 8,
+        "Hkv": 8,
+        "causal": False,
+        "desc": "2k non-causal",
+    },
 ]
 CASES += [
     dict(_c, d_qk=_d, d_v=_d, page=_p)
@@ -583,21 +625,59 @@ CASES += [
 # page_size 1 a 2^17 sequence is ~131k blocks. The short-q/long-kv rows are the shape
 # prefix caching actually produces.
 _PAGED_LARGE = [
-    {"layout": "paged", "B": 4, "sq": 16384, "sk": 16384, "Hq": 8, "Hkv": 8,
-     "causal": True, "desc": "16k causal, multi-batch (paged case 10)"},
-    {"layout": "paged", "B": 1, "sq": 65536, "sk": 65536, "Hq": 4, "Hkv": 1,
-     "causal": True, "desc": "64k causal, MQA long context"},
-    {"layout": "paged", "B": 1, "sq": 131071, "sk": 131071, "Hq": 4, "Hkv": 1,
-     "causal": True, "desc": "odd ~2^17 causal, MQA long context"},
-    {"layout": "paged", "B": 1, "sq": 897, "sk": 65537, "Hq": 8, "Hkv": 8,
-     "causal": True, "desc": "short q into a long cache (prefix caching)"},
-    {"layout": "paged", "B": 8, "sq": 1, "sk": 32768, "Hq": 8, "Hkv": 1,
-     "causal": True, "desc": "decode-shaped q=1 into a long cache"},
+    {
+        "layout": "paged",
+        "B": 4,
+        "sq": 16384,
+        "sk": 16384,
+        "Hq": 8,
+        "Hkv": 8,
+        "causal": True,
+        "desc": "16k causal, multi-batch (paged case 10)",
+    },
+    {
+        "layout": "paged",
+        "B": 1,
+        "sq": 65536,
+        "sk": 65536,
+        "Hq": 4,
+        "Hkv": 1,
+        "causal": True,
+        "desc": "64k causal, MQA long context",
+    },
+    {
+        "layout": "paged",
+        "B": 1,
+        "sq": 131071,
+        "sk": 131071,
+        "Hq": 4,
+        "Hkv": 1,
+        "causal": True,
+        "desc": "odd ~2^17 causal, MQA long context",
+    },
+    {
+        "layout": "paged",
+        "B": 1,
+        "sq": 897,
+        "sk": 65537,
+        "Hq": 8,
+        "Hkv": 8,
+        "causal": True,
+        "desc": "short q into a long cache (prefix caching)",
+    },
+    {
+        "layout": "paged",
+        "B": 8,
+        "sq": 1,
+        "sk": 32768,
+        "Hq": 8,
+        "Hkv": 1,
+        "causal": True,
+        "desc": "decode-shaped q=1 into a long cache",
+    },
 ]
 CASES += [
-    dict(_c, d_qk=128, d_v=128, page=_p)
-    for _p in (1, 16, 1024)
-    for _c in _PAGED_LARGE
+    dict(_c, d_qk=128, d_v=128, page=_p) for _p in (1, 16, 1024) for _c in _PAGED_LARGE
 ]
 # 8-bit paged, appended last so every id above keeps its number. The bf8 duplication
 # above runs before the paged blocks exist, so these would otherwise be bf16 only.

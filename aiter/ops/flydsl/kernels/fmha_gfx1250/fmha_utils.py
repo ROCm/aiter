@@ -130,7 +130,9 @@ def s_buffer_load(ptr, offset, size, dtype=fx.Int32, *, num_records_bytes=None):
     rejects it). Returns a python list, indexable at trace time.
     """
     assert size >= 1, f"size must be positive, got {size}"
-    assert dtype.width == 32, f"s_buffer_load handles 4-byte elements, got {dtype.width}"
+    assert (
+        dtype.width == 32
+    ), f"s_buffer_load handles 4-byte elements, got {dtype.width}"
     # kernel tensor args arrive as memrefs; get_iter is the pointer behind one.
     base = ptr if isinstance(ptr, fx.Pointer) else fx.get_iter(ptr)
     rsrc = buffer_ops.create_buffer_resource_from_addr(
@@ -140,7 +142,9 @@ def s_buffer_load(ptr, offset, size, dtype=fx.Int32, *, num_records_bytes=None):
     out, taken = [], 0
     while taken < size:
         width = next(w for w in _S_BUFFER_WIDTHS if w <= size - taken)
-        word = buffer_ops.buffer_load(rsrc, base + taken, vec_width=width, is_scalar=True)
+        word = buffer_ops.buffer_load(
+            rsrc, base + taken, vec_width=width, is_scalar=True
+        )
         raw = [word] if width == 1 else [Vec(word)[i] for i in range(width)]
         out += raw if dtype is fx.Int32 else [v.bitcast(dtype) for v in raw]
         taken += width
@@ -514,9 +518,7 @@ def _o_manager(*, v_hdim, gqa_ratio, num_q_tiles_per_wave, elem_dtype):
     Two waves share a chunk at 0 and LDS_QO_BYTES, and the upper one must stop short of
     the next chunk -- that clearance is what keeps O off the V rows a dead carried ring
     head may still be reading."""
-    _o_manager_cls = {"v1": OManagerV1, "v2": OManagerV2, "v3": OManagerV3}[
-        O_VARIANT
-    ]
+    _o_manager_cls = {"v1": OManagerV1, "v2": OManagerV2, "v3": OManagerV3}[O_VARIANT]
     o_mgr = _o_manager_cls(
         v_hdim=v_hdim,
         gqa_ratio=gqa_ratio,
@@ -794,7 +796,9 @@ def _is_paged_layout_supported(k, v, kv_indptr, kv_page_indices, kv_last_page_le
     if page_size & (page_size - 1):
         return False
     # the token-row view the gather addresses only exists when pages are contiguous
-    if k.stride(0) != page_size * k.stride(-3) or v.stride(0) != page_size * v.stride(-3):
+    if k.stride(0) != page_size * k.stride(-3) or v.stride(0) != page_size * v.stride(
+        -3
+    ):
         return False
     if k.stride(-1) != 1 or v.stride(-1) != 1:
         return False
