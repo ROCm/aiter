@@ -232,6 +232,10 @@ def dry_run(
             (torch.cuda, "use_mem_pool", lambda *_a, **_k: nullcontext()),
             (torch.cuda, "is_current_stream_capturing", lambda: False),
             (graph_alloc, "_persistent_pool", lambda _index: None),
+            # A replay never captures: every cached scratch buffer is built
+            # eagerly, and asking HIP which capture a stream is in would reach
+            # the GPU runtime.
+            (graph_alloc, "_capture_id", lambda _stream: None),
             (torch.Tensor, "data_ptr", data_ptr),
             (torch.Tensor, "__getitem__", getitem),
             (torch.Tensor, "contiguous", contiguous),

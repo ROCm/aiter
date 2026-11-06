@@ -18,6 +18,7 @@ from ..jit.core import (
 from ..jit.utils.asm_guard import is_gfx1250_asm_supported, require_gfx1250_asm
 from ..jit.utils.chip_info import get_cu_num, get_gfx, get_gfx_runtime
 from ..jit.utils.mha_recipes import (
+    _ck_targets_flag,
     compose_mha_fwd_variant_suffix_and_filter,
     get_mha_varlen_prebuild_variants_by_names,
 )
@@ -120,7 +121,8 @@ def cmdGenFunc_mha_fwd(
 
     blob_gen_cmd = [
         f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd "
-        "--receipt 100 --filter {} --output_dir {{}}".format(filter),
+        "--receipt 100 --filter {} --output_dir {{}}".format(filter)
+        + _ck_targets_flag(),
     ]
     return {
         "md_name": md_name,
@@ -1511,7 +1513,8 @@ def cmdGenFunc_mha_bwd(
 
     blob_gen_cmd = [
         f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d bwd "
-        "--receipt 300 --filter {} --output_dir {{}}".format(filter),
+        "--receipt 300 --filter {} --output_dir {{}}".format(filter)
+        + _ck_targets_flag(),
         f"{AITER_META_DIR}/hsa/codegen.py -m fmha_v3_bwd --output_dir {{}}",
     ]
     return {
@@ -1769,7 +1772,8 @@ def cmdGenFunc_mha_varlen_bwd(
 
     blob_gen_cmd = [
         f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d bwd "
-        "--receipt 400 --filter {} --output_dir {{}}".format(filter),
+        "--receipt 400 --filter {} --output_dir {{}}".format(filter)
+        + _ck_targets_flag(),
         f"{AITER_META_DIR}/hsa/codegen.py -m fmha_v3_bwd --output_dir {{}}",
     ]
     return {
@@ -2782,7 +2786,8 @@ def _flash_attn_backward(
 
     _, seqlen_q, nhead_q, hdim_q = q.shape
     _, seqlen_k, nhead_k, hdim_v = v.shape
-    swa = (window_size_left > 0) or (window_size_right > 0)
+    # a left size of 0 is a window too, it keeps only the diagonal
+    swa = (window_size_left >= 0) or (window_size_right > 0)
 
     # only 1 block when sk <= 256, thus deterministic
     is_950_1block = (
@@ -2799,19 +2804,44 @@ def _flash_attn_backward(
         ret &= bias is None
         ret &= dbias is None
         ret &= dropout_p == 0.0
+        # the v3 kernels take no sink, so d_sink would be left unwritten
+        ret &= sink is None and d_sink is None
         ret &= not deterministic or is_950_1block
         ret &= nhead_q % nhead_k == 0
         ret &= (
-            (hdim_q > 64 and hdim_q <= 128) or (hdim_q == 192 and hdim_v == 128)
+            (hdim_q > 64 and hdim_q <= 128 and hdim_q == hdim_v)
+            or (hdim_q == 192 and hdim_v == 128)
         ) and hdim_q % 8 == 0
-        ret &= not swa
+        # sliding window kernels are hd128 only
+        ret &= not swa or hdim_q <= 128
+        return ret
+
+    def can_impl_fmha_v3_bwd_gfx1250():
+        # fmha_v3_bwd has no CK fallback, so this must match the gfx1250 kernel
+        # set exactly: bf16, no mask or bottom-right causal, no hdim padding.
+        wl = -1 if window_size_left >= seqlen_k else window_size_left
+        wr = -1 if window_size_right >= seqlen_k else window_size_right
+        ret = get_gfx() == "gfx1250" and is_gfx1250_asm_supported()
+        ret &= q.dtype == dtypes.bf16
+        ret &= alibi_slopes is None
+        ret &= bias is None
+        ret &= dbias is None
+        ret &= dropout_p == 0.0
+        ret &= (hdim_q, hdim_v) in ((64, 64), (128, 128), (192, 128))
+        ret &= nhead_q % nhead_k == 0
+        ret &= wl == -1 and (causal or wr == -1)
+        ret &= sink is None and d_sink is None
         return ret
 
     can_impl_fmha_v3_bwd_ |= can_impl_fmha_v3_bwd_gfx950()
+    # ck fmha bwd has optimization for seqlen_q <= 16; gfx1250 builds no such ck tiles
+    can_impl_fmha_v3_bwd_ &= seqlen_q > 16
+    can_impl_fmha_v3_bwd_ |= can_impl_fmha_v3_bwd_gfx1250()
+    # gfx1250 backward only ships a32 (atomic32=1)
+    if get_gfx() == "gfx1250":
+        is_v3_atomic_fp32 = True
 
-    if (
-        can_impl_fmha_v3_bwd_ and seqlen_q > 16
-    ):  # ck fmha bwd has optimization for seqlen_q <= 16
+    if can_impl_fmha_v3_bwd_:
         if dq is not None:
             dq.zero_()
         (
@@ -3127,8 +3157,13 @@ def flash_attn_func(
             "FP8 attention requires q_descale, k_descale, and v_descale together"
         )
 
-    if _FLYDSL_AVAILABLE and (
-        cu_seqlens_q is None
+    # The FlyDSL forward returns a plain tensor with no autograd graph, so it must
+    # not take requests that need gradients.
+    is_grad = torch.is_grad_enabled() and any(x.requires_grad for x in [q, k, v])
+    if (
+        _FLYDSL_AVAILABLE
+        and not is_grad
+        and cu_seqlens_q is None
         and cu_seqlens_kv is None
         and num_splits <= 1
         and (len(window_size) < 3 or window_size[2] == 0)
@@ -3634,15 +3669,33 @@ def _flash_attn_varlen_backward(
         # ret &= bias is None
         # ret &= dbias is None
         ret &= dropout_p == 0.0
+        # the v3 kernels take no sink, so d_sink would be left unwritten
+        ret &= sink is None and d_sink is None
         ret &= deterministic == False
         ret &= hdim_q == hdim_v
         ret &= nhead_q % nhead_k == 0
         ret &= (hdim_q > 64 and hdim_q <= 128 and hdim_q % 8 == 0) or hdim_q == 256
-        ret &= not swa
+        # sliding window kernels are hd128 only
+        ret &= not swa or hdim_q <= 128
         if hdim_q == 256:
             ret &= not causal
+            ret &= window_size_left == -1 and window_size_right == -1
             ret &= nhead_q == nhead_k
             ret &= q.dtype == dtypes.bf16
+
+        return ret
+
+    def can_impl_fmha_v3_bwd_gfx1250():
+        # fmha_v3_varlen_bwd has no CK fallback, so this must match the gfx1250
+        # kernel set exactly: bf16, no mask or bottom-right causal, no hdim padding.
+        ret = get_gfx() == "gfx1250" and is_gfx1250_asm_supported()
+        ret &= q.dtype == dtypes.bf16
+        ret &= alibi_slopes is None
+        ret &= dropout_p == 0.0
+        ret &= (hdim_q, hdim_v) in ((64, 64), (128, 128), (192, 128))
+        ret &= nhead_q % nhead_k == 0
+        ret &= window_size_left == -1 and (causal or window_size_right == -1)
+        ret &= sink is None and d_sink is None
 
         return ret
 
@@ -3673,10 +3726,17 @@ def _flash_attn_varlen_backward(
 
         return ret
 
-    can_impl_fmha_v3_bwd_ = can_impl_fmha_v3_bwd() or can_impl_fmha_v3_bwd_gfx950()
+    can_impl_fmha_v3_bwd_ = (
+        can_impl_fmha_v3_bwd()
+        or can_impl_fmha_v3_bwd_gfx950()
+        or can_impl_fmha_v3_bwd_gfx1250()
+    )
     # gfx950 hd256 backward uses a16 (atomic32=0)
     if get_gfx() == "gfx950" and hdim_q == 256:
         is_v3_atomic_fp32 = False
+    # gfx1250 backward only ships a32 (atomic32=1)
+    if get_gfx() == "gfx1250":
+        is_v3_atomic_fp32 = True
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
     # Evaluated after maybe_contiguous: the gate checks contiguity.
@@ -4156,8 +4216,12 @@ def flash_attn_varlen_func(
                 v_descale,
             )
 
+    # The FlyDSL forward returns a plain tensor with no autograd graph, so it must
+    # not take requests that need gradients.
+    is_grad = torch.is_grad_enabled() and any(x.requires_grad for x in [q, k, v])
     if (
         _FLYDSL_AVAILABLE
+        and not is_grad
         and (len(window_size) < 3 or window_size[2] == 0)
         and cu_seqlens_q_padded is None
         and cu_seqlens_k_padded is None
