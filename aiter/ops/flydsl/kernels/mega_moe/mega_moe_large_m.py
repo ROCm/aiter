@@ -38,7 +38,7 @@ from ..flydsl_dispatch_combine_intranode_op import (
 from ..kernels_common import ceildiv
 from ..mxfp4_gemm_common import _fabs_f32 as fabs_f32
 from ..mxfp4_gemm_common import lds_typed_ptr, lds_vec_load
-from ..tensor_shim import _preload_compiled, _run_compiled
+from ..tensor_shim import _preload_compiled, _run_compiled, ptr_buf_tensor
 from ..tensor_shim import torch_stream as _torch_stream
 from .dispatch import _wave_inclusive_scan_i32, _wave_reduce_max_i32
 from .gemm1 import _LdsF32View
@@ -1568,11 +1568,11 @@ def compile_mega_moe_stage1(
         addr_tile_expected = _disp_ptr(DispatchSlot.TILE_EXPECTED)
         wave_id = fx.thread_idx.x // 64
 
-        w_rsrc = _make_buffer(w, fx.Int32, 4)
-        sx_rsrc = _make_buffer(scale_x, fx.Int32, 4)
-        sw_rsrc = _make_buffer(scale_w, fx.Int32)
-        trb_rsrc = _make_buffer(sorted_token_ids, fx.Int32)
-        expert_rsrc = _make_buffer(expert_ids, fx.Int32)
+        w_rsrc = ptr_buf_tensor(fx.get_iter(w), fx.Int32, unit_elems=4)
+        sx_rsrc = ptr_buf_tensor(fx.get_iter(scale_x), fx.Int32, unit_elems=4)
+        sw_rsrc = ptr_buf_tensor(fx.get_iter(scale_w), fx.Int32)
+        trb_rsrc = ptr_buf_tensor(fx.get_iter(sorted_token_ids), fx.Int32)
+        expert_rsrc = ptr_buf_tensor(fx.get_iter(expert_ids), fx.Int32)
         nv_rsrc = _make_buffer(num_valid_ids, fx.Int32)
         scale_cols = (inter_dim // 32 + 7) // 8 * 8
         os_nbytes = tokens * fx.Int32(scale_cols) + fx.Int32(8192)
