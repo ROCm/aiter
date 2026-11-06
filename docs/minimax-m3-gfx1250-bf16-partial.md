@@ -11,7 +11,7 @@ or a recommendation to replace every existing backend.
 - Main-model BF16 GEMMs only; the separate Eagle draft-model list is not included.
 - Full imported TDM candidate space with split-K enabled, no extra pruning.
 - Requires the `tdm` implementation in [PR #7548](https://github.com/ROCm/aiter/pull/7548).
-  This branch contains that prerequisite; #7548 remains separate.
+  These partial model results are included in #7548 alongside that implementation.
 - Opt-in CSV: `aiter/configs/minimax_m3_gfx1250_tdm_bf16_partial_tuned_gemm.csv`.
   It is deliberately outside `model_configs/` and does not replace the default
   BF16 table. No default dispatch code or model table is changed.
