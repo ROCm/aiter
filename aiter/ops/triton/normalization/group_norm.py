@@ -92,9 +92,9 @@ def group_norm(
             out.shape == x.shape and out.dtype == x.dtype and out.is_contiguous()
         ), "out must be contiguous, with the shape and dtype of x"
         # The apply kernel reads x, temb, weight and bias after it writes out.
-        # An overlap lets a write change what a later read sees. A meta or
-        # traced tensor has no address, so skip the check for it.
-        lo = out.data_ptr()
+        # An overlap lets a write change what a later read sees.
+        lo = 0 if torch.compiler.is_compiling() else out.data_ptr()
+        # Dynamo cannot trace an assert on an address, and meta has no address.
         if lo:
             hi = lo + out.numel() * out.element_size()
             for name, p in (

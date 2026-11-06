@@ -250,6 +250,23 @@ def test_group_norm_inplace_split():
     torch.testing.assert_close(got, want, atol=1e-2, rtol=1e-2)
 
 
+@pytest.mark.parametrize("in_place", [False, True])
+def test_group_norm_torch_compile(in_place):
+    """group_norm with out= must stay traceable in a full graph.
+
+    Dynamo cannot trace an assert on an address, so the overlap check must
+    not read a data pointer while it traces.
+    """
+    x, weight, bias, _ = generate_group_norm_inputs(
+        (2, 64, 8, 8), 32, torch.float16, True, False
+    )
+    expected = group_norm(x.clone(), 32, weight, bias)
+    out = x if in_place else torch.empty_like(x)
+    compiled = torch.compile(group_norm, fullgraph=True)
+    actual = compiled(x, 32, weight, bias, out=out)
+    torch.testing.assert_close(actual, expected, atol=1e-2, rtol=1e-2)
+
+
 def test_group_norm_inplace_inline():
     """out=x on a shape that keeps each group in one program."""
     x, weight, bias, t = generate_group_norm_inputs(
