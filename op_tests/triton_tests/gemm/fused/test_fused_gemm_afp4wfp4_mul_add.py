@@ -165,3 +165,45 @@ def test_fused_gemm_afp4wfp4_mul_add(
             )
 
     torch.testing.assert_close(torch_out, triton_out, atol=0.1, rtol=0.1)
+
+
+def _scales_with_tail(scales: torch.Tensor, tail: int) -> torch.Tensor:
+    """The same [rows, K // 32] scales, followed in memory by another K // 32
+    groups of `tail` bytes, so a read past K // 32 sees a known value. The
+    wrapper keeps BLOCK_SIZE_K below twice the unpacked K, so the last block
+    reads fewer than K // 32 groups past the end."""
+    rows, groups = scales.shape
+    buf = torch.full((2 * groups, rows), tail, dtype=torch.uint8, device="cuda")
+    buf[:groups, :] = scales.T
+    return buf[:groups, :].T
+
+
+@pytest.mark.parametrize("scale_tail", ["x", "w"])
+@pytest.mark.parametrize("K", [2112, 2048])
+def test_fused_gemm_afp4wfp4_mul_add_ragged_k_scales(K: int, scale_tail: str):
+    """With K not a multiple of BLOCK_SIZE_K, the last K block must not read the
+    scale bytes past K // 32: 0xFF there is the e8m0 NaN. K = 2112 = 33 * 64
+    leaves a partial last block for every power-of-two BLOCK_SIZE_K from 128 up,
+    K = 2048 for none of them."""
+    if not (arch_info.is_fp4_avail()):
+        pytest.skip("MXFP4 not supported on this architecture")
+
+    M, N, dtype = 32, 64, torch.bfloat16
+    x, w, w_triton, x_scales, w_scales, x_scales_triton, w_scales_triton, _, y = (
+        generate_gemm_afp4wfp4_inputs(M, N, K, dtype, layout="TN", output=True)
+    )
+    _, a, b = generate_fused_mul_add_inputs(
+        [M, N], (torch.Tensor, False), (torch.Tensor, False), dtype
+    )
+    torch_out = run_torch_fused_mul_add(
+        run_torch_gemm_afp4wfp4(x, w, x_scales, w_scales, torch.float32), a, b
+    ).to(dtype)
+    if scale_tail == "x":
+        x_scales_triton = _scales_with_tail(x_scales_triton, 255)
+    else:
+        w_scales_triton = _scales_with_tail(w_scales_triton, 255)
+    triton_out = fused_gemm_afp4wfp4_mul_add(
+        x, w_triton, x_scales_triton, w_scales_triton, a, b, dtype, y, fuse_type=0
+    )
+
+    torch.testing.assert_close(torch_out, triton_out, atol=0.1, rtol=0.1)

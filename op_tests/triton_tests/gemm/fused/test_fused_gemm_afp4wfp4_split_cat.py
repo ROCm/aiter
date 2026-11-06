@@ -218,3 +218,40 @@ def test_fused_gemm_afp4wfp4_split_cat(dtype, M, N, K, D, S3, layout, shuffle):
 
     torch.testing.assert_close(c1_torch, c1_triton, atol=0.01, rtol=1e-2)
     torch.testing.assert_close(c2_torch, c2_triton, atol=0.01, rtol=1e-2)
+
+
+def _scales_with_tail(scales: torch.Tensor, tail: int) -> torch.Tensor:
+    """The same [rows, K // 32] scales, followed in memory by another K // 32
+    groups of `tail` bytes, so a read past K // 32 sees a known value. The
+    wrapper keeps BLOCK_SIZE_K below twice the unpacked K, so the last block
+    reads fewer than K // 32 groups past the end."""
+    rows, groups = scales.shape
+    buf = torch.full((2 * groups, rows), tail, dtype=torch.uint8, device="cuda")
+    buf[:groups, :] = scales.T
+    return buf[:groups, :].T
+
+
+@pytest.mark.parametrize("scale_tail", ["x", "w"])
+@pytest.mark.parametrize("K", [2112, 2048])
+def test_fused_gemm_afp4wfp4_split_cat_ragged_k_scales(K: int, scale_tail: str):
+    """With K not a multiple of BLOCK_SIZE_K, the last K block must not read the
+    scale bytes past K // 32: 0xFF there is the e8m0 NaN. K = 2112 = 33 * 64
+    leaves a partial last block for every power-of-two BLOCK_SIZE_K from 128 up,
+    K = 2048 for none of them."""
+    if not (arch_info.is_fp4_avail()):
+        pytest.skip("MXFP4 not supported on this architecture")
+
+    M, D, S1, S2, S3, dtype = 32, 8, 16, 16, 64, torch.bfloat16
+    N = D * (S1 + S2)
+    x, w, _, y, x_scale, w_scale, _, _ = generate_fused_gemm_afp4wfp4_split_cat_inputs(
+        M, N, K, S3, dtype=dtype, layout="TN"
+    )
+    c1_torch, c2_torch = run_torch(x, w, y, x_scale, w_scale, S1, S2, D, dtype)
+    if scale_tail == "x":
+        x_scale = _scales_with_tail(x_scale, 255)
+    else:
+        w_scale = _scales_with_tail(w_scale, 255)
+    c1_triton, c2_triton = run_triton(x, w, y, x_scale, w_scale, S1, S2, D, dtype)
+
+    torch.testing.assert_close(c1_torch, c1_triton, atol=0.01, rtol=1e-2)
+    torch.testing.assert_close(c2_torch, c2_triton, atol=0.01, rtol=1e-2)
