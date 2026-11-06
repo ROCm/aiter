@@ -19,11 +19,17 @@
 //   Group mode  : q [total_q, H, D_QK]  k [total_k, H_KV, D_QK]  v [total_k, H_KV, D_V]
 //                 out [total_q, H, D_V]   (packed / varlen; group = num sequences)
 //
-// Supported head dims: (D_QK, D_V) in {(128,128), (192,128)}. Group mode requires
-// (192,128) (the D=128 kernel is batch only).
+// Supported head dims: (D_QK, D_V) in {(128,128), (192,128)}. Both support batch and
+// group mode.
 //
 // `causal` selects the causal mask (bottom-right aligned when seqlen_q != seqlen_kv).
 // `softmax_scale` is applied to Q·K^T internally (pass <= 0 for the default 1/sqrt(D_QK)).
+//
+// `window_size_left` bounds the causal mask on the left: a query at KV-coordinate j sees
+// keys [j - window_size_left, j]. -1 (the default) is unbounded, i.e. plain causal. Needs
+// `causal`; a window wider than seqlen_kv is folded back to -1 by the launch layer, so the
+// cheaper non-windowed kernel runs. Only the D=128 kernel implements it; a window on
+// (192,128) is rejected. There is no right-hand window.
 //
 // `lse` (optional) receives the log-sum-exp of the scaled scores in natural log,
 // float32, contiguous along the query dim:
@@ -48,5 +54,6 @@ void fmha_fwd_bf16_opus_fwd(at::Tensor& q,
                             std::optional<at::Tensor> seqstart_k     = std::nullopt,
                             std::optional<at::Tensor> seqstart_q_pad = std::nullopt,
                             std::optional<at::Tensor> seqstart_k_pad = std::nullopt,
-                            int max_seqlen_q = 0,
-                            int max_seqlen_k = 0);
+                            int max_seqlen_q                         = 0,
+                            int max_seqlen_k                         = 0,
+                            int window_size_left                     = -1);

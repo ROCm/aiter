@@ -62,6 +62,53 @@ struct fmha_fwd_bf16_opus_args
     float softmax_scale = 0.f;
     // Bottom-right aligned when seqlen_q != seqlen_k.
     bool causal = false;
+    // Sliding-window attention. >= 0 bounds the window on the left: a query at
+    // KV-coordinate j sees keys [j - window_size_left, j]. -1 (the default) is unbounded,
+    // i.e. plain causal. Needs causal; right > 0 is not implemented.
+    int window_size_left = -1;
+
+    // Group mode only. Length of the flattened Q-block axis, so the grid no longer gives
+    // every group the longest group's block count. 0 (the default) keeps the rectangular
+    // grid.
+    //
+    // This is the grid extent, not a free-standing block count, so its value follows from
+    // which of the three placement schemes below the caller selects -- each one packs the
+    // flat index differently and so has its own extent:
+    //
+    //   block_map_ptr    any length >= the number of real blocks; see its note
+    //   block_start_ptr  any length >= block_start[batch];        see its note
+    //   neither          exactly sum(seqlen_q) / 256 + batch
+    //
+    // The last one is the scheme with nothing precomputed, and the only one whose extent
+    // the caller does not choose: the kernel places a block by inverting seqstart_q, which
+    // spaces the groups by that expression, so a grid shorter than it drops real blocks
+    // rather than merely retiring surplus ones. Note it is NOT sum_g ceil(seqlen_q[g] /
+    // 256) -- that sum is smaller whenever the lengths are not multiples of 256, and three
+    // groups of 255 would lose the third group's only block.
+    //
+    // Worth supplying when the group lengths are uneven. The rectangle gives every group
+    // the LONGEST group's block count, so one sequence at max_seqlen drags the whole
+    // batch: at B=8 with seven ~8.4k sequences plus one at 16,354 it cost 73% more
+    // workgroups and 53% more time for 11% more work. When the lengths are close the
+    // rectangle wastes under 10% and this is not worth the per-block scalar lookup.
+    int total_q_blocks = 0;
+    // Device array of length batch+1 holding the cumulative Q-block counts (so
+    // block_start[0] == 0 and block_start[batch] == sum_g ceil(seqlen_q[g] / 256)).
+    //
+    // Only worth building if the caller is producing it anyway: the lookup it replaces is
+    // already a binary search over seqstart_q, and this one saves nothing but the divide.
+    // A kernel to build it costs ~5 us of launch latency, which is a quarter of the
+    // attention kernel on the smallest shapes.
+    const int* block_start_ptr = nullptr;
+    // Device array of packed (group << 16) | block pairs, one per flat index, which places
+    // a block in a single scalar load. Takes precedence over block_start_ptr. Build it
+    // block-major -- block 0 of every group, then block 1, and so on -- which keeps the
+    // residency pattern the rectangular grid has and with it the L2 hit rate; a group-major
+    // layout costs 8% (hit rate 54.9% -> 34.8%) even with the lookup removed.
+    //
+    // Entries past the last real block must be negative, so a grid sized from an upper
+    // bound can retire its surplus. See opus_gqa_kargs::ptr_block_map.
+    const int* block_map_ptr = nullptr;
 
     std::string data_type = "bf16";
 };
@@ -133,23 +180,66 @@ inline bool launch_d128(const fmha_fwd_bf16_opus_args& a, hipStream_t stream)
     kargs.stride_lse_b = a.stride_lse_b;
     kargs.stride_lse_h = a.stride_lse_h;
 
+    // Group / varlen. A null seqstart_q selects batch mode, where these stay null and the
+    // GROUP_MODE branches compile out entirely.
+    const bool is_group = (a.seqstart_q_ptr != nullptr);
+    if(is_group && (!a.seqstart_k_ptr || !a.seqstart_q_pad_ptr || !a.seqstart_k_pad_ptr))
+        return false;
+    kargs.ptr_seqstart_q     = is_group ? a.seqstart_q_ptr : nullptr;
+    kargs.ptr_seqstart_k     = is_group ? a.seqstart_k_ptr : nullptr;
+    kargs.ptr_seqstart_q_pad = is_group ? a.seqstart_q_pad_ptr : nullptr;
+    kargs.ptr_seqstart_k_pad = is_group ? a.seqstart_k_pad_ptr : nullptr;
+    kargs.total_q_blocks     = is_group ? a.total_q_blocks : 0;
+    kargs.ptr_block_map      = is_group ? a.block_map_ptr : nullptr;
+    kargs.ptr_block_start    = is_group ? a.block_start_ptr : nullptr;
+
+    // A window wider than the longest KV is no window at all; fold it away so those shapes
+    // take the cheaper non-LOCAL kernel.
+    const bool is_local    = a.causal && a.window_size_left >= 0 && a.window_size_left < a.seqlen_k;
+    kargs.window_size_left = is_local ? a.window_size_left : -1;
+
     auto launch = [&](auto traits_tag) {
         using Traits          = decltype(traits_tag);
         const int num_q_tiles = ceil_div(a.seqlen_q, Traits::Q_TILE_SIZE);
         const int num_q_blk   = ceil_div(num_q_tiles, Traits::NUM_WARPS);
-        dim3 grid(a.nhead, num_q_blk, a.batch);
+        // Group mode has two groupings, see opus_gqa_kargs::total_q_blocks.
+        //
+        // Flat: the caller counted sum_g ceil(seqlen_q[g] / q_block) for us, so y carries
+        // exactly the blocks that exist. Rectangular: rotated axes (head=x, group=y,
+        // Q-block=z) so the shorter groups' empty tail blocks short-circuit together; the
+        // Q-block extent is the longest group. Batch mode keeps q-block=y, batch=z.
+        const bool flat = Traits::GROUP_MODE && kargs.total_q_blocks > 0;
+        dim3 grid       = flat ? dim3(a.nhead, kargs.total_q_blocks, 1)
+                               : (Traits::GROUP_MODE ? dim3(a.nhead, a.batch, num_q_blk)
+                                                     : dim3(a.nhead, num_q_blk, a.batch));
         dim3 block(Traits::BLOCK_SIZE);
         gqa_d128_kernel<Traits><<<grid, block, 0, stream>>>(kargs);
         HIP_CALL_LAUNCH(hipGetLastError());
     };
 
-    if(a.causal)
+    // causal x group x local. LOCAL implies CAUSAL, so there is no non-causal window.
+    if(is_group)
     {
-        launch(opus_gqa_traits<32, 64, 128, 8, true>{});
+        if(a.causal)
+        {
+            if(is_local)
+                launch(opus_gqa_traits<32, 64, 128, 8, true, true, true>{});
+            else
+                launch(opus_gqa_traits<32, 64, 128, 8, true, true, false>{});
+        }
+        else
+            launch(opus_gqa_traits<32, 64, 128, 8, false, true, false>{});
+    }
+    else if(a.causal)
+    {
+        if(is_local)
+            launch(opus_gqa_traits<32, 64, 128, 8, true, false, true>{});
+        else
+            launch(opus_gqa_traits<32, 64, 128, 8, true, false, false>{});
     }
     else
     {
-        launch(opus_gqa_traits<32, 64, 128, 8, false>{});
+        launch(opus_gqa_traits<32, 64, 128, 8, false, false, false>{});
     }
     return true;
 }
@@ -288,8 +378,7 @@ inline bool fmha_fwd_bf16_opus_launch(const fmha_fwd_bf16_opus_args& a, hipStrea
 
     if(a.hdim_q == 128 && a.hdim_v == 128)
     {
-        if(is_group)
-            return false;
+        // One kernel template covers batch, group / varlen and the sliding window.
         return fmha_fwd_bf16_opus_detail::launch_d128(a, stream);
     }
     if(a.hdim_q == 192 && a.hdim_v == 128)
