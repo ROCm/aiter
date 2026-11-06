@@ -19,6 +19,7 @@ import triton
 
 import aiter
 from aiter.ops.mha import (
+    flash_attn_fp8_pertensor_func,
     flash_attn_func,
 )
 from aiter.ops.mha_v4 import (
@@ -27,22 +28,21 @@ from aiter.ops.mha_v4 import (
     AttentionScaleMode,
     mha_v4,
     mha_v4_kv_tile,
+    mha_v4_mx_producers,
     mha_v4_packed,
     native_fp8_format,
     scale_modes_for_formats,
 )
 from aiter.ops.mha_v4_quant import (
+    MHA_V4_HD256,
     mha_v4_q_multiplier,
     mxfp4_k_view,
     mxfp4_v_view,
     mxfp6_k_view,
+    mxfp6_k_view_hd256,
     quantize_fp8,
     quantize_fp8_rotated,
     quantize_int8,
-    quantize_mxfp4_k,
-    quantize_mxfp4_q,
-    quantize_mxfp6_k,
-    quantize_mxfp6_q,
     quantize_mxfp8_k,
     quantize_mxfp8_q,
     quantize_v_fp8,
@@ -80,6 +80,7 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
 from op_tests.triton_tests.attention.test_fav3_sage import (
     check_attention_outputs,
     compare_accuracy,
+    fp8_max_diff_percentage,
 )
 
 logging.getLogger().setLevel(logging.INFO)
@@ -87,10 +88,13 @@ logger = logging.getLogger(__name__)
 
 
 def _production_quantize_mxfp4(query, key, value, softmax_scale):
-    q_fp4, q_scale = quantize_mxfp4_q(query, mha_v4_q_multiplier(softmax_scale))
-    k_raw, k_scale = quantize_mxfp4_k(key)
+    quant_q, quant_k, quant_v = mha_v4_mx_producers(
+        AttentionFormat.MXFP4, query.shape[-1]
+    )
+    q_fp4, q_scale = quant_q(query, mha_v4_q_multiplier(softmax_scale))
+    k_raw, k_scale = quant_k(key)
     k_fp4 = mxfp4_k_view(k_raw, k_scale)
-    v_raw, v_scale = quantize_v_mxfp4_fp6_p(value)
+    v_raw, v_scale = quant_v(value)
     v_fp4 = mxfp4_v_view(v_raw, v_scale, value.shape[1])
     return q_fp4, q_scale, k_fp4, k_scale, v_fp4, v_scale
 
@@ -102,28 +106,23 @@ def _production_quantize_mxfp8(query, key, value, softmax_scale):
     return q_fp8, k_fp8, v_fp8, q_scale, k_scale, v_scale
 
 
-def _production_quantize_f4f4(query, key, value, softmax_scale):
-    q_fp4, q_scale = quantize_mxfp4_q(query, mha_v4_q_multiplier(softmax_scale))
-    k_raw, k_scale = quantize_mxfp4_k(key)
-    k_fp4 = mxfp4_k_view(k_raw, k_scale)
-    v_raw, v_scale = quantize_v_mxfp4_fp6_p(value)
-    v_fp4 = mxfp4_v_view(v_raw, v_scale, value.shape[1])
-    return q_fp4, q_scale, k_fp4, k_scale, v_fp4, v_scale
-
-
 def _production_quantize_mxfp6(
     query, key, value, softmax_scale, v_format=None, fp6_p=False
 ):
-    q_fp6, q_scale = quantize_mxfp6_q(query, mha_v4_q_multiplier(softmax_scale))
-    k_raw, k_scale_raw = quantize_mxfp6_k(key)
-    batch, sequence, heads, _ = key.shape
-    k_fp6, k_scale = mxfp6_k_view(k_raw, k_scale_raw, batch, sequence, heads)
+    batch, sequence, heads, head_dim = key.shape
+    quant_q, quant_k, quant_v_fp6_p = mha_v4_mx_producers(
+        AttentionFormat.MXFP6, head_dim
+    )
+    q_fp6, q_scale = quant_q(query, mha_v4_q_multiplier(softmax_scale))
+    k_raw, k_scale_raw = quant_k(key)
+    k_view = mxfp6_k_view_hd256 if head_dim == MHA_V4_HD256 else mxfp6_k_view
+    k_fp6, k_scale = k_view(k_raw, k_scale_raw, batch, sequence, heads)
     if v_format is None:
         v_quantized, v_scale = quantize_v_fp8(value)
         return q_fp6, q_scale, k_fp6, k_scale, v_quantized, v_scale
 
     if v_format == AttentionFormat.MXFP6:
-        quantize_v = quantize_v_mxfp6_fp6_p if fp6_p else quantize_v_mxfp6
+        quantize_v = quant_v_fp6_p if fp6_p else quantize_v_mxfp6
         return q_fp6, q_scale, k_fp6, k_scale, *quantize_v(value)
     if v_format != AttentionFormat.MXFP4:
         raise ValueError(f"unsupported MXFP6 Q/K V format: {v_format!r}")
@@ -148,6 +147,8 @@ class KernelSpec:
     uses_hadamard: bool = False
     supports_causal: bool = True
     include_in_all: bool = False
+    # Output comes back in --layout; every other runner is handed BSHD and returns BSHD.
+    follows_layout: bool = False
 
 
 def _mha_v4_spec(
@@ -173,15 +174,20 @@ KERNEL_SPECS = {
         quantized=True,
         supports_block_sparse=True,
         uses_hadamard=True,
+        follows_layout=True,
     ),
     "sage_mxfp4": KernelSpec(
         (0.5, 0.5, 1.0),
         quantized=True,
         supports_block_sparse=True,
         uses_hadamard=True,
+        follows_layout=True,
     ),
     "fav3_fp8": KernelSpec((1.0, 1.0, 1.0), quantized=True, uses_hadamard=True),
     "aiter_bf16": KernelSpec((2.0, 2.0, 2.0), include_in_all=True),
+    # FMHA v3 per-tensor FP8, the quantized counterpart to the aiter_bf16 baseline. Select it
+    # explicitly; at d=256 it is the one non-MX row that runs at all.
+    "aiter_fp8": KernelSpec((1.0, 1.0, 1.0), quantized=True),
     "mha4_bf16": _mha_v4_spec(
         (2.0, 2.0, 2.0), quantized=False, supports_block_sparse=True
     ),
@@ -218,11 +224,6 @@ KERNEL_SPECS = {
         uses_hadamard=True,
     ),
     "mha4_mxfp4": _mha_v4_spec(
-        (0.5, 0.5, 0.5),
-        supports_block_sparse=True,
-        uses_hadamard=True,
-    ),
-    "mha4_f4f4": _mha_v4_spec(
         (0.5, 0.5, 0.5),
         supports_block_sparse=True,
         uses_hadamard=True,
@@ -356,6 +357,13 @@ _DIFFUSION_CHANNEL_SIGMA = 0.16
 _DIFFUSION_LOGIT_STD = 2.2
 _DIFFUSION_V_OUTLIER_DIM_GAIN = 2.0
 _DIFFUSION_V_OUTLIER_TOKEN_GAIN = 4.0
+# Attention concentrated on ~10-20 effective tokens, where averaging fewer V rows cancels less of
+# the independent MX quantization noise. Calibrated to land near p64 of real heads in that band.
+_PEAKED_LOGIT_STD = 4.0
+# Tied-key pairs for `tiebreak`. The gaps span the formats' mantissa resolution so each flips a
+# different fraction of the ties; a single gap only yields an arbitrary, non-monotone ranking.
+_TIEBREAK_PEAK_LOGIT = 20.0
+_TIEBREAK_GAPS = (0.005, 0.011, 0.025, 0.055, 0.12, 0.26)
 
 
 def _coherent_rows(batch, heads, seq, dim, rho, sigma, device):
@@ -385,6 +393,7 @@ def _generate_diffusion_qkv(
     d_head: int,
     d_head_v: int,
     device: str,
+    logit_std: float = _DIFFUSION_LOGIT_STD,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Diffusion-transformer activations. Returns fp32 q/k/v.
 
@@ -411,7 +420,7 @@ def _generate_diffusion_qkv(
     # common modes, which are ratios.
     probe = torch.arange(0, sq, max(1, sq // 64), device=device)[:64]
     measured = ((q[0, 0, probe] @ k[0, 0].T) * (d_head**-0.5)).std(-1).median()
-    q *= _DIFFUSION_LOGIT_STD / measured.clamp_min(1e-9)
+    q *= logit_std / measured.clamp_min(1e-9)
     return q, k, v
 
 
@@ -419,6 +428,8 @@ _NAMED_DISTRIBUTIONS = (
     "zero",
     "normal",
     "diffusion",
+    "peaked",
+    "tiebreak",
     "padded",
     "transformer",
     "sink",
@@ -660,6 +671,49 @@ def generate_test_tensors(
         direction = torch.randn((hk, d_head), device=device, dtype=torch.float32)
         direction /= direction.norm(dim=-1, keepdim=True)
         k += 16.0 * k.norm(dim=-1).mean() * direction[None, :, None, :]
+        return q.to(dtype), k.to(dtype), v.to(dtype)
+
+    if distribution == "peaked":
+        # Diffusion activations peaked onto ~10-20 effective tokens, the regime where MX V
+        # quantization starts to hurt. Reproduces a TYPICAL head for that diffuseness, not the
+        # p90+ tail where real heads amplify 3-6x; use dump:PATH when severity matters.
+        q, k, v = _generate_diffusion_qkv(
+            batch, hq, hk, sq, sk, d_head, d_head_v, device, logit_std=_PEAKED_LOGIT_STD
+        )
+        return q.to(dtype), k.to(dtype), v.to(dtype)
+
+    if distribution == "tiebreak":
+        # Near-degenerate attention (n_eff ~1.6): nothing averages, so the output inherits V's own
+        # quantization error unattenuated, and the near-tied keys add a smaller Q/K-precision term.
+        # Measured: V is the larger contributor at MXFP4 (~0.12 against ~0.035 for Q/K).
+        if sk < 2 * len(_TIEBREAK_GAPS):
+            raise ValueError(
+                f"tiebreak needs at least {2 * len(_TIEBREAK_GAPS)} keys, got sk={sk}"
+            )
+        q, k, v = _generate_diffusion_qkv(
+            batch, hq, hk, sq, sk, d_head, d_head_v, device
+        )
+        pairs = len(_TIEBREAK_GAPS)
+        direction = torch.nn.functional.normalize(
+            torch.randn((pairs, hk, d_head), device=device, dtype=torch.float32), dim=-1
+        )
+        # Independent, not opposing: opposing rows cancel the tied reference output to ~0.
+        v_axis = torch.nn.functional.normalize(
+            torch.randn((2 * pairs, hk, d_head_v), device=device, dtype=torch.float32),
+            dim=-1,
+        )
+        # q.k = amp^2 and the kernel scales by d^-0.5, so this lands the winners at the target.
+        amp = (_TIEBREAK_PEAK_LOGIT * d_head**0.5) ** 0.5
+        row_norm = v.norm(dim=-1).mean()
+        for i, gap in enumerate(_TIEBREAK_GAPS):
+            k[:, :, 2 * i, :] = amp * direction[i]
+            k[:, :, 2 * i + 1, :] = amp * (1.0 + gap) * direction[i]
+            v[:, :, 2 * i, :] = row_norm * v_axis[2 * i]
+            v[:, :, 2 * i + 1, :] = row_norm * v_axis[2 * i + 1]
+        # Each query row points at one pair, so the shards of the output ride on different ties.
+        kv_of_q = torch.arange(hq, device=device) // (hq // hk)
+        pair_of_row = torch.arange(sq, device=device) % pairs
+        q[:] = amp * direction[pair_of_row][:, kv_of_q].permute(1, 0, 2)
         return q.to(dtype), k.to(dtype), v.to(dtype)
 
     if distribution == "padded":
@@ -913,11 +967,15 @@ def cancel_internal_qk_rotation(
     q: torch.Tensor, k: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Pre-rotate Q/K so a fused production Hadamard quantizer emits raw-domain Q/K."""
-    q_rotated = torch.empty_like(q)
-    k_rotated = torch.empty_like(k)
-    rotate_activation_hd128(q_rotated, q)
-    rotate_activation_hd128(k_rotated, k)
-    return q_rotated, k_rotated
+
+    def rotate(x: torch.Tensor) -> torch.Tensor:
+        # The hd256 producers rotate each 128-wide half as its own head, so cancel per half.
+        rows = x.reshape(*x.shape[:-2], -1, 128)
+        rotated = torch.empty_like(rows)
+        rotate_activation_hd128(rotated, rows)
+        return rotated.reshape(x.shape)
+
+    return rotate(q), rotate(k)
 
 
 def rotate_qk_blocks(
@@ -1257,6 +1315,41 @@ def make_kernel_runner(
             return_attn_probs=False,
         )
 
+    if args.kernel == "aiter_fp8":
+        # Plain per-tensor FP8, deliberately unrotated: xDiT's AITER_FP8 Hadamard-rotates Q/K,
+        # so these two are not the same preprocessing and their accuracy is not comparable.
+        def _fp8_v3(q, k, v):
+            q_fp8, q_descale = quantize_fp8(q)
+            k_fp8, k_descale = quantize_fp8(k)
+            v_fp8, v_descale = quantize_fp8(v)
+            return flash_attn_fp8_pertensor_func(
+                q_fp8,
+                k_fp8,
+                v_fp8,
+                q_descale=q_descale,
+                k_descale=k_descale,
+                v_descale=v_descale,
+                causal=args.causal,
+                softmax_scale=softmax_scale,
+            )
+
+        if args.e2e:
+            return lambda: _fp8_v3(q_bshd, k_bshd, v_bshd)
+
+        q_fp8, q_descale = quantize_fp8(q_bshd)
+        k_fp8, k_descale = quantize_fp8(k_bshd)
+        v_fp8, v_descale = quantize_fp8(v_bshd)
+        return lambda: flash_attn_fp8_pertensor_func(
+            q_fp8,
+            k_fp8,
+            v_fp8,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            causal=args.causal,
+            softmax_scale=softmax_scale,
+        )
+
     if args.kernel == "mha4_bf16":
         return lambda: launch_mha_v4(
             q_bshd,
@@ -1439,29 +1532,24 @@ def make_kernel_runner(
             softmax_scale=softmax_scale,
         )
 
-    if args.kernel in ("mha4_mxfp4", "mha4_f4f4"):
+    if args.kernel == "mha4_mxfp4":
         block_r = args.block_r
         if block_r != 128:
             raise ValueError(f"{args.kernel} requires block_r=128, got {block_r}")
         if args.qsmooth:
             raise ValueError(f"{args.kernel} does not support --qsmooth")
 
-        is_f4f4 = args.kernel == "mha4_f4f4"
         v_format = AttentionFormat.MXFP4
         scale_modes = scale_modes_for_formats(
             AttentionFormat.MXFP4, AttentionFormat.MXFP4, v_format
         )
-        # Both all-MXFP4 kernels consume an FP6 P operand, so both need the FP6-P V order.
+        # The all-MXFP4 kernel consumes an FP6 P operand, so it needs the FP6-P V order.
         v_pack = AttentionPack.V_FOR_FP6_P
 
         def _quantize_mxfp4():
             quant_q, quant_k = q_bshd, k_bshd
             if not args.hadamard_rotate:
                 quant_q, quant_k = cancel_internal_qk_rotation(quant_q, quant_k)
-            if is_f4f4:
-                return _production_quantize_f4f4(
-                    quant_q, quant_k, v_bshd, softmax_scale
-                )
             return _production_quantize_mxfp4(quant_q, quant_k, v_bshd, softmax_scale)
 
         def _kernel_mxfp4(q_fp4, q_descale, k_fp4, k_descale, v_quantized, v_descale):
@@ -1586,9 +1674,9 @@ def make_kernel_runner(
 
 def to_bshd_output_if_needed(
     out: torch.Tensor,
-    layout: Literal["bshd", "bhsd"],
+    args: argparse.Namespace,
 ) -> torch.Tensor:
-    if layout == "bhsd":
+    if args.layout == "bhsd" and KERNEL_SPECS[args.kernel].follows_layout:
         return out.permute(0, 2, 1, 3).contiguous()
     return out
 
@@ -1610,23 +1698,13 @@ def compute_accuracy_metrics(
     )
 
 
-def fp8_max_diff_percentage(args: argparse.Namespace) -> float:
-    # The coherent distributions and the LLM one are both harder on FP8 than iid inputs.
-    if args.input_distribution in (
-        "transformer",
-        "sink",
-        "diffusion",
-        "kcommon",
-    ) or str(args.input_distribution).startswith("dump:"):
-        return 2.0
-    return 0.5
-
-
-def check_output_against_reference(
+def report_quality_against_reference(
     args: argparse.Namespace,
     current: torch.Tensor,
     reference: torch.Tensor,
 ) -> None:
+    # Quality is the second axis of the tradeoff this bench measures, so it is reported, not
+    # enforced. `--strict` turns it into a gate for local bisects; CI enforces it from the tests.
     if os.environ.get("DUMP_PROBE"):
         torch.save(
             {
@@ -1638,18 +1716,25 @@ def check_output_against_reference(
         print(f"[DUMP_PROBE] saved to {os.environ['DUMP_PROBE']}")
     n_nan = int(torch.isnan(current).sum().item())
     n_inf = int(torch.isinf(current).sum().item())
-    if n_nan or n_inf:
+    finite = not (n_nan or n_inf)
+    print(
+        f"[NAN-CHECK] {'PASS' if finite else 'FAIL'} kernel={args.kernel} "
+        f"nan={n_nan} inf={n_inf}"
+    )
+    compare_accuracy(current, reference)
+
+    if not args.strict:
+        return
+    if not finite:
         raise AssertionError(
             f"non-finite output from {args.kernel}: nan={n_nan}, inf={n_inf}"
         )
-    print(f"[NAN-CHECK] PASS kernel={args.kernel} (output finite)")
-    compare_accuracy(current, reference)
     if KERNEL_SPECS[args.kernel].quantized:
         check_attention_outputs(
             current,
             reference,
             fp8=True,
-            max_diff_percentage=fp8_max_diff_percentage(args),
+            max_diff_percentage=fp8_max_diff_percentage(args.input_distribution),
         )
     else:
         check_attention_outputs(current, reference, fp8=False)
@@ -1798,11 +1883,11 @@ def benchmark_single_case(
     )
     ms = triton.testing.do_bench(fn, warmup=args.warmup, rep=args.rep)
 
-    if args.compare_to_ref:
+    if args.report_quality:
         current_primary = primary_output(fn())
-        current_primary = to_bshd_output_if_needed(current_primary, args.layout)
+        current_primary = to_bshd_output_if_needed(current_primary, args)
         ref_primary = make_reference_output(args, q, k, v, block_attn_mask)
-        check_output_against_reference(args, current_primary, ref_primary)
+        report_quality_against_reference(args, current_primary, ref_primary)
 
     total_flops = (
         2.0
@@ -1845,7 +1930,7 @@ def metric_lines(args: argparse.Namespace, include_sparse_metric: bool) -> list[
         "sparseput": "sparse_throughput(TFLOPS)",
     }
 
-    if args.compare_to_ref:
+    if args.report_quality:
         return ["time(ms)"]
 
     if args.metric == "all":
@@ -2381,10 +2466,18 @@ def parse_args() -> argparse.Namespace:
         "--input-distribution",
         type=_input_distribution,
         default="diffusion",
-        metavar="{zero,normal,diffusion,padded,transformer,sink,underflow,latepeak,maxstair,kcommon,dump:PATH}",
+        metavar="{zero,normal,diffusion,peaked,tiebreak,padded,transformer,sink,underflow,latepeak,maxstair,kcommon,dump:PATH}",
         help=(
-            "Distribution used for generated Q/K/V tensors. 'diffusion' (default) is calibrated "
-            "to dumped Wan, HunyuanVideo 1.5 and Flux2 attention; 'transformer' is the LLM "
+            "Distribution used for generated Q/K/V tensors. The three that cover diffusion latent "
+            "self-attention are 'diffusion', 'peaked' and 'tiebreak'. 'diffusion' (default) is the "
+            "benign bulk, calibrated to dumped Wan, HunyuanVideo 1.5, Flux2, Z-Image, MiniMax-H3 "
+            "and LTX-2.5 attention (n_eff ~190, V-quantization amplification ~0.36); 'peaked' "
+            "concentrates attention on ~10-20 effective tokens, the regime where MX V quantization "
+            "starts to hurt, and lands at about the median real head for that diffuseness; "
+            "'tiebreak' drives attention onto ~2 near-tied keys so nothing averages, which is "
+            "the worst case for inheriting V's own quantization error and also exposes Q/K "
+            "precision. "
+            "'transformer' is the LLM "
             "activation model, which differs mainly in carrying almost no token-common "
             "component; 'padded' is diffusion with empty Ulysses-padding heads, which real "
             "sharded models produce and which no other distribution covers; 'zero' "
@@ -2394,7 +2487,7 @@ def parse_args() -> argparse.Namespace:
             "for alternating query-row groups; 'kcommon' adds a shared K direction far past what "
             "real models reach, which inflates quantization noise without changing any softmax "
             "statistic; 'dump:PATH' replays Q/K/V captured from a real model, which no synthetic "
-            "distribution here reproduces the quantization error of."
+            "distribution here reproduces the worst-case severity of."
         ),
     )
     parser.add_argument(
@@ -2435,9 +2528,16 @@ def parse_args() -> argparse.Namespace:
         help="Reference kernel for accuracy metrics/checks. --kernel=all reports MAE/MaxE/Cosine against this reference.",
     )
     parser.add_argument(
+        "--report-quality",
         "--compare-to-ref",
+        dest="report_quality",
         action="store_true",
-        help="Run correctness checks against the selected --ref",
+        help="Report MAE/MaxE/Cosine against the selected --ref alongside the timing",
+    )
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Make --report-quality fail the run when it exceeds its bound",
     )
 
     parser.add_argument(
@@ -2609,7 +2709,7 @@ def benchmark_all_kernel_row(
         ms = triton.testing.do_bench(fn, warmup=args.warmup, rep=args.rep)
         tflops = total_flops / ms * 1e-9
         current_primary = primary_output(fn())
-        current_primary = to_bshd_output_if_needed(current_primary, args.layout)
+        current_primary = to_bshd_output_if_needed(current_primary, args)
         accuracy = compute_accuracy_metrics(current_primary, ref_primary)
         return AllKernelRow(kernel_name, ms, tflops, accuracy)
     finally:
