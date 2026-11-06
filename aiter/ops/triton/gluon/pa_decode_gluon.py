@@ -4838,15 +4838,11 @@ def pa_decode_gluon(
         Scaling factor for attention scores, typically 1/sqrt(head_size).
 
     query_length : int
-        Length of query sequences. On the PS kernel with one KV head, the
-        launch spreads the query tokens over the grid: query_group_size must
-        be <= 64, and query_length must be less than sliding_window when
-        sliding_window > 0. On the PS kernel with more than one KV head,
-        query_length must be <= 8 and query_length * query_group_size must be
-        <= 64. Query length above 4 on that kernel also requires
-        query_length < sliding_window when sliding_window > 0. Every other
-        kernel keeps query_length <= 4 and query_length * query_group_size
-        <= 64.
+        Length of query sequences. Must be <= 8, and
+        query_length * query_group_size must be <= 64, except on the PS
+        kernel with one KV head. That launch spreads the query tokens over
+        the grid, so only query_group_size must be <= 64, and query_length
+        must be less than sliding_window when sliding_window > 0.
 
     max_context_partition_num : int
         Maximum number of context partitions.
@@ -4907,13 +4903,10 @@ def pa_decode_gluon(
 
     Notes
     -----
-    - On the PS kernel with one KV head, query_group_size must be <= 64, and
-      query_length must be less than sliding_window when sliding_window > 0.
-      On the PS kernel with more than one KV head, query_length must be <= 8
-      and query_length * query_group_size must be <= 64; query_length > 4
-      also requires query_length < sliding_window when sliding_window > 0.
-      Every other kernel keeps query_length <= 4 and
-      query_length * query_group_size <= 64.
+    - query_length must be <= 8, and query_length * query_group_size must be
+      <= 64. On the PS kernel with one KV head only query_group_size must be
+      <= 64, and query_length must be less than sliding_window when
+      sliding_window > 0
     - kv_block_size must be one of [16, 64, 1024]
     - When query_length > 1, automatic transpose operations are performed
       between standard and gluon layouts
@@ -4962,10 +4955,10 @@ def pa_decode_gluon(
     uses_persistent_kernel = _uses_ps_kernel(ps, sliding_window, kv_block_size)
 
     # A single-KV-head PS launch spreads the query tokens over the grid (see
-    # _ps_query_split), so only the group bounds its query tile. The other
-    # kernels hold every query token of a sequence in one tile. That tile has
-    # register bases through 64 rows. Query length 8 with 8 heads per KV head
-    # fills it: Muse Spark at TP8, a DSpark K=7 verify row (q = 1 + K).
+    # _ps_query_split), so only the group bounds its query tile. Every other
+    # kernel holds every query token of a sequence in one tile. That tile has
+    # register bases through 64 rows, so query length 8 is the full tile at
+    # 8 heads per KV head (Muse Spark at TP8, a DSpark K=7 verify row).
     if num_kv_heads == 1 and uses_persistent_kernel:
         assert (
             query_group_size <= 64
@@ -4975,19 +4968,8 @@ def pa_decode_gluon(
         assert (
             sliding_window <= 0 or query_length < sliding_window
         ), f"query_length={query_length} must be less than sliding_window={sliding_window}"
-    elif uses_persistent_kernel:
-        assert query_length <= 8, f"query_length == {query_length} exceeds maximum of 8"
-        assert (
-            equivalent_query_group_size <= 64
-        ), f"equivalent_query_group_size={equivalent_query_group_size} exceeds maximum of 64"
-        # Lengths that this path already accepted stay valid. A longer query
-        # on this kernel sees sliding_window - query_length keys.
-        if query_length > 4:
-            assert (
-                sliding_window <= 0 or query_length < sliding_window
-            ), f"query_length={query_length} must be less than sliding_window={sliding_window}"
     else:
-        assert query_length <= 4, f"query_length == {query_length} exceeds maximum of 4"
+        assert query_length <= 8, f"query_length == {query_length} exceeds maximum of 8"
         assert (
             equivalent_query_group_size <= 64
         ), f"equivalent_query_group_size={equivalent_query_group_size} exceeds maximum of 64"
