@@ -14,8 +14,6 @@ forward shapes so the op-test can validate it against MegaMoEV2 and ``ep_referen
   needs the whole GPU; do not run it next to other kernels / processes.
 * The symmetric memory uses hipIpc handles; in containers on the host network ROCm 7.1
   needs ``HSA_ENABLE_IPC_MODE_LEGACY=1``.
-
-SCAFFOLD STATE: ``forward`` is not wired to the device kernel yet; see the engine.
 """
 
 from __future__ import annotations
@@ -68,7 +66,12 @@ class MegaMoeEP:
         w2_scale,
         group=None,
         device=None,
+        weights_preshuffled: bool = False,
     ):
+        """``weights_preshuffled``: w1 / w1_scale / w2 / w2_scale are already in MegaMoEV2's
+        layout (``shuffle_weight_a16w4(., 16, gate_up)`` / ``shuffle_scale_a16w4``) and
+        are bound by pointer (kept alive by the caller); else natural MXFP4, shuffled
+        into copies."""
         if not mega_moe_ep_supported():
             raise ValueError("MegaMoeEP: needs gfx950")
         self.cfg = cfg
@@ -91,6 +94,7 @@ class MegaMoeEP:
             swiglu_limit=cfg.swiglu_limit,
             group=group,
             device=device,
+            weights_preshuffled=weights_preshuffled,
         )
 
     def forward(
@@ -120,13 +124,16 @@ class MegaMoeEP:
         self.engine.prepare()
 
     def reference_forward(self, x_bf16, wts, topk_ids, ref_weights):
-        """Pure-torch EP MoE oracle for these inputs (对拍); ``ref_weights`` are the
+        """Pure-torch EP MoE oracle for these inputs; ``ref_weights`` are the
         unshuffled quantized weights ``(w1_q, w1_scale, w2_q, w2_scale)``."""
         return self.engine.reference_forward(x_bf16, wts, topk_ids, ref_weights)
 
-    def set_weights(self, *, w1, w1_scale, w2, w2_scale) -> None:
-        """Run the next forwards on another layer's weights of the same shape."""
-        self.engine.set_weights(w1, w1_scale, w2, w2_scale)
+    def set_weights(
+        self, *, w1, w1_scale, w2, w2_scale, preshuffled: bool = False
+    ) -> None:
+        """Run the next forwards on another layer's weights of the same shape
+        (``preshuffled``: as in the constructor)."""
+        self.engine.set_weights(w1, w1_scale, w2, w2_scale, preshuffled)
 
     def error_flag(self):
         return self.engine.error_flag()

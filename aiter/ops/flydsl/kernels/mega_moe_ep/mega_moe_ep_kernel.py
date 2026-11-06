@@ -18,25 +18,12 @@ from __future__ import annotations
 
 import functools
 import inspect
-import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr
 
-from .common import bst, g_ld_sys, i32, lds_st, now, rsrc, uni
-
-# Device-phase profiling: when EP_PROF_DEV=1, each CTA's tid0 stamps now() into a
-# per-CTA global `dbg` buffer at the kernel phase boundaries (entry / post-barrier_init
-# / post-compute / post-combine_final). Off by default (zero runtime cost -- the writes
-# are compile-time gated and the `dbg` arg is just an unused pointer).
-_PROF = bool(int(os.environ.get("EP_PROF_DEV", "0")))
-_PROF_SLOTS = 24  # 0:entry 1:post-barrier_init 2:post-compute 3:post-combine_final
-#   4:post-routing-wait 5:post-dyn_plan 7:post-gemm1 8:post-gemm2 (schedule)
-#   6: payload-wait tick sum | sender send ticks << 32 (schedule)
-#   9:post-dispatch-send 10:post-gather 11:post-payload-wait (schedule)
-#   12:post-combine_wait (communication.combine_final)
-#   13..18: gemm1 {kloop, pre-epi cbar, epi}, gemm2 {..} tick sums (gemm.py _pmark)
+from .common import g_ld_sys, i32, lds_st, uni
 from .communication import build_communication
 from .gemm import build_gemm
 from .mega_moe_ep_config import (
@@ -93,7 +80,6 @@ def compile_mega_moe_ep(
     kc.add(build_schedule(kc))
     name, LDS_BYTES = kc.get("name LDS_BYTES")
     NBW, L_DYN, L_DCNT, L_CTL = kc.get("NBW L_DYN L_DCNT L_CTL")
-    L_PF = kc.get("L_PF")[0]
     compute_units = kc.get("compute_units")[0]
     combine_final, barrier_init = kc.get("combine_final barrier_init")
     NTT = kc.get("NTT")[0]
@@ -107,9 +93,6 @@ def compile_mega_moe_ep(
             lds_st(L, L_DYN + i32(s_) * i32(4), i32(0))
         for s_ in range(tid, i32(EPR), i32(NTT)):
             lds_st(L, L_DCNT + i32(s_) * i32(4), i32(0))
-        if const_expr(_PROF):  # noqa: SIM102 - compile-time gate, not dynamic
-            if tid < i32(16):  # gemm.py _pmark tick sums + last mark, 8/9: payload waits
-                lds_st(L, L_PF + tid * i32(4), i32(0))
         if tid == i32(0):
             lds_st(L, L_CTL + C_BARCNT * 4, i32(0))
             lds_st(L, L_CTL + C_BARGEN * 4, i32(0))
@@ -151,7 +134,6 @@ def compile_mega_moe_ep(
         rowidx: fx.Int64,
         rowlist: fx.Int64,
         ecnt: fx.Int64,
-        dbg: fx.Int64,
         rank: fx.Int32,
         npes: fx.Int32,
         epr: fx.Int32,
@@ -188,39 +170,24 @@ def compile_mega_moe_ep(
         )  # dynamic-planner scan bound (indexed recv)
         if const_expr(SBXP):  # this launch's part bank
             a["off_part"] = off_part + fx.Int64(a["epoch"] & i32(1)) * fx.Int64(
-                mtpr * i32(TOPK * (H + H // 8)))
-
-        def _ts(slot):
-            if const_expr(_PROF):  # noqa: SIM102 - compile-time gate, not dynamic
-                if tid == i32(0):
-                    bst(
-                        now(),
-                        rsrc(dbg),
-                        (i32(gpu.block_id("x")) * i32(_PROF_SLOTS) + i32(slot))
-                        * i32(8),
-                        0,
-                        0,
-                    )
+                mtpr * i32(TOPK * (H + H // 8))
+            )
 
         init_lds(L, tid, a)
         gpu.barrier()
-        _ts(0)
         # recv_le is sentinel'd on the host on THIS stream before the launch (stream
         # order); barrier_init is the cross-rank wait so a peer only dispatches once every
         # rank's fill is done -- no host sync/barrier, so forward() stays a stream pipeline.
         if const_expr(not SBXP):
             barrier_init(L, tid, a)
-        _ts(1)
         compute_units(L, tid, a)
-        _ts(2)
         gpu.barrier()
         combine_final(L, tid, a)
-        _ts(3)
 
     kargs = list(inspect.signature(mega_moe_ep_kernel).parameters)
-    mega_moe_ep_kernel = flyc.kernel(
-        name=name + ("_prof" if _PROF else ""), known_block_size=[NTT, 1, 1]
-    )(mega_moe_ep_kernel)
+    mega_moe_ep_kernel = flyc.kernel(name=name, known_block_size=[NTT, 1, 1])(
+        mega_moe_ep_kernel
+    )
 
     def launch(
         w1: fx.Int64,
@@ -253,7 +220,6 @@ def compile_mega_moe_ep(
         rowidx: fx.Int64,
         rowlist: fx.Int64,
         ecnt: fx.Int64,
-        dbg: fx.Int64,
         rank: fx.Int32,
         npes: fx.Int32,
         epr: fx.Int32,

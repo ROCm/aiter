@@ -1,11 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """Host side of the single-kernel EP MegaMoE: launch configs, launches, and the
-pure-torch reference oracle used to validate the kernel (对拍)."""
+pure-torch reference oracle used to validate the kernel."""
 
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass
 
 import torch
@@ -42,18 +41,15 @@ __all__ = ["LaunchCfg", "MegaMoeEPEngine", "ep_reference"]
 LDS_LIMIT = 160 * 1024
 # a4w4 row tile: mt=8 (RG=128: each W tile serves twice the rows) from MT8_MIN
 # tokens, else mt=4.  mt=8 needs the per-echunk inter rebase (kernel_config forces it):
-# without it the K-loop spills.  8x MI355X a4w4 vs mt=4: bs512 +2%, 768 -5%, 1024 even,
-# 2048 -7%, 4096 -9%, 8192..32768 -11..-14%.  a8w4 mt=8 needs > 160 KB LDS (the 2-bank A
-# ring that fits is +20%), so a8 stays at mt=4.
+# without it the K-loop spills.  a8w4 mt=8 needs > 160 KB LDS (only a 2-bank A ring
+# fits), so a8 stays at mt=4.
 MT8_MIN = 768
 # Small-batch kernel variant (LaunchCfg.small) for engines of max_tok_per_rank <= SB_MAX:
 # picked from mtpr, so every rank runs the same variant.  a8w4 row tile mt=2 up to
-# SB_MT2_MAX tokens (8x MI355X graph, mtpr 256, WNT, vs mt=4: bs96..144 -4..-6%, bs159 -5%,
-# bs160 even, bs168..191 +6%); mt only shapes the rank-local echunks.
+# SB_MT2_MAX tokens; mt only shapes the rank-local echunks.
 SB_MAX = 256
 SB_MT2_MAX = 159
-# a4w4 likewise up to SB_MT2_MAX_A4 (vs mt=4: bs1..128 -2.4..-4.3%, bs160 even, bs192 +1%,
-# bs256 +6%).
+# a4w4 likewise up to SB_MT2_MAX_A4.
 SB_MT2_MAX_A4 = 159
 # SB kernel streams its weights (kernel_config WNT) from this many tokens.
 SB_WNT_MIN = 2
@@ -168,14 +164,10 @@ class LaunchCfg:
 
 
 class MegaMoeEPEngine:
-    """Host side of the fused EP MoE (see the module docstring).
-
-    SCAFFOLD STATE: ``forward`` is not wired to the device kernel yet (the role bodies
-    are stubs -- see the planner / arena_flags / dispatch_send / compute / combine
-    milestones). Use ``reference_forward`` / ``ep_reference`` as the numerical oracle;
-    ``config`` / ``_launcher`` already select and compile the one-launch, grid=#CU,
-    block=512 launcher so the host plumbing can be exercised.
-    """
+    """Host side of the fused EP MoE (see the module docstring): owns the symmetric
+    arena and the plan tables, binds the weights, and launches one grid=#CU, block=512
+    kernel per ``forward``.  ``reference_forward`` / ``ep_reference`` are the pure-torch
+    oracle."""
 
     def __init__(
         self,
@@ -198,6 +190,7 @@ class MegaMoeEPEngine:
         swiglu_limit=0.0,
         group=None,
         device=None,
+        weights_preshuffled=False,
     ):
         if quant not in ("a4w4", "a8w4"):
             raise ValueError("MegaMoeEP quant must be 'a4w4' or 'a8w4'")
@@ -233,7 +226,7 @@ class MegaMoeEPEngine:
         if device.index is None:
             device = torch.device(device.type, self.rank)
         self.device = device
-        self._bind_weights(w1, w1_scale, w2, w2_scale)
+        self._bind_weights(w1, w1_scale, w2, w2_scale, weights_preshuffled)
         props = torch.cuda.get_device_properties(self.device)
         self.n_cta = int(props.multi_processor_count)
         if self.n_cta > NCTA_MAX:
@@ -270,7 +263,9 @@ class MegaMoeEPEngine:
         self.sdma = SDMA_ENV if self.mtpr > SB_MAX else 0
         sd = bool(self.sdma)
         self._stage = arena.reserve("stage", (tot if sd else 1, a_row), torch.uint8)
-        self._sstage = arena.reserve("sstage", (tot if sd else 1, self.H // 32), torch.uint8)
+        self._sstage = arena.reserve(
+            "sstage", (tot if sd else 1, self.H // 32), torch.uint8
+        )
         self._rpos = arena.reserve("rpos", (tot if sd else 1,), torch.int32)
         self._sdum = arena.reserve("sdum", (MAX_NPES * SD_DUM,), torch.uint8)
         self._sdq = None
@@ -281,8 +276,9 @@ class MegaMoeEPEngine:
         arena.commit()
         self.arena = arena
         self._sdst = torch.zeros(SD_INTS, dtype=torch.int32, device=self.device)
-        self._spos = torch.empty(self.mtpr * MAX_NPES if sd else 1, dtype=torch.int32,
-                                 device=self.device)
+        self._spos = torch.empty(
+            self.mtpr * MAX_NPES if sd else 1, dtype=torch.int32, device=self.device
+        )
         if sd:  # this launch's signal base per (source, payload / scale queue)
             sig = self._sdq.signals().cpu()
             for s_ in range(self.world_size):
@@ -325,18 +321,36 @@ class MegaMoeEPEngine:
         # the gather reads it by position. _ecnt is zeroed each forward; the small-batch
         # kernel uses one EPR block of it per XCD.
         self._rowlist = torch.empty(
-            self.epr * self.world_size * self.mtpr, dtype=torch.int32, device=self.device
+            self.epr * self.world_size * self.mtpr,
+            dtype=torch.int32,
+            device=self.device,
         )
-        self._ecnt = torch.zeros(self.epr * N_XCD, dtype=torch.int32, device=self.device)
-        # Per-CTA device-phase timestamps (now() at kernel phase boundaries), only
-        # written when EP_PROF_DEV=1; see mega_moe_ep_kernel._PROF.
-        self._dbg = torch.zeros(self.n_cta * 24, dtype=torch.int64, device=self.device)
+        self._ecnt = torch.zeros(
+            self.epr * N_XCD, dtype=torch.int32, device=self.device
+        )
 
-    def _bind_weights(self, w1, w1_scale, w2, w2_scale):
+    def _bind_weights(self, w1, w1_scale, w2, w2_scale, preshuffled=False):
         # GEMM1 is the V2 pipelined path: its BWeightLoader / BScaleLoader read W1 and
         # its E8M0 scale in the shuffle_weight_a16w4 / shuffle_scale_a16w4 (gate|up
         # interleave) B-layout, so shuffle them host-side (natural weights are fed by
         # the tests / oracle). GEMM2 stays the naive natural-layout read -> W2 natural.
+        if preshuffled:
+            # Already in those layouts (MegaMoEV2's): bound by pointer, not copied; the
+            # caller keeps them alive (and may update them in place, e.g. EPLB).
+            want = (
+                (w1, self.epr * 2 * self.I * self.H // 2),
+                (w1_scale, self.epr * 2 * self.I * self.H // 32),
+                (w2, self.epr * self.H * self.I // 2),
+                (w2_scale, self.epr * self.H * self.I // 32),
+            )
+            for t, n in want:
+                if not t.is_contiguous() or t.numel() * t.element_size() != n:
+                    raise ValueError(
+                        f"MegaMoeEP: preshuffled weight {tuple(t.shape)} {t.dtype} is not "
+                        f"a contiguous {n}-byte tensor"
+                    )
+            self.w1, self.w1s, self.w2, self.w2s = w1, w1_scale, w2, w2_scale
+            return
         from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
 
         w1 = w1 if w1.is_contiguous() else w1.contiguous()
@@ -352,8 +366,8 @@ class MegaMoeEPEngine:
             w2_scale.reshape(-1, self.I // 32).contiguous(), self.epr, False
         ).contiguous()
 
-    def set_weights(self, w1, w1_scale, w2, w2_scale):
-        self._bind_weights(w1, w1_scale, w2, w2_scale)
+    def set_weights(self, w1, w1_scale, w2, w2_scale, preshuffled=False):
+        self._bind_weights(w1, w1_scale, w2, w2_scale, preshuffled)
 
     def _fit_mt(self, m, small):
         # The V2 pipelined GEMM1 packs rows in pairs (MfmaScaleGU / AScaleLoader use
@@ -369,7 +383,13 @@ class MegaMoeEPEngine:
         while mt > 4:
             if (
                 mega_moe_ep_consts(
-                    self.H, self.I, mt, self.epr, self.mtpr * self.world_size, self.a8, small
+                    self.H,
+                    self.I,
+                    mt,
+                    self.epr,
+                    self.mtpr * self.world_size,
+                    self.a8,
+                    small,
                 )["LDS_BYTES"]
                 <= LDS_LIMIT
             ):
@@ -395,8 +415,9 @@ class MegaMoeEPEngine:
         SB_WNT_MIN / SB_MT2 / MT8_MIN bounds)."""
         th = SB_MT2_MAX if self.a8 else SB_MT2_MAX_A4
         ms = {0, 1, SB_WNT_MIN, th, th + 1, MT8_MIN - 1, MT8_MIN, self.mtpr}
-        return sorted({self.config(m) for m in ms if 0 <= m <= self.mtpr},
-                      key=lambda c: c.mt)
+        return sorted(
+            {self.config(m) for m in ms if 0 <= m <= self.mtpr}, key=lambda c: c.mt
+        )
 
     def prepare(self):
         """Collective: compile every launch variant on every rank, then barrier.  The
@@ -413,7 +434,8 @@ class MegaMoeEPEngine:
         stream = torch.cuda.current_stream()
         for cfg in self._variants():
             _preload_compiled(
-                self._launcher(cfg), *self._launch_args(0, None, None, None, None, None),
+                self._launcher(cfg),
+                *self._launch_args(0, None, None, None, None, None),
                 stream,
             )
         torch.cuda.synchronize(self.device)
@@ -444,7 +466,7 @@ class MegaMoeEPEngine:
         return fn
 
     def reference_forward(self, x_bf16, wts, topk_ids, ref_weights):
-        """Run the pure-torch oracle for these inputs (对拍). ``ref_weights`` are the
+        """Run the pure-torch oracle for these inputs. ``ref_weights`` are the
         unshuffled quantized weights ``(w1_q, w1_scale, w2_q, w2_scale)``."""
         return ep_reference(
             x_bf16,
@@ -495,7 +517,6 @@ class MegaMoeEPEngine:
             self._rowidx.data_ptr(),
             self._rowlist.data_ptr(),
             self._ecnt.data_ptr(),
-            self._dbg.data_ptr(),
             self.rank,
             self.world_size,
             self.epr,
@@ -524,20 +545,13 @@ class MegaMoeEPEngine:
         run_tokens = int(x_bf16.shape[0])
         if run_tokens > self.mtpr:
             raise ValueError(f"run_tokens={run_tokens} > max_tok_per_rank={self.mtpr}")
-        del mask_invalid_slots  # TODO(C): expected-route masking in combine_final
+        del mask_invalid_slots  # -1 top-k slots are always skipped in-kernel
         self.prepare()
         cfg = self.config(run_tokens)
         fn = self._launcher(cfg)
-        # Optional host-phase decomposition (set engine._prof = [] to collect
-        # (prep, launch->sync) seconds per call; purely diagnostic, off by default).
-        prof = getattr(self, "_prof", None)
-        if prof is not None:
-            torch.cuda.synchronize()
-            _t0 = time.perf_counter()
         # Dynamic MX quant of the activations (same per-1x32 MX path as MegaMoEV2); the
         # scales are natural [m, H/32], which dispatch copies verbatim into pscale.  SBX:
-        # sbx_send quantizes the bf16 rows itself (8x MI355X graph mtpr 256 vs the host
-        # quant: a8 bs1..256 -6.5..-1.3%, a4 -6.0..-2.7%).
+        # sbx_send quantizes the bf16 rows itself (one launch less).
         if sbx_on(cfg.small):
             x_q, xs = x_bf16.contiguous(), None
         elif run_tokens:
@@ -545,14 +559,19 @@ class MegaMoeEPEngine:
                 x_bf16.contiguous(), quant_mode="fp8" if self.a8 else "fp4"
             )
         else:  # HIP rejects the quant's zero grid; the rank still launches (peers wait on it)
-            x_q = torch.empty((0, self.H if self.a8 else self.H // 2), dtype=torch.uint8,
-                              device=self.device)
+            x_q = torch.empty(
+                (0, self.H if self.a8 else self.H // 2),
+                dtype=torch.uint8,
+                device=self.device,
+            )
             xs = torch.empty((0, self.H // 32), dtype=torch.uint8, device=self.device)
         if stream is None:
             stream = torch.cuda.current_stream()
         # combine_final writes every row of [0, run_tokens); only the unsliced tail needs zeros
         with torch.cuda.stream(stream):
-            out = torch.empty((self.mtpr, self.H), dtype=torch.bfloat16, device=self.device)
+            out = torch.empty(
+                (self.mtpr, self.H), dtype=torch.bfloat16, device=self.device
+            )
             if not slice_output:
                 out[run_tokens:].zero_()
         # recv_le init (SENTINEL = epr, masked by the planner) on the kernel stream, so it
@@ -563,16 +582,9 @@ class MegaMoeEPEngine:
             if not sbx_on(cfg.small):
                 self._recv.local.fill_(self.epr)
                 self._ecnt.zero_()  # per-expert position counters for the balanced-gather pre-pass
-        if prof is not None:
-            torch.cuda.synchronize()
-            _t1 = time.perf_counter()
         _run_compiled(
             fn, *self._launch_args(run_tokens, x_q, xs, topk_ids, wts, out), stream
         )
-        if prof is not None:
-            torch.cuda.synchronize()
-            _t2 = time.perf_counter()
-            prof.append((_t1 - _t0, _t2 - _t1))
         return out[:run_tokens] if slice_output else out
 
     __call__ = forward

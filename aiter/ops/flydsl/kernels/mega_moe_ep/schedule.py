@@ -13,14 +13,12 @@ adapted to expert parallelism:
 * a local expert routed by ``R`` received tokens runs as ``ceil(R / rch)`` row chunks
   (echunks), whose n-tiles the CTAs of the owning XCD pull from a tile queue.
 
-The GEMM1+act+GEMM2 body (``unit_tile``) and the per-expert received-row gather
-(``gather_recv_chunk``) are stubs filled by the compute / dispatch milestones; the
-planner only needs the per-expert row counts the route scan already wrote to ``L_DCNT``.
+``compute_units`` runs the whole compute side of one launch: the dispatch sends, the
+position pre-pass and plan, the per-echunk received-row gather (``gather_recv_chunk``)
+and the per-XCD GEMM1 -> GEMM2 tile queue.
 """
 
 from __future__ import annotations
-
-import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -45,21 +43,14 @@ from .common import (
     lds_ld_i32,
     lds_st,
     lds_st_rel,
-    now,
     rsrc,
     wait_lgkm0,
     wait_vm,
     wave_rank,
 )
-
-# Device-phase profiling (matches mega_moe_ep_kernel._PROF): slots 4,5 are stamped in
-# compute_units (post routing wait / post dyn_plan) to split the `roles` phase.
-_PROF = bool(int(os.environ.get("EP_PROF_DEV", "0")))
-_PROF_SLOTS = 24  # +7 post-gemm1, +8 post-gemm2, +9/10/11 (see mega_moe_ep_kernel)
 from .mega_moe_ep_config import (
     C_BARCNT,
     C_BARGEN,
-    C_EBASE,
     C_ELAST,
     C_NACT,
     C_NCH,
@@ -88,7 +79,10 @@ __all__ = ["build_schedule"]
 def _hw_xcc_id():
     return fx.Int32(
         _llvm.InlineAsmOp(
-            T.i32, [], "s_getreg_b32 $0, hwreg(HW_REG_XCC_ID, 0, 4)", "=s",
+            T.i32,
+            [],
+            "s_getreg_b32 $0, hwreg(HW_REG_XCC_ID, 0, 4)",
+            "=s",
             has_side_effects=True,
         ).result
     )
@@ -102,26 +96,26 @@ def build_schedule(kc: KernelCtx) -> dict:
     ECNT2, CE_BITS, L_DIX, NDIXW = kc.get("ECNT2 CE_BITS L_DIX NDIXW")
     const_expr, rch, N_TILES = kc.get("const_expr rch N_TILES")
     HWBAR = kc.get("HWBAR")[0]
-    N_TILES2, INTER_XBASE = kc.get("N_TILES2 INTER_XBASE")
+    N_TILES2 = kc.get("N_TILES2")[0]
     # The inline-A GEMMs (gemm.build_gemm) and the combine epilogue
     # (communication.build_communication) are added to kc before build_schedule.
     gemm1_nw8, gemm2_scatter_nw8 = kc.get("gemm1_nw8 gemm2_scatter_nw8")
     comb_arrive_rows = kc.get("comb_arrive_rows")[0]
     QLA = kc.get("QLA")[0]
+    PB, PBK, L_PBC, PBSG = kc.get("PB PBK L_PBC PBSG")
     SBXP, sbx_send, sbx_wait = kc.get("SBXP sbx_send sbx_wait")
     src_windows, sbx_done, sbx_scrub = kc.get("src_windows sbx_done sbx_scrub")
     sbx_wait_hdr, sbx_tag = kc.get("sbx_wait_hdr sbx_tag")
     _sbx_word = kc.get("sbx_word")[0]
-    _pmark = kc.get("_pmark")[0]
     dispatch_route_all, payload_send_ovl = kc.get("dispatch_route_all payload_send_ovl")
+    payload_hot0 = kc.get("payload_hot0")[0]
     payload_wait, payload_reset = kc.get("payload_wait payload_reset")
     SDMAD, sd_rows, sd_wait_c = kc.get("SDMAD sd_rows sd_wait_c")
-    NSXK, OVG0K = kc.get("NSXK OVG0K")
+    NSXK, OVG0K, OWS = kc.get("NSXK OVG0K OWS")
     report = kc.get("report")[0]
     dispatch_wait_meta = kc.get("dispatch_wait_meta")[0]
     grid_bar = kc.get("grid_bar")[0]
     ctrl_at, spin_sys_ge = kc.get("ctrl_at spin_sys_ge")
-    L_PF_ = kc.get("L_PF")[0]
     NW, NT = kc.get("NW NT")
     # The plan hand-off (ecnt, rowlist) goes through memory with system-scope accesses
     # and each XCD gathers only its own tile-queue echunks, so neither barrier before the
@@ -132,9 +126,30 @@ def build_schedule(kc: KernelCtx) -> dict:
     # each XCD buckets the rows of its own expert-aligned echunk range with an XCD-private
     # position counter, so the plan needs neither the grid barrier nor rowlist / gather.
     SBP = SBXP
-    # SBP up to this many NT-route rounds: every CTA ranks its XCD's routes itself (sb_local)
-    SBL_ROUNDS = 4
+    # SBP up to SBL_ROUNDS NT-route rounds, or up to SBLX rounds when the expert-snapped
+    # split's largest XCD range exceeds SBIMB/8 of the even share (hot experts): sb_local,
+    # every CTA ranks its XCD's routes itself on the even (unsnapped) split, so a hot
+    # expert's echunks may span XCDs.
+    SBL_ROUNDS, SBLX, SBIMB = 8, 24, 10
+    XHOT, L_SEG = kc.get("XHOT L_SEG")
+    SG_S, SG_E, SG_C = 4, 4 + EPR + 1, 4 + 2 * EPR + 1  # L_SEG words
+
+    def _sg(base, i):
+        return L_SEG + (i32(base) + i) * i32(4)
+
+    def _tab(L, j):
+        """Start of echunk group j: active expert j, or (XHOT) this XCD's segment j."""
+        return lds_ld_i32(L, _sg(SG_S, j) if XHOT else L_DCH + j * i32(4))
+
+    def _ngrp(L):
+        return lds_ld_i32(L, L_SEG + 8 if XHOT else L_CTL + C_NACT * 4)
+
+    def _q0(L):
+        """First echunk L_DIX covers: 0, or (XHOT) this XCD's range start."""
+        return lds_ld_i32(L, L_SEG) if XHOT else i32(0)
+
     assert L_EOFF is not None and const_expr  # L_EOFF: gather offsets (future)
+
     @flyc.jit
     def cbar(L, tid):
         """The four compute waves' LDS generation barrier (TP ``communication.cbar``)."""
@@ -188,20 +203,21 @@ def build_schedule(kc: KernelCtx) -> dict:
     def _dch_search(L, q):
         """Active index j of echunk q: binary search of the active-expert chunk prefix
         L_DCH (_chunk_table) for the last start <= q."""
-        nact = lds_ld_i32(L, L_CTL + C_NACT * 4)
+        nact = _ngrp(L)
         j = i32(0)
         for b in range_constexpr((EPR - 1).bit_length() - 1, -1, -1):
             cand = j + i32(1 << b)
-            st = lds_ld_i32(L, L_DCH + fx.min(cand, i32(EPR)) * i32(4))
+            st = _tab(L, fx.min(cand, i32(EPR)))
             j = ((cand < nact) & (st <= q)).select(cand, j)
         return j
 
     @flyc.jit
     def _dch_j(L, q):
         j = i32(0)
-        if q < i32(4 * NDIXW):
-            w = lds_ld_i32(L, L_DIX + q.shrui(i32(2)) * i32(4))
-            j = w.shrui((q & i32(3)) * i32(8)) & i32(0xFF)
+        r = q - _q0(L)
+        if r < i32(4 * NDIXW):
+            w = lds_ld_i32(L, L_DIX + r.shrui(i32(2)) * i32(4))
+            j = w.shrui((r & i32(3)) * i32(8)) & i32(0xFF)
         else:
             j = _dch_search(L, q)
         return j
@@ -210,25 +226,38 @@ def build_schedule(kc: KernelCtx) -> dict:
     def _dix_fill(L, tid):
         """L_DIX[q] = active index of echunk q (q < 4*NDIXW): one search per word, then
         j advances by at most one per echunk (every active expert has >= 1 chunk)."""
-        nw = fx.min(ceildiv(lds_ld_i32(L, L_CTL + C_NCH * 4), i32(4)), i32(NDIXW))
+        if const_expr(XHOT):
+            nq = lds_ld_i32(L, L_SEG + 4) - _q0(L)
+        else:
+            nq = lds_ld_i32(L, L_CTL + C_NCH * 4)
+        nw = fx.min(ceildiv(nq, i32(4)), i32(NDIXW))
         for w_ in range(tid, nw, i32(NT)):
             w = i32(w_)
-            q = w * i32(4)
+            q = _q0(L) + w * i32(4)
             j = _dch_search(L, q)
             word = j
             for k in range_constexpr(1, 4):
-                nxt = lds_ld_i32(L, L_DCH + (j + i32(1)) * i32(4))
+                nxt = _tab(L, j + i32(1))
                 j = (nxt <= q + i32(k)).select(j + i32(1), j)
                 word = word | (j << i32(8 * k))
             lds_st(L, L_DIX + w * i32(4), word)
 
     def dch(L, q):
-        """(expert, c, ce) of echunk q: chunk c of the expert's ce chunks."""
+        """(expert, c, ce, c0) of echunk q: chunk c of its group's ce chunks, the group
+        starting at the expert's chunk c0 (the group is the expert's chunks, or XHOT
+        this XCD's segment of them)."""
         j = _dch_j(L, q) if NDIXW else _dch_search(L, q)
-        s0 = lds_ld_i32(L, L_DCH + j * i32(4))
-        s1 = lds_ld_i32(L, L_DCH + (j + i32(1)) * i32(4))
+        s0 = _tab(L, j)
+        s1 = _tab(L, j + i32(1))
+        if const_expr(XHOT):
+            return (
+                lds_ld_i32(L, _sg(SG_E, j)),
+                q - s0,
+                s1 - s0,
+                lds_ld_i32(L, _sg(SG_C, j)),
+            )
         expert = lds_ld_i32(L, L_DYN + (i32(2 * NBW) + j) * i32(4))
-        return expert, q - s0, s1 - s0
+        return expert, q - s0, s1 - s0, i32(0)
 
     def dch_rows(L, expert, c):
         """Valid rows of chunk c of ``expert`` (the last chunk may be partial)."""
@@ -238,27 +267,55 @@ def build_schedule(kc: KernelCtx) -> dict:
         """Active index of (active) local expert e (its L_DCH slot)."""
         wv = lds_ld_i32(L, L_DYN + (e >> i32(5)) * i32(4))
         low = (i32(1) << (e & i32(31))) - i32(1)
-        return lds_ld_i32(L, L_DYN + (i32(NBW) + (e >> i32(5))) * i32(4)) + _ctpop(wv & low)
+        return lds_ld_i32(L, L_DYN + (i32(NBW) + (e >> i32(5))) * i32(4)) + _ctpop(
+            wv & low
+        )
 
     def _xsnap(L, b, nch):
         """Echunk boundary b snapped to the nearer start of the expert group holding it."""
-        _, c, ce = dch(L, b)
+        _, c, ce, _ = dch(L, b)
         s0 = b - c
         return fx.min(fx.max(((c + c) <= ce).select(s0, s0 + ce), i32(0)), nch)
 
-    def _xrange(L, nch, x):
-        """XCD x's tile-queue echunks [lo, hi): an even split of nch; SBP snaps the bounds to
-        expert groups so one XCD owns all of an expert's echunks."""
+    def _xrange(L, nch, x, a):
+        """XCD x's tile-queue echunks [lo, hi): an even split of nch; SBP outside sb_local
+        snaps the bounds to expert groups so one XCD owns all of an expert's echunks
+        (sb_bucket's XCD-private positions need it; sb_local's deterministic ones do not).
+        """
+        if const_expr(XHOT):  # this XCD's (x's) range, from _seg_table
+            return lds_ld_i32(L, L_SEG), lds_ld_i32(L, L_SEG + 4)
         lo = x * nch // i32(N_XCD)
         hi = (x + i32(1)) * nch // i32(N_XCD)
         if SBP:
-            lo = (x == i32(0)).select(i32(0), _xsnap(L, lo, nch))
-            hi = (x == i32(N_XCD - 1)).select(nch, _xsnap(L, hi, nch))
+            lo_s = (x == i32(0)).select(i32(0), lds_ld_i32(L, L_WSUM + x * i32(4)))
+            hi_s = (x == i32(N_XCD - 1)).select(
+                nch, lds_ld_i32(L, L_WSUM + (x + i32(1)) * i32(4))
+            )
+            split = _sbl(a)
+            lo = split.select(lo, lo_s)
+            hi = split.select(hi, hi_s)
         return lo, hi
 
     def _sbl(a):
-        """SBP batch small enough for sb_local."""
-        return _rwin(a) <= i32(SBL_ROUNDS * NT)
+        """SBP batch on sb_local (_sb_mode)."""
+        return a["sbl"]
+
+    @flyc.jit
+    def _sb_mode(L, tid, a, nch):
+        """sb_local for batches up to SBL_ROUNDS rounds, or up to SBLX rounds when the
+        snapped split's largest XCD range exceeds SBIMB/8 of nch/N_XCD; identical on every
+        CTA (from L_DCH).  L_WSUM[x] = snapped bound x (0 < x < N_XCD), for _xrange."""
+        sbl = _rwin(a) <= i32(SBL_ROUNDS * NT)
+        if (tid >= i32(1)) & (tid < i32(N_XCD)):
+            lds_st(L, L_WSUM + tid * i32(4), _xsnap(L, tid * nch // i32(N_XCD), nch))
+        cbar(L, tid)
+        prev, mx = i32(0), i32(0)
+        for x in range_constexpr(1, N_XCD + 1):
+            b = nch if x == N_XCD else lds_ld_i32(L, L_WSUM + i32(x * 4))
+            mx = fx.max(mx, b - prev)
+            prev = b
+        imb = mx * i32(8 * N_XCD) > nch * i32(SBIMB)
+        return sbl | ((_rwin(a) <= i32(SBLX * NT)) & imb)
 
     def _wave_prefix(v, bits):
         pre, tot = i32(0), i32(0)
@@ -328,6 +385,67 @@ def build_schedule(kc: KernelCtx) -> dict:
             lds_st(L, L_CTL + C_NCH * 4, base)
 
     @flyc.jit
+    def _seg_table(L, tid, nch):
+        """XHOT (wave 0, lane j = active expert j): the echunk list reordered XCD-major --
+        XCD x's range [X0, X1) holds chunks [x ce / 8, (x + 1) ce / 8) of every hot expert
+        (ce * 64 > XHOT * nch) and the even share x of the other experts' chunks (in
+        expert order, as without XHOT), as one segment per expert ordered by (payload
+        round le % OVL_LB, expert), so every XCD starts on the earliest-sent rows."""
+        if tid < i32(64):
+            x = i32(gpu.block_id("x")) % i32(N_XCD)
+            nact = lds_ld_i32(L, L_CTL + C_NACT * 4)
+            live = tid < nact
+            jj = fx.min(tid, i32(EPR - 1))
+            s0 = lds_ld_i32(L, L_DCH + jj * i32(4))
+            ce = live.select(lds_ld_i32(L, L_DCH + (jj + i32(1)) * i32(4)) - s0, i32(0))
+            expert = lds_ld_i32(L, L_DYN + (i32(2 * NBW) + jj) * i32(4))
+            hot = ce * i32(64) > nch * i32(XHOT)
+            hc = hot.select(ce, i32(0))
+            cc = hot.select(i32(0), ce)
+            cpre, ctot = _wave_prefix(cc, CE_BITS)
+            if const_expr(PB):  # PB: hot chunks x, x + 8, ... (as many as c % 8 == x)
+                hlo = (hc // i32(N_XCD)) * x + fx.min(hc % i32(N_XCD), x)
+            else:
+                hlo = x * hc // i32(N_XCD)
+            k0 = x * ctot // i32(N_XCD)
+            k1 = (x + i32(1)) * ctot // i32(N_XCD)
+            lo = hot.select(hlo, fx.max(k0 - cpre, i32(0)))
+            if const_expr(PB):
+                hhi = (
+                    hlo
+                    + hc // i32(N_XCD)
+                    + (x < hc % i32(N_XCD)).select(i32(1), i32(0))
+                )
+            else:
+                hhi = (x + i32(1)) * hc // i32(N_XCD)
+            hi = hot.select(hhi, fx.min(k1 - cpre, cc))
+            ln = fx.max(hi - lo, i32(0))
+            _, x0h = _wave_prefix(hlo, CE_BITS)
+            x0 = x0h + k0
+            emit = ln > i32(0)
+            st, k, acc, kacc = i32(0), i32(0), i32(0), i32(0)
+            for g in range_constexpr(OVL_LB):
+                sel = emit & (expert % i32(OVL_LB) == i32(g))
+                p, t = _wave_prefix(sel.select(ln, i32(0)), CE_BITS)
+                b, n = wave_rank(sel)
+                st = sel.select(acc + p, st)
+                k = sel.select(kacc + b, k)
+                acc = acc + t
+                kacc = kacc + n
+            c0w = (
+                hot.select(i32(-1) - x, lo) if PB else lo
+            )  # PB: hot c0 = -1 - x (_ach)
+            if emit:
+                lds_st(L, _sg(SG_S, k), x0 + st)
+                lds_st(L, _sg(SG_E, k), expert)
+                lds_st(L, _sg(SG_C, k), c0w)
+            if tid == i32(0):
+                lds_st(L, L_SEG, x0)
+                lds_st(L, L_SEG + 4, x0 + acc)
+                lds_st(L, L_SEG + 8, kacc)
+                lds_st(L, _sg(SG_S, kacc), x0 + acc)
+
+    @flyc.jit
     def pre_pos(L, tid, a):
         """Balanced-gather pre-pass (pre-sort): give every received (token,route) pair a
         GLOBAL per-local-expert position (0..R_e-1 rank) via an agent-scope atomic counter
@@ -335,7 +453,8 @@ def build_schedule(kc: KernelCtx) -> dict:
         ``rowlist[le*cap + pos]`` (cap = npes*mtpr: a token routes to an expert at most
         once).  Strided across ALL CTAs x threads so each recv slot is visited exactly
         once; the gather then reads a chunk's RG rows by position -- O(RG), no rescan of
-        the npes x m x topk window per echunk."""
+        the npes x m x topk window per echunk.  One atomic per (wave, local expert): a
+        hot expert's routes would otherwise serialize on one address."""
         del L
         rle = rsrc(a["recv_le"], a["nrecv"] * i32(4))
         cap = a["npes"] * a["mtpr"]
@@ -343,11 +462,36 @@ def build_schedule(kc: KernelCtx) -> dict:
         ecnt = fx.Int64(a["ecnt"])
         base = i32(gpu.block_id("x")) * i32(NT) + tid
         gstride = i32(gpu.grid_dim.x) * i32(NT)
-        for c_ in range(base, _rwin(a), gstride):
-            idx, le = _recv_le_at(a, rle, i32(c_))
-            if masked(le) == fx.Boolean(False):
-                pos = g_add_agent(ecnt + fx.Int64(le) * fx.Int64(4), i32(1))
-                bst(idx, rlist, (le * cap + pos) * i32(4), 0, AUX_PL)
+        # wave-uniform trip count (full waves for the match ballots); each group of
+        # same-expert lanes takes one atomic of its size at its lowest lane
+        lane = tid % i32(64)
+        n = _rwin(a)
+        for c0_ in range(base - lane, n, gstride):
+            c = i32(c0_) + lane
+            idx, le = _recv_le_at(a, rle, fx.min(c, n - i32(1)))
+            own = (c < n) & (masked(le) == fx.Boolean(False))
+            if const_expr(PB):  # key (expert, token bucket), bucket-major rows
+                jb = _win_bucket(a, fx.min(c, n - i32(1)))
+                key = own.select(le * i32(PB) + jb, i32(EPR * PB))
+                below, cnt, lead = _match_lead(key, lane, (EPR * PB).bit_length())
+            else:
+                key = own.select(le, i32(EPR))
+                below, cnt, lead = _match_lead(key, lane, EPR.bit_length())
+            p0 = i32(0)
+            if own & (below == i32(0)):
+                p0 = g_add_agent(ecnt + fx.Int64(key) * fx.Int64(4), cnt)
+            p0 = gpu.shuffle(p0, lead, 64, mode="idx")
+            if own:
+                if const_expr(PB):
+                    bst(
+                        idx,
+                        rlist,
+                        (le * cap + jb * _capj(a) + p0 + below) * i32(4),
+                        0,
+                        AUX_PL,
+                    )
+                else:
+                    bst(idx, rlist, (le * cap + p0 + below) * i32(4), 0, AUX_PL)
 
     def _epoch_bump(a):
         # skip 0 (the zeroed flags would pass its waits) by 2: the parity banks alternate
@@ -358,9 +502,42 @@ def build_schedule(kc: KernelCtx) -> dict:
         """Routes of local expert e: SBP's own LDS count, else pre_pos's global ecnt."""
         if SBP:
             return lds_ld_i32(L, L_DCNT + e * i32(4))
-        cnt = fx.Int32(bld(recnt, e * i32(4), 0, T.i32, AUX_PL))
+        if PB:  # sum the buckets, keep their inclusive prefix
+            cnt = i32(0)
+            for jb in range_constexpr(PB):
+                cnt = cnt + fx.Int32(
+                    bld(recnt, (e * i32(PB) + i32(jb)) * i32(4), 0, T.i32, AUX_PL)
+                )
+                lds_st(L, L_PBC + (e * i32(PB) + i32(jb)) * i32(4), cnt)
+        else:
+            cnt = fx.Int32(bld(recnt, e * i32(4), 0, T.i32, AUX_PL))
         lds_st(L, L_DCNT + e * i32(4), cnt)  # distinct e per thread: no race
         return cnt
+
+    def _capj(a):
+        """Rowlist slots per (expert, token bucket) (kernel_config asserts PB | mtpr)."""
+        return a["npes"] * (a["mtpr"] // i32(PB))
+
+    def _win_bucket(a, c):
+        """Token bucket of routing-window entry c (its source's
+        token * PB // m)."""
+        o = a["sbo"]
+        base, nxt = i32(0), o[1]
+        for j in range_constexpr(1, MAX_NPES):
+            ge = c >= o[j]
+            base = ge.select(o[j], base)
+            nxt = ge.select(o[j + 1], nxt)
+        return ((c - base) // i32(TOPK)) * i32(PB) // ((nxt - base) // i32(TOPK))
+
+    def _pb_pos(L, expert, q):
+        """(bucket, position in it) of the expert's bucket-major row q."""
+        jb, bs = i32(0), i32(0)
+        for k in range_constexpr(1, PB):
+            P = lds_ld_i32(L, L_PBC + (expert * i32(PB) + i32(k - 1)) * i32(4))
+            ge = q >= P
+            jb = ge.select(i32(k), jb)
+            bs = ge.select(P, bs)
+        return jb, q - bs
 
     def _rwin(a):
         """Routing-window size: every source's own m_p * topk (src_windows prefix)."""
@@ -431,7 +608,7 @@ def build_schedule(kc: KernelCtx) -> dict:
             t = i32(t_)
             ei = lo + t // i32(rch)
             r = t - (t // i32(rch)) * i32(rch)
-            expert, cc, _ = dch(L, ei)
+            expert, cc, _, _ = dch(L, ei)
             if r >= dch_rows(L, expert, cc):
                 off = (ei * i32(rch) + r) * i32(4)
                 bst(i32(0), r_rowidx, off, 0, 0)
@@ -440,16 +617,32 @@ def build_schedule(kc: KernelCtx) -> dict:
     def _pop64(m):
         return _ctpop(i32(m & fx.Int64(0xFFFFFFFF))) + _ctpop(i32(m >> fx.Int64(32)))
 
-    def _match_rank(key, lane, bits):
-        """(lanes below with the same key, lanes with the same key) of a fully active
-        wave; key < 2**bits."""
+    def _match_mask(key, bits):
         m = fx.Int64(-1)
         for b in range_constexpr(bits):
             hit = ((key >> i32(b)) & i32(1)) == i32(1)
             bal = fx.Int64(rocdl.ballot(T.i64, hit))
             m = m & hit.select(bal, bal ^ fx.Int64(-1))
+        return m
+
+    def _match_rank(key, lane, bits):
+        """(lanes below with the same key, lanes with the same key) of a fully active
+        wave; key < 2**bits."""
+        m = _match_mask(key, bits)
         lt = (fx.Int64(1) << fx.Int64(lane)) - fx.Int64(1)
         return _pop64(m & lt), _pop64(m)
+
+    def _match_lead(key, lane, bits):
+        """_match_rank plus the lowest lane with the same key."""
+        m = _match_mask(key, bits)
+        lt = (fx.Int64(1) << fx.Int64(lane)) - fx.Int64(1)
+        lo = i32(m & fx.Int64(0xFFFFFFFF))
+        hi = i32(m >> fx.Int64(32))
+        lead = (lo != i32(0)).select(
+            _ctpop((lo & (i32(0) - lo)) - i32(1)),
+            i32(32) + _ctpop((hi & (i32(0) - hi)) - i32(1)),
+        )
+        return _pop64(m & lt), _pop64(m), lead
 
     @flyc.jit
     def sb_local(L, tid, a, lo, hi):
@@ -463,7 +656,10 @@ def build_schedule(kc: KernelCtx) -> dict:
         rle = rsrc(a["recv_le"], a["nrecv"] * i32(4))
         n = _rwin(a)
         w = tid // i32(64)
-        LW, LB = L_C, L_C + NW * EPR * 4  # per-wave key counts | running per-expert base
+        LW, LB = (
+            L_C,
+            L_C + NW * EPR * 4,
+        )  # per-wave key counts | running per-expert base
         for e_ in range(tid, i32(EPR), i32(NT)):
             lds_st(L, LB + i32(e_) * i32(4), i32(0))
         for rnd_ in range(i32(0), ceildiv(n, i32(NT)), i32(1)):
@@ -472,7 +668,9 @@ def build_schedule(kc: KernelCtx) -> dict:
             own = (c < n) & (masked(le) == fx.Boolean(False))
             j = _act_rank(L, own.select(le, i32(0)))
             s0 = lds_ld_i32(L, L_DCH + j * i32(4))
-            own = own & (s0 >= lo) & (s0 < hi)
+            # every expert with an echunk in [lo, hi): its routes rank alike on each XCD
+            # holding part of it, and each XCD writes only its own echunks' rows
+            own = own & (s0 < hi) & (lds_ld_i32(L, L_DCH + (j + i32(1)) * i32(4)) > lo)
             key = own.select(le, i32(EPR))
             for t_ in range(tid, i32(NW * EPR), i32(NT)):
                 lds_st(L, LW + i32(t_) * i32(4), i32(0))
@@ -487,8 +685,10 @@ def build_schedule(kc: KernelCtx) -> dict:
                     wv = lds_ld_i32(L, LW + (i32(v * EPR) + key) * i32(4))
                     pos = pos + (i32(v) < w).select(wv, i32(0))
                 off = (s0 * i32(rch) + pos) * i32(4)
-                bst(idx, r_rowidx, off, 0, 0)
-                bst(idx // i32(TOPK), r_rowmap, off, 0, 0)
+                row = s0 * i32(rch) + pos
+                if (row >= lo * i32(rch)) & (row < hi * i32(rch)):
+                    bst(idx, r_rowidx, off, 0, 0)
+                    bst(idx // i32(TOPK), r_rowmap, off, 0, 0)
             cbar(L, tid)
             for e_ in range(tid, i32(EPR), i32(NT)):
                 e = i32(e_)
@@ -508,8 +708,9 @@ def build_schedule(kc: KernelCtx) -> dict:
         pre_pos's global ``ecnt`` (one value per local expert; pre_pos already did the
         agent-atomic scan of recv_le) -- so dyn_plan reads only EPR ints instead of
         re-scanning the whole npes x m x topk routing window (which otherwise contends for
-        HBM with the overlapped payload a2a).  The grid_bar before this publishes ecnt."""
-        recnt = rsrc(fx.Int64(a["ecnt"]), i32(EPR) * i32(4))
+        HBM with the overlapped payload a2a).  The grid_bar before this publishes ecnt.
+        """
+        recnt = rsrc(fx.Int64(a["ecnt"]), i32(EPR * PBK) * i32(4))
         for e_ in range(tid, i32(EPR), i32(NT)):
             e = i32(e_)
             cnt = _plan_cnt(L, recnt, e)
@@ -525,6 +726,9 @@ def build_schedule(kc: KernelCtx) -> dict:
         cbar(L, tid)
         _chunk_table(L, tid)
         cbar(L, tid)
+        if const_expr(XHOT):
+            _seg_table(L, tid, lds_ld_i32(L, L_CTL + C_NCH * 4))
+            cbar(L, tid)
         if const_expr(NDIXW):
             _dix_fill(L, tid)
             cbar(L, tid)
@@ -535,7 +739,8 @@ def build_schedule(kc: KernelCtx) -> dict:
         exactly positions [cc*RG, min((cc+1)*RG, R_e)) of the expert's pre-sorted bucket
         ``rowlist[expert*cap + pos]`` (pre_pos) -- a full RG-row tile, deterministic.
         L_RIX stores the recv slot idx (= source_key*topk + route); the GEMM reads payload
-        row idx//topk and combine recovers route/source from idx. ``ce`` is unused now."""
+        row idx//topk and combine recovers route/source from idx. ``ce`` is unused now.
+        """
         del ce
         cap = a["npes"] * a["mtpr"]
         rlist = rsrc(a["rowlist"], i32(EPR) * cap * i32(4))
@@ -543,17 +748,24 @@ def build_schedule(kc: KernelCtx) -> dict:
         R = fx.min(lds_ld_i32(L, L_DCNT + expert * i32(4)) - lo, i32(rch))
         for r_ in range(tid, R, i32(NT)):
             r = i32(r_)
-            idx = fx.Int32(bld(rlist, (expert * cap + lo + r) * i32(4), 0, T.i32, AUX_PL))
+            if const_expr(PB):
+                jb, pos = _pb_pos(L, expert, lo + r)
+                idx = fx.Int32(
+                    bld(
+                        rlist,
+                        (expert * cap + jb * _capj(a) + pos) * i32(4),
+                        0,
+                        T.i32,
+                        AUX_PL,
+                    )
+                )
+            else:
+                idx = fx.Int32(
+                    bld(rlist, (expert * cap + lo + r) * i32(4), 0, T.i32, AUX_PL)
+                )
             lds_st(L, L_RIX + r * i32(4), idx)
         cbar(L, tid)
         return R
-
-    @flyc.jit
-    def _prof_mark(tid, a, slot):
-        if const_expr(_PROF):  # noqa: SIM102 - compile-time gate, not dynamic
-            if tid == i32(0):
-                bst(now(), rsrc(a["dbg"]),
-                    (i32(gpu.block_id("x")) * i32(_PROF_SLOTS) + i32(slot)) * i32(8), 0, 0)
 
     # XCD x's CTAs pull tiles i = 0, 1, ... of its echunks [e_lo, e_lo + nx) from
     # ctrl[QCNT + x]: i < nx * N_TILES is a GEMM1 tile (_qtile), then GEMM2 the same way.
@@ -596,8 +808,9 @@ def build_schedule(kc: KernelCtx) -> dict:
         """Payload rounds every CTA sends up front (the rest go to the NSX senders)."""
         if OVG0K is not None:
             return i32(min(OVG0K, OVL_LB))
-        return (a["m"] >= i32(OVG0_MIN)).select(i32(min(OVG0_HI, OVL_LB)),
-                                                i32(min(OVG0_LO, OVL_LB)))
+        return (a["m"] >= i32(OVG0_MIN)).select(
+            i32(min(OVG0_HI, OVL_LB)), i32(min(OVG0_LO, OVL_LB))
+        )
 
     def _dynq_tile(L, j, NTn, e_lo, nx):
         """(echunk, n-tile, expert, chunk) of tile j of a pass over the XCD's echunks
@@ -606,14 +819,39 @@ def build_schedule(kc: KernelCtx) -> dict:
         # NTn * n_g tiles, so tile j lies in echunk e_lo + j // NTn's group; within it
         # n-tile-major, echunk minor
         q = e_lo + j // NTn
-        expert, c, ce = dch(L, q)
+        expert, c, ce, c0 = dch(L, q)
         g0 = q - c
         gs = fx.max(g0, e_lo)
         ng = fx.min(g0 + ce, e_lo + nx) - gs
         jj = j - NTn * (gs - e_lo)
+        if PB:  # a hot segment runs as PB sub-groups in send order
+            hot = c0 < i32(0)
+            # 2**lg sub-groups (<= PB) of >= PBSG echunks each
+            lg = i32(0)
+            for k in range_constexpr(1, PB.bit_length()):
+                lg = (ng >= i32(PBSG << k)).select(i32(k), lg)
+            sks = [
+                (i32(k) < (i32(1) << lg)).select((i32(k) * ng) >> lg, ng)
+                for k in range(1, PB)
+            ]
+            sl, sh = i32(0), ng
+            for k in range_constexpr(1, PB):
+                sl = (hot & (jj >= NTn * sks[k - 1])).select(sks[k - 1], sl)
+            for k in range_constexpr(PB - 1, 0, -1):
+                sh = (hot & (jj < NTn * sks[k - 1])).select(sks[k - 1], sh)
+            jj = jj - NTn * sl
+            ns_ = sh - sl
+            nt = jj // ns_
+            e = gs + sl + jj - nt * ns_
+            return e, nt, expert, _ach(c0, e - g0)
         nt = jj // ng
         e = gs + jj - nt * ng
-        return e, nt, expert, e - g0
+        return e, nt, expert, c0 + e - g0
+
+    def _ach(c0, c):
+        """Expert chunk of segment chunk c (c0 < 0: hot, XCD -1 - c0's
+        strided share)."""
+        return (c0 >= i32(0)).select(c0 + c, i32(-1) - c0 + c * i32(N_XCD))
 
     def _qtile(L, i, B1, e_lo, nx):
         """(is GEMM2, echunk, n-tile, expert, chunk) of queue index i (< TT)."""
@@ -631,15 +869,19 @@ def build_schedule(kc: KernelCtx) -> dict:
         """C_ROT = the first whole group (echunk offset from e_lo) whose expert is
         sent in round 0 (le % LB == 0), else 0; the walk starts there and wraps, so the
         groups come in send-round order."""
-        if tid == i32(0):
-            nact = lds_ld_i32(L, L_CTL + C_NACT * 4)
-            r0 = nx
-            for j in range_constexpr(EPR):
-                s = lds_ld_i32(L, L_DCH + i32(j * 4)) - e_lo
-                ex = lds_ld_i32(L, L_DYN + i32((2 * NBW + j) * 4))
-                hit = (i32(j) < nact) & (s >= i32(0)) & (s < nx) & (r0 == nx)
-                r0 = (hit & (ex % i32(OVL_LB) == i32(0))).select(s, r0)
-            lds_st(L, L_CTL + C_ROT * 4, (r0 == nx).select(i32(0), r0))
+        if const_expr(XHOT):  # the segments are in round order already
+            if tid == i32(0):
+                lds_st(L, L_CTL + C_ROT * 4, i32(0))
+        else:
+            if tid == i32(0):
+                nact = lds_ld_i32(L, L_CTL + C_NACT * 4)
+                r0 = nx
+                for j in range_constexpr(EPR):
+                    s = lds_ld_i32(L, L_DCH + i32(j * 4)) - e_lo
+                    ex = lds_ld_i32(L, L_DYN + i32((2 * NBW + j) * 4))
+                    hit = (i32(j) < nact) & (s >= i32(0)) & (s < nx) & (r0 == nx)
+                    r0 = (hit & (ex % i32(OVL_LB) == i32(0))).select(s, r0)
+                lds_st(L, L_CTL + C_ROT * 4, (r0 == nx).select(i32(0), r0))
         gpu.barrier()
 
     @flyc.jit
@@ -651,45 +893,59 @@ def build_schedule(kc: KernelCtx) -> dict:
         if const_expr(not SBXP):
             # the first NSX CTAs of each XCD send the remaining rounds, then join
             ns = fx.min(i32(NSXK * N_XCD), nblk)
-            if i32(gpu.block_id("x")) < ns:
-                t0 = fx.Int32(now())
-                payload_send_ovl(L, tid, a, i32(gpu.block_id("x")), ns, _ovg0(a), i32(OVL_LB))
-                if const_expr(_PROF):  # noqa: SIM102 - compile-time gate, not dynamic
-                    if tid == i32(0):
-                        lds_st(L, L_PF_ + i32(9 * 4), fx.Int32(now()) - t0)
+            bid = i32(gpu.block_id("x"))
+            npes = a["npes"]
+            if bid < ns:
+                if const_expr(
+                    OWS
+                ):  # sender bid: owner bid % npes (+ its deferred up-front rounds)
+                    po = bid % npes
+                    g_lo = _ovg0(a)
+                    g_lo = (((a["hv"] >> po) & i32(1)) == i32(1)).select(i32(0), g_lo)
+                    payload_send_ovl(
+                        L,
+                        tid,
+                        a,
+                        bid // npes,
+                        (ns - i32(1) - po) // npes + i32(1),
+                        g_lo,
+                        i32(OVL_LB),
+                        po,
+                        i32(0),
+                    )
+                else:
+                    payload_send_ovl(
+                        L, tid, a, bid, ns, _ovg0(a), i32(OVL_LB), i32(-1), i32(0)
+                    )
         cx = (nblk - i32(1) - x) // i32(N_XCD) + i32(1)
-        e_lo, e_hi = _xrange(L, nch, x)
+        e_lo, e_hi = _xrange(L, nch, x, a)
         nx = e_hi - e_lo
-        if const_expr(INTER_XBASE):  # noqa: SIM102 - compile-time gate, not dynamic
-            if tid == i32(0):  # published by _dynq_pull's cbar
-                lds_st(L, L_CTL + C_EBASE * 4, e_lo)
         # queue: GEMM1 tiles [0, B1), GEMM2 tiles [B1, TT)
         B1 = nx * i32(N_TILES)
         TT = B1 + nx * i32(N_TILES2)
         _ovl_rot(L, tid, e_lo, nx)
         qa = ctrl_at(a, i32(QCNT) + x)
-        _pmark(L, tid, i32(6))  # EP_PROF_DEV: start the per-tile split's clock
         _dynq_pull(L, tid, qa)
         i = lds_ld_i32(L, L_CTL + C_QIDX * 4)
         # QLA: the next pull runs between this tile's K-loop and its epilogue (a CTA
         # holding an unstarted GEMM1 tile is itself on a GEMM1 tile, which never waits)
         claim = None
         if const_expr(QLA):
+
             def claim():
                 _dynq_pull(L, tid, qa)
+
         while i < TT:
             g2, e, ntb, expert, cc = _qtile(L, i, B1, e_lo, nx)
             if g2:
                 rows = dch_rows(L, expert, cc)
                 echunk_wait(a, tid == i32(0), i32(ECNT1) + e, i32(N_TILES))
                 cbar(L, tid)
-                _pmark(L, tid, i32(13))
                 gemm2_scatter_nw8(L, tid, a, expert, e, rows, ntb, ntb + i32(1), claim)
                 if const_expr(QLA):
                     _dynq_done(L, tid, a, i32(ECNT2) + e)
                 else:
                     _dynq_next(L, tid, a, i32(ECNT2) + e, qa)
-                _pmark(L, tid, i32(11))
                 # the echunk's last GEMM2 tile: every part store of e is drained and every
                 # ECNT1 waiter of e has passed
                 if lds_ld_i32(L, L_CTL + C_ELAST * 4) == i32(N_TILES2 - 1):
@@ -701,22 +957,41 @@ def build_schedule(kc: KernelCtx) -> dict:
             else:
                 if const_expr(not SBXP):
                     if tid == i32(0):
-                        t0 = fx.Int32(now())
                         if const_expr(SDMAD):
                             sd_wait_c(L, a, expert % i32(OVL_LB))
+                        elif const_expr(PB):  # the buckets of rows [r_lo, r_hi)
+                            r_lo = cc * i32(rch)
+                            r_hi = r_lo + dch_rows(L, expert, cc)
+                            prev = i32(0)
+                            for jb in range_constexpr(PB):
+                                P = lds_ld_i32(
+                                    L, L_PBC + (expert * i32(PB) + i32(jb)) * i32(4)
+                                )
+                                if (prev < r_hi) & (P > r_lo):
+                                    payload_wait(
+                                        a, expert * i32(PB) + i32(jb), P - prev
+                                    )
+                                prev = P
                         else:
-                            payload_wait(a, expert, lds_ld_i32(L, L_DCNT + expert * i32(4)))
-                        if const_expr(_PROF):
-                            lds_st(L, L_PF_ + i32(8 * 4),
-                                   lds_ld_i32(L, L_PF_ + i32(8 * 4)) + fx.Int32(now()) - t0)
+                            payload_wait(
+                                a, expert, lds_ld_i32(L, L_DCNT + expert * i32(4))
+                            )
                     cbar(L, tid)
-                _pmark(L, tid, i32(12))
-                gemm1_nw8(L, tid, a, expert, e, ntb, ntb + i32(1), dch_rows(L, expert, cc), claim)
+                gemm1_nw8(
+                    L,
+                    tid,
+                    a,
+                    expert,
+                    e,
+                    ntb,
+                    ntb + i32(1),
+                    dch_rows(L, expert, cc),
+                    claim,
+                )
                 if const_expr(QLA):
                     _dynq_done(L, tid, a, i32(ECNT1) + e)
                 else:
                     _dynq_next(L, tid, a, i32(ECNT1) + e, qa)
-                _pmark(L, tid, i32(10))
             i = lds_ld_i32(L, L_CTL + C_QIDX * 4)
         if tid == i32(0):
             if i == TT + cx - i32(1):
@@ -731,14 +1006,6 @@ def build_schedule(kc: KernelCtx) -> dict:
                     payload_reset(a)
                 if const_expr(SBP):  # every CTA has read the epoch
                     _epoch_bump(a)
-        if const_expr(_PROF):  # noqa: SIM102 - slot 6: payload-wait ticks | send ticks << 32
-            if tid == i32(0):
-                bst(fx.Int64(lds_ld_i32(L, L_PF_ + i32(8 * 4)))
-                    + fx.Int64(lds_ld_i32(L, L_PF_ + i32(9 * 4))) * fx.Int64(1 << 32),
-                    rsrc(a["dbg"]), (i32(gpu.block_id("x")) * i32(_PROF_SLOTS) + i32(6)) * i32(8),
-                    0, 0)
-        _prof_mark(tid, a, 7)
-        _prof_mark(tid, a, 8)
 
     @flyc.jit
     def compute_units(L, tid, a):
@@ -750,32 +1017,34 @@ def build_schedule(kc: KernelCtx) -> dict:
         # then all of them run the planner + inline-A GEMM.
         if const_expr(SBXP):
             sbx_send(L, tid, a)
-            _prof_mark(tid, a, 19)
         else:  # the rest of the payload rounds later, by the senders (_dynq_passes_nw8)
             if const_expr(SDMAD):
                 sd_rows(L, tid, a)
             dispatch_route_all(L, tid, a)
-            _prof_mark(tid, a, 19)
-            payload_send_ovl(L, tid, a, i32(gpu.block_id("x")), i32(gpu.grid_dim.x),
-                             i32(0), _ovg0(a))
+            a["hv"] = payload_hot0(L, tid, a) if const_expr(OWS) else i32(0)
+            payload_send_ovl(
+                L,
+                tid,
+                a,
+                i32(gpu.block_id("x")),
+                i32(gpu.grid_dim.x),
+                i32(0),
+                _ovg0(a),
+                i32(-1),
+                a["hv"],
+            )
         gpu.barrier()
-        if const_expr(_PROF):  # noqa: SIM102 - compile-time gate, not dynamic
-            if tid == i32(0):  # post dispatch send (slot 9)
-                bst(now(), rsrc(a["dbg"]),
-                    (i32(gpu.block_id("x")) * i32(_PROF_SLOTS) + i32(9)) * i32(8), 0, 0)
         if const_expr(SBXP):
             sbx_wait_hdr(tid, a)
             cbar(L, tid)
             a["sbtag"] = sbx_tag(a)
         else:
             if tid == i32(0):
-                dispatch_wait_meta(a, a["epoch"] & i32(1), i32(0))  # wait ROUTING only (fast)
+                dispatch_wait_meta(
+                    a, a["epoch"] & i32(1), i32(0)
+                )  # wait ROUTING only (fast)
             cbar(L, tid)
         a["sbo"] = src_windows(a)
-        if const_expr(_PROF):  # noqa: SIM102 - compile-time gate, not dynamic
-            if tid == i32(0):  # post dispatch_wait_meta (slot 4)
-                bst(now(), rsrc(a["dbg"]),
-                    (i32(gpu.block_id("x")) * i32(_PROF_SLOTS) + i32(4)) * i32(8), 0, 0)
         # balanced-gather pre-pass: assign global per-expert positions, then a true
         # cross-CTA barrier (the scan is distributed) publishes rowlist to every CTA.
         # All of pre_pos / dyn_plan / PASS0-gather read only the routing (recv_le), so
@@ -785,20 +1054,16 @@ def build_schedule(kc: KernelCtx) -> dict:
             sb_count(L, tid, a)
         else:
             pre_pos(L, tid, a)
-            _prof_mark(tid, a, 20)
             # pre_pos's atomics returned and its rowlist stores went to memory
             wait_vm(0)
             cbar(L, tid)
             grid_bar(a, tid)
             cbar(L, tid)
-            if (i32(gpu.block_id("x")) == i32(0)) & (tid == i32(0)):  # every CTA has read it
+            if (i32(gpu.block_id("x")) == i32(0)) & (
+                tid == i32(0)
+            ):  # every CTA has read it
                 _epoch_bump(a)
-        _prof_mark(tid, a, 21)
         dyn_plan(L, tid, a)
-        if const_expr(_PROF):  # noqa: SIM102 - compile-time gate, not dynamic
-            if tid == i32(0):  # post dyn_plan (slot 5)
-                bst(now(), rsrc(a["dbg"]),
-                    (i32(gpu.block_id("x")) * i32(_PROF_SLOTS) + i32(5)) * i32(8), 0, 0)
         nch = lds_ld_i32(L, L_CTL + C_NCH * 4)
         nblk = i32(gpu.grid_dim.x)
         r_rowmap = rsrc(a["rowmap"])
@@ -806,29 +1071,39 @@ def build_schedule(kc: KernelCtx) -> dict:
         # --- PASS 0 (gather): walk this CTA's echunks, publish per-row recv-slot (rowidx,
         #     for combine) + payload-row (rowmap, for GEMM1's A-gather) to global.
         if const_expr(SBP):
-            x_lo, x_hi = _xrange(L, nch, i32(gpu.block_id("x")) % i32(N_XCD))
+            a["sbl"] = _sb_mode(L, tid, a, nch)
+            x_lo, x_hi = _xrange(L, nch, i32(gpu.block_id("x")) % i32(N_XCD), a)
             if _sbl(a):
                 sb_local(L, tid, a, x_lo, x_hi)
             else:
                 sb_bucket(L, tid, a, x_lo, x_hi)
-                _prof_mark(tid, a, 22)
                 xbar(L, tid, a)
-                if const_expr(SBXP):  # noqa: SIM102 - the XCD's position atomics returned: re-zero
+                # the XCD's position atomics returned: re-zero
+                if const_expr(SBXP):  # noqa: SIM102
                     if i32(gpu.block_id("x")) < i32(N_XCD):
                         for e_ in range(tid, i32(EPR), i32(NT)):
-                            g_st_sys(fx.Int64(a["ecnt"]) + fx.Int64(
-                                (i32(gpu.block_id("x")) * i32(EPR) + i32(e_)) * i32(4)), i32(0))
+                            g_st_sys(
+                                fx.Int64(a["ecnt"])
+                                + fx.Int64(
+                                    (i32(gpu.block_id("x")) * i32(EPR) + i32(e_))
+                                    * i32(4)
+                                ),
+                                i32(0),
+                            )
         else:
             # XCD x gathers its tile-queue echunks [x*nch/8, (x+1)*nch/8)
             gx = i32(gpu.block_id("x")) % i32(N_XCD)
-            g_lo = gx * nch // i32(N_XCD) + i32(gpu.block_id("x")) // i32(N_XCD)
-            g_hi = (gx + i32(1)) * nch // i32(N_XCD)
+            x_lo, g_hi = _xrange(L, nch, gx, a)
+            g_lo = x_lo + i32(gpu.block_id("x")) // i32(N_XCD)
             g_st = (nblk - i32(1) - gx) // i32(N_XCD) + i32(1)
             r_rpos = rsrc(a["mine"] + fx.Int64(a["off_rpos"]))
             for ei_ in range(g_lo, g_hi, g_st):
                 ei = i32(ei_)
-                expert, cc, ce = dch(L, ei)
-                R = gather_recv_chunk(L, tid, a, expert, cc, ce)  # -> L_RIX, R; ends in cbar
+                expert, cc, ce, c0 = dch(L, ei)
+                ach = _ach(c0, cc) if PB else c0 + cc
+                R = gather_recv_chunk(
+                    L, tid, a, expert, ach, ce
+                )  # -> L_RIX, R; ends in cbar
                 for r_ in range(tid, i32(rch), i32(NT)):
                     r = i32(r_)
                     idx = (r < R).select(lds_ld_i32(L, L_RIX + r * i32(4)), i32(0))
@@ -836,16 +1111,19 @@ def build_schedule(kc: KernelCtx) -> dict:
                     bst(idx, r_rowidx, off, 0, 0)
                     sk = idx // i32(TOPK)
                     if const_expr(SDMAD):  # the source's compacted row (sd_rows)
-                        sk = sk - sk % a["mtpr"] + fx.Int32(bld(r_rpos, sk * i32(4), 0, T.i32, AUX_PL))
+                        sk = (
+                            sk
+                            - sk % a["mtpr"]
+                            + fx.Int32(bld(r_rpos, sk * i32(4), 0, T.i32, AUX_PL))
+                        )
                     bst((r < R).select(sk, i32(0)), r_rowmap, off, 0, 0)
-                cbar(L, tid)  # done reading L_RIX before the next echunk's gather overwrites it
-            _prof_mark(tid, a, 22)
-        if const_expr(not SBP):  # GEMM tiles read only their own XCD's gather (SBP: synced above)
+                cbar(
+                    L, tid
+                )  # done reading L_RIX before the next echunk's gather overwrites it
+        if const_expr(
+            not SBP
+        ):  # GEMM tiles read only their own XCD's gather (SBP: synced above)
             xbar(L, tid, a)
-        if const_expr(_PROF):  # noqa: SIM102 - compile-time gate, not dynamic
-            if tid == i32(0):  # post gather (slot 10)
-                bst(now(), rsrc(a["dbg"]),
-                    (i32(gpu.block_id("x")) * i32(_PROF_SLOTS) + i32(10)) * i32(8), 0, 0)
         # payload wait: only NOW does the kernel need the dispatched activation (GEMM1's
         # A-gather). The planning + gather above overlapped the payload a2a, so this spin
         # is short (payload mostly landed). After it, the rows for every echunk are live.
@@ -853,18 +1131,6 @@ def build_schedule(kc: KernelCtx) -> dict:
         if const_expr(SBXP):
             sbx_wait(tid, a, FLAG_SBP, ERR_DISPATCH)
         cbar(L, tid)
-        if const_expr(_PROF):  # noqa: SIM102 - compile-time gate, not dynamic
-            if tid == i32(0):  # post payload wait (slot 11)
-                bst(now(), rsrc(a["dbg"]),
-                    (i32(gpu.block_id("x")) * i32(_PROF_SLOTS) + i32(11)) * i32(8), 0, 0)
         _dynq_passes_nw8(L, tid, a, nch, nblk)
-        if const_expr(_PROF):  # noqa: SIM102 - compile-time gate, not dynamic
-            if tid == i32(0):  # per-n-tile GEMM tick sums (gemm.py _pmark) -> slots 13..18
-                for k in range_constexpr(6):
-                    bst(fx.Int64(lds_ld_i32(L, L_PF_ + k * 4))
-                        + fx.Int64(lds_ld_i32(L, L_PF_ + (10 + k) * 4)) * fx.Int64(1 << 32),
-                        rsrc(a["dbg"]),
-                        (i32(gpu.block_id("x")) * i32(_PROF_SLOTS) + i32(13 + k)) * i32(8),
-                        0, 0)
 
     return locals()

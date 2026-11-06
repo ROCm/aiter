@@ -109,13 +109,15 @@ def nch_max(tmax: int, topk: int, rg: int, epr: int) -> int:
 
 def inter_rows(tmax: int, topk: int, epr: int, rg_max: int = 128) -> int:
     """Worst-case rows of the per-echunk scratch (inter / inters / rowmap / rowidx):
-    every received pair plus each local expert's partial last chunk at the largest RG."""
+    every received pair plus each local expert's partial last chunk at the largest RG.
+    """
     return tmax * topk + epr * rg_max
 
 
 def ctrl_ints(tmax: int, topk: int, epr: int, rg_min: int = 32) -> int:
     """ctrl ints covering ECNT1 / ECNT2 of any row tile >= ``rg_min``."""
     return ECNT1 + 2 * nch_max(tmax, topk, rg_min, epr)
+
 
 # Epoch-flag arena: ints in the symmetric arena ``off_flag`` region. Two banks selected
 # by epoch parity so a launch never races the previous one's slots. Each readiness tile
@@ -191,8 +193,7 @@ ECNT1 = 64
 # Tile queue: XCD x owns a contiguous echunk range and its CTAs pull single n-tiles from
 # an XCD-local atomic counter -- all GEMM1 tiles, then all GEMM2 tiles (each waits its
 # echunk's N_TILES GEMM1 tiles; the echunk's last GEMM2 tile arrives the combine).  No
-# idle CTAs, no partial rounds, no grid barrier between the GEMMs (vs a whole-echunk
-# walk: bs3072 -13%, bs6144 -6%).  An echunk's producers and consumers share the XCD's
+# idle CTAs, no partial rounds, no grid barrier between the GEMMs.  An echunk's producers and consumers share the XCD's
 # L2, so drained stores + the counter suffice; a CTA whose hardware XCC is not
 # bid % N_XCD reports ERR_COMPUTE.  The queue runs expert-major (an expert's n-tiles,
 # its echunks minor, so the expert's A stays in L2 across its n-tiles).
@@ -205,14 +206,26 @@ assert QDONE < ECNT1
 # XCD per round -- each counting its landed routes into the owner's FLAG_PAYC[le].
 # Every CTA sends the first rounds with the routing (before plan: the plan's grid
 # barriers would wait on any CTA still sending), then NSX CTAs per XCD send the rest
-# while the others start the tile queue.  The queue starts at the XCD's first round-0
-# expert, and a GEMM1 tile waits its expert's count (bs2048 -4%, 4096 -7%, 8192 -7%).
+# while the others start the tile queue.  The queue walks the XCD's experts in send-round
+# order, and a GEMM1 tile waits its expert's count.
 # The up-front rounds are picked per launch from m: OVG0_HI at m >= OVG0_MIN, else
-# OVG0_LO (8x MI355X a8w4 / a4w4, 1 vs 2 rounds: bs512 +2%, bs1024 even, bs2048..32768
-# -1..-4%; 0 rounds slower everywhere).  NSX 2 vs 4: a8w4 mtpr 32768 bs8192..32768
-# -1..-2%, elsewhere even (1 / 3 / 8 slower).
-NSX = 2
+# OVG0_LO.
+# Owner-split senders (non-SDMA): sender CTA b sends only owner b % npes's rounds, so a
+# destination whose ingress a hot round saturates no longer holds back the other owners'
+# later rounds.  Owners taking over HVT % of a strided token sample's round-0 sends --
+# except the sample's most-loaded owner -- skip the up-front rounds (they would stall
+# every CTA ahead of the plan's grid barrier on that owner's ingress); their senders
+# send those rounds first.  Deferring the most-loaded owner too would leave its senders
+# alone on the busiest ingress.
+NSX = 4
+HVT = 30
 OVG0_LO, OVG0_HI, OVG0_MIN = 2, 1, 1024
+# Large kernel: a local expert with more than XHOT/8 of an even XCD share of echunks is
+# hot -- its echunks are split evenly over the XCDs (the rest as before), and each XCD
+# walks its segments in payload round order, so a hot expert sent in a late round no
+# longer idles the XCDs it alone fills (schedule._seg_table).  A low threshold splits
+# every expert, so each XCD streams all experts' weights.
+XHOT_LARGE = 4
 # [SBX_SCNT, SBX_SCNT + MAX_NPES): SBX payload senders to owner d done (self-resetting;
 # the MAGG slots, unused by SBX)
 SBX_SCNT = MAGG_X
@@ -223,23 +236,27 @@ SBX_SCNT = MAGG_X
 # off(p, g) + pos (pos from per-(p, g) counters, then a grid barrier), into its own
 # arena's stage region (p == rank: straight into its payload); the round's last CTA posts
 # one put per (owner, payload / scale) and the owner waits the per-(source, queue)
-# signal counts instead of FLAG_PAYC.  The owner finds a row through recv_pos.
-# 8x MI355X a8w4 graph vs off: mtpr 32768 bs8192 / 16384 / 32768 -2 / -5 / -6%, mtpr 8192
-# bs4096 / 8192 -1%, bs2048 +4% (the extra counting pass + grid barrier, ~5 us per put).
+# signal counts instead of FLAG_PAYC.  The owner finds a row through recv_pos.  The
+# extra counting pass and grid barrier cost small batches.
 SDMA_ENV = int(os.environ.get("AITER_MEGAMOE_EP_SDMA", "0"))
 SD_QP, SD_QS = 1, 2  # SDMA queues: payload rows, their scales
 SD_GMAX = 8  # >= payload rounds (ceil(EPR / N_XCD))
 # sdst (local int32 tensor) slots
 SD_CNT = 0  # [MAX_NPES * SD_GMAX]: rows per (owner, round) (self-resetting)
-SD_RD = SD_CNT + MAX_NPES * SD_GMAX  # [SD_GMAX]: CTAs done packing round g (self-resetting)
-SD_TURN = SD_RD + SD_GMAX  # the next round to post (puts in round order; self-resetting)
+SD_RD = (
+    SD_CNT + MAX_NPES * SD_GMAX
+)  # [SD_GMAX]: CTAs done packing round g (self-resetting)
+SD_TURN = (
+    SD_RD + SD_GMAX
+)  # the next round to post (puts in round order; self-resetting)
 SD_SELF = SD_TURN + 1  # epoch * SD_GMAX + rounds of this rank's own rows written
 SD_LAND = SD_SELF + 1  # epoch * SD_GMAX + rounds some CTA saw landed from every source
-SD_BASE = SD_SELF + 7  # [MAX_NPES * 2]: this launch's signal base per (source, SD_QP / SD_QS)
+SD_BASE = (
+    SD_SELF + 7
+)  # [MAX_NPES * 2]: this launch's signal base per (source, SD_QP / SD_QS)
 SD_INTS = SD_BASE + 2 * MAX_NPES
 SD_DUM = 64  # bytes per source of the dummy-put target (a round without rows)
-# SDMA: the packing is local, so it takes more up-front rounds and sender CTAs (vs NSX /
-# OVG0: mtpr 32768 bs16384..32768 -2..-3%; all 6 rounds up front within 0.7%)
+# SDMA: the packing is local, so it takes more up-front rounds and sender CTAs
 SD_NSX, SD_OVG0 = 8, 2
 
 
@@ -253,11 +270,16 @@ def sbx_on(SB):
     return bool(SB)
 
 
+def pb_on(SB):
+    """Payload token buckets per source (kernel_config PB): 4 in the large kernel, none
+    in the SB kernel."""
+    return 0 if SB else 4
+
+
 def a_banks(SB):
     """GEMM K-loop A-ring banks: 4 (one barrier per two K-steps, A gathered two K-steps
-    ahead: -1% bs2048, -3% bs8192 vs 2), except the SB kernel's 2 (8x MI355X graph mtpr
-    256 vs 4: a4 mt4 bs1..256 -0.2..-3%, a8 bs1..256 -0.2..-2%; 2 banks in the large
-    kernel are +20% at a8 bs32768)."""
+    ahead), except the SB kernel's 2 (its few K-loops per CTA do not amortize the deeper
+    ring; the large kernel needs it at large m)."""
     return 2 if SB else 4
 
 
@@ -269,7 +291,6 @@ C_UROWS, C_USEQ, C_GEXP, C_CNT = 6, 7, 8, 9  # current unit rows / seq / gather 
 C_ELAST = 10  # old value of this CTA's last echunk-counter add (tid0 -> waves)
 C_QIDX = 11  # the tile index tid0 pulled from the XCD queue (tid0 -> waves)
 C_ROT = 14  # the expert-major walk's start group (in echunks from e_lo)
-C_EBASE = 15  # INTER_XBASE: first echunk of this CTA's XCD range (the inter base)
 C_SDL = 12  # SDMA: epoch * SD_GMAX + payload rounds this CTA saw landed (tid0)
 C_UL = 16  # per-CTA unit list base (records of 4 ints: expert_chunk, i0, icnt, kind)
 UL_MAX = (128 - C_UL) // 4
@@ -296,11 +317,7 @@ def mega_moe_ep_consts(
 ) -> dict:
     """Per-instance LDS layout (bytes): one row tile's activation + E8M0 scale +
     intermediate staging, plus the dynamic planner's tables (active-expert bitmap /
-    dense list, per-local-expert counts, chunk table, wave-prefix scratch, control).
-
-    TODO(compute): grow the A / B / scale / intermediate region into the full ring that
-    ``mega_moe_tp_consts`` carries once the GEMM device code lands.
-    """
+    dense list, per-local-expert counts, chunk table, wave-prefix scratch, control)."""
     RG = MT * 16  # rows per GEMM tile (sort_block_m)
     a_row = H if a8 else H // 2  # activation bytes per row (FP8 vs packed FP4)
     a_scale = H // 32  # E8M0 scale bytes per row
@@ -346,9 +363,11 @@ def mega_moe_ep_consts(
     # quantized intermediate goes to a GLOBAL buffer (like stage1->stage2), not LDS: a
     # full RG x inter tile would blow the 160 KB budget for FP8. The cshuffle epilogue
     # aliases the A pool (compile_gemm1 pattern); GEMM2 reads the intermediate from
-    # global. TODO(tune): keep it per-inter-piece in LDS to drop the global round-trip.
+    # global.
     c["L_A"] = take(lds_pool)  # A bank ring (GEMM1 + GEMM2); cshuffle is in L_C
-    c["L_AS"] = take(RG * a_scale)  # A-scale (E8M0) of one row tile (compute-side stage)
+    c["L_AS"] = take(
+        RG * a_scale
+    )  # A-scale (E8M0) of one row tile (compute-side stage)
     # GEMM2's cshuffle C-tile gets its OWN region (the A ring is staged ahead during the
     # epilogue, so it can't alias L_A).  GEMM1 uses a register epilogue (no C-tile);
     # GEMM2's cshuffle is processed one MFMA m-tile (16 rows) at a time, so L_C only
@@ -372,7 +391,11 @@ def mega_moe_ep_consts(
         RG * 4
     )  # gathered source_key (payload row) list of one unit chunk
     c["L_CTL"] = take(128 * 4)  # control slots (C_* above)
-    c["L_PF"] = take(64 * 4)  # EP_PROF_DEV scratch (gemm.py _pmark tick sums)
+    # large kernel (XHOT): this XCD's echunk range + segments (schedule._seg_table),
+    # [X0, X1, nseg, pad] | starts[EPR + 1] | experts[EPR] | chunk offsets[EPR]
+    c["L_SEG"] = None if SB else take((4 + 3 * EPR + 1) * 4)
+    # large kernel: per-(local expert, token bucket) inclusive position prefix
+    c["L_PBC"] = take(EPR * pb_on(SB) * 4) if pb_on(SB) else None
     c["LDS_BYTES"] = ceildiv(off, 128) * 128
     return c
 
@@ -414,16 +437,14 @@ def kernel_config(
     L_DYN, L_DCNT, L_WSUM = c["L_DYN"], c["L_DCNT"], c["L_WSUM"]
     L_DCH, L_EOFF, L_RIX, L_CTL = c["L_DCH"], c["L_EOFF"], c["L_RIX"], c["L_CTL"]
     L_DIX, NDIXW = c["L_DIX"], c["NDIXW"]
-    L_C, L_PF = c["L_C"], c["L_PF"]
+    L_C = c["L_C"]
     KS1, KS2, G2 = c["KS1"], c["KS2"], c["G2"]
     CH1, CH2, M_REPEAT = c["CH1"], c["CH2"], c["M_REPEAT"]
     N_TILES, NUM_ACC_N = c["N_TILES"], c["NUM_ACC_N"]
     A_K_STEP, K_ITERS, A_LDS_I32 = c["A_K_STEP"], c["K_ITERS"], c["A_LDS_I32"]
-    # GEMM1 inter-piece choices the planner balances over. BRING-UP: fixed at P=1 (no
-    # inter split). unit_tile fuses GEMM1->GEMM2 per unit and GEMM2 contracts the full
-    # inter dim, so one unit must own the whole inter dim; P>1 would feed GEMM2 an
-    # incomplete intermediate. TODO(tune): separate GEMM1/GEMM2 phases over a shared full
-    # intermediate to re-enable P>1 ([p for p in range(1, KS2+1) if KS2 % p == 0]).
+    # GEMM1 inter-piece choices the planner balances over: fixed at P=1 (no inter
+    # split).  GEMM2 contracts the full inter dim, so one unit must own the whole inter
+    # dim; P>1 would feed GEMM2 an incomplete intermediate.
     DYN_PS = [1]
     rch = RG  # dynamic row chunk = one row tile (16*mt)
     NCHM = nch_max(TMAX, TOPK, RG, EPR)
@@ -432,46 +453,63 @@ def kernel_config(
     # inter (/ inters) past 2 GB: rebase its 64-bit base per echunk so the 32-bit buffer
     # offsets stay within one echunk; rowmap / rowidx stay 32-bit
     REBASE_AUTO = inter_rows(TMAX, TOPK, EPR) * (I if a8 else I // 2) >= 2**31
-    # mt=8 (a4w4): the non-rebased per-echunk offset math spills its K-loop (e2e
-    # +11% bs8192), so it always rebases
+    # mt=8 (a4w4): the non-rebased per-echunk offset math spills its K-loop, so it
+    # always rebases
     INTER_REBASE = REBASE_AUTO or MT == 8
     SDMAD = not SB and bool(SDMA_ENV)
     NSXK = SD_NSX if SDMAD else NSX  # payload sender CTAs per XCD
     OVG0K = SD_OVG0 if SDMAD else None  # up-front payload rounds (None: by m, OVG0_*)
+    OWS = (
+        not SB and not SDMAD
+    )  # owner-split senders + hot-owner up-front deferral (NSX)
+    assert not OWS or NSXK * N_XCD >= MAX_NPES
     assert not SDMAD or ceildiv(EPR, N_XCD) <= SD_GMAX
-    # An XCD's tiles only touch its own echunk range [e_lo, e_lo + nx),
-    # nx <= ceil(nch / N_XCD) under any routing, so rebase once per CTA at e_lo (C_EBASE)
-    # instead of per echunk.  8x MI355X mtpr 32768: a8w4 bs8192..32768 -1..-2%; a4w4
-    # +1.5% (cause unknown), so a8 only.
-    INTER_XBASE = INTER_REBASE and a8
-    if INTER_XBASE:
-        assert ceildiv(NCHM, N_XCD) * RG * (I if a8 else I // 2) < 2**31
+    XHOT = 0 if SB else XHOT_LARGE
+    # Large kernel: per-(local expert, token bucket) payload readiness.  Every payload
+    # round goes in PB token buckets (bucket j: the source's tokens [j m / PB,
+    # (j + 1) m / PB)), each counted into FLAG_PAYC[le * PB + j] after its drain; pre_pos
+    # orders an expert's positions bucket-major and a GEMM1 tile waits only the buckets
+    # holding its rows.  Hot (XHOT) experts are split over the XCDs chunk-strided (XCD x:
+    # chunks x, x + 8, ...) and walked in sub-groups, so an expert that holds most of a
+    # rank's rows starts its GEMM1 before all of its payload has landed.
+    PB = pb_on(SB)
+    PBK = max(PB, 1)
+    # a sender of m tokens drains every PB / nb buckets (nb = min(PB, pow2 <= m // PBT):
+    # a drain per bucket costs more than it overlaps at small m); a hot segment of ng
+    # echunks runs in min(PB, max(1, ng // PBSG)) sub-groups
+    PBT = 2048
+    PBSG = 4
+    assert not PB or (
+        XHOT
+        and not SDMAD
+        and EPR * PB <= NCTA_MAX
+        and PB <= N_XCD
+        and PB & (PB - 1) == 0
+        and (TMAX // NPES) % PB == 0
+    )
     assert NCHM * RG * 4 < 2**31
     const_expr = fx.const_expr
     SBXP = sbx_on(SB)
     A_NBK = a_banks(SB)
     # SB kernel: cbar = wait_lgkm0 + s_barrier instead of the LDS generation barrier
-    # (every wave of the CTA computes, so the hardware barrier covers them all; 8x MI355X
-    # graph mtpr 256 bs1..256: a4 -0.4..-2.9%, a8 -1.3..-5.2%).  The large kernel keeps
-    # the LDS barrier: s_barrier there spills its mt8 K-loop (VGPR spill 38 -> 191,
-    # mtpr 8192 a4 bs2048 / 8192 +14%).
+    # (every wave of the CTA computes, so the hardware barrier covers them all).  The
+    # large kernel keeps the LDS barrier: s_barrier there spills its mt8 K-loop.
     HWBAR = bool(SB)
     # GEMM2 n-tile: no quant group ties it to the wave, and the tile queue ends on GEMM2
-    # tiles, so the SB mt2 kernel halves it to shorten the queue's tail (8x MI355X graph
-    # mtpr 256, with QLA: bs1..128 -0.8..-6.7%, bs7 +1%; the mt4 SB kernel is +1.5% at
-    # a8 bs168, so it keeps TILE_N).
+    # tiles, so the SB mt2 kernel halves it to shorten the queue's tail (the mt4 SB
+    # kernel keeps TILE_N).
     TILE_N2 = 256 if SB and MT == 2 else TILE_N
     # SB tile queue: pull the next tile after the K-loop, before this tile's epilogue,
-    # instead of after its drain (a4 / a8 bs1..256 -0.6..-2.2%).  Pre-loading that tile's
-    # first B K-steps into the caches there measured slower (k=2 even, k=4 +4..7%).
+    # instead of after its drain.  The large kernel keeps the pull after the drain.
     QLA = bool(SB)
     # WNT: W1 / W2 buffer loads sc0 nt (each SB weight tile is read about once).  The host
-    # picks it from m >= 2 (8x MI355X graph mtpr 256 vs cached: a4 / a8 bs2..256 -6..-10%,
-    # bs1 +11%; nt alone is within 1% of sc0 nt).
+    # picks it from m >= SB_WNT_MIN.
     assert SB or not WNT
     BNT = 3 if WNT else 0
     # m / local expert in SBX_TB bits; all-ones value bits = a scrubbed routing word
     assert not SBXP or max(TMAX // NPES, EPR) < (1 << SBX_TB) - 1
+    L_SEG, L_PBC = c["L_SEG"], c["L_PBC"]
+    assert not XHOT or EPR <= 64  # _seg_table: one lane per active expert
     name = (
         f"mega_moe_ep_h{H}_i{I}_e{E}_epr{EPR}_k{TOPK}_mt{MT}_t{TMAX}_np{NPES}_{act}"
         + ("_a8" if a8 else "_a4")
