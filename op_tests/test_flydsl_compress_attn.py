@@ -39,7 +39,7 @@ from aiter.ops.flydsl.kernels.fused_compress_attn_hca import flydsl_hca_compress
 from aiter.ops.torch_ref.fused_compress_attn import (
     fused_compress_attn as fused_compress_attn_reference,
 )
-from aiter.test_common import benchmark, checkAllclose, run_perftest
+from aiter.test_common import assertAllclose, benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
 
@@ -297,7 +297,7 @@ def _check_fp4_cache(out_cache, out_scale, ref_cache, ref_scale, msg):
     r_dq = mxfp4_to_f32(ref_cache.reshape(-1, 16)) * (
         2.0 ** (ref_scale.reshape(-1).to(torch.int32)[:, None].float() - 127.0)
     )
-    err = checkAllclose(
+    err = assertAllclose(
         k_dq,
         r_dq,
         rtol=1e-2,
@@ -305,7 +305,7 @@ def _check_fp4_cache(out_cache, out_scale, ref_cache, ref_scale, msg):
         tol_err_ratio=0.05,
         msg=f"{msg} kv_cache(fp4 dequant)",
     )
-    checkAllclose(
+    assertAllclose(
         out_scale.to(torch.int32),
         ref_scale.to(torch.int32),
         rtol=0,
@@ -322,7 +322,7 @@ def _check_fp8_cache(out_cache, out_scale, ref_cache, ref_scale, msg):
     mirrors the kernel's exact fp32 ops — am_safe * inv_fp8_max + ue8m0 ceil-pow2
     — so the scale per row must match to the bit). Returns the kv_cache err %.
     Shared by the shape sweep and the dedicated K-split coverage test."""
-    err = checkAllclose(
+    err = assertAllclose(
         out_cache.to(dtypes.fp32),
         ref_cache.to(dtypes.fp32),
         rtol=1e-2,
@@ -330,7 +330,7 @@ def _check_fp8_cache(out_cache, out_scale, ref_cache, ref_scale, msg):
         tol_err_ratio=0.05,
         msg=f"{msg} kv_cache(fp8)",
     )
-    checkAllclose(
+    assertAllclose(
         out_scale,
         ref_scale,
         rtol=0,
@@ -843,6 +843,119 @@ def test_flydsl_csa_indexer_ksplit(shape_label, bs=2, mtp=0):
     }
 
 
+# Fresh sequences, padding mixed with cached history, and a continuation whose
+# position-3 boundary was emitted by an earlier forward.
+PREFILL_CACHED_PREFIX = (0, 1, 2, 3, 6)
+
+
+def _apply_cached_prefix(inp, prefixes):
+    """Build a chunked-prefill continuation with identity slots and no ring wrap.
+    Drop boundaries emitted earlier, read positions below each prefix from state,
+    and poison only state rows that have never held valid history. Negative source
+    positions must be skipped even when the unused state contains NaN/+inf."""
+    state_size = inp["kv_state"].shape[1]
+    assert len(prefixes) == inp["kv_state"].shape[0]
+    assert all(0 <= prefix < state_size for prefix in prefixes)
+    assert inp["state_slot_mapping"].cpu().tolist() == list(range(len(prefixes)))
+    plan = inp["plan_gpu"].cpu()
+    K = 2 * inp["ratio"] if inp["overlap"] else inp["ratio"]
+    rows = []
+    for ragged_id, b, position, _ in plan.tolist():
+        if position < 0 or position < prefixes[b]:
+            continue
+        window_len = min(K, max(0, prefixes[b] + K - 1 - position))
+        rows.append([ragged_id, b, position, window_len])
+    new_plan = torch.full_like(plan, -1)
+    new_plan[: len(rows)] = torch.tensor(rows, dtype=torch.int32, device=plan.device)
+    inp["plan_gpu"] = new_plan.to(inp["plan_gpu"].device)
+    for name in ("kv_state", "score_state"):
+        st = inp[name]
+        for b in range(st.shape[0]):
+            st[b, prefixes[b] :] = float("nan") if b % 2 == 0 else float("inf")
+    return len(rows)
+
+
+@benchmark()
+def test_flydsl_csa_indexer_legacy_prefill(shape_label, bs):
+    """Check AUTO legacy and forced K-split (NW=2/4) against the torch reference.
+    Capacity > 1280 forces AUTO NW=1. Cached prefixes mix negative padding with
+    valid state history; fresh sequences poison row 0, which must never be read
+    for their first boundary. Each candidate starts with fresh output buffers.
+    gfx950 only (gated in main())."""
+    shape = _shape_by_label(shape_label)
+    _, D, RD, ratio, overlap, quant_mode, ue8m0, _ = shape
+    inp = _build_inputs(shape, bs, 0, "prefill")
+    prefixes = [
+        PREFILL_CACHED_PREFIX[b % len(PREFILL_CACHED_PREFIX)] for b in range(bs)
+    ]
+    live_rows = _apply_cached_prefix(inp, prefixes)
+    plan_capacity = inp["plan_gpu"].shape[0]
+    nw = csa_ksplit_num_waves(plan_capacity)
+    assert plan_capacity > 1280 and nw == 1, (
+        f"{shape_label} bs={bs} plan_capacity={plan_capacity} auto-picked NW={nw}; "
+        "this case must exercise the single-wave kernel"
+    )
+    common = {
+        "kv_in": inp["kv_in"],
+        "score_in": inp["score_in"],
+        "kv_state": inp["kv_state"],
+        "score_state": inp["score_state"],
+        "plan_gpu": inp["plan_gpu"],
+        "state_slot_mapping": inp["state_slot_mapping"],
+        "ape": inp["ape"],
+        "rms_weight": inp["rms_weight"],
+        "rms_eps": inp["rms_eps"],
+        "cos_cache": inp["cos_cache"],
+        "sin_cache": inp["sin_cache"],
+        "block_tables": inp["block_tables"],
+        "k_per_block": inp["k_per_block"],
+        "overlap": overlap,
+        "ratio": ratio,
+        "head_dim": D,
+        "rope_head_dim": RD,
+        "quant": True,
+        "quant_mode": quant_mode,
+        "use_ue8m0": ue8m0,
+        "preshuffle": inp["preshuffle"],
+    }
+    ref_cache = torch.zeros_like(inp["kv_cache"])
+    ref_scale = torch.zeros_like(inp["cache_scale"])
+    fused_compress_attn_reference(**common, kv_cache=ref_cache, cache_scale=ref_scale)
+    check = _check_fp4_cache if quant_mode == "fp4" else _check_fp8_cache
+    ret = {
+        "gfx": get_gfx(),
+        "plan_capacity": plan_capacity,
+        "live_rows": live_rows,
+        "auto_nw": nw,
+    }
+    candidates = {
+        "auto NW=1": {},
+        "NW=2": {"k_split_num_waves": 2},
+        "NW=4": {"k_split_num_waves": 4},
+    }
+    for label, extra in candidates.items():
+        out_cache = torch.zeros_like(inp["kv_cache"])
+        out_scale = torch.zeros_like(inp["cache_scale"])
+        _, us_kernel = run_perftest(
+            flydsl_fused_compress_attn,
+            num_rotate_args=1,
+            **common,
+            kv_cache=out_cache,
+            cache_scale=out_scale,
+            **extra,
+        )
+        ret[f"{label} us"] = us_kernel
+        ret[f"{label} err"] = check(
+            out_cache,
+            out_scale,
+            ref_cache,
+            ref_scale,
+            f"{shape_label}/legacy-prefill({label}) bs={bs} "
+            f"plan_capacity={plan_capacity} live_rows={live_rows}",
+        )
+    return ret
+
+
 def main():
     # The wrappers dispatch wave64/wave32 by arch; skip cleanly on anything
     # outside the validated set.
@@ -931,6 +1044,16 @@ def main():
         small bs keep plan_capacity in the K-split regime. Empty to skip.""",
     )
 
+    parser.add_argument(
+        "--legacy-prefill-bs",
+        type=int,
+        nargs="*",
+        default=[20],
+        help="""Prefill batch sizes for the CSA-indexer single-wave coverage check
+        (gfx950; plan_capacity = bs*64+16 > 1280, so the auto path picks the
+        legacy kernel). Empty to skip.""",
+    )
+
     args = parser.parse_args()
 
     def summarize(name, rows):
@@ -983,6 +1106,23 @@ def main():
             for bs in args.ksplit_bs
         ],
     )
+
+    # --- Table 5: gfx950 CSA-indexer AUTO legacy and forced K-split vs torch ref,
+    # with cached prefixes and poisoned unused state rows (fp8 + fp4). ---
+    if get_gfx() != "gfx950":
+        aiter.logger.warning(
+            "%s: skipping gfx950-only CSA-indexer legacy-prefill check", get_gfx()
+        )
+    else:
+        summarize(
+            "flydsl_csa_indexer_legacy_prefill",
+            [
+                test_flydsl_csa_indexer_legacy_prefill(shape_label, bs)
+                for shape_label in ("csa_indexer", "csa_indexer_fp4")
+                if shape_label in args.shapes
+                for bs in args.legacy_prefill_bs
+            ],
+        )
 
 
 if __name__ == "__main__":
