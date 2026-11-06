@@ -3484,9 +3484,17 @@ def _get_compiled_fused_quant_preshuffle_route_ksplit(
     )
 
 
+# Ids per thread every TP route-in-quant build loads: 8 x 256 threads cover the
+# 2048 routes the grouped MoE hands it (_FUSE_TP_ROUTE_QUANT_MAX_NUMEL), so one
+# build serves every batch instead of one per power-of-two bucket of routes.
+_TP_ROUTE_MIN_SLOTS = 8
+
+
 def _tp_route_slots(numel: int) -> int:
-    """Ids per thread of the 256-thread block, a power of two: few builds."""
-    slots = 1
+    """Ids per thread of the 256-thread block: _TP_ROUTE_MIN_SLOTS, so the batch
+    is not part of the compile key, or the next power of two above it for a
+    larger call. Ids past numel load the last id and count nothing."""
+    slots = _TP_ROUTE_MIN_SLOTS
     while slots * 256 < numel:
         slots *= 2
     return slots
