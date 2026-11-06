@@ -125,7 +125,19 @@ def all_reduce_(
     )
 
 
-@torch_compile_guard(gen_fake=all_reduce_fake)
+def all_reduce_add_fake(
+    tensor: torch.Tensor, other: torch.Tensor, *args, **kwargs
+) -> torch.Tensor:
+    # The fallback all-reduces `tensor + other`, so the output takes the
+    # broadcast shape and promoted dtype of that sum, not `tensor`'s.
+    return torch.empty(
+        torch.broadcast_shapes(tensor.shape, other.shape),
+        dtype=torch.result_type(tensor, other),
+        device=tensor.device,
+    )
+
+
+@torch_compile_guard(gen_fake=all_reduce_add_fake)
 def all_reduce_add_(
     tensor: torch.Tensor,
     other: torch.Tensor,
