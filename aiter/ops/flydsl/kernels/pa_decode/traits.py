@@ -840,6 +840,7 @@ class Gfx1250Traits:
     plan_tile_tokens: int = 256
     single_task_tile: bool = False
     direct_context: bool = False
+    single_kv_head: bool = False
 
     WAVE = 32
     NWARP = 4

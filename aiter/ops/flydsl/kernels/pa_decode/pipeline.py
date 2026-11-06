@@ -765,7 +765,11 @@ class Gfx1250Bf16Pipeline:
         ctx.tid = fx.Int32(gpu.thread_id("x"))
         ctx.warp, ctx.lane = ctx.tid // t.WAVE, ctx.tid % t.WAVE
         ctx.lane16, ctx.half = ctx.lane % 16, ctx.lane // 16
-        ctx.kv_h = fx.Int32(gpu.block_id("y")) // t.query_splits
+        ctx.kv_h = (
+            fx.Int32(0)
+            if const_expr(t.single_kv_head)
+            else fx.Int32(gpu.block_id("y")) // t.query_splits
+        )
         ctx.query_begin = (fx.Int32(gpu.block_id("y")) % t.query_splits) * (
             t.query_length // t.query_splits
         )
@@ -1201,7 +1205,11 @@ class Gfx1250Bf16WavePipeline:
         ctx.tid = fx.Int32(gpu.thread_id("x"))
         ctx.warp, ctx.lane = ctx.tid // t.WAVE, ctx.tid % t.WAVE
         ctx.lane16, ctx.half = ctx.lane % 16, ctx.lane // 16
-        ctx.kv_h = fx.Int32(gpu.block_id("y")) // t.query_splits
+        ctx.kv_h = (
+            fx.Int32(0)
+            if const_expr(t.single_kv_head)
+            else fx.Int32(gpu.block_id("y")) // t.query_splits
+        )
         ctx.query_begin = (fx.Int32(gpu.block_id("y")) % t.query_splits) * (
             t.query_length // t.query_splits
         )
@@ -1418,7 +1426,11 @@ class Gfx1250Bf16DecodePipeline(Gfx1250Bf16WavePipeline):
         ctx.tid = fx.Int32(gpu.thread_id("x"))
         ctx.warp, ctx.lane = ctx.tid // t.WAVE, ctx.tid % t.WAVE
         ctx.lane16, ctx.half = ctx.lane % 16, ctx.lane // 16
-        ctx.kv_h = fx.Int32(gpu.block_id("y")) // t.query_splits
+        ctx.kv_h = (
+            fx.Int32(0)
+            if const_expr(t.single_kv_head)
+            else fx.Int32(gpu.block_id("y")) // t.query_splits
+        )
         ctx.query_begin = (fx.Int32(gpu.block_id("y")) % t.query_splits) * (
             t.query_length // t.query_splits
         )
@@ -1845,7 +1857,11 @@ class Gfx1250WavePipeline:
         ctx.tid = fx.Int32(gpu.thread_id("x"))
         ctx.warp, ctx.lane = ctx.tid // t.WAVE, ctx.tid % t.WAVE
         ctx.lane16, ctx.half = ctx.lane % 16, ctx.lane // 16
-        ctx.kv_h = fx.Int32(gpu.block_id("y")) // t.query_splits
+        ctx.kv_h = (
+            fx.Int32(0)
+            if const_expr(t.single_kv_head)
+            else fx.Int32(gpu.block_id("y")) // t.query_splits
+        )
         ctx.query_begin = (fx.Int32(gpu.block_id("y")) % t.query_splits) * (
             t.query_length // t.query_splits
         )
@@ -1968,7 +1984,11 @@ class Gfx1250Pipeline:
         ctx.tid = fx.Int32(gpu.thread_id("x"))
         ctx.warp, ctx.lane = ctx.tid // t.WAVE, ctx.tid % t.WAVE
         ctx.lane16, ctx.half = ctx.lane % 16, ctx.lane // 16
-        ctx.kv_h = fx.Int32(gpu.block_id("y")) // t.query_splits
+        ctx.kv_h = (
+            fx.Int32(0)
+            if const_expr(t.single_kv_head)
+            else fx.Int32(gpu.block_id("y")) // t.query_splits
+        )
         ctx.query_begin = (fx.Int32(gpu.block_id("y")) % t.query_splits) * (
             t.query_length // t.query_splits
         )

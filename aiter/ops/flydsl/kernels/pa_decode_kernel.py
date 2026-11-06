@@ -290,6 +290,16 @@ def compile_pa_decode_tile(
             cluster_task_stride=cluster_task_stride,
             plan_tile_tokens=plan_tile_tokens,
             single_task_tile=single_task_tile,
+            single_kv_head=(
+                num_kv_heads == 1
+                and head_dim == 128
+                and block_size == 16
+                and query_group_size == 16
+                and query_length == 1
+                and sliding_window == 0
+                and not direct_output
+                and not cluster_merge
+            ),
             direct_context=direct_output
             and num_partitions == 1
             and sliding_window == 0
@@ -576,6 +586,7 @@ def compile_gfx1250_pa_decode(
     plan_tile_tokens=256,
     single_task_tile=False,
     direct_context=False,
+    single_kv_head=False,
 ):
     """Compile a gfx1250 tile kernel; merging partitions writes final output.
 
@@ -595,6 +606,8 @@ def compile_gfx1250_pa_decode(
     one KV buffer and skip its final reuse barrier; BF16 wave merge keeps two.
     ``plan_tile_tokens`` matches the plan's 128/256-token units; the value
     participates in the kernel cache key and planned range conversion.
+    ``single_kv_head`` requires a one-head launch; KV indexing and head
+    strides then fold to constants while query-split indexing stays dynamic.
     ``direct_context`` replaces the work pointer with context lengths for
     one-partition full-attention output; active CTAs derive their complete
     tile range and empty CTAs clear output without reading packed metadata.
@@ -626,6 +639,7 @@ def compile_gfx1250_pa_decode(
         plan_tile_tokens,
         single_task_tile,
         direct_context,
+        single_kv_head,
     )
     if type(plan_tile_tokens) is not int or plan_tile_tokens not in (128, 256):
         raise ValueError("plan_tile_tokens must be 128 or 256")
@@ -708,6 +722,8 @@ def compile_gfx1250_pa_decode(
         counters: fx.Pointer,
     ):
         _ = tag
+        if const_expr(t.single_kv_head):
+            kv_heads = fx.Int32(1)
 
         def zero_output(seq, dst):
             # Empty sequences have no attention mass; clear this CTA's rows.

@@ -904,6 +904,24 @@ _COMMON_CASES = [
             "capture": True,
         },
     ),
+    *[
+        (
+            f"single-kv-reducer-{kv_heads}heads",
+            {
+                "kv_heads": kv_heads,
+                "group_size": 16,
+                "block_size": 16,
+                "query_length": 1,
+                "lengths": (0, 33, 257, 2048),
+                "max_partitions": 4,
+                "sink_dtype": torch.float32,
+                "pattern": "one_hot_token",
+                "capture": True,
+                "single_kv_head": kv_heads == 1,
+            },
+        )
+        for kv_heads in (1, 2)
+    ],
 ]
 _FP8_CASES = _COMMON_CASES + [
     (
@@ -1769,7 +1787,7 @@ def _check_pipe_policy(pa, case, arch, compile_kwargs):
     from aiter.ops.flydsl.kernels.pa_decode.traits import PaDecodeSchedule
 
     assert compile_kwargs[-1]["wide_kv_addressing"] == case["wide"]
-    if (case.get("single_page") or case.get("direct_context")) and arch == "gfx1250":
+    if arch == "gfx1250":
         from aiter.ops.flydsl.kernels import pa_decode_kernel as kernels
 
         selected = compile_kwargs[-1]
@@ -1782,6 +1800,9 @@ def _check_pipe_policy(pa, case, arch, compile_kwargs):
             if entry is compiled
         ]
         assert len(traits) == 1
+        assert not traits[0].single_kv_head or selected["num_kv_heads"] == 1
+        if "single_kv_head" in case:
+            assert traits[0].single_kv_head == case["single_kv_head"]
         if case.get("single_page"):
             assert traits[0].single_task_tile and traits[0].buffers == 1
         if case.get("direct_context"):
