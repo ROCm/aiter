@@ -303,13 +303,13 @@ def launch_gemm_a8w4_tdm(
     # both cluster dimensions from the tuned configuration.
     cluster_m = 1 if FORCE_1X4_CLUSTER else cluster_m
     iglp_params = IGLP_PARAMS["a4w4" if a_is_fp4 else "a8w4"][
-        "prefill" if tile_m == 256 and tile_n == 256 and tile_k == 256 else "default"
+        "prefill" if tile_m in (256, 288) and tile_n == 256 and tile_k == 256 else "default"
     ]
-    tmnk256_wpmn2_b4 = all((not persistent_workers, tile_m == 256, tile_n == 256,
-                            tile_k == 256, m_warp == 2, n_warp == 2, num_buffers == 4))
-    sched_mma_group = (2 if all((bool(a_is_fp4), bool(a_preshuffled), tmnk256_wpmn2_b4))
+    prefill_w2x2_b4 = all((not persistent_workers, tile_m in (256, 288), tile_n == 256,
+                         tile_k == 256, m_warp == 2, n_warp == 2, num_buffers == 4))
+    sched_mma_group = (2 if all((bool(a_is_fp4), bool(a_preshuffled), prefill_w2x2_b4))
                        else iglp_params["mma_group"])
-    sched_first_group = (1 if all((bool(a_is_fp4), bool(a_preshuffled), tmnk256_wpmn2_b4))
+    sched_first_group = (1 if all((bool(a_is_fp4), bool(a_preshuffled), prefill_w2x2_b4))
                          else iglp_params["mma_first_group"])
     sched_ds_first = iglp_params["ds_first_n"]
     cache_tag = (
@@ -380,13 +380,14 @@ def launch_gemm_a8w4_tdm(
                 "ep_quant_bits requires wmma_n_rep % "
                 f"{WN_PER_MX_BLOCK_EP} == 0, got {tile_n // n_warp // 16}"
             )
-    use_spec_prefill_opt = bool(a_is_fp4 and a_preshuffled and tmnk256_wpmn2_b4)
+    use_spec_prefill_opt = bool(a_is_fp4 and a_preshuffled and prefill_w2x2_b4)
+    m288_prefill = use_spec_prefill_opt and tile_m == 288
     # Ring-unrolled loops retain explicit zeroing; only the peeled tile initializes C.
     inline_zero_acc = (use_spec_prefill_opt and cluster_m == 1 and bool(next_stage_on)
                        and K // tile_k > num_buffers)
     interleaved_m_rows = (inline_zero_acc and stage1_act == 1 and bool(stage1_quant_out)
                           and cluster_n == 4 and not row_major_ascale
-                          and not tdm_as_in_prologue and K % tile_k == 0)
+                          and not tdm_as_in_prologue and K % tile_k == 0 and tile_m == 256)
     M_ROW_STEP = 32 if interleaved_m_rows else 16
     new_auto_stage1 = bool(interleaved_m_rows and not explicit_vgpr_partition
                           and callable(getattr(rocdl, "sched_vgpr", None)))
@@ -1166,7 +1167,6 @@ def launch_gemm_a8w4_tdm(
             else (wmb + lane16) * A_LDS_ROW + kgrp * 16
         )
         lds_b_lane_off = (wnb // 16) * B_LDS_ROW + kgrp * 256 + lane16 * 16
-        assert wmma_m_rep == 1 or wmma_m_rep % 2 == 0
         sa_lane = lane16 if wmma_m_rep == 1 else lane
         SA_ROWS_PER_LOAD = 16 if wmma_m_rep == 1 else 32
         lds_sa_lane_off = (
@@ -1317,19 +1317,26 @@ def launch_gemm_a8w4_tdm(
         def load_sa(base, sm, ksl, kt):
             off = (((sm // 2) * AS_INNER + (sm % 2) * 64 + ksl * 128) * 4
                    if interleaved_m_rows else (ksl * wmma_m_rep + sm * 2) * 16 * 4)
+            # A full wave normally loads two M16 scale fragments. For the
+            # final unpaired fragment, duplicate lanes 0:15 into lanes 16:31
+            # instead of reading the next k128, wave, or LDS buffer. WMMA
+            # selects the lower half for that last even-numbered fragment.
+            tail_lane_bytes = ((sa_lane - lane16) * 4
+                               if const_expr(wmma_m_rep % 2 and sm == wmma_m_rep // 2) else 0)
             if const_expr(row_major_ascale and tdm_as_in_prologue):
                 as_base = ptr_to_idx(base_ptr) + AS_FULL_OFF
-                row = wave_m * warp_tile_m + sa_lane + sm * SA_ROWS_PER_LOAD
+                row = wave_m * warp_tile_m + sa_lane + sm * SA_ROWS_PER_LOAD - tail_lane_bytes // 4
                 off = (row * AS_FULL_KDW + kt * SA_KDW + ksl) * 4
                 return lds_load_b32(as_base, fx.Int32(off))[0]
             if const_expr(row_major_ascale):
-                off = (sm * SA_ROWS_PER_LOAD * SA_KDW + ksl) * 4
+                off = (sm * SA_ROWS_PER_LOAD * SA_KDW + ksl) * 4 - tail_lane_bytes * SA_KDW
                 return lds_load_b32(base, fx.Int32(off))[0]
             if const_expr(tdm_as_in_prologue):
                 as_base = ptr_to_idx(base_ptr) + AS_FULL_OFF
-                off = off + wave_m * AS_FULL_INNER * 4 + sa_lane * 4 + kt * AS_INNER * 4
+                off = (off + wave_m * AS_FULL_INNER * 4 + sa_lane * 4
+                       + kt * AS_INNER * 4 - tail_lane_bytes)
                 return lds_load_b32(as_base, fx.Int32(off))[0]
-            return lds_load_b32(base, fx.Int32(off))[0]
+            return lds_load_b32(base, fx.Int32(off - tail_lane_bytes))[0]
 
         def load_sb(base, sn, ksl):
             off = (sn * SC_INNER + ksl * 32) * 4
@@ -1363,17 +1370,32 @@ def launch_gemm_a8w4_tdm(
             for _ in range_constexpr(n_acc)
         ]
         if const_expr(explicit_vgpr_partition):
-            assert n_acc * WMMA_VECTOR_DWORDS <= 512
+            assert n_acc * WMMA_VECTOR_DWORDS <= (576 if m288_prefill else 512)
             for idx in range_constexpr(n_acc):
                 c_frags[idx] = pin_rmem_vgpr(
                     c_frags[idx],
-                    start=(256 if resident_ring_addresses else (64 if pinned_fp4_prefill else 256))
+                    start=(256 if resident_ring_addresses or m288_prefill
+                           else (64 if pinned_fp4_prefill else 256))
                         + idx * WMMA_VECTOR_DWORDS,
                 )
 
-        if const_expr(use_spec_prefill_opt and not inline_zero_acc):
+        # A constant zero store becomes the ring phi's input and is copied into
+        # pinned C at loop entry, after the prologue fence. Pin the zero itself
+        # before that fence so the copy overlaps the stage-0 TDM wait.
+        early_zero_acc = (use_spec_prefill_opt and not inline_zero_acc
+                          and resident_ring_addresses
+                          and callable(getattr(rocdl, "sched_vgpr", None)))
+        if const_expr(use_spec_prefill_opt and not inline_zero_acc and not early_zero_acc):
             for cf in c_frags:
                 cf.store(fx.constant_vector(0.0, T.vec(WMMA_VECTOR_DWORDS, T.f32)))
+
+        def zero_resident_accumulators():
+            rocdl.sched_barrier(0)
+            for idx in range_constexpr(n_acc):
+                c_frags[idx].store(Vec(rocdl.sched_vgpr(
+                    fx.constant_vector(0.0, T.vec(WMMA_VECTOR_DWORDS, T.f32)),
+                    256 + idx * WMMA_VECTOR_DWORDS)))
+            rocdl.sched_barrier(0)
 
         def init_accumulators():
             # Cover prologue TDM latency before the first pipeline wait.
@@ -1482,7 +1504,7 @@ def launch_gemm_a8w4_tdm(
             width-1 rmem vector leaves a poison lane under SSA promotion, and
             tile_m=16 gives wmma_m_rep == 1, so a scale slot is at least 2 wide.
             """
-            SA_WIDTH = max(2, (active_m_rep + 1) // 2)
+            SA_WIDTH = 8 if m288_prefill else max(2, (active_m_rep + 1) // 2)
             a = [
                 fx.make_rmem_tensor(ACT_NDW, fx.Int32)
                 for _ in range_constexpr(wmma_m_rep)
@@ -1493,26 +1515,33 @@ def launch_gemm_a8w4_tdm(
             ]
             if const_expr(explicit_vgpr_partition):
                 slot_width = wmma_m_rep * ACT_NDW + wmma_n_rep * WMMA_VECTOR_DWORDS
-                assert slot_width <= 128
-                slot_base = ((64 if slot_idx == 0 else 128) if resident_ring_addresses else
+                assert slot_width <= (136 if m288_prefill else 128)
+                # M288: A0 v64:135, A1 v144:215, C v256:831,
+                # B0 v832:895, B1 v896:959, alternate B1 v960:991.
+                # Keep every T256 register location unchanged.
+                split_ab = resident_ring_addresses or m288_prefill
+                split_b_base = 832 if m288_prefill else 768
+                slot_base = ((64 + slot_idx * (80 if m288_prefill else 64)) if split_ab else
                              (576 if pinned_fp4_prefill else 768) + slot_idx * 128)
                 reg = slot_base
                 for wm in range_constexpr(wmma_m_rep):
                     a[wm] = pin_rmem_vgpr(a[wm], start=reg)
                     reg += ACT_NDW
-                if const_expr(resident_ring_addresses):
-                    reg = 768 if slot_idx == 0 else 832
+                if const_expr(split_ab):
+                    reg = split_b_base + slot_idx * 64
                 for wn in range_constexpr(wmma_n_rep):
                     b[wn] = pin_rmem_vgpr(b[wn], start=reg)
                     reg += WMMA_VECTOR_DWORDS
-                assert reg <= ((832 if slot_idx == 0 else 896)
-                               if resident_ring_addresses else slot_base + 128)
+                assert reg <= (split_b_base + (slot_idx + 1) * 64
+                               if split_ab else slot_base + 128)
             sa = fx.make_rmem_tensor(SA_WIDTH, fx.Int32)
             sb = fx.make_rmem_tensor(SB_WIDTH, fx.Int32)
             if const_expr(resident_ring_addresses):
-                assert SA_WIDTH == SB_WIDTH == 4
-                sa = pin_rmem_vgpr(sa, start=16 + slot_idx * 8)
-                sb = pin_rmem_vgpr(sb, start=20 + slot_idx * 8)
+                assert SA_WIDTH == (8 if m288_prefill else 4) and SB_WIDTH == 4
+                # The M288 fifth ScaleA word needs a wider slot. Leave v32:47
+                # available to the four resident LDS address tuples.
+                sa = pin_rmem_vgpr(sa, start=(16 + slot_idx * 32 if m288_prefill else 16 + slot_idx * 8))
+                sb = pin_rmem_vgpr(sb, start=(24 + slot_idx * 32 if m288_prefill else 20 + slot_idx * 8))
             return RmemSlot(
                 a=a,
                 b=b,
@@ -1527,7 +1556,7 @@ def launch_gemm_a8w4_tdm(
         def load_lds_data(slot, lds_addr, ksl, kt, interleaved_lds_load=False, active_m_rep=wmma_m_rep):
             """Load one k128 from precomputed LDS bases into ``slot``."""
             sa_pairs = (active_m_rep + 1) // 2
-            SA_WIDTH = max(2, sa_pairs)
+            SA_WIDTH = 8 if m288_prefill else max(2, sa_pairs)
             if const_expr(interleaved_m_rows and active_m_rep == 8
                           and not explicit_vgpr_partition):
                 rocdl.sched_barrier(0)
@@ -1895,7 +1924,7 @@ def launch_gemm_a8w4_tdm(
                                 for _ in range_constexpr(2)]
                     for wn in range_constexpr(2):
                         extra_b1[wn] = pin_rmem_vgpr(
-                            extra_b1[wn], start=896 + wn * WMMA_VECTOR_DWORDS
+                            extra_b1[wn], start=(960 if m288_prefill else 896) + wn * WMMA_VECTOR_DWORDS
                         )
                     alternate_b1 = RmemSlot(a=rmem_slots[1].a,
                         b=extra_b1 + rmem_slots[1].b[2:],
@@ -1988,6 +2017,8 @@ def launch_gemm_a8w4_tdm(
                     PRE = num_buffers if next_stage_on else num_buffers - 1
                     for i in range_constexpr(PRE):
                         issue(i, i)
+                    if const_expr(early_zero_acc):
+                        zero_resident_accumulators()
                     if const_expr(not use_spec_prefill_opt):
                         init_accumulators()
                     n_steady = K_TILES - PRE
@@ -2732,7 +2763,15 @@ def launch_gemm_a8w4_tdm(
                         (tile_m // 16, STORE_N * 16),
                         (out_stride * 16, 1),
                     )
-                    atomC = make_tdm_store(gtC, (mn_oob + 15) // 16, out_stride * 16)
+                    c_m16_extent = (mn_oob + 15) // 16
+                    if const_expr((tile_m // 16) % num_waves != 0):
+                        # TDM rounds the outer blocks per wave upward. Clamp
+                        # the ragged final wave to this tile so its rounded
+                        # box cannot overwrite the following workgroup's rows.
+                        c_m16_extent = (c_m16_extent < tile_m // 16).select(
+                            c_m16_extent, tile_m // 16
+                        )
+                    atomC = make_tdm_store(gtC, c_m16_extent, out_stride * 16)
                     src = tensor_view(
                         fx.recast_iter(oc_store, base_ptr),
                         (tile_m // 16, STORE_N * 16),
