@@ -1043,7 +1043,18 @@ class Gfx1250Bf16WavePipeline:
             words.extend([fragment[w] for w in range_constexpr(4)])
         return fx.Vector.from_elements(words, dtype=fx.Int32).bitcast(fx.BFloat16)
 
-    def _page(self, token_base, begin, end, state, q_operands, uppers, bases, masked):
+    def _page(
+        self,
+        token_base,
+        begin,
+        end,
+        state,
+        q_operands,
+        uppers,
+        bases,
+        masked,
+        initial=False,
+    ):
         """Consume half a page; ``masked`` applies the causal and window bounds."""
         t = self.t
         # A positive scale commutes with the maximum and fuses into the
@@ -1100,12 +1111,19 @@ class Gfx1250Bf16WavePipeline:
             tile_max = fx.maxnumf(maxima[0], maxima[0].shuffle_xor(16, t.WAVE))
             if const_expr(fused):
                 tile_max = tile_max * scale
-            old_max = state[m * stride]
+            old_max = (
+                fx.Float32(float("-inf")) if const_expr(initial) else state[m * stride]
+            )
             new_max = fx.maxnumf(old_max, tile_max)
             safe_max = (new_max > fx.Float32(float("-inf"))).select(
                 new_max, fx.Float32(0.0)
             )
-            corr = fx.Float32(fx.exp2(old_max - safe_max, fastmath="afn"))
+            if const_expr(initial):
+                # The initial maximum is -inf, so this correction is exactly
+                # zero even when the page contains no visible tokens.
+                corr = fx.Float32(0.0)
+            else:
+                corr = fx.Float32(fx.exp2(old_max - safe_max, fastmath="afn"))
             scores = fx.Vector.from_elements(units, dtype=fx.Float32)
             if const_expr(fused):
                 exponent = fx.fma(
@@ -1141,15 +1159,26 @@ class Gfx1250Bf16WavePipeline:
                     for s in range_constexpr(self.token_tiles // 2)
                 ]
             )
-            next_state.append([new_max, state[m * stride + 1] * corr + tile_sum])
-            # Rescale the running accumulator before PV's fused adds.
-            factor = fx.Vector.from_elements([corr], dtype=fx.Float32).broadcast_to(8)
-            outs.append(
-                [
-                    state[m * stride + 2 + d] * factor
-                    for d in range_constexpr(t.head_dim // 16)
-                ]
-            )
+            if const_expr(initial):
+                next_state.append([new_max, tile_sum])
+                outs.append(
+                    [
+                        fx.Vector.filled(8, 0.0, fx.Float32)
+                        for _ in range_constexpr(t.head_dim // 16)
+                    ]
+                )
+            else:
+                next_state.append([new_max, state[m * stride + 1] * corr + tile_sum])
+                # Rescale the running accumulator before PV's fused adds.
+                factor = fx.Vector.from_elements([corr], dtype=fx.Float32).broadcast_to(
+                    8
+                )
+                outs.append(
+                    [
+                        state[m * stride + 2 + d] * factor
+                        for d in range_constexpr(t.head_dim // 16)
+                    ]
+                )
         for d in range_constexpr(t.head_dim // 16):
             for s in range_constexpr(self.token_tiles // 2):
                 v = self._operand(
@@ -1449,6 +1478,22 @@ class Gfx1250Bf16DecodePipeline(Gfx1250Bf16WavePipeline):
             ]
         )
         head, head_state = begin, initial
+        if const_expr(t.sliding_window == 0):
+            # Peel the first page so its zero softmax/PV state is visible to
+            # the compiler instead of entering the runtime loop through a phi.
+            head_state = self._page(
+                begin,
+                begin,
+                end,
+                initial,
+                [operands],
+                [upper],
+                bases,
+                True,
+                initial=True,
+            )
+            head = begin + 128
+            split = fx.max(split, head)
         if const_expr(t.sliding_window > 0):
             window_begin = (
                 ctx.planned_context
