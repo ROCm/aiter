@@ -264,11 +264,14 @@ class MegaMoEV2:
         """(route, capacity) of this call; see MegaMoEBundlePlan.route_for.
 
         ``max_tokens`` is the call's row count on its largest EP rank (counting
-        graph padding), identical on every rank. Without it the plan assumes the
-        instance capacity, never this rank's own row count.
+        graph padding), identical on every rank. Without it the route depends on
+        the instance capacity alone, never on this rank's own row count.
         """
         if max_tokens is None:
-            max_tokens = self.mtpr
+            # Without the row bound the plan keeps the staged route (or the small-input
+            # route when the whole capacity fits it): the large-input kernel is slower
+            # than staged below ~512 rows per rank, so it needs the caller's bound.
+            return self._bundle_plan.route_for(self.mtpr, small_m=small_m, large_m=False)
         max_tokens = int(max_tokens)
         if not run_tokens <= max_tokens <= self.mtpr:
             raise ValueError(
@@ -1089,7 +1092,8 @@ class MegaMoEV2:
 
         ``max_tokens``: rows of this call on its largest EP rank, counting graph
         padding, passed identically on every rank; it selects the route. None
-        plans for the instance capacity.
+        plans for the instance capacity without the large-input route (staged, or
+        small-input when the capacity fits it).
 
         The output is a view of the route's combine buffer, valid until the next
         call. ``slice_output=False`` returns the whole buffer: as many rows as

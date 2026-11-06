@@ -114,6 +114,12 @@ def _rel_l2(output, reference):
     return float(torch.sqrt(error_sq / reference_sq))
 
 
+def _fwd(moe, *args, **kwargs):
+    """forward() planned for the instance capacity (the EP-wide row bound of every call
+    here): the staged route, or the large-input route when the instance has it."""
+    return moe.forward(*args, max_tokens=moe.mtpr, **kwargs)
+
+
 def _next_power_of_two(value):
     return 1 << (int(value) - 1).bit_length()
 
@@ -388,11 +394,11 @@ def _run_size(moe, x, weights, ids, ref_weights, args, rank, world, device):
             raise ValueError("--compare-main requires --expect-large-m")
         moe.set_large_m_enabled(False)
         try:
-            main_output = moe(x, weights, ids)[:tokens].clone()
+            main_output = _fwd(moe, x, weights, ids)[:tokens].clone()
         finally:
             moe.set_large_m_enabled(True)
         _barrier()
-    output = moe(x, weights, ids)[:tokens]
+    output = _fwd(moe, x, weights, ids)[:tokens]
     if args.expect_large_m:
         runtime = moe._large_m
         if runtime is None:
@@ -430,7 +436,7 @@ def _run_size(moe, x, weights, ids, ref_weights, args, rank, world, device):
     active_config = getattr(moe, "_active_config", None)
     if active_config is not None and active_config.stage2.aligned_pair:
         aligned_output = output.clone()
-        full_output = moe(x, weights, ids, slice_output=False)
+        full_output = _fwd(moe, x, weights, ids, slice_output=False)
         expected_shape = (moe.mtpr, moe.model_dim)
         if tuple(full_output.shape) != expected_shape:
             raise AssertionError(
@@ -508,7 +514,7 @@ def _run_size(moe, x, weights, ids, ref_weights, args, rank, world, device):
         state["output"] = moe._run_stage2(tokens, None, True, moe._active_config)
 
     def end_to_end():
-        state["output"] = moe(x, weights, ids)
+        state["output"] = _fwd(moe, x, weights, ids)
 
     stage1_ms = _time_graph(stage1, device, args.iters)
     stage1()
@@ -568,13 +574,13 @@ def _check_explicit_stream(moe, x, weights, ids, eager_output, device):
     side = torch.cuda.Stream()
     for handle in (side, fx.Stream(side.cuda_stream), side.cuda_stream):
         # A zero-input call leaves other data in the quant and combine buffers.
-        moe(torch.zeros_like(x), weights, ids)
+        _fwd(moe, torch.zeros_like(x), weights, ids)
         # Hold the caller's stream back: a launch left on the current stream
         # would run first and read those buffers before this call fills them.
         side.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(side):
             torch.cuda._sleep(50_000_000)
-        output = moe(x, weights, ids, stream=handle)[:tokens]
+        output = _fwd(moe, x, weights, ids, stream=handle)[:tokens]
         torch.cuda.synchronize()
         if not _reduce_float(
             torch.equal(output, eager_output), device, dist.ReduceOp.MIN
@@ -609,13 +615,13 @@ def _check_large_m_edges(
 
     tokens = x.shape[0]
     # A zero-input call first, so a quant buffer reused on the current stream holds other data.
-    moe(torch.zeros_like(x), weights, ids)
+    _fwd(moe, torch.zeros_like(x), weights, ids)
     # Only the side stream waits for the inputs; the current stream is held back,
     # so work left on it would run after the kernel.
     side = torch.cuda.Stream()
     side.wait_stream(torch.cuda.current_stream())
     torch.cuda._sleep(50_000_000)
-    output = moe(x, weights, ids, stream=side)[:tokens]
+    output = _fwd(moe, x, weights, ids, stream=side)[:tokens]
     torch.cuda.synchronize()
     stream_exact = torch.equal(output, eager_output)
     if not _reduce_float(stream_exact, device, dist.ReduceOp.MIN):
@@ -630,7 +636,9 @@ def _check_large_m_edges(
             gen = torch.Generator(device=device).manual_seed(args.seed + 17)
             drop = torch.rand(ids.shape, generator=gen, device=device) < 1 / 3
             masked_ids[drop] = -1
-        output = moe(x, weights, masked_ids, mask_invalid_slots=mask)[:tokens].clone()
+        output = _fwd(moe, x, weights, masked_ids, mask_invalid_slots=mask)[
+            :tokens
+        ].clone()
         _barrier()
         reference = _reference(
             x,
@@ -695,7 +703,7 @@ def _check_large_m_edges(
         _torch_stream(s) != torch.cuda.default_stream() for s in (0, fx.Stream(None))
     ):
         raise AssertionError("a null stream handle did not map to the default stream")
-    null_output = moe(x, weights, ids, stream=fx.Stream(None))[:tokens]
+    null_output = _fwd(moe, x, weights, ids, stream=fx.Stream(None))[:tokens]
     torch.cuda.synchronize()
     if not _reduce_float(
         torch.equal(null_output, eager_output), device, dist.ReduceOp.MIN
@@ -753,7 +761,7 @@ def _check_pad_tail(moe, x, weights, ids, ref_weights, args, rank, world, device
     masked_ids[real:] = -1
 
     def masked():
-        return moe(x, weights, masked_ids, mask_invalid_slots=True)[:tokens]
+        return _fwd(moe, x, weights, masked_ids, mask_invalid_slots=True)[:tokens]
 
     eager_output = masked().clone()
     _barrier()
@@ -800,10 +808,10 @@ def _check_pad_tail(moe, x, weights, ids, ref_weights, args, rank, world, device
 
 
 def _run_burst(moe, x, weights, ids, depth, rank):
-    moe(x, weights, ids)
+    _fwd(moe, x, weights, ids)
     _barrier()
     for _ in range(depth):
-        moe(x, weights, ids)
+        _fwd(moe, x, weights, ids)
     torch.cuda.synchronize()
     if rank == 0:
         print(f"[BURST] completed={depth}/{depth}", flush=True)
@@ -854,13 +862,13 @@ def _run_layer_slot_stress(moe, x, weights, ids, slots, cycles, rank):
                     (ids + cycle * 37 + slot * 11).remainder(moe.experts).contiguous()
                 )
             moe.bind_layer(slot, *bound)
-            output = moe(x, route_weights, route_ids)[:tokens]
+            output = _fwd(moe, x, route_weights, route_ids)[:tokens]
             if slot not in checked_slots:
                 continue
             output = output.clone()
             moe.set_large_m_enabled(False)
             try:
-                reference = moe(x, route_weights, route_ids)[:tokens].clone()
+                reference = _fwd(moe, x, route_weights, route_ids)[:tokens].clone()
             finally:
                 moe.set_large_m_enabled(True)
             mismatched = (output != reference).any(dim=-1).sum().to(torch.int64)
@@ -875,9 +883,9 @@ def _run_layer_slot_stress(moe, x, weights, ids, slots, cycles, rank):
             checked += 1
     # The doubled W2 must change the result, or the comparisons above could not see a stale binding.
     moe.bind_layer(0, w1_a, sw1_a, w2_a, sw2_a)
-    out_a = moe(x, weights, ids)[:tokens].clone()
+    out_a = _fwd(moe, x, weights, ids)[:tokens].clone()
     moe.bind_layer(0, w1_b, sw1_b, w2_b, sw2_b)
-    out_b = moe(x, weights, ids)[:tokens].clone()
+    out_b = _fwd(moe, x, weights, ids)[:tokens].clone()
     differ = (out_a != out_b).any().to(torch.int64)
     dist.all_reduce(differ, op=dist.ReduceOp.MAX)
     if not int(differ.item()):
@@ -946,8 +954,8 @@ def _run_skewed_route_switch(moe, x, weights, ids, rounds, seed, rank, world):
         raise AssertionError("skewed route switch requires the large-M path")
     tokens = x.shape[0]
     local_experts = moe.experts // world
-    moe(x, weights, ids)
-    moe(x, weights, ids)
+    _fwd(moe, x, weights, ids)
+    _fwd(moe, x, weights, ids)
     _barrier()
     worst = 0.0
     failures = []
@@ -973,11 +981,11 @@ def _run_skewed_route_switch(moe, x, weights, ids, rounds, seed, rank, world):
             raise AssertionError("skewed route did not exceed four payload producers")
         moe.set_large_m_enabled(False)
         try:
-            main_output = moe(x, route_weights, route_ids)[:tokens].clone()
+            main_output = _fwd(moe, x, route_weights, route_ids)[:tokens].clone()
         finally:
             moe.set_large_m_enabled(True)
         _barrier()
-        output = moe(x, route_weights, route_ids)[:tokens].float()
+        output = _fwd(moe, x, route_weights, route_ids)[:tokens].float()
         mismatched = (output != main_output.float()).any(dim=-1).sum().to(torch.int64)
         error_sq = torch.sum((output - main_output.float()) ** 2)
         reference_sq = torch.sum(main_output.float() ** 2)
