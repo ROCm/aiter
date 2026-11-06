@@ -2128,7 +2128,10 @@ def _tp_route_quant_takes_route(
     map from the psum remap.
     """
     from aiter.ops.flydsl.kernels.moe_route_maps import TP_ROUTE_PSUM_MAX_EXPERTS
-    from aiter.ops.flydsl.moe_kernels import token_multidest_eligible
+    from aiter.ops.flydsl.moe_kernels import (
+        token_multidest_eligible,
+        token_multidest_quant_enabled,
+    )
 
     if int(experts) > TP_ROUTE_PSUM_MAX_EXPERTS or a_preshuffled:
         return False
@@ -2136,11 +2139,7 @@ def _tp_route_quant_takes_route(
     # activation the dispatch ignores a1_scale.
     if hidden_states.dtype != torch.bfloat16:
         return False
-    if os.environ.get("AITER_FLYDSL_TOKEN_MULTIDEST_QUANT", "1") not in (
-        "1",
-        "true",
-        "True",
-    ):
+    if not token_multidest_quant_enabled():
         return False
     quant_mode = "fp4" if data_format == "fp4" else "fp8"
     return token_multidest_eligible(token_num, topk) and not (
