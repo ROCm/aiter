@@ -20,9 +20,38 @@ from .base_device_communicator import All2AllManagerBase, DeviceCommunicatorBase
 _GLUON_AR_MAX_BYTES = 8 << 20
 # The plain Gluon all-reduce is faster than the custom all-reduce and RCCL up to 4 MiB.
 _GLUON_PLAIN_AR_MAX_BYTES = 4 << 20
+# The plain Gluon all-reduce also does the residual add, RMSNorm and per-token FP8 of
+# hidden 6144 (all_reduce_rmsnorm) up to this many tokens. AITER_GLUON_AR_NORM=0
+# turns it off.
+# TP4 graph replay: faster than the split path at every measured size, 1 to 256.
+_GLUON_AR_NORM_MAX_TOKENS = int(os.environ.get("AITER_GLUON_AR_NORM_MAX_TOKENS", "256"))
+_GLUON_AR_NORM_HIDDEN = 6144
 
 should_nccl_symm_mem_allreduce = False
 _SUPPORTED_ALL2ALL_MANAGER_BACKENDS = ("flydsl", "mori", "mori_v2")
+
+
+def _use_gluon_ar_norm(comm, input_, res_inp_, weight_) -> bool:
+    """True if all_reduce_rmsnorm gives the bits of the plain Gluon all-reduce
+    followed by the HIP add_rmsnorm or add_rmsnorm_quant(round_before_quant=True)."""
+    if not getattr(comm, "gluon_ar_norm", False) or comm.gluon_ar_plain is None:
+        return False
+    return (
+        input_.dim() == 2
+        and input_.shape[1] == _GLUON_AR_NORM_HIDDEN
+        and 0 < input_.shape[0] <= _GLUON_AR_NORM_MAX_TOKENS
+        and input_.dtype == res_inp_.dtype == weight_.dtype == torch.bfloat16
+        and res_inp_.shape == input_.shape
+        and weight_.shape == (_GLUON_AR_NORM_HIDDEN,)
+        and input_.is_contiguous()
+        and res_inp_.is_contiguous()
+        and weight_.is_contiguous()
+        and input_.device == res_inp_.device == weight_.device
+        and input_.data_ptr() % 16 == 0
+        and res_inp_.data_ptr() % 16 == 0
+        and weight_.data_ptr() % 16 == 0
+        and input_.numel() * input_.element_size() <= _GLUON_PLAIN_AR_MAX_BYTES
+    )
 
 
 class CudaCommunicator(DeviceCommunicatorBase):
@@ -86,6 +115,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             self.symm_mem_comm = reuse_from.symm_mem_comm
             self.gluon_ar = reuse_from.gluon_ar
             self.gluon_ar_plain = reuse_from.gluon_ar_plain
+            self.gluon_ar_norm = reuse_from.gluon_ar_norm
             return
 
         # lazy import to avoid documentation build error
@@ -138,6 +168,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         # long as the process: destroy() runs after the groups are gone.
         self.gluon_ar = None
         self.gluon_ar_plain = None
+        self.gluon_ar_norm = False  # gluon_ar_plain also runs all_reduce_rmsnorm
         if (
             os.environ.get("AITER_GLUON_FUSED_AR") == "1"
             and self.world_size == 4
@@ -149,6 +180,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             self.gluon_ar_plain = all_reduce_init(
                 self.cpu_group, _GLUON_PLAIN_AR_MAX_BYTES
             )
+            self.gluon_ar_norm = os.environ.get("AITER_GLUON_AR_NORM", "1") == "1"
 
         if self.world_size > 1:
             from aiter.dist.device_communicators.quick_all_reduce import (
@@ -438,6 +470,26 @@ class CudaCommunicator(DeviceCommunicatorBase):
             assert res_out is not None
             return out, res_out
 
+        if (
+            not use_general_path
+            and x_pad_to_multiple == 0
+            and input_n == n
+            and _use_gluon_ar_norm(self, input_, res_inp_, weight_)
+        ):
+            # The plain Gluon all-reduce and the HIP add_rmsnorm below, in one launch.
+            from aiter.ops.triton.comms.all_reduce import all_reduce_rmsnorm
+
+            return all_reduce_rmsnorm(
+                input_,
+                res_inp_,
+                weight_,
+                eps,
+                gemma_norm,
+                False,
+                self.cpu_group,
+                *self.gluon_ar_plain,
+            )
+
         input_for_ar = input_ if input_is_weak_contiguous else input_.contiguous()
         ar_out = self.all_reduce(input_for_ar, prefill_support=prefill_support)
         if input_n != n:
@@ -550,6 +602,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             else 64 * 1024 * 1024
         )
         ca_comm = self.ca_comm
+        qr_comm = self.qr_comm
         if (
             ca_comm is not None
             and not ca_comm.disabled
@@ -593,7 +646,6 @@ class CudaCommunicator(DeviceCommunicatorBase):
             and ca_comm is not None
             and not ca_comm.disabled
             and not ca_comm.has_old_arch_fused_kernels
-            and (self.qr_comm is None or self.qr_comm.disabled)
             and input_.dim() == 2
             # Match the vectorized FP8 store alignment; tail rows keep
             # the existing standalone quantizer.
@@ -611,30 +663,59 @@ class CudaCommunicator(DeviceCommunicatorBase):
             and weight_.device == input_.device
             and ca_comm.can_fuse_ar_rms(input_, hidden_dim, hidden_dim)
             and not ca_comm.should_fuse_ar_rms(input_, hidden_dim, hidden_dim)
+            and (
+                qr_comm is None
+                or qr_comm.disabled
+                or (
+                    # This branch is already confined to the gfx1250 LL range
+                    # by should_fuse_ar_rms above. Keep QR's production routing
+                    # predicate authoritative for its minimum-size crossover.
+                    self.world_size == 4
+                    and get_gfx() == "gfx1250"
+                    and input_.dtype == torch.bfloat16
+                    and not qr_comm.should_quick_allreduce(input_)
+                )
+            )
             and ca_comm.should_custom_ar(input_, prefill_support)
         ):
             # Keep the LL all-reduce, but fuse its residual/norm and quant
             # epilogue. Round to the input dtype before amax, just as the
             # separate norm -> per-token quant path does.
-            from aiter import add_rmsnorm_quant
+            if _use_gluon_ar_norm(self, input_, res_inp_, weight_):
+                # The same all-reduce and epilogue in one launch: the plain Gluon
+                # all-reduce kernel does the add_rmsnorm_quant work.
+                from aiter.ops.triton.comms.all_reduce import all_reduce_rmsnorm
 
-            ar_out = self.all_reduce(input_, prefill_support=prefill_support)
-            out = torch.empty_like(ar_out, dtype=fp8)
-            res_out = torch.empty_like(res_inp_)
-            scale_out = torch.empty(
-                (*ar_out.shape[:-1], 1), dtype=torch.float32, device=ar_out.device
-            )
-            add_rmsnorm_quant(
-                out,
-                ar_out,
-                res_inp_,
-                res_out,
-                scale_out,
-                weight_,
-                eps,
-                gemma_norm=gemma_norm,
-                round_before_quant=True,
-            )
+                out, res_out, scale_out = all_reduce_rmsnorm(
+                    input_,
+                    res_inp_,
+                    weight_,
+                    eps,
+                    gemma_norm,
+                    True,
+                    self.cpu_group,
+                    *self.gluon_ar_plain,
+                )
+            else:
+                from aiter import add_rmsnorm_quant
+
+                ar_out = self.all_reduce(input_, prefill_support=prefill_support)
+                out = torch.empty_like(ar_out, dtype=fp8)
+                res_out = torch.empty_like(res_inp_)
+                scale_out = torch.empty(
+                    (*ar_out.shape[:-1], 1), dtype=torch.float32, device=ar_out.device
+                )
+                add_rmsnorm_quant(
+                    out,
+                    ar_out,
+                    res_inp_,
+                    res_out,
+                    scale_out,
+                    weight_,
+                    eps,
+                    gemma_norm=gemma_norm,
+                    round_before_quant=True,
+                )
         else:
             out_, res_out = self.fused_allreduce_rmsnorm(
                 input_,

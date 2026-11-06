@@ -16,6 +16,11 @@ _LINES = 64  # lines of a chunk: 2 for each lane of one wave
 _MAXIT = 20_000_000  # poll limit, some seconds: a peer can still be compiling
 _PROGRAMS = 2048  # receivers: more polling receivers can fill the GPU
 _POOLS = {}  # the IPC pool of each inbox, by its address: the pool owns the inbox
+# all_reduce_rmsnorm: the hidden size whose rows are 8 waves of 2 chunks, as the 8 waves
+# of add_rmsnorm_quant_kernel<256, 24>, so that the results have the same bits.
+NORM_HIDDEN = 6144
+_NORM_WAVES = 8
+_NORM_SEND = 8  # chunks of a NORM sender program, one a wave: faster than 1
 
 
 def all_reduce_init(group, max_bytes):
@@ -95,10 +100,102 @@ def all_reduce(x: torch.Tensor, group, inboxes, calls) -> torch.Tensor:
         calls[-1:],
         n,
         programs,
+        x,  # residual, weight, out, scale: not used without NORM
+        x,
+        x,
+        x,
         RANK=dist.get_rank(group),
         LINES=_LINES,
         SLOT=4 * _LINES * chunks,
         MAXIT=_MAXIT,
+        NORM=0,
+        HIDDEN=0,
+        GEMMA=False,
+        EPS=0.0,
+        SEND=1,
         num_warps=1,
     )
     return y
+
+
+def all_reduce_rmsnorm(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    gemma: bool,
+    quant: bool,
+    group,
+    inboxes,
+    calls,
+):
+    """
+    Returns RMSNorm(residual_out) and residual_out = all_reduce(x) + residual over
+    the 4 ranks of ``group`` on gfx1250, with one launch of the all-reduce kernel.
+    The bits are those of ``all_reduce`` followed by ``aiter.add_rmsnorm`` (or by
+    ``aiter.add_rmsnorm_quant(..., round_before_quant=True)`` with quant), for finite
+    values that are not fp32 subnormals. All ranks must make the same calls in the
+    same order. HIP graphs are supported.
+
+    Args:
+        x, residual (torch.Tensor): Contiguous bf16 (tokens, 6144), 16-byte aligned.
+        weight (torch.Tensor): Contiguous bf16 (6144,). With gemma, the norm uses
+            1 + weight.
+        eps (float): The epsilon of the norm. Each value compiles a kernel.
+        quant (bool): Return out as per-token FP8 (float8_e4m3fn) and also its fp32
+            scale of shape (tokens, 1). Else out is bf16.
+        inboxes, calls: The result of ``all_reduce_init``, shared with ``all_reduce``.
+
+    Returns:
+        tuple: (out, residual_out), or (out, residual_out, scale) with quant. If a
+        poll times out, the results are wrong and calls[-1] is more than 0.
+    """
+    tokens, hidden = x.shape
+    assert hidden == NORM_HIDDEN and tokens > 0
+    assert x.dtype == residual.dtype == weight.dtype == torch.bfloat16
+    assert residual.shape == x.shape and weight.shape == (hidden,)
+    assert x.is_contiguous() and residual.is_contiguous() and weight.is_contiguous()
+    for t in (x, residual, weight):
+        assert t.data_ptr() % 16 == 0
+    chunks = (calls.numel() - 1) // 2
+    n = x.numel()
+    num_chunks = n // (6 * _LINES)  # rows are whole chunks
+    assert num_chunks <= chunks
+
+    _LOGGER.info("ALL_REDUCE_RMSNORM [gluon]: x=%s quant=%s", x.shape, quant)
+
+    residual_out = torch.empty_like(x)
+    if quant:
+        out = torch.empty(x.shape, dtype=torch.float8_e4m3fn, device=x.device)
+        scale = torch.empty((tokens, 1), dtype=torch.float32, device=x.device)
+    else:
+        out = torch.empty_like(x)
+        scale = residual_out  # not used without quant
+    _all_reduce_kernel[(num_chunks // _NORM_SEND + tokens,)](
+        x,
+        residual_out,
+        inboxes,
+        calls,
+        calls[-1:],
+        n,
+        tokens,
+        residual,
+        weight,
+        out,
+        scale,
+        RANK=dist.get_rank(group),
+        LINES=_LINES,
+        SLOT=4 * _LINES * chunks,
+        MAXIT=_MAXIT,
+        NORM=2 if quant else 1,
+        HIDDEN=NORM_HIDDEN,
+        GEMMA=bool(gemma),
+        EPS=float(eps),
+        SEND=_NORM_SEND,
+        num_warps=_NORM_WAVES,
+        # No fma: the HIP kernel rounds each square before it adds it.
+        enable_fp_fusion=False,
+    )
+    if quant:
+        return out, residual_out, scale
+    return out, residual_out
