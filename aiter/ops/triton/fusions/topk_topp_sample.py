@@ -18,6 +18,7 @@ from aiter.ops.triton._triton_kernels.fusions.topk_topp_sample import (
     _topk_topp_sample_select_kernel,
     _topk_topp_sample_stats_kernel,
 )
+from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.config_utils import (
     load_config_json,
     resolve_config_dir,
@@ -27,9 +28,16 @@ from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 
-__all__ = ["MAX_K", "topk_topp_sample", "topk_topp_sample_supported"]
+__all__ = [
+    "MAX_K",
+    "topk_topp_sample",
+    "topk_topp_sample_gluon_select_supported",
+    "topk_topp_sample_supported",
+]
 
 MAX_K = 64
+# the Gluon select packs a group index in 13 bits and a chunk index in 10 bits
+_GLUON_SELECT_MAX_VOCAB = 8192 * 32
 
 
 def _get_config(rows: int) -> tuple[dict, dict]:
@@ -37,6 +45,12 @@ def _get_config(rows: int) -> tuple[dict, dict]:
     configs = load_config_json(f"{config_dir}/DEFAULT.json", required=True)
     stats = select_leq_config(configs["stats"], rows, prefix="ROWS_LEQ_")
     return stats, dict(configs["select"])
+
+
+def _get_gluon_select_config(rows: int) -> dict:
+    config_dir = resolve_config_dir("fusions", "TOPK_TOPP_SAMPLE", backend="gluon")
+    configs = load_config_json(f"{config_dir}/DEFAULT.json", required=True)
+    return select_leq_config(configs, rows, prefix="ROWS_LEQ_")
 
 
 def topk_topp_sample_supported(logits: torch.Tensor, top_k) -> bool:
@@ -49,6 +63,15 @@ def topk_topp_sample_supported(logits: torch.Tensor, top_k) -> bool:
         and isinstance(top_k, int)
         and 0 < top_k <= MAX_K
         and top_k * GROUP.value <= logits.shape[1]
+    )
+
+
+def topk_topp_sample_gluon_select_supported(logits: torch.Tensor, top_k) -> bool:
+    """True when ``topk_topp_sample(..., gluon_select=True)`` takes these logits."""
+    return (
+        topk_topp_sample_supported(logits, top_k)
+        and get_arch() == "gfx1250"
+        and logits.shape[1] <= _GLUON_SELECT_MAX_VOCAB
     )
 
 
@@ -66,6 +89,8 @@ def topk_topp_sample(
     out: torch.Tensor | None = None,
     debug: torch.Tensor | None = None,
     presence: dict | None = None,
+    gluon_select: bool = False,
+    philox: tuple[int, int] | None = None,
 ) -> torch.Tensor:
     """Sample one token a row from ``softmax(logits / t)`` under top-k and top-p.
 
@@ -99,7 +124,16 @@ def topk_topp_sample(
             [s] fp32, ``mask`` uint8 [slots, V] and ``max_extra``. A column is
             penalized when ``mask[slots[s], col]`` is set, or when it is one of
             ``input_ids[seq_start[s] + 1 .. seq_start[s] + row_pos[R]]`` (the
-            drafts before a verify row).
+            drafts before a verify row). Optional key ``anchor``
+            (gluon_select only): also penalize ``input_ids[seq_start[s]]``,
+            the query's first token, and set its byte in the mask.
+        gluon_select: the select pass as a Gluon kernel with fewer dependent
+            steps (gfx1250, see ``topk_topp_sample_gluon_select_supported``).
+            The same tokens as the Triton select kernel.
+        philox: ``(seed, offset)``, gluon_select only: the uniform of row r is
+            Philox-4x32-10 at key ``seed`` and counter ``(r, offset)``, made
+            in the kernel, in place of ``uniform``. Use a new offset for
+            each call.
 
     Returns:
         int32 [n] token ids.
@@ -120,7 +154,12 @@ def topk_topp_sample(
         out = torch.empty(n, dtype=torch.int32, device=device)
     if n == 0:
         return out
-    if uniform is None:
+    anchor = presence is not None and bool(presence.get("anchor", False))
+    assert gluon_select or (
+        philox is None and not anchor
+    ), "philox and anchor need gluon_select"
+    assert philox is None or uniform is None, "philox replaces uniform"
+    if uniform is None and philox is None:
         uniform = torch.rand(n, dtype=torch.float32, device=device)
     _LOGGER.info(
         "TOPK_TOPP_SAMPLE: logits=%s rows=%d k=%d", tuple(logits.shape), n, top_k
@@ -136,7 +175,6 @@ def topk_topp_sample(
     m = torch.empty((n, NCH), dtype=torch.float32, device=device)
     z = torch.empty((n, NCH), dtype=torch.float32, device=device)
     g = torch.empty((n, NG), dtype=torch.int16, device=device)
-    ws = torch.empty((n, NG_P2 + 2 * KB), dtype=torch.int32, device=device)
     penalty = presence is not None
     if penalty:
         pen = (
@@ -156,6 +194,88 @@ def topk_topp_sample(
     per_req = isinstance(top_p, torch.Tensor)
     top_p_t = top_p.float().contiguous() if per_req else temperatures
 
+    if gluon_select:
+        assert topk_topp_sample_gluon_select_supported(logits, top_k), "gfx1250 only"
+        from aiter.ops.triton._gluon_kernels.gfx1250.fusions.topk_topp_sample import (
+            _topk_topp_sample_select_gluon_kernel,
+            _topk_topp_sample_stats_gluon_kernel,
+        )
+
+        gcfg = _get_gluon_select_config(n)
+        # 4 waves a chunk: the Triton stats kernel's reduction order
+        gcpp = gcfg["stats_chunks"]
+        _topk_topp_sample_stats_gluon_kernel[(n, triton.cdiv(NCH, gcpp))](
+            logits,
+            logits.stride(0),
+            verify_rows,
+            bonus_rows,
+            cu_num_draft_tokens,
+            temperatures,
+            m,
+            z,
+            g,
+            *pen,
+            n_verify,
+            n_cu,
+            V,
+            NG,
+            NCH,
+            ROW_MAP=row_map,
+            BLOCK_BS=block_bs,
+            PENALTY=penalty,
+            MAX_EXTRA=max_extra,
+            ANCHOR=anchor,
+            GROUPS=groups,
+            CPP=gcpp,
+            NW=4 * gcpp,
+            num_warps=4 * gcpp,
+        )
+        nw = gcfg["num_warps"]
+        seed, offset = philox if philox is not None else (0, 0)
+        _topk_topp_sample_select_gluon_kernel[(n,)](
+            logits,
+            logits.stride(0),
+            verify_rows,
+            bonus_rows,
+            cu_num_draft_tokens,
+            temperatures,
+            top_p_t,
+            0.0 if per_req else float(top_p),
+            uniform if uniform is not None else out,
+            seed & 0xFFFFFFFF,
+            (seed >> 32) & 0xFFFFFFFF,
+            offset & 0xFFFFFFFF,
+            (offset >> 32) & 0xFFFFFFFF,
+            m,
+            z,
+            g,
+            out,
+            debug if debug is not None else out,
+            *pen,
+            presence["mask"].shape[1] if penalty else 0,
+            n_verify,
+            n_cu,
+            V,
+            NG,
+            NCH,
+            top_k,
+            eps,
+            ROW_MAP=row_map,
+            BLOCK_BS=block_bs,
+            PENALTY=penalty,
+            MAX_EXTRA=max_extra,
+            ANCHOR=anchor,
+            GROUPS=groups,
+            NCH_P2=triton.next_power_of_2(NCH),
+            KB=KB,
+            CAP=2 * KB,
+            TOP_P_PER_REQ=per_req,
+            PHILOX=philox is not None,
+            DEBUG=debug is not None,
+            NW=nw,
+            num_warps=nw,
+        )
+        return out
     cpp = stats_cfg["CHUNKS_PER_PROGRAM"]
     _topk_topp_sample_stats_kernel[(n, triton.cdiv(NCH, cpp))](
         logits,
@@ -181,6 +301,7 @@ def topk_topp_sample(
         CHUNKS_PER_PROGRAM=cpp,
         num_warps=stats_cfg["num_warps"],
     )
+    ws = torch.empty((n, NG_P2 + 2 * KB), dtype=torch.int32, device=device)
     _topk_topp_sample_select_kernel[(n,)](
         logits,
         logits.stride(0),

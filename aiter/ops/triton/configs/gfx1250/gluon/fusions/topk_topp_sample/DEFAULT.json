@@ -1,0 +1,6 @@
+{
+    "any": {
+        "stats_chunks": 1,
+        "num_warps": 8
+    }
+}
