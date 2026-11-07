@@ -588,6 +588,123 @@ def test_mha_sliding_window_no_sink(
     )
 
 
+@pytest.mark.parametrize("SEQLEN_Q, SEQLEN_K", [(128, 128), (64, 128)])
+@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(8, 1), (8, 8)])
+@pytest.mark.parametrize("HEAD_SZ", [64, 128])
+@pytest.mark.parametrize("WINDOW_SIZE", [(16, 16), (32, 0), (-1, 32), (4, 64)])
+def test_mha_non_causal_right_window(
+    SEQLEN_Q: int,
+    SEQLEN_K: int,
+    NUM_Q_HEADS: int,
+    NUM_K_HEADS: int,
+    HEAD_SZ: int,
+    WINDOW_SIZE: tuple[int, int],
+):
+    # A right window works with the default impl, without calling mha_set_impl.
+    BATCH = 2
+    device: str = "cuda"
+    dtype: torch.dtype = torch.bfloat16
+
+    torch.cuda.empty_cache()
+    torch.manual_seed(0)
+    q = torch.randn(
+        (BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ),
+        device=device,
+        dtype=dtype,
+        requires_grad=True,
+    )
+    k = torch.randn(
+        (BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ),
+        device=device,
+        dtype=dtype,
+        requires_grad=True,
+    )
+    v = torch.randn(
+        (BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ),
+        device=device,
+        dtype=dtype,
+        requires_grad=True,
+    )
+
+    triton_out = flash_attn_func(q, k, v, causal=False, window_size=WINDOW_SIZE)
+    torch_out, _, _ = attention_ref(q, k, v, causal=False, window_size=WINDOW_SIZE)
+    torch.testing.assert_close(
+        triton_out,
+        torch_out,
+        atol=1e-2,
+        rtol=1e-2,
+        msg=lambda msg: f"fwd mismatch\n\n{msg}\n",
+    )
+
+    do = torch.randn_like(q)
+    triton_grads = torch.autograd.grad(triton_out, (q, k, v), do)
+    torch_grads = torch.autograd.grad(torch_out, (q, k, v), do)
+    for name, triton_grad, torch_grad in zip(
+        ("dq", "dk", "dv"), triton_grads, torch_grads
+    ):
+        torch.testing.assert_close(
+            triton_grad,
+            torch_grad,
+            atol=1.5e-2,
+            rtol=1.5e-2,
+            msg=lambda msg, name=name: f"bwd {name} mismatch\n\n{msg}\n",
+        )
+
+
+@pytest.mark.parametrize("WINDOW_SIZE", [(16, 16), (-1, 32)])
+def test_mha_varlen_non_causal_right_window(WINDOW_SIZE: tuple[int, int]):
+    # Equal-length sequences, so varlen must match the fixed-length path,
+    # including the documented (total_q, num_q_heads) LSE layout.
+    BATCH, SEQLEN, NUM_HEADS, HEAD_SZ = 2, 128, 8, 64
+    torch.manual_seed(0)
+    q, k, v = (
+        torch.randn(
+            (BATCH, SEQLEN, NUM_HEADS, HEAD_SZ),
+            device="cuda",
+            dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+        for _ in range(3)
+    )
+    cu_seqlens = torch.arange(
+        0, (BATCH + 1) * SEQLEN, SEQLEN, device="cuda", dtype=torch.int32
+    )
+
+    out, lse = flash_attn_func(
+        q, k, v, causal=False, window_size=WINDOW_SIZE, return_lse=True
+    )
+    out_varlen, lse_varlen = flash_attn_varlen_func(
+        q.flatten(0, 1),
+        k.flatten(0, 1),
+        v.flatten(0, 1),
+        cu_seqlens,
+        cu_seqlens,
+        SEQLEN,
+        SEQLEN,
+        causal=False,
+        window_size=WINDOW_SIZE,
+        return_lse=True,
+    )
+    assert lse_varlen.shape == (BATCH * SEQLEN, NUM_HEADS)
+    torch.testing.assert_close(out_varlen, out.flatten(0, 1))
+    torch.testing.assert_close(lse_varlen, lse.transpose(1, 2).flatten(0, 1))
+
+    do = torch.randn_like(out)
+    grads = torch.autograd.grad(out, (q, k, v), do)
+    grads_varlen = torch.autograd.grad(out_varlen, (q, k, v), do.flatten(0, 1))
+    for grad, grad_varlen in zip(grads, grads_varlen):
+        torch.testing.assert_close(grad_varlen, grad)
+
+
+def test_mha_non_causal_right_window_with_dropout_raises():
+    q, k, v = (
+        torch.randn((1, 128, 8, 64), device="cuda", dtype=torch.bfloat16)
+        for _ in range(3)
+    )
+    with pytest.raises(ValueError, match="window_size_right is not supported"):
+        flash_attn_func(q, k, v, dropout_p=0.2, causal=False, window_size=(16, 16))
+
+
 def test_mha_sliding_window_fused_backward_raises():
     q = torch.randn(
         (1, 128, 8, 64), device="cuda", dtype=torch.bfloat16, requires_grad=True
