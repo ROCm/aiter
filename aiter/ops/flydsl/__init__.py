@@ -3,14 +3,20 @@
 
 """FlyDSL -- high-performance GPU kernels implemented using FlyDSL."""
 
+import os
 from importlib import import_module
 
 import flydsl as _flydsl
 from packaging.version import Version
 
 from aiter.fused_moe_registry import register_fused_moe_impl
+from aiter.jit.utils.cpp_extension import ROCM_HOME
 
 from .moe_common import GateMode
+
+# MLIR's ROCDL serializer needs the SDK path already located for C++ builds.
+if ROCM_HOME is not None:
+    os.environ.setdefault("ROCM_PATH", ROCM_HOME)
 
 _MIN_FLYDSL_VERSION = Version("0.2.4")
 

@@ -67,7 +67,7 @@ jobs:
           docker exec \
           -w /workspace \
           operators_tuning_test \
-          bash -c "BUILD_TRITON=0 ./.github/scripts/build_aiter_triton.sh"
+          bash -c "apt-get update && apt-get install -y git && BUILD_TRITON=0 ./.github/scripts/build_aiter_triton.sh"
 
       - name: Show Computing Units
         run: |

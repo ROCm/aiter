@@ -79,10 +79,12 @@ jobs:
             "${DOCKER_IMAGE}" \
             bash -lc '
               set -euo pipefail
+              apt-get update
+              apt-get install -y git
               git config --global --add safe.directory /workspace
               rm -rf dist build aiter_meta ./*.egg-info
               pip install --upgrade build "setuptools_scm>=8"
-              version=$(python -m setuptools_scm)
+              version=$(python3 -m setuptools_scm)
               # The prebuilt wheel of the same commit is published next to this
               # one; a local-version suffix keeps an exact pin from resolving
               # to the other.
@@ -94,7 +96,7 @@ jobs:
               # AITER_PY3_WHEEL=1 tags the wheel py3-none (see setup.py).
               PREBUILD_KERNELS=0 AITER_PY3_WHEEL=1 \
                 SETUPTOOLS_SCM_PRETEND_VERSION_FOR_AMD_AITER="${version}" \
-                python -m build --wheel
+                python3 -m build --wheel
               ls -lh dist/*.whl
             '
 

@@ -83,7 +83,7 @@ jobs:
             -e GPU_ARCHS="${GPU_ARCHS}" \
             -w /workspace \
             tuning_tests_level01 \
-            bash -lc "BUILD_TRITON=0 ./.github/scripts/build_aiter_triton.sh"
+            bash -lc "apt-get update && apt-get install -y git && BUILD_TRITON=0 ./.github/scripts/build_aiter_triton.sh"
 
       - name: Run README level 0+1 suite
         run: |
@@ -166,7 +166,7 @@ jobs:
             -e GPU_ARCHS="${GPU_ARCHS}" \
             -w /workspace \
             tuning_tests_pipeline \
-            bash -lc "BUILD_TRITON=0 ./.github/scripts/build_aiter_triton.sh"
+            bash -lc "apt-get update && apt-get install -y git && BUILD_TRITON=0 ./.github/scripts/build_aiter_triton.sh"
 
       - name: Run README tune pipeline suite
         run: |
@@ -249,7 +249,7 @@ jobs:
             -e GPU_ARCHS="${GPU_ARCHS}" \
             -w /workspace \
             tuning_tests_run_config \
-            bash -lc "BUILD_TRITON=0 ./.github/scripts/build_aiter_triton.sh"
+            bash -lc "apt-get update && apt-get install -y git && BUILD_TRITON=0 ./.github/scripts/build_aiter_triton.sh"
 
       - name: Run README run_config suite
         run: |
