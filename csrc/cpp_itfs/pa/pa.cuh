@@ -115,6 +115,8 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
     constexpr int GQA_RATIO_PER_LOOP     = GQA_RATIO / GQA_RATIO_LOOP;
     constexpr int GQA_RATIO_MTP_PARALLEL = GQA_RATIO_PER_LOOP * MTP_PARALLEL_THREADS;
     constexpr int GQA_RATIO4             = DIVIDE_ROUND_UP(GQA_RATIO_MTP_PARALLEL, 4);
+    static_assert(GQA_RATIO % GQA_RATIO_LOOP == 0,
+                  "GQA_RATIO > 16 must be a multiple of DIVIDE_ROUND_UP(GQA_RATIO, 16)");
 
     // shared_logits is used for multiple purposes
     __shared__ _B16x4 shared_logits[GQA_RATIO_LOOP][HEAD_LOOP][MTP_PER_THREAD][NWARPS][4][16][4];
@@ -147,7 +149,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
     // can be interpreted as B8x16 for 8 bit types
     _B16x8 Klocal[HEAD_LOOP][TLOOP][QKHELOOP];
 
-    const auto wg_start_head_idx    = blockIdx.z * GQA_RATIO_PER_LOOP;
+    const auto wg_start_head_idx    = blockIdx.z * GQA_RATIO;
     const auto wg_start_kv_head_idx = blockIdx.z;
     const auto total_num_heads      = gridDim.z * GQA_RATIO;
 

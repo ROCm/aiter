@@ -1154,3 +1154,20 @@ if __name__ == "__main__":
             0,
             "cuda:0",
         )
+
+    test_paged_attention(
+        128,
+        128,
+        (48, 2),
+        128,
+        False,
+        16,
+        dtypes.bf16,
+        "auto",
+        "HND",
+        0.0,
+        PAVariant.Shomy,
+        None,
+        0,
+        "cuda:0",
+    )
