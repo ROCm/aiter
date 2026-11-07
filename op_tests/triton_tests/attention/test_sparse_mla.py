@@ -12,6 +12,7 @@ import torch
 
 import aiter.ops.triton.attention.sparse_mla as smd
 from aiter.ops.triton.attention.sparse_mla import (
+    FNUZ_DSV32_ARCHS,
     FP8_ARCHS,
     SUPPORTED_ARCHS,
     sparse_mla_fwd,
@@ -21,7 +22,8 @@ from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 from op_tests.triton_tests.attention.test_pa_decode_sparse import _inv_rope_ref
 
 # The arch-native fp8, as a producer on this machine writes it. That is OCP e4m3,
-# what the kernel reads, only on FP8_ARCHS; the fp8 cases skip everywhere else.
+# what the kernel reads, only on FP8_ARCHS; the fp8 cases skip everywhere else,
+# except dsmla on FNUZ_DSV32_ARCHS, whose dequant reads the native fnuz.
 FP8_DTYPE = get_fp8_e4m3_dtype()
 FP8_MAX = torch.finfo(FP8_DTYPE).max
 KV_LORA, ROPE = 512, 64
@@ -32,7 +34,8 @@ def _skip_unless_supported(dots="bf16", fmt="bf16"):
     arch = arch_info.get_arch()
     if arch not in SUPPORTED_ARCHS:
         pytest.skip(f"sparse_mla_fwd does not support {arch}")
-    if (dots == "fp8" or fmt != "bf16") and arch not in FP8_ARCHS:
+    fnuz_dsv32 = fmt == "dsmla" and dots == "bf16" and arch in FNUZ_DSV32_ARCHS
+    if (dots == "fp8" or fmt != "bf16") and arch not in FP8_ARCHS and not fnuz_dsv32:
         pytest.skip(f"fp8 is read as OCP e4m3, and {arch}'s native fp8 is fnuz")
 
 
@@ -240,9 +243,15 @@ def test_fp8_arch_gate(arch):
     for fmt, q_dtype in (
         ("fp8_scalar", torch.bfloat16),
         ("fp8_dsv32_mla", torch.bfloat16),
+        ("fp8_dsv32_mla", torch.float8_e4m3fn),
         ("bf16", torch.float8_e4m3fn),
     ):
-        if arch in FP8_ARCHS:
+        fnuz_dsv32 = (
+            arch in FNUZ_DSV32_ARCHS
+            and fmt == "fp8_dsv32_mla"
+            and q_dtype == torch.bfloat16
+        )
+        if arch in FP8_ARCHS or fnuz_dsv32:
             smd._check_fp8_arch(arch, fmt, q_dtype)
         else:
             with pytest.raises(ValueError, match="fnuz"):
@@ -259,6 +268,8 @@ def test_native_fp8_cache_rejected(fmt):
     arch = arch_info.get_arch()
     if arch not in SUPPORTED_ARCHS or arch in FP8_ARCHS:
         pytest.skip(f"fp8 caches run on {arch}")
+    if fmt == "dsmla" and arch in FNUZ_DSV32_ARCHS:
+        pytest.skip(f"{arch} reads fp8_dsv32_mla in its native fnuz")
     q, cache, ks, idx, ptr, _ = _build(fmt, 1, 16, 64, 1024, ragged=False)
     assert cache.dtype == torch.uint8
     with pytest.raises(ValueError, match="fnuz"):
@@ -320,9 +331,18 @@ def test_lds_budget_gfx942_boundary(kv_lds_pad, kv_lora_rank, rope, need):
         smd._check_lds_budget("gfx942", block_k, kv_lora_rank, rope, kv_lds_pad)
 
 
-def test_ds_mla_format():
+@pytest.mark.parametrize(
+    "C,H,topk,kwargs",
+    [
+        (8, 16, 2048, {}),
+        (8, 12, 2048, {"check_lse": True}),  # Kimi-K3.1's 96 heads at TP8
+        (2048, 16, 256, {"pool": 1 << 13, "check_lse": True}),
+    ],
+    ids=["topk2048", "h12_lse", "prefill_lse"],
+)
+def test_ds_mla_format(C, H, topk, kwargs):
     _skip_unless_supported(fmt="dsmla")
-    _run_and_check("dsmla", C=8, H=16, topk=2048, ragged=True)
+    _run_and_check("dsmla", C=C, H=H, topk=topk, ragged=True, **kwargs)
 
 
 def reference_lse(q, kv_truth, indices, indptr, sm_scale, sink=None):
