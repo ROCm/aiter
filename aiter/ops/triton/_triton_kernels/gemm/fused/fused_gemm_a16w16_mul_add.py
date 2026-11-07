@@ -181,8 +181,8 @@ def _get_config(
     N: int,
     K: int,
 ):
-    # On gfx1151 the mul_add epilogue needs a smaller tile than the plain GEMM.
-    # Other arches use the base GEMM-A16W16 family.
-    if arch_info.get_arch() == "gfx1151":
+    # On gfx1150 and gfx1151 the mul_add epilogue needs its own tiles, not the
+    # plain GEMM ones. Other arches use the base GEMM-A16W16 family.
+    if arch_info.get_arch() in ("gfx1150", "gfx1151"):
         return get_gemm_config("FUSED-GEMM-A16W16-MUL_ADD", M, N, K, backend="triton")
     return get_gemm_config("GEMM-A16W16", M, N, K, backend="triton")
