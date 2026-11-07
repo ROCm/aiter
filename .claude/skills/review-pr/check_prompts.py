@@ -41,6 +41,11 @@ CHECKS = [
         "**Output rules (strictly enforced):**",
         '- `⚠️ The benchmark may not include setup cost` — no "Author must" conclusion',
     ),
+    (
+        "prompts/worker.md",
+        "## Step 7.8 — Design Assessment",
+        "and an over-bar PR carries a split.",
+    ),
 ]
 
 
