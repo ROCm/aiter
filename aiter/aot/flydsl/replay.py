@@ -35,7 +35,7 @@ each replaying its jobs in a pool of workers.
 
 For an arch in ``SCAN_ARCHS``, every size of a job's range is identified:
 replayed with its launches stopped at their cache identity
-(:func:`identified_kernels`, nothing compiled), and one size per set of
+(:func:`identified_kernels`, traced but nothing compiled), and one size per set of
 kernels not yet built is replayed for real. A runtime whose choices are not
 monotonic in the size needs that, as a gfx1250 GEMM's are: it fits cluster_m
 to the number of M tiles and specializes a ragged last tile, so M=5120 and
@@ -101,7 +101,7 @@ def job_arch(job: dict, default: str = "gfx950") -> str:
 
 class ReplayHookBroken(RuntimeError):
     """A FlyDSL launch derived no cache key in
-    ``JitFunction._build_full_cache_key``: the FlyDSL internals the replay
+    ``jit_function._artifact_cache_key``: the FlyDSL internals the replay
     hooks into have changed, and it would miss the launch's kernel."""
 
 
@@ -114,28 +114,29 @@ class _Identified(BaseException):
 def requested_kernels(*, stop: bool = False) -> Iterator[set]:
     """Collect the cache identity of every FlyDSL launch a replay reaches, as
     FlyDSL itself derives it for its cache lookup. With ``stop``, a launch
-    ends there: nothing is traced, compiled or read from the cache, and the
-    launcher gets the None a COMPILE_ONLY launch returns.
+    ends there: it is traced, but nothing is compiled or read from the cache,
+    and the launcher gets the None a COMPILE_ONLY launch returns.
 
-    Hooks two private names of FlyDSL's ``JitFunction``:
-    ``_compile_or_execute``, which every launch (``__call__``,
-    ``flyc.compile``) goes through, and ``_build_full_cache_key``, which it
-    calls once before tracing. Should either be renamed, entering this
+    Hooks two private names of FlyDSL's ``jit_function`` module:
+    ``JitFunction._compile_or_execute``, which every launch (``__call__``,
+    ``flyc.compile``) goes through, and ``_artifact_cache_key``, which it
+    calls once after tracing. Should either be renamed, entering this
     fails; should a launch stop deriving its key there, it raises
     :class:`ReplayHookBroken`."""
     from unittest import mock
 
+    from flydsl.compiler import jit_function
     from flydsl.compiler.jit_function import JitFunction
 
     kernels = set()
-    build_key = JitFunction._build_full_cache_key
+    build_key = jit_function._artifact_cache_key
     dispatch = JitFunction._compile_or_execute
     derived = depth = 0
 
-    def record(self, *args, **kwargs):
+    def record(*args, **kwargs):
         nonlocal derived
-        key = build_key(self, *args, **kwargs)
-        kernels.add((self.manager_key, key))
+        key = build_key(*args, **kwargs)
+        kernels.add(key)
         derived += 1
         # Only a launch is stopped; host code may derive a key itself.
         if stop and depth:
@@ -156,12 +157,12 @@ def requested_kernels(*, stop: bool = False) -> Iterator[set]:
         if not depth and derived == before:
             raise ReplayHookBroken(
                 f"FlyDSL launched {self.func.__name__} without deriving its "
-                "cache key in JitFunction._build_full_cache_key"
+                "cache key in jit_function._artifact_cache_key"
             )
         return result
 
     with (
-        mock.patch.object(JitFunction, "_build_full_cache_key", record),
+        mock.patch.object(jit_function, "_artifact_cache_key", record),
         mock.patch.object(JitFunction, "_compile_or_execute", launch),
     ):
         yield kernels

@@ -141,6 +141,15 @@ def _bigm_cached(launch, args):
     """Collective-free: make launch(*args)'s compiled artifact resident -- from this process's
     memory, else the disk cache, else compiled (no kernel dispatch) and written to the disk
     cache -- and its code object loaded."""
+    if not hasattr(launch, "_build_full_cache_key"):
+        # FlyDSL >= 0.5 traces every launch and keys its own disk cache on the traced IR,
+        # which is stable across processes: its cache is this one
+        _preload_compiled(launch, *args)
+        if launch._last_compiled is not None:
+            art = launch._last_compiled[1]
+            art._get_func_exe()
+            _warn_spills(launch, art)
+        return
     try:  # FlyDSL's in-process key of these arguments (private API: on any change, just compile)
         launch._ensure_sig()
         launch._ensure_cache_manager()
