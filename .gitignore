@@ -111,3 +111,6 @@ csrc/opus_gemm/gen_co/**/asm/
 
 # Merge-conflict backups, which git writes next to the file being merged.
 *.orig
+
+# Local experiments, test drivers, documents, and benchmark logs.
+/my_code/
