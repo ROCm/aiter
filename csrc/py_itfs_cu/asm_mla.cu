@@ -264,6 +264,7 @@ struct MlaAsmDecodeCfg
     int gqa;
     int qseqlen;
     int ps;
+    int prefill; // 1: decode runs a prefill kernel from the CSV
     int causal;
     int lse;
     int cprr;
@@ -308,8 +309,15 @@ static MlaAsmDecodeCfg mla_asm_decode_remap(const std::string& arch_id,
     if(gqa_ratio == 128){
         config_max_seqlen_q = 0;
         sub_Q = 128;
-        if (q_type == "bf16" && kv_type == "bf16" && arch_id == "gfx942"){
-            ps = 0; // not use ps
+        if (q_type == "bf16" && kv_type == "bf16"){
+            if(arch_id == "gfx942")
+                ps = 0; // not use ps
+            // The decode kernel has no causal mask. Causal qlen > 1 runs the
+            // masked prefill build instead; it takes the same arguments.
+            if(!ps && causal && max_seqlen_q > 1){
+                c.prefill     = 1;
+                config_causal = 0;
+            }
         }
     }
     else if(gqa_ratio == 16){
@@ -354,7 +362,11 @@ static MlaAsmDecodeCfg mla_asm_decode_remap(const std::string& arch_id,
     } else if (gqa_ratio == 32){
         if (q_type == "bf16" && kv_type == "bf16"){
             if(!persistent){
-                config_max_seqlen_q = 0;
+                // qSeqLen 1: the one-token kernel (every request has at most one query
+                // token); 0: the causal kernel for any qlen. Both: 2 tokens x 32 heads
+                // per workgroup (sub_Q 64), the same grid and kernargs. Only gfx942 has
+                // the qSeqLen 1 kernel.
+                config_max_seqlen_q = (max_seqlen_q == 1 && arch_id == "gfx942") ? 1 : 0;
                 sub_Q = 64;
             }
         }else if (q_type == "fp8" && kv_type == "fp8"){
@@ -606,7 +618,7 @@ MlaAsmDecodeCfg mla_asm_decode_config(const std::string& arch_id,
                                             kv_type,
                                             c.gqa,
                                             c.ps,
-                                            0,
+                                            c.prefill,
                                             c.causal,
                                             c.qseqlen,
                                             arch_id,
