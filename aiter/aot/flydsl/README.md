@@ -15,6 +15,7 @@ compiles them up front so the runtime JIT path hits the cache.
 | `mega_moe.py` | MegaMoE A8W4 and A4W4 bundles of every deployment profile, by preloading `MegaMoEV2` itself (see below) |
 | `fmha_fp8.py` | gfx950 FP8 flash-attention forward, by replaying `flydsl_flash_attn_fp8_func` per head shape in `DEFAULT_SHAPES` |
 | `pa_decode_plan.py` | PA decode planner, every batch bucket, block size and window mode up to each arch's LDS limit, by replaying `plan_pa_decode` (see below) |
+| `unified_attention.py` | gfx942 FP8 unified attention, by replaying `unified_attention` per layer shape in `DEFAULT_SHAPES` (no CSV) |
 | `mxfp4_moe.py` | Not part of the AOT build; the MXFP4 tuner's `--fast-scan` precompiles its candidates with it |
 | `common.py` | Job collection, the deadlock-free fork pool, `run_aot` (what `setup.py` runs), and cache-hit checking logic |
 | `replay.py` | The shared driver of the replaying modules other than MoE/MegaMoE: per-arch processes, worker batches, size scans and bisection, `--check` |
@@ -111,7 +112,7 @@ variant of the profile's bundle plan.
   `python -m aiter.aot.flydsl.mega_moe` and `setup.py` start it that way. It
   is skipped when `GPU_ARCHS` names targets without gfx950.
 
-### How `gemm.py`, `conv.py`, `chunk_gdn_h.py`, `gdn_fused_prefill.py` and `fmha_fp8.py` work
+### How `gemm.py`, `conv.py`, `chunk_gdn_h.py`, `gdn_fused_prefill.py`, `fmha_fp8.py`, `pa_decode_plan.py` and `unified_attention.py` work
 
 They follow `moe.py`: none restates launch logic. Each turns a tuned row (or,
 for `gdn_fused_prefill.py` and `fmha_fp8.py`, a configured head shape) into
@@ -159,6 +160,12 @@ and launches them; every FlyDSL launch is compiled into the cache instead.
   each bucket, at each task capacity where the block size can change and
   with and without a window. Capacity stops at the batch times the CU
   count, so each arch replays with the most CUs any of its devices has.
+- `unified_attention.py` replays two calls per layer shape, served page size
+  and canonical K/V layout: an all-decode batch, which reaches the decode-only
+  build and its splits' combine, and a lone chunk over a cached prefix, which
+  reaches the unified build and its KV splits' combine. It calls the router
+  with `backend="flydsl"`, so a call the router would hand to Triton fails the
+  build instead of compiling nothing.
 - Ops with a Python body behind `torch_compile_guard` run that body under
   `dry_run(python_ops=True)`, so a replay can enter at a public op; C++ ops
   still dispatch to their fakes.
@@ -256,6 +263,23 @@ window are passed at launch, and `max_batch_size` only bounds the batch.
 python -m aiter.aot.flydsl.pa_decode_plan
 # one arch
 GPU_ARCHS=gfx950 python -m aiter.aot.flydsl.pa_decode_plan
+```
+
+The gfx942 unified-attention kernel compiles in the layer shape, page size, K/V
+strides and decode-only flag. `unified_attention` replays, per layer shape in its
+`DEFAULT_SHAPES` (`num_heads, num_kv_heads, head_dim, window`), every served
+page size for the two canonical K/V layouts (separate caches, or vLLM's views
+of one cache), which reaches the unified and decode-only builds and the decode
+and prefill split combines. It takes no `--csv`. Other K/V strides, such as a
+padded cache, and a block table with row stride 1 (one column, allocated on its
+own) compile on first use; under `FLYDSL_RUNTIME_RUN_ONLY=1` they fall back to
+Triton.
+
+```bash
+# Gemma-4-31B at TP1: 16 attention + 4 combine kernels
+python -m aiter.aot.flydsl.unified_attention
+# compile nothing; fail on any kernel the cache lacks
+python -m aiter.aot.flydsl.unified_attention --check
 ```
 
 The gfx1250 MoE build imports aiter, so it needs aiter's C++ core module. An
