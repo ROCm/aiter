@@ -13,14 +13,27 @@ Usage:
     python bench_mha_fp8.py --seqlen_q 1024 --seqlen_k 8192 --causal  # bottom-right causal
     python bench_mha_fp8.py --q_heads 32 --k_heads 8  # grouped query attention
     python bench_mha_fp8.py --rep 100
+    python bench_mha_fp8.py --varlen --q_heads 12 --seqlen_q 7680 --causal  # gfx950 MLA prefill
+    python bench_mha_fp8.py --varlen --q_heads 12 --seqlen_q 128 --seqlen_k 16384  # key split
+
+``--varlen`` benchmarks ``mha_varlen_fwd`` (gfx950) with packed q/k ``[T, H, head_dim +
+pe_dim]`` and v ``[T, H, head_dim]``. A non-causal call also writes the LSE, as an MLA
+context chunk does.
 """
 
 import argparse
+import functools
 
 import torch
 import triton
 
-from aiter.ops.triton.attention.mha_fp8 import mha_fwd
+from aiter.ops.triton.attention.mha_fp8 import mha_fwd, mha_varlen_fwd
+from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
+    RotatingBufferBench,
+)
+from op_tests.triton_tests.attention.test_mha_fp8_gfx1250 import (
+    generate_mha_varlen_fp8_inputs,
+)
 
 FP8_DTYPE = torch.float8_e4m3fn
 FP8_MAX = 448.0
@@ -42,7 +55,39 @@ def make_inputs(b, hq, hk, sq, sk, d, device):
     return q, k, v, q_scale, k_scale, v_scale, o
 
 
-def bench_case(b, hq, hk, sq, sk, d, causal, rep, device):
+def bench_case(b, hq, hk, sq, sk, d, causal, rep, device, varlen=False, d_pe=0):
+    if varlen:
+        assert hk == hq, "varlen needs the same head count for q and k/v"
+        rot_keys = [
+            "q", "k", "v", "cu_seqlens_q", "cu_seqlens_k",
+            "q_descale", "k_descale", "v_descale", "out", "lse",
+        ]  # fmt: skip
+        bencher = RotatingBufferBench()
+        bencher.build_pool(
+            [
+                functools.partial(
+                    generate_mha_varlen_fp8_inputs, [sq] * b, [sk] * b, hq, 0, device
+                )
+            ],
+            [rot_keys],
+        )
+        kernel_fn = functools.partial(
+            mha_varlen_fwd,
+            max_seqlen_q=sq,
+            max_seqlen_k=sk,
+            causal=causal,
+            return_lse=not causal,
+        )
+        ms = bencher.bench(kernel_fn)
+        num_pairs = sq * sk - sq * (sq - 1) / 2 if causal else sq * sk
+        flops = 2.0 * b * hq * num_pairs * (2 * d + d_pe)
+        num_bytes = b * hq * ((sq + sk) * (d + d_pe) + sk * d + 2 * sq * d)
+        return {
+            "us": ms * 1e3,
+            "tflops": flops * 1e-12 / (ms * 1e-3),
+            "tbps": num_bytes * 1e-12 / (ms * 1e-3),
+        }
+
     q, k, v, q_scale, k_scale, v_scale, o = make_inputs(b, hq, hk, sq, sk, d, device)
 
     def run():
@@ -94,6 +139,15 @@ def main():
     parser.add_argument("--head_dim", type=int, default=128)
     parser.add_argument("--causal", action="store_true", default=False)
     parser.add_argument(
+        "--varlen",
+        action="store_true",
+        default=False,
+        help="benchmark mha_varlen_fwd (gfx950 MLA prefill layout)",
+    )
+    parser.add_argument(
+        "--pe_dim", type=int, default=64, help="rope head dim of q/k with --varlen"
+    )
+    parser.add_argument(
         "--rep", type=int, default=500, help="do_bench_cudagraph replay budget, in ms"
     )
     args = parser.parse_args()
@@ -111,6 +165,31 @@ def main():
     assert (
         not args.causal or seqlen_k >= args.seqlen_q
     ), f"--causal requires --seqlen_k ({seqlen_k}) >= --seqlen_q ({args.seqlen_q})"
+
+    if args.varlen:
+        assert k_heads == args.q_heads, "--varlen needs --k_heads == --q_heads"
+        print("MHA varlen fwd fp8")
+        print(
+            f"{'B':>4} {'H':>4} {'SQ':>7} {'SK':>7} {'D':>5} {'D_PE':>5} {'us':>10} {'TFLOP/s':>10} {'TB/s':>9}"
+        )
+        r = bench_case(
+            args.batch,
+            args.q_heads,
+            k_heads,
+            args.seqlen_q,
+            seqlen_k,
+            args.head_dim,
+            args.causal,
+            args.rep,
+            device,
+            varlen=True,
+            d_pe=args.pe_dim,
+        )
+        print(
+            f"{args.batch:>4} {args.q_heads:>4} {args.seqlen_q:>7} {seqlen_k:>7} {args.head_dim:>5} {args.pe_dim:>5} "
+            f"{r['us']:>10.2f} {r['tflops']:>10.2f} {r['tbps']:>9.2f}"
+        )
+        return
 
     print("MHA fwd fp8")
     print(

@@ -4,6 +4,11 @@ import torch
 import triton
 import triton.experimental.gluon.language as gl
 
+from aiter.ops.triton._gluon_kernels.gfx950.attention.mha import kv_async_copy_ok
+from aiter.ops.triton._gluon_kernels.gfx950.attention.mha_fp8 import (
+    _mha_varlen_fp8_combine,
+    _mha_varlen_fwd_fp8,
+)
 from aiter.ops.triton._gluon_kernels.gfx1250.attention.mha_fp8 import _mha_fwd_subtiled
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
@@ -202,3 +207,195 @@ def mha_fwd(
     )
 
     return o
+
+
+def _get_varlen_config(causal: bool) -> dict:
+    cfg_dir = resolve_config_dir("attention", "MHA", backend="gluon")
+    configs = load_config_json(f"{cfg_dir}/mha.json")["fwd_varlen_fp8"]
+    return dict(configs["causal" if causal else "non_causal"])
+
+
+def _max_offset(t: torch.Tensor) -> int:
+    return sum((n - 1) * s for n, s in zip(t.shape, t.stride()))
+
+
+def mha_varlen_fwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    q_descale: torch.Tensor,
+    k_descale: torch.Tensor,
+    v_descale: torch.Tensor,
+    softmax_scale: float | None = None,
+    causal: bool = False,
+    return_lse: bool = False,
+    out: torch.Tensor | None = None,
+    lse: torch.Tensor | None = None,
+    config: dict | None = None,
+):
+    """FP8 varlen MHA forward (gfx950).
+
+    Args:
+        q, k: [T, H, d_qk] float8_e4m3fn. v: [T, H, d_v] float8_e4m3fn. The last dim is contiguous.
+        cu_seqlens_q, cu_seqlens_k: [batch + 1] int32 cumulative sequence lengths.
+        max_seqlen_q, max_seqlen_k: largest sequence lengths in the batch.
+        q_descale, k_descale, v_descale: one-element fp32 tensors, the per-tensor dequant scales.
+        softmax_scale: defaults to 1 / sqrt(d_qk).
+        causal: apply the causal mask.
+        return_lse: also return the log-sum-exp.
+        out, lse: optional preallocated outputs.
+        config: optional kernel config. The default comes from the JSON config.
+
+    Returns:
+        out [Tq, H, d_v] bfloat16, and with ``return_lse`` also lse [H, Tq] float32 (natural log,
+        -inf for a row that sees no key).
+    """
+    arch = get_arch()
+    assert arch == "gfx950", f"mha_varlen_fwd is only supported on gfx950, got {arch}"
+    assert q.dtype == k.dtype == v.dtype == torch.float8_e4m3fn
+    Tq, H, DQK = q.shape
+    DV = v.shape[-1]
+    D_PE = DQK - DV
+    assert (DV, D_PE) == (
+        128,
+        64,
+    ), f"needs d_v 128 and d_qk - d_v 64, got d_qk {DQK}, d_v {DV}"
+    Tk = k.shape[0]
+    assert k.shape == (
+        Tk,
+        H,
+        DQK,
+    ), f"k must be [{Tk}, {H}, {DQK}] like q, got {list(k.shape)}"
+    assert v.shape == (
+        Tk,
+        H,
+        DV,
+    ), f"v must be [{Tk}, {H}, {DV}] with the token count of k, got {list(v.shape)}"
+    for t in (q, k, v):
+        assert t.stride(-1) == 1, "the last dim must be contiguous"
+        assert t.device == q.device, "q, k and v must be on the same device"
+    for cu in (cu_seqlens_q, cu_seqlens_k):
+        assert (
+            cu.dtype == torch.int32 and cu.is_contiguous() and cu.device == q.device
+        ), "cu_seqlens_q and cu_seqlens_k must be contiguous int32 on the device of q"
+    assert cu_seqlens_k.numel() == cu_seqlens_q.numel(), "cu_seqlens sizes differ"
+    if softmax_scale is None:
+        softmax_scale = 1.0 / math.sqrt(DQK)
+    cfg = dict(config) if config is not None else _get_varlen_config(causal)
+    if out is None:
+        out = torch.empty((Tq, H, DV), dtype=torch.bfloat16, device=q.device)
+    assert (
+        out.shape == (Tq, H, DV) and out.dtype == torch.bfloat16
+    ), f"out must be [{Tq}, {H}, {DV}] bfloat16, got {list(out.shape)} {out.dtype}"
+    assert (
+        out.device == q.device and out.stride(-1) == 1
+    ), "out must be on the device of q with a contiguous last dim"
+    if return_lse:
+        if lse is None:
+            lse = torch.empty((H, Tq), dtype=torch.float32, device=q.device)
+        assert (
+            lse.shape == (H, Tq) and lse.dtype == torch.float32
+        ), f"lse must be [{H}, {Tq}] float32, got {list(lse.shape)} {lse.dtype}"
+        assert (
+            lse.device == q.device and lse.stride(-1) == 1
+        ), "lse must be on the device of q with a contiguous last dim"
+    batch = cu_seqlens_q.numel() - 1
+    BLOCK_M = cfg.pop("BLOCK_M")
+    BLOCK_N = cfg.pop("BLOCK_N")
+    num_warps = cfg.pop("num_warps")
+    waves_per_eu = cfg.pop("waves_per_eu")
+    target_ctas = cfg.pop("TARGET_CTAS", 0)
+    max_splits = cfg.pop("MAX_SPLITS", 1)
+    kv_align = math.gcd(16, k.stride(0), k.stride(1), v.stride(0), v.stride(1))
+    assert (
+        kv_align == 16 and k.data_ptr() % 16 == 0 and v.data_ptr() % 16 == 0
+    ), "k and v rows and heads must be 16-byte aligned"
+    assert kv_async_copy_ok(DV, D_PE, BLOCK_N, num_warps, 8, kv_align)
+    ctas = triton.cdiv(int(max_seqlen_q), BLOCK_M) * H * batch
+    # Short queries over a long context leave most CUs idle: split the keys until the launch has about
+    # target_ctas programs, with at least 4 key blocks per split. The partials are merged below.
+    num_splits = 1
+    if not causal and target_ctas > ctas:
+        num_splits = max(
+            1, min(max_splits, target_ctas // ctas, int(max_seqlen_k) // (4 * BLOCK_N))
+        )
+        num_splits = 1 << (
+            num_splits.bit_length() - 1
+        )  # power of 2 for the combine kernel
+    if num_splits > 1:
+        o_dst = torch.empty(
+            (num_splits, Tq, H, DV), dtype=torch.float32, device=q.device
+        )
+        lse_dst = torch.empty((num_splits, H, Tq), dtype=torch.float32, device=q.device)
+    else:
+        o_dst = out
+        lse_dst = lse if return_lse else out
+    # Use int64 base offsets only when an element offset can pass int32.
+    int64_offsets = max(_max_offset(t) for t in (q, k, v, o_dst, lse_dst, out)) >= 2**31
+    grid = (ctas * num_splits,)
+    _mha_varlen_fwd_fp8[grid](
+        q,
+        k,
+        v,
+        o_dst,
+        lse_dst,
+        q_descale,
+        k_descale,
+        v_descale,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        q.stride(0),
+        q.stride(1),
+        k.stride(0),
+        k.stride(1),
+        v.stride(0),
+        v.stride(1),
+        o_dst.stride(-3),
+        o_dst.stride(-2),
+        lse_dst.stride(-2) if (return_lse or num_splits > 1) else 0,
+        o_dst.stride(0) if num_splits > 1 else 0,
+        lse_dst.stride(0) if num_splits > 1 else 0,
+        SM_SCALE=float(softmax_scale),
+        CAUSAL=bool(causal),
+        NUM_Q_HEADS=H,
+        NUM_K_HEADS=k.shape[1],
+        MAX_SEQLEN_Q=int(max_seqlen_q),
+        num_splits=num_splits,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        HEAD_DIM_NOPE=DV,
+        HEAD_DIM_PE=D_PE,
+        HEAD_DIM_V=DV,
+        RETURN_LSE=bool(return_lse or num_splits > 1),
+        INT64_OFFSETS=int64_offsets,
+        num_warps=num_warps,
+        waves_per_eu=waves_per_eu,
+    )
+    if num_splits > 1:
+        _mha_varlen_fp8_combine[(Tq * H,)](
+            o_dst,
+            lse_dst,
+            out,
+            lse if return_lse else lse_dst,
+            cu_seqlens_q,
+            batch,
+            o_dst.stride(0),
+            o_dst.stride(1),
+            o_dst.stride(2),
+            lse_dst.stride(0),
+            lse_dst.stride(1),
+            out.stride(0),
+            out.stride(1),
+            lse.stride(0) if return_lse else 0,
+            NUM_Q_HEADS=H,
+            NUM_SPLITS=num_splits,
+            HEAD_DIM_V=DV,
+            RETURN_LSE=bool(return_lse),
+            INT64_OFFSETS=int64_offsets,
+            num_warps=1,
+        )
+    return (out, lse) if return_lse else out

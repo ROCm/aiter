@@ -55,5 +55,21 @@
       "waves_per_eu": 2,
       "num_warps": 4
     }
+  },
+  "fwd_varlen_fp8": {
+    "causal": {
+      "BLOCK_M": 128,
+      "BLOCK_N": 64,
+      "num_warps": 4,
+      "waves_per_eu": 2
+    },
+    "non_causal": {
+      "BLOCK_M": 128,
+      "BLOCK_N": 64,
+      "num_warps": 4,
+      "waves_per_eu": 2,
+      "TARGET_CTAS": 512,
+      "MAX_SPLITS": 16
+    }
   }
 }
