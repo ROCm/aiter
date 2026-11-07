@@ -8664,7 +8664,9 @@ class Mxfp4FlydslTuner(FmoeTuner):
                     f"accuracy {exc}"
                 )
                 print(f"[mxfp4-port] candidate rejected: {failures[-1]}", flush=True)
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
+                if _is_accelerator_error(exc):
+                    raise
                 failures.append(
                     f"{candidate['kernelName1']}/{candidate['kernelName2']}: {exc}"
                 )
@@ -8761,7 +8763,9 @@ class Mxfp4FlydslTuner(FmoeTuner):
                         f"[mxfp4-port] finalist rejected: {failures[-1]}",
                         flush=True,
                     )
-                except Exception as exc:  # noqa: BLE001
+                except Exception as exc:
+                    if _is_accelerator_error(exc):
+                        raise
                     failures.append(
                         f"finalist {candidate['kernelName1']}/"
                         f"{candidate['kernelName2']}: {exc}"
@@ -8832,9 +8836,15 @@ class Mxfp4FlydslTuner(FmoeTuner):
         )
 
         if mp_num <= 1 and not staged:
+            results = []
             for row in rows:
                 row["gfx"], row["cu_num"] = identities[0]
-            return [self._tune_one_shape(row, args) for row in rows]
+                try:
+                    results.append(self._tune_one_shape(row, args))
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[mxfp4-port] shape failed: {exc}", flush=True)
+                    results.append(_mxfp4_failed_row(self.keys, row, f"FAILED: {exc}"))
+            return results
 
         # One fresh process per shape (memory fully released between shapes),
         # spread across mp_num GPUs, each on a distinct device.
