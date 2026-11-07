@@ -1083,6 +1083,64 @@ def test_grouped_a4w4_swiglu_limit_clamps(activation):
     run_moe("a4w4", activation=activation, swiglu_limit=1.0)
 
 
+_EPILOGUE_CASE = """
+import importlib.util, sys, torch
+spec = importlib.util.spec_from_file_location("_grouped_gemm_case", sys.argv[1])
+t = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(t)
+t.set_data_format(sys.argv[2])
+out, ref, _, _ = t._run_grouped_via_fused_moe(
+    experts=8, tokens=int(sys.argv[3]), topk=6, model_dim=512, inter_dim=768,
+    data_format=sys.argv[2], activation=t.ActivationType.Silu, use_bias=False,
+    seed=1,
+)
+torch.save((out.cpu(), ref.cpu()), sys.argv[4])
+"""
+
+
+# The LDS-readback (lds, the default) and register-store (reg) epilogues selected
+# by AITER_FLYDSL_TDM_REGSTORE must write the same bytes as the LDS + TDM store
+# one: bf16 GEMM2, the fused MX requant GEMM1 and its bf16 fallback, with ragged
+# expert tails; 4096 tokens reach the 128-row tiles. FlyDSL folds the setting
+# into its cache key and rejects a change within a process, so each epilogue
+# runs in its own interpreter.
+@pytest.mark.parametrize("disable_requant", [False, True])
+@pytest.mark.parametrize("tokens", [37, 300, 4096])
+@pytest.mark.parametrize("data_format", ["a4w4", "a8w4"])
+@pytest.mark.parametrize("mode", ["lds", "reg"])
+def test_grouped_output_epilogue_matches_tdm_store(
+    mode, data_format, tokens, disable_requant, tmp_path
+):
+    import subprocess
+
+    _require_gfx1250()
+    results = []
+    for epilogue in ("tdm", mode):
+        path = tmp_path / f"out_{epilogue}.pt"
+        env = dict(
+            os.environ,
+            AITER_FLYDSL_TDM_REGSTORE=epilogue,
+            AITER_FLYDSL_DISABLE_GEMM1_REQUANT="1" if disable_requant else "0",
+        )
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                _EPILOGUE_CASE,
+                os.path.abspath(__file__),
+                data_format,
+                str(tokens),
+                str(path),
+            ],
+            env=env,
+            check=True,
+        )
+        results.append(torch.load(path))
+    (out_tdm, ref), (out_mode, _) = results
+    torch.testing.assert_close(out_mode, out_tdm, rtol=0, atol=0)
+    assert _logits_diff(out_mode, ref) < LOGITS_DIFF_TOL
+
+
 # ---------------------------------------------------------------------------
 # Contiguous-M prefix scan
 #
