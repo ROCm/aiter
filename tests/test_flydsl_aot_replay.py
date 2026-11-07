@@ -3,12 +3,17 @@ size inside a row's range it may report as the runtime refusing that size, and
 the command line its per-arch processes get.
 
 These run on CPU: each launch happens inside ``dry_run`` and compiles nothing.
+The last test needs a gfx950 GPU: it serves a real run-only process from an
+AOT-built cache.
 """
 
 import csv
 import os
 import pathlib
+import signal
+import subprocess
 import sys
+import time
 from types import SimpleNamespace
 from unittest import mock
 
@@ -178,3 +183,98 @@ def test_a4w4_csv_rows_reach_flydsl_through_public_replay(monkeypatch):
                 assert kernels, job
     finally:
         get_GEMM_config.cache_clear()
+
+
+# One split-K A16W16 row (dsv3_bf16_tuned_gemm.csv, M=2 N=256 K=7168, ks7); the
+# CU count is filled in from the live device.
+_HGEMM_CSV = (
+    "gfx,cu_num,M,N,K,bias,dtype,outdtype,scaleAB,bpreshuffle,libtype,solidx,"
+    "splitK,us,kernelName,err_ratio,tflops,bw\n"
+    "gfx950,{cu_num},2,256,7168,False,torch.bfloat16,torch.bfloat16,False,False,"
+    "flydsl,312,7,5.1366,"
+    "flydsl_hgemm_abf16_wbf16_bf16_t16x32x128x7_ks7_w1x2x1_bias0_ktail0_gm0_pft_gfx950,"
+    "0.0137,1.43,720.26\n"
+)
+_DEVICE_PROBE = """
+import torch
+if torch.cuda.is_available():
+    props = torch.cuda.get_device_properties(0)
+    arch = str(props.gcnArchName).split(":", 1)[0].lower()
+    print("device", arch, props.multi_processor_count)
+"""
+_HGEMM_RUN_ONLY = """
+import torch
+import aiter.tuned_gemm as tuned_gemm
+# gemm_a16w16 picks its backend here, from the arch and CU count it reads itself. A
+# missed row falls back to another one and never reads the cache, so count FlyDSL calls.
+flydsl_gemm, flydsl_calls = tuned_gemm.solMap["flydsl"], []
+def counted(*args, **kwargs):
+    flydsl_calls.append(args[0].shape)
+    return flydsl_gemm(*args, **kwargs)
+tuned_gemm.solMap["flydsl"] = counted
+m, n, k = 2, 256, 7168
+# seeded values in {-1, 0, 1}: sums stay exact and within bf16's exact integer range
+# (|out| <= 161 for this seed), and a dropped K-slice or swapped row/column changes the result
+g = torch.Generator().manual_seed(0)
+a = torch.randint(-1, 2, (m, k), generator=g).to("cuda", torch.bfloat16)
+w = torch.randint(-1, 2, (n, k), generator=g).to("cuda", torch.bfloat16)
+ref = (a.float() @ w.float().t()).to(torch.bfloat16)
+out = tuned_gemm.gemm_a16w16(a, w, otype=torch.bfloat16)
+assert flydsl_calls == [a.shape], f"the tuned row did not reach FlyDSL: {flydsl_calls}"
+torch.testing.assert_close(out, ref, rtol=0, atol=0)
+"""
+# One budget for every child of the test, well inside CI's 10-minute tests/ step.
+_BUDGET_S = 240
+
+
+def _run(name, cmd, env, deadline):
+    """Run cmd in its own process group; kill the group (replay workers too) at deadline."""
+    proc = subprocess.Popen(
+        [sys.executable, *cmd],
+        cwd=_REPO_ROOT,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        out, _ = proc.communicate(timeout=max(deadline - time.monotonic(), 1))
+    except subprocess.TimeoutExpired:
+        os.killpg(proc.pid, signal.SIGKILL)
+        out, _ = proc.communicate()
+        pytest.fail(
+            f"{name} step ran past the test's {_BUDGET_S}s budget:\n{out[-4000:]}"
+        )
+    assert proc.returncode == 0, f"{name}:\n{out[-4000:]}"
+    return out
+
+
+def test_a16w16_aot_cache_serves_a_run_only_process(tmp_path):
+    """A fresh FLYDSL_RUNTIME_RUN_ONLY process must load the kernel the AOT
+    replay built for a tuned A16W16 row; a cache miss raises there."""
+    deadline = time.monotonic() + _BUDGET_S
+    env = dict(
+        os.environ,
+        FLYDSL_RUNTIME_CACHE_DIR=str(tmp_path / "cache"),
+        AITER_CONFIG_GEMM_BF16=str(tmp_path / "bf16_tuned_gemm.csv"),
+    )
+    for name in ("FLYDSL_RUNTIME_RUN_ONLY", "GPU_ARCHS"):
+        env.pop(name, None)
+    # Device 0 is read in a child, as gemm_a16w16 reads it, so that this pytest
+    # process starts no HIP runtime for the tests that follow.
+    probe = _run("device probe", ["-c", _DEVICE_PROBE], env, deadline)
+    lines = [line.split() for line in probe.splitlines() if line.startswith("device ")]
+    _, arch, cu_num = lines[-1] if lines else (None, None, None)
+    if arch != "gfx950":
+        pytest.skip(f"needs a gfx950 GPU as device 0, found {arch}")
+    # The row takes the CU count the runtime looks rows up with.
+    pathlib.Path(env["AITER_CONFIG_GEMM_BF16"]).write_text(
+        _HGEMM_CSV.format(cu_num=cu_num)
+    )
+    # GPU_ARCHS picks the arch the replay builds for. An inference process has
+    # none, so the run-only child detects its arch as inference does.
+    aot = ["-m", "aiter.aot.flydsl.gemm", "--csv", env["AITER_CONFIG_GEMM_BF16"]]
+    _run("AOT", aot, {**env, "GPU_ARCHS": "gfx950"}, deadline)
+    run_only = ["-c", _HGEMM_RUN_ONLY]
+    _run("RUN_ONLY", run_only, {**env, "FLYDSL_RUNTIME_RUN_ONLY": "1"}, deadline)
