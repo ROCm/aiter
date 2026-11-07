@@ -12,14 +12,13 @@ from typing import Any
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-import mori.shmem as ms
 import torch
+import torch.distributed as dist
 from flydsl.runtime.device import get_rocm_arch
-from mori.shmem import mori_shmem_create_tensor
 
 from aiter.jit.utils.chip_info import get_lds_capacity_bytes
 
-from ..communication_ops_host_utils import build_p2p_table
+from ..ipc_symm_heap import IpcSymmetricAllocator, MoriShmemAllocator
 from .communication_ops_utils import GeometryTuningTable
 from .flydsl_dispatch_combine_intranode_kernel import (
     make_combine_jit,
@@ -376,8 +375,14 @@ class FlyDSLDispatchGroupMajorOp:
         scale_type_size=1,
         compact=False,
         indexed_payload=False,
+        heap=None,
     ):
         assert world_size <= 8
+        self._heap = (
+            heap
+            if heap is not None
+            else MoriShmemAllocator(rank, world_size, torch.device("cuda", rank))
+        )
         # Compact mode uses a count-first layout without per-expert reservations.
         self.compact = bool(compact)
         self.indexed_payload = bool(indexed_payload)
@@ -426,13 +431,11 @@ class FlyDSLDispatchGroupMajorOp:
         )
 
         self._alloc()
-        ms.shmem_barrier_all()
+        self._heap.barrier()
         self._build_p2p()
 
     def _sym(self, shape, dtype):
-        t = mori_shmem_create_tensor(shape, dtype)
-        t.zero_()
-        return t
+        return self._heap.create_tensor(shape, dtype)  # zeroed
 
     def _alloc(self):
         npes, epr = self.npes, self.epr
@@ -504,7 +507,7 @@ class FlyDSLDispatchGroupMajorOp:
             )  # per-launch reset (write cursor)
 
     def _p2p_table(self, t):
-        return build_p2p_table(t, self.rank, self.npes, self._dev)
+        return self._heap.p2p_table(t)
 
     def _build_p2p(self):
         self.p2p_done2 = self._p2p_table(self.done2)
@@ -555,18 +558,35 @@ class FlyDSLDispatchGroupMajorOp:
 
 
 class FlyDSLDispatchCombineIntraNodeOp:
-    def __init__(self, config):
+    def __init__(self, config, group=None):
+        """``group``: process group of the intra-node EP ranks (a CPU/gloo group
+        is preferred). With a group, the symmetric buffers are HIP IPC
+        allocations exchanged over it and mori is not used. Without one they
+        come from mori's shmem heap, for callers whose own kernels share them
+        (e.g. MegaMoE v2)."""
         self.cfg = config
         self._check_config()
         if config.tuning_table is None:
             self.load_tuning_config(config.tuning_config_path)
         self._dev = torch.device("cuda", config.rank)
         r = config.rank
+        if group is None:
+            self._heap = MoriShmemAllocator(r, config.world_size, self._dev)
+        else:
+            if (
+                dist.get_rank(group=group) != r
+                or dist.get_world_size(group=group) != config.world_size
+            ):
+                raise ValueError(
+                    f"group rank/size ({dist.get_rank(group=group)}/"
+                    f"{dist.get_world_size(group=group)}) != config "
+                    f"({r}/{config.world_size})"
+                )
+            self._heap = IpcSymmetricAllocator(group, self._dev)
 
         self._alloc_buffers()
-        ms.shmem_barrier_all()
+        self._heap.barrier()
 
-        npes = config.world_size
         _p2p_srcs = {
             "_p2p_tok_off": self.shmem_tok_off,
             "_p2p_tis": self.shmem_tok_id_to_src,
@@ -580,10 +600,13 @@ class FlyDSLDispatchCombineIntraNodeOp:
             "_p2p_xdb_mem": self.shmem_xdev_bar_mem,
         }
         for _attr, _src in _p2p_srcs.items():
-            setattr(self, _attr, build_p2p_table(_src, r, npes, self._dev))
+            setattr(self, _attr, self._heap.p2p_table(_src))
 
         # Dispatch (encode) and combine (decode, Stage 3) must agree on this.
         self._effective_max_recv = config.effective_max_recv
+        # Token-major dispatch (epoch-flag completion, receiver-side count)
+        # whenever the StdMoE expert-major output is not requested.
+        self._tokmajor_dispatch = not config.enable_std_moe
 
         self._disp_jit_cache: dict[tuple[torch.dtype, int, int], Any] = {}
         self._disp_compiled_cache: dict[tuple[torch.dtype, int, int], Any] = {}
@@ -650,13 +673,14 @@ class FlyDSLDispatchCombineIntraNodeOp:
                 scale_type_size=config.scale_type_size,
                 compact=config.gm_compact,
                 indexed_payload=config.gm_indexed_payload,
+                heap=self._heap,
             )
             # Fused dispatch and combine share one receive-count buffer.
             self._gm.total_recv = self.total_recv
-            ms.shmem_barrier_all()
+            self._heap.barrier()
 
         self._fx_tis = self._fx_out_shmem_tok_id_to_src
-        ms.shmem_barrier_all()
+        self._heap.barrier()
 
     def load_tuning_config(self, path=None):
         """Build and attach the geometry tuning table for this op's shape."""
@@ -687,23 +711,23 @@ class FlyDSLDispatchCombineIntraNodeOp:
         ) // 2  # combine input, worst-case (combine_dtype)
         tok_i16_mt = (mt * comb_tb + 1) // 2  # combine output (combine_dtype)
 
-        self.shmem_disp_out_tok = mori_shmem_create_tensor((tok_i16_mr,), torch.int16)
-        self.shmem_disp_out_wts = mori_shmem_create_tensor((mr * k,), torch.float32)
-        self.shmem_disp_out_idx = mori_shmem_create_tensor((mr * k,), torch.int32)
+        self.shmem_disp_out_tok = self._heap.create_tensor((tok_i16_mr,), torch.int16)
+        self.shmem_disp_out_wts = self._heap.create_tensor((mr * k,), torch.float32)
+        self.shmem_disp_out_idx = self._heap.create_tensor((mr * k,), torch.int32)
         scale_total = mr * cfg.scale_bytes if cfg.scale_bytes > 0 else 1
-        self.shmem_out_scales = mori_shmem_create_tensor((scale_total,), torch.int8)
-        self.shmem_tok_off = mori_shmem_create_tensor((1,), torch.int32)
-        self.shmem_recv_tok_num = mori_shmem_create_tensor((npes,), torch.int32)
-        self.shmem_tok_id_to_src = mori_shmem_create_tensor((mr,), torch.int32)
-        self.shmem_comb_inp_tok = mori_shmem_create_tensor(
+        self.shmem_out_scales = self._heap.create_tensor((scale_total,), torch.int8)
+        self.shmem_tok_off = self._heap.create_tensor((1,), torch.int32)
+        self.shmem_recv_tok_num = self._heap.create_tensor((npes,), torch.int32)
+        self.shmem_tok_id_to_src = self._heap.create_tensor((mr,), torch.int32)
+        self.shmem_comb_inp_tok = self._heap.create_tensor(
             (tok_i16_mr_worst,), torch.int16
         )
-        self.shmem_comb_inp_wts = mori_shmem_create_tensor(
+        self.shmem_comb_inp_wts = self._heap.create_tensor(
             (mr_worst * k,), torch.float32
         )
-        self.shmem_comb_out_tok = mori_shmem_create_tensor((tok_i16_mt,), torch.int16)
-        self.shmem_comb_out_wts = mori_shmem_create_tensor((mt * k,), torch.float32)
-        self.shmem_xdev_bar_mem = mori_shmem_create_tensor((npes,), torch.int64)
+        self.shmem_comb_out_tok = self._heap.create_tensor((tok_i16_mt,), torch.int16)
+        self.shmem_comb_out_wts = self._heap.create_tensor((mt * k,), torch.float32)
+        self.shmem_xdev_bar_mem = self._heap.create_tensor((npes,), torch.int64)
 
         # shmem_malloc is uninitialized; zero what combine reads.
         self.shmem_tok_id_to_src.zero_()
@@ -712,6 +736,10 @@ class FlyDSLDispatchCombineIntraNodeOp:
         self.shmem_xdev_bar_mem.zero_()
 
         self.dest_pe_ctr = torch.zeros(npes, dtype=torch.int32, device=self._dev)
+        # Zeroed row the fast combine reads for top-k slots with no contribution.
+        self._zero_row = torch.zeros(
+            max(comb_tb, 16), dtype=torch.int8, device=self._dev
+        )
         self.disp_bar = torch.zeros(1, dtype=torch.int32, device=self._dev)
         self.comb_bar = torch.zeros(1, dtype=torch.int32, device=self._dev)
         self.total_recv = torch.zeros(1, dtype=torch.int32, device=self._dev)
@@ -1090,6 +1118,7 @@ class FlyDSLDispatchCombineIntraNodeOp:
                 scale_type_size=cfg.scale_type_size,
                 enable_std_moe=cfg.enable_std_moe,
                 max_recv=self._effective_max_recv,
+                tokmajor=self._tokmajor_dispatch,
             )
         return self._disp_jit_cache[key]
 
@@ -1374,6 +1403,16 @@ class FlyDSLDispatchCombineIntraNodeOp:
         else:
             prx_ptr = packed_recv_x.data_ptr() if packed_recv_x is not None else 0
 
+        fast_path = (
+            not cfg.zero_copy
+            and not skip_stage1
+            and not cfg.enable_std_moe
+            and not fp8_dc
+            and not blockwise_fp8
+            and c_dtype in (torch.bfloat16, torch.float32)
+        )
+        if fast_path:
+            prx_ptr = self._zero_row.data_ptr()
         key = (
             c_dtype,
             bool(cfg.zero_copy),
@@ -1384,6 +1423,7 @@ class FlyDSLDispatchCombineIntraNodeOp:
             wpb,
             bool(skip_stage1),
             bool(mask_topk_ids),
+            fast_path,
         )
         fn = self._comb_jit_cache.get(key)
         if fn is None:
@@ -1405,6 +1445,7 @@ class FlyDSLDispatchCombineIntraNodeOp:
                 # Must match dispatch's encoding stride so tok_map decode lines up.
                 max_recv=self._effective_max_recv,
                 mask_topk_ids=bool(mask_topk_ids),
+                fast_path=fast_path,
             )
             self._comb_jit_cache[key] = fn
         self._run_combine_kernel(
@@ -1440,14 +1481,19 @@ class FlyDSLDispatchCombineIntraNodeOp:
         packed_recv_x=None,
         cur_tok=None,
     ):
-        """Run intranode combine."""
+        """Run intranode combine.
+
+        ``weights=None`` skips the per-slot weight combine (the returned
+        weights view is then not written), which is what callers that only
+        need the token sum (e.g. ATOM, mori-style ``combine(x, None, ids)``)
+        want."""
         return self._launch_combine(
             input,
             weights,
             indices,
             packed_recv_x,
             cur_tok,
-            enable_weights=True,
+            enable_weights=weights is not None or self.cfg.enable_std_moe,
             skip_stage1=False,
         )
 

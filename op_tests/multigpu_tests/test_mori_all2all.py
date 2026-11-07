@@ -147,7 +147,8 @@ def run_mori_with_manager(
             "gpu_per_node": 1,
         }
 
-        mori_op = mori_manager.get_handle(handle_kwargs)
+        # This test exercises mori itself, not the FlyDSL intra-node path.
+        mori_op = mori_manager.get_handle(handle_kwargs, backend="mori")
 
         # Dispatch
         (

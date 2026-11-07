@@ -85,3 +85,12 @@ gfx950,mi355x,8,combine,bf16,7168,8,32,True,16,64,4
 gfx950,mi355x,8,combine,bf16,7168,8,32,True,32,64,8
 gfx950,mi355x,8,combine,bf16,7168,8,32,True,64,64,4
 gfx950,mi355x,8,combine,bf16,7168,8,32,True,8192,64,16
+gfx950,mi355x,8,dispatch,fp8_ocp,5120,6,48,,256,32,2
+gfx950,mi355x,8,dispatch,fp8_ocp,5120,6,48,,65536,32,4
+gfx950,mi355x,8,combine,bf16,5120,6,48,False,192,128,8
+gfx950,mi355x,8,combine,bf16,5120,6,48,False,65536,256,8
+gfx950,mi355x,8,dispatch,fp8_ocp,5120,3,16,,256,32,2
+gfx950,mi355x,8,dispatch,fp8_ocp,5120,3,16,,65536,32,4
+gfx950,mi355x,8,combine,bf16,5120,3,16,False,64,64,8
+gfx950,mi355x,8,combine,bf16,5120,3,16,False,256,128,8
+gfx950,mi355x,8,combine,bf16,5120,3,16,False,65536,256,8
