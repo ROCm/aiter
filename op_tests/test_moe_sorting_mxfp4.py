@@ -1084,8 +1084,9 @@ def _check_three_stage_sort_pad_rows(bm, tokens=32, valid=29, topk=16):
 
 def _check_fused_moe_inline_sort_pad_rows(tokens=32, valid=29):
     """fused_moe on Kimi-K3's tuned inline-sort row with pad rows routed to -1
-    and num_local_tokens, as ATOM passes them: the tuned row is kept, real rows
-    match a call on the valid rows alone and pad rows come out zero."""
+    and num_local_tokens, with row-strided activations as a merged projection
+    produces: the tuned row is kept, real rows match contiguous input and pad
+    rows come out zero."""
     from aiter.ops.shuffle import shuffle_weight
     from aiter.utility import fp4_utils
 
@@ -1101,7 +1102,11 @@ def _check_fused_moe_inline_sort_pad_rows(tokens=32, valid=29):
     torch.manual_seed(tokens)
     w1, w1_scale = fp4_weight(2 * inter, hidden)
     w2, w2_scale = fp4_weight(hidden, inter)
-    x = torch.randn((tokens, hidden), dtype=dtypes.bf16, device="cuda")
+    x = torch.randn((tokens, hidden + 64), dtype=dtypes.bf16, device="cuda")[:, :hidden]
+    assert not x.is_contiguous()
+    inner_strided = torch.randn((tokens, hidden * 2), dtype=dtypes.bf16, device="cuda")[
+        :, ::2
+    ]
     topk_ids = torch.stack(
         [torch.randperm(experts, dtype=torch.int32)[:topk] for _ in range(tokens)]
     ).cuda()
@@ -1123,9 +1128,9 @@ def _check_fused_moe_inline_sort_pad_rows(tokens=32, valid=29):
     fused_moe._mxfp4_inline_sort_unsupported = record
     try:
 
-        def run(ids, rows, nlt=None):
+        def run(ids, rows, nlt=None, activations=x):
             return fused_moe.fused_moe(
-                x[:rows],
+                activations[:rows],
                 w1,
                 w2,
                 topk_weights[:rows],
@@ -1139,6 +1144,15 @@ def _check_fused_moe_inline_sort_pad_rows(tokens=32, valid=29):
 
         out = run(pad_ids, tokens, count)
         ref = run(topk_ids, valid)
+        contiguous = run(pad_ids, tokens, count, x.contiguous())
+        materialized = run(pad_ids, tokens, count, inner_strided)
+        materialized_ref = run(pad_ids, tokens, count, inner_strided.contiguous())
+        graph = None
+        if tokens == 32:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                graph_out = run(pad_ids, tokens, count)
+            graph.replay()
     finally:
         fused_moe._mxfp4_inline_sort_unsupported = unsupported
         for k, v in saved.items():
@@ -1151,6 +1165,16 @@ def _check_fused_moe_inline_sort_pad_rows(tokens=32, valid=29):
     real = out[:valid].float()
     rel = ((real - ref.float()).norm() / ref.float().norm()).item()
     assert rel < 0.02, rel  # atomic stage2 order only (~0.5%)
+    rel = ((out.float() - contiguous.float()).norm() / contiguous.float().norm()).item()
+    assert rel < 0.02, rel
+    rel = (
+        (materialized.float() - materialized_ref.float()).norm()
+        / materialized_ref.float().norm()
+    ).item()
+    assert rel < 0.02, rel
+    if graph is not None:
+        rel = ((out.float() - graph_out.float()).norm() / out.float().norm()).item()
+        assert rel < 0.02, rel
     assert (out[valid:] == 0).all()
 
 

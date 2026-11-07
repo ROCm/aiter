@@ -66,6 +66,7 @@ def _gemm1_body(
     arg_aqout,
     arg_ascaleout,
     arg_hidden,
+    i32_hidden_row_stride_bytes,
     arg_bias,
     bx_i32,
     lane,
@@ -176,7 +177,9 @@ def _gemm1_body(
     ascale_dma_atom4 = fx.make_copy_atom(fx.rocdl.BufferCopyLDS32b(), fx.Int32)
 
     if const_expr(inline_quant):
-        hidden_num = fx.Int64(i32_ntok * fx.Int32(K * 2))
+        hidden_num = fx.Int64(
+            (i32_ntok - fx.Int32(1)) * i32_hidden_row_stride_bytes + fx.Int32(K * 2)
+        )
         hidden_tiles = _global_i32_buffer_tiles(arg_hidden, hidden_num, 4)
         hidden_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Int32)
 
@@ -695,7 +698,7 @@ def _gemm1_body(
 
     def inline_quant_load_kt(B128_IDX, kt, row_token):
         v_voff = (
-            row_token * fx.Int32(K * 2)
+            row_token * i32_hidden_row_stride_bytes
             + lane_shr2_and3 * fx.Int32(64)
             + lib * fx.Int32(16)
         )
@@ -1719,6 +1722,7 @@ def compile_gemm1_a4w4_port(
         arg_aqout: fx.Int64,
         arg_ascaleout: fx.Int64,
         arg_hidden: fx.Int64,
+        i32_hidden_row_stride_bytes: fx.Int32,
         arg_bias: fx.Int64,
     ):
         lds_raw_ptr = fx.SharedAllocator().allocate(SharedStorage).peek().raw.ptr
@@ -1766,6 +1770,7 @@ def compile_gemm1_a4w4_port(
                 arg_aqout,
                 arg_ascaleout,
                 arg_hidden,
+                i32_hidden_row_stride_bytes,
                 arg_bias,
                 tile,
                 lane,
@@ -1810,6 +1815,7 @@ def compile_gemm1_a4w4_port(
         arg_aqout: fx.Int64,
         arg_ascaleout: fx.Int64,
         arg_hidden: fx.Int64,
+        i32_hidden_row_stride_bytes: fx.Int32,
         arg_bias: fx.Int64,
         stream: fx.Stream,
     ):
@@ -1826,6 +1832,7 @@ def compile_gemm1_a4w4_port(
             arg_aqout,
             arg_ascaleout,
             arg_hidden,
+            i32_hidden_row_stride_bytes,
             arg_bias,
         ).launch(
             grid=(grid_x, 1, 1),
