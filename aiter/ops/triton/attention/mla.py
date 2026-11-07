@@ -512,16 +512,19 @@ def mla_decode_fwd(
             num_seqs,
             max_seqlen_kv,
         )
-        # The tuned table is keyed on H, B and KV only. The flags below were
-        # measured for page64, rank 512 and RoPE 64, and XCHG_MODE=1 needs a
-        # 64-token tile, so other geometries keep the current path.
+        # The tuned table is keyed on H, B and KV only. NPOT_SPLITS (a split
+        # count), PARTIAL_BF16 and XCHG_MODE were measured for page64, rank 512
+        # and RoPE 64, and XCHG_MODE=1 needs a 64-token tile. Other geometries
+        # keep NUM_SEGMENTS_PER_SEQ and the current path.
+        npot_splits = tuned.pop("NPOT_SPLITS", 0)
+        partial_bf16 = bool(tuned.pop("PARTIAL_BF16", False))
         if (block_size, kv_lora_rank, qk_rope_head_dim) != (64, 512, 64):
-            for key in ("NPOT_SPLITS", "PARTIAL_BF16", "XCHG_MODE"):
-                tuned.pop(key, None)
-        # Wrapper flags of the tuned entry. They are not kernel arguments.
-        npot_splits = bool(tuned.pop("NPOT_SPLITS", False))
+            tuned.pop("XCHG_MODE", None)
+            npot_splits, partial_bf16 = 0, False
+        if npot_splits:
+            tuned["NUM_SEGMENTS_PER_SEQ"] = npot_splits
         # skip_reduce returns the partials to the caller, so keep them FP32.
-        partial_bf16 = bool(tuned.pop("PARTIAL_BF16", False)) and not skip_reduce
+        partial_bf16 = partial_bf16 and not skip_reduce
         # Overrides may increase stages or Q padding even when the heuristic fits.
         # Reject the whole override before changing tiles or either segment count.
         if (
@@ -538,7 +541,7 @@ def mla_decode_fwd(
             > 256 * 1024
         ):
             tuned = {}
-            npot_splits = partial_bf16 = False
+            npot_splits, partial_bf16 = 0, False
         if "BLOCK_M" in tuned:
             # A smaller head tile needs less LDS, so the gate above still holds.
             assert (
@@ -549,7 +552,7 @@ def mla_decode_fwd(
             NUM_HEAD_BLOCKS = (num_queries_per_kv + BLOCK_M - 1) // BLOCK_M
             total_num_q_blocks = num_seqs * NUM_HEAD_BLOCKS
         if "NUM_SEGMENTS_PER_SEQ" in tuned:
-            # NPOT_SPLITS keeps the tuned count. Else use a power of 2.
+            # NPOT_SPLITS keeps its count. Else use a power of 2.
             # The reduce kernel pads its segment aranges to a power of 2.
             num_segments = min(
                 tuned["NUM_SEGMENTS_PER_SEQ"],

@@ -855,8 +855,11 @@ def test_mla_decode_fwd_unshuffled_tuned_h64(
         max_seqlen_kv,
     )
     # The bucket must hold the tuned entry, else this test checks nothing new.
-    assert entry.get("NPOT_SPLITS") and entry.get("PARTIAL_BF16"), entry
+    # NPOT_SPLITS is the measured split count; NUM_SEGMENTS_PER_SEQ is the
+    # baseline count for other geometries.
+    assert entry.get("NPOT_SPLITS", 0) > 0 and entry.get("PARTIAL_BF16"), entry
     assert entry.get("XCHG_MODE") == 1, entry
+    assert entry["NPOT_SPLITS"] != entry["NUM_SEGMENTS_PER_SEQ"], entry
     kernel = mla_module.gluon_mla_decode_fwd_kernel
     launches = []
 
@@ -911,15 +914,16 @@ def test_mla_decode_fwd_unshuffled_tuned_h64(
     )
     assert len(launches) == 1
     grid, kwargs = launches[0]
-    segments = min(entry["NUM_SEGMENTS_PER_SEQ"], num_pages)
     assert grid[2] == kwargs["NUM_SEGMENTS_PER_SEQ"]
     if measured:
-        # NPOT_SPLITS: the tuned count is used without power-of-2 rounding.
-        assert grid[2] == segments
+        # NPOT_SPLITS: the measured count, without power-of-2 rounding.
+        assert grid[2] == min(entry["NPOT_SPLITS"], num_pages)
         assert grid[2] & (grid[2] - 1) != 0, grid[2]
         assert kwargs.get("XCHG_MODE", 0) == 1
     else:
-        assert grid[2] == triton.next_power_of_2(segments)
+        # Other geometries keep the baseline count, rounded as on main.
+        baseline = min(entry["NUM_SEGMENTS_PER_SEQ"], num_pages)
+        assert grid[2] == triton.next_power_of_2(baseline)
         assert kwargs.get("XCHG_MODE", 0) == 0
     partial_dtype = torch.bfloat16 if measured and not skip_reduce else torch.float32
     assert kwargs["segm_output_ptr"].dtype == partial_dtype
