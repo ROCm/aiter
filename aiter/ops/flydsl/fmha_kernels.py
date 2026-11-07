@@ -47,6 +47,9 @@ from .kernels.fmha_gfx1250.fmha_fwd_prefill_a8w8_m32x8 import (
     flash_attn_batch_a8w8_m32x8 as flash_attn_batch_a8w8_gfx1250,
 )
 from .kernels.fmha_gfx1250.fmha_fwd_prefill_a8w8_m32x8 import (
+    flash_attn_paged_a8w8_m32x8 as flash_attn_paged_a8w8_gfx1250,
+)
+from .kernels.fmha_gfx1250.fmha_fwd_prefill_a8w8_m32x8 import (
     flash_attn_varlen_a8w8_m32x8 as flash_attn_varlen_a8w8_gfx1250,
 )
 from .kernels.fmha_gfx1250.fmha_fwd_prefill_a16w16_m32x8 import (
@@ -54,6 +57,9 @@ from .kernels.fmha_gfx1250.fmha_fwd_prefill_a16w16_m32x8 import (
 )
 from .kernels.fmha_gfx1250.fmha_fwd_prefill_a16w16_m32x8 import (
     flash_attn_batch_m32x8 as flash_attn_batch_a16w16_gfx1250,
+)
+from .kernels.fmha_gfx1250.fmha_fwd_prefill_a16w16_m32x8 import (
+    flash_attn_paged_m32x8 as flash_attn_paged_a16w16_gfx1250,
 )
 from .kernels.fmha_gfx1250.fmha_fwd_prefill_a16w16_m32x8 import (
     flash_attn_varlen_m32x8 as flash_attn_varlen_a16w16_gfx1250,
@@ -563,7 +569,7 @@ def _check_out(out, q, v_hdim, out_dtype=None):
     ), f"out shape {tuple(out.shape)} != expected {want} (v_hdim={v_hdim})"
 
 
-def _descale_ok(d, q):
+def _is_per_tensor_descale(d, q):
     """A per-tensor fp32 descale, as gfx950 defines it."""
     return (
         torch.is_tensor(d)
@@ -573,7 +579,7 @@ def _descale_ok(d, q):
     )
 
 
-def _bshd_batch_stride_ok(t, seq_len):
+def _has_implicit_bshd_batch_stride(t, seq_len):
     """The BSHD kernels take no batch stride: they address batch b at
     ``b * seq_len * stride_seq``. A view whose own batch stride differs from that
     product (e.g. [S,B,H,D] storage permuted to [B,S,H,D]) reads the wrong rows, or
@@ -737,7 +743,7 @@ def flydsl_flash_attn_varlen_fwd(
         # and a partial set is ambiguous, so both fall through.
         _descales = (q_descale, k_descale, v_descale)
         if any(d is not None for d in _descales) and not (
-            _is_b8 and all(_descale_ok(d, q) for d in _descales)
+            _is_b8 and all(_is_per_tensor_descale(d, q) for d in _descales)
         ):
             return None
         if any(t.stride(-1) != 1 for t in (q, k, v)):
@@ -805,6 +811,141 @@ def flydsl_flash_attn_varlen_fwd(
         )
 
     return None
+
+
+def flydsl_flash_attn_paged_fwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    qo_indptr: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_page_indices: torch.Tensor,
+    *,
+    kv_last_page_lens: torch.Tensor | None = None,
+    max_seqlen_q: int | None = None,
+    max_seqlen_k: int | None = None,
+    softmax_scale: float | None = None,
+    causal: bool = False,
+    window_size=(-1, -1),
+    return_lse: bool = False,
+    dropout_p: float = 0.0,
+    logits_soft_cap: float = 0.0,
+    bias=None,
+    alibi_slopes=None,
+    deterministic=False,
+    return_attn_probs=False,
+    block_table=None,
+    seqlen_k=None,
+    out=None,
+    sink=None,
+    q_descale=None,
+    k_descale=None,
+    v_descale=None,
+):
+    """Paged-KV prefill, for a page-indexed K/V cache.
+
+    ``k``/``v`` are the page pool: ``[num_blocks, page_size, nheads_k, hdim]``, or
+    ``[num_blocks, nheads_k, hdim]`` at page size 1. ``qo_indptr`` carries this batch's Q
+    token ranges; ``kv_indptr`` is a cumulative PAGE count (not tokens) into
+    ``kv_page_indices``, and ``kv_last_page_lens`` gives each request's fill of its last
+    page.
+
+    Returns the result when FlyDSL can serve this configuration, otherwise None so the
+    caller falls through to CK. Never raises on an unsupported shape.
+    """
+    from ...jit.utils.chip_info import get_gfx_runtime
+
+    if get_gfx_runtime() != "gfx1250":
+        return None
+    # Options the paged kernel does not implement. Silently honouring any of these would
+    # return wrong numbers, so each one falls through.
+    if logits_soft_cap != 0.0 or block_table is not None or seqlen_k is not None:
+        return None
+    if any(t.stride(-1) != 1 for t in (q, k, v)):
+        return None
+    if (
+        sink is not None
+        and torch.is_tensor(sink)
+        and sink.dim() > 0
+        and sink.stride(-1) != 1
+    ):
+        return None
+    if softmax_scale is not None and not (0 < softmax_scale < float("inf")):
+        return None
+    # 8-bit Q/K/V go to the a8w8 sibling, which writes bf16 output; everything else to
+    # a16w16, whose output follows the input.
+    _is_b8 = q.dtype in _A8W8_GFX1250_IN_DTYPES
+    # a8w8 applies per-tensor fp32 descales (gfx950's contract); a16w16 has none,
+    # and a partial set is ambiguous, so both fall through.
+    _descales = (q_descale, k_descale, v_descale)
+    if any(d is not None for d in _descales) and not (
+        _is_b8 and all(_is_per_tensor_descale(d, q) for d in _descales)
+    ):
+        return None
+    _supported = (
+        flash_attn_a8w8_gfx1250_supported
+        if _is_b8
+        else flash_attn_a16w16_gfx1250_supported
+    )
+    if not _supported(
+        "paged",
+        q,
+        k,
+        v,
+        dropout_p=dropout_p,
+        window_size=window_size,
+        bias=bias,
+        alibi_slopes=alibi_slopes,
+        sink=sink,
+        return_attn_probs=return_attn_probs,
+        kv_indptr=kv_indptr,
+        kv_page_indices=kv_page_indices,
+        kv_last_page_lens=kv_last_page_lens,
+    ):
+        return None
+
+    if max_seqlen_q is None:
+        max_seqlen_q = int((qo_indptr[1:] - qo_indptr[:-1]).max())
+    if max_seqlen_k is None:
+        page_size = 1 if k.dim() == 3 else k.shape[1]
+        pages = kv_indptr[1:] - kv_indptr[:-1]
+        max_seqlen_k = int(
+            ((pages - 1).clamp(min=0) * page_size + kv_last_page_lens).max()
+        )
+
+    _out_dtype = _A8W8_GFX1250_OUT_DTYPE if _is_b8 else q.dtype
+    if out is None:
+        out = q.new_empty((*q.shape[:-1], v.shape[-1]), dtype=_out_dtype)
+    else:
+        _check_out(out, q, v.shape[-1], out_dtype=_out_dtype)
+    _entry = (
+        flash_attn_paged_a8w8_gfx1250 if _is_b8 else flash_attn_paged_a16w16_gfx1250
+    )
+    # a16w16 has no descale parameters at all; the gate above already guaranteed none
+    # were given in that case, so only the 8-bit entry is handed them.
+    _descale_kwargs = (
+        {"q_descale": q_descale, "k_descale": k_descale, "v_descale": v_descale}
+        if _is_b8
+        else {}
+    )
+    return _entry(
+        q,
+        k,
+        v,
+        qo_indptr,
+        kv_indptr,
+        kv_page_indices,
+        kv_last_page_lens,
+        max_seqlen_q,
+        max_seqlen_k,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        window_size=window_size,
+        out=out,
+        return_lse=return_lse,
+        sink=sink,
+        **_descale_kwargs,
+    )
 
 
 def flydsl_flash_attn_batch_fwd(
@@ -881,7 +1022,7 @@ def flydsl_flash_attn_batch_fwd(
         # and a partial set is ambiguous, so both fall through.
         _descales = (q_descale, k_descale, v_descale)
         if any(d is not None for d in _descales) and not (
-            _is_b8 and all(_descale_ok(d, q) for d in _descales)
+            _is_b8 and all(_is_per_tensor_descale(d, q) for d in _descales)
         ):
             return None
         if any(t.stride(-1) != 1 for t in (q, k, v)):
@@ -895,12 +1036,12 @@ def flydsl_flash_attn_batch_fwd(
             return None
         if softmax_scale is not None and not (0 < softmax_scale < float("inf")):
             return None
-        if not all(_bshd_batch_stride_ok(t, t.shape[1]) for t in (q, k, v)):
+        if not all(_has_implicit_bshd_batch_stride(t, t.shape[1]) for t in (q, k, v)):
             return None
         if (
             out is not None
             and out.dim() == 4
-            and not _bshd_batch_stride_ok(out, out.shape[1])
+            and not _has_implicit_bshd_batch_stride(out, out.shape[1])
         ):
             return None
         _out_dtype = _A8W8_GFX1250_OUT_DTYPE if _is_b8 else q.dtype
