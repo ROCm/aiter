@@ -41,7 +41,7 @@ def d256_pipe(
 
     Uniform query length; rows = query_length * query_group_size fit two
     16-row M-tiles that share one K/V stream. Packed caches support both V
-    layouts, per-tensor/per-token scales and causal sliding windows.
+    layouts, per-tensor/per-token scales and sliding windows.
     """
     return (
         "gfx95" in arch
@@ -99,6 +99,13 @@ def _bf16_lds_bytes(head_dim, query_rows, block_size):
     return qp_bytes + max_sum_bytes + 4 * pages_per_chunk * 4
 
 
+def resolve_causal(causal, query_length):
+    """Validate ``causal``; one query row sees the same keys either way."""
+    if not isinstance(causal, bool):
+        raise TypeError("causal must be a bool")
+    return causal and query_length > 1
+
+
 @dataclass(frozen=True)
 class PaDecodeSchedule:
     """Select the cache key without constructing the full kernel layout."""
@@ -132,6 +139,7 @@ class PaDecodeSchedule:
         sliding_window: int = 0,
         trans_k: bool = True,
         mask_unowned_kv: bool = True,
+        causal: bool = True,
         direct_output: bool = False,
     ) -> PaDecodeSchedule:
         """Choose the existing policy from host-known grid and query bounds."""
@@ -141,6 +149,7 @@ class PaDecodeSchedule:
             raise ValueError("work_capacity must be positive")
         if not trans_k:
             raise NotImplementedError("Non-transposed key cache is not implemented")
+        causal = resolve_causal(causal, query_length)
         arch = str(get_rocm_arch()).split(":", 1)[0]
         is_gfx950 = "gfx95" in arch
         if kv_dtype not in ("fp8", "bf16", "mxfp4"):
@@ -372,6 +381,7 @@ class PaDecodeSchedule:
             single_tile_plan,
             batch_first_plan_grid,
             sliding_window,
+            causal,
             kv_dtype,
             bool(mask_unowned_kv),
             direct_output,
@@ -402,6 +412,7 @@ class PaDecodeTraits:
     softmax_scale: float
     per_token_kv: bool
     query_length: int
+    causal: bool
     trans_v: bool
     wide_kv_addressing: bool
     mask_unowned_kv: bool
@@ -517,6 +528,7 @@ class PaDecodeTraits:
             single_tile_plan,
             batch_first_plan_grid,
             sliding_window,
+            causal,
             kv_dtype,
             mask_unowned_kv,
             DIRECT,
@@ -736,6 +748,7 @@ class PaDecodeTraits:
             softmax_scale=softmax_scale,
             per_token_kv=per_token_kv,
             query_length=query_length,
+            causal=causal,
             trans_v=trans_v,
             wide_kv_addressing=wide_kv_addressing,
             mask_unowned_kv=mask_unowned_kv,
@@ -833,6 +846,7 @@ class Gfx1250Traits:
     merge_partitions: bool = False
     # Workgroups per sequence cluster that merges its partitions; 0 disables.
     cluster_merge: int = 0
+    causal: bool = True
 
     WAVE = 32
     NWARP = 4
@@ -989,18 +1003,31 @@ class Gfx1250Traits:
         return 16 * self.v_stride
 
     @property
+    def causal_rows(self):
+        # The per-wave tiles bound every row causally. One query token sees the
+        # same keys either way; longer non-causal blocks keep the shared tiles.
+        return self.causal or self.query_length == 1
+
+    @property
     def wave_query_tiles(self):
         # One query tile per wave keeps scores, P and output in registers:
         # softmax needs no cross-wave exchange, only the page buffers are shared.
         # fp8_multi_tile bounds four query tiles to D128.
-        return self.fp8_multi_tile and self.m_tiles == self.NWARP and self.async_page
+        return (
+            self.fp8_multi_tile
+            and self.m_tiles == self.NWARP
+            and self.async_page
+            and self.causal_rows
+        )
 
     @property
     def bf16_wave_query_tiles(self):
         # Four query tiles over BF16 page128 caches: wave pairs share two
         # tiles, P stays in registers, and a page needs only its buffer barrier.
         # Packed page128 limits D256 to 32 rows, so this selects D64 and D128.
-        return self.bf16_page128_packed and self.m_tiles == self.NWARP
+        return (
+            self.bf16_page128_packed and self.m_tiles == self.NWARP and self.causal_rows
+        )
 
     @property
     def async_page(self):

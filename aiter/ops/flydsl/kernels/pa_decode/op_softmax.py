@@ -81,7 +81,7 @@ class PaDecodeSoftmax:
         return self.traits.sP_off + m * MFMA_MNK * self.traits.SP_ROW_BYTES
 
     def row_thresholds(self, tile_valid, window_left, m):
-        n_valid_tile = (tile_valid - self.ctx.causal_offset[m]).to(fx.Float32)
+        n_valid_tile = (tile_valid - self.ctx.upper_offset[m]).to(fx.Float32)
         base_tok_f = fx.Int32(
             self.ctx.warp * self.traits.TOK_PER_WARP + self.ctx.rgroup * 4
         ).to(fx.Float32)
@@ -121,8 +121,8 @@ class PaDecodeSoftmax:
                 ],
                 dtype=fx.Float32,
             )
-            needs_mask = (
-                tile_valid < self.traits.TILE_TOK + self.traits.query_length - 1
+            needs_mask = tile_valid < self.traits.TILE_TOK + (
+                self.traits.query_length - 1 if self.traits.causal else 0
             )
             if const_expr(self.traits.sliding_window > 0):
                 needs_mask = needs_mask | (window_left > 0)
