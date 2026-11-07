@@ -26,7 +26,11 @@ MXFP4_P_EXP_SHIFT = 20
 BF16_LDS_LIMIT_BYTES = 64 * 1024
 MXFP4_LDS_LIMIT_BYTES = 160 * 1024
 PAGE_ID_STAGE_LIMIT = 4096  # i32 page ids, 16 KiB of LDS.
-D256_PIPE_MAX_ROWS = 2 * MFMA_MNK
+# Four M-tiles: MTP-3 verify at GQA 16 (4 x 16 = 64 rows, e.g. a 2-way
+# tensor-parallel split of 32 query / 2 KV heads). The per-token V-scale
+# reload for M_TILES >= 4 is in the generic path's pack_multi only; the pipe
+# (single_query_tile / pack_single) keeps one V-scale set for all M-tiles.
+D256_PIPE_MAX_ROWS = 4 * MFMA_MNK
 
 
 def d256_pipe(
@@ -37,10 +41,10 @@ def d256_pipe(
     query_length,
     query_group_size,
 ) -> bool:
-    """gfx950 FP8 head 256, page 16/64, <= two M-tiles.
+    """gfx950 FP8 head 256, page 16/64, <= four M-tiles.
 
-    Uniform query length; rows = query_length * query_group_size fit two
-    16-row M-tiles that share one K/V stream. Packed caches support both V
+    Uniform query length; rows = query_length * query_group_size fit at most
+    four 16-row M-tiles that share one K/V stream. Packed caches support both V
     layouts, per-tensor/per-token scales and causal sliding windows.
     """
     return (
