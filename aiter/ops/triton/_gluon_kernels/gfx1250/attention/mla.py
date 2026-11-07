@@ -2117,6 +2117,10 @@ def _mla_decode_fwd_kernel(
         XCHG_MODE,
     )
 
+    if XCHG_MODE == 1:
+        # P_XCHG_LAYOUT covers one 64x64 P tile.
+        gl.static_assert(TILE_SIZE == 64 and BLOCK_M == 64)
+
     if USE_LDS_PIPELINE:
         gl.static_assert(ALL_DECODE and SHUFFLED_KV_CACHE)
         gl.static_assert(QUERY_DTYPE == "fp8" and KV_CACHE_DTYPE == "fp8")

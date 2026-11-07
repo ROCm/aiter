@@ -815,14 +815,27 @@ def test_mla_decode_fwd_unshuffled_pipeline_ring_wraparound(
 
 
 @pytest.mark.parametrize(
-    "batch_size, max_seqlen_kv",
-    [(128, 16401), (32, 16401), (19, 65553), (15, 131089)],
+    "batch_size, max_seqlen_kv, block_size, kv_lora_rank, skip_reduce",
+    [
+        (128, 16401, 64, 512, False),
+        (32, 16401, 64, 512, False),
+        (19, 65553, 64, 512, False),
+        (15, 131089, 64, 512, False),
+        # skip_reduce returns the partials to the caller: they stay FP32.
+        (32, 16401, 64, 512, True),
+        # Same bucket, other geometry: the new flags do not apply.
+        (32, 16401, 128, 128, False),
+    ],
 )
 @torch.inference_mode()
-def test_mla_decode_fwd_unshuffled_tuned_h64(monkeypatch, batch_size, max_seqlen_kv):
+def test_mla_decode_fwd_unshuffled_tuned_h64(
+    monkeypatch, batch_size, max_seqlen_kv, block_size, kv_lora_rank, skip_reduce
+):
     """Tuned H64 FP8 entries through the wrapper's config loading: split count
     without power-of-2 rounding (NPOT_SPLITS), BF16 partial outputs
-    (PARTIAL_BF16) and the one-barrier alpha/P exchange (XCHG_MODE)."""
+    (PARTIAL_BF16) and the one-barrier alpha/P exchange (XCHG_MODE). The flags
+    apply only to page64, rank 512 and RoPE 64, and partials stay FP32 with
+    skip_reduce."""
     if DEVICE_ARCH != "gfx1250":
         pytest.skip("unshuffled LDS pipeline requires gfx1250")
 
@@ -830,8 +843,9 @@ def test_mla_decode_fwd_unshuffled_tuned_h64(monkeypatch, batch_size, max_seqlen
 
     import aiter.ops.triton.attention.mla as mla_module
 
-    num_query_heads, block_size, kv_lora_rank, qk_rope_head_dim = 64, 64, 512, 64
+    num_query_heads, qk_rope_head_dim = 64, 64
     qk_head_dim = kv_lora_rank + qk_rope_head_dim
+    measured = (block_size, kv_lora_rank) == (64, 512)
     entry = mla_module._tuned_decode_config(
         "pipelined_unshuffled",
         "fp8",
@@ -840,6 +854,9 @@ def test_mla_decode_fwd_unshuffled_tuned_h64(monkeypatch, batch_size, max_seqlen
         batch_size,
         max_seqlen_kv,
     )
+    # The bucket must hold the tuned entry, else this test checks nothing new.
+    assert entry.get("NPOT_SPLITS") and entry.get("PARTIAL_BF16"), entry
+    assert entry.get("XCHG_MODE") == 1, entry
     kernel = mla_module.gluon_mla_decode_fwd_kernel
     launches = []
 
@@ -875,7 +892,7 @@ def test_mla_decode_fwd_unshuffled_tuned_h64(monkeypatch, batch_size, max_seqlen
     output = torch.empty(
         (batch_size, num_query_heads, kv_lora_rank), dtype=torch.bfloat16, device="cuda"
     )
-    mla_decode_fwd(
+    result = mla_decode_fwd(
         q=query,
         kv_buffer=kv_buffer,
         out=output,
@@ -890,17 +907,28 @@ def test_mla_decode_fwd_unshuffled_tuned_h64(monkeypatch, batch_size, max_seqlen
         q_descale=descale,
         kv_descale=descale,
         shuffled_kv_cache=False,
+        skip_reduce=skip_reduce,
     )
     assert len(launches) == 1
     grid, kwargs = launches[0]
-    if entry:
-        segments = min(entry["NUM_SEGMENTS_PER_SEQ"], num_pages)
-        if not entry.get("NPOT_SPLITS"):
-            segments = triton.next_power_of_2(segments)
-        assert grid[2] == segments == kwargs["NUM_SEGMENTS_PER_SEQ"]
-        assert kwargs.get("XCHG_MODE", 0) == entry.get("XCHG_MODE", 0)
-        expected = torch.bfloat16 if entry.get("PARTIAL_BF16") else torch.float32
-        assert kwargs["segm_output_ptr"].dtype == expected
+    segments = min(entry["NUM_SEGMENTS_PER_SEQ"], num_pages)
+    assert grid[2] == kwargs["NUM_SEGMENTS_PER_SEQ"]
+    if measured:
+        # NPOT_SPLITS: the tuned count is used without power-of-2 rounding.
+        assert grid[2] == segments
+        assert grid[2] & (grid[2] - 1) != 0, grid[2]
+        assert kwargs.get("XCHG_MODE", 0) == 1
+    else:
+        assert grid[2] == triton.next_power_of_2(segments)
+        assert kwargs.get("XCHG_MODE", 0) == 0
+    partial_dtype = torch.bfloat16 if measured and not skip_reduce else torch.float32
+    assert kwargs["segm_output_ptr"].dtype == partial_dtype
+    if skip_reduce:
+        # The caller gets FP32 partials and does its own reduction.
+        segm_output, segm_max, segm_expsum = result
+        assert segm_output.dtype == torch.float32
+        assert segm_max.dtype == segm_expsum.dtype == torch.float32
+        return
     ref_output = torch_mla_extend(
         query,
         kv_buffer,

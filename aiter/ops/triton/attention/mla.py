@@ -512,9 +512,16 @@ def mla_decode_fwd(
             num_seqs,
             max_seqlen_kv,
         )
+        # The tuned table is keyed on H, B and KV only. The flags below were
+        # measured for page64, rank 512 and RoPE 64, and XCHG_MODE=1 needs a
+        # 64-token tile, so other geometries keep the current path.
+        if (block_size, kv_lora_rank, qk_rope_head_dim) != (64, 512, 64):
+            for key in ("NPOT_SPLITS", "PARTIAL_BF16", "XCHG_MODE"):
+                tuned.pop(key, None)
         # Wrapper flags of the tuned entry. They are not kernel arguments.
         npot_splits = bool(tuned.pop("NPOT_SPLITS", False))
-        partial_bf16 = bool(tuned.pop("PARTIAL_BF16", False))
+        # skip_reduce returns the partials to the caller, so keep them FP32.
+        partial_bf16 = bool(tuned.pop("PARTIAL_BF16", False)) and not skip_reduce
         # Overrides may increase stages or Q padding even when the heuristic fits.
         # Reject the whole override before changing tiles or either segment count.
         if (
