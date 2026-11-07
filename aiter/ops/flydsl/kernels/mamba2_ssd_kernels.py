@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""FlyDSL Mamba-2 SSD chunked forward kernels (gfx11 WMMA, wave32).
+"""FlyDSL Mamba-2 SSD chunked forward kernels (RDNA WMMA, wave32).
 
 The chunked forward is split into three kernels:
 
@@ -15,19 +15,28 @@ The chunked forward is split into three kernels:
   masked intra-chunk term ``(C B^T * L) (dt x)`` and the ``D x`` skip without
   materialising the ``[chunk, chunk]`` interaction matrix.
 
-gfx11 WMMA ``16x16x16`` (v16 operands, v8 f32 accumulator) lane contract:
-  A operand : lane L carries row ``L % 16``, K = 0..15
-  B operand : lane L carries column ``L % 16``, K = 0..15
-  C/D       : lane L, slot si holds ``D[2*si + L // 16][L % 16]``
+All matmuls are RDNA ``16x16x16`` bf16 WMMA (wave32, v8 f32 accumulator).
+``_WmmaLayout`` holds the per-generation lane contract:
+
+  gfx11 (RDNA3 / RDNA3.5), v16 operands:
+    A / B : lane L carries row / column ``L % 16``, K = 0..15
+    C / D : lane L, slot si holds ``D[2*si + L // 16][L % 16]``
+  gfx120x (RDNA4), v8 operands:
+    A / B : lane L carries row / column ``L % 16``, K = 8*(L // 16) .. +7
+    C / D : lane L, slot si holds ``D[si + 8*(L // 16)][L % 16]``
+
 Operands are chosen so every load is either contiguous per lane or coalesced
-across lanes 0-15; ``compute_out`` builds its P operand from an accumulator of
-``B C^T`` with a single ``xor 16`` lane exchange instead of an LDS transpose,
-and stages only the strided x tile (plus decay / dt) in LDS.
+across lanes 0-15. ``compute_out`` builds its P operand from an accumulator of
+``B C^T``: on gfx120x each lane already holds its operand, on gfx11 a single
+``xor 16`` lane exchange replaces an LDS transpose. Only the strided x tile
+(plus decay / dt) is staged in LDS.
 """
+
+from dataclasses import dataclass
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
+from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import Int32
 from flydsl.expr.typing import Vector as Vec
 
@@ -38,13 +47,45 @@ WAVE = 32
 TILE = 16  # WMMA M = N = K
 
 
+@dataclass(frozen=True)
+class _WmmaLayout:
+    """Lane contract of the bf16 ``16x16x16`` WMMA on one RDNA generation."""
+
+    op_k: int  # K elements one lane carries per operand
+
+    @property
+    def split_k(self):
+        """The two half-waves carry different K halves (gfx120x), not both all 16."""
+        return self.op_k < TILE
+
+    def k0(self, hi):
+        """First K index of the operand run carried by half-wave ``hi``."""
+        return hi * self.op_k if self.split_k else 0
+
+    def acc_row(self, si, hi):
+        """Row of accumulator slot ``si`` in half-wave ``hi``."""
+        return si + 8 * hi if self.split_k else 2 * si + hi
+
+
+def wmma_layout(arch):
+    if arch.startswith("gfx11"):
+        return _WmmaLayout(op_k=16)
+    if arch.startswith("gfx120"):
+        return _WmmaLayout(op_k=8)
+    raise ValueError(f"mamba2 kernels need RDNA3 / RDNA4 WMMA, got {arch}")
+
+
 def _wmma(a_v, b_v, acc):
-    """``acc += A @ B`` with bf16 v16 operands and a v8 f32 accumulator."""
-    return Vec(
-        rocdl.wmma_f32_16x16x16_bf16(
-            acc.type, a_v.bitcast(fx.Int16), b_v.bitcast(fx.Int16), acc
-        ).result
-    )
+    """``acc += A @ B`` through FlyDSL's arch-dispatched bf16 WMMA atom."""
+    atom = fx.make_mma_atom(fx.rocdl.WMMA(TILE, TILE, TILE, fx.BFloat16, fx.Float32))
+    a_frag = fx.make_rmem_tensor(a_v.numel, fx.BFloat16)
+    b_frag = fx.make_rmem_tensor(b_v.numel, fx.BFloat16)
+    c_frag = fx.make_rmem_tensor(8, fx.Float32)
+    a_frag.store(a_v)
+    b_frag.store(b_v)
+    c_frag.store(acc)
+    fx.gemm(atom, c_frag, a_frag, b_frag, c_frag)
+    return Vec(c_frag.load())
 
 
 def _bf16_vec(vals):
@@ -86,11 +127,14 @@ def _row_view(t):
     return ptr_buf_tensor(t, fx.BFloat16, unit_elems=8, unit_stride=1)
 
 
-def _load16(view, off):
-    """16 contiguous bf16 at element offset ``off`` (16-byte aligned): two dwordx4 loads."""
-    lo = buf_copy_load(view, off, fx.BFloat16, unit_elems=8)
-    hi = buf_copy_load(view, off + 8, fx.BFloat16, unit_elems=8)
-    return lo.shuffle(hi, list(range(16)))
+def _load_op(view, off, n):
+    """``n`` (8 or 16) contiguous bf16 at element offset ``off`` (16-byte aligned),
+    as 128-bit loads."""
+    parts = [
+        buf_copy_load(view, off + 8 * k, fx.BFloat16, unit_elems=8)
+        for k in range(n // 8)
+    ]
+    return parts[0] if n == 8 else parts[0].shuffle(parts[1], list(range(16)))
 
 
 def build_chunk_cumsum(num_heads, chunk_size, block_h):
@@ -146,7 +190,7 @@ def build_chunk_cumsum(num_heads, chunk_size, block_h):
 
 
 def build_fwd_pass_state(
-    num_heads, num_groups, head_size, state_size, chunk_size, rm, rn, ks
+    arch, num_heads, num_groups, head_size, state_size, chunk_size, rm, rn, ks
 ):
     """Carry the state across chunks; one wave owns a (16*rm) x (16*rn) state tile.
 
@@ -161,6 +205,8 @@ def build_fwd_pass_state(
     """
     H, G, P, N, L = num_heads, num_groups, head_size, state_size, chunk_size
     HPG = H // G
+    W = wmma_layout(arch)
+    OK = W.op_k
     SL = TILE * ks  # tokens per slab
     SPC = L // SL  # slabs per chunk
     W_PASSES = (SL + WAVE - 1) // WAVE
@@ -263,9 +309,9 @@ def build_fwd_pass_state(
             if lane == 0:
                 _lds_store(lds, SCALE_OFF, fx.Float32, scale)
 
-        # Accumulator element (rm, rn, si) is state[p0 + 16*rm + 2*si + hi, n0 + 16*rn + l16].
+        # Accumulator element (i, j, si) is state[p0 + 16*i + acc_row(si), n0 + 16*j + l16].
         def state_off(i, j, si):
-            return (p0 + TILE * i + 2 * si + hi) * N + n0 + TILE * j + l16
+            return (p0 + TILE * i + W.acc_row(si, hi)) * N + n0 + TILE * j + l16
 
         state_base = bh * (P * N)
         accs = []
@@ -305,25 +351,22 @@ def build_fwd_pass_state(
             scale = _lds_load(lds, SCALE_OFF, fx.Float32)
             s_accs = [acc * Vec.filled(8, scale, fx.Float32) for acc in s_accs]
             for kk in range_constexpr(ks):
-                t0 = TILE * kk
-                wv = _lds_load(lds, W_OFF + t0 * 4, fx.Float32, TILE)
+                t0 = TILE * kk + W.k0(hi)  # this lane's K (token) run
+                wv = _lds_load(lds, W_OFF + t0 * 4, fx.Float32, OK)
                 a_ops = [
                     _lds_load(
-                        lds, X_OFF + ((TILE * i + l16) * XS + t0) * 2, fx.BFloat16, TILE
+                        lds, X_OFF + ((TILE * i + l16) * XS + t0) * 2, fx.BFloat16, OK
                     )
                     for i in range_constexpr(rm)
                 ]
                 b_ops = []
                 for j in range_constexpr(rn):
                     b_raw = _lds_load(
-                        lds, B_OFF + ((TILE * j + l16) * XS + t0) * 2, fx.BFloat16, TILE
+                        lds, B_OFF + ((TILE * j + l16) * XS + t0) * 2, fx.BFloat16, OK
                     )
                     b_ops.append(
                         _bf16_vec(
-                            [
-                                fx.Float32(b_raw[k]) * wv[k]
-                                for k in range_constexpr(TILE)
-                            ]
+                            [fx.Float32(b_raw[k]) * wv[k] for k in range_constexpr(OK)]
                         )
                     )
                 for i in range_constexpr(rm):
@@ -368,7 +411,7 @@ def build_fwd_pass_state(
 
 
 def build_compute_out(
-    num_heads, num_groups, head_size, state_size, chunk_size, rp, ku, persistent
+    arch, num_heads, num_groups, head_size, state_size, chunk_size, rp, ku, persistent
 ):
     """One block per (chunk, p-tile, batch*head); wave w owns token rows 16w..16w+15.
 
@@ -384,6 +427,8 @@ def build_compute_out(
     """
     H, G, P, N, L = num_heads, num_groups, head_size, state_size, chunk_size
     HPG = H // G
+    W = wmma_layout(arch)
+    OK = W.op_k
     NWAVES = L // TILE
     THREADS = NWAVES * WAVE
     NK = N // TILE
@@ -477,8 +522,10 @@ def build_compute_out(
                 )
             gpu.barrier()
 
+            k0 = W.k0(hi)  # this lane's K run within a 16-wide tile
+
             def c_op(kn):
-                return _load16(c_rows, c_base + TILE * kn)
+                return _load_op(c_rows, c_base + TILE * kn + k0, OK)
 
             # A-operand row of this lane: token t_a = 16*wave + l16 of the chunk.
             t_a = TILE * wave + l16
@@ -498,11 +545,13 @@ def build_compute_out(
                     kn = fx.Int32(kb) * KU + u
                     c_kn = c_op(kn)
                     a_op = _bf16_vec(
-                        [fx.Float32(c_kn[k]) * exp_dt for k in range_constexpr(TILE)]
+                        [fx.Float32(c_kn[k]) * exp_dt for k in range_constexpr(OK)]
                     )
                     for i in range_constexpr(rp):
-                        h_op = _load16(
-                            hid_rows, hid_base + (p0 + TILE * i + l16) * N + TILE * kn
+                        h_op = _load_op(
+                            hid_rows,
+                            hid_base + (p0 + TILE * i + l16) * N + TILE * kn + k0,
+                            OK,
                         )
                         k_accs[i] = _wmma(a_op, h_op, k_accs[i])
                 k_results = yield k_accs
@@ -520,28 +569,36 @@ def build_compute_out(
                     sT = _carried(s_state)[0]
                     for u in range_constexpr(KU):
                         kn = fx.Int32(kb) * KU + u
-                        sT = _wmma(_load16(b_rows, b_base + TILE * kn), c_op(kn), sT)
+                        b_op = _load_op(b_rows, b_base + TILE * kn + k0, OK)
+                        sT = _wmma(b_op, c_op(kn), sT)
                     s_results = yield [sT]
                 sT = _carried(s_results)[0]
-                # Slot si holds source s = s0 + 2*si + hi for target t_a.
+                # Slot si holds source s = s0 + acc_row(si) for target t_a.
                 own = []
                 for si in range_constexpr(8):
-                    s = s0 + 2 * si + hi
+                    s = s0 + W.acc_row(si, hi)
                     d_s = _lds_load(lds, DEC_OFF + s * 4, fx.Float32)
                     dt_s = _lds_load(lds, DT_OFF + s * 4, fx.Float32)
                     expo = (s <= t_a).select(d_ta - d_s, fx.Float32(float("-inf")))
                     own.append(fx.Float32(sT[si]) * expo.exp2() * dt_s)
-                other = [v.shuffle_xor(16, WAVE) for v in own]
-                # P[t_a, s0 + k]: even k from the hi == 0 half, odd k from hi == 1.
-                is_lo = hi == 0
-                p_vals = []
-                for si in range_constexpr(8):
-                    p_vals.append(is_lo.select(own[si], other[si]))
-                    p_vals.append(is_lo.select(other[si], own[si]))
-                p_op = _bf16_vec(p_vals)
+                if const_expr(W.split_k):
+                    # Slots si are sources s0 + k0 + si: already this lane's A run.
+                    p_op = _bf16_vec(own)
+                else:
+                    # P[t_a, s0 + k]: even k from the hi == 0 half, odd k from hi == 1.
+                    other = [v.shuffle_xor(16, WAVE) for v in own]
+                    is_lo = hi == 0
+                    p_vals = []
+                    for si in range_constexpr(8):
+                        p_vals.append(is_lo.select(own[si], other[si]))
+                        p_vals.append(is_lo.select(other[si], own[si]))
+                    p_op = _bf16_vec(p_vals)
                 for i in range_constexpr(rp):
                     x_op = _lds_load(
-                        lds, X_OFF + ((TILE * i + l16) * XS + s0) * 2, fx.BFloat16, TILE
+                        lds,
+                        X_OFF + ((TILE * i + l16) * XS + s0 + k0) * 2,
+                        fx.BFloat16,
+                        OK,
                     )
                     s_accs[i] = _wmma(p_op, x_op, s_accs[i])
                 results = yield s_accs
@@ -550,7 +607,7 @@ def build_compute_out(
             for i in range_constexpr(rp):
                 acc = _carried(results)[i]
                 for si in range_constexpr(8):
-                    t = TILE * wave + 2 * si + hi
+                    t = TILE * wave + W.acc_row(si, hi)
                     x_t = _lds_load(
                         lds, X_OFF + ((TILE * i + l16) * XS + t) * 2, fx.BFloat16
                     )

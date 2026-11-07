@@ -30,8 +30,17 @@ from .kernels.mamba2_ssd_kernels import (
     build_fwd_pass_state,
 )
 
-# The kernels use the gfx11 (RDNA3 / RDNA3.5) v16-operand WMMA.
-SUPPORTED_GFX = ["gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151"]
+# RDNA3 / RDNA3.5 and RDNA4: wave32 bf16 16x16x16 WMMA (see ``wmma_layout``).
+SUPPORTED_GFX = [
+    "gfx1100",
+    "gfx1101",
+    "gfx1102",
+    "gfx1150",
+    "gfx1151",
+    "gfx1152",
+    "gfx1200",
+    "gfx1201",
+]
 
 _CUMSUM_BLOCK_H = 32
 _TILE_REPEATS = (1, 2, 4)  # 16-wide WMMA tiles per wave along a dimension
@@ -70,12 +79,12 @@ def _cumsum(H, L):
 
 @functools.cache
 def _state(H, G, P, N, L, rm, rn, ks):
-    return build_fwd_pass_state(H, G, P, N, L, rm, rn, ks)
+    return build_fwd_pass_state(get_gfx(), H, G, P, N, L, rm, rn, ks)
 
 
 @functools.cache
 def _out(H, G, P, N, L, rp, ku, persistent):
-    return build_compute_out(H, G, P, N, L, rp, ku, persistent)
+    return build_compute_out(get_gfx(), H, G, P, N, L, rp, ku, persistent)
 
 
 def _tuning_key(*args):
@@ -221,7 +230,7 @@ def mamba2_chunk_forward_flydsl(
     c.dtype."""
     if get_gfx() not in SUPPORTED_GFX:
         raise RuntimeError(
-            f"mamba2_chunk_forward_flydsl needs gfx11 WMMA; got {get_gfx()}"
+            f"mamba2_chunk_forward_flydsl supports {SUPPORTED_GFX}; got {get_gfx()}"
         )
     _validate_chunk_size(x.shape[1], chunk_size)
     head_size, state_size = x.shape[3], b.shape[3]
