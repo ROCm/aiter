@@ -72,11 +72,42 @@ def _posix_path(path):
     return path.replace("\\", "/") if IS_WINDOWS else path
 
 
+def _is_zombie(pid):
+    """True if ``pid`` has already exited but was never reaped.
+
+    A zombie stays in the process table and still answers ``os.kill(pid, 0)``
+    with success, so an incompletely published staging tree or a transaction
+    directory left by a killed builder would look owned by a live process and
+    never be reclaimed. Only Linux exposes the process state; elsewhere the
+    kill probe decides.
+
+    Keep this in sync with ``FileBaton._is_zombie``: the two probes must agree
+    on liveness, otherwise whichever path kept the plain ``os.kill`` check
+    still hangs on a crashed peer.
+    """
+    if not sys.platform.startswith("linux"):
+        return False
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as f:
+            data = f.read()
+    except (FileNotFoundError, ProcessLookupError, PermissionError):
+        return False
+    # "<pid> (<comm>) <state> ..." — the comm field is parenthesised and may
+    # itself contain spaces or ')', so slice between the outer parens.
+    rparen = data.rfind(b")")
+    if rparen < 0:
+        return False
+    rest = data[rparen + 1 :].split()
+    return bool(rest) and rest[0] in (b"Z", b"X")
+
+
 def _pid_alive(pid):
     """Liveness probe for a local process id.
 
     Kept self-contained rather than shared with file_baton: this module is
     also loaded straight from its path, without its directory on sys.path.
+    Its zombie handling therefore has to stay in sync with
+    ``FileBaton._pid_alive`` by hand.
     """
     if IS_WINDOWS:
         # os.kill() on Windows calls TerminateProcess() for any signal other
@@ -111,8 +142,11 @@ def _pid_alive(pid):
     except ProcessLookupError:
         return False
     except PermissionError:
-        return True  # exists but owned by another user
-    return True
+        # Exists but owned by another user; /proc still reports its state.
+        return not _is_zombie(pid)
+    # Success only proves the pid is taken: a zombie answers the probe but has
+    # already exited and can never finish the codegen it marked as active.
+    return not _is_zombie(pid)
 
 
 def _remove_path(path):
