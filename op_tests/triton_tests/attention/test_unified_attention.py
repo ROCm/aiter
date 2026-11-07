@@ -558,6 +558,8 @@ def test_triton_unified_attn_3d(
     "seq_lens",
     [
         [(512, 512)],
+        # crosses Q_GEQ_1024 so the head-512 bf16 large-prefill entry is hit
+        [(1234, 1234)],
         [
             (1, 15),
             (12, 133),
@@ -637,6 +639,10 @@ def test_triton_unified_attn(
         backend,
     )
     torch.manual_seed(0)
+    # the 1234-token prefill arm only needs the default block-table size; the
+    # 32768-block variant would allocate a very large fp32 KV cache.
+    if max(q for q, _ in seq_lens) > 1024 and num_blocks > 2048:
+        pytest.skip("large-prefill shape only runs with the default block count")
     # shuffling only supported for gfx1250 gluon kernels
     if shuffled_kv_cache and not use_gluon_2d:
         pytest.skip("skip shuffled_kv_cache, 2d gluon not available")
