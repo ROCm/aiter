@@ -146,22 +146,34 @@ get_time() {
         seconds="${DEFAULT_TEST_TIME}"
     fi
 
-    if [[ -n "${MEMORY_WEIGHT_FLOOR[$abs]+x}" && "$seconds" -lt "${MEMORY_WEIGHT_FLOOR[$abs]}" ]]; then
-        echo "${MEMORY_WEIGHT_FLOOR[$abs]}"
+    if [[ -n "${SHARD_WEIGHT_FLOOR[$abs]+x}" && "$seconds" -lt "${SHARD_WEIGHT_FLOOR[$abs]}" ]]; then
+        echo "${SHARD_WEIGHT_FLOOR[$abs]}"
     else
         echo "$seconds"
     fi
 }
 
-# Some tests have short wall time but high peak memory usage. Give them a
-# scheduling weight floor so the greedy splitter avoids packing them together.
-declare -A MEMORY_WEIGHT_FLOOR
+# Floors keep the greedy splitter from packing expensive tests together when
+# the automatically refreshed median times understate MI35X PR-run cost, or
+# when a fast test has a high peak memory footprint. These affect assignment
+# only; every selected test still runs with its usual arguments.
+declare -A SHARD_WEIGHT_FLOOR
 if [[ "$TEST_TYPE" == "aiter" ]]; then
-    MEMORY_WEIGHT_FLOOR[op_tests/test_flydsl_causal_conv1d_update.py]=300
-    MEMORY_WEIGHT_FLOOR[op_tests/test_flydsl_gdr_mtp.py]=300
-    MEMORY_WEIGHT_FLOOR[op_tests/test_flydsl_qk_norm_rope_quant.py]=300
-    MEMORY_WEIGHT_FLOOR[op_tests/test_kvcache.py]=300
-    MEMORY_WEIGHT_FLOOR[op_tests/test_mla_prefill_ps.py]=300
+    # MI35X shard 4 timed out at 90 minutes on both main and PR #7166.
+    # Nov 1-2 logs show topk at 30-37 min, a8w8 GEMM at 26-31 min,
+    # concat-cache MLA at 9-10 min, and implicit conv at about 10 min.
+    # Keep a little headroom over those observations across runner variance.
+    SHARD_WEIGHT_FLOOR[op_tests/test_topk_per_row.py]=2500
+    SHARD_WEIGHT_FLOOR[op_tests/test_gemm_a8w8.py]=2100
+    SHARD_WEIGHT_FLOOR[op_tests/test_concat_cache_mla.py]=720
+    SHARD_WEIGHT_FLOOR[op_tests/test_flydsl_conv_implicit.py]=720
+
+    # Memory-heavy tests also need separation even when their runtime is short.
+    SHARD_WEIGHT_FLOOR[op_tests/test_flydsl_causal_conv1d_update.py]=300
+    SHARD_WEIGHT_FLOOR[op_tests/test_flydsl_gdr_mtp.py]=300
+    SHARD_WEIGHT_FLOOR[op_tests/test_flydsl_qk_norm_rope_quant.py]=300
+    SHARD_WEIGHT_FLOOR[op_tests/test_kvcache.py]=300
+    SHARD_WEIGHT_FLOOR[op_tests/test_mla_prefill_ps.py]=300
 fi
 
 # ------------------------------
