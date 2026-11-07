@@ -5,6 +5,7 @@
 
 import ctypes
 import inspect
+import struct
 
 import pytest
 import torch
@@ -46,7 +47,7 @@ def dispatch(monkeypatch):
         address_slots = {
             names[index]: ctype
             for index, ctype, _fill in slots
-            if index >= 0 and names[index] in _ADDRESS_ARGS
+            if index >= 0 and names[index] in _ADDRESS_ARGS and ctype is ctypes.c_void_p
         }
         state = CallState(slots, lambda _packed: None)
 
@@ -58,9 +59,14 @@ def dispatch(monkeypatch):
                     for (index, _ctype, _fill), storage in zip(
                         slots, state._tls.storages
                     )
-                    if index >= 0
+                    if index >= 0 and hasattr(storage, "value")
                 }
             )
+            launches[-1]["layout_buffers"] = {
+                names[index]: bytes(storage)
+                for (index, _ctype, _fill), storage in zip(slots, state._tls.storages)
+                if index >= 0 and isinstance(storage, ctypes.Array)
+            }
 
         compiled.append(dispatch)
         dispatch(*args)
@@ -80,8 +86,9 @@ def dispatch(monkeypatch):
 
 @pytest.mark.parametrize("ep_quant_bits", [None, 0, 4, 8])
 @pytest.mark.parametrize("use_default_buffers", [False, True])
+@pytest.mark.parametrize("a_preshuffled", [0, 1])
 def test_large_buffers_pack_on_first_and_cached_calls(
-    dispatch, ep_quant_bits, use_default_buffers
+    dispatch, ep_quant_bits, use_default_buffers, a_preshuffled
 ):
     # Meta tensors exercise multi-billion-element dimensions without allocating
     # GPU memory. Arena addresses remain constexprs and are not ABI slots.
@@ -105,7 +112,8 @@ def test_large_buffers_pack_on_first_and_cached_calls(
             combine_quant_bits=ep_quant_bits,
         )
     )
-    for shape in [(64, 8192, 7168), (64, 1, 7168)]:
+    shapes = [(64, 8192, 7168), (64, 1, 7168)]
+    for shape in shapes * 2:
         out = meta(shape, torch.bfloat16)
         assert (
             grouped.flydsl_grouped_gemm_a8w4_masked(
@@ -119,6 +127,9 @@ def test_large_buffers_pack_on_first_and_cached_calls(
                 contiguous_m=shape[0] * shape[1],
                 N=7168,
                 K=256,
+                a_is_fp4=a_preshuffled,
+                a_preshuffled=a_preshuffled,
+                num_buffers=2,
                 stream=0,
                 quant_scale=None if use_default_buffers else meta((2**31,)),
                 ep_row_map=(
@@ -129,8 +140,47 @@ def test_large_buffers_pack_on_first_and_cached_calls(
             is out
         )
 
-    assert len(compiled) == 1
-    assert len(launches) == 2
+    # Packed input changes ABI at the Tensor dimension limit. Ordinary input
+    # keeps Pointer packing, and both policies reuse their own cached calls.
+    assert len(compiled) == (2 if a_preshuffled else 1)
+    assert len(launches) == 4
+
+
+@pytest.mark.parametrize("a_preshuffled", [0, 1])
+def test_output_dimension_boundary_preserves_cached_abis(dispatch, a_preshuffled):
+    compiled, launches = dispatch
+
+    def meta(shape, dtype=torch.uint8):
+        return torch.empty(shape, dtype=dtype, device="meta")
+
+    for elements in (2**31 - 1, 2**31) * 2:
+        out = meta((elements,), torch.bfloat16)
+        grouped.flydsl_grouped_gemm_a8w4_masked(
+            out,
+            meta((64, 256)),
+            meta((1, 256, 128)),
+            meta((256,)),
+            meta((256,)),
+            meta((1,), torch.int32),
+            n_experts=1,
+            contiguous_m=64,
+            N=256,
+            K=256,
+            a_is_fp4=a_preshuffled,
+            a_preshuffled=a_preshuffled,
+            num_buffers=2,
+            stream=0,
+            quant_scale=meta((1,)),
+            ep_row_map=meta((64,), torch.int32),
+        )
+        layout = launches[-1]["layout_buffers"].get("arg_c")
+        if a_preshuffled and elements == 2**31 - 1:
+            assert struct.unpack("<i", layout) == (elements,)
+        else:
+            assert layout is None
+        assert (launches[-1]["arg_c"] or 0) == out.data_ptr()
+    assert len(compiled) == (2 if a_preshuffled else 1)
+    assert len(launches) == 4
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.uint8])
@@ -223,3 +273,159 @@ def test_changing_arena_selects_a_new_specialization(dispatch):
         )
     assert len(compiled) == 2
     assert len(launches) == 3
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.uint8])
+@pytest.mark.parametrize("elements", [3, 4])
+def test_default_optional_buffers_allow_odd_output_sizes(dispatch, dtype, elements):
+    compiled, launches = dispatch
+    for _ in range(2):
+        out = torch.empty(elements, dtype=dtype)
+        grouped.flydsl_grouped_gemm_a8w4_masked(
+            out,
+            torch.empty((elements, 256), dtype=torch.uint8),
+            torch.empty((1, 1, 128), dtype=torch.uint8),
+            torch.empty(256, dtype=torch.uint8),
+            torch.empty(256, dtype=torch.uint8),
+            torch.empty(1, dtype=torch.int32),
+            n_experts=1,
+            contiguous_m=elements,
+            N=1,
+            K=256,
+            stream=0,
+            out_is_f16=int(dtype == torch.float16),
+            stage1_quant_out=int(dtype == torch.uint8),
+        )
+        for name in ("arg_c", "arg_quant_scale", "arg_ep_row_map"):
+            assert launches[-1][name] == out.data_ptr()
+        row_layout = launches[-1]["layout_buffers"].get("arg_ep_row_map")
+        assert row_layout is None
+    assert len(compiled) == 1
+    assert len(launches) == 2
+
+
+@pytest.mark.parametrize(
+    "dtype,shape,offset,tensor_abi",
+    [
+        (torch.bfloat16, (2, 3), 0, True),
+        (torch.uint8, (4, 3), 0, True),
+        (torch.float64, (2, 3), 0, True),
+        (torch.bfloat16, (4,), 1, False),
+        (torch.bfloat16, (4,), 2, True),
+        (torch.uint8, (4,), 1, False),
+        (torch.uint8, (4,), 2, False),
+        (torch.uint8, (4,), 3, False),
+        (torch.uint8, (4,), 4, True),
+        (torch.int32, (3,), 1, True),
+    ],
+)
+def test_scale_reinterpretation_packs_flat_sizes_and_byte_offsets(
+    dtype, shape, offset, tensor_abi
+):
+    elements = 1
+    for dim in shape:
+        elements *= dim
+    storage = torch.empty(elements + offset, dtype=dtype)
+    tensor = storage[offset:].view(shape)
+    argument = grouped._gemm_launch_buffer_arg(tensor, grouped.fx.Int32)
+    assert isinstance(argument, torch.Tensor) == tensor_abi
+
+    def launcher(buffer):
+        pass
+
+    slots = _build_call_spec(inspect.signature(launcher), (argument,))
+    state = CallState(slots, lambda _packed: None)
+    state((argument,))
+    # Hidden stream slots have negative indices and are not buffer arguments.
+    pointers = [
+        value.value
+        for (index, _ctype, _fill), value in zip(slots, state._tls.storages)
+        if index == 0 and isinstance(value, ctypes.c_void_p)
+    ]
+    assert pointers == [tensor.data_ptr()]
+    layouts = [
+        bytes(value)
+        for (index, _ctype, _fill), value in zip(slots, state._tls.storages)
+        if index == 0 and isinstance(value, ctypes.Array)
+    ]
+    expected = [struct.pack("<i", elements * tensor.element_size() // 4)]
+    assert layouts == (expected if tensor_abi else [])
+
+
+@pytest.mark.parametrize("a_preshuffled", [0, 1])
+def test_scale_byte_offset_changes_cached_abi(dispatch, a_preshuffled):
+    compiled, launches = dispatch
+    for offset in (1, 4) * 2:
+        storage = torch.empty(256 + offset, dtype=torch.uint8)
+        scale_a = storage[offset:]
+        out = torch.empty((64, 256), dtype=torch.bfloat16)
+        grouped.flydsl_grouped_gemm_a8w4_masked(
+            out,
+            torch.empty((64, 256), dtype=torch.uint8),
+            torch.empty((1, 256, 128), dtype=torch.uint8),
+            scale_a,
+            torch.empty(256, dtype=torch.uint8),
+            torch.empty(1, dtype=torch.int32),
+            n_experts=1,
+            contiguous_m=64,
+            N=256,
+            K=256,
+            a_is_fp4=a_preshuffled,
+            a_preshuffled=a_preshuffled,
+            num_buffers=2,
+            stream=0,
+        )
+        assert launches[-1]["arg_scale_a"] == scale_a.data_ptr()
+        layout = launches[-1]["layout_buffers"].get("arg_scale_a")
+        assert layout == (
+            struct.pack("<i", 64) if a_preshuffled and offset == 4 else None
+        )
+    assert len(compiled) == (2 if a_preshuffled else 1)
+    assert len(launches) == 4
+
+
+@pytest.mark.parametrize("native_quant_output", [False, True])
+def test_quant_output_layout_preserves_size_and_offset_abis(
+    dispatch, native_quant_output
+):
+    compiled, launches = dispatch
+    for _ in range(2):
+        for elements in (2**31 - 1, 2**31):
+            for offset in (1, 4):
+                out = torch.empty(elements, dtype=torch.uint8, device="meta")
+                storage = torch.empty(256 + offset, dtype=torch.uint8)
+                scale_a = storage[offset:]
+                grouped.flydsl_grouped_gemm_a8w4_masked(
+                    out,
+                    torch.empty((64, 256), dtype=torch.uint8, device="meta"),
+                    torch.empty((1, 256, 128), dtype=torch.uint8, device="meta"),
+                    scale_a,
+                    torch.empty(256, dtype=torch.uint8, device="meta"),
+                    torch.empty(1, dtype=torch.int32, device="meta"),
+                    n_experts=1,
+                    contiguous_m=64,
+                    N=256,
+                    K=256,
+                    stream=0,
+                    a_is_fp4=1,
+                    stage1_act=1,
+                    stage1_quant_out=1,
+                    quant_payload_preshuffled=native_quant_output,
+                    quant_scale=torch.empty(512, dtype=torch.uint8, device="meta"),
+                    ep_row_map=torch.empty(64, dtype=torch.int32, device="meta"),
+                )
+                launch = launches[-1]
+                assert (launch["arg_c"] or 0) == out.data_ptr()
+                assert launch["arg_scale_a"] == scale_a.data_ptr()
+                assert launch["layout_buffers"].get("arg_c") == (
+                    struct.pack("<i", elements)
+                    if native_quant_output and elements < 2**31
+                    else None
+                )
+                assert launch["layout_buffers"].get("arg_scale_a") == (
+                    struct.pack("<i", 64)
+                    if native_quant_output and offset == 4
+                    else None
+                )
+    assert len(compiled) == (4 if native_quant_output else 1)
+    assert len(launches) == 8
