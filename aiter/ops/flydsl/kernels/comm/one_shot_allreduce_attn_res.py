@@ -215,6 +215,57 @@ def _xchg_join_triple(
 #: Deepest bank the epilogue builds: K3 keeps at most 8 earlier block states.
 MAX_NVB = 8
 
+
+def _make_kw_wave0_score(nvb: int, n_waves: int):
+    """A ``@flyc.jit`` that runs the wave-0-only softmax scoring of the fuse-KW
+    epilogue (read_hip.cuh ``if (wave == 0)``). ``nvb``/``n_waves`` are baked at
+    build time so the loops unroll. On wave 0 only: fold the prefix dot/sq from
+    the per-wave LDS partials, score it, take the softmax over the nvb precomputed
+    bank scores + the prefix, and publish the nvb+1 normalised weights to LDS.
+    Every other wave executes nothing (the ``if`` is an exec-mask guard in a jit
+    body, so the transcendentals run once per row, not once per wave -- the whole
+    point of the Kevin-way read)."""
+
+    @flyc.jit
+    def _kw_wave0_score(part_ptr, weight_ptr, score_buf, token, inv_h, score_eps, tid):
+        wid = tid // fx.Int32(WAVE)
+        lane = tid % fx.Int32(WAVE)
+        if wid == fx.Int32(0):
+            d_tot = fx.Float32(0.0)
+            s_tot = fx.Float32(0.0)
+            for w in range_constexpr(n_waves):
+                d_tot = d_tot + fx.Float32(part_ptr[fx.Int32(w)])
+                s_tot = s_tot + fx.Float32(part_ptr[fx.Int32(n_waves + w)])
+            with fx.fastmath("afn"):
+                p_score = d_tot * fmath.rsqrt(s_tot * inv_h + score_eps)
+            n_cand = nvb + 1
+            live = lane < fx.Int32(n_cand)
+            is_prefix = lane == fx.Int32(nvb)
+            safe_bank = (lane < fx.Int32(nvb)).select(lane, fx.Int32(0))
+            bscore = _buffer_load(
+                score_buf, token * fx.Int32(nvb) + safe_bank, 1, fx.Float32
+            )[0]
+            score = is_prefix.select(p_score, bscore)
+            neg_inf = fx.Float32(float("-inf"))
+            score = live.select(score, neg_inf)
+            m = score
+            for off in (32, 16, 8, 4, 2, 1):
+                moved = m.shuffle_xor(off, WAVE)
+                m = (moved > m).select(moved, m)
+            e = live.select(fmath.exp(score - m), fx.Float32(0.0))
+            denom = e
+            for off in (32, 16, 8, 4, 2, 1):
+                denom = denom + denom.shuffle_xor(off, WAVE)
+            wgt = e * (fx.Float32(1.0) / denom)
+            # Inactive lanes (lane > nvb) must NOT clobber a real weight slot:
+            # their wgt is 0 and would zero the prefix weight if they aliased
+            # slot nvb. Send them to a trash slot at nvb+1 (one past the nvb+1
+            # real weights), exactly as the standalone KW read does.
+            safe_w = live.select(lane, fx.Int32(nvb + 1))
+            fx.ptr_store(wgt, weight_ptr + fx.Int64(safe_w))
+
+    return _kw_wave0_score
+
 #: Rows whose butterfly steps are emitted together by
 #: :func:`_wave_reduce_add_xpose`. Tail at T=1, atoms=2, nvb=8, against the
 #: one-row-at-a-time emission this replaces: that order 7.82 us, chunk 3 7.56,
@@ -451,6 +502,30 @@ class OneShotAttnResEpilogue:
         # writes).
         self.n_score_sums = 2
         self.slots_per_color = self.n_waves * (self.n_score_sums + 1)
+        # SILOTIGER-1277 fuse-KW (attnres_rewrite): opt-in, split=1, scores-only.
+        # Replace the all-waves block-reduce + all-waves softmax of the prefix
+        # candidate with Kevin-way wave-0-only scoring: DPP wave-sum of the
+        # prefix dot/sq -> tiny per-wave LDS -> wave 0 alone forms the softmax
+        # over (nvb precomputed bank scores + prefix) and publishes the nvb+1
+        # weights to LDS; all threads then read the weights and mix. This is the
+        # read_hip.cuh `if (wave == 0)` structure the standalone KW read uses,
+        # ported into the one-shot epilogue so AR + residual + KW read are one
+        # kernel. Byte-identical to the default build unless the flag is set
+        # (then ulp-gated by the multigpu verify). Only legal for the scores-only
+        # (bank VALUES in-kernel), unsplit, single-token-per-WG build.
+        self.kw_score = (
+            os.environ.get("AITER_FLY_AR_KW_SCORE") == "1"
+            and split == 1
+            and not self.acc_cache
+        )
+        # Extra LDS the KW branch needs on top of the score partials: nvb+1
+        # softmax weights wave 0 publishes (one f32 each) plus one trash slot for
+        # the inactive scoring lanes, per colour. The score partials reuse
+        # slots_per_color's first n_score_sums*n_waves f32.
+        self.kw_weight_slots = (nvb + 2) if self.kw_score else 0
+        self._kw_score_fn = (
+            _make_kw_wave0_score(nvb, self.n_waves) if self.kw_score else None
+        )
         if split > 1:
             # A split build joins each row sum across workgroups through HBM
             # exchange words (one per (stream, colour, group)) instead of LDS,
@@ -484,12 +559,20 @@ class OneShotAttnResEpilogue:
             # nothing but the colour rotation separates one tile's reads of the
             # partials from the next tile's writes.
             multi_wave = self.n_waves > 1
-            self.lds_bytes = n_colors * self.slots_per_color * 4 if multi_wave else 0
-            self._shared = (
-                make_wave_partials(n_colors * self.slots_per_color)
-                if multi_wave
-                else None
-            )
+            # The KW branch also publishes nvb+1 softmax weights per colour (wave
+            # 0 writes, every thread reads), so its colour block is wider than the
+            # default's score-partial slots; and it needs LDS even at n_waves==1.
+            self.slots_per_color_kw = self.slots_per_color + self.kw_weight_slots
+            if self.kw_score:
+                self.lds_bytes = n_colors * self.slots_per_color_kw * 4
+                self._shared = make_wave_partials(n_colors * self.slots_per_color_kw)
+            else:
+                self.lds_bytes = n_colors * self.slots_per_color * 4 if multi_wave else 0
+                self._shared = (
+                    make_wave_partials(n_colors * self.slots_per_color)
+                    if multi_wave
+                    else None
+                )
 
     @property
     def tag(self) -> str:
@@ -502,6 +585,8 @@ class OneShotAttnResEpilogue:
             tag += "_nonorm"
         if self.acc_cache:
             tag += "_acc"
+        if self.kw_score:
+            tag += "_kw"
         return tag
 
     def spec(self) -> dict:
@@ -664,9 +749,10 @@ class _BoundOneShotAttnRes:
             self.ow_atoms = io.load_tile(w_buf, self.part)
 
         self.lds = None
-        if const_expr(epi.split == 1 and epi.n_waves > 1):
+        if const_expr(epi.split == 1 and (epi.n_waves > 1 or epi.kw_score)):
             # Allocated once, at kernel scope (SharedAllocator is static). A
-            # split build joins through HBM and has no LDS.
+            # split build joins through HBM and has no LDS. The KW branch needs
+            # LDS even at n_waves==1 (it publishes the softmax weights there).
             self.lds = fx.SharedAllocator().allocate(epi._shared).peek().wave.ptr
 
     def _bank_row_i32(self, tile, j):
@@ -867,7 +953,52 @@ class _BoundOneShotAttnRes:
         # joined word vs the two-barrier path (so it wins at every decode T).
         merge = const_expr(epi.split > 1 and epi.out_norm and epi.outnorm_merge)
         acc_atoms = None
-        if merge:
+        # SILOTIGER-1277 fuse-KW: wave-0-only scoring (read_hip.cuh finish). The
+        # prefix dot/sq fold through a DPP wave-sum + tiny per-wave LDS, and wave
+        # 0 alone forms the softmax over (nvb precomputed bank scores + prefix)
+        # and publishes the nvb+1 weights, which every thread reads for the mix.
+        # The all-waves block-reduce AND the all-waves softmax of the default
+        # scores-only path are both collapsed to one wave. Scores-only, split=1.
+        kw = const_expr(epi.kw_score and epi.split == 1 and not epi.acc_cache)
+        kw_weights = None
+        if kw:
+            # per-wave partials of the prefix dot/sq, in this colour's slots.
+            base = color * fx.Int32(epi.slots_per_color_kw)
+            n_waves = epi.n_waves
+            wid = self.tid // fx.Int32(WAVE)
+            d_wave = wave_reduce_add([d_pv])[0]
+            s_wave = wave_reduce_add([s_pv])[0]
+            # Every lane holds the wave sum after the butterfly, so all lanes
+            # write the same slot the same value -- no leader, no race. At
+            # n_waves==1 this single store + barrier is still cheaper than the
+            # wave-0 fold reading one slot, and keeps the jit helper uniform.
+            fx.ptr_store(d_wave, self.lds + fx.Int64(base) + fx.Int64(wid))
+            fx.ptr_store(
+                s_wave, self.lds + fx.Int64(base + fx.Int32(n_waves)) + fx.Int64(wid)
+            )
+            rocdl.s_waitcnt(lgkmcnt=0)
+            rocdl.s_barrier()
+            # weight slots sit after the 2*n_waves (dot, sq) partials.
+            woff = base + fx.Int32(epi.n_score_sums * n_waves)
+            # Wave-0-only softmax scoring + publish (exec-mask guarded in a jit
+            # body so the transcendentals run once per row, not once per wave).
+            epi._kw_score_fn(
+                self.lds + fx.Int64(base),
+                self.lds + fx.Int64(woff),
+                self.score_buf,
+                token,
+                fx.Float32(inv_h),
+                self.score_eps,
+                self.tid,
+            )
+            rocdl.s_waitcnt(lgkmcnt=0)
+            rocdl.s_barrier()
+            kw_weights = [
+                fx.Float32(self.lds[woff + fx.Int32(r)])
+                for r in range_constexpr(epi.nvb + 1)
+            ]
+            prefix_score = fx.Float32(0.0)  # unused on the KW path
+        elif merge:
             acc_atoms = self._acc_row(token)  # fp32 (T, hidden) weighted sum
             cross_pv = self._row_cross(pv, acc_atoms)
             d_wave = wave_reduce_add([d_pv])[0]
@@ -954,34 +1085,48 @@ class _BoundOneShotAttnRes:
             # weighted mix in-kernel. Global max first (bit-comparable to Triton).
             bank_atoms = self._bank_rows(tile)
             rows = [[atom_bf16_to_f32(x) for x in row] for row in bank_atoms]
-            n_rows = epi.nvb + 1
-            bank_scores = [
-                _buffer_load(
-                    self.score_buf,
-                    tile * fx.Int32(epi.nvb) + fx.Int32(j),
-                    1,
-                    fx.Float32,
-                )[0]
-                for j in range_constexpr(epi.nvb)
-            ]
-            scores = bank_scores + [prefix_score]
-            m = scores[0]
-            for r in range_constexpr(1, n_rows):
-                m = (scores[r] > m).select(scores[r], m)
-            weights = [fmath.exp(s - m) for s in scores]
-            denom = None
-            for r in range_constexpr(epi.nvb):
-                denom = weights[r] if denom is None else denom + weights[r]
-            inv = fx.Float32(1.0) / (denom + weights[epi.nvb])
-            mix = []
-            for a in range_constexpr(epi.atoms):
-                with fx.fastmath("contract"):
-                    acc = None
-                    for r in range_constexpr(epi.nvb):
-                        term = rows[r][a] * (weights[r] * inv)
-                        acc = term if acc is None else acc + term
-                    pterm = pv[a] * (weights[epi.nvb] * inv)
-                    mix.append(pterm if acc is None else pterm + acc)
+            if kw:
+                # KW path: the nvb+1 normalised softmax weights are already
+                # published by wave 0 (read_hip.cuh mix). The wave-0 softmax
+                # folded the 1/denom in, so these weights sum to 1 -- no inv here.
+                mix = []
+                for a in range_constexpr(epi.atoms):
+                    with fx.fastmath("contract"):
+                        acc = None
+                        for r in range_constexpr(epi.nvb):
+                            term = rows[r][a] * kw_weights[r]
+                            acc = term if acc is None else acc + term
+                        pterm = pv[a] * kw_weights[epi.nvb]
+                        mix.append(pterm if acc is None else pterm + acc)
+            else:
+                n_rows = epi.nvb + 1
+                bank_scores = [
+                    _buffer_load(
+                        self.score_buf,
+                        tile * fx.Int32(epi.nvb) + fx.Int32(j),
+                        1,
+                        fx.Float32,
+                    )[0]
+                    for j in range_constexpr(epi.nvb)
+                ]
+                scores = bank_scores + [prefix_score]
+                m = scores[0]
+                for r in range_constexpr(1, n_rows):
+                    m = (scores[r] > m).select(scores[r], m)
+                weights = [fmath.exp(s - m) for s in scores]
+                denom = None
+                for r in range_constexpr(epi.nvb):
+                    denom = weights[r] if denom is None else denom + weights[r]
+                inv = fx.Float32(1.0) / (denom + weights[epi.nvb])
+                mix = []
+                for a in range_constexpr(epi.atoms):
+                    with fx.fastmath("contract"):
+                        acc = None
+                        for r in range_constexpr(epi.nvb):
+                            term = rows[r][a] * (weights[r] * inv)
+                            acc = term if acc is None else acc + term
+                        pterm = pv[a] * (weights[epi.nvb] * inv)
+                        mix.append(pterm if acc is None else pterm + acc)
 
         done_m = None
         if merge:
@@ -1015,11 +1160,25 @@ class _BoundOneShotAttnRes:
             else:
                 lds2 = None
                 if const_expr(epi.n_waves > 1):
-                    lds2 = _LdsWindow(
-                        self.lds,
-                        color * fx.Int32(epi.slots_per_color)
-                        + fx.Int32(epi.n_score_sums * epi.n_waves),
-                    )
+                    if kw:
+                        # KW's colour block is wider (slots_per_color_kw) and its
+                        # first n_score_sums*n_waves slots hold the prefix dot/sq
+                        # partials, the next nvb+1 the weights; put the out-norm
+                        # sq partials after both so they never alias. There is a
+                        # barrier between the weight read and this reduce.
+                        lds2 = _LdsWindow(
+                            self.lds,
+                            color * fx.Int32(epi.slots_per_color_kw)
+                            + fx.Int32(
+                                epi.n_score_sums * epi.n_waves + epi.kw_weight_slots
+                            ),
+                        )
+                    else:
+                        lds2 = _LdsWindow(
+                            self.lds,
+                            color * fx.Int32(epi.slots_per_color)
+                            + fx.Int32(epi.n_score_sums * epi.n_waves),
+                        )
                 total = block_reduce_add(
                     [local], tid=self.tid, block=epi.block, lds=lds2
                 )[0]
