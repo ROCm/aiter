@@ -36,9 +36,9 @@ Per-thread layout (single wave64, BLOCK_THREADS=64):
     arrays carried across K iterations via scf.for loop-carried state.
 
 Two-phase K loop (matches Triton perf split):
-  Phase 1 (state cache): k ? [0, window_len) -- dynamic bound, scf.for with
-    loop-carry. Each iter loads kv_state/score_state at ``s = pos - K + 1 + k``,
-    masking padding (s < 0) via ``select(is_padding, NEG_INF, score_b)``.
+  Phase 1 (state cache): pool kv_state/score_state up to window_len.
+    The single-wave path masks both scores and values for negative source
+    positions; the K-split path skips those padding iterations entirely.
   Phase 2 (ragged input): k ? [window_len, K) -- dynamic start, constexpr end.
     Each iter loads kv_in/score_in/ape, then ``score_k = score_a + ape_v``.
 
@@ -1517,23 +1517,14 @@ def _build_kernel_ksplit(
 
             def _phase1_loads(k_i32):
                 s = position - (K - 1) + fx.Int32(k_i32)
-                is_pad = s < fx.Int32(0)
-                s_safe = is_pad.select(fx.Int32(0), s)
-                ring = fx.Int32(s_safe) % state_size
+                ring = fx.Int32(s) % state_size
                 col_off = _col_off_for_k(k_i32)
                 # Slot term already folded into the descriptor base.
                 base_kv = ring * kv_state_pos_stride + col_off + lid_x_vec
                 base_sc = ring * score_state_pos_stride + col_off + lid_x_vec
                 kv_v = _load_f32_vec(kv_state_buf, base_kv, VEC)
                 sc_v = _load_f32_vec(score_state_buf, base_sc, VEC)
-                sc_pad = [
-                    is_pad.select(c_neg_inf, fx.Float32(sc_v[i])) for i in range(VEC)
-                ]
-                # A masked score alone does not protect 0 * NaN/Inf.
-                kv_pad = [
-                    is_pad.select(c_zero_f32, fx.Float32(kv_v[i])) for i in range(VEC)
-                ]
-                return kv_pad, sc_pad
+                return kv_v, sc_v
 
             def _phase2_loads(k_i32):
                 col_off = _col_off_for_k(k_i32)
@@ -1562,9 +1553,11 @@ def _build_kernel_ksplit(
             init_w = [c_zero_f32 for _ in range(VEC)]
             init_state = init_m + init_kv + init_w
 
-            # Phase 1 sub-loop [k_start, split): state cache.
+            # Skip negative history in each wave's state-cache sub-loop.
+            # Empty waves retain (-inf, 0, 0) for the cross-wave reduction.
+            first_state_k = fx.max(k_start, fx.Int32(K - 1) - position)
             p1 = init_state
-            for k_static, state in range(k_start, split, 1, init=init_state):
+            for k_static, state in range(first_state_k, split, 1, init=init_state):
                 m_lane = list(state[0:VEC])
                 kv_lane = list(state[VEC : 2 * VEC])
                 w_lane = list(state[2 * VEC : 3 * VEC])
@@ -2680,6 +2673,8 @@ def flydsl_fused_compress_attn(
         preshuffle=preshuffle,
         rms_weight_is_bf16=_rms_weight_is_bf16,
         rms_eps=float(rms_eps),
+        # The short CSA group-FP8 window is faster without input prefetch.
+        enable_prefetch_input=not _is_csa_main_nm,
         quant_mode=_mode,  # single selector: none|per_row_fp8|group_fp8|fp4
         quant_group_size=64,
     )

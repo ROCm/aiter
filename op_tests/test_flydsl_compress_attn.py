@@ -861,12 +861,19 @@ def test_csa_padding_state(quant_mode, num_waves, plan_capacity):
     cos = torch.ones((16, 32), device=device, dtype=torch.bfloat16)
     sin = torch.zeros_like(cos)
 
-    def run(position, fill):
+    def run(position, fill, window_len=4):
         state.fill_(fill)
-        # Positions -4..-1 are padding at the first compression boundary.
-        # Position 7 instead consumes real history at positions 0..3.
-        state_scores.fill_(float("nan") if position == 3 else 0.0)
-        plan[0] = torch.tensor([3, 0, position, 4], device=device, dtype=torch.int32)
+        # At position 3, the first overlap half covers padding positions -4..-1.
+        # The second half can hold valid history as window_len grows past 4.
+        if position == 3:
+            state[:, :, 512:] = 0.0
+        # Position 7 instead consumes real history from the poisoned first half.
+        state_scores.zero_()
+        if position == 3:
+            state_scores[:, :, :512] = float("nan")
+        plan[0] = torch.tensor(
+            [3, 0, position, window_len], device=device, dtype=torch.int32
+        )
         cache = torch.zeros(
             (1, 64, 512),
             device=device,
@@ -900,25 +907,31 @@ def test_csa_padding_state(quant_mode, num_waves, plan_capacity):
         index = position // 4
         return cache[0, index].cpu(), rope[0, index].cpu()
 
-    expected_bytes = None
-    for fill in (0.0, float("nan"), float("inf"), -float("inf")):
-        output, rope_output = run(3, fill)
-        bits = output.view(torch.uint8)
-        if quant_mode == "none":
-            assert torch.isfinite(output).all()
-            # Scores and APE are zero: the four valid values have equal weight.
-            pooled = kv[:, 512:].float().cpu().mean(dim=0)
-            expected = pooled * torch.rsqrt(pooled.square().mean() + 1e-6)
-            torch.testing.assert_close(output.float(), expected, rtol=0.01, atol=0.02)
-        else:
-            assert torch.isfinite(output[:448].float()).all()
-            assert (bits[448:462] != 255).all()
-            assert torch.isfinite(rope_output).all()
-        actual_bytes = (bits, rope_output.view(torch.uint8))
-        if expected_bytes is None:
-            expected_bytes = actual_bytes
-        else:
-            assert all(torch.equal(a, b) for a, b in zip(actual_bytes, expected_bytes))
+    for window_len in (4, 5, 7, 8):
+        expected_bytes = None
+        for fill in (0.0, float("nan"), float("inf"), -float("inf")):
+            output, rope_output = run(3, fill, window_len)
+            bits = output.view(torch.uint8)
+            if quant_mode == "none":
+                assert torch.isfinite(output).all()
+                # Four valid positions have equal weight; state values are zero.
+                # Increasing window_len replaces a prefix of kv with that state.
+                pooled = kv[window_len - 4 :, 512:].float().cpu().sum(dim=0) / 4
+                expected = pooled * torch.rsqrt(pooled.square().mean() + 1e-6)
+                torch.testing.assert_close(
+                    output.float(), expected, rtol=0.01, atol=0.02
+                )
+            else:
+                assert torch.isfinite(output[:448].float()).all()
+                assert (bits[448:462] != 255).all()
+                assert torch.isfinite(rope_output).all()
+            actual_bytes = (bits, rope_output.view(torch.uint8))
+            if expected_bytes is None:
+                expected_bytes = actual_bytes
+            else:
+                assert all(
+                    torch.equal(a, b) for a, b in zip(actual_bytes, expected_bytes)
+                )
 
     # The same physical state becomes semantically valid at the next boundary.
     # It must still affect the result, including propagating a genuine NaN.
@@ -1038,7 +1051,7 @@ def main():
             ("none", "group_fp8"), (1, 2, 4), (1, 128, 2048)
         ):
             test_csa_padding_state(quant_mode, num_waves, plan_capacity)
-        aiter.logger.info("CSA padding state: 18 regression cases passed")
+        aiter.logger.info("CSA padding state: 18 cases x 4 history windows passed")
 
     # --- Table 1: bf16/fp8 compress_attn sweep (decode + prefill) ---
     main_rows = []
