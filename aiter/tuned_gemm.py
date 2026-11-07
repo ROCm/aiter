@@ -24,6 +24,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from aiter import dtypes, gemm_a16w16_asm, hipb_create_extension, hipb_mm, logger
+from aiter.execution_context import get_execution_phase, get_execution_role
 from aiter.jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG
 from aiter.jit.utils.build_targets import base_gfx_arch
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
@@ -243,6 +244,205 @@ def get_GEMM_A16W16_tuned_config(
     return None
 
 
+_EXECUTION_PHASE_INVARIANT_N = 4096
+_EXECUTION_PHASE_INVARIANT_K = 1536
+
+
+def _is_execution_phase_invariant_shape(
+    *,
+    N: int,
+    K: int,
+    bias: bool,
+    dtype: str,
+    otype: str,
+    scaleAB: bool,
+    bpreshuffle: bool,
+) -> bool:
+    return (
+        N == _EXECUTION_PHASE_INVARIANT_N
+        and K == _EXECUTION_PHASE_INVARIANT_K
+        and not bias
+        and str(dtype) == str(dtypes.bf16)
+        and str(otype) == str(dtypes.bf16)
+        and not scaleAB
+        and not bpreshuffle
+    )
+
+
+def _get_execution_phase_invariant_config(
+    *,
+    M: int,
+    N: int,
+    K: int,
+    bias: bool,
+    dtype: str,
+    otype: str,
+    scaleAB: bool,
+    bpreshuffle: bool,
+    execution_role: str | None,
+    execution_phase: str | None,
+    gfx: str,
+    cu_num: int,
+) -> dict | None:
+    """Use one reduction family for full and cache-reuse target prefills."""
+    if (
+        gfx != "gfx950"
+        or cu_num != 256
+        or execution_role != "target"
+        or execution_phase != "prefill"
+        or not _is_execution_phase_invariant_shape(
+            N=N,
+            K=K,
+            bias=bias,
+            dtype=dtype,
+            otype=otype,
+            scaleAB=scaleAB,
+            bpreshuffle=bpreshuffle,
+        )
+    ):
+        return None
+    # These non-split OPUS tiles and ASM use the same reduction order.
+    if M <= 1536 and _opus_launch is not None:
+        from aiter.ops.opus.policy import resolve_a16w16_tuned_candidate
+
+        kid = 138 if M <= 1024 else 137
+        resolved = resolve_a16w16_tuned_candidate(
+            arch=gfx,
+            M=M,
+            N=N,
+            K=K,
+            batch=1,
+            cu_num=cu_num,
+            has_bias=bias,
+            input_dtype=dtypes.bf16,
+            output_dtype=dtypes.bf16,
+            requested_kid=kid,
+            requested_split_k=0,
+        )
+        if resolved is not None:
+            tile_m = 128 if kid == 138 else 192
+            return {
+                "libtype": "opus",
+                "solidx": int(resolved.resolved_kid),
+                "splitK": 0,
+                "kernelName": (
+                    f"opus_gemm_mono_tile_512x{tile_m}x128x64_"
+                    "2x4_16x16x32_0x0x0_nooob_4g_safe"
+                ),
+                "_selection_source": "execution_phase_invariant_family",
+            }
+    return {
+        "libtype": "asm",
+        "solidx": 10,
+        "splitK": 1,
+        "kernelName": "_ZN5aiter24bf16gemm_bf16_tn_256x256E",
+        "_selection_source": "execution_phase_invariant_family",
+    }
+
+
+def _config_identity(config: dict) -> tuple[str, str, str]:
+    return (
+        str(config.get("libtype")),
+        str(config.get("solidx")),
+        str(config.get("splitK")),
+    )
+
+
+def _log_shadowed_tuned_config(
+    *,
+    M: int,
+    N: int,
+    K: int,
+    bias: bool,
+    dtype: str,
+    otype: str,
+    scaleAB: bool,
+    bpreshuffle: bool,
+    gfx: str,
+    cu_num: int,
+    selected: dict,
+) -> None:
+    """Name the tuned row that the invariant-family early return shadows."""
+    try:
+        tuned = get_GEMM_A16W16_tuned_config(
+            M, N, K, bias, dtype, otype, scaleAB, bpreshuffle, gfx, cu_num
+        )
+    except Exception:  # noqa: BLE001 - diagnostics must not change dispatch
+        logger.debug("could not resolve the shadowed tuned row", exc_info=True)
+        return
+    if tuned is None or _config_identity(tuned) == _config_identity(selected):
+        return
+    logger.info(
+        "execution_phase invariant family shadows tuned row: "
+        "shape=(%d,%d,%d), gfx=%s, cu_num=%d, selected=%s/%s/splitK=%s "
+        "(%s), tuned=%s/%s/splitK=%s, kernel=%s",
+        M,
+        N,
+        K,
+        gfx,
+        cu_num,
+        selected.get("libtype"),
+        selected.get("solidx"),
+        selected.get("splitK"),
+        selected.get("_selection_source", "unknown"),
+        tuned.get("libtype"),
+        tuned.get("solidx"),
+        tuned.get("splitK"),
+        tuned.get("kernelName", ""),
+    )
+
+
+_warned_execution_phase_gate_misses: set[tuple[str, int]] = set()
+
+
+def _warn_execution_phase_gate_miss(
+    *,
+    M: int,
+    N: int,
+    K: int,
+    bias: bool,
+    dtype: str,
+    otype: str,
+    scaleAB: bool,
+    bpreshuffle: bool,
+    execution_role: str | None,
+    execution_phase: str | None,
+    gfx: str,
+    cu_num: int,
+) -> None:
+    """Warn once when target/prefill opts in outside the invariant scope."""
+    if (
+        execution_role != "target"
+        or execution_phase != "prefill"
+        or not _is_execution_phase_invariant_shape(
+            N=N,
+            K=K,
+            bias=bias,
+            dtype=dtype,
+            otype=otype,
+            scaleAB=scaleAB,
+            bpreshuffle=bpreshuffle,
+        )
+        or (gfx == "gfx950" and cu_num == 256)
+    ):
+        return
+    key = (gfx, cu_num)
+    if key in _warned_execution_phase_gate_misses:
+        return
+    _warned_execution_phase_gate_misses.add(key)
+    logger.warning(
+        "execution_role('target') and execution_phase('prefill') are set for "
+        "M=%d, N=%d, K=%d, but the invariant family requires gfx950 with 256 "
+        "CUs (got gfx=%s, cu_num=%d); dispatch falls back to the tuned/default "
+        "path.",
+        M,
+        N,
+        K,
+        gfx,
+        cu_num,
+    )
+
+
 @functools.lru_cache(maxsize=4096)
 def get_GEMM_A16W16_config(
     M: int,
@@ -255,9 +455,56 @@ def get_GEMM_A16W16_config(
     bpreshuffle: bool = False,
     gfx: str | None = None,
     cu_num: int | None = None,
+    execution_role: str | None = None,
+    execution_phase: str | None = None,
 ):
     cu_num = get_cu_num() if cu_num is None else cu_num
     gfx = get_gfx() if gfx is None else gfx
+    phase_config = _get_execution_phase_invariant_config(
+        M=M,
+        N=N,
+        K=K,
+        bias=bias,
+        dtype=dtype,
+        otype=otype,
+        scaleAB=scaleAB,
+        bpreshuffle=bpreshuffle,
+        execution_role=execution_role,
+        execution_phase=execution_phase,
+        gfx=gfx,
+        cu_num=cu_num,
+    )
+    if phase_config is not None:
+        if AITER_LOG_TUNED_CONFIG:
+            _log_shadowed_tuned_config(
+                M=M,
+                N=N,
+                K=K,
+                bias=bias,
+                dtype=dtype,
+                otype=otype,
+                scaleAB=scaleAB,
+                bpreshuffle=bpreshuffle,
+                gfx=gfx,
+                cu_num=cu_num,
+                selected=phase_config,
+            )
+        return phase_config
+    if execution_role == "target" and execution_phase == "prefill":
+        _warn_execution_phase_gate_miss(
+            M=M,
+            N=N,
+            K=K,
+            bias=bias,
+            dtype=dtype,
+            otype=otype,
+            scaleAB=scaleAB,
+            bpreshuffle=bpreshuffle,
+            execution_role=execution_role,
+            execution_phase=execution_phase,
+            gfx=gfx,
+            cu_num=cu_num,
+        )
     config = get_GEMM_A16W16_tuned_config(
         M, N, K, bias, dtype, otype, scaleAB, bpreshuffle, gfx, cu_num
     )
@@ -444,6 +691,8 @@ def _gemm_a16w16(
         bpreshuffle=bpreshuffle,
         gfx=gfx,
         cu_num=cu_num,
+        execution_role=get_execution_role(),
+        execution_phase=get_execution_phase(),
     )
     libtype = config["libtype"]
     solution_idx = config["solidx"]
