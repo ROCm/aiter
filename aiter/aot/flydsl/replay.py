@@ -194,7 +194,12 @@ def replay_job(
     started = time.time()
     with requested_kernels() as kernels:
         try:
-            with dry_run(arch, int(job.get("cu_num") or 0), python_ops=True):
+            with dry_run(
+                arch,
+                int(job.get("cu_num") or 0),
+                python_ops=True,
+                num_xcds=job.get("num_xcds"),
+            ):
                 module.replay(job)
             result["compile_time"] = time.time() - started
         except NotImplementedError as error:
@@ -296,7 +301,12 @@ def _kernel_sets(module: Any, job: dict, sizes: range) -> dict:
     # The runtime warns at every untuned size, and a scan visits thousands.
     logger.setLevel(logging.ERROR)
     try:
-        with dry_run(arch, int(job.get("cu_num") or 0), python_ops=True):
+        with dry_run(
+            arch,
+            int(job.get("cu_num") or 0),
+            python_ops=True,
+            num_xcds=job.get("num_xcds"),
+        ):
             for size in sizes:
                 with identified_kernels() as kernels:
                     try:
@@ -522,8 +532,63 @@ def _jobs(module: Any, csv_paths: list[str], args: argparse.Namespace | None) ->
     the defaults), else ``parse_csv`` over every path."""
     collect = getattr(module, "collect_jobs", None)
     if collect is not None:
-        return collect(csv_paths, args)
-    return collect_aot_jobs(csv_paths, module.parse_csv)
+        jobs = collect(csv_paths, args)
+    else:
+        jobs = collect_aot_jobs(csv_paths, module.parse_csv)
+    return _with_xcd_variants(module, jobs)
+
+
+# Real parts per arch as (XCDs, CUs). The XCD count is a compile-time kernel kwarg
+# (part of the cache key) that the runtime reads from the device, and a tuned row
+# is looked up by (gfx, cu_num), so a part is identified by both. Sources: the
+# GPU hardware specifications of rocm.docs.amd.com (CU counts; 38 CUs per XCD on
+# gfx942, 32 on gfx950) and ROCm/aiter PR #6327 (MI308X has 4 XCDs). The CU counts
+# match ``GFX_CU_NUMS_MAP`` in aiter/jit/utils/build_targets.py (cross-checked by
+# tests/test_flydsl_aot_replay.py).
+DEVICE_PARTS = {
+    "gfx942": (
+        (8, 304),  # MI300X, MI325X
+        (6, 228),  # MI300A
+        (4, 80),  # MI308X
+    ),
+    "gfx950": (
+        (8, 256),  # MI350X, MI355X
+        (4, 128),  # MI350P
+    ),
+}
+
+
+def _with_xcd_variants(module: Any, jobs: list[dict]) -> list[dict]:
+    """Fork each job that names no ``num_xcds`` into one job per real part of
+    its arch (``DEVICE_PARTS``), for the arches in ``module.XCD_VARIANTS``. The
+    count is a compile-time kernel kwarg, so every part is its own cache entry.
+
+    A job carrying a ``cu_num`` (a tuned row) forks only to the parts with that
+    CU count, and a cu_num that no part has raises rather than replaying with
+    whatever XCD count the host reports. A job without one forks to every part
+    of the arch and takes its ``cu_num`` from it."""
+    arches = getattr(module, "XCD_VARIANTS", None)
+    if not arches:
+        return jobs
+    default = _default_arch(module)
+    out = []
+    for job in jobs:
+        arch = job_arch(job, default)
+        if "num_xcds" in job or arch not in arches:
+            out.append(job)
+            continue
+        parts = DEVICE_PARTS[arch]
+        cu_num = int(job.get("cu_num") or 0)
+        if cu_num:
+            parts = tuple(p for p in parts if p[1] == cu_num)
+            if not parts:
+                raise ValueError(
+                    f"no part of {arch} with cu_num={cu_num} in replay.DEVICE_PARTS; "
+                    "add it there with its XCD count"
+                )
+        for xcds, cus in parts:
+            out.append({**job, "num_xcds": xcds, "cu_num": cus})
+    return out
 
 
 def _child_env(module: Any, csv_paths: list[str]) -> dict[str, str] | None:

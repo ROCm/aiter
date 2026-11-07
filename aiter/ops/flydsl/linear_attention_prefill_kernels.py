@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import csv
 import functools
+import itertools
 import math
 import os
 import warnings
@@ -27,6 +28,8 @@ import triton
 from flydsl.runtime.device import get_rocm_arch
 
 from aiter.jit.core import AITER_CONFIGS
+from aiter.jit.utils.chip_info import get_num_xcds
+from aiter.ops.prefill_batch_metadata import PrefillBatchLayout, _tensor_version
 
 from ..triton._triton_kernels.gated_delta_net.utils import (
     GatedDeltaRulePrefillMetadata,
@@ -36,6 +39,7 @@ from ..triton._triton_kernels.gated_delta_net.utils import (
     prepare_rebased_cu_seqlens,
 )
 from .kernels.gdr_prefill import compile_gdn_prepare
+from .kernels.gdr_prefill.chunk_gated_delta_h import PHASE_BUILD_MAP, PHASE_EMIT
 from .kernels.tensor_shim import _run_compiled
 
 # log2(e); g pre-scaled by this constant lets the kernel use exp2(g) in
@@ -139,9 +143,11 @@ def _hipeq_varlen_host_metadata(chunk_offsets: torch.Tensor) -> tuple[int, int]:
 # -- Hidden-state host wrapper (K5 opt kernel) ---------------------------
 _OPT_MIN_FLYDSL_VERSION = "0.2.0"
 
-# gfx942 gate for SCHED_GFX942; normalize feature-suffixed arch strings first.
+# Arch gates: gfx942 enables SCHED_GFX942, gfx950 enables the blocked prefill
+# path. Normalize feature-suffixed arch strings first.
 _GFX_ARCH = get_rocm_arch().split(":")[0]
 _IS_GFX942 = _GFX_ARCH.startswith("gfx942")
+_IS_GFX950 = _GFX_ARCH.startswith("gfx950")
 
 # Host-path knobs. Heavy dtype/shape/device audit is off by default; set
 # ``AITER_K5_OPT_CHECK=1`` to enable it. k/w/u must still be contiguous.
@@ -288,6 +294,7 @@ def _tuned_bv(
 
 _INT32_ATTR = "_flydsl_int32_view"
 _PROLOGUE_ATTR = "_flydsl_prologue_cache"
+_ADAPTIVE_K5_META_ATTR = "_aiter_gdn_k5_adaptive_meta"
 
 
 def _as_int32(t: torch.Tensor) -> torch.Tensor:
@@ -375,6 +382,135 @@ def _resolve_prologue(
     return result
 
 
+def _gdn_k5_sequence_lengths(cu_seqlens, T, prefill_metadata=None):
+    if cu_seqlens is None:
+        return (T,)
+    if prefill_metadata is not None:
+        return prefill_metadata.layout.seq_lens_cpu
+    bounds = cu_seqlens.tolist()
+    if bounds[0] != 0 or bounds[-1] != T:
+        raise ValueError("Blocked cu_seqlens must span the packed input.")
+    return tuple(end - start for start, end in itertools.pairwise(bounds))
+
+
+# Chunk size the GDN K5 schedules are built for.
+_GDN_CHUNK_SIZE = 64
+# Target number of blocks per sequence; the per-sequence block size is the
+# sequence's chunk count divided by this.
+_GDN_K5_TARGET_SEGMENTS = 8
+# The blocked path needs at least this many chunks in the longest sequence.
+# Blocked loses on balanced two-sequence splits under ~96 chunks ([4064,4065],
+# [3000,5129]) and wins from 97.
+_BLOCKED_MIN_CHUNKS = 96
+# Floor on per-sequence block size: keeps short sequences in a mixed batch from
+# fragmenting into many tiny blocks, so each sequence's partition depends only on
+# its own length.
+_BLOCKED_MIN_BLOCK_CHUNKS = 12
+# Upper bound on (blocks x heads) per longest-sequence chunk. Serial K5 costs
+# ~1.6 us/chunk of the longest sequence; blocked ~0.18 us/block/head plus a
+# ~25-chunk carry pass. gfx950 break-even is work ratio ~9; 6 leaves margin and
+# bounds scratch.
+_BLOCKED_MAX_WORK_PER_CHUNK = 6
+
+
+@functools.lru_cache(maxsize=32)
+def _dense_k5_metadata(device, T, H):
+    """Gated schedule/metadata for dense input, one sequence ``[0, T]``."""
+    cu_seqlens = torch.tensor([0, T], device=device, dtype=torch.int32)
+    return _resolve_adaptive_k5_metadata(
+        cu_seqlens,
+        T,
+        device,
+        _GDN_K5_TARGET_SEGMENTS,
+        lengths=(T,),
+        num_heads=H,
+    )
+
+
+def _resolve_adaptive_k5_metadata(
+    cu_seqlens, T, device, target_segments, *, lengths=None, num_heads=None
+):
+    """Resolve adaptive schedules without retaining cu_seqlens.
+
+    With ``num_heads`` set, also applies the blocked-path gate (positive lengths,
+    longest sequence >= ``_BLOCKED_MIN_CHUNKS`` chunks, bounded work ratio) on host
+    lengths before any schedule tensor is built, and returns None on rejection.
+    Host lengths and the verdict are cached on ``cu_seqlens``, so a warm call
+    does no device-to-host copy.
+    """
+    if target_segments <= 0:
+        raise ValueError("`target_segments` must be positive.")
+    if lengths is not None:
+        lengths = tuple(lengths)
+    if cu_seqlens is None:
+        return _dense_k5_metadata(device, T, num_heads)
+    cache_key = (_GDN_CHUNK_SIZE, T, target_segments, num_heads)
+    version = _tensor_version(cu_seqlens)
+    cached = getattr(cu_seqlens, _ADAPTIVE_K5_META_ATTR, None)
+    hit = (
+        cached is not None
+        and cached[0] == cache_key
+        and cached[1] == version
+        and (lengths is None or cached[2] == lengths)
+    )
+    if hit:
+        lengths, schedule = cached[2], cached[3]
+        if schedule is None:
+            return None
+        return GatedDeltaRulePrefillMetadata(
+            layout=PrefillBatchLayout(
+                seq_lens_cpu=lengths,
+                cu_seqlens=cu_seqlens,
+                cu_seqlens_version=version,
+                kernel_cu_seqlens=schedule.kernel_cu_seqlens,
+            ),
+            schedule=schedule,
+        )
+    if lengths is None:
+        lengths = _gdn_k5_sequence_lengths(cu_seqlens, T)
+    block_chunks_per_seq = [
+        max(
+            _BLOCKED_MIN_BLOCK_CHUNKS,
+            triton.cdiv(triton.cdiv(length, 64), target_segments),
+        )
+        for length in lengths
+    ]
+    metadata = None
+    if num_heads is not None:
+        chunk_counts = [triton.cdiv(length, 64) for length in lengths]
+        total_blocks = sum(
+            triton.cdiv(count, size)
+            for count, size in zip(chunk_counts, block_chunks_per_seq)
+        )
+        if not (
+            all(length > 0 for length in lengths)
+            and max(chunk_counts) >= _BLOCKED_MIN_CHUNKS
+            and total_blocks * num_heads
+            <= _BLOCKED_MAX_WORK_PER_CHUNK * max(chunk_counts)
+        ):
+            block_chunks_per_seq = None
+    if block_chunks_per_seq is not None:
+        metadata = build_gated_delta_rule_prefill_metadata(
+            lengths,
+            cu_seqlens=cu_seqlens,
+            block_chunks_per_seq=block_chunks_per_seq,
+        )
+    try:
+        object.__setattr__(
+            cu_seqlens,
+            _ADAPTIVE_K5_META_ATTR,
+            (
+                cache_key,
+                version,
+                lengths,
+                metadata.schedule if metadata is not None else None,
+            ),
+        )
+    except (AttributeError, TypeError):
+        pass
+    return metadata
+
+
 def _resolve_state_dtype(initial_state, state_dtype):
     """Resolve/validate the SSM state dtype (float32 or bfloat16)."""
     if initial_state is not None:
@@ -427,13 +563,16 @@ def _get_or_compile_opt(
     g_head_major=False,
     bf16_convert_trunc=True,
     snapshot_bf16=True,
+    phase=PHASE_EMIT,
+    block_entry_seed=False,
+    num_xcds=1,
 ):
     """Compile (and cache) the K5 opt kernel: 16x16x16 bf16
     MFMA + HIP-matching warp partition, writing the public VK layout [..., V, K].
 
     ``snapshot_bf16`` selects the per-chunk ``h`` snapshot specialization and
     joins the cache key, so the bf16 and fp32 snapshot variants are separate
-    compiled products and the bf16 one keeps its emitted code.
+    compiled products. Map construction and emit have separate specializations.
 
     ``use_state_indices`` compiles the indexed state-pool variant: the SSM
     ``initial_state`` is a pool ``[pool_size, H, V, K]`` and each sequence's slot
@@ -478,6 +617,9 @@ def _get_or_compile_opt(
         SCHED_GFX942=sched_gfx942,
         G_HEAD_MAJOR=g_head_major,
         BF16_CONVERT_TRUNC=bf16_convert_trunc,
+        PHASE=phase,
+        BLOCK_ENTRY_SEED=block_entry_seed,
+        NUM_XCDS=num_xcds,
     )
 
 
@@ -756,7 +898,6 @@ def chunk_gated_delta_rule_fwd_h_flydsl_opt(
     else:
         si_i32 = None
 
-    # BV: tuned table, then hip LDS/CU rule; env override wins last.
     if is_varlen:
         _total_chunks, _max_seq_chunks = (
             host_chunk_meta
@@ -765,6 +906,85 @@ def chunk_gated_delta_rule_fwd_h_flydsl_opt(
         )
     else:
         _total_chunks, _max_seq_chunks = B * NT, NT
+    if g is not None:
+        if _opt_check():
+            if g.device != k.device:
+                raise ValueError(
+                    f"FlyDSL K5 opt: g must be on k's device ({k.device}), "
+                    f"got {g.device}."
+                )
+            if g.dim() != 3:
+                raise ValueError(
+                    f"FlyDSL K5 opt: `g` must be 3-D, got shape {tuple(g.shape)}."
+                )
+            expected_g_shape = (B, H, T_flat) if g_head_major else (B, T_flat, H)
+            if tuple(g.shape) != expected_g_shape:
+                layout = (
+                    "head-major [B, H, T]" if g_head_major else "token-major [B, T, H]"
+                )
+                raise ValueError(
+                    f"FlyDSL K5 opt: `g` shape mismatch, expected "
+                    f"{expected_g_shape} for {layout} layout, got {tuple(g.shape)}."
+                )
+        if g.dtype != torch.float32:
+            g = g.to(torch.float32)
+        g = _as_contiguous(g)
+
+    if gk is not None:
+        gk = _as_contiguous(gk)
+        if g_log2_scaled:
+            gk = gk * _RCP_LN2
+
+    if (
+        B == 1
+        and use_g
+        and not use_gk
+        and K == V == 128
+        and BT == 64
+        and num_decodes == num_decode_tokens == 0
+        and not use_state_indices
+        and _total_chunks >= _BLOCKED_MIN_CHUNKS
+        and k.dtype == w.dtype == u.dtype == torch.bfloat16
+        and snapshot_bf16
+        and output_final_state
+        and save_new_value
+        and not inplace
+        and g_head_major
+        and use_exp2
+        and bf16_convert_trunc
+        and k.is_cuda
+        and _IS_GFX950
+        and not torch.cuda.is_current_stream_capturing()
+    ):
+        # Shared prefill metadata carries no per-sequence blocks, so build them
+        # from the host lengths.
+        adaptive_metadata = _resolve_adaptive_k5_metadata(
+            cu_seqlens,
+            T_flat,
+            k.device,
+            _GDN_K5_TARGET_SEGMENTS,
+            # Dense input is one sequence; passing it spares the resolver a
+            # device-to-host read of its placeholder cu_seqlens.
+            lengths=(
+                prefill_metadata.layout.seq_lens_cpu
+                if prefill_metadata is not None
+                else (T_flat,) if cu_seqlens is None else None
+            ),
+            num_heads=H,
+        )
+        if adaptive_metadata is not None:
+            return _chunk_gated_delta_rule_fwd_h_blocked(
+                k,
+                w,
+                u,
+                g,
+                initial_state,
+                cu_seqlens=cu_seqlens,
+                prefill_metadata=adaptive_metadata,
+                state_dtype=resolved_state_dtype,
+            )
+
+    # BV: tuned table, then hip LDS/CU rule; env override wins last.
     BV = _tuned_bv(
         H=H,
         Hg=Hg,
@@ -795,6 +1015,8 @@ def chunk_gated_delta_rule_fwd_h_flydsl_opt(
     # SCHED_GFX942 is only enabled on gfx942; other arches (incl. gfx950) pass
     # False, keeping their emitted code byte-identical, and it joins the
     # lru_cache key as a distinct compiled product.
+    # The XCD count only reorders work-groups (each is still visited once), so a
+    # wrong count costs L2 locality only; the default of 8 picks a prebuilt AOT variant.
     launch_fn = _get_or_compile_opt(
         K,
         V,
@@ -816,6 +1038,8 @@ def chunk_gated_delta_rule_fwd_h_flydsl_opt(
         g_head_major=g_head_major,
         bf16_convert_trunc=bf16_convert_trunc,
         snapshot_bf16=snapshot_bf16,
+        phase=PHASE_EMIT,
+        num_xcds=get_num_xcds(),
     )
 
     dummy, int32_dummy = _placeholder_pair(k.device)
@@ -835,35 +1059,6 @@ def chunk_gated_delta_rule_fwd_h_flydsl_opt(
     fs_shape = (N, H, V, K) if output_final_state else None
     fs_dtype = resolved_state_dtype if output_final_state else None
     save_vn = save_new_value
-
-    if g is not None:
-        if _opt_check():
-            if g.device != k.device:
-                raise ValueError(
-                    f"FlyDSL K5 opt: g must be on k's device ({k.device}), "
-                    f"got {g.device}."
-                )
-            if g.dim() != 3:
-                raise ValueError(
-                    f"FlyDSL K5 opt: `g` must be 3-D, got shape {tuple(g.shape)}."
-                )
-            expected_g_shape = (B, H, T_flat) if g_head_major else (B, T_flat, H)
-            if tuple(g.shape) != expected_g_shape:
-                layout = (
-                    "head-major [B, H, T]" if g_head_major else "token-major [B, T, H]"
-                )
-                raise ValueError(
-                    f"FlyDSL K5 opt: `g` shape mismatch, expected "
-                    f"{expected_g_shape} for {layout} layout, got {tuple(g.shape)}."
-                )
-        if g.dtype != torch.float32:
-            g = g.to(torch.float32)
-        g = _as_contiguous(g)
-
-    if gk is not None:
-        gk = _as_contiguous(gk)
-        if g_log2_scaled:
-            gk = gk * _RCP_LN2
 
     h = k.new_empty(h_shape, dtype=resolved_snapshot_dtype)
     v_new_buf = k.new_empty(vn_shape, dtype=vn_dtype)
@@ -913,6 +1108,275 @@ def chunk_gated_delta_rule_fwd_h_flydsl_opt(
     )
 
     return h, (v_new_buf if save_vn else None), final_state
+
+
+def _build_chunk_gdn_block_maps(
+    k: torch.Tensor,
+    w: torch.Tensor,
+    u: torch.Tensor,
+    g: torch.Tensor | None,
+    *,
+    prefill_metadata: GatedDeltaRulePrefillMetadata,
+    bv: int = 64,
+    out: torch.Tensor,
+    stream,
+) -> torch.Tensor:
+    """Build packed fp32 [Aᵀ,Cᵀ] maps with request-aligned blocks.
+
+    BF16-rounded basis states and reassociation approximate serial recurrence.
+    """
+    B, T, Hg, K = k.shape
+    H, V = u.shape[1], u.shape[-1]
+    schedule = prefill_metadata.get_chunk_schedule(64)
+    if B != 1 or T == 0 or schedule.total_prefill_tokens != T:
+        raise ValueError("Block-map operands must match the packed prefill schedule.")
+    if K != 128 or V != 128 or bv not in (16, 32, 64) or H % Hg:
+        raise ValueError("Unsupported block-map geometry.")
+    if w.shape != (1, H, T, K) or u.shape != (1, H, T, V):
+        raise ValueError("Block-map w/u must be head-major.")
+    if any(t.dtype != torch.bfloat16 or t.device != k.device for t in (k, w, u)):
+        raise ValueError("Block-map operands must be colocated bf16 tensors.")
+    if g is not None and (g.shape != (1, H, T) or g.device != k.device):
+        raise ValueError("Block-map g must be colocated head-major [1,H,T].")
+    if g is not None:
+        g = _require_contiguous(g, "g")
+        if g.dtype != torch.float32:
+            raise ValueError("Block-map g must be fp32.")
+    k, w = _require_contiguous(k, "k"), _require_contiguous(w, "w")
+    u = _require_contiguous(u, "u")
+    blocks = schedule.total_blocks
+    # The first K columns of the map propagate the homogeneous basis state,
+    # which needs no stored u; the remaining V columns carry the real forcing.
+    packed_v = K + V
+    maps = out
+    dummy, int_dummy = _placeholder_pair(k.device)
+    launch = _get_or_compile_opt(
+        K,
+        packed_v,
+        64,
+        bv,
+        H,
+        Hg,
+        g is not None,
+        False,
+        False,
+        True,
+        False,
+        True,
+        True,
+        g_head_major=True,
+        g_log2_scaled=True,
+        phase=PHASE_BUILD_MAP,
+        num_xcds=get_num_xcds(),
+    )
+    _run_compiled(
+        launch,
+        k,
+        u,
+        w,
+        dummy,
+        g if g is not None else dummy,
+        dummy,
+        dummy,
+        dummy,
+        maps,
+        schedule.kernel_cu_seqlens,
+        schedule.chunk_offsets,
+        int_dummy,
+        schedule.block_seq_id,
+        schedule.block_chunk_base,
+        schedule.block_nchunks,
+        blocks,
+        T,
+        T,
+        schedule.n_prefill,
+        packed_v // bv,
+        blocks * H,
+        stream,
+    )
+    return maps
+
+
+@functools.lru_cache(maxsize=32)
+def _get_or_compile_chunk_gdn_carry(
+    heads: int, use_initial_state: bool, state_bf16: bool = False, num_xcds: int = 1
+):
+    from .kernels.gdr_prefill.chunk_gdn_carry_gfx950 import compile_chunk_gdn_carry
+
+    return compile_chunk_gdn_carry(
+        H=heads,
+        use_initial_state=use_initial_state,
+        STATE_DTYPE_BF16=state_bf16,
+        NUM_XCDS=num_xcds,
+    )
+
+
+def _carry_chunk_gdn_block_maps(
+    maps: torch.Tensor,
+    initial_state: torch.Tensor | None = None,
+    *,
+    prefill_metadata: GatedDeltaRulePrefillMetadata,
+    out: torch.Tensor,
+    stream,
+) -> torch.Tensor:
+    """Scan request-local maps into fp32 [blocks,H,K,V] entries.
+
+    Initial state retains public [N,H,V,K] layout; final map exits are unused.
+    """
+    schedule = prefill_metadata.get_chunk_schedule(64)
+    requests = schedule.n_prefill
+    K = V = 128
+    if maps.ndim != 4 or maps.shape[0] < 1 or maps.shape[1] < 1:
+        raise ValueError("Carry requires nonempty [blocks,H,K+V,K] maps.")
+    blocks, heads = maps.shape[:2]
+    if maps.shape != (blocks, heads, K + V, K):
+        raise ValueError("Carry requires packed maps with K=V=128.")
+    if maps.dtype != torch.float32:
+        raise ValueError("Carry maps must be fp32 tensors.")
+    if not maps.is_cuda or not _IS_GFX950:
+        raise ValueError("Block-map carry currently supports gfx950 only.")
+    maps = _require_contiguous(maps, "maps")
+    if initial_state is not None:
+        if (
+            initial_state.shape != (requests, heads, K, V)
+            or initial_state.dtype not in (torch.float32, torch.bfloat16)
+            or initial_state.device != maps.device
+        ):
+            raise ValueError(
+                "Carry initial_state must be colocated fp32/bf16 [N,H,V,K]."
+            )
+        initial_state = _require_contiguous(initial_state, "initial_state")
+    entry = out
+    if blocks != schedule.total_blocks or schedule.block_prefix.device != maps.device:
+        raise ValueError("Carry maps must match the block schedule.")
+    launch = _get_or_compile_chunk_gdn_carry(
+        heads,
+        initial_state is not None,
+        initial_state is not None and initial_state.dtype is torch.bfloat16,
+        get_num_xcds(),
+    )
+    _run_compiled(
+        launch,
+        maps,
+        initial_state if initial_state is not None else maps,
+        entry,
+        schedule.block_prefix,
+        blocks,
+        requests,
+        stream,
+    )
+    return entry
+
+
+def _chunk_gated_delta_rule_fwd_h_blocked(
+    k: torch.Tensor,
+    w: torch.Tensor,
+    u: torch.Tensor,
+    g: torch.Tensor | None,
+    initial_state: torch.Tensor | None = None,
+    *,
+    cu_seqlens: torch.Tensor | None = None,
+    prefill_metadata: GatedDeltaRulePrefillMetadata | None = None,
+    state_dtype: torch.dtype = torch.float32,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Approximate serial recurrence with BF16-rounded maps and FP32 carry.
+
+    Inputs use public k and head-major w/u, with log2-scaled head-major g.
+    ``prefill_metadata`` must carry per-sequence blocks and no empty sequence.
+    The final state has dtype ``state_dtype``; h is bf16 and v_new matches u.
+    """
+    if k.ndim != 4 or k.shape[0] != 1:
+        raise ValueError("Blocked emit requires packed [1,T,Hg,K] input.")
+    _, T, Hg, K = k.shape
+    if prefill_metadata is None:
+        raise ValueError("Blocked emit requires prefill_metadata.")
+    if 0 in prefill_metadata.layout.seq_lens_cpu:
+        raise ValueError("Blocked emit does not support empty sequences.")
+    if cu_seqlens is not None:
+        prefill_metadata.layout.validate(cu_seqlens)
+    schedule = prefill_metadata.get_chunk_schedule(64)
+    if schedule.kernel_cu_seqlens.device != k.device:
+        raise ValueError("Blocked metadata must be on the input device.")
+    blocks = schedule.total_blocks
+    map_bv = 64
+    bv = 64
+    H, V = u.shape[1], u.shape[-1]
+    stream = torch.cuda.current_stream(k.device)
+    # Per-call allocation: the caching allocator reuses it safely in stream order and
+    # framework memory profiling sees it.
+    maps_buf = torch.empty((blocks, H, K + V, K), device=k.device, dtype=torch.float32)
+    entry_buf = torch.empty((blocks, H, K, V), device=k.device, dtype=torch.float32)
+    maps = _build_chunk_gdn_block_maps(
+        k,
+        w,
+        u,
+        g,
+        prefill_metadata=prefill_metadata,
+        bv=map_bv,
+        out=maps_buf,
+        stream=stream,
+    )
+    entry = _carry_chunk_gdn_block_maps(
+        maps,
+        initial_state,
+        prefill_metadata=prefill_metadata,
+        out=entry_buf,
+        stream=stream,
+    )
+    h = torch.empty(
+        (1, schedule.total_chunks, H, V, K), device=k.device, dtype=torch.bfloat16
+    )
+    v_new = torch.empty_like(u)
+    final_state = torch.empty(
+        (schedule.n_prefill, H, V, K), device=k.device, dtype=state_dtype
+    )
+    dummy, int_dummy = _placeholder_pair(k.device)
+    launch = _get_or_compile_opt(
+        K,
+        V,
+        64,
+        bv,
+        H,
+        Hg,
+        g is not None,
+        False,
+        True,
+        True,
+        True,
+        True,
+        True,
+        g_head_major=True,
+        g_log2_scaled=True,
+        block_entry_seed=True,
+        state_bf16=(state_dtype is torch.bfloat16),
+        num_xcds=get_num_xcds(),
+    )
+    _run_compiled(
+        launch,
+        k,
+        u,
+        w,
+        v_new,
+        g if g is not None else dummy,
+        dummy,
+        h,
+        entry,
+        final_state,
+        schedule.kernel_cu_seqlens,
+        schedule.chunk_offsets,
+        int_dummy,
+        schedule.block_seq_id,
+        schedule.block_chunk_base,
+        schedule.block_nchunks,
+        blocks,
+        T,
+        T,
+        schedule.n_prefill,
+        V // bv,
+        blocks * H,
+        stream,
+    )
+    return h, v_new, final_state
 
 
 # -- GDN prepare host wrapper (single fused FlyDSL kernel) -----------------

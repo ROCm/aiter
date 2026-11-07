@@ -41,6 +41,10 @@ _DTYPES = ("torch.bfloat16", "torch.float16")
 # widest BV, as the work per CU only grows.
 _MAX_SEQUENCES = 8192
 _G_HEAD_MAJOR = (False, True)
+# Arches whose tuned rows replay forks by XCD count (``replay.DEVICE_PARTS``).
+# NUM_XCDS is a kernel kwarg and so part of the cache key; each row forks only to
+# the part with its (gfx, cu_num), so a row serves the one part it was tuned on.
+XCD_VARIANTS = ("gfx942", "gfx950")
 
 
 def _bool(value: str | None, default: bool) -> bool:
@@ -181,9 +185,10 @@ def describe(job: dict) -> str:
         )
         if job[name]
     )
+    xcds = f" num_xcds={job['num_xcds']}" if job.get("num_xcds") else ""
     return (
         f"chunk_gdn_h_opt K={job['K']} V={job['V']} BT={job['BT']} H={job['H']} "
-        f"Hg={job['Hg']} {job['dtype']} {batch} {flags}"
+        f"Hg={job['Hg']} {job['dtype']} {batch} {flags}{xcds}"
     )
 
 

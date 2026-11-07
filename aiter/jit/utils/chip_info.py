@@ -750,7 +750,13 @@ def get_num_xcds(default: int | None = 8) -> int:
     failure logged once; pass default=None to raise instead, as any caller whose
     correctness or identity depends on the count must. A HIP runtime that lacks
     the attribute (before 7.0) also returns the default, or raises without one.
+
+    ``AITER_NUM_XCDS`` overrides the query. Only an AOT replay sets it, to
+    compile for a part other than the build host (as it sets ``CU_NUM``).
     """
+    faked = os.getenv("AITER_NUM_XCDS")
+    if faked:
+        return int(faked)
     try:
         device_id = get_current_hip_device()
         if device_id is None:
