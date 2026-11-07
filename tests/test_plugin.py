@@ -1031,3 +1031,43 @@ def test_a_name_enabled_without_an_installed_provider_says_so(monkeypatch):
     assert plugin.explain("test.add", 2, 3).declines == {
         "ghost": "enabled but not installed"
     }
+
+
+def test_the_environment_cannot_enable_a_provider(monkeypatch):
+    """The asymmetry this interface rests on: the environment only subtracts.
+
+    Enablement names an owner, so it has one mechanism that records one. If
+    AITER_PLUGIN_ENABLE is ever read again, this is what catches it -- without
+    it the claim lives only in a commit message.
+    """
+
+    provider = _Provider("aklr", _candidate("aklr"))
+    monkeypatch.setattr(
+        plugin, "_entry_points", lambda: (_EntryPoint("aklr", provider),)
+    )
+    for name in ("AITER_PLUGIN_ENABLE", "AITER_PLUGIN_FORCE", "AITER_PLUGIN_DISABLE"):
+        monkeypatch.setenv(name, "aklr")
+    add = _route_add([])
+
+    assert add(2, 3) == 5, "a provider the environment named must not serve"
+    decision = plugin.last_decision()
+    assert decision.route == "native"
+    assert decision.config_source == "default-deny"
+    assert provider.select_calls == 0
+
+
+def test_the_environment_can_still_stop_an_enabled_provider(monkeypatch):
+    """The other half: what configure() turned on, the operator can turn off."""
+
+    provider = _Provider("aklr", _candidate("aklr"))
+    monkeypatch.setattr(
+        plugin, "_entry_points", lambda: (_EntryPoint("aklr", provider),)
+    )
+    plugin.configure(enable=("aklr",), source="test")
+    add = _route_add([])
+    assert add(2, 3) == 100, "serving, so the next assertion means something"
+
+    monkeypatch.setenv("AITER_PLUGINS", "0")
+    plugin.reload_config()
+
+    assert add(2, 3) == 5, "the kill switch outranks the framework default"
