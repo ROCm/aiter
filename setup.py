@@ -493,6 +493,7 @@ setup_requires = [
     "ninja",
     "setuptools_scm",
     "vcs_versioning",  # transitive dep of setuptools_scm>=10
+    "jinja2",
 ]
 if PREBUILD_KERNELS != 0:
     setup_requires.append("pandas")
@@ -513,6 +514,7 @@ else:
         "einops",
         "psutil",
         "packaging",
+        "jinja2",
         *FLYDSL_REQUIRES,
     ]
 

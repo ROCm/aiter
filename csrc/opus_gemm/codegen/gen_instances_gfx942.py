@@ -24,6 +24,7 @@ from codegen.common import (
     splitk_workspace_type,
     write_if_changed,
 )
+from codegen.template_env import render as render_template
 
 
 # gfx942 pipeline header helper. Paired splitK tags reuse their nosplit
@@ -358,177 +359,32 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
     }}}}
     }}}}
 """
-    INSTANCE_IMPL = f"""// SPDX-License-Identifier: MIT
-// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
-#pragma once
-#if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
-#include "aiter_tensor.h"
-#include "aiter_stream.h"
-#include "opus_gemm_common.cuh"
-#include <optional>
-#include <type_traits>
-#endif
-#ifdef OPUS_FUSED_HOST_TU
-#include "{traits_header}"
-{kernel_fwd_decl}
-#else
-#include "{pipeline_header}"
-#endif
-{traits_aliases}
-#if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
-template <typename D_C>
-void
-{k.name}(
-    aiter_tensor_t &XQ,
-    aiter_tensor_t &WQ,
-    aiter_tensor_t &Y,
-    aiter_tensor_t &workspace,
-    std::optional<aiter_tensor_t> bias,
-    int splitK)
-{{{{
-    static_assert(std::is_same<D_C, fp32_t>::value,
-    "{err_label} split_k launcher uses the fp32 launch-dispatch table");
-
-    int batch = XQ.size(0);
-    int M = XQ.size(1);
-    int N = WQ.size(1);
-    int K = XQ.size(2);
-
-{bf16ws_host_guard}
-{bf16_y_check}
-    AITER_CHECK(Y.dtype() == AITER_DTYPE_bf16
-            || Y.dtype() == AITER_DTYPE_fp32,
-    "{err_label} requires Y dtype bf16 or fp32");
-    AITER_CHECK(M >= 1 && N >= 1 && K >= 1 && batch >= 1,
-    "M, N, K, batch must be >= 1");
-    AITER_CHECK(K % 2 == 0,
-    "K=", K, " must be even (a16w16 family rejects odd K due to a "
-    "latent K-tail accumulation bug; pass an even K)");
-    // The gfx942 a16w16 splitk pipeline does not yet implement mask_va_tail
-    // (the per-lane K-tail zeroing that gfx950's flatmm_splitk uses). When
-    // K is not a multiple of B_K the last K-tile's buffer_load wraps past
-    // the row into the next M-row's data, corrupting the accumulator
-    // (observed max|err|~44 on bf16). Reject K%B_K!=0 until the
-    // mask_va_tail port lands; callers must pad K to a multiple of B_K.
-    AITER_CHECK(K % {k.B_K} == 0,
-    "K=", K, " must be a multiple of B_K={k.B_K} for {err_label} "
-    "(K-tail masking not yet implemented on gfx942 splitk)");
-{BIAS_HOST_VALIDATE}
-    using Traits = {k.name}_Traits<D_C>;
-
-    // splitK semantics for gfx942 splitk launchers:
-    //   splitK >  1 -> caller-pinned (tuner / explicit override). Used verbatim
-    //                  (subject to the iters-per-split auto-clamp below).
-    //   splitK <= 0 -> caller wants the launcher to auto-pick. Production
-    //                  dispatcher (opus_gemm.cu) takes this path so the call
-    //                  site stays gfx950-style (`fn(..., 0)`) without
-    //                  arch-aware splitK plumbing leaking up.
-    //   splitK == 1 -> caller explicitly requested no K-split. Honored.
-    int split_k;
-    if (splitK > 0) {{{{
-    split_k = splitK;
-    }}}} else {{{{
-    // Auto-pick: target ~1 WG per CU. cu_num cached thread_local so we
-    // do not pay hipGetDeviceProperties on every launch.
-    static thread_local int cu_cached = -1;
-    if (cu_cached < 0) {{{{
-        int dev = 0;
-        hipDeviceProp_t prop{{{{}}}};
-        if (hipGetDevice(&dev) == hipSuccess &&
-            hipGetDeviceProperties(&prop, dev) == hipSuccess) {{{{
-            cu_cached = prop.multiProcessorCount;
-        }}}}
-        if (cu_cached <= 0) cu_cached = 64;  // safe gfx942 lower bound
-    }}}}
-    const size_t tiles_mn = opus_checked_extent_product(
-        {{static_cast<size_t>(1 + (M - 1) / {k.B_M}),
-          static_cast<size_t>(1 + (N - 1) / {k.B_N}),
-          static_cast<size_t>(batch)}},
-        "{k.name} launch grid");
-    // P1 variant wants 2 wg/CU co-residency for TLP -> aim for 2x cu_num grid.
-    int target_wg_dbuf2 = {"2 * cu_cached" if k.kernel_tag.endswith("_p1") else "cu_cached"};
-    split_k = static_cast<int>(
-        1 + (static_cast<size_t>(target_wg_dbuf2) - 1) / tiles_mn);
-    if (split_k < 1)  split_k = 1;
-    if (split_k > {GFX942_MAX_AUTO_SPLIT_K})
-        split_k = {GFX942_MAX_AUTO_SPLIT_K};  // tuner enumeration ceiling
-    }}}}
-
-    // Host-side auto-clamp: split-barrier pipeline requires at least 2
-    // K-tile iterations per split (one in LDS + one prefetched). Applies to
-    // both caller-pinned and auto-picked split_k. P1 (depth=2 K-dbuf) additionally
-    // requires loops even per split.
-    int total_iters = (K + {k.B_K} - 1) / {k.B_K};
-    constexpr int min_iters_per_split = {GFX942_MIN_ITERS_PER_SPLIT};
-    constexpr bool require_even_loops_dbuf2 = {"true" if k.kernel_tag in GFX942_EVEN_LOOP_SPLITK_TAGS else "false"};
-    while (split_k > 1) {{{{
-    int iters_full = (total_iters + split_k - 1) / split_k;
-    int last_loops = total_iters - (split_k - 1) * iters_full;
-    bool parity_ok = !require_even_loops_dbuf2
-                   || (iters_full % 2 == 0 && last_loops % 2 == 0);
-    if (iters_full >= min_iters_per_split && last_loops >= min_iters_per_split && parity_ok) break;
-    split_k--;
-    }}}}
-    AITER_CHECK(total_iters >= min_iters_per_split,
-    "K=", K, " too small for {err_label} B_K={k.B_K}: need K >= ",
-    {k.B_K} * min_iters_per_split);
-    if (require_even_loops_dbuf2) {{{{
-    int iters_full = (total_iters + split_k - 1) / split_k;
-    int last_loops = total_iters - (split_k - 1) * iters_full;
-    AITER_CHECK(iters_full % 2 == 0 && last_loops % 2 == 0,
-        "{err_label} needs even loops per split; K=", K,
-        " split_k=", split_k, " gives loops=(", iters_full, ",", last_loops, ")");
-    }}}}
-
-    int num_tiles_m = 1 + (M - 1) / {k.B_M};
-    int num_tiles_n = 1 + (N - 1) / {k.B_N};
-    const size_t padded_M_size = opus_checked_extent_product(
-        {{static_cast<size_t>(num_tiles_m), static_cast<size_t>({k.B_M})}},
-        "{k.name}");
-    const size_t padded_N_size = opus_checked_extent_product(
-        {{static_cast<size_t>(num_tiles_n), static_cast<size_t>({k.B_N})}},
-        "{k.name}");
-    const size_t workspace_slice_numel = opus_checked_extent_product(
-        {{padded_M_size, padded_N_size}}, "{k.name}");
-    AITER_CHECK(padded_M_size <= static_cast<size_t>(std::numeric_limits<int>::max())
-                    && padded_N_size <= static_cast<size_t>(std::numeric_limits<int>::max())
-                    && workspace_slice_numel <= static_cast<size_t>(std::numeric_limits<int>::max()),
-        "{k.name}: padded workspace extents exceed 32-bit kernel stride limits");
-    int padded_M = static_cast<int>(padded_M_size);
-    int padded_N = static_cast<int>(padded_N_size);
-
-    const size_t required_numel = opus_checked_extent_product(
-        {{static_cast<size_t>(split_k), static_cast<size_t>(batch),
-          workspace_slice_numel}},
-        "{k.name}");
-    void* workspace_ptr_ = opus_validate_workspace(
-        workspace, XQ, {workspace_aiter_dtype}, required_numel, 16, "{k.name}");
-    auto stream = aiter::getCurrentHIPStream();
-
-    {kargs_name} kargs{{{{}}}};
-    kargs.ptr_a         = XQ.data_ptr();
-    kargs.ptr_b         = WQ.data_ptr();
-    kargs.ptr_ws        = workspace_ptr_;
-    kargs.ptr_c         = Y.data_ptr();
-    kargs.ptr_bias      = ptr_bias_;
-    kargs.m = M; kargs.n = N; kargs.k = K; kargs.batch = batch;
-    kargs.split_k = split_k;
-    kargs.stride_a        = XQ.stride(1);
-    kargs.stride_b        = WQ.stride(1);
-    kargs.stride_ws       = padded_N;
-    kargs.stride_c        = N;
-    kargs.stride_a_batch  = XQ.stride(0);
-    kargs.stride_b_batch  = WQ.stride(0);
-    kargs.stride_ws_batch = static_cast<int>(workspace_slice_numel);
-    kargs.stride_c_batch  = M * N;
-    kargs.stride_bias_batch = stride_bias_batch_;
-    dim3 grid_main(num_tiles_m * num_tiles_n * split_k, 1, batch);
-    dim3 block_main({k.BLOCK_SIZE});
-
-{kernel_launch_body}{reduce_launch}
-}}}}
-#endif // launcher only on regular host pass
-"""
+    INSTANCE_IMPL = render_template(
+        "gfx942_splitk_launcher.cuh.j2",
+        traits_header=traits_header,
+        pipeline_header=pipeline_header,
+        kernel_fwd_decl=kernel_fwd_decl,
+        traits_aliases=traits_aliases,
+        name=k.name,
+        err_label=err_label,
+        bf16ws_host_guard=bf16ws_host_guard,
+        bf16_y_check=bf16_y_check,
+        B_K=k.B_K,
+        bias_host_validate=BIAS_HOST_VALIDATE,
+        B_M=k.B_M,
+        B_N=k.B_N,
+        target_wg_expr="2 * cu_cached" if k.kernel_tag.endswith("_p1") else "cu_cached",
+        max_auto_split_k=GFX942_MAX_AUTO_SPLIT_K,
+        min_iters_per_split=GFX942_MIN_ITERS_PER_SPLIT,
+        require_even_loops=(
+            "true" if k.kernel_tag in GFX942_EVEN_LOOP_SPLITK_TAGS else "false"
+        ),
+        workspace_aiter_dtype=workspace_aiter_dtype,
+        kargs_name=kargs_name,
+        BLOCK_SIZE=k.BLOCK_SIZE,
+        kernel_launch_body=kernel_launch_body,
+        reduce_launch=reduce_launch,
+    )
     write_if_changed(os.path.join(cg.impl_path, f"{k.name}.cuh"), INSTANCE_IMPL)
 
     record_one_instantiation(
@@ -591,46 +447,22 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
         kernel_func,
         fwd_decl_kargs_fnarg,
     )
-    INSTANCE_IMPL = f"""{preamble}
-{host_tu_split}
-{traits_aliases}
-#if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
-template <typename D_C>
-void
-{k.name}(
-    aiter_tensor_t &XQ,
-    aiter_tensor_t &WQ,
-    aiter_tensor_t &Y{extra_param})
-{{{{
-    int batch = XQ.size(0);
-    int M = XQ.size(1);
-    int N = WQ.size(1);
-    int K = XQ.size(2);
-{k_check}
-    {kargs_name} kargs{{}};
-    kargs.ptr_a = XQ.data_ptr();
-    kargs.ptr_b = WQ.data_ptr();
-    kargs.ptr_c = Y.data_ptr();
-    kargs.m = M;
-    kargs.n = N;
-    kargs.k = K;
-    kargs.batch = batch;
-    kargs.stride_a = XQ.stride(1);
-    kargs.stride_b = WQ.stride(1);
-    kargs.stride_c = N;
-    kargs.stride_a_batch = XQ.stride(0);
-    kargs.stride_b_batch = WQ.stride(0);
-    kargs.stride_c_batch = M * N;
-{bias_kargs_block}
-    int num_tiles_m = (M + {k.B_M} - 1) / {k.B_M};
-    int num_tiles_n = (N + {k.B_N} - 1) / {k.B_N};
-{grid_decl}
-    dim3 block({k.BLOCK_SIZE});
-{launch_block}
-
-}}}}
-#endif // launcher only on regular host pass
-"""
+    INSTANCE_IMPL = render_template(
+        "gfx942_a16w16_launcher.cuh.j2",
+        preamble=preamble,
+        host_tu_split=host_tu_split,
+        traits_aliases=traits_aliases,
+        name=k.name,
+        extra_param=extra_param,
+        k_check=k_check,
+        kargs_name=kargs_name,
+        bias_kargs_block=bias_kargs_block,
+        B_M=k.B_M,
+        B_N=k.B_N,
+        grid_decl=grid_decl,
+        BLOCK_SIZE=k.BLOCK_SIZE,
+        launch_block=launch_block,
+    )
     write_if_changed(os.path.join(cg.impl_path, f"{k.name}.cuh"), INSTANCE_IMPL)
 
     inst_extra_param = (
@@ -897,104 +729,20 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
     dim3 block({k.BLOCK_SIZE});
     {kernel_func}<{k.name}_Traits<D_C>><<<grid, block, 0, stream>>>(kargs);
 """
-    INSTANCE_IMPL = f"""{preamble}
-{host_tu_split}
-{traits_aliases}
-#if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
-template <typename D_C>
-void
-{k.name}(
-    aiter_tensor_t &XQ,
-    aiter_tensor_t &WQ,
-    aiter_tensor_t &x_scale,
-    aiter_tensor_t &w_scale,
-    aiter_tensor_t &Y)
-{{{{
-    AITER_CHECK((XQ.dim() == 2 || XQ.dim() == 3),
-        "opus_gemm_a8w8_blockscale_bpreshuffle_launch: XQ must be "
-        "[M,K] or [B,M,K]");
-    AITER_CHECK((WQ.dim() == 2 || WQ.dim() == 3),
-        "opus_gemm_a8w8_blockscale_bpreshuffle_launch: WQ must be "
-        "[N,K] or [B,N,K]");
-    AITER_CHECK((Y.dim() == 2 || Y.dim() == 3),
-        "opus_gemm_a8w8_blockscale_bpreshuffle_launch: Y must be "
-        "[M,N] or [B,M,N]");
-    AITER_CHECK(XQ.dtype() == AITER_DTYPE_fp8 && WQ.dtype() == AITER_DTYPE_fp8,
-        "opus_gemm_a8w8_blockscale_bpreshuffle_launch: expected fp8 XQ/WQ");
-    AITER_CHECK(Y.dtype() == AITER_DTYPE_bf16,
-        "opus_gemm_a8w8_blockscale_bpreshuffle_launch: expected bf16 Y");
-    AITER_CHECK(XQ.is_contiguous() && WQ.is_contiguous() && Y.is_contiguous(),
-        "opus_gemm_a8w8_blockscale_bpreshuffle_launch: expects contiguous "
-        "XQ/WQ/Y");
-
-    int batch = XQ.dim() == 3 ? XQ.size(0) : 1;
-    int M = XQ.dim() == 3 ? XQ.size(1) : XQ.size(0);
-    int K = XQ.dim() == 3 ? XQ.size(2) : XQ.size(1);
-    int N = WQ.dim() == 3 ? WQ.size(1) : WQ.size(0);
-    AITER_CHECK(batch == 1,
-        "opus_gemm_a8w8_blockscale_bpreshuffle_launch: gfx942 currently "
-        "supports batch=1 only");
-    AITER_CHECK((WQ.dim() == 2 || WQ.size(0) == batch) &&
-                    (Y.dim() == 2 || Y.size(0) == batch),
-        "opus_gemm_a8w8_blockscale_bpreshuffle_launch: batch dimensions "
-        "must match");
-    AITER_CHECK(WQ.size(WQ.dim() - 1) == K,
-        "opus_gemm_a8w8_blockscale_bpreshuffle_launch: WQ K dim must "
-        "match XQ K dim");
-    AITER_CHECK((Y.dim() == 3 ? Y.size(1) : Y.size(0)) == M &&
-                (Y.dim() == 3 ? Y.size(2) : Y.size(1)) == N,
-        "opus_gemm_a8w8_blockscale_bpreshuffle_launch: Y shape must be "
-        "[M,N] or [B,M,N]");
-    AITER_CHECK(N % {k.B_N} == 0 && K % {k.B_K} == 0,
-        "opus_gemm_a8w8_blockscale_bpreshuffle_launch: gfx942 requires "
-        "exact N/K tiles: N%",
-        {k.B_N}, "=0 K%", {k.B_K}, "=0");
-
-    int GROUP_N = {k.GROUP_N};
-    int GROUP_K = {k.GROUP_K};
-    int num_groups_n = N / GROUP_N;
-    int num_groups_k = K / GROUP_K;
-
-    const auto& xs = x_scale;
-    const auto& ws = w_scale;
-    AITER_CHECK(xs.dtype() == AITER_DTYPE_fp32 && ws.dtype() == AITER_DTYPE_fp32,
-        "opus_gemm_a8w8_blockscale_bpreshuffle_launch: expects fp32 scales");
-    AITER_CHECK(xs.is_contiguous() && ws.is_contiguous(),
-        "opus_gemm_a8w8_blockscale_bpreshuffle_launch: expects contiguous "
-        "scales");
-    AITER_CHECK(xs.device_id == XQ.device_id && ws.device_id == XQ.device_id,
-        "opus_gemm_a8w8_blockscale_bpreshuffle_launch: scales must be on "
-        "the XQ device");
-    AITER_CHECK(xs.dim() == 2 && xs.size(0) == M && xs.size(1) == num_groups_k,
-        "opus_gemm_a8w8_blockscale_bpreshuffle_launch: x_scale must use "
-        "the transposed storage contract with shape [M,K/128]");
-    AITER_CHECK(ws.dim() == 2 && ws.size(0) == num_groups_n && ws.size(1) == num_groups_k,
-        "opus_gemm_a8w8_blockscale_bpreshuffle_launch: w_scale must be "
-        "row-major [N/128,K/128]");
-
-    int num_tiles_m = (M + {k.B_M} - 1) / {k.B_M};
-    int num_tiles_n = N / {k.B_N};
-    auto stream = aiter::getCurrentHIPStream();
-
-    {kargs_name} kargs{{{{}}}};
-    kargs.ptr_a = XQ.data_ptr();
-    kargs.ptr_b = WQ.data_ptr();
-    kargs.ptr_c = Y.data_ptr();
-    kargs.m = M;
-    kargs.k = K;
-    kargs.stride_a = K;
-    kargs.stride_b = K;
-    kargs.stride_c = N;
-
-    kargs.ptr_sfa = xs.data_ptr();
-    kargs.ptr_sfb = ws.data_ptr();
-    kargs.stride_sfb = num_groups_k;
-
-{kernel_launch}
-
-}}}}
-#endif // launcher only on regular host pass
-"""
+    INSTANCE_IMPL = render_template(
+        "gfx942_a8w8_bpreshuffle_launcher.cuh.j2",
+        preamble=preamble,
+        host_tu_split=host_tu_split,
+        traits_aliases=traits_aliases,
+        name=k.name,
+        B_N=k.B_N,
+        B_K=k.B_K,
+        GROUP_N=k.GROUP_N,
+        GROUP_K=k.GROUP_K,
+        B_M=k.B_M,
+        kargs_name=kargs_name,
+        kernel_launch=kernel_launch,
+    )
     write_if_changed(os.path.join(cg.impl_path, f"{k.name}.cuh"), INSTANCE_IMPL)
     record_one_instantiation(
         cg,
