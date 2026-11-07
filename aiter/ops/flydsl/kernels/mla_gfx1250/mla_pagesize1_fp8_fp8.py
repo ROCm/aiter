@@ -1236,13 +1236,26 @@ def launch_mla_pagesize1_fp8_fp8(
                         )
                     )
 
+            # The metadata planner deliberately emits one work item for a
+            # zero-length KV row. Do not issue TDM gathers for such an item:
+            # every row index would be the one-past-end `num_pages` sentinel,
+            # and the item has no tiles that can consume the gathered data.
+            has_tokens = kv_start < kv_end
             if const_expr(q_operands is None):
-                page_indices = load_prologue_page_indices(kv_start, kv_end)
-                issue_prologue(page_indices, [0])
+                # An empty item's kv_start does not address a live page-index
+                # entry and may be negative after an MTP metadata rewrite.
+                safe_kv_start = has_tokens.select(kv_start, fx.Int32(0))
+                safe_kv_end = has_tokens.select(kv_end, fx.Int32(0))
+                page_indices = load_prologue_page_indices(
+                    safe_kv_start, safe_kv_end
+                )
+                if has_tokens:
+                    issue_prologue(page_indices, [0])
                 q_operands = load_q(work_info)
-                issue_prologue(page_indices, range(1, KV_PROLOGUE_TILES))
+                if has_tokens:
+                    issue_prologue(page_indices, range(1, KV_PROLOGUE_TILES))
             else:
-                if issue_tiles:
+                if issue_tiles & has_tokens:
                     issue_prologue(
                         load_prologue_page_indices(kv_start, kv_end),
                         range(KV_PROLOGUE_TILES),
@@ -1350,7 +1363,9 @@ def launch_mla_pagesize1_fp8_fp8(
                 seed_producer_start,
                 next_in_flight.select(seed_producer_start + next_offset, kv_start),
             )
-            seed_page_indices = load_page_indices(safe_seed_start)
+            seed_page_indices = load_page_indices(
+                has_tokens.select(safe_seed_start, fx.Int32(0))
+            )
 
             last_tile_start = kv_start + (tile_count - 1) * KV_TILE_TOKENS
             full_tile_end = has_tokens.select(last_tile_start, kv_start)
