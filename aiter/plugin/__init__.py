@@ -165,6 +165,20 @@ class _Config:
 
 
 @dataclass(frozen=True, slots=True)
+class _Eligibility:
+    """Who may serve one op at one config generation, and why the rest may not.
+
+    ``reason`` is what a native route records when ``providers`` is empty; it
+    is computed here because everything it depends on is already in hand.
+    """
+
+    providers: tuple[_ProviderRecord, ...]
+    # provider name -> why it cannot serve this op, for enabled providers only
+    ineligible: Mapping[str, str]
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
 class _RoutedOp:
     """What ``route()`` registered, so routed ops are enumerable by name."""
 
@@ -209,7 +223,7 @@ _provider_lock = RLock()
 _config_snapshot: _Config | None = None
 _config_lock = RLock()
 _framework_default: _FrameworkDefault | None = None
-_eligible_cache: dict[tuple[str, int, int], tuple[_ProviderRecord, ...]] = {}
+_eligible_cache: dict[tuple[str, int, int], _Eligibility] = {}
 _FALSY = {"0", "false", "no", "off"}
 _CANONICALIZER = "_canonicalize"
 _DEFAULT_PREFIX = "__aiter_default_"
@@ -366,20 +380,16 @@ def _dispatch(
         return native(*args, **kwargs)
 
     eligible = _eligible(op, config)
-    if not eligible:
-        if _providers() and not config.enabled:
-            reason = "provider-not-enabled"
-        else:
-            reason = "no-provider"
+    if not eligible.providers:
         return _run_native(
-            op, native, args, kwargs, reason, config.source, config.generation
+            op, native, args, kwargs, eligible.reason, config.source, config.generation
         )
 
     provider_args, provider_kwargs = canonicalize(*args, **kwargs)
     readonly_kwargs = MappingProxyType(provider_kwargs)
     declined = False
     failure: tuple[str, str] | None = None
-    for record in eligible:
+    for record in eligible.providers:
         candidate, rejection = _ask_provider(record, op, provider_args, readonly_kwargs)
         if rejection is not None:
             # Isolation: this provider is unusable for this call, but it may not
@@ -522,12 +532,7 @@ def status() -> Mapping[str, Any]:
                 for skipped in _skipped_providers
             ),
             "routed_ops": {
-                name: {
-                    "version": routed.op.version,
-                    "eligible": tuple(
-                        record.name for record in _eligible(routed.op, config)
-                    ),
-                }
+                name: _described_op(routed, config)
                 for name, routed in _routed_ops.items()
             },
             "api_versions_accepted": (API_VERSION, *sorted(SUPERSEDED_API_VERSIONS)),
@@ -578,17 +583,15 @@ def explain(op: str, *args: Any, **kwargs: Any) -> Explanation:
         # Mirrors dispatch exactly: it records nothing, so neither do we.
         return Explanation(None, MappingProxyType({}))
     eligible = _eligible(operation, config, warn=False)
-    if not eligible:
-        if _providers() and not config.enabled:
-            reason = "provider-not-enabled"
-        else:
-            reason = "no-provider"
-        return _explained(operation, reason, config.source)
+    if not eligible.providers:
+        return _explained(
+            operation, eligible.reason, config.source, eligible.ineligible
+        )
 
     canonical_args, canonical_kwargs = routed.canonicalize(*args, **kwargs)
     readonly = MappingProxyType(canonical_kwargs)
-    declines: dict[str, str] = {}
-    for record in eligible:
+    declines: dict[str, str] = dict(eligible.ineligible)
+    for record in eligible.providers:
         candidate, rejection = _ask_provider(
             record, operation, canonical_args, readonly
         )
@@ -811,9 +814,7 @@ def _run_native(
     return native(*args, **kwargs)
 
 
-def _eligible(
-    op: Op, config: _Config, *, warn: bool = True
-) -> tuple[_ProviderRecord, ...]:
+def _eligible(op: Op, config: _Config, *, warn: bool = True) -> _Eligibility:
     """Cached per ``(op, config generation)``.
 
     A build race is benign: both racers compute the same value from the same
@@ -832,20 +833,82 @@ def _eligible(
     return built
 
 
-def _build_eligible(
-    op: Op, config: _Config, *, warn: bool = True
-) -> tuple[_ProviderRecord, ...]:
-    """Providers that may serve this op, in preference order."""
+def _build_eligible(op: Op, config: _Config, *, warn: bool = True) -> _Eligibility:
+    """Who may serve this op, in preference order, and why the rest may not.
+
+    The exclusions are kept rather than filtered away. A provider that is
+    installed and enabled and simply declares the wrong op version used to be
+    indistinguishable from nothing being installed at all: both answered
+    ``no-provider``, and ``explain()`` -- the read whose whole job is saying
+    why -- reported no declines. Built once per ``(op, generation)``, so the
+    detail costs the hot path nothing.
+    """
 
     # Walk the enable list, not the provider names: the enable list order is the
     # preference order, and entry-point order is environment-dependent.
     by_name = _records_by_provider_name()
-    return tuple(
-        record
-        for name in config.enabled
-        for record in by_name.get(name, ())
-        if _supports(record, op, warn=warn)
+    providers: list[_ProviderRecord] = []
+    ineligible: dict[str, str] = {}
+    installed_enabled = False
+    for name in config.enabled:
+        records = by_name.get(name, ())
+        if not records:
+            ineligible[name] = "enabled but not installed"
+            continue
+        installed_enabled = True
+        for record in records:
+            if _supports(record, op, warn=warn):
+                providers.append(record)
+            else:
+                ineligible[record.name] = _unsupported_reason(record, op)
+
+    if providers:
+        reason = "selected"
+    elif not config.enabled:
+        reason = "provider-not-enabled" if _providers() else "no-provider"
+    elif installed_enabled:
+        reason = "provider-op-unsupported"
+    else:
+        reason = "no-provider"
+    return _Eligibility(tuple(providers), MappingProxyType(ineligible), reason)
+
+
+def _unsupported_reason(record: _ProviderRecord, op: Op) -> str:
+    """Why this installed, enabled provider cannot serve ``op``."""
+
+    try:
+        served = record.provider.op_versions
+        declared = (
+            sorted(served.get(op.name, ()))
+            if isinstance(served, Mapping)
+            else (op.name in served)
+        )
+    except Exception as error:  # noqa: BLE001 - providers are an isolation boundary
+        return f"op_versions could not be read: {error}"
+    if declared is False:
+        return f"does not serve {op.name}"
+    if declared is True or not declared:
+        return f"does not serve {op.name} version {op.version}"
+    return (
+        f"serves {op.name} version{'s' if len(declared) > 1 else ''} "
+        f"{', '.join(map(str, declared))}, not {op.version}"
     )
+
+
+def _described_op(routed: _RoutedOp, config: _Config) -> dict[str, Any]:
+    """One routed op as status() reports it: who may serve, and why the rest may not.
+
+    The ineligible side is the half that is otherwise invisible -- without it an
+    enabled provider missing from the list can only be explained by reading its
+    op_versions against the contract by eye.
+    """
+
+    eligible = _eligible(routed.op, config)
+    return {
+        "version": routed.op.version,
+        "eligible": tuple(record.name for record in eligible.providers),
+        "ineligible": dict(eligible.ineligible),
+    }
 
 
 def _records_by_provider_name() -> dict[str, list[_ProviderRecord]]:
