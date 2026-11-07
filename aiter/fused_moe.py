@@ -1128,6 +1128,7 @@ def fused_moe(
     clamp_shared: bool = True,
     post_gemm2_rms_weight: torch.Tensor | None = None,
     post_gemm2_rms_eps: float = 1e-6,
+    post_gemm2_rms_zero_centered: bool = False,
 ):
     """Run fused MoE, dispatching to FHMoE when shared-expert tensors are present.
 
@@ -1143,7 +1144,11 @@ def fused_moe(
     FlyDSL AOT cache.
 
     ``post_gemm2_rms_weight`` enables GEMM2 -> per-route RMSNorm ->
-    route-weighted reduction on the gfx1250 grouped and MegaMoE paths.
+    route-weighted reduction on the gfx1250 grouped and MegaMoE paths (bf16
+    output only). The norm is input-scaled, ``rms(bf16(x * w))`` with no gain
+    after, and only routed rows are normalized.
+    ``post_gemm2_rms_zero_centered`` treats the weight as zero-centred, so
+    ``w + 1`` is applied.
 
     """
     has_shared_expert = (
@@ -1277,6 +1282,7 @@ def fused_moe(
         quant_dtype_a2=quant_dtype_a2,
         post_gemm2_rms_weight=post_gemm2_rms_weight,
         post_gemm2_rms_eps=post_gemm2_rms_eps,
+        post_gemm2_rms_zero_centered=post_gemm2_rms_zero_centered,
     )
 
 
@@ -1321,6 +1327,7 @@ def fused_moe_fake(
     quant_dtype_a2: torch.dtype | None = None,
     post_gemm2_rms_weight: torch.Tensor | None = None,
     post_gemm2_rms_eps: float = 1e-6,
+    post_gemm2_rms_zero_centered: bool = False,
 ) -> torch.Tensor:
     device = topk_ids.device
     M, _topk = topk_ids.shape
@@ -1384,6 +1391,7 @@ def fused_moe_(
     quant_dtype_a2: torch.dtype | None = None,
     post_gemm2_rms_weight: torch.Tensor | None = None,
     post_gemm2_rms_eps: float = 1e-6,
+    post_gemm2_rms_zero_centered: bool = False,
 ) -> torch.Tensor:
     stage2_scatter = None
     if ep_source_token_map is not None:
@@ -1429,6 +1437,7 @@ def fused_moe_(
         quant_dtype_a2=quant_dtype_a2,
         post_gemm2_rms_weight=post_gemm2_rms_weight,
         post_gemm2_rms_eps=post_gemm2_rms_eps,
+        post_gemm2_rms_zero_centered=post_gemm2_rms_zero_centered,
     )
 
 
@@ -1465,6 +1474,7 @@ def _fused_moe_impl(
     quant_dtype_a2: torch.dtype | None = None,
     post_gemm2_rms_weight: torch.Tensor | None = None,
     post_gemm2_rms_eps: float = 1e-6,
+    post_gemm2_rms_zero_centered: bool = False,
     *,
     _q_dtype_a: torch.dtype | None = None,
     _metadata_transform: Callable | None = None,
@@ -1527,6 +1537,10 @@ def _fused_moe_impl(
             raise ValueError(
                 "post_gemm2_rms_weight must have shape "
                 f"({model_dim},), got {tuple(post_gemm2_rms_weight.shape)}"
+            )
+        if dtype != dtypes.bf16:
+            raise TypeError(
+                f"post-GEMM2 RMSNorm supports only bfloat16 output, got {dtype}"
             )
         if post_gemm2_rms_weight.dtype != dtype:
             raise TypeError(
@@ -1605,6 +1619,7 @@ def _fused_moe_impl(
             stage2_scatter=stage2_scatter,
             post_gemm2_rms_weight=post_gemm2_rms_weight,
             post_gemm2_rms_eps=post_gemm2_rms_eps,
+            post_gemm2_rms_zero_centered=post_gemm2_rms_zero_centered,
         )
 
     if grouped_a8w4_out is not None:
@@ -5429,6 +5444,7 @@ def torch_moe_stage2(
     doweight=True,
     post_gemm2_rms_weight=None,
     post_gemm2_rms_eps=1e-6,
+    post_gemm2_rms_zero_centered=False,
 ):
     ctype = dtypes.fp32  # compute type
     E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
@@ -5538,10 +5554,14 @@ def torch_moe_stage2(
             if w2_bias is not None:
                 out[mask] = out[mask] + w2_bias[E_id].view(1, -1)
     if post_gemm2_rms_weight is not None:
+        rms_weight = post_gemm2_rms_weight.view(1, 1, model_dim).to(ctype)
+        if post_gemm2_rms_zero_centered:
+            rms_weight = rms_weight + 1.0
+        # The scaled input is rounded to bf16 once before the RMS.
+        out = (out * rms_weight).to(dtypes.bf16).to(ctype)
         out = out * torch.rsqrt(
             out.square().mean(dim=-1, keepdim=True) + float(post_gemm2_rms_eps)
         )
-        out = out * post_gemm2_rms_weight.view(1, 1, model_dim).to(ctype)
     if doweight:
         # In-place: out and topk_weights are both fp32 (ctype), so this is
         # numerically identical to `out = out * ...` but avoids allocating a

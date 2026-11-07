@@ -604,6 +604,7 @@ def _grouped_a8w4_tdm_moe(
     a1_scale=None,
     post_gemm2_rms_weight: torch.Tensor | None = None,
     post_gemm2_rms_eps: float = 1e-6,
+    post_gemm2_rms_zero_centered: bool = False,
 ):
     import functools
 
@@ -1355,16 +1356,23 @@ def _grouped_a8w4_tdm_moe(
         # MegaMoE ignores its contents and consumes comb_inp instead.
         return torch.empty((token_num, model_dim), dtype=dtype, device=device)
 
-    norm_out = grouped_out
     if post_gemm2_rms_weight is not None:
         from aiter.ops.flydsl.kernels.rmsnorm_gfx1250 import rmsnorm_flydsl_out
 
-        norm_out = torch.empty_like(grouped_out)
+        if topids_to_rows is None:
+            raise NotImplementedError(
+                "post-GEMM2 RMSNorm needs the route -> row map on this path"
+            )
+
+        grouped_rows = grouped_out.view(-1, model_dim)
         rmsnorm_flydsl_out(
-            norm_out.view(-1, model_dim),
-            grouped_out.view(-1, model_dim),
+            grouped_rows,  # norm in place
+            grouped_rows,
             post_gemm2_rms_weight,
             float(post_gemm2_rms_eps),
+            zero_centered=post_gemm2_rms_zero_centered,
+            row_map=topids_to_rows,
+            num_valid_tokens=_ep_nvt if _is_ep else None,
         )
 
     moe_out = torch.empty((token_num, model_dim), dtype=dtype, device=device)
@@ -1381,7 +1389,7 @@ def _grouped_a8w4_tdm_moe(
             else topk_weight.contiguous()
         )
     flydsl_moe_gather_reduce(
-        norm_out,
+        grouped_out,
         topids_to_rows,
         gather_w,
         out=moe_out,
@@ -1422,6 +1430,7 @@ def grouped_gemm_gfx1250_a8w4(
     a1_scale: torch.Tensor | None = None,
     post_gemm2_rms_weight: torch.Tensor | None = None,
     post_gemm2_rms_eps: float = 1e-6,
+    post_gemm2_rms_zero_centered: bool = False,
 ):
     """Grouped a8w4/a4w4 MoE on the TDM batched GEMM (gfx1250).
 
@@ -1732,6 +1741,7 @@ def grouped_gemm_gfx1250_a8w4(
             a1_scale=a1_scale,
             post_gemm2_rms_weight=post_gemm2_rms_weight,
             post_gemm2_rms_eps=post_gemm2_rms_eps,
+            post_gemm2_rms_zero_centered=post_gemm2_rms_zero_centered,
             **_tdm_kw,
         )
 

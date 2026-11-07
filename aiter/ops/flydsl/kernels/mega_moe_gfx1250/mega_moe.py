@@ -577,6 +577,7 @@ class MegaMoEGfx1250:
         stage1_fused: bool = False,
         combine_quant: str | None = None,
         post_gemm2_rmsnorm: bool = False,
+        post_gemm2_rms_zero_centered: bool = False,
     ):
         """Everything here is fixed for the whole model; forward() takes the rest.
 
@@ -650,6 +651,7 @@ class MegaMoEGfx1250:
         self.situ_beta = situ_beta
         self.situ_linear_beta = situ_linear_beta
         self.post_gemm2_rmsnorm = bool(post_gemm2_rmsnorm)
+        self.post_gemm2_rms_zero_centered = bool(post_gemm2_rms_zero_centered)
         combine_quant_value = (
             combine_quant
             if combine_quant is not None
@@ -734,7 +736,10 @@ class MegaMoEGfx1250:
 
         When ``post_gemm2_rmsnorm`` is enabled,
         ``post_gemm2_rms_weight`` contains the shared ``[model_dim]`` for
-        this layer. RMSNorm is applied to every route before ``topk_weights``.
+        this layer. The RMSNorm ``rms(bf16(x * w))`` (weight applied before the
+        norm, no gain after) is applied to every route before ``topk_weights``;
+        ``post_gemm2_rms_zero_centered`` at construction applies the weight as
+        ``w + 1``.
         """
         combine_quant_bits = self._resolve_combine_quant(combine_quant)
         if self.post_gemm2_rmsnorm:
@@ -1889,6 +1894,7 @@ class MegaMoEGfx1250:
                 strided_slots[:rows],
                 post_gemm2_rms_weight,
                 float(post_gemm2_rms_eps),
+                zero_centered=self.post_gemm2_rms_zero_centered,
             )
             combine_input = normalized.data_ptr()
             route_weights = topk_weights.data_ptr()

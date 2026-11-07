@@ -384,17 +384,23 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
             stream=0,
         )
 
-    # Optional post-GEMM2 RMSNorm.
-    rmsnorm = build_rmsnorm_gfx1250(model_dim)
-    rmsnorm(
-        0,
-        0,
-        0,
-        numel,
-        model_dim,
-        1e-6,
-        stream=0,
-    )
+    # Precompile optional RMSNorm kernel
+    for row_map in (False, True):
+        rmsnorm = build_rmsnorm_gfx1250(model_dim, row_map)
+        rmsnorm(
+            0,
+            0,
+            0,
+            0,
+            0,
+            numel,
+            model_dim,
+            model_dim,
+            topk,
+            1e-6,
+            0.0,
+            stream=0,
+        )
 
 
 def compile_one_config(**job):
