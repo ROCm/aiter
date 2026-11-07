@@ -16,6 +16,7 @@ _LINES = 64  # lines of a chunk: 2 for each lane of one wave
 _MAXIT = 20_000_000  # poll limit, some seconds: a peer can still be compiling
 _PROGRAMS = 2048  # receivers: more polling receivers can fill the GPU
 _POOLS = {}  # the IPC pool of each inbox, by its address: the pool owns the inbox
+_HIDDEN = {}  # the row size of the quant calls of each inbox, 0 without quant
 
 
 def all_reduce_init(group, max_bytes):
@@ -58,6 +59,7 @@ def all_reduce_free(group, inboxes):
     """Unmaps the peer inboxes and frees the inbox of this rank. All ranks must
     call it."""
     pool = _POOLS.pop(inboxes[dist.get_rank(group)])
+    _HIDDEN.pop(inboxes[dist.get_rank(group)], None)
     torch.cuda.synchronize()
     dist.barrier(group=group)
     pool.close_peer_buffers()
@@ -65,7 +67,7 @@ def all_reduce_free(group, inboxes):
     pool.close()
 
 
-def all_reduce(x: torch.Tensor, group, inboxes, calls) -> torch.Tensor:
+def all_reduce(x: torch.Tensor, group, inboxes, calls, quant: bool = False):
     """
     Returns the sum of the bf16 tensor x over the 4 ranks of ``group`` on gfx1250,
     with one kernel launch. All ranks get the same bits. All ranks must make the
@@ -76,29 +78,49 @@ def all_reduce(x: torch.Tensor, group, inboxes, calls) -> torch.Tensor:
             values and at most max_bytes.
         inboxes, calls: The result of ``all_reduce_init``. If a poll times out,
             the sum is wrong and calls[-1] is more than 0.
+        quant (bool): Also return q, the sum as fp8, and scale, max |row| / 448
+            for each row of the last dim: q = sum / scale. The row size is a
+            power of 2 and at least 128. The inboxes are then for the quant
+            calls of one row size only, with max_bytes of 2 rows or more.
     """
     assert x.dtype == torch.bfloat16 and x.is_contiguous() and x.numel() % 4 == 0
     chunks = (calls.numel() - 1) // 2
     n = x.numel()
     assert x.data_ptr() % 16 == 0 and n <= 6 * _LINES * chunks
+    hidden = x.shape[-1] if quant else 0
+    assert not quant or (hidden >= 128 and hidden & (hidden - 1) == 0)
+    lines = hidden // 2 if quant else _LINES  # with quant, a chunk is 3 rows
+    num_chunks = triton.cdiv(n, 6 * lines)  # 6 values a line
+    assert num_chunks * lines <= _LINES * chunks, "x is larger than max_bytes"
+    # Chunks of another size would meet old call numbers.
+    first = _HIDDEN.setdefault(inboxes[dist.get_rank(group)], hidden)
+    assert first == hidden, f"these inboxes serve hidden {first}, not {hidden}"
 
-    _LOGGER.info("ALL_REDUCE [gluon]: x=%s", x.shape)
+    _LOGGER.info("ALL_REDUCE [gluon]: x=%s quant=%s", x.shape, quant)
 
     y = torch.empty_like(x)
-    num_chunks = triton.cdiv(n, 6 * _LINES)  # 6 values a line
+    q, scale = y, y  # not used without quant
+    if quant:
+        q = torch.empty(x.shape, dtype=torch.float8_e4m3fn, device=x.device)
+        scale = torch.empty((*x.shape[:-1], 1), dtype=torch.float32, device=x.device)
     programs = min(num_chunks, _PROGRAMS)
     _all_reduce_kernel[(num_chunks + programs,)](
         x,
         y,
+        q,
+        scale,
         inboxes,
         calls,
         calls[-1:],
         n,
         programs,
         RANK=dist.get_rank(group),
-        LINES=_LINES,
+        LINES=lines,
         SLOT=4 * _LINES * chunks,
         MAXIT=_MAXIT,
-        num_warps=1,
+        QUANT=quant,
+        num_warps=min(16, lines // 64),  # 2 lines a lane
     )
+    if quant:
+        return y, q, scale
     return y
