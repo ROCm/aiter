@@ -13,8 +13,11 @@ Contract:
   same order, with the same local token count (and, ar, the same input and routing).
   Layers of one shape may share an instance (``set_weights``): their forwards form one
   collective sequence.
-* ``prepare(local_tokens)`` before CUDA graph capture: it compiles every launch config,
-  runs each once and checks every rank's watchdog (reset + retry on a timeout).
+* ``prepare(local_tokens)`` (``prepare_all()``: every count up to ``max_local_tokens``)
+  before CUDA graph capture: it compiles every launch config, runs each once and checks
+  every rank's watchdog (reset + retry on a timeout).
+* Setup failures every rank reports alike (MORI / SDMA, the IPC mapping, warmup timeouts)
+  raise ``MegaMoeSetupError`` on every rank, so the caller can fall back collectively.
 * The kernel is persistent (one CTA per CU, CTAs and ranks spin on each other): it
   needs the whole GPU. Do not run it concurrently with other kernels (other streams,
   other processes, CU-masked / partitioned GPUs).
@@ -60,6 +63,7 @@ import torch
 
 from aiter import ActivationType
 
+from ..communication import MegaMoeSetupError
 from .kernels.mega_moe_tp.bigm_compute import MegaMoeTPBigM, _kcopy
 from .kernels.mega_moe_tp.mega_moe_tp import (
     COMM_MODES,
@@ -75,6 +79,7 @@ ERR_BIGM = 32
 __all__ = [
     "COMM_MODES",
     "ERR_BIGM",
+    "MegaMoeSetupError",
     "MegaMoeTP",
     "MegaMoeTPConfig",
     "MegaMoeTPLDSError",
@@ -425,6 +430,17 @@ class MegaMoeTP:
             else:
                 self.forward(x, tw, ids)
             torch.cuda.synchronize()
+
+    def prepare_all(
+        self, tail: bool = False, tail_bf16: bool = False, warmup: bool = True
+    ) -> None:
+        """Collective: prepare() one local token count per launch variant of 1 ..
+        max_local_tokens, so no batch up to max_local_tokens compiles while serving or
+        inside CUDA graph capture."""
+        reps = {}
+        for m in range(1, self.max_local_tokens + 1):
+            reps.setdefault(self.launch_config(m), m)
+        self.prepare(sorted(reps.values()), tail, tail_bf16, warmup)
 
     @property
     def max_local_tokens(self) -> int:

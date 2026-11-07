@@ -15,6 +15,7 @@ import torch.distributed as dist
 
 from aiter.jit.core import AITER_CONFIGS
 
+from ....communication import MegaMoeSetupError
 from ...quick_allreduce_int4_ipc import UncachedIpcHeap as _Ipc
 from ..kernels_common import ceildiv
 from ..tensor_shim import _preload_compiled, _run_compiled
@@ -211,7 +212,7 @@ class SymmetricArena:
             bad = {r: e for r, e in enumerate(opened) if e}
         if bad:
             self.close()
-            raise RuntimeError(f"SymmetricArena: mapping failed on ranks {bad}")
+            raise MegaMoeSetupError(f"SymmetricArena: mapping failed on ranks {bad}")
         self._base_ptrs = tuple(ptrs)
         dist.barrier(group=self.group)
         return self
@@ -759,7 +760,9 @@ class MegaMoeTPEngine:
             if not any(errs):
                 return
             self.reset()
-        raise RuntimeError(f"MegaMoeTP.prepare: warmup launches timed out ({errs})")
+        raise MegaMoeSetupError(
+            f"MegaMoeTP.prepare: warmup launches timed out ({errs})"
+        )
 
     def _warmup(self, m: int, tn: int = 0) -> None:
         rows = m * self.tp if self.ar else m

@@ -17,6 +17,7 @@
 
 import ctypes
 import functools
+import math
 import os
 import pickle
 from contextlib import contextmanager
@@ -2591,6 +2592,83 @@ class CustomAllreduce:
 
         if view_dtype is not None and out is not None:
             out = out.view(orig_dtype)
+        return out
+
+    def registered_input_view(
+        self, shape: tuple[int, ...], dtype: torch.dtype
+    ) -> torch.Tensor | None:
+        """A ``shape``/``dtype`` view of the registered input pool, or None if
+        the pool cannot hold it or has no tensor (a raw HIP or VMM allocation).
+
+        A producer may write its result here and pass the view to a collective
+        with ``registered=True`` to skip the staging copy. The view is scratch:
+        the two must run back to back on the current stream, since the next
+        collective overwrites the pool."""
+        if self.disabled:
+            return None
+        nbytes = math.prod(shape) * dtype.itemsize
+        entry = self._pool["input"]
+        if nbytes == 0 or nbytes % 16 or nbytes > entry.max_size:
+            return None
+        if isinstance(entry, IPCBuffer):
+            storage = entry._buffer
+        else:
+            storage = getattr(entry, "tensor", None)
+        if storage is None:
+            return None
+        return storage[:nbytes].view(dtype).view(shape)
+
+    # Sync blocks of one head exchange (kMaxBlocks).
+    _HEAD_EXCHANGE_BLOCKS: ClassVar[int] = 80
+
+    def should_head_exchange(self, inp: torch.Tensor) -> bool:
+        """Whether `head_exchange` takes ``inp``: four ranks on the pre-gfx1250
+        kernel and a contiguous matrix whose rows split four ways, are a whole
+        number of 16-byte packs and fit the registered input pool."""
+        if self.disabled or self._is_gfx1250 or self.world_size != 4:
+            return False
+        if inp.dim() != 2 or not inp.is_contiguous():
+            return False
+        if inp.shape[0] % 4 or inp.shape[1] * inp.element_size() % 16:
+            return False
+        return inp.numel() * inp.element_size() <= self._pool["input"].max_size
+
+    def head_exchange(
+        self, inp: torch.Tensor, *, registered: bool = False
+    ) -> torch.Tensor:
+        """``[S, H]`` on each rank to ``[S/4, 4*H]``: this rank's quarter of the
+        rows with every rank's columns, rank-major. Each rank reads only its
+        own rows from its peers.
+
+        ``registered=True`` takes ``inp`` from `registered_input_view`. Inside
+        capture() on the registered path, ``inp`` is bound in place as well.
+        """
+        from aiter.ops.sp_head_exchange import sp_head_exchange
+
+        # The op casts the handle to the pre-gfx1250 communicator.
+        if self.disabled or self._is_gfx1250:
+            raise RuntimeError(
+                "head_exchange needs an enabled custom allreduce on the "
+                "pre-gfx1250 kernel; check should_head_exchange first"
+            )
+        out = torch.empty(
+            (inp.shape[0] // 4, inp.shape[1] * 4), dtype=inp.dtype, device=inp.device
+        )
+        if not registered and self._IS_CAPTURING:
+            registered = (
+                torch.cuda.is_current_stream_capturing()
+                and self._capture_registered(inp)
+            )
+        pool = self._pool["input"]
+        sp_head_exchange(
+            self._ptr,
+            inp,
+            out,
+            pool.data_ptr,
+            pool.max_size,
+            not registered,
+            self._HEAD_EXCHANGE_BLOCKS,
+        )
         return out
 
     # Tensors one `all_gatherv` launch takes (kAllGatherVMax).
