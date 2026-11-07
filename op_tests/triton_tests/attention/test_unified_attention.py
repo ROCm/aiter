@@ -2,21 +2,25 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+import functools
 import random
 import sys
 from types import SimpleNamespace
 
 import pytest
 import torch
+import triton
 
 from aiter.ops.triton.attention.unified_attention import (
     _is_gluon_available,
+    _length_aware_split,
     is_2d_gluon_available,
     unified_attention,
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.shuffle import shuffle_scale_batched, shuffle_weight
 from aiter.ops.triton.utils.types import e4m3_dtype
+from aiter.ops.triton.utils.unified_attention_utils import get_unified_attention_config
 from aiter.test_common import checkAllclose
 from op_tests.triton_tests.quant.test_quant_mxfp4 import (
     torch_dynamic_mxfp4_quant,
@@ -381,6 +385,25 @@ def ref_paged_attn(
     return out.to(out_dtype)
 
 
+def _assert_request_rel_l2(output, ref_output, seq_lens, bound=2e-2):
+    """Bound each request's relative L2 error against the reference.
+
+    Long-KV outputs are small, so a fixed atol would pass all-zero rows.
+    gfx950 measures ~0.0025; one dropped 64-token KV tile gives ~0.06.
+    A zero-length request (a padded slot) must give zero rows.
+    """
+    start = 0
+    for q_len, kv_len in seq_lens:
+        out_rows = output[start : start + q_len].float()
+        ref_rows = ref_output[start : start + q_len].float()
+        start += q_len
+        if kv_len == 0:
+            assert torch.equal(out_rows, torch.zeros_like(out_rows)), "kv_len 0"
+            continue
+        rel_err = ((out_rows - ref_rows).norm() / ref_rows.norm()).item()
+        assert rel_err < bound, f"kv_len {kv_len}: relative L2 error {rel_err:.4f}"
+
+
 @pytest.mark.parametrize(
     "seq_lens",
     [
@@ -552,6 +575,525 @@ def test_triton_unified_attn_3d(
         )
         <= tol_err_ratio
     )
+
+
+@pytest.mark.parametrize("captured_max_seqlen_k", [False, True])
+@torch.inference_mode()
+def test_triton_unified_attn_3d_long_kv(captured_max_seqlen_k: bool) -> None:
+    """Split-KV verify on the Kimi-K3 DSpark draft shape (head dim 64, bf16 Q, fp8 KV).
+
+    max_seqlen_k is the real maximum (20000) or the 1M bound a CUDA graph captures.
+    """
+    if DEVICE_ARCH not in ("gfx942", "gfx950", "gfx1250"):
+        pytest.skip(f"skip {DEVICE_ARCH}")
+    torch.cuda.empty_cache()
+    seq_lens = [(4, 20000), (4, 9000), (4, 300), (4, 13000)]
+    (
+        query,
+        key_cache,
+        value_cache,
+        _,
+        _,
+        _,
+        output,
+        cu_query_lens,
+        kv_lens,
+        max_query_len,
+        max_kv_len,
+        scale,
+        window_size,
+        block_tables,
+        _,
+        _,
+        q_descale,
+        k_descale,
+        v_descale,
+        _,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        num_blocks=1024,
+        block_size=128,
+        head_size=64,
+        num_heads=(8, 2),
+        q_dtype=torch.bfloat16,
+        kv_dtype=e4m3_dtype,
+        out_dtype=torch.bfloat16,
+    )
+
+    unified_attention(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=max_query_len,
+        max_seqlen_k=1 << 20 if captured_max_seqlen_k else max_kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window_size,
+        block_table=block_tables,
+        softcap=0,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+    )
+
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        query_lens=[x[0] for x in seq_lens],
+        kv_lens=kv_lens,
+        block_tables=block_tables,
+        scale=scale,
+        out_dtype=torch.bfloat16,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+    )
+
+    _assert_request_rel_l2(output, ref_output, seq_lens)
+
+
+def _length_aware_seq_lens(batch: str, query_len: int):
+    if batch in ("skewed", "skewed_300", "skewed_empty"):
+        # one long request among short ones, as a long-context draft batch; 300
+        # requests take more than one step over seq_lens in the kernels
+        rng = random.Random(7)
+        short = [
+            rng.randint(200, 3000) for _ in range(299 if batch == "skewed_300" else 31)
+        ]
+        if batch == "skewed_empty":
+            # padded slots of a CUDA graph batch have no KV
+            short = [0 if i % 8 == 0 else kv for i, kv in enumerate(short)]
+        return [(query_len, 120_000)] + [(query_len, kv) for kv in short]
+    return [(query_len, 8192)] * 32
+
+
+def _length_aware_pages(page_counts):
+    """Return a KV cache size and block table with only the pages each request uses.
+
+    Each request gets its own random pages, so skewed_300 does not need ~37 GB of K/V.
+    """
+    num_blocks = sum(page_counts) + 64  # spare pages no request owns
+    rng = torch.Generator(device="cuda").manual_seed(0)
+    block_tables = torch.randint(
+        num_blocks,
+        (len(page_counts), max(page_counts)),
+        generator=rng,
+        dtype=torch.int32,
+        device="cuda",
+    )
+    counts = torch.tensor(page_counts, device="cuda")
+    owned = torch.arange(block_tables.shape[1], device="cuda") < counts[:, None]
+    pages = torch.randperm(num_blocks, generator=rng, device="cuda")
+    block_tables[owned] = pages[: sum(page_counts)].to(torch.int32)
+    return num_blocks, block_tables
+
+
+def _use_gfx950_length_aware_split(monkeypatch) -> None:
+    """Run the gfx950 length-aware kv_split entry on gfx942 and gfx950.
+
+    Only gfx950 tunes the entry, but its kernels are plain Triton, so gfx942
+    pins the gfx950 tables to check the split there too.
+    """
+    if DEVICE_ARCH not in ("gfx942", "gfx950"):
+        pytest.skip("the length-aware kv_split entry is checked on gfx942/gfx950")
+    if DEVICE_ARCH != "gfx950":
+        module = sys.modules[unified_attention.__module__]
+        gfx950_config = functools.partial(get_unified_attention_config, arch="gfx950")
+        monkeypatch.setattr(module, "get_unified_attention_config", gfx950_config)
+
+
+@pytest.mark.parametrize(
+    "batch, num_heads, max_query_len, option, seqused_k_dtype",
+    [
+        (batch, *shape, torch.int32)
+        for shape in [
+            ((8, 2), 4, None),  # Kimi-K3 DSpark draft verify
+            ((8, 2), 1, None),
+            ((8, 1), 1, "sinks"),  # GPT-OSS TP8 full-attention decode
+        ]
+        for batch in ["skewed", "uniform", "skewed_empty"]
+    ]
+    + [("skewed_300", (8, 2), 1, None, torch.int32)]
+    # the widest verify query that still fits one block of the q >= 4 entry
+    + [("skewed", (8, 2), 8, None, torch.int32)]
+    # sglang passes int64 sequence lengths
+    + [("skewed", (8, 2), 4, None, torch.int64)]
+    # the length-aware split does not exclude these inputs
+    + [
+        ("skewed", (8, 2), 4, option, torch.int32)
+        for option in ("shuffled_kv_cache", "softcap", "qq_bias")
+    ],
+)
+@torch.inference_mode()
+def test_triton_unified_attn_3d_length_aware_split(
+    batch: str,
+    num_heads: tuple[int, int],
+    max_query_len: int,
+    option: str | None,
+    seqused_k_dtype: torch.dtype,
+    monkeypatch,
+) -> None:
+    """Length-aware KV split (kv_split SPLIT_PROGRAMS_PER_CU), head dim 64 bf16-Q / fp8-KV.
+
+    max_seqlen_k is the 1M bound a CUDA graph captures, so the grid's segment
+    count only knows the batch size; each sequence must take its own share of
+    the segments from seqused_k, and the reduce must merge exactly those.
+    """
+    _use_gfx950_length_aware_split(monkeypatch)
+    torch.cuda.empty_cache()
+    block_size = 128
+    seq_lens = _length_aware_seq_lens(batch, max_query_len)
+    num_blocks, block_tables = _length_aware_pages(
+        [triton.cdiv(kv, block_size) for _, kv in seq_lens]
+    )
+    shuffled_kv_cache = option == "shuffled_kv_cache"
+    (
+        query,
+        key_cache,
+        value_cache,
+        maybe_shuffled_key_cache,
+        maybe_shuffled_value_cache,
+        sinks,
+        output,
+        cu_query_lens,
+        kv_lens,
+        max_seqlen_q,
+        _,
+        scale,
+        window_size,
+        _,  # block_tables come from _length_aware_pages
+        _,
+        _,
+        q_descale,
+        k_descale,
+        v_descale,
+        _,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        num_blocks=num_blocks,
+        block_size=block_size,
+        head_size=64,
+        num_heads=num_heads,
+        q_dtype=torch.bfloat16,
+        kv_dtype=e4m3_dtype,
+        out_dtype=torch.bfloat16,
+        shuffled_kv_cache=shuffled_kv_cache,
+    )
+    sinks = sinks if option == "sinks" else None
+    # the scores here are ~0.1; a cap of 0.1 moves each request ~5%, past the bound
+    soft_cap = 0.1 if option == "softcap" else None
+    qq_bias = None
+    if option == "qq_bias":
+        qq_bias = torch.randn(
+            max_query_len, max_query_len, dtype=torch.float32, device="cuda"
+        )
+
+    # record the split the launcher picks
+    module = sys.modules[unified_attention.__module__]
+    launches = []
+    launch_3d = module._unified_attention_3d_triton
+
+    def spy(params, *args):
+        launches.append(args[3:])  # NUM_SEGMENTS, TILE_SIZE, length-aware split
+        return launch_3d(params, *args)
+
+    monkeypatch.setattr(module, "_unified_attention_3d_triton", spy)
+
+    output.fill_(float("nan"))  # the reduce must write every row
+    unified_attention(
+        q=query,
+        k=maybe_shuffled_key_cache,
+        v=maybe_shuffled_value_cache,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens.to(seqused_k_dtype),
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=1 << 20,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window_size,
+        block_table=block_tables,
+        softcap=soft_cap or 0,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        sinks=sinks,
+        qq_bias=qq_bias,
+        shuffled_kv_cache=shuffled_kv_cache,
+    )
+
+    # the split is length-aware, and the per-sequence counts (the kernels'
+    # seq_num_segments) differ from the cap the grid was sized for
+    assert len(launches) == 1, "expected the 3D split-KV path"
+    num_segments, _, split = launches[0]
+    assert num_segments > 1 and split is not None
+    split_budget = split.split_budget
+    kv = [k for _, k in seq_lens]
+    segment_tokens = max(triton.cdiv(sum(kv), split_budget), 1)
+    used = [min(max(k // segment_tokens, 1), num_segments) for k in kv]
+    assert sum(used) <= split_budget + len(kv) - 1
+    if batch != "uniform":
+        assert used[0] > max(used[1:]) and min(used) < num_segments, used
+    else:
+        assert len(set(used)) == 1 and used[0] < num_segments, used
+
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        query_lens=[q for q, _ in seq_lens],
+        kv_lens=kv_lens,
+        block_tables=block_tables,
+        scale=scale,
+        out_dtype=torch.bfloat16,
+        soft_cap=soft_cap,
+        sinks=sinks,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        qq_bias=qq_bias,
+    )
+
+    # a dropped or doubly merged segment moves it far past the bound
+    _assert_request_rel_l2(output, ref_output, seq_lens)
+
+
+@torch.inference_mode()
+def test_triton_unified_attn_3d_length_aware_split_graph_replay(monkeypatch) -> None:
+    """A CUDA graph captured at the 1M bound splits by the seqused_k of each replay.
+
+    A serving engine changes the lengths in place between replays, from a skewed
+    batch to a uniform one, to one with padded (zero-length) slots, and back.
+    """
+    _use_gfx950_length_aware_split(monkeypatch)
+    torch.cuda.empty_cache()
+    block_size, query_len = 128, 4
+    skewed = _length_aware_seq_lens("skewed", query_len)
+    batches = [
+        skewed,
+        _length_aware_seq_lens("uniform", query_len),
+        _length_aware_seq_lens("skewed_empty", query_len),
+        skewed,
+    ]
+    # each request keeps its pages across the replays
+    num_blocks, block_tables = _length_aware_pages(
+        [max(triton.cdiv(kv, block_size) for _, kv in r) for r in zip(*batches)]
+    )
+    (
+        query,
+        key_cache,
+        value_cache,
+        _,
+        _,
+        _,
+        output,
+        cu_query_lens,
+        kv_lens,
+        max_seqlen_q,
+        _,
+        scale,
+        window_size,
+        _,  # block_tables come from _length_aware_pages
+        _,
+        _,
+        q_descale,
+        k_descale,
+        v_descale,
+        _,
+    ) = generate_data(
+        seq_lens=skewed,
+        num_blocks=num_blocks,
+        block_size=block_size,
+        head_size=64,
+        num_heads=(8, 2),
+        q_dtype=torch.bfloat16,
+        kv_dtype=e4m3_dtype,
+        out_dtype=torch.bfloat16,
+    )
+
+    def run():
+        unified_attention(
+            q=query,
+            k=key_cache,
+            v=value_cache,
+            out=output,
+            cu_seqlens_q=cu_query_lens,
+            seqused_k=kv_lens,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=1 << 20,
+            softmax_scale=scale,
+            causal=True,
+            window_size=window_size,
+            block_table=block_tables,
+            softcap=0,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+        )
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        run()  # compile outside the capture
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+
+    for batch in batches:
+        kv = [k for _, k in batch]
+        kv_lens.copy_(torch.tensor(kv, dtype=kv_lens.dtype, device="cuda"))
+        output.fill_(float("nan"))
+        graph.replay()
+        ref_output = ref_paged_attn(
+            query=query,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            query_lens=[q for q, _ in batch],
+            kv_lens=kv,
+            block_tables=block_tables,
+            scale=scale,
+            out_dtype=torch.bfloat16,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+        )
+        _assert_request_rel_l2(output, ref_output, batch)
+
+
+def _gfx950_split(**overrides):
+    """gfx950 Triton kv_split config and params, Kimi-K3 draft decode at the 1M bound."""
+    p = {
+        "head_size": 64,
+        "head_size_v": 64,
+        "max_seqlen_q": 1,
+        "max_seqlen_k": 1 << 20,
+        "sliding_window": 0,
+        "shuffled_kv_cache": False,
+        "q_dtype": torch.bfloat16,
+        "kv_cache_dtype": e4m3_dtype,
+        "block_size": 128,
+        "num_sms": 256,
+        "num_seqs": 64,
+        "num_kv_heads": 2,
+        "num_queries_per_kv": 4,
+        "all_decode": True,
+        "skip_reduce": False,
+    }
+    p.update(overrides)
+    params = SimpleNamespace(**p, num_2d_prgms=p["num_seqs"] * p["num_kv_heads"])
+    config = get_unified_attention_config("kv_split", params, arch="gfx950")
+    return config, params
+
+
+def test_length_aware_split_scope(monkeypatch) -> None:
+    """The length-aware entry leaves every call it does not split as before."""
+    # _length_aware_split reads the attn_3d and reduce tables; pin them to gfx950
+    # like the rest
+    module = sys.modules[unified_attention.__module__]
+    gfx950_config = functools.partial(get_unified_attention_config, arch="gfx950")
+    monkeypatch.setattr(module, "get_unified_attention_config", gfx950_config)
+    config, params = _gfx950_split()
+    split = _length_aware_split(config, params)
+    assert split.seq_block == triton.next_power_of_2(params.num_seqs)
+    assert split.num_segments == config["SPLIT_NUM_SEGMENTS"] > config["NUM_SEGMENTS"]
+    # calls left out keep the uniform split of the head <= 128 entry
+    head_128, _ = _gfx950_split(head_size=128, head_size_v=128)
+    assert config["NUM_SEGMENTS"] == head_128["NUM_SEGMENTS"]
+    for left_out in (
+        {"q_dtype": torch.float16},
+        {"skip_reduce": True},
+        {"head_size": 32, "head_size_v": 64},
+        {"head_size": 64, "head_size_v": 32},
+    ):
+        fallback, fallback_params = _gfx950_split(**left_out)
+        assert _length_aware_split(fallback, fallback_params) is None
+        assert fallback["NUM_SEGMENTS"] == head_128["NUM_SEGMENTS"]
+        assert fallback["TILE_SIZE"] == head_128["TILE_SIZE"]
+    # a sliding window keeps the uniform split even where the entry opts in
+    windowed = _gfx950_split(sliding_window=4096)
+    assert "SPLIT_PROGRAMS_PER_CU" in windowed[0]
+    assert _length_aware_split(*windowed) is None
+    # head 64 only
+    head_32, _ = _gfx950_split(head_size=32, head_size_v=32)
+    assert "SPLIT_PROGRAMS_PER_CU" not in head_32
+    # the kernels round sum(seq_len) up by the budget in int32
+    edge = {"num_seqs": 1023, "num_kv_heads": 1}
+    assert _length_aware_split(*_gfx950_split(**edge, max_seqlen_k=1 << 21))
+    assert _length_aware_split(*_gfx950_split(**edge, max_seqlen_k=2_099_202)) is None
+    # and round one sequence up by its segments' tiles in int32
+    one = {"num_seqs": 1, "num_kv_heads": 1}
+    assert _length_aware_split(*_gfx950_split(**one, max_seqlen_k=2**31 - 2048)) is None
+    # find_work_item unpacks the sequences before an item from 15 bits
+    wide = {**vars(params), "max_seqlen_k": 1 << 15}
+    assert _length_aware_split(
+        config, SimpleNamespace(**{**wide, "num_seqs": 2**15 - 1})
+    )
+    assert (
+        _length_aware_split(config, SimpleNamespace(**{**wide, "num_seqs": 2**15}))
+        is None
+    )
+
+    # the grid holds split_budget + num_seqs - 1 work items; the shares reach that
+    # only when empty sequences sit beside one that fills the budget
+    def num_items(kv, budget):
+        segment_tokens = max(triton.cdiv(sum(kv), budget), 1)
+        return sum(max(k // segment_tokens, 1) for k in kv)
+
+    rng = random.Random(0)
+    for _ in range(2000):
+        kv = [
+            rng.choice((0, 1, rng.randint(1, 1 << 17)))
+            for _ in range(rng.randint(1, 40))
+        ]
+        budget = rng.randint(1, 1024)
+        assert num_items(kv, budget) <= budget + len(kv) - 1, (kv, budget)
+    assert num_items([512 * 64, 0], 512) == 512 + 2 - 1
+
+    # an entry without one of the split's keys keeps the uniform split
+    for key in module._LENGTH_AWARE_KV_SPLIT_KEYS:
+        partial = {k: v for k, v in config.items() if k != key}
+        assert _length_aware_split(partial, params) is None, key
+    for section, key in (
+        ("attn_3d", "SPLIT_RUNS_PER_XCD"),
+        ("reduce", "SPLIT_SEGMENT_BLOCK_MIN"),
+    ):
+
+        def without_key(op, *args, section=section, key=key, **kwargs):
+            entry = gfx950_config(op, *args, **kwargs)
+            if op == section:
+                entry.pop(key)
+            return entry
+
+        with monkeypatch.context() as m:
+            m.setattr(module, "get_unified_attention_config", without_key)
+            assert _length_aware_split(config, params) is None, key
+
+    def verify(q):
+        return SimpleNamespace(
+            **{**vars(params), "max_seqlen_q": q, "all_decode": q == 1}
+        )
+
+    # a verify query longer than one query block (BLOCK_Q 8 at q >= 4) keeps the
+    # uniform split
+    assert _length_aware_split(config, verify(9)) is None
+    # the 3D launch and the reduce read their length-aware keys from these entries,
+    # for decode and for verify queries up to one query block (q <= 8 here)
+    for q in (1, 4, 8):
+        verify_q = verify(q)
+        assert _length_aware_split(config, verify_q)
+        attn_3d = get_unified_attention_config("attn_3d", verify_q, arch="gfx950")
+        assert "SPLIT_RUNS_PER_XCD" in attn_3d
+        if attn_3d["BLOCK_M"] > 16:
+            # a wider tuned block is cut down to the query rows of one sequence
+            assert attn_3d["SPLIT_BLOCK_M"] == 16
+        assert "SPLIT_SEGMENT_BLOCK_MIN" in get_unified_attention_config(
+            "reduce", verify_q, arch="gfx950"
+        )
 
 
 @pytest.mark.parametrize(
