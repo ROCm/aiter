@@ -380,6 +380,59 @@ def _time_graph(fn, device, iters):
     return mean_ms, max_ms
 
 
+def _check_sdma_exact(moe, x, weights, ids, output, rank, device):
+    """The SDMA Stage2 must produce the default Stage2's bytes: same GEMM2 numerics,
+    same fp8 1x32 rows, same top-k sum order. Rows past the end of the send buffer
+    took the direct P2P path and must match too."""
+    tokens = x.shape[0]
+    overflow = moe._sdma_stage2.take_overflow_rows()
+    # Per-call switching: this call takes the default Stage2, the caller's next one
+    # the SDMA path again.
+    moe.set_stage2_sdma_enabled(False)
+    try:
+        default = moe(x, weights, ids)[:tokens].clone()
+    finally:
+        moe.set_stage2_sdma_enabled(True)
+    _barrier()
+    mismatched = torch.tensor(
+        int((default != output).any(dim=1).sum()) if tokens else 0,
+        dtype=torch.int64,
+        device=device,
+    )
+    dist.all_reduce(mismatched, op=dist.ReduceOp.MAX)
+    overflow_t = torch.tensor(overflow, dtype=torch.int64, device=device)
+    dist.all_reduce(overflow_t)
+    if int(mismatched.item()):
+        raise AssertionError(
+            f"bs={tokens} SDMA Stage2 differs from the default Stage2 in "
+            f"{int(mismatched.item())} rows (max over ranks)"
+        )
+    if rank == 0:
+        print(
+            f"[MEGA-V2] bs={tokens} stage2_sdma=EXACT p2p_overflow_rows={int(overflow_t.item())}",
+            flush=True,
+        )
+
+
+def _preset_sdma_plan_barrier(moe):
+    """Put the SDMA plan's grid-barrier counters where 2^26 + 5 launches leave them.
+
+    Each group counter then holds more than 2^31: an i32 counter would be negative,
+    its launch number too, and the wait on the top counter would pass at once.
+    """
+    from aiter.ops.flydsl.kernels.mega_moe.stage2_sdma import BAR_GROUP, BAR_STRIDE
+
+    stage = moe._sdma_stage2
+    launches = (1 << 26) + 5
+    nblocks = stage.plan_blocks
+    n_groups = (nblocks + BAR_GROUP - 1) // BAR_GROUP
+    bar = stage.plan_bar.view(-1, BAR_STRIDE)
+    for g in range(n_groups):
+        bar[g, 0] = min(BAR_GROUP, nblocks - g * BAR_GROUP) * launches
+    bar[n_groups, 0] = n_groups * launches
+    torch.cuda.synchronize()
+
+
 def _run_size(moe, x, weights, ids, ref_weights, args, rank, world, device):
     tokens = x.shape[0]
     main_output = None
@@ -393,6 +446,9 @@ def _run_size(moe, x, weights, ids, ref_weights, args, rank, world, device):
             moe.set_large_m_enabled(True)
         _barrier()
     output = moe(x, weights, ids)[:tokens]
+    if moe.stage2_sdma:
+        _check_sdma_exact(moe, x, weights, ids, output.clone(), rank, device)
+        output = moe(x, weights, ids)[:tokens]
     if args.expect_large_m:
         runtime = moe._large_m
         if runtime is None:
@@ -1056,6 +1112,25 @@ def main():
         help="Also route each rank's last N rows to -1 (whole rows) and check "
         "forward(mask_invalid_slots=True) returns them as zeros",
     )
+    parser.add_argument(
+        "--stage2-sdma",
+        action="store_true",
+        help="Run Stage2 + combine through the SDMA copy engines and check the output "
+        "byte for byte against the default Stage2 (needs MORI_ENABLE_SDMA=1)",
+    )
+    parser.add_argument(
+        "--sdma-preset-barrier",
+        action="store_true",
+        help="With --stage2-sdma, start the plan's grid-barrier counters past the "
+        "point an i32 counter wraps",
+    )
+    parser.add_argument(
+        "--sdma-send-slack",
+        type=float,
+        default=None,
+        help="Send-buffer rows for --stage2-sdma, as a multiple of max_tok_per_rank * "
+        "topk; a small value forces rows onto the direct P2P fallback",
+    )
     parser.add_argument("--expect-large-m", action="store_true")
     parser.add_argument("--compare-main", action="store_true")
     parser.add_argument("--smoke-only", action="store_true")
@@ -1066,6 +1141,8 @@ def main():
     args = parser.parse_args()
     if args.route_switch_rounds and not (args.expect_large_m and args.smoke_only):
         raise ValueError("--route-switch-rounds requires --expect-large-m --smoke-only")
+    if args.sdma_send_slack is not None:
+        os.environ["AITER_MEGA_SDMA_SEND_SLACK"] = str(args.sdma_send_slack)
     if (
         sum(
             (
@@ -1146,6 +1223,8 @@ def main():
                 16, _next_power_of_two(batch_size)
             )
             if shared_moe is None or args.max_tok_per_rank is None:
+                if shared_moe is not None:
+                    shared_moe.close()
                 fanout_masks = ()
                 if args.force_fanout_boundary:
                     pair_mask = (1 << (local_experts - 2)) | (1 << (local_experts - 1))
@@ -1168,9 +1247,16 @@ def main():
                     max_tok_per_rank=max_tok_per_rank,
                     fanout_masks=fanout_masks,
                     stage2_p2p_quant=args.stage2_p2p_quant,
+                    stage2_sdma=args.stage2_sdma,
                     large_m_state_slots=args.large_m_state_slots,
                     **network,
                 )
+                if args.stage2_sdma and not shared_moe.stage2_sdma:
+                    raise RuntimeError(
+                        "--stage2-sdma: the SDMA Stage2 is unavailable (see the warning)"
+                    )
+                if args.sdma_preset_barrier:
+                    _preset_sdma_plan_barrier(shared_moe)
             moe = shared_moe
             _install_config_policy(moe, config_tokens, args.unify_fields)
             if rank_tokens:
@@ -1208,6 +1294,8 @@ def main():
                     world,
                     device,
                 )
+        if shared_moe is not None:
+            shared_moe.close()
     finally:
         _cleanup()
 
