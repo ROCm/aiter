@@ -106,6 +106,7 @@ from .mega_moe_tp_config import (
     kernel_config,
 )
 from .schedule import build_schedule
+from .smallm import build_smallm
 
 __all__ = ["compile_bigm_kernel", "compile_mega_moe_tp"]
 
@@ -144,6 +145,8 @@ def compile_mega_moe_tp(
     tn_local: bool = False,
     lbpf: bool = False,
     lbp: int = 0,
+    sm: bool = False,
+    ar2: bool = False,
 ):
     """Build the launcher of one (shape, variant) instance; LaunchCfg (host) picks them.
 
@@ -168,11 +171,16 @@ def compile_mega_moe_tp(
         once final, becomes res_out[r] = y[r] + res_in[r] and the per-token FP8 quant of
         GemmaRMSNorm(res_out[r]; w, tn_eps) (RMSNorm unless tn_gemma), gathered by every
         rank into qall / sall; tn 2: the bf16 normed rows too (qall after the FP8 rows).
+    sm: (ll_rs, ll_route, not lb) the small-M schedule (smallm.py). ar2: (ar, LL route rows)
+        the two-shot all-reduce (reduce-scatter, then the owners' y rows to every rank)
+        instead of the one-shot one.
     """
     kc = kernel_config(**locals())
     kc.add(build_communication(kc))
     kc.add(build_gemm(kc))
     kc.add(build_schedule(kc))
+    if kc.SM:
+        kc.add(build_smallm(kc))
     AG8, ARLL, DLL, L_CTL, L_RING, LBPF = kc.get("AG8 ARLL DLL L_CTL L_RING LBPF")
     LDS_BYTES, MLL, NCHA, TN, TPC = kc.get("LDS_BYTES MLL NCHA TN TPC")
     a_loader, ag8_convert, ag_send = kc.get("a_loader ag8_convert ag_send")
@@ -181,6 +189,7 @@ def compile_mega_moe_tp(
     compute_units, const_expr, ctrl_at = kc.get("compute_units const_expr ctrl_at")
     (TNL,) = kc.get("TNL")
     _drop_stale, _dyn_zero, fin_key = kc.get("_drop_stale _dyn_zero fin_key")
+    (sm_zero_next,) = kc.get("sm_zero_next")
     fin_owned, fin_split, finish = kc.get("fin_owned fin_split finish")
     init_lds, layout_tag, lb_finish = kc.get("init_lds layout_tag lb_finish")
     lb_g2_prefetch, name, peer_rs = kc.get("lb_g2_prefetch name peer_rs")
@@ -190,6 +199,7 @@ def compile_mega_moe_tp(
 
     TN_V = H // 8
     TN_IT = ceildiv(TN_V, NTT)
+    (ag_ready_all,) = kc.get("ag_ready_all")
 
     @flyc.jit
     def blk_red(L, tid, v, op, slot):
@@ -372,10 +382,13 @@ def compile_mega_moe_tp(
     def roles(L, tid, a, epoch):
         if tid < i32(NT):
             compute_units(L, tid, a)
+            if const_expr(DLL):
+                push_dll(L, tid, a, 4 + tid // 64)
             comm_help(L, tid, a, epoch)
         else:
             if tid < i32(NT + 64):
                 ag_send(L, tid % i32(64), a)
+                ag_ready_all(L, tid % i32(64), a, epoch)
                 if const_expr(DLL):
                     push_dll(L, tid, a)
                     comm_wave(L, tid, a, epoch)
@@ -458,6 +471,7 @@ def compile_mega_moe_tp(
         epoch = lds_ld_i32(L, L_CTL + C_EPOCH * 4)
         a["epoch"] = epoch
         _drop_stale(tid, a)
+        sm_zero_next(tid, a)
         if (tid == i32(0)) & (i32(gpu.block_id("x")) == i32(0)):
             g_st_sys(claim_addr(a, 1), i32(0))
         if const_expr(ar):

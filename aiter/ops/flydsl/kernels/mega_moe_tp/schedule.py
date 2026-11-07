@@ -25,7 +25,6 @@ from .common import (
     g_st_sys,
     i32,
     lds_atomic_add,
-    lds_atomic_or,
     lds_ld,
     lds_ld_acq,
     lds_ld_i32,
@@ -67,12 +66,16 @@ from .mega_moe_tp_config import (
     CTRL_G1C,
     CTRL_LBR,
     CTRL_LBSEQ,
+    CTRL_SMC,
+    CTRL_SMF,
     CTRL_XF,
+    DYN_MAX,
     G1C_STRIDE,
     LRDY_STRIDE,
     N_XCD,
     NCHLB_MAX,
     NCK_MAX,
+    NCTA_MAX,
     NT,
     NW,
     UL_MAX,
@@ -88,15 +91,17 @@ def build_schedule(kc: KernelCtx) -> dict:
     L_B1, L_B1S, L_CTL, L_DCH, L_DCNT = kc.get("L_B1 L_B1S L_CTL L_DCH L_DCNT")
     L_DPRE, L_DYN, L_EOFF, L_INTER = kc.get("L_DPRE L_DYN L_EOFF L_INTER")
     L_INTERS, L_RIX, L_WSUM, L_WT, LB_B = kc.get("L_INTERS L_RIX L_WSUM L_WT LB_B")
+    L_ROFF, L_RLI, L_RLW, RL = kc.get("L_ROFF L_RLI L_RLW RL")
     LB_PS, LBMIX, LBMIX_DIV, LBPF, MLL = kc.get("LB_PS LBMIX LBMIX_DIV LBPF MLL")
     NBW, NCG, NCK, RG, SI_STRIDE, TMAX = kc.get("NBW NCG NCK RG SI_STRIDE TMAX")
     TOPK, ag_stage_free, ag_wait_meta = kc.get("TOPK ag_stage_free ag_wait_meta")
     ar, cbar, cg_lo, claim_addr = kc.get("ar cbar cg_lo claim_addr")
     col_claim, const_expr, ctrl_at = kc.get("col_claim const_expr ctrl_at")
     gather_routes_chunk, gemm1, gemm2 = kc.get("gather_routes_chunk gemm1 gemm2")
-    lb, lrdy_at, masked, meta_ll_wait = kc.get("lb lrdy_at masked meta_ll_wait")
+    lb, lrdy_at, masked = kc.get("lb lrdy_at masked")
     rch, report_chunk, spin_sys_ge = kc.get("rch report_chunk spin_sys_ge")
     unit_fields, zero_masked = kc.get("unit_fields zero_masked")
+    SM, route_regs = kc.get("SM route_regs")
 
     @flyc.jit
     def gemm2_dispatch(L, tid, a, expert, ks0, icnt, r0, rows, signal):
@@ -106,9 +111,43 @@ def build_schedule(kc: KernelCtx) -> dict:
                 gemm2(L, tid, a, expert, ks0, r0, rows, signal, n, ks0 // i32(n))
 
     @flyc.jit
-    def _drop_stale(tid, a):
+    def sm_zero_next(tid, a):
+        """every launch zeroes the small-M chunk counters of the next launch's bank (epoch
+        parity): a small-M launch reads its own bank only, and other variants may run in
+        between"""
+        bid = i32(gpu.block_id("x"))
+        nblk = i32(gpu.grid_dim.x)
+        nb = (a["epoch"] + i32(1)) & i32(1)
         if tid < i32(64):
-            fx.memory_fence(syncscope="agent", ordering=ACQ)  # drop stale L1 lines
+            for j_ in range(bid + tid * nblk, i32(NCHLB_MAX), nblk * i32(64)):
+                g_st_sys(
+                    ctrl_at(
+                        a,
+                        i32(CTRL_SMC)
+                        + (nb * i32(NCHLB_MAX) + i32(j_)) * i32(G1C_STRIDE),
+                    ),
+                    i32(0),
+                )
+            if bid == i32(0):
+                for j_ in range(tid, i32(NCTA_MAX), i32(64)):
+                    g_st_sys(
+                        ctrl_at(
+                            a,
+                            i32(CTRL_SMF)
+                            + (nb * i32(NCTA_MAX) + i32(j_)) * i32(G1C_STRIDE),
+                        ),
+                        i32(0),
+                    )
+
+    # small-M launches: no L2 invalidate at the start (it evicts the kernarg lines, whose
+    # re-load then stalls every CTA ~2 us); their reads of peer-written data are sc1 / sys
+    DSTALE = not SM or kc.TN
+
+    @flyc.jit
+    def _drop_stale(tid, a):
+        if const_expr(DSTALE):  # noqa: SIM102
+            if tid < i32(64):
+                fx.memory_fence(syncscope="agent", ordering=ACQ)  # drop stale L1 lines
         bid = i32(gpu.block_id("x"))
         if (tid < i32(64)) & (bid < i32(N_XCD)) & (a["epoch"] == i32(1)):
             fx.memory_fence(syncscope="one-as", ordering=ACQ)
@@ -126,26 +165,9 @@ def build_schedule(kc: KernelCtx) -> dict:
         gemm2_dispatch(L, tid, a, expert, i0 // i32(128), icnt, r0, rows, sig)
 
     @flyc.jit
-    def compute_units(L, tid, a):
+    def _dyn_loop(L, tid, a):
         lane = tid % i32(64)
         w = tid // i32(64)
-        if const_expr(MLL):
-            meta_ll_wait(tid, a)
-        elif const_expr(not ar):
-            ag_wait_meta(a, tid, a["epoch"])
-        _stale_dropped(tid, a)
-        if const_expr(ar and not DLL):
-            zero_masked(L, tid % i32(64), a, tid // i32(64), NW)
-        cbar(L, tid)
-        if const_expr(MLL):  # noqa: SIM102
-            if tid == i32(0):
-                lds_st_rel(L, L_CTL + C_RLAND * 4, i32(1))
-        if const_expr(not ar and not DLL):
-            zero_masked(L, tid % i32(64), a, tid // i32(64), NW)
-        if const_expr(lb):
-            lb_plan(L, tid, a)
-        else:
-            dyn_plan(L, tid, a)
         ub = lds_ld_i32(L, L_CTL + C_UNIT * 4)
         ue = lds_ld_i32(L, L_CTL + (C_UNIT + 1) * 4)
         if ub == ue:
@@ -181,31 +203,126 @@ def build_schedule(kc: KernelCtx) -> dict:
             lb_g2_consume(L, tid, a)
         elif const_expr(lb):
             lb_g2_phase(L, tid, a)
+
+    @flyc.jit
+    def compute_units(L, tid, a):
+        if const_expr(not ar and not MLL):
+            ag_wait_meta(a, tid, a["epoch"])
+            cbar(L, tid)  # (wave 0 polled the routing flags)
+        if const_expr(not lb):
+            # the dynamic schedule's routes in registers (MLL: the meta wait)
+            a["rregs"] = route_regs(tid, a)
+        _stale_dropped(tid, a)
+        if const_expr(ar and not DLL):
+            zero_masked(L, tid % i32(64), a, tid // i32(64), NW)
+        cbar(L, tid)
+        if const_expr(MLL):  # noqa: SIM102
+            if tid == i32(0):
+                lds_st_rel(L, L_CTL + C_RLAND * 4, i32(1))
+        if const_expr(not ar and not DLL):
+            zero_masked(L, tid % i32(64), a, tid // i32(64), NW)
+        if const_expr(lb):
+            lb_plan(L, tid, a)
+        else:
+            dyn_plan(L, tid, a)
+        if const_expr(SM):
+            kc.sm_compute(L, tid, a)
+        else:
+            _dyn_loop(L, tid, a)
         if const_expr(DLL):  # noqa: SIM102
             if tid == i32(0):
                 lds_st_rel(L, L_CTL + C_CDONE * 4, i32(1))
 
     @flyc.jit
     def dyn_plan(L, tid, a):
-        n = a["ttot"] * i32(TOPK)
-        rid = rsrc(a["ids"], n * i32(16 if MLL else 4))
-        for idx_ in range(tid, n, i32(NT)):
-            idx = i32(idx_)
-            e = fx.Int32(bld(rid, idx * i32(16 if MLL else 4), 0, T.i32, 0))
-            if masked(e) == fx.Boolean(False):
-                lds_atomic_or(
-                    L, L_DYN + (e >> i32(5)) * i32(4), i32(1) << (e & i32(31))
+        """(compute waves) the routes per expert (LDS atomics from the registers), then wave
+        0 alone: the row-chunk table (expert ascending) and this CTA's units"""
+        ranks = []
+        for idx, e, wv, live in a["rregs"]:
+            ok = live & (masked(e) == fx.Boolean(False))
+            rk = i32(0)
+            if ok:
+                rk = lds_atomic_add(L, L_DCNT + e * i32(4), 1)
+            ranks.append((ok, e, rk, idx, wv))
+        cbar(L, tid)
+        _par_chunk_table(L, tid)
+        if const_expr(RL):
+            # (aiter #7095's route histogram: the count's LDS atomic gives each route its
+            # rank in its expert) the route list, expert by expert: the chunk gathers copy
+            # their rows from it (published by the closing barrier below)
+            for ok, e, rk, idx, wv in ranks:
+                if ok:
+                    sl = lds_ld_i32(L, L_ROFF + e * i32(4)) + rk
+                    lds_st(L, L_RLI + sl * i32(4), idx)
+                    lds_st(L, L_RLW + sl * i32(4), wv)
+        if tid < i32(64):
+            if const_expr(SM):
+                kc.sm_units(L, tid, a)
+            else:
+                _dyn_units(L, tid)
+        cbar(L, tid)
+
+    # the chunk table over the compute waves (contiguous expert groups of 64 per wave)
+    NG = ceildiv(E, 64)
+    GPW = ceildiv(NG, NW)
+
+    @flyc.jit
+    def _par_chunk_table(L, tid):
+        """(compute waves) expert e -> ceil(routes / rch) row chunks, listed expert-ascending
+        in L_DCH (e | chunks << 16 | chunk << 24), C_NCH = their number; wave w the expert
+        groups [w GPW, (w+1) GPW). RL: L_ROFF = each expert's first route list entry"""
+        lane = tid % i32(64)
+        w = tid // i32(64)
+        ces = []
+        loc = i32(0)
+        rlo = i32(0)
+        for g in range_constexpr(GPW):
+            e = (w * i32(GPW) + i32(g)) * i32(64) + lane
+            live = e < i32(E)
+            r = live.select(
+                lds_ld_i32(L, L_DCNT + fx.min(e, i32(E - 1)) * i32(4)), i32(0)
+            )
+            ce = fx.min(ceildiv(r, i32(rch)), i32(255))
+            pre, tot = _wave_prefix(ce, 8)
+            rpre = i32(0)
+            if const_expr(RL):
+                # (the route list offsets: routes per expert at most the batch's tokens)
+                rpre, rtot = _wave_prefix(r, min(TMAX, DYN_MAX).bit_length())
+                rpre = rlo + rpre
+                rlo = rlo + rtot
+            ces.append((e, ce, loc + pre, rpre))
+            loc = loc + tot
+        if lane == i32(0):
+            lds_st(L, L_WSUM + w * i32(4), loc)
+            if const_expr(RL):
+                lds_st(L, L_WSUM + (w + i32(NW)) * i32(4), rlo)
+        cbar(L, tid)
+        base = i32(0)
+        nch = i32(0)
+        rbase = i32(0)
+        for v in range_constexpr(NW):
+            cv = lds_ld_i32(L, L_WSUM + i32(v * 4))
+            base = base + (i32(v) < w).select(cv, i32(0))
+            nch = nch + cv
+            if const_expr(RL):
+                rv = lds_ld_i32(L, L_WSUM + i32((NW + v) * 4))
+                rbase = rbase + (i32(v) < w).select(rv, i32(0))
+        if const_expr(RL):
+            for gi in range_constexpr(GPW):
+                e, _, _, rpre = ces[gi]
+                if e < i32(E):
+                    lds_st(L, L_ROFF + e * i32(4), rbase + rpre)
+        for gi in range_constexpr(GPW):
+            e, ce, off, _ = ces[gi]
+            for c_ in range(i32(0), ce, i32(1)):
+                c = i32(c_)
+                lds_st(
+                    L,
+                    L_DCH + (base + off + c) * i32(4),
+                    e | (ce << i32(16)) | (c << i32(24)),
                 )
-                lds_atomic_add(L, L_DCNT + e * i32(4), 1)
-        cbar(L, tid)
-        _dyn_prefix(L, tid)
-        cbar(L, tid)
-        for it in range_constexpr(ceildiv(E, NT)):
-            _dyn_list(L, tid + i32(it * NT))
-        cbar(L, tid)
-        _chunk_table(L, tid)
-        cbar(L, tid)
-        _dyn_units(L, tid)
+        if tid == i32(0):
+            lds_st(L, L_CTL + C_NCH * 4, nch)
         cbar(L, tid)
 
     @flyc.jit
@@ -880,6 +997,12 @@ def build_schedule(kc: KernelCtx) -> dict:
             rix = lds_ld_i32(L, L_RIX + (r0 + row) * i32(4))
             sv = lds_ld_i32(L, i32(L_INTERS) + row * i32(I // 32) + c * i32(4))
             bst(sv, rxs, rix * i32(I // 32) + i0 // i32(32) + c * i32(4), 0, AUX_SYS)
+        if (icnt % i32(128)) != i32(0):  # (small-M half block: its 2 scales per row)
+            for row_ in range(tid, rows, i32(NT)):
+                row = i32(row_)
+                rix = lds_ld_i32(L, L_RIX + (r0 + row) * i32(4))
+                sv = lds_ld(L, i32(L_INTERS) + row * i32(I // 32), T.i16, 2)
+                bst(sv, rxs, rix * i32(I // 32) + i0 // i32(32), 0, AUX_SYS)
         wait_vm(0)
 
     return locals()

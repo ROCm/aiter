@@ -6,7 +6,9 @@ KernelCtx shared by the parts of the fused TP MegaMoE kernel."""
 from __future__ import annotations
 
 import functools
+import hashlib
 import math
+import os
 import struct
 import types
 
@@ -66,6 +68,10 @@ CTRL_CLM = CTRL_AGG + NCHA_MAX * LRDY_STRIDE
 #   CTRL_COLC + (bank*NCK_MAX + c)*LRDY_STRIDE   GEMM2 units done of column group c
 #   CTRL_G1C + (bank*NCHLB_MAX + j)*G1C_STRIDE   GEMM1 pieces done of row chunk j
 #   CTRL_TNC + i                                 tail (tn): CTAs done with row i
+#   CTRL_SMC + (bank*NCHLB_MAX + j)*G1C_STRIDE   small-M: GEMM1 inter blocks exported of
+#                                                row chunk j (bank: launch epoch parity)
+#   CTRL_SMF + (bank*NCTA_MAX + b)*G1C_STRIDE    small-M split-K: K pieces done of GEMM1
+#                                                block b
 NCHLB_MAX = 2048
 G1C_STRIDE = 16
 CTRL_LBSEQ = CTRL_CLM + 2 * LRDY_STRIDE
@@ -73,7 +79,9 @@ CTRL_LBR = CTRL_LBSEQ + LRDY_STRIDE
 CTRL_COLC = CTRL_LBR + 2 * N_XCD * LRDY_STRIDE
 CTRL_G1C = CTRL_COLC + 2 * NCK_MAX * LRDY_STRIDE
 CTRL_TNC = CTRL_G1C + 2 * NCHLB_MAX * G1C_STRIDE
-CTRL_INTS = CTRL_TNC + TN_MAX
+CTRL_SMC = CTRL_TNC + TN_MAX
+CTRL_SMF = CTRL_SMC + 2 * NCHLB_MAX * G1C_STRIDE
+CTRL_INTS = CTRL_SMF + 2 * NCTA_MAX * G1C_STRIDE
 # unit records (expert, i0, icnt, kind); LB: kind = UNIT_G1X | piece << 8 | chunk << XQ_SHIFT
 # (a GEMM1 piece exporting its intermediate)
 UNIT_G1X = 3
@@ -87,7 +95,34 @@ SLOT = 4 * 1024 + 2 * 256
 OPS = 6
 KCS = 2
 ALOAD_DEPTH = 3
-POLL_SLEEP = 16
+POLL_SLEEP = 4
+# small-M split-K GEMM1 partial sums (fp32, the MFMA register layout) after the export area
+# of xg: one slot of NW waves x 4 * MT accumulators x 64 lanes x 16 B per unit, MT <= 3
+SM_PART_BYTES = NCTA_MAX * NW * 4 * 3 * 1024
+
+
+def _src_key(*fnames: str) -> str:
+    """content hash of sibling source files: smallm.py's device functions are reached through
+    kc at trace time, outside the JIT cache key's closure scan, so its kernel names carry it
+    """
+    h = hashlib.sha1()
+    for fname in fnames:
+        with open(
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), fname), "rb"
+        ) as f:
+            h.update(f.read())
+    return h.hexdigest()[:8]
+
+
+_SM_KEY = _src_key(
+    "smallm.py",
+    "mega_moe_tp_config.py",
+    "communication.py",
+    "gemm.py",
+    "schedule.py",
+    "mega_moe_tp_kernel.py",
+    "common.py",
+)
 
 
 def mega_moe_tp_shape_supported(model_dim: int, inter_dim: int, tp: int) -> bool:
@@ -130,7 +165,12 @@ def mega_moe_tp_consts(
     nch: int = 0,
     a8: bool = False,
     lb: bool = False,
+    hb: bool = False,
+    rl: int = 0,
 ) -> dict:
+    """hb: the A chunk buffers hold two chunks (small-M half blocks: the K halves of a
+    64-column GEMM1 block on the two wave pairs); rl: (small-M) the route list's entries
+    (every route by expert, rank order: the per-chunk gathers copy from it)"""
     RG = MT * 16
     KS1 = H // 128
     KS2 = I // 128
@@ -159,6 +199,9 @@ def mega_moe_tp_consts(
         "CW": GPC * NW * 64,
         "NAB": nab,
         "NBW": ceildiv(dyn_e, 32),
+        # A chunk buffer strides (rows / scales)
+        "ABS": RG * acb * (2 if hb else 1),
+        "ASS": KCS * NSC_BLK * 64 * 4 * (2 if hb else 1),
     }
     off = 0
 
@@ -169,8 +212,8 @@ def mega_moe_tp_consts(
         return start
 
     c["L_RING"] = take(NW * NSK * SLOT)
-    c["L_A"] = take(nab * RG * acb)
-    c["L_AS"] = take(nab * KCS * NSC_BLK * 64 * 4)
+    c["L_A"] = take(nab * c["ABS"])
+    c["L_AS"] = take(nab * c["ASS"])
     c["L_B1"] = c["L_A"]
     c["L_B1S"] = c["L_A"] + RG * c["SI_STRIDE"]
     c["B1_FITS"] = (
@@ -189,6 +232,9 @@ def mega_moe_tp_consts(
     c["L_DCH"] = take((nch + 2 * NW) * 4) if nch else 0
     c["L_EOFF"] = take(dyn_e * 4) if lb else 0
     c["L_DPRE"] = take(dyn_e * 4) if lb else 0
+    c["L_ROFF"] = take(dyn_e * 4) if rl else 0
+    c["L_RLI"] = take(rl * 4) if rl else 0
+    c["L_RLW"] = take(rl * 4) if rl else 0
     c["LDS_BYTES"] = ceildiv(off, 128) * 128
     assert H // 256 <= NCHA_MAX
     assert KS1 % NSK == 0 and NSK % KCS == 0
@@ -214,6 +260,9 @@ C_CLAIM, C_PRDY, C_FRDY, C_PBITS, C_RLAND = 56, 60, 61, 62, 63
 C_LBB, C_LBN, C_G1FIN, C_TNL = 64, 65, 67, 69
 C_G2RDY, C_G2FREE, C_G2END, C_G2V, C_G2U = 76, 77, 78, 79, 80
 C_G2LAST, C_G2VN, C_PFW, C_LBJ2 = 88, 89, 90, 94
+# 1: every activation chunk of the launch landed (the AG helper polled it before the GEMMs
+# load the memory system: the A loader skips its per-chunk waits)
+C_AGALL = 95
 # per-CTA unit list (dynamic / LB): UL_MAX records of 4 ints
 C_UL = 96
 UL_MAX = (128 - C_UL) // 4
@@ -263,6 +312,8 @@ def kernel_config(
     tn_local: bool = False,
     lbpf: bool = False,
     lbp: int = 0,
+    sm: bool = False,
+    ar2: bool = False,
 ):
     """The derived compile-time values of one compile_mega_moe_tp instance."""
     if swiglu_limit is None:
@@ -270,7 +321,23 @@ def kernel_config(
     TN = tn in (1, 2)
     assert not TN or not ar
     nsk = NSK
-    c = mega_moe_tp_consts(H, I, MT, TMAX, agr, E, nab, nch, a8, lb)
+    # small-M half blocks (smallm.py): 64-column GEMM1 blocks, the K halves on the two wave
+    # pairs (both A chunks in one buffer), when the LDS takes the second A chunk
+    HB = (
+        bool(sm)
+        # (MT 3: the halves run at half the bytes per us, measured)
+        and MT <= 2
+        and (KCS * 2) <= H // 128
+        and (H // 128 // 2) % (nsk * KCS // math.gcd(nsk, KCS)) == 0
+    )
+    # (small-M) the plan's route list (route ranks from the count's LDS atomics, after
+    # aiter #7095's route histograms): the chunk gathers copy instead of scanning
+    RL = min(TMAX, DYN_MAX) * TOPK if sm and not lb else 0
+    if HB:
+        c_ = mega_moe_tp_consts(H, I, MT, TMAX, agr, E, nab, nch, a8, lb, True, RL)
+        HB = c_["LDS_BYTES"] <= 160 * 1024 and 2 * c_["NA_L"] * (ALOAD_DEPTH - 1) <= 63
+    c = mega_moe_tp_consts(H, I, MT, TMAX, agr, E, nab, nch, a8, lb, HB, RL)
+    ABS, ASS = c["ABS"], c["ASS"]
     RG, KS1, NCH, KS2, G2 = c["RG"], c["KS1"], c["NCH"], c["KS2"], c["G2"]
     CH1, CH2, SI_STRIDE = c["CH1"], c["CH2"], c["SI_STRIDE"]
     ACB, XB = c["ACB"], c["XB"]
@@ -282,6 +349,7 @@ def kernel_config(
     L_B1, L_B1S = c["L_B1"], c["L_B1S"]
     L_DCNT, L_DCH = c["L_DCNT"], c["L_DCH"]
     L_EOFF, L_DPRE = c["L_EOFF"], c["L_DPRE"]
+    L_ROFF, L_RLI, L_RLW = c["L_ROFF"], c["L_RLI"], c["L_RLW"]
     L_WSUM = L_DCH + nch * 4
     assert npp >= 1 and nsk % (npp * KCS) == 0 and (KS1 * npp) % nsk == 0
     assert 3 <= NAB <= 4
@@ -294,7 +362,9 @@ def kernel_config(
     DLL = bool(ll_rs and ll_route)
     assert not DLL or route_fp8
     MLL = DLL and not ar
-    ARLL = DLL and ar
+    # the one-shot LL all-reduce (every rank's partials to every rank: tp x the RS bytes over
+    # xGMI), unless ar2: the two-shot one (RS to the owner, its y rows to every rank)
+    ARLL = DLL and ar and not ar2
     AG8 = bool(ag8 and ar and not ARLL)
     NV = NCK
     TPC = tp
@@ -366,7 +436,13 @@ def kernel_config(
         + (f"_ad{ADEPTH}" if ADEPTH != ALOAD_DEPTH else "")
         + ("_pf" if LBPF else "")
         + ("_tnl" if TNL else "")
+        + (f"_sm{_SM_KEY}" if sm else "")
+        + ("_hb" if HB else "")
+        + ("_ar2" if ar and ar2 else "")
     )
+    # small-M schedule (smallm.py): needs the dynamic schedule's LL route rows
+    SM = bool(sm)
+    assert not SM or (DLL and not lb and not a8)
     const_expr = fx.const_expr
     layout_tag = f"{CTRL_INTS}/{FLAG_INTS}/{DEADLINE}/{NCTA_MAX}"
     return KernelCtx(**locals())
