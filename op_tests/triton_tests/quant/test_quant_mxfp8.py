@@ -1464,3 +1464,65 @@ def test_dynamic_mxfp8_quant_backend_validation():
     # fp32 input has no Gluon kernel on any arch.
     with pytest.raises(RuntimeError, match="Gluon backend requires"):
         dynamic_mxfp8_quant(x.float(), backend="gluon")
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_two_stage_rejects_non_fp32_scratch(dtype):
+    _skip_without_fp8()
+    cfg = {
+        **_COMPRESSOR_BASE_CFG,
+        "compress_ratio": 128,
+        "overlap": False,
+        "state_width": 512,
+        "token_stride": _REC,
+    }
+    _, a = _compressor_inputs(8, cfg)
+    with pytest.raises(ValueError, match="compress_scratch"):
+        fused_deepseek_v4_compress_norm_rope_store_two_stage(
+            **vars(a),
+            num_decode_tokens=0,
+            compress_scratch=torch.zeros(
+                8, cfg["head_dim"], dtype=dtype, device="cuda"
+            ),
+        )
+
+
+def test_two_stage_rejects_short_scratch():
+    _skip_without_fp8()
+    cfg = {
+        **_COMPRESSOR_BASE_CFG,
+        "compress_ratio": 128,
+        "overlap": False,
+        "state_width": 512,
+        "token_stride": _REC,
+    }
+    _, a = _compressor_inputs(8, cfg)
+    with pytest.raises(ValueError, match="rows"):
+        fused_deepseek_v4_compress_norm_rope_store_two_stage(
+            **vars(a),
+            num_decode_tokens=0,
+            compress_scratch=torch.zeros(
+                4, cfg["head_dim"], dtype=torch.float32, device="cuda"
+            ),
+        )
+
+
+def test_two_stage_rejects_head_dim_128():
+    _skip_without_fp8()
+    cfg = {
+        **_COMPRESSOR_BASE_CFG,
+        "head_dim": 128,
+        "compress_ratio": 128,
+        "overlap": False,
+        "state_width": 128,
+        "token_stride": 576,
+    }
+    _, a = _compressor_inputs(4, cfg)
+    with pytest.raises(NotImplementedError, match="head_dim 512"):
+        fused_deepseek_v4_compress_norm_rope_store_two_stage(
+            **vars(a),
+            num_decode_tokens=0,
+            compress_scratch=torch.zeros(
+                4, cfg["head_dim"], dtype=torch.float32, device="cuda"
+            ),
+        )
