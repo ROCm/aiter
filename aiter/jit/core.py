@@ -296,11 +296,9 @@ def _runtime_power_selection() -> bool:
 class AITER_CONFIG:
     @property
     def AITER_CONFIG_GEMM_A4W4_FILE(self):
-        return self.get_config_file(
-            "AITER_CONFIG_GEMM_A4W4",
-            AITER_CONFIG_GEMM_A4W4,
-            "a4w4_blockscale_tuned_gemm",
-        )
+        from aiter.utility.mxfp4_tuning import get_mxfp4_config_file
+
+        return get_mxfp4_config_file()
 
     @property
     def AITER_CONFIG_GEMM_A6W6_FILE(self):
