@@ -18,66 +18,57 @@ so it can be pushed straight from registers.
 
 On a cacheable (fine-grained) inbox each wave writes its push back out of L2,
 and the re-arm is written through.
+
+Padded builds (a hidden dim with no native row geometry) mask their pad columns
+with a per-row buffer descriptor bounded to ``hidden*2`` bytes: pad columns are
+out of bounds for that descriptor, so a plain tiled copy gets hardware OOB
+handling for free (load->0, store dropped), with no exec-mask split. See
+``quick_allreduce_fusions.make_rowbuf_atom_row``.
 """
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
-from flydsl.expr.typing import Int32, Int64, Stream, T
+from flydsl.expr.typing import T
 
 # The peer-store/load primitives, the cache-policy table and the inbox-memory
 # taxonomy are shared with the quantized kernels verbatim.
-from .allreduce_shared import (
+from ...allreduce_policy import (
+    FANOUT_ORDERS,
+    SUPPORTED_ATOMS,
+    SUPPORTED_BLOCKS,
+    SUPPORTED_SPLITS,
+    SUPPORTED_WORLDS,
+)
+from .one_shot_allreduce_rmsnorm import OneShotRMSNormEpilogue
+from .quick_allreduce_fusions import check_fusion_args, make_row_io
+from .transport import (
     _CM_SC0,
     _CM_SC1,
     _INBOX_POLICY,
-    SUPPORTED_BLOCKS,
-    SUPPORTED_WORLDS,
+    _RECV_POLICY,
     _buffer_load,
     _buffer_ptr,
     _buffer_store,
     _color_io,
     _i32_to_bytes,
     _load_peers,
-    _payload_io,
     _poll_v4i32,
     _release_inbox,
     _store_v4i32_peer,
     _to_sgpr_i64,
+    atom_bf16_to_f32,
+    atom_f32_to_bf16,
 )
 
-# Threads per block, which sets the tile width: ``tile = block * atoms * 16 B``.
-# It sets the parallelism floor at a given payload. ``SUPPORTED_BLOCKS`` lists
-# the values.
+# ``block`` is threads per block, which sets the tile width:
+# ``tile = block * atoms * 16 B``. It sets the parallelism floor at a given
+# payload. The trade is per-block fixed cost: every block polls and re-arms its
+# own slots, so that work rises by the same factor the block count does.
 #
-# The trade is per-block fixed cost: every block polls and re-arms its own
-# slots, so that work rises by the same factor the block count does.
-DEFAULT_BLOCK = 256
 # 16 B per thread per atom -- one ``global_store_dwordx4``.
 ATOM_BYTES = 16
 ATOM_I32 = ATOM_BYTES // 4
-DEFAULT_ATOMS = 1
-# Atoms per thread per tile. More atoms means a bigger tile, hence fewer blocks
-# for a given payload, at the cost of coarser load balance on the last partial
-# tile.
-SUPPORTED_ATOMS = (1, 2, 4)
-DEFAULT_GRID_CAP = 64
-
-# Read our own inbox with the caches bypassed: a peer wrote these lines
-# microseconds ago and an L1 hit here is a stale hit. Same reasoning as the
-# ring kernel's ``_RECV_POLICY``.
-_RECV_POLICY = _CM_SC0 | _CM_SC1
-
-# Which axis of the (peer, atom) fanout runs fastest across consecutive stores.
-#
-# "peer": a thread pushes all its atoms to one destination before moving to the
-# next, so a wave hands each destination a contiguous ``block * 16`` B run.
-#
-# "atom": consecutive stores walk the peers of one atom. On xGMI the native
-# packet is 64 B and there is no per-destination run-length benefit to collect,
-# so spreading across links sooner can start more of them in parallel.
-FANOUT_ORDERS = ("peer", "atom")
-DEFAULT_FANOUT = "peer"
 
 # Three inbox buffers rotate by colour. Round ``c`` reads buffer ``c``, and
 # re-arms buffer ``c + 2`` (mod 3) with the sentinel. No peer can be writing that
@@ -89,19 +80,6 @@ INBOX_BUFFERS = 3
 SENTINEL_FILL_BYTE = 0xFF
 # Bit 15 of both half-words of an i32, as a signed i32.
 _HALF_SIGN_BITS = -0x7FFF8000  # 0x80008000
-
-
-def _atom_bf16_to_f32(atom_i32):
-    """16 B of bf16 (8 values) -> 8 f32. bf16 is the high half of f32, so this
-    is a widening move, not a conversion -- exact, no rounding."""
-    return fx.Vector(atom_i32).bitcast(fx.BFloat16).to(fx.Float32)
-
-
-def _atom_f32_to_bf16(acc_f32):
-    """8 f32 -> 16 B of bf16. One rounding, at the end of the reduction, which
-    is what makes this bit-comparable with ``cross_device_reduce``'s fp32
-    accumulate + single ``downcast``."""
-    return acc_f32.to(fx.BFloat16).bitcast(fx.Int32)
 
 
 def _sentinel_mask(atom_i32):
@@ -131,18 +109,98 @@ def _has_sentinel(vec_i32):
     return acc != 0
 
 
+class _PlainEpilogue:
+    """The plain all-reduce's end of a tile: round the fp32 sum once to bf16
+    and store it.
+
+    Also the reference for the hooks the schedule drives an epilogue through
+    (``one_shot_allreduce_rmsnorm.OneShotRMSNormEpilogue`` is the other one).
+    At build time an epilogue fixes ``block`` and the HBM row geometry; in the
+    kernel body ``bind`` returns an object with
+
+    * ``prefetch(tile)`` -- loads issued before the push, so they retire
+      during the poll; handed back to ``finish``.
+    * ``init_state(color)`` / ``finish(tile, color, accs, prefetched, state)``
+      / ``persist(color, state)`` -- *state* is carried from tile to tile (a
+      pytree of values, ``()`` when there is none); ``finish`` stores the
+      reduced fp32 *accs* and returns the next state; ``persist`` runs on one
+      thread after the last tile.
+
+    Hooks run inline in the kernel trace, so they hold no runtime ``if`` or
+    loop of their own -- those live in the kernel body or a ``@flyc.jit``
+    helper, the only code the AST rewriter sees.
+    """
+
+    fusion = "none"
+    padded = False
+    hidden = None
+    xchg_bytes = 0
+    lds_bytes = 0
+    tag = ""
+
+    def __init__(self, *, block: int | None, atoms: int):
+        if block is None:
+            raise ValueError("a plain build requires block")
+        block = int(block)
+        if block not in SUPPORTED_BLOCKS:
+            raise ValueError(f"block must be one of {SUPPORTED_BLOCKS}, got {block!r}")
+        self.block = block
+        self.row_stride_i32 = block * atoms * ATOM_I32
+
+    def spec(self) -> dict:
+        return {
+            "fusion": self.fusion,
+            "hidden": None,
+            "h_pad": None,
+            "padded": False,
+            "split": 1,
+            "xchg_bytes": 0,
+        }
+
+    def bind(self, *, io, out_buf, **_unused):
+        self.io = io
+        self.out_buf = out_buf
+        return self
+
+    def prefetch(self, tile):
+        return None
+
+    def init_state(self, color):
+        return ()
+
+    def finish(self, tile, color, accs, prefetched, state):
+        self.io.store_tile(self.out_buf, tile, [atom_f32_to_bf16(a) for a in accs])
+        return state
+
+    def persist(self, color, state):
+        pass
+
+
 def make_one_shot_allreduce_kernel(
     *,
     world_size: int,
-    atoms: int = DEFAULT_ATOMS,
+    atoms: int,
     grid: int,
-    inbox_memory: str = "uncached",
-    fanout: str = DEFAULT_FANOUT,
+    inbox_memory: str,
+    fanout: str,
     rank: int,
-    block: int = DEFAULT_BLOCK,
+    block: int | None = None,
+    fusion: str = "none",
+    hidden: int | None = None,
+    h_pad: int | None = None,
+    split: int = 1,
 ):
-    if block not in SUPPORTED_BLOCKS:
-        raise ValueError(f"block must be one of {SUPPORTED_BLOCKS}, got {block!r}")
+    """Build the one-shot all-reduce, plain or fused with residual-add + RMSNorm.
+
+    ``split`` (fused only) spreads each token row over that many workgroups;
+    see ``one_shot_allreduce_rmsnorm``.
+    """
+    check_fusion_args(fusion, hidden, h_pad)
+    split = int(split)
+    if split not in SUPPORTED_SPLITS:
+        raise ValueError(f"split must be one of {SUPPORTED_SPLITS}, got {split!r}")
+    if split > 1 and fusion == "none":
+        raise ValueError("split is only meaningful for a fused build")
     if world_size not in SUPPORTED_WORLDS:
         raise ValueError(
             f"world_size must be one of {SUPPORTED_WORLDS}, got {world_size}"
@@ -163,6 +221,21 @@ def make_one_shot_allreduce_kernel(
     policy = _INBOX_POLICY[inbox_memory]
     payload_policy = policy["payload"]
     release_scope = policy["release"]
+
+    if fusion == "none":
+        epilogue = _PlainEpilogue(block=block, atoms=atoms)
+    else:
+        epilogue = OneShotRMSNormEpilogue(
+            hidden=hidden,
+            h_pad=h_pad,
+            split=split,
+            atoms=atoms,
+            block=block,
+            grid=grid,
+            n_colors=INBOX_BUFFERS,
+        )
+    block = epilogue.block
+    padded = epilogue.padded
 
     tile_bytes = block * atoms * ATOM_BYTES
     tile_i32 = tile_bytes // 4
@@ -186,28 +259,81 @@ def make_one_shot_allreduce_kernel(
     else:
         fanout_pairs = [(p, a) for a in range(atoms) for p in push_peers]
 
+    # One signature for both modes. The fused-only arguments are present (and
+    # passed as zeros) in a plain build rather than being appended to a second
+    # kernel; a plain epilogue never reads them, so only five unused kernargs
+    # remain in a plain build. ``xchg_ptr`` is the split build's exchange
+    # state, and 0 (never read) in every other build.
     @flyc.kernel(known_block_size=[block, 1, 1])
     def one_shot_allreduce(
-        rank: Int32,
-        nbytes: Int64,
-        num_tiles: Int32,
-        inp_ptr: Int64,
-        out_ptr: Int64,
-        peer_ptrs: Int64,
-        colors_ptr: Int64,
-        n_blocks: Int32,
+        rank: fx.Int32,
+        nbytes: fx.Int64,
+        num_tiles: fx.Int32,
+        inp_ptr: fx.Int64,
+        out_ptr: fx.Int64,
+        peer_ptrs: fx.Int64,
+        colors_ptr: fx.Int64,
+        n_blocks: fx.Int32,
+        res_in_ptr: fx.Int64,
+        res_out_ptr: fx.Int64,
+        w_ptr: fx.Int64,
+        eps: fx.Float32,
+        xchg_ptr: fx.Int64,
     ):
         tid = fx.Int32(gpu.thread_id("x"))
         bid = fx.Int32(gpu.block_id("x"))
+
+        # Every HBM operand moves through one tiled copy, one atom-wide row at
+        # a time. A padded build addresses each row through a per-row buffer
+        # descriptor bounded to the true width; an unpadded one slices a
+        # whole-tensor buffer tensor. The one-shot's tile is a single row, so
+        # it never outruns M and the rows need no bound of their own.
+        io = make_row_io(
+            tid=tid,
+            nbytes=nbytes,
+            num_tiles=num_tiles,
+            block=block,
+            atoms_per_row=atoms,
+            rows_per_tile=1,
+            row_stride_i32=epilogue.row_stride_i32,
+            padded=padded,
+            hidden=epilogue.hidden,
+            bound_rows=False,
+        )
 
         peers = _load_peers(peer_ptrs, world_size)
         peer_vec = fx.Vector.from_elements(peers, dtype=fx.Int64)
         inbox = _buffer_ptr(_to_sgpr_i64(peer_vec[rank]), T.i32, 16)
 
-        _load_payload, _store_payload = _payload_io(
-            inp_ptr, out_ptr, nbytes, num_tiles, atoms, block, tid
-        )
+        in_buf = io.operand(inp_ptr)
+        out_buf = io.operand(out_ptr)
         _load_color, _store_color = _color_io(colors_ptr, bid)
+
+        def _wrap(color):
+            """*color* reduced into ``[0, INBOX_BUFFERS)``, for a *color* below
+            twice that."""
+            if color >= fx.Int32(INBOX_BUFFERS):
+                color = color - fx.Int32(INBOX_BUFFERS)
+            return color
+
+        ep = epilogue.bind(
+            tid=tid,
+            bid=bid,
+            io=io,
+            out_buf=out_buf,
+            res_in_ptr=res_in_ptr,
+            res_out_ptr=res_out_ptr,
+            w_ptr=w_ptr,
+            eps=eps,
+            xchg_ptr=xchg_ptr,
+            wrap=_wrap,
+        )
+        # Bare names, not ``ep.<hook>(...)``: the rewriter takes a method call
+        # inside a runtime loop or branch as a possible mutation of its base
+        # and would try to carry ``ep`` through the loop as an SSA value.
+        _prefetch = ep.prefetch
+        _finish = ep.finish
+        _persist = ep.persist
 
         def _slot_i32(buf, src):
             """i32 offset of the wire slot ``[buf][bid][src]``.
@@ -224,12 +350,7 @@ def make_one_shot_allreduce_kernel(
             )
 
         def _load_tile(tile):
-            """This thread's 16 B of each atom of *tile*, as raw i32x4."""
-            return [_load_payload(tile, atom) for atom in range_constexpr(atoms)]
-
-        def _store_tile(tile, vals):
-            for atom in range_constexpr(atoms):
-                _store_payload(tile, atom, vals[atom])
+            return io.load_tile(in_buf, tile)
 
         def _fanout(buf, my_atoms):
             """Push this thread's atoms into every peer's slot for this rank.
@@ -334,12 +455,11 @@ def make_one_shot_allreduce_kernel(
                             payload_policy,
                         )
 
-        def _reduce(my_atoms, polled):
+        def _reduce_f32(my_atoms, polled):
             """Sum this thread's atom across all N contributions, in rank order.
 
             Rank order, not a rotated order: every rank must accumulate in the
             same sequence or the results differ in the last bit across ranks.
-            ``cross_device_reduce`` makes the same promise for the same reason.
             Our own contribution comes out of the registers; the peers' come
             from *polled*, ``_poll``'s result.
             """
@@ -351,26 +471,26 @@ def make_one_shot_allreduce_kernel(
                         raw = my_atoms[atom]
                     else:
                         raw = polled[(src, atom)]
-                    v = _atom_bf16_to_f32(raw)
+                    v = atom_bf16_to_f32(raw)
                     acc = v if acc is None else acc + v
-                outs.append(_atom_f32_to_bf16(acc))
+                outs.append(acc)
             return outs
 
-        def _round(tile, color, raw_atoms):
-            """One tile, from its input atoms; returns the next colour. The
-            colour is the buffer index itself, kept in [0, 3), so it never wraps
-            out of step with the rotation."""
+        def _round(tile, color, raw_atoms, prefetched, state):
+            """One tile, from its input atoms and the epilogue's prefetch.
+
+            Returns ``(next colour, next epilogue state)``. The colour is the
+            buffer index itself, kept in [0, 3), so it never wraps out of step
+            with the rotation.
+            """
             my_atoms = [_canonicalize(v) for v in raw_atoms]
             _fanout(color, my_atoms)
-            _store_tile(tile, _reduce(my_atoms, _poll(color)))
-            rearm = color + fx.Int32(2)
-            if rearm >= fx.Int32(INBOX_BUFFERS):
-                rearm = rearm - fx.Int32(INBOX_BUFFERS)
-            _rearm(rearm)
-            color = color + fx.Int32(1)
-            if color == fx.Int32(INBOX_BUFFERS):
-                color = fx.Int32(0)
-            return color
+            polled = _poll(color)
+            state = _finish(
+                tile, color, _reduce_f32(my_atoms, polled), prefetched, state
+            )
+            _rearm(_wrap(color + fx.Int32(2)))
+            return _wrap(color + fx.Int32(1)), state
 
         # Stride by the *launched* grid, not the compile-time cap: the host may
         # launch fewer blocks than ``grid``, and striding by the cap would leave
@@ -380,32 +500,44 @@ def make_one_shot_allreduce_kernel(
         # first tile, and its input is read before the colour: the two loads are
         # then in flight together rather than one after the other.
         first_atoms = _load_tile(bid)
+        first_x = _prefetch(bid)
         color = _load_color()
-        color = _round(bid, color, first_atoms)
+        state = ep.init_state(color)
+        first = _round(bid, color, first_atoms, first_x, state)
+        color = first[0]
+        state = first[1]
         for i in range(fx.Int32(1), n_block_tiles, fx.Int32(1)):
             # The last round's re-arm must land before this round's push: a peer
             # that sees the push can be one round further on, writing into the
             # slot just re-armed. Between calls the kernel boundary does this.
             rocdl.s_waitcnt(vmcnt=0)
             tile = bid + i * n_blocks
-            color = _round(tile, color, _load_tile(tile))
+            step = _round(tile, color, _load_tile(tile), _prefetch(tile), state)
+            color = step[0]
+            state = step[1]
         if tid == 0:
             _store_color(color)
+            _persist(color, state)
         gpu.barrier()
 
     flat_wg = f"{block},{block}"
 
     @flyc.jit
     def launch_one_shot_allreduce(
-        rank: Int32,
-        nbytes: Int64,
-        num_tiles: Int32,
-        inp_ptr: Int64,
-        out_ptr: Int64,
-        peer_ptrs: Int64,
-        colors_ptr: Int64,
-        grid_x: Int32,
-        stream: Stream = Stream(None),  # noqa: B008
+        rank: fx.Int32,
+        nbytes: fx.Int64,
+        num_tiles: fx.Int32,
+        inp_ptr: fx.Int64,
+        out_ptr: fx.Int64,
+        peer_ptrs: fx.Int64,
+        colors_ptr: fx.Int64,
+        grid_x: fx.Int32,
+        res_in_ptr: fx.Int64,
+        res_out_ptr: fx.Int64,
+        w_ptr: fx.Int64,
+        eps: fx.Float32,
+        xchg_ptr: fx.Int64,
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         one_shot_allreduce(
             rank,
@@ -416,12 +548,18 @@ def make_one_shot_allreduce_kernel(
             peer_ptrs,
             colors_ptr,
             grid_x,
+            res_in_ptr,
+            res_out_ptr,
+            w_ptr,
+            eps,
+            xchg_ptr,
             value_attrs={"rocdl.flat_work_group_size": flat_wg},
         ).launch(grid=(grid_x, 1, 1), block=(block, 1, 1), stream=stream)
 
     tag = f"ws{world_size}_r{self_rank}_a{atoms}_g{grid}_{inbox_memory}_b{block}"
     if atoms > 1:
         tag += f"_{fanout}"
+    tag += epilogue.tag
     launch_one_shot_allreduce.func.__name__ = f"launch_one_shot_allreduce_{tag}"
     try:
         one_shot_allreduce.func.__name__ = f"one_shot_allreduce_{tag}"
@@ -431,11 +569,11 @@ def make_one_shot_allreduce_kernel(
         "launch": launch_one_shot_allreduce,
         "flags_bytes": 0,
         "data_bytes": data_bytes,
-        "lds_bytes": 0,
+        "lds_bytes": epilogue.lds_bytes,
         "tile_bytes": tile_bytes,
         # No handshake sector: a wire slot is just the payload.
         "wire_tile_bytes": tile_bytes,
-        # Shims for ``quick_allreduce_int4._StEngine``, which is reused verbatim for the IPC
+        # Shims for ``quick_allreduce._StEngine``, which is reused verbatim for the IPC
         # inbox and peer table. This schedule has no super-tile (one round per
         # tile, nothing to batch) and no per-rank tile split (every rank sends
         # the whole tile), so the two are 1 and the full tile respectively.
@@ -451,4 +589,5 @@ def make_one_shot_allreduce_kernel(
         "inbox_fill": SENTINEL_FILL_BYTE,
         "grid": grid,
         "block": block,
+        **epilogue.spec(),
     }
