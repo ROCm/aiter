@@ -391,6 +391,9 @@ if PREBUILD_KERNELS != 0:
                 srcs=one_opt_args["srcs"],
                 flags_extra_cc=flags_cc,
                 flags_extra_hip=flags_hip,
+                flags_extra_hip_per_source=one_opt_args.get(
+                    "flags_extra_hip_per_source", {}
+                ),
                 blob_gen_cmd=one_opt_args["blob_gen_cmd"],
                 extra_include=one_opt_args["extra_include"],
                 extra_ldflags=one_opt_args.get("extra_ldflags"),
