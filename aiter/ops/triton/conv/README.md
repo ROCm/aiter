@@ -61,8 +61,36 @@ y = conv2d(
     stride=(1, 1), padding=(1, 1), dilation=(1, 1),
     activation="relu",          # "none" | "relu" | "relu6" | "gelu"
     layout="nchw",              # "nchw" or "nhwc"
+    padding_mode="zeros",
 )
 ```
+
+### Conv2D padding modes
+
+The routed APIs `conv2d`, `conv2d_nchw`, and `conv2d_nhwc` accept the
+keyword-only argument `padding_mode`, defaulting to `"zeros"`. Padding is
+symmetric on opposing sides and accepts an integer or `(pad_height, pad_width)`.
+
+| Mode | Border behavior | Padding limits per spatial axis |
+|---|---|---|
+| `zeros` | Implicit zero padding in convolution | Nonnegative |
+| `reflect` | Mirror without repeating the edge | Less than the input size |
+| `replicate` | Repeat the nearest edge | Nonnegative; no dimension-based maximum |
+| `circular` | Wrap to the opposite edge | At most the input size |
+
+Input spatial dimensions must be positive, and padding must be nonnegative.
+Invalid modes are rejected even when padding is zero.
+
+`zeros` uses implicit padding. For other modes with nonzero padding, the input
+is padded with `torch.nn.functional.pad` before routing and activation packing;
+convolution then uses padding `(0, 0)`. Zero padding amounts skip materialization.
+Layout conversion may require an extra copy.
+
+Input, weight, and bias must share a CUDA/ROCm device. Routed calls use that
+device and restore the caller's current device afterward. Mixed-architecture
+execution within one process is unsupported.
+
+Direct specialized Conv2D APIs and Conv3D support only implicit zero padding.
 
 ### Inference tensors
 
@@ -138,9 +166,10 @@ and seed under both backends, only VAE convs swapped to Triton): max diff
 
 - Only `groups=1` is implemented; callers must send depthwise or grouped
   convolutions to another backend.
-- Only zero padding is implemented. Per-axis pad amounts may differ, for
-  example `(0, 2)` for Conv2D or `(0, 1, 2)` for Conv3D, but callers must send
-  `"reflect"`, `"replicate"`, and `"circular"` padding modes to PyTorch/MIOpen.
+- Routed Conv2D supports `zeros`, `reflect`, `replicate`, and `circular`
+  padding as described above. Direct specialized Conv2D APIs and Conv3D
+  still support only zero padding. Per-axis pad amounts may differ, for
+  example `(0, 2)` for Conv2D or `(0, 1, 2)` for Conv3D.
 - Inputs must be `fp16` or `bf16`.
 - Forward only (no backward / training).
 
