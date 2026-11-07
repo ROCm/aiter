@@ -1169,13 +1169,15 @@ struct Bufs
 // The row itself is the dynamic LDS here, and the load cap matters because a
 // small row cannot occupy many waves: sizing purely from the load count picked a
 // 512-thread block at M=4096 N=2048 (50.2 us) where 256 measures 39.7 us.
-static int small_n_block(int M, int N)
+static int small_n_block(int M, int N, int cu)
 {
     const int t = small_n_threads_from_table(M, N);
     if(t > 0)
         return t;
-    return occupancy_block_threads(
-        M, SMALL_N_STATIC_LDS + N * (int)sizeof(uint32_t), std::max(1, (N / FP32_EPT) / WAVE_SIZE));
+    return occupancy_block_threads(M,
+                                   cu,
+                                   SMALL_N_STATIC_LDS + N * (int)sizeof(uint32_t),
+                                   std::max(1, (N / FP32_EPT) / WAVE_SIZE));
 }
 
 // Builds the output bundle for the requested instantiation. The WRITE_VALUES
@@ -1218,10 +1220,11 @@ static void topk_small_n(const float* d_in,
                          int K,
                          int* d_idx,
                          float* d_val,
+                         int cu,
                          hipStream_t s)
 {
     phase_small_n_topk<RAGGED, WRITE_VALUES, NAN_HIGH>
-        <<<M, small_n_block(M, pitch), (size_t)pitch * sizeof(uint32_t), s>>>(
+        <<<M, small_n_block(M, pitch, cu), (size_t)pitch * sizeof(uint32_t), s>>>(
             d_in,
             pitch,
             make_row_extents<RAGGED>(d_row_starts, d_row_ends),
@@ -1233,8 +1236,8 @@ static void topk_small_n(const float* d_in,
 // phase_a's radix passes when it selects without the wide buffer. 3 give
 // bit-identical candidate counts to 4 (the 4th byte never moves the bucket at
 // fp32 precision); 2 spread to max=3919 against C_alloc=4096.
-constexpr int PHASE_A_PASSES      = 3;
-constexpr int PB_BATCH_MAX_BLOCKS = 2 * CU_COUNT;
+constexpr int PHASE_A_PASSES         = 3;
+constexpr int PB_BATCH_BLOCKS_PER_CU = 2;
 
 // Every launch decision for one call of the three-kernel pipeline, made in one
 // place. Every shape runs phase_b_filter_coop + phase_c_select_contig; g = 1
@@ -1258,15 +1261,17 @@ static LaunchPlan plan_launch(int M, int pitch, const ShapeParams& sp)
     const int S     = sp.S;
     const int cap   = sp.cap;
     const int n4    = pitch / FP32_EPT;
+    const int cu    = sp.cu;
     lp.S            = S;
     lp.rank         = sp.rank;
     lp.cap          = cap;
     lp.chunk_stride = sample_chunk_stride(pitch, S / SAMPLE_CHUNK_ELEMS);
 
     const int wide_buf         = WIDE_WORDS * (int)sizeof(uint32_t);
-    const bool baseline_wide_c = wide_select_fits(M, PHASE_C_STATIC_LDS + cap * 8, 2 * wide_buf);
+    const bool baseline_wide_c = wide_select_fits(M, cu, PHASE_C_STATIC_LDS + cap * 8, 2 * wide_buf);
     const bool compact_wide_c =
-        cap == PHASE_C_CAP && wide_select_fits_allocated(M, PHASE_C_STATIC_LDS + cap * 4, wide_buf);
+        cap == PHASE_C_CAP &&
+        wide_select_fits_allocated(M, cu, PHASE_C_STATIC_LDS + cap * 4, wide_buf);
     const bool resource_compact_c = !sp.keys_only_c && !baseline_wide_c && compact_wide_c;
     lp.keys_only_c                = sp.keys_only_c || resource_compact_c;
     lp.reuse_wide_c               = resource_compact_c;
@@ -1274,15 +1279,16 @@ static LaunchPlan plan_launch(int M, int pitch, const ShapeParams& sp)
         cap * (lp.keys_only_c ? (int)sizeof(uint32_t) : (int)(sizeof(uint32_t) + sizeof(int)));
     lp.nwide_c                = (resource_compact_c || baseline_wide_c) ? 2 : 0;
     const size_t wide_c_bytes = (size_t)wide_buffer_count(lp.nwide_c, lp.reuse_wide_c) * wide_buf;
-    lp.c_block = occupancy_block_threads(M, PHASE_C_STATIC_LDS + c_cand_lds + (int)wide_c_bytes, 0);
+    lp.c_block =
+        occupancy_block_threads(M, cu, PHASE_C_STATIC_LDS + c_cand_lds + (int)wide_c_bytes, 0);
     lp.c_dyn_bytes = (size_t)c_cand_lds + wide_c_bytes;
 
     // Provisional wide/occupancy with keys in LDS; register-resident keys (KPT in
     // {4, 8, 16} when the block divides S) leave LDS, and the wide buffer is
     // re-checked without them. The block size stays the provisional one.
-    bool wide_a         = wide_select_fits(M, PHASE_A_STATIC_LDS + S * 4, wide_buf);
+    bool wide_a         = wide_select_fits(M, cu, PHASE_A_STATIC_LDS + S * 4, wide_buf);
     size_t wide_a_bytes = (size_t)wide_buffer_count(wide_a ? 1 : 0, false) * wide_buf;
-    lp.a_block = occupancy_block_threads(M, PHASE_A_STATIC_LDS + S * 4 + (int)wide_a_bytes, 0);
+    lp.a_block = occupancy_block_threads(M, cu, PHASE_A_STATIC_LDS + S * 4 + (int)wide_a_bytes, 0);
     if(lp.a_block > 0 && (S % lp.a_block) == 0)
     {
         const int kpt = S / lp.a_block;
@@ -1291,7 +1297,7 @@ static LaunchPlan plan_launch(int M, int pitch, const ShapeParams& sp)
     }
     if(lp.pa_kpt > 0)
     {
-        wide_a       = wide_select_fits(M, PHASE_A_STATIC_LDS, wide_buf);
+        wide_a       = wide_select_fits(M, cu, PHASE_A_STATIC_LDS, wide_buf);
         wide_a_bytes = (size_t)wide_buffer_count(wide_a ? 1 : 0, false) * wide_buf;
     }
     lp.nwide_a      = wide_a ? 1 : 0;
@@ -1324,7 +1330,8 @@ static LaunchPlan plan_launch(int M, int pitch, const ShapeParams& sp)
     // The batch never exceeds a thread's loads: dead slots cost 4-7% at 1-2.
     auto batches = [&](int g) {
         const int it = ((n4 + g - 1) / g + PB_BLOCK - 1) / PB_BLOCK;
-        return !lp.nt_st && it >= 2 && (size_t)M * (size_t)g <= (size_t)PB_BATCH_MAX_BLOCKS;
+        return !lp.nt_st && it >= 2 &&
+               (size_t)M * (size_t)g <= (size_t)PB_BATCH_BLOCKS_PER_CU * (size_t)cu;
     };
     const int g = sp.coop_g;
     lp.g        = g;
@@ -1484,12 +1491,12 @@ static inline WsLayout ws_layout(int M, int cap)
     return L;
 }
 
-// A pure function of the shape, so a call never depends on the calls before it.
-// Every call here is ragged, so the geometry is sized by geometry_k_ragged()
-// (topk_shape.hip.hpp) rather than the caller's k.
-static inline ShapeParams params_for(int M, int N, int K)
+// A pure function of the shape and the device's CU count, so a call never
+// depends on the calls before it. Every call here is ragged, so the geometry is
+// sized by geometry_k_ragged() (topk_shape.hip.hpp) rather than the caller's k.
+static inline ShapeParams params_for(int M, int N, int K, int cu)
 {
-    return derive_shape_params(M, N, geometry_k_ragged(K, N));
+    return derive_shape_params(M, N, geometry_k_ragged(K, N), cu);
 }
 
 static inline Bufs bind_bufs(void* ws, const WsLayout& L, int cap)
@@ -1507,48 +1514,57 @@ static inline Bufs bind_bufs(void* ws, const WsLayout& L, int cap)
 
 } // namespace sampled
 
+// gfx950 only: elsewhere the kernels are traps (TOPK_SAMPLED_DEVICE), and the
+// launch plan's LDS would not fit -- at N=262144 k=2048 phase_c asks for
+// 100,352 B of dynamic LDS at M=1 and 67,584 B at M=64, against gfx942's
+// 65,536 B. Answered per device: one process can drive gfx942 and gfx950 GPUs
+// side by side, or gfx950 parts with different CU counts, so a single
+// process-wide answer would let one GPU's verdict or plan stand for another's.
+// Cached, because the property query costs far more than the rest of
+// topk_sampled_supports, which the entry repeats on every call.
+struct SampledDevice
+{
+    bool ok; // gfx950
+    int cu;
+};
+
+static SampledDevice sampled_device(int device)
+{
+    if(device < 0)
+        HIP_CALL(hipGetDevice(&device));
+    constexpr int kCached = 64;
+    static std::atomic<int> cached[kCached]; // 0 unknown, else 2 * cu + ok
+    if(device < kCached)
+    {
+        const int v = cached[device].load(std::memory_order_relaxed);
+        if(v != 0)
+            return {(v & 1) != 0, v >> 1};
+    }
+    hipDeviceProp_t prop;
+    HIP_CALL(hipGetDeviceProperties(&prop, device));
+    const bool ok = std::strncmp(prop.gcnArchName, "gfx950", 6) == 0 &&
+                    (prop.gcnArchName[6] == '\0' || prop.gcnArchName[6] == ':');
+    const int cu  = std::max(1, prop.multiProcessorCount);
+    if(device < kCached)
+        cached[device].store(2 * cu + (ok ? 1 : 0), std::memory_order_relaxed);
+    return {ok, cu};
+}
+
 // Published to Python so the caller allocates the scratch (aiter's rule: host
 // code here never allocates device memory). Plain scratch, not zeroed: Phase A
 // clears the reservation counters before any consumer reads them, and the
-// small_n path touches none of them.
-int64_t topk_sampled_workspace_size(int64_t numRows, int64_t stride0, int64_t k)
+// small_n path touches none of them. device_id < 0 sizes it for the current
+// device.
+int64_t topk_sampled_workspace_size(int64_t numRows, int64_t stride0, int64_t k, int64_t device_id)
 {
     if(numRows <= 0)
         return 1;
     const int M   = static_cast<int>(numRows);
     const int N   = static_cast<int>(stride0);
     const int K   = static_cast<int>(k);
-    const auto sp = sampled::params_for(M, N, K);
+    const auto sp = sampled::params_for(M, N, K, sampled_device(static_cast<int>(device_id)).cu);
     const int cap = sp.path == PATH_SMALL_N ? 0 : sp.cap;
     return static_cast<int64_t>(sampled::ws_layout(M, cap).total);
-}
-
-// gfx950 only: elsewhere the kernels are traps (TOPK_SAMPLED_DEVICE), and the
-// launch plan's LDS would not fit -- at N=262144 k=2048 phase_c asks for
-// 100,352 B of dynamic LDS at M=1 and 67,584 B at M=64, against gfx942's
-// 65,536 B. Answered per device: one process can drive gfx942 and gfx950 GPUs
-// side by side, so a single process-wide answer would let one GPU's verdict
-// stand for another's. Cached, because the property query costs far more than
-// the rest of topk_sampled_supports, which the entry repeats on every call.
-static bool sampled_device_ok(int device)
-{
-    if(device < 0)
-        HIP_CALL(hipGetDevice(&device));
-    constexpr int kCached = 64;
-    static std::atomic<signed char> verdict[kCached]; // 0 unknown, 1 no, 2 yes
-    if(device < kCached)
-    {
-        const signed char v = verdict[device].load(std::memory_order_relaxed);
-        if(v != 0)
-            return v == 2;
-    }
-    hipDeviceProp_t prop;
-    HIP_CALL(hipGetDeviceProperties(&prop, device));
-    const bool ok = std::strncmp(prop.gcnArchName, "gfx950", 6) == 0 &&
-                    (prop.gcnArchName[6] == '\0' || prop.gcnArchName[6] == ':');
-    if(device < kCached)
-        verdict[device].store(ok ? 2 : 1, std::memory_order_relaxed);
-    return ok;
 }
 
 // Reports whether this op can serve the shape at all, so Python can route
@@ -1560,7 +1576,7 @@ static bool sampled_device_ok(int device)
 // derives once for both the test and the launch.
 static bool sampled_args_ok(int64_t numRows, int64_t stride0, int64_t k, int64_t device_id)
 {
-    if(!sampled_device_ok(static_cast<int>(device_id)))
+    if(!sampled_device(static_cast<int>(device_id)).ok)
         return false;
     if(numRows <= 0 || stride0 <= 0 || k <= 0)
         return false;
@@ -1585,8 +1601,10 @@ bool topk_sampled_supports(int64_t numRows, int64_t stride0, int64_t k, int64_t 
     // fallback through the bounds-checked loader (topk_generalize.hip.hpp). A
     // change to any of them has to keep that.
     return sampled_args_ok(numRows, stride0, k, device_id) &&
-           sampled::params_for(
-               static_cast<int>(numRows), static_cast<int>(stride0), static_cast<int>(k))
+           sampled::params_for(static_cast<int>(numRows),
+                               static_cast<int>(stride0),
+                               static_cast<int>(k),
+                               sampled_device(static_cast<int>(device_id)).cu)
                .geom_ok;
 }
 
@@ -1656,7 +1674,8 @@ void top_k_per_row_prefill_sampled(
     const int M          = static_cast<int>(numRows);
     const int N          = static_cast<int>(stride0);
     const int K          = static_cast<int>(k);
-    const ShapeParams sp = args_ok ? sampled::params_for(M, N, K) : ShapeParams{};
+    const ShapeParams sp =
+        args_ok ? sampled::params_for(M, N, K, sampled_device(logits.device_id).cu) : ShapeParams{};
     AITER_CHECK(args_ok && sp.geom_ok,
                 "top_k_per_row_prefill_sampled: unsupported shape (numRows=",
                 numRows,
@@ -1694,24 +1713,24 @@ void top_k_per_row_prefill_sampled(
         {
             if(ragged_small)
                 topk_small_n<true, false, true>(
-                    in, M, N, row_starts, row_ends, K, idx, nullptr, stream);
+                    in, M, N, row_starts, row_ends, K, idx, nullptr, sp.cu, stream);
             else
                 topk_small_n<false, false, true>(
-                    in, M, N, row_starts, row_ends, K, idx, nullptr, stream);
+                    in, M, N, row_starts, row_ends, K, idx, nullptr, sp.cu, stream);
         }
         else if(ragged_small)
         {
             if(val)
-                topk_small_n<true, true>(in, M, N, row_starts, row_ends, K, idx, val, stream);
+                topk_small_n<true, true>(in, M, N, row_starts, row_ends, K, idx, val, sp.cu, stream);
             else
-                topk_small_n<true, false>(in, M, N, row_starts, row_ends, K, idx, nullptr, stream);
+                topk_small_n<true, false>(in, M, N, row_starts, row_ends, K, idx, nullptr, sp.cu, stream);
         }
         else
         {
             if(val)
-                topk_small_n<false, true>(in, M, N, row_starts, row_ends, K, idx, val, stream);
+                topk_small_n<false, true>(in, M, N, row_starts, row_ends, K, idx, val, sp.cu, stream);
             else
-                topk_small_n<false, false>(in, M, N, row_starts, row_ends, K, idx, nullptr, stream);
+                topk_small_n<false, false>(in, M, N, row_starts, row_ends, K, idx, nullptr, sp.cu, stream);
         }
         HIP_CALL_LAUNCH(hipGetLastError());
         return;

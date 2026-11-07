@@ -2417,7 +2417,8 @@ namespace py = pybind11;
           &topk_sampled_workspace_size,          \
           py::arg("numRows"),                    \
           py::arg("stride0"),                    \
-          py::arg("k"));                         \
+          py::arg("k"),                          \
+          py::arg("device_id") = -1);            \
     m.def("topk_sampled_supports",               \
           &topk_sampled_supports,                \
           py::arg("numRows"),                    \
