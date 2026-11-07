@@ -219,7 +219,9 @@ def build_fwd_pass_state(
     ``backward`` runs the adjoint recurrence instead: chunks in reverse order,
     with ``x`` <- dout, ``b`` <- c and weights ``w[t] = exp2(d[t])``, giving the
     state gradient leaving each chunk and the initial-state gradient. Chunk
-    states are stored in fp32 if ``state_f32``, else bf16.
+    states are stored in fp32 if ``state_f32``, else bf16; in fp32 mode the
+    weighted operand ``B * w`` is fed as a bf16 high / low pair (two WMMAs), so
+    the states keep fp32 accuracy instead of that of one bf16 rounding.
 
     The chunk loop is walked in slabs of ``16 * ks`` tokens (the GEMM K loop of
     ``x^T @ (B * w)``). Each slab's x and B tiles are staged into LDS transposed
@@ -404,16 +406,23 @@ def build_fwd_pass_state(
                     b_raw = _lds_load(
                         lds, B_OFF + ((TILE * j + l16) * XS + t0) * 2, fx.BFloat16, OK
                     )
-                    b_ops.append(
-                        _bf16_vec(
-                            [fx.Float32(b_raw[k]) * wv[k] for k in range_constexpr(OK)]
+                    bw = [fx.Float32(b_raw[k]) * wv[k] for k in range_constexpr(OK)]
+                    b_hi = _bf16_vec(bw)
+                    if const_expr(state_f32):
+                        # x / dout are exact bf16; split B * w into two bf16
+                        # terms so the fp32 state is not limited by its rounding.
+                        b_lo = _bf16_vec(
+                            [bw[k] - fx.Float32(b_hi[k]) for k in range_constexpr(OK)]
                         )
-                    )
+                        b_ops.append((b_hi, b_lo))
+                    else:
+                        b_ops.append((b_hi,))
                 for i in range_constexpr(rm):
                     for j in range_constexpr(rn):
-                        s_accs[i * rn + j] = _wmma(
-                            a_ops[i], b_ops[j], s_accs[i * rn + j]
-                        )
+                        for b_op in b_ops[j]:
+                            s_accs[i * rn + j] = _wmma(
+                                a_ops[i], b_op, s_accs[i * rn + j]
+                            )
 
             gpu.barrier()
             store_slab(*nxt)
