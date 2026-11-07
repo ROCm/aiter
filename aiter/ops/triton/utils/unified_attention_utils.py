@@ -91,8 +91,8 @@ def _ua3d_nhd_override_applies(op, params, backend, arch) -> bool:
         and not params.shuffled_kv_cache
         and params.all_decode
         and params.sliding_window <= 0
-        and params.q_dtype == torch.bfloat16
-        and params.kv_cache_dtype == torch.bfloat16
+        and params.q_dtype in (torch.bfloat16, e4m3_dtype)
+        and params.kv_cache_dtype in (torch.bfloat16, e4m3_dtype)
     )
 _OPS = ("attn_2d", "attn_3d", "reduce", "kv_split")
 
