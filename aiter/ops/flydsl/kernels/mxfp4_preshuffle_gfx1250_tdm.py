@@ -1873,10 +1873,17 @@ def build_gemm_a8w4_tdm_task(
                     + idx * WMMA_VECTOR_DWORDS,
                 )
 
-        # Preserve ordinary zero constants on unpeeled paths. A side-effecting
-        # inline-asm identity forces separate Lo256 live ranges for every C
-        # vector and can spill wide fallback tiles before their first WMMA.
-        if const_expr(not inline_zero_acc):
+        # Pin the ring phi's initial zero before the prologue fence, so its
+        # materialization overlaps TDM rather than the first LDS/WMMA reads.
+        # Short pipelines retain the common initialization below.
+        early_zero_acc = (
+            resident_ring_addresses
+            and not inline_zero_acc
+            and K_TILES > num_buffers
+            and callable(getattr(rocdl, "sched_vgpr", None))
+        )
+        # Preserve ordinary zero constants on all other unpeeled paths.
+        if const_expr(not inline_zero_acc and not early_zero_acc):
             for cf in c_frags:
                 cf.store(fx.constant_vector(0.0, T.vec(WMMA_VECTOR_DWORDS, T.f32)))
 
@@ -2661,6 +2668,20 @@ def build_gemm_a8w4_tdm_task(
                     a_ready_gate()
                     for i in range_constexpr(PRE):
                         issue(i, i)
+                    if const_expr(early_zero_acc):
+                        rocdl.sched_barrier(0)
+                        for idx in range_constexpr(n_acc):
+                            c_frags[idx].store(
+                                Vec(
+                                    rocdl.sched_vgpr(
+                                        fx.constant_vector(
+                                            0.0, T.vec(WMMA_VECTOR_DWORDS, T.f32)
+                                        ),
+                                        256 + idx * WMMA_VECTOR_DWORDS,
+                                    )
+                                )
+                            )
+                        rocdl.sched_barrier(0)
                     n_steady = K_TILES - PRE
                     if const_expr(next_stage_on):
                         pipeline_fence(outstanding=TDM_PER * (PRE - 1))
