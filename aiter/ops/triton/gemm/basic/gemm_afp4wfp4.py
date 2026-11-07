@@ -42,6 +42,22 @@ _GLUON_DEFAULT_ARCHS = (
 )
 
 
+def _block_k_without_masked_tail(k: int, block_k: int) -> int:
+    """Return a BLOCK_SIZE_K for a K loop over k FP4 values.
+
+    A software-pipelined K loop of two iterations with a masked last iteration gives
+    wrong values, often NaN, when M is a multiple of 16 (Triton 3.7, gfx950). For that
+    loop, use the largest power of two from 256 that divides k, so that no iteration
+    is masked. Return block_k for all other loops.
+    """
+    if k % block_k == 0 or triton.cdiv(k, block_k) != 2:
+        return block_k
+    b = block_k
+    while b > 256 and k % b:
+        b //= 2
+    return b if k % b == 0 else block_k
+
+
 def set_use_gemm_splitk_bf16(value: bool):
     global _USE_GEMM_SPLITK_BF16
     _USE_GEMM_SPLITK_BF16 = value
@@ -230,6 +246,10 @@ def gemm_afp4wfp4_(
             config["SPLITK_BLOCK_SIZE"] = 2 * K
             config["NUM_KSPLIT"] = 1
         config["BLOCK_SIZE_K"] = max(config["BLOCK_SIZE_K"], 128)
+        if config["NUM_KSPLIT"] == 1:
+            config["BLOCK_SIZE_K"] = _block_k_without_masked_tail(
+                2 * K, config["BLOCK_SIZE_K"]
+            )
 
     return_y_pp = config["NUM_KSPLIT"] > 1 and skip_reduce
 
