@@ -301,6 +301,13 @@ _LL128_MIXED_SIZES = {
 # owning block (16, 32 and 1 blocks) from one call to the next.
 _LL_GFX1250_MIXED_SIZES = [32000, 32768, 512]
 
+# Back-to-back gfx1250 messages at TP4 and TP8 that alternate the LL two-shot
+# kernel (1.15 MB and 4.59 MB of fp32) with the one-shot LL (0.36 MB). Each
+# kernel keeps its own scratch and per-block epochs. The 4.59 MB message runs
+# the two-shot with 512-thread blocks instead of 256. fp32, so that the expected
+# bits depend on the order the ranks are summed in (see rank_order).
+_LL2S_GFX1250_MIXED_SIZES = [40 * 7168, 25 * 3584, 160 * 7168]
+
 
 def _is_gfx1250() -> bool:
     return (
@@ -335,7 +342,16 @@ def _start_queue_evictions(stop):
 
 
 def _allreduce_mixed_size_regression(
-    rank, tp_size, sizes, iterations, distributed_init_method, stop, name, check_every
+    rank,
+    tp_size,
+    sizes,
+    iterations,
+    distributed_init_method,
+    stop,
+    name,
+    check_every,
+    vary_inputs=False,
+    rank_order=False,
 ):
     from aiter.dist.device_communicators.custom_all_reduce import CustomAllreduce
 
@@ -349,9 +365,27 @@ def _allreduce_mixed_size_regression(
     generator = torch.Generator().manual_seed(2026)
     inputs, refs = [], []
     for n in sizes:
+        if rank_order:
+            # Random fp32 partials: most of their sums round differently in
+            # another order, so the expected bits pin the order 0..n-1 that
+            # every custom all-reduce sums ranks in.
+            x = torch.randn((tp_size, n), generator=generator)
+            ref = x[0].clone()
+            for peer in range(1, tp_size):
+                ref += x[peer]
+            inputs.append(x[rank].to(device))
+            refs.append(ref.to(device))
+            continue
         x = torch.randint(-8, 9, (tp_size, n), generator=generator, dtype=torch.int16)
         inputs.append(x[rank].to(device, torch.bfloat16))
         refs.append(x.sum(dim=0, dtype=torch.float32).to(device, torch.bfloat16))
+    # With vary_inputs, rounds cycle through x, -x and 2x (all exact), so a
+    # stale line, left in a scratch bank by its previous use one or two rounds
+    # back, never carries the bits now expected.
+    variants = [(inputs, refs)]
+    if vary_inputs:
+        for factor in (-1, 2):
+            variants.append(([x * factor for x in inputs], [r * factor for r in refs]))
     # Opt-in: how the evictions behave depends on the host's KFD driver.
     evict = os.environ.get("AITER_TEST_LL128_EVICT") == "1"
     # Rank 1 reads the peer slots that a faster rank's next call overlaps.
@@ -360,7 +394,8 @@ def _allreduce_mixed_size_regression(
     dist.barrier()
     done = torch.cuda.Event()
     for iteration in range(iterations):
-        outs = [ca_comm.custom_all_reduce(x, use_new=True) for x in inputs]
+        round_inputs, round_refs = variants[iteration % len(variants)]
+        outs = [ca_comm.custom_all_reduce(x, use_new=True) for x in round_inputs]
         if iteration % check_every != check_every - 1:
             continue
         done.record()
@@ -374,7 +409,7 @@ def _allreduce_mixed_size_regression(
                 stop.set()
                 deadline, evicting = time.time() + 60, False
             time.sleep(0.001)
-        for n, out, ref in zip(sizes, outs, refs):
+        for n, out, ref in zip(sizes, outs, round_refs):
             context = f"{name} {rank=} {iteration=} numel={n}"
             torch.testing.assert_close(
                 out,
@@ -420,7 +455,33 @@ def test_allreduce_ll_gfx1250_mixed_size_regression(tp_size, iterations=1000):
     )
 
 
-def _run_mixed_size_regression(tp_size, sizes, iterations, name, check_every):
+def test_allreduce_ll2s_gfx1250_mixed_size_regression(tp_size, iterations=200):
+    # Mixing the LL two-shot with the one-shot LL, and two-shot launches of
+    # different block sizes, must neither accept a stale line nor overwrite a
+    # slower peer's unread one, and both must sum the ranks in order 0..n-1.
+    # The two-shot runs at TP4 and TP8 only (ar2sMaxBytes).
+    if not _is_gfx1250() or tp_size not in (4, 8):
+        return
+    _run_mixed_size_regression(
+        tp_size,
+        _LL2S_GFX1250_MIXED_SIZES,
+        iterations,
+        "gfx1250 LL two-shot",
+        1,
+        vary_inputs=True,
+        rank_order=True,
+    )
+
+
+def _run_mixed_size_regression(
+    tp_size,
+    sizes,
+    iterations,
+    name,
+    check_every,
+    vary_inputs=False,
+    rank_order=False,
+):
     torch.multiprocessing.spawn(
         _allreduce_mixed_size_regression,
         args=(
@@ -431,6 +492,8 @@ def _run_mixed_size_regression(tp_size, sizes, iterations, name, check_every):
             torch.multiprocessing.get_context("spawn").Event(),
             name,
             check_every,
+            vary_inputs,
+            rank_order,
         ),
         nprocs=tp_size,
         join=True,
@@ -560,6 +623,7 @@ if __name__ == "__main__":
                 if tp <= args.tp_size:
                     test_allreduce_ll128_mixed_size_regression(tp)
             test_allreduce_ll_gfx1250_mixed_size_regression(args.tp_size)
+            test_allreduce_ll2s_gfx1250_mixed_size_regression(args.tp_size)
     if args.regression:
         raise SystemExit(0)
     with_graph = args.mode == "graph"
