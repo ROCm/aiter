@@ -1,7 +1,10 @@
 # tests are adapted from https://github.com/deepseek-ai/DeepGEMM/blob/main/tests/test_attention.py
+from collections import defaultdict
+
 import pytest
 import torch
 
+import aiter.ops.triton.attention.fp8_mqa_logits as fp8_mqa_logits_launcher
 from aiter.ops.triton.attention.fp8_mqa_logits import fp8_mqa_logits
 from aiter.ops.triton.utils.types import get_fp8_dtypes
 
@@ -250,3 +253,21 @@ def test_fp8_mqa_logits_nonzero_cu_start(
     logits = logits.masked_fill(neginf_mask, 0)
     diff = calc_diff(logits, ref_logits)
     assert diff < 1e-4, f"{diff=}"
+
+
+@pytest.mark.skipif(
+    fp8_mqa_logits_launcher.arch != "gfx950"
+    or not fp8_mqa_logits_launcher.TRITON_GE_36
+    or fp8_mqa_logits_launcher._gluon_fp8_mqa_logits_kernel is None,
+    reason="gfx950 Gluon kernel only",
+)
+@torch.inference_mode()
+def test_fp8_mqa_logits_query_rows_do_not_add_specializations(monkeypatch) -> None:
+    # Query row counts 16, 17, 1 and 33 fall in different Triton integer
+    # specialization classes; 64 heads and 1024 KV rows fix every launch constexpr.
+    kernel = fp8_mqa_logits_launcher._gluon_fp8_mqa_logits_kernel
+    monkeypatch.setattr(kernel, "device_caches", defaultdict(kernel.create_binder))
+    cache = kernel.device_caches[torch.cuda.current_device()][0]
+    for s_q in (16, 17, 1, 33):
+        test_fp8_mqa_logits(s_q, 1024, 64, 128, disable_cp=True, clean_logits=True)
+    assert len(cache) == 1
