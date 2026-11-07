@@ -37,6 +37,7 @@ import time
 from dataclasses import dataclass
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.ops.flydsl.comm_collectives_host_shared import INBOX_MEMORY_MODES
 
 # Requested global shapes (B, S, H, D); S is padded up to a multiple of world * 32.
 _SHAPES = {
@@ -385,7 +386,8 @@ def _run_recipe(
 def _render(records, shapes, world, arch, args, elapsed_s):
     lines = [
         (
-            f"world={world}; GPU arch={arch}; rotations={_ROTATIONS}; "
+            f"world={world}; GPU arch={arch}; link={args.link}; "
+            f"inbox={args.resolved_inbox}; rotations={_ROTATIONS}; "
             f"warmup={args.warmup}; iters={args.iterations}"
         )
     ]
@@ -427,9 +429,13 @@ def _render(records, shapes, world, arch, args, elapsed_s):
 def _worker(rank, world, args):
     os.environ.setdefault("MORI_SHMEM_HEAP_SIZE", "12G")
 
-    import mori.shmem as ms
     import torch
     import torch.distributed as dist
+
+    # Only the uncached (MoRI heap) path needs MoRI.
+    ms = None
+    if args.resolved_inbox == "uncached":
+        import mori.shmem as ms
 
     torch.cuda.set_device(rank)
     device = torch.device("cuda", rank)
@@ -446,8 +452,9 @@ def _worker(rank, world, args):
     start = time.perf_counter()
     try:
         cpu_group = dist.new_group(backend="gloo")
-        torch._C._distributed_c10d._register_process_group("mori", cpu_group)
-        ms.shmem_torch_process_group_init("mori")
+        if ms is not None:
+            torch._C._distributed_c10d._register_process_group("mori", cpu_group)
+            ms.shmem_torch_process_group_init("mori")
         for shape_name in args.shapes:
             requested = _SHAPES[shape_name]
             shape = _local_shape(requested, world)
@@ -482,7 +489,11 @@ def _worker(rank, world, args):
                     recipe,
                     args,
                     dist.group.WORLD,
-                    functools.partial(AttentionA2AIntraNodeOp, group=cpu_group),
+                    functools.partial(
+                        AttentionA2AIntraNodeOp,
+                        group=cpu_group,
+                        inbox_memory=args.resolved_inbox,
+                    ),
                     packers,
                 )
             del inputs
@@ -503,7 +514,8 @@ def _worker(rank, world, args):
         # Skip finalize while an exception unwinds: a peer may be mid-collective.
         if sys.exc_info()[0] is None:
             try:
-                ms.shmem_finalize()
+                if ms is not None:
+                    ms.shmem_finalize()
             finally:
                 dist.destroy_process_group()
 
@@ -523,6 +535,13 @@ def main():
     parser.add_argument("--master-port", type=int, default=29517)
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--iterations", type=int, default=15)
+    parser.add_argument(
+        "--inbox-memory",
+        choices=INBOX_MEMORY_MODES,
+        default="auto",
+        help="memory type of the peer-written buffers (auto: uncached on xGMI, "
+        "fine-grained on PCIe); only uncached needs MoRI",
+    )
     args = parser.parse_args()
     if args.warmup < 0 or args.iterations <= 0:
         parser.error("--warmup must be nonnegative and --iterations positive")
@@ -546,6 +565,14 @@ def main():
             f"SKIP: world={args.world_size}, only {torch.cuda.device_count()} HIP devices visible"
         )
         return 0
+    from aiter.ops.flydsl.allreduce_policy import detect_link
+    from aiter.ops.flydsl.comm_collectives_host_shared import resolve_inbox_flags
+
+    # Only auto depends on the link; a named mode must not fail without it.
+    args.link = detect_link() if args.inbox_memory == "auto" else "n/a"
+    args.resolved_inbox = resolve_inbox_flags(
+        args.inbox_memory, args.world_size, args.link
+    )[1]
     mp.spawn(_worker, args=(args.world_size, args), nprocs=args.world_size, join=True)
     return 0
 

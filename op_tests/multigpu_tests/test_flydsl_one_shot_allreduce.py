@@ -710,7 +710,7 @@ def _capture_first_rank(rank: int, tp: int, init_method: str) -> dict:
     import torch.distributed as dist
 
     from aiter.dist.parallel_state import graph_capture
-    from aiter.ops.flydsl.allreduce_host_shared import launcher_loaded
+    from aiter.ops.flydsl.comm_collectives_host_shared import launcher_loaded
 
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)

@@ -57,7 +57,7 @@ from aiter.ops.custom_all_reduce import (
     free_meta_buffer,
     get_meta_buffer_ipc_handle,
 )
-from aiter.ops.flydsl.quick_allreduce_int4_ipc import UncachedIpcHeap
+from aiter.ops.flydsl.ipc_heap import IpcHeap
 from aiter.ops.msa_block_select import (
     CP_MAX_BLOCKS,
     pa_sparse_block_score_decode,
@@ -112,7 +112,7 @@ def _ipc_alloc(nbytes: int, rank: int, world: int) -> tuple[torch.Tensor, int, l
         if r == rank:
             peers.append(ptr)
             continue
-        mapped = UncachedIpcHeap.open_mem_handle(handles[r])
+        mapped = IpcHeap.open_mem_handle(handles[r])
         opened.append(mapped)
         peers.append(mapped)
     return torch.tensor(peers, dtype=torch.int64, device="cpu"), ptr, opened
@@ -335,7 +335,7 @@ def _worker(rank, world, port, num_idx_heads, ctxs, batches):
         dist.barrier()
     finally:
         for mapped in opened:
-            UncachedIpcHeap.close_mem_handle(mapped)
+            IpcHeap.close_mem_handle(mapped)
         free_meta_buffer(own_ptr)
         dist.destroy_process_group()
 

@@ -26,6 +26,7 @@ import torch.distributed as dist
 
 import aiter
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.flydsl.comm_collectives_host_shared import INBOX_MEMORY_MODES
 from aiter.ops.mha_v4 import AttentionPack
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 from aiter.utility.fp4_utils import _f32_to_floatx_unpacked, e8m0_to_f32
@@ -688,19 +689,23 @@ def _check_valid_kv_rejections(rank, world_size, op_cls):
 def _check_group_disagreement(rank, world_size, op_cls):
     """Differing configs must raise ValueError on every rank before any allocation."""
     failure = None
-    try:
-        op_cls(
-            rank=rank,
-            world_size=world_size,
-            shape=(1, 64, 8, 128),
-            block_num=64 if rank == 0 else _DEFAULT_BLOCKS,
-        )
-        failure = "accepted a config that differs across ranks"
-    except ValueError as exc:
-        if "disagree" not in str(exc):
-            failure = f"wrong ValueError: {exc}"
-    except Exception as exc:  # noqa: BLE001
-        failure = f"{type(exc).__name__}: {exc}"
+    # Each case differs on rank 0 only. The inbox_memory one must raise before
+    # the heap exists, even where one rank would fail its MoRI check.
+    cases = (
+        {"block_num": 64 if rank == 0 else _DEFAULT_BLOCKS},
+        {"inbox_memory": "uncached" if rank == 0 else "finegrained"},
+    )
+    for case in cases:
+        try:
+            op_cls(rank=rank, world_size=world_size, shape=(1, 64, 8, 128), **case)
+            failure = f"accepted a config that differs across ranks: {case}"
+        except ValueError as exc:
+            if "disagree" not in str(exc):
+                failure = f"wrong ValueError: {exc}"
+        except Exception as exc:  # noqa: BLE001
+            failure = f"{type(exc).__name__}: {exc}"
+        if failure is not None:
+            break
     # Report cross-rank so one rank's failure is seen by all, not just itself.
     flags = torch.zeros(world_size, dtype=torch.int32)
     flags[rank] = failure is not None
@@ -1340,20 +1345,28 @@ def test_a2a(world_size, recipe, sequence, heads, blocks):
     gc.collect()
     return {
         "gfx": _CTX.gfx,
+        "inbox": _CTX.inbox_memory,
         "a2a us": us,
         "a2a TB/s": nbytes / us / 1e6,
         "a2a err": _STATS.err,
     }
 
 
-def _run_rank(rank, world_size, port, recipes, sequences, heads_list, valid_kv_len):
+def _run_rank(
+    rank, world_size, port, recipes, sequences, heads_list, valid_kv_len, inbox_memory
+):
     _CTX.valid_kv_len = valid_kv_len
     os.environ.setdefault("MORI_SHMEM_HEAP_SIZE", "12G")
     torch.cuda.set_device(rank)
     device = torch.device("cuda", rank)
-    import mori.shmem as ms
-
     from aiter.ops.flydsl.attention_a2a_intranode import AttentionA2AIntraNodeOp
+    from aiter.ops.flydsl.comm_collectives_host_shared import resolve_inbox_flags
+
+    # Only the uncached (MoRI heap) path needs MoRI.
+    _CTX.inbox_memory = resolve_inbox_flags(inbox_memory, world_size)[1]
+    ms = None
+    if _CTX.inbox_memory == "uncached":
+        import mori.shmem as ms
 
     dist.init_process_group(
         "cpu:gloo,cuda:nccl",
@@ -1364,8 +1377,9 @@ def _run_rank(rank, world_size, port, recipes, sequences, heads_list, valid_kv_l
     )
     try:
         cpu_group = dist.new_group(backend="gloo")
-        torch._C._distributed_c10d._register_process_group("mori", cpu_group)
-        ms.shmem_torch_process_group_init("mori")
+        if ms is not None:
+            torch._C._distributed_c10d._register_process_group("mori", cpu_group)
+            ms.shmem_torch_process_group_init("mori")
         gfx = get_gfx()
         _CTX.rank, _CTX.device, _CTX.gfx = rank, device, gfx
         _CTX.cpu_group = cpu_group
@@ -1375,7 +1389,9 @@ def _run_rank(rank, world_size, port, recipes, sequences, heads_list, valid_kv_l
             else (torch.float8_e4m3fn, 448.0)
         )
         rows = []
-        _CTX.op_cls = functools.partial(AttentionA2AIntraNodeOp, group=cpu_group)
+        _CTX.op_cls = functools.partial(
+            AttentionA2AIntraNodeOp, group=cpu_group, inbox_memory=inbox_memory
+        )
         _check_valid_kv_rejections(rank, world_size, _CTX.op_cls)
         _check_group_disagreement(rank, world_size, _CTX.op_cls)
         _check_negative_construction(rank, world_size, _CTX.op_cls)
@@ -1400,6 +1416,7 @@ def _run_rank(rank, world_size, port, recipes, sequences, heads_list, valid_kv_l
             _CTX.op_cls = functools.partial(
                 AttentionA2AIntraNodeOp,
                 group=cpu_group,
+                inbox_memory=inbox_memory,
                 block_num=_OVERSUBSCRIBED_BLOCKS,
             )
             rows.append(
@@ -1414,12 +1431,13 @@ def _run_rank(rank, world_size, port, recipes, sequences, heads_list, valid_kv_l
         return rows, _STATS.checks
     finally:
         try:
-            ms.shmem_finalize()
+            if ms is not None:
+                ms.shmem_finalize()
         finally:
             dist.destroy_process_group()
 
 
-def _run_world(world_size, recipes, sequences, heads_list, valid_kv_len):
+def _run_world(world_size, recipes, sequences, heads_list, valid_kv_len, inbox_memory):
     visible = torch.cuda.device_count()
     if visible < world_size:
         aiter.logger.warning(
@@ -1431,7 +1449,16 @@ def _run_world(world_size, recipes, sequences, heads_list, valid_kv_len):
         results = pool.starmap(
             _run_rank,
             [
-                (rank, world_size, port, recipes, sequences, heads_list, valid_kv_len)
+                (
+                    rank,
+                    world_size,
+                    port,
+                    recipes,
+                    sequences,
+                    heads_list,
+                    valid_kv_len,
+                    inbox_memory,
+                )
                 for rank in range(world_size)
             ],
         )
@@ -1482,6 +1509,13 @@ def main():
         default=None,
         help="compact K/V length for v4-consumer recipes; Q retains the padded length",
     )
+    parser.add_argument(
+        "--inbox-memory",
+        choices=INBOX_MEMORY_MODES,
+        default="auto",
+        help="memory type of the peer-written buffers (auto: uncached on xGMI,\n"
+        "fine-grained on PCIe); only uncached needs MoRI",
+    )
     args = parser.parse_args()
     if args.valid_kv_len is not None and any(
         not recipe.startswith("v4-consumer-") for recipe in args.recipes
@@ -1493,7 +1527,12 @@ def main():
     rows, checks = [], 0
     for world_size in args.world_sizes:
         world_rows, world_checks = _run_world(
-            world_size, args.recipes, args.sequences, args.heads, args.valid_kv_len
+            world_size,
+            args.recipes,
+            args.sequences,
+            args.heads,
+            args.valid_kv_len,
+            args.inbox_memory,
         )
         rows += world_rows
         checks += world_checks

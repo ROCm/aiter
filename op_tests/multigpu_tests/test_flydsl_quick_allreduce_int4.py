@@ -138,8 +138,8 @@ from aiter.ops.flydsl.kernels.comm.allreduce_shared import (
 from aiter.ops.flydsl.kernels.comm.quick_allreduce_int4 import clamp_grid_cap
 from aiter.ops.flydsl.quick_allreduce_int4 import (
     DEFAULT_DIVISOR,
-    _resolve_inbox_flags,
     batches_publishes,
+    resolve_inbox_flags,
 )
 
 ARCH = get_gfx()
@@ -487,7 +487,7 @@ def _kernel_payloads(
     everything.
     """
     ladder = _ladder(algorithm, world_size, link)
-    inbox_memory = _resolve_inbox_flags("auto", world_size)[1]
+    inbox_memory = resolve_inbox_flags("auto", world_size)[1]
     batched = batches_publishes(inbox_memory, algorithm, link)
     grids = _rung_grids(world_size, ladder)
     ends = [rung.min_bytes - 1 for rung in ladder[1:]] + [hi]
@@ -1124,7 +1124,7 @@ def _capture_first_rank(rank: int, tp: int, init_method: str) -> dict:
     import torch.distributed as dist
 
     from aiter.dist.parallel_state import graph_capture
-    from aiter.ops.flydsl.allreduce_host_shared import launcher_loaded
+    from aiter.ops.flydsl.comm_collectives_host_shared import launcher_loaded
 
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
