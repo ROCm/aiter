@@ -536,7 +536,8 @@ def write_cshuffle_vec_to_global(
             )
             fx.copy_atom_call(atomic_atom, pair_frag, pair_dst)
     else:
-        fx.ptr_store(c_vec, fx.get_iter(out) + global_offset)
+        # C is written once and not reread by this kernel; skip cache allocation.
+        fx.generic_store(fx.get_iter(out) + global_offset, c_vec, nontemporal=True)
 
 
 @flyc.kernel
