@@ -349,9 +349,13 @@ def test_device_row_limited_mxfp8_quant_graph_replay(capacity, cols, dtype):
 
 
 @_SKIP_GFX950_GPU
-def test_large_mxfp8_quant_clamps_device_row_count():
+@pytest.mark.parametrize(
+    "capacity,cols,row_factor",
+    [(17, 32, 1), (18, 32, 2), (8192, 4096, 1)],
+)
+def test_mxfp8_quant_clamps_device_row_count(capacity, cols, row_factor):
     """Malformed replay counts must not write past the logical tensor capacity."""
-    capacity, cols, padding = 8192, 4096, 64
+    padding = 64
     sentinel = 0xA5
     # Extra backing storage keeps the test safe if the logical bound regresses.
     storage = torch.ones(capacity + padding, cols, dtype=dtypes.bf16, device="cuda")
@@ -364,14 +368,15 @@ def test_large_mxfp8_quant_clamps_device_row_count():
     expected = torch.empty_like(out)
     expected_scales = torch.empty_like(scales)
     dynamic_per_group_scaled_quant(expected, x, expected_scales, 32, False)
-    count = torch.tensor([capacity], dtype=torch.int32, device="cuda")
-    dynamic_per_group_scaled_quant(out, x, scales, 32, False, count)
+    full_count = capacity // row_factor
+    count = torch.tensor([full_count], dtype=torch.int32, device="cuda")
+    dynamic_per_group_scaled_quant(out, x, scales, 32, False, count, row_factor)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        dynamic_per_group_scaled_quant(out, x, scales, 32, False, count)
+        dynamic_per_group_scaled_quant(out, x, scales, 32, False, count, row_factor)
 
-    for reported in (capacity, capacity + 1, -1, 0):
+    for reported in (full_count, full_count + 1, torch.iinfo(torch.int32).max, -1, 0):
         output.view(torch.uint8).fill_(sentinel)
         scale_bytes.fill_(sentinel)
         count.fill_(reported)

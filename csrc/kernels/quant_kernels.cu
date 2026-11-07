@@ -130,7 +130,11 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
 
     if(num_rows != nullptr)
     {
-        ori_rows = static_cast<int64_t>(*num_rows) * num_cols_factor;
+        const int64_t requested_rows = static_cast<int64_t>(*num_rows) * num_cols_factor;
+        // Replay may change the live count, but cannot enlarge the allocation.
+        ori_rows = requested_rows < ori_rows ? requested_rows : ori_rows;
+        if(ori_rows <= 0)
+            return;
     }
     static constexpr int num_thread_per_group = group_size / thread_data_size;
     const int lane_in_group  = threadIdx.x % num_thread_per_group;
