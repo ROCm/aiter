@@ -1709,7 +1709,7 @@ def find_seq_idx(
     return left - 1
 
 
-@gluon.jit(do_not_specialize=["num_blocks"])
+@gluon.jit(do_not_specialize=["num_blocks", "num_seqs"])
 def _unified_attention_gluon_kernel(
     query_ptr,  # [num_tokens, num_query_heads, head_size]
     key_cache_ptr,  # [num_blks, blk_size, num_kv_heads, head_size]
