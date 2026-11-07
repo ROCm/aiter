@@ -152,6 +152,21 @@ def tensor_model_parallel_all_reduce(
     return get_tp_group().all_reduce(input_, use_new, open_fp8_quant, prefill_support)
 
 
+def tensor_model_parallel_all_reduce_add(
+    input_: torch.Tensor,
+    other: torch.Tensor,
+    use_new: bool = True,
+    open_fp8_quant: bool = False,
+    prefill_support: bool = False,
+) -> torch.Tensor:
+    """All-reduce input_ + other across the model parallel group, the add folded
+    into the all-reduce where the device communicator can."""
+    _assert_no_custom_group("tensor_model_parallel_all_reduce_add")
+    return get_tp_group().all_reduce_add(
+        input_, other, use_new, open_fp8_quant, prefill_support
+    )
+
+
 def tensor_model_parallel_fused_allreduce_rmsnorm(
     input_: torch.Tensor,
     residual_inp_: torch.Tensor,

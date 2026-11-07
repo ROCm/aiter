@@ -136,6 +136,84 @@ def _worker(rank, init_method):
         aiter.destroy_dist_env()
 
 
+def _inputs_add(numel, seed, rank, device):
+    """This rank's two inputs and the fp32 sum over ranks of their bf16 sums, as bf16:
+    the bits of all-reducing the materialized x + x2."""
+    gen = torch.Generator(device=device).manual_seed(seed)
+    xs = [
+        torch.randn(numel, generator=gen, dtype=torch.bfloat16, device=device)
+        for _ in range(2 * WORLD_SIZE)
+    ]
+    sums = [(xs[2 * r] + xs[2 * r + 1]).float() for r in range(WORLD_SIZE)]
+    ref = sums[0] + sums[1] + sums[2] + sums[3]
+    return xs[2 * rank], xs[2 * rank + 1], ref.to(torch.bfloat16)
+
+
+def _worker_add(rank, init_method):
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+    aiter.init_dist_env(WORLD_SIZE, rank, distributed_init_method=init_method)
+    tp = get_tp_group()
+    group = tp.cpu_group
+    inboxes, calls = all_reduce_init(group, 2 * max(NUMELS))
+    failures = []
+    try:
+        for i, numel in enumerate(NUMELS):
+            x, x2, ref = _inputs_add(numel, 500 + i, rank, device)
+            out = all_reduce(x, group, inboxes, calls, x2=x2)
+            outs = [torch.empty_like(out) for _ in range(WORLD_SIZE)]
+            dist.all_gather(outs, out, group=tp.device_group)
+            if _bad(out, ref) or any(_bad(o, out) for o in outs):
+                failures.append(
+                    f"rank {rank} add numel {numel}: wrong or rank-dependent"
+                )
+
+        # Plain and fused calls interleaved share the call counters, then the same
+        # calls in a HIP graph.
+        cases = [
+            _inputs_add(t * HIDDEN, 700 + i, rank, device) for i, t in enumerate(MIXED)
+        ]
+        plain = _inputs(8 * HIDDEN, 799, rank, device)
+        xs = [(torch.empty_like(x), torch.empty_like(x2)) for x, x2, _ in cases]
+        px = torch.empty_like(plain[0])
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            outs = []
+            for x, x2 in xs:
+                outs.append(all_reduce(x, group, inboxes, calls, x2=x2))
+                pout = all_reduce(px, group, inboxes, calls)
+        for rep in range(20):
+            refs = []
+            for i, (t, (x, x2)) in enumerate(zip(MIXED, xs)):
+                nx, nx2, ref = _inputs_add(t * HIDDEN, 900 * rep + i, rank, device)
+                x.copy_(nx)
+                x2.copy_(nx2)
+                refs.append(ref)
+            np_x, p_ref = _inputs(8 * HIDDEN, 5000 + rep, rank, device)
+            px.copy_(np_x)
+            graph.replay()
+            if sum(_bad(o, ref) for o, ref in zip(outs, refs)) or _bad(pout, p_ref):
+                failures.append(f"rank {rank}: add graph replay {rep} is wrong")
+        if calls[-1].item():
+            failures.append(f"rank {rank}: {calls[-1].item()} polls timed out")
+        return failures
+    finally:
+        all_reduce_free(group, inboxes)
+        aiter.destroy_dist_env()
+
+
+def test_all_reduce_add():
+    ensure_spawn_method()
+    init_method = get_distributed_init_method(get_ip(), get_open_port())
+    with mp.Pool(processes=WORLD_SIZE) as pool:
+        results = [
+            pool.apply_async(_worker_add, (rank, init_method))
+            for rank in range(WORLD_SIZE)
+        ]
+        failures = [f for r in results for f in r.get(timeout=1800)]
+    assert not failures, "\n".join(failures)
+
+
 def test_all_reduce():
     ensure_spawn_method()
     init_method = get_distributed_init_method(get_ip(), get_open_port())
@@ -152,3 +230,4 @@ if __name__ == "__main__":  # CI runs the multi-GPU tests as scripts
         logger.warning("test_all_reduce skipped: needs 4 gfx1250 GPUs")
     else:
         test_all_reduce()
+        test_all_reduce_add()
