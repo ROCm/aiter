@@ -67,13 +67,6 @@ void dynamic_per_group_scaled_quant(aiter_tensor_t& out,         // [..., d]
                                     bool scale_layout_m32k4                    = false,
                                     bool hadamard_rotate                       = false);
 
-// Explicit EP MXFP8 input quantization; ordinary fallback outside gfx950 or
-// below the persistent scheduling threshold. Generic entry points are unchanged.
-void mxfp8_ep_quant(aiter_tensor_t& out,
-                    const aiter_tensor_t& input,
-                    aiter_tensor_t& scales,
-                    const aiter_tensor_t& num_rows);
-
 // Backward-compat fp4-only entry; delegates to dynamic_per_group_scaled_quant.
 void dynamic_per_group_scaled_quant_fp4(aiter_tensor_t& out,         // [..., d]
                                         const aiter_tensor_t& input, // [..., d]

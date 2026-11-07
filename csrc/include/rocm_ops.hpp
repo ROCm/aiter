@@ -1701,9 +1701,6 @@ namespace py = pybind11;
           py::arg("num_rows_factor") = 1,                                \
           py::arg("scale_layout_m32k4") = false,                         \
           py::arg("hadamard_rotate") = false);                           \
-    m.def("mxfp8_ep_quant", &aiter::mxfp8_ep_quant,                       \
-          py::arg("out"), py::arg("input"),                             \
-          py::arg("scales"), py::arg("num_rows"));                      \
     m.def("dynamic_per_group_scaled_quant_fp4",                          \
           &aiter::dynamic_per_group_scaled_quant_fp4,                    \
           py::arg("out"),                                                \
