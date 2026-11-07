@@ -35,6 +35,8 @@ A section with no axes, like reduce above, is just a config.
 Tile size and number of splits (segments) are derived from the following parameters:
 TILE_SIZE_MIN/MAX, and MIN_SEGMENTS/MAX_SEGMENTS/SEGMENTS_PER_CU, plus MFMA_DIM
 and the SPLIT_MIN_* floors; see compute_segment_params.
+
+The gfx950 gluon 128-key tile policy is the flat "kv_tile" section.
 """
 
 import copy
@@ -53,7 +55,7 @@ from aiter.ops.triton.utils.config_utils import (
 from aiter.ops.triton.utils.types import e4m3_dtype
 
 _CONFIG_NAME = "UNIFIED-ATTENTION"
-_OPS = ("attn_2d", "attn_3d", "reduce", "kv_split")
+_OPS = ("attn_2d", "attn_3d", "reduce", "kv_split", "kv_tile")
 
 # Groups of RDNA GPUs have similar hardware. Use the same config file until further investigation shows they diverge.
 _ARCH_ALIAS = {
@@ -203,20 +205,32 @@ def compute_segment_params(config: dict, params) -> dict:
     wave_slots = config.pop("SPLIT_WAVE_SLOTS_PER_CU", 0)
     seg_overhead = config.pop("SPLIT_SEG_OVERHEAD_TILES", 0)
     partial_cost = config.pop("SPLIT_PARTIAL_COST", 0.0)
+    window_plus_q = config.pop("SPLIT_WINDOW_PLUS_Q", False)
+
+    # Callers may pass NumPy scalars (e.g. max_seqlen_k from a NumPy array), and
+    # those have no bit_length and can overflow in shifts. Work in Python ints.
+    num_seqs = int(params.num_seqs)
+    num_kv_heads = int(params.num_kv_heads)
+    num_sms = int(params.num_sms)
+    num_queries_per_kv = int(params.num_queries_per_kv)
+    max_seqlen_q = int(params.max_seqlen_q)
 
     # tokens one segment must cover, so the split never outruns the context
-    tile = triton.next_power_of_2(params.block_size)
+    tile = triton.next_power_of_2(int(params.block_size))
     tile = max(tile_lo, tile if tile_hi is None else min(tile_hi, tile))
-    keys = params.max_seqlen_k
+    keys = int(params.max_seqlen_k)
     if getattr(params, "sliding_window", 0) > 0:
-        keys = min(keys, params.sliding_window + params.max_seqlen_q)
+        # a window row sees window + q - 1 keys. Entries that opt in cover
+        # window + q (the bf16 short-query split, measured that way).
+        extra = max_seqlen_q if window_plus_q else max_seqlen_q - 1
+        keys = min(keys, int(params.sliding_window) + extra)
     tiles = triton.cdiv(keys, tile)
     limit = tiles
-    too_many_seqs = seqs_per_tile and params.num_seqs > seqs_per_tile * limit
+    too_many_seqs = seqs_per_tile and num_seqs > seqs_per_tile * limit
     if cap is not None:
         limit = min(cap, limit)
 
-    q_rows = params.max_seqlen_q * params.num_queries_per_kv
+    q_rows = max_seqlen_q * num_queries_per_kv
     if wave_slots and mfma_dim and q_rows <= 128:
         # One block covers each sequence, so the split grid holds num_seqs *
         # num_kv_heads programs per segment, each of next_pow2(q_rows) //
@@ -227,8 +241,8 @@ def compute_segment_params(config: dict, params) -> dict:
         # seg_min_tiles tiles, and once the unsplit grid fills the machine
         # twice a split only adds rounds.
         waves = max(1, triton.next_power_of_2(q_rows) // mfma_dim)
-        load = params.num_seqs * params.num_kv_heads * waves
-        slots = params.num_sms * wave_slots
+        load = num_seqs * num_kv_heads * waves
+        slots = num_sms * wave_slots
         segments = 1
         best = float(triton.cdiv(load, slots) * (tiles + seg_overhead))
         split = 2
@@ -247,13 +261,11 @@ def compute_segment_params(config: dict, params) -> dict:
         config["NUM_SEGMENTS"] = segments
         return config
 
-    budget = params.num_sms * per_cu
-    prgms = max(1, params.num_2d_prgms)
+    budget = num_sms * per_cu
+    prgms = max(1, int(params.num_2d_prgms))
     # this is specific to gfx950 gluon as the num waves depends on mfma dim there
     if mfma_dim:
-        num_waves = max(
-            1, triton.next_power_of_2(params.num_queries_per_kv) // mfma_dim
-        )
+        num_waves = max(1, triton.next_power_of_2(num_queries_per_kv) // mfma_dim)
         budget //= num_waves
     share = triton.cdiv(budget, prgms)
     if fit_budget:

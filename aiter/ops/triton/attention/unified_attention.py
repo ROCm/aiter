@@ -215,22 +215,28 @@ def _gfx950_tile_size(params: _UAParams, tile: int):
         or params.max_seqlen_q * params.num_queries_per_kv > 128
     ):
         return tile
+    # the thresholds and the wide tile size are tuned in configs/ (kv_tile)
+    policy = get_unified_attention_config("kv_tile", params, backend="gluon")
     num_segments = get_unified_attention_config(
         "kv_split", _gfx950_split_params(params), backend="gluon"
     )["NUM_SEGMENTS"]
-    min_keys = 1536 if _gfx950_short_query(params) else 2048
+    short = _gfx950_short_query(params)
+    min_keys = (
+        policy["TILE_WIDE_MIN_KEYS_SHORT"] if short else policy["TILE_WIDE_MIN_KEYS"]
+    )
     if params.max_seqlen_k < min_keys * num_segments:
         return tile
     programs = params.num_seqs * params.num_kv_heads * num_segments
+    per_cu = policy["TILE_WIDE_PROGRAMS_PER_CU"]
     if params.all_decode:
-        wide = programs <= params.num_sms
-    elif _gfx950_short_query(params):
+        wide = programs <= per_cu * params.num_sms
+    elif short:
         wide = True
     elif params.shuffled_kv_cache:
-        wide = programs < 2 * params.num_sms
+        wide = programs < policy["TILE_WIDE_SHUFFLED_PROGRAMS_PER_CU"] * params.num_sms
     else:
-        wide = programs < params.num_sms
-    return max(tile, 128) if wide else tile
+        wide = programs < per_cu * params.num_sms
+    return max(tile, policy["TILE_WIDE"]) if wide else tile
 
 
 def _gfx950_split_grid(params: _UAParams):
@@ -244,7 +250,10 @@ def _gfx950_split_grid(params: _UAParams):
         params.max_seqlen_q * params.num_queries_per_kv > 128
     ):
         return False
-    # unsplit, the 2d grid is faster
+    # A window reaching here is not a short bf16 query at head 64 (those return
+    # above): it is a head size above 64, or a non-bf16 query. It takes the
+    # split grid only when the split has more than one segment, and otherwise
+    # keeps the 2d grid. Not measured for these shapes.
     config = get_unified_attention_config(
         "kv_split", _gfx950_split_params(params), backend="gluon"
     )
