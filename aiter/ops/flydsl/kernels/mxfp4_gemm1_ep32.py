@@ -69,7 +69,14 @@ def _situv2_4_25_mul_batch(gs, us):
 #     padding is padding throughout, so its A loads, LDS reads, MFMAs and
 #     activation are skipped (it emits zeros). A tail block of an expert run with
 #     <= 16 real rows is folded into the preceding full block (one 80-row tile,
-#     one weight stream); its own workgroups exit immediately.
+#     one weight stream).
+#   * Scheduling: workgroups index a compact list of real tiles (unit ballot), so
+#     the real tiles take the first grid slots and land 2-3 per CU in one wave;
+#     with folded blocks interleaved in the grid, the dispatcher refilled their
+#     freed slots and stacked up to 4 real tiles on some CUs (amd bench routing,
+#     every expert 64 + 9 rows: 85.5 -> 74 us). The list is cut into one
+#     contiguous run per XCD, so each unit's gathered A rows are read into one or
+#     two XCD L2s instead of all eight (HBM reads ~402 -> 336 MB).
 #   * 3 workgroups per CU: K-half-major MFMA order with one 16-row A chunk live
 #     at a time, one B stage in registers, and the epilogue staged 32 rows at a
 #     time, so VGPRs fit 3 waves/SIMD and LDS fits 3 workgroups.
@@ -1749,6 +1756,8 @@ def compile_gemm1_ep32(
     skip_pad = True
     khalf_loop = 2
     epi32 = True
+    compact = True  # real tiles first in the grid (see the unit ballot in the kernel)
+    xcd_chunk = True  # contiguous tile runs per XCD over the compact list
     fast_situ = False  # True: SiTUv2 beta=4/25 as 2 exp2 + 1 rcp (_situv2_4_25_mul_batch), not bit-exact
     kAStages_ = k_stages + 1
     lds_bytes = max(
@@ -1795,146 +1804,250 @@ def compile_gemm1_ep32(
         cumsum0 = _global_i32_at(arg_cumsum, fx.Int32(0))
         total_m_blocks = cumsum0 // fx.Int32(BM)
         bound = total_m_blocks * fx.Int32(NUM_N_BLOCKS)
-
-        NXCD = 8
-        xq = _udiv(bound, NXCD)
-        xr = _umod(bound, NXCD)
-
-        def _xcd(pid):
-            xc = _umod(pid, NXCD)
-            wgid = xc * xq + (xc < xr).select(xc, xr) + _udiv(pid, NXCD)
-            ng = fx.Int32(xcd_swizzle * NUM_N_BLOCKS)
-            group_id = wgid // ng
-            first_pid_m = group_id * fx.Int32(xcd_swizzle)
-            remaining_m = total_m_blocks - first_pid_m
-            sw = fx.Int32(xcd_swizzle)
-            group_size_m = (remaining_m < sw).select(remaining_m, sw)
-            wig = wgid % ng
-            m_block = first_pid_m + (wig % group_size_m)
-            n_block = wig // group_size_m
-            return m_block * fx.Int32(NUM_N_BLOCKS) + n_block
-
-        gate = bx_i32 < bound
-        if gate:
-            if const_expr(xcd_swizzle > 0):
-                tile = _xcd(bx_i32)
+        one, zero = fx.Int32(1), fx.Int32(0)
+        pad_tok = _global_i32_at(arg_cumsum, one)
+        # Workgroups past every M block's tiles (the host grid is an upper
+        # bound, ~20x the real tiles) exit before any per-block loads.
+        if bx_i32 < bound:
+            if const_expr(compact):
+                # Units = M blocks not folded into the previous block's tile, found
+                # with a wave ballot over the first 128 blocks (later blocks are
+                # appended unchanged). Workgroups index units compactly so the real
+                # tiles take the first grid slots; with folded blocks interleaved
+                # the dispatcher refills their freed slots and stacks up to 4 real
+                # tiles on some CUs while others get one.
+                u_masks = []
+                for c in range_constexpr(2):
+                    b = lane + fx.Int32(c * 64)
+                    b_ok = b < total_m_blocks
+                    bc = b_ok.select(b, zero)
+                    bp = (bc > zero).select(bc - one, bc)
+                    t16 = _global_i32_at(arg_mind, bc * fx.Int32(BM) + fx.Int32(16))
+                    folded = (bc > zero).select(
+                        (_global_i32_at(arg_eids, bc) == _global_i32_at(arg_eids, bp)).select(
+                            (t16 == pad_tok).select(one, zero), zero
+                        ),
+                        zero,
+                    )
+                    is_unit = b_ok.select((folded == zero).select(one, zero), zero)
+                    u_masks.append(fx.Int64(rocdl.ballot(T.i64, as_ir_value(is_unit == one))))
+                u_cnt0 = fx.Int32(fx.math.ctpop(u_masks[0]))
+                u_cnt1 = fx.Int32(fx.math.ctpop(u_masks[1]))
+                extra = (total_m_blocks > fx.Int32(128)).select(total_m_blocks - fx.Int32(128), zero)
+                n_units = u_cnt0 + u_cnt1 + extra
+                gate = bx_i32 < n_units * fx.Int32(NUM_N_BLOCKS)
             else:
-                tile = bx_i32
-            if const_expr(skip_pad):
-                # Per M block: absorb a <=16-row tail block of the same expert
-                # into the preceding full block's tile (80 rows, one weight
-                # stream); blocks with <=16 real rows otherwise take the light
-                # path. Padding sits at the end of each expert run.
-                one = fx.Int32(1)
-                pad_tok = _global_i32_at(arg_cumsum, one)
-                m_blk = tile // fx.Int32(NUM_N_BLOCKS)
-                m_prev = (m_blk > fx.Int32(0)).select(m_blk - one, m_blk)
-                has_next = m_blk + one < total_m_blocks
-                m_next = has_next.select(m_blk + one, m_blk)
-                e_cur = _global_i32_at(arg_eids, m_blk)
-                e_prev = _global_i32_at(arg_eids, m_prev)
-                e_next = _global_i32_at(arg_eids, m_next)
-                tok16 = _global_i32_at(arg_mind, m_blk * fx.Int32(BM) + fx.Int32(16))
-                tokn16 = _global_i32_at(arg_mind, m_next * fx.Int32(BM) + fx.Int32(16))
-                light = (tok16 == pad_tok).select(one, fx.Int32(0))
-                prev_same = (m_blk > fx.Int32(0)).select((e_prev == e_cur).select(one, fx.Int32(0)), fx.Int32(0))
-                next_light = has_next.select((e_next == e_cur).select((tokn16 == pad_tok).select(one, fx.Int32(0)), fx.Int32(0)), fx.Int32(0))
-                mode = rocdl.readfirstlane(
-                    T.i32,
-                    as_ir_value((light * prev_same == one).select(fx.Int32(3), (next_light * (one - light) == one).select(fx.Int32(2), light))),
-                )
-                mode = fx.Int32(mode)
-                if mode == fx.Int32(2):
-                    _gemm1_body(
-                        lds_raw_ptr,
-                        arg_aq,
-                        arg_ascale,
-                        arg_bq,
-                        arg_bscale,
-                        arg_eids,
-                        arg_mind,
-                        arg_aqout,
-                        arg_ascaleout,
-                        arg_hidden,
-                        arg_bias,
-                        tile,
-                        lane,
-                        wave,
-                        use_nt,
-                        i32_ntok,
-                        total_m_blocks,
-                        BM=BM,
-                        BN=BN,
-                        BK=BK,
-                        inline_quant=inline_quant,
-                        prefetch_hidden=prefetch_hidden,
-                        a_dtype=a_dtype,
-                        out_dtype=out_dtype,
-                        act=act,
-                        situ_beta=situ_beta,
-                        situ_linear_beta=situ_linear_beta,
-                        swiglu_limit=swiglu_limit,
-                        enable_bias=enable_bias,
-                        K=D_HIDDEN,
-                        N_OUT=N_OUT,
-                        NE=NE,
-                        interleave=interleave,
-                        native_scale_layout=native_scale_layout,
-                        num_waves=num_waves,
-                        k_wave=k_wave,
-                        epi_splits=epi_splits,
-                        k_stages=k_stages,
-                        khalf_loop=khalf_loop,
-                        epi32=epi32,
-                        fast_situ=fast_situ,
-                        active_chunks=5,
+                gate = bx_i32 < bound
+
+            NXCD = 8
+            xq = _udiv(bound, NXCD)
+            xr = _umod(bound, NXCD)
+
+            def _xcd(pid):
+                xc = _umod(pid, NXCD)
+                wgid = xc * xq + (xc < xr).select(xc, xr) + _udiv(pid, NXCD)
+                ng = fx.Int32(xcd_swizzle * NUM_N_BLOCKS)
+                group_id = wgid // ng
+                first_pid_m = group_id * fx.Int32(xcd_swizzle)
+                remaining_m = total_m_blocks - first_pid_m
+                sw = fx.Int32(xcd_swizzle)
+                group_size_m = (remaining_m < sw).select(remaining_m, sw)
+                wig = wgid % ng
+                m_block = first_pid_m + (wig % group_size_m)
+                n_block = wig // group_size_m
+                return m_block * fx.Int32(NUM_N_BLOCKS) + n_block
+
+            if gate:
+                if const_expr(compact):
+                    tid = bx_i32
+                    if const_expr(xcd_chunk):
+                        # Workgroups go round-robin over the 8 XCDs; give each XCD a
+                        # contiguous run of the (unit, N block) list so a unit's
+                        # gathered A rows are read into one or two XCD L2s, not all 8.
+                        n_tiles = n_units * fx.Int32(NUM_N_BLOCKS)
+                        cq = _udiv(n_tiles, 8)
+                        cr = _umod(n_tiles, 8)
+                        xc = _umod(bx_i32, 8)
+                        tid = xc * cq + (xc < cr).select(xc, cr) + _udiv(bx_i32, 8)
+                    u = tid // fx.Int32(NUM_N_BLOCKS)
+                    n_blk = tid - u * fx.Int32(NUM_N_BLOCKS)
+                    in0 = u < u_cnt0
+                    k = in0.select(u, u - u_cnt0)
+                    msk = in0.select(u_masks[0], u_masks[1])
+                    lane64 = fx.Int64(lane)
+                    below = msk & ((fx.Int64(1) << lane64) - fx.Int64(1))
+                    bit = (msk >> lane64) & fx.Int64(1)
+                    rank = fx.Int32(fx.math.ctpop(below))
+                    hit = (bit == fx.Int64(1)).select((rank == k).select(one, zero), zero)
+                    sel = fx.Int64(rocdl.ballot(T.i64, as_ir_value(hit == one)))
+                    pos = fx.Int32(fx.math.cttz(sel))
+                    m_u = (u < u_cnt0 + u_cnt1).select(
+                        in0.select(pos, pos + fx.Int32(64)), fx.Int32(128) + u - u_cnt0 - u_cnt1
                     )
-                elif mode == fx.Int32(1):
-                    _gemm1_body(
-                        lds_raw_ptr,
-                        arg_aq,
-                        arg_ascale,
-                        arg_bq,
-                        arg_bscale,
-                        arg_eids,
-                        arg_mind,
-                        arg_aqout,
-                        arg_ascaleout,
-                        arg_hidden,
-                        arg_bias,
-                        tile,
-                        lane,
-                        wave,
-                        use_nt,
-                        i32_ntok,
-                        total_m_blocks,
-                        BM=BM,
-                        BN=BN,
-                        BK=BK,
-                        inline_quant=inline_quant,
-                        prefetch_hidden=prefetch_hidden,
-                        a_dtype=a_dtype,
-                        out_dtype=out_dtype,
-                        act=act,
-                        situ_beta=situ_beta,
-                        situ_linear_beta=situ_linear_beta,
-                        swiglu_limit=swiglu_limit,
-                        enable_bias=enable_bias,
-                        K=D_HIDDEN,
-                        N_OUT=N_OUT,
-                        NE=NE,
-                        interleave=interleave,
-                        native_scale_layout=native_scale_layout,
-                        num_waves=num_waves,
-                        k_wave=k_wave,
-                        epi_splits=epi_splits,
-                        k_stages=k_stages,
-                        khalf_loop=khalf_loop,
-                        epi32=epi32,
-                        fast_situ=fast_situ,
-                        active_chunks=1,
+                    m_u = fx.Int32(rocdl.readfirstlane(T.i32, as_ir_value(m_u)))
+                    tile = m_u * fx.Int32(NUM_N_BLOCKS) + n_blk
+                elif const_expr(xcd_swizzle > 0):
+                    tile = _xcd(bx_i32)
+                else:
+                    tile = bx_i32
+                if const_expr(skip_pad):
+                    # Per M block: absorb a <=16-row tail block of the same expert
+                    # into the preceding full block's tile (80 rows, one weight
+                    # stream); blocks with <=16 real rows otherwise take the light
+                    # path. Padding sits at the end of each expert run.
+                    m_blk = tile // fx.Int32(NUM_N_BLOCKS)
+                    m_prev = (m_blk > fx.Int32(0)).select(m_blk - one, m_blk)
+                    has_next = m_blk + one < total_m_blocks
+                    m_next = has_next.select(m_blk + one, m_blk)
+                    e_cur = _global_i32_at(arg_eids, m_blk)
+                    e_prev = _global_i32_at(arg_eids, m_prev)
+                    e_next = _global_i32_at(arg_eids, m_next)
+                    tok16 = _global_i32_at(arg_mind, m_blk * fx.Int32(BM) + fx.Int32(16))
+                    tokn16 = _global_i32_at(arg_mind, m_next * fx.Int32(BM) + fx.Int32(16))
+                    light = (tok16 == pad_tok).select(one, fx.Int32(0))
+                    prev_same = (m_blk > fx.Int32(0)).select((e_prev == e_cur).select(one, fx.Int32(0)), fx.Int32(0))
+                    next_light = has_next.select((e_next == e_cur).select((tokn16 == pad_tok).select(one, fx.Int32(0)), fx.Int32(0)), fx.Int32(0))
+                    mode = rocdl.readfirstlane(
+                        T.i32,
+                        as_ir_value((light * prev_same == one).select(fx.Int32(3), (next_light * (one - light) == one).select(fx.Int32(2), light))),
                     )
-                elif mode == fx.Int32(0):
+                    mode = fx.Int32(mode)
+                    if mode == fx.Int32(2):
+                        _gemm1_body(
+                            lds_raw_ptr,
+                            arg_aq,
+                            arg_ascale,
+                            arg_bq,
+                            arg_bscale,
+                            arg_eids,
+                            arg_mind,
+                            arg_aqout,
+                            arg_ascaleout,
+                            arg_hidden,
+                            arg_bias,
+                            tile,
+                            lane,
+                            wave,
+                            use_nt,
+                            i32_ntok,
+                            total_m_blocks,
+                            BM=BM,
+                            BN=BN,
+                            BK=BK,
+                            inline_quant=inline_quant,
+                            prefetch_hidden=prefetch_hidden,
+                            a_dtype=a_dtype,
+                            out_dtype=out_dtype,
+                            act=act,
+                            situ_beta=situ_beta,
+                            situ_linear_beta=situ_linear_beta,
+                            swiglu_limit=swiglu_limit,
+                            enable_bias=enable_bias,
+                            K=D_HIDDEN,
+                            N_OUT=N_OUT,
+                            NE=NE,
+                            interleave=interleave,
+                            native_scale_layout=native_scale_layout,
+                            num_waves=num_waves,
+                            k_wave=k_wave,
+                            epi_splits=epi_splits,
+                            k_stages=k_stages,
+                            khalf_loop=khalf_loop,
+                            epi32=epi32,
+                            fast_situ=fast_situ,
+                            active_chunks=5,
+                        )
+                    elif mode == fx.Int32(1):
+                        _gemm1_body(
+                            lds_raw_ptr,
+                            arg_aq,
+                            arg_ascale,
+                            arg_bq,
+                            arg_bscale,
+                            arg_eids,
+                            arg_mind,
+                            arg_aqout,
+                            arg_ascaleout,
+                            arg_hidden,
+                            arg_bias,
+                            tile,
+                            lane,
+                            wave,
+                            use_nt,
+                            i32_ntok,
+                            total_m_blocks,
+                            BM=BM,
+                            BN=BN,
+                            BK=BK,
+                            inline_quant=inline_quant,
+                            prefetch_hidden=prefetch_hidden,
+                            a_dtype=a_dtype,
+                            out_dtype=out_dtype,
+                            act=act,
+                            situ_beta=situ_beta,
+                            situ_linear_beta=situ_linear_beta,
+                            swiglu_limit=swiglu_limit,
+                            enable_bias=enable_bias,
+                            K=D_HIDDEN,
+                            N_OUT=N_OUT,
+                            NE=NE,
+                            interleave=interleave,
+                            native_scale_layout=native_scale_layout,
+                            num_waves=num_waves,
+                            k_wave=k_wave,
+                            epi_splits=epi_splits,
+                            k_stages=k_stages,
+                            khalf_loop=khalf_loop,
+                            epi32=epi32,
+                            fast_situ=fast_situ,
+                            active_chunks=1,
+                        )
+                    elif mode == fx.Int32(0):
+                        _gemm1_body(
+                            lds_raw_ptr,
+                            arg_aq,
+                            arg_ascale,
+                            arg_bq,
+                            arg_bscale,
+                            arg_eids,
+                            arg_mind,
+                            arg_aqout,
+                            arg_ascaleout,
+                            arg_hidden,
+                            arg_bias,
+                            tile,
+                            lane,
+                            wave,
+                            use_nt,
+                            i32_ntok,
+                            total_m_blocks,
+                            BM=BM,
+                            BN=BN,
+                            BK=BK,
+                            inline_quant=inline_quant,
+                            prefetch_hidden=prefetch_hidden,
+                            a_dtype=a_dtype,
+                            out_dtype=out_dtype,
+                            act=act,
+                            situ_beta=situ_beta,
+                            situ_linear_beta=situ_linear_beta,
+                            swiglu_limit=swiglu_limit,
+                            enable_bias=enable_bias,
+                            K=D_HIDDEN,
+                            N_OUT=N_OUT,
+                            NE=NE,
+                            interleave=interleave,
+                            native_scale_layout=native_scale_layout,
+                            num_waves=num_waves,
+                            k_wave=k_wave,
+                            epi_splits=epi_splits,
+                            k_stages=k_stages,
+                            khalf_loop=khalf_loop,
+                            epi32=epi32,
+                            fast_situ=fast_situ,
+                            active_chunks=None,
+                        )
+                else:
                     _gemm1_body(
                         lds_raw_ptr,
                         arg_aq,
@@ -1979,51 +2092,6 @@ def compile_gemm1_ep32(
                         fast_situ=fast_situ,
                         active_chunks=None,
                     )
-            else:
-                _gemm1_body(
-                    lds_raw_ptr,
-                    arg_aq,
-                    arg_ascale,
-                    arg_bq,
-                    arg_bscale,
-                    arg_eids,
-                    arg_mind,
-                    arg_aqout,
-                    arg_ascaleout,
-                    arg_hidden,
-                    arg_bias,
-                    tile,
-                    lane,
-                    wave,
-                    use_nt,
-                    i32_ntok,
-                    total_m_blocks,
-                    BM=BM,
-                    BN=BN,
-                    BK=BK,
-                    inline_quant=inline_quant,
-                    prefetch_hidden=prefetch_hidden,
-                    a_dtype=a_dtype,
-                    out_dtype=out_dtype,
-                    act=act,
-                    situ_beta=situ_beta,
-                    situ_linear_beta=situ_linear_beta,
-                    swiglu_limit=swiglu_limit,
-                    enable_bias=enable_bias,
-                    K=D_HIDDEN,
-                    N_OUT=N_OUT,
-                    NE=NE,
-                    interleave=interleave,
-                    native_scale_layout=native_scale_layout,
-                    num_waves=num_waves,
-                    k_wave=k_wave,
-                    epi_splits=epi_splits,
-                    k_stages=k_stages,
-                    khalf_loop=khalf_loop,
-                    epi32=epi32,
-                    fast_situ=fast_situ,
-                    active_chunks=None,
-                )
 
     @flyc.jit
     def launch_gemm1(
