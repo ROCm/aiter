@@ -188,6 +188,8 @@ def shuffle_weight(
             x_ = x_.permute(0, 1, 3, 4, 2, 5).contiguous()
         x_ = x_.view(*x.shape).contiguous().view(x_type)
         x_.is_shuffled = True
+        x_.aiter_shuffle_layout = tuple(layout)
+        x_.aiter_shuffle_is_guinterleave = True
         x_.gate_up_interleave = gate_up
         return x_
 
@@ -205,6 +207,8 @@ def shuffle_weight(
     x_ = x_.view(*x.shape)
     x_ = x_.view(x_type)
     x_.is_shuffled = True
+    x_.aiter_shuffle_layout = tuple(layout)
+    x_.aiter_shuffle_is_guinterleave = False
     if pad_k_to:
         x_.aiter_original_k = original_k
         x_.aiter_padded_k = x.shape[-1]
