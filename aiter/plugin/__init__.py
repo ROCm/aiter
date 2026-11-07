@@ -9,9 +9,12 @@ Ownership boundary:
 - Providers own their kernels, their qualification evidence, and their
   lifecycle; ``KernelCandidate.qualification`` is self-reported provenance,
   not an AITER certification.
-- Frameworks and users own enablement: installing a provider never makes it
-  the default. A provider serves only when explicitly enabled
-  (``AITER_PLUGIN_ENABLE``) or forced (``AITER_PLUGIN_FORCE``).
+- Frameworks own enablement: installing a provider makes it available, never
+  active. A provider serves only when a framework names it in
+  ``configure(enable=...)``, which records the source of that decision.
+  ``AITER_PLUGINS=0`` is the one environment control, and it only turns
+  everything off: an operator can stop routing without editing framework code,
+  and nothing can start it from the environment.
 """
 
 from __future__ import annotations
@@ -138,7 +141,6 @@ class _FrameworkDefault:
     """What ``configure()`` last set: the config layer below the environment."""
 
     enable: tuple[str, ...]
-    disable: frozenset[str]
     source: str
 
 
@@ -152,10 +154,6 @@ class _Config:
     """
 
     kill_switch: bool
-    # op name -> the config layer that disabled it, so an op-disabled route
-    # names the layer that produced it rather than the enable layer.
-    disabled_ops: Mapping[str, str]
-    forced_provider: str | None
     enabled: tuple[str, ...]
     source: str
     generation: int
@@ -163,13 +161,7 @@ class _Config:
     def _settings(self) -> tuple[Any, ...]:
         """Everything that defines this configuration except its generation."""
 
-        return (
-            self.kill_switch,
-            self.disabled_ops,
-            self.forced_provider,
-            self.enabled,
-            self.source,
-        )
+        return (self.kill_switch, self.enabled, self.source)
 
 
 @dataclass(frozen=True, slots=True)
@@ -232,18 +224,14 @@ def last_decision() -> Decision | None:
     return _last_decision.get()
 
 
-def configure(
-    *,
-    source: str,
-    enable: Sequence[str] = (),
-    disable: Sequence[str] = (),
-) -> None:
-    """Set the framework default enablement.
+def configure(*, source: str, enable: Sequence[str] = ()) -> None:
+    """Set which providers may serve. This is the only way to enable one.
 
     ``enable`` is a provider list in preference order and **replaces** any
-    previous ``configure()`` state; ``disable`` is a per-op opt-out that
-    **unions** with the user's. ``source`` is required provenance ("vllm rocm
-    defaults 2026.11") and is recorded so every route names an owner.
+    previous ``configure()`` state. ``source`` is required provenance ("vllm
+    rocm defaults 2026.11") and is recorded so every route names an owner --
+    the reason enablement lives here rather than in the environment, which
+    cannot say who set it.
 
     Init-time by convention. A call after the first dispatch takes effect on the
     next dispatch and bumps the config generation; it is never silent. All
@@ -258,7 +246,6 @@ def configure(
         _framework_default = _FrameworkDefault(
             # dict.fromkeys de-duplicates while preserving the preference order.
             enable=tuple(dict.fromkeys(n.strip() for n in enable if n.strip())),
-            disable=frozenset(n.strip() for n in disable if n.strip()),
             source=source.strip(),
         )
         _swap_config_locked()
@@ -275,46 +262,24 @@ def reload_config() -> None:
         _swap_config_locked()
 
 
-def _env_list(name: str) -> tuple[str, ...] | None:
-    """Parse an env list, or ``None`` when unset. An empty value counts as unset."""
-
-    raw = os.getenv(name)
-    if raw is None:
-        return None
-    items = tuple(item.strip() for item in raw.split(",") if item.strip())
-    return items or None
-
-
 def _build_config(default: _FrameworkDefault | None, generation: int) -> _Config:
-    env_enable = _env_list("AITER_PLUGIN_ENABLE")
-    env_disable = _env_list("AITER_PLUGIN_DISABLE") or ()
-    # Stripped like every other control: " aklr" naming nothing is a typo, not
-    # a request to disable forcing.
-    forced = (os.getenv("AITER_PLUGIN_FORCE") or "").strip() or None
+    """The snapshot dispatch reads: who may serve, and who decided that.
+
+    Enablement has one source, ``configure()``, so the framework that turned a
+    provider on is always named. The environment can only take enablement
+    away, never grant it: a provider wheel arriving as somebody's transitive
+    dependency must not be able to change which kernels run.
+    """
+
     kill_switch = os.getenv("AITER_PLUGINS", "1").strip().lower() in _FALSY
-
-    # Enable layers replace; disable layers union.
-    enabled = (default.enable if default else ()) if env_enable is None else env_enable
-
-    if default:
-        framework_source = f"configure:{default.source}"
-        disabled = dict.fromkeys(default.disable, framework_source)
-    else:
-        framework_source = None
-        disabled = {}
-    # Union, and the user's act is the one named when both layers disable an op.
-    disabled.update(dict.fromkeys(env_disable, "env"))
-
-    if kill_switch or env_enable is not None or forced:
+    enabled = default.enable if default else ()
+    if kill_switch:
         source = "env"
-    elif framework_source:
-        source = framework_source
+    elif default:
+        source = f"configure:{default.source}"
     else:
         source = "default-deny"
-
-    return _Config(
-        kill_switch, MappingProxyType(disabled), forced, enabled, source, generation
-    )
+    return _Config(kill_switch, enabled, source, generation)
 
 
 def _swap_config_locked() -> _Config:
@@ -396,20 +361,13 @@ def _dispatch(
     config = _config()
     if config.kill_switch:
         # The feature is off, so there is nothing to observe and no Decision is
-        # recorded. A per-op disable below still records one: that op was routed
-        # and deliberately turned off, which is what an operator is watching.
+        # recorded. Everything an operator would ask afterwards is still
+        # answerable from status() and explain(), which compute on demand.
         return native(*args, **kwargs)
-    disabled_by = config.disabled_ops.get(op.name)
-    if disabled_by is not None:
-        return _run_native(
-            op, native, args, kwargs, "op-disabled", disabled_by, config.generation
-        )
 
     eligible = _eligible(op, config)
     if not eligible:
-        if config.forced_provider:
-            reason = "forced-provider-unavailable"
-        elif _providers() and not config.enabled:
+        if _providers() and not config.enabled:
             reason = "provider-not-enabled"
         else:
             reason = "no-provider"
@@ -558,8 +516,6 @@ def status() -> Mapping[str, Any]:
             "config_source": config.source,
             "kill_switch": config.kill_switch,
             "enabled": config.enabled,
-            "forced_provider": config.forced_provider,
-            "disabled_ops": dict(config.disabled_ops),
             "providers": tuple(_described(record) for record in _providers()),
             "skipped_providers": tuple(
                 {"entry_point": skipped.entry_point, "reason": skipped.reason}
@@ -621,15 +577,9 @@ def explain(op: str, *args: Any, **kwargs: Any) -> Explanation:
     if config.kill_switch:
         # Mirrors dispatch exactly: it records nothing, so neither do we.
         return Explanation(None, MappingProxyType({}))
-    disabled_by = config.disabled_ops.get(op)
-    if disabled_by is not None:
-        return _explained(operation, "op-disabled", disabled_by)
-
     eligible = _eligible(operation, config, warn=False)
     if not eligible:
-        if config.forced_provider:
-            reason = "forced-provider-unavailable"
-        elif _providers() and not config.enabled:
+        if _providers() and not config.enabled:
             reason = "provider-not-enabled"
         else:
             reason = "no-provider"
@@ -887,14 +837,6 @@ def _build_eligible(
 ) -> tuple[_ProviderRecord, ...]:
     """Providers that may serve this op, in preference order."""
 
-    if config.forced_provider:
-        return tuple(
-            record
-            for record in _providers()
-            if record.name == config.forced_provider
-            and _supports(record, op, warn=warn)
-        )
-
     # Walk the enable list, not the provider names: the enable list order is the
     # preference order, and entry-point order is environment-dependent.
     by_name = _records_by_provider_name()
@@ -1074,8 +1016,8 @@ def _discover_providers() -> (
     for record in ordered:
         owner = claimed.get(record.name)
         if owner is not None:
-            # A provider name is an identity: AITER_PLUGIN_ENABLE and
-            # AITER_PLUGIN_FORCE address it, and a Decision names it. Two
+            # A provider name is an identity: configure(enable=...) addresses
+            # it, and a Decision names it. Two
             # providers answering to one name would make every one of those
             # ambiguous and would let install order decide which serves.
             # Skipped rather than raised: a bad install must never break

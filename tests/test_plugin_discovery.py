@@ -69,13 +69,7 @@ def _install(tmp_path, monkeypatch, name, target):
 
 @pytest.fixture(autouse=True)
 def _clean(monkeypatch):
-    for name in (
-        "AITER_PLUGINS",
-        "AITER_PLUGIN_DISABLE",
-        "AITER_PLUGIN_FORCE",
-        "AITER_PLUGIN_ENABLE",
-    ):
-        monkeypatch.delenv(name, raising=False)
+    monkeypatch.delenv("AITER_PLUGINS", raising=False)
     plugin._reset_for_testing()
     yield
     plugin._reset_for_testing()
@@ -89,7 +83,7 @@ def test_a_real_entry_point_is_discovered_and_serves(tmp_path, monkeypatch, targ
 
     name = "aklr" if target == "instance" else "factoryprov"
     _install(tmp_path, monkeypatch, name, target)
-    monkeypatch.setenv("AITER_PLUGIN_ENABLE", name)
+    plugin.configure(enable=(name,), source="test")
 
     @plugin.route(op="demo.add", version=1)
     def add(left: int, right: int = 1) -> int:

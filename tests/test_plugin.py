@@ -38,13 +38,7 @@ class _Provider:
 
 @pytest.fixture(autouse=True)
 def _clean_plugin_state(monkeypatch):
-    for name in (
-        "AITER_PLUGINS",
-        "AITER_PLUGIN_DISABLE",
-        "AITER_PLUGIN_FORCE",
-        "AITER_PLUGIN_ENABLE",
-    ):
-        monkeypatch.delenv(name, raising=False)
+    monkeypatch.delenv("AITER_PLUGINS", raising=False)
     plugin._reset_for_testing()
     yield
     plugin._reset_for_testing()
@@ -117,7 +111,7 @@ def test_decline_or_select_error_uses_visible_native_fallback(monkeypatch, outco
                 raise outcome
 
     provider = Provider("aklr")
-    monkeypatch.setenv("AITER_PLUGIN_ENABLE", "aklr")
+    plugin.configure(enable=("aklr",), source="test")
     monkeypatch.setattr(
         plugin, "_entry_points", lambda: (_EntryPoint("aklr", provider),)
     )
@@ -135,7 +129,7 @@ def test_decline_or_select_error_uses_visible_native_fallback(monkeypatch, outco
 
 def test_selected_candidate_records_provenance(monkeypatch):
     provider = _Provider("aklr", _candidate("aklr"))
-    monkeypatch.setenv("AITER_PLUGIN_ENABLE", "aklr")
+    plugin.configure(enable=("aklr",), source="test")
     monkeypatch.setattr(
         plugin, "_entry_points", lambda: (_EntryPoint("aklr", provider),)
     )
@@ -151,13 +145,13 @@ def test_selected_candidate_records_provenance(monkeypatch):
         kernel_id="kernel-1",
         artifact_digest="sha256:abc",
         qualification="experimental",
-        config_source="env",
+        config_source="configure:test",
     )
 
 
 def test_aiter_signature_is_enforced_before_provider_selection(monkeypatch):
     provider = _Provider("aklr", _candidate("aklr"))
-    monkeypatch.setenv("AITER_PLUGIN_ENABLE", "aklr")
+    plugin.configure(enable=("aklr",), source="test")
     monkeypatch.setattr(
         plugin, "_entry_points", lambda: (_EntryPoint("aklr", provider),)
     )
@@ -181,7 +175,7 @@ def test_run_error_propagates_without_native_fallback(monkeypatch):
         run=fail,
     )
     provider = _Provider("aklr", candidate)
-    monkeypatch.setenv("AITER_PLUGIN_ENABLE", "aklr")
+    plugin.configure(enable=("aklr",), source="test")
     monkeypatch.setattr(
         plugin, "_entry_points", lambda: (_EntryPoint("aklr", provider),)
     )
@@ -200,7 +194,7 @@ def test_enable_list_order_is_the_preference_order(monkeypatch):
 
     zebra = _Provider("zebra", _candidate("zebra", 200))
     alpha = _Provider("alpha", _candidate("alpha", 100))
-    monkeypatch.setenv("AITER_PLUGIN_ENABLE", "zebra, alpha")
+    plugin.configure(enable=("zebra", "alpha"), source="test")
     monkeypatch.setattr(
         plugin,
         "_entry_points",
@@ -231,7 +225,7 @@ def test_broken_and_incompatible_providers_are_isolated(monkeypatch):
     incompatible = _Provider("old")
     incompatible.api_versions = {plugin.API_VERSION + 1}
     good = _Provider("good", _candidate("good"))
-    monkeypatch.setenv("AITER_PLUGIN_ENABLE", "good")
+    plugin.configure(enable=("good",), source="test")
     monkeypatch.setattr(plugin.logger, "warning", lambda *args: warnings.append(args))
     monkeypatch.setattr(
         plugin,
@@ -261,25 +255,6 @@ def test_broken_and_incompatible_providers_are_isolated(monkeypatch):
     assert "this aiter accepts" in skipped["old"]
 
 
-def test_force_and_per_op_disable_are_explicit(monkeypatch):
-    alpha = _Provider("alpha", _candidate("alpha", 100))
-    zebra = _Provider("zebra", _candidate("zebra", 200))
-    monkeypatch.setattr(
-        plugin,
-        "_entry_points",
-        lambda: (_EntryPoint("alpha", alpha), _EntryPoint("zebra", zebra)),
-    )
-    add = _route_add([])
-
-    monkeypatch.setenv("AITER_PLUGIN_FORCE", "zebra")
-    assert add(2, 3) == 200
-
-    monkeypatch.setenv("AITER_PLUGIN_DISABLE", "other.op, test.add")
-    plugin.reload_config()
-    assert add(2, 3) == 5
-    assert plugin.last_decision().reason == "op-disabled"
-
-
 def test_installed_provider_is_not_enabled_by_default(monkeypatch):
     provider = _Provider("aklr", _candidate("aklr"))
     monkeypatch.setattr(
@@ -293,7 +268,7 @@ def test_installed_provider_is_not_enabled_by_default(monkeypatch):
     assert provider.select_calls == 0
     assert plugin.last_decision().reason == "provider-not-enabled"
 
-    monkeypatch.setenv("AITER_PLUGIN_ENABLE", "aklr")
+    plugin.configure(enable=("aklr",), source="test")
     plugin.reload_config()  # env is snapshotted; a mid-process change needs a reload
     assert add(2, 3) == 100
     assert provider.select_calls == 1
@@ -306,7 +281,7 @@ def test_non_candidate_return_falls_back_to_native(monkeypatch):
             return 42
 
     provider = Garbage("aklr")
-    monkeypatch.setenv("AITER_PLUGIN_ENABLE", "aklr")
+    plugin.configure(enable=("aklr",), source="test")
     monkeypatch.setattr(
         plugin, "_entry_points", lambda: (_EntryPoint("aklr", provider),)
     )
@@ -330,60 +305,19 @@ def _enabled_pair(monkeypatch):
     return alpha, zebra
 
 
-def test_env_change_is_not_observed_without_reload(monkeypatch):
+def test_an_environment_change_is_not_observed_without_reload(monkeypatch):
     provider = _Provider("aklr", _candidate("aklr"))
     monkeypatch.setattr(
         plugin, "_entry_points", lambda: (_EntryPoint("aklr", provider),)
     )
-    monkeypatch.setenv("AITER_PLUGIN_ENABLE", "aklr")
+    plugin.configure(enable=("aklr",), source="test")
     add = _route_add([])
     assert add(2, 3) == 100
 
-    monkeypatch.setenv("AITER_PLUGIN_ENABLE", "")
+    monkeypatch.setenv("AITER_PLUGINS", "0")
     assert add(2, 3) == 100, "the snapshot is taken at first dispatch"
     plugin.reload_config()
     assert add(2, 3) == 5
-
-
-def test_empty_enable_env_falls_through_to_the_framework_default(monkeypatch):
-    """Empty env is unset, so it must not wipe out configure()'s enable list."""
-
-    provider = _Provider("aklr", _candidate("aklr"))
-    monkeypatch.setattr(
-        plugin, "_entry_points", lambda: (_EntryPoint("aklr", provider),)
-    )
-    plugin.configure(enable=["aklr"], source="framework")
-    monkeypatch.setenv("AITER_PLUGIN_ENABLE", "")
-    plugin.reload_config()
-
-    assert _route_add([])(2, 3) == 100
-    assert plugin._config().source == "configure:framework"
-
-
-def test_env_enable_replaces_the_framework_default(monkeypatch):
-    alpha, _ = _enabled_pair(monkeypatch)
-    plugin.configure(enable=["alpha"], source="framework")
-    monkeypatch.setenv("AITER_PLUGIN_ENABLE", "zebra")
-    plugin.reload_config()
-
-    assert _route_add([])(2, 3) == 200
-    assert alpha.select_calls == 0
-    assert plugin._config().source == "env"
-
-
-def test_disable_layers_union(monkeypatch):
-    _enabled_pair(monkeypatch)
-    plugin.configure(enable=["alpha"], disable=["framework.op"], source="framework")
-    monkeypatch.setenv("AITER_PLUGIN_DISABLE", "test.add")
-    plugin.reload_config()
-
-    assert _route_add([])(2, 3) == 5
-    assert plugin.last_decision().reason == "op-disabled"
-    # Union, and each op names the layer that disabled it.
-    assert dict(plugin._config().disabled_ops) == {
-        "framework.op": "configure:framework",
-        "test.add": "env",
-    }
 
 
 def test_generation_bumps_on_change_but_not_on_an_identical_reload(monkeypatch):
@@ -393,14 +327,14 @@ def test_generation_bumps_on_change_but_not_on_an_identical_reload(monkeypatch):
     plugin.reload_config()
     assert plugin._config().generation == first, "identical snapshot must not bump"
 
-    monkeypatch.setenv("AITER_PLUGIN_ENABLE", "zebra")
+    plugin.configure(enable=("zebra",), source="test")
     plugin.reload_config()
     assert plugin._config().generation == first + 1
 
 
 def test_eligible_list_is_cached_per_generation(monkeypatch):
     _enabled_pair(monkeypatch)
-    monkeypatch.setenv("AITER_PLUGIN_ENABLE", "alpha")
+    plugin.configure(enable=("alpha",), source="test")
     add = _route_add([])
     assert add(2, 3) == 100
     cached = dict(plugin._eligible_cache)
@@ -409,7 +343,7 @@ def test_eligible_list_is_cached_per_generation(monkeypatch):
     assert add(2, 3) == 100
     assert dict(plugin._eligible_cache) == cached, "a second call must reuse it"
 
-    monkeypatch.setenv("AITER_PLUGIN_ENABLE", "zebra")
+    plugin.configure(enable=("zebra",), source="test")
     plugin.reload_config()
     assert add(2, 3) == 200
     assert dict(plugin._eligible_cache) != cached, "a bump must invalidate it"
@@ -545,7 +479,7 @@ def test_a_misbehaving_provider_does_not_deny_service_to_the_next(
 ):
     broken = _Broken("broken", failure)
     good = _Provider("good", _candidate("good", 100))
-    monkeypatch.setenv("AITER_PLUGIN_ENABLE", "broken, good")
+    plugin.configure(enable=("broken", "good"), source="test")
     monkeypatch.setattr(
         plugin,
         "_entry_points",
@@ -571,7 +505,7 @@ def test_a_misbehaving_provider_does_not_deny_service_to_the_next(
 def test_native_fallback_records_the_first_provider_error(monkeypatch, failure, reason):
     broken = _Broken("broken", failure)
     quiet = _Provider("quiet")  # declines
-    monkeypatch.setenv("AITER_PLUGIN_ENABLE", "broken, quiet")
+    plugin.configure(enable=("broken", "quiet"), source="test")
     monkeypatch.setattr(
         plugin,
         "_entry_points",
@@ -587,7 +521,7 @@ def test_native_fallback_records_the_first_provider_error(monkeypatch, failure, 
 
 def test_every_provider_declining_is_not_reported_as_an_error(monkeypatch):
     first, second = _Provider("first"), _Provider("second")
-    monkeypatch.setenv("AITER_PLUGIN_ENABLE", "first, second")
+    plugin.configure(enable=("first", "second"), source="test")
     monkeypatch.setattr(
         plugin,
         "_entry_points",
@@ -596,16 +530,6 @@ def test_every_provider_declining_is_not_reported_as_an_error(monkeypatch):
 
     assert _route_add([])(2, 3) == 5
     assert plugin.last_decision().reason == "provider-declined"
-
-
-def test_per_op_disable_is_still_recorded(monkeypatch):
-    """Unlike the kill switch: the op was routed and deliberately turned off."""
-
-    monkeypatch.setenv("AITER_PLUGIN_DISABLE", "test.add")
-    assert _route_add([])(2, 3) == 5
-
-    decision = plugin.last_decision()
-    assert (decision.reason, decision.config_source) == ("op-disabled", "env")
 
 
 def test_config_source_names_the_layer_that_produced_the_route(monkeypatch):
@@ -622,10 +546,9 @@ def test_config_source_names_the_layer_that_produced_the_route(monkeypatch):
     assert add(2, 3) == 100
     assert plugin.last_decision().config_source == "configure:vllm rocm 2026.11"
 
-    monkeypatch.setenv("AITER_PLUGIN_ENABLE", "aklr")
+    monkeypatch.setenv("AITER_PLUGINS", "0")
     plugin.reload_config()
-    assert add(2, 3) == 100
-    assert plugin.last_decision().config_source == "env"
+    assert add(2, 3) == 5, "the kill switch outranks the framework default"
 
 
 def test_routing_one_op_name_twice_is_an_error():
@@ -640,20 +563,19 @@ def test_status_reports_the_stack_and_what_is_routable(monkeypatch):
         plugin, "_entry_points", lambda: (_EntryPoint("aklr", provider),)
     )
     _route_add([])
-    plugin.configure(enable=["aklr"], disable=["other.op"], source="vllm 2026.11")
+    plugin.configure(enable=["aklr"], source="vllm 2026.11")
 
     status = plugin.status()
 
     assert status["config_source"] == "configure:vllm 2026.11"
     assert status["enabled"] == ("aklr",)
-    assert status["disabled_ops"] == {"other.op": "configure:vllm 2026.11"}
     assert status["routed_ops"]["test.add"] == {"version": 1, "eligible": ("aklr",)}
     assert status["providers"][0]["name"] == "aklr"
 
 
 def test_explain_answers_without_executing(monkeypatch):
     provider = _Provider("aklr", _candidate("aklr"))
-    monkeypatch.setenv("AITER_PLUGIN_ENABLE", "aklr")
+    plugin.configure(enable=("aklr",), source="test")
     monkeypatch.setattr(
         plugin, "_entry_points", lambda: (_EntryPoint("aklr", provider),)
     )
@@ -672,7 +594,7 @@ def test_explain_answers_without_executing(monkeypatch):
 def test_explain_names_why_each_provider_declined(monkeypatch):
     broken = _Broken("broken", RuntimeError("boom"))
     quiet = _Provider("quiet")
-    monkeypatch.setenv("AITER_PLUGIN_ENABLE", "broken, quiet")
+    plugin.configure(enable=("broken", "quiet"), source="test")
     monkeypatch.setattr(
         plugin,
         "_entry_points",
@@ -746,7 +668,7 @@ def test_route_changes_are_logged_once_per_generation(monkeypatch):
     add(2, 3)
     assert infos == [], "the first generation has nothing to compare against"
 
-    monkeypatch.setenv("AITER_PLUGIN_ENABLE", "aklr")
+    plugin.configure(enable=("aklr",), source="test")
     plugin.reload_config()
     add(2, 3)
     add(2, 3)
@@ -770,7 +692,7 @@ def test_a_superseded_api_version_still_loads_and_names_its_removal(monkeypatch)
         plugin, "SUPERSEDED_API_VERSIONS", {plugin.API_VERSION - 1: "aiter 0.5"}
     )
     provider = _provider_at(plugin.API_VERSION - 1)
-    monkeypatch.setenv("AITER_PLUGIN_ENABLE", "aklr")
+    plugin.configure(enable=("aklr",), source="test")
     monkeypatch.setattr(
         plugin, "_entry_points", lambda: (_EntryPoint("aklr", provider),)
     )
@@ -787,7 +709,7 @@ def test_a_superseded_api_version_still_loads_and_names_its_removal(monkeypatch)
 def test_an_api_version_outside_the_window_is_skipped(monkeypatch):
     monkeypatch.setattr(plugin, "SUPERSEDED_API_VERSIONS", {})
     provider = _provider_at(plugin.API_VERSION - 1)
-    monkeypatch.setenv("AITER_PLUGIN_ENABLE", "aklr")
+    plugin.configure(enable=("aklr",), source="test")
     monkeypatch.setattr(
         plugin, "_entry_points", lambda: (_EntryPoint("aklr", provider),)
     )
@@ -803,7 +725,7 @@ def test_a_superseded_op_version_is_routable_while_the_contract_accepts_it(monke
     )
     provider = _Provider("aklr", _candidate("aklr"))
     provider.op_versions = {"test.add": {1}}  # still on the old contract
-    monkeypatch.setenv("AITER_PLUGIN_ENABLE", "aklr")
+    plugin.configure(enable=("aklr",), source="test")
     monkeypatch.setattr(
         plugin, "_entry_points", lambda: (_EntryPoint("aklr", provider),)
     )
@@ -822,7 +744,7 @@ def test_a_superseded_op_version_is_routable_while_the_contract_accepts_it(monke
 def test_an_op_version_the_contract_does_not_accept_stays_native(monkeypatch):
     provider = _Provider("aklr", _candidate("aklr"))
     provider.op_versions = {"test.add": {1}}
-    monkeypatch.setenv("AITER_PLUGIN_ENABLE", "aklr")
+    plugin.configure(enable=("aklr",), source="test")
     monkeypatch.setattr(
         plugin, "_entry_points", lambda: (_EntryPoint("aklr", provider),)
     )
@@ -893,7 +815,7 @@ def test_the_single_api_version_spelling_still_works_and_says_so(monkeypatch):
     legacy = _Provider("aklr", _candidate("aklr"))
     del legacy.api_versions
     legacy.api_version = plugin.API_VERSION
-    monkeypatch.setenv("AITER_PLUGIN_ENABLE", "aklr")
+    plugin.configure(enable=("aklr",), source="test")
     monkeypatch.setattr(plugin, "_entry_points", lambda: (_EntryPoint("aklr", legacy),))
 
     assert _route_add([])(2, 3) == 100, "the old spelling must keep working"
@@ -906,7 +828,7 @@ def test_two_providers_cannot_answer_to_one_name(monkeypatch):
 
     first = _Provider("aklr", _candidate("aklr", 100))
     second = _Provider("aklr", _candidate("aklr", 200))
-    monkeypatch.setenv("AITER_PLUGIN_ENABLE", "aklr")
+    plugin.configure(enable=("aklr",), source="test")
     monkeypatch.setattr(
         plugin,
         "_entry_points",
@@ -946,7 +868,7 @@ def test_a_candidate_without_evidence_can_still_serve(monkeypatch):
         run=lambda left, right: 100,
     )
     provider = _Provider("aklr", bare)
-    monkeypatch.setenv("AITER_PLUGIN_ENABLE", "aklr")
+    plugin.configure(enable=("aklr",), source="test")
     monkeypatch.setattr(
         plugin, "_entry_points", lambda: (_EntryPoint("aklr", provider),)
     )
@@ -964,7 +886,7 @@ def test_the_newest_acceptable_op_version_is_matched(monkeypatch):
     )
     provider = _Provider("aklr", _candidate("aklr"))
     provider.op_versions = {"test.add": {1, 2}}
-    monkeypatch.setenv("AITER_PLUGIN_ENABLE", "aklr")
+    plugin.configure(enable=("aklr",), source="test")
     monkeypatch.setattr(
         plugin, "_entry_points", lambda: (_EntryPoint("aklr", provider),)
     )
@@ -983,7 +905,7 @@ def test_explain_names_the_provider_it_blames(monkeypatch):
     """explain() claims to return the Decision the call would produce."""
 
     broken = _Broken("broken", RuntimeError("boom"))
-    monkeypatch.setenv("AITER_PLUGIN_ENABLE", "broken")
+    plugin.configure(enable=("broken",), source="test")
     monkeypatch.setattr(
         plugin, "_entry_points", lambda: (_EntryPoint("broken", broken),)
     )
@@ -1011,7 +933,7 @@ def test_explain_does_not_spend_the_one_shot_deprecation_warning(monkeypatch):
     )
     provider = _Provider("aklr", _candidate("aklr"))
     provider.op_versions = {"test.add": {1}}
-    monkeypatch.setenv("AITER_PLUGIN_ENABLE", "aklr")
+    plugin.configure(enable=("aklr",), source="test")
     monkeypatch.setattr(
         plugin, "_entry_points", lambda: (_EntryPoint("aklr", provider),)
     )
@@ -1025,16 +947,6 @@ def test_explain_does_not_spend_the_one_shot_deprecation_warning(monkeypatch):
 
     add(2, 3)
     assert len(warnings) == 1, "real traffic still gets told"
-
-
-def test_a_forced_provider_name_is_stripped(monkeypatch):
-    provider = _Provider("aklr", _candidate("aklr"))
-    monkeypatch.setenv("AITER_PLUGIN_FORCE", "  aklr ")
-    monkeypatch.setattr(
-        plugin, "_entry_points", lambda: (_EntryPoint("aklr", provider),)
-    )
-
-    assert _route_add([])(2, 3) == 100, "whitespace is a typo, not a different name"
 
 
 def test_status_survives_a_provider_that_stops_answering(monkeypatch):
@@ -1055,7 +967,7 @@ def test_status_survives_a_provider_that_stops_answering(monkeypatch):
             return _candidate("aklr")
 
     provider = Rotting()
-    monkeypatch.setenv("AITER_PLUGIN_ENABLE", "aklr")
+    plugin.configure(enable=("aklr",), source="test")
     monkeypatch.setattr(
         plugin, "_entry_points", lambda: (_EntryPoint("aklr", provider),)
     )

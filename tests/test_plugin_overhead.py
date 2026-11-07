@@ -76,9 +76,7 @@ class _Provider:
 
 @pytest.fixture(autouse=True)
 def _clean(monkeypatch):
-    for name in ("AITER_PLUGINS", "AITER_PLUGIN_DISABLE", "AITER_PLUGIN_FORCE"):
-        monkeypatch.delenv(name, raising=False)
-    monkeypatch.delenv("AITER_PLUGIN_ENABLE", raising=False)
+    monkeypatch.delenv("AITER_PLUGINS", raising=False)
     plugin._reset_for_testing()
     yield
     plugin._reset_for_testing()
@@ -95,7 +93,7 @@ def test_dispatch_overhead_is_within_budget(monkeypatch, capsys):
     monkeypatch.setattr(
         plugin, "_entry_points", lambda: (_EntryPoint("bench", _Provider()),)
     )
-    monkeypatch.setenv("AITER_PLUGIN_ENABLE", "bench")
+    plugin.configure(enable=("bench",), source="test")
     routed = plugin.route(op="bench.rmsnorm", version=1)(rmsnorm)
     args = ("out", "input", "weight", 1e-6)
 
@@ -107,7 +105,7 @@ def test_dispatch_overhead_is_within_budget(monkeypatch, capsys):
     killed = _microseconds(lambda: routed(*args))
 
     monkeypatch.setenv("AITER_PLUGINS", "1")
-    monkeypatch.setenv("AITER_PLUGIN_ENABLE", "")
+    plugin.configure(enable=(), source="test")
     plugin.reload_config()
     unrouted = _microseconds(lambda: routed(*args))
 
