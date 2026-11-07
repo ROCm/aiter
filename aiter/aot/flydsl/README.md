@@ -333,13 +333,13 @@ correctness nor precompiled replay acceptance.
 | `AITER_FLYDSL_AOT_TIMEOUT` | Wall-clock cap (seconds) of one worker: one kernel, or for the replaying modules the batch of jobs it replays in turn. A worker stuck *alive* past this is killed (and retried); `0` disables. | `1200` |
 | `AITER_FLYDSL_AOT_MAX_RETRIES` | Retries for a worker that **died abnormally** (OOM-kill / segfault / timeout-kill). A clean compile error is never retried. `0` disables. | `2` |
 | `AITER_CONFIGS` | Resolves the default CSV lookup path (same as the runtime JIT) | repo built-in |
-| `ARCH` / `GPU_ARCHS` | Selects which jobs to build, not what arch a job compiles *for* (that comes from the CSV's `gfx`, with legacy `cu_num` fallback). Every module applies it (`GPU_ARCHS` only) before it starts its per-arch replays, so both `python -m` and the `setup.py` path (`run_aot`) honour it. | auto-detect |
+| `GPU_ARCHS` | Selects which jobs to build, not what arch a job compiles *for* (that comes from the CSV's `gfx`, with legacy `cu_num` fallback). Every module applies it before it starts its per-arch replays, so both `python -m` and the `setup.py` path (`run_aot`) honour it. | auto-detect |
 
 > **About the compile target arch.** The arch each kernel is actually compiled
 > for is taken from the CSV's `gfx` column, with `cu_num_to_arch(...)` retained
 > as a fallback for legacy rows, and applied internally via `FLYDSL_GPU_ARCH`.
 > That internal var is overwritten
-> for every job, so setting `ARCH` / `GPU_ARCHS` / `FLYDSL_GPU_ARCH` in your shell
+> for every job, so setting `GPU_ARCHS` / `FLYDSL_GPU_ARCH` in your shell
 > does **not** change what gets built. To cross-compile, use the target `gfx` and
 > `cu_num` values in the CSV. Every module additionally runs each target arch in
 > its own process with `GPU_ARCHS` pinned and `AITER_AOT_REPLAY=1`, so it builds
