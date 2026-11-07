@@ -96,7 +96,41 @@ __device__ __forceinline__ float mx_amax_abs(float f)
 // Every TUNING choice below is gated on gfx1250: each was swept there and leans on
 // something arch-specific (wave32, b128 as the widest per-lane access). Nothing was
 // measured on gfx950, so that target keeps the shape it had before.
-template <typename DTYPE_I, typename DTYPE_O, int thread_data_size = 32, int32_t group_size = 128, bool shuffle_scale = true, int32_t block_size = 64, bool emit_e8m0_scale = false, bool enable_tdm = false, int tdm_tile_rows = 0, bool full_group_stores = false, bool wide_group_stores = false, bool grid_2d = false, bool mx32_tile = false, int tdm_steps = kDynGqTdmKPT, int mx32_tiles_x = kMx32TilesX<DTYPE_O>>
+// Normalized 32-point Sylvester Hadamard transform of one thread-owned group, in fp32,
+// rounded back to the input type. Equal to `x @ (scipy.linalg.hadamard(32) / sqrt(32))`.
+template <typename DTYPE_I, int thread_data_size>
+__device__ __forceinline__ void hadamard32_rotate(opus::vector_t<DTYPE_I, thread_data_size>& data)
+{
+    static_assert(thread_data_size == 32);
+    float v[32];
+#pragma unroll
+    for(int j = 0; j < 32; ++j)
+        v[j] = static_cast<float>(data[j]);
+#pragma unroll
+    for(int h = 1; h < 32; h <<= 1)
+    {
+#pragma unroll
+        for(int i = 0; i < 32; i += 2 * h)
+        {
+#pragma unroll
+            for(int j = i; j < i + h; ++j)
+            {
+                const float a = v[j];
+                const float b = v[j + h];
+                v[j]          = a + b;
+                v[j + h]      = a - b;
+            }
+        }
+    }
+    constexpr float kInvSqrt32 = 0.17677669529663687f;
+#pragma unroll
+    for(int j = 0; j < 32; ++j)
+        data[j] = static_cast<DTYPE_I>(v[j] * kInvSqrt32);
+}
+
+// hadamard32: rotate each 32-element group with hadamard32_rotate before computing its
+// scale. fp4 output with group_size == 32 only, where one thread owns a whole group.
+template <typename DTYPE_I, typename DTYPE_O, int thread_data_size = 32, int32_t group_size = 128, bool shuffle_scale = true, int32_t block_size = 64, bool emit_e8m0_scale = false, bool enable_tdm = false, int tdm_tile_rows = 0, bool full_group_stores = false, bool wide_group_stores = false, bool grid_2d = false, bool mx32_tile = false, int tdm_steps = kDynGqTdmKPT, int mx32_tiles_x = kMx32TilesX<DTYPE_O>, bool hadamard32 = false>
 __global__ void __launch_bounds__(block_size)
 dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
                                       float* __restrict__ scale,
@@ -394,6 +428,12 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     const int32_t pair_stride = kColumnMajorGroups ? ori_cols : group_size;
 
     auto process = [&](vec_i thread_data, int64_t x, int32_t y, int64_t groupId) {
+        if constexpr(hadamard32)
+        {
+            static_assert(std::is_same_v<DTYPE_O, opus::fp4_t> && group_size == 32 &&
+                          thread_data_size == 32 && !kInterleavedChunks);
+            hadamard32_rotate<DTYPE_I, thread_data_size>(thread_data);
+        }
         static constexpr bool kMxFp8 = use_e8m0_scale && std::is_same_v<DTYPE_O, opus::fp8_t>;
         static constexpr bool kStoreTakesDivisor =
             kMxFp8 && opus::is_any_of_v<DTYPE_I, opus::bf16_t, opus::fp16_t> &&
@@ -1904,8 +1944,19 @@ void dynamic_per_group_scaled_quant(aiter_tensor_t& out,         // [..., d]
                                     bool shuffle_scale,
                                     std::optional<aiter_tensor_t> num_rows,
                                     int num_rows_factor,
-                                    bool scale_layout_m32k4)
+                                    bool scale_layout_m32k4,
+                                    bool hadamard_rotate)
 {
+    if(hadamard_rotate)
+    {
+        AITER_CHECK(group_size == 32 && !scale_layout_m32k4 &&
+                        (out.dtype() == AITER_DTYPE_fp4x2 || out.dtype() == AITER_DTYPE_u8),
+                    __func__,
+                    " hadamard_rotate requires fp4x2 output with group_size 32");
+        AITER_CHECK(get_gpu_arch() == "gfx950",
+                    __func__,
+                    " hadamard_rotate requires gfx950 hardware FP4 conversion");
+    }
     if(scale_layout_m32k4)
     {
         // Separate kernel; shuffle_scale / num_rows_factor do not apply to this layout.
@@ -1962,10 +2013,11 @@ void dynamic_per_group_scaled_quant(aiter_tensor_t& out,         // [..., d]
         static constexpr int num_thread_per_group = _GS / thread_data_size;
         int scaleN    = cols / _GS;
 
-        auto launch = [&](auto out_type_tag, auto shuffle_tag, auto e8m0_tag) {
+        auto launch = [&](auto out_type_tag, auto shuffle_tag, auto e8m0_tag, auto had_tag) {
             using out_t = decltype(out_type_tag);
             constexpr bool ss = decltype(shuffle_tag)::value;
             constexpr bool ee = decltype(e8m0_tag)::value;
+            constexpr bool hh = decltype(had_tag)::value && _GS == 32;
             // Column-major group order: consecutive groups walk x at a fixed y, which is
             // what makes the transposed scale store contiguous.
             constexpr bool kColMajor =
@@ -2052,7 +2104,8 @@ void dynamic_per_group_scaled_quant(aiter_tensor_t& out,         // [..., d]
                     // block's two scale tiles are 512 adjacent bytes, stored at once.
                     // Narrower or shorter tiles split those lines and measured slower:
                     // 16384x7168 fp4 shuffled 18.6 -> 23.8 us at 32x256.
-                    if constexpr(_GS == 32 && ee && kMxOut)
+                    // The tile kernels do not rotate; hadamard_rotate keeps the generic kernel.
+                    if constexpr(_GS == 32 && ee && kMxOut && !hh)
                     {
                         const bool tdm32 =
                             tile_ok && rows % 32 == 0 &&
@@ -2097,7 +2150,7 @@ void dynamic_per_group_scaled_quant(aiter_tensor_t& out,         // [..., d]
                     // row, so the 32 B fp8 stores already coalesce; each tile's
                     // 256 scale bytes are staged and stored as sixteen uint4s
                     // instead of 256 scattered bytes.
-                    if constexpr(_GS == 32 && ee && ss && kMxOut)
+                    if constexpr(_GS == 32 && ee && ss && kMxOut && !hh)
                     {
                         // Below these tile counts the generic kernel is faster: fp8 two per
                         // CU, fp4 one per two CUs (7168 cols: 112 tiles 1.05x, 224 tiles 0.96x).
@@ -2175,7 +2228,8 @@ void dynamic_per_group_scaled_quant(aiter_tensor_t& out,         // [..., d]
                     constexpr int32_t BS = decltype(blk_tag)::value;
                     constexpr bool fgs = decltype(fgs_tag)::value;
                     aiter::dynamic_per_group_scaled_quant_kernel<input_dtype, out_t, thread_data_size, _GS, ss, BS, ee, false,
-                                                                 0, fgs>
+                                                                 0, fgs, false, false, false, kDynGqTdmKPT,
+                                                                 kMx32TilesX<out_t>, hh>
                         <<<grid, block, 0, stream>>>(
                         reinterpret_cast<out_t*>(out.data_ptr()),
                         reinterpret_cast<float*>(scales.data_ptr()),
@@ -2222,19 +2276,22 @@ void dynamic_per_group_scaled_quant(aiter_tensor_t& out,         // [..., d]
             constexpr bool ee = decltype(e8m0_tag)::value;
             if(out.dtype() == AITER_DTYPE_fp8)
             {
-                launch(opus::fp8_t{}, shuffle_tag, e8m0_tag);
+                launch(opus::fp8_t{}, shuffle_tag, e8m0_tag, std::false_type{});
             }
             else if(out.dtype() == AITER_DTYPE_i8)
             {
                 static_assert(true, "i8 path does not support e8m0 scale");
                 AITER_CHECK(!ee, __func__, " i8 output does not support e8m0 scale");
-                launch(opus::i8_t{}, shuffle_tag, std::false_type{});
+                launch(opus::i8_t{}, shuffle_tag, std::false_type{}, std::false_type{});
             }
 #if defined(__Float4_e2m1fn_x2)
             else if(out.dtype() == AITER_DTYPE_fp4x2 || out.dtype() == AITER_DTYPE_u8)
             {
                 // fp4 always uses e8m0 scale regardless of `use_e8m0_scale`.
-                launch(opus::fp4_t{}, shuffle_tag, std::true_type{});
+                if(hadamard_rotate)
+                    launch(opus::fp4_t{}, shuffle_tag, std::true_type{}, std::true_type{});
+                else
+                    launch(opus::fp4_t{}, shuffle_tag, std::true_type{}, std::false_type{});
             }
 #endif
             else
