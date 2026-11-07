@@ -1,0 +1,148 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+
+"""End-to-end autograd op for jagged_dense_bmm_broadcast_add (jdbba).
+
+Pairs the FlyDSL forward (``jagged_dense_bmm_dispatched``) with the backward
+(``jagged_dense_bmm_bwd_dispatched``) as a single ``torch.autograd.Function``.
+
+Per group b over its packed row slice [s, e):
+    Out[s:e] = Jagged[s:e] @ Dense[b] + Bias[b][None, :]     (forward)
+    dJagged / dDense / dBias                                  (backward)
+
+LAYOUT RECONCILIATION (the one place fwd↔bwd layouts are bridged):
+  The caller holds ``dense`` in the natural ``(n_groups, K, N)`` weight layout.
+    * forward kernel wants a TALL, pre-transposed ``(n_groups*N, K)`` buffer
+      (N-major per group) + a flat ``(n_groups*N,)`` bias -> built here per call;
+    * backward wrapper wants the PLAIN ``(n_groups*K, N)`` K-major dense and
+      returns ``dDense`` already shaped ``(n_groups, K, N)`` -> it takes the
+      natural ``dense`` directly, so no transpose is needed on the backward side.
+  So this Function saves the natural ``(n_groups, K, N)`` dense for backward and
+  only pre-transposes for the forward launch. Gradients come back in the caller's
+  input layouts: ``dJagged (L, K)``, ``dDense (n_groups, K, N)``, ``dBias (n_groups, N)``.
+
+CONSTRAINTS (inherited from the backward):
+  * D = K = N is baked into memoized per-shape kernel builds (multiple D can
+    coexist in one process via the forward/backward dispatch wrappers).
+"""
+
+from __future__ import annotations
+
+import torch
+
+from .jagged_dense_bmm_bwd_dispatch import jagged_dense_bmm_bwd_dispatched
+from .jagged_dense_bmm_dispatch import jagged_dense_bmm_dispatched
+from .jagged_dense_bmm_validation import validate_jdbba_autograd_inputs
+
+__all__ = ["jagged_dense_bmm_autograd"]
+
+
+class _JaggedDenseBmmBroadcastAdd(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        jagged,
+        dense,
+        bias,
+        seq_offsets,
+        n_groups,
+        max_seq_len,
+        uniform_seqlen,
+    ):
+        n_groups = int(n_groups)
+        max_seq_len = int(max_seq_len)
+        _, K, N = dense.shape
+        L = jagged.shape[0]
+        device = jagged.device
+
+        # The Function drives autograd itself, so all kernel I/O runs on DETACHED
+        # tensors (FlyDSL's from_dlpack rejects grad-requiring tensors). Detached
+        # copies are also what we save for backward (we only need the values).
+        jagged_k = jagged.detach()
+        dense_k = dense.detach()
+        bias_k = bias.detach()
+
+        # fwd contract: tall pre-transposed (n_groups*N, K) dense + flat bias.
+        dense_tall = dense_k.transpose(1, 2).reshape(n_groups * N, K).contiguous()
+        bias_flat = bias_k.reshape(n_groups * N).contiguous()
+
+        # Each group's C stores are bounded to its length, so C is exactly (L, N).
+        # The dispatcher takes torch.Tensor and converts at the jit boundary.
+        out = torch.empty(L, N, dtype=torch.bfloat16, device=device)
+        jagged_dense_bmm_dispatched(
+            out,
+            jagged_k,
+            dense_tall,
+            bias_flat,
+            seq_offsets,
+            n_groups,
+            max_seq_len,
+            uniform_seqlen=uniform_seqlen,
+        )
+
+        ctx.save_for_backward(jagged_k, dense_k, seq_offsets)
+        ctx.n_groups = n_groups
+        ctx.max_seq_len = max_seq_len
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        jagged, dense, seq_offsets = ctx.saved_tensors  # already detached in forward
+        # The backward kernels consume a contiguous bf16 (L, N) upstream grad; it is
+        # a grad tensor (no grad tracking) but may be non-contiguous / non-bf16.
+        grad_out = grad_out.detach()
+        if grad_out.dtype != torch.bfloat16:
+            grad_out = grad_out.to(torch.bfloat16)
+        grad_out = grad_out.contiguous()
+
+        d_jagged, d_dense, d_bias = jagged_dense_bmm_bwd_dispatched(
+            jagged,
+            dense,
+            grad_out,
+            seq_offsets,
+            n_groups=ctx.n_groups,
+            max_seq_len=ctx.max_seq_len,
+        )
+        # Grads for (jagged, dense, bias, seq_offsets, n_groups, max_seq_len,
+        # uniform_seqlen). Only the first three are differentiable.
+        return d_jagged, d_dense, d_bias, None, None, None, None
+
+
+def jagged_dense_bmm_autograd(
+    jagged: torch.Tensor,  # (L, K)           bf16, packed rows (requires_grad ok)
+    dense: torch.Tensor,  # (n_groups, K, N) bf16 weight (requires_grad ok)
+    bias: torch.Tensor,  # (n_groups, N)    bf16 bias   (requires_grad ok)
+    seq_offsets: torch.Tensor,  # (n_groups + 1,)  int32 prefix-sum offsets
+    n_groups: int | None = None,
+    max_seq_len: int | None = None,
+    uniform_seqlen: bool = True,
+):
+    """Autograd-enabled jdbba: returns ``Out (L, N)`` with a fused backward.
+
+    ``Out[s:e] = Jagged[s:e] @ Dense[b] + Bias[b]`` per group b. Backpropagates to
+    ``jagged`` / ``dense`` / ``bias`` via the FlyDSL backward. ``max_seq_len`` sizes
+    the forward/backward M grid envelope; if omitted it is derived from
+    ``seq_offsets`` (one device→host sync — pass it to avoid that). ``uniform_seqlen``
+    routes the forward's XCD-remap/kernel-variant choice (scheduling only, not
+    correctness); pass ``False`` for skewed/genrec deployment sequence lengths.
+
+    D = K = N must be square; each distinct D memoizes its own compiled kernels.
+    """
+    if n_groups is None:
+        n_groups = dense.shape[0]
+    n_groups = int(n_groups)
+
+    validate_jdbba_autograd_inputs(jagged, dense, bias, seq_offsets, n_groups)
+
+    if max_seq_len is None:
+        max_seq_len = int((seq_offsets[1:] - seq_offsets[:-1]).max().item())
+
+    return _JaggedDenseBmmBroadcastAdd.apply(
+        jagged,
+        dense,
+        bias,
+        seq_offsets,
+        n_groups,
+        int(max_seq_len),
+        uniform_seqlen,
+    )
