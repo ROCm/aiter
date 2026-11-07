@@ -15,6 +15,7 @@ template<int BlockM = opus_moe::kStage2A8W4DecodeDefaultBlockM,
          int CachectlWScaleOverride = 0,
          int PairSlots = 1,
          int SteadyPairSlots = PairSlots,
+         int NumXcd = 8,
          int SortBlockM = BlockM>
 struct OpusMoeStage2A8W4DecodeShape
 {
@@ -46,8 +47,8 @@ struct OpusMoeStage2A8W4DecodeShape
 
     // One tile must not combine sorted blocks belonging to different experts.
     static constexpr int ROUTE_M_STRIDE = SortBlockM < B_M ? SortBlockM : B_M;
-    // route_out XCD swizzle (gfx950=8 XCDs).
-    static constexpr int NUM_XCD = DIRECT_ATOMIC_OUT ? 1 : 8;
+    // route_out XCD swizzle.
+    static constexpr int NUM_XCD = DIRECT_ATOMIC_OUT ? 1 : NumXcd;
     static constexpr int SWIZZLE_W = 2;
     static constexpr int SWIZZLE_C =
         (!DIRECT_ATOMIC_OUT && (IS_BM32_BN256 || IS_BM64_BN256))

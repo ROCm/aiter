@@ -10,6 +10,7 @@ manifests are the single source of truth for kid -> launcher mapping.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import shutil
 import sys
 from pathlib import Path
@@ -110,7 +111,8 @@ def _emit_bf16_manifest_header() -> str:
         for idx, inst in enumerate(bf16_kernels):
             suffix = " \\\n" if idx != len(bf16_kernels) - 1 else "\n"
             lines.append(
-                f"    case {inst.kid}: return &{inst.launcher}<{inst.trait}>;" + suffix
+                f"    case {inst.kid}: return &{inst.launcher}<{inst.trait}<{build_num_xcd()}>>;"
+                + suffix
             )
     lines.append("\n")
 
@@ -136,6 +138,18 @@ def _cpp_name_suffix(name: str) -> str:
     )
 
 
+def build_num_xcd() -> int:
+    spec = importlib.util.find_spec("aiter")  # locates, does not execute
+    if spec is None or not spec.submodule_search_locations:
+        return 8  # Standalone codegen without aiter.
+    utils_dir = str(Path(next(iter(spec.submodule_search_locations))) / "jit" / "utils")
+    if utils_dir not in sys.path:
+        sys.path.insert(0, utils_dir)
+    import build_targets
+
+    return build_targets.build_num_xcds("gfx950")
+
+
 def _stage2_a8w4_traits_alias(kid: int) -> str:
     return f"OpusMoeStage2A8W4DecodeKid{int(kid)}Traits"
 
@@ -153,7 +167,8 @@ def _stage2_a8w4_traits_type(inst) -> str:
         f"{inst.cachectl_b}, "
         f"{inst.cachectl_wscale}, "
         f"{inst.pair_slots}, "
-        f"{inst.steady_pair_slots}{sort_block}"
+        f"{inst.steady_pair_slots}, "
+        f"{build_num_xcd()}{sort_block}"
         ">"
     )
 
@@ -599,7 +614,7 @@ class OpusMoeDeviceCodegen:
             lines.extend(
                 [
                     "template __global__ void opus_moe_stage2_gemmstyle_kernel_gfx950<",
-                    f"{inst.trait}>(opus_moe_stage2_bf16_kargs);\n",
+                    f"{inst.trait}<{build_num_xcd()}>>(opus_moe_stage2_bf16_kargs);\n",
                 ]
             )
         (self.instances_path / "opus_moe_stage2_bf16.device.cu").write_text(
