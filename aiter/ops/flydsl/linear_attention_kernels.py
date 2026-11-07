@@ -7,20 +7,31 @@ from __future__ import annotations
 
 import collections
 import functools
+import os
+from collections.abc import Iterable
 
 import flydsl.expr as fx
 import torch
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.runtime.device import get_rocm_arch
 
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.triton.utils.device_info import get_num_sms
 
 from .kernels.gdn_decode_verify import create_gdn_decode_verify_kernel
 from .kernels.gdr_decode import (
+    _KDA_DIM,
+    _KDA_HEADS,
     MTP_MODE_CHAIN,
     MTP_MODE_SNAPSHOT,
+    create_kda_decode_kernel,
     create_vk_gdr_decode_kernel,
     create_vk_gdr_mtp_kernel,
+)
+from .kernels.kda_verify import (
+    KDA_VERIFY_MAX_TOKENS,
+    KDA_VERIFY_NUM_WARPS,
+    create_kda_verify_kernel,
 )
 from .kernels.tensor_shim import _run_compiled, get_dtype_str
 
@@ -29,6 +40,10 @@ __all__ = [
     "flydsl_gdr_decode",
     "flydsl_gdr_mtp",
     "flydsl_gdr_mtp_sglang",
+    "flydsl_kda_decode",
+    "flydsl_kda_decode_with_f_b",
+    "flydsl_kda_verify_with_f_b",
+    "is_flydsl_kda_decode_supported",
 ]
 
 
@@ -1070,6 +1085,1247 @@ def flydsl_gdr_mtp_sglang(
         disable_state_update=disable_state_update,
         stream=stream,
     )
+
+
+# Fused KDA decode: the gated delta rule with a per-channel decay, fixed to
+# the Kimi-K3 TP8 layout (_KDA_HEADS=12 local heads, _KDA_DIM=128 state,
+# both imported from the kernel so the two cannot disagree).
+_KDA_CONV_CHANNELS = 3 * _KDA_HEADS * _KDA_DIM
+# Validated on both; tuned on gfx950.
+_KDA_SUPPORTED_ARCHS = ("gfx942", "gfx950")
+_KDA_CONV_WIDTH = 4
+# Recurrent-state storage the KDA kernels accept, mapped to the tag that keys
+# kernels/gdr_decode.py's _KDA_STATE_DTYPES; the recurrence computes in FP32.
+_KDA_STATE_DTYPE_TAGS = {torch.float32: "f32", torch.bfloat16: "bf16"}
+_INT32_MAX = 2**31 - 1
+# Debug check that live KDA ``state_indices`` are unique. It copies the
+# duplicates to the host, a sync, so it is off by default and skipped while a
+# CUDA graph is being captured. Slot 0 is live, so by default it also flags
+# SGLang's eager DP-attention padding rows, which share the reserved scratch
+# slot 0; AITER_KDA_DECODE_SLOT_CHECK_PADDING_SLOT=0 lets that slot repeat.
+_KDA_SLOT_CHECK = os.environ.get("AITER_KDA_DECODE_SLOT_CHECK", "0") == "1"
+
+
+def _env_padding_slot(name: str) -> int | None:
+    value = os.environ.get(name, "").strip()
+    if not value:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        raise ValueError(f"{name} must be a slot index, got {value!r}.") from None
+
+
+# A slot the debug check treats as padding, like a negative index: the kernel
+# still decodes it, but the caller reserves it for rows whose results it drops.
+_KDA_SLOT_CHECK_PADDING_SLOT = _env_padding_slot(
+    "AITER_KDA_DECODE_SLOT_CHECK_PADDING_SLOT"
+)
+
+
+def _mask_padding_slot(state_indices: torch.Tensor) -> torch.Tensor:
+    """Map the opted-in padding slot to -1, so the slot check lets it repeat."""
+    if _KDA_SLOT_CHECK_PADDING_SLOT is None:
+        return state_indices
+    return torch.where(state_indices == _KDA_SLOT_CHECK_PADDING_SLOT, -1, state_indices)
+
+
+def is_flydsl_kda_decode_supported(
+    device: torch.device | str | int | None = None,
+) -> bool:
+    """Return whether ``device`` can run this gfx942/gfx950 specialization."""
+    if not torch.cuda.is_available():
+        return False
+    try:
+        if device is None:
+            index = torch.cuda.current_device()
+        else:
+            resolved = (
+                torch.device("cuda", device)
+                if isinstance(device, int)
+                else torch.device(device)
+            )
+            if resolved.type != "cuda":
+                return False
+            index = (
+                torch.cuda.current_device()
+                if resolved.index is None
+                else resolved.index
+            )
+        if not 0 <= index < torch.cuda.device_count():
+            return False
+        # FlyDSL builds for GDR_GPU_ARCH (FLYDSL_GPU_ARCH or the first GPU), so
+        # the GPU must be a supported arch and match the build target.
+        arch = get_gfx_runtime()
+        return arch in _KDA_SUPPORTED_ARCHS and GDR_GPU_ARCH == arch
+    except (AssertionError, KeyError, RuntimeError, TypeError, ValueError):
+        return False
+
+
+def _check_tensor(
+    name: str,
+    tensor: torch.Tensor,
+    *,
+    shape: tuple[int, ...],
+    dtype: torch.dtype,
+    device: torch.device,
+    inner_strides: tuple[int, ...] = (),
+) -> None:
+    if tensor.shape != shape:
+        raise ValueError(
+            f"`{name}` must have shape {list(shape)}, got {list(tensor.shape)}."
+        )
+    if tensor.dtype != dtype:
+        raise ValueError(f"`{name}` must have dtype {dtype}, got {tensor.dtype}.")
+    if tensor.device != device:
+        raise ValueError(f"`{name}` must be on {device}, got {tensor.device}.")
+    if inner_strides and tensor.stride()[-len(inner_strides) :] != inner_strides:
+        raise ValueError(
+            f"`{name}` must have inner strides {inner_strides}, got {tensor.stride()}."
+        )
+
+
+def _check_same_device(
+    tensors: Iterable[tuple[str, torch.Tensor]],
+    device: torch.device,
+) -> None:
+    for name, tensor in tensors:
+        if not tensor.is_cuda:
+            raise ValueError(f"`{name}` must be a CUDA tensor.")
+        if tensor.device != device:
+            raise ValueError(f"`{name}` must be on {device}, got {tensor.device}.")
+
+
+def _num_cache_slots(state: torch.Tensor, conv_state: torch.Tensor) -> int:
+    """Return the slot count shared by both caches, clamped to the int32 index range."""
+    return min(state.shape[0], conv_state.shape[0], _INT32_MAX)
+
+
+def _check_unique_live_slots(
+    state_indices: torch.Tensor, num_slots: int, name: str = "state_indices"
+) -> None:
+    """Reject a live slot that appears more than once in ``state_indices``."""
+    live = state_indices[(state_indices >= 0) & (state_indices < num_slots)]
+    slots, counts = torch.unique(live, return_counts=True)
+    duplicates = slots[counts > 1].tolist()
+    if duplicates:
+        raise ValueError(
+            f"`{name}` must not repeat a live (non-negative, in-range) slot; "
+            f"duplicated slots: {duplicates[:8]}."
+        )
+
+
+def _check_dense_cache_slots(
+    name: str,
+    tensor: torch.Tensor,
+    layouts: tuple[tuple[int, ...], ...],
+) -> None:
+    """Require disjoint, dense cache slots while allowing padding between slots.
+
+    ``layouts`` lists the accepted inner strides; the kernel takes every stride
+    as an argument, so any dense ordering of a slot's elements works.
+    """
+    if (
+        tensor.stride()[1:] not in layouts
+        or tensor.stride(0) < tensor.shape[1:].numel()
+    ):
+        raise ValueError(f"`{name}` must have dense, non-overlapping cache slots.")
+
+
+def _check_disjoint_rows(
+    name: str,
+    tensor: torch.Tensor,
+    row_dims: tuple[int, ...],
+    rows: str,
+) -> None:
+    """Require the rows ``row_dims`` index (each the unit-stride last dim) to be disjoint.
+
+    Any dimension order (batch- or heads-outer) and any padding between rows
+    works: taken by increasing stride, each dimension must step past everything
+    the narrower dimensions span.
+    """
+    span = tensor.shape[-1]
+    for dim in sorted(
+        (dim for dim in row_dims if tensor.shape[dim] > 1), key=tensor.stride
+    ):
+        if tensor.stride(dim) < span:
+            raise ValueError(f"`{name}` must have non-overlapping {rows} rows.")
+        span += (tensor.shape[dim] - 1) * tensor.stride(dim)
+
+
+def _slot_blocks(tensor: torch.Tensor) -> tuple[int, int, int, int]:
+    """Return (start, step, size, count): the byte blocks of each dim-0 slot.
+
+    Spans are conservative: a block covers every byte its slot can reach,
+    which is exact for the dense slots the callers have already checked.
+    """
+    es = tensor.element_size()
+    count = tensor.shape[0]
+    reach = sum((n - 1) * st for n, st in zip(tensor.shape[1:], tensor.stride()[1:]))
+    return tensor.data_ptr(), tensor.stride(0) * es, (reach + 1) * es, count
+
+
+def _blocks_overlap(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> bool:
+    """Whether two runs of evenly spaced byte blocks share a byte.
+
+    Exact when both runs step alike or one run is a single block: then some
+    k = j - i must put b's block j within a's block i. Other runs whose
+    overall spans meet count as overlapping.
+    """
+    (a0, a_step, a_size, na), (b0, b_step, b_size, nb) = a, b
+    if (
+        na == 0
+        or nb == 0
+        or a0 >= b0 + (nb - 1) * b_step + b_size
+        or b0 >= a0 + (na - 1) * a_step + a_size
+    ):
+        return False
+    if na > 1 and nb > 1 and a_step != b_step:
+        return True
+    step = a_step if na > 1 else b_step
+    if step <= 0 or (na == 1 and nb == 1):
+        return True
+    # Need -b_size < d + k * step < a_size for some k in [1 - na, nb - 1].
+    d = b0 - a0
+    k_low = max((-b_size - d) // step + 1, 1 - na)
+    k_high = min(-((d - a_size) // step) - 1, nb - 1)
+    return k_low <= k_high
+
+
+def _check_no_alias(
+    written: tuple[tuple[str, torch.Tensor | None], ...],
+    read: tuple[tuple[str, torch.Tensor], ...],
+) -> None:
+    """Reject a written buffer that shares a byte with a read-only cache.
+
+    A verify must leave the caches unchanged until the caller commits, so a
+    scratch or output store into a cache is an early commit. Buffers may
+    still interleave slots in one pool.
+    """
+    for w_name, w in written:
+        if w is None:
+            continue
+        for r_name, r in read:
+            if _blocks_overlap(_slot_blocks(w), _slot_blocks(r)):
+                raise ValueError(f"`{w_name}` must not overlap `{r_name}`.")
+
+
+def _check_i32_addressing(
+    name: str,
+    tensor: torch.Tensor,
+    *,
+    first_dim: int = 0,
+) -> None:
+    """Bound strides and the full byte span relative to the buffer base.
+
+    Cache buffers are rebased per slot in i64, so only their inner dimensions
+    contribute. The leading sequence dimension of raw gates and output is
+    unused by the kernel and is also excluded.
+    """
+    strides = tensor.stride()[first_dim:]
+    if any(stride < 0 or stride > _INT32_MAX for stride in strides):
+        raise ValueError(f"`{name}` strides must fit non-negative int32 addressing.")
+    # Include the last element's full width, including vector load/store tails.
+    span_bytes = (
+        1
+        + sum(
+            (size - 1) * stride
+            for size, stride in zip(tensor.shape[first_dim:], strides)
+        )
+    ) * tensor.element_size()
+    if span_bytes > _INT32_MAX:
+        raise ValueError(f"`{name}` byte span must fit int32 buffer addressing.")
+
+
+def _validate_kda_inputs(
+    *,
+    api_name: str,
+    batch_source: str,
+    device: torch.device,
+    batch: int,
+    x: torch.Tensor,
+    conv_weight: torch.Tensor,
+    conv_bias: torch.Tensor | None,
+    conv_state: torch.Tensor,
+    raw_beta: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    lower_bound: float | None,
+    state: torch.Tensor,
+    state_indices: torch.Tensor,
+    output_gate: torch.Tensor,
+    norm_weight: torch.Tensor,
+    out: torch.Tensor | None,
+) -> torch.Tensor:
+    """Validate operands shared by both explicit KDA specializations."""
+    if not is_flydsl_kda_decode_supported(device):
+        raise RuntimeError(f"`{api_name}` requires a gfx942 or gfx950 GPU.")
+    if batch <= 0:
+        raise ValueError(f"`{batch_source}` must have a non-empty batch dimension.")
+    if batch * _KDA_HEADS > _INT32_MAX:
+        raise ValueError("The KDA launch grid must fit int32 addressing.")
+    if conv_bias is not None:
+        raise ValueError("This specialization requires `conv_bias=None`.")
+    if lower_bound is None:
+        raise ValueError("This specialization requires the KDA lower-bound gate.")
+
+    _check_same_device(
+        (
+            ("x", x),
+            ("conv_weight", conv_weight),
+            ("conv_state", conv_state),
+            ("raw_beta", raw_beta),
+            ("A_log", A_log),
+            ("dt_bias", dt_bias),
+            ("state", state),
+            ("state_indices", state_indices),
+            ("output_gate", output_gate),
+            ("norm_weight", norm_weight),
+        ),
+        device,
+    )
+    _check_tensor(
+        "x",
+        x,
+        shape=(batch, _KDA_CONV_CHANNELS),
+        dtype=torch.bfloat16,
+        device=device,
+        inner_strides=(1,),
+    )
+    _check_tensor(
+        "conv_weight",
+        conv_weight,
+        shape=(_KDA_CONV_CHANNELS, _KDA_CONV_WIDTH),
+        dtype=torch.float32,
+        device=device,
+    )
+    if conv_state.ndim != 3 or conv_state.shape[1:] != (
+        _KDA_CONV_CHANNELS,
+        _KDA_CONV_WIDTH - 1,
+    ):
+        raise ValueError(
+            "`conv_state` must have shape [cache, 4608, 3], "
+            f"got {list(conv_state.shape)}."
+        )
+    if conv_state.dtype != torch.bfloat16:
+        raise ValueError("`conv_state` must have dtype torch.bfloat16.")
+    # Channel-major [cache, 4608, 3], or the [cache, 3, 4608] width-major cache
+    # (SGLang's layout) viewed through transpose(-1, -2).
+    _check_dense_cache_slots(
+        "conv_state", conv_state, ((_KDA_CONV_WIDTH - 1, 1), (1, _KDA_CONV_CHANNELS))
+    )
+    if state.ndim != 4 or state.shape[1:] != (
+        _KDA_HEADS,
+        _KDA_DIM,
+        _KDA_DIM,
+    ):
+        raise ValueError(
+            f"`state` must have shape [cache, 12, 128, 128], got {list(state.shape)}."
+        )
+    if state.dtype not in _KDA_STATE_DTYPE_TAGS:
+        raise ValueError(
+            "`state` must have dtype torch.float32 or torch.bfloat16, "
+            f"got {state.dtype}."
+        )
+    _check_dense_cache_slots("state", state, ((_KDA_DIM * _KDA_DIM, _KDA_DIM, 1),))
+    _check_tensor(
+        "raw_beta",
+        raw_beta,
+        shape=(1, batch, _KDA_HEADS),
+        dtype=torch.bfloat16,
+        device=device,
+        inner_strides=(1,),
+    )
+    _check_tensor(
+        "A_log",
+        A_log,
+        shape=(_KDA_HEADS,),
+        dtype=torch.float32,
+        device=device,
+        inner_strides=(1,),
+    )
+    _check_tensor(
+        "dt_bias",
+        dt_bias,
+        shape=(_KDA_HEADS * _KDA_DIM,),
+        dtype=torch.float32,
+        device=device,
+        inner_strides=(1,),
+    )
+    _check_tensor(
+        "state_indices",
+        state_indices,
+        shape=(batch,),
+        dtype=torch.int32,
+        device=device,
+        inner_strides=(1,),
+    )
+    _check_tensor(
+        "output_gate",
+        output_gate,
+        shape=(batch, _KDA_HEADS, _KDA_DIM),
+        dtype=torch.bfloat16,
+        device=device,
+        inner_strides=(1,),
+    )
+    _check_tensor(
+        "norm_weight",
+        norm_weight,
+        shape=(_KDA_DIM,),
+        dtype=torch.bfloat16,
+        device=device,
+        inner_strides=(1,),
+    )
+
+    for name, tensor, first_dim in (
+        ("x", x, 0),
+        ("conv_weight", conv_weight, 0),
+        ("conv_state", conv_state, 1),
+        ("raw_beta", raw_beta, 1),
+        ("A_log", A_log, 0),
+        ("dt_bias", dt_bias, 0),
+        ("state", state, 1),
+        ("state_indices", state_indices, 0),
+        ("output_gate", output_gate, 0),
+        ("norm_weight", norm_weight, 0),
+    ):
+        _check_i32_addressing(name, tensor, first_dim=first_dim)
+    # Any strides work, but FlyDSL's layout-dynamic tensor argument needs one
+    # unit-stride axis.
+    if 1 not in conv_weight.stride():
+        raise ValueError("`conv_weight` must have an axis with stride 1.")
+
+    if out is None:
+        out = torch.empty(
+            (1, batch, _KDA_HEADS, _KDA_DIM),
+            dtype=torch.bfloat16,
+            device=device,
+        )
+    _check_same_device((("out", out),), device)
+    _check_tensor(
+        "out",
+        out,
+        shape=(1, batch, _KDA_HEADS, _KDA_DIM),
+        dtype=torch.bfloat16,
+        device=device,
+        inner_strides=(1,),
+    )
+    _check_i32_addressing("out", out, first_dim=1)
+    _check_disjoint_rows("out", out, (1, 2), "batch and head")
+    if _KDA_SLOT_CHECK:
+        # Capture is per stream, so ask about the stream the kernel launches on.
+        with torch.cuda.device(device):
+            if not torch.cuda.is_current_stream_capturing():
+                _check_unique_live_slots(
+                    _mask_padding_slot(state_indices),
+                    _num_cache_slots(state, conv_state),
+                )
+    return out
+
+
+def flydsl_kda_decode(
+    x: torch.Tensor,
+    conv_weight: torch.Tensor,
+    conv_bias: torch.Tensor | None,
+    conv_state: torch.Tensor,
+    raw_g: torch.Tensor,
+    raw_beta: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    lower_bound: float | None,
+    state: torch.Tensor,
+    state_indices: torch.Tensor,
+    output_gate: torch.Tensor,
+    norm_weight: torch.Tensor,
+    norm_eps: float,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Fuse width-4 Q/K/V convolution, FP32 KDA updates, and BF16 output gating.
+
+    Requires gfx942 or gfx950, 12 heads, and 128-dim state (Kimi-K3 TP8). Check
+    :func:`is_flydsl_kda_decode_supported` before dispatch.
+    ``state`` may be stored as FP32 or BF16. The recurrence always computes
+    in FP32: a BF16 state is widened on load and rounded to nearest-even BF16
+    on store, so it does not reproduce an FP32 state bit-for-bit.
+    ``conv_weight``, ``A_log`` and ``dt_bias`` must be FP32, and ``norm_weight``
+    and every activation BF16. This is narrower than the Triton
+    ``fused_kda_decode``, which also takes BF16 ``conv_weight`` and FP32
+    ``norm_weight``; cast such weights once at load time.
+    Strides and byte spans must fit non-negative int32 buffer addressing,
+    except cache slot strides, which are rebased in int64.
+    Both caches require dense inner dimensions and non-overlapping slots;
+    padding between slots is supported. Output batch and head rows must not
+    overlap, but may be padded and in either order (batch- or heads-outer).
+    Uses RMSNorm/sigmoid gating. Negative ``state_indices`` (PAD_SLOT_ID) are
+    padding: they produce zero output and leave both caches unchanged. Slot
+    zero is a live slot, as in the Triton ``fused_kda_decode``. Indices at or
+    above ``min(state.shape[0], conv_state.shape[0])`` are treated as padding
+    too, so out-of-range slots are never accessed.
+
+    Every non-negative in-range entry in ``state_indices`` must be unique within
+    the batch. Duplicate live slots cause unsynchronized concurrent updates of
+    the same recurrent and convolution cache rows and have undefined behavior.
+    Padding entries may repeat. The kernel does not check this; the caller
+    guarantees it. SGLang's KDA backend passes ``mamba_cache_indices``, where
+    each live request owns a distinct slot from its mamba slot allocator and
+    CUDA-graph padding rows are PAD_SLOT_ID (-1). Its eager DP-attention padding
+    rows instead share the reserved scratch slot 0, which is only safe because no
+    request owns that slot. Set ``AITER_KDA_DECODE_SLOT_CHECK=1`` to raise
+    ``ValueError`` on any duplicate live slot; the check syncs with the host and
+    is skipped during graph capture. By default it also flags those shared
+    slot-0 padding rows; set ``AITER_KDA_DECODE_SLOT_CHECK_PADDING_SLOT=0`` to
+    let slot 0 repeat like a negative index (the kernel still decodes it).
+    """
+    if x.ndim != 2:
+        raise ValueError(f"`x` must have rank 2, got rank {x.ndim}.")
+    if not x.is_cuda:
+        raise ValueError("`x` must be a CUDA tensor.")
+    device = x.device
+    batch = x.shape[0]
+    out = _validate_kda_inputs(
+        api_name="flydsl_kda_decode",
+        batch_source="x",
+        device=device,
+        batch=batch,
+        x=x,
+        conv_weight=conv_weight,
+        conv_bias=conv_bias,
+        conv_state=conv_state,
+        raw_beta=raw_beta,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        lower_bound=lower_bound,
+        state=state,
+        state_indices=state_indices,
+        output_gate=output_gate,
+        norm_weight=norm_weight,
+        out=out,
+    )
+    _check_same_device((("raw_g", raw_g),), device)
+    _check_tensor(
+        "raw_g",
+        raw_g,
+        shape=(1, batch, _KDA_HEADS, _KDA_DIM),
+        dtype=torch.bfloat16,
+        device=device,
+        inner_strides=(_KDA_DIM, 1),
+    )
+    _check_i32_addressing("raw_g", raw_g, first_dim=1)
+
+    executable = create_kda_decode_kernel(
+        float(norm_eps),
+        float(lower_bound),
+        fuse_f_b=False,
+        state_dtype=_KDA_STATE_DTYPE_TAGS[state.dtype],
+    )
+    with torch.cuda.device(device):
+        stream = torch.cuda.current_stream(device)
+        _run_compiled(
+            executable,
+            x,
+            conv_weight,
+            conv_state,
+            raw_g,
+            raw_beta,
+            A_log,
+            dt_bias,
+            state,
+            state_indices,
+            output_gate,
+            norm_weight,
+            out,
+            batch,
+            _num_cache_slots(state, conv_state),
+            x.stride(0),
+            conv_weight.stride(0),
+            conv_weight.stride(1),
+            conv_state.stride(0),
+            conv_state.stride(1),
+            conv_state.stride(2),
+            raw_g.stride(1),
+            raw_beta.stride(1),
+            state.stride(0),
+            output_gate.stride(0),
+            output_gate.stride(1),
+            out.stride(1),
+            out.stride(2),
+            stream,
+        )
+    return out
+
+
+def flydsl_kda_decode_with_f_b(
+    f_a: torch.Tensor,
+    f_b_weight: torch.Tensor,
+    x: torch.Tensor,
+    conv_weight: torch.Tensor,
+    conv_bias: torch.Tensor | None,
+    conv_state: torch.Tensor,
+    raw_beta: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    lower_bound: float | None,
+    state: torch.Tensor,
+    state_indices: torch.Tensor,
+    output_gate: torch.Tensor,
+    norm_weight: torch.Tensor,
+    norm_eps: float,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Run :func:`flydsl_kda_decode` with a fused head-local ``f_b`` projection.
+
+    Projects ``f_a`` with ``f_b_weight`` in FP32, then rounds once to BF16
+    before the lower-bound decay gate, without storing raw-g in global memory.
+    Uses the same int32 stride/span limits and FP32-or-BF16 ``state`` storage
+    as :func:`flydsl_kda_decode`.
+    ``state_indices`` follows the same bounded, unique-live-slot contract and
+    opt-in ``AITER_KDA_DECODE_SLOT_CHECK`` as :func:`flydsl_kda_decode`.
+
+    Fusing saves the projection launch, which wins at decode batch sizes, but each
+    head re-reads the whole ``f_a`` row. On MI355X (CUDA-graph replay) it beats a
+    BF16 ``F.linear`` followed by :func:`flydsl_kda_decode` by 3-4 us up to batch 32,
+    is within 6% at 64-96, and is 2-8% slower at 128 (more with a BF16 state).
+    Callers serving larger batches should project separately.
+    """
+    if f_a.ndim != 2:
+        raise ValueError(f"`f_a` must have rank 2, got rank {f_a.ndim}.")
+    if not f_a.is_cuda:
+        raise ValueError("`f_a` must be a CUDA tensor.")
+    device = f_a.device
+    batch = f_a.shape[0]
+    _check_same_device((("f_b_weight", f_b_weight),), device)
+    _check_tensor(
+        "f_a",
+        f_a,
+        shape=(batch, _KDA_DIM),
+        dtype=torch.bfloat16,
+        device=device,
+        inner_strides=(1,),
+    )
+    _check_tensor(
+        "f_b_weight",
+        f_b_weight,
+        shape=(_KDA_HEADS, _KDA_DIM, _KDA_DIM),
+        dtype=torch.bfloat16,
+        device=device,
+        inner_strides=(_KDA_DIM, 1),
+    )
+    _check_i32_addressing("f_a", f_a)
+    _check_i32_addressing("f_b_weight", f_b_weight)
+    out = _validate_kda_inputs(
+        api_name="flydsl_kda_decode_with_f_b",
+        batch_source="f_a",
+        device=device,
+        batch=batch,
+        x=x,
+        conv_weight=conv_weight,
+        conv_bias=conv_bias,
+        conv_state=conv_state,
+        raw_beta=raw_beta,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        lower_bound=lower_bound,
+        state=state,
+        state_indices=state_indices,
+        output_gate=output_gate,
+        norm_weight=norm_weight,
+        out=out,
+    )
+
+    executable = create_kda_decode_kernel(
+        float(norm_eps),
+        float(lower_bound),
+        fuse_f_b=True,
+        state_dtype=_KDA_STATE_DTYPE_TAGS[state.dtype],
+    )
+    with torch.cuda.device(device):
+        stream = torch.cuda.current_stream(device)
+        _run_compiled(
+            executable,
+            f_a,
+            f_b_weight,
+            x,
+            conv_weight,
+            conv_state,
+            raw_beta,
+            A_log,
+            dt_bias,
+            state,
+            state_indices,
+            output_gate,
+            norm_weight,
+            out,
+            batch,
+            _num_cache_slots(state, conv_state),
+            f_a.stride(0),
+            f_b_weight.stride(0),
+            f_b_weight.stride(1),
+            x.stride(0),
+            conv_weight.stride(0),
+            conv_weight.stride(1),
+            conv_state.stride(0),
+            conv_state.stride(1),
+            conv_state.stride(2),
+            raw_beta.stride(1),
+            state.stride(0),
+            output_gate.stride(0),
+            output_gate.stride(1),
+            out.stride(1),
+            out.stride(2),
+            stream,
+        )
+    return out
+
+
+# Lets callers such as SGLang's dispatch probe which recurrent-state dtypes a
+# given build accepts before routing a cache to it.
+flydsl_kda_decode.state_dtypes = tuple(_KDA_STATE_DTYPE_TAGS)
+flydsl_kda_decode_with_f_b.state_dtypes = tuple(_KDA_STATE_DTYPE_TAGS)
+# As with flydsl_gdr_decode, padding and out-of-range rows get positive-zero
+# output, so callers may allocate ``out`` with ``torch.empty``.
+flydsl_kda_decode.zeroes_invalid_output = True
+flydsl_kda_decode_with_f_b.zeroes_invalid_output = True
+
+
+def _check_slot_tensor(
+    name: str,
+    tensor: torch.Tensor,
+    *,
+    inner_shape: tuple[int, ...],
+    dtype: torch.dtype,
+    device: torch.device,
+    inner_strides: tuple[int, ...] = (),
+) -> None:
+    """Check a cache indexed by a leading slot/line dimension of any size."""
+    if tensor.ndim != len(inner_shape) + 1 or tuple(tensor.shape[1:]) != inner_shape:
+        raise ValueError(
+            f"`{name}` must have shape [cache, {', '.join(map(str, inner_shape))}], "
+            f"got {list(tensor.shape)}."
+        )
+    if tensor.dtype != dtype:
+        raise ValueError(f"`{name}` must have dtype {dtype}, got {tensor.dtype}.")
+    _check_same_device(((name, tensor),), device)
+    if inner_strides and tensor.stride()[-len(inner_strides) :] != inner_strides:
+        raise ValueError(
+            f"`{name}` must have inner strides {inner_strides}, got {tensor.stride()}."
+        )
+    if tensor.stride(0) < 0:
+        raise ValueError(f"`{name}` must have a non-negative slot stride.")
+    _check_i32_addressing(name, tensor, first_dim=1)
+
+
+def _kda_verify_num_warps(batch: int, ring: bool) -> int:
+    """Waves per workgroup (4 or 8) the verify launches for ``batch`` sequences.
+
+    The grid has one workgroup per sequence and head. 8 waves shorten each
+    serial step but run one workgroup per CU, against two for 4 waves, so once
+    the grid outgrows the CUs the 8-wave launch needs a second round.
+
+    Measured on MI355X (256 CUs; cold L2/MALL; BF16 state; 5, 6 and 8 tokens;
+    median of 3 passes of 6 rounds, passes agreeing to 0.6% median and 1.4%
+    p90), 4-wave over 8-wave time:
+
+        batch (workgroups)   ring        snapshot
+        1-21 (12-252)        1.07-1.12   1.05-1.13
+        22-26 (264-312)      0.78-0.80   0.99-1.05
+        27-32 (324-384)      0.78-0.79   0.97-1.02
+        40-128 (480-1536)    0.62-0.79   0.89-0.99
+
+    Past one workgroup per CU (batch 22), ring times grow 60-70% with 8 waves
+    against about 20% with 4, so the ring takes 8 waves up to one workgroup
+    per CU. Snapshot times grow about 25% with either, so snapshots keep 8
+    waves up to 5/4 of a workgroup per CU (batch 26 on 256 CUs); their
+    crossover is batch 28-30, and the rule stays within 2% of the faster
+    choice around it. Scaling by the CU count makes a partitioned GPU switch
+    earlier. With FP32 state the ring crossover is the same, while snapshots
+    show no consistent winner past batch 14 (within 5% either way), where this
+    rule does as well as a fixed batch-16 cutoff on average.
+    """
+    workgroups = batch * _KDA_HEADS
+    cus = get_num_sms()
+    if ring:
+        return 8 if workgroups <= cus else 4
+    return 8 if 4 * workgroups <= 5 * cus else 4
+
+
+def flydsl_kda_verify_with_f_b(
+    f_a: torch.Tensor,
+    f_b_weight: torch.Tensor,
+    x: torch.Tensor,
+    conv_weight: torch.Tensor,
+    conv_bias: torch.Tensor | None,
+    conv_state: torch.Tensor,
+    raw_beta: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    lower_bound: float | None,
+    state: torch.Tensor,
+    cache_indices: torch.Tensor,
+    intermediate_indices: torch.Tensor,
+    intermediate_conv_window: torch.Tensor,
+    output_gate: torch.Tensor,
+    norm_weight: torch.Tensor,
+    norm_eps: float,
+    num_tokens: int,
+    intermediate_states: torch.Tensor | None = None,
+    replay_ring: (
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None
+    ) = None,
+    out: torch.Tensor | None = None,
+    num_warps: int | None = None,
+) -> torch.Tensor:
+    """Kimi-K3 KDA speculative verify of ``num_tokens`` draft tokens per sequence.
+
+    Runs the :func:`flydsl_kda_decode_with_f_b` chain (``f_b`` projection, Q/K/V
+    causal convolution, decay gate, gated delta rule, gated RMSNorm) over each
+    sequence's tokens in one launch, with verify semantics: ``conv_state`` and
+    ``state`` are read, never written.
+
+    Tokens are dense: sequence ``b`` owns rows ``b * num_tokens`` to
+    ``(b + 1) * num_tokens - 1`` of ``f_a``, ``x``, ``raw_beta``,
+    ``output_gate`` and ``out``.
+
+    ``cache_indices[b]`` selects the ``conv_state``/``state`` slot (and the
+    ReplaySSM ring slot); ``intermediate_indices[b]`` selects the line of
+    ``intermediate_conv_window`` ``[lines, steps, 4608, 3]`` and of
+    ``intermediate_states`` ``[lines, steps, 12, 128, 128]``. Step ``t`` stores
+    the conv window after token ``t`` (oldest first) and, without a ring, the
+    recurrent state after token ``t`` in the ``state`` dtype.
+
+    ``replay_ring`` is ``(raw_v, raw_k, g, beta)`` with shapes
+    ``[slots, 12, L, 128]`` (BF16), ``[slots, 12, L, 128]`` (BF16),
+    ``[slots, 12, L, 128]`` (FP32) and ``[slots, 12, L]`` (FP32), ``L >=
+    num_tokens``. Step ``t`` stores the convolved V and K (before the L2 norm),
+    the log decay and the beta, and no state snapshot. Exactly one of
+    ``intermediate_states`` and ``replay_ring`` must be given.
+
+    A sequence whose cache index or intermediate index is negative or out of
+    range is padding: its output rows are zero and no cache is touched. Among
+    live sequences, ``intermediate_indices`` must be unique, and with
+    ``replay_ring`` so must ``cache_indices``: a repeated intermediate line or
+    ring slot is written by several workgroups at once, with undefined results.
+    Without a ring, ``conv_state`` and ``state`` are only read, so live
+    sequences may share a cache slot. Padding entries may repeat. The kernel
+    does not check this; set ``AITER_KDA_DECODE_SLOT_CHECK=1`` to raise
+    ``ValueError`` on a repeat (it syncs with the host and is skipped during
+    CUDA graph capture). As in the decode check, a sequence on
+    ``AITER_KDA_DECODE_SLOT_CHECK_PADDING_SLOT`` counts as padding there. Its
+    indices are in range, so the kernel still writes its intermediate line,
+    and the check rejects that line when a live sequence uses it too.
+
+    Every buffer the kernel writes needs dense, non-overlapping slots or lines,
+    with padding between them allowed: ``intermediate_conv_window`` as
+    channel-major ``[lines, steps, 4608, 3]`` or SGLang's ``[lines, steps, 3,
+    4608]`` viewed through ``transpose(-1, -2)``, ``intermediate_states`` and
+    the ring tensors in their stated order, and ``out`` with non-overlapping
+    token and head rows. No written buffer may overlap ``conv_state`` or
+    ``state``. ``conv_state`` takes either conv layout; strides and byte spans
+    follow the int32 limits of :func:`flydsl_kda_decode`.
+
+    ``num_warps`` overrides the per-workgroup wave count, one of
+    ``flydsl_kda_verify_with_f_b.num_warps`` (4 or 8); by default it follows
+    the batch, the ring or snapshot mode and the CU count. Each value is a
+    separate specialization, compiled on first use; call once per value (batch
+    1 suffices) before CUDA graph capture to build them all.
+    """
+    if not isinstance(num_tokens, int) or not (
+        1 <= num_tokens <= KDA_VERIFY_MAX_TOKENS
+    ):
+        raise ValueError(
+            f"`num_tokens` must be an int in [1, {KDA_VERIFY_MAX_TOKENS}], "
+            f"got {num_tokens!r}."
+        )
+    if (intermediate_states is None) == (replay_ring is None):
+        raise ValueError("Pass exactly one of `intermediate_states` and `replay_ring`.")
+    if cache_indices.ndim != 1:
+        raise ValueError("`cache_indices` must have rank 1.")
+    if not cache_indices.is_cuda:
+        raise ValueError("`cache_indices` must be a CUDA tensor.")
+    device = cache_indices.device
+    batch = cache_indices.shape[0]
+    tokens = batch * num_tokens
+    if not is_flydsl_kda_decode_supported(device):
+        raise RuntimeError(
+            "`flydsl_kda_verify_with_f_b` requires a gfx942 or gfx950 GPU."
+        )
+    if batch <= 0:
+        raise ValueError("`cache_indices` must have a non-empty batch dimension.")
+    if batch * _KDA_HEADS > _INT32_MAX:
+        raise ValueError("The KDA launch grid must fit int32 addressing.")
+    if conv_bias is not None:
+        raise ValueError("This specialization requires `conv_bias=None`.")
+    if lower_bound is None:
+        raise ValueError("This specialization requires the KDA lower-bound gate.")
+
+    _check_tensor(
+        "f_a",
+        f_a,
+        shape=(tokens, _KDA_DIM),
+        dtype=torch.bfloat16,
+        device=device,
+        inner_strides=(1,),
+    )
+    _check_tensor(
+        "f_b_weight",
+        f_b_weight,
+        shape=(_KDA_HEADS, _KDA_DIM, _KDA_DIM),
+        dtype=torch.bfloat16,
+        device=device,
+        inner_strides=(_KDA_DIM, 1),
+    )
+    _check_tensor(
+        "x",
+        x,
+        shape=(tokens, _KDA_CONV_CHANNELS),
+        dtype=torch.bfloat16,
+        device=device,
+        inner_strides=(1,),
+    )
+    _check_tensor(
+        "conv_weight",
+        conv_weight,
+        shape=(_KDA_CONV_CHANNELS, _KDA_CONV_WIDTH),
+        dtype=torch.float32,
+        device=device,
+    )
+    _check_slot_tensor(
+        "conv_state",
+        conv_state,
+        inner_shape=(_KDA_CONV_CHANNELS, _KDA_CONV_WIDTH - 1),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    _check_dense_cache_slots(
+        "conv_state", conv_state, ((_KDA_CONV_WIDTH - 1, 1), (1, _KDA_CONV_CHANNELS))
+    )
+    if state.dtype not in _KDA_STATE_DTYPE_TAGS:
+        raise ValueError(
+            "`state` must have dtype torch.float32 or torch.bfloat16, "
+            f"got {state.dtype}."
+        )
+    _check_slot_tensor(
+        "state",
+        state,
+        inner_shape=(_KDA_HEADS, _KDA_DIM, _KDA_DIM),
+        dtype=state.dtype,
+        device=device,
+        inner_strides=(_KDA_DIM * _KDA_DIM, _KDA_DIM, 1),
+    )
+    _check_tensor(
+        "raw_beta",
+        raw_beta,
+        shape=(1, tokens, _KDA_HEADS),
+        dtype=torch.bfloat16,
+        device=device,
+        inner_strides=(1,),
+    )
+    _check_tensor(
+        "A_log",
+        A_log,
+        shape=(_KDA_HEADS,),
+        dtype=torch.float32,
+        device=device,
+        inner_strides=(1,),
+    )
+    _check_tensor(
+        "dt_bias",
+        dt_bias,
+        shape=(_KDA_HEADS * _KDA_DIM,),
+        dtype=torch.float32,
+        device=device,
+        inner_strides=(1,),
+    )
+    for name, indices in (
+        ("cache_indices", cache_indices),
+        ("intermediate_indices", intermediate_indices),
+    ):
+        _check_tensor(
+            name,
+            indices,
+            shape=(batch,),
+            dtype=torch.int32,
+            device=device,
+            inner_strides=(1,),
+        )
+    if (
+        intermediate_conv_window.ndim != 4
+        or intermediate_conv_window.shape[1] < num_tokens
+        or tuple(intermediate_conv_window.shape[2:])
+        != (_KDA_CONV_CHANNELS, _KDA_CONV_WIDTH - 1)
+    ):
+        raise ValueError(
+            "`intermediate_conv_window` must have shape "
+            f"[lines, >= {num_tokens}, 4608, 3], "
+            f"got {list(intermediate_conv_window.shape)}."
+        )
+    _check_slot_tensor(
+        "intermediate_conv_window",
+        intermediate_conv_window,
+        inner_shape=tuple(intermediate_conv_window.shape[1:]),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    # Dense steps of a channel-major [4608, 3] window, or of SGLang's
+    # [3, 4608] window viewed through transpose(-1, -2).
+    window_step = _KDA_CONV_CHANNELS * (_KDA_CONV_WIDTH - 1)
+    _check_dense_cache_slots(
+        "intermediate_conv_window",
+        intermediate_conv_window,
+        (
+            (window_step, _KDA_CONV_WIDTH - 1, 1),
+            (window_step, 1, _KDA_CONV_CHANNELS),
+        ),
+    )
+    num_inter_lines = intermediate_conv_window.shape[0]
+    num_slots = _num_cache_slots(state, conv_state)
+
+    dummy = state
+    inter_state = dummy
+    inter_strides = (0, 0)
+    ring_tensors = (dummy, dummy, dummy, dummy)
+    ring_strides = (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+    if intermediate_states is not None:
+        if (
+            intermediate_states.ndim != 5
+            or intermediate_states.shape[1] < num_tokens
+            or tuple(intermediate_states.shape[2:]) != (_KDA_HEADS, _KDA_DIM, _KDA_DIM)
+        ):
+            raise ValueError(
+                "`intermediate_states` must have shape "
+                f"[lines, >= {num_tokens}, 12, 128, 128], "
+                f"got {list(intermediate_states.shape)}."
+            )
+        _check_slot_tensor(
+            "intermediate_states",
+            intermediate_states,
+            inner_shape=tuple(intermediate_states.shape[1:]),
+            dtype=state.dtype,
+            device=device,
+        )
+        _check_dense_cache_slots(
+            "intermediate_states",
+            intermediate_states,
+            ((_KDA_HEADS * _KDA_DIM * _KDA_DIM, _KDA_DIM * _KDA_DIM, _KDA_DIM, 1),),
+        )
+        num_inter_lines = min(num_inter_lines, intermediate_states.shape[0])
+        inter_state = intermediate_states
+        inter_strides = (intermediate_states.stride(0), intermediate_states.stride(1))
+    else:
+        if len(replay_ring) != 4:
+            raise ValueError("`replay_ring` must be (raw_v, raw_k, g, beta).")
+        raw_v, raw_k, ring_g, ring_beta = replay_ring
+        ring_len = raw_v.shape[2] if raw_v.ndim == 4 else -1
+        if ring_len < num_tokens:
+            raise ValueError(
+                f"The ReplaySSM ring length must be >= num_tokens ({num_tokens})."
+            )
+        for name, tensor, dtype in (
+            ("raw_v", raw_v, torch.bfloat16),
+            ("raw_k", raw_k, torch.bfloat16),
+            ("g", ring_g, torch.float32),
+        ):
+            _check_slot_tensor(
+                f"replay_ring.{name}",
+                tensor,
+                inner_shape=(_KDA_HEADS, ring_len, _KDA_DIM),
+                dtype=dtype,
+                device=device,
+            )
+            _check_dense_cache_slots(
+                f"replay_ring.{name}", tensor, ((ring_len * _KDA_DIM, _KDA_DIM, 1),)
+            )
+        _check_slot_tensor(
+            "replay_ring.beta",
+            ring_beta,
+            inner_shape=(_KDA_HEADS, ring_len),
+            dtype=torch.float32,
+            device=device,
+        )
+        _check_dense_cache_slots("replay_ring.beta", ring_beta, ((ring_len, 1),))
+        num_slots = min(num_slots, *(tensor.shape[0] for tensor in replay_ring))
+        ring_tensors = (raw_v, raw_k, ring_g, ring_beta)
+        ring_strides = (
+            raw_v.stride(0),
+            raw_v.stride(1),
+            raw_v.stride(2),
+            raw_k.stride(0),
+            raw_k.stride(1),
+            raw_k.stride(2),
+            ring_g.stride(0),
+            ring_g.stride(1),
+            ring_g.stride(2),
+            ring_beta.stride(0),
+            ring_beta.stride(1),
+        )
+
+    _check_tensor(
+        "output_gate",
+        output_gate,
+        shape=(tokens, _KDA_HEADS, _KDA_DIM),
+        dtype=torch.bfloat16,
+        device=device,
+        inner_strides=(1,),
+    )
+    _check_tensor(
+        "norm_weight",
+        norm_weight,
+        shape=(_KDA_DIM,),
+        dtype=torch.bfloat16,
+        device=device,
+        inner_strides=(1,),
+    )
+    for name, tensor, first_dim in (
+        ("f_a", f_a, 0),
+        ("f_b_weight", f_b_weight, 0),
+        ("x", x, 0),
+        ("conv_weight", conv_weight, 0),
+        ("raw_beta", raw_beta, 1),
+        ("A_log", A_log, 0),
+        ("dt_bias", dt_bias, 0),
+        ("output_gate", output_gate, 0),
+        ("norm_weight", norm_weight, 0),
+    ):
+        _check_i32_addressing(name, tensor, first_dim=first_dim)
+    # Any strides work, but FlyDSL's layout-dynamic tensor argument needs one
+    # unit-stride axis.
+    if 1 not in conv_weight.stride():
+        raise ValueError("`conv_weight` must have an axis with stride 1.")
+
+    if out is None:
+        out = torch.empty(
+            (1, tokens, _KDA_HEADS, _KDA_DIM), dtype=torch.bfloat16, device=device
+        )
+    _check_same_device((("out", out),), device)
+    _check_tensor(
+        "out",
+        out,
+        shape=(1, tokens, _KDA_HEADS, _KDA_DIM),
+        dtype=torch.bfloat16,
+        device=device,
+        inner_strides=(1,),
+    )
+    _check_i32_addressing("out", out, first_dim=1)
+    _check_disjoint_rows("out", out, (1, 2), "token and head")
+    written = (
+        ("out", out),
+        ("intermediate_conv_window", intermediate_conv_window),
+        ("intermediate_states", intermediate_states),
+    ) + tuple((f"replay_ring[{i}]", t) for i, t in enumerate(replay_ring or ()))
+    _check_no_alias(written, (("conv_state", conv_state), ("state", state)))
+    # The written buffers must not share a byte with each other either: raw_v
+    # and raw_k over one ring would let the K store overwrite the V store.
+    for i, (name, tensor) in enumerate(written[:-1]):
+        if tensor is not None:
+            _check_no_alias(written[i + 1 :], ((name, tensor),))
+    num_inter_lines = min(num_inter_lines, _INT32_MAX)
+    if _KDA_SLOT_CHECK:
+        # Capture is per stream, so ask about the stream the kernel launches on.
+        with torch.cuda.device(device):
+            if not torch.cuda.is_current_stream_capturing():
+                # The kernel writes a row when both indices are in range. Such a
+                # row on the reserved padding slot is padding, as in the decode
+                # check; padding may repeat lines, but not share a live one.
+                writes = (
+                    (cache_indices >= 0)
+                    & (cache_indices < num_slots)
+                    & (intermediate_indices >= 0)
+                    & (intermediate_indices < num_inter_lines)
+                )
+                live = writes & (_mask_padding_slot(cache_indices) >= 0)
+                # Only the ring is written per cache slot; a snapshot verify
+                # just reads conv_state and state there.
+                if replay_ring is not None:
+                    _check_unique_live_slots(
+                        torch.where(live, cache_indices, -1),
+                        num_slots,
+                        "cache_indices",
+                    )
+                _check_unique_live_slots(
+                    torch.where(live, intermediate_indices, -1),
+                    num_inter_lines,
+                    "intermediate_indices",
+                )
+                shared = torch.isin(
+                    intermediate_indices[live], intermediate_indices[writes & ~live]
+                )
+                if shared.any():
+                    raise ValueError(
+                        "`intermediate_indices` must not give a padding row the "
+                        "line of a live sequence; shared lines: "
+                        f"{intermediate_indices[live][shared][:8].tolist()}."
+                    )
+
+    if num_warps is None:
+        num_warps = _kda_verify_num_warps(batch, replay_ring is not None)
+    elif not isinstance(num_warps, int) or num_warps not in KDA_VERIFY_NUM_WARPS:
+        raise ValueError(
+            f"`num_warps` must be an int in {KDA_VERIFY_NUM_WARPS}, got {num_warps!r}."
+        )
+    executable = create_kda_verify_kernel(
+        float(norm_eps),
+        float(lower_bound),
+        num_tokens,
+        _KDA_STATE_DTYPE_TAGS[state.dtype],
+        replay_ring is not None,
+        num_warps,
+    )
+    window = intermediate_conv_window
+    with torch.cuda.device(device):
+        stream = torch.cuda.current_stream(device)
+        _run_compiled(
+            executable,
+            f_a,
+            f_b_weight,
+            x,
+            conv_weight,
+            conv_state,
+            raw_beta,
+            A_log,
+            dt_bias,
+            state,
+            cache_indices,
+            intermediate_indices,
+            window,
+            inter_state,
+            *ring_tensors,
+            output_gate,
+            norm_weight,
+            out,
+            batch,
+            num_slots,
+            num_inter_lines,
+            f_a.stride(0),
+            f_b_weight.stride(0),
+            f_b_weight.stride(1),
+            x.stride(0),
+            conv_weight.stride(0),
+            conv_weight.stride(1),
+            conv_state.stride(0),
+            conv_state.stride(1),
+            conv_state.stride(2),
+            raw_beta.stride(1),
+            state.stride(0),
+            window.stride(0),
+            window.stride(1),
+            window.stride(2),
+            window.stride(3),
+            *inter_strides,
+            *ring_strides,
+            output_gate.stride(0),
+            output_gate.stride(1),
+            out.stride(1),
+            out.stride(2),
+            stream,
+        )
+    return out
+
+
+flydsl_kda_verify_with_f_b.state_dtypes = tuple(_KDA_STATE_DTYPE_TAGS)
+flydsl_kda_verify_with_f_b.max_tokens = KDA_VERIFY_MAX_TOKENS
+# Wave counts ``num_warps`` accepts, each its own compiled specialization, so a
+# caller can build every one (with a batch-1 call) before CUDA graph capture.
+flydsl_kda_verify_with_f_b.num_warps = KDA_VERIFY_NUM_WARPS
+flydsl_kda_verify_with_f_b.zeroes_invalid_output = True
 
 
 # Swept on MI355X (Qwen3.8 TP1, batch 1-128, 1-5 tokens per sequence, KSPLIT

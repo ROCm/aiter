@@ -91,6 +91,18 @@ _LAZY_IMPORTS = {
         ".hstu_attention",
         "flydsl_hstu_attention_fwd",
     ),
+    "flydsl_kda_decode": (
+        ".linear_attention_kernels",
+        "flydsl_kda_decode",
+    ),
+    "flydsl_kda_decode_with_f_b": (
+        ".linear_attention_kernels",
+        "flydsl_kda_decode_with_f_b",
+    ),
+    "flydsl_kda_verify_with_f_b": (
+        ".linear_attention_kernels",
+        "flydsl_kda_verify_with_f_b",
+    ),
     "flydsl_mega_mhc": (".mega_mhc_kernels", "flydsl_mega_mhc"),
     "flydsl_mla_reduce_v1": (".mla_reduce_kernels", "flydsl_mla_reduce_v1"),
     "flydsl_moe_stage1": (".moe_kernels", "flydsl_moe_stage1"),
@@ -141,6 +153,10 @@ _LAZY_IMPORTS = {
     "gather_kv_b_proj_flydsl_fp8_supported": (
         ".gather_kv_b_proj",
         "gather_kv_b_proj_flydsl_fp8_supported",
+    ),
+    "is_flydsl_kda_decode_supported": (
+        ".linear_attention_kernels",
+        "is_flydsl_kda_decode_supported",
     ),
     "minimax_m3_index_score_flydsl": (
         ".kernels.minimax_m3_index_score",
@@ -215,6 +231,9 @@ __all__ = [
     "flydsl_hstu_attention",
     "flydsl_hstu_attention_bwd",
     "flydsl_hstu_attention_fwd",
+    "flydsl_kda_decode",
+    "flydsl_kda_decode_with_f_b",
+    "flydsl_kda_verify_with_f_b",
     "flydsl_mega_mhc",
     "flydsl_mla_reduce_v1",
     "flydsl_moe_stage1",
@@ -228,6 +247,7 @@ __all__ = [
     "gather_kv_b_proj_flydsl",
     "gather_kv_b_proj_flydsl_fp8_supported",
     "gather_kv_b_proj_flydsl_supported",
+    "is_flydsl_kda_decode_supported",
     "make_fp4_mqa_plan",
     "minimax_m3_index_score_alloc",
     "minimax_m3_index_score_flydsl",
