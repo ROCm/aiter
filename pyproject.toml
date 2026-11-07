@@ -92,6 +92,11 @@ tag_regex = "^(?:[\\w-]+-)?(?P<version>[vV]?\\d+(?:\\.\\d+){0,2}[^-+]*(?:-(?:pre
 filterwarnings = [
     "ignore:`torch.jit.script_method` is deprecated:DeprecationWarning",
 ]
+markers = [
+    "smoke: fast tests eligible for default PR CI",
+    "full: tests reserved for full CI runs",
+    "perf: performance tests and benchmarks",
+]
 
 [tool.black]
 # Same reason as ruff's `.claude` exclude above: narrowing .gitignore made the bot's tooling
