@@ -45,6 +45,11 @@ def device(monkeypatch):
         (65, None, None, 0, 1, 100, 128),
         (100, None, None, 0, 1, 100, 128),
         (4097, None, None, 0, 1, 5000, 8192),
+        # Slots per sequence at or above the thresholds: new gfx1250 plans take
+        # 128-token partitions (51 for one query token, 256 for MTP4).
+        (5, None, None, 0, 1, None, 8),
+        (1, None, None, 8193, 4, None, 1),
+        (3, None, None, 8193, 4, None, 4),
         pytest.param(None, None, None, 0, 1, None, None, id="lds-limit"),
     ],
 )
@@ -63,6 +68,9 @@ def test_pa_decode_plan(
     from aiter.ops.flydsl.kernels import pa_decode_plan as planner
 
     properties = torch.cuda.get_device_properties(device)
+    arch = properties.gcnArchName.split(":", 1)[0]
+    sizes = planner.context_partition_sizes(arch)
+    limit = planner.PAIRED_PARTITION_LIMIT
     lds_limit = batch is None
     if lds_limit:
         lds_bytes = getattr(properties, "shared_memory_per_block", None)
@@ -83,12 +91,17 @@ def test_pa_decode_plan(
 
     def check(plan, lengths):
         window, query_length = plan.sliding_window, plan.query_length
+        size = plan.context_partition_size
         info = plan.reduce_info.cpu().tolist()
         work = plan.work_info.cpu().tolist()
         ranges = [
             (
-                max(max(ctx, 0) - query_length + 1 - window, 0) // 256 if window else 0,
-                (max(ctx, 0) + 255) // 256,
+                (
+                    max(max(ctx, 0) - query_length + 1 - window, 0) // size
+                    if window
+                    else 0
+                ),
+                (max(ctx, 0) + size - 1) // size,
             )
             for ctx in lengths
         ]
@@ -104,12 +117,23 @@ def test_pa_decode_plan(
             # to distribute slots by cumulative visible tile count.
             extra = (prefix_tiles + tiles) * remaining // total_tiles
             extra -= prefix_tiles * remaining // total_tiles
-            assert count == min(int(tiles > 0) + extra, tiles, plan.max_partitions)
+            expected = min(int(tiles > 0) + extra, tiles, plan.max_partitions)
+            half = (tiles + 1) // 2
+            busy = query_length > 1 and total_tiles * 2 >= plan.capacity
+            if size < 256 and (
+                half <= expected < tiles
+                or (tiles > limit and half <= limit)
+                or (busy and half <= expected)
+            ):
+                # Pairs of partitions: they fill the slots or fit one cluster.
+                expected = min(expected, half)
+            assert count == expected
             tile = first
             for record in work[start : start + count]:
                 row, begin, end, original_length = record
                 assert row == seq and original_length == ctx
                 assert begin == tile and begin < end <= last
+                assert end - begin <= -(-tiles // count)
                 tile = end
             assert tile == last
             cursor += count
@@ -117,7 +141,7 @@ def test_pa_decode_plan(
         assert cursor <= plan.capacity
         assert all(record == [0, 0, 0, 0] for record in work[cursor:])
 
-    pattern = (-1, 0, 1, 255, 256, 257, 65537, 2**31 - 1)
+    pattern = (-1, 0, 1, 127, 128, 129, 255, 256, 257, 3000, 65537, 2**31 - 1)
     lengths = [pattern[i % len(pattern)] for i in range(batch)]
     context = torch.tensor(lengths, dtype=torch.int32, device=device)
     plan = planner.plan_pa_decode(
@@ -129,9 +153,47 @@ def test_pa_decode_plan(
         sliding_window=window,
         query_length=query_length,
     )
+    # New and hand-built plans pick the partition size from slots per sequence.
+    default = planner.default_context_partition_size(
+        arch, batch, plan.capacity, query_length
+    )
+    slots = (
+        planner.MULTI_QUERY_FINE_PARTITION_SLOTS
+        if query_length > 1
+        else planner.FINE_PARTITION_SLOTS
+    )
+    assert default == (sizes[0] if plan.capacity >= slots * batch else 256)
+    assert plan.context_partition_size == default
+    assert (
+        planner.PADecodePlan(
+            plan.work_info,
+            plan.reduce_info,
+            2,
+            plan.max_partitions,
+            query_length=query_length,
+        ).context_partition_size
+        == default
+    )
     check(plan, lengths)
     config, launch = calls[-1]
     assert config[0] == bucket
+    for size in sizes:
+        if size == plan.context_partition_size:
+            continue
+        # Each partition size compiles its own kernel for the same bucket.
+        sized = planner.plan_pa_decode(
+            context,
+            2,
+            max_partitions=max_parts,
+            max_batch_size=max_batch_size,
+            workgroup_budget=budget,
+            context_partition_size=size,
+            sliding_window=window,
+            query_length=query_length,
+        )
+        assert sized.context_partition_size == size
+        check(sized, lengths)
+        assert calls[-1][0] == (*config[:3], size, size < 256 and query_length > 1)
     if max_batch_size is not None:
         assert plan.max_batch_size == max_batch_size
     pointers = (plan.work_info.data_ptr(), plan.reduce_info.data_ptr())
@@ -168,6 +230,10 @@ def test_pa_decode_plan(
         other_parts = max(2, -(-other_capacity // other_batch))
         assert other_parts != plan.max_partitions
         other_window = window + 256 if window else 0
+        # 128-token plans also specialize on whether rows hold several queries.
+        other_query_length = query_length + 1
+        if plan.context_partition_size < 256 and query_length == 1:
+            other_query_length = 1
         values = [pattern[i % len(pattern)] for i in range(other_batch)]
         other_context = torch.tensor(values, dtype=torch.int32, device=device)
         other_plan = planner.plan_pa_decode(
@@ -176,8 +242,9 @@ def test_pa_decode_plan(
             max_partitions=other_parts,
             max_batch_size=plan.max_batch_size,
             workgroup_budget=2 * other_capacity,
+            context_partition_size=plan.context_partition_size,
             sliding_window=other_window,
-            query_length=query_length + 1,
+            query_length=other_query_length,
         )
         assert other_plan.capacity == other_capacity
         check(other_plan, values)
@@ -775,6 +842,20 @@ _COMMON_CASES = [
             "sink_dtype": torch.float32,
         },
     ),
+    # gfx1250 defaults to 128-token plans; explicit 256-token windowed plans
+    # start tasks mid-sequence at 256-token boundaries.
+    (
+        "window-cp256",
+        {
+            "query_length": 4,
+            "group_size": 16,
+            "block_size": 128,
+            "max_partitions": 7,
+            "window": 257,
+            "lengths": (0, 1, 255, 256, 257, 1027, 4099),
+            "partition": 256,
+        },
+    ),
     (
         "head1024",
         {
@@ -853,6 +934,36 @@ _FP8_CASES = _COMMON_CASES + [
     (
         "default-cap",
         {"group_size": 16, "block_size": 128, "max_partitions": None},
+    ),
+    # Dense D128/page128 with two or three query tiles exchanges every tile's
+    # softmax statistics together; QL3/G8 pads its second tile. Four tiles
+    # take the per-wave pipeline below instead.
+    *[
+        (
+            f"batched-softmax-mtp{length}-g{group}",
+            {
+                "query_length": length,
+                "kv_heads": 2,
+                "group_size": group,
+                "block_size": 128,
+                "max_partitions": 7,
+                "sink_dtype": torch.float32,
+                "fp8_batched_softmax": True,
+            },
+        )
+        for length, group in ((3, 16), (3, 8))
+    ],
+    (
+        "batched-softmax-cp256",
+        {
+            "query_length": 4,
+            "group_size": 8,
+            "block_size": 128,
+            "max_partitions": 3,
+            "lengths": (0, 1, 255, 256, 257, 1027, 4099),
+            "partition": 256,
+            "fp8_batched_softmax": True,
+        },
     ),
     # Four 16-row query tiles at D128 give each gfx1250 wave its own tile.
     # Varied token magnitudes make a misplaced per-token scale fail; rows past
@@ -1057,7 +1168,17 @@ _BF16_CASES = _COMMON_CASES + [
             ),
         )
     ],
-    ("graph-workspace", {"query_length": 4, "max_partitions": 7, "capture": True}),
+    # An explicit argument restates the plan's partition size.
+    (
+        "graph-workspace",
+        {
+            "query_length": 4,
+            "max_partitions": 7,
+            "capture": True,
+            "partition": 256,
+            "partition_argument": 256,
+        },
+    ),
     (
         "loose-bound",
         {
@@ -1092,6 +1213,59 @@ _BF16_CASES = _COMMON_CASES + [
         )
         for dim in (256, 128)
     ],
+    # gfx1250 gathers plain V into the packed chunks used by transposed V:
+    # page16 at D64/D128/D256 and page128 D64/D128 with two to four query tiles.
+    *[
+        (
+            f"plain-v-page16-head{dim}",
+            {
+                "trans_v": False,
+                "head_dim": dim,
+                "block_size": 16,
+                "max_partitions": 4,
+                "bf16_packed": True,
+            },
+        )
+        for dim in (64, 128, 256)
+    ],
+    *[
+        (
+            f"plain-v-page128-head{dim}-mtp{length}-g{group}",
+            {
+                "trans_v": False,
+                "query_length": length,
+                "group_size": group,
+                "head_dim": dim,
+                "block_size": 128,
+                "max_partitions": 4,
+                "bf16_packed": True,
+            },
+        )
+        for dim, length, group in ((64, 4, 8), (128, 3, 16), (128, 4, 16))
+    ],
+    (
+        "plain-v-page128-window",
+        {
+            "trans_v": False,
+            "query_length": 4,
+            "group_size": 16,
+            "block_size": 128,
+            "max_partitions": 7,
+            "window": 257,
+            "sink_dtype": torch.float32,
+            "bf16_packed": True,
+        },
+    ),
+    # One query tile retains padded plain-V staging.
+    (
+        "plain-v-page128-decode",
+        {
+            "trans_v": False,
+            "block_size": 128,
+            "max_partitions": 4,
+            "bf16_packed": False,
+        },
+    ),
 ]
 # FP8 head 256, page 64, plain V, uniform query length with at most 32 query
 # rows: the gfx950 pipe, for per-tensor and per-token scales. A plan-independent
@@ -1353,6 +1527,9 @@ _INVALID_CASES = [
     ),
     ("vector16-k", ValueError, "key_cache shape must be"),
     ("vector16-v", ValueError, "transposed value_cache shape must be"),
+    ("partition-type", TypeError, "context_partition_size must be an int"),
+    ("partition-size", NotImplementedError, "supports context_partition_size"),
+    ("partition-mismatch", ValueError, "must match work_plan.context_partition_size"),
 ]
 _MXFP4_INVALID_CASES = [
     ("fp16-output", TypeError, "bf16 output"),
@@ -1414,6 +1591,15 @@ def _check_unsupported_input(pa, arguments, options, plan, case, monkeypatch):
         options.update(
             key_scale=torch.ones(1, dtype=torch.float32, device=query.device),
             value_scale=torch.ones(1, dtype=torch.float32, device=query.device),
+        )
+    elif invalid == "partition-type":
+        options["context_partition_size"] = 256.0
+    elif invalid == "partition-size":
+        options["context_partition_size"] = 512
+    elif invalid == "partition-mismatch":
+        # gfx1250 supports 128 and 256 tokens; restate the size the plan lacks.
+        options["context_partition_size"] = (
+            128 if plan.context_partition_size == 256 else 256
         )
     elif invalid == "vector16-k":
         key = torch.empty((1, 1, 8, 64, 16), dtype=query.dtype, device=query.device)
@@ -1552,9 +1738,10 @@ def _check_select_rejected(monkeypatch, invalid, error, match):
 def _one_hot_kv(key, value, table, context, compute_type, tokens_per_channel=256):
     """Zero K and one-hot V in channel (token // tokens_per_channel) % dim.
 
-    With 256 tokens per channel each tile owns one output channel, so a task
-    that drops or repeats a tile changes that channel's mean. With one, a row's
-    output marks exactly the tokens it sees, and zero K keeps FP8 P exact.
+    With 256 tokens per channel, each 256-token span owns one output channel,
+    so a task that drops or repeats any 128- or 256-token plan partition changes
+    that channel's mean. With one, a row's output marks exactly the tokens it
+    sees, and zero K keeps FP8 P exact.
     Scales are explicit because a zero K must not reach the quantizer.
     """
     dim, page = value.shape[-1], value.shape[2]
@@ -1585,11 +1772,23 @@ def _check_pipe_policy(pa, case, arch, compile_kwargs):
         schedule_kwargs = dict(compile_kwargs[-1])
         schedule_kwargs.pop("architecture", None)
         schedule_kwargs.pop("direct_output", None)
+        schedule_kwargs.pop("context_partition_size", None)
         schedule_kwargs.pop("cluster_merge", None)
         pipe, staged = PaDecodeSchedule.select(**schedule_kwargs).cache_key[-2:]
         assert pipe == (arch == "gfx950")
         if pipe:
             assert (staged > 0) == (case["staged"] is not False)
+
+
+def _check_gfx1250_policy(case, plan, compiled):
+    """Pin gfx1250 cases to the plan's partition size and their staging path."""
+    from aiter.ops.flydsl.kernels.pa_decode_kernel import _GFX1250_PA_DECODE_CACHE
+
+    traits = next(t for t, c in _GFX1250_PA_DECODE_CACHE.items() if c is compiled)
+    assert traits.context_partition_size == plan.context_partition_size
+    for name in ("fp8_batched_softmax", "bf16_packed"):
+        if case[name] is not None:
+            assert getattr(traits, name) == case[name]
 
 
 @pytest.mark.parametrize(
@@ -1684,6 +1883,10 @@ def test_pa_decode(case, device, monkeypatch):
             "wide": False,
             "pipe": False,
             "staged": None,
+            "partition": None,
+            "partition_argument": None,
+            "fp8_batched_softmax": None,
+            "bf16_packed": None,
             "invalid_kind": "bf16",
             "plan_free": False,
             "pool": None,
@@ -1721,6 +1924,10 @@ def test_pa_decode(case, device, monkeypatch):
             and case["head_dim"] != 64
         ):
             pytest.skip("gfx1250 supports head_dim 64 or multiples of 128")
+    elif case["kv_dtype"] == "bf16" and not case["trans_v"]:
+        pytest.skip(f"{arch} BF16 requires a transposed value cache")
+    elif case.get("invalid_input") == "partition-mismatch":
+        pytest.skip(f"{arch} supports only 256-token partitions")
     if case["invalid_kind"] == "mxfp4":
         _check_unsupported_mxfp4(
             case["invalid_input"], case["error"], case["match"], device
@@ -1830,6 +2037,7 @@ def test_pa_decode(case, device, monkeypatch):
         "value_scale": value_scale,
         "sinks": sinks,
         "sliding_window": window,
+        "context_partition_size": case["partition_argument"],
         "max_context_length": (
             None
             if case["max_context"] is None
@@ -1846,6 +2054,7 @@ def test_pa_decode(case, device, monkeypatch):
         kv_heads,
         max_partitions=case["max_partitions"],
         workgroup_budget=case["budget"],
+        context_partition_size=case["partition"],
         query_length=query_length,
         sliding_window=window,
     )
@@ -1853,12 +2062,13 @@ def test_pa_decode(case, device, monkeypatch):
         _check_unsupported_input(pa, arguments, options, plan, case, monkeypatch)
         return
 
-    compile_kwargs = []
+    compile_kwargs, compiled = [], []
     compile_tile = pa.compile_pa_decode_tile
 
     def spy_tile(**kwargs):
         compile_kwargs.append(kwargs)
-        return compile_tile(**kwargs)
+        compiled.append(compile_tile(**kwargs))
+        return compiled[-1]
 
     monkeypatch.setattr(pa, "compile_pa_decode_tile", spy_tile)
 
@@ -1973,6 +2183,8 @@ def test_pa_decode(case, device, monkeypatch):
         assert (padded[:, query.shape[1] :] == 7.0).all()
     if case["kv_dtype"] != "mxfp4":
         _check_pipe_policy(pa, case, arch, compile_kwargs)
+    if arch == "gfx1250":
+        _check_gfx1250_policy(case, plan, compiled[-1])
     if case["capture"]:
         # Compile/allocate before capture; replay must observe changed query data.
         capture_stream = torch.cuda.Stream()
