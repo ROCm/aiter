@@ -198,3 +198,26 @@ pytest op_tests/triton_tests/              # all tests
 pytest op_tests/triton_tests/gemm/basic/   # one folder
 python op_tests/op_benchmarks/triton/bench_gemm_a16w16.py
 ```
+
+### Small-M MoE sorting
+
+`moe.small_m_sort.small_m_sort` produces the packed token/slot IDs, route
+weights, padded expert blocks and counts used by the A16W4 MoE kernels.
+It also clears a caller-provided BF16 output matrix. The wrapper returns
+`None` for unsupported cases so the caller can use its existing sorter.
+
+The supported path is gfx942, 384 experts, top-k 6, 1 to 64 tokens and
+block size 16 or 32. Route IDs must be contiguous int32 and route weights
+must be contiguous float32 on the same GPU. Negative and out-of-range
+expert IDs do not contribute. The output must not share storage with an
+input. Entries after the returned padded count are undefined.
+
+The wrapper is optional and is not selected by the default MoE path.
+It does not change routing scores, activation math or expert GEMMs.
+It has no expert-mask or local-token-count argument. Callers that need
+these features must use their existing sorter.
+
+```bash
+pytest op_tests/triton_tests/moe/test_small_m_sort.py -q
+python op_tests/op_benchmarks/triton/bench_small_m_sort.py -b 1 8 32 64
+```
