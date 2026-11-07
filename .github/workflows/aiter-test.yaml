@@ -921,6 +921,7 @@ jobs:
           docker exec -w /workspace aiter_test \
             bash -c "./.github/scripts/install_triton.sh && pip show triton"
 
+
       - name: Show Aiter version
         run: |
           set -ex
@@ -946,7 +947,7 @@ jobs:
           docker exec \
           -w /workspace \
           aiter_test \
-          bash -c "SHARD_TOTAL=${{ matrix.shard_total }} SHARD_IDX=${{ matrix.shard_idx }} ./.github/scripts/aiter_test.sh"
+          bash -c "SHARD_TOTAL=${{ matrix.shard_total }} SHARD_IDX=${{ matrix.shard_idx }} AITER_MOE_2STAGE_CI_PROFILE=standard ./.github/scripts/aiter_test.sh"
 
       - name: Collect test logs
         if: always()

@@ -1,0 +1,23 @@
+# Known pre-existing non-strict accuracy failures for test_moe_2stage.py's
+# full-profile matrix (mxfp4 per_1x32/Swiglu), MI35X (gfx950), full default
+# token sweep. Source: main run 41552231943, job 125695520646.
+#
+# activation_bucket is the fused_moe dispatcher's actual intermediate-
+# activation dtype for each token (manually verified against the raw log,
+# NOT derivable from test_fmoe()'s static AQDType input, which stays bf16
+# across the whole sweep). This is the real discriminator behind the
+# baseline's "7 BF16 / 5 FP4" breakdown: bf16 for token <= 128, fp4 once
+# the dispatcher switches at token >= 256.
+token,qType,actType,AQDType,WQDType,activation_bucket,failure_mode
+1,QuantType.per_1x32,ActivationType.Swiglu,torch.bfloat16,torch.float4_e2m1fn_x2,bf16,numeric
+3,QuantType.per_1x32,ActivationType.Swiglu,torch.bfloat16,torch.float4_e2m1fn_x2,bf16,numeric
+5,QuantType.per_1x32,ActivationType.Swiglu,torch.bfloat16,torch.float4_e2m1fn_x2,bf16,numeric
+16,QuantType.per_1x32,ActivationType.Swiglu,torch.bfloat16,torch.float4_e2m1fn_x2,bf16,numeric
+32,QuantType.per_1x32,ActivationType.Swiglu,torch.bfloat16,torch.float4_e2m1fn_x2,bf16,numeric
+64,QuantType.per_1x32,ActivationType.Swiglu,torch.bfloat16,torch.float4_e2m1fn_x2,bf16,numeric
+128,QuantType.per_1x32,ActivationType.Swiglu,torch.bfloat16,torch.float4_e2m1fn_x2,bf16,numeric
+256,QuantType.per_1x32,ActivationType.Swiglu,torch.bfloat16,torch.float4_e2m1fn_x2,fp4,numeric
+1024,QuantType.per_1x32,ActivationType.Swiglu,torch.bfloat16,torch.float4_e2m1fn_x2,fp4,numeric
+4096,QuantType.per_1x32,ActivationType.Swiglu,torch.bfloat16,torch.float4_e2m1fn_x2,fp4,numeric
+8192,QuantType.per_1x32,ActivationType.Swiglu,torch.bfloat16,torch.float4_e2m1fn_x2,fp4,numeric
+163840,QuantType.per_1x32,ActivationType.Swiglu,torch.bfloat16,torch.float4_e2m1fn_x2,fp4,numeric
