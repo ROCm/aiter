@@ -88,6 +88,9 @@ class MLAConfig:
     USE_LDS_PIPELINE: gl.constexpr
     Q_FROM_LDS: gl.constexpr
     P_SHARED_LAYOUT: gl.constexpr
+    P_XCHG_LAYOUT: gl.constexpr
+    ALPHA_XCHG_LAYOUT: gl.constexpr
+    XCHG_MODE: gl.constexpr
 
     @gluon.constexpr_function
     def __init__(
@@ -119,9 +122,11 @@ class MLAConfig:
         KV_ROW_PAD=8,
         Q_FROM_LDS=False,
         Q_ROW_PAD=8,
+        XCHG_MODE=0,
     ):
         self.USE_LDS_PIPELINE = gl.constexpr(USE_LDS_PIPELINE)
         self.Q_FROM_LDS = gl.constexpr(Q_FROM_LDS)
+        self.XCHG_MODE = gl.constexpr(XCHG_MODE)
         # Constants
         self.KV_LORA_RANK = gl.constexpr(KV_LORA_RANK)
         self.QK_ROPE_HEAD_DIM = gl.constexpr(QK_ROPE_HEAD_DIM)
@@ -501,6 +506,29 @@ class MLAConfig:
                     [64, 0],
                 ]
             )
+        )
+
+        # XCHG_MODE=1: LDS layouts for the alpha and P exchange of one ring tile.
+        self.P_XCHG_LAYOUT = gl.constexpr(
+            gl.SharedLinearLayout(
+                [
+                    [0, 1],
+                    [0, 2],
+                    [0, 4],
+                    [0, 16],
+                    [1, 0],
+                    [2, 0],
+                    [4, 0],
+                    [8, 0],
+                    [16, 0],
+                    [32, 0],
+                    [0, 8],
+                    [0, 32],
+                ]
+            )
+        )
+        self.ALPHA_XCHG_LAYOUT = gl.constexpr(
+            gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[0])
         )
 
         self.q_cache_modifier = gl.constexpr(".cg")
@@ -1681,9 +1709,25 @@ class MLAProgram:
             S = gl.where(pos[None, :] < seq_len, S, float("-inf"))
 
         p, alpha, M = self.softmax_part0(S, M)
-        p, L, acc = self.softmax_part1(p, L, acc, alpha)
-        v = self.lds_unshuffle_kv_lora_trans(buffer_id).load(cfg.V_DOT_LAYOUT)
-        acc = self.compute_pkv_lora_trans(p, v, None, acc)
+        if cfg.XCHG_MODE == 1:
+            # Write alpha and P to two LDS buffers, then read both after one
+            # barrier. This removes the barriers of the shared conversion scratch.
+            L = L * alpha + gl.sum(p, 1)
+            v = self.lds_unshuffle_kv_lora_trans(buffer_id).load(cfg.V_DOT_LAYOUT)
+            p8 = p.to(v.dtype)
+            a_s = gl.allocate_shared_memory(
+                gl.float32, [cfg.BLOCK_M], cfg.ALPHA_XCHG_LAYOUT, alpha
+            )
+            p_s = gl.allocate_shared_memory(
+                p8.dtype, [cfg.BLOCK_M, cfg.TILE_SIZE], cfg.P_XCHG_LAYOUT, p8
+            )
+            alpha_pv = a_s.load(gl.SliceLayout(1, cfg.PV_WMMA_LAYOUT))
+            acc = acc * alpha_pv[:, None]
+            acc = gl.amd.gfx1250.wmma(p_s.load(cfg.P_DOT_LAYOUT), v, acc)
+        else:
+            p, L, acc = self.softmax_part1(p, L, acc, alpha)
+            v = self.lds_unshuffle_kv_lora_trans(buffer_id).load(cfg.V_DOT_LAYOUT)
+            acc = self.compute_pkv_lora_trans(p, v, None, acc)
         return L, M, acc
 
 
@@ -1975,6 +2019,7 @@ _mla_decode_fwd_kernel_repr = make_kernel_repr(
         "KV_CACHE_DTYPE",
         "TDM_PARTIAL_STORE",
         "Q_FROM_LDS",
+        "XCHG_MODE",
     ],
 )
 
@@ -2031,6 +2076,7 @@ def _mla_decode_fwd_kernel(
     output_stride_1: gl.int32 = 0,
     TDM_PARTIAL_STORE: gl.constexpr = 0,
     Q_FROM_LDS: gl.constexpr = 0,
+    XCHG_MODE: gl.constexpr = 0,
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
 ):
@@ -2068,6 +2114,7 @@ def _mla_decode_fwd_kernel(
         KV_ROW_PAD,
         Q_FROM_LDS,
         Q_ROW_PAD,
+        XCHG_MODE,
     )
 
     if USE_LDS_PIPELINE:

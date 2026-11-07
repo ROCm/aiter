@@ -689,7 +689,11 @@ def _mla_decode_fwd_reduce_kernel(
     ALL_DECODE: tl.constexpr = False,  # int
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
+    # Width of the segment aranges: a power of 2 >= NUM_SEGMENTS_PER_SEQ.
+    # Zero means NUM_SEGMENTS_PER_SEQ, which must then be a power of 2.
+    SEGMENTS_P2: tl.constexpr = 0,
 ):
+    SEG_RANGE: tl.constexpr = SEGMENTS_P2 if SEGMENTS_P2 > 0 else NUM_SEGMENTS_PER_SEQ
     query_token_idx = tl.program_id(0)
     query_head_idx = tl.program_id(1)
 
@@ -711,15 +715,15 @@ def _mla_decode_fwd_reduce_kernel(
 
     # create masks for subsequent loads
     act_num_segments = cdiv_fn(seq_len, tiles_per_segment * TILE_SIZE)
-    segm_mask = tl.arange(0, NUM_SEGMENTS_PER_SEQ) < tl.full(
-        [NUM_SEGMENTS_PER_SEQ], act_num_segments, dtype=tl.int32
+    segm_mask = tl.arange(0, SEG_RANGE) < tl.full(
+        [SEG_RANGE], act_num_segments, dtype=tl.int32
     )
 
     # load segment maxima
     segm_offset = (
         query_token_idx.to(tl.int64) * (num_query_heads * NUM_SEGMENTS_PER_SEQ)
         + query_head_idx * NUM_SEGMENTS_PER_SEQ
-        + tl.arange(0, NUM_SEGMENTS_PER_SEQ)
+        + tl.arange(0, SEG_RANGE)
     )
     segm_max = tl.load(segm_max_ptr + segm_offset, mask=segm_mask, other=float("-inf"))
     overall_max = tl.max(segm_max)
@@ -734,7 +738,7 @@ def _mla_decode_fwd_reduce_kernel(
         query_token_idx.to(tl.int64)
         * (num_query_heads * NUM_SEGMENTS_PER_SEQ * KV_LORA_RANK)
         + query_head_idx * (NUM_SEGMENTS_PER_SEQ * KV_LORA_RANK)
-        + tl.arange(0, NUM_SEGMENTS_PER_SEQ)[:, None] * KV_LORA_RANK
+        + tl.arange(0, SEG_RANGE)[:, None] * KV_LORA_RANK
         + tl.arange(0, KV_LORA_RANK)[None, :]
     )
     segm_output = tl.load(

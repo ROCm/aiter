@@ -502,6 +502,7 @@ def mla_decode_fwd(
         )
         <= 256 * 1024
     )
+    partial_bf16 = False
     if use_pipelined_unshuffled:
         tuned = _tuned_decode_config(
             "pipelined_unshuffled",
@@ -511,6 +512,9 @@ def mla_decode_fwd(
             num_seqs,
             max_seqlen_kv,
         )
+        # Wrapper flags of the tuned entry. They are not kernel arguments.
+        npot_splits = bool(tuned.pop("NPOT_SPLITS", False))
+        partial_bf16 = bool(tuned.pop("PARTIAL_BF16", False))
         # Overrides may increase stages or Q padding even when the heuristic fits.
         # Reject the whole override before changing tiles or either segment count.
         if (
@@ -527,6 +531,7 @@ def mla_decode_fwd(
             > 256 * 1024
         ):
             tuned = {}
+            npot_splits = partial_bf16 = False
         if "BLOCK_M" in tuned:
             # A smaller head tile needs less LDS, so the gate above still holds.
             assert (
@@ -537,12 +542,14 @@ def mla_decode_fwd(
             NUM_HEAD_BLOCKS = (num_queries_per_kv + BLOCK_M - 1) // BLOCK_M
             total_num_q_blocks = num_seqs * NUM_HEAD_BLOCKS
         if "NUM_SEGMENTS_PER_SEQ" in tuned:
-            # The reduce kernel indexes segments with tl.arange: keep a power of 2.
-            tuned["NUM_SEGMENTS_PER_SEQ"] = triton.next_power_of_2(
-                min(
-                    tuned["NUM_SEGMENTS_PER_SEQ"],
-                    triton.cdiv(max_seqlen_kv, block_size),
-                )
+            # NPOT_SPLITS keeps the tuned count. Else use a power of 2.
+            # The reduce kernel pads its segment aranges to a power of 2.
+            num_segments = min(
+                tuned["NUM_SEGMENTS_PER_SEQ"],
+                triton.cdiv(max_seqlen_kv, block_size),
+            )
+            tuned["NUM_SEGMENTS_PER_SEQ"] = (
+                num_segments if npot_splits else triton.next_power_of_2(num_segments)
             )
             reduce_config["NUM_SEGMENTS_PER_SEQ"] = tuned["NUM_SEGMENTS_PER_SEQ"]
         attn_config.update(tuned)
@@ -567,7 +574,8 @@ def mla_decode_fwd(
             num_query_heads,
             NUM_SEGMENTS,
             triton.next_power_of_2(kv_lora_rank),
-            dtype=torch.float32,
+            # PARTIAL_BF16: the attention kernel stores BF16 partial outputs.
+            dtype=torch.bfloat16 if partial_bf16 else torch.float32,
             device=q.device,
         )
         segm_max = torch.empty(
@@ -726,6 +734,7 @@ def mla_decode_fwd(
         query_start_len_ptr=cu_seqlens_q,
         BLOCK_Q=BLOCK_Q,
         ALL_DECODE=ALL_DECODE,
+        SEGMENTS_P2=triton.next_power_of_2(reduce_config["NUM_SEGMENTS_PER_SEQ"]),
         **reduce_config,
     )
     return out

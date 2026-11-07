@@ -10,44 +10,56 @@
       "H_LEQ_64.B_LEQ_15.KV_LEQ_262144": {
         "BLOCK_M": 64,
         "num_warps": 4,
-        "NUM_SEGMENTS_PER_SEQ": 32,
+        "NUM_SEGMENTS_PER_SEQ": 25,
         "num_stages": 3,
         "TDM_PARTIAL_STORE": 1,
         "Q_FROM_LDS": 1,
-        "waves_per_eu": 2
+        "waves_per_eu": 2,
+        "NPOT_SPLITS": 1,
+        "PARTIAL_BF16": 1,
+        "XCHG_MODE": 1
       },
       "H_LEQ_64.B_LEQ_18": {},
       "H_LEQ_64.B_LEQ_19.KV_LEQ_32768": {},
       "H_LEQ_64.B_LEQ_19.KV_LEQ_131072": {
         "BLOCK_M": 64,
         "num_warps": 4,
-        "NUM_SEGMENTS_PER_SEQ": 8,
+        "NUM_SEGMENTS_PER_SEQ": 10,
         "num_stages": 3,
         "TDM_PARTIAL_STORE": 1,
         "Q_FROM_LDS": 1,
-        "waves_per_eu": 2
+        "waves_per_eu": 2,
+        "NPOT_SPLITS": 1,
+        "PARTIAL_BF16": 1,
+        "XCHG_MODE": 1
       },
       "H_LEQ_64.B_LEQ_31": {},
       "H_LEQ_64.B_LEQ_32.KV_LEQ_16384": {},
       "H_LEQ_64.B_LEQ_32.KV_LEQ_131072": {
         "BLOCK_M": 64,
         "num_warps": 4,
-        "NUM_SEGMENTS_PER_SEQ": 16,
+        "NUM_SEGMENTS_PER_SEQ": 6,
         "num_stages": 3,
         "TDM_PARTIAL_STORE": 1,
         "Q_FROM_LDS": 1,
-        "waves_per_eu": 2
+        "waves_per_eu": 2,
+        "NPOT_SPLITS": 1,
+        "PARTIAL_BF16": 1,
+        "XCHG_MODE": 1
       },
       "H_LEQ_64.B_LEQ_127": {},
       "H_LEQ_64.B_LEQ_128.KV_LEQ_16384": {},
       "H_LEQ_64.B_LEQ_128.KV_LEQ_32768": {
         "BLOCK_M": 64,
         "num_warps": 4,
-        "NUM_SEGMENTS_PER_SEQ": 4,
+        "NUM_SEGMENTS_PER_SEQ": 3,
         "num_stages": 3,
         "TDM_PARTIAL_STORE": 1,
         "Q_FROM_LDS": 1,
-        "waves_per_eu": 2
+        "waves_per_eu": 2,
+        "NPOT_SPLITS": 1,
+        "PARTIAL_BF16": 1,
+        "XCHG_MODE": 1
       },
       "any": {}
     }

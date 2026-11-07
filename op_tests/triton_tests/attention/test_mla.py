@@ -814,6 +814,120 @@ def test_mla_decode_fwd_unshuffled_pipeline_ring_wraparound(
     )
 
 
+@pytest.mark.parametrize(
+    "batch_size, max_seqlen_kv",
+    [(128, 16401), (32, 16401), (19, 65553), (15, 131089)],
+)
+@torch.inference_mode()
+def test_mla_decode_fwd_unshuffled_tuned_h64(monkeypatch, batch_size, max_seqlen_kv):
+    """Tuned H64 FP8 entries through the wrapper's config loading: split count
+    without power-of-2 rounding (NPOT_SPLITS), BF16 partial outputs
+    (PARTIAL_BF16) and the one-barrier alpha/P exchange (XCHG_MODE)."""
+    if DEVICE_ARCH != "gfx1250":
+        pytest.skip("unshuffled LDS pipeline requires gfx1250")
+
+    import triton
+
+    import aiter.ops.triton.attention.mla as mla_module
+
+    num_query_heads, block_size, kv_lora_rank, qk_rope_head_dim = 64, 64, 512, 64
+    qk_head_dim = kv_lora_rank + qk_rope_head_dim
+    entry = mla_module._tuned_decode_config(
+        "pipelined_unshuffled",
+        "fp8",
+        "fp8",
+        num_query_heads,
+        batch_size,
+        max_seqlen_kv,
+    )
+    kernel = mla_module.gluon_mla_decode_fwd_kernel
+    launches = []
+
+    class CaptureLaunch:
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                launches.append((grid, kwargs))
+                return kernel[grid](*args, **kwargs)
+
+            return launch
+
+    monkeypatch.setattr(mla_module, "gluon_mla_decode_fwd_kernel", CaptureLaunch())
+
+    torch.manual_seed(0)
+    num_pages = (max_seqlen_kv + block_size - 1) // block_size
+    # Two full-length sequences cover every segment; short ones cover tails.
+    lengths = [max_seqlen_kv, max_seqlen_kv - 37]
+    lengths += torch.randint(1, 4 * block_size, (batch_size - 2,)).tolist()
+    seq_lens_kv = torch.tensor(lengths, dtype=torch.int32, device="cuda")
+    cu_seqlens_q = torch.arange(batch_size + 1, dtype=torch.int32, device="cuda")
+    # Logical pages may reuse physical pages; the oracle follows the same table.
+    num_blocks = 2 * num_pages
+    block_tables = torch.randint(
+        0, num_blocks, (batch_size, num_pages), dtype=torch.int32, device="cuda"
+    )
+    kv_buffer = torch.randn(
+        (num_blocks, block_size, 1, qk_head_dim), dtype=torch.bfloat16, device="cuda"
+    ).to(e4m3_dtype)
+    query = torch.randn(
+        (batch_size, num_query_heads, qk_head_dim), dtype=torch.bfloat16, device="cuda"
+    ).to(e4m3_dtype)
+    descale = torch.ones(1, dtype=torch.float32, device="cuda")
+    output = torch.empty(
+        (batch_size, num_query_heads, kv_lora_rank), dtype=torch.bfloat16, device="cuda"
+    )
+    mla_decode_fwd(
+        q=query,
+        kv_buffer=kv_buffer,
+        out=output,
+        cu_seqlens_q=cu_seqlens_q,
+        seqused_k=seq_lens_kv,
+        max_seqlen_kv=max_seqlen_kv,
+        block_tables=block_tables,
+        softmax_scale=qk_head_dim**-0.5,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        causal=True,
+        q_descale=descale,
+        kv_descale=descale,
+        shuffled_kv_cache=False,
+    )
+    assert len(launches) == 1
+    grid, kwargs = launches[0]
+    if entry:
+        segments = min(entry["NUM_SEGMENTS_PER_SEQ"], num_pages)
+        if not entry.get("NPOT_SPLITS"):
+            segments = triton.next_power_of_2(segments)
+        assert grid[2] == segments == kwargs["NUM_SEGMENTS_PER_SEQ"]
+        assert kwargs.get("XCHG_MODE", 0) == entry.get("XCHG_MODE", 0)
+        expected = torch.bfloat16 if entry.get("PARTIAL_BF16") else torch.float32
+        assert kwargs["segm_output_ptr"].dtype == expected
+    ref_output = torch_mla_extend(
+        query,
+        kv_buffer,
+        cu_seqlens_q,
+        seq_lens_kv,
+        block_tables,
+        kv_lora_rank,
+        qk_head_dim**-0.5,
+        q_descale=descale,
+        kv_descale=descale,
+        o_dtype=torch.float32,
+    )
+    assert torch.isfinite(output).all()
+    tol_err_ratio = 0.01
+    assert (
+        checkAllclose(
+            output.float(),
+            ref_output,
+            atol=1.5e-1,
+            rtol=1.5e-1,
+            tol_err_ratio=tol_err_ratio,
+            msg="mla_decode_fwd tuned H64 output",
+        )
+        <= tol_err_ratio
+    )
+
+
 @pytest.mark.parametrize("batch_size", [1])
 @pytest.mark.parametrize("ctx_lens", [200])
 @pytest.mark.parametrize("num_heads", [(16, 1), (128, 1)])
