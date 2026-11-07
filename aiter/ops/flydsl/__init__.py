@@ -134,6 +134,10 @@ _LAZY_IMPORTS = {
     ),
     "pa_decode": (".pa_decode", "pa_decode"),
     "prepare_pa_decode_plan": (".pa_decode_tuning", "prepare_pa_decode_plan"),
+    "prepare_pa_decode_plan_with_policy": (
+        ".pa_decode_policy",
+        "prepare_pa_decode_plan_with_policy",
+    ),
     "prepare_gemm_a16wfp4_weight": (
         ".gemm_a16wfp4",
         "prepare_gemm_a16wfp4_weight",
@@ -243,6 +247,7 @@ __all__ = [
     "pa_decode",
     "prepare_gemm_a16wfp4_weight",
     "prepare_pa_decode_plan",
+    "prepare_pa_decode_plan_with_policy",
 ]
 
 _fused_moe_impl_path = "aiter.ops.flydsl.fused_moe_gfx942:run_flydsl_moe_gfx942_impl"
