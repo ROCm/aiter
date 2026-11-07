@@ -37,6 +37,7 @@ from aiter.ops.flydsl.fused_moe_gfx942 import (
     Config,
     _gateup_output,
     _Problem,
+    flydsl_block_weight_scale,
     get_tune_space,
 )
 from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8 import (
@@ -55,8 +56,13 @@ QUANTS = {
     "no": QuantType.No,
     "per_tensor": QuantType.per_Tensor,
     "ptpc": QuantType.per_Token,
+    "block": QuantType.per_128x128,
 }
-ACTIVATIONS = {"silu": ActivationType.Silu, "swiglu": ActivationType.Swiglu}
+ACTIVATIONS = {
+    "silu": ActivationType.Silu,
+    "swiglu": ActivationType.Swiglu,
+    "swiglustep": ActivationType.SwigluStep,
+}
 # MI300X then MI308X, the order in which a cached launcher meets a smaller device.
 CU_COUNTS = (304, 80)
 GUARD, CANARY = 64, -123
@@ -67,6 +73,7 @@ TOKEN_ERR_LIMIT = 0.2
 LOGITS_DIFF_LIMIT = 1e-3
 # Prefill paths of one case share Gate/Up and quantization and agree to BF16 rounding.
 PATH_DIFF_LIMIT = 0.1
+SWIGLU_STEP_LIMIT = 7.0
 
 
 def guarded_task_buffers(sorted_expert_ids, experts, cu_count):
@@ -317,6 +324,37 @@ def stale_gateup_output(hidden_states, problem):
     return _gateup_output(hidden_states, problem).fill_(float("inf"))
 
 
+def block_quant(w, scale_k, block=128):
+    """FP8 weights with 128x128 block scales (partial edge blocks allowed).
+
+    Returns the FP8 weights, their exact FP32 dequantization and the scales in
+    the FlyDSL [E, K // scale_k, N] layout.
+    """
+    experts, n, k = w.shape
+    n_blocks, k_blocks = -(-n // block), -(-k // block)
+    padded = torch.nn.functional.pad(
+        w.float(), (0, k_blocks * block - k, 0, n_blocks * block - n)
+    )
+    blocks = padded.view(experts, n_blocks, block, k_blocks, block)
+    scale = blocks.abs().amax(dim=(2, 4)) / torch.finfo(dtypes.fp8).max
+    expanded = scale.repeat_interleave(block, 1).repeat_interleave(block, 2)
+    expanded = expanded[:, :n, :k]
+    w_q = (w.float() / expanded).to(dtypes.fp8)
+    return (
+        w_q,
+        w_q.float() * expanded,
+        flydsl_block_weight_scale(scale, n, k, scale_k),
+    )
+
+
+def group_quant(x, group):
+    """FP8 round trip with one scale per (row, group of K), as the prefill kernels see x."""
+    groups = x.float().view(*x.shape[:-1], -1, group)
+    scale = groups.abs().amax(dim=-1, keepdim=True) / torch.finfo(dtypes.fp8).max
+    scale = scale.clamp_min(torch.finfo(torch.float32).tiny)
+    return ((groups / scale).to(dtypes.fp8).float() * scale).view(x.shape)
+
+
 @functools.lru_cache(maxsize=1)
 def make_case(
     token,
@@ -334,6 +372,7 @@ def make_case(
     q_type, act_type = QUANTS[quant], ACTIVATIONS[activation]
     q_dtype = None if q_type == QuantType.No else dtypes.fp8
     torch_quant = aiter.get_torch_quant(q_type)
+    swiglu_limit = SWIGLU_STEP_LIMIT if activation == "swiglustep" else None
 
     def quantize_activation(x):
         # Decode and batch-1 kernels read BF16 activations even with FP8 weights.
@@ -345,38 +384,70 @@ def make_case(
     w1 = torch.randn((experts, 2 * inter_dim, model_dim), dtype=dtypes.bf16)
     w2 = torch.randn((experts, model_dim, inter_dim), dtype=dtypes.bf16)
     topk_weights, topk_ids = route(hidden, experts, topk, routing)
-    if q_type == QuantType.per_Tensor:
-        w1_q, w1_scale = aiter.pertoken_quant(w1.view(experts, -1), quant_dtype=q_dtype)
-        w2_q, w2_scale = aiter.pertoken_quant(w2.view(experts, -1), quant_dtype=q_dtype)
-        w1_q, w2_q = w1_q.view(w1.shape), w2_q.view(w2.shape)
+    if q_type == QuantType.per_128x128:
+        w1_q, w1_ref, w1_scale = block_quant(w1, 64)
+        w2_q, w2_ref, w2_scale = block_quant(w2, 128 if inter_dim % 128 == 0 else 64)
+        # Prefill quantizes activations per (token, 64-wide K group); decode reads BF16.
+        a1 = group_quant(hidden, 64) if quantize_activations else hidden
+        stage1 = torch_moe_stage1(
+            a1,
+            w1_ref,
+            w2_ref,
+            topk_weights,
+            topk_ids,
+            dtype=dtypes.bf16,
+            activation=act_type,
+            swiglu_limit=swiglu_limit,
+        )
+        a2 = stage1
+        if quantize_activations:
+            a2 = group_quant(stage1, w2.shape[2] // w2_scale.shape[1])
+        reference = torch_moe_stage2(
+            a2.view(token, topk, -1),
+            w1_ref,
+            w2_ref,
+            topk_weights,
+            topk_ids,
+            dtype=dtypes.bf16,
+        )
     else:
-        w1_q, w1_scale = torch_quant(w1, quant_dtype=q_dtype)
-        w2_q, w2_scale = torch_quant(w2, quant_dtype=q_dtype)
-    a1, a1_scale = quantize_activation(hidden)
-    stage1 = torch_moe_stage1(
-        a1,
-        w1_q,
-        w2_q,
-        topk_weights,
-        topk_ids,
-        dtype=dtypes.bf16,
-        activation=act_type,
-        quant_type=q_type,
-        a1_scale=a1_scale,
-        w1_scale=w1_scale,
-    )
-    a2, a2_scale = quantize_activation(stage1)
-    reference = torch_moe_stage2(
-        a2.view(token, topk, -1),
-        w1_q,
-        w2_q,
-        topk_weights,
-        topk_ids,
-        dtype=dtypes.bf16,
-        quant_type=q_type,
-        w2_scale=w2_scale,
-        a2_scale=a2_scale,
-    )
+        if q_type == QuantType.per_Tensor:
+            w1_q, w1_scale = aiter.pertoken_quant(
+                w1.view(experts, -1), quant_dtype=q_dtype
+            )
+            w2_q, w2_scale = aiter.pertoken_quant(
+                w2.view(experts, -1), quant_dtype=q_dtype
+            )
+            w1_q, w2_q = w1_q.view(w1.shape), w2_q.view(w2.shape)
+        else:
+            w1_q, w1_scale = torch_quant(w1, quant_dtype=q_dtype)
+            w2_q, w2_scale = torch_quant(w2, quant_dtype=q_dtype)
+        a1, a1_scale = quantize_activation(hidden)
+        stage1 = torch_moe_stage1(
+            a1,
+            w1_q,
+            w2_q,
+            topk_weights,
+            topk_ids,
+            dtype=dtypes.bf16,
+            activation=act_type,
+            quant_type=q_type,
+            a1_scale=a1_scale,
+            w1_scale=w1_scale,
+            swiglu_limit=swiglu_limit,
+        )
+        a2, a2_scale = quantize_activation(stage1)
+        reference = torch_moe_stage2(
+            a2.view(token, topk, -1),
+            w1_q,
+            w2_q,
+            topk_weights,
+            topk_ids,
+            dtype=dtypes.bf16,
+            quant_type=q_type,
+            w2_scale=w2_scale,
+            a2_scale=a2_scale,
+        )
     request = FusedMoeRequest(
         hidden_states=hidden,
         w1=behind_nan_expert(shuffle_weight(w1_q, layout=(16, 16))),
@@ -387,6 +458,7 @@ def make_case(
         quant_type=q_type,
         w1_scale=behind_nan_expert(w1_scale),
         w2_scale=behind_nan_expert(w2_scale),
+        swiglu_limit=swiglu_limit,
     )
     # Holds the first FlyDSL output of the case for the cross-path check.
     return request, reference, {}
@@ -619,6 +691,48 @@ EDGE_CASES = [
     ),
     # Direct decoding reads -1 pad rows from topk_ids without sorting.
     (2, 2560, 320, 513, 11, "ptpc", "silu", "pad_rows", "16_16_16_False_True"),
+    # Block-scaled FP8 with SwiGLU-step on every algorithm. inter_dim 192 ends in a
+    # partial 128-wide K block of w2 (64-wide Down groups); 256 uses 128-wide groups.
+    *(
+        (token, 1024, inter_dim, 32, 8, "block", "swiglustep", "random", config)
+        for inter_dim in (192, 256)
+        for token, config in (
+            (1, "16_16_16_False:default:0"),
+            (5, "16_16_16_False_True:default:0"),
+            (64, "16_16_16_False:default:0"),
+            (64, "16_128_64_False:default:0"),
+            (2048, "64_128_128_True:1x4_64x256:128"),
+        )
+    ),
+    # Hot routing (all tokens same expert) on one decode config per inter_dim.
+    *(
+        (
+            64,
+            1024,
+            inter_dim,
+            32,
+            8,
+            "block",
+            "swiglustep",
+            "hot",
+            "16_16_16_False:default:0",
+        )
+        for inter_dim in (192, 256)
+    ),
+    # Step-5 shape (model_dim 4096, inter_dim 192 partial K block) at CI-friendly
+    # sizes; the 2048-token prefill above already covers the full kernel path.
+    (8, 4096, 192, 64, 8, "block", "swiglustep", "random", "16_16_16_False:default:0"),
+    (
+        2048,
+        4096,
+        192,
+        64,
+        8,
+        "block",
+        "swiglustep",
+        "random",
+        "64_128_128_True:1x4_64x256:128",
+    ),
 ]
 
 
