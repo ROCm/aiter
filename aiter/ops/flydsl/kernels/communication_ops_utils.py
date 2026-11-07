@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 FlyDSL Project Contributors
+# Tagged mailbox adapted from ROCm/ATOM at a526f0d under the MIT License.
 
 """Cross-card (P2P) communication primitives for communication kernels.
 
@@ -19,18 +20,26 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
-from flydsl.expr import arith
+from flydsl.compiler.ast_rewriter import ASTRewriter
+from flydsl.expr import arith, const_expr, range_constexpr
 from flydsl.expr.rocdl import readfirstlane
 from flydsl.expr.typing import T
 
+from aiter.ops.flydsl.kernels import buffer_ops as bo
+
 __all__ = [
+    "CACHE_DEVICE",
+    "CACHE_SYSTEM",
     "GeometryTuningTable",
+    "TaggedMailbox",
     "atomic_add_agent",
     "atomic_add_agent_one_as",
     "atomic_add_global_at",
     "atomic_add_lds",
     "atomic_add_system",
     "atomic_add_workgroup",
+    "buffer_load_i32",
+    "buffer_resource",
     "fence_acquire",
     "fence_agent_acquire",
     "fence_agent_release",
@@ -46,8 +55,10 @@ __all__ = [
     "load_i32_nt",
     "load_i32_system",
     "load_i64_acquire",
+    "load_i64_from_buffer",
     "load_i64_global",
     "load_v4i32_nt",
+    "memrealtime",
     "spin_until_eq_i32",
     "spin_until_ge_i32_agent",
     "spin_until_ge_i32_system",
@@ -61,14 +72,168 @@ __all__ = [
     "store_i32_system",
     "store_i64_global",
     "store_i64_global_system",
+    "tagged_peer_address",
+    "tagged_shift",
     "wait_i32_until_equals",
     "wait_i32_until_greater_than",
     "wait_i64_until_equals",
     "wait_lds_wave",
     "waitcnt_all",
     "waitcnt_stores",
+    "wave_uniform_i32",
     "wave_uniform_i64",
 ]
+
+_TAGGED_POLL_MAX = 12
+CACHE_DEVICE = 16
+CACHE_SYSTEM = 17
+DIAG_TICKS = 10 * 100_000_000
+
+
+def buffer_resource(address):
+    return bo.create_buffer_resource_from_addr(address)
+
+
+def tagged_peer_address(base, byte_offset):
+    """Return a byte address in an IPC-mapped peer buffer."""
+    return base + fx.Int64(byte_offset)
+
+
+def tagged_shift(address, byte_offset):
+    return address + byte_offset
+
+
+@ASTRewriter.transform
+def _spin_tagged(load_all, pending):
+    values = load_all()
+    while pending(values):
+        fx.rocdl.s_sleep(1)
+        values = load_all()
+    return values
+
+
+def memrealtime():
+    """Read the AMD 100 MHz device timer for bounded diagnostics."""
+    return fx.Int64(llvm.call_intrinsic(T.i64, "llvm.amdgcn.s.memrealtime", [], [], []))
+
+
+@ASTRewriter.transform
+def _spin_tagged_bounded(load_all, pending, on_timeout):
+    """Poll for at most ``DIAG_TICKS`` and record a diagnostic on timeout."""
+    start = memrealtime()
+    values = load_all()
+    late = fx.Int32(0)
+    while pending(values) & (late == 0):
+        fx.rocdl.s_sleep(1)
+        values = load_all()
+        late = (memrealtime() - start > DIAG_TICKS).select(fx.Int32(1), fx.Int32(0))
+    if late != 0:
+        on_timeout()
+    return values
+
+
+class TaggedMailbox:
+    """Transfer naturally aligned 32-bit values with adjacent launch tags.
+
+    A payload and tag form one 8-byte pair and are written by one vector store.
+    ``pair_layout`` preserves this alignment; splitting or widening a pair would
+    remove the atomic hand-off that makes a separate release fence unnecessary.
+    """
+
+    def __init__(
+        self,
+        tag,
+        *,
+        debug=False,
+        epoch_addresses=None,
+        expected_epoch=None,
+        diagnostic=None,
+    ):
+        self.tag = tag + 1
+        self.debug = debug
+        self.epoch_addresses = epoch_addresses
+        self.expected_epoch = expected_epoch
+        self.diagnostic = diagnostic
+
+    def put(self, address, index, value):
+        bits = (
+            value.bitcast(fx.Int32)
+            if isinstance(value, fx.Float32)
+            else fx.Int32(value)
+        )
+        bo.buffer_store(
+            fx.Vector.from_elements([bits, self.tag], fx.Int32),
+            buffer_resource(address),
+            index * 2,
+            cache_modifier=CACHE_SYSTEM,
+        )
+
+    def put_words(self, address, index, words):
+        values = []
+        for word in words:
+            values += [fx.Int32(word), self.tag]
+        bo.buffer_store(
+            fx.Vector.from_elements(values, fx.Int32),
+            buffer_resource(address),
+            index * 2,
+            cache_modifier=CACHE_SYSTEM,
+        )
+
+    def poll(self, specs, batch=_TAGGED_POLL_MAX):
+        """Poll ``(address, pair index, pair count)`` specifications."""
+        if const_expr(len(specs) == 0):
+            return []
+        if const_expr(len(specs) > batch):
+            return self.poll(specs[:batch], batch) + self.poll(specs[batch:], batch)
+        tag = self.tag
+
+        def load_all():
+            words = []
+            for address, index, count in specs:
+                loaded = fx.Vector(
+                    bo.buffer_load(
+                        buffer_resource(address),
+                        fx.Int32(index) * 2,
+                        vec_width=2 * count,
+                        dtype=T.i32,
+                        cache_modifier=CACHE_SYSTEM,
+                    )
+                )
+                words += [loaded[item] for item in range(2 * count)]
+            return fx.Vector.from_elements(words, fx.Int32)
+
+        word_count = sum(2 * count for _, _, count in specs)
+
+        def pending(values):
+            stale = values[1] != tag
+            for index in range_constexpr(3, word_count, 2):
+                stale = stale | (values[index] != tag)
+            return stale
+
+        if self.debug and self.epoch_addresses is not None:
+
+            def on_timeout():
+                missing = fx.Int32(0)
+                for rank, address in enumerate(self.epoch_addresses):
+                    seen = buffer_load_i32(address, 0, cache_modifier=CACHE_SYSTEM)
+                    missing = missing | (seen < self.expected_epoch).select(
+                        1 << rank, 0
+                    )
+                bo.buffer_store(
+                    missing,
+                    buffer_resource(self.diagnostic),
+                    2,
+                    cache_modifier=CACHE_DEVICE,
+                )
+
+            values = _spin_tagged_bounded(load_all, pending, on_timeout)
+        else:
+            values = _spin_tagged(load_all, pending)
+        out, index = [], 0
+        for _, _, count in specs:
+            out.append([values[index + 2 * item] for item in range(count)])
+            index += 2 * count
+        return out
 
 
 def wait_lds_wave():
@@ -76,11 +241,42 @@ def wait_lds_wave():
     fx.rocdl.s_waitcnt(lgkmcnt=0)
 
 
+def wave_uniform_i32(value):
+    """Broadcast an i32 value from the first lane of the wave."""
+    return fx.Int32(readfirstlane(T.i32, fx.Int32(value).ir_value()))
+
+
 def wave_uniform_i64(addr):
     v = fx.Uint64(addr)
     lo = readfirstlane(T.i32, fx.Uint32(v))  # low 32 bits
     hi = readfirstlane(T.i32, fx.Uint32(v >> 32))  # high 32 bits (unsigned shift)
     return (fx.Uint64(hi) << 32) | fx.Uint64(lo)
+
+
+def buffer_load_i32(address, index, cache_modifier=0):
+    """Load one i32 from a raw device address through a buffer resource."""
+    return fx.Int32(
+        bo.buffer_load(
+            buffer_resource(address),
+            index,
+            vec_width=1,
+            dtype=T.i32,
+            cache_modifier=cache_modifier,
+        )
+    )
+
+
+def load_i64_from_buffer(address, index):
+    """Load a wave-uniform i64 from two adjacent i32 buffer words."""
+    words = fx.Vector(
+        bo.buffer_load(
+            buffer_resource(address),
+            index * 2,
+            vec_width=2,
+            dtype=T.i32,
+        )
+    )
+    return wave_uniform_i64((fx.Int64(words[1]) << 32) | fx.Int64(fx.Uint32(words[0])))
 
 
 def _to_ptr_global(v, dtype=fx.Int32, alignment=4):
