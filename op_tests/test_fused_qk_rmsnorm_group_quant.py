@@ -10,9 +10,11 @@ import torch.nn.functional as F
 
 import aiter
 from aiter import dtypes
+from aiter.ops.fused_qk_rmsnorm_group_quant import fused_qk_rmsnorm_group_quant
 from aiter.ops.triton.quant.fused_fp8_quant import fused_rms_fp8_group_quant
 from aiter.ops.triton.quant.fused_mxfp4_quant import fused_rms_mxfp4_quant
-from aiter.test_common import benchmark, checkAllclose, perftest
+from aiter.ops.triton.quant.fused_mxfp8_quant import fused_dual_rmsnorm_mxfp8_quant
+from aiter.test_common import assertAllclose, benchmark, checkAllclose, perftest
 from aiter.utility import fp4_utils
 
 MI308_BW_MAX_TBPS = 5.3
@@ -68,6 +70,21 @@ def _per_token_group_fp4x2_quant_ref(
     q_fp4x2 = fp4_utils.f32_to_mxfp4(x_scaled)
     scale_exp = ((quant_scale.view(torch.int32) >> 23) & 0xFF).to(torch.uint8)
     return q_fp4x2, scale_exp.squeeze(-1)
+
+
+def _per_token_group_mxfp8_quant_ref(
+    x: torch.Tensor, amax_floor: float
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # OCP MX rule of the triton _mxfp8_quant_op: amax rounded to a power of two (up iff its
+    # mantissa is >= 0.75), scale 2^(floor(log2) - 8), e8m0 code = exponent + 127.
+    m, n = x.shape
+    xg = x.float().view(m, n // 32, 32)
+    amax = torch.amax(torch.abs(xg), dim=-1, keepdim=True).clamp_min(amax_floor)
+    biased = ((amax.view(torch.int32) + 0x200000) >> 23) & 0xFF
+    s = torch.where(biased == 0xFF, 127, (biased - 135).clamp_min(-127))
+    scale = torch.exp2(s.float())
+    q = torch.clamp(xg / scale, -448.0, 448.0).to(dtypes.fp8).view(m, n)
+    return q, (s + 127).to(torch.uint8).squeeze(-1)
 
 
 def _to_transposed_scale_layout(scale: torch.Tensor) -> torch.Tensor:
@@ -768,6 +785,146 @@ def test_fused_qk_rmsnorm_group_quant(
     }
 
 
+@perftest()
+def run_triton_mxfp8(q, q_weight, k, k_weight, eps, amax_floor):
+    return fused_dual_rmsnorm_mxfp8_quant(
+        q, k, q_weight, k_weight, eps, eps_k=eps, amax_floor=amax_floor
+    )
+
+
+@perftest()
+def run_hip_mxfp8(q, q_weight, k, k_weight, eps, amax_floor):
+    m, n1 = q.shape
+    yq = torch.empty((m, n1), dtype=dtypes.fp8, device=q.device)
+    sq = torch.empty((m, n1 // 32), dtype=torch.uint8, device=q.device)
+    yk = torch.empty_like(k)
+    fused_qk_rmsnorm_group_quant(
+        yq,
+        sq,
+        q,
+        q_weight,
+        eps,
+        k_out=yk,
+        k=k,
+        k_weight=k_weight,
+        k_epsilon=eps,
+        group_size=32,
+        amax_floor=amax_floor,
+    )
+    return yq, sq, yk
+
+
+def _byte_mismatch(a: torch.Tensor, b: torch.Tensor) -> int:
+    return int((a.view(torch.uint8) != b.view(torch.uint8)).sum().item())
+
+
+@benchmark()
+def test_fused_qk_rmsnorm_mxfp8(
+    dtype: torch.dtype,
+    token: int,
+    num_head1: int,
+    num_head2: int,
+    head_dim: int = 128,
+    amax_floor: float = 1e-10,
+):
+    """MXFP8 q (fp8 e4m3 + uint8 e8m0 per 32) / bf16 k, against the triton
+    fused_dual_rmsnorm_mxfp8_quant it replaces and a torch reference."""
+    m = token
+    n1 = num_head1 * head_dim
+    n2 = num_head2 * head_dim
+    # q and k are adjacent slices of one projection, as in the model.
+    full = torch.randn((m, n1 + n2), dtype=dtype, device="cuda")
+    # Rows spanning many binades, and all-zero groups for the amax floor.
+    full[:, :n1] *= torch.exp2(
+        torch.randint(-20, 10, (m, 1), device="cuda").float()
+    ).to(dtype)
+    full[:, : n1 // 4] = 0
+    q, k = torch.split(full, [n1, n2], dim=1)
+    q_weight = (torch.rand(n1, device="cuda") * 2).to(dtype)
+    k_weight = (torch.rand(n2, device="cuda") * 2).to(dtype)
+    eps = 1e-6
+
+    q_norm = F.rms_norm(q.float(), (n1,), q_weight.float(), eps)
+    yq_ref, sq_ref = _per_token_group_mxfp8_quant_ref(q_norm, amax_floor)
+    yk_ref = _rmsnorm_ref(k, k_weight, eps)
+    (yq_tri, sq_tri, yk_tri), triton_us = run_triton_mxfp8(
+        q, q_weight, k, k_weight, eps, amax_floor
+    )
+    (yq_hip, sq_hip, yk_hip), hip_us = run_hip_mxfp8(
+        q, q_weight, k, k_weight, eps, amax_floor
+    )
+
+    info = f"mxfp8 m={m}, n1={n1}, n2={n2}, amax_floor={amax_floor:g}"
+    sq_tri = sq_tri.view(torch.uint8)
+    for name, yq_r, sq_r in (("torch", yq_ref, sq_ref), ("triton", yq_tri, sq_tri)):
+        # An amax on a rounding boundary may move its e8m0 code by one; the fp8 values are
+        # compared where the codes agree, within one e4m3 step (1/8 relative, 2^-9 subnormal).
+        assertAllclose(
+            sq_r.float(),
+            sq_hip.float(),
+            rtol=0,
+            atol=1,
+            msg=f"check q scale {name} vs hip, {info}",
+        )
+        assertAllclose(
+            yq_r.float(),
+            yq_hip.float(),
+            rtol=0.13,
+            atol=2**-9,
+            mask=(sq_r == sq_hip).repeat_interleave(32, dim=1),
+            msg=f"check q {name} vs hip, {info}",
+        )
+    assertAllclose(
+        yk_ref, yk_hip, rtol=0.02, atol=0.02, msg=f"check k torch vs hip, {info}"
+    )
+    assertAllclose(
+        yk_tri, yk_hip, rtol=0.02, atol=0.02, msg=f"check k triton vs hip, {info}"
+    )
+    mismatch = (
+        _byte_mismatch(yq_tri, yq_hip)
+        + _byte_mismatch(sq_tri, sq_hip)
+        + _byte_mismatch(yk_tri, yk_hip)
+    )
+    total = yq_hip.numel() + sq_hip.numel() + yk_hip.numel() * yk_hip.element_size()
+    io_bytes = (
+        _tensor_bytes(q)
+        + _tensor_bytes(k)
+        + _tensor_bytes(yq_hip)
+        + _tensor_bytes(sq_hip)
+        + _tensor_bytes(yk_hip)
+    )
+    aiter.logger.info(
+        "[result] %s | time(us): triton=%.2f hip=%.2f uplift=%.1f%% | "
+        "bw(TB/s): triton=%.3f hip=%.3f | bytes differing from triton: %d / %d",
+        info,
+        triton_us,
+        hip_us,
+        (triton_us / hip_us - 1) * 100.0,
+        io_bytes / (triton_us * 1e-6) / 1e12,
+        io_bytes / (hip_us * 1e-6) / 1e12,
+        mismatch,
+        total,
+    )
+    return {
+        "dtype": str(dtype),
+        "quant_type": "mxfp8",
+        "gfx": aiter.get_gfx(),
+        "token": token,
+        "num_head1": num_head1,
+        "num_head2": num_head2,
+        "head_dim": head_dim,
+        "residual": False,
+        "triton_us": triton_us,
+        "hip_us": hip_us,
+        "uplift": f"{triton_us / hip_us - 1:.1%}",
+        "triton_bw_TBps": io_bytes / (triton_us * 1e-6) / 1e12,
+        "hip_bw_TBps": io_bytes / (hip_us * 1e-6) / 1e12,
+        "triton_error_rate": None,
+        "hip_error_rate": mismatch / total,
+        "note": "hip_error_rate: share of bytes differing from triton",
+    }
+
+
 if __name__ == "__main__":
     l_dtype = ["bf16"]
     l_quant_type = ["fp8"]
@@ -780,6 +937,9 @@ if __name__ == "__main__":
     )
     if _fp4x2_available:
         l_quant_type = ["fp8", "fp4x2"]
+    # The triton MXFP8 baseline emits OCP e4m3fn, as gfx950 / gfx1250 do.
+    if _gfx in ("gfx950", "gfx1250"):
+        l_quant_type.append("mxfp8")
     # DeepSeekV2 MLA realistic default:
     # q_lora_rank ~= 1536 (12 * 128), kv_lora_rank ~= 512 (4 * 128), usually n1 > n2.
     l_token = [32, 256, 8192, 16384]
@@ -808,14 +968,16 @@ if __name__ == "__main__":
     parser.add_argument(
         "--quant_out_dtype",
         type=str,
-        choices=["fp8", "fp4x2"],
+        choices=["fp8", "fp4x2", "mxfp8"],
         nargs="*",
         default=None,
         help=(
             "Quant output dtype(s). Overrides auto-detected defaults. "
             "fp8 enables Triton fused_rms_fp8_group_quant baseline; "
             "fp4x2 enables Triton fused_rms_mxfp4_quant baseline only when "
-            "group_size=32 and transpose_scale=False."
+            "group_size=32 and transpose_scale=False; "
+            "mxfp8 (bf16, no residual, num_head2 > 0) compares against Triton "
+            "fused_dual_rmsnorm_mxfp8_quant."
         ),
     )
     parser.add_argument(
@@ -972,6 +1134,27 @@ if __name__ == "__main__":
     df = []
     for dtype in [dtypes.d_dtypes[k] for k in l_dtype]:
         for quant_out_dtype_name in l_quant_type:
+            if quant_out_dtype_name == "mxfp8":
+                if dtype != dtypes.bf16:
+                    continue
+                for head_dim in l_head_dim:
+                    for token in l_token:
+                        for num_head1 in l_num_head1:
+                            for num_head2 in l_num_head2:
+                                if num_head2 == 0:
+                                    continue
+                                for amax_floor in (0.0, 1e-10):
+                                    df.append(
+                                        test_fused_qk_rmsnorm_mxfp8(
+                                            dtype=dtype,
+                                            token=token,
+                                            num_head1=num_head1,
+                                            num_head2=num_head2,
+                                            head_dim=head_dim,
+                                            amax_floor=amax_floor,
+                                        )
+                                    )
+                continue
             quant_out_dtype = (
                 dtypes.fp8 if quant_out_dtype_name == "fp8" else dtypes.fp4x2
             )
