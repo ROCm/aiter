@@ -499,6 +499,12 @@ def _build_kernel(
                 kv_v_lane = _load_f32_vec(kv_state_buf, base_kv_off, VEC)
                 sc_v_lane = _load_f32_vec(score_state_buf, base_sc_off, VEC)
 
+                # Padding has zero probability, but 0 * NaN/Inf is still NaN.
+                # Mask the value too: state storage for s < 0 is not valid input.
+                kv_v_lane = [
+                    is_pad.select(c_zero_f32, fx.Float32(kv_v_lane[i]))
+                    for i in range_constexpr(VEC)
+                ]
                 sc_pad_lane = []
                 for i in range_constexpr(VEC):
                     sc_pad_lane.append(
@@ -1523,7 +1529,11 @@ def _build_kernel_ksplit(
                 sc_pad = [
                     is_pad.select(c_neg_inf, fx.Float32(sc_v[i])) for i in range(VEC)
                 ]
-                return kv_v, sc_pad
+                # A masked score alone does not protect 0 * NaN/Inf.
+                kv_pad = [
+                    is_pad.select(c_zero_f32, fx.Float32(kv_v[i])) for i in range(VEC)
+                ]
+                return kv_pad, sc_pad
 
             def _phase2_loads(k_i32):
                 col_off = _col_off_for_k(k_i32)
