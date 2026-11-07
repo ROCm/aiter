@@ -1,0 +1,17 @@
+{
+    "C_LEQ_320": {
+        "BLOCK_P": 128,
+        "BLOCK_C": 32,
+        "num_warps": 2
+    },
+    "C_LEQ_640": {
+        "BLOCK_P": 256,
+        "BLOCK_C": 64,
+        "num_warps": 8
+    },
+    "any": {
+        "BLOCK_P": 64,
+        "BLOCK_C": 32,
+        "num_warps": 1
+    }
+}
