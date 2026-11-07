@@ -275,17 +275,23 @@ def test_mamba2_chunk_backward(
         candidates["fla_triton"] = fla_fn
 
     names = ["dx", "da", "db", "dc", "dd", "ddt", "dinit"]
+    FP32_GRADS = ("da", "dd", "dinit")
     ret = {"gfx": get_gfx_runtime()}
     for name, fn in candidates.items():
         grads, us = run_perftest(fn)
         errs = []
         for gname, r, g in zip(names, ref, grads):
+            scale = r.abs().max().item()
+            if gname in FP32_GRADS:  # returned in fp32: held to fp32 accuracy
+                rtol, atol = 1e-3, 1e-4 * scale
+            else:
+                rtol, atol = 2e-2, 2e-2 + _bf16_ulp(scale)
             errs.append(
                 checkAllclose(
                     r,
                     g.to(dtypes.fp32),
-                    rtol=2e-2,
-                    atol=2e-2 + _bf16_ulp(r.abs().max().item()),
+                    rtol=rtol,
+                    atol=atol,
                     msg=f"{name}: {gname}",
                 )
             )
