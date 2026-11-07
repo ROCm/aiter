@@ -21,6 +21,9 @@ from aiter.ops.triton.moe.moe_routing.routing import _USE_HERD, routing
 from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.shuffle import moe_weight_decode_view, shuffle_scale_moe
+from op_tests.op_benchmarks.triton.proton_visible_devices import (
+    proton_visible_devices,
+)
 from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 
 
@@ -303,7 +306,8 @@ def bench_mlp_single_weight_init(
 
     # run layer
     fpath = Path(tempfile.mktemp())
-    proton.start(str(fpath), hook="triton")
+    with proton_visible_devices():
+        proton.start(str(fpath), hook="triton")
     for _ in range(reps):
         logits = gemm_a16w16(xg, wg.T, bg)
         if pin_mask is not None:
