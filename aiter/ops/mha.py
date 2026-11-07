@@ -21,6 +21,7 @@ from ..jit.utils.mha_recipes import (
     _ck_targets_flag,
     compose_mha_fwd_variant_suffix_and_filter,
     get_mha_varlen_prebuild_variants_by_names,
+    _ck_targets_flag,
 )
 from ..jit.utils.torch_guard import torch_compile_guard
 from ..utility import dtypes
@@ -1222,10 +1223,12 @@ def cmdGenFunc_mha_varlen_fwd(
         blob_gen_cmd = [
             f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd "
             "--receipt 200 --filter {} --output_dir {{}}".format('" "')
+            + _ck_targets_flag()
         ]
         blob_gen_cmd.append(
             f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv "
             "--receipt 200 --filter {} --output_dir {{}}".format(filter_fwd_splitkv)
+            + _ck_targets_flag()
         )
     return {
         "md_name": md_name,
@@ -1897,6 +1900,7 @@ def cmdGenFunc_mha_batch_prefill(
     blob_gen_cmd = [
         f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d batch_prefill "
         "--receipt 200 --filter {} --output_dir {{}}".format(filter_fwd)
+        + _ck_targets_flag()
     ]
     return {
         "md_name": md_name,
