@@ -91,6 +91,9 @@ void ck_moe_stage1_gemm(const hipStream_t& stream,
     static constexpr ck::index_t D0Vec  = 1;
     static constexpr ck::index_t D1Vec  = PerTensorQuant ? 1 : EVec;
     static constexpr ck::index_t D2Vec  = 1;
+    // Unquantized (a16w16) instances take no scales.
+    static constexpr bool HasScales =
+        !(std::is_same_v<A0DataType, B0DataType> && sizeof(A0DataType) == 2);
 
     using DeviceOpInstance = ck::tensor_operation::device::DeviceMoeGemm
         // clang-format off
@@ -108,7 +111,8 @@ void ck_moe_stage1_gemm(const hipStream_t& stream,
                S<K0_A, K0_M_A, 1>, S<1, 0, 2>, S<1, 0, 2>, 2, AK1, AK1, 0,
                S<K0_B, K0_N_B, 1>, S<1, 0, 2>, S<1, 0, 2>, 2, BK1, BK1, 0,
                CShuffleMXDLPerWave,    CShuffleNXDLPerWave,   S<1, CShuffleMLane, 1, CShuffleNLane>, S<EVec, D0Vec, D1Vec>,
-               ck::BlockGemmPipelineScheduler::Intrawave, PipelineVer, ActOP, Nswizzle, true, MulRoutedWeight, !PerTensorQuant, ck::index_t, A0DataType>;
+               ck::BlockGemmPipelineScheduler::Intrawave, PipelineVer, ActOP, Nswizzle, true, MulRoutedWeight, !PerTensorQuant, ck::index_t, A0DataType,
+               A0DataType, A0DataType, A0DataType, /*RuntimeSwigluLimit*/ false, HasScales>;
     // clang-format on
 
     auto a_element_op   = AElementOp{};
@@ -120,6 +124,12 @@ void ck_moe_stage1_gemm(const hipStream_t& stream,
     constexpr auto I0             = ck::Number<0>{};
     constexpr auto I1             = ck::Number<1>{};
     static constexpr auto DStride = PerTensorQuant ? I0 : I1;
+
+    if(!HasScales &&
+       (w1_scale.value_or(nullptr) != nullptr || a1_scale.value_or(nullptr) != nullptr))
+    {
+        throw std::runtime_error("unquantized CK MoE stage 1 takes no w1_scale or a1_scale");
+    }
 
     // do GEMM
     auto device_op = DeviceOpInstance{};
@@ -261,8 +271,11 @@ void ck_moe_stage2_gemm(const hipStream_t& stream,
     static constexpr ck::index_t CShuffleMXDLPerWave = (2 < MXDLPerWave ? 2 : MXDLPerWave);
     static constexpr ck::index_t CShuffleNXDLPerWave =
         ck::is_same_v<B0DataType, I4> ? 2 : NXDLPerWave;
+    static constexpr ck::index_t EVec = 2;
+    // Each lane must write a single EVec-wide pair per row: a wider slice per lane splits every
+    // 64-byte output atomic into partial ones.
     static constexpr ck::index_t CShuffleNLane =
-        ck::is_same_v<B0DataType, I4> ? 32 : NPerBlock / 2 / NXDLPerWave; // 64
+        ck::is_same_v<B0DataType, I4> ? 32 : CShuffleNXDLPerWave * NWaves * MNPerXDL / EVec;
     static constexpr ck::index_t CShuffleMLane = BLOCKSIZE / CShuffleNLane;
     // Note: some fp8 instances didn't compile with AK1/BK1=16
     static constexpr ck::index_t K1 =
@@ -270,7 +283,6 @@ void ck_moe_stage2_gemm(const hipStream_t& stream,
     static constexpr ck::index_t AK1 = K1 / sizeof(A0DataType);
     static constexpr ck::index_t BK1 =
         ck::is_same_v<B0DataType, I4> ? 32 / sizeof(B0DataType) : K1 / sizeof(B0DataType);
-    static constexpr ck::index_t EVec  = 2;
     static constexpr ck::index_t D0Vec = 1;
     static constexpr ck::index_t D1Vec = PerTensorQuant ? 1 : EVec;
     static constexpr ck::index_t D2Vec = 1;
@@ -278,6 +290,9 @@ void ck_moe_stage2_gemm(const hipStream_t& stream,
     static constexpr ck::index_t K0_B  = KPerBlock / BK1;
     static constexpr ck::index_t K0_M  = BLOCKSIZE / K0_A;
     static constexpr ck::index_t K0_N  = BLOCKSIZE / K0_B;
+    // Unquantized (a16w16) instances take no scales.
+    static constexpr bool HasScales =
+        !(std::is_same_v<A0DataType, B0DataType> && sizeof(A0DataType) == 2);
 
     using DeviceOpInstance = ck::tensor_operation::device::DeviceMoeGemm
         // clang-format off
@@ -295,7 +310,8 @@ void ck_moe_stage2_gemm(const hipStream_t& stream,
               S<K0_A, K0_M, 1>, S<1, 0, 2>, S<1, 0, 2>, 2, AK1, AK1, 0,
               S<K0_B, K0_N, 1>, S<1, 0, 2>, S<1, 0, 2>, 2, BK1, BK1, 0,
               CShuffleMXDLPerWave,    CShuffleNXDLPerWave,   S<1, CShuffleMLane, 1, CShuffleNLane>, S<EVec, D0Vec, D1Vec, D2Vec>,
-              ck::BlockGemmPipelineScheduler::Intrawave, PipelineVer, 0, Nswizzle, false, MulRoutedWeight, !PerTensorQuant, ck::index_t, A0DataType>;
+              ck::BlockGemmPipelineScheduler::Intrawave, PipelineVer, 0, Nswizzle, false, MulRoutedWeight, !PerTensorQuant, ck::index_t, A0DataType,
+              A0DataType, A0DataType, A0DataType, /*RuntimeSwigluLimit*/ false, HasScales>;
 
 
     auto a_element_op = AElementOp{};
@@ -307,6 +323,12 @@ void ck_moe_stage2_gemm(const hipStream_t& stream,
     constexpr auto I0 = ck::Number<0>{};
     constexpr auto I1 = ck::Number<1>{};
     static constexpr auto DStride = PerTensorQuant ? I0 : I1;
+
+    if(!HasScales &&
+       (w2_scale.value_or(nullptr) != nullptr || a2_scale.value_or(nullptr) != nullptr))
+    {
+        throw std::runtime_error("unquantized CK MoE stage 2 takes no w2_scale or a2_scale");
+    }
 
     // do GEMM
     auto device_op = DeviceOpInstance{};
