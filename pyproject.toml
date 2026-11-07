@@ -75,6 +75,8 @@ extend-exclude = [
     "3rdparty",
     "aiter/jit/build",
     "aiter_logs",
+    # GENERATED vendored FlyDSL kernel: tools/derive_dstmap.py derives it and tests/check_r17_static.py compares it byte for byte with a fresh derivation, so it must stay exactly as derived
+    "csrc/gemm_fusion/sp_qkv/large/r17/flydsl_dstmap_gemm.py",
 ]
 
 [tool.setuptools_scm]
@@ -98,4 +100,5 @@ filterwarnings = [
 # visible to the formatter for the first time, and reformatting it is not this change.
 extend-exclude = '''
 /\.claude/
+|/csrc/gemm_fusion/sp_qkv/large/r17/flydsl_dstmap_gemm\.py
 '''

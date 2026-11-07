@@ -1,0 +1,2874 @@
+{
+  "profile": "minimax_m3_sp4_gfx950_v1",
+  "window_budget": {
+    "window_bytes": 339738624,
+    "max_windows": 61,
+    "small_owners": 15,
+    "large_owners": 10,
+    "small_window_sizes": [
+      8388608,
+      8388608,
+      8388608,
+      4194304,
+      4194304,
+      4194304,
+      4194304,
+      4194304,
+      4194304,
+      4194304,
+      4194304,
+      4194304,
+      4194304,
+      4194304,
+      4194304,
+      4194304,
+      4194304,
+      4194304,
+      4194304,
+      4194304,
+      4194304,
+      4194304,
+      4194304,
+      4194304,
+      4194304,
+      4194304,
+      4194304,
+      4194304,
+      4194304,
+      4194304
+    ],
+    "shared": {
+      "sp_qkv.large/S": 339738624,
+      "sp_qkv.large/R": 339738624,
+      "sp_qkv.large/C": 4194304,
+      "gf.global": 4194304
+    }
+  },
+  "wait_budget_us": 5000000,
+  "m_pad_min_large": 386,
+  "generated_by": {
+    "tool": "aiter.ops.gemm_fusion.sp_qkv.gen_profile",
+    "ledger": "sp4-opus-mori-playground records/branch-ledger.md r165 (small), r152 (large)",
+    "note": "m is local tokens per rank (T/4); exact rows plus P1 large range rules (placeholder params)"
+  },
+  "native_m_ranges": [],
+  "rows": [
+    {
+      "sig": "50b7acf9943802c2",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 1,
+      "vid": "sp_qkv.small.v1",
+      "params": {
+        "src": "r19",
+        "sk": 3,
+        "nh": 1,
+        "no_credit": 1
+      },
+      "cell": "dense_T4",
+      "note": "R13 P2: copy of the mode's m=16 params"
+    },
+    {
+      "sig": "50b7acf9943802c2",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 2,
+      "vid": "sp_qkv.small.v1",
+      "params": {
+        "src": "r19",
+        "sk": 3,
+        "nh": 1,
+        "no_credit": 1
+      },
+      "cell": "dense_T8",
+      "note": "R13 P2: copy of the mode's m=16 params"
+    },
+    {
+      "sig": "50b7acf9943802c2",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 4,
+      "vid": "sp_qkv.small.v1",
+      "params": {
+        "src": "r19",
+        "sk": 3,
+        "nh": 1,
+        "no_credit": 1
+      },
+      "cell": "dense_T16",
+      "note": "R13 P2: copy of the mode's m=16 params"
+    },
+    {
+      "sig": "50b7acf9943802c2",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 8,
+      "vid": "sp_qkv.small.v1",
+      "params": {
+        "src": "r19",
+        "sk": 3,
+        "nh": 1,
+        "no_credit": 1
+      },
+      "cell": "dense_T32",
+      "note": "R13 P2: copy of the mode's m=16 params"
+    },
+    {
+      "sig": "50b7acf9943802c2",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 12,
+      "vid": "sp_qkv.small.v1",
+      "params": {
+        "src": "r19",
+        "sk": 3,
+        "nh": 1,
+        "no_credit": 1
+      },
+      "cell": "dense_T48",
+      "note": "R13 P2: copy of the mode's m=16 params"
+    },
+    {
+      "sig": "50b7acf9943802c2",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 16,
+      "vid": "sp_qkv.small.v1",
+      "params": {
+        "src": "r19",
+        "sk": 3,
+        "nh": 1,
+        "no_credit": 1
+      },
+      "cell": "dense_T64"
+    },
+    {
+      "sig": "50b7acf9943802c2",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 32,
+      "vid": "sp_qkv.small.v1",
+      "params": {
+        "src": "r19",
+        "sk": 3,
+        "nh": 1,
+        "no_credit": 1,
+        "b_rowsplit": 1,
+        "rx_bypass": 1
+      },
+      "cell": "dense_T128"
+    },
+    {
+      "sig": "50b7acf9943802c2",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 64,
+      "vid": "sp_qkv.small.v1",
+      "params": {
+        "src": "r20",
+        "sk": 3,
+        "nh": 1,
+        "no_credit": 1,
+        "rx_bypass": 1
+      },
+      "cell": "dense_T256",
+      "note": "R13 MP64 (src r20)"
+    },
+    {
+      "sig": "50b7acf9943802c2",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 128,
+      "vid": "sp_qkv.small.v1",
+      "params": {
+        "src": "r22",
+        "sk": 3,
+        "nh": 1,
+        "no_credit": 1,
+        "rx_bypass": 1,
+        "b_quad": 1,
+        "gemm_bn128": 0,
+        "rx3": 1,
+        "p_nt": 2,
+        "push_passtrip": 1
+      },
+      "cell": "dense_T512",
+      "note": "R14 MP128 tuned (src r22, nh=1, 4 MiB Rx view)"
+    },
+    {
+      "sig": "50b7acf9943802c2",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 256,
+      "vid": "sp_qkv.small.v1",
+      "params": {
+        "src": "r23",
+        "sk": 3,
+        "nh": 1,
+        "no_credit": 1,
+        "rx_bypass": 1,
+        "b_quad": 1,
+        "rx3": 1,
+        "gemm_bn128": 0,
+        "pfk": 4,
+        "p_nt": 2,
+        "push_passtrip": 1
+      },
+      "cell": "dense_T1024",
+      "note": "R14 MP256 (src r23, nh=1, 8 MiB Rx view)"
+    },
+    {
+      "sig": "9b114a3a8b31ec50",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 1,
+      "vid": "sp_qkv.small.v1",
+      "params": {
+        "src": "r19",
+        "sk": 3,
+        "nh": 1,
+        "no_credit": 1,
+        "push8": 1
+      },
+      "cell": "indexer_T4",
+      "note": "R13 P2: copy of the mode's m=16 params"
+    },
+    {
+      "sig": "9b114a3a8b31ec50",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 2,
+      "vid": "sp_qkv.small.v1",
+      "params": {
+        "src": "r19",
+        "sk": 3,
+        "nh": 1,
+        "no_credit": 1,
+        "push8": 1
+      },
+      "cell": "indexer_T8",
+      "note": "R13 P2: copy of the mode's m=16 params"
+    },
+    {
+      "sig": "9b114a3a8b31ec50",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 4,
+      "vid": "sp_qkv.small.v1",
+      "params": {
+        "src": "r19",
+        "sk": 3,
+        "nh": 1,
+        "no_credit": 1,
+        "push8": 1
+      },
+      "cell": "indexer_T16",
+      "note": "R13 P2: copy of the mode's m=16 params"
+    },
+    {
+      "sig": "9b114a3a8b31ec50",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 8,
+      "vid": "sp_qkv.small.v1",
+      "params": {
+        "src": "r19",
+        "sk": 3,
+        "nh": 1,
+        "no_credit": 1,
+        "push8": 1
+      },
+      "cell": "indexer_T32",
+      "note": "R13 P2: copy of the mode's m=16 params"
+    },
+    {
+      "sig": "9b114a3a8b31ec50",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 12,
+      "vid": "sp_qkv.small.v1",
+      "params": {
+        "src": "r19",
+        "sk": 3,
+        "nh": 1,
+        "no_credit": 1,
+        "push8": 1
+      },
+      "cell": "indexer_T48",
+      "note": "R13 P2: copy of the mode's m=16 params"
+    },
+    {
+      "sig": "9b114a3a8b31ec50",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 16,
+      "vid": "sp_qkv.small.v1",
+      "params": {
+        "src": "r19",
+        "sk": 3,
+        "nh": 1,
+        "no_credit": 1,
+        "push8": 1
+      },
+      "cell": "indexer_T64"
+    },
+    {
+      "sig": "9b114a3a8b31ec50",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 32,
+      "vid": "sp_qkv.small.v1",
+      "params": {
+        "src": "r19",
+        "sk": 3,
+        "nh": 1,
+        "no_credit": 1
+      },
+      "cell": "indexer_T128"
+    },
+    {
+      "sig": "9b114a3a8b31ec50",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 64,
+      "vid": "sp_qkv.small.v1",
+      "params": {
+        "src": "r20",
+        "sk": 3,
+        "nh": 1,
+        "no_credit": 1,
+        "rx_bypass": 1
+      },
+      "cell": "indexer_T256",
+      "note": "R13 MP64 (src r20)"
+    },
+    {
+      "sig": "9b114a3a8b31ec50",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 128,
+      "vid": "sp_qkv.small.v1",
+      "params": {
+        "src": "r22",
+        "sk": 3,
+        "nh": 1,
+        "no_credit": 1,
+        "rx_bypass": 1,
+        "b_quad": 1,
+        "gemm_bn128": 0,
+        "rx3": 1,
+        "p_nt": 2,
+        "push_passtrip": 1
+      },
+      "cell": "indexer_T512",
+      "note": "R14 MP128 tuned (src r22, nh=1, 4 MiB Rx view)"
+    },
+    {
+      "sig": "9b114a3a8b31ec50",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 256,
+      "vid": "sp_qkv.small.v1",
+      "params": {
+        "src": "r23",
+        "sk": 3,
+        "nh": 1,
+        "no_credit": 1,
+        "rx_bypass": 1,
+        "b_quad": 1,
+        "rx3": 1,
+        "gemm_bn128": 0,
+        "pfk": 4,
+        "p_nt": 2,
+        "push_passtrip": 1
+      },
+      "cell": "indexer_T1024",
+      "note": "R14 MP256 (src r23, nh=1, 8 MiB Rx view)"
+    },
+    {
+      "sig": "46e08c40c4ec4374",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 1,
+      "vid": "sp_qkv.small.v1",
+      "params": {
+        "src": "r19",
+        "sk": 3,
+        "nh": 1,
+        "no_credit": 1,
+        "reuse_no_idx": 1
+      },
+      "cell": "reuse_T4",
+      "note": "R13 P2: copy of the mode's m=16 params"
+    },
+    {
+      "sig": "46e08c40c4ec4374",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 2,
+      "vid": "sp_qkv.small.v1",
+      "params": {
+        "src": "r19",
+        "sk": 3,
+        "nh": 1,
+        "no_credit": 1,
+        "reuse_no_idx": 1
+      },
+      "cell": "reuse_T8",
+      "note": "R13 P2: copy of the mode's m=16 params"
+    },
+    {
+      "sig": "46e08c40c4ec4374",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 4,
+      "vid": "sp_qkv.small.v1",
+      "params": {
+        "src": "r19",
+        "sk": 3,
+        "nh": 1,
+        "no_credit": 1,
+        "reuse_no_idx": 1
+      },
+      "cell": "reuse_T16",
+      "note": "R13 P2: copy of the mode's m=16 params"
+    },
+    {
+      "sig": "46e08c40c4ec4374",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 8,
+      "vid": "sp_qkv.small.v1",
+      "params": {
+        "src": "r19",
+        "sk": 3,
+        "nh": 1,
+        "no_credit": 1,
+        "reuse_no_idx": 1
+      },
+      "cell": "reuse_T32",
+      "note": "R13 P2: copy of the mode's m=16 params"
+    },
+    {
+      "sig": "46e08c40c4ec4374",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 12,
+      "vid": "sp_qkv.small.v1",
+      "params": {
+        "src": "r19",
+        "sk": 3,
+        "nh": 1,
+        "no_credit": 1,
+        "reuse_no_idx": 1
+      },
+      "cell": "reuse_T48",
+      "note": "R13 P2: copy of the mode's m=16 params"
+    },
+    {
+      "sig": "46e08c40c4ec4374",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 16,
+      "vid": "sp_qkv.small.v1",
+      "params": {
+        "src": "r19",
+        "sk": 3,
+        "nh": 1,
+        "no_credit": 1,
+        "reuse_no_idx": 1
+      },
+      "cell": "reuse_T64"
+    },
+    {
+      "sig": "46e08c40c4ec4374",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 32,
+      "vid": "sp_qkv.small.v1",
+      "params": {
+        "src": "r19",
+        "sk": 3,
+        "nh": 1,
+        "no_credit": 1,
+        "push_halves": 1
+      },
+      "cell": "reuse_T128"
+    },
+    {
+      "sig": "46e08c40c4ec4374",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 64,
+      "vid": "sp_qkv.small.v1",
+      "params": {
+        "src": "r20",
+        "sk": 3,
+        "nh": 1,
+        "no_credit": 1,
+        "rx_bypass": 1
+      },
+      "cell": "reuse_T256",
+      "note": "R13 MP64 (src r20)"
+    },
+    {
+      "sig": "46e08c40c4ec4374",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 128,
+      "vid": "sp_qkv.small.v1",
+      "params": {
+        "src": "r22",
+        "sk": 3,
+        "nh": 1,
+        "no_credit": 1,
+        "rx_bypass": 1,
+        "b_quad": 1,
+        "gemm_bn128": 0,
+        "rx3": 1,
+        "p_nt": 2,
+        "push_passtrip": 1
+      },
+      "cell": "reuse_T512",
+      "note": "R14 MP128 tuned (src r22, nh=1, 4 MiB Rx view)"
+    },
+    {
+      "sig": "46e08c40c4ec4374",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 256,
+      "vid": "sp_qkv.small.v1",
+      "params": {
+        "src": "r23",
+        "sk": 3,
+        "nh": 1,
+        "no_credit": 1,
+        "rx_bypass": 1,
+        "b_quad": 1,
+        "rx3": 1,
+        "gemm_bn128": 0,
+        "pfk": 4,
+        "p_nt": 2,
+        "push_passtrip": 1
+      },
+      "cell": "reuse_T1024",
+      "note": "R14 MP256 (src r23, nh=1, 8 MiB Rx view)"
+    },
+    {
+      "sig": "15f0490f0df1d837",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 1024,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "dense_T4096",
+      "pad_min": 769
+    },
+    {
+      "sig": "15f0490f0df1d837",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 1280,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "dense_T5120"
+    },
+    {
+      "sig": "15f0490f0df1d837",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 1536,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 2,
+        "half_first": 1,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "dense_T6144"
+    },
+    {
+      "sig": "15f0490f0df1d837",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 1792,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "dense_T7168"
+    },
+    {
+      "sig": "15f0490f0df1d837",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 2048,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 3,
+        "half_first": 2,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "dense_T8192"
+    },
+    {
+      "sig": "15f0490f0df1d837",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 2304,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "dense_T9216"
+    },
+    {
+      "sig": "15f0490f0df1d837",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 2560,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 2,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "dense_T10240"
+    },
+    {
+      "sig": "15f0490f0df1d837",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 2816,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "dense_T11264"
+    },
+    {
+      "sig": "15f0490f0df1d837",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 3072,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 4,
+        "half_first": 1,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "dense_T12288"
+    },
+    {
+      "sig": "15f0490f0df1d837",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 3328,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "dense_T13312"
+    },
+    {
+      "sig": "15f0490f0df1d837",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 3584,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 2,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "dense_T14336"
+    },
+    {
+      "sig": "15f0490f0df1d837",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 3840,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "dense_T15360"
+    },
+    {
+      "sig": "15f0490f0df1d837",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 4096,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 4,
+        "half_first": 1,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "dense_T16384",
+      "note": "P1 sweep best; replaces the r11-era tuned (n=2, half_first=0)"
+    },
+    {
+      "sig": "15f0490f0df1d837",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 4352,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "dense_T17408"
+    },
+    {
+      "sig": "15f0490f0df1d837",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 4608,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 2,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "dense_T18432"
+    },
+    {
+      "sig": "15f0490f0df1d837",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 4864,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "dense_T19456"
+    },
+    {
+      "sig": "15f0490f0df1d837",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 5120,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 4,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "dense_T20480"
+    },
+    {
+      "sig": "15f0490f0df1d837",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 5376,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "dense_T21504"
+    },
+    {
+      "sig": "15f0490f0df1d837",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 5632,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 2,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "dense_T22528"
+    },
+    {
+      "sig": "15f0490f0df1d837",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 5888,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "dense_T23552"
+    },
+    {
+      "sig": "15f0490f0df1d837",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 6144,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 4,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "dense_T24576"
+    },
+    {
+      "sig": "15f0490f0df1d837",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 6400,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "dense_T25600"
+    },
+    {
+      "sig": "15f0490f0df1d837",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 6656,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 2,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "dense_T26624"
+    },
+    {
+      "sig": "15f0490f0df1d837",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 6912,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "dense_T27648"
+    },
+    {
+      "sig": "15f0490f0df1d837",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 7168,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 4,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "dense_T28672"
+    },
+    {
+      "sig": "15f0490f0df1d837",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 7424,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "dense_T29696"
+    },
+    {
+      "sig": "15f0490f0df1d837",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 7680,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 2,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "dense_T30720"
+    },
+    {
+      "sig": "15f0490f0df1d837",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 7936,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "dense_T31744"
+    },
+    {
+      "sig": "15f0490f0df1d837",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 8192,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 4,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "dense_T32768"
+    },
+    {
+      "sig": "15f0490f0df1d837",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 9216,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 4,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r19"
+      },
+      "cell": "dense_T36864",
+      "note": "ROUTE A extended band (src r19): measured Gate-3 winner (n=4, half_first=0); m 9216..9216 exact, the gaps below pad into this row"
+    },
+    {
+      "sig": "15f0490f0df1d837",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 10240,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 4,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r19"
+      },
+      "cell": "dense_T40960",
+      "note": "ROUTE A extended band (src r19): measured Gate-3 winner (n=4, half_first=0); m 10240..10240 exact, the gaps below pad into this row"
+    },
+    {
+      "sig": "15f0490f0df1d837",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 11264,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 4,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r19"
+      },
+      "cell": "dense_T45056",
+      "note": "ROUTE A extended band (src r19): measured Gate-3 winner (n=4, half_first=0); m 11264..11264 exact, the gaps below pad into this row"
+    },
+    {
+      "sig": "15f0490f0df1d837",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 12288,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 4,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r19"
+      },
+      "cell": "dense_T49152",
+      "note": "ROUTE A extended band (src r19): measured Gate-3 winner (n=4, half_first=0); m 12288..12288 exact, the gaps below pad into this row"
+    },
+    {
+      "sig": "15f0490f0df1d837",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 13312,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 4,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r19"
+      },
+      "cell": "dense_T53248",
+      "note": "ROUTE A extended band (src r19): measured Gate-3 winner (n=4, half_first=0); m 13312..13312 exact, the gaps below pad into this row"
+    },
+    {
+      "sig": "15f0490f0df1d837",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 14336,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 4,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r19"
+      },
+      "cell": "dense_T57344",
+      "note": "ROUTE A extended band (src r19): measured Gate-3 winner (n=4, half_first=0); m 14336..14336 exact, the gaps below pad into this row"
+    },
+    {
+      "sig": "15f0490f0df1d837",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 15360,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 4,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r19"
+      },
+      "cell": "dense_T61440",
+      "note": "ROUTE A extended band (src r19): measured Gate-3 winner (n=4, half_first=0); m 15360..15360 exact, the gaps below pad into this row"
+    },
+    {
+      "sig": "15f0490f0df1d837",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 16384,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 4,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r19"
+      },
+      "cell": "dense_T65536",
+      "note": "ROUTE A extended band (src r19): measured Gate-3 winner (n=4, half_first=0); m 16384..16384 exact, the gaps below pad into this row"
+    },
+    {
+      "sig": "15f0490f0df1d837",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 512,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r18"
+      },
+      "cell": "dense_T2048",
+      "pad_min": 386,
+      "note": "R16 pad-M bucket below the P1 grid (not swept): n=1, half_first=0 = the best at the smallest swept cells; real m 386..512 pad into it (r18 route B floors: FlyDSL dst-map GEMM + put kernel + quiet_ready)"
+    },
+    {
+      "sig": "15f0490f0df1d837",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 768,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r18"
+      },
+      "cell": "dense_T3072",
+      "pad_min": 513,
+      "note": "R16 pad-M bucket below the P1 grid (not swept): n=1, half_first=0 = the best at the smallest swept cells; real m 513..768 pad into it (r18 route B floors: FlyDSL dst-map GEMM + put kernel + quiet_ready)"
+    },
+    {
+      "sig": "0fd134d47bb1534f",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 1024,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "indexer_T4096",
+      "pad_min": 769
+    },
+    {
+      "sig": "0fd134d47bb1534f",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 1280,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "indexer_T5120"
+    },
+    {
+      "sig": "0fd134d47bb1534f",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 1536,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 2,
+        "half_first": 1,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "indexer_T6144"
+    },
+    {
+      "sig": "0fd134d47bb1534f",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 1792,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "indexer_T7168"
+    },
+    {
+      "sig": "0fd134d47bb1534f",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 2048,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 2,
+        "half_first": 1,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "indexer_T8192"
+    },
+    {
+      "sig": "0fd134d47bb1534f",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 2304,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "indexer_T9216"
+    },
+    {
+      "sig": "0fd134d47bb1534f",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 2560,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 2,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "indexer_T10240"
+    },
+    {
+      "sig": "0fd134d47bb1534f",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 2816,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "indexer_T11264"
+    },
+    {
+      "sig": "0fd134d47bb1534f",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 3072,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 4,
+        "half_first": 1,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "indexer_T12288"
+    },
+    {
+      "sig": "0fd134d47bb1534f",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 3328,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "indexer_T13312"
+    },
+    {
+      "sig": "0fd134d47bb1534f",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 3584,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 2,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "indexer_T14336"
+    },
+    {
+      "sig": "0fd134d47bb1534f",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 3840,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "indexer_T15360"
+    },
+    {
+      "sig": "0fd134d47bb1534f",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 4096,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 4,
+        "half_first": 1,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "indexer_T16384",
+      "note": "P1 sweep best; replaces the r11-era tuned (n=4, half_first=0)"
+    },
+    {
+      "sig": "0fd134d47bb1534f",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 4352,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "indexer_T17408"
+    },
+    {
+      "sig": "0fd134d47bb1534f",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 4608,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 2,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "indexer_T18432"
+    },
+    {
+      "sig": "0fd134d47bb1534f",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 4864,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "indexer_T19456"
+    },
+    {
+      "sig": "0fd134d47bb1534f",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 5120,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 4,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "indexer_T20480"
+    },
+    {
+      "sig": "0fd134d47bb1534f",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 5376,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "indexer_T21504"
+    },
+    {
+      "sig": "0fd134d47bb1534f",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 5632,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 2,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "indexer_T22528"
+    },
+    {
+      "sig": "0fd134d47bb1534f",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 5888,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "indexer_T23552"
+    },
+    {
+      "sig": "0fd134d47bb1534f",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 6144,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 4,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "indexer_T24576"
+    },
+    {
+      "sig": "0fd134d47bb1534f",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 6400,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "indexer_T25600"
+    },
+    {
+      "sig": "0fd134d47bb1534f",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 6656,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 2,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "indexer_T26624"
+    },
+    {
+      "sig": "0fd134d47bb1534f",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 6912,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "indexer_T27648"
+    },
+    {
+      "sig": "0fd134d47bb1534f",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 7168,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 4,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "indexer_T28672"
+    },
+    {
+      "sig": "0fd134d47bb1534f",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 7424,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "indexer_T29696"
+    },
+    {
+      "sig": "0fd134d47bb1534f",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 7680,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 2,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "indexer_T30720"
+    },
+    {
+      "sig": "0fd134d47bb1534f",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 7936,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "indexer_T31744"
+    },
+    {
+      "sig": "0fd134d47bb1534f",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 8192,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 4,
+        "half_first": 1,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "indexer_T32768",
+      "note": "P1 sweep best; replaces the r11-era tuned (n=4, half_first=0)"
+    },
+    {
+      "sig": "0fd134d47bb1534f",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 9216,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 4,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r19"
+      },
+      "cell": "indexer_T36864",
+      "note": "ROUTE A extended band (src r19): measured Gate-3 winner (n=4, half_first=0); m 9216..9216 exact, the gaps below pad into this row"
+    },
+    {
+      "sig": "0fd134d47bb1534f",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 10240,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 4,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r19"
+      },
+      "cell": "indexer_T40960",
+      "note": "ROUTE A extended band (src r19): measured Gate-3 winner (n=4, half_first=0); m 10240..10240 exact, the gaps below pad into this row"
+    },
+    {
+      "sig": "0fd134d47bb1534f",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 11264,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 4,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r19"
+      },
+      "cell": "indexer_T45056",
+      "note": "ROUTE A extended band (src r19): measured Gate-3 winner (n=4, half_first=0); m 11264..11264 exact, the gaps below pad into this row"
+    },
+    {
+      "sig": "0fd134d47bb1534f",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 12288,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 4,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r19"
+      },
+      "cell": "indexer_T49152",
+      "note": "ROUTE A extended band (src r19): measured Gate-3 winner (n=4, half_first=0); m 12288..12288 exact, the gaps below pad into this row"
+    },
+    {
+      "sig": "0fd134d47bb1534f",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 13312,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 4,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r19"
+      },
+      "cell": "indexer_T53248",
+      "note": "ROUTE A extended band (src r19): measured Gate-3 winner (n=4, half_first=0); m 13312..13312 exact, the gaps below pad into this row"
+    },
+    {
+      "sig": "0fd134d47bb1534f",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 14336,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 4,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r19"
+      },
+      "cell": "indexer_T57344",
+      "note": "ROUTE A extended band (src r19): measured Gate-3 winner (n=4, half_first=0); m 14336..14336 exact, the gaps below pad into this row"
+    },
+    {
+      "sig": "0fd134d47bb1534f",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 15360,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 4,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r19"
+      },
+      "cell": "indexer_T61440",
+      "note": "ROUTE A extended band (src r19): measured Gate-3 winner (n=4, half_first=0); m 15360..15360 exact, the gaps below pad into this row"
+    },
+    {
+      "sig": "0fd134d47bb1534f",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 16384,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 4,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r19"
+      },
+      "cell": "indexer_T65536",
+      "note": "ROUTE A extended band (src r19): measured Gate-3 winner (n=4, half_first=0); m 16384..16384 exact, the gaps below pad into this row"
+    },
+    {
+      "sig": "0fd134d47bb1534f",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 512,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r18"
+      },
+      "cell": "indexer_T2048",
+      "pad_min": 386,
+      "note": "R16 pad-M bucket below the P1 grid (not swept): n=1, half_first=0 = the best at the smallest swept cells; real m 386..512 pad into it (r18 route B floors: FlyDSL dst-map GEMM + put kernel + quiet_ready)"
+    },
+    {
+      "sig": "0fd134d47bb1534f",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 768,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r18"
+      },
+      "cell": "indexer_T3072",
+      "pad_min": 513,
+      "note": "R16 pad-M bucket below the P1 grid (not swept): n=1, half_first=0 = the best at the smallest swept cells; real m 513..768 pad into it (r18 route B floors: FlyDSL dst-map GEMM + put kernel + quiet_ready)"
+    },
+    {
+      "sig": "1f5973865d6bcd73",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 1024,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "reuse_T4096",
+      "pad_min": 769
+    },
+    {
+      "sig": "1f5973865d6bcd73",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 1280,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "reuse_T5120"
+    },
+    {
+      "sig": "1f5973865d6bcd73",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 1536,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 2,
+        "half_first": 1,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "reuse_T6144"
+    },
+    {
+      "sig": "1f5973865d6bcd73",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 1792,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "reuse_T7168"
+    },
+    {
+      "sig": "1f5973865d6bcd73",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 2048,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 2,
+        "half_first": 1,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "reuse_T8192"
+    },
+    {
+      "sig": "1f5973865d6bcd73",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 2304,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "reuse_T9216"
+    },
+    {
+      "sig": "1f5973865d6bcd73",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 2560,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 2,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "reuse_T10240"
+    },
+    {
+      "sig": "1f5973865d6bcd73",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 2816,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "reuse_T11264"
+    },
+    {
+      "sig": "1f5973865d6bcd73",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 3072,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 4,
+        "half_first": 1,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "reuse_T12288"
+    },
+    {
+      "sig": "1f5973865d6bcd73",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 3328,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "reuse_T13312"
+    },
+    {
+      "sig": "1f5973865d6bcd73",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 3584,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 2,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "reuse_T14336"
+    },
+    {
+      "sig": "1f5973865d6bcd73",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 3840,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "reuse_T15360"
+    },
+    {
+      "sig": "1f5973865d6bcd73",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 4096,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 4,
+        "half_first": 1,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "reuse_T16384",
+      "note": "P1 sweep best; replaces the r11-era tuned (n=4, half_first=0)"
+    },
+    {
+      "sig": "1f5973865d6bcd73",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 4352,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "reuse_T17408"
+    },
+    {
+      "sig": "1f5973865d6bcd73",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 4608,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 2,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "reuse_T18432"
+    },
+    {
+      "sig": "1f5973865d6bcd73",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 4864,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "reuse_T19456"
+    },
+    {
+      "sig": "1f5973865d6bcd73",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 5120,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 4,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "reuse_T20480"
+    },
+    {
+      "sig": "1f5973865d6bcd73",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 5376,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "reuse_T21504"
+    },
+    {
+      "sig": "1f5973865d6bcd73",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 5632,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 2,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "reuse_T22528"
+    },
+    {
+      "sig": "1f5973865d6bcd73",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 5888,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "reuse_T23552"
+    },
+    {
+      "sig": "1f5973865d6bcd73",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 6144,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 4,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "reuse_T24576"
+    },
+    {
+      "sig": "1f5973865d6bcd73",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 6400,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "reuse_T25600"
+    },
+    {
+      "sig": "1f5973865d6bcd73",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 6656,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 2,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "reuse_T26624"
+    },
+    {
+      "sig": "1f5973865d6bcd73",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 6912,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "reuse_T27648"
+    },
+    {
+      "sig": "1f5973865d6bcd73",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 7168,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 4,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "reuse_T28672"
+    },
+    {
+      "sig": "1f5973865d6bcd73",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 7424,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "reuse_T29696"
+    },
+    {
+      "sig": "1f5973865d6bcd73",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 7680,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 2,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "reuse_T30720"
+    },
+    {
+      "sig": "1f5973865d6bcd73",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 7936,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "reuse_T31744"
+    },
+    {
+      "sig": "1f5973865d6bcd73",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 8192,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 4,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "cell": "reuse_T32768"
+    },
+    {
+      "sig": "1f5973865d6bcd73",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 9216,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 4,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r19"
+      },
+      "cell": "reuse_T36864",
+      "note": "ROUTE A extended band (src r19): measured Gate-3 winner (n=4, half_first=0); m 9216..9216 exact, the gaps below pad into this row"
+    },
+    {
+      "sig": "1f5973865d6bcd73",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 10240,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 4,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r19"
+      },
+      "cell": "reuse_T40960",
+      "note": "ROUTE A extended band (src r19): measured Gate-3 winner (n=4, half_first=0); m 10240..10240 exact, the gaps below pad into this row"
+    },
+    {
+      "sig": "1f5973865d6bcd73",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 11264,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 4,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r19"
+      },
+      "cell": "reuse_T45056",
+      "note": "ROUTE A extended band (src r19): measured Gate-3 winner (n=4, half_first=0); m 11264..11264 exact, the gaps below pad into this row"
+    },
+    {
+      "sig": "1f5973865d6bcd73",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 12288,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 4,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r19"
+      },
+      "cell": "reuse_T49152",
+      "note": "ROUTE A extended band (src r19): measured Gate-3 winner (n=4, half_first=0); m 12288..12288 exact, the gaps below pad into this row"
+    },
+    {
+      "sig": "1f5973865d6bcd73",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 13312,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 4,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r19"
+      },
+      "cell": "reuse_T53248",
+      "note": "ROUTE A extended band (src r19): measured Gate-3 winner (n=4, half_first=0); m 13312..13312 exact, the gaps below pad into this row"
+    },
+    {
+      "sig": "1f5973865d6bcd73",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 14336,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 4,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r19"
+      },
+      "cell": "reuse_T57344",
+      "note": "ROUTE A extended band (src r19): measured Gate-3 winner (n=4, half_first=0); m 14336..14336 exact, the gaps below pad into this row"
+    },
+    {
+      "sig": "1f5973865d6bcd73",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 15360,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 4,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r19"
+      },
+      "cell": "reuse_T61440",
+      "note": "ROUTE A extended band (src r19): measured Gate-3 winner (n=4, half_first=0); m 15360..15360 exact, the gaps below pad into this row"
+    },
+    {
+      "sig": "1f5973865d6bcd73",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 16384,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 4,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r19"
+      },
+      "cell": "reuse_T65536",
+      "note": "ROUTE A extended band (src r19): measured Gate-3 winner (n=4, half_first=0); m 16384..16384 exact, the gaps below pad into this row"
+    },
+    {
+      "sig": "1f5973865d6bcd73",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 512,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r18"
+      },
+      "cell": "reuse_T2048",
+      "pad_min": 386,
+      "note": "R16 pad-M bucket below the P1 grid (not swept): n=1, half_first=0 = the best at the smallest swept cells; real m 386..512 pad into it (r18 route B floors: FlyDSL dst-map GEMM + put kernel + quiet_ready)"
+    },
+    {
+      "sig": "1f5973865d6bcd73",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 768,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r18"
+      },
+      "cell": "reuse_T3072",
+      "pad_min": 513,
+      "note": "R16 pad-M bucket below the P1 grid (not swept): n=1, half_first=0 = the best at the smallest swept cells; real m 513..768 pad into it (r18 route B floors: FlyDSL dst-map GEMM + put kernel + quiet_ready)"
+    }
+  ],
+  "rules": [
+    {
+      "sig": "50b7acf9943802c2",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m_min": 1,
+      "m_max": 16,
+      "m_multiple": 1,
+      "vid": "sp_qkv.small.v1",
+      "params": {
+        "src": "r19",
+        "sk": 3,
+        "nh": 1,
+        "no_credit": 1
+      },
+      "name": "dense_r19_m1-16",
+      "note": "copy of the mode's m=16 params (r19); exact rows win at m 1, 2, 4, 8, 12, 16"
+    },
+    {
+      "sig": "50b7acf9943802c2",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m_min": 17,
+      "m_max": 32,
+      "m_multiple": 1,
+      "vid": "sp_qkv.small.v1",
+      "params": {
+        "src": "r19",
+        "sk": 3,
+        "nh": 1,
+        "no_credit": 1,
+        "b_rowsplit": 1,
+        "rx_bypass": 1
+      },
+      "name": "dense_r19_m17-32",
+      "note": "copy of the mode's m=32 params (r19); exact row wins at m=32"
+    },
+    {
+      "sig": "50b7acf9943802c2",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m_min": 33,
+      "m_max": 64,
+      "m_multiple": 1,
+      "vid": "sp_qkv.small.v1",
+      "params": {
+        "src": "r20",
+        "sk": 3,
+        "nh": 1,
+        "no_credit": 1,
+        "rx_bypass": 1
+      },
+      "name": "dense_mp64_m33-64",
+      "note": "R13 MP64 (src r20), any padded T = 4 m in 132..256; m=64 (T=256, the default capture bucket) is an exact row"
+    },
+    {
+      "sig": "50b7acf9943802c2",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m_min": 65,
+      "m_max": 128,
+      "m_multiple": 1,
+      "vid": "sp_qkv.small.v1",
+      "params": {
+        "src": "r22",
+        "sk": 3,
+        "nh": 1,
+        "no_credit": 1,
+        "rx_bypass": 1,
+        "b_quad": 1,
+        "gemm_bn128": 0,
+        "rx3": 1,
+        "p_nt": 2,
+        "push_passtrip": 1
+      },
+      "name": "dense_mp128_m65-128",
+      "note": "R14 MP128 tuned (src r22, nh=1, 4 MiB Rx view), any padded T = 4 m in 260..512; m=128 (T=512, the default capture bucket) is an exact row"
+    },
+    {
+      "sig": "50b7acf9943802c2",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m_min": 129,
+      "m_max": 255,
+      "m_multiple": 1,
+      "vid": "sp_qkv.small.v1",
+      "params": {
+        "src": "r23",
+        "sk": 3,
+        "nh": 1,
+        "no_credit": 1,
+        "rx_bypass": 1,
+        "b_quad": 1,
+        "rx3": 1,
+        "gemm_bn128": 0,
+        "pfk": 4,
+        "p_nt": 2,
+        "push_passtrip": 1
+      },
+      "name": "dense_mp256_m129-255",
+      "note": "R14 MP256 (src r23, nh=1, 8 MiB Rx view, 3 slots), any padded T = 4 m in 516..1020"
+    },
+    {
+      "sig": "9b114a3a8b31ec50",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m_min": 1,
+      "m_max": 16,
+      "m_multiple": 1,
+      "vid": "sp_qkv.small.v1",
+      "params": {
+        "src": "r19",
+        "sk": 3,
+        "nh": 1,
+        "no_credit": 1,
+        "push8": 1
+      },
+      "name": "indexer_r19_m1-16",
+      "note": "copy of the mode's m=16 params (r19); exact rows win at m 1, 2, 4, 8, 12, 16"
+    },
+    {
+      "sig": "9b114a3a8b31ec50",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m_min": 17,
+      "m_max": 32,
+      "m_multiple": 1,
+      "vid": "sp_qkv.small.v1",
+      "params": {
+        "src": "r19",
+        "sk": 3,
+        "nh": 1,
+        "no_credit": 1
+      },
+      "name": "indexer_r19_m17-32",
+      "note": "copy of the mode's m=32 params (r19); exact row wins at m=32"
+    },
+    {
+      "sig": "9b114a3a8b31ec50",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m_min": 33,
+      "m_max": 64,
+      "m_multiple": 1,
+      "vid": "sp_qkv.small.v1",
+      "params": {
+        "src": "r20",
+        "sk": 3,
+        "nh": 1,
+        "no_credit": 1,
+        "rx_bypass": 1
+      },
+      "name": "indexer_mp64_m33-64",
+      "note": "R13 MP64 (src r20), any padded T = 4 m in 132..256; m=64 (T=256, the default capture bucket) is an exact row"
+    },
+    {
+      "sig": "9b114a3a8b31ec50",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m_min": 65,
+      "m_max": 128,
+      "m_multiple": 1,
+      "vid": "sp_qkv.small.v1",
+      "params": {
+        "src": "r22",
+        "sk": 3,
+        "nh": 1,
+        "no_credit": 1,
+        "rx_bypass": 1,
+        "b_quad": 1,
+        "gemm_bn128": 0,
+        "rx3": 1,
+        "p_nt": 2,
+        "push_passtrip": 1
+      },
+      "name": "indexer_mp128_m65-128",
+      "note": "R14 MP128 tuned (src r22, nh=1, 4 MiB Rx view), any padded T = 4 m in 260..512; m=128 (T=512, the default capture bucket) is an exact row"
+    },
+    {
+      "sig": "9b114a3a8b31ec50",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m_min": 129,
+      "m_max": 255,
+      "m_multiple": 1,
+      "vid": "sp_qkv.small.v1",
+      "params": {
+        "src": "r23",
+        "sk": 3,
+        "nh": 1,
+        "no_credit": 1,
+        "rx_bypass": 1,
+        "b_quad": 1,
+        "rx3": 1,
+        "gemm_bn128": 0,
+        "pfk": 4,
+        "p_nt": 2,
+        "push_passtrip": 1
+      },
+      "name": "indexer_mp256_m129-255",
+      "note": "R14 MP256 (src r23, nh=1, 8 MiB Rx view, 3 slots), any padded T = 4 m in 516..1020"
+    },
+    {
+      "sig": "46e08c40c4ec4374",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m_min": 1,
+      "m_max": 16,
+      "m_multiple": 1,
+      "vid": "sp_qkv.small.v1",
+      "params": {
+        "src": "r19",
+        "sk": 3,
+        "nh": 1,
+        "no_credit": 1,
+        "reuse_no_idx": 1
+      },
+      "name": "reuse_r19_m1-16",
+      "note": "copy of the mode's m=16 params (r19); exact rows win at m 1, 2, 4, 8, 12, 16"
+    },
+    {
+      "sig": "46e08c40c4ec4374",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m_min": 17,
+      "m_max": 32,
+      "m_multiple": 1,
+      "vid": "sp_qkv.small.v1",
+      "params": {
+        "src": "r19",
+        "sk": 3,
+        "nh": 1,
+        "no_credit": 1,
+        "push_halves": 1
+      },
+      "name": "reuse_r19_m17-32",
+      "note": "copy of the mode's m=32 params (r19); exact row wins at m=32"
+    },
+    {
+      "sig": "46e08c40c4ec4374",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m_min": 33,
+      "m_max": 64,
+      "m_multiple": 1,
+      "vid": "sp_qkv.small.v1",
+      "params": {
+        "src": "r20",
+        "sk": 3,
+        "nh": 1,
+        "no_credit": 1,
+        "rx_bypass": 1
+      },
+      "name": "reuse_mp64_m33-64",
+      "note": "R13 MP64 (src r20), any padded T = 4 m in 132..256; m=64 (T=256, the default capture bucket) is an exact row"
+    },
+    {
+      "sig": "46e08c40c4ec4374",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m_min": 65,
+      "m_max": 128,
+      "m_multiple": 1,
+      "vid": "sp_qkv.small.v1",
+      "params": {
+        "src": "r22",
+        "sk": 3,
+        "nh": 1,
+        "no_credit": 1,
+        "rx_bypass": 1,
+        "b_quad": 1,
+        "gemm_bn128": 0,
+        "rx3": 1,
+        "p_nt": 2,
+        "push_passtrip": 1
+      },
+      "name": "reuse_mp128_m65-128",
+      "note": "R14 MP128 tuned (src r22, nh=1, 4 MiB Rx view), any padded T = 4 m in 260..512; m=128 (T=512, the default capture bucket) is an exact row"
+    },
+    {
+      "sig": "46e08c40c4ec4374",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m_min": 129,
+      "m_max": 255,
+      "m_multiple": 1,
+      "vid": "sp_qkv.small.v1",
+      "params": {
+        "src": "r23",
+        "sk": 3,
+        "nh": 1,
+        "no_credit": 1,
+        "rx_bypass": 1,
+        "b_quad": 1,
+        "rx3": 1,
+        "gemm_bn128": 0,
+        "pfk": 4,
+        "p_nt": 2,
+        "push_passtrip": 1
+      },
+      "name": "reuse_mp256_m129-255",
+      "note": "R14 MP256 (src r23, nh=1, 8 MiB Rx view, 3 slots), any padded T = 4 m in 516..1020"
+    },
+    {
+      "sig": "15f0490f0df1d837",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m_min": 512,
+      "m_max": 8192,
+      "m_multiple": 256,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "name": "dense_chunks_mod4_x256",
+      "note": "fallback default (chunks mod 4 classes, half_first 0); shadowed by the 87 exact P1 rows on the sweep grid"
+    },
+    {
+      "sig": "15f0490f0df1d837",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m_min": 512,
+      "m_max": 8192,
+      "m_multiple": 512,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 2,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "name": "dense_chunks_mod4_x512",
+      "note": "fallback default (chunks mod 4 classes, half_first 0); shadowed by the 87 exact P1 rows on the sweep grid"
+    },
+    {
+      "sig": "15f0490f0df1d837",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m_min": 512,
+      "m_max": 8192,
+      "m_multiple": 1024,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 4,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "name": "dense_chunks_mod4_x1024",
+      "note": "fallback default (chunks mod 4 classes, half_first 0); shadowed by the 87 exact P1 rows on the sweep grid"
+    },
+    {
+      "sig": "0fd134d47bb1534f",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m_min": 512,
+      "m_max": 8192,
+      "m_multiple": 256,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "name": "indexer_chunks_mod4_x256",
+      "note": "fallback default (chunks mod 4 classes, half_first 0); shadowed by the 87 exact P1 rows on the sweep grid"
+    },
+    {
+      "sig": "0fd134d47bb1534f",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m_min": 512,
+      "m_max": 8192,
+      "m_multiple": 512,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 2,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "name": "indexer_chunks_mod4_x512",
+      "note": "fallback default (chunks mod 4 classes, half_first 0); shadowed by the 87 exact P1 rows on the sweep grid"
+    },
+    {
+      "sig": "0fd134d47bb1534f",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m_min": 512,
+      "m_max": 8192,
+      "m_multiple": 1024,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 4,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "name": "indexer_chunks_mod4_x1024",
+      "note": "fallback default (chunks mod 4 classes, half_first 0); shadowed by the 87 exact P1 rows on the sweep grid"
+    },
+    {
+      "sig": "1f5973865d6bcd73",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m_min": 512,
+      "m_max": 8192,
+      "m_multiple": 256,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 1,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "name": "reuse_chunks_mod4_x256",
+      "note": "fallback default (chunks mod 4 classes, half_first 0); shadowed by the 87 exact P1 rows on the sweep grid"
+    },
+    {
+      "sig": "1f5973865d6bcd73",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m_min": 512,
+      "m_max": 8192,
+      "m_multiple": 512,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 2,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "name": "reuse_chunks_mod4_x512",
+      "note": "fallback default (chunks mod 4 classes, half_first 0); shadowed by the 87 exact P1 rows on the sweep grid"
+    },
+    {
+      "sig": "1f5973865d6bcd73",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m_min": 512,
+      "m_max": 8192,
+      "m_multiple": 1024,
+      "vid": "sp_qkv.large.v1",
+      "params": {
+        "n": 4,
+        "half_first": 0,
+        "no_gridread": 1,
+        "src": "r13"
+      },
+      "name": "reuse_chunks_mod4_x1024",
+      "note": "fallback default (chunks mod 4 classes, half_first 0); shadowed by the 87 exact P1 rows on the sweep grid"
+    }
+  ],
+  "extended_large": {
+    "src": "r19",
+    "m_min": 9216,
+    "m_max": 16384,
+    "grid_stride": 1024,
+    "measured": "Gate-3 sweep (48/48 points, commit 63c2429c): every bucket keeps n=4, half_first=0"
+  }
+}
