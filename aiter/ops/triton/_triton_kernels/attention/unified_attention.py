@@ -52,6 +52,124 @@ def find_seq_idx(
     return left - 1
 
 
+# LENGTH_AWARE_SPLIT: a sequence gets seq_len // cdiv(sum(seq_len), split_budget)
+# segments, clamped to [1, NUM_SEGMENTS_PER_SEQ] and read on the GPU (CUDA-graph safe).
+# When ITEM_RUN is a multiple of the XCD count, all KV heads of an item share one L2.
+
+
+@triton.jit
+def batch_segment_tokens(lens, seq_lens_ptr, num_seqs, split_budget, SEQ_BLOCK):
+    """segment_tokens for the batch; lens holds the first SEQ_BLOCK lengths.
+
+    int32 is enough: the launcher keeps num_seqs * max_seqlen_k + split_budget
+    below 2**31.
+    """
+    total = tl.sum(lens)
+    for s0 in range(SEQ_BLOCK, num_seqs, SEQ_BLOCK):
+        total += tl.sum(load_seq_lens(seq_lens_ptr, num_seqs, s0, SEQ_BLOCK))
+    return tl.maximum(cdiv_fn(total, split_budget), 1)
+
+
+@triton.jit
+def seq_num_segments(seq_len, segment_tokens, NUM_SEGMENTS_PER_SEQ):
+    return tl.minimum(tl.maximum(seq_len // segment_tokens, 1), NUM_SEGMENTS_PER_SEQ)
+
+
+@triton.jit
+def load_seq_lens(seq_lens_ptr, num_seqs, s0, SEQ_BLOCK: tl.constexpr):
+    offs = s0 + tl.arange(0, SEQ_BLOCK)
+    # callers pass int32 or int64 lengths; the split math runs in int32
+    return tl.load(seq_lens_ptr + offs, mask=offs < num_seqs, other=0).to(tl.int32)
+
+
+@triton.jit
+def find_work_item(
+    item,
+    seq_lens_ptr,
+    num_seqs,
+    split_budget,
+    NUM_SEGMENTS_PER_SEQ: tl.constexpr,
+    SEQ_BLOCK: tl.constexpr,
+):
+    """Map a flat work item to (sequence, segment, its KV length, segment_tokens).
+
+    The sequence index is num_seqs for an item past the batch's last segment.
+    """
+    lens = load_seq_lens(seq_lens_ptr, num_seqs, 0, SEQ_BLOCK)
+    segment_tokens = batch_segment_tokens(
+        lens, seq_lens_ptr, num_seqs, split_budget, SEQ_BLOCK
+    )
+    # one reduction per chunk: [sequences before | items before] in the high
+    # word (both below 2**16 for the batches the launcher admits), the owning
+    # sequence's KV length in the low word
+    found = tl.zeros([], dtype=tl.int64)
+    items = 0
+    for s0 in range(0, num_seqs, SEQ_BLOCK):
+        if s0 > 0:
+            lens = load_seq_lens(seq_lens_ptr, num_seqs, s0, SEQ_BLOCK)
+        valid = s0 + tl.arange(0, SEQ_BLOCK) < num_seqs
+        segs = seq_num_segments(lens, segment_tokens, NUM_SEGMENTS_PER_SEQ)
+        segs = tl.where(valid, segs, 0)
+        end = items + tl.cumsum(segs, 0)
+        # an empty lane past num_seqs is not a sequence before the item
+        before = (end <= item) & valid
+        owner = (end > item) & (end - segs <= item) & valid
+        word = tl.where(before, (segs + 65536).to(tl.int64) << 32, 0)
+        found += tl.sum(word + tl.where(owner, lens, 0).to(tl.int64))
+        if s0 + SEQ_BLOCK < num_seqs:
+            items += tl.sum(segs)
+    high = (found >> 32).to(tl.int32)
+    return high >> 16, item - (high & 65535), found.to(tl.int32), segment_tokens
+
+
+@triton.jit
+def key_prefix_len(
+    context_len,
+    q_block_local_idx,
+    seq_len,
+    BLOCK_Q,
+    BLOCK_M: tl.constexpr,
+    num_queries_per_kv,
+    CAUSAL: tl.constexpr,
+):
+    """Keys the query block can see: the causal prefix of its last query token
+    (capped by seq_len for a padded block), or all keys when not causal."""
+    if CAUSAL:
+        prefix_len = tl.minimum(
+            context_len
+            + q_block_local_idx * BLOCK_Q
+            + (BLOCK_M - 1) // num_queries_per_kv
+            + 1,
+            seq_len,
+        )
+    else:
+        prefix_len = seq_len
+    return prefix_len
+
+
+@triton.jit
+def key_unmasked_len(
+    context_len, q_block_local_idx, seq_len, BLOCK_Q, CAUSAL: tl.constexpr
+):
+    """Keys every query token of the query block sees: the causal prefix of its
+    first query token, or all keys when not causal."""
+    if CAUSAL:
+        unmasked_len = context_len + q_block_local_idx * BLOCK_Q + 1
+    else:
+        unmasked_len = seq_len
+    return unmasked_len
+
+
+@triton.jit
+def key_mask(seq_offset, context_len, query_pos, seq_len, CAUSAL: tl.constexpr):
+    """[query, key] mask of the keys each query token sees."""
+    if CAUSAL:
+        mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1
+    else:
+        mask = seq_offset[None, :] < seq_len
+    return mask
+
+
 @triton.jit
 def split_window_tiles(seq_len, query_len, TILE_SIZE, SLIDING_WINDOW: tl.constexpr):
     """First tile and tile count a sliding-window split carves for one sequence.
@@ -86,6 +204,7 @@ _kernel_unified_attention_2d_repr = make_kernel_repr(
         "SHUFFLED_KV_CACHE",
         "SPLIT_UNMASKED_LOOP",
         "K_WIDTH",
+        "CAUSAL",
     ],
 )
 
@@ -144,6 +263,7 @@ def kernel_unified_attention_2d(
     SHUFFLED_KV_CACHE: tl.constexpr = False,  # bool
     SPLIT_UNMASKED_LOOP: tl.constexpr = False,  # bool
     K_WIDTH: tl.constexpr = 0,  # int
+    CAUSAL: tl.constexpr = True,  # bool
 ):
     # SPLIT_UNMASKED_LOOP does not support SHUFFLED_KV_CACHE or SLIDING_WINDOW.
     tl.static_assert(
@@ -153,6 +273,11 @@ def kernel_unified_attention_2d(
     tl.static_assert(
         not (SPLIT_UNMASKED_LOOP and SLIDING_WINDOW > 0),
         "SPLIT_UNMASKED_LOOP does not support sliding-window attention",
+    )
+    # the launcher rejects a window for non-causal calls; keep -O from skipping it
+    tl.static_assert(
+        CAUSAL or SLIDING_WINDOW <= 0,
+        "non-causal attention does not support a sliding window",
     )
 
     kv_head_idx = tl.program_id(0)
@@ -261,22 +386,17 @@ def kernel_unified_attention_2d(
             qq_bias_ptr + query_pos[:, None] * qq_bias_stride_0
         )  # shape: [BLOCK_M]
 
-    # compute the length of the longest sequence prefix spanned by any
-    # query token in the current q_block (q_block_local_idx)
-    max_seq_prefix_len = (
-        context_len
-        + q_block_local_idx * BLOCK_Q
-        + (BLOCK_M - 1) // num_queries_per_kv
-        + 1
+    max_seq_prefix_len = key_prefix_len(
+        context_len,
+        q_block_local_idx,
+        seq_len,
+        BLOCK_Q,
+        BLOCK_M,
+        num_queries_per_kv,
+        CAUSAL,
     )
 
-    # adjust for potential padding in the last q_block by considering the
-    # actual sequence length
-    max_seq_prefix_len = tl.minimum(max_seq_prefix_len, seq_len)
-
-    # calculate the number of tiles that need to be processed to
-    # cover the longest sequence prefix (due to causal masking, tiles beyond
-    # this prefix can be skipped)
+    # the tiles that cover that prefix; causal masking skips the tiles past it
     num_tiles = cdiv_fn(max_seq_prefix_len, TILE_SIZE)
 
     # ---- Sliding-window tile pruning --------------------
@@ -316,7 +436,9 @@ def kernel_unified_attention_2d(
 
     masked_tile_start = tile_start
     if SPLIT_UNMASKED_LOOP:
-        min_query_key_limit = context_len + q_block_local_idx * BLOCK_Q + 1
+        min_query_key_limit = key_unmasked_len(
+            context_len, q_block_local_idx, seq_len, BLOCK_Q, CAUSAL
+        )
         unmasked_tile_end = tl.minimum(min_query_key_limit // TILE_SIZE, tile_end)
         unmasked_tile_end = tl.maximum(unmasked_tile_end, tile_start)
 
@@ -482,7 +604,7 @@ def kernel_unified_attention_2d(
             # softcap here uses exp2 and consumes RCP_LN2 conversion.
             # multiply by RCP_LN2 again to be used in later exp2
             S = apply_softcap(S, softcap) * RCP_LN2
-        seq_mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1
+        seq_mask = key_mask(seq_offset, context_len, query_pos, seq_len, CAUSAL)
 
         S = tl.where(
             query_mask_1[:, None] & query_mask_0[:, None] & seq_mask, S, float("-inf")
@@ -583,6 +705,10 @@ kernel_unified_attention_3d_repr = make_kernel_repr(
         "SHUFFLED_KV_CACHE",
         "IS_Q_FP8",
         "IS_KV_FP8",
+        "LENGTH_AWARE_SPLIT",
+        "SEQ_BLOCK",
+        "ITEM_RUN",
+        "CAUSAL",
     ],
 )
 
@@ -645,7 +771,19 @@ def kernel_unified_attention_3d(
     K_WIDTH: tl.constexpr = 0,  # int
     IS_Q_FP8: tl.constexpr = False,  # bool
     IS_KV_FP8: tl.constexpr = False,  # bool
+    split_budget=1,  # int, segments per KV head the batch shares (LENGTH_AWARE_SPLIT)
+    LENGTH_AWARE_SPLIT: tl.constexpr = False,  # bool, grid axis 0 = work items x heads
+    SEQ_BLOCK: tl.constexpr = 0,  # int, seq_lens read per step (LENGTH_AWARE_SPLIT)
+    ITEM_RUN: tl.constexpr = 1,  # int, work items per KV head in a row (LENGTH_AWARE_SPLIT)
+    num_tokens=1,  # int, query tokens: the partials' slot stride (LENGTH_AWARE_SPLIT)
+    CAUSAL: tl.constexpr = True,  # bool
 ):
+    # the launcher rejects a window for non-causal calls; keep -O from skipping it
+    tl.static_assert(
+        CAUSAL or SLIDING_WINDOW <= 0,
+        "non-causal attention does not support a sliding window",
+    )
+
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
     segm_idx = tl.program_id(2)
@@ -654,7 +792,31 @@ def kernel_unified_attention_3d(
     RCP_LN2 = 1.4426950408889634
     qk_scale = scale * RCP_LN2
 
-    if ALL_DECODE:
+    if LENGTH_AWARE_SPLIT:
+        # one q block per sequence; axis 0 enumerates (work item, KV head) pairs
+        NUM_KV_HEADS: tl.constexpr = num_query_heads // num_queries_per_kv
+        kv_head_idx = (q_block_global_idx // ITEM_RUN) % NUM_KV_HEADS
+        item = (q_block_global_idx // (ITEM_RUN * NUM_KV_HEADS)) * ITEM_RUN + (
+            q_block_global_idx % ITEM_RUN
+        )
+        seq_idx, segm_idx, seq_len, segment_tokens = find_work_item(
+            item, seq_lens_ptr, num_seqs, split_budget, NUM_SEGMENTS_PER_SEQ, SEQ_BLOCK
+        )
+        if seq_idx >= num_seqs:
+            return
+        q_block_local_idx: tl.int32 = 0
+        if ALL_DECODE:
+            cur_batch_query_len: tl.int32 = 1
+            cur_batch_in_all_start_index = seq_idx
+        else:
+            cur_batch_in_all_start_index = tl.load(query_start_len_ptr + seq_idx)
+            cur_batch_query_len = (
+                tl.load(query_start_len_ptr + seq_idx + 1)
+                - cur_batch_in_all_start_index
+            )
+            if cur_batch_query_len == 0:
+                return
+    elif ALL_DECODE:
         seq_idx = q_block_global_idx
         q_block_local_idx: tl.int32 = 0
         cur_batch_query_len: tl.int32 = 1
@@ -677,10 +839,14 @@ def kernel_unified_attention_3d(
             return
 
     # sequence len for this particular sequence
-    seq_len = tl.load(seq_lens_ptr + seq_idx)
+    if not LENGTH_AWARE_SPLIT:
+        seq_len = tl.load(seq_lens_ptr + seq_idx)
 
     # number of segments for this particular sequence
-    num_segments = NUM_SEGMENTS_PER_SEQ
+    if LENGTH_AWARE_SPLIT:
+        num_segments = seq_num_segments(seq_len, segment_tokens, NUM_SEGMENTS_PER_SEQ)
+    else:
+        num_segments = NUM_SEGMENTS_PER_SEQ
     if SLIDING_WINDOW > 0:
         tile_lo, window_tiles = split_window_tiles(
             seq_len, cur_batch_query_len, TILE_SIZE, SLIDING_WINDOW
@@ -770,22 +936,17 @@ def kernel_unified_attention_3d(
             qq_bias_ptr + query_pos[:, None] * qq_bias_stride_0
         )  # shape: [BLOCK_M]
 
-    # compute the length of the longest sequence prefix spanned by any
-    # query token in the current q_block (q_block_local_idx)
-    max_seq_prefix_len = (
-        context_len
-        + q_block_local_idx * BLOCK_Q
-        + (BLOCK_M - 1) // num_queries_per_kv
-        + 1
+    max_seq_prefix_len = key_prefix_len(
+        context_len,
+        q_block_local_idx,
+        seq_len,
+        BLOCK_Q,
+        BLOCK_M,
+        num_queries_per_kv,
+        CAUSAL,
     )
 
-    # adjust for potential padding in the last q_block by considering the
-    # actual sequence length
-    max_seq_prefix_len = tl.minimum(max_seq_prefix_len, seq_len)
-
-    # calculate the number of tiles that need to be processed to
-    # cover the longest sequence prefix (due to causal masking, tiles beyond
-    # this prefix can be skipped)
+    # the tiles that cover that prefix; causal masking skips the tiles past it
     num_tiles = cdiv_fn(max_seq_prefix_len, TILE_SIZE)
 
     KV_cache_modifier: tl.constexpr = ".cg" if ALL_DECODE else ""
@@ -900,7 +1061,7 @@ def kernel_unified_attention_3d(
                 .reshape(TILE_SIZE, HEAD_SIZE_PADDED)
             )
 
-        seq_mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1
+        seq_mask = key_mask(seq_offset, context_len, query_pos, seq_len, CAUSAL)
 
         # S : (BLOCK_M, TILE_SIZE)
         # qk_scale = scale * RCP_LN2 (log_2 e) so that we can use exp2 later
@@ -972,24 +1133,35 @@ def kernel_unified_attention_3d(
         one_over_L = 1.0 / L[:, None]
         acc = acc * one_over_L
 
-    segm_output_offset = (
-        query_offset_0[:, None].to(tl.int64)
-        * (num_query_heads * NUM_SEGMENTS_PER_SEQ * V_HEAD_SIZE_PADDED)
-        + query_offset_1[:, None] * (NUM_SEGMENTS_PER_SEQ * V_HEAD_SIZE_PADDED)
-        + segm_idx * V_HEAD_SIZE_PADDED
-        + offs_vd[None, :]
-    )
+    if LENGTH_AWARE_SPLIT:
+        # slot-major partials [segment, token, head]: the slots a batch uses fill
+        # one dense region instead of the head of every token's slot block
+        segm_offset = (
+            segm_idx.to(tl.int64) * num_tokens + query_offset_0
+        ) * num_query_heads + query_offset_1
+        segm_output_offset = (
+            segm_offset[:, None] * V_HEAD_SIZE_PADDED + offs_vd[None, :]
+        )
+    else:
+        segm_output_offset = (
+            query_offset_0[:, None].to(tl.int64)
+            * (num_query_heads * NUM_SEGMENTS_PER_SEQ * V_HEAD_SIZE_PADDED)
+            + query_offset_1[:, None] * (NUM_SEGMENTS_PER_SEQ * V_HEAD_SIZE_PADDED)
+            + segm_idx * V_HEAD_SIZE_PADDED
+            + offs_vd[None, :]
+        )
     tl.store(
         segm_output_ptr + segm_output_offset,
         acc,
         mask=v_dim_mask[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
     )
     if NUM_SEGMENTS_PER_SEQ > 1:
-        segm_offset = (
-            query_offset_0.to(tl.int64) * (num_query_heads * NUM_SEGMENTS_PER_SEQ)
-            + query_offset_1 * NUM_SEGMENTS_PER_SEQ
-            + segm_idx
-        )
+        if not LENGTH_AWARE_SPLIT:
+            segm_offset = (
+                query_offset_0.to(tl.int64) * (num_query_heads * NUM_SEGMENTS_PER_SEQ)
+                + query_offset_1 * NUM_SEGMENTS_PER_SEQ
+                + segm_idx
+            )
         tl.store(segm_max_ptr + segm_offset, M, mask=query_mask_0 & query_mask_1)
         tl.store(segm_expsum_ptr + segm_offset, L, mask=query_mask_0 & query_mask_1)
 
@@ -1004,6 +1176,9 @@ _reduce_segments_repr = make_kernel_repr(
         "NUM_SEGMENTS_PER_SEQ",
         "SEGMENT_BLOCK",
         "BLOCK_D",
+        "LENGTH_AWARE_SPLIT",
+        "SEQ_BLOCK",
+        "LENGTH_AWARE_SEGMENT_BLOCK",
     ],
 )
 
@@ -1034,6 +1209,11 @@ def reduce_segments(
     FP8_MAX: tl.constexpr = float8_info.max,
     SEGMENT_BLOCK: tl.constexpr = 0,  # segments per merge step, 0 = all at once
     BLOCK_D: tl.constexpr = 0,  # head-dim slice per program (grid axis 2), 0 = all
+    split_budget=1,  # int, as passed to kernel_unified_attention_3d
+    LENGTH_AWARE_SPLIT: tl.constexpr = False,  # bool, see seq_num_segments
+    SEQ_BLOCK: tl.constexpr = 0,  # int, seq_lens read per step (LENGTH_AWARE_SPLIT)
+    LENGTH_AWARE_SEGMENT_BLOCK: tl.constexpr = 0,  # int, used slots merged per step
+    num_tokens=1,  # int, as passed to kernel_unified_attention_3d
     SLIDING_WINDOW: tl.constexpr = 0,  # int, the producer's; carves its window
 ):
     query_token_idx = tl.program_id(0)
@@ -1043,6 +1223,16 @@ def reduce_segments(
     if out_scale_ptr is not None:
         out_scale = 1 / tl.load(out_scale_ptr)
 
+    if LENGTH_AWARE_SPLIT:
+        # independent of this program's sequence: issue it first
+        segment_tokens = batch_segment_tokens(
+            load_seq_lens(seq_lens_ptr, num_seqs, 0, SEQ_BLOCK),
+            seq_lens_ptr,
+            num_seqs,
+            split_budget,
+            SEQ_BLOCK,
+        )
+
     seq_idx = find_seq_idx(
         query_start_len_ptr, query_token_idx, num_seqs, BLOCK_Q, False
     )
@@ -1051,7 +1241,10 @@ def reduce_segments(
     seq_len = tl.load(seq_lens_ptr + seq_idx)
 
     # number of segments for this particular sequence
-    num_segments = NUM_SEGMENTS_PER_SEQ
+    if LENGTH_AWARE_SPLIT:
+        num_segments = seq_num_segments(seq_len, segment_tokens, NUM_SEGMENTS_PER_SEQ)
+    else:
+        num_segments = NUM_SEGMENTS_PER_SEQ
     if SLIDING_WINDOW > 0:
         query_len = tl.load(query_start_len_ptr + seq_idx + 1) - tl.load(
             query_start_len_ptr + seq_idx
@@ -1063,13 +1256,14 @@ def reduce_segments(
         # create masks for subsequent loads
         act_num_segments = cdiv_fn(window_tiles, tiles_per_segment)
     else:
-        tiles_per_segment = cdiv_fn(seq_len, num_segments * TILE_SIZE)
+        # at least 1: a zero-length sequence has no tiles, and then merges no segment
+        tiles_per_segment = tl.maximum(cdiv_fn(seq_len, num_segments * TILE_SIZE), 1)
         # create masks for subsequent loads
         act_num_segments = cdiv_fn(seq_len, tiles_per_segment * TILE_SIZE)
     single_tile: tl.constexpr = (
         SEGMENT_BLOCK == 0 or SEGMENT_BLOCK >= NUM_SEGMENTS_PER_SEQ
     )
-    if single_tile:
+    if single_tile and not LENGTH_AWARE_SPLIT:
         segm_mask = tl.arange(0, NUM_SEGMENTS_PER_SEQ) < tl.full(
             [NUM_SEGMENTS_PER_SEQ], act_num_segments, dtype=tl.int32
         )
@@ -1087,7 +1281,41 @@ def reduce_segments(
     else:
         v_dim_mask = tl.full((1,), 1, dtype=tl.int1)
 
-    if single_tile:
+    if LENGTH_AWARE_SPLIT:
+        # slot-major partials (see kernel_unified_attention_3d), merged a block of
+        # used slots at a time, so the cost follows the split, not the slot count
+        segm_row = query_token_idx.to(tl.int64) * num_query_heads + query_head_idx
+        offs_s = tl.arange(0, LENGTH_AWARE_SEGMENT_BLOCK)
+        # the 3D kernel writes at most NUM_SEGMENTS_PER_SEQ slots
+        act_num_segments = tl.minimum(act_num_segments, NUM_SEGMENTS_PER_SEQ)
+        overall_max = float("-inf")
+        overall_expsum = 0.0
+        acc_sum = tl.zeros([D_TILE], dtype=tl.float32)
+        for s0 in range(0, act_num_segments, LENGTH_AWARE_SEGMENT_BLOCK):
+            segs = s0 + offs_s
+            segm_mask = segs < act_num_segments
+            segm_offset = segs.to(tl.int64) * num_tokens * num_query_heads + segm_row
+            segm_max = tl.load(
+                segm_max_ptr + segm_offset, mask=segm_mask, other=float("-inf")
+            )
+            segm_expsum = tl.load(
+                segm_expsum_ptr + segm_offset, mask=segm_mask, other=0.0
+            )
+            segm_output = tl.load(
+                segm_output_ptr
+                + segm_offset[:, None] * V_HEAD_SIZE_PADDED
+                + offs_vd[None, :],
+                mask=segm_mask[:, None] & v_dim_mask[None, :],
+                other=0.0,
+            )
+            block_max = tl.maximum(overall_max, tl.max(segm_max))
+            block_max = tl.where(block_max > float("-inf"), block_max, 0.0)
+            rescale = tl.math.exp2(overall_max - block_max)
+            weight = tl.math.exp2(segm_max - block_max)
+            overall_expsum = overall_expsum * rescale + tl.sum(segm_expsum * weight)
+            acc_sum = acc_sum * rescale + tl.sum(segm_output * weight[:, None], axis=0)
+            overall_max = block_max
+    elif single_tile:
         # load segment maxima
         segm_offset = (
             query_token_idx.to(tl.int64) * (num_query_heads * NUM_SEGMENTS_PER_SEQ)
