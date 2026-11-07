@@ -111,8 +111,9 @@ def _build(
     QUADS = wave // 4  # groups per slice
     ROWS_WG = W * R
     SHARED_CS = H > 0 and H % R == 0
-    WORDS = R * NG // 4  # scale dwords per wave
-    assert WORDS <= wave
+    ROW_WORDS = NG // 4  # scale dwords per row
+    WORDS = R * ROW_WORDS  # scale dwords per wave
+    assert NG % 4 == 0 and WORDS <= wave
     ROT_LANES = RD // 8  # lanes per row in the in-place rotation
     assert wave % ROT_LANES == 0
     ROT_ROWS_WG = W * (wave // ROT_LANES)
@@ -395,10 +396,13 @@ def _build(
             # The wave's R rows of codes, one dword a lane, in one store. LDS
             # ops of a wave retire in order, so no barrier is needed.
             word = fx.Int32(lds_load_b32(lds_idx, wave_lds + tid * 4)[0])
-            rel = fx.min(row0 + wv * R + (tid >> 2), last) - row0
+            rel = fx.min(row0 + wv * R + tid // ROW_WORDS, last) - row0
             if tid < WORDS:
                 buffer_ops.buffer_store(
-                    word, sc_rsrc, rel * NG + (tid & 3) * 4, offset_is_bytes=True
+                    word,
+                    sc_rsrc,
+                    rel * NG + (tid % ROW_WORDS) * 4,
+                    offset_is_bytes=True,
                 )
 
         def emit_query_tdm():
@@ -726,9 +730,12 @@ def _dummy_tensor(device):
 
 @cache
 def _arch():
-    from aiter.jit.utils.chip_info import get_gfx
+    from aiter.jit.utils.chip_info import get_gfx_runtime
 
-    return get_gfx()
+    arch = get_gfx_runtime()
+    if arch not in ("gfx950", "gfx1250"):
+        raise RuntimeError(f"rope_quant_window is unsupported on {arch}")
+    return arch
 
 
 def rope_quant_window(
@@ -758,6 +765,8 @@ def rope_quant_window(
     kv_half = ring is not None or qat is not None or values is not None
     if tokens == 0 or (heads == 0 and not kv_half):
         return
+    if heads > 0 and not query.is_contiguous():
+        raise ValueError("rope_quant_window needs a contiguous query")
     arch = _arch()
     wave = 32 if arch == "gfx1250" else 64
     pk8 = arch == "gfx1250"
@@ -768,12 +777,7 @@ def rope_quant_window(
         else QUERY_FP8 if query_fp8 is not None else QUERY_ROTATE
     )
     rows = tokens * heads
-    tdm = (
-        pk8
-        and query_mode == QUERY_FP8
-        and rows >= TDM_MIN_ROWS
-        and query.is_contiguous()
-    )
+    tdm = pk8 and query_mode == QUERY_FP8 and rows >= TDM_MIN_ROWS
     if tdm:
         K, CT, W = TDM_DENSE if rows >= TDM_DENSE_ROWS else TDM_SPARSE
         R = 1

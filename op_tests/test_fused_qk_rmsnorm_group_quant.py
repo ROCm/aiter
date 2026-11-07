@@ -14,7 +14,7 @@ from aiter.ops.fused_qk_rmsnorm_group_quant import fused_qk_rmsnorm_group_quant
 from aiter.ops.triton.quant.fused_fp8_quant import fused_rms_fp8_group_quant
 from aiter.ops.triton.quant.fused_mxfp4_quant import fused_rms_mxfp4_quant
 from aiter.ops.triton.quant.fused_mxfp8_quant import fused_dual_rmsnorm_mxfp8_quant
-from aiter.test_common import benchmark, checkAllclose, perftest
+from aiter.test_common import assertAllclose, benchmark, checkAllclose, perftest
 from aiter.utility import fp4_utils
 
 MI308_BW_MAX_TBPS = 5.3
@@ -859,14 +859,14 @@ def test_fused_qk_rmsnorm_mxfp8(
     for name, yq_r, sq_r in (("torch", yq_ref, sq_ref), ("triton", yq_tri, sq_tri)):
         # An amax on a rounding boundary may move its e8m0 code by one; the fp8 values are
         # compared where the codes agree, within one e4m3 step (1/8 relative, 2^-9 subnormal).
-        checkAllclose(
+        assertAllclose(
             sq_r.float(),
             sq_hip.float(),
             rtol=0,
             atol=1,
             msg=f"check q scale {name} vs hip, {info}",
         )
-        checkAllclose(
+        assertAllclose(
             yq_r.float(),
             yq_hip.float(),
             rtol=0.13,
@@ -874,10 +874,10 @@ def test_fused_qk_rmsnorm_mxfp8(
             mask=(sq_r == sq_hip).repeat_interleave(32, dim=1),
             msg=f"check q {name} vs hip, {info}",
         )
-    checkAllclose(
+    assertAllclose(
         yk_ref, yk_hip, rtol=0.02, atol=0.02, msg=f"check k torch vs hip, {info}"
     )
-    checkAllclose(
+    assertAllclose(
         yk_tri, yk_hip, rtol=0.02, atol=0.02, msg=f"check k triton vs hip, {info}"
     )
     mismatch = (

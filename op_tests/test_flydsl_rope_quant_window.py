@@ -104,9 +104,10 @@ if __name__ == "__main__":
     parser.add_argument("--mode", type=str, nargs="*", default=MODES, choices=MODES)
     args = parser.parse_args()
     if aiter.get_gfx() not in ("gfx950", "gfx1250"):
-        raise SystemExit(
-            f"rope_quant_window needs gfx950 / gfx1250, not {aiter.get_gfx()}"
+        aiter.logger.warning(
+            "rope_quant_window unsupported on %s; skipping", aiter.get_gfx()
         )
+        raise SystemExit(0)
     random.seed(1)
     torch.manual_seed(1)
 

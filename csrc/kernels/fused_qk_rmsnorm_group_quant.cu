@@ -48,7 +48,7 @@ struct KvRopeQuantArgs
     uint8_t* pool_scale = nullptr; // e8m0 plane [rows, n / 32] beside the fp8 data plane
     int64_t values_stride = 0;
     int64_t scales_stride = 0;
-    int64_t pool_stride = 0; // row strides in elements
+    int64_t pool_stride = 0; // row strides in bytes
     int64_t pool_scale_stride = 0;
     int64_t ring_start = 0;
     int64_t slot_rows = 0;
@@ -125,6 +125,13 @@ struct KvRopePrefetch
     int64_t ring_row;
     bool rope;
 };
+
+// A ring row's byte offset in a plane. The host bounds the rows and the stride to 31 bits, so
+// this is one 32 x 32 -> 64 multiply, not a 64-bit one.
+__device__ __forceinline__ uint64_t kv_ring_offset(int64_t row, int64_t stride)
+{
+    return static_cast<uint64_t>(static_cast<uint32_t>(row)) * static_cast<uint32_t>(stride);
+}
 
 template <int TDS>
 __device__ __forceinline__ KvRopePrefetch<TDS> kv_rope_prefetch(
@@ -288,18 +295,17 @@ __device__ __forceinline__ uint32_t kv_rope_quant_row(const opus::vector_t<float
     }
     if(p.ring_row >= 0)
     {
+        uint8_t* data = static_cast<uint8_t*>(a.pool) + kv_ring_offset(p.ring_row, a.pool_stride);
         if(a.pool_scale != nullptr)
         {
-            *reinterpret_cast<opus::vector_t<uint8_t, TDS>*>(
-                static_cast<uint8_t*>(a.pool) + p.ring_row * a.pool_stride + col) = q8;
+            *reinterpret_cast<opus::vector_t<uint8_t, TDS>*>(data + col) = q8;
             if(code_lane)
-                a.pool_scale[p.ring_row * a.pool_scale_stride + col / 32] =
+                a.pool_scale[kv_ring_offset(p.ring_row, a.pool_scale_stride) + col / 32] =
                     static_cast<uint8_t>(code);
         }
         else
         {
-            *reinterpret_cast<opus::vector_t<uint16_t, TDS>*>(
-                static_cast<uint16_t*>(a.pool) + p.ring_row * a.pool_stride + col) = dequant();
+            *reinterpret_cast<opus::vector_t<uint16_t, TDS>*>(data + col * 2) = dequant();
         }
     }
     return code;
@@ -521,8 +527,9 @@ __device__ __forceinline__ void mx_quant_store(const opus::vector_t<float, kMxV>
             if((chunk0 + c) * CH < n)
                 mx_fp8_store(o_buf, f[c], (chunk0 + c) * CH + lane * kMxV, inv, code);
         }
+        // C may round the row's chunks up; a padding chunk's dwords would land in the next row.
         const uint32_t out = mx_gather_codes<C>(packed);
-        if(lane < C * D)
+        if(lane < C * D && (chunk0 * D + lane) * 128 < n)
             reinterpret_cast<uint32_t*>(scale_row)[chunk0 * D + lane] = out;
         return;
     }
@@ -570,7 +577,7 @@ __device__ __forceinline__ void mx_k_store(const opus::vector_t<float, kMxV> (&f
         }
         if(a.pool_scale != nullptr && pre[0].ring_row >= 0)
         {
-            uint8_t* p = a.pool_scale + pre[0].ring_row * a.pool_scale_stride;
+            uint8_t* p = a.pool_scale + kv_ring_offset(pre[0].ring_row, a.pool_scale_stride);
             gather = gather && (reinterpret_cast<uintptr_t>(p) & 3) == 0;
             ring_dw = reinterpret_cast<uint32_t*>(p);
         }
@@ -593,7 +600,7 @@ __device__ __forceinline__ void mx_k_store(const opus::vector_t<float, kMxV> (&f
         if(gather && (scale_dw != nullptr || ring_dw != nullptr))
         {
             const uint32_t out = mx_gather_codes<C>(packed);
-            if(lane < C * D)
+            if(lane < C * D && (chunk0 * D + lane) * 128 < n)
             {
                 if(scale_dw != nullptr)
                     scale_dw[chunk0 * D + lane] = out;
@@ -2163,6 +2170,9 @@ void fused_qk_rmsnorm_mxfp8_kv_rope_quant(aiter_tensor_t& q_out,
     auto is_index = [](const aiter_tensor_t& t) {
         return t.dtype() == AITER_DTYPE_i32 || t.dtype() == AITER_DTYPE_i64;
     };
+    AITER_CHECK(rope_dim > 0 && rope_dim % 16 == 0 && rope_dim <= n,
+                __func__,
+                " rope_dim must be a positive multiple of 16, at most kv width");
     for(const aiter_tensor_t* t : {&cos, &sin})
     {
         AITER_CHECK(t->is_gpu() && t->dtype() == AITER_DTYPE_bf16 && t->is_contiguous() &&
@@ -2258,7 +2268,11 @@ void fused_qk_rmsnorm_mxfp8_kv_rope_quant(aiter_tensor_t& q_out,
                         " batch_ids / cu_seqlens_q / slots must be int32/int64");
         }
         a.pool = p.data_ptr();
-        a.pool_stride = p.stride(0);
+        a.pool_stride = p.stride(0) * static_cast<int64_t>(p.element_size());
+        AITER_CHECK(p.size(0) <= INT32_MAX && a.pool_stride <= INT32_MAX &&
+                        a.pool_scale_stride <= INT32_MAX,
+                    __func__,
+                    " ring pool rows and row strides must fit in 31 bits");
         a.batches = batch_ids.value().data_ptr();
         a.cu = cu_seqlens_q.value().data_ptr();
         a.slots = slots.value().data_ptr();

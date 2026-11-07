@@ -77,21 +77,29 @@ def test_fused_qk_rmsnorm_mxfp8_kv_rope_quant(mode, tokens, idx64, n1=1536):
     torch.cuda.synchronize()
 
     tag = f"{mode} T={tokens} idx64={idx64}"
-    checkAllclose(yk_t, kv_out, rtol=0.02, atol=0.02, msg=f"{tag} kv_out vs triton")
-    # An amax on a rounding boundary may move its e8m0 code by one; the fp8 values are
-    # compared where the codes agree, within one e4m3 step.
-    checkAllclose(
-        sq_t.float(), sq.float(), rtol=0, atol=1, msg=f"{tag} q scale vs triton"
-    )
-    checkAllclose(
-        yq_t.float(),
-        yq.float(),
-        rtol=0.13,
-        atol=2**-9,
-        mask=(sq_t == sq).repeat_interleave(32, dim=1),
-        msg=f"{tag} q vs triton",
+    ratios = [
+        checkAllclose(
+            yk_t, kv_out, rtol=0.02, atol=0.02, msg=f"{tag} kv_out vs triton"
+        ),
+        # An amax on a rounding boundary may move its e8m0 code by one; the fp8 values
+        # are compared where the codes agree, within one e4m3 step.
+        checkAllclose(
+            sq_t.float(), sq.float(), rtol=0, atol=1, msg=f"{tag} q scale vs triton"
+        ),
+    ]
+    ratios.append(
+        checkAllclose(
+            yq_t.float(),
+            yq.float(),
+            rtol=0.13,
+            atol=2**-9,
+            mask=(sq_t == sq).repeat_interleave(32, dim=1),
+            msg=f"{tag} q vs triton",
+        )
     )
     bad = byte_diff(ref, got)
+    if max(ratios) > 0.05:
+        bad["vs triton"] = max(ratios)
     result = f"\033[31mbytes differ {bad}\033[0m" if bad else "byte exact"
     aiter.logger.info(
         "[result] %s | %.2f us | kv sinks vs reference: %s", tag, us, result
@@ -127,6 +135,13 @@ def test_packed_ring_rejected(n1=1536):
 
 
 if __name__ == "__main__":
+    # The reference and the triton baseline are OCP e4m3fn, as gfx950 / gfx1250 emit.
+    if aiter.get_gfx() not in ("gfx950", "gfx1250"):
+        aiter.logger.warning(
+            "fused_qk_rmsnorm_mxfp8_kv_rope_quant unsupported on %s; skipping",
+            aiter.get_gfx(),
+        )
+        raise SystemExit(0)
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter, description=__doc__
     )

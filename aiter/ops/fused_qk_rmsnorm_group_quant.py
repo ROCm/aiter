@@ -127,6 +127,10 @@ def fused_qk_rmsnorm_mxfp8_kv_rope_quant(
     Returns `(q_out, q_out_scale)`.
     """
     m, kq = q.shape
+    if not (0 < rope_dim <= kv.shape[-1] and rope_dim % 16 == 0):
+        raise ValueError(
+            f"rope_dim must be a positive multiple of 16, at most kv width; got {rope_dim}"
+        )
     if q_out is None:
         q_out = q.new_empty((m, kq), dtype=dtypes.fp8)
     if q_out_scale is None:
