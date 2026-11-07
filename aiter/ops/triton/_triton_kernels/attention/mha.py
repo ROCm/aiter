@@ -16,6 +16,7 @@ from aiter.ops.triton._triton_kernels.common.pid_preprocessing import (
 )
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
+from aiter.ops.triton.utils.types import get_fp8_dtypes
 
 
 @triton.jit
@@ -959,6 +960,16 @@ def _get_config(
         return fwd_cfg["pe"]
     elif enable_dropout or dtype == torch.float32:
         return fwd_cfg["dropout_or_fp32"]
+    elif (
+        head_dim_v is not None
+        and head_dim_v >= 256
+        and dtype in get_fp8_dtypes()
+        and "fp8_large_head" in fwd_cfg
+    ):
+        # FP8 at large head dims needs num_warps=8 at the 128x64 tile; "default"
+        # pairs that tile with num_warps=4 and measured ~2.4x slower than the
+        # CK path this config replaces (108-config sweep, two MI325X hosts).
+        return fwd_cfg["fp8_large_head"]
     elif head_dim_v is not None and 16 < head_dim_v <= 64 and "small_head" in fwd_cfg:
         # Mid-small V head dims (16 < d <= 64) hit a num_stages=1 software-pipelining
         # pathology on this backend (e.g. ~3x slower at d64). Using num_stages=3
