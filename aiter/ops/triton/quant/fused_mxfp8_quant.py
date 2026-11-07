@@ -718,6 +718,7 @@ def _launch_two_stage_sparse_attn_compressor(
     block_size: int,
     state_width: int,
     compress_ratio: int,
+    overlap: bool,
     cos_sin_cache: torch.Tensor,
     kv_cache: torch.Tensor,
     kv_slot_mapping: torch.Tensor,
@@ -749,6 +750,7 @@ def _launch_two_stage_sparse_attn_compressor(
         HEAD_SIZE=head_dim,
         STATE_WIDTH=state_width,
         COMPRESS_RATIO=compress_ratio,
+        OVERLAP=overlap,
         NUM_SPLITS=num_splits,
         HEAD_TILE=head_tile,
     )
@@ -806,11 +808,11 @@ def fused_deepseek_v4_compress_norm_rope_store_two_stage(
     num_decode_tokens: int,
     compress_scratch: torch.Tensor,
 ) -> None:
-    """Two-stage split compressor dispatch for head=512 cr>=128 (no-overlap)
+    """Two-stage split compressor dispatch for head=512 cr>=128
 
     Run the occupancy-fanned two-stage split for prefill [num_decodee_tokens:]
     to fill the CUs, and use the original single-pass launcher
-    for decode [0, num_decode_tokens)
+    for decode [0, num_decode_tokens). Both halves honour ``overlap``.
     """
     num_decodes = min(max(num_decode_tokens, 0), num_actual)
     num_prefills = num_actual - num_decodes
@@ -824,6 +826,7 @@ def fused_deepseek_v4_compress_norm_rope_store_two_stage(
             block_size=block_size,
             state_width=state_width,
             compress_ratio=compress_ratio,
+            overlap=overlap,
             cos_sin_cache=cos_sin_cache,
             kv_cache=kv_cache,
             kv_slot_mapping=k_cache_metadata.slot_mapping[num_decodes:],
