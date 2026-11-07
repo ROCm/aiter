@@ -129,6 +129,7 @@ def _gemm_a16wfp4_kernel(
         offs_ks = (pid_k * (SPLITK_BLOCK_SIZE // SCALE_GROUP_SIZE)) + tl.arange(
             0, BLOCK_SIZE_K // SCALE_GROUP_SIZE
         )
+        offs_ks_local = tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_SIZE)
         # B scales are N x K even though B operand is K x N.
         b_scale_ptrs = (
             b_scales_ptr + offs_bn[:, None] * stride_bsn + offs_ks[None, :] * stride_bsk
@@ -137,7 +138,16 @@ def _gemm_a16wfp4_kernel(
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
         for k in range(pid_k * num_k_iter, (pid_k + 1) * num_k_iter):
-            b_scales = tl.load(b_scale_ptrs)
+            if EVEN_K:
+                b_scales = tl.load(b_scale_ptrs)
+            else:
+                b_scales = tl.load(
+                    b_scale_ptrs,
+                    mask=offs_ks_local[None, :]
+                    < tl.cdiv(2 * K, SCALE_GROUP_SIZE)
+                    - k * (BLOCK_SIZE_K // SCALE_GROUP_SIZE),
+                    other=0,
+                )
             # Load the next block of A and B, generate a mask by checking the K dimension.
             # If it is out of bounds, set it to 0.
             if EVEN_K:
@@ -278,6 +288,10 @@ def _gemm_a16wfp4_preshuffle_kernel(
     tl.assume(pid_m >= 0)
     tl.assume(pid_n >= 0)
     tl.assume(pid_k >= 0)
+
+    tl.static_assert(
+        EVEN_K, "_gemm_a16wfp4_preshuffle_kernel requires EVEN_K; K tail unsupported"
+    )
 
     # We assume 32 elements along K share the same scale.
     SCALE_GROUP_SIZE: tl.constexpr = 32
