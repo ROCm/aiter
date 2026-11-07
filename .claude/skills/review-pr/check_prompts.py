@@ -44,7 +44,7 @@ CHECKS = [
     (
         "prompts/worker.md",
         "## Step 7.8 — Design Assessment",
-        "and an over-bar PR routes a split.",
+        "and an over-bar PR carries a split.",
     ),
 ]
 

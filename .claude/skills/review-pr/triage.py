@@ -2571,7 +2571,7 @@ def audit_design(design_text, card_text, reviewers_text, meta, diff_text):
     What is checkable, and only this: the two lines exist in design.txt and on the card;
     the Size line states the PR's real size against the reviewability bar; a recommended
     person is on the roster of people who have worked on these paths and is not the PR's
-    own author; a PR over the bar routes a split. Whether the decision itself is right is
+    own author; a PR over the bar carries a split. Whether the decision itself is right is
     not checkable here -- that is what the routed human is for, and the card names them.
     """
     problems = []
@@ -2689,25 +2689,23 @@ def audit_design(design_text, card_text, reviewers_text, meta, diff_text):
                                      "names nothing from this PR -- a question about nothing "
                                      "in the diff routes a judgment about some other PR"))
 
-    # Over the bar, the design line routes a split: the one holistic judgment with a purely
-    # mechanical trigger. ghstack makes a stacked split cheap, so the recommendation is
-    # actionable rather than a complaint.
+    # Over the bar, the split is not a judgment to weigh -- the bar already decided it. The
+    # design line must carry SPLIT and its seams; the worker's only judgment is where the
+    # seams fall. ghstack makes a stacked split cheap, so the recommendation is actionable
+    # rather than a complaint.
     if over and d_card:
         if c_none:
             problems.append(("UNSPLIT", c_none.group(1)[:60],
                              f"{lines_n} lines / {files_n} files is over the review bar "
-                             f"({SIZE_BAR_LINES}/{SIZE_BAR_FILES}) -- the design line must be "
-                             "`SPLIT -- <the natural seams>`, not NONE"))
+                             f"({SIZE_BAR_LINES}/{SIZE_BAR_FILES}) -- the split is not a "
+                             "judgment to weigh over the bar: `SPLIT -- <the natural seams>`, "
+                             "not NONE"))
         else:
             rest = d_card.group(1).strip()
             if not rest.upper().startswith("SPLIT") or len(rest) < 25:
                 problems.append(("UNSPLIT", rest[:60],
                                  "over the review bar -- `SPLIT -- <the natural seams>`; "
                                  "ghstack makes a stacked split cheap"))
-    if over and h_card and NA_REASON.match(h_card.group(1).strip()) and not roster_empty:
-        problems.append(("UNROUTED-SPLIT", h_card.group(1)[:60],
-                         "a PR over the review bar routes its split like any other design "
-                         "decision -- `recommend <person> review <the split>`"))
     return problems
 
 

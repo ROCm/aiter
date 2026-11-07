@@ -187,7 +187,7 @@ t "a silent downgrade is rejected" "$rc" "1"
 echo "[design gate]"
 # Step 7.8's gate, driven like the independent gate above. The routing is the checkable
 # half -- the person is on the roster and not the author, the size is the PR's real size,
-# an over-bar PR routes a split -- and a routing gate that cannot go red is a rubber stamp,
+# an over-bar PR carries a split -- and a routing gate that cannot go red is a rubber stamp,
 # so each rule gets its negative case here.
 design_gate() {  # <design.txt> <card.md> <reviewers.txt> <pr_meta.json> -> problem kinds, or "routed"
   local d out rc; d=$(mktemp -d)
@@ -262,10 +262,18 @@ dg_split_card='Review (advisory): NEEDS WORK
 Size: 1200 lines / 1 files — over the review bar
 Design (advisory): SPLIT -- the gate change and the cache layout change are separable stacks
 Human: recommend bob review whether the fused_moe.py split keeps the gate change reviewable'
-t "an over-bar PR that routes its split passes" \
+t "an over-bar PR that routes its design question passes" \
   "$(design_gate 'DESIGN: SPLIT -- the gate change and the cache layout change are separable stacks
 HUMAN: recommend bob review whether the fused_moe.py split keeps the gate change reviewable' \
     "$dg_split_card" "$dg_roster" "$dg_meta_big")" "routed"
+t "an over-bar PR with an unrouted design question is rejected" \
+  "$(design_gate 'DESIGN: SPLIT -- the gate change and the cache layout change are separable stacks
+HUMAN: N/A -- nobody else has touched these paths' \
+    'Review (advisory): NEEDS WORK
+Size: 1200 lines / 1 files — over the review bar
+Design (advisory): SPLIT -- the gate change and the cache layout change are separable stacks
+Human: N/A -- nobody else has touched these paths' \
+    "$dg_roster" "$dg_meta_big")" "UNROUTED-DESIGN"
 t "an over-bar PR without a split design is rejected" \
   "$(design_gate "$dg_design" 'Review (advisory): NEEDS WORK
 Size: 1200 lines / 1 files — over the review bar

@@ -363,8 +363,10 @@ HUMAN: recommend <person> review <the question only they can answer> | N/A -- <r
   or the roster is empty.
 - **Size bar:** the header carries `Size: N lines / M files` (from `$WORK/size.txt`; the
   gate recomputes it from the PR metadata). Past **1000 lines or 15 files** a review
-  degrades from reading to sampling — the Size line says `over the review bar`, `DESIGN:`
-  becomes `SPLIT -- <the natural seams>`, and the split is routed like any other decision.
+  degrades from reading to sampling — the Size line says `over the review bar` and
+  `DESIGN:` becomes `SPLIT -- <the natural seams>`: over the bar the split is not a
+  judgment to weigh, it is the recommendation — the worker's only judgment is where the
+  seams fall, and the `HUMAN:` line routes the design question as in any other review.
   ghstack makes a stacked split cheap; recommend it rather than complain about the size.
 - A lean concern with a concrete case is an ordinary finding; a taste is not. "This
   abstraction has one implementation" with file:line is a Step 5/7 finding — "over-engineered"
@@ -372,7 +374,7 @@ HUMAN: recommend <person> review <the question only they can answer> | N/A -- <r
 
 Step 8's `design` gate checks the routing, not the judgment: the lines exist in both
 places, the size is the PR's real size, the person is on the roster and not the author, the
-question names this PR, and an over-bar PR routes a split.
+question names this PR, and an over-bar PR carries a split.
 
 ---
 
@@ -438,7 +440,7 @@ tried to kill each finding; `independent` requires that someone who had not seen
 reasoning tried too, or that the card admits nobody did. `design` requires that the one
 judgment this skill does not make was routed: the two lines exist in both places, the size
 is the PR's real size, the person is on the roster and not the author, and an over-bar PR
-routes a split.
+carries a split.
 
 Write the card to `$WORK/card.md` before running the gate — a missing file is a hard
 failure, because not writing it was the cheapest way past this check. Whether a finding is
