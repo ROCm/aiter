@@ -241,6 +241,7 @@ def dry_run(
             (torch.Tensor, "contiguous", contiguous),
             (torch.Tensor, "record_stream", lambda *_a, **_k: None),
             (chip_info, "_detect_native", lambda: [arch]),
+            (chip_info, "_gpu_info_archs", lambda: [arch]),
             (
                 jit_core,
                 "_pybind_develop_hooks_cache",
