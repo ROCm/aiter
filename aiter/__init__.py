@@ -147,6 +147,7 @@ else:
     from .ops.msa_attention import *
     from .ops.pos_encoding import *
     from .ops.cache import *
+    from .ops.kpool_compress import *
     from .ops.rmsnorm import *
     from .ops.communication import *
     from .ops.rope import *
