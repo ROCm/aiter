@@ -601,6 +601,32 @@ def _query_positions(m: int, seq_len: int, device) -> torch.Tensor:
     return torch.arange(seq_len - m, seq_len, device=device, dtype=dtypes.i32)
 
 
+def _paged_gqa_live_n_sel(
+    m: int, seq_len: int, token_budget: int, compress_ratio: int
+) -> int:
+    """Widest packed prefix expand fills for this bench batch.
+
+    Query positions are ``seq_len - m .. seq_len - 1`` in one request of
+    length ``seq_len``. A row's live columns are its selected complete
+    blocks plus the incomplete block at its own query position, so the
+    batch width is the max of those, not the last row alone.
+    """
+    if compress_ratio < 1 or token_budget % compress_ratio:
+        raise ValueError(
+            f"token_budget {token_budget} must be a multiple of "
+            f"compress_ratio {compress_ratio}"
+        )
+    if m < 1 or m > seq_len:
+        raise ValueError(f"m must fit in seq_len, got m={m} seq_len={seq_len}")
+    block_topk = token_budget // compress_ratio
+    widest = 0
+    for qpos in range(seq_len - m, seq_len):
+        visible = min((qpos + 1) // compress_ratio, seq_len // compress_ratio)
+        complete = min(visible, block_topk)
+        widest = max(widest, complete * compress_ratio + (qpos + 1) % compress_ratio)
+    return widest
+
+
 def _selected_width(indices: torch.Tensor) -> float:
     """Mean non-padding selection slots per row.
 
@@ -609,9 +635,9 @@ def _selected_width(indices: torch.Tensor) -> float:
     of it, capped at the budget. Below ``L = 2048`` the remainder is ``-1``
     padding: a quarter of the row is live at ``L = 512`` decode and an eighth
     at ``M = 512`` prefill. Deriving FLOPS and bytes from ``indices.shape[1]``
-    therefore overstates the work by up to 8x on those rows. The kernels still
-    walk all ``index_width`` columns -- that part is faithful to serving -- so
-    only the *derived* columns need the live count.
+    therefore overstates the work by up to 8x on those rows. The paged GQA
+    timed call passes that prefix as ``n_sel``. Callers that omit it still
+    walk the allocated row.
     """
     return float((indices >= 0).sum().item()) / indices.shape[0]
 
@@ -2050,6 +2076,111 @@ def test_paged_gqa_d128_decode_matches_oracle():
             )
 
 
+def test_paged_gqa_live_prefix_matches_full_width():
+    """Walking the packed live prefix matches walking the allocated -1 tail."""
+    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
+        return
+    idx = FLASH_NEXT_INDEXER
+    gqa = FLASH_NEXT_GQA
+    device = torch.device("cuda")
+    page_size = 16
+    for m, seq_len in ((1, 512), (1, 2048), (1, 8192), (8, 512), (8, 8192)):
+        torch.manual_seed(0)
+        n_blocks = seq_len // idx.compress_ratio
+        q_indexer = torch.randn(
+            m, idx.n_heads, idx.head_dim, dtype=dtypes.bf16, device=device
+        )
+        k_bar = torch.randn(n_blocks, idx.head_dim, dtype=dtypes.bf16, device=device)
+        q = torch.randn(m, gqa.n_heads, gqa.head_dim, dtype=dtypes.bf16, device=device)
+        k = torch.randn(
+            seq_len, gqa.kv_heads, gqa.head_dim, dtype=dtypes.bf16, device=device
+        )
+        v = torch.randn(
+            seq_len, gqa.kv_heads, gqa.head_dim, dtype=dtypes.bf16, device=device
+        )
+        qpos = _query_positions(m, seq_len, device)
+        slen = torch.full((1,), seq_len, dtype=dtypes.i32, device=device)
+        token_to_req = torch.zeros(m, dtype=dtypes.i32, device=device)
+        _index_cache, _index_table, k_cache, v_cache, kv_table = _pack_flash_next(
+            k_bar, k, v, page_size, device
+        )
+        ref = qsa_oracle(
+            q_indexer,
+            k_bar,
+            q,
+            k,
+            v,
+            qpos,
+            slen,
+            token_to_req,
+            idx,
+            gqa,
+            score_scale=FLASH_NEXT_SCORE_SCALE,
+            out_dtype=dtypes.fp32,
+        )
+        indices = ref.indices.contiguous()
+        live = _paged_gqa_live_n_sel(m, seq_len, idx.token_budget, idx.compress_ratio)
+        if m == 1 and seq_len == 512:
+            try:
+                flydsl_qsa_paged_gqa(
+                    q, k_cache, v_cache, indices, kv_table, token_to_req, n_sel=True
+                )
+            except TypeError:
+                pass
+            else:
+                raise AssertionError("bool n_sel was accepted")
+            try:
+                flydsl_qsa_paged_gqa(
+                    q,
+                    k_cache,
+                    v_cache,
+                    indices,
+                    kv_table,
+                    token_to_req,
+                    n_sel=int(indices.shape[1]) + 1,
+                )
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("n_sel past the row was accepted")
+        if live <= 0 or live > indices.shape[1]:
+            raise AssertionError(f"live n_sel {live} outside 1..{indices.shape[1]}")
+        if int((indices[:, live:] >= 0).any().item()):
+            raise AssertionError(f"live token past n_sel={live} at M={m} L={seq_len}")
+        if int((indices >= 0).sum(dim=1).max().item()) > live:
+            raise AssertionError(
+                f"a row is wider than n_sel={live} at M={m} L={seq_len}"
+            )
+        full = flydsl_qsa_paged_gqa(
+            q, k_cache, v_cache, indices, kv_table, token_to_req
+        )
+        short = flydsl_qsa_paged_gqa(
+            q, k_cache, v_cache, indices, kv_table, token_to_req, n_sel=live
+        )
+        err = checkAllclose(
+            full.to(dtypes.fp32),
+            short.to(dtypes.fp32),
+            rtol=1e-2,
+            atol=1e-2,
+            msg=f"live prefix vs full width M={m} L={seq_len}",
+        )
+        if err != 0:
+            raise AssertionError(
+                f"live prefix diverged from the full row at M={m} L={seq_len} (err={err})"
+            )
+        err = checkAllclose(
+            ref.output,
+            short.to(dtypes.fp32),
+            rtol=1e-2,
+            atol=1e-2,
+            msg=f"live prefix vs oracle M={m} L={seq_len}",
+        )
+        if err != 0:
+            raise AssertionError(
+                f"live prefix diverged from the oracle at M={m} L={seq_len} (err={err})"
+            )
+
+
 def test_paged_gqa_flash_next_prefill_matches_oracle():
     """The BLOCK_N=64/two-wave paged GQA specialization matches at prefill M=512."""
     if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
@@ -3341,7 +3472,9 @@ def bench_qsa_flash_next_paged_gqa(
 
     Live-AMD-shaped BLOCK_N/threads/split policy, tiled MFMA QK/PV,
     log2 online softmax, direct output at one split, and a D-sliced merge.
-    Expand and sigmoid stay unfused. Same ``rotate`` on every GQA column.
+    Expand and sigmoid stay unfused. The FlyDSL column passes the packed
+    live prefix as ``n_sel`` so the split grid follows filled columns.
+    Same ``rotate`` on every GQA column.
     ``n_heads`` and ``kv_heads`` are one tensor-parallel rank. The indexer
     that builds the oracle indices stays at 4 heads.
     ``cache_layout="wide"`` gives K and V the serving cache span. Sparse GQA
@@ -3407,8 +3540,10 @@ def bench_qsa_flash_next_paged_gqa(
         "valid%": 100.0 * w / w_alloc,
         "cache_span_gib": _span_gib(k_cache),
     }
+    live_n_sel = _paged_gqa_live_n_sel(m, seq_len, idx.token_budget, idx.compress_ratio)
     for name, (fn, msg) in candidates.items():
-        out, us = _time(fn, *gqa_args, rotate=rotate)
+        extra = {"n_sel": live_n_sel} if fn is flydsl_qsa_paged_gqa else {}
+        out, us = _time(fn, *gqa_args, rotate=rotate, **extra)
         err = checkAllclose(
             ref.output,
             out.to(dtypes.fp32),
