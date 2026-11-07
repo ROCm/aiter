@@ -3,9 +3,9 @@
 """FlyDSL V4.1 CSA main compressor.
 
 One wave owns one plan row: online-softmax pool, FP32 RMSNorm, GPT-J RoPE,
-BF16 rounding, then the NVFP4 or MXFP8 packed row. NoPE pairs go through
-the rotation too, with cos 1 / sin 0. NVFP4 uses groups of 16 with the E4M3
-scale ``max(amax, 6 * 2^-9) / 6``. MXFP8 follows aiter's MX quant rule: the
+BF16 rounding, then the NVFP4 or MXFP8 row, its values and scales written
+to separate cache tensors. NoPE pairs go through the rotation too, with
+cos 1 / sin 0. NVFP4 uses groups of 16 with the E4M3 scale ``max(amax, 6 * 2^-9) / 6``. MXFP8 follows aiter's MX quant rule: the
 ``MxScaleRoundMode.RoundUp`` scale over a NaN-skipping amax, capped at 0xFE
 for a group holding an Inf, with NaN and Inf converting to FP8 NaN. This
 does not change ``flydsl_fused_compress_attn`` or the V4 ``fp4`` /
@@ -41,7 +41,8 @@ _ROPE = 64
 _FP8_MAX = 448.0
 _AMAX_FLOOR = 1e-10
 _NVFP4_FLOOR = 6.0 * 2.0**-9
-_ROW_BYTES = {"nvfp4": 288, "mxfp8": 528}
+# Bytes per cache row: (values, scales).
+_ROW_BYTES = {"nvfp4": (256, 32), "mxfp8": (_DIM, 16)}
 _NEG = float("-inf")
 _DPP_ROW_SHR = 0x110
 _DPP_ROW_BCAST15 = 0x142
@@ -96,7 +97,6 @@ def _build(
     group = 16 if nvfp4 else 32
     group_lanes = group // 4
     group_shift = group_lanes.bit_length() - 1
-    scale_base = 256 if nvfp4 else _DIM
     # RoPE pairs sit in the last row chunk, from this lane on.
     rope_lane = (_DIM - _ROPE - (row_chunks - 1) * stride) // 4
     log2_wave = wave.bit_length() - 1
@@ -135,7 +135,8 @@ def _build(
         sin_cache: fx.Pointer,
         latent_out: fx.Pointer,
         rotated_out: fx.Pointer,
-        cache: fx.Pointer,
+        kv_cache: fx.Pointer,
+        kv_cache_scale: fx.Pointer,
         block_tables: fx.Pointer,
         kv_stride: Int32,
         score_stride: Int32,
@@ -150,6 +151,8 @@ def _build(
         bt_stride: Int32,
         page_stride: Int64,
         row_stride: Int64,
+        scale_page_stride: Int64,
+        scale_row_stride: Int64,
         rows_per_page: Int32,
         state_size: Int32,
         eps_bits: Int32,
@@ -628,25 +631,27 @@ def _build(
                     packed = fx.rocdl.cvt_pk_fp8_f32(T.i32, qs[2], qs[3], packed, True)
                     words.append(fx.Int32(packed))
 
-            row = (
-                addr(cache)
+            out = rsrc(
+                addr(kv_cache)
                 + fx.Int64(page) * page_stride
                 + fx.Int64(in_page) * row_stride
             )
-            out = rsrc(row)
             value_bytes = 2 if nvfp4 else 4
             for c in range_constexpr(chunks):
                 buffer_ops.buffer_store(
                     words[c], out, chunk_off(c) // 4 * value_bytes, offset_is_bytes=True
                 )
             if (tid & (group_lanes - 1)) == 0:
+                scale_out = rsrc(
+                    addr(kv_cache_scale)
+                    + fx.Int64(page) * scale_page_stride
+                    + fx.Int64(in_page) * scale_row_stride
+                )
                 for c in range_constexpr(chunks):
                     buffer_ops.buffer_store(
                         scale_bytes[c],
-                        out,
-                        scale_base
-                        + (tid >> group_shift)
-                        + row_chunk(c) * (stride // group),
+                        scale_out,
+                        (tid >> group_shift) + row_chunk(c) * (stride // group),
                         offset_is_bytes=True,
                     )
 
@@ -667,7 +672,8 @@ def _build(
         sin_cache: fx.Pointer,
         latent_out: fx.Pointer,
         rotated_out: fx.Pointer,
-        cache: fx.Pointer,
+        kv_cache: fx.Pointer,
+        kv_cache_scale: fx.Pointer,
         block_tables: fx.Pointer,
         kv_stride: Int32,
         score_stride: Int32,
@@ -682,6 +688,8 @@ def _build(
         bt_stride: Int32,
         page_stride: Int64,
         row_stride: Int64,
+        scale_page_stride: Int64,
+        scale_row_stride: Int64,
         rows_per_page: Int32,
         state_size: Int32,
         eps_bits: Int32,
@@ -702,7 +710,8 @@ def _build(
             sin_cache,
             latent_out,
             rotated_out,
-            cache,
+            kv_cache,
+            kv_cache_scale,
             block_tables,
             kv_stride,
             score_stride,
@@ -717,6 +726,8 @@ def _build(
             bt_stride,
             page_stride,
             row_stride,
+            scale_page_stride,
+            scale_row_stride,
             rows_per_page,
             state_size,
             eps_bits,
@@ -741,14 +752,22 @@ def fused_compress_attn_v41(
     rms_eps: float,
     cos_cache: torch.Tensor,
     sin_cache: torch.Tensor,
-    cache: torch.Tensor,
+    kv_cache: torch.Tensor,
+    kv_cache_scale: torch.Tensor,
     block_tables: torch.Tensor,
     ratio: int,
     cache_format: str,
     latent_out: torch.Tensor | None = None,
     rotated_out: torch.Tensor | None = None,
 ) -> None:
-    """V4.1 CSA main compressor: pool, RMSNorm, RoPE and the packed cache row."""
+    """V4.1 CSA main compressor: pool, RMSNorm, RoPE and the quantized cache row.
+
+    ``kv_cache`` gets a row's values (256 B NVFP4, 512 B MXFP8) and
+    ``kv_cache_scale`` its scales (32 E4M3 / 16 E8M0 bytes), both
+    ``[pages, rows_per_page, width]`` with any one-byte dtype and unit last
+    stride; value rows must be 4-byte aligned. A packed ``[..., 288 / 528]``
+    cache is passed as its two column slices.
+    """
     row_bytes = _ROW_BYTES.get(cache_format)
     if row_bytes is None:
         raise ValueError(f"cache_format must be nvfp4 or mxfp8, got {cache_format}")
@@ -823,18 +842,26 @@ def fused_compress_attn_v41(
         raise ValueError(
             "block_tables must be int32 [batch, pages] with unit last stride"
         )
-    if (
-        cache.ndim != 3
-        or cache.dtype != torch.uint8
-        or cache.shape[2] != row_bytes
-        or cache.stride(2) != 1
-        or cache.shape[1] == 0
-        or cache.stride(0) % 4
-        or cache.stride(1) % 4
+    value_bytes, scale_bytes = row_bytes
+    for name, tensor, width in (
+        ("kv_cache", kv_cache, value_bytes),
+        ("kv_cache_scale", kv_cache_scale, scale_bytes),
     ):
-        raise ValueError(
-            f"{cache_format} cache must be 4-byte-aligned uint8 [pages, rows, {row_bytes}]"
-        )
+        if (
+            tensor.ndim != 3
+            or tensor.element_size() != 1
+            or tensor.shape[2] != width
+            or tensor.stride(2) != 1
+            or tensor.shape[1] == 0
+        ):
+            raise ValueError(
+                f"{cache_format} {name} must be one-byte [pages, rows, {width}] "
+                "with unit last stride"
+            )
+    if kv_cache_scale.shape[:2] != kv_cache.shape[:2]:
+        raise ValueError("kv_cache and kv_cache_scale must share [pages, rows]")
+    if kv_cache.data_ptr() % 4 or kv_cache.stride(0) % 4 or kv_cache.stride(1) % 4:
+        raise ValueError("kv_cache rows must be 4-byte aligned")
     rows = plan.shape[0]
     for name, tensor in (("latent_out", latent_out), ("rotated_out", rotated_out)):
         if tensor is None:
@@ -894,7 +921,8 @@ def fused_compress_attn_v41(
         ptr(sin_cache),
         ptr(latent_out if latent_out is not None else placeholder),
         ptr(rotated_out if rotated_out is not None else placeholder),
-        ptr(cache),
+        ptr(kv_cache),
+        ptr(kv_cache_scale),
         ptr(block_tables),
         int(kv_in.stride(0)),
         int(score_in.stride(0)),
@@ -907,9 +935,11 @@ def fused_compress_attn_v41(
         int(latent_out.stride(0) if latent_out is not None else 0),
         int(rotated_out.stride(0) if rotated_out is not None else 0),
         int(block_tables.stride(0)),
-        int(cache.stride(0)),
-        int(cache.stride(1)),
-        int(cache.shape[1]),
+        int(kv_cache.stride(0)),
+        int(kv_cache.stride(1)),
+        int(kv_cache_scale.stride(0)),
+        int(kv_cache_scale.stride(1)),
+        int(kv_cache.shape[1]),
         int(kv_state.shape[1]),
         _f32_bits(rms_eps),
         int(rows),

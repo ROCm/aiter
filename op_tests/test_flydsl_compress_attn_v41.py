@@ -2,8 +2,9 @@
 
 Only valid plan rows are compared. The latent (pooling and RMSNorm) and the
 rotated echo (RoPE) are checked against an fp64 reference within BF16
-rounding. The packed cache row must equal, byte for byte, the NVFP4 / MXFP8
-quant of the kernel's own rotated echo, which is the value the quant reads.
+rounding. The cache row, values and scales, must equal byte for byte the
+NVFP4 / MXFP8 quant of the kernel's own rotated echo, which is the value the
+quant reads. Values and scales go to one packed row or to two tensors.
 """
 
 import pytest
@@ -13,7 +14,8 @@ from aiter.ops.flydsl.kernels.fused_compress_attn_v41 import fused_compress_attn
 
 _DIM = 512
 _ROPE = 64
-_FORMATS = {"nvfp4": 288, "mxfp8": 528}
+# Bytes per cache row: (values, scales).
+_FORMATS = {"nvfp4": (256, 32), "mxfp8": (512, 16)}
 
 
 def _stage(name, got, expected):
@@ -86,6 +88,27 @@ def _cache(num_pages, rows_per_page, row_bytes, gap):
         (page_stride, row_bytes, 1),
     )
     return storage, cache
+
+
+def _caches(cache_format, layout):
+    # (storage, used bytes per page, gap) per pool, the value and the scale cache.
+    # "packed" slices one [.., values + scales] row; "split" uses two tensors
+    # with their own page strides (the scale one not 4-byte aligned).
+    values, scales = _FORMATS[cache_format]
+    if layout == "packed":
+        storage, cache = _cache(6, 4, values + scales, gap=64)
+        pools = [(storage, 4 * (values + scales), 64)]
+        return pools, cache[..., :values], cache[..., values:]
+    value_storage, value_cache = _cache(6, 4, values, gap=64)
+    scale_storage, scale_cache = _cache(6, 4, scales, gap=20)
+    pools = [(value_storage, 4 * values, 64), (scale_storage, 4 * scales, 20)]
+    return pools, value_cache, scale_cache
+
+
+def _gaps_untouched(pools):
+    for storage, used, gap in pools:
+        pages = storage.view(-1, used + gap)
+        assert torch.all(pages[:, used:] == 0xA5)
 
 
 def _reference(
@@ -175,7 +198,8 @@ def _live(plan):
 @pytest.mark.parametrize("cache_format", ["nvfp4", "mxfp8"])
 @pytest.mark.parametrize("ratio", [1, 2])
 @pytest.mark.parametrize("padded", [False, True])
-def test_fused_compress_attn_v41(cache_format, ratio, padded):
+@pytest.mark.parametrize("layout", ["packed", "split"])
+def test_fused_compress_attn_v41(cache_format, ratio, padded, layout):
     torch.manual_seed(ratio * 19 + (0 if cache_format == "nvfp4" else 5))
     plan = _plan(ratio)
     if padded:
@@ -183,7 +207,8 @@ def test_fused_compress_attn_v41(cache_format, ratio, padded):
         idle = torch.tensor([[0, -1, -1, 0]], dtype=torch.int32, device="cuda")
         plan = torch.cat([plan, idle.expand(4200, 4)])
     kv, score, state, score_state, ape, weight, cos, sin, slots, tables = _inputs(ratio)
-    storage, cache = _cache(6, 4, _FORMATS[cache_format], gap=64)
+    pools, kv_cache, kv_cache_scale = _caches(cache_format, layout)
+    before = torch.cat([kv_cache, kv_cache_scale], -1)
     latent = torch.zeros(plan.shape[0], _DIM, dtype=torch.bfloat16, device="cuda")
     rotated = torch.zeros_like(latent)
     fused_compress_attn_v41(
@@ -198,7 +223,8 @@ def test_fused_compress_attn_v41(cache_format, ratio, padded):
         rms_eps=1e-6,
         cos_cache=cos,
         sin_cache=sin,
-        cache=cache,
+        kv_cache=kv_cache,
+        kv_cache_scale=kv_cache_scale,
         block_tables=tables,
         ratio=ratio,
         cache_format=cache_format,
@@ -215,14 +241,10 @@ def test_fused_compress_attn_v41(cache_format, ratio, padded):
     torch.testing.assert_close(
         rotated[live].double(), ref_rotated[live], rtol=2**-7, atol=1e-6
     )
-    expected = _expected_cache(rotated, plan, tables, cache, ratio, cache_format)
-    _stage("quant or paged store (packed row differs)", cache, expected)
-    page_stride = 4 * _FORMATS[cache_format] + 64
-    for page in range(6):
-        gap = storage[
-            page * page_stride + 4 * _FORMATS[cache_format] : (page + 1) * page_stride
-        ]
-        assert torch.all(gap == 0xA5)
+    expected = _expected_cache(rotated, plan, tables, before, ratio, cache_format)
+    got = torch.cat([kv_cache, kv_cache_scale], -1)
+    _stage("quant or paged store (cache row differs)", got, expected)
+    _gaps_untouched(pools)
     inactive = ~live
     assert torch.all(latent[inactive] == 0)
     assert torch.all(rotated[inactive] == 0)
@@ -232,8 +254,8 @@ def test_negative_batch_does_not_write():
     torch.manual_seed(3)
     plan = torch.tensor([[2, -1, 4, 0]], dtype=torch.int32, device="cuda")
     kv, score, state, score_state, ape, weight, cos, sin, slots, tables = _inputs(2)
-    _, cache = _cache(6, 4, 288, gap=64)
-    before = cache.clone()
+    _, kv_cache, kv_cache_scale = _caches("nvfp4", "split")
+    before = torch.cat([kv_cache, kv_cache_scale], -1)
     latent = torch.zeros(1, _DIM, dtype=torch.bfloat16, device="cuda")
     rotated = torch.zeros_like(latent)
     fused_compress_attn_v41(
@@ -248,14 +270,15 @@ def test_negative_batch_does_not_write():
         rms_eps=1e-6,
         cos_cache=cos,
         sin_cache=sin,
-        cache=cache,
+        kv_cache=kv_cache,
+        kv_cache_scale=kv_cache_scale,
         block_tables=tables,
         ratio=2,
         cache_format="nvfp4",
         latent_out=latent,
         rotated_out=rotated,
     )
-    assert torch.equal(cache, before)
+    assert torch.equal(torch.cat([kv_cache, kv_cache_scale], -1), before)
     assert torch.all(latent == 0)
     assert torch.all(rotated == 0)
 
@@ -274,7 +297,7 @@ def test_mxfp8_nonfinite_follows_aiter_mx_rule():
     kv, score, state, score_state, ape, weight, cos, sin, slots, tables = _inputs(1)
 
     def run(weight):
-        _, cache = _cache(6, 4, _FORMATS["mxfp8"], gap=64)
+        _, kv_cache, kv_cache_scale = _caches("mxfp8", "split")
         rotated = torch.zeros(1, _DIM, dtype=torch.bfloat16, device="cuda")
         fused_compress_attn_v41(
             kv_in=kv,
@@ -288,13 +311,16 @@ def test_mxfp8_nonfinite_follows_aiter_mx_rule():
             rms_eps=1e-6,
             cos_cache=cos,
             sin_cache=sin,
-            cache=cache,
+            kv_cache=kv_cache,
+            kv_cache_scale=kv_cache_scale,
             block_tables=tables,
             ratio=1,
             cache_format="mxfp8",
             rotated_out=rotated,
         )
-        return cache[int(tables[0, 0]), 0].cpu(), rotated[0]
+        page = int(tables[0, 0])
+        row = torch.cat([kv_cache[page, 0], kv_cache_scale[page, 0]])
+        return row.cpu(), rotated[0]
 
     # The weight scales single elements after RMSNorm: group 0 holds an Inf
     # beside a finite 2^127 (element 0, the large one), group 1 a NaN, group
