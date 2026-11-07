@@ -621,7 +621,9 @@ def _decode_with_backend(
         return
     stream = torch.cuda.current_stream(logits.device)
 
-    if backend is None:
+    # Without a bound the gate can only answer single or default, and both run the
+    # single-launch kernel below, so it is not asked.
+    if backend is None and max_row_len is not None:
         # The tensor contract was enforced above, so only the shape is asked.
         backend = decode_backend_for_shape(
             logits,

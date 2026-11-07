@@ -853,6 +853,31 @@ def test_decode_mixed_node():
     print("[decode_mixed_node] PASS")
 
 
+def test_decode_no_bound_skips_gate():
+    """Without `max_row_len` the FlyDSL entry runs the single-launch kernel
+    without asking the gate; with one it asks."""
+    rows, width, top_k = 4, 65536, 2048
+    torch.manual_seed(0)
+    logits = torch.randn(rows, width, device="cuda")
+    seq_lens = torch.full((rows,), width, dtype=torch.int32, device="cuda")
+    want = stable_reference(logits, top_k)
+    host = flydsl_decode_host
+    with mock.patch.object(
+        host, "decode_backend_for_shape", wraps=host.decode_backend_for_shape
+    ) as gate:
+        for bound, asked in ((None, 0), (width, 1)):
+            out = torch.full((rows, top_k), -7, dtype=torch.int32, device="cuda")
+            host.flydsl_top_k_per_row_decode(
+                logits, 1, seq_lens, out, rows, width, 1, top_k, True,
+                max_row_len=bound,
+            )  # fmt: skip
+            torch.cuda.synchronize()
+            assert gate.call_count == asked, f"bound {bound}: {gate.call_count} asks"
+            assert torch.equal(out.long(), want), f"bound {bound}: mismatch"
+            gate.reset_mock()
+    print("[decode_no_bound_skips_gate] PASS")
+
+
 def test_decode_bound_entry_points(card):
     """`topk_select` and the public FlyDSL wrapper each carry `max_row_len` to the
     adaptive kernel. A dropped bound still returns correct indices, so the launch
@@ -2614,6 +2639,7 @@ def run_decode(args):
 def run_adaptive():
     test_decode_bound_gate()
     test_decode_mixed_node()
+    test_decode_no_bound_skips_gate()
     card = (get_gfx_runtime(), get_cu_num_device(torch.cuda.current_device()))
     if card not in topk._ADAPTIVE_BANDS_BY_K_GROUP:
         aiter.logger.warning(
