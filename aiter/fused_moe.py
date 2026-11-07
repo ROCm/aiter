@@ -4394,6 +4394,36 @@ def get_2stage_cfgs(
 
     if (
         cfg is not None
+        and cfg.get("run_1stage", False)
+        and kn1.startswith("_ZN5aiter")
+        and activation == ActivationType.Situv2
+        and q_type == QuantType.per_1x32
+        and q_dtype_w == dtypes.fp4x2
+    ):
+        if is_shuffled:
+            if not opus_weights_shuffled:
+                raise ValueError(
+                    "SiTUv2 MXFP4 requires both w1 and w2 to use the same "
+                    "preshuffled weight layout"
+                )
+            if gate_mode != GateMode.SEPARATED or gate_up_interleave is True:
+                raise ValueError("SiTUv2 A16W4 requires separated preshuffled weights")
+            cfg = None
+            logger.warning(
+                "[fused_moe] discarding 1-stage SiTUv2 ASM config for preshuffled "
+                "MXFP4 weights; using the two-stage layout-compatible path"
+            )
+        elif (
+            situ_beta != DEFAULT_SITUV2_BETA
+            or situ_linear_beta != DEFAULT_SITUV2_LINEAR_BETA
+        ):
+            raise ValueError(
+                "1-stage SiTUv2 ASM has fixed beta=4 and linear_beta=25; "
+                "use separated preshuffled weights for runtime betas"
+            )
+
+    if (
+        cfg is not None
         and cfg.get("flat", AsmMoeMode.SORTED) == AsmMoeMode.POST_REDUCE
         and (
             gate_mode != GateMode.SEPARATED
