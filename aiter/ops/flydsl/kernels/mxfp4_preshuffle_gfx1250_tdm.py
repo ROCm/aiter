@@ -2908,8 +2908,9 @@ def launch_gemm_a8w4_tdm(
     launch_kernel = kernel if persistent_workers else gemm_task
     launch_args = kargs if persistent_workers else kargs + (0, 0)
     if cluster_m > 1 or cluster_n > 1:
-        # Geometry must reach BOTH the definition and the launch site, or the
-        # cluster never forms and the TDM loads silently fall back to per-load.
+        # Fixed cluster dimensions are carried by the kernel metadata. Use the
+        # ordinary module launch, which honors them and supports stream capture;
+        # hipDrvLaunchKernelEx currently omits the kernel from a captured graph.
         launch_kernel(
             *launch_args,
             value_attrs={"rocdl.cluster_dims": f"{cluster_n},{cluster_m},1"},
@@ -2917,7 +2918,6 @@ def launch_gemm_a8w4_tdm(
             grid=grid,
             block=(block, 1, 1),
             stream=stream,
-            cluster=(cluster_n, cluster_m, 1),
         )
     else:
         launch_kernel(*launch_args).launch(
