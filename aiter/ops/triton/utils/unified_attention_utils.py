@@ -205,7 +205,6 @@ def compute_segment_params(config: dict, params) -> dict:
     wave_slots = config.pop("SPLIT_WAVE_SLOTS_PER_CU", 0)
     seg_overhead = config.pop("SPLIT_SEG_OVERHEAD_TILES", 0)
     partial_cost = config.pop("SPLIT_PARTIAL_COST", 0.0)
-    window_plus_q = config.pop("SPLIT_WINDOW_PLUS_Q", False)
 
     # Callers may pass NumPy scalars (e.g. max_seqlen_k from a NumPy array), and
     # those have no bit_length and can overflow in shifts. Work in Python ints.
@@ -218,13 +217,12 @@ def compute_segment_params(config: dict, params) -> dict:
     # tokens one segment must cover, so the split never outruns the context
     tile = triton.next_power_of_2(int(params.block_size))
     tile = max(tile_lo, tile if tile_hi is None else min(tile_hi, tile))
-    keys = int(params.max_seqlen_k)
-    if getattr(params, "sliding_window", 0) > 0:
-        # a window row sees window + q - 1 keys. Entries that opt in cover
-        # window + q (the bf16 short-query split, measured that way).
-        extra = max_seqlen_q if window_plus_q else max_seqlen_q - 1
-        keys = min(keys, int(params.sliding_window) + extra)
-    tiles = triton.cdiv(keys, tile)
+    kv_len = int(params.max_seqlen_k)
+    # a sliding-window split carves only the window: rows see at most
+    # window + q - 1 keys
+    if params.sliding_window > 0:
+        kv_len = min(kv_len, int(params.sliding_window) + max_seqlen_q - 1)
+    tiles = triton.cdiv(kv_len, tile)
     limit = tiles
     too_many_seqs = seqs_per_tile and num_seqs > seqs_per_tile * limit
     if cap is not None:

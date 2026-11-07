@@ -223,8 +223,7 @@
     "TILE_WIDE_SHUFFLED_PROGRAMS_PER_CU": 2
   },
   "kv_split": {
-    "SW_GEQ_256.D_LEQ_64.Q_GEQ_2.DT_bf16_bf16": {
-      "SPLIT_WINDOW_PLUS_Q": true,
+    "SW_GEQ_256.D_LEQ_64.Q_GEQ_2": {
       "SEGMENTS_PER_CU": 1,
       "SPLIT_FIT_BUDGET": true,
       "SPLIT_SEQS_PER_TILE": 2,
@@ -239,23 +238,10 @@
     "SW_GEQ_256.Q_GEQ_2": {
       "SEGMENTS_PER_CU": 1,
       "SPLIT_FIT_BUDGET": true,
-      "SPLIT_SEQS_PER_TILE": 1.5,
+      "SPLIT_SEQS_PER_TILE": 4,
+      "SPLIT_SEG_MIN_TILES": 4,
       "MFMA_DIM": 16,
       "SPLIT_MIN_TILES": 4,
-      "SEGMENT_TILE_MIN": 64,
-      "SEGMENT_TILE_MAX": 64,
-      "TILE_SIZE_MIN": 64,
-      "TILE_SIZE_MAX": 64
-    },
-    "SW.D_LEQ_64.DT_bf16_bf16": {
-      "SPLIT_WINDOW_PLUS_Q": true,
-      "SEGMENTS_PER_CU": 2,
-      "MFMA_DIM": 16,
-      "MAX_SEGMENTS": 64,
-      "MIN_SEGMENTS": 1,
-      "SPLIT_MIN_TILES": 4,
-      "SPLIT_MIN_SHARE": 2,
-      "SPLIT_SEQS_PER_TILE": 5,
       "SEGMENT_TILE_MIN": 64,
       "SEGMENT_TILE_MAX": 64,
       "TILE_SIZE_MIN": 64,
@@ -264,7 +250,11 @@
     "SW": {
       "SEGMENTS_PER_CU": 2,
       "MFMA_DIM": 16,
-      "MAX_SEGMENTS": 1,
+      "MAX_SEGMENTS": 64,
+      "MIN_SEGMENTS": 1,
+      "SPLIT_MIN_TILES": 4,
+      "SPLIT_MIN_SHARE": 2,
+      "SPLIT_SEQS_PER_TILE": 5,
       "SEGMENT_TILE_MIN": 64,
       "SEGMENT_TILE_MAX": 64,
       "TILE_SIZE_MIN": 64,

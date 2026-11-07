@@ -251,9 +251,9 @@ def _gfx950_split_grid(params: _UAParams):
     ):
         return False
     # A window reaching here is not a short bf16 query at head 64 (those return
-    # above): it is a head size above 64, or a non-bf16 query. It takes the
-    # split grid only when the split has more than one segment, and otherwise
-    # keeps the 2d grid. Not measured for these shapes.
+    # above): it is a head size above 64, or an fp8 query. It takes the split
+    # grid only when the split has more than one segment, and otherwise keeps
+    # the 2d grid.
     config = get_unified_attention_config(
         "kv_split", _gfx950_split_params(params), backend="gluon"
     )
