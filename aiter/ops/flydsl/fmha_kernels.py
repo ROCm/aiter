@@ -259,6 +259,8 @@ def flydsl_flash_attn_func(
         q: tensor with shape ``[batch, seqlen_q, num_heads, head_dim]`` (BSHD).
         k, v: tensors with shape ``[batch, seqlen_kv, num_heads, head_dim]``.
             All three inputs must share dtype, batch, num_heads, and head_dim.
+            head_dim must be a multiple of 8 (BF16/F16), or at least 64 and a
+            multiple of 32 (FP8).
         causal: apply causal masking when ``True``. Causal cross-attention is
             not supported.
         waves_per_eu: kernel occupancy hint passed to the FlyDSL builder.
@@ -329,10 +331,14 @@ def flydsl_flash_attn_func(
     is_cross = seq_len_real != seq_len_kv_real
     if causal and is_cross:
         raise ValueError("causal cross-attention is not supported")
-    if head_dim < 64 or head_dim % 32 != 0:
-        raise ValueError(
-            f"kernel requires head_dim >= 64 and head_dim % 32 == 0, got {head_dim}"
-        )
+    if q.dtype in _FP8_DTYPES:
+        if head_dim < 64 or head_dim % 32 != 0:
+            raise ValueError(
+                "FP8 kernel requires head_dim >= 64 and head_dim % 32 == 0, "
+                f"got {head_dim}"
+            )
+    elif head_dim % 8 != 0:
+        raise ValueError(f"kernel requires head_dim % 8 == 0, got {head_dim}")
 
     if softmax_scale is not None:
         if torch.is_tensor(softmax_scale):
