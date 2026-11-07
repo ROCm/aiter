@@ -33,7 +33,9 @@ _fused_clamp_silu_mul_repr = make_kernel_repr(
 )
 
 
-@triton.jit(repr=_fused_clamp_silu_mul_repr)
+# M only sizes the grid (one program per row) and is never read here, so its
+# divisibility only recompiled the same code when the token count changed class.
+@triton.jit(repr=_fused_clamp_silu_mul_repr, do_not_specialize=["M"])
 def _fused_clamp_silu_mul_kernel(
     inp_ptr,
     out_ptr,

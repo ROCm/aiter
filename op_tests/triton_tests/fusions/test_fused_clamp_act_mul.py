@@ -1,8 +1,13 @@
+from collections import defaultdict
+
 import pytest
 import torch
 import torch.nn.functional as F
 
 import aiter
+from aiter.ops.triton._triton_kernels.fusions.fused_clamp_act_mul import (
+    _fused_clamp_silu_mul_kernel,
+)
 from aiter.ops.triton.fusions.fused_clamp_act_mul import (
     _get_config,
     fused_clamp_act_mul,
@@ -576,3 +581,18 @@ def test_fused_clamp_act_mul_float16_input(M, D, dtype_quant, backend):
         ref = _torch_reference(inp, 0.0, None, None)
         assert out.dtype == inp.dtype
         torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("backend", ["triton"])
+@torch.inference_mode()
+def test_fused_clamp_act_mul_row_counts_share_one_compile(monkeypatch, backend):
+    # Row counts 16, 17, 1 and 33 fall in different Triton integer specialization
+    # classes; N = 1024 has no M-bucketed config, so every launch constexpr is equal.
+    _check_backend(backend)
+    kernel = _fused_clamp_silu_mul_kernel
+    monkeypatch.setattr(kernel, "device_caches", defaultdict(kernel.create_binder))
+    cache = kernel.device_caches[torch.cuda.current_device()][0]
+    for M in (16, 17, 1, 33):
+        inp = torch.randn(M, 2 * 1024, device="cuda", dtype=torch.bfloat16)
+        fused_clamp_act_mul(inp, swiglu_limit=7.0, backend=backend)
+    assert len(cache) == 1
