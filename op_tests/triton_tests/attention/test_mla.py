@@ -335,6 +335,7 @@ def torch_mla_extend(
     "q_dtype, kv_dtype, out_dtype, block_size, use_out_scale",
     [
         (torch.bfloat16, torch.bfloat16, torch.bfloat16, 64, False),
+        (torch.bfloat16, torch.bfloat16, torch.bfloat16, 16, False),
         (torch.bfloat16, e4m3_dtype, torch.bfloat16, 64, False),
         (e4m3_dtype, e4m3_dtype, torch.bfloat16, 64, False),
         (e4m3_dtype, e4m3_dtype, e4m3_dtype, 64, True),
@@ -362,11 +363,18 @@ def test_mla_decode_fwd(
 ):
     if DEVICE_ARCH not in (
         "gfx950",
+        "gfx1201",
         "gfx1250",
     ):
         # gfx1250 -> Gluon
-        # gfx950 -> Triton
+        # gfx950, gfx1201 -> Triton
         pytest.skip(f"skip {DEVICE_ARCH}")
+    if DEVICE_ARCH == "gfx1201" and (
+        shuffled_kv_cache or q_dtype != torch.bfloat16 or kv_dtype != torch.bfloat16
+    ):
+        pytest.skip("gfx1201 runs the BF16 non-shuffled KV cache path only")
+    if block_size == 16 and DEVICE_ARCH != "gfx1201":
+        pytest.skip("block_size 16 is the RDNA vLLM page size")
 
     if kv_dtype == torch.uint8:
         if DEVICE_ARCH not in ("gfx1250",):
@@ -1169,3 +1177,41 @@ def test_mla_decode_fwd_unshuffled_query_stride_eligibility(
     assert query.stride(2) == query_stride
     assert launches == [query_stride == 1]
     assert result is output
+
+
+@pytest.mark.parametrize("arch", ["gfx1100", "gfx1201", "gfx1250"])
+@pytest.mark.parametrize("kv_dtype", [torch.bfloat16, torch.float16, e4m3_dtype])
+def test_mla_decode_select_3d_config_arch_table(monkeypatch, arch, kv_dtype):
+    import aiter.ops.triton.attention.mla as mla_module
+    from aiter.ops.triton.utils.config_utils import (
+        load_config_json,
+        resolve_config_dir,
+    )
+
+    # Host-only: select_3d_config reads the MLA decode config of the patched arch.
+    monkeypatch.setattr(arch_info, "get_arch", lambda: arch)
+    monkeypatch.setattr(mla_module, "DEVICE_ARCH", arch)
+    monkeypatch.setattr(mla_module, "IS_DEVICE_ARCH_GFX12", arch == "gfx1250")
+    table = load_config_json(
+        f"{resolve_config_dir('attention', 'MLA_DECODE')}/DEFAULT.json",
+        required=False,
+    )
+    entry = (table or {}).get(str(kv_dtype).removeprefix("torch."))
+    if arch == "gfx1201" and kv_dtype == torch.bfloat16:
+        assert entry is not None, "gfx1201 must have a BF16 KV entry"
+    for num_seqs, max_seqlen_k in [(1, 2048), (4, 32768), (128, 8192)]:
+        attn, reduce = mla_module.select_3d_config(
+            16, max_seqlen_k, 4 * 64, num_seqs, torch.bfloat16, kv_dtype, False, 16
+        )
+        segments = attn["NUM_SEGMENTS_PER_SEQ"]
+        assert segments == reduce["NUM_SEGMENTS_PER_SEQ"]
+        if arch == "gfx1250":
+            continue  # gfx1250 has its own branch and does not read this table
+        if entry is None:
+            # No entry: the generic split path.
+            assert attn["num_warps"] == 2 and reduce["num_warps"] == 1
+            assert 8 <= segments <= 128
+        else:
+            assert attn["num_warps"] == entry["attn"]["num_warps"]
+            assert reduce["num_warps"] == entry["reduce"]["num_warps"]
+            assert 8 <= segments <= entry["attn"]["MAX_SEGMENTS"]
