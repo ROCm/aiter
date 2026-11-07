@@ -774,6 +774,26 @@
         "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
+    "module_moe_nvfp4": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/kernels/nvfp4_moe/moe_nvfp4_instances.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/nvfp4_moe/moe_nvfp4.cu'",
+            "f'{AITER_CSRC_DIR}/pybind/moe_nvfp4_pybind.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-fno-gpu-flush-denormals-to-zero'",
+            "'-mllvm -enable-post-misched=1'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [
+            "f'{AITER_CSRC_DIR}/kernels/nvfp4_moe'"
+        ],
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": "''",
+        "is_experimental": "True"
+    },
     "module_fmha_fwd_bf16_opus": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/py_itfs_cu/fmha_fwd_bf16_opus_kernels.cu'",
