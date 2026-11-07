@@ -7,6 +7,7 @@ Run with: python -m pytest -q op_tests/test_flydsl_pa_decode.py
 """
 
 import importlib.util
+import inspect
 from functools import partial
 from itertools import product
 
@@ -2140,3 +2141,189 @@ def test_pa_decode_unowned_kv_rows(
     assert torch.equal(poisoned, clean)
     if fill == "nan":
         assert torch.equal(run("zero", mask_unowned_kv=False), clean)
+
+
+@pytest.mark.parametrize(
+    "kv,query_length,per_token",
+    [("fp8", 1, False), ("fp8", 2, True), ("mxfp4", 1, False)],
+)
+def test_pa_decode_static_graph_and_plan_reuse(
+    device, monkeypatch, kv, query_length, per_token
+):
+    """Wide-table replay rewrites empty partials and preserves the caller plan."""
+    if get_gfx_runtime() != "gfx950":
+        pytest.skip("static split runs on gfx950")
+    if torch.cuda.get_device_properties(device).multi_processor_count < 16:
+        pytest.skip("the static split needs at least eight CTAs per row")
+    pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    compile_tile = pa.compile_pa_decode_tile
+    static_calls = []
+
+    def track_static(**kwargs):
+        static_calls.append(kwargs.get("static_partitions", 0))
+        return compile_tile(**kwargs)
+
+    monkeypatch.setattr(pa, "compile_pa_decode_tile", track_static)
+    torch.manual_seed(71)
+    capacity, group, page, dim = (
+        16384,
+        8,
+        128 if kv == "mxfp4" else 64,
+        128 if kv == "mxfp4" else 256,
+    )
+    query, key, value, table, context = _make_inputs(
+        query_length,
+        1,
+        group,
+        dim,
+        page,
+        torch.bfloat16,
+        "random",
+        device,
+        (capacity, capacity),
+    )
+    # Distinct physical pages expose stale or prematurely overwritten page IDs.
+    values = (torch.arange(value.shape[0], device=device) % 8 + 1).float() / 8
+    value.copy_(values[:, None, None, None].expand_as(value))
+    if kv == "mxfp4":
+        # A smaller scheduling hint has always allowed extra table padding.
+        table = torch.nn.functional.pad(table, (0, 4097 - table.shape[1]))
+        kp, logical_key = _mxfp4_pages(key)
+        vp, logical_value = _mxfp4_pages(value)
+        (kc, ks), (vc, vs) = _mxfp4_views(kp), _mxfp4_views(vp)
+        plan = None
+    else:
+        fp8 = dtypes.fp8
+        key, value = key.to(fp8), value.to(fp8)
+        shape = (*key.shape[:3], 1) if per_token else (1,)
+        ks = torch.ones(shape, dtype=torch.float32, device=device)
+        vs = torch.ones_like(ks)
+        if per_token:
+            vs.copy_(
+                (torch.arange(page, device=device) % 7 + 4)[None, None, :, None] / 8
+            )
+        logical_key, logical_value = key.float() * ks, value.float() * vs
+        kc = key.reshape(-1, 1, page, dim // 16, 16).permute(0, 1, 3, 2, 4).contiguous()
+        vc = (
+            value.reshape(-1, 1, page // 16, 16, dim)
+            .permute(0, 1, 2, 4, 3)
+            .contiguous()
+        )
+        plan = pa.plan_pa_decode(
+            context, 1, max_partitions=1, query_length=query_length
+        )
+        original_info, original_work = plan.reduce_info.clone(), plan.work_info.clone()
+    output = torch.empty_like(query)
+
+    def launch(out=output):
+        pa.pa_decode(
+            out,
+            query,
+            kc,
+            vc,
+            context,
+            table,
+            dim**-0.5,
+            query_length,
+            work_plan=plan,
+            key_scale=ks,
+            value_scale=vs,
+            max_context_length=capacity,
+        )
+
+    def check(out=output):
+        reference = _reference(
+            _round_query_e4m3(query) if kv == "mxfp4" else query,
+            logical_key,
+            logical_value,
+            table,
+            context,
+            query_length,
+            0,
+            None,
+        )
+        assert torch.isfinite(out).all()
+        torch.testing.assert_close(out.float(), reference, atol=2.5e-2, rtol=2.5e-2)
+        zero = reference.abs().sum(-1) == 0
+        assert (out[zero] == 0).all()
+        if plan is not None:
+            assert torch.equal(plan.reduce_info, original_info)
+            assert torch.equal(plan.work_info, original_work)
+
+    launch()
+    check()
+    assert static_calls[-1] >= 2
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        launch()
+    for lengths in (
+        (capacity - 1, 257),
+        (0, 0),
+        (1, 255),
+        (256, 257),
+        (capacity, capacity),
+    ):
+        context.copy_(torch.tensor(lengths, dtype=torch.int32, device=device))
+        query.neg_()
+        output.fill_(float("nan"))
+        graph.replay()
+        check()
+        previous = output.clone()
+        for _ in range(20):
+            output.fill_(float("nan"))
+            graph.replay()
+            assert torch.equal(output, previous)
+    if plan is not None:
+        # This fallback uses the original packed plan, after a static call used
+        # a different number of private slots. No plan refresh is needed: the
+        # last replay restored the original lengths.
+        padded = torch.full(
+            (query.shape[0], 2 * group, dim),
+            float("nan"),
+            dtype=query.dtype,
+            device=device,
+        )
+        strided = padded[:, :group]
+        launch(strided)
+        check(strided)
+        assert torch.isnan(padded[:, group:]).all()
+
+
+@pytest.mark.parametrize("max_partitions", [1, 2])
+def test_pa_decode_gfx1250_launch_signature(device, monkeypatch, max_partitions):
+    """Bind host arguments to the actual gfx1250 JIT signature without launching."""
+    pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    query, key, value, table, context = _make_inputs(
+        1,
+        1,
+        8,
+        128,
+        128,
+        torch.bfloat16,
+        "random",
+        device,
+        (257,),
+    )
+    key = key.reshape(-1, 1, 128, 16, 8).permute(0, 1, 3, 2, 4).contiguous()
+    value = value.reshape(-1, 1, 16, 8, 128).permute(0, 1, 2, 4, 3).contiguous()
+    plan = pa.plan_pa_decode(context, 1, max_partitions=max_partitions)
+    monkeypatch.setattr(pa, "get_gfx_runtime", lambda: "gfx1250")
+    calls = []
+
+    def bind_launch(launch, *args):
+        inspect.signature(launch.func).bind(*args)
+        calls.append(launch)
+
+    monkeypatch.setattr(pa, "_run_compiled", bind_launch)
+    pa.pa_decode(
+        torch.empty_like(query),
+        query,
+        key,
+        value,
+        context,
+        table,
+        128**-0.5,
+        1,
+        work_plan=plan,
+    )
+    assert len(calls) == 1
