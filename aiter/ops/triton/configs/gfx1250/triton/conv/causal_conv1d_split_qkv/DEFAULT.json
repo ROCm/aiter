@@ -1,0 +1,50 @@
+{
+    "M_LEQ_16": {
+        "R": 1,
+        "BC": 2,
+        "BD": 256,
+        "ORDER": 0,
+        "SEQ_VEC": 256,
+        "num_warps": 2
+    },
+    "M_LEQ_64": {
+        "R": 1,
+        "BC": 8,
+        "BD": 128,
+        "ORDER": 0,
+        "SEQ_VEC": 256,
+        "num_warps": 1
+    },
+    "M_LEQ_1024": {
+        "R": 2,
+        "BC": 8,
+        "BD": 64,
+        "ORDER": 2,
+        "SEQ_VEC": 256,
+        "num_warps": 1
+    },
+    "M_LEQ_2048": {
+        "R": 1,
+        "BC": 8,
+        "BD": 128,
+        "ORDER": 2,
+        "SEQ_VEC": 256,
+        "num_warps": 1
+    },
+    "M_LEQ_4096": {
+        "R": 4,
+        "BC": 16,
+        "BD": 128,
+        "ORDER": 0,
+        "SEQ_VEC": 256,
+        "num_warps": 4
+    },
+    "any": {
+        "R": 8,
+        "BC": 32,
+        "BD": 128,
+        "ORDER": 2,
+        "SEQ_VEC": 256,
+        "num_warps": 8
+    }
+}
