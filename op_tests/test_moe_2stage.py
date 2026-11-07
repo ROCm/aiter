@@ -145,6 +145,8 @@ def test_fmoe(
     disable_stage2_bias=False,
     ref_dtype="bf16",
     gate_up_layout: bool | None = None,
+    output_offset=0,
+    output_perf=False,
 ):
     if get_gfx() not in ["gfx950"] and qType in [aiter.QuantType.per_1x32]:
         return
@@ -589,10 +591,11 @@ def test_fmoe(
         logger.error(
             "output contains NaN! (possible aiter #3117 stage2 K-pad regression)"
         )
+    flops = token * model_dim * inter_dim * 3 * topk * 2
     err = checkAllclose(
         out2_ref,
         out2_ck,
-        msg=f"ck_moe_2stages:{us2:>8.2f} us, {token*model_dim*inter_dim*3*topk*2/us2/1000/1000:>8.2f} tflops......(quant:{AQDType})",
+        msg=f"ck_moe_2stages:{us2:>8.2f} us, {flops/us2/1000/1000:>8.2f} tflops......(quant:{AQDType})",
     )
 
     def calc_diff(x: torch.Tensor, y: torch.Tensor):
@@ -618,7 +621,102 @@ def test_fmoe(
             f"accuracy check failed (non-strict): err={err}, logits_diff={logits_diff}"
         )
 
-    return {"us": us2, "logits_diff": float(logits_diff)}
+    # Callers such as the serving MoE layer hand fused_moe their own [token,
+    # model_dim] buffer. Fill it with NaN so a path that skips zeroing it before
+    # accumulating, or writes the result elsewhere, cannot pass. output_offset
+    # starts it that many elements into its allocation, as a contiguous view.
+    out_pool = torch.full(
+        (out2_ck.numel() + output_offset,),
+        float("nan"),
+        dtype=out2_ck.dtype,
+        device=out2_ck.device,
+    )
+    out_buf = out_pool[output_offset:].view(out2_ck.shape)
+    out_ret = fused_moe(
+        input,
+        w1_qt_aiter,
+        w2_qt_aiter,
+        topk_weights,
+        topk_ids,
+        output=out_buf,
+        **_fused_moe_kwargs,
+    )
+    # calc_diff turns an inf element into NaN, which no threshold catches.
+    out_non_finite = not out_buf.isfinite().all().item()
+    out_err = checkAllclose(
+        out2_ref.to(dtypes.fp32),
+        out_buf.to(dtypes.fp32),
+        msg="ck_moe_2stages output=",
+    )
+    out_logits_diff = calc_diff(out2_ref, out_buf)
+    out_failed = (
+        out_ret is not out_buf
+        or out_non_finite
+        or (out_err != 0 and out_logits_diff > 0.01)
+    )
+    out_msg = (
+        f"output= check failed: returned buf={out_ret is out_buf}, "
+        f"non_finite={out_non_finite}, err={out_err}, logits_diff={out_logits_diff}"
+    )
+    if strict_accuracy:
+        assert not out_failed, out_msg
+    elif out_failed:
+        logger.warning("accuracy check failed (non-strict): %s", out_msg)
+    ret = {
+        "us": us2,
+        "logits_diff": float(logits_diff),
+        "output err": out_err,
+        "output logits_diff": float(out_logits_diff),
+    }
+    if not output_perf:
+        return ret
+    # Time the output= call too (--output-perf; it doubles the timed calls of a
+    # sweep): it is how the serving layer calls fused_moe, and writing into the
+    # caller's buffer is what saves the copy. Checked above, as the timed calls
+    # overwrite out_buf and may run on rotated copies of it.
+    _, out_us = run_perftest(
+        fused_moe,
+        input,
+        w1_qt_aiter,
+        w2_qt_aiter,
+        topk_weights,
+        topk_ids,
+        num_iters=5,
+        num_warmup=2,
+        output=out_buf,
+        **_fused_moe_kwargs,
+    )
+    # Bytes one call moves: activations in and out, routing, and the weights,
+    # scales and biases of the experts the tokens are routed to.
+    routed_experts = topk_ids.unique().numel()
+    expert_bytes = sum(
+        t.nbytes
+        for t in (
+            w1_qt_aiter,
+            w2_qt_aiter,
+            w1_scale_aiter,
+            w2_scale_aiter,
+            exp_bias1_aiter,
+            exp_bias2_aiter,
+        )
+        if t is not None
+    )
+    out_nbytes = (
+        input.nbytes
+        + out_buf.nbytes
+        + topk_weights.nbytes
+        + topk_ids.nbytes
+        + expert_bytes * routed_experts // E
+    )
+
+    ret.update(
+        {
+            "output us": out_us,
+            "output TFLOPS": flops / out_us / 1e6,
+            "output TB/s": out_nbytes / out_us / 1e6,
+        }
+    )
+    return ret
 
 
 l_quant = [
@@ -814,6 +912,13 @@ parser.add_argument(
     "in fp32 so the a2 mxfp4 amax is taken over fp32 (mirrors the fused asm "
     "kernel, which computes amax on the in-register fp32 silu result, instead "
     "of the bf16 round-trip the 2-stage flydsl/torch path does). Default: bf16.",
+)
+
+parser.add_argument(
+    "--output-perf",
+    action="store_true",
+    help="Also time each case's fused_moe(output=) call and report its us, TFLOPS "
+    "and TB/s. Its accuracy is always checked; timing it doubles the timed calls.",
 )
 
 args = parser.parse_args()
@@ -1445,8 +1550,8 @@ def test_presorted_moe_hook():
     presorted, and "own err" (diff vs the own sort on the timed routing) for both
     presorted calls. Its eager summed kernel time does not rank the two presorted
     calls (a GPU idle gap before GEMM1 skews it); graph replay does. Then the
-    contract: a reused-address moe_buf is zeroed, a 2-byte-aligned output is
-    copied back while a 4-byte-aligned one is used in place, and a registration
+    contract: a reused-address moe_buf is zeroed, a 2- or 4-byte-aligned output
+    is copied back while a 16-byte-aligned one is used in place, and a registration
     that does not match the call is ignored and still consumed, so it never
     leaks into a later call, even when fused_moe exits before sorting.
     """
@@ -1690,9 +1795,10 @@ def test_presorted_moe_hook():
         assert handed and out is stale, "presort did not allocate its own moe_buf"
         check_close(ref, out, "reused-address moe_buf was not zeroed")
 
-        # An output at an odd bf16 element (2-byte aligned) cannot be the atomic
-        # moe_buf (GEMM2's 4-byte atomics fault on it): fused_moe uses a fresh
-        # one and copies back. A 4-byte-aligned one is used in place.
+        # The kernels store moe_buf as 16-byte vectors (and GEMM2's 4-byte atomics
+        # fault at an odd bf16 element), so an output below 16-byte alignment gets
+        # a fresh moe_buf and fused_moe copies back. A 16-byte-aligned one is used
+        # in place.
         real_return = fm._return_output
         copies = []
 
@@ -1700,7 +1806,7 @@ def test_presorted_moe_hook():
             copies.append(output is not None and ret is not output)
             return real_return(ret, output)
 
-        for offset, copied in ((1, True), (2, False)):
+        for offset, copied in ((1, True), (2, True), (8, False)):
             pool = torch.empty(token * model_dim + offset, dtype=dtype)
             buf = pool[offset:].view(token, model_dim)
             sort_calls.clear()
@@ -2171,6 +2277,96 @@ def test_bm16_tiled_scale_boundary():
             os.environ["AITER_BF16_FP8_MOE_BOUND"] = old_moe_bound
 
 
+def test_adaptive_sort_output_in_place():
+    """The a4w4 adaptive aux sort accumulates straight into the caller's output.
+
+    Kimi-K3 A4W4 TP=8. test_fmoe hands fused_moe a NaN-filled output buffer and
+    checks it against the torch reference; here we also check that the adaptive
+    sort returned that buffer as its atomic moe_buf and it was never copied into.
+    The sort zeroes moe_buf with 16-byte stores, so a buffer starting 2 or 4
+    bytes into its allocation must take a fresh moe_buf and be copied into; one
+    starting 16 bytes in stays in place.
+    """
+    global AITER_MOE_NUM_EXPERT_ACTIVATED
+    fm = aiter.fused_moe
+    real_adaptive = fm._adaptive_moe_sort
+    real_return = fm._return_output
+    # AITER_MOE_SORT_BACKEND=opus/ck bypasses the adaptive sort under test.
+    real_backend = fm._MOE_SORT_BACKEND
+    # The parsed override can exceed token * topk at M=1 and make test_fmoe raise.
+    real_n_act = AITER_MOE_NUM_EXPERT_ACTIVATED
+    # One entry per adaptive sort: whether its moe_buf is the buffer it was handed.
+    in_place, copies = [], []
+
+    def tracking_adaptive(*a, **kw):
+        ret = real_adaptive(*a, **kw)
+        output = kw.get("output")
+        in_place.append(output is not None and ret[4] is output)
+        return ret
+
+    def tracking_return(ret, output):
+        if output is not None and ret is not output:
+            copies.append(1)
+        return real_return(ret, output)
+
+    # Decode batches; their tuned BM=16 configs take the adaptive aux sort.
+    # Kimi-K3 config.json: model_dim = routed_expert_hidden_size (3584),
+    # inter_dim = moe_intermediate_size / TP (3072 / 8 = 384),
+    # E = num_experts (896), topk = num_experts_per_token (16).
+    rows = []
+    torch.manual_seed(0)
+    try:
+        fm._adaptive_moe_sort = tracking_adaptive
+        fm._return_output = tracking_return
+        fm._MOE_SORT_BACKEND = "auto"
+        AITER_MOE_NUM_EXPERT_ACTIVATED = 0
+        with override_env("AITER_SITUV2_A8W4", None), override_env(
+            "AITER_SITUV2_A4W4", "1"
+        ):
+            # output_offset is in bf16 elements: 1, 2 and 8 are 2, 4 and 16 bytes.
+            for token, output_offset in ((1, 0), (4, 0), (1, 1), (1, 2), (1, 8)):
+                in_place.clear()
+                copies.clear()
+                rows.append(
+                    test_fmoe(
+                        dtype=dtypes.bf16,
+                        token=token,
+                        model_dim=3584,
+                        inter_dim=384,
+                        E=896,
+                        topk=16,
+                        actType=aiter.ActivationType.Situv2,
+                        gateMode=GateMode.SEPARATED.value,
+                        qType=aiter.QuantType.per_1x32,
+                        AQDType=dtypes.fp4x2,
+                        WQDType=dtypes.fp4x2,
+                        use_g1u1=True,
+                        check_aot_cache=False,
+                        output_offset=output_offset,
+                        output_perf=True,
+                    )
+                )
+                case = f"token={token} output_offset={output_offset}"
+                assert in_place, f"{case}: the adaptive sort did not run"
+                if output_offset % 8:
+                    assert copies, f"{case}: underaligned output not copied into"
+                    assert not any(in_place), f"{case}: underaligned output in place"
+                else:
+                    assert any(in_place), f"{case}: output is not the sort's moe_buf"
+                    assert not copies, f"{case}: output was copied into"
+                gc.collect()
+                torch.cuda.empty_cache()
+    finally:
+        fm._adaptive_moe_sort = real_adaptive
+        fm._return_output = real_return
+        fm._MOE_SORT_BACKEND = real_backend
+        AITER_MOE_NUM_EXPERT_ACTIVATED = real_n_act
+    aiter.logger.info(
+        "moe_2stage adaptive-sort in-place output summary (markdown):\n%s",
+        pd.DataFrame(rows).to_markdown(index=False),
+    )
+
+
 def test_output_buffer_contract():
     """Validate output identity, copy-back, validation, and compile contracts."""
     torch.manual_seed(0)
@@ -2202,8 +2398,8 @@ def test_output_buffer_contract():
         kw["output"] = None
         return sort(*a, **kw)
 
-    # in_place=False stands in for FLAT, adaptive-aux atomic, and grouped gfx1250
-    # paths, which cannot take the caller's buffer and must copy their result into it.
+    # in_place=False stands in for FLAT and grouped gfx1250 paths, which cannot
+    # take the caller's buffer and must copy their result into it.
     for in_place in (True, False):
         try:
             if not in_place:
@@ -2237,13 +2433,146 @@ def test_output_buffer_contract():
         "a non-contiguous output",
         output=torch.empty((token, model_dim * 2), dtype=dtype)[:, ::2],
     )
-    # moe_sorting zeroes output before stage1 reads hidden_states.
+    # moe_sorting zeroes output before the stages read their inputs.
     expect_raise("an output overlapping hidden_states", output=hidden)
+    for name, tensor in (("w1", w1), ("w2", w2)):
+        expect_raise(
+            f"an output overlapping {name}",
+            output=tensor.view(-1)[: token * model_dim].view(token, model_dim),
+        )
 
     # Disjoint slices of one pool are the symmetric-buffer case, and stay legal.
     pool = torch.zeros((2 * token, model_dim), dtype=dtype)
     pool[:token] = hidden
     assert torch.equal(fused_moe(pool[:token], *args[1:], output=pool[token:]), ref)
+    # A view 1 or 2 bf16 elements into its allocation is only 2- or 4-byte
+    # aligned. The kernels store output as 16-byte vectors (and atomic GEMM2
+    # faulted the GPU queue on the 2-byte one), so such a buffer is filled through
+    # a fresh one and a copy, and one 8 elements (16 bytes) in is used in place.
+    # fused_moe_2stages, which writes output= itself in reduce mode, must see the
+    # same choice.
+    fm = aiter.fused_moe
+    real_return = fm._return_output
+    real_2stages = fm.fused_moe_2stages
+    copies, stage_outputs = [], []
+
+    def tracking_return(ret, output):
+        copies.append(ret is not output)
+        return real_return(ret, output)
+
+    def tracking_2stages(*a, **kw):
+        stage_outputs.append(kw.get("output"))
+        return real_2stages(*a, **kw)
+
+    for offset in (1, 2, 8):
+        offset_pool = torch.full(
+            (token * model_dim + offset,), float("nan"), dtype=dtype
+        )
+        buf = offset_pool[offset:].view(token, model_dim)
+        copies.clear()
+        stage_outputs.clear()
+        try:
+            fm._return_output = tracking_return
+            fm.fused_moe_2stages = tracking_2stages
+            assert fused_moe(*args, output=buf) is buf, f"{offset=}: buf not returned"
+        finally:
+            fm._return_output = real_return
+            fm.fused_moe_2stages = real_2stages
+        assert torch.equal(buf, ref), f"{offset=}: buf does not hold the result"
+        aligned = offset % 8 == 0
+        assert copies == [not aligned], f"{offset=}: copied into: {copies}"
+        assert len(stage_outputs) == 1 and stage_outputs[0] is (
+            buf if aligned else None
+        ), f"{offset=}: fused_moe_2stages got the wrong output"
+    # The same through the FlyDSL sort (AITER_USE_FLYDSL_MOE_SORTING=1), whose
+    # launcher raised on a 2-byte-aligned buffer. AITER_USE_CK_MOE_SORTING=1
+    # would take precedence, so it is forced off here too.
+    odd_pool = torch.full((token * model_dim + 1,), float("nan"), dtype=dtype)
+    odd = odd_pool[1:].view(token, model_dim)
+    real_use_ck = fm._USE_CK_MOE_SORTING
+    real_use_flydsl = fm._USE_FLYDSL_MOE_SORTING
+    real_flydsl_sort = fm._flydsl_moe_sorting
+    flydsl_sorts = []
+
+    def counting_flydsl_sort(*a, **kw):
+        flydsl_sorts.append(1)
+        return real_flydsl_sort(*a, **kw)
+
+    try:
+        fm._USE_CK_MOE_SORTING = False
+        fm._USE_FLYDSL_MOE_SORTING = True
+        fm._flydsl_moe_sorting = counting_flydsl_sort
+        flydsl_ref = fused_moe(*args)
+        odd.fill_(float("nan"))
+        assert fused_moe(*args, output=odd) is odd, "FlyDSL sort: output not returned"
+        assert flydsl_sorts, "the FlyDSL sort did not run"
+        assert torch.equal(
+            odd, flydsl_ref
+        ), "FlyDSL sort: output does not hold the result"
+    finally:
+        fm._USE_CK_MOE_SORTING = real_use_ck
+        fm._USE_FLYDSL_MOE_SORTING = real_use_flydsl
+        fm._flydsl_moe_sorting = real_flydsl_sort
+
+    # Called directly, moe_sorting has no copy-back, so it rejects an output its
+    # 16-byte stores cannot write instead of faulting in the kernel.
+    for offset in (1, 2, 8):
+        offset_pool = torch.zeros((token * model_dim + offset,), dtype=dtype)
+        sort_out = offset_pool[offset:].view(token, model_dim)
+        try:
+            moe_buf = fm.moe_sorting(
+                topk_ids, topk_weights, E, model_dim, dtype, output=sort_out
+            )[4]
+        except ValueError:
+            assert offset % 8, f"{offset=}: a 16-byte-aligned output was rejected"
+        else:
+            assert not offset % 8, f"{offset=}: an underaligned output was accepted"
+            assert moe_buf is sort_out, f"{offset=}: moe_buf is not the output"
+
+    check_overlap = aiter.fused_moe._validate_output_buffer_no_overlap
+    # A strided scale view reaches past its logical nbytes: scale_pool[::2] holds
+    # 8 rows (16 KiB) yet its expert 7 row starts at byte 28672, and the kernels
+    # honor stride(0). An output over that row must be rejected.
+    scale_pool = torch.zeros((16, model_dim), dtype=dtypes.fp32)
+    strided_scale = scale_pool[::2]
+    row = scale_pool[14].view(dtype)[:model_dim].view(1, model_dim)
+    assert row.data_ptr() >= strided_scale.data_ptr() + strided_scale.nbytes
+    try:
+        check_overlap(row, (("w1_scale", strided_scale),))
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("output overlapping a strided w1_scale view was accepted")
+    # Memory past the view's last element stays legal.
+    check_overlap(
+        scale_pool[15].view(dtype)[:model_dim].view(1, model_dim),
+        (("w1_scale", strided_scale),),
+    )
+
+    # The check clears most inputs from data_ptr/nbytes alone before the exact
+    # span test; probe each edge of that screen around one output row.
+    flat = torch.zeros(4 * model_dim, dtype=dtype)
+    out_row = flat[model_dim : 2 * model_dim].view(1, model_dim)
+    for described, tensor, overlaps in (
+        ("an input covering output from below", flat[: 3 * model_dim], True),
+        ("an input starting inside output", flat[2 * model_dim - 1 :], True),
+        ("an input ending where output starts", flat[:model_dim], False),
+        ("an input starting where output ends", flat[2 * model_dim :], False),
+        ("an empty input inside output", flat[model_dim + 1 : model_dim + 1], False),
+    ):
+        try:
+            check_overlap(out_row, (("x", tensor),))
+        except RuntimeError:
+            assert overlaps, f"{described} was rejected"
+        else:
+            assert not overlaps, f"{described} was accepted"
+    # Tensors in the stage extra-arg dicts (FHMoE shared weights) count as inputs.
+    try:
+        check_overlap(out_row, (), ({"shared_expert_id": 0, "shared_w1": flat}, None))
+    except RuntimeError as e:
+        assert "shared_w1" in str(e), e
+    else:
+        raise AssertionError("output overlapping an extra-arg tensor was accepted")
 
     stage2_scatter = Stage2ScatterContext(
         arena_handle=0,
@@ -2433,6 +2762,17 @@ test_route_workspace_token_capacity()
 if args.bm16_scale_boundary:
     test_bm16_tiled_scale_boundary()
 else:
+    # Kimi-K3 weights at two batch sizes; skip it for an explicit CLI quant
+    # sweep, like the tuned-CSV validation below.
+    if args.quant is not None:
+        aiter.logger.info("skipping adaptive-sort in-place output test for --quant")
+    elif get_gfx() == "gfx950":
+        test_adaptive_sort_output_in_place()
+    else:
+        aiter.logger.warning(
+            "%s: skipping adaptive-sort in-place output test (a4w4 is gfx950-only)",
+            get_gfx(),
+        )
     test_output_buffer_contract()
     test_swiglu_mxfp4_nonsplit_nobias_dispatch()
     test_swiglu_mxfp4_untagged_layout_dispatch()
@@ -2514,7 +2854,10 @@ for kwargs, extras in case_iter:
         )
         with aot_guard:
             ret = test_fmoe(
-                **kwargs, kernel_bench=args.kernel, ref_dtype=args.ref_dtype
+                **kwargs,
+                kernel_bench=args.kernel,
+                ref_dtype=args.ref_dtype,
+                output_perf=args.output_perf,
             )
     except torch.cuda.OutOfMemoryError as exc:
         aiter.logger.warning(
