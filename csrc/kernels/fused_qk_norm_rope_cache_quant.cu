@@ -35,6 +35,8 @@
 #include "quant_amax_floor.h"
 #include "mx_quant_utils.h"  // fp_f32_to_e8m0_scale (MX RoundUp E8M0 block scale)
 #include "rope/rope_common.h"
+#include "fused_qk_norm_rope_group_quant_gfx1250.cuh"
+#include "gemm_dispatch_utils.h" // get_device_gfx
 
 #define CHECK_TYPE(x, st)                     \
     AITER_CHECK(x.dtype() == st,              \
@@ -6481,6 +6483,76 @@ void fused_qk_norm_rope_group_quant(
   void* q_weight_ptr   = has_q_weight ? q_weight->data_ptr()   : nullptr;
   void* q_scale_ptr    = (q_is_fp8 && q_scale.has_value()) ? q_scale->data_ptr() : nullptr;
   void* q_rope_out_ptr = has_q_rope   ? q_rope_buff->data_ptr() : nullptr;
+
+  // ---------------------------------------------------------------------------
+  // gfx1250: the multi-row TDM kernel (fused_qk_norm_rope_group_quant_gfx1250.cuh)
+  // for the DeepSeek-V4 configuration it implements -- bf16 in, fp8 Q and K with
+  // the 1x64 e8m0 scale, weightless Q, GPT-J RoPE -- with packed Q/output rows
+  // and the alignment its vector stores and TDM copies need. Anything else
+  // falls through to the coarse kernel below. Its outputs are bit-identical to
+  // the coarse kernel's.
+  // ---------------------------------------------------------------------------
+  {
+    // Per device: a process may drive GPUs of different archs, and on any other
+    // arch the kernel body is compiled out.
+    const bool is_gfx1250 = get_device_gfx() == "gfx1250";
+    auto aligned = [](const void* p, uintptr_t n) {
+      return reinterpret_cast<uintptr_t>(p) % n == 0;
+    };
+    const bool fast = is_gfx1250 && kv.dtype() == AITER_DTYPE_bf16 && q_is_fp8 &&
+                      kv_cache_dtype == "fp8" && quant_group_size == 64 &&
+                      scale_dtype != "fp32" && !has_q_weight && !is_neox &&
+                      head_dim == 512 && rot_dim == 64 && num_heads % 4 == 0 &&
+                      // Q rows packed 512 apart; the token pitch is free.
+                      q.stride(2) == 1 && q.stride(1) == 512 && q_stride_0 % 8 == 0 &&
+                      aligned(q.data_ptr(), 16) &&
+                      kv_stride_0 % 8 == 0 && aligned(kv.data_ptr(), 16) &&
+                      k_weight.stride(0) == 1 && aligned(k_weight.data_ptr(), 16) &&
+                      // Outputs: token-contiguous rows, as the wrapper allocates them.
+                      q_out_stride_1 == 512 && q_out_stride_0 == num_heads * 512 &&
+                      aligned(q_nope_scale_buff.data_ptr(), 16) &&
+                      has_q_rope && q_rope_buff->dim() == 3 && q_rope_out_stride_1 == 64 &&
+                      q_rope_out_stride_0 == num_heads * 64 &&
+                      aligned(q_rope_buff->data_ptr(), 4) &&
+                      token_stride == 512 && aligned(k_nope_scale_buff.data_ptr(), 16) &&
+                      k_pe_out_stride_0 == 64 && aligned(k_rope_buff.data_ptr(), 4) &&
+                      (!has_swa ||
+                       (mla_params.swa_nope_row_stride % 16 == 0 && aligned(swa_nope_ptr, 16) &&
+                        mla_params.swa_rope_row_stride % 2 == 0 && aligned(swa_rope_ptr, 4)));
+    if (fast) {
+      aiter::qknr_gfx1250::LaunchArgs a{};
+      a.q                   = q.data_ptr();
+      a.positions           = positions.data_ptr();
+      a.cos_cache           = cos_cache.data_ptr();
+      a.sin_cache           = sin_cache.data_ptr();
+      a.kv                  = kv.data_ptr();
+      a.k_weight            = k_weight.data_ptr();
+      a.q_nope              = q_nope_scale_buff.data_ptr();
+      a.q_rope              = q_rope_out_ptr;
+      a.k_nope              = k_nope_scale_buff.data_ptr();
+      a.k_rope              = k_rope_buff.data_ptr();
+      a.swa_dest_row        = static_cast<const int32_t*>(swa_dest_row_ptr);
+      a.batch_id            = static_cast<const int32_t*>(swa_bid_ptr);
+      a.swa_nope            = swa_nope_ptr;
+      a.swa_rope            = swa_rope_ptr;
+      a.swa_block_tables    = static_cast<const int32_t*>(swa_block_tables_ptr);
+      a.eps                 = static_cast<float>(eps);
+      a.num_tokens          = num_tokens;
+      a.num_heads           = num_heads;
+      a.q_stride_0          = q_stride_0;
+      a.kv_stride_0         = kv_stride_0;
+      a.max_position        = mla_params.max_position;
+      a.swa_mode            = !has_swa ? 0 : (swa_dest_row_ptr != nullptr ? 1 : 2);
+      a.swa_num_rows        = mla_params.swa_num_rows;
+      a.swa_nope_row_stride = mla_params.swa_nope_row_stride;
+      a.swa_rope_row_stride = mla_params.swa_rope_row_stride;
+      a.swa_block_size      = mla_params.swa_block_size;
+      a.swa_bt_stride       = mla_params.swa_block_tables_stride;
+      a.swa_bt_blocks       = mla_params.swa_block_tables_blocks;
+      aiter::qknr_gfx1250::launch(a, stream);
+      return;
+    }
+  }
 
   int num_CUs;
   hipDeviceGetAttribute(&num_CUs, hipDeviceAttributeMultiprocessorCount, kv.device_id);
