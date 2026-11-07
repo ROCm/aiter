@@ -1,5 +1,9 @@
 # Transactional JIT cache
 
+This page covers AITER native-extension build caches. For the separate FlyDSL
+kernel-artifact cache and container mounts, see
+[Persisting FlyDSL kernel caches](flydsl_container_cache.md).
+
 Code generation uses a fixed `{bd_dir}/{module}/blob.staging` tree so Ninja
 input paths, unchanged-file mtimes and debug source paths survive a build.
 The compiler writes objects under `{module}/build`. After the binary is
