@@ -1685,7 +1685,7 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
 
     source_tag = f"srctk{source_topk}" if source_topk > 0 else "srcrow"
     remap_tag = "_remap" if remap_rows or fuse_ep_psum else ""
-    psum_tag = "_eppsum" if fuse_ep_psum else ""
+    psum_tag = "_eppsum_v2" if fuse_ep_psum else ""
     ksplit_tag = "" if ksplit else "_noKS"
     # In the name because it changes what the kernel READS, not just how fast:
     # two builds with the same feat_dim/quant_mode are not interchangeable.
@@ -1859,7 +1859,11 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
                 else:
                     store_cond = is_lane0
                 if store_cond:
-                    rows_t[route] = row
+                    # K-split + EP psum: other K-group blocks of this route may
+                    # still read rows_t[route]; writing the remapped row in place
+                    # would make them remap it twice (wrong destination row).
+                    if const_expr(not (fuse_ep_psum and ksplit)):
+                        rows_t[route] = row
                     if const_expr(fuse_ep_psum):
                         w_f32 = ptr_buf_tensor(gather_w, fx.BFloat16)[route].to(
                             fx.Float32

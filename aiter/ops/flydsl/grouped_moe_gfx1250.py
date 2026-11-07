@@ -975,7 +975,6 @@ def _grouped_a8w4_tdm_moe(
         and not _fuse_ep_route_quant
         and int(E) <= 256
         and dtype in (torch.bfloat16, dtypes.bf16)
-        and _flydsl_dispatch_context() is not None
         and os.environ.get("AITER_TDM_FUSE_PSUM_QUANT", "1") in ("1", "true", "True")
     )
     ep_psum_params = None
