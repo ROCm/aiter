@@ -86,6 +86,11 @@ def _get_flydsl_moe_kernels():
 
 BLOCK_SIZE_M = 32
 
+# Untuned gfx950 fp8 block-scale MoE: at or below this many routed rows per
+# expert (token * topk // expert), the CK 2-stage path beats the 1-stage asm
+# kernel, whose BLOCK_SIZE_M-row tile per expert is then mostly padding.
+_BLOCKSCALE_2STAGE_MAX_ROWS_PER_EXPERT = 8
+
 _USE_CK_MOE_SORTING = os.environ.get("AITER_USE_CK_MOE_SORTING", "0") == "1"
 _USE_FLYDSL_MOE_SORTING = os.environ.get("AITER_USE_FLYDSL_MOE_SORTING", "0") == "1"
 # Adaptive sort has no shape fallback, so output_aux is limited to generated shapes.
@@ -4599,6 +4604,7 @@ def get_2stage_cfgs(
         kernelName2 = ""
         run_1stage = False
         run_1stage_xbf16 = False
+        few_rows_per_expert = False
         # No tuned config => default host moe_sort (flat=0). A tuned FLAT row
         # sets flat=1 (one token per TG) or flat=2 (EMSORT).
         cfg_flat = AsmMoeMode.SORTED
@@ -4625,6 +4631,14 @@ def get_2stage_cfgs(
                     )
                     == 1
                 )
+                # With few routed rows per expert, the CK 2-stage path with a
+                # narrow block_m is faster than the asm kernel.
+                few_rows_per_expert = (
+                    run_1stage
+                    and get_gfx() == "gfx950"
+                    and token * topk // expert <= _BLOCKSCALE_2STAGE_MAX_ROWS_PER_EXPERT
+                )
+                run_1stage = run_1stage and not few_rows_per_expert
                 run_1stage_xbf16 = run_1stage and xbf16
             elif q_type == QuantType.per_Token and q_dtype_w == dtypes.i8:
                 run_1stage = token > 32
@@ -4638,7 +4652,11 @@ def get_2stage_cfgs(
             if run_1stage
             else (
                 # block_m=16 CK stage1 uses KPerBlock=256 (K=model_dim)
-                (64 if token > 32 else 16 if model_dim % 256 == 0 else 32)
+                (
+                    64
+                    if token > 32 and not few_rows_per_expert
+                    else 16 if model_dim % 256 == 0 else 32
+                )
                 if q_type == QuantType.per_1x128
                 else get_block_size_M(token, topk, expert, inter_dim)
             )
