@@ -16,7 +16,7 @@ from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
 
-SUPPORTED_GFX = ["gfx942", "gfx950"]
+SUPPORTED_GFX = ["gfx942", "gfx950", "gfx1250"]
 
 # Case shapes the correctness checks and the perf sweep share. Each one bends a
 # different part of the op; see make_case for how the inputs are bent.

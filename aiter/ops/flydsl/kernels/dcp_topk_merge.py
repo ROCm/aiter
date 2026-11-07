@@ -34,8 +34,9 @@ _PACK_SHIFT = 16
 _PACK_MASK = (1 << _PACK_SHIFT) - 1
 _N_HIST_BINS = 1 << _RADIX_BITS
 _BLOCK_THREADS = 256
-_WAVE_SIZE = 64
-_NUM_WAVES = _BLOCK_THREADS // _WAVE_SIZE
+# The wave width is a build parameter: wave64 on gfx942/gfx950, wave32 on
+# gfx1250. The block stays _BLOCK_THREADS wide, so wave32 runs twice the waves.
+_WAVE_SIZES = (32, 64)
 _DPP_ROW_SHR_1 = 0x111
 _DPP_ROW_SHR_2 = 0x112
 _DPP_ROW_SHR_4 = 0x114
@@ -60,18 +61,23 @@ def _f32_to_ord(val):
     return is_nan.select(fx.Int32(uint32_to_int32(0x80000000)), ords)
 
 
-def _make_storage():
+def _make_storage(num_waves):
     @fx.struct
     class Storage:
         bins: Array[Int32, _N_HIST_BINS, 16]
-        scan: Array[Int32, _NUM_WAVES + 1, 16]
+        scan: Array[Int32, num_waves + 1, 16]
         # 5 slots: 0=prefix 1=mask 2=remaining_k 3=emitted-count 4=equal-seen
         acc: Array[Int32, 5, 4]
 
     return Storage
 
 
-def build_dcp_topk_merge_module(n_cand, k_loc, topk_tokens, page_size, world_size):
+def build_dcp_topk_merge_module(
+    n_cand, k_loc, topk_tokens, page_size, world_size, wave_size
+):
+    if wave_size not in _WAVE_SIZES:
+        raise ValueError(f"wave size must be 32 or 64, got {wave_size}")
+    num_waves = _BLOCK_THREADS // wave_size
     steps = (n_cand + _BLOCK_THREADS - 1) // _BLOCK_THREADS
     own_steps = (k_loc + _BLOCK_THREADS - 1) // _BLOCK_THREADS
 
@@ -109,9 +115,9 @@ def build_dcp_topk_merge_module(n_cand, k_loc, topk_tokens, page_size, world_siz
                 fx.Int32(_INT32_MIN),
             )
 
-        storage = fx.SharedAllocator().allocate(_make_storage())
+        storage = fx.SharedAllocator().allocate(_make_storage(num_waves))
         s_hist = storage.bins.peek().view(fx.make_layout(_N_HIST_BINS, 1))
-        s_scan = storage.scan.peek().view(fx.make_layout(_NUM_WAVES + 1, 1))
+        s_scan = storage.scan.peek().view(fx.make_layout(num_waves + 1, 1))
         s_acc = storage.acc.peek().view(fx.make_layout(5, 1))
 
         def unwrap_val(val):
@@ -140,30 +146,33 @@ def build_dcp_topk_merge_module(n_cand, k_loc, topk_tokens, page_size, world_siz
             src16 = (lane & fx.Int32(0x30)) - 1
             r16 = fly_rocdl.ds_bpermute(T.i32, src16 * fx.Int32(4), val)
             val = (lane >= fx.Int32(16)).select(val + fx.Int32(r16), val)
-            src32 = (lane & fx.Int32(0x30)) - fx.Int32(17)
-            r32 = fly_rocdl.ds_bpermute(T.i32, src32 * fx.Int32(4), val)
-            return (lane >= fx.Int32(32)).select(val + fx.Int32(r32), val)
+            # Lanes 32-63 exist only on wave64; a wave32 prefix is done here.
+            if const_expr(wave_size > 32):
+                src32 = (lane & fx.Int32(0x30)) - fx.Int32(17)
+                r32 = fly_rocdl.ds_bpermute(T.i32, src32 * fx.Int32(4), val)
+                val = (lane >= fx.Int32(32)).select(val + fx.Int32(r32), val)
+            return val
 
         def block_exclusive_prefix_i32(val, scan):
-            lane = tid % fx.Int32(_WAVE_SIZE)
-            warp = tid // fx.Int32(_WAVE_SIZE)
+            lane = tid % fx.Int32(wave_size)
+            warp = tid // fx.Int32(wave_size)
             inclusive = warp_inclusive_prefix_i32(val, lane)
             exclusive = inclusive - val
-            if lane == fx.Int32(_WAVE_SIZE - 1):
+            if lane == fx.Int32(wave_size - 1):
                 scan[warp] = inclusive
             gpu.barrier()
             if warp == 0:
                 wv = fx.Int32(0)
-                if lane < fx.Int32(_NUM_WAVES):
+                if lane < fx.Int32(num_waves):
                     wv = scan[lane]
                 wi = warp_inclusive_prefix_i32(wv, lane)
-                if lane < fx.Int32(_NUM_WAVES):
+                if lane < fx.Int32(num_waves):
                     scan[lane] = wi - wv
-                if lane == fx.Int32(_NUM_WAVES - 1):
-                    scan[_NUM_WAVES] = wi
+                if lane == fx.Int32(num_waves - 1):
+                    scan[num_waves] = wi
             gpu.barrier()
             res = scan[warp] + exclusive
-            tot = scan[_NUM_WAVES]
+            tot = scan[num_waves]
             # Trailing barrier: without it a fast wave entering the *next* call
             # would execute `scan[warp] = inclusive` above while a slow wave is
             # still reading this call's results, corrupting the totals. All call
@@ -366,8 +375,8 @@ def build_dcp_topk_merge_module(n_cand, k_loc, topk_tokens, page_size, world_siz
         row = fx.block_idx.x
         tid = fx.thread_idx.x
 
-        storage = fx.SharedAllocator().allocate(_make_storage())
-        s_scan = storage.scan.peek().view(fx.make_layout(_NUM_WAVES + 1, 1))
+        storage = fx.SharedAllocator().allocate(_make_storage(num_waves))
+        s_scan = storage.scan.peek().view(fx.make_layout(num_waves + 1, 1))
         s_dst = storage.acc.peek().view(fx.make_layout(5, 1))
 
         def unwrap_val(val):
@@ -396,30 +405,33 @@ def build_dcp_topk_merge_module(n_cand, k_loc, topk_tokens, page_size, world_siz
             src16 = (lane & fx.Int32(0x30)) - 1
             r16 = fly_rocdl.ds_bpermute(T.i32, src16 * fx.Int32(4), val)
             val = (lane >= fx.Int32(16)).select(val + fx.Int32(r16), val)
-            src32 = (lane & fx.Int32(0x30)) - fx.Int32(17)
-            r32 = fly_rocdl.ds_bpermute(T.i32, src32 * fx.Int32(4), val)
-            return (lane >= fx.Int32(32)).select(val + fx.Int32(r32), val)
+            # Lanes 32-63 exist only on wave64; a wave32 prefix is done here.
+            if const_expr(wave_size > 32):
+                src32 = (lane & fx.Int32(0x30)) - fx.Int32(17)
+                r32 = fly_rocdl.ds_bpermute(T.i32, src32 * fx.Int32(4), val)
+                val = (lane >= fx.Int32(32)).select(val + fx.Int32(r32), val)
+            return val
 
         def block_exclusive_prefix_i32(val, scan):
-            lane = tid % fx.Int32(_WAVE_SIZE)
-            warp = tid // fx.Int32(_WAVE_SIZE)
+            lane = tid % fx.Int32(wave_size)
+            warp = tid // fx.Int32(wave_size)
             inclusive = warp_inclusive_prefix_i32(val, lane)
             exclusive = inclusive - val
-            if lane == fx.Int32(_WAVE_SIZE - 1):
+            if lane == fx.Int32(wave_size - 1):
                 scan[warp] = inclusive
             gpu.barrier()
             if warp == 0:
                 wv = fx.Int32(0)
-                if lane < fx.Int32(_NUM_WAVES):
+                if lane < fx.Int32(num_waves):
                     wv = scan[lane]
                 wi = warp_inclusive_prefix_i32(wv, lane)
-                if lane < fx.Int32(_NUM_WAVES):
+                if lane < fx.Int32(num_waves):
                     scan[lane] = wi - wv
-                if lane == fx.Int32(_NUM_WAVES - 1):
-                    scan[_NUM_WAVES] = wi
+                if lane == fx.Int32(num_waves - 1):
+                    scan[num_waves] = wi
             gpu.barrier()
             res = scan[warp] + exclusive
-            tot = scan[_NUM_WAVES]
+            tot = scan[num_waves]
             gpu.barrier()
             return res, tot
 
