@@ -569,7 +569,11 @@ def test_status_reports_the_stack_and_what_is_routable(monkeypatch):
 
     assert status["config_source"] == "configure:vllm 2026.11"
     assert status["enabled"] == ("aklr",)
-    assert status["routed_ops"]["test.add"] == {"version": 1, "eligible": ("aklr",)}
+    assert status["routed_ops"]["test.add"] == {
+        "version": 1,
+        "eligible": ("aklr",),
+        "ineligible": {},
+    }
     assert status["providers"][0]["name"] == "aklr"
 
 
@@ -759,7 +763,7 @@ def test_an_op_version_the_contract_does_not_accept_stays_native(monkeypatch):
     # on an op version this contract no longer accepts" -- a distinction the
     # window makes newly common. Not invented here: the design enumerates no
     # reason for it.
-    assert plugin.last_decision().reason == "no-provider"
+    assert plugin.last_decision().reason == "provider-op-unsupported"
 
 
 def test_a_contract_cannot_supersede_its_own_version():
@@ -988,3 +992,42 @@ def test_status_survives_a_provider_that_stops_answering(monkeypatch):
         assert "backend went away" in entry["op_versions"]
     finally:
         Rotting.broken = False
+
+
+def test_an_enabled_provider_that_cannot_serve_is_told_apart_from_none(monkeypatch):
+    """Both used to answer ``no-provider`` with no declines, which made the
+
+    commonest misconfiguration -- a provider built against another contract
+    version -- look exactly like nothing being installed.
+    """
+
+    provider = _Provider("aklr", _candidate("aklr"))
+    provider.op_versions = {"test.add": {7}}
+    monkeypatch.setattr(
+        plugin, "_entry_points", lambda: (_EntryPoint("aklr", provider),)
+    )
+    plugin.configure(enable=("aklr",), source="test")
+    add = _route_add([])
+
+    assert add(2, 3) == 5
+    assert plugin.last_decision().reason == "provider-op-unsupported"
+    explained = plugin.explain("test.add", 2, 3)
+    assert explained.declines == {"aklr": "serves test.add version 7, not 1"}
+    assert provider.select_calls == 0, "ineligible providers are never asked"
+
+    plugin.configure(enable=(), source="test")
+    assert add(2, 3) == 5
+    assert plugin.last_decision().reason == "provider-not-enabled"
+    assert plugin.explain("test.add", 2, 3).declines == {}
+
+
+def test_a_name_enabled_without_an_installed_provider_says_so(monkeypatch):
+    monkeypatch.setattr(plugin, "_entry_points", lambda: ())
+    plugin.configure(enable=("ghost",), source="test")
+    add = _route_add([])
+
+    assert add(2, 3) == 5
+    assert plugin.last_decision().reason == "no-provider"
+    assert plugin.explain("test.add", 2, 3).declines == {
+        "ghost": "enabled but not installed"
+    }
