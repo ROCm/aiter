@@ -83,6 +83,7 @@ def _fused_qk_rmsnorm_mxfp8_kv_rope_quant_kernel(
     values: Tensor | None = None,
     scales: Tensor | None = None,
     pool: Tensor | None = None,
+    pool_scale: Tensor | None = None,
     batch_ids: Tensor | None = None,
     cu_seqlens_q: Tensor | None = None,
     slots: Tensor | None = None,
@@ -120,7 +121,9 @@ def fused_qk_rmsnorm_mxfp8_kv_rope_quant(
     `rope_quant_window` on that row (GPT-J RoPE on the last `rope_dim` columns, MXFP8 with
     step 2^ceil(log2(amax / 448))), into whichever of `qat` (dequantized bf16 row),
     `values` / `scales` (fp8 + e8m0 rows of any stride) and `ring` (`(pool, step, window)`,
-    as rope_quant_window takes it) are given. `kv_out` keeps the normed bf16 kv row.
+    as rope_quant_window takes it) are given. `ring`'s pool is either `(data, scale)`, an
+    fp8 plane [rows, width] and an e8m0 plane [rows, width / 32], or a bf16 [rows, width]
+    tensor; `window`'s geometry counts rows. `kv_out` keeps the normed bf16 kv row.
     Returns `(q_out, q_out_scale)`.
     """
     m, kq = q.shape
@@ -129,6 +132,9 @@ def fused_qk_rmsnorm_mxfp8_kv_rope_quant(
     if q_out_scale is None:
         q_out_scale = q.new_empty((m, kq // 32), dtype=torch.uint8)
     pool, step, window = ring or (None, None, None)
+    pool, pool_scale = pool if isinstance(pool, tuple) else (pool, None)
+    if pool_scale is None and pool is not None and pool.dtype != torch.bfloat16:
+        raise ValueError("A quantized ring needs separate (data, scale) planes")
     _fused_qk_rmsnorm_mxfp8_kv_rope_quant_kernel(
         q_out,
         q_out_scale,
@@ -148,6 +154,7 @@ def fused_qk_rmsnorm_mxfp8_kv_rope_quant(
         values,
         scales,
         pool,
+        pool_scale,
         None if step is None else step.batch_ids,
         None if step is None else step.cu_seqlens_q,
         None if step is None else step.slots,

@@ -6,7 +6,8 @@ Byte-for-byte the ATOM Triton kernel (``atom.model_ops.deepseek_v41.rope_window`
 the query half either rotates the RoPE tails in place or emits MXFP8
 (FP8 e4m3fn values plus one E8M0 code per 32), and the KV half quantizes the
 normed row the same way into any of a dequantized BF16 copy (``qat``), packed
-values/scales rows, or the decode ring (FP8 byte pool or BF16 pool).
+values/scales rows, or the decode ring (FP8 data / E8M0 scale planes or a BF16
+pool).
 
 The rule both halves share: GPT-J rotation in fp32 (a NoPE pair is rotated by
 cos 1 / sin 0, which turns some -0 into +0), the result rounded to BF16, an
@@ -92,7 +93,7 @@ def _build(
     qat,
     packed,
     ring,
-    ring_bytes,
+    ring_fp8,
     batch64,
     cu64,
     slot64,
@@ -138,7 +139,7 @@ def _build(
     name += "_qat" if qat else ""
     name += "_packed" if packed else ""
     if ring:
-        name += f"_ring{'b' if ring_bytes else 'h'}{RING_SLOTS}x{SLOT_ROWS}x{RING_STRIDE}x{RUN_ROWS}"
+        name += f"_ring{'p' if ring_fp8 else 'h'}{RING_SLOTS}x{SLOT_ROWS}x{RING_STRIDE}x{RUN_ROWS}"
         name += f"_i{int(batch64)}{int(cu64)}{int(slot64)}"
 
     @flyc.kernel(name=name, known_block_size=[wave, W, 1])
@@ -158,12 +159,15 @@ def _build(
         query_values: fx.Pointer,
         query_scales: fx.Pointer,
         pool: fx.Pointer,
+        pool_scale: fx.Pointer,
         batches: fx.Pointer,
         cu: fx.Pointer,
         slots: fx.Pointer,
         kv_stride: Int32,
         values_stride: Int32,
         scales_stride: Int32,
+        pool_stride: Int32,
+        pool_scale_stride: Int32,
         ring_start: Int64,
     ):
         tid = fx.thread_idx.x
@@ -611,12 +615,16 @@ def _build(
                             + ring_pos % RING_STRIDE
                         )
                     )
-                    if const_expr(ring_bytes):
-                        pool_rsrc = rsrc(addr(pool) + row)
-                        store_values(pool_rsrc, 0, res)
-                        store_codes(pool_rsrc, D, res)
+                    data_rsrc = rsrc(addr(pool) + row * fx.Int64(pool_stride))
+                    if const_expr(ring_fp8):
+                        store_values(data_rsrc, 0, res)
+                        store_codes(
+                            rsrc(addr(pool_scale) + row * fx.Int64(pool_scale_stride)),
+                            0,
+                            res,
+                        )
                     else:
-                        store_dequant(rsrc(addr(pool) + row * (D * 2)), res)
+                        store_dequant(data_rsrc, res)
 
         lds_load_b32, _ = make_lds_copy_ops(32)
         lds_load_b128, _ = make_lds_copy_ops(128)
@@ -656,12 +664,15 @@ def _build(
         query_values: fx.Pointer,
         query_scales: fx.Pointer,
         pool: fx.Pointer,
+        pool_scale: fx.Pointer,
         batches: fx.Pointer,
         cu: fx.Pointer,
         slots: fx.Pointer,
         kv_stride: fx.Int32,
         values_stride: fx.Int32,
         scales_stride: fx.Int32,
+        pool_stride: fx.Int32,
+        pool_scale_stride: fx.Int32,
         ring_start: fx.Int64,
         num_wg: fx.Int32,
         stream: fx.Stream,
@@ -682,12 +693,15 @@ def _build(
             query_values,
             query_scales,
             pool,
+            pool_scale,
             batches,
             cu,
             slots,
             kv_stride,
             values_stride,
             scales_stride,
+            pool_stride,
+            pool_scale_stride,
             ring_start,
         )
         k.launch(grid=(fx.Int64(num_wg), 1, 1), block=(wave, W, 1), stream=stream)
@@ -736,8 +750,9 @@ def rope_quant_window(
     ``ring`` is ``(pool, step, window)`` with ``step.batch_ids``,
     ``step.cu_seqlens_q`` and ``step.slots``, and ``window`` the pool's
     ``ring_start``, ``ring_slots``, ``slot_rows``, ``ring_stride`` and
-    ``run_rows``; a uint8 ``pool`` is the FP8 byte pool, else a
-    ``[rows, head_dim]`` BF16 one.
+    ``run_rows``, all in rows. ``pool`` is either ``(data, scale)``, an FP8
+    ``[rows, head_dim]`` plane and an E8M0 ``[rows, head_dim / 32]`` plane, or a
+    ``[rows, head_dim]`` BF16 tensor; each plane keeps its own row stride.
     """
     tokens, heads, dim = query.shape
     kv_half = ring is not None or qat is not None or values is not None
@@ -780,7 +795,31 @@ def rope_quant_window(
     gx_kv = -(-tokens // W) if kv_half else 0
 
     pool, step, window = ring or (None, None, None)
-    ring_bytes = pool is not None and pool.dtype == torch.uint8
+    ring_fp8 = isinstance(pool, tuple)
+    pool, pool_scale = pool if ring_fp8 else (pool, None)
+    if pool is not None:
+        if ring_fp8:
+            ok = (
+                pool.element_size() == 1
+                and pool_scale.element_size() == 1
+                and pool_scale.dim() == 2
+                and pool_scale.shape == (pool.shape[0], dim // 32)
+                and pool_scale.stride(1) == 1
+            )
+        else:
+            ok = pool.dtype == torch.bfloat16
+        if not (
+            ok
+            and pool.dim() == 2
+            and pool.shape[1] == dim
+            and pool.stride(1) == 1
+            and pool.stride(0) * pool.element_size() % 4 == 0
+            and pool.data_ptr() % 4 == 0
+        ):
+            raise ValueError(
+                "ring pool must be (fp8 [rows, D], e8m0 [rows, D / 32]) planes or a "
+                "bf16 [rows, D] tensor, with dword-aligned data rows"
+            )
     index = (
         (None, None, None)
         if step is None
@@ -802,7 +841,7 @@ def rope_quant_window(
         qat=qat is not None,
         packed=values is not None,
         ring=ring is not None,
-        ring_bytes=ring_bytes,
+        ring_fp8=ring_fp8,
         batch64=index[0] is not None and index[0].dtype == torch.int64,
         cu64=index[1] is not None and index[1].dtype == torch.int64,
         slot64=index[2] is not None and index[2].dtype == torch.int64,
@@ -833,12 +872,15 @@ def rope_quant_window(
         ptr(query_values),
         ptr(query_scales),
         ptr(pool),
+        ptr(pool_scale),
         ptr(index[0]),
         ptr(index[1]),
         ptr(index[2]),
         kv.stride(0) if kv_half else 0,
         0 if values is None else values.stride(-2),
         0 if scales is None else scales.stride(-2),
+        0 if pool is None else pool.stride(0) * pool.element_size(),
+        0 if pool_scale is None else pool_scale.stride(0),
         0 if window is None else int(window.ring_start),
         gx_q + gx_kv,
         Stream(torch.cuda.current_stream()),

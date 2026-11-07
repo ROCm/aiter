@@ -28,9 +28,9 @@ from op_tests.rope_quant_window_ref import (
 MODES = [
     "qfp8",
     "rot",
-    "qfp8+ringb",
+    "qfp8+ringp",
     "rot+ringh",
-    "rot+ringb",
+    "rot+ringps",
     "qfp8+rows",
     "rot+qat+vs",
     "rot+qat",
@@ -78,6 +78,20 @@ def test_flydsl_rope_quant_window(mode, tokens, heads, idx64):
     return not bad
 
 
+def test_packed_ring_rejected():
+    """A ring of rows packing values and codes together has no planar layout to write."""
+    step = Step(5, False)
+    o = sinks("ringp", 5, 0)
+    kv = torch.randn(5, D, device=dev).to(torch.bfloat16)
+    query = torch.empty(5, 0, D, device=dev, dtype=torch.bfloat16)
+    packed = torch.zeros(o["pool"].shape[0], D + D // 32, device=dev, dtype=torch.uint8)
+    try:
+        flydsl(query, kv, step.positions, {"ring": (packed, step, o["w"])})
+    except ValueError:
+        return True
+    return False
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter, description=__doc__
@@ -107,9 +121,11 @@ if __name__ == "__main__":
     # heads == 0: the KV row alone.
     failed += [
         f"{mode} T=37 H=0"
-        for mode in ("rows", "qat+vs", "ringb")
+        for mode in ("rows", "qat+vs", "ringp", "ringps")
         if not test_flydsl_rope_quant_window(mode, 37, 0, False)
     ]
+    if not test_packed_ring_rejected():
+        failed.append("packed byte ring accepted")
     if failed:
         raise SystemExit(f"{len(failed)} cases differ: {failed}")
     aiter.logger.info("rope_quant_window: every case byte exact")

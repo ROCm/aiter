@@ -44,9 +44,12 @@ struct KvRopeQuantArgs
     uint16_t* qat = nullptr; // bf16 [m, n]
     uint8_t* values = nullptr;
     uint8_t* scales = nullptr;
-    void* pool = nullptr; // byte pool (fp8 values then codes) or bf16 [rows, n]
+    void* pool = nullptr;          // fp8 data plane [rows, n] or bf16 [rows, n]
+    uint8_t* pool_scale = nullptr; // e8m0 plane [rows, n / 32] beside the fp8 data plane
     int64_t values_stride = 0;
     int64_t scales_stride = 0;
+    int64_t pool_stride = 0; // row strides in elements
+    int64_t pool_scale_stride = 0;
     int64_t ring_start = 0;
     int64_t slot_rows = 0;
     int64_t ring_slots = 1;
@@ -57,7 +60,6 @@ struct KvRopeQuantArgs
     bool batch64 = false;
     bool cu64 = false;
     bool slot64 = false;
-    bool pool_bytes = false;
 };
 
 // Every index here fits in 32 bits, so an int64 one is read as its low dword. One load either
@@ -286,17 +288,18 @@ __device__ __forceinline__ uint32_t kv_rope_quant_row(const opus::vector_t<float
     }
     if(p.ring_row >= 0)
     {
-        if(a.pool_bytes)
+        if(a.pool_scale != nullptr)
         {
-            uint8_t* base = static_cast<uint8_t*>(a.pool) + p.ring_row;
-            *reinterpret_cast<opus::vector_t<uint8_t, TDS>*>(base + col) = q8;
+            *reinterpret_cast<opus::vector_t<uint8_t, TDS>*>(
+                static_cast<uint8_t*>(a.pool) + p.ring_row * a.pool_stride + col) = q8;
             if(code_lane)
-                base[n + col / 32] = static_cast<uint8_t>(code);
+                a.pool_scale[p.ring_row * a.pool_scale_stride + col / 32] =
+                    static_cast<uint8_t>(code);
         }
         else
         {
             *reinterpret_cast<opus::vector_t<uint16_t, TDS>*>(
-                static_cast<uint16_t*>(a.pool) + p.ring_row * n + col) = dequant();
+                static_cast<uint16_t*>(a.pool) + p.ring_row * a.pool_stride + col) = dequant();
         }
     }
     return code;
@@ -551,7 +554,7 @@ __device__ __forceinline__ void mx_k_store(const opus::vector_t<float, kMxV> (&f
     constexpr int CH = WARP_SIZE * kMxV;
     constexpr int D = WARP_SIZE / 16;
     const int lane = threadIdx.x % WARP_SIZE;
-    // The codes go to the scales row and / or the ring row's tail, gathered into dwords as the
+    // The codes go to the scales row and / or the ring's scale row, gathered into dwords as the
     // q scales when every destination is dword-aligned; the ring row is the token's, wave-uniform.
     const auto& a = kv_args;
     uint32_t* scale_dw = nullptr;
@@ -565,9 +568,9 @@ __device__ __forceinline__ void mx_k_store(const opus::vector_t<float, kMxV> (&f
             gather = gather && (reinterpret_cast<uintptr_t>(p) & 3) == 0;
             scale_dw = reinterpret_cast<uint32_t*>(p);
         }
-        if(a.pool != nullptr && a.pool_bytes && pre[0].ring_row >= 0)
+        if(a.pool_scale != nullptr && pre[0].ring_row >= 0)
         {
-            uint8_t* p = static_cast<uint8_t*>(a.pool) + pre[0].ring_row + n;
+            uint8_t* p = a.pool_scale + pre[0].ring_row * a.pool_scale_stride;
             gather = gather && (reinterpret_cast<uintptr_t>(p) & 3) == 0;
             ring_dw = reinterpret_cast<uint32_t*>(p);
         }
@@ -750,11 +753,13 @@ __global__ void fused_qk_rmsnorm_group_quant_kernel(
     {
         const auto& a = kv_args;
         asm volatile("" ::"s"(a.cos), "s"(a.sin), "s"(a.positions), "s"(a.batches), "s"(a.cu),
-                     "s"(a.slots), "s"(a.qat), "s"(a.values), "s"(a.scales), "s"(a.pool));
-        asm volatile("" ::"s"(a.values_stride), "s"(a.scales_stride), "s"(a.ring_start),
-                     "s"(a.slot_rows), "s"(a.ring_slots), "s"(a.ring_stride), "s"(a.run_rows),
-                     "s"(a.rope_dim), "s"(int(a.pos64)), "s"(int(a.batch64)), "s"(int(a.cu64)),
-                     "s"(int(a.slot64)), "s"(int(a.pool_bytes)));
+                     "s"(a.slots), "s"(a.qat), "s"(a.values), "s"(a.scales), "s"(a.pool),
+                     "s"(a.pool_scale));
+        asm volatile("" ::"s"(a.values_stride), "s"(a.scales_stride), "s"(a.pool_stride),
+                     "s"(a.pool_scale_stride), "s"(a.ring_start), "s"(a.slot_rows),
+                     "s"(a.ring_slots), "s"(a.ring_stride), "s"(a.run_rows), "s"(a.rope_dim),
+                     "s"(int(a.pos64)), "s"(int(a.batch64)), "s"(int(a.cu64)),
+                     "s"(int(a.slot64)));
     }
 
     static constexpr int32_t load_chunk_bytes =
@@ -2142,6 +2147,7 @@ void fused_qk_rmsnorm_mxfp8_kv_rope_quant(aiter_tensor_t& q_out,
                                           std::optional<aiter_tensor_t> values,
                                           std::optional<aiter_tensor_t> scales,
                                           std::optional<aiter_tensor_t> pool,
+                                          std::optional<aiter_tensor_t> pool_scale,
                                           std::optional<aiter_tensor_t> batch_ids,
                                           std::optional<aiter_tensor_t> cu_seqlens_q,
                                           std::optional<aiter_tensor_t> slots,
@@ -2209,18 +2215,38 @@ void fused_qk_rmsnorm_mxfp8_kv_rope_quant(aiter_tensor_t& q_out,
         a.values_stride = v.stride(-2);
         a.scales_stride = s.stride(-2);
     }
+    AITER_CHECK(pool.has_value() || !pool_scale.has_value(),
+                __func__,
+                " pool_scale comes with pool");
     if(pool.has_value())
     {
         auto& p = pool.value();
         AITER_CHECK(batch_ids.has_value() && cu_seqlens_q.has_value() && slots.has_value(),
                     __func__,
                     " a ring write needs batch_ids, cu_seqlens_q and slots");
-        AITER_CHECK(p.is_gpu() && (p.dtype() == AITER_DTYPE_u8 || p.dtype() == AITER_DTYPE_bf16),
+        const bool fp8 = pool_scale.has_value();
+        AITER_CHECK(p.is_gpu() && p.dim() == 2 && p.size(1) == n && p.stride(1) == 1 &&
+                        (fp8 ? p.dtype() == AITER_DTYPE_u8 || p.dtype() == AITER_DTYPE_fp8
+                             : p.dtype() == AITER_DTYPE_bf16),
                     __func__,
-                    " pool must be a uint8 byte pool or a bf16 [rows, kv width] one");
-        AITER_CHECK(p.dtype() == AITER_DTYPE_u8 || p.size(-1) == n,
+                    " pool must be an fp8 data plane [rows, kv width] with pool_scale, or a"
+                    " bf16 [rows, kv width] pool");
+        AITER_CHECK(p.stride(0) * static_cast<int64_t>(p.element_size()) % 16 == 0 &&
+                        reinterpret_cast<uintptr_t>(p.data_ptr()) % 16 == 0,
                     __func__,
-                    " a bf16 pool's rows must be kv width wide");
+                    " pool rows must be 16-byte aligned");
+        if(fp8)
+        {
+            auto& s = pool_scale.value();
+            AITER_CHECK(s.is_gpu() &&
+                            (s.dtype() == AITER_DTYPE_u8 || s.dtype() == AITER_DTYPE_fp8_e8m0) &&
+                            s.dim() == 2 && s.size(0) == p.size(0) && s.size(1) == n / 32 &&
+                            s.stride(1) == 1,
+                        __func__,
+                        " pool_scale must be an e8m0 plane [pool rows, kv width / 32]");
+            a.pool_scale = static_cast<uint8_t*>(s.data_ptr());
+            a.pool_scale_stride = s.stride(0);
+        }
         AITER_CHECK(ring_slots > 0 && ring_stride > 0 && ring_slots <= INT32_MAX &&
                         ring_stride <= INT32_MAX,
                     __func__,
@@ -2232,7 +2258,7 @@ void fused_qk_rmsnorm_mxfp8_kv_rope_quant(aiter_tensor_t& q_out,
                         " batch_ids / cu_seqlens_q / slots must be int32/int64");
         }
         a.pool = p.data_ptr();
-        a.pool_bytes = p.dtype() == AITER_DTYPE_u8;
+        a.pool_stride = p.stride(0);
         a.batches = batch_ids.value().data_ptr();
         a.cu = cu_seqlens_q.value().data_ptr();
         a.slots = slots.value().data_ptr();

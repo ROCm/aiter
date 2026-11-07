@@ -32,7 +32,7 @@ from op_tests.rope_quant_window_ref import (
     with_zeros,
 )
 
-MODES = ["rows", "qat+vs", "ringb", "ringbu", "ringh", "qat+vs+ringb"]
+MODES = ["rows", "qat+vs", "ringp", "ringps", "ringh", "qat+vs+ringp"]
 
 
 @perftest()
@@ -99,6 +99,33 @@ def test_fused_qk_rmsnorm_mxfp8_kv_rope_quant(mode, tokens, idx64, n1=1536):
     return not bad
 
 
+def test_packed_ring_rejected(n1=1536):
+    """A ring of rows packing values and codes together has no planar layout to write."""
+    step = Step(5, False)
+    o = sinks("ringp", 5, 0)
+    q = torch.randn(5, n1, device=dev).to(torch.bfloat16)
+    kv = torch.randn(5, D, device=dev).to(torch.bfloat16)
+    g = torch.ones(n1, device=dev, dtype=torch.bfloat16)
+    packed = torch.zeros(o["pool"].shape[0], D + D // 32, device=dev, dtype=torch.uint8)
+    try:
+        fused_qk_rmsnorm_mxfp8_kv_rope_quant(
+            q,
+            g,
+            1e-6,
+            kv,
+            g[:D],
+            1e-6,
+            COS,
+            SIN,
+            step.positions,
+            rope_dim=RD,
+            ring=(packed, step, o["w"]),
+        )
+    except ValueError:
+        return True
+    return False
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter, description=__doc__
@@ -118,6 +145,8 @@ if __name__ == "__main__":
         for idx64 in (False, True)
         if not test_fused_qk_rmsnorm_mxfp8_kv_rope_quant(mode, tokens, idx64)
     ]
+    if not test_packed_ring_rejected():
+        failed.append("packed byte ring accepted")
     if failed:
         raise SystemExit(f"{len(failed)} cases differ: {failed}")
     aiter.logger.info("fused_qk_rmsnorm_mxfp8_kv_rope_quant: every case byte exact")

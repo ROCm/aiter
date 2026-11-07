@@ -111,11 +111,10 @@ def rope_quant_window_ref(
             + (ring_pos // w.ring_stride) * w.run_rows
             + ring_pos % w.ring_stride
         )
-        if pool.dtype == torch.uint8:
-            cols = torch.arange(dim, device=dev)
-            pool[row[:, None] + cols] = q8[t].view(torch.uint8)
-            groups = torch.arange(dim // 32, device=dev)
-            pool[row[:, None] + dim + groups] = codes[t]
+        if isinstance(pool, tuple):
+            data, scale = pool
+            data.view(torch.uint8)[row] = q8[t].view(torch.uint8)
+            scale.view(torch.uint8)[row] = codes[t]
         else:
             pool[row] = _dequant(q8[t], step[t])
 
@@ -150,28 +149,37 @@ class Step:
         self.positions = pos.to(dev, dt)
 
 
-def window(byte_pool, start=4096):
+def window(start=4096, ring_stride=RING, run_rows=RING):
+    """Ring geometry in rows: position p of a slot lands on run p // ring_stride, row
+    p % ring_stride of it, runs run_rows apart."""
     w = type("Window", (), {})()
-    run_rows = D + D // 32 if byte_pool else 1
-    w.ring_start, w.slot_rows, w.ring_slots = start, RING * run_rows, RING
-    w.ring_stride, w.run_rows = (1, run_rows) if byte_pool else (RING, RING)
+    w.ring_start, w.ring_slots = start, RING
+    w.ring_stride, w.run_rows = ring_stride, run_rows
+    w.slot_rows = (RING // ring_stride) * run_rows
     return w
 
 
 def sinks(mode, tokens, heads):
     """Zeroed outputs for a mode, a '+'-joined subset of: qfp8 (query MXFP8, else rotated in
-    place), qat, vs (values / scales), rows (values / scales packed in one row), ringb (byte
-    pool), ringbu (byte pool at an unaligned start) and ringh (bf16 pool)."""
+    place), qat, vs (values / scales), rows (values / scales packed in one row), ringp (fp8 /
+    e8m0 ring planes, contiguous), ringps (the planes as strided slices, the scale rows not
+    dword-aligned, the ring rows in gapped runs) and ringh (bf16 pool)."""
     o = {}
     if "qfp8" in mode:
         o["qv"] = torch.zeros(tokens, heads, D, device=dev, dtype=FP8)
         o["qs"] = torch.zeros(tokens, heads, D // 32, device=dev, dtype=E8)
-    if "ringb" in mode:
-        o["w"] = window(True, 4099 if "ringbu" in mode else 4096)
+    if "ringps" in mode:
+        o["w"] = window(4099, ring_stride=2, run_rows=3)
         rows = o["w"].ring_start + 6 * o["w"].slot_rows
-        o["pool"] = torch.zeros(rows, device=dev, dtype=torch.uint8)
+        o["pool"] = torch.zeros(rows, D + 64, device=dev, dtype=torch.uint8)
+        o["pool_s"] = torch.zeros(rows, D // 32 + 4, device=dev, dtype=torch.uint8)
+    elif "ringp" in mode:
+        o["w"] = window()
+        rows = o["w"].ring_start + 6 * o["w"].slot_rows
+        o["pool"] = torch.zeros(rows, D, device=dev, dtype=torch.uint8)
+        o["pool_s"] = torch.zeros(rows, D // 32, device=dev, dtype=torch.uint8)
     if "ringh" in mode:
-        o["w"] = window(False)
+        o["w"] = window()
         rows = o["w"].ring_start + 6 * o["w"].slot_rows
         o["pool"] = torch.zeros(rows, D, device=dev, dtype=torch.bfloat16)
     if "rows" in mode:
@@ -188,7 +196,12 @@ def sink_kwargs(o, step):
     kw = {}
     if "qv" in o:
         kw["query_fp8"] = (o["qv"], o["qs"])
-    if "pool" in o:
+    if "pool_s" in o:
+        data, scale = o["pool"], o["pool_s"]
+        if data.shape[1] != D:
+            data, scale = data[:, 32 : 32 + D], scale[:, 3 : 3 + D // 32]
+        kw["ring"] = ((data.view(FP8), scale.view(E8)), step, o["w"])
+    elif "pool" in o:
         kw["ring"] = (o["pool"], step, o["w"])
     if "rows" in o:
         kw["values"] = o["rows"][:, :D].view(FP8)

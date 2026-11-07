@@ -46,6 +46,7 @@ PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
           py::arg("values")       = std::nullopt,
           py::arg("scales")       = std::nullopt,
           py::arg("pool")         = std::nullopt,
+          py::arg("pool_scale")   = std::nullopt,
           py::arg("batch_ids")    = std::nullopt,
           py::arg("cu_seqlens_q") = std::nullopt,
           py::arg("slots")        = std::nullopt,
