@@ -147,6 +147,16 @@ CASE_SETS = {
             "context_length": [256],
             "ps": [False],
         },
+        # More than one KV head: every query token stays in one tile.
+        # (16, 2) is Muse Spark at TP8, eight query heads per KV head, so
+        # query length 8 fills the 64-row layout.
+        {
+            "num_heads": [(16, 2)],
+            "kv_varlen": [False],
+            "query_length": [8],
+            "context_length": [2048],
+            "ps": [True],
+        },
     ],
     "sliding_window_accuracy": [
         {
@@ -1319,12 +1329,12 @@ def test_multi_case_set(case_set_name):
 @pytest.mark.parametrize(
     "num_heads, ps, sliding_window, block_size, query_length",
     [
-        # More than one KV head: the PS kernel holds every query token in one tile.
-        pytest.param((64, 8), True, 0, 16, 8, id="ps_multi_kv_head"),
-        # The non-PS kernels hold every query token in one tile.
-        pytest.param((8, 1), False, 0, 16, 8, id="non_ps"),
+        # One-tile kernels take query length 8 only while the tile stays <= 64.
+        pytest.param((16, 2), True, 0, 16, 9, id="one_tile_qlen_9"),
+        pytest.param((32, 2), True, 0, 16, 8, id="one_tile_rows_128"),
+        pytest.param((8, 1), False, 0, 16, 9, id="non_ps_qlen_9"),
         # PS hands sliding-window 1024-token blocks to the non-PS kernel.
-        pytest.param((8, 1), True, 128, 1024, 8, id="ps_sliding_window_block_1024"),
+        pytest.param((8, 1), True, 128, 1024, 9, id="sliding_window_block_1024_qlen_9"),
         # One query token per program, but the group alone is 128 rows.
         pytest.param((128, 1), True, 0, 16, 2, id="ps_one_kv_head_group_128"),
         # Each query token sees sliding_window - query_length keys: none here.
@@ -1336,9 +1346,9 @@ def test_unsupported_query_shape_is_rejected(
 ):
     """Reject unsupported query shapes before launch.
 
-    Kernels that hold every query token in one tile take at most 4 tokens. No
-    kernel takes a tile over 64 rows. The single-KV-head PS kernel needs a
-    sliding window that is longer than the query.
+    Kernels other than the single-KV-head PS kernel take at most 8 query
+    tokens and at most 64 rows. No kernel takes a tile over 64 rows. The
+    single-KV-head PS kernel needs a sliding window longer than the query.
     """
     num_query_heads, num_kv_heads = num_heads
     head_size = 128
