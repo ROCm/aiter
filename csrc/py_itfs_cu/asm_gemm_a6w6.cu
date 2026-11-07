@@ -17,7 +17,7 @@ constexpr int kKPaddingTiles        = 2;
 constexpr size_t kPackedTileBytes   = 24576;
 constexpr size_t kScaleTileBytes    = 1024;
 constexpr char kPackLayout[]        = "mxfp6_c0c1_256_padk2";
-constexpr char kDefaultKernelName[] = "f6gemm_dmabig_kernel_func";
+constexpr char kDefaultKernelName[] = "_ZN5aiter29f6gemm_bf16_per1x32Fp6_dmabigE";
 
 // KernelArgs layout is identical to the a4w4 asm gemm ABI; the mxfp6 dmabig
 // kernel was assembled against the same kernarg struct (0x180 bytes). Fields
