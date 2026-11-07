@@ -4,6 +4,7 @@
 """Generic FlyDSL paged decode correctness test.
 
 Run with: python -m pytest -q op_tests/test_flydsl_pa_decode.py
+Benchmark with: python -m op_tests.op_benchmarks.flydsl.bench_pa_decode --help
 """
 
 import importlib.util
@@ -815,6 +816,20 @@ _COMMON_CASES = [
             "sink_dtype": torch.float32,
         },
     ),
+    # More than 240 split sequences share two-sequence clusters on gfx1250;
+    # an odd batch pads the last cluster, and empty rows still meet the barrier.
+    (
+        "cluster2-shared",
+        {
+            "group_size": 16,
+            "block_size": 16,
+            "lengths": (512, 0, 300) * 81,
+            "max_partitions": 2,
+            "capture": True,
+            "cluster": 2,
+            "cluster_seqs": 2,
+        },
+    ),
 ]
 _FP8_CASES = _COMMON_CASES + [
     (
@@ -1580,82 +1595,90 @@ def _check_pipe_policy(pa, case, arch, compile_kwargs):
     if case["cluster"] is not None:
         expected = case["cluster"] if arch == "gfx1250" else 0
         assert compile_kwargs[-1]["cluster_merge"] == expected
+    if case["cluster_seqs"] is not None and arch == "gfx1250":
+        assert compile_kwargs[-1]["cluster_seqs"] == case["cluster_seqs"]
     if case["pipe"]:
         # The cache key ends with (D256_PIPE, staged page ids).
         schedule_kwargs = dict(compile_kwargs[-1])
         schedule_kwargs.pop("architecture", None)
         schedule_kwargs.pop("direct_output", None)
         schedule_kwargs.pop("cluster_merge", None)
+        schedule_kwargs.pop("cluster_seqs", None)
         pipe, staged = PaDecodeSchedule.select(**schedule_kwargs).cache_key[-2:]
         assert pipe == (arch == "gfx950")
         if pipe:
             assert (staged > 0) == (case["staged"] is not False)
 
 
-@pytest.mark.parametrize(
-    "case",
-    [
-        *[
-            pytest.param(
-                dict(
-                    geometry,
-                    kv_dtype="fp8",
-                    query_dtype=dtype,
-                    scale_mode=scale_mode,
-                    trans_v=trans_v,
-                ),
-                id=f"fp8-{dtype}-{scale_mode}-{'transposed' if trans_v else 'plain'}-v-{name}",
-            )
-            for name, geometry in _FP8_CASES
-            for dtype, scale_mode, trans_v in product(
-                (torch.bfloat16, torch.float16),
-                ("per-tensor", "per-token"),
-                (False, True),
-            )
-        ],
-        *[pytest.param(geometry, id=f"bf16-{name}") for name, geometry in _BF16_CASES],
-        *[pytest.param(geometry, id=name) for name, geometry in _PIPE_CASES],
-        *[pytest.param(geometry, id=name) for name, geometry in _MXFP4_CASES],
-        *[
-            pytest.param(
-                {
-                    "invalid_input": invalid,
-                    "error": error,
-                    "match": match,
-                    "lengths": (1,),
-                },
-                id=f"invalid-bf16-{invalid}",
-            )
-            for invalid, error, match in _INVALID_CASES
-        ],
-        *[
-            pytest.param(
-                {
-                    "invalid_input": invalid,
-                    "invalid_kind": "mxfp4",
-                    "kv_dtype": "mxfp4",
-                    "error": error,
-                    "match": match,
-                },
-                id=f"invalid-mxfp4-{invalid}",
-            )
-            for invalid, error, match in _MXFP4_INVALID_CASES
-        ],
-        *[
-            pytest.param(
-                {
-                    "invalid_input": invalid,
-                    "invalid_kind": "select",
-                    "error": error,
-                    "match": match,
-                },
-                id=f"invalid-select-{invalid}",
-            )
-            for invalid, error, match in _SELECT_INVALID_CASES
-        ],
+_PA_DECODE_CASES = [
+    *[
+        pytest.param(
+            dict(
+                geometry,
+                kv_dtype="fp8",
+                query_dtype=dtype,
+                scale_mode=scale_mode,
+                trans_v=trans_v,
+            ),
+            id=f"fp8-{dtype}-{scale_mode}-{'transposed' if trans_v else 'plain'}-v-{name}",
+        )
+        for name, geometry in _FP8_CASES
+        for dtype, scale_mode, trans_v in product(
+            (torch.bfloat16, torch.float16),
+            ("per-tensor", "per-token"),
+            (False, True),
+        )
     ],
-)
+    *[pytest.param(geometry, id=f"bf16-{name}") for name, geometry in _BF16_CASES],
+    *[pytest.param(geometry, id=name) for name, geometry in _PIPE_CASES],
+    *[pytest.param(geometry, id=name) for name, geometry in _MXFP4_CASES],
+    *[
+        pytest.param(
+            {
+                "invalid_input": invalid,
+                "error": error,
+                "match": match,
+                "lengths": (1,),
+            },
+            id=f"invalid-bf16-{invalid}",
+        )
+        for invalid, error, match in _INVALID_CASES
+    ],
+    *[
+        pytest.param(
+            {
+                "invalid_input": invalid,
+                "invalid_kind": "mxfp4",
+                "kv_dtype": "mxfp4",
+                "error": error,
+                "match": match,
+            },
+            id=f"invalid-mxfp4-{invalid}",
+        )
+        for invalid, error, match in _MXFP4_INVALID_CASES
+    ],
+    *[
+        pytest.param(
+            {
+                "invalid_input": invalid,
+                "invalid_kind": "select",
+                "error": error,
+                "match": match,
+            },
+            id=f"invalid-select-{invalid}",
+        )
+        for invalid, error, match in _SELECT_INVALID_CASES
+    ],
+]
+
+
+@pytest.mark.parametrize("case", _PA_DECODE_CASES)
 def test_pa_decode(case, device, monkeypatch):
+    """FP8/BF16/MXFP4 decode shares input, reference, planning and replay checks."""
+    _run_pa_decode_case(case, device, monkeypatch)
+
+
+def _run_pa_decode_case(case, device, monkeypatch):
     """FP8/BF16/MXFP4 decode shares input, reference, planning and replay checks.
 
     A case with ``invalid_input`` is an input the wrapper must refuse before any
@@ -1692,6 +1715,7 @@ def test_pa_decode(case, device, monkeypatch):
             "ref_mean_min": None,
             "variants": False,
             "cluster": None,
+            "cluster_seqs": None,
         },
         **case,
     )
@@ -1989,6 +2013,9 @@ def test_pa_decode(case, device, monkeypatch):
             graph.replay()
             check()
 
+    # Reuse the validated inputs after restoring the test compilation spy.
+    return case, launch, check, arguments, options, plan
+
 
 def _poison_unowned(cache, scale, owned, fill):
     """Overwrite K/V rows no sequence owns (and their per-token scales)."""
@@ -2140,3 +2167,94 @@ def test_pa_decode_unowned_kv_rows(
     assert torch.equal(poisoned, clean)
     if fill == "nan":
         assert torch.equal(run("zero", mask_unowned_kv=False), clean)
+
+
+@pytest.mark.parametrize("block_size", [16, 128])
+@pytest.mark.parametrize(
+    "case",
+    [
+        # Q = K = 0: uniform weights; the halves' V scales differ by 1e40. A
+        # shared accumulator scale from the first half overflows to inf.
+        pytest.param(((1.0, 1.0), (0.0, 0.0), (1e-8, 1e32)), id="v-scale-range"),
+        # The second half's logits dominate by 14 while only the first half has
+        # V mass: P must keep the first half's own maximum through FP8
+        # quantization, or its ~4e-4 probabilities round to zero.
+        pytest.param(((224.0, 0.0), (0.0, 14.0), (100.0, 1.0)), id="p-underflow"),
+    ],
+)
+def test_pa_decode_two_page_steps_keep_page_scales(block_size, case, device):
+    """gfx1250 FP8 steps that span two one-page steps stay page-local.
+
+    One step covers two page128 pages (256 tokens) or 128 tokens of page16
+    pages; each half of it gets one value, logit and per-token V scale.
+    """
+    if get_gfx_runtime() != "gfx1250":
+        pytest.skip("two-page FP8 softmax steps run on gfx1250")
+    pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    values, logits, value_scales = case
+    heads, dim, x = 16, 128, 16
+    length = 256 if block_size == 128 else 128
+    pages = length // block_size
+    half = pages // 2
+    fp8 = torch.float8_e4m3fn
+    query = torch.zeros(1, heads, dim, dtype=torch.bfloat16, device=device)
+    query[..., 0] = 1.0
+    key = torch.zeros(pages, 1, dim, block_size, device=device)
+    value = torch.zeros(pages, 1, block_size, dim, device=device)
+    key_scale = torch.ones(pages, 1, block_size, 1, device=device)
+    value_scale = torch.ones(pages, 1, block_size, 1, device=device)
+    for page in range(pages):
+        h = page // half
+        if logits[h]:
+            # q . k * dim**-0.5 = logit, with K at the FP8 maximum.
+            key[page, 0, 0] = 448.0
+            key_scale[page] = logits[h] / dim**-0.5 / 448.0
+        value[page] = values[h]
+        value_scale[page] = value_scales[h]
+    key_cache = (
+        key.reshape(pages, 1, dim // x, x, block_size)
+        .permute(0, 1, 2, 4, 3)
+        .contiguous()
+        .to(fp8)
+    )
+    value_cache = (
+        value.reshape(pages, 1, block_size // x, x, dim)
+        .permute(0, 1, 2, 4, 3)
+        .contiguous()
+        .to(fp8)
+    )
+    logical_key = (
+        key_cache.float().permute(0, 1, 3, 2, 4).reshape(-1, dim)
+        * key_scale.reshape(-1, 1)
+    ).double()
+    logical_value = (
+        value_cache.float().permute(0, 1, 2, 4, 3).reshape(-1, dim)
+        * value_scale.reshape(-1, 1)
+    ).double()
+    reference = (
+        torch.softmax(query[0].double() @ logical_key.T * dim**-0.5, -1) @ logical_value
+    )
+    table = torch.arange(pages, dtype=torch.int32, device=device)[None]
+    context = torch.tensor([length], dtype=torch.int32, device=device)
+    plan = pa.plan_pa_decode(context, 1, max_partitions=1)
+    output = torch.full_like(query, float("nan"))
+    pa.pa_decode(
+        output,
+        query,
+        key_cache,
+        value_cache,
+        context,
+        table,
+        dim**-0.5,
+        1,
+        compute_type=fp8,
+        key_scale=key_scale,
+        value_scale=value_scale,
+        work_plan=plan,
+        max_context_length=length,
+    )
+    output = output[0].double()
+    assert torch.isfinite(output).all()
+    torch.testing.assert_close(
+        output, reference, rtol=0.02, atol=0.02 * reference.abs().max().item()
+    )

@@ -833,6 +833,19 @@ class Gfx1250Traits:
     merge_partitions: bool = False
     # Workgroups per sequence cluster that merges its partitions; 0 disables.
     cluster_merge: int = 0
+    # Grids within two CTAs per CU stage BF16 page16 pairs per wave.
+    wide_bf16_page16: bool = False
+    # Grids within two CTAs per CU stage two FP8 page128 pages per step.
+    wide_fp8_page128: bool = False
+    # Grids within one CTA per CU stage two BF16 page128 pages per step.
+    wide_bf16_page128: bool = False
+    # Grids beyond four CTAs per CU keep 64-token FP8 page16 steps.
+    narrow_fp8_page16: bool = False
+    # Sequences sharing one cluster of cluster_merge * cluster_seqs CTAs.
+    cluster_seqs: int = 1
+    # Grids within one CTA per CU, where copy latency rather than bandwidth
+    # bounds a task.
+    latency_grid: bool = False
 
     WAVE = 32
     NWARP = 4
@@ -869,12 +882,112 @@ class Gfx1250Traits:
         return self.bf16_packed and self.block_size == 128
 
     @property
+    def page16_wide(self):
+        # One FP8 D128 query tile over page16 caches stages two pages per wave,
+        # halving the softmax exchanges per token.
+        return (
+            not self.narrow_fp8_page16
+            and self.packed_lds
+            and self.block_size == 16
+            and self.head_dim == 128
+            and self.m_tiles == 1
+            and self.sliding_window == 0
+        )
+
+    @property
+    def page128_pair(self):
+        # One D128 FP8 query tile over page128 caches on a small grid stages
+        # two pages per softmax step.
+        return (
+            self.wide_fp8_page128
+            and self.packed_lds
+            and self.block_size == 128
+            and self.head_dim == 128
+            and self.m_tiles == 1
+            and self.sliding_window == 0
+        )
+
+    @property
+    def bf16_page128_pair(self):
+        # One D128 BF16 query tile over page128 caches on a one-CTA-per-CU
+        # grid stages two pages per softmax step.
+        return (
+            self.wide_bf16_page128
+            and self.bf16_page128_packed
+            and self.head_dim == 128
+            and self.m_tiles == 1
+            and self.sliding_window == 0
+        )
+
+    @property
+    def early_second_stage(self):
+        # On latency-bound grids, double-buffered page16 steps issue the second
+        # stage in the prologue: short sparse tasks overlap both copies. Fuller
+        # grids and page128 pairs lose more to the earlier copy than they gain.
+        return (
+            self.latency_grid
+            and self.block_size == 16
+            and self.use_tdm
+            and self.buffers == 2
+            and (self.packed_lds or self.bf16_page16_packed)
+        )
+
+    @property
+    def stage_tdm_ops(self):
+        # TDM copies one wave issues for a whole stage; partial stages issue
+        # at least as many.
+        if self.page16_wide:
+            return 2 * self.page16_pages
+        if self.page128_pair:
+            return 4
+        if self.bf16_page16_packed:
+            return 2 * (self.TOKENS // 64)
+        return 2
+
+    @property
+    def stage_async_ops(self):
+        # Asynchronous scale copies a wave issues for a whole stage (wave 0
+        # alone for page128; others issue none). Partial stages issue none.
+        if not self.per_token_kv:
+            return 0
+        if self.page128_pair:
+            return 4
+        return 2
+
+    @property
+    def page16_pages(self):
+        # page16 pages each wave stages per softmax step (four lost accuracy
+        # for no consistent gain).
+        return 2
+
+    @property
     def TOKENS(self):
         # Page-sized transfers amortize page/scale staging and softmax exchange.
         # Windowed rows retain 64-token normalization for FP8 accuracy.
+        if self.page16_wide:
+            return 64 * self.page16_pages
+        if self.page128_pair or self.bf16_page128_pair:
+            return 256
+        if (
+            self.bf16_page16_packed
+            and self.wide_bf16_page128
+            and self.head_dim == 128
+            and self.m_tiles == 1
+            and self.sliding_window == 0
+        ):
+            # One-CTA-per-CU grids stage four BF16 page16 pages per wave.
+            return 256
         return (
             128
             if self.bf16_page128_packed
+            or self.page16_wide
+            or (
+                self.bf16_page16_packed
+                and self.wide_bf16_page16
+                and self.head_dim == 128
+                and self.m_tiles == 1
+                and self.sliding_window == 0
+            )
             or (
                 self.packed_lds
                 and self.head_dim in (128, 256)
@@ -990,8 +1103,8 @@ class Gfx1250Traits:
 
     @property
     def wave_query_tiles(self):
-        # One query tile per wave keeps scores, P and output in registers:
-        # softmax needs no cross-wave exchange, only the page buffers are shared.
+        # Wave pairs share two query tiles and keep scores, P and output in
+        # registers: softmax needs no cross-wave exchange until the pair merge.
         # fp8_multi_tile bounds four query tiles to D128.
         return self.fp8_multi_tile and self.m_tiles == self.NWARP and self.async_page
 
