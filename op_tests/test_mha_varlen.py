@@ -920,6 +920,38 @@ def varlen_flash_attn_seq_padding_benchmark(
     )
 
 
+@pytest.mark.parametrize("zero_stride", ["q", "k", "v", "q_single_token"])
+def test_flash_attn_varlen_func_zero_token_stride(zero_stride):
+    """q/k/v with token stride 0 (an expanded view) must give the same result as a
+    dense copy. The gfx950 bf16 hd128 ASM kernel reads them wrong, with no error."""
+    torch.manual_seed(0)
+    batch, seqlen_k, nheads, nheads_k, d = 13, 32, 4, 2, 128
+    q = torch.randn(batch, nheads, d, device="cuda", dtype=dtypes.bf16)
+    k = torch.randn(batch * seqlen_k, nheads_k, d, device="cuda", dtype=dtypes.bf16)
+    v = torch.randn_like(k)
+    if zero_stride == "q_single_token":
+        batch = 1
+        q = q[:1].as_strided((1, nheads, d), (0, d, 1))
+    elif zero_stride == "q":
+        q = q[:1].expand_as(q)
+    elif zero_stride == "k":
+        k = k[:1].expand_as(k)
+    else:
+        v = v[:1].expand_as(v)
+    cu_seqlens_q = torch.arange(batch + 1, dtype=torch.int32, device="cuda")
+    args = (cu_seqlens_q, cu_seqlens_q * seqlen_k, 1, seqlen_k)
+
+    def dense(x):
+        return torch.empty(x.shape, dtype=x.dtype, device=x.device).copy_(x)
+
+    out, lse = aiter.flash_attn_varlen_func(q, k, v, *args, return_lse=True)
+    out_ref, lse_ref = aiter.flash_attn_varlen_func(
+        dense(q), dense(k), dense(v), *args, return_lse=True
+    )
+    assert torch.equal(out, out_ref)
+    assert torch.equal(lse, lse_ref)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,
@@ -1053,6 +1085,9 @@ if __name__ == "__main__":
         e.g.: -i BSHD""",
     )
     args = parser.parse_args()
+
+    for zero_stride in ("q", "k", "v", "q_single_token"):
+        test_flash_attn_varlen_func_zero_token_stride(zero_stride)
 
     seqlen_q, seqlen_k = args.seqlen_q_k
 
