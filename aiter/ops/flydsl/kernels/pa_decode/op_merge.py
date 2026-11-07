@@ -92,9 +92,9 @@ class Gfx1250PartitionMerge:
         ctx, t = self.ctx, self.t
         return (
             (fx.Int64(ctx.planned_seq) * t.query_length + row // t.query_group_size)
-            * ctx.stride_q_row
+            * ctx.stride_o_row
             + (ctx.kv_h * t.query_group_size + row % t.query_group_size)
-            * ctx.stride_q_head
+            * ctx.stride_o_head
             + d
         )
 
@@ -250,10 +250,10 @@ class Gfx1250ClusterMerge:
     other CTAs only merge. Partials sit at packed slots from ``first`` on.
     """
 
-    def __init__(self, t, pmax, psum, pout, output, stride_q_row, stride_q_head):
+    def __init__(self, t, pmax, psum, pout, output, stride_o_row, stride_o_head):
         self.t = t
         self.pmax, self.psum, self.pout, self.output = pmax, psum, pout, output
-        self.stride_q_row, self.stride_q_head = stride_q_row, stride_q_head
+        self.stride_o_row, self.stride_o_head = stride_o_row, stride_o_head
         # Each CTA writes ``share`` rows of its query split, ``per_wave`` per wave.
         self.share = -(-t.rows // t.cluster_merge)
         self.per_wave = -(-self.share // t.NWARP)
@@ -349,9 +349,9 @@ class Gfx1250ClusterMerge:
                     fx.add_offset(
                         output,
                         (fx.Int64(seq) * t.query_length + row // t.query_group_size)
-                        * self.stride_q_row
+                        * self.stride_o_row
                         + (kv_h * t.query_group_size + row % t.query_group_size)
-                        * self.stride_q_head
+                        * self.stride_o_head
                         + lane_elem,
                     ),
                 )

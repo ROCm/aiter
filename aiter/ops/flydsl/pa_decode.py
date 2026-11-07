@@ -18,6 +18,7 @@ from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.triton.utils.device_info import get_num_xcds
 from aiter.utility import dtypes
 
+from .kernels.pa_decode.traits import Gfx1250Traits
 from .kernels.pa_decode_kernel import (
     CLUSTER_PARTITIONS,
     KV_COMPUTE_BLOCK,
@@ -474,16 +475,20 @@ def pa_decode(
     otherwise; ``tune=True`` forces a search during preparation.
     Decode and graph replay use the explicit plan without accessing autotune. Set its
     partition cap with ``plan_pa_decode(max_partitions=...)``. On gfx1250, when
-    sinks are absent and query/output strides match, a cap of one writes output
-    directly. So do plans with one task slot per sequence (capacity equal to
-    the batch, at most 8 partitions per sequence, head_dim <= 512): sequences
-    that still own several tasks merge them in the tile kernel using the plan's
-    arrival counters when partial scratch is eight-byte aligned. Otherwise,
-    when P = min(partition bound, max_partitions)
+    sinks are absent, eligible cap-one plans write output using its own strides.
+    When query/output strides match, so do plans with one task slot per sequence
+    (capacity equal to the batch, at most 8 partitions per sequence, head_dim
+    <= 512): sequences that still own several tasks merge them in the tile
+    kernel using the plan's arrival counters when partial scratch is eight-byte
+    aligned. Independent output layouts retain the reducer for those otherwise
+    last-arriver-eligible plans. Other plans can use clusters when
+    P = min(partition bound, max_partitions)
     is in [2, 16], P CTAs per sequence fit the plan capacity or two per CU,
     and the sequences times KV heads stay within 15 per 16 CUs (head_dim <=
     512), each sequence's tasks run as one cluster of P workgroups that merges
     them on chip. Other plans use packed scratch and the separate reducer.
+    Independent output layouts in the FP8 wave-query pipeline also retain the
+    reducer because direct/cluster output does not improve their GPU latency.
 
     ``sinks`` is a contiguous [num_query_heads] BF16/FP16/FP32 tensor on the
     query device: unscaled zero-value logits shared across batch/MTP positions.
@@ -940,26 +945,47 @@ def pa_decode(
     # CTA. That merge costs two device-scope round trips (sparse decode 64
     # rows: 17.7 us vs 10.3 us for tile plus reducer), so wider plans merge
     # within workgroup clusters instead.
+    output_strides_match = output.stride() == query.stride()
+    output_fusion_supported = True
+    if arch in ("gfx1250", "gfx1250-strict") and not output_strides_match:
+        # The FP8 wave-query pipeline does not benefit from replacing its
+        # independent-output reducer with direct/cluster output on FlyDSL 0.4.1.
+        # Reuse the kernel's pipeline selector instead of a shape-specific gate.
+        output_fusion_supported = not Gfx1250Traits(
+            head_dim=head_dim,
+            query_group_size=query_group_size,
+            block_size=int(block_size),
+            softmax_scale=softmax_scale,
+            query_dtype=query_dtype,
+            per_token_kv=per_token_kv,
+            query_length=query_length,
+            trans_v=trans_v,
+            sliding_window=sliding_window,
+            compute_dtype=kv_dtype,
+        ).wave_query_tiles
+    last_arriver_eligible = (
+        arch in ("gfx1250", "gfx1250-strict")
+        and sinks is None
+        and work_plan.capacity == num_seqs
+        and work_plan.arrival_counters is not None
+        and max_partitions <= MERGE_PARTITIONS
+        and head_dim <= MERGE_HEAD_DIM
+        # Last-arriver partials use naturally aligned 64-bit atomics.
+        # Internal torch allocations are aligned; supplied contiguous
+        # views may have only element alignment.
+        and (
+            pout is None
+            or (isinstance(pout, torch.Tensor) and pout.data_ptr() % 8 == 0)
+        )
+    )
+    # Independent layouts retain the reducer for last-arriver-eligible plans:
+    # those sparse batches regress when switching from their reducer fallback.
+    # Single-partition stores and wider cluster plans still use output strides.
     direct_output = (
         arch in ("gfx1250", "gfx1250-strict")
         and sinks is None
-        and output.stride() == query.stride()
-        and (
-            num_partitions == 1
-            or (
-                work_plan.capacity == num_seqs
-                and work_plan.arrival_counters is not None
-                and max_partitions <= MERGE_PARTITIONS
-                and head_dim <= MERGE_HEAD_DIM
-                # Last-arriver partials use naturally aligned 64-bit atomics.
-                # Internal torch allocations are aligned; supplied contiguous
-                # views may have only element alignment.
-                and (
-                    pout is None
-                    or (isinstance(pout, torch.Tensor) and pout.data_ptr() % 8 == 0)
-                )
-            )
-        )
+        and output_fusion_supported
+        and (num_partitions == 1 or (last_arriver_eligible and output_strides_match))
     )
     one_partition_output = direct_output and num_partitions == 1
     num_compute_units = torch.cuda.get_device_properties(dev).multi_processor_count
@@ -973,8 +999,9 @@ def pa_decode(
         if (
             arch in ("gfx1250", "gfx1250-strict")
             and not direct_output
+            and output_fusion_supported
+            and (output_strides_match or not last_arriver_eligible)
             and sinks is None
-            and output.stride() == query.stride()
             and 2 <= max_partitions <= CLUSTER_PARTITIONS
             and num_seqs * max_partitions
             <= max(work_plan.capacity, -(-2 * num_compute_units // num_kv_heads))
@@ -1017,6 +1044,7 @@ def pa_decode(
             trans_k=trans_k,
             mask_unowned_kv=mask_unowned_kv,
             cluster_merge=cluster_merge,
+            output_strides_match=output_strides_match,
         )
 
     total_rows = query_length * query_group_size
@@ -1083,6 +1111,8 @@ def pa_decode(
                 if merged
                 else flyc.from_c_void_p(fx.Int32, 0)
             ),
+            int(output.stride(0)),
+            int(output.stride(1)),
         )
     with torch.cuda.device(dev):
         s = torch.cuda.current_stream(dev)

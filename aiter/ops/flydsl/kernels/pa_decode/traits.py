@@ -833,6 +833,8 @@ class Gfx1250Traits:
     merge_partitions: bool = False
     # Workgroups per sequence cluster that merges its partitions; 0 disables.
     cluster_merge: int = 0
+    # Matching layouts reuse query strides and keep the existing argument preload.
+    output_strides_match: bool = True
 
     WAVE = 32
     NWARP = 4
