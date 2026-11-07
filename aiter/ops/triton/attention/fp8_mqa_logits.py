@@ -102,6 +102,7 @@ def fp8_mqa_logits(
     cu_starts,
     cu_ends,
     clean_logits=True,
+    logits=None,
 ):
     """
     This function computes the logits to be used by a topk function for sparse attention.
@@ -115,6 +116,16 @@ def fp8_mqa_logits(
     clean_logits: bool. If True, positions outside [cu_starts[i], cu_ends[i]) in row i
                   are explicitly written as -inf. If False those positions are
                   unspecified.
+    logits:      optional caller-owned output, [seq_len, seq_len_kv] float32 with a
+                  unit column stride and a row stride of at least seq_len_kv (for
+                  example a view of a persistent workspace). Only the first
+                  seq_len_kv columns of each row are written; outside
+                  [cu_starts[i], cu_ends[i]) they hold unspecified values unless
+                  clean_logits. When None, a buffer is allocated per call; its
+                  size follows seq_len_kv, so a caller whose key count grows call
+                  after call (a long chunked prefill) should pass one instead of
+                  making the caching allocator reserve a new, slightly larger
+                  block every time.
 
     Returns:
     logits:      [seq_len, seq_len_kv], dtype float32 (must be initialized to -inf, because of causal masking)
@@ -128,7 +139,26 @@ def fp8_mqa_logits(
     # Initialize with -inf because of causal masking
     aligned_size = 256
     seq_len_kv_aligned = (seq_len_kv + aligned_size - 1) // aligned_size * aligned_size
-    if clean_logits:
+    if logits is not None:
+        if logits.dtype != torch.float32 or logits.dim() != 2:
+            raise ValueError(
+                f"logits must be a 2-D float32 tensor, got {logits.dtype} "
+                f"with {logits.dim()} dims"
+            )
+        if tuple(logits.shape) != (seq_len, seq_len_kv):
+            raise ValueError(
+                f"logits must be [{seq_len}, {seq_len_kv}], got {tuple(logits.shape)}"
+            )
+        if logits.stride(1) != 1 or (seq_len > 1 and logits.stride(0) < seq_len_kv):
+            raise ValueError(
+                "logits needs a unit column stride and a row stride of at least "
+                f"seq_len_kv={seq_len_kv}, got strides {logits.stride()}"
+            )
+        if logits.device != Q.device:
+            raise ValueError(f"logits is on {logits.device}, Q on {Q.device}")
+        if clean_logits:
+            logits.fill_(-float("inf"))
+    elif clean_logits:
         logits = torch.full(
             (seq_len, seq_len_kv_aligned),
             fill_value=-float("inf"),
