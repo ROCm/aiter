@@ -77,7 +77,7 @@ def batched_gemm_a16w8(
     assert is_batched_gemm_a16w8_supported(
         X, WQ
     ), "X must be bf16/fp16 and WQ fp8, both K-contiguous"
-    assert dtype in (torch.bfloat16, torch.float16)
+    assert dtype in (torch.bfloat16, torch.float16, torch.float8_e4m3fn, torch.float8_e4m3fnuz, torch.float8_e5m2, torch.float8_e5m2fnuz)
 
     if YQ is None:
         if transpose_bm:
