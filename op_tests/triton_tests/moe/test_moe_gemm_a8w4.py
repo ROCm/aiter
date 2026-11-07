@@ -29,6 +29,8 @@ from aiter.ops.triton.utils.shuffle import moe_weight_decode_view, shuffle_scale
 from op_tests.triton_tests.moe.moe_test_utils import assert_close
 from op_tests.triton_tests.utils.mxfp_ref import upcast_from_mxfp
 
+import triton
+
 
 def preshuffle_moe_weight(w: torch.Tensor) -> torch.Tensor:
     """``(E, K, N)`` -> the gfx1250 WMMA TDM view ``(E, K*16, N//16)``.
@@ -343,3 +345,77 @@ def test_op(
     elif not act_mxfp8 and fused_quant:
         tri_y = (tri_y.float() * quant_static_scale).to(ref_y.dtype)
     assert_close(ref_y, tri_y, maxtol=maxtol, rmstol=rmstol)
+
+
+# ---------------
+# SwiGLU activation correctness at block_m 128 vs fp32 torch reference.
+# ---------------
+
+_SKIP_SWIGLU = pytest.mark.skipif(
+    get_arch() != "gfx1250",
+    reason="SwiGLU inline-asm regression is gfx1250-only",
+)
+
+
+def _a8w4_gemm1_swiglu_vs_torch_ref(M, E, E_LOCAL, TOPK, D, I, block_m, in_kernel_gather, device):
+    """a8w4 GEMM1 with SwiGLU vs fp32 torch reference. 0 bad rows required."""
+    from op_tests.triton_tests.moe.moe_test_utils import (
+        dequant_e2m1,
+        ep_routing,
+        gemm1_swiglu_torch_ref,
+        make_mxfp4_weight,
+        upcast_fp8,
+    )
+
+    g = torch.Generator(device=device).manual_seed(0)
+    x = torch.randn(M, D, generator=g, device=device, dtype=torch.bfloat16)
+    vals, ids = torch.topk(torch.randn(M, E, generator=g, device=device), TOPK, dim=-1)
+    ids = ids.to(torch.int32).contiguous()
+    wts = torch.softmax(vals, -1).contiguous()
+
+    # weight: (E_LOCAL, K=D, N=2*I), quant along K (axis=1)
+    g_w = torch.Generator(device=device).manual_seed(1)
+    w = torch.randn(E_LOCAL, D, 2 * I, generator=g_w, device=device, dtype=torch.bfloat16) / D**0.5
+    wq, ws = downcast_to_mxfp(w, torch.uint8, axis=1)
+    # w_ref needs (E, N=2*I, K=D) so gemm1_swiglu_torch_ref can do xr @ w_ref[e].T
+    w_ref = dequant_e2m1(wq.transpose(1, 2), ws.transpose(1, 2))
+    sk = moe_shuffle_scale(ws.transpose(-1, -2).contiguous()).transpose(-1, -2)
+    wk = moe_weight_decode_view(moe_shuffle_weight(wq.transpose(-1, -2).contiguous()).contiguous())
+
+    bm = max(16, min(triton.next_power_of_2(max(1, M * TOPK // E)), block_m))
+    rd, gidx, _, _, _ = ep_routing(M, E, E_LOCAL, TOPK, bm, ids, wts, device)
+
+    xq, xs = downcast_to_mxfp(x, torch.float8_e4m3fn, axis=-1)
+    xr = upcast_fp8(xq, xs)
+    n = int(rd.expt_data.hist.sum())
+    ref, tok, _ = gemm1_swiglu_torch_ref(xr, w_ref, E_LOCAL, ids, gidx, n, TOPK)
+    ref_rq = upcast_fp8(*downcast_to_mxfp(ref.bfloat16(), torch.float8_e4m3fn, axis=-1))
+
+    gemm_kw = dict(
+        swizzle_mx_scale="GFX1250_SCALE", preshuffled=True,
+        out_mx_quant=True, apply_swiglu=True, alpha=1.0, limit=1e4,
+        swiglu_add_residual=False,
+    )
+    if in_kernel_gather:
+        y, ys = moe_gemm_a8w4(xq, wk, xs, sk, None, None, None, rd, gather_indx=gidx, **gemm_kw)
+    else:
+        y, ys = moe_gemm_a8w4(xq[tok], wk, xs[tok], sk, None, None, None, rd, gather_indx=None, **gemm_kw)
+
+    got = upcast_fp8(y[:n], ys[:n])
+    rc = torch.nn.functional.cosine_similarity(got, ref_rq, dim=1)
+    bad = ~(rc > 0.99)
+    n_bad = int(bad.sum())
+    cos = torch.nn.functional.cosine_similarity(got.flatten(), ref_rq.flatten(), dim=0).item()
+    assert n_bad == 0 and cos > 0.999, (
+        f"a8w4 GEMM1 SwiGLU {'gather' if in_kernel_gather else 'pregathered'} "
+        f"block_m={rd.block_m}: cos={cos:.6f} bad_rows={n_bad}/{n}"
+    )
+
+
+@_SKIP_SWIGLU
+@pytest.mark.parametrize("M", [4096, 8192])
+@pytest.mark.parametrize("in_kernel_gather", [True, False], ids=["gather", "pregathered"])
+def test_a8w4_gluon_swiglu_vs_torch_ref(M, in_kernel_gather, device="cuda"):
+    """a8w4 GEMM1 SwiGLU must produce 0 bad rows vs fp32 torch reference at block_m 128."""
+    E, E_LOCAL, TOPK, D, I = 256, 128, 8, 2304, 2304
+    _a8w4_gemm1_swiglu_vs_torch_ref(M, E, E_LOCAL, TOPK, D, I, 128, in_kernel_gather, device)
