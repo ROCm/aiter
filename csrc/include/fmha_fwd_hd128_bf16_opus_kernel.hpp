@@ -471,6 +471,43 @@ __device__ inline void attn_mask_causal_tile(V& v_s, int q_start_pos, int kv_til
         });
     });
 }
+// ─── sliding-window mask ───
+// One unsigned range test covers BOTH bounds:
+//   unmasked <=> thr <= rel <= thr + W  <=>  (u32)(rel - thr) <= W
+// rel < thr (a future key) underflows to a huge unsigned value and is caught by the same
+// compare, so no separate causal test is needed. W is workgroup-uniform (SGPR); the causal
+// version can keep its threshold as an inline-asm immediate, this one cannot.
+template<typename T, typename V>
+__device__ inline void attn_mask_window_tile(V& v_s, int q_start_pos, int kv_tile_idx,
+                                             int window_left, opus::u32_t neg_inf_v, int lane_id) {
+    using D_ACC = typename T::D_ACC;
+    constexpr int elems_per_wave_tile = (T::W_M * T::W_N) / T::WARP_SIZE;
+    constexpr int c_pack = 4;
+    constexpr int c_rept = elems_per_wave_tile / c_pack;
+    constexpr int c_rept_stride = (T::WARP_SIZE / T::W_M) * c_pack;
+
+    const int q_pos = q_start_pos + (lane_id % T::W_M);
+    int k_start_pos = kv_tile_idx * T::KV_TILE_SIZE;
+    asm volatile("" : "+s"(k_start_pos));
+    const int lane_group = lane_id / T::W_M;
+    const opus::u32_t w = static_cast<opus::u32_t>(window_left);
+    const D_ACC neg_inf = std::bit_cast<D_ACC>(neg_inf_v);
+
+    opus::static_for<T::GEMM0_E_N>([&](auto i_n) {
+        constexpr int base_idx = i_n.value * elems_per_wave_tile;
+        const int k_pos = k_start_pos + i_n.value * T::W_N + lane_group * c_pack;
+        const int rel = q_pos - k_pos;
+        opus::static_for<c_rept>([&](auto i_rept) {
+            constexpr int rept_base_idx = base_idx + i_rept.value * c_pack;
+            constexpr int thr_base = i_rept.value * c_rept_stride;
+            opus::static_for<c_pack>([&](auto i_e) {
+                constexpr int idx = rept_base_idx + i_e.value;
+                constexpr int thr = thr_base + i_e.value;
+                v_s[idx] = (static_cast<opus::u32_t>(rel - thr) <= w) ? v_s[idx] : neg_inf;
+            });
+        });
+    });
+}
 
 // Boundary column masking: set S columns with global KV index >= seqlen_k to -inf
 // (partial last KV tile, arbitrary seqlen). Same machinery as the causal mask but with
@@ -533,8 +570,6 @@ __device__ __attribute__((always_inline)) void gqa_d128_impl(opus_gqa_kargs karg
     using D_ACC = typename T::D_ACC;
 
     const int workgroup_x = block_id_x();
-    const int q_block_idx = block_id_y();
-    const int b = block_id_z();
     int warp_id = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
     int lane_id = thread_id_x() % T::WARP_SIZE;
     asm volatile("" : "+v"(lane_id));
@@ -544,12 +579,114 @@ __device__ __attribute__((always_inline)) void gqa_d128_impl(opus_gqa_kargs karg
     const int h = (workgroup_x % kargs.H_KV) * group_size + (workgroup_x / kargs.H_KV);
     const int h_kv = h / group_size;
     const int q_block_size = T::NUM_WARPS * T::Q_TILE_SIZE;
+
+    // Per-workgroup seqlens and base ROW offsets. GROUP_MODE reads both from the seqstart
+    // prefix sums; batch mode keeps the uniform batch-stride form. Everything after this
+    // uses seqlen_q / seqlen_kv, never kargs.N / kargs.N_KV.
+    int seqlen_q, seqlen_kv;
+    int64_t q_batch_base, o_batch_base, k_batch_base, v_batch_base, lse_batch_base;
+    int q_block_idx;
+    if constexpr (T::GROUP_MODE) {
+        auto sc = [](int x) { return __builtin_amdgcn_readfirstlane(x); };
+        // Two groupings of the same work, chosen by the host.
+        //
+        // Rectangular (total_q_blocks == 0): rotated axes (head=x, group=y, Q-block=z),
+        // Q-block on the slowest axis so the shorter groups' empty tail blocks
+        // short-circuit together. Every group gets ceil(max_seqlen / q_block) of them.
+        //
+        // Flat (total_q_blocks > 0): y carries one block per (group, Q-block) pair that
+        // actually exists, so nothing is launched that will not work. The cost is finding
+        // which group the flat index belongs to.
+        int g;
+        if (kargs.total_q_blocks > 0) {
+            const int i = sc(block_id_y());
+            if (kargs.ptr_block_map != nullptr) {
+                // A grid sized from an upper bound has entries past the last real block;
+                // they are marked negative so they retire on the same load that would
+                // have placed them.
+                const int packed = sc(kargs.ptr_block_map[i]);
+                if (packed < 0) return;
+                g           = packed >> 16;
+                q_block_idx = packed & 0xffff;
+            } else if (kargs.ptr_block_start != nullptr) {
+                // block_start[B] is the exact block count, so a grid sized from an upper
+                // bound lands its surplus past it. Retire those before the search, which
+                // would otherwise clamp them onto the last group with an out-of-range
+                // q_block_idx.
+                if (i >= sc(kargs.ptr_block_start[kargs.B])) return;
+                // The last g with block_start[g] <= i. Taking the LAST one is what skips
+                // a zero-length group, which leaves block_start[g] == block_start[g+1].
+                int lo = 0, hi = kargs.B;                 // invariant: answer in [lo, hi)
+                while (hi - lo > 1) {
+                    const int mid = (lo + hi) >> 1;
+                    if (sc(kargs.ptr_block_start[mid]) <= i) lo = mid; else hi = mid;
+                }
+                g           = lo;
+                q_block_idx = i - sc(kargs.ptr_block_start[lo]);
+            } else {
+                // No side array at all. Place group g at the flat index
+                // seqstart_q[g] / q_block + g, which is strictly increasing in g and
+                // reaches total_q / q_block + batch at g == B -- the extent the host sized
+                // the grid to. So the mapping inverts straight out of seqstart_q, with
+                // neither the exact block count nor anything precomputed, by the same
+                // search as the branch above. Same shape as the Triton
+                // unified_attention kernels' find_seq_idx.
+                //
+                // The spacing gives group g one more block than ceil(seqlen_q[g] /
+                // q_block) whenever its length is not a multiple of q_block; that one
+                // lands past the group's real rows and retires on the seqlen check below,
+                // which is the same slack the grid's upper bound already carries.
+                //
+                // This replaced a walk over the groups accumulating their block counts.
+                // The walk measured the same to within noise even at B=1024 with one Q
+                // row per group -- its scalar loads hit the K$ and run ahead of the
+                // block's vector setup -- so the reason to prefer the search is that its
+                // cost does not scale with the batch at all, not a time saved.
+                int lo = 0, hi = kargs.B;             // invariant: answer in [lo, hi)
+                while (hi - lo > 1) {
+                    const int mid = (lo + hi) >> 1;
+                    const int at  = sc(kargs.ptr_seqstart_q[mid]) / q_block_size + mid;
+                    if (at <= i) lo = mid; else hi = mid;
+                }
+                g           = lo;
+                q_block_idx = i - (sc(kargs.ptr_seqstart_q[lo]) / q_block_size + lo);
+            }
+        } else {
+            g           = sc(block_id_y());
+            q_block_idx = block_id_z();
+        }
+        const int q0 = sc(kargs.ptr_seqstart_q[g]);
+        const int k0 = sc(kargs.ptr_seqstart_k[g]);
+        seqlen_q  = sc(kargs.ptr_seqstart_q[g + 1]) - q0;
+        seqlen_kv = sc(kargs.ptr_seqstart_k[g + 1]) - k0;
+        const int64_t qpad = sc(kargs.ptr_seqstart_q_pad[g]);
+        const int64_t kpad = sc(kargs.ptr_seqstart_k_pad[g]);
+        q_batch_base   = qpad * kargs.stride_q_n;
+        o_batch_base   = qpad * kargs.stride_o_n;
+        k_batch_base   = kpad * kargs.stride_k_n;
+        v_batch_base   = kpad * kargs.stride_v_n;
+        lse_batch_base = qpad;
+        // The rectangular grid gives every group the longest group's block count, and a
+        // flat grid sized from an upper bound overshoots by at most one block per group;
+        // either way the surplus is dropped here.
+        if (q_block_idx >= ceil_div(seqlen_q, q_block_size)) return;
+    } else {
+        const int b    = block_id_z();
+        seqlen_q       = kargs.N;
+        seqlen_kv      = kargs.N_KV;
+        q_batch_base   = (int64_t)b * kargs.stride_q_b;
+        o_batch_base   = (int64_t)b * kargs.stride_o_b;
+        k_batch_base   = (int64_t)b * kargs.stride_k_b;
+        v_batch_base   = (int64_t)b * kargs.stride_v_b;
+        lse_batch_base = (int64_t)b * kargs.stride_lse_b;
+        q_block_idx    = block_id_y();
+    }
     const int q_block_start = q_block_idx * q_block_size;
     // int64 offsets: B*N*H*D can exceed INT_MAX at large shapes.
-    const int64_t q_gmem_offset = (int64_t)b * kargs.stride_q_b + (int64_t)q_block_start * kargs.stride_q_n + (int64_t)h * kargs.stride_q_h;
-    const int64_t o_gmem_offset = (int64_t)b * kargs.stride_o_b + (int64_t)q_block_start * kargs.stride_o_n + (int64_t)h * kargs.stride_o_h;
-    const int64_t k_gmem_offset = (int64_t)b * kargs.stride_k_b + (int64_t)h_kv * kargs.stride_k_h;
-    const int64_t v_gmem_offset = (int64_t)b * kargs.stride_v_b + (int64_t)h_kv * kargs.stride_v_h;
+    const int64_t q_gmem_offset = q_batch_base + (int64_t)q_block_start * kargs.stride_q_n + (int64_t)h * kargs.stride_q_h;
+    const int64_t o_gmem_offset = o_batch_base + (int64_t)q_block_start * kargs.stride_o_n + (int64_t)h * kargs.stride_o_h;
+    const int64_t k_gmem_offset = k_batch_base + (int64_t)h_kv * kargs.stride_k_h;
+    const int64_t v_gmem_offset = v_batch_base + (int64_t)h_kv * kargs.stride_v_h;
 
     // num_records (bytes) bounds each descriptor to its valid rows so an out-of-bounds
     // read (partial last KV tile / partial last Q block, arbitrary seqlen) returns 0 with
@@ -559,13 +696,13 @@ __device__ __attribute__((always_inline)) void gqa_d128_impl(opus_gqa_kargs karg
         const int64_t bytes = elems * (int64_t)sizeof(D_ATTN);
         return bytes >= (int64_t)0xffffffffu ? 0xffffffffu : (unsigned int)bytes;
     };
-    const unsigned int k_num_records = rec_bytes((int64_t)kargs.N_KV * kargs.stride_k_n);
-    const unsigned int v_num_records = rec_bytes((int64_t)kargs.N_KV * kargs.stride_v_n);
-    const unsigned int q_num_records = rec_bytes((int64_t)(kargs.N - q_block_start) * kargs.stride_q_n);
-    const unsigned int o_num_records = rec_bytes((int64_t)(kargs.N - q_block_start) * kargs.stride_o_n);
+    const unsigned int k_num_records = rec_bytes((int64_t)seqlen_kv * kargs.stride_k_n);
+    const unsigned int v_num_records = rec_bytes((int64_t)seqlen_kv * kargs.stride_v_n);
+    const unsigned int q_num_records = rec_bytes((int64_t)(seqlen_q - q_block_start) * kargs.stride_q_n);
+    const unsigned int o_num_records = rec_bytes((int64_t)(seqlen_q - q_block_start) * kargs.stride_o_n);
     // Same bound for the fp32 LSE buffer (different element size than D_ATTN).
     const unsigned int lse_num_records =
-        (unsigned int)((int64_t)(kargs.N - q_block_start) * (int64_t)sizeof(D_ACC));
+        (unsigned int)((int64_t)(seqlen_q - q_block_start) * (int64_t)sizeof(D_ACC));
 
     // Global memory tensors
     auto g_q = make_gmem(reinterpret_cast<const D_ATTN*>(kargs.ptr_q) + q_gmem_offset, q_num_records);
@@ -659,10 +796,10 @@ __device__ __attribute__((always_inline)) void gqa_d128_impl(opus_gqa_kargs karg
     // differ from seqlen_q (N) for cross-attention.
     const int k_tile_stride = T::KV_TILE_SIZE * kargs.stride_k_n;
     const int v_tile_stride = T::KV_TILE_SIZE * kargs.stride_v_n;
-    const int num_kv_tiles = ceil_div(kargs.N_KV, T::KV_TILE_SIZE);
+    const int num_kv_tiles = ceil_div(seqlen_kv, T::KV_TILE_SIZE);
     // causal bottom-right alignment: query at global pos q_pos attends to keys with
     // k_pos <= q_pos + causal_offset. offset==0 for self-attention (N_KV==N).
-    [[maybe_unused]] const int causal_offset = kargs.N_KV - kargs.N;
+    [[maybe_unused]] const int causal_offset = seqlen_kv - seqlen_q;
     int max_num_tiles = num_kv_tiles;
     if constexpr (T::CAUSAL) {
         const int q_block_end = q_block_start + q_block_size;
@@ -673,8 +810,21 @@ __device__ __attribute__((always_inline)) void gqa_d128_impl(opus_gqa_kargs karg
         // also keeps every tile index non-negative (no OOB kv_tile offset).
         if (max_num_tiles < 1) max_num_tiles = 1;
     }
-    auto k_tile = [&](int tile_idx) { return tile_idx * k_tile_stride; };
-    auto v_tile = [&](int tile_idx) { return tile_idx * v_tile_stride; };
+    // Sliding window: bound the traversal on the LEFT too -- the skipped tiles are never
+    // read from DRAM. Bound is per Q BLOCK, i.e. the window start of its FIRST row. From
+    // here max_num_tiles is a COUNT relative to tile_begin, so the loop body keeps indexing
+    // from 0 and only k_tile / v_tile / the mask's tile index re-add the base.
+    int tile_begin = 0;
+    if constexpr (T::LOCAL) {
+        if (kargs.window_size_left >= 0) {
+            const int min_kv = q_block_start + causal_offset - kargs.window_size_left;
+            tile_begin = min_kv > 0 ? (min_kv / T::KV_TILE_SIZE) : 0;
+            if (tile_begin > max_num_tiles - 1) tile_begin = max_num_tiles - 1;
+        }
+        max_num_tiles -= tile_begin;
+    }
+    auto k_tile = [&](int tile_idx) { return (tile_begin + tile_idx) * k_tile_stride; };
+    auto v_tile = [&](int tile_idx) { return (tile_begin + tile_idx) * v_tile_stride; };
     // Clamp a (possibly out-of-range) prefetch tile index to the last valid tile so K is
     // always prefetched (constant in-flight vmem → uniform rolling vmcnt, no tail branch;
     // the extra re-read of the last tile is harmless — it is never consumed).
@@ -697,7 +847,7 @@ __device__ __attribute__((always_inline)) void gqa_d128_impl(opus_gqa_kargs karg
                                   ? ((m_row + __builtin_amdgcn_logf(l_row)) * LN2)
                                   : -opus::numeric_limits<D_ACC>::infinity();
             auto g_lse = make_gmem(reinterpret_cast<D_ACC*>(kargs.ptr_lse) +
-                                       (int64_t)b * kargs.stride_lse_b +
+                                       lse_batch_base +
                                        (int64_t)h * kargs.stride_lse_h + q_block_start,
                                    lse_num_records);
             g_lse.store(lse, warp_id * T::Q_TILE_SIZE + lane_id);
@@ -793,15 +943,20 @@ __device__ __attribute__((always_inline)) void gqa_d128_impl(opus_gqa_kargs karg
         v_kv.v = tr_load<T::VEC_TR_V>(s_v[prev], u_rv);
         async_load<T::VEC_KV>(g_k, s_k[cur].ptr, u_gk, u_sk, k_tile(clamp_tile(t + 2)));
         if constexpr (T::CAUSAL) {
-            const int kv_end_pos = (t + 1) * T::KV_TILE_SIZE;
-            if (q_start_pos_c < kv_end_pos) {
-                attn_mask_causal_tile<T>(vs_cur.s, q_start_pos_c, t, neg_inf_v, lane_id);
+            const int kv_end_pos = (tile_begin + t + 1) * T::KV_TILE_SIZE;
+            // LOCAL needs the window test on EVERY tile, not just the near-diagonal ones:
+            // the left bound cuts tiles the causal check would wave through.
+            if constexpr (T::LOCAL) {
+                attn_mask_window_tile<T>(vs_cur.s, q_start_pos_c, tile_begin + t,
+                                         kargs.window_size_left, neg_inf_v, lane_id);
+            } else if (q_start_pos_c < kv_end_pos) {
+                attn_mask_causal_tile<T>(vs_cur.s, q_start_pos_c, tile_begin + t, neg_inf_v, lane_id);
             }
         } else {
             // Non-causal: mask padded columns (global KV idx >= seqlen_kv) of the last KV
             // tile when seqlen_kv is not a multiple of KV_TILE (arbitrary seqlen).
-            if ((kargs.N_KV % T::KV_TILE_SIZE) != 0 && t == max_num_tiles - 1) {
-                attn_mask_border_tile<T>(vs_cur.s, kargs.N_KV, t, neg_inf_v, lane_id);
+            if ((seqlen_kv % T::KV_TILE_SIZE) != 0 && t == max_num_tiles - 1) {
+                attn_mask_border_tile<T>(vs_cur.s, seqlen_kv, tile_begin + t, neg_inf_v, lane_id);
             }
         }
         s_waitcnt_lgkmcnt(0_I);
@@ -893,15 +1048,18 @@ __device__ __attribute__((always_inline)) void gqa_d128_impl(opus_gqa_kargs karg
     v_s0.s = mma0(v_q, v_kv.k);
     __builtin_amdgcn_sched_barrier(0);
     if constexpr (T::CAUSAL) {
-        const int kv_end_pos = T::KV_TILE_SIZE;
-        if (q_start_pos_c < kv_end_pos) {
-            attn_mask_causal_tile<T>(v_s0.s, q_start_pos_c, 0, neg_inf_v, lane_id);
+        const int kv_end_pos = (tile_begin + 1) * T::KV_TILE_SIZE;
+        if constexpr (T::LOCAL) {
+            attn_mask_window_tile<T>(v_s0.s, q_start_pos_c, tile_begin,
+                                     kargs.window_size_left, neg_inf_v, lane_id);
+        } else if (q_start_pos_c < kv_end_pos) {
+            attn_mask_causal_tile<T>(v_s0.s, q_start_pos_c, tile_begin, neg_inf_v, lane_id);
         }
     } else {
         // Non-causal: border-mask tile 0 only when it is also the last tile (tiny seqlen,
         // num_kv_tiles==1) and seqlen_kv is not KV_TILE-aligned.
-        if ((kargs.N_KV % T::KV_TILE_SIZE) != 0 && max_num_tiles == 1) {
-            attn_mask_border_tile<T>(v_s0.s, kargs.N_KV, 0, neg_inf_v, lane_id);
+        if ((seqlen_kv % T::KV_TILE_SIZE) != 0 && max_num_tiles == 1) {
+            attn_mask_border_tile<T>(v_s0.s, seqlen_kv, tile_begin, neg_inf_v, lane_id);
         }
     }
     m_row = attn_row_max<T>(v_s0.s);

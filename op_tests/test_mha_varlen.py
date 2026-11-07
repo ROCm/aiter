@@ -1370,25 +1370,30 @@ _OPUS_D192_GROUP_CASES = [
 ]
 
 
-@pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize(
-    "seqlens_q,seqlens_kv,nheads,nheads_k,kv_pad",
-    _OPUS_D192_GROUP_CASES,
-    ids=[
-        f"g{len(a)}_h{h}_hkv{hk}_pad{p}" + ("_emptykv" if 0 in b else "")
-        for (a, b, h, hk, p) in _OPUS_D192_GROUP_CASES
-    ],
-)
-def test_fmha_fwd_bf16_opus_d192_v128_group(
-    seqlens_q, seqlens_kv, nheads, nheads_k, kv_pad, causal
+def _run_opus_group_case(
+    seqlens_q,
+    seqlens_kv,
+    nheads,
+    nheads_k,
+    kv_pad,
+    causal,
+    d_qk,
+    d_v,
+    window_size_left=-1,
 ):
-    """OPUS D=192 group/varlen forward with LSE, per group against attention_ref."""
-    if get_gfx() != "gfx950":
-        pytest.skip("opus D=192 kernel requires gfx950")
+    """Shared body: OPUS group/varlen forward with LSE, per group vs attention_ref.
+
+    `window_size_left` >= 0 adds the left-bounded causal window (D=128 only); -1 keeps
+    the unbounded mask. The window is per sequence, so each group's reference gets it
+    independently.
+    """
     assert len(seqlens_q) == len(seqlens_kv)
 
     torch.manual_seed(0)
-    d_qk, d_v = 192, 128
+    window_size = (window_size_left, 0) if window_size_left >= 0 else (-1, -1)
+    tag = f"opus-d{d_qk}-group" + (
+        f"-win{window_size_left}" if window_size_left >= 0 else ""
+    )
 
     def _cumsum(lengths):
         return torch.tensor(
@@ -1427,6 +1432,7 @@ def test_fmha_fwd_bf16_opus_d192_v128_group(
             max_seqlen_q=max(seqlens_q),
             max_seqlen_k=max(seqlens_kv),
             return_lse=True,
+            window_size_left=window_size_left,
         )
 
     assert tuple(lse.shape) == (nheads, total_q), f"lse shape {tuple(lse.shape)}"
@@ -1438,6 +1444,11 @@ def test_fmha_fwd_bf16_opus_d192_v128_group(
         ql, qh = int(cu_q[g]), int(cu_q[g + 1])
         kl = int(cu_k_pad[g])  # physical start, real length
         kh = kl + seqlens_kv[g]
+        if seqlens_q[g] == 0:
+            # No query rows, so the group owns no output and there is nothing to
+            # compare. What matters is that it consumed no Q blocks and left the
+            # neighbouring groups' rows alone, which the other groups' checks cover.
+            continue
         if seqlens_kv[g] == 0:
             # Assert the contract exactly rather than through attention_ref, whose
             # degenerate-shape behaviour is its own question.
@@ -1451,18 +1462,203 @@ def test_fmha_fwd_bf16_opus_d192_v128_group(
         qg = q[ql:qh].unsqueeze(0)
         kg = k[kl:kh].unsqueeze(0)
         vg = v[kl:kh].unsqueeze(0)
-        out_ref, _, _ = attention_ref(qg, kg, vg, causal=causal)
+        out_ref, _, _ = attention_ref(
+            qg, kg, vg, causal=causal, window_size=window_size
+        )
         out_pt, _, _ = attention_ref(
-            qg, kg, vg, causal=causal, upcast=False, reorder_ops=True
+            qg,
+            kg,
+            vg,
+            causal=causal,
+            window_size=window_size,
+            upcast=False,
+            reorder_ops=True,
         )
         tol = max(2 * (out_pt - out_ref).abs().max().item(), 0.01)
         diff = (out[ql:qh].unsqueeze(0) - out_ref).abs().max().item()
         max_diff = max(max_diff, diff)
         assert diff <= tol, f"group {g} diff {diff} > tol {tol}"
         opus_check_lse(
-            f"opus-d192-group g{g}", lse[:, ql:qh], opus_ref_lse(qg, kg, causal)[0]
+            f"{tag} g{g}",
+            lse[:, ql:qh],
+            opus_ref_lse(qg, kg, causal, window_size_left=window_size_left)[0],
         )
-    print(f"[opus-d192-group] max diff across groups: {max_diff}")
+    print(f"[{tag}] max diff across groups: {max_diff}")
+
+
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize(
+    "seqlens_q,seqlens_kv,nheads,nheads_k,kv_pad",
+    _OPUS_D192_GROUP_CASES,
+    ids=[
+        f"g{len(a)}_h{h}_hkv{hk}_pad{p}" + ("_emptykv" if 0 in b else "")
+        for (a, b, h, hk, p) in _OPUS_D192_GROUP_CASES
+    ],
+)
+def test_fmha_fwd_bf16_opus_d192_v128_group(
+    seqlens_q, seqlens_kv, nheads, nheads_k, kv_pad, causal
+):
+    """OPUS D=192 group/varlen forward with LSE, per group against attention_ref."""
+    if get_gfx() != "gfx950":
+        pytest.skip("opus D=192 kernel requires gfx950")
+    _run_opus_group_case(
+        seqlens_q, seqlens_kv, nheads, nheads_k, kv_pad, causal, 192, 128
+    )
+
+
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize(
+    "seqlens_q,seqlens_kv,nheads,nheads_k,kv_pad",
+    _OPUS_D192_GROUP_CASES,
+    ids=[
+        f"g{len(a)}_h{h}_hkv{hk}_pad{p}" + ("_emptykv" if 0 in b else "")
+        for (a, b, h, hk, p) in _OPUS_D192_GROUP_CASES
+    ],
+)
+def test_fmha_fwd_bf16_opus_d128_group(
+    seqlens_q, seqlens_kv, nheads, nheads_k, kv_pad, causal, monkeypatch
+):
+    """OPUS D=128 group/varlen forward with LSE, per group against attention_ref.
+
+    The same shape matrix as the D=192 test: the two kernels share the group-mode
+    contract (packed THD, KV padding, cross-attention, empty groups), so the cases
+    that pin it down are the same. Env-gated like the dense D=128 path.
+    """
+    if get_gfx() != "gfx950":
+        pytest.skip("opus D=128 kernel requires gfx950")
+    monkeypatch.setenv("AITER_ENABLE_FMHA_OPUS", "1")
+    _run_opus_group_case(
+        seqlens_q, seqlens_kv, nheads, nheads_k, kv_pad, causal, 128, 128
+    )
+
+
+# Longer group-mode shapes for D=128, both mask modes. _OPUS_D192_GROUP_CASES pins the
+# structural edges (empty groups, KV padding, cross-attention, partial tails) but tops out
+# at 1,024 tokens, so none of its cases reach the sequence lengths this kernel is built
+# for, the batch sizes a serving engine produces, or the capacity the request doc states.
+#   (q seqlens, kv seqlens, nheads, nheads_k, kv_pad)
+_OPUS_D128_GROUP_LONG_CASES = [
+    ([8400] * 4, [8400] * 4, 4, 4, 0),  # the request doc's band, uniform
+    ([7500, 9400, 8100, 8900], [7500, 9400, 8100, 8900], 4, 4, 0),  # band, jagged
+    ([8400] * 16, [8400] * 16, 4, 4, 0),  # band at a serving batch
+    ([16354], [16354], 4, 4, 0),  # the stated capacity, B=1
+    ([512] * 7 + [16354], [512] * 7 + [16354], 4, 4, 0),  # one long among short
+    ([2048] * 32, [2048] * 32, 8, 2, 0),  # mid lengths, large batch, GQA
+    ([64] * 64, [64] * 64, 8, 2, 0),  # many tiny groups
+    ([1] * 64, [4096] * 64, 16, 4, 0),  # decode: one query row against a long context
+    ([4096] * 8, [512] * 8, 32, 8, 0),  # cross q>k, GQA 4:1
+    ([512] * 8, [4096] * 8, 16, 1, 0),  # cross q<k, MQA
+    (
+        [3000, 50, 12000, 700],
+        [3000, 50, 12000, 700],
+        8,
+        8,
+        0,
+    ),  # orders of magnitude apart
+    ([9000, 9000], [9000, 9000], 4, 4, 1024),  # long + KV padding
+]
+
+
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize(
+    "seqlens_q,seqlens_kv,nheads,nheads_k,kv_pad",
+    _OPUS_D128_GROUP_LONG_CASES,
+    ids=[
+        f"g{len(a)}_max{max(a)}_h{h}_hkv{hk}_pad{p}"
+        for (a, b, h, hk, p) in _OPUS_D128_GROUP_LONG_CASES
+    ],
+)
+def test_fmha_fwd_bf16_opus_d128_group_long(
+    seqlens_q, seqlens_kv, nheads, nheads_k, kv_pad, causal, monkeypatch
+):
+    """OPUS D=128 group/varlen at the sequence lengths and batch sizes it is built for.
+
+    Separate from test_fmha_fwd_bf16_opus_d128_group because that one shares its shapes
+    with the D=192 test and stops at 1,024 tokens: nothing there spans more than four
+    Q blocks, so the flat grid's block count, the group lookup and the KV traversal are
+    all exercised only at their smallest.
+    """
+    if get_gfx() != "gfx950":
+        pytest.skip("opus D=128 kernel requires gfx950")
+    monkeypatch.setenv("AITER_ENABLE_FMHA_OPUS", "1")
+    _run_opus_group_case(
+        seqlens_q, seqlens_kv, nheads, nheads_k, kv_pad, causal, 128, 128
+    )
+
+
+# Group mode crossed with the left-bounded causal window: the window is per sequence,
+# so a group shorter than the window must still mask on the diagonal and a group longer
+# than it must drop its early keys. Windows are only causal, hence no causal=False.
+#   (q seqlens, kv seqlens, nheads, nheads_k, kv_pad, window_size_left)
+_OPUS_D128_GROUP_SWA_CASES = [
+    # Window width against a fixed profile: the boundaries LOCAL's bound moves across.
+    ([64, 200, 500], [64, 200, 500], 8, 2, 0, 0),  # diagonal key only
+    ([64, 200, 500], [64, 200, 500], 8, 2, 0, 1),  # two keys per row
+    ([64, 200, 500], [64, 200, 500], 8, 2, 0, 63),  # inside one KV tile
+    ([64, 200, 500], [64, 200, 500], 8, 2, 0, 64),  # exactly one KV tile
+    ([64, 200, 500], [64, 200, 500], 8, 2, 0, 128),  # wider than the first group
+    ([64, 200, 500], [64, 200, 500], 8, 2, 0, 255),  # one row short of a Q block
+    ([64, 200, 500], [64, 200, 500], 8, 2, 0, 256),  # exactly a Q block
+    ([64, 200, 500], [64, 200, 500], 8, 2, 0, 4096),  # wider than every group
+    # Partial tails and odd lengths, where the window and the tail mask interact.
+    ([1023, 65], [1023, 65], 16, 4, 0, 100),  # odd lengths, partial tiles
+    ([1, 255, 257, 511], [1, 255, 257, 511], 8, 8, 0, 128),  # Q-block boundaries
+    ([513, 1025], [513, 1025], 4, 4, 0, 257),  # window straddles a block
+    # Structural shapes: these never reach LOCAL in the non-window group cases.
+    ([256, 256], [0, 256], 8, 2, 0, 64),  # empty group + window
+    ([256, 0, 256], [256, 256, 256], 8, 2, 0, 64),  # empty query group + window
+    ([200, 64, 700], [200, 64, 700], 8, 2, 256, 128),  # KV padded + window
+    ([100, 100], [0, 300], 8, 2, 64, 32),  # empty kv + KV padding + window
+    ([777], [777], 8, 2, 0, 128),  # single group
+    ([64] * 17, [64] * 17, 8, 8, 0, 32),  # many groups, all below the window
+    # Cross attention: the bottom-right alignment shifts where the window sits.
+    ([300, 77, 1024], [700, 200, 300], 4, 4, 0, 64),  # cross, mixed
+    ([128, 512], [512, 128], 8, 2, 0, 96),  # cross, one each way
+    ([1024, 8], [1, 8], 2, 1, 0, 16),  # 1024 queries vs a single key, MQA
+    ([1, 1, 1], [256, 512, 64], 16, 4, 0, 32),  # decode-shaped groups
+    # GQA / MQA / MHA fan-out under a window.
+    ([512, 1000], [512, 1000], 32, 8, 0, 128),  # GQA 4:1
+    ([512, 1000], [512, 1000], 16, 1, 0, 128),  # MQA
+    ([512, 1000], [512, 1000], 8, 8, 0, 128),  # MHA
+    # At the stated capacity, and a long sequence beside short ones.
+    ([16354], [16354], 4, 4, 0, 256),  # max_seqlen, the request doc's window
+    ([512] * 7 + [16354], [512] * 7 + [16354], 4, 4, 0, 256),  # one long + short
+    ([8400] * 4, [8400] * 4, 4, 4, 0, 256),  # the request doc's band, uniform
+]
+
+
+@pytest.mark.parametrize(
+    "seqlens_q,seqlens_kv,nheads,nheads_k,kv_pad,window_size_left",
+    _OPUS_D128_GROUP_SWA_CASES,
+    ids=[
+        f"g{len(a)}_h{h}_hkv{hk}_pad{p}_win{w}"
+        for (a, b, h, hk, p, w) in _OPUS_D128_GROUP_SWA_CASES
+    ],
+)
+def test_fmha_fwd_bf16_opus_d128_group_swa(
+    seqlens_q, seqlens_kv, nheads, nheads_k, kv_pad, window_size_left, monkeypatch
+):
+    """OPUS D=128 group/varlen with a sliding window.
+
+    Distinct from test_fmha_fwd_bf16_opus_d128_group because GROUP_MODE and LOCAL are
+    separate kernel instances: the group cases never select LOCAL, and the dense SWA
+    cases in test_mha.py never select GROUP_MODE. This is the only test that covers
+    both at once, where the per-sequence base and the window bound interact.
+    """
+    if get_gfx() != "gfx950":
+        pytest.skip("opus D=128 kernel requires gfx950")
+    monkeypatch.setenv("AITER_ENABLE_FMHA_OPUS", "1")
+    _run_opus_group_case(
+        seqlens_q,
+        seqlens_kv,
+        nheads,
+        nheads_k,
+        kv_pad,
+        causal=True,
+        d_qk=128,
+        d_v=128,
+        window_size_left=window_size_left,
+    )
 
 
 # ---------------------------------------------------------------------------
