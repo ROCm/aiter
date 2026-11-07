@@ -17,10 +17,12 @@ from .kernels.conv.conv3d_gfx1250_utils import (
     DEFAULT_BLOCK_ROWS,
     LDS_PAD,
     MAX_WAVES,
+    PATCH_STAGES,
     TILE_K,
     WMMA_M,
     WMMA_N,
     make_tile_config_gfx1250,
+    patch_stage_elems_gfx1250,
     validate_launch_config_gfx1250,
 )
 
@@ -63,9 +65,30 @@ def tile_kernel_name_gfx1250(tile_m, tile_n, wave_m, wave_n, block_rows):
     )
 
 
-def lds_bytes_tap(tile_m, tile_n, num_buffers=2):
-    lds_k = TILE_K + LDS_PAD
+def lds_bytes_tap(tile_m, tile_n, num_buffers=2, tile_k=TILE_K):
+    lds_k = (tile_k // TILE_K) * (TILE_K + LDS_PAD)
     a = num_buffers * (tile_m * lds_k + LDS_PAD)
+    b = num_buffers * (tile_n * lds_k + LDS_PAD)
+    return (a + b) * BF16_BYTES
+
+
+def lds_bytes_patch(
+    tile_m,
+    tile_n,
+    block_rows,
+    kh,
+    kw,
+    dh=1,
+    dw=1,
+    num_buffers=2,
+    num_warps=1,
+    tile_k=TILE_K,
+):
+    """LDS of the kH x kW patch path: PATCH_STAGES A patches + the B ring."""
+    lds_k = (tile_k // TILE_K) * (TILE_K + LDS_PAD)
+    a = PATCH_STAGES * patch_stage_elems_gfx1250(
+        block_rows, tile_m // block_rows, kh, kw, dh, dw, num_warps, tile_k
+    )
     b = num_buffers * (tile_n * lds_k + LDS_PAD)
     return (a + b) * BF16_BYTES
 
