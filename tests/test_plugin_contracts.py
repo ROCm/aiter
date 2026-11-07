@@ -68,7 +68,10 @@ def _is_route(decorator: ast.expr, spellings: set[str]) -> bool:
         name = getattr(target, "id", "")
     if name not in spellings:
         return False
-    return {keyword.arg for keyword in decorator.keywords} >= {"op", "version"}
+    # ``op`` alone: ``version`` defaults to 1 and is written only once it has
+    # moved, so requiring it here would make every unversioned route invisible
+    # to this gate -- unprotected in exactly the common case.
+    return "op" in {keyword.arg for keyword in decorator.keywords}
 
 
 def _literal(node: ast.expr | None) -> str | None:
@@ -133,9 +136,14 @@ def routed_contracts(root: Path) -> dict[str, dict[str, object]]:
                     continue
                 keywords = {k.arg: k.value for k in decorator.keywords}
                 op = ast.literal_eval(keywords["op"])
+                version = (
+                    ast.literal_eval(keywords["version"])
+                    if "version" in keywords
+                    else 1
+                )
                 signature = _signature(node)
                 found[op] = {
-                    "version": ast.literal_eval(keywords["version"]),
+                    "version": version,
                     "signature": signature,
                     "fingerprint": hashlib.sha256(signature.encode()).hexdigest()[:16],
                     "source": str(path.relative_to(root)),
@@ -237,3 +245,27 @@ def test_every_kind_of_signature_change_moves_the_fingerprint(tmp_path, changed)
 def routed_contracts_for(tmp_path: Path, source: str) -> dict:
     (tmp_path / "aiter" / "sample.py").write_text(source)
     return routed_contracts(tmp_path)
+
+
+UNVERSIONED = """
+from aiter.plugin import route
+
+@route(op="demo.plain")
+def plain(a, b=2): ...
+"""
+
+
+def test_a_route_without_an_explicit_version_is_still_seen(tmp_path):
+    """version defaults to 1, so the common route omits it.
+
+    Requiring the keyword here would have made every such route invisible to
+    this gate: unprotected in exactly the case that is recommended.
+    """
+
+    (tmp_path / "aiter").mkdir()
+    (tmp_path / "aiter" / "sample.py").write_text(UNVERSIONED)
+
+    found = routed_contracts(tmp_path)
+
+    assert set(found) == {"demo.plain"}
+    assert found["demo.plain"]["version"] == 1
