@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Gluon all-reduce against RCCL and the aiter custom all-reduce on 4 gfx1250 GPUs.
-The time is the slowest rank, in a HIP graph."""
+gluon_fp8 is the Gluon all-reduce with the fp8 per-token quant. The time is the
+slowest rank, in a HIP graph."""
 
 import multiprocessing as mp
 
@@ -35,13 +36,18 @@ WORLD_SIZE = 4
 TOKENS = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048]
 
 
-def benchmark(args, rank, device, tp, inboxes, calls):
+def benchmark(args, rank, device, tp, inboxes, calls, quant_state):
     ca = tp.device_communicator.ca_comm
     providers = ["gluon", "rccl"]
+    if args.hidden >= 128 and args.hidden & (args.hidden - 1) == 0:
+        providers.append("gluon_fp8")  # the quant needs rows of a power of 2
     if ca is not None and not ca.disabled:
         providers.append("car")
     fns = {
         "gluon": lambda x, out: all_reduce(x, tp.cpu_group, inboxes, calls),
+        "gluon_fp8": lambda x, out: all_reduce(
+            x.view(-1, args.hidden), tp.cpu_group, *quant_state, quant=True
+        ),
         "rccl": lambda x, out: dist.all_reduce(x, group=tp.device_group),
         "car": lambda x, out: ca.all_reduce(x, out=out, registered_input=False),
     }
@@ -89,10 +95,14 @@ def _worker(rank, init_method, args):
     tp = get_tp_group()
     max_bytes = max(args.tokens) * args.hidden * 2
     inboxes, calls = all_reduce_init(tp.cpu_group, max_bytes)
+    # The quant calls move 3 rows a chunk: inboxes of their own, of 2 rows or more.
+    quant_state = all_reduce_init(tp.cpu_group, max(max_bytes, 4 * args.hidden))
     try:
-        benchmark(args, rank, device, tp, inboxes, calls)
+        benchmark(args, rank, device, tp, inboxes, calls, quant_state)
         assert calls[-1].item() == 0, "a Gluon all-reduce poll timed out"
+        assert quant_state[1][-1].item() == 0, "a Gluon quant poll timed out"
     finally:
+        all_reduce_free(tp.cpu_group, quant_state[0])
         all_reduce_free(tp.cpu_group, inboxes)
         aiter.destroy_dist_env()
 
