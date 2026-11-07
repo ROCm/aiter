@@ -806,3 +806,24 @@ def sparse_mla_dsv4_ref(q, kv, topk_indices, attn_sink=None, scale=None):
         )
         lses.append((m + torch.log(denom)).detach())
     return torch.stack(outs, dim=0), torch.stack(lses, dim=0)
+
+
+def run_fp8_mha_or_skip(run):
+    """Run one per-tensor FP8 MHA call, or skip when the backend has no kernel.
+
+    A missing CK or FMHA v3 instance comes back as RuntimeError
+    "invalid argument for fmha_fwd" (varlen split-KV uses the same prefix,
+    "invalid argument for fmha_fwd_splitkv"). The harness does not keep its
+    own copy of the head-dim, GPU, or GQA rules, so a kernel added later is
+    checked instead of staying skipped. Accuracy failures happen after this
+    returns and are not skipped. Any other error is re-raised.
+    """
+    try:
+        return run()
+    except RuntimeError as exc:
+        message = str(exc)
+        if "invalid argument for fmha_fwd" not in message:
+            raise
+        import pytest
+
+        pytest.skip(message)
