@@ -13,6 +13,7 @@ from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.enum import QuantType
 from aiter.utility.dtypes import fp8
 
+from ._all_reduce_config import get_ar_1stage_max_bytes
 from .base_device_communicator import All2AllManagerBase, DeviceCommunicatorBase
 
 # gfx1250, 4 ranks: the Gluon all-reduce + RMSNorm takes up to 2048 tokens of hidden
@@ -30,7 +31,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
     _ar_1stage_override = {"1": True, "0": False}.get(
         os.environ.get("AITER_AR_1STAGE", "")
     )
-    _ar_1stage_max_kb = int(os.environ.get("AITER_AR_1STAGE_MAX_KB", "-1"))
+    _ar_1stage_max_bytes = get_ar_1stage_max_bytes(os.environ)
     _ar_quant_max_bytes = int(os.environ.get("AITER_AR_QUANT_MAX_BYTES", "-1"))
     _ar_quant_no_prefill_max_bytes = int(
         os.environ.get("AITER_AR_QUANT_NO_PREFILL_MAX_BYTES", "-1")
@@ -252,8 +253,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
 
             return gluon_all_reduce(input_, self.cpu_group, *self.gluon_ar_plain)
 
-        # always try quick reduce first, then custom allreduce,
-        # and then pynccl. (quick reduce just for ROCM MI3*)
+        # Quick reduce, then custom allreduce, then pynccl. (quick reduce just
+        # for ROCM MI3*)
         qr_comm = self.qr_comm
         if (
             qr_comm is not None
@@ -372,8 +373,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
             and ca_comm.should_fuse_ar_rms(input_, n, out_n)
         )
         total_bytes_limit = (
-            self._ar_1stage_max_kb
-            if self._ar_1stage_max_kb >= 0
+            self._ar_1stage_max_bytes
+            if self._ar_1stage_max_bytes >= 0
             else 128 * 7168 * 2 // self.world_size
         )
         use_1stage = (
@@ -499,9 +500,12 @@ class CudaCommunicator(DeviceCommunicatorBase):
         emit_bf16: bool = False,
         transpose_scale: bool = False,
         gemma_norm: bool = False,
+        hadamard_rotate: bool = False,
     ):
         # quant_type arrives already canonicalized to a string ("per_token"/
         # "per_group"/"mxfp4") from the public API.
+        if hadamard_rotate and quant_type != "mxfp4":
+            raise ValueError("hadamard_rotate is MXFP4-only")
         if quant_type == "per_group":
             return self.fused_allreduce_rmsnorm_quant_per_group(
                 input_,
@@ -523,6 +527,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 prefill_support=prefill_support,
                 emit_bf16=emit_bf16,
                 gemma_norm=gemma_norm,
+                hadamard_rotate=hadamard_rotate,
             )
         # emit_bf16 additionally returns the pre-quantization bf16/fp16 normed
         # output alongside the per-token FP8 result. Used by v32 DSA models
@@ -566,7 +571,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
             and ca_comm.should_custom_ar(input_, prefill_support)
         ):
             total_bytes_limit = (
-                self._ar_1stage_max_kb if self._ar_1stage_max_kb >= 0 else 128 * 1024
+                self._ar_1stage_max_bytes
+                if self._ar_1stage_max_bytes >= 0
+                else 128 * 1024
             )
             use_1stage = (
                 self._ar_1stage_override
@@ -645,7 +652,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
             and (prefill_support or total_bytes <= 64 * 1024 * 1024)
         ):
             total_bytes_limit = (
-                self._ar_1stage_max_kb if self._ar_1stage_max_kb >= 0 else 128 * 1024
+                self._ar_1stage_max_bytes
+                if self._ar_1stage_max_bytes >= 0
+                else 128 * 1024
             )
             use_1stage = (
                 self._ar_1stage_override
@@ -754,6 +763,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         prefill_support: bool = False,
         emit_bf16: bool = False,
         gemma_norm: bool = False,
+        hadamard_rotate: bool = False,
     ):
         """Fused AR+RMSNorm with an MXFP4 quantization epilogue when supported.
 
@@ -829,6 +839,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 use_1stage=can_1stage,
                 emit_bf16=emit_bf16,
                 gemma_norm=gemma_norm,
+                hadamard_rotate=hadamard_rotate,
             )
             assert result is not None
             if emit_bf16:
@@ -839,9 +850,16 @@ class CudaCommunicator(DeviceCommunicatorBase):
             normed, res_out = self.fused_allreduce_rmsnorm(
                 input_, res_inp_, weight_, eps, prefill_support, gemma_norm=gemma_norm
             )
-            from aiter.ops.triton.quant import dynamic_mxfp4_quant
+            if hadamard_rotate:
+                from aiter.ops.quant import per_1x32_f4_quant_hip
 
-            out_fp4, scale_out = dynamic_mxfp4_quant(normed)
+                out_fp4, scale_out = per_1x32_f4_quant_hip(
+                    normed, hadamard_rotate=True
+                )
+            else:
+                from aiter.ops.triton.quant import dynamic_mxfp4_quant
+
+                out_fp4, scale_out = dynamic_mxfp4_quant(normed)
             if emit_bf16:
                 bf16_out = normed
         assert out_fp4 is not None
