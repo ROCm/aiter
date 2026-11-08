@@ -308,5 +308,30 @@ def test_deep_small_pipeline():
     check(out, a, b, None, 1)
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("n_waves", [2, 4])
+def test_tdm_store_masked_tail_replay(dtype, n_waves):
+    require_gpu()
+    from aiter.ops.flydsl import flydsl_gemm_a16w16_tdm as gemm
+
+    a, _ = matrix(137, 512, dtype)
+    b, _ = matrix(512, 139, dtype, True)
+    y, guard = matrix(137, 139, dtype)
+    config = {"block_m": 256, "block_n": 256, "n_waves": n_waves}
+    gemm(a, b, out=y, **config)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        gemm(a, b, out=y, **config)
+    for _ in range(5):
+        a.neg_()
+        y.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        check(y, a, b, None, 1)
+        assert torch.all(guard[0] == 17) and torch.all(guard[-1] == 17)
+        assert torch.all(guard[:, :8] == 17) and torch.all(guard[:, 147:] == 17)
+    graph.reset()
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main(["-q", __file__]))

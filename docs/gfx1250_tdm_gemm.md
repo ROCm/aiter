@@ -90,7 +90,7 @@ bias, changed graph inputs, concurrent streams, argument guards, cancellation
 and overflow. ISA inspection confirms buffer_atomic_pk_add_bf16/f16 and the
 cluster synchronization. Finite coverage is not proof for every configuration.
 
-## Final-code performance
+## Initial revision performance (vector-store epilogue)
 
 Explicit release/acquire fences included. Exclusive GPU, four calls per graph,
 31 randomized rounds. Same 256x256x128 tile, 2x2 waves and two buffers:
@@ -122,3 +122,34 @@ BF16 8192 cubed: simple 760.66 us, A/A 766.83 us, interleaved 535.26 us
 (**2054 TFLOPS**); FP16: simple 786.22 us, A/A 795.58 us, interleaved 548.09 us
 (**2006 TFLOPS**). These are local measurements, not peak hardware claims.
 Raw samples and the split sweep are in `gfx1250_tdm_gemm_results.json`.
+
+
+## TDM output-store regression correction
+
+The initial unified rewrite replaced the old no-bias, non-split TDM output
+store with a vector-store epilogue. An old/new same-device comparison exposed
+a regression that was not visible in the simple/interleaved-only benchmark.
+For split_k=1 and no bias, C-shuffle now uses a TDM store through the common
+operand helper again. Bias and packed atomic split-K paths are unchanged.
+
+BF16 8192 cubed, 256x256x128, stages2, same C5 GPU and FlyDSL0.5.0:
+- an ablation at 2x2 waves/group_m0 measured 556.38 us (vector stores) versus
+  441.48 us (TDM stores), with bit-identical outputs;
+- separately restoring quadrant fences or scheduler hint counts did not
+  reproduce that gain;
+- final old/new graph comparison: old 448.66 us, fixed unified 450.65 us at
+  2x2/group_m0; old 490.93 us, fixed 479.70 us at 2x4/group_m0.
+  This reverses the earlier apparent recommendation of 2x4 over 2x2.
+
+The historical 2.79 PFLOPS was real: old all-wave HTI on f01/FlyDSL0.4.1,
+2x2 waves, group_m0, three rotating-input runs, median 394.30 us.
+With the same 10-buffer/500-warmup/100-profiler-event procedure on current C5,
+three old-source run means were 431.51/441.25/440.41 us; fixed unified means
+444.54/446.39/450.63 us (about 2.46 PFLOPS at the median).
+Both use split_k=1, so packed atomic reduction is NOT the cause.
+Different hardware/runtime/compiler conditions remain a confound; the residual
+historical gap has not been attributed to clocks or compiler without evidence.
+Do not present the historical 2.79 PFLOPS as a current C5 measurement.
+
+The correction passed the 102 existing tests plus four BF16/FP16, 2x2/2x4
+TDM-store graph-replay cases with odd N and output padding guards.

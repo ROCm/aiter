@@ -10,15 +10,17 @@ from flydsl.expr import rocdl
 from flydsl.expr.typing import T
 
 
-def make_tdm_operand(pointer, shape, strides, tile_shape, tile_strides, *, num_warps):
-    """Build a tiled load atom and its tile-indexed global coordinates.
+def make_tdm_operand(
+    pointer, shape, strides, tile_shape, tile_strides, *, num_warps, store=False
+):
+    """Build a tiled load/store atom and its tile-indexed global coordinates.
 
     Both schedules use the full input tensor shape for edge zero-fill.
     ``num_warps`` splits each tile into disjoint wave-sized copies.
     """
     view = fx.make_view(pointer, fx.make_layout(shape, strides))
     atom, coords = rocdl.cdna5.make_tiled_tdm_atom(
-        rocdl.TensorLoad(),
+        rocdl.TensorStore() if store else rocdl.TensorLoad(),
         view,
         fx.make_layout(tile_shape, tile_strides),
         tile_shape,

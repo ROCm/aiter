@@ -416,6 +416,34 @@ def compile_gemm(
                                     elem
                                 )
                             )
+        elif const_expr(not has_bias):
+            # C-shuffle is already row-contiguous in LDS. Preserve TDM output
+            # stores: the vector-store replacement regressed the 256x256 tile
+            # in same-device A/B tests. Mask M/N edges in the global descriptor.
+            tile_shape = (bm, cp)
+            catom, coords = make_tdm_operand(
+                c + fx.Int64(row0) * fx.Int64(ldc) + col0,
+                (fx.max(0, fx.min(bm, m - row0)), fx.max(0, fx.min(bn, n - col0))),
+                (ldc, 1),
+                tile_shape,
+                (cp, 1),
+                num_warps=waves,
+                store=True,
+            )
+            coords = coords[None, (0, None)]
+            cshared = fx.make_view(
+                sc,
+                fx.make_layout((tile_shape, 1), ((cp, 1), bm * cp)),
+            )
+            src, dst = rocdl.cdna5.tdm_partition(
+                catom,
+                wave,
+                fx.make_layout(waves, 1),
+                cshared,
+                coords,
+            )
+            fx.copy(catom, src[None, 0], dst[None, 0])
+            tdm_ops.tensor_wait(0)
         else:
             for i in range_constexpr(bm * bn // (threads * 8)):
                 off = (i * threads + tid) * 8
