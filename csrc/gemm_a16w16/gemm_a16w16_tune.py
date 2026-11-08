@@ -23,7 +23,7 @@ import torch.nn.functional as F
 import aiter
 from aiter import dtypes, logger
 from aiter.jit.core import AITER_CONFIG_GEMM_BF16, get_asm_dir
-from aiter.jit.utils.chip_info import get_cu_num, get_gfx
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx, get_gfx_runtime
 from aiter.ops.flydsl.gemm_a16w16_policy import (
     get_flydsl_a16w16_configs,
 )
@@ -333,21 +333,22 @@ def get_flydsl_bf16_catalog(
     k: int,
     out_dtype: torch.dtype,
     has_bias: bool,
+    in_dtype: torch.dtype = torch.bfloat16,
 ):
     if flydsl_hgemm_kernel_name is None:
         return []
-    fused_bias = bool(has_bias and out_dtype == torch.bfloat16)
+    fused_bias = bool(has_bias and out_dtype == in_dtype)
     configs = get_flydsl_a16w16_configs(
         m,
         n,
         k,
-        torch.bfloat16,
+        in_dtype,
         out_dtype,
         fused_bias,
     )
     kernels = {
         flydsl_hgemm_kernel_name(
-            dtype=torch.bfloat16,
+            dtype=in_dtype,
             out_dtype=out_dtype,
             config=config,
             has_bias=fused_bias,
@@ -568,9 +569,9 @@ class GemmA16W16Tuner(GemmCommonTuner):
         return results
 
     def get_untuned_gemm_list(self, untuned_gemm_file):
-        assert os.path.exists(
-            untuned_gemm_file
-        ), f"Not exist untuned file: {untuned_gemm_file}"
+        assert os.path.exists(untuned_gemm_file), (
+            f"Not exist untuned file: {untuned_gemm_file}"
+        )
         untunedf = pd.read_csv(untuned_gemm_file).fillna("")
         return untunedf.drop_duplicates().reset_index(drop=True)
 
@@ -743,11 +744,14 @@ class GemmA16W16Tuner(GemmCommonTuner):
     def _get_flydsl_tasks(
         self, info_keys, has_bias, indtype, outdtype, scaleAB, is_shuffle, run_kwargs
     ):
-        if scaleAB or is_shuffle or indtype != dtypes.bf16:
+        supported_dtype = indtype == dtypes.bf16 or (
+            get_gfx_runtime() == "gfx1250" and indtype == dtypes.fp16
+        )
+        if scaleAB or is_shuffle or not supported_dtype:
             return []
         M, N, K = (int(info_keys[2]), int(info_keys[3]), int(info_keys[4]))
         rtol, atol = _default_tol(outdtype)
-        flydsl_catalog = get_flydsl_bf16_catalog(M, N, K, outdtype, has_bias)
+        flydsl_catalog = get_flydsl_bf16_catalog(M, N, K, outdtype, has_bias, indtype)
         tasks = []
         for solidx, kernel_name, config in flydsl_catalog:
             info = (

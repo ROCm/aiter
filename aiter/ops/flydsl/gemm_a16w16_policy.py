@@ -8,7 +8,7 @@ from dataclasses import dataclass
 
 import torch
 
-from aiter.jit.utils.chip_info import get_gfx, get_lds_capacity_bytes
+from aiter.jit.utils.chip_info import get_gfx_runtime, get_lds_capacity_bytes
 
 from .gemm_a16w16_band import band_stream_config
 from .kernels.gemm_a16w16_gfx950 import (
@@ -35,6 +35,8 @@ class GemmConfigPruner:
     target_waves_per_cu: int = 8
     max_split_grid_rounds: int = 2
     max_tile_grid_ratio: int = 4
+    tdm: bool = False
+    b_k_contiguous: bool = True
 
     @staticmethod
     def _ceil_div(value, divisor):
@@ -68,9 +70,27 @@ class GemmConfigPruner:
             * config["block_n"]
             * self.element_bytes,
         )
+        if self.tdm:
+            pad = 8
+            a_stage = config["block_m"] * (config["block_k"] + pad)
+            b_stage = (
+                config["block_n"] * (config["block_k"] + pad)
+                if self.b_k_contiguous
+                else config["block_k"] * (config["block_n"] + pad)
+            )
+            c_pad = 8 if config.get("interleave", False) else 0
+            lds = (
+                max(
+                    config["stages"] * (a_stage + b_stage),
+                    config["block_m"] * (config["block_n"] + c_pad),
+                )
+                * self.element_bytes
+            )
         # A workgroup may occupy the whole per-CU LDS here, so the capacity the
         # chip table reports per workgroup is also the per-CU figure.
-        lds_per_cu = get_lds_capacity_bytes()
+        lds_per_cu = (
+            get_lds_capacity_bytes("gfx1250") if self.tdm else get_lds_capacity_bytes()
+        )
         resident = (
             min(
                 props.max_threads_per_multi_processor // props.warp_size // waves,
@@ -198,6 +218,119 @@ def _gfx1250_configs(m: int, n: int, k: int):
     return GemmConfigPruner(m, n, k, device_props, 2).prune(configs)
 
 
+def _gfx1250_tdm_configs(m, n, k, dtype, layout="nt"):
+    from .kernels.gemm_a16w16_tdm_gfx1250 import (
+        GEMM_DTYPE_BF16,
+        GEMM_DTYPE_FP16,
+        validate_gemm_gfx1250_config,
+    )
+
+    split_k_candidates = [1]
+    split_k_candidates.extend(split_k for split_k in range(2, 10) if k % split_k == 0)
+    selections = {
+        "block_m": [16, 32, 48, 64, 80, 96, 128, 256],
+        "block_n": [16, 32, 64, 80, 96, 128, 256],
+        "block_k": [64, 128, 256, 512],
+        "stages": [i for i in range(2, 10)],
+        "split_k": split_k_candidates,
+        # BF16 split-K searches both workspace and packed-atomic reduction.
+        "split_k_atomic": (
+            [False, True] if dtype is torch.bfloat16 and n % 2 == 0 else [False]
+        ),
+        "m_waves": [1, 2, 4],
+        "n_waves": [1, 2, 4],
+        "group_m": [0, 4],
+        "mma_m": [16],
+        "mma_n": [16],
+        "mma_k": [32],
+        # NN keeps the original schedule; the validator checks NT quadrant fit.
+        "interleave": [False, True] if layout == "nt" else [False],
+    }
+    if layout == "nt" and min(m, n, k) >= 4096:
+        # Pin large NT GEMMs while retaining the group_m search.
+        selections.update(
+            {
+                "block_m": [256],
+                "block_n": [256],
+                "block_k": [128],
+                "stages": [2],
+                "m_waves": [2],
+                "n_waves": [2],
+                "interleave": [True],
+                "split_k": [1],
+                "split_k_atomic": [False],
+            }
+        )
+    keys = selections.keys()
+    values = selections.values()
+    configs = [dict(zip(keys, combo)) for combo in itertools.product(*values)]
+    configs = [
+        config
+        for config in configs
+        if (
+            not config["interleave"]
+            or (config["m_waves"], config["n_waves"]) not in ((2, 4), (4, 2), (4, 4))
+        )
+        and (not config["split_k_atomic"] or config["split_k"] > 1)
+    ]
+    for config in configs:
+        config["k_waves"] = 1
+    device_props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    b_k_contiguous = layout == "nt"
+    pruner = GemmConfigPruner(
+        m,
+        n,
+        k,
+        device_props,
+        2,
+        tdm=True,
+        b_k_contiguous=b_k_contiguous,
+    )
+    configs = pruner.prune(configs)
+    dtype_id = GEMM_DTYPE_FP16 if dtype is torch.float16 else GEMM_DTYPE_BF16
+    valid_configs = []
+    for config in configs:
+        try:
+            validate_gemm_gfx1250_config(
+                m,
+                n,
+                k,
+                config["block_m"],
+                config["block_n"],
+                config["block_k"],
+                config["stages"],
+                config["m_waves"],
+                config["n_waves"],
+                config["group_m"],
+                dtype_id,
+                config["mma_m"],
+                config["mma_n"],
+                config["mma_k"],
+                b_k_contiguous,
+                config["split_k"],
+                interleave=config["interleave"],
+                split_k_atomic=config["split_k_atomic"],
+            )
+            valid_configs.append(config)
+        except Exception:
+            pass
+    for config in valid_configs:
+        config.pop("mma_m")
+        config.pop("mma_n")
+        config.pop("mma_k")
+        config["policy"] = (
+            "tdmia"
+            if config["interleave"] and config["split_k_atomic"]
+            else "tdmi"
+            if config["interleave"]
+            else "tdma"
+            if config["split_k_atomic"]
+            else "tdm"
+        )
+        config["use_half_tile_interleaved"] = False
+    return valid_configs
+
+
 def get_flydsl_a16w16_configs(
     m: int,
     n: int,
@@ -212,11 +345,13 @@ def get_flydsl_a16w16_configs(
         return []
     if out_dtype not in (dtype, torch.float32):
         return []
-    if get_gfx() in ("gfx1250", "gfx1250-strict"):
+    if get_gfx_runtime() == "gfx1250" and out_dtype == dtype:
+        return _gfx1250_tdm_configs(m, n, k, dtype)
+    if get_gfx_runtime() in ("gfx1250", "gfx1250-strict"):
         return _gfx1250_configs(m, n, k)
     if make_gemm_a16w16_param_and_validate is None:
         return []
-    if get_gfx() != "gfx950":
+    if get_gfx_runtime() != "gfx950":
         return []
 
     split_k_candidates = [1]

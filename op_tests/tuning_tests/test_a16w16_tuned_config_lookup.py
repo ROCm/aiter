@@ -82,7 +82,7 @@ class TestGfx1250FlydslCandidates(unittest.TestCase):
             max_threads_per_multi_processor=2048,
         )
         with (
-            mock.patch.object(policy, "get_gfx", lambda: "gfx1250"),
+            mock.patch.object(policy, "get_gfx_runtime", lambda: "gfx1250"),
             mock.patch.object(torch.cuda, "current_device", lambda: 0),
             mock.patch.object(torch.cuda, "get_device_properties", lambda _: props),
         ):
@@ -93,17 +93,20 @@ class TestGfx1250FlydslCandidates(unittest.TestCase):
                 self.assertTrue(configs, (m, n, k))
                 for config in configs:
                     self.assertEqual(config["k_waves"], 1)
-                    lds = policy.gfx1250_lds_bytes(
-                        config["block_m"],
-                        config["block_n"],
-                        config["block_k"],
-                        config["stages"],
-                        config["split_k"],
+                    lds = (
+                        max(
+                            config["stages"]
+                            * (config["block_m"] + config["block_n"])
+                            * (config["block_k"] + 8),
+                            config["block_m"]
+                            * (config["block_n"] + (8 if config["interleave"] else 0)),
+                        )
+                        * 2
                     )
                     self.assertLessEqual(lds, 320 * 1024)
                     k_tiles = -(-(k // config["split_k"]) // config["block_k"])
                     self.assertGreaterEqual(k_tiles, config["stages"] - 1)
-                    for target_gfx in ("gfx1250", "gfx1250-strict"):
+                    for target_gfx in ("gfx1250",):
                         name = flydsl_hgemm_kernel_name(
                             dtype=torch.bfloat16,
                             out_dtype=torch.bfloat16,
@@ -116,6 +119,121 @@ class TestGfx1250FlydslCandidates(unittest.TestCase):
                             {key: params[key] for key in config}, config, name
                         )
                         self.assertEqual(params["target_gfx"], target_gfx)
+
+
+class TestTdmPolicyContract(unittest.TestCase):
+    def test_names_include_schedule_and_reduction_and_reject_invalid(self):
+        from aiter.ops.flydsl.gemm_kernels import (
+            flydsl_hgemm_kernel_name,
+            get_flydsl_hgemm_kernel_params,
+        )
+
+        config = dict(
+            block_m=128,
+            block_n=128,
+            block_k=128,
+            stages=2,
+            split_k=3,
+            m_waves=2,
+            n_waves=2,
+            k_waves=1,
+            group_m=0,
+        )
+        names = []
+        for dtype in (torch.bfloat16, torch.float16):
+            for policy in ("tdm", "tdmi", "tdma", "tdmia"):
+                kwargs = dict(
+                    dtype=dtype,
+                    out_dtype=dtype,
+                    config=dict(config, policy=policy),
+                    has_bias=True,
+                    target_gfx="gfx1250",
+                )
+                if dtype == torch.float16 and policy in ("tdma", "tdmia"):
+                    with self.assertRaises(ValueError):
+                        flydsl_hgemm_kernel_name(**kwargs)
+                    continue
+                name = flydsl_hgemm_kernel_name(**kwargs)
+                names.append(name)
+                parsed = get_flydsl_hgemm_kernel_params(name)
+                self.assertEqual(parsed["policy"], policy)
+                self.assertEqual(parsed["split_k_atomic"], policy in ("tdma", "tdmia"))
+                self.assertEqual(parsed["interleave"], policy in ("tdmi", "tdmia"))
+                for invalid in (
+                    name.replace("gfx1250", "gfx950"),
+                    name.replace("_w2x2x1_", "_w2x2x2_"),
+                    name.replace("x128x2_ks", "x128x1_ks"),
+                ):
+                    self.assertIsNone(get_flydsl_hgemm_kernel_params(invalid))
+                if parsed["split_k_atomic"]:
+                    self.assertIsNone(
+                        get_flydsl_hgemm_kernel_params(name.replace("_ks3_", "_ks1_"))
+                    )
+        self.assertEqual(len(set(names)), len(names))
+
+    def test_examples_large_policy_and_both_reductions(self):
+        from types import SimpleNamespace
+        from aiter.ops.flydsl import gemm_a16w16_policy as policy
+
+        props = SimpleNamespace(
+            multi_processor_count=256,
+            warp_size=32,
+            max_threads_per_multi_processor=2048,
+        )
+        with (
+            mock.patch.object(torch.cuda, "current_device", return_value=0),
+            mock.patch.object(torch.cuda, "get_device_properties", return_value=props),
+        ):
+            for dtype in (torch.bfloat16, torch.float16):
+                large = policy._gfx1250_tdm_configs(4096, 4096, 4096, dtype)
+                self.assertEqual(len(large), 2)
+                for c in large:
+                    self.assertEqual(
+                        (
+                            c["block_m"],
+                            c["block_n"],
+                            c["block_k"],
+                            c["stages"],
+                            c["m_waves"],
+                            c["n_waves"],
+                            c["split_k"],
+                            c["interleave"],
+                            c["split_k_atomic"],
+                        ),
+                        (256, 256, 128, 2, 2, 2, 1, True, False),
+                    )
+                self.assertEqual({c["group_m"] for c in large}, {0, 4})
+                small = policy._gfx1250_tdm_configs(32, 32, 256, dtype)
+                self.assertTrue(small)
+                paired = {}
+                for c in small:
+                    key = tuple(
+                        sorted(
+                            (k, v)
+                            for k, v in c.items()
+                            if k not in ("split_k_atomic", "policy")
+                        )
+                    )
+                    paired.setdefault(key, set()).add(c["split_k_atomic"])
+                for key, flags in paired.items():
+                    self.assertEqual(
+                        flags,
+                        {False, True}
+                        if dtype == torch.bfloat16 and dict(key)["split_k"] > 1
+                        else {False},
+                    )
+            configs = policy._gfx1250_tdm_configs(128, 128, 768, torch.bfloat16)
+            self.assertTrue(any(c["interleave"] for c in configs))
+            self.assertTrue(
+                all(
+                    not c["interleave"]
+                    or (c["m_waves"], c["n_waves"]) not in ((2, 4), (4, 2), (4, 4))
+                    for c in configs
+                )
+            )
+            odd = policy._gfx1250_tdm_configs(128, 139, 768, torch.bfloat16)
+            self.assertTrue(odd)
+            self.assertTrue(all(not c["split_k_atomic"] for c in odd))
 
 
 class TestGfx950FlydslMemoryCandidates(unittest.TestCase):
@@ -175,7 +293,7 @@ class TestGfx950FlydslMemoryCandidates(unittest.TestCase):
             "use_half_tile_interleaved": False,
         }
         with (
-            mock.patch.object(policy, "get_gfx", return_value="gfx950"),
+            mock.patch.object(policy, "get_gfx_runtime", return_value="gfx950"),
             mock.patch.object(
                 policy.itertools,
                 "product",
@@ -327,7 +445,7 @@ class TestLegacyFlydslHgemmConfigs(unittest.TestCase):
         b = torch.empty((18432, 3072), dtype=a.dtype)[:, ::2]
         stream = SimpleNamespace(device=a.device)
         with (
-            mock.patch.object(kernels, "get_gfx", return_value="gfx950"),
+            mock.patch.object(kernels, "get_gfx_runtime", return_value="gfx950"),
             mock.patch.object(
                 torch.cuda, "stream", return_value=nullcontext()
             ) as context,
@@ -376,7 +494,7 @@ class TestLegacyFlydslHgemmConfigs(unittest.TestCase):
             for gfx in ("gfx1250", "gfx1250-strict"):
                 with (
                     self.subTest(gfx=gfx, kernel=name),
-                    mock.patch.object(kernels, "get_gfx", return_value=gfx),
+                    mock.patch.object(kernels, "get_gfx_runtime", return_value=gfx),
                     mock.patch.object(torch.cuda, "stream", return_value=nullcontext()),
                     mock.patch.object(
                         kernels, "gemm_a16w16_gfx1250", return_value=out
