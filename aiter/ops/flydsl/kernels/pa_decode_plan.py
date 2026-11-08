@@ -19,6 +19,8 @@ DEFAULT_MAX_BATCH_SIZE = 4096
 ARRIVAL_COUNTER_STRIDE = 32
 # Largest gfx1250 workgroup cluster.
 CLUSTER_PARTITIONS = 16
+# Tokens per step of a step-split cluster CTA.
+CLUSTER_STEP_TOKENS = 128
 # Two warp scans and one reduction use at most 512 bytes at 1024 wave32 threads.
 _PLAN_SCAN_LDS_BYTES = 512
 

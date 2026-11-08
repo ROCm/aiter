@@ -88,7 +88,7 @@ from .pa_decode.traits import (
     PaDecodeSchedule,
     PaDecodeTraits,
 )
-from .pa_decode_plan import CLUSTER_PARTITIONS
+from .pa_decode_plan import CLUSTER_PARTITIONS, CLUSTER_STEP_TOKENS
 from .tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
@@ -96,6 +96,7 @@ from .tensor_shim import (
 
 __all__ = [
     "CLUSTER_PARTITIONS",
+    "CLUSTER_STEP_TOKENS",
     "FP8_PACK_K",
     "KV_COMPUTE_BLOCK",
     "LOG2E",
@@ -581,9 +582,9 @@ def compile_gfx1250_pa_decode(
     ``cluster_merge`` P instead launches P CTAs per sequence as one workgroup
     cluster: a sequence with n tasks splits its tiles over its first min(n, P)
     CTAs, as the planner splits them, and the cluster merges after a cluster
-    barrier. ``work`` then holds the context lengths. ``cluster_steps`` splits
-    each sequence evenly into at most P runs of whole steps instead, ignoring
-    the plan's task counts, with partials at slot sequence * P + part. In both
+    barrier. ``work`` then holds the context lengths. ``cluster_steps`` instead
+    gives CTA p step p, ignoring the plan's task counts, with partials at slot
+    sequence * P + p; block tables then hold at most P steps. In both
     modes a sequence's single task stores final rows directly, and empty
     sequences clear their rows.
     ``merge_partitions`` partial storage must be eight-byte aligned for its
@@ -640,10 +641,11 @@ def compile_gfx1250_pa_decode(
         and block_size == 16
         and query_length == 1
         and sliding_window == 0
+        and t.TOKENS == CLUSTER_STEP_TOKENS
     ):
         raise ValueError(
             "cluster_steps requires an unshared cluster over page16 decode rows "
-            "without a sliding window"
+            f"without a sliding window and {CLUSTER_STEP_TOKENS}-token steps"
         )
     if t.total_bytes > 327680:
         raise NotImplementedError(
@@ -738,18 +740,28 @@ def compile_gfx1250_pa_decode(
             task_context = fx.Int32(fx.recast_iter(fx.Int32, work)[seq])
             step_bounds = None
             if const_expr(t.cluster_steps):
-                # Each CTA takes an even share of the sequence's steps, so the
-                # plan's task count and slots are not read.
+                # CTA p takes step p: block tables hold at most one step per
+                # CTA. The step's page ids depend on no load, so they load
+                # with the context length rather than after it: the wave's
+                # pages, then token 0's for masked tail slices. The plan's
+                # tasks are not read.
+                wave_pages = t.TOKENS // t.block_size // t.NWARP
+                tbl = fx.recast_iter(fx.Int32, table)
+                row = seq * max_blocks
+                page = (
+                    part * (t.TOKENS // t.block_size)
+                    + fx.Int32(fx.rocdl.wave_id()) * wave_pages
+                )
+                stage_pages = [
+                    fx.Int32(tbl[row + fx.min(page + j, max_blocks - 1)])
+                    for j in range_constexpr(wave_pages)
+                ] + [fx.Int32(tbl[row])]
                 length = fx.max(task_context, fx.Int32(0))
                 steps = (length + t.TOKENS - 1) // t.TOKENS
                 count = fx.min(steps, fx.Int32(t.cluster_merge))
                 first = seq * t.cluster_merge
                 task_slot = first + part
-                parts = fx.max(count, fx.Int32(1))
-                step_bounds = (
-                    part * steps // parts * t.TOKENS,
-                    (part + 1) * steps // parts * t.TOKENS,
-                )
+                step_bounds = (part * t.TOKENS, (part + 1) * t.TOKENS)
                 task_seq = seq
                 task_begin = step_bounds[0] // KV_COMPUTE_BLOCK
                 task_end = (step_bounds[1] + KV_COMPUTE_BLOCK - 1) // KV_COMPUTE_BLOCK
@@ -851,6 +863,8 @@ def compile_gfx1250_pa_decode(
                 ctx.task_count = count
                 ctx.output_ptr = output
                 ctx.step_bounds = step_bounds
+                if const_expr(t.cluster_steps):
+                    ctx.stage_pages = stage_pages
             if const_expr(t.bf16_wave_query_tiles):
                 Gfx1250Bf16WavePipeline(ctx).run()
             elif const_expr(t.bf16_page128_packed):

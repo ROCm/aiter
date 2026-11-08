@@ -20,6 +20,7 @@ from aiter.utility import dtypes
 
 from .kernels.pa_decode_kernel import (
     CLUSTER_PARTITIONS,
+    CLUSTER_STEP_TOKENS,
     KV_COMPUTE_BLOCK,
     MERGE_HEAD_DIM,
     MERGE_PARTITIONS,
@@ -1004,10 +1005,11 @@ def pa_decode(
         )
         else 0
     )
-    # Batches within one cluster per CU split each page16 decode row into
-    # CLUSTER_PARTITIONS step-sized parts, whatever the partition bound, for
-    # shorter per-CTA chains (sparse decode at 4 rows: 5.3 -> 5.0 us). Plans
-    # for these batches reserve the parts' partial slots.
+    # Batches within one cluster per CU split each page16 decode row into its
+    # CLUSTER_STEP_TOKENS-token steps, one per CTA, whatever the partition bound, for shorter
+    # per-CTA chains (sparse decode at 4 rows: 5.3 -> 4.6 us). Block tables
+    # must hold at most one step per CTA. Plans for these batches reserve the
+    # steps' partial slots.
     cluster_steps = bool(
         cluster_merge
         and cluster_seqs == 1
@@ -1017,6 +1019,7 @@ def pa_decode(
         and sliding_window == 0
         and num_seqs * num_kv_heads * CLUSTER_PARTITIONS <= num_compute_units
         and num_seqs * CLUSTER_PARTITIONS <= work_plan.capacity
+        and max_blocks_per_seq * block_size <= CLUSTER_PARTITIONS * CLUSTER_STEP_TOKENS
     )
     if cluster_steps:
         cluster_merge = CLUSTER_PARTITIONS

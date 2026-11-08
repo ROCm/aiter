@@ -825,6 +825,19 @@ _COMMON_CASES = [
             "cluster_steps": True,
         },
     ),
+    # Block tables of more than 16 steps keep plan-derived clusters.
+    (
+        "cluster4-wide-table",
+        {
+            "group_size": 16,
+            "block_size": 16,
+            "lengths": (1000, 0, 777, 1),
+            "table_width": 129,
+            "max_partitions": 8,
+            "cluster": 4,
+            "cluster_steps": False,
+        },
+    ),
     (
         "mtp4-g16-page128",
         {

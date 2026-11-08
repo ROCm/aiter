@@ -1177,14 +1177,7 @@ class Gfx1250Memory:
         for j in range_constexpr(per_wave):
             slot = ctx.warp * per_wave + j
             absolute = token_base + slot * 16
-            safe = (
-                absolute
-                if full_tile
-                else (absolute < ctx.planned_context).select(absolute, fx.Int32(0))
-            )
-            page = fx.Int32(
-                table[ctx.planned_seq * ctx.max_blocks_per_seq + safe // 16]
-            )
+            page = self._stage_page(table, absolute, j, full_tile)
             off = (fx.Int64(page) * ctx.n_kv + ctx.kv_h) * t.head_dim * 16
             valid = fx.max(
                 fx.Int32(0), fx.min(fx.Int32(16), ctx.planned_context - absolute)
@@ -1303,15 +1296,29 @@ class Gfx1250Memory:
         pages = []
         for j in range_constexpr(n):
             absolute = token_base + (ctx.warp * n + j) * 16
-            safe = (
-                absolute
-                if full_tile
-                else (absolute < ctx.planned_context).select(absolute, fx.Int32(0))
-            )
-            pages.append(
-                fx.Int32(table[ctx.planned_seq * ctx.max_blocks_per_seq + safe // 16])
-            )
+            pages.append(self._stage_page(table, absolute, j, full_tile))
         return pages
+
+    def _stage_page(self, table, absolute, j, full_tile):
+        """Page of a wave's j-th page16 slice; tokens past the context use page 0.
+
+        Step-split clusters load their single stage's ids with the context
+        length (``ctx.stage_pages``: the wave's pages, then token 0's).
+        """
+        ctx = self.ctx
+        stage_pages = getattr(ctx, "stage_pages", None)
+        if const_expr(stage_pages is not None):
+            if const_expr(full_tile):
+                return stage_pages[j]
+            return (absolute < ctx.planned_context).select(
+                stage_pages[j], stage_pages[-1]
+            )
+        safe = (
+            absolute
+            if full_tile
+            else (absolute < ctx.planned_context).select(absolute, fx.Int32(0))
+        )
+        return fx.Int32(table[ctx.planned_seq * ctx.max_blocks_per_seq + safe // 16])
 
     @flyc.jit
     def stage_page16_pair(self, token_base, kv_off, full_tile):
