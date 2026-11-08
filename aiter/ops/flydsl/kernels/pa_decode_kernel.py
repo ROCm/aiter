@@ -286,6 +286,7 @@ def compile_pa_decode_tile(
             wide_pages=grid_ctas <= num_compute_units
             or (
                 grid_ctas <= 2 * num_compute_units
+                and max_context_length is not None
                 and num_seqs * -(-max_context_length // KV_COMPUTE_BLOCK)
                 >= 3 * grid_sequences
             ),

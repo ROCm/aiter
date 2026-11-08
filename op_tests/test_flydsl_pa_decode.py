@@ -2180,6 +2180,10 @@ def test_pa_decode_unowned_kv_rows(
         # V mass: P must keep the first half's own maximum through FP8
         # quantization, or its ~4e-4 probabilities round to zero.
         pytest.param(((224.0, 0.0), (0.0, 14.0), (100.0, 1.0)), id="p-underflow"),
+        # The second half dominates the softmax but has the far smaller V
+        # scale: the accumulator must follow its weighted factor, or its
+        # 1e-48 ratio to the first half's factor rounds to zero.
+        pytest.param(((1.0, 1.0), (0.0, 128.0), (1e32, 1e-16)), id="weighted-factor"),
     ],
 )
 def test_pa_decode_two_page_steps_keep_page_scales(block_size, case, device):
@@ -2258,3 +2262,29 @@ def test_pa_decode_two_page_steps_keep_page_scales(block_size, case, device):
     torch.testing.assert_close(
         output, reference, rtol=0.02, atol=0.02 * reference.abs().max().item()
     )
+
+
+def test_pa_decode_tile_without_context_bound(device):
+    """Kernel selection takes the documented max_context_length=None default.
+
+    32 sequences over a 384-slot plan put the grid between one and two CTAs
+    per CU, where the gfx1250 step-width heuristic reads the bound.
+    """
+    if get_gfx_runtime() != "gfx1250":
+        pytest.skip("the step-width heuristic runs on gfx1250")
+    pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    compiled = pa.compile_pa_decode_tile(
+        architecture="gfx1250",
+        head_dim=128,
+        query_group_size=16,
+        block_size=128,
+        num_seqs=32,
+        num_kv_heads=1,
+        num_compute_units=256,
+        work_capacity=384,
+        num_partitions=12,
+        query_dtype="bf16",
+        kv_dtype="fp8",
+        per_token_kv=True,
+    )
+    assert "launch" in compiled

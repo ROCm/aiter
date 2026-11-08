@@ -1911,7 +1911,6 @@ class Gfx1250Pipeline:
             # the halves combine in FP32 with bounded weights.
             split = t.page128_pair or t.page16_wide
             half_vnorm = vnorm
-            half_ratios = (fx.Float32(1.0), fx.Float32(1.0))
             if const_expr(split and t.per_token_kv):
                 scale_base = kv_off + t.k_bytes + t.v_bytes + t.TOKENS * 4
                 half_tokens = t.TOKENS // 2
@@ -1939,16 +1938,13 @@ class Gfx1250Pipeline:
                     # Empty planned tails carry no new mass. Keep the prior
                     # scale so their zero V contribution preserves the output.
                     factors.append((factor > 0.0).select(factor, fx.Float32(state[-1])))
-                # The accumulator keeps the larger factor, so both halves'
-                # ratios stay at most one.
-                vfactor = fx.maxnumf(factors[0], factors[1])
-                vnorm = fx.Float32(rcp_f32(fx.maxnumf(vfactor, fx.Float32(1e-20))))
+                # The accumulator factor is chosen once the halves' softmax
+                # weights are known; see below.
                 norms = [
                     fx.Float32(rcp_f32(fx.maxnumf(f, fx.Float32(1e-20))))
                     for f in factors
                 ]
                 half_vnorm = (ctx.warp < 2).select(norms[0], norms[1])
-                half_ratios = (factors[0] * vnorm, factors[1] * vnorm)
             elif const_expr(t.per_token_kv):
                 # Every wave reduces the tile's scales, avoiding a CTA barrier.
                 scale_base = kv_off + t.k_bytes + t.v_bytes + t.TOKENS * 4
@@ -2130,6 +2126,25 @@ class Gfx1250Pipeline:
                         for hm in half_max
                     ]
                     p_max = (ctx.warp < 2).select(safe_half[0], safe_half[1])
+                    if const_expr(t.per_token_kv):
+                        # The accumulator takes the factor of the half with the
+                        # larger weighted factor: its contribution keeps a ratio
+                        # of one, and only a negligible half can underflow.
+                        larger = half_weights[1] * factors[1] > (
+                            half_weights[0] * factors[0]
+                        )
+                        vfactor = larger.select(factors[1], factors[0])
+                        vnorm = fx.Float32(
+                            rcp_f32(fx.maxnumf(vfactor, fx.Float32(1e-20)))
+                        )
+                        # Weight each factor before dividing: the products are
+                        # at most the chosen one, so no ratio overflows.
+                        half_coeffs = [
+                            half_weights[h] * factors[h] * vnorm
+                            for h in range_constexpr(2)
+                        ]
+                    else:
+                        half_coeffs = half_weights
                 probs = fx.Vector(
                     fx.exp2(
                         scores
@@ -2256,7 +2271,7 @@ class Gfx1250Pipeline:
                                     t.bf16,
                                 )
                             out = out + part * fx.Vector.from_elements(
-                                [half_weights[h] * half_ratios[h]], dtype=fx.Float32
+                                [half_coeffs[h]], dtype=fx.Float32
                             ).broadcast_to(8)
                     else:
                         for d in range_constexpr(t.TOKENS // pv_k):
