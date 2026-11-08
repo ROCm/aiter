@@ -846,6 +846,9 @@ class Gfx1250Traits:
     # Grids within one CTA per CU, where copy latency rather than bandwidth
     # bounds a task.
     latency_grid: bool = False
+    # Cluster CTAs split each sequence into step-sized parts of their own and
+    # keep their partials at slot sequence * cluster_merge + part.
+    cluster_steps: bool = False
 
     WAVE = 32
     NWARP = 4

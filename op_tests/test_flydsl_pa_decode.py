@@ -450,9 +450,13 @@ def test_pa_decode_merge_alignment(
         assert torch.count_nonzero(plan.arrival_counters) == 0
     last_arriver = mode == "last" and scratch_offset == 0
     assert compile_kwargs[-1]["direct_output"] == last_arriver
+    # A one-row D128 decode splits its row into 16 step-sized parts; the
+    # one-slot budget of the last-arriver plans leaves no room for them.
+    steps = mode == "cluster" and dim == 128
     assert compile_kwargs[-1]["cluster_merge"] == (
-        0 if last_arriver or mode == "reducer" else 4
+        0 if last_arriver or mode == "reducer" else 16 if steps else 4
     )
+    assert compile_kwargs[-1]["cluster_steps"] == steps
 
 
 @pytest.mark.parametrize("architecture", ["gfx942", "gfx950"])
@@ -800,10 +804,25 @@ _COMMON_CASES = [
         {
             "group_size": 16,
             "block_size": 16,
-            "lengths": (2048,) * 6 + (0, 1, 257, 2047),
+            "lengths": ((2048,) * 6 + (0, 1, 257, 2047)) * 2,
             "max_partitions": 8,
             "capture": True,
             "cluster": 8,
+            "cluster_steps": False,
+        },
+    ),
+    # Batches within one 16-CTA cluster per CU split each row into 16
+    # step-sized parts whatever the cap; short rows leave parts idle.
+    (
+        "cluster16-steps",
+        {
+            "group_size": 16,
+            "block_size": 16,
+            "lengths": (2048,) * 6 + (0, 1, 129, 257, 2047),
+            "max_partitions": 8,
+            "capture": True,
+            "cluster": 16,
+            "cluster_steps": True,
         },
     ),
     (
@@ -938,9 +957,10 @@ _BF16_CASES = _COMMON_CASES + [
         {
             "group_size": 16,
             "block_size": 16,
-            "lengths": (4096,) * 3 + (0, 255),
+            "lengths": ((4096,) * 3 + (0, 255)) * 4,
             "max_partitions": 16,
             "cluster": 16,
+            "cluster_steps": False,
         },
     ),
     ("head192-decode", {"group_size": 16, "head_dim": 192, "max_partitions": 4}),
@@ -1597,6 +1617,8 @@ def _check_pipe_policy(pa, case, arch, compile_kwargs):
         assert compile_kwargs[-1]["cluster_merge"] == expected
     if case["cluster_seqs"] is not None and arch == "gfx1250":
         assert compile_kwargs[-1]["cluster_seqs"] == case["cluster_seqs"]
+    if case["cluster_steps"] is not None and arch == "gfx1250":
+        assert compile_kwargs[-1]["cluster_steps"] == case["cluster_steps"]
     if case["pipe"]:
         # The cache key ends with (D256_PIPE, staged page ids).
         schedule_kwargs = dict(compile_kwargs[-1])
@@ -1604,6 +1626,7 @@ def _check_pipe_policy(pa, case, arch, compile_kwargs):
         schedule_kwargs.pop("direct_output", None)
         schedule_kwargs.pop("cluster_merge", None)
         schedule_kwargs.pop("cluster_seqs", None)
+        schedule_kwargs.pop("cluster_steps", None)
         pipe, staged = PaDecodeSchedule.select(**schedule_kwargs).cache_key[-2:]
         assert pipe == (arch == "gfx950")
         if pipe:
@@ -1716,6 +1739,7 @@ def _run_pa_decode_case(case, device, monkeypatch):
             "variants": False,
             "cluster": None,
             "cluster_seqs": None,
+            "cluster_steps": None,
         },
         **case,
     )

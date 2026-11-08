@@ -36,8 +36,6 @@ from .traits import LOG2E
 MERGE_PARTITIONS = 8
 # Largest head dimension whose merge loads stay within 64 VGPRs per row group.
 MERGE_HEAD_DIM = 512
-# Largest gfx1250 workgroup cluster.
-CLUSTER_PARTITIONS = 16
 
 
 def _global_pointer(target, dtype):

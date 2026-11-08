@@ -488,8 +488,10 @@ def pa_decode(
     is in [2, 32], C = min(P, 16) CTAs per sequence fit the plan capacity or
     two per CU, and the sequences times KV heads stay within 15 per 16 CUs
     (head_dim <= 512), each sequence runs as one cluster of C workgroups that
-    split its tiles and merge them on chip. Other plans use packed scratch and
-    the separate reducer.
+    split its tiles and merge them on chip. Page16 D128 decode batches within
+    one 16-CTA cluster per CU whose plan holds 16 slots per sequence (see
+    ``plan_pa_decode``) instead split each sequence into 16 step-sized parts.
+    Other plans use packed scratch and the separate reducer.
 
     ``sinks`` is a contiguous [num_query_heads] BF16/FP16/FP32 tensor on the
     query device: unscaled zero-value logits shared across batch/MTP positions.
@@ -1002,6 +1004,22 @@ def pa_decode(
         )
         else 0
     )
+    # Batches within one cluster per CU split each page16 decode row into
+    # CLUSTER_PARTITIONS step-sized parts, whatever the partition bound, for
+    # shorter per-CTA chains (sparse decode at 4 rows: 5.3 -> 5.0 us). Plans
+    # for these batches reserve the parts' partial slots.
+    cluster_steps = bool(
+        cluster_merge
+        and cluster_seqs == 1
+        and block_size == 16
+        and head_dim == 128
+        and query_length == 1
+        and sliding_window == 0
+        and num_seqs * num_kv_heads * CLUSTER_PARTITIONS <= num_compute_units
+        and num_seqs * CLUSTER_PARTITIONS <= work_plan.capacity
+    )
+    if cluster_steps:
+        cluster_merge = CLUSTER_PARTITIONS
 
     # Bound byte offsets as well as element indices for 16-bit BF16 caches.
     cache_extent = max(
@@ -1037,6 +1055,7 @@ def pa_decode(
             mask_unowned_kv=mask_unowned_kv,
             cluster_merge=cluster_merge,
             cluster_seqs=cluster_seqs,
+            cluster_steps=cluster_steps,
         )
 
     total_rows = query_length * query_group_size

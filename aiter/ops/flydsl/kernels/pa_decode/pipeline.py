@@ -1836,6 +1836,8 @@ class Gfx1250Pipeline:
             ctx.planned_start * KV_COMPUTE_BLOCK,
             ctx.planned_end * KV_COMPUTE_BLOCK,
         )
+        if const_expr(t.cluster_steps):
+            begin, end = ctx.step_bounds
         # Q loads overlap the table lookup and the first page's DMA issue;
         # the LDS regions are disjoint. Wider heads keep fewer Q registers live.
         early_query = t.q_tiles == t.m_tiles and t.head_dim <= 256

@@ -66,7 +66,6 @@ from aiter.jit.utils.chip_info import get_gfx_runtime
 from .pa_decode import implementation_cache_tag
 from .pa_decode.context import PaDecodeContext
 from .pa_decode.op_merge import (
-    CLUSTER_PARTITIONS,
     MERGE_HEAD_DIM,
     MERGE_PARTITIONS,
     Gfx1250ClusterMerge,
@@ -89,6 +88,7 @@ from .pa_decode.traits import (
     PaDecodeSchedule,
     PaDecodeTraits,
 )
+from .pa_decode_plan import CLUSTER_PARTITIONS
 from .tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
@@ -180,6 +180,7 @@ def compile_pa_decode_tile(
     mask_unowned_kv: bool = True,
     cluster_merge: int = 0,
     cluster_seqs: int = 1,
+    cluster_steps: bool = False,
 ):
     """Select and cache a PA-decode kernel and launch wrapper.
 
@@ -276,6 +277,7 @@ def compile_pa_decode_tile(
             merge_partitions=direct_output and num_partitions > 1,
             cluster_merge=cluster_merge,
             cluster_seqs=cluster_seqs,
+            cluster_steps=cluster_steps,
             # Wide page16 stages leave room for two CTAs per CU: larger
             # grids (sparse prefill) keep narrower stages.
             small_grid=grid_ctas <= 2 * num_compute_units,
@@ -566,6 +568,7 @@ def compile_gfx1250_pa_decode(
     merge_partitions=False,
     cluster_merge=0,
     cluster_seqs=1,
+    cluster_steps=False,
     small_grid=False,
     wide_pages=False,
     one_cta_grid=False,
@@ -578,8 +581,11 @@ def compile_gfx1250_pa_decode(
     ``cluster_merge`` P instead launches P CTAs per sequence as one workgroup
     cluster: a sequence with n tasks splits its tiles over its first min(n, P)
     CTAs, as the planner splits them, and the cluster merges after a cluster
-    barrier. ``work`` then holds the context lengths. In both modes a sequence's single task stores final rows directly,
-    and empty sequences clear their rows.
+    barrier. ``work`` then holds the context lengths. ``cluster_steps`` splits
+    each sequence evenly into at most P runs of whole steps instead, ignoring
+    the plan's task counts, with partials at slot sequence * P + part. In both
+    modes a sequence's single task stores final rows directly, and empty
+    sequences clear their rows.
     ``merge_partitions`` partial storage must be eight-byte aligned for its
     device-scope atomic accesses; the host wrapper falls back for offset views.
     """
@@ -602,10 +608,13 @@ def compile_gfx1250_pa_decode(
         cluster_merge,
         small_grid and compute_dtype == "bf16" and block_size == 16,
         wide_pages and compute_dtype == "fp8" and block_size == 128,
-        one_cta_grid and compute_dtype == "bf16",
+        # Step-split clusters keep 128-token BF16 page16 steps: their parts
+        # are a step each, so wider steps halve the parts.
+        one_cta_grid and compute_dtype == "bf16" and not cluster_steps,
         many_cta_grid and compute_dtype == "fp8" and block_size == 16,
         cluster_seqs=cluster_seqs if cluster_merge else 1,
         latency_grid=one_cta_grid,
+        cluster_steps=cluster_steps,
     )
     if compute_dtype not in ("fp8", "bf16"):
         raise ValueError(f"Unsupported gfx1250 PA compute dtype: {compute_dtype}")
@@ -624,6 +633,17 @@ def compile_gfx1250_pa_decode(
         raise ValueError(
             f"cluster_merge must be in [2, {CLUSTER_PARTITIONS}] and excludes other "
             f"output modes and head_dim > {MERGE_HEAD_DIM}"
+        )
+    if cluster_steps and not (
+        cluster_merge
+        and cluster_seqs == 1
+        and block_size == 16
+        and query_length == 1
+        and sliding_window == 0
+    ):
+        raise ValueError(
+            "cluster_steps requires an unshared cluster over page16 decode rows "
+            "without a sliding window"
         )
     if t.total_bytes > 327680:
         raise NotImplementedError(
@@ -715,37 +735,58 @@ def compile_gfx1250_pa_decode(
                 # The last cluster pads the grid past the batch.
                 present = seq < sequences
                 seq = present.select(seq, fx.Int32(0))
-            # Scalar loads return out of order, so a use waits for every load
-            # issued before it: issue both before either is used.
             task_context = fx.Int32(fx.recast_iter(fx.Int32, work)[seq])
-            seq_tasks = fx.ptr_load(
-                fx.add_offset(fx.recast_iter(fx.Int32, reduce_info), seq * 2),
-                result_type=fx.Vector.make_type(2, fx.Int32),
-            )
-            fx.rocdl.sched_barrier(0)
-            # A sequence with more tasks than the cluster has CTAs splits its
-            # tiles over the cluster, in its first task slots.
-            first = fx.Int32(seq_tasks[0])
-            count = fx.min(fx.Int32(seq_tasks[1]), fx.Int32(t.cluster_merge))
-            if const_expr(t.cluster_seqs > 1):
-                count = present.select(count, fx.Int32(0))
-            task_slot = (part < count).select(first + part, fx.Int32(0))
-            # Tiles of an int32 length, times at most 16 parts, fit Int32.
-            length = fx.max(task_context, fx.Int32(0))
-            first_tile = fx.Int32(0)
-            if const_expr(t.sliding_window > 0):
-                window = min(t.query_length - 1 + t.sliding_window, 2**31 - 1)
-                first_tile = fx.max(length - window, fx.Int32(0)) // KV_COMPUTE_BLOCK
-            tiles = (
-                length // KV_COMPUTE_BLOCK
-                + fx.Int32(length % KV_COMPUTE_BLOCK != 0)
-                - first_tile
-            )
-            parts = fx.max(count, fx.Int32(1))
-            task_seq = seq
-            task_begin = first_tile + part * tiles // parts
-            task_end = first_tile + (part + 1) * tiles // parts
-            active = part < count
+            step_bounds = None
+            if const_expr(t.cluster_steps):
+                # Each CTA takes an even share of the sequence's steps, so the
+                # plan's task count and slots are not read.
+                length = fx.max(task_context, fx.Int32(0))
+                steps = (length + t.TOKENS - 1) // t.TOKENS
+                count = fx.min(steps, fx.Int32(t.cluster_merge))
+                first = seq * t.cluster_merge
+                task_slot = first + part
+                parts = fx.max(count, fx.Int32(1))
+                step_bounds = (
+                    part * steps // parts * t.TOKENS,
+                    (part + 1) * steps // parts * t.TOKENS,
+                )
+                task_seq = seq
+                task_begin = step_bounds[0] // KV_COMPUTE_BLOCK
+                task_end = (step_bounds[1] + KV_COMPUTE_BLOCK - 1) // KV_COMPUTE_BLOCK
+                active = part < count
+            else:
+                # Scalar loads return out of order, so a use waits for every
+                # load issued before it: issue both before either is used.
+                seq_tasks = fx.ptr_load(
+                    fx.add_offset(fx.recast_iter(fx.Int32, reduce_info), seq * 2),
+                    result_type=fx.Vector.make_type(2, fx.Int32),
+                )
+                fx.rocdl.sched_barrier(0)
+                # A sequence with more tasks than the cluster has CTAs splits its
+                # tiles over the cluster, in its first task slots.
+                first = fx.Int32(seq_tasks[0])
+                count = fx.min(fx.Int32(seq_tasks[1]), fx.Int32(t.cluster_merge))
+                if const_expr(t.cluster_seqs > 1):
+                    count = present.select(count, fx.Int32(0))
+                task_slot = (part < count).select(first + part, fx.Int32(0))
+                # Tiles of an int32 length, times at most 16 parts, fit Int32.
+                length = fx.max(task_context, fx.Int32(0))
+                first_tile = fx.Int32(0)
+                if const_expr(t.sliding_window > 0):
+                    window = min(t.query_length - 1 + t.sliding_window, 2**31 - 1)
+                    first_tile = (
+                        fx.max(length - window, fx.Int32(0)) // KV_COMPUTE_BLOCK
+                    )
+                tiles = (
+                    length // KV_COMPUTE_BLOCK
+                    + fx.Int32(length % KV_COMPUTE_BLOCK != 0)
+                    - first_tile
+                )
+                parts = fx.max(count, fx.Int32(1))
+                task_seq = seq
+                task_begin = first_tile + part * tiles // parts
+                task_end = first_tile + (part + 1) * tiles // parts
+                active = part < count
         else:
             if const_expr(t.direct_output):
                 # One task per nonempty sequence; reduce_info supplies its slot.
@@ -809,6 +850,7 @@ def compile_gfx1250_pa_decode(
             if const_expr(t.cluster_merge):
                 ctx.task_count = count
                 ctx.output_ptr = output
+                ctx.step_bounds = step_bounds
             if const_expr(t.bf16_wave_query_tiles):
                 Gfx1250Bf16WavePipeline(ctx).run()
             elif const_expr(t.bf16_page128_packed):
