@@ -14,6 +14,7 @@ from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.rocdl import tdm_ops
 from flydsl.expr.typing import ReductionOp
 
+from ..pa_decode_plan import CLUSTER_PARTITIONS
 from ..utils import rcp_f32
 from .op_epilog import PaDecodeEpilogue
 from .op_gemm import Gfx1250Gemm, PaDecodeGemm
@@ -1844,6 +1845,9 @@ class Gfx1250Pipeline:
         if const_expr(early_query):
             q_tiles = self.mem.load_query()
         self.mem.stage_kv(begin, fx.Int32(0))
+        if const_expr(t.cluster_steps and t.cluster_merge < CLUSTER_PARTITIONS):
+            # Preloaded page ids cover the first of several steps only.
+            ctx.stage_pages = None
         if const_expr(t.early_second_stage):  # noqa: SIM102
             if begin + t.TOKENS < end:
                 self.mem.stage_kv(begin + t.TOKENS, fx.Int32(1))

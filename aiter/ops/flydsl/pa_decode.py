@@ -1005,24 +1005,33 @@ def pa_decode(
         )
         else 0
     )
-    # Batches within one cluster per CU split each page16 decode row into its
-    # CLUSTER_STEP_TOKENS-token steps, one per CTA, whatever the partition bound, for shorter
-    # per-CTA chains (sparse decode at 4 rows: 5.3 -> 4.6 us). Block tables
-    # must hold at most one step per CTA. Plans for these batches reserve the
-    # steps' partial slots.
-    cluster_steps = bool(
+    # Page16 D128 decode clusters of P CTAs over block tables of at most 16
+    # steps give CTA p steps [p * 16 / P, (p + 1) * 16 / P), so it loads its
+    # first page ids with the context length rather than after it. For rows of
+    # 16 steps the runs are the planner's tiles. Batches within
+    # one cluster per CU split each row into single steps, one per CTA,
+    # whatever the partition bound (sparse decode at 4 rows: 5.3 -> 4.6 us);
+    # their plans reserve the steps' partial slots.
+    step_split = bool(
         cluster_merge
-        and cluster_seqs == 1
         and block_size == 16
         and head_dim == 128
         and query_length == 1
         and sliding_window == 0
-        and num_seqs * num_kv_heads * CLUSTER_PARTITIONS <= num_compute_units
-        and num_seqs * CLUSTER_PARTITIONS <= work_plan.capacity
         and max_blocks_per_seq * block_size <= CLUSTER_PARTITIONS * CLUSTER_STEP_TOKENS
     )
-    if cluster_steps:
+    if (
+        step_split
+        and cluster_seqs == 1
+        and num_seqs * num_kv_heads * CLUSTER_PARTITIONS <= num_compute_units
+        and num_seqs * CLUSTER_PARTITIONS <= work_plan.capacity
+    ):
         cluster_merge = CLUSTER_PARTITIONS
+    cluster_steps = (
+        step_split
+        and CLUSTER_PARTITIONS % cluster_merge == 0
+        and num_seqs * cluster_merge <= work_plan.capacity
+    )
 
     # Bound byte offsets as well as element indices for 16-bit BF16 caches.
     cache_extent = max(

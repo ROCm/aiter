@@ -583,8 +583,9 @@ def compile_gfx1250_pa_decode(
     cluster: a sequence with n tasks splits its tiles over its first min(n, P)
     CTAs, as the planner splits them, and the cluster merges after a cluster
     barrier. ``work`` then holds the context lengths. ``cluster_steps`` instead
-    gives CTA p step p, ignoring the plan's task counts, with partials at slot
-    sequence * P + p; block tables then hold at most P steps. In both
+    gives CTA p steps [p * 16 / P, (p + 1) * 16 / P) of block tables at most
+    16 steps wide, ignoring the plan's task counts, with partials at slot
+    sequence * P + p. In both
     modes a sequence's single task stores final rows directly, and empty
     sequences clear their rows.
     ``merge_partitions`` partial storage must be eight-byte aligned for its
@@ -637,7 +638,7 @@ def compile_gfx1250_pa_decode(
         )
     if cluster_steps and not (
         cluster_merge
-        and cluster_seqs == 1
+        and CLUSTER_PARTITIONS % cluster_merge == 0
         and block_size == 16
         and query_length == 1
         and sliding_window == 0
@@ -740,16 +741,18 @@ def compile_gfx1250_pa_decode(
             task_context = fx.Int32(fx.recast_iter(fx.Int32, work)[seq])
             step_bounds = None
             if const_expr(t.cluster_steps):
-                # CTA p takes step p: block tables hold at most one step per
-                # CTA. The step's page ids depend on no load, so they load
-                # with the context length rather than after it: the wave's
-                # pages, then token 0's for masked tail slices. The plan's
-                # tasks are not read.
+                # Block tables hold at most CLUSTER_PARTITIONS steps, so CTA p
+                # takes steps [p chunk, (p + 1) chunk). Its first page ids
+                # depend on no load, so they load with the context length
+                # rather than after it: the wave's pages, then token 0's for
+                # masked tail slices. The plan's tasks are not read.
+                chunk = CLUSTER_PARTITIONS // t.cluster_merge
+                first_step = part * chunk
                 wave_pages = t.TOKENS // t.block_size // t.NWARP
                 tbl = fx.recast_iter(fx.Int32, table)
                 row = seq * max_blocks
                 page = (
-                    part * (t.TOKENS // t.block_size)
+                    first_step * (t.TOKENS // t.block_size)
                     + fx.Int32(fx.rocdl.wave_id()) * wave_pages
                 )
                 stage_pages = [
@@ -758,10 +761,12 @@ def compile_gfx1250_pa_decode(
                 ] + [fx.Int32(tbl[row])]
                 length = fx.max(task_context, fx.Int32(0))
                 steps = (length + t.TOKENS - 1) // t.TOKENS
-                count = fx.min(steps, fx.Int32(t.cluster_merge))
+                count = fx.min((steps + chunk - 1) // chunk, fx.Int32(t.cluster_merge))
+                if const_expr(t.cluster_seqs > 1):
+                    count = present.select(count, fx.Int32(0))
                 first = seq * t.cluster_merge
                 task_slot = first + part
-                step_bounds = (part * t.TOKENS, (part + 1) * t.TOKENS)
+                step_bounds = (first_step * t.TOKENS, (first_step + chunk) * t.TOKENS)
                 task_seq = seq
                 task_begin = step_bounds[0] // KV_COMPUTE_BLOCK
                 task_end = (step_bounds[1] + KV_COMPUTE_BLOCK - 1) // KV_COMPUTE_BLOCK

@@ -808,7 +808,7 @@ _COMMON_CASES = [
             "max_partitions": 8,
             "capture": True,
             "cluster": 8,
-            "cluster_steps": False,
+            "cluster_steps": True,
         },
     ),
     # Batches within one 16-CTA cluster per CU split each row into 16
@@ -825,7 +825,7 @@ _COMMON_CASES = [
             "cluster_steps": True,
         },
     ),
-    # Block tables of more than 16 steps keep plan-derived clusters.
+    # Block tables of more than 16 steps keep plan-derived tasks.
     (
         "cluster4-wide-table",
         {
@@ -860,6 +860,7 @@ _COMMON_CASES = [
             "capture": True,
             "cluster": 2,
             "cluster_seqs": 2,
+            "cluster_steps": True,
         },
     ),
 ]
