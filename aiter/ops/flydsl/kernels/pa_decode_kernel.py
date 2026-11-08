@@ -260,6 +260,18 @@ def compile_pa_decode_tile(
             if max_context_length is not None and max_context_length > 0
             else 0
         )
+        task_limit_per_seq = 0
+        if (
+            tile_bound
+            and work_capacity
+            and query_length > 1
+            and not direct_output
+            and not cluster_merge
+        ):
+            bound = min(num_partitions, tile_bound)
+            bucket = 1 << (bound - 1).bit_length()
+            if num_seqs * bucket < work_capacity:
+                task_limit_per_seq = bucket
         single_task_tile = bool(
             tile_bound
             and kv_dtype == "fp8"
@@ -290,6 +302,7 @@ def compile_pa_decode_tile(
             cluster_task_stride=cluster_task_stride,
             plan_tile_tokens=plan_tile_tokens,
             single_task_tile=single_task_tile,
+            task_limit_per_seq=task_limit_per_seq,
             single_kv_head=(
                 num_kv_heads == 1
                 and head_dim == 128
@@ -587,6 +600,7 @@ def compile_gfx1250_pa_decode(
     single_task_tile=False,
     direct_context=False,
     single_kv_head=False,
+    task_limit_per_seq=0,
 ):
     """Compile a gfx1250 tile kernel; merging partitions writes final output.
 
@@ -606,6 +620,9 @@ def compile_gfx1250_pa_decode(
     one KV buffer and skip its final reuse barrier; BF16 wave merge keeps two.
     ``plan_tile_tokens`` matches the plan's 128/256-token units; the value
     participates in the kernel cache key and planned range conversion.
+    ``task_limit_per_seq`` bounds packed active tasks per sequence for
+    separate-reducer output; it only trims the launch and retains capacity
+    for all scratch strides. Zero keeps the original grid.
     ``single_kv_head`` requires a one-head launch; KV indexing and head
     strides then fold to constants while query-split indexing stays dynamic.
     ``direct_context`` replaces the work pointer with context lengths for
@@ -640,7 +657,12 @@ def compile_gfx1250_pa_decode(
         single_task_tile,
         direct_context,
         single_kv_head,
+        task_limit_per_seq,
     )
+    if type(task_limit_per_seq) is not int or task_limit_per_seq < 0:
+        raise ValueError("task_limit_per_seq must be a nonnegative int")
+    if task_limit_per_seq and (direct_output or merge_partitions or cluster_merge):
+        raise ValueError("task_limit_per_seq requires separate-reducer output")
     if type(plan_tile_tokens) is not int or plan_tile_tokens not in (128, 256):
         raise ValueError("plan_tile_tokens must be 128 or 256")
     if direct_context and (not direct_output or sliding_window != 0):
@@ -1061,6 +1083,8 @@ def compile_gfx1250_pa_decode(
     ):
         _ = tag
         grid_x = capacity
+        if const_expr(t.task_limit_per_seq > 0):
+            grid_x = fx.min(capacity, sequences * t.task_limit_per_seq)
         if const_expr(t.direct_output):
             grid_x = sequences
         if const_expr(t.cluster_merge):

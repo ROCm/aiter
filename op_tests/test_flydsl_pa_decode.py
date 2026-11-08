@@ -922,6 +922,42 @@ _COMMON_CASES = [
         )
         for kv_heads in (1, 2)
     ],
+    *[
+        (
+            f"trimmed-mtp-unit{unit}",
+            {
+                "group_size": 16,
+                "block_size": 128,
+                "query_length": 4,
+                "lengths": (0, 4, 31, 128, 129, 8192),
+                "max_partitions": 256,
+                "max_context": 8192,
+                "tile_tokens": unit,
+                "pattern": "one_hot_token",
+                "capture": True,
+                "task_limit": 8192 // unit,
+            },
+        )
+        for unit in (128, 256)
+    ],
+    *[
+        (
+            f"trimmed-mtp-rounded-unit{unit}",
+            {
+                "group_size": 16,
+                "block_size": 128,
+                "query_length": 4,
+                "lengths": (4353,) * 6,
+                "max_partitions": 256,
+                "max_context": 4353,
+                "tile_tokens": unit,
+                "pattern": "one_hot_v",
+                "capture": True,
+                "task_limit": 64 if unit == 128 else 32,
+            },
+        )
+        for unit in (128, 256)
+    ],
 ]
 _FP8_CASES = _COMMON_CASES + [
     (
@@ -1800,6 +1836,8 @@ def _check_pipe_policy(pa, case, arch, compile_kwargs):
             if entry is compiled
         ]
         assert len(traits) == 1
+        if "task_limit" in case:
+            assert traits[0].task_limit_per_seq == case["task_limit"]
         assert not traits[0].single_kv_head or selected["num_kv_heads"] == 1
         if "single_kv_head" in case:
             assert traits[0].single_kv_head == case["single_kv_head"]
@@ -2253,6 +2291,30 @@ def test_pa_decode(case, device, monkeypatch):
             launch()
         for _ in range(2):
             query.neg_()
+            output.fill_(float("nan"))
+            graph.replay()
+            check()
+        if "task_limit" in case and arch == "gfx1250":
+            saved_context = context.clone()
+            context.zero_()
+            pa.plan_pa_decode(
+                context,
+                kv_heads,
+                query_length=query_length,
+                sliding_window=window,
+                plan=plan,
+            )
+            output.fill_(float("nan"))
+            graph.replay()
+            assert torch.count_nonzero(output) == 0
+            context.copy_(saved_context)
+            pa.plan_pa_decode(
+                context,
+                kv_heads,
+                query_length=query_length,
+                sliding_window=window,
+                plan=plan,
+            )
             output.fill_(float("nan"))
             graph.replay()
             check()
