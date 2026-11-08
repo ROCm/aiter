@@ -12,7 +12,13 @@ import torch
 
 from aiter.jit.utils.chip_info import get_lds_capacity_bytes
 
-from .tensor_shim import _run_compiled, ptr_arg, ptr_buf_tensor
+from .tensor_shim import (
+    AITER_FLYDSL_KERNARG_PRELOAD,
+    AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
+    _run_compiled,
+    ptr_arg,
+    ptr_buf_tensor,
+)
 
 DEFAULT_MAX_BATCH_SIZE = 4096
 # int32 slots per arrival counter: one 128-byte line per (sequence, KV head).
@@ -200,6 +206,12 @@ def compile_pa_decode_plan(max_batch, threads, windowed):
             lengths, work, reduce_info, batch, capacity, max_parts, window
         ).launch(grid=(1, 1, 1), block=(threads, 1, 1), stream=stream)
 
+    # All 40 argument bytes preload into user SGPRs, so the length loads need
+    # not wait for an argument load.
+    launch.compile_hints["llvm_options"] = {
+        "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
+        "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
+    }
     return launch
 
 
