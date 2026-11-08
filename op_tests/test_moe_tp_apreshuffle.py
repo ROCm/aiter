@@ -131,3 +131,7 @@ def test_tp_apreshuffle_matches_row_major_and_replays(tokens, tile_m, monkeypatc
     finally:
         for graph in graphs:
             graph.reset()
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main(["-q", __file__]))
