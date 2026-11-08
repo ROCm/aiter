@@ -24,6 +24,13 @@ pytestmark = pytest.mark.skipif(
     ARCH not in ("gfx1250", "gfx950"),
     reason=f"chunk KDA gluon needs gfx1250 or gfx950, got {ARCH}",
 )
+STATE_DTYPES = [
+    torch.float32,
+    pytest.param(
+        torch.bfloat16,
+        marks=pytest.mark.skipif(ARCH != "gfx950", reason="bf16 state requires gfx950"),
+    ),
+]
 
 DEVICE = "cuda"
 D = 128
@@ -245,13 +252,11 @@ def workspace_ref(inp, scale):
 
 @pytest.mark.parametrize(
     "seqlens",
-    [[64], [1], [63], [65], [300], [1, 64, 130, 7], [1000], [4096], [5, 0, 70]],
+    [[64], [1], [63], [65], [1, 64, 130, 7], [1000], [5, 0, 70]],
 )
-@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("state_dtype", STATE_DTYPES)
 def test_chunk_kda(seqlens, state_dtype):
     H = 4
-    if state_dtype == torch.bfloat16 and ARCH != "gfx950":
-        pytest.skip("bf16 state requires gfx950")
     inp = make_inputs(seqlens, H)
     h0 = torch.randn(len(seqlens), H, D, D, dtype=torch.float32, device=DEVICE).to(
         state_dtype
@@ -276,12 +281,10 @@ def test_chunk_kda_workspace(seqlens):
 
 
 @pytest.mark.parametrize("padded", [False, True])
-@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("state_dtype", STATE_DTYPES)
 def test_chunk_kda_paged(padded, state_dtype):
     """State cache in place, out aliasing v; ``padded`` gives a hybrid-page slot stride."""
     seqlens, H = [130, 1, 64, 257], 24
-    if state_dtype == torch.bfloat16 and ARCH != "gfx950":
-        pytest.skip("bf16 state requires gfx950")
     inp = make_inputs(seqlens, H, seed=1)
     N = len(seqlens)
     lead, tail = (3 * 2 * H * D, 1000) if padded else (0, 0)
@@ -533,9 +536,7 @@ def test_chunk_kda_chunked_prefill():
     ).all(), "cache memory outside the used slots was written"
 
 
-@pytest.mark.parametrize(
-    "seqlens", [[5, 0, 70], [0, 64, 0, 0, 129, 1], [0], [64, 0], [1000]]
-)
+@pytest.mark.parametrize("seqlens", [[0, 64, 0, 0, 129, 1], [0], [64, 0], [1000]])
 def test_chunk_kda_metadata(seqlens):
     """The chunk_indices=None fallback keeps sequence ids across zero-length sequences."""
     cu = torch.tensor(

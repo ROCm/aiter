@@ -328,8 +328,8 @@ def dynamic_mxfp4_quant(
             and blockscale_e8m0.dtype == torch.uint8
         )
 
-    # Every gfx1250 input has a Gluon kernel, given Triton's cdna5.scaled_downcast.
-    if arch_info.get_arch() == "gfx1250" and _use_gluon(
+    # gfx1250 and gfx1250-strict use the Gluon kernel when Triton has cdna5.scaled_downcast.
+    if arch_info.get_arch() in ("gfx1250", "gfx1250-strict") and _use_gluon(
         backend,
         _has_cdna5_scaled_downcast(),
         "gfx1250 and Triton gl.amd.cdna5.scaled_downcast",
@@ -581,7 +581,7 @@ def dynamic_mxfp8_quant(
         assert scale.shape == (M, Ns), f"scale shape {scale.shape} != ({M},{Ns})"
         assert scale.dtype == torch.uint8
 
-    if arch_info.get_arch() == "gfx1250" and _use_gluon(
+    if arch_info.get_arch() in ("gfx1250", "gfx1250-strict") and _use_gluon(
         backend,
         x2d.dtype in (torch.bfloat16, torch.float16)
         and quant_dtype == torch.float8_e4m3fn
