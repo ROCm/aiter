@@ -95,8 +95,10 @@ FAMILIES = [
     ("AITER_CONFIG_CONV3D_BF16", "bf16_tuned_conv3d"),
     ("AITER_CONFIG_FMOE", "tuned_fmoe"),
     ("AITER_CONFIG_FHMOE", "tuned_fhmoe"),
+    ("AITER_CONFIG_MQA_LOGITS", "tuned_mqa_logits"),
     ("AITER_CONFIG_GROUPED_FMOE", "tuned_grouped_fmoe"),
     ("AITER_CONFIG_GDN_K5_OPT", "chunk_gdn_h_opt_tuned"),
+    ("AITER_CONFIG_PAGED_MQA_LOGITS", "paged_mqa_logits_tuned"),
 ]
 
 
@@ -433,7 +435,7 @@ class TestConfigShapeCollision(unittest.TestCase):
         )
 
         # The generic config registry owns file discovery and merging; the
-        # dedicated caller policy still owns public-kid normalization.
+        # dedicated caller policy still owns local-kid lookup.
         from aiter.ops.opus import policy
 
         policy._load_mxscale_bmm_tuned.cache_clear()
@@ -441,14 +443,14 @@ class TestConfigShapeCollision(unittest.TestCase):
         self.assertTrue(rows)
         self.assertEqual(len(rows), len(set(rows)))
         self.assertEqual(
-            rows[("gfx950", 2, 1, 1024, 4096, "128x128")]["kernelId"],
-            8311,
-            "legacy local OPUS kid 311 must become public global kid 8311",
+            rows[("gfx950", 256, 2, 1, 1024, 4096, "128x128")]["kernelId"],
+            63,
+            "saved OPUS row must select local kid 63 for CU=256",
         )
         self.assertEqual(
-            rows[("gfx950", 8, 128, 1024, 4096, "128x128")]["kernelId"],
-            8653,
-            "legacy local OPUS kid 653 must become public global kid 8653",
+            rows[("gfx950", 256, 8, 128, 1024, 4096, "128x128")]["kernelId"],
+            144,
+            "saved OPUS row must select local kid 144 for CU=256",
         )
         policy._load_mxscale_bmm_tuned.cache_clear()
 
@@ -466,6 +468,9 @@ class TestConfigShapeCollision(unittest.TestCase):
 
     def test_fmoe(self):
         self._check_family("AITER_CONFIG_FMOE", "tuned_fmoe")
+
+    def test_mqa_logits(self):
+        self._check_family("AITER_CONFIG_MQA_LOGITS", "tuned_mqa_logits")
 
     def test_fhmoe(self):
         merged = self._resolve(
@@ -548,6 +553,9 @@ class TestConfigShapeCollision(unittest.TestCase):
 
     def test_gdn_k5_opt(self):
         self._check_family("AITER_CONFIG_GDN_K5_OPT", "chunk_gdn_h_opt_tuned")
+
+    def test_paged_mqa_logits(self):
+        self._check_family("AITER_CONFIG_PAGED_MQA_LOGITS", "paged_mqa_logits_tuned")
 
 
 def _fix_real_tree():

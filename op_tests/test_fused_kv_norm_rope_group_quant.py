@@ -50,6 +50,9 @@ from aiter.utility.mx_types import MxDtypeInt, MxScaleRoundModeInt
 torch.set_default_device("cuda")
 
 _FP8 = dtypes.fp8
+_FP8_MX_DTYPE = (
+    MxDtypeInt.FP8_E4M3_FNUZ if _FP8 == torch.float8_e4m3fnuz else MxDtypeInt.FP8_E4M3
+)
 _DEV = "cuda"
 # MI355X HBM3e peak. Used only for the "%peak" perf column.
 _PEAK_BW_GBPS = 8000.0
@@ -107,12 +110,12 @@ def _kv_only_ref(kv, kv_weight, cos, sin, pos, eps, *, is_neox, group_size):
     nope, pe = normed[..., :nope_dim], normed[..., nope_dim:]
     pe_rotated = _apply_gptj_rope(pe, cos, sin, pos, is_neox=is_neox)
 
-    # nope: per-group amax -> e8m0 scale (MX RoundUp, FP8 E4M3) -> fp8.
+    # nope: per-group amax -> e8m0 scale (MX RoundUp, HW-native FP8 E4M3) -> fp8.
     amax = (
         nope.reshape(T, n_heads, n_groups, group_size).abs().amax(-1).clamp_min(1e-12)
     )
     scale_e8m0 = f32_to_mx_e8m0_scale(
-        amax, mode=MxScaleRoundModeInt.RoundUp, dtype=MxDtypeInt.FP8_E4M3
+        amax, mode=MxScaleRoundModeInt.RoundUp, dtype=_FP8_MX_DTYPE
     ).view(torch.uint8)
     inv_scale = 1.0 / (scale_e8m0.to(torch.int32) << 23).view(torch.float32)
     nope_fp8 = (

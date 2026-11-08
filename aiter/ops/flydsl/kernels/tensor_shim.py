@@ -36,7 +36,7 @@ AITER_FLYDSL_KERNARG_PRELOAD_COUNT = int(
 # kernels. Disabled by default; set AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE=1
 # to enable it.
 AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE = bool(
-    int(os.environ.get("AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE", "0"))
+    int(os.environ.get("AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE", "1"))
 )
 
 _PRELOAD_COMPILE_LOCK = threading.RLock()
@@ -275,6 +275,18 @@ def check_e8m0(
         raise RuntimeError(f"[{owner}] {name} must be e8m0/uint8, got {scale.dtype}")
     if not scale.is_contiguous():
         raise RuntimeError(f"[{owner}] {name} must be contiguous")
+
+
+# Resolve the optional API once, but query its device/stream on every call.
+# This is not a stream cache: graph capture and thread-local stream switches
+# must still be observed. Older torch builds keep the public API fallback.
+_get_current_raw_stream = getattr(torch._C, "_cuda_getCurrentRawStream", None)
+
+
+def current_stream_arg():
+    if _get_current_raw_stream is None:
+        return torch.cuda.current_stream()
+    return fx.Stream(_get_current_raw_stream(torch.cuda.current_device()))
 
 
 def ptr_arg(t: torch.Tensor, dtype=None):
