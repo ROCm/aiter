@@ -5,7 +5,7 @@ dispatch metadata. Unsupported recipes fail instead of falling back to another a
 
 ## Scope
 
-- Contiguous BF16 BSHD inputs with head dimension 128, or 256 for dense MXFP4 and MXFP6 on GFX950.
+- Contiguous BF16 BSHD inputs with head dimension 128, or 256 for dense MXFP4/6/8 on GFX950.
 - BF16 BSHD output.
 - Dense, sorted block-sparse, and Sol-Attn inference.
 - Each sparse and Sol-Attn row declares the KV tiles per sequence it can traverse (`lut_max`);
@@ -42,8 +42,8 @@ GFX942 ships per-tensor FP8/FP8 and INT8/FP8, dense and sparse. It has no Sol-At
 
 MXFP4 Q/K requires MXFP4 V. The FP8-V variant is retired.
 
-Head dimension 256 exists only for all-MXFP4 and all-MXFP6 Q/K/V, dense, on GFX950. Every other
-recipe, sorted sparse, and GFX942 reject it.
+Head dimension 256 exists only for all-MXFP4, all-MXFP6 and MXFP8 (FP8 V) operands, dense, on
+GFX950. Every other recipe, sorted sparse, and GFX942 reject it.
 
 ## Ownership
 
@@ -144,6 +144,10 @@ acts on each 128-wide half independently, which keeps it orthogonal and Q.K^T un
 hd256 MXFP6 reuses the hd128 MXFP6 producers the same way, then byte-gathers each pair of 128-token
 hd128 K/V records into two 64-token hd256 records: K 13,312 bytes (row stride 208) with its K-scale
 tail inside the record, V 12,288 bytes (row stride 192), V scales 1,024 bytes per 128 tokens.
+
+hd256 MXFP8 keeps Q and V natural BSHD (Q from the hd128 producer on the half-head view) and packs
+K into one 17,408-byte record per 64 tokens (row stride 272): 16 KiB of data in the FP8 MFMA lane
+order, then the same 1 KiB K-scale tail as MXFP6. `mxfp8_k_view_hd256` rebuilds the BSHD view.
 
 E8M0 Q and K descales are contiguous `[B, S, H, D / 32]`, as the producers write them, and the
 launcher rejects any other strides: no kernel reads a descale's token stride, and most derive every
