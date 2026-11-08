@@ -2326,6 +2326,8 @@ def _flydsl_moe_stage2_impl(
     else:
         total_sorted = sorted_expert_ids.shape[0] * _sbm
         m_blocks = (total_sorted + tile_m - 1) // tile_m
+    if persist is not None:
+        persist = bool(persist)
     if persist is True:
         _persist_m = -1
     elif persist is False:
