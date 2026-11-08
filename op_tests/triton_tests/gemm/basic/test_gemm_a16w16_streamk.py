@@ -110,6 +110,12 @@ def get_k_tail_x_vals():
         (64, 64, 1056),  # several whole steps, then a tail
         (64, 4096, 4128),  # a wide N with a tail
         (32, 64, 288),  # M below the tile
+        # A gluon slice needs a power-of-two extent, but the tail rounded up to
+        # the wmma K step is not one in general. These two are the smallest
+        # shapes that reach it through the tuned config: BLOCK_K is 256, so
+        # K=352 leaves 96 and K=480 leaves 224. Both failed to compile.
+        (64, 64, 352),
+        (64, 64, 480),
     ]
 
 
