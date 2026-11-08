@@ -1550,3 +1550,118 @@ def test_mha_fwd_mid_head_selection(
         batch_heads=batch_heads,
     )
     assert cfg == fwd_cfg[expected]
+
+
+@pytest.mark.parametrize(
+    "enable_dropout, use_fp8, head_dim_v, expected",
+    [
+        (False, True, 256, "fp8_large_head"),
+        (False, True, 320, "default"),  # pads to 512, exceeds LDS
+        (False, True, 512, "default"),  # pads to 512, exceeds LDS
+        (False, True, 255, "default"),
+        (False, True, 128, "default"),
+        (False, False, 256, "default"),  # bf16 unaffected
+        (True, True, 256, "dropout_or_fp32"),  # dropout keeps precedence
+    ],
+)
+def test_mha_fwd_fp8_large_head_selection(
+    enable_dropout, use_fp8, head_dim_v, expected
+):
+    from aiter.ops.triton._triton_kernels.attention.mha import _get_config
+    from aiter.ops.triton.utils._triton.arch_info import get_arch
+    from aiter.ops.triton.utils.config_utils import (
+        load_config_json,
+        resolve_config_dir,
+    )
+    from aiter.ops.triton.utils.types import get_fp8_dtypes
+
+    fwd_cfg = load_config_json(
+        f"{resolve_config_dir('attention', 'MHA', backend='triton')}/DEFAULT.json"
+    )["fwd"]
+    if get_arch() != "gfx942":
+        # Arches without fp8_large_head keep the pre-existing selection.
+        assert "fp8_large_head" not in fwd_cfg
+        pytest.skip("fp8_large_head is only defined for gfx942")
+    dtype = get_fp8_dtypes()[1] if use_fp8 else torch.bfloat16
+    cfg = _get_config(enable_dropout, dtype, head_dim_v=head_dim_v)
+    assert cfg == fwd_cfg[expected]
+
+
+@pytest.mark.parametrize("CAUSAL", [True, False])
+def test_mha_varlen_fp8_large_head(CAUSAL: bool, dtype=torch.bfloat16):
+    """Compile fp8_large_head at d256; the Gluon FP8 tests stop at d128."""
+    # flash_attn_varlen_func forwards descales only on backend="gluon".
+    from aiter.ops.triton.attention.mha import _flash_attn_forward
+    from aiter.ops.triton.utils._triton.arch_info import get_arch
+
+    if get_arch() != "gfx942":
+        pytest.skip("fp8_large_head is only defined for gfx942")
+
+    BATCH, SEQLEN_Q, SEQLEN_K = 2, 512, 1024
+    NUM_Q_HEADS, NUM_K_HEADS, HEAD_SZ = 8, 2, 256
+
+    torch.manual_seed(20)
+    torch.cuda.empty_cache()
+    q = torch.randn((BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
+    k = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
+    v = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
+    query_padding_mask = generate_random_padding_mask(
+        SEQLEN_Q, BATCH, "cuda", mode="random"
+    )
+    key_padding_mask = generate_random_padding_mask(
+        SEQLEN_K, BATCH, "cuda", mode="random"
+    )
+    (
+        q_unpad,
+        k_unpad,
+        v_unpad,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        q,
+        k,
+        v,
+        output_pad_fn,
+        _,
+        _,
+    ) = generate_qkv(q, k, v, query_padding_mask, key_padding_mask, kvpacked=False)
+
+    fp8_dtype = get_fp8_e4m3_dtype()
+    q_fp8, q_descale = quantize_fp8_per_bh(q_unpad.detach(), fp8_dtype, cu_seqlens_q)
+    k_fp8, k_descale = quantize_fp8_per_bh(k_unpad.detach(), fp8_dtype, cu_seqlens_k)
+    v_fp8, v_descale = quantize_fp8_per_bh(v_unpad.detach(), fp8_dtype, cu_seqlens_k)
+
+    triton_out, _, _, _, _ = _flash_attn_forward(
+        q_fp8,
+        k_fp8,
+        v_fp8,
+        0.0,
+        HEAD_SZ**-0.5,
+        CAUSAL,
+        -1,
+        -1,
+        None,
+        None,
+        False,
+        False,
+        max_seqlen_q,
+        max_seqlen_k,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        descale_q=q_descale,
+        descale_k=k_descale,
+        descale_v=v_descale,
+    )
+    triton_out = output_pad_fn(triton_out)
+
+    torch_out, _, _ = attention_ref(
+        q,
+        k,
+        v,
+        query_padding_mask=query_padding_mask,
+        key_padding_mask=key_padding_mask,
+        causal=CAUSAL,
+    )
+
+    _fp8_assert_close(triton_out, torch_out.to(triton_out.dtype))
