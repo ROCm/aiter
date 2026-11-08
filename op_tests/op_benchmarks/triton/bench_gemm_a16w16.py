@@ -48,6 +48,7 @@ def bench_gemm_fn(
     activation: str | None = None,
     persistent: bool = False,
     kernel_type: str = "bandwidth_bound",
+    accumulate: bool = False,
     **kwargs,
 ):
     # NOTE: Assume bias and output has the same dtype
@@ -63,6 +64,9 @@ def bench_gemm_fn(
         _out_vals_keys = ["x", "w", "y"]  # matches gemm_a16w16_atomic's kwargs
         kernel_fn = functools.partial(gemm_a16w16_atomic, dtype=torch.float32)
     else:
+        assert not accumulate or (
+            backend == "gluon" and not persistent
+        ), "--accumulate needs --backend gluon and no --persistent"
         if persistent:
             assert not (backend == "gluon" and layout not in ("TN", "TT")), (
                 f"--persistent with --backend gluon requires --layout TN or TT, got "
@@ -91,6 +95,7 @@ def bench_gemm_fn(
             kernel_type=kernel_type,
             backend=backend,
             persistent=persistent,
+            accumulate=accumulate,
         )
 
     # create rotating buffers pool
@@ -105,6 +110,8 @@ def bench_gemm_fn(
         "w"
     ].element_size()
     mem_write = (M * N) * rot_bufs[0]["y"].element_size()
+    if accumulate:
+        mem_read += (M * N) * rot_bufs[0]["y"].element_size()  # y is read too
     mem = mem_read + mem_write
 
     ms = bencher.bench(kernel_fn)
@@ -170,6 +177,7 @@ def run_model_benchmark(args, backend):
             activation=args.activation,
             persistent=args.persistent,
             kernel_type=args.kernel_type,
+            accumulate=args.accumulate,
         )
 
     bench_gemm_a16w16.run(save_path="." if args.o else None, print_data=True)
@@ -200,6 +208,7 @@ def run_shape_benchmark(args, backend):
             atomic=args.atomic,
             persistent=args.persistent,
             kernel_type=args.kernel_type,
+            accumulate=args.accumulate,
         )
 
     bench_gemm_a16w16.run(save_path="." if args.o else None, print_data=True)
@@ -263,6 +272,13 @@ def parse_args(args: list[str] | None = None):
         choices=["bandwidth_bound", "compute_bound"],
         default="bandwidth_bound",
         help="Kernel variant to use (gluon only). Default: bandwidth_bound.",
+    )
+    parser.add_argument(
+        "--accumulate",
+        action="store_true",
+        default=False,
+        help="Add the result into y in place (gemm_a16w16(..., accumulate=True)). "
+        "Gluon only.",
     )
     return get_ff_args(parser, args=args)
 
