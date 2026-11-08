@@ -20,7 +20,9 @@ model_dim difference 7168 vs 4096 is invisible to the kernel):
 
 Each shape is swept across batch sizes and speculative-decode step counts {0,3}
 (MTP3). The HCA Main shape is additionally cross-checked against the 2-kernel
-split launcher. The fp8 nm-asm cross-checks run on wave64 only.
+split launcher. The fp8 nm-asm cross-checks run on wave64 only. A masked-NaN
+regression check puts NaN in each K row the kernels mask and checks that the
+output stays finite and matches the reference.
 """
 
 import argparse
@@ -67,6 +69,7 @@ SENTINEL_PAD = 16  # extra plan rows with position=-1 (kernel must skip them)
 CG_TOKEN_PAD = 32  # extra kv_in/score_in tail rows filled with NaN (CUDAGraph
 # bucket-padding: kernel must not read past the last valid ragged_id, else
 # NaN propagates and the test fails loudly)
+MASKED_NAN_NW = {"csa": [1, 4], "hca": [None]}  # k_split_num_waves per kind
 
 
 def _shape_by_label(label):
@@ -932,6 +935,118 @@ def test_flydsl_opus_cache_permutation(waves):
     return {"waves": waves, "us_kernel": us_kernel, "err_pct": err}
 
 
+def _build_masked_nan_inputs(kind):
+    """Inputs where each K row the kernel masks holds NaN and every other row is finite.
+
+    * csa: seq 0 is new, so its first boundary (plan [3, 0, 3, 4]) pads k=0..3.
+      The kernel reads ring row 0 of seq 0's state slot for them, and that row
+      holds NaN from a previous slot owner. Seq 1 (plan [7, 1, 103, 4]) is a
+      normal decode boundary.
+    * hca: seq 1 crosses a 128-boundary (plan [1, 1, 255, 127]): 127 rows come
+      from the state ring and 1 from kv_in. The gfx1250 Phase 2 also visits the
+      127 state rows and clamps their kv_in row to 0, which belongs to seq 0
+      and holds NaN.
+    """
+    D, RD = 512, 64
+    if kind == "csa":
+        ratio, overlap = 4, True
+        rows = [[3, 0, 3, 4], [7, 1, 103, 4]]
+        num_tokens = 8
+    elif kind == "hca":
+        ratio, overlap = 128, False
+        rows = [[1, 1, 255, 127]]
+        num_tokens = 2
+    else:
+        raise ValueError(f"unknown kind {kind!r}")
+    dim_full = (2 if overlap else 1) * D
+    state_size = (2 if overlap else 1) * ratio
+    num_slots = 6
+    state_slot_mapping = torch.tensor([2, 4], dtype=torch.int32)
+
+    g = torch.Generator(device="cuda").manual_seed(SEED)
+    kv_in = torch.randn(num_tokens, dim_full, dtype=torch.bfloat16, generator=g) * 0.1
+    score_in = (
+        torch.randn(num_tokens, dim_full, dtype=torch.bfloat16, generator=g) * 0.5
+    )
+    kv_state = torch.randn(num_slots, state_size, dim_full, generator=g) * 0.1
+    score_state = torch.randn(num_slots, state_size, dim_full, generator=g) * 0.5
+    if kind == "csa":
+        kv_state[int(state_slot_mapping[0]), 0] = float("nan")
+    else:
+        kv_in[0] = float("nan")
+
+    plan = torch.full((len(rows) + SENTINEL_PAD, 4), -1, dtype=torch.int32)
+    plan[: len(rows)] = torch.tensor(rows, dtype=torch.int32)
+    cos_cache, sin_cache = _hca_cos_sin(384, RD)
+    inp = {
+        "kv_in": kv_in,
+        "score_in": score_in,
+        "kv_state": kv_state,
+        "score_state": score_state,
+        "state_slot_mapping": state_slot_mapping,
+        "plan_gpu": plan,
+        "ape": torch.randn(ratio, dim_full, generator=g) * 0.1,
+        "rms_weight": torch.rand(D, generator=g) * 0.5 + 0.5,
+        "rms_eps": RMS_EPS,
+        "cos_cache": cos_cache,
+        "sin_cache": sin_cache,
+        "kv_cache": torch.zeros(2, K_PER_BLOCK, D, dtype=torch.bfloat16),
+        "block_tables": torch.tensor([[0], [1]], dtype=torch.int32),
+        "k_per_block": K_PER_BLOCK,
+        "ratio": ratio,
+        "head_dim": D,
+        "rope_head_dim": RD,
+    }
+    return inp, overlap
+
+
+@benchmark()
+def test_flydsl_compress_attn_masked_nan(kind, k_split_num_waves=None):
+    """A masked K row must add 0 to the pool, also when its value is NaN.
+
+    The kernels mask CSA padding rows and gfx1250 HCA rows that Phase 1 already
+    consumed with a -inf score (weight 0), and 0 * NaN is NaN. The output must
+    be finite and match the torch reference, which reads zeros for padding and
+    only the boundary's own rows. ``kind`` is "csa" (single-wave kernel with
+    ``k_split_num_waves=1``, K-split with 4) or "hca" (2-kernel path, auto config).
+    """
+    inp, overlap = _build_masked_nan_inputs(kind)
+    ref_cache = inp["kv_cache"].clone()
+    if kind == "csa":
+        flydsl_fused_compress_attn(
+            **inp,
+            overlap=overlap,
+            quant=False,
+            quant_mode="none",
+            cache_scale=None,
+            use_ue8m0=False,
+            preshuffle=False,
+            k_split_num_waves=k_split_num_waves,
+        )
+    else:
+        flydsl_hca_compress_attn(**inp)
+    fused_compress_attn_reference(
+        **{**inp, "kv_cache": ref_cache},
+        overlap=overlap,
+        quant=False,
+        quant_mode="none",
+        cache_scale=None,
+        use_ue8m0=False,
+        preshuffle=False,
+    )
+
+    msg = f"{kind}/masked_nan nw={k_split_num_waves}"
+    out = inp["kv_cache"].to(dtypes.fp32)
+    ref = ref_cache.to(dtypes.fp32)
+    assert torch.isfinite(ref).all(), f"{msg}: reference is not finite"
+    assert torch.isfinite(out).all(), f"{msg}: a masked NaN reached the output"
+    err = checkAllclose(
+        out, ref, rtol=1e-2, atol=2e-2, tol_err_ratio=0.02, msg=f"{msg} kv_cache(bf16)"
+    )
+    assert err <= 0.02, f"{msg}: {err:.1%} of kv_cache elements differ from reference"
+    return {"gfx": get_gfx(), "err_pct": err}
+
+
 def main():
     # The wrappers dispatch wave64/wave32 by arch; skip cleanly on anything
     # outside the validated set.
@@ -1019,6 +1134,16 @@ def main():
         then validates the K-split scatter vs the torch ref + forced-legacy. These
         small bs keep plan_capacity in the K-split regime. Empty to skip.""",
     )
+    parser.add_argument(
+        "--masked-nan",
+        type=str,
+        nargs="*",
+        default=["csa", "hca"],
+        choices=["csa", "hca"],
+        help="""Kinds for the masked-NaN regression check: NaN in each K row the
+        kernel masks (CSA padding, HCA rows consumed by Phase 1) must not reach
+        the output. Empty to skip.""",
+    )
 
     args = parser.parse_args()
 
@@ -1082,6 +1207,16 @@ def main():
             "flydsl_opus_cache_permutation",
             [test_flydsl_opus_cache_permutation(waves) for waves in (1, 4)],
         )
+
+    # --- Table 5: masked-NaN regression (CSA single-wave + K-split, HCA) ---
+    summarize(
+        "flydsl_compress_attn_masked_nan",
+        [
+            test_flydsl_compress_attn_masked_nan(kind, nw)
+            for kind in args.masked_nan
+            for nw in MASKED_NAN_NW[kind]
+        ],
+    )
 
 
 if __name__ == "__main__":

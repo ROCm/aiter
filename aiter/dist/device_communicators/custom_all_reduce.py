@@ -259,6 +259,15 @@ _AR_RESIDUAL_MAX_BYTES = {
 }
 
 
+# On the gfx9 archs in _LAMPORT_GFX, all_reduce takes the lamport one-shot /
+# two-shot kernels for the sizes in CustomAllreduce::lamportKernel unless this
+# is set; every rank must match. Read only there: gfx1250 has no lamport path
+# and ignores it.
+_DISABLE_LAMPORT_ENV = "AITER_CUSTOM_AR_DISABLE_LAMPORT"
+# Archs the lamport kernels run on (wave64, uncached inboxes + nontemporal ops).
+_LAMPORT_GFX = ("gfx942", "gfx950")
+
+
 @functools.cache
 def _runtime_gfx() -> str | None:
     """The live GPU arch, or None if unknown (never fused)."""
@@ -1214,6 +1223,8 @@ class CustomAllreduce:
         """
         self._IS_CAPTURING = False
         self.disabled = True
+        # Whether all_reduce may take the lamport kernels (_initLamport).
+        self.lamport_enabled = False
         self._register_for_capturing = False
         self._register_for_capturing_init = False
         self._register_for_capturing_requested = False
@@ -1880,6 +1891,58 @@ class CustomAllreduce:
             self._pool["input"].data_ptr,
             [h.data_ptr() for h in handles],
             offsets,
+        )
+        if not self._is_gfx1250:
+            self._initLamport(world_size)
+
+    def _initLamport(self, world_size: int):
+        """Set up the lamport one-shot / two-shot path of all_reduce.
+
+        On by default on the gfx9 archs in _LAMPORT_GFX with 2, 4 or 8 ranks;
+        AITER_CUSTOM_AR_DISABLE_LAMPORT=1 keeps the original dispatch there.
+        gfx1250 never gets here and never reads the env var. The size ranges
+        it covers (one-shot, then two-shot up to 2MB at TP2, 1MB at TP4 / TP8) are
+        CustomAllreduce::lamportKernel in custom_all_reduce.cuh. The buffer is
+        ops.lamportBufferSize, 16-27MB of uncached IPC memory per rank.
+        Every rank must agree: a rank that took the lamport kernel while a peer
+        did not would hang both, so the verdict is AND-ed over the group.
+        """
+        # arch first, so the env var is only read on a lamport arch
+        wanted = (
+            _runtime_gfx() in _LAMPORT_GFX
+            and world_size in (2, 4, 8)
+            and not env_flag(_DISABLE_LAMPORT_ENV)
+        )
+        if not self._all_reduce_and(wanted):
+            if wanted:
+                logger.warning(
+                    "Custom allreduce lamport path is off: another rank has it "
+                    "disabled (%s, arch or world size).",
+                    _DISABLE_LAMPORT_ENV,
+                )
+            return
+        # Uncached for the same reason as the meta buffer; >= 2 MB (coarse
+        # grained) so the IPC handle always exports, see the comment above.
+        _COARSE_GRAIN = 2 * 1024 * 1024
+        size = ops.lamportBufferSize(world_size)
+        size = (size + _COARSE_GRAIN - 1) // _COARSE_GRAIN * _COARSE_GRAIN
+        self._pool.create("lamport", size, uncached=True)
+        handles, offsets = self._pool.get_ipc_meta("lamport")
+        ops.initLamport(
+            self._ptr,
+            self._pool["lamport"].data_ptr,
+            [h.data_ptr() for h in handles],
+            offsets,
+        )
+        # initLamport fills this rank's inboxes with the sentinel; every rank
+        # must be done before any rank sends its first round.
+        torch.cuda.synchronize(self.device)
+        dist.barrier(group=self.group)
+        self.lamport_enabled = True
+        logger.info(
+            "Custom allreduce lamport path on (%d MiB buffer); set %s=1 to disable",
+            size >> 20,
+            _DISABLE_LAMPORT_ENV,
         )
 
     @property
@@ -3192,6 +3255,7 @@ class CustomAllreduce:
         use_1stage: bool = False,
         emit_bf16: bool = False,
         gemma_norm: bool = False,
+        hadamard_rotate: bool = False,
     ):
         self._require_old_arch_fused_kernels("fused_ar_rms_mxfp4_quant")
         K = inp.shape[-1]
@@ -3224,6 +3288,7 @@ class CustomAllreduce:
             use_1stage,
             bf16_ptr,
             gemma_norm,
+            hadamard_rotate,
         )
         if emit_bf16:
             return out, res_out, scale_out, bf16_out
@@ -3307,6 +3372,7 @@ class CustomAllreduce:
         use_1stage: bool = False,
         emit_bf16: bool = False,
         gemma_norm: bool = False,
+        hadamard_rotate: bool = False,
     ):
         if self.disabled or not self.should_custom_ar(input):
             return None
@@ -3321,6 +3387,7 @@ class CustomAllreduce:
                     use_1stage=use_1stage,
                     emit_bf16=emit_bf16,
                     gemma_norm=gemma_norm,
+                    hadamard_rotate=hadamard_rotate,
                 )
             else:
                 K = input.shape[-1]
@@ -3349,6 +3416,7 @@ class CustomAllreduce:
             use_1stage=use_1stage,
             emit_bf16=emit_bf16,
             gemma_norm=gemma_norm,
+            hadamard_rotate=hadamard_rotate,
         )
 
     def close(self):

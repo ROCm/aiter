@@ -478,6 +478,9 @@ def _build_kernel(
                 sc_pad_lane = []
                 for i in range_constexpr(VEC):
                     sc_pad_lane.append(arith.select(is_pad, c_neg_inf, sc_v_lane[i]))
+                # A padding row reads ring 0 of whatever the slot last held, and its
+                # zero weight does not cancel a NaN there (0 * NaN = NaN): zero the kv too.
+                kv_v_lane = [arith.select(is_pad, c_zero_f32, v) for v in kv_v_lane]
 
                 new_m, new_kv, new_w = _online_softmax_update(
                     m_lane, kv_lane, w_lane, sc_pad_lane, kv_v_lane
@@ -1500,7 +1503,10 @@ def _build_kernel_ksplit(
                 kv_v = _load_f32_vec(kv_state_rsrc, base_kv, VEC)
                 sc_v = _load_f32_vec(score_state_rsrc, base_sc, VEC)
                 sc_pad = [arith.select(is_pad, c_neg_inf, sc_v[i]) for i in range(VEC)]
-                return kv_v, sc_pad
+                # A padding row reads ring 0 of whatever the slot last held, and its
+                # zero weight does not cancel a NaN there (0 * NaN = NaN): zero the kv too.
+                kv_pad = [arith.select(is_pad, c_zero_f32, v) for v in kv_v]
+                return kv_pad, sc_pad
 
             def _phase2_loads(k_i32):
                 col_off_fx = fx.Int32(_col_off_for_k(k_i32))
