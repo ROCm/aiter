@@ -1071,3 +1071,91 @@ def test_the_environment_can_still_stop_an_enabled_provider(monkeypatch):
     plugin.reload_config()
 
     assert add(2, 3) == 5, "the kill switch outranks the framework default"
+
+
+def _route_fill(version: int, supersedes: dict[int, str] | None = None):
+    """An op whose v2 contract is functional and whose v1 contract wrote out.
+
+    This is the shape ``rmsnorm`` took when its mount point moved: v1 filled a
+    caller-supplied buffer and returned nothing, v2 allocates and returns. Both
+    contracts take a mutable sequence first, which is what makes confusing them
+    silent -- as it is for the real op, where both are tensors.
+    """
+
+    extra = {"supersedes": supersedes} if supersedes else {}
+
+    @plugin.route(op="demo.fill", version=version, **extra)
+    def fill(values: list[int], scale: int = 1) -> list[int]:
+        return [value * scale for value in values]
+
+    return fill
+
+
+def _writes_into_its_first_argument(name: str) -> _Provider:
+    """A kernel written for the v1 write-out contract: first argument is the output."""
+
+    def run(out, values, **kwargs):
+        out[:] = [-1] * len(out)  # whatever it computes, it writes it here
+
+    provider = _Provider(name)
+    provider.op_versions = {"demo.fill": {1}}
+    provider.selected = plugin.KernelCandidate(
+        provider=name, kernel_id="writes-out", artifact_digest="sha256:0", run=run
+    )
+    return provider
+
+
+def test_a_kernel_built_for_the_superseded_write_out_shape_is_never_asked(monkeypatch):
+    """The risk ``rmsnorm``'s v1 -> v2 bump exists to prevent, as a test.
+
+    A kernel written against the write-out contract treats its first argument
+    as the output buffer. Handed a functional call it would write the caller's
+    input instead, and silently: the argument counts line up, both arguments
+    are the same kind of object, and the signature check -- which only asks
+    whether the call binds -- passes. Only the version number separates them,
+    and only because v1 was deliberately left out of ``supersedes``.
+    """
+
+    provider = _writes_into_its_first_argument("legacy")
+    monkeypatch.setattr(
+        plugin, "_entry_points", lambda: (_EntryPoint("legacy", provider),)
+    )
+    plugin.configure(enable=("legacy",), source="test")
+    fill = _route_fill(version=2)
+    caller_input = [3, 4]
+
+    assert fill(caller_input, 2) == [6, 8], "the native functional contract served it"
+    assert caller_input == [3, 4], "the caller's input is untouched"
+    assert provider.select_calls == 0, "a v1 kernel must not be offered a v2 call"
+    assert plugin.last_decision().reason == "provider-op-unsupported"
+
+
+def test_accepting_the_superseded_version_is_what_would_let_it_corrupt(monkeypatch):
+    """The counterfactual, so the protection is visibly the omission.
+
+    Nothing about the provider changes here. Adding v1 to ``supersedes`` is the
+    whole difference, and it is enough to let a v1 kernel write the caller's
+    input. That is why the real bump left it out, and why this test asserts the
+    damage rather than describing it.
+    """
+
+    warnings = []
+    monkeypatch.setattr(
+        plugin.logger, "warning", lambda fmt, *rest: warnings.append(fmt % rest)
+    )
+    provider = _writes_into_its_first_argument("legacy")
+    monkeypatch.setattr(
+        plugin, "_entry_points", lambda: (_EntryPoint("legacy", provider),)
+    )
+    plugin.configure(enable=("legacy",), source="test")
+    fill = _route_fill(version=2, supersedes={1: "a later aiter release"})
+    caller_input = [3, 4]
+
+    fill(caller_input, 2)
+
+    assert provider.select_calls == 1
+    assert plugin.last_decision().provider == "legacy"
+    assert caller_input == [-1, -1], "the v1 kernel wrote the caller's input"
+    assert (
+        len(warnings) == 1 and "a later aiter release" in warnings[0]
+    ), "accepting a superseded version must say so, naming its removal"

@@ -142,11 +142,23 @@ def routed_contracts(root: Path) -> dict[str, dict[str, object]]:
                     else 1
                 )
                 signature = _signature(node)
+                # Which older versions this contract still accepts is part of
+                # the contract: it decides whether a Provider built for an
+                # earlier shape is offered this call at all. Leaving one out is
+                # a deliberate act -- rmsnorm v1 was left out because a v1
+                # kernel handed a v2 call writes the caller's input -- so
+                # adding one back has to be visible here.
+                supersedes = (
+                    sorted(ast.literal_eval(keywords["supersedes"]))
+                    if "supersedes" in keywords
+                    else []
+                )
                 found[op] = {
                     "version": version,
                     "signature": signature,
                     "fingerprint": hashlib.sha256(signature.encode()).hexdigest()[:16],
                     "source": str(path.relative_to(root)),
+                    "supersedes": supersedes,
                 }
     return found
 
@@ -161,6 +173,13 @@ def test_routed_contracts_match_the_committed_baseline():
             f"{op} is routed at {entry['source']} but is not in "
             f"{_BASELINE.name}. Add it: a routed signature is a contract, and "
             f"the baseline is where it is recorded."
+        )
+        assert recorded.get("supersedes", []) == entry["supersedes"], (
+            f"The versions {op} still accepts changed, from "
+            f"{recorded.get('supersedes', [])} to {entry['supersedes']}. That "
+            f"decides whether a Provider built for an older shape is offered "
+            f"this call, so it is a contract change: record it in "
+            f"{_BASELINE.name} in the same change."
         )
         if recorded["fingerprint"] == entry["fingerprint"]:
             assert recorded["version"] == entry["version"], (
@@ -269,3 +288,31 @@ def test_a_route_without_an_explicit_version_is_still_seen(tmp_path):
 
     assert set(found) == {"demo.plain"}
     assert found["demo.plain"]["version"] == 1
+
+
+SUPERSEDING = """
+from aiter.plugin import route
+
+@route(op="demo.bumped", version=2, supersedes={1: "a later aiter release"})
+def bumped(a, b=2): ...
+"""
+
+
+def test_the_versions_a_contract_still_accepts_are_part_of_the_baseline(tmp_path):
+    """Adding a version back to supersedes= must not be a silent change.
+
+    It decides whether a Provider built for the older shape is offered the call
+    at all. rmsnorm's v1 was left out of supersedes= on purpose, because a v1
+    kernel handed a v2 call treats the caller's input as its output buffer; a
+    later edit putting it back would undo that with no signature change to show
+    for it, so the fingerprint alone would never notice.
+    """
+
+    (tmp_path / "aiter").mkdir()
+
+    plain = routed_contracts_for(tmp_path, UNVERSIONED)["demo.plain"]
+    assert plain["supersedes"] == [], "a route with no supersedes= accepts only its own"
+
+    bumped = routed_contracts_for(tmp_path, SUPERSEDING)["demo.bumped"]
+    assert bumped["supersedes"] == [1]
+    assert bumped["version"] == 2
