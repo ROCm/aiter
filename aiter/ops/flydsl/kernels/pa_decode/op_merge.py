@@ -299,12 +299,14 @@ class Gfx1250ClusterMerge:
         load_rows = [
             split_row + fx.min(row_id, fx.Int32(t.rows - 1)) for row_id in row_ids
         ]
-        # Partitions past the count reread the last one with zero weight.
-        slots = [
-            fx.Int64(first_slot + fx.min(fx.Int32(p), count - 1))
+        lane_elem = lane * elems
+        # Partitions past the count reread the last one with zero weight. Each
+        # partition's offset from the first joins the lane's in one 32-bit
+        # VGPR offset, so the loads share one SGPR base and issue back to back.
+        parts = [
+            fx.min(fx.Int32(p), count - 1) * (rows * t.head_dim) + lane_elem
             for p in range_constexpr(t.cluster_merge)
         ]
-        lane_elem = lane * elems
         # Contiguous scratch can start at an offset, and final output heads
         # can have odd strides. Both buffers guarantee only element alignment.
         vector = fx.PointerType.get(
@@ -312,21 +314,18 @@ class Gfx1250ClusterMerge:
         )
 
         def load_values(i):
+            row = fx.add_offset(
+                pout,
+                (fx.Int64(first_slot) * rows + fx.Int64(load_rows[i])) * t.head_dim,
+            )
             return [
                 fx.Vector(
                     fx.ptr_load(
-                        fx.recast_iter(
-                            vector,
-                            fx.add_offset(
-                                pout,
-                                (slot * rows + fx.Int64(load_rows[i])) * t.head_dim
-                                + fx.Int64(lane_elem),
-                            ),
-                        ),
+                        fx.recast_iter(vector, fx.add_offset(row, part)),
                         result_type=fx.Vector.make_type(elems, t.q_dtype),
                     )
                 )
-                for slot in slots
+                for part in parts
             ]
 
         # Issue the first rows' partials with the statistics, so one L2 round
