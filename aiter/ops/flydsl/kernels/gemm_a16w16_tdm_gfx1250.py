@@ -98,7 +98,7 @@ def validate_gemm_gfx1250_config(
         mma_n,
         mma_k,
     )
-    if any((type(v) is not int or v <= 0 for v in values)):
+    if any(type(v) is not int or v <= 0 for v in values):
         raise ValueError(
             "dimensions, tiles, stages, wave counts and WMMA sizes must be positive integers"
         )
@@ -602,9 +602,8 @@ def build_gemm_gfx1250(
                         fragments[index] = fragment
 
                 loads = {
-                    index * frag_loads + part: lambda index=index, part=part: load_part(
-                        index, part
-                    )
+                    index * frag_loads
+                    + part: lambda index=index, part=part: load_part(index, part)
                     for index in range(count)
                     for part in range(frag_loads)
                 }

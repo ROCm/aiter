@@ -2,16 +2,14 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Torch launch wrapper for the gfx1250 BF16/FP16 TDM GEMM."""
 
-from typing import Optional
-
 import torch
 
 
 def gemm_a16w16_tdm(
     a: torch.Tensor,
     b: torch.Tensor,
-    out: Optional[torch.Tensor] = None,
-    bias: Optional[torch.Tensor] = None,
+    out: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
     *,
     block_m: int = 256,
     block_n: int = 256,
@@ -24,7 +22,7 @@ def gemm_a16w16_tdm(
     mma_n: int = 16,
     mma_k: int = 32,
     split_k: int = 1,
-    stream: Optional[torch.cuda.Stream] = None,
+    stream: torch.cuda.Stream | None = None,
     layout: str = "nt",
     interleave: bool = False,
     split_k_atomic: bool = False,
@@ -53,7 +51,9 @@ def gemm_a16w16_tdm(
     ``"workspace"`` selects the default, ``"atomic"`` selects BF16 atomics.
     """
     import flydsl.expr as fx
+
     from aiter.jit.utils.chip_info import get_gfx_runtime
+
     from .kernels.gemm_a16w16_tdm_gfx1250 import (
         GEMM_DTYPE_BF16,
         GEMM_DTYPE_FP16,

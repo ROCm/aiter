@@ -569,9 +569,9 @@ class GemmA16W16Tuner(GemmCommonTuner):
         return results
 
     def get_untuned_gemm_list(self, untuned_gemm_file):
-        assert os.path.exists(untuned_gemm_file), (
-            f"Not exist untuned file: {untuned_gemm_file}"
-        )
+        assert os.path.exists(
+            untuned_gemm_file
+        ), f"Not exist untuned file: {untuned_gemm_file}"
         untunedf = pd.read_csv(untuned_gemm_file).fillna("")
         return untunedf.drop_duplicates().reset_index(drop=True)
 

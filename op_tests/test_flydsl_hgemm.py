@@ -37,7 +37,6 @@ from aiter.test_common import (
     run_perftest,
 )
 
-
 # The public wrapper selects the architecture; unsupported cards skip in main.
 SUPPORTED_GFX = ["gfx950", "gfx1250"]
 SEED = 0
@@ -500,9 +499,9 @@ def test_hgemm_memory(
         ret[f"{name} TFLOPS"] = flops / us / 1e6
         ret[f"{name} TB/s"] = nbytes / us / 1e6
         ret[f"{name} err"] = err
-    assert torch.all(guard[:16] == 8192) and torch.all(guard[-16:] == 8192), (
-        "output guard overwritten"
-    )
+    assert torch.all(guard[:16] == 8192) and torch.all(
+        guard[-16:] == 8192
+    ), "output guard overwritten"
 
     # Exact binary fractions expose missing/repeated K tiles without depending
     # on a relaxed BF16 split-K tolerance. Check repeated dirty-output launches.
@@ -659,9 +658,9 @@ def test_hgemm_band(m, n, k, dtype):
             printLog=False,
         )
         assert err == 0, f"band graph mismatch {err}"
-    assert torch.all(guard[:16] == 8192) and torch.all(guard[-16:] == 8192), (
-        "band output overrun"
-    )
+    assert torch.all(guard[:16] == 8192) and torch.all(
+        guard[-16:] == 8192
+    ), "band output overrun"
     return ret
 
 
@@ -804,17 +803,17 @@ def _tdm_config(m, n, k, split_k, stages):
     if k % (block_k * split_k) or k // split_k < (stages - 1) * block_k:
         return None
     tile = 256 if min(m, n, k) >= 4096 else 128
-    return dict(
-        block_m=tile,
-        block_n=tile,
-        block_k=block_k,
-        stages=stages,
-        m_waves=2,
-        n_waves=2,
-        k_waves=1,
-        group_m=0,
-        split_k=split_k,
-    )
+    return {
+        "block_m": tile,
+        "block_n": tile,
+        "block_k": block_k,
+        "stages": stages,
+        "m_waves": 2,
+        "n_waves": 2,
+        "k_waves": 1,
+        "group_m": 0,
+        "split_k": split_k,
+    }
 
 
 def _guarded_matrix(rows, cols, dtype):
@@ -1018,20 +1017,21 @@ def test_hgemm_tdm(m, n, k, dtype, has_bias, layout, split_k, stages):
 @benchmark()
 def test_hgemm_tdm_tuned(m, n, k, dtype, has_bias):
     from unittest import mock
+
     import aiter.tuned_gemm as tuned
     from aiter.jit.utils.chip_info import get_cu_num
 
-    config = dict(
-        block_m=128,
-        block_n=128,
-        block_k=128,
-        stages=2,
-        split_k=3,
-        m_waves=2,
-        n_waves=2,
-        k_waves=1,
-        group_m=0,
-    )
+    config = {
+        "block_m": 128,
+        "block_n": 128,
+        "block_k": 128,
+        "stages": 2,
+        "split_k": 3,
+        "m_waves": 2,
+        "n_waves": 2,
+        "k_waves": 1,
+        "group_m": 0,
+    }
     a = torch.zeros(m, k, device="cuda", dtype=dtype)
     weight = torch.zeros(n, k, device="cuda", dtype=dtype)
     row = ((torch.arange(m, device="cuda") % 3) - 1).to(dtype)
@@ -1071,7 +1071,9 @@ def test_hgemm_tdm_tuned(m, n, k, dtype, has_bias):
             target_gfx=get_gfx_runtime(),
             config={**config, "policy": policy},
         )
-        table = {key: dict(libtype="flydsl", solidx=0, splitK=3, kernelName=name)}
+        table = {
+            key: {"libtype": "flydsl", "solidx": 0, "splitK": 3, "kernelName": name}
+        }
         out = outputs[policy]
 
         def launch(out=out):
@@ -1121,9 +1123,15 @@ def check_tdm_contracts(dtype):
     a = torch.zeros(128, 768, device="cuda", dtype=dtype)
     w = torch.zeros(128, 768, device="cuda", dtype=dtype)
     out = torch.empty(128, 128, device="cuda", dtype=dtype)
-    cfg = dict(
-        block_m=128, block_n=128, block_k=128, stages=2, m_waves=2, n_waves=2, split_k=3
-    )
+    cfg = {
+        "block_m": 128,
+        "block_n": 128,
+        "block_k": 128,
+        "stages": 2,
+        "m_waves": 2,
+        "n_waves": 2,
+        "split_k": 3,
+    }
     calls = {
         "host input": lambda: gemm(a.cpu(), w.t(), out, **cfg),
         "overlap": lambda: gemm(a, w.t(), a[:, :128], **cfg),
@@ -1248,14 +1256,16 @@ def main():
         "--mnk",
         type=dtypes.str2tuple,
         nargs="*",
-        default=_TDM_MNK
-        if get_gfx_runtime() == "gfx1250"
-        else (
-            _default_mnk()
-            + _CONCURRENT_COPY_MNK
-            + [row[:3] for row in _MEMORY_TILES]
-            + _TUNED_MEMORY_MNK
-            + _BAND_MNK
+        default=(
+            _TDM_MNK
+            if get_gfx_runtime() == "gfx1250"
+            else (
+                _default_mnk()
+                + _CONCURRENT_COPY_MNK
+                + [row[:3] for row in _MEMORY_TILES]
+                + _TUNED_MEMORY_MNK
+                + _BAND_MNK
+            )
         ),
         help="""Shape of mnk.
         e.g.:   -s 128,4096,4096

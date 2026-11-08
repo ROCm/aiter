@@ -128,27 +128,27 @@ class TestTdmPolicyContract(unittest.TestCase):
             get_flydsl_hgemm_kernel_params,
         )
 
-        config = dict(
-            block_m=128,
-            block_n=128,
-            block_k=128,
-            stages=2,
-            split_k=3,
-            m_waves=2,
-            n_waves=2,
-            k_waves=1,
-            group_m=0,
-        )
+        config = {
+            "block_m": 128,
+            "block_n": 128,
+            "block_k": 128,
+            "stages": 2,
+            "split_k": 3,
+            "m_waves": 2,
+            "n_waves": 2,
+            "k_waves": 1,
+            "group_m": 0,
+        }
         names = []
         for dtype in (torch.bfloat16, torch.float16):
             for policy in ("tdm", "tdmi", "tdma", "tdmia"):
-                kwargs = dict(
-                    dtype=dtype,
-                    out_dtype=dtype,
-                    config=dict(config, policy=policy),
-                    has_bias=True,
-                    target_gfx="gfx1250",
-                )
+                kwargs = {
+                    "dtype": dtype,
+                    "out_dtype": dtype,
+                    "config": dict(config, policy=policy),
+                    "has_bias": True,
+                    "target_gfx": "gfx1250",
+                }
                 if dtype == torch.float16 and policy in ("tdma", "tdmia"):
                     with self.assertRaises(ValueError):
                         flydsl_hgemm_kernel_name(**kwargs)
@@ -173,6 +173,7 @@ class TestTdmPolicyContract(unittest.TestCase):
 
     def test_examples_large_policy_and_both_reductions(self):
         from types import SimpleNamespace
+
         from aiter.ops.flydsl import gemm_a16w16_policy as policy
 
         props = SimpleNamespace(
@@ -218,9 +219,11 @@ class TestTdmPolicyContract(unittest.TestCase):
                 for key, flags in paired.items():
                     self.assertEqual(
                         flags,
-                        {False, True}
-                        if dtype == torch.bfloat16 and dict(key)["split_k"] > 1
-                        else {False},
+                        (
+                            {False, True}
+                            if dtype == torch.bfloat16 and dict(key)["split_k"] > 1
+                            else {False}
+                        ),
                     )
             configs = policy._gfx1250_tdm_configs(128, 128, 768, torch.bfloat16)
             self.assertTrue(any(c["interleave"] for c in configs))

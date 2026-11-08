@@ -312,8 +312,9 @@ def _gfx1250_tdm_configs(m, n, k, dtype, layout="nt"):
                 split_k_atomic=config["split_k_atomic"],
             )
             valid_configs.append(config)
-        except Exception:
-            pass
+        except ValueError:
+            # Invalid tile/partition combinations are expected during enumeration.
+            continue
     for config in valid_configs:
         config.pop("mma_m")
         config.pop("mma_n")
@@ -321,11 +322,11 @@ def _gfx1250_tdm_configs(m, n, k, dtype, layout="nt"):
         config["policy"] = (
             "tdmia"
             if config["interleave"] and config["split_k_atomic"]
-            else "tdmi"
-            if config["interleave"]
-            else "tdma"
-            if config["split_k_atomic"]
-            else "tdm"
+            else (
+                "tdmi"
+                if config["interleave"]
+                else "tdma" if config["split_k_atomic"] else "tdm"
+            )
         )
         config["use_half_tile_interleaved"] = False
     return valid_configs
