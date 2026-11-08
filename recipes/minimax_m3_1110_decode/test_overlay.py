@@ -13,10 +13,11 @@ mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mod)
 
 
-def sample():
+def sample(token=16):
+    key, expected, _ = mod.profile(token)
     row = dict(
-        mod.KEY,
-        **mod.EXPECTED,
+        key,
+        **expected,
         us="31.2030",
         kernelName1="grouped_gemm1_fp4_gugu",
         kernelName2="grouped_gemm2_fp4",
@@ -74,3 +75,74 @@ def test_changed_source_rejected(monkeypatch, tmp_path):
         p.write_text("changed")
     with pytest.raises(ValueError, match="source mismatch"):
         mod.check_source(tmp_path)
+
+
+@pytest.mark.parametrize("token", [16, 32])
+def test_bucket_and_duplicate_guards(token):
+    before = list(csv.DictReader(io.StringIO(sample(token))))
+    text = mod.make_overlay(sample(token), token)
+    after = list(csv.DictReader(io.StringIO(text)))
+    assert after[:-1] == before
+    assert after[-1] == dict(before[0], **mod.profile(token)[2])
+    with pytest.raises(ValueError, match="expected one"):
+        mod.make_overlay(text, token)
+
+
+@pytest.mark.parametrize("field", list(mod.M32_EXPECTED))
+def test_m32_changed_baseline_rejected(field):
+    row = next(csv.DictReader(io.StringIO(sample(32))))
+    row[field] = "not-validated"
+    f = io.StringIO()
+    wr = csv.DictWriter(f, fieldnames=list(row))
+    wr.writeheader()
+    wr.writerow(row)
+    with pytest.raises(ValueError, match="unmeasured"):
+        mod.make_overlay(f.getvalue(), 32)
+
+
+def test_composes_without_changing_other_rows():
+    text = sample() + sample(32).split("\n", 1)[1]
+    before = list(csv.DictReader(io.StringIO(text)))
+    combined = mod.make_overlay(mod.make_overlay(text), 32)
+    after = list(csv.DictReader(io.StringIO(combined)))
+    assert after[:2] == before
+    assert after[2] == dict(before[0], **mod.UPDATE)
+    assert after[3] == dict(before[1], **mod.M32_UPDATE)
+    reverse = mod.make_overlay(mod.make_overlay(text, 32))
+    rev = list(csv.DictReader(io.StringIO(reverse)))
+    assert rev[:2] == before
+    assert rev[2:] == list(reversed(after[2:]))
+
+
+def test_unmeasured_bucket_rejected():
+    with pytest.raises(ValueError, match="unmeasured token"):
+        mod.make_overlay(sample(), 64)
+
+
+@pytest.mark.parametrize("token", [16, 32])
+def test_cli_creates_output_without_modifying_baseline(monkeypatch, tmp_path, token):
+    baseline = tmp_path / "base.csv"
+    out = tmp_path / "out.csv"
+    text = sample(token)
+    baseline.write_text(text)
+    monkeypatch.setattr(mod, "check_source", lambda root: None)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "make_overlay.py",
+            "--aiter-root",
+            str(tmp_path),
+            "--baseline",
+            str(baseline),
+            "--output",
+            str(out),
+            "--token",
+            str(token),
+        ],
+    )
+    mod.main()
+    assert baseline.read_bytes() == text.encode()
+    assert out.read_bytes() == mod.make_overlay(text, token).encode()
+    with pytest.raises(FileExistsError):
+        mod.main()
+    assert out.read_bytes() == mod.make_overlay(text, token).encode()

@@ -9,15 +9,17 @@ import os
 from pathlib import Path
 
 import torch
-from make_overlay import UPDATE, check_source, make_overlay
+from make_overlay import check_source, make_overlay, profile
 
 ap = argparse.ArgumentParser(description=__doc__)
 ap.add_argument("--aiter-root", type=Path, required=True)
 ap.add_argument("--baseline", type=Path, required=True)
 ap.add_argument("--output", type=Path, required=True)
+ap.add_argument("--token", type=int, choices=(16, 32), default=16)
 args = ap.parse_args()
+_, _, update = profile(args.token)
 check_source(args.aiter_root)
-make_overlay(args.baseline.read_text())
+make_overlay(args.baseline.read_text(), args.token)
 os.environ["AITER_CONFIG_GROUPED_FMOE"] = str(args.baseline)
 os.environ["AITER_LOG_LEVEL"] = "WARNING"
 
@@ -37,7 +39,7 @@ helper = module(
     "inputs", args.aiter_root / "op_tests/test_moe_prefill_route_in_quant.py"
 )
 route = module("routes", args.aiter_root / "op_tests/test_moe_tp_route_quant_fused.py")
-fixed, kw = helper._moe_args(16)
+fixed, kw = helper._moe_args(args.token)
 original = gm._find_grouped_config
 override = {}
 
@@ -47,7 +49,7 @@ def getcfg(**k):
 
 
 gm._find_grouped_config = getcfg
-configs = [UPDATE]
+configs = [update]
 rows = []
 for seed in (401, 402):
     torch.manual_seed(seed)
@@ -56,14 +58,19 @@ for seed in (401, 402):
     for exp in (116, 119, 122, 125):
         for key in ("w1_scale", "w2_scale"):
             kw[key].view(torch.uint8).random_(exp - 1, exp + 2)
-        for m, amp in ((9, 0.125), (12, 0.5), (16, 1.0), (16, 4.0)):
+        for m, amp in (
+            (args.token // 2 + 1, 0.125),
+            (args.token * 3 // 4, 0.5),
+            (args.token, 1.0),
+            (args.token, 4.0),
+        ):
             x = (torch.randn(m, 6144, device="cuda") * amp).bfloat16()
             ids = route.m3_routes(m, 129, seed + m)
             weight = torch.rand(m, 5, device="cuda")
             weight[:, :4] /= weight[:, :4].sum(1, keepdim=True)
             weight[:, -1] = 1
 
-            def run():
+            def run(x=x, weight=weight, ids=ids):
                 return fm.fused_moe(x, fixed[1], fixed[2], weight, ids, **kw)
 
             override = {}
@@ -74,21 +81,21 @@ for seed in (401, 402):
                 a, b = old.float(), new.float()
                 delta = a - b
                 den = (a.square() + b.square()).sum().item()
-                row = dict(
-                    seed=seed,
-                    scale_exp=exp,
-                    m=m,
-                    amp=amp,
-                    config=i,
-                    exact=torch.equal(old, new),
-                    finite=bool(torch.isfinite(new).all()),
-                    logits_diff=delta.square().sum().item() / max(den, 1e-30),
-                    maxerr=delta.abs().max().item(),
-                    out_rms=b.square().mean().sqrt().item(),
-                    mismatched=int((old != new).sum().item()),
-                    elements=old.numel(),
-                )
+                row = {
+                    "seed": seed,
+                    "scale_exp": exp,
+                    "m": m,
+                    "amp": amp,
+                    "config": i,
+                    "exact": torch.equal(old, new),
+                    "finite": bool(torch.isfinite(new).all()),
+                    "logits_diff": delta.square().sum().item() / max(den, 1e-30),
+                    "maxerr": delta.abs().max().item(),
+                    "out_rms": b.square().mean().sqrt().item(),
+                    "mismatched": int((old != new).sum().item()),
+                    "elements": old.numel(),
+                }
                 rows.append(row)
                 print(json.dumps(row), flush=True)
-assert all(r["finite"] and r["logits_diff"] < 1e-5 for r in rows)
+assert all(r["finite"] and r["exact"] for r in rows)
 args.output.write_text(json.dumps(rows, indent=2))

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""Generate a guarded TP-only M16 overlay for the MiniMax-M3 2026-11-10 image.
+"""Generate a guarded TP-only M16 or M32 overlay for the MiniMax-M3 2026-11-10 image.
 
 Pure CPU; does not import aiter or touch GPUs. Never edits the supplied baseline.
 """
@@ -74,6 +74,59 @@ UPDATE = {
 }
 
 
+M32_EXPECTED = {
+    "tile_m": "16",
+    "tile_n": "64",
+    "tile_k": "1024",
+    "m_warp": "1",
+    "n_warp": "1",
+    "num_buffers": "2",
+    "tile_m2": "16",
+    "tile_n2": "256",
+    "tile_k2": "128",
+    "m_warp2": "1",
+    "n_warp2": "2",
+    "num_buffer_stage2": "3",
+    "split_k1": "",
+    "split_k2": "",
+    "waves_per_tensor_tdm": "1",
+    "waves_per_tensor_tdm2": "",
+    "tdm_b_th": "0",
+    "a_preshuffle": "0",
+    "persistent_workers": "0",
+    "persistent_workers2": "0",
+    "cluster_m": "-1",
+    "cluster_n": "-1",
+    "cluster_m2": "",
+    "cluster_n2": "",
+    "next_stage_prefetch": "0",
+    "tdm_as_in_prologue": "0",
+    "lds_soa_load_interleave": "0",
+    "rolled_drain": "0",
+    "ep_fused": "",
+}
+M32_UPDATE = {
+    "ep_fused": "0",
+    "tile_k": "256",
+    "tile_n2": "64",
+    "n_warp2": "1",
+    "num_buffers": "3",
+    "num_buffer_stage2": "2",
+    "split_k1": "1",
+    "tdm_b_th": "1",
+    "us": "30.21",
+}
+
+
+def profile(token):
+    """Return a measured bucket; never infer settings for other shapes."""
+    if token == 16:
+        return KEY, EXPECTED, UPDATE
+    if token == 32:
+        return dict(KEY, token="32"), M32_EXPECTED, M32_UPDATE
+    raise ValueError(f"unmeasured token bucket: {token}")
+
+
 def check_source(root):
     head = subprocess.check_output(
         ["git", "-C", str(root), "rev-parse", "HEAD"], text=True
@@ -85,21 +138,22 @@ def check_source(root):
             raise ValueError(f"source mismatch: {name}; refusing unmeasured kernel")
 
 
-def make_overlay(text):
+def make_overlay(text, token=16):
+    key, expected, update = profile(token)
     reader = csv.DictReader(io.StringIO(text))
     fields = reader.fieldnames
     rows = list(reader)
-    if fields is None or not set(KEY | EXPECTED | UPDATE) <= set(fields):
+    if fields is None or not set(key | expected | update) <= set(fields):
         raise ValueError("baseline CSV lacks required fields")
-    matched = [r for r in rows if all(r[k] == v for k, v in KEY.items())]
+    matched = [r for r in rows if all(r[k] == v for k, v in key.items())]
     if len(matched) != 1:
-        raise ValueError(f"expected one M16 FP4 row, found {len(matched)}")
+        raise ValueError(f"expected one M{token} FP4 row, found {len(matched)}")
     row = matched[0]
-    for k, v in EXPECTED.items():
+    for k, v in expected.items():
         if row[k] != v:
             raise ValueError(f"unmeasured baseline field {k}: {row[k]!r} != {v!r}")
     # ep-specific TP row wins; wildcard row remains an unchanged EP fallback.
-    new = dict(row, **UPDATE)
+    new = dict(row, **update)
     output = io.StringIO()
     writer = csv.DictWriter(output, fieldnames=fields)
     writer.writeheader()
@@ -112,9 +166,10 @@ def main():
     parser.add_argument("--aiter-root", type=pathlib.Path, required=True)
     parser.add_argument("--baseline", type=pathlib.Path, required=True)
     parser.add_argument("--output", type=pathlib.Path, required=True)
+    parser.add_argument("--token", type=int, choices=(16, 32), default=16)
     args = parser.parse_args()
     check_source(args.aiter_root)
-    result = make_overlay(args.baseline.read_text())
+    result = make_overlay(args.baseline.read_text(), args.token)
     with args.output.open("x") as f:
         f.write(result)
     print(
