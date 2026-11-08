@@ -372,3 +372,85 @@ def test_one_provider_serving_two_contracts_is_recorded_separately(
 
     routed = plugin.status()["routed_ops"]
     assert routed["rmsnorm_with_add"]["eligible"] == ("refprov",)
+
+
+requires_cuda = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="graph capture needs a device"
+)
+
+
+def _capture(fn):
+    """Capture ``fn`` into a graph, after one warm-up call outside it."""
+
+    fn()  # the RFC's advice: warm the op before capturing, so first-call work
+    torch.cuda.synchronize()  # does not land inside the graph
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = fn()
+    return graph, out
+
+
+@requires_cuda
+def test_the_capture_time_decision_is_what_every_replay_runs(tmp_path, monkeypatch):
+    """Replay runs no Python, so dispatch cannot revisit a routing decision.
+
+    This is the quietest failure mode in the design: whatever was decided on
+    the capturing call is what the graph does for its whole life, and because
+    replay records no Decision, nothing afterwards says which call decided it.
+    Pinning it is the difference between a documented property and a belief.
+    """
+
+    _install_reference_provider(tmp_path, monkeypatch)
+    plugin.configure(enable=("refprov",), source="test")
+
+    weight = torch.rand(8, device="cuda")
+    value = torch.rand(2, 8, device="cuda")
+    graph, _ = _capture(lambda: aiter.rmsnorm2d_fwd(value, weight, 1e-6))
+
+    captured = plugin.last_decision()
+    assert captured.route == "provider" and captured.provider == "refprov"
+
+    before = plugin.decision_counts().copy()
+    for _ in range(3):
+        graph.replay()
+    torch.cuda.synchronize()
+
+    assert plugin.decision_counts() == before, (
+        "replay must not reach dispatch: a Decision per replay would mean "
+        "Python ran, and a graph that runs Python is not a graph"
+    )
+    assert plugin.last_decision() == captured, (
+        "the reading still describes the capturing call, which is why an "
+        "operator cannot tell replays apart from it"
+    )
+
+
+@requires_cuda
+def test_turning_a_provider_off_does_not_reach_an_already_captured_graph(
+    tmp_path, monkeypatch
+):
+    """The consequence worth stating: the kill switch does not un-bake a graph.
+
+    AITER_PLUGINS=0 stops future dispatch. It cannot touch kernels already
+    captured, because there is no dispatch left in them to stop. An operator
+    reaching for the switch during an incident needs to know the graphs have
+    to be rebuilt.
+    """
+
+    _install_reference_provider(tmp_path, monkeypatch)
+    plugin.configure(enable=("refprov",), source="test")
+
+    weight = torch.rand(8, device="cuda")
+    value = torch.rand(2, 8, device="cuda")
+    graph, out = _capture(lambda: aiter.rmsnorm2d_fwd(value, weight, 1e-6))
+    assert plugin.last_decision().provider == "refprov"
+
+    monkeypatch.setenv("AITER_PLUGINS", "0")
+    plugin.reload_config()
+    graph.replay()
+    torch.cuda.synchronize()
+
+    scale = torch.rsqrt(value.float().pow(2).mean(-1, keepdim=True) + 1e-6)
+    expect = (value.float() * scale * weight.float()).to(out.dtype)
+    torch.testing.assert_close(out, expect)
+    assert plugin.last_decision() is None, "the switch is off for anything new"
