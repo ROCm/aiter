@@ -264,6 +264,15 @@ def gemm_a16w16_streamk_(
     # that do not take the tail.
     _k_rem = K % BLOCK_K
     KTAIL = triton.cdiv(_k_rem, _WMMA_K) * _WMMA_K if _k_rem else 0
+    # A gluon slice needs a power-of-two extent, and rounding the remainder up to
+    # the wmma K step does not give one in general: K=2880 with BLOCK_K=512
+    # leaves 320, which fails to compile. Round up again to a power of two; the
+    # TDM load zero-fills past K, so the wider drain stays correct. When that
+    # reaches BLOCK_K the narrow drain saves nothing, so take the full-width path.
+    if KTAIL:
+        KTAIL = 1 << (KTAIL - 1).bit_length()
+        if KTAIL >= BLOCK_K:
+            KTAIL = 0
 
     # The masked C store indexes C by an absolute element offset, which overflows int32 past
     # 2**31 elements. Switch that store to a 64-bit base only when C can reach it: the 64-bit
