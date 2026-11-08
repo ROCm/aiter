@@ -407,27 +407,24 @@ def _build_kernel(
                     w_old = w_lane[i]
                     kv_old = kv_lane[i]
 
-                    # -inf sentinel. maximumf keeps the ambient fast_fp_math
-                    # (matches the old raw maximumf, which resolved
-                    # fastmath<fast>). The OEQ compares against -inf MUST emit
-                    # fastmath<none> -- ambient fast lets `x == -inf` fold to
-                    # false and corrupts the sentinel -- so scope only the `==`
-                    # to fastmath(None) (== the old raw cmpf, no fastmath).
+                    # Padding and the initial maximum use -inf. Preserve its
+                    # semantics through the max and exponential arguments too;
+                    # protecting only the comparisons lets fast-math corrupt
+                    # the first valid row after an all-padding prefix.
                     m_old_f = fx.Float32(m_old)
                     score_f = fx.Float32(score)
                     neg_inf_f = fx.Float32(c_neg_inf)
-                    m_new = fx.max(m_old_f, score_f).ir_value()
                     with fastmath(None):
+                        m_new = fx.max(m_old_f, score_f).ir_value()
                         is_first = m_old_f == neg_inf_f
-                    scale_active = _fexp_f32(m_old_f - m_new, c_log2e)
-                    scale_v = is_first.select(c_zero_f32, scale_active)
-                    wk_active = _fexp_f32(score_f - m_new, c_log2e)
-                    if const_expr(score_can_be_neg_inf):
-                        with fastmath(None):
+                        scale_active = _fexp_f32(m_old_f - m_new, c_log2e)
+                        scale_v = is_first.select(c_zero_f32, scale_active)
+                        wk_active = _fexp_f32(score_f - m_new, c_log2e)
+                        if const_expr(score_can_be_neg_inf):
                             is_pad_score = score_f == neg_inf_f
-                        w_k = is_pad_score.select(c_zero_f32, wk_active)
-                    else:
-                        w_k = wk_active
+                            w_k = is_pad_score.select(c_zero_f32, wk_active)
+                        else:
+                            w_k = wk_active
                     new_m.append(m_new)
                     new_kv.append(
                         _to_raw(
@@ -1495,24 +1492,20 @@ def _build_kernel_ksplit(
                 for i in range_constexpr(VEC):
                     m_old = m_lane[i]
                     score = score_lane[i]
-                    # -inf sentinel. maximumf keeps the ambient fast_fp_math
-                    # (matches the old raw maximumf, which resolved
-                    # fastmath<fast>). The OEQ compares against -inf MUST emit
-                    # fastmath<none> -- ambient fast lets `x == -inf` fold to
-                    # false and corrupts the sentinel -- so scope only the `==`
-                    # to fastmath(None) (== the old raw cmpf, no fastmath).
+                    # Keep the -inf padding/initial-state semantics in the
+                    # maximum and exponential arguments, as in the single-wave
+                    # update above. The accumulation retains fast-math.
                     m_old_f = fx.Float32(m_old)
                     score_f = fx.Float32(score)
                     neg_inf_f = fx.Float32(c_neg_inf)
-                    m_new = fx.max(m_old_f, score_f).ir_value()
                     with fastmath(None):
+                        m_new = fx.max(m_old_f, score_f).ir_value()
                         is_first = m_old_f == neg_inf_f
-                    scale_active = _fexp_f32(m_old_f - m_new, c_log2e)
-                    scale_v = is_first.select(c_zero_f32, scale_active)
-                    wk_active = _fexp_f32(score_f - m_new, c_log2e)
-                    with fastmath(None):
+                        scale_active = _fexp_f32(m_old_f - m_new, c_log2e)
+                        scale_v = is_first.select(c_zero_f32, scale_active)
+                        wk_active = _fexp_f32(score_f - m_new, c_log2e)
                         is_pad = score_f == neg_inf_f
-                    w_k = is_pad.select(c_zero_f32, wk_active)
+                        w_k = is_pad.select(c_zero_f32, wk_active)
                     new_m.append(m_new)
                     new_kv.append(
                         _to_raw(
