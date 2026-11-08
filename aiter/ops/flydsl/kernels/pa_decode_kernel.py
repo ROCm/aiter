@@ -239,27 +239,50 @@ def compile_pa_decode_tile(
         raise NotImplementedError("Non-transposed key cache is not implemented")
     architecture = (architecture or get_gfx_runtime()).split(":", 1)[0]
     if architecture in ("gfx1250", "gfx1250-strict"):
-        if query_splits is None:
-            # Split the measured spilling BF16 specialization into one Q tile
-            # per CTA. Other shapes retain fused queries and their KV reuse.
-            query_splits = (
-                4
-                if kv_dtype == "bf16"
-                and head_dim == 1024
-                and query_group_size == 16
-                and query_length == 4
-                and block_size == 128
-                and trans_v
-                and sliding_window == 0
-                else 1
-            )
-        # Capacity covers every row's upper tile bound, so each visible
-        # tile gets its own task even with empty/mixed rows.
         tile_bound = (
             max(1, -(-max_context_length // plan_tile_tokens))
             if max_context_length is not None and max_context_length > 0
             else 0
         )
+        if query_splits is None:
+            small_fp8_mtp = (
+                kv_dtype == "fp8"
+                and per_token_kv
+                and query_dtype == "bf16"
+                and head_dim == 128
+                and query_group_size == 16
+                and query_length == 4
+                and block_size == 128
+                and trans_v
+                and sliding_window == 0
+                and not direct_output
+                and not cluster_merge
+                and plan_tile_tokens == 256
+                and num_seqs <= 3
+                and max_context_length is not None
+                and 4096 < max_context_length <= 8192
+                and num_partitions >= tile_bound
+                and work_capacity >= num_seqs * tile_bound
+            )
+            # Split the measured spilling BF16 specialization into one Q tile
+            # per CTA. Small bounded FP8 MTP grids also expose one Q tile per
+            # CTA; larger grids retain the four-query tile's KV reuse.
+            query_splits = (
+                4
+                if small_fp8_mtp
+                or (
+                    kv_dtype == "bf16"
+                    and head_dim == 1024
+                    and query_group_size == 16
+                    and query_length == 4
+                    and block_size == 128
+                    and trans_v
+                    and sliding_window == 0
+                )
+                else 1
+            )
+        # Capacity covers every row's upper tile bound, so each visible
+        # tile gets its own task even with empty/mixed rows.
         task_limit_per_seq = 0
         if (
             tile_bound

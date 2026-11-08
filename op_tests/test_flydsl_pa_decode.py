@@ -1361,6 +1361,38 @@ _PIPE_BASE = {
     "pipe": True,
 }
 _PIPE_CASES = [
+    *[
+        (
+            f"fp8-short-mtp-auto-{name}",
+            {
+                "kv_dtype": "fp8",
+                "query_dtype": torch.bfloat16,
+                "scale_mode": "per-token",
+                "trans_v": True,
+                "group_size": 16,
+                "block_size": 128,
+                "query_length": 4,
+                "lengths": (8192, 1, 4353),
+                "max_partitions": 256,
+                "max_context": 8192,
+                "tile_tokens": 256,
+                "capture": True,
+                "expected_splits": splits,
+                **extra,
+            },
+        )
+        for name, extra, splits in (
+            ("split4", {"task_limit": 32}, 4),
+            ("unknown-bound", {"max_context": None, "table_width": 2048}, 1),
+            ("wide-bound", {"max_context": 32768, "table_width": 256}, 1),
+            ("scalar-scales", {"scale_mode": "per-tensor"}, 1),
+            ("bf16", {"kv_dtype": "bf16", "scale_mode": "none"}, 1),
+            ("batch4", {"lengths": (8192, 1, 4353, 4099)}, 1),
+            ("unit128", {"tile_tokens": 128}, 1),
+            ("fp16-query", {"query_dtype": torch.float16}, 1),
+            ("plain-v", {"trans_v": False}, 1),
+        )
+    ],
     # At GQA 8, query length q gives 8 * q rows: one M-tile at 1 and 2 (1 pads
     # it), two at 3 and 4 (3 pads the second). Lengths put some row's causal
     # edge on a page or tile boundary, and lengths below q leave rows empty.
@@ -1844,6 +1876,8 @@ def _check_pipe_policy(pa, case, arch, compile_kwargs):
             if entry is compiled
         ]
         assert len(traits) == 1
+        if "expected_splits" in case:
+            assert traits[0].query_splits == case["expected_splits"]
         if "task_limit" in case:
             assert traits[0].task_limit_per_seq == case["task_limit"]
         assert not traits[0].single_kv_head or selected["num_kv_heads"] == 1
