@@ -40,6 +40,10 @@ def device(monkeypatch):
         (1, 7, 160, 257, 4, None, 1),
         (1, None, 512, 0, 1, None, 1),
         (6, 7, 160, 257, 4, None, 8),
+        (2, 7, 160, 0, 1, None, 2),
+        (31, 7, 160, 257, 4, None, 32),
+        (32, None, 512, 0, 1, None, 32),
+        (33, 7, 160, 257, 4, None, 64),
         (6, 1, 160, 257, 4, None, 8),
         (65, 1, None, 1, 4, None, 128),
         (4097, 1, None, 0, 1, 5000, 8192),
@@ -179,6 +183,8 @@ def test_pa_decode_plan(
     replay_lengths = [[0] * batch, list(reversed(lengths))]
     if batch == 1:
         replay_lengths.extend([[length] for length in pattern])
+    elif batch == 2:
+        replay_lengths.extend([[2**31 - 1, 0], [1, 257]])
     for values in replay_lengths:
         context.copy_(torch.tensor(values, dtype=torch.int32, device=device))
         graph.replay()
@@ -196,15 +202,17 @@ def test_pa_decode_plan(
         )
 
     if bucket > 1:
-        # Change every runtime value inside the same batch/block-size bucket
-        # and window mode.
-        if batch < min(bucket, plan.max_batch_size):
+        # Exercise runtime values inside the same batch/block-size bucket
+        # and window mode. Bucket 2 contains only batch 2.
+        if bucket == 2:
+            other_batch = batch
+        elif batch < min(bucket, plan.max_batch_size):
             other_batch = batch + 1
         else:
             other_batch = batch - 1
         # Move the capacity by one slot within the block size.
         threads = planner._block_threads(plan.capacity)
-        other_capacity = plan.capacity - 1
+        other_capacity = plan.capacity + 1 if bucket == 2 else plan.capacity - 1
         if (
             other_capacity < other_batch
             or planner._block_threads(other_capacity) != threads

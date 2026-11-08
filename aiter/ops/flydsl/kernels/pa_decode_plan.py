@@ -38,6 +38,7 @@ def compile_pa_decode_plan(
     cluster_tasks=False,
     tile_tokens=256,
     single_partition=False,
+    warp_rows=False,
 ):
     """Compile a batch bucket and block size for dense or windowed plans.
 
@@ -46,8 +47,12 @@ def compile_pa_decode_plan(
     Actual batch, task capacity, partition cap and window are runtime values.
     ``single_partition`` specializes a validated cap of one: a single
     count scan compacts live rows and no tile-budget allocation is needed.
+    ``warp_rows`` handles gfx1250 batch buckets of 2 through 32 in one
+    wave, retaining all block threads for packed record writes.
     ``cluster_tasks`` adds aligned records for small gfx1250 cluster plans.
     """
+    if warp_rows and (not 1 < max_batch <= 32 or single_partition):
+        raise ValueError("warp_rows requires a 2..32 bucket and multiple partitions")
     if single_partition and cluster_tasks:
         raise ValueError("single-partition plans cannot have cluster records")
     if max_batch == 1:
@@ -85,6 +90,15 @@ def compile_pa_decode_plan(
     # max_batch.bit_length() at power-of-two buckets.
     lookup_bits = (max_batch - 1).bit_length()
 
+    def warp_inclusive(value, row):
+        # At most 32 int32 contexts yield at most 2**29 128-token tiles,
+        # so the warp prefix fits int32. Budget products stay int64 below.
+        result = fx.Int32(value)
+        for offset in (1, 2, 4, 8, 16):
+            previous = fx.gpu.shuffle_up(result, offset, 32)
+            result = result + (row >= offset).select(previous, fx.Int32(0))
+        return result
+
     @flyc.kernel(known_block_size=[threads, 1, 1])
     def pa_decode_plan_kernel(
         lengths_ptr: fx.Pointer,
@@ -101,80 +115,114 @@ def compile_pa_decode_plan(
         work = ptr_buf_tensor(work_ptr)
         reduce_info = ptr_buf_tensor(reduce_ptr)
         smem = fx.SharedAllocator()
-        tile_storage = smem.allocate(scan_tiles.SharedStorage).peek()
-        count_storage = smem.allocate(scan_counts.SharedStorage).peek()
-        row_storage = smem.allocate(reduce_rows.SharedStorage).peek()
-        task_ends = smem.allocate(TaskStorage).peek().ends
-        # Each thread owns consecutive rows, so scans of per-thread totals
-        # preserve sequence order. Buckets that fit the block give each thread
-        # at most one row; larger ones walk rows with runtime bounds, so padding
-        # rows cost nothing and register use does not grow with the bucket.
-        single = max_batch <= threads
-        if fx.const_expr(single):
-            row = fx.Int32(tid)
-            row_ctx = fx.Int32(0)
-            if row < batch:
-                row_ctx = lengths[row]
-            _, thread_tiles = visible_tiles(row_ctx, window)
-            thread_rows = fx.Int32(thread_tiles > 0)
-        else:
-            rows = (batch + threads - 1) // threads
-            row_begin = fx.min(fx.Int32(tid) * rows, batch)
-            row_end = fx.min(row_begin + rows, batch)
-            thread_tiles = fx.Int64(0)
-            thread_rows = fx.Int32(0)
-            for seq in range(row_begin, row_end):
-                _, tiles = visible_tiles(lengths[seq], window)
-                thread_tiles = thread_tiles + tiles
-                thread_rows = thread_rows + fx.Int32(tiles > 0)
-
-        cumulative, total = scan_tiles.exclusive_with_aggregate(
-            thread_tiles, fx.ReductionOp.ADD, storage=tile_storage
-        )
-        total = fx.max(total, fx.Int64(1))
-        remaining = fx.Int64(
-            capacity - reduce_rows(thread_rows, fx.ReductionOp.ADD, storage=row_storage)
-        )
-        if fx.const_expr(single):
-            # Empty and padding rows get no tasks; skip their Int64 divisions.
-            thread_tasks = fx.Int32(0)
-            if thread_tiles > 0:
-                thread_tasks = split(
-                    thread_tiles,
-                    cumulative * remaining // total,
-                    (cumulative + thread_tiles) * remaining // total,
-                    max_parts,
+        if fx.const_expr(warp_rows):
+            task_ends = smem.allocate(TaskStorage).peek().ends
+            # Every lane of the first wave participates, including padding.
+            # Other waves wait once, then keep the original record-write work.
+            if tid < 32:
+                row = fx.Int32(tid)
+                row_ctx = fx.Int32(0)
+                if row < batch:
+                    row_ctx = lengths[row]
+                _, thread_tiles = visible_tiles(row_ctx, window)
+                tile_prefix = warp_inclusive(fx.Int32(thread_tiles), row)
+                total = fx.Int64(
+                    fx.max(fx.gpu.shuffle_idx(tile_prefix, 31, 32), fx.Int32(1))
                 )
+                row_prefix = warp_inclusive(fx.Int32(thread_tiles > 0), row)
+                remaining = fx.Int64(capacity - fx.gpu.shuffle_idx(row_prefix, 31, 32))
+                cumulative = fx.Int64(tile_prefix) - thread_tiles
+                thread_tasks = fx.Int32(0)
+                if thread_tiles > 0:
+                    thread_tasks = split(
+                        thread_tiles,
+                        cumulative * remaining // total,
+                        (cumulative + thread_tiles) * remaining // total,
+                        max_parts,
+                    )
+                count_prefix = warp_inclusive(thread_tasks, row)
+                if row < batch:
+                    reduce_info[row * 2] = count_prefix - thread_tasks
+                    reduce_info[row * 2 + 1] = thread_tasks
+                    task_ends[row] = count_prefix
+            fx.gpu.barrier()
+            total_tasks = task_ends[batch - 1]
         else:
-            # Each row's lower bound is the previous row's upper bound.
-            lower = cumulative * remaining // total
-            thread_tasks = fx.Int32(0)
-            for seq in range(row_begin, row_end):
-                _, tiles = visible_tiles(lengths[seq], window)
-                cumulative = cumulative + tiles
-                upper = cumulative * remaining // total
-                count = split(tiles, lower, upper, max_parts)
-                lower = upper
-                task_ends[seq] = count
-                thread_tasks = thread_tasks + count
-        row_start, total_tasks = scan_counts.exclusive_with_aggregate(
-            thread_tasks, fx.ReductionOp.ADD, storage=count_storage
-        )
+            tile_storage = smem.allocate(scan_tiles.SharedStorage).peek()
+            count_storage = smem.allocate(scan_counts.SharedStorage).peek()
+            row_storage = smem.allocate(reduce_rows.SharedStorage).peek()
+            task_ends = smem.allocate(TaskStorage).peek().ends
+            # Each thread owns consecutive rows, so scans of per-thread totals
+            # preserve sequence order. Buckets that fit the block give each thread
+            # at most one row; larger ones walk rows with runtime bounds, so padding
+            # rows cost nothing and register use does not grow with the bucket.
+            single = max_batch <= threads
+            if fx.const_expr(single):
+                row = fx.Int32(tid)
+                row_ctx = fx.Int32(0)
+                if row < batch:
+                    row_ctx = lengths[row]
+                _, thread_tiles = visible_tiles(row_ctx, window)
+                thread_rows = fx.Int32(thread_tiles > 0)
+            else:
+                rows = (batch + threads - 1) // threads
+                row_begin = fx.min(fx.Int32(tid) * rows, batch)
+                row_end = fx.min(row_begin + rows, batch)
+                thread_tiles = fx.Int64(0)
+                thread_rows = fx.Int32(0)
+                for seq in range(row_begin, row_end):
+                    _, tiles = visible_tiles(lengths[seq], window)
+                    thread_tiles = thread_tiles + tiles
+                    thread_rows = thread_rows + fx.Int32(tiles > 0)
 
-        if fx.const_expr(single):
-            if row < batch:
-                reduce_info[row * 2] = row_start
-                reduce_info[row * 2 + 1] = thread_tasks
-                task_ends[row] = row_start + thread_tasks
-        else:
-            # Rows are thread-private here; convert counts to ends in place.
-            for seq in range(row_begin, row_end):
-                count = task_ends[seq]
-                reduce_info[seq * 2] = row_start
-                reduce_info[seq * 2 + 1] = count
-                row_start = row_start + count
-                task_ends[seq] = row_start
-        fx.gpu.barrier()
+            cumulative, total = scan_tiles.exclusive_with_aggregate(
+                thread_tiles, fx.ReductionOp.ADD, storage=tile_storage
+            )
+            total = fx.max(total, fx.Int64(1))
+            remaining = fx.Int64(
+                capacity
+                - reduce_rows(thread_rows, fx.ReductionOp.ADD, storage=row_storage)
+            )
+            if fx.const_expr(single):
+                # Empty and padding rows get no tasks; skip their Int64 divisions.
+                thread_tasks = fx.Int32(0)
+                if thread_tiles > 0:
+                    thread_tasks = split(
+                        thread_tiles,
+                        cumulative * remaining // total,
+                        (cumulative + thread_tiles) * remaining // total,
+                        max_parts,
+                    )
+            else:
+                # Each row's lower bound is the previous row's upper bound.
+                lower = cumulative * remaining // total
+                thread_tasks = fx.Int32(0)
+                for seq in range(row_begin, row_end):
+                    _, tiles = visible_tiles(lengths[seq], window)
+                    cumulative = cumulative + tiles
+                    upper = cumulative * remaining // total
+                    count = split(tiles, lower, upper, max_parts)
+                    lower = upper
+                    task_ends[seq] = count
+                    thread_tasks = thread_tasks + count
+            row_start, total_tasks = scan_counts.exclusive_with_aggregate(
+                thread_tasks, fx.ReductionOp.ADD, storage=count_storage
+            )
+
+            if fx.const_expr(single):
+                if row < batch:
+                    reduce_info[row * 2] = row_start
+                    reduce_info[row * 2 + 1] = thread_tasks
+                    task_ends[row] = row_start + thread_tasks
+            else:
+                # Rows are thread-private here; convert counts to ends in place.
+                for seq in range(row_begin, row_end):
+                    count = task_ends[seq]
+                    reduce_info[seq * 2] = row_start
+                    reduce_info[seq * 2 + 1] = count
+                    row_start = row_start + count
+                    task_ends[seq] = row_start
+            fx.gpu.barrier()
 
         if fx.const_expr(cluster_tasks):
             # One aligned record per cluster CTA avoids a dependent lookup of
@@ -703,6 +751,9 @@ def plan_pa_decode(
             plan.cluster_info is not None,
             plan.tile_tokens,
             plan.max_partitions == 1,
+            properties.gcnArchName.split(":", 1)[0] in ("gfx1250", "gfx1250-strict")
+            and 1 < max_batch <= 32
+            and plan.max_partitions > 1,
         )
         _run_compiled(
             launch,
