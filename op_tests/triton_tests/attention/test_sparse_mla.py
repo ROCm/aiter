@@ -42,6 +42,14 @@ def _skip_unless_supported(dots="bf16", fmt="bf16"):
         pytest.skip(f"the fp8_dsv32_mla cache is {'/'.join(FP8_ARCHS)}-only")
 
 
+def _skip_unless_fp8_kernel():
+    """The custom fp8 kernel (sparse_mla_fp8.py), and the fp8 q and two-loop
+    inputs it takes. gfx942 runs fp8 dots in the generic kernel instead."""
+    arch = arch_info.get_arch()
+    if arch not in FP8_ARCHS:
+        pytest.skip(f"the custom fp8 kernel is {'/'.join(FP8_ARCHS)}-only")
+
+
 def quantize_flat_fp8(kv):
     """vLLM's production layout: whole row fp8 with one per-tensor scale."""
     scale = (kv.float().abs().amax() / FP8_MAX).clamp_min(1e-30).reshape(1)
@@ -511,6 +519,7 @@ def test_sparse_mla_fp8_kernel(H, C, topk, ragged, pool, opts):
     """fp8_scalar with fp8 dots: gfx950's fp8 kernel (sparse_mla_fp8.py), at every
     head count it takes."""
     _skip_unless_supported("fp8", "tensor")
+    _skip_unless_fp8_kernel()
     _run_and_check(
         "tensor",
         C=C,
@@ -532,6 +541,7 @@ def test_sparse_mla_fp8_two_caches(one_alloc, mxfp8, splits):
     the fp8 kernel: one allocation under one scale (one loop) or two with their own
     scales (two loops)."""
     _skip_unless_supported("fp8", "tensor")
+    _skip_unless_fp8_kernel()
     C, H, B, nb = 8, 64, 64, 512
     sm = KV_LORA**-0.5
     torch.manual_seed(0)
