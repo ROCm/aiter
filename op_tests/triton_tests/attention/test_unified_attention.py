@@ -10,21 +10,13 @@ import pytest
 import torch
 
 from aiter.ops.triton.attention.unified_attention import (
-    _gfx950_gluon_supported,
-    _gfx950_split_params,
     _is_gluon_available,
-    _UAParams,
     is_2d_gluon_available,
     unified_attention,
-    use_2d_kernel,
 )
 from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.triton.utils.device_info import get_num_sms
 from aiter.ops.triton.utils.shuffle import shuffle_scale_batched, shuffle_weight
 from aiter.ops.triton.utils.types import e4m3_dtype
-from aiter.ops.triton.utils.unified_attention_utils import (
-    get_unified_attention_config,
-)
 from aiter.test_common import checkAllclose
 from op_tests.triton_tests.quant.test_quant_mxfp4 import (
     torch_dynamic_mxfp4_quant,
@@ -1029,73 +1021,30 @@ def test_triton_unified_attn_sw_split_no_sinks(seq_lens, num_heads, block_size):
     torch.testing.assert_close(out.float(), ref, atol=1.5e-2, rtol=1e-2)
 
 
-def _window_decode_params(
-    q, k, v, out, cu_seqlens_q, seqused_k, block_table, scale, window_size, sinks
-):
-    """The params unified_attention builds for an unshuffled launch."""
-    num_tokens, num_query_heads, head_size = q.shape
-    num_blocks, block_size, num_kv_heads, _ = k.shape
-    num_seqs = len(seqused_k)
-    num_queries_per_kv = num_query_heads // num_kv_heads
-    num_sms = get_num_sms()
-    return _UAParams(
-        q=q,
-        k=k,
-        v=v,
-        out=out,
-        cu_seqlens_q=cu_seqlens_q,
-        seqused_k=seqused_k,
-        block_table=block_table,
-        softmax_scale=scale,
-        softcap=0,
-        causal=True,
-        sliding_window=1 + window_size[0],
-        max_seqlen_q=int(max(torch.diff(cu_seqlens_q.cpu()))),
-        max_seqlen_k=int(seqused_k.max()),
-        num_tokens=num_tokens,
-        num_query_heads=num_query_heads,
-        num_kv_heads=num_kv_heads,
-        num_queries_per_kv=num_queries_per_kv,
-        head_size=head_size,
-        head_size_v=v.shape[-1],
-        num_seqs=num_seqs,
-        total_num_q_blocks=num_seqs,
-        num_2d_prgms=num_seqs * num_kv_heads,
-        num_blocks=num_blocks,
-        block_size=block_size,
-        k_width=16 if q.dtype == e4m3_dtype else 8,
-        scale_k_width=4,
-        block_scales_size=16,
-        q_dtype=q.dtype,
-        kv_cache_dtype=k.dtype,
-        all_decode=True,
-        shuffled_kv_cache=False,
-        use_alibi_slopes=False,
-        use_qq_bias=False,
-        num_sms=num_sms,
-        target_num_prgms=num_sms * 4,
-        sinks=sinks,
-    )
-
-
-@pytest.mark.parametrize("head_size, num_heads", [(128, (8, 1)), (256, (32, 2))])
+@pytest.mark.parametrize(
+    "head_size, num_heads, query_len",
+    [(128, (8, 1), 1), (256, (32, 2), 1), (128, (8, 8), 32)],
+)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, e4m3_dtype])
 @pytest.mark.parametrize("use_sinks", [False, True])
 @torch.inference_mode()
 def test_triton_unified_attn_window_decode_split(
-    head_size, num_heads, dtype, use_sinks
+    head_size, num_heads, query_len, dtype, use_sinks, monkeypatch
 ):
-    """q=1 sliding-window decode at head 128 and 256, bf16 and fp8.
+    """Sliding-window decode (q=1) at head 128 and 256, and a 32-token query
+    at head 128 with one query head per KV head, bf16 and fp8.
 
-    These heads are outside test_triton_unified_attn_3d, which is head 64.
+    These heads are outside test_triton_unified_attn_3d, which is head 64, and
+    the 32-token query is past the 16-token bound the window split had before.
     The batch is one that the gfx950 gluon config splits into several
-    segments, and the test checks that before comparing the output.
+    segments. The test records what the launch site receives and checks that
+    before comparing the output, so it cannot drift from the dispatch.
     """
     if DEVICE_ARCH != "gfx950" or not _is_gluon_available():
         pytest.skip("gfx950 gluon window decode")
 
     sliding_window = 2048
-    seq_lens = [(1, 8192)] * 8
+    seq_lens = [(query_len, 8192)] * 8
     block_size = 16
     query_lens = [q for q, _ in seq_lens]
     kv_lens = [kv for _, kv in seq_lens]
@@ -1132,26 +1081,23 @@ def test_triton_unified_attn_window_decode_split(
         out_dtype=torch.bfloat16,
     )
     sinks = sinks if use_sinks else None
-    params = _window_decode_params(
-        query,
-        launched_k,
-        launched_v,
-        output,
-        cu_query_lens,
-        kv_lens_t,
-        block_tables,
-        scale,
-        window_size,
-        sinks,
-    )
-    assert _gfx950_gluon_supported(params)
-    assert not use_2d_kernel(params, "gluon")
-    num_segments = int(
-        get_unified_attention_config(
-            "kv_split", _gfx950_split_params(params), backend="gluon"
-        )["NUM_SEGMENTS"]
-    )
-    assert num_segments > 1, num_segments
+
+    # the one launch site of the gfx950 gluon kernel, for both grids
+    module = sys.modules[unified_attention.__module__]
+    launches = []
+    real_launch = module._unified_attention_gfx950
+
+    def record_launch(params, *args, **kwargs):
+        launches.append(
+            {
+                "all_decode": params.all_decode,
+                "sliding_window": params.sliding_window,
+                "num_segments": kwargs.get("NUM_SEGMENTS", 1),
+            }
+        )
+        return real_launch(params, *args, **kwargs)
+
+    monkeypatch.setattr(module, "_unified_attention_gfx950", record_launch)
 
     unified_attention(
         q=query,
@@ -1172,6 +1118,11 @@ def test_triton_unified_attn_window_decode_split(
         v_descale=v_descale,
         sinks=sinks,
     )
+    # one gluon launch, split into several segments, with the window set
+    assert len(launches) == 1, launches
+    assert launches[0]["all_decode"] == (query_len == 1), launches
+    assert launches[0]["sliding_window"] == sliding_window, launches
+    assert launches[0]["num_segments"] > 1, launches
     ref = ref_paged_attn(
         query=query,
         key_cache=key_cache,
@@ -1195,7 +1146,7 @@ def test_triton_unified_attn_window_decode_split(
             atol=atol,
             rtol=rtol,
             tol_err_ratio=0.01,
-            msg=f"window decode head {head_size} {dtype} sinks={use_sinks}",
+            msg=f"window head {head_size} q={query_len} {dtype} sinks={use_sinks}",
         )
         <= 0.01
     )

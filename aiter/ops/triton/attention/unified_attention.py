@@ -184,14 +184,22 @@ def _gfx950_short_query(params: _UAParams):
 
     The split grid sizes BLOCK_M to the query group, so each sequence is one
     query block with no masked rows, where the 2d grid's BLOCK_M 128 leaves
-    half of them empty. Measured for head size 64 only.
+    half of them empty. Measured for head size 64 only, and only while the
+    batch does not oversubscribe the GPU: from SHORT_MAX_PROGRAMS_PER_CU
+    programs per CU (kv_tile) the launch is memory bound, and the split grid's
+    smaller BLOCK_M has fewer warps per program to hide it (gpt-oss, q=8, 512
+    sequences: 11 % slower than the 2d grid).
     """
-    return (
+    if not (
         not params.all_decode
         and params.q_dtype == torch.bfloat16
         and params.head_size <= 64
         and params.max_seqlen_q * params.num_queries_per_kv <= 128
-    )
+    ):
+        return False
+    policy = get_unified_attention_config("kv_tile", params, backend="gluon")
+    programs = params.num_seqs * params.num_kv_heads
+    return programs < policy["SHORT_MAX_PROGRAMS_PER_CU"] * params.num_sms
 
 
 def _gfx950_tile_size(params: _UAParams, tile: int):
@@ -204,9 +212,10 @@ def _gfx950_tile_size(params: _UAParams, tile: int):
     short queries on the split grid; shorter runs lose the deeper prologue)
     and while the wider tile's doubled LDS does not cost co-residency: past
     one program per CU for decode, and on the 2d grid past one program per CU
-    dense or two shuffled. Short queries on the split grid keep winning at any
-    program count. Sliding windows keep the 64-key tile. Measured for bf16
-    and head size 64 only; at head 256 the wider tile is slower.
+    dense or two shuffled. Short queries on the split grid (see
+    _gfx950_short_query) widen at any program count they are used at. Sliding
+    windows keep the 64-key tile. Measured for bf16 and head size 64 only; at
+    head 256 the wider tile is slower.
     """
     if (
         params.sliding_window > 0
@@ -1166,7 +1175,8 @@ def _unified_attention_gfx950(
     assert BLOCK_Q >= 1
 
     # every sequence fits one query block: launch exactly one per sequence.
-    # This trusts max_seqlen_q. An underestimate drops query rows.
+    # This trusts max_seqlen_q. An underestimate drops query rows (the
+    # previous grid covered them). AITER_UNIFIED_ATTN_CHECK_SEQLENS=1 asserts.
     one_q_block = not params.all_decode and params.max_seqlen_q <= BLOCK_Q
     if one_q_block and os.environ.get("AITER_UNIFIED_ATTN_CHECK_SEQLENS") == "1":
         # Reading the lengths syncs the device, so the check stays opt-in.
