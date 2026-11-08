@@ -8,7 +8,9 @@ Ownership boundary:
   (isolation, fallback, no-fallback-after-run), and observable provenance.
 - Providers own their kernels, their qualification evidence, and their
   lifecycle; ``KernelCandidate.qualification`` is self-reported provenance,
-  not an AITER certification.
+  not an AITER certification. A kernel plugin is the unit that ships and
+  registers; ``KernelProvider`` is the interface it implements, the way a
+  pytest plugin implements hooks the host calls.
 - Frameworks own enablement: installing a provider makes it available, never
   active. A provider serves only when a framework names it in
   ``configure(enable=...)``, which records the source of that decision.
@@ -40,7 +42,12 @@ SUPERSEDED_API_VERSIONS: Mapping[int, str] = MappingProxyType({})
 # The single-version ``api_version`` spelling, and the release that stops
 # reading it. Providers declare ``api_versions``.
 SUPERSEDED_API_SPELLING: str | None = "a later aiter release"
-ENTRY_POINT_GROUP = "aiter.kernel_providers"
+# Every kernel plugin registers here, and many are expected to: AITER is a
+# kernel library, so a plugin to it is a kernel plugin, and the group is not
+# qualified by a kind that has no second member. The plugin is the unit that
+# ships; what it registers is an object implementing KernelProvider, which is
+# the role this module asks, the way a pytest plugin implements hooks.
+ENTRY_POINT_GROUP = "aiter.plugins"
 
 _Canonicalizer = Callable[..., tuple[tuple[Any, ...], dict[str, Any]]]
 _P = ParamSpec("_P")
