@@ -504,6 +504,11 @@ def _build_kernel(
                     sc_pad_lane.append(
                         is_pad.select(c_neg_inf, fx.Float32(sc_v_lane[i]))
                     )
+                # A padding row reads ring 0 of whatever the slot last held, and its
+                # zero weight does not cancel a NaN there (0 * NaN = NaN): zero the kv too.
+                kv_v_lane = [
+                    is_pad.select(c_zero_f32, fx.Float32(v)) for v in kv_v_lane
+                ]
 
                 new_m, new_kv, new_w = _online_softmax_update(
                     m_lane, kv_lane, w_lane, sc_pad_lane, kv_v_lane
@@ -1141,18 +1146,18 @@ def _build_kernel(
                             fx.Int8,
                         )
                         if const_expr(preshuffle):
-                            # scale [NB, k_tiles, 4, kvbs] u8, with the slot axis
-                            # INTERLEAVED so the mqa-logits reader's packed-dword
-                            # load (4 nt-bytes adjacent) is contiguous:
-                            #   sflat = (slot % 16) * KVS_NTPW + (slot // 16)
-                            # (KVS_NTPW == 4). Matches the op-test reference
-                            # writer `indexer_k_fp4_paged_preshuffle` and the
-                            # packed N_PHYS==1 readers in pa_mqa_logits_fp4*.
-                            sg_u = scale_group_idx
-                            k_tile_s = fx.Int32(sg_u // 4)
-                            group4_s = fx.Int32(sg_u % 4)
+                            # scale [NB, k_tiles, 4, kvbs] u8, with four
+                            # equally-sized token groups interleaved so the
+                            # mqa-logits reader can assemble one packed scale
+                            # dword for each 64-token warp tile.
+                            sg_u = fx.Uint32(scale_group_idx)
+                            k_tile_s = fx.Int32(sg_u // fx.Uint32(4))
+                            group4_s = fx.Int32(sg_u % fx.Uint32(4))
                             slot_u = fx.Uint32(slot_in_block)
-                            sflat = fx.Int32(slot_u % 16) * 4 + fx.Int32(slot_u // 16)
+                            scale_group_size = fx.Uint32(KVBS // 4)
+                            sflat = fx.Int32(slot_u % scale_group_size) * 4 + fx.Int32(
+                                slot_u // scale_group_size
+                            )
                             cs_off = k_tile_s * (4 * KVBS) + group4_s * KVBS + sflat
                         else:
                             cs_off = slot_in_block * (D // _FP4_GROUP_SIZE) + fx.Int32(
@@ -1523,7 +1528,10 @@ def _build_kernel_ksplit(
                 sc_pad = [
                     is_pad.select(c_neg_inf, fx.Float32(sc_v[i])) for i in range(VEC)
                 ]
-                return kv_v, sc_pad
+                # A padding row reads ring 0 of whatever the slot last held, and its
+                # zero weight does not cancel a NaN there (0 * NaN = NaN): zero the kv too.
+                kv_pad = [is_pad.select(c_zero_f32, fx.Float32(v)) for v in kv_v]
+                return kv_pad, sc_pad
 
             def _phase2_loads(k_i32):
                 col_off = _col_off_for_k(k_i32)
