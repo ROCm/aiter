@@ -76,6 +76,11 @@ Environment variables for variants (`name:ENV=VAL,...`), all off by default. The
   topk / experts, tile), instead of the CUDA-graph-safe worst case, so the gemm1 and gemm2 grids have no all-padding M
   tiles. The host checks that every expert got exactly tokens x topk / experts rows and raises otherwise; EP routing is
   refused.
+- `AITER_FLYDSL_SIMPLE_EPI=1` (`mxfp4_preshuffle_gfx1250_tdm.py`, kernel name suffix `_simpleepi`): gemm1's epilogue
+  only converts each accumulator fragment to FP4 with scale 1.0, stages it in LDS and TDM-stores it, with no
+  activation, block amax, scale computation or scale stores. The LDS layout and the bytes written match the normal
+  epilogue, but the output is wrong by design: the accuracy check fails (`logits_diff=1.0`) and the process exits 1
+  after printing its timing.
 
 ## Notes
 

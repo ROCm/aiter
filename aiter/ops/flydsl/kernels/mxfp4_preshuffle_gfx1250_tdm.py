@@ -102,6 +102,13 @@ if DISABLE_CLUSTER_SYNC not in (0, 1):
     raise ValueError("AITER_FLYDSL_DISABLE_CLUSTER_SYNC must be 0 or 1")
 if TDM_EARLY_TIMEOUT not in (0, 1):
     raise ValueError("AITER_FLYDSL_TDM_EARLY_TIMEOUT must be 0 or 1")
+# Experiment only (moe_exp): the FP4 stage1 epilogue (gemm1 with fused activation
+# and MX quantization) converts the accumulators straight to FP4 with scale 1.0,
+# stages them in LDS and TDM-stores them. No clamp, activation, block amax or
+# E8M0 scale computation, and no scale stores. The output is wrong by design.
+SIMPLE_EPI = int(os.environ.get("AITER_FLYDSL_SIMPLE_EPI", "0"))
+if SIMPLE_EPI not in (0, 1):
+    raise ValueError("AITER_FLYDSL_SIMPLE_EPI must be 0 or 1")
 
 SUPPORT_EXPLICIT_VGPR_PARTITION = bool(
     EXPLICIT_VGPR_PARTITION and is_fx_set_register_available()
@@ -476,6 +483,8 @@ def launch_gemm_a8w4_tdm(
     _persistent = f"_pw{persistent_workers}" if persistent_workers else ""
     _drain = "_rolleddrain" if rolled_drain else ""
     _early_timeout = "_et0" if not TDM_EARLY_TIMEOUT else ""
+    simple_epi = bool(SIMPLE_EPI and stage1_quant_out and stage1_act and a_is_fp4)
+    _simple_epi = "_simpleepi" if simple_epi else ""
     _kname = (
         f"a8w4_tdm_{_afp}{_a_layout}"
         f"_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}"
@@ -486,6 +495,7 @@ def launch_gemm_a8w4_tdm(
         f"{_mma_group}{_ds_first}"
         f"{_explicit_vgpr_partition}{_planar_lds}"
         f"{_interleaved_lds_load}{_persistent}{_drain}{_early_timeout}"
+        f"{_simple_epi}"
     )
 
     # Compile the static path directly, preserving its launch ABI and the
@@ -1946,8 +1956,94 @@ def launch_gemm_a8w4_tdm(
                     acc = acc + bias_vals
                 return acc
 
+            def quant_byte_offset(row, col):
+                if const_expr(a_preshuffled):
+                    # TDM reads dense LDS tiles. Stage each K32 slab as
+                    # contiguous M16 x 16B, without row padding.
+                    return (
+                        (row // 16) * 16 * STORE_N
+                        + (col // 16) * 256
+                        + (row % 16) * 16
+                        + col % 16
+                    )
+                return row * STORE_N + col
+
+            # Each FP4 store address is one per-lane base plus a compile-time
+            # offset. The wave terms are products: the wave index comes from
+            # readfirstlane, so the compiler cannot prove wmb / wnb non-negative,
+            # and // or % on them costs a signed floor-division fix-up per store.
+            # Needs whole 16-row blocks per wave and, preshuffled, whole 16-byte
+            # column groups (64 FP4 columns) per wave.
+            quant_lane_addr = (
+                warp_tile_m % 16 == 0
+                and warp_tile_n % (64 if a_preshuffled else 4) == 0
+            )
+
+            def quant_lane_base():
+                # Per-lane part of quant_byte_offset(row_rel, col_fp4), with
+                # row_rel = wmb + wm * 16 + lane16 and
+                # col_fp4 = (wnb + wn * 16) // 4 + kgrp * 2.
+                if const_expr(a_preshuffled):
+                    return (
+                        wave_m * (warp_tile_m // 16 * 16 * STORE_N)
+                        + wave_n * (warp_tile_n // 64 * 256)
+                        + lane16 * 16
+                        + kgrp * 2
+                    )
+                return (
+                    (wave_m * warp_tile_m + lane16) * STORE_N
+                    + wave_n * (warp_tile_n // 4)
+                    + kgrp * 2
+                )
+
+            def quant_const_off(wm, wn):
+                # The compile-time rest; kgrp * 2 + (wn % 4) * 4 stays inside one
+                # 16-byte column group.
+                if const_expr(a_preshuffled):
+                    return wm * 16 * STORE_N + (wn // 4) * 256 + (wn % 4) * 4
+                return wm * 16 * STORE_N + wn * 4
+
+            if const_expr(
+                stage1_quant_out and stage1_act and is_fp4_quant and quant_lane_addr
+            ):
+                stC_lane = fx.Int32(stC_idx) + fx.Int32(quant_lane_base())
+
             # -- Activate + stage to LDS --
-            if const_expr(stage1_quant_out and stage1_act):
+            if const_expr(simple_epi):
+                # Experiment: FP4 conversion only (AITER_FLYDSL_SIMPLE_EPI=1).
+                # One v_cvt_scalef32_pk8_fp4_f32 per accumulator fragment
+                # turns its 8 f32 (4 interleaved gate/up pairs) into 32 bits
+                # of FP4; the low 16 bits (pairs 0-1) go to the same LDS slot
+                # the activated values use, so the LDS layout, the TDM store
+                # and the bytes written match the fused path. The high 16
+                # bits are dropped: activation halves the column count, and
+                # converting all 8 values keeps every WMMA result live with
+                # no register shuffles. Scale 1.0, no scale stores.
+                for wm in range_constexpr(wmma_m_rep):
+                    # Same wave-uniform skip of all-padding row blocks as the
+                    # fused path.
+                    if wmb + wm * 16 < mn_oob:
+                        row_rel = wmb + wm * 16 + lane16
+                        for wn in range_constexpr(output_n_rep):
+                            acc = _biased_acc(wm, wn, wnb + wn * 16 + kgrp * 8)
+                            packed_i32 = emit_cvt_scalef32_pk8_fp4_f32(
+                                acc.ir_value(),
+                                fx.Float32(1.0),
+                                i32_ty=T.i32,
+                                rocdl=rocdl,
+                            )
+                            if const_expr(quant_lane_addr):
+                                lds_store_b16(
+                                    stC_lane, quant_const_off(wm, wn), packed_i32
+                                )
+                            else:
+                                col_fp4 = (wnb + wn * 16) // 4 + kgrp * 2
+                                lds_store_b16(
+                                    stC_idx,
+                                    quant_byte_offset(row_rel, col_fp4),
+                                    packed_i32,
+                                )
+            elif const_expr(stage1_quant_out and stage1_act):
                 # Fused activation + MX quant; payload to LDS, scale to global.
                 i32_ptr_g = fx.PointerType.get(
                     elem_ty=fx.Int8.ir_type,
@@ -1968,56 +2064,6 @@ def launch_gemm_a8w4_tdm(
 
                 v2i32_ty = T.vec(2, T.i32)
                 N_MX_BLKS = output_n_rep // WN_PER_MX_BLOCK
-
-                def quant_byte_offset(row, col):
-                    if const_expr(a_preshuffled):
-                        # TDM reads dense LDS tiles. Stage each K32 slab as
-                        # contiguous M16 x 16B, without row padding.
-                        return (
-                            (row // 16) * 16 * STORE_N
-                            + (col // 16) * 256
-                            + (row % 16) * 16
-                            + col % 16
-                        )
-                    return row * STORE_N + col
-
-                # Each FP4 store address is one per-lane base plus a compile-time
-                # offset. The wave terms are products: the wave index comes from
-                # readfirstlane, so the compiler cannot prove wmb / wnb non-negative,
-                # and // or % on them costs a signed floor-division fix-up per store.
-                # Needs whole 16-row blocks per wave and, preshuffled, whole 16-byte
-                # column groups (64 FP4 columns) per wave.
-                quant_lane_addr = (
-                    warp_tile_m % 16 == 0
-                    and warp_tile_n % (64 if a_preshuffled else 4) == 0
-                )
-
-                def quant_lane_base():
-                    # Per-lane part of quant_byte_offset(row_rel, col_fp4), with
-                    # row_rel = wmb + wm * 16 + lane16 and
-                    # col_fp4 = (wnb + wn * 16) // 4 + kgrp * 2.
-                    if const_expr(a_preshuffled):
-                        return (
-                            wave_m * (warp_tile_m // 16 * 16 * STORE_N)
-                            + wave_n * (warp_tile_n // 64 * 256)
-                            + lane16 * 16
-                            + kgrp * 2
-                        )
-                    return (
-                        (wave_m * warp_tile_m + lane16) * STORE_N
-                        + wave_n * (warp_tile_n // 4)
-                        + kgrp * 2
-                    )
-
-                def quant_const_off(wm, wn):
-                    # The compile-time rest; kgrp * 2 + (wn % 4) * 4 stays inside one
-                    # 16-byte column group.
-                    if const_expr(a_preshuffled):
-                        return wm * 16 * STORE_N + (wn // 4) * 256 + (wn % 4) * 4
-                    return wm * 16 * STORE_N + wn * 4
-
-                if const_expr(is_fp4_quant and quant_lane_addr):
-                    stC_lane = fx.Int32(stC_idx) + fx.Int32(quant_lane_base())
 
                 for wm in range_constexpr(wmma_m_rep):
                     # A 16-row block entirely past this expert's valid rows has its
