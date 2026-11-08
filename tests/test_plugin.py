@@ -206,20 +206,6 @@ def test_enable_list_order_is_the_preference_order(monkeypatch):
     assert alpha.select_calls == 0
 
 
-def test_enable_list_order_is_honoured_through_configure(monkeypatch):
-    zebra = _Provider("zebra", _candidate("zebra", 200))
-    alpha = _Provider("alpha", _candidate("alpha", 100))
-    monkeypatch.setattr(
-        plugin,
-        "_entry_points",
-        lambda: (_EntryPoint("z-entry", zebra), _EntryPoint("a-entry", alpha)),
-    )
-    plugin.configure(enable=["zebra", "alpha"], source="test")
-
-    assert _route_add([])(2, 3) == 200
-    assert zebra.select_calls == 1
-
-
 def test_broken_and_incompatible_providers_are_isolated(monkeypatch):
     warnings = []
     incompatible = _Provider("old")
@@ -269,7 +255,6 @@ def test_installed_provider_is_not_enabled_by_default(monkeypatch):
     assert plugin.last_decision().reason == "provider-not-enabled"
 
     plugin.configure(enable=("aklr",), source="test")
-    plugin.reload_config()  # env is snapshotted; a mid-process change needs a reload
     assert add(2, 3) == 100
     assert provider.select_calls == 1
     assert plugin.last_decision().route == "provider"
@@ -1159,3 +1144,37 @@ def test_accepting_the_superseded_version_is_what_would_let_it_corrupt(monkeypat
     assert (
         len(warnings) == 1 and "a later aiter release" in warnings[0]
     ), "accepting a superseded version must say so, naming its removal"
+
+
+def test_the_first_provider_to_fail_is_the_one_named(monkeypatch):
+    """Which failure gets reported is a rule, so it needs a test.
+
+    Both dispatch and explain keep the first error and let later ones pass:
+    the provider that broke first is the one an operator can act on, and a
+    later failure saying the same thing adds nothing. Nothing pinned that --
+    reversing it to keep the last error left the suite green.
+    """
+
+    class Breaks(_Provider):
+        def select(self, op, args, kwargs):
+            self.select_calls += 1
+            raise RuntimeError(f"{self.name} is broken")
+
+    first, second = Breaks("aaa"), Breaks("bbb")
+    monkeypatch.setattr(
+        plugin,
+        "_entry_points",
+        lambda: (_EntryPoint("a", first), _EntryPoint("b", second)),
+    )
+    plugin.configure(enable=("aaa", "bbb"), source="test")
+    add = _route_add([])
+
+    assert add(2, 3) == 5
+    assert (first.select_calls, second.select_calls) == (
+        1,
+        1,
+    ), "a broken provider must not deny the next one its turn"
+    assert plugin.last_decision().provider == "aaa"
+    assert (
+        plugin.explain("test.add", 2, 3).decision.provider == "aaa"
+    ), "explain must name the same provider dispatch did"

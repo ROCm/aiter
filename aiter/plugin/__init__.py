@@ -409,39 +409,60 @@ def _dispatch(
             continue
 
         _record(
-            Decision(
-                op=op,
-                route="provider",
-                reason="selected",
-                provider=candidate.provider,
-                kernel_id=candidate.kernel_id,
-                artifact_digest=candidate.artifact_digest,
-                qualification=candidate.qualification,
-                config_source=config.source,
-            ),
-            config.generation,
-            candidate.kernel_id,
+            _selected(op, candidate, config), config.generation, candidate.kernel_id
         )
         # Once provider execution starts, errors propagate. Falling back here could
         # repeat side effects or hide a broken kernel behind a successful result.
         return cast(_R, candidate.run(*provider_args, **provider_kwargs))
 
-    if failure is not None:
-        reason, provider_name = failure
-        return _run_native(
-            op,
-            native,
-            args,
-            kwargs,
-            reason,
-            config.source,
-            config.generation,
-            provider_name,
-        )
-    reason = "provider-declined" if declined else "no-provider"
+    reason, provider_name = _native_outcome(failure, declined)
     return _run_native(
-        op, native, args, kwargs, reason, config.source, config.generation
+        op,
+        native,
+        args,
+        kwargs,
+        reason,
+        config.source,
+        config.generation,
+        provider_name,
     )
+
+
+def _selected(op: Op, candidate: KernelCandidate, config: _Config) -> Decision:
+    """The Decision a selected candidate produces.
+
+    Dispatch records it and explain returns it without running anything. They
+    must not drift: explain exists to say what dispatch would do, so a field
+    added on one side and not the other makes it lie.
+    """
+
+    return Decision(
+        op=op,
+        route="provider",
+        reason="selected",
+        provider=candidate.provider,
+        kernel_id=candidate.kernel_id,
+        artifact_digest=candidate.artifact_digest,
+        qualification=candidate.qualification,
+        config_source=config.source,
+    )
+
+
+def _native_outcome(
+    failure: tuple[str, str] | None, declined: bool
+) -> tuple[str, str | None]:
+    """Why the call went native once every eligible provider was asked.
+
+    An error outranks a decline, and the first error is the one named: one
+    misbehaving provider is more actionable than the fact that others said no.
+    Both callers keep the same bookkeeping so the rule is shared rather than
+    mirrored -- it used to be written twice, once as a tuple and once derived
+    back out of a dictionary.
+    """
+
+    if failure is not None:
+        return failure
+    return ("provider-declined" if declined else "no-provider"), None
 
 
 def _record(
@@ -598,37 +619,26 @@ def explain(op: str, *args: Any, **kwargs: Any) -> Explanation:
     canonical_args, canonical_kwargs = routed.canonicalize(*args, **kwargs)
     readonly = MappingProxyType(canonical_kwargs)
     declines: dict[str, str] = dict(eligible.ineligible)
+    failure: tuple[str, str] | None = None
+    declined = False
     for record in eligible.providers:
         candidate, rejection = _ask_provider(
             record, operation, canonical_args, readonly
         )
         if rejection is not None:
             declines[record.name] = rejection
+            failure = failure or (rejection, record.name)
             continue
         if candidate is None:
             declines[record.name] = "declined"
+            declined = True
             continue
         return Explanation(
-            Decision(
-                op=operation,
-                route="provider",
-                reason="selected",
-                provider=candidate.provider,
-                kernel_id=candidate.kernel_id,
-                artifact_digest=candidate.artifact_digest,
-                qualification=candidate.qualification,
-                config_source=config.source,
-            ),
-            MappingProxyType(declines),
+            _selected(operation, candidate, config), MappingProxyType(declines)
         )
 
-    # Same precedence as dispatch, and the same provider named with it.
-    blamed = next(
-        ((name, why) for name, why in declines.items() if why != "declined"), None
-    )
-    if blamed is not None:
-        return _explained(operation, blamed[1], config.source, declines, blamed[0])
-    return _explained(operation, "provider-declined", config.source, declines)
+    reason, provider_name = _native_outcome(failure, declined)
+    return _explained(operation, reason, config.source, declines, provider_name)
 
 
 def _described(record: _ProviderRecord) -> Mapping[str, Any]:
