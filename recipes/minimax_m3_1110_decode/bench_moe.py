@@ -13,7 +13,7 @@ import os
 import pathlib
 import statistics
 
-from make_overlay import check_source, make_overlay
+from make_overlay import check_source, make_overlay, profile
 
 
 def load(name, path):
@@ -29,16 +29,19 @@ def main():
     ap.add_argument("--baseline", type=pathlib.Path, required=True)
     ap.add_argument("--output", type=pathlib.Path, required=True)
     ap.add_argument("--seed", type=int, default=393)
+    ap.add_argument("--token", type=int, choices=(16, 32), default=16)
     args = ap.parse_args()
     check_source(args.aiter_root)
-    make_overlay(args.baseline.read_text())  # validates the exact baseline row
+    make_overlay(
+        args.baseline.read_text(), args.token
+    )  # validates the exact baseline row
     os.environ["AITER_CONFIG_GROUPED_FMOE"] = str(args.baseline)
     os.environ["AITER_LOG_LEVEL"] = "WARNING"
     import torch
 
     gm = importlib.import_module("aiter.ops.flydsl.grouped_moe_gfx1250")
     fm = importlib.import_module("aiter.fused_moe")
-    from make_overlay import UPDATE
+    _, _, update = profile(args.token)
 
     assert pathlib.Path(gm.__file__).resolve().is_relative_to(args.aiter_root.resolve())
     helper = load(
@@ -49,7 +52,7 @@ def main():
     )
     torch.set_num_threads(1)
     torch.manual_seed(args.seed)
-    fixture, kw = helper._moe_args(16)
+    fixture, kw = helper._moe_args(args.token)
     sets = [(fixture[1], fixture[2], kw["w1_scale"], kw["w2_scale"])]
     sets += [tuple(x.clone() for x in sets[0]) for _ in range(3)]
     original = gm._find_grouped_config
@@ -57,14 +60,14 @@ def main():
 
     def config(**k):
         row = original(**k)
-        if enabled and k["token_num"] == 16 and not k.get("ep_fused", False):
-            return dict(row, **UPDATE)
+        if enabled and k["token_num"] == args.token and not k.get("ep_fused", False):
+            return dict(row, **update)
         return row
 
     gm._find_grouped_config = config
     rows = []
     try:
-        for m in range(9, 17):
+        for m in range(args.token // 2 + 1, args.token + 1):
             inputs = []
             for slot in range(4):
                 x = (torch.randn(m, 6144, device="cuda") * 0.25).bfloat16()
@@ -74,7 +77,7 @@ def main():
                 weights[:, -1] = 1.0
                 inputs.append((x, ids, weights))
 
-            def run(slot):
+            def run(slot, inputs=inputs):
                 x, ids, weights = inputs[slot]
                 w1, w2, s1, s2 = sets[slot]
                 return fm.fused_moe(
@@ -126,17 +129,17 @@ def main():
                     end.synchronize()
                     times[i].append(start.elapsed_time(end) * 1000 / 32)
             us = [statistics.median(v) for v in times]
-            row = dict(
-                m=m,
-                seed=args.seed,
-                base_us=us[0],
-                aa_us=us[1],
-                candidate_us=us[2],
-                speedup=us[0] / us[2],
-                aa_speedup=us[0] / us[1],
-                exact=True,
-                samples_us=times,
-            )
+            row = {
+                "m": m,
+                "seed": args.seed,
+                "base_us": us[0],
+                "aa_us": us[1],
+                "candidate_us": us[2],
+                "speedup": us[0] / us[2],
+                "aa_speedup": us[0] / us[1],
+                "exact": True,
+                "samples_us": times,
+            }
             rows.append(row)
             print(
                 json.dumps({k: v for k, v in row.items() if k != "samples_us"}),

@@ -1,4 +1,4 @@
-# MiniMax-M3 2026-11-10 recipe: TP4 M16 MoE decode overlay
+# MiniMax-M3 2026-11-10 recipe: guarded TP4 MoE decode overlays
 
 This is an **opt-in, version-pinned recipe experiment**, not a tuning-table
 change for current main. Current main's grouped TDM load interface differs
@@ -12,7 +12,7 @@ Pinned server:
 - TP4, EAGLE3 K3 with real acceptance, FP8 KV, TG=1, MONO=0,
   online PTPC FP8 for non-MoE layers, original INT4 communication.
 
-## Change
+## Default M16 change
 
 Only the FP4 MoE row for D=6144, I=768, E=129, top-k=5, padded M=16:
 - GEMM1 tile N: 384 -> 128
@@ -23,7 +23,7 @@ Only the FP4 MoE row for D=6144, I=768, E=129, top-k=5, padded M=16:
 
 The tensor dtype, quantization, activation, routing, shared expert, gather,
 GEMM2 tile and model/sampling settings are unchanged. M16 dispatch serves
-actual token counts 9–16. Other buckets remain unchanged.
+actual token counts 9–16. Other buckets remain unchanged unless the optional M32 profile below is explicitly selected.
 
 `make_overlay.py` appends a TP-only (`ep_fused=0`) row, preserving the original
 wildcard row for EP. It requires the pinned AITER commit, hashes of both critical
@@ -140,3 +140,106 @@ with A/A within about 1%, four independent weight buffers, changed inputs/routes
 and exact old/new outputs. The public numeric script passed 32 additional
 candidate comparisons exactly. CPU guard tests: 34 passed. TP-only dispatch was
 checked against the service config and EP selected its unchanged original row.
+
+## M32 incremental experiment
+
+`make_overlay.py --token 32` opts into a separately measured M32 profile.
+The default remains `--token 16`. To compose both, first generate the M16
+overlay as above, then run:
+
+    python /path/to/make_overlay.py --token 32 \
+      --aiter-root /app/aiter \
+      --baseline /workspace/m3-m16-overlay.csv \
+      --output /workspace/m3-m16-m32-overlay.csv
+
+Use the new file for `AITER_CONFIG_GROUPED_FMOE` and restart the server.
+The M32 profile appends only a TP-specific row for actual M17–32:
+GEMM1 K tile 1024 -> 256 and buffers 2 -> 3; GEMM2 N tile 256 -> 64,
+N waves 2 -> 1 and buffers 3 -> 2; B cache hint 0 -> 1. Other tiles,
+quantization, route semantics, and model/sampling settings stay unchanged.
+The original M32 wildcard EP row and all M16 rows are preserved.
+Both tools reject already-patched or unmeasured inputs.
+
+The benchmark and numeric scripts accept the same `--token 32` option.
+Run them with the original recipe CSV, not a CSV already patched for the
+selected bucket. Numeric validation requires finite, **bit-identical** outputs.
+The old M16 commands and their default bucket remain available.
+
+### Incremental AgentX evidence: M16 baseline vs M16+M32
+
+Fresh TP4 servers; 5-minute issue cap A->B, then 10-minute cap B->A.
+Client, dataset, EAGLE3 and sampling settings are as above. These results are
+incremental comparisons, not directly comparable to the earlier M16 pairs.
+
+| Pair | Metric | M16 baseline | M16+M32 | Change |
+|---|---|---:|---:|---:|
+| 5 min | TPOT p50 (ms) | 3.887 | 3.779 | -2.8% |
+| 5 min | TPOT mean (ms) | 3.853 | 3.716 | -3.5% |
+| 5 min | System output tok/s | 939.4 | 878.9 | **-6.4% (worse)** |
+| 5 min | TTFT p50 (ms) | 103.76 | 103.54 | -0.2% |
+| 5 min | Mean output tokens/turn | 520.9 | 460.0 | different |
+| 5 min | EAGLE acceptance | 17.589% | 18.050% | different |
+| 10 min | TPOT p50 (ms) | 3.878 | 3.842 | -0.9% |
+| 10 min | TPOT mean (ms) | 3.828 | 3.763 | -1.7% |
+| 10 min | System output tok/s | 934.7 | 964.4 | +3.2% |
+| 10 min | TTFT p50 (ms) | 100.77 | 95.69 | -5.0% |
+| 10 min | Mean output tokens/turn | 447.8 | 491.5 | different |
+| 10 min | EAGLE acceptance | 18.799% | 19.037% | different |
+
+All 3,704 measured turns completed, with no client tokenization fallback.
+An offline reconstruction using the exact pinned client's structured output
+and after-first-chunk rules matches each run's output-token total and mean
+TPOT. Output-length bins and inline scores are included in `results_m32.json`.
+Those bins are diagnostic, not randomized or matched-request comparisons.
+
+**No stable system-throughput gain is established.** Both TPOT point estimates
+are lower, but batch composition, output lengths and acceptance differ;
+these two pairs alone do not establish a statistical guarantee. There is no
+full-trajectory or independent accuracy evaluation, and no TTFT guarantee.
+
+### Real-data replay scope
+
+An eager diagnostic server captured rank-0 activation, routing and weight
+snapshots for MoE ordinals 0, 1, 12, 26, 40 and 56 at M32. These local-only
+model fixtures are NOT distributed in this PR. This is not a TP4 service replay
+and is not exhaustive coverage of all layers or ranks.
+
+Each saved baseline output and each candidate replay were checked exactly.
+Randomized A/A/B graph timing, rotating all six layers, measured:
+- first process: 31.863 -> 29.651 us/MoE (1.0746x);
+- independent repeat: 32.200 -> 29.980 us/MoE (1.0740x).
+
+Single-layer hot-cache results vary substantially; ordinal 12 is slightly
+slower with the candidate in the first process. The six-layer cycle is the
+reported aggregate, not a claim that every layer improves. Replaying synthetic
+inputs with `bench_moe.py` is independently reproducible but need not reproduce
+the same real-route timing. All per-layer and A/A results are retained.
+
+These incremental tests were run on control-host date 2026-11-11; C5's
+uncorrected clock labels them 2026-11-08. GPU clock settings were not changed.
+
+### Release validation and fixed-length diagnostics
+
+The shared public tools were rerun after adding `--token`:
+- CPU guards: **69 passed**, Ruff check/format and `git diff --check` passed.
+- Public whole-MoE M17–32: **1.044–1.097x**, all outputs exact, including
+  changed activation/routing and dead-tail graph replay; A/A varied by up to
+  about 1.8%. Default M9–16 regression remained 1.165–1.384x.
+- Signed packed FP4, varied scales and activation amplitudes: **32 finite,
+  bit-identical cases per bucket**, 64 total.
+
+Four fresh diagnostic servers ran A->B->B->A, c8, 32 requests per point,
+2048 output tokens/request (`ignore_eos=True`), two request sets at each of
+approximately 1.8K/14.4K input tokens. All 512 measured requests succeeded.
+Every paired request hash and input/output token count matched. All eight
+paired TPOT means were lower (0.36–5.08%); observed output tok/s was higher
+(0.48–4.45%). These are **synthetic fixed-length diagnostics, not AgentX**.
+
+In each pair, 19–26 of the 32 generated text hashes matched. Real EAGLE3
+acceptance was roughly 85–93% and differed between most pairs, much higher
+than AgentX. Fixed-length counts remove the output-length confound but do
+not remove acceptance, content or dynamic-batching differences. The client
+TPOT here uses server output usage minus one, not Endpoints' structured
+after-first-chunk token count; the two metric populations must not be pooled.
+All per-point results, exact acceptance counts and paired deltas are retained
+in `results_m32.json`. There is still no stable AgentX-throughput claim.
