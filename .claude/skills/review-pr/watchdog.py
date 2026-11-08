@@ -40,7 +40,7 @@ def _minutes_between(start, end):
 
 
 class GitHub:
-    """The three calls this needs, with no dependency to install on the hosted runner.
+    """The calls this needs, with no dependency to install on the hosted runner.
 
     Transport sits behind _get/_post on purpose: the test substitutes those two and everything
     above them -- paging, URLs, which token posts the comment -- is the shipping code.
