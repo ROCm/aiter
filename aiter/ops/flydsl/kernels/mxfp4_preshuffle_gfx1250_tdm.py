@@ -1981,6 +1981,44 @@ def launch_gemm_a8w4_tdm(
                         )
                     return row * STORE_N + col
 
+                # Each FP4 store address is one per-lane base plus a compile-time
+                # offset. The wave terms are products: the wave index comes from
+                # readfirstlane, so the compiler cannot prove wmb / wnb non-negative,
+                # and // or % on them costs a signed floor-division fix-up per store.
+                # Needs whole 16-row blocks per wave and, preshuffled, whole 16-byte
+                # column groups (64 FP4 columns) per wave.
+                quant_lane_addr = (
+                    warp_tile_m % 16 == 0
+                    and warp_tile_n % (64 if a_preshuffled else 4) == 0
+                )
+
+                def quant_lane_base():
+                    # Per-lane part of quant_byte_offset(row_rel, col_fp4), with
+                    # row_rel = wmb + wm * 16 + lane16 and
+                    # col_fp4 = (wnb + wn * 16) // 4 + kgrp * 2.
+                    if const_expr(a_preshuffled):
+                        return (
+                            wave_m * (warp_tile_m // 16 * 16 * STORE_N)
+                            + wave_n * (warp_tile_n // 64 * 256)
+                            + lane16 * 16
+                            + kgrp * 2
+                        )
+                    return (
+                        (wave_m * warp_tile_m + lane16) * STORE_N
+                        + wave_n * (warp_tile_n // 4)
+                        + kgrp * 2
+                    )
+
+                def quant_const_off(wm, wn):
+                    # The compile-time rest; kgrp * 2 + (wn % 4) * 4 stays inside one
+                    # 16-byte column group.
+                    if const_expr(a_preshuffled):
+                        return wm * 16 * STORE_N + (wn // 4) * 256 + (wn % 4) * 4
+                    return wm * 16 * STORE_N + wn * 4
+
+                if const_expr(is_fp4_quant and quant_lane_addr):
+                    stC_lane = fx.Int32(stC_idx) + fx.Int32(quant_lane_base())
+
                 for wm in range_constexpr(wmma_m_rep):
                     # A 16-row block entirely past this expert's valid rows has its
                     # output OOB-clamped away, so skip its work. Wave-uniform, so
@@ -2067,18 +2105,30 @@ def launch_gemm_a8w4_tdm(
                                         scale_f32,
                                         i32_ty=T.i32,
                                     )
-                                    col_fp4_0 = (wnb + wn0 * 16) // 4 + kgrp * 2
-                                    col_fp4_1 = (wnb + wn1 * 16) // 4 + kgrp * 2
-                                    lds_store_b16(
-                                        stC_idx,
-                                        quant_byte_offset(row_rel, col_fp4_0),
-                                        packed_i32,
-                                    )
-                                    lds_store_b16(
-                                        stC_idx,
-                                        quant_byte_offset(row_rel, col_fp4_1),
-                                        packed_i32 >> fx.Int32(16),
-                                    )
+                                    if const_expr(quant_lane_addr):
+                                        lds_store_b16(
+                                            stC_lane,
+                                            quant_const_off(wm, wn0),
+                                            packed_i32,
+                                        )
+                                        lds_store_b16(
+                                            stC_lane,
+                                            quant_const_off(wm, wn1),
+                                            packed_i32 >> fx.Int32(16),
+                                        )
+                                    else:
+                                        col_fp4_0 = (wnb + wn0 * 16) // 4 + kgrp * 2
+                                        col_fp4_1 = (wnb + wn1 * 16) // 4 + kgrp * 2
+                                        lds_store_b16(
+                                            stC_idx,
+                                            quant_byte_offset(row_rel, col_fp4_0),
+                                            packed_i32,
+                                        )
+                                        lds_store_b16(
+                                            stC_idx,
+                                            quant_byte_offset(row_rel, col_fp4_1),
+                                            packed_i32 >> fx.Int32(16),
+                                        )
                             else:
                                 for half in range_constexpr(WN_PER_MX_BLOCK // 2):
                                     src = Vec.from_elements(
