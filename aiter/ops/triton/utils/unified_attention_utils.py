@@ -205,6 +205,7 @@ def compute_segment_params(config: dict, params) -> dict:
     wave_slots = config.pop("SPLIT_WAVE_SLOTS_PER_CU", 0)
     seg_overhead = config.pop("SPLIT_SEG_OVERHEAD_TILES", 0)
     partial_cost = config.pop("SPLIT_PARTIAL_COST", 0.0)
+    max_prgms_per_cu = config.pop("SPLIT_MAX_PRGMS_PER_CU", 0)
 
     # Callers may pass NumPy scalars (e.g. max_seqlen_k from a NumPy array), and
     # those have no bit_length and can overflow in shifts. Work in Python ints.
@@ -275,7 +276,10 @@ def compute_segment_params(config: dict, params) -> dict:
             half = 1 << (half.bit_length() - 1) if half else 0
             longest = 1 << (max(1, limit // seg_min_tiles).bit_length() - 1)
             share = max(longest, half)
-    if limit <= min_tiles or share < min_share or too_many_seqs:
+    # past this many programs per CU the unsplit grid already streams KV at
+    # full bandwidth, and splitting only adds partials
+    too_busy = max_prgms_per_cu and prgms > max_prgms_per_cu * num_sms
+    if limit <= min_tiles or share < min_share or too_many_seqs or too_busy:
         segments = 1
     else:
         claim = max(min(lo, limit), min(limit, max(1, share)))
