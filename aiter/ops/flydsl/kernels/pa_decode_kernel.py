@@ -60,6 +60,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import const_expr, gpu, range_constexpr
+from flydsl.expr.typing import T
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
 
@@ -755,10 +756,17 @@ def compile_gfx1250_pa_decode(
                     first_step * (t.TOKENS // t.block_size)
                     + fx.Int32(fx.rocdl.wave_id()) * wave_pages
                 )
+                # Only the active branch reads the ids, and the compiler would
+                # sink their loads into it, after the length's wait; the
+                # readfirstlanes are convergent, so they keep the loads here.
                 stage_pages = [
-                    fx.Int32(tbl[row + fx.min(page + j, max_blocks - 1)])
+                    fx.Int32(
+                        fx.rocdl.readfirstlane(
+                            T.i32, tbl[row + fx.min(page + j, max_blocks - 1)]
+                        )
+                    )
                     for j in range_constexpr(wave_pages)
-                ] + [fx.Int32(tbl[row])]
+                ] + [fx.Int32(fx.rocdl.readfirstlane(T.i32, tbl[row]))]
                 length = fx.max(task_context, fx.Int32(0))
                 steps = (length + t.TOKENS - 1) // t.TOKENS
                 count = fx.min((steps + chunk - 1) // chunk, fx.Int32(t.cluster_merge))
