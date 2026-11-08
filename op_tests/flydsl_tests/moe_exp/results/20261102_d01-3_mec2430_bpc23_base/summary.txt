@@ -1,0 +1,36 @@
+start      2026-11-02 00:42:49 UTC
+host       heliosr-1b114-d01-3   boot 2026-11-01 23:42:32 (system clock, UTC)
+repo       f471dc7f4 2026-11-01 21:25:09 +0000 moe_exp: 2026-11-01 baseline at 8ea2265dc; profiler probe
+dirty      0 modified tracked files
+python     3.12.3 | torch 2.11.0+rocm10.1.0a20260820 | flydsl 0.3.3.dev882 | aiter 0.1.27.dev297+g34a8bad6a @ /data/lixzhang/flydsl_moe_exp/site_8ea2265dc/aiter/__init__.py
+site       /data/lixzhang/flydsl_moe_exp/site_8ea2265dc
+firmware   CP_MEC1 FW_VERSION: 2430 PM FW_VERSION: 02.125.15.00
+clock       MAX_CLK: 2400 MHz
+power cap   SOCKET_POWER_LIMIT: 2500 W  SOCKET_POWER_LIMIT: 3700 W
+variants   base
+rounds     5 timed (+ warm-up round 0)
+args       --scenario kernel --data-format a4w4 --experts 64 --tokens 1536 --topk 8 --model-dim 7168 --inter-dim 2048 --act silu --no-bias --iters 128 --no-check-aot-cache --data-init uniform --scale-init uniform
+base env   AITER_FLYDSL_MMA_FIRST_GROUP=4 AITER_FLYDSL_MMA_GROUP=4 AITER_FLYDSL_DS_FIRST_N=8 AITER_USE_GROUPED_GEMM=1 AITER_GROUPED_DEBUG=0 ENABLE_CK=0 FLYDSL_DUMP_IR=1 AITER_LOG_MORE=1 AITER_MOE_EXPERT_BALANCE=true AITER_FLYDSL_EXPLICIT_VGPR_PARTITION=1 AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE=1
+
+byte model (MB): gemm1 1058.4, gemm2 688.7  (see summarize.py)
+
+variant    kernel   timer     per-round us                         median   TB/s  vs 1st
+----------------------------------------------------------------------------------------
+base       quant_a1 profiler  21.89 21.75 21.67 21.73 21.65         21.73      -   +0.0%
+base       quant_a1 graph     20.31 20.34 20.26 20.33 20.38         20.33      -   +0.0%
+base       gemm1    profiler  73.73 74.53 74.72 74.97 74.63         74.63  14.18   +0.0%
+base       gemm1    graph     74.81 75.04 74.85 74.96 75.03         74.96  14.12   +0.0%
+base       gemm2    profiler  52.08 51.67 52.22 52.50 52.52         52.22  13.19   +0.0%
+base       gemm2    graph     51.79 51.75 51.80 51.99 51.82         51.80  13.29   +0.0%
+
+base: accuracy logits_diff=3.4249e-06 rel_l2=2.6172e-03
+    a8w4_tdm_fp4_apre_t256x256x256_w2x2_b4_K2048_e64_cluster1x4_prefetch_bth1_wpt1_mg4_dsfirst8_regpart_planarlds_interleavelds_rolleddrain
+    a8w4_tdm_fp4_apre_t256x256x256_w2x2_b4_K7168_e64_act1_q1r8_cluster1x4_prefetch_bth1_wpt1_mg4_dsfirst8_regpart_planarlds_interleavelds_rolleddrain
+
+outputs vs base_r1.pt:
+    base_r0.pt               bit-identical=True NaN=0
+    base_r1.pt               bit-identical=True NaN=0
+    base_r2.pt               bit-identical=True NaN=0
+    base_r3.pt               bit-identical=True NaN=0
+    base_r4.pt               bit-identical=True NaN=0
+    base_r5.pt               bit-identical=True NaN=0

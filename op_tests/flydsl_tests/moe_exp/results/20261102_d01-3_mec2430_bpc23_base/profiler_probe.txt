@@ -1,0 +1,17 @@
+# 2026-11-02 01:26:25 UTC, boot 2026-11-01 23:42:32 UTC (power-cycled), MEC CP_MEC1 2430 (d798bf71), perf_setup_BPC23 applied 00:25 UTC
+# gpu-lock python -I op_tests/flydsl_tests/moe_exp/profiler_probe.py
+/home/lixzhang/gfx1250/.venv/lib/python3.12/site-packages/torch/profiler/profiler.py:224: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
+  _warn_once(
+[W1102 01:26:26.929325504 collection.cpp:1148] Warning: ROCTracer produced duplicate flow start: 1 (function operator())
+trial 0: 256 device events (expect 256)
+    128 x Memcpy DtoD (Device -> Device)  avg 24.74 us
+    128 x Cijk_Ailk_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT32x16x32_MI16x16x1_SN_L  avg 1014.40 us
+trial 1: 256 device events (expect 256)
+    128 x Memcpy DtoD (Device -> Device)  avg 24.35 us
+    128 x Cijk_Ailk_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT32x16x32_MI16x16x1_SN_L  avg 1018.12 us
+trial 2: 256 device events (expect 256)
+    128 x Memcpy DtoD (Device -> Device)  avg 24.39 us
+    128 x Cijk_Ailk_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT32x16x32_MI16x16x1_SN_L  avg 1018.38 us
+# Same boot, 00:42 UTC (before the benchmark): the GPU REALTIME counter and KFD's gpu clock counter agree to 0.016 ms.
+# On the 2026-11-01 08:28 and 22:08 UTC boots (warm reboots) they differed by 38.8 s and 77.7 s and this probe got 0 events;
+# the power cycle before this boot re-aligned them.

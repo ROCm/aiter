@@ -1,0 +1,18 @@
+agent timestamp freq 100000000 Hz, system freq 1000000000 Hz, KFD system_clock_freq 1000000000
+KFD pair before: gpu 1259443724648  system(boottime) 12518234917335   host BOOTTIME 12518234922615   (KFD sys - host = -5.3 us)
+ROCr convert(KFD gpu tick) - KFD system = -0.000 ms
+kernel REALTIME R = 1259443726312;  R - KFD gpu before = 1664 ticks = +0.017 ms;  KFD gpu after - R = +0.027 ms
+ROCr convert(R) - host window start = +0.011 ms (window 0.035 ms)
+roctracer HIP_OPS record op 0: begin - host window start = +0.010 ms, dur 1.92 us
+/home/lixzhang/gfx1250/.venv/lib/python3.12/site-packages/torch/profiler/profiler.py:224: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
+  _warn_once(
+[W1102 17:53:00.260810158 collection.cpp:1148] Warning: ROCTracer produced duplicate flow start: 1 (function operator())
+trial 0: 256 device events (expect 256)
+    128 x Memcpy DtoD (Device -> Device)  avg 24.52 us
+    128 x Cijk_Ailk_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT32x16x32_MI16x16x1_SN_L  avg 1013.26 us
+trial 1: 256 device events (expect 256)
+    128 x Memcpy DtoD (Device -> Device)  avg 24.23 us
+    128 x Cijk_Ailk_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT32x16x32_MI16x16x1_SN_L  avg 1014.36 us
+trial 2: 256 device events (expect 256)
+    128 x Memcpy DtoD (Device -> Device)  avg 24.36 us
+    128 x Cijk_Ailk_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT32x16x32_MI16x16x1_SN_L  avg 1015.64 us

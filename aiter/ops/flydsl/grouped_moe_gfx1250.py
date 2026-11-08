@@ -694,6 +694,26 @@ def _grouped_a8w4_tdm_moe(
         _align_m, _tdm_align_up(token_num * topk + E * _align_m - topk, _align_m)
     )
     max_m = max(_align_m, _tdm_align_up(token_num * topk, _align_m))
+    if os.environ.get("AITER_GROUPED_UNIFORM_M", "0") == "1" and not _compact:
+        # Experiment only (moe_exp): with uniform routing every expert gets exactly
+        # token_num * topk / E rows, so M is sized for that instead of the worst
+        # case, and the grid has no all-padding M tiles. A heavier expert would
+        # write past the buffers, so the routing is checked here (outside capture).
+        if expert_mask is not None or (token_num * topk) % E:
+            raise ValueError(
+                "AITER_GROUPED_UNIFORM_M=1 needs non-EP routing with token_num * "
+                f"topk ({token_num} * {topk}) divisible by E ({E})"
+            )
+        _rows_per_expert = token_num * topk // E
+        contiguous_m = E * _tdm_align_up(_rows_per_expert, _align_m)
+        if not torch.cuda.is_current_stream_capturing():
+            _counts = torch.bincount(topk_ids.reshape(-1).long(), minlength=E)
+            if not bool((_counts == _rows_per_expert).all()):
+                raise ValueError(
+                    "AITER_GROUPED_UNIFORM_M=1: routing is not uniform; rows per "
+                    f"expert range {int(_counts.min())}..{int(_counts.max())}, "
+                    f"expected {_rows_per_expert}"
+                )
     if _compact:
         # Rows this step can hold, falling back to the arena's when the caller
         # gave no bound. The arena is sized for a full prefill, so spending it on
@@ -729,6 +749,9 @@ def _grouped_a8w4_tdm_moe(
         not _compact
         and not _is_ep
         and not enable_ep_scatter
+        # The fused route cannot fill the A-preshuffle row -> token map; without it
+        # the A scatter treats every row as padding and A's scales stay zero.
+        and not a_preshuffled
         and token_num * topk <= _FUSED_ROUTE_PSUM_MAX_NUMEL
         and int(E) <= _FUSED_ROUTE_PSUM_MAX_EXPERTS
     )

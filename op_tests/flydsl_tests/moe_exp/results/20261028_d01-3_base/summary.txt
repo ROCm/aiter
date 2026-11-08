@@ -1,0 +1,33 @@
+start      2026-10-28 23:35:34 UTC
+host       heliosr-1b114-d01-3   boot 2026-10-28 14:09:13
+repo       2489bae2d 2026-10-27 16:20:59 +0800 Optimize gfx1250 MoE A-preshuffle preparation and prefill scheduling (#6984)
+dirty      0 modified tracked files
+python     3.12.3 | torch 2.11.0+rocm10.1.0a20260820 | flydsl 0.3.3.dev882 | aiter 0.1.26.dev44+g2489bae2d @ /data/lixzhang/flydsl_moe_exp/site/aiter/__init__.py
+site       /data/lixzhang/flydsl_moe_exp/site
+firmware   CP_MEC1 FW_VERSION: 2560 PM FW_VERSION: 02.125.15.00
+clock       MAX_CLK: 2400 MHz
+variants   base
+rounds     5 timed (+ warm-up round 0)
+args       --scenario kernel --data-format a4w4 --experts 64 --tokens 1536 --topk 8 --model-dim 7168 --inter-dim 2048 --act silu --no-bias --iters 128 --no-check-aot-cache --data-init uniform --scale-init uniform
+base env   AITER_USE_GROUPED_GEMM=1 AITER_GROUPED_A4W4_A_PRESHUFFLE=1 AITER_GROUPED_DEBUG=0 ENABLE_CK=0 FLYDSL_DUMP_IR=1 AITER_LOG_MORE=1 AITER_MOE_EXPERT_BALANCE=true AITER_FLYDSL_EXPLICIT_VGPR_PARTITION=1 AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE=1
+
+byte model (MB): gemm1 1058.4, gemm2 688.7  (see summarize.py)
+
+variant    kernel timer     per-round us                         median   TB/s  vs 1st
+--------------------------------------------------------------------------------------
+base       gemm1  profiler  83.73 83.76 84.30 83.76 84.19         83.76  12.64   +0.0%
+base       gemm1  graph     80.47 80.85 80.35 81.05 80.86         80.85  13.09   +0.0%
+base       gemm2  profiler  58.87 58.40 59.18 58.80 59.30         58.87  11.70   +0.0%
+base       gemm2  graph     53.73 53.62 53.90 53.63 54.05         53.73  12.82   +0.0%
+
+base: accuracy logits_diff=3.4249e-06 rel_l2=2.6172e-03
+    a8w4_tdm_fp4_apre_t256x256x256_w2x2_b4_K2048_e64_cluster1x4_prefetch_bth1_wpt1_mg1x2_dsfirst16_regpart_planarlds_interleavelds_rolleddrain
+    a8w4_tdm_fp4_apre_t256x256x256_w2x2_b4_K7168_e64_act1_q1r8_cluster1x4_prefetch_bth1_wpt1_mg1x2_dsfirst16_regpart_planarlds_interleavelds_rolleddrain
+
+outputs vs base_r1.pt:
+    base_r0.pt               bit-identical=True NaN=0
+    base_r1.pt               bit-identical=True NaN=0
+    base_r2.pt               bit-identical=True NaN=0
+    base_r3.pt               bit-identical=True NaN=0
+    base_r4.pt               bit-identical=True NaN=0
+    base_r5.pt               bit-identical=True NaN=0
