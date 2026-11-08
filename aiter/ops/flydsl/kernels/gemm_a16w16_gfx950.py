@@ -14,7 +14,7 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.runtime.device import get_rocm_arch
 
 from aiter.jit.utils.chip_info import get_cu_num
-from aiter.utility.graph_alloc import persistent_alloc
+from aiter.utility.graph_alloc import capture_scoped_cache, persistent_alloc
 
 from .gemm_a16w16_gfx950_utils import (
     GFX950_DMA_BYTES,
@@ -31,7 +31,11 @@ from .gemm_a16w16_gfx950_utils import (
     wait_vmcnt_and_barrier,
 )
 from .kernels_common import run_cached, set_slp_vectorize_once_used
-from .tensor_shim import buf_base_i64
+from .tensor_shim import (
+    AITER_FLYDSL_KERNARG_PRELOAD,
+    AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
+    buf_base_i64,
+)
 
 GEMM_A16W16_DTYPE_FP32 = 1
 GEMM_A16W16_DTYPE_BF16 = 2
@@ -143,6 +147,8 @@ class GemmA16W16Gfx950Param:
     n_waves: fx.Constexpr[int]
     k_waves: fx.Constexpr[int]
     group_m: fx.Constexpr[int]
+    k_stagger: fx.Constexpr[int]
+    b_non_temporal: fx.Constexpr[bool]
     use_half_tile_interleaved: fx.Constexpr[bool]
     a_is_transposed: fx.Constexpr[bool]
     b_is_transposed: fx.Constexpr[bool]
@@ -187,6 +193,7 @@ class AsyncLoadTile:
     global_outer_offset: Any
     leading_stride: Any
     k_tile: Any
+    non_temporal: bool = False
 
 
 def make_gemm_a16w16_gfx950_param(
@@ -210,6 +217,8 @@ def make_gemm_a16w16_gfx950_param(
     mma_m: int = 16,
     mma_n: int = 16,
     mma_k: int = 32,
+    k_stagger: int = 0,
+    b_non_temporal: bool = False,
 ) -> GemmA16W16Gfx950Param:
     if in_dtype_id not in (GEMM_A16W16_DTYPE_BF16, GEMM_A16W16_DTYPE_FP16):
         raise ValueError(f"unsupported in_dtype_id={in_dtype_id}")
@@ -229,6 +238,10 @@ def make_gemm_a16w16_gfx950_param(
         raise ValueError("m_waves, n_waves, and k_waves must be positive")
     if m_waves * n_waves * k_waves > 16:
         raise ValueError("the workgroup cannot contain more than 16 waves")
+    if not isinstance(k_stagger, int) or isinstance(k_stagger, bool) or k_stagger < 0:
+        raise ValueError("k_stagger must be a non-negative integer")
+    if not isinstance(b_non_temporal, bool):
+        raise TypeError("b_non_temporal must be a bool")
     if group_m < 0:
         raise ValueError("group_m must be non-negative")
     in_dbytes = 2
@@ -388,6 +401,8 @@ def make_gemm_a16w16_gfx950_param(
         n_waves=n_waves,
         k_waves=k_waves,
         group_m=group_m,
+        k_stagger=k_stagger,
+        b_non_temporal=b_non_temporal,
         use_half_tile_interleaved=use_half_tile_interleaved,
         a_is_transposed=a_is_transposed,
         b_is_transposed=b_is_transposed,
@@ -432,6 +447,8 @@ def make_gemm_a16w16_gfx950_kernel_name(param: GemmA16W16Gfx950Param):
     # "m": split-K partials of the rows below M only
     name += "m" if param.split_k_row_mask else ""
     name += f"_gm{param.group_m}"
+    name += f"_stg{param.k_stagger}" if param.k_stagger else ""
+    name += "_bnt" if param.b_non_temporal else ""
     name += f"_bias{int(param.has_bias)}"
     a_layout = "t" if param.a_is_transposed else "n"
     b_layout = "t" if param.b_is_transposed else "n"
@@ -548,7 +565,22 @@ def async_load_to_lds(
         src = fx.make_view(tile.src_base + global_offset, g2s_copy_layout)
         dst = fx.make_view(lds_ptr, g2s_copy_layout)
         rocdl.sched_barrier(0)
-        fx.copy_atom_call(context.async_g2s_copy_atom, src, dst)
+        if const_expr(tile.non_temporal):
+            # The async copy atom has no cache-policy operand. Keep the raw
+            # load async too, so the existing asyncmark/wait_asyncmark groups
+            # still track its completion. src_base is the buffer origin;
+            # lds_ptr is wave-uniform and hardware adds the lane offset.
+            rocdl.raw_ptr_buffer_load_async_lds(
+                fx.rocdl.get_buffer_rsrc(tile.src_base),
+                fx.to_llvm_ptr(lds_ptr),
+                fx.Int32(GFX950_DMA_BYTES).ir_value(),
+                fx.Int32(global_offset * elem_bytes).ir_value(),
+                fx.Int32(0).ir_value(),
+                fx.Int32(0).ir_value(),
+                aux=ir.IntegerAttr.get(ir.IntegerType.get_signless(32), 2),
+            )
+        else:
+            fx.copy_atom_call(context.async_g2s_copy_atom, src, dst)
         rocdl.sched_barrier(0)
         if i < load_iters - 1:
             lds_ptr = lds_ptr + block_threads * async_load_vec_size
@@ -631,6 +663,10 @@ def gemm_a16w16_gfx950_kernel(
     ks_end = ks_begin + working_k
     ks_end = (ks_end < k).select(ks_end, k)
     k_tiles = (ks_end - ks_begin) // block_k
+    if const_expr(param.k_stagger > 0):
+        # Rotate only the global K loads, never the LDS ring index. The
+        # actual partition length also handles a shorter final split.
+        k_start = (fx.block_idx.x * param.k_stagger) % k_tiles
     block_m_offset = bid_m * block_m
     block_n_offset = bid_n * block_n
 
@@ -762,6 +798,9 @@ def gemm_a16w16_gfx950_kernel(
         init_frag_C()
 
     def async_load_a_to_lds(k_tile, stage):
+        if const_expr(param.k_stagger > 0):
+            shifted = k_tile + k_start
+            k_tile = (shifted < k_tiles).select(shifted, shifted - k_tiles)
         async_load_to_lds(
             tile=AsyncLoadTile(
                 lds_base=smem_a + stage * block_m * block_k,
@@ -779,10 +818,14 @@ def gemm_a16w16_gfx950_kernel(
         )
 
     def async_load_b_to_lds(k_tile, stage):
+        if const_expr(param.k_stagger > 0):
+            shifted = k_tile + k_start
+            k_tile = (shifted < k_tiles).select(shifted, shifted - k_tiles)
         async_load_to_lds(
             tile=AsyncLoadTile(
                 lds_base=smem_b + stage * block_n * block_k,
                 src_base=fx.get_iter(b_buf),
+                non_temporal=param.b_non_temporal,
                 lds_layout=b_lds_layout,
                 outer_tile_size=block_n,
                 outer_bound=n,
@@ -1220,6 +1263,10 @@ def gemm_a16w16_hti_gfx950_kernel(
     ks_end = ks_begin + working_k
     ks_end = (ks_end < k).select(ks_end, k)
     k_tiles = (ks_end - ks_begin) // block_k
+    if const_expr(param.k_stagger > 0):
+        # Rotate only the global K loads, never the LDS ring index. The
+        # actual partition length also handles a shorter final split.
+        k_start = (fx.block_idx.x * param.k_stagger) % k_tiles
     block_m_offset = bid_m * block_m
     block_n_offset = bid_n * block_n
 
@@ -1296,6 +1343,9 @@ def gemm_a16w16_hti_gfx950_kernel(
         return smem_b + (stage * block_n + n_part * half_block_n) * block_k
 
     def async_load_a_to_lds(m_part, k_tile, stage):
+        if const_expr(param.k_stagger > 0):
+            shifted = k_tile + k_start
+            k_tile = (shifted < k_tiles).select(shifted, shifted - k_tiles)
         async_load_to_lds(
             tile=AsyncLoadTile(
                 lds_base=half_a_base(stage, m_part),
@@ -1313,10 +1363,14 @@ def gemm_a16w16_hti_gfx950_kernel(
         )
 
     def async_load_b_to_lds(n_part, k_tile, stage):
+        if const_expr(param.k_stagger > 0):
+            shifted = k_tile + k_start
+            k_tile = (shifted < k_tiles).select(shifted, shifted - k_tiles)
         async_load_to_lds(
             tile=AsyncLoadTile(
                 lds_base=half_b_base(stage, n_part),
                 src_base=fx.get_iter(b_buf),
+                non_temporal=param.b_non_temporal,
                 lds_layout=b_lds_layout,
                 outer_tile_size=half_block_n,
                 outer_bound=n,
@@ -1674,6 +1728,12 @@ def gemm_a16w16_gfx950(
     )
 
 
+gemm_a16w16_gfx950.compile_hints = {
+    "llvm_options": {
+        "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
+        "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
+    },
+}
 set_slp_vectorize_once_used(gemm_a16w16_gfx950, False)
 
 
@@ -1771,7 +1831,7 @@ def assert_no_k_tail(k: int, kwargs: dict):
         )
 
 
-@functools.lru_cache(maxsize=128)
+@capture_scoped_cache
 def get_split_k_buffers(stream, device):
     # One arrival counter per output tile, which the last split to arrive resets.
     with persistent_alloc(torch.device(device)):
