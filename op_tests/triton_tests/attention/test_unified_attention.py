@@ -10,13 +10,21 @@ import pytest
 import torch
 
 from aiter.ops.triton.attention.unified_attention import (
+    _gfx950_gluon_supported,
+    _gfx950_split_params,
     _is_gluon_available,
+    _UAParams,
     is_2d_gluon_available,
     unified_attention,
+    use_2d_kernel,
 )
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.device_info import get_num_sms
 from aiter.ops.triton.utils.shuffle import shuffle_scale_batched, shuffle_weight
 from aiter.ops.triton.utils.types import e4m3_dtype
+from aiter.ops.triton.utils.unified_attention_utils import (
+    get_unified_attention_config,
+)
 from aiter.test_common import checkAllclose
 from op_tests.triton_tests.quant.test_quant_mxfp4 import (
     torch_dynamic_mxfp4_quant,
@@ -1019,6 +1027,178 @@ def test_triton_unified_attn_sw_split_no_sinks(seq_lens, num_heads, block_size):
         v_descale=None,
     )
     torch.testing.assert_close(out.float(), ref, atol=1.5e-2, rtol=1e-2)
+
+
+def _window_decode_params(
+    q, k, v, out, cu_seqlens_q, seqused_k, block_table, scale, window_size, sinks
+):
+    """The params unified_attention builds for an unshuffled launch."""
+    num_tokens, num_query_heads, head_size = q.shape
+    num_blocks, block_size, num_kv_heads, _ = k.shape
+    num_seqs = len(seqused_k)
+    num_queries_per_kv = num_query_heads // num_kv_heads
+    num_sms = get_num_sms()
+    return _UAParams(
+        q=q,
+        k=k,
+        v=v,
+        out=out,
+        cu_seqlens_q=cu_seqlens_q,
+        seqused_k=seqused_k,
+        block_table=block_table,
+        softmax_scale=scale,
+        softcap=0,
+        causal=True,
+        sliding_window=1 + window_size[0],
+        max_seqlen_q=int(max(torch.diff(cu_seqlens_q.cpu()))),
+        max_seqlen_k=int(seqused_k.max()),
+        num_tokens=num_tokens,
+        num_query_heads=num_query_heads,
+        num_kv_heads=num_kv_heads,
+        num_queries_per_kv=num_queries_per_kv,
+        head_size=head_size,
+        head_size_v=v.shape[-1],
+        num_seqs=num_seqs,
+        total_num_q_blocks=num_seqs,
+        num_2d_prgms=num_seqs * num_kv_heads,
+        num_blocks=num_blocks,
+        block_size=block_size,
+        k_width=16 if q.dtype == e4m3_dtype else 8,
+        scale_k_width=4,
+        block_scales_size=16,
+        q_dtype=q.dtype,
+        kv_cache_dtype=k.dtype,
+        all_decode=True,
+        shuffled_kv_cache=False,
+        use_alibi_slopes=False,
+        use_qq_bias=False,
+        num_sms=num_sms,
+        target_num_prgms=num_sms * 4,
+        sinks=sinks,
+    )
+
+
+@pytest.mark.parametrize("head_size, num_heads", [(128, (8, 1)), (256, (32, 2))])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, e4m3_dtype])
+@pytest.mark.parametrize("use_sinks", [False, True])
+@torch.inference_mode()
+def test_triton_unified_attn_window_decode_split(
+    head_size, num_heads, dtype, use_sinks
+):
+    """q=1 sliding-window decode at head 128 and 256, bf16 and fp8.
+
+    These heads are outside test_triton_unified_attn_3d, which is head 64.
+    The batch is one that the gfx950 gluon config splits into several
+    segments, and the test checks that before comparing the output.
+    """
+    if DEVICE_ARCH != "gfx950" or not _is_gluon_available():
+        pytest.skip("gfx950 gluon window decode")
+
+    sliding_window = 2048
+    seq_lens = [(1, 8192)] * 8
+    block_size = 16
+    query_lens = [q for q, _ in seq_lens]
+    kv_lens = [kv for _, kv in seq_lens]
+    (
+        query,
+        key_cache,
+        value_cache,
+        launched_k,
+        launched_v,
+        sinks,
+        output,
+        cu_query_lens,
+        kv_lens_t,
+        max_query_len,
+        max_kv_len,
+        scale,
+        window_size,
+        block_tables,
+        _maybe_quant_query,
+        _query_scales,
+        q_descale,
+        k_descale,
+        v_descale,
+        _output_scale,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        num_blocks=len(seq_lens) * ((max(kv_lens) + block_size - 1) // block_size),
+        block_size=block_size,
+        head_size=head_size,
+        num_heads=num_heads,
+        sliding_window=sliding_window,
+        q_dtype=dtype,
+        kv_dtype=dtype,
+        out_dtype=torch.bfloat16,
+    )
+    sinks = sinks if use_sinks else None
+    params = _window_decode_params(
+        query,
+        launched_k,
+        launched_v,
+        output,
+        cu_query_lens,
+        kv_lens_t,
+        block_tables,
+        scale,
+        window_size,
+        sinks,
+    )
+    assert _gfx950_gluon_supported(params)
+    assert not use_2d_kernel(params, "gluon")
+    num_segments = int(
+        get_unified_attention_config(
+            "kv_split", _gfx950_split_params(params), backend="gluon"
+        )["NUM_SEGMENTS"]
+    )
+    assert num_segments > 1, num_segments
+
+    unified_attention(
+        q=query,
+        k=launched_k,
+        v=launched_v,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens_t,
+        max_seqlen_q=max_query_len,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window_size,
+        block_table=block_tables,
+        softcap=0,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        sinks=sinks,
+    )
+    ref = ref_paged_attn(
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        query_lens=query_lens,
+        kv_lens=kv_lens,
+        block_tables=block_tables,
+        scale=scale,
+        out_dtype=torch.bfloat16,
+        sliding_window=sliding_window,
+        sinks=sinks,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+    )
+    atol, rtol = (1.5e-2, 1e-2) if dtype == torch.bfloat16 else (1.5e-1, 1.5e-1)
+    assert (
+        checkAllclose(
+            output,
+            ref,
+            atol=atol,
+            rtol=rtol,
+            tol_err_ratio=0.01,
+            msg=f"window decode head {head_size} {dtype} sinks={use_sinks}",
+        )
+        <= 0.01
+    )
 
 
 @pytest.mark.parametrize(
