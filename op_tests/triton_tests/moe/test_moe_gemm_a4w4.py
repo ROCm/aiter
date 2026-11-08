@@ -298,14 +298,21 @@ def test_op(
     assert_close(ref_y, tri_y, maxtol=maxtol, rmstol=rmstol)
 
 
-def _compiled_kernels(fn):
+def _kernels_launched_by(fn, call):
+    """Run call() with fn's in-memory JIT cache emptied first, so whatever
+    is in the cache afterwards is exactly what this call launched (reloaded
+    from the on-disk cache if it was compiled before)."""
     while not hasattr(fn, "device_caches"):
         fn = fn.fn
-    return {
-        key: kernel
+    for kernel_cache, *_ in fn.device_caches.values():
+        kernel_cache.clear()
+    call()
+    torch.cuda.synchronize()
+    return [
+        kernel
         for kernel_cache, *_ in fn.device_caches.values()
-        for key, kernel in kernel_cache.items()
-    }
+        for kernel in kernel_cache.values()
+    ]
 
 
 # DeepSeek-V4-Pro TP4 decode: GEMM1 (gather + SwiGLU) and GEMM2 (scatter + gammas).
@@ -349,34 +356,28 @@ def test_decode_output_not_tdm_stored(m, n, k, do_gather, device="cuda"):
     w = preshuffle_moe_weight(w)
     x, x_scale = mxfp4_quant(x)
 
-    before = set(_compiled_kernels(gluon_a4w4._moe_gemm_a4w4_decode))
-    moe_gemm_a4w4(
-        x,
-        w,
-        x_scale,
-        w_scale,
-        bias,
-        rdata,
-        gindx,
-        sindx,
-        gammas,
-        "GFX1250_SCALE",
-        True,
-        torch.bfloat16,
-        do_gather,
-        backend="gluon",
+    launched = _kernels_launched_by(
+        gluon_a4w4._moe_gemm_a4w4_decode,
+        lambda: moe_gemm_a4w4(
+            x,
+            w,
+            x_scale,
+            w_scale,
+            bias,
+            rdata,
+            gindx,
+            sindx,
+            gammas,
+            "GFX1250_SCALE",
+            True,
+            torch.bfloat16,
+            do_gather,
+            backend="gluon",
+        ),
     )
-    torch.cuda.synchronize()
-    compiled = {
-        key: kernel
-        for key, kernel in _compiled_kernels(gluon_a4w4._moe_gemm_a4w4_decode).items()
-        if key not in before
-    }
-    if not compiled:
-        # Already compiled by an earlier case in this process: check those.
-        compiled = _compiled_kernels(gluon_a4w4._moe_gemm_a4w4_decode)
-    assert compiled, "the decode kernel did not run for this shape"
-    for kernel in compiled.values():
+    assert launched, "this call did not launch the gluon decode kernel"
+    for kernel in launched:
+        assert "EP_SCATTER_0" in kernel.name, f"unexpected specialization {kernel.name}"
         assert (
             "tensor_store_from_lds" not in kernel.asm["amdgcn"]
         ), f"{kernel.name} stores its output tile with tensor_store_from_lds"
