@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Explicit gfx1250 TDM GEMM, with optional low-precision cluster split-K."""
+"""Explicit gfx1250 TDM GEMM with atomic or FP32-workspace cluster split-K."""
 
 import torch
 
@@ -18,6 +18,7 @@ def gemm_a16w16_tdm(
     m_waves: int = 2,
     n_waves: int = 2,
     split_k: int = 1,
+    split_k_policy: str = "atomic",
     group_m: int = 0,
     layout: str = "nt",
     interleave: bool = True,
@@ -28,14 +29,19 @@ def gemm_a16w16_tdm(
     B is a logical [K,N] view: NT has stride(0)=1, NN stride(1)=1.
     Explicit entrypoint only: existing GEMM dispatch/tuning is unchanged.
 
-    split_k>1 clears C inside cluster rank 0, synchronizes the cluster, then
+    split_k_policy="workspace" uses FP32 LDS/global partials and a fixed-order
+    FP32 sum before the final output rounding. It supports odd N and deterministic
+    mode, but can differ from split_k=1 due to FP32 accumulation grouping.
+
+    split_k_policy="atomic" (backward-compatible default), when split_k>1,
+    clears C inside cluster rank 0, synchronizes the cluster, then
     each rank atomically adds its rounded BF16/FP16 partial, using packed pairs.
     It is nondeterministic and NOT equivalent to FP32 partial reduction:
     cancellation and overflow may magnify low-precision rounding. Use split_k=1
     when deterministic accumulation or small absolute cancellation error matters.
     With bias, a second cluster barrier precedes one final bias addition.
 
-    K must be divisible by split_k*block_k. Odd N is supported for split_k=1 only.
+    K must be divisible by split_k*block_k. Odd N is supported with split_k=1 or workspace policy.
     Leading strides must be 16-byte aligned; all tensors remain caller-owned.
     Inputs produced on another stream require the caller's normal stream ordering.
     """
@@ -63,6 +69,7 @@ def gemm_a16w16_tdm(
         group_m,
         layout,
         interleave,
+        split_k_policy,
     )
     m, k = a.shape
     n = b.shape[1]
@@ -74,9 +81,13 @@ def gemm_a16w16_tdm(
         raise ValueError("each K split must contain at least stages full tiles")
     if group_m * ((n + block_n - 1) // block_n) >= 2**31:
         raise ValueError("grouped swizzle exceeds the supported 31-bit range")
-    if split_k > 1 and n % 2:
+    if split_k > 1 and split_k_policy == "atomic" and n % 2:
         raise ValueError("packed split-K requires even N")
-    if torch.are_deterministic_algorithms_enabled() and split_k > 1:
+    if (
+        torch.are_deterministic_algorithms_enabled()
+        and split_k > 1
+        and split_k_policy == "atomic"
+    ):
         raise RuntimeError("packed atomic split-K is nondeterministic; use split_k=1")
 
     def leading(t, unit, major, minimum, name):
@@ -140,7 +151,14 @@ def gemm_a16w16_tdm(
             layout,
             interleave,
             bias is not None,
+            split_k_policy,
         )
+        if split_k > 1 and split_k_policy == "workspace":
+            size = ((m + block_m - 1) // block_m) * ((n + block_n - 1) // block_n)
+            size *= split_k * block_m * block_n
+            workspace = torch.empty(size, dtype=torch.float32, device=a.device)
+        else:
+            workspace = out
         elem = fx.BFloat16 if a.dtype == torch.bfloat16 else fx.Float16
         _run_compiled(
             launch,
@@ -148,6 +166,7 @@ def gemm_a16w16_tdm(
             ptr_arg(b, elem),
             ptr_arg(out, elem),
             ptr_arg(out if bias is None else bias, elem),
+            ptr_arg(workspace, fx.Float32 if workspace is not out else elem),
             m,
             n,
             k,
@@ -156,6 +175,6 @@ def gemm_a16w16_tdm(
             ldc,
             fx.Stream(stream.cuda_stream),
         )
-        for t in tensors:
+        for t in tensors + [workspace]:
             t.record_stream(stream)
     return out

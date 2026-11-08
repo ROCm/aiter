@@ -41,7 +41,7 @@ all members address the same output tile. The helper describes grouped cluster
 coordinates then row-major M/N ranks; this entrypoint uses M/N cluster 1x1 and
 K cluster size 1..9. It does not implement M/N multicast.
 
-## Packed atomic split-K
+## Packed atomic split-K (explicit-call default)
 
 Rank 0 clears its output tile. Agent release, store wait, cluster barrier and
 acquire fence precede GEMM. After C-shuffle each rank issues four packed
@@ -69,7 +69,7 @@ at most 320 KiB LDS. Interleaving requires NT and sufficiently large even
 quadrants. Leading strides and tensor pointers are 16-byte aligned.
 Padded/offset views and M/N edges are supported.
 
-Odd N is supported only for split_k=1. Packed atomics cannot safely touch a
+Odd N is supported for split_k=1 or `split_k_policy="workspace"`. Packed atomics cannot safely touch a
 missing high half. Tensor footprints/grouped-swizzle arithmetic are bounded.
 The wrapper records tensor lifetimes on the requested stream, but callers must
 order external producer streams normally. Concurrent writes to the same output
@@ -153,3 +153,13 @@ Do not present the historical 2.79 PFLOPS as a current C5 measurement.
 
 The correction passed the 102 existing tests plus four BF16/FP16, 2x2/2x4
 TDM-store graph-replay cases with odd N and output padding guards.
+
+## Offline tunable reduction policy
+
+The kernel now also supports `split_k_policy="workspace"` with FP32 partials
+and fixed-order FP32 cluster reduction. `TdmTunedPolicy` loads exact-contract
+results from the AITER offline tuner; the tuner defaults to this safer strategy
+plus split1, with low-precision atomic candidates only under explicit opt-in.
+See [tuning and runtime usage](gfx1250_tdm_split_policy.md).
+Earlier performance sections above describe the packed-only revisions; the
+policy document and its separate result file describe the added strategy.

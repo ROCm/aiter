@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Wave32 TDM BF16/FP16 GEMM: one kernel, two-tile unroll, clustered packed split-K.
+"""Wave32 TDM BF16/FP16 GEMM: one kernel, two-tile unroll, tunable cluster split-K.
 
 NT uses wave-parity serpentine quadrants to overlap WMMA with independent LDS
 reads. The same kernel retains a simple schedule for small or NN tiles.
@@ -22,12 +22,26 @@ from .tdm_gemm_gfx1250_utils import (
 )
 
 
-def validate_config(bm, bn, bk, stages, mw, nw, split_k, group_m, layout, interleave):
+def validate_config(
+    bm,
+    bn,
+    bk,
+    stages,
+    mw,
+    nw,
+    split_k,
+    group_m,
+    layout,
+    interleave,
+    split_k_policy="atomic",
+):
     """CPU-only launch constraints, shared by the wrapper and compiler."""
     if any(type(x) is not int or x <= 0 for x in (bm, bn, bk, stages, mw, nw, split_k)):
         raise ValueError("tiles, stages, waves and split_k must be positive integers")
     if type(group_m) is not int or group_m < 0:
         raise ValueError("group_m must be a nonnegative integer")
+    if split_k_policy not in ("atomic", "workspace"):
+        raise ValueError("split_k_policy must be atomic or workspace")
     if layout not in ("nt", "nn"):
         raise ValueError("layout must be nt or nn")
     if bk not in (32, 64, 128, 256, 512) or not 2 <= stages <= 16:
@@ -52,7 +66,8 @@ def validate_config(bm, bn, bk, stages, mw, nw, split_k, group_m, layout, interl
             "interleave needs NT and even quadrants with room for LDS loads"
         )
     b_slots = bn * (bk + 8) if layout == "nt" else bk * (bn + 8)
-    shared = max(stages * (bm * (bk + 8) + b_slots), bm * (bn + 8)) * 2
+    c_bytes = 4 if split_k > 1 and split_k_policy == "workspace" else 2
+    shared = max(stages * (bm * (bk + 8) + b_slots) * 2, bm * (bn * c_bytes + 16))
     if shared > 320 * 1024:
         raise ValueError("tile exceeds the 320 KiB LDS capacity")
     return shared
@@ -60,10 +75,22 @@ def validate_config(bm, bn, bk, stages, mw, nw, split_k, group_m, layout, interl
 
 @functools.lru_cache(maxsize=256)
 def compile_gemm(
-    dtype, bm, bn, bk, stages, mw, nw, split_k, group_m, layout, interleave, has_bias
+    dtype,
+    bm,
+    bn,
+    bk,
+    stages,
+    mw,
+    nw,
+    split_k,
+    group_m,
+    layout,
+    interleave,
+    has_bias,
+    split_k_policy="atomic",
 ):
     shared_bytes = validate_config(
-        bm, bn, bk, stages, mw, nw, split_k, group_m, layout, interleave
+        bm, bn, bk, stages, mw, nw, split_k, group_m, layout, interleave, split_k_policy
     )
     if dtype not in ("bf16", "fp16"):
         raise ValueError("only BF16/FP16 are supported")
@@ -77,7 +104,9 @@ def compile_gemm(
     b_size = bn * bp if layout == "nt" else bk * bp
     a_stride = (ap, 1)
     b_stride = (1, bp) if layout == "nt" else (bp, 1)
-    cp = bn + 8  # 16-byte padding for BF16 and FP16 C-shuffle.
+    workspace_reduce = split_k > 1 and split_k_policy == "workspace"
+    c_elem = fx.Float32 if workspace_reduce else elem
+    cp = bn + (4 if workspace_reduce else 8)  # 16-byte C-shuffle padding.
     steps = bk // 32
 
     @fx.struct
@@ -90,6 +119,7 @@ def compile_gemm(
         b: fx.Pointer,
         c: fx.Pointer,
         bias: fx.Pointer,
+        workspace: fx.Pointer,
         m: fx.Int32,
         n: fx.Int32,
         k: fx.Int32,
@@ -110,7 +140,12 @@ def compile_gemm(
         row0, col0 = br * bm, bc * bn
         wr, wc = wave // nw * (bm // mw), wave % nw * (bn // nw)
         shared = fx.SharedAllocator(static=True).allocate(Shared).peek().data.ptr
-        sa, sb, sc = shared, shared + stages * a_size, shared
+        sa, sb = shared, shared + stages * a_size
+        sc = (
+            fx.recast_iter(fx.Float32, shared)
+            if const_expr(workspace_reduce)
+            else shared
+        )
         mma = fx.make_mma_atom(rocdl.WMMA(16, 16, 32, elem, fx.Float32))
         fragments = WmmaFragments(elem, 16, 32)
         acc = [fx.make_rmem_tensor(8, fx.Float32) for _ in range_constexpr(ms * ns)]
@@ -119,7 +154,7 @@ def compile_gemm(
 
         # No scratch partials/counters or separate zero kernel. Each C element
         # has one initializer (cluster rank 0) before ANY packed atomic write.
-        if const_expr(split_k > 1):
+        if const_expr(split_k > 1 and not workspace_reduce):
             if part == 0:
                 for i in range_constexpr(bm * bn // (threads * 8)):
                     off = (i * threads + tid) * 8
@@ -363,11 +398,61 @@ def compile_gemm(
             for j in range_constexpr(ns):
                 row = wr + i * 16 + lane % 16
                 col = wc + j * 16 + lane // 16 * 8
-                values = acc[i * ns + j].load().to(elem)
+                values = acc[i * ns + j].load().to(c_elem)
                 fx.make_view(sc + row * cp + col, fx.make_layout(8, 1)).store(values)
         fx.gpu.barrier()
 
-        if const_expr(split_k > 1):
+        if const_expr(workspace_reduce):
+            # One producer per (tile, split, element). Never round partials.
+            tile_base = fx.Int64(tile_id) * (split_k * bm * bn)
+            for i in range_constexpr(bm * bn // (threads * 4)):
+                off = (i * threads + tid) * 4
+                row, col = off // bn, off % bn
+                values = fx.ptr_load(sc + row * cp + col, result_type=T.vec(4, T.f32))
+                fx.make_view(
+                    workspace + tile_base + part * (bm * bn) + off, fx.make_layout(4, 1)
+                ).store(values)
+            fx.memory_fence(syncscope="agent", ordering=fx.AtomicOrdering.Release)
+            rocdl.s_wait_storecnt(0)
+            cluster_barrier()
+            fx.memory_fence(syncscope="agent", ordering=fx.AtomicOrdering.Acquire)
+            if part == 0:
+                for i in range_constexpr(bm * bn // (threads * 4)):
+                    off = (i * threads + tid) * 4
+                    row, col = off // bn, off % bn
+                    total = fx.ptr_load(
+                        workspace + tile_base + off, result_type=T.vec(4, T.f32)
+                    )
+                    for j in range_constexpr(1, split_k):
+                        value = fx.ptr_load(
+                            workspace + tile_base + j * (bm * bn) + off,
+                            result_type=T.vec(4, T.f32),
+                        )
+                        total = total + value
+                    values = total.to(elem)
+                    dest = c + fx.Int64(row0 + row) * fx.Int64(ldc) + col0 + col
+                    if (row0 + row < m) and (col0 + col + 3 < n):
+                        if const_expr(has_bias):
+                            bv = fx.ptr_load(
+                                bias + col0 + col, result_type=T.vec(4, elem.ir_type)
+                            )
+                            values = (values.to(fx.Float32) + bv.to(fx.Float32)).to(
+                                elem
+                            )
+                        fx.make_view(dest, fx.make_layout(4, 1)).store(values)
+                    else:
+                        for j in range_constexpr(4):
+                            if (row0 + row < m) and (col0 + col + j < n):
+                                value = values[j]
+                                if const_expr(has_bias):
+                                    bv = fx.ptr_load(
+                                        bias + col0 + col + j, result_type=elem.ir_type
+                                    )
+                                    value = (
+                                        value.to(fx.Float32) + bv.to(fx.Float32)
+                                    ).to(elem)
+                                fx.ptr_store(value, dest + j)
+        elif const_expr(split_k > 1):
             out_buf = rocdl.make_buffer_tensor(
                 fx.make_view(c, fx.make_layout((1, 1), (1, 1))), max_size=True
             )
@@ -476,6 +561,7 @@ def compile_gemm(
         b: fx.Pointer,
         c: fx.Pointer,
         bias: fx.Pointer,
+        workspace: fx.Pointer,
         m: fx.Int32,
         n: fx.Int32,
         k: fx.Int32,
@@ -491,6 +577,7 @@ def compile_gemm(
                 b,
                 c,
                 bias,
+                workspace,
                 m,
                 n,
                 k,
@@ -502,13 +589,13 @@ def compile_gemm(
                 grid=grid, block=(threads, 1, 1), stream=stream, cluster=(1, split_k, 1)
             )
         else:
-            kernel(a, b, c, bias, m, n, k, lda, ldb, ldc).launch(
+            kernel(a, b, c, bias, workspace, m, n, k, lda, ldb, ldc).launch(
                 grid=grid, block=(threads, 1, 1), stream=stream
             )
 
     kernel._func.__name__ = (
         f"tdm_gemm_{dtype}_{layout}_t{bm}x{bn}x{bk}_s{stages}_w{mw}x{nw}"
-        f"_sk{split_k}_gm{group_m}_i{int(interleave)}_bias{int(has_bias)}_u2_pk"
+        f"_sk{split_k}_{split_k_policy}_gm{group_m}_i{int(interleave)}_bias{int(has_bias)}_u2"
     )
     if interleave:
         launch.compile_hints["llvm_options"] = {
