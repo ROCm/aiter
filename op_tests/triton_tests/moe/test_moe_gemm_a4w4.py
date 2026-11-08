@@ -157,6 +157,11 @@ class Case:
             Case(256, 1024, 1024, 8, 4, preshuffle_weights=True),
             Case(16, 1536, 7168, 256, 8, hbm_swizzling=True, preshuffle_weights=True),
             Case(16, 7168, 768, 256, 8, hbm_swizzling=True, preshuffle_weights=True),
+            # DeepSeek-V4-Pro TP4 decode (384 experts, top-6): GEMM1 and GEMM2
+            # shapes on the block_m=16 decode kernel, ragged and full batches.
+            Case(37, 1536, 7168, 384, 6, hbm_swizzling=True, preshuffle_weights=True),
+            Case(37, 7168, 768, 384, 6, hbm_swizzling=True, preshuffle_weights=True),
+            Case(512, 7168, 768, 384, 6, hbm_swizzling=True, preshuffle_weights=True),
         ]
     ],
 )
@@ -291,3 +296,87 @@ def test_op(
         backend=backend,
     )
     assert_close(ref_y, tri_y, maxtol=maxtol, rmstol=rmstol)
+
+
+def _compiled_kernels(fn):
+    while not hasattr(fn, "device_caches"):
+        fn = fn.fn
+    return {
+        key: kernel
+        for kernel_cache, *_ in fn.device_caches.values()
+        for key, kernel in kernel_cache.items()
+    }
+
+
+# DeepSeek-V4-Pro TP4 decode: GEMM1 (gather + SwiGLU) and GEMM2 (scatter + gammas).
+@pytest.mark.parametrize(
+    "m, n, k, do_gather",
+    [
+        (37, 1536, 7168, True),
+        (37, 7168, 768, False),
+        (512, 7168, 768, False),
+    ],
+)
+def test_decode_output_not_tdm_stored(m, n, k, do_gather, device="cuda"):
+    """On gfx1250 the decode kernel must not write its output tile through
+    LDS + TDM store: under serving load that store can ship stale LDS into the
+    output (see #7202). The corruption is too rare to hit reliably from an op
+    test, so this checks the compiled kernel for tensor_store_from_lds."""
+    if get_arch() != "gfx1250" or not is_fp4_avail():
+        pytest.skip("gfx1250 Gluon decode kernel only")
+    import aiter.ops.triton._gluon_kernels.gfx1250.moe.moe_op_gemm_a4w4 as gluon_a4w4
+
+    n_expts_tot, n_expts_act = 384, 6
+    torch.manual_seed(0)
+    m, rdata, gindx, sindx = init_routing_data(
+        m, n_expts_tot, n_expts_act, do_gather, not do_gather, device=device
+    )
+    x, w, bias, gammas = init_compute_data(
+        m,
+        n,
+        k,
+        gindx,
+        sindx,
+        n_expts_tot,
+        n_expts_act,
+        torch.bfloat16,
+        torch.bfloat16,
+        not do_gather,
+        device=device,
+    )
+    w, w_scale = downcast_to_mxfp(w, dtype_str_to_torch("float4_e2m1"), axis=1)
+    w_scale = preshuffle_moe_wscale(w_scale)
+    w = preshuffle_moe_weight(w)
+    x, x_scale = mxfp4_quant(x)
+
+    before = set(_compiled_kernels(gluon_a4w4._moe_gemm_a4w4_decode))
+    moe_gemm_a4w4(
+        x,
+        w,
+        x_scale,
+        w_scale,
+        bias,
+        rdata,
+        gindx,
+        sindx,
+        gammas,
+        "GFX1250_SCALE",
+        True,
+        torch.bfloat16,
+        do_gather,
+        backend="gluon",
+    )
+    torch.cuda.synchronize()
+    compiled = {
+        key: kernel
+        for key, kernel in _compiled_kernels(gluon_a4w4._moe_gemm_a4w4_decode).items()
+        if key not in before
+    }
+    if not compiled:
+        # Already compiled by an earlier case in this process: check those.
+        compiled = _compiled_kernels(gluon_a4w4._moe_gemm_a4w4_decode)
+    assert compiled, "the decode kernel did not run for this shape"
+    for kernel in compiled.values():
+        assert (
+            "tensor_store_from_lds" not in kernel.asm["amdgcn"]
+        ), f"{kernel.name} stores its output tile with tensor_store_from_lds"

@@ -2212,23 +2212,37 @@ def _moe_gemm_a4w4_decode(
         gl.amd.gfx1250.tdm.async_scatter(y_desc, dst, y_buffer)
         gl.amd.gfx1250.tdm.async_wait(0)
     else:
-        # write-back via TDM store: registers -> shared memory -> global memory
+        # Store the output straight from registers. The tile used to go
+        # registers -> LDS (ds_store) -> TDM store; on gfx1250 that TDM store
+        # can read stale LDS (16-byte chunks of the weight tile last loaded into
+        # the aliased buffer) despite s_wait_dscnt 0 + s_barrier before it, when
+        # several of these workgroups share a WGP. Same fix as the a8w4 decode
+        # kernel.
         out = out.to(gl.bfloat16)
+        # In the WMMA layout a lane holds 8 bf16 of one row, so storing from it
+        # writes 16 rows x 32 bytes per instruction. Re-lay the tile so lanes
+        # run along N (16 bytes each) and every store covers whole row pieces.
+        # convert_layout goes through LDS with ds_store/ds_load only, no TDM.
+        OUT_TPW_N: gl.constexpr = 32 if OUT_BLOCK_N >= 256 else OUT_BLOCK_N // 8
+        OUT_LAYOUT: gl.constexpr = gl.BlockedLayout(
+            [1, 8], [32 // OUT_TPW_N, OUT_TPW_N], [gl.num_warps(), 1], [1, 0]
+        )
+        out = gl.convert_layout(out, OUT_LAYOUT)
         Y += start_m.to(index_type) * stride_y_m
-        y_buffer = gl.allocate_shared_memory(
-            Y.type.element_ty,
-            shape=[BLOCK_M, OUT_BLOCK_N],
-            layout=SHARED_LAYOUT_Y,
+        offs_y_m = block_id * BLOCK_M + gl.arange(
+            0, BLOCK_M, layout=gl.SliceLayout(1, OUT_LAYOUT)
         )
-        y_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-            base=Y,
-            shape=(M, yN),
-            strides=(stride_y_m, stride_y_n),
-            block_shape=(BLOCK_M, OUT_BLOCK_N),
-            layout=SHARED_LAYOUT_Y,
+        offs_y_n = pid_n * OUT_BLOCK_N + gl.arange(
+            0, OUT_BLOCK_N, layout=gl.SliceLayout(0, OUT_LAYOUT)
         )
-        y_buffer.store(out)
-        gl.amd.gfx1250.tdm.async_store(
-            y_desc, [block_id * BLOCK_M, pid_n * OUT_BLOCK_N], y_buffer
+        mask_y = (offs_y_m < M)[:, None] & (offs_y_n < yN)[None, :]
+        # Widen before the stride multiply. offs * stride is an int32 product
+        # otherwise, so a tile past 2**31 elements wraps and stores before Y
+        # even though start_m was already cast to index_type.
+        gl.store(
+            Y
+            + offs_y_m.to(index_type)[:, None] * stride_y_m
+            + offs_y_n.to(index_type)[None, :] * stride_y_n,
+            out,
+            mask=mask_y,
         )
-        gl.amd.gfx1250.tdm.async_wait(0)
