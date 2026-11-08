@@ -585,9 +585,8 @@ def compile_gfx1250_pa_decode(
     barrier. ``work`` then holds the context lengths. ``cluster_steps`` instead
     gives CTA p steps [p * 16 / P, (p + 1) * 16 / P) of block tables at most
     16 steps wide, ignoring the plan's task counts, with partials at slot
-    sequence * P + p. In both
-    modes a sequence's single task stores final rows directly, and empty
-    sequences clear their rows.
+    sequence * P + p. In both modes a sequence's single task stores final rows
+    directly, and empty sequences clear their rows.
     ``merge_partitions`` partial storage must be eight-byte aligned for its
     device-scope atomic accesses; the host wrapper falls back for offset views.
     """
@@ -610,8 +609,8 @@ def compile_gfx1250_pa_decode(
         cluster_merge,
         small_grid and compute_dtype == "bf16" and block_size == 16,
         wide_pages and compute_dtype == "fp8" and block_size == 128,
-        # Step-split clusters keep 128-token BF16 page16 steps: their parts
-        # are a step each, so wider steps halve the parts.
+        # Step-split clusters run 128-token steps, which their runs and
+        # preloaded page ids assume.
         one_cta_grid and compute_dtype == "bf16" and not cluster_steps,
         many_cta_grid and compute_dtype == "fp8" and block_size == 16,
         cluster_seqs=cluster_seqs if cluster_merge else 1,
@@ -645,8 +644,9 @@ def compile_gfx1250_pa_decode(
         and t.TOKENS == CLUSTER_STEP_TOKENS
     ):
         raise ValueError(
-            "cluster_steps requires an unshared cluster over page16 decode rows "
-            f"without a sliding window and {CLUSTER_STEP_TOKENS}-token steps"
+            "cluster_steps requires a cluster dividing "
+            f"{CLUSTER_PARTITIONS} CTAs over page16 decode rows without a "
+            f"sliding window and {CLUSTER_STEP_TOKENS}-token steps"
         )
     if t.total_bytes > 327680:
         raise NotImplementedError(

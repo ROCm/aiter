@@ -1302,7 +1302,7 @@ class Gfx1250Memory:
     def _stage_page(self, table, absolute, j, full_tile):
         """Page of a wave's j-th page16 slice; tokens past the context use page 0.
 
-        Step-split clusters load their single stage's ids with the context
+        Step-split clusters load their first stage's ids with the context
         length (``ctx.stage_pages``: the wave's pages, then token 0's).
         """
         ctx = self.ctx
