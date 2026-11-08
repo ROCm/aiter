@@ -825,6 +825,21 @@ _COMMON_CASES = [
             "cluster_steps": True,
         },
     ),
+    # Two KV heads split each row's steps per head and keep their partials
+    # apart.
+    (
+        "cluster16-steps-kv2",
+        {
+            "kv_heads": 2,
+            "group_size": 8,
+            "block_size": 16,
+            "lengths": (2048, 0, 129, 1000, 2047),
+            "max_partitions": 8,
+            "capture": True,
+            "cluster": 16,
+            "cluster_steps": True,
+        },
+    ),
     # Block tables of more than 16 steps keep plan-derived tasks.
     (
         "cluster4-wide-table",
