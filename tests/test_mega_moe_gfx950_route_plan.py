@@ -277,6 +277,8 @@ def test_ep4_small_m_buckets_share_one_protocol(mtpr):
         protocols.add((k.dedup_rows, k.plan_local, bool(k.direct_done), k.tok_counters, k.bf16_head_tokens))
         # tok_done adds to the per-token counters every bucket clears.
         assert not k.tok_done or k.tok_counters
+        # The runtime's tok_counters also double-buffer the expert counters, which the plan_local combine zeroes.
+        assert not k.tok_counters or k.plan_local
     assert protocols == {(True, True, True, True, 4)}
     # A tok_done bucket (1 and 4 tokens) and one without it run on the same counters.
     assert select_fused_config(1, mtpr, **V41_FLASH_EP4_SHAPE).fused_stage1.tok_done
