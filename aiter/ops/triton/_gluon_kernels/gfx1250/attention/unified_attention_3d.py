@@ -9,7 +9,6 @@ import triton.language as tl
 from triton.experimental import gluon
 from triton.language.core import _aggregate as aggregate
 
-from aiter.ops.triton._gluon_kernels.common.utils import tdm_gather
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils.common_utils import strip_annotate
@@ -1349,7 +1348,9 @@ class AttentionProgram:
             src_row_indices = (block_idx * self.cfg.NUM_KV_HEADS + self.kv_head_idx).to(
                 gl.int32
             )
-            tdm_gather(self.k_desc, src_row_indices, self.k_shared.index(buffer_id))
+            gl.amd.gfx1250.tdm.async_gather(
+                self.k_desc, src_row_indices, self.k_shared.index(buffer_id)
+            )
 
     @gluon.jit
     def tdm_load_global_to_shared_v(self, block_idx, buffer_id):
@@ -1381,7 +1382,9 @@ class AttentionProgram:
             src_row_indices = (block_idx * self.cfg.NUM_KV_HEADS + self.kv_head_idx).to(
                 gl.int32
             )
-            tdm_gather(self.v_desc, src_row_indices, self.v_shared.index(buffer_id))
+            gl.amd.gfx1250.tdm.async_gather(
+                self.v_desc, src_row_indices, self.v_shared.index(buffer_id)
+            )
 
     @gluon.jit
     def compute_qk(self, k, q_scales, k_scales):

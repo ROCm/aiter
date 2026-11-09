@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import inspect
 import math
 
 from triton.experimental import gluon
@@ -15,27 +14,6 @@ from aiter.ops.triton._triton_kernels.rope.rope import _get_gptj_rotated_x
 # only _reinterpret. Kernels call reinterpret; give older Tritons that name too.
 if not hasattr(gl.shared_memory_descriptor, "reinterpret"):
     gl.shared_memory_descriptor.reinterpret = gl.shared_memory_descriptor._reinterpret
-
-
-def _tdm_gather_takes_col():
-    try:
-        params = inspect.signature(gl.amd.gfx1250.tdm.async_gather).parameters
-    except AttributeError:
-        return False
-    return list(params)[2] != "dst"
-
-
-# Upstream Triton's tdm.async_gather is (desc, src_row_indices, dst, ...). Some older
-# gfx1250 builds take a source column before dst. tdm_gather calls the installed form.
-_TDM_GATHER_TAKES_COL = gl.constexpr(_tdm_gather_takes_col())
-
-
-@gluon.jit
-def tdm_gather(desc, src_row_indices, dst):
-    if _TDM_GATHER_TAKES_COL:
-        gl.amd.gfx1250.tdm.async_gather(desc, src_row_indices, 0, dst)
-    else:
-        gl.amd.gfx1250.tdm.async_gather(desc, src_row_indices, dst)
 
 
 @gluon.jit
