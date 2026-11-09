@@ -282,11 +282,6 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
                 f"512 K elements and a whole K-pair; got K={K}, split_k={split_k}, "
                 f"tile_k={tile_k}, K-pair={k_pair}"
             )
-        if cluster_m * cluster_n < 2:
-            raise RuntimeError(
-                f"[FlyDSL gfx1250 mxfp8 compute] needs a real cluster, got "
-                f"{cluster_m}x{cluster_n}"
-            )
     if split_k > 1:
         if Out.stride(1) != 1:
             raise RuntimeError(
@@ -541,31 +536,15 @@ def cluster_m_grid_ok(M: int, tile_m: int, cluster_m: int) -> bool:
     return m_blocks % cluster_m == 0
 
 
-def resolve_cluster_m(
-    M: int,
-    tile_m: int,
-    cluster_m: int,
-    cluster_n: int,
-    compute_bound: bool,
-) -> int | None:
+def resolve_cluster_m(M: int, tile_m: int, cluster_m: int) -> int | None:
     for cm in range(max(1, int(cluster_m)), 0, -1):
-        if not cluster_m_grid_ok(M, tile_m, cm):
-            continue
-        # A compute-bound cluster must hold at least two workgroups.
-        if compute_bound and cm * cluster_n < 2:
-            continue
-        return cm
+        if cluster_m_grid_ok(M, tile_m, cm):
+            return cm
     return None
 
 
-def cluster_m_fallback_values(
-    cluster_m: int, cluster_n: int, compute_bound: bool
-) -> list[int]:
-    return [
-        cm
-        for cm in range(1, max(1, int(cluster_m)) + 1)
-        if not compute_bound or cm * cluster_n >= 2
-    ]
+def cluster_m_fallback_values(cluster_m: int) -> list[int]:
+    return list(range(1, max(1, int(cluster_m)) + 1))
 
 
 def is_compute_wmma_kernel_name(name: str) -> bool:
@@ -590,13 +569,7 @@ def _resolved_wmma_config(
         )
     if allow_cluster_m_fallback:
         cfg["cluster_m"] = (
-            resolve_cluster_m(
-                true_m,
-                cfg["tile_m"],
-                cfg["cluster_m"],
-                cfg["cluster_n"],
-                is_compute_wmma_kernel_name(kernel_name),
-            )
+            resolve_cluster_m(true_m, cfg["tile_m"], cfg["cluster_m"])
             or cfg["cluster_m"]
         )
     return tuple(cfg.items())

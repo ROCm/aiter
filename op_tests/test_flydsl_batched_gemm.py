@@ -73,7 +73,9 @@ A8W8_1X32_GFX = ["gfx1250"]
 RAGGED_K_GFX = ["gfx1250"]
 # Archs whose a8w8 mxfp8_32 batched GEMM also runs the compute kernel.
 COMPUTE_GFX = ["gfx1250"]
-# (b, m, n, k, kernelName): ragged M (cluster_m falls back) and persistent N tiles.
+# (b, m, n, k, kernelName): ragged M, persistent N tiles with and without the
+# four-buffer C relocation, a three-wide cluster, and a cluster_n = 1 config that
+# falls back to a one-workgroup cluster at a prime M-tile count.
 COMPUTE_CASES = (
     (
         8,
@@ -88,6 +90,27 @@ COMPUTE_CASES = (
         2048,
         2048,
         "flydsl_mxfp8_32_bpreshuffle_compute_wmma_t128x256x128_mw2_nw2_nb3_sk1_cm2_cn2",
+    ),
+    (
+        2,
+        333,
+        2048,
+        2048,
+        "flydsl_mxfp8_32_bpreshuffle_compute_wmma_t256x256x128_mw2_nw2_nb4_sk1_cm2_cn2_ps2",
+    ),
+    (
+        1,
+        768,
+        32768,
+        1280,
+        "flydsl_mxfp8_32_bpreshuffle_compute_wmma_t256x256x128_mw2_nw2_nb4_sk1_cm3_cn4",
+    ),
+    (
+        2,
+        1787,
+        1792,
+        5120,
+        "flydsl_mxfp8_32_bpreshuffle_compute_wmma_t256x256x128_mw2_nw2_nb2_sk1_cm4_cn1",
     ),
 )
 
@@ -357,6 +380,7 @@ def test_batched_gemm_a8w8_compute(b, m, n, k, kernel_name, dtype=dtypes.bf16):
     ref = torch.einsum(
         "mbk,bnk->mbn", x8.to(dtypes.fp32) * x_scale, w8.to(dtypes.fp32) * w_scale
     )
+    assert torch.isfinite(out).all(), f"{kernel_name}: unwritten or non-finite output"
     for i in range(b):
         err = checkAllclose(
             ref[:, i],

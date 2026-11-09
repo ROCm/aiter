@@ -85,8 +85,8 @@ def launch_gemm_a8w8_256x256(
         (128, 256, 128, 2, 2, 3),
     ), "only the tuned 2x2-wave profiles are supported"
     assert (
-        1 <= cluster_m < 16 and 1 <= cluster_n < 16 and 1 < cluster_m * cluster_n <= 16
-    ), f"cluster_m*cluster_n must be 2..16, got {cluster_m}x{cluster_n}"
+        1 <= cluster_m < 16 and 1 <= cluster_n < 16 and cluster_m * cluster_n <= 16
+    ), f"cluster_m*cluster_n must be 1..16, got {cluster_m}x{cluster_n}"
     assert split_k in (1, 2, 4, 8), f"split_k must be 1/2/4/8, got {split_k}"
     assert (
         persistent_n_tiles >= 1
@@ -102,6 +102,7 @@ def launch_gemm_a8w8_256x256(
     assert (
         cluster_m * cluster_n * cluster_k <= 16
     ), "all K splits must fit in one cluster with at most 16 workgroups"
+    use_cluster = cluster_m * cluster_n * cluster_k > 1
     cluster_sync_revs = 8
     m_run_max, m_run_min = 32, 8
     WMMA_M = WMMA_N = 16
@@ -288,8 +289,11 @@ def launch_gemm_a8w8_256x256(
         kgrp = lane // 16
         wave_m = wave // n_warp
         wave_n = wave % n_warp
-        local_x, local_y = cluster.compute_cluster_position()
-        a_mask, b_mask = compute_mcast_masks(local_x, local_y, cluster_m, cluster_n)
+        if const_expr(use_cluster):
+            local_x, local_y = cluster.compute_cluster_position()
+            a_mask, b_mask = compute_mcast_masks(local_x, local_y, cluster_m, cluster_n)
+        else:
+            a_mask, b_mask = 0, 0
         cluster_plane = fx.Int32(0)
         if const_expr(cluster_splitk):
             # Multicast inputs only within the matching K split. The hardware
@@ -476,7 +480,7 @@ def launch_gemm_a8w8_256x256(
                     0,
                     True,
                 )
-                if const_expr(not mx32):
+                if const_expr(not mx32 and use_cluster):
                     flat_wg = (
                         fx.Int32(local_x)
                         + fx.Int32(local_y) * cluster_m
@@ -658,12 +662,12 @@ def launch_gemm_a8w8_256x256(
 
         if const_expr(c_relocate):
             if tile_idx == 0:
-                cluster.cluster_barrier()
+                workgroup_barrier(use_cluster=use_cluster)
         else:
             if const_expr(persistent_n_tiles > 1):
                 rocdl.sched_barrier(0)
                 tdm_ops.tensor_wait(0)
-            cluster.cluster_barrier()
+            workgroup_barrier(use_cluster=use_cluster)
         # Keep fragment displacements as DS immediates inside the K loop.
         stage_a_addr, stage_b_addr, stage_sa_addr, stage_sb_addr = (
             [],
@@ -1426,7 +1430,7 @@ def launch_gemm_a8w8_256x256(
             already landed in the previous tile's drain)."""
             rocdl.sched_barrier(0)
             tdm_ops.tensor_wait(0)
-            cluster.cluster_barrier()
+            workgroup_barrier(use_cluster=use_cluster)
             if fx.Int32(wave) == 0:
                 tdm_ops.tensor_load_2d(_prepare_tdm(BB_SLOT, _seed_delta(BB_SLOT)))
             for s in range_constexpr(BB_SLOT + 1, num_buffers):
@@ -1488,8 +1492,9 @@ def launch_gemm_a8w8_256x256(
                             _first_refill if const_expr(BB_OK and g == 0) else None
                         ),
                     )
-                if do_sync:
-                    cluster.cluster_barrier()
+                if const_expr(use_cluster):  # noqa: SIM102
+                    if do_sync:
+                        cluster.cluster_barrier()
 
         wave_parity = fx.Int32(
             llvm_dialect.inline_asm(
@@ -1540,7 +1545,7 @@ def launch_gemm_a8w8_256x256(
                     tdm_ops.tensor_wait(c)
             workgroup_barrier(use_cluster=False)
         else:
-            pipeline_fence(outstanding=0, use_cluster=True)
+            pipeline_fence(outstanding=0, use_cluster=use_cluster)
         gC_base = fx.recast_iter(
             fx.PointerType.get(partial_elem.ir_type, arg_c.address_space),
             arg_c,
@@ -1734,7 +1739,7 @@ def launch_gemm_a8w8_256x256(
     gy_launch = gy // persistent_n_tiles if const_expr(persistent_n_tiles > 1) else gy
     grid_arg = (m_run, gy_launch, batch if const_expr(batched) else m_chunks * split_k)
     # Runtime N/K shape checks belong to the caller.
-    cluster_arg = (cluster_m, cluster_n, cluster_k)
+    cluster_arg = (cluster_m, cluster_n, cluster_k) if use_cluster else None
     kernel_gemm_a8w8_256x256(
         arg_c,
         arg_a,
@@ -1748,7 +1753,11 @@ def launch_gemm_a8w8_256x256(
         i32_lda,
         i32_ldc,
         arg_out,
-        value_attrs={"rocdl.cluster_dims": f"{cluster_m},{cluster_n},{cluster_k}"},
+        value_attrs={
+            "rocdl.cluster_dims": (
+                f"{cluster_m},{cluster_n},{cluster_k}" if use_cluster else None
+            )
+        },
     ).launch(
         grid=grid_arg,
         block=(block, 1, 1),
