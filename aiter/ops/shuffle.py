@@ -453,7 +453,7 @@ def moe_shuffle_weight_iod(
     Call once per layer and GEMM at weight-load time, after
     ``moe_shuffle_weight`` / ``moe_shuffle_scale`` (GUGU gate_up for
     ``gemm=1``, the down weight for ``gemm=2``) and outside CUDA graph capture.
-    On MI455X it probes the IOD home of fresh pages and re-lays the weight and
+    On gfx1250 it probes the IOD home of fresh pages and re-lays the weight and
     its scale so that each workgroup of that GEMM reads its own IOD's memory;
     the grouped GEMM then picks the copy up by the tensors' addresses.
     ``weight`` / ``weight_scale`` are left as they are and must stay alive

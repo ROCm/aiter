@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""IOD phase probe for ``iod_locality`` (MI455X SPX + NPS1, gfx1250).
+"""IOD phase probe for ``iod_locality`` (gfx1250, SPX + NPS1).
 
 home(addr) = a14 ^ a17 ^ a20 ^ phase[addr >> 21]; workgroup b of a grid whose
 workgroups all run is on domain ((b + 3) % 8) >= 4. One launch of 8 probers,
