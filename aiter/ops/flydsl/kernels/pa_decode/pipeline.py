@@ -1870,17 +1870,11 @@ class Gfx1250WavePipeline:
             ctx.planned_start * t.plan_tile_tokens,
             ctx.planned_end * t.plan_tile_tokens,
         )
-        # The first page's DMA overlaps Q staging; the regions are disjoint.
+        # Overlap the first page's DMA with direct Q operand construction.
         self.mem.stage_kv(begin, fx.Int32(0))
-        self.mem.stage_query()
         row = ctx.warp * 16 + ctx.lane16
-        gpu.barrier()
-        q_operand = self.mem.operand(
-            ctx.warp * 16 * t.q_stride, t.q_stride, 128, ctx.lane16, ctx.half
-        )
-        scale = fx.Float32(
-            self.mem.load(row * t.q_stride + t.head_dim, fx.Float32)[0]
-        ) * fx.Float32(t.softmax_scale * LOG2E)
+        q_operand, qscale = self.mem.wave_query_operand(row)
+        scale = qscale * fx.Float32(t.softmax_scale * LOG2E)
         if const_expr(not t.per_token_kv):
             key_scale = fx.recast_iter(fx.Float32, ctx.key_scale_ptr)
             scale = scale * fx.Float32(key_scale[0])

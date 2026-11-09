@@ -1929,6 +1929,8 @@ def _check_pipe_policy(pa, case, arch, compile_kwargs):
             assert traits[0].query_splits == case["expected_splits"]
         if "expected_paired_softmax" in case:
             assert traits[0].paired_softmax == case["expected_paired_softmax"]
+        if "expected_wave_query" in case:
+            assert traits[0].wave_query_tiles == case["expected_wave_query"]
         if "task_limit" in case:
             assert traits[0].task_limit_per_seq == case["task_limit"]
         assert not traits[0].single_kv_head or selected["num_kv_heads"] == 1
@@ -2131,6 +2133,14 @@ def test_pa_decode(case, device, monkeypatch):
         # Hand-built pages: the pool, table, context and query replace the random ones.
         query, *pools, table, context = case["pool"](device=device)
     query = query.to(case["query_dtype"])
+    if case.get("strided_query"):
+        rows, heads, width = query.shape
+        head_stride = width + 16
+        row_stride = (heads + 3) * head_stride + 16
+        span = 1 + (rows - 1) * row_stride + (heads - 1) * head_stride + width
+        storage = torch.full((span,), float("nan"), dtype=query.dtype, device=device)
+        view = storage[1:].as_strided(query.shape, (row_stride, head_stride, 1))
+        query = view.copy_(query)
     compute_type = torch.bfloat16
     key_scale = value_scale = None
     vector = 8
@@ -2563,3 +2573,39 @@ def test_pa_decode_unowned_kv_rows(
     assert torch.equal(poisoned, clean)
     if fill == "nan":
         assert torch.equal(run("zero", mask_unowned_kv=False), clean)
+
+
+@pytest.mark.parametrize("query_dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("scale_mode", ["per-token", "per-tensor"])
+@pytest.mark.parametrize(
+    "group_size,query_length", [(64, 1), (32, 2), (16, 4), (12, 5)]
+)
+def test_gfx1250_wave_query_views(
+    device, monkeypatch, query_dtype, scale_mode, group_size, query_length
+):
+    """Wave-owned Q must preserve offset/strided views and padded query rows."""
+    if get_gfx_runtime() != "gfx1250":
+        pytest.skip("direct wave-owned Q operands require gfx1250")
+    test_pa_decode(
+        {
+            "query_length": query_length,
+            "kv_heads": 2,
+            "group_size": group_size,
+            "head_dim": 128,
+            "block_size": 128,
+            "max_partitions": 7,
+            "max_context": None,
+            "kv_dtype": "fp8",
+            "query_dtype": query_dtype,
+            "scale_mode": scale_mode,
+            "trans_v": True,
+            "capture": True,
+            "lengths": (0, 1, 129, 257, 1027),
+            "pattern": "varied",
+            "tile_tokens": 256,
+            "strided_query": True,
+            "expected_wave_query": True,
+        },
+        device,
+        monkeypatch,
+    )

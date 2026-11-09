@@ -1745,6 +1745,48 @@ class Gfx1250Memory:
                     )
 
     @flyc.jit
+    def wave_query_operand(self, row):
+        """Build one wave's FP8 Q operand directly from alternating Q chunks."""
+        ctx, t = self.ctx, self.t
+        query = fx.recast_iter(t.q_dtype, ctx.query_ptr)
+        qbase = (
+            fx.Int64(ctx.planned_seq) * t.query_length
+            + ctx.query_begin
+            + row // t.query_group_size
+        ) * ctx.stride_q_row + (
+            ctx.kv_h * t.query_group_size + row % t.query_group_size
+        ) * ctx.stride_q_head
+        units = []
+        absmax = fx.Float32(0.0)
+        for j in range_constexpr(4):
+            for k in range_constexpr(2):
+                values = fx.Vector.filled(8, 0.0, fx.Float32)
+                if row < t.rows:
+                    values = fx.Vector(
+                        fx.ptr_load(
+                            fx.add_offset(
+                                query, qbase + ctx.half * 16 + j * 32 + k * 8
+                            ),
+                            result_type=fx.Vector.make_type(8, t.q_dtype),
+                        )
+                    ).to(fx.Float32)
+                units.append(values)
+                absmax = fx.maxnumf(absmax, fmath.absf(values).reduce(ReductionOp.MAX))
+        absmax = fx.maxnumf(absmax, absmax.shuffle_xor(16, t.WAVE))
+        scale = absmax * fx.Float32(1.0 / t.FP8_MAX)
+        inv = fx.Float32(rcp_f32(fx.maxnumf(scale, fx.Float32(1e-20))))
+        words = []
+        for values in units:
+            packed = self.fp8(
+                values
+                * fx.Vector.from_elements(
+                    [fx.Float32(inv)], dtype=fx.Float32
+                ).broadcast_to(8)
+            )
+            words.extend([packed[i] for i in range_constexpr(2)])
+        return fx.Vector.from_elements(words, dtype=fx.Int32), scale
+
+    @flyc.jit
     def stage_query(self, first_tile=0):
         ctx, t = self.ctx, self.t
         query = fx.recast_iter(t.q_dtype, ctx.query_ptr)
