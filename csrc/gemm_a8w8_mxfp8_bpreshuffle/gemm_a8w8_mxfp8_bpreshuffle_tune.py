@@ -343,7 +343,9 @@ def _opus_select_budget(kids, geometries, profiles, footprints, costs, budget):
             ("tile_cache", geometry, caches): 1,
             ("cache_pair", pipeline, caches): 4,
         }
-        modes[kid].update({("axis", pipeline, index, profile[index]): 4 for index in axes})
+        modes[kid].update(
+            {("axis", pipeline, index, profile[index]): 4 for index in axes}
+        )
     # A route includes the K tile, wave layout and split count. Every legal
     # route keeps a baseline; other tile geometries compete for the budget.
     selected = {
@@ -358,7 +360,9 @@ def _opus_select_budget(kids, geometries, profiles, footprints, costs, budget):
             penalties[kid] = 1 + 0.5 * (costs[geometries[kid]] / best - 1)
     covered = set().union(*(modes[kid] for kid in selected))
     required = {
-        mode for candidate_modes in modes.values() for mode in candidate_modes
+        mode
+        for candidate_modes in modes.values()
+        for mode in candidate_modes
         if mode[0] in ("axis", "cache_pair")
     }
     remaining = set(kids) - selected
@@ -368,7 +372,9 @@ def _opus_select_budget(kids, geometries, profiles, footprints, costs, budget):
             remaining,
             key=lambda kid: (
                 -len(modes[kid].keys() & uncovered) / penalties[kid],
-                costs[geometries[kid]], footprints[kid], kid,
+                costs[geometries[kid]],
+                footprints[kid],
+                kid,
             ),
         )
         selected.add(kid)
@@ -459,13 +465,12 @@ def opus_candidates(m, n, k, *, cu_num):
             min(layout, key=lambda g: (costs[g], g)) for layout in layouts.values()
         }
         if pipeline in ("prefetch_b_vgpr", "prefetch_b_vgpr_overlap", "direct_b"):
-            def a_live_set(g):
+
+            def a_live_set(g, pipeline=pipeline):
                 owner_m = g[4] if pipeline == "direct_b" else 1
                 return (g[3] // 128) * (g[1] // (owner_m * 16))
 
-            native = any(
-                g[4] * g[5] == 4 and a_live_set(g) < 16 for g in tiles
-            )
+            native = any(g[4] * g[5] == 4 and a_live_set(g) < 16 for g in tiles)
             for (bk, wm, wn, _split), layout in layouts.items():
                 full_a = [g for g in layout if a_live_set(g) < 16]
                 if full_a:
@@ -580,7 +585,8 @@ def opus_candidates(m, n, k, *, cu_num):
             variants.update(kid for kid in kids if profiles[kid] in signatures)
         selected.update(variants)
     small = {
-        kid for kid in selected
+        kid
+        for kid in selected
         if (registry[kid].bpreshuffle_entry or {}).get("small_shape")
     }
     retained_small = _opus_select_budget(
@@ -712,76 +718,6 @@ def run_gemm_flydsl(x, weight_shuffle, x_scale, w_scale, out, kernel_name):
     )
 
 
-def load_candidate_plan(path, libtype):
-    """Read an explicit per-shape plan for a focused, reproducible retune."""
-    plan = pd.read_csv(path, dtype={"kernelId": str, "kernelName": str})
-    columns = {"M", "N", "K", "w_scale_block", "libtype", "kernelId", "kernelName"}
-    if columns - set(plan.columns):
-        raise ValueError(f"Candidate plan is missing {sorted(columns - set(plan.columns))}")
-    if plan.empty or plan[list(columns)].isna().any().any():
-        raise ValueError("Candidate plan must contain complete candidate rows")
-    if not set(plan.libtype) <= {"opus", "flydsl"}:
-        raise ValueError("Candidate plan contains an unknown backend")
-    if libtype != "both" and set(plan.libtype) != {libtype}:
-        raise ValueError(f"Candidate plan conflicts with --libtype {libtype}")
-    for column in ("M", "N", "K"):
-        values = pd.to_numeric(plan[column], errors="raise")
-        if ((values <= 0) | (values % 1 != 0)).any():
-            raise ValueError(f"Candidate plan requires positive integer {column}")
-        plan[column] = values.astype(int)
-    keys = ["M", "N", "K", "w_scale_block"]
-    plan = plan.drop_duplicates(keys + ["libtype", "kernelId", "kernelName"])
-    return {key: group for key, group in plan.groupby(keys, sort=False)}
-
-
-def candidate_plan_runs(rows, m, n, k, block, *, cu_num):
-    """Validate explicit kernels against their backend's real launch rules."""
-    from csrc.opus_gemm.opus_gemm_common import candidate_kids_for_shape, get_registry
-    from aiter.ops.flydsl.batched_gemm_a8w8_gfx950 import (
-        bmm_config_runs,
-        parse_bmm_kernel_name,
-    )
-
-    registry = get_registry("a8w8_blockscale_bpreshuffle", "gfx950", cu_num)
-    legal = set(candidate_kids_for_shape("gfx950", m, n, k, cu_num=cu_num))
-    mxpsh = {
-        ki.name: (kid, ki)
-        for pipe in PIPELINES_BY_W_SCALE_BLOCK[block]
-        for kid, ki in pipe.kernels_list.items()
-        if pipe.fits(ki, m, n, k)
-    }
-    runs = []
-    for row in rows.itertuples():
-        name = str(row.kernelName)
-        if row.libtype == "opus":
-            kid = int(row.kernelId)
-            if block != "128x128" or kid not in legal or not registry[kid].matches_name(name):
-                raise ValueError(f"Illegal OPUS plan candidate {kid}/{name} for {(m, n, k, block)}")
-            instance = registry[kid]
-            split = (instance.bpreshuffle_entry or {}).get("split_k", 1)
-            runs.append((kid, split, instance.name, run_gemm_opus))
-        elif row.kernelId == MXSCALE_BMM_KERNEL_ID:
-            cfg = parse_bmm_kernel_name(name)
-            scales = _bmm_scale_args(block)
-            active_scales = {**scales, "x_scale_transposed": scales["x_scale_transposed"] and m > 1}
-            if cfg is None or not bmm_config_runs(1, n, k, active_scales, cfg):
-                raise ValueError(f"Illegal BMM plan candidate {name} for {(m, n, k, block)}")
-            if scales["x_scale_transposed"] and not bmm_config_runs(
-                1, n, k, {**scales, "x_scale_transposed": False}, cfg
-            ):
-                raise ValueError(f"BMM plan candidate {name} cannot serve padded M=1")
-            tiles = math.ceil(m / cfg["tile_m"]) * (n // cfg["tile_n"])
-            if cfg["splits"] > 1 and tiles > (1 << 16):
-                raise ValueError(f"BMM plan candidate {name} exceeds the split-K grid limit")
-            runs.append((KERNEL_ID_BASE_BMM + len(runs), cfg["splits"], name, run_bmm_flydsl))
-        elif row.kernelId == MXSCALE_KERNEL_ID and name in mxpsh:
-            kid, ki = mxpsh[name]
-            runs.append((kid, ki.split_k, name, run_gemm_flydsl))
-        else:
-            raise ValueError(f"Unknown or illegal FlyDSL plan candidate {row.kernelId}/{name}")
-    return runs
-
-
 def gfx1250_candidates(m, n, k):
     """(kernelId, kernel) of the gfx1250 mxfp8_128 kernels the 2-D dispatch can
     run for the shape (row-major A)."""
@@ -841,18 +777,9 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
             "and requires --mxscale_table and 128x128. "
             "Prebuild COs with csrc/opus_gemm/gen_co/build_co.py --arch gfx950.",
         )
-        self.parser.add_argument(
-            "--candidate_file",
-            help="CSV with M,N,K,w_scale_block,libtype,kernelId,kernelName; "
-            "measure only these validated candidates in the unified gfx950 flow.",
-        )
 
     def pre_process(self, args):
         self._mxscale_table = args.mxscale_table
-        self._candidate_plan = (
-            load_candidate_plan(args.candidate_file, args.libtype)
-            if args.candidate_file else None
-        )
         if args.libtype == "opus" and not self._mxscale_table:
             self.parser.error("OPUS tuning requires --mxscale_table")
         super().pre_process(args)
@@ -944,8 +871,6 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
         if args.libtype == "opus" and gfx != "gfx950":
             raise ValueError("OPUS bpreshuffle tuning supports gfx950 only")
         cu_num = self.get_cu_num()
-        if self._candidate_plan is not None and gfx != "gfx950":
-            raise ValueError("Explicit candidate plans support gfx950 only")
         gemm_keys = ["x", "weight_shuffle", "x_scale", "w_scale", "out"]
         ref_args = (["x_deq", "w_deq"], dtypes.bf16)
         run_kwargs = {"num_warmup": args.warmup, "num_iters": args.iters}
@@ -967,15 +892,13 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
                 "bpreshuffle's table only: pass --mxscale_table and 128x128 shapes"
             )
         seeds = (
-            self._bmm_seeds()
-            if self._candidate_plan is None and self._mxscale_table and args.libtype != "opus"
-            else {}
+            self._bmm_seeds() if self._mxscale_table and args.libtype != "opus" else {}
         )
         # This op's gfx950 1x32 table: bmm joins the mxpsh / 8-wave kernels too.
         self._bmm_1x32 = gfx == "gfx950" and not self._mxscale_table
         seeds_nk, seed_pool = self._bmm_seeds_mxfp8() if self._bmm_1x32 else ({}, [])
         opus_by_shape = {}
-        if self._candidate_plan is None and gfx == "gfx950" and args.libtype != "flydsl" and self._mxscale_table:
+        if gfx == "gfx950" and args.libtype != "flydsl" and self._mxscale_table:
             if args.libtype == "opus" and set(untunedf.w_scale_block) != {"128x128"}:
                 raise ValueError("OPUS supports A 1x128 / B 128x128 scales only")
             for row in untunedf.itertuples():
@@ -991,7 +914,7 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
             block = str(untunedf.loc[i, "w_scale_block"])
             info_keys = (gfx, cu_num, M, N, K, block)
             opus = opus_by_shape.get((M, N, K), ()) if block == "128x128" else ()
-            cands = [] if self._candidate_plan is not None else (
+            cands = (
                 gfx1250_candidates(M, N, K)
                 if gfx == "gfx1250"
                 else [
@@ -1004,13 +927,13 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
             run_fn = run_gemm_flydsl_gfx1250 if gfx == "gfx1250" else run_gemm_flydsl
             runs = [(kernel_id, ki.split_k, ki.name, run_fn) for kernel_id, ki in cands]
             near = None
-            if self._candidate_plan is None and self._mxscale_table and gfx == "gfx950" and args.libtype != "opus":
+            if self._mxscale_table and gfx == "gfx950" and args.libtype != "opus":
                 near = [
                     name
                     for mm, name in seeds.get((N, K, block), ())
                     if M / 2 <= mm <= M * 2
                 ]
-            elif self._candidate_plan is None and self._bmm_1x32:
+            elif self._bmm_1x32:
                 near = [
                     name
                     for mm, name in seeds_nk.get((N, K), ())
@@ -1027,12 +950,6 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
             runs.extend(
                 (kid, 1, instance.name, run_gemm_opus) for kid, instance in opus
             )
-            if self._candidate_plan is not None:
-                plan_rows = self._candidate_plan.get((M, N, K, block))
-                if plan_rows is None:
-                    raise ValueError(f"Candidate plan has no rows for {(M, N, K, block)}")
-                runs = candidate_plan_runs(plan_rows, M, N, K, block, cu_num=cu_num)
-                print(f"[Focused search] shape={(M, N, K)} candidates={len(runs)}", flush=True)
             for kernel_id, split_k, name, run in runs:
                 is_opus = run is run_gemm_opus
                 info = (
@@ -1071,57 +988,21 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
     def _run_tasks(self, tasks, args):
         if not tasks:
             return []
-        opus_kids = {task[0][1] for task in tasks if task[0][-1] == "opus"}
-        if self._candidate_plan is not None:
-            # Compile the explicit plan together before CSV batching. Otherwise
-            # later K shapes can trigger another library build between batches.
-            opus_kids.update(
-                int(kid)
-                for rows in self._candidate_plan.values()
-                for kid in rows.loc[rows.libtype == "opus", "kernelId"]
-            )
         ensure_opus_kids_compiled(
-            opus_kids,
+            {task[0][1] for task in tasks if task[0][-1] == "opus"},
             cu_num=self.get_cu_num(),
         )
-        groups = [tasks]
-        if self._candidate_plan is not None and args.shape_grouped:
-            # Keep the requested CSV checkpoint batch while bounding profiler
-            # mappings in each worker's lifetime during a focused retune.
-            by_shape = defaultdict(list)
-            for task in tasks:
-                by_shape[task[0][0]].append(task)
-            shapes = list(by_shape)
-            # Paired validation measures at most eight candidates per shape.
-            # Sixty such shapes have fewer profiler calls than fifteen search
-            # shapes, so they can share a pool without repeated worker startup.
-            pool_shapes = 60 if max(map(len, by_shape.values())) <= 8 else 15
-            groups = [
-                [task for shape in shapes[i:i + pool_shapes] for task in by_shape[shape]]
-                for i in range(0, len(shapes), pool_shapes)
-            ]
-        results = []
-        completed_shapes = 0
-        for group in groups:
-            counts = Counter(task[0][0] for task in group)
-            results.extend(mp_tuner(
-                group,
-                [(count, ()) for count in counts.values()],
-                args.mp,
-                False,
-                args.shape_grouped,
-                args.errRatio,
-                timeout=args.timeout,
-                verbose=args.verbose,
-            ))
-            completed_shapes += len(counts)
-            if self._candidate_plan is not None:
-                print(
-                    f"[Focused progress] completed_shapes_in_batch={completed_shapes} "
-                    f"total_shapes_in_batch={len({task[0][0] for task in tasks})}",
-                    flush=True,
-                )
-        return results
+        counts = Counter(task[0][0] for task in tasks)
+        return mp_tuner(
+            tasks,
+            [(count, ()) for count in counts.values()],
+            args.mp,
+            False,
+            args.shape_grouped,
+            args.errRatio,
+            timeout=args.timeout,
+            verbose=args.verbose,
+        )
 
     def result_to_df(self, results):
         rows = []

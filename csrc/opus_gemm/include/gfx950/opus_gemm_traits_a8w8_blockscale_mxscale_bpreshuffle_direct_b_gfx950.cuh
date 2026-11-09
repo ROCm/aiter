@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include "opus_gemm_bpreshuffle_args_gfx950.cuh"
+#include "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh"
 #include <opus/hip_minimal.hpp>
 #include <opus/opus.hpp>
 #include <type_traits>

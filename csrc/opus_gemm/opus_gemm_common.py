@@ -4408,8 +4408,13 @@ def _small_m_parameters():
 
     # Append deeper K tiles so existing runtime-small IDs remain stable.
     # One/two-wave narrow tiles keep BK1024 within the register/LDS limits.
-    for geometry in ((16, 16, 1, 1), (16, 32, 1, 1),
-                     (16, 32, 1, 2), (32, 16, 1, 1), (32, 32, 1, 2)):
+    for geometry in (
+        (16, 16, 1, 1),
+        (16, 32, 1, 1),
+        (16, 32, 1, 2),
+        (32, 16, 1, 1),
+        (32, 32, 1, 2),
+    ):
         panel = 64 * geometry[2] * geometry[3]
         for caches in _M_CACHE_PAIRS + _M_SMALL_STORE_CACHE_PAIRS:
             yield from profile(geometry, panel, 1, caches, 0, 1024)
@@ -4562,9 +4567,7 @@ def _install_small_shape_kernels():
         instance = OpusGemmInstance(**parameters, bpreshuffle_entry=entry)
         for table in tables.values():
             if kid in table:
-                raise ValueError(
-                    f"small-shape kid {kid} collides with the PR catalog"
-                )
+                raise ValueError(f"small-shape kid {kid} collides with the PR catalog")
             table[kid] = instance
         a8w8_blockscale_mxscale_gemm_bpreshuffle_kernels_list[kid] = instance
 
