@@ -1,3 +1,4 @@
+import functools
 from typing import Literal
 
 import torch
@@ -28,8 +29,16 @@ def _get_silu_and_mul_backward_config(n_cols: int) -> dict:
     return select_leq_config(configs, n_cols)
 
 
+@functools.lru_cache(maxsize=1)
+def _act_mul_and_fp8_group_quant_config_dir() -> str:
+    # resolve_config_dir probes the file system, so an eager call must not repeat it.
+    return resolve_config_dir("fusions", "ACT_MUL_AND_FP8_GROUP_QUANT")
+
+
 def _get_act_mul_and_fp8_group_quant_config(M: int) -> dict | None:
-    config_dir = resolve_config_dir("fusions", "ACT_MUL_AND_FP8_GROUP_QUANT")
+    # The gfx942 entries were tuned with bfloat16 input and group_size 128, for
+    # N // 2 from 1000 to 17408. Other dtypes and group sizes use the same entries.
+    config_dir = _act_mul_and_fp8_group_quant_config_dir()
     configs = load_config_json(f"{config_dir}/DEFAULT.json", required=False)
     return None if configs is None else select_leq_config(configs, M, prefix="M_LEQ_")
 

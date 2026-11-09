@@ -156,22 +156,41 @@ def test_act_mul_and_mxfp4_quant(
 FP8_GROUP_QUANT_N = [2 * 1000, 2 * 2176, 2 * 4352, 2 * 8704, 2 * 17408]
 
 
-@pytest.mark.parametrize("M", [1, 32, 256, 4097])
-@pytest.mark.parametrize("N", FP8_GROUP_QUANT_N)
-@pytest.mark.parametrize("activation", ["silu", "gelu"])
-def test_act_mul_and_fp8_group_quant(M: int, N: int, activation: str):
+def _check_act_mul_and_fp8_group_quant(
+    M: int, N: int, activation: str, dtype: torch.dtype, group_size: int
+):
     torch.manual_seed(0)
-    x = torch.randn((M, N), dtype=torch.bfloat16, device="cuda")
+    x = torch.randn((M, N), dtype=dtype, device="cuda")
 
-    out_q, out_s = act_mul_and_fp8_group_quant(x, activation, group_size=128)
+    out_q, out_s = act_mul_and_fp8_group_quant(x, activation, group_size=group_size)
     # The kernel computes in fp32, so the reference also does.
     (ref_q, ref_s), _ = run_torch_reduce_act_mul_fp8_group_quant(
-        x.float(), None, activation, torch.float32, out_q.dtype, group_size=128
+        x.float(), None, activation, torch.float32, out_q.dtype, group_size=group_size
     )
 
+    assert out_s.shape == (M, (N // 2 + group_size - 1) // group_size)
     torch.testing.assert_close(out_s, ref_s, atol=0, rtol=1e-5)
     # A value at a rounding boundary can move by one FP8 step.
     torch.testing.assert_close(out_q.float(), ref_q.float(), atol=2**-9, rtol=0.125)
+
+
+@pytest.mark.parametrize("M", [1, 32, 256, 4097])
+@pytest.mark.parametrize("N", FP8_GROUP_QUANT_N)
+@pytest.mark.parametrize("activation", ["silu", "gelu", "gelu_tanh"])
+def test_act_mul_and_fp8_group_quant(M: int, N: int, activation: str):
+    _check_act_mul_and_fp8_group_quant(M, N, activation, torch.bfloat16, 128)
+
+
+# The gfx942 entries were tuned with bfloat16 and group_size 128. These cases
+# check that another dtype or group size gives the reference result too.
+@pytest.mark.parametrize("M", [1, 4097])
+@pytest.mark.parametrize("N", [2 * 1000, 2 * 17408])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("group_size", [64, 256])
+def test_act_mul_and_fp8_group_quant_dtype_and_group_size(
+    M: int, N: int, dtype: torch.dtype, group_size: int
+):
+    _check_act_mul_and_fp8_group_quant(M, N, "silu", dtype, group_size)
 
 
 class _LaunchRecorder:
