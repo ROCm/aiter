@@ -111,7 +111,15 @@ def compile_pa_decode_pingpong(
     softmax_scale,
     stages=None,
     pair_ctas=0,
+    varlen=False,
 ):
+    """``pair_ctas`` > 0 gives each CTA two adjacent work slots.
+
+    ``varlen`` reads an int32 [num_seqs, 4] query map of (first query row,
+    block-table row, valid queries, unused) per work-info sequence; queries at
+    or past the valid count repeat the last one and the reducer drops them.
+    Without it sequence s owns query rows [s * QLEN, (s + 1) * QLEN).
+    """
     stages = stages or int(os.environ.get("PP_STAGES", "3"))
     prio = int(os.environ.get("PP_PRIO", "0"))
     pair_ctas = int(os.environ.get("PP_PAIR", pair_ctas))
@@ -137,10 +145,11 @@ def compile_pa_decode_pingpong(
         float(softmax_scale),
         stages,
         prio,
-        pair_ctas,
+        pair_tasks,
         nocompute,
         dma_aux,
         (M, R, CH),
+        bool(varlen),
     )
     if key in _CACHE:
         return _CACHE[key]
@@ -181,8 +190,10 @@ def compile_pa_decode_pingpong(
 
     kernel_name = (
         f"pa_decode_pingpong_kvbf16_d{D}_v{DV}_bs{block_size}_gqa{GQA}_mtp{QLEN}"
-        f"_m{M}r{R}c{CH}_s{stages}_p{prio}_c{pair_ctas}_n{nocompute}_a{dma_aux}"
+        f"_m{M}r{R}c{CH}_s{stages}_p{prio}_c{int(pair_tasks)}_n{nocompute}_a{dma_aux}"
     )
+    if varlen:
+        kernel_name += "_varlen"
 
     @flyc.jit
     def _task(
@@ -193,6 +204,7 @@ def compile_pa_decode_pingpong(
         key_cache_ptr: fx.Pointer,
         value_cache_ptr: fx.Pointer,
         block_tables_ptr: fx.Pointer,
+        query_map_ptr: fx.Pointer,
         max_blocks_per_seq: fx.Int32,
         stride_q_row: fx.Int32,
         stride_q_head: fx.Int32,
@@ -220,6 +232,18 @@ def compile_pa_decode_pingpong(
         zero = fx.Float32(0.0)
         # Query of each of the wave's M tiles; padded tiles reuse the last query.
         queries = [rb * M + m for m in range_constexpr(M)]
+        if const_expr(varlen):
+            qmap = fx.ptr_load(
+                fx.add_offset(fx.recast_iter(fx.Int32, query_map_ptr), seq * 4),
+                result_type=fx.Vector.make_type(4, fx.Int32),
+            )
+            first_row = _uni(fx.Int32(qmap[0]))
+            table_seq = _uni(fx.Int32(qmap[1]))
+            valid = _uni(fx.Int32(qmap[2]))
+        else:
+            first_row = seq * QLEN
+            table_seq = seq
+            valid = QLEN
 
         # Q: B operand of QK, lane (g, l16) holds head l16, dims 32kk + 8g.
         q_buf = ptr_buf_tensor(query_ptr, fx.BFloat16)
@@ -229,9 +253,11 @@ def compile_pa_decode_pingpong(
         q_ops = []
         for m in range_constexpr(M):
             q_idx = queries[m]
-            if const_expr(R * M > QLEN):
+            if const_expr(varlen):
+                q_idx = (q_idx < valid).select(q_idx, valid - 1)
+            elif const_expr(R * M > QLEN):
                 q_idx = (q_idx < QLEN).select(q_idx, QLEN - 1)
-            q_row = seq * QLEN + q_idx
+            q_row = first_row + q_idx
             head = kv_h * GQA + l16
             row_elem = q_row * stride_q_row + head * stride_q_head + g * 8
             ops_m = []
@@ -253,7 +279,7 @@ def compile_pa_decode_pingpong(
         t_end_plan = end * TILES_PER_PLAN
         t_end = (t_end_plan < ctx_tiles).select(t_end_plan, ctx_tiles)
         # Tiles below t_split hold no position past any query's causal bound.
-        unmasked = context - (QLEN - 1)
+        unmasked = context - (valid - 1)
         unmasked = (unmasked > 0).select(unmasked, 0) // TILE
         t_split = (unmasked < t_end).select(unmasked, t_end)
         t_split = (t_split > t_begin).select(t_split, t_begin)
@@ -306,7 +332,7 @@ def compile_pa_decode_pingpong(
         def issue(tile, stage):
             tok0 = tile * TILE
             phys = fx.Int32(
-                buf_scalar_load(bt, seq * max_blocks_per_seq + tok0 // block_size)
+                buf_scalar_load(bt, table_seq * max_blocks_per_seq + tok0 // block_size)
             )
             page_tok0 = tok0 % block_size
             if const_expr(nocompute == 2):
@@ -370,7 +396,7 @@ def compile_pa_decode_pingpong(
             + [zero] * M
             + [fx.full(4, 0.0, fx.Float32) for _ in range_constexpr(M * NB)]
         )
-        limit = [context - QLEN + queries[m] for m in range_constexpr(M)]
+        limit = [context - valid + queries[m] for m in range_constexpr(M)]
         rescale_raw = RESCALE_LOG2 / scale_log2
 
         def scaled_ref(m_raw):
@@ -679,6 +705,7 @@ def compile_pa_decode_pingpong(
         stride_q_head: fx.Int32,
         work_info_ptr: fx.Pointer,
         work_capacity: fx.Int32,
+        query_map_ptr: fx.Pointer,
     ):
         work = fx.recast_iter(fx.Int32, work_info_ptr)
 
@@ -697,6 +724,7 @@ def compile_pa_decode_pingpong(
                 key_cache_ptr,
                 value_cache_ptr,
                 block_tables_ptr,
+                query_map_ptr,
                 max_blocks_per_seq,
                 stride_q_row,
                 stride_q_head,
@@ -770,6 +798,7 @@ def compile_pa_decode_pingpong(
                         key_cache_ptr,
                         value_cache_ptr,
                         block_tables_ptr,
+                        query_map_ptr,
                         max_blocks_per_seq,
                         stride_q_row,
                         stride_q_head,
@@ -791,8 +820,10 @@ def compile_pa_decode_pingpong(
                 run(slot, task, start, end)
 
     def _grid_x(work_capacity):
-        # Outside the JIT rewriter, which would make ``or`` a dynamic boolean.
-        return pair_ctas or work_capacity
+        # Outside the JIT rewriter, which would make the branch dynamic.
+        if pair_tasks:
+            return (work_capacity + 1) // 2
+        return work_capacity
 
     @flyc.jit
     def pa_decode_pingpong_launch(
@@ -814,6 +845,7 @@ def compile_pa_decode_pingpong(
         stride_q_head: fx.Int32,
         work_info: fx.Pointer,
         work_capacity: fx.Int32,
+        query_map: fx.Pointer,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         _ = kernel_name
@@ -831,6 +863,7 @@ def compile_pa_decode_pingpong(
                 stride_q_head,
                 work_info,
                 work_capacity,
+                query_map,
             ).launch(
                 grid=(_grid_x(work_capacity), num_kv_heads, 1),
                 block=(NWAVES * WAVE, 1, 1),
@@ -842,6 +875,7 @@ def compile_pa_decode_pingpong(
     compiled = {
         "launch": pa_decode_pingpong_launch,
         "kernel": pa_decode_pingpong_kernel,
+        "query_map": True,
     }
     _CACHE[key] = compiled
     return compiled

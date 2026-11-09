@@ -321,7 +321,7 @@ def compile_pa_decode_tile(
             block_size=block_size,
             softmax_scale=(head_dim**-0.5 if softmax_scale is None else softmax_scale),
             # One CTA per CU: fuse task pairs when live tasks can exceed the CUs.
-            pair_ctas=(-(-work_capacity // 2) if live_tiles > num_compute_units else 0),
+            pair_ctas=int(live_tiles > num_compute_units),
         )
     schedule = PaDecodeSchedule.select(
         head_dim=head_dim,

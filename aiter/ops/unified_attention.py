@@ -38,7 +38,8 @@ def unified_attention(
     otherwise. ``"flydsl"`` raises RuntimeError naming the unsupported property
     instead of falling back. ``"triton"``/``"gluon"`` bypass FlyDSL. The
     validated FlyDSL configurations are listed in
-    ``aiter.ops.flydsl.unified_attention``; they require
+    ``aiter.ops.flydsl.unified_attention``. When q holds
+    ``num_seqs * max_seqlen_q`` tokens with ``max_seqlen_q <= 8``, they require
     ``cu_seqlens_q == arange(num_seqs + 1) * max_seqlen_q``, which is not
     checked on the GPU. ``AITER_UNIFIED_ATTN_FLYDSL=0`` disables automatic use.
 
