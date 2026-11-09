@@ -1523,7 +1523,7 @@ def build_gemm_a8w4_tdm_task(
 
         LdsAddr = namedtuple("LdsAddr", "a b sa sb")
 
-        def lds_base(addr):
+        def lds_address_base(addr):
             # Hide the stage constant from address reassociation. Otherwise
             # LLVM can fold it into every load and materialize many full VGPR
             # addresses instead of one base plus DS offset immediates.
@@ -1541,13 +1541,13 @@ def build_gemm_a8w4_tdm_task(
 
         def calc_payload_bases(slot):
             return (
-                lds_base(
+                lds_address_base(
                     stC_idx
                     + A_LDS_OFF
                     + fx.Index(slot) * A_LDS_STAGE
                     + fx.index_cast(T.index, lds_a_lane_off)
                 ),
-                lds_base(
+                lds_address_base(
                     stC_idx
                     + B_LDS_OFF
                     + fx.Index(slot) * B_LDS_STAGE
@@ -1557,13 +1557,13 @@ def build_gemm_a8w4_tdm_task(
 
         def calc_scale_bases(slot):
             return (
-                lds_base(
+                lds_address_base(
                     stC_idx
                     + SA_LDS_OFF
                     + fx.Index(slot) * SA_LDS_STAGE
                     + fx.index_cast(T.index, lds_sa_lane_off)
                 ),
-                lds_base(
+                lds_address_base(
                     stC_idx
                     + SB_LDS_OFF
                     + fx.Index(slot) * SB_LDS_STAGE
