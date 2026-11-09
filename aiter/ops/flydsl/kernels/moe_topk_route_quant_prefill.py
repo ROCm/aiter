@@ -35,6 +35,12 @@ contiguous run of ``tokens_per_wg`` tokens, a token a wave (``slots`` a wave):
   C. Writes topids_to_rows and row_to_token, every route's payload from the
      registers (all of a token's row descriptors first, then whole 1 KB rows)
      and -1 in row_to_token on the experts' tile padding (spread over the grid).
+     With ``tdm_store`` each slot's payload goes to its token's LDS row right
+     after its quant (A2), and C stores it by TDM gather instead: one op is 8
+     tokens x 1 route (8 KB), spread over all waves, so the store rate no longer
+     depends on how many slots a wave holds. That lets the host launch 16 waves
+     x 4 slots where it would launch 32 x 2: half the wave launches at the same
+     store throughput (16384 tokens on 256 CUs: 26.5 -> 24.0 us).
 
 The status words must be zero at launch. The last workgroup out zeroes them
 again, so a CUDA graph replays without a memset; the host allocates them zeroed
@@ -60,6 +66,10 @@ from flydsl.expr.typing import Int32, T
 from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.ops.flydsl.kernels import tdm_ops_gfx1250 as tdm_ops
 from aiter.ops.flydsl.kernels.gemm_common_gfx1250 import make_lds_copy_ops
+from aiter.ops.flydsl.kernels.mega_moe_gfx1250.tdm_gather_shim import (
+    make_tensor_gather_descriptor,
+    tensor_store_gather,
+)
 from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
     _emit_payload_stores,
     _emit_quant_compute,
@@ -84,6 +94,11 @@ from aiter.ops.flydsl.kernels.tensor_shim import (
 WAVE_CHOICES = (8, 16, 32)
 # Tokens a wave holds (payload in VGPRs across the wait).
 MAX_SLOTS = 4
+# With the TDM store the payload leaves the registers right after each slot's
+# quant, so a wave may hold more tokens.
+MAX_SLOTS_TDM = 8
+# LDS the kernel may use (hidden staging, plus the TDM store's payload rows).
+LDS_BUDGET = 300 * 1024
 # Spins (s_sleep 1 each) before a wait gives up and flags the error word.
 SPIN_LIMIT = 1 << 22
 # A status count word: routes in the low bits, arrived workgroups above.
@@ -129,6 +144,18 @@ def _load_agent(base_i64, index):
     )
 
 
+def tdm_store_fits(feat_dim: int, topk: int, slots: int, waves: int) -> bool:
+    """Whether the TDM-store variant serves this geometry: 8-token gather groups
+    dealt evenly over the waves, and the payload rows next to the hidden
+    staging in LDS."""
+    tokens = slots * waves
+    if slots > MAX_SLOTS_TDM or tokens % 8 or (topk * tokens // 8) % waves:
+        return False
+    staging = min(slots, 2) * waves * feat_dim * 2
+    payload = tokens * (feat_dim // 2 + 4 * topk)  # MXFP4 rows + route-row table
+    return staging + payload <= LDS_BUDGET
+
+
 def build_moe_topk_route_quant_prefill_module(
     *,
     experts: int,
@@ -138,6 +165,7 @@ def build_moe_topk_route_quant_prefill_module(
     slots: int,
     waves: int = 32,
     quant_mode: str = "fp4",
+    tdm_store: bool = False,
 ):
     """JIT launcher ``(logits, hidden, num_valid_rows, topk_weights, topk_ids,
     topids_to_rows, masked_m, psum, payload, compact_scale, row_to_token,
@@ -156,8 +184,9 @@ def build_moe_topk_route_quant_prefill_module(
         raise NotImplementedError(f"topk {topk} unsupported")
     if align_m <= 0 or align_m & (align_m - 1):
         raise ValueError(f"align_m {align_m} must be a power of two")
-    if not 1 <= slots <= MAX_SLOTS:
-        raise ValueError(f"slots {slots} outside 1..{MAX_SLOTS}")
+    max_slots = MAX_SLOTS_TDM if tdm_store else MAX_SLOTS
+    if not 1 <= slots <= max_slots:
+        raise ValueError(f"slots {slots} outside 1..{max_slots}")
     if waves not in WAVE_CHOICES:
         raise ValueError(f"waves {waves} not in {WAVE_CHOICES}")
     L = _quant_layout(feat_dim, quant_mode, 1)
@@ -176,25 +205,46 @@ def build_moe_topk_route_quant_prefill_module(
     experts_per_lane = experts // wave_size
     nbuf = min(slots, 2)
     buf_bytes = waves * row_bytes
-    if nbuf * buf_bytes > 300 * 1024:
+    if nbuf * buf_bytes > LDS_BUDGET:
         raise NotImplementedError(f"hidden staging {nbuf * buf_bytes} B exceeds LDS")
+    if tdm_store and not tdm_store_fits(feat_dim, topk, slots, waves):
+        raise NotImplementedError(
+            f"TDM store does not fit slots {slots} x waves {waves}"
+        )
+    n_tok_wg = slots * waves
     n_pad_items = experts * align_m
     st_depart = _status_depart(experts)
     st_error = _status_error(experts)
     n_reset = experts + 1  # everything but the sticky error word
 
-    @fx.struct
-    class _Storage:
-        cnt: fx.Array[fx.Int32, experts, 16]
-        woff: fx.Array[fx.Int32, experts, 16]
-        start: fx.Array[fx.Int32, experts, 16]
-        tot: fx.Array[fx.Int32, experts, 16]
-        misc: fx.Array[fx.Int32, 4, 16]
+    if tdm_store:
+
+        @fx.struct
+        class _Storage:
+            cnt: fx.Array[fx.Int32, experts, 16]
+            woff: fx.Array[fx.Int32, experts, 16]
+            start: fx.Array[fx.Int32, experts, 16]
+            tot: fx.Array[fx.Int32, experts, 16]
+            misc: fx.Array[fx.Int32, 4, 16]
+            # a slot-major token's MXFP4 row (token slot * waves + wave)
+            pay: fx.Array[fx.Int32, n_tok_wg * L.payload_bytes_per_row // 4, 16]
+            # that token's grouped row of each route (the OOB bound if none)
+            rmap: fx.Array[fx.Int32, n_tok_wg * topk, 16]
+
+    else:
+
+        @fx.struct
+        class _Storage:
+            cnt: fx.Array[fx.Int32, experts, 16]
+            woff: fx.Array[fx.Int32, experts, 16]
+            start: fx.Array[fx.Int32, experts, 16]
+            tot: fx.Array[fx.Int32, experts, 16]
+            misc: fx.Array[fx.Int32, 4, 16]
 
     module_name = (
         f"moe_topk_route_quant_prefill_e{experts}_k{topk}_fd{feat_dim}"
         f"_a{align_m}_s{slots}_w{waves}_{quant_mode}_{L.native_tag}"
-    )
+    ) + ("_tdm" if tdm_store else "")
 
     @flyc.kernel(name=module_name, known_block_size=[block, 1, 1])
     def prefill_kernel(
@@ -465,6 +515,16 @@ def build_moe_topk_route_quant_prefill_module(
             qc = _qc(rows[i], pre)
             results, _ = _emit_quant_compute(qc)
             quant.append((qc, results))
+            if const_expr(tdm_store):
+                # The payload to this token's LDS row (the byte layout of
+                # _emit_payload_stores); it does not stay in VGPRs across B.
+                j_tok = fx.Int32(i * waves) + fx.Int32(wid)
+                for mx_block, payload_val, _ in results:
+                    lds.pay.ptr[
+                        j_tok * fx.Int32(L.payload_bytes_per_row // 4)
+                        + fx.Int32(mx_block) * fx.Int32(L.payload_bytes_per_block // 4)
+                        + fx.Int32(lane_in_block)
+                    ] = fx.Int32(payload_val)
             if const_expr(i + nbuf < slots):
                 # The buffer is free once this slot's LDS reads have landed.
                 rocdl.s_wait_dscnt(0)
@@ -540,6 +600,9 @@ def build_moe_topk_route_quant_prefill_module(
         _lds_barrier()
 
         # ---- C: the maps and every route's payload ----------------------
+        # TDM gather OOB bound: above every grouped row (a route's row is below
+        # token_num * topk + experts * align_m); the hardware drops indices >= it.
+        oob_row = fx.Int32(token_num) * fx.Int32(topk) + fx.Int32(experts * align_m)
         rows_t = ptr_buf_tensor(topids_to_rows)
         r2t_t = ptr_buf_tensor(row_to_token)
         pay_base = fx.Int64(ptrtoint(grouped_payload))
@@ -556,24 +619,79 @@ def build_moe_topk_route_quant_prefill_module(
                 rows_t[fx.Int32(row) * fx.Int32(topk) + fx.Int32(g)] = l_row
             if l_valid:
                 r2t_t[l_row] = fx.Int32(row)
-            # From the registers, a grouped row at a time (whole 1 KB runs).
-            # Every route's descriptor first: rebuilding one in the SGPRs the
-            # previous row's stores read makes each row wait (s_wait_xcnt).
-            qc, results = quant[i]
-            rsrcs = []
-            for k in range_constexpr(topk):
-                r_k = live.select(fx.Int32(rocdl.readlane(i32, l_row, k)), c0_i32)
-                rsrcs.append(
-                    buffer_ops.create_buffer_resource_from_addr(
-                        pay_base + fx.Uint64(fx.Uint32(r_k)) * L.payload_bytes_per_row,
-                        num_records_bytes=live.select(
-                            fx.Int32(L.payload_bytes_per_row), c0_i32
-                        ),
+            if const_expr(tdm_store):
+                # Route g's grouped row for the gather stores below.
+                if is_route:
+                    lds.rmap.ptr[
+                        (fx.Int32(i * waves) + fx.Int32(wid)) * fx.Int32(topk)
+                        + fx.Int32(g)
+                    ] = l_valid.select(l_row, oob_row)
+            else:
+                # From the registers, a grouped row at a time (whole 1 KB runs).
+                # Every route's descriptor first: rebuilding one in the SGPRs the
+                # previous row's stores read makes each row wait (s_wait_xcnt).
+                qc, results = quant[i]
+                rsrcs = []
+                for k in range_constexpr(topk):
+                    r_k = live.select(fx.Int32(rocdl.readlane(i32, l_row, k)), c0_i32)
+                    rsrcs.append(
+                        buffer_ops.create_buffer_resource_from_addr(
+                            pay_base
+                            + fx.Uint64(fx.Uint32(r_k)) * L.payload_bytes_per_row,
+                            num_records_bytes=live.select(
+                                fx.Int32(L.payload_bytes_per_row), c0_i32
+                            ),
+                        )
+                    )
+                for rsrc in rsrcs:
+                    for mx_block, payload_val, _ in results:
+                        _emit_payload_stores(qc, [rsrc], payload_val, mx_block)
+
+        if const_expr(tdm_store):
+            # Every wave stores 8-token x 1-route groups: the LDS rows of tokens
+            # 8 grp .. 8 grp + 7 to their route k rows (OOB rows dropped).
+            _lds_barrier()
+            pay_row = L.payload_bytes_per_row
+            pay_view = fx.Tensor(
+                fx.make_view(
+                    fx.recast_iter(fx.Int8, grouped_payload),
+                    fx.make_layout((oob_row, pay_row), (pay_row, 1)),
+                )
+            )
+            pay_lds_idx = fx.index_cast(T.index, ptrtoint(lds.pay.ptr))
+            for n in range_constexpr(topk * n_tok_wg // 8 // waves):
+                o = fx.Int32(wid) + fx.Int32(n * waves)
+                k_r = o % fx.Int32(topk)
+                grp = o // fx.Int32(topk)
+                idxs = [
+                    fx.Int32(
+                        rocdl.readfirstlane(
+                            i32,
+                            fx.Int32(
+                                lds.rmap.ptr[
+                                    (grp * fx.Int32(8) + fx.Int32(q)) * fx.Int32(topk)
+                                    + k_r
+                                ]
+                            ),
+                        )
+                    )
+                    for q in range_constexpr(8)
+                ]
+                tensor_store_gather(
+                    make_tensor_gather_descriptor(
+                        pay_view,
+                        pay_lds_idx,
+                        idxs,
+                        row_width=pay_row,
+                        tensor_dim0=pay_row,
+                        tensor_dim1=oob_row,
+                        stride=pay_row,
+                        elem_bytes=1,
+                        index_size=32,
+                        lds_byte_offset=grp * fx.Int32(8 * pay_row),
                     )
                 )
-            for rsrc in rsrcs:
-                for mx_block, payload_val, _ in results:
-                    _emit_payload_stores(qc, [rsrc], payload_val, mx_block)
+            tdm_ops.tensor_wait(0)
 
         # row_to_token -1 on each expert's tile padding rows: workgroup w
         # takes items [w * chunk, (w + 1) * chunk) of experts x align_m.

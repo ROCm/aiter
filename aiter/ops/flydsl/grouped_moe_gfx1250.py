@@ -2309,6 +2309,7 @@ def _get_compiled_topk_route_quant_prefill(
     slots: int,
     waves: int,
     quant_mode: str,
+    tdm_store: bool = False,
 ):
     from aiter.ops.flydsl.kernels.moe_topk_route_quant_prefill import (
         build_moe_topk_route_quant_prefill_module,
@@ -2322,6 +2323,7 @@ def _get_compiled_topk_route_quant_prefill(
         slots=slots,
         waves=waves,
         quant_mode=quant_mode,
+        tdm_store=tdm_store,
     )
 
 
@@ -2384,6 +2386,19 @@ def _prefill_geometry(token_num: int, device) -> tuple[int, int, int, int]:
     grid = -(-int(token_num) // tpw)
     waves = next((w for w in WAVE_CHOICES if w >= tpw), WAVE_CHOICES[-1])
     return grid, tpw, -(-tpw // waves), waves
+
+
+def _prefill_tdm_geometry(tpw: int, feat_dim: int, topk: int):
+    """(slots, waves) of the TDM-store variant, or None to keep the register
+    store. It replaces the 32-wave launches (more than 16 tokens a workgroup)
+    by 16 waves holding twice the slots; AITER_MOE_PREFILL_TDM_STORE=0 opts out."""
+    from aiter.ops.flydsl.kernels.moe_topk_route_quant_prefill import tdm_store_fits
+
+    if os.environ.get("AITER_MOE_PREFILL_TDM_STORE", "1") == "0" or tpw <= 16:
+        return None
+    waves = 16
+    slots = -(-int(tpw) // waves)
+    return (slots, waves) if tdm_store_fits(feat_dim, topk, slots, waves) else None
 
 
 def fused_topk_route_quant_prefill_supported(
@@ -2477,8 +2492,18 @@ def fused_topk_route_quant_prefill(
     else:
         nvr = num_valid_rows.reshape(-1)[:1].to(dtype=torch.int32)
     grid, tpw, slots, waves = _prefill_geometry(token_num, device)
+    tdm = _prefill_tdm_geometry(tpw, int(feat_dim), int(topk))
+    if tdm is not None:
+        slots, waves = tdm
     _get_compiled_topk_route_quant_prefill(
-        experts, int(topk), int(feat_dim), int(align_m), slots, waves, quant_mode
+        experts,
+        int(topk),
+        int(feat_dim),
+        int(align_m),
+        slots,
+        waves,
+        quant_mode,
+        tdm is not None,
     )(
         ptr_arg(gating_output),
         ptr_arg(hidden_states),
