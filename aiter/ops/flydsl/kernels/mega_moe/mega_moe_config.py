@@ -149,10 +149,187 @@ class Stage2Config:
 
 
 @dataclass(frozen=True, slots=True)
+class FusedStage1Knobs:
+    """Dispatch / plan / GEMM1 knobs only the fused (small- and large-input) kernels read.
+
+    All off is the EP8 DeepSeek-V4-Pro kernel; the EP4 DeepSeek-V4.1-Flash
+    tune (_tune_v41_flash_ep4) turns them on. The protocol knobs (dedup_rows,
+    plan_local, direct_done, tok_done) change what the ranks of a launch
+    exchange: every rank of a launch must agree on them, so they are set per
+    layout, never per token bucket.
+    """
+
+    # Large-input dispatch: at least this many payload producers per destination (0: one per row chunk).
+    payload_min_blocks: int = 0
+    # With payload_min_blocks: a rank with at most payload_small_tokens tokens gives each destination at least
+    # payload_small_blocks producers instead (0: off).
+    payload_small_blocks: int = 0
+    payload_small_tokens: int = 0
+    # One dispatch row per (token, destination rank) instead of per route; GEMM1 reads A through the srcmap.
+    # Every rank of a launch must agree.
+    dedup_rows: bool = False
+    # Small-input fused kernel: every CTA waits on the plan flag itself and invalidates only its L1, instead of one
+    # CTA an XCD acquiring and republishing the flag. No CTA reads the plan, srcmap or token rows before the flag, so
+    # its XCD's L2 holds none of their lines (the launch's acquire dropped the earlier ones).
+    plan_direct: bool = False
+    # Small-input fused kernel: the plan CTA writes the plan through to memory, so it publishes the flag without an L2
+    # writeback first.
+    plan_wt: bool = False
+    # Small-input fused kernel: every CTA waits for the sources itself and builds the plan from the expert counts
+    # in its LDS; GEMM1 takes its tiles from there, and only GEMM2 reads the plan CTA's metadata.
+    plan_local: bool = False
+    # Small-input fused kernel: GEMM2 moves its dispatch-table pointers into SGPRs, so its buffer loads need no
+    # readfirstlane waterfall loop.
+    g2_uniform: bool = False
+    # Small-input fused kernel: the dispatch-table and remote pointers of the head (producers, plan finalize,
+    # kernel entry) in SGPRs, for the same reason.
+    head_uniform: bool = False
+    # Small-input fused kernel: the GEMM2 scatter epilogue reads its rows' ids / weights from LDS once into lanes and
+    # picks them with readlane, instead of an LDS round trip and readfirstlane per row (2: the peer bases too).
+    g2_epi_lean: int = 0
+    # Small-input GEMM1: K-steps its W1 / W1-scale loads are issued ahead of their MFMAs.
+    g1_lookahead: int = 1
+    # Small-input GEMM1: K-steps its A rows are loaded ahead of their MFMAs (2: through registers, see do_tile_la).
+    g1_a_ahead: int = 1
+    # Small-input fused kernel: when a rank's routes need at most this many producers, each of them adds its share of
+    # the source flag to every destination itself after its own drain, instead of the last of all producers storing
+    # it behind a rank-local done counter (0: off; at most mega_moe_small_m._DIRECT_DONE_INC).
+    direct_done: int = 0
+    # Small-input fused kernel: each GEMM2 scatter wave drains its rows and adds one to their tokens' counters on
+    # the destination, whose combine reduces a token once its counter reaches valid routes x GEMM2 n-blocks instead
+    # of after every rank's grid ticket and flag (BF16 rows; the flags stay as the fallback).
+    tok_done: bool = False
+    # Small-input fused kernel: the runtime keeps per-token GEMM2 completion counters (two parity halves): the
+    # tok_done buckets add to them and every launch clears the previous launch's half. Every bucket of a layout
+    # must agree, since a tok_done launch may follow any other.
+    tok_counters: bool = False
+    # Small-input fused kernel: the GEMM2 rows of the first this-many tokens of a destination are BF16 even when
+    # the rank sends FP8 rows, and the combine reduces them as BF16 and leaves them poisoned. Sender and combine
+    # must agree, so every bucket of a layout sets the same value.
+    bf16_head_tokens: int = 0
+    # Large-input GEMM1: m-tiles with at most this many real rows (an expert's padded tail) run a
+    # short_tail_rows-row tile (0: every m-tile runs sort_block_m rows).
+    short_tail_rows: int = 0
+    # With short_tail_rows: a tail tile with at most fold_tail real rows folds into its expert's preceding
+    # m-tile, which then runs sort_block_m + fold_tail rows and reads the W1 slab once for both (0: off).
+    fold_tail: int = 0
+    # With fold_tail: an expert's last m-tile with more than short_tail_rows real rows and at most mid_tail_rows
+    # runs a mid_tail_rows-row tile (0: off).
+    mid_tail_rows: int = 0
+    # Large-input plan: every wave of the plan CTA plans a slice of the local experts (False: one wave plans all).
+    parallel_plan: bool = False
+    # GEMM1 epilogue: output columns per lane in the quantize/store pass (2 or 8).
+    epi_evec: int = 2
+    # Large-input dispatch: a payload chunk issues one system release before its tile-ready and chunk_done RMWs
+    # (False: a second one before chunk_done).
+    merge_release: bool = False
+    # Large-input dispatch: an expert's last payload chunk does not publish payload_ready (no reader).
+    skip_payload_ready: bool = False
+    # Large-input GEMM1 with dedup_rows: one wave issues the acquire once the tile's row stamps landed, then
+    # a barrier (False: every wave acquires).
+    one_row_acquire: bool = False
+    # Large-input dispatch with merge_release: a payload chunk publishes its tiles without a system release; its
+    # peer stores go to the uncached symmetric heap and are drained first (False: one L2 writeback per chunk).
+    no_chunk_release: bool = False
+    # Large-input GEMM1 K-loop reads its A operands through inline asm, so the step's first read does not wait for
+    # the next step's A copy (False: the compiler makes it wait).
+    a_asm_reads: bool = False
+    # Large-input dispatch with dedup_rows: a payload chunk resolves its routes one per thread, then its waves copy
+    # the sent token rows with all loads ahead of the stores (False: one route per wave in turn).
+    batch_rows: bool = False
+    # Large-input parallel plan: the plan CTA's warp 1 sizes the payload geometry (read by the producers only, after
+    # pair_ready) next to the count exchange instead of before it, only warp 0 fences around the barriers every wave
+    # passes, and each wave loads its slice's counts and the peers' row-base pointers with the prefix counts.
+    lean_plan: bool = False
+    # Large-input lean parallel plan: a source writes each count word to its destination with this launch's tag in
+    # the high half, and every plan wave spins on the words it reads (False: count_done flags + a barrier).
+    tag_counts: bool = False
+    # Large-input dispatch with batch_rows: a route's histogram RMW result is its slot in a fixed-size per-expert
+    # bucket of the pair order, so the order is complete with the histogram (False: prefix + a cursor RMW pass).
+    bucket_pairs: bool = False
+    # Large-input dispatch with bucket_pairs: the payload producers count their routes before the launch gate, next to
+    # the owner's launch handshake (only the group_done RMW stays after it).
+    early_hist: bool = False
+    # Large-input dispatch: a payload producer reads the destination's rows per tile before the plan wait and its
+    # ready-order flag once after it (not in every chunk publish).
+    peer_hoist: bool = False
+    # Large-input launch: the owner clears its rank-local counters between sending and awaiting the launch handshake.
+    early_clear: bool = False
+    # Large-input dispatch with batch_rows: before the plan, the consumer CTAs send the token rows whose lowest expert
+    # at a destination is one of its first presend_experts local experts (the first payload round), so that round's
+    # tasks only send route headers (0: off).
+    presend_experts: int = 0
+    # With presend_experts: the presend covers presend_rows // tokens-on-this-rank experts instead (at least
+    # presend_experts, at most 64), so the first round's rows stay about constant as the rows per expert grow (0: off).
+    presend_rows: int = 0
+    # GEMM1 A scales staged to LDS in K-loop order: lane l's packed scale word of row group g at K-step s is one
+    # dword, so a K-step reads one ds_read_b32 per group (False: four ds_read_u8 per group, packed in VALU).
+    ascale_packed: bool = False
+    # GEMM1 epilogue (epi_evec 8): the quantize/store pass without serial waits. Its lane offsets come from
+    # the tile, so they are not hoisted out of the persistent loop and reloaded from scratch between the output stores
+    # (each reload's vmcnt(0) waits for the stores before it); all rows' LDS reads go first; the 4-lane max uses DPP.
+    # Bit 1: SiLU as v_exp_f32 + v_rcp_f32 (no IEEE divide, no exp2 range fix).
+    epi_lean: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class FusedStage2Knobs:
+    """GEMM2 / combine knobs only the fused kernels read (all off: the EP8 kernels)."""
+
+    # Large-input fused kernel: GEMM2 claims per XCD in chunks of this many units, stealing from the other XCDs
+    # once its own run out (0: one claim counter per work shard).
+    xcd_chunk: int = 0
+    # Large-input fused kernel: P2P row stride rounded up to this many bytes (0: unrounded).
+    row_align: int = 0
+    # Large-input fused kernel: stage the FP8 row scales rank-locally; the m-block's closing unit sends
+    # each row's scales as whole lines (needs row_align to leave the scale lines to the row).
+    scale_stage: bool = False
+    # Large-input fused kernel: every GEMM2 K-step issues its A copy, so its MFMAs no longer wait for it.
+    a_dma_uniform: bool = False
+    # Large-input fused kernel: drop a GEMM2 unit whose m-block is all padding at its claim (needs parallel_plan).
+    skip_pad: bool = False
+    # Large-input fused kernel: the GEMM2 epilogue's per-row chain skips most LDS round trips (readlane row ids and
+    # weights, DPP scale max, branch-free staged scale store).
+    epi_lean: bool = False
+    # Large-input fused kernel: each Combine wave starts its token once that token's rows arrived (per-token
+    # counts, cleared at launch) instead of after a generation barrier over every rank's GEMM2.
+    comb_tok_wait: bool = False
+    # Large-input fused kernel (with xcd_chunk): GEMM2 claims walk groups of this many m-blocks, all n-blocks of a
+    # group before the next, instead of one n-block over every m-block.
+    m_group: int = 0
+    # Large-input fused kernel (with m_group): one CTA in early_k leaves GEMM1 for GEMM2 once its claims pass
+    # early_p/16 of the GEMM1 work. Small-input kernel: the same, per XCD slice of the GEMM1 work.
+    early_k: int = 0
+    early_p: int = 8
+    # Large-input fused kernel (with early_k and a Stage1 mid_tail_rows): when the rank's tokens give its experts at
+    # most mid_tail_rows rows on average, the early CTAs leave after early_p_mid/16 instead (0: off).
+    early_p_mid: int = 0
+    # With early_k: pick the early CTAs (and every CTA's GEMM1 claim shard) by workgroup id, so each XCD has the same
+    # number of early CTAs and both sets cover every shard (False: by arrival ticket).
+    early_xcd: bool = False
+    # Large-input fused kernel (BM64 1-stage, with a_dma_uniform): a GEMM2 unit copies its m-block's A scales for
+    # every K-step into LDS once (LDS DMA past the A slots); the K-steps read them from LDS, not 2 loads per wave.
+    ascale_lds: bool = False
+    # Large-input fused kernel (BM64, with skip_pad, ascale_lds, scale_stage and an equal Stage1 fold_tail): a GEMM2
+    # unit whose next m-block is its expert's tail of at most fold_tail rows also runs those rows (80-row unit, one
+    # more MFMA row group and a 16-row epilogue pass); the tail's own units are dropped at their claim (0: off).
+    fold_tail: int = 0
+    # Large-input fused kernel (with fold_tail, cached W2): a GEMM2 unit whose m-block (with its folded tail) is its
+    # expert's only one streams its W2 slab (nt), as no other m-block rereads it from L2.
+    nt_single: bool = False
+    # Large-input fused kernel (with epi_lean): the P2P rows carry offset int8 (u8 = q + 128) with the same E8M0
+    # scale per 32 values instead of E4M3: same bytes, about half the transport rounding error.
+    route_i8: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class MegaMoEConfig:
     stage1: Stage1Config
     stage2: Stage2Config
     p2p_quant: str
+    # Fused-kernel knobs (small- and large-input routes only; the staged kernels never read them).
+    fused_stage1: FusedStage1Knobs = FusedStage1Knobs()
+    fused_stage2: FusedStage2Knobs = FusedStage2Knobs()
 
     def __post_init__(self):
         sbm = self.stage1.sort_block_m
