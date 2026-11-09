@@ -408,8 +408,12 @@ MIN_BATCH_BLOCKS = 32
 # World size from which the ring's reduce-scatter lap defaults to INT6, to
 # clear the 18 dB SQNR floor the schedules are held to. The ring requantizes
 # the running partial at every hop, and the partial's extremum grows with the
-# contributions folded in, so unlike the mesh its error grows with N.
-RS_INT6_MIN_WORLD = 8
+# contributions folded in, so unlike the mesh its error grows with N. With the
+# E5M2 group scale an all-INT4 ring reaches 17.9 dB at TP4 (E4M3: 18.3), under
+# the floor, so INT6 starts at TP4. On PCIe that is up to 26/18 of the
+# reduce-scatter bytes at TP4; a precision-preserving scale (per-slice
+# E4M3/E5M2) would let it move back to TP8.
+RS_INT6_MIN_WORLD = 4
 
 
 # Host and environment
