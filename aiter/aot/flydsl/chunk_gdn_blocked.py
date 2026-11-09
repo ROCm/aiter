@@ -26,6 +26,11 @@ import itertools
 from aiter.aot.flydsl import chunk_gdn_h as _serial
 from aiter.aot.flydsl import replay as _replay
 from aiter.jit.core import AITER_CONFIGS
+from aiter.ops.flydsl.gdn_blocked_constants import (
+    _BLOCKED_MAX_WORK_PER_CHUNK,
+    _BLOCKED_MIN_CHUNKS,
+    _GDN_K5_TARGET_SEGMENTS,
+)
 
 LABEL = "CHUNK_GDN_BLOCKED"
 AOT_ARCH_DEFAULT = "gfx950"
@@ -44,13 +49,6 @@ def _chunks(H: int) -> int:
     are at most _GDN_K5_TARGET_SEGMENTS blocks, so the gate
     (H * blocks <= _BLOCKED_MAX_WORK_PER_CHUNK * L, L >= _BLOCKED_MIN_CHUNKS)
     holds from L = ceil(_GDN_K5_TARGET_SEGMENTS * H / _BLOCKED_MAX_WORK_PER_CHUNK)."""
-    # Lazy: the runtime module needs FlyDSL, which the AOT collector may not load.
-    from aiter.ops.flydsl.linear_attention_prefill_kernels import (
-        _BLOCKED_MAX_WORK_PER_CHUNK,
-        _BLOCKED_MIN_CHUNKS,
-        _GDN_K5_TARGET_SEGMENTS,
-    )
-
     return max(
         _MIN_CHUNKS,
         _BLOCKED_MIN_CHUNKS,

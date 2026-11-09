@@ -29,6 +29,11 @@ from flydsl.runtime.device import get_rocm_arch
 
 from aiter.jit.core import AITER_CONFIGS
 from aiter.jit.utils.chip_info import get_num_xcds
+from aiter.ops.flydsl.gdn_blocked_constants import (
+    _BLOCKED_MAX_WORK_PER_CHUNK,
+    _BLOCKED_MIN_CHUNKS,
+    _GDN_K5_TARGET_SEGMENTS,
+)
 from aiter.ops.prefill_batch_metadata import PrefillBatchLayout, _tensor_version
 
 from ..triton._triton_kernels.gated_delta_net.utils import (
@@ -395,22 +400,10 @@ def _gdn_k5_sequence_lengths(cu_seqlens, T, prefill_metadata=None):
 
 # Chunk size the GDN K5 schedules are built for.
 _GDN_CHUNK_SIZE = 64
-# Target number of blocks per sequence; the per-sequence block size is the
-# sequence's chunk count divided by this.
-_GDN_K5_TARGET_SEGMENTS = 8
-# The blocked path needs at least this many chunks in the longest sequence.
-# Blocked loses on balanced two-sequence splits under ~96 chunks ([4064,4065],
-# [3000,5129]) and wins from 97.
-_BLOCKED_MIN_CHUNKS = 96
 # Floor on per-sequence block size: keeps short sequences in a mixed batch from
 # fragmenting into many tiny blocks, so each sequence's partition depends only on
 # its own length.
 _BLOCKED_MIN_BLOCK_CHUNKS = 12
-# Upper bound on (blocks x heads) per longest-sequence chunk. Serial K5 costs
-# ~1.6 us/chunk of the longest sequence; blocked ~0.18 us/block/head plus a
-# ~25-chunk carry pass. gfx950 break-even is work ratio ~9; 6 leaves margin and
-# bounds scratch.
-_BLOCKED_MAX_WORK_PER_CHUNK = 6
 
 
 @functools.lru_cache(maxsize=32)
