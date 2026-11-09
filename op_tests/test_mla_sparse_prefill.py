@@ -23,14 +23,18 @@ The ``prec`` axis picks both the input format and the backends that run:
 * ``v41_fp4`` -- ``v41_fp8`` with an NVFP4 prefix source: 512 e2m1 and 32 e4m3
   scales packed in a 288-byte row: ``opus``, gfx950 only.
 
-``triton`` is the ``pa_prefill_sparse`` dispatcher, which on gfx1250 reaches a
-gluon kernel that takes both KV sources natively. ``asm`` needs ``H_Q == 128``.
-Both are gfx1250-only here and drop out of the sweep elsewhere.
+``triton`` is the ``pa_prefill_sparse`` dispatcher. On gfx1250 it runs as is, a
+gluon kernel that takes both KV sources natively. On gfx950 it runs as
+``mla_sparse_prefill(backend="triton")``, which serves ``H_Q == 32`` with no
+extend rows (``--total_tokens 0``). ``asm`` needs ``H_Q == 128`` on gfx1250.
+Each drops out of the sweep elsewhere.
 
 Example CLI usage::
 
     PYTHONPATH=. python3 op_tests/test_mla_sparse_prefill.py
     PYTHONPATH=. python3 op_tests/test_mla_sparse_prefill.py --topk 256 2048
+    PYTHONPATH=. python3 op_tests/test_mla_sparse_prefill.py --prec bf16 \\
+        --backend opus triton --h_q 32 --total_tokens 0
     PYTHONPATH=. python3 op_tests/test_mla_sparse_prefill.py --backend opus \\
         -n 1024 --h_q 128 --prec v4_fp8 --no-verify
 """
@@ -597,8 +601,9 @@ _PREC_BACKENDS = {
 # Baked into the asm code object; its Q address math needs gridDim.y == 1.
 _ASM_HEADS = 128
 
-# Only gfx1250's pa_prefill_sparse reads a second KV source; the rest reject it.
-_TRITON_ARCHS = ("gfx1250",) if pa_prefill_sparse is not None else ()
+# gfx1250's pa_prefill_sparse reads both KV sources and runs as is. gfx950's reads
+# unified_kv alone and runs as mla_sparse_prefill's triton backend.
+_TRITON_ARCHS = ("gfx950", "gfx1250") if pa_prefill_sparse is not None else ()
 
 # Mismatch ratio allowed per backend; same as test_pa_decode_sparse.py.
 _ERR_TOL = 0.01
@@ -746,18 +751,31 @@ def run_mla_sparse_prefill(
                     ),
                 )
             )
-        if "triton" in wanted and _get_gpu_arch() in _TRITON_ARCHS:
-            # These CSRs never hold -1; the wrapper's default guess costs ~1.5x.
-            candidates.append(
-                (
-                    "triton",
-                    lambda: pa_prefill_sparse(
-                        **kernel_inputs,
-                        softmax_scale=softmax_scale,
-                        has_invalid=False,
-                    ),
+        arch = _get_gpu_arch()
+        if "triton" in wanted and arch in _TRITON_ARCHS:
+            if arch == "gfx1250":
+                # These CSRs never hold -1; the wrapper's default guess costs ~1.5x.
+                candidates.append(
+                    (
+                        "triton",
+                        lambda: pa_prefill_sparse(
+                            **kernel_inputs,
+                            softmax_scale=softmax_scale,
+                            has_invalid=False,
+                        ),
+                    )
                 )
-            )
+            elif h == 32 and total_tokens == 0 and num_kv_splits in (None, 1):
+                candidates.append(
+                    (
+                        "triton",
+                        lambda: mla_sparse_prefill(
+                            **kernel_inputs,
+                            softmax_scale=softmax_scale,
+                            backend="triton",
+                        ),
+                    )
+                )
 
     if not candidates:
         return None
@@ -824,6 +842,7 @@ _PYTEST_CASES = [
     (192, 96, 1024, 192, 256),
     (256, 128, 2048, 2048, 512),
     (64, 32, 0, 0, 128),  # empty pools -> sink-only
+    (256, 32, 2048, 0, 512),  # one source: gfx950's triton backend
 ]
 
 
@@ -959,6 +978,30 @@ def test_opus_csr_one_key_scale_one(dtype):
         actual, expected, rtol=_RTOL, atol=_ATOL, tol_err_ratio=_ERR_TOL
     )
     assert err <= _ERR_TOL
+
+
+@pytest.mark.parametrize("has_sink", [False, True], ids=["no-sink", "sink"])
+def test_default_backend_gfx950(has_sink):
+    """backend=None runs triton for a sink-free H=32 call with one source, else opus."""
+    if _get_gpu_arch() != "gfx950" or pa_prefill_sparse is None:
+        pytest.skip("the triton backend needs gfx950 and Triton >= 3.6")
+    inputs = _make_inputs(
+        n=256,
+        h=32,
+        d=512,
+        total_pages=2048,
+        total_tokens=0,
+        dtype=torch.bfloat16,
+        topk=512,
+        seed=42,
+    )
+    if not has_sink:
+        inputs["attn_sink"] = None
+    scale = 1.0 / math.sqrt(512)
+    expected = mla_sparse_prefill(
+        **inputs, softmax_scale=scale, backend="opus" if has_sink else "triton"
+    )
+    assert torch.equal(mla_sparse_prefill(**inputs, softmax_scale=scale), expected)
 
 
 # ---------------------------------------------------------------------------
