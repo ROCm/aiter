@@ -137,7 +137,8 @@ def fused_gdn_verify_qkvz(
         max_query_len,
         cap,
     )
-    if seqs == 0:
+    # Without token rows, the programs would read row 0 of the empty projections.
+    if seqs == 0 or projected_qkvz.shape[0] == 0:
         return out
     config = _get_config(seqs)
     has_bias = conv_bias is not None

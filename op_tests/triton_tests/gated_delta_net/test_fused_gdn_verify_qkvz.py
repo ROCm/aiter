@@ -373,6 +373,26 @@ def test_fused_gdn_verify_skips_padded_sequences():
     check_pools(pools, expected)
 
 
+def test_fused_gdn_verify_all_empty_batch():
+    """A batch without token rows changes nothing. The op must not launch, because
+    the programs would read row 0 of the empty projections."""
+    _requires_gfx1250()
+    window, cap = 4, 16
+    layer = make_layer(4, 8, seed=41)
+    pools = make_pools(layer, window, cap, seed=42)
+    step = make_step(layer, 2, window, seed=43, lengths=[0, 0])
+    commit(pools, step, cap)
+    _, expected = reference(layer, step, pools, cap)
+    out = torch.empty((0, layer.vh, V), dtype=torch.bfloat16, device="cuda")
+    fused_gdn_verify_qkvz(
+        max_query_len=window,
+        scale=K**-0.5,
+        norm_eps=EPS,
+        **op_args(layer, step, pools, out),
+    )
+    check_pools(pools, expected)
+
+
 def test_fused_gdn_verify_is_deterministic():
     _requires_gfx1250()
     window, cap = 4, 16
