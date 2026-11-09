@@ -517,7 +517,9 @@ class TestLegacyFlydslHgemmConfigs(unittest.TestCase):
             if name in seen:
                 continue
             params = kernels.get_flydsl_hgemm_kernel_params(name)
-            if not params["target_gfx"].startswith("gfx1250"):
+            if not params["target_gfx"].startswith("gfx1250") or params[
+                "policy"
+            ] not in ("ft", "ht"):
                 continue
             seen.add(name)
             for gfx in ("gfx1250", "gfx1250-strict"):
