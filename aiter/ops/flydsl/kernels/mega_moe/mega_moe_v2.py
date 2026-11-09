@@ -24,7 +24,6 @@ from .dispatch import DISPATCH_TABLE_SIZE, DispatchSlot
 from .mega_moe_config import (
     DEFAULT_SMALL_M_MTPRS,
     INDEXED_PAYLOAD_MIN_MTPR,
-    LARGE_M_MTPRS,
     ROUTE_LARGE_M,
     ROUTE_SMALL_M,
     ROUTE_STAGED,
@@ -33,6 +32,7 @@ from .mega_moe_config import (
     build_mega_moe_bundle_plan,
     fixed_stage1_epoch_slot_count,
     fused_layout_supported,
+    large_m_mtprs_for,
     small_m_cu_supported,
 )
 from .mega_moe_stage1 import stage1_output_nbytes
@@ -131,7 +131,14 @@ class MegaMoEV2:
                 tuple(small_m_mtprs) if fused and small_m_cu_supported(num_cu) else ()
             ),
             large_m=(
-                fused and large_m_enabled is not False and self.mtpr in LARGE_M_MTPRS
+                fused
+                and large_m_enabled is not False
+                and self.mtpr
+                in large_m_mtprs_for(
+                    world_size=self.world_size,
+                    model_dim=self.model_dim,
+                    inter_dim=self.inter_dim,
+                )
             ),
         )
         self._active_bundle_entry = None
@@ -420,6 +427,7 @@ class MegaMoEV2:
         fused = dict(
             world_size=self.world_size,
             model_dim=self.model_dim,
+            inter_dim=self.inter_dim,
             experts=self.experts,
             topk=self.topk,
         )

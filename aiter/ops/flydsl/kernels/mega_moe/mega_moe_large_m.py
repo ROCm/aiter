@@ -5,7 +5,7 @@
 
 Quant runs as a separate kernel. Dispatch plans each destination's rows and publishes them per tile;
 GEMM2 work waits only for the GEMM1 tile that feeds it. Used on instances whose capacity is in
-mega_moe_config.LARGE_M_MTPRS.
+mega_moe_config.large_m_mtprs_for() of their layout.
 """
 
 import functools
@@ -43,9 +43,9 @@ from .dispatch import _increment_i32, _wave_inclusive_scan_i32, _wave_reduce_max
 from .gemm1 import _LdsF32View, build_fused_gemm1
 from .gemm2 import _resolve_g2_knobs, gemm2_compute_v2, issue_a_load_lds_dt
 from .mega_moe_config import (
-    LARGE_M_MTPRS,
     MegaMoEConfig,
     fused_layout_supported,
+    large_m_mtprs_for,
     select_fused_config,
 )
 from .mega_moe_fused_gemm import (
@@ -1749,7 +1749,7 @@ class LargeMRuntime:
 
     @classmethod
     def payload_capacity(
-        cls, *, world_size, model_dim, experts, topk, max_tok_per_rank
+        cls, *, world_size, model_dim, inter_dim, experts, topk, max_tok_per_rank
     ):
         """group_major_capacity() of this runtime's dispatch, for a shared payload arena."""
         return group_major_capacity(
@@ -1781,13 +1781,15 @@ class LargeMRuntime:
             raise ValueError(f"experts={experts} must be divisible by world_size={world_size}")
         if max_tok_per_rank <= 0 or max_tok_per_rank & (max_tok_per_rank - 1):
             raise ValueError(f"max_tok_per_rank={max_tok_per_rank} must be a power of two")
+        large_mtprs = large_m_mtprs_for(world_size=world_size, model_dim=model_dim, inter_dim=inter_dim)
         if not fused_layout_supported(
             arch=get_gfx_runtime(), world_size=world_size, model_dim=model_dim, inter_dim=inter_dim,
             experts=experts, topk=topk, quant=quant, swiglu_limit=float(swiglu_limit),
-        ) or max_tok_per_rank not in LARGE_M_MTPRS:
+        ) or max_tok_per_rank not in large_mtprs:
             raise ValueError(
-                "the large-input path requires the EP8 DeepSeek-V4 a8w4 layout on gfx950 "
-                f"(7168x3072, 384 experts, topk6, swiglu_limit=10) and max_tok_per_rank in {LARGE_M_MTPRS}"
+                "the large-input path requires a fused a8w4 layout on gfx950 (EP8 DeepSeek-V4-Pro or EP4 "
+                "DeepSeek-V4.1-Flash, swiglu_limit=10) and a max_tok_per_rank the layout builds it for "
+                f"({large_mtprs or 'none'})"
             )
         self.rank = int(rank)
         self.world_size = int(world_size)
