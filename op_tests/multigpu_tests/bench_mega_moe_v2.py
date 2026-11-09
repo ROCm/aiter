@@ -4,7 +4,7 @@
 
 MegaMoEV2 is pinned to its staged route (the one the Stage1/Stage2 variants
 tune); the small- and large-input routes are measured by
-test_mega_moe_small_m.py and test_mega_moe_v2.py --expect-large-m.
+test_mega_moe_v2.py --suite routes and --expect-large-m.
 """
 
 from __future__ import annotations

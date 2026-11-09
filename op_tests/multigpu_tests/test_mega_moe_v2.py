@@ -1,12 +1,43 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Independent v4_pro MegaMoEV2 accuracy and performance test."""
+r"""MegaMoEV2 multi-GPU accuracy and performance test.
+
+--suite size (default): one instance per batch size (or one at --max-tok-per-rank),
+pinned to the staged route, or to the large-input route with --expect-large-m.
+Accuracy against an fp32 reference, explicit and null streams, CUDA graph replay,
+per-stage timing, and the opt-in edge cases (pad tail, burst, layer-slot stress,
+skewed route switch, adversarial routes, --compare-main).
+
+--suite routes: one instance as production builds it, at --mtpr (default 8192):
+the staged, small-input (MTPR 256 and 512) and large-input routes side by side,
+each call's route picked by forward(max_tokens=...). Accuracy against the fp32
+reference and the pinned staged route (uneven, idle, padded ranks), per-layer
+weight rebinding with interleaved staged calls, the 32-bit epoch wrap with zero
+rows, CUDA graph replay against eager, and paired timing against the staged route.
+The fused routes need an a8w4 layout they support on an 8-XCD gfx950: EP8
+DeepSeek-V4-Pro (--network v4_pro, 8 ranks) or EP4 DeepSeek-V4.1-Flash
+(--network v41_flash, 4 ranks).
+
+    torchrun --nproc-per-node 8 test_mega_moe_v2.py --bs-list 1,64,128
+    torchrun --nproc-per-node 8 test_mega_moe_v2.py --max-tok-per-rank 8192 \
+        --expect-large-m --compare-main --bs-list 1,64,513,8192 --accuracy-max-bs 8192
+    torchrun --nproc-per-node 8 test_mega_moe_v2.py --suite routes
+    # every timed route also checked against the reference:
+    torchrun --nproc-per-node 4 test_mega_moe_v2.py --suite routes --network v41_flash --check-time-acc
+    # against a same-MTPR staged route, timing only:
+    torchrun --nproc-per-node 8 test_mega_moe_v2.py --suite routes \
+        --mtpr 256 --time-only --time-bs 140,168,196,224,252
+
+The routes suite takes the flags of the former test_mega_moe_small_m.py; its
+--mtpr and --slots are aliases of --max-tok-per-rank and --large-m-state-slots.
+"""
 
 from __future__ import annotations
 
 import argparse
 import os
 from dataclasses import replace
+from types import SimpleNamespace
 
 os.environ.setdefault("MORI_SHMEM_HEAP_SIZE", "40G")
 
@@ -17,7 +48,15 @@ import torch.nn.functional as F
 
 import aiter
 from aiter import dtypes
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.kernels.mega_moe import MegaMoEV2
+from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import (
+    ROUTE_LARGE_M,
+    ROUTE_SMALL_M,
+    ROUTE_STAGED,
+    fused_layout_supported,
+    small_m_cu_supported,
+)
 from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
 from aiter.utility import fp4_utils
 
@@ -105,6 +144,7 @@ def _reduce_float(value, device, op):
 
 def _rel_l2(output, reference):
     """Relative L2 error over all ranks; -1.0 when the reference is all zero."""
+    reference = reference.float()
     error_sq = torch.sum((output.float() - reference) ** 2)
     reference_sq = torch.sum(reference**2)
     dist.all_reduce(error_sq)
@@ -112,6 +152,11 @@ def _rel_l2(output, reference):
     if not reference_sq.item():
         return -1.0
     return float(torch.sqrt(error_sq / reference_sq))
+
+
+def _all_ranks(flag, device):
+    """Whether ``flag`` holds on every rank."""
+    return bool(_reduce_float(bool(flag), device, dist.ReduceOp.MIN))
 
 
 def _fwd(moe, *args, **kwargs):
@@ -360,6 +405,25 @@ def _reference(
     return partial[start : start + x.shape[0]]
 
 
+def _moe_reference(moe, x, route_weights, ids, ref_weights):
+    """_reference() for the layout and activation of ``moe``."""
+    return _reference(
+        x,
+        route_weights,
+        ids,
+        ref_weights,
+        moe.rank,
+        moe.world_size,
+        moe.model_dim,
+        moe.inter_dim,
+        moe.experts,
+        moe.swiglu_limit,
+        moe.act,
+        moe.situ_beta,
+        moe.situ_linear_beta,
+    )
+
+
 def _time_graph(fn, device, iters):
     _barrier()
     fn()
@@ -455,21 +519,7 @@ def _run_size(moe, x, weights, ids, ref_weights, args, rank, world, device):
     token_max = torch.tensor(tokens, dtype=torch.int32, device=device)
     dist.all_reduce(token_max, op=dist.ReduceOp.MAX)
     if 0 < int(token_max.item()) <= args.accuracy_max_bs:
-        reference = _reference(
-            x,
-            weights,
-            ids,
-            ref_weights,
-            rank,
-            world,
-            moe.model_dim,
-            moe.inter_dim,
-            moe.experts,
-            moe.swiglu_limit,
-            moe.act,
-            moe.situ_beta,
-            moe.situ_linear_beta,
-        )
+        reference = _moe_reference(moe, x, weights, ids, ref_weights)
         rel_l2 = _rel_l2(output, reference)
         if rel_l2 >= args.rtol:
             raise AssertionError(f"bs={tokens} relL2={rel_l2:.6f} exceeds {args.rtol}")
@@ -607,10 +657,6 @@ def _check_large_m_edges(
     """Large-input path: explicit stream, rank-local mask and the SiLU-only gate."""
     import flydsl.expr as fx
 
-    from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import (
-        fused_layout_supported,
-        small_m_cu_supported,
-    )
     from aiter.ops.flydsl.kernels.mega_moe.mega_moe_large_m import _torch_stream
 
     tokens = x.shape[0]
@@ -640,21 +686,7 @@ def _check_large_m_edges(
             :tokens
         ].clone()
         _barrier()
-        reference = _reference(
-            x,
-            weights,
-            masked_ids,
-            ref_weights,
-            rank,
-            world,
-            moe.model_dim,
-            moe.inter_dim,
-            moe.experts,
-            moe.swiglu_limit,
-            moe.act,
-            moe.situ_beta,
-            moe.situ_linear_beta,
-        )
+        reference = _moe_reference(moe, x, weights, masked_ids, ref_weights)
         rel_l2 = _rel_l2(output, reference)
         if rel_l2 >= args.rtol:
             raise AssertionError(f"bs={tokens} rank-local mask relL2={rel_l2:.6f}")
@@ -722,15 +754,16 @@ def _check_large_m_edges(
         else:
             raise AssertionError(f"{label} Stage1 accepted float8_e4m3fn scales")
 
+    # The instance's own layout (EP8 DeepSeek-V4-Pro or EP4 DeepSeek-V4.1-Flash).
     layout = {
         "arch": "gfx950",
-        "world_size": 8,
-        "model_dim": 7168,
-        "inter_dim": 3072,
-        "experts": 384,
-        "topk": 6,
+        "world_size": moe.world_size,
+        "model_dim": moe.model_dim,
+        "inter_dim": moe.inter_dim,
+        "experts": moe.experts,
+        "topk": moe.topk,
         "quant": "a8w4",
-        "swiglu_limit": 10.0,
+        "swiglu_limit": moe.swiglu_limit,
     }
     if not fused_layout_supported(**layout) or fused_layout_supported(
         act="situv2", **layout
@@ -768,21 +801,7 @@ def _check_pad_tail(moe, x, weights, ids, ref_weights, args, rank, world, device
     pad_zero = bool((eager_output[real:] == 0).all())
     if not _reduce_float(pad_zero, device, dist.ReduceOp.MIN):
         raise AssertionError(f"bs={tokens} masked pad rows are not zero")
-    reference = _reference(
-        x[:real],
-        weights[:real],
-        ids[:real],
-        ref_weights,
-        rank,
-        world,
-        moe.model_dim,
-        moe.inter_dim,
-        moe.experts,
-        moe.swiglu_limit,
-        moe.act,
-        moe.situ_beta,
-        moe.situ_linear_beta,
-    )
+    reference = _moe_reference(moe, x[:real], weights[:real], ids[:real], ref_weights)
     # -1: every row of every rank is padding, so there is nothing to compare.
     rel_l2 = _rel_l2(eager_output[:real], reference)
     if rel_l2 >= args.rtol:
@@ -1056,192 +1075,783 @@ def _install_config_policy(moe, config_tokens, unify_fields):
     moe._select_config = select_config
 
 
+# ---- routes suite: the instance production builds ----------------------------
+
+
+def _routed(moe, x, weights, ids, max_tokens, expect=None):
+    """forward() as production calls it: max_tokens, the call's rows on its largest
+    EP rank, picks the route; ``expect`` checks which one."""
+    if expect is not None:
+        route = moe._route(x.shape[0], max_tokens)[0]
+        if route != expect:
+            raise AssertionError(
+                f"max_tokens={max_tokens} took the {route} route, not {expect}"
+            )
+    return moe.forward(x, weights, ids, max_tokens=max_tokens)[: x.shape[0]]
+
+
+def _staged_forward(moe, x, weights, ids):
+    """The staged route of the instance (the accuracy and timing reference)."""
+    return moe._forward_route((ROUTE_STAGED, moe.mtpr), x, weights, ids)[: x.shape[0]]
+
+
+def _large_forward(moe, x, weights, ids):
+    """The large-input route of the instance."""
+    return moe._forward_route((ROUTE_LARGE_M, moe.mtpr), x, weights, ids)[: x.shape[0]]
+
+
+def _time_replays(fn, calls, trials, device):
+    """Median time of one call (us) over graph replays of ``calls`` calls, max over ranks."""
+    for _ in range(3):
+        fn()
+    _barrier()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=torch.cuda.Stream()):
+        for _ in range(calls):
+            fn()
+    for _ in range(3):
+        graph.replay()
+    _barrier()
+    times = []
+    for _ in range(trials):
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        _barrier()
+        start.record()
+        graph.replay()
+        end.record()
+        torch.cuda.synchronize()
+        times.append(start.elapsed_time(end) * 1000.0 / calls)
+    del graph
+    times.sort()
+    return _reduce_float(times[len(times) // 2], device, dist.ReduceOp.MAX)
+
+
+def _rank_case(tokens_per_rank, rank, x, w, ids, experts, pad_rows=0):
+    """Local inputs for one case; 0 tokens means an idle rank that sends one sentinel row."""
+    n = tokens_per_rank[rank]
+    if n == 0:
+        xi = torch.zeros((1, x.shape[1]), dtype=x.dtype, device=x.device)
+        wi = torch.zeros((1, w.shape[1]), dtype=w.dtype, device=w.device)
+        ii = torch.full((1, ids.shape[1]), experts, dtype=ids.dtype, device=ids.device)
+        return xi, wi, ii, 0
+    xi, wi, ii = x[:n].clone(), w[:n].clone(), ids[:n].clone()
+    if pad_rows:
+        # _fill_padded_rows: rows past num_token_non_padded route to `experts`.
+        ii[n - pad_rows :] = experts
+    return xi, wi, ii, n - pad_rows
+
+
+def _check_epoch_wrap_and_zero_rows(moe, bind, case, large_case, device):
+    """All ranks with zero rows, then launches across the 32-bit epoch wrap.
+
+    The small-input generation is preset just below 2**31 and 2**32 and the large-input
+    combine generation and launch epoch just below 2**31; each following launch must give
+    the result it gave before. Returns the number of mismatched rows over all ranks.
+    """
+    bind(0, 0)
+    mism = 0
+    empty_x = torch.empty((0, case[0].shape[1]), dtype=case[0].dtype, device=device)
+    empty_w = torch.empty((0, case[1].shape[1]), dtype=case[1].dtype, device=device)
+    empty_i = torch.empty((0, case[2].shape[1]), dtype=case[2].dtype, device=device)
+    if _routed(moe, empty_x, empty_w, empty_i, 0, ROUTE_SMALL_M).shape[0] != 0:
+        mism += 1
+    if (
+        moe._large_m is not None
+        and _large_forward(moe, empty_x, empty_w, empty_i).shape[0] != 0
+    ):
+        mism += 1
+
+    xi, wi, ii, expect, real, mt = case
+    large_expect = None
+    if large_case is not None:
+        large_expect = _large_forward(moe, *large_case[:3])[: large_case[4]].clone()
+    for base in (2**31 - 2, 2**32 - 2):
+        _barrier()
+        for runtime in moe._small_m_runtimes:
+            # generation = entry_count // (2 * CUs); the next launches cross the wrap.
+            runtime._s1_dispatch_workspace["entry_count"].fill_(
+                base * 2 * runtime._s1_num_cu
+            )
+        if moe._large_m is not None:
+            large = moe._large_m
+            large._fused_comb_ctr_arena[:, 1].fill_(2**31 - 3)
+            large._s1_epoch_expected_arena.fill_(2**31 - 2 * moe.world_size)
+        torch.cuda.synchronize()
+        _barrier()
+        for _ in range(4):
+            out = _routed(moe, xi, wi, ii, mt, ROUTE_SMALL_M)[:real]
+            mism += int((out != expect[:real]).any(dim=-1).sum().item())
+            if large_expect is not None:
+                out = _large_forward(moe, *large_case[:3])[: large_case[4]]
+                mism += int((out != large_expect).any(dim=-1).sum().item())
+    total = torch.tensor(mism, device=device)
+    dist.all_reduce(total)
+    return int(total.item())
+
+
+def _routes_instance(args, rank, world, device):
+    """The instance with every route its layout supports, and two layers of weights."""
+    net = NETWORKS[args.network]
+    packs = [
+        _quantize_weights(
+            net["model_dim"],
+            net["inter_dim"],
+            net["experts"] // world,
+            rank,
+            args.seed + 17 * i,
+            device,
+        )
+        for i in range(2)
+    ]
+    moe = MegaMoEV2(
+        rank=rank,
+        world_size=world,
+        quant="a8w4",
+        w1=packs[0][0],
+        w1_scale=packs[0][1],
+        w2=packs[0][2],
+        w2_scale=packs[0][3],
+        max_tok_per_rank=args.max_tok_per_rank,
+        large_m_state_slots=args.large_m_state_slots,
+        small_m_mtprs=tuple(args.small_m_mtprs),
+        **net,
+    )
+    if moe.small_m_mtpr != max(args.small_m_mtprs):
+        raise AssertionError(
+            f"small-input route not built (small_m_mtpr={moe.small_m_mtpr}); it needs a fused "
+            "a8w4 layout (EP8 DeepSeek-V4-Pro on 8 ranks or EP4 DeepSeek-V4.1-Flash on 4 ranks) "
+            "on an 8-XCD gfx950"
+        )
+    x, w, ids = _make_inputs(
+        moe.small_m_mtpr,
+        net["model_dim"],
+        net["experts"],
+        net["topk"],
+        rank,
+        args.seed,
+        device,
+        force_fanout_boundary=False,
+        inject_invalid_route=False,
+        force_padding_boundary=False,
+    )
+    binds = [p[:4] for p in packs]
+
+    def bind(slot, which):
+        moe.bind_layer(slot, *binds[which])
+
+    return SimpleNamespace(
+        moe=moe,
+        net=net,
+        rank=rank,
+        world=world,
+        device=device,
+        x=x,
+        w=w,
+        ids=ids,
+        refw=[p[4:] for p in packs],
+        bind=bind,
+        large_m=moe._large_m is not None,
+        failures=[],
+    )
+
+
+def _routes_accuracy(ctx, args):
+    """Small-input route against the fp32 reference and the staged route, both layers.
+
+    Returns {(case, layer): (x, w, ids, output, real rows, max_tokens)}.
+    """
+    moe, rank, world, device = ctx.moe, ctx.rank, ctx.world, ctx.device
+    experts = ctx.net["experts"]
+    cases = [
+        ("uniform1", [1] * world, 0),
+        ("uniform8", [8] * world, 0),
+        ("uniform32", [32] * world, 0),
+        ("uniform51", [51] * world, 0),
+        ("uniform64", [64] * world, 0),
+        ("uneven", [64, 1, 33, 7, 50, 64, 2, 17][:world], 0),
+        ("idle_ranks", [0, 64, 0, 13, 64, 0, 40, 0][:world], 0),
+        ("padded", [64, 48, 64, 32, 56, 64, 24, 64][:world], 5),
+        ("all_idle", [0] * world, 0),
+        ("uniform70", [70] * world, 0),
+        ("uniform126", [126] * world, 0),
+        ("uniform168", [168] * world, 0),
+        ("uniform224", [224] * world, 0),
+        ("uniform256", [256] * world, 0),
+        ("dec_uneven", [168, 126, 126, 84, 84, 70, 56, 1][:world], 0),
+        ("dec_idle", [224, 0, 7, 0, 140, 0, 1, 0][:world], 0),
+        ("dec_padded", [224, 224, 224, 224, 224, 224, 224, 224][:world], 37),
+        ("uniform280", [280] * world, 0),
+        ("uniform364", [364] * world, 0),
+        ("uniform448", [448] * world, 0),
+        ("uniform512", [512] * world, 0),
+        ("c384_uneven", [336, 182, 280, 119, 224, 308, 154, 210][:world], 0),
+        ("c384_padded", [448] * world, 160),
+        ("c384_idle", [448, 0, 7, 0, 364, 1, 0, 280][:world], 0),
+    ]
+    cases = [c for c in cases if max(c[1]) <= moe.small_m_mtpr]
+    outputs = {}
+    for name, tpr, pad in cases:
+        for which in range(2):
+            ctx.bind(which, which)
+            xi, wi, ii, real = _rank_case(
+                tpr, rank, ctx.x, ctx.w, ctx.ids, experts, pad
+            )
+            max_tokens = max(max(tpr), 1)
+            out_g = _routed(moe, xi, wi, ii, max_tokens, ROUTE_SMALL_M).clone()
+            _barrier()
+            out_m = _staged_forward(moe, xi, wi, ii).clone()
+            _barrier()
+            rows = slice(0, real)
+            if max(tpr) == 0:
+                rel_staged, rel_ref = 0.0, 0.0
+            else:
+                ref = _moe_reference(moe, xi[rows], wi[rows], ii[rows], ctx.refw[which])
+                rel_ref = _rel_l2(out_g[rows], ref)
+                rel_staged = _rel_l2(out_g[rows], out_m[rows])
+            # Padded rows are discarded by the caller; they only must not be
+            # NaN/Inf. Whether they are exactly zero is reported, not gated.
+            pad_ok = _all_ranks(torch.isfinite(out_g).all(), device)
+            pad_zero = _all_ranks((out_g[real:] == 0).all(), device) if pad else True
+            outputs[(name, which)] = (xi, wi, ii, out_g, real, max_tokens)
+            ok = rel_ref < args.rtol and rel_staged < args.rtol and pad_ok
+            if rank == 0:
+                print(
+                    f"[ACC] {name:10s} w{which} tpr={tpr} pad={pad} relL2_vs_ref={rel_ref:.6f} "
+                    f"relL2_vs_staged={rel_staged:.6f} finite={pad_ok} pad_rows_zero={pad_zero} "
+                    f"{'PASS' if ok else 'FAIL'}",
+                    flush=True,
+                )
+            if not ok:
+                ctx.failures.append(f"acc {name} w{which}")
+    return outputs
+
+
+def _routes_edges(ctx, args):
+    """Truly empty ranks and rank-local -1 slots, then skewed routes."""
+    moe, rank, world, device = ctx.moe, ctx.rank, ctx.world, ctx.device
+    x, w, ids = ctx.x, ctx.w, ctx.ids
+    ctx.bind(0, 0)
+    tpr = [0, 64, 0, 13, 64, 0, 40, 0][:world]
+    n = tpr[rank]
+    xi, wi, ii = x[:n].clone(), w[:n].clone(), ids[:n].clone()
+    if rank % 2:
+        # The combine input still holds the rows of the calls above: a -1 slot must not read them.
+        gen = torch.Generator(device=device).manual_seed(args.seed + rank)
+        ii[torch.rand(ii.shape, generator=gen, device=device) < 1 / 3] = -1
+    # forward_small_m: the wrapper existing callers use (forward with mask_invalid_slots=True).
+    out = moe.forward_small_m(xi, wi, ii, max_tokens=max(tpr))[:n].clone()
+    _barrier()
+    rel_ref = _rel_l2(out, _moe_reference(moe, xi, wi, ii, ctx.refw[0]))
+    ok = rel_ref < args.rtol and _all_ranks(torch.isfinite(out).all(), device)
+    if rank == 0:
+        print(
+            f"[EDGE] empty_ranks+masked_slots tpr={tpr} relL2_vs_ref={rel_ref:.6f} "
+            f"{'PASS' if ok else 'FAIL'}",
+            flush=True,
+        )
+    if not ok:
+        ctx.failures.append("empty ranks / masked slots")
+    # Skewed routes: the rank holding the hot experts sends FP8 rows and reads cached weights, the others
+    # keep BF16 rows, so the combine reads both formats.
+    hot = torch.arange(moe.topk, dtype=ids.dtype, device=device)
+    for name, n, share in (("hot60", 128, 3), ("one_rank", 64, 5), ("hot60", 448, 3)):
+        if n > moe.small_m_mtpr:
+            continue
+        xi, wi, ii = x[:n].clone(), w[:n].clone(), ids[:n].clone()
+        ii[(torch.arange(n, device=device) % 5) < share] = hot
+        out = _routed(moe, xi, wi, ii, n, ROUTE_SMALL_M).clone()
+        _barrier()
+        rel_ref = _rel_l2(out, _moe_reference(moe, xi, wi, ii, ctx.refw[0]))
+        ok = rel_ref < args.rtol and _all_ranks(torch.isfinite(out).all(), device)
+        if rank == 0:
+            print(
+                f"[EDGE] {name} tpr={n} relL2_vs_ref={rel_ref:.6f} {'PASS' if ok else 'FAIL'}",
+                flush=True,
+            )
+        if not ok:
+            ctx.failures.append(f"skewed {name} {n}")
+
+
+def _routes_alternation(ctx, args, outputs):
+    """Layer rebinding over the state slots, staged calls between small-input calls (eager).
+
+    Every small-input call must repeat its first output bit for bit.
+    """
+    moe, device = ctx.moe, ctx.device
+    gen = torch.Generator().manual_seed(args.seed)
+    mism = 0
+    staged_calls = 0
+    keys = [k for k in outputs if k[0] != "all_idle"]
+    for step in range(args.alt_steps):
+        slot = step % args.large_m_state_slots
+        which = (step + slot // 7) & 1
+        ctx.bind(slot, which)
+        if torch.rand((), generator=gen).item() < 0.3:
+            # A larger staged call on the same bound layer between small-input calls.
+            n = 64 + int(torch.randint(0, 200, (), generator=gen).item())
+            xm = torch.randn(
+                (n, ctx.net["model_dim"]), dtype=torch.bfloat16, device=device
+            )
+            wm = ctx.w[:1].expand(n, -1).contiguous()
+            im = ctx.ids[:1].expand(n, -1).contiguous()
+            _staged_forward(moe, xm, wm, im)
+            staged_calls += 1
+        name = keys[int(torch.randint(0, len(keys), (), generator=gen).item())][0]
+        xi, wi, ii, expect, real, mt = outputs[(name, which)]
+        out = _routed(moe, xi, wi, ii, mt)[:real]
+        # Only real rows: sentinel/idle rows are never reduced, so they hold
+        # whatever the combine buffer last had (the caller discards them).
+        mism += int((out != expect[:real]).any(dim=-1).sum().item())
+    mism_t = torch.tensor(mism, device=device)
+    dist.all_reduce(mism_t)
+    ok = int(mism_t.item()) == 0
+    if ctx.rank == 0:
+        print(
+            f"[ALT] steps={args.alt_steps} slots={args.large_m_state_slots} "
+            f"staged_calls={staged_calls} mismatched_rows_vs_first_call={int(mism_t.item())} "
+            f"{'PASS' if ok else 'FAIL'}",
+            flush=True,
+        )
+    if not ok:
+        ctx.failures.append("alternation")
+    _barrier()
+    return keys
+
+
+def _routes_graph(ctx, args):
+    """A CUDA graph of --graph-layers small-input calls over alternating layers, replayed
+    on new inputs, against the same calls run eagerly."""
+    moe, device, net = ctx.moe, ctx.device, ctx.net
+    n = args.graph_bs
+    sx, sw, si = ctx.x[:n].clone(), ctx.w[:n].clone(), ctx.ids[:n].clone()
+    graph_out = []
+
+    def graph_body():
+        graph_out.clear()
+        for layer in range(args.graph_layers):
+            ctx.bind(layer, layer & 1)
+            # The output is the operator's combine buffer (as in main), valid
+            # until its next call: copy it out before the next call.
+            graph_out.append(_routed(moe, sx, sw, si, n).clone())
+
+    # Warm (eager) so dispatch tables exist before capture.
+    graph_body()
+    _barrier()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=torch.cuda.Stream()):
+        graph_body()
+    mism = 0
+    for rep in range(args.graph_reps):
+        gx, gw, gi = _make_inputs(
+            n,
+            net["model_dim"],
+            net["experts"],
+            net["topk"],
+            ctx.rank,
+            args.seed + 100 + rep % 3,
+            device,
+            force_fanout_boundary=False,
+            inject_invalid_route=False,
+            force_padding_boundary=False,
+        )
+        sx.copy_(gx)
+        sw.copy_(gw)
+        si.copy_(gi)
+        _barrier()
+        graph.replay()
+        torch.cuda.synchronize()
+        replay = [o.clone() for o in graph_out]
+        _barrier()
+        for layer in range(args.graph_layers):
+            ctx.bind(layer, layer & 1)
+            eager = _routed(moe, gx, gw, gi, n)
+            mism += int((eager != replay[layer]).any(dim=-1).sum().item())
+        _barrier()
+    mism_t = torch.tensor(mism, device=device)
+    dist.all_reduce(mism_t)
+    ok = int(mism_t.item()) == 0
+    if ctx.rank == 0:
+        print(
+            f"[GRAPH] layers={args.graph_layers} reps={args.graph_reps} bs/rank={n} "
+            f"route={moe._route(n, n)[0]} replay_vs_eager_mismatched_rows={int(mism_t.item())} "
+            f"{'PASS' if ok else 'FAIL'}",
+            flush=True,
+        )
+    if not ok:
+        ctx.failures.append("graph")
+    del graph
+    _barrier()
+
+
+def _routes_timing(ctx, args):
+    """Per --time-bs: the routed call against the staged route, each a graph of
+    --time-calls calls; --check-time-acc first checks every route at that size."""
+    moe, rank, device, net = ctx.moe, ctx.rank, ctx.device, ctx.net
+    for n in args.time_bs:
+        if n <= ctx.x.shape[0]:
+            tx, tw, ti = (
+                ctx.x[:n].contiguous(),
+                ctx.w[:n].contiguous(),
+                ctx.ids[:n].contiguous(),
+            )
+        else:
+            tx, tw, ti = _make_inputs(
+                n,
+                net["model_dim"],
+                net["experts"],
+                net["topk"],
+                rank,
+                args.seed + 500,
+                device,
+                force_fanout_boundary=False,
+                inject_invalid_route=False,
+                force_padding_boundary=False,
+            )
+        ctx.bind(0, 0)
+        route = moe._route(n, n)[0]
+        if args.check_time_acc:
+            # The pinned staged and large-input routes and the routed call, against the fp32
+            # reference at the timed token count.
+            checks = [("staged", lambda: _staged_forward(moe, tx, tw, ti))]
+            if ctx.large_m:
+                checks.append(("large_m", lambda: _large_forward(moe, tx, tw, ti)))
+            checks.append((f"routed:{route}", lambda: _routed(moe, tx, tw, ti, n)))
+            ref = _moe_reference(moe, tx, tw, ti, ctx.refw[0])
+            for label, fn in checks:
+                out = fn()[:n].clone()
+                _barrier()
+                rel_ref = _rel_l2(out, ref)
+                ok = rel_ref < args.rtol and _all_ranks(
+                    torch.isfinite(out).all(), device
+                )
+                if rank == 0:
+                    print(
+                        f"[ACC-T] bs/rank={n} {label} relL2_vs_ref={rel_ref:.6f} "
+                        f"{'PASS' if ok else 'FAIL'}",
+                        flush=True,
+                    )
+                if not ok:
+                    ctx.failures.append(f"time-acc {label} {n}")
+        paths = [
+            ("staged", lambda tx=tx, tw=tw, ti=ti: _staged_forward(moe, tx, tw, ti))
+        ]
+        if route != ROUTE_STAGED:
+            paths.append(
+                (route, lambda tx=tx, tw=tw, ti=ti, n=n: _routed(moe, tx, tw, ti, n))
+            )
+        res = {
+            label: _time_replays(fn, args.time_calls, args.time_trials, device)
+            for label, fn in paths
+        }
+        if rank == 0:
+            staged = res.pop("staged")
+            line = f"[TIME] bs/rank={n:5d} staged={staged:8.1f}us"
+            for label, us in res.items():
+                line += f" {label}={us:8.1f}us speedup={staged / us:.3f}x"
+            print(f"{line} (median of {args.time_trials}, max over ranks)", flush=True)
+
+
+def _run_routes(args, rank, world, device):
+    ctx = _routes_instance(args, rank, world, device)
+    moe = ctx.moe
+    if rank == 0:
+        print(
+            f"[SETUP] network={args.network} mtpr={moe.mtpr} small_m_mtpr={moe.small_m_mtpr} "
+            f"large_m={ctx.large_m} world={world}",
+            flush=True,
+        )
+    if not args.time_only:
+        outputs = _routes_accuracy(ctx, args)
+        _routes_edges(ctx, args)
+        keys = _routes_alternation(ctx, args, outputs)
+        # Zero rows on every rank; 32-bit epochs wrapping.
+        case = outputs[(keys[0][0], 0)]
+        wrap_mism = _check_epoch_wrap_and_zero_rows(
+            moe, ctx.bind, case, case if ctx.large_m else None, device
+        )
+        if rank == 0:
+            print(
+                f"[WRAP] zero_rows+epoch_wrap mismatched_rows={wrap_mism} "
+                f"large_m={ctx.large_m} {'PASS' if wrap_mism == 0 else 'FAIL'}",
+                flush=True,
+            )
+        if wrap_mism:
+            ctx.failures.append("epoch wrap")
+        _routes_graph(ctx, args)
+    _routes_timing(ctx, args)
+    _barrier()
+    if ctx.failures:
+        raise AssertionError("FAILED: " + ", ".join(ctx.failures))
+    if rank == 0:
+        print("[RESULT] ALL PASS", flush=True)
+
+
+def _run_sizes(args, rank, world, device):
+    batch_sizes, rank_tokens = args.batch_sizes, args.rank_tokens_list
+    network = NETWORKS[args.network]
+    if network["experts"] % world:
+        raise ValueError(
+            f"experts={network['experts']} must be divisible by world={world}"
+        )
+    if args.max_tok_per_rank is not None and args.max_tok_per_rank < max(batch_sizes):
+        raise ValueError("--max-tok-per-rank must cover the largest batch size")
+    if args.config_tokens and args.max_tok_per_rank is None:
+        raise ValueError("--config-tokens requires --max-tok-per-rank")
+    if args.config_tokens < 0 or (
+        args.max_tok_per_rank is not None and args.config_tokens > args.max_tok_per_rank
+    ):
+        raise ValueError("--config-tokens must be between zero and max-tok-per-rank")
+    local_experts = network["experts"] // world
+    packed = _quantize_weights(
+        network["model_dim"],
+        network["inter_dim"],
+        local_experts,
+        rank,
+        args.seed,
+        device,
+    )
+    w1, w1_scale, w2, w2_scale, w1_q, w1_ref_scale, w2_q, w2_ref_scale = packed
+    if rank_tokens and len(rank_tokens) != world:
+        raise ValueError("--rank-tokens must contain one value per rank")
+    max_bs = max(batch_sizes + rank_tokens)
+    x, weights, ids = _make_inputs(
+        max_bs,
+        network["model_dim"],
+        network["experts"],
+        network["topk"],
+        rank,
+        args.seed,
+        device,
+        force_fanout_boundary=args.force_fanout_boundary,
+        inject_invalid_route=args.inject_invalid_route,
+        force_padding_boundary=args.force_padding_boundary,
+        concentrate_experts=args.concentrate_experts,
+        zipf=args.zipf,
+    )
+    ref_weights = w1_q, w1_ref_scale, w2_q, w2_ref_scale
+    # MegaMoE's producer/consumer wire geometry is rank-invariant. A
+    # deliberately skewed test therefore selects one configuration that
+    # covers the largest participating rank instead of mixing protocols.
+    config_tokens = args.config_tokens
+    if rank_tokens and not config_tokens:
+        config_tokens = max(1, max(rank_tokens))
+
+    shared_moe = None
+    for batch_size in batch_sizes:
+        local_batch_size = rank_tokens[rank] if rank_tokens else batch_size
+        max_tok_per_rank = args.max_tok_per_rank or max(
+            16, _next_power_of_two(batch_size)
+        )
+        if shared_moe is None or args.max_tok_per_rank is None:
+            fanout_masks = ()
+            if args.force_fanout_boundary:
+                pair_mask = (1 << (local_experts - 2)) | (1 << (local_experts - 1))
+                fanout_masks = (pair_mask,) * world
+            elif args.inject_invalid_route or args.force_padding_boundary:
+                pair_mask = 1 | (1 << (local_experts - 1))
+                fanout_masks = (
+                    (pair_mask,) + (0,) * (world - 1)
+                    if args.force_padding_boundary
+                    else (pair_mask,) * world
+                )
+            shared_moe = MegaMoEV2(
+                rank=rank,
+                world_size=world,
+                quant=args.quant,
+                w1=w1,
+                w1_scale=w1_scale,
+                w2=w2,
+                w2_scale=w2_scale,
+                max_tok_per_rank=max_tok_per_rank,
+                fanout_masks=fanout_masks,
+                stage2_p2p_quant=args.stage2_p2p_quant,
+                large_m_state_slots=args.large_m_state_slots,
+                # Pin the plan: the staged route unless --expect-large-m.
+                large_m_enabled=args.expect_large_m,
+                small_m_mtprs=(),
+                **network,
+            )
+        moe = shared_moe
+        _install_config_policy(moe, config_tokens, args.unify_fields)
+        if rank_tokens:
+            selected = moe._select_config(local_batch_size)
+            configs = [None] * world
+            dist.all_gather_object(
+                configs,
+                (
+                    rank,
+                    local_batch_size,
+                    selected.stage1,
+                    selected.stage2,
+                    selected.p2p_quant,
+                ),
+            )
+            if rank == 0:
+                for config in configs:
+                    print(f"[CONFIG] {config}", flush=True)
+        local_x = x[:local_batch_size].contiguous()
+        local_weights = weights[:local_batch_size].contiguous()
+        local_ids = ids[:local_batch_size].contiguous()
+        if args.burst_depth:
+            _run_burst(moe, local_x, local_weights, local_ids, args.burst_depth, rank)
+        else:
+            _run_size(
+                moe,
+                local_x,
+                local_weights,
+                local_ids,
+                ref_weights,
+                args,
+                rank,
+                world,
+                device,
+            )
+
+
+def _int_list(text):
+    return [int(value) for value in text.split(",") if value]
+
+
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument(
+        "--suite",
+        choices=("size", "routes"),
+        default="size",
+        help="size: one pinned-route instance per batch size; routes: the production "
+        "instance, its route picked by max_tokens",
+    )
     parser.add_argument("--network", choices=NETWORKS, default="v4_pro")
     parser.add_argument("--quant", choices=("a4w4", "a8w4"), default="a8w4")
     parser.add_argument(
+        "--seed", type=int, help="default 123 (size suite), 7 (routes suite)"
+    )
+    parser.add_argument(
+        "--rtol",
+        type=float,
+        help="relL2 gate; default 0.10 (0.25 for a4w4) in the size suite, 0.08 in the routes suite",
+    )
+    parser.add_argument(
+        "--max-tok-per-rank",
+        "--mtpr",
+        type=int,
+        help="instance capacity; size suite default: one instance per batch size, "
+        "routes suite default: 8192",
+    )
+    parser.add_argument(
+        "--large-m-state-slots",
+        "--slots",
+        type=int,
+        help="large-input layer state slots; default 2 (size suite, so the edge checks "
+        "can bind another slot), 61 (routes suite, a DeepSeek model's layers)",
+    )
+    size = parser.add_argument_group("size suite")
+    size.add_argument(
         "--stage2-p2p-quant",
         choices=("auto", "none", "fp8_blockwise_1x32"),
         default="auto",
     )
-    parser.add_argument("--bs-list", default="128")
-    parser.add_argument("--iters", type=int, default=30)
-    parser.add_argument("--seed", type=int, default=123)
-    parser.add_argument("--accuracy-max-bs", type=int, default=128)
-    parser.add_argument("--rtol", type=float)
-    parser.add_argument("--max-tok-per-rank", type=int)
-    parser.add_argument("--rank-tokens", default="")
-    parser.add_argument("--config-tokens", type=int, default=0)
-    parser.add_argument("--unify-fields", default="")
-    parser.add_argument("--burst-depth", type=int, default=0)
-    parser.add_argument("--concentrate-experts", type=int, default=0)
-    parser.add_argument("--zipf", type=float, default=0.0)
-    parser.add_argument("--force-fanout-boundary", action="store_true")
-    parser.add_argument("--inject-invalid-route", action="store_true")
-    parser.add_argument("--force-padding-boundary", action="store_true")
-    parser.add_argument(
+    size.add_argument("--bs-list", default="128")
+    size.add_argument("--iters", type=int, default=30)
+    size.add_argument("--accuracy-max-bs", type=int, default=128)
+    size.add_argument("--rank-tokens", default="")
+    size.add_argument("--config-tokens", type=int, default=0)
+    size.add_argument("--unify-fields", default="")
+    size.add_argument("--burst-depth", type=int, default=0)
+    size.add_argument("--concentrate-experts", type=int, default=0)
+    size.add_argument("--zipf", type=float, default=0.0)
+    size.add_argument("--force-fanout-boundary", action="store_true")
+    size.add_argument("--inject-invalid-route", action="store_true")
+    size.add_argument("--force-padding-boundary", action="store_true")
+    size.add_argument(
         "--pad-tail-rows",
         type=int,
         default=0,
         help="Also route each rank's last N rows to -1 (whole rows) and check "
         "forward(mask_invalid_slots=True) returns them as zeros",
     )
-    parser.add_argument("--expect-large-m", action="store_true")
-    parser.add_argument("--compare-main", action="store_true")
-    parser.add_argument("--smoke-only", action="store_true")
-    # Two by default, so the edge checks can bind another slot.
-    parser.add_argument("--large-m-state-slots", type=int, default=2)
-    parser.add_argument("--layer-stress-cycles", type=int, default=0)
-    parser.add_argument("--route-switch-rounds", type=int, default=0)
+    size.add_argument("--expect-large-m", action="store_true")
+    size.add_argument("--compare-main", action="store_true")
+    size.add_argument("--smoke-only", action="store_true")
+    size.add_argument("--layer-stress-cycles", type=int, default=0)
+    size.add_argument("--route-switch-rounds", type=int, default=0)
+    routes = parser.add_argument_group("routes suite")
+    routes.add_argument(
+        "--small-m-mtprs",
+        type=_int_list,
+        default=[256, 512],
+        help="small-input runtime MTPRs",
+    )
+    routes.add_argument("--alt-steps", type=int, default=600)
+    routes.add_argument("--graph-layers", type=int, default=8)
+    routes.add_argument("--graph-reps", type=int, default=6)
+    routes.add_argument("--graph-bs", type=int, default=168)
+    routes.add_argument(
+        "--time-bs",
+        type=_int_list,
+        default=[7, 14, 28, 56, 70, 84, 126, 168, 224, 280, 336, 448],
+    )
+    routes.add_argument("--time-only", action="store_true")
+    routes.add_argument(
+        "--check-time-acc",
+        action="store_true",
+        help="check every timed route against the fp32 reference",
+    )
+    routes.add_argument("--time-calls", type=int, default=50)
+    routes.add_argument("--time-trials", type=int, default=15)
     args = parser.parse_args()
-    if args.route_switch_rounds and not (args.expect_large_m and args.smoke_only):
-        raise ValueError("--route-switch-rounds requires --expect-large-m --smoke-only")
-    if (
-        sum(
-            (
-                args.force_fanout_boundary,
-                args.inject_invalid_route,
-                args.force_padding_boundary,
+
+    if args.suite == "routes":
+        if get_gfx() != "gfx950":
+            print(
+                f"[SKIP] the small- and large-input routes need gfx950, got {get_gfx()}"
             )
-        )
-        > 1
-    ):
-        raise ValueError("fanout adversarial flags are mutually exclusive")
-    if args.rtol is None:
-        args.rtol = 0.25 if args.quant == "a4w4" else 0.10
-    batch_sizes = [int(value) for value in args.bs_list.split(",")]
-    if not batch_sizes or min(batch_sizes) <= 0:
-        raise ValueError("--bs-list must contain positive integers")
-    rank_tokens = [int(value) for value in args.rank_tokens.split(",") if value]
+            return
+        if args.network not in ("v4_pro", "v41_flash") or args.quant != "a8w4":
+            raise ValueError(
+                "--suite routes needs --network v4_pro or v41_flash and --quant a8w4"
+            )
+        args.seed = 7 if args.seed is None else args.seed
+        args.rtol = 0.08 if args.rtol is None else args.rtol
+        if args.max_tok_per_rank is None:
+            args.max_tok_per_rank = 8192
+        if args.large_m_state_slots is None:
+            args.large_m_state_slots = 61
+        run = _run_routes
+    else:
+        if args.route_switch_rounds and not (args.expect_large_m and args.smoke_only):
+            raise ValueError(
+                "--route-switch-rounds requires --expect-large-m --smoke-only"
+            )
+        if (
+            sum(
+                (
+                    args.force_fanout_boundary,
+                    args.inject_invalid_route,
+                    args.force_padding_boundary,
+                )
+            )
+            > 1
+        ):
+            raise ValueError("fanout adversarial flags are mutually exclusive")
+        if args.rtol is None:
+            args.rtol = 0.25 if args.quant == "a4w4" else 0.10
+        batch_sizes = [int(value) for value in args.bs_list.split(",")]
+        if not batch_sizes or min(batch_sizes) <= 0:
+            raise ValueError("--bs-list must contain positive integers")
+        rank_tokens = _int_list(args.rank_tokens)
+        args.seed = 123 if args.seed is None else args.seed
+        if args.large_m_state_slots is None:
+            args.large_m_state_slots = 2
+        args.batch_sizes, args.rank_tokens_list = batch_sizes, rank_tokens
+        run = _run_sizes
 
     rank, world, device = _setup_dist()
     try:
-        network = NETWORKS[args.network]
-        if network["experts"] % world:
-            raise ValueError(
-                f"experts={network['experts']} must be divisible by world={world}"
-            )
-        if args.max_tok_per_rank is not None and args.max_tok_per_rank < max(
-            batch_sizes
-        ):
-            raise ValueError("--max-tok-per-rank must cover the largest batch size")
-        if args.config_tokens and args.max_tok_per_rank is None:
-            raise ValueError("--config-tokens requires --max-tok-per-rank")
-        if args.config_tokens < 0 or (
-            args.max_tok_per_rank is not None
-            and args.config_tokens > args.max_tok_per_rank
-        ):
-            raise ValueError(
-                "--config-tokens must be between zero and max-tok-per-rank"
-            )
-        local_experts = network["experts"] // world
-        packed = _quantize_weights(
-            network["model_dim"],
-            network["inter_dim"],
-            local_experts,
-            rank,
-            args.seed,
-            device,
-        )
-        w1, w1_scale, w2, w2_scale, w1_q, w1_ref_scale, w2_q, w2_ref_scale = packed
-        if rank_tokens and len(rank_tokens) != world:
-            raise ValueError("--rank-tokens must contain one value per rank")
-        max_bs = max(batch_sizes + rank_tokens)
-        x, weights, ids = _make_inputs(
-            max_bs,
-            network["model_dim"],
-            network["experts"],
-            network["topk"],
-            rank,
-            args.seed,
-            device,
-            force_fanout_boundary=args.force_fanout_boundary,
-            inject_invalid_route=args.inject_invalid_route,
-            force_padding_boundary=args.force_padding_boundary,
-            concentrate_experts=args.concentrate_experts,
-            zipf=args.zipf,
-        )
-        ref_weights = w1_q, w1_ref_scale, w2_q, w2_ref_scale
-        # MegaMoE's producer/consumer wire geometry is rank-invariant. A
-        # deliberately skewed test therefore selects one configuration that
-        # covers the largest participating rank instead of mixing protocols.
-        config_tokens = args.config_tokens
-        if rank_tokens and not config_tokens:
-            config_tokens = max(1, max(rank_tokens))
-
-        shared_moe = None
-        for batch_size in batch_sizes:
-            local_batch_size = rank_tokens[rank] if rank_tokens else batch_size
-            max_tok_per_rank = args.max_tok_per_rank or max(
-                16, _next_power_of_two(batch_size)
-            )
-            if shared_moe is None or args.max_tok_per_rank is None:
-                fanout_masks = ()
-                if args.force_fanout_boundary:
-                    pair_mask = (1 << (local_experts - 2)) | (1 << (local_experts - 1))
-                    fanout_masks = (pair_mask,) * world
-                elif args.inject_invalid_route or args.force_padding_boundary:
-                    pair_mask = 1 | (1 << (local_experts - 1))
-                    fanout_masks = (
-                        (pair_mask,) + (0,) * (world - 1)
-                        if args.force_padding_boundary
-                        else (pair_mask,) * world
-                    )
-                shared_moe = MegaMoEV2(
-                    rank=rank,
-                    world_size=world,
-                    quant=args.quant,
-                    w1=w1,
-                    w1_scale=w1_scale,
-                    w2=w2,
-                    w2_scale=w2_scale,
-                    max_tok_per_rank=max_tok_per_rank,
-                    fanout_masks=fanout_masks,
-                    stage2_p2p_quant=args.stage2_p2p_quant,
-                    large_m_state_slots=args.large_m_state_slots,
-                    # Pin the plan: the staged route unless --expect-large-m.
-                    large_m_enabled=args.expect_large_m,
-                    small_m_mtprs=(),
-                    **network,
-                )
-            moe = shared_moe
-            _install_config_policy(moe, config_tokens, args.unify_fields)
-            if rank_tokens:
-                selected = moe._select_config(local_batch_size)
-                configs = [None] * world
-                dist.all_gather_object(
-                    configs,
-                    (
-                        rank,
-                        local_batch_size,
-                        selected.stage1,
-                        selected.stage2,
-                        selected.p2p_quant,
-                    ),
-                )
-                if rank == 0:
-                    for config in configs:
-                        print(f"[CONFIG] {config}", flush=True)
-            local_x = x[:local_batch_size].contiguous()
-            local_weights = weights[:local_batch_size].contiguous()
-            local_ids = ids[:local_batch_size].contiguous()
-            if args.burst_depth:
-                _run_burst(
-                    moe, local_x, local_weights, local_ids, args.burst_depth, rank
-                )
-            else:
-                _run_size(
-                    moe,
-                    local_x,
-                    local_weights,
-                    local_ids,
-                    ref_weights,
-                    args,
-                    rank,
-                    world,
-                    device,
-                )
+        run(args, rank, world, device)
     finally:
         _cleanup()
 
