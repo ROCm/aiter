@@ -913,6 +913,9 @@ def compile_mega_moe_stage1(
     # rank's launch N + 1 routes would otherwise overwrite the slots of launch N routes a peer's GEMM1 / GEMM2 still
     # reads (that peer's sources are not done with launch N).
     assert not tok_counters or plan_local, "the double-buffered expert counters are zeroed by the combine"
+    # Only the dedup token rows (indexed by source token) leave the slot-indexed payload rows unused; those
+    # rows are single-buffered, so a run-ahead launch would overwrite them as it did the srcmap.
+    assert not tok_counters or dedup_rows, "a runtime with tok_done buckets must send dedup token rows"
     # Small batches stream B; large batches cache it across M tiles.
     b_cache_modifier = int(b_nt) if int(b_nt) >= 0 else (3 if fz_mtpr <= 512 else 0)
     fz_n_i32, fz_nbytes = model_dim // 4, model_dim
@@ -1818,6 +1821,9 @@ class SmallMRuntime:
             # the combine op's single one; allocated after tok_done, so its distance from FC_INP is unchanged.
             workspace["running"] = op._sym((2 * self.epr,), torch.int32)
             # The routes' srcmap and weight slots, in the same two halves (fz_epr * fz_cap apart).
+            # Half 1 starts epr * ll_cap past half 0; the non-compact slot layout (num_valid_max >= epr * ll_cap)
+            # keeps it clear of half 0.
+            assert op.num_valid_max >= self.epr * op.ll_cap, "double-buffered slots need the non-compact layout"
             meta_rows = op.num_valid_max + self.epr * op.ll_cap
             workspace["srcmap"] = op._sym((meta_rows,), torch.int32)
             workspace["wts"] = op._sym((meta_rows,), torch.float32)
