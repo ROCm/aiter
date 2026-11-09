@@ -290,10 +290,13 @@ def emit_direct_fixed_slot_payload(
     *, num_waves, fz_npes, fz_epr, fz_k, fz_cap, fz_mtpr, fz_rank, fz_total_experts, fz_nbytes, fz_n_i32,
     fz_scale_n_i32, fz_enable_scales, addr_disp, addr_in_tok, addr_in_idx, addr_in_wts, addr_in_sc,
     i32_cur_tok, dispatch_blocks, producer_slot, parity, expected, prefetched, route_rounds, prefetch_args,
-    dedup=False, direct_done=0,
+    dedup=False, direct_done=0, running_half=None,
 ):
 # fmt: on
-    """Allocate and publish routes directly into destination fixed slots."""
+    """Allocate and publish routes directly into destination fixed slots.
+
+    ``running_half``: the destinations' expert counters are two halves of fz_epr; the routes count into this one.
+    """
     # prefetch_direct_fixed_slot_route loaded this wave's first len(prefetched) routes before the epoch gate.
     p_source_done = prefetched[0]["tables"]["source_done"]
     a_producer_done = prefetched[0]["tables"]["producer_done"]
@@ -321,12 +324,15 @@ def emit_direct_fixed_slot_payload(
             safe_expert = valid_expert.select(global_expert, fx.Int32(0))
             destination = safe_expert // fx.Int32(fz_epr)
             local_expert = safe_expert - destination * fx.Int32(fz_epr)
+            running_slot = local_expert
+            if const_expr(running_half is not None):
+                running_slot = running_slot + running_half * fx.Int32(fz_epr)
             offset_lane = fx.Int32(0)
             if lane == fx.Int32(0):
                 if valid_expert:
                     offset_lane = fx.Int32(
                         comm_ops.atomic_add_system(
-                            rpf["remote"]["running"] + fx.Int64(local_expert) * fx.Int64(4), fx.Int32(1)
+                            rpf["remote"]["running"] + fx.Int64(running_slot) * fx.Int64(4), fx.Int32(1)
                         )
                     )
             expert_offset = fx.Int32(fx.rocdl.readlane(T.i32, offset_lane, 0))
@@ -457,13 +463,14 @@ def _plan_flag(no_overflow, total_tiles, hot_expert, routed_rows, fz_tile_m):
 @flyc.jit
 def emit_direct_fixed_slot_finalize(
     *, fz_npes, fz_epr, fz_cap, fz_mtpr, fz_rank, fz_tile_m, addr_disp, parity, expected, plan_nv,
-    plan_wt=False, keep_running=False, uniform=False,
+    plan_wt=False, keep_running=False, uniform=False, running_half=None,
 ):
     """Finalize local fixed slots as soon as every source publishes this destination.
 
     ``plan_nv = (addr, epoch)``: the local plan is published as one i64 ``epoch << 32 | num_valid`` store, so
     consumers get num_valid from the flag itself. Only this rank's consumers read it. The srcmap of padding rows
     is left unwritten: GEMM2 masks rows past the tile's valid count itself.
+    ``running_half``: the expert counters are two halves of fz_epr; this launch's routes counted into this one.
     """
     assert 0 < fz_epr <= 128, "direct fixed-slot finalize requires 1..128 experts per rank"
     rdisp = AddrBuffer(addr_disp)
@@ -478,6 +485,8 @@ def emit_direct_fixed_slot_finalize(
     a_trb = dp(DispatchSlot.TILE_ROW_BASE)
     a_nv = dp(DispatchSlot.NUM_VALID)
     a_running = dp(DispatchSlot.RUNNING)
+    if const_expr(running_half is not None):
+        a_running = a_running + fx.Int64(running_half) * fx.Int64(fz_epr * 4)
     a_source_done = dp(DispatchSlot.COUNT_DONE)
     a_tile_rows = dp(DispatchSlot.TILE_ROWS)
     wt_cm = _SC0_SC1_CACHE if plan_wt else 0
@@ -538,7 +547,8 @@ def make_fused_combine_tail(*, lds_fc_off, reducers, npes, rank, topk, total_exp
     ``l1_acquire``: the reducers acquire the peers' rows by dropping only the CU's L1. Valid when the combine input
     lives in the uncached shmem heap (never held in L2) and the local rows were released by the last WG.
     ``reset_running``: the last WG zeroes the first reset_running expert counts at ``arg_running`` before it
-    publishes (every CTA read them before its ticket; the peers' next producers add to them only after the flag).
+    publishes (every CTA read them before its ticket; the peers' next producers add to them only after the flag,
+    or, when tok_done reducers skip it, to the other half of the runtime's double-buffered counters).
     ``row_format``: each rank sent its rows as BF16 or FP8 (1x32 E8M0 scales after the values, BF16 row stride),
     as ``i32_fp8_rows`` says; the choice travels as the low bit of the published flag.
     ``reset_tok``: the last WG zeroes that many per-token counters at ``arg_inp + arg_tok_reset`` (the previous
@@ -891,6 +901,11 @@ def compile_mega_moe_stage1(
     # rank use the same direct_done setting, so they agree on it.
     done_step = _DIRECT_DONE_INC if direct_done else fz_npes
     assert not tok_done or tok_counters, "tok_done needs the runtime's per-token counters"
+    # A tok_done rank leaves without the peers' flags, so its next launch's producers can add to a peer's expert
+    # counters before that peer's combine zeroes them. A runtime with tok_done buckets (tok_counters) keeps two halves
+    # of the counters by launch parity: launch N counts into half N & 1 and its last WG zeroes that half; the next
+    # one a peer can add to it is launch N + 2, which needs this rank's launch N + 1 sources, so launch N is over.
+    assert not tok_counters or plan_local, "the double-buffered expert counters are zeroed by the combine"
     # Small batches stream B; large batches cache it across M tiles.
     b_cache_modifier = int(b_nt) if int(b_nt) >= 0 else (3 if fz_mtpr <= 512 else 0)
     fz_n_i32, fz_nbytes = model_dim // 4, model_dim
@@ -1055,6 +1070,8 @@ def compile_mega_moe_stage1(
             expected1 = _buffer_load(expected_rsrc, fx.Int32(1), fx.Int32, cache_modifier=_SC0_SC1_CACHE)
             return parity, (parity == fx.Int32(0)).select(expected0, expected1)
         producer_slot = ticket - fx.Int32(1)
+        # tok_counters: this launch's half of the expert counters (every rank's launch has the same entry epoch).
+        running_half = gate_epoch & fx.Int32(1) if const_expr(tok_counters) else None
 
         if owner:
             if tid < fx.Int32(64):
@@ -1115,7 +1132,7 @@ def compile_mega_moe_stage1(
                 addr_in_tok=addr_in_tok, addr_in_idx=addr_in_idx, addr_in_wts=addr_in_wts, addr_in_sc=addr_in_sc,
                 i32_cur_tok=i32_cur_tok, dispatch_blocks=dispatch_blocks, producer_slot=producer_slot,
                 parity=route_parity, expected=route_expected, prefetched=prefetched, route_rounds=pre_rounds,
-                prefetch_args=prefetch_args, dedup=dedup_rows, direct_done=direct_done,
+                prefetch_args=prefetch_args, dedup=dedup_rows, direct_done=direct_done, running_half=running_half,
             )
         payload_parity, payload_expected = _load_epoch()
         if owner:
@@ -1123,7 +1140,7 @@ def compile_mega_moe_stage1(
                 fz_npes=fz_npes, fz_epr=fz_epr, fz_cap=fz_cap, fz_mtpr=fz_mtpr, fz_rank=fz_rank,
                 fz_tile_m=fz_tile_m, addr_disp=addr_disp, parity=payload_parity,
                 expected=payload_expected, plan_nv=(_disp_ptr(DispatchSlot.PLAN_NV), gate_epoch),
-                plan_wt=plan_wt, keep_running=plan_local, uniform=head_uniform,
+                plan_wt=plan_wt, keep_running=plan_local, uniform=head_uniform, running_half=running_half,
             )
         wave_id = fx.thread_idx.x // 64
 
@@ -1237,16 +1254,19 @@ def compile_mega_moe_stage1(
 
         def _local_plan():
             # Wave 0: wait for every source as the plan CTA does, then build this CTA's plan table in LDS. The
-            # counts are final once the sources are done; they are read past L2 (the last WG of the previous
-            # launch zeroed them). Returns the plan word's low half.
+            # counts are final once the sources are done; they are read past L2 (the last WG of the launch
+            # that used them before zeroed them). Returns the plan word's low half.
             lane = tid & fx.Int32(63)
             a_done = _disp_ptr(DispatchSlot.COUNT_DONE)
             for source in range(lane, fz_npes, 64):
                 done_index = payload_parity * fx.Int32(fz_npes) + source
                 comm_ops.wait_i32_until_equals(a_done + fx.Int64(done_index) * fx.Int64(4), payload_expected)
             comm_ops.invalidate_l1()
+            a_running = _disp_ptr(DispatchSlot.RUNNING)
+            if const_expr(tok_counters):
+                a_running = a_running + fx.Int64(running_half) * fx.Int64(fz_epr * 4)
             chunks, total_tiles, routed_rows, max_count, _overflow, no_overflow = _plan_counts(
-                _disp_ptr(DispatchSlot.RUNNING), lane, fz_epr, fz_cap, fz_tile_m, count_cm=_SC0_SC1_CACHE)
+                a_running, lane, fz_epr, fz_cap, fz_tile_m, count_cm=_SC0_SC1_CACHE)
             for chunk in range_constexpr(plan_chunks):
                 _valid, _expert, safe_count, num_expert_tiles, metadata_base = chunks[chunk]
                 slot = (fx.Int32(chunk * 64) + lane) * fx.Int32(4)
@@ -1459,6 +1479,14 @@ def compile_mega_moe_stage1(
                         fx.Int32(model_dim), fp8_rows, tok_off)
             g2_active = g2_local < g2_units
             g2_fetch = fx.Int32(1)
+
+        def reset_running_addr():
+            a_running = _disp_ptr(DispatchSlot.RUNNING)
+            if const_expr(tok_counters):
+                # The combine's last WG zeroes this launch's half of the expert counters.
+                a_running = a_running + fx.Int64(running_half) * fx.Int64(fz_epr * 4)
+            return a_running
+
         # The entry-ticket epoch is the same on every rank and needs no load; the high bit keeps it apart from
         # the combine op's own flag values in the shared xdb slots.
         fc_flag = fx.Int64(gate_epoch) + fx.Int64(1 << 40)
@@ -1466,7 +1494,7 @@ def compile_mega_moe_stage1(
             _disp_ptr(DispatchSlot.FC_XDB), _disp_ptr(DispatchSlot.FC_P2P_XDB), _disp_ptr(DispatchSlot.FC_INP),
             _disp_ptr(DispatchSlot.FC_OUT), _disp_ptr(DispatchSlot.FC_TRECV), addr_in_idx, i32_cur_tok,
             fx.Int32(launch_grid_x), fp8_rows,
-            _disp_ptr(DispatchSlot.RUNNING) if const_expr(plan_local) else fx.Int64(0), tok_off, tok_reset)
+            reset_running_addr() if const_expr(plan_local) else fx.Int64(0), tok_off, tok_reset)
 
     @flyc.jit
     def launch(
@@ -1773,8 +1801,13 @@ class SmallMRuntime:
         if self._protocol.tok_counters:
             # Two parity halves of per-token GEMM2 completion counts, reached through each peer's FC_INP.
             workspace["tok_done"] = op._sym((2 * self.mtpr,), torch.int32)
+            # Two launch-parity halves of the per-expert receive counters (compile_mega_moe_stage1), in place of
+            # the combine op's single one; allocated after tok_done, so its distance from FC_INP is unchanged.
+            workspace["running"] = op._sym((2 * self.epr,), torch.int32)
         ms.shmem_barrier_all()
         workspace["p2p_count_done"] = op._p2p_table(workspace["count_done"])
+        if self._protocol.tok_counters:
+            workspace["p2p_running"] = op._p2p_table(workspace["running"])
         self._s1_dispatch_workspace = workspace
 
     def _build_disp_table(self):
@@ -1796,6 +1829,9 @@ class SmallMRuntime:
         table[DispatchSlot.NUM_VALID] = op.num_valid.data_ptr()
         table[DispatchSlot.RUNNING] = op.running.data_ptr()
         table[DispatchSlot.P2P_RUNNING] = op.p2p_running.data_ptr()
+        if self._protocol.tok_counters:
+            table[DispatchSlot.RUNNING] = workspace["running"].data_ptr()
+            table[DispatchSlot.P2P_RUNNING] = workspace["p2p_running"].data_ptr()
         table[DispatchSlot.G2_AQ] = self._s1_out.data_ptr()
         table[DispatchSlot.G2_ASCALE] = self._s1_osd.data_ptr()
         table[DispatchSlot.G2_BQ] = self.w2.data_ptr()
