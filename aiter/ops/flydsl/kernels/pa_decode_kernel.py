@@ -214,7 +214,8 @@ def compile_pa_decode_tile(
     ``static_partitions=P`` instead interprets ``work_info`` as the context-length
     vector and launches P packed partial slots per sequence. Each CTA derives its
     contiguous half-open 256-token-tile range from the runtime length. This is a
-    dense gfx950 specialization; empty ranges publish neutral partials and the
+    gfx950 specialization covering dense or windowed FP8/BF16 attention;
+    empty ranges publish neutral partials and the
     separate reducer combines slots in increasing partition order.
     Positive ``sliding_window`` includes the query token.
     Plans cover the MTP window union; scores are masked per query row.
@@ -286,11 +287,11 @@ def compile_pa_decode_tile(
         and static_partitions >= 2
         and work_capacity == num_seqs * static_partitions
         and not direct_output
-        and sliding_window == 0
-        and kv_dtype in ("fp8", "mxfp4")
+        and kv_dtype in ("fp8", "bf16", "mxfp4")
+        and (kv_dtype != "mxfp4" or sliding_window == 0)
     ):
         raise NotImplementedError(
-            "static split requires dense gfx950 FP8/MXFP4 partial output with "
+            "static split requires gfx950 FP8/BF16/MXFP4 partial output with "
             "capacity=batch*partitions"
         )
     if direct_output and not (
@@ -481,7 +482,10 @@ def compile_pa_decode_tile(
             kv_query = fx.Int32(gpu.block_id("y"))
             kv_h = kv_query // traits.query_splits
             query_begin = (kv_query % traits.query_splits) * traits.QUERIES_PER_CTA
-            partial_slot = kv_h * fx.Int32(gpu.grid_dim.x) + slot
+            capacity = fx.Int32(gpu.grid_dim.x)
+            if const_expr(traits.batch_first_plan_grid):
+                capacity = capacity * fx.Int32(gpu.grid_dim.z)
+            partial_slot = kv_h * capacity + slot
             pmax = fx.recast_iter(fx.Float32, pmax_ptr)
             psum = fx.recast_iter(fx.Float32, psum_ptr)
             pout = fx.recast_iter(traits.Q_DTYPE, pout_ptr)
@@ -523,9 +527,28 @@ def compile_pa_decode_tile(
             seq = slot // partitions
             partition = slot - seq * partitions
             context = fx.Int32(fx.ptr_load(fx.add_offset(work, seq)))
-            tiles = (context + (KV_COMPUTE_BLOCK - 1)) // KV_COMPUTE_BLOCK
-            start = partition * tiles // partitions
-            end = (partition + 1) * tiles // partitions
+            tile_end = (fx.Int64(context) + KV_COMPUTE_BLOCK - 1) // KV_COMPUTE_BLOCK
+            tile_begin = fx.Int64(0)
+            if const_expr(traits.sliding_window > 0):
+                window = min(traits.sliding_window + traits.query_length - 1, 2**31 - 1)
+                tile_begin = (
+                    fx.max(fx.Int64(context) - window, fx.Int64(0)) // KV_COMPUTE_BLOCK
+                )
+            tiles = tile_end - tile_begin
+            start = fx.Int32(
+                tile_begin + fx.Int64(partition) * tiles // traits.static_partitions
+            )
+            end = fx.Int32(
+                tile_begin + fx.Int64(partition + 1) * tiles // traits.static_partitions
+            )
+            # A padded table may select a large host split even for short
+            # runtime contexts. Keep the same 64-tile profitability floor on
+            # replay: one producer retains the original online-softmax path,
+            # while the other packed slots publish neutral partials.
+            long_context = tiles >= 64
+            active_partitions = long_context.select(partitions, fx.Int32(1))
+            start = long_context.select(start, fx.Int32(tile_begin))
+            end = long_context.select(end, fx.Int32(tile_end))
             # One later reducer launch observes these writes after every producer
             # CTA has completed. Only partition zero of grid-y zero owns them.
             if (
@@ -535,8 +558,8 @@ def compile_pa_decode_tile(
             ):
                 info = fx.recast_iter(fx.Int32, static_reduce_info_ptr)
                 info[seq * 2] = seq * partitions
-                info[seq * 2 + 1] = (context > 0).select(partitions, fx.Int32(0))
-            if start < end:
+                info[seq * 2 + 1] = (context > 0).select(active_partitions, fx.Int32(0))
+            if partition < active_partitions and start < end:
                 _run_task(seq, start, end, context)
             else:
                 _store_neutral_partial(slot)

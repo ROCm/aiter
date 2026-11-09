@@ -52,31 +52,32 @@ def _static_split_count(
     num_compute_units: int,
     parallel_rows: int,
     context_capacity: int,
-    block_size: int,
     min_tiles_per_cta: int,
+    partition_limit: int | None = None,
 ) -> int:
-    """Host-only dense split from launch geometry and table capacity.
+    """Host-only split from launch geometry and visible context capacity.
 
     Power-of-two P keeps reducer variants bounded. Enough KV tiles and at least
     eight CTAs per logical row are required to pay for the second launch.
-    The 256-page check also guarantees the minimum staged page-id
-    allocation is sufficient when ``max_context_length`` is only a short
-    scheduling hint rather than a bound on the real runtime length.
+    Supplied scratch bounds P through ``partition_limit`` without allocating
+    replacements for buffers whose original capacity is already sufficient.
+    Page IDs beyond the staged scheduling bound use the existing table-load
+    fallback, so a short host hint does not bound the runtime partition span.
     """
     if parallel_rows < 1 or context_capacity < 1:
         return 1
     tiles = -(-context_capacity // KV_COMPUTE_BLOCK)
     if tiles < 64:
         return 1
-    target = min(num_compute_units, num_compute_units // parallel_rows)
+    # Match the planner's two-CTAs-per-CU budget. A sparse runtime batch can
+    # otherwise strand CUs when only one of its fixed sequence grids is busy.
+    target = min(num_compute_units, 2 * num_compute_units // parallel_rows)
     target = min(target, tiles // min_tiles_per_cta)
+    if partition_limit is not None:
+        target = min(target, partition_limit)
     if target < 8:
         return 1
-    partitions = 1 << (target.bit_length() - 1)
-    pages_per_tile = KV_COMPUTE_BLOCK // block_size
-    if -(-tiles // partitions) * pages_per_tile > 256:
-        return 1
-    return partitions
+    return 1 << (target.bit_length() - 1)
 
 
 def launch_pa_decode_ps_reduce(
@@ -372,7 +373,6 @@ def _pa_decode_mxfp4(
             props.multi_processor_count,
             num_seqs * num_kv_heads,
             max_blocks_per_seq * 128,
-            128,
             4,
         )
         static_partitions = 0 if candidate == 1 else candidate
@@ -552,9 +552,12 @@ def pa_decode(
     Decode and graph replay use the explicit plan without accessing autotune. Set its
     partition cap with ``plan_pa_decode(max_partitions=...)``. On gfx950, a cap
     of one writes output directly when sinks are absent and query/output
-    strides match. Long dense FP8 head-256 page-16/64 calls without supplied
-    scratch may subdivide that task into private static partials and reduce
-    them in fixed order; the caller's plan metadata remains unchanged.
+    strides match. Long FP8/BF16 calls may instead use static partials and
+    reduce them in fixed order, including sliding windows, sinks, strided
+    outputs and multi-partition plans. All supported heads, pages and query
+    shapes share this path. Supplied scratch is reused as packed storage;
+    its capacity bounds the static split. The caller's plan metadata remains
+    unchanged.
     On gfx1250, when
     sinks are absent and query/output strides match, a cap of one writes output
     directly. So do plans with one task slot per sequence (capacity equal to
@@ -1008,10 +1011,15 @@ def pa_decode(
     psum = exp_sums
     pout = temporary_output
     # Bound this call's partitions without shrinking the reusable plan or scratch.
+    # A short scheduling hint trims staging, but cannot bound the number of
+    # live partials in the caller's plan. Use table capacity for gfx950's reducer.
+    partition_context_length = (
+        context_capacity_length if arch == "gfx950" else schedule_context_length
+    )
     max_partitions = min(
         num_partitions,
         work_plan.capacity,
-        max(1, -(-schedule_context_length // KV_COMPUTE_BLOCK)),
+        max(1, -(-partition_context_length // KV_COMPUTE_BLOCK)),
     )
     if sliding_window > 0:
         # Bound the unaligned MTP window without shrinking the reusable plan.
@@ -1021,27 +1029,36 @@ def pa_decode(
         max_partitions = min(max_partitions, window_tiles)
     num_compute_units = torch.cuda.get_device_properties(dev).multi_processor_count
     static_partitions = 0
-    if (
-        arch == "gfx950"
-        and num_partitions == 1
-        and kv_dtype == "fp8"
-        and head_dim == 256
-        and block_size in (16, 64)
-        and query_length * query_group_size <= 32
-        and sliding_window == 0
-        and sinks is None
-        and output.stride() == query.stride()
-        and exp_sums is None
-        and max_logits is None
-        and temporary_output is None
-    ):
+    if arch == "gfx950":
+        # Only visible tiles contribute work. The extra tile accounts for an
+        # unaligned left edge of the causal MTP window union.
+        visible_capacity = context_capacity_length
+        if sliding_window > 0:
+            visible_capacity = min(visible_capacity, window_tiles * KV_COMPUTE_BLOCK)
+        # Keep caller allocations useful: every supplied buffer has the
+        # original plan capacity, and static partials reuse a packed prefix.
+        # A multi-partition plan compacted to one slot per sequence carries
+        # a single-task workgroup budget; retain that bounded launch policy.
+        partition_limit = (
+            work_plan.capacity // num_seqs
+            if (
+                any(t is not None for t in (exp_sums, max_logits, temporary_output))
+                or (num_partitions > 1 and work_plan.capacity == num_seqs)
+            )
+            else None
+        )
         candidate = _static_split_count(
             num_compute_units,
             num_seqs * num_kv_heads,
-            context_capacity_length,
-            block_size,
+            visible_capacity,
             2,
+            partition_limit,
         )
+        # Retain a larger caller partition cap when its pooled budget already
+        # supplies this many tasks. It can concentrate slots on long rows;
+        # uniform static grids would merge useful work or add idle CTAs.
+        if num_partitions > candidate and work_plan.capacity >= candidate:
+            candidate = 1
         static_partitions = 0 if candidate == 1 else candidate
     # Static slots belong to this invocation, not to the reusable caller plan.
     # A later call may use that plan's original records with supplied scratch
@@ -1159,22 +1176,41 @@ def pa_decode(
     )
     expected_scalar_shape = (num_kv_heads, partial_capacity, total_rows)
     expected_output_shape = (*expected_scalar_shape, head_dim)
+    supplied_scalar_shape = (num_kv_heads, work_plan.capacity, total_rows)
     scratch_specs = (
-        ("max_logits", pmax, expected_scalar_shape, torch.float32),
-        ("exp_sums", psum, expected_scalar_shape, torch.float32),
-        ("temporary_output", pout, expected_output_shape, output.dtype),
+        (
+            "max_logits",
+            pmax,
+            expected_scalar_shape,
+            supplied_scalar_shape,
+            torch.float32,
+        ),
+        (
+            "exp_sums",
+            psum,
+            expected_scalar_shape,
+            supplied_scalar_shape,
+            torch.float32,
+        ),
+        (
+            "temporary_output",
+            pout,
+            expected_output_shape,
+            (*supplied_scalar_shape, head_dim),
+            output.dtype,
+        ),
     )
     validated_scratch = []
-    for name, tensor, shape, dtype in scratch_specs:
-        if tensor is None and not gfx950_one_partition_output:
-            tensor = torch.empty(*shape, dtype=dtype, device=dev)
+    for name, tensor, shape, supplied_shape, dtype in scratch_specs:
         if tensor is not None:
             if not isinstance(tensor, torch.Tensor):
                 raise TypeError(
                     f"{name} must be a torch.Tensor, got {type(tensor).__name__}"
                 )
-            if tensor.shape != shape:
-                raise ValueError(f"{name} shape {tuple(tensor.shape)} != {shape}")
+            if tensor.shape != supplied_shape:
+                raise ValueError(
+                    f"{name} shape {tuple(tensor.shape)} != {supplied_shape}"
+                )
             if tensor.dtype != dtype:
                 raise TypeError(f"{name} must be {dtype}, got {tensor.dtype}")
             if tensor.device != dev:
@@ -1184,6 +1220,13 @@ def pa_decode(
                 )
             if not tensor.is_contiguous():
                 raise ValueError(f"{name} must be contiguous")
+            if static_partitions:
+                elements = num_kv_heads * partial_capacity * total_rows
+                if name == "temporary_output":
+                    elements *= head_dim
+                tensor = tensor.view(-1)[:elements].view(shape)
+        elif not gfx950_one_partition_output:
+            tensor = torch.empty(*shape, dtype=dtype, device=dev)
         validated_scratch.append(tensor)
     if gfx950_one_partition_output:
         # Only raw pointer placeholders are needed by the shared launch ABI.

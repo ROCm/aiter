@@ -2215,7 +2215,7 @@ def test_pa_decode_static_graph_and_plan_reuse(
         original_info, original_work = plan.reduce_info.clone(), plan.work_info.clone()
     output = torch.empty_like(query)
 
-    def launch(out=output):
+    def launch(out=output, **scratch):
         pa.pa_decode(
             out,
             query,
@@ -2229,6 +2229,7 @@ def test_pa_decode_static_graph_and_plan_reuse(
             key_scale=ks,
             value_scale=vs,
             max_context_length=capacity,
+            **scratch,
         )
 
     def check(out=output):
@@ -2274,9 +2275,9 @@ def test_pa_decode_static_graph_and_plan_reuse(
             graph.replay()
             assert torch.equal(output, previous)
     if plan is not None:
-        # This fallback uses the original packed plan, after a static call used
-        # a different number of private slots. No plan refresh is needed: the
-        # last replay restored the original lengths.
+        # A one-slot scratch buffer cannot hold static partials. This fallback
+        # uses the original packed plan, after calls with private static slots.
+        # The last replay restored the original lengths, so no refresh is needed.
         padded = torch.full(
             (query.shape[0], 2 * group, dim),
             float("nan"),
@@ -2284,9 +2285,476 @@ def test_pa_decode_static_graph_and_plan_reuse(
             device=device,
         )
         strided = padded[:, :group]
-        launch(strided)
+        scalar_shape = (1, plan.capacity, query_length * group)
+        launch(
+            strided,
+            max_logits=torch.empty(scalar_shape, dtype=torch.float32, device=device),
+            exp_sums=torch.empty(scalar_shape, dtype=torch.float32, device=device),
+            temporary_output=torch.empty(
+                (*scalar_shape, dim), dtype=query.dtype, device=device
+            ),
+        )
         check(strided)
         assert torch.isnan(padded[:, group:]).all()
+
+
+def _make_static_generalized_inputs(device, case):
+    """Shared unit-test inputs for correctness and before/after measurements."""
+    config = {
+        "kv": "fp8",
+        "dim": 128,
+        "page": 64,
+        "query_length": 1,
+        "group": 8,
+        "dtype": torch.bfloat16,
+        "plain": False,
+        "sinks": False,
+        "per_token": False,
+        "window": 0,
+        "partitions": 1,
+        "scratch": None,
+        "short_hint": False,
+        "head_stride": False,
+        "capacity": 32768,
+        "expect_static": True,
+    }
+    config.update(case)
+    dim, page, qlen, group = (
+        config[k] for k in ("dim", "page", "query_length", "group")
+    )
+    capacity, heads = config["capacity"], 2
+    torch.manual_seed(109)
+    pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    query, key, value, table, context = _make_inputs(
+        qlen,
+        heads,
+        group,
+        dim,
+        page,
+        config["dtype"],
+        "random",
+        device,
+        (capacity, capacity - 257),
+    )
+    # Unequal values across heads and pages expose misplaced packed partials.
+    page_value = (
+        torch.arange(table.shape[1], device=device).float() * 4 / table.shape[1] - 1
+    ).repeat(context.numel())
+    value[table.reshape(-1).long()] = page_value.to(value.dtype)[
+        :, None, None, None
+    ].expand_as(value)
+    value[:, 1].neg_()
+    if config["kv"] == "fp8":
+        key, value = key.to(dtypes.fp8), value.to(dtypes.fp8)
+        shape = (*key.shape[:3], 1) if config["per_token"] else (1,)
+        ks = torch.ones(shape, dtype=torch.float32, device=device)
+        vs = torch.ones_like(ks)
+        if config["per_token"]:
+            vs.copy_(
+                (torch.arange(page, device=device) % 7 + 4)[None, None, :, None] / 8
+            )
+        logical_key, logical_value = key.float() * ks, value.float() * vs
+        width = 16
+    else:
+        ks = vs = None
+        logical_key, logical_value = key.float(), value.float()
+        width = 8
+    kc = (
+        key.reshape(-1, heads, page, dim // width, width)
+        .permute(0, 1, 3, 2, 4)
+        .contiguous()
+    )
+    vc = (
+        value.permute(0, 1, 3, 2).contiguous()
+        if config["plain"]
+        else value.reshape(-1, heads, page // width, width, dim)
+        .permute(0, 1, 2, 4, 3)
+        .contiguous()
+    )
+    sinks = None
+    if config["sinks"]:
+        sinks = torch.linspace(-1, 4, heads * group, dtype=query.dtype, device=device)
+    plan = pa.plan_pa_decode(
+        context,
+        heads,
+        max_partitions=config["partitions"],
+        query_length=qlen,
+        sliding_window=config["window"],
+    )
+    padded = torch.full(
+        (query.shape[0], 2 * heads * group, dim),
+        float("nan"),
+        dtype=query.dtype,
+        device=device,
+    )
+    output = padded[:, ::2] if config["head_stride"] else padded[:, : heads * group]
+    scalar_shape = (heads, plan.capacity, qlen * group)
+    scratch = {}
+    for name in ("max_logits", "exp_sums", "temporary_output"):
+        if config["scratch"] == "all" or config["scratch"] == name:
+            shape = (*scalar_shape, dim) if name == "temporary_output" else scalar_shape
+            dtype = query.dtype if name == "temporary_output" else torch.float32
+            scratch[name] = torch.full(shape, float("nan"), dtype=dtype, device=device)
+    args = (output, query, kc, vc, context, table, dim**-0.5, qlen)
+    kwargs = {
+        "key_scale": ks,
+        "value_scale": vs,
+        "sinks": sinks,
+        "work_plan": plan,
+        "sliding_window": config["window"],
+        "max_context_length": page if config["short_hint"] else capacity,
+        **scratch,
+    }
+    return config, args, kwargs, padded, scratch, logical_key, logical_value
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        pytest.param(
+            {"dim": 64, "page": 128, "plain": True, "sinks": True, "head_stride": True},
+            id="fp8-d64-page128",
+        ),
+        pytest.param(
+            {"dim": 128, "page": 16, "query_length": 4, "group": 16, "per_token": True},
+            id="fp8-mtp64-page16",
+        ),
+        pytest.param(
+            {
+                "dim": 128,
+                "page": 128,
+                "query_length": 4,
+                "group": 16,
+                "per_token": True,
+                "window": 16385,
+                "partitions": 4,
+            },
+            id="fp8-mtp64-window-page128",
+        ),
+        pytest.param(
+            {
+                "dim": 256,
+                "page": 128,
+                "dtype": torch.float16,
+                "plain": True,
+                "sinks": True,
+                "partitions": 2,
+            },
+            id="fp16-query-page128-sinks",
+        ),
+        pytest.param({"kv": "bf16", "dim": 64, "page": 16}, id="bf16-d64-page16"),
+        pytest.param(
+            {
+                "kv": "bf16",
+                "dim": 192,
+                "page": 64,
+                "query_length": 2,
+                "group": 16,
+                "sinks": True,
+                "partitions": 2,
+            },
+            id="bf16-d192-mtp-sinks",
+        ),
+        pytest.param(
+            {
+                "kv": "bf16",
+                "dim": 512,
+                "page": 128,
+                "query_length": 4,
+                "group": 16,
+                "partitions": 16,
+                "scratch": "all",
+            },
+            id="bf16-d512-split-query-scratch",
+        ),
+        pytest.param(
+            {"kv": "bf16", "dim": 1024, "page": 64, "query_length": 4, "group": 16},
+            id="bf16-d1024-split-query",
+        ),
+        pytest.param(
+            {
+                "dim": 256,
+                "page": 64,
+                "window": 16385,
+                "partitions": 128,
+                "scratch": "all",
+                "head_stride": True,
+                "expect_static": False,
+            },
+            id="fp8-window-packed-scratch",
+        ),
+        pytest.param(
+            {
+                "dim": 128,
+                "page": 128,
+                "query_length": 4,
+                "group": 16,
+                "per_token": True,
+                "window": 16385,
+                "partitions": 128,
+                "scratch": "exp_sums",
+                "expect_static": False,
+            },
+            id="fp8-window-mixed-scratch",
+        ),
+        pytest.param(
+            {
+                "dim": 512,
+                "page": 16,
+                "query_length": 3,
+                "group": 16,
+                "dtype": torch.float16,
+                "plain": True,
+                "sinks": True,
+                "partitions": 2,
+                "window": 16385,
+            },
+            id="fp16-mtp48-window-sinks",
+        ),
+        pytest.param(
+            {
+                "kv": "bf16",
+                "dim": 128,
+                "page": 128,
+                "query_length": 2,
+                "group": 32,
+                "window": 16385,
+                "partitions": 64,
+                "scratch": "all",
+                "expect_static": False,
+            },
+            id="bf16-mtp64-window-scratch",
+        ),
+        pytest.param(
+            {
+                "dim": 256,
+                "page": 16,
+                "query_length": 4,
+                "partitions": 8,
+                "scratch": "all",
+                "short_hint": True,
+                "capacity": 65536,
+            },
+            id="fp8-scratch-cap-short-hint",
+        ),
+        pytest.param(
+            {
+                "dim": 256,
+                "page": 64,
+                "window": 16385,
+                "partitions": 24,
+                "scratch": "all",
+                "head_stride": True,
+                "expect_static": False,
+            },
+            id="fp8-window-nonpower-scratch",
+        ),
+        pytest.param(
+            {
+                "dim": 128,
+                "page": 128,
+                "query_length": 4,
+                "group": 16,
+                "per_token": True,
+                "window": 16385,
+                "partitions": 24,
+                "scratch": "exp_sums",
+                "expect_static": False,
+            },
+            id="fp8-window-nonpower-mixed-scratch",
+        ),
+    ],
+)
+def test_pa_decode_static_generalized(device, monkeypatch, case):
+    """Static partials cover supported layouts, windows and reusable scratch."""
+    if get_gfx_runtime() != "gfx950":
+        pytest.skip("static split runs on gfx950")
+    if torch.cuda.get_device_properties(device).multi_processor_count < 32:
+        pytest.skip("the static split needs at least eight CTAs per logical row")
+    config, args, kwargs, padded, scratch, logical_key, logical_value = (
+        _make_static_generalized_inputs(device, case)
+    )
+    output, query, kc, _vc, context, table, _, qlen = args
+    group, capacity, heads = config["group"], config["capacity"], kc.shape[1]
+    sinks, plan = kwargs["sinks"], kwargs["work_plan"]
+    original_info, original_work = plan.reduce_info.clone(), plan.work_info.clone()
+    pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    compile_tile, reduce = pa.compile_pa_decode_tile, pa.launch_pa_decode_ps_reduce
+    static_calls, partials = [], []
+
+    def track_static(**kwargs):
+        static_calls.append(kwargs.get("static_partitions", 0))
+        return compile_tile(**kwargs)
+
+    def track_reduce(out, sums, maxima, values, *args, **kwargs):
+        partials.append(
+            {"exp_sums": sums, "max_logits": maxima, "temporary_output": values}
+        )
+        return reduce(out, sums, maxima, values, *args, **kwargs)
+
+    monkeypatch.setattr(pa, "compile_pa_decode_tile", track_static)
+    monkeypatch.setattr(pa, "launch_pa_decode_ps_reduce", track_reduce)
+
+    def launch():
+        nonlocal original_info, original_work
+        if not config["expect_static"]:
+            pa.plan_pa_decode(
+                context,
+                heads,
+                max_partitions=plan.max_partitions,
+                query_length=qlen,
+                sliding_window=config["window"],
+                plan=plan,
+            )
+            original_info, original_work = (
+                plan.reduce_info.clone(),
+                plan.work_info.clone(),
+            )
+        pa.pa_decode(*args, **kwargs)
+
+    def check():
+        reference = _reference(
+            query,
+            logical_key,
+            logical_value,
+            table,
+            context,
+            qlen,
+            config["window"],
+            sinks,
+        )
+        assert torch.isfinite(output).all()
+        torch.testing.assert_close(output.float(), reference, atol=2.5e-2, rtol=2.5e-2)
+        expected = reference.double().reshape(-1, output.shape[-1])
+        actual = output.double().reshape(-1, output.shape[-1])
+        relative_l2 = (actual - expected).norm(dim=-1) / expected.norm(
+            dim=-1
+        ).clamp_min(1e-300)
+        assert relative_l2.max() <= 0.035
+        zero = reference.abs().sum(-1) == 0
+        assert (output[zero] == 0).all()
+        unused = (
+            padded[:, 1::2] if config["head_stride"] else padded[:, heads * group :]
+        )
+        assert torch.isnan(unused).all()
+        assert torch.equal(plan.reduce_info, original_info)
+        assert torch.equal(plan.work_info, original_work)
+        for name, storage in scratch.items():
+            actual = partials[-1][name]
+            assert actual.data_ptr() == storage.data_ptr()
+            assert torch.isnan(storage.view(-1)[actual.numel() :]).all()
+
+    launch()
+    check()
+    if config["expect_static"]:
+        assert static_calls[-1] >= 8
+    else:
+        assert static_calls[-1] == 0
+    if scratch:
+        assert static_calls[-1] <= plan.capacity // context.numel()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        launch()
+    for lengths in (
+        (0, 0),
+        (1, 255),
+        (256, 257),
+        (capacity - 1, 8193),
+        (capacity, capacity - 257),
+    ):
+        context.copy_(torch.tensor(lengths, dtype=torch.int32, device=device))
+        query.neg_()
+        output.fill_(float("nan"))
+        for storage in scratch.values():
+            storage.fill_(float("nan"))
+        graph.replay()
+        check()
+        partitions = static_calls[-1]
+        for seq, length in enumerate(lengths):
+            tile_begin = (
+                max(length - config["window"] - qlen + 1, 0) // 256
+                if config["window"]
+                else 0
+            )
+            if partitions and (length + 255) // 256 - tile_begin < 64:
+                # Short replay rows use one producer despite the large table.
+                inactive = slice(seq * partitions + 1, (seq + 1) * partitions)
+                assert torch.isneginf(partials[-1]["max_logits"][:, inactive]).all()
+                assert (partials[-1]["exp_sums"][:, inactive] == 0).all()
+                assert (partials[-1]["temporary_output"][:, inactive] == 0).all()
+        if partitions and lengths == (0, 0):
+            assert torch.isneginf(partials[-1]["max_logits"]).all()
+            assert (partials[-1]["exp_sums"] == 0).all()
+            assert (partials[-1]["temporary_output"] == 0).all()
+        previous = output.clone()
+        for _ in range(5):
+            output.fill_(float("nan"))
+            graph.replay()
+            assert torch.equal(output, previous)
+
+
+@pytest.mark.parametrize("kv", ["fp8", "bf16"])
+def test_pa_decode_short_hint_reducer_capacity(device, monkeypatch, kv):
+    """A short hint must not truncate live partials on the planned fallback."""
+    if get_gfx_runtime() != "gfx950":
+        pytest.skip("gfx950 scheduling-hint reducer bound")
+    config, args, kwargs, padded, _, logical_key, logical_value = (
+        _make_static_generalized_inputs(
+            device,
+            {
+                "kv": kv,
+                "page": 128,
+                "partitions": 4,
+                "scratch": "all",
+                "short_hint": True,
+            },
+        )
+    )
+    pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    output, query, kc, _, context, table, _, qlen = args
+    plan = kwargs["work_plan"]
+    compile_tile, reduce = pa.compile_pa_decode_tile, pa.launch_pa_decode_ps_reduce
+    static_calls, reduction_bounds = [], []
+
+    def track_static(**kwargs):
+        static_calls.append(kwargs.get("static_partitions", 0))
+        return compile_tile(**kwargs)
+
+    def track_reduce(*args, **kwargs):
+        reduction_bounds.append(kwargs["max_partitions"])
+        return reduce(*args, **kwargs)
+
+    monkeypatch.setattr(pa, "compile_pa_decode_tile", track_static)
+    monkeypatch.setattr(pa, "launch_pa_decode_ps_reduce", track_reduce)
+
+    def launch():
+        pa.plan_pa_decode(context, kc.shape[1], max_partitions=4, plan=plan)
+        pa.pa_decode(*args, **kwargs)
+
+    def check():
+        reference = _reference(
+            query, logical_key, logical_value, table, context, qlen, 0, None
+        )
+        _check_output(output, reference)
+        assert torch.isnan(padded[:, query.shape[1] :]).all()
+
+    launch()
+    check()
+    assert static_calls[-1] == 0
+    assert reduction_bounds[-1] == plan.max_partitions == 4
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        launch()
+    for lengths in (
+        (0, 0),
+        (257, 8193),
+        (config["capacity"], config["capacity"] - 257),
+    ):
+        context.copy_(torch.tensor(lengths, dtype=torch.int32, device=device))
+        query.neg_()
+        output.fill_(float("nan"))
+        graph.replay()
+        check()
 
 
 @pytest.mark.parametrize("max_partitions", [1, 2])

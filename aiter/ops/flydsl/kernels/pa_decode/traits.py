@@ -148,11 +148,10 @@ class PaDecodeSchedule:
             static_partitions != num_partitions
             or work_capacity != num_seqs * static_partitions
             or direct_output
-            or sliding_window
         ):
             raise ValueError(
                 "static split requires P=num_partitions, capacity=batch*P, "
-                "partial output and dense attention"
+                "partial output"
             )
         if not trans_k:
             raise NotImplementedError("Non-transposed key cache is not implemented")
