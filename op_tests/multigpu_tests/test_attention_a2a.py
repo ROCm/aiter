@@ -807,8 +807,9 @@ def _agree(name, rank, world_size, failure):
 
 
 @contextlib.contextmanager
-def _counting_ipc_heap():
-    """Record the IPC heap's allocations and frees."""
+def _counting_ipc_heap(fail_rank=None, fail_after=None):
+    """Record the IPC heap's allocations and frees; optionally make allocation
+    number *fail_after* (0-based) fail on *fail_rank* alone."""
     from aiter.ops.flydsl.ipc_heap import IpcHeap
 
     # freed: the addresses freed and not allocated again since. A freed
@@ -817,6 +818,8 @@ def _counting_ipc_heap():
     alloc, free = IpcHeap.alloc, IpcHeap.free_device_mem
 
     def counting_alloc(*args, **kwargs):
+        if _CTX.rank == fail_rank and len(counts["alloc"]) == fail_after:
+            raise RuntimeError("injected allocation failure")
         ptr = alloc(*args, **kwargs)
         counts["alloc"].append(ptr)
         counts["freed"].discard(ptr)
@@ -917,6 +920,39 @@ def _check_outputs_outlive_op(rank, world_size, device, op_cls):
     except Exception as exc:  # noqa: BLE001
         failure = f"{type(exc).__name__}: {exc}"
     _agree("outputs outlive the op", rank, world_size, failure)
+
+
+def _check_rank_local_alloc_failure(rank, world_size, op_cls):
+    """An allocation failing on one rank alone raises on every rank instead of
+    leaving the others in publish, and every rank frees what it allocated."""
+    if _CTX.inbox_memory != "finegrained":
+        return
+    failing = world_size - 1
+    # The first allocation leaves the failing rank's heap empty.
+    for fail_after in (0, 3):
+        failure = None
+        with _counting_ipc_heap(failing, fail_after) as counts:
+            try:
+                op_cls(rank=rank, world_size=world_size, shape=(1, 64, 8, 128))
+                failure = "did not raise"
+            except RuntimeError as exc:
+                # The others learn of it from the handle exchange or the vote.
+                want = "injected" if rank == failing else "failed to"
+                if want not in str(exc):
+                    failure = f"wrong RuntimeError: {exc}"
+            except Exception as exc:  # noqa: BLE001
+                failure = f"{type(exc).__name__}: {exc}"
+            gc.collect()
+            if failure is None and sorted(counts["free"]) != sorted(counts["alloc"]):
+                failure = (
+                    f"{len(counts['alloc'])} allocated, {len(counts['free'])} freed"
+                )
+        _agree(
+            f"allocation failure after {fail_after} on rank {failing}",
+            rank,
+            world_size,
+            failure,
+        )
 
 
 def _check_e4m3_scale_rounding(
@@ -1526,6 +1562,7 @@ def _run_rank(
         _check_group_disagreement(rank, world_size, _CTX.op_cls)
         _check_negative_construction(rank, world_size, _CTX.op_cls)
         _check_outputs_outlive_op(rank, world_size, device, _CTX.op_cls)
+        _check_rank_local_alloc_failure(rank, world_size, _CTX.op_cls)
         for recipe, sequence, heads in itertools.product(
             recipes, sequences, heads_list
         ):

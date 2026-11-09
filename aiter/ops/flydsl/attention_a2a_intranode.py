@@ -461,194 +461,206 @@ class AttentionA2AIntraNodeOp:
             group=group,
         )
         self._heap = heap
-        role_sequences = (seq_full, valid_kv_len, valid_kv_len)
-        role_numels = tuple(
-            sequence * heads_local * shape[3] for sequence in role_sequences
-        )
-        kv_tiles = (valid_kv_len + 127) // 128
-        mxfp4_k_size = heads_local * kv_tiles * 8192
-        mxfp4_v_size = heads_local * kv_tiles * 128 * 64 + 64
-        fp6_k_payload_size = heads_local * kv_tiles * 17408 + 256
-        fp6_v_payload_size = mxfp6_v_raw_buffer_size(1, valid_kv_len, heads_local)
-        fp6_k_scale_size = valid_kv_len * heads_local * 4 + 64
-        if self.return_packed and any(codec == "mxfp4" for codec in self.codecs):
-            from aiter.ops.mha_v4_quant import (
-                mxfp4_k_raw_buffer_size,
-                mxfp4_v_raw_buffer_size,
+        # A failure may happen on one rank alone and the peers would wait for it in publish.
+        # Every rank joins publish with its outcome instead, and all of them raise.
+        error = None
+        try:
+            role_sequences = (seq_full, valid_kv_len, valid_kv_len)
+            role_numels = tuple(
+                sequence * heads_local * shape[3] for sequence in role_sequences
             )
+            kv_tiles = (valid_kv_len + 127) // 128
+            mxfp4_k_size = heads_local * kv_tiles * 8192
+            mxfp4_v_size = heads_local * kv_tiles * 128 * 64 + 64
+            fp6_k_payload_size = heads_local * kv_tiles * 17408 + 256
+            fp6_v_payload_size = mxfp6_v_raw_buffer_size(1, valid_kv_len, heads_local)
+            fp6_k_scale_size = valid_kv_len * heads_local * 4 + 64
+            if self.return_packed and any(codec == "mxfp4" for codec in self.codecs):
+                from aiter.ops.mha_v4_quant import (
+                    mxfp4_k_raw_buffer_size,
+                    mxfp4_v_raw_buffer_size,
+                )
 
-            mxfp4_k_size = mxfp4_k_raw_buffer_size(1, valid_kv_len, heads_local)
-            mxfp4_v_size = mxfp4_v_raw_buffer_size(1, valid_kv_len, heads_local)
-        if self.return_packed and any(codec == "mxfp6" for codec in self.codecs):
-            from aiter.ops.triton.quant.mxfp6_fmha_pack import fp6_k_raw_buffer_sizes
+                mxfp4_k_size = mxfp4_k_raw_buffer_size(1, valid_kv_len, heads_local)
+                mxfp4_v_size = mxfp4_v_raw_buffer_size(1, valid_kv_len, heads_local)
+            if self.return_packed and any(codec == "mxfp6" for codec in self.codecs):
+                from aiter.ops.triton.quant.mxfp6_fmha_pack import (
+                    fp6_k_raw_buffer_sizes,
+                )
 
-            fp6_k_payload_size, fp6_k_scale_size = fp6_k_raw_buffer_sizes(
-                1, valid_kv_len, heads_local
-            )
-        payload_sizes = tuple(
-            _payload_size(
-                role,
-                codec,
-                self.return_packed,
-                self.quant,
-                role_numels[role],
-                mxfp4_k_size,
-                fp6_k_payload_size,
-                mxfp4_v_size,
-                fp6_v_payload_size,
-            )
-            for role, codec in enumerate(self.codecs)
-        )
-        scale_sizes = tuple(
-            _scale_size(
-                role,
-                codec,
-                per_tensor,
-                self.return_packed,
-                role_numels[role],
-                heads_local,
-                world_size,
-                block_num,
-                valid_kv_len,
-                fp6_k_scale_size,
-            )
-            for role, (codec, per_tensor) in enumerate(
-                zip(self.codecs, v4_amax_exchange)
-            )
-        )
-        scale_storage_sizes = scale_sizes
-        if self.return_packed:
-            # Mirror mha_v4_quant's consumer-owned backing extent for speculative gathers.
-            padding_sizes = tuple(
-                _scale_padding_size(
-                    role, codec, role_sequences[role], valid_kv_len, heads_local
+                fp6_k_payload_size, fp6_k_scale_size = fp6_k_raw_buffer_sizes(
+                    1, valid_kv_len, heads_local
+                )
+            payload_sizes = tuple(
+                _payload_size(
+                    role,
+                    codec,
+                    self.return_packed,
+                    self.quant,
+                    role_numels[role],
+                    mxfp4_k_size,
+                    fp6_k_payload_size,
+                    mxfp4_v_size,
+                    fp6_v_payload_size,
                 )
                 for role, codec in enumerate(self.codecs)
             )
-            scale_storage_sizes = tuple(
-                size + padding for size, padding in zip(scale_sizes, padding_sizes)
-            )
-        for role, size in enumerate(payload_sizes):
-            _require_raw_buffer_extent(
-                f"{'qkv'[role]} output",
-                size * torch.empty((), dtype=payload_dtype).element_size(),
-            )
-        for role, (size, per_tensor) in enumerate(
-            zip(scale_storage_sizes, v4_amax_exchange)
-        ):
-            _require_raw_buffer_extent(
-                f"{'qkv'[role]} scale",
-                size * (4 if per_tensor else 1),
-            )
-        for role in range(3):
-            _require_raw_buffer_extent(f"{'qkv'[role]} input", numel * 2)
-        for name, extent in (
-            ("p2p output table", world_size * 8),
-            ("p2p scale table", world_size * 8),
-            ("xdb memory", world_size * 8),
-            ("reuse memory", world_size * 8),
-            ("reuse flags", 2 * 8),
-            ("xdb flag", 8),
-        ):
-            _require_raw_buffer_extent(name, extent)
-        if split_v_exchange:
-            _require_raw_buffer_extent("V partial amax", shape[2] * 1024)
-        self.v_pc_partial = None
-        if self.codecs[2] == "e4m3_pc":
-            partial_size = v_pc_partial_elems(shape[1], shape[2], shape[3])
-            _require_raw_buffer_extent("V per-channel partial amax", partial_size * 4)
-            self.v_pc_partial = torch.empty(
-                partial_size, dtype=torch.float32, device=self.device
-            )
-        self.v_partial_sets = (
-            tuple(
-                heap.create_tensor(
-                    (world_size // 2, 2, heads_local, 256), torch.float32
+            scale_sizes = tuple(
+                _scale_size(
+                    role,
+                    codec,
+                    per_tensor,
+                    self.return_packed,
+                    role_numels[role],
+                    heads_local,
+                    world_size,
+                    block_num,
+                    valid_kv_len,
+                    fp6_k_scale_size,
                 )
-                for _ in range(2)
-            )
-            if split_v_exchange
-            else ()
-        )
-        self.v_partial_ready_sets = (
-            tuple(
-                heap.create_tensor((world_size, heads_local), torch.int64)
-                for _ in range(2)
-            )
-            if split_v_exchange
-            else ()
-        )
-        for ready in self.v_partial_ready_sets:
-            ready.zero_()
-        self.outputs_sets = tuple(
-            tuple(heap.create_tensor((size,), payload_dtype) for size in payload_sizes)
-            for _ in range(2)
-        )
-        # FP32 descales precede the replicated partial-max exchange slots.
-        self.scale_storage_sets = tuple(
-            tuple(
-                heap.create_tensor(
-                    (size,),
-                    torch.float32 if per_tensor else torch.uint8,
-                )
-                for size, per_tensor in zip(scale_storage_sizes, v4_amax_exchange)
-            )
-            for _ in range(2)
-        )
-        self.scales_sets = tuple(
-            tuple(
-                (
-                    scale[: heads_local * 128].view(1, heads_local, 128)
-                    if codec == "e4m3_pc"
-                    else scale[:1] if per_tensor else scale[:size]
-                )
-                for scale, per_tensor, size, codec in zip(
-                    scales, v4_amax_exchange, scale_sizes, self.codecs
+                for role, (codec, per_tensor) in enumerate(
+                    zip(self.codecs, v4_amax_exchange)
                 )
             )
-            for scales in self.scale_storage_sets
-        )
-        device = self.device
-        self.bf16_outputs_sets = ()
-        self._dequant_launch = None
-        if self.quant and not self.return_packed:
-            # Local consumers retain the same two-parity lifetime as received payloads.
-            self.bf16_outputs_sets = tuple(
+            scale_storage_sizes = scale_sizes
+            if self.return_packed:
+                # Mirror mha_v4_quant's consumer-owned backing extent for speculative gathers.
+                padding_sizes = tuple(
+                    _scale_padding_size(
+                        role, codec, role_sequences[role], valid_kv_len, heads_local
+                    )
+                    for role, codec in enumerate(self.codecs)
+                )
+                scale_storage_sizes = tuple(
+                    size + padding for size, padding in zip(scale_sizes, padding_sizes)
+                )
+            for role, size in enumerate(payload_sizes):
+                _require_raw_buffer_extent(
+                    f"{'qkv'[role]} output",
+                    size * torch.empty((), dtype=payload_dtype).element_size(),
+                )
+            for role, (size, per_tensor) in enumerate(
+                zip(scale_storage_sizes, v4_amax_exchange)
+            ):
+                _require_raw_buffer_extent(
+                    f"{'qkv'[role]} scale",
+                    size * (4 if per_tensor else 1),
+                )
+            for role in range(3):
+                _require_raw_buffer_extent(f"{'qkv'[role]} input", numel * 2)
+            for name, extent in (
+                ("p2p output table", world_size * 8),
+                ("p2p scale table", world_size * 8),
+                ("xdb memory", world_size * 8),
+                ("reuse memory", world_size * 8),
+                ("reuse flags", 2 * 8),
+                ("xdb flag", 8),
+            ):
+                _require_raw_buffer_extent(name, extent)
+            if split_v_exchange:
+                _require_raw_buffer_extent("V partial amax", shape[2] * 1024)
+            self.v_pc_partial = None
+            if self.codecs[2] == "e4m3_pc":
+                partial_size = v_pc_partial_elems(shape[1], shape[2], shape[3])
+                _require_raw_buffer_extent(
+                    "V per-channel partial amax", partial_size * 4
+                )
+                self.v_pc_partial = torch.empty(
+                    partial_size, dtype=torch.float32, device=self.device
+                )
+            self.v_partial_sets = (
                 tuple(
-                    torch.empty(numel, dtype=torch.bfloat16, device=device)
-                    for _ in range(3)
+                    heap.create_tensor(
+                        (world_size // 2, 2, heads_local, 256), torch.float32
+                    )
+                    for _ in range(2)
+                )
+                if split_v_exchange
+                else ()
+            )
+            self.v_partial_ready_sets = (
+                tuple(
+                    heap.create_tensor((world_size, heads_local), torch.int64)
+                    for _ in range(2)
+                )
+                if split_v_exchange
+                else ()
+            )
+            for ready in self.v_partial_ready_sets:
+                ready.zero_()
+            self.outputs_sets = tuple(
+                tuple(
+                    heap.create_tensor((size,), payload_dtype) for size in payload_sizes
                 )
                 for _ in range(2)
             )
-            self._dequant_launch = make_attention_a2a_dequant_jit(
-                numel=numel, codec=self.codecs, fp8_fnuz=self.fp8_fnuz
+            # FP32 descales precede the replicated partial-max exchange slots.
+            self.scale_storage_sets = tuple(
+                tuple(
+                    heap.create_tensor(
+                        (size,),
+                        torch.float32 if per_tensor else torch.uint8,
+                    )
+                    for size, per_tensor in zip(scale_storage_sizes, v4_amax_exchange)
+                )
+                for _ in range(2)
             )
-        self.xdb_mem = heap.create_tensor((world_size,), torch.int64)
-        # Consumer-drain readiness is separate from producer-complete flags.
-        self.reuse_mem_sets = tuple(
-            heap.create_tensor((world_size,), torch.int64) for _ in range(2)
-        )
-        for ready_mem in self.reuse_mem_sets:
-            ready_mem.zero_()
-        self.reuse_flags = torch.ones(2, dtype=torch.int64, device=device)
-        for scales in self.scales_sets:
-            for role, (scale, codec) in enumerate(zip(scales, self.codecs)):
-                if self.return_packed and role == 1 and codec == "mxfp6":
-                    scale.zero_()
-        for storage, scales in zip(self.scale_storage_sets, self.scales_sets):
-            for backing, scale in zip(storage, scales):
-                backing[scale.numel() :].zero_()
-        for outputs in self.outputs_sets:
-            for output in outputs:
-                output.zero_()
-        self.xdb_mem.zero_()
-        self.xdb_flag = torch.ones(1, dtype=torch.int64, device=device)
+            self.scales_sets = tuple(
+                tuple(
+                    (
+                        scale[: heads_local * 128].view(1, heads_local, 128)
+                        if codec == "e4m3_pc"
+                        else scale[:1] if per_tensor else scale[:size]
+                    )
+                    for scale, per_tensor, size, codec in zip(
+                        scales, v4_amax_exchange, scale_sizes, self.codecs
+                    )
+                )
+                for scales in self.scale_storage_sets
+            )
+            device = self.device
+            self.bf16_outputs_sets = ()
+            self._dequant_launch = None
+            if self.quant and not self.return_packed:
+                # Local consumers retain the same two-parity lifetime as received payloads.
+                self.bf16_outputs_sets = tuple(
+                    tuple(
+                        torch.empty(numel, dtype=torch.bfloat16, device=device)
+                        for _ in range(3)
+                    )
+                    for _ in range(2)
+                )
+                self._dequant_launch = make_attention_a2a_dequant_jit(
+                    numel=numel, codec=self.codecs, fp8_fnuz=self.fp8_fnuz
+                )
+            self.xdb_mem = heap.create_tensor((world_size,), torch.int64)
+            # Consumer-drain readiness is separate from producer-complete flags.
+            self.reuse_mem_sets = tuple(
+                heap.create_tensor((world_size,), torch.int64) for _ in range(2)
+            )
+            for ready_mem in self.reuse_mem_sets:
+                ready_mem.zero_()
+            self.reuse_flags = torch.ones(2, dtype=torch.int64, device=device)
+            for scales in self.scales_sets:
+                for role, (scale, codec) in enumerate(zip(scales, self.codecs)):
+                    if self.return_packed and role == 1 and codec == "mxfp6":
+                        scale.zero_()
+            for storage, scales in zip(self.scale_storage_sets, self.scales_sets):
+                for backing, scale in zip(storage, scales):
+                    backing[scale.numel() :].zero_()
+            for outputs in self.outputs_sets:
+                for output in outputs:
+                    output.zero_()
+            self.xdb_mem.zero_()
+            self.xdb_flag = torch.ones(1, dtype=torch.int64, device=device)
 
-        # The heap barrier is host-only: peers must not publish into our flags
-        # before our zeroing has completed on the device. The zeroing is enqueued
-        # on the current stream, so syncing it avoids waiting on unrelated work.
-        torch.cuda.current_stream(self.device).synchronize()
-        heap.publish()
+            # The heap barrier is host-only: peers must not publish into our flags
+            # before our zeroing has completed on the device. The zeroing is enqueued
+            # on the current stream, so syncing it avoids waiting on unrelated work.
+            torch.cuda.current_stream(self.device).synchronize()
+        except Exception as exc:  # noqa: BLE001
+            error = exc
+        heap.publish(error)
         self.p2p_outputs_sets = tuple(
             tuple(heap.p2p_table(output) for output in outputs)
             for outputs in self.outputs_sets

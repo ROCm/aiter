@@ -42,12 +42,29 @@ def build_p2p_table(tensor, rank, world_size, device) -> torch.Tensor:
 #
 #   create_tensor(shape, dtype)  A new tensor, not necessarily zeroed. No peer
 #                                can address it before ``publish``.
-#   publish()                    Make every tensor created so far addressable
-#                                by the peers. Also a barrier.
+#   publish(error=None)          Make every tensor created so far addressable
+#                                by the peers. Also a barrier. A rank that
+#                                failed since the heap was created passes its
+#                                error: every rank still joins, and every rank
+#                                raises, so none is left waiting.
 #   p2p_table(tensor)            i64 device table of the tensor on every rank.
 #   barrier()                    Host barrier over the participants.
 #   close()                      Release the heap's memory. Collective.
 #   needs_close                  True while memory awaits a collective close.
+
+
+def _vote(group, error):
+    """Raise on every rank in *group* if any of them has an *error*.
+
+    The rank that failed raises its own error, the others a RuntimeError.
+    """
+    oks = [None] * dist.get_world_size(group=group)
+    dist.all_gather_object(oks, error is None, group=group)
+    if error is not None:
+        raise error
+    if not all(oks):
+        failed = [rank for rank, ok in enumerate(oks) if not ok]
+        raise RuntimeError(f"rank(s) {failed} failed to set up the symmetric heap")
 
 
 class MoriSymmetricHeap:
@@ -61,7 +78,7 @@ class MoriSymmetricHeap:
     # MoRI owns the memory and releases it when it is finalized.
     needs_close = False
 
-    def __init__(self, *, rank, world_size, device):
+    def __init__(self, *, rank, world_size, device, group):
         import mori.shmem as ms
 
         if rank != ms.shmem_mype() or world_size != ms.shmem_npes():
@@ -71,13 +88,17 @@ class MoriSymmetricHeap:
             )
         self._ms = ms
         self.rank, self.world_size, self.device = rank, world_size, device
+        self.group = group
 
     def create_tensor(self, shape, dtype):
         from mori.shmem import mori_shmem_create_tensor
 
         return mori_shmem_create_tensor(shape, dtype)
 
-    def publish(self):
+    def publish(self, error=None):
+        # The vote comes first: a rank that failed must not be awaited in the
+        # MoRI barrier.
+        _vote(self.group, error)
         self._ms.shmem_barrier_all()
 
     def barrier(self):
@@ -105,9 +126,9 @@ def _free_allocation(ptr, device, exported):
 class _IpcAllocation:
     """One HIP IPC allocation, as a ``__cuda_array_interface__`` byte array.
 
-    The tensors made from the IPC allocation hold it through their storage. 
-    Hence, the memory stays valid while any of them, or any view of them, is alive. 
-    The IPC memory is freed only after the last tensor referencing it is out of scope, 
+    The tensors made from the IPC allocation hold it through their storage.
+    Hence, the memory stays valid while any of them, or any view of them, is alive.
+    The IPC memory is freed only after the last tensor referencing it is out of scope,
     but only while no peer maps it. Collective ``close`` confirms that every peer
     has unmapped the IPC memory, otherwise the IPC memory is leaked.
     """
@@ -183,17 +204,18 @@ class IpcSymmetricHeap:
         tensor = torch.as_tensor(allocation, device=self.device)
         return tensor.view(dtype).view(*shape)
 
-    def publish(self):
+    def publish(self, error=None):
         start = next(
             (i for i, p in enumerate(self._peer_ptrs) if p is None),
             len(self._peer_ptrs),
         )
         pending = self._local[start:]
-        error = None
-        try:
-            handles = [IpcHeap.get_mem_handle_bytes(a.ptr) for a in pending]
-        except Exception as exc:  # noqa: BLE001
-            error, handles = exc, None
+        handles = None
+        if error is None:
+            try:
+                handles = [IpcHeap.get_mem_handle_bytes(a.ptr) for a in pending]
+            except Exception as exc:  # noqa: BLE001
+                error = exc
         # From the gather on, a peer may map them.
         for allocation in pending:
             allocation.exported = True
@@ -219,10 +241,12 @@ class IpcSymmetricHeap:
                         self._peer_ptrs[start + i] = ptrs
             except Exception as exc:  # noqa: BLE001
                 error = exc
-        oks = [None] * self.world_size
-        dist.all_gather_object(oks, error is None, group=self.group)
-        if error is not None or not all(oks):
-            raise error or RuntimeError("a peer rank failed to open the IPC buffers")
+        try:
+            _vote(self.group, error)
+        except Exception:
+            # Every rank is here, so the teardown can be collective too.
+            self.close()
+            raise
 
     def barrier(self):
         dist.barrier(group=self.group)
@@ -276,7 +300,9 @@ def make_symmetric_heap(*, memory, rank, world_size, device, group):
     """The heap for a resolved *memory* type: MoRI for ``uncached``, HIP IPC
     for ``finegrained``. MoRI's heap has no fine-grained mode."""
     if memory == "uncached":
-        return MoriSymmetricHeap(rank=rank, world_size=world_size, device=device)
+        return MoriSymmetricHeap(
+            rank=rank, world_size=world_size, device=device, group=group
+        )
     return IpcSymmetricHeap(
         rank=rank, world_size=world_size, device=device, group=group, memory=memory
     )
