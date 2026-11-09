@@ -47,6 +47,9 @@ from .communication import ccqe_enabled as _rail_ccqe
 from .communication import rail as _rail
 from .gemm import gemm2_compute_v2, issue_a_load_lds_dt, kStages
 
+# Keep constexpr and runtime guards separate (local SIM102/SIM114 exemptions).
+# Raw loads/atomics preserve system scope, ordering and element-offset units;
+# scaled MFMA SSA fragments retain the tuned instruction and rounding contract.
 _BUFFER_OFFSET_ABI_BYTES = 1 << 31
 # Tile shape: 32-row M tiles (one Stage1 tile each), K step 256.
 BM = 32
@@ -58,7 +61,7 @@ NUM_XCD = 8
 # fmt: off
 def p2p_scatter_epilog(lds_acc_base, accm, n_block_idx, wave, lane, *, N_OUT, BM, BN, npes, topk,
     log2_max_tok, mask_max_tok, recv_cap, comb_inp_nbytes, lds_packed_off, lds_weight_off,
-    lds_peer_off, scatter_vec, gpus_per_node, lds_rowptr_off=None):
+    lds_peer_off, scatter_vec, gpus_per_node, lds_rowptr_off=None, NW=4):
 # fmt: on
     """CShuffle one GEMM2 tile into weighted BF16 rows and scatter them to peers.
 
@@ -66,7 +69,13 @@ def p2p_scatter_epilog(lds_acc_base, accm, n_block_idx, wave, lane, *, N_OUT, BM
     before the GEMM: an absolute row address in LDS (0 = no row), pointing at
     the local send buffer, this GPU's own landing rows, or -- past the send
     buffer -- the peer's landing row directly.
+
+    NW=8 (two n_blocks per CTA, see gemm2_compute_v2): each four-wave half
+    shuffles through its own BM x BN slab and stores its own n_block.
     """
+    if NW == 8:
+        lds_acc_base = lds_acc_base + (wave // fx.Int32(4)) * fx.Int32(BM * BN * 4)
+        wave = wave % fx.Int32(4)
     kMChunks = BM // 16
     numAccN = (BN // 4) // 16
     wave_n = BN // 4
@@ -244,6 +253,39 @@ K1_CTAS_PER_CU = 5
 SDMA_PLAN_WORDS_MAX = 1024
 
 
+def tr_layout(max_tok: int, topk: int) -> dict:
+    """Token-ready rail words, byte offsets into a rank's plane_slot_arrived
+    plane (per parity), packed at its end; inv and the SDMA chunk counters sit
+    at its start.
+
+    cnt[tok]  i32: the rail rank adds -E (rows of tok its node peers compute),
+              every peer +1 per finished row; it reaches 0 exactly once.
+    q[pos]    i64: non-SDMA ready queue, gen32 << 32 | tok.
+              SDMA uses q[tok] as the full compute-ready generation.
+              Fixed owners keep their consumed bitmap/cursor in CTA LDS.
+    tail/head i32: enqueue / claim counters (separate lines).
+    posted[8], rung[8] i32: per QP batches posted / covered by a doorbell.
+    req[8]    i64: per QP last flush request.  bdone[b] i32: tokens reduced.
+    prog[8]   i64: SDMA landed-row prefix per source rank (gen32 << 32 | end).
+    """
+    plane = 2 * int(max_tok) * int(topk) * 8
+    out, off = {}, 0
+    for name, nbytes in (("cnt", max_tok * 4), ("q", max_tok * 8), ("tail", 4), ("head", 4),
+                         ("scan", 4), ("state", max_tok * 4),
+                         ("posted", 32), ("rung", 32), ("req", 64),
+                         ("bdone", (max_tok // 4 + 1) * 4),
+                         ("issued", (max_tok // 4 + 1) * 4), ("prog", 64)):
+        off = (off + 127) // 128 * 128
+        out[name] = off
+        off += nbytes
+    base = (plane - off) // 256 * 256
+    if base < 256 + 2 * int(max_tok) * int(topk) * 4:
+        raise ValueError("token-ready words do not fit the arrival plane")
+    out = {k: base + v for k, v in out.items()}
+    out["base"] = base
+    return out
+
+
 def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, topk: int, npes: int,
     max_tok: int, recv_cap: int, comb_inp_nbytes: int, BN: int, cu_num: int, gpus_per_node: int,
     arrival_delta: int, arrival_delta_step: int, epoch_planes: tuple, a_tile_map_plane: int,
@@ -252,9 +294,15 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
     tile_group: int = 1, expert_count_plane: int = 0, sdma: bool = False,
     sdma_chunk_tiles: int = 32, sdma_send_rows: int = 0, sdma_frac_q64: int = 64,
     sdma_put_bytes: int = 4 << 20, sdma_arrival_woff: int = 0, sdma_arrival_plane: int = 0,
-    sdma_max_chunks: int = 0, gemm2_bm: int = 32, sdma_ramp_chunks: int = 0):
+    sdma_max_chunks: int = 0, gemm2_bm: int = 32, sdma_ramp_chunks: int = 0, waves: int = 4,
+    sdma_remote_only: bool = False, token_ready: bool = False, a_dtype: str = "fp4"):
 # fmt: on
     """Compile the persistent GEMM2 + node push kernel (stage2 kernel1).
+
+    ``waves`` = 8 (the single-kernel CTA shape, one CTA per CU at <= 256
+    registers a wave): a CTA runs the n_block pair (2p, 2p+1) of each m-block
+    it claims, waves 0-3 / 4-7 one n_block each over the shared A tile; the
+    tickets are per n_block pair.  Fused dynamic xGMI kernel only.
 
     ``dynamic_claim`` makes each CTA take m-blocks from a per-n_block ticket
     instead of a fixed stride (ignored when the XCD remap is on); the grid is
@@ -280,6 +328,9 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
     Stage1 already stores local expert ids.
     """
     epoch_planes = tuple(int(v) for v in epoch_planes)
+    if a_dtype not in ("fp4", "fp8"):
+        raise ValueError("a_dtype must be fp4 or fp8")
+    a_pack = 1 if a_dtype == "fp8" else 2
     if len(epoch_planes) != 6:
         raise ValueError("epoch_planes must hold six plane sizes")
     arch = str(get_rocm_arch() or "")
@@ -308,13 +359,22 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
     mask_max_tok = max_tok - 1
     N_OUT = model_dim
     aStages = kStages + 1
-    KH_TILE_A = BK // 2  # FP4: two values per byte
+    KH_TILE_A = BK // a_pack
     # The f32 CShuffle slab and the A stages share one LDS union.
-    compute_lds_bytes = max(GBM * BN * 4, aStages * GBM * KH_TILE_A)
+    WAVES = int(waves)
+    PAIR = WAVES == 8
+    if WAVES not in (4, 8):
+        raise ValueError(f"stage2 kernel1 waves must be 4 or 8, got {WAVES}")
+    if PAIR and (not fused or (model_dim // BN) % 2):
+        raise ValueError("8-wave kernel1 needs the fused kernel and an even n_block count")
+    THREADS_K1 = 64 * WAVES
+    NPAIR = 2 if PAIR else 1  # n_blocks per CTA unit
+    compute_lds_bytes = max(NPAIR * GBM * BN * 4, aStages * GBM * KH_TILE_A)
     lds_packed_off = compute_lds_bytes
     lds_weight_off = lds_packed_off + GBM * 4
     lds_peer_off = lds_weight_off + GBM * 4
     num_n_blocks_c = model_dim // BN
+    NB_CLAIM = num_n_blocks_c // NPAIR  # claim tickets / CTA columns (n_block pairs)
     xcd_group = int(m_group)
     if fused:
         # The fused kernel runs kernel2 on these CTAs once their GEMM2 work is
@@ -322,7 +382,7 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
         # waiting for a slot behind spinning kernel2 CTAs never gets one.
         if resident_ctas <= 0:
             raise ValueError("fused stage2 needs resident_ctas > 0")
-        cu_num = min(int(cu_num), max(1, int(resident_ctas) // num_n_blocks_c))
+        cu_num = min(int(cu_num), max(1, int(resident_ctas) // NB_CLAIM))
     if xcd_group > 1 and (cu_num * num_n_blocks_c) % (NUM_XCD * xcd_group) != 0:
         xcd_group = 1  # remap would not be a bijection; keep the plain order
     # Without the XCD remap, each CTA keeps its static n_block (so its w2 column
@@ -339,7 +399,16 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
     if dynamic and resident_ctas <= 0:
         raise ValueError("dynamic_claim needs resident_ctas > 0")
     lds_claim_off = lds_peer_off + npes * 8  # two i32 slots, double-buffered
-    lds_bytes = lds_claim_off + (16 if dynamic else 0)
+    # token_ready: words 2..7 of the claim area are the rail hooks' broadcasts.
+    TRK = bool(token_ready)
+    # Fixed token owners retain one bit per assigned token in private CTA LDS.
+    # Use a lower bound on the effective grid (resident_ctas is a capacity
+    # scaled by K1_CTAS_PER_CU). Over-allocation also covers non-paired grids.
+    TR_OWNER_GRID = max(1, int(resident_ctas) // K1_CTAS_PER_CU - NB_CLAIM + 1)
+    TR_OWNER_ROUNDS = _ceil_div(max_tok, TR_OWNER_GRID * WAVES)
+    TR_OWNER_WORDS = _ceil_div(TR_OWNER_ROUNDS, 32)
+    tr_owner_bytes = (TR_OWNER_WORDS * WAVES + 2) * 4 if TRK and sdma else 0
+    lds_bytes = lds_claim_off + ((64 + tr_owner_bytes if TRK else 16) if dynamic else 0)
     # Remote-first claim (dynamic only): per local expert its local/remote tile
     # counts and the prefix sums that map a ticket to an m-block.
     remote_first = bool(remote_first) and dynamic
@@ -364,6 +433,15 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
     # over every link (a cut by send-buffer position would pile the xGMI share
     # onto the highest-numbered peers).
     SD_FQ = int(sdma_frac_q64)
+    if TRK and not (fused and remote_first and dynamic):
+        raise ValueError("token_ready needs the fused remote-first kernel")
+    TRL = tr_layout(max_tok, topk) if TRK else None
+    # Remote-only SDMA: the remote-source half (pushed first, awaited by the rail
+    # reduce) goes by the copy engine; the local half, computed last, is stored
+    # over xGMI by the GEMM2 CTAs so no engine tail follows the last unit.
+    SD_RO = bool(sdma_remote_only)
+    if SD_RO and not sdma:
+        raise ValueError("sdma_remote_only needs the sdma stage2")
     if not 0 <= SD_FQ <= 64:
         raise ValueError("sdma_frac_q64 must be in [0, 64]")
     SD_RB = model_dim + model_dim // 32  # one FP8 output row + its E8M0 scales
@@ -395,6 +473,10 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
             raise ValueError("sdma FP8 rows need hidden % 256 == 0 and 8-byte rows")
         if SD_AWOFF <= 0 or SD_MAXCH <= 0 or SD_PUT_B <= 0:
             raise ValueError("sdma needs the arrival window offset, max chunks and put bytes")
+        if TRK and SD_CDONE_B + SD_MAXCH * SD_CDONE_STRIDE * 4 > TRL["base"]:
+            raise ValueError("SDMA chunk counters overlap token-ready words")
+        if TRK and 2 * max_tok * topk >= (1 << 28):
+            raise ValueError("token-ready SDMA row indices exceed 28 bits")
         if SD_CDONE_B + SD_MAXCH * SD_CDONE_STRIDE * 4 > SD_APLANE:
             raise ValueError("sdma chunk counters do not fit the arrival region")
         if SD_CT % GS:
@@ -406,7 +488,9 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
         lds_bytes = lds_coff_off + SD_PLAN_CTAS * 8 * 4
         # The plan's scratch reuses the GEMM LDS union (it runs before the
         # CTA's first unit): per-thread totals, per-group sums, dest totals.
-        SP_TOT, SP_GS, SP_SUM = 0, 256 * 8 * 4, 256 * 8 * 4 + 32 * 8 * 4
+        # One thread per ticket range, groups of 8 threads (THREADS_K1 // 8).
+        SP_TOT, SP_GS = 0, THREADS_K1 * 8 * 4
+        SP_SUM = SP_GS + (THREADS_K1 // 8) * 8 * 4
         SP_LAST, SP_RUN = 255, 192  # i32 slots in SP_GS: "last plan CTA", per-peer run start
         if SP_SUM + 8 * 4 > compute_lds_bytes:
             raise ValueError("sdma plan scratch does not fit the GEMM LDS union")
@@ -422,10 +506,10 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
     # CTAs that fit on a CU (160 KiB LDS); a bigger GEMM2 tile lowers it, and
     # the persistent grid must shrink with it (a CTA that never becomes
     # resident behind spinning ones hangs the fused kernel).
-    K1_OCC = max(1, min(K1_CTAS_PER_CU, (160 * 1024) // lds_bytes))
+    K1_OCC = 1 if PAIR else max(1, min(K1_CTAS_PER_CU, (160 * 1024) // lds_bytes))
     res_eff = int(resident_ctas) // K1_CTAS_PER_CU * K1_OCC
     if fused:
-        cu_num = min(int(cu_num), max(1, res_eff // num_n_blocks_c))
+        cu_num = min(int(cu_num), max(1, res_eff // NB_CLAIM))
     # Past the 32-bit buffer-resource range the push addresses one token row
     # per descriptor (see p2p_scatter_epilog), so only a row must fit.
     if not 0 < comb_inp_nbytes or not model_dim * 2 < _BUFFER_OFFSET_ABI_BYTES:
@@ -438,8 +522,13 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
     claim_word = 0  # arg_arrival_count holds only kernel1's K1_CLAIM_WORDS words
     # Dynamic: only resident CTAs, so none launches after the tickets run out
     # just to bump the same two atomics (+200us at K3 TPR 1024 with 7168 CTAs).
-    ctas_per_nb = min(cu_num, max(1, res_eff // num_n_blocks_c)) if dynamic else cu_num
-    grid_ctas = ctas_per_nb * num_n_blocks_c
+    ctas_per_nb = min(cu_num, max(1, res_eff // NB_CLAIM)) if dynamic else cu_num
+    grid_ctas = ctas_per_nb * NB_CLAIM
+    if PAIR:
+        # One CTA per CU, all of them: kernel2 (and later Stage1) runs on the
+        # same grid.  Tickets are dynamic, so bx % NB_CLAIM may give a pair
+        # one CTA more than another.
+        grid_ctas = max(grid_ctas, res_eff)
     # n-block tickets, the done count, and (remote-first) the remote-half count.
     if num_n_blocks_c + 2 > K1_CLAIM_WORDS:
         raise ValueError(f"k1 needs {num_n_blocks_c + 2} claim words, has {K1_CLAIM_WORDS}")
@@ -466,10 +555,13 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
 
     kernel_name = (
         f"megamoe_k1_t{GBM}x{BN}x{BK}_cu{cu_num}"
+        + ("_a8w4" if a_dtype == "fp8" else "")
         + (f"_xg{xcd_group}" if xcd_group > 1 else "")
         + (f"_dynp{ctas_per_nb}" if dynamic else "")
+        + (f"_w{WAVES}" if PAIR else "")
         + (f"_rf{LE}g{int(tile_group)}" if remote_first else "")
         + (f"_sd{SD_CTB}r{SD_ROWS}q{SD_FQ}p{SD_PUT_B >> 10}" if sdma else "")
+        + ("ro" if SD_RO else "") + ("_trpub" if TRK else "")
         + (f"s{SD_S}n{SD_NS}" if sdma and SD_NS else "")
         + "_de_" + "_".join(str(v) for v in epoch_planes)
         # 符号名里不能有 '-':负步长写成 m 前缀
@@ -488,8 +580,13 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
         i32_inter: fx.Int32, i32_hidden: fx.Int32, arg_arrival_count: fx.Int64,
         i64_generation: fx.Int64, arg_a_tile_map: fx.Int64, i32_local_rank: fx.Int32, bx_i32: fx.Int32,
         arg_expert_count=None, boundary_hook=None, dev_comm=None, arg_sd_send=None,
-        arg_sd_tb=None, arg_sd_plan=None, arg_sd_cdone=None, arena_win=None, arena_ptr=None):
+        arg_sd_tb=None, arg_sd_plan=None, arg_sd_cdone=None, arena_win=None, arena_ptr=None,
+        lds_ptr=None, grp_sync=None, boundary_probe=None, arg_tr_mcnt=None,
+        unit_hook=None, tail_hook=None, arg_tr_sdprog=None):
     # fmt: on
+        # grp_sync (single fused kernel): (window offset of Stage1's per-group
+        # h1 ready words, their parity plane, Stage1 tile group); each unit
+        # waits for its physical group's GMM1 before loading A.
         tx_i32 = fx.thread_idx.x
 
 
@@ -515,11 +612,14 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
             arrival_delta_step)
         p2p_shift = fx.Int32(_par) * fx.Int32(npes)
 
-        lds = fx.SharedAllocator().allocate(SharedStorage).peek()
-        lds_base_i32 = fx.Int32(fx.ptrtoint(lds.buf.ptr))
+        if const_expr(lds_ptr is None):
+            lds_base_i32 = fx.Int32(fx.ptrtoint(fx.SharedAllocator().allocate(SharedStorage).peek().buf.ptr))
+        else:
+            # Single fused kernel: one LDS allocation shared with Stage1.
+            lds_base_i32 = fx.Int32(fx.ptrtoint(lds_ptr))
 
         num_n_blocks = fx.Int32(i32_hidden) // fx.Int32(BN)
-        k_bytes = fx.Int32(i32_inter) // fx.Int32(2)
+        k_bytes = fx.Int32(i32_inter) // fx.Int32(a_pack)
         # kernel-invariant scatter resources + peer-base table (loaded into registers once).
         stids_buf = ptr_buf_tensor(arg_stids, fx.Int32)
         sweights_buf = ptr_buf_tensor(arg_sweights, fx.Float32)
@@ -535,10 +635,18 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
                 ),
             )
 
+        A_NW = min(WAVES, GBM // (4 if a_dtype == "fp8" else 8))
+
         def issue_all_a_loads(m_row0):
-            for slot in range_constexpr(kStages):
-                issue_a_load_lds_dt(arg_aq, lds_base_i32, slot, slot, m_row0, wave, lane,
-                    KH_TILE_A, k_bytes, BM=GBM)
+            if const_expr(A_NW < WAVES):
+                if wave < fx.Int32(A_NW):
+                    for slot in range_constexpr(kStages):
+                        issue_a_load_lds_dt(arg_aq, lds_base_i32, slot, slot, m_row0, wave, lane,
+                            KH_TILE_A, k_bytes, BM=GBM, NW=A_NW, a_dtype=a_dtype)
+            else:
+                for slot in range_constexpr(kStages):
+                    issue_a_load_lds_dt(arg_aq, lds_base_i32, slot, slot, m_row0, wave, lane,
+                        KH_TILE_A, k_bytes, BM=GBM, NW=WAVES, a_dtype=a_dtype)
 
         # a_tile_map:A(h1)按物理 tile 存放,排序后的第 t 个 32 行 tile 的数据在
         # 物理 tile a_tile_map[t]。只有 A/A-scale 走这层间接;expert id、srcmap、
@@ -587,6 +695,8 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
                 fx.Int32(lds_splan_off + 96) + dpe * fx.Int32(4), T.i32, align=4)))
             to_send = ((dpe != fx.Int32(i32_local_rank)) & (tb + rank < sd_cap)
                        & (srow < fx.Int32(SD_ROWS)))
+            if const_expr(SD_RO):
+                to_send = to_send & (ticket < remote_total)
             rowptr = to_send.select(
                 fx.Int64(arg_sd_send) + fx.Int64(srow) * fx.Int64(SD_RB),
                 peer + fx.Int64(land) * fx.Int64(SD_RB))
@@ -597,7 +707,10 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
                 # with the arrival flags, which follow every CTA's drained stores.
                 comm.store_i32_global_system_relaxed(
                     peer + arrival_delta_rt + fx.Int64(SD_INV_B)
-                    + fx.Int64(slot) * fx.Int64(4), land)
+                    + fx.Int64(slot) * fx.Int64(4),
+                    (land | (fx.Int32(i32_local_rank) << fx.Int32(28))
+                     | to_send.select(fx.Int32(-2147483648), fx.Int32(0)))
+                    if TRK else land)
 
         def run_unit(unit_bx, m_block_idx, a_row, ticket=None):
             # Row metadata (source token/slot, weight) sits at the A row's
@@ -625,12 +738,14 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
                 )
                 if const_expr(sdma):
                     _sdma_row_target(packed, ticket)
+            if const_expr(PAIR):
+                unit_bx = unit_bx + wave // fx.Int32(4)  # waves 4-7: the pair's second n_block
             # fmt: off
             accm_vecs, _m_row, n_block_idx, _n_out_rt = gemm2_compute_v2(lds_base_i32, arg_ascale, arg_bq,
                 arg_bscale, arg_eids, arg_aq, i32_max_m_blocks, unit_bx, lane, wave, i32_inter, i32_hidden,
                 BM=GBM, BN=BN, BK=BK, INTER_MAX=inter_dim, aStages=aStages, explicit_a_row=a_row,
-                eids_stride=GS)
-            p2p_scatter_epilog(lds_base_i32, accm_vecs, n_block_idx, wave, lane, N_OUT=N_OUT,
+                eids_stride=GS, NW=WAVES, a_dtype=a_dtype)
+            p2p_scatter_epilog(lds_base_i32, accm_vecs, n_block_idx, wave, lane, NW=WAVES, N_OUT=N_OUT,
                 BM=GBM, BN=BN, npes=npes, topk=topk,
                 log2_max_tok=log2_max_tok, mask_max_tok=mask_max_tok, recv_cap=recv_cap,
                 comb_inp_nbytes=comb_inp_nbytes, lds_packed_off=lds_packed_off,
@@ -638,9 +753,25 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
                 gpus_per_node=gpus_per_node, lds_rowptr_off=lds_rowptr_off if sdma else None)
             # fmt: on
 
+        if const_expr(grp_sync is not None):
+            gs_ready = arena_ptr + fx.Int64(grp_sync[0]) + _par * fx.Int64(grp_sync[1])
+            gs_gen = fx.Int32(i64_generation)
+
+        def wait_group(a_row):
+            # The unit's GBM rows lie in one Stage1 tile group (GS | tile_group).
+            if const_expr(grp_sync is not None):
+                if tx_i32 == fx.Int32(0):
+                    gaddr = gs_ready + fx.Int64(a_row // fx.Int32(32 * int(grp_sync[2]))) * fx.Int64(4)
+                    gv = fx.Int32(comm.load_i32_global_system_relaxed(gaddr))
+                    while gv != gs_gen:
+                        fx.rocdl.s_sleep(1)
+                        gv = fx.Int32(comm.load_i32_global_system_relaxed(gaddr))
+                fx.barrier()
+
         def run_mapped_unit(unit_bx, m_block_idx):
             m_row0 = m_block_idx * fx.Int32(BM)
             a_row = a_map_buf[m_row0 // fx.Int32(32)] * fx.Int32(32) + m_row0 % fx.Int32(32)
+            wait_group(a_row)
             issue_all_a_loads(a_row)
             rocdl.sched_barrier(0)
             run_unit(unit_bx, m_block_idx, a_row)
@@ -650,7 +781,8 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
 
         if const_expr(dynamic):
             claim_ptr = arg_arrival_count + fx.Int64(claim_word * 4)
-            dyn_n_block = bx_i32 % fx.Int32(num_n_blocks_c)
+            dyn_n_block = bx_i32 % fx.Int32(NB_CLAIM)  # n_block (pair) of this CTA
+            dyn_n0 = dyn_n_block * fx.Int32(NPAIR) if PAIR else dyn_n_block  # its first n_block
             ticket_ptr = claim_ptr + fx.Int64(dyn_n_block) * fx.Int64(4)
 
             def claim():
@@ -680,6 +812,7 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
                         nxt = fx.Int32(comm.atomic_add_agent(ticket_ptr, fx.Int32(1)))
                     m_row0 = m_block * fx.Int32(BM)
                     a_row = a_map_buf[m_row0 // fx.Int32(32)] * fx.Int32(32) + m_row0 % fx.Int32(32)
+                    wait_group(a_row)
                     issue_all_a_loads(a_row)
                     if tx_i32 == fx.Int32(0):
                         fx.ptr_store(
@@ -687,7 +820,7 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
                             lds_typed_ptr(fx.Int32(lds_claim_off) + slot * fx.Int32(4), T.i32, align=4),
                         )
                     rocdl.sched_barrier(0)
-                    run_unit(m_block * num_n_blocks + dyn_n_block, m_block, a_row)
+                    run_unit(m_block * num_n_blocks + dyn_n0, m_block, a_row)
                     fx.barrier()  # epilog LDS reads vs next A-load; also publishes the slot
                     m_block = fx.Int32(rocdl.readfirstlane(T.i32, fx.ptr_load(
                         lds_typed_ptr(fx.Int32(lds_claim_off) + slot * fx.Int32(4), T.i32,
@@ -846,7 +979,7 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
                         pc = bx_i32 - fx.Int32(SD_PLAN_BX)
                         c_base = pc * _sd_tpc()
                         n_loc = _min_rt(_max_rt(n_tk - c_base, fx.Int32(0)), _sd_tpc())
-                        kper = (n_loc + fx.Int32(255)) // fx.Int32(256)
+                        kper = (n_loc + fx.Int32(THREADS_K1 - 1)) // fx.Int32(THREADS_K1)
                         t_lo = c_base + tx_i32 * kper
                         t_hi = _min_rt(t_lo + kper, c_base + n_loc)
                         stids4 = ptr_buf_tensor(arg_stids, fx.Int32, unit_elems=4)
@@ -886,7 +1019,7 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
                         fx.barrier()
                         if tx_i32 < fx.Int32(8):
                             run = fx.Int32(0)
-                            for _g in range_constexpr(32):
+                            for _g in range_constexpr(THREADS_K1 // 8):
                                 gv = _sd_lds_i32(SP_GS, fx.Int32(_g * 8) + tx_i32)
                                 _sd_lds_put(SP_GS, fx.Int32(_g * 8) + tx_i32, run)
                                 run = run + gv
@@ -934,7 +1067,7 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
                             # This parity's counters were last read by the copy
                             # engine two generations ago (done before any peer
                             # finished that kernel2).
-                            for c in range(tx_i32, _sd_nch(), fx.Int32(256)):
+                            for c in range(tx_i32, _sd_nch(), fx.Int32(THREADS_K1)):
                                 comm.store_i32_global_system_relaxed(_sd_cdone(c), fx.Int32(0))
                         if last & (tx_i32 < fx.Int32(8)):
                             run = fx.Int32(0)
@@ -1004,6 +1137,9 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
                             seg = _sd_lds_i32(lds_splan_off, p)
                             rb = _sd_lds_i32(lds_splan_off + 32, p)
                             cap = _sd_lds_i32(lds_splan_off + 96, p)
+                            if const_expr(SD_RO):
+                                cap = _min_rt(cap, _sd_gtb(remote_total, p))
+                                nch = nrc
                             _sd_lds_put(SP_GS, fx.Int32(SP_RUN) + p, fx.Int32(0))
                             if nrc == fx.Int32(0):
                                 _sdma_signal(sd, p)
@@ -1031,6 +1167,20 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
                                             fx.Int64(arg_sd_send) + fx.Int64(s_lo) * fx.Int64(SD_RB),
                                             fx.Int64(s_hi - s_lo) * fx.Int64(SD_RB), fx.Int32(0),
                                             aggregate=True)
+                                    if const_expr(TRK):  # noqa: SIM102
+                                        if s_hi > s_lo:
+                                            # This peer queue is FIFO: the prefix lands only
+                                            # after the preceding row put. Each source word
+                                            # is unique until all SDMA signals finish.
+                                            src_prog = (fx.Int64(arg_tr_sdprog)
+                                                + fx.Int64(p * fx.Int32(SD_MAXCH) + c) * fx.Int64(8))
+                                            comm.store_i64_global_system_relaxed(src_prog,
+                                                ((i64_generation & fx.Int64(0xFFFFFFFF)) << fx.Int64(32))
+                                                | fx.Int64(rb + s_hi - seg))
+                                            fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
+                                            sd.put_ptr(p, _sd_peer(p) + arrival_delta_rt
+                                                + fx.Int64(TRL["prog"]) + fx.Int64(i32_local_rank) * fx.Int64(8),
+                                                src_prog, fx.Int64(8), fx.Int32(0), aggregate=True)
                                     _sd_lds_put(SP_GS, fx.Int32(SP_RUN) + p, hi)
                                     if c == nrc - fx.Int32(1):
                                         _sdma_signal(sd, p)
@@ -1070,8 +1220,71 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
                                 c = _sd_chunk_of(tk, remote_total)
                             # System scope: the copy engine reads the counter
                             # from memory, not from an XCD's L2.
-                            comm.atomic_add_system(_sd_cdone(c), fx.Int32(GS))
+                            # One unit = GS tiles x NPAIR n_blocks of the chunk's count.
+                            comm.atomic_add_system(_sd_cdone(c), fx.Int32(GS * NPAIR))
 
+                def _tr_lw(i):
+                    # LDS words 4..7 of the claim area, for the rail hooks.
+                    return lds_typed_ptr(fx.Int32(lds_claim_off + 16 + 4 * i), T.i32, align=4)
+
+                # The last of an m-block's NB_CLAIM column units (each CTA walks
+                # one column group) finds the rows complete: every unit's pushes
+                # drained at its barrier and released through the agent counter.
+                # It adds one per row to the row's destination counter; whoever
+                # brings it to 0 enqueues the token there (see tr_layout).  Split
+                # in a thread-0 part and a whole-CTA part so the rail hook's
+                # barrier serves both.
+                def _tr_count_tx0(mb):
+                    _mc = fx.Int64(arg_tr_mcnt) + fx.Int64(mb) * fx.Int64(4)
+                    _c = fx.Int32(comm.atomic_add_agent_acq_rel(_mc, fx.Int32(1)))
+                    _l = (_c + fx.Int32(1)) == fx.Int32(NB_CLAIM)
+                    if _l:
+                        comm.atomic_add_agent(_mc, fx.Int32(-NB_CLAIM))
+                    fx.ptr_store(_l.select(fx.Int32(1), fx.Int32(0)), lds_typed_ptr(
+                        fx.Int32(lds_claim_off + 12), T.i32, align=4))
+
+                def _tr_count_rows():
+                    _last = fx.Int32(rocdl.readfirstlane(T.i32, fx.ptr_load(lds_typed_ptr(
+                        fx.Int32(lds_claim_off + 12), T.i32, align=4)).ir_value()))
+                    if _last != fx.Int32(0):  # noqa: SIM102
+                        if tx_i32 < fx.Int32(GBM):
+                            pk = fx.Int32(fx.ptr_load(lds_typed_ptr(
+                                fx.Int32(lds_packed_off) + tx_i32 * fx.Int32(4), T.i32, align=4)))
+                            t24 = pk & fx.Int32(0x00FFFFFF)
+                            sk = pk.shrui(fx.Int32(24)) & fx.Int32(0xFF)
+                            own = t24 >> fx.Int32(log2_max_tok)
+                            ok = ((t24 < fx.Int32(recv_cap)) & (sk < fx.Int32(topk))
+                                  & (own < fx.Int32(npes)))
+                            if ok:
+                                dpe = own & fx.Int32(gpus_per_node - 1)
+                                tok = t24 & fx.Int32(mask_max_tok)
+                                trb = fx.Int64(fx.ptr_load(lds_typed_ptr(
+                                    fx.Int32(lds_peer_off) + dpe * fx.Int32(8), T.i64,
+                                    align=8))) + arrival_delta_rt
+                                old = fx.Int32(comm.atomic_add_system(
+                                    trb + fx.Int64(TRL["cnt"]) + fx.Int64(tok) * fx.Int64(4),
+                                    fx.Int32(1)))
+                                if old == fx.Int32(-1):
+                                    if const_expr(sdma):
+                                        # One unique last arrival publishes this token.
+                                        # Its counter protects inv and direct-store rows;
+                                        # the receiver separately checks SDMA landing.
+                                        comm.store_i64_global_system_relaxed(
+                                            trb + fx.Int64(TRL["q"]) + fx.Int64(tok) * fx.Int64(8),
+                                            i64_generation)
+                                    else:
+                                        q = fx.Int32(comm.atomic_add_system(
+                                            trb + fx.Int64(TRL["tail"]), fx.Int32(1)))
+                                        comm.store_i64_global_system_relaxed(
+                                            trb + fx.Int64(TRL["q"]) + fx.Int64(q) * fx.Int64(8),
+                                            ((i64_generation & fx.Int64(0xFFFFFFFF)) << fx.Int64(32))
+                                            | fx.Int64(tok))
+
+                if const_expr(TRK and sdma):
+                    for w in range(tx_i32, fx.Int32(TR_OWNER_WORDS * WAVES + 2),
+                                   fx.Int32(THREADS)):
+                        fx.ptr_store(fx.Int32(0), _tr_lw(12 + w))
+                    fx.barrier()
                 t = _gs(claim())
                 slot = fx.Int32(1)
                 while t < remote_total:
@@ -1081,6 +1294,7 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
                     m_block = tmap(t)
                     m_row0 = m_block * fx.Int32(BM)
                     a_row = a_map_buf[m_row0 // fx.Int32(32)] * fx.Int32(32) + m_row0 % fx.Int32(32)
+                    wait_group(a_row)
                     issue_all_a_loads(a_row)
                     if tx_i32 == fx.Int32(0):
                         fx.ptr_store(
@@ -1089,10 +1303,16 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
                         )
                     rocdl.sched_barrier(0)
                     run_unit((m_block // fx.Int32(GS) if GS > 1 else m_block) * num_n_blocks
-                             + dyn_n_block, m_block, a_row, ticket=t)
+                             + dyn_n0, m_block, a_row, ticket=t)
                     fx.barrier()  # epilog LDS reads vs next A-load; also publishes the slot
                     if const_expr(sdma):
                         _sd_count(t, False)
+                    if const_expr(unit_hook is not None):
+                        if const_expr(TRK):
+                            # The hook emits IR synchronously in this iteration; it never stores the callback.
+                            unit_hook(_tr_lw, lambda: _tr_count_tx0(m_block), _tr_count_rows)  # noqa: B023
+                        else:
+                            unit_hook(_tr_lw, None, None)
                     t = _gs(fx.Int32(rocdl.readfirstlane(T.i32, fx.ptr_load(
                         lds_typed_ptr(fx.Int32(lds_claim_off) + slot * fx.Int32(4), T.i32,
                                       align=4)).ir_value())))
@@ -1102,20 +1322,57 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
                 # remote-source half of kernel1 has been pushed (word 8 + local
                 # rank), so they can reduce and ship the remote plane while the
                 # local half is still in GEMM2.
-                if tx_i32 == fx.Int32(0):
-                    rdone = fx.Int32(comm.atomic_add_agent(
-                        arg_arrival_count + fx.Int64((claim_word + num_n_blocks_c + 1) * 4),
-                        fx.Int32(1)))
-                    if rdone == fx.Int32(n_workers - 1):
-                        comm.fence_system_release()
-                        for _p in range_constexpr(gpus_per_node):
-                            peer = fx.Int64(fx.ptr_load(lds_typed_ptr(
-                                fx.Int32(lds_peer_off + _p * 8), T.i64, align=8)))
-                            comm.store_i64_global_system_relaxed(
-                                peer + arrival_delta_rt
-                                + fx.Int64(i32_local_rank + fx.Int32(gpus_per_node)) * fx.Int64(8),
-                                i64_generation)
-                if const_expr(boundary_hook is not None):
+                if const_expr(not TRK):  # noqa: SIM102
+                    if tx_i32 == fx.Int32(0):
+                        rdone = fx.Int32(comm.atomic_add_agent(
+                            arg_arrival_count + fx.Int64((claim_word + num_n_blocks_c + 1) * 4),
+                            fx.Int32(1)))
+                        if rdone == fx.Int32(n_workers - 1):
+                            comm.fence_system_release()
+                            for _p in range_constexpr(gpus_per_node):
+                                peer = fx.Int64(fx.ptr_load(lds_typed_ptr(
+                                    fx.Int32(lds_peer_off + _p * 8), T.i64, align=8)))
+                                comm.store_i64_global_system_relaxed(
+                                    peer + arrival_delta_rt
+                                    + fx.Int64(i32_local_rank + fx.Int32(gpus_per_node)) * fx.Int64(8),
+                                    i64_generation)
+                if const_expr(boundary_hook is not None and boundary_probe is not None):
+                    # Part 1 (remote plane reduce + rail post) runs once every
+                    # node peer's remote half is in.  Until then keep doing local
+                    # units, probing (local words only) after each one; with the
+                    # tickets gone it runs anyway and waits inside.
+                    rdy = (t < total_m_blocks).select(fx.Int32(0), fx.Int32(1))
+                    while rdy == fx.Int32(0):
+                        nxt = fx.Int32(0)
+                        if tx_i32 == fx.Int32(0):
+                            nxt = fx.Int32(comm.atomic_add_agent(ticket_ptr, fx.Int32(1)))
+                        m_block = tmap(t)
+                        m_row0 = m_block * fx.Int32(BM)
+                        a_row = a_map_buf[m_row0 // fx.Int32(32)] * fx.Int32(32) + m_row0 % fx.Int32(32)
+                        wait_group(a_row)
+                        issue_all_a_loads(a_row)
+                        if tx_i32 == fx.Int32(0):
+                            fx.ptr_store(
+                                nxt,
+                                lds_typed_ptr(fx.Int32(lds_claim_off) + slot * fx.Int32(4), T.i32, align=4),
+                            )
+                        rocdl.sched_barrier(0)
+                        run_unit((m_block // fx.Int32(GS) if GS > 1 else m_block) * num_n_blocks
+                                 + dyn_n0, m_block, a_row, ticket=t)
+                        fx.barrier()  # epilog LDS reads vs next A-load; also publishes the slot
+                        if const_expr(sdma and not SD_RO):
+                            _sd_count(t, True)
+                        t = _gs(fx.Int32(rocdl.readfirstlane(T.i32, fx.ptr_load(
+                            lds_typed_ptr(fx.Int32(lds_claim_off) + slot * fx.Int32(4), T.i32,
+                                          align=4)).ir_value())))
+                        slot = fx.Int32(1) - slot
+                        boundary_probe(lds_typed_ptr(fx.Int32(lds_claim_off + 8), T.i32, align=4))
+                        fx.barrier()
+                        r = fx.Int32(rocdl.readfirstlane(T.i32, fx.ptr_load(lds_typed_ptr(
+                            fx.Int32(lds_claim_off + 8), T.i32, align=4)).ir_value()))
+                        rdy = (t < total_m_blocks).select(r, fx.Int32(1))
+                    boundary_hook()
+                elif const_expr(boundary_hook is not None):
                     boundary_hook()
                 while t < total_m_blocks:
                     nxt = fx.Int32(0)
@@ -1124,6 +1381,7 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
                     m_block = tmap(t)
                     m_row0 = m_block * fx.Int32(BM)
                     a_row = a_map_buf[m_row0 // fx.Int32(32)] * fx.Int32(32) + m_row0 % fx.Int32(32)
+                    wait_group(a_row)
                     issue_all_a_loads(a_row)
                     if tx_i32 == fx.Int32(0):
                         fx.ptr_store(
@@ -1132,10 +1390,12 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
                         )
                     rocdl.sched_barrier(0)
                     run_unit((m_block // fx.Int32(GS) if GS > 1 else m_block) * num_n_blocks
-                             + dyn_n_block, m_block, a_row, ticket=t)
+                             + dyn_n0, m_block, a_row, ticket=t)
                     fx.barrier()  # epilog LDS reads vs next A-load; also publishes the slot
-                    if const_expr(sdma):
+                    if const_expr(sdma and not SD_RO):
                         _sd_count(t, True)
+                    if const_expr(unit_hook is not None):
+                        unit_hook(_tr_lw, None, None)
                     t = _gs(fx.Int32(rocdl.readfirstlane(T.i32, fx.ptr_load(
                         lds_typed_ptr(fx.Int32(lds_claim_off) + slot * fx.Int32(4), T.i32,
                                       align=4)).ir_value())))
@@ -1195,7 +1455,6 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
                         i64_generation)
 
         fx.barrier()
-        # Keep constexpr and runtime guards separate for FlyDSL specialization.
         if const_expr(dynamic):  # noqa: SIM102
             if tx_i32 == fx.Int32(0):
                 _count_and_publish(fx.Int32(n_workers))
@@ -1209,6 +1468,13 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
             takes_part = (m_slot < total_m_blocks) | (no_work & (bx_i32 == fx.Int32(0)))
             if (tx_i32 == fx.Int32(0)) & takes_part:
                 _count_and_publish(target)
+
+        # Source completion covers inv and direct-store payload, independent
+        # of the receiver's remote-token reductions. SDMA consumers still
+        # wait for the engine signal. Do not gate the local plane on a remote
+        # reducer's tail; only drain that tail before returning to kernel2.
+        if const_expr(dynamic and tail_hook is not None):
+            tail_hook(_tr_lw)
 
 
     # fmt: off
@@ -1245,8 +1511,11 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
     launch.body = k1_body
     launch.grid_ctas = grid_ctas
     launch.remote_first = remote_first
+    launch.token_ready = TRK
     launch.sd_plan_bx = SD_PLAN_BX
     launch.ctas_per_cu = K1_OCC
+    launch.threads = THREADS_K1
+    launch.lds_bytes = int(lds_bytes)
     return launch
 
 
@@ -1472,8 +1741,12 @@ def compile_stage2_node_combine(
     epoch_off: int,
     parity_planes: tuple,
     sdma: bool = False,
+    threads: int = THREADS,
+    token_ready: bool = False,
+    rail_idx_off: int = 0,
+    rail_idx_plane: int = 0,
 ):
-    """构建 kernel2。所有 *_off 是相对 window local_ptr 的字节偏移。
+    """构建 kernel2。threads:CTA 宽度(fused 8-wave 时随 kernel1 取 512)。所有 *_off 是相对 window local_ptr 的字节偏移。
 
     generation 从 window 里 stage1 的 epoch_gate(epoch_off)读(同一条 stream
     上 stage1 已写好),*_off 传 parity 0 的偏移,
@@ -1505,6 +1778,9 @@ def compile_stage2_node_combine(
         raise ValueError("num_qp must be one of 1,2,4,8")
     # 参考实现是 qp = wave。wave 数多于 QP 时有 wave 没活干,少于 QP 时
     # 一个 wave 顺序带 num_qp//waves 个 QP —— 两者都要求整除。
+    THREADS = int(threads)
+    if THREADS not in (256, 512):
+        raise ValueError(f"kernel2 threads must be 256 or 512, got {THREADS}")
     _waves = THREADS // 64
     if int(num_qp) < _waves or int(num_qp) % _waves:
         raise ValueError(
@@ -1560,6 +1836,11 @@ def compile_stage2_node_combine(
     VEC = 8                                 # 每 lane 8 个 bf16 = 16 B
     RED_BATCH = min(int(topk), 8)           # 归约每批在途的 topk load 数
     RED_BATCHES = _ceil_div(int(topk), RED_BATCH)
+    # Reduce units interleaved per wave step (see the reduce loop).  The 4-wave
+    # fused stage2 keeps 1: its VGPRs bound kernel1's CTAs per CU.  8 waves: at
+    # most 24 row loads in flight per wave (K3, RED_BATCH 8: U=4 ran 7-70x slow
+    # in 4 of 8 TPR1024 cases, U=2 0 of 6; DSv4.1, RED_BATCH 6: U=4 clean).
+    RED_U = (4 if 4 * RED_BATCH <= 24 else 2) if THREADS == 512 else 1
     CHUNKS_PER_WAVE = HIDDEN // (64 * VEC)  # 一个 wave 覆盖 512 列
     CHUNK_ITERS = _ceil_div(CHUNKS_PER_WAVE, WAVES)
     # 阶段1 的工作单元:一个 (plane, token, hidden 分片) 由**一个 wave** 做完。
@@ -1586,8 +1867,20 @@ def compile_stage2_node_combine(
         + ("_qr8" if RAIL_FP8 else "")
         + f"_de{epoch_off}_" + "_".join(str(v) for v in parity_planes)
 
-        + ("_sd" if sdma else "")
+        + ("_sd" if sdma else "") + (f"_ru{RED_U}" if RED_U > 1 else "")
+        + ("_trf" if token_ready and sdma else "_tr" if token_ready else "")
     )
+    # Token-ready rail (fused remote-first only, see tr_layout): the remote
+    # plane goes out in completion order, CHUNK tokens a batch, each batch
+    # with its token ids; part 2 reduces only the local plane and combines
+    # the partner's batches through those ids.
+    TRC = bool(token_ready)
+    if TRC and (INBOX_PER_PLANE or CHUNK < WAVES or not RAIL_FP8):
+        raise ValueError("token_ready needs fp8 rail, one inbox descriptor and CHUNK >= waves")
+    if TRC and (int(rail_idx_off) < int(s2_window_off) or int(rail_idx_plane) < 8 * MAX_TOKENS):
+        raise ValueError("token_ready needs the rail_idx region")
+    TRL2 = tr_layout(MAX_TOKENS, TOPK) if TRC else None
+    RIDX_OFF, RIDX_PLANE = int(rail_idx_off), int(rail_idx_plane)
     # SDMA stage2 (fused remote-first only): kernel1's rows land packed in the
     # inbox; inv (in the arrival region, see compile_mega_moe_stage2) maps each
     # (plane, token, slot) to its row, and each node peer's copy engine signals
@@ -1691,6 +1984,10 @@ def compile_stage2_node_combine(
         # published at words 8 + local rank.
         # part 0: the whole kernel2; part 1: remote plane + ring; part 2: rest.
         _flag0 = int(gpus_per_node) if part == 1 else 0
+        if const_expr(TRC and sdma and part != 1):  # noqa: SIM102
+            if (bx < fx.Int32(NUM_QP)) & (wave == fx.Int32(0)):
+                _tr_owner_step(dev_comm, arena_win, _par, generation, arrival_ptr,
+                               local_tokens, bx, lane, drain=True)
         if tx == fx.Int32(0):
             for _p in range_constexpr(int(gpus_per_node)):
                 _wait_ready_relaxed(arrival_ptr + fx.Int64((_flag0 + _p) * 8), generation)
@@ -1732,124 +2029,157 @@ def compile_stage2_node_combine(
               ustep = n_cta * fx.Int32(WAVES)
               ulo = fx.Int32(0)
               uhi = ck_tok * fx.Int32(HPARTS)
-              for u in range(ulo + unit0, uhi, ustep):
-                  token = ck_first + u // fx.Int32(HPARTS)
-                  hpart = u - (u // fx.Int32(HPARTS)) * fx.Int32(HPARTS)
-                  token_index = fx.Int32(plane * MAX_TOKENS) + token
-                  slot_mask = fx.Int32(buffer_ops.buffer_load(
-                      mask_rsrc, token_index, vec_width=1, dtype=T.i32))
-                  col = (hpart * fx.Int32(64) + lane) * fx.Int32(VEC)
-                  totals = fx.Vector.filled(VEC, 0.0, Float32)
+              # RED_U units per wave per step, interleaved: their slot masks,
+              # then their inv words, then their rows go out together, so the
+              # three dependent loads of a unit are paid once per RED_U units
+              # (part 1, DSv4.1 TPR4096: 60us at ~1.4 TB/s was this chain).
+              for u in range(ulo + unit0, uhi, ustep * fx.Int32(RED_U)):
+                  _ok_u, _tok, _tix, _col, _sm, _tot = [], [], [], [], [], []
+                  for _j in range_constexpr(RED_U):
+                      uj = u + fx.Int32(_j) * ustep
+                      okj = uj < uhi
+                      ujc = okj.select(uj, u)  # a valid unit; its work is masked off
+                      token = ck_first + ujc // fx.Int32(HPARTS)
+                      hpart = ujc - (ujc // fx.Int32(HPARTS)) * fx.Int32(HPARTS)
+                      _ok_u.append(okj)
+                      _tok.append(token)
+                      _tix.append(fx.Int32(plane * MAX_TOKENS) + token)
+                      _col.append((hpart * fx.Int32(64) + lane) * fx.Int32(VEC))
+                  for _j in range_constexpr(RED_U):
+                      _sm.append(_ok_u[_j].select(fx.Int32(buffer_ops.buffer_load(
+                          mask_rsrc, _tix[_j], vec_width=1, dtype=T.i32)), fx.Int32(0)))
+                      _tot.append(fx.Vector.filled(VEC, 0.0, Float32))
                   # MegaMoEv2 的流水(intranode_kernel.py:1010-1085):K 个
                   # load 先全部攒进 list,一个都不当场消费,发完才累加。
                   # 有效性走掩码不走分支 —— buffer_load(mask=) 把越界偏移
                   # 设成 0x7FFFFFFF,硬件边界检查返回 0。
-                  # Loads go out RED_BATCH at a time, accumulated before the
-                  # next batch: all TOPK at once held 64 VGPRs of loads and put
-                  # kernel2 at 117 VGPRs, which pushes a fused stage2 kernel
-                  # below kernel1's five CTAs per CU.
+                  # Loads go out RED_BATCH slots at a time (per unit), accumulated
+                  # before the next batch: all TOPK at once held 64 VGPRs of loads
+                  # and put kernel2 at 117 VGPRs, which pushes a fused stage2
+                  # kernel below kernel1's five CTAs per CU.
                   for _rb in range_constexpr(RED_BATCHES):
-                      vals = []
                       if const_expr(sdma):
                           # inv first for the whole batch, then the rows.
                           _oks, _recs = [], []
-                          for _rj in range_constexpr(RED_BATCH):
-                              slot = _rb * RED_BATCH + _rj
-                              if const_expr(slot < TOPK):
-                                  ok = ((slot_mask >> fx.Int32(slot))
-                                        & fx.Int32(1)) != fx.Int32(0)
-                                  _oks.append(ok)
-                                  _recs.append(fx.Int32(buffer_ops.buffer_load(
-                                      inv_rsrc, token_index * fx.Int32(TOPK) + fx.Int32(slot),
-                                      vec_width=1, dtype=T.i32, mask=ok)))
+                          for _j in range_constexpr(RED_U):
+                              _oj, _rj_l = [], []
+                              for _rj in range_constexpr(RED_BATCH):
+                                  slot = _rb * RED_BATCH + _rj
+                                  if const_expr(slot < TOPK):
+                                      ok = ((_sm[_j] >> fx.Int32(slot))
+                                            & fx.Int32(1)) != fx.Int32(0)
+                                      _oj.append(ok)
+                                      _rj_l.append(fx.Int32(buffer_ops.buffer_load(
+                                          inv_rsrc, _tix[_j] * fx.Int32(TOPK) + fx.Int32(slot),
+                                          vec_width=1, dtype=T.i32, mask=ok)))
+                              _oks.append(_oj)
+                              _recs.append(_rj_l)
                           # Rows are FP8 + E8M0 (SD_RB8 bytes); a masked load
                           # reads 0, which decodes to 0.
                           _pk, _sc = [], []
-                          for _k in range_constexpr(len(_oks)):
-                              if const_expr(INBOX_PER_PLANE):
-                                  # One-row descriptor: the packed row index can
-                                  # pass the i32 byte range.  The row is
-                                  # wave-uniform (one token-slot per wave).
-                                  _ru = fx.Int32(rocdl.readfirstlane(T.i32, _recs[_k].ir_value()))
-                                  _row_rsrc = buffer_ops.create_buffer_resource_from_addr(
-                                      inbox_ptr + fx.Int64(_ru) * fx.Int64(SD_RB8),
-                                      num_records_bytes=fx.Int32(SD_RB8))
-                                  _b0 = fx.Int32(0)
-                              else:
-                                  _row_rsrc = inbox_rsrc
-                                  _b0 = _recs[_k] * fx.Int32(SD_RB8)
-                              _pk.append(buffer_ops.buffer_load(
-                                  _row_rsrc, (_b0 + col) // fx.Int32(4),
-                                  vec_width=2, dtype=T.i32, mask=_oks[_k]))
-                              _sc.append(buffer_ops.buffer_load(
-                                  _row_rsrc, _b0 + fx.Int32(HIDDEN) + col // fx.Int32(32),
-                                  vec_width=1, dtype=T.i8, mask=_oks[_k]))
-                          for _k in range_constexpr(len(_oks)):
-                              totals = totals + _fp8_decode8(
-                                  _pk[_k],
-                                  ((fx.Uint8(_sc[_k]).to(fx.Uint32).bitcast(fx.Int32))
-                                   << fx.Int32(23)).bitcast(Float32))
-                      for _rj in range_constexpr(RED_BATCH if not sdma else 0):
-                          slot = _rb * RED_BATCH + _rj
-                          if const_expr(slot < TOPK):
-                              ok = ((slot_mask >> fx.Int32(slot))
-                                    & fx.Int32(1)) != fx.Int32(0)
-                              if const_expr(INBOX_PER_PLANE):
-                                  rec = (token * fx.Int32(TOPK)
-                                         + fx.Int32(slot))
-                                  src = rec * fx.Int32(HIDDEN) + col
-                                  vals.append(buffer_ops.buffer_load(
-                                      inbox_rsrc_p, src // fx.Int32(2),
-                                      vec_width=4, dtype=T.i32, mask=ok))
-                              else:
-                                  rec = (token_index * fx.Int32(TOPK)
-                                         + fx.Int32(slot))
-                                  src = rec * fx.Int32(HIDDEN) + col
-                                  vals.append(buffer_ops.buffer_load(
-                                      inbox_rsrc, src // fx.Int32(2),
-                                      vec_width=4, dtype=T.i32, mask=ok))
-                      for _v in vals:
-                          totals = totals + fx.Vector(_v).bitcast(
-                              BFloat16).to(Float32)
+                          for _j in range_constexpr(RED_U):
+                              _pj, _cj = [], []
+                              for _k in range_constexpr(len(_oks[_j])):
+                                  _rec = _recs[_j][_k]
+                                  if const_expr(TRC):
+                                      _rec = _rec & fx.Int32(0x0FFFFFFF)
+                                  if const_expr(INBOX_PER_PLANE):
+                                      # One-row descriptor: the packed row index can
+                                      # pass the i32 byte range.  The row is
+                                      # wave-uniform (one token-slot per wave).
+                                      _ru = fx.Int32(rocdl.readfirstlane(T.i32, _rec.ir_value()))
+                                      _row_rsrc = buffer_ops.create_buffer_resource_from_addr(
+                                          inbox_ptr + fx.Int64(_ru) * fx.Int64(SD_RB8),
+                                          num_records_bytes=fx.Int32(SD_RB8))
+                                      _b0 = fx.Int32(0)
+                                  else:
+                                      _row_rsrc = inbox_rsrc
+                                      _b0 = _rec * fx.Int32(SD_RB8)
+                                  _pj.append(buffer_ops.buffer_load(
+                                      _row_rsrc, (_b0 + _col[_j]) // fx.Int32(4),
+                                      vec_width=2, dtype=T.i32, mask=_oks[_j][_k]))
+                                  _cj.append(buffer_ops.buffer_load(
+                                      _row_rsrc, _b0 + fx.Int32(HIDDEN) + _col[_j] // fx.Int32(32),
+                                      vec_width=1, dtype=T.i8, mask=_oks[_j][_k]))
+                              _pk.append(_pj)
+                              _sc.append(_cj)
+                          for _j in range_constexpr(RED_U):
+                              for _k in range_constexpr(len(_pk[_j])):
+                                  _tot[_j] = _tot[_j] + _fp8_decode8(
+                                      _pk[_j][_k],
+                                      ((fx.Uint8(_sc[_j][_k]).to(fx.Uint32).bitcast(fx.Int32))
+                                       << fx.Int32(23)).bitcast(Float32))
+                      else:
+                          vals = []
+                          for _j in range_constexpr(RED_U):
+                              _vj = []
+                              for _rj in range_constexpr(RED_BATCH):
+                                  slot = _rb * RED_BATCH + _rj
+                                  if const_expr(slot < TOPK):
+                                      ok = ((_sm[_j] >> fx.Int32(slot))
+                                            & fx.Int32(1)) != fx.Int32(0)
+                                      if const_expr(INBOX_PER_PLANE):
+                                          rec = (_tok[_j] * fx.Int32(TOPK)
+                                                 + fx.Int32(slot))
+                                          src = rec * fx.Int32(HIDDEN) + _col[_j]
+                                          _vj.append(buffer_ops.buffer_load(
+                                              inbox_rsrc_p, src // fx.Int32(2),
+                                              vec_width=4, dtype=T.i32, mask=ok))
+                                      else:
+                                          rec = (_tix[_j] * fx.Int32(TOPK)
+                                                 + fx.Int32(slot))
+                                          src = rec * fx.Int32(HIDDEN) + _col[_j]
+                                          _vj.append(buffer_ops.buffer_load(
+                                              inbox_rsrc, src // fx.Int32(2),
+                                              vec_width=4, dtype=T.i32, mask=ok))
+                              vals.append(_vj)
+                          for _j in range_constexpr(RED_U):
+                              for _v in vals[_j]:
+                                  _tot[_j] = _tot[_j] + fx.Vector(_v).bitcast(
+                                      BFloat16).to(Float32)
                       if const_expr(_rb + 1 < RED_BATCHES):
                           rocdl.sched_barrier(0)
                   # 【设计点:accumulator 不写穿】ACCUM_WT=1(sc0|sc1 写穿,
                   # 省掉每 chunk 那次 fence_system_release 的整 L2 写回)实测
                   # 194.5 vs 195.6 —— 零收益,开关已删,这里恒用默认策略。
                   _acm = 0
-                  if const_expr(RAIL_FP8):
-                      _vals = [fx.Float32(totals[i])
-                               for i in range_constexpr(VEC)]
-                      _w, _e8m0, _is_ldr = _fp8_encode8(_vals, lane, VEC=VEC)
-                      _abyte = (token_index * fx.Int32(ACC_ROW_BYTES) + col)
-                      buffer_ops.buffer_store(
-                          fx.Vector.from_elements(_w, fx.Int32),
-                          accum_rsrc, _abyte // fx.Int32(4),
-                          cache_modifier=_acm)
-                      # 尺度字节用 mask 而不是 if:分支里做 store 没问题,
-                      # 但掩码版不产生分歧,省一次 exec mask 往返。
-                      buffer_ops.buffer_store(
-                          _e8m0.to(fx.Int8), accum_rsrc,
-                          token_index * fx.Int32(ACC_ROW_BYTES)
-                          + fx.Int32(HIDDEN) + col // fx.Int32(32),
-                          mask=_is_ldr, cache_modifier=_acm)
-                  # 17 = sc0|sc1(SIDefines.h:593 的 pre-gfx12 编码,GLC=SC0=1、
-                  # SCC=SC1=16):写穿到系统一致点。NIC 要读 node_accumulator,
-                  # 默认策略下这些写是脏在本 rank 的 L2 里,得靠下面那次
-                  # fence_system_release 的 buffer_wbl2(整 L2 写回)刷出去 ——
-                  # 每 chunk 一次。写穿之后那次 fence 就不需要了。
-                  # 和 kernel1 payload 用 pay_cm=19 是同一条路子。
-                  if const_expr(not RAIL_FP8):
-                      out = fx.Vector.from_elements(
-                          [fx.Float32(totals[i])
-                           for i in range_constexpr(VEC)],
-                          Float32,
-                      ).to(BFloat16).bitcast(fx.Int32)
-                      buffer_ops.buffer_store(
-                          out, accum_rsrc,
-                          (token_index * fx.Int32(HIDDEN) + col)
-                          // fx.Int32(2),
-                          cache_modifier=_acm)
+                  for _j in range_constexpr(RED_U):
+                      totals = _tot[_j]
+                      token_index = _tix[_j]
+                      col = _col[_j]
+                      if const_expr(RAIL_FP8):
+                          _vals = [fx.Float32(totals[i])
+                                   for i in range_constexpr(VEC)]
+                          _w, _e8m0, _is_ldr = _fp8_encode8(_vals, lane, VEC=VEC)
+                          _abyte = (token_index * fx.Int32(ACC_ROW_BYTES) + col)
+                          buffer_ops.buffer_store(
+                              fx.Vector.from_elements(_w, fx.Int32),
+                              accum_rsrc, _abyte // fx.Int32(4),
+                              mask=_ok_u[_j], cache_modifier=_acm)
+                          # 尺度字节用 mask 而不是 if:分支里做 store 没问题,
+                          # 但掩码版不产生分歧,省一次 exec mask 往返。
+                          buffer_ops.buffer_store(
+                              _e8m0.to(fx.Int8), accum_rsrc,
+                              token_index * fx.Int32(ACC_ROW_BYTES)
+                              + fx.Int32(HIDDEN) + col // fx.Int32(32),
+                              mask=_is_ldr & _ok_u[_j], cache_modifier=_acm)
+                      # 17 = sc0|sc1(SIDefines.h:593 的 pre-gfx12 编码,GLC=SC0=1、
+                      # SCC=SC1=16):写穿到系统一致点。NIC 要读 node_accumulator,
+                      # 默认策略下这些写是脏在本 rank 的 L2 里,得靠下面那次
+                      # fence_system_release 的 buffer_wbl2(整 L2 写回)刷出去 ——
+                      # 每 chunk 一次。写穿之后那次 fence 就不需要了。
+                      # 和 kernel1 payload 用 pay_cm=19 是同一条路子。
+                      if const_expr(not RAIL_FP8):
+                          out = fx.Vector.from_elements(
+                              [fx.Float32(totals[i])
+                               for i in range_constexpr(VEC)],
+                              Float32,
+                          ).to(BFloat16).bitcast(fx.Int32)
+                          buffer_ops.buffer_store(
+                              out, accum_rsrc,
+                              (token_index * fx.Int32(HIDDEN) + col)
+                              // fx.Int32(2),
+                              mask=_ok_u[_j], cache_modifier=_acm)
               # token 段模式:本 CTA 的字节范围是连续的,自己发自己的 put,
               # Drain this CTA's stores before its acq_rel arrival. The last
               # arrival observes every partial before posting the chunk's WQE.
@@ -1928,30 +2258,66 @@ def compile_stage2_node_combine(
         if const_expr(part != 1):
           # 阶段 2:rail 返回 —— the doorbell rang after the remote plane; reap
           # the completion here, after the local plane's reduce.
-          if (bx < fx.Int32(NUM_QP)) & (wave == fx.Int32(0)):
-           if const_expr(part == 2):
-               _rail_req = fx.Int64(rocdl.readfirstlane(T.i64, fx.Int64(
-                   comm.load_i64_global(
-                       arg_scratch + fx.Int64(SCRATCH_RAIL_REQ * 4)
-                       + fx.Int64(bx) * fx.Int64(8))).ir_value()))
-           _rail.wait(dev_comm, bx, _rail_req)
-           if lane == fx.Int32(0):
-               comm.store_i32_system(
-                   arg_scratch, fx.Int32(SCRATCH_WQE_POSTED) + bx,
-                   fx.Int32(0))
+          if const_expr(TRC):
+           # Token-ready: this QP's owner waits until all of its batches are
+           # posted (by whichever CTA completed them), covers the rest with
+           # one more doorbell and reaps the last request.
+           if (bx < fx.Int32(NUM_QP)) & (wave == fx.Int32(0)):
+               _nbt = _ceil_div_rt(local_tokens, fx.Int32(CHUNK))
+               _nbq = _max_rt((_nbt - bx + fx.Int32(NUM_QP - 1)) // fx.Int32(NUM_QP), fx.Int32(0))
+               _tb = arrival_ptr
+               if const_expr(not sdma):
+                _pa = _tb + fx.Int64(TRL2["posted"]) + fx.Int64(bx) * fx.Int64(4)
+                _posted = fx.Int32(comm.load_i32_global_system_relaxed(_pa))
+                while _posted < _nbq:
+                    _posted = fx.Int32(comm.load_i32_global_system_relaxed(_pa))
+                _rung = fx.Int32(comm.load_i32_global_system_relaxed(
+                    _tb + fx.Int64(TRL2["rung"]) + fx.Int64(bx) * fx.Int64(4)))
+                if _posted > _rung:
+                    comm.fence_system_acquire()
+                    _rq = fx.Int64(_rail.flush_async(dev_comm, bx, fx.Int32(remote_node)))
+                    if lane == fx.Int32(0):
+                        comm.store_i64_global_system_relaxed(
+                            _tb + fx.Int64(TRL2["req"]) + fx.Int64(bx) * fx.Int64(8), _rq)
+               if _nbq > fx.Int32(0):
+                   _rail.wait(dev_comm, bx, fx.Int64(rocdl.readfirstlane(T.i64, fx.Int64(
+                       comm.load_i64_global_system_relaxed(
+                           _tb + fx.Int64(TRL2["req"]) + fx.Int64(bx) * fx.Int64(8))).ir_value())))
+          else:
+           if (bx < fx.Int32(NUM_QP)) & (wave == fx.Int32(0)):
+            if const_expr(part == 2):
+                _rail_req = fx.Int64(rocdl.readfirstlane(T.i64, fx.Int64(
+                    comm.load_i64_global(
+                        arg_scratch + fx.Int64(SCRATCH_RAIL_REQ * 4)
+                        + fx.Int64(bx) * fx.Int64(8))).ir_value()))
+            _rail.wait(dev_comm, bx, _rail_req)
+            if lane == fx.Int32(0):
+                comm.store_i32_system(
+                    arg_scratch, fx.Int32(SCRATCH_WQE_POSTED) + bx,
+                    fx.Int32(0))
           # 阶段 3:所有 CTA 做 node 间归约 + unpermute
           # Both node partials are already reduced. Add and unpermute them;
           # synchronize once per CTA/chunk and distribute its work across waves.
+          if const_expr(TRC):
+              # A batch holds tokens of any local chunk: wait for all of them.
+              for _c in range(tx, total_chunks, fx.Int32(THREADS)):
+                  _wait_ready_relaxed(
+                      ready_ptr
+                      + fx.Int64(fx.Int32(local_plane * MAX_TOKENS) + _c * fx.Int32(CHUNK))
+                      * fx.Int64(8), generation)
+              _ridx_rx = (arena_ptr + fx.Int64(RIDX_OFF + MAX_TOKENS * 4)
+                          + _par * fx.Int64(RIDX_PLANE))
           for ck in range(bx % total_chunks, total_chunks, grid):
             ck_first = ck * fx.Int32(CHUNK)
             ck_tok = _min_rt(fx.Int32(CHUNK), local_tokens - ck_first)
             if tx == fx.Int32(0):
                 # ready 位是阶段1 按整个 chunk 一起发布的,所以等首 token 即可,
                 # 不用逐个等 32 次。
-                _wait_ready_relaxed(
-                    ready_ptr
-                    + fx.Int64(fx.Int32(local_plane * MAX_TOKENS) + ck_first)
-                    * fx.Int64(8), generation)
+                if const_expr(not TRC):
+                    _wait_ready_relaxed(
+                        ready_ptr
+                        + fx.Int64(fx.Int32(local_plane * MAX_TOKENS) + ck_first)
+                        * fx.Int64(8), generation)
                 _wait_ready_relaxed(
                     group_ready_ptr + fx.Int64(ck) * fx.Int64(8), generation)
             gpu.barrier()
@@ -1964,13 +2330,19 @@ def compile_stage2_node_combine(
                 token = ck_first + u // fx.Int32(HPARTS)
                 hpart = u - (u // fx.Int32(HPARTS)) * fx.Int32(HPARTS)
                 col = (hpart * fx.Int32(64) + lane) * fx.Int32(VEC)
+                rx_row = token
+                if const_expr(TRC):
+                    # rx row = batch position; its token came with the batch.
+                    token = fx.Int32(rocdl.readfirstlane(T.i32, fx.Int32(
+                        comm.load_i32_global_system_relaxed(
+                            _ridx_rx + fx.Int64(rx_row) * fx.Int64(4))).ir_value()))
                 local_index = ((fx.Int32(local_plane * MAX_TOKENS) + token)
                                * fx.Int32(HIDDEN) + col)
                 out_index = token * fx.Int32(HIDDEN) + col
                 if const_expr(RAIL_FP8):
                     _lrow = ((fx.Int32(local_plane * MAX_TOKENS) + token)
                              * fx.Int32(ACC_ROW_BYTES))
-                    _rrow = token * fx.Int32(ACC_ROW_BYTES)
+                    _rrow = rx_row * fx.Int32(ACC_ROW_BYTES)
                     local_packed = buffer_ops.buffer_load(
                         accum_rsrc, (_lrow + col) // fx.Int32(4),
                         vec_width=2, dtype=T.i32)
@@ -2101,8 +2473,614 @@ def compile_stage2_node_combine(
             value_attrs={"rocdl.flat_work_group_size": f"{THREADS},{THREADS}"},
         ).launch(grid=(blocks, 1, 1), block=(THREADS, 1, 1), stream=stream)
 
+    @flyc.jit
+    def k2_remote_ready(dev_comm: fx.Int64, arena_ptr: fx.Int64, arg_scratch: fx.Int64, word_ptr):
+        """Non-blocking form of part 1's opening wait: thread 0 stores 1 into the
+        LDS word ``word_ptr`` when every node peer has published its remote-source
+        half (and, with SDMA, the copy engine signalled it), else 0.  The caller
+        broadcasts the word (barrier) so the whole CTA takes the same branch."""
+        tx = fx.Int32(gpu.thread_id("x"))
+        if tx == fx.Int32(0):
+            generation = fx.Int64(comm.load_i64_global_agent_relaxed(
+                arena_ptr + fx.Int64(epoch_off)))
+            _par = generation & fx.Int64(1)
+            arrival_ptr = arena_ptr + fx.Int64(arrival_off) + _par * fx.Int64(parity_planes[7])
+            ok = fx.Int32(1)
+            for _p in range_constexpr(int(gpus_per_node)):
+                w = fx.Int64(comm.load_i64_global_system_relaxed(
+                    arrival_ptr + fx.Int64((int(gpus_per_node) + _p) * 8)))
+                ok = (w < generation).select(fx.Int32(0), ok)
+            if const_expr(sdma):
+                _epoch = fx.Int32(comm.load_i32_global_system_relaxed(
+                    arg_scratch + fx.Int64(SCRATCH_SDMA_EPOCH * 4)))
+                _sd = cco.DevComm(dev_comm).sdma()
+                _want = fx.Int64(_epoch) * fx.Int64(2) + fx.Int64(1)
+                for _p in range_constexpr(int(gpus_per_node)):
+                    if const_expr(_p != LOCAL_RANK):
+                        w = fx.Int64(comm.load_i64_global_system_relaxed(
+                            fx.Int64(_sd.signal_slot(fx.Int32(_p), fx.Int32(0)))))
+                        ok = (w < _want).select(fx.Int32(0), ok)
+            fx.ptr_store(ok, word_ptr)
+
+    def _tr_gen(arena_ptr):
+        gen = fx.Int64(rocdl.readfirstlane(T.i64, fx.Int64(
+            comm.load_i64_global_agent_relaxed(arena_ptr + fx.Int64(epoch_off))).ir_value()))
+        return gen, gen & fx.Int64(1)
+
+    def _tr_words(arena_ptr, par):
+        return arena_ptr + fx.Int64(arrival_off) + par * fx.Int64(parity_planes[7])
+
+    def _tr_enqueue(trb, tok, g32):
+        q = fx.Int32(comm.atomic_add_system(trb + fx.Int64(TRL2["tail"]), fx.Int32(1)))
+        comm.store_i64_global_system_relaxed(
+            trb + fx.Int64(TRL2["q"]) + fx.Int64(q) * fx.Int64(8),
+            (g32 << fx.Int64(32)) | fx.Int64(tok))
+
+    @flyc.jit
+    def k2_tr_init(arena_ptr: fx.Int64, local_tokens: fx.Int32, bx: fx.Int32, grid: fx.Int32):
+        """Every CTA, before kernel1: clear the other parity's token-ready words
+        (stream order: its last forward is over and the next one cannot start
+        before ours ends), then add -E to this parity's counters (E = rows of
+        the token its node peers will compute), enqueuing the tokens it closes."""
+        tx = fx.Int32(gpu.thread_id("x"))
+        gen, par = _tr_gen(arena_ptr)
+        g32 = gen & fx.Int64(0xFFFFFFFF)
+        cur = _tr_words(arena_ptr, par)
+        oth = _tr_words(arena_ptr, fx.Int64(1) - par)
+        step = grid * fx.Int32(THREADS)
+        for t in range(bx * fx.Int32(THREADS) + tx, fx.Int32(MAX_TOKENS), step):
+            comm.store_i32_global_system_relaxed(
+                oth + fx.Int64(TRL2["cnt"]) + fx.Int64(t) * fx.Int64(4), fx.Int32(0))
+        if bx == fx.Int32(0):
+            for w in range(tx, fx.Int32(MAX_TOKENS // 4 + 1), fx.Int32(THREADS)):
+                comm.store_i32_global_system_relaxed(
+                    oth + fx.Int64(TRL2["bdone"]) + fx.Int64(w) * fx.Int64(4), fx.Int32(0))
+                if const_expr(sdma):
+                    comm.store_i32_global_system_relaxed(
+                        oth + fx.Int64(TRL2["issued"]) + fx.Int64(w) * fx.Int64(4), fx.Int32(0))
+            if tx < fx.Int32(8):
+                comm.store_i32_global_system_relaxed(
+                    oth + fx.Int64(TRL2["posted"]) + fx.Int64(tx) * fx.Int64(4), fx.Int32(0))
+                comm.store_i32_global_system_relaxed(
+                    oth + fx.Int64(TRL2["rung"]) + fx.Int64(tx) * fx.Int64(4), fx.Int32(0))
+            if tx == fx.Int32(0):
+                if const_expr(not sdma):
+                    comm.store_i32_global_system_relaxed(oth + fx.Int64(TRL2["tail"]), fx.Int32(0))
+                comm.store_i32_global_system_relaxed(oth + fx.Int64(TRL2["head"]), fx.Int32(0))
+        mask_base = arena_ptr + fx.Int64(slot_mask_off) + par * fx.Int64(parity_planes[1])
+        for t in range(bx * fx.Int32(THREADS) + tx, local_tokens, step):
+            m = fx.Int32(comm.load_i32_global_system_relaxed(
+                mask_base + fx.Int64(fx.Int32(remote_plane * MAX_TOKENS) + t) * fx.Int64(4)))
+            e = fx.Int32(0)
+            for _k in range_constexpr(TOPK):
+                e = e + ((m >> fx.Int32(_k)) & fx.Int32(1))
+            old = fx.Int32(comm.atomic_add_system(
+                cur + fx.Int64(TRL2["cnt"]) + fx.Int64(t) * fx.Int64(4), fx.Int32(0) - e))
+            if old == e:
+                if const_expr(sdma):
+                    comm.store_i64_global_system_relaxed(
+                        cur + fx.Int64(TRL2["q"]) + fx.Int64(t) * fx.Int64(8), gen)
+                else:
+                    _tr_enqueue(cur, t, g32)
+
+    @flyc.jit
+    def _tr_landed(arena_ptr, par, cur, g32, pos):
+        # One probe, never a wait while a CTA holds its next GEMM2 ticket.
+        # The queue tail can precede the entry store. A compute-ready token
+        # can also precede the last row of its SDMA chunk.
+        qe = fx.Int64(comm.load_i64_global_system_relaxed(
+            cur + fx.Int64(TRL2["q"]) + fx.Int64(pos) * fx.Int64(8)))
+        good = fx.Int32(0)
+        if qe.shrui(fx.Int64(32)) == g32:
+            tok = fx.Int32(qe & fx.Int64(0xFFFFFFFF))
+            ti = fx.Int32(remote_plane * MAX_TOKENS) + tok
+            sm = fx.Int32(comm.load_i32_global_system_relaxed(
+                arena_ptr + fx.Int64(slot_mask_off) + par * fx.Int64(parity_planes[1])
+                + fx.Int64(ti) * fx.Int64(4)))
+            good = fx.Int32(1)
+            for sk in range_constexpr(TOPK):
+                if ((sm >> fx.Int32(sk)) & fx.Int32(1)) != fx.Int32(0):
+                    inv = fx.Int32(comm.load_i32_global_system_relaxed(
+                        cur + fx.Int64(SD_INV_B)
+                        + fx.Int64(ti * fx.Int32(TOPK) + fx.Int32(sk)) * fx.Int64(4)))
+                    if inv < fx.Int32(0):
+                        src = inv.shrui(fx.Int32(28)) & fx.Int32(7)
+                        prog = fx.Int64(comm.load_i64_global_system_relaxed(
+                            cur + fx.Int64(TRL2["prog"]) + fx.Int64(src) * fx.Int64(8)))
+                        landed = ((prog.shrui(fx.Int64(32)) == g32)
+                                  & ((prog & fx.Int64(0xFFFFFFFF))
+                                     > fx.Int64(inv & fx.Int32(0x0FFFFFFF))))
+                        good = landed.select(good, fx.Int32(0))
+        return good
+
+    @flyc.jit
+    def _tr_landed_wave(arena_ptr, par, cur, g32, pos, lane):
+        # One token per wave, one slot per lane. A single probe never holds
+        # a GEMM2 ticket waiting for a copy-engine chunk to complete.
+        qe = fx.Int64(0)
+        if lane == fx.Int32(0):
+            qe = fx.Int64(comm.load_i64_global_system_relaxed(
+                cur + fx.Int64(TRL2["q"]) + fx.Int64(pos) * fx.Int64(8)))
+        qe = fx.Int64(rocdl.readfirstlane(T.i64, qe.ir_value()))
+        if const_expr(sdma):
+            good = qe == g32  # full generation, token-indexed compute-ready word
+            tok = pos
+        else:
+            good = qe.shrui(fx.Int64(32)) == g32
+            tok = fx.Int32(qe & fx.Int64(0xFFFFFFFF))
+        if good:
+            ti = fx.Int32(remote_plane * MAX_TOKENS) + tok
+            sm = fx.Int32(0)
+            if lane == fx.Int32(0):
+                sm = fx.Int32(comm.load_i32_global_system_relaxed(
+                    arena_ptr + fx.Int64(slot_mask_off) + par * fx.Int64(parity_planes[1])
+                    + fx.Int64(ti) * fx.Int64(4)))
+            sm = fx.Int32(rocdl.readfirstlane(T.i32, sm.ir_value()))
+            if lane < fx.Int32(TOPK):  # noqa: SIM102
+                if ((sm >> lane) & fx.Int32(1)) != fx.Int32(0):
+                    inv = fx.Int32(comm.load_i32_global_system_relaxed(
+                        cur + fx.Int64(SD_INV_B)
+                        + fx.Int64(ti * fx.Int32(TOPK) + lane) * fx.Int64(4)))
+                    if inv < fx.Int32(0):
+                        src = inv.shrui(fx.Int32(28)) & fx.Int32(7)
+                        prog = fx.Int64(comm.load_i64_global_system_relaxed(
+                            cur + fx.Int64(TRL2["prog"]) + fx.Int64(src) * fx.Int64(8)))
+                        good = ((prog.shrui(fx.Int64(32)) == (g32 & fx.Int64(0xFFFFFFFF)))
+                            & ((prog & fx.Int64(0xFFFFFFFF))
+                               > fx.Int64(inv & fx.Int32(0x0FFFFFFF))))
+        missing = fx.Int64(rocdl.ballot(T.i64, (~good).ir_value()))
+        return (missing == fx.Int64(0)).select(fx.Int32(1), fx.Int32(0))
+
+    @flyc.jit
+    def _tr_reduce(arena_ptr, par, cur, g32, pos, lane, wait_landing=True, queue_pos=None,
+                   direct_token=None):
+        """One wave: wait for queue entry pos, reduce its token's remote-plane
+        rows (all HPARTS, RED_U at a time) into accumulator row pos, record
+        the token id for the batch."""
+        if const_expr(direct_token is not None):
+            tok = direct_token
+        else:
+            qp = pos
+            if const_expr(queue_pos is not None):
+                qp = queue_pos
+            qa = cur + fx.Int64(TRL2["q"]) + fx.Int64(qp) * fx.Int64(8)
+            e = fx.Int64(0)
+            if lane == fx.Int32(0):
+                e = fx.Int64(comm.load_i64_global_system_relaxed(qa))
+                while (e >> fx.Int64(32)) != g32:
+                    fx.rocdl.s_sleep(1)
+                    e = fx.Int64(comm.load_i64_global_system_relaxed(qa))
+            if const_expr(sdma and wait_landing):  # noqa: SIM102
+                if lane == fx.Int32(0):
+                    landed = fx.Int32(_tr_landed(arena_ptr, par, cur, g32, pos))
+                    while landed == fx.Int32(0):
+                        fx.rocdl.s_sleep(1)
+                        landed = fx.Int32(_tr_landed(arena_ptr, par, cur, g32, pos))
+            tok = fx.Int32(rocdl.readfirstlane(T.i32, fx.Int32(e & fx.Int64(0xFFFFFFFF)).ir_value()))
+        tix = fx.Int32(remote_plane * MAX_TOKENS) + tok
+        sm = fx.Int32(0)
+        if lane == fx.Int32(0):
+            sm = fx.Int32(comm.load_i32_global_system_relaxed(
+                arena_ptr + fx.Int64(slot_mask_off) + par * fx.Int64(parity_planes[1])
+                + fx.Int64(tix) * fx.Int64(4)))
+        sm = fx.Int32(rocdl.readfirstlane(T.i32, sm.ir_value()))
+        # Landing map is immutable once this token has passed readiness.
+        # Fetch each valid row once rather than for every hidden-part group.
+        tr_rows = []
+        if const_expr(sdma):
+            for slot in range_constexpr(TOPK):
+                row = fx.Int32(0)
+                if lane == fx.Int32(0):  # noqa: SIM102
+                    if ((sm >> fx.Int32(slot)) & fx.Int32(1)) != fx.Int32(0):
+                        rec = fx.Int32(comm.load_i32_global_system_relaxed(
+                            cur + fx.Int64(SD_INV_B)
+                            + fx.Int64(tix * fx.Int32(TOPK) + fx.Int32(slot)) * fx.Int64(4)))
+                        row = (rec & fx.Int32(0x0FFFFFFF)) * fx.Int32(SD_RB8)
+                tr_rows.append(fx.Int32(rocdl.readfirstlane(T.i32, row.ir_value())))
+        inbox_rs = buffer_ops.create_buffer_resource_from_addr(
+            arena_ptr + fx.Int64(inbox_off) + par * fx.Int64(parity_planes[0]),
+            num_records_bytes=fx.Int32(inbox_bytes))
+        acc_rs = buffer_ops.create_buffer_resource_from_addr(
+            arena_ptr + fx.Int64(accumulator_off) + par * fx.Int64(parity_planes[2]),
+            num_records_bytes=fx.Int32(accumulator_bytes))
+        arow = (fx.Int32(remote_plane * MAX_TOKENS) + pos) * fx.Int32(ACC_ROW_BYTES)
+        for _hg in range_constexpr(0, HPARTS, RED_U):
+            hps = list(range(_hg, min(_hg + RED_U, HPARTS)))
+            cols = [(fx.Int32(_hp * 64) + lane) * fx.Int32(VEC) for _hp in hps]
+            tots = [fx.Vector.filled(VEC, 0.0, Float32) for _hp in hps]
+            for _rb in range_constexpr(RED_BATCHES):
+                vals, scales = [], []
+                for _i in range_constexpr(len(hps)):
+                    _vi = []
+                    for _rj in range_constexpr(RED_BATCH):
+                        slot = _rb * RED_BATCH + _rj
+                        if const_expr(slot < TOPK):
+                            ok = ((sm >> fx.Int32(slot)) & fx.Int32(1)) != fx.Int32(0)
+                            if const_expr(sdma):
+                                row = tr_rows[slot]
+                                _vi.append(buffer_ops.buffer_load(inbox_rs,
+                                    (row + cols[_i]) // fx.Int32(4), vec_width=2,
+                                    dtype=T.i32, mask=ok, cache_modifier=17))
+                                scales.append(buffer_ops.buffer_load(inbox_rs,
+                                    row + fx.Int32(HIDDEN) + cols[_i] // fx.Int32(32),
+                                    vec_width=1, dtype=T.i8, mask=ok, cache_modifier=17))
+                            else:
+                                src = (tix * fx.Int32(TOPK) + fx.Int32(slot)) * fx.Int32(HIDDEN) + cols[_i]
+                                _vi.append(buffer_ops.buffer_load(
+                                    inbox_rs, src // fx.Int32(2), vec_width=4, dtype=T.i32,
+                                    mask=ok, cache_modifier=17))
+                    vals.append(_vi)
+                for _i in range_constexpr(len(hps)):
+                    for _k in range_constexpr(len(vals[_i])):
+                        if const_expr(sdma):
+                            sc = scales[_i * len(vals[_i]) + _k]
+                            tots[_i] = tots[_i] + _fp8_decode8(vals[_i][_k],
+                                ((fx.Uint8(sc).to(fx.Uint32).bitcast(fx.Int32))
+                                 << fx.Int32(23)).bitcast(Float32))
+                        else:
+                            tots[_i] = tots[_i] + fx.Vector(vals[_i][_k]).bitcast(BFloat16).to(Float32)
+                if const_expr(_rb + 1 < RED_BATCHES):
+                    rocdl.sched_barrier(0)
+            for _i in range_constexpr(len(hps)):
+                _vals = [fx.Float32(tots[_i][k]) for k in range_constexpr(VEC)]
+                _w, _e8m0, _is_ldr = _fp8_encode8(_vals, lane, VEC=VEC)
+                buffer_ops.buffer_store(
+                    fx.Vector.from_elements(_w, fx.Int32), acc_rs, (arow + cols[_i]) // fx.Int32(4))
+                buffer_ops.buffer_store(
+                    _e8m0.to(fx.Int8), acc_rs, arow + fx.Int32(HIDDEN) + cols[_i] // fx.Int32(32),
+                    mask=_is_ldr)
+        if lane == fx.Int32(0):
+            comm.store_i32_global_system_relaxed(
+                arena_ptr + fx.Int64(RIDX_OFF) + par * fx.Int64(RIDX_PLANE)
+                + fx.Int64(pos) * fx.Int64(4), tok)
+
+    @flyc.jit
+    def _tr_post(dev_comm, arena_win, par, gen, cur, b, local_tokens, lane, publish=True):
+        """Wave 0 of the CTA that completed batch b: rows, ids, then its ready
+        word, on QP b % NUM_QP; the QP's owner rings (see k2_tr_step)."""
+        comm.fence_system_release()
+        qp = b % fx.Int32(NUM_QP)
+        pos0 = b * fx.Int32(CHUNK)
+        nt = _min_rt(fx.Int32(CHUNK), local_tokens - pos0)
+        rb = fx.Int64(RECORD_BYTES)
+        _rail.put(dev_comm, qp, fx.Int32(remote_node), arena_win,
+                  fx.Int64(rx_off) + par * fx.Int64(parity_planes[3]) + fx.Int64(pos0) * rb,
+                  arena_win,
+                  fx.Int64(accumulator_off) + par * fx.Int64(parity_planes[2])
+                  + fx.Int64(remote_plane * MAX_TOKENS) * rb + fx.Int64(pos0) * rb,
+                  fx.Int64(nt) * rb, aggregate=True)
+        ridx = fx.Int64(RIDX_OFF) + par * fx.Int64(RIDX_PLANE)
+        _rail.put(dev_comm, qp, fx.Int32(remote_node), arena_win,
+                  ridx + fx.Int64(MAX_TOKENS * 4) + fx.Int64(pos0) * fx.Int64(4),
+                  arena_win, ridx + fx.Int64(pos0) * fx.Int64(4),
+                  fx.Int64(nt) * fx.Int64(4), aggregate=True)
+        _rail.put_value(dev_comm, qp, fx.Int32(remote_node), arena_win,
+                        fx.Int64(group_ready_off) + par * fx.Int64(parity_planes[5])
+                        + fx.Int64(b) * fx.Int64(8), gen, aggregate=True)
+        fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
+        if const_expr(publish):  # noqa: SIM102
+            if lane == fx.Int32(0):
+                comm.atomic_add_agent(cur + fx.Int64(TRL2["posted"]) + fx.Int64(qp) * fx.Int64(4),
+                                      fx.Int32(1))
+
+    @flyc.jit
+    def _tr_owner_step(dev_comm, arena_win, par, gen, cur, local_tokens, qp, lane, drain=False):
+        # Only wave 0 of CTA qp touches this QP. Reducers publish bdone after
+        # their drained output stores; this owner posts and rings serially.
+        # No post/flush overlap and no posted/rung handoff are required.
+        nb = _ceil_div_rt(local_tokens, fx.Int32(CHUNK))
+        if const_expr(((MAX_TOKENS + CHUNK - 1) // CHUNK) <= NUM_QP):
+            if qp < nb:
+                issued = fx.Int32(0)
+                if lane == fx.Int32(0):
+                    issued = fx.Int32(comm.load_i32_global_system_relaxed(
+                        cur + fx.Int64(TRL2["issued"]) + fx.Int64(qp) * fx.Int64(4)))
+                issued = fx.Int32(rocdl.readfirstlane(T.i32, issued.ir_value()))
+                if issued == fx.Int32(0):
+                    done = fx.Int32(0)
+                    if lane == fx.Int32(0):
+                        done = fx.Int32(comm.load_i32_global_system_relaxed(
+                            cur + fx.Int64(TRL2["bdone"]) + fx.Int64(qp) * fx.Int64(4)))
+                    done = fx.Int32(rocdl.readfirstlane(T.i32, done.ir_value()))
+                    want = _min_rt(fx.Int32(CHUNK), local_tokens - qp * fx.Int32(CHUNK))
+                    if const_expr(drain):
+                        while done < want:
+                            fx.rocdl.s_sleep(1)
+                            if lane == fx.Int32(0):
+                                done = fx.Int32(comm.load_i32_global_system_relaxed(
+                                    cur + fx.Int64(TRL2["bdone"]) + fx.Int64(qp) * fx.Int64(4)))
+                            done = fx.Int32(rocdl.readfirstlane(T.i32, done.ir_value()))
+                    if done == want:
+                        comm.fence_system_acquire()
+                        _tr_post(dev_comm, arena_win, par, gen, cur, qp, local_tokens,
+                                 lane, publish=False)
+                        rq = fx.Int64(_rail.flush_async(dev_comm, qp, fx.Int32(remote_node)))
+                        if lane == fx.Int32(0):
+                            comm.store_i64_global_system_relaxed(
+                                cur + fx.Int64(TRL2["req"]) + fx.Int64(qp) * fx.Int64(8), rq)
+                            comm.store_i32_global_system_relaxed(
+                                cur + fx.Int64(TRL2["issued"]) + fx.Int64(qp) * fx.Int64(4),
+                                fx.Int32(1))
+        else:
+            nb = _ceil_div_rt(local_tokens, fx.Int32(CHUNK))
+            more = fx.Int32(1)
+            while more != fx.Int32(0):
+                more = fx.Int32(0)
+                for b in range(qp, nb, fx.Int32(NUM_QP)):
+                    issued = fx.Int32(0)
+                    if lane == fx.Int32(0):
+                        issued = fx.Int32(comm.load_i32_global_system_relaxed(
+                            cur + fx.Int64(TRL2["issued"]) + fx.Int64(b) * fx.Int64(4)))
+                    issued = fx.Int32(rocdl.readfirstlane(T.i32, issued.ir_value()))
+                    if issued == fx.Int32(0):
+                        done = fx.Int32(0)
+                        if lane == fx.Int32(0):
+                            done = fx.Int32(comm.load_i32_global_system_relaxed(
+                                cur + fx.Int64(TRL2["bdone"]) + fx.Int64(b) * fx.Int64(4)))
+                        done = fx.Int32(rocdl.readfirstlane(T.i32, done.ir_value()))
+                        want = _min_rt(fx.Int32(CHUNK), local_tokens - b * fx.Int32(CHUNK))
+                        if done == want:
+                            comm.fence_system_acquire()
+                            _tr_post(dev_comm, arena_win, par, gen, cur, b, local_tokens,
+                                     lane, publish=False)
+                            rq = fx.Int64(_rail.flush_async(dev_comm, qp, fx.Int32(remote_node)))
+                            if lane == fx.Int32(0):
+                                comm.store_i64_global_system_relaxed(
+                                    cur + fx.Int64(TRL2["req"]) + fx.Int64(qp) * fx.Int64(8), rq)
+                                comm.store_i32_global_system_relaxed(
+                                    cur + fx.Int64(TRL2["issued"]) + fx.Int64(b) * fx.Int64(4),
+                                    fx.Int32(1))
+                        else:
+                            more = fx.Int32(1)
+                if const_expr(drain):
+                    if more != fx.Int32(0):
+                        fx.rocdl.s_sleep(1)
+                else:
+                    more = fx.Int32(0)
+
+    @flyc.jit
+    def k2_tr_step(dev_comm, arena_win, arena_ptr, local_tokens, bx, lw, drain, pre=None,
+                   post=None):
+        """One round of the rail role for a CTA between its GEMM2 units: the
+        QP owner rings what was posted; then the CTA claims up to WAVES ready
+        tokens (any queued ones when draining), one per wave, reduces them and
+        posts every batch it completes.  Returns the tokens claimed (uniform).
+        lw(i): LDS words 0..3 for the broadcasts.  pre(): extra thread-0 work
+        and post(): extra whole-CTA work after the same barrier (kernel1's
+        m-block count).  With nothing claimed it costs that one barrier."""
+        tx = fx.Int32(gpu.thread_id("x"))
+        wave = tx // fx.Int32(64)
+        lane = tx % fx.Int32(64)
+        gen, par = _tr_gen(arena_ptr)
+        g32 = gen & fx.Int64(0xFFFFFFFF)
+        cur = _tr_words(arena_ptr, par)
+        if (bx < fx.Int32(NUM_QP)) & (wave == fx.Int32(0)):
+            _posted = fx.Int32(comm.load_i32_global_system_relaxed(
+                cur + fx.Int64(TRL2["posted"]) + fx.Int64(bx) * fx.Int64(4)))
+            _rung = fx.Int32(comm.load_i32_global_system_relaxed(
+                cur + fx.Int64(TRL2["rung"]) + fx.Int64(bx) * fx.Int64(4)))
+            if _posted > _rung:
+                comm.fence_system_acquire()  # the posters' WQEs (as the per-chunk ring did)
+                _rq = fx.Int64(_rail.flush_async(dev_comm, bx, fx.Int32(remote_node)))
+                if lane == fx.Int32(0):
+                    comm.store_i64_global_system_relaxed(
+                        cur + fx.Int64(TRL2["req"]) + fx.Int64(bx) * fx.Int64(8), _rq)
+                    comm.store_i32_global_system_relaxed(
+                        cur + fx.Int64(TRL2["rung"]) + fx.Int64(bx) * fx.Int64(4), _posted)
+        if tx == fx.Int32(0):
+            if const_expr(pre is not None):
+                pre()
+            tail = fx.Int32(comm.load_i32_global_system_relaxed(cur + fx.Int64(TRL2["tail"])))
+            head = fx.Int32(comm.load_i32_global_system_relaxed(cur + fx.Int64(TRL2["head"])))
+            p0 = fx.Int32(0)
+            n = fx.Int32(0)
+            if const_expr(drain):
+                # Out of GEMM2 tickets: claim even ahead of the queue tail; the
+                # missing tokens only wait on other CTAs' GEMM2.
+                if head < local_tokens:
+                    p0 = fx.Int32(comm.atomic_add_agent(cur + fx.Int64(TRL2["head"]),
+                                                        fx.Int32(WAVES)))
+                    n = _max_rt(_min_rt(local_tokens - p0, fx.Int32(WAVES)), fx.Int32(0))
+            else:
+                # Between GEMM2 units only queued tokens: a CTA holding its next
+                # ticket must never wait on a row that ticket (or one held by a
+                # CTA waiting like it) computes.  One CAS, no retry.
+                ready_n = _max_rt(_min_rt(_min_rt(tail, local_tokens) - head,
+                                         fx.Int32(WAVES)), fx.Int32(0))
+                if const_expr(sdma):
+                    # First broadcast a snapshot; the waves check it together.
+                    p0, n = head, ready_n
+                else:
+                    if ready_n > fx.Int32(0):
+                        _old, _ok = fx.llvm.atomic_cas(
+                            fx.inttoptr(fx.PointerType.get(T.i32, fx.AddressSpace.Global, 4),
+                                        cur + fx.Int64(TRL2["head"])),
+                            head, head + ready_n, syncscope=rocdl.SyncScope.Agent)
+                        if _ok:
+                            p0 = head
+                            n = ready_n
+            fx.ptr_store(p0, lw(0))
+            fx.ptr_store(n, lw(1))
+        gpu.barrier()
+        if const_expr(post is not None):
+            post()
+        p0 = fx.Int32(rocdl.readfirstlane(T.i32, fx.ptr_load(lw(0)).ir_value()))
+        n = fx.Int32(rocdl.readfirstlane(T.i32, fx.ptr_load(lw(1)).ir_value()))
+        if const_expr(sdma and not drain):  # noqa: SIM102
+            if n != fx.Int32(0):
+                eligible = fx.Int32(0)
+                if wave < n:
+                    eligible = fx.Int32(_tr_landed_wave(
+                        arena_ptr, par, cur, g32, p0 + wave, lane))
+                if lane == fx.Int32(0):
+                    fx.ptr_store(eligible, lw(4 + wave))
+                gpu.barrier()
+                if tx == fx.Int32(0):
+                    ready_n = n
+                    for w in range_constexpr(WAVES):
+                        landed = fx.Int32(fx.ptr_load(lw(4 + w)))
+                        ready_n = ((landed == fx.Int32(0)) & (fx.Int32(w) < ready_n)).select(
+                            fx.Int32(w), ready_n)
+                    claimed = fx.Int32(0)
+                    if ready_n > fx.Int32(0):
+                        _old, _ok = fx.llvm.atomic_cas(
+                            fx.inttoptr(fx.PointerType.get(T.i32, fx.AddressSpace.Global, 4),
+                                        cur + fx.Int64(TRL2["head"])),
+                            p0, p0 + ready_n, syncscope=rocdl.SyncScope.Agent)
+                        claimed = _ok.select(ready_n, fx.Int32(0))
+                    fx.ptr_store(claimed, lw(1))
+                gpu.barrier()
+                n = fx.Int32(rocdl.readfirstlane(T.i32, fx.ptr_load(lw(1)).ir_value()))
+        if n != fx.Int32(0):
+            _tr_work(dev_comm, arena_win, arena_ptr, local_tokens, bx, lw, par, gen, g32, cur,
+                     p0, n, tx, wave, lane, wait_landing=drain)
+        return n
+
+    @flyc.jit
+    def _tr_work(dev_comm, arena_win, arena_ptr, local_tokens, bx, lw, par, gen, g32, cur,
+                 p0, n, tx, wave, lane, wait_landing=True, queue_base=None, direct_token=None):
+        if const_expr(direct_token is not None):
+            offset = fx.Int32(rocdl.readfirstlane(T.i32, fx.ptr_load(lw(4 + wave)).ir_value()))
+            if offset >= fx.Int32(0):
+                _tr_reduce(arena_ptr, par, cur, g32, p0 + offset, lane,
+                           wait_landing=False, direct_token=direct_token)
+        elif const_expr(queue_base is not None):
+            offset = fx.Int32(rocdl.readfirstlane(T.i32, fx.ptr_load(lw(4 + wave)).ir_value()))
+            if offset >= fx.Int32(0):
+                _tr_reduce(arena_ptr, par, cur, g32, p0 + offset, lane,
+                           wait_landing=False, queue_pos=queue_base + wave)
+        else:
+            if wave < n:
+                _tr_reduce(arena_ptr, par, cur, g32, p0 + wave, lane, wait_landing=wait_landing)
+        fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
+        gpu.barrier()
+        if tx == fx.Int32(0):
+            f0 = fx.Int32(0)
+            f1 = fx.Int32(0)
+            if n > fx.Int32(0):
+                b0 = p0 // fx.Int32(CHUNK)
+                b1 = (p0 + n - fx.Int32(1)) // fx.Int32(CHUNK)
+                c0 = _min_rt(n, (b0 + fx.Int32(1)) * fx.Int32(CHUNK) - p0)
+                z0 = _min_rt(fx.Int32(CHUNK), local_tokens - b0 * fx.Int32(CHUNK))
+                r0 = fx.Int32(comm.atomic_add_agent_acq_rel(
+                    cur + fx.Int64(TRL2["bdone"]) + fx.Int64(b0) * fx.Int64(4), c0))
+                f0 = ((r0 + c0) == z0).select(b0 + fx.Int32(1), fx.Int32(0))
+                if b1 != b0:
+                    c1 = n - c0
+                    z1 = _min_rt(fx.Int32(CHUNK), local_tokens - b1 * fx.Int32(CHUNK))
+                    r1 = fx.Int32(comm.atomic_add_agent_acq_rel(
+                        cur + fx.Int64(TRL2["bdone"]) + fx.Int64(b1) * fx.Int64(4), c1))
+                    f1 = ((r1 + c1) == z1).select(b1 + fx.Int32(1), fx.Int32(0))
+            if const_expr(not sdma):
+                fx.ptr_store(f0, lw(2))
+                fx.ptr_store(f1, lw(3))
+        if const_expr(not sdma):
+            gpu.barrier()
+            f0 = fx.Int32(rocdl.readfirstlane(T.i32, fx.ptr_load(lw(2)).ir_value()))
+            f1 = fx.Int32(rocdl.readfirstlane(T.i32, fx.ptr_load(lw(3)).ir_value()))
+            gpu.barrier()
+            if wave == fx.Int32(0):
+                if f0 != fx.Int32(0):
+                    _tr_post(dev_comm, arena_win, par, gen, cur, f0 - fx.Int32(1), local_tokens, lane)
+                if f1 != fx.Int32(0):
+                    _tr_post(dev_comm, arena_win, par, gen, cur, f1 - fx.Int32(1), local_tokens, lane)
+
+    @flyc.jit
+    def k2_tr_sdma_step(dev_comm, arena_win, arena_ptr, local_tokens, bx, lw, drain,
+                        pre=None, post=None, owner_grid=256):
+        # Fixed CTA/wave ownership replaces the global queue, scan and CAS.
+        # Each service round probes one token per wave without waiting while
+        # a CTA holds a GEMM ticket. The cursor covers all assigned tokens.
+        tx = fx.Int32(gpu.thread_id("x"))
+        wave, lane = tx // fx.Int32(64), tx % fx.Int32(64)
+        gen, par = _tr_gen(arena_ptr)
+        cur = _tr_words(arena_ptr, par)
+        rounds = _ceil_div(MAX_TOKENS, owner_grid * WAVES)
+        words = _ceil_div(rounds, 32)
+        cursor_word = 12 + words * WAVES
+        done_word = cursor_word + 1
+        # Once all fixed-owner tokens have been reduced, GEMM2 may still
+        # have tickets. Preserve producer publication and QP progress, but
+        # stop probing completed tokens and packing empty service rounds.
+        stride = fx.Int32(owner_grid * WAVES)
+        want = (local_tokens // stride) * fx.Int32(WAVES) + _max_rt(
+            _min_rt(local_tokens % stride - bx * fx.Int32(WAVES), fx.Int32(WAVES)),
+            fx.Int32(0))
+        done_before = fx.Int32(rocdl.readfirstlane(T.i32,
+            fx.ptr_load(lw(done_word)).ir_value()))
+        service = done_before < want
+        if tx == fx.Int32(0):
+            if const_expr(pre is not None):
+                pre()
+            if service:
+                cursor = fx.Int32(fx.ptr_load(lw(cursor_word)))
+                fx.ptr_store(cursor, lw(0))
+                fx.ptr_store((cursor + fx.Int32(1)) % fx.Int32(rounds), lw(cursor_word))
+        if const_expr(pre is not None):  # noqa: SIM114
+            gpu.barrier()
+        elif service:
+            gpu.barrier()
+        if const_expr(post is not None):
+            post()
+        n = fx.Int32(0)
+        if service:
+            cursor = fx.Int32(rocdl.readfirstlane(T.i32, fx.ptr_load(lw(0)).ir_value()))
+            tok = bx * fx.Int32(WAVES) + wave + cursor * fx.Int32(owner_grid * WAVES)
+            bit = fx.Int32(1) << (cursor % fx.Int32(32))
+            bitmap_ptr = lw(12 + (cursor // fx.Int32(32)) * fx.Int32(WAVES) + wave)
+            got = fx.Int32(0)
+            if tok < local_tokens:
+                bitmap = fx.Int32(0)
+                if lane == fx.Int32(0):
+                    bitmap = fx.Int32(fx.ptr_load(bitmap_ptr))
+                bitmap = fx.Int32(rocdl.readfirstlane(T.i32, bitmap.ir_value()))
+                if (bitmap & bit) == fx.Int32(0):
+                    got = fx.Int32(_tr_landed_wave(arena_ptr, par, cur, gen, tok, lane))
+                    if lane == fx.Int32(0):  # noqa: SIM102
+                        if got != fx.Int32(0):
+                            fx.ptr_store(bitmap | bit, bitmap_ptr)
+            if lane == fx.Int32(0):
+                fx.ptr_store(got, lw(4 + wave))
+            gpu.barrier()
+            if tx == fx.Int32(0):
+                n = fx.Int32(0)
+                for w in range_constexpr(WAVES):
+                    have = fx.Int32(fx.ptr_load(lw(4 + w)))
+                    fx.ptr_store((have != fx.Int32(0)).select(n, fx.Int32(-1)), lw(4 + w))
+                    n = n + have
+                packed = fx.Int32(0)
+                if n != fx.Int32(0):
+                    packed = fx.Int32(comm.atomic_add_agent(cur + fx.Int64(TRL2["head"]), n))
+                fx.ptr_store(packed, lw(0))
+                fx.ptr_store(n, lw(1))
+                done = fx.Int32(fx.ptr_load(lw(done_word)))
+                fx.ptr_store(done + n, lw(done_word))
+            gpu.barrier()
+            packed = fx.Int32(rocdl.readfirstlane(T.i32, fx.ptr_load(lw(0)).ir_value()))
+            n = fx.Int32(rocdl.readfirstlane(T.i32, fx.ptr_load(lw(1)).ir_value()))
+            if n != fx.Int32(0):
+                _tr_work(dev_comm, arena_win, arena_ptr, local_tokens, bx, lw, par, gen, gen, cur,
+                         packed, n, tx, wave, lane, direct_token=tok)
+        if (bx < fx.Int32(NUM_QP)) & (wave == fx.Int32(0)):
+            _tr_owner_step(dev_comm, arena_win, par, gen, cur, local_tokens, bx, lane)
+        if const_expr(drain):
+            if n == fx.Int32(0):
+                fx.rocdl.s_sleep(16)
+            if tx == fx.Int32(0):
+                done = fx.Int32(fx.ptr_load(lw(done_word)))
+                # lw3 remains stable until all waves cross the next barrier.
+                fx.ptr_store((done < want).select(fx.Int32(1), fx.Int32(0)), lw(3))
+            gpu.barrier()
+            return fx.Int32(rocdl.readfirstlane(T.i32, fx.ptr_load(lw(3)).ir_value()))
+        return n
+
     launch.kernel_name = kernel_name
     launch.body = k2_body
+    launch.remote_ready = k2_remote_ready
+    launch.tr_init = k2_tr_init
+    launch.tr_step = k2_tr_sdma_step if sdma else k2_tr_step
+    launch.token_ready = TRC
+    launch.threads = THREADS
     return launch
 
 
@@ -2141,25 +3119,20 @@ _FUSED_CACHE = {}
 
 
 def compile_stage2_fused(k1_kw: dict, k2_kw: dict, k2_ctas: int):
-    k1 = compile_mega_moe_stage2(**k1_kw, fused=True)
-    k2 = compile_stage2_node_combine(**k2_kw)
-    k1_body, k2_body = k1.body, k2.body
-    grid_ctas = int(k1.grid_ctas)
-    remote_first = bool(k1.remote_first)
-    k2_ctas = int(k2_ctas)
-    if k2_ctas > grid_ctas:
-        raise ValueError(f"fused stage2 grid {grid_ctas} < kernel2 CTAs {k2_ctas}")
-    sdma = bool(k1_kw.get("sdma", False))
+    from .stage2_pipeline import compile_stage2_pipeline
+
+    pipeline = compile_stage2_pipeline(k1_kw, k2_kw, k2_ctas)
+    k1, k2 = pipeline.k1, pipeline.k2
+    grid_ctas = pipeline.grid
     k1_occ = int(k1.ctas_per_cu)
-    if sdma != bool(k2_kw.get("sdma", False)):
-        raise ValueError("kernel1 and kernel2 must agree on sdma")
-    if sdma and k2_ctas > k1.sd_plan_bx:
-        # The plan CTAs (then GEMM2) and the comm CTA sit past kernel2's CTAs.
-        raise ValueError(f"sdma fused stage2 grid {grid_ctas} leaves no room for {k2_ctas} kernel2 CTAs")
     kernel_name = "megamoe_s2f_" + k1.kernel_name[len("megamoe_"):] + "__" + k2.kernel_name[len("megamoe_"):]
+    threads = pipeline.threads
+    # 4 waves: keep kernel1's occupancy (the grid assumes k1_occ CTAs per CU);
+    # 8 waves: one CTA per CU, two waves per SIMD.
+    wpe = k1_occ if threads == 256 else 2
 
     # fmt: off
-    @flyc.kernel(name=kernel_name, known_block_size=[256, 1, 1])
+    @flyc.kernel(name=kernel_name, known_block_size=[threads, 1, 1])
     def fused(arg_aq: fx.Int64, arg_ascale: fx.Int64, arg_bq: fx.Int64, arg_bscale: fx.Int64,
         arg_eids: fx.Int64, arg_cumsum: fx.Int64, arg_stids: fx.Int64, arg_sweights: fx.Int64,
         arg_trb: fx.Int64, arg_p2p_comb_inp: fx.Int64, i32_max_m_blocks: fx.Int32,
@@ -2168,29 +3141,14 @@ def compile_stage2_fused(k1_kw: dict, k2_kw: dict, k2_ctas: int):
         dev_comm: fx.Int64, arena_win: fx.Int64, arena_ptr: fx.Int64,
         arg_output_bf16: fx.Int64, arg_scratch: fx.Int64, local_tokens: fx.Int32,
         arg_expert_count: fx.Int64, arg_sd_send: fx.Int64, arg_sd_tb: fx.Int64,
-        arg_sd_plan: fx.Int64, arg_sd_cdone: fx.Int64):
+        arg_sd_plan: fx.Int64, arg_sd_cdone: fx.Int64, arg_tr_mcnt: fx.Int64, arg_tr_sdprog: fx.Int64):
     # fmt: on
-        bx = fx.Int32(fx.block_idx.x)
-
-        def remote_half_done():
-            # Remote-first kernel1: once this CTA has no remote m-block left,
-            # the kernel2 CTAs reduce the remote plane and ring the rail while
-            # the other CTAs carry on with the local half of GEMM2.
-            if bx < fx.Int32(k2_ctas):
-                k2_body(dev_comm, arena_win, arena_ptr, arg_output_bf16, arg_scratch,
-                        local_tokens, bx, fx.Int32(k2_ctas), part=1)
-
-        k1_body(arg_aq, arg_ascale, arg_bq, arg_bscale, arg_eids, arg_cumsum, arg_stids,
-                arg_sweights, arg_trb, arg_p2p_comb_inp, i32_max_m_blocks, i32_inter,
-                i32_hidden, arg_arrival_count, i64_generation, arg_a_tile_map, i32_local_rank,
-                fx.block_idx.x, arg_expert_count=arg_expert_count,
-                boundary_hook=remote_half_done if remote_first else None,
-                dev_comm=dev_comm, arg_sd_send=arg_sd_send, arg_sd_tb=arg_sd_tb,
-                arg_sd_plan=arg_sd_plan, arg_sd_cdone=arg_sd_cdone,
-                arena_win=arena_win, arena_ptr=arena_ptr)
-        if bx < fx.Int32(k2_ctas):
-            k2_body(dev_comm, arena_win, arena_ptr, arg_output_bf16, arg_scratch,
-                    local_tokens, bx, fx.Int32(k2_ctas), part=2 if remote_first else 0)
+        pipeline.body(arg_aq, arg_ascale, arg_bq, arg_bscale, arg_eids, arg_cumsum,
+                      arg_stids, arg_sweights, arg_trb, arg_p2p_comb_inp, i32_max_m_blocks,
+                      i32_inter, i32_hidden, arg_arrival_count, i64_generation, arg_a_tile_map,
+                      i32_local_rank, dev_comm, arena_win, arena_ptr, arg_output_bf16,
+                      arg_scratch, local_tokens, arg_expert_count, arg_sd_send, arg_sd_tb,
+                      arg_sd_plan, arg_sd_cdone, arg_tr_mcnt, arg_tr_sdprog)
 
     # fmt: off
     @flyc.jit
@@ -2202,17 +3160,16 @@ def compile_stage2_fused(k1_kw: dict, k2_kw: dict, k2_ctas: int):
         dev_comm: fx.Int64, arena_win: fx.Int64, arena_ptr: fx.Int64,
         arg_output_bf16: fx.Int64, arg_scratch: fx.Int64, local_tokens: fx.Int32,
         arg_expert_count: fx.Int64, arg_sd_send: fx.Int64, arg_sd_tb: fx.Int64,
-        arg_sd_plan: fx.Int64, arg_sd_cdone: fx.Int64, stream: fx.Stream):
+        arg_sd_plan: fx.Int64, arg_sd_cdone: fx.Int64, arg_tr_mcnt: fx.Int64, arg_tr_sdprog: fx.Int64, stream: fx.Stream):
     # fmt: on
         fused(arg_aq, arg_ascale, arg_bq, arg_bscale, arg_eids, arg_cumsum, arg_stids,
               arg_sweights, arg_trb, arg_p2p_comb_inp, i32_max_m_blocks, i32_inter,
               i32_hidden, arg_arrival_count, i64_generation, arg_a_tile_map, i32_local_rank,
               dev_comm, arena_win, arena_ptr, arg_output_bf16, arg_scratch, local_tokens,
-              arg_expert_count, arg_sd_send, arg_sd_tb, arg_sd_plan, arg_sd_cdone,
-              # Keep kernel1's occupancy: the grid assumes K1_CTAS_PER_CU per CU.
-              value_attrs={"rocdl.waves_per_eu": k1_occ,
-                           "rocdl.flat_work_group_size": "256,256"},
-              ).launch(grid=(grid_ctas, 1, 1), block=(256, 1, 1), stream=stream)
+              arg_expert_count, arg_sd_send, arg_sd_tb, arg_sd_plan, arg_sd_cdone, arg_tr_mcnt, arg_tr_sdprog,
+              value_attrs={"rocdl.waves_per_eu": wpe,
+                           "rocdl.flat_work_group_size": f"{threads},{threads}"},
+              ).launch(grid=(grid_ctas, 1, 1), block=(threads, 1, 1), stream=stream)
 
     launch.kernel_name = kernel_name
     return launch
@@ -2239,6 +3196,6 @@ def run_stage2_fused(*, k1_ptrs: dict, k1_compile: dict, dev_comm, arena_win, ar
         fx.Int64(int(arg_output_bf16)), fx.Int64(int(arg_scratch)), fx.Int32(int(local_tokens)),
         fx.Int64(int(p.get("arg_expert_count", 0))),
         *(fx.Int64(int(p.get(k, 0))) for k in ("arg_sd_send", "arg_sd_tb", "arg_sd_plan",
-                                               "arg_sd_cdone")),
+                                               "arg_sd_cdone", "arg_tr_mcnt", "arg_tr_sdprog")),
         stream,
     )

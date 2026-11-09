@@ -93,11 +93,18 @@ def _compile_stage1(
     rank: int,
     stage2_window_offset: int = 0,
     fanout_shards: int = 2,
+    data_send_ctas: int = 0,
     split_local: bool = False,
     activation: str = "silu",
     swiglu_limit: float | None = None,
+    waves: int = 4,
+    group_ready: bool = False,
 ):
     """Compile one EP16 Stage-1 persistent-kernel shape specialization.
+
+    ``group_ready`` (single fused kernel): GMM1 writes h1 write-through and
+    counts its jobs per physical tile group; the last job of a group stores
+    the generation into ``h1_grp_sync`` so GEMM2 can start on that group.
 
     ``arena_ptr`` is the base of the one registered two-kernel window.
     ``stage2_window_offset`` locates the logical :class:`Stage2ArenaLayout`
@@ -115,8 +122,17 @@ def _compile_stage1(
     # Reservation completion fixes the final row counts before consumers pad tails.
     # Metadata/payload writes use system write-through, so publication needs no
     # repeated L2 writeback; consumers acquire once per job to preserve weight reuse.
-    # Keep constexpr guards outside runtime guards (local SIM102 exemptions).
+    # Keep constexpr guards outside runtime guards: FlyDSL rewrites them separately.
     tile_ready = lite_sync = fan_wt = not split_local
+    # ready_q(split 路径):组满即入就绪队列。dispatch 每批报到达行数,凑满 32*G 行的那次
+    # 原子的发起者把物理组号追加进 dest 的 gmm1_ready_q;sealer 段 1/段 2 再追加本地/远端的
+    # 尾组。GMM1 消费者做完自己的 fanout 就从队列领 job,不再等 h1_local_eos/h1_queue_eos 两道门。
+    # 到达计数要求载荷/元数据写穿(同 tile_ready),所以连带打开 fan_wt。
+    # 不 split(static_g0)时尾组由「补差额」入队:预约终值后消费者 0 给每个尾组加上缺的行数,
+    # 到达计数与补差额谁最后把组凑满 GROUP_ROWS,谁入队(见 _rq_pad_tails)。
+    ready_q = True
+    if ready_q:
+        fan_wt = True
     # buffer_store cache_modifier(pre-gfx12 编码):1=sc0(GLC) 16=sc1(SCC) 2=nt(SLC)。
     _WT_META = 17 if fan_wt else 0
     _WT_PAY = 19 if fan_wt else 0
@@ -124,6 +140,7 @@ def _compile_stage1(
     if not isinstance(layout, Stage1ArenaLayout):
         raise TypeError("layout must be Stage1ArenaLayout")
     HIDDEN = int(layout.hidden)
+    A_DTYPE = layout.activation_dtype
     INTER = int(layout.inter)
     EXPERTS = int(layout.experts)
     WORLD = int(layout.world_size)
@@ -134,6 +151,14 @@ def _compile_stage1(
     # Claim G adjacent BM32 tiles per expert; Stage2 retains the BM32 ABI.
     G = int(layout.tile_group)
     GBM = BM * G
+    # CTA width: 4 waves (one per SIMD, up to 512 registers each) or 8 waves
+    # (two per SIMD, <= 256 registers each; GMM1 gives each wave a 32-column
+    # slice over all rows, see _gemm1_body).
+    WAVES = int(waves)
+    THREADS = 64 * WAVES
+    if WAVES not in (4, 8):
+        raise ValueError(f"stage1 waves must be 4 or 8, got {WAVES}")
+    group_ready = bool(group_ready)
     GROUP_ROWS = BM * G
     BN = int(layout.block_n)
     if WORLD != 16 or GPUS_PER_NODE != 8:
@@ -204,7 +229,7 @@ def _compile_stage1(
     # rail_soa 的 SoA 排布(发送端 dispatch_staging[p] 与接收端 remote_dispatch_rx[p] 共用)。
     from .quant import rail_record_layout as _rail_record_layout
 
-    REC_BYTES, REC_Q, REC_S, REC_I, REC_W = _rail_record_layout(HIDDEN, TOPK)
+    REC_BYTES, REC_Q, REC_S, REC_I, REC_W = _rail_record_layout(HIDDEN, TOPK, A_DTYPE)
     RAIL_QPS = 4
     # fanout 按 (dest, shard) 分到 CTA;T0(CCO 收发 + credit + seal)不兼做 dest0 的分片,
     # 所以至少要 2 个分片。
@@ -220,9 +245,8 @@ def _compile_stage1(
     # GMM1 的两条路径由 split_local 选:
     # split:本地来源行(fan1)和远端来源行(fan2)各自计数、各自成组,sealer 分两段封尾:
     #   段 1 在 8 个 local_eos 后封本地组(h1 段基址 0),段 2 在全部 comm_eos 后封远端组。
-    #   early_local_gmm:段 1 封好本地组即发布 h1_local_eos + 物理组表
-    #   gmm1_group_list[本地组..|远端组..];消费者先用本地头领本地 job(与 rail/fan2/段 2 重叠),
-    #   过全局门后再用远端头领远端 job。
+    #   满组在 fanout 期间入队;两段 sealer 分别发布尾组。
+    #   h1_local_eos 保证本地段封尾先于最终置换/远端段封尾。
     #   fan2_shards:每个 dest 只有 fanout_shard < fan2_shards 的 fan CTA 做 fan2(按新步长
     #   分 token),其余 fan CTA 做完 fan1 直接进 GMM1 本地段,把等 rail 的空档让给本地组。
     #   lazy_pad:段 1 不补本地组的尾行就发布 h1_local_eos,改由段 2 的 sealer 补。GMM1 只经
@@ -237,6 +261,13 @@ def _compile_stage1(
     #   封尾按 expert×SPL 线程并行(_seal_pad_par、_seal_perm(par=True))。
     # 两条路径共用:GMM1 按物理组写 h1,封尾额外写逆置换 tile_src_of_dst,stage2 按它间接读 A;
     # rail 发帖 CTA(ticket _POST_LO.._POST_HI)先发帖、不分 fan token。
+    data_send_ctas = int(data_send_ctas)
+    if data_send_ctas not in (0, 32, 64):
+        raise ValueError("data_send_ctas must be 0, 32 or 64")
+    SEND_FIRST = GPUS_PER_NODE * fanout_shards
+    SEND_END = SEND_FIRST + data_send_ctas
+    if data_send_ctas and (WAVES != 8 or SEND_END > worker_blocks):
+        raise ValueError("copy roles require eight waves and a resident grid")
     F2S = int(fan2_shards)
     if F2S and F2S > fanout_shards - 1:
         raise ValueError("fan2_shards must be <= fanout_shards - 1")
@@ -246,7 +277,6 @@ def _compile_stage1(
         if extra_consumers
         else []
     )
-    N_CONSUMERS = worker_blocks - COMPUTE_FIRST + len(_XC)
     # QP q 由 ticket q+1 发帖(T0 不发)。
     _POST_LO, _POST_HI = 1, RAIL_QPS + 1
     # 段 1 放在哪个 fan CTA(ticket = 8*_SEG1_SHARD + local_rank)。dest0 的分片号整体减 1、
@@ -266,28 +296,20 @@ def _compile_stage1(
     dispatch_chunks = layout.dispatch_chunks
     max_route_tiles = layout.max_route_tiles
     max_tiles_per_expert = layout.max_tiles_per_expert
+    GR_N = max_route_tiles // G + 1  # h1_grp_sync words per half (see layout)
     # GMM1 的 N 块宽 = arena 的 block_n(256;128 在实测的每个 shape 上都更慢)。job 数按 GNB 算。
     GBN = BN
     GNB = (2 * INTER) // GBN
 
-    kh_tile = BK // 2
+    kh_tile = BK if A_DTYPE == "fp8" else BK // 2
     k_tiles_total = k_tiles_total_for(HIDDEN, BK)
     # LDS 按 GMM1 实际的 M tiling 算,不是 arena 的 tile 粒度:G>1 时
     # _gemm1_body 以 BM*G 行跑,累加器要 BM*G*BN*4 字节。按 BM 算会
     # 静默写越界(G=2 实测 relL2=1.55)。
     _, _, _, lds_bytes = _bm_constants(GBM, BN, kh_tile, k_tiles_total)
-    # next_claim(只在 early_local_gmm 下):GMM1 体内提前领下一个 job,
-    # 映射好的 job 号经 LDS 信箱(GMM1 LDS 之后多分配的 16B,dword0=job,1=本段上界,2=本段偏移)
-    # 交回领取循环。lead = 在倒数第几个 K 步开头发领位原子。
-    gmm1_next_claim = bool(early_local_gmm)
-    gmm1_next_claim_lead = 2
-    if gmm1_next_claim:
-        assert lds_bytes % 16 == 0
-        assert gmm1_next_claim_lead >= 1
-    NC_MBOX_DW = lds_bytes // 4  # 信箱在全部 GMM1 LDS(A 环/scale/累加器)之后
-    if tile_ready:
-        assert lds_bytes % 16 == 0
-    lds_alloc_bytes = lds_bytes + (16 if (gmm1_next_claim or tile_ready) else 0)
+    assert lds_bytes % 16 == 0
+    NC_MBOX_DW = lds_bytes // 4  # Ready-queue job broadcast after all GEMM1 LDS.
+    lds_alloc_bytes = lds_bytes + 16
     # h1_output_q at mtpr > 4096 passes the i32 byte range: GMM1 then puts each
     # m-block's row offset into the 64-bit base (sizes <= 4096 keep the old ISA).
     H1_ROW_BASE = layout.region("h1_output_q").nbytes // layout.parity_depth >= 1 << 31
@@ -342,9 +364,10 @@ def _compile_stage1(
 
     # 名字只带随 shape / tune 表变化的编译期参数;写死的开关不进名字。
     # split_local 一项代表它那一整套配套开关(early local GMM / fan2 / lazy pad /
-    # extra consumers / next claim,或 seal fast / static g0)。
+    # extra consumers,或并行封尾 / static g0)。
     kernel_name = (
         f"megamoe_stage1_{activation}"
+        + ("_a8w4" if A_DTYPE == "fp8" else "")
         + (
             ""
             if swiglu_limit is None
@@ -356,13 +379,19 @@ def _compile_stage1(
         + (f"_bm{BM}" if BM != 32 else "")
         + (f"_tg{G}" if G != 1 else "")
         + (f"_fos{fanout_shards}" if fanout_shards != 1 else "")
+        + (f"_ds{data_send_ctas}_wtpub" if data_send_ctas else "")
         + ("_slg" if split_local else "_nsl")
+        + (f"_w{WAVES}" if WAVES != 4 else "")
+        + ("_gr" if group_ready else "")
+        + ("_rq_bounded_ac1_mgloop_c1" if ready_q else "")
         # rail 的 CQ 轮询按 CCQE 模式编译
         + ("_ccqe" if _rail_ccqe() else "")
     )
 
-    @flyc.kernel(name=kernel_name, known_block_size=[THREADS, 1, 1])
-    def kernel(
+    # The body is a device function so the single fused kernel can inline it
+    # ahead of stage2 with one shared LDS allocation (``lds_raw``).
+    @flyc.jit
+    def s1_body(
         dev_comm: fx.Int64,
         arena_win: fx.Int64,
         arena_ptr: fx.Int64,
@@ -373,8 +402,10 @@ def _compile_stage1(
         w1q: fx.Int64,
         w1scale: fx.Int64,
         ntokens: fx.Int32,
+        lds_raw=None,
     ):
-        lds_raw = fx.SharedAllocator().allocate(SharedStorage).peek().raw.ptr
+        if const_expr(lds_raw is None):
+            lds_raw = fx.SharedAllocator().allocate(SharedStorage).peek().raw.ptr
         arena_window = cco.Window(arena_win)
         # cco_lsa_ptr(w, peer, off) = winBase + peer*(stride4G<<32) + off:
         # 每次调用都要从 window 结构里重新读两个字段(ATT 里 ~6.5% 的 route 时间)。
@@ -544,6 +575,10 @@ def _compile_stage1(
                     )
                     buffer_ops.buffer_store(fx.Int32(0), _jh_res, fx.Int32(0))
                     buffer_ops.buffer_store(fx.Int32(0), _jh_res, fx.Int32(16))
+                    if const_expr(ready_q):
+                        # word 8 = 就绪队列写入位置,word 9 = 消费者领 job 头。
+                        buffer_ops.buffer_store(fx.Int32(0), _jh_res, fx.Int32(8))
+                        buffer_ops.buffer_store(fx.Int32(0), _jh_res, fx.Int32(9))
                 if ntokens != fx.Int32(MAX_TOKENS):
                     comm.atomic_add_system(error_addr, fx.Int32(1))
             if const_expr(static_g0):
@@ -603,6 +638,31 @@ def _compile_stage1(
                                 ),
                                 tr_e,
                             )
+            if const_expr(ready_q and not tile_ready):
+                # 组到达计数:launch_ready 发布前清零(dispatch 等 dest 的 launch_ready 后才原子加)。
+                rq_done = buffer_ops.create_buffer_resource_from_addr(
+                    local_addr("tile_row_done")
+                )
+                for rq_i in range(tx, fx.Int32(max_route_tiles), fx.Int32(THREADS)):
+                    buffer_ops.buffer_store(fx.Int32(0), rq_done, rq_i)
+            if const_expr(data_send_ctas):
+                js = buffer_ops.create_buffer_resource_from_addr(
+                    local_addr("send_job_state")
+                )
+                if tx < fx.Int32(32):
+                    buffer_ops.buffer_store(fx.Int32(0), js, tx)
+                if tx < fx.Int32(2 * GPUS_PER_NODE):
+                    jd = tx % fx.Int32(GPUS_PER_NODE)
+                    jn = (jd == fx.Int32(0)).select(
+                        fx.Int32(fanout_shards - 1), fx.Int32(fanout_shards)
+                    )
+                    buffer_ops.buffer_store(
+                        jn,
+                        buffer_ops.create_buffer_resource_from_addr(
+                            local_addr("send_join")
+                        ),
+                        tx,
+                    )
             fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
             gpu.barrier()
             if tx == fx.Int32(0):
@@ -645,7 +705,9 @@ def _compile_stage1(
         # a trailing ready value and one flush/doorbell.  The same CTA receives
         # the reciprocal chunk and performs selected-rank proxy fan-out.
         if is_cco:
-            qp = wave
+            # One wave per QP; with more waves than QPs the extra waves repeat
+            # a QP's waits (reads only).
+            qp = wave % fx.Int32(layout.num_qp) if WAVES > layout.num_qp else wave
 
             # credit_async:对端对 g-2(同 parity)那批数据的消费确认改到
             # 这里等 —— 只有覆盖对端同一块 remote_dispatch_rx 之前才需要。
@@ -750,6 +812,64 @@ def _compile_stage1(
                     _peer_addr(dest, "gmm1_job_head") + fx.Int64(16 * 4), fx.Int32(1)
                 )
 
+        def _rq_push(dest, pg):
+            """ready_q:把 dest 上的物理组 pg 追加进它的就绪队列(调用方保证组内数据已落地)。
+            dest=None:本 GPU。"""
+            rq_h = (
+                local_addr("gmm1_job_head")
+                if dest is None
+                else _peer_addr(dest, "gmm1_job_head")
+            )
+            rq_b = (
+                local_addr("gmm1_ready_q")
+                if dest is None
+                else _peer_addr(dest, "gmm1_ready_q")
+            )
+            rq_q = fx.Int32(comm.atomic_add_system(rq_h + fx.Int64(8 * 4), fx.Int32(1)))
+            comm.store_i64_global_system_relaxed(
+                rq_b + fx.Int64(rq_q) * fx.Int64(8),
+                (fx.Int64(generation) << fx.Int64(32)) | fx.Int64(pg),
+            )
+
+        def _rq_entry(addr, valid):
+            # Terminal claims may exceed physical queue capacity, especially
+            # with few N blocks. Clamp the address and mask the generation:
+            # adjacent arena data must never be accepted as a ready group.
+            value = fx.Int64(comm.load_i64_global_system_relaxed(addr))
+            return valid.select(value, fx.Int64(0))
+
+        def _rq_seal_tails(EO):
+            """ready_q 封尾:本类(EO=0 本地 / LE 远端)每个 expert 的不满尾组入队(满组已在
+            dispatch 里入过)。调用方已 acquire 到本类的全部到达(计数为终值)。"""
+            if tx < fx.Int32(LOCAL_EXPERTS):
+                rq_c = buffer_ops.buffer_load(
+                    buffer_ops.create_buffer_resource_from_addr(
+                        local_addr("expert_count")
+                    ),
+                    tx + fx.Int32(EO),
+                    vec_width=1,
+                    dtype=T.i32,
+                )
+                if rq_c % fx.Int32(GROUP_ROWS) != fx.Int32(0):
+                    rq_mi = (tx + fx.Int32(EO)) * fx.Int32(max_tiles_per_expert) + (
+                        rq_c // fx.Int32(GROUP_ROWS)
+                    ) * fx.Int32(G)
+                    _spin(
+                        local_addr("expert_tile_map_ready")
+                        + fx.Int64(rq_mi) * fx.Int64(8),
+                        generation,
+                    )
+                    comm.fence_system_acquire()
+                    rq_pg = buffer_ops.buffer_load(
+                        buffer_ops.create_buffer_resource_from_addr(
+                            local_addr("expert_tile_map")
+                        ),
+                        rq_mi,
+                        vec_width=1,
+                        dtype=T.i32,
+                    ) // fx.Int32(G)
+                    _rq_push(None, rq_pg)
+
         def _alloc_tiles_for(count):
             """一个 expert 实际被分配的 tile 数(向上取整到 G 的倍数)。"""
             n = (count + fx.Int32(BM - 1)) // fx.Int32(BM)
@@ -779,7 +899,6 @@ def _compile_stage1(
             expert_res = buffer_ops.create_buffer_resource_from_addr(
                 _peer_addr(dest, "tile_expert")
             )
-            # tile_row_done/tile_row_base 只有 tile_ready 有读者。
             for j in range_constexpr(G):
                 phys = base + fx.Int32(j)
                 buffer_ops.buffer_store(
@@ -788,7 +907,8 @@ def _compile_stage1(
                 buffer_ops.buffer_store(
                     local_expert, expert_res, phys, cache_modifier=_WT_META
                 )
-            if const_expr(tile_ready and G > 1):
+            if const_expr((tile_ready or ready_q) and G > 1):
+                # ready_q:local_expert 已是本类(本地/远端)内的 expert 号,GMM1 按它取权重。
                 buffer_ops.buffer_store(
                     local_expert,
                     buffer_ops.create_buffer_resource_from_addr(
@@ -797,21 +917,9 @@ def _compile_stage1(
                     base // fx.Int32(G),
                     cache_modifier=_WT_META,
                 )
-            if const_expr(tile_ready):
-                # 组在本 expert 内的序号 k;随下面的 fence 发布。
-                buffer_ops.buffer_store(
-                    (map_index % fx.Int32(max_tiles_per_expert)) // fx.Int32(G),
-                    buffer_ops.create_buffer_resource_from_addr(
-                        _peer_addr(dest, "tile_row_base")
-                    ),
-                    base,
-                    cache_modifier=_WT_META,
-                )
             if const_expr(fan_wt):
                 # 上面全是写穿:等它们完成即对端可见,不必整 L2 写回。
                 fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
-            else:
-                comm.fence_system_release()
             for j in range_constexpr(G):
                 # claim_relaxed:上面一次 fence 已放行 map/tile_expert,G 条 release store 各带一次整 L2 写回。
                 (comm.store_i64_global_system_relaxed)(
@@ -838,8 +946,7 @@ def _compile_stage1(
         _GB_CNT = 16
         _GB_BASE = _GB_CNT + LOCAL_EXPERTS
         _GB_HIT = _GB_BASE + LOCAL_EXPERTS
-        _GB_ROW = _GB_HIT + _GB_NB
-        _GB_PH = _GB_ROW + THREADS
+        _GB_PH = _GB_HIT + _GB_NB
         # meta_opt:本 CTA 在 P2 自己认领的组(组号, 物理基址),解析时不必远端查。
         _GB_OWN = _GB_PH + 2 * LOCAL_EXPERTS
         _GB_OWNB = _GB_OWN + LOCAL_EXPERTS
@@ -849,12 +956,11 @@ def _compile_stage1(
         assert (
             LOCAL_EXPERTS + _GB_NB <= THREADS
         ), "P0 clears HIT with threads [LE, LE+_GB_NB)"
-        assert (
-            _GB_NB <= GROUP_ROWS
-        ), "one batch may cross at most one group head per expert"
+        assert _GB_NB <= GROUP_ROWS, "token batch fits group-sized payload staging"
         assert payload_dwords % 4 == 0
         assert (
-            int(layout.source_capacity) <= max_route_tiles * BM
+            layout.region("grouped_input_scale").nbytes // layout.parity_depth
+            == int(layout.source_capacity) * scale_bytes
         ), "source-major scales must fit the grouped_input_scale region"
 
         def _gb_ptr(idx):
@@ -957,10 +1063,9 @@ def _compile_stage1(
                     head = (
                         (seg + fx.Int32(GROUP_ROWS - 1)) // fx.Int32(GROUP_ROWS)
                     ) * fx.Int32(GROUP_ROWS)
-                    gb_claim = head < seg + n
                     if const_expr(static_g0):
-                        gb_claim = gb_claim & (head >= fx.Int32(GROUP_ROWS))
-                    if gb_claim:
+                        head = (head == fx.Int32(0)).select(fx.Int32(GROUP_ROWS), head)
+                    while head < seg + n:
                         m0 = (tx + fx.Int32(_EO)) * fx.Int32(
                             max_tiles_per_expert
                         ) + head // fx.Int32(BM)
@@ -973,6 +1078,7 @@ def _compile_stage1(
                         )
                         _gb_st(fx.Int32(_GB_OWN) + tx, head // fx.Int32(GROUP_ROWS))
                         _gb_st(fx.Int32(_GB_OWNB) + tx, own_base)
+                        head += fx.Int32(GROUP_ROWS)
             gpu.barrier()
             if const_expr(tile_ready and resv_last is not None):  # noqa: SIM102
                 # P2 的系统原子都已返回(上面的 barrier 前);fan2 最后一批之后不会再有预约。
@@ -1009,7 +1115,8 @@ def _compile_stage1(
                     )
                     _pl.append((prec, ptok, vals, sv))
 
-            _issue_payload_loads()
+            if const_expr(not data_send_ctas):
+                _issue_payload_loads()
             # 每 expert 一个线程解析本批段落 [seg, seg+n) 涉及的至多 2 个组的物理基址
             # (组头认领都已在 P2 完成,这里只等不认领)。逐行的远端 map 读没了。
             # 每 expert 两个线程并发解析(j=0 首组,j=1 末组);末组与首组相同时 j=1 不做。
@@ -1065,6 +1172,21 @@ def _compile_stage1(
                     _gb_ld(fx.Int32(_GB_PH) + le),
                     _gb_ld(fx.Int32(_GB_PH + LOCAL_EXPERTS) + le),
                 )
+                g_end = (
+                    _gb_ld(fx.Int32(_GB_BASE) + le)
+                    + _gb_ld(fx.Int32(_GB_CNT) + le)
+                    - fx.Int32(1)
+                ) // fx.Int32(GROUP_ROWS)
+                if (g_row > g_0) & (g_row < g_end):
+                    pbase = buffer_ops.buffer_load(
+                        buffer_ops.create_buffer_resource_from_addr(
+                            _peer_addr(dest, "expert_tile_map")
+                        ),
+                        (le + fx.Int32(_EO)) * fx.Int32(max_tiles_per_expert)
+                        + g_row * fx.Int32(G),
+                        vec_width=1,
+                        dtype=T.i32,
+                    )
                 grow = (pbase + (row_slot // fx.Int32(BM)) % fx.Int32(G)) * fx.Int32(
                     BM
                 ) + row_slot % fx.Int32(BM)
@@ -1096,76 +1218,38 @@ def _compile_stage1(
                     grow,
                     cache_modifier=_WT_META,
                 )
-            _gb_st(fx.Int32(_GB_ROW) + tx, grow)
-            for prec, ptok, vals, sv in _pl:
-                if _gb_ld(fx.Int32(_GB_HIT) + prec) != fx.Int32(0):
-                    dst_payload = buffer_ops.create_buffer_resource_from_addr(
-                        _peer_addr(dest, "grouped_input_q")
-                        + fx.Int64(src_base + ptok) * fx.Int64(wire.payload_bytes),
-                        num_records_bytes=wire.payload_bytes,
-                    )
-                    for it in range_constexpr(_GB_IT):
-                        d = (lane + fx.Int32(it * 64)) * fx.Int32(4)
-                        if d < fx.Int32(payload_dwords):
-                            buffer_ops.buffer_store(
-                                vals[it], dst_payload, d, cache_modifier=_WT_PAY
-                            )
-                    if lane < fx.Int32(scale_dwords):
-                        buffer_ops.buffer_store(
-                            sv,
-                            buffer_ops.create_buffer_resource_from_addr(
-                                _peer_addr(dest, "grouped_input_scale")
-                                + fx.Int64(src_base + ptok) * fx.Int64(scale_bytes)
-                            ),
-                            lane,
-                            cache_modifier=_WT_PAY,
+            if const_expr(not data_send_ctas):
+                for prec, ptok, vals, sv in _pl:
+                    if _gb_ld(fx.Int32(_GB_HIT) + prec) != fx.Int32(0):
+                        dst_payload = buffer_ops.create_buffer_resource_from_addr(
+                            _peer_addr(dest, "grouped_input_q")
+                            + fx.Int64(src_base + ptok) * fx.Int64(wire.payload_bytes),
+                            num_records_bytes=wire.payload_bytes,
                         )
-            gpu.barrier()
-            # P4:scale 按 (record, 字节) 摊到全 CTA,散写到每条 route 的 BM32 预排布。
-            scale_res = buffer_ops.create_buffer_resource_from_addr(
-                _peer_addr(dest, "grouped_input_scale")
-            )
-            for ps in range_constexpr(0):
-                idx = tx + fx.Int32(ps * THREADS)
-                if idx < fx.Int32(_GB_NB * scale_bytes):
-                    sr = idx // fx.Int32(scale_bytes)
-                    sbyte = idx % fx.Int32(scale_bytes)
-                    stok = tok0 + sr * tstride
-                    stok = (stok < ntokens).select(stok, fx.Int32(0))
-                    scale = buffer_ops.buffer_load(
-                        rs,
-                        stok * fx.Int32(REC_BYTES) + fx.Int32(REC_S) + sbyte,
-                        vec_width=1,
-                        dtype=T.i8,
-                    )
-                    ku = sbyte // fx.Int32(8)
-                    ikxdl = (sbyte % fx.Int32(8)) // fx.Int32(4)
-                    k_lane = sbyte % fx.Int32(4)
-                    for sslot in range_constexpr(TOPK):
-                        s_row = _gb_ld(fx.Int32(_GB_ROW + sslot) + sr * fx.Int32(TOPK))
-                        if s_row >= fx.Int32(0):
-                            s_phys = s_row // fx.Int32(BM)
-                            s_rit = s_row % fx.Int32(BM)
-                            a_sub = s_rit // fx.Int32(32)
-                            a_row = s_rit % fx.Int32(32)
-                            im_a = a_row // fx.Int32(16)
-                            n_lane = a_row % fx.Int32(16)
-                            dst_dword = (
-                                (s_phys * fx.Int32(BM // 32) + a_sub)
-                                * fx.Int32(scale_dwords * 32)
-                                + ku * fx.Int32(64)
-                                + k_lane * fx.Int32(16)
-                                + n_lane
-                            )
+                        for it in range_constexpr(_GB_IT):
+                            d = (lane + fx.Int32(it * 64)) * fx.Int32(4)
+                            if d < fx.Int32(payload_dwords):
+                                buffer_ops.buffer_store(
+                                    vals[it], dst_payload, d, cache_modifier=_WT_PAY
+                                )
+                        if lane < fx.Int32(scale_dwords):
                             buffer_ops.buffer_store(
-                                scale,
-                                scale_res,
-                                dst_dword * fx.Int32(4) + ikxdl * fx.Int32(2) + im_a,
-                                offset_is_bytes=True,
+                                sv,
+                                buffer_ops.create_buffer_resource_from_addr(
+                                    _peer_addr(dest, "grouped_input_scale")
+                                    + fx.Int64(src_base + ptok) * fx.Int64(scale_bytes)
+                                ),
+                                lane,
+                                cache_modifier=_WT_PAY,
                             )
-            if const_expr(tile_ready):
+            if const_expr(not data_send_ctas):
+                gpu.barrier()
+            if const_expr(data_send_ctas):
+                _send_enqueue(tok0, tstride, dest, src_base, remote)
+            elif const_expr(tile_ready or ready_q):
                 # 本批的行元数据/载荷(各 wave 的远端 store)落地后,按组报到达行数。
                 # 段 [seg, seg+n) 至多跨 2 个组(_GB_PH 只解析首/末组,同一前提)。
+                # ready_q:把组凑满(到达 GROUP_ROWS)的那次原子的发起者负责入队。
                 fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
                 gpu.barrier()
                 if tx < fx.Int32(LOCAL_EXPERTS):
@@ -1174,22 +1258,334 @@ def _compile_stage1(
                         tr_seg = _gb_ld(fx.Int32(_GB_BASE) + tx)
                         tr_g0 = tr_seg // fx.Int32(GROUP_ROWS)
                         tr_g1 = (tr_seg + tr_n - fx.Int32(1)) // fx.Int32(GROUP_ROWS)
-                        tr_c0 = (tr_g0 + fx.Int32(1)) * fx.Int32(GROUP_ROWS) - tr_seg
-                        tr_c0 = (tr_c0 < tr_n).select(tr_c0, tr_n)
-                        comm.atomic_add_system(
-                            _peer_addr(dest, "tile_row_done")
-                            + fx.Int64(_gb_ld(fx.Int32(_GB_PH) + tx)) * fx.Int64(4),
-                            tr_c0,
-                        )
-                        if tr_g1 != tr_g0:
-                            comm.atomic_add_system(
-                                _peer_addr(dest, "tile_row_done")
-                                + fx.Int64(
-                                    _gb_ld(fx.Int32(_GB_PH + LOCAL_EXPERTS) + tx)
-                                )
-                                * fx.Int64(4),
-                                tr_n - tr_c0,
+                        tr_group = tr_g0
+                        tr_remaining = tr_n
+                        tr_amount = (tr_g0 + fx.Int32(1)) * fx.Int32(
+                            GROUP_ROWS
+                        ) - tr_seg
+                        while tr_remaining > fx.Int32(0):
+                            tr_amount = (tr_amount < tr_remaining).select(
+                                tr_amount, tr_remaining
                             )
+                            tr_ph = (tr_group == tr_g0).select(
+                                _gb_ld(fx.Int32(_GB_PH) + tx),
+                                _gb_ld(fx.Int32(_GB_PH + LOCAL_EXPERTS) + tx),
+                            )
+                            if (tr_group > tr_g0) & (tr_group < tr_g1):
+                                tr_ph = buffer_ops.buffer_load(
+                                    buffer_ops.create_buffer_resource_from_addr(
+                                        _peer_addr(dest, "expert_tile_map")
+                                    ),
+                                    (tx + fx.Int32(_EO))
+                                    * fx.Int32(max_tiles_per_expert)
+                                    + tr_group * fx.Int32(G),
+                                    vec_width=1,
+                                    dtype=T.i32,
+                                )
+                            tr_old = fx.Int32(
+                                comm.atomic_add_system(
+                                    _peer_addr(dest, "tile_row_done")
+                                    + fx.Int64(tr_ph) * fx.Int64(4),
+                                    tr_amount,
+                                )
+                            )
+                            if const_expr(ready_q):  # noqa: SIM102
+                                if tr_old + tr_amount == fx.Int32(GROUP_ROWS):
+                                    _rq_push(dest, tr_ph // fx.Int32(G))
+                            tr_remaining -= tr_amount
+                            tr_amount = fx.Int32(GROUP_ROWS)
+                            tr_group += fx.Int32(1)
+
+        # Copy roles consume only completed metadata batches. All descriptors
+        # are local and write-through. No map lookup or remote reservation is
+        # allowed in the copy loop. Generation tags avoid per-launch flag clears.
+        SEND_NB = min(THREADS // TOPK, GROUP_ROWS) // WAVES * WAVES
+        SEND_DW = (8 + SEND_NB + 4 * LOCAL_EXPERTS + 15) // 16 * 16
+        SEND_C0 = 8 + SEND_NB
+        SEND_P0 = SEND_C0 + LOCAL_EXPERTS
+        SEND_C1 = SEND_P0 + LOCAL_EXPERTS
+        SEND_P1 = SEND_C1 + LOCAL_EXPERTS
+
+        def _send_join_done(dest, local_only=False):
+            # One pending join counter: producers are registered at launch;
+            # each queued copy registers before publication. Both retire once.
+            # Thus old==1 has one unique owner and cannot race a late enqueue.
+            jo = GPUS_PER_NODE if local_only else 0
+            ja = local_addr("send_join") + fx.Int64(dest + fx.Int32(jo)) * fx.Int64(4)
+            old = fx.Int32(comm.atomic_add_system(ja, fx.Int32(-1)))
+            if old == fx.Int32(1):
+                if const_expr(local_only):
+                    comm.store_i64_global_system_relaxed(
+                        _peer_addr(dest, "comm_eos")
+                        + fx.Int64(GPUS_PER_NODE + local_rank) * fx.Int64(8),
+                        generation,
+                    )
+                else:
+                    for ci in range_constexpr(dispatch_chunks * layout.num_qp):
+                        comm.atomic_add_system(
+                            local_addr("remote_chunk_consumed") + fx.Int64(ci * 4),
+                            fx.Int32(1),
+                        )
+                    comm.store_i64_global_system_relaxed(
+                        _peer_addr(dest, "comm_eos") + fx.Int64(local_rank * 8),
+                        generation,
+                    )
+
+        def _send_enqueue(tok0, stride, dest, src_base, remote):
+            # The metadata batch is fully resolved before registering the copy.
+            # All producers are still registered, so neither join can reach zero.
+            if tx == fx.Int32(0):
+                comm.atomic_add_agent(
+                    local_addr("send_join") + fx.Int64(dest) * fx.Int64(4), fx.Int32(1)
+                )
+                if const_expr(split_local and not remote):
+                    comm.atomic_add_agent(
+                        local_addr("send_join")
+                        + fx.Int64(dest + fx.Int32(GPUS_PER_NODE)) * fx.Int64(4),
+                        fx.Int32(1),
+                    )
+                ji = fx.Int32(
+                    comm.atomic_add_agent(local_addr("send_job_state"), fx.Int32(1))
+                )
+                _gb_st(fx.Int32(0), ji)
+            gpu.barrier()
+            ji = _gb_ld(fx.Int32(0))
+            dr = buffer_ops.create_buffer_resource_from_addr(
+                local_addr("send_job_desc") + fx.Int64(ji) * fx.Int64(SEND_DW * 4),
+                num_records_bytes=SEND_DW * 4,
+            )
+            if tx == fx.Int32(0):
+                for di, dv in enumerate(
+                    [tok0, stride, dest, fx.Int32(int(remote)), src_base]
+                ):
+                    buffer_ops.buffer_store(
+                        dv, dr, fx.Int32(di), cache_modifier=_WT_META
+                    )
+            if tx < fx.Int32(SEND_NB):
+                hv = fx.Int32(0)
+                if tx < fx.Int32(_GB_NB):
+                    hv = _gb_ld(fx.Int32(_GB_HIT) + tx)
+                buffer_ops.buffer_store(
+                    hv, dr, fx.Int32(8) + tx, cache_modifier=_WT_META
+                )
+            if tx < fx.Int32(LOCAL_EXPERTS):
+                n = _gb_ld(fx.Int32(_GB_CNT) + tx)
+                c0 = fx.Int32(0)
+                c1 = fx.Int32(0)
+                p0 = fx.Int32(0)
+                p1 = fx.Int32(0)
+                if n > fx.Int32(0):
+                    seg = _gb_ld(fx.Int32(_GB_BASE) + tx)
+                    g0 = seg // fx.Int32(GROUP_ROWS)
+                    c0 = (g0 + fx.Int32(1)) * fx.Int32(GROUP_ROWS) - seg
+                    c0 = (c0 < n).select(c0, n)
+                    c1 = n - c0
+                    p0 = _gb_ld(fx.Int32(_GB_PH) + tx)
+                    if c1 > fx.Int32(0):
+                        p1 = _gb_ld(fx.Int32(_GB_PH + LOCAL_EXPERTS) + tx)
+                    if c1 > fx.Int32(GROUP_ROWS):
+                        # Negative C1 denotes multiple following groups. P1 is
+                        # their first logical map index; all maps are published.
+                        # Positive C1 retains the original count/physical pair.
+                        c1 = -c1
+                        p1 = (
+                            tx
+                            + fx.Int32(LOCAL_EXPERTS if split_local and remote else 0)
+                        ) * fx.Int32(max_tiles_per_expert) + (
+                            g0 + fx.Int32(1)
+                        ) * fx.Int32(
+                            G
+                        )
+                for di, dv in [
+                    (SEND_C0, c0),
+                    (SEND_P0, p0),
+                    (SEND_C1, c1),
+                    (SEND_P1, p1),
+                ]:
+                    buffer_ops.buffer_store(
+                        dv, dr, fx.Int32(di) + tx, cache_modifier=_WT_META
+                    )
+            # Covers every metadata and descriptor writer, before ready release.
+            fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
+            gpu.barrier()
+            if tx == fx.Int32(0):
+                # All descriptor and row metadata stores are system write-through
+                # and every writer drained before the CTA barrier above. Publish
+                # readiness without flushing unrelated GEMM1 lines from this L2.
+                comm.store_i64_global_system_relaxed(
+                    local_addr("send_job_ready") + fx.Int64(ji) * fx.Int64(8),
+                    generation,
+                )
+
+        def _send_copy_jobs():
+            go = fx.Int32(1) == fx.Int32(1)
+            while go:
+                if tx == fx.Int32(0):
+                    ji = fx.Int32(
+                        comm.atomic_add_agent(
+                            local_addr("send_job_state") + fx.Int64(4), fx.Int32(1)
+                        )
+                    )
+                    ready_a = local_addr("send_job_ready") + fx.Int64(ji) * fx.Int64(8)
+                    rv = fx.Int64(comm.load_i64_global_system_relaxed(ready_a))
+                    ev = fx.Int64(
+                        comm.load_i64_global_system_relaxed(local_addr("send_job_eos"))
+                    )
+                    while (rv < generation) & (ev < generation):
+                        _mlir_rocdl.s_sleep(16)
+                        rv = fx.Int64(comm.load_i64_global_system_relaxed(ready_a))
+                        ev = fx.Int64(
+                            comm.load_i64_global_system_relaxed(
+                                local_addr("send_job_eos")
+                            )
+                        )
+                    comm.fence_system_acquire()
+                    total = fx.Int32(_pl32(local_addr("send_job_state")))
+                    live = (rv >= generation) | (ji < total)
+                    if live:
+                        dr = buffer_ops.create_buffer_resource_from_addr(
+                            local_addr("send_job_desc")
+                            + fx.Int64(ji) * fx.Int64(SEND_DW * 4),
+                            num_records_bytes=SEND_DW * 4,
+                        )
+                        for di in range_constexpr(5):
+                            _gb_st(
+                                fx.Int32(di + 1),
+                                buffer_ops.buffer_load(
+                                    dr, fx.Int32(di), vec_width=1, dtype=T.i32
+                                ),
+                            )
+                    _gb_st(fx.Int32(0), live.select(ji, fx.Int32(-1)))
+                gpu.barrier()
+                ji = _gb_ld(fx.Int32(0))
+                go = ji >= fx.Int32(0)
+                if go:
+                    tok0 = _gb_ld(fx.Int32(1))
+                    stride = _gb_ld(fx.Int32(2))
+                    dest = _gb_ld(fx.Int32(3))
+                    remote = _gb_ld(fx.Int32(4))
+                    src_base = _gb_ld(fx.Int32(5))
+                    dr = buffer_ops.create_buffer_resource_from_addr(
+                        local_addr("send_job_desc")
+                        + fx.Int64(ji) * fx.Int64(SEND_DW * 4),
+                        num_records_bytes=SEND_DW * 4,
+                    )
+                    rs = buffer_ops.create_buffer_resource_from_addr(
+                        (remote != fx.Int32(0)).select(
+                            local_addr("remote_dispatch_rx"), x_q
+                        )
+                    )
+                    # Wave-uniform live mask skips every inactive payload row.
+                    # No CTA barrier, atomic, map wait or acquire inside copies.
+                    for rr in range_constexpr(SEND_NB // WAVES):
+                        prec = wave + fx.Int32(rr * WAVES)
+                        hit = buffer_ops.buffer_load(
+                            dr, fx.Int32(8) + prec, vec_width=1, dtype=T.i32
+                        )
+                        ptok = tok0 + prec * stride
+                        if hit != fx.Int32(0):
+                            q0 = ptok * fx.Int32(REC_BYTES // 4) + fx.Int32(REC_Q // 4)
+                            vals = []
+                            for it in range_constexpr(_GB_IT):
+                                d = (lane + fx.Int32(it * 64)) * fx.Int32(4)
+                                dc = (d < fx.Int32(payload_dwords)).select(
+                                    d, fx.Int32(0)
+                                )
+                                vals.append(
+                                    buffer_ops.buffer_load(
+                                        rs, q0 + dc, vec_width=4, dtype=T.i32
+                                    )
+                                )
+                            sv = buffer_ops.buffer_load(
+                                rs,
+                                ptok * fx.Int32(REC_BYTES // 4)
+                                + fx.Int32(REC_S // 4)
+                                + (lane < fx.Int32(scale_dwords)).select(
+                                    lane, fx.Int32(0)
+                                ),
+                                vec_width=1,
+                                dtype=T.i32,
+                            )
+                            pay = buffer_ops.create_buffer_resource_from_addr(
+                                _peer_addr(dest, "grouped_input_q")
+                                + fx.Int64(src_base + ptok)
+                                * fx.Int64(wire.payload_bytes),
+                                num_records_bytes=wire.payload_bytes,
+                            )
+                            for it in range_constexpr(_GB_IT):
+                                d = (lane + fx.Int32(it * 64)) * fx.Int32(4)
+                                if d < fx.Int32(payload_dwords):
+                                    buffer_ops.buffer_store(
+                                        vals[it], pay, d, cache_modifier=_WT_PAY
+                                    )
+                            if lane < fx.Int32(scale_dwords):
+                                buffer_ops.buffer_store(
+                                    sv,
+                                    buffer_ops.create_buffer_resource_from_addr(
+                                        _peer_addr(dest, "grouped_input_scale")
+                                        + fx.Int64(src_base + ptok)
+                                        * fx.Int64(scale_bytes)
+                                    ),
+                                    lane,
+                                    cache_modifier=_WT_PAY,
+                                )
+                    fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
+                    gpu.barrier()
+                    if tx < fx.Int32(LOCAL_EXPERTS):
+                        for ci, pi in [(SEND_C0, SEND_P0), (SEND_C1, SEND_P1)]:
+                            cnt = buffer_ops.buffer_load(
+                                dr, fx.Int32(ci) + tx, vec_width=1, dtype=T.i32
+                            )
+                            if cnt > fx.Int32(0):
+                                ph = buffer_ops.buffer_load(
+                                    dr, fx.Int32(pi) + tx, vec_width=1, dtype=T.i32
+                                )
+                                old = fx.Int32(
+                                    comm.atomic_add_system(
+                                        _peer_addr(dest, "tile_row_done")
+                                        + fx.Int64(ph) * fx.Int64(4),
+                                        cnt,
+                                    )
+                                )
+                                if old + cnt == fx.Int32(GROUP_ROWS):
+                                    _rq_push(dest, ph // fx.Int32(G))
+                            if const_expr(ci == SEND_C1):  # noqa: SIM102
+                                if cnt < fx.Int32(0):
+                                    logical = buffer_ops.buffer_load(
+                                        dr, fx.Int32(pi) + tx, vec_width=1, dtype=T.i32
+                                    )
+                                    remaining = -cnt
+                                    while remaining > fx.Int32(0):
+                                        amount = (
+                                            remaining < fx.Int32(GROUP_ROWS)
+                                        ).select(remaining, fx.Int32(GROUP_ROWS))
+                                        ph = buffer_ops.buffer_load(
+                                            buffer_ops.create_buffer_resource_from_addr(
+                                                _peer_addr(dest, "expert_tile_map")
+                                            ),
+                                            logical,
+                                            vec_width=1,
+                                            dtype=T.i32,
+                                        )
+                                        old = fx.Int32(
+                                            comm.atomic_add_system(
+                                                _peer_addr(dest, "tile_row_done")
+                                                + fx.Int64(ph) * fx.Int64(4),
+                                                amount,
+                                            )
+                                        )
+                                        if old + amount == fx.Int32(GROUP_ROWS):
+                                            _rq_push(dest, ph // fx.Int32(G))
+                                        remaining -= amount
+                                        logical += fx.Int32(G)
+                    # Join only after every publication and RX read has retired.
+                    fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
+                    gpu.barrier()
+                    if tx == fx.Int32(0):
+                        if const_expr(split_local):  # noqa: SIM102
+                            if remote == fx.Int32(0):
+                                _send_join_done(dest, True)
+                        _send_join_done(dest)
 
         # early_local_gmm:封尾的 pad/组表按 expert×SPL 线程并行(原来每 expert 一个线程串行,
         # F8T2 段 1 pad ~12µs、组表+发布 ~11µs,且在本地 GMM1 的关键路径上)。
@@ -1422,74 +1818,6 @@ def _compile_stage1(
                             buffer_ops.buffer_store(pe, group_e_res, head_group)
                     run_base = run_base + my_tiles
 
-        def _seal_group_list(EO, base_segs, rev=False):
-            """early_local_gmm:把 expert_count[EO:EO+LE] 这一类的物理组号(组首物理 tile // G)
-            按 expert 顺序写进 gmm1_group_list;base_segs 的组数之和是本段起点(远端段接在本地段后)。
-            rev:按 expert 倒序排(远端段用;本地段最后读的权重还在 MALL 里)。"""
-            counts_res = buffer_ops.create_buffer_resource_from_addr(
-                local_addr("expert_count")
-            )
-            if tx < fx.Int32(LOCAL_EXPERTS * SPL):
-                ge = tx // fx.Int32(SPL)
-                gl = tx - ge * fx.Int32(SPL)
-                my_base = fx.Int32(0)
-                for bi in range_constexpr(len(base_segs)):
-                    for e in range_constexpr(LOCAL_EXPERTS):
-                        my_base = my_base + _alloc_tiles_for(
-                            buffer_ops.buffer_load(
-                                counts_res,
-                                fx.Int32(base_segs[bi] + e),
-                                vec_width=1,
-                                dtype=T.i32,
-                            )
-                        ) // fx.Int32(G)
-                for e in range_constexpr(LOCAL_EXPERTS):
-                    my_base = my_base + (
-                        (fx.Int32(e) > ge) if rev else (fx.Int32(e) < ge)
-                    ).select(
-                        _alloc_tiles_for(
-                            buffer_ops.buffer_load(
-                                counts_res, fx.Int32(EO + e), vec_width=1, dtype=T.i32
-                            )
-                        )
-                        // fx.Int32(G),
-                        fx.Int32(0),
-                    )
-                gl_map = buffer_ops.create_buffer_resource_from_addr(
-                    local_addr("expert_tile_map")
-                )
-                gl_list = buffer_ops.create_buffer_resource_from_addr(
-                    local_addr("gmm1_group_list")
-                )
-                gl_egrp = (
-                    buffer_ops.create_buffer_resource_from_addr(
-                        local_addr("tile_expert_group")
-                    )
-                    if G > 1
-                    else None
-                )
-                gl_map0 = (ge + fx.Int32(EO)) * fx.Int32(max_tiles_per_expert)
-                gl_groups = _alloc_tiles_for(
-                    buffer_ops.buffer_load(
-                        counts_res, ge + fx.Int32(EO), vec_width=1, dtype=T.i32
-                    )
-                ) // fx.Int32(G)
-                for gl_j in range(gl, gl_groups, fx.Int32(SPL)):
-                    gl_mi = gl_map0 + gl_j * fx.Int32(G)
-                    _spin(
-                        local_addr("expert_tile_map_ready")
-                        + fx.Int64(gl_mi) * fx.Int64(8),
-                        generation,
-                    )
-                    gl_grp = buffer_ops.buffer_load(
-                        gl_map, gl_mi, vec_width=1, dtype=T.i32
-                    ) // fx.Int32(G)
-                    buffer_ops.buffer_store(gl_grp, gl_list, my_base + gl_j)
-                    # GMM1 按 tile_expert_group[物理组] 取权重;本地组要在段 2 置换之前就能算,
-                    # 所以这里先写(段 2 的 _seal_perm 会写同一个值)。
-                    if const_expr(G > 1):
-                        buffer_ops.buffer_store(ge, gl_egrp, gl_grp)
-
         def _seal_seg1():
             """split_local 段 1:等 8 个 local_eos(本 node 全部来源的 fan1 推完),补齐本地组,
             写本地段 tile 数(以及 early_local_gmm 的本地组表 + h1_local_eos)。
@@ -1529,8 +1857,8 @@ def _compile_stage1(
                     ),
                     fx.Int32(1),
                 )
-            if const_expr(early_local_gmm):
-                _seal_group_list(0, ())
+            if const_expr(ready_q):
+                _rq_seal_tails(0)
             fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
             gpu.barrier()
             if const_expr(early_local_gmm):  # noqa: SIM102
@@ -1590,22 +1918,25 @@ def _compile_stage1(
                 fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
                 gpu.barrier()
                 if tx == fx.Int32(0):
-                    _ldone = (
-                        local_addr("fanout_shard_done")
-                        + fx.Int64(GPUS_PER_NODE * 4)
-                        + fx.Int64(dest) * fx.Int64(4)
-                    )
-                    _lprev = fx.Int32(
-                        comm.atomic_add_system_acq_rel(_ldone, fx.Int32(1))
-                    )
-                    if _lprev + fx.Int32(1) == fan_stride:
-                        comm.atomic_add_agent(_ldone, fx.Int32(0) - fan_stride)
-                        comm.fence_system_release()
-                        (comm.store_i64_global_system_relaxed)(
-                            _peer_addr(dest, "comm_eos")
-                            + fx.Int64((GPUS_PER_NODE + local_rank) * 8),
-                            generation,
+                    if const_expr(data_send_ctas):
+                        _send_join_done(dest, True)
+                    else:
+                        _ldone = (
+                            local_addr("fanout_shard_done")
+                            + fx.Int64(GPUS_PER_NODE * 4)
+                            + fx.Int64(dest) * fx.Int64(4)
                         )
+                        _lprev = fx.Int32(
+                            comm.atomic_add_system_acq_rel(_ldone, fx.Int32(1))
+                        )
+                        if _lprev + fx.Int32(1) == fan_stride:
+                            comm.atomic_add_agent(_ldone, fx.Int32(0) - fan_stride)
+                            comm.fence_system_release()
+                            (comm.store_i64_global_system_relaxed)(
+                                _peer_addr(dest, "comm_eos")
+                                + fx.Int64((GPUS_PER_NODE + local_rank) * 8),
+                                generation,
+                            )
             if const_expr(early_local_gmm):  # noqa: SIM102
                 # Seal local groups after intra-node fanout; this does not wait
                 # for remote fanout and stays outside the rail-post pool.
@@ -1666,65 +1997,89 @@ def _compile_stage1(
             # remote_chunk_consumed:这三者都描述「本 dest 的全部 record
             # 都推完了」,而 k1 只推完了本地来源那一半。
             if tx == fx.Int32(0):
-                # 每个 dest 的最后一个分片才发 EOS 和信用原子:
-                # remote_chunk_consumed 的每个字必须恰好累到
-                # GPUS_PER_NODE,分片不能各加一次。用减法复位
-                # (和 stage2 到达协议同一手法),不依赖下一代的清零。
-                # 本分片所有远端写(上面已 drain+barrier)经这条
-                # system release RMW 发布;最后到达者经它的
-                # acquire 看到全部分片,再由下面的 release 传给 comm_eos。
-                # fan_wt:本分片的远端写都是写穿且已在上面 s_waitcnt(0) 完成,
-                # 不需要 release 的整 L2 写回;读端仍在看到 comm_eos 后 acquire。
-                _prev = fx.Int32(
-                    (
-                        comm.atomic_add_system
-                        if fan_wt
-                        else comm.atomic_add_system_acq_rel
-                    )(
-                        local_addr("fanout_shard_done") + fx.Int64(dest) * fx.Int64(4),
-                        fx.Int32(1),
+                if const_expr(data_send_ctas):
+                    _send_join_done(dest)
+                    mp = fx.Int32(
+                        comm.atomic_add_agent(
+                            local_addr("send_job_state") + fx.Int64(8), fx.Int32(1)
+                        )
                     )
-                )
-                _publish = _prev + fx.Int32(1) == fan_stride
-                if _publish:
-                    comm.atomic_add_agent(
-                        local_addr("fanout_shard_done") + fx.Int64(dest) * fx.Int64(4),
-                        fx.Int32(0) - fan_stride,
-                    )
-                if _publish:
-                    if const_expr(lite_sync):
-                        # 上面 acq_rel RMW 的 release 已放行本 CTA 的写,acquire 已看到其它分片;
-                        # consumed 只被本 GPU 的 T0 读(system load + acquire fence),fan 读 rx 已在
-                        # s_waitcnt(0) 完成,credit 与之无竞争 ⇒ relaxed 原子即可。
-                        for consume_index in range_constexpr(
-                            dispatch_chunks * layout.num_qp
-                        ):
-                            comm.atomic_add_system(
-                                local_addr("remote_chunk_consumed")
-                                + fx.Int64(consume_index * 4),
-                                fx.Int32(1),
-                            )
-                    else:
+                    if mp + fx.Int32(1) == fx.Int32(SEND_FIRST - 1):
                         comm.fence_system_release()
-                        for consume_index in range_constexpr(
-                            dispatch_chunks * layout.num_qp
-                        ):
-                            comm.atomic_add_system_acq_rel(
-                                local_addr("remote_chunk_consumed")
-                                + fx.Int64(consume_index * 4),
-                                fx.Int32(1),
-                            )
-                    (comm.store_i64_global_system_relaxed)(
-                        _peer_addr(dest, "comm_eos") + fx.Int64(local_rank) * 8,
-                        generation,
+                        comm.store_i64_global_system_relaxed(
+                            local_addr("send_job_eos"), generation
+                        )
+                else:
+                    # 每个 dest 的最后一个分片才发 EOS 和信用原子:
+                    # remote_chunk_consumed 的每个字必须恰好累到
+                    # GPUS_PER_NODE,分片不能各加一次。用减法复位
+                    # (和 stage2 到达协议同一手法),不依赖下一代的清零。
+                    # 本分片所有远端写(上面已 drain+barrier)经这条
+                    # system release RMW 发布;最后到达者经它的
+                    # acquire 看到全部分片,再由下面的 release 传给 comm_eos。
+                    # fan_wt:本分片的远端写都是写穿且已在上面 s_waitcnt(0) 完成,
+                    # 不需要 release 的整 L2 写回;读端仍在看到 comm_eos 后 acquire。
+                    _prev = fx.Int32(
+                        (
+                            comm.atomic_add_system
+                            if fan_wt
+                            else comm.atomic_add_system_acq_rel
+                        )(
+                            local_addr("fanout_shard_done")
+                            + fx.Int64(dest) * fx.Int64(4),
+                            fx.Int32(1),
+                        )
                     )
+                    _publish = _prev + fx.Int32(1) == fan_stride
+                    if _publish:
+                        comm.atomic_add_agent(
+                            local_addr("fanout_shard_done")
+                            + fx.Int64(dest) * fx.Int64(4),
+                            fx.Int32(0) - fan_stride,
+                        )
+                    if _publish:
+                        if const_expr(lite_sync):
+                            # 上面 acq_rel RMW 的 release 已放行本 CTA 的写,acquire 已看到其它分片;
+                            # consumed 只被本 GPU 的 T0 读(system load + acquire fence),fan 读 rx 已在
+                            # s_waitcnt(0) 完成,credit 与之无竞争 ⇒ relaxed 原子即可。
+                            for consume_index in range_constexpr(
+                                dispatch_chunks * layout.num_qp
+                            ):
+                                comm.atomic_add_system(
+                                    local_addr("remote_chunk_consumed")
+                                    + fx.Int64(consume_index * 4),
+                                    fx.Int32(1),
+                                )
+                        else:
+                            comm.fence_system_release()
+                            for consume_index in range_constexpr(
+                                dispatch_chunks * layout.num_qp
+                            ):
+                                comm.atomic_add_system_acq_rel(
+                                    local_addr("remote_chunk_consumed")
+                                    + fx.Int64(consume_index * 4),
+                                    fx.Int32(1),
+                                )
+                        (comm.store_i64_global_system_relaxed)(
+                            _peer_addr(dest, "comm_eos") + fx.Int64(local_rank) * 8,
+                            generation,
+                        )
+
+        if const_expr(data_send_ctas):  # noqa: SIM102
+            if (ticket >= fx.Int32(SEND_FIRST)) & (ticket < fx.Int32(SEND_END)):
+                _send_copy_jobs()
 
         # The CCO CTA is also destination role zero, so delayed-credit progress
         # must run only after the common is_comm path above has contributed its
         # own consumed count. Otherwise the scoreboard can reach only seven.
 
         if is_cco:
-            qp = wave
+            # One wave per QP posts its credits (a QP has one poster); the extra
+            # waves of an 8-wave CTA only join the waits and barriers.
+            qp = wave % fx.Int32(layout.num_qp) if WAVES > layout.num_qp else wave
+            qp_poster = (
+                (wave < fx.Int32(layout.num_qp)) if WAVES > layout.num_qp else None
+            )
             for chunk in range(fx.Int32(0), fx.Int32(dispatch_chunks), fx.Int32(1)):
                 # Do not credit a chunk until every destination fanout role has
                 # consumed its reciprocal payload.
@@ -1748,25 +2103,47 @@ def _compile_stage1(
                 credit_byte = window_off("remote_chunk_credit") + fx.Int64(
                     consume_index
                 ) * fx.Int64(8)
-                _rail.put_value(
-                    dev_comm,
-                    qp,
-                    fx.Int32(remote_node),
-                    arena_win,
-                    credit_byte,
-                    generation,
-                    aggregate=True,
-                )
-                # Ring per chunk so the peer sees each credit as soon as it is
-                # earned; nothing here needs our own completion, so reap only
-                # the last request (one QP completes in order).
-                credit_req = _rail.flush_async(
-                    dev_comm,
-                    qp,
-                    fx.Int32(remote_node),
-                )
-                if chunk == fx.Int32(dispatch_chunks - 1):
-                    _rail.wait(dev_comm, qp, credit_req)
+                if const_expr(WAVES <= layout.num_qp):
+                    _rail.put_value(
+                        dev_comm,
+                        qp,
+                        fx.Int32(remote_node),
+                        arena_win,
+                        credit_byte,
+                        generation,
+                        aggregate=True,
+                    )
+                    # Ring per chunk so the peer sees each credit as soon as it is
+                    # earned; nothing here needs our own completion, so reap only
+                    # the last request (one QP completes in order).
+                    credit_req = _rail.flush_async(
+                        dev_comm,
+                        qp,
+                        fx.Int32(remote_node),
+                    )
+                    if chunk == fx.Int32(dispatch_chunks - 1):
+                        _rail.wait(dev_comm, qp, credit_req)
+                else:
+                    if qp_poster:
+                        _rail.put_value(
+                            dev_comm,
+                            qp,
+                            fx.Int32(remote_node),
+                            arena_win,
+                            credit_byte,
+                            generation,
+                            aggregate=True,
+                        )
+                        # Ring per chunk so the peer sees each credit as soon as it is
+                        # earned; nothing here needs our own completion, so reap only
+                        # the last request (one QP completes in order).
+                        credit_req_w = _rail.flush_async(
+                            dev_comm,
+                            qp,
+                            fx.Int32(remote_node),
+                        )
+                        if chunk == fx.Int32(dispatch_chunks - 1):
+                            _rail.wait(dev_comm, qp, credit_req_w)
 
         # The role targeting this rank observes exactly eight EOS values; each
         # one covers a local source rank and its aligned remote source rank.
@@ -1816,16 +2193,12 @@ def _compile_stage1(
             # deep and this costs no LDS and no extra barrier.
             if const_expr(split_local):
                 _seal_perm((0, LOCAL_EXPERTS), (), tiles, False)
-                if const_expr(early_local_gmm):
-                    _seal_group_list(LOCAL_EXPERTS, (0,), False)
+                if const_expr(ready_q):
+                    _rq_seal_tails(LOCAL_EXPERTS)
             else:
                 _seal_perm((0,), (), tiles, False, par=True)
             fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
             gpu.barrier()
-            # GMM1 的一个 m_block 覆盖 G 个物理 tile,所以作业数按组算。
-            total_jobs = (tiles // fx.Int32(G)) * fx.Int32(GNB)
-            # 非 pipeline 的 GMM1 按 tile_alloc 闭式跨步取作业,不读
-            # h1_ready_queue / h1_ready_queue_generation,不再逐 job 写它们。
             fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
             gpu.barrier()
             if tx == fx.Int32(0):
@@ -1842,10 +2215,7 @@ def _compile_stage1(
                     local_addr("h1_queue_eos"), generation
                 )
 
-        def _run_gemm1_job(job, nc=None):
-            # nc = (领位头地址, 本段上界, 本段偏移):GMM1 体内提前领下一个 job(next_claim)。
-            # gemm1 rev: 3-stage A, 2-ahead DMA, wait_lds_barrier(vmcnt 24), ascale_gather v2, BN128 v2, lds alias scopes v1, epi acc pad4 v2, nofence barrier v1, next_claim v1, env-free v1, aqout_row_base v1(改 gemm1.py 时改这行,
-            # 否则 flydsl 缓存 key 不变、继续跑旧 GMM1)
+        def _run_gemm1_job(job):
             _gemm1_body(
                 lds_raw,
                 local_addr("grouped_input_q"),
@@ -1860,17 +2230,10 @@ def _compile_stage1(
                 local_addr("tile_row_input"),
                 local_addr("h1_output_q"),
                 local_addr("h1_output_scale"),
-                x_q,
                 job,
                 lane,
                 wave,
                 fx.Int32(layout.source_capacity),
-                fx.Int32(max_route_tiles // G),
-                fx.Int64(0),  # arg_tile_perm: unused by GMM1
-                nc[0] if nc is not None else fx.Int64(0),
-                local_addr("gmm1_group_list") if nc is not None else fx.Int64(0),
-                nc[1] if nc is not None else fx.Int32(0),
-                nc[2] if nc is not None else fx.Int32(0),
                 BM=GBM,
                 BN=GBN,
                 BK=BK,
@@ -1882,11 +2245,34 @@ def _compile_stage1(
                 # Match fused_moe's FlyDSL defaults and the Kimi K3 reference.
                 situ_beta=1.0,
                 situ_linear_beta=1.0,
-                next_claim=nc is not None,
-                next_claim_lds_dw=NC_MBOX_DW,
-                next_claim_lead=gmm1_next_claim_lead,
+                NW=WAVES,
                 aqout_row_base=H1_ROW_BASE,
+                h1_wt=group_ready,
+                a_dtype=A_DTYPE,
             )
+            if const_expr(group_ready):
+                # Every wave's write-through h1 stores retired, then one count
+                # per job; the group's last job publishes the generation.
+                fx.rocdl.s_waitcnt(vmcnt=0)
+                gpu.barrier()
+                if tx == fx.Int32(0):
+                    gr_g = job // fx.Int32(GNB)
+                    gr_sync = local_addr("h1_grp_sync")
+                    gr_old = fx.Int32(
+                        comm.atomic_add_agent(
+                            gr_sync + fx.Int64(gr_g) * fx.Int64(4), fx.Int32(1)
+                        )
+                    )
+                    if gr_old == fx.Int32(GNB - 1):
+                        # Relaxed: the other jobs' h1 stores retired write-through
+                        # before their counts; no L2 write-back is needed.
+                        comm.store_i32_global_system_relaxed(
+                            gr_sync + fx.Int64(gr_g) * fx.Int64(4), fx.Int32(0)
+                        )
+                        comm.store_i32_global_system_relaxed(
+                            gr_sync + fx.Int64(gr_g + fx.Int32(GR_N)) * fx.Int64(4),
+                            fx.Int32(generation),
+                        )
 
         # GMM1 consumers.
         # GMM1 消费者本来只有 ticket >= ESSENTIAL_CTAS 的 120 个,8 个 comm
@@ -1898,435 +2284,152 @@ def _compile_stage1(
         for _xt in _XC:
             is_compute = is_compute | (ticket == fx.Int32(_xt))
         if is_compute:
-            if const_expr(early_local_gmm):
-                # F5:两段动态领 job。本地段:过 h1_local_eos(段 1 发布,只依赖 node 内 fan1)
-                # 后用本地头领 [0, 本地组数*GNB);远端段:过 h1_queue_eos 后用远端头领
-                # [0, 远端组数*GNB),组号表偏移本地组数。各段越界的那次领取直接丢弃。
-                # 领取都在看到对应门之后,初始化者的清零经 launch_ready→fan1→comm_eos→
-                # 段 1 的链先行。门口一律 s_sleep 退避(F4:无退避的轮询把封尾拖慢 5x)。
-                # 槽:3=过本地门 5=本地段做完 6=过全局门(4 由下面的原收尾写)。
-                el_sl = 127
-                el_scr = fx.recast_iter(fx.Int32, lds_raw)
-                el_view = fx.make_view(el_scr, fx.make_layout(1, 1))
-                el_list = buffer_ops.create_buffer_resource_from_addr(
-                    local_addr("gmm1_group_list")
-                )
-                if tx == fx.Int32(0):
-                    (comm.spin_until_ge_i64_sleep_rx)(
-                        local_addr("h1_local_eos"), generation, el_sl
-                    )
-                _cta_acquire()
-                if const_expr(gmm1_next_claim):
-                    # 首领(过门后,不能提前):tx0 领位 + 本段上界 + 组表映射,写信箱。
-                    # 之后每个 job 的下一领在 GMM1 体内发,job 后那一把 barrier 同时
-                    # 发布信箱,省掉循环顶的 barrier + 领位 + 广播 barrier。
-                    el_mbox = fx.add_offset(el_scr, NC_MBOX_DW)  # 按元素(i32)计
-                    el_mview = fx.make_view(el_mbox, fx.make_layout(2, 1))
+            if const_expr(ready_q and not split_local):  # noqa: SIM102
+                # 不 split:预约终值(各来源 fan CTA 的 P2 全部完成)后 expert_count 是终值,
+                # 消费者 0 给每个 expert 的尾组(static_g0 下 0 行的 expert 是整组 pad)补上缺的行数。
+                # 补差额与到达计数加在同一个字上,恰好凑满 GROUP_ROWS 的那次原子负责入队;
+                # 尾行的 tile_row_* 由 sealer 稍后补齐(GMM1 只经带界的 tile_row_input 取 A,
+                # pad 行算出的 h1 被 stage2 按 INVALID_SOURCE/权重 0 丢掉)。
+                if ticket == fx.Int32(COMPUTE_FIRST):
                     if tx == fx.Int32(0):
-                        el_nj = fx.Int32(
-                            comm.atomic_add_agent(
-                                local_addr("gmm1_job_head"), fx.Int32(1)
-                            )
+                        pd_rf = fx.Int32(
+                            _pl32(local_addr("gmm1_job_head") + fx.Int64(16 * 4))
                         )
-                        el_nn = (
-                            fx.Int32(
-                                comm.load_i32_global_system(
-                                    local_addr("tile_alloc") + fx.Int64(4)
-                                )
-                            )
-                            // fx.Int32(G)
-                        ) * fx.Int32(GNB)
-                        el_nv = el_nj < el_nn
-                        el_ng = el_nv.select(el_nj // fx.Int32(GNB), fx.Int32(0))
-                        el_np = buffer_ops.buffer_load(
-                            el_list, el_ng, vec_width=1, dtype=T.i32
-                        )
-                        fx.ptr_store(
-                            Vec.from_elements(
-                                [
-                                    el_nv.select(
-                                        el_np * fx.Int32(GNB)
-                                        + el_nj
-                                        - el_ng * fx.Int32(GNB),
-                                        fx.Int32(-1),
-                                    ),
-                                    el_nn,
-                                ],
-                                fx.Int32,
-                            ),
-                            el_mbox,
-                        )
-                    gpu.barrier()
-                    el_nbound = fx.Int32(
-                        rocdl.readfirstlane(T.i32, fx.Int32(Vec(el_mview.load())[1]))
-                    )
-                    el_na = fx.Int32(1) == fx.Int32(1)
-                    while el_na:
-                        el_njob = fx.Int32(
-                            rocdl.readfirstlane(
-                                T.i32, fx.Int32(Vec(el_mview.load())[0])
-                            )
-                        )
-                        el_nhas = el_njob >= fx.Int32(0)
-                        if el_nhas:
-                            _run_gemm1_job(
-                                el_njob,
-                                (local_addr("gmm1_job_head"), el_nbound, fx.Int32(0)),
-                            )
-                            gpu.barrier()
-                        el_na = el_nhas
-                else:
-                    el_la = fx.Int32(1) == fx.Int32(1)
-                    while el_la:
-                        gpu.barrier()
-                        if tx == fx.Int32(0):
-                            el_lj = fx.Int32(
-                                comm.atomic_add_agent(
-                                    local_addr("gmm1_job_head"), fx.Int32(1)
-                                )
-                            )
-                            el_ln = (
-                                fx.Int32(
-                                    comm.load_i32_global_system(
-                                        local_addr("tile_alloc") + fx.Int64(4)
-                                    )
-                                )
-                                // fx.Int32(G)
-                            ) * fx.Int32(GNB)
-                            fx.ptr_store(
-                                Vec.from_elements(
-                                    [(el_lj < el_ln).select(el_lj, fx.Int32(-1))],
-                                    fx.Int32,
-                                ),
-                                el_scr,
-                            )
-                        gpu.barrier()
-                        el_ljob = fx.Int32(Vec(el_view.load())[0])
-                        # dword0 同时是 A 槽 0 的第 0 行:全体 wave 读完 job 号之前,不能让任何 wave 的
-                        # A DMA(序章写槽 0)覆盖它,否则慢 wave 读到激活字节,各 wave 对 has 的判断分叉 → barrier 死锁。
-                        gpu.barrier()
-                        el_lhas = el_ljob >= fx.Int32(0)
-                        if el_lhas:
-                            el_lg = el_ljob // fx.Int32(GNB)
-                            el_lp = buffer_ops.buffer_load(
-                                el_list, el_lg, vec_width=1, dtype=T.i32
-                            )
-                            _run_gemm1_job(
-                                fx.Int32(
-                                    rocdl.readfirstlane(
-                                        T.i32,
-                                        el_lp * fx.Int32(GNB)
-                                        + el_ljob
-                                        - el_lg * fx.Int32(GNB),
-                                    )
-                                )
-                            )
-                            gpu.barrier()
-                        el_la = el_lhas
-                if tx == fx.Int32(0):
-                    (comm.spin_until_ge_i64_sleep_rx)(
-                        local_addr("h1_queue_eos"), generation, el_sl
-                    )
-                _cta_acquire()
-                if const_expr(gmm1_next_claim):
-                    el_rbox = fx.add_offset(el_scr, NC_MBOX_DW)  # 按元素(i32)计
-                    el_rview = fx.make_view(el_rbox, fx.make_layout(4, 1))
-                    if tx == fx.Int32(0):
-                        el_mj = fx.Int32(
-                            comm.atomic_add_agent(
-                                local_addr("gmm1_job_head") + fx.Int64(16 * 4),
-                                fx.Int32(1),
-                            )
-                        )
-                        el_mlg = fx.Int32(
-                            comm.load_i32_global_system(
-                                local_addr("tile_alloc") + fx.Int64(4)
-                            )
-                        ) // fx.Int32(G)
-                        el_mn = (
-                            fx.Int32(
-                                comm.load_i32_global_system(local_addr("tile_alloc"))
-                            )
-                            // fx.Int32(G)
-                            - el_mlg
-                        ) * fx.Int32(GNB)
-                        el_mo = el_mlg * fx.Int32(GNB)
-                        el_mv = el_mj < el_mn
-                        el_mjj = el_mj + el_mo
-                        el_mg = el_mv.select(el_mjj // fx.Int32(GNB), fx.Int32(0))
-                        el_mp = buffer_ops.buffer_load(
-                            el_list, el_mg, vec_width=1, dtype=T.i32
-                        )
-                        fx.ptr_store(
-                            Vec.from_elements(
-                                [
-                                    el_mv.select(
-                                        el_mp * fx.Int32(GNB)
-                                        + el_mjj
-                                        - el_mg * fx.Int32(GNB),
-                                        fx.Int32(-1),
-                                    ),
-                                    el_mn,
-                                    el_mo,
-                                    fx.Int32(0),
-                                ],
-                                fx.Int32,
-                            ),
-                            el_rbox,
-                        )
-                    gpu.barrier()
-                    el_rvals = Vec(el_rview.load())
-                    el_mbound = fx.Int32(
-                        rocdl.readfirstlane(T.i32, fx.Int32(el_rvals[1]))
-                    )
-                    el_moff = fx.Int32(
-                        rocdl.readfirstlane(T.i32, fx.Int32(el_rvals[2]))
-                    )
-                    el_ma = fx.Int32(1) == fx.Int32(1)
-                    while el_ma:
-                        el_mjob = fx.Int32(
-                            rocdl.readfirstlane(
-                                T.i32, fx.Int32(Vec(el_rview.load())[0])
-                            )
-                        )
-                        el_mhas = el_mjob >= fx.Int32(0)
-                        if el_mhas:
-                            _run_gemm1_job(
-                                el_mjob,
-                                (
-                                    local_addr("gmm1_job_head") + fx.Int64(16 * 4),
-                                    el_mbound,
-                                    el_moff,
-                                ),
-                            )
-                            gpu.barrier()
-                        el_ma = el_mhas
-                else:
-                    el_ra = fx.Int32(1) == fx.Int32(1)
-                    while el_ra:
-                        gpu.barrier()
-                        if tx == fx.Int32(0):
-                            el_rj = fx.Int32(
-                                comm.atomic_add_agent(
-                                    local_addr("gmm1_job_head") + fx.Int64(16 * 4),
-                                    fx.Int32(1),
-                                )
-                            )
-                            el_rlg = fx.Int32(
-                                comm.load_i32_global_system(
-                                    local_addr("tile_alloc") + fx.Int64(4)
-                                )
-                            ) // fx.Int32(G)
-                            el_rn = (
-                                fx.Int32(
-                                    comm.load_i32_global_system(
-                                        local_addr("tile_alloc")
-                                    )
-                                )
-                                // fx.Int32(G)
-                                - el_rlg
-                            ) * fx.Int32(GNB)
-                            fx.ptr_store(
-                                Vec.from_elements(
-                                    [
-                                        (el_rj < el_rn).select(
-                                            el_rj + el_rlg * fx.Int32(GNB), fx.Int32(-1)
-                                        )
-                                    ],
-                                    fx.Int32,
-                                ),
-                                el_scr,
-                            )
-                        gpu.barrier()
-                        el_rjob = fx.Int32(Vec(el_view.load())[0])
-                        # dword0 同时是 A 槽 0 的第 0 行:全体 wave 读完 job 号之前,不能让任何 wave 的
-                        # A DMA(序章写槽 0)覆盖它,否则慢 wave 读到激活字节,各 wave 对 has 的判断分叉 → barrier 死锁。
-                        gpu.barrier()
-                        el_rhas = el_rjob >= fx.Int32(0)
-                        if el_rhas:
-                            el_rg = el_rjob // fx.Int32(GNB)
-                            el_rp = buffer_ops.buffer_load(
-                                el_list, el_rg, vec_width=1, dtype=T.i32
-                            )
-                            _run_gemm1_job(
-                                fx.Int32(
-                                    rocdl.readfirstlane(
-                                        T.i32,
-                                        el_rp * fx.Int32(GNB)
-                                        + el_rjob
-                                        - el_rg * fx.Int32(GNB),
-                                    )
-                                )
-                            )
-                            gpu.barrier()
-                        el_ra = el_rhas
-            if const_expr(tile_ready):
-                tr_ci = ticket - fx.Int32(COMPUTE_FIRST)
-                tr_done_a = local_addr("tile_row_done")
-                tr_rf_a = local_addr("gmm1_job_head") + fx.Int64(16 * 4)
-                tr_cnt = buffer_ops.create_buffer_resource_from_addr(
-                    local_addr("expert_count")
-                )
-                tr_te = buffer_ops.create_buffer_resource_from_addr(
-                    local_addr("tile_expert")
-                )
-                tr_in = buffer_ops.create_buffer_resource_from_addr(
-                    local_addr("tile_row_input")
-                )
-                tr_src = buffer_ops.create_buffer_resource_from_addr(
-                    local_addr("tile_row_source")
-                )
-                tr_w = buffer_ops.create_buffer_resource_from_addr(
-                    local_addr("tile_row_weight")
-                )
-                # 广播用 GMM1 LDS 之后的 16B 信箱,不碰 A 环(dword0 是 A 槽 0 的第 0 行)。
-                tr_scr = fx.add_offset(fx.recast_iter(fx.Int32, lds_raw), NC_MBOX_DW)
-                tr_sv = fx.make_view(tr_scr, fx.make_layout(3, 1))
-
-                def _tr_run(tr_job, tr_static):
-                    """组 g=job//GNB 就绪(满 32*G 行,或预约终值后其 expert 行到齐)后补组尾并算。"""
-                    tr_g = tr_job // fx.Int32(GNB)
-                    if tx == fx.Int32(0):
-                        tr_a = fx.Int32(
-                            _pl32(
-                                tr_done_a + fx.Int64(tr_g * fx.Int32(G)) * fx.Int64(4)
-                            )
-                        )
-                        tr_rf = fx.Int32(_pl32(tr_rf_a))
-                        tr_st = (tr_a >= fx.Int32(GROUP_ROWS)).select(
-                            fx.Int32(1),
-                            (tr_rf >= fx.Int32(GPUS_PER_NODE)).select(
-                                fx.Int32(2), fx.Int32(0)
-                            ),
-                        )
-                        while tr_st == fx.Int32(0):
+                        while pd_rf < fx.Int32(GPUS_PER_NODE):
                             _mlir_rocdl.s_sleep(127)
-                            tr_a = fx.Int32(
-                                _pl32(
-                                    tr_done_a
-                                    + fx.Int64(tr_g * fx.Int32(G)) * fx.Int64(4)
-                                )
+                            pd_rf = fx.Int32(
+                                _pl32(local_addr("gmm1_job_head") + fx.Int64(16 * 4))
                             )
-                            tr_rf = fx.Int32(_pl32(tr_rf_a))
-                            tr_st = (tr_a >= fx.Int32(GROUP_ROWS)).select(
-                                fx.Int32(1),
-                                (tr_rf >= fx.Int32(GPUS_PER_NODE)).select(
-                                    fx.Int32(2), fx.Int32(0)
-                                ),
-                            )
-                        comm.fence_system_acquire()
-                        tr_e = tr_g
-                        if const_expr(not tr_static):
-                            tr_e = buffer_ops.buffer_load(
-                                tr_te, tr_g * fx.Int32(G), vec_width=1, dtype=T.i32
-                            )
-                        tr_c = buffer_ops.buffer_load(
-                            tr_cnt, tr_e, vec_width=1, dtype=T.i32
+                    _cta_acquire()
+                    for pd_e in range(tx, fx.Int32(LOCAL_EXPERTS), fx.Int32(THREADS)):
+                        pd_c = buffer_ops.buffer_load(
+                            buffer_ops.create_buffer_resource_from_addr(
+                                local_addr("expert_count")
+                            ),
+                            pd_e,
+                            vec_width=1,
+                            dtype=T.i32,
                         )
-                        if tr_st == fx.Int32(2):
-                            # 预约终值后 count 是终值;本组应有 clamp(count - k*GR, 0, GR) 行。
-                            tr_k = fx.Int32(0)
-                            if const_expr(not tr_static):
-                                tr_k = buffer_ops.buffer_load(
+                        pd_k = pd_c // fx.Int32(GROUP_ROWS)
+                        pd_r = pd_c - pd_k * fx.Int32(GROUP_ROWS)
+                        if (pd_r != fx.Int32(0)) | (pd_c == fx.Int32(0)):
+                            pd_ph = pd_e * fx.Int32(G)
+                            if pd_k != fx.Int32(0):
+                                pd_mi = pd_e * fx.Int32(
+                                    max_tiles_per_expert
+                                ) + pd_k * fx.Int32(G)
+                                _spin(
+                                    local_addr("expert_tile_map_ready")
+                                    + fx.Int64(pd_mi) * fx.Int64(8),
+                                    generation,
+                                )
+                                comm.fence_system_acquire()
+                                pd_ph = buffer_ops.buffer_load(
                                     buffer_ops.create_buffer_resource_from_addr(
-                                        local_addr("tile_row_base")
+                                        local_addr("expert_tile_map")
                                     ),
-                                    tr_g * fx.Int32(G),
+                                    pd_mi,
                                     vec_width=1,
                                     dtype=T.i32,
                                 )
-                            tr_x = tr_c - tr_k * fx.Int32(GROUP_ROWS)
-                            tr_x = (tr_x < fx.Int32(GROUP_ROWS)).select(
-                                tr_x, fx.Int32(GROUP_ROWS)
-                            )
-                            tr_x = (tr_x > fx.Int32(0)).select(tr_x, fx.Int32(0))
-                            tr_ga = fx.Int32(
-                                _pl32(
-                                    tr_done_a
-                                    + fx.Int64(tr_g * fx.Int32(G)) * fx.Int64(4)
+                            pd_add = fx.Int32(GROUP_ROWS) - pd_r
+                            pd_old = fx.Int32(
+                                comm.atomic_add_system(
+                                    local_addr("tile_row_done")
+                                    + fx.Int64(pd_ph) * fx.Int64(4),
+                                    pd_add,
                                 )
                             )
-                            while tr_ga < tr_x:
-                                _mlir_rocdl.s_sleep(127)
-                                tr_ga = fx.Int32(
-                                    _pl32(
-                                        tr_done_a
-                                        + fx.Int64(tr_g * fx.Int32(G)) * fx.Int64(4)
-                                    )
+                            if pd_old + pd_add == fx.Int32(GROUP_ROWS):
+                                _rq_push(None, pd_ph // fx.Int32(G))
+            if const_expr(ready_q):
+                # 就绪队列:领 job j → 队列项 q = j // GNB;等该项写入(generation 标记),
+                # 或全局封尾后 q 超出总组数(退出)。信箱在 GMM1 LDS 之后,不与 A 环重叠。
+                rq_box = fx.add_offset(fx.recast_iter(fx.Int32, lds_raw), NC_MBOX_DW)
+                rq_view = fx.make_view(rq_box, fx.make_layout(1, 1))
+                rq_qa = local_addr("gmm1_ready_q")
+                rq_ha = local_addr("gmm1_job_head") + fx.Int64(9 * 4)
+                rq_go = fx.Int32(1) == fx.Int32(1)
+                while rq_go:
+                    gpu.barrier()
+                    if tx == fx.Int32(0):
+                        rq_j = fx.Int32(comm.atomic_add_agent(rq_ha, fx.Int32(1)))
+                        rq_q = rq_j // fx.Int32(GNB)
+                        rq_valid = rq_q < fx.Int32(GR_N)
+                        rq_safe_q = rq_valid.select(rq_q, fx.Int32(0))
+                        rq_ea = rq_qa + fx.Int64(rq_safe_q) * fx.Int64(8)
+                        # 0 = 等待,1 = 项已写入,3 = 看到全局封尾(acquire 后再判)。
+                        rq_v = _rq_entry(rq_ea, rq_valid)
+                        rq_e = fx.Int64(
+                            comm.load_i64_global_system_relaxed(
+                                local_addr("h1_queue_eos")
+                            )
+                        )
+                        rq_st = ((rq_v >> fx.Int64(32)) == fx.Int64(generation)).select(
+                            fx.Int32(1),
+                            (rq_e >= fx.Int64(generation)).select(
+                                fx.Int32(3), fx.Int32(0)
+                            ),
+                        )
+                        while rq_st == fx.Int32(0):
+                            _mlir_rocdl.s_sleep(16)
+                            rq_v = _rq_entry(rq_ea, rq_valid)
+                            rq_e = fx.Int64(
+                                comm.load_i64_global_system_relaxed(
+                                    local_addr("h1_queue_eos")
                                 )
+                            )
+                            rq_st = (
+                                (rq_v >> fx.Int64(32)) == fx.Int64(generation)
+                            ).select(
+                                fx.Int32(1),
+                                (rq_e >= fx.Int64(generation)).select(
+                                    fx.Int32(3), fx.Int32(0)
+                                ),
+                            )
+                        # Only EOS-based termination needs the final allocation
+                        # count here. A ready entry is generation tagged; the
+                        # payload/metadata acquire remains below before GMM1.
+                        rq_in = rq_st == fx.Int32(1)
+                        if rq_st == fx.Int32(3):
                             comm.fence_system_acquire()
-                        tr_a = fx.Int32(
-                            _pl32(
-                                tr_done_a + fx.Int64(tr_g * fx.Int32(G)) * fx.Int64(4)
-                            )
-                        )
+                            rq_tot = fx.Int32(
+                                _pl32(local_addr("tile_alloc"))
+                            ) // fx.Int32(G)
+                            rq_in = rq_q < rq_tot
+                        # A successful generation-tagged read already owns this
+                        # entry. Only EOS needs the final allocation count; an
+                        # in-range EOS claim still waits for queue publication.
+                        rq_w = (rq_v >> fx.Int64(32)) != fx.Int64(generation)
+                        rq_w = rq_w & rq_in
+                        while rq_w:
+                            _mlir_rocdl.s_sleep(16)
+                            rq_v = _rq_entry(rq_ea, rq_valid)
+                            rq_w = (rq_v >> fx.Int64(32)) != fx.Int64(generation)
+                        comm.fence_system_acquire()
                         fx.ptr_store(
-                            Vec.from_elements([tr_a, tr_e, tr_c], fx.Int32), tr_scr
-                        )
-                    gpu.barrier()
-                    tr_v = Vec(tr_sv.load())
-                    tr_rows = fx.Int32(rocdl.readfirstlane(T.i32, fx.Int32(tr_v[0])))
-                    tr_ee = fx.Int32(rocdl.readfirstlane(T.i32, fx.Int32(tr_v[1])))
-                    tr_cc = fx.Int32(rocdl.readfirstlane(T.i32, fx.Int32(tr_v[2])))
-                    gpu.barrier()
-                    # 组尾补齐(sealer 稍后写同样的值);0 行的 expert 指向第 0 行。
-                    tr_base = tr_g * fx.Int32(GROUP_ROWS)
-                    tr_fb = (tr_cc > fx.Int32(0)).select(
-                        buffer_ops.buffer_load(
-                            tr_in,
-                            tr_ee * fx.Int32(GROUP_ROWS),
-                            vec_width=1,
-                            dtype=T.i32,
-                        ),
-                        fx.Int32(0),
-                    )
-                    for tr_r in range(
-                        tr_rows + tx, fx.Int32(GROUP_ROWS), fx.Int32(THREADS)
-                    ):
-                        buffer_ops.buffer_store(tr_fb, tr_in, tr_base + tr_r)
-                        buffer_ops.buffer_store(
-                            fx.Int32(INVALID_SOURCE), tr_src, tr_base + tr_r
-                        )
-                        buffer_ops.buffer_store(fx.Float32(0.0), tr_w, tr_base + tr_r)
-                    fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
-                    gpu.barrier()
-                    _run_gemm1_job(tr_job)
-                    gpu.barrier()
-
-                # A 段:静态组(组号 e = expert e),不需要预约终值即可开工。
-                for tr_job in range(
-                    tr_ci, fx.Int32(LOCAL_EXPERTS * GNB), fx.Int32(N_CONSUMERS)
-                ):
-                    _tr_run(tr_job, True)
-                # B 段:溢出组。预约终值后 tile_alloc 是终值,job 数精确。
-                if tx == fx.Int32(0):
-                    tr_rf2 = fx.Int32(_pl32(tr_rf_a))
-                    while tr_rf2 < fx.Int32(GPUS_PER_NODE):
-                        _mlir_rocdl.s_sleep(127)
-                        tr_rf2 = fx.Int32(_pl32(tr_rf_a))
-                    comm.fence_system_acquire()
-                    fx.ptr_store(
-                        Vec.from_elements(
-                            [
-                                fx.Int32(
-                                    comm.load_i32_global_system(
-                                        local_addr("tile_alloc")
+                            Vec.from_elements(
+                                [
+                                    rq_in.select(
+                                        fx.Int32(rq_v & fx.Int64(0xFFFFFFFF))
+                                        * fx.Int32(GNB)
+                                        + rq_j
+                                        - rq_q * fx.Int32(GNB),
+                                        fx.Int32(-1),
                                     )
-                                )
-                            ],
-                            fx.Int32,
-                        ),
-                        tr_scr,
+                                ],
+                                fx.Int32,
+                            ),
+                            rq_box,
+                        )
+                    gpu.barrier()
+                    rq_job = fx.Int32(
+                        rocdl.readfirstlane(T.i32, fx.Int32(Vec(rq_view.load())[0]))
                     )
-                gpu.barrier()
-                tr_tiles = fx.Int32(
-                    rocdl.readfirstlane(T.i32, fx.Int32(Vec(tr_sv.load())[0]))
-                )
-                gpu.barrier()
-                tr_total = (tr_tiles // fx.Int32(G)) * fx.Int32(GNB)
-                for tr_job in range(tr_ci, tr_total, fx.Int32(N_CONSUMERS)):
-                    if tr_job >= fx.Int32(LOCAL_EXPERTS * GNB):
-                        _tr_run(tr_job, False)
+                    rq_has = rq_job >= fx.Int32(0)
+                    if rq_has:
+                        _run_gemm1_job(rq_job)
+                    rq_go = rq_has
             if tx == fx.Int32(0):
                 # 融合版里 248 个 CTA 做完 fanout 就停在这里等全局封尾;
                 # 退避轮询,不和仍在 fanout/发 credit 的 CTA 抢访存。
@@ -2334,51 +2437,32 @@ def _compile_stage1(
                     local_addr("h1_queue_eos"), generation, 127
                 )
             _cta_acquire()
-            # 融合版:GMM1 消费者(ticket>=COMPUTE_FIRST,从不写 T0 专用的 3..10 槽)
-            # 3 = 过 h1_queue_eos 门,4 = 自己的 job 做完。
-            tiles = fx.Int32(
-                buffer_ops.buffer_load(
-                    buffer_ops.create_buffer_resource_from_addr(
-                        local_addr("tile_alloc")
-                    ),
-                    fx.Int32(0),
-                    vec_width=1,
-                    dtype=T.i32,
-                )
-            )
-            # early_local_gmm:job 已在上面两段领完,这里只剩 sortcopy + 完成计数(每 CTA +1)。
-            total_jobs = (tiles // fx.Int32(G)) * fx.Int32(
-                0 if early_local_gmm else GNB
-            )
-            consumer_index = ticket - fx.Int32(COMPUTE_FIRST)
-            for _xi, _xt in enumerate(_XC):
-                consumer_index = (ticket == fx.Int32(_xt)).select(
-                    fx.Int32(worker_blocks - COMPUTE_FIRST + _xi), consumer_index
-                )
-            consumer_count = fx.Int32(N_CONSUMERS)
-            # 诊断:消费者在做任何 job 之前要先等 h1_queue_eos(全部 8 个
-            # 通信角色 EOS)。这个戳把 flush_post->done 切成
-            # 「fanout/等 EOS」与「GMM1 jobs」两段。单一写者:consumer 0 的 tx0。
-            # (sortcopy removed: stage2 reads tile_row_source/weight at the
-            # physical arena row through a_tile_map.)
-            # 每 job 一次 s_waitcnt(0)(全流水排空)+ release fence
-            # (自带整 L2 写回)+ system acq_rel 原子 —— 这正是 stage2
-            # AR57 修掉的簿记粒度(546.8 -> 245.7us),以及
-            # arrival-flag 协议里 release 每条自带 buffer_wbl2 的同一个病。
-            # 6720 个 job 下实测每 job 182us,而一个 job 只有 58.7 MFLOP。
-            #
-            # 计数语义不变:finisher 等的是总数 == tiles*h1_n_blocks,
-            # 所以一次加上本 CTA 的 job 数即可。**不能在运行期 for 循环里
-            # 跨迭代累加标量**(AST rewriter 会把循环体抽成函数,跨迭代
-            # 标量不可靠),所以 job 数用闭式算,不靠累加。
-            # 循环内保留 gpu.barrier():它管的是 LDS 复用的 CTA 内序,
-            # 与这里要批量化的系统级 ordering 无关。
-            if const_expr(not tile_ready):
-                # tile_ready 下全部 job 已在过门前按组就绪做完(同一 job 集合,完成计数公式不变)。
-                for job in range(consumer_index, total_jobs, consumer_count):
-                    _run_gemm1_job(job)
-                    gpu.barrier()
-            # Stage2 runs after this kernel on the stream: no completion count.
+
+    @flyc.kernel(name=kernel_name, known_block_size=[THREADS, 1, 1])
+    def kernel(
+        dev_comm: fx.Int64,
+        arena_win: fx.Int64,
+        arena_ptr: fx.Int64,
+        x_q: fx.Int64,
+        input_scale: fx.Int64,
+        route_weights: fx.Int64,
+        topk_ids: fx.Int64,
+        w1q: fx.Int64,
+        w1scale: fx.Int64,
+        ntokens: fx.Int32,
+    ):
+        s1_body(
+            dev_comm,
+            arena_win,
+            arena_ptr,
+            x_q,
+            input_scale,
+            route_weights,
+            topk_ids,
+            w1q,
+            w1scale,
+            ntokens,
+        )
 
     @flyc.jit
     def launch_stage1(
@@ -2408,8 +2492,8 @@ def _compile_stage1(
             value_attrs={
                 # 256 个 4-wave CTA、每 CU 一个:=2 的提示只会把 VGPR 压到 256,
                 # GMM1 主循环出现 scratch 溢出(K3 TPR128 7 个、DSV4 TPR256 29 个)。
-                "rocdl.waves_per_eu": 1,
-                "rocdl.flat_work_group_size": "256,256",
+                "rocdl.waves_per_eu": WAVES // 4,
+                "rocdl.flat_work_group_size": f"{THREADS},{THREADS}",
             },
         ).launch(
             grid=(worker_blocks, 1, 1),
@@ -2418,6 +2502,25 @@ def _compile_stage1(
         )
 
     launch_stage1.kernel_name = kernel_name
+    launch_stage1.body = s1_body
+    launch_stage1.lds_bytes = int(lds_alloc_bytes)
+    launch_stage1.threads = THREADS
+    launch_stage1.waves = WAVES
+    launch_stage1.grid = int(worker_blocks)
+    # Single fused kernel: where GEMM2 finds the tables-final gate and the
+    # per-group h1 completion words (window byte offsets, parity-0 + plane).
+    launch_stage1.group_sync = (
+        {
+            "eos_off": off("h1_queue_eos"),
+            "eos_plane": plane("h1_queue_eos"),
+            "sync_off": off("h1_grp_sync") + 4 * GR_N,
+            "sync_plane": plane("h1_grp_sync"),
+            "tile_group": G,
+        }
+        if group_ready
+        else None
+    )
+    launch_stage1.epoch_off = int(off("epoch_gate"))
     return launch_stage1
 
 

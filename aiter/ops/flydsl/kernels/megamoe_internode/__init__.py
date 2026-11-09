@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""MegaMoE across two nodes (EP16, A4W4) with lazy public imports."""
+"""MegaMoE across two nodes (EP16, A4W4/A8W4) with lazy public imports."""
 
 import importlib
 

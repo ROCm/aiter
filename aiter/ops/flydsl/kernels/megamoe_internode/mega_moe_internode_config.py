@@ -13,7 +13,7 @@ a table, so every swept value is recorded in a file.
 Stage1 table (``megamoe_internode_stage1_tuned.csv``)
 =====================================================
 
-Three columns decide how Stage1 runs a shape:
+Four columns decide how Stage1 runs a shape:
 
 ``tile_group`` (G)
     The arena tile stays ``block_m`` = 32 rows (Stage2 and MegaMoEv2's SBM depend
@@ -24,7 +24,11 @@ Three columns decide how Stage1 runs a shape:
 ``split_local`` (0/1)
     Which GMM1 path runs (below).
 ``fanout_shards``
-    Fan-out CTAs per destination GPU (32 on the split path, 16 unsplit).
+    Fan-out CTAs per destination GPU. Defaults to 17 on the split path and
+    16 unsplit when absent or invalid. Unsplit accepts 2..31; split accepts 17..31.
+``data_send_ctas`` (0/32/64)
+    Payload-send CTAs shared by the fanout roles. Zero keeps metadata and
+    payload together; 32 or 64 separates their work through a send queue.
 
 Knobs every measured shape set to the same value are constants in the Stage1
 kernel, not columns: GMM1's N block = 256 (128 was slower on every shape
@@ -60,6 +64,19 @@ not fit: the 256-row accumulator needs 256 KB of LDS.
         DSV4 128    32            269.7 (1)         207.9 (1)
         DSV4 256    64            304.1 (4)         262.7 (2)
         DSV4 512    128           331.5 (4)         283.5 (4)
+
+    In the single kernel (2026-11-05, 46+50, end-to-end us, split -> unsplit,
+    random / eplb) the cut moved to a per-rank token count: unsplit wins below
+    TPR 1024, split from 1024 up (``_SPLIT_MIN_TPR``):
+
+        K3 256       811 -> 650 / 734 -> 565      DSv4.1 512   593 -> 534 / 506 -> 469
+        K3 512       982 -> 841 / 782 -> 898      DSv4.1 1024  789 -> 795 / 584 -> 664
+        K3 1024     1363 -> 1238 / 1293 -> 1288   DSv4.1 2048 1085 -> 1338 / 974 -> 1138
+        K3 2048     1707 -> 2135 / 1890 -> 2053   DSv4.1 4096 1746 -> 2391 / 1679 -> 2109
+        K3 4096     2972 -> 3980 / 3102 -> 4001
+
+    (K3 512 eplb is the one loss below the cut; at TPR >= 2048 unsplit also gives
+    up the SDMA push and remote-first GEMM2, which need the split.)
 
     The G=1/G=4 rule above was measured on the split path (a G=2 split pads each
     half to 64 rows, which is why it lost); unsplit takes the smallest G whose
@@ -189,12 +206,12 @@ TILE_GROUPS = (1, 2, 4)
 _ARENA_BM = 32
 # Between the measured 36.6 (G=1 best) and 73 (G=4 best) rows per expert.
 _G1_MAX_ROWS = 48
-# Unsplit wins while one m_block holds an expert's rows: 32 * max(TILE_GROUPS).
-_UNSPLIT_MAX_ROWS = _ARENA_BM * max(TILE_GROUPS)
-# K3 TPR128 unsplit: 16 shards 234 vs 32 shards 239us; the split path was tuned at 32.
-_FANOUT_SHARDS = {0: 16, 1: 32}
-# fan2 takes 16 of the split path's shards.
-FANOUT_SHARDS_MIN, FANOUT_SHARDS_MAX = 2, 64
+# Split from this many tokens per rank up (token / topk; see ``split_local`` above).
+_SPLIT_MIN_TPR = 1024
+# The split path reserves 16 remote fanout shards plus the CCO ticket.
+_FANOUT_SHARDS = {0: 16, 1: 17}
+# T0 keeps its CCO role, so dest0 needs another shard; leave compute CTAs free.
+FANOUT_SHARDS_MIN, FANOUT_SHARDS_MAX = 2, 31
 
 
 def _validate_stage1(row: dict, where: str) -> None:
@@ -208,29 +225,32 @@ def _validate_stage1(row: dict, where: str) -> None:
         raise ValueError(
             f"{where}: split_local must be 0 or 1 (got {row['split_local']})"
         )
-    fs = row["fanout_shards"]
-    if not FANOUT_SHARDS_MIN <= fs <= FANOUT_SHARDS_MAX:
-        raise ValueError(
-            f"{where}: fanout_shards must be in [{FANOUT_SHARDS_MIN}, {FANOUT_SHARDS_MAX}] (got {fs})"
-        )
-    if row["split_local"] and fs < 17:
-        raise ValueError(
-            f"{where}: the split path needs fanout_shards >= 17 (fan2 uses 16)"
-        )
+    ds = int(row.get("data_send_ctas", 0))
+    if ds not in (0, 32, 64):
+        raise ValueError(f"{where}: data_send_ctas must be 0, 32 or 64 (got {ds})")
+    minimum = 17 if row["split_local"] else FANOUT_SHARDS_MIN
+    fs = row.get("fanout_shards")
+    if fs is None or not minimum <= fs <= FANOUT_SHARDS_MAX:
+        fs = default_fanout_shards(row["split_local"])
+    row["fanout_shards"] = fs
+    if ds and fs * 8 + ds > 256:
+        raise ValueError(f"{where}: metadata plus data roles exceed the resident grid")
 
 
 STAGE1_TABLE = _TuneTable(
     "AITER_CONFIG_MEGAMOE_INTERNODE_STAGE1",
     "megamoe_internode_stage1_tuned.csv",
-    ("tile_group", "split_local", "fanout_shards"),
+    ("tile_group", "split_local"),
     _validate_stage1,
+    optional_fields=(("fanout_shards", 0), ("data_send_ctas", 0)),
 )
 
 
-def default_split_local(token: int, expert: int) -> int:
-    """Split only when one m_block cannot hold an expert's rows (see docstring)."""
-    rows = int(token) / max(1, int(expert))
-    return 0 if rows <= _UNSPLIT_MAX_ROWS else 1
+def default_split_local(token: int, topk: int) -> int:
+    """Split from ``_SPLIT_MIN_TPR`` tokens per rank up (see docstring).
+
+    ``token`` is the GEMM row count (tokens per rank x top-k)."""
+    return 1 if int(token) // max(1, int(topk)) >= _SPLIT_MIN_TPR else 0
 
 
 def default_tile_group(token: int, expert: int, split_local: int = 1) -> int:
@@ -247,6 +267,7 @@ def default_tile_group(token: int, expert: int, split_local: int = 1) -> int:
 
 
 def default_fanout_shards(split_local: int) -> int:
+    """Safe default shared by table validation and shape-rule fallback."""
     return _FANOUT_SHARDS[int(bool(split_local))]
 
 
@@ -263,7 +284,17 @@ def resolve_stage1_tile(
     """Return ``{"tile_group", "split_local", "fanout_shards", "source"}`` for this
     shape; ``source`` is ``table`` or ``default`` (the built-in rule).  The kernel
     name (``_tg{G}``, ``_fos{N}``, ``_slg``) remains the ground truth for what ran.
+
+    ``split_local`` is fixed at compile time by the tokens per rank
+    (``default_split_local``); a table row only supplies G and the fanout shards,
+    and is used only when its ``split_local`` agrees.
+
+    The split path needs 16 remote fanout shards plus the CCO ticket,
+    so its minimum fanout count is 17; the unsplit minimum is 2.
+    A missing or out-of-range table fanout uses the same path's default while
+    preserving that row's tile and copy roles.
     """
+    split = default_split_local(token, topk)
     tuned = None
     try:
         if gfx is None or cu_num is None:
@@ -286,19 +317,65 @@ def resolve_stage1_tile(
         # Anything else (no device, no aiter root) falls back to the rule.
         logger.debug("Stage1 tune lookup failed; using built-in rules", exc_info=True)
         tuned = None
-    if tuned is not None:
+    if tuned is not None and int(tuned["split_local"]) == split:
         out, source = dict(tuned), "table"
     else:
-        split = default_split_local(token, expert)
         out = {
             "split_local": split,
             "tile_group": default_tile_group(token, expert, split),
             "fanout_shards": default_fanout_shards(split),
+            "data_send_ctas": 0,
         }
         source = "default"
         _validate_stage1(out, "stage1 tile rule")
     out["source"] = source
     return out
+
+
+# Stage1 CTA width.  8 waves (two per SIMD, <= 256 registers each; the PR6881
+# layout the single fused kernel shares with stage2): GMM1 gives each wave a
+# 32-column slice over all rows.
+STAGE1_WAVES = 8
+
+
+def resolve_stage1_waves(tile_group: int) -> int:
+    """Waves per Stage1 CTA (see STAGE1_WAVES)."""
+    del tile_group  # every tile group runs at STAGE1_WAVES
+    return STAGE1_WAVES
+
+
+# Fused stage2 CTA width.  8 waves (one CTA per CU, each CTA runs an n_block
+# pair over a shared A tile) is the single-kernel shape.
+STAGE2_FUSED_WAVES = 8
+
+
+# Stage1 and the fused Stage2 in one kernel (see single_kernel.py) whenever
+# both run 8-wave CTAs; otherwise the separate launches.
+SINGLE_KERNEL = False
+
+
+def resolve_single_kernel(stage1_waves: int, stage2_waves: int) -> bool:
+    """Whether to launch Stage1 + fused Stage2 as one kernel."""
+    return bool(SINGLE_KERNEL) and int(stage1_waves) == 8 and int(stage2_waves) == 8
+
+
+def single_kernel_possible(tile_group: int, sdma: bool, n_blocks: int) -> bool:
+    """Whether the single kernel applies (it then forces the fused Stage2 at
+    every TPR): 8-wave Stage1 and an even GEMM2 n_block count."""
+    del sdma  # xGMI or SDMA push
+    return (
+        bool(SINGLE_KERNEL)
+        and resolve_stage1_waves(tile_group) == 8
+        and int(n_blocks) % 2 == 0
+    )
+
+
+def resolve_stage2_waves(fused: bool, sdma: bool, n_blocks: int) -> int:
+    """Waves per fused-stage2 CTA (see STAGE2_FUSED_WAVES)."""
+    del sdma  # the SDMA plan follows the CTA width
+    if not fused or int(n_blocks) % 2:
+        return 4
+    return STAGE2_FUSED_WAVES
 
 
 # Stage2
@@ -323,7 +400,7 @@ GEMM2_DYNAMIC_MIN_TPR = 2048
 # remote plane while the local half is still in GEMM2.  Measured vs two
 # kernels (K3 / DSv4.1 EP16): -5~13% at TPR >= 2048, even to -8% at 1024,
 # +2~6% at 512 (the fused kernel always claims dynamically).
-STAGE2_FUSED_MIN_TPR = 1024
+STAGE2_FUSED_MIN_TPR = 0
 # From this max_tok_per_rank the fused stage2 ships its intra-node rows with
 # the copy engines (SDMA) instead of xGMI stores from the GEMM2 epilogue.
 STAGE2_SDMA_MIN_TPR = 2048
@@ -347,6 +424,17 @@ STAGE2_SDMA_PUT_BYTES = 4 << 20
 STAGE2_SDMA_SEND_ROWS_PER_ROUTE = 2
 # Share of each peer's rows sent by SDMA, in 1/64 (the rest go as xGMI stores).
 STAGE2_SDMA_FRAC_Q64 = 64
+# Remote-first stage2: kernel2 part 1 (remote plane reduce + rail post) starts
+# when the node peers' remote halves are in, probed after each local GEMM2
+# unit, instead of blocking at the remote/local boundary.
+STAGE2_PART1_PROBE = True
+# SDMA stage2: only the remote-source half goes by the copy engine; the local
+# half (computed last) goes as xGMI stores.
+STAGE2_SDMA_REMOTE_ONLY = False
+# Single kernel, remote-first stage2: the remote plane goes over the rail in
+# token-completion order (tokens whose rows are all in are reduced between
+# GEMM2 units and sent CHUNK at a time), not per token range at the end.
+STAGE2_TOKEN_READY = True
 
 
 def _validate_stage2(row: dict, where: str) -> None:

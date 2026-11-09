@@ -10,18 +10,25 @@ k1 的 T0 按 QP 切 token 段,每段一个 PUT 发出,不再有零散的 scale/
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr import math as fmath
-from flydsl.expr import range_constexpr, rocdl
 from flydsl.expr.typing import ReductionOp, T
 
-from ..mega_moe.quant import _FP4_INV_MAX_POS_BITS, BLOCK, GROUP
+from ..mega_moe.quant import (
+    _FP4_INV_MAX_POS_BITS,
+    _FP8_E4M3_INV_MAX_POS_BITS,
+    BLOCK,
+    GROUP,
+)
 from ..tensor_shim import buf_copy_load, buf_copy_store, ptr_buf_tensor
 
 
-def rail_record_layout(hidden: int, topk: int):
+def rail_record_layout(hidden: int, topk: int, activation_dtype: str = "fp4"):
     """(REC_BYTES, off_q, off_scale, off_ids, off_weights),全部 16B 对齐。"""
+    if activation_dtype not in ("fp4", "fp8"):
+        raise ValueError("activation_dtype must be fp4 or fp8")
     off_q = 0
-    off_s = off_q + hidden // 2
+    off_s = off_q + hidden // (1 if activation_dtype == "fp8" else 2)
     off_i = off_s + hidden // 32
     # ids 段补齐到 16B:topk*4 不是 16 的倍数时(如 topk=6),weights 起点仍对齐。
     off_w = off_i + (topk * 4 + 15) // 16 * 16
@@ -32,13 +39,21 @@ def rail_record_layout(hidden: int, topk: int):
     return rec, off_q, off_s, off_i, off_w
 
 
-def build_rail_record_quant(hidden: int, topk: int):
+def build_rail_record_quant(hidden: int, topk: int, activation_dtype: str = "fp4"):
     assert hidden % GROUP == 0
     scale_n = hidden // GROUP
     assert scale_n >= 2 * topk, "ids/weights 由每 token 前 2*topk 个 group 线程顺带写"
-    rec, off_q, off_s, off_i, off_w = rail_record_layout(hidden, topk)
+    rec, off_q, off_s, off_i, off_w = rail_record_layout(hidden, topk, activation_dtype)
 
-    @flyc.kernel(name=f"per_1x32_mx_quant_fp4_n{hidden}_railrec_k{topk}_r{rec}")
+    inv_max_bits = (
+        _FP8_E4M3_INV_MAX_POS_BITS
+        if activation_dtype == "fp8"
+        else _FP4_INV_MAX_POS_BITS
+    )
+
+    @flyc.kernel(
+        name=f"per_1x32_mx_quant_{activation_dtype}_n{hidden}_railrec_k{topk}_r{rec}"
+    )
     def rec_quant_kernel(
         x: fx.Int64,
         topk_ids: fx.Int64,
@@ -70,9 +85,9 @@ def build_rail_record_quant(hidden: int, topk: int):
                 )
                 for elem in range_constexpr(8):
                     act.append(values[elem])
-            working = (
-                local_max * fx.Int32(_FP4_INV_MAX_POS_BITS).bitcast(fx.Float32)
-            ).bitcast(fx.Int32)
+            working = (local_max * fx.Int32(inv_max_bits).bitcast(fx.Float32)).bitcast(
+                fx.Int32
+            )
             mantissa = working & fx.Int32(0x7FFFFF)
             biased_exp = (working >> fx.Int32(23)) & fx.Int32(0xFF)
             e8m0 = (mantissa != fx.Int32(0)).select(
@@ -81,23 +96,51 @@ def build_rail_record_quant(hidden: int, topk: int):
             e8m0 = (e8m0 > fx.Int32(255)).select(fx.Int32(255), e8m0)
             rec_base = token * fx.Int32(rec)
             out_scale[rec_base + fx.Int32(off_s) + gi] = e8m0.to(fx.Uint8)
-            dequant_scale = (e8m0 << fx.Int32(23)).bitcast(fx.Float32)
-            words = []
-            for word in range_constexpr(GROUP // 8):
-                packed = fx.Int32(0)
-                for pair in range_constexpr(4):
-                    idx = word * 8 + pair * 2
-                    packed = rocdl.cvt_scalef32_pk_fp4_f32(
-                        T.i32, packed, act[idx], act[idx + 1], dequant_scale, pair
+            if const_expr(activation_dtype == "fp4"):
+                dequant_scale = (e8m0 << fx.Int32(23)).bitcast(fx.Float32)
+                words = []
+                for word in range_constexpr(GROUP // 8):
+                    packed = fx.Int32(0)
+                    for pair in range_constexpr(4):
+                        idx = word * 8 + pair * 2
+                        packed = rocdl.cvt_scalef32_pk_fp4_f32(
+                            T.i32, packed, act[idx], act[idx + 1], dequant_scale, pair
+                        )
+                    words.append(packed)
+                buf_copy_store(
+                    out_q,
+                    (rec_base + fx.Int32(off_q)) // fx.Int32(16) + gi,
+                    fx.Vector.from_elements(words, fx.Int32),
+                    fx.Int32,
+                    unit_elems=4,
+                )
+            else:
+                # Match the shared BF16 -> MXFP8 converter, including reciprocal scale.
+                quant_scale = ((fx.Int32(254) - e8m0) << fx.Int32(23)).bitcast(
+                    fx.Float32
+                )
+                scaled = [v * quant_scale for v in act]
+                out_vec = (rec_base + fx.Int32(off_q)) // fx.Int32(16) + gi * fx.Int32(
+                    2
+                )
+                for half in range_constexpr(2):
+                    words = []
+                    for word in range_constexpr(4):
+                        idx = (half * 4 + word) * 4
+                        packed = rocdl.cvt_pk_fp8_f32(
+                            T.i32, scaled[idx], scaled[idx + 1], fx.Int32(0), 0
+                        )
+                        packed = rocdl.cvt_pk_fp8_f32(
+                            T.i32, scaled[idx + 2], scaled[idx + 3], packed, 1
+                        )
+                        words.append(packed)
+                    buf_copy_store(
+                        out_q,
+                        out_vec + fx.Int32(half),
+                        fx.Vector.from_elements(words, fx.Int32),
+                        fx.Int32,
+                        unit_elems=4,
                     )
-                words.append(packed)
-            buf_copy_store(
-                out_q,
-                (rec_base + fx.Int32(off_q)) // fx.Int32(16) + gi,
-                fx.Vector.from_elements(words, fx.Int32),
-                fx.Int32,
-                unit_elems=4,
-            )
             # 每 token 前 2*topk 个 group 线程顺带把 ids / weights 写进 record。
             if gi < fx.Int32(topk):
                 ids_buf = ptr_buf_tensor(topk_ids, fx.Int32)
@@ -133,8 +176,8 @@ def build_rail_record_quant(hidden: int, topk: int):
 _CACHE = {}
 
 
-def get_rail_record_quant(hidden: int, topk: int):
-    key = (int(hidden), int(topk))
+def get_rail_record_quant(hidden: int, topk: int, activation_dtype: str = "fp4"):
+    key = (int(hidden), int(topk), activation_dtype)
     if key not in _CACHE:
         _CACHE[key] = build_rail_record_quant(*key)
     return _CACHE[key]

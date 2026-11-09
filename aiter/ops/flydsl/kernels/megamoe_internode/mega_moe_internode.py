@@ -1,36 +1,21 @@
 # SPDX-License-Identifier: MIT
-"""MegaMoE across two MI355 nodes (EP16, A4W4).
+"""MegaMoE across two MI355 nodes (EP16, A4W4 or A8W4).
 
-The public interface follows :class:`MegaMoEV2`
-(``aiter.ops.flydsl.kernels.mega_moe``): the constructor takes the same
-keyword arguments, and ``forward`` / ``forward_prequant`` / ``quantize`` /
-``__call__`` behave the same way.  Differences:
+The public forward methods take BF16 or prequantized input, FP32 routing
+weights and INT32 expert IDs. Each call uses exactly ``max_tok_per_rank``
+rows; callers pad unused rows with zero input/weights and expert ID -1,
+then slice the returned BF16 output to their active row count.
 
-* ``quant='a4w4'`` only (MXFP4 activations and weights) and
-  ``world_size=16`` laid out as two nodes of eight GPUs;
-* a forward always runs at the compiled capacity: ``x`` has exactly
-  ``max_tok_per_rank`` rows;
-* extra keyword arguments ``activation``, ``comm_quant``, ``communicator``
-  and ``max_routes_per_token_per_rank``;
-* ``close()`` (or the context manager) releases the CCO window.
+A forward quantizes input into rail records, then launches Stage1
+(dispatch, GEMM1, activation and requantization) and fused Stage2
+(GEMM2, node reduction, rail transfer and combine) on one stream. Optional
+single-kernel and separate GEMM2/combine paths share the device routines.
+Launchers are explicitly compiled once and cached per operator instance.
+Device generation/parity state supports CUDA graph replay.
 
-A forward is four launches on one stream:
-
-0. MXFP4 quant of ``x``, written as rail records straight into the window
-   (``quant.py``);
-1. stage1: InterNodeV1 dispatch to expert tiles + GMM1 + activation + A4
-   requant (``stage1.py``);
-2. stage2 kernel1: GEMM2 + weighted push into the node-local plane-slot
-   inbox (``stage2.py``);
-3. stage2 kernel2: node reduce -> rail to the peer node -> combine
-   (``stage2.py``).
-
-Package layout: ``layout.py`` is the registered-window layout both stages
-share, ``gemm.py`` the GMM1 / GMM2 bodies, ``communication.py`` the device
-communication primitives and rail GDA externs, ``common.py`` the GEMM helpers,
-and ``mega_moe_internode_config.py`` the per-shape stage1 / stage2 tune tables.
-The generation/parity of each forward is derived on the device, so the four
-launches can be captured into a CUDA graph and replayed.
+``layout.py`` defines the CCO window shared by both stages; ``gemm.py``
+contains GEMM bodies, ``communication.py`` provides device communication,
+and ``mega_moe_internode_config.py`` resolves per-shape tune parameters.
 """
 
 from __future__ import annotations
@@ -39,13 +24,15 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
+import flydsl.compiler as flyc
 import torch
 import torch.distributed as dist
+from flydsl._mlir import ir
+from flydsl.utils import env
 from typing_extensions import Self
 
 from ..mega_moe.quant import BLOCK as _QUANT_BLOCK
 from ..mega_moe.quant import per_1x32_mx_quant
-from ..tensor_shim import _run_compiled
 from .layout import (
     MAX_FUSED_TOKENS_PER_RANK,
     Stage1ArenaLayout,
@@ -58,28 +45,36 @@ from .mega_moe_internode_config import (
     STAGE2_SDMA_FRAC_Q64,
     STAGE2_SDMA_PUT_BYTES,
     STAGE2_SDMA_RAMP_CHUNKS,
+    STAGE2_SDMA_REMOTE_ONLY,
     STAGE2_SDMA_SEND_ROWS_PER_ROUTE,
+    STAGE2_TOKEN_READY,
     lookup_stage2_tune,
     resolve_gemm2_bm,
     resolve_gemm2_bn,
     resolve_gemm2_cu,
     resolve_gemm2_dynamic,
     resolve_sdma_chunk_tiles,
+    resolve_single_kernel,
     resolve_stage1_tile,
+    resolve_stage1_waves,
     resolve_stage2_fused,
     resolve_stage2_sdma,
+    resolve_stage2_waves,
+    single_kernel_possible,
 )
 from .quant import get_rail_record_quant
+from .single_kernel import compile_single_kernel
 from .stage1 import WORKER_BLOCKS, compile_stage1
 from .stage2 import (
+    BM,
     K1_CLAIM_WORDS,
     K1_CTAS_PER_CU,
     SCRATCH_WORDS,
     SDMA_PLAN_WORDS_MAX,
+    compile_mega_moe_stage2,
+    compile_stage2_fused,
+    compile_stage2_node_combine,
     peer_table_launcher,
-    run_mega_moe_stage2,
-    run_stage2_fused,
-    run_stage2_node_combine,
 )
 
 __all__ = ["MegaMoEInternode", "build_window_layout"]
@@ -110,6 +105,7 @@ _RDMA_STAGE2_REGIONS = (
     "remote_partial_rx",
     "return_group_ready",
     "return_consumed",
+    "rail_idx",
 )
 # Parity-planed regions as stage2 kernel1 / kernel2 expect them, in order.
 _K1_EPOCH_PLANES = (
@@ -164,6 +160,9 @@ def build_window_layout(
     max_routes_per_token_per_rank: int,
     tile_group: int,
     comm_quant: str = "fp8",
+    data_send_ctas: int = 0,
+    fanout_shards: int = 16,
+    quant: str = "a4w4",
 ) -> TwoKernelArenaLayout:
     """Stage1 and Stage2 layouts sharing one registered window.
 
@@ -192,9 +191,27 @@ def build_window_layout(
         topk=topk,
         max_tokens=max_tok_per_rank,
         max_routes_per_token_per_rank=max_routes_per_token_per_rank,
+        activation_dtype="fp8" if quant == "a8w4" else "fp4",
         block_m=TILE_M,
         tile_group=tile_group,
         embed_stage2_bytes=int(stage2.total_bytes),
+        # Each destination partitions T records into at most ceil(T/NB)+S
+        # batches per phase. This conservative bound covers both fan1/fan2.
+        send_queue_capacity=(
+            2
+            * GPUS_PER_NODE
+            * (
+                (
+                    max_tok_per_rank
+                    + max(8, min(512 // topk, TILE_M * tile_group) // 8 * 8)
+                    - 1
+                )
+                // max(8, min(512 // topk, TILE_M * tile_group) // 8 * 8)
+                + fanout_shards
+            )
+            if data_send_ctas
+            else 0
+        ),
     )
     return TwoKernelArenaLayout.compose(stage1, stage2)
 
@@ -266,6 +283,8 @@ class MegaMoEInternode:
         self.mtpr = int(max_tok_per_rank)
         self.swiglu_limit = float(swiglu_limit)
         self.activation = str(activation)
+        self.quant = str(quant).lower()
+        self._activation_dtype = "fp8" if self.quant == "a8w4" else "fp4"
         self.comm_quant = str(comm_quant)
         self.max_routes_per_token_per_rank = int(route_cap)
         self.device = torch.device("cuda", torch.cuda.current_device())
@@ -302,6 +321,13 @@ class MegaMoEInternode:
         # split); it is dropped at runtime setup if MORI gives no SDMA queue.
         self._stage2_sdma = bool(
             resolve_stage2_sdma(self.mtpr, s2_tuned or None)[0] and remote_first)
+        # The single kernel needs the fused Stage2 body: below the fused-TPR
+        # threshold it switches it on (remote-first when Stage1 splits local).
+        if not self._stage2_fused and single_kernel_possible(
+                self._s1_tile["tile_group"], self._stage2_sdma,
+                self.model_dim // self._gemm2_bn):
+            self._stage2_fused = True
+            remote_first = bool(self._s1_tile["split_local"])
         # GEMM2 M tile (fused remote-first stage2 only; 32 elsewhere).
         self._s2_tuned = s2_tuned or None
         self._gemm2_bm, _ = resolve_gemm2_bm(
@@ -319,6 +345,9 @@ class MegaMoEInternode:
             topk=self.topk, max_tok_per_rank=self.mtpr,
             max_routes_per_token_per_rank=self.max_routes_per_token_per_rank,
             tile_group=self._s1_tile["tile_group"], comm_quant=self.comm_quant,
+            quant=self.quant,
+            data_send_ctas=int(self._s1_tile["data_send_ctas"]),
+            fanout_shards=int(self._s1_tile["fanout_shards"]),
         )
         # One NIC MR covers the rail prefix; past ~1 GiB rail writes stop
         # landing (ionic). Refuse here instead of hanging in k2.
@@ -334,17 +363,27 @@ class MegaMoEInternode:
             self._output = torch.empty(
                 (self.mtpr, self.model_dim), dtype=torch.bfloat16, device=self.device)
             self._init_input_records()
+            # One kernel for Stage1 + fused Stage2 when both run 8-wave CTAs;
+            # Stage1 then publishes per-group GMM1 completion for GEMM2.
+            s1_waves = resolve_stage1_waves(self._s1_tile["tile_group"])
+            self._s2_waves = resolve_stage2_waves(
+                self._stage2_fused, self._stage2_sdma, self.model_dim // self._gemm2_bn)
+            self._single_kernel = resolve_single_kernel(s1_waves, self._s2_waves)
             self._stage1 = compile_stage1(
                 self.layout.stage1, self.layout.stage2,
                 rank=self.rank,
                 stage2_window_offset=self.layout.stage2_offset,
                 fanout_shards=int(self._s1_tile["fanout_shards"]),
+                data_send_ctas=int(self._s1_tile["data_send_ctas"]),
                 split_local=bool(self._s1_tile["split_local"]),
                 activation=self.activation,
                 swiglu_limit=(self.swiglu_limit or None),
+                waves=s1_waves,
+                group_ready=self._single_kernel,
             )
             self.stage1_kernel_name = self._stage1.kernel_name
             self._init_stage2()
+            self._init_launchers()
             # Constructor-time clears and compiles must be complete everywhere
             # before the first generation can receive remote writes.
             torch.cuda.synchronize(self.device)
@@ -358,8 +397,8 @@ class MegaMoEInternode:
     def _validate_args(*, rank, world_size, model_dim, inter_dim, experts, topk, quant,
                        max_tok_per_rank, swiglu_limit, fanout_masks, activation, comm_quant,
                        route_cap) -> None:
-        if str(quant).lower() != "a4w4":
-            raise ValueError("MegaMoEInternode supports quant='a4w4' only")
+        if str(quant).lower() not in ("a4w4", "a8w4"):
+            raise ValueError("MegaMoEInternode supports quant=a4w4 or a8w4")
         if int(world_size) != WORLD_SIZE:
             raise ValueError(f"MegaMoEInternode requires world_size={WORLD_SIZE} (two nodes of {GPUS_PER_NODE})")
         if not 0 <= int(rank) < int(world_size):
@@ -509,11 +548,11 @@ class MegaMoEInternode:
         holds fixed pointers, and the PUT is retired before stage1 ends.
         """
         hidden, mtpr, topk = self.model_dim, self.mtpr, self.topk
-        self._record_quant = get_rail_record_quant(hidden, topk)
+        self._record_quant = get_rail_record_quant(hidden, topk, self._activation_dtype)
         rec, off_q, off_s, off_i, off_w = self._record_quant.layout
         base = int(self._runtime.window.local_ptr) + int(
             self.layout.stage1.offset("dispatch_staging", parity=0))
-        self._rec_q = _window_view(base + off_q, (mtpr, hidden // 2), "|u1", (rec, 1))
+        self._rec_q = _window_view(base + off_q, (mtpr, self.layout.stage1.wire.payload_bytes), "|u1", (rec, 1))
         self._rec_scale = _window_view(base + off_s, (mtpr, hidden // 32), "|u1", (rec, 1))
         self._rec_ids = _window_view(base + off_i, (mtpr, topk), "<i4", (rec, 4))
         self._rec_weights = _window_view(base + off_w, (mtpr, topk), "<f4", (rec, 4))
@@ -581,6 +620,7 @@ class MegaMoEInternode:
         self._k1_compile = {
             "model_dim": self.model_dim, "inter_dim": self.inter_dim, "experts": self.epr,
             "topk": self.topk, "npes": self.world_size, "max_tok": self.mtpr,
+            "a_dtype": self._activation_dtype,
             "recv_cap": self.world_size * self.mtpr,
             "comb_inp_nbytes": 2 * self.mtpr * self.topk * self.model_dim * 2,
             "BN": self._gemm2_bn, "cu_num": self._gemm2_cu, "gpus_per_node": GPUS_PER_NODE,
@@ -621,7 +661,8 @@ class MegaMoEInternode:
                 sdma_frac_q64=STAGE2_SDMA_FRAC_Q64, sdma_put_bytes=STAGE2_SDMA_PUT_BYTES,
                 sdma_arrival_woff=s2_off("plane_slot_arrived"),
                 sdma_arrival_plane=s2_plane("plane_slot_arrived"), sdma_max_chunks=sd_chunks,
-                sdma_ramp_chunks=STAGE2_SDMA_RAMP_CHUNKS)
+                sdma_ramp_chunks=STAGE2_SDMA_RAMP_CHUNKS,
+                sdma_remote_only=STAGE2_SDMA_REMOTE_ONLY)
 
         self._k2_scratch = torch.zeros(SCRATCH_WORDS, dtype=torch.int32, device=dev)
         self._k2_compile = {
@@ -640,13 +681,88 @@ class MegaMoEInternode:
             "parity_planes": tuple(s2_plane(n) for n in _K2_PARITY_PLANES),
             **({"sdma": True} if self._stage2_sdma else {}),
         }
+        s2_waves = self._s2_waves
+        if s2_waves != 4:
+            self._k1_compile["waves"] = s2_waves
+            self._k2_compile["threads"] = 64 * s2_waves
+        # Token-ready rail for the rail-bound low-topk SDMA path. High topk
+        # stays on the established local critical path (K3 measured regression).
+        token_ready = (STAGE2_TOKEN_READY and self._stage2_fused and self._s2_waves == 8
+                       and self._k1_compile["remote_first"]
+                       and self._stage2_sdma and self.topk <= 8 and self.mtpr >= 2048)
+        if token_ready:
+            # Token service shares the arrival plane with inv and SDMA counters.
+            # Keep the ordinary reduction when this optional state cannot fit.
+            from .stage2 import tr_layout
+            try:
+                tr_base = tr_layout(self.mtpr, self.topk)["base"]
+            except ValueError:
+                token_ready = False
+            else:
+                cdone_base = (256 + 2 * self.mtpr * self.topk * 4 + 255) // 256 * 256
+                cdone_end = cdone_base + self._k1_compile["sdma_max_chunks"] * 128
+                token_ready = (cdone_end <= tr_base
+                               and self._k2_compile["inbox_bytes"] < (1 << 31)
+                               and self._chunk_tokens >= s2_waves
+                               and self.comm_quant == "fp8")
+        if token_ready:
+            tiles = (s1.max_route_rows + TILE_M - 1) // TILE_M
+            # Column units finished per m-block; the last one counts its rows.
+            self._tr_mcnt = torch.zeros(tiles + 1, dtype=torch.int32, device=dev)
+            self._k1_ptrs["arg_tr_mcnt"] = self._tr_mcnt.data_ptr()
+            self._tr_sdprog = torch.empty(
+                (GPUS_PER_NODE, self._k1_compile["sdma_max_chunks"]),
+                dtype=torch.int64, device=dev)
+            self._k1_ptrs["arg_tr_sdprog"] = self._tr_sdprog.data_ptr()
+            self._k1_compile["sdma_put_bytes"] = 2 << 20
+            self._k1_compile["token_ready"] = True
+            self._k2_compile.update(token_ready=True, rail_idx_off=s2_off("rail_idx"),
+                                    rail_idx_plane=s2_plane("rail_idx"))
 
+
+    def _init_launchers(self) -> None:
+        """Fix the specialization once; compiled callables belong to this instance."""
+        self._compiled = {}
+        self._launchers = {"record_quant": self._record_quant}
+        if self._single_kernel:
+            self._launchers["single"] = compile_single_kernel(
+                self._stage1, self._k1_compile, self._k2_compile, WORKER_BLOCKS
+            )
+        else:
+            self._launchers["stage1"] = self._stage1
+            if self._stage2_fused:
+                self._launchers["stage2"] = compile_stage2_fused(
+                    self._k1_compile, self._k2_compile, WORKER_BLOCKS
+                )
+            else:
+                self._launchers["gemm2"] = compile_mega_moe_stage2(**self._k1_compile)
+                self._launchers["combine"] = compile_stage2_node_combine(**self._k2_compile)
+
+    def _compile_launcher(self, name, args) -> None:
+        """Compile and execute once, or only compile during preload.
+
+        Keep an execution cache intact across compile-only contexts. FlyDSL
+        can leak an MLIR context on compilation failure; unwind it so a retry
+        behaves the same as the shared tensor_shim compile path.
+        """
+        compile_only = env.compile.compile_only
+        try:
+            compiled = flyc.compile(self._launchers[name], *args)
+        except Exception:
+            try:
+                while ir.Context.current is not None:
+                    ir.Context.current.__exit__(None, None, None)
+            except Exception:  # noqa: BLE001, S110
+                pass
+            raise
+        if not compile_only and compiled is not None:
+            self._compiled[name] = compiled
 
     # forward
 
     def quantize(self, x_bf16: torch.Tensor):
-        """Per-1x32 MXFP4 quant: (packed FP4 ``[T, H/2]``, E8M0 ``[T, H/32]``)."""
-        return per_1x32_mx_quant(x_bf16, quant_mode="fp4")
+        """Return MXFP4 ``[T, H/2]`` or MXFP8 ``[T, H]`` and E8M0 ``[T, H/32]``."""
+        return per_1x32_mx_quant(x_bf16, quant_mode=self._activation_dtype)
 
     def forward(self, x_bf16, wts, topk_ids, *, stream=None, slice_output=True):
         """Return this rank's BF16 output rows for BF16 input ``[mtpr, H]``."""
@@ -657,19 +773,25 @@ class MegaMoEInternode:
         self._check_routing(x_bf16, wts, topk_ids)
         launch_stream = self._fx_stream(stream)
         # One launch quantizes x and packs it with ids/weights into the records.
-        _run_compiled(
-            self._record_quant,
+        args = (
             x_bf16.data_ptr(), topk_ids.data_ptr(), wts.data_ptr(), self._rec_q.data_ptr(),
             self.mtpr, self._quant_grid, launch_stream,
         )
+        compiled = self._compiled.get("record_quant")
+        if compiled is None or env.compile.compile_only:
+            self._compile_launcher("record_quant", args)
+        else:
+            compiled(*args)
         return self._run(wts, topk_ids, launch_stream, slice_output)
 
     def forward_prequant(self, x_q, scales, wts, topk_ids, *, stream=None, slice_output=True):
         """Same as :meth:`forward` for input already quantized by :meth:`quantize`."""
-        if x_q.dtype not in _FP4_DTYPES or not x_q.is_contiguous():
-            raise ValueError("x_q must be contiguous packed FP4 (uint8 or float4_e2m1fn_x2)")
-        if tuple(x_q.shape) != (self.mtpr, self.model_dim // 2):
-            raise ValueError(f"x_q must be [{self.mtpr}, {self.model_dim // 2}], got {tuple(x_q.shape)}")
+        payload_dtype = (torch.float8_e4m3fn,) if self.quant == "a8w4" else _FP4_DTYPES
+        payload_cols = self.layout.stage1.wire.payload_bytes
+        if x_q.dtype not in payload_dtype or not x_q.is_contiguous():
+            raise ValueError(f"x_q must be contiguous {self._activation_dtype} payload, got {x_q.dtype}")
+        if tuple(x_q.shape) != (self.mtpr, payload_cols):
+            raise ValueError(f"x_q must be [{self.mtpr}, {payload_cols}], got {tuple(x_q.shape)}")
         if (scales.dtype != torch.uint8 or not scales.is_contiguous()
                 or tuple(scales.shape) != (self.mtpr, self.model_dim // 32)):
             raise ValueError(f"scales must be contiguous uint8 E8M0 [{self.mtpr}, {self.model_dim // 32}]")
@@ -712,31 +834,44 @@ class MegaMoEInternode:
     def _run(self, wts, topk_ids, stream, slice_output):
         runtime = self._runtime
         window = runtime.window
-        # x comes from the records; stage1 reads routing from the caller's
-        # contiguous tensors.
-        _run_compiled(
-            self._stage1,
+        s1_args = (
             runtime.dev_comm.ptr, window.handle, window.local_ptr,
             self._rec_q.data_ptr(), self._rec_scale.data_ptr(),
             wts.data_ptr(), topk_ids.data_ptr(),
             self._w1.data_ptr(), self._w1_scale.data_ptr(), self.mtpr,
+        )
+        p = self._k1_ptrs
+        gemm2_args = (
+            *(p[k] for k in ("arg_aq", "arg_ascale", "arg_bq", "arg_bscale", "arg_eids",
+                             "arg_cumsum", "arg_stids", "arg_sweights", "arg_trb", "arg_p2p")),
+            (p["row_capacity"] + BM - 1) // BM,
+            self.inter_dim, self.model_dim,
+            p["arg_arrival_count"], p["arg_generation"],
+            p["arg_a_tile_map"], p["local_rank"],
+        )
+        output_args = (self._output.data_ptr(), self._k2_scratch.data_ptr(), self.mtpr)
+        extra_args = (
+            *(p.get(k, 0) for k in ("arg_expert_count", "arg_sd_send", "arg_sd_tb",
+                                  "arg_sd_plan", "arg_sd_cdone", "arg_tr_mcnt", "arg_tr_sdprog")),
             stream,
         )
-        if self._stage2_fused:
-            run_stage2_fused(
-                k1_ptrs=self._k1_ptrs, k1_compile=self._k1_compile,
-                dev_comm=runtime.dev_comm.ptr, arena_win=window.handle,
-                arena_ptr=window.local_ptr, arg_output_bf16=self._output.data_ptr(),
-                arg_scratch=self._k2_scratch.data_ptr(), local_tokens=self.mtpr,
-                k2_ctas=WORKER_BLOCKS, stream=stream, k2_compile=self._k2_compile,
-            )
+        if self._single_kernel:
+            launches = (("single", (*s1_args, *gemm2_args, *output_args, *extra_args)),)
         else:
-            run_mega_moe_stage2(**self._k1_ptrs, stream=stream, **self._k1_compile)
-            run_stage2_node_combine(
-                runtime.dev_comm.ptr, window.handle, window.local_ptr,
-                self._output.data_ptr(), self._k2_scratch.data_ptr(), self.mtpr,
-                WORKER_BLOCKS, stream, **self._k2_compile,
-            )
+            launches = (("stage1", (*s1_args, stream)),)
+            if self._stage2_fused:
+                launches += (("stage2", (*gemm2_args, *s1_args[:3], *output_args, *extra_args)),)
+            else:
+                launches += (
+                    ("gemm2", (*gemm2_args, stream)),
+                    ("combine", (*s1_args[:3], *output_args, WORKER_BLOCKS, stream)),
+                )
+        for name, args in launches:
+            compiled = self._compiled.get(name)
+            if compiled is None or env.compile.compile_only:
+                self._compile_launcher(name, args)
+            else:
+                compiled(*args)
         return self._output[: self.mtpr] if slice_output else self._output
     def close(self) -> None:
         if self._closed:

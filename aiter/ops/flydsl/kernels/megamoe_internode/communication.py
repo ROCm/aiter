@@ -18,12 +18,12 @@ per-call ``defer_doorbell`` (+ ``posted_before_flush`` when present).  See
 
 from __future__ import annotations
 
+import flydsl.compiler as flyc
 import mori.cco.device.flydsl as cco
 from flydsl import expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as _llvm_d
 from flydsl._mlir.dialects import rocdl as _mlir_rocdl
-from flydsl.compiler.ast_rewriter import ASTRewriter
 
 from aiter.ops.flydsl.kernels.communication_ops_utils import (
     atomic_add_agent,
@@ -34,13 +34,6 @@ from aiter.ops.flydsl.kernels.communication_ops_utils import (
     store_i32_system,
     store_i64_global_system,
 )
-
-
-def traced(fn):
-    """Run FlyDSL's AST rewriting over a helper that kernel bodies call
-    (upstream dropped this from communication_ops_utils)."""
-    return ASTRewriter.transform(fn)
-
 
 __all__ = [
     "atomic_add_agent",
@@ -230,7 +223,7 @@ def atomic_add_agent_acq_rel(addr_i64, value):
     ).res
 
 
-@traced
+@flyc.jit
 def spin_until_ge_i64_system_rx(addr_i64, expected):
     """spin_until_ge_i64_system,但轮询用 relaxed system load(不带 buffer_inv),
     看到目标值之后再做一次 acquire load。语义不变:acquire 仍然发生在观察到值之后、
@@ -241,7 +234,7 @@ def spin_until_ge_i64_system_rx(addr_i64, expected):
     return fx.Int64(load_i64_global_system(addr_i64))
 
 
-@traced
+@flyc.jit
 def spin_until_ge_i64_sleep_rx(addr_i64, expected, sleep):
     """spin_until_ge_i64_sleep 的 relaxed 轮询版,退出时一次 acquire load(见 _system_rx)。"""
     cur = fx.Int64(load_i64_global_system_relaxed(addr_i64))

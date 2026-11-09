@@ -16,15 +16,15 @@ import flydsl.expr as fx
 from ..mxfp4_gemm_common import kbs_c_n1_for
 
 
-def _e8m0_roundup(amax_f32):
-    wi = (amax_f32 * fx.Float32(1.0 / 6.0)).bitcast(fx.Int32)
+def _e8m0_roundup(amax_f32, max_norm=6.0):
+    wi = (amax_f32 * fx.Float32(1.0 / float(max_norm))).bitcast(fx.Int32)
     bexp = (wi + fx.Int32(0x7FFFFF)).shrui(fx.Int32(23)) & fx.Int32(0xFF)
     lt = fx.Uint32(bexp) < fx.Uint32(254)
     return lt.select(bexp, fx.Int32(254))
 
 
-def _e8m0_from_amax(amax_f32):
-    e8m0 = _e8m0_roundup(amax_f32)
+def _e8m0_from_amax(amax_f32, max_norm=6.0):
+    e8m0 = _e8m0_roundup(amax_f32, max_norm=max_norm)
     qscale = (e8m0 << fx.Int32(23)).bitcast(fx.Float32)
     return e8m0, qscale
 

@@ -101,8 +101,11 @@ class Stage1DispatchWire:
     world_size: int = 16
     num_qp: int = 4
     max_tokens: int = 0
+    activation_dtype: str = "fp4"
 
     def __post_init__(self) -> None:
+        if self.activation_dtype not in ("fp4", "fp8"):
+            raise ValueError("activation_dtype must be fp4 or fp8")
         if self.hidden <= 0 or self.hidden % 128:
             raise ValueError("hidden must be positive and divisible by 128")
         if not 0 < self.topk <= 16:
@@ -120,7 +123,7 @@ class Stage1DispatchWire:
 
     @property
     def payload_bytes(self) -> int:
-        return self.hidden // 2
+        return self.hidden // (1 if self.activation_dtype == "fp8" else 2)
 
     @property
     def scale_bytes(self) -> int:
@@ -221,6 +224,7 @@ class Stage1ArenaLayout:
     # 的推送方/转发方直接 LSA 读。payload 阶段因此没有任何跨设备原子。
     regions: tuple[Stage1ArenaRegion, ...]
     total_bytes: int
+    activation_dtype: str = "fp4"
 
     @property
     def local_experts(self) -> int:
@@ -279,6 +283,7 @@ class Stage1ArenaLayout:
             world_size=self.world_size,
             num_qp=self.num_qp,
             max_tokens=self.max_tokens,
+            activation_dtype=self.activation_dtype,
         )
 
     @classmethod
@@ -299,7 +304,12 @@ class Stage1ArenaLayout:
         parity_depth: int = 2,
         num_qp: int = 4,
         embed_stage2_bytes: int = 0,
+        send_queue_capacity: int = 0,
+        activation_dtype: str = "fp4",
     ) -> Stage1ArenaLayout:
+        if activation_dtype not in ("fp4", "fp8"):
+            raise ValueError("activation_dtype must be fp4 or fp8")
+        a_pack = 1 if activation_dtype == "fp8" else 2
         hidden = int(hidden)
         inter = int(inter)
         experts = int(experts)
@@ -373,9 +383,9 @@ class Stage1ArenaLayout:
         # offset into its 64-bit base (gemm1 aqout_row_base); one m-block
         # still indexes in i32.
         signed_i32_payloads = {
-            "grouped_input_q": source_capacity * (hidden // 2),
-            "grouped_input_scale": max_route_rows * (hidden // 32),
-            "h1_output_q (one m-block)": block_m * tile_group * (inter // 2),
+            "grouped_input_q": source_capacity * (hidden // a_pack),
+            "grouped_input_scale": source_capacity * (hidden // 32),
+            "h1_output_q (one m-block)": block_m * tile_group * (inter // a_pack),
             "h1_output_scale": max_route_rows * (inter // 32),
         }
         oversized_payloads = {
@@ -397,6 +407,7 @@ class Stage1ArenaLayout:
             world_size=world_size,
             num_qp=num_qp,
             max_tokens=max_tokens,
+            activation_dtype=activation_dtype,
         )
         chunks = (max_tokens + wire.records_per_chunk - 1) // wire.records_per_chunk
         input_scale_bytes = hidden // 32
@@ -456,30 +467,31 @@ class Stage1ArenaLayout:
             ("tile_alloc", (parity_depth, 2), torch.int32, 64),
             ("tile_row_done", (parity_depth, max_route_tiles), torch.int32, 64),
             ("tile_expert", (parity_depth, max_route_tiles), torch.int32, 64),
-            ("tile_row_base", (parity_depth, max_route_tiles), torch.int32, 64),
+            # GEMM2 keeps sorted IDs separate from physical expert IDs.
+            ("tile_expert_sorted", (parity_depth, max_route_tiles), torch.int32, 64),
             ("num_valid", (parity_depth,), torch.int32, 64),
             # Quantized A is stored once per global source token on each
             # selected destination rank.  tile_row_input maps every grouped
             # expert route back to that shared source row; scales remain in
-            # grouped BM32 layout for the existing GMM1 scale loader.
+            # source-major layout; GMM1 gathers and shuffles scales into LDS.
             ("tile_row_input", (parity_depth, max_route_rows), torch.int32, 64),
             ("tile_row_source", (parity_depth, max_route_rows), torch.int32, 64),
             ("tile_row_weight", (parity_depth, max_route_rows), torch.float32, 64),
             (
                 "grouped_input_q",
-                (parity_depth, source_capacity, hidden // 2),
+                (parity_depth, source_capacity, hidden // a_pack),
                 torch.uint8,
                 256,
             ),
             (
                 "grouped_input_scale",
-                (parity_depth, max_route_rows * input_scale_bytes),
+                (parity_depth, source_capacity * input_scale_bytes),
                 torch.uint8,
                 256,
             ),
             (
                 "h1_output_q",
-                (parity_depth, max_route_rows, inter // 2),
+                (parity_depth, max_route_rows, inter // a_pack),
                 torch.uint8,
                 256,
             ),
@@ -497,34 +509,14 @@ class Stage1ArenaLayout:
             ("entry_count", (1,), torch.int64, 64),
             ("epoch_gate", (1,), torch.int64, 64),
             ("error_count", (1,), torch.int32, 64),
-            # 自旋超时标记:每个自旋点一个槽,挂死时由限时自旋写 generation。
-            # Diagnostic split-fanout completion flags. Appended so every
-            # existing production region keeps its byte offset unchanged.
-            # Split diagnostic: second quant CTA publishes one generation flag
-            # per token before the metadata-owning first CTA marks staging ready.
-            # Sparse multi-CTA transport. Producer CTAs post token data WQEs
-            # without ringing and leave one local 0/1 decision per token in
-            # sparse_remote_token_ready.  The fixed CCO CTA ballots 32 decisions
-            # into each QP's terminal ready word and flushes that QP once.
-            # Optional correctness-only instrumentation for the sparse
-            # tile-ready pipeline.  Appending these preserves every pre-v3
-            # region offset. Production builds leave the counters at zero so
-            # they add no per-tile/job atomic traffic to steady runs.
-            # Expert-major Stage2 view.  Physical tiles stay in arrival order
-            # (that is what keeps dispatch single-pass and compact); these
-            # regions carry the permutation to expert-major order plus the two
-            # per-row metadata arrays Stage2 indexes by absolute row.  GMM1
-            # writes h1_output straight to the permuted slot, so no activation
-            # is ever copied.  Appended so every existing region keeps its
-            # byte offset unchanged.
-            ("tile_expert_sorted", (parity_depth, max_route_tiles), torch.int32, 64),
+            # GEMM2 reads expert-major IDs and maps them to physical activation
+            # tiles, so sorting never copies the quantized activation payload.
             # h1_phys:tile_dst_of_src 的逆(排序后第 t 个 tile 的物理 tile);stage2 按它读 A。
             ("tile_src_of_dst", (parity_depth, max_route_tiles), torch.int32, 64),
-            # early_local_gmm(F5):本地组封好即发布的 generation 字;GMM1 job 领取头
-            # (word0 本地/word16 远端,各占一行;每次 launch 由初始化者清零);按「先本地组后远端组」排的物理组号表。
+            # Local sealing must precede final metadata publication. Job heads
+            # also contain reservation counters; their cache-line spacing is ABI.
             ("h1_local_eos", (parity_depth,), torch.int64, 64),
             ("gmm1_job_head", (parity_depth, 32), torch.int32, 64),
-            ("gmm1_group_list", (parity_depth, max_route_tiles), torch.int32, 64),
         ]
 
         if tile_group > 1:
@@ -539,6 +531,57 @@ class Stage1ArenaLayout:
                         64,
                     )
                 )
+
+        # Single fused kernel: per physical tile group, the GMM1 jobs done
+        # (words [0, n)) and the generation whose h1 is complete (words
+        # [n, 2n)); GEMM2 waits on the latter instead of a grid barrier.
+        specs.append(
+            (
+                "h1_grp_sync",
+                (parity_depth, 2 * (max_route_tiles // tile_group + 1)),
+                torch.int32,
+                64,
+            )
+        )
+
+        # split 路径的 GMM1 就绪队列:每项 (generation << 32) | 物理组号,generation 即有效标记,
+        # 不需要每代清零;写入位置由 gmm1_job_head word 8 的原子分配。
+        specs.append(
+            (
+                "gmm1_ready_q",
+                (parity_depth, max_route_tiles // tile_group + 1),
+                torch.int64,
+                64,
+            )
+        )
+
+        if int(send_queue_capacity):
+            if int(send_queue_capacity) < 0:
+                raise ValueError("send_queue_capacity must be nonnegative")
+            # Local metadata-to-copy handoff. Eight-wave metadata batches use
+            # at most this many records; 64 extra ready slots cover terminal
+            # claims by all supported copy roles, without reading out of bounds.
+            send_nb = min(512 // topk, block_m * tile_group) // 8 * 8
+            send_dw = (8 + send_nb + 4 * local_experts + 15) // 16 * 16
+            specs.extend(
+                [
+                    ("send_job_state", (parity_depth, 32), torch.int32, 64),
+                    ("send_job_eos", (parity_depth,), torch.int64, 64),
+                    (
+                        "send_job_ready",
+                        (parity_depth, int(send_queue_capacity) + 64),
+                        torch.int64,
+                        64,
+                    ),
+                    (
+                        "send_job_desc",
+                        (parity_depth, int(send_queue_capacity), send_dw),
+                        torch.int32,
+                        64,
+                    ),
+                    ("send_join", (parity_depth, 2 * gpus_per_node), torch.int32, 64),
+                ]
+            )
 
         # 被 RDMA(rail GDA)读写的 region 排在窗口最前,其后预留 stage2 整块(embed_stage2_bytes),
         # 再放其余(LSA/本地,按 max_route_rows 放大的大块都在这里)。CCO 的 GDA 把整窗注册成一个
@@ -595,6 +638,7 @@ class Stage1ArenaLayout:
             tile_group=tile_group,
             regions=tuple(regions),
             total_bytes=_align_up(offset, 4096),
+            activation_dtype=activation_dtype,
         )
 
     def region(self, name: str) -> Stage1ArenaRegion:
@@ -822,6 +866,9 @@ class Stage2ArenaLayout:
                 256,
             ),
             ("return_group_ready", (parity_depth, groups), torch.int64, 64),
+            # Token-ready rail: per parity [send ids | received ids] of the
+            # remote plane, batch position -> token (rides the rail with rows).
+            ("rail_idx", (parity_depth, 2, max_tokens), torch.int32, 256),
             ("return_consumed", (parity_depth,), torch.int64, 64),
             (
                 "node_partial_ready",
@@ -868,6 +915,7 @@ class Stage2ArenaLayout:
             "remote_partial_rx",
             "return_group_ready",
             "return_consumed",
+            "rail_idx",
         )
         specs = [sp for sp in specs if sp[0] in _rdma_first] + [
             sp for sp in specs if sp[0] not in _rdma_first

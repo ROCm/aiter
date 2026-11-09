@@ -172,6 +172,7 @@ def parse_args(argv=None):
         help="cross-node rail payload format of the fused operator",
     )
     p.add_argument("--smallop-quant", choices=("a4w4", "a8w4"))
+    p.add_argument("--fused-quant", choices=("a4w4", "a8w4"), default="a4w4")
     p.add_argument("--fmoe-csv", help="fused_moe tune table for the small-op baseline")
     p.add_argument(
         "--allow-tune-miss",
@@ -326,6 +327,7 @@ def stage2_tile(net, tpr):
         resolve_gemm2_cu,
         resolve_stage2_fused,
         resolve_stage2_sdma,
+        single_kernel_possible,
     )
 
     tuned = lookup_stage2_tune(
@@ -345,9 +347,15 @@ def stage2_tile(net, tpr):
         else f"gemm2_bn={bn_source},gemm2_cu={cu_source}"
     )
     s1 = stage1_tile(net, tpr)
-    remote_first = bool(resolve_stage2_fused(tpr) and s1["split_local"])
+    fused = resolve_stage2_fused(tpr)
+    remote_first = bool(fused and s1["split_local"])
     sdma, comm_source = resolve_stage2_sdma(tpr, tuned)
     sdma = sdma and remote_first
+    # The single kernel switches the fused Stage2 on at every TPR.
+    if not fused and single_kernel_possible(
+        s1["tile_group"], sdma, net["model_dim"] // bn
+    ):
+        remote_first = bool(s1["split_local"])
     bm, _ = resolve_gemm2_bm(
         tuned, tile_group=s1["tile_group"], fused=remote_first, sdma=sdma
     )
@@ -395,7 +403,11 @@ def check_fused_config(stage1_name, stage2_names, comm_quant, tile, s2tile):
     # A fused stage2 kernel carries both names: megamoe_s2f_<k1>__<k2>.
     split = []
     for n in stage2_names:
-        if n.startswith("megamoe_s2f_"):
+        if n.startswith("megamoe_one_"):
+            # megamoe_one_<stage1>__<k1>__<k2>: Stage1 is checked by name above.
+            split += ["megamoe_" + x for x in n[len("megamoe_one_") :].split("__")[1:]]
+            split.append("")  # count as fused (grid = resident CTAs)
+        elif n.startswith("megamoe_s2f_"):
             a, _, b = n[len("megamoe_s2f_") :].partition("__")
             split += ["megamoe_" + a, "megamoe_" + b]
         else:
@@ -516,7 +528,17 @@ class MoriSmallOp:
     the EP16 rows of the model tables use the real TopK.
     """
 
-    def __init__(self, quant, shape, shared, rank, *, swiglu_limit, a8w4_weights=None):
+    def __init__(
+        self,
+        quant,
+        shape,
+        shared,
+        rank,
+        *,
+        swiglu_limit,
+        a8w4_weights=None,
+        separated_weights=False,
+    ):
         import mori
         import torch
 
@@ -525,6 +547,8 @@ class MoriSmallOp:
         from aiter.ops.flydsl.moe_common import GateMode
 
         self.torch, self.quant, self.shape, self.shared = torch, quant, shape, shared
+        self.rank = rank
+        self._native_a8_reference = quant == "a8w4" and separated_weights
         self.blocks, self.rdma_blocks = MORI_BLOCKS[quant]
         if quant == "a4w4":
             from aiter.ops.quant import dynamic_per_group_scaled_quant
@@ -543,10 +567,23 @@ class MoriSmallOp:
             from aiter.ops.flydsl.kernels.mega_moe.quant import per_1x32_mx_quant
 
             self._quant_op = per_1x32_mx_quant
-            self.weights = a8w4_weights
+            w = shared.prepared_weights
+            self.weights = (
+                (w.w1, w.w1_scale, w.w2, w.w2_scale)
+                if separated_weights
+                else a8w4_weights
+            )
             data_type = torch.float8_e4m3fn
-            self.activation = aiter.ActivationType.Silu
-            self.gate_mode = GateMode.INTERLEAVE.value
+            self.activation = (
+                aiter.ActivationType.Situv2
+                if shape.activation == "situv2"
+                else aiter.ActivationType.Silu
+            )
+            self.gate_mode = (
+                GateMode.SEPARATED.value
+                if separated_weights
+                else GateMode.INTERLEAVE.value
+            )
         self.swiglu_limit = float(swiglu_limit)
         self._fused_moe = fused_moe
         config = mori.ops.EpDispatchCombineConfig(
@@ -613,24 +650,29 @@ class MoriSmallOp:
         w1, w1_scale, w2, w2_scale = self.weights
         import aiter
 
-        local_out = self._fused_moe(
-            dispatched,
-            w1,
-            w2,
-            recv_weights,
-            recv_ids,
-            shared.local_expert_mask,
-            activation=self.activation,
-            quant_type=aiter.QuantType.per_1x32,
-            doweight_stage1=False,
-            w1_scale=w1_scale,
-            w2_scale=w2_scale,
-            a1_scale=recv_scales,
-            num_local_tokens=recv_tokens,
-            dtype=torch.bfloat16,
-            swiglu_limit=self.swiglu_limit,
-            gate_mode=self.gate_mode,
-        )
+        if self._native_a8_reference:
+            local_out = self._reference_a8(
+                dispatched, recv_scales, recv_ids, recv_weights, recv_tokens
+            )
+        else:
+            local_out = self._fused_moe(
+                dispatched,
+                w1,
+                w2,
+                recv_weights,
+                recv_ids,
+                shared.local_expert_mask,
+                activation=self.activation,
+                quant_type=aiter.QuantType.per_1x32,
+                doweight_stage1=False,
+                w1_scale=w1_scale,
+                w2_scale=w2_scale,
+                a1_scale=recv_scales,
+                num_local_tokens=recv_tokens,
+                dtype=torch.bfloat16,
+                swiglu_limit=self.swiglu_limit,
+                gate_mode=self.gate_mode,
+            )
         result = self.op.combine(
             local_out,
             None,
@@ -640,6 +682,74 @@ class MoriSmallOp:
             warp_per_block=4,
         )
         return result[0] if isinstance(result, tuple) else result
+
+    def _reference_a8(self, dispatched, scales, ids, weights, num_tokens):
+        """Independent FP32 matmuls on the candidate's quantized weights.
+
+        The small-op selector uses FP4 for separated SiLU weights, so it
+        cannot serve as a native A8 reference for this ABI. MORI retains
+        dispatch/combine ownership; PyTorch checks the expert MLP arithmetic.
+        """
+        from aiter.utility.fp4_utils import e8m0_to_f32, mxfp4_to_f32
+
+        torch, shape = self.torch, self.shape
+        e, h, k = shape.local_experts, shape.hidden, shape.inter
+        if not hasattr(self, "_reference_dense_weights"):
+            w1, s1, w2, s2 = (w.view(torch.uint8) for w in self.weights)
+            q1 = (
+                w1.reshape(e, 2 * k // 16, h // 64, 2, 16, 16)
+                .permute(0, 1, 4, 2, 3, 5)
+                .contiguous()
+                .reshape(e, 2 * k, h // 2)
+            )
+            q2 = (
+                w2.reshape(e, h // 16, k // 128, 4, 16, 16)
+                .permute(0, 1, 4, 2, 3, 5)
+                .contiguous()
+                .reshape(e, h, k // 2)
+            )
+            sc1 = (
+                s1.reshape(e * 2 * k // 32, h // 256, 4, 16, 2, 2)
+                .permute(0, 5, 3, 1, 4, 2)
+                .contiguous()
+                .reshape(e, 2 * k, h // 32)
+            )
+            sc2 = (
+                s2.reshape(e, h // 32, k // 256, 4, 16, 2, 2)
+                .permute(0, 1, 6, 4, 2, 5, 3)
+                .contiguous()
+                .reshape(e, h, k // 32)
+            )
+            self._reference_dense_weights = (
+                mxfp4_to_f32(q1) * e8m0_to_f32(sc1).repeat_interleave(32, dim=-1),
+                mxfp4_to_f32(q2) * e8m0_to_f32(sc2).repeat_interleave(32, dim=-1),
+            )
+        w1, w2 = self._reference_dense_weights
+        n = int(num_tokens.item()) if hasattr(num_tokens, "item") else int(num_tokens)
+        x = dispatched[:n].float() * e8m0_to_f32(scales[:n]).repeat_interleave(
+            32, dim=-1
+        )
+        out = torch.zeros(
+            (dispatched.shape[0], h), dtype=torch.float32, device=dispatched.device
+        )
+        for expert in range(e):
+            row, slot = torch.where(ids[:n] == self.rank * e + expert)
+            if row.numel() == 0:
+                continue
+            gate, up = (x[row] @ w1[expert].T).chunk(2, dim=-1)
+            if shape.activation == "situv2":
+                activated = torch.tanh(gate) * torch.sigmoid(gate) * torch.tanh(up)
+            else:
+                if self.swiglu_limit > 0:
+                    gate, up = gate.clamp(max=self.swiglu_limit), up.clamp(
+                        -self.swiglu_limit, self.swiglu_limit
+                    )
+                activated = gate * torch.sigmoid(gate) * up
+            aq, asc = self._quant_op(activated.bfloat16(), quant_mode="fp8")
+            a = aq.float() * e8m0_to_f32(asc).repeat_interleave(32, dim=-1)
+            values = ((a @ w2[expert].T) * weights[row, slot, None]).bfloat16().float()
+            out.index_add_(0, row, values)
+        return out.bfloat16()
 
 
 # --------------------------------------------------------------------------
@@ -679,6 +789,8 @@ def time_replays(torch, dist, graph, device, warmup, iters):
 
 
 def kernel_class(name):
+    if name.startswith("megamoe_one_"):  # Stage1 + fused stage2 in one launch
+        return "one"
     if "megamoe_stage1" in name:
         return "stage1"
     if name.startswith("megamoe_k1"):  # fused kernel1: GEMM2 + push
@@ -910,7 +1022,12 @@ class Runner:
             quant == "a4w4" and "smallop" in args.paths
         ):
             reference = MoriSmallOp(
-                "a4w4", shape, shared, self.rank, swiglu_limit=net["swiglu_limit"]
+                args.fused_quant if "fused" in args.paths else "a4w4",
+                shape,
+                shared,
+                self.rank,
+                swiglu_limit=net["swiglu_limit"],
+                separated_weights=True,
             )
         if "fused" in args.paths:
             rec["fused"] = self.run_fused(shape, shared, cap, reference, fixture)
@@ -918,8 +1035,10 @@ class Runner:
             small = (
                 reference
                 if quant == "a4w4"
+                and reference is not None
+                and reference.quant == quant
                 else MoriSmallOp(
-                    "a8w4",
+                    quant,
                     shape,
                     shared,
                     self.rank,
@@ -955,7 +1074,7 @@ class Runner:
                 inter_dim=shape.inter,
                 experts=shape.experts,
                 topk=shape.topk,
-                quant="a4w4",
+                quant=args.fused_quant,
                 w1=w.w1,
                 w1_scale=w.w1_scale,
                 w2=w.w2,
@@ -970,8 +1089,14 @@ class Runner:
 
         op = make_op()
         res = {
+            "quant": args.fused_quant,
+            "reference": (
+                "mori_dispatch_pytorch_a8_mlp_mori_combine"
+                if args.fused_quant == "a8w4"
+                else "mori_fused_moe"
+            ),
             "stage1_kernel": op.stage1_kernel_name,
-            "stage1_tile": stage1_tile(self.net, tokens),
+            "stage1_tile": dict(op._s1_tile),
             "stage2_tile": stage2_tile(self.net, tokens),
             "checks": [],
         }
@@ -1207,6 +1332,7 @@ def print_case(net, args, rec):
             ("GEMM2 (k1)", "gemm2"),
             ("k2", "k2"),
             ("stage2", "stage2"),
+            ("one kernel", "one"),
             ("replay span", "span"),
         ):
             p(f"    {label:<12} {fmt(fb.get(key)):>8}")
