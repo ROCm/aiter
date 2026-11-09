@@ -2190,8 +2190,15 @@ class Gfx1250Pipeline:
                             )[0]
                         )
                     )
-        for token_i, state in range(begin, end, t.TOKENS, init=initial):
-            token_base = fx.Int32(token_i)
+        # Active D128 single-task tiles contain one matching plan/page unit.
+        one_page = (
+            t.head_dim == 128 and t.single_task_tile and t.plan_tile_tokens == t.TOKENS
+        )
+        loop_begin = fx.Int32(0) if const_expr(one_page) else begin
+        loop_end = fx.Int32(1) if const_expr(one_page) else end
+        loop_step = 1 if one_page else t.TOKENS
+        for token_i, state in range(loop_begin, loop_end, loop_step, init=initial):
+            token_base = begin if const_expr(one_page) else fx.Int32(token_i)
             buffer = ((token_base - begin) // t.TOKENS) % t.buffers
             if const_expr(t.use_tdm):
                 tdm_ops.tensor_wait(0)
