@@ -1,0 +1,18 @@
+{
+  "any": {
+    "BLOCK_SIZE_M": 32,
+    "BLOCK_SIZE_N": 32,
+    "BLOCK_SIZE_K": 64,
+    "GROUP_SIZE_M": 1,
+    "NUM_KSPLIT": 4,
+    "num_warps": 4,
+    "num_stages": 2,
+    "waves_per_eu": 0,
+    "matrix_instr_nonkdim": 16,
+    "cache_modifier": "",
+    "REVERSE": true,
+    "USE_XCD": true,
+    "REDUCE_BLOCK": 256,
+    "LOOP_UNROLL_FACTOR": 1
+  }
+}

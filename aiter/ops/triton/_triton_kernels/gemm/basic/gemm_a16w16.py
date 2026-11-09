@@ -27,6 +27,9 @@ _gemm_a16w16_repr = make_kernel_repr(
         "use_activation",
         "ADD_BIAS",
         "SKIP_REDUCE",
+        "BIAS_ON_ROWS",
+        "GROUP_SPLIT_K",
+        "LOOP_UNROLL_FACTOR",
     ],
 )
 
@@ -73,6 +76,9 @@ def _gemm_a16_w16_kernel(
     ADD_BIAS: tl.constexpr,
     SKIP_REDUCE: tl.constexpr,
     NUM_XCDS: tl.constexpr,
+    BIAS_ON_ROWS: tl.constexpr = False,
+    GROUP_SPLIT_K: tl.constexpr = False,
+    LOOP_UNROLL_FACTOR: tl.constexpr = 1,
 ):
     """Kernel for computing the matmul C = A x B.
     A has shape (M, K), B has shape (K, N) and C has shape (M, N)
@@ -98,7 +104,7 @@ def _gemm_a16_w16_kernel(
     pid_k = pid_unified % NUM_KSPLIT
     pid = pid_unified // NUM_KSPLIT
 
-    if NUM_KSPLIT == 1:
+    if NUM_KSPLIT == 1 or GROUP_SPLIT_K:
         pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
     else:
         pid_m = pid // num_pid_n
@@ -130,10 +136,17 @@ def _gemm_a16_w16_kernel(
         acc_dtype = tl.float32 if c_ptr.type.element_ty != tl.int8 else tl.int32
         if ADD_BIAS:
             if NUM_KSPLIT == 1 or (SKIP_REDUCE and pid_k == 0):
-                accumulator = tl.load(bias_ptr + offs_bn).to(dtype=acc_dtype)
-                accumulator = tl.broadcast_to(
-                    accumulator[None, :], (BLOCK_SIZE_M, BLOCK_SIZE_N)
-                )
+                # The oriented wrapper computes W @ X.T; its bias follows rows.
+                if BIAS_ON_ROWS:
+                    accumulator = tl.load(bias_ptr + offs_am).to(dtype=acc_dtype)
+                    accumulator = tl.broadcast_to(
+                        accumulator[:, None], (BLOCK_SIZE_M, BLOCK_SIZE_N)
+                    )
+                else:
+                    accumulator = tl.load(bias_ptr + offs_bn).to(dtype=acc_dtype)
+                    accumulator = tl.broadcast_to(
+                        accumulator[None, :], (BLOCK_SIZE_M, BLOCK_SIZE_N)
+                    )
             else:
                 accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
         else:
@@ -143,7 +156,7 @@ def _gemm_a16_w16_kernel(
         k_span = split_k_end - split_k_start
         num_k_iter = tl.cdiv(k_span, BLOCK_SIZE_K)
 
-        for k in range(num_k_iter):
+        for k in tl.range(num_k_iter, loop_unroll_factor=LOOP_UNROLL_FACTOR):
             # Load the next block of A and B, generate a mask by checking the K dimension.
             # If it is out of bounds, set it to 0.
             if EVEN_K:

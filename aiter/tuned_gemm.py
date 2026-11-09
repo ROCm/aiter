@@ -791,6 +791,12 @@ def triton_gemm(
         scale_a is None and scale_b is None and scale_c is None
     ), "Triton gemm_a16w16 does not support scaling yet"
     assert not bpreshuffle, "Triton gemm_a16w16 does not support bpreshuffle yet."
+    if config is not None and config.get("kernelName") == "triton_a16w16_oriented":
+        from aiter.ops.triton.gemm.basic.gemm_a16w16_oriented import (
+            gemm_a16w16_oriented,
+        )
+
+        return gemm_a16w16_oriented(inp, weights, bias=bias, dtype=otype, out=out)
     return gemm_a16w16(inp, weights, bias=bias, dtype=otype, y=out)
 
 

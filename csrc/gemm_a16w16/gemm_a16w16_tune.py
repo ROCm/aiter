@@ -197,6 +197,12 @@ def run_triton_gemm_bf16(input, weight, bias=None, otype=dtypes.bf16):
     return triton_gemm_a16w16(input, weight, bias=bias, dtype=otype)
 
 
+def run_triton_oriented_bf16(input, weight, bias=None, otype=dtypes.bf16):
+    from aiter.ops.triton.gemm.basic.gemm_a16w16_oriented import gemm_a16w16_oriented
+
+    return gemm_a16w16_oriented(input, weight, bias=bias, dtype=otype)
+
+
 _opus_max_delta_checked = set()
 
 
@@ -847,7 +853,7 @@ class GemmA16W16Tuner(GemmCommonTuner):
         M, N, K = info_keys[2], info_keys[3], info_keys[4]
         rtol, _ = _default_tol(outdtype)
         info = (info_keys, 0, 0, "auto", "triton", is_shuffle)
-        return [
+        tasks = [
             (
                 info,
                 generate_data,
@@ -863,6 +869,20 @@ class GemmA16W16Tuner(GemmCommonTuner):
                 rtol,
             )
         ]
+
+        if get_gfx() == "gfx950" and 8 <= M <= 256:
+            oriented = list(tasks[0])
+            oriented[0] = (
+                info_keys,
+                1,
+                0,
+                "triton_a16w16_oriented",
+                "triton",
+                is_shuffle,
+            )
+            oriented[3] = run_triton_oriented_bf16
+            tasks.append(tuple(oriented))
+        return tasks
 
     # -------------------------------------------------------------------
     # hipblaslt (delegates to gradlib)
