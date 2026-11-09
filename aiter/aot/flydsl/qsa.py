@@ -25,10 +25,13 @@ the artifacts the build wrote. The keys do not depend on the order variants comp
 in within a process (kernel 6b537f3b; see ``_raw`` in the kernel module), so the
 artifacts of a parallel AOT build are the ones a serving process looks up.
 
-Measured (no device, a08-1 no-device container, 256 cores, image
-``local/qwen38-gfx1250-aiter:e7c0a0ad8``, flydsl 0.3.4.1, profile
-``qsa_page4_gfx1250_v1`` at kernel 6b537f3b): see the README table row; the numbers
-are repeated in ``records/integration/r3-aiter`` of the integration workspace.
+Measured without a device (no-device container, 256 cores, flydsl 0.4.0 -- this
+driver's replay hooks need flydsl >= 0.4 --, profile ``qsa_page4_gfx1250_v1`` at
+kernel 6b537f3b): 2578 call classes replayed in 162 worker batches, 39 kernels
+compiled (one per profile variant x page size x cache dtype, int64 positions;
+808 KiB of cache), cold 9.2 s (11.9 s wall with process start-up); ``--check`` 4.4 s
+with every launch a cache hit; a second build adds no artifact; ``--check`` against an
+empty cache fails all 2578 replays.
 
 Usage:
     python -m aiter.aot.flydsl.qsa                        # shipped profile
