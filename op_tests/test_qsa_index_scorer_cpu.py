@@ -1301,14 +1301,19 @@ def _gen():
 def _gpu_stamp_kernels(ksha):
     """Kernels whose GPU stamps count as on the profiled kernel ``ksha``: ``ksha`` itself
     and (AITER-LINT, black/ruff only) the R2E kernel the GPU check ran on, provided the
-    record carries the AITER-LINT ISA-identity link (see :func:`_assert_lint_link`)."""
-    return (ksha, _gen().R2E_KERNEL_SHA256)
+    record carries the AITER-LINT ISA-identity link (see :func:`_assert_lint_link`);
+    AITER-R3: also the lint kernel c01cf365 the 2026-11-06 GPU check ran on (carried by the
+    AITER-R3 cache-key link)."""
+    gen = _gen()
+    return (ksha, gen.R2E_KERNEL_SHA256, gen.LINT_KERNEL_SHA256)
 
 
 def _assert_lint_link(case, g, ksha, label):
-    """A pass stamped on the R2E kernel (not ``ksha``) carries the AITER-LINT link."""
+    """A pass stamped on an earlier chain kernel (not ``ksha``) carries the link(s) to it."""
     if g["kernel_sha256"] != ksha:
-        case.assertIn("AITER-LINT", g.get("isa_identity", ""), label)
+        case.assertIn("AITER-R3", g.get("isa_identity", ""), label)
+        if g["kernel_sha256"] != _gen().LINT_KERNEL_SHA256:
+            case.assertIn("AITER-LINT", g.get("isa_identity", ""), label)
 
 
 def _verified_rules(data):

@@ -82,7 +82,7 @@ Performance is not a goal of this path (it is the correctness floor for uncovere
 
 ## Profile `aiter/configs/qsa_index_scorer/qsa_page4_gfx1250_v1.json`
 
-Pins kernel source sha256 `c01cf365d7e6cd734bcde6977707c8c4c47c89d0b17c98b811e16dc6e826afbf` and
+Pins kernel source sha256 `6b537f3bc8caa54d7b6dfd66a5ff7ca396d0647c189febeadf4d48c1f9f5d8ad` and
 every import-time `QSA_*` switch (`kernel_env`). GPU-stamped by `gen_profile check` on kernel
 `58051973626d598b36b0c51c4ac89a8830fa05b3a8f78d9628aeadd436c1f0ad`, which differs from the pinned
 source only by black/ruff formatting (no-device ISA-identity gate: all 276 default and routable

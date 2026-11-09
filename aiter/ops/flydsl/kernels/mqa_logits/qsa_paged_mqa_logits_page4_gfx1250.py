@@ -309,34 +309,38 @@ def _plane(tensor, num_bytes):
     return ptr if _ACCESS == "cop" else fx.rocdl.get_buffer_rsrc(ptr)
 
 
-_RAW: dict = {}
+@cache
+def _raw_aux_is_attr() -> bool:
+    """True when flydsl takes the buffer cache policy as an enum attribute (newer
+    flydsl) rather than an i32 operand; ``buffer_ops.py:44-48`` detects the same way."""
+    import inspect
+
+    return (
+        inspect.signature(fx.rocdl.RawPtrBufferLoadOp).parameters["aux"].kind
+        is inspect.Parameter.KEYWORD_ONLY
+    )
 
 
 def _raw():
-    """``(ir, aux)`` for the raw ROCDL intrinsics, resolved once per process.
+    """``(ir, aux)`` for the raw ROCDL intrinsics (aux = cache policy 0).
 
     Kept lazy on purpose: this module must still import on a host with no
     ``flydsl`` (``_g2/_load.py`` installs a stub so the op wrapper stays
     testable), and ``flydsl._mlir`` is not part of that stub.
+
+    No module-level mutable state: FlyDSL folds the values of every module global
+    a kernel's code reads into its disk-cache key (``_globals_`` key segment), so a
+    lazily filled module dict here made each kernel's cache key depend on whether
+    another kernel had been traced earlier in the process (R3: compile order
+    changed the key of every variant, e.g. the decode-group bf16/fp8 kernels).
+    The attribute is built per call in the current MLIR context; only the
+    flydsl-version probe is memoised (a function: keyed by name, not by state).
     """
-    if not _RAW:
-        import inspect
+    from flydsl._mlir import ir
 
-        from flydsl._mlir import ir
-
-        # flydsl moved the buffer cache policy from an i32 operand to an enum
-        # attribute; ``buffer_ops.py:44-48`` detects the same way.
-        is_attr = (
-            inspect.signature(fx.rocdl.RawPtrBufferLoadOp).parameters["aux"].kind
-            is inspect.Parameter.KEYWORD_ONLY
-        )
-        aux = (
-            ir.IntegerAttr.get(ir.IntegerType.get_signless(32), 0)
-            if is_attr
-            else fx.Int32(0).ir_value()
-        )
-        _RAW.update(ir=ir, aux=aux)
-    return _RAW["ir"], _RAW["aux"]
+    if _raw_aux_is_attr():
+        return ir, ir.IntegerAttr.get(ir.IntegerType.get_signless(32), 0)
+    return ir, fx.Int32(0).ir_value()
 
 
 def _ld_vec(ptr, byte_off, n, elem):
