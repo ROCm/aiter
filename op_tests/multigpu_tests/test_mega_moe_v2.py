@@ -26,7 +26,7 @@ DeepSeek-V4-Pro (--network v4_pro, 8 ranks) or EP4 DeepSeek-V4.1-Flash
     torchrun --nproc-per-node 4 test_mega_moe_v2.py --suite routes --network v41_flash --check-time-acc
     # against a same-MTPR staged route, timing only:
     torchrun --nproc-per-node 8 test_mega_moe_v2.py --suite routes \
-        --mtpr 256 --time-only --time-bs 140,168,196,224,252
+        --mtpr 256 --small-m-mtprs 256 --time-only --time-bs 140,168,196,224,252
 
 The routes suite takes the flags of the former test_mega_moe_small_m.py; its
 --mtpr and --slots are aliases of --max-tok-per-rank and --large-m-state-slots.
