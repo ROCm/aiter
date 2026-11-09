@@ -233,11 +233,28 @@ jobs:
           echo "Docker login failed after 3 attempts, continuing anyway"
           exit 0
 
+      - name: Pull Aiter build image
+        if: ${{ matrix.build_enabled && steps.restore_aiter_wheel.outputs.cache-hit != 'true' }}
+        env:
+          DOCKER_IMAGE: ${{ matrix.docker_image }}
+          DOCKER_PULL_MAX_ATTEMPTS: "5"
+          DOCKER_PULL_RETRY_DELAY_SECONDS: "60"
+        run: |
+          set -euo pipefail
+          # Fork PRs intentionally have no registry credentials. Reuse the
+          # runner's pinned image when present; otherwise tolerate transient
+          # registry throttling without retrying the whole wheel build.
+          if docker image inspect "${DOCKER_IMAGE}" >/dev/null 2>&1; then
+            echo "Using locally cached build image: ${DOCKER_IMAGE}"
+          else
+            bash .github/scripts/docker_pull_with_retry.sh "${DOCKER_IMAGE}"
+          fi
+
       - name: Build Aiter wheel in base container
         if: ${{ matrix.build_enabled && steps.restore_aiter_wheel.outputs.cache-hit != 'true' }}
         run: |
           set -euo pipefail
-          docker run --rm \
+          docker run --rm --pull=never \
             --network=host \
             -e AITER_PREBUILD_MAX_JOBS="${{ env.AITER_PREBUILD_MAX_JOBS }}" \
             -e AITER_RUNNER_NAME="${RUNNER_NAME:-unknown}" \
@@ -733,8 +750,43 @@ jobs:
           name: ${{ env.TRITON_WHEEL_ARTIFACT_NAME }}
           path: triton_wheels
 
+      - name: Resolve CK submodule SHA
+        id: ck_submodule
+        if: ${{ github.event_name != 'schedule' }}
+        run: |
+          set -euo pipefail
+          ck_path="3rdparty/composable_kernel"
+          ck_sha="$(git ls-tree HEAD "${ck_path}" | awk '{print $3}')"
+          if [ -z "${ck_sha}" ]; then
+            echo "::error::Unable to resolve CK submodule SHA"
+            exit 1
+          fi
+          echo "path=${ck_path}" >> "$GITHUB_OUTPUT"
+          echo "sha=${ck_sha}" >> "$GITHUB_OUTPUT"
+          echo "CK submodule SHA: ${ck_sha}"
+
+      - name: Clear CK submodule checkout
+        if: ${{ github.event_name != 'schedule' }}
+        run: |
+          rm -rf 3rdparty/composable_kernel .git/modules/3rdparty/composable_kernel
+
+      - name: Restore CK submodule cache
+        id: restore_ck_submodule
+        if: ${{ github.event_name != 'schedule' }}
+        continue-on-error: true
+        uses: actions/cache/restore@v4
+        env:
+          SEGMENT_DOWNLOAD_TIMEOUT_MINS: 30
+        with:
+          path: |
+            .git/modules/3rdparty/composable_kernel
+            3rdparty/composable_kernel
+          key: ${{ runner.os }}-ck-submodule-${{ steps.ck_submodule.outputs.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            ${{ runner.os }}-ck-submodule-${{ steps.ck_submodule.outputs.sha }}-
+
       - name: Speedtest after Aiter test cache or artifact download failure
-        if: ${{ always() && startsWith(runner.name, 'linux-aiter-mi35x-1-') && (steps.download_aiter_shards.outcome == 'failure' || steps.restore_aiter_wheel.outcome == 'failure' || steps.retry_aiter_wheel.outcome == 'failure' || steps.restore_triton_wheel.outcome == 'failure' || steps.download_triton_wheel.outcome == 'failure') }}
+        if: ${{ always() && startsWith(runner.name, 'linux-aiter-mi35x-1-') && (steps.download_aiter_shards.outcome == 'failure' || steps.restore_aiter_wheel.outcome == 'failure' || steps.retry_aiter_wheel.outcome == 'failure' || steps.restore_triton_wheel.outcome == 'failure' || steps.download_triton_wheel.outcome == 'failure' || steps.restore_ck_submodule.outcome == 'failure') }}
         continue-on-error: true
         timeout-minutes: 5
         run: |
@@ -810,6 +862,7 @@ jobs:
           fi
 
       - name: Sync CK submodule
+        id: sync_ck_submodule
         run: |
           set -ex
           if [ "${GITHUB_EVENT_NAME}" = "schedule" ]; then
@@ -819,9 +872,34 @@ jobs:
             git submodule update --init --recursive --remote --jobs 4
           else
             echo "Using pinned CK commit..."
-            git submodule sync
-            git submodule update --init --recursive --depth 1 --jobs 4
+            ck_path="3rdparty/composable_kernel"
+            ck_sha="${{ steps.ck_submodule.outputs.sha }}"
+            git submodule sync "${ck_path}"
+            if [ "${{ steps.restore_ck_submodule.outcome }}" = "success" ] && \
+              [ -n "${{ steps.restore_ck_submodule.outputs.cache-hit }}" ] && \
+              git -C "${ck_path}" rev-parse --git-dir >/dev/null 2>&1 && \
+              git -C "${ck_path}" cat-file -e "${ck_sha}^{commit}" >/dev/null 2>&1; then
+              echo "Using restored CK submodule cache for ${ck_sha}"
+              echo "fetched=false" >> "$GITHUB_OUTPUT"
+              git -C "${ck_path}" checkout --detach "${ck_sha}"
+              git -C "${ck_path}" submodule update --init --recursive --depth 1 --jobs 4
+            else
+              echo "CK submodule cache miss or invalid restore; fetching ${ck_sha}"
+              rm -rf "${ck_path}" ".git/modules/${ck_path}"
+              git submodule update --init --recursive --depth 1 --jobs 4 "${ck_path}"
+              echo "fetched=true" >> "$GITHUB_OUTPUT"
+            fi
           fi
+
+      - name: Save CK submodule cache
+        if: ${{ github.event_name != 'schedule' && steps.sync_ck_submodule.outputs.fetched == 'true' }}
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            .git/modules/3rdparty/composable_kernel
+            3rdparty/composable_kernel
+          key: ${{ runner.os }}-ck-submodule-${{ steps.ck_submodule.outputs.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Install Aiter wheel
         run: |
@@ -1087,6 +1165,41 @@ jobs:
           name: ${{ env.TRITON_WHEEL_ARTIFACT_NAME }}
           path: triton_wheels
 
+      - name: Resolve CK submodule SHA
+        id: ck_submodule
+        if: ${{ github.event_name != 'schedule' }}
+        run: |
+          set -euo pipefail
+          ck_path="3rdparty/composable_kernel"
+          ck_sha="$(git ls-tree HEAD "${ck_path}" | awk '{print $3}')"
+          if [ -z "${ck_sha}" ]; then
+            echo "::error::Unable to resolve CK submodule SHA"
+            exit 1
+          fi
+          echo "path=${ck_path}" >> "$GITHUB_OUTPUT"
+          echo "sha=${ck_sha}" >> "$GITHUB_OUTPUT"
+          echo "CK submodule SHA: ${ck_sha}"
+
+      - name: Clear CK submodule checkout
+        if: ${{ github.event_name != 'schedule' }}
+        run: |
+          rm -rf 3rdparty/composable_kernel .git/modules/3rdparty/composable_kernel
+
+      - name: Restore CK submodule cache
+        id: restore_ck_submodule
+        if: ${{ github.event_name != 'schedule' }}
+        continue-on-error: true
+        uses: actions/cache/restore@v4
+        env:
+          SEGMENT_DOWNLOAD_TIMEOUT_MINS: 30
+        with:
+          path: |
+            .git/modules/3rdparty/composable_kernel
+            3rdparty/composable_kernel
+          key: ${{ runner.os }}-ck-submodule-${{ steps.ck_submodule.outputs.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            ${{ runner.os }}-ck-submodule-${{ steps.ck_submodule.outputs.sha }}-
+
       - name: Docker login
         if: ${{ !github.event.pull_request || !github.event.pull_request.head.repo.fork }}
         env:
@@ -1145,6 +1258,7 @@ jobs:
           fi
 
       - name: Sync CK submodule
+        id: sync_ck_submodule
         run: |
           set -ex
           if [ "${GITHUB_EVENT_NAME}" = "schedule" ]; then
@@ -1154,9 +1268,32 @@ jobs:
             git submodule update --init --recursive --remote --jobs 4
           else
             echo "Using pinned CK commit..."
-            git submodule sync
-            git submodule update --init --recursive --depth 1 --jobs 4
+            ck_path="3rdparty/composable_kernel"
+            ck_sha="${{ steps.ck_submodule.outputs.sha }}"
+            git submodule sync "${ck_path}"
+            if git -C "${ck_path}" rev-parse --git-dir >/dev/null 2>&1 && \
+              git -C "${ck_path}" cat-file -e "${ck_sha}^{commit}" >/dev/null 2>&1; then
+              echo "Using restored CK submodule cache for ${ck_sha}"
+              echo "fetched=false" >> "$GITHUB_OUTPUT"
+              git -C "${ck_path}" checkout --detach "${ck_sha}"
+              git -C "${ck_path}" submodule update --init --recursive --depth 1 --jobs 4
+            else
+              echo "CK submodule cache miss or invalid restore; fetching ${ck_sha}"
+              rm -rf "${ck_path}" ".git/modules/${ck_path}"
+              git submodule update --init --recursive --depth 1 --jobs 4 "${ck_path}"
+              echo "fetched=true" >> "$GITHUB_OUTPUT"
+            fi
           fi
+
+      - name: Save CK submodule cache
+        if: ${{ github.event_name != 'schedule' && steps.sync_ck_submodule.outputs.fetched == 'true' }}
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            .git/modules/3rdparty/composable_kernel
+            3rdparty/composable_kernel
+          key: ${{ runner.os }}-ck-submodule-${{ steps.ck_submodule.outputs.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Install Aiter wheel
         run: |
