@@ -62,6 +62,312 @@
         "XCHG_MODE": 1
       },
       "any": {}
+    },
+    "bf16_fp8": {
+      "H_LEQ_8.B_LEQ_1.KV_LEQ_16384": {},
+      "H_LEQ_8.B_LEQ_2.KV_LEQ_16384": {
+        "PARTIAL_BF16": 1,
+        "Q_FROM_LDS": 0,
+        "num_stages": 3,
+        "num_warps": 2,
+        "waves_per_eu": 1
+      },
+      "H_LEQ_8.B_LEQ_4.KV_LEQ_16384": {
+        "NPOT_SPLITS": 48,
+        "PARTIAL_BF16": 1,
+        "Q_FROM_LDS": 0,
+        "num_stages": 3,
+        "num_warps": 2,
+        "waves_per_eu": 1
+      },
+      "H_LEQ_8.B_LEQ_8.KV_LEQ_16384": {
+        "NPOT_SPLITS": 24,
+        "PARTIAL_BF16": 1,
+        "Q_FROM_LDS": 0,
+        "num_stages": 3,
+        "num_warps": 2,
+        "waves_per_eu": 1
+      },
+      "H_LEQ_8.B_LEQ_12.KV_LEQ_16384": {
+        "NPOT_SPLITS": 32,
+        "PARTIAL_BF16": 1,
+        "Q_FROM_LDS": 0,
+        "num_stages": 2,
+        "num_warps": 1,
+        "waves_per_eu": 1
+      },
+      "H_LEQ_8.B_LEQ_16.KV_LEQ_16384": {
+        "NPOT_SPLITS": 24,
+        "PARTIAL_BF16": 1,
+        "Q_FROM_LDS": 0,
+        "num_stages": 2,
+        "num_warps": 1,
+        "waves_per_eu": 1
+      },
+      "H_LEQ_8.B_LEQ_24.KV_LEQ_16384": {
+        "NPOT_SPLITS": 16,
+        "PARTIAL_BF16": 1,
+        "Q_FROM_LDS": 0,
+        "num_stages": 2,
+        "num_warps": 1,
+        "waves_per_eu": 1
+      },
+      "H_LEQ_8.B_LEQ_32.KV_LEQ_16384": {
+        "NPOT_SPLITS": 12,
+        "PARTIAL_BF16": 1,
+        "Q_FROM_LDS": 0,
+        "num_stages": 2,
+        "num_warps": 1,
+        "waves_per_eu": 1
+      },
+      "H_LEQ_8.B_LEQ_40.KV_LEQ_16384": {
+        "NPOT_SPLITS": 20,
+        "PARTIAL_BF16": 1,
+        "Q_FROM_LDS": 0,
+        "num_stages": 2,
+        "num_warps": 1,
+        "waves_per_eu": 1
+      },
+      "H_LEQ_8.B_LEQ_48.KV_LEQ_16384": {
+        "NPOT_SPLITS": 8,
+        "PARTIAL_BF16": 0,
+        "Q_FROM_LDS": 0,
+        "num_stages": 2,
+        "num_warps": 1,
+        "waves_per_eu": 1
+      },
+      "H_LEQ_8.B_LEQ_56.KV_LEQ_16384": {
+        "NPOT_SPLITS": 14,
+        "PARTIAL_BF16": 1,
+        "Q_FROM_LDS": 0,
+        "num_stages": 2,
+        "num_warps": 1,
+        "waves_per_eu": 1
+      },
+      "H_LEQ_8.B_LEQ_64.KV_LEQ_16384": {
+        "NPOT_SPLITS": 6,
+        "PARTIAL_BF16": 0,
+        "Q_FROM_LDS": 0,
+        "num_stages": 2,
+        "num_warps": 1,
+        "waves_per_eu": 1
+      },
+      "H_LEQ_8.B_LEQ_72.KV_LEQ_16384": {
+        "NPOT_SPLITS": 11,
+        "PARTIAL_BF16": 1,
+        "Q_FROM_LDS": 0,
+        "num_stages": 2,
+        "num_warps": 1,
+        "waves_per_eu": 1
+      },
+      "H_LEQ_8.B_LEQ_80.KV_LEQ_16384": {
+        "NPOT_SPLITS": 8,
+        "PARTIAL_BF16": 1,
+        "Q_FROM_LDS": 0,
+        "num_stages": 2,
+        "num_warps": 1,
+        "waves_per_eu": 1
+      },
+      "H_LEQ_8.B_LEQ_88.KV_LEQ_16384": {
+        "NPOT_SPLITS": 7,
+        "PARTIAL_BF16": 1,
+        "Q_FROM_LDS": 0,
+        "num_stages": 2,
+        "num_warps": 1,
+        "waves_per_eu": 1
+      },
+      "H_LEQ_8.B_LEQ_96.KV_LEQ_16384": {
+        "NPOT_SPLITS": 4,
+        "PARTIAL_BF16": 1,
+        "Q_FROM_LDS": 0,
+        "num_stages": 2,
+        "num_warps": 1,
+        "waves_per_eu": 1
+      },
+      "H_LEQ_8.B_LEQ_104.KV_LEQ_16384": {
+        "NPOT_SPLITS": 6,
+        "PARTIAL_BF16": 1,
+        "Q_FROM_LDS": 0,
+        "num_stages": 2,
+        "num_warps": 1,
+        "waves_per_eu": 1
+      },
+      "H_LEQ_8.B_LEQ_112.KV_LEQ_16384": {
+        "NPOT_SPLITS": 6,
+        "PARTIAL_BF16": 0,
+        "Q_FROM_LDS": 0,
+        "num_stages": 2,
+        "num_warps": 1,
+        "waves_per_eu": 1
+      },
+      "H_LEQ_8.B_LEQ_120.KV_LEQ_16384": {
+        "NPOT_SPLITS": 5,
+        "PARTIAL_BF16": 1,
+        "Q_FROM_LDS": 0,
+        "num_stages": 2,
+        "num_warps": 1,
+        "waves_per_eu": 1
+      },
+      "H_LEQ_8.B_LEQ_128.KV_LEQ_16384": {
+        "NPOT_SPLITS": 3,
+        "PARTIAL_BF16": 0,
+        "Q_FROM_LDS": 0,
+        "num_stages": 2,
+        "num_warps": 1,
+        "waves_per_eu": 1
+      },
+      "H_LEQ_8.B_LEQ_1.KV_LEQ_32768": {
+        "NPOT_SPLITS": 64,
+        "PARTIAL_BF16": 1,
+        "Q_FROM_LDS": 0,
+        "num_stages": 3,
+        "num_warps": 2,
+        "waves_per_eu": 1
+      },
+      "H_LEQ_8.B_LEQ_2.KV_LEQ_32768": {
+        "PARTIAL_BF16": 1,
+        "Q_FROM_LDS": 0,
+        "num_stages": 2,
+        "num_warps": 1,
+        "waves_per_eu": 1
+      },
+      "H_LEQ_8.B_LEQ_4.KV_LEQ_32768": {
+        "NPOT_SPLITS": 48,
+        "PARTIAL_BF16": 1,
+        "Q_FROM_LDS": 0,
+        "num_stages": 3,
+        "num_warps": 2,
+        "waves_per_eu": 1
+      },
+      "H_LEQ_8.B_LEQ_8.KV_LEQ_32768": {
+        "NPOT_SPLITS": 48,
+        "PARTIAL_BF16": 1,
+        "Q_FROM_LDS": 0,
+        "num_stages": 2,
+        "num_warps": 1,
+        "waves_per_eu": 1
+      },
+      "H_LEQ_8.B_LEQ_12.KV_LEQ_32768": {
+        "NPOT_SPLITS": 32,
+        "PARTIAL_BF16": 1,
+        "Q_FROM_LDS": 0,
+        "num_stages": 2,
+        "num_warps": 1,
+        "waves_per_eu": 1
+      },
+      "H_LEQ_8.B_LEQ_16.KV_LEQ_32768": {
+        "NPOT_SPLITS": 24,
+        "PARTIAL_BF16": 1,
+        "Q_FROM_LDS": 0,
+        "num_stages": 2,
+        "num_warps": 1,
+        "waves_per_eu": 1
+      },
+      "H_LEQ_8.B_LEQ_24.KV_LEQ_32768": {
+        "NPOT_SPLITS": 16,
+        "PARTIAL_BF16": 0,
+        "Q_FROM_LDS": 0,
+        "num_stages": 2,
+        "num_warps": 1,
+        "waves_per_eu": 1
+      },
+      "H_LEQ_8.B_LEQ_32.KV_LEQ_32768": {
+        "NPOT_SPLITS": 12,
+        "PARTIAL_BF16": 0,
+        "Q_FROM_LDS": 0,
+        "num_stages": 2,
+        "num_warps": 1,
+        "waves_per_eu": 1
+      },
+      "H_LEQ_8.B_LEQ_40.KV_LEQ_32768": {
+        "NPOT_SPLITS": 20,
+        "PARTIAL_BF16": 1,
+        "Q_FROM_LDS": 0,
+        "num_stages": 2,
+        "num_warps": 1,
+        "waves_per_eu": 1
+      },
+      "H_LEQ_8.B_LEQ_48.KV_LEQ_32768": {
+        "NPOT_SPLITS": 8,
+        "PARTIAL_BF16": 0,
+        "Q_FROM_LDS": 0,
+        "num_stages": 2,
+        "num_warps": 1,
+        "waves_per_eu": 1
+      },
+      "H_LEQ_8.B_LEQ_56.KV_LEQ_32768": {
+        "NPOT_SPLITS": 11,
+        "PARTIAL_BF16": 1,
+        "Q_FROM_LDS": 0,
+        "num_stages": 2,
+        "num_warps": 1,
+        "waves_per_eu": 1
+      },
+      "H_LEQ_8.B_LEQ_64.KV_LEQ_32768": {
+        "NPOT_SPLITS": 12,
+        "PARTIAL_BF16": 1,
+        "Q_FROM_LDS": 0,
+        "num_stages": 2,
+        "num_warps": 1,
+        "waves_per_eu": 1
+      },
+      "H_LEQ_8.B_LEQ_80.KV_LEQ_32768": {
+        "NPOT_SPLITS": 8,
+        "PARTIAL_BF16": 1,
+        "Q_FROM_LDS": 0,
+        "num_stages": 2,
+        "num_warps": 1,
+        "waves_per_eu": 1
+      },
+      "H_LEQ_8.B_LEQ_88.KV_LEQ_32768": {
+        "NPOT_SPLITS": 7,
+        "PARTIAL_BF16": 1,
+        "Q_FROM_LDS": 0,
+        "num_stages": 2,
+        "num_warps": 1,
+        "waves_per_eu": 1
+      },
+      "H_LEQ_8.B_LEQ_96.KV_LEQ_32768": {
+        "NPOT_SPLITS": 4,
+        "PARTIAL_BF16": 1,
+        "Q_FROM_LDS": 0,
+        "num_stages": 2,
+        "num_warps": 1,
+        "waves_per_eu": 1
+      },
+      "H_LEQ_8.B_LEQ_104.KV_LEQ_32768": {
+        "NPOT_SPLITS": 6,
+        "PARTIAL_BF16": 1,
+        "Q_FROM_LDS": 0,
+        "num_stages": 2,
+        "num_warps": 1,
+        "waves_per_eu": 1
+      },
+      "H_LEQ_8.B_LEQ_112.KV_LEQ_32768": {
+        "NPOT_SPLITS": 6,
+        "PARTIAL_BF16": 0,
+        "Q_FROM_LDS": 0,
+        "num_stages": 2,
+        "num_warps": 1,
+        "waves_per_eu": 1
+      },
+      "H_LEQ_8.B_LEQ_120.KV_LEQ_32768": {
+        "NPOT_SPLITS": 5,
+        "PARTIAL_BF16": 0,
+        "Q_FROM_LDS": 0,
+        "num_stages": 2,
+        "num_warps": 1,
+        "waves_per_eu": 1
+      },
+      "H_LEQ_8.B_LEQ_128.KV_LEQ_32768": {
+        "NPOT_SPLITS": 6,
+        "PARTIAL_BF16": 1,
+        "Q_FROM_LDS": 0,
+        "num_stages": 2,
+        "num_warps": 1,
+        "waves_per_eu": 1
+      },
+      "any": {}
     }
   }
 }
