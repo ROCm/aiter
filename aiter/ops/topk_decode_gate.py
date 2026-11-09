@@ -399,9 +399,10 @@ def decode_backend_for_shape(
         # No bound means the host cannot size the adaptive config, and no
         # `seq_lens` leaves the adaptive kernel nothing to read row lengths from,
         # so either declines it; the single-launch bands still see the width.
+        # A bound below 1 is no bound: it holds only for a batch of empty rows.
         (
             None
-            if max_row_len is None or seq_lens is None
+            if max_row_len is None or max_row_len < 1 or seq_lens is None
             else decode_adaptive_width(width, max_row_len)
         ),
     )

@@ -1258,7 +1258,8 @@ def topk_select(
             ``decode``).
         max_row_len: an upper bound on every entry of ``end``. It opts the call
             into the adaptive decode kernel and changes only its speed, never
-            the result (see ``top_k_per_row_decode``). ``None`` declines it.
+            the result (see ``top_k_per_row_decode``). ``None``, or a bound
+            below 1, declines it.
 
     Returns:
         ``(values, indices)``; ``values`` is None when ``return_value`` is False.

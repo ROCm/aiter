@@ -1299,7 +1299,8 @@ def top_k_per_row_decode(
 
     `max_row_len` is an upper bound on every `seqLens` entry, for a `logits`
     buffer sized to a maximum context that decode only partly fills. Stating it
-    opts the call into the adaptive path; `None` declines that path only.
+    opts the call into the adaptive path; `None`, or a bound below 1, declines
+    that path only.
 
     It sizes the kernel, never the read: rows are still read to `seqLens`. A
     bound below a live row stays exact but runs slower; one far above builds a

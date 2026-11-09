@@ -854,8 +854,8 @@ def test_decode_mixed_node():
 
 
 def test_decode_no_bound_skips_gate():
-    """Without `max_row_len` the FlyDSL entry runs the single-launch kernel
-    without asking the gate; with one it asks."""
+    """Without `max_row_len`, or with one below 1, the FlyDSL entry runs the
+    single-launch kernel without asking the gate; with one it asks."""
     rows, width, top_k = 4, 65536, 2048
     torch.manual_seed(0)
     logits = torch.randn(rows, width, device="cuda")
@@ -865,7 +865,7 @@ def test_decode_no_bound_skips_gate():
     with mock.patch.object(
         host, "decode_backend_for_shape", wraps=host.decode_backend_for_shape
     ) as gate:
-        for bound, asked in ((None, 0), (width, 1)):
+        for bound, asked in ((None, 0), (0, 0), (width, 1)):
             out = torch.full((rows, top_k), -7, dtype=torch.int32, device="cuda")
             host.flydsl_top_k_per_row_decode(
                 logits, 1, seq_lens, out, rows, width, 1, top_k, True,
@@ -876,6 +876,48 @@ def test_decode_no_bound_skips_gate():
             assert torch.equal(out.long(), want), f"bound {bound}: mismatch"
             gate.reset_mock()
     print("[decode_no_bound_skips_gate] PASS")
+
+
+def test_decode_bound_below_one():
+    """A `max_row_len` below 1 is no bound: calls that can never route adaptive
+    (`values`, a k no band carries, `topk_select`) return what `None` returns,
+    and a batch of empty rows, which 0 truly bounds, pads every slot."""
+    rows, width = 4, 65536
+    torch.manual_seed(0)
+    logits = torch.randn(rows, width, device="cuda")
+    full = torch.full((rows,), width, dtype=torch.int32, device="cuda")
+    empty = torch.zeros(rows, dtype=torch.int32, device="cuda")
+
+    def decode(seq_lens, k, with_values, bound):
+        indices = torch.full((rows, k), -7, dtype=torch.int32, device="cuda")
+        values = torch.full((rows, k), -7.0, device="cuda") if with_values else None
+        topk.top_k_per_row_decode(
+            logits, 1, seq_lens, indices, rows, width, 1, k, True, values,
+            max_row_len=bound,
+        )  # fmt: skip
+        return indices, values
+
+    calls = {
+        "values": lambda b: decode(full, 2048, True, b),
+        "k=7": lambda b: decode(full, 7, False, b),
+        "empty rows": lambda b: decode(empty, 2048, False, b),
+        "topk_select": lambda b: topk_select(
+            logits, 2048, end=full, tie="low", max_row_len=b
+        ),
+    }
+    for name, call in calls.items():
+        want = call(None)
+        for bound in (0, -1):
+            got = call(bound)
+            torch.cuda.synchronize()
+            for w, g in zip(want, got):
+                assert (w is None) == (g is None), f"{name} bound {bound}"
+                if w is not None:
+                    assert torch.equal(w, g), f"{name} bound {bound}: mismatch"
+    indices, _ = decode(empty, 2048, False, 0)
+    torch.cuda.synchronize()
+    assert (indices == -1).all(), "empty rows at bound 0 left a slot unpadded"
+    print(f"[decode_bound_below_one] PASS: {', '.join(calls)} at bounds 0, -1")
 
 
 def test_decode_bound_entry_points(card):
@@ -2640,6 +2682,7 @@ def run_adaptive():
     test_decode_bound_gate()
     test_decode_mixed_node()
     test_decode_no_bound_skips_gate()
+    test_decode_bound_below_one()
     card = (get_gfx_runtime(), get_cu_num_device(torch.cuda.current_device()))
     if card not in topk._ADAPTIVE_BANDS_BY_K_GROUP:
         aiter.logger.warning(
