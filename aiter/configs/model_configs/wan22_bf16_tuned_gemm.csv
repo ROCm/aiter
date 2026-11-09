@@ -8,3 +8,12 @@ gfx1250,192,32400,64,5120,True,torch.bfloat16,torch.bfloat16,False,False,triton,
 gfx1250,192,32400,5120,5120,True,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,2632.5930,auto,0.0,645.25,271.97
 gfx1250,192,32400,13824,5120,True,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,6425.5517,auto,0.0,713.79,213.08
 gfx1250,192,32400,5120,13824,True,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,6618.6352,auto,0.0,692.96,206.86
+gfx1250,256,1,5120,256,True,torch.bfloat16,torch.bfloat16,False,False,flydsl,14,1,3.7382,flydsl_hgemm_abf16_wbf16_bf16_t16x128x256x2_ks1_w1x4x1_bias1_ktail0_gm0_ptdm_gfx1250,0,0.70,704.14
+gfx1250,256,1,5120,5120,True,torch.bfloat16,torch.bfloat16,False,False,flydsl,34,4,11.5008,flydsl_hgemm_abf16_wbf16_bf16_t16x128x128x3_ks4_w1x2x1_bias1_ktail0_gm0_ptdma_gfx1250,0.0130859375,4.56,4560.50
+gfx1250,256,1,30720,5120,True,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,22.5423,auto,0.0,13.95,13957.95
+gfx1250,256,512,5120,4096,True,torch.bfloat16,torch.bfloat16,False,False,flydsl,37,1,23.0466,flydsl_hgemm_abf16_wbf16_bf16_t128x128x128x3_ks1_w2x2x1_bias1_ktail0_gm0_ptdmi_gfx1250,0,931.80,2229.41
+gfx1250,256,512,5120,5120,True,torch.bfloat16,torch.bfloat16,False,False,flydsl,35,1,28.4815,flydsl_hgemm_abf16_wbf16_bf16_t128x128x128x3_ks1_w2x2x1_bias1_ktail0_gm0_ptdmi_gfx1250,0,942.49,2208.96
+gfx1250,256,32400,64,5120,True,torch.bfloat16,torch.bfloat16,False,False,flydsl,20,1,28.9193,flydsl_hgemm_abf16_wbf16_bf16_t128x64x128x3_ks1_w2x1x1_bias1_ktail0_gm0_ptdmi_gfx1250,0,734.24,11638.55
+gfx1250,256,32400,5120,5120,True,torch.bfloat16,torch.bfloat16,False,False,flydsl,0,1,755.2566,flydsl_hgemm_abf16_wbf16_bf16_t256x256x128x2_ks1_w2x2x1_bias1_ktail0_gm0_ptdmi_gfx1250,0,2249.16,948.00
+gfx1250,256,32400,13824,5120,True,torch.bfloat16,torch.bfloat16,False,False,flydsl,0,1,2150.2040,flydsl_hgemm_abf16_wbf16_bf16_t256x256x128x2_ks1_w2x2x1_bias1_ktail0_gm0_ptdmi_gfx1250,0,2133.04,636.74
+gfx1250,256,32400,5120,13824,True,torch.bfloat16,torch.bfloat16,False,False,flydsl,0,1,1998.6614,flydsl_hgemm_abf16_wbf16_bf16_t256x256x128x2_ks1_w2x2x1_bias1_ktail0_gm0_ptdmi_gfx1250,0,2294.77,685.02
