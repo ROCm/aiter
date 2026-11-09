@@ -543,6 +543,8 @@ def _tile_sizes(start: int, end: int, tile: int, window: int) -> set[int]:
     """Smallest, next and largest M of the first ``window`` tile counts and the last."""
     first, last = -(-start // tile), -(-(end - 1) // tile)
     sizes = set()
+    if start > (first - 1) * tile + 1:
+        window += 1
     for count in {*range(first, min(last, first + window - 1) + 1), last}:
         lo, hi = max(start, (count - 1) * tile + 1), min(end - 1, count * tile)
         sizes |= {lo, min(lo + 1, hi), hi}
