@@ -295,7 +295,8 @@ def emit_direct_fixed_slot_payload(
 # fmt: on
     """Allocate and publish routes directly into destination fixed slots.
 
-    ``running_half``: the destinations' expert counters are two halves of fz_epr; the routes count into this one.
+    ``running_half``: the destinations' expert counters are two halves of fz_epr; the routes count into this one,
+    and their srcmap and weight go to the same half of the destinations' two halves of fz_epr * fz_cap slots.
     """
     # prefetch_direct_fixed_slot_route loaded this wave's first len(prefetched) routes before the epoch gate.
     p_source_done = prefetched[0]["tables"]["source_done"]
@@ -338,6 +339,9 @@ def emit_direct_fixed_slot_payload(
             expert_offset = fx.Int32(fx.rocdl.readlane(T.i32, offset_lane, 0))
             publish = valid_expert & (expert_offset < fx.Int32(fz_cap))
             payload_row = local_expert * fx.Int32(fz_cap) + expert_offset
+            meta_row = payload_row
+            if const_expr(running_half is not None):
+                meta_row = meta_row + running_half * fx.Int32(fz_epr * fz_cap)
 
             if const_expr(dedup):
                 if publish & ~rpf["duplicate"]:
@@ -364,8 +368,8 @@ def emit_direct_fixed_slot_payload(
                 if lane == fx.Int32(0):
                     weight_bits = fx.Vector.from_elements([rpf["weight"]], fx.Float32).bitcast(fx.Int32)[0]
                     source_encoding = (fx.Int32(fz_rank * fz_mtpr) + source_token) | (topk_slot << fx.Int32(24))
-                    store_at(weight_bits, AddrBuffer(rpf["remote"]["wts"]), payload_row)
-                    store_at(source_encoding, AddrBuffer(rpf["remote"]["sm"]), payload_row)
+                    store_at(weight_bits, AddrBuffer(rpf["remote"]["wts"]), meta_row)
+                    store_at(source_encoding, AddrBuffer(rpf["remote"]["sm"]), meta_row)
 
     fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
     fx.barrier()
@@ -905,6 +909,9 @@ def compile_mega_moe_stage1(
     # counters before that peer's combine zeroes them. A runtime with tok_done buckets (tok_counters) keeps two halves
     # of the counters by launch parity: launch N counts into half N & 1 and its last WG zeroes that half; the next
     # one a peer can add to it is launch N + 2, which needs this rank's launch N + 1 sources, so launch N is over.
+    # The routes' srcmap and weight slots follow the same halves: the offsets restart at 0 in every launch, so a
+    # rank's launch N + 1 routes would otherwise overwrite the slots of launch N routes a peer's GEMM1 / GEMM2 still
+    # reads (that peer's sources are not done with launch N).
     assert not tok_counters or plan_local, "the double-buffered expert counters are zeroed by the combine"
     # Small batches stream B; large batches cache it across M tiles.
     b_cache_modifier = int(b_nt) if int(b_nt) >= 0 else (3 if fz_mtpr <= 512 else 0)
@@ -1072,6 +1079,12 @@ def compile_mega_moe_stage1(
         producer_slot = ticket - fx.Int32(1)
         # tok_counters: this launch's half of the expert counters (every rank's launch has the same entry epoch).
         running_half = gate_epoch & fx.Int32(1) if const_expr(tok_counters) else None
+        # tok_counters: byte offset of this launch's half of the srcmap and weight slots.
+        meta_half = fx.Int64(running_half) * fx.Int64(fz_epr * fz_cap * 4) if const_expr(tok_counters) else None
+
+        def _slot_meta_ptr(slot):
+            v = _disp_ptr(slot)
+            return v + meta_half if const_expr(tok_counters) else v
 
         if owner:
             if tid < fx.Int32(64):
@@ -1163,7 +1176,7 @@ def compile_mega_moe_stage1(
         row_map = None
         if const_expr(dedup_rows):
             row_map = {
-                "srcmap": _make_buffer_from_addr(_disp_ptr(DispatchSlot.G2_STIDS), fx.Int32),
+                "srcmap": _make_buffer_from_addr(_slot_meta_ptr(DispatchSlot.G2_STIDS), fx.Int32),
                 # A constant bound keeps the A buffer resource scalar.
                 "x_bytes": fx.Int32(_TOKEN_REGION_END),
             }
@@ -1242,8 +1255,8 @@ def compile_mega_moe_stage1(
         g2_bq = _disp_ptr(DispatchSlot.G2_BQ)
         g2_bscale = _disp_ptr(DispatchSlot.G2_BSCALE)
         g2_eids = _disp_ptr(DispatchSlot.G2_EIDS)
-        g2_stids = _disp_ptr(DispatchSlot.G2_STIDS)
-        g2_sweights = _disp_ptr(DispatchSlot.G2_SWEIGHTS)
+        g2_stids = _slot_meta_ptr(DispatchSlot.G2_STIDS)
+        g2_sweights = _slot_meta_ptr(DispatchSlot.G2_SWEIGHTS)
         g2_trb = _disp_ptr(DispatchSlot.G2_TRB)
         g2_rows = _disp_ptr(DispatchSlot.TILE_ROWS)
         g2_max_m_blocks = fx.Int32(_disp_ptr(DispatchSlot.G2_MAX_M_BLOCKS))
@@ -1804,10 +1817,16 @@ class SmallMRuntime:
             # Two launch-parity halves of the per-expert receive counters (compile_mega_moe_stage1), in place of
             # the combine op's single one; allocated after tok_done, so its distance from FC_INP is unchanged.
             workspace["running"] = op._sym((2 * self.epr,), torch.int32)
+            # The routes' srcmap and weight slots, in the same two halves (fz_epr * fz_cap apart).
+            meta_rows = op.num_valid_max + self.epr * op.ll_cap
+            workspace["srcmap"] = op._sym((meta_rows,), torch.int32)
+            workspace["wts"] = op._sym((meta_rows,), torch.float32)
         ms.shmem_barrier_all()
         workspace["p2p_count_done"] = op._p2p_table(workspace["count_done"])
         if self._protocol.tok_counters:
             workspace["p2p_running"] = op._p2p_table(workspace["running"])
+            workspace["p2p_srcmap"] = op._p2p_table(workspace["srcmap"])
+            workspace["p2p_wts"] = op._p2p_table(workspace["wts"])
         self._s1_dispatch_workspace = workspace
 
     def _build_disp_table(self):
@@ -1832,6 +1851,8 @@ class SmallMRuntime:
         if self._protocol.tok_counters:
             table[DispatchSlot.RUNNING] = workspace["running"].data_ptr()
             table[DispatchSlot.P2P_RUNNING] = workspace["p2p_running"].data_ptr()
+            table[DispatchSlot.P2P_SRCMAP] = workspace["p2p_srcmap"].data_ptr()
+            table[DispatchSlot.P2P_WEIGHT] = workspace["p2p_wts"].data_ptr()
         table[DispatchSlot.G2_AQ] = self._s1_out.data_ptr()
         table[DispatchSlot.G2_ASCALE] = self._s1_osd.data_ptr()
         table[DispatchSlot.G2_BQ] = self.w2.data_ptr()
@@ -1839,6 +1860,9 @@ class SmallMRuntime:
         table[DispatchSlot.G2_EIDS] = op.sorted_expert_ids.data_ptr()
         table[DispatchSlot.G2_STIDS] = op.srcmap_em.data_ptr()
         table[DispatchSlot.G2_SWEIGHTS] = op.wts_em.data_ptr()
+        if self._protocol.tok_counters:
+            table[DispatchSlot.G2_STIDS] = workspace["srcmap"].data_ptr()
+            table[DispatchSlot.G2_SWEIGHTS] = workspace["wts"].data_ptr()
         table[DispatchSlot.G2_TRB] = op.tile_row_base.data_ptr()
         table[DispatchSlot.G2_P2P_COMB_INP] = comb_op._p2p_comb_inp.data_ptr()
         table[DispatchSlot.G2_MAX_M_BLOCKS] = (self._s1_nvm + self.sort_block_m - 1) // self.sort_block_m
