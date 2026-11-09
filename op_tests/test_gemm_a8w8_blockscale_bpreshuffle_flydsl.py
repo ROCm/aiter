@@ -41,6 +41,7 @@ from aiter.ops.flydsl.gemm_kernels import flydsl_gemm_a8w8_blockscale_bpreshuffl
 from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_blockscale_bpreshuffle_common import (
     OFFSET_LIMIT,
     kernelInstance,
+    offsets_fit,
     parse_kernel_name,
 )
 from aiter.ops.shuffle import shuffle_weight
@@ -218,6 +219,33 @@ def check_split_k_graph_replay(dtype=dtypes.bf16):
         assert err == 0, f"split-K graph replay {replay} differs from the reference"
 
 
+def check_split_k_first_call_in_capture_raises():
+    """A stream's first split-K call inside a capture raises."""
+    m, n, k, ki = _CASES[0]
+    x, w, x_scale, w_scale = _make_inputs(m, n, k)
+    w_shuf = shuffle_weight(w, layout=(16, 16))
+    x_scale_km = x_scale.t().contiguous().view(m, k // BLOCK)
+    out = torch.empty(m, n, dtype=dtypes.bf16)
+    stream = torch.cuda.Stream()
+    try:
+        with torch.cuda.graph(torch.cuda.CUDAGraph(), stream=stream):
+            flydsl_gemm_a8w8_blockscale_bpreshuffle(
+                x,
+                w_shuf,
+                x_scale_km,
+                w_scale,
+                out,
+                ki.tile_m,
+                ki.tile_n,
+                ki.tile_k,
+                split_k=ki.split_k,
+            )
+    except RuntimeError as e:
+        assert "graph capture" in str(e), f"unexpected error: {e}"
+    else:
+        raise AssertionError("first split-K call inside a capture did not raise")
+
+
 def check_unservable_flydsl_rows_fall_back_to_ck():
     """A flydsl row the FlyDSL kernels cannot serve goes to CK, not to a FlyDSL function.
 
@@ -226,14 +254,15 @@ def check_unservable_flydsl_rows_fall_back_to_ck():
     shape past the kernel's 32-bit offsets, which the padded lookup can map onto a
     FlyDSL row.
     """
-    n, k = 128, 256
-    huge_m = OFFSET_LIMIT // k  # M * K reaches the limit
-    kernel_name = _CASES[0][3].name
+    n, k = 128, 128
+    kernel = _CASES[0][3]
+    tail_m = OFFSET_LIMIT // n - 1
+    assert offsets_fit(tail_m, n, k, 1) and not offsets_fit(tail_m, n, k, kernel.tile_m)
     # label: (M, kernelName, arch supported)
     cases = {
         "unknown name": (16, "flydsl_something_else_16x64x256", True),
-        "bpreshuffle name on another arch": (16, kernel_name, False),
-        "shape past 32-bit offsets": (huge_m, kernel_name, True),
+        "bpreshuffle name on another arch": (16, kernel.name, False),
+        "tail rows past 32-bit offsets": (tail_m, kernel.name, True),
     }
     w = torch.empty(n, k, dtype=dtypes.fp8)
     w_scale = torch.empty(n // BLOCK, k // BLOCK)
@@ -303,6 +332,7 @@ def main():
         )
         return
     check_split_k_graph_replay()
+    check_split_k_first_call_in_capture_raises()
 
     failures = []
     for dtype in args.dtype:

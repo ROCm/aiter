@@ -464,6 +464,12 @@ def _get_blockscale_split_buffers(
     outlive every graph that used it. The kernel leaves every counter at zero, so
     nothing resets them between launches or replays.
     """
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            f"[FlyDSL] the block-scale split-K counters for stream {stream} would be "
+            "allocated inside a CUDA graph capture, which leaves them unzeroed. Run "
+            "one split-K call on this stream before capturing."
+        )
     with persistent_alloc(device):
         workspace = torch.empty(
             bs_tune.SPLIT_K_WORKSPACE_ELEMS, dtype=torch.float32, device=device
@@ -511,8 +517,8 @@ def flydsl_gemm_a8w8_blockscale_bpreshuffle(
     * Under CUDA graph capture the capture stream's pair is recorded into the graph.
       Replaying a graph is a race if, at the same time, the capture stream or another
       replay of a graph captured on it runs a split kernel; replays in one stream order
-      are safe. On torch older than 2.10 the first split call on the capture stream
-      must precede the capture, as for every persistent_alloc buffer.
+      are safe. The first split call on the capture stream must precede the capture;
+      inside one, the wrapper raises.
     * A launch aborted mid-kernel can leave counters non-zero, which breaks every later
       split call on that stream.
     """
@@ -520,10 +526,11 @@ def flydsl_gemm_a8w8_blockscale_bpreshuffle(
 
     m, k = XQ.shape[0], XQ.shape[-1]
     n = WQ.shape[0]
-    if not bs_tune.offsets_fit(m, n, k):
+    if not bs_tune.offsets_fit(m, n, k, tile_m):
         raise RuntimeError(
-            f"[FlyDSL] M={m}, N={n}, K={k} needs offsets past 2**31; the block-scale "
-            f"kernel requires M * K, N * K and M * N below {bs_tune.OFFSET_LIMIT}."
+            f"[FlyDSL] M={m} (tile_m={tile_m}), N={n}, K={k} needs offsets past 2**31; "
+            f"the block-scale kernel requires M * K, N * K and M * N below "
+            f"{bs_tune.OFFSET_LIMIT}, with M rounded up to tile_m."
         )
 
     # uint8-typed fp8 bytes are accepted by the CK and triton paths, so accept them
@@ -598,21 +605,22 @@ def flydsl_gemm_a8w8_blockscale_bpreshuffle(
 
     # Unlike flydsl_preshuffle_gemm_a8, the launcher takes fx.Tensor, not pointers.
     out_contig = out if out.is_contiguous() else out.contiguous()
-    stream = torch.cuda.current_stream()
+    stream = torch.cuda.current_stream(XQ.device)
     split_args = (
         _get_blockscale_split_buffers(stream.device, stream) if split_k > 1 else ()
     )
-    _run_compiled(
-        exe,
-        out_contig,
-        XQ.contiguous(),
-        WQ.contiguous(),
-        x_scale_flat,
-        w_scale.contiguous().view(-1),
-        m,
-        *split_args,
-        fx.Stream(stream),
-    )
+    with torch.cuda.device(XQ.device):
+        _run_compiled(
+            exe,
+            out_contig,
+            XQ.contiguous(),
+            WQ.contiguous(),
+            x_scale_flat,
+            w_scale.contiguous().view(-1),
+            m,
+            *split_args,
+            fx.Stream(stream),
+        )
     if out_contig is not out:
         out.copy_(out_contig)
 

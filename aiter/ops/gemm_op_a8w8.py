@@ -69,17 +69,19 @@ def _flydsl_blockscale_supported() -> bool:
         return False
 
 
-def _flydsl_blockscale_offsets_fit(m: int, n: int, k: int) -> bool:
-    """True if the shape stays within the FlyDSL block-scale kernel's 32-bit offsets.
+def _flydsl_blockscale_offsets_fit(m: int, n: int, k: int, kernel_name: str) -> bool:
+    """True if the shape stays within the named FlyDSL kernel's 32-bit offsets.
 
     The padded tuned-row lookup serves every M above 8192 from an M = 8192 row, so a
-    shape past the limit can still name a FlyDSL kernel.
+    shape past the limit can still name a FlyDSL kernel. An unparsable name passes.
     """
     from .flydsl.gemm_tune.flydsl_gemm_a8w8_blockscale_bpreshuffle_common import (
         offsets_fit,
+        parse_kernel_name,
     )
 
-    return offsets_fit(m, n, k)
+    kernel_config = parse_kernel_name(kernel_name)
+    return kernel_config is None or offsets_fit(m, n, k, kernel_config.tile_m)
 
 
 def _ck_a8w8_supported() -> bool:
@@ -1785,7 +1787,7 @@ def gemm_a8w8_blockscale_bpreshuffle(
             if (
                 kernelName.startswith("flydsl_blockscale_bpreshuffle_")
                 and _flydsl_blockscale_supported()
-                and _flydsl_blockscale_offsets_fit(m, n, k)
+                and _flydsl_blockscale_offsets_fit(m, n, k, kernelName)
             ):
                 return gemm_a8w8_blockscale_bpreshuffle_flydsl(
                     XQ, WQ, x_scale, w_scale, Y, config

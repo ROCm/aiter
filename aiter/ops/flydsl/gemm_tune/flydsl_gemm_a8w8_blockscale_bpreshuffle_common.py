@@ -168,9 +168,10 @@ def tile_is_valid(config: kernelInstance, n: int, k: int) -> bool:
     return not lds_bytes or lds_bytes <= max_lds_bytes_for_tune()
 
 
-def offsets_fit(m: int, n: int, k: int) -> bool:
-    """Whether M * K, N * K and M * N stay below the kernel's 32-bit offset limit."""
-    return max(m * k, n * k, m * n) < OFFSET_LIMIT
+def offsets_fit(m: int, n: int, k: int, tile_m: int) -> bool:
+    """Whether M * K, N * K and M * N, with M rounded up to tile_m, stay below 2**31."""
+    padded_m = -(-m // tile_m) * tile_m
+    return max(padded_m * k, n * k, padded_m * n) < OFFSET_LIMIT
 
 
 def split_k_buffers_fit(m: int, n: int, tile_m: int, tile_n: int, split_k: int) -> bool:
@@ -297,10 +298,10 @@ def candidate_kernel_ids(
     m: int, n: int, k: int, cu_num: int, full_space: bool = False
 ) -> list[int]:
     """Return IDs passing resource checks; full_space skips performance heuristics."""
-    if not offsets_fit(m, n, k):
-        return []
     kernel_ids = []
     for kernel_id, config in kernels_list.items():
+        if not offsets_fit(m, n, k, config.tile_m):
+            continue
         if not tile_is_valid(config, n, k):
             continue
         if not split_k_buffers_fit(m, n, config.tile_m, config.tile_n, config.split_k):
