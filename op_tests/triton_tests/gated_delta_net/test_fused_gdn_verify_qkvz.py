@@ -393,6 +393,52 @@ def test_fused_gdn_verify_all_empty_batch():
     check_pools(pools, expected)
 
 
+@pytest.mark.parametrize(
+    "name",
+    [
+        "query_start_loc",
+        "slot_idx",
+        "num_accepted_tokens",
+        "write_pos",
+        "A_log",
+        "dt_bias",
+        "norm_weight",
+        "conv_bias",
+    ],
+)
+def test_fused_gdn_verify_rejects_strided_vectors(name):
+    """A strided view of a 1-D operand fails before the launch, because the kernel
+    reads these operands with unit stride."""
+    _requires_gfx1250()
+    window, cap = 4, 16
+    layer = make_layer(4, 8, seed=71, conv_bias=True)
+    pools = make_pools(layer, window, cap, seed=72)
+    step = make_step(layer, 4, window, seed=73)
+    out = torch.empty((step.n, layer.vh, V), dtype=torch.bfloat16, device="cuda")
+    args = op_args(layer, step, pools, out)
+    args[name] = torch.stack([args[name], args[name]], -1)[..., 0]
+    with pytest.raises(AssertionError, match="1-D operands"):
+        fused_gdn_verify_qkvz(max_query_len=window, scale=K**-0.5, norm_eps=EPS, **args)
+
+
+def test_fused_gdn_verify_extreme_gates():
+    """A gate of -1e8 before small gates, with 32 records and head ratio 3, where the
+    record weights come from a scan. The weights of the later records must keep fp32
+    precision."""
+    _requires_gfx1250()
+    window, cap = 4, 32
+    layer = make_layer(4, 12, seed=61)
+    pools = make_pools(layer, window, cap, seed=62)
+    step = make_step(layer, 8, window, seed=63)
+    slots = step.slots.long()
+    pools["wp"][slots] = 8
+    commit(pools, step, cap)
+    pools["rg"][slots, :, 0] = -1e8
+    truth, expected = reference(layer, step, pools, cap)
+    check_output(run_op(layer, step, pools), truth)
+    check_pools(pools, expected)
+
+
 def test_fused_gdn_verify_is_deterministic():
     _requires_gfx1250()
     window, cap = 4, 16

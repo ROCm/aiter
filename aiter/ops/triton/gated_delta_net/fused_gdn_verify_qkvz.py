@@ -129,6 +129,19 @@ def fused_gdn_verify_qkvz(
         == record_u.stride(3)
         == 1
     ), "the rows of the projections and the records must be contiguous"
+    vectors = (
+        query_start_loc,
+        slot_idx,
+        num_accepted_tokens,
+        write_pos,
+        A_log,
+        dt_bias,
+        norm_weight,
+        conv_bias,
+    )
+    assert all(
+        x is None or x.is_contiguous() for x in vectors
+    ), "the 1-D operands other than conv_state_indices must be contiguous"
     _LOGGER.info(
         "FUSED_GDN_VERIFY_QKVZ: seqs=%d k_heads=%d v_heads=%d max_query_len=%d cap=%d",
         seqs,

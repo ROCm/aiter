@@ -226,6 +226,12 @@ def _fused_gdn_verify(
             )
         else:
             g_rec = gl.load(record_g + later_idx * rg_pos_stride)
+        # The gate of the next record, for the suffix sums of the scan in phase 3.
+        g_next = g_rec
+        if not PAIRS:
+            g_next = gl.load(
+                record_g + (jrec + 1) * rg_pos_stride, mask=jrec + 1 < CAP, other=0.0
+            )
         k_rec = gl.load(
             RecordK
             + slot * rk_slot_stride
@@ -261,7 +267,7 @@ def _fused_gdn_verify(
             gates = gates + (g,)
             decays = decays + (exp_scaled(1.0, g),)
             betas = betas + (_sigmoid(b).to(gl.bfloat16).to(gl.float32),)
-        heads = heads + ((g_rec, k_rec, u_rec, ckpt_raw, gates, decays, betas),)
+        heads = heads + ((g_rec, k_rec, u_rec, ckpt_raw, gates, decays, betas, g_next),)
 
     # Phase 1: the conv of the window, one row of conv_out per token.
     conv_out = gl.allocate_shared_memory(gl.float32, [T_P2, CONV_P2], rec_shared)
@@ -304,7 +310,7 @@ def _fused_gdn_verify(
     # trips of a head do not wait behind the token loop of the head before it.
     staged = ()
     for i in gl.static_range(RATIO):
-        g_rec, k_rec, u_rec, ckpt_raw, gates, decays, betas = heads[i]
+        g_rec, k_rec, u_rec, ckpt_raw, gates, decays, betas, g_next = heads[i]
         # S = exp(sum g) S_0 + sum_j exp(sum of the gates after j) k_j u_j^T.
         if PAIRS:
             g_live = gl.where(later_idx < committed, g_rec, 0.0)
@@ -319,7 +325,12 @@ def _fused_gdn_verify(
             g_live = gl.convert_layout(
                 gl.where(jrec < committed, g_rec, 0.0), scan_layout
             )
-            after = gl.sum(g_live, 0) - gl.cumsum(g_live, 0)
+            # The suffix sums come from a reverse scan of the next gates. A difference
+            # of two large sums would lose fp32 precision.
+            g_after = gl.convert_layout(
+                gl.where(jrec + 1 < committed, g_next, 0.0), scan_layout
+            )
+            after = gl.cumsum(g_after, 0, reverse=True)
             w_rec = gl.convert_layout(
                 gl.where(jall < committed, exp_scaled(1.0, after), 0.0),
                 gl.SliceLayout(1, rec_layout),
