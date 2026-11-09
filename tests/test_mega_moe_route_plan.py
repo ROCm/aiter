@@ -14,19 +14,23 @@ pytest.importorskip("flydsl", reason="MegaMoE is built with FlyDSL")
 pytest.importorskip("mori.shmem", reason="MegaMoE's runtime imports mori")
 
 import hashlib  # noqa: E402
-from dataclasses import astuple  # noqa: E402
+from dataclasses import astuple, fields  # noqa: E402
 
 from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import (  # noqa: E402
     DEFAULT_SMALL_M_MTPRS,
+    FUSED_TOKEN_BUCKETS,
     LARGE_M_MIN_TOKENS,
     LARGE_M_MTPRS,
     ROUTE_LARGE_M,
     ROUTE_SMALL_M,
     ROUTE_STAGED,
     TOKEN_BUCKETS,
+    FusedStage1Knobs,
+    FusedStage2Knobs,
     build_mega_moe_bundle_plan,
-    select_fused_config,
     fused_layout_supported,
+    large_m_mtprs_for,
+    select_fused_config,
     small_m_cu_supported,
     small_m_mtprs_for,
 )
@@ -41,6 +45,9 @@ V4_PRO = dict(
     quant="a8w4",
     swiglu_limit=10.0,
 )
+# EP4 DeepSeek-V4.1-Flash: 96 experts a rank.
+V41_FLASH_EP4 = dict(V4_PRO, world_size=4, model_dim=5120, inter_dim=2304, experts=384)
+V41_FLASH_EP4_SHAPE = dict(world_size=4, experts_per_rank=96, model_dim=5120, inter_dim=2304)
 MTPRS = tuple(b for b in TOKEN_BUCKETS if b >= 16)
 
 
@@ -54,6 +61,11 @@ def _plan(mtpr, *, small=DEFAULT_SMALL_M_MTPRS, large=None):
 
 def test_fused_layout_gate():
     assert fused_layout_supported(**V4_PRO)
+    assert fused_layout_supported(**V41_FLASH_EP4)
+    # Each layout is supported whole: no mix of the two shapes.
+    assert not fused_layout_supported(**{**V41_FLASH_EP4, "world_size": 8})
+    assert not fused_layout_supported(**{**V41_FLASH_EP4, "experts": 768})
+    assert not fused_layout_supported(**{**V41_FLASH_EP4, "inter_dim": 3072})
     for field, value in (
         ("arch", "gfx942"),
         ("world_size", 4),
@@ -117,6 +129,17 @@ def test_route_exclusions():
     assert all(
         staged_only.route_for(t) == (ROUTE_STAGED, 8192) for t in (0, 1, 512, 8192)
     )
+
+
+def test_large_m_capacities_per_layout():
+    shape = dict(world_size=8, model_dim=7168, inter_dim=3072)
+    assert large_m_mtprs_for(**shape) == LARGE_M_MTPRS
+    # EP4 V4.1-Flash: the large-input kernel only at the MTPR its tune was measured at.
+    assert large_m_mtprs_for(world_size=4, model_dim=5120, inter_dim=2304) == (8192,)
+    select_fused_config(8192, 8192, **V41_FLASH_EP4_SHAPE)
+    for mtpr in (1024, 2048, 4096, 16384):
+        with pytest.raises(ValueError):
+            select_fused_config(mtpr, mtpr, **V41_FLASH_EP4_SHAPE)
 
 
 def test_large_m_capacity_validated():
@@ -207,3 +230,87 @@ def test_set_large_m_enabled_keeps_mains_interface():
     moe.set_large_m_enabled(False)
     assert moe._route(7, None) == (ROUTE_STAGED, 8192)
     assert moe._route(4096, 4096) == (ROUTE_STAGED, 8192)
+
+
+def test_ep8_fused_configs_keep_fused_knobs_off():
+    """The EP8 V4-Pro fused kernels are the ones before the EP4 tune: every fused knob off."""
+    for mtpr, tokens in _FUSED_CASES:
+        config = select_fused_config(tokens, mtpr)
+        assert config.fused_stage1 == FusedStage1Knobs(), (mtpr, tokens)
+        assert config.fused_stage2 == FusedStage2Knobs(), (mtpr, tokens)
+
+
+def _knob_table(config):
+    return (
+        astuple(config.stage1),
+        astuple(config.stage2),
+        config.p2p_quant,
+        tuple((f.name, getattr(config.fused_stage1, f.name)) for f in fields(FusedStage1Knobs)),
+        tuple((f.name, getattr(config.fused_stage2, f.name)) for f in fields(FusedStage2Knobs)),
+    )
+
+
+# The EP4 V4.1-Flash fused configs, as ported from 28ee7fcd (its _tune_v41_flash_ep4 on the post-processed
+# small-input configs and on the large-input config at MTPR 8192). On a mismatch the assertion shows the
+# current table.
+_EP4_FUSED_DIGEST = "46b5425e10dcb8ecf68983dee099df3fdb83a2ec4c0008bf44c4e083dafab45e"
+
+
+def test_ep4_fused_configs_unchanged():
+    table = {}
+    for mtpr, tokens in _FUSED_CASES:
+        if mtpr in (256, 512, 8192):
+            table[(mtpr, tokens)] = _knob_table(select_fused_config(tokens, mtpr, **V41_FLASH_EP4_SHAPE))
+    digest = hashlib.sha256(repr(sorted(table.items())).encode()).hexdigest()
+    assert digest == _EP4_FUSED_DIGEST, table
+
+
+@pytest.mark.parametrize("mtpr", (256, 512))
+def test_ep4_small_m_buckets_share_one_protocol(mtpr):
+    """The ranks of a launch may pick different buckets: the knobs that change what ranks and launches
+    exchange are the same in every bucket (SmallMRuntime asserts it too)."""
+    protocols = set()
+    for bucket in (b for b in FUSED_TOKEN_BUCKETS if b <= mtpr):
+        k = select_fused_config(bucket, mtpr, **V41_FLASH_EP4_SHAPE).fused_stage1
+        protocols.add((k.dedup_rows, k.plan_local, bool(k.direct_done), k.tok_counters, k.bf16_head_tokens))
+        # tok_done adds to the per-token counters every bucket clears.
+        assert not k.tok_done or k.tok_counters
+    assert protocols == {(True, True, True, True, 4)}
+    # A tok_done bucket (1 and 4 tokens) and one without it run on the same counters.
+    assert select_fused_config(1, mtpr, **V41_FLASH_EP4_SHAPE).fused_stage1.tok_done
+    assert not select_fused_config(16, mtpr, **V41_FLASH_EP4_SHAPE).fused_stage1.tok_done
+
+
+def test_ep4_dispatch_cus_cover_two_expert_waves():
+    """96 experts a rank are two 64-expert waves: twice the EP8 producers, capped at 224."""
+    for tokens in (1, 4, 8, 16, 32, 64, 128, 256, 512):
+        ep8 = select_fused_config(tokens, 512).stage1.num_dispatch_cu
+        ep4 = select_fused_config(tokens, 512, **V41_FLASH_EP4_SHAPE).stage1.num_dispatch_cu
+        assert ep4 == min(224, 2 * ep8), tokens
+    assert select_fused_config(8192, 8192, **V41_FLASH_EP4_SHAPE).stage1.num_dispatch_cu == 192
+
+
+@pytest.mark.parametrize("mtpr", (256, 512))
+def test_small_m_token_rows_live_in_the_payload_arena(mtpr):
+    """dedup_rows token rows sit past the fixed slots of the shared payload arena, inside u32 buffer offsets."""
+    from aiter.ops.flydsl.kernels.mega_moe.mega_moe_small_m import (
+        _TOKEN_REGION_END,
+        SmallMRuntime,
+    )
+
+    def rows(world_size, model_dim, inter_dim):
+        return SmallMRuntime.payload_capacity(
+            world_size=world_size,
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            experts=384,
+            topk=6,
+            max_tok_per_rank=mtpr,
+        )
+
+    ep8 = rows(8, 7168, 3072)
+    ep4 = rows(4, 5120, 2304)
+    # EP8 keeps the plain fixed-slot payload; EP4 adds one row per (source rank, token).
+    assert ep8[1] == 48 * (8 * mtpr) + 256
+    assert ep4[1] == 96 * (4 * mtpr) + 256 + 4 * mtpr
+    assert ep4[1] * ep4[2] <= _TOKEN_REGION_END
