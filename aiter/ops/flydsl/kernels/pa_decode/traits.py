@@ -842,6 +842,8 @@ class Gfx1250Traits:
     direct_context: bool = False
     single_kv_head: bool = False
     task_limit_per_seq: int = 0
+    # Two M tiles keep separate P/max/sum storage and share their barriers.
+    paired_softmax: bool = False
 
     WAVE = 32
     NWARP = 4
@@ -1005,7 +1007,7 @@ class Gfx1250Traits:
 
     @property
     def p_bytes(self):
-        return 16 * self.v_stride
+        return (2 if self.paired_softmax else 1) * 16 * self.v_stride
 
     @property
     def wave_query_tiles(self):
@@ -1079,7 +1081,7 @@ class Gfx1250Traits:
 
     @property
     def total_bytes(self):
-        return self.stats_offset + 576
+        return self.stats_offset + (1088 if self.paired_softmax else 576)
 
     @property
     def use_tdm(self):

@@ -1378,6 +1378,7 @@ _PIPE_CASES = [
                 "tile_tokens": 256,
                 "capture": True,
                 "expected_splits": splits,
+                "expected_paired_softmax": splits == 2,
                 **extra,
             },
         )
@@ -1425,6 +1426,7 @@ _PIPE_CASES = [
                 "tile_tokens": 256,
                 "capture": True,
                 "expected_splits": splits,
+                "expected_paired_softmax": splits == 2,
                 **extra,
             },
         )
@@ -1925,6 +1927,8 @@ def _check_pipe_policy(pa, case, arch, compile_kwargs):
         assert len(traits) == 1
         if "expected_splits" in case:
             assert traits[0].query_splits == case["expected_splits"]
+        if "expected_paired_softmax" in case:
+            assert traits[0].paired_softmax == case["expected_paired_softmax"]
         if "task_limit" in case:
             assert traits[0].task_limit_per_seq == case["task_limit"]
         assert not traits[0].single_kv_head or selected["num_kv_heads"] == 1

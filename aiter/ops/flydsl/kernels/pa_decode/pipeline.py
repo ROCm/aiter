@@ -1979,6 +1979,144 @@ class Gfx1250Pipeline:
         self.merge = Gfx1250PartitionMerge(ctx, self.mem)
 
     @flyc.jit
+    def pair_tile(
+        self,
+        token_base,
+        kv_off,
+        state,
+        q_operands,
+        q_scales,
+        packed_k_operands,
+        page_v_operands,
+        vnorm,
+    ):
+        """Batch the two query tiles' shared-memory softmax exchanges."""
+        ctx, t = self.ctx, self.t
+        kscales, vvalues = [], []
+        for n in range_constexpr(2):
+            token = ctx.warp * 32 + n * 16 + ctx.half * 8
+            kscales.append(
+                self.mem.load(kv_off + t.k_bytes + t.v_bytes + token * 4, fx.Float32, 8)
+            )
+            vs = self.mem.load(
+                kv_off + t.k_bytes + t.v_bytes + (128 + token) * 4, fx.Float32, 8
+            )
+            vvalues.extend([fx.Float32(vs[r]) for r in range_constexpr(8)])
+        vscales = fx.Vector.from_elements(vvalues, dtype=fx.Float32)
+        scores_all = []
+        for m in range_constexpr(2):
+            row = m * 16 + ctx.lane16
+            upper = (
+                ctx.planned_context
+                - t.query_length
+                + ctx.query_begin
+                + row // t.query_group_size
+                + 1
+            )
+            scale = q_scales[m] * fx.Float32(t.softmax_scale * LOG2E)
+            units = []
+            for n in range_constexpr(2):
+                qk = Gfx1250Gemm.mma(
+                    packed_k_operands[n][0],
+                    q_operands[m][0],
+                    fx.Vector.filled(8, 0.0, fx.Float32),
+                    128,
+                    False,
+                )
+                for r in range_constexpr(8):
+                    token = ctx.warp * 32 + n * 16 + ctx.half * 8 + r
+                    value = qk[r] * scale
+                    value = value * fx.Float32(kscales[n][r])
+                    visible = (token_base + token < upper) & (row < t.rows)
+                    units.append(visible.select(value, fx.Float32(float("-inf"))))
+            score_vec = fx.Vector.from_elements(units, dtype=fx.Float32)
+            local_max = score_vec.reduce(ReductionOp.MAX)
+            local_max = fx.maxnumf(local_max, local_max.shuffle_xor(16, t.WAVE))
+            if ctx.half == 0:
+                self.mem.store(
+                    t.stats_offset + m * 512 + (ctx.lane16 * 4 + ctx.warp) * 4,
+                    local_max,
+                    fx.Float32,
+                )
+            scores_all.append(score_vec)
+        gpu.barrier()
+
+        maxima, corrections = [], []
+        for m in range_constexpr(2):
+            tile_max = self.mem.load(
+                t.stats_offset + m * 512 + ctx.lane16 * 16, fx.Float32, 4
+            ).reduce(ReductionOp.MAX)
+            old_max = state[m * 4]
+            new_max = fx.maxnumf(old_max, tile_max)
+            safe_max = (new_max > fx.Float32(float("-inf"))).select(
+                new_max, fx.Float32(0.0)
+            )
+            corr = fx.Float32(fx.exp2(old_max - safe_max, fastmath="afn"))
+            probs = fx.Vector(
+                fx.exp2(
+                    scores_all[m]
+                    - fx.Vector.from_elements(
+                        [fx.Float32(safe_max)], dtype=fx.Float32
+                    ).broadcast_to(16),
+                    fastmath="afn",
+                )
+            )
+            local_sum = probs.reduce(ReductionOp.ADD)
+            local_sum = local_sum + local_sum.shuffle_xor(16, t.WAVE)
+            pscale = [
+                probs[r] * fx.Float32(vscales[r]) * vnorm for r in range_constexpr(16)
+            ]
+            for n in range_constexpr(2):
+                packed = self.mem.fp8(
+                    fx.Vector.from_elements(
+                        [pscale[n * 8 + r] for r in range_constexpr(8)],
+                        dtype=fx.Float32,
+                    )
+                )
+                self.mem.store(
+                    t.p_offset
+                    + m * 16 * t.v_stride
+                    + ctx.lane16 * t.v_stride
+                    + ctx.warp * 32
+                    + n * 16
+                    + ctx.half * 8,
+                    packed,
+                    fx.Int32,
+                )
+            if ctx.half == 0:
+                self.mem.store(
+                    t.stats_offset + m * 512 + 256 + (ctx.lane16 * 4 + ctx.warp) * 4,
+                    local_sum,
+                    fx.Float32,
+                )
+            maxima.append(new_max)
+            corrections.append(corr)
+        gpu.barrier()
+
+        next_state = []
+        for m in range_constexpr(2):
+            denom = state[m * 4 + 1] * corrections[m] + self.mem.load(
+                t.stats_offset + m * 512 + 256 + ctx.lane16 * 16, fx.Float32, 4
+            ).reduce(ReductionOp.ADD)
+            next_state.extend([maxima[m], denom])
+            p_operand = self.mem.operand(
+                t.p_offset + m * 16 * t.v_stride,
+                t.v_stride,
+                128,
+                ctx.lane16,
+                ctx.half,
+            )
+            for vh in range_constexpr(2):
+                out = state[m * 4 + 2 + vh] * fx.Vector.from_elements(
+                    [corrections[m] * state[-1] * vnorm], dtype=fx.Float32
+                ).broadcast_to(8)
+                out = Gfx1250Gemm.mma(
+                    page_v_operands[vh][0], p_operand, out, 128, False
+                )
+                next_state.append(out)
+        return next_state
+
+    @flyc.jit
     def run(self):
         ctx, t = self.ctx, self.t
         ctx.tid = fx.Int32(gpu.thread_id("x"))
@@ -2126,252 +2264,274 @@ class Gfx1250Pipeline:
                     for n in range_constexpr(t.TOKENS // 64)
                 ]
                 page_v_operands = self.mem.page_v_operands(kv_off)
-            next_state = []
-            for m in range_constexpr(t.m_tiles):
-                if const_expr(t.q_tiles != t.m_tiles):
-                    self.mem.stage_query(m)
-                    gpu.barrier()
-                q_tile = m if t.q_tiles == t.m_tiles else 0
-                row = m * 16 + ctx.lane16
-                qscale = fx.Float32(1.0)
-                if const_expr(resident_q):
-                    qscale = q_scales[m]
-                elif const_expr(not t.bf16):
-                    qscale = fx.Float32(
-                        self.mem.load(
-                            (q_tile * 16 + ctx.lane16) * t.q_stride + t.head_dim,
-                            fx.Float32,
-                        )[0]
-                    )
-                scale = qscale * fx.Float32(t.softmax_scale * LOG2E)
-                if const_expr(not t.per_token_kv and not t.bf16):
-                    ks = fx.recast_iter(fx.Float32, ctx.key_scale_ptr)
-                    scale = scale * fx.Float32(ks[0])
-                upper = (
-                    ctx.planned_context
-                    - t.query_length
-                    + ctx.query_begin
-                    + row // t.query_group_size
-                    + 1
+            if const_expr(t.paired_softmax):
+                next_state = self.pair_tile(
+                    token_base,
+                    kv_off,
+                    state,
+                    q_operands,
+                    q_scales,
+                    packed_k_operands,
+                    page_v_operands,
+                    vnorm,
                 )
-                units, values = [], []
-                qk_k = 32 if t.bf16 else (128 if t.head_dim % 128 == 0 else 64)
-                for n in range_constexpr(t.TOKENS // 64):
-                    scores = fx.Vector.filled(8, 0.0, fx.Float32)
-                    for d in range_constexpr(t.head_dim // qk_k):
-                        if const_expr(t.fp8_multi_tile):
-                            a = packed_k_operands[n][d]
-                        elif const_expr(t.packed_lds):
-                            a = self.mem.packed_k_operand(kv_off, n, d)
-                        elif const_expr(t.bf16_page16_packed):
-                            a = self.mem.bf16_k_operand(
-                                kv_off + ctx.warp * t.head_dim * 32,
-                                0,
-                                d * qk_k,
-                                ctx.lane16,
-                                ctx.half,
-                            )
-                        else:
-                            a = self.mem.operand(
-                                kv_off
-                                + ctx.warp * 16 * t.q_stride
-                                + d * qk_k * t.elem_bytes,
-                                t.q_stride,
-                                qk_k,
-                                ctx.lane16,
-                                ctx.half,
-                            )
-                        if const_expr(resident_q):
-                            b = q_operands[m][d]
-                        else:
-                            b = self.mem.operand(
-                                q_tile * 16 * t.q_stride + d * qk_k * t.elem_bytes,
-                                t.q_stride,
-                                qk_k,
-                                ctx.lane16,
-                                ctx.half,
-                            )
-                        scores = Gfx1250Gemm.mma(a, b, scores, qk_k, t.bf16)
-                    if const_expr(t.per_token_kv):
-                        scale_token = ctx.warp * (t.TOKENS // 4) + n * 16 + ctx.half * 8
-                        ks = self.mem.load(
-                            kv_off + t.k_bytes + t.v_bytes + scale_token * 4,
-                            fx.Float32,
-                            8,
+            else:
+                next_state = []
+                for m in range_constexpr(t.m_tiles):
+                    if const_expr(t.q_tiles != t.m_tiles):
+                        self.mem.stage_query(m)
+                        gpu.barrier()
+                    q_tile = m if t.q_tiles == t.m_tiles else 0
+                    row = m * 16 + ctx.lane16
+                    qscale = fx.Float32(1.0)
+                    if const_expr(resident_q):
+                        qscale = q_scales[m]
+                    elif const_expr(not t.bf16):
+                        qscale = fx.Float32(
+                            self.mem.load(
+                                (q_tile * 16 + ctx.lane16) * t.q_stride + t.head_dim,
+                                fx.Float32,
+                            )[0]
                         )
-                        vs = self.mem.load(
-                            kv_off
-                            + t.k_bytes
-                            + t.v_bytes
-                            + (t.TOKENS + scale_token) * 4,
-                            fx.Float32,
-                            8,
-                        )
-                        values.extend([vs[r] for r in range_constexpr(8)])
-                    for r in range_constexpr(8):
-                        token = ctx.warp * (t.TOKENS // 4) + n * 16 + ctx.half * 8 + r
-                        value = scores[r] * scale
+                    scale = qscale * fx.Float32(t.softmax_scale * LOG2E)
+                    if const_expr(not t.per_token_kv and not t.bf16):
+                        ks = fx.recast_iter(fx.Float32, ctx.key_scale_ptr)
+                        scale = scale * fx.Float32(ks[0])
+                    upper = (
+                        ctx.planned_context
+                        - t.query_length
+                        + ctx.query_begin
+                        + row // t.query_group_size
+                        + 1
+                    )
+                    units, values = [], []
+                    qk_k = 32 if t.bf16 else (128 if t.head_dim % 128 == 0 else 64)
+                    for n in range_constexpr(t.TOKENS // 64):
+                        scores = fx.Vector.filled(8, 0.0, fx.Float32)
+                        for d in range_constexpr(t.head_dim // qk_k):
+                            if const_expr(t.fp8_multi_tile):
+                                a = packed_k_operands[n][d]
+                            elif const_expr(t.packed_lds):
+                                a = self.mem.packed_k_operand(kv_off, n, d)
+                            elif const_expr(t.bf16_page16_packed):
+                                a = self.mem.bf16_k_operand(
+                                    kv_off + ctx.warp * t.head_dim * 32,
+                                    0,
+                                    d * qk_k,
+                                    ctx.lane16,
+                                    ctx.half,
+                                )
+                            else:
+                                a = self.mem.operand(
+                                    kv_off
+                                    + ctx.warp * 16 * t.q_stride
+                                    + d * qk_k * t.elem_bytes,
+                                    t.q_stride,
+                                    qk_k,
+                                    ctx.lane16,
+                                    ctx.half,
+                                )
+                            if const_expr(resident_q):
+                                b = q_operands[m][d]
+                            else:
+                                b = self.mem.operand(
+                                    q_tile * 16 * t.q_stride + d * qk_k * t.elem_bytes,
+                                    t.q_stride,
+                                    qk_k,
+                                    ctx.lane16,
+                                    ctx.half,
+                                )
+                            scores = Gfx1250Gemm.mma(a, b, scores, qk_k, t.bf16)
                         if const_expr(t.per_token_kv):
-                            value = value * fx.Float32(ks[r])
-                        visible = (token_base + token < upper) & (row < t.rows)
-                        if const_expr(t.sliding_window > 0):
-                            visible = visible & (
-                                token_base + token >= upper - t.sliding_window
+                            scale_token = (
+                                ctx.warp * (t.TOKENS // 4) + n * 16 + ctx.half * 8
                             )
-                        units.append(visible.select(value, fx.Float32(float("-inf"))))
-                scores = fx.Vector.from_elements(units, dtype=fx.Float32)
-                if const_expr(t.per_token_kv):
-                    vscales = fx.Vector.from_elements(values, dtype=fx.Float32)
-                local_max = scores.reduce(ReductionOp.MAX)
-                local_max = fx.maxnumf(local_max, local_max.shuffle_xor(16, t.WAVE))
-                if ctx.half == 0:
-                    self.mem.store(
-                        t.stats_offset + (ctx.lane16 * t.NWARP + ctx.warp) * 4,
-                        local_max,
-                        fx.Float32,
-                    )
-                gpu.barrier()
-                tile_max = self.mem.load(
-                    t.stats_offset + ctx.lane16 * t.NWARP * 4, fx.Float32, t.NWARP
-                ).reduce(ReductionOp.MAX)
-                old_max = state[m * state_stride]
-                new_max = fx.maxnumf(old_max, tile_max)
-                safe_max = (new_max > fx.Float32(float("-inf"))).select(
-                    new_max, fx.Float32(0.0)
-                )
-                # Approximate exponentials avoid the library underflow fixup.
-                # Keep infinity semantics for masked rows and empty history.
-                corr = fx.Float32(fx.exp2(old_max - safe_max, fastmath="afn"))
-                probs = fx.Vector(
-                    fx.exp2(
-                        scores
-                        - fx.Vector.from_elements(
-                            [fx.Float32(safe_max)], dtype=fx.Float32
-                        ).broadcast_to(t.TOKENS // 8),
-                        fastmath="afn",
-                    )
-                )
-                local_sum = probs.reduce(ReductionOp.ADD)
-                local_sum = local_sum + local_sum.shuffle_xor(16, t.WAVE)
-                pscale = []
-                for r in range_constexpr(t.TOKENS // 8):
-                    if const_expr(t.per_token_kv):
-                        vs = fx.Float32(vscales[r])
-                        pscale.append(probs[r] * vs * vnorm)
-                    else:
-                        pscale.append(
-                            probs[r] * fx.Float32(1.0 if t.bf16 else t.FP8_MAX)
-                        )
-                for n in range_constexpr(t.TOKENS // 64):
-                    pvalues = fx.Vector.from_elements(
-                        [pscale[n * 8 + r] for r in range_constexpr(8)],
-                        dtype=fx.Float32,
-                    )
-                    p = pvalues.to(fx.BFloat16) if t.bf16 else self.mem.fp8(pvalues)
-                    self.mem.store(
-                        t.p_offset
-                        + ctx.lane16 * t.v_stride
-                        + (ctx.warp * (t.TOKENS // 4) + n * 16 + ctx.half * 8)
-                        * t.elem_bytes,
-                        p,
-                        fx.BFloat16 if t.bf16 else fx.Int32,
-                    )
-                if ctx.half == 0:
-                    self.mem.store(
-                        t.stats_offset + 256 + (ctx.lane16 * t.NWARP + ctx.warp) * 4,
-                        local_sum,
-                        fx.Float32,
-                    )
-                # Prefetch V operands before waiting for cross-wave P stores.
-                pv_k = 32 if t.bf16 else t.TOKENS
-                if const_expr(t.fp8_multi_tile):
-                    v_operands = page_v_operands
-                elif const_expr(t.packed_lds):
-                    v_operands = self.mem.page_v_operands(kv_off)
-                elif const_expr(t.bf16_page16_packed):
-                    v_operands = [
-                        [
-                            self.mem.bf16_v_operand(
-                                kv_off + t.k_bytes,
-                                vh * 64 + ctx.warp * 16,
-                                d * pv_k,
-                                ctx.lane16,
-                                ctx.half,
+                            ks = self.mem.load(
+                                kv_off + t.k_bytes + t.v_bytes + scale_token * 4,
+                                fx.Float32,
+                                8,
                             )
-                            for d in range_constexpr(t.TOKENS // pv_k)
-                        ]
-                        for vh in range_constexpr(vh_count)
-                    ]
-                else:
-                    v_operands = [
-                        [
-                            self.mem.operand(
+                            vs = self.mem.load(
                                 kv_off
                                 + t.k_bytes
-                                + (vh * 64 + ctx.warp * 16) * t.v_stride
-                                + d * pv_k * t.elem_bytes,
-                                t.v_stride,
-                                pv_k,
-                                ctx.lane16,
-                                ctx.half,
+                                + t.v_bytes
+                                + (t.TOKENS + scale_token) * 4,
+                                fx.Float32,
+                                8,
                             )
-                            for d in range_constexpr(t.TOKENS // pv_k)
-                        ]
-                        for vh in range_constexpr(vh_count)
-                    ]
-                gpu.barrier()
-                denom = state[m * state_stride + 1] * corr + self.mem.load(
-                    t.stats_offset + 256 + ctx.lane16 * t.NWARP * 4, fx.Float32, t.NWARP
-                ).reduce(ReductionOp.ADD)
-                next_state.extend([new_max, denom])
-                p_operands = [
-                    self.mem.operand(
-                        t.p_offset + d * pv_k * t.elem_bytes,
-                        t.v_stride,
-                        pv_k,
-                        ctx.lane16,
-                        ctx.half,
-                    )
-                    for d in range_constexpr(t.TOKENS // pv_k)
-                ]
-                for vh in range_constexpr(vh_count):
-                    # Packed outputs remain normalized by the previous V
-                    # factor. Rescale before WMMA to fuse its accumulation.
-                    out = (
-                        state[m * state_stride + 2 + vh]
-                        * fx.Vector.from_elements(
-                            [corr * state[-1] * vnorm], dtype=fx.Float32
-                        ).broadcast_to(8)
-                        if t.packed_lds
-                        else fx.Vector.filled(8, 0.0, fx.Float32)
-                    )
-                    for d in range_constexpr(t.TOKENS // pv_k):
-                        out = Gfx1250Gemm.mma(
-                            v_operands[vh][d], p_operands[d], out, pv_k, t.bf16
+                            values.extend([vs[r] for r in range_constexpr(8)])
+                        for r in range_constexpr(8):
+                            token = (
+                                ctx.warp * (t.TOKENS // 4) + n * 16 + ctx.half * 8 + r
+                            )
+                            value = scores[r] * scale
+                            if const_expr(t.per_token_kv):
+                                value = value * fx.Float32(ks[r])
+                            visible = (token_base + token < upper) & (row < t.rows)
+                            if const_expr(t.sliding_window > 0):
+                                visible = visible & (
+                                    token_base + token >= upper - t.sliding_window
+                                )
+                            units.append(
+                                visible.select(value, fx.Float32(float("-inf")))
+                            )
+                    scores = fx.Vector.from_elements(units, dtype=fx.Float32)
+                    if const_expr(t.per_token_kv):
+                        vscales = fx.Vector.from_elements(values, dtype=fx.Float32)
+                    local_max = scores.reduce(ReductionOp.MAX)
+                    local_max = fx.maxnumf(local_max, local_max.shuffle_xor(16, t.WAVE))
+                    if ctx.half == 0:
+                        self.mem.store(
+                            t.stats_offset + (ctx.lane16 * t.NWARP + ctx.warp) * 4,
+                            local_max,
+                            fx.Float32,
                         )
-                    if const_expr(t.packed_lds):
-                        next_state.append(out)
+                    gpu.barrier()
+                    tile_max = self.mem.load(
+                        t.stats_offset + ctx.lane16 * t.NWARP * 4, fx.Float32, t.NWARP
+                    ).reduce(ReductionOp.MAX)
+                    old_max = state[m * state_stride]
+                    new_max = fx.maxnumf(old_max, tile_max)
+                    safe_max = (new_max > fx.Float32(float("-inf"))).select(
+                        new_max, fx.Float32(0.0)
+                    )
+                    # Approximate exponentials avoid the library underflow fixup.
+                    # Keep infinity semantics for masked rows and empty history.
+                    corr = fx.Float32(fx.exp2(old_max - safe_max, fastmath="afn"))
+                    probs = fx.Vector(
+                        fx.exp2(
+                            scores
+                            - fx.Vector.from_elements(
+                                [fx.Float32(safe_max)], dtype=fx.Float32
+                            ).broadcast_to(t.TOKENS // 8),
+                            fastmath="afn",
+                        )
+                    )
+                    local_sum = probs.reduce(ReductionOp.ADD)
+                    local_sum = local_sum + local_sum.shuffle_xor(16, t.WAVE)
+                    pscale = []
+                    for r in range_constexpr(t.TOKENS // 8):
+                        if const_expr(t.per_token_kv):
+                            vs = fx.Float32(vscales[r])
+                            pscale.append(probs[r] * vs * vnorm)
+                        else:
+                            pscale.append(
+                                probs[r] * fx.Float32(1.0 if t.bf16 else t.FP8_MAX)
+                            )
+                    for n in range_constexpr(t.TOKENS // 64):
+                        pvalues = fx.Vector.from_elements(
+                            [pscale[n * 8 + r] for r in range_constexpr(8)],
+                            dtype=fx.Float32,
+                        )
+                        p = pvalues.to(fx.BFloat16) if t.bf16 else self.mem.fp8(pvalues)
+                        self.mem.store(
+                            t.p_offset
+                            + ctx.lane16 * t.v_stride
+                            + (ctx.warp * (t.TOKENS // 4) + n * 16 + ctx.half * 8)
+                            * t.elem_bytes,
+                            p,
+                            fx.BFloat16 if t.bf16 else fx.Int32,
+                        )
+                    if ctx.half == 0:
+                        self.mem.store(
+                            t.stats_offset
+                            + 256
+                            + (ctx.lane16 * t.NWARP + ctx.warp) * 4,
+                            local_sum,
+                            fx.Float32,
+                        )
+                    # Prefetch V operands before waiting for cross-wave P stores.
+                    pv_k = 32 if t.bf16 else t.TOKENS
+                    if const_expr(t.fp8_multi_tile):
+                        v_operands = page_v_operands
+                    elif const_expr(t.packed_lds):
+                        v_operands = self.mem.page_v_operands(kv_off)
+                    elif const_expr(t.bf16_page16_packed):
+                        v_operands = [
+                            [
+                                self.mem.bf16_v_operand(
+                                    kv_off + t.k_bytes,
+                                    vh * 64 + ctx.warp * 16,
+                                    d * pv_k,
+                                    ctx.lane16,
+                                    ctx.half,
+                                )
+                                for d in range_constexpr(t.TOKENS // pv_k)
+                            ]
+                            for vh in range_constexpr(vh_count)
+                        ]
                     else:
-                        next_state.append(
+                        v_operands = [
+                            [
+                                self.mem.operand(
+                                    kv_off
+                                    + t.k_bytes
+                                    + (vh * 64 + ctx.warp * 16) * t.v_stride
+                                    + d * pv_k * t.elem_bytes,
+                                    t.v_stride,
+                                    pv_k,
+                                    ctx.lane16,
+                                    ctx.half,
+                                )
+                                for d in range_constexpr(t.TOKENS // pv_k)
+                            ]
+                            for vh in range_constexpr(vh_count)
+                        ]
+                    gpu.barrier()
+                    denom = state[m * state_stride + 1] * corr + self.mem.load(
+                        t.stats_offset + 256 + ctx.lane16 * t.NWARP * 4,
+                        fx.Float32,
+                        t.NWARP,
+                    ).reduce(ReductionOp.ADD)
+                    next_state.extend([new_max, denom])
+                    p_operands = [
+                        self.mem.operand(
+                            t.p_offset + d * pv_k * t.elem_bytes,
+                            t.v_stride,
+                            pv_k,
+                            ctx.lane16,
+                            ctx.half,
+                        )
+                        for d in range_constexpr(t.TOKENS // pv_k)
+                    ]
+                    for vh in range_constexpr(vh_count):
+                        # Packed outputs remain normalized by the previous V
+                        # factor. Rescale before WMMA to fuse its accumulation.
+                        out = (
                             state[m * state_stride + 2 + vh]
                             * fx.Vector.from_elements(
-                                [fx.Float32(corr)], dtype=fx.Float32
+                                [corr * state[-1] * vnorm], dtype=fx.Float32
                             ).broadcast_to(8)
-                            + out
-                            * fx.Vector.from_elements(
-                                [fx.Float32(vfactor)], dtype=fx.Float32
-                            ).broadcast_to(8)
+                            if t.packed_lds
+                            else fx.Vector.filled(8, 0.0, fx.Float32)
                         )
-                # The next M-tile writes P and statistics only after its max
-                # barrier, which every wave reaches after these reads. The next
-                # iteration's barrier likewise retires them before a double
-                # buffer is reused; single-buffer staging still needs one here.
-                if const_expr(
-                    t.buffers == 1
-                    and m + 1 == t.m_tiles
-                    and not (t.single_task_tile and t.plan_tile_tokens == t.TOKENS)
-                ):
-                    gpu.barrier()
+                        for d in range_constexpr(t.TOKENS // pv_k):
+                            out = Gfx1250Gemm.mma(
+                                v_operands[vh][d], p_operands[d], out, pv_k, t.bf16
+                            )
+                        if const_expr(t.packed_lds):
+                            next_state.append(out)
+                        else:
+                            next_state.append(
+                                state[m * state_stride + 2 + vh]
+                                * fx.Vector.from_elements(
+                                    [fx.Float32(corr)], dtype=fx.Float32
+                                ).broadcast_to(8)
+                                + out
+                                * fx.Vector.from_elements(
+                                    [fx.Float32(vfactor)], dtype=fx.Float32
+                                ).broadcast_to(8)
+                            )
+                    # The next M-tile writes P and statistics only after its max
+                    # barrier, which every wave reaches after these reads. The next
+                    # iteration's barrier likewise retires them before a double
+                    # buffer is reused; single-buffer staging still needs one here.
+                    if const_expr(
+                        t.buffers == 1
+                        and m + 1 == t.m_tiles
+                        and not (t.single_task_tile and t.plan_tile_tokens == t.TOKENS)
+                    ):
+                        gpu.barrier()
             if const_expr(t.buffers == 1):  # noqa: SIM102
                 if token_base + t.TOKENS < end:
                     self.mem.stage_kv(token_base + t.TOKENS, fx.Int32(0))

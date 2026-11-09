@@ -244,6 +244,7 @@ def compile_pa_decode_tile(
             if max_context_length is not None and max_context_length > 0
             else 0
         )
+        paired_softmax = False
         if query_splits is None:
             bounded_fp8_mtp = (
                 kv_dtype == "fp8"
@@ -284,6 +285,7 @@ def compile_pa_decode_tile(
                     else 1
                 )
             )
+            paired_softmax = bounded_fp8_mtp and query_splits == 2
         # Capacity covers every row's upper tile bound, so each visible
         # tile gets its own task even with empty/mixed rows.
         task_limit_per_seq = 0
@@ -329,6 +331,7 @@ def compile_pa_decode_tile(
             plan_tile_tokens=plan_tile_tokens,
             single_task_tile=single_task_tile,
             task_limit_per_seq=task_limit_per_seq,
+            paired_softmax=paired_softmax,
             single_kv_head=(
                 num_kv_heads == 1
                 and head_dim == 128
@@ -627,6 +630,7 @@ def compile_gfx1250_pa_decode(
     direct_context=False,
     single_kv_head=False,
     task_limit_per_seq=0,
+    paired_softmax=False,
 ):
     """Compile a gfx1250 tile kernel; merging partitions writes final output.
 
@@ -646,6 +650,9 @@ def compile_gfx1250_pa_decode(
     one KV buffer and skip its final reuse barrier; BF16 wave merge keeps two.
     ``plan_tile_tokens`` matches the plan's 128/256-token units; the value
     participates in the kernel cache key and planned range conversion.
+    ``paired_softmax`` batches the two FP8 MTP query tiles' max and P/sum
+    exchanges. It requires the separate D128/GQA16 split2 path and keeps
+    independent per-query LDS storage; each query retains its own state.
     ``task_limit_per_seq`` bounds packed active tasks per sequence for
     separate-reducer output; it only trims the launch and retains capacity
     for all scratch strides. Zero keeps the original grid.
@@ -684,7 +691,25 @@ def compile_gfx1250_pa_decode(
         direct_context,
         single_kv_head,
         task_limit_per_seq,
+        paired_softmax,
     )
+    if type(paired_softmax) is not bool:
+        raise ValueError("paired_softmax must be a bool")
+    if paired_softmax and not (
+        compute_dtype == "fp8"
+        and query_dtype == "bf16"
+        and per_token_kv
+        and head_dim == 128
+        and query_group_size == 16
+        and query_length == 4
+        and query_splits == 2
+        and block_size == 128
+        and trans_v
+        and sliding_window == 0
+        and plan_tile_tokens == 256
+        and not t.merged_output
+    ):
+        raise ValueError("paired_softmax requires the separate FP8 MTP4 split2 tile")
     if type(task_limit_per_seq) is not int or task_limit_per_seq < 0:
         raise ValueError("task_limit_per_seq must be a nonnegative int")
     if task_limit_per_seq and (direct_output or merge_partitions or cluster_merge):
@@ -744,6 +769,8 @@ def compile_gfx1250_pa_decode(
         merge_partitions=merge_partitions,
         cluster_merge=cluster_merge,
     )
+    if paired_softmax:
+        kernel_name += "_ps2"
 
     @flyc.jit
     def run_tile(
