@@ -523,6 +523,23 @@ def _worker(rank, world, args):
                 dist.destroy_process_group()
 
 
+def _resolve_inbox(mode, world_size):
+    """(link for the report, resolved inbox memory), on the op's own policy.
+
+    The inbox memory comes from the op's resolver, so an undetectable link
+    falls back to uncached as in the op. The link is only reported, as
+    "unknown" when it cannot be detected.
+    """
+    from aiter.ops.flydsl.allreduce_policy import detect_link
+    from aiter.ops.flydsl.comm_collectives_host_shared import resolve_inbox_flags
+
+    try:
+        link = detect_link()
+    except ValueError:
+        link = "unknown"
+    return link, resolve_inbox_flags(mode, world_size)[1]
+
+
 def main():
     names = [r.name for r in _RECIPES]
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -568,14 +585,7 @@ def main():
             f"SKIP: world={args.world_size}, only {torch.cuda.device_count()} HIP devices visible"
         )
         return 0
-    from aiter.ops.flydsl.allreduce_policy import detect_link
-    from aiter.ops.flydsl.comm_collectives_host_shared import resolve_inbox_flags
-
-    # Only auto depends on the link; a named mode must not fail without it.
-    args.link = detect_link() if args.inbox_memory == "auto" else "n/a"
-    args.resolved_inbox = resolve_inbox_flags(
-        args.inbox_memory, args.world_size, args.link
-    )[1]
+    args.link, args.resolved_inbox = _resolve_inbox(args.inbox_memory, args.world_size)
     mp.spawn(_worker, args=(args.world_size, args), nprocs=args.world_size, join=True)
     return 0
 
