@@ -25,7 +25,7 @@ from ..jit.utils.chip_info import get_cu_num
 from ..jit.utils.chip_info import get_gfx_runtime as get_gfx
 from ..jit.utils.torch_guard import torch_compile_guard
 from ..utility import dtypes
-from ..utility.graph_alloc import persistent_alloc
+from ..utility.graph_alloc import capture_scoped_cache, persistent_alloc
 
 __all__ = [
     "clear_gemm_a16w8_mxfp8_config_cache",
@@ -230,7 +230,13 @@ def _mx_default_kernel(M: int, N: int) -> str:
     return _mx_registry()[name]["knl_name"]
 
 
-_mx_workspace_by_stream: dict[tuple[torch.device, int], tuple[Tensor, Tensor]] = {}
+_mx_partials_by_stream: dict[tuple[torch.device, int], Tensor] = {}
+
+
+@capture_scoped_cache
+def _mx_counters_keyed(device: torch.device, stream_id: int) -> Tensor:
+    with persistent_alloc(device):
+        return torch.zeros(_MX_COUNTERS, dtype=torch.int32, device=device)
 
 
 def _mx_workspace(device: torch.device) -> tuple[Tensor, Tensor]:
@@ -238,17 +244,20 @@ def _mx_workspace(device: torch.device) -> tuple[Tensor, Tensor]:
 
     The last split of each tile resets its counter, so the counters stay zero
     between calls. Launches on different streams must not share counters, so
-    each stream gets its own pair. Pairs are never freed: a captured graph keeps
-    their addresses and can replay them at any time.
+    each stream gets its own. Counters first built inside a capture are zeroed
+    only when that graph replays, so they belong to that capture alone
+    (capture_scoped_cache). Every split writes its partials before the last one
+    reads them, so the partials need no zero fill and one buffer per stream
+    serves eager calls and all its captures. Neither is ever freed: a captured
+    graph keeps their addresses and can replay them at any time.
     """
-    key = (device, torch.cuda.current_stream(device).cuda_stream)
-    pair = _mx_workspace_by_stream.get(key)
-    if pair is None:
+    stream_id = torch.cuda.current_stream(device).cuda_stream
+    ws = _mx_partials_by_stream.get((device, stream_id))
+    if ws is None:
         with persistent_alloc(device):
             ws = torch.empty(_MX_WORKSPACE_BYTES, dtype=torch.uint8, device=device)
-            cnt = torch.zeros(_MX_COUNTERS, dtype=torch.int32, device=device)
-        pair = _mx_workspace_by_stream[key] = (ws, cnt)
-    return pair
+        _mx_partials_by_stream[(device, stream_id)] = ws
+    return ws, _mx_counters_keyed(device, stream_id)
 
 
 def gemm_a16w8_mxfp8_asm(

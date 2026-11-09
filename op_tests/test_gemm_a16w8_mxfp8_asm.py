@@ -37,14 +37,18 @@ import torch
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
+from aiter.jit.utils.hip_runtime import load_hip_runtime
 from aiter.ops.gemm_op_a16w8_mxfp8 import (
+    _MX_COUNTERS,
+    _mx_counters_keyed,
+    _mx_partials_by_stream,
     _mx_workspace,
-    _mx_workspace_by_stream,
     gemm_a16w8_mxfp8_asm,
     gemm_a16w8_mxfp8_prepare_weight,
     is_gemm_a16w8_mxfp8_tuned,
 )
 from aiter.test_common import benchmark, checkAllclose, run_perftest
+from aiter.utility.graph_alloc import persistent_alloc
 
 torch.set_default_device("cuda")
 
@@ -224,29 +228,35 @@ def _run_guard_checks():
     a0 = torch.empty(0, 5120, dtype=dtypes.bf16)
     assert gemm_a16w8_mxfp8_asm(a0, b, bs).shape == (0, 1792), "M 0 should be a no-op"
 
-    # Split-K kernels leave their arrival counters at zero, so a CUDA graph of
-    # several calls replays to the eager result.
+    # Split-K graphs. A stream's first split-K call inside a capture records the
+    # counter zero fill into that graph only, so each capture needs its own
+    # counters. Leave 7s where they will be allocated, capture two graphs on a
+    # fresh stream and replay the second one first: counters shared with the
+    # first graph would never reach splitK - 1, and its outputs would stay NaN.
     a, b_fn, s = make_inputs(12, 1152, 5120, "exact", seed=1)
     b, bs = gemm_a16w8_mxfp8_prepare_weight(b_fn, s)
     eager = gemm_a16w8_mxfp8_asm(a, b, bs).clone()
-    outs = [torch.empty(12, 1152, dtype=dtypes.bf16) for _ in range(3)]
-    side = torch.cuda.Stream()
-    side.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(side):
-        for o in outs:
-            gemm_a16w8_mxfp8_asm(a, b, bs, o)
-    torch.cuda.current_stream().wait_stream(side)
-    graph = torch.cuda.CUDAGraph()
     cap = torch.cuda.Stream()
-    with torch.cuda.graph(graph, stream=cap):
-        for o in outs:
-            gemm_a16w8_mxfp8_asm(a, b, bs, o)
+    assert (
+        _mx_counters_keyed.eager_cached(a.device, cap.cuda_stream) is None
+    ), "the capture stream already has eager counters"
+    with torch.cuda.stream(cap), persistent_alloc(a.device):
+        torch.full((_MX_COUNTERS,), 7, dtype=torch.int32)
+    torch.cuda.synchronize()
+    graphs, outs, captured = [], [], []
+    for _ in range(2):
+        graph = torch.cuda.CUDAGraph()
+        graph_outs = [torch.empty(12, 1152, dtype=dtypes.bf16) for _ in range(3)]
+        with torch.cuda.graph(graph, stream=cap):
+            for o in graph_outs:
+                gemm_a16w8_mxfp8_asm(a, b, bs, o)
+            captured += [weakref.ref(t) for t in _mx_workspace(a.device)]
+        graphs.append(graph)
+        outs += graph_outs
 
-    # The graph keeps the addresses of the capture stream's split-K workspace,
-    # so split-K calls on 64 other streams must not free it.
-    with torch.cuda.stream(cap):
-        captured = [weakref.ref(t) for t in _mx_workspace(a.device)]
-    hip = ctypes.CDLL("libamdhip64.so")
+    # The graphs keep the addresses of their split-K scratch, so split-K calls
+    # on 64 other streams must not free it.
+    hip = load_hip_runtime()
     handles = []
     for _ in range(64):
         h = ctypes.c_void_p()
@@ -256,16 +266,17 @@ def _run_guard_checks():
             gemm_a16w8_mxfp8_asm(a, b, bs)
     torch.cuda.synchronize()
     for h in handles:
-        _mx_workspace_by_stream.pop((a.device, h.value), None)
+        _mx_partials_by_stream.pop((a.device, h.value), None)
         hip.hipStreamDestroy(h)
     gc.collect()
     assert all(
         r() is not None for r in captured
-    ), "split-K workspace of a captured graph was freed"
+    ), "split-K scratch of a captured graph was freed"
     for _ in range(2):
         for o in outs:
             o.fill_(float("nan"))
-        graph.replay()
+        for graph in reversed(graphs):
+            graph.replay()
         torch.cuda.synchronize()
         assert all(
             torch.equal(o, eager) for o in outs
@@ -287,9 +298,10 @@ def _run_guard_checks():
     aiter.logger.info(
         "guard checks passed: M 65, N 1800, unprepared weights or scales, 3-D A, "
         "strided A, short B_scale, fp16 out, splitK 9, and exponent 254 or NaN "
-        "weights in prepare_weight raise; M 0 is a no-op; a captured graph keeps "
-        "its split-K workspace after calls on 64 other streams; graph replay and "
-        "torch.compile(fullgraph) equal eager"
+        "weights in prepare_weight raise; M 0 is a no-op; two graphs captured on a "
+        "stream with dirty counter memory replay to eager in either order and keep "
+        "their split-K scratch after calls on 64 other streams; "
+        "torch.compile(fullgraph) equals eager"
     )
 
 
