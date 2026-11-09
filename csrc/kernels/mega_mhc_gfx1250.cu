@@ -159,6 +159,19 @@ struct Variant<H, 18, true>
 {
     using type = Config<H, 2, 8, 32, 2, H / 2, DISTRIBUTED, true, split_cluster<2>>;
 };
+// Five splits: H / 5 columns per split, for widths divisible by 5 * 64. A
+// token count whose tiles leave too few workgroups at four splits and too
+// many at eight gets one workgroup per CU with even stages per wave.
+template <int H, bool SHUF>
+struct Variant<H, 20, SHUF>
+{
+    using type = std::conditional_t<
+        H % (5 * 64) != 0,
+        typename Variant<H, 17, SHUF>::type,
+        std::conditional_t<SHUF,
+                           Config<H, 5, 8, 32, 2, H / 5, DISTRIBUTED, true, split_cluster<5>>,
+                           Config<H, 5, 8, 64, 1, H / 5, DISTRIBUTED, false, split_cluster<5>>>>;
+};
 template <int H, bool SHUF>
 struct Variant<H, 19, SHUF>
 {
@@ -1933,6 +1946,7 @@ void mega_mhc_gfx1250(aiter_tensor_t& residual_out,
             case 16: run.template operator()<typename Variant<H, 16, SHUF>::type>(); return;
             case 17: run.template operator()<typename Variant<H, 17, SHUF>::type>(); return;
             case 18: run.template operator()<typename Variant<H, 18, SHUF>::type>(); return;
+            case 20: run.template operator()<typename Variant<H, 20, SHUF>::type>(); return;
             case LARGE_VARIANT: {
                 // A partial final round of token tiles runs as split tiles.
                 using L          = typename Variant<H, LARGE_VARIANT, SHUF>::type;

@@ -13,7 +13,7 @@ import triton.language as tl
 from torch import Tensor
 
 from ..jit.core import compile_ops
-from ..jit.utils.chip_info import get_gfx_runtime
+from ..jit.utils.chip_info import get_gfx_runtime, get_num_xcds
 
 __all__ = [
     "MEGA_MHC_RES_KS",
@@ -54,6 +54,7 @@ _STREAM_VARIANTS = (
     "gfx1250_split4",
     "gfx1250_split2",
     "gfx1250_large",
+    "gfx1250_split5",
 )
 
 _DISTRIBUTED_VARIANTS = frozenset(
@@ -74,6 +75,7 @@ _DISTRIBUTED_VARIANTS = frozenset(
         "gfx1250_split8",
         "gfx1250_split4",
         "gfx1250_split2",
+        "gfx1250_split5",
     )
 )
 
@@ -82,7 +84,7 @@ _DISTRIBUTED_VARIANTS = frozenset(
 _TAGGED_VARIANTS = _DISTRIBUTED_VARIANTS | {"gfx1250_large"}
 
 # Largest split first; each token tile and split gets its own CU.
-_GFX1250_SPLITS = (32, 16, 8, 4, 2)
+_GFX1250_SPLITS = (32, 16, 8, 5, 4, 2)
 
 
 def _select_stream_variant(tokens, hidden=5120):
@@ -110,11 +112,18 @@ def _select_stream_variant(tokens, hidden=5120):
     return "large", 1
 
 
-def _select_gfx1250_variant(tokens, cu):
+def _select_gfx1250_variant(tokens, cu, hidden=5120, xcds=1):
     if tokens == 0:
         return "generic", 1
     blocks = (tokens + 15) // 16
     for split in _GFX1250_SPLITS:
+        # Five splits run as 1x5 clusters, which do not straddle an XCD, so
+        # only (cu / xcds / 5) * xcds tiles are resident at once; beyond that
+        # a second round makes it slower than four splits.
+        if split == 5 and (
+            hidden % (5 * 64) or blocks > (cu // max(xcds, 1) // 5) * max(xcds, 1)
+        ):
+            continue
         if blocks * split <= cu:
             return f"gfx1250_split{split}", split
     return "gfx1250_large", 1
@@ -306,7 +315,9 @@ def _prepare_scratch(device, tokens, hidden, split_k=None, *, reuse_scratch=True
         if arch == "gfx950" and hidden in _STREAM_HIDDEN_SIZES:
             variant, selected_split = _select_stream_variant(tokens, hidden)
         elif arch == "gfx1250" and hidden in _STREAM_HIDDEN_SIZES:
-            variant, selected_split = _select_gfx1250_variant(tokens, cu)
+            variant, selected_split = _select_gfx1250_variant(
+                tokens, cu, hidden, get_num_xcds()
+            )
         else:
             variant = "generic"
             selected_split = max(
@@ -704,6 +715,7 @@ def _mega_mhc_post_shuffled_kernel(
 _POST_SHUFFLED_LAUNCH = (
     (256, (8, 128, 4)),
     (512, (8, 64, 4)),
+    (1024, (8, 64, 4)),
     (None, (32, 64, 2)),
 )
 
