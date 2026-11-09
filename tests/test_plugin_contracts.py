@@ -75,6 +75,22 @@ def _is_route(decorator: ast.expr, spellings: set[str]) -> bool:
 
 
 def _literal(node: ast.expr | None) -> str | None:
+    """A default rendered so a change to it moves the fingerprint.
+
+    A literal is rendered by value. Anything else -- a module constant, an
+    attribute, a call -- is rendered by the source that spells it, because this
+    gate reads the tree and never imports it, so it has no value to render.
+
+    That is a real gap, and it is stated rather than hidden: a routed op whose
+    default is a module constant keeps the same fingerprint when the constant's
+    *value* changes, which is the silent contract change this gate exists to
+    catch. Closing it means either importing the module here -- trading a gate
+    that runs in milliseconds without a build for one that needs the package to
+    load -- or forbidding non-literal defaults on routed ops outright. Neither
+    is obviously right while no routed op has such a default; what is wrong is
+    leaving a reader to assume the coverage is total.
+    """
+
     if node is None:
         return None
     try:

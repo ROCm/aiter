@@ -536,6 +536,49 @@ def test_config_source_names_the_layer_that_produced_the_route(monkeypatch):
     assert add(2, 3) == 5, "the kill switch outranks the framework default"
 
 
+def test_no_dataclass_field_has_a_default_python_3_11_would_reject():
+    """A plain default must be hashable, or `import aiter` fails on 3.11.
+
+    3.11's dataclasses reject any unhashable default; 3.10 rejects only list,
+    dict and set by type, and 3.12 accepts a mappingproxy because the type
+    gained __hash__. CI runs 3.10 and 3.12 -- precisely the two that accept what
+    3.11 refuses -- so no green gate can speak for the Python in between.
+
+    The test asks whether the default can actually be hashed, not whether its
+    type declares __hash__. 3.11 checks the declaration, but on 3.12 a
+    mappingproxy declares one and still raises when hashed, so checking the
+    declaration here would pass on exactly the version CI runs and catch
+    nothing. Hashability is the property that reads the same on every version.
+
+    `_RoutedOp.superseded` was exactly this: `MappingProxyType({})` as a plain
+    default made `import aiter` raise ValueError on every 3.11 install, with
+    setup.py declaring python_requires=">=3.10" and every gate green.
+    """
+
+    import dataclasses
+
+    from aiter import plugin as module
+
+    offenders = []
+    for name in dir(module):
+        candidate = getattr(module, name)
+        if not (isinstance(candidate, type) and dataclasses.is_dataclass(candidate)):
+            continue
+        for item in dataclasses.fields(candidate):
+            if item.default is dataclasses.MISSING:
+                continue
+            try:
+                hash(item.default)
+            except TypeError:
+                offenders.append(f"{candidate.__name__}.{item.name}")
+
+    assert not offenders, (
+        "these defaults are unhashable, so 3.11's dataclasses refuse the class "
+        f"and `import aiter` fails there: {', '.join(offenders)} -- use "
+        "field(default_factory=...)"
+    )
+
+
 def test_routing_one_op_name_twice_is_an_error():
     _route_add([])
     with pytest.raises(ValueError, match="already routed"):

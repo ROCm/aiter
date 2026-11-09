@@ -192,8 +192,15 @@ class _RoutedOp:
     op: Op
     contract: Signature
     canonicalize: _Canonicalizer
-    # older op_version -> the release that stops accepting it
-    superseded: Mapping[int, str] = MappingProxyType({})
+    # older op_version -> the release that stops accepting it.
+    #
+    # default_factory, not a plain default: a mappingproxy is unhashable before
+    # 3.12, and 3.11's dataclasses reject any unhashable default outright, so
+    # the plain spelling makes `import aiter` raise ValueError on 3.11 -- which
+    # setup.py supports and no CI leg runs. 3.10 accepts it (it only rejects
+    # list/dict/set by type) and 3.12 accepts it (mappingproxy gained __hash__),
+    # so the two Pythons CI does run are exactly the two that hide it.
+    superseded: Mapping[int, str] = field(default_factory=lambda: MappingProxyType({}))
 
 
 @dataclass(frozen=True, slots=True)
