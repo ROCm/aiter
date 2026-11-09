@@ -11,7 +11,8 @@ There are several ways you can contribute to AITER:
 * **Optimize Kernels**: Improve existing HIP/CK/Triton kernel performance
 * **Hardware Support**: Extend support for new AMD GPU architectures (MI200, MI300, etc.)
 * **Documentation**: Improve docs, add tutorials, or write performance guides
-* **Code Review**: Review pull requests and provide constructive feedback
+* **Code Review**: Review pull requests and provide constructive feedback (see [REVIEWERS.md](REVIEWERS.md)
+  for how to become a reviewer)
 * **Community Support**: Answer questions and help other users
 
 We also encourage you to share your experiences with AITER in blog posts, social media, or conference talks. If AITER helps your project, please consider starring our repository!
@@ -487,7 +488,40 @@ reviewed revision and answers for the new head.
 4. **Approval**: Obtain the required approval for the latest revision
 5. **Merge**: Once all required checks pass, a maintainer will merge
 
-If your PR is urgent or hasn't been reviewed, ping maintainers on the issue or PR.
+#### Merge requirements
+
+`main` only accepts squash merges. Before a pull request can merge:
+
+* It has at least one approving review, including one from the AITER team.
+* The latest push is approved. A new push dismisses earlier approvals, and the last push must be approved
+  by someone other than its author, so batch your fixes instead of pushing one at a time.
+* Every review conversation is resolved.
+* Black, Ruff, repository dependency and Aiter Test Gate checks pass.
+
+The pull request title becomes the commit message, so keep it accurate when the scope changes.
+
+#### Review timeline
+
+A reviewer is usually assigned within one working day after the pull request is ready for human review.
+Most pull requests get a first review within a few working days. The exact time depends on the size and
+risk of the change and on current project priorities; fixes for regressions and release blockers come first.
+
+If nobody has responded for about a week, mention the contact for the area listed in
+[CONTACTS.md](CONTACTS.md), then the backup contact.
+
+On your side, keep CI green and reply to review comments. Pull requests with no activity for an extended
+period (around six weeks) may be closed; you are welcome to reopen them.
+
+#### Pull requests from forks
+
+GitHub requires a maintainer to approve workflow runs for first-time contributors, and some GPU jobs need
+repository resources that forks do not have. If your CI has not started, or a GPU job needs to be run,
+mention the area contact and a maintainer can help run it.
+
+#### Large changes
+
+For a new feature, a new public API or a change that spans several backends, open an issue first to agree on
+the approach before writing the code.
 
 ---
 
