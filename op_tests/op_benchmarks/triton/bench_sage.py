@@ -239,9 +239,10 @@ KERNEL_SPECS = {
 }
 
 # The four deployed Sol-Attn (mode 2) rows, each mapped to the kernel whose
-# quantization it reuses, plus what its pooled operands need: whether K carries a
-# pooled scale of its own, and the packed formats K and V are stored in when their
-# codes cannot be pooled directly.
+# quantization it reuses, plus what its pooled operands need: whether Q and K carry
+# E8M0 1x32 scales, which routing has to apply to Q and pooling has to give K a pooled
+# copy of, and the packed formats K and V are stored in when their codes cannot be
+# pooled directly.
 #
 # The all-MXFP4 mode-2 row consumes the FP6-P V order, so its pooled V has to be
 # packed in that order too.
@@ -1269,8 +1270,8 @@ def _sol_packed_kwargs(
     operands -- needed for the packed recipes, whose stored codes are neither element addressable
     nor pooled from what the kernel reads.
     """
-    quant_q, quant_k, quant_v, _, k_descale, _ = tensors[:6]
-    _, k_needs_pooled_scale, packed_format, v_packed_format = SOL_KERNELS[kernel]
+    quant_q, quant_k, quant_v, q_descale, k_descale, _ = tensors[:6]
+    _, qk_block_scaled, packed_format, v_packed_format = SOL_KERNELS[kernel]
     q_source, k_source, v_source = sources
 
     plan = sol_prepare(
@@ -1279,7 +1280,8 @@ def _sol_packed_kwargs(
         quant_v,
         beta=beta if block_mask is None else None,
         num_heads=quant_q.shape[2],
-        k_scale=k_descale if k_needs_pooled_scale and packed_format is None else None,
+        k_scale=k_descale if qk_block_scaled and packed_format is None else None,
+        q_scale=q_descale if qk_block_scaled and packed_format is None else None,
         k_source=k_source if packed_format is not None else None,
         v_source=v_source if packed_format is not None else None,
         k_packed_format=packed_format,
