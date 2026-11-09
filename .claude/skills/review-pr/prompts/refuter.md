@@ -29,6 +29,13 @@ SURVIVED -- <what you opened>
 KILLED -- <what you opened>
 ```
 
+**A finding is a line starting with 🔴, ⚠️ or 📝 — nothing else is one.** The card's header
+block also carries status lines (`Review:`, `Validation:`, `Perf:`, `Size:`, `Design
+(advisory):`, `Human:`); they are not findings, take no verdict line, and are not yours to
+attack. The `Design (advisory)` and `Human:` lines report a routing decision that Step 8's
+`design` gate checks mechanically — whether the routed judgment is *right* is the routed
+human's, not yours.
+
 **Only these two verdicts** (from the text: `SURVIVED|KILLED`). `KILLED` means the finding comes off the card;
 use it only when you actually refute it. If you cannot refute it, it is `SURVIVED` — **even if you think it is overstated** —
 because severity is not yours to change; the card author sets it per SKILL.md.
