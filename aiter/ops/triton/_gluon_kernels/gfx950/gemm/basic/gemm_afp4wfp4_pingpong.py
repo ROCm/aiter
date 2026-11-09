@@ -1,20 +1,14 @@
-"""gfx950 Gluon MXFP4 GEMM with an 8-wave ping-pong schedule ("compute_bound" kernel_type).
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-Eight waves compute the four 128x128 quadrants of a 256x256 output tile. Each quadrant region
-has an MFMA stage and a memory stage, and the two wave groups run one stage apart, so the MFMAs
-of one group overlap the LDS reads and the direct-to-LDS copies of the other group.
-"""
+"""Gluon MXFP4 GEMM kernel for gfx950 with an 8-wave ping-pong schedule."""
 
 import math
 
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
-from triton.experimental.gluon.language.amd import (
-    AMDMFMALayout,
-    cdna4,
-    warp_pipeline_stage,
-)
-from triton.experimental.gluon.language.amd.cdna4 import async_copy as acp
+from triton.experimental.gluon.language.amd import warp_pipeline_stage
+from triton.experimental.gluon.language.amd.cdna4 import async_copy
 
 from aiter.ops.triton._triton_kernels.common.pid_preprocessing import (
     pid_grid,
@@ -24,293 +18,67 @@ from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 _gemm_afp4wfp4_pingpong_repr = make_kernel_repr(
     "_gemm_afp4wfp4_pingpong_kernel",
-    [
-        "BLOCK_SIZE_M",
-        "BLOCK_SIZE_N",
-        "BLOCK_SIZE_K",
-        "GROUP_SIZE_M",
-        "EVEN_K",
-        "NUM_WARPS",
-    ],
+    ["BLOCK_SIZE_M", "BLOCK_SIZE_N", "BLOCK_SIZE_K", "GROUP_SIZE_M", "NUM_WARPS"],
 )
 
 
 @gluon.constexpr_function
-def _d2l_layout(padded, num_warps, vec_bytes, warp_size=64):
-    """Direct-to-LDS copy layout for a padded LDS destination, as in Triton's
-    CoalesceAsyncCopy: one 16-B run per lane, one contiguous LDS run per wave."""
-    bases = [list(b) for b in padded.offset_bases]
-    rank = len(padded.shape)
-    nv = int(math.log2(vec_bytes))
-    nl = int(math.log2(warp_size))
-    nw = int(math.log2(num_warps))
-    reg = bases[:nv]
-    lane = bases[nv : nv + nl]
-    warp = bases[nv + nl : nv + nl + nw]
-    warp = warp + [[0] * rank for _ in range(nw - len(warp))]
-    reg = reg + bases[nv + nl + nw :]
+def _copy_layout(shared_layout, num_warps):
+    """Direct-to-LDS copy layout of a padded LDS tile, as Triton's
+    CoalesceAsyncCopy makes it: 16 B for each lane, one LDS run for each wave."""
+    bases = [list(b) for b in shared_layout.offset_bases]
+    n_reg = 4  # log2(16 B)
+    n_lane = 6  # log2(64 lanes)
+    n_warp = int(math.log2(num_warps))
+    warp = bases[n_reg + n_lane : n_reg + n_lane + n_warp]
+    warp += [[0] * len(shared_layout.shape) for _ in range(n_warp - len(warp))]
     return gl.DistributedLinearLayout(
-        reg_bases=reg,
-        lane_bases=lane,
+        reg_bases=bases[:n_reg] + bases[n_reg + n_lane + n_warp :],
+        lane_bases=bases[n_reg : n_reg + n_lane],
         warp_bases=warp,
         block_bases=[],
-        shape=list(padded.shape),
-    )
-
-
-@gluon.constexpr_function
-def _mma_layout(num_warps):
-    return AMDMFMALayout(
-        version=4,
-        instr_shape=[32, 32, 64],
-        transposed=True,
-        warps_per_cta=[2, num_warps // 2],
-    )
-
-
-@gluon.constexpr_function
-def _dot_layout(operand_index, num_warps):
-    return gl.DotOperandLayout(
-        operand_index=operand_index, parent=_mma_layout(num_warps), k_width=16
-    )
-
-
-@gluon.constexpr_function
-def _half_smem_layout(operand_index, num_warps):
-    """Padded LDS layout of one A half [128, 128 B] or one B half [128 B, 128]."""
-    shape = [128, 128]
-    return cdna4.compute_efficient_padded_shared_layout(
-        _dot_layout(operand_index, num_warps), shape, gl.uint8, is_k_contig=True
-    )
-
-
-@gluon.constexpr_function
-def _half_dma_layout(operand_index, num_warps):
-    return _d2l_layout(
-        _half_smem_layout(operand_index, num_warps), num_warps, vec_bytes=16
-    )
-
-
-@gluon.constexpr_function
-def _scale_layout(operand_index, num_warps, rows):
-    return cdna4.get_mfma_scale_layout(
-        _dot_layout(operand_index, num_warps), [rows, 8]  # 8 scales per 256-K step
+        shape=list(shared_layout.shape),
     )
 
 
 @gluon.jit
-def _split_halves(s, NUM_WARPS: gl.constexpr, OPERAND: gl.constexpr):
-    """[256, 8] scales -> rows 0..127 and 128..255. In the [256, 8] scale layout
-    the top/bottom half is one register bit, so this is a register selection."""
-    HALF_LAYOUT: gl.constexpr = _scale_layout(OPERAND, NUM_WARPS, 128)
-    top, bot = gl.split(gl.permute(s.reshape([2, 128, 8]), [1, 2, 0]))
-    return gl.convert_layout(top, HALF_LAYOUT), gl.convert_layout(bot, HALF_LAYOUT)
+def _copy(smem, stage, ptr, offsets):
+    async_copy.buffer_load_to_shared(smem.index(stage), ptr, offsets)
 
 
 @gluon.jit
-def _copy(smem, src, off, mask, MASK_K: gl.constexpr):
-    if MASK_K:
-        acp.buffer_load_to_shared(smem, src, off, mask=mask)
-    else:
-        acp.buffer_load_to_shared(smem, src, off)
-    acp.commit_group()
+def _split_scales(scales, layout: gl.constexpr):
+    """Split the scales of a tile into the top and bottom halves of the rows. In
+    the MFMA scale layout, the half is one register bit, so this only selects
+    registers."""
+    rows: gl.constexpr = scales.shape[0] // 2
+    halves = scales.reshape([2, rows, scales.shape[1]])
+    top, bot = gl.split(gl.permute(halves, [1, 2, 0]))
+    return gl.convert_layout(top, layout), gl.convert_layout(bot, layout)
 
 
 @gluon.jit
-def _issue_tile(
-    smem_a_top,
-    smem_a_bot,
-    smem_b_left,
-    smem_b_right,
-    smem_as,
-    smem_bs,
-    stage,
-    a_ptr,
-    b_ptr,
-    a_scales_ptr,
-    b_scales_ptr,
-    off_a_top,
-    off_a_bot,
-    off_b_left,
-    off_b_right,
-    off_as,
-    off_bs,
-    k_a,
-    k_b,
-    g_s,
-    kt,
-    K,
-    stride_ask,
-    stride_bsk,
-    MASK_K: gl.constexpr,
-):
-    """Copy K tile kt (six tensors) into LDS stage `stage`, one commit group
-    each. Offsets are loop invariant; the K advance is a scalar base add."""
-    BKB: gl.constexpr = 128
-    NG: gl.constexpr = 8
-    k_left = K - kt * BKB
-    g_left = (2 * K) // 32 - kt * NG
-    m_a = k_a[None, :] < k_left
-    m_b = k_b[:, None] < k_left
-    m_s = g_s[None, :] < g_left
-    _copy(
-        smem_as.index(stage), a_scales_ptr + kt * (NG * stride_ask), off_as, m_s, MASK_K
+def _mfma(a, a_scale, b, b_scale, acc):
+    return gl.amd.cdna4.mfma_scaled(
+        a=a,
+        a_scale=a_scale,
+        a_format="e2m1",
+        b=b,
+        b_scale=b_scale,
+        b_format="e2m1",
+        acc=acc,
     )
-    _copy(
-        smem_bs.index(stage), b_scales_ptr + kt * (NG * stride_bsk), off_bs, m_s, MASK_K
-    )
-    _copy(smem_a_top.index(stage), a_ptr + kt * BKB, off_a_top, m_a, MASK_K)
-    _copy(smem_a_bot.index(stage), a_ptr + kt * BKB, off_a_bot, m_a, MASK_K)
-    _copy(smem_b_left.index(stage), b_ptr + kt * BKB, off_b_left, m_b, MASK_K)
-    _copy(smem_b_right.index(stage), b_ptr + kt * BKB, off_b_right, m_b, MASK_K)
 
 
 @gluon.jit
-def _ld_a(smem, stage, NUM_WARPS: gl.constexpr):
-    return smem.index(stage).load(_dot_layout(0, NUM_WARPS))
-
-
-@gluon.jit
-def _ld_b(smem, stage, NUM_WARPS: gl.constexpr):
-    return smem.index(stage).load(_dot_layout(1, NUM_WARPS))
-
-
-@gluon.jit
-def _ld_scales(smem, stage, OPERAND: gl.constexpr, NUM_WARPS: gl.constexpr):
-    s = smem.index(stage).load(_scale_layout(OPERAND, NUM_WARPS, 256))
-    return _split_halves(s, NUM_WARPS, OPERAND)
-
-
-@gluon.jit
-def _refill(smem, stage, src, off, mask, MASK_K: gl.constexpr):
-    if MASK_K:
-        acp.buffer_load_to_shared(smem.index(stage), src, off, mask=mask)
-    else:
-        acp.buffer_load_to_shared(smem.index(stage), src, off)
-
-
-@gluon.jit
-def _issue_stage(
-    smem_a_top,
-    smem_a_bot,
-    smem_b_left,
-    smem_b_right,
-    smem_as,
-    smem_bs,
-    stage,
-    a_ptr,
-    b_ptr,
-    a_scales_ptr,
-    b_scales_ptr,
-    off_a_top,
-    off_a_bot,
-    off_b_left,
-    off_b_right,
-    off_as,
-    off_bs,
-    k_a,
-    k_b,
-    g_s,
-    kt,
-    K,
-    stride_ask,
-    stride_bsk,
-    MASK_K: gl.constexpr,
-):
-    """Copy K step kt into stage `stage` as the loop's four commit groups,
-    in consumption order: {B_left + B scales}, {A_top + A scales}, {A_bot},
-    {B_right}."""
-    BKB: gl.constexpr = 128
-    NG: gl.constexpr = 8
-    k_left = K - kt * BKB
-    g_left = (2 * K) // 32 - kt * NG
-    m_a = k_a[None, :] < k_left
-    m_b = k_b[:, None] < k_left
-    m_s = g_s[None, :] < g_left
-    _refill(smem_b_left, stage, b_ptr + kt * BKB, off_b_left, m_b, MASK_K)
-    _refill(smem_bs, stage, b_scales_ptr + kt * (NG * stride_bsk), off_bs, m_s, MASK_K)
-    acp.commit_group()
-    _refill(smem_a_top, stage, a_ptr + kt * BKB, off_a_top, m_a, MASK_K)
-    _refill(smem_as, stage, a_scales_ptr + kt * (NG * stride_ask), off_as, m_s, MASK_K)
-    acp.commit_group()
-    _refill(smem_a_bot, stage, a_ptr + kt * BKB, off_a_bot, m_a, MASK_K)
-    acp.commit_group()
-    _refill(smem_b_right, stage, b_ptr + kt * BKB, off_b_right, m_b, MASK_K)
-    acp.commit_group()
-
-
-@gluon.jit
-def _read_tile_plain(
-    smem_a_top,
-    smem_a_bot,
-    smem_b_left,
-    smem_b_right,
-    smem_as,
-    smem_bs,
-    stage,
-    NUM_WARPS: gl.constexpr,
-):
-    a_s = smem_as.index(stage).load(_scale_layout(0, NUM_WARPS, 256))
-    b_s = smem_bs.index(stage).load(_scale_layout(1, NUM_WARPS, 256))
-    a_top = _ld_a(smem_a_top, stage, NUM_WARPS)
-    a_bot = _ld_a(smem_a_bot, stage, NUM_WARPS)
-    b_left = _ld_b(smem_b_left, stage, NUM_WARPS)
-    b_right = _ld_b(smem_b_right, stage, NUM_WARPS)
-    return a_top, a_bot, b_left, b_right, a_s, b_s
-
-
-@gluon.jit
-def _fix_k_tail(a_top, a_bot, a_s, b_s, kt, K, NUM_WARPS: gl.constexpr):
-    """Last K tile when K % 256 != 0: zero A beyond K and give both scales the
-    finite value 2^0 there, so the invalid K range adds exactly 0 (masked
-    copies already zero-fill; this does not rely on it)."""
-    BKB: gl.constexpr = 128
-    NG: gl.constexpr = 8
-    k_left = K - kt * BKB
-    g_left = (2 * K) // 32 - kt * NG
-    k_a = gl.arange(0, BKB, layout=gl.SliceLayout(0, _dot_layout(0, NUM_WARPS)))
-    a_top = gl.where(k_a[None, :] < k_left, a_top, 0)
-    a_bot = gl.where(k_a[None, :] < k_left, a_bot, 0)
-    g_a = gl.arange(0, NG, layout=gl.SliceLayout(0, _scale_layout(0, NUM_WARPS, 256)))
-    a_s = gl.where(g_a[None, :] < g_left, a_s, 127)
-    g_b = gl.arange(0, NG, layout=gl.SliceLayout(0, _scale_layout(1, NUM_WARPS, 256)))
-    b_s = gl.where(g_b[None, :] < g_left, b_s, 127)
-    return a_top, a_bot, a_s, b_s
-
-
-@gluon.jit
-def _mma_quadrants(
-    a_top,
-    a_bot,
-    b_left,
-    b_right,
-    a_s,
-    b_s,
-    acc_tl,
-    acc_bl,
-    acc_tr,
-    acc_br,
-    NUM_WARPS: gl.constexpr,
-):
-    as_top, as_bot = _split_halves(a_s, NUM_WARPS, 0)
-    bs_left, bs_right = _split_halves(b_s, NUM_WARPS, 1)
-    acc_tl = cdna4.mfma_scaled(a_top, as_top, "e2m1", b_left, bs_left, "e2m1", acc_tl)
-    acc_bl = cdna4.mfma_scaled(a_bot, as_bot, "e2m1", b_left, bs_left, "e2m1", acc_bl)
-    acc_tr = cdna4.mfma_scaled(a_top, as_top, "e2m1", b_right, bs_right, "e2m1", acc_tr)
-    acc_br = cdna4.mfma_scaled(a_bot, as_bot, "e2m1", b_right, bs_right, "e2m1", acc_br)
-    return acc_tl, acc_bl, acc_tr, acc_br
-
-
-@gluon.jit
-def _store_quadrant(
-    acc, c_ptr, row0, col0, M, N, stride_cm, stride_cn, MMA: gl.constexpr
-):
+def _store_quadrant(acc, c_ptr, row0, col0, M, N, stride_cm, stride_cn):
     c = acc.to(c_ptr.type.element_ty)
-    offs_cm = row0 + gl.arange(0, 128, layout=gl.SliceLayout(1, MMA))
-    offs_cn = col0 + gl.arange(0, 128, layout=gl.SliceLayout(0, MMA))
-    c_offs = offs_cm[:, None] * stride_cm + offs_cn[None, :] * stride_cn
+    layout: gl.constexpr = acc.type.layout
+    offs_cm = row0 + gl.arange(0, acc.shape[0], layout=gl.SliceLayout(1, layout))
+    offs_cn = col0 + gl.arange(0, acc.shape[1], layout=gl.SliceLayout(0, layout))
+    offs_c = offs_cm[:, None] * stride_cm + offs_cn[None, :] * stride_cn
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-    cdna4.buffer_store(c, c_ptr, c_offs, mask=c_mask)
+    gl.amd.cdna4.buffer_store(c, c_ptr, offs_c, mask=c_mask)
 
 
 @gluon.jit(repr=_gemm_afp4wfp4_pingpong_repr)
@@ -333,17 +101,22 @@ def _gemm_afp4wfp4_pingpong_kernel(
     stride_ask,
     stride_bsn,
     stride_bsk,
+    # Meta-parameters
     BLOCK_SIZE_M: gl.constexpr,
     BLOCK_SIZE_N: gl.constexpr,
     BLOCK_SIZE_K: gl.constexpr,
     GROUP_SIZE_M: gl.constexpr,
-    EVEN_K: gl.constexpr,
-    NUM_WARPS: gl.constexpr,
     NUM_XCDS: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
 ):
-    """C = A x B for MXFP4 A (M, K) and B (K, N) with E8M0 scales.
+    """
+    Kernel for computing the matmul C = A x B.
+    A and B inputs are in the microscale fp4 (mxfp4) format.
+    A_scales and B_scales are in e8m0 format.
+    A has shape (M, K), B has shape (K, N) and C has shape (M, N)
 
-    K is the packed size in bytes (x.shape[1]). B is the (K, N) view of w.
+    K is the packed size in bytes. The wrapper checks the limits: a 256x256x256
+    tile with 8 warps, no split-K and no K tail.
     """
     gl.static_assert(BLOCK_SIZE_M == 256)
     gl.static_assert(BLOCK_SIZE_N == 256)
@@ -359,398 +132,270 @@ def _gemm_afp4wfp4_pingpong_kernel(
     gl.assume(stride_ask > 0)
     gl.assume(stride_bsk > 0)
 
-    BM: gl.constexpr = BLOCK_SIZE_M
-    BN: gl.constexpr = BLOCK_SIZE_N
-    HM: gl.constexpr = BLOCK_SIZE_M // 2
-    HN: gl.constexpr = BLOCK_SIZE_N // 2
-    BKB: gl.constexpr = BLOCK_SIZE_K // 2
-    NG: gl.constexpr = BLOCK_SIZE_K // 32
-    MMA: gl.constexpr = _mma_layout(NUM_WARPS)
-    SM_A: gl.constexpr = _half_smem_layout(0, NUM_WARPS)
-    SM_B: gl.constexpr = _half_smem_layout(1, NUM_WARPS)
-    LD_A: gl.constexpr = _half_dma_layout(0, NUM_WARPS)
-    LD_B: gl.constexpr = _half_dma_layout(1, NUM_WARPS)
-    LD_S: gl.constexpr = gl.BlockedLayout([4, 1], [64, 1], [1, NUM_WARPS], [0, 1])
-    SM_S: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, order=[0, 1])
-
-    num_pid_m = gl.cdiv(M, BM)
-    num_pid_n = gl.cdiv(N, BN)
-    pid = remap_xcd(gl.program_id(axis=0), num_pid_m * num_pid_n, NUM_XCDS=NUM_XCDS)
+    # -----------------------------------------------------------
+    # Map program ids `pid` to the block of C it should compute.
+    # This is done in a grouped ordering to promote L2 data reuse.
+    num_pid_m = gl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = gl.cdiv(N, BLOCK_SIZE_N)
+    pid = gl.program_id(axis=0)
+    # Remap so that each XCD gets a contiguous chunk of pids.
+    pid = remap_xcd(pid, num_pid_m * num_pid_n, NUM_XCDS=NUM_XCDS)
     pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
 
-    # Loop-invariant DMA offsets; rows past M (columns past N) wrap to valid
-    # rows and their results are masked at the store.
-    r_a = gl.arange(0, HM, layout=gl.SliceLayout(1, LD_A))
-    k_a = gl.arange(0, BKB, layout=gl.SliceLayout(0, LD_A))
-    off_a_top = ((pid_m * BM + r_a) % M)[:, None] * stride_am + k_a[None, :]
-    off_a_bot = ((pid_m * BM + HM + r_a) % M)[:, None] * stride_am + k_a[None, :]
-    k_b = gl.arange(0, BKB, layout=gl.SliceLayout(1, LD_B))
-    c_b = gl.arange(0, HN, layout=gl.SliceLayout(0, LD_B))
-    off_b_left = k_b[:, None] + ((pid_n * BN + c_b) % N)[None, :] * stride_bn
-    off_b_right = k_b[:, None] + ((pid_n * BN + HN + c_b) % N)[None, :] * stride_bn
-    rows_as = (pid_m * BM + gl.arange(0, BM, layout=gl.SliceLayout(1, LD_S))) % M
-    rows_bs = (pid_n * BN + gl.arange(0, BN, layout=gl.SliceLayout(1, LD_S))) % N
-    g_s = gl.arange(0, NG, layout=gl.SliceLayout(0, LD_S))
-    off_as = rows_as[:, None] + g_s[None, :] * stride_ask
-    off_bs = rows_bs[:, None] + g_s[None, :] * stride_bsk
+    # We assume 32 elements along K share the same scale.
+    SCALE_GROUP_SIZE: gl.constexpr = 32
+    HALF_M: gl.constexpr = BLOCK_SIZE_M // 2
+    HALF_N: gl.constexpr = BLOCK_SIZE_N // 2
+    # Packed bytes and scales of one K step.
+    BLOCK_K_BYTES: gl.constexpr = BLOCK_SIZE_K // 2
+    BLOCK_K_SCALES: gl.constexpr = BLOCK_SIZE_K // SCALE_GROUP_SIZE
 
-    smem_a_top = gl.allocate_shared_memory(gl.uint8, [2, HM, BKB], SM_A)
-    smem_a_bot = gl.allocate_shared_memory(gl.uint8, [2, HM, BKB], SM_A)
-    smem_b_left = gl.allocate_shared_memory(gl.uint8, [2, BKB, HN], SM_B)
-    smem_b_right = gl.allocate_shared_memory(gl.uint8, [2, BKB, HN], SM_B)
-    smem_as = gl.allocate_shared_memory(gl.uint8, [2, BM, NG], SM_S)
-    smem_bs = gl.allocate_shared_memory(gl.uint8, [2, BN, NG], SM_S)
+    mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
+        version=4,
+        instr_shape=[32, 32, 64],
+        transposed=True,
+        warps_per_cta=[2, NUM_WARPS // 2],
+    )
+    dot_a_layout: gl.constexpr = gl.DotOperandLayout(
+        operand_index=0, parent=mfma_layout, k_width=16
+    )
+    dot_b_layout: gl.constexpr = gl.DotOperandLayout(
+        operand_index=1, parent=mfma_layout, k_width=16
+    )
+    # LDS holds A as top and bottom halves, B as left and right halves.
+    shared_a: gl.constexpr = gl.amd.cdna4.compute_efficient_padded_shared_layout(
+        dot_a_layout, [HALF_M, BLOCK_K_BYTES], gl.uint8
+    )
+    shared_b: gl.constexpr = gl.amd.cdna4.compute_efficient_padded_shared_layout(
+        dot_b_layout, [BLOCK_K_BYTES, HALF_N], gl.uint8
+    )
+    shared_scales: gl.constexpr = gl.SwizzledSharedLayout(
+        vec=1, per_phase=1, max_phase=1, order=[0, 1]
+    )
+    copy_a: gl.constexpr = _copy_layout(shared_a, NUM_WARPS)
+    copy_b: gl.constexpr = _copy_layout(shared_b, NUM_WARPS)
+    blocked_scales: gl.constexpr = gl.BlockedLayout(
+        size_per_thread=[4, 1],
+        threads_per_warp=[64, 1],
+        warps_per_cta=[1, NUM_WARPS],
+        order=[0, 1],
+    )
+    # Scales of one K step, and of one half of the tile.
+    linear_as: gl.constexpr = gl.amd.cdna4.get_mfma_scale_layout(
+        dot_a_layout, [BLOCK_SIZE_M, BLOCK_K_SCALES]
+    )
+    linear_bs: gl.constexpr = gl.amd.cdna4.get_mfma_scale_layout(
+        dot_b_layout, [BLOCK_SIZE_N, BLOCK_K_SCALES]
+    )
+    linear_as_half: gl.constexpr = gl.amd.cdna4.get_mfma_scale_layout(
+        dot_a_layout, [HALF_M, BLOCK_K_SCALES]
+    )
+    linear_bs_half: gl.constexpr = gl.amd.cdna4.get_mfma_scale_layout(
+        dot_b_layout, [HALF_N, BLOCK_K_SCALES]
+    )
 
-    num_full = (
-        K // BKB
-    )  # full K steps; a partial last step is handled after the pipeline
-    k0 = num_full % 2  # peel one full K step when their number is odd
-    acc_tl = gl.zeros([HM, HN], gl.float32, MMA)
-    acc_bl = gl.zeros([HM, HN], gl.float32, MMA)
-    acc_tr = gl.zeros([HM, HN], gl.float32, MMA)
-    acc_br = gl.zeros([HM, HN], gl.float32, MMA)
+    # Loop-invariant copy offsets. Rows past M and columns past N wrap to valid
+    # rows and columns, and the store masks their results.
+    rows_a = gl.arange(0, HALF_M, layout=gl.SliceLayout(1, copy_a))
+    offs_ak = gl.arange(0, BLOCK_K_BYTES, layout=gl.SliceLayout(0, copy_a))
+    offs_am_top = (pid_m * BLOCK_SIZE_M + rows_a) % M
+    offs_a_top = offs_am_top[:, None] * stride_am + offs_ak[None, :]
+    offs_am_bot = (pid_m * BLOCK_SIZE_M + HALF_M + rows_a) % M
+    offs_a_bot = offs_am_bot[:, None] * stride_am + offs_ak[None, :]
+    offs_bk = gl.arange(0, BLOCK_K_BYTES, layout=gl.SliceLayout(1, copy_b))
+    cols_b = gl.arange(0, HALF_N, layout=gl.SliceLayout(0, copy_b))
+    offs_bn_left = (pid_n * BLOCK_SIZE_N + cols_b) % N
+    offs_b_left = offs_bk[:, None] + offs_bn_left[None, :] * stride_bn
+    offs_bn_right = (pid_n * BLOCK_SIZE_N + HALF_N + cols_b) % N
+    offs_b_right = offs_bk[:, None] + offs_bn_right[None, :] * stride_bn
+    offs_asm = (
+        pid_m * BLOCK_SIZE_M
+        + gl.arange(0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, blocked_scales))
+    ) % M
+    offs_bsn = (
+        pid_n * BLOCK_SIZE_N
+        + gl.arange(0, BLOCK_SIZE_N, layout=gl.SliceLayout(1, blocked_scales))
+    ) % N
+    offs_ks = gl.arange(0, BLOCK_K_SCALES, layout=gl.SliceLayout(0, blocked_scales))
+    offs_as = offs_asm[:, None] + offs_ks[None, :] * stride_ask
+    # B scales are N x K even though B operand is K x N.
+    offs_bs = offs_bsn[:, None] + offs_ks[None, :] * stride_bsk
+
+    # Create shared memories: two LDS stages of each half and of the scales.
+    smem_a_top = gl.allocate_shared_memory(
+        a_ptr.type.element_ty, [2, HALF_M, BLOCK_K_BYTES], layout=shared_a
+    )
+    smem_a_bot = gl.allocate_shared_memory(
+        a_ptr.type.element_ty, [2, HALF_M, BLOCK_K_BYTES], layout=shared_a
+    )
+    smem_b_left = gl.allocate_shared_memory(
+        b_ptr.type.element_ty, [2, BLOCK_K_BYTES, HALF_N], layout=shared_b
+    )
+    smem_b_right = gl.allocate_shared_memory(
+        b_ptr.type.element_ty, [2, BLOCK_K_BYTES, HALF_N], layout=shared_b
+    )
+    smem_as = gl.allocate_shared_memory(
+        a_scales_ptr.type.element_ty,
+        [2, BLOCK_SIZE_M, BLOCK_K_SCALES],
+        layout=shared_scales,
+    )
+    smem_bs = gl.allocate_shared_memory(
+        b_scales_ptr.type.element_ty,
+        [2, BLOCK_SIZE_N, BLOCK_K_SCALES],
+        layout=shared_scales,
+    )
+
+    num_k_iter = K // BLOCK_K_BYTES
+    k0 = num_k_iter % 2  # peel K step 0 when the number of K steps is odd
+    acc_tl = gl.zeros((HALF_M, HALF_N), dtype=gl.float32, layout=mfma_layout)
+    acc_bl = gl.zeros((HALF_M, HALF_N), dtype=gl.float32, layout=mfma_layout)
+    acc_tr = gl.zeros((HALF_M, HALF_N), dtype=gl.float32, layout=mfma_layout)
+    acc_br = gl.zeros((HALF_M, HALF_N), dtype=gl.float32, layout=mfma_layout)
 
     if k0 == 1:
-        # Peeled K step 0, lockstep.
-        _issue_tile(
-            smem_a_top,
-            smem_a_bot,
-            smem_b_left,
-            smem_b_right,
-            smem_as,
-            smem_bs,
-            0,
-            a_ptr,
-            b_ptr,
-            a_scales_ptr,
-            b_scales_ptr,
-            off_a_top,
-            off_a_bot,
-            off_b_left,
-            off_b_right,
-            off_as,
-            off_bs,
-            k_a,
-            k_b,
-            g_s,
-            0,
-            K,
-            stride_ask,
-            stride_bsk,
-            False,
-        )
-        acp.wait_group(0)
+        # Peeled K step 0 in stage 0, lockstep.
+        _copy(smem_as, 0, a_scales_ptr, offs_as)
+        _copy(smem_bs, 0, b_scales_ptr, offs_bs)
+        _copy(smem_a_top, 0, a_ptr, offs_a_top)
+        _copy(smem_a_bot, 0, a_ptr, offs_a_bot)
+        _copy(smem_b_left, 0, b_ptr, offs_b_left)
+        _copy(smem_b_right, 0, b_ptr, offs_b_right)
+        async_copy.commit_group()
+        async_copy.wait_group(0)
         gl.barrier()
-        a_top, a_bot, b_left, b_right, a_s, b_s = _read_tile_plain(
-            smem_a_top,
-            smem_a_bot,
-            smem_b_left,
-            smem_b_right,
-            smem_as,
-            smem_bs,
-            0,
-            NUM_WARPS,
-        )
-        acc_tl, acc_bl, acc_tr, acc_br = _mma_quadrants(
-            a_top,
-            a_bot,
-            b_left,
-            b_right,
-            a_s,
-            b_s,
-            acc_tl,
-            acc_bl,
-            acc_tr,
-            acc_br,
-            NUM_WARPS,
-        )
-        gl.barrier()  # WAR: stage 0 is refilled by the prologue below
+        a_scales = smem_as.index(0).load(linear_as)
+        b_scales = smem_bs.index(0).load(linear_bs)
+        a_top = smem_a_top.index(0).load(dot_a_layout)
+        a_bot = smem_a_bot.index(0).load(dot_a_layout)
+        b_left = smem_b_left.index(0).load(dot_b_layout)
+        b_right = smem_b_right.index(0).load(dot_b_layout)
+        as_top, as_bot = _split_scales(a_scales, linear_as_half)
+        bs_left, bs_right = _split_scales(b_scales, linear_bs_half)
+        acc_tl = _mfma(a_top, as_top, b_left, bs_left, acc_tl)
+        acc_bl = _mfma(a_bot, as_bot, b_left, bs_left, acc_bl)
+        acc_tr = _mfma(a_top, as_top, b_right, bs_right, acc_tr)
+        acc_br = _mfma(a_bot, as_bot, b_right, bs_right, acc_br)
+        gl.barrier()  # WAR: the prologue below refills stage 0
 
-    if num_full - k0 >= 2:
-        # Prologue: K steps k0 (stage 0) and k0+1 (stage 1), 8 commit groups.
-        _issue_stage(
-            smem_a_top,
-            smem_a_bot,
-            smem_b_left,
-            smem_b_right,
-            smem_as,
-            smem_bs,
-            0,
-            a_ptr,
-            b_ptr,
-            a_scales_ptr,
-            b_scales_ptr,
-            off_a_top,
-            off_a_bot,
-            off_b_left,
-            off_b_right,
-            off_as,
-            off_bs,
-            k_a,
-            k_b,
-            g_s,
-            k0,
-            K,
-            stride_ask,
-            stride_bsk,
-            False,
-        )
-        _issue_stage(
-            smem_a_top,
-            smem_a_bot,
-            smem_b_left,
-            smem_b_right,
-            smem_as,
-            smem_bs,
-            1,
-            a_ptr,
-            b_ptr,
-            a_scales_ptr,
-            b_scales_ptr,
-            off_a_top,
-            off_a_bot,
-            off_b_left,
-            off_b_right,
-            off_as,
-            off_bs,
-            k_a,
-            k_b,
-            g_s,
-            k0 + 1,
-            K,
-            stride_ask,
-            stride_bsk,
-            False,
-        )
-        acp.wait_group(6)  # {B_left0 + Bs0}, {A_top0 + As0} are in LDS
+    if num_k_iter - k0 >= 2:
+        # Prologue: K steps k0 and k0 + 1 into stages 0 and 1, in the commit
+        # groups of the loop: {B_left, B scales}, {A_top, A scales}, {A_bot},
+        # {B_right}.
+        for s in gl.static_range(2):
+            _copy(smem_b_left, s, b_ptr + (k0 + s) * BLOCK_K_BYTES, offs_b_left)
+            _copy(
+                smem_bs,
+                s,
+                b_scales_ptr + (k0 + s) * (BLOCK_K_SCALES * stride_bsk),
+                offs_bs,
+            )
+            async_copy.commit_group()
+            _copy(smem_a_top, s, a_ptr + (k0 + s) * BLOCK_K_BYTES, offs_a_top)
+            _copy(
+                smem_as,
+                s,
+                a_scales_ptr + (k0 + s) * (BLOCK_K_SCALES * stride_ask),
+                offs_as,
+            )
+            async_copy.commit_group()
+            _copy(smem_a_bot, s, a_ptr + (k0 + s) * BLOCK_K_BYTES, offs_a_bot)
+            async_copy.commit_group()
+            _copy(smem_b_right, s, b_ptr + (k0 + s) * BLOCK_K_BYTES, offs_b_right)
+            async_copy.commit_group()
+        async_copy.wait_group(6)  # the first two groups of stage 0 are in LDS
         gl.barrier()
-        b_left = _ld_b(smem_b_left, 0, NUM_WARPS)
-        bs_left, bs_right = _ld_scales(smem_bs, 0, 1, NUM_WARPS)
-        a_top = _ld_a(smem_a_top, 0, NUM_WARPS)
-        as_top, as_bot = _ld_scales(smem_as, 0, 0, NUM_WARPS)
+        b_left = smem_b_left.index(0).load(dot_b_layout)
+        bs_left, bs_right = _split_scales(
+            smem_bs.index(0).load(linear_bs), linear_bs_half
+        )
+        a_top = smem_a_top.index(0).load(dot_a_layout)
+        as_top, as_bot = _split_scales(smem_as.index(0).load(linear_as), linear_as_half)
 
-        kr = k0 + 2  # K step refilled into stage 0 (stage 1 gets kr + 1)
-        for _ in range((num_full - k0 - 2) // 2):
-            # ---------------- K step kr - 2: stage 0 ----------------
-            acp.wait_group(5)
-            with warp_pipeline_stage("mfma", priority=0):
-                acc_tl = cdna4.mfma_scaled(
-                    a_top, as_top, "e2m1", b_left, bs_left, "e2m1", acc_tl
-                )
-            with warp_pipeline_stage("mem", priority=1):
-                a_bot = _ld_a(smem_a_bot, 0, NUM_WARPS)
-                _refill(smem_b_left, 0, b_ptr + kr * BKB, off_b_left, None, False)
-                _refill(
-                    smem_bs,
-                    0,
-                    b_scales_ptr + kr * (NG * stride_bsk),
-                    off_bs,
-                    None,
-                    False,
-                )
-                acp.commit_group()
-            acp.wait_group(5)
-            with warp_pipeline_stage("mfma", priority=0):
-                acc_bl = cdna4.mfma_scaled(
-                    a_bot, as_bot, "e2m1", b_left, bs_left, "e2m1", acc_bl
-                )
-            with warp_pipeline_stage("mem", priority=1):
-                b_right = _ld_b(smem_b_right, 0, NUM_WARPS)
-                _refill(smem_a_top, 0, a_ptr + kr * BKB, off_a_top, None, False)
-                _refill(
-                    smem_as,
-                    0,
-                    a_scales_ptr + kr * (NG * stride_ask),
-                    off_as,
-                    None,
-                    False,
-                )
-                acp.commit_group()
-            acp.wait_group(5)
-            with warp_pipeline_stage("mfma", priority=0):
-                acc_tr = cdna4.mfma_scaled(
-                    a_top, as_top, "e2m1", b_right, bs_right, "e2m1", acc_tr
-                )
-            with warp_pipeline_stage("mem", priority=1):
-                b_left = _ld_b(smem_b_left, 1, NUM_WARPS)
-                bs_left_n, bs_right_n = _ld_scales(smem_bs, 1, 1, NUM_WARPS)
-                _refill(smem_a_bot, 0, a_ptr + kr * BKB, off_a_bot, None, False)
-                acp.commit_group()
-            acp.wait_group(5)
-            with warp_pipeline_stage("mfma", priority=0):
-                acc_br = cdna4.mfma_scaled(
-                    a_bot, as_bot, "e2m1", b_right, bs_right, "e2m1", acc_br
-                )
-            with warp_pipeline_stage("mem", priority=1):
-                a_top = _ld_a(smem_a_top, 1, NUM_WARPS)
-                as_top, as_bot = _ld_scales(smem_as, 1, 0, NUM_WARPS)
-                _refill(smem_b_right, 0, b_ptr + kr * BKB, off_b_right, None, False)
-                acp.commit_group()
-            # ---------------- K step kr - 1: stage 1 ----------------
-            acp.wait_group(5)
-            with warp_pipeline_stage("mfma", priority=0):
-                acc_tl = cdna4.mfma_scaled(
-                    a_top, as_top, "e2m1", b_left, bs_left_n, "e2m1", acc_tl
-                )
-            with warp_pipeline_stage("mem", priority=1):
-                a_bot = _ld_a(smem_a_bot, 1, NUM_WARPS)
-                _refill(smem_b_left, 1, b_ptr + (kr + 1) * BKB, off_b_left, None, False)
-                _refill(
-                    smem_bs,
-                    1,
-                    b_scales_ptr + (kr + 1) * (NG * stride_bsk),
-                    off_bs,
-                    None,
-                    False,
-                )
-                acp.commit_group()
-            acp.wait_group(5)
-            with warp_pipeline_stage("mfma", priority=0):
-                acc_bl = cdna4.mfma_scaled(
-                    a_bot, as_bot, "e2m1", b_left, bs_left_n, "e2m1", acc_bl
-                )
-            with warp_pipeline_stage("mem", priority=1):
-                b_right = _ld_b(smem_b_right, 1, NUM_WARPS)
-                _refill(smem_a_top, 1, a_ptr + (kr + 1) * BKB, off_a_top, None, False)
-                _refill(
-                    smem_as,
-                    1,
-                    a_scales_ptr + (kr + 1) * (NG * stride_ask),
-                    off_as,
-                    None,
-                    False,
-                )
-                acp.commit_group()
-            acp.wait_group(5)
-            with warp_pipeline_stage("mfma", priority=0):
-                acc_tr = cdna4.mfma_scaled(
-                    a_top, as_top, "e2m1", b_right, bs_right_n, "e2m1", acc_tr
-                )
-            with warp_pipeline_stage("mem", priority=1):
-                b_left = _ld_b(smem_b_left, 0, NUM_WARPS)
-                bs_left, bs_right = _ld_scales(smem_bs, 0, 1, NUM_WARPS)
-                _refill(smem_a_bot, 1, a_ptr + (kr + 1) * BKB, off_a_bot, None, False)
-                acp.commit_group()
-            acp.wait_group(5)
-            with warp_pipeline_stage("mfma", priority=0):
-                acc_br = cdna4.mfma_scaled(
-                    a_bot, as_bot, "e2m1", b_right, bs_right_n, "e2m1", acc_br
-                )
-            with warp_pipeline_stage("mem", priority=1):
-                a_top = _ld_a(smem_a_top, 0, NUM_WARPS)
-                as_top, as_bot = _ld_scales(smem_as, 0, 0, NUM_WARPS)
-                _refill(
-                    smem_b_right, 1, b_ptr + (kr + 1) * BKB, off_b_right, None, False
-                )
-                acp.commit_group()
-                kr += 2
+        kr = k0 + 2  # K step that refills stage 0; stage 1 gets kr + 1
+        for _ in range((num_k_iter - k0 - 2) // 2):
+            for stage in gl.static_range(2):
+                # K step kr - 2 + stage from LDS stage `stage`. The memory
+                # stages refill `stage` with K step kr + stage and read the
+                # operands of the next K step from the other stage.
+                async_copy.wait_group(5)
+                with warp_pipeline_stage("mfma", priority=0):
+                    acc_tl = _mfma(a_top, as_top, b_left, bs_left, acc_tl)
+                with warp_pipeline_stage("mem", priority=1):
+                    a_bot = smem_a_bot.index(stage).load(dot_a_layout)
+                    kt = kr + stage
+                    _copy(smem_b_left, stage, b_ptr + kt * BLOCK_K_BYTES, offs_b_left)
+                    _copy(
+                        smem_bs,
+                        stage,
+                        b_scales_ptr + kt * (BLOCK_K_SCALES * stride_bsk),
+                        offs_bs,
+                    )
+                    async_copy.commit_group()
+                async_copy.wait_group(5)
+                with warp_pipeline_stage("mfma", priority=0):
+                    acc_bl = _mfma(a_bot, as_bot, b_left, bs_left, acc_bl)
+                with warp_pipeline_stage("mem", priority=1):
+                    b_right = smem_b_right.index(stage).load(dot_b_layout)
+                    _copy(smem_a_top, stage, a_ptr + kt * BLOCK_K_BYTES, offs_a_top)
+                    _copy(
+                        smem_as,
+                        stage,
+                        a_scales_ptr + kt * (BLOCK_K_SCALES * stride_ask),
+                        offs_as,
+                    )
+                    async_copy.commit_group()
+                async_copy.wait_group(5)
+                with warp_pipeline_stage("mfma", priority=0):
+                    acc_tr = _mfma(a_top, as_top, b_right, bs_right, acc_tr)
+                with warp_pipeline_stage("mem", priority=1):
+                    b_left = smem_b_left.index(1 - stage).load(dot_b_layout)
+                    bs_left_next, bs_right_next = _split_scales(
+                        smem_bs.index(1 - stage).load(linear_bs), linear_bs_half
+                    )
+                    _copy(smem_a_bot, stage, a_ptr + kt * BLOCK_K_BYTES, offs_a_bot)
+                    async_copy.commit_group()
+                async_copy.wait_group(5)
+                with warp_pipeline_stage("mfma", priority=0):
+                    acc_br = _mfma(a_bot, as_bot, b_right, bs_right, acc_br)
+                with warp_pipeline_stage("mem", priority=1):
+                    a_top = smem_a_top.index(1 - stage).load(dot_a_layout)
+                    as_top, as_bot = _split_scales(
+                        smem_as.index(1 - stage).load(linear_as), linear_as_half
+                    )
+                    _copy(smem_b_right, stage, b_ptr + kt * BLOCK_K_BYTES, offs_b_right)
+                    async_copy.commit_group()
+                    if stage == 1:
+                        kr += 2
+                bs_left, bs_right = bs_left_next, bs_right_next
 
-        # Drain: K steps num_full-2 (stage 0) and num_full-1 (stage 1), lockstep.
-        acp.wait_group(0)
+        # Drain: K steps num_k_iter - 2 (stage 0) and num_k_iter - 1
+        # (stage 1), lockstep.
+        async_copy.wait_group(0)
         gl.barrier()
-        a_bot = _ld_a(smem_a_bot, 0, NUM_WARPS)
-        b_right = _ld_b(smem_b_right, 0, NUM_WARPS)
-        acc_tl = cdna4.mfma_scaled(
-            a_top, as_top, "e2m1", b_left, bs_left, "e2m1", acc_tl
-        )
-        acc_bl = cdna4.mfma_scaled(
-            a_bot, as_bot, "e2m1", b_left, bs_left, "e2m1", acc_bl
-        )
-        acc_tr = cdna4.mfma_scaled(
-            a_top, as_top, "e2m1", b_right, bs_right, "e2m1", acc_tr
-        )
-        acc_br = cdna4.mfma_scaled(
-            a_bot, as_bot, "e2m1", b_right, bs_right, "e2m1", acc_br
-        )
-        a_top, a_bot, b_left, b_right, a_s, b_s = _read_tile_plain(
-            smem_a_top,
-            smem_a_bot,
-            smem_b_left,
-            smem_b_right,
-            smem_as,
-            smem_bs,
-            1,
-            NUM_WARPS,
-        )
-        acc_tl, acc_bl, acc_tr, acc_br = _mma_quadrants(
-            a_top,
-            a_bot,
-            b_left,
-            b_right,
-            a_s,
-            b_s,
-            acc_tl,
-            acc_bl,
-            acc_tr,
-            acc_br,
-            NUM_WARPS,
-        )
+        a_bot = smem_a_bot.index(0).load(dot_a_layout)
+        b_right = smem_b_right.index(0).load(dot_b_layout)
+        acc_tl = _mfma(a_top, as_top, b_left, bs_left, acc_tl)
+        acc_bl = _mfma(a_bot, as_bot, b_left, bs_left, acc_bl)
+        acc_tr = _mfma(a_top, as_top, b_right, bs_right, acc_tr)
+        acc_br = _mfma(a_bot, as_bot, b_right, bs_right, acc_br)
+        a_scales = smem_as.index(1).load(linear_as)
+        b_scales = smem_bs.index(1).load(linear_bs)
+        a_top = smem_a_top.index(1).load(dot_a_layout)
+        a_bot = smem_a_bot.index(1).load(dot_a_layout)
+        b_left = smem_b_left.index(1).load(dot_b_layout)
+        b_right = smem_b_right.index(1).load(dot_b_layout)
+        as_top, as_bot = _split_scales(a_scales, linear_as_half)
+        bs_left, bs_right = _split_scales(b_scales, linear_bs_half)
+        acc_tl = _mfma(a_top, as_top, b_left, bs_left, acc_tl)
+        acc_bl = _mfma(a_bot, as_bot, b_left, bs_left, acc_bl)
+        acc_tr = _mfma(a_top, as_top, b_right, bs_right, acc_tr)
+        acc_br = _mfma(a_bot, as_bot, b_right, bs_right, acc_br)
 
-    if not EVEN_K:
-        # Partial last K step (index num_full), lockstep: masked copies (masked
-        # bytes zero-fill), then the register fix-up.
-        gl.barrier()  # WAR: stage 0 may still be read by the drain above
-        _issue_tile(
-            smem_a_top,
-            smem_a_bot,
-            smem_b_left,
-            smem_b_right,
-            smem_as,
-            smem_bs,
-            0,
-            a_ptr,
-            b_ptr,
-            a_scales_ptr,
-            b_scales_ptr,
-            off_a_top,
-            off_a_bot,
-            off_b_left,
-            off_b_right,
-            off_as,
-            off_bs,
-            k_a,
-            k_b,
-            g_s,
-            num_full,
-            K,
-            stride_ask,
-            stride_bsk,
-            True,
-        )
-        acp.wait_group(0)
-        gl.barrier()
-        a_top, a_bot, b_left, b_right, a_s, b_s = _read_tile_plain(
-            smem_a_top,
-            smem_a_bot,
-            smem_b_left,
-            smem_b_right,
-            smem_as,
-            smem_bs,
-            0,
-            NUM_WARPS,
-        )
-        a_top, a_bot, a_s, b_s = _fix_k_tail(
-            a_top, a_bot, a_s, b_s, num_full, K, NUM_WARPS
-        )
-        acc_tl, acc_bl, acc_tr, acc_br = _mma_quadrants(
-            a_top,
-            a_bot,
-            b_left,
-            b_right,
-            a_s,
-            b_s,
-            acc_tl,
-            acc_bl,
-            acc_tr,
-            acc_br,
-            NUM_WARPS,
-        )
-
-    row0 = pid_m * BM
-    col0 = pid_n * BN
-    _store_quadrant(acc_tl, c_ptr, row0, col0, M, N, stride_cm, stride_cn, MMA)
-    _store_quadrant(acc_bl, c_ptr, row0 + HM, col0, M, N, stride_cm, stride_cn, MMA)
-    _store_quadrant(acc_tr, c_ptr, row0, col0 + HN, M, N, stride_cm, stride_cn, MMA)
+    row0 = pid_m * BLOCK_SIZE_M
+    col0 = pid_n * BLOCK_SIZE_N
+    _store_quadrant(acc_tl, c_ptr, row0, col0, M, N, stride_cm, stride_cn)
+    _store_quadrant(acc_bl, c_ptr, row0 + HALF_M, col0, M, N, stride_cm, stride_cn)
+    _store_quadrant(acc_tr, c_ptr, row0, col0 + HALF_N, M, N, stride_cm, stride_cn)
     _store_quadrant(
-        acc_br, c_ptr, row0 + HM, col0 + HN, M, N, stride_cm, stride_cn, MMA
+        acc_br, c_ptr, row0 + HALF_M, col0 + HALF_N, M, N, stride_cm, stride_cn
     )

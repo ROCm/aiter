@@ -167,7 +167,6 @@ def _gemm_afp4wfp4_pingpong(x, b, x_scales, w_scales, dtype, y, config):
         BLOCK_SIZE_N=config["BLOCK_SIZE_N"],
         BLOCK_SIZE_K=config["BLOCK_SIZE_K"],
         GROUP_SIZE_M=config["GROUP_SIZE_M"],
-        EVEN_K=True,
         NUM_WARPS=8,
         NUM_XCDS=get_num_xcds(),
         num_warps=8,
