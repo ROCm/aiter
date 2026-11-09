@@ -1296,17 +1296,20 @@ def _check_no_alias(
     written: tuple[tuple[str, torch.Tensor | None], ...],
     read: tuple[tuple[str, torch.Tensor], ...],
 ) -> None:
-    """Reject a written buffer that shares a byte with a read-only cache.
+    """Reject a written buffer that shares a byte with a read-only input.
 
     A verify must leave the caches unchanged until the caller commits, so a
-    scratch or output store into a cache is an early commit. Buffers may
-    still interleave slots in one pool.
+    scratch or output store into a cache is an early commit. A store into a
+    weight corrupts it for the workgroups that have not read it yet. Buffers
+    may still interleave slots in one pool.
     """
+    read_blocks = [(name, _slot_blocks(tensor)) for name, tensor in read]
     for w_name, w in written:
         if w is None:
             continue
-        for r_name, r in read:
-            if _blocks_overlap(_slot_blocks(w), _slot_blocks(r)):
+        w_blocks = _slot_blocks(w)
+        for r_name, r_blocks in read_blocks:
+            if _blocks_overlap(w_blocks, r_blocks):
                 raise ValueError(f"`{w_name}` must not overlap `{r_name}`.")
 
 
@@ -1918,8 +1921,9 @@ def flydsl_kda_verify_with_f_b(
     channel-major ``[lines, steps, 4608, 3]`` or SGLang's ``[lines, steps, 3,
     4608]`` viewed through ``transpose(-1, -2)``, ``intermediate_states`` and
     the ring tensors in their stated order, and ``out`` with non-overlapping
-    token and head rows. No written buffer may overlap ``conv_state`` or
-    ``state``. ``conv_state`` takes either conv layout; strides and byte spans
+    token and head rows. No written buffer may overlap ``conv_state``,
+    ``state`` or a weight (``f_b_weight``, ``conv_weight``, ``A_log``,
+    ``dt_bias``, ``norm_weight``). ``conv_state`` takes either conv layout; strides and byte spans
     follow the int32 limits of :func:`flydsl_kda_decode`.
 
     ``num_warps`` overrides the per-workgroup wave count, one of
@@ -2211,7 +2215,21 @@ def flydsl_kda_verify_with_f_b(
         ("intermediate_conv_window", intermediate_conv_window),
         ("intermediate_states", intermediate_states),
     ) + tuple((f"replay_ring[{i}]", t) for i, t in enumerate(replay_ring or ()))
-    _check_no_alias(written, (("conv_state", conv_state), ("state", state)))
+    # Every workgroup reads the same weights, so a store into one of them would
+    # race with the workgroups still to read it, as a store into a cache would
+    # commit early.
+    _check_no_alias(
+        written,
+        (
+            ("conv_state", conv_state),
+            ("state", state),
+            ("f_b_weight", f_b_weight),
+            ("conv_weight", conv_weight),
+            ("A_log", A_log),
+            ("dt_bias", dt_bias),
+            ("norm_weight", norm_weight),
+        ),
+    )
     # The written buffers must not share a byte with each other either: raw_v
     # and raw_k over one ring would let the K store overwrite the V store.
     for i, (name, tensor) in enumerate(written[:-1]):

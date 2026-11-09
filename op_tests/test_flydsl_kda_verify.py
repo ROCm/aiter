@@ -635,6 +635,39 @@ def test_kda_verify_rejects_scratch_on_a_cache(monkeypatch, scratch, cache):
         _run(inp, 1)
 
 
+def _overlay(pool, offset, like):
+    """A tensor of ``like``'s shape and dtype at a byte offset into ``pool``."""
+    nbytes = like.numel() * like.element_size()
+    return pool[offset : offset + nbytes].view(like.dtype).view(like.shape)
+
+
+@pytest.mark.parametrize(
+    "weight", ["f_b_weight", "conv_weight", "A_log", "dt_bias", "norm_weight"]
+)
+@pytest.mark.parametrize("written", ["window", "out"])
+def test_kda_verify_rejects_writes_over_a_weight(monkeypatch, written, weight):
+    """Every workgroup reads the weights, so a store into one is a race."""
+    _reject_compile(monkeypatch)
+    inp = _make_inputs(2, 1, torch.bfloat16, False)
+    out = torch.empty(
+        (1, 2, _H, _D), dtype=torch.bfloat16, device=_DEVICE
+    )  # 2 x 1 token
+    victim = getattr(inp, weight)
+    target = inp.window if written == "window" else out
+    # One allocation holds both, the written buffer over the weight's first bytes.
+    size = 2 * max(victim.numel() * victim.element_size(), target.numel() * 4)
+    pool = torch.zeros(size, dtype=torch.uint8, device=_DEVICE)
+    setattr(inp, weight, _overlay(pool, 0, victim).copy_(victim))
+    over = _overlay(pool, 0, target)
+    if written == "window":
+        inp.window = over
+        out = None
+    else:
+        out = over
+    with pytest.raises(ValueError, match=f"must not overlap `{weight}`"):
+        _run(inp, 1, out=out)
+
+
 @pytest.mark.parametrize("written, other", [(1, 0), (3, 2)], ids=["k-v", "beta-g"])
 def test_kda_verify_rejects_ring_buffers_that_overlap(monkeypatch, written, other):
     """Two ring buffers over one allocation would overwrite each other's stores."""
