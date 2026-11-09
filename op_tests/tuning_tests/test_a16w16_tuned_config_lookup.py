@@ -239,6 +239,32 @@ class TestTdmPolicyContract(unittest.TestCase):
             self.assertTrue(all(not c["split_k_atomic"] for c in odd))
 
 
+class TestTdmRegisterPrefetchBudget(unittest.TestCase):
+    def test_small_and_many_wave_working_sets(self):
+        from aiter.ops.flydsl.kernels.gemm_a16w16_tdm_gfx1250 import (
+            _register_prefetch_fits,
+        )
+
+        # m_steps, n_steps, k_steps, waves from measured old-best geometries:
+        # 16x16x256/w1x1, 64x64x128/w4x2, 64x128x128/w2x2.
+        for ms, ns, ks, waves in ((1, 1, 8, 1), (1, 2, 4, 8), (2, 4, 4, 4)):
+            self.assertTrue(_register_prefetch_fits(ms, ns, ks, 16, 16, 8, waves))
+        # 128x64x256/w4x4 spills when prefetched without the workgroup bound.
+        self.assertFalse(_register_prefetch_fits(2, 1, 8, 16, 16, 8, 16))
+        # 32x64x512/w1x1 exceeds the per-wave working set budget.
+        self.assertFalse(_register_prefetch_fits(2, 4, 16, 16, 16, 8, 1))
+
+    def test_budget_boundary_and_monotonicity(self):
+        from aiter.ops.flydsl.kernels.gemm_a16w16_tdm_gfx1250 import (
+            _register_prefetch_fits,
+        )
+
+        # Estimate=2*4*(2+4)*8 + 2*4*8 + 32=480 registers/wave.
+        self.assertTrue(_register_prefetch_fits(2, 4, 4, 16, 16, 8, 4))
+        self.assertFalse(_register_prefetch_fits(2, 4, 4, 16, 16, 8, 8))
+        self.assertFalse(_register_prefetch_fits(2, 4, 8, 16, 16, 8, 4))
+
+
 class TestGfx950FlydslMemoryCandidates(unittest.TestCase):
     """Keep wide decode panels and the existing skinny backend in the catalog."""
 

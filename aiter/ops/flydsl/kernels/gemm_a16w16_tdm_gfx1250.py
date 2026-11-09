@@ -100,6 +100,22 @@ def _zero_output_available(pointer, width):
         )
 
 
+def _register_prefetch_fits(
+    m_steps, n_steps, k_steps, frag_elems, elem_bits, acc_elems, waves
+):
+    """Conservative tuning heuristic, not a compiler register allocation bound.
+
+    Hold current and next operand tiles plus FP32 accumulators. Cap both the
+    per-wave working set and workgroup aggregate: eager whole-tile prefetch on
+    large/many-wave tiles can spill, even when the LDS allocation is legal.
+    Unmodeled address temporaries get 32 registers of headroom. Layout gating is
+    separate so NN and quadrant-interleaved schedules retain their pipelines.
+    """
+    operands = 2 * k_steps * (m_steps + n_steps) * frag_elems * elem_bits // 32
+    estimate = operands + m_steps * n_steps * acc_elems + 32
+    return estimate <= 512 and estimate * waves <= 2048
+
+
 def _validate_interleaved_tile(
     block_m,
     block_n,
@@ -330,6 +346,19 @@ def build_gemm_gfx1250(
     shared_elements = max(stages * (a_stage_size + b_stage_size), c_slots)
     m_steps, n_steps = (block_m // (m_waves * mma_m), block_n // (n_waves * mma_n))
     half_m_steps, half_n_steps = (m_steps // 2, n_steps // 2)
+    use_register_pipeline = (
+        b_k_contiguous
+        and not interleave
+        and _register_prefetch_fits(
+            m_steps,
+            n_steps,
+            block_k // mma_k,
+            frag_elems,
+            elem_bits,
+            acc_elems,
+            waves,
+        )
+    )
     _validate_interleaved_tile(
         block_m,
         block_n,
@@ -535,6 +564,42 @@ def build_gemm_gfx1250(
                     for ni in range_constexpr(n_steps):
                         acc = accumulators[mi * n_steps + ni]
                         fx.gemm(mma, acc, a_fragment, b_fragments[ni], acc)
+
+        def read_fragments(stage):
+            a_values = [
+                load_fragment(
+                    shared_a, a_stage_size, stage, wave_row + mi * mma_m, ki * mma_k
+                ).load()
+                for ki in range_constexpr(block_k // mma_k)
+                for mi in range_constexpr(m_steps)
+            ]
+            b_values = [
+                load_fragment(
+                    shared_b,
+                    b_stage_size,
+                    stage,
+                    wave_col + ni * mma_n,
+                    ki * mma_k,
+                    k_contiguous=b_k_contiguous,
+                ).load()
+                for ki in range_constexpr(block_k // mma_k)
+                for ni in range_constexpr(n_steps)
+            ]
+            return a_values, b_values
+
+        def compute_fragments(a_values, b_values):
+            for ki in range_constexpr(block_k // mma_k):
+                b_frags = []
+                for ni in range_constexpr(n_steps):
+                    fragment = fx.make_rmem_tensor(frag_elems, elem_dtype)
+                    fragment.store(b_values[ki * n_steps + ni])
+                    b_frags.append(fragment)
+                for mi in range_constexpr(m_steps):
+                    fragment = fx.make_rmem_tensor(frag_elems, elem_dtype)
+                    fragment.store(a_values[ki * m_steps + mi])
+                    for ni in range_constexpr(n_steps):
+                        acc = accumulators[mi * n_steps + ni]
+                        fx.gemm(mma, acc, fragment, b_frags[ni], acc)
 
         k_rank = fx.block_idx.y
         k_tiles = k // split_k // block_k
@@ -849,6 +914,67 @@ def build_gemm_gfx1250(
             else:
                 run_interleaved(1)
             tdm_ops.tensor_wait(0)
+        elif const_expr(use_register_pipeline):
+            for stage in range_constexpr(stages - 1):
+                copy_tile(stage, k_tile_base + fx.Int32(stage))
+            wait_tile(stages - 2)
+            current_a, current_b = read_fragments(fx.Int32(0))
+            a_count = block_k // mma_k * m_steps
+            b_count = block_k // mma_k * n_steps
+            main_tiles = k_tiles - (stages - 1)
+            # Prefetch the next LDS tile while current operands are carried
+            # in registers. Carry accumulators explicitly through the SSA loop.
+            # main_tiles may be zero; the prologue fragments then feed drain.
+            init_state = (
+                [acc.load() for acc in accumulators]
+                + current_a
+                + current_b
+                + [fx.Int32(0)]
+            )
+            loop_result = init_state
+            for tile, state in range(main_tiles, init=init_state):
+                for i in range_constexpr(m_steps * n_steps):
+                    accumulators[i].store(state[i])
+                ca = list(state[m_steps * n_steps : m_steps * n_steps + a_count])
+                cb = list(
+                    state[
+                        m_steps * n_steps
+                        + a_count : m_steps * n_steps
+                        + a_count
+                        + b_count
+                    ]
+                )
+                current_stage = fx.Int32(state[-1])
+                copy_tile(
+                    (current_stage + stages - 1) % stages,
+                    k_tile_base + fx.Int32(tile) + stages - 1,
+                )
+                wait_tile(stages - 2)
+                next_stage = (current_stage + 1) % stages
+                na, nb = read_fragments(next_stage)
+                compute_fragments(ca, cb)
+                loop_result = yield (
+                    [acc.load() for acc in accumulators] + na + nb + [next_stage]
+                )
+            for i in range_constexpr(m_steps * n_steps):
+                accumulators[i].store(loop_result[i])
+            ca = list(loop_result[m_steps * n_steps : m_steps * n_steps + a_count])
+            cb = list(
+                loop_result[
+                    m_steps * n_steps + a_count : m_steps * n_steps + a_count + b_count
+                ]
+            )
+            current_stage = fx.Int32(loop_result[-1])
+            for tail in range_constexpr(stages - 1):
+                if const_expr(tail < stages - 2):
+                    wait_tile(stages - 3 - tail)
+                    next_stage = (current_stage + 1) % stages
+                    na, nb = read_fragments(next_stage)
+                    compute_fragments(ca, cb)
+                    ca, cb = na, nb
+                    current_stage = next_stage
+                else:
+                    compute_fragments(ca, cb)
         else:
             for stage in range_constexpr(stages - 1):
                 copy_tile(stage, k_tile_base + fx.Int32(stage))
@@ -1184,6 +1310,11 @@ def build_gemm_gfx1250(
         interleave,
         split_k_atomic,
     )
+    if use_register_pipeline:
+        launch.compile_hints["llvm_options"] = {
+            "amdgpu-expert-scheduling-mode": True,
+            "unroll-threshold": 0,
+        }
     if interleave:
         launch.compile_hints["llvm_options"] = {
             "amdgpu-expert-scheduling-mode": True,
