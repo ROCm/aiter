@@ -104,13 +104,13 @@ class Stage2ScatterContext:
     # signature of ``flydsl_grouped_gemm_a8w4_masked``; it runs the fused
     # dispatch + GEMM1 stage-1 kernel instead. None keeps the default GEMM1.
     stage1_gemm1: object = None
-    # Compact only: gemm2 returns each peer's run with one plain TDM store into
-    # the plan's dense comb_inp layout, reading the run table the plan appended
-    # to compact_psum (see compact_plan.compact_comb_tab_dwords).
+    # Compact, quantized wire only: gemm2 returns each peer's run with one plain
+    # TDM store into the plan's dense comb_inp layout, reading the run table the
+    # plan appended to compact_psum (see compact_plan.compact_comb_tab_dwords).
     per_rank_scatter: bool = False
-    # Per-rank scatter on a quantized wire only, 0 when off: arena offset of a
-    # [N/256][slot] x 8 B e8m0 region that replaces the slots' scale plane, so a
-    # peer's run of slots takes its 8-byte scale slices as one contiguous store.
+    # Per-rank scatter only, 0 when off: arena offset of a [N/256][slot] x 8 B
+    # e8m0 region that replaces the slots' scale plane, so a peer's run of
+    # slots takes its 8-byte scale slices as one contiguous store.
     combine_scale_offset: int = 0
     # Slots per N/256 column block of that region (compact_dense_comb_slots).
     combine_scale_slots: int = 0
@@ -120,6 +120,8 @@ class Stage2ScatterContext:
             raise ValueError(
                 f"combine_quant_bits must be 0, 8 or 4, got {self.combine_quant_bits}"
             )
+        if self.per_rank_scatter and not self.combine_quant_bits:
+            raise ValueError("the per-rank scatter runs on a quantized combine wire")
         if self.arena_handle < 0:
             raise ValueError("arena_handle must be non-negative")
         if self.combine_input_offset < 0:

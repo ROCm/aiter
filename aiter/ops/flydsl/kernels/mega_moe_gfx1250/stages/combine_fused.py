@@ -120,10 +120,11 @@ class _FusedScatterCombine:
             )
 
     @staticmethod
-    def _slot_count(config: MegaMoEConfig) -> int:
-        """comb_inp slots: one a route, or the per-rank scatter's padded runs."""
+    def _slot_count(config: MegaMoEConfig, quant_bits: int) -> int:
+        """comb_inp slots on the ``quant_bits`` wire: one a route, or the
+        per-rank scatter's padded runs."""
         max_routes = config.max_tokens_per_rank * config.topk
-        if not config.per_rank_scatter:
+        if not config.per_rank_scatter_for(quant_bits):
             return max_routes
         from ..compact_plan import compact_dense_comb_slots
 
@@ -135,19 +136,22 @@ class _FusedScatterCombine:
 
     @classmethod
     def regions(cls, config: MegaMoEConfig, caps=None) -> dict:
-        slots = cls._slot_count(config)
         regions = {
             "cross_device_barrier": config.world_size * 8,
-            # Cut to the bf16 pitch whatever wire runs: it is the widest, so this
-            # holds a step on any of them and a quantized one just packs into the
-            # front of it at its own pitch.
-            "comb_inp": slots * config.combine_slot_stride_bytes,
+            # Holds a step on any wire, each at its own slot count and pitch: the
+            # bf16 one route-major, a quantized one packed into the front.
+            "comb_inp": max(
+                cls._slot_count(config, bits) * config.combine_slot_stride_for(bits)
+                for bits in config.combine_quant_bit_modes
+            ),
         }
-        # On a quantized wire the per-rank scatter keeps the slots' e8m0 scales
-        # in a separate [hidden/256][slot] region instead of each slot's tail,
-        # so a peer's run of slots takes them as one contiguous store per block.
-        if config.per_rank_scatter and config.combine_quant_bits:
-            regions["comb_scale"] = slots * (config.hidden_dim // _COMBINE_SCALE_BLOCK)
+        # The per-rank scatter keeps the slots' e8m0 scales in a separate
+        # [hidden/256][slot] region instead of each slot's tail, so a peer's run
+        # of slots takes them as one contiguous store per block.
+        if config.per_rank_scatter:
+            regions["comb_scale"] = cls._slot_count(
+                config, config.combine_quant_bits
+            ) * (config.hidden_dim // _COMBINE_SCALE_BLOCK)
         return regions
 
     def build(self, res: _EpResources) -> None:
@@ -163,6 +167,7 @@ class _FusedScatterCombine:
         self._reduces = {}
         for bits, (toks, chunks) in self._tiles.items():
             lanes = toks * chunks * _COMBINE_CHUNK_ELEMS // 16
+            per_rank = config.per_rank_scatter_for(bits)
             self._reduces[bits] = _make_combine_fused_reduce(
                 experts_per_token=config.topk,
                 hidden_dim=config.hidden_dim,
@@ -172,12 +177,10 @@ class _FusedScatterCombine:
                 quant_bits=bits,
                 tokens_per_block=toks,
                 chunks_per_iter=chunks,
-                dense_slots=(
-                    self._slot_count(config) if config.per_rank_scatter else 0
-                ),
+                dense_slots=self._slot_count(config, bits) if per_rank else 0,
                 scale_planar_rel=(
                     res.arena.offset("comb_scale") - res.arena.offset("comb_inp")
-                    if config.per_rank_scatter and bits
+                    if per_rank
                     else 0
                 ),
             )
@@ -187,9 +190,23 @@ class _FusedScatterCombine:
             off_xdb_mem=res.arena.offset("cross_device_barrier"),
         )
 
+    def _check_layout(self, routing: Routing, quant_bits: int) -> bool:
+        """Whether the ``quant_bits`` step runs the per-rank scatter, checked
+        against the comb_inp layout its dispatch planned."""
+        per_rank = self.config.per_rank_scatter_for(quant_bits)
+        if per_rank != (routing.comb_slot is not None):
+            raise ValueError(
+                f"a combine_quant_bits={quant_bits} step needs the "
+                f"{'dense' if per_rank else 'tok*topk + k'} comb_inp layout, but "
+                "its dispatch planned the other one; dispatch the step for the "
+                "wire it combines on"
+            )
+        return per_rank
+
     def prepare(self, batch: _DispatchBatch, quant_bits: int) -> _ComputeTarget:
         config, arena = self.config, self.res.arena
         grouped = batch.layout is BatchLayout.EXPERT_GROUPED
+        per_rank = self._check_layout(batch.routing, quant_bits)
         scatter = Stage2ScatterContext(
             arena_handle=arena.handle,
             combine_input_offset=arena.offset("comb_inp"),
@@ -199,13 +216,13 @@ class _FusedScatterCombine:
             source_token_map=batch.routing.source_token_map,
             **(batch.grouping.scatter_fields() if grouped else {}),
             combine_quant_bits=quant_bits,
-            per_rank_scatter=config.per_rank_scatter,
+            per_rank_scatter=per_rank,
             **(
                 {
                     "combine_scale_offset": arena.offset("comb_scale"),
-                    "combine_scale_slots": self._slot_count(config),
+                    "combine_scale_slots": self._slot_count(config, quant_bits),
                 }
-                if config.per_rank_scatter and quant_bits
+                if per_rank
                 else {}
             ),
         )
@@ -219,6 +236,7 @@ class _FusedScatterCombine:
         """The gemm2 epilogue has already scattered the results into the peers'
         slots, packed as the ``quant_bits`` wire; reduce them."""
         res = self.res
+        per_rank = self._check_layout(routing, quant_bits)
         stream = fx.Stream(torch.cuda.current_stream())
         # 1-block cross-device barrier, then the barrier-free reduce on the
         # same stream; the kernel boundary gives the reduce its visibility.
@@ -233,7 +251,7 @@ class _FusedScatterCombine:
             self._reduces[quant_bits],
             res.arena.local_ptr("comb_inp"),
             res.combine_output.data_ptr(),
-            routing.comb_slot.data_ptr() if routing.comb_slot is not None else 0,
+            routing.comb_slot.data_ptr() if per_rank else 0,
             routing.token_count,
             stream,
         )

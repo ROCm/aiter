@@ -59,8 +59,8 @@ Launch (4x gfx1250; every env knob below is already the script's default):
     # Setting DEBUG_HIP_GRAPH_CLASSIC_PATH yourself keeps it to one pass on that
     # path; =0 drops the stage1_fused kernel tables, which that path would
     # mislabel.
-    # --stage1_fused true returns gemm2's rows with one per-rank TDM store;
-    # AITER_MEGA_PER_RANK_SCATTER=0 keeps the 8-row gather scatter instead.
+    # --stage1_fused true with a quantized --combine_quant returns gemm2's rows
+    # with one per-rank TDM store; a bf16 combine keeps the 8-row gather scatter.
 
 Env / CLI: --layers --logits_tol --acc_verify --dispatch_backend
            --stage1_fused --stage2_fused --dispatch_wire --combine --combine_quant

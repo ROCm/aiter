@@ -3,6 +3,7 @@
 
 """The FlyDSL compact plan and its TDM dispatch as a dispatch stage."""
 
+import itertools
 import os
 from dataclasses import dataclass
 
@@ -364,17 +365,7 @@ class _CompactDispatch(_Dispatch):
         self.fusion.arm()
         # Warm the capacity bucket: compiling inside graph capture is not
         # allowed.
-        for slot in slots:
-            self._plan_for(geo.tile_m, slot)
-            if self.fusion.plan_mode(geo.tile_m):
-                self._plan_for(geo.tile_m, slot, tok_map=False)
-                if _QUANT_FUSE_BLOCKS:
-                    self._plan_for(
-                        geo.tile_m,
-                        slot,
-                        tok_map=False,
-                        quant_blocks=_QUANT_FUSE_BLOCKS,
-                    )
+        self._warm_plans(geo.tile_m, None)
         self._precompile_s1f_plans()
         self._precompile_per_rank_plans()
         self._kernels = self._build_kernels()
@@ -493,6 +484,7 @@ class _CompactDispatch(_Dispatch):
         recv_token_bound: int | None = None,
         begin_step: bool = True,
         s1f: bool = False,
+        combine_quant_bits: int = 0,
     ) -> _DispatchBatch:
         """Compact cannot slice recv_x -- the rows are grouped per expert, not
         token-major -- so ``recv_token_bound`` is spent on the step's geometry
@@ -501,10 +493,16 @@ class _CompactDispatch(_Dispatch):
 
         ``s1f`` skips the dispatch kernel: the stage-1 kernel, launched in place
         of GEMM1, ships the rows off the plan's run table.
+
+        ``combine_quant_bits`` is the wire this step combines on. The plan lays
+        comb_inp out for it: dense for the per-rank scatter on a quantized
+        wire, ``tok*topk + k`` otherwise. Every rank of a step must pass the
+        same one, since gemm2 writes into its peers' comb_inp.
         """
         config, res = self.config, self.res
         token_count = int(hidden_states.shape[0])
         _check_recv_token_bound(config, "recv_token_bound", recv_token_bound)
+        dense_comb = config.per_rank_scatter_for(combine_quant_bits)
         if begin_step:
             self.prepare_step(recv_token_bound)
         kernel = self._kernels[_pick(self.schedule, token_count)]
@@ -518,6 +516,7 @@ class _CompactDispatch(_Dispatch):
             self._step.align_m,
             tok_map=not s1f,
             quant_src=hidden_states if fused_quant else None,
+            dense_comb=dense_comb,
         )
         if fused_quant:
             payload = self._quant_payload[:token_count]
@@ -563,7 +562,9 @@ class _CompactDispatch(_Dispatch):
             topk_ids=self._dummy_ids,
             scales=self.recv_scales,
             num_local_tokens=None,
-            routing=self._routing(token_count, self._comb_slots[slot]),
+            routing=self._routing(
+                token_count, self._comb_slots[slot] if dense_comb else None
+            ),
             layout=BatchLayout.EXPERT_GROUPED,
             grouping=ExpertGrouping(
                 masked_m=self._masked_ms[slot],
@@ -590,18 +591,31 @@ class _CompactDispatch(_Dispatch):
             if token_count is None
             else int(token_count)
         )
-        for slot in range(self._PLAN_SLOTS):
-            self._plan_for(self._step.align_m, slot, tok)
-            if self.fusion.plan_mode(self._step.align_m):
-                self._plan_for(self._step.align_m, slot, tok, tok_map=False)
-                if _QUANT_FUSE_BLOCKS:
+        self._warm_plans(self._step.align_m, tok)
+
+    def _dense_modes(self) -> tuple:
+        """The comb_inp layouts a step's plan may write: the dense one only
+        when the per-rank scatter is built, for the quantized steps."""
+        return (False, True) if self.config.per_rank_scatter else (False,)
+
+    def _warm_plans(self, align_m: int, token_count: int | None) -> None:
+        """Compile every plan variant a step at ``align_m`` may launch."""
+        for dense in self._dense_modes():
+            for slot in range(self._PLAN_SLOTS):
+                self._plan_for(align_m, slot, token_count, dense_comb=dense)
+                if self.fusion.plan_mode(align_m):
                     self._plan_for(
-                        self._step.align_m,
-                        slot,
-                        tok,
-                        tok_map=False,
-                        quant_blocks=_QUANT_FUSE_BLOCKS,
+                        align_m, slot, token_count, tok_map=False, dense_comb=dense
                     )
+                    if _QUANT_FUSE_BLOCKS:
+                        self._plan_for(
+                            align_m,
+                            slot,
+                            token_count,
+                            tok_map=False,
+                            quant_blocks=_QUANT_FUSE_BLOCKS,
+                            dense_comb=dense,
+                        )
 
     def _recv_bound(self, recv_token_bound: int | None) -> int:
         """This step's recv bound: the caller's, already checked, else the
@@ -667,12 +681,21 @@ class _CompactDispatch(_Dispatch):
                 if not self.fusion.plan_mode(align_m):
                     continue
                 for tok in sorted(widths.values()):
-                    for slot in range(self._PLAN_SLOTS):
-                        self._plan_for(align_m, slot, tok)
-                        self._plan_for(align_m, slot, tok, tok_map=False)
+                    for dense, slot in itertools.product(
+                        self._dense_modes(), range(self._PLAN_SLOTS)
+                    ):
+                        self._plan_for(align_m, slot, tok, dense_comb=dense)
+                        self._plan_for(
+                            align_m, slot, tok, tok_map=False, dense_comb=dense
+                        )
                         if _qfb:
                             self._plan_for(
-                                align_m, slot, tok, tok_map=False, quant_blocks=_qfb
+                                align_m,
+                                slot,
+                                tok,
+                                tok_map=False,
+                                quant_blocks=_qfb,
+                                dense_comb=dense,
                             )
         finally:
             self._step = saved
@@ -705,7 +728,8 @@ class _CompactDispatch(_Dispatch):
         return compact_plan_blocks(routes)
 
     def _precompile_per_rank_plans(self) -> None:
-        """Compile the per-rank scatter's S1F=0 plan for every block count.
+        """Compile the per-rank scatter's (dense) S1F=0 plan for every block
+        count.
 
         Off the stage-1 path that plan is keyed by its block count, which
         follows the step's token count, so a prefill width the warmup never
@@ -735,7 +759,7 @@ class _CompactDispatch(_Dispatch):
                 self._step = st
                 for tok in sorted(widths.values()):
                     for slot in range(self._PLAN_SLOTS):
-                        self._plan_for(align_m, slot, tok)
+                        self._plan_for(align_m, slot, tok, dense_comb=True)
         finally:
             self._step = saved
 
@@ -758,13 +782,15 @@ class _CompactDispatch(_Dispatch):
         token_count: int | None = None,
         tok_map: bool = True,
         quant_blocks: int = 0,
+        dense_comb: bool = False,
     ):
         """The compact-plan launch that aligns each expert's rows to ``align_m``.
 
-        Compiled per alignment, hist/done slot, launch width and, on the
-        stage-1 path, whether it rewrites tok_map or quantizes in the same
-        launch. The plan and the expert GEMM must agree on the tile, and
-        double-buffered plans must not share a done counter.
+        Compiled per alignment, hist/done slot, launch width, comb_inp layout
+        (``dense_comb`` for a per-rank scatter step) and, on the stage-1 path,
+        whether it rewrites tok_map or quantizes in the same launch. The plan
+        and the expert GEMM must agree on the tile, and double-buffered plans
+        must not share a done counter.
         """
         from ..compact_plan import compact_plan_waves, compile_tdm_compact_plan
 
@@ -775,6 +801,9 @@ class _CompactDispatch(_Dispatch):
         plan_s1f = fused and self.fusion.plan_mode(align_m)
         write_tok_map = (not plan_s1f) or bool(tok_map)
         qb = int(quant_blocks) if plan_s1f else 0
+        dense_comb = bool(dense_comb)
+        if dense_comb and not self.config.per_rank_scatter:
+            raise ValueError("a dense comb_inp plan needs the per-rank scatter built")
         # With the stage-1 kernel off, one launch per alignment and slot, as
         # before: the width is the plan's own default. On, the width follows
         # the step, and tok_map / the fused quant are their own kernels.
@@ -787,18 +816,16 @@ class _CompactDispatch(_Dispatch):
             # block's LDS route table it splits the routes across blocks like
             # the fused plan does.
             waves = None
-            blocks = (
-                self._plan_blocks_for(token_count)
-                if self.config.per_rank_scatter
-                else None
-            )
+            blocks = self._plan_blocks_for(token_count) if dense_comb else None
             key = (align_m, slot, blocks)
+        key += (dense_comb,)
         launch = self._plan_launches.get(key)
         if launch is None:
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError(
                     f"compact plan for align_m={align_m} slot={slot} "
-                    f"waves={waves} blocks={blocks} was not compiled before "
+                    f"waves={waves} blocks={blocks} dense_comb={dense_comb} "
+                    "was not compiled before "
                     "graph capture; warm this token bucket eagerly first"
                 )
             config, geo, arena = self.config, self.compact, self.res.arena
@@ -840,7 +867,7 @@ class _CompactDispatch(_Dispatch):
                 hist_stride=geo.hist_stride,
                 max_routes=geo.max_routes,
                 hist_pingpong=False,
-                dense_comb=config.per_rank_scatter,
+                dense_comb=dense_comb,
                 **extra,
             )
             # Compiled now, without a launch, so a graph capture never has to.
@@ -897,6 +924,7 @@ class _CompactDispatch(_Dispatch):
         *,
         tok_map: bool = True,
         quant_src: torch.Tensor | None = None,
+        dense_comb: bool = False,
     ) -> None:
         plan_s1f = self.fusion.plan_mode(align_m) and not self.fusion.step_off()
         qb = _QUANT_FUSE_BLOCKS if plan_s1f and quant_src is not None else 0
@@ -912,6 +940,7 @@ class _CompactDispatch(_Dispatch):
                     token_count,
                     tok_map=tok_map,
                     quant_blocks=qb,
+                    dense_comb=dense_comb,
                 ),
                 *self._plan_args(
                     topk_ids.data_ptr(),

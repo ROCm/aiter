@@ -34,7 +34,11 @@ from aiter.ops.flydsl.kernels.mega_moe_gfx1250.compact_plan import (
     compact_hist_stride,
     compact_row_capacity,
 )
-from aiter.ops.flydsl.kernels.mega_moe_gfx1250.types import COMBINE_SCALE_BLOCK
+from aiter.ops.flydsl.kernels.mega_moe_gfx1250.stages.base import Routing
+from aiter.ops.flydsl.kernels.mega_moe_gfx1250.types import (
+    COMBINE_SCALE_BLOCK,
+    Stage2ScatterContext,
+)
 
 D, C = MM.DispatchKind, MM.CombineKind
 COMPACT_TILE = 64
@@ -190,20 +194,27 @@ def _reference_regions(config, tile_m):
             ("compact_hist", hist * 4),
             ("compact_done", compact_done_nbytes()),
         ]
+    # The per-rank scatter rides with the quantized combine wire.
+    per_rank = (
+        compact and recipe.combine is C.FUSED_SCATTER and config.combine_quant_bits
+    )
     if recipe.combine is C.FUSED_SCATTER:
+        # bf16 slots one a route, the quantized wire's at its own pitch: one a
+        # route as well, or the per-rank scatter's padded runs.
         routes = config.max_tokens_per_rank * topk
-        slots = (
-            compact_dense_comb_slots(
-                max_routes=routes,
-                npes=ws,
-                experts_per_rank=config.experts_per_rank,
-            )
-            if config.per_rank_scatter
-            else routes
+        dense = compact_dense_comb_slots(
+            max_routes=routes,
+            npes=ws,
+            experts_per_rank=config.experts_per_rank,
         )
-        comb_inp = slots * config.combine_slot_stride_bytes
+        comb_inp = routes * config.combine_slot_stride_bytes
+        if config.combine_quant_bits:
+            comb_inp = max(
+                comb_inp,
+                (dense if per_rank else routes)
+                * config.combine_slot_stride_for(config.combine_quant_bits),
+            )
     else:
-        slots = None
         comb_inp = max_recv * config.hidden_dim * 2
         if config.combine_quant_bits:
             land = _push_land_rows(ws, config.max_tokens_per_rank, topk)
@@ -211,9 +222,9 @@ def _reference_regions(config, tile_m):
             if 4 <= ws <= 32:
                 comb_inp += land * 8
     regions.append(("comb_inp", comb_inp))
-    if config.per_rank_scatter and config.combine_quant_bits:
+    if per_rank:
         regions.append(
-            ("comb_scale", slots * (config.hidden_dim // COMBINE_SCALE_BLOCK))
+            ("comb_scale", dense * (config.hidden_dim // COMBINE_SCALE_BLOCK))
         )
     return regions
 
@@ -266,16 +277,47 @@ def _config(dispatch, combine, wire, wires, *geometry, rank=0):
     return MM.MegaMoEConfig(recipe=recipe, geometry=_geometry(*geometry, rank=rank))
 
 
-def test_per_rank_scatter_defaults_on_with_stage1_fused(monkeypatch):
-    monkeypatch.delenv("AITER_MEGA_PER_RANK_SCATTER", raising=False)
+@pytest.mark.parametrize("wire", ["fp8", "fp4"])
+def test_per_rank_scatter_rides_with_the_quantized_combine_wire(wire):
     shape = (4, 7168, 8, 16, 8)
-    compact = _config(D.COMPACT, C.FUSED_SCATTER, "fp4", ("bf16",), *shape)
-    mori = _config(D.MORI, C.FUSED_SCATTER, "bf16", ("bf16",), *shape)
-    assert compact.stage1_fused and compact.per_rank_scatter
-    assert not mori.stage1_fused and not mori.per_rank_scatter
-    monkeypatch.setenv("AITER_MEGA_PER_RANK_SCATTER", "0")
-    off = _config(D.COMPACT, C.FUSED_SCATTER, "fp4", ("bf16",), *shape)
-    assert off.stage1_fused and not off.per_rank_scatter
+    bits = {"fp8": 8, "fp4": 4}[wire]
+    quant = _config(D.COMPACT, C.FUSED_SCATTER, "fp4", ("bf16", wire), *shape)
+    assert quant.per_rank_scatter
+    assert quant.per_rank_scatter_for(bits) and not quant.per_rank_scatter_for(0)
+    bf16 = _config(D.COMPACT, C.FUSED_SCATTER, "fp4", ("bf16",), *shape)
+    mori = _config(D.MORI, C.FUSED_SCATTER, "fp4", ("bf16", wire), *shape)
+    for config in (bf16, mori):
+        assert not config.per_rank_scatter
+        assert not config.per_rank_scatter_for(bits)
+
+
+def test_combine_refuses_a_layout_planned_for_another_wire():
+    config = _config(
+        D.COMPACT, C.FUSED_SCATTER, "fp4", ("bf16", "fp4"), 4, 7168, 8, 16, 8
+    )
+    stage = recipe._stage_classes(config.recipe)[1](config, None)
+    view = torch.zeros(1, dtype=torch.int32)
+    gathered = Routing(token_count=1, reverse_source_view=view)
+    dense = Routing(token_count=1, reverse_source_view=view, comb_slot=view)
+    assert stage._check_layout(dense, 4)
+    assert not stage._check_layout(gathered, 0)
+    with pytest.raises(ValueError, match="needs the dense comb_inp layout"):
+        stage._check_layout(gathered, 4)
+    with pytest.raises(ValueError, match=r"needs the tok\*topk \+ k comb_inp layout"):
+        stage._check_layout(dense, 0)
+
+
+def test_scatter_context_refuses_a_bf16_per_rank_scatter():
+    with pytest.raises(ValueError, match="runs on a quantized combine wire"):
+        Stage2ScatterContext(
+            arena_handle=0,
+            combine_input_offset=0,
+            slot_stride_bytes=16,
+            max_tokens_per_rank=1,
+            world_size=4,
+            source_token_map=torch.zeros(1, dtype=torch.int32),
+            per_rank_scatter=True,
+        )
 
 
 def _cases():

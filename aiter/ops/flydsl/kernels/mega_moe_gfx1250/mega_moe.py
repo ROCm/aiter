@@ -235,9 +235,16 @@ class MegaMoEGfx1250:
             max_tokens_per_rank=max_tokens_per_rank,
         )
         if stage1_fused:
+            # Every combine wire: a quantized one adds the per-rank scatter's
+            # padded slots and scale region.
             candidates = [
-                MegaMoERecipe(dispatch=DispatchKind.COMPACT, dispatch_wire=wire)
+                MegaMoERecipe(
+                    dispatch=DispatchKind.COMPACT,
+                    dispatch_wire=wire,
+                    combine_wires=wires,
+                )
                 for wire in ("fp8", "fp4")
+                for wires in (("bf16",), ("bf16", "fp8"), ("bf16", "fp4"))
             ]
         else:
             candidates = [
@@ -330,7 +337,9 @@ class MegaMoEGfx1250:
         on the wire to pay for it and leave the rest on bf16. Omitting it means
         bf16 -- building a format only makes it available, each step still has to
         ask for it. ``combine_quant`` is the same choice in the older spelling
-        (none / mxfp8 / mxfp4).
+        (none / mxfp8 / mxfp4). On the compact plan a quantized step also runs
+        gemm2's per-rank scatter and a bf16 step its gather scatter, so every
+        rank of a step must name the same wire.
 
         ``recv_counter_is_zero`` is accepted and ignored: the dispatch
         overwrites the received count, so there is no reset to skip.
@@ -361,7 +370,11 @@ class MegaMoEGfx1250:
                 hook = disp.fusion.gemm1
             elif disp.fusion.should_probe():
                 hook = disp.fusion.probe
-            step_kw = {"begin_step": False, "s1f": s1f}
+            step_kw = {
+                "begin_step": False,
+                "s1f": s1f,
+                "combine_quant_bits": quant_bits,
+            }
         batch = ep.dispatch(
             hidden_states,
             topk_weights,
@@ -589,11 +602,20 @@ class MegaMoEGfx1250:
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
         recv_counter_is_zero: bool = False,
+        combine_quant_bits: int = 0,
     ):
         """Dispatch alone: (recv_x, recv_weights, recv_indices, total_recv,
-        routing), each over the arena's full recv rows."""
+        routing), each over the arena's full recv rows.
+
+        ``combine_quant_bits`` is the wire the matching ``_combine`` runs on;
+        the compact plan lays comb_inp out for it."""
         ep = self._ep
-        batch = ep.dispatch(hidden_states, topk_weights, topk_ids, begin_step=False)
+        step = {}
+        if isinstance(ep._dispatch, _CompactDispatch):
+            step["combine_quant_bits"] = combine_quant_bits
+        batch = ep.dispatch(
+            hidden_states, topk_weights, topk_ids, begin_step=False, **step
+        )
         return (*ep.recv_views(), ep.total_recv, batch.routing)
 
     def _recv_dispatch_scales(self) -> torch.Tensor | None:

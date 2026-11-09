@@ -90,8 +90,9 @@ class _EpDispatcher:
         return self._dispatch.recv_views()
 
     def dispatch(self, hidden_states, topk_weights, topk_ids, **step) -> _DispatchBatch:
-        """``step`` is recv_token_bound and begin_step, as the dispatch stage
-        takes them."""
+        """``step`` is recv_token_bound and begin_step, plus s1f and
+        combine_quant_bits on the compact plan, as the dispatch stage takes
+        them."""
         return self._dispatch.dispatch(hidden_states, topk_weights, topk_ids, **step)
 
     def prepare(self, batch: _DispatchBatch, quant_bits: int) -> _ComputeTarget:
