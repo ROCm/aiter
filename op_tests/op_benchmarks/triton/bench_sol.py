@@ -461,7 +461,14 @@ def run_recipe(name, recipe, degree, tokens, args):
         for sparsity in args.sparsity:
             torch.manual_seed(int(sparsity * 1000))
             mask = (
-                torch.rand(1, heads, num_q_tiles, num_kv_blocks, device="cuda")
+                torch.rand(
+                    1,
+                    heads,
+                    num_q_tiles,
+                    num_kv_blocks,
+                    device="cuda",
+                    dtype=torch.float32,
+                )
                 > sparsity
             )
             point = time_point(
