@@ -53,18 +53,21 @@ def worker(rank, world):
     dist.init_process_group("nccl", rank=rank, world_size=world)
     group = _Group(dist.new_group(backend="gloo"), rank, world)
     try:
-        tokens, hl = 8, 12
+        tokens, hl = int(os.environ.get("TOKENS", "8")), 12
+        max_tokens = max(tokens, 64)
         gen = torch.Generator(device="cuda")
         gen.manual_seed(100 + rank)
-        # Request 1 has no KV on every third rank; rows 6 and 7 are graph padding.
-        qsl = torch.tensor([0, 3, 6], device="cuda", dtype=torch.int32)
+        # Request 1 has no KV on every third rank; the last two rows are padding.
+        qsl = torch.tensor(
+            [0, tokens // 2, tokens - 2], device="cuda", dtype=torch.int32
+        )
         seq_lens = torch.tensor(
             [5, 0 if rank % 3 == 0 else 7], device="cuda", dtype=torch.int32
         )
         # dim 128 runs the debug build: epoch push and bounded poll.
         for dim, debug in ((64, False), (128, True), (512, False), (576, False)):
             cws = CombineWorkspace(
-                group, torch.device("cuda"), hl, dim, 64, debug=debug
+                group, torch.device("cuda"), hl, dim, max_tokens, debug=debug
             )
             for base_e in (True, False):
                 for masked in (False, True):
@@ -115,7 +118,13 @@ def worker(rank, world):
 
         dim = 512
         gws = GatherWorkspace(
-            group, torch.device("cuda"), hl, dim, torch.bfloat16, world * hl, 64
+            group,
+            torch.device("cuda"),
+            hl,
+            dim,
+            torch.bfloat16,
+            world * hl,
+            max_tokens,
         )
         query = torch.randn(
             tokens, hl, dim, device="cuda", dtype=torch.bfloat16, generator=gen
@@ -130,7 +139,13 @@ def worker(rank, world):
         nope_w, pe_w = 512, 64
         qdim = nope_w + pe_w
         qws = GatherWorkspace(
-            group, torch.device("cuda"), hl, qdim, torch.float8_e4m3fn, world * hl, 64
+            group,
+            torch.device("cuda"),
+            hl,
+            qdim,
+            torch.float8_e4m3fn,
+            world * hl,
+            max_tokens,
         )
         nope = torch.randn(
             tokens, hl, nope_w, device="cuda", dtype=torch.bfloat16, generator=gen

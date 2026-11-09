@@ -5,10 +5,11 @@
 """DCP LSE combine as one FlyDSL mailbox launch.
 
 Each rank pushes every peer's head and LSE as tagged pairs. Each rank polls
-its own heads and applies the LSE weights. One CTA owns one (token, local head)
-and each of its ``dim / 4`` threads owns four values of the head.
+its own heads and applies the LSE weights. One CTA owns one or more tokens for
+one local head, and each of its ``dim / 4`` threads owns four head values.
 """
 
+import os
 from dataclasses import dataclass
 
 import flydsl.compiler as flyc
@@ -65,6 +66,18 @@ class CombineBuild:
     base_e: bool
     ret_lse: bool
     debug: bool
+    token_tile: int
+
+
+def _token_tile(tokens):
+    override = int(os.environ.get("AITER_DCP_MAILBOX_TOKEN_TILE", "0"))
+    if override > 0:
+        return override
+    if tokens >= 192:
+        return 8
+    if tokens >= 96:
+        return 4
+    return 2 if tokens >= 48 else 1
 
 
 def peer_layout(ranks, max_tokens, heads, dim):
@@ -224,14 +237,15 @@ def build(key: CombineBuild):
     n, hl, d, mt = key.ranks, key.heads, key.dim, key.max_tokens
     words = d // 2
     threads = d // 4
-    nblk = key.tokens * hl
+    tile = key.token_tile
+    nblk = ((key.tokens + tile - 1) // tile) * hl
     lay = peer_layout(n, mt, hl, d)
     half = pair_span(lay)
     keyed = key_tuple(key)
     name = (
         f"aiter_dcp_lse_combine_t{key.tokens}_n{n}_h{hl}_d{d}_m{mt}"
         f"_s{key.seqs}_e{int(key.base_e)}_l{int(key.ret_lse)}"
-        f"_g{int(key.debug)}"
+        f"_g{int(key.debug)}_bt{tile}"
     )
 
     @flyc.kernel(name=name, known_block_size=[threads, 1, 1])
@@ -255,7 +269,7 @@ def build(key: CombineBuild):
         _ = keyed
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
-        b = bid // hl
+        first_b = (bid // hl) * tile
         lh = bid % hl
         e = wave_uniform_i32(buffer_load_i32(state, 0, cache_modifier=CACHE_DEVICE))
         flip = fx.Int64(e % 2) * half
@@ -287,57 +301,60 @@ def build(key: CombineBuild):
         ]
         own_data = tagged_shift(tagged_peer_address(own, lay["data"][0]), flip)
         own_lse = tagged_shift(tagged_peer_address(own, lay["lse"][0]), flip)
-        slot = (rank * mt + b) * hl + lh
         j = tid * 2
-        ws = [
-            fx.Vector(
-                bo.buffer_load(
-                    buffer_resource(out),
-                    (b * out_sb + (dest * hl + lh) * out_sh) // 2 + j,
-                    vec_width=2,
-                    dtype=T.i32,
+        for token_offset in range_constexpr(tile):
+            b = first_b + token_offset
+            if b < key.tokens:
+                slot = (rank * mt + b) * hl + lh
+                ws = [
+                    fx.Vector(
+                        bo.buffer_load(
+                            buffer_resource(out),
+                            (b * out_sb + (dest * hl + lh) * out_sh) // 2 + j,
+                            vec_width=2,
+                            dtype=T.i32,
+                        )
+                    )
+                    for dest in range(n)
+                ]
+                lv = [
+                    fx.Float32(
+                        bo.buffer_load(
+                            buffer_resource(lse),
+                            b * lse_sb + (dest * hl + lh) * lse_sh,
+                            vec_width=1,
+                            dtype=T.f32,
+                        )
+                    )
+                    for dest in range(n)
+                ]
+                for dest in range_constexpr(n):
+                    put_words(data[dest], slot * words + j, [ws[dest][0], ws[dest][1]])
+                if const_expr(key.seqs > 0):
+                    empty = _row_empty(b, key.seqs, seq_lens, qsl)
+                    for dest in range_constexpr(n):
+                        lv[dest] = empty.select(fx.Float32(NEG_INF), lv[dest])
+                for dest in range_constexpr(n):
+                    if tid == dest:
+                        put(lsep[dest], slot, lv[dest])
+                _poll_combine(
+                    poll,
+                    own_lse,
+                    own_data,
+                    n,
+                    mt,
+                    hl,
+                    words,
+                    b,
+                    lh,
+                    tid,
+                    key.base_e,
+                    key.ret_lse,
+                    res,
+                    res_sb,
+                    res_sh,
+                    res_lse,
                 )
-            )
-            for dest in range(n)
-        ]
-        lv = [
-            fx.Float32(
-                bo.buffer_load(
-                    buffer_resource(lse),
-                    b * lse_sb + (dest * hl + lh) * lse_sh,
-                    vec_width=1,
-                    dtype=T.f32,
-                )
-            )
-            for dest in range(n)
-        ]
-        for dest in range_constexpr(n):
-            put_words(data[dest], slot * words + j, [ws[dest][0], ws[dest][1]])
-        if const_expr(key.seqs > 0):
-            empty = _row_empty(b, key.seqs, seq_lens, qsl)
-            for dest in range_constexpr(n):
-                lv[dest] = empty.select(fx.Float32(NEG_INF), lv[dest])
-        for dest in range_constexpr(n):
-            if tid == dest:
-                put(lsep[dest], slot, lv[dest])
-        _poll_combine(
-            poll,
-            own_lse,
-            own_data,
-            n,
-            mt,
-            hl,
-            words,
-            b,
-            lh,
-            tid,
-            key.base_e,
-            key.ret_lse,
-            res,
-            res_sb,
-            res_sh,
-            res_lse,
-        )
         _finish(tid, state, e, nblk)
 
     return _jit(key, combine, nblk, threads, keyed)
@@ -472,6 +489,7 @@ def dcp_lse_combine(
         base_e=base_e,
         ret_lse=return_lse,
         debug=ws.debug,
+        token_tile=_token_tile(tokens),
     )
     build(key)(
         out.data_ptr(),

@@ -66,9 +66,10 @@ def worker(rank, world):
     dist.init_process_group("nccl", rank=rank, world_size=world)
     group = _Group(dist.new_group(backend="gloo"), rank, world)
     try:
-        tokens, hl = 16, 12
+        tokens, hl = int(os.environ.get("TOKENS", "16")), 12
+        max_tokens = max(tokens, 64)
         for dim in (128, 512, 576):
-            cws = CombineWorkspace(group, torch.device("cuda"), hl, dim, 64)
+            cws = CombineWorkspace(group, torch.device("cuda"), hl, dim, max_tokens)
             out = torch.randn(
                 tokens, world * hl, dim, device="cuda", dtype=torch.bfloat16
             )
@@ -86,7 +87,13 @@ def worker(rank, world):
             cws.close()
         dim = 512
         gws = GatherWorkspace(
-            group, torch.device("cuda"), hl, dim, torch.bfloat16, world * hl, 64
+            group,
+            torch.device("cuda"),
+            hl,
+            dim,
+            torch.bfloat16,
+            world * hl,
+            max_tokens,
         )
         query = torch.randn(tokens, hl, dim, device="cuda", dtype=torch.bfloat16)
         gather_us, gather_spread = _graph_us(lambda: dcp_query_gather(gws, query))
@@ -106,7 +113,7 @@ def worker(rank, world):
             nope_dim + pe_dim,
             torch.float8_e4m3fn,
             world * hl,
-            64,
+            max_tokens,
         )
         nope = torch.randn(tokens, hl, nope_dim, device="cuda", dtype=torch.bfloat16)
         pe = torch.randn(tokens, hl, pe_dim, device="cuda", dtype=torch.bfloat16)
