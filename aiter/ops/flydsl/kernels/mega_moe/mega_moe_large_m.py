@@ -3124,8 +3124,11 @@ class LargeMRuntime:
             self.state_slots, 2, dtype=torch.int32, device=self.dev
         )
         self._s1_num_cu = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+        # The pair order is rank-local, and a launch reads only the entries its own routes wrote, so the layer
+        # slots share one copy.
+        pair_order = self._allocate_pair_order()
         self._s1_dispatch_workspaces = [
-            self._allocate_dispatch_workspace(op, metadata_blocks)
+            self._allocate_dispatch_workspace(op, metadata_blocks, pair_order)
             for _ in range(self.state_slots)
         ]
         torch.cuda.synchronize()
@@ -3149,17 +3152,20 @@ class LargeMRuntime:
         self._s1_out, self._s1_osd = stage1_output_buffers(
             self._s1_nvm, self.inter_dim, self.dev, arena=self._s1_output_arena
         )
-    def _allocate_dispatch_workspace(self, op, metadata_blocks):
+    def _allocate_pair_order(self):
+        # Per-expert buckets of mtpr routes for bucket_pairs, else mtpr * topk routes.
+        routes = self.mtpr * self.topk
+        if self._select_config(self.mtpr).fused_stage1.bucket_pairs:
+            routes = max(routes, self.world_size * self.epr * self.mtpr)
+        return torch.empty(routes, dtype=torch.int32, device=self.dev)
+
+    def _allocate_dispatch_workspace(self, op, metadata_blocks, pair_order):
         total_experts = self.world_size * self.epr
         knobs = self._select_config(self.mtpr).fused_stage1
-        # Per-expert buckets of mtpr routes for bucket_pairs, else mtpr * topk routes.
-        pair_order_routes = self.mtpr * self.topk
-        if knobs.bucket_pairs:
-            pair_order_routes = max(pair_order_routes, total_experts * self.mtpr)
         workspace = {
             "local_hist": torch.zeros(total_experts, dtype=torch.int32, device=self.dev),
             "local_cursor": torch.zeros(total_experts, dtype=torch.int32, device=self.dev),
-            "pair_order": torch.empty(pair_order_routes, dtype=torch.int32, device=self.dev),
+            "pair_order": pair_order,
             "pair_base": torch.empty(total_experts, dtype=torch.int32, device=self.dev),
             "pair_ready": torch.zeros(2, dtype=torch.int32, device=self.dev),
             "entry_count": torch.zeros(10, dtype=torch.int64, device=self.dev),
