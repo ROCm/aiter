@@ -295,11 +295,28 @@ jobs:
           echo "Docker login failed after 3 attempts, continuing anyway"
           exit 0
 
+      - name: Pull Aiter build image
+        if: ${{ matrix.build_enabled && steps.restore_aiter_wheel.outputs.cache-hit != 'true' }}
+        env:
+          DOCKER_IMAGE: ${{ matrix.docker_image }}
+          DOCKER_PULL_MAX_ATTEMPTS: "5"
+          DOCKER_PULL_RETRY_DELAY_SECONDS: "60"
+        run: |
+          set -euo pipefail
+          # Fork PRs intentionally have no registry credentials. Reuse the
+          # runner's pinned image when present; otherwise tolerate transient
+          # registry throttling without retrying the whole wheel build.
+          if docker image inspect "${DOCKER_IMAGE}" >/dev/null 2>&1; then
+            echo "Using locally cached build image: ${DOCKER_IMAGE}"
+          else
+            bash .github/scripts/docker_pull_with_retry.sh "${DOCKER_IMAGE}"
+          fi
+
       - name: Build Aiter wheel in base container
         if: ${{ matrix.build_enabled && steps.restore_aiter_wheel.outputs.cache-hit != 'true' }}
         run: |
           set -euo pipefail
-          docker run --rm \
+          docker run --rm --pull=never \
             --network=host \
             -e AITER_PREBUILD_MAX_JOBS="${{ env.AITER_PREBUILD_MAX_JOBS }}" \
             -e AITER_RUNNER_NAME="${RUNNER_NAME:-unknown}" \

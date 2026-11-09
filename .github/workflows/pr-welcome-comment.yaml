@@ -33,7 +33,7 @@ jobs:
             | \`ci:gfx1250-ffm-triton\` | Run the five-shard gfx1250 FFM Triton test suite |
             | \`ci:triton-300x\` | Run an additional Triton test job on MI300X in PRs (added automatically when gfx942 configs change); main branch always runs both MI35X and MI300X |
             | \`ci:triton-355\` | Run the full Triton test suite on MI35X, not only the tests the change affects |
-            | \`ci:windows\` | Windows JIT op smoke test on the gfx1201 ROCm runner |
+            | \`ci:windows\` | Windows JIT op smoke test on the Radeon R9700 ROCm runner |
             | \`ci:multi-gpu\` | Aiter multi-GPU tests on the 8-GPU runner |
             | \`ci:sglang\` | SGLang integration tests: DeepSeek-R1-MXFP4 accuracy, Qwen 3.5 accuracy |
             | \`ci:atom\` | ATOM benchmark: DeepSeek-R1-0528, GPT-OSS-120B |
@@ -48,5 +48,8 @@ jobs:
             A PR changes one kernel backend: \`[Triton/Gluon]\` (Triton and Gluon count as one), \`[HIP]\`, \`[ASM]\`, \`[CK]\`, \`[OPUS]\` or \`[FlyDSL]\`. If the title ends up with two backend tags, split the PR -- as [stacked pull requests](https://docs.github.com/en/pull-requests/get-started/about-stacked-prs) when one part cannot merge without the other.
 
             **PR title tags & labels:**
-            Component tags (\`[Triton/Gluon]\`, \`[HIP]\`, \`[CK]\`, \`[ASM]\`, ...) are added to the PR title and as PR labels automatically from the changed files and re-synced on every push — change-type tags like \`[fix]\`/\`[Perf]\`, op tags like \`[MLA]\`, and human labels (\`ci:*\`) are left untouched. Add the \`no-auto-title\` label to stop the title rewrites; labels stay in sync either way.`
+            Component tags (\`[Triton/Gluon]\`, \`[HIP]\`, \`[CK]\`, \`[ASM]\`, ...) are added to the PR title and as PR labels automatically from the changed files and re-synced on every push — change-type tags like \`[fix]\`/\`[Perf]\`, op tags like \`[MLA]\`, and human labels (\`ci:*\`) are left untouched. Add the \`no-auto-title\` label to stop the title rewrites; labels stay in sync either way.
+
+            **Reviews:**
+            A reviewer is usually assigned within one working day after the PR is ready for review (see [Code Review Process](https://github.com/ROCm/aiter/blob/main/CONTRIBUTE.md#code-review-process)). If nobody has responded for about a week, mention the area contact listed in [CONTACTS.md](https://github.com/ROCm/aiter/blob/main/CONTACTS.md). Want to help review? See [REVIEWERS.md](https://github.com/ROCm/aiter/blob/main/REVIEWERS.md).`
             });

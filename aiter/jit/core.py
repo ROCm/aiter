@@ -235,6 +235,11 @@ AITER_CONFIG_CONV3D_BF16 = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/bf16_tuned_conv3d.csv",
 )
 
+AITER_CONFIG_MQA_LOGITS = os.getenv(
+    "AITER_CONFIG_MQA_LOGITS",
+    f"{AITER_ROOT_DIR}/aiter/configs/tuned_mqa_logits.csv",
+)
+
 # K5 opt BV tuned config. Per-model tuned rows live under model_configs/
 # (qwen3_5_*_chunk_gdn_h_opt_tuned.csv) and get merged into this canonical file by
 # get_config_file. It ships header-only: with no per-model table present
@@ -437,6 +442,14 @@ class AITER_CONFIG:
     def AITER_CONFIG_CONV3D_BF16_FILE(self):
         return self.get_config_file(
             "AITER_CONFIG_CONV3D_BF16", AITER_CONFIG_CONV3D_BF16, "bf16_tuned_conv3d"
+        )
+
+    @property
+    def AITER_CONFIG_MQA_LOGITS_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_MQA_LOGITS",
+            AITER_CONFIG_MQA_LOGITS,
+            "tuned_mqa_logits",
         )
 
     @property
@@ -1372,12 +1385,17 @@ def _build_archs_from_env(detect_gfx) -> list[str]:
     return explicit or [detect_gfx()]
 
 
-def _cluster_launch_target(detect_gfx) -> bool:
-    """True when any targeted arch wants -DAITER_ENABLE_CLUSTER_LAUNCH."""
+def _targets_gfx1250(detect_gfx) -> bool:
+    """True when any targeted arch is gfx1250 or gfx1250-strict."""
     return any(
         arch in ("gfx1250", "gfx1250-strict")
         for arch in _build_archs_from_env(detect_gfx)
     )
+
+
+def _cluster_launch_target(detect_gfx) -> bool:
+    """True when any targeted arch wants -DAITER_ENABLE_CLUSTER_LAUNCH."""
+    return _targets_gfx1250(detect_gfx)
 
 
 def build_module(
@@ -1507,6 +1525,11 @@ def build_module(
         # path was compiled out (AiterAsmKernelFast then rejects them at launch).
         if _cluster_launch_target(get_gfx) and hip_version >= Version("7.0.0"):
             flags_hip += ["-DAITER_ENABLE_CLUSTER_LAUNCH"]
+        # CK's CMakeLists forces the unified ck_tile framework off for any build that
+        # targets gfx1250, which it does not support yet; the JIT bypasses that CMake.
+        # It has to be a whole-TU define so the host and device passes agree.
+        if _targets_gfx1250(get_gfx):
+            flags_hip += ["-DUSE_NEW_UNIFIED_FRAMEWORK=0"]
 
         if not torch_exclude:
             import torch
