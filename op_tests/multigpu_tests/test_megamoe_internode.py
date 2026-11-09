@@ -21,8 +21,9 @@ case runs in that process, largest TPR first:
   check      fused eager output vs the MORI A4W4 reference built on the same
              weights (relL2), then CUDA-graph replays vs eager, with changed
              inputs and swapped routing in between (--no-check skips all)
-  total      bench_mega_moe.py timing: each replay is synchronized and timed
-             with the host clock; per-rank min/median, mean over ranks
+  total      GPU events around the full graph replay, including quantization
+             and communication; per-rank min/median, mean over all 16 ranks.
+             Mega and SmallOp use the same warmup and sampling procedure
   breakdown  fused only: torch.profiler over --prof-replays more replays;
              per-kernel rows from the last --prof-tail of them.  The small-op
              graph is not profiled: under torch.profiler its replay now and then
@@ -601,16 +602,15 @@ def shared_inputs(shape, rank, device, *, route_pattern, seed, prepared_weights)
         0.6,
         device,
     )
-    if seed != 1234:
+    balanced = route_pattern in ("cross_node", "eplb-balanced")
+    if seed != 1234 or balanced:
         generator = torch.Generator(device=device).manual_seed(seed + rank)
         x.normal_(generator=generator)
-    if route_pattern in ("cross_node", "eplb-balanced"):
+    if balanced:
         if route_pattern == "cross_node" and shape.topk != shape.ep_size:
             raise ValueError("cross_node needs topk == ep_size; use eplb-balanced")
         if shape.topk % 2 or shape.topk // 2 > shape.gpus_per_node:
             raise ValueError("eplb routing needs even topk <= 2 * gpus_per_node")
-        generator = torch.Generator(device=device).manual_seed(seed + rank)
-        x.normal_(generator=generator)
         topk_ids, route_weights = _balanced_routes(
             shape,
             rank,
@@ -723,21 +723,7 @@ def coalesce_reference_routes(ids, weights, *, experts_per_rank, num_experts):
 # --------------------------------------------------------------------------
 
 
-def stage1_tile(net, tpr):
-    from aiter.ops.flydsl.kernels.mega_moe_internode.mega_moe_internode_config import (
-        resolve_stage1_tile,
-    )
-
-    return resolve_stage1_tile(
-        token=tpr * net["topk"],
-        model_dim=net["model_dim"],
-        inter_dim=net["inter_dim"],
-        expert=net["experts"] // EP_SIZE,
-        topk=net["topk"],
-    )
-
-
-def stage2_tile(net, tpr):
+def stage2_tile(net, tpr, s1):
     """GEMM2 (kernel1) N tile, resolved exactly as the operator does."""
     from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
     from aiter.ops.flydsl.kernels.mega_moe_internode.mega_moe_internode_config import (
@@ -766,7 +752,6 @@ def stage2_tile(net, tpr):
         if bn_source == cu_source
         else f"gemm2_bn={bn_source},gemm2_cu={cu_source}"
     )
-    s1 = stage1_tile(net, tpr)
     fused = resolve_stage2_fused(tpr)
     remote_first = bool(fused and s1["split_local"])
     sdma, comm_source = resolve_stage2_sdma(tpr, tuned)
@@ -974,40 +959,32 @@ class MoriSmallOp:
         self.situ_linear_beta = float(situ_linear_beta)
         self._native_a8_reference = quant == "a8w4" and separated_weights
         self.blocks, self.rdma_blocks = MORI_BLOCKS[quant]
+        w = shared.prepared_weights
+        self.weights = (
+            (w.w1, w.w1_scale, w.w2, w.w2_scale)
+            if quant == "a4w4" or separated_weights
+            else a8w4_weights
+        )
+        self.activation = (
+            aiter.ActivationType.Situv2
+            if shape.activation == "situv2"
+            else aiter.ActivationType.Silu
+        )
+        self.gate_mode = (
+            GateMode.SEPARATED.value
+            if quant == "a4w4" or separated_weights
+            else GateMode.INTERLEAVE.value
+        )
         if quant == "a4w4":
             from aiter.ops.quant import dynamic_per_group_scaled_quant
 
             self._quant_op = dynamic_per_group_scaled_quant
-            w = shared.prepared_weights
-            self.weights = (w.w1, w.w1_scale, w.w2, w.w2_scale)
             data_type = shared.a_quant.dtype
-            self.activation = (
-                aiter.ActivationType.Situv2
-                if shape.activation == "situv2"
-                else aiter.ActivationType.Silu
-            )
-            self.gate_mode = GateMode.SEPARATED.value
         else:
             from aiter.ops.flydsl.kernels.mega_moe.quant import per_1x32_mx_quant
 
             self._quant_op = per_1x32_mx_quant
-            w = shared.prepared_weights
-            self.weights = (
-                (w.w1, w.w1_scale, w.w2, w.w2_scale)
-                if separated_weights
-                else a8w4_weights
-            )
             data_type = torch.float8_e4m3fn
-            self.activation = (
-                aiter.ActivationType.Situv2
-                if shape.activation == "situv2"
-                else aiter.ActivationType.Silu
-            )
-            self.gate_mode = (
-                GateMode.SEPARATED.value
-                if separated_weights
-                else GateMode.INTERLEAVE.value
-            )
         self.swiglu_limit = float(swiglu_limit)
         self._fused_moe = fused_moe
         config = mori.ops.EpDispatchCombineConfig(
@@ -1205,17 +1182,20 @@ def capture_graph(torch, dist, fn, device):
 
 
 def time_replays(torch, dist, graph, device, warmup, iters):
-    """bench_mega_moe.py: one sample = replay + synchronize, host wall clock (us)."""
+    """Full-forward GPU event samples in microseconds, identical for both paths."""
     for _ in range(warmup):
         graph.replay()
     torch.cuda.synchronize(device)
     dist.barrier()
     samples = []
+    begin = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
     for _ in range(iters):
-        t0 = time.perf_counter()
+        begin.record()
         graph.replay()
-        torch.cuda.synchronize(device)
-        samples.append((time.perf_counter() - t0) * 1e6)
+        end.record()
+        end.synchronize()
+        samples.append(begin.elapsed_time(end) * 1000)
     dist.barrier()
     return samples
 
@@ -1240,10 +1220,13 @@ REPLAY_MARK = re.compile(r"megamoe_replay(\d+)$")
 
 
 def profile_breakdown(torch, graph, device, replays, tail, trace_file):
-    """Per-rank minimum of each row over the last ``tail`` profiled replays.
+    """Stage durations from the same complete replay with minimum kernel sum.
 
-    Returns (rows, kernel names) or (None, error) when the profiler recorded
-    none of those replays; it drops one now and then, so a partial window is used.
+    Select within the last ``tail`` replays on each rank. Stage2 includes
+    GEMM2 and combine; its kernel sum excludes gaps between separate launches.
+    The quant + Stage1 + Stage2 sum is a profiled measurement; the independent
+    GPU-event total is used for the SmallOp comparison. Incomplete profiler
+    replays are skipped. Single-kernel mode exposes only its combined duration.
     """
     from torch.profiler import ProfilerActivity, profile, record_function
 
@@ -1280,32 +1263,39 @@ def profile_breakdown(torch, graph, device, replays, tail, trace_file):
             key = kernel_class(e["name"])
             row[key] = row.get(key, 0.0) + float(e["dur"])
             names.add(e["name"])
+        if "quant" not in row:
+            continue
+        if "one" in row:
+            row["device_total"] = row["quant"] + row["one"]
+        elif "stage1" in row and ("stage2" in row or ("gemm2" in row and "k2" in row)):
+            if "stage2" not in row:
+                row["stage2"] = row["gemm2"] + row["k2"]
+            row["device_total"] = row["quant"] + row["stage1"] + row["stage2"]
+        else:
+            continue
+        row["kernel_sum"] = sum(float(e["dur"]) for e in active)
         ends = [float(e["ts"]) + float(e["dur"]) for e in active]
         row["span"] = max(ends) - min(float(e["ts"]) for e in active)
-        # Stage2 = first GEMM2 (k1) start to last k2 end, gaps included.
-        first = [float(e["ts"]) for e in active if kernel_class(e["name"]) == "gemm2"]
-        last = [
-            float(e["ts"]) + float(e["dur"])
-            for e in active
-            if kernel_class(e["name"]) == "k2"
-        ]
-        if first and last:
-            row["stage2"] = max(last) - min(first)
         samples.append(row)
     if not samples:
-        return None, "no kernels inside the profiled replays"
-    keys = set.intersection(*(set(s) for s in samples))
-    return {k: min(s[k] for s in samples) for k in keys}, sorted(names)
+        return None, "no complete quant/Stage1/Stage2 replay was recorded"
+    return min(samples, key=lambda row: row["kernel_sum"]), sorted(names)
 
 
-def wall_stats(rank_samples):
+def gpu_stats(rank_samples):
+    """Preserve every rank's samples and summarize full-forward GPU latency."""
     mins = [min(s) for s in rank_samples]
-    medians = [sorted(s)[len(s) // 2] for s in rank_samples]
+    medians = [statistics.median(s) for s in rank_samples]
     return {
+        "metric": "full-forward GPU events, including quantization and communication",
         "min": statistics.mean(mins),
         "median": statistics.mean(medians),
         "pooled_min": min(mins),
         "worst_median": max(medians),
+        "ranks": [
+            {"rank": rank, "samples_us": samples}
+            for rank, samples in enumerate(rank_samples)
+        ],
     }
 
 
@@ -1338,8 +1328,10 @@ class Runner:
         )
         if world != EP_SIZE:
             raise ValueError(f"EP16 needs {EP_SIZE} ranks, got {world}")
+        from aiter import logger
+
         self.tune_log = TuneLog()
-        logging.getLogger("aiter").addHandler(self.tune_log)
+        logger.addHandler(self.tune_log)
         self.guard = all(
             item.partition("=")[0] in TILE_ENV_KEYS for item in args.env_set
         )
@@ -1501,30 +1493,27 @@ class Runner:
             vmm = 40 * 1024**3 if max(self.args.tprs) > 4096 else 16 * 1024**3
             self.comm = PooledCommunicator(self.rank, EP_SIZE, per_rank_vmm=vmm)
 
-        def make_op():
-            return MegaMoEInternode(
-                rank=self.rank,
-                world_size=EP_SIZE,
-                model_dim=shape.hidden,
-                inter_dim=shape.inter,
-                experts=shape.experts,
-                topk=shape.topk,
-                quant=args.fused_quant,
-                w1=w.w1,
-                w1_scale=w.w1_scale,
-                w2=w.w2,
-                w2_scale=w.w2_scale,
-                max_tok_per_rank=tokens,
-                swiglu_limit=self.net["swiglu_limit"],
-                act=shape.activation,
-                situ_beta=args.situ_beta,
-                situ_linear_beta=args.situ_linear_beta,
-                comm_quant=args.comm_quant,
-                communicator=self.comm,
-                max_routes_per_token_per_rank=cap,
-            )
-
-        op = make_op()
+        op = MegaMoEInternode(
+            rank=self.rank,
+            world_size=EP_SIZE,
+            model_dim=shape.hidden,
+            inter_dim=shape.inter,
+            experts=shape.experts,
+            topk=shape.topk,
+            quant=args.fused_quant,
+            w1=w.w1,
+            w1_scale=w.w1_scale,
+            w2=w.w2,
+            w2_scale=w.w2_scale,
+            max_tok_per_rank=tokens,
+            swiglu_limit=self.net["swiglu_limit"],
+            act=shape.activation,
+            situ_beta=args.situ_beta,
+            situ_linear_beta=args.situ_linear_beta,
+            comm_quant=args.comm_quant,
+            communicator=self.comm,
+            max_routes_per_token_per_rank=cap,
+        )
         res = {
             "quant": args.fused_quant,
             "act": op.act,
@@ -1537,7 +1526,7 @@ class Runner:
             ),
             "stage1_kernel": op.stage1_kernel_name,
             "stage1_tile": dict(op._s1_tile),
-            "stage2_tile": stage2_tile(self.net, tokens),
+            "stage2_tile": stage2_tile(self.net, tokens, op._s1_tile),
             "checks": [],
         }
         coalesce = fixture == "permuted"
@@ -1719,8 +1708,13 @@ class Runner:
             samples = time_replays(
                 self.torch, self.dist, graph, self.device, args.warmup, args.iters
             )
-            res["total"] = wall_stats(self.gather(samples))
+            res["total"] = gpu_stats(self.gather(samples))
         if profile and "breakdown" in args.timing:
+            if "total" not in args.timing:
+                for _ in range(args.warmup):
+                    graph.replay()
+                self.torch.cuda.synchronize(self.device)
+            self.dist.barrier()
             trace = self.out_root / f"{case}_rank{self.rank}.json"
             rows, names = profile_breakdown(
                 self.torch, graph, self.device, args.prof_replays, args.prof_tail, trace
@@ -1731,6 +1725,7 @@ class Runner:
                 res["breakdown"] = {
                     k: statistics.mean(r[k] for r in gathered) for k in keys
                 }
+                res["breakdown_ranks"] = gathered
                 res["kernel_names"] = names
             else:
                 res["breakdown_error"] = (
@@ -1831,7 +1826,8 @@ def print_case(net, args, rec):
     if ft or st:
         speed = f"  speedup {fmt_x(rec['compare']['speedup'])}" if ft and st else ""
         p(
-            f"  total     (us, per-rank min / median, mean over ranks)  "
+            f"  GPU total (us, full forward including quant and communication; "
+            f"per-rank min / median, mean over ranks)  "
             f"fused {fmt((ft or {}).get('min'))} / {fmt((ft or {}).get('median'))}"
             f"  | small-op {fmt((st or {}).get('min'))} / {fmt((st or {}).get('median'))}{speed}"
         )
@@ -1840,24 +1836,24 @@ def print_case(net, args, rec):
         p(f"  breakdown fused unavailable: {fused['breakdown_error']}")
     if fb:
         p(
-            f"  breakdown (us, fused, per-rank min over profiled replays "
-            f"{args.prof_replays - args.prof_tail}..{args.prof_replays - 1}, mean over ranks)"
+            f"  breakdown (us, GPU kernels; same minimum-kernel-sum replay per rank "
+            f"from {args.prof_replays - args.prof_tail}..{args.prof_replays - 1}, "
+            f"mean over ranks; profiling separate from GPU total)"
         )
         for label, key in (
             ("quant", "quant"),
             ("stage1", "stage1"),
-            ("GEMM2 (k1)", "gemm2"),
-            ("k2", "k2"),
             ("stage2", "stage2"),
+            ("quant+s1+s2", "device_total"),
             ("one kernel", "one"),
             ("replay span", "span"),
         ):
-            p(f"    {label:<12} {fmt(fb.get(key)):>8}")
+            if key in fb:
+                p(f"    {label:<12} {fmt(fb[key]):>8}")
     if small:
         t = small["tune"]
-        # fused_moe logs a lookup only the first time it sees a shape; a later
-        # case of the same TPR reuses that (already checked) selection.
-        state = "MISS" if t["misses"] else "HIT" if t["hits"] else "HIT (cached)"
+        # Cached metadata emits no lookup log, which alone cannot prove a hit.
+        state = "MISS" if t["misses"] else "HIT" if t["hits"] else "NO LOOKUP LOG"
         p(
             f"  small-op  {small['quant']} fused_moe tune {state} (hits={t['hits']} "
             f"misses={t['misses']}) csv={os.environ.get('AITER_CONFIG_FMOE')}"
@@ -1870,13 +1866,15 @@ def print_case(net, args, rec):
 
 def print_summary(args, results):
     print(
-        f"[SUMMARY] network={args.network} (us; total = per-rank min, mean over ranks; "
-        f"speedup = small-op / fused; stage1/stage2 = fused breakdown)",
+        f"[SUMMARY] network={args.network} (us; GPU totals include quantization and "
+        f"communication, mean of per-rank minima; speedup = SmallOp GPU / Mega GPU; "
+        f"quant/stage1/stage2/sum come from separate profiling)",
         flush=True,
     )
     print(
-        f"  {'TPR':>5} {'fixture':<9} {'check':<5} {'relL2':>8} {'fused':>8} "
-        f"{'small-op':>9} {'speedup':>8} {'f.stage1':>9} {'f.stage2':>9}",
+        f"  {'TPR':>5} {'fixture':<9} {'check':<5} {'relL2':>8} "
+        f"{'quant':>9} {'stage1':>9} {'stage2':>9} {'q+s1+s2':>9} "
+        f"{'Mega GPU':>9} {'SmallOp GPU':>11} {'speedup':>8}",
         flush=True,
     )
     for rec in results:
@@ -1898,9 +1896,10 @@ def print_summary(args, results):
         fb = fused.get("breakdown") or {}
         print(
             f"  {rec['tpr']:>5} {rec['fixture']:<9} {state:<5} "
-            f"{'-' if rel is None else f'{rel:.5f}':>8} {fmt(ft):>8} {fmt(st):>9} "
-            f"{fmt_x(rec['compare']['speedup']):>8} {fmt(fb.get('stage1')):>9} "
-            f"{fmt(fb.get('stage2')):>9}",
+            f"{'-' if rel is None else f'{rel:.5f}':>8} "
+            f"{fmt(fb.get('quant')):>9} {fmt(fb.get('stage1')):>9} "
+            f"{fmt(fb.get('stage2')):>9} {fmt(fb.get('device_total')):>9} "
+            f"{fmt(ft):>9} {fmt(st):>11} {fmt_x(rec['compare']['speedup']):>8}",
             flush=True,
         )
 
