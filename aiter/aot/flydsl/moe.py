@@ -176,7 +176,7 @@ def _is_grouped(row: dict) -> bool:
     """Served by FlyDSL's grouped GEMM: a row of the gfx1250 grouped table, or
     a gfx1250 deployment."""
     if row.get("deployment"):
-        return job_arch(row) == "gfx1250"
+        return is_gfx1250_family(job_arch(row))
     return (row.get("kernelName1") or "").strip().startswith("grouped_gemm")
 
 
