@@ -180,10 +180,21 @@ _TUNE_EXCLUDE_KERNEL_PATTERNS = [
 ]
 
 
+# These kernels' fused fp8 stage-1 output holds a few 32-value blocks of wrong
+# values on some runs and none on others, so one tuning run's check cannot rule
+# them out. Drop the entry once they are fixed.
+_TUNE_EXCLUDE_KERNEL_RES = [
+    re.compile(r"_afp8_wfp4_bf16_t32x128x256_w[234]_.*_fp8$"),
+]
+
+
 def _is_tune_excluded_kernel(kernel_name) -> bool:
-    """True if ``kernel_name`` matches any excluded-kernel pattern."""
+    """True if ``kernel_name`` matches an excluded-kernel pattern, from
+    AITER_FMOE_TUNE_EXCLUDE_KERNELS or the built-in list."""
     name = str(kernel_name or "")
-    return any(pat in name for pat in _TUNE_EXCLUDE_KERNEL_PATTERNS)
+    return any(pat in name for pat in _TUNE_EXCLUDE_KERNEL_PATTERNS) or any(
+        pattern.search(name) for pattern in _TUNE_EXCLUDE_KERNEL_RES
+    )
 
 
 def _all_finite(tensor: torch.Tensor) -> bool:
@@ -4300,6 +4311,8 @@ class FmoeTuner(TunerCommon):
                         ]
 
                 for s1_name, s1_params, is_fp4, is_fp8 in s1_variants:
+                    if _is_tune_excluded_kernel(s1_name):
+                        continue
                     s1_compare_fn = None
                     s1_ref_kwargs = {}
                     if is_splitk or is_fp4 or is_fp8:
@@ -4618,6 +4631,8 @@ class FmoeTuner(TunerCommon):
                 else:
                     s1_name = kname + "_fp4"
                     s1_params = {**kparams, "out_dtype": "fp4"}
+                if _is_tune_excluded_kernel(s1_name):
+                    continue
                 a1_key = (
                     "a1_qt_fp8_cast" if adtype == "fp8" and bdtype == "fp4" else "a1_qt"
                 )
