@@ -76,6 +76,7 @@ from aiter.ops.flydsl.moe_kernels import (
     get_flydsl_stage2_kernels_a16w16,
     get_flydsl_stage2_kernels_int4_bf16,
     get_flydsl_stage2_v2_kernels,
+    pick_flydsl_stage1_tile_n,
     runtime_swiglu_limit,
 )
 from aiter.ops.flydsl.mxfp4_kname import (
@@ -159,6 +160,22 @@ def _is_tune_excluded_kernel(kernel_name) -> bool:
     """True if ``kernel_name`` matches any excluded-kernel pattern."""
     name = str(kernel_name or "")
     return any(pat in name for pat in _TUNE_EXCLUDE_KERNEL_PATTERNS)
+
+
+def _flydsl_s1_tile_n_forced(a_dtype, b_dtype, inter_dim, tile_n) -> bool:
+    """True if flydsl_moe_stage1 would replace ``tile_n`` for this shape.
+
+    Mirrors resolve_flydsl_stage1_tile_n (a16w4 / a8w4 only): such a candidate
+    runs as its tile_n=pick_flydsl_stage1_tile_n(inter_dim) twin, which is in
+    the candidate set under its own name, so tuning it only times that kernel
+    twice and can record it under a tile it does not run.
+    """
+    if b_dtype != "fp4" or a_dtype not in ("bf16", "fp8"):
+        return False
+    return (
+        inter_dim % tile_n != 0
+        and inter_dim % pick_flydsl_stage1_tile_n(inter_dim) == 0
+    )
 
 
 def _all_finite(tensor: torch.Tensor) -> bool:
@@ -3952,6 +3969,10 @@ class FmoeTuner(TunerCommon):
                     # Match the kernel assert; a floor divide lets tile_n=96 through.
                     if kparams["tile_n"] % (16 * _n_waves) != 0:
                         continue
+                if _flydsl_s1_tile_n_forced(
+                    a_dtype_str, b_dtype_str, inter_dim, kparams["tile_n"]
+                ):
+                    continue
 
                 # (kernel_name, kparams, is_fp4, is_fp8)
                 # out_dtype encodes fused quant type: "fp4" or "fp8"
@@ -4291,6 +4312,10 @@ class FmoeTuner(TunerCommon):
                 if kparams.get("tile_m") != blockM:
                     continue
                 if kparams.get("k_batch", 1) != 1:
+                    continue
+                if _flydsl_s1_tile_n_forced(
+                    adtype, bdtype, inter_dim, kparams["tile_n"]
+                ):
                     continue
                 # Only the FUSED variant (v2 always fuses quant). Fused name and
                 # params exactly as gen_flydsl_2stages_task builds them.
