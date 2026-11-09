@@ -1662,6 +1662,10 @@ class SmallMRuntime:
             for k in (config.fused_stage1 for config in self._configs.values())
         }
         assert len(protocols) == 1, f"buckets disagree on the launch protocol: {protocols}"
+        # A tok_done reducer waits for valid routes x its own GEMM2 n-blocks on a token's counter, which the
+        # senders' GEMM2 scatter waves count up one per n-block: every tok_done bucket splits model_dim alike.
+        tok_done_block_n = {config.stage2.block_n for config in self._configs.values() if config.fused_stage1.tok_done}
+        assert len(tok_done_block_n) <= 1, f"tok_done buckets disagree on the GEMM2 block_n: {tok_done_block_n}"
         self._protocol = self._configs[1].fused_stage1
         # The combine reducers run at the end of the kernel on a fully resident grid, so they are not bounded by
         # one XCD's residency.

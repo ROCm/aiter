@@ -279,6 +279,13 @@ def test_ep4_small_m_buckets_share_one_protocol(mtpr):
     # A tok_done bucket (1 and 4 tokens) and one without it run on the same counters.
     assert select_fused_config(1, mtpr, **V41_FLASH_EP4_SHAPE).fused_stage1.tok_done
     assert not select_fused_config(16, mtpr, **V41_FLASH_EP4_SHAPE).fused_stage1.tok_done
+    # A tok_done reducer waits for valid routes x its own GEMM2 n-blocks, which every tok_done sender counts.
+    tok_done_block_n = {
+        config.stage2.block_n
+        for config in (select_fused_config(b, mtpr, **V41_FLASH_EP4_SHAPE) for b in FUSED_TOKEN_BUCKETS if b <= mtpr)
+        if config.fused_stage1.tok_done
+    }
+    assert tok_done_block_n == {256}
 
 
 def test_ep4_dispatch_cus_cover_two_expert_waves():
