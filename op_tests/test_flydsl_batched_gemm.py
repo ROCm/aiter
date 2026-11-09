@@ -364,16 +364,26 @@ def test_batched_gemm(b, m, n, k, dtype, layout):
     return ret
 
 
+@benchmark()
 def test_batched_gemm_a8w8_compute(b, m, n, k, kernel_name, dtype=dtypes.bf16):
-    """The 32x32 batched GEMM on an explicit compute kernelName; every batch is
-    checked against its own dequantized reference."""
+    """The 32x32 batched GEMM on an explicit compute kernelName; the output starts
+    as NaN and every batch is checked against its own dequantized reference."""
     torch.manual_seed(SEED)
     x8, xs8 = quant_act_e8m0(blockwise_randn(m, b, k, dtype=dtype), 32)
     w = blockwise_randn(b, n, k, dtype=dtype)
     w = w * torch.exp2(torch.arange(b) % 4 - 1.0).to(dtype)[:, None, None]
     w8, ws8 = quant_weight_e8m0(w, 32, 32)
     out = torch.full((m, b, n), float("nan"), dtype=dtype)
-    run_bmm_a8w8_mxfp8(x8, shuffle_weight(w8), xs8, ws8, out, kernel_name=kernel_name)
+    fn = functools.partial(
+        run_bmm_a8w8_mxfp8,
+        x8,
+        shuffle_weight(w8),
+        xs8,
+        ws8,
+        out,
+        kernel_name=kernel_name,
+    )
+    _, us = run_perftest(fn)
     x_scale = torch.exp2(xs8.to(dtypes.fp32) - 127).repeat_interleave(32, -1)
     w_scale = torch.exp2(ws8.to(dtypes.fp32) - 127).repeat_interleave(32, -2)
     w_scale = w_scale.repeat_interleave(32, -1)
@@ -381,6 +391,7 @@ def test_batched_gemm_a8w8_compute(b, m, n, k, kernel_name, dtype=dtypes.bf16):
         "mbk,bnk->mbn", x8.to(dtypes.fp32) * x_scale, w8.to(dtypes.fp32) * w_scale
     )
     assert torch.isfinite(out).all(), f"{kernel_name}: unwritten or non-finite output"
+    errs = []
     for i in range(b):
         err = checkAllclose(
             ref[:, i],
@@ -391,6 +402,21 @@ def test_batched_gemm_a8w8_compute(b, m, n, k, kernel_name, dtype=dtypes.bf16):
             msg=f"{kernel_name} B={b} M={m} N={n} K={k} batch {i}",
         )
         assert err <= 0.01, f"{kernel_name}: batch {i} mismatch ratio {err}"
+        errs.append(err)
+    nbytes = (
+        m * b * k
+        + b * n * k
+        + m * b * (k // 32)
+        + b * (n // 32) * (k // 32)
+        + b * m * n * out.element_size()
+    )
+    return {
+        "gfx": get_gfx(),
+        "compute us": us,
+        "compute TFLOPS": 2 * b * m * n * k / us / 1e6,
+        "compute TB/s": nbytes / us / 1e6,
+        "compute err": max(errs),
+    }
 
 
 def summarize(title: str, rows: list) -> None:
@@ -459,8 +485,10 @@ def main():
     args = parser.parse_args()
 
     if get_gfx() in COMPUTE_GFX:
-        for case in COMPUTE_CASES:
-            test_batched_gemm_a8w8_compute(*case)
+        summarize(
+            "batched_gemm a8w8 on explicit compute kernelNames",
+            [test_batched_gemm_a8w8_compute(*case) for case in COMPUTE_CASES],
+        )
 
     for dtype in args.dtype:
         quant_rows = []
