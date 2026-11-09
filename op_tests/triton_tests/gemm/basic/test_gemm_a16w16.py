@@ -224,6 +224,46 @@ def test_gemm_a16_w16_atomic(M: int, N: int, K: int, output):
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
 
 
+# Split-K configs whose split, cdiv(K, NUM_KSPLIT), is not a multiple of BLOCK_SIZE_K
+# (the first two are buckets of the gfx950 N=256 K=6144 file).
+@pytest.mark.parametrize(
+    "M, N, K, block_m, block_n, block_k, num_ksplit",
+    [
+        (1, 256, 6144, 16, 16, 512, 16),
+        (32, 256, 6144, 16, 16, 256, 16),
+        (16, 896, 3584, 16, 16, 256, 8),
+        (33, 1000, 777, 32, 32, 64, 4),
+    ],
+)
+def test_gemm_a16_w16_atomic_uneven_split(
+    M: int, N: int, K: int, block_m, block_n, block_k, num_ksplit
+):
+    torch.cuda.empty_cache()
+
+    x, w, _, _out_dtype, _y = generate_gemm_a16w16_inputs(
+        M, N, K, torch.bfloat16, output=False
+    )
+    config = {
+        "BLOCK_SIZE_M": block_m,
+        "BLOCK_SIZE_N": block_n,
+        "BLOCK_SIZE_K": block_k,
+        "GROUP_SIZE_M": 1,
+        "NUM_KSPLIT": num_ksplit,
+        "num_warps": 4,
+        "num_stages": 2,
+        "waves_per_eu": 0,
+        "matrix_instr_nonkdim": 16,
+        "cache_modifier": None,
+    }
+
+    torch_out = F.linear(x, w, bias=None)
+    triton_out = gemm_a16w16_atomic(x, w, torch.float32, config=config).to(
+        torch.bfloat16
+    )
+
+    torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
+
+
 @pytest.mark.parametrize("M, N, K", get_fewer_x_vals())
 @pytest.mark.parametrize("layout", ["TT", "NN", "NT"])
 def test_gemm_a16_w16_atomic_layout(M: int, N: int, K: int, layout):

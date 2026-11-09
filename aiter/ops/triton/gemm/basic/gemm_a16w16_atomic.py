@@ -92,8 +92,16 @@ def gemm_a16w16_atomic_(
         * triton.cdiv(N, META["BLOCK_SIZE_N"])
         * META["NUM_KSPLIT"],
     )
-    # NOTE: if k split doesnt divide K evenly, this will waste compute
+    # Each split runs whole BLOCK_SIZE_K steps from pid_k * SPLITK_BLOCK_SIZE, so the split
+    # length must be a multiple of BLOCK_SIZE_K; otherwise a split reads into the next one
+    # and the overlap is added twice. Round it up and recompute the number of splits.
     SPLITK_BLOCK_SIZE = triton.cdiv(K, config["NUM_KSPLIT"])
+    if config["NUM_KSPLIT"] > 1 and SPLITK_BLOCK_SIZE % config["BLOCK_SIZE_K"] != 0:
+        SPLITK_BLOCK_SIZE = (
+            triton.cdiv(SPLITK_BLOCK_SIZE, config["BLOCK_SIZE_K"])
+            * config["BLOCK_SIZE_K"]
+        )
+        config["NUM_KSPLIT"] = triton.cdiv(K, SPLITK_BLOCK_SIZE)
     config["SPLITK_BLOCK_SIZE"] = SPLITK_BLOCK_SIZE
     _gemm_a16_w16_atomic_kernel[grid](
         x,
