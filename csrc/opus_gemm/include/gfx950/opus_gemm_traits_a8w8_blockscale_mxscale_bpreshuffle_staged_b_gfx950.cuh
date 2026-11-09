@@ -5,7 +5,6 @@
 #include <opus/opus.hpp>
 #include "opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_4wave_pin_agpr_gfx950.cuh"
 
-// Complete M-repeat tiles share packed scales, an A fragment ring and LDS stages.
 template<
     int BlockM, int BlockN, int WaveM, int WaveN, int ScalePanel,
     int SplitK = 1, int CacheA = 0, int CacheB = 0, int GroupM = 0, int BlockK = 128>

@@ -9,7 +9,6 @@
 #if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx950__)
 namespace opus_gemm_bpreshuffle_staged_b_layout {
 
-// All views retain explicit shapes, dimensions, strides and producer coordinates.
 
 template<int CachedVec = 0, class Shape, class Dimensions, class Strides, class Coordinates>
 __device__ inline constexpr auto make_layout_from_coordinates(
@@ -17,7 +16,6 @@ __device__ inline constexpr auto make_layout_from_coordinates(
     return opus::make_layout<CachedVec>(shape, opus::unfold_x_stride(dimensions, shape, strides), opus::unfold_p_coord(dimensions, coordinates));
 }
 
-// A layouts: global memory -> LDS -> MFMA registers.
 
 template<class T>
 __device__ inline auto make_layout_ga_scale(int lane_id, int wave_id_m, int wave_id_n, int stride_a) {
@@ -32,7 +30,6 @@ __device__ inline auto make_layout_ga_scale(int lane_id, int wave_id_m, int wave
         opus::tuple{wave_id_n, lane_id / threads_k, wave_id_m, lane_id % threads_k});
 }
 
-// A and normal-N B share one LDS stage shape; their producer wave coordinates differ.
 
 template<int Repeats, int WavesFirst, int WavesSecond, int Vector, int Pitch>
 __device__ inline constexpr auto make_matrix_stage_layout(int first_wave, int second_wave) {
@@ -62,7 +59,6 @@ __device__ inline constexpr auto make_layout_ra_scale(int lane_id, int wave_id_m
         opus::tuple{producer_n, producer_m, producer_lane_row, lane_id / T::W_M});
 }
 
-// Preshuffled B layouts: global memory -> LDS -> MFMA registers.
 
 template<class T>
 __device__ inline constexpr auto make_layout_gb_scale(int lane_id, int wave_id_m, int wave_id_n, int stride_b) {
@@ -132,7 +128,6 @@ __device__ inline constexpr auto make_layout_rb_scale(int lane_id, int wave_id_n
     }
 }
 
-// A-scale layouts: raw M vectors -> four-repeat packed LDS words -> registers.
 
 template<class T>
 __device__ inline constexpr auto make_layout_gsfa_scale(int lane_id, int wave_id_m, int wave_id_n, int stride_sfa) {
@@ -170,9 +165,7 @@ __device__ inline constexpr auto make_layout_rsfa_scale(int lane_id, int wave_id
         opus::tuple{opus::number<T::VEC_SF>{}, 1_I}, opus::tuple{wave_id_m, lane_id % T::W_M});
 }
 
-// B-scale layouts: external K128 bytes -> packed LDS words -> registers.
 
-// Read an A/B fragment without fixing its register allocation.
 
 template<int Vec, int OFFSET_BEGIN, class Fragment, int OffsetStride = 1, class Mem, class Offsets>
 __device__ inline Fragment load_operand_fragment_staged(Mem& smem, const Offsets& offsets) {
@@ -189,7 +182,6 @@ __device__ inline Fragment load_operand_fragment_staged(Mem& smem, const Offsets
 }
 } // namespace opus_gemm_bpreshuffle_staged_b_layout
 
-// Matrix LDS stages feed an A fragment ring and reusable B fragments.
 
 template<class Traits, bool ShortK, int Capacity>
 __device__ __forceinline__ void opus_gemm_bpreshuffle_staged_b_body_impl(
@@ -298,7 +290,6 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_staged_b_body_impl(
         static_cast<unsigned>(scale_k_groups * kargs.stride_sfa - row));
     auto g_sfb = make_gmem( reinterpret_cast<const D_SF*>(kargs.ptr_sfb) + (col / T::GROUP_N) * kargs.stride_sfb +
             split * scale_k_groups, static_cast<unsigned>(T::SCALE_N_HALVES * kargs.stride_sfb - split * scale_k_groups));
-    // ===== Explicit A/B/SFA/SFB layouts: global -> LDS -> MFMA =====
     auto u_ga = make_layout_ga_scale<T>(lane_id, wave_id_m, wave_id_n, kargs.stride_a);
     auto u_sa = [&] {
         const auto logical = make_layout_sa_scale<T>(wave_id_m, wave_id_n);
@@ -337,12 +328,10 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_staged_b_body_impl(
     const auto u_gsfa = make_layout_gsfa_scale<T>(lane_id, wave_id_m, wave_id_n, kargs.stride_sfa);
     const auto u_ssfa = make_layout_ssfa_scale<T>(lane_id, wave_id_m, wave_id_n);
     const auto u_rsfa = make_layout_rsfa_scale<T>(lane_id, wave_id_m);
-    // SFB is one packed scale word per K128 group, with one/two global N128 rows.
     const int sfb_thread = wave_id * T::WARP_SIZE + lane_id;
     const auto u_gsfb = make_layout<1>( make_tuple(number<T::SCALE_N_HALVES>{}, 1_I), make_tuple(kargs.stride_sfb, 1_I), make_tuple(underscore{}, sfb_thread));
     const auto u_ssfb = make_layout<1>( make_tuple(1_I, 1_I), make_tuple(1_I, 1_I), make_tuple(sfb_thread, underscore{}));
     const auto u_rsfb = make_layout<1>(make_tuple(1_I), make_tuple(1_I));
-    // ===== LDS initialization; matrix storage is reused for C =====
     alignas(16) extern __shared__ char smem_matrix[];
     auto s_a = make_smem(reinterpret_cast<D_A*>(smem_matrix));
     auto s_b = make_smem(reinterpret_cast<D_B*>(smem_matrix + stages * a_stage_bytes));
@@ -350,7 +339,6 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_staged_b_body_impl(
     auto s_sfa = make_smem(reinterpret_cast<D_SF*>(smem_matrix + matrix_lds_bytes));
     auto s_sfb = make_smem(reinterpret_cast<D_SF_PACK*>(smem_matrix + matrix_lds_bytes + (!ShortK && T::B_M == 128 && T::B_N == 128 && T::T_M == 4 && T::T_N == 2
         ? T::normal_sfa_bytes(kargs.k) : T::SFA_BYTES)));
-    // Square MFMA inputs share layouts; native C packs its four values along M.
     constexpr bool native_short = ShortK && T::B_N == 64 && T::B_K == 128 &&
         T::T_N == 2 && T::SPLIT_K == 1 && T::GROUPED_M == 0 &&
         ((T::T_M == 1 && T::B_M == 48 && T::SCALE_PANEL == 8 && capacity == 6 && T::CACHE_A == 17 && T::CACHE_B == 1) ||
@@ -363,7 +351,6 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_staged_b_body_impl(
     array<array<typename BaseMMA::vtype_a, T::A_RING>, T::E_K> v_a;
     array<array<typename BaseMMA::vtype_b, T::E_N>, T::E_K> v_b;
     array<typename BaseMMA::vtype_c, T::E_M * T::E_N> v_c{};
-    // ===== Explicit C layout and accumulator initialization =====
     constexpr int store_vec_c = native_short ? 1 : T::VEC_C;
     const auto p_coord_c = opus::make_tuple(wave_id_m,
         native_short ? lane_id / mma.grpn_c : lane_id % mma.grpn_c, wave_id_n,
@@ -380,7 +367,6 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_staged_b_body_impl(
     };
     auto ssfa_offset = [&](int tile_k) { return tile_k * number<T::SFA_PANEL_PITCH>{};
     };
-    // ===== Ordinary Opus prefetch, scale and MFMA helpers =====
     auto issue_matrix_prefetch = [&](auto stage_i, int tile_k) {
         const int stage = static_cast<int>(stage_i);
         constexpr bool typed_resident_six = raw_resident_a && T::B_M == 48 && T::B_N == 32 &&
@@ -392,7 +378,6 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_staged_b_body_impl(
             (ShortK && T::B_M == 32 && T::B_N == 32 && T::B_K == 512 && capacity == 3 && T::NUM_WAVES == 2 && T::E_M == 1) ||
             (ShortK && T::B_M == 32 && T::B_N == 64 && T::B_K == 128 && T::T_M == 1 && T::T_N == 2 &&
              T::SCALE_PANEL == 4 && capacity == 3 && T::SPLIT_K == 1 && T::CACHE_A == 1 && T::CACHE_B == 17 && T::GROUPED_M == 0)) {
-            // Preserve the LDS address space through ordinary Opus buffer copies.
             const auto ga = layout_to_offsets<T::VEC_A>(u_ga);
             const auto sa = layout_to_offsets<T::VEC_A>(u_sa);
             const auto gb = layout_to_offsets<T::VEC_B>(u_gb);
@@ -804,7 +789,6 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_staged_b_body_impl(
             } else store<T::VEC_C>(g_c, value, gc_offsets[index], 0, cache_control);
         });
     };
-    // ===== Prologue =====
     if (!small_full_two && (!panel_short || (!compact_panel_short && loops != capacity))) {
     issue_matrix_prefetch(0_I, 0);
     if constexpr (ShortK && T::B_M == 16 && T::B_K >= 256) {
@@ -819,7 +803,6 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_staged_b_body_impl(
     publish_sfa_panel(0);
     __builtin_amdgcn_sched_barrier(0);
     }
-    // ===== Short K: resident panels use the shared load/MFMA helpers =====
     if constexpr (ShortK) {
         auto short_loop = [&](auto full) {
         if constexpr ((decltype(full)::value && register_short_scales && !full_resident) || compact_panel_short) {
@@ -986,9 +969,6 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_staged_b_body_impl(
             else short_loop(0_I);
         } else short_loop(0_I);
     } else {
-        // Normal K reuses the same A-fragment ring and B fragments; ring8 only
-        // changes the internal LDS queue depth for the one-wave 16x16 geometry.
-        // ===== Normal K: staged panels; ring8 is selected internally =====
         auto normal_loop = [&](auto stage_count) {
             constexpr int count = decltype(stage_count)::value;
             if constexpr ((T::B_M <= 32 || T::B_M == 64) && T::B_N <= 256) {
@@ -1073,7 +1053,6 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_staged_b_body_impl(
             read_scales(0, v_sfa, v_sfb);
             load_tile_fragments(0_I);
             s_waitcnt_lgkmcnt(0_I);
-            // ===== Main loop =====
             constexpr int live_fragments = 4 * T::E_M * T::E_N +
                 8 * T::E_K * (T::A_RING + T::E_N);
             int base = 0;
@@ -1103,7 +1082,6 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_staged_b_body_impl(
                                 ? (count - 2) * T::MATRIX_VMEM_INSTRUCTIONS : 63)>{});
                 });
             }
-            // ===== Drain =====
             finish_tile((loops - 1) % count);
         };
         if (ring8)
@@ -1117,7 +1095,6 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_staged_b_body_impl(
             normal_loop(number<4>{});
         else normal_loop(number<T::NUM_STAGES>{});
     }
-    // ===== Output writeback =====
     if constexpr (c_stage_overlap && !native_short) {
         if (loops == capacity && kargs.m > 32) {
             s_waitcnt_lgkmcnt(0_I);

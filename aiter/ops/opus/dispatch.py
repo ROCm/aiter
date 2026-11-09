@@ -97,10 +97,7 @@ def _resolve_contract(
         has_bias=has_bias,
         has_workspace=has_workspace,
         split_k=split_k,
-        bpreshuffle_uses_workspace=(instance.bpreshuffle_entry or {}).get(
-            "workspace_rule", ("none",)
-        )[0]
-        != "none",
+        bpreshuffle_uses_workspace=instance.splitk_workspace_dtype is not None,
     )
     return family, instance, _a8w8_family
 

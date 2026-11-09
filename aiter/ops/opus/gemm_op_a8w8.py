@@ -346,8 +346,7 @@ def _launch_a8w8_blockscale_bpreshuffle_gemm(
     ``WQ`` pre-shuffle is a content/layout semantic. It
     cannot be proven from Tensor shape or strides. Build it with
     ``shuffle_weight(WQ, layout=(16, 16))``. The generated launcher checks
-    output dtype, scale layout, batch and tile alignment. Small-shape split-K
-    candidates allocate flat FP32 workspace, or reuse the supplied tensor.
+    output dtype, scale layout, batch and tile alignment.
     """
     resolved_kid = kid
     if instance is None:
@@ -366,11 +365,9 @@ def _launch_a8w8_blockscale_bpreshuffle_gemm(
             cu_num=cu_num,
         )
         instance = get_registry(_A8W8_BPRESHUFFLE_FAMILY, arch, cu_num)[resolved_kid]
-    workspace_rule = (instance.bpreshuffle_entry or {}).get("workspace_rule", ("none",))
     launch_workspace = workspace
-    if workspace_rule[0] != "none":
+    if instance.splitk_workspace_dtype is not None:
         if launch_workspace is None:
-            # Bound automatic allocation using the existing shape/resource rule.
             M, K = map(int, XQ.shape)
             N = int(WQ.shape[0])
             if not a8w8_mxscale_bpreshuffle_supports_shape(instance, M, N, K):
@@ -382,7 +379,6 @@ def _launch_a8w8_blockscale_bpreshuffle_gemm(
             launch_workspace = torch.empty(
                 (required_bytes // 4,), dtype=torch.float32, device=XQ.device
             )
-        # C++ validates tensor layouts and workspace.
     elif launch_workspace is not None:
         raise ValueError(f"OPUS bpreshuffle kid {resolved_kid} does not use workspace")
     _launch_a8w8_backend(

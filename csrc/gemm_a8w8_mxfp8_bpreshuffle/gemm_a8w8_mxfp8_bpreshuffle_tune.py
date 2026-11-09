@@ -124,7 +124,7 @@ _OPUS_TRAIT_DEFAULTS = {
 
 
 @lru_cache(maxsize=65536)
-def _opus_kernel_profile(geometry, traits, wg, threads):
+def _opus_kernel_profile(geometry, traits, wg, threads, static_lds=None):
     """Return effective traits and LDS bytes, reused across shapes."""
     pipeline, bm, bn, bk, wm, wn = geometry[:6]
     match = re.fullmatch(r"\s*\w+\s*<([^<>]*)>\s*", traits)
@@ -162,44 +162,8 @@ def _opus_kernel_profile(geometry, traits, wg, threads):
     elif pipeline == "pingpong_lds":
         packs = math.ceil((bm // (wm * 16)) / 4)
         lds = 264 * (bm + bn) + int(profile[2]) * (packs * wm * 64 + 4)
-    elif pipeline == "direct_b":
-        from csrc.opus_gemm.opus_gemm_common import _b_normal_resources
-
-        values = tuple(map(int, args))
-        if (
-            values[:5] != (bm, bn, bk, wm, wn)
-            or values[7] != wg
-            or values[12] != geometry[6]
-            or threads != 64 * wm * wn
-        ):
-            raise ValueError(f"OPUS geometry disagrees with traits: {traits}")
-        stages, ahead, _, ca, cb, vec, _, _ = values[5:]
-        resources = _b_normal_resources(
-            bm, bn, bk, wm, wn, stages, ahead, wg, vec, ca, cb
-        )
-        if resources is None:
-            raise ValueError(f"Invalid OPUS resource profile: {traits}")
-        # Static resource estimates rank variants; launch code owns runtime LDS.
-        lds = resources["lds_bytes"]
-    elif pipeline == "staged_b":
-        from csrc.opus_gemm.opus_gemm_common import _m_normal_resources
-
-        values = tuple(map(int, args))
-        if (
-            values[:4] != (bm, bn, wm, wn)
-            or values[9] != bk
-            or values[5] != geometry[6]
-            or wg != 1
-            or threads != 64 * wm * wn
-        ):
-            raise ValueError(f"OPUS geometry disagrees with traits: {traits}")
-        panel, split, ca, cb, group_m, _ = values[4:]
-        resources = _m_normal_resources(
-            bm, bn, wm, wn, panel, split, bk, ca, cb, group_m
-        )
-        if resources is None:
-            raise ValueError(f"Invalid OPUS resource profile: {traits}")
-        lds = resources["normal_lds_bytes"]
+    elif pipeline in ("direct_b", "staged_b"):
+        lds = static_lds
     return tuple(profile), lds
 
 
@@ -257,10 +221,6 @@ def _opus_select_variants(geometry, kids, kernel_profiles, footprints, m, n, mod
                 for kid in routes
                 if int(profiles[kid][group_index]) in (0, smallest)
             ]
-        elif pipeline in ("direct_b", "staged_b"):
-            # These traits have different axes; joint coverage below selects
-            # their representatives instead of retaining every primary variant.
-            routes = []
         selected.update(routes)
     elif pipeline == "prefetch_b_vgpr_overlap":
         publications = sorted({int(profile[15]) for profile in profiles.values()})
@@ -285,13 +245,9 @@ def _opus_select_variants(geometry, kids, kernel_profiles, footprints, m, n, mod
         # fragments/cache/guard, launch groups
         indices += [(5, 6, 7, 8), (4, 9)]
     elif pipeline == "direct_b":
-        # A stages/B queue/residency, paired caches and scale-copy policy.
         indices += [(5, 6, 7), (8, 9), (10, 8, 9)]
     elif pipeline == "staged_b":
-        # Scale arena and cache choices can change internal execution routes.
         indices += [(4, 5), (6, 7), (4, 6, 7), (8,)]
-        if len(next(iter(profiles.values()))) > 10:
-            indices += [(5, 10), (4, 6, 7, 10)]
     modes = {
         kid: {
             (positions, tuple(profile[index] for index in positions))
@@ -330,9 +286,6 @@ def _opus_select_budget(kids, geometries, profiles, footprints, costs, budget):
             caches = profile[6:8]
             tuning = (profile[4], profile[8])
             axes = (4, 6, 7, 8)
-            if len(profile) > 10:
-                route = (*route, profile[10])
-                axes += (10,)
         else:
             raise ValueError(f"Unsupported OPUS budget profile: {pipeline}")
         routes[route].append(kid)
@@ -346,8 +299,7 @@ def _opus_select_budget(kids, geometries, profiles, footprints, costs, budget):
         modes[kid].update(
             {("axis", pipeline, index, profile[index]): 4 for index in axes}
         )
-    # A route includes the K tile, wave layout and split count. Every legal
-    # route keeps a baseline; other tile geometries compete for the budget.
+    # Keep every K tile, wave layout and split count.
     selected = {
         min(route_kids, key=lambda kid: (costs[geometries[kid]], footprints[kid], kid))
         for route_kids in routes.values()
@@ -433,6 +385,7 @@ def opus_candidates(m, n, k, *, cu_num):
             instance.bpreshuffle_entry["traits"],
             instance.WG_PER_CU,
             instance.BLOCK_SIZE,
+            instance.bpreshuffle_entry.get("static_lds_bytes"),
         )
         profiles[kid] = profile
         footprints[kid] = lds
@@ -458,21 +411,21 @@ def opus_candidates(m, n, k, *, cu_num):
 
     primary, secondary = set(), set()
     for pipeline, tiles in by_pipeline.items():
+        if pipeline in ("direct_b", "staged_b"):
+            continue
         layouts = defaultdict(list)
         for geometry in tiles:
             layouts[geometry[3:]].append(geometry)
         ranked = {
             min(layout, key=lambda g: (costs[g], g)) for layout in layouts.values()
         }
-        if pipeline in ("prefetch_b_vgpr", "prefetch_b_vgpr_overlap", "direct_b"):
-
-            def a_live_set(g, pipeline=pipeline):
-                owner_m = g[4] if pipeline == "direct_b" else 1
-                return (g[3] // 128) * (g[1] // (owner_m * 16))
-
-            native = any(g[4] * g[5] == 4 and a_live_set(g) < 16 for g in tiles)
+        if pipeline in ("prefetch_b_vgpr", "prefetch_b_vgpr_overlap"):
+            native = any(
+                wm * wn == 4 and (bk // 128) * (bm // 16) < 16
+                for _, bm, _, bk, wm, wn, _split in tiles
+            )
             for (bk, wm, wn, _split), layout in layouts.items():
-                full_a = [g for g in layout if a_live_set(g) < 16]
+                full_a = [g for g in layout if (bk // 128) * (g[1] // 16) < 16]
                 if full_a:
                     largest = max(full_a, key=lambda g: (g[1] * g[2], g))
                     max_bm, max_bn = largest[1:3]
@@ -496,11 +449,11 @@ def opus_candidates(m, n, k, *, cu_num):
                         secondary.update(chosen)
                     else:
                         primary.update(chosen)
-                rotated = [g for g in layout if a_live_set(g) >= 16]
+                rotated = [g for g in layout if (bk // 128) * (g[1] // 16) >= 16]
                 if rotated:
                     # Cover the changed A live set, LDS waits, and B queue clamp.
                     secondary.add(min(rotated, key=lambda g: (costs[g], g)))
-        elif pipeline in ("pingpong_lds", "staged_b"):
+        elif pipeline == "pingpong_lds":
             # Fill the A ring with E_M=3..4; add two-resident-block tiles if needed.
             core = [
                 g for g in tiles if g[4] * g[5] == 8 and 3 <= g[1] // (g[4] * 16) <= 4
@@ -528,38 +481,23 @@ def opus_candidates(m, n, k, *, cu_num):
     # Tighten primary ranges by relative work and grid supply, retaining modes.
     dropped, core_costs, by_layout = set(), {}, defaultdict(list)
     for geometry in primary:
-        pipeline, bm, bn, _, wm, wn, split = geometry
-        if (
-            pipeline in ("pingpong_lds", "staged_b")
-            and wm * wn == 8
-            and bm // (wm * 16) >= 3
-        ):
+        _, bm, bn, _, wm, wn, _split = geometry
+        if geometry[0] == "pingpong_lds" and wm * wn == 8 and bm // (wm * 16) >= 3:
             em, en = bm // (16 * wm), bn // (16 * wn)
             mfma = em * en * 32 * wm * wn / 4
             transfer = (bm + bn) * 128 / 512
             refill = max(0, em - 3) * 64
-            body = (
-                (k / (split * 128)) * (mfma + transfer + refill)
-                + 3072
-                + bm * bn * 2 / 512
-            )
+            body = (k / 128) * (mfma + transfer + refill) + 3072 + bm * bn * 2 / 512
             occupancy = grids[geometry] / cu_grid
             tail = 1 + 0.1 * (math.ceil(occupancy) / occupancy - 1)
             core_costs[geometry] = grids[geometry] * body * tail / (m * n * k)
-        elif pipeline in ("prefetch_b_vgpr", "prefetch_b_vgpr_overlap", "direct_b"):
+        elif geometry[0] in ("prefetch_b_vgpr", "prefetch_b_vgpr_overlap"):
             by_layout[(geometry[0], *geometry[3:])].append(geometry)
         if grids[geometry] < cu_grid / 2:
             dropped.add(geometry)
     if core_costs:
-        best_by_pipeline = {}
-        for geometry, cost in core_costs.items():
-            pipeline = geometry[0]
-            best_by_pipeline[pipeline] = min(
-                best_by_pipeline.get(pipeline, float("inf")), cost
-            )
-        dropped.update(
-            g for g in core_costs if core_costs[g] > 1.025 * best_by_pipeline[g[0]]
-        )
+        best = min(core_costs.values())
+        dropped.update(g for g in core_costs if core_costs[g] > 1.025 * best)
     for geometries in by_layout.values():
         best = min(costs[g] for g in geometries)
         margin = 4 / 3 if geometries[0][4] * geometries[0][5] < 4 else 1.1
@@ -573,9 +511,7 @@ def opus_candidates(m, n, k, *, cu_num):
             mode = "primary"
         elif geometry in secondary:
             mode = "secondary"
-        if geometry[0] in ("direct_b", "staged_b") and mode == "baseline":
-            # The budget below chooses which tiles survive. Offer parameter
-            # representatives first so its tile choices can retain cache routes.
+        if geometry[0] in ("direct_b", "staged_b"):
             mode = "secondary"
         variants = _opus_select_variants(
             geometry, kids, profiles, footprints, m, n, mode

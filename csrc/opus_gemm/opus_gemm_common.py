@@ -226,11 +226,6 @@ class OpusGemmInstance:
     bpreshuffle_co: dict | None = None
     bpreshuffle_entry: dict | None = None
 
-    def matches_name(self, name: str) -> bool:
-        return name == self.name or name in (self.bpreshuffle_entry or {}).get(
-            "name_aliases", ()
-        )
-
     @property
     def name(self) -> str:
         if self.bpreshuffle_entry is not None:
@@ -3214,30 +3209,14 @@ def candidate_kids_for_shape(gfx, m, n, k, outdtype="bf16", *, cu_num):
 
 def a8w8_mxscale_bpreshuffle_supports_shape(instance, m, n, k):
     entry = instance.bpreshuffle_entry or {}
-    if entry.get("small_shape"):
-        split_k = entry["split_k"]
-        if (min(m, n, k) <= 0 or m % instance.m_align or n % 128
-                or k % (split_k * instance.B_K)
-                or (instance.max_m is not None and m > instance.max_m)
-                or (not entry["pad_n"] and n % instance.B_N)
-                or (instance.max_k is not None and k > instance.max_k)
-                or k // instance.B_K < split_k):
-            return False
-        if max(m * k, n * k) > _INT32_MAX:
-            return False
-        if 2 * min(m, instance.B_M) * n > _INT32_MAX:
-            return False
-        if entry['pipeline'] == 'staged_b' and 2 * instance.B_M * n > _INT32_MAX:
-            return False
-        if split_k > 1:
-            return bpreshuffle_workspace_bytes(instance, m, n, k) <= instance.max_tensor_bytes
-        return 2 * m * n <= instance.max_tensor_bytes
+    split = entry.get("split_k", 1)
     if instance.bpreshuffle_co is not None:
         shapes = instance.bpreshuffle_co.get("supported_shapes")
         if shapes is not None:
             return [m, n, k] in shapes
-    if (min(m, n, k) <= 0 or m % instance.m_align or n % 128 or k % instance.B_K
+    if (min(m, n, k) <= 0 or m % instance.m_align or n % 128 or k % (split * instance.B_K)
             or n % instance.B_N
+            or (instance.max_m is not None and m > instance.max_m)
             or (instance.max_k is not None and k > instance.max_k)):
         return False
     if max(m * k, n * k) > _INT32_MAX:
@@ -3247,19 +3226,15 @@ def a8w8_mxscale_bpreshuffle_supports_shape(instance, m, n, k):
     if (instance.bpreshuffle_co is not None and instance.bpreshuffle_co.get("wide_output")
             and 2 * ((min(m, instance.B_M) - 1) * n + instance.B_N) > _INT32_MAX):
         return False
-    return 2 * m * n <= instance.max_tensor_bytes
+    if entry.get("pipeline") == "staged_b" and 2 * instance.B_M * n > _INT32_MAX:
+        return False
+    return max(2 * m * n, bpreshuffle_workspace_bytes(instance, m, n, k)) <= instance.max_tensor_bytes
+
 
 
 def bpreshuffle_workspace_bytes(instance, m, n, k):
-    rule = (instance.bpreshuffle_entry or {}).get("workspace_rule", ("none",))
-    if rule[0] == "none":
-        return 0
-    if rule[0] == "tiles":
-        _, factor, bm, bn, counter = rule
-        tiles = ((m + bm - 1) // bm) * (n // bn)
-        return tiles * (factor * bm * bn + counter)
-    _, factor, extra = rule
-    return factor * m * n + extra
+    split = (instance.bpreshuffle_entry or {}).get("split_k", 1)
+    return 4 * split * m * n if split > 1 else 0
 
 # combined list (used by production gen_instances / dispatch)
 gfx950_a16w16_kernels_list = {
@@ -3808,9 +3783,7 @@ def _opus_sidecar_path():
     return os.path.join(bd_dir, "compiled_kids_opus.json")
 
 
-# Small-shape candidates are generated from declared parameter products.
-# Layout, register and LDS limits filter the search; no historical recipes or
-# tuned shape catalog constrain it. K and N remain runtime arguments.
+# Small pipelines: enumerate parameters within register and LDS limits.
 _B_PREFIX = "opus_gemm_bpreshuffle_"
 _B_LDS_LIMIT = 160 * 1024
 _B_CACHE_PAIRS = ((0, 0), (1, 17), (17, 1))
@@ -3859,22 +3832,9 @@ def _b_instance(bm, bn, bk, wm, wn, wg, ca, cb, split):
 
 
 def _b_workspace_entry(split):
-    if split == 1:
-        return {
-            "host_kind": "tile",
-            "grid_kind": "nm",
-            "split_k": 1,
-            "workspace_dtype": None,
-            "workspace_rule": ("none",),
-            "workspace_zero_init": False,
-        }
     return {
-        "host_kind": "reduce",
-        "grid_kind": "nm_split",
+        "host_kind": "reduce" if split > 1 else "tile",
         "split_k": split,
-        "workspace_dtype": "fp32_t",
-        "workspace_rule": ("mn", 4 * split, 0),
-        "workspace_zero_init": False,
         "reduce_kernel": "splitk_reduce_kernel",
     }
 
@@ -4006,25 +3966,11 @@ def _b_normal_resources(bm, bn, bk, wm, wn, stages, ahead, wg, vec, ca=0, cb=0):
         or 16 * (bn + 8) * 2 > lds
     ):
         return None
-    return {
-        "scale_cols": columns,
-        "short_columns": short_columns,
-        "lds_bytes": lds,
-        "short_lds_bytes": short_lds,
-        "a_bytes": a_bytes,
-        "short_a_bytes": short_a,
-        "short_sa_bytes": short_sa,
-        "sb_bytes": sb_bytes,
-        "resident_panels": capacity,
-        "uniform_short_queue": uniform,
-        "estimated_registers": registers,
-    }
+    return {"lds_bytes": lds}
 
 
 def _b_strategy_args():
     """Search complete B tiles with queue, occupancy and scale policies bound."""
-    # Four-wave tiles are the normal small-B search. BK512 is limited to
-    # narrow N and at most four M fragments; deeper K tiles need more registers.
     for bm, bn, bk in product(
         (32, 48, 64, 80, 96, 128),
         (64, 128, 256),
@@ -4046,8 +3992,6 @@ def _b_strategy_args():
                 for vec, (ca, cb) in product(vectors, _B_CACHE_PAIRS):
                     yield (bm, bn, bk, 1, 4, stages, ahead, wg, ca, cb, vec, 0, 1)
 
-    # Two-wave tiles cover fewer N columns or more M repeats. They use only
-    # shallow/overlapped queues, the normal scale vector and one workgroup.
     for bm, bn, bk in product((32, 48, 64, 96, 128), (32, 64, 128), (128, 256, 512)):
         if bk == 512 and (bm > 48 or bn != 32):
             continue
@@ -4055,8 +3999,6 @@ def _b_strategy_args():
             vec = 4 if bm <= 32 else 16
             yield (bm, bn, bk, 1, 2, stages, ahead, 1, ca, cb, vec, 0, 1)
 
-    # Eight-wave tiles keep at most four M fragments. Alternative scale
-    # vectors are restricted to a single full N scale group with BK256.
     for bm, bn, bk in product((32, 48, 64), (128, 256), (128, 256)):
         for (stages, ahead), wg, (ca, cb) in product(
             ((2, 1), (3, 1), (3, 2)),
@@ -4069,8 +4011,6 @@ def _b_strategy_args():
             for vec in vectors:
                 yield (bm, bn, bk, 1, 8, stages, ahead, wg, ca, cb, vec, 0, 1)
 
-    # Single-wave corners keep small M/N fragments and a two/three-stage queue.
-    # Wide BK512 is useful only while the per-wave tile stays at most 16x32.
     for bm, bn, bk in product((16, 32), (16, 32, 64), (128, 256, 512)):
         if bk == 512 and (bm > 16 or bn > 32):
             continue
@@ -4082,8 +4022,6 @@ def _b_strategy_args():
             vec = 16 if bm == 16 and bk == 512 and wg == 2 else 4
             yield (bm, bn, bk, 1, 1, stages, ahead, wg, ca, cb, vec, 0, 1)
 
-    # WaveM2 shares the normal queue and vector layouts without multiplying
-    # every occupancy, scale and cache policy into the two-M-wave geometry.
     for bm, bn, bk, wn, split in product(
         (64, 128),
         (128, 256),
@@ -4095,8 +4033,6 @@ def _b_strategy_args():
         for ca, cb in caches:
             yield (bm, bn, bk, 2, wn, 2, 1, 1, ca, cb, 16, 0, split)
 
-    # Split-K extends the normal two-stage schedule and balanced cache;
-    # it does not multiply the alternative queues, vectors or occupancies.
     for bm, bn, bk, split in product(
         (32, 48, 64, 96, 128),
         (64, 128, 256),
@@ -4106,8 +4042,6 @@ def _b_strategy_args():
         vec = 4 if bm <= 32 else 16
         yield (bm, bn, bk, 1, 4, 2, 1, 1, 0, 0, vec, 0, split)
 
-    # Deep queues and streaming/symmetric cache policies remain paired with
-    # shallow N tiles; the four-stage lookahead is a two-wave alternative.
     for bm, bn, bk in product((48, 64, 80, 96), (64, 128), (128, 256, 512)):
         mr, nr = bm // 16, bn // 64
         if mr <= 4 and nr == 1 and bk in (128, 512):
@@ -4124,7 +4058,6 @@ def _b_strategy_args():
             for vec, (ca, cb) in product((4, 16), _B_CACHE_PAIRS):
                 yield (bm, bn, bk, 1, 2, 4, 3, 1, ca, cb, vec, 0, 1)
 
-    # Byte scales are restricted to one/two M fragments and one K fragment.
     for bm, bn, wg, (stages, ahead) in product(
         (16, 32),
         (128, 256),
@@ -4142,17 +4075,15 @@ def _small_b_jit_configs():
             continue
         seen.add(args)
         bm, bn, bk, wm, wn, stages, ahead, wg, ca, cb, vec, _output, split = args
-        if (
-            _b_normal_resources(bm, bn, bk, wm, wn, stages, ahead, wg, vec, ca, cb)
-            is None
-        ):
+        resources = _b_normal_resources(
+            bm, bn, bk, wm, wn, stages, ahead, wg, vec, ca, cb
+        )
+        if resources is None:
             continue
         yield _b_instance(bm, bn, bk, wm, wn, wg, ca, cb, split), dict(
-            traits=_B_PREFIX + "direct_b_traits<" + ", ".join(map(str, args)) + ">",
+            traits=_bpreshuffle_cpp_traits(_B_PREFIX + "direct_b_traits", args),
             pipeline="direct_b",
-            b_vgpr_schedule="normal",
-            search_family="b_normal_cartesian",
-            dynamic_lds=True,
+            static_lds_bytes=resources["lds_bytes"],
             m_align=(
                 16
                 if vec == 4 and (cb == 2 or (bm >= 96 and (ca, cb) == (17, 1)))
@@ -4163,9 +4094,6 @@ def _small_b_jit_configs():
         )
 
 
-_M_CART_PREFIX = "opus_gemm_bpreshuffle_"
-_M_LDS_LIMIT = 160 * 1024
-_M_CACHE_PAIRS = ((0, 0), (1, 17), (17, 1))
 _M_SMALL_STORE_CACHE_PAIRS = ((0, 2), (1, 2), (17, 2))
 
 
@@ -4214,11 +4142,11 @@ def _m_normal_resources(
     ):
         stages = 4
     elif (bm, bn, bk) == (32, 64, 128) and (
-        8 * (a_stage + b_stage) + scale_bytes <= _M_LDS_LIMIT
+        8 * (a_stage + b_stage) + scale_bytes <= _B_LDS_LIMIT
     ):
         stages = 8
     else:
-        stages = 3 if 3 * (a_stage + b_stage) + scale_bytes <= _M_LDS_LIMIT else 2
+        stages = 3 if 3 * (a_stage + b_stage) + scale_bytes <= _B_LDS_LIMIT else 2
     if (bm, bn, bk, wm, wn, panel, split, cache_a, cache_b, group_m) == (
         32,
         64,
@@ -4252,48 +4180,18 @@ def _m_normal_resources(
         resident_panels = 6
     else:
         resident_panels = 8
-    available_panels = (_M_LDS_LIMIT - scale_bytes) // (a_stage + b_stage)
+    available_panels = (_B_LDS_LIMIT - scale_bytes) // (a_stage + b_stage)
     resident = min(available_panels, resident_panels)
     output = bm * (bn + 8) * 2 if split == 1 else 0
     static_lds = stages * (a_stage + b_stage) + scale_bytes
     registers = 4 * em * en + ek * (8 * (min(em, 3) + en) + 2 * packs) + 48
-    if resident < 2 or max(static_lds, output) > _M_LDS_LIMIT or registers > 512:
+    if resident < 2 or max(static_lds, output) > _B_LDS_LIMIT or registers > 512:
         return None
     return {
-        "bm": bm,
-        "bn": bn,
-        "bk": bk,
-        "wm": wm,
-        "wn": wn,
-        "panel": panel,
-        "split": split,
-        "cache_a": cache_a,
-        "cache_b": cache_b,
-        "group_m": group_m,
-        "waves": waves,
         "threads": threads,
-        "half_m": half_m,
         "em": em,
-        "en": en,
-        "ek": ek,
-        "a_scale_packs": packs,
-        "a_stage": a_stage,
-        "a_resident_stage": half_m * bk,
-        "b_stage": b_stage,
-        "packed_sfa_pitch": packed_pitch,
         "sfa_panel_pitch": pitch,
-        "sfa_bytes": pitch * panel,
-        "sfb_bytes": 4 * panel,
-        "scale_bytes": scale_bytes,
-        "num_stages": stages,
-        "resident_limit": resident_limit,
-        "resident_panels": resident_panels,
-        "resident_capacity": resident,
-        "legacy_capacity": min(8, available_panels, resident),
-        "output_bytes": output,
-        "static_lds_bytes": static_lds,
         "normal_lds_bytes": max(static_lds, output),
-        "estimated_registers": registers,
     }
 
 
@@ -4338,16 +4236,15 @@ def _small_m_parameters():
                 continue
             main_panel = panels[-1]
             resource = _m_normal_resources(*geometry, main_panel, 1, bk)
-            normal_caches = _M_CACHE_PAIRS
+            normal_caches = _B_CACHE_PAIRS
             if bk == 512:
                 normal_caches = (
-                    _M_CACHE_PAIRS + _M_SMALL_STORE_CACHE_PAIRS
+                    _B_CACHE_PAIRS + _M_SMALL_STORE_CACHE_PAIRS
                     if bn <= 32
                     else ((0, 0),)
                 )
             for caches in normal_caches:
                 yield from profile(geometry, main_panel, 1, caches, 0, bk)
-            # Split-K searches the main arena only; it does not multiply profiles.
             for split in (2, 4):
                 yield from profile(geometry, main_panel, split, (0, 0), 0, bk)
             if bk == 128 and wm == 4 and wn == 2 and bm >= 128 and bn <= 128:
@@ -4355,7 +4252,6 @@ def _small_m_parameters():
             if bk == 128 and wm == 4 and wn == 2 and bm >= 128 and bn >= 128:
                 yield from profile(geometry, main_panel, 1, (0, 0), 4, bk)
 
-            # A small streaming arena complements the main cache on repeated-M tiles.
             if (
                 (bk == 128 and bm >= 48 and bn >= 64)
                 or (bk == 256 and bm >= 128 and bn >= 128)
@@ -4363,7 +4259,6 @@ def _small_m_parameters():
             ):
                 yield from profile(geometry, 16, 1, (0, 0), 0, bk)
 
-            # Middle arenas are tied to the scale-row pitch, not a panel cross product.
             if bk == 128 and bm >= 64 and bn >= 64:
                 budgets = (16 * 1024,) if wm == 4 else (8 * 1024,)
                 middle_caches = ((0, 0), (1, 17))
@@ -4373,7 +4268,7 @@ def _small_m_parameters():
                     if resource["em"] == 3
                     else ((16 * 1024,) if resource["em"] == 1 else (8 * 1024,))
                 )
-                middle_caches = _M_CACHE_PAIRS
+                middle_caches = _B_CACHE_PAIRS
             else:
                 budgets, middle_caches = (), ()
             for budget in budgets:
@@ -4390,11 +4285,10 @@ def _small_m_parameters():
                     geometry, resource["threads"] // 4, 1, (1, 17), 0, bk
                 )
 
-            # Short scale arenas stay on shallow, narrow-N wave tiles.
             if bk == 128 and bm <= 96 and bn <= 64 and wm * wn <= 4:
                 short_panels = (4, 8) if bm <= 32 else ((4,) if wm >= 2 else (8,))
                 for panel in short_panels:
-                    caches = _M_CACHE_PAIRS
+                    caches = _B_CACHE_PAIRS
                     if bm <= 32 and bn <= 32:
                         caches += ((0, 2), (1, 2)) if panel == 4 else ((0, 2),)
                     for pair in caches:
@@ -4406,8 +4300,7 @@ def _small_m_parameters():
                 for caches in ((0, 2), (17, 1), (17, 2)):
                     yield from profile(geometry, 8, 1, caches, 0, bk)
 
-    # Append deeper K tiles so existing runtime-small IDs remain stable.
-    # One/two-wave narrow tiles keep BK1024 within the register/LDS limits.
+    # Append BK1024 after existing IDs.
     for geometry in (
         (16, 16, 1, 1),
         (16, 32, 1, 1),
@@ -4416,7 +4309,7 @@ def _small_m_parameters():
         (32, 32, 1, 2),
     ):
         panel = 64 * geometry[2] * geometry[3]
-        for caches in _M_CACHE_PAIRS + _M_SMALL_STORE_CACHE_PAIRS:
+        for caches in _B_CACHE_PAIRS + _M_SMALL_STORE_CACHE_PAIRS:
             yield from profile(geometry, panel, 1, caches, 0, 1024)
 
 
@@ -4437,68 +4330,19 @@ def _small_m_jit_configs():
         values = (bm, bn, wm, wn, panel, split, ca, cb, group_m)
         if bk != 128:
             values += (bk,)
-        traits = _M_CART_PREFIX + "staged_b_traits<" + ", ".join(map(str, values)) + ">"
-        instance = {
-            "BLOCK_SIZE": 64 * wm * wn,
-            "B_M": bm,
-            "B_N": bn,
-            "B_K": bk,
-            "T_M": wm,
-            "T_N": wn,
-            "W_M": 16,
-            "W_N": 16,
-            "W_K": 128,
-            "VEC_A": 16,
-            "VEC_B": 16,
-            "VEC_C": 4,
-            "GROUP_M": 1,
-            "GROUP_N": 128,
-            "GROUP_K": 128,
-            "WG_PER_CU": 1,
-            "cachectl_a": ca,
-            "cachectl_b": cb,
-            "kernel_tag": "a8w8_blockscale_mxscale_gemm_bpreshuffle",
-            "output_dtypes": ["bf16_t"],
-            "arch_prefix": "gfx950",
-            "direct_only": split == 1,
-            "has_oob": True,
-            "pad_m": True,
-            "max_m": 1024,
-            "max_k": split * panel * 128,
-            "max_tensor_bytes": 2**63 - 1,
-            "splitk_workspace_dtype": "fp32_t" if split > 1 else None,
-        }
+        traits = _bpreshuffle_cpp_traits(_B_PREFIX + "staged_b_traits", values)
+        instance = _b_instance(bm, bn, bk, wm, wn, 1, ca, cb, split)
+        instance["max_k"] = split * panel * 128
         entry = {
             "traits": traits,
             "pipeline": "staged_b",
-            "product_family": "normal_m_repeat",
-            "kernel": _M_CART_PREFIX + "staged_b_kernel",
-            "headers": [
-                "gfx950/opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_staged_b_gfx950.cuh"
-            ],
-            "host_traits_headers": [
-                "gfx950/opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_staged_b_gfx950.cuh"
-            ],
-            "small_shape": True,
-            "m_repeat_schedule": "normal",
-            "dynamic_lds": True,
-            "host_kind": "tile",
-            "grid_kind": "nm",
+            "static_lds_bytes": _m_normal_resources(
+                bm, bn, wm, wn, panel, split, bk, ca, cb, group_m
+            )["normal_lds_bytes"],
             "m_align": 1,
             "pad_n": False,
-            "split_k": split,
-            "workspace_dtype": None,
-            "workspace_rule": ("none",),
-            "workspace_zero_init": False,
+            **_b_workspace_entry(split),
         }
-        if split > 1:
-            entry.update(
-                host_kind="reduce",
-                grid_kind="nm_split",
-                workspace_dtype="fp32_t",
-                workspace_rule=("mn", 4 * split, 0),
-                reduce_kernel="splitk_reduce_kernel",
-            )
         yield instance, entry
 
 
@@ -4517,7 +4361,6 @@ def _small_bpreshuffle_config_name(parameters, entry):
     pipeline = entry["pipeline"]
     parts = [pipeline, f"m{bm}n{bn}k{bk}", f"w{wm}x{wn}"]
     if pipeline == "direct_b":
-        # Output is fixed to zero by the traits' static assertion.
         parts += [f"p{values[5]}", f"bd{values[6]}", f"sv{values[10]}"]
     elif pipeline == "staged_b":
         parts.append(f"sp{values[4]}")
@@ -4540,26 +4383,13 @@ def _install_small_shape_kernels():
     for kid, (parameters, entry) in enumerate(_small_jit_configs(), start=6300):
         pipeline = entry["pipeline"]
         config_name = _small_bpreshuffle_config_name(parameters, entry)
-        previous_pipeline, previous_wave_version = {
-            "direct_b": ("b_vgpr", "v1"),
-            "staged_b": ("m_repeat", "v2"),
-        }[pipeline]
-        previous_suffix = config_name.removeprefix(pipeline + "_")
         entry.update(
             kid=kid,
             small_shape=True,
             config_name=config_name,
-            name_aliases=(
-                f"opus_gemm_gfx950_small_runtime_{previous_pipeline}_jit_{kid}",
-                f"opus_gemm_gfx950_{previous_pipeline}_small_{previous_suffix}",
-                f"opus_gemm_gfx950_wave{parameters['T_M'] * parameters['T_N']}_small_{previous_wave_version}_{previous_suffix}",
-            ),
             kernel=f"opus_gemm_bpreshuffle_{pipeline}_kernel",
             headers=[
                 f"gfx950/opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_{pipeline}_gfx950.cuh"
-            ],
-            host_traits_headers=[
-                f"gfx950/opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_{pipeline}_gfx950.cuh"
             ],
         )
         if entry.get("host_kind") == "reduce":

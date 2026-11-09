@@ -9,8 +9,6 @@
 namespace opus_gemm_bpreshuffle_direct_b_layout {
 using opus::operator""_I;
 using namespace opus;
-// Complete global/LDS A tiles; the XOR ownership matches the normal B pipeline.
-// A: global copy, LDS stage and MFMA fragment layouts.
 template<class T>
 __device__ inline auto make_layout_ga(int lane_id, int wave_id, int stride_a) {
     constexpr int threads_k = T::B_K / T::VEC_A;
@@ -47,7 +45,6 @@ __device__ inline auto make_layout_sa(int wave_id) {
         opus::unfold_x_stride(sa_block_dim, sa_block_shape, opus::tuple{opus::number<smem_linear_wave>{}, 1_I}),
         opus::unfold_p_coord(sa_block_dim, opus::tuple{wave_id % T::A_COPY_N, wave_id / T::A_COPY_N}));
 }
-// All A MFMA offsets for this wave, including both K64 halves of every K128.
 template<class T>
 __device__ inline auto make_layout_ra(int lane_id, int wave_id_m) {
     constexpr auto ra_block_shape = opus::make_tuple(
@@ -66,7 +63,6 @@ __device__ inline auto make_layout_ra(int lane_id, int wave_id_m) {
         opus::unfold_x_stride(ra_block_dim, ra_block_shape, opus::tuple{opus::number<T::B_K>{}, 1_I}),
         opus::unfold_p_coord(ra_block_dim, opus::tuple{wave_id_m, lane_id % T::W_M, lane_id / T::W_M}));
 }
-// B: preshuffled global panels map directly to the VGPR queue.
 template<class T>
 __device__ inline auto make_layout_rb(int lane_id, int wave_id_n, int stride_b) {
     constexpr auto rb_block_shape = opus::make_tuple(
@@ -90,8 +86,6 @@ __device__ inline auto make_layout_rb(int lane_id, int wave_id_n, int stride_b) 
                 opus::number<T::WARP_SIZE * T::VEC_B>{}, opus::number<1>{}}),
         opus::unfold_p_coord(rb_block_dim, opus::tuple{wave_id_n, lane_id / T::W_N, lane_id % T::W_N}));
 }
-// Full scale tiles. Runtime row bounds and K-window movement belong to the load.
-// SFA: global columns, LDS bytes and MFMA scale operands.
 template<class T>
 __device__ inline auto make_layout_gsfa(int lane_id, int wave_id) {
     constexpr auto gsfa_block_shape = opus::make_tuple(
@@ -139,7 +133,6 @@ __device__ inline auto make_layout_rsfa(int lane_id, int wave_id_m) {
             opus::tuple{opus::number<T::B_M * T::SA_SPACING>{}, opus::number<T::SA_SPACING>{}}),
         opus::unfold_p_coord(rsfa_block_dim, opus::tuple{wave_id_m, lane_id % T::W_M}));
 }
-// SFB: global scale groups and LDS reads for each wave.
 template<class T>
 __device__ inline auto make_layout_gsfb(int stride_sfb) {
     constexpr auto gsfb_block_shape = opus::make_tuple(
@@ -186,8 +179,6 @@ __device__ inline auto make_layout_rsfb(int wave_id_n) {
                 opus::number<T::SCALE_COLS * T::VEC_SCALE_B>{}}),
         opus::unfold_p_coord(rsfb_block_dim, opus::tuple{wave_id_n * (T::B_N / T::T_N) / T::GROUP_N}));
 }
-// MFMA C coordinates mapped to global output addresses, including FP32 partials.
-// C: MFMA fragments, LDS stripes and contiguous output vectors.
 template<class T>
 __device__ inline auto make_layout_gc_fragment(int lane_id, int wave_id_m, int wave_id_n, int stride_c) {
     constexpr auto gc_block_shape = opus::make_tuple(
@@ -209,7 +200,6 @@ __device__ inline auto make_layout_gc_fragment(int lane_id, int wave_id_m, int w
             gc_block_dim, opus::tuple{wave_id_m, lane_id % T::W_M,
                 wave_id_n, lane_id / T::W_M}));
 }
-// The same MFMA coordinates map to the padded LDS output stripe.
 template<class T>
 __device__ inline auto make_layout_sc_fragment(int lane_id, int wave_id_m, int wave_id_n) {
     return make_layout_gc_fragment<T>(lane_id, wave_id_m, wave_id_n, T::B_N + T::C_PADDING);
@@ -270,7 +260,6 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_direct_b_body_impl(
     using D_SF = unsigned char;
     using D_C = std::conditional_t<T::SPLIT_K == 1, bf16_t, fp32_t>;
     using Index = unsigned;
-    // Tile geometry and K-panel resource bounds.
     constexpr int BM = T::B_M;
     constexpr int BN = T::B_N;
     constexpr int NB = T::STAGES;
@@ -314,7 +303,6 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_direct_b_body_impl(
          T::T_M == 1 && T::T_N == 4 && T::WG_PER_CU == 2 && T::SPLIT_K == 1 &&
          T::VEC_SCALE_A == 4 && T::CACHECTL_A == 0 && T::B_CACHE == 0));
     static_assert(T::SPLIT_K == 1 || T::SPLIT_K == 2 || T::SPLIT_K == 4);
-    // Runtime dimensions and contiguous tensor strides.
     const int total_k = ShortK ? __builtin_amdgcn_readfirstlane(kargs.k) : kargs.k;
     __builtin_assume(total_k > 0 && total_k % (T::SPLIT_K * BK) == 0);
     __builtin_assume(static_cast<unsigned>(kargs.m) - 1 < 1024);
@@ -340,7 +328,6 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_direct_b_body_impl(
     static_assert(BK == 128 || BK == 256 || BK == 512);
     static_assert(T::T_M * T::T_N * T::WARP_SIZE == T::BLOCK_SIZE);
     static_assert(T::MR * T::T_M * T::W_M == T::B_M && T::NR * T::T_N * T::W_N == T::B_N);
-    // Tile and thread coordinates.
     const Index tid       = thread_id_x();
     const Index lane_id   = tid % T::WARP_SIZE;
     const Index wave_id   = __builtin_amdgcn_readfirstlane(tid / T::WARP_SIZE);
@@ -351,7 +338,6 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_direct_b_body_impl(
     const int row        = block_id_y() * BM;
     const int tile_n = [&] {
         if constexpr (BM == 16 && BN == 16 && T::NUM_WAVES == 1 && T::SPLIT_K == 1) {
-            // The original tile order distributes adjacent groups across gfx950 XCDs.
             const int groups = N / (8 * BN);
             return block_id_x() % 8 * groups + block_id_x() / 8;
         } else {
@@ -360,7 +346,6 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_direct_b_body_impl(
     }();
     const int col        = tile_n * BN;
     const int valid_rows = M - row < BM ? M - row : BM;
-    // Global memory views bound the final partial-M tile.
     auto g_a = make_gmem(
         reinterpret_cast<const D_A*>(kargs.ptr_a) + row * stride_a + part_start,
         static_cast<unsigned>(valid_rows * stride_a - part_start));
@@ -398,7 +383,6 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_direct_b_body_impl(
     array<typename Base::vtype_c, MR * NR> c{};
     array<array<array<typename Base::vtype_b, NR>, KS>, BS> b_regs;
     constexpr int VecScaleA = T::VEC_SCALE_A;
-    // Apply the A LDS XOR permutation after constructing the logical layouts.
     constexpr int a_threads_k = T::B_K / T::VEC_A;
     constexpr int a_rows_per_wave = T::WARP_SIZE / a_threads_k;
     const int a_wave_n = wave_id % T::A_COPY_N;
@@ -431,7 +415,6 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_direct_b_body_impl(
     const auto u_rsfb = layout::make_layout_rsfb<T>(wave_id_n);
     const auto u_gc = layout::make_layout_gc_fragment<T>(lane_id, wave_id_m, wave_id_n, stride_c);
     const auto u_sc = layout::make_layout_sc_fragment<T>(lane_id, wave_id_m, wave_id_n);
-    // Prefetch one B panel directly into its VGPR queue slot.
     auto issue_b = [&](auto bi, int kt) {
         if constexpr ((ShortK && T::UNIFORM_SHORT_QUEUE) ||
                       (!ShortK && !(BM == 64 && BN == 128 && BK == 128 && T::T_M == 1 && T::T_N == 2 && NB == 4 && BD == 3 && T::WG_PER_CU == 1 && T::VEC_SCALE_A == 16 && T::SPLIT_K == 1 && T::CACHECTL_A == 1 && T::B_CACHE == 17) &&
@@ -457,7 +440,6 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_direct_b_body_impl(
         });
         __builtin_amdgcn_sched_barrier(0);
     };
-    // Prefetch one A panel into a padded LDS stage.
     auto issue_a = [&](int slot, int kt) {
         if constexpr ((ShortK && T::UNIFORM_SHORT_QUEUE) ||
                       (!ShortK && !(BM == 64 && BN == 128 && BK == 128 && T::T_M == 1 && T::T_N == 2 && NB == 4 && BD == 3 && T::WG_PER_CU == 1 && T::VEC_SCALE_A == 16 && T::SPLIT_K == 1 && T::CACHECTL_A == 1 && T::B_CACHE == 17) &&
@@ -485,7 +467,6 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_direct_b_body_impl(
         }
         __builtin_amdgcn_sched_barrier(0);
     };
-    // Move the scale view; row and final-window bounds stay at the load site.
     auto issue_scale_panel = [&](int first_column) {
         const int remaining = part_sc - first_column;
         const int available = remaining < SC ? remaining : SC;
@@ -522,7 +503,6 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_direct_b_body_impl(
         }
         constexpr bool live_b = !ShortK &&
             (KS == 4 || (KS == 1 && BN >= 128) || BM <= 32);
-        // Limit B producers only in the tile schedules that benefit from it.
         if (!live_b || tid < T::SB_ROWS * SC) {
             const int index = live_b ? tid : tid % (T::SB_ROWS * SC);
             const int group = index / SC;
@@ -535,14 +515,12 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_direct_b_body_impl(
                     col / 128 * kargs.stride_sfb + first_column);
         }
     };
-    // Consume one panel, overlapping its reads and MFMA with queue refills.
     auto consume_panel = [&](int t, int slot, auto bi, auto wai, auto wbi, auto fai, auto fbi) {
         constexpr int set   = decltype(bi)::value;
         constexpr int wa    = decltype(wai)::value;
         constexpr int wb    = decltype(wbi)::value;
         const bool future_a = fai;
         const bool future_b = fbi;
-        // Wait for the A stage and replenish the B queue.
         __builtin_amdgcn_sched_barrier(0);
         if constexpr (wa >= 0)
             s_waitcnt_vmcnt(number<(wa > 63 ? 63 : wa)>{});
@@ -555,7 +533,6 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_direct_b_body_impl(
                 sync_threads();
         if (future_b)
             issue_b(number<(set + BD) % BS>{}, t + BD);
-        // Read A fragments and their A/B scales from the current LDS window.
         array<array<typename Base::vtype_a, MR>, KS> af;
         array<array<unsigned, MR>, KS> as;
         array<array<unsigned, NR>, KS> bs;
@@ -604,14 +581,12 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_direct_b_body_impl(
             });
         });
         __builtin_amdgcn_sched_barrier(0);
-        // Refill the consumed A stage before computing this panel.
         if (future_a)
             issue_a(slot == 0 ? NB - 1 : slot - 1, t + NB - 1);
         __builtin_amdgcn_sched_barrier(0);
         if constexpr (NB > 2 && wb >= 0)
             s_waitcnt_vmcnt(number<(wb > 63 ? 63 : wb)>{});
         s_waitcnt_lgkmcnt(0_I);
-        // Compute the K128 MFMA slices for this panel.
         static_for<KS>([&](auto ki) {
             constexpr int ks = decltype(ki)::value;
             auto compute = [&](auto mi, auto ni) {
@@ -661,8 +636,6 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_direct_b_body_impl(
         static_assert(T::RESIDENT_BYTES / T::STAGE_BYTES <= SC / KS);
         auto roll_scales = [](int) {};
         auto begin_panels = [&] {
-            // Prologue.
-            // Issue B, the first A stage, both scale panels, then the remaining A stages.
             if constexpr (!early_b0) static_for<T::INITIAL_B>([&](auto i) {
                 if constexpr (ShortK && T::UNIFORM_SHORT_QUEUE)
                     issue_b(i, decltype(i)::value);
@@ -685,7 +658,6 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_direct_b_body_impl(
             }
         };
         auto run_short = [&](auto full) {
-            // Short-K main loop: fixed resident A slots.
             constexpr int capacity = T::RESIDENT_BYTES / T::STAGE_BYTES;
             constexpr int full_panels = capacity - (resident_six && BK == 128 ? 2 : (resident_three ? 1 : (resident362 ? 3 : 0)));
             const int panels = decltype(full)::value ? full_panels : P;
@@ -799,8 +771,6 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_direct_b_body_impl(
             run_short(number<false>{});
         }
     } else {
-        // Prologue.
-        // Issue B, the first A stage, both scale panels, then the remaining A stages.
         static_for<T::INITIAL_B>([&](auto i) {
             if constexpr (ShortK && T::UNIFORM_SHORT_QUEUE)
                 issue_b(i, decltype(i)::value);
@@ -837,7 +807,6 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_direct_b_body_impl(
             }
         };
         if constexpr (ShortK) {
-            // Short-K main loop: fixed resident A slots.
             constexpr int capacity = T::RESIDENT_BYTES / T::STAGE_BYTES;
             // Subgroup copiers publish all resident A before the other waves consume it.
             constexpr bool publish_all = T::A_COPY_THREADS != T::BLOCK_SIZE;
@@ -910,8 +879,6 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_direct_b_body_impl(
                 }
             });
         } else {
-            // Normal-K main loop: rolling A stages and B VGPR slots.
-            // Keep one computation site per B register set in the runtime loop.
             // Clamped lookahead preserves the steady A/B wait ledger.
             consume_panel(0, 0, 0_I, number<(T::INITIAL_A - 1) * T::A_REPEATS>{}, number<-1>{},
                  number<true>{}, number<true>{});
@@ -949,7 +916,6 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_direct_b_body_impl(
         }
     }
     // Drain outstanding global copies before the output arena is reused.
-    // Writeback and split-K partials.
     if constexpr (T::OUTPUT == 0)
         s_waitcnt_vmcnt(0_I);
     if constexpr (T::SPLIT_K > 1) {
@@ -963,13 +929,11 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_direct_b_body_impl(
             });
         });
     } else {
-        // Stage C in LDS and gather contiguous BF16 stores.
         constexpr int MAX_ROWS = BM;
         static_for<(MAX_ROWS + T::C_ROWS - 1) / T::C_ROWS>([&](auto parti) {
             constexpr int part      = decltype(parti)::value;
             constexpr int PART_ROWS =
                 MAX_ROWS - part * T::C_ROWS < T::C_ROWS ? MAX_ROWS - part * T::C_ROWS : T::C_ROWS;
-            // Store one BF16 stripe from the MFMA register tile.
             s_waitcnt_lgkmcnt(0_I);
             if constexpr (T::NUM_WAVES > 1)
                 sync_threads();
@@ -987,7 +951,6 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_direct_b_body_impl(
             s_waitcnt_lgkmcnt(0_I);
             if constexpr (T::NUM_WAVES > 1)
                 sync_threads();
-            // Gather contiguous BF16 vectors from the LDS stripe.
             constexpr int CHUNKS = (PART_ROWS * (BN / 8) + T::BLOCK_SIZE - 1) / T::BLOCK_SIZE;
             array<vector_t<bf16_t, 8>, CHUNKS> output;
             const auto u_sc_out = layout::make_layout_sc_vector<T, PART_ROWS>(lane_id, wave_id);
@@ -1001,7 +964,6 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_direct_b_body_impl(
                 else if (rr < PART_ROWS)
                     output[i] = load<8>(s_c, u_sc_out.offsets[i]);
             });
-            // Write only the valid M rows to global memory.
             __builtin_amdgcn_sched_barrier(0);
             s_waitcnt_lgkmcnt(0_I);
             static_for<CHUNKS>([&](auto ii) {
@@ -1020,8 +982,6 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_direct_b_body_impl(
         s_waitcnt_vmcnt(0_I);
 }
 #endif // gfx950
-// A uses its LDS ring; B is loaded directly into its VGPR prefetch queue.
-// Only the K draining mode is an entry parameter.
 template<class Traits, bool ShortK>
 __global__ __launch_bounds__(Traits::BLOCK_SIZE, Traits::WG_PER_CU)
 void opus_gemm_bpreshuffle_direct_b_kernel(

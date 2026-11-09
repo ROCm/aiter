@@ -40,12 +40,9 @@ __host__ __device__ constexpr int rows(int bm, int bn, int bytes) {
 }
 } // namespace opus_gemm_bpreshuffle_direct_b_resources
 
-// A complete tile uses an A LDS ring and a direct B VGPR queue.
-// K and tensor strides remain runtime values; only actual resource axes are public.
 template<int BM, int BN, int BK, int WM, int WN, int Stages, int Ahead,
     int WGPerCU, int ACache, int BCache, int ScaleVec, int Output, int SplitK = 1>
 struct opus_gemm_bpreshuffle_direct_b_traits {
-    // Workgroup, wave tiles and operand vectors define the shared Opus layouts.
     static constexpr int WARP_SIZE = 64;
     static constexpr int NUM_WAVES = WM * WN;
     static constexpr int W_M = 16;
@@ -65,7 +62,6 @@ struct opus_gemm_bpreshuffle_direct_b_traits {
     static constexpr int B_CHUNKS_PER_FRAGMENT = W_N * W_K / (WARP_SIZE * VEC_B);
 
 
-    // Tile geometry and execution resources.
     static constexpr int B_M = BM;
     static constexpr int B_N = BN;
     static constexpr int B_K = BK;
@@ -86,7 +82,6 @@ struct opus_gemm_bpreshuffle_direct_b_traits {
     static constexpr int INITIAL_A = Stages - 1;
     static constexpr int INITIAL_B = Ahead;
 
-    // A stage storage and copy ownership.
     static constexpr int A_REPEATS = (BM * BK + BLOCK_SIZE * VEC_A - 1) / (BLOCK_SIZE * VEC_A);
     static constexpr int A_BYTES = A_REPEATS * BLOCK_SIZE * VEC_A;
     static constexpr int A_COPY_THREADS = BLOCK_SIZE;
@@ -96,10 +91,8 @@ struct opus_gemm_bpreshuffle_direct_b_traits {
     static constexpr int STAGE_BYTES = A_BYTES;
     static constexpr int B_ISSUES = NR * B_CHUNKS_PER_FRAGMENT * KS;
 
-    // Scale windows and LDS offsets.
     static constexpr int SA_SPACING = ScaleVec == 1 ? 4 : 1;
     static constexpr int SB_ROWS = (BN + GROUP_N - 1) / GROUP_N;
-    // Byte scales and three matrix slots share the old BM32 resource footprint.
     static constexpr bool UNIFORM_SHORT_QUEUE = BM == 64 && BN == 64 && BK == 128 && WM == 1 && WN == 4 &&
             Stages == 4 && Ahead == 2 && WGPerCU == 1 && ACache == 0 && BCache == 2 && ScaleVec == 4;
     static constexpr int STORE_CACHE = UNIFORM_SHORT_QUEUE ? 0 : 2;
@@ -135,7 +128,6 @@ struct opus_gemm_bpreshuffle_direct_b_traits {
     static constexpr int C_ROWS =
         opus_gemm_bpreshuffle_direct_b_resources::rows(BM, BN, LDS_BYTES);
 
-    // Short-K resident capacity uses the same tile and scale layouts.
     static constexpr int RESIDENT_PANELS = [] {
         if (RESIDENT_K128_SIX) return Stages;
         if (UNIFORM_SHORT_QUEUE) return Stages - 1;
@@ -156,7 +148,6 @@ struct opus_gemm_bpreshuffle_direct_b_traits {
     static constexpr int SHORT_LDS_BYTES = RESIDENT_PANELS * SHORT_A_BYTES + SHORT_SA_BYTES + SB_BYTES;
     static constexpr int RESIDENT_BYTES = RESIDENT_PANELS * A_BYTES;
 
-    // All queries accept total K; only the partition panel count selects storage.
     __host__ __device__ static constexpr bool short_k(int k) {
         return k / (SplitK * BK) <= RESIDENT_PANELS;
     }
@@ -177,7 +168,6 @@ struct opus_gemm_bpreshuffle_direct_b_traits {
     }
 
 
-    // Candidate constraints bound every shared resource.
     static_assert(BM > 0 && BM % (WM * 16) == 0 && BN > 0 && BN % (WN * 16) == 0);
     static_assert((WM == 1 || WM == 2) && (WN == 1 || WN == 2 || WN == 4 || WN == 8));
     static_assert(WM * WN <= 8 && BN <= 256 && (BN >= 128 ? BN % 128 == 0 : 128 % BN == 0));
@@ -198,7 +188,6 @@ struct opus_gemm_bpreshuffle_direct_b_traits {
     static_assert(C_ROWS * (BN + 8) * 2 <= LDS_BYTES);
 };
 
-// Short K changes the resident arena; the tile, layouts and computation are shared.
 template<class Base>
 struct opus_gemm_bpreshuffle_direct_b_short_traits : Base {
     static constexpr int A_COPY_THREADS =

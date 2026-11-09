@@ -480,8 +480,7 @@ def _make_host_decl(kid_name, dtype, host_extra_params):
 
 def _make_a8w8_bpreshuffle_host_decl(kid_name, dtype, host_extra_params):
     """Emit the bpreshuffle host declaration with an optional workspace tail."""
-    # The gfx942 emitter passes the legacy scale marker, whose tensors are
-    # already present below. Keep its original five-tensor declaration.
+    # gfx942 already includes the scale tensors below.
     if host_extra_params == A8W8_BLOCKSCALE_HOST_EXTRA:
         host_extra_params = ""
     return (
@@ -1481,7 +1480,7 @@ if __name__ == "__main__":
             instance = available.get(key)
             name = str(row.get("kernelName", ""))
             if instance is None or (
-                name not in ("", "nan", "None") and not instance.matches_name(name)
+                name not in ("", "nan", "None") and name != instance.name
             ):
                 continue
             csv_keys.add(key)
