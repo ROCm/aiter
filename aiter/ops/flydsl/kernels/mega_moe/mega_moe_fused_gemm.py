@@ -32,8 +32,15 @@ def _addr_view(buf, elem, width):
     )
 
 
-def load_at(buf, index, elem=fx.Int32, width=1, cache_modifier=0):
-    """Load ``width`` x ``elem`` at element ``index`` of ``buf``."""
+def load_at(buf, index, elem=fx.Int32, width=1, cache_modifier=0, mask=None):
+    """Load ``width`` x ``elem`` at element ``index`` of ``buf``.
+
+    A false ``mask`` moves the access past the buffer bound.
+    """
+    if mask is not None:
+        index = fx.Boolean(mask).select(
+            index, fx.Int32(0x7FFFFFFF // (elem.width // 8))
+        )
     return buf_copy_load(
         _addr_view(buf, elem, width), index, elem, width, cache_modifier
     )
