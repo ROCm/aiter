@@ -48,38 +48,6 @@ def _flydsl_pointer_dtype(dtype: torch.dtype):
     }[dtype]
 
 
-def _static_split_count(
-    num_compute_units: int,
-    parallel_rows: int,
-    context_capacity: int,
-    min_tiles_per_cta: int,
-    partition_limit: int | None = None,
-) -> int:
-    """Host-only split from launch geometry and visible context capacity.
-
-    Power-of-two P keeps reducer variants bounded. Enough KV tiles and at least
-    eight CTAs per logical row are required to pay for the second launch.
-    Supplied scratch bounds P through ``partition_limit`` without allocating
-    replacements for buffers whose original capacity is already sufficient.
-    Page IDs beyond the staged scheduling bound use the existing table-load
-    fallback, so a short host hint does not bound the runtime partition span.
-    """
-    if parallel_rows < 1 or context_capacity < 1:
-        return 1
-    tiles = -(-context_capacity // KV_COMPUTE_BLOCK)
-    if tiles < 64:
-        return 1
-    # Match the planner's two-CTAs-per-CU budget. A sparse runtime batch can
-    # otherwise strand CUs when only one of its fixed sequence grids is busy.
-    target = min(num_compute_units, 2 * num_compute_units // parallel_rows)
-    target = min(target, tiles // min_tiles_per_cta)
-    if partition_limit is not None:
-        target = min(target, partition_limit)
-    if target < 8:
-        return 1
-    return 1 << (target.bit_length() - 1)
-
-
 def launch_pa_decode_ps_reduce(
     output: torch.Tensor,
     exp_sums: torch.Tensor,
@@ -361,36 +329,9 @@ def _pa_decode_mxfp4(
         if work_plan.sliding_window:
             raise ValueError("sliding_window must match work_plan.sliding_window")
     props = torch.cuda.get_device_properties(dev)
-    static_partitions = 0
-    if (
-        work_plan is None
-        and same_strides
-        and exp_sums is None
-        and max_logits is None
-        and temporary_output is None
-    ):
-        candidate = _static_split_count(
-            props.multi_processor_count,
-            num_seqs * num_kv_heads,
-            max_blocks_per_seq * 128,
-            4,
-        )
-        static_partitions = 0 if candidate == 1 else candidate
-    # Short rows retain the one-node producer. Long plan-free rows use packed
-    # static partials and the existing deterministic reducer.
-    direct = static_partitions == 0 and (
-        work_plan is None or (work_plan.max_partitions == 1 and same_strides)
-    )
-    capacity = (
-        num_seqs * static_partitions
-        if static_partitions
-        else num_seqs if direct else work_plan.capacity
-    )
-    static_reduce_info = (
-        torch.empty((num_seqs, 2), dtype=torch.int32, device=dev)
-        if static_partitions
-        else context_lengths if work_plan is None else work_plan.reduce_info
-    )
+    # One task per sequence needs neither partial scratch nor the reducer.
+    direct = work_plan is None or (work_plan.max_partitions == 1 and same_strides)
+    capacity = num_seqs if direct else work_plan.capacity
     with torch.cuda.device(dev):
         compiled = compile_pa_decode_tile(
             head_dim=head_dim,
@@ -399,18 +340,13 @@ def _pa_decode_mxfp4(
             num_seqs=num_seqs,
             num_kv_heads=num_kv_heads,
             num_compute_units=props.multi_processor_count,
-            num_partitions=(
-                static_partitions
-                if static_partitions
-                else 1 if direct else work_plan.max_partitions
-            ),
+            num_partitions=1 if direct else work_plan.max_partitions,
             softmax_scale=softmax_scale,
             query_dtype="fp8" if query.dtype == torch.float8_e4m3fn else "bf16",
             kv_dtype="mxfp4",
             work_capacity=capacity,
             max_context_length=schedule_context_length,
             direct_output=direct,
-            static_partitions=static_partitions,
         )
     pmax = psum = pout = output
     if not direct:
@@ -453,11 +389,7 @@ def _pa_decode_mxfp4(
             *page_head_strides,
             query.stride(0),
             query.stride(1),
-            ptr_arg(
-                context_lengths if direct or static_partitions else work_plan.work_info,
-                fx.Int32,
-            ),
-            ptr_arg(static_reduce_info, fx.Int32),
+            ptr_arg(context_lengths if direct else work_plan.work_info, fx.Int32),
             capacity,
             stream,
         )
@@ -480,13 +412,9 @@ def _pa_decode_mxfp4(
             query_group_size=group,
             head_size=head_dim,
             # Not bounded by max_context_length: a task may own more tokens than it.
-            max_partitions=(
-                static_partitions
-                if static_partitions
-                else min(work_plan.max_partitions, capacity)
-            ),
+            max_partitions=min(work_plan.max_partitions, capacity),
             stream=stream,
-            reduce_info=static_reduce_info,
+            reduce_info=work_plan.reduce_info,
         )
 
 
@@ -552,12 +480,8 @@ def pa_decode(
     Decode and graph replay use the explicit plan without accessing autotune. Set its
     partition cap with ``plan_pa_decode(max_partitions=...)``. On gfx950, a cap
     of one writes output directly when sinks are absent and query/output
-    strides match. Long FP8/BF16 calls may instead use static partials and
-    reduce them in fixed order, including sliding windows, sinks, strided
-    outputs and multi-partition plans. All supported heads, pages and query
-    shapes share this path. Supplied scratch is reused as packed storage;
-    its capacity bounds the static split. The caller's plan metadata remains
-    unchanged.
+    strides match. Other FP8/BF16 calls use the caller's packed tasks and
+    fixed-order reducer. Decode leaves the caller's plan metadata unchanged.
     On gfx1250, when
     sinks are absent and query/output strides match, a cap of one writes output
     directly. So do plans with one task slot per sequence (capacity equal to
@@ -588,10 +512,9 @@ def pa_decode(
     rows. V is staged as bf16, so a V element above the bf16 maximum (3.39e38: e8m0
     byte 254 with an e2m1 magnitude of 2 or more, byte 253 with 4 or more) widens to
     infinity even when the normalized output is finite. ``work_plan=None`` is
-    accepted for MXFP4 only: short rows write output directly with the query's
-    row and head strides, and context-0 rows are zero-filled. Long plan-free
-    calls without supplied scratch may use private static partials and the
-    fixed-order reducer. A plan with ``max_partitions == 1`` retains direct
+    accepted for MXFP4 only: one task per sequence writes output directly with
+    the query's row and head strides, and context-0 rows are zero-filled.
+    A plan with ``max_partitions == 1`` retains direct
     output when the strides match. A task may span at
     most 4096 pages in ``max_context_length``: pass a smaller one otherwise. A
     real context longer than that bound is still fully attended (up to 2**19
@@ -1028,46 +951,6 @@ def pa_decode(
         ) // KV_COMPUTE_BLOCK + 1
         max_partitions = min(max_partitions, window_tiles)
     num_compute_units = torch.cuda.get_device_properties(dev).multi_processor_count
-    static_partitions = 0
-    if arch == "gfx950":
-        # Only visible tiles contribute work. The extra tile accounts for an
-        # unaligned left edge of the causal MTP window union.
-        visible_capacity = context_capacity_length
-        if sliding_window > 0:
-            visible_capacity = min(visible_capacity, window_tiles * KV_COMPUTE_BLOCK)
-        # Keep caller allocations useful: every supplied buffer has the
-        # original plan capacity, and static partials reuse a packed prefix.
-        # A multi-partition plan compacted to one slot per sequence carries
-        # a single-task workgroup budget; retain that bounded launch policy.
-        partition_limit = (
-            work_plan.capacity // num_seqs
-            if (
-                any(t is not None for t in (exp_sums, max_logits, temporary_output))
-                or (num_partitions > 1 and work_plan.capacity == num_seqs)
-            )
-            else None
-        )
-        candidate = _static_split_count(
-            num_compute_units,
-            num_seqs * num_kv_heads,
-            visible_capacity,
-            2,
-            partition_limit,
-        )
-        # Retain a larger caller partition cap when its pooled budget already
-        # supplies this many tasks. It can concentrate slots on long rows;
-        # uniform static grids would merge useful work or add idle CTAs.
-        if num_partitions > candidate and work_plan.capacity >= candidate:
-            candidate = 1
-        static_partitions = 0 if candidate == 1 else candidate
-    # Static slots belong to this invocation, not to the reusable caller plan.
-    # A later call may use that plan's original records with supplied scratch
-    # or a strided output, so its reduction metadata must remain unchanged.
-    static_reduce_info = (
-        torch.empty((num_seqs, 2), dtype=torch.int32, device=dev)
-        if static_partitions
-        else work_plan.reduce_info
-    )
     # gfx950 one-partition plans have capacity == batch; reduce_info therefore
     # proves every nonempty sequence owns exactly one producer task. With no
     # sinks and matching output strides, that producer can normalize directly
@@ -1076,7 +959,6 @@ def pa_decode(
     # the existing reducer.
     gfx950_one_partition_output = (
         arch == "gfx950"
-        and static_partitions == 0
         and num_partitions == 1
         and sinks is None
         and output.stride() == query.stride()
@@ -1147,7 +1029,7 @@ def pa_decode(
             num_seqs=num_seqs,
             num_kv_heads=num_kv_heads,
             num_compute_units=num_compute_units,
-            num_partitions=static_partitions or num_partitions,
+            num_partitions=num_partitions,
             softmax_scale=softmax_scale,
             query_dtype=query_dtype,
             kv_dtype=kv_dtype,
@@ -1156,61 +1038,47 @@ def pa_decode(
             trans_v=trans_v,
             wide_kv_addressing=wide_kv_addressing,
             kv_buffer_u32=kv_buffer_u32,
-            work_capacity=(
-                num_seqs * static_partitions
-                if static_partitions
-                else work_plan.capacity
-            ),
+            work_capacity=work_plan.capacity,
             max_context_length=schedule_context_length,
             sliding_window=sliding_window,
             direct_output=direct_output,
             trans_k=trans_k,
             mask_unowned_kv=mask_unowned_kv,
             cluster_merge=cluster_merge,
-            static_partitions=static_partitions,
         )
 
     total_rows = query_length * query_group_size
-    partial_capacity = (
-        num_seqs * static_partitions if static_partitions else work_plan.capacity
-    )
-    expected_scalar_shape = (num_kv_heads, partial_capacity, total_rows)
+    expected_scalar_shape = (num_kv_heads, work_plan.capacity, total_rows)
     expected_output_shape = (*expected_scalar_shape, head_dim)
-    supplied_scalar_shape = (num_kv_heads, work_plan.capacity, total_rows)
     scratch_specs = (
         (
             "max_logits",
             pmax,
             expected_scalar_shape,
-            supplied_scalar_shape,
             torch.float32,
         ),
         (
             "exp_sums",
             psum,
             expected_scalar_shape,
-            supplied_scalar_shape,
             torch.float32,
         ),
         (
             "temporary_output",
             pout,
             expected_output_shape,
-            (*supplied_scalar_shape, head_dim),
             output.dtype,
         ),
     )
     validated_scratch = []
-    for name, tensor, shape, supplied_shape, dtype in scratch_specs:
+    for name, tensor, shape, dtype in scratch_specs:
         if tensor is not None:
             if not isinstance(tensor, torch.Tensor):
                 raise TypeError(
                     f"{name} must be a torch.Tensor, got {type(tensor).__name__}"
                 )
-            if tensor.shape != supplied_shape:
-                raise ValueError(
-                    f"{name} shape {tuple(tensor.shape)} != {supplied_shape}"
-                )
+            if tensor.shape != shape:
+                raise ValueError(f"{name} shape {tuple(tensor.shape)} != {shape}")
             if tensor.dtype != dtype:
                 raise TypeError(f"{name} must be {dtype}, got {tensor.dtype}")
             if tensor.device != dev:
@@ -1220,11 +1088,6 @@ def pa_decode(
                 )
             if not tensor.is_contiguous():
                 raise ValueError(f"{name} must be contiguous")
-            if static_partitions:
-                elements = num_kv_heads * partial_capacity * total_rows
-                if name == "temporary_output":
-                    elements *= head_dim
-                tensor = tensor.view(-1)[:elements].view(shape)
         elif not gfx950_one_partition_output:
             tensor = torch.empty(*shape, dtype=dtype, device=dev)
         validated_scratch.append(tensor)
@@ -1247,13 +1110,6 @@ def pa_decode(
                 else flyc.from_c_void_p(fx.Int32, 0)
             ),
         )
-    # gfx1250 retains its existing launch ABI; only the gfx9 launch accepts the
-    # pointer used to publish static reduction metadata.
-    static_args = (
-        ()
-        if arch in ("gfx1250", "gfx1250-strict")
-        else (ptr_arg(static_reduce_info, fx.Int32),)
-    )
     with torch.cuda.device(dev):
         s = torch.cuda.current_stream(dev)
         _run_compiled(
@@ -1289,12 +1145,8 @@ def pa_decode(
             stride_ks_head,
             int(query.stride(0)),
             int(query.stride(1)),
-            ptr_arg(
-                context_lengths if static_partitions else work_plan.work_info,
-                fx.Int32,
-            ),
-            *static_args,
-            partial_capacity,
+            ptr_arg(work_plan.work_info, fx.Int32),
+            work_plan.capacity,
             *merge_args,
             s,
         )
@@ -1321,7 +1173,7 @@ def pa_decode(
             query_seq_len=query_length,
             query_group_size=query_group_size,
             head_size=head_dim,
-            max_partitions=static_partitions or max_partitions,
+            max_partitions=max_partitions,
             stream=s,
-            reduce_info=static_reduce_info,
+            reduce_info=work_plan.reduce_info,
         )

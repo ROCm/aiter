@@ -2147,23 +2147,11 @@ def test_pa_decode_unowned_kv_rows(
     "kv,query_length,per_token",
     [("fp8", 1, False), ("fp8", 2, True), ("mxfp4", 1, False)],
 )
-def test_pa_decode_static_graph_and_plan_reuse(
-    device, monkeypatch, kv, query_length, per_token
-):
-    """Wide-table replay rewrites empty partials and preserves the caller plan."""
+def test_pa_decode_graph_and_plan_reuse(device, kv, query_length, per_token):
+    """Wide-table replay refreshes packed tasks and preserves them during decode."""
     if get_gfx_runtime() != "gfx950":
-        pytest.skip("static split runs on gfx950")
-    if torch.cuda.get_device_properties(device).multi_processor_count < 16:
-        pytest.skip("the static split needs at least eight CTAs per row")
+        pytest.skip("gfx950 direct-output and plan-free replay")
     pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
-    compile_tile = pa.compile_pa_decode_tile
-    static_calls = []
-
-    def track_static(**kwargs):
-        static_calls.append(kwargs.get("static_partitions", 0))
-        return compile_tile(**kwargs)
-
-    monkeypatch.setattr(pa, "compile_pa_decode_tile", track_static)
     torch.manual_seed(71)
     capacity, group, page, dim = (
         16384,
@@ -2216,6 +2204,13 @@ def test_pa_decode_static_graph_and_plan_reuse(
     output = torch.empty_like(query)
 
     def launch(out=output, **scratch):
+        nonlocal original_info, original_work
+        if plan is not None:
+            pa.plan_pa_decode(context, 1, query_length=query_length, plan=plan)
+            original_info, original_work = (
+                plan.reduce_info.clone(),
+                plan.work_info.clone(),
+            )
         pa.pa_decode(
             out,
             query,
@@ -2253,7 +2248,6 @@ def test_pa_decode_static_graph_and_plan_reuse(
 
     launch()
     check()
-    assert static_calls[-1] >= 2
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         launch()
@@ -2275,9 +2269,7 @@ def test_pa_decode_static_graph_and_plan_reuse(
             graph.replay()
             assert torch.equal(output, previous)
     if plan is not None:
-        # A one-slot scratch buffer cannot hold static partials. This fallback
-        # uses the original packed plan, after calls with private static slots.
-        # The last replay restored the original lengths, so no refresh is needed.
+        # Strided output uses packed partials and the caller's reusable scratch.
         padded = torch.full(
             (query.shape[0], 2 * group, dim),
             float("nan"),
@@ -2298,7 +2290,7 @@ def test_pa_decode_static_graph_and_plan_reuse(
         assert torch.isnan(padded[:, group:]).all()
 
 
-def _make_static_generalized_inputs(device, case):
+def _make_generalized_inputs(device, case):
     """Shared unit-test inputs for correctness and before/after measurements."""
     config = {
         "kv": "fp8",
@@ -2316,7 +2308,6 @@ def _make_static_generalized_inputs(device, case):
         "short_hint": False,
         "head_stride": False,
         "capacity": 32768,
-        "expect_static": True,
     }
     config.update(case)
     dim, page, qlen, group = (
@@ -2479,7 +2470,6 @@ def _make_static_generalized_inputs(device, case):
                 "partitions": 128,
                 "scratch": "all",
                 "head_stride": True,
-                "expect_static": False,
             },
             id="fp8-window-packed-scratch",
         ),
@@ -2493,7 +2483,6 @@ def _make_static_generalized_inputs(device, case):
                 "window": 16385,
                 "partitions": 128,
                 "scratch": "exp_sums",
-                "expect_static": False,
             },
             id="fp8-window-mixed-scratch",
         ),
@@ -2521,7 +2510,6 @@ def _make_static_generalized_inputs(device, case):
                 "window": 16385,
                 "partitions": 64,
                 "scratch": "all",
-                "expect_static": False,
             },
             id="bf16-mtp64-window-scratch",
         ),
@@ -2545,7 +2533,6 @@ def _make_static_generalized_inputs(device, case):
                 "partitions": 24,
                 "scratch": "all",
                 "head_stride": True,
-                "expect_static": False,
             },
             id="fp8-window-nonpower-scratch",
         ),
@@ -2559,32 +2546,25 @@ def _make_static_generalized_inputs(device, case):
                 "window": 16385,
                 "partitions": 24,
                 "scratch": "exp_sums",
-                "expect_static": False,
             },
             id="fp8-window-nonpower-mixed-scratch",
         ),
     ],
 )
-def test_pa_decode_static_generalized(device, monkeypatch, case):
-    """Static partials cover supported layouts, windows and reusable scratch."""
+def test_pa_decode_generalized(device, monkeypatch, case):
+    """Packed tasks cover supported layouts, windows and reusable scratch."""
     if get_gfx_runtime() != "gfx950":
-        pytest.skip("static split runs on gfx950")
-    if torch.cuda.get_device_properties(device).multi_processor_count < 32:
-        pytest.skip("the static split needs at least eight CTAs per logical row")
+        pytest.skip("gfx950 generalized packed-task coverage")
     config, args, kwargs, padded, scratch, logical_key, logical_value = (
-        _make_static_generalized_inputs(device, case)
+        _make_generalized_inputs(device, case)
     )
     output, query, kc, _vc, context, table, _, qlen = args
     group, capacity, heads = config["group"], config["capacity"], kc.shape[1]
     sinks, plan = kwargs["sinks"], kwargs["work_plan"]
     original_info, original_work = plan.reduce_info.clone(), plan.work_info.clone()
     pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
-    compile_tile, reduce = pa.compile_pa_decode_tile, pa.launch_pa_decode_ps_reduce
-    static_calls, partials = [], []
-
-    def track_static(**kwargs):
-        static_calls.append(kwargs.get("static_partitions", 0))
-        return compile_tile(**kwargs)
+    reduce = pa.launch_pa_decode_ps_reduce
+    partials = []
 
     def track_reduce(out, sums, maxima, values, *args, **kwargs):
         partials.append(
@@ -2592,24 +2572,22 @@ def test_pa_decode_static_generalized(device, monkeypatch, case):
         )
         return reduce(out, sums, maxima, values, *args, **kwargs)
 
-    monkeypatch.setattr(pa, "compile_pa_decode_tile", track_static)
     monkeypatch.setattr(pa, "launch_pa_decode_ps_reduce", track_reduce)
 
     def launch():
         nonlocal original_info, original_work
-        if not config["expect_static"]:
-            pa.plan_pa_decode(
-                context,
-                heads,
-                max_partitions=plan.max_partitions,
-                query_length=qlen,
-                sliding_window=config["window"],
-                plan=plan,
-            )
-            original_info, original_work = (
-                plan.reduce_info.clone(),
-                plan.work_info.clone(),
-            )
+        pa.plan_pa_decode(
+            context,
+            heads,
+            max_partitions=plan.max_partitions,
+            query_length=qlen,
+            sliding_window=config["window"],
+            plan=plan,
+        )
+        original_info, original_work = (
+            plan.reduce_info.clone(),
+            plan.work_info.clone(),
+        )
         pa.pa_decode(*args, **kwargs)
 
     def check():
@@ -2642,16 +2620,9 @@ def test_pa_decode_static_generalized(device, monkeypatch, case):
         for name, storage in scratch.items():
             actual = partials[-1][name]
             assert actual.data_ptr() == storage.data_ptr()
-            assert torch.isnan(storage.view(-1)[actual.numel() :]).all()
 
     launch()
     check()
-    if config["expect_static"]:
-        assert static_calls[-1] >= 8
-    else:
-        assert static_calls[-1] == 0
-    if scratch:
-        assert static_calls[-1] <= plan.capacity // context.numel()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         launch()
@@ -2669,23 +2640,6 @@ def test_pa_decode_static_generalized(device, monkeypatch, case):
             storage.fill_(float("nan"))
         graph.replay()
         check()
-        partitions = static_calls[-1]
-        for seq, length in enumerate(lengths):
-            tile_begin = (
-                max(length - config["window"] - qlen + 1, 0) // 256
-                if config["window"]
-                else 0
-            )
-            if partitions and (length + 255) // 256 - tile_begin < 64:
-                # Short replay rows use one producer despite the large table.
-                inactive = slice(seq * partitions + 1, (seq + 1) * partitions)
-                assert torch.isneginf(partials[-1]["max_logits"][:, inactive]).all()
-                assert (partials[-1]["exp_sums"][:, inactive] == 0).all()
-                assert (partials[-1]["temporary_output"][:, inactive] == 0).all()
-        if partitions and lengths == (0, 0):
-            assert torch.isneginf(partials[-1]["max_logits"]).all()
-            assert (partials[-1]["exp_sums"] == 0).all()
-            assert (partials[-1]["temporary_output"] == 0).all()
         previous = output.clone()
         for _ in range(5):
             output.fill_(float("nan"))
@@ -2695,11 +2649,11 @@ def test_pa_decode_static_generalized(device, monkeypatch, case):
 
 @pytest.mark.parametrize("kv", ["fp8", "bf16"])
 def test_pa_decode_short_hint_reducer_capacity(device, monkeypatch, kv):
-    """A short hint must not truncate live partials on the planned fallback."""
+    """A short hint must not truncate live partials in the caller's plan."""
     if get_gfx_runtime() != "gfx950":
         pytest.skip("gfx950 scheduling-hint reducer bound")
     config, args, kwargs, padded, _, logical_key, logical_value = (
-        _make_static_generalized_inputs(
+        _make_generalized_inputs(
             device,
             {
                 "kv": kv,
@@ -2713,18 +2667,13 @@ def test_pa_decode_short_hint_reducer_capacity(device, monkeypatch, kv):
     pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
     output, query, kc, _, context, table, _, qlen = args
     plan = kwargs["work_plan"]
-    compile_tile, reduce = pa.compile_pa_decode_tile, pa.launch_pa_decode_ps_reduce
-    static_calls, reduction_bounds = [], []
-
-    def track_static(**kwargs):
-        static_calls.append(kwargs.get("static_partitions", 0))
-        return compile_tile(**kwargs)
+    reduce = pa.launch_pa_decode_ps_reduce
+    reduction_bounds = []
 
     def track_reduce(*args, **kwargs):
         reduction_bounds.append(kwargs["max_partitions"])
         return reduce(*args, **kwargs)
 
-    monkeypatch.setattr(pa, "compile_pa_decode_tile", track_static)
     monkeypatch.setattr(pa, "launch_pa_decode_ps_reduce", track_reduce)
 
     def launch():
@@ -2740,7 +2689,6 @@ def test_pa_decode_short_hint_reducer_capacity(device, monkeypatch, kv):
 
     launch()
     check()
-    assert static_calls[-1] == 0
     assert reduction_bounds[-1] == plan.max_partitions == 4
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):

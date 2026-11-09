@@ -133,26 +133,12 @@ class PaDecodeSchedule:
         trans_k: bool = True,
         mask_unowned_kv: bool = True,
         direct_output: bool = False,
-        static_partitions: int = 0,
     ) -> PaDecodeSchedule:
         """Choose the existing policy from host-known grid and query bounds."""
         if isinstance(work_capacity, bool) or not isinstance(work_capacity, int):
             raise TypeError("work_capacity must be a positive int")
         if work_capacity < 1:
             raise ValueError("work_capacity must be positive")
-        if static_partitions not in (0, 1) and static_partitions < 2:
-            raise ValueError("static_partitions must be zero or at least two")
-        if static_partitions == 1:
-            static_partitions = 0
-        if static_partitions and (
-            static_partitions != num_partitions
-            or work_capacity != num_seqs * static_partitions
-            or direct_output
-        ):
-            raise ValueError(
-                "static split requires P=num_partitions, capacity=batch*P, "
-                "partial output"
-            )
         if not trans_k:
             raise NotImplementedError("Non-transposed key cache is not implemented")
         arch = str(get_rocm_arch()).split(":", 1)[0]
@@ -388,7 +374,6 @@ class PaDecodeSchedule:
             sliding_window,
             kv_dtype,
             bool(mask_unowned_kv),
-            static_partitions,
             direct_output,
             D256_PIPE,
             stage_pages,
@@ -428,9 +413,6 @@ class PaDecodeTraits:
     buffer_plan_output: bool
     D256_PIPE: bool
     stage_page_capacity: int
-    # Host-selected dense partitions. The device derives ranges from each
-    # runtime context length, so replay never depends on a host readback.
-    static_partitions: int
 
     # Element formats and instruction policy.
     FP8: type
@@ -537,7 +519,6 @@ class PaDecodeTraits:
             sliding_window,
             kv_dtype,
             mask_unowned_kv,
-            static_partitions,
             DIRECT,
             D256_PIPE,
             stage_page_capacity,
@@ -766,7 +747,6 @@ class PaDecodeTraits:
             buffer_plan_output=buffer_plan_output,
             D256_PIPE=D256_PIPE,
             stage_page_capacity=stage_page_capacity,
-            static_partitions=static_partitions,
             FP8=FP8,
             FP8_MAX=FP8_MAX,
             Q_DTYPE=Q_DTYPE,
