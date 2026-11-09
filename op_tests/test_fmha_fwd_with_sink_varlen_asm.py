@@ -672,6 +672,70 @@ _QK_SHAPES = [
 ]
 
 
+@benchmark()
+def test_fmha_fwd_with_sink_varlen_asm_d64_qk(
+    hq, hk, seqlens_q, seqlens_k, is_causal, d64_sink
+):
+    """D64 through the ops wrapper with separate q and k lengths, q > k.  Causal rows
+    that see no key must give O = 0 and LSE = -inf (the sink logit with a sink) on
+    every element; without a sink the wrapper's -inf sink meets a -inf row maximum
+    there."""
+    torch.manual_seed(0)
+    q = torch.randn(sum(seqlens_q), hq, 64, dtype=dtypes.bf16)
+    k = torch.randn(sum(seqlens_k), hk, 64, dtype=dtypes.bf16)
+    v = torch.randn(sum(seqlens_k), hk, 64, dtype=dtypes.bf16)
+    cu_q, cu_k = _cu(seqlens_q), _cu(seqlens_k)
+    sink = _d64_sink(hq) if d64_sink else None
+    ref_out, ref_lse = run_torch(q, k, v, cu_q, cu_k, is_causal=is_causal, sink=sink)
+    fn = functools.partial(
+        run_kernel,
+        q,
+        k,
+        v,
+        cu_q,
+        cu_k,
+        max(seqlens_q),
+        scale=1.0 / math.sqrt(64),
+        is_causal=is_causal,
+        sink=sink,
+        via="ops",
+    )
+    (out, lse), us = run_perftest(fn)
+    pairs = sum(_visible_pairs(a, b, is_causal) for a, b in zip(seqlens_q, seqlens_k))
+    msg = f"D64 q/k lengths c={is_causal} sink={d64_sink}"
+    # Rows without a key by position (bottom-right aligned; every k length here is
+    # non-zero): a sink makes the reference LSE finite on them too.
+    no_key = torch.cat(
+        [
+            torch.arange(a) < (a - b if is_causal else 0)
+            for a, b in zip(seqlens_q, seqlens_k)
+        ]
+    )
+    ret = {
+        "gfx": get_gfx(),
+        "rows without a key": int(no_key.sum()),
+        "asm us": us,
+        "asm TFLOPS": 2.0 * hq * pairs * (64 + 64) / us / 1e6,
+        "asm err(O)": assertAllclose(
+            ref_out.float(), out.float(), rtol=1e-2, atol=1e-2, msg=f"{msg} O"
+        ),
+        "asm err(LSE)": assertAllclose(
+            ref_lse, lse.float(), rtol=1e-2, atol=1e-2, msg=f"{msg} LSE"
+        ),
+    }
+    # assertAllclose tolerates a few bad elements; rows without a key must match on
+    # every element
+    assert not out[no_key].any(), f"{msg}: O != 0 without keys"
+    ok = torch.isclose(lse[no_key], ref_lse[no_key], rtol=1e-2, atol=1e-2)
+    assert ok.all(), f"{msg}: LSE differs from the reference without keys"
+    return ret
+
+
+# (hq, hk, seqlens_q, seqlens_k) for test_fmha_fwd_with_sink_varlen_asm_d64_qk: two
+# sequences whose q and k offsets differ; causal, the first 44 rows of each see no key.
+_D64_QK_SHAPES = [(64, 8, [300, 300], [256, 256])]
+
+
 # Attention options _select_gfx1250_fmha_fwd_varlen_asm checks the same way for
 # both kernels.  The gate tests use one sequence of 2 query and 2 key tokens, so
 # max_seqlen_k is 2.  name -> (gate arguments, accepted)
@@ -1699,6 +1763,16 @@ def main():
                 if c[0] in args.head_dim
             ],
         )
+        if 64 in args.head_dim:
+            summarize(
+                "D64 q/k lengths",
+                [
+                    test_fmha_fwd_with_sink_varlen_asm_d64_qk(hq, hk, sq, sk, c, s)
+                    for (hq, hk, sq, sk), c, s in itertools.product(
+                        _D64_QK_SHAPES, causal_modes, (True, False)
+                    )
+                ],
+            )
 
         # ---- D192x128 / D256: strided q/k/v/out, separate q and k lengths ----
         strided_hdims = [hd for hd in _STRIDED_HDIMS if hd[0] in args.head_dim]

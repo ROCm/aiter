@@ -176,6 +176,7 @@ _CORRECTNESS_SHAPES = [
     (64, 64, 8, 128, 2048, 2),
     (64, 64, 8, 130, 2048, 1),  # D64  q-unaligned (sq not mult of 128)
     (64, 64, 8, 128, 2300, 1),  # D64  kv-unaligned (sk not mult of 256) -> causal
+    (64, 64, 8, 300, 256, 2),  # D64  sq > sk: causal rows that see no key
     (128, 64, 4, 128, 2048, 1),  # D128 aligned
     (128, 64, 4, 128, 2048, 2),
     (128, 64, 4, 130, 2048, 1),  # D128 q-unaligned
@@ -247,10 +248,14 @@ def test_fmha_fwd_with_sink_asm(
     }
 
     ret = {"gfx": get_gfx()}
-    # Rows that see no key (causal, sq > sk): O = 0, LSE = -inf.  The ASM LSE is
-    # checked on every row; flash_attn_func may run FlyDSL, Triton or CK, and Triton
-    # writes LSE = 0 there, so the public LSE is checked on rows that see a key.
-    has_key = torch.isfinite(ref_lse)
+    # Rows that see no key (causal, sq > sk): O = 0, LSE = -inf, or the sink logit
+    # with a sink.  The ASM LSE is checked on every row; flash_attn_func may run
+    # FlyDSL, Triton or CK, which can write LSE = 0 there (Triton; FlyDSL with a
+    # sink), so the public LSE is checked on rows that see a key.  Those rows are
+    # found by position (bottom-right aligned): a sink makes the reference LSE
+    # finite on every row.
+    has_key = (torch.arange(sq) >= (sq - sk if is_causal else 0)).expand(batch, hq, sq)
+    no_key = ~has_key
     for name, fn in candidates.items():
         (out, lse), us = run_perftest(fn)
         ret[f"{name} us"] = us
@@ -271,6 +276,12 @@ def test_fmha_fwd_with_sink_asm(
             msg=f"{name} LSE d={head_dim} c={is_causal}",
             mask=has_key if name == "public" else None,
         )
+        # assertAllclose tolerates a few bad elements; rows without a key must match on
+        # every element: O = 0, LSE = -inf (no sink) or the sink logit
+        if name == "asm" and no_key.any():
+            assert not out.permute(0, 2, 1, 3)[no_key].any(), "asm O != 0 without keys"
+            ok = torch.isclose(lse[no_key], ref_lse[no_key], rtol=1e-2, atol=1e-2)
+            assert ok.all(), "asm LSE differs from the reference without keys"
     return ret
 
 
