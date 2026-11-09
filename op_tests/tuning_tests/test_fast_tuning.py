@@ -1119,16 +1119,20 @@ class TestFusedStage1Fp8AndSplitKCompare(unittest.TestCase):
                 sorted_ids, num_valid_ids, self.token_num, self.topk, 8
             )
 
-    def _split_k(self, quant, scale_of=lambda x: x, x=None):
-        """A split-K-like output: the bf16-rounded result quantized by quant, its
-        scales in the sorted layout, and the reference the check reads."""
+    def _fused_output(self, quant, scale_of=lambda x: x, x=None, split_k=True):
+        """A fused stage-1 output: the result quantized by quant (rounded to bf16
+        first under split_k, which sums bf16 partials), its scales in the sorted
+        layout, and the reference the check reads."""
         import torch
 
         tune = self._tune()
         sorted_ids, num_valid_ids = self._routes()
         if x is None:
             x = torch.randn(self.token_num, self.topk, self.inter)
-        codes, scales = quant(scale_of(x).bfloat16().float())
+        quantized = scale_of(x)
+        if split_k:
+            quantized = quantized.bfloat16().float()
+        codes, scales = quant(quantized)
         sorted_scales = tune._sorted_route_scales(
             scales, sorted_ids, num_valid_ids, self.token_num, self.topk
         )
@@ -1150,11 +1154,112 @@ class TestFusedStage1Fp8AndSplitKCompare(unittest.TestCase):
             ),
         }
 
-    def test_split_k_within_one_step_passes(self):
+    def _split_k_compare(self):
+        import functools
+
+        return functools.partial(self._tune().dequantized_output_compare, split_k=True)
+
+    def test_reference_rounding_passes(self):
         compare = self._tune().dequantized_output_compare
         for name, quant in self._quantizers().items():
             with self.subTest(name):
-                ref, res = self._split_k(quant)
+                ref, res = self._fused_output(quant, split_k=False)
+                self.assertEqual(compare(ref, res, printLog=False), 0.0)
+
+    def test_rounding_of_a_value_within_the_block_floor_passes(self):
+        """A value on a rounding boundary may round either way: the kernel's fp32
+        accumulation differs from the reference's in the last bits."""
+        compare = self._tune().dequantized_output_compare
+        for name, quant in self._quantizers().items():
+            with self.subTest(name):
+                ref, res = self._fused_output(
+                    quant, scale_of=lambda x: x * (1 + 2**-14), split_k=False
+                )
+                self.assertEqual(compare(ref, res, printLog=False), 0.0)
+
+    def test_neighbouring_code_fails_without_split_k(self):
+        """One value on the other neighbouring code is within one step of the
+        reference, which split-K allows and the default check does not."""
+        import torch
+
+        from aiter.utility import fp4_utils
+
+        tune = self._tune()
+        (x, positions), (codes, scales) = self._fused_output(
+            self._quantizers()["fp8"], split_k=False
+        )
+        scale = fp4_utils.e8m0_to_f32(
+            scales.view(torch.uint8)[positions.reshape(-1)]
+        ).view(-1, 1)
+        flat_x = x.reshape(-1, 32)
+        rounded = codes.reshape(-1, 32).float() * scale
+        byte = codes.view(torch.uint8).reshape(-1, 32)
+        # A positive normal value well away from a rounding boundary, so the
+        # other neighbour is more than the block floor from the reference.
+        step = torch.exp2(torch.floor(torch.log2(flat_x.abs() / scale)) - 3) * scale
+        candidates = (
+            (flat_x > flat_x.abs().amax(-1, keepdim=True) * 2**-6)
+            & ((flat_x - rounded).abs() < 0.25 * step)
+            & (byte > 0x08)
+            & (byte < 0x7E)
+        ).nonzero()
+        block, lane = candidates[0].tolist()
+        moved = codes.clone()
+        moved_bytes = moved.view(torch.uint8).reshape(-1, 32)
+        moved_bytes[block, lane] += (
+            1 if flat_x[block, lane] > rounded[block, lane] else -1
+        )
+        ref, res = (x, positions), (moved, scales)
+        self.assertEqual(tune.dequantized_output_compare(ref, res, printLog=False), 1.0)
+        self.assertEqual(self._split_k_compare()(ref, res, printLog=False), 0.0)
+
+    def test_sorted_row_codes_pass(self):
+        """The v2 fused stage 1 writes its codes in sorted rows."""
+        import torch
+
+        tune = self._tune()
+        sorted_ids, num_valid_ids = self._routes()
+        for name, quant in self._quantizers().items():
+            with self.subTest(name):
+                (x, positions), (codes, scales) = self._fused_output(
+                    quant, split_k=False
+                )
+                token_major = codes.view(torch.uint8).view(
+                    self.token_num, self.topk, -1
+                )
+                sorted_codes = torch.zeros(
+                    sorted_ids.numel(), token_major.shape[-1], dtype=torch.uint8
+                )
+                for row, route in enumerate(sorted_ids[: num_valid_ids[0]].tolist()):
+                    sorted_codes[row] = token_major[route & 0xFFFFFF, route >> 24]
+                route_rows = tune._route_sorted_rows(
+                    sorted_ids, num_valid_ids, self.token_num, self.topk
+                )
+                ref = (x, positions, route_rows, codes.dtype)
+                compare = tune.dequantized_output_compare
+                self.assertEqual(
+                    compare(ref, (sorted_codes, scales), printLog=False), 0.0
+                )
+                first, second = route_rows[:2].tolist()
+                sorted_codes[[first, second]] = sorted_codes[[second, first]]
+                self.assertEqual(
+                    compare(ref, (sorted_codes, scales), printLog=False), 1.0
+                )
+
+    def test_sorted_rows_reject_an_unmapped_route(self):
+        tune = self._tune()
+        sorted_ids, num_valid_ids = self._routes()
+        sorted_ids[0] = self.token_num
+        with self.assertRaises(ValueError):
+            tune._route_sorted_rows(
+                sorted_ids, num_valid_ids, self.token_num, self.topk
+            )
+
+    def test_split_k_within_one_step_passes(self):
+        compare = self._split_k_compare()
+        for name, quant in self._quantizers().items():
+            with self.subTest(name):
+                ref, res = self._fused_output(quant)
                 self.assertEqual(compare(ref, res, printLog=False), 0.0)
 
     def test_near_zero_value_within_the_block_floor_passes(self):
@@ -1162,43 +1267,53 @@ class TestFusedStage1Fp8AndSplitKCompare(unittest.TestCase):
         several fine steps off but tiny next to its block still passes."""
         import torch
 
-        compare = self._tune().dequantized_output_compare
         x = torch.randn(self.token_num, self.topk, self.inter)
         x[0, 0, 1] = 0
-        (_, positions), res = self._split_k(self._quantizers()["fp8"], x=x)
-        drifted = x.clone()
-        drifted[0, 0, 1] = x[0, 0, :32].abs().max() * 2**-13
-        self.assertEqual(compare((drifted, positions), res, printLog=False), 0.0)
-        drifted[0, 0, 1] = x[0, 0, :32].abs().max() * 2**-10
-        self.assertEqual(compare((drifted, positions), res, printLog=False), 1.0)
+        (_, positions), res = self._fused_output(
+            self._quantizers()["fp8"], x=x, split_k=False
+        )
+        for name, compare in (
+            ("default", self._tune().dequantized_output_compare),
+            ("split_k", self._split_k_compare()),
+        ):
+            with self.subTest(name):
+                drifted = x.clone()
+                drifted[0, 0, 1] = x[0, 0, :32].abs().max() * 2**-13
+                self.assertEqual(
+                    compare((drifted, positions), res, printLog=False), 0.0
+                )
+                drifted[0, 0, 1] = x[0, 0, :32].abs().max() * 2**-10
+                self.assertEqual(
+                    compare((drifted, positions), res, printLog=False), 1.0
+                )
 
     def test_one_corrupted_route_fails(self):
         """A fault in one route of many is below any whole-output fraction, but
         each of its values is far from the reference."""
         import torch
 
-        compare = self._tune().dequantized_output_compare
+        compare = self._split_k_compare()
         for name, quant in self._quantizers().items():
             with self.subTest(name):
-                ref, (codes, scales) = self._split_k(quant)
+                ref, (codes, scales) = self._fused_output(quant)
                 codes = codes.clone()
                 codes.view(torch.uint8).view(-1, codes.shape[-1])[3] = 0
                 self.assertEqual(compare(ref, (codes, scales), printLog=False), 1.0)
 
     def test_split_k_bias_fails(self):
-        compare = self._tune().dequantized_output_compare
+        compare = self._split_k_compare()
         for name, quant in self._quantizers().items():
             with self.subTest(name):
-                ref, res = self._split_k(quant, scale_of=lambda x: x * 1.03)
+                ref, res = self._fused_output(quant, scale_of=lambda x: x * 1.03)
                 self.assertEqual(compare(ref, res, printLog=False), 1.0)
 
     def test_split_k_misplaced_scales_fail(self):
         import torch
 
-        compare = self._tune().dequantized_output_compare
+        compare = self._split_k_compare()
         for name, quant in self._quantizers().items():
             with self.subTest(name):
-                ref, (codes, scales) = self._split_k(quant)
+                ref, (codes, scales) = self._fused_output(quant)
                 flat = scales.view(torch.uint8)
                 permuted = flat[torch.randperm(flat.numel())].view(scales.dtype)
                 self.assertEqual(compare(ref, (codes, permuted), printLog=False), 1.0)
@@ -1206,10 +1321,10 @@ class TestFusedStage1Fp8AndSplitKCompare(unittest.TestCase):
     def test_split_k_scale_one_exponent_off_fails(self):
         import torch
 
-        compare = self._tune().dequantized_output_compare
+        compare = self._split_k_compare()
         for name, quant in self._quantizers().items():
             with self.subTest(name):
-                ref, (codes, scales) = self._split_k(quant)
+                ref, (codes, scales) = self._fused_output(quant)
                 smaller = (scales.view(torch.uint8) - 1).view(scales.dtype)
                 self.assertEqual(compare(ref, (codes, smaller), printLog=False), 1.0)
 

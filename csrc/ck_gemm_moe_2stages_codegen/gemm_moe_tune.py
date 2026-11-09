@@ -609,6 +609,29 @@ def _route_scale_positions(sorted_ids, num_valid_ids, token_num, topk, cols):
     return positions.view(token_num * topk, cols)
 
 
+def _route_sorted_rows(sorted_ids, num_valid_ids, token_num, topk):
+    """Row of each route [token * topk] in the sorted buffer the v2 fused stage 1
+    writes its codes to (_token_major_to_sorted_routes' layout)."""
+    routes = torch.arange(
+        token_num * topk, dtype=torch.float64, device=sorted_ids.device
+    )
+    rows = _token_major_to_sorted_routes(
+        routes.view(token_num, topk, 1),
+        sorted_ids,
+        num_valid_ids,
+        token_num,
+        mark_padding=True,
+    ).view(-1)
+    mapped = ~torch.isnan(rows)
+    if int(mapped.sum()) != routes.numel():
+        raise ValueError("sorted_ids does not map every (token, slot) route")
+    route_rows = torch.empty(routes.numel(), dtype=torch.int64, device=routes.device)
+    route_rows[rows[mapped].long()] = torch.arange(rows.numel(), device=rows.device)[
+        mapped
+    ]
+    return route_rows
+
+
 def _roundup_mxfp8_scale(amax):
     """The shared RoundUp MXFP8 rule, ceil_pow2(amax / 448), as opus writes it."""
     from aiter.utility.mx_types import MxDtypeInt, MxScaleRoundModeInt
@@ -630,40 +653,62 @@ def _mxfp8_quant(x, scale_fn):
 
 
 @compares_whole_output
-def dequantized_output_compare(ref, res, msg="", printLog=True):
+def dequantized_output_compare(ref, res, msg="", printLog=True, split_k=False):
     """compare_fn for a fused stage-1 output, given the whole tuples:
     res = (codes, sorted e8m0 scales), ref = (fp32 stage-1 result, positions from
-    _route_scale_positions). Every dequantized value must be within one step of
-    the reference on the kernel's grid, or within DEQUANT_BLOCK_FLOOR of its
-    block's largest magnitude, and the slope within SLOPE_BIAS_CAP of 1.
+    _route_scale_positions), plus (rows from _route_sorted_rows, code dtype) when
+    the codes sit in sorted rows, as the v2 kernels write them. Every dequantized
+    value must be the reference rounded on the kernel's grid after a shift of at
+    most DEQUANT_BLOCK_FLOOR of its block's largest magnitude, so a value on a
+    rounding boundary may take either neighbour. split_k allows one step instead:
+    split-K quantizes a bf16 sum of partials, which no rounding of the reference
+    reproduces. The slope must be within SLOPE_BIAS_CAP of 1.
     Returns 0.0, or 1.0 on failure."""
     from aiter import logger
 
-    ref1, positions = ref
+    ref1, positions, *sorted_layout = ref
     codes, scales = res
     routes, groups = positions.shape
+    if sorted_layout:
+        route_rows, code_dtype = sorted_layout
+        row_bytes = groups * 32 // (2 if code_dtype == dtypes.fp4x2 else 1)
+        codes = (
+            codes.view(torch.uint8).reshape(-1, row_bytes)[route_rows].view(code_dtype)
+        )
+    fp4 = codes.dtype == dtypes.fp4x2
     x = ref1.float().reshape(routes, groups, 32)
     scale = fp4_utils.e8m0_to_f32(
         scales.view(torch.uint8).reshape(-1)[positions.reshape(-1)]
     ).view(routes, groups, 1)
-    on_grid = (x / scale).reshape(routes, -1)
-    if codes.dtype == dtypes.fp4x2:
+
+    def nearest_code(v):
+        on_grid = (v / scale).reshape(routes, -1)
+        if fp4:
+            code = fp4_utils.mxfp4_to_f32(fp4_utils.f32_to_mxfp4(on_grid))
+        else:
+            code = on_grid.clamp(-448, 448).to(torch.float8_e4m3fn).float()
+        return code.view(routes, groups, 32) * scale
+
+    if fp4:
         values = fp4_utils.mxfp4_to_f32(codes.reshape(routes, -1))
-        rounded = fp4_utils.mxfp4_to_f32(fp4_utils.f32_to_mxfp4(on_grid))
         mbits, min_exp, max_exp = 1, 0, 2
     else:
         values = codes.reshape(routes, -1).float()
-        rounded = on_grid.clamp(-448, 448).to(torch.float8_e4m3fn).float()
         mbits, min_exp, max_exp = 3, -6, 8
     dequant = values.view(routes, groups, 32) * scale
-    rounded = rounded.view(routes, groups, 32) * scale
-    # Spacing of the code grid at |x|: 2^(exponent - mantissa bits), subnormals
-    # sharing the smallest normal exponent's spacing and values past the largest
-    # code the largest exponent's, so a scale too small to hold x still fails.
-    exponent = torch.floor(torch.log2(x.abs() / scale)).clamp(min_exp, max_exp)
-    step = torch.exp2(exponent - mbits) * scale
+    rounded = nearest_code(x)
     floor = x.abs().amax(-1, keepdim=True) * DEQUANT_BLOCK_FLOOR
-    beyond = ~((dequant - x).abs() <= torch.maximum(step, floor))
+    if split_k:
+        # Spacing of the code grid at |x|: 2^(exponent - mantissa bits), subnormals
+        # sharing the smallest normal exponent's spacing and values past the largest
+        # code the largest exponent's, so a scale too small to hold x still fails.
+        exponent = torch.floor(torch.log2(x.abs() / scale)).clamp(min_exp, max_exp)
+        step = torch.exp2(exponent - mbits) * scale
+        beyond = ~((dequant - x).abs() <= torch.maximum(step, floor))
+    else:
+        beyond = ~(
+            (dequant >= nearest_code(x - floor)) & (dequant <= nearest_code(x + floor))
+        )
     mismatch = beyond.float().mean().item()
     # Fit on the reference rounded to the same grid: the raw reference would
     # carry the format's own rounding bias.
@@ -1673,22 +1718,16 @@ class FmoeTuner(TunerCommon):
         return ref2
 
     @staticmethod
-    def run_v2_stage1_quantized_ref(ref1_fp32, sti, cumsum, token, topk, adtype):
-        """fp4 or fp8 codes in sorted rows and e8m0 scales in the sorted tiled
-        layout, as the fused v2 stage 1 writes them, from the fp32 stage-1
-        reference."""
-        if adtype == "fp4":
-            from aiter.ops.quant import per_1x32_f4_quant
-
-            codes, scales = per_1x32_f4_quant(ref1_fp32, quant_dtype=dtypes.fp4x2)
-        else:
-            codes, scales = _mxfp8_quant(
-                ref1_fp32, fp4_utils.f32_to_fused_moe_mxfp8_scale
-            )
-        codes = codes.view(torch.uint8).view(token, topk, -1).to(dtypes.fp16)
-        return _token_major_to_sorted_routes(
-            codes, sti, cumsum, token, mark_padding=True
-        ), _sorted_route_scales(scales, sti, cumsum, token, topk)
+    def run_v2_stage1_dequant_ref(ref1_fp32, sti, cumsum, token, topk, adtype):
+        """dequantized_output_compare's reference for the fused v2 stage 1, which
+        writes its codes in sorted rows."""
+        routes = ref1_fp32.view(token * topk, -1)
+        return (
+            routes,
+            _route_scale_positions(sti, cumsum, token, topk, routes.shape[-1] // 32),
+            _route_sorted_rows(sti, cumsum, token, topk),
+            dtypes.fp4x2 if adtype == "fp4" else torch.float8_e4m3fn,
+        )
 
     @staticmethod
     def run_a16w_stage1_sorted_ref(
@@ -4170,7 +4209,9 @@ class FmoeTuner(TunerCommon):
                         # sum of partials that no reference quantizer reproduces
                         # byte for byte, and a byte count cannot tell a rounding
                         # tie from a value that moved by its whole block.
-                        s1_compare_fn = dequantized_output_compare
+                        s1_compare_fn = functools.partial(
+                            dequantized_output_compare, split_k=is_splitk
+                        )
                         s1_ref_kwargs = {"scale_positions": True}
                     # fp8-activation kernels read a1_qt cast to fp8; the reference
                     # reads the same.
@@ -4521,13 +4562,13 @@ class FmoeTuner(TunerCommon):
                             s1_params,
                         ),
                         {},
-                        FmoeTuner.run_v2_stage1_quantized_ref,
+                        FmoeTuner.run_v2_stage1_dequant_ref,
                         s1_ref_args,
                         {},
                         None,
                         0.1,
                         0.1,
-                        quantized_output_compare,
+                        dequantized_output_compare,
                     )
                 )
             # ---- v2 stage2 tasks ----
