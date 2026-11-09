@@ -592,7 +592,7 @@ def _mxfp4_quant_op_kernel(
     tl.store(scale_ptr + rows[:, None] * (N // 32) + scale_cols[None, :], scales)
 
 
-@pytest.mark.parametrize("scaling_mode", [0, 1])
+@pytest.mark.parametrize("scaling_mode", [0, 1, 2])
 def test_mxfp4_quant_op_asm_matches_bits(scaling_mode):
     torch.manual_seed(scaling_mode)
     m, n = 1024, 128
@@ -616,8 +616,10 @@ def test_mxfp4_quant_op_asm_matches_bits(scaling_mode):
         outs.append((x_fp4, scales))
     torch.testing.assert_close(outs[0][0], outs[1][0], atol=0, rtol=0)
     torch.testing.assert_close(outs[0][1], outs[1][1], atol=0, rtol=0)
-    if scaling_mode == 1:
-        amax = x.reshape(m, -1, 32).abs().amax(-1).double().clamp(min=6 * 2**-126)
+    if scaling_mode > 0:
+        # "ceil" floors amax at 6 * 2^-126, "roundup" at 1e-10 like the HIP quant.
+        amax_floor = 6 * 2**-126 if scaling_mode == 1 else 1e-10
+        amax = x.reshape(m, -1, 32).abs().amax(-1).double().clamp(min=amax_floor)
         ref = torch.ceil(torch.log2(amax / 6)).to(torch.int32) + 127
         torch.testing.assert_close(outs[0][1].int(), ref, atol=0, rtol=0)
 
