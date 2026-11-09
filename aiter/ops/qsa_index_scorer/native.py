@@ -70,8 +70,9 @@ def _vector(name: str, t, n: int) -> None:
 
 
 def cache_kind(cache: torch.Tensor, scale) -> str:
-    """'bf16' or 'fp8' (E4M3 + fp32 per-row scale); anything else raises."""
-    if cache.dtype == torch.bfloat16 and scale is None:
+    """'bf16' (any unquantized float cache: bf16 / fp16 / fp32, read in q's dtype) or
+    'fp8' (E4M3 + fp32 per-row scale); anything else raises."""
+    if cache.dtype in _Q_DTYPES and scale is None:
         return "bf16"
     if _FP8 is not None and cache.dtype == _FP8:
         if scale is None:
@@ -82,8 +83,8 @@ def cache_kind(cache: torch.Tensor, scale) -> str:
                 "fp32 per-row scale only (MXFP8 / E8M0 scales are a non-goal)"
             )
         return "fp8"
-    if cache.dtype == torch.bfloat16:
-        raise NativeContractError("a bf16 QSA cache takes no scale plane")
+    if cache.dtype in _Q_DTYPES:
+        raise NativeContractError("an unquantized QSA cache takes no scale plane")
     raise NativeContractError(
         f"unsupported QSA cache dtype {cache.dtype} (contract v1: bf16, or fp8 E4M3 + fp32 "
         "per-row scale; MXFP4 / MXFP8 are non-goals)"
@@ -234,7 +235,7 @@ class NativePlan:
             self.dim,
         )
         i64, f32 = torch.int64, torch.float32
-        elem = 1 if self.kind == "fp8" else 2
+        elem = torch.empty((), dtype=self.geo["cache_dtype"]).element_size()
         col = torch.arange(max(1, self.columns), dtype=i64, device=dev)
         self.col_idx = col  # [columns]
         self.col_page = torch.div(col, self.page, rounding_mode="floor")

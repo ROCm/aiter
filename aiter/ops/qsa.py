@@ -12,6 +12,7 @@ from collections.abc import Sequence
 
 import torch
 
+from aiter.ops.qsa_index_scorer import dispatch as _D
 from aiter.ops.topk import top_k_per_row_prefill
 from aiter.ops.triton.attention.qsa import (
     FP4_GROUP,
@@ -46,32 +47,85 @@ except ImportError:
     _HAS_FLYDSL_PREFILL = False
 
 DEFAULT_LOGITS_WORKSPACE_BYTES = 128 * 1024 * 1024
+DEFAULT_LOGITS_WORKSPACE_BYTES = 128 * 1024 * 1024
+
+# ---------------------------------------------------------------------------
+# qsa_paged_mqa_logits: neutral op (contract v1) + fused-path policy
+# ---------------------------------------------------------------------------
+# Route-ready: the op is routed through aiter.plugin when that interface exists
+# (provider stack #7465/#7484); until then the decorator is a no-op.
+try:
+    from aiter.plugin import route as _route
+except ImportError:  # aiter.plugin not in this tree yet
+
+    def _route(*, op: str, version: int = 1, supersedes=None):
+        def wrap(func):
+            func.__aiter_route__ = (op, version)
+            return func
+
+        return wrap
+
+    ROUTED = False
+else:
+    ROUTED = True
+
+OP_NAME = _D.OP_NAME
+OP_CONTRACT_VERSION = _D.OP_CONTRACT_VERSION
+API_VERSION = _D.API_VERSION
+Decision = _D.Decision
 
 
-def qsa_paged_mqa_logits(
-    q: torch.Tensor,
-    compressed_k_cache: torch.Tensor,
-    page_table: torch.Tensor,
-    token_to_request: torch.Tensor,
-    query_positions: torch.Tensor,
-    context_lens: torch.Tensor,
-    compress_ratio: int = 4,
-    score_divisor: float | None = None,
-    max_columns: int | None = None,
-    row_starts: torch.Tensor | None = None,
-    allow_flydsl: bool = False,
-    compressed_k_scale: torch.Tensor | None = None,
-    stacked_decode: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Score compressed key groups.
+def _on_gpu(t) -> bool:
+    return t.is_cuda
 
-    Dispatches to the FlyDSL MFMA scorer for large prefill batches when
-    ``allow_flydsl`` is set and FlyDSL is available, otherwise falls through
-    to the triton wrapper.
 
-    FP8 / MXFP4 keys (with ``compressed_k_scale``) and ``stacked_decode`` are
-    triton only.
-    """
+def _existing_route(
+    q, compressed_k_cache, page_table, allow_flydsl, compressed_k_scale
+):
+    """Which of aiter's existing native kernels takes this call (``None``: neither --
+    the pure-torch implementation serves a valid call, e.g. on a CPU device)."""
+    if not _on_gpu(q):
+        return None
+    if (
+        allow_flydsl
+        and _HAS_FLYDSL
+        and compressed_k_scale is None
+        and q.shape[0] > 256
+        and q.stride(2) == 1
+        and compressed_k_cache.stride(3) == 1
+        and page_table.stride(1) == 1
+        and q.shape[2] >= 16
+        and compressed_k_cache.shape[1] == _FLYDSL_PAGE_SIZE
+    ):
+        return _D.VID_FLYDSL_PAGE16
+    dt = compressed_k_cache.dtype
+    if dt == torch.uint8 or (FP8_MAX is not None and dt == FP8_DTYPE):
+        return _D.VID_TRITON if compressed_k_scale is not None else None
+    if dt.is_floating_point and dt.itemsize > 1:
+        return _D.VID_TRITON
+    return None
+
+
+def _existing_native(
+    q,
+    compressed_k_cache,
+    page_table,
+    token_to_request,
+    query_positions,
+    context_lens,
+    compress_ratio=4,
+    score_divisor=None,
+    max_columns=None,
+    row_starts=None,
+    allow_flydsl=False,
+    compressed_k_scale=None,
+    stacked_decode=False,
+    logits=None,
+    visible_groups=None,
+):
+    """aiter's native dispatch as before the fused path: the FlyDSL page-16 prefill
+    scorer for large ``allow_flydsl`` batches, otherwise Triton (bf16/fp16/fp32, fp8 +
+    fp32 scale, MXFP4). Caller-supplied ``logits`` / ``visible_groups`` are filled."""
     if (
         allow_flydsl
         and _HAS_FLYDSL
@@ -87,10 +141,12 @@ def qsa_paged_mqa_logits(
         columns = page_table.shape[1] * compressed_k_cache.shape[1]
         if max_columns is not None:
             columns = max(1, min(columns, int(max_columns)))
-        logits = torch.empty(
-            (q.shape[0], columns), dtype=torch.float32, device=q.device
-        )
-        visible_groups = torch.empty(q.shape[0], dtype=torch.int32, device=q.device)
+        if logits is None:
+            logits = torch.empty(
+                (q.shape[0], columns), dtype=torch.float32, device=q.device
+            )
+        if visible_groups is None:
+            visible_groups = torch.empty(q.shape[0], dtype=torch.int32, device=q.device)
         qsa_paged_mqa_logits_flydsl(
             q,
             compressed_k_cache,
@@ -105,7 +161,7 @@ def qsa_paged_mqa_logits(
             row_starts,
         )
         return logits, visible_groups
-    return _triton_qsa_paged_mqa_logits(
+    out_logits, out_visible = _triton_qsa_paged_mqa_logits(
         q,
         compressed_k_cache,
         page_table,
@@ -119,6 +175,196 @@ def qsa_paged_mqa_logits(
         compressed_k_scale=compressed_k_scale,
         stacked_decode=stacked_decode,
     )
+    if logits is not None:
+        logits.copy_(out_logits)
+        out_logits = logits
+    if visible_groups is not None:
+        visible_groups.view(-1).copy_(out_visible)
+        out_visible = visible_groups
+    return out_logits, out_visible
+
+
+@_route(op="qsa_paged_mqa_logits", version=1)
+def qsa_paged_mqa_logits(
+    q: torch.Tensor,
+    compressed_k_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    token_to_request: torch.Tensor,
+    query_positions: torch.Tensor,
+    context_lens: torch.Tensor,
+    compress_ratio: int = 4,
+    score_divisor: float | None = None,
+    max_columns: int | None = None,
+    row_starts: torch.Tensor | None = None,
+    allow_flydsl: bool = False,
+    compressed_k_scale: torch.Tensor | None = None,
+    stacked_decode: bool = False,
+    *,
+    logits: torch.Tensor | None = None,
+    visible_groups: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Score compressed key groups (QSA indexer); op contract
+    ``qsa_paged_mqa_logits`` v1 (``docs/qsa_index_scorer.md``).
+
+    ``q`` ``[rows, heads, head_dim]``; ``compressed_k_cache`` ``[pages, page_size, 1,
+    head_dim]``: unquantized (Q's dtype), FP8 E4M3 + ``compressed_k_scale`` fp32
+    ``[pages, page_size, 1]``, or MXFP4 + E8M0 scale (Triton). ``page_table``
+    ``[requests, width]``; ``token_to_request`` / ``query_positions`` ``[rows]``;
+    ``context_lens`` ``[requests]`` (int32/int64). Returns ``(logits fp32 [rows,
+    columns], visible_groups int32 [rows])``, ``columns = max(1, min(width *
+    page_size, max_columns))``; ``visible = clamp(min((pos + 1) // ratio, ctx //
+    ratio), 0)``; ``logits[t, c] = sum_h relu(q[t, h] . k[c]) / divisor`` for ``c <
+    visible`` on a valid page, else ``-inf``; ``row_starts`` (if given) zero-filled.
+    The 12 leading parameters are the frozen ATOM scorer's; ``stacked_decode`` is a
+    Triton scheduling hint; ``logits`` / ``visible_groups`` are optional output buffers.
+
+    Implementation (a dispatch decision, per call class, decided once on the host):
+    the fused FlyDSL gfx1250 kernels when a profile is active (:func:`configure`,
+    ``$AITER_QSA_PROFILE``; kill switch ``$AITER_QSA_FUSED=0``) and covers the class;
+    else aiter's existing native kernels (FlyDSL page-16 prefill with ``allow_flydsl``,
+    Triton); else a pure-torch implementation (e.g. CPU tensors). Default: no profile,
+    i.e. the existing native dispatch. :func:`explain` names the path of a call.
+
+    Raises ``ValueError`` only for calls that violate the contract.
+    """
+    if _D._ACTIVE is None and isinstance(q, torch.Tensor):
+        try:
+            route = _existing_route(
+                q, compressed_k_cache, page_table, allow_flydsl, compressed_k_scale
+            )
+        except Exception:  # noqa: BLE001 -- the dispatch core decides
+            route = None
+        if route is not None:  # default (fused off): exactly the existing dispatch
+            return _existing_native(
+                q,
+                compressed_k_cache,
+                page_table,
+                token_to_request,
+                query_positions,
+                context_lens,
+                compress_ratio,
+                score_divisor,
+                max_columns,
+                row_starts,
+                allow_flydsl,
+                compressed_k_scale,
+                stacked_decode,
+                logits,
+                visible_groups,
+            )
+    return _D.call(
+        _existing_native,
+        _existing_route,
+        q,
+        compressed_k_cache,
+        page_table,
+        token_to_request,
+        query_positions,
+        context_lens,
+        compress_ratio,
+        score_divisor,
+        max_columns,
+        row_starts,
+        allow_flydsl,
+        compressed_k_scale,
+        stacked_decode,
+        logits,
+        visible_groups,
+    )
+
+
+def configure(*, profile: str | None, source: str) -> None:
+    """Enable the fused ``qsa_paged_mqa_logits`` path with a named profile (``None``:
+    off, the default). Process-global, idempotent; ``source`` names the caller (e.g.
+    ``"atom:<config>"``). ``$AITER_QSA_PROFILE`` (operator) overrides ``profile``
+    (``off`` disables); ``$AITER_QSA_FUSED=0`` is the kill switch. Call before model
+    load / warm-up / graph capture."""
+    _D.configure(profile=profile, source=source)
+
+
+def prewarm(
+    *,
+    page_sizes,
+    cache_dtypes,
+    pos_dtypes=(torch.int64,),
+    compressed_k_cache: torch.Tensor | None = None,
+    compressed_k_scale: torch.Tensor | None = None,
+    device=None,
+) -> list[str]:
+    """Load (AOT cache hit) or compile the fused variants the active profile can select
+    for these index caches: ``page_sizes`` (4 / 8 / 16), ``cache_dtypes`` (``"bf16"`` /
+    ``"fp8"`` or torch dtypes), ``pos_dtypes``; a bound ``compressed_k_cache`` (+ scale)
+    narrows to what it can select. Returns the warmed variant tags (``[]`` when the
+    fused path is off). Call after KV allocation, before graph capture."""
+    return _D.prewarm(
+        page_sizes=page_sizes,
+        cache_dtypes=cache_dtypes,
+        pos_dtypes=pos_dtypes,
+        compressed_k_cache=compressed_k_cache,
+        compressed_k_scale=compressed_k_scale,
+        device=device,
+    )
+
+
+def explain(
+    q,
+    compressed_k_cache,
+    page_table,
+    token_to_request,
+    query_positions,
+    context_lens,
+    compress_ratio=4,
+    score_divisor=None,
+    max_columns=None,
+    row_starts=None,
+    allow_flydsl=False,
+    compressed_k_scale=None,
+    stacked_decode=False,
+    *,
+    logits=None,
+    visible_groups=None,
+) -> Decision:
+    """``Decision(path, reason, vid, ...)`` for this call's class without running it
+    (``path`` in ``fused`` / ``native-triton`` / ``native-torch``; ``invalid`` for a
+    contract violation). Decides and caches the class like the first call would."""
+    if _D._ACTIVE is None and isinstance(q, torch.Tensor):
+        try:
+            vid = _existing_route(
+                q, compressed_k_cache, page_table, allow_flydsl, compressed_k_scale
+            )
+        except Exception:  # noqa: BLE001
+            vid = None
+        if vid is not None:
+            reason = "kill_switch" if _D._ORIGIN.startswith("kill") else "disabled"
+            return Decision(_D.PATH_NATIVE_TRITON, reason, vid, _D._ORIGIN)
+    return _D.explain(
+        _existing_native,
+        _existing_route,
+        q,
+        compressed_k_cache,
+        page_table,
+        token_to_request,
+        query_positions,
+        context_lens,
+        compress_ratio,
+        score_divisor,
+        max_columns,
+        row_starts,
+        allow_flydsl,
+        compressed_k_scale,
+        stacked_decode,
+        logits,
+        visible_groups,
+    )
+
+
+def status() -> dict:
+    """Fused-path state: enabled, profile (+ origin: configure source / env / kill
+    switch), kernel and profile sha256, op / API versions, decided classes per path,
+    route (``aiter.plugin`` or shim)."""
+    out = _D.status()
+    out["routed"] = ROUTED
+    return out
 
 
 def qsa_select_paged_tokens(
@@ -248,6 +494,10 @@ __all__ = [
     "FP4_GROUP",
     "FP8_DTYPE",
     "FP8_MAX",
+    "Decision",
+    "configure",
+    "explain",
+    "prewarm",
     "qsa_cache_row_layout",
     "qsa_expand_block_indices",
     "qsa_paged_mqa_logits",
@@ -255,4 +505,5 @@ __all__ = [
     "qsa_sparse_paged_gqa",
     "qsa_sparse_prefill",
     "qsa_store_quantized_rows",
+    "status",
 ]

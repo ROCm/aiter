@@ -84,6 +84,7 @@ def load_api():
 
 
 PKG = load_api()
+API = PKG.api  # private implementation module (the public op is aiter.ops.qsa)
 #: profile name or JSON path (e.g. the GPU-restamped `gen_profile check --out` file)
 PROFILE = os.environ.get("QSA_TEST_PROFILE") or PKG.DEFAULT_PROFILE
 ITERS = int(os.environ.get("PT_ITERS", "51"))
@@ -105,7 +106,7 @@ CASES = [  # name, regime, rows, requests, max_ctx, fmt  (integration brief sect
 
 
 def fused(q, kc, pt, t2r, qp, cl, sc, cols):
-    return PKG.qsa_paged_mqa_logits(
+    return API.qsa_paged_mqa_logits(
         q, kc, pt, t2r, qp, cl, 4, None, cols, None, False, sc, profile=PROFILE
     )
 
@@ -154,12 +155,12 @@ def graph_replay_us(fn, args, iters=ITERS):
 def decide_host_us(args, n=2000):
     q, kc, pt, t2r, qp, cl, sc, cols = args
     for _ in range(50):
-        PKG.decide(
+        API.decide(
             q, kc, pt, t2r, qp, cl, 4, None, cols, None, False, sc, profile=PROFILE
         )
     t0 = time.perf_counter()
     for _ in range(n):
-        PKG.decide(
+        API.decide(
             q, kc, pt, t2r, qp, cl, 4, None, cols, None, False, sc, profile=PROFILE
         )
     return (time.perf_counter() - t0) * 1e6 / n
@@ -224,7 +225,7 @@ def main(argv=None) -> int:
             d["compressed_k_scale"],
             cols,
         )
-        dec = PKG.decide(
+        dec = API.decide(
             *args[:6], 4, None, cols, None, False, args[6], profile=PROFILE
         )
         rec = {

@@ -1632,7 +1632,7 @@ class Scripts(unittest.TestCase):
             "compile_cache_dir",
             "kernel_page_sizes",
         ):
-            self.assertIs(getattr(base.PKG, name), getattr(API, name))
+            self.assertTrue(callable(getattr(API, name)), name)
 
 
 if __name__ == "__main__":

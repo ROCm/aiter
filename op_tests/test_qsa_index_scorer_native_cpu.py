@@ -4,9 +4,8 @@
 
 No GPU, no device, no ``aiter`` import (the package is loaded standalone):
 
-* contract: the public op ``aiter.qsa_paged_mqa_logits`` has exactly ATOM's 12-parameter
-  signature (``inspect.signature``), a backend-neutral name, and is exported from
-  ``aiter/__init__.py``;
+* contract: the private implementation keeps ATOM's 12 leading parameters (the public
+  neutral op ``aiter.ops.qsa.qsa_paged_mqa_logits``: ``test_qsa_neutral_op_cpu.py``);
 * default off: without a profile every call is served by the native path
   (``Decision.path == "native"``, reason ``disabled``, vid ``native.torch.v1``) and the
   kernel module is never imported;
@@ -44,7 +43,6 @@ import test_qsa_index_scorer_cpu as base
 
 API, PR, K, PKG = base.API, base.PR, base.K, base.PKG
 NAT = sys.modules[PKG.__name__ + ".native"]
-OP = sys.modules[PKG.__name__ + ".op"]
 FP8 = torch.float8_e4m3fn
 
 
@@ -146,51 +144,15 @@ def assert_matches(tc, out, ref, msg=""):
 
 # ---------------------------------------------------------------------------
 class Contract(unittest.TestCase):
-    def test_public_signature_is_atoms(self):
-        sig = inspect.signature(OP.qsa_paged_mqa_logits)
-        params = list(sig.parameters.values())
-        self.assertEqual(
-            tuple((p.name, p.default) for p in params), API.ATOM_SCORER_SIGNATURE
-        )
-        self.assertTrue(
-            all(p.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD for p in params)
-        )
-        self.assertEqual(
-            (OP.OP_NAME, OP.OP_CONTRACT_VERSION), ("qsa_paged_mqa_logits", 1)
-        )
-        self.assertEqual(OP.qsa_paged_mqa_logits.__name__, OP.OP_NAME)
-        for suffix in (
-            "_flydsl",
-            "_gfx1250",
-            "_triton",
-            "_hip",
-            "_asm",
-            "_ck",
-            "_opus",
-            "_torch",
-        ):
-            self.assertFalse(OP.OP_NAME.endswith(suffix))
-        # module API keeps the 12 leading parameters; extras are keyword-only
+    def test_module_api_keeps_atoms_leading_parameters(self):
+        # the private fused/native implementation keeps ATOM's 12 leading parameters;
+        # extras are keyword-only (the public neutral op is aiter.ops.qsa, see
+        # test_qsa_neutral_op_cpu.py)
         mod = list(inspect.signature(API.qsa_paged_mqa_logits).parameters.values())
         self.assertEqual(
             tuple((p.name, p.default) for p in mod[:12]), API.ATOM_SCORER_SIGNATURE
         )
         self.assertTrue(all(p.kind is inspect.Parameter.KEYWORD_ONLY for p in mod[12:]))
-
-    def test_exported_from_aiter(self):
-        with open(
-            os.path.join(base.ROOT, "aiter", "__init__.py"), encoding="utf-8"
-        ) as fh:
-            tree = ast.parse(fh.read())
-        hits = [
-            n
-            for n in ast.walk(tree)
-            if isinstance(n, ast.ImportFrom)
-            and n.module == "ops.qsa_index_scorer.op"
-            and n.level == 1
-            and [a.name for a in n.names] == ["qsa_paged_mqa_logits"]
-        ]
-        self.assertEqual(len(hits), 1)
 
     def test_native_module_is_torch_only(self):
         with open(NAT.__file__, encoding="utf-8") as fh:
@@ -243,7 +205,7 @@ class Contract(unittest.TestCase):
                 with self.assertRaises(ValueError, msg=name):
                     API.launch(d, *a)
                 with self.assertRaises(ValueError, msg=name):
-                    OP.qsa_paged_mqa_logits(*a)
+                    API.qsa_paged_mqa_logits(*a)
 
 
 class DefaultOff(unittest.TestCase):
@@ -262,7 +224,7 @@ class DefaultOff(unittest.TestCase):
                 (False, PR.Reason.DISABLED, API.PATH_NATIVE, API.NATIVE_VID),
             )
             self.assertIsInstance(d._plan, NAT.NativePlan)
-            out = OP.qsa_paged_mqa_logits(*args)
+            out = API.qsa_paged_mqa_logits(*args)
             ref = reference(*args[:6], max_columns=args[8], scale=args[11])
             assert_matches(self, out, ref)
             out2 = API.launch(d, *args)
@@ -412,7 +374,7 @@ class NativeNumerics(unittest.TestCase):
 
     def test_empty_and_degenerate(self):
         a = make_call(rows=0, bad_requests=False)
-        lg, vg = OP.qsa_paged_mqa_logits(*a)
+        lg, vg = API.qsa_paged_mqa_logits(*a)
         self.assertEqual((tuple(lg.shape), tuple(vg.shape)), ((0, 36), (0,)))
         a = make_call(width=0, bad_pages=False)  # columns 0 -> 1 (ATOM)
         a[8] = 5
@@ -435,7 +397,7 @@ class NativeNumerics(unittest.TestCase):
                     a = make_call(page=page, fmt=fmt, seed=page + 1, bad_pages=False)
                     a[2][0, 1] = -1  # golden: -1 invalid
                     a[8] = mc
-                    out = OP.qsa_paged_mqa_logits(*a)
+                    out = API.qsa_paged_mqa_logits(*a)
                     gl, gv, valid = G.reference_logits(*a[:6], 4, mc, a[11])
                     res = G.compare_logits(out[0], out[1], gl, gv, valid)
                     self.assertTrue(res["pass"], (page, fmt, mc, res))

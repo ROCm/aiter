@@ -15,6 +15,7 @@ compiles them up front so the runtime JIT path hits the cache.
 | `mega_moe.py` | MegaMoE A8W4 and A4W4 bundles of every deployment profile, by preloading `MegaMoEV2` itself (see below) |
 | `fmha_fp8.py` | gfx950 FP8 flash-attention forward, by replaying `flydsl_flash_attn_fp8_func` per head shape in `DEFAULT_SHAPES` |
 | `pa_decode_plan.py` | PA decode planner, every batch bucket, block size and window mode up to each arch's LDS limit, by replaying `plan_pa_decode` (see below) |
+| `qsa.py` | The fused QSA index scorer (gfx1250): every call class its shipped profile serves (verified rows, rule samples and bucket samples; page 4/8/16, bf16/fp8, int64 positions), by replaying `aiter.ops.qsa.qsa_paged_mqa_logits` with the profile configured. No device, 256 cores, flydsl 0.4.0: 2578 classes, 39 kernels, cold 9.2 s, `--check` 4.4 s (all hits) |
 | `mxfp4_moe.py` | Not part of the AOT build; the MXFP4 tuner's `--fast-scan` precompiles its candidates with it |
 | `common.py` | Job collection, the deadlock-free fork pool, `run_aot` (what `setup.py` runs), and cache-hit checking logic |
 | `replay.py` | The shared driver of the replaying modules other than MoE/MegaMoE: per-arch processes, worker batches, size scans and bisection, `--check` |
@@ -217,6 +218,9 @@ python -m aiter.aot.flydsl.conv
 
 # chunk-gdn-h
 python -m aiter.aot.flydsl.chunk_gdn_h
+
+# fused QSA index scorer (gfx1250; the shipped profile, or --profile <name|path>)
+python -m aiter.aot.flydsl.qsa
 
 # single-kernel GDN prefill (DEFAULT_SHAPES, or ad hoc H:Hg)
 python -m aiter.aot.flydsl.gdn_fused_prefill

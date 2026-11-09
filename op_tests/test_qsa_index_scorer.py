@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""GPU golden test: Phase-1 golden cases through the public aiter API (gfx1250 only).
+"""GPU golden test: Phase-1 golden cases through the neutral op (gfx1250 only).
 
-Every case runs through ``aiter.ops.qsa_index_scorer.qsa_paged_mqa_logits``
-with the default profile and is compared against the **frozen golden**
+Every case runs through ``aiter.ops.qsa.qsa_paged_mqa_logits`` with the default profile
+configured (``aiter.ops.qsa.configure``; ``explain`` must report the fused path) and is
+compared against the **frozen golden**
 (``$QSA_GOLDEN_DIR/qsa_golden.py``) with the frozen comparator and tolerance
 (``compare_logits(rtol=1e-4, atol=1e-4)`` over ``valid_page & c < visible``),
 plus: ``visible_groups`` exact, no NaN, every element outside the mask
@@ -14,22 +15,21 @@ the frozen ATOM native scorer on identical inputs (same comparator).
 
 logits_indexer benchmark cells (69 = index page 4/8/16 x single/concurrent decode, MTP
 verify bench3, prefill; bf16 and fp8): the fused path (strict: the profile must cover
-the cell) and aiter's native torch path (no profile) against the frozen golden, the
-native path also eager vs CUDA-graph replay of a prepared ``launch`` (bitwise).
+the cell), the implementation's native torch path (no profile) and the neutral op with
+the fused path off (aiter's existing dispatch) against the frozen golden, the native
+torch path also eager vs CUDA-graph replay of a prepared ``launch`` (bitwise).
 
     QSA_GOLDEN_DIR=/work/task/MI455_QSA_INDEX_SCORER/golden_baseline \
         python3 op_tests/test_qsa_index_scorer.py [-k case_substring] [--json out.json]
     python3 op_tests/test_qsa_index_scorer.py --logits-indexer-only [--skip-native]
 
-The package is loaded standalone by default (``import aiter`` builds/touches the
-GPU at import time); ``QSA_IMPORT_PACKAGE=1`` uses ``aiter.ops.qsa_index_scorer``.
+Imports ``aiter`` (the neutral op lives in ``aiter.ops.qsa``).
 GPU work must run under the node's gpu-lock (root runs this file).
 """
 
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import json
 import os
 import sys
@@ -50,36 +50,35 @@ W, PAGES, CTX = 16384, 738964, 262144
 
 
 def load_api():
-    if os.environ.get("QSA_IMPORT_PACKAGE") == "1":
-        import aiter.ops.qsa_index_scorer as pkg
-        from aiter.ops.qsa_index_scorer import api, gen_profile
+    """The neutral op (``aiter.ops.qsa``) and its private implementation package."""
+    import aiter.ops.qsa_index_scorer as pkg
+    from aiter.ops import qsa
+    from aiter.ops.qsa_index_scorer import api, gen_profile
 
-        return pkg, api, gen_profile
-    d = os.path.join(ROOT, "aiter", "ops", "qsa_index_scorer")
-    spec = importlib.util.spec_from_file_location(
-        "qsa_isc_gpu", os.path.join(d, "__init__.py"), submodule_search_locations=[d]
-    )
-    pkg = importlib.util.module_from_spec(spec)
-    sys.modules["qsa_isc_gpu"] = pkg
-    spec.loader.exec_module(pkg)
-    import qsa_isc_gpu.gen_profile as gen
-
-    return pkg, sys.modules["qsa_isc_gpu.api"], gen
+    return qsa, pkg, api, gen_profile
 
 
-PKG, API, GEN = load_api()
+QSA, PKG, API, GEN = load_api()
 PROFILE = os.environ.get("QSA_TEST_PROFILE") or PKG.DEFAULT_PROFILE
+QSA.configure(profile=PROFILE, source="op_tests/test_qsa_index_scorer.py")
 #: --allow-unverified: also serve `pending` rows (gen_profile sweep path). Needed to
 #: run the suite on a kernel whose rows are not restamped yet (82c4dec5: fp8 rows).
 ALLOW_UNVERIFIED = False
 
 
-def scorer(*args, **kw):
-    """Fused path only (``strict=True``: an uncovered call raises instead of running the
-    native path); with --allow-unverified the try-API sweep path (pending rows)."""
+def scorer(*args, profile=None, **kw):
+    """The neutral op ``aiter.ops.qsa.qsa_paged_mqa_logits`` on its fused path only (the
+    profile must cover the call: ``explain`` first, an uncovered call raises instead of
+    running natively); with --allow-unverified the implementation's try-API sweep path
+    (pending rows, which the op never selects)."""
     if not ALLOW_UNVERIFIED:
-        return API.qsa_paged_mqa_logits(*args, strict=True, **kw)
-    out, d = API.try_qsa_paged_mqa_logits(*args, allow_unverified=True, **kw)
+        d = QSA.explain(*args, **kw)
+        if d.path != "fused":
+            raise RuntimeError(f"not served fused: {d.path} {d.reason}: {d.detail}")
+        return QSA.qsa_paged_mqa_logits(*args, **kw)
+    out, d = API.try_qsa_paged_mqa_logits(
+        *args, allow_unverified=True, profile=profile or PROFILE, **kw
+    )
     if out is None:
         raise API.QSAIndexScorerUnsupported(d)
     return out
@@ -752,9 +751,9 @@ def run_logits_indexer(native=True):
                     False,
                     d["compressed_k_scale"],
                 )
-                dec = API.decide(*call, profile=PROFILE)
+                dec = QSA.explain(*call)
                 rec.update(fused_path=dec.path, fused_vid=dec.vid, fused_cell=dec.cell)
-                ok = dec.ok
+                ok = dec.path == "fused"
                 if ok:
                     fo, fv = scorer(*call, profile=PROFILE)
                     torch.cuda.synchronize()
@@ -792,6 +791,17 @@ def run_logits_indexer(native=True):
                     rec.update(native_path=nd.path, native_vid=nd.vid, native=res)
                     ok = ok and res["pass"] and res["row_starts_zero"]
                     ok = ok and res["graph_bitwise"] and nd.path == API.PATH_NATIVE
+                    # the neutral op with the fused path off: aiter's existing dispatch
+                    QSA.configure(profile=None, source="op_tests: fused off")
+                    try:
+                        od = QSA.explain(*call)
+                        oo, ov = QSA.qsa_paged_mqa_logits(*call)
+                        torch.cuda.synchronize()
+                    finally:
+                        QSA.configure(profile=PROFILE, source="op_tests")
+                    rec.update(off_path=od.path, off_vid=od.vid)
+                    rec["off"] = compare(oo, ov, d, cols)
+                    ok = ok and rec["off"]["pass"] and od.path == "native-triton"
                 rec["passed"] = bool(ok)
             except Exception as exc:  # noqa: BLE001 -- recorded as a failed cell
                 rec.update(passed=False, error=f"{type(exc).__name__}: {exc}"[:2000])

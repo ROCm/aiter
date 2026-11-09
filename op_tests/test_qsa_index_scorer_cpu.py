@@ -870,7 +870,8 @@ class AbiDrift(unittest.TestCase):
                 "native",
             ],
         )
-        self.assertIs(PKG.qsa_paged_mqa_logits, API.qsa_paged_mqa_logits)
+        # AITER-R3: the package is private (no re-export); the public op is aiter.ops.qsa
+        self.assertFalse(hasattr(PKG, "qsa_paged_mqa_logits"))
 
     def test_api_1_1_signatures(self):
         """1.1 is additive: launch = (decision, <ATOM 12>, *, logits, visible_groups)."""
@@ -927,8 +928,7 @@ class AbiDrift(unittest.TestCase):
                 "compile_only": False,
             },
         )
-        self.assertIs(PKG.launch, API.launch)
-        self.assertIs(PKG.prewarm, API.prewarm)
+        self.assertTrue(callable(API.launch) and callable(API.prewarm))
         # Decision keeps its 1.0 public fields (the plan is private, not compared); API 1.2
         # adds ``path`` (fused / native / invalid)
         import dataclasses
