@@ -197,6 +197,11 @@ class _FusedScatterCombine:
             res.combine_output.data_ptr(),
             routing.token_count,
             stream,
+            (
+                routing.source_topk_ids.data_ptr()
+                if routing.source_topk_ids is not None
+                else 0
+            ),
         )
         return res.output(routing.token_count)
 
