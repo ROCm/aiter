@@ -57,6 +57,9 @@ def is_fx_set_register_available():
     return callable(getattr(fx, "set_register", None))
 
 
+# computePadEncoding keeps log2(dwords) - 1 in three bits, so a padded LDS
+# row cannot declare an interval wider than this.
+_TDM_MAX_PAD_INTERVAL_BYTES = 1024
 IGLP_PARAMS = {
     "a8w4": {
         "default": {"mma_group": 10, "mma_first_group": 10, "ds_first_n": 0},
