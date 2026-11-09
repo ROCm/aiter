@@ -727,6 +727,7 @@
             ],
             "*fused_norm_rope_attn_rope_cast/attention_64rows_*.cu": [
                 "-ffast-math",
+                "-fno-finite-math-only",
                 "-fno-gpu-flush-denormals-to-zero",
                 "-mllvm -enable-post-misched=1"
             ]
