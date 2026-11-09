@@ -64,7 +64,7 @@ VID_TORCH = N.NATIVE_VID
 
 #: decided call classes kept (FIFO beyond this; a class is a few hundred bytes plus,
 #: for ``native-torch`` only, its bounded workspace)
-MAX_CLASSES = 4096
+MAX_CLASSES = 32768
 _OFF = ("0", "off", "none", "false", "no")
 
 
@@ -242,7 +242,10 @@ def class_key(
         c.dtype,
         c.is_contiguous(),
         c.is_cuda,
-        c.data_ptr(),
+        # base offset within a 2 MiB page only (the fused router's alignment/addressing
+        # predicates look at it): every layer has its own cache tensor, and keying on
+        # the full base address multiplied the classes by the layer count (FIFO thrash).
+        c.data_ptr() & 0x1FFFFF,
         None if s is None else (_tk(s), s.data_ptr() & 3),
         _tk(page_table),
         _tk(token_to_request),
