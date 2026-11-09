@@ -750,9 +750,9 @@ class AsyncKVLoader:
             blk = i
         else:
             # clamp to the last column so the loop's j+2 prefetch
-            # never reads past the (padded) block table
-            if self.cfg.ALL_DECODE:
-                i = gl.minimum(i, self.block_table_stride - 1)
+            # never reads past the block table (prefill/extend tables may
+            # be exactly as wide as the longest sequence)
+            i = gl.minimum(i, self.block_table_stride - 1)
             blk = gl.load(self.block_tables_ptr_shifted + i)
         # For >2 GB caches (not USE_LOAD_BUFFER_OP) this is the one term that can exceed int32
         if self.cfg.USE_LOAD_BUFFER_OP:
