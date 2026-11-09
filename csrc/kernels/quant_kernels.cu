@@ -16,7 +16,7 @@
 #include "quant_amax_floor.h"
 #include "rocprim/rocprim.hpp"
 #include <cstdlib>
-#include <string>
+#include <string_view>
 
 
 const int32_t BlockSize           = 256;
@@ -201,6 +201,10 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     {
         ori_rows = static_cast<int64_t>(*num_rows) * num_cols_factor;
     }
+    // A fixed-capacity launch can have no live rows. Exit uniformly before
+    // column-major indexing divides by ori_rows or any block reaches a barrier.
+    if(ori_rows <= 0)
+        return;
     static constexpr int num_thread_per_group = group_size / thread_data_size;
     const int lane_in_group  = threadIdx.x % num_thread_per_group;
     // Reused at the end as the scale-store index, which the shuffled layouts rewrite.
@@ -872,6 +876,12 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
 
     if(scale_run_in_lds)
     {
+        // This path visits groups in column-major order, exactly the flattened
+        // scale order. Derive the run from the block, independent of live lanes.
+        const int64_t scale_begin = static_cast<int64_t>(blockIdx.x) * kScaleRun;
+        const int64_t scale_count = ori_rows * scaleN;
+        if(scale_begin >= scale_count)
+            return; // block-uniform: dynamic row counts may leave whole blocks empty
         if(resolve(groupId, x, y))
             process(gather(input + x * ori_row_stride + y * group_size), x, y, groupId);
         // Wait on LDS only; __syncthreads would also drain the data stores.
@@ -879,26 +889,18 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
         opus::s_wait_dscnt<0>();
 #endif
         __builtin_amdgcn_s_barrier();
-        // The run starts at thread 0's group and may wrap into the next column. Words
-        // need rows and the scale base 4-aligned; otherwise store bytes.
         const bool words = ori_rows % 4 == 0 && reinterpret_cast<uintptr_t>(scale) % 4 == 0;
         const int step   = words ? 4 : 1;
         if(threadIdx.x < WARP_SIZE)
         {
-            const int64_t x0 = __builtin_amdgcn_readfirstlane(static_cast<int32_t>(x));
-            const int32_t y0 = __builtin_amdgcn_readfirstlane(y);
             for(int i = threadIdx.x * step; i < kScaleRun; i += WARP_SIZE * step)
             {
-                int64_t gx = x0 + i;
-                int32_t gy = y0;
-                while(gx >= ori_rows)
+                const int64_t scale_idx = scale_begin + i;
+                // Only flush produced bytes. In the word path scale_count and
+                // scale_begin are multiples of four, so no word straddles the tail.
+                if(scale_idx + step <= scale_count)
                 {
-                    gx -= ori_rows;
-                    ++gy;
-                }
-                auto* dst = reinterpret_cast<uint8_t*>(scale) + gy * ori_rows + gx;
-                if(gy < scaleN)
-                {
+                    auto* dst = reinterpret_cast<uint8_t*>(scale) + scale_idx;
                     if(words)
                         *reinterpret_cast<uint32_t*>(dst) = s_scale_run[i / 4];
                     else

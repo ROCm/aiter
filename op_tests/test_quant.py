@@ -202,8 +202,10 @@ def _mx_reference(x, G, q_dtype):
 
 
 def _fp8_bytes(out):
-    """fp8 output bytes with both e4m3fn NaNs (0x7f, 0xff) as 0xff: the NaN sign
-    an Inf converts to differs between archs."""
+    """Normalize both e4m3fn NaN encodings (0x7f, 0xff) to 0xff.
+
+    Converting Inf to FP8 can produce different NaN encodings across architectures.
+    """
     b = out.view(torch.uint8)
     return b if get_gfx() == "gfx942" else b.masked_fill(b == 0x7F, 0xFF)
 
@@ -258,6 +260,67 @@ def test_quant_1x32_e8m0(m, n, q_dtype, h_dtype, shuffle, strided, pattern=None)
     ), f"{m=} {n=} {shuffle=} {strided=} {pattern=} {scale_err=} {out_err=}"
 
 
+@benchmark()
+def test_quant_1x128_e8m0_dynamic(m, n, active_rows, q_dtype, h_dtype, scale_offset):
+    """Check compact dynamic scales, empty blocks and aligned/unaligned tail stores."""
+    G = 128
+    fp4 = q_dtype == dtypes.fp4x2
+    x = torch.randn((m, n), dtype=h_dtype)
+    x[active_rows:] = float("nan")
+    n_out, scale_n = n // 2 if fp4 else n, n // G
+    out_buf, out = _guarded(m * n_out, q_dtype)
+    out = out.view(m, n_out)
+    scale_buf, storage = _guarded(m * scale_n + scale_offset, torch.uint8)
+    scale = storage[scale_offset:]
+    rows = torch.tensor([active_rows], dtype=torch.int32)
+    candidates = {
+        "hip": lambda: dynamic_per_group_scaled_quant(
+            out, x, scale, G, shuffle_scale=True, num_rows=rows
+        )
+    }
+    ret = {"gfx": get_gfx()}
+    for name, fn in candidates.items():
+        _, us = run_perftest(fn, num_iters=21, num_rotate_args=1)
+        _assert_guard(out_buf, "dynamic out")
+        _assert_guard(scale_buf, "dynamic scale")
+        assert torch.all(out[active_rows:].view(torch.uint8) == _GUARD_BYTE).item()
+        assert torch.all(scale[active_rows * scale_n :] == _GUARD_BYTE).item()
+        assert torch.all(storage[:scale_offset] == _GUARD_BYTE).item()
+        out_err = scale_err = 0
+        if active_rows:
+            expected, expected_scale = _mx_reference(x[:active_rows], G, q_dtype)
+            got = scale[: active_rows * scale_n].view(scale_n, active_rows).t()
+            scale_err = checkAllclose(
+                expected_scale.float(),
+                got.float(),
+                atol=0,
+                rtol=0,
+                msg="dynamic group-128 scale bytes",
+            )
+            got_out = out[:active_rows].view(torch.uint8)
+            out_err = checkAllclose(
+                expected.float(),
+                got_out.float(),
+                atol=0,
+                rtol=0,
+                msg="dynamic group-128 output bytes",
+            )
+            assert out_err == 0 and scale_err == 0
+        # Effective work: abs, max and scaling per input element; bytes count
+        # valid input/output and compact scales, without cache-line amplification.
+        ops = 3 * active_rows * n
+        nbytes = active_rows * (n * x.element_size() + n_out + scale_n)
+        ret.update(
+            {
+                f"{name} us": us,
+                f"{name} TFLOPS": ops / us / 1e6,
+                f"{name} TB/s": nbytes / us / 1e6,
+                f"{name} err": max(out_err, scale_err),
+            }
+        )
+    return ret
+
+
 def test_mxfp8_nonfinite_g128(m, n, h_dtype, shuffle, pattern):
     """NaN/Inf at shapes that reach the group-128 TDM tile path on gfx1250."""
     G = 128
@@ -303,7 +366,7 @@ def test_mxfp8_m32k4(m, n, h_dtype, pattern=None):
 
 def _assert_tiled_paths_covered(g32_shapes, g128_shapes):
     """Fail if no case satisfies the gfx1250 tiled-path dispatch predicates."""
-    if get_gfx() != "gfx1250":
+    if get_gfx() not in ("gfx1250", "gfx1250-strict"):
         return
     cu = torch.cuda.get_device_properties(torch.cuda.current_device())
     cu = cu.multi_processor_count
@@ -559,7 +622,7 @@ e8m0_shapes = (
     if args.m or args.n
     else E8M0_SHAPES
 )
-_skip_fp4_e8m0 = get_gfx() not in ("gfx950", "gfx1250")
+_skip_fp4_e8m0 = get_gfx() not in ("gfx950", "gfx1250", "gfx1250-strict")
 for key in [k for k in args.quant if k in d_quant_e8m0]:
     if _skip_fp4_e8m0 and d_quant_e8m0[key] == dtypes.fp4x2:
         aiter.logger.info("Skipping %s on %s (no HW fp4 convert)", key, get_gfx())
@@ -574,7 +637,28 @@ for key in [k for k in args.quant if k in d_quant_e8m0]:
     df = pd.DataFrame(df)
     aiter.logger.info("%s summary (markdown):\n%s", key, df.to_markdown(index=False))
 
-if "fp8_mx_nonfinite" in args.quant and get_gfx() in ("gfx950", "gfx1250"):
+    # The allocated shape exceeds the gfx1250 LDS scale-run threshold (32768
+    # groups); num_rows prevents tiled dispatch. Odd scale_n exercises the final
+    # partial group run; dynamic zero/short rows leave whole grid blocks empty.
+    dynamic_rows = [
+        test_quant_1x128_e8m0_dynamic(
+            1025, 7296, live, d_quant_e8m0[key], dtype, offset
+        )
+        for dtype, live, offset in itertools.product(
+            args.dtype, (0, 1, 3, 4, 17, 63, 64, 65, 1024, 1025), (0, 1)
+        )
+    ]
+    aiter.logger.info(
+        "%s dynamic rows summary (markdown):\n%s",
+        key,
+        pd.DataFrame(dynamic_rows).to_markdown(index=False),
+    )
+
+if "fp8_mx_nonfinite" in args.quant and get_gfx() in (
+    "gfx950",
+    "gfx1250",
+    "gfx1250-strict",
+):
     # Group-32 shapes on both sides of the tile-path gates, odd fp4 tile counts per
     # row band for both mx32 block shapes (4096, 2304) and (8192, 2304), padded TDM
     # bands for one and two steps (1056, 7168) and (3104, 7168), and narrow rows.
@@ -635,7 +719,12 @@ if "fp8_mx_nonfinite" in args.quant and get_gfx() in ("gfx950", "gfx1250"):
     ):
         test_mxfp8_m32k4(m, n, h_dtype, pattern)
     aiter.logger.info("fp8_1x32_e8m0 passed")
-if "fp8_mx_nonfinite" in args.quant and get_gfx() in ("gfx942", "gfx950", "gfx1250"):
+if "fp8_mx_nonfinite" in args.quant and get_gfx() in (
+    "gfx942",
+    "gfx950",
+    "gfx1250",
+    "gfx1250-strict",
+):
     for gs, shuffle in itertools.product([32, 64, 128], [True, False]):
         for h_dtype, pattern in itertools.product(
             [dtypes.bf16, dtypes.fp16],

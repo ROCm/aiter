@@ -36,9 +36,9 @@ Per-thread layout (single wave64, BLOCK_THREADS=64):
     arrays carried across K iterations via scf.for loop-carried state.
 
 Two-phase K loop (matches Triton perf split):
-  Phase 1 (state cache): pool kv_state/score_state up to window_len.
-    The single-wave path masks both scores and values for negative source
-    positions; the K-split path skips those padding iterations entirely.
+  Phase 1 (state cache): k ? [0, window_len) -- dynamic bound, scf.for with
+    loop-carry. Each iter loads kv_state/score_state at ``s = pos - K + 1 + k``,
+    masking padding (s < 0) via ``select(is_padding, NEG_INF, score_b)``.
   Phase 2 (ragged input): k ? [window_len, K) -- dynamic start, constexpr end.
     Each iter loads kv_in/score_in/ape, then ``score_k = score_a + ape_v``.
 
@@ -498,17 +498,16 @@ def _build_kernel(
                 kv_v_lane = _load_f32_vec(kv_state_buf, base_kv_off, VEC)
                 sc_v_lane = _load_f32_vec(score_state_buf, base_sc_off, VEC)
 
-                # Padding has zero probability, but 0 * NaN/Inf is still NaN.
-                # Mask the value too: state storage for s < 0 is not valid input.
-                kv_v_lane = [
-                    is_pad.select(c_zero_f32, fx.Float32(kv_v_lane[i]))
-                    for i in range_constexpr(VEC)
-                ]
                 sc_pad_lane = []
                 for i in range_constexpr(VEC):
                     sc_pad_lane.append(
                         is_pad.select(c_neg_inf, fx.Float32(sc_v_lane[i]))
                     )
+                # A padding row reads ring 0 of whatever the slot last held, and its
+                # zero weight does not cancel a NaN there (0 * NaN = NaN): zero the kv too.
+                kv_v_lane = [
+                    is_pad.select(c_zero_f32, fx.Float32(v)) for v in kv_v_lane
+                ]
 
                 new_m, new_kv, new_w = _online_softmax_update(
                     m_lane, kv_lane, w_lane, sc_pad_lane, kv_v_lane
@@ -1524,14 +1523,22 @@ def _build_kernel_ksplit(
 
             def _phase1_loads(k_i32):
                 s = position - (K - 1) + fx.Int32(k_i32)
-                ring = fx.Int32(s) % state_size
+                is_pad = s < fx.Int32(0)
+                s_safe = is_pad.select(fx.Int32(0), s)
+                ring = fx.Int32(s_safe) % state_size
                 col_off = _col_off_for_k(k_i32)
                 # Slot term already folded into the descriptor base.
                 base_kv = ring * kv_state_pos_stride + col_off + lid_x_vec
                 base_sc = ring * score_state_pos_stride + col_off + lid_x_vec
                 kv_v = _load_f32_vec(kv_state_buf, base_kv, VEC)
                 sc_v = _load_f32_vec(score_state_buf, base_sc, VEC)
-                return kv_v, sc_v
+                sc_pad = [
+                    is_pad.select(c_neg_inf, fx.Float32(sc_v[i])) for i in range(VEC)
+                ]
+                # A padding row reads ring 0 of whatever the slot last held, and its
+                # zero weight does not cancel a NaN there (0 * NaN = NaN): zero the kv too.
+                kv_pad = [is_pad.select(c_zero_f32, fx.Float32(v)) for v in kv_v]
+                return kv_pad, sc_pad
 
             def _phase2_loads(k_i32):
                 col_off = _col_off_for_k(k_i32)
@@ -1560,11 +1567,9 @@ def _build_kernel_ksplit(
             init_w = [c_zero_f32 for _ in range(VEC)]
             init_state = init_m + init_kv + init_w
 
-            # Skip negative history in each wave's state-cache sub-loop.
-            # Empty waves retain (-inf, 0, 0) for the cross-wave reduction.
-            first_state_k = fx.max(k_start, fx.Int32(K - 1) - position)
+            # Phase 1 sub-loop [k_start, split): state cache.
             p1 = init_state
-            for k_static, state in range(first_state_k, split, 1, init=init_state):
+            for k_static, state in range(k_start, split, 1, init=init_state):
                 m_lane = list(state[0:VEC])
                 kv_lane = list(state[VEC : 2 * VEC])
                 w_lane = list(state[2 * VEC : 3 * VEC])

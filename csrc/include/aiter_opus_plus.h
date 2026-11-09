@@ -71,7 +71,9 @@ OPUS_D decltype(auto) fp32_to_fp8_scaled_x2(const S& s, float inverted_scale)
 // scale), which -fgpu-flush-denormals-to-zero turns into 0; ldexp has no such step.
 OPUS_D int pow2_div_exponent(float scale)
 {
-    return 127 - static_cast<int>(__builtin_bit_cast(uint32_t, scale) >> 23);
+    const uint32_t bits = __builtin_bit_cast(uint32_t, scale);
+    const uint32_t exponent = (bits >> 23) & 0xFFu;
+    return 127 - static_cast<int>(exponent);
 }
 
 // fp32x2 / scale -> fp8x2, no clamp: NaN and anything past +-max convert to NaN.
