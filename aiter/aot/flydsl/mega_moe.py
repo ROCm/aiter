@@ -24,7 +24,7 @@ and large-input kernels where the layout and MTPR support them), and
 ``preload_aot_bundles()`` loads the kernels of all of them.
 
 Usage:
-    # Every profile the service ships (DeepSeek-V4-Pro and Kimi-K3)
+    # Every profile the service ships (DeepSeek-V4-Pro, Kimi-K3, DeepSeek-V4.1-Flash EP4)
     python -m aiter.aot.flydsl.mega_moe
 
     # One custom profile
@@ -78,6 +78,16 @@ K3_INTER_DIM = 3072
 K3_ACT = "situv2"
 K3_SITU_BETA = 4.0
 K3_SITU_LINEAR_BETA = 25.0
+# DeepSeek-V4.1-Flash EP4 deployment profile (epr96, d5120 / i2304, a8w4 only:
+# the fused routes are a8w4). Its MTPRs are those of ATOM's instances: decode
+# (128: staged + small-input 256) and prefill (8192: staged + small-input +
+# large-input; 16384: staged + small-input).
+V41_FLASH_WORLD_SIZE = 4
+V41_FLASH_EXPERTS_PER_RANKS = (96,)
+V41_FLASH_MODEL_DIM = 5120
+V41_FLASH_INTER_DIM = 2304
+V41_FLASH_MTPRS = (128, 8192, 16384)
+V41_FLASH_QUANTS = ("a8w4",)
 WORLD_SIZE = 8
 TOPK = 6
 MODEL_DIM = 7168
@@ -142,10 +152,12 @@ def production_jobs(
     quants=DEFAULT_QUANTS,
     world_size=WORLD_SIZE,
     swiglu_limit=SWIGLU_LIMIT,
+    v41_flash_mtprs=V41_FLASH_MTPRS,
 ):
-    """Every geometry the service ships: V4-Pro (default shape) + Kimi-K3.
+    """Every geometry the service ships: V4-Pro (default shape), Kimi-K3 and
+    V4.1-Flash EP4 (``v41_flash_mtprs``, a8w4 in ``quants`` only).
 
-    Used by the default build so both profiles are AOT-covered and neither
+    Used by the default build so every profile is AOT-covered and none
     triggers an online JIT compile at serving time.
     """
     jobs = default_jobs(
@@ -163,6 +175,15 @@ def production_jobs(
         act=K3_ACT,
         situ_beta=K3_SITU_BETA,
         situ_linear_beta=K3_SITU_LINEAR_BETA,
+    )
+    jobs += default_jobs(
+        v41_flash_mtprs,
+        V41_FLASH_EXPERTS_PER_RANKS,
+        quants=tuple(q for q in quants if q in V41_FLASH_QUANTS),
+        world_size=V41_FLASH_WORLD_SIZE,
+        model_dim=V41_FLASH_MODEL_DIM,
+        inter_dim=V41_FLASH_INTER_DIM,
+        swiglu_limit=swiglu_limit,
     )
     return jobs
 
@@ -322,12 +343,18 @@ def main():
         and args.inter_dim == INTER_DIM
     )
     if default_shape:
-        # Default build ships both V4-Pro and Kimi-K3 so neither JITs online.
+        # Default build ships V4-Pro, Kimi-K3 and V4.1-Flash EP4 so none JITs
+        # online. An explicit --mtpr applies to the EP4 profile as well.
         jobs = production_jobs(
             tuple(args.mtpr),
             quants=tuple(args.quant),
             world_size=args.world_size,
             swiglu_limit=args.swiglu_limit,
+            v41_flash_mtprs=(
+                V41_FLASH_MTPRS
+                if list(args.mtpr) == list(DEFAULT_MTPRS)
+                else tuple(args.mtpr)
+            ),
         )
     else:
         jobs = default_jobs(
