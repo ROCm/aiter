@@ -38,6 +38,13 @@ from ..mxfp4_gemm_common import _fabs_f32 as fabs_f32
 from ..mxfp4_gemm_common import lds_typed_ptr, lds_vec_load
 from ..tensor_shim import _preload_compiled, _run_compiled
 from .dispatch import _wave_inclusive_scan_i32, _wave_reduce_max_i32
+from .mega_moe_config import (
+    FUSED_PATH_SHAPES,
+    K26_INTER_DIM,
+    K26_MODEL_DIM,
+    V4_INTER_DIM,
+    V4_MODEL_DIM,
+)
 from .mega_moe_fused_gemm import (
     AddrBuffer,
     MegaMoEConfig,
@@ -1168,9 +1175,10 @@ def make_stage2_body_emitter(*, model_dim, topk, rank, npes, max_tok, experts, B
 _SC0_CACHE = 1
 
 
-# Chunks of 3 n-major GEMM2 units keep consecutive m-blocks of one n-block together for W2 reuse while short
+# Chunks of n-major GEMM2 units keep consecutive m-blocks of one n-block together for W2 reuse while short
 # enough to narrow the per-CTA drain tail; the kernel takes them only when the received rows warrant it.
-LARGE_M_G2_CHUNK = 3
+# Keyed by (model_dim, inter_dim): Kimi-K2.6's shorter GEMM2 K and top-8 rows favour chunks of 2.
+LARGE_M_G2_CHUNK = {(V4_MODEL_DIM, V4_INTER_DIM): 3, (K26_MODEL_DIM, K26_INTER_DIM): 2}
 
 
 def large_m_kernel_specs(
@@ -1974,20 +1982,17 @@ class LargeMRuntime:
         if max_tok_per_rank <= 0 or max_tok_per_rank & (max_tok_per_rank - 1):
             raise ValueError(f"max_tok_per_rank={max_tok_per_rank} must be a power of two")
         arch = get_gfx_runtime()
-        shape = (
-            world_size,
-            model_dim,
-            inter_dim,
-            experts,
-            experts // world_size,
-            topk,
-            max_tok_per_rank,
-            float(swiglu_limit),
-        )
-        if arch != "gfx950" or shape != (8, 7168, 3072, 384, 48, 6, 8192, 10.0):
+        shape = (model_dim, inter_dim, experts, topk, float(swiglu_limit))
+        if (
+            arch != "gfx950"
+            or world_size != 8
+            or max_tok_per_rank != 8192
+            or shape not in FUSED_PATH_SHAPES
+        ):
             raise ValueError(
-                "the large-input path requires gfx950, EP8, 7168x3072, "
-                "384 experts/EPR48, topk6, max_tok_per_rank 8192, and swiglu_limit=10"
+                "the large-input path requires gfx950, EP8, max_tok_per_rank 8192 and "
+                f"one of the (model_dim, inter_dim, experts, topk, swiglu_limit) layouts "
+                f"{FUSED_PATH_SHAPES}"
             )
         self.rank = int(rank)
         self.world_size = int(world_size)
@@ -2380,7 +2385,7 @@ class LargeMRuntime:
             "fused_args": (self._fused_mtile_ctr.data_ptr(), *s2_args),
             "fused_combine": c_spec,
             "fused_combine_args": c_args,
-            "fused_g2_chunk": LARGE_M_G2_CHUNK,
+            "fused_g2_chunk": LARGE_M_G2_CHUNK[(self.model_dim, self.inter_dim)],
         }
         return s1, kw
 

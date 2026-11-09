@@ -331,7 +331,7 @@ def emit_direct_fixed_slot_payload(
 
 @flyc.jit
 def emit_direct_fixed_slot_finalize(
-    *, fz_npes, fz_epr, fz_cap, fz_mtpr, fz_rank, fz_tile_m, addr_disp, parity, expected, plan_nv,
+    *, fz_npes, fz_epr, fz_cap, fz_mtpr, fz_rank, fz_tile_m, fz_topk, addr_disp, parity, expected, plan_nv,
 ):
     """Finalize local fixed slots as soon as every source publishes this destination.
 
@@ -406,7 +406,7 @@ def emit_direct_fixed_slot_finalize(
             nv_flag = nv_flag | (hot_expert | (routed_rows >= fx.Int32(_CACHED_W_MIN_ROWS))).select(
                 fx.Int32(1 << _PLAN_CACHED_W_BIT), fx.Int32(0)
             )
-            nv_flag = nv_flag | (hot_expert | (routed_rows >= fx.Int32(_FP8_ROWS_MIN_ROWS))).select(
+            nv_flag = nv_flag | (hot_expert | (routed_rows >= fx.Int32(_fp8_rows_min_rows(fz_topk)))).select(
                 fx.Int32(1 << _PLAN_FP8_ROWS_BIT), fx.Int32(0)
             )
             comm_ops.store_i64_global_system(
@@ -1113,7 +1113,7 @@ def compile_mega_moe_stage1(
         if owner:
             emit_direct_fixed_slot_finalize(
                 fz_npes=fz_npes, fz_epr=fz_epr, fz_cap=fz_cap, fz_mtpr=fz_mtpr, fz_rank=fz_rank,
-                fz_tile_m=fz_tile_m, addr_disp=addr_disp, parity=payload_parity,
+                fz_tile_m=fz_tile_m, fz_topk=fz_k, addr_disp=addr_disp, parity=payload_parity,
                 expected=payload_expected, plan_nv=(_disp_ptr(DispatchSlot.PLAN_NV), gate_epoch),
             )
         wave_id = fx.thread_idx.x // 64
@@ -1409,9 +1409,15 @@ _BM64_MIN_BUCKET = 256
 # cached-weight ones, whose experts then span enough m-tiles to reuse their weights. Measured: cached loads
 # cost uniform routing at 384 tokens (2304 rows) and gain from 448 (2688).
 _CACHED_W_MIN_ROWS = 2560
+
+
 # Routed rows a rank receives from which its GEMM2 sends FP8 rows (1x32 E8M0 scales, the numerics of the main
-# path) to the combine instead of BF16: above the 3072 rows of uniform routing at 512 tokens.
-_FP8_ROWS_MIN_ROWS = 3584
+# path) to the combine instead of BF16: 512 rows above uniform routing at 512 tokens (3584 at top-6, 4608 at
+# top-8), so uniform calls always combine BF16 rows.
+def _fp8_rows_min_rows(topk: int) -> int:
+    return 512 * (int(topk) + 1)
+
+
 # Rows of a rank's largest expert from which the rank also takes both of the above: its rows sit in a few experts
 # (skewed routing), far above the 64-row average of uniform routing at 512 tokens.
 _HOT_EXPERT_MIN_ROWS = 256
@@ -1485,14 +1491,14 @@ class SmallMRuntime:
         from .mega_moe_v2 import small_m_eligible
 
         # Built directly, the runtime checks the layout MegaMoEV2 gates it to (the kernel splits its
-        # work over 8 XCDs and bakes in the EP8 DeepSeek-V4 shape), instead of failing at compile.
+        # work over 8 XCDs and bakes in the EP8 / 48-experts-per-rank layout), instead of failing at compile.
         if not small_m_eligible(
             enabled=True, arch=get_gfx_runtime(),
             num_cu=torch.cuda.get_device_properties(self.dev).multi_processor_count,
             world_size=self.world_size, model_dim=self.model_dim, inter_dim=self.inter_dim,
             experts=self.experts, topk=self.topk, quant=quant, swiglu_limit=self.swiglu_limit,
         ):
-            raise ValueError("SmallMRuntime supports the EP8 DeepSeek-V4 a8w4 layout on 8-XCD gfx950 only")
+            raise ValueError("SmallMRuntime supports the EP8 a8w4 FUSED_PATH_SHAPES layouts on 8-XCD gfx950 only")
         # The combine reducers run at the end of the kernel on a fully resident grid, so they are not bounded by
         # one XCD's residency.
         self._reducers = _COMBINE_REDUCERS

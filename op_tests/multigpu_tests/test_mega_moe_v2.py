@@ -44,6 +44,14 @@ NETWORKS = {
         "topk": 6,
         "swiglu_limit": 10.0,
     },
+    # Kimi-K2.6: SiLU without a SwiGLU clamp.
+    "kimi_k26": {
+        "model_dim": 7168,
+        "inter_dim": 2048,
+        "experts": 384,
+        "topk": 8,
+        "swiglu_limit": 0.0,
+    },
     "r1_v3": {
         "model_dim": 7168,
         "inter_dim": 2048,
