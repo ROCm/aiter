@@ -442,6 +442,26 @@ class TestWorkerErrorRatio(unittest.TestCase):
         self.assertEqual(merge_error_ratio(0.1, 0.2), 0.2)
         self.assertEqual(merge_error_ratio(0.2, 0.1), 0.2)
 
+    def test_output_keys_reset_float_and_integer_buffers(self):
+        import torch
+
+        if not torch.cuda.is_available():
+            self.skipTest("worker runs the task on a GPU")
+        tuner = importlib.import_module("aiter.utility.mp_tuner")
+        codes = torch.zeros(4, dtype=torch.uint8, device="cuda")
+        values = torch.zeros(4, device="cuda")
+        tuner.worker(
+            0,
+            "info",
+            lambda codes, values: (codes, values),
+            [codes, values],
+            {},
+            output_keys=["codes", "values"],
+            _arg_key_list=["codes", "values"],
+        )
+        self.assertTrue(torch.all(codes == 0xFF))
+        self.assertTrue(torch.all(values.isnan()))
+
     def test_whole_output_compare_gets_both_tuples_once(self):
         import torch
 

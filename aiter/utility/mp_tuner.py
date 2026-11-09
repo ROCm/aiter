@@ -150,8 +150,14 @@ def worker(
                         # warmup runs with this initial state.  If the kernel
                         # does not fully write the output, NaN values survive
                         # through warmup/iters and will be caught by
-                        # checkAllclose.
-                        args[idx].fill_(float("nan"))
+                        # checkAllclose.  Integer buffers have no NaN; their
+                        # largest value stands in.
+                        out = args[idx]
+                        out.fill_(
+                            float("nan")
+                            if out.is_floating_point()
+                            else torch.iinfo(out.dtype).max
+                        )
         torch.cuda.synchronize()
         res = None
         us = float("inf")

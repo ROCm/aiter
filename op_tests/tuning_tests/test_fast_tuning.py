@@ -1159,6 +1159,12 @@ class TestFusedStage1Fp8AndSplitKCompare(unittest.TestCase):
 
         return functools.partial(self._tune().dequantized_output_compare, split_k=True)
 
+    def _compare_modes(self):
+        return (
+            ("default", self._tune().dequantized_output_compare),
+            ("split_k", self._split_k_compare()),
+        )
+
     def test_reference_rounding_passes(self):
         compare = self._tune().dequantized_output_compare
         for name, quant in self._quantizers().items():
@@ -1169,11 +1175,18 @@ class TestFusedStage1Fp8AndSplitKCompare(unittest.TestCase):
     def test_rounding_of_a_value_within_the_block_floor_passes(self):
         """A value on a rounding boundary may round either way: the kernel's fp32
         accumulation differs from the reference's in the last bits."""
+        import torch
+
+        torch.manual_seed(0)
         compare = self._tune().dequantized_output_compare
         for name, quant in self._quantizers().items():
             with self.subTest(name):
                 ref, res = self._fused_output(
                     quant, scale_of=lambda x: x * (1 + 2**-14), split_k=False
+                )
+                exact, _ = quant(ref[0])
+                self.assertFalse(
+                    torch.equal(res[0].view(torch.uint8), exact.view(torch.uint8))
                 )
                 self.assertEqual(compare(ref, res, printLog=False), 0.0)
 
@@ -1255,6 +1268,50 @@ class TestFusedStage1Fp8AndSplitKCompare(unittest.TestCase):
                 sorted_ids, num_valid_ids, self.token_num, self.topk
             )
 
+    def _kernel_rule_output(self, fmt, exponent_offset):
+        """Fused-kernel scale rule shifted by exponent_offset, converted with
+        saturation."""
+        import torch
+
+        from aiter import dtypes
+        from aiter.utility import fp4_utils
+
+        tune = self._tune()
+        sorted_ids, num_valid_ids = self._routes()
+        x = torch.randn(self.token_num, self.topk, self.inter)
+        blocks = x.view(-1, 32)
+        headroom, largest = (2, 6.0) if fmt == "fp4" else (8, 448.0)
+        rounded = (blocks.abs().amax(-1).view(torch.int32) + 0x400000) >> 23
+        exponent = (rounded - headroom + exponent_offset).clamp(min=0)
+        scale = (exponent << 23).view(torch.float32).unsqueeze(-1)
+        on_grid = (blocks / scale).clamp(-largest, largest).view(-1, self.inter)
+        if fmt == "fp4":
+            codes = fp4_utils.f32_to_mxfp4(on_grid)
+        else:
+            codes = on_grid.to(torch.float8_e4m3fn)
+        sorted_scales = tune._sorted_route_scales(
+            exponent.to(torch.uint8).view(dtypes.fp8_e8m0).view(-1, self.inter // 32),
+            sorted_ids,
+            num_valid_ids,
+            self.token_num,
+            self.topk,
+        )
+        positions = tune._route_scale_positions(
+            sorted_ids, num_valid_ids, self.token_num, self.topk, self.inter // 32
+        )
+        return (x, positions), (codes, sorted_scales)
+
+    def test_kernel_scale_rule_passes_and_one_exponent_less_fails(self):
+        """A scale one exponent too small makes the kernel clip to its largest
+        code, which the clipped reference rounding would match."""
+        for fmt in ("fp4", "fp8"):
+            for name, compare in self._compare_modes():
+                with self.subTest(fmt=fmt, mode=name):
+                    ref, res = self._kernel_rule_output(fmt, 0)
+                    self.assertEqual(compare(ref, res, printLog=False), 0.0)
+                    ref, res = self._kernel_rule_output(fmt, -1)
+                    self.assertEqual(compare(ref, res, printLog=False), 1.0)
+
     def test_split_k_within_one_step_passes(self):
         compare = self._split_k_compare()
         for name, quant in self._quantizers().items():
@@ -1272,10 +1329,7 @@ class TestFusedStage1Fp8AndSplitKCompare(unittest.TestCase):
         (_, positions), res = self._fused_output(
             self._quantizers()["fp8"], x=x, split_k=False
         )
-        for name, compare in (
-            ("default", self._tune().dequantized_output_compare),
-            ("split_k", self._split_k_compare()),
-        ):
+        for name, compare in self._compare_modes():
             with self.subTest(name):
                 drifted = x.clone()
                 drifted[0, 0, 1] = x[0, 0, :32].abs().max() * 2**-13
@@ -1292,41 +1346,53 @@ class TestFusedStage1Fp8AndSplitKCompare(unittest.TestCase):
         each of its values is far from the reference."""
         import torch
 
-        compare = self._split_k_compare()
-        for name, quant in self._quantizers().items():
-            with self.subTest(name):
-                ref, (codes, scales) = self._fused_output(quant)
-                codes = codes.clone()
-                codes.view(torch.uint8).view(-1, codes.shape[-1])[3] = 0
-                self.assertEqual(compare(ref, (codes, scales), printLog=False), 1.0)
+        for name, compare in self._compare_modes():
+            for fmt, quant in self._quantizers().items():
+                with self.subTest(mode=name, fmt=fmt):
+                    ref, (codes, scales) = self._fused_output(
+                        quant, split_k=name == "split_k"
+                    )
+                    codes = codes.clone()
+                    codes.view(torch.uint8).view(-1, codes.shape[-1])[3] = 0
+                    self.assertEqual(compare(ref, (codes, scales), printLog=False), 1.0)
 
-    def test_split_k_bias_fails(self):
-        compare = self._split_k_compare()
-        for name, quant in self._quantizers().items():
-            with self.subTest(name):
-                ref, res = self._fused_output(quant, scale_of=lambda x: x * 1.03)
-                self.assertEqual(compare(ref, res, printLog=False), 1.0)
+    def test_bias_fails(self):
+        for name, compare in self._compare_modes():
+            for fmt, quant in self._quantizers().items():
+                with self.subTest(mode=name, fmt=fmt):
+                    ref, res = self._fused_output(
+                        quant, scale_of=lambda x: x * 1.03, split_k=name == "split_k"
+                    )
+                    self.assertEqual(compare(ref, res, printLog=False), 1.0)
 
-    def test_split_k_misplaced_scales_fail(self):
+    def test_misplaced_scales_fail(self):
         import torch
 
-        compare = self._split_k_compare()
-        for name, quant in self._quantizers().items():
-            with self.subTest(name):
-                ref, (codes, scales) = self._fused_output(quant)
-                flat = scales.view(torch.uint8)
-                permuted = flat[torch.randperm(flat.numel())].view(scales.dtype)
-                self.assertEqual(compare(ref, (codes, permuted), printLog=False), 1.0)
+        for name, compare in self._compare_modes():
+            for fmt, quant in self._quantizers().items():
+                with self.subTest(mode=name, fmt=fmt):
+                    ref, (codes, scales) = self._fused_output(
+                        quant, split_k=name == "split_k"
+                    )
+                    flat = scales.view(torch.uint8)
+                    permuted = flat[torch.randperm(flat.numel())].view(scales.dtype)
+                    self.assertEqual(
+                        compare(ref, (codes, permuted), printLog=False), 1.0
+                    )
 
-    def test_split_k_scale_one_exponent_off_fails(self):
+    def test_scale_one_exponent_off_fails(self):
         import torch
 
-        compare = self._split_k_compare()
-        for name, quant in self._quantizers().items():
-            with self.subTest(name):
-                ref, (codes, scales) = self._fused_output(quant)
-                smaller = (scales.view(torch.uint8) - 1).view(scales.dtype)
-                self.assertEqual(compare(ref, (codes, smaller), printLog=False), 1.0)
+        for name, compare in self._compare_modes():
+            for fmt, quant in self._quantizers().items():
+                with self.subTest(mode=name, fmt=fmt):
+                    ref, (codes, scales) = self._fused_output(
+                        quant, split_k=name == "split_k"
+                    )
+                    smaller = (scales.view(torch.uint8) - 1).view(scales.dtype)
+                    self.assertEqual(
+                        compare(ref, (codes, smaller), printLog=False), 1.0
+                    )
 
 
 class TestStage2RelativeL2Compare(unittest.TestCase):

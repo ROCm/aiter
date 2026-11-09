@@ -158,9 +158,10 @@ STAGE2_REL_L2_CAP = 1e-2
 # worst row stays near its global error; one wrong row is diluted in the global
 # figure as the token count grows, but not in its own.
 STAGE2_ROW_REL_L2_CAP = 3e-2
-# Error, as a fraction of its 32-value block's largest magnitude, a dequantized
-# value may have whatever the code grid: near zero the grid is finer than the
-# difference between the kernel's and torch's fp32 accumulation.
+# Shift, as a fraction of its 32-value block's largest magnitude, the reference
+# may take before it is rounded: the kernel's fp32 accumulation differs from
+# torch's in the last bits, which can carry a value across a rounding boundary,
+# and near zero the code grid is finer than that difference.
 DEQUANT_BLOCK_FLOOR = 2.0**-12
 
 
@@ -660,7 +661,8 @@ def dequantized_output_compare(ref, res, msg="", printLog=True, split_k=False):
     the codes sit in sorted rows, as the v2 kernels write them. Every dequantized
     value must be the reference rounded on the kernel's grid after a shift of at
     most DEQUANT_BLOCK_FLOOR of its block's largest magnitude, so a value on a
-    rounding boundary may take either neighbour. split_k allows one step instead:
+    rounding boundary may take either neighbour, and must fit the scale's largest
+    code, so clipping to a too-small scale fails. split_k allows one step instead:
     split-K quantizes a bf16 sum of partials, which no rounding of the reference
     reproduces. The slope must be within SLOPE_BIAS_CAP of 1.
     Returns 0.0, or 1.0 on failure."""
@@ -681,21 +683,22 @@ def dequantized_output_compare(ref, res, msg="", printLog=True, split_k=False):
         scales.view(torch.uint8).reshape(-1)[positions.reshape(-1)]
     ).view(routes, groups, 1)
 
+    if fp4:
+        decode = fp4_utils.mxfp4_to_f32
+        encode = fp4_utils.f32_to_mxfp4
+        largest, mbits, min_exp, max_exp = 6.0, 1, 0, 2
+    else:
+        decode = torch.Tensor.float
+        largest, mbits, min_exp, max_exp = 448.0, 3, -6, 8
+
+        def encode(v):
+            return v.clamp(-largest, largest).to(torch.float8_e4m3fn)
+
     def nearest_code(v):
         on_grid = (v / scale).reshape(routes, -1)
-        if fp4:
-            code = fp4_utils.mxfp4_to_f32(fp4_utils.f32_to_mxfp4(on_grid))
-        else:
-            code = on_grid.clamp(-448, 448).to(torch.float8_e4m3fn).float()
-        return code.view(routes, groups, 32) * scale
+        return decode(encode(on_grid)).view(routes, groups, 32) * scale
 
-    if fp4:
-        values = fp4_utils.mxfp4_to_f32(codes.reshape(routes, -1))
-        mbits, min_exp, max_exp = 1, 0, 2
-    else:
-        values = codes.reshape(routes, -1).float()
-        mbits, min_exp, max_exp = 3, -6, 8
-    dequant = values.view(routes, groups, 32) * scale
+    dequant = decode(codes.reshape(routes, -1)).view(routes, groups, 32) * scale
     rounded = nearest_code(x)
     floor = x.abs().amax(-1, keepdim=True) * DEQUANT_BLOCK_FLOOR
     if split_k:
@@ -707,7 +710,9 @@ def dequantized_output_compare(ref, res, msg="", printLog=True, split_k=False):
         beyond = ~((dequant - x).abs() <= torch.maximum(step, floor))
     else:
         beyond = ~(
-            (dequant >= nearest_code(x - floor)) & (dequant <= nearest_code(x + floor))
+            ((x.abs() - floor) <= largest * scale)
+            & (dequant >= nearest_code(x - floor))
+            & (dequant <= nearest_code(x + floor))
         )
     mismatch = beyond.float().mean().item()
     # Fit on the reference rounded to the same grid: the raw reference would
@@ -4569,6 +4574,10 @@ class FmoeTuner(TunerCommon):
                         0.1,
                         0.1,
                         dequantized_output_compare,
+                        None,
+                        # Reset the shared isq so rows a kernel skips cannot keep
+                        # another candidate's codes.
+                        ["isq"],
                     )
                 )
             # ---- v2 stage2 tasks ----
