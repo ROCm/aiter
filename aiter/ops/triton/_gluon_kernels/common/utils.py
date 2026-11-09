@@ -25,8 +25,6 @@ def _tdm_gather_takes_col():
     return list(params)[2] != "dst"
 
 
-# Upstream Triton's tdm.async_gather is (desc, src_row_indices, dst, ...). Some older
-# gfx1250 builds take a source column before dst. tdm_gather calls the installed form.
 _TDM_GATHER_TAKES_COL = gl.constexpr(_tdm_gather_takes_col())
 
 
