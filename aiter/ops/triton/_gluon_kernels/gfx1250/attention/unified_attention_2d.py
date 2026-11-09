@@ -2083,13 +2083,16 @@ def _unified_attention_gluon_kernel_2d(
     else:
         KVLoader: gl.constexpr = TDMGatherKVLoader
 
+    # Bound the page ids by this sequence's pages. A zero-padded block table names
+    # block 0 past them, and NaN in block 0 would reach the output through 0 * NaN.
+    seq_pages = gl.minimum((seq_len + BLOCK_SIZE - 1) // BLOCK_SIZE, block_table_stride)
     kv_loader = KVLoader.initialize(
         cfg,
         key_cache_ptr,
         value_cache_ptr,
         block_tables_ptr_shifted,
         kv_head_idx,
-        block_table_stride,
+        gl.maximum(seq_pages, 1),
         REMOVE_INDIRECT_ACCESS,
     )
 
