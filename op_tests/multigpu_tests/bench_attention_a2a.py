@@ -351,6 +351,8 @@ def _run_recipe(
     if not flag.item():
         if rank == 0:
             print(f"MISMATCH {recipe.name}: timing skipped", flush=True)
+        # Every rank reaches this point together after the agreement above.
+        op.close()
         return []
     if rank == 0:
         print(f"PASS {shape_name} {recipe.name}: all ranks match baseline", flush=True)
@@ -380,6 +382,7 @@ def _run_recipe(
                     "wire_bytes": wire_bytes,
                 }
             )
+    op.close()
     return records
 
 

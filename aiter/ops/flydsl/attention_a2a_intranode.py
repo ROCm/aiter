@@ -8,6 +8,7 @@ from __future__ import annotations
 import math
 import operator
 import os
+import warnings
 from typing import NamedTuple
 
 import flydsl.expr as fx
@@ -190,14 +191,17 @@ class AttentionA2AIntraNodeOp:
     Consumers must finish on that stream before the next call reusing their
     parity (two calls later); cross-stream consumers require an explicit join.
 
-    inbox_memory selects the memory type of the buffers peers write into:
+    Inbox_memory selects the memory type of the buffers peers write into:
     "uncached" allocates them in the MoRI symmetric heap, "finegrained" in HIP
     IPC buffers exchanged over group. "auto" (default) is uncached on xGMI and
-    fine-grained on PCIe at TP4 and TP8: over PCIe, uncached peer writes
-    serialize per destination, while fine-grained writes combine in L2 and are
-    published by the release before each completion flag. The link comes from
-    the KFD topology, or from AITER_FLY_AR_LINK when that is unreadable.
-    Only "uncached" needs MoRI initialized.
+    fine-grained on PCIe at TP4 and TP8. Only "uncached" needs MoRI initialized.
+
+    Returned outputs, and views of them, live in the op's peer-written buffers.
+    They stay valid after the op is closed or deleted, as long as they are
+    referenced, but a later call reusing their parity overwrites them. close()
+    is collective: every rank calls it after its last submit. A fine-grained op
+    that is not closed leaks its IPC buffers, because only the ranks together
+    can tell when no peer maps them.
 
     group is a required torch.distributed ProcessGroup containing exactly the
     participants (size == world_size, group rank == rank; for "uncached", the
@@ -456,7 +460,6 @@ class AttentionA2AIntraNodeOp:
             device=self.device,
             group=group,
         )
-        # Owned from here, so a failed construction still frees it in __del__.
         self._heap = heap
         role_sequences = (seq_full, valid_kv_len, valid_kv_len)
         role_numels = tuple(
@@ -738,6 +741,8 @@ class AttentionA2AIntraNodeOp:
         - quantized BF16 (dequant): None for Q/K; the three BF16 outputs after V.
         - lossless BF16: None for Q/K; the three outputs after V.
         """
+        if self._heap is None:
+            raise RuntimeError("AttentionA2AIntraNodeOp is closed")
         if role not in (0, 1, 2) or role != self._next_role:
             raise ValueError("submit Q, K, V in order without interleaving trios")
         if input.dtype != self.dtype or tuple(input.shape) != self.shape:
@@ -827,19 +832,27 @@ class AttentionA2AIntraNodeOp:
         return packed_result
 
     def close(self):
-        """Free the IPC buffers of a fine-grained op; the op is unusable after.
-        The MoRI heap keeps its buffers until MoRI is finalized."""
+        """Collective: every rank calls it after its last submit. The op is
+        unusable after it.
+
+        A fine-grained op releases its IPC buffers: each is freed once every
+        peer has unmapped it and no returned output or view on it is left. The
+        MoRI heap keeps its buffers until MoRI is finalized.
+        """
         heap = getattr(self, "_heap", None)
         if heap is not None:
             self._heap = None
             heap.close()
 
     def __del__(self):
-        try:
-            self.close()
-        except Exception:  # noqa: BLE001
-            # Destructors must not raise, especially during interpreter shutdown.
-            return
+        heap = getattr(self, "_heap", None)
+        if heap is not None and heap.needs_close:
+            warnings.warn(
+                "AttentionA2AIntraNodeOp was not closed; its IPC buffers leak. "
+                "Call close() on every rank.",
+                ResourceWarning,
+                stacklevel=2,
+            )
 
     def _submit_role_launch(self, i, args):
         launch_args = (*(fx.Int64(arg) for arg in args[:-1]), args[-1])

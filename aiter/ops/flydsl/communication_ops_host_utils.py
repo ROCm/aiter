@@ -5,11 +5,16 @@
 
 from __future__ import annotations
 
+import logging
+import weakref
+
 import torch
 import torch.distributed as dist
 
 from .comm_collectives_host_shared import resolve_inbox_flags
 from .ipc_heap import IpcHeap
+
+logger = logging.getLogger("aiter")
 
 
 def build_p2p_table(tensor, rank, world_size, device) -> torch.Tensor:
@@ -41,6 +46,8 @@ def build_p2p_table(tensor, rank, world_size, device) -> torch.Tensor:
 #                                by the peers. Also a barrier.
 #   p2p_table(tensor)            i64 device table of the tensor on every rank.
 #   barrier()                    Host barrier over the participants.
+#   close()                      Release the heap's memory. Collective.
+#   needs_close                  True while memory awaits a collective close.
 
 
 class MoriSymmetricHeap:
@@ -51,6 +58,8 @@ class MoriSymmetricHeap:
     """
 
     memory = "uncached"
+    # MoRI owns the memory and releases it when it is finalized.
+    needs_close = False
 
     def __init__(self, *, rank, world_size, device):
         import mori.shmem as ms
@@ -81,17 +90,52 @@ class MoriSymmetricHeap:
         """The tensors stay in MoRI's heap until MoRI is finalized."""
 
 
-class _DeviceBuffer:
-    """A raw device allocation as a ``__cuda_array_interface__`` byte array."""
+def _free_allocation(ptr, device, exported):
+    # Freeing memory that a peer still maps is undefined behavior in HIP, so
+    # an allocation that may still be mapped is leaked rather than freed.
+    if exported[0]:
+        return
+    try:
+        with torch.cuda.device(device):
+            IpcHeap.free_device_mem(ptr)
+    except RuntimeError as exc:
+        logger.warning("IPC heap: freeing %#x failed: %s", ptr, exc)
 
-    def __init__(self, ptr, nbytes):
+
+class _IpcAllocation:
+    """One HIP IPC allocation, as a ``__cuda_array_interface__`` byte array.
+
+    The tensors made from the IPC allocation hold it through their storage. 
+    Hence, the memory stays valid while any of them, or any view of them, is alive. 
+    The IPC memory is freed only after the last tensor referencing it is out of scope, 
+    but only while no peer maps it. Collective ``close`` confirms that every peer
+    has unmapped the IPC memory, otherwise the IPC memory is leaked.
+    """
+
+    def __init__(self, ptr, nbytes, device):
+        self.ptr = int(ptr)
         self.__cuda_array_interface__ = {
-            "data": (int(ptr), False),
+            "data": (self.ptr, False),
             "shape": (int(nbytes),),
             "typestr": "|u1",
             "strides": None,
             "version": 3,
         }
+        # A list, shared with the finalizer, which must not reference self.
+        self._exported = [False]
+        finalizer = weakref.finalize(
+            self, _free_allocation, self.ptr, device, self._exported
+        )
+        # At exit the process releases the memory, and HIP may be torn down.
+        finalizer.atexit = False
+
+    @property
+    def exported(self):
+        return self._exported[0]
+
+    @exported.setter
+    def exported(self, value):
+        self._exported[0] = bool(value)
 
 
 class IpcSymmetricHeap:
@@ -100,6 +144,10 @@ class IpcSymmetricHeap:
     One allocation per tensor, each exported by its own IPC handle. ``publish``
     gathers every rank's handles and opens the peers'. Works on any
     ``torch.distributed`` backend: the handles travel as Python objects.
+
+    The tensors own their memory (see ``_IpcAllocation``). The heap only
+    releases it: ``close`` is collective, and without it the memory exported to
+    the peers is never freed.
     """
 
     def __init__(self, *, rank, world_size, device, group, memory):
@@ -114,15 +162,25 @@ class IpcSymmetricHeap:
         # Per allocation, the base address on every rank; ``None`` for the
         # allocations not yet published.
         self._peer_ptrs = []
+        self._index = {}
         self._opened = []
+        self._closed = False
+
+    @property
+    def needs_close(self):
+        return not self._closed and bool(self._local)
 
     def create_tensor(self, shape, dtype):
+        if self._closed:
+            raise RuntimeError("IpcSymmetricHeap is closed")
         nbytes = torch.Size(shape).numel() * dtype.itemsize
         with torch.cuda.device(self.device):
             ptr = IpcHeap.alloc(max(nbytes, 1), self._flags)
-        self._local.append(ptr)
+        allocation = _IpcAllocation(ptr, nbytes, self.device)
+        self._index[allocation.ptr] = len(self._local)
+        self._local.append(allocation)
         self._peer_ptrs.append(None)
-        tensor = torch.as_tensor(_DeviceBuffer(ptr, nbytes), device=self.device)
+        tensor = torch.as_tensor(allocation, device=self.device)
         return tensor.view(dtype).view(*shape)
 
     def publish(self):
@@ -130,12 +188,16 @@ class IpcSymmetricHeap:
             (i for i, p in enumerate(self._peer_ptrs) if p is None),
             len(self._peer_ptrs),
         )
+        pending = self._local[start:]
         error = None
         try:
-            handles = [IpcHeap.get_mem_handle_bytes(p) for p in self._local[start:]]
+            handles = [IpcHeap.get_mem_handle_bytes(a.ptr) for a in pending]
         except Exception as exc:  # noqa: BLE001
             error, handles = exc, None
-        # Every rank joins both collectives, and a failure on one rank raises on
+        # From the gather on, a peer may map them.
+        for allocation in pending:
+            allocation.exported = True
+        # Every rank joins every collective, and a failure on one rank raises on
         # all of them after the vote: raising at once would leave the peers
         # waiting in a collective this rank never joins.
         gathered = [None] * self.world_size
@@ -144,16 +206,17 @@ class IpcSymmetricHeap:
             try:
                 if any(h is None or len(h) != len(handles) for h in gathered):
                     raise RuntimeError("a peer rank failed to export its buffers")
-                for i, ptr in enumerate(self._local[start:]):
-                    ptrs = []
-                    for peer, peer_handles in enumerate(gathered):
-                        if peer == self.rank:
-                            ptrs.append(ptr)
-                        else:
-                            base = IpcHeap.open_mem_handle(peer_handles[i])
-                            self._opened.append(base)
-                            ptrs.append(base)
-                    self._peer_ptrs[start + i] = ptrs
+                with torch.cuda.device(self.device):
+                    for i, allocation in enumerate(pending):
+                        ptrs = []
+                        for peer, peer_handles in enumerate(gathered):
+                            if peer == self.rank:
+                                ptrs.append(allocation.ptr)
+                            else:
+                                base = IpcHeap.open_mem_handle(peer_handles[i])
+                                self._opened.append(base)
+                                ptrs.append(base)
+                        self._peer_ptrs[start + i] = ptrs
             except Exception as exc:  # noqa: BLE001
                 error = exc
         oks = [None] * self.world_size
@@ -165,33 +228,48 @@ class IpcSymmetricHeap:
         dist.barrier(group=self.group)
 
     def p2p_table(self, tensor):
-        ptr = tensor.data_ptr()
-        index = self._local.index(ptr)
+        index = self._index.get(tensor.data_ptr())
+        if index is None:
+            raise ValueError("p2p_table: tensor was not created by this heap")
         ptrs = self._peer_ptrs[index]
         if ptrs is None:
             raise RuntimeError("p2p_table before publish")
         return torch.tensor(ptrs, dtype=torch.int64, device=self.device)
 
     def close(self):
-        """Unmap the peers' buffers and free ours, once this device is idle.
+        """Collective: unmap the peers' buffers and release ours.
 
-        Local: when the device is idle no store of ours is in flight, and a
-        peer that still maps our buffers keeps them alive until it unmaps.
+        Every rank must call it, after its last use of the heap. IPC buffers
+        are freed once every peer has unmapped them and no tensor on them is left.
         """
-        if not self._local:
+        if self._closed:
             return
-        torch.cuda.synchronize(self.device)
-        for base in self._opened:
-            try:
-                IpcHeap.close_mem_handle(base)
-            except RuntimeError:
-                pass
-        for ptr in self._local:
-            try:
-                IpcHeap.free_device_mem(ptr)
-            except RuntimeError:
-                pass
-        self._opened, self._local, self._peer_ptrs = [], [], []
+        self._closed = True
+        error = None
+        try:
+            with torch.cuda.device(self.device):
+                # No store of ours into a peer's buffer is in flight after this.
+                torch.cuda.synchronize(self.device)
+                for base in self._opened:
+                    IpcHeap.close_mem_handle(base)
+        except Exception as exc:  # noqa: BLE001
+            error = exc
+        local, self._opened = self._local, []
+        self._local, self._peer_ptrs, self._index = [], [], {}
+        # The acknowledgement: past it, no peer maps our buffers, unless one of
+        # them failed to unmap, and then every rank leaks rather than frees.
+        oks = [None] * self.world_size
+        dist.all_gather_object(oks, error is None, group=self.group)
+        if all(oks):
+            for allocation in local:
+                allocation.exported = False
+        else:
+            logger.warning(
+                "IPC heap: a rank failed to unmap its peers' buffers (%s); "
+                "leaking %d buffers",
+                error,
+                len(local),
+            )
 
 
 def make_symmetric_heap(*, memory, rank, world_size, device, group):

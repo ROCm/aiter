@@ -10,6 +10,7 @@ against a torch/packer reference and then times the exchange with run_perftest.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import functools
 import gc
 import itertools
@@ -19,6 +20,7 @@ import socket
 from multiprocessing import freeze_support, get_context
 from types import SimpleNamespace
 from typing import NamedTuple
+from unittest import mock
 
 import pandas as pd
 import torch
@@ -790,6 +792,131 @@ def _check_negative_construction(rank, world_size, op_cls):
     )
     torch.cuda.synchronize()
     dist.barrier(group=_CTX.cpu_group)
+    op.close()
+
+
+def _agree(name, rank, world_size, failure):
+    """Raise on every rank if *failure* is set on any of them."""
+    flags = torch.zeros(world_size, dtype=torch.int32)
+    flags[rank] = failure is not None
+    dist.all_reduce(flags, group=_CTX.cpu_group)
+    failed = flags.nonzero().flatten().tolist()
+    if failed:
+        raise AssertionError(f"{name} failed on rank(s) {failed}: {failure}")
+    _STATS.checks += 1
+
+
+@contextlib.contextmanager
+def _counting_ipc_heap():
+    """Record the IPC heap's allocations and frees."""
+    from aiter.ops.flydsl.ipc_heap import IpcHeap
+
+    # freed: the addresses freed and not allocated again since. A freed
+    # address may be reused by a later allocation.
+    counts = {"alloc": [], "free": [], "freed": set()}
+    alloc, free = IpcHeap.alloc, IpcHeap.free_device_mem
+
+    def counting_alloc(*args, **kwargs):
+        ptr = alloc(*args, **kwargs)
+        counts["alloc"].append(ptr)
+        counts["freed"].discard(ptr)
+        return ptr
+
+    def counting_free(ptr):
+        free(ptr)
+        counts["free"].append(ptr)
+        counts["freed"].add(ptr)
+
+    with (
+        mock.patch.object(IpcHeap, "alloc", counting_alloc),
+        mock.patch.object(IpcHeap, "free_device_mem", counting_free),
+    ):
+        yield counts
+
+
+def _trio_outputs_only(rank, world_size, inputs, op_cls, **kwargs):
+    """One trio's outputs, as from a helper that keeps no op: the op is closed
+    and dropped here. Also returns a copy of each output taken before."""
+    op = op_cls(rank=rank, world_size=world_size, shape=inputs[0].shape, **kwargs)
+    outputs = _submit_roles(op, inputs)
+    torch.cuda.synchronize()
+    flat = list(itertools.chain(*outputs)) if op.return_packed else list(outputs)
+    copies = [t.clone() for t in flat]
+    op.close()
+    try:
+        op.submit_role(0, inputs[0])
+    except RuntimeError as exc:
+        assert "closed" in str(exc), str(exc)
+    else:
+        raise AssertionError("a closed op accepted a submit")
+    return flat, copies
+
+
+def _check_outputs_outlive_op(rank, world_size, device, op_cls):
+    """Outputs, and views of them, stay valid after the op is closed and dropped
+    on every rank; a fine-grained op frees each buffer after the last of them."""
+    from aiter.ops.flydsl.ipc_heap import IpcHeap
+
+    heads, sequence = 8, 64
+    inputs = tuple(
+        _input(rank + 13 * role, heads, sequence, device) for role in range(3)
+    )
+    expected = tuple(_all_to_all(value, rank, world_size) for value in inputs)
+    finegrained = _CTX.inbox_memory == "finegrained"
+    alloc, free = IpcHeap.alloc, IpcHeap.free_device_mem
+    failure = None
+    try:
+        with _counting_ipc_heap() as counts:
+            bf16, bf16_copies = _trio_outputs_only(rank, world_size, inputs, op_cls)
+            packed, packed_copies = _trio_outputs_only(
+                rank,
+                world_size,
+                inputs,
+                op_cls,
+                quant="e4m3",
+                return_packed=True,
+                softmax_scale=0.125,
+                hadamard=True,
+            )
+            # Keep views only: their storage is all that holds the buffers.
+            # A per-tensor scale has one element, so it is kept whole.
+            kept = [t.view(-1)[int(t.numel() > 1) :] for t in bf16 + packed]
+            copies = [
+                t.view(-1)[int(t.numel() > 1) :] for t in bf16_copies + packed_copies
+            ]
+            backing = {t.untyped_storage().data_ptr() for t in kept}
+            sizes = [t.untyped_storage().nbytes() for t in kept]
+            del bf16, packed
+            gc.collect()
+            # The op's other buffers go with it; the ones under the views stay.
+            if finegrained and backing & counts["freed"]:
+                raise AssertionError("buffers freed under live views")
+            allocated = list(counts["alloc"])
+            # Fresh memory filled with 0xFF: if a buffer had been freed, it may
+            # land here and overwrite the views. Not counted.
+            churn = [
+                alloc(size, IpcHeap._HIP_DEVICE_MALLOC_FINEGRAINED, 0xFF)
+                for size in sizes
+            ]
+            for ptr in churn:
+                free(ptr)
+            for i, (got, want) in enumerate(zip(kept, copies, strict=True)):
+                _exact(got, want, f"output {i} after close")
+            for role, (got, want) in enumerate(zip(kept, expected)):
+                _exact(got, want.reshape(-1)[1:], f"bf16 {'QKV'[role]} after close")
+            # The loop variables hold views too.
+            del kept, got, want
+            gc.collect()
+            if finegrained and (
+                not allocated or sorted(counts["free"]) != sorted(allocated)
+            ):
+                raise AssertionError(
+                    f"{len(allocated)} buffers allocated, "
+                    f"{len(counts['free'])} freed"
+                )
+    except Exception as exc:  # noqa: BLE001
+        failure = f"{type(exc).__name__}: {exc}"
+    _agree("outputs outlive the op", rank, world_size, failure)
 
 
 def _check_e4m3_scale_rounding(
@@ -1341,6 +1468,9 @@ def test_a2a(world_size, recipe, sequence, heads, blocks):
     # arithmetic, so there is no TFLOPS column.
     nbytes = 3 * sequence * heads * 128 * 2
     out, us = run_perftest(exchange, num_iters=20, use_cuda_event=True)
+    # Every rank passed the check, so every rank closes, as close() requires.
+    for op in keep if isinstance(keep, tuple) else (keep,):
+        op.close()
     del keep, exchange, out
     gc.collect()
     return {
@@ -1395,6 +1525,7 @@ def _run_rank(
         _check_valid_kv_rejections(rank, world_size, _CTX.op_cls)
         _check_group_disagreement(rank, world_size, _CTX.op_cls)
         _check_negative_construction(rank, world_size, _CTX.op_cls)
+        _check_outputs_outlive_op(rank, world_size, device, _CTX.op_cls)
         for recipe, sequence, heads in itertools.product(
             recipes, sequences, heads_list
         ):
