@@ -96,16 +96,14 @@ from aiter.test_common import (
 #
 # The score is ``score_scale * sum_h ReLU(dot(q[h], k_bar[b]))`` for complete
 # blocks. The oracle may materialize ``[M, n_blocks]`` scores. The FlyDSL
-# indexer does the same on every path except short-row emit: a private fp32
-# ``[M, n_columns]`` buffer,
-# then top-512 block ids, and the scores are dropped. ``n_columns`` is
-# the page-table capacity (``page_table.shape[1] * page_size``), so a
-# padded ``max_model_len`` table pays full width. At compress ratio 4
-# that buffer is 1 GiB for 128k tokens at M=8192 and 8 GiB for 1M tokens
-# at the same M. The allocation is capacity-sized. Score traffic is
-# live-bounded: both scorers skip tiles past the visible prefix. Fusing
-# that buffer waits on 128k and 1M measurements. A caller may pass the
-# buffer in; it is not a returned intermediate.
+# indexer does the same on every path except short-row emit, then drops
+# the scores after top-512 block ids. ``n_columns`` is the page-table
+# capacity (``page_table.shape[1] * page_size``), so each row is still
+# full width. The private workspace is at most 128 MiB and is reused
+# across row chunks. The scorer and selector stay the ones chosen for
+# the whole batch. A caller may pass the full ``[M, n_columns]`` buffer
+# in; it is launched once and is not a returned intermediate. Score
+# traffic is live-bounded: both scorers skip tiles past the visible prefix.
 #
 # Tie-break, same as ``top_k_per_row_decode``: among equal finite scores, keep
 # the **smaller block index**. Invalid / incomplete blocks are ``-inf`` and
@@ -1705,6 +1703,126 @@ def test_indexer_row_tile_spanning_requests_gathers_each_requests_pages():
         [257, 1, 253, 1],
         "indexer four-tile prefill block spanning requests diverged",
     )
+
+
+def test_indexer_score_chunks_keep_the_prefill_selector(monkeypatch):
+    """A batch past 128 MiB is scored in row chunks and keeps one selector.
+
+    The width is the streaming cutoff, and the batch is one row past a
+    128 MiB chunk, so the tail is a single row. That tail would take the
+    one-row scorer and the streaming radix if the chunk's own row count
+    chose them. The whole batch is a prefill, so both chunks stay on the
+    16-row scorer and the stable radix. Ids match the fp32 oracle.
+    """
+    if qsa_paged._SCORE_WORKSPACE_BYTES != DEFAULT_LOGITS_WORKSPACE_BYTES:
+        raise AssertionError(
+            "indexer score workspace and logits workspace differ: "
+            f"{qsa_paged._SCORE_WORKSPACE_BYTES} vs "
+            f"{DEFAULT_LOGITS_WORKSPACE_BYTES}"
+        )
+    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
+        pytest.skip("unsupported arch")
+    from aiter.ops.flydsl.kernels.qsa.indexer_select import (
+        _STREAM_SELECT_MIN_COLUMNS,
+    )
+    from aiter.ops.topk_select import topk_select as real_stream
+
+    idx = FLASH_NEXT_INDEXER
+    device = torch.device("cuda")
+    page_size = 16
+    n_columns = _STREAM_SELECT_MIN_COLUMNS
+    if n_columns % page_size:
+        raise AssertionError(f"{n_columns} columns do not fill a page of {page_size}")
+    rows_per_chunk = qsa_paged._score_workspace_rows(n_columns)
+    if rows_per_chunk <= qsa_paged._DECODE_MAX_ROWS:
+        raise AssertionError(
+            f"a chunk of {rows_per_chunk} rows is already a decode batch"
+        )
+    m = rows_per_chunk + 1
+    # The reused score chunk, the paged cache, and one oracle tile.
+    need = qsa_paged._SCORE_WORKSPACE_BYTES + (256 << 20)
+    free, _total = torch.cuda.mem_get_info(device)
+    if free < need:
+        pytest.skip(f"not enough free memory: need {need} bytes, {free} free")
+    seq_len = n_columns * idx.compress_ratio
+    torch.manual_seed(0)
+    q = torch.randn(m, idx.n_heads, idx.head_dim, dtype=dtypes.bf16, device=device)
+    k_bar = torch.randn(n_columns, idx.head_dim, dtype=dtypes.bf16, device=device)
+    gen = torch.Generator(device=device)
+    gen.manual_seed(1)
+    index_cache, table = pack_paged_cache(k_bar.unsqueeze(1), page_size, generator=gen)
+    if int(table.shape[1]) * page_size != n_columns:
+        raise AssertionError(
+            f"table width {int(table.shape[1]) * page_size} != {n_columns}"
+        )
+    qpos = torch.full((m,), seq_len - 1, dtype=dtypes.i32, device=device)
+    slen = torch.tensor([seq_len], dtype=dtypes.i32, device=device)
+    t2r = torch.zeros(m, dtype=dtypes.i32, device=device)
+    refs = []
+    for start in range(0, m, 64):
+        end = min(m, start + 64)
+        refs.append(
+            qsa_topk_blocks(
+                qsa_indexer_scores(
+                    q[start:end],
+                    k_bar,
+                    qpos[start:end],
+                    slen,
+                    t2r[start:end],
+                    idx.compress_ratio,
+                    score_scale=FLASH_NEXT_SCORE_SCALE,
+                ),
+                idx.block_budget,
+            )
+        )
+    ref_ids = torch.cat(refs)
+
+    plans = []
+    stable_rows = []
+    stream_rows = []
+    real_prefill = qsa_paged._prefill_scores_plan
+    real_decode = qsa_paged._scores_plan
+    real_stable = qsa_paged.flydsl_top_k_per_row_decode
+
+    def prefill_plan(*args, **kwargs):
+        plans.append("prefill")
+        return real_prefill(*args, **kwargs)
+
+    def decode_plan(*args, **kwargs):
+        plans.append("decode")
+        return real_decode(*args, **kwargs)
+
+    def stable(*args, **kwargs):
+        stable_rows.append(int(args[4]))
+        return real_stable(*args, **kwargs)
+
+    def stream(logits, k, **kwargs):
+        stream_rows.append(int(logits.shape[0]))
+        return real_stream(logits, k, **kwargs)
+
+    monkeypatch.setattr(qsa_paged, "_prefill_scores_plan", prefill_plan)
+    monkeypatch.setattr(qsa_paged, "_scores_plan", decode_plan)
+    monkeypatch.setattr(qsa_paged, "flydsl_top_k_per_row_decode", stable)
+    monkeypatch.setattr("aiter.ops.topk_select.topk_select", stream)
+    got = qsa_indexer_block_ids(
+        q,
+        index_cache,
+        table,
+        t2r,
+        qpos,
+        slen,
+        heads=(idx.n_heads,),
+    )
+    if plans != ["prefill", "prefill"]:
+        raise AssertionError(f"score plans {plans}, expected two prefill chunks")
+    if stable_rows != [rows_per_chunk, m - rows_per_chunk]:
+        raise AssertionError(
+            f"stable radix rows {stable_rows}, expected "
+            f"{[rows_per_chunk, m - rows_per_chunk]}"
+        )
+    if stream_rows:
+        raise AssertionError(f"streaming radix ran for rows {stream_rows}")
+    _assert_indexer_block_ids(ref_ids, got, "chunked indexer score workspace")
 
 
 def test_indexer_padded_decode_graph_capture():
@@ -4814,9 +4932,7 @@ def test_qsa_ops_dispatch_flash_next_matches_oracle(monkeypatch):
             "supported indexer shape did not enter qsa_indexer_block_ids"
         )
     if _set_mismatch_ratio(case["ref"].indices, selected) != 0.0:
-        raise AssertionError(
-            "qsa_select_paged_tokens diverged from the oracle indices"
-        )
+        raise AssertionError("qsa_select_paged_tokens diverged from the oracle indices")
 
     out = qsa_sparse_paged_gqa(
         case["q_gqa"],

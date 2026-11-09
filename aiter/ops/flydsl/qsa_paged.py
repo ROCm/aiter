@@ -12,8 +12,10 @@ radix. A packed table at or under 20000 columns uses that radix too.
 Batches averaging at least two query rows per request (prefill, mixed
 prefill and decode, MTP decode) score 16 rows by 64 columns per workgroup,
 and a prefill workgroup walks four column tiles; MTP with 4 heads scores 4
-rows x 4 heads per MFMA instead. The indexer head count is 4 or 8, each a
-separate compile.
+rows x 4 heads per MFMA instead. The long-row score workspace is at most
+128 MiB. Rows past that are scored in chunks, and the scorer and selector
+stay the ones chosen for the whole batch. The indexer head count is 4 or
+8, each a separate compile.
 
 ``flydsl_qsa_paged_gqa`` writes sparse GQA ``o [M, Hq, D]`` from paged K/V at the
 selected token ids. Decode runs a BLOCK_N=16 two-wave tile with split-K and
@@ -432,6 +434,16 @@ def _pack_missing_pages(out, page_table, token_to_req, context_lens, k_cache):
     )
 
 
+# Same cap as ``aiter.ops.qsa.DEFAULT_LOGITS_WORKSPACE_BYTES``. That module
+# imports this one, so the number is repeated here.
+_SCORE_WORKSPACE_BYTES = 128 * 1024 * 1024
+
+
+def _score_workspace_rows(n_columns: int) -> int:
+    """How many fp32 score rows of ``n_columns`` fit in 128 MiB."""
+    return max(1, _SCORE_WORKSPACE_BYTES // max(int(n_columns) * 4, 1))
+
+
 def qsa_indexer_score_and_select(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -465,13 +477,104 @@ def qsa_indexer_score_and_select(
 
     ``scores`` is an optional fp32 ``[M, n_columns]`` workspace with a
     unit column stride. When ``M`` is more than one, the row stride is at
-    least ``n_columns``, so the rows do not alias. ``None`` allocates it.
-    The buffer is overwritten and is not returned.
+    least ``n_columns``, so the rows do not alias. ``None`` allocates at
+    most 128 MiB and reuses that buffer across row chunks. The scorer and
+    the selector stay the ones chosen for the whole batch, including a
+    chunk shorter than 16 rows or 64 rows. A caller buffer is the full
+    matrix and is launched once. The buffer is overwritten and is not
+    returned.
     """
     if n_heads not in _SCORE_HEADS:
         raise ValueError(f"score heads must be {_SCORE_HEADS}, got {n_heads}")
     if q.shape[1] != n_heads:
         raise ValueError(f"q must have {n_heads} heads, got {tuple(q.shape)}")
+    m = int(q.shape[0])
+    n_columns = int(n_columns)
+    if scores is not None:
+        _check_indexer_score_workspace(scores, m, n_columns)
+        if scores.device != q.device:
+            raise ValueError("scores must be on the same device as q")
+        return _score_and_select_rows(
+            q,
+            k_cache,
+            page_table,
+            token_to_req,
+            query_positions,
+            context_lens,
+            out,
+            n_columns,
+            score_scale,
+            n_heads,
+            live_columns=live_columns,
+            row_bounded=row_bounded,
+            scores=scores,
+            batch_rows=m,
+        )
+    rows_per_chunk = _score_workspace_rows(n_columns)
+    if m <= rows_per_chunk:
+        return _score_and_select_rows(
+            q,
+            k_cache,
+            page_table,
+            token_to_req,
+            query_positions,
+            context_lens,
+            out,
+            n_columns,
+            score_scale,
+            n_heads,
+            live_columns=live_columns,
+            row_bounded=row_bounded,
+            scores=None,
+            batch_rows=m,
+        )
+    chunk_scores = torch.empty(
+        rows_per_chunk, n_columns, dtype=torch.float32, device=q.device
+    )
+    for row_start in range(0, m, rows_per_chunk):
+        row_end = min(m, row_start + rows_per_chunk)
+        _score_and_select_rows(
+            q[row_start:row_end],
+            k_cache,
+            page_table,
+            token_to_req[row_start:row_end],
+            query_positions[row_start:row_end],
+            context_lens,
+            out[row_start:row_end],
+            n_columns,
+            score_scale,
+            n_heads,
+            live_columns=live_columns,
+            row_bounded=row_bounded,
+            scores=chunk_scores[: row_end - row_start],
+            batch_rows=m,
+        )
+    return out
+
+
+def _score_and_select_rows(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    token_to_req: torch.Tensor,
+    query_positions: torch.Tensor,
+    context_lens: torch.Tensor,
+    out: torch.Tensor,
+    n_columns: int,
+    score_scale: float,
+    n_heads: int,
+    live_columns: int | None,
+    row_bounded: bool,
+    scores: torch.Tensor | None,
+    batch_rows: int,
+) -> torch.Tensor:
+    """Score ``q`` and select into ``out``. Policy follows ``batch_rows``.
+
+    ``q`` may be a row chunk of a larger batch. ``batch_rows`` is that
+    batch, so a short chunk keeps the full batch's scorer and selector.
+    ``page_table`` and ``context_lens`` stay the whole launch; the row
+    arguments are the chunk.
+    """
     m = int(q.shape[0])
     n_columns = int(n_columns)
     if scores is not None:
@@ -490,15 +593,28 @@ def qsa_indexer_score_and_select(
     # packed page, and the descriptor covers that span.
     wide_cache = span_bytes(k_cache) > (1 << 32)
     k_strides = tuple(int(s) for s in k_cache.stride()[:3]) if wide_cache else None
-    if _indexer_uses_prefill_scorer(int(context_lens.shape[0]), m, n_heads, arch):
+    n_requests = int(context_lens.shape[0])
+    # Scorer family follows the whole batch. A one-row tail must not drop
+    # a prefill onto the one-row scorer.
+    if _indexer_uses_prefill_scorer(n_requests, batch_rows, n_heads, arch):
         layout_columns = n_columns if live_columns is None else int(live_columns)
         fold_heads, tiles_per_wg = _indexer_rows_scorer_layout(
-            int(context_lens.shape[0]),
-            m,
+            n_requests,
+            batch_rows,
             n_heads,
             layout_columns,
             row_bounded=row_bounded,
         )
+        # tiles_per_wg only fills the GPU, so a chunk may retune it.
+        # fold_heads and row_bounded stay on the batch decision.
+        if m != batch_rows and not fold_heads and not row_bounded:
+            tiles_per_wg = _indexer_rows_scorer_layout(
+                n_requests,
+                m,
+                n_heads,
+                layout_columns,
+                row_bounded=False,
+            )[1]
         col_tiles = ceildiv(n_columns, _ROWS_BLOCK_N)
         tile_rows = 16 // n_heads if fold_heads else 16
         _run_compiled(
@@ -581,14 +697,16 @@ def qsa_indexer_score_and_select(
         scores if select_columns == n_columns else scores.narrow(1, 0, select_columns)
     )
     narrowed = select_columns < n_columns
+    # A chunk of 64 or fewer rows must not switch a prefill from the
+    # stable radix to streaming. That switch reads the batch row count.
     one_workgroup = (
         narrowed
         and select_columns <= _ONE_WORKGROUP_MAX_ROW_WIDTH
-        and m <= _DECODE_MAX_ROWS
+        and batch_rows <= _DECODE_MAX_ROWS
     )
     if (
         one_workgroup
-        or m > _DECODE_MAX_ROWS
+        or batch_rows > _DECODE_MAX_ROWS
         or (not narrowed and select_columns < _STREAM_SELECT_MIN_COLUMNS)
     ):
         finite_only = select_columns <= _ONE_WORKGROUP_MAX_ROW_WIDTH
@@ -848,12 +966,13 @@ def qsa_indexer_block_ids(
     dropped and the kept ids stay packed in front of ``-1``, so a short
     context does not fill the budget with that page: emit and the
     one-workgroup radix skip it, and a separate pack follows the split
-    and streaming selectors. ``scores`` is an optional fp32
+    and streaming selectors.     ``scores`` is an optional fp32
     ``[M, n_columns]`` workspace for that writer, with a unit column
     stride. ``n_columns`` is ``page_table.shape[1] * page_size``. When
     ``M`` is more than one, the row stride is at least ``n_columns``.
-    ``None`` allocates it. Emit does not read it. The buffer is overwritten
-    and is not returned. Batches averaging two or more rows per request score 16
+    ``None`` allocates at most 128 MiB and reuses it across row chunks.
+    A caller buffer is the full matrix and is launched once. Emit does
+    not read it. The buffer is overwritten and is not returned. Batches averaging two or more rows per request score 16
     query rows per workgroup, except gfx942 H=8; one-row decode uses one row
     per workgroup. Padded decode (more than 20000 columns and at most 64
     rows) selects with the one-workgroup radix on the full width and stops
@@ -1209,8 +1328,9 @@ def qsa_layer(
             scorer. ``n_columns`` is ``index_page_table.shape[1] *
             page_size``. The column stride is 1. When ``M`` is more than
             one, the row stride is at least ``n_columns``. ``None``
-            allocates it. The layer overwrites it and does not return it.
-            Emit ignores a buffer of that shape.
+            allocates at most 128 MiB and reuses it across row chunks. A
+            caller buffer is the full matrix. The layer overwrites it and
+            does not return it. Emit ignores a buffer of that shape.
         out: optional contiguous bf16 ``[M, Hq, D]`` matching ``q_gqa``.
             ``None`` allocates it.
         token_topk: selected tokens. The default is 2048, which is the
@@ -1268,9 +1388,7 @@ def qsa_layer(
     ):
         # No compressed group is selected. The expand kernel does not read
         # group ids when this axis is zero, but still emits the causal tail.
-        block_ids = torch.empty(
-            (m, 0), dtype=torch.int32, device=q_indexer.device
-        )
+        block_ids = torch.empty((m, 0), dtype=torch.int32, device=q_indexer.device)
     else:
         block_ids = _write_indexer_block_ids(
             q_indexer,
