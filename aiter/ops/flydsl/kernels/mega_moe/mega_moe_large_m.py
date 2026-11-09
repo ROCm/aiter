@@ -3011,6 +3011,20 @@ class LargeMRuntime:
             compact=cls.GM_COMPACT,
         )
 
+    @classmethod
+    def ends_all_ranks(cls, *, world_size, model_dim, inter_dim, experts, topk, max_tok_per_rank):
+        """Whether every launch ends only once every rank finished its GEMM2 (the combine's generation barrier).
+
+        With comb_tok_wait a rank's combine waits only for its own tokens' rows, so it can leave, and start its next
+        call's dispatch into its peers, while a peer still reads its payload: such a runtime cannot share payload
+        storage with another route.
+        """
+        # The large-input config is the same for every token count.
+        return not select_fused_config(
+            1, max_tok_per_rank, world_size=world_size, experts_per_rank=experts // world_size,
+            model_dim=model_dim, inter_dim=inter_dim,
+        ).fused_stage2.comb_tok_wait
+
     # fmt: off
     def __init__(self, *, rank: int, world_size: int, model_dim: int, inter_dim: int, experts: int, topk: int,
         quant: str, w1: torch.Tensor, w1_scale: torch.Tensor, w2: torch.Tensor, w2_scale: torch.Tensor,
