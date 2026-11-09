@@ -1308,14 +1308,14 @@ class AttentionProgram:
             ]
         )
 
-        seq_mask = seq_offset < (self.context_len_q_pos_qk + 1)
+        # distance of each key behind its query; negative keys are in the future
+        key_dist = self.context_len_q_pos_qk - seq_offset
         if self.cfg.SLIDING_WINDOW > 0:
-            seq_mask = seq_mask & (
-                (self.context_len_q_pos_qk - seq_offset) < self.cfg.SLIDING_WINDOW
-            )
-        full_mask = seq_mask
-        S = gl.where(full_mask, S, float("-inf"))
-        return S
+            # one unsigned compare covers both 0 <= key_dist and key_dist < window
+            seq_mask = key_dist.to(gl.uint32, bitcast=True) < self.cfg.SLIDING_WINDOW
+        else:
+            seq_mask = key_dist >= 0
+        return gl.where(seq_mask, S, float("-inf"))
 
     @gluon.jit
     def softmax_part0(self, S, M):
