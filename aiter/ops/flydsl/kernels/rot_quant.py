@@ -3,9 +3,9 @@
 
 """Fused online Hadamard rotation + MXFP4 quantization (FlyDSL, gfx950).
 
-``flydsl_rot_quant(x, RS)`` rotates each RS-wide block of a bf16 activation by a
-normalized Sylvester Hadamard matrix, quantizes the result to MXFP4 and writes
-the e8m0 block scales, optionally already in the CK layout that
+``flydsl_rot_quant(x, rotation_size=RS)`` rotates each RS-wide block of a bf16
+activation by a normalized Sylvester Hadamard matrix, quantizes the result to
+MXFP4 and writes the e8m0 block scales, optionally already in the CK layout that
 ``aiter.gemm_a4w4`` consumes. Rotated MXFP4 checkpoints fold the rotation into
 the weights, so this runs on the activation of every rotated projection.
 Unfused, it is a Hadamard matmul followed by a separate quant pass.
@@ -212,7 +212,7 @@ def _build_rot_quant(K: int, RS: int, shuffle_scales: bool):
             grid=(grid_x, 1, 1), block=(BLOCK, 1, 1), stream=stream
         )
 
-    launch.compile_hints["llvm_options"] = dict(NO_SLP)
+    launch.compile_hints.setdefault("llvm_options", {}).update(NO_SLP)
     return launch
 
 
@@ -262,14 +262,6 @@ def _build_rot_quant_moe_sort(K: int, RS: int, block: int):
                     )
                     off = _ck_scale_offset(row, col, padded_scale_cols)
                     xs[off] = e8m0.to(fx.Int8)
-                    if const_expr(  # noqa: SIM102 - preserve DSL staging
-                        padded_scale_cols > scale_cols
-                    ):
-                        # Pad columns get 0, as mxfp4_moe_sort_fwd writes them.
-                        if col == scale_cols - 1:
-                            for pad in range_constexpr(scale_cols, padded_scale_cols):
-                                off = _ck_scale_offset(row, pad, padded_scale_cols)
-                                xs[off] = fx.Int8(0)
 
     @flyc.jit
     def launch(
@@ -287,7 +279,7 @@ def _build_rot_quant_moe_sort(K: int, RS: int, block: int):
             x, xq, xs, sorted_ids, num_valid_ids, num_tokens, topk
         ).launch(grid=(grid_x, 1, 1), block=(block, 1, 1), stream=stream)
 
-    launch.compile_hints["llvm_options"] = dict(NO_SLP)
+    launch.compile_hints.setdefault("llvm_options", {}).update(NO_SLP)
     return launch
 
 
@@ -387,8 +379,8 @@ def flydsl_rot_quant_moe_sort(
         ``(xq, xs)``: ``xq`` is fp4x2 ``[M, K // 2]`` in token order; the rows
         of tokens with no valid route may be left unwritten. ``xs`` is e8m0
         ``[ceil32(len(sorted_ids)), ceil8(K // 32)]`` in the layout of
-        ``mxfp4_moe_sort_fwd``; only the rows of valid routes are defined, and
-        their padding columns hold 0 as there.
+        ``mxfp4_moe_sort_fwd``; as there, only the first ``K // 32`` columns
+        of the rows of valid routes are defined.
     """
     M, K = _check_input(x, rotation_size)
     if M != token_num:
@@ -401,8 +393,8 @@ def flydsl_rot_quant_moe_sort(
 
         xq, xs = flydsl_rot_quant(x, rotation_size=rotation_size)
         # mxfp4_moe_sort_fwd drops the last token's final scales when K // 32
-        # is not a multiple of 4 (#7646). Zero columns up to a multiple of 4
-        # avoid that and change nothing else: it writes padding columns as 0.
+        # is not a multiple of 4 (#7646); the extra zero columns avoid that and
+        # land in the output's padding columns. Drop this once #7653 is in.
         pad = -(K // MX_GROUP) % 4
         if pad:
             xs = torch.nn.functional.pad(xs.view(torch.uint8), (0, pad))

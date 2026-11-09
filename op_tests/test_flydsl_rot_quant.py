@@ -46,7 +46,7 @@ def run_torch(x, rs, shuffle):
 
 def run_torch_moe_sort(x, rs, sorted_ids, num_valid_ids, topk):
     """run_torch, with each valid route's scales copied to its sorted row and
-    swizzled as mxfp4_moe_sort_fwd lays them out, padding columns 0. A route is
+    swizzled as mxfp4_moe_sort_fwd lays them out. A route is
     valid when its token is below M and its slot below topk: a sort with
     num_local_tokens pads with topk << 24 | count. Also returns the valid rows
     and their tokens."""
@@ -189,8 +189,8 @@ def test_rot_quant_gemm_a4w4(m, n, k, rs):
 @benchmark()
 def test_rot_quant_moe_sort(m, k, rs, experts, topk, block_m, counted):
     """The MoE stage-1 input: scales sorted by moe_sorting's sorted_ids. Only
-    the valid routes' rows are defined, so only they are compared, padding
-    columns included. `counted` sorts only the first half of the tokens through
+    the valid routes' rows and the first K // 32 columns are defined, so only
+    they are compared. `counted` sorts only the first half of the tokens through
     num_local_tokens, whose padding slots name a real token."""
     x = make_input(m, k)
     ids = torch.rand((m, experts)).topk(topk, dim=1).indices.to(dtypes.i32)
@@ -236,7 +236,7 @@ def test_rot_quant_moe_sort(m, k, rs, experts, topk, block_m, counted):
         rtol=0,
         atol=0,
         tol_err_ratio=0,
-        mask=scale_mask(ref_s.shape, live_rows, ref_s.shape[1], True),
+        mask=scale_mask(ref_s.shape, live_rows, k // 32, True),
         msg="flydsl: sorted e8m0",
     )
     nbytes = m * k * x.element_size() + m * k // 2 + m * topk * k // 32
@@ -394,6 +394,9 @@ def main():
             args.rs, args.k, args.experts, args.topk, args.block_m, args.counted, args.m
         )
         if k % rs == 0 and topk <= experts
+        # Block size and counted sorts change only the grid bound and the route
+        # filter, which small M covers.
+        and (m <= 1024 or (block_m, counted) == (32, False))
     ]
     aiter.logger.info(
         "rot_quant_moe_sort summary (markdown):\n%s",
