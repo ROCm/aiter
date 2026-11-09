@@ -241,6 +241,8 @@ _checked_runs: dict[tuple[int, str], Any] = {}
 _PROBE = object()
 _callback_errors = 0
 _route_log: dict[str, tuple[int, tuple[str, str | None, str | None]]] = {}
+# What an op was doing before anything was recorded for it. See _log_route_change.
+_UNROUTED = ("native", None, None)
 _skipped_providers: tuple[_SkippedProvider, ...] = ()
 _provider_records: tuple[_ProviderRecord, ...] | None = None
 # Reentrant, and discovery runs outside it: both guard against a provider
@@ -261,19 +263,22 @@ _last_decision: ContextVar[Decision | None] = ContextVar(
 def last_decision() -> Decision | None:
     """The last routing decision in this execution context, or ``None``.
 
-    ``None`` under ``AITER_PLUGINS=0``: with the feature off there are no
-    decisions to report, and the one recorded before it was turned off
-    describes a world that no longer holds. Answering with it would be worse
-    than answering with nothing, because nothing about it says it is stale.
+    ``None`` whenever no provider can serve -- under ``AITER_PLUGINS=0`` and
+    while no provider is enabled. Dispatch records nothing in either state, and
+    whatever was recorded before it was entered describes a world that no longer
+    holds. Answering with it would be worse than answering with nothing, because
+    nothing about it says it is stale: a framework that calls
+    ``configure(enable=())`` to turn routing off would still read back the
+    provider route from before the call.
 
-    The check is here rather than on the dispatch path on purpose. The kill
-    switch exists to cost nothing, and clearing the record on every call would
-    tax a few million of them to make a handful of reads correct; this way the
-    read pays, and reads are rare.
+    The check is here rather than on the dispatch path on purpose. Both states
+    exist to cost nothing, and clearing the record on every call would tax a few
+    million of them to make a handful of reads correct; this way the read pays,
+    and reads are rare.
     """
 
     snapshot = _config_snapshot
-    if snapshot is not None and snapshot.kill_switch:
+    if snapshot is not None and (snapshot.kill_switch or not snapshot.enabled):
         return None
     return _last_decision.get()
 
@@ -417,10 +422,22 @@ def _dispatch(
     kwargs: dict[str, Any],
 ) -> _R:
     config = _config()
-    if config.kill_switch:
-        # The feature is off, so there is nothing to observe and no Decision is
-        # recorded. Everything an operator would ask afterwards is still
-        # answerable from status() and explain(), which compute on demand.
+    if config.kill_switch or not config.enabled:
+        # Two ways of saying the same thing: no provider can possibly serve this
+        # call. The kill switch says so for the process; an empty enable list
+        # says so because no framework has called configure(). Neither can
+        # produce a provider route, so dispatch spends nothing deciding it --
+        # and nothing recording the decision, which is the expensive half: a
+        # frozen Decision costs more to build than the rest of the path.
+        #
+        # The cost of this shortcut is that these calls record no Decision, so
+        # last_decision() and decision_counts() stay empty. That is the same
+        # trade the kill switch already makes, and it is the right one here:
+        # on the day this merges every caller is in this state, so the whole
+        # cost would be paid by people who get nothing back for it. What an
+        # operator actually asks -- is anything enabled, who is installed, what
+        # would this call do -- is still answered on demand by status() and
+        # explain().
         return native(*args, **kwargs)
 
     eligible = _eligible(op, config)
@@ -529,18 +546,28 @@ def _log_route_change(
     Within one generation the route is a deterministic function of the call
     arguments; call-to-call variation is provider behaviour, visible in
     ``decision_counts()``, and is not an audit event.
+
+    An op with no entry yet was running native: dispatch records nothing until a
+    provider is enabled, so ``_UNROUTED`` is what it was doing before, not an
+    unknown. Saying so turns the one change an operator most wants to see -- the
+    moment a framework takes an op over -- into an audit line instead of a
+    silent first baseline. A first decision that is native with nobody named
+    matches ``_UNROUTED`` and stays silent; one that names a provider does not,
+    and should not -- "aklr was asked and did not serve" is the line an operator
+    goes looking for when an enabled provider seems to do nothing.
     """
 
     previous = _route_log.get(decision.op.name)
     if previous is not None and previous[0] == generation:
         return
     current = (decision.route, decision.provider, kernel_id)
-    if previous is not None and previous[1] != current:
+    before = previous[1] if previous is not None else _UNROUTED
+    if before != current:
         logger.info(
             "Route for %s changed at config generation %s: %s -> %s",
             decision.op.name,
             generation,
-            previous[1],
+            before,
             current,
         )
     _route_log[decision.op.name] = (generation, current)

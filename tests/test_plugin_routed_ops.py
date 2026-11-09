@@ -102,7 +102,8 @@ def test_pertoken_quant_stays_native_by_default(monkeypatch):
     scale = amax / 127
     assert torch.equal(y, (x / scale).to(torch.int8))
     assert torch.equal(y_scale, scale.to(torch.float32))
-    decision = plugin.last_decision()
+    assert plugin.last_decision() is None, "nothing enabled, nothing recorded"
+    decision = plugin.explain("pertoken_quant", x, quant_dtype=torch.int8).decision
     assert decision.route == "native"
     assert decision.reason == "no-provider"
 
