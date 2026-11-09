@@ -76,13 +76,15 @@ launch ended; that holds whichever path (large_m or staged, which share
 ``disp_out``, ``ep_rowmap`` and ``comb_inp``) ran it, as the staged dispatch
 likewise waits for d's counts.
 
-Start handshake: that ordering is not enough on its own. Writes that reached a
-rank still between two launches (its previous kernel done, the next one not
-started) came out corrupted now and then: about 1 in 400 small_m calls had one
-token wrong, and an idle delay before any send removed it. So small_m sends
-only once every peer's ``started`` flag carries this launch's generation, which
-CTA 0 polls and passes on through each CTA's send gate. large_m needs no extra
-step: its rows go out after every peer's X1, which proves the same.
+Start handshake (off by default, ``AITER_DMK_NO_HS=0`` turns it on): small_m
+then sends only once every peer's ``started`` flag carries this launch's
+generation, which CTA 0 polls and passes on through each CTA's send gate. It
+was added when writes that reached a rank still between two launches came out
+corrupted now and then (about 1 in 400 calls had one token wrong). That no
+longer reproduces: without it, ~72k calls with up to 1 ms of random launch skew
+between ranks and staged calls interleaved matched the staged path bit for
+bit (4x gfx1250), and it costs ~5 us per launch. large_m needs no such step:
+its rows go out after every peer's X1.
 
 Generation and parity come from u64 entry tickets (``G`` per launch over
 ``N_TICKET`` counters): every rank launches once per layer, so they agree.
@@ -96,7 +98,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import mori.cco.device.flydsl as cco
 from flydsl._mlir.dialects import llvm as _llvm
-from flydsl.expr import arith, const_expr, range_constexpr, rocdl
+from flydsl.expr import arith, const_expr, range_constexpr, rocdl, tdm_ops
 from flydsl.expr.rocdl import ballot, ds_bpermute, readlane
 from flydsl.expr.typing import T
 
@@ -212,8 +214,11 @@ LEAD_SLEEP = 1
 GATE_SLEEP = 32
 
 #: Phase stamps per CTA under AITER_DMK_TRACE: start, ticket, produced,
-#: planned, GEMM1 done, GEMM2 done, combine flags seen, end.
-TR_N = 24
+#: planned, GEMM1 done, GEMM2 done, combine flags seen, end. Slots 24-26 hold
+#: the CTA's GEMM item count, its last item's start and its first GEMM2
+#: item's start.
+TR_N = 28
+TR_ITEMS, TR_LAST_ITEM, TR_FIRST_G2 = 24, 25, 26
 RT_N = 1024
 
 #: Elements a reduce wave owns per item: 32 lanes x 16.
@@ -259,7 +264,9 @@ def dmk_ctl_layout(
     serialize at its DRAM bank."""
     epr_pad = dmk_epr_pad(experts_per_rank)
     plan = CTL_G1 + int(mt_cap) * G1_STRIDE
-    plan_slot = (epr_pad // 2 + 31) // 32 * 32
+    # A replica holds WAVE packed-count dwords per chunk pair (one pair at
+    # least); the tagged replicas store each as a (counts, generation) i64.
+    plan_slot = 2 * WAVE * max(1, epr_pad // WAVE // 2)
     gate_p = plan + PLAN_REPS * plan_slot
     gate_c = gate_p + int(workers) * GATE_STRIDE
     gate_s = gate_c + int(workers) * GATE_STRIDE
@@ -443,12 +450,38 @@ def make_decode_mega(
     # Debug only: every wave idles this many us after its ticket (lets every
     # rank's launch start before anyone sends).
     DELAY_US = int(os.environ.get("AITER_DMK_DELAY_US", "0"))
-    # Debug only: AITER_DMK_NO_HS=1 drops small_m's start handshake.
-    HS = not int(os.environ.get("AITER_DMK_NO_HS", "0"))
+    # small_m's start handshake is off by default; AITER_DMK_NO_HS=0 restores it.
+    HS = not int(os.environ.get("AITER_DMK_NO_HS", "1"))
     TIMEOUT_TICKS = int(
         float(os.environ.get("AITER_DMK_TIMEOUT_S", TIMEOUT_S)) * NOW_HZ
     )
     POLL_SL = int(os.environ.get("AITER_DMK_POLL_SLEEP", POLL_SLEEP))
+    # AITER_DMK_PLAN_TAG: each plan replica dword is stored with the launch's
+    # generation in the same 64-bit store, so a CTA polls its replica instead
+    # of a gate CTA 0 opens after the replicas. On by default for 16-row tiles
+    # (V4.1-Flash DEP4: tpr 8 -2.8, tpr 32 -1.5 us/layer; +1 to +4 past 128).
+    PLAN_TAG = (
+        0
+        if COMPACT
+        else int(os.environ.get("AITER_DMK_PLAN_TAG", "1" if TM <= 16 else "0"))
+    )
+    # AITER_DMK_DEFER_SCATTER (default 1): a GEMM2 item does not wait for its
+    # EP-scatter stores; they retire under the next item, and the queue's end
+    # drains them before the close counts the CTA's units. Its separate C stage
+    # does not fit next to 64-row tiles at 2 CTAs per CU.
+    DEFER_SC = 0 if COMPACT else int(os.environ.get("AITER_DMK_DEFER_SCATTER", "1"))
+    if TM >= 64:
+        DEFER_SC = 0
+    knob_sfx = "".join(
+        f"_{name}{val}"
+        for name, val, default in (
+            ("ps", POLL_SL, POLL_SLEEP),
+            ("hs", int(HS and not COMPACT), 0),
+            ("pt", PLAN_TAG, 1 if TM <= 16 else 0),
+            ("ds", DEFER_SC, 1),
+        )
+        if val != default
+    )
 
     @flyc.jit
     def launch(
@@ -550,6 +583,7 @@ def make_decode_mega(
             a_ready=ready2_holder,
             a_cache_modifier=POL_A,
             scatter_cache_policy=POL_S,
+            defer_ep_wait=DEFER_SC,
             **common,
         )
         if block != 4 * WAVE or block2 != block:
@@ -570,6 +604,7 @@ def make_decode_mega(
             ("large_mega" if COMPACT else "decode_mega")
             + f"_w{G}_r{rank}of{npes}_c{CAP if not COMPACT else MT_CAP * TM}"
             + (f"_ph{PH}" if PH != 15 else "")
+            + knob_sfx
             + f"__{g1_name}__{g2_name}"
         )
         # Keep the separate-kernel launcher in this cache key's dependency set.
@@ -637,7 +672,7 @@ def make_decode_mega(
             )
             tok = fx.Int32(i32_tok)
 
-            def stamp(k):
+            def stamp(k, value=None):
                 if const_expr(TRACE):  # noqa: SIM102 - preserve DSL staging
                     if is_t0:
                         # Relaxed: a release store would flush L2 per stamp.
@@ -645,7 +680,7 @@ def make_decode_mega(
                             addr_ctl
                             + fx.Int64(TR_BASE * 4)
                             + fx.Int64(bid * fx.Int32(TR_N * 8) + fx.Int32(k * 8)),
-                            _now(),
+                            _now() if value is None else value,
                         )
 
             def spin_end():
@@ -834,26 +869,68 @@ def make_decode_mega(
                         wave * fx.Int32(PLAN_REPS // 4) + fx.Int32(c)
                     ) * fx.Int32(PLAN_SLOT)
                     for j2 in range_constexpr(len(pk)):
-                        buffer_store(
-                            pk[j2],
+                        if const_expr(PLAN_TAG):
+                            buffer_store(
+                                fx.Vector.from_elements([pk[j2], gen], dtype=fx.Int32),
+                                rsrc_ctl,
+                                slot_w + (fx.Int32(j2 * WAVE) + lane) * fx.Int32(2),
+                                cache_modifier=SCOPE_DEV,
+                            )
+                        else:
+                            buffer_store(
+                                pk[j2],
+                                rsrc_ctl,
+                                slot_w + fx.Int32(j2 * WAVE) + lane,
+                                cache_modifier=SCOPE_DEV,
+                            )
+
+            def load_tagged_replica(slot_w):
+                """PLAN_TAG: (packed counts, all tags == gen) of one replica."""
+                pkw, ok = [], fx.Int32(1)
+                for j2 in range_constexpr(EPR_CH // 2 if EPR_CH > 1 else 1):
+                    vv = fx.Vector(
+                        buffer_load(
                             rsrc_ctl,
-                            slot_w + fx.Int32(j2 * WAVE) + lane,
-                            cache_modifier=SCOPE_DEV,
+                            slot_w + (fx.Int32(j2 * WAVE) + lane) * fx.Int32(2),
+                            vec_width=2,
+                            dtype=T.i32,
+                            cache_modifier=SCOPE_DEV | (1 << 31),
                         )
+                    )
+                    pkw.append(fx.Int32(vv[0]))
+                    ok = ok & fx.Int32(
+                        (fx.Int32(vv[1]) == gen).select(fx.Int32(1), fx.Int32(0))
+                    )
+                return pkw, ok
 
             def follower_plan(gate_w, site):
                 """Wave 0 of every other CTA: once its gate opens, its LDS plan
                 from its replica."""
-                wait_gate(gate_w, GATE_STRIDE, site)
-                stamp(9)
                 slot_w = fx.Int32(PLAN_W) + (bid & fx.Int32(PLAN_REPS - 1)) * fx.Int32(
                     PLAN_SLOT
                 )
-                pkw = []
-                for j2 in range_constexpr(EPR_CH // 2 if EPR_CH > 1 else 1):
-                    pkw.append(
-                        _load_i32_dev(rsrc_ctl, slot_w + fx.Int32(j2 * WAVE) + lane)
-                    )
+                if const_expr(PLAN_TAG):
+                    _, ok = load_tagged_replica(slot_w)
+                    bad = fx.Int32(ballot(T.i32, ok == fx.Int32(0)))
+                    t_end = spin_end()
+                    live = fx.Int32(1)
+                    while (bad != fx.Int32(0)) & (live != fx.Int32(0)):
+                        fx.rocdl.s_sleep(GATE_SLEEP)
+                        _, ok = load_tagged_replica(slot_w)
+                        bad = fx.Int32(ballot(T.i32, ok == fx.Int32(0)))
+                        live = alive(t_end)
+                    if bad != fx.Int32(0):
+                        spin_fail(site)
+                    stamp(9)
+                    pkw, _ = load_tagged_replica(slot_w)
+                else:
+                    wait_gate(gate_w, GATE_STRIDE, site)
+                    stamp(9)
+                    pkw = []
+                    for j2 in range_constexpr(EPR_CH // 2 if EPR_CH > 1 else 1):
+                        pkw.append(
+                            _load_i32_dev(rsrc_ctl, slot_w + fx.Int32(j2 * WAVE) + lane)
+                        )
                 # Unpack: expert e = lane + 32 j sits in dword e / 2.
                 cnts = []
                 for j in range_constexpr(EPR_CH):
@@ -889,12 +966,9 @@ def make_decode_mega(
                     comm_ops.store_i32_lds(fx.Int64(bc + fx.Int32(8)), carry)
 
             if const_expr(not COMPACT and HS):  # noqa: SIM102 - preserve DSL staging
-                # ---- start handshake (small_m) ----
+                # ---- start handshake (small_m, AITER_DMK_NO_HS=0) ----
                 # A peer writes this rank's counters, rows and rowmap only once
-                # this launch has started: writes that reached a rank still
-                # between launches came out corrupted now and then (measured;
-                # a 300 us delay before any send removed it). large_m sends
-                # only after every peer's X1, which proves the same.
+                # this launch has started (see the module docstring).
                 if (bid == fx.Int32(0)) & (wave == fx.Int32(0)):
                     if lane < fx.Int32(npes):
                         comm_ops.store_i32_global_system_monotonic(
@@ -1608,15 +1682,17 @@ def make_decode_mega(
                     rocdl.s_barrier_wait(-1)
                     stamp(15)
                     # Every wave of CTA 0 writes a quarter of the replicas; wave
-                    # 0 then opens the gates.
+                    # 0 then opens the gates (tagged replicas need none).
                     lead_plan_replicas()
-                    rocdl.s_wait_storecnt(0)
+                    if const_expr(not PLAN_TAG):
+                        rocdl.s_wait_storecnt(0)
                     rocdl.s_barrier_signal(-1)
                     rocdl.s_barrier_wait(-1)
                     stamp(16)
-                    if wave == fx.Int32(0):
-                        open_gates(GATE_P, GATE_STRIDE)
-                        stamp(17)
+                    if const_expr(not PLAN_TAG):  # noqa: SIM102 - preserve DSL staging
+                        if wave == fx.Int32(0):
+                            open_gates(GATE_P, GATE_STRIDE)
+                    stamp(17)
             else:
                 if wave == fx.Int32(0):
                     follower_plan(GATE_S if COMPACT else GATE_P, 3)
@@ -1709,7 +1785,10 @@ def make_decode_mega(
             bc_next = fx.Int64(bc + fx.Int32(12))
             u = bid
             n2_done = fx.Int32(0)
+            n_items = fx.Int32(0)
             while u < U:
+                n_items = n_items + fx.Int32(1)
+                stamp(TR_LAST_ITEM)
                 claim = _buffer_atomic_add_ret(
                     rsrc_ctl,
                     fx.Int32(
@@ -1772,6 +1851,9 @@ def make_decode_mega(
                             )
                             comm_ops.atomic_add_agent(cnt_va, fx.Int32(-NT1))
                 else:
+                    if const_expr(TRACE):  # noqa: SIM102 - preserve DSL staging
+                        if n2_done == fx.Int32(0):
+                            stamp(TR_FIRST_G2)
                     n2_done = n2_done + fx.Int32(1)
                     v = u - U1
                     i = v // fx.Int32(NT2)
@@ -1825,7 +1907,14 @@ def make_decode_mega(
                 rocdl.s_barrier_signal(-1)
                 rocdl.s_barrier_wait(-1)
                 u = _uniform(comm_ops.load_i32_lds(bc_next))
+            if const_expr(DEFER_SC):
+                # The last GEMM2 item's scatter: every wave retires its own
+                # before the barrier that precedes the close.
+                tdm_ops.tensor_wait(0)
+                rocdl.s_barrier_signal(-1)
+                rocdl.s_barrier_wait(-1)
             stamp(4)
+            stamp(TR_ITEMS, fx.Int64(n_items))
 
             # CTA 0's counter reset (its stores retired above) is one unit.
             n2_done = n2_done + fx.Int32(
@@ -1951,6 +2040,9 @@ DMK_TILE = dict(  # noqa: C408 - the builder's keyword names
 #: Past this many tokens per rank the 32-row tile wins (tpr 128: 303 vs
 #: 312 us/layer; tpr 64: 306 vs 301).
 DMK_TILE_M32_TOKENS = 64
+#: Past this many the 64-row tile wins (V4.1-Flash DEP4, 97 experts a rank:
+#: tpr 512 172 vs 189 us/layer; tpr 256 158 vs 147).
+DMK_TILE_M64_TOKENS = 256
 DMK_CTAS_PER_CU = 2
 # Debug/tuning only: AITER_DMK_TILE="tm,tn,tk,nb,tn2,tk2,nb2" and
 # AITER_DMK_CTAS_PER_CU override the above.
@@ -1976,7 +2068,9 @@ def dmk_tile(max_tokens_per_rank: int) -> dict:
             )
         )
     tile = dict(DMK_TILE)
-    if int(max_tokens_per_rank) > DMK_TILE_M32_TOKENS:
+    if int(max_tokens_per_rank) > DMK_TILE_M64_TOKENS:
+        tile["tile_m"] = 64
+    elif int(max_tokens_per_rank) > DMK_TILE_M32_TOKENS:
         tile["tile_m"] = 32
     return tile
 

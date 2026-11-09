@@ -185,6 +185,7 @@ def build_gemm_a8w4_tdm_task(
     a_cache_modifier=0,
     c_cache_modifier=0,
     scatter_cache_policy=0,
+    defer_ep_wait=0,
 ):
     """Build the grouped contiguous-M a8w4 TDM GEMM tile body (``gemm_task``).
 
@@ -241,6 +242,11 @@ def build_gemm_a8w4_tdm_task(
       and e8m0 stores), and of the EP-scatter gather stores. One kernel then
       hands GEMM1's output to GEMM2 across XCCs, and GEMM2's rows to the
       peers, with no kernel boundary in between.
+    - ``defer_ep_wait`` (persistent EP scatter): stage C past the input
+      stages and skip the wait after the scatter, so the remote stores retire
+      under the next tile's mainloop. The next tile's epilogue waits for them
+      before it restages C; the caller must drain tensorcnt before it counts
+      the scatter as done or exits.
     """
     if tile_meta is not None or item_hooks is not None:
         assert explicit_tile and persistent_workers, "S1F hooks need explicit tiles"
@@ -479,6 +485,10 @@ def build_gemm_a8w4_tdm_task(
         else num_buffers
     )
     C_EP_OFF = 0
+    if defer_ep_wait:
+        assert enable_ep_scatter and persistent_workers and not ep_quant_bits
+        C_EP_OFF = ((INPUT_LDS_B + 127) // 128) * 128
+        ARENA_B = max(ARENA_B, C_EP_OFF + C_STORE_B)
     # fp4 stage-1 output staging (tile_m x tile_n/4 B): the last pipeline stage
     # with defer_c_wait, so the next tile's prologue cannot overwrite it.
     C_Q_OFF = (num_buffers - 1) * PITCH if defer_c_wait else 0
@@ -542,6 +552,7 @@ def build_gemm_a8w4_tdm_task(
         f"{_mma_group}{_ds_first}"
         f"{_explicit_vgpr_partition}{_planar_lds}"
         f"{_interleaved_lds_load}{_persistent}{_drain}{_malign}{_cpol}"
+        f"{'_dew' if defer_ep_wait else ''}"
     )
 
     # Compile the static path directly, preserving its launch ABI and the
@@ -2144,6 +2155,12 @@ def build_gemm_a8w4_tdm_task(
                             )
             else:
                 # bf16/f16 activation (or passthrough) -> stage to LDS.
+                if const_expr(defer_ep_wait):
+                    # The previous tile's scatter may still read the C stage:
+                    # each wave retires its own, then no wave restages early.
+                    tdm_ops.tensor_wait(0)
+                    rocdl.s_barrier_signal(-1)
+                    rocdl.s_barrier_wait(-1)
                 if const_expr(enable_ep_scatter):
                     _wf_rows = _rm_weight_rows
 
@@ -2452,7 +2469,8 @@ def build_gemm_a8w4_tdm_task(
                             issue_scatter_group(group, scatter_vector, vector_pass)
                     else:
                         issue_scatter_group(group, scatter_vector, vector_pass)
-                tdm_ops.tensor_wait(0)
+                if const_expr(not defer_ep_wait):
+                    tdm_ops.tensor_wait(0)
             else:
                 if const_expr(stage1_act):
                     out_divisor = 4 if is_fp4_quant else 2
