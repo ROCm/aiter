@@ -67,6 +67,44 @@ class TestA16W16TunedConfigLookup(unittest.TestCase):
 class TestGfx1250FlydslCandidates(unittest.TestCase):
     """GemmA16W16Tuner's FlyDSL candidates on gfx1250, with the device mocked."""
 
+    def test_bf16_tdm_catalog_keeps_legacy_policies(self):
+        import aiter.ops.flydsl.gemm_a16w16_policy as policy
+
+        legacy = [{"policy": "ft"}, {"policy": "ht"}]
+        tdm = [{"policy": "tdm"}, {"policy": "tdma"}]
+        with (
+            mock.patch.object(policy, "get_gfx_runtime", return_value="gfx1250"),
+            mock.patch.object(
+                policy, "_gfx1250_configs", return_value=legacy
+            ) as old_catalog,
+            mock.patch.object(
+                policy, "_gfx1250_tdm_configs", side_effect=lambda *args: list(tdm)
+            ) as tdm_catalog,
+        ):
+            self.assertEqual(
+                policy.get_flydsl_a16w16_configs(
+                    16, 128, 5120, torch.bfloat16, torch.bfloat16, False
+                ),
+                tdm + legacy,
+            )
+            old_catalog.assert_called_once_with(16, 128, 5120)
+            old_catalog.reset_mock()
+            self.assertEqual(
+                policy.get_flydsl_a16w16_configs(
+                    16, 128, 5120, torch.float16, torch.float16, False
+                ),
+                tdm,
+            )
+            old_catalog.assert_not_called()
+            tdm_catalog.reset_mock()
+            self.assertEqual(
+                policy.get_flydsl_a16w16_configs(
+                    16, 128, 5120, torch.bfloat16, torch.float32, False
+                ),
+                legacy,
+            )
+            tdm_catalog.assert_not_called()
+
     def test_candidates_fit_the_gfx1250_kernel_and_round_trip(self):
         from types import SimpleNamespace
 
@@ -102,6 +140,14 @@ class TestGfx1250FlydslCandidates(unittest.TestCase):
                             * (config["block_n"] + (8 if config["interleave"] else 0)),
                         )
                         * 2
+                        if config.get("policy", "").startswith("tdm")
+                        else policy.gfx1250_lds_bytes(
+                            config["block_m"],
+                            config["block_n"],
+                            config["block_k"],
+                            config["stages"],
+                            config["split_k"],
+                        )
                     )
                     self.assertLessEqual(lds, 320 * 1024)
                     k_tiles = -(-(k // config["split_k"]) // config["block_k"])
@@ -491,7 +537,9 @@ class TestLegacyFlydslHgemmConfigs(unittest.TestCase):
             if name in seen:
                 continue
             params = kernels.get_flydsl_hgemm_kernel_params(name)
-            if not params["target_gfx"].startswith("gfx1250"):
+            if not params["target_gfx"].startswith("gfx1250") or params[
+                "policy"
+            ] not in ("ft", "ht"):
                 continue
             seen.add(name)
             for gfx in ("gfx1250", "gfx1250-strict"):

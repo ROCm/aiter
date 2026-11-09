@@ -347,7 +347,12 @@ def get_flydsl_a16w16_configs(
     if out_dtype not in (dtype, torch.float32):
         return []
     if get_gfx_runtime() == "gfx1250" and out_dtype == dtype:
-        return _gfx1250_tdm_configs(m, n, k, dtype)
+        configs = _gfx1250_tdm_configs(m, n, k, dtype)
+        # TDM is an additional BF16 policy, not a replacement for the legacy
+        # ft/ht search space. Retuning must allow existing winners to compete.
+        if dtype == torch.bfloat16:
+            configs.extend(_gfx1250_configs(m, n, k))
+        return configs
     if get_gfx_runtime() in ("gfx1250", "gfx1250-strict"):
         return _gfx1250_configs(m, n, k)
     if make_gemm_a16w16_param_and_validate is None:
