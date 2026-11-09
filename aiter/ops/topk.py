@@ -1588,8 +1588,7 @@ def flydsl_top_k_per_row_decode(
     This path is optimized for long-context decode, where its multi-CTA radix
     selection typically outperforms the HIP one-block implementation.
 
-    `max_row_len` must be at least every `seqLens` entry; if not, the result is
-    wrong. Pass `None` when unsure. `top_k_per_row_decode` holds the full contract.
+    `top_k_per_row_decode` holds the `max_row_len` contract.
     """
     from .flydsl.topk.topk_per_row import (
         flydsl_top_k_per_row_decode as _flydsl_top_k_per_row_decode,
