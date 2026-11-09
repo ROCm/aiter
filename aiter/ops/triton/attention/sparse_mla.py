@@ -88,22 +88,17 @@ FP8_ARCHS = ("gfx950",)
 FP8_SCALAR_ARCHS = ("gfx942", "gfx950")
 
 # The packed caches (fp8_dsv4_mla, fp8_g64) and the SWA+top-k two-loop do not
-# run outside PACKED_ARCHS. Packed caches and a bf16 or dsv4 two-loop route to
-# pa_decode_sparse, whose driver is gfx950-only and whose fallback reads a plain
-# grouped fp8 pool rather than these records. An fp8_scalar two-loop would
-# instead launch the kernel below, so sparse_mla_fwd rejects every extra_kv
-# before that launch.
+# run outside PACKED_ARCHS. An fp8_scalar two-loop would launch the kernel below
+# rather than pa_decode_sparse, so sparse_mla_fwd rejects extra_kv first.
 PACKED_ARCHS = ("gfx950",)
 
 
 def _get_config(arch: str | None = None, fp8_dots: bool = False) -> dict:
     """The _sparse_mla launch config published for arch, the running one by default.
 
-    BLOCK_K is per arch because gfx950's tile does not fit gfx942's 64 KB of
-    LDS. num_warps is its own entry rather than BLOCK_K // 16, so the smaller
-    tile does not halve the warps too. An arch may publish a separate
-    _sparse_mla_fp8 entry for fp8 dots, whose one-byte tiles fit twice the
-    BLOCK_K in the same LDS.
+    BLOCK_K and num_warps are per arch because gfx950's tile does not fit
+    gfx942's 64 KB of LDS. An arch may publish a separate _sparse_mla_fp8 entry
+    for fp8 dots, whose one-byte tiles fit twice the BLOCK_K.
     """
     cfg_dir = resolve_config_dir("attention", "SPARSE_MLA", backend="gluon", arch=arch)
     configs = load_config_json(f"{cfg_dir}/DEFAULT.json")
@@ -115,9 +110,8 @@ def _get_config(arch: str | None = None, fp8_dots: bool = False) -> dict:
 def _check_packed_arch(arch: str) -> None:
     """Packed caches and the two-loop are gfx950-only, whatever SUPPORTED_ARCHS says.
 
-    The paged route fails inside pa_decode_sparse on a cache dtype, which says
-    nothing about the arch being the reason. An fp8_scalar two-loop never takes
-    that route, so sparse_mla_fwd calls this before launching the kernel below.
+    An fp8_scalar two-loop never reaches pa_decode_sparse, so sparse_mla_fwd
+    calls this before launching the kernel below.
     """
     if arch not in PACKED_ARCHS:
         if arch in FP8_ARCHS:
@@ -867,9 +861,8 @@ def sparse_mla_fwd(
     if any(a is not None for a in extra) and not has_extra:
         raise ValueError("extra_kv, extra_indptr and extra_indices go together")
     if has_extra and arch_info.get_arch() not in PACKED_ARCHS:
-        # fp8_scalar extra never reaches _forward_paged. Without this it launches
-        # the kernel below, which gfx942 could not reach until fp8 caches were
-        # accepted. The two-loop stays gfx950-only for every cache format.
+        # fp8_scalar extra never reaches _forward_paged and would launch the
+        # kernel below. The two-loop stays gfx950-only for every cache format.
         _check_packed_arch(arch_info.get_arch())
     if has_extra:
         # The SWA-window + top-k two-loop: both segments are block caches the
