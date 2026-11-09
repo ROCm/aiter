@@ -2131,10 +2131,19 @@ class Gfx1250Pipeline:
             ctx.planned_start * t.plan_tile_tokens,
             ctx.planned_end * t.plan_tile_tokens,
         )
-        # The first page's DMA overlaps Q staging; the regions are disjoint.
+        # Prefetch cooperative Q before the first page's metadata/scale work.
+        early_q = (
+            t.head_dim == 128
+            and t.m_tiles == 1
+            and t.single_task_tile
+            and t.plan_tile_tokens == t.TOKENS
+        )
+        first_q = None
+        if const_expr(early_q):
+            first_q = self.mem.query_units(ctx.tid // 8, ctx.tid % 8)
         self.mem.stage_kv(begin, fx.Int32(0))
         if const_expr(t.q_tiles == t.m_tiles):
-            self.mem.stage_query()
+            self.mem.stage_query(first_units=first_q)
         # Per-M-tile state: maximum, denominator, then wave-owned D fragments.
         vh_count = t.head_dim // 64
         initial = []

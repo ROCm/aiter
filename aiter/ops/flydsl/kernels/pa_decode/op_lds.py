@@ -1787,37 +1787,47 @@ class Gfx1250Memory:
         return fx.Vector.from_elements(words, dtype=fx.Int32), scale
 
     @flyc.jit
-    def stage_query(self, first_tile=0):
+    def query_units(self, flat, shard):
         ctx, t = self.ctx, self.t
         query = fx.recast_iter(t.q_dtype, ctx.query_ptr)
+        units = []
+        for j in range_constexpr(t.head_dim // 64):
+            d = shard * (t.head_dim // 8) + j * 8
+            qoff = (
+                (
+                    fx.Int64(ctx.planned_seq) * t.query_length
+                    + ctx.query_begin
+                    + flat // t.query_group_size
+                )
+                * ctx.stride_q_row
+                + (ctx.kv_h * t.query_group_size + flat % t.query_group_size)
+                * ctx.stride_q_head
+                + d
+            )
+            values = fx.Vector.filled(8, 0.0, fx.Float32)
+            if flat < t.rows:
+                values = fx.Vector(
+                    fx.ptr_load(
+                        fx.add_offset(query, qoff),
+                        result_type=fx.Vector.make_type(8, t.q_dtype),
+                    )
+                ).to(fx.Float32)
+            units.append(values)
+        return units
+
+    @flyc.jit
+    def stage_query(self, first_tile=0, first_units=None):
+        ctx, t = self.ctx, self.t
         # Eight adjacent lanes stage each row, normalizing only for FP8.
         row, shard = ctx.tid // 8, ctx.tid % 8
         for m in range_constexpr(t.q_tiles):
             flat = (first_tile + m) * 16 + row
             shared_row = m * 16 + row
-            units = []
-            for j in range_constexpr(t.head_dim // 64):
-                d = shard * (t.head_dim // 8) + j * 8
-                qoff = (
-                    (
-                        fx.Int64(ctx.planned_seq) * t.query_length
-                        + ctx.query_begin
-                        + flat // t.query_group_size
-                    )
-                    * ctx.stride_q_row
-                    + (ctx.kv_h * t.query_group_size + flat % t.query_group_size)
-                    * ctx.stride_q_head
-                    + d
-                )
-                values = fx.Vector.filled(8, 0.0, fx.Float32)
-                if flat < t.rows:
-                    values = fx.Vector(
-                        fx.ptr_load(
-                            fx.add_offset(query, qoff),
-                            result_type=fx.Vector.make_type(8, t.q_dtype),
-                        )
-                    ).to(fx.Float32)
-                units.append(values)
+            units = (
+                first_units
+                if const_expr(first_units is not None)
+                else self.query_units(flat, shard)
+            )
             if const_expr(not t.bf16):
                 absmax = fx.Float32(0.0)
                 for j in range_constexpr(len(units)):
