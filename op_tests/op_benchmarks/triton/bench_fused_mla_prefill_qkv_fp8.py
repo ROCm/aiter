@@ -3,6 +3,7 @@
 
 """Benchmark for the one-launch FP8 MLA prefill q/k/v prep."""
 
+import functools
 import sys
 
 import torch
@@ -13,12 +14,17 @@ from aiter.ops.triton.fusions.fused_mla_prefill_qkv_fp8 import (
     fused_mla_prefill_qkv_fp8,
 )
 from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_do_bench_graph_kwargs,
     get_parser,
+    get_rot_bufs_kwargs,
     override_parser_action,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,
     print_vgpr,
+)
+from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
+    RotatingBufferBench,
 )
 from op_tests.triton_tests.fusions.test_fused_mla_prefill_qkv_fp8 import (
     generate_inputs,
@@ -41,20 +47,30 @@ def get_benchmark_shapes(args):
 
 
 def bench_fn_impl(T, H, H_out, provider, metric, args):
-    q, k_nope, v, k_pe = generate_inputs(T, H, arg_to_torch_dtype[args.dtype])
+    bencher = RotatingBufferBench.from_dict(
+        {**get_rot_bufs_kwargs(args), **get_do_bench_graph_kwargs(args)}
+    )
+    _p_gen = functools.partial(generate_inputs, T, H, arg_to_torch_dtype[args.dtype])
+    _out_val_keys = ["q", "k_nope", "v", "k_pe"]
+    rot_bufs = bencher.build_pool([_p_gen], [_out_val_keys])
+
+    # Shapes/dtypes are identical across the pool, so any entry works for sizing.
+    sample = rot_bufs[0]
+    q, k_nope, v, k_pe = sample["q"], sample["k_nope"], sample["v"], sample["k_pe"]
     read = sum(t.numel() for t in (q, k_nope, v, k_pe)) * q.element_size()
     written = T * H_out * (2 * q.shape[-1] + v.shape[-1])  # one byte per FP8 value
+
     if provider == "fused":
 
-        def fn():
-            return fused_mla_prefill_qkv_fp8(q, k_nope, v, k_pe, H_out, dtypes.fp8)
+        def _run(q, k_nope, v, k_pe):
+            fused_mla_prefill_qkv_fp8(q, k_nope, v, k_pe, H_out, dtypes.fp8)
 
     else:
 
-        def fn():
-            return torch_mla_prefill_qkv_fp8_ref(q, k_nope, v, k_pe, H_out, dtypes.fp8)
+        def _run(q, k_nope, v, k_pe):
+            torch_mla_prefill_qkv_fp8_ref(q, k_nope, v, k_pe, H_out, dtypes.fp8)
 
-    ms = triton.testing.do_bench(fn, warmup=args.warmup, rep=args.rep)
+    ms = bencher.bench(_run)
     if metric == "time":
         return ms * 1000  # us
     if metric == "bandwidth":
@@ -107,8 +123,6 @@ def parse_args():
     override_parser_action(
         parser, action="--metric", choices=["time", "bandwidth", "all"], default="all"
     )
-    parser.add_argument("--warmup", type=int, default=25)
-    parser.add_argument("--rep", type=int, default=100)
     parser.add_argument(
         "-print_vgpr",
         action="store_true",

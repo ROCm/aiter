@@ -247,9 +247,12 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
             f"split_k*tile_k={split_k}*{tile_k}={split_k * tile_k}"
         )
     num_k_tiles = (K // split_k) // tile_k
-    if num_k_tiles < nb:
+    # Generic K=128 with two buffers uses only the prologue and drain.
+    # Other configurations, including compute-bound kernels, keep their limits.
+    min_k_tiles = 1 if not compute_bound and nb == 2 and K == tile_k == 128 else nb
+    if num_k_tiles < min_k_tiles:
         raise RuntimeError(
-            f"[FlyDSL gfx1250 mxfp8] {nb}-buffer pipeline needs >= {nb} "
+            f"[FlyDSL gfx1250 mxfp8] {nb}-buffer pipeline needs >= {min_k_tiles} "
             f"K-tiles per split-k chunk, got {num_k_tiles}"
         )
     if compute_bound:
@@ -387,6 +390,7 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
             fused,
             bounded_m,
             a_scale_preshuffled,
+            compute_kernel_k_tiles_class(num_k_tiles),
         )
         _run_compiled(
             _launch_gemm_a8w8_compute_bound,
@@ -491,6 +495,12 @@ def parse_mxfp8_32_wmma_kernel_name(name: str):
 def compute_kernel_k_pair(num_buffers: int, tile_n: int) -> int:
     """K-tiles the compute-bound kernel stages per TDM super."""
     return 1 if num_buffers == 4 and tile_n == 256 else 2
+
+
+def compute_kernel_k_tiles_class(num_k_tiles: int) -> int:
+    """K-loop length bucket of the compute-bound kernel: 0 for <= 16 K-tiles
+    per split, 1 for <= 64, 2 above."""
+    return 0 if num_k_tiles <= 16 else (1 if num_k_tiles <= 64 else 2)
 
 
 def cluster_m_grid_ok(M: int, tile_m: int, cluster_m: int) -> bool:

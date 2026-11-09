@@ -6,16 +6,39 @@
 import triton
 import triton.language as tl
 
+from aiter.ops.triton._triton_kernels.quant.fused_fp8_quant import _fp8_quant_op
+from aiter.ops.triton._triton_kernels.quant.quant import (
+    _mxfp4_e8m0_to_fp32,
+    _mxfp4_quant_op,
+)
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+
+# Quantized cache rows. An FP8 row has one FP32 scale (row amax / FP8 max). An
+# FP4 row is MXFP4: two E2M1 values in each byte (dim 2j in the low nibble) and
+# one E8M0 exponent for each GROUP dims, rounded up so that no value clips.
+_qsa_store_rows_fp8_repr = make_kernel_repr(
+    "_qsa_store_rows_fp8",
+    ["HEAD_DIM", "BLOCK_D", "FP8_MAX_C"],
+)
+
+_qsa_store_rows_fp4_repr = make_kernel_repr(
+    "_qsa_store_rows_fp4",
+    ["HEAD_DIM", "GROUP"],
+)
 
 _qsa_paged_mqa_logits_repr = make_kernel_repr(
     "_qsa_paged_mqa_logits",
-    ["NUM_HEADS", "HEAD_DIM", "COMPRESS_RATIO", "BLOCK_N", "BLOCK_D"],
+    ["NUM_HEADS", "HEAD_DIM", "COMPRESS_RATIO", "BLOCK_N", "BLOCK_D", "KEY_FMT"],
 )
 
 _qsa_paged_mqa_logits_mfma_repr = make_kernel_repr(
     "_qsa_paged_mqa_logits_mfma",
-    ["NUM_HEADS", "HEAD_DIM", "COMPRESS_RATIO", "BMT", "BN"],
+    ["NUM_HEADS", "HEAD_DIM", "COMPRESS_RATIO", "BMT", "BN", "KEY_FMT"],
+)
+
+_qsa_paged_mqa_logits_stacked_repr = make_kernel_repr(
+    "_qsa_paged_mqa_logits_stacked",
+    ["NUM_HEADS", "HEAD_DIM", "COMPRESS_RATIO", "BMT", "BN", "KEY_FMT"],
 )
 
 _expand_selected_groups_repr = make_kernel_repr(
@@ -34,14 +57,176 @@ _qsa_sparse_paged_gqa_repr = make_kernel_repr(
         "BLOCK_N",
         "BLOCK_D",
         "KV_SPLITS",
+        "KV_FP8",
     ],
 )
+
+
+@triton.jit
+def _e2m1_value_lo(code):
+    """FP32 value of E2M1 `code` (int32, 0..15) times 2^-14, decoded with an
+    FP16 bitcast. The group scale makes up the 2^14: it is decoded as E8M0
+    `e + 14`, which is exact for e <= 240, as the writer keeps."""
+    bits = ((code & 7) << 9) | ((code & 8) << 12)
+    return bits.to(tl.int16).to(tl.float16, bitcast=True).to(tl.float32)
+
+
+@triton.jit
+def _store_fp8_row(
+    values_ptr,
+    cache_ptr,
+    scale_ptr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    FP8_MAX_C: tl.constexpr,
+):
+    dims = tl.arange(0, BLOCK_D)
+    x = tl.load(values_ptr + dims[None, :], mask=dims[None, :] < HEAD_DIM, other=0.0)
+    y, scale = _fp8_quant_op(
+        x.to(tl.float32), 1, BLOCK_D, BLOCK_D, FP8_MAX_C, -FP8_MAX_C
+    )
+    tl.store(
+        cache_ptr + dims,
+        tl.reshape(y, (BLOCK_D,)).to(cache_ptr.dtype.element_ty),
+        mask=dims < HEAD_DIM,
+    )
+    tl.store(scale_ptr + tl.arange(0, 1), tl.reshape(scale, (1,)))
+
+
+@triton.jit(repr=_qsa_store_rows_fp8_repr)
+def _qsa_store_rows_fp8_kernel(
+    cache_ptr,
+    scale_ptr,
+    slots_ptr,
+    values_ptr,
+    stride_cache_slot,
+    stride_cache_head,
+    stride_scale_slot,
+    stride_scale_head,
+    stride_value_row,
+    stride_value_head,
+    num_slots,
+    second_cache_ptr,
+    second_scale_ptr,
+    second_values_ptr,
+    stride_second_value_row,
+    stride_second_value_head,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    FP8_MAX_C: tl.constexpr,
+) -> None:
+    """FP8 rows with one FP32 scale per (row, head). An optional second tensor
+    (V with K) uses the same slots and strides."""
+    row = tl.program_id(0)
+    head = tl.program_id(1)
+    slot = tl.load(slots_ptr + row)
+    if (slot < 0) | (slot >= num_slots):
+        return
+    slot = slot.to(tl.int64)
+    cache_offset = slot * stride_cache_slot + head * stride_cache_head
+    scale_offset = slot * stride_scale_slot + head * stride_scale_head
+    _store_fp8_row(
+        values_ptr + row * stride_value_row + head * stride_value_head,
+        cache_ptr + cache_offset,
+        scale_ptr + scale_offset,
+        HEAD_DIM,
+        BLOCK_D,
+        FP8_MAX_C,
+    )
+    if second_cache_ptr is not None:
+        _store_fp8_row(
+            second_values_ptr
+            + row * stride_second_value_row
+            + head * stride_second_value_head,
+            second_cache_ptr + cache_offset,
+            second_scale_ptr + scale_offset,
+            HEAD_DIM,
+            BLOCK_D,
+            FP8_MAX_C,
+        )
+
+
+@triton.jit(repr=_qsa_store_rows_fp4_repr)
+def _qsa_store_rows_fp4_kernel(
+    cache_ptr,
+    scale_ptr,
+    slots_ptr,
+    values_ptr,
+    stride_cache_slot,
+    stride_cache_head,
+    stride_scale_slot,
+    stride_scale_head,
+    stride_value_row,
+    stride_value_head,
+    num_slots,
+    HEAD_DIM: tl.constexpr,
+    GROUP: tl.constexpr,
+) -> None:
+    """MXFP4 rows: packed E2M1 pairs plus one E8M0 exponent per GROUP dims."""
+    row = tl.program_id(0)
+    head = tl.program_id(1)
+    slot = tl.load(slots_ptr + row)
+    if (slot < 0) | (slot >= num_slots):
+        return
+    slot = slot.to(tl.int64)
+    HALF: tl.constexpr = HEAD_DIM // 2
+    GROUPS: tl.constexpr = HEAD_DIM // GROUP
+    dims = tl.arange(0, HEAD_DIM)
+    x = tl.load(
+        values_ptr + row * stride_value_row + head * stride_value_head + dims[None, :]
+    ).to(tl.float32)
+    # Ties away from zero match ATOM's cache bytes. The E8M0 cap of 240 is
+    # what the readers' FP16 decode needs.
+    packed, exponents = _mxfp4_quant_op(
+        x,
+        HEAD_DIM,
+        1,
+        GROUP,
+        SCALING_MODE=1,
+        ROUNDING_MODE=1,
+        MAX_SCALE_E8M0=240,
+    )
+    tl.store(
+        cache_ptr
+        + slot * stride_cache_slot
+        + head * stride_cache_head
+        + tl.arange(0, HALF),
+        tl.reshape(packed, (HALF,)),
+    )
+    tl.store(
+        scale_ptr
+        + slot * stride_scale_slot
+        + head * stride_scale_head
+        + tl.arange(0, GROUPS),
+        tl.reshape(exponents, (GROUPS,)),
+    )
+
+
+@triton.jit
+def _load_fp4_keys(
+    k_rows, scale_rows, mask, dtype, HEAD_DIM: tl.constexpr, GROUP: tl.constexpr
+):
+    """`[rows, HEAD_DIM]` keys in `dtype` (exact for BF16 / FP32) decoded from
+    the MXFP4 rows at `k_rows` and their E8M0 exponents at `scale_rows`."""
+    pairs = tl.arange(0, HEAD_DIM // 2)
+    packed = tl.load(k_rows[:, None] + pairs[None, :], mask=mask[:, None], other=0)
+    exponent = tl.load(
+        scale_rows[:, None] + (pairs // (GROUP // 2))[None, :],
+        mask=mask[:, None],
+        other=127,
+    )
+    group_scale = _mxfp4_e8m0_to_fp32(exponent.to(tl.int32) + 14)
+    packed = packed.to(tl.int32)
+    low = (_e2m1_value_lo(packed & 15) * group_scale).to(dtype)
+    high = (_e2m1_value_lo(packed >> 4) * group_scale).to(dtype)
+    return tl.interleave(low, high)
 
 
 @triton.jit(repr=_qsa_paged_mqa_logits_repr)
 def _qsa_paged_mqa_logits_kernel(
     q_ptr,
     k_cache_ptr,
+    k_scale_ptr,
     page_table_ptr,
     token_to_request_ptr,
     query_positions_ptr,
@@ -55,6 +240,8 @@ def _qsa_paged_mqa_logits_kernel(
     stride_cache_page,
     stride_cache_token,
     stride_cache_dim,
+    stride_scale_page,
+    stride_scale_token,
     stride_table_request,
     stride_table_page,
     stride_logits_token,
@@ -70,8 +257,11 @@ def _qsa_paged_mqa_logits_kernel(
     COMPRESS_RATIO: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    KEY_FMT: tl.constexpr = 0,
+    GROUP: tl.constexpr = 32,
 ) -> None:
-    """Score BF16 compressed QSA keys directly from a paged cache."""
+    """Score compressed QSA keys directly from a paged cache: unquantized
+    (KEY_FMT 0), FP8 with a per-row scale (1) or MXFP4 (2)."""
     token = tl.program_id(0)
     dims = tl.arange(0, BLOCK_D)
 
@@ -138,14 +328,32 @@ def _qsa_paged_mqa_logits_kernel(
         )
         valid &= (physical_page >= 0) & (physical_page < num_cache_pages)
         safe_physical_page = tl.maximum(physical_page, 0).to(tl.int64)
-        keys = tl.load(
-            k_cache_ptr
-            + safe_physical_page[:, None] * stride_cache_page
-            + page_offset[:, None] * stride_cache_token
-            + dims[None, :] * stride_cache_dim,
-            mask=valid[:, None] & (dims[None, :] < HEAD_DIM),
-            other=0.0,
-        ).to(tl.float32)
+        if KEY_FMT != 0:
+            scale_rows = (
+                k_scale_ptr
+                + safe_physical_page * stride_scale_page
+                + page_offset * stride_scale_token
+            )
+        if KEY_FMT == 2:
+            keys = _load_fp4_keys(
+                k_cache_ptr
+                + safe_physical_page * stride_cache_page
+                + page_offset * stride_cache_token,
+                scale_rows,
+                valid,
+                tl.float32,
+                HEAD_DIM,
+                GROUP,
+            )
+        else:
+            keys = tl.load(
+                k_cache_ptr
+                + safe_physical_page[:, None] * stride_cache_page
+                + page_offset[:, None] * stride_cache_token
+                + dims[None, :] * stride_cache_dim,
+                mask=valid[:, None] & (dims[None, :] < HEAD_DIM),
+                other=0.0,
+            ).to(tl.float32)
         score = tl.maximum(tl.sum(keys * q0[None, :], axis=1), 0.0)
         if NUM_HEADS > 1:
             score += tl.maximum(tl.sum(keys * q1[None, :], axis=1), 0.0)
@@ -153,6 +361,9 @@ def _qsa_paged_mqa_logits_kernel(
             score += tl.maximum(tl.sum(keys * q2[None, :], axis=1), 0.0)
         if NUM_HEADS > 3:
             score += tl.maximum(tl.sum(keys * q3[None, :], axis=1), 0.0)
+        if KEY_FMT == 1:
+            # The row scale is positive, so it commutes with every head's ReLU.
+            score *= tl.load(scale_rows, mask=valid, other=0.0)
         score /= score_divisor
         tl.store(
             logits_ptr + token * stride_logits_token + columns,
@@ -165,6 +376,7 @@ def _qsa_paged_mqa_logits_kernel(
 def _qsa_paged_mqa_logits_mfma_kernel(
     q_ptr,
     k_cache_ptr,
+    k_scale_ptr,
     page_table_ptr,
     token_to_request_ptr,
     query_positions_ptr,
@@ -176,6 +388,8 @@ def _qsa_paged_mqa_logits_mfma_kernel(
     stride_q_head,
     stride_cache_page,
     stride_cache_token,
+    stride_scale_page,
+    stride_scale_token,
     stride_table_request,
     stride_logits_token,
     num_tokens,
@@ -190,6 +404,8 @@ def _qsa_paged_mqa_logits_mfma_kernel(
     COMPRESS_RATIO: tl.constexpr,
     BMT: tl.constexpr,
     BN: tl.constexpr,
+    KEY_FMT: tl.constexpr = 0,
+    GROUP: tl.constexpr = 32,
 ) -> None:
     """`_qsa_paged_mqa_logits_kernel` on matrix cores."""
     pid_m = tl.program_id(0)
@@ -219,7 +435,8 @@ def _qsa_paged_mqa_logits_mfma_kernel(
     columns = col0 + tl.arange(0, BN)
     logical_page = columns // PAGE_SIZE
     page_offset = columns % PAGE_SIZE
-    page_ok = logical_page < PAGE_TABLE_WIDTH
+    # The width is rounded up; columns < num_columns keeps table reads in bounds.
+    page_ok = (logical_page < PAGE_TABLE_WIDTH) & (columns < num_columns)
     safe_page = tl.minimum(logical_page, PAGE_TABLE_WIDTH - 1)
     active = visible > 0
     req_lo = tl.min(tl.where(active, safe_request, num_requests), axis=0)
@@ -232,18 +449,41 @@ def _qsa_paged_mqa_logits_mfma_kernel(
             other=-1,
         )
         key_ok = page_ok & (physical >= 0) & (physical < num_cache_pages)
-        keys_t = tl.load(
-            k_cache_ptr
-            + tl.maximum(physical, 0).to(tl.int64)[None, :] * stride_cache_page
-            + page_offset[None, :] * stride_cache_token
-            + dims[:, None],
-            mask=key_ok[None, :],
-            other=0.0,
-        )
+        if KEY_FMT != 0:
+            safe_physical = tl.maximum(physical, 0).to(tl.int64)
+            scale_rows = (
+                k_scale_ptr
+                + safe_physical * stride_scale_page
+                + page_offset * stride_scale_token
+            )
+        if KEY_FMT == 2:
+            keys = _load_fp4_keys(
+                k_cache_ptr
+                + safe_physical * stride_cache_page
+                + page_offset * stride_cache_token,
+                scale_rows,
+                key_ok,
+                q_ptr.dtype.element_ty,
+                HEAD_DIM,
+                GROUP,
+            )
+            keys_t = tl.trans(keys)
+        else:
+            keys_t = tl.load(
+                k_cache_ptr
+                + tl.maximum(physical, 0).to(tl.int64)[None, :] * stride_cache_page
+                + page_offset[None, :] * stride_cache_token
+                + dims[:, None],
+                mask=key_ok[None, :],
+                other=0.0,
+            ).to(q_ptr.dtype.element_ty)
         s = tl.zeros((BMT, BN), dtype=tl.float32)
         for head in tl.static_range(NUM_HEADS):
             qh = tl.load(q_rows + head * stride_q_head, mask=rvalid[:, None], other=0.0)
             s += tl.maximum(tl.dot(qh, keys_t), 0.0)
+        if KEY_FMT == 1:
+            # The row scale is positive, so it commutes with every ReLU.
+            s *= tl.load(scale_rows, mask=key_ok, other=0.0)[None, :]
         score = tl.where((safe_request == req)[:, None], s, score)
     score = score / score_divisor
     tl.store(
@@ -253,6 +493,137 @@ def _qsa_paged_mqa_logits_mfma_kernel(
         tl.where(columns[None, :] < visible[:, None], score, -float("inf")),
         mask=rvalid[:, None] & (columns < num_columns)[None, :],
     )
+
+
+@triton.jit(repr=_qsa_paged_mqa_logits_stacked_repr)
+def _qsa_paged_mqa_logits_stacked_kernel(
+    q_ptr,
+    k_cache_ptr,
+    k_scale_ptr,
+    page_table_ptr,
+    token_to_request_ptr,
+    query_positions_ptr,
+    context_lens_ptr,
+    visible_groups_ptr,
+    row_starts_ptr,
+    logits_ptr,
+    stride_q_token,
+    stride_q_head,
+    stride_cache_page,
+    stride_cache_token,
+    stride_scale_page,
+    stride_scale_token,
+    stride_table_request,
+    stride_logits_token,
+    num_tokens,
+    num_columns,
+    num_cache_pages,
+    num_requests,
+    score_divisor,
+    PAGE_SIZE: tl.constexpr,
+    PAGE_TABLE_WIDTH: tl.constexpr,
+    NUM_HEADS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    COMPRESS_RATIO: tl.constexpr,
+    BMT: tl.constexpr,
+    BN: tl.constexpr,
+    KEY_FMT: tl.constexpr,
+    GROUP: tl.constexpr,
+) -> None:
+    """`_qsa_paged_mqa_logits_mfma_kernel` with the heads stacked into M.
+
+    BMT rows times NUM_HEADS heads make one M operand, so one dot reads each
+    key tile for all heads of all rows. The ReLU is applied to each head
+    before the heads are added. Keys are unquantized, FP8 or MXFP4.
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    rows = pid_m * BMT + tl.arange(0, BMT)
+    rvalid = rows < num_tokens
+    request = tl.load(token_to_request_ptr + rows, mask=rvalid, other=-1)
+    request_ok = rvalid & (request >= 0) & (request < num_requests)
+    safe_request = tl.minimum(tl.maximum(request, 0), num_requests - 1)
+    position = tl.load(query_positions_ptr + rows, mask=rvalid, other=-1)
+    context = tl.load(context_lens_ptr + safe_request, mask=request_ok, other=0)
+    visible = tl.maximum(
+        0,
+        tl.minimum((position + 1) // COMPRESS_RATIO, context // COMPRESS_RATIO),
+    )
+    visible = tl.where(request_ok, visible, 0)
+    if pid_n == 0:
+        tl.store(visible_groups_ptr + rows, visible, mask=rvalid)
+        if row_starts_ptr is not None:
+            tl.store(row_starts_ptr + rows, 0, mask=rvalid)
+    # Each program scores the column tiles pid_n, pid_n + G, ... (G = grid dim 1).
+    tile_step = tl.num_programs(1)
+    num_tiles = tl.cdiv(tl.minimum(tl.max(visible, axis=0), num_columns), BN)
+    if pid_n >= num_tiles:
+        return
+
+    stacked = tl.arange(0, BMT * NUM_HEADS)
+    stacked_row = pid_m * BMT + stacked // NUM_HEADS
+    q_base = (
+        q_ptr
+        + stacked_row.to(tl.int64) * stride_q_token
+        + (stacked % NUM_HEADS) * stride_q_head
+    )[:, None]
+    dims = tl.arange(0, HEAD_DIM)
+    q_all = tl.load(
+        q_base + dims[None, :], mask=(stacked_row < num_tokens)[:, None], other=0.0
+    )
+
+    active = visible > 0
+    req_lo = tl.min(tl.where(active, safe_request, num_requests), axis=0)
+    req_hi = tl.max(tl.where(active, safe_request, -1), axis=0)
+    for tile in range(pid_n, num_tiles, tile_step):
+        columns = tile * BN + tl.arange(0, BN)
+        logical_page = columns // PAGE_SIZE
+        page_offset = columns % PAGE_SIZE
+        # The width is rounded up; columns < num_columns keeps table reads in bounds.
+        page_ok = (logical_page < PAGE_TABLE_WIDTH) & (columns < num_columns)
+        safe_page = tl.minimum(logical_page, PAGE_TABLE_WIDTH - 1)
+        score = tl.zeros((BMT, BN), dtype=tl.float32)
+        for req in range(req_lo, req_hi + 1):
+            physical = tl.load(
+                page_table_ptr + req.to(tl.int64) * stride_table_request + safe_page,
+                mask=page_ok,
+                other=-1,
+            )
+            key_ok = page_ok & (physical >= 0) & (physical < num_cache_pages)
+            safe_physical = tl.maximum(physical, 0).to(tl.int64)
+            k_rows = (
+                k_cache_ptr
+                + safe_physical * stride_cache_page
+                + page_offset * stride_cache_token
+            )
+            if KEY_FMT != 0:
+                scale_rows = (
+                    k_scale_ptr
+                    + safe_physical * stride_scale_page
+                    + page_offset * stride_scale_token
+                )
+            if KEY_FMT == 2:
+                keys = _load_fp4_keys(
+                    k_rows, scale_rows, key_ok, q_ptr.dtype.element_ty, HEAD_DIM, GROUP
+                )
+                keys_t = tl.trans(keys)
+            else:
+                keys_t = tl.load(
+                    k_rows[None, :] + dims[:, None], mask=key_ok[None, :], other=0.0
+                ).to(q_ptr.dtype.element_ty)
+            s = tl.dot(q_all, keys_t)
+            s = tl.sum(tl.reshape(tl.maximum(s, 0.0), (BMT, NUM_HEADS, BN)), axis=1)
+            if KEY_FMT == 1:
+                s *= tl.load(scale_rows, mask=key_ok, other=0.0)[None, :]
+            score = tl.where((safe_request == req)[:, None], s, score)
+        score = score / score_divisor
+        tl.store(
+            logits_ptr
+            + rows[:, None].to(tl.int64) * stride_logits_token
+            + columns[None, :],
+            tl.where(columns[None, :] < visible[:, None], score, -float("inf")),
+            mask=rvalid[:, None] & (columns < num_columns)[None, :],
+        )
 
 
 @triton.jit(repr=_expand_selected_groups_repr)
@@ -309,6 +680,8 @@ def _qsa_sparse_paged_gqa_kernel(
     q_ptr,
     k_cache_ptr,
     v_cache_ptr,
+    k_scale_ptr,
+    v_scale_ptr,
     logical_indices_ptr,
     block_table_ptr,
     token_to_request_ptr,
@@ -327,6 +700,9 @@ def _qsa_sparse_paged_gqa_kernel(
     stride_v_token,
     stride_v_head,
     stride_v_dim,
+    stride_scale_page,
+    stride_scale_token,
+    stride_scale_head,
     stride_indices_token,
     stride_indices_column,
     stride_table_request,
@@ -349,8 +725,14 @@ def _qsa_sparse_paged_gqa_kernel(
     BLOCK_D: tl.constexpr,
     KV_SPLITS: tl.constexpr = 1,
     SUB_GROUP: tl.constexpr = 0,
+    KV_FP8: tl.constexpr = False,
 ) -> None:
-    """Apply GQA over arbitrary logical tokens in separate paged BF16 K/V."""
+    """Apply GQA over arbitrary logical tokens in separate paged K/V, unquantized
+    or FP8.
+
+    FP8 K/V have one FP32 scale per (token, KV head). The key scale multiplies
+    the scores. The value scale multiplies the probabilities before PV.
+    """
     token = tl.program_id(0)
     part = tl.program_id(2)
     ACTIVE_SUB: tl.constexpr = SUB_GROUP if SUB_GROUP > 0 else GROUP_SIZE
@@ -441,7 +823,16 @@ def _qsa_sparse_paged_gqa_kernel(
             cache_modifier=".cg",
         )
 
-        scores = tl.where(valid[None, :], tl.dot(query, keys), -1.0e20)
+        qk = tl.dot(query, keys.to(query.dtype))
+        if KV_FP8:
+            scale_offset = (
+                safe_physical_page * stride_scale_page
+                + page_offset * stride_scale_token
+                + kv_head * stride_scale_head
+            )
+            qk *= tl.load(k_scale_ptr + scale_offset, mask=valid, other=0.0)[None, :]
+            value_scale = tl.load(v_scale_ptr + scale_offset, mask=valid, other=0.0)
+        scores = tl.where(valid[None, :], qk, -1.0e20)
         next_max = tl.maximum(running_max, tl.max(scores, axis=1))
         alpha = tl.math.exp2(running_max - next_max)
         probabilities = tl.where(
@@ -449,9 +840,10 @@ def _qsa_sparse_paged_gqa_kernel(
             tl.math.exp2(scores - next_max[:, None]),
             0.0,
         )
+        weights = probabilities * value_scale[None, :] if KV_FP8 else probabilities
         accumulator = tl.dot(
-            probabilities.to(values.dtype),
-            values,
+            weights.to(query.dtype),
+            values.to(query.dtype),
             acc=accumulator * alpha[:, None],
         )
         running_sum = running_sum * alpha + tl.sum(probabilities, axis=1)
