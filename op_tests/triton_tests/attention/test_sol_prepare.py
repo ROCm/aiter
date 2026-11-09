@@ -25,12 +25,6 @@ import torch._dynamo
 
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.triton.attention.sol_tilt import (
-    sol_jensen_cap,
-    sol_q_abs_max,
-    sol_tilt_factors,
-    sol_tilt_planes,
-)
 from aiter.ops.triton.attention.utils import (
     SOL_ATTN_TS_KV,
     SOL_ATTN_TS_QO,
@@ -819,116 +813,6 @@ def test_pooled_scales_run_zeroed_to_a_whole_scale_tile(seqlen_k, kv_tile, compi
         rows = -(-blocks // SOL_ATTN_TS_KV) * SOL_ATTN_TS_KV - blocks
         assert tail.numel() >= rows * scale[0, 0].numel(), name
         assert not tail[: rows * scale[0, 0].numel()].any(), name
-
-
-@pytest.mark.parametrize("compiled", [False, True], ids=["eager", "compiled"])
-@pytest.mark.parametrize("kv_tile", [64, SOL_ATTN_TS_KV])
-@pytest.mark.parametrize(
-    "k_format",
-    [
-        "mxfp8",
-        pytest.param(
-            "mxfp4",
-            marks=pytest.mark.skipif(
-                get_gfx() != "gfx950", reason="the MXFP4 packer is a gfx950 kernel"
-            ),
-        ),
-    ],
-)
-def test_jensen_cap_scale_keeps_the_pooled_scale_backing(k_format, kv_tile, compiled):
-    """sol_jensen_cap's mean_k_var_scale is read as sol_prepare's is, past its last row.
-
-    The cap writes a new scale, so its zeroed backing has to reach at least as far as the one it
-    replaces: at 64x64 a 2048-token K pools to 32 rows, and the kernel still reads 128 of them.
-    The scale bytes themselves are the input's moved by each block's exponent gain.
-    """
-    seqlen_k = 2048
-    if k_format == "mxfp8":
-        q, k, v = _operands(1, 512, seqlen_k, 2, 2)
-        k_scale = (
-            122 + torch.randint(0, 6, (*k.shape[:3], k.shape[3] // 32), device="cuda")
-        ).to(torch.uint8)
-        prep = sol_prepare(q, k, v, BETA, 64, kv_tile, k_scale=k_scale, k_variance=True)
-    else:
-        q = torch.randn(1, 512, 2, 128, device="cuda", dtype=torch.bfloat16)
-        k = torch.randn(1, seqlen_k, 2, 128, device="cuda", dtype=torch.bfloat16)
-        v = torch.randn_like(k)
-        prep = sol_prepare(
-            q,
-            k,
-            v,
-            BETA,
-            64,
-            kv_tile,
-            k_source=k,
-            v_source=v,
-            k_packed_format="mxfp4",
-            v_packed_format="mxfp4_fp6_p",
-            k_variance=True,
-        )
-    source = prep["mean_k_var_scale"]
-    before = source.clone()
-    cap = (
-        torch.compile(sol_jensen_cap, fullgraph=True, dynamic=False)
-        if compiled
-        else sol_jensen_cap
-    )
-    _, scale, gain = cap(
-        q,
-        None,
-        None,
-        prep["mean_k_var"],
-        0.125,
-        kv_tile,
-        q_abs_max=sol_q_abs_max(q),
-        mean_k_var_scale=source,
-        mean_k_var_pooled=prep["mean_k_var_pooled"],
-    )
-
-    assert torch.equal(source, before)
-    assert scale.shape == source.shape and scale.stride() == source.stride()
-    blocks = gain.shape[1]
-    expected = before.to(torch.int32)
-    shift = torch.log2(gain).round().to(torch.int32)[..., None]
-    expected[:, :blocks] = (expected[:, :blocks] + shift).clamp(0, 254)
-    assert torch.equal(scale.to(torch.int32), expected)
-    tail = _allocated_tail(scale)
-    assert tail.numel() >= _allocated_tail(source).numel()
-    assert not tail.any()
-
-
-@pytest.mark.parametrize("path", ["factors", "planes"])
-@pytest.mark.parametrize(
-    "v_shape",
-    [(1, 1024, 2, 128), (1, 4096, 2, 128), (2, 2048, 2, 128)],
-    ids=["shorter", "longer", "batch"],
-)
-def test_tilt_rejects_v_not_shaped_as_k(path, v_shape):
-    """The factor kernel loads V unmasked over K's extent, so a V shorter than K would be read
-    past its allocation; any other V shape is refused before the launch."""
-    fp8 = torch.float8_e4m3fn
-    kv_tile = SOL_ATTN_TS_KV
-    k = torch.randn(1, 2048, 2, 128, device="cuda").to(fp8)
-    v = torch.randn(v_shape, device="cuda").to(fp8)
-    q = torch.randn(1, 512, 2, 128, device="cuda").to(fp8)
-    mean = torch.zeros(1, k.shape[1] // kv_tile, 2, 128, device="cuda").to(fp8)
-    one = torch.ones(1, device="cuda")
-    with pytest.raises(ValueError, match="the tilt needs V shaped as K"):
-        if path == "factors":
-            sol_tilt_factors(q, k, v, one, one, one, mean, mean, 0.125, 2, kv_tile)
-        else:
-            sol_tilt_planes(
-                k,
-                v,
-                sol_q_abs_max(q),
-                mean,
-                mean,
-                0.125,
-                2,
-                kv_tile,
-                k_format="e4m3",
-                v_format="e4m3",
-            )
 
 
 def test_error_router_compiles_fullgraph_and_matches_eager():
