@@ -465,7 +465,7 @@ class FlyQuickAllReduce:
                     cu_count=self._cu_count,
                     block=b,
                 )
-                if tile_atoms != DEFAULT_ATOMS:
+                if self.algorithm == "mesh":
                     grid = min(grid, self._lds_resident_grid(b, tile_atoms))
                 shared_grid = torch.tensor(grid, dtype=torch.int64)
                 dist.all_reduce(shared_grid, op=dist.ReduceOp.MIN, group=self.group)
@@ -499,8 +499,9 @@ class FlyQuickAllReduce:
                 )
 
     def _lds_resident_grid(self, block: int, tile_atoms: int) -> int:
-        """Largest persistent grid whose workgroups all fit in the CUs' LDS,
-        counting the fused RMSNorm's partial sums."""
+        """Largest persistent mesh grid whose workgroups all fit in the CUs' LDS,
+        counting the fused RMSNorm's partial sums so one bound serves both
+        builds. ``clamp_grid_cap``'s residency table only counts VGPRs."""
         wg_lds = mesh_lds_bytes(
             world_size=self.world_size,
             block=block,
