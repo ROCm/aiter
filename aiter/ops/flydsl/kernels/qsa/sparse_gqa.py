@@ -1152,24 +1152,6 @@ def build_qsa_sparse_gqa_module(
                     Float32,
                 )
             next_acc = []
-            # D=128 decode on gfx950 miscompiles the first unrolled 16x16x16
-            # PV MFMA under AMD clang 23.0.0git 46fcb339, HIP 7.14.60850,
-            # torch 2.12.0+rocm7.14.0, FlyDSL 0.4.0. That chunk is NaN or
-            # about 1e36 and every later chunk matches. One unused MFMA
-            # occupies the bad slot. Decode never reads this scratch; the
-            # store only keeps the call from being deleted.
-            # test_paged_gqa_d128_decode_matches_oracle fails if it is
-            # removed while this compiler stands. The scratch is the extra
-            # v_mfma_f32_16x16x16_bf16 in that kernel's ISA.
-            if const_expr(decode_tr_pv and head_dim == 128):
-                junk = pv_mfma(
-                    fx.Vector.filled(4, 0.0, BFloat16),
-                    p_vecs[0],
-                    fx.Vector(state[0]) * alpha4,
-                )
-                storage.partial.view(fx.make_layout(num_waves, 1))[wave] = junk[
-                    0
-                ].bitcast(Int32)
             for c in range_constexpr(out_chunks):
                 d = wave * Int32(head_dim // num_waves) + Int32(c * 16) + lane_m
                 acc4 = fx.Vector(state[c]) * alpha4
