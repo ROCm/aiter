@@ -17,7 +17,7 @@ This is the explicit FlyDSL-side test complementing the routed a16w4 rows of
 API.
 
 Run:
-    pytest op_tests/flydsl_tests/test_flydsl_moe_a16wfp4.py -q
+    python3 -m pytest -q op_tests/test_flydsl_moe_a16wfp4.py
 """
 
 import pytest
