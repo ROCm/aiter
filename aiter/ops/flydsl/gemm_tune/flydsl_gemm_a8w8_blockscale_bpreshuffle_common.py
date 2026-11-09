@@ -185,47 +185,55 @@ def split_k_buffers_fit(m: int, n: int, tile_m: int, tile_n: int, split_k: int) 
     )
 
 
-# Performance heuristics apply only to the reduced tuning search.
-_DECODE_M_MAX = 256
-_LARGE_M_TILE_ALLOWLIST = {  # M >= 8192
-    (32, 128, 128),
-    (64, 128, 128),
-    (64, 128, 256),
-    (64, 256, 128),
-    (128, 128, 128),
-    (128, 256, 128),
-}
-_MID_M_TILE_DENYLIST = {  # 1024 <= M < 8192
-    (64, 64, 128),
-    (64, 64, 256),
-    (256, 128, 128),
-}
+# These heuristics prune the tuning search only. They do not affect correctness
+# or runtime dispatch. Full-space sweeps of Qwen shapes on MI300X (M 1 to 16384)
+# kept the best kernel, or one within noise of it.
+# Tiles of 128 rows or more are skipped up to this M.
+_TALL_TILE_M_MAX = 256
+# Async copy is timed only up to this M; a full search over M 384 to 1024
+# found no consistent async win.
+_ASYNC_COPY_M_MAX = 256
+# A 256-row tile's two A buffers fill the 64 KiB LDS, leaving one workgroup per CU.
+_MAX_TILE_M = 128
+# A 64x64 tile does half the MFMA work of a 64x128 tile per A row it loads.
+_WIDE_64_TILE_MIN_M = 1024
+# A split leaves the ping-pong K loop nothing to prefetch with one K tile.
+_SPLIT_K_MIN_K_TILES = 2
+_SPLIT_K_MAX_TILE_M = 64
+# A split grid stops at four workgroups per CU.
+_SPLIT_K_MAX_WORKGROUPS_PER_CU = 4
+
+
+def _min_tile_m(m: int) -> int:
+    """Smallest tile_m worth timing at M; each M tile rereads the whole B panel."""
+    return 64 if m >= 8192 else 32 if m >= 2048 else MFMA_MN
 
 
 def passes_tuning_heuristics(
-    config: kernelInstance, m: int, n: int, cu_num: int
+    config: kernelInstance, m: int, n: int, k: int, cu_num: int
 ) -> bool:
     """Apply the reduced-search heuristics to an already-valid configuration."""
-    tile_shape = (config.tile_m, config.tile_n, config.tile_k)
     unsplit_workgroups = -(-m // config.tile_m) * (n // config.tile_n)
     total_workgroups = unsplit_workgroups * config.split_k
     min_workgroups = max(4, min(16, n // 64))
     if total_workgroups < min_workgroups:
         return False
-    if m <= _DECODE_M_MAX:
-        if config.tile_m >= 128:
-            return False
-    elif config.use_async_copy:
+    if m <= _TALL_TILE_M_MAX and config.tile_m >= 128:
         return False
-    if m >= 8192 and tile_shape not in _LARGE_M_TILE_ALLOWLIST:
+    if m > _ASYNC_COPY_M_MAX and config.use_async_copy:
         return False
-    if 1024 <= m < 8192 and tile_shape in _MID_M_TILE_DENYLIST:
+    if not _min_tile_m(m) <= config.tile_m <= _MAX_TILE_M:
+        return False
+    if m >= _WIDE_64_TILE_MIN_M and config.tile_m >= 64 and config.tile_n < 128:
         return False
     if config.split_k > 1:
+        # Split only a grid that leaves CUs idle.
+        k_tiles_per_split = k // config.tile_k // config.split_k
         return (
-            config.tile_m <= 64
+            config.tile_m <= _SPLIT_K_MAX_TILE_M
             and unsplit_workgroups < cu_num
-            and total_workgroups <= 4 * cu_num
+            and k_tiles_per_split >= _SPLIT_K_MIN_K_TILES
+            and total_workgroups <= _SPLIT_K_MAX_WORKGROUPS_PER_CU * cu_num
         )
     return True
 
@@ -306,6 +314,6 @@ def candidate_kernel_ids(
             continue
         if not split_k_buffers_fit(m, n, config.tile_m, config.tile_n, config.split_k):
             continue
-        if full_space or passes_tuning_heuristics(config, m, n, cu_num):
+        if full_space or passes_tuning_heuristics(config, m, n, k, cu_num):
             kernel_ids.append(kernel_id)
     return kernel_ids
