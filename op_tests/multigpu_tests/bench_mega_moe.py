@@ -283,8 +283,8 @@ def shuffle_group(w1_qt, w1_s, w2_qt, w2_s, spec, n_experts):
         gate_up=True,
     )
     w2_ss = moe_shuffle_scale(w2_s.contiguous(), experts_cnt=n_experts)
-    moe_shuffle_weight_iod(w1_a, w1_ss, n_experts)
-    moe_shuffle_weight_iod(w2_a, w2_ss, n_experts, gemm=2)
+    moe_shuffle_weight_iod(w1_a, w1_ss, n_experts, gate_up=True)
+    moe_shuffle_weight_iod(w2_a, w2_ss, n_experts)
     if spec["key"] == "a4w4_mxfp4":
         w1_a = w1_a.view(dtypes.fp4x2)
         w2_a = w2_a.view(dtypes.fp4x2)

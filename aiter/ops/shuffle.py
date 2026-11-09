@@ -446,13 +446,14 @@ def moe_shuffle_weight_iod(
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
     experts_cnt: int | None = None,
-    gemm: int = 1,
+    gate_up: bool = False,
 ):
     """IOD-placed copy of a shuffled MoE weight (``AITER_MOE_LOC=1``).
 
-    Call once per layer and GEMM at weight-load time, after
-    ``moe_shuffle_weight`` / ``moe_shuffle_scale`` (GUGU gate_up for
-    ``gemm=1``, the down weight for ``gemm=2``) and outside CUDA graph capture.
+    Call once per layer and stage at weight-load time, after
+    ``moe_shuffle_weight`` / ``moe_shuffle_scale`` with the same ``gate_up``
+    (the GUGU stage1 weight, or the stage2 down weight) and outside CUDA graph
+    capture.
     On gfx1250 it probes the IOD home of fresh pages and re-lays the weight and
     its scale so that each workgroup of that GEMM reads its own IOD's memory;
     the grouped GEMM then picks the copy up by the tensors' addresses.
@@ -464,9 +465,7 @@ def moe_shuffle_weight_iod(
 
     if not iod_locality.enabled():
         return None
-    if gemm not in (1, 2):
-        raise ValueError(f"gemm must be 1 or 2, got {gemm}")
-    place = iod_locality.place_w13 if gemm == 1 else iod_locality.place_w2
+    place = iod_locality.place_w13 if gate_up else iod_locality.place_w2
     return place(weight, weight_scale, experts_cnt)
 
 
