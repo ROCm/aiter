@@ -158,6 +158,12 @@ def _register(weight, scale, experts_cnt, tile):
     N = int(weight.shape[-2])
     K = int(weight.shape[-1]) * 2
     if not supported(N, K, *tile):
+        logger.warning(
+            "[iod_locality] weight %s has no placed layout for %dx%d tiles; "
+            "it stays unplaced",
+            tuple(weight.shape),
+            *tile,
+        )
         return None
     w = weight.detach().contiguous().view(torch.uint8)
     sc = scale.detach().contiguous().reshape(-1).view(torch.int32)
