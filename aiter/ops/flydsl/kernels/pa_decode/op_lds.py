@@ -1364,6 +1364,8 @@ class Gfx1250Memory:
             if full_tile
             else (token_base < ctx.planned_context).select(token_base, fx.Int32(0))
         )
+        if const_expr(cached_page is None):
+            cached_page = self._preloaded_page(token_base, 0, full_tile)
         if const_expr(cached_page is not None):
             page = cached_page
         else:
@@ -1702,6 +1704,21 @@ class Gfx1250Memory:
                 kv_off + t.k_bytes + d * t.v_stride + token * t.elem_bytes,
             )
 
+    def _preloaded_page(self, token_base, j, full_tile):
+        """Preloaded page128 id of a run's first stage, or None.
+
+        Fixed-run clusters load their first stage's ids with the context
+        length (``ctx.stage_pages``: the stage's pages, then token 0's).
+        """
+        stage_pages = getattr(self.ctx, "stage_pages", None)
+        if const_expr(stage_pages is None or not self.t.cluster_runs):
+            return None
+        if const_expr(full_tile):
+            return stage_pages[j]
+        return (token_base < self.ctx.planned_context).select(
+            stage_pages[j], stage_pages[-1]
+        )
+
     @flyc.jit
     def stage_page128_pair(self, token_base, buffer, full_tile):
         """Stage two page128 pages; each keeps the one-page LDS layout 16 KiB apart."""
@@ -1711,10 +1728,12 @@ class Gfx1250Memory:
         scales = kv_off + t.k_bytes + t.v_bytes
         for p in range_constexpr(2):
             base = token_base + p * 128
-            safe = (base < ctx.planned_context).select(base, fx.Int32(0))
-            page = fx.Int32(
-                table[ctx.planned_seq * ctx.max_blocks_per_seq + safe // 128]
-            )
+            page = self._preloaded_page(base, p, full_tile)
+            if const_expr(page is None):
+                safe = (base < ctx.planned_context).select(base, fx.Int32(0))
+                page = fx.Int32(
+                    table[ctx.planned_seq * ctx.max_blocks_per_seq + safe // 128]
+                )
             if const_expr(full_tile):
                 self.stage_page_tdm(base, kv_off + p * 128 * t.head_dim, True, page)
             else:

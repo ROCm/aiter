@@ -880,6 +880,33 @@ _COMMON_CASES = [
     ),
 ]
 _FP8_CASES = _COMMON_CASES + [
+    # Page128 clusters under a length bound give each CTA a fixed run of
+    # tiles: bound rows split evenly, shorter rows leave CTAs idle, and rows
+    # within one tile store directly. A nine-tile bound takes nine CTAs.
+    (
+        "cluster16-runs-page128",
+        {
+            "group_size": 16,
+            "block_size": 128,
+            "lengths": (8192, 0, 1, 129, 1000, 4097, 7777, 8191),
+            "max_partitions": 16,
+            "capture": True,
+            "cluster": 16,
+            "cluster_runs": True,
+        },
+    ),
+    (
+        "cluster16-runs-page128-kv2",
+        {
+            "kv_heads": 2,
+            "group_size": 8,
+            "block_size": 128,
+            "lengths": (2048, 300, 0, 2049),
+            "max_partitions": 16,
+            "cluster": 9,
+            "cluster_runs": True,
+        },
+    ),
     (
         "packed-mtp4",
         {
@@ -1648,6 +1675,8 @@ def _check_pipe_policy(pa, case, arch, compile_kwargs):
         assert compile_kwargs[-1]["cluster_seqs"] == case["cluster_seqs"]
     if case["cluster_steps"] is not None and arch == "gfx1250":
         assert compile_kwargs[-1]["cluster_steps"] == case["cluster_steps"]
+    if case["cluster_runs"] is not None and arch == "gfx1250":
+        assert compile_kwargs[-1]["cluster_runs"] == case["cluster_runs"]
     if case["pipe"]:
         # The cache key ends with (D256_PIPE, staged page ids).
         schedule_kwargs = dict(compile_kwargs[-1])
@@ -1656,6 +1685,7 @@ def _check_pipe_policy(pa, case, arch, compile_kwargs):
         schedule_kwargs.pop("cluster_merge", None)
         schedule_kwargs.pop("cluster_seqs", None)
         schedule_kwargs.pop("cluster_steps", None)
+        schedule_kwargs.pop("cluster_runs", None)
         pipe, staged = PaDecodeSchedule.select(**schedule_kwargs).cache_key[-2:]
         assert pipe == (arch == "gfx950")
         if pipe:
@@ -1769,6 +1799,7 @@ def _run_pa_decode_case(case, device, monkeypatch):
             "cluster": None,
             "cluster_seqs": None,
             "cluster_steps": None,
+            "cluster_runs": None,
         },
         **case,
     )

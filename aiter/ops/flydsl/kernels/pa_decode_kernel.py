@@ -183,6 +183,7 @@ def compile_pa_decode_tile(
     cluster_merge: int = 0,
     cluster_seqs: int = 1,
     cluster_steps: bool = False,
+    cluster_runs: bool = False,
 ):
     """Select and cache a PA-decode kernel and launch wrapper.
 
@@ -280,6 +281,7 @@ def compile_pa_decode_tile(
             cluster_merge=cluster_merge,
             cluster_seqs=cluster_seqs,
             cluster_steps=cluster_steps,
+            cluster_runs=cluster_runs,
             # Wide page16 stages leave room for two CTAs per CU: larger
             # grids (sparse prefill) keep narrower stages.
             small_grid=grid_ctas <= 2 * num_compute_units,
@@ -571,6 +573,7 @@ def compile_gfx1250_pa_decode(
     cluster_merge=0,
     cluster_seqs=1,
     cluster_steps=False,
+    cluster_runs=False,
     small_grid=False,
     wide_pages=False,
     one_cta_grid=False,
@@ -586,7 +589,9 @@ def compile_gfx1250_pa_decode(
     barrier. ``work`` then holds the context lengths. ``cluster_steps`` instead
     gives CTA p steps [p * 16 / P, (p + 1) * 16 / P) of block tables at most
     16 steps wide, ignoring the plan's task counts, with partials at slot
-    sequence * P + p. In both modes a sequence's single task stores final rows
+    sequence * P + p. ``cluster_runs`` (page128) likewise gives CTA p tiles
+    [p * run_tiles, (p + 1) * run_tiles), ``run_tiles`` sized by the host from
+    the length bound. In all modes a sequence's single task stores final rows
     directly, and empty sequences clear their rows.
     ``merge_partitions`` partial storage must be eight-byte aligned for its
     device-scope atomic accesses; the host wrapper falls back for offset views.
@@ -617,6 +622,7 @@ def compile_gfx1250_pa_decode(
         cluster_seqs=cluster_seqs if cluster_merge else 1,
         latency_grid=one_cta_grid,
         cluster_steps=cluster_steps,
+        cluster_runs=cluster_runs,
     )
     if compute_dtype not in ("fp8", "bf16"):
         raise ValueError(f"Unsupported gfx1250 PA compute dtype: {compute_dtype}")
@@ -703,6 +709,7 @@ def compile_gfx1250_pa_decode(
         reduce_info: fx.Pointer,
         output: fx.Pointer,
         counters: fx.Pointer,
+        run_tiles: fx.Int32,
     ):
         _ = tag
 
@@ -779,6 +786,37 @@ def compile_gfx1250_pa_decode(
                 task_begin = step_bounds[0] // KV_COMPUTE_BLOCK
                 task_end = (step_bounds[1] + KV_COMPUTE_BLOCK - 1) // KV_COMPUTE_BLOCK
                 active = part < count
+            elif const_expr(t.cluster_runs):
+                # CTA p takes tiles [p run_tiles, (p + 1) run_tiles), a run the
+                # host sizes from the length bound, so its first stage's page
+                # ids load with the context length rather than after it. Only
+                # the active branch reads them, and the compiler would sink
+                # their loads into it; readfirstlane keeps them here.
+                first_tile = part * run_tiles
+                tbl = fx.recast_iter(fx.Int32, table)
+                row = seq * max_blocks
+                page = first_tile * (KV_COMPUTE_BLOCK // t.block_size)
+                stage_pages = [
+                    fx.Int32(
+                        fx.rocdl.readfirstlane(
+                            T.i32, tbl[row + fx.min(page + j, max_blocks - 1)]
+                        )
+                    )
+                    for j in range_constexpr(t.TOKENS // t.block_size)
+                ] + [fx.Int32(fx.rocdl.readfirstlane(T.i32, tbl[row]))]
+                # Keep the loads ahead of the length's wait.
+                fx.rocdl.sched_barrier(0)
+                length = fx.max(task_context, fx.Int32(0))
+                tiles = (length + KV_COMPUTE_BLOCK - 1) // KV_COMPUTE_BLOCK
+                count = fx.min(
+                    (tiles + run_tiles - 1) // run_tiles, fx.Int32(t.cluster_merge)
+                )
+                first = seq * t.cluster_merge
+                task_slot = first + part
+                task_seq = seq
+                task_begin = first_tile
+                task_end = fx.min(first_tile + run_tiles, tiles)
+                active = first_tile < tiles
             else:
                 # Scalar loads return out of order, so a use waits for every
                 # load issued before it: issue both before either is used.
@@ -876,7 +914,7 @@ def compile_gfx1250_pa_decode(
                 ctx.task_count = count
                 ctx.output_ptr = output
                 ctx.step_bounds = step_bounds
-                if const_expr(t.cluster_steps):
+                if const_expr(t.cluster_steps or t.cluster_runs):
                     ctx.stage_pages = stage_pages
             if const_expr(t.bf16_wave_query_tiles):
                 Gfx1250Bf16WavePipeline(ctx).run()
@@ -938,6 +976,7 @@ def compile_gfx1250_pa_decode(
         output: fx.Pointer,
         reduce_info: fx.Pointer,
         counters: fx.Pointer,
+        run_tiles: fx.Int32,
         stream: fx.Stream,
     ):
         _ = tag
@@ -971,6 +1010,7 @@ def compile_gfx1250_pa_decode(
             reduce_info,
             output,
             counters,
+            run_tiles,
             value_attrs=(
                 {"rocdl.cluster_dims": f"{t.cluster_merge * t.cluster_seqs},1,1"}
                 if t.cluster_merge

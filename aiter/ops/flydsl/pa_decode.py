@@ -1032,6 +1032,24 @@ def pa_decode(
         and CLUSTER_PARTITIONS % cluster_merge == 0
         and num_seqs * cluster_merge <= work_plan.capacity
     )
+    # FP8 page128 clusters given a length bound instead give CTA p tiles
+    # [p * run, (p + 1) * run), runs splitting the bound evenly, so they too
+    # load their first page ids with the context length (decode at 8K, 1-8
+    # rows: 3-5% faster). The bound's longest rows split as the planner
+    # would; shorter rows use fewer CTAs. Runs beyond four tiles gain nothing.
+    bound_tiles = -(-schedule_context_length // KV_COMPUTE_BLOCK)
+    cluster_runs = bool(
+        cluster_merge
+        and not cluster_steps
+        and cluster_seqs == 1
+        and block_size == 128
+        and kv_dtype == "fp8"
+        and max_context_length is not None
+        and sliding_window == 0
+        and num_seqs * cluster_merge <= work_plan.capacity
+        and bound_tiles <= 4 * cluster_merge
+    )
+    run_tiles = -(-bound_tiles // cluster_merge) if cluster_runs else 0
 
     # Bound byte offsets as well as element indices for 16-bit BF16 caches.
     cache_extent = max(
@@ -1068,6 +1086,7 @@ def pa_decode(
             cluster_merge=cluster_merge,
             cluster_seqs=cluster_seqs,
             cluster_steps=cluster_steps,
+            cluster_runs=cluster_runs,
         )
 
     total_rows = query_length * query_group_size
@@ -1134,6 +1153,7 @@ def pa_decode(
                 if merged
                 else flyc.from_c_void_p(fx.Int32, 0)
             ),
+            run_tiles,
         )
     with torch.cuda.device(dev):
         s = torch.cuda.current_stream(dev)

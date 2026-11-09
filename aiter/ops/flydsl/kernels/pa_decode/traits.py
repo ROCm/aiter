@@ -849,6 +849,9 @@ class Gfx1250Traits:
     # Cluster CTAs take fixed runs of steps across the block table's width and
     # keep their partials at slot sequence * cluster_merge + part.
     cluster_steps: bool = False
+    # Page128 cluster CTAs take fixed runs of tiles sized by the host, with
+    # partials at slot sequence * cluster_merge + part.
+    cluster_runs: bool = False
 
     WAVE = 32
     NWARP = 4

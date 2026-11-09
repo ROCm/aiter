@@ -1632,6 +1632,9 @@ class Gfx1250WavePipeline:
         # the LDS regions are disjoint.
         q_tiles = self.mem.load_query()
         self.mem.stage_kv(begin, fx.Int32(0))
+        if const_expr(t.cluster_runs):
+            # Preloaded page ids cover the first step only.
+            ctx.stage_pages = None
         self.mem.store_query(q_tiles)
         gpu.barrier()
         # Wave 2 g + p holds tiles 2 g + p (slot 0, the one it stores) and
@@ -1845,7 +1848,9 @@ class Gfx1250Pipeline:
         if const_expr(early_query):
             q_tiles = self.mem.load_query()
         self.mem.stage_kv(begin, fx.Int32(0))
-        if const_expr(t.cluster_steps and t.cluster_merge < CLUSTER_PARTITIONS):
+        if const_expr(
+            t.cluster_runs or (t.cluster_steps and t.cluster_merge < CLUSTER_PARTITIONS)
+        ):
             # Preloaded page ids cover the first of several steps only.
             ctx.stage_pages = None
         if const_expr(t.early_second_stage):  # noqa: SIM102
