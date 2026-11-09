@@ -492,7 +492,7 @@ def _run_grouped_via_fused_moe(
         gate_up=True,
     )
     w2_scale = moe_shuffle_scale(w2_scale_raw.contiguous(), experts_cnt=experts)
-    moe_shuffle_weight_iod(w1_grouped, w1_scale, experts)
+    moe_shuffle_weight_iod(w1_grouped, w1_scale, experts, gate_up=True)
 
     if data_format == "a4w4":
         w1_arg = w1_grouped.view(dtypes.fp4x2)
