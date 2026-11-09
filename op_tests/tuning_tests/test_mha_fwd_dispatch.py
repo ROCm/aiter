@@ -185,12 +185,13 @@ class TestMhaFwdTable(_Table):
             _tuned_row("ck", mode="batch"),
             _tuned_row("ck", has_physical_padding=1),
             _tuned_row("ck", has_block_table=1),
+            _tuned_row("ck", gpu_model="unknown"),
             _tuned_row("asm_v3"),
         ]
         with self.assertLogs("aiter", level="WARNING") as logs:
             table = policy._load_mha_fwd_tuning_table(self.use(rows))
         self.assertEqual(list(table.values()), ["asm_v3"])
-        self.assertEqual(len(logs.records), 6)
+        self.assertEqual(len(logs.records), 7)
 
     def test_a_duplicate_key_keeps_the_first_row(self):
         rows = [_tuned_row("ck"), _tuned_row("asm_v3")]
@@ -251,7 +252,8 @@ class TestMhaFwdLookup(_Table):
     def test_rows_for_other_hardware_or_head_dims_skip_the_key(self):
         for row in (
             _tuned_row("ck", hdim_q=128, hdim_v=128),
-            _tuned_row("ck", gpu_model="mi300x"),
+            _tuned_row("ck", cu_num=80),
+            _tuned_row("ck", gfx="gfx950", cu_num=256),
         ):
             with self.subTest(row=row):
                 policy.clear_mha_fwd_tuning_cache()
@@ -262,6 +264,59 @@ class TestMhaFwdLookup(_Table):
                 ):
                     self.assertIsNone(policy.get_mha_fwd_tuned_backend(**_key_args()))
                 key.assert_not_called()
+
+    def test_a_model_without_rows_uses_another_models_with_its_gfx_and_cu_num(self):
+        self.use(
+            [
+                _tuned_row("opus", gpu_model="mi308x"),
+                _tuned_row("ck", gpu_model="mi300x"),
+            ]
+        )
+        with _on_hardware(), self.assertLogs("aiter", level="INFO") as logs:
+            self.assertEqual(policy.get_mha_fwd_tuned_backend(**_key_args()), "ck")
+            self.assertEqual(policy.get_mha_fwd_tuned_backend(**_key_args()), "ck")
+        self.assertEqual(len(logs.records), 1)
+        self.assertIn("tuned on mi300x", logs.output[0])
+
+    def test_rows_without_a_model_serve_a_model_without_rows_of_its_own(self):
+        cases = {
+            "before another model's": ([("opus", "mi300x"), ("ck", "")], "ck"),
+            "after its own": ([("ck", ""), ("opus", "mi325x")], "opus"),
+        }
+        for name, (rows, backend) in cases.items():
+            with self.subTest(name):
+                policy.clear_mha_fwd_tuning_cache()
+                self.use([_tuned_row(b, gpu_model=model) for b, model in rows])
+                with _on_hardware():
+                    self.assertEqual(
+                        policy.get_mha_fwd_tuned_backend(**_key_args()), backend
+                    )
+
+    def test_a_table_without_the_model_column_serves_every_model(self):
+        path = self.use([])
+        row = _tuned_row("opus")
+        del row["gpu_model"]
+        with open(path, "w", encoding="utf-8", newline="") as file:
+            writer = csv.DictWriter(file, fieldnames=list(row))
+            writer.writeheader()
+            writer.writerow(row)
+        with _on_hardware():
+            self.assertEqual(policy.get_mha_fwd_tuned_backend(**_key_args()), "opus")
+
+    def test_a_model_with_rows_of_its_own_uses_only_those(self):
+        self.use(
+            [
+                _tuned_row("opus", gpu_model="mi300x"),
+                _tuned_row("ck"),
+                _tuned_row("opus", gpu_model="mi300x", total_q=2048, max_seqlen_q=2048),
+            ]
+        )
+        q = torch.empty((2048, 12, 192), dtype=torch.bfloat16)
+        with _on_hardware():
+            self.assertEqual(policy.get_mha_fwd_tuned_backend(**_key_args()), "ck")
+            self.assertIsNone(
+                policy.get_mha_fwd_tuned_backend(**_key_args(q=q, max_seqlen_q=2048))
+            )
 
     def test_padded_or_paged_calls_skip_the_key(self):
         self.use([_tuned_row("opus")])

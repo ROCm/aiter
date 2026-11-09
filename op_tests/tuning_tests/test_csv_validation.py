@@ -221,8 +221,6 @@ class TestCSVValidation(unittest.TestCase):
 
         df = self._load_csv("mha_fwd")
         self.assertEqual(list(df.columns), list(MHA_FWD_RUNTIME_CSV_FIELDS))
-        self.assertFalse(df["gpu_model"].isna().any())
-        self.assertFalse(df["gpu_model"].astype(str).str.strip().eq("").any())
         self.assertFalse(df.duplicated(subset=list(MHA_FWD_TUNING_KEY_FIELDS)).any())
 
         path = os.path.join(CONFIGS_DIR, "tuned_mha_fwd.csv")

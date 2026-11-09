@@ -12,7 +12,7 @@ from __future__ import annotations
 import csv
 import functools
 import os
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass, fields
 from typing import Any
 
@@ -172,7 +172,8 @@ class MhaFwdProblem:
     def __post_init__(self) -> None:
         if not self.gfx.startswith("gfx"):
             raise ValueError(f"invalid MHA architecture {self.gfx!r}")
-        if not self.gpu_model or self.gpu_model == "unknown":
+        # Blank: valid for every model with this gfx and cu_num.
+        if self.gpu_model == "unknown":
             raise ValueError("gpu_model must identify the measured GPU SKU")
         if self.cu_num <= 0:
             raise ValueError("cu_num must be positive")
@@ -247,7 +248,7 @@ def _load_mha_fwd_tuning_table(path: str) -> dict[tuple[str, ...], str]:
         missing = [
             field
             for field in (*MHA_FWD_TUNING_KEY_FIELDS, "backend")
-            if field not in (reader.fieldnames or ())
+            if field not in (reader.fieldnames or ()) and field != "gpu_model"
         ]
         if missing:
             logger.warning("%s is missing MHA columns %s; ignoring it", path, missing)
@@ -257,7 +258,7 @@ def _load_mha_fwd_tuning_table(path: str) -> dict[tuple[str, ...], str]:
                 backend = str(row["backend"]).strip()
                 if backend not in MHA_FWD_BACKENDS:
                     raise ValueError(f"unknown backend {backend!r}")
-                problem = MhaFwdProblem.from_mapping(row)
+                problem = MhaFwdProblem.from_mapping({"gpu_model": "", **row})
                 key = problem.key()
             except Exception as error:  # noqa: BLE001
                 logger.warning("%s:%d: skipping MHA tuned row: %s", path, line, error)
@@ -296,18 +297,56 @@ def _mha_fwd_coarse_keys(path: str) -> frozenset[tuple[str, ...]]:
     )
 
 
+_MODEL_AT = TUNING_HARDWARE_FIELDS.index("gpu_model")
+
+
+def _without_model(prefix: tuple[str, ...]) -> tuple[str, ...]:
+    return prefix[:_MODEL_AT] + prefix[_MODEL_AT + 1 :]
+
+
+def mha_fwd_serving_hardware(
+    prefixes: Collection[tuple[str, ...]], local: tuple[str, ...]
+) -> tuple[str, ...] | None:
+    """Of the (gfx, gpu_model, cu_num) ``prefixes`` a table has rows for, the
+    one whose rows serve the ``local`` device: its own model's, else those
+    with a blank model, else another model's with the same gfx and cu_num,
+    so a model without rows is no worse off than a table without the model
+    key. Of several other models the alphabetically first serves; None
+    without any."""
+    blank = local[:_MODEL_AT] + ("",) + local[_MODEL_AT + 1 :]
+    for prefix in (local, blank):
+        if prefix in prefixes:
+            return prefix
+    others = sorted(p for p in prefixes if _without_model(p) == _without_model(local))
+    return others[0] if others else None
+
+
+@functools.lru_cache(maxsize=8)
+def _mha_fwd_serving_hardware(
+    path: str, local: tuple[str, ...]
+) -> tuple[str, ...] | None:
+    prefix = mha_fwd_serving_hardware(_mha_fwd_hardware_prefixes(path), local)
+    if prefix is not None and prefix[_MODEL_AT] not in ("", local[_MODEL_AT]):
+        logger.info(
+            "MHA fwd: no tuned rows for gpu_model %s; using the rows tuned on %s",
+            local[_MODEL_AT],
+            prefix[_MODEL_AT],
+        )
+    return prefix
+
+
 def clear_mha_fwd_tuning_cache() -> None:
     """Re-read the tuned table (and its path) on the next call."""
     _mha_fwd_table_path.cache_clear()
     _load_mha_fwd_tuning_table.cache_clear()
     _mha_fwd_hardware_prefixes.cache_clear()
     _mha_fwd_coarse_keys.cache_clear()
+    _mha_fwd_serving_hardware.cache_clear()
 
 
-def _mha_fwd_has_rows(prefix: tuple[str, ...] | None = None) -> bool:
-    """Whether the table has rows at all, or for one (gfx, gpu_model, cu_num)."""
-    prefixes = _mha_fwd_hardware_prefixes(_mha_fwd_table_path())
-    return bool(prefixes) if prefix is None else prefix in prefixes
+def _mha_fwd_has_rows() -> bool:
+    """Whether the table has any rows."""
+    return bool(_mha_fwd_hardware_prefixes(_mha_fwd_table_path()))
 
 
 def _mha_fwd_has_coarse_rows(coarse: tuple[str, ...]) -> bool:
@@ -414,10 +453,9 @@ def get_mha_fwd_tuned_backend(**key_args) -> str | None:
     ):
         return None
     q, v = key_args["q"], key_args["v"]
-    prefix = _mha_fwd_local_hardware(
-        q.device.index if q.device.index is not None else 0
-    )
-    if not prefix or not _mha_fwd_has_rows(prefix):
+    local = _mha_fwd_local_hardware(q.device.index if q.device.index is not None else 0)
+    prefix = _mha_fwd_serving_hardware(_mha_fwd_table_path(), local) if local else None
+    if prefix is None:
         return None
     coarse = (
         *prefix,
