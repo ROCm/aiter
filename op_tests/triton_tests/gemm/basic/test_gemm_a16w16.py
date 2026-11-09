@@ -5,6 +5,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a16w16_atomic import _get_config
 from aiter.ops.triton.gemm.basic.gemm_a16w16 import _is_gluon_available, gemm_a16w16
 from aiter.ops.triton.gemm.basic.gemm_a16w16_atomic import gemm_a16w16_atomic
 from op_tests.triton_tests.utils.types import str_to_torch_dtype
@@ -224,37 +225,42 @@ def test_gemm_a16_w16_atomic(M: int, N: int, K: int, output):
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
 
 
-# Split-K configs whose split, cdiv(K, NUM_KSPLIT), is not a multiple of BLOCK_SIZE_K
-# (the first two are buckets of the gfx950 N=256 K=6144 file).
+# Each value makes cdiv(K, NUM_KSPLIT) odd, so the split is never a multiple of
+# BLOCK_SIZE_K. The last case puts the split below BLOCK_SIZE_K, the regime of the
+# gfx950 M_LEQ_1 bucket.
 @pytest.mark.parametrize(
-    "M, N, K, block_m, block_n, block_k, num_ksplit",
+    "M, N, K, num_ksplit, split_below_block_k",
     [
-        (1, 256, 6144, 16, 16, 512, 16),
-        (32, 256, 6144, 16, 16, 256, 16),
-        (16, 896, 3584, 16, 16, 256, 8),
-        (33, 1000, 777, 32, 32, 64, 4),
+        (1, 256, 6144, 5, False),
+        (32, 256, 6144, 5, False),
+        (16, 896, 3584, 3, False),
+        (33, 1000, 777, 2, False),
+        (33, 1000, 777, 20, True),
     ],
 )
 def test_gemm_a16_w16_atomic_uneven_split(
-    M: int, N: int, K: int, block_m, block_n, block_k, num_ksplit
+    M: int, N: int, K: int, num_ksplit: int, split_below_block_k: bool
 ):
     torch.cuda.empty_cache()
+
+    try:
+        base_config, _ = _get_config(M, N, K)
+    except AssertionError:
+        pytest.skip("this architecture ships no gemm_a16w16_atomic config")
+
+    config = {**base_config, "NUM_KSPLIT": num_ksplit}
+    split = -(-K // num_ksplit)
+    # The split is odd and BLOCK_SIZE_K is a power of two, so the case is always an
+    # uneven split. Which side of BLOCK_SIZE_K the split falls on does depend on the
+    # config, so check it: a config change must not silently drop a regime.
+    assert (split < config["BLOCK_SIZE_K"]) == split_below_block_k, (
+        f"split {split} against BLOCK_SIZE_K {config['BLOCK_SIZE_K']}: this "
+        "architecture's config no longer covers the intended regime"
+    )
 
     x, w, _, _out_dtype, _y = generate_gemm_a16w16_inputs(
         M, N, K, torch.bfloat16, output=False
     )
-    config = {
-        "BLOCK_SIZE_M": block_m,
-        "BLOCK_SIZE_N": block_n,
-        "BLOCK_SIZE_K": block_k,
-        "GROUP_SIZE_M": 1,
-        "NUM_KSPLIT": num_ksplit,
-        "num_warps": 4,
-        "num_stages": 2,
-        "waves_per_eu": 0,
-        "matrix_instr_nonkdim": 16,
-        "cache_modifier": None,
-    }
 
     torch_out = F.linear(x, w, bias=None)
     triton_out = gemm_a16w16_atomic(x, w, torch.float32, config=config).to(
