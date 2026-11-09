@@ -7,6 +7,7 @@ import torch
 import triton
 
 from aiter.ops.triton._triton_kernels.attention.unified_attention import (
+    attention_output_gate_rows,
     kernel_unified_attention_2d,
     kernel_unified_attention_3d,
     reduce_segments,
@@ -69,6 +70,15 @@ _GFX12_ROUTING_KEYS = (
     "PREFILL_MIN_KV_PER_PRGM",
     "PREFILL_FILL_TIERS",
     "PREFILL_REF_BLOCK_M",
+)
+# gfx1250: the output gate inside the 2d kernel's epilogue (its gate tile TDM-loaded
+# before the attention loop) from this longest context on; below it, and with
+# AITER_UA2D_FUSED_EPILOGUE=0, the gate is the separate attention_output_gate_rows
+# launch after the 2d kernel. Short prefills (478-8192 new tokens, no prefix) measured
+# 2-6 us slower with the gate in the epilogue than with the separate launch.
+_UA2D_FUSED_EPILOGUE = os.environ.get("AITER_UA2D_FUSED_EPILOGUE", "1") == "1"
+_UA2D_FUSED_EPILOGUE_MIN_KV = int(
+    os.environ.get("AITER_UA2D_FUSED_EPILOGUE_MIN_KV", "16384")
 )
 
 DEVICE_ARCH = arch_info.get_arch()
@@ -347,6 +357,13 @@ def unified_attention(
     force_fp8_pv_on_fp4_kv_cache: bool = False,
     # backend
     backend: str | None = None,  # "triton" | "gluon"
+    # Epilogue of the Qwen3-Next / Qwen3.5 attention: out * sigmoid(output_gate),
+    # output_gate [num_tokens, num_query_heads * head_size_v] (row-strided, e.g. a
+    # slice of the QKV-gate projection), bitwise the unfused sigmoid-mul. With
+    # output_rows ([R] int32/int64), out has R rows: out[r] is query token
+    # output_rows[r] (every token still attends and its KV is read as usual).
+    output_gate: torch.Tensor | None = None,
+    output_rows: torch.Tensor | None = None,
 ):
     assert causal, "Only causal attention is supported"
 
@@ -372,6 +389,24 @@ def unified_attention(
 
     if sinks is not None:
         assert sinks.shape[0] == num_query_heads, "Sinks must be num_query_heads size"
+
+    epilogue = output_gate is not None or output_rows is not None
+    final_out = out
+    if epilogue:
+        assert not skip_reduce, "the output epilogue needs the reduce"
+        assert out.dtype in (torch.bfloat16, torch.float16) and output_scale is None
+        assert out.stride(-1) == 1 and out.stride(-2) == out.shape[-1]
+        if output_gate is not None:
+            assert output_gate.dim() == 2 and output_gate.stride(1) == 1
+            assert output_gate.shape == (num_tokens, num_query_heads * out.shape[-1])
+            assert output_gate.dtype == out.dtype
+        if output_rows is not None:
+            assert output_rows.dim() == 1 and output_rows.is_contiguous()
+            assert out.shape[0] == output_rows.shape[0]
+            # The kernels write every token; the epilogue picks the rows.
+            out = torch.empty(
+                (num_tokens, *out.shape[1:]), dtype=out.dtype, device=out.device
+            )
 
     BLOCK_SCALES_SIZE = 16
     if q_dtype == torch.uint8:
@@ -514,15 +549,26 @@ def unified_attention(
         # The gfx1250 Gluon 2d kernel only handles bf16/fp8 q+kv (with optional
         # sinks / output_scale / shuffled_kv_cache)
         use_gluon_2d = is_2d_gluon_available(params, backend)
+        # the gate in the gfx1250 2d kernel's own epilogue (no row selection)
+        fused_2d_gate = (
+            output_gate is not None
+            and use_gluon_2d
+            and DEVICE_ARCH == "gfx1250"
+            and _2d_gate_fusable(params, output_rows)
+        )
         if use_gluon_2d:
             if DEVICE_ARCH in ("gfx1250", "gfx1250-strict"):
-                _unified_attention_2d_gfx1250(params)
+                _unified_attention_2d_gfx1250(
+                    params, output_gate=output_gate if fused_2d_gate else None
+                )
             elif DEVICE_ARCH == "gfx950":
                 _unified_attention_2d_gfx950(params)
             else:
                 assert False, f"No gluon subwrapper for {DEVICE_ARCH}"
         else:
             _unified_attention_2d_triton(params)
+        if epilogue and not fused_2d_gate:
+            _output_epilogue(out, final_out, output_gate, output_rows)
     else:
         use_gluon_3d = is_3d_gluon_available(params, backend)
         split_params = params
@@ -616,6 +662,9 @@ def unified_attention(
             )
 
         if NUM_SEGMENTS == 1:
+            if epilogue:
+                _output_epilogue(segm_output, final_out, output_gate, output_rows)
+                return final_out
             return segm_output
         elif skip_reduce:
             # with a sliding window the segments carve only the window's tiles
@@ -623,9 +672,11 @@ def unified_attention(
             return segm_output, segm_max, segm_expsum
 
         # Gluon reduce (one workgroup/token, in-wave segment merge); valid for all-decode with small split counts, else the Triton reduce_segments.
+        # The output epilogue is the Triton reduce's.
         use_gluon_reduce = (
             is_reduce_gluon_available(params, NUM_SEGMENTS, backend)
             and backend == "gluon"
+            and not epilogue
         )
         if use_gluon_reduce:
             if DEVICE_ARCH in ("gfx1250", "gfx1250-strict"):
@@ -641,14 +692,55 @@ def unified_attention(
                 assert False, f"No gluon subwrapper for {DEVICE_ARCH}"
         else:
             _reduce_segments_triton(
-                params,
+                params._replace(out=final_out),
                 segm_output,
                 segm_max,
                 segm_expsum,
                 NUM_SEGMENTS,
                 TILE_SIZE,
+                output_gate=output_gate,
+                output_rows=output_rows,
             )
-    return out
+    return final_out
+
+
+def _2d_gate_fusable(params: _UAParams, output_rows) -> bool:
+    """Whether the gfx1250 2d kernel applies the output gate in its epilogue: every row
+    (no row selection), a power-of-2 GQA group whose output columns split into
+    128-column groups, and a context from _UA2D_FUSED_EPILOGUE_MIN_KV on."""
+    nq = params.num_queries_per_kv
+    return (
+        output_rows is None
+        and _UA2D_FUSED_EPILOGUE
+        and int(params.max_seqlen_k) >= _UA2D_FUSED_EPILOGUE_MIN_KV
+        and nq & (nq - 1) == 0
+        and (nq * params.head_size_v) % 256 == 0
+        and params.head_size == params.head_size_v
+    )
+
+
+def _output_epilogue(out, final_out, output_gate, output_rows):
+    """The output epilogue of reduce_segments for an attention that ends without it:
+    final_out[r] = out[rows[r]] * sigmoid(gate[rows[r]]), in one launch."""
+    width = out.shape[-2] * out.shape[-1]
+    num_rows = final_out.shape[0]
+    if num_rows == 0:
+        return
+    block = min(1024, triton.next_power_of_2(width))
+    attention_output_gate_rows[(num_rows, triton.cdiv(width, block))](
+        final_out,
+        out,
+        output_gate,
+        output_rows,
+        out.stride(0),
+        output_gate.stride(0) if output_gate is not None else 0,
+        final_out.stride(0),
+        WIDTH=width,
+        BLOCK=block,
+        num_warps=4,
+        # the roundings of the production _gated_pointwise_kernel, which runs unfused
+        enable_fp_fusion=False,
+    )
 
 
 def is_2d_gluon_available(params: _UAParams, backend: str):
@@ -893,15 +985,20 @@ def _reduce_segments_triton(
     segm_expsum,
     NUM_SEGMENTS,
     TILE_SIZE,
+    output_gate=None,
+    output_rows=None,
 ):
     head_size_padded = triton.next_power_of_2(params.head_size)
     config = get_unified_attention_config("reduce", params, backend="triton")
+    num_rows = params.num_tokens if output_rows is None else output_rows.shape[0]
+    if num_rows == 0:
+        return
     v_head_size_padded = triton.next_power_of_2(params.head_size_v)
     num_d_blocks = triton.cdiv(
         v_head_size_padded, config.get("BLOCK_D") or v_head_size_padded
     )
 
-    reduce_segments[(params.num_tokens, params.num_query_heads, num_d_blocks)](
+    reduce_segments[(num_rows, params.num_query_heads, num_d_blocks)](
         output_ptr=params.out,
         segm_output_ptr=segm_output,
         segm_max_ptr=segm_max,
@@ -922,6 +1019,9 @@ def _reduce_segments_triton(
         TILE_SIZE=TILE_SIZE,
         SLIDING_WINDOW=params.sliding_window,
         BLOCK_Q=None,
+        gate_ptr=output_gate,
+        gate_stride_0=output_gate.stride(0) if output_gate is not None else None,
+        rows_ptr=output_rows,
         **config,
         enable_fp_fusion=True,
     )
@@ -957,7 +1057,7 @@ _reduce_segments_{arch}(
 """
 
 
-def _unified_attention_2d_gfx1250(params: _UAParams):
+def _unified_attention_2d_gfx1250(params: _UAParams, output_gate=None):
     """
     Internal wrapper for the gfx1250 gluon kernel.
 
@@ -1100,8 +1200,15 @@ def _unified_attention_2d_gfx1250(params: _UAParams):
         KV_NVFP4=kv_nvfp4,
         V_NVFP4=params.v_cache_dtype == torch.uint8,
         query_scales_ptr=params.q_scales,
-        query_scales_stride_0=params.q_scales.stride(0) if params.q_scales is not None else 0,
-        query_scales_stride_1=params.q_scales.stride(1) if params.q_scales is not None else 0,
+        query_scales_stride_0=(
+            params.q_scales.stride(0) if params.q_scales is not None else 0
+        ),
+        query_scales_stride_1=(
+            params.q_scales.stride(1) if params.q_scales is not None else 0
+        ),
+        gate_ptr=output_gate,
+        gate_stride_0=output_gate.stride(0) if output_gate is not None else None,
+        GATE=output_gate is not None,
         enable_fp_fusion=True,
     )
 

@@ -1035,8 +1035,19 @@ def reduce_segments(
     SEGMENT_BLOCK: tl.constexpr = 0,  # segments per merge step, 0 = all at once
     BLOCK_D: tl.constexpr = 0,  # head-dim slice per program (grid axis 2), 0 = all
     SLIDING_WINDOW: tl.constexpr = 0,  # int, the producer's; carves its window
+    # Epilogue (Qwen3-Next / Qwen3.5 attention output gate): out * sigmoid(gate),
+    # gate [num_tokens, num_query_heads * V_HEAD_SIZE], rounded as the unfused ops.
+    # (None without the gate: a constexpr, so the ungated kernel keeps its arguments)
+    gate_ptr=None,
+    gate_stride_0=None,
+    # Output row r is query token rows[r] (only those rows are reduced), or None.
+    rows_ptr=None,
 ):
-    query_token_idx = tl.program_id(0)
+    out_row_idx = tl.program_id(0)
+    if rows_ptr is not None:
+        query_token_idx = tl.load(rows_ptr + out_row_idx).to(tl.int32)
+    else:
+        query_token_idx = out_row_idx
     query_head_idx = tl.program_id(1)
 
     out_scale = None
@@ -1086,6 +1097,17 @@ def reduce_segments(
         v_dim_mask = offs_vd < V_HEAD_SIZE
     else:
         v_dim_mask = tl.full((1,), 1, dtype=tl.int1)
+
+    if gate_ptr is not None:
+        # issued before the segment loads, so its latency hides under them
+        gate = tl.load(
+            gate_ptr
+            + query_token_idx.to(tl.int64) * gate_stride_0
+            + query_head_idx * V_HEAD_SIZE
+            + offs_vd,
+            mask=v_dim_mask,
+            other=0.0,
+        )
 
     if single_tile:
         # load segment maxima
@@ -1174,12 +1196,45 @@ def reduce_segments(
     if output_ptr.type.element_ty.is_fp8():
         acc = tl.clamp(acc, FP8_MIN, FP8_MAX)
 
+    result = acc.to(output_ptr.type.element_ty)
+    if gate_ptr is not None:
+        gate = tl.sigmoid(gate.to(tl.float32)).to(gate.dtype).to(tl.float32)
+        result = (result.to(tl.float32) * gate).to(output_ptr.type.element_ty)
+
     # write result
     output_offset = (
-        query_token_idx * output_stride_0 + query_head_idx * output_stride_1 + offs_vd
+        out_row_idx * output_stride_0 + query_head_idx * output_stride_1 + offs_vd
     )
     tl.store(
         output_ptr + output_offset,
-        acc.to(output_ptr.type.element_ty),
+        result,
         mask=v_dim_mask,
     )
+
+
+@triton.jit
+def attention_output_gate_rows(
+    out_ptr,  # [num_rows, width]
+    x_ptr,  # [num_tokens, width] (row stride x_stride_0)
+    gate_ptr,  # [num_tokens, width] (row stride gate_stride_0), or None
+    rows_ptr,  # [num_rows] (out row r is token rows[r]), or None
+    x_stride_0: tl.int64,
+    gate_stride_0: tl.int64,
+    out_stride_0: tl.int64,
+    WIDTH: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """The epilogue of reduce_segments for attention that ends without it (2d, or 3d
+    with one segment): out[r] = x[rows[r]] * sigmoid(gate[rows[r]])."""
+    out_row = tl.program_id(0)
+    token = out_row.to(tl.int64)
+    if rows_ptr is not None:
+        token = tl.load(rows_ptr + out_row).to(tl.int64)
+    cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    mask = cols < WIDTH
+    x = tl.load(x_ptr + token * x_stride_0 + cols, mask=mask)
+    if gate_ptr is not None:
+        gate = tl.load(gate_ptr + token * gate_stride_0 + cols, mask=mask)
+        gate = tl.sigmoid(gate.to(tl.float32)).to(gate.dtype).to(tl.float32)
+        x = (x.to(tl.float32) * gate).to(out_ptr.type.element_ty)
+    tl.store(out_ptr + out_row.to(tl.int64) * out_stride_0 + cols, x, mask=mask)
