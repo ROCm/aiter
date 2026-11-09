@@ -552,6 +552,7 @@ def create_topk_per_row_decode_adaptive_kernel(
         f"{'_es' if early_stop else ''}"
         f"{'_ses' if short_early_stop else ''}"
         f"{'_ord' if ordered else ''}"
+        f"{'_compact' if compact else ''}"
         f"{'_cert' if histogram_certificate else ''}"
         f"{'_packed' if packed_rows else ''}"
     )
