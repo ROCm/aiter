@@ -4688,6 +4688,7 @@ def mha_paged_fwd_prefill(
         return_lse=return_lse,
         out=out,
         kv_last_page_lens=kv_last_page_lens,
+        sink_size=int(window_size[2]) if len(window_size) > 2 else 0,
         sink_ptr=sink,
     )
 

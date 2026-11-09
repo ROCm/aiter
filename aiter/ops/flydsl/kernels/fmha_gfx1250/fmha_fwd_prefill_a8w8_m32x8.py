@@ -2944,6 +2944,7 @@ def build_fmha_fwd_prefill_a8w8_m32x8(
             "window_right": window_right,
             "q_dtype": Q_ELEM_DTYPE,
             "kv_dtype": KV_ELEM_DTYPE,
+            "paged": None,
         }
         # Exactly one core reaches the binary: the host decides from the shape (bshd) or
         # from max_seqlen_k (thd) whether every WG sees a single KV tile.
@@ -3701,9 +3702,7 @@ def flash_attn_paged_a8w8_m32x8(
     assert (
         q.dtype in SUPPORTED_TORCH_DTYPES and k.dtype in SUPPORTED_TORCH_DTYPES
     ), f"Expected 8-bit q/kv, got {q.dtype}/{k.dtype}"
-    assert (
-        k.dtype == q.dtype and v.dtype == q.dtype
-    ), f"q/k/v dtype must match, got {q.dtype}/{k.dtype}/{v.dtype}"
+    assert v.dtype == k.dtype, f"k/v dtype must match, got {k.dtype}/{v.dtype}"
     q_dtype_str = _TORCH_IN_DTYPES[q.dtype]
     kv_dtype_str = _TORCH_IN_DTYPES[k.dtype]
     qk_hdim = q.shape[-1]

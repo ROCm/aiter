@@ -863,6 +863,16 @@ def flydsl_flash_attn_paged_fwd(
         return None
     if any(t.stride(-1) != 1 for t in (q, k, v)):
         return None
+    _metadata = (qo_indptr, kv_indptr, kv_page_indices, kv_last_page_lens)
+    if any(
+        t is None
+        or t.dtype != torch.int32
+        or t.dim() != 1
+        or t.stride(0) != 1
+        or t.device != q.device
+        for t in _metadata
+    ):
+        return None
     if (
         sink is not None
         and torch.is_tensor(sink)
