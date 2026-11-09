@@ -35,7 +35,7 @@ import functools
 
 import torch
 
-from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 
 from .kernels.kernels_common import LOG2E, ceildiv, get_warp_size
 from .kernels.qsa.indexer_select import (
@@ -1095,8 +1095,10 @@ def flydsl_qsa_paged_gqa_supported(
         return (
             f"page_table must be int32 [n_req, n_pages], got {tuple(page_table.shape)}"
         )
+    # The tile does not depend on the CU count, and this gate runs with no
+    # device. The split count is discarded.
     block_n, block_threads, _ = _launch_config(
-        int(q.shape[0]), int(indices.shape[1]), n_kv_heads, head_dim
+        int(q.shape[0]), int(indices.shape[1]), n_kv_heads, head_dim, num_cus=1
     )
     coverage = _paged_gqa_coverage_reason(head_dim, block_n, block_threads)
     if coverage is not None:
@@ -1158,12 +1160,16 @@ def flydsl_qsa_paged_gqa(
     out: torch.Tensor | None = None,
     softmax_scale: float | None = None,
     workspace: tuple[torch.Tensor, torch.Tensor] | None = None,
+    num_cus: int | None = None,
 ) -> torch.Tensor:
     """Write sparse GQA ``o [M, Hq, D]`` from paged K/V.
 
     ``workspace`` is ``(partial_out, partial_lse)`` for a split launch.
     ``None`` allocates that pair. A one-split launch writes ``out``
-    directly and does not read ``workspace``.
+    directly and does not read ``workspace``. ``num_cus`` is the CU count
+    the prefill split target uses. ``None`` reads ``get_cu_num()``. A
+    caller that compiles more than one arch in one process passes the
+    count for that arch, because ``get_cu_num()`` is cached for the process.
     """
     reason = flydsl_qsa_paged_gqa_supported(q, k_cache, v_cache, indices, page_table)
     if reason is not None:
@@ -1209,7 +1215,11 @@ def flydsl_qsa_paged_gqa(
     page_size = k_cache.shape[1]
     use_k32 = arch == "gfx950"
     n_sel = int(indices.shape[1])
-    block_n, block_threads, n_splits = _launch_config(rows, n_sel, n_kv_heads, head_dim)
+    if num_cus is None:
+        num_cus = int(get_cu_num())
+    block_n, block_threads, n_splits = _launch_config(
+        rows, n_sel, n_kv_heads, head_dim, num_cus
+    )
     if n_splits == 1:
         # The split kernel stores straight into out. A caller workspace
         # is not a second buffer on this path.

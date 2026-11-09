@@ -211,7 +211,9 @@ def _compile_sparse_gqa(job):
             indices = torch.zeros(rows, width, dtype=i32, device=device)
             indices[:, -1] = -1
             token_to_req = torch.zeros(rows, dtype=i32, device=device)
-            flydsl_qsa_paged_gqa(q, k_cache, v_cache, indices, table, token_to_req)
+            flydsl_qsa_paged_gqa(
+                q, k_cache, v_cache, indices, table, token_to_req, num_cus=cu_num
+            )
 
 
 def replay(job: dict) -> None:

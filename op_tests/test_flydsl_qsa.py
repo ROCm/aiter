@@ -51,11 +51,12 @@ import torch.nn.functional as F
 
 import aiter
 from aiter import dtypes
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.ops.flydsl import qsa_paged
 from aiter.ops.flydsl.kernels.kernels_common import get_warp_size
 from aiter.ops.flydsl.kernels.qsa.indexer_select import _K
 from aiter.ops.flydsl.kernels.qsa.sparse_gqa import (
+    _PREFILL_WGS_PER_CU,
     _launch_config,
     build_qsa_sparse_gqa_module,
 )
@@ -2698,6 +2699,42 @@ def test_paged_gqa_merge_covers_every_head_dim_slice():
             raise AssertionError(f"D={d} split merge diverged (err={err})")
 
 
+def test_paged_gqa_prefill_splits_follow_cu_count():
+    """Prefill splits are four workgroups per CU. Decode stays on the gfx950 ladder.
+
+    64 programs is past the decode band, so the split count is
+    ``4 * num_cus // 64`` until the selected-tile cap. 256 CUs keeps the
+    old ``1024 // 64`` count. 304 and 80 move. A one-program decode row
+    stays at 128 splits on each of those counts. Width 2048 leaves the
+    tile cap above both counts.
+    """
+    if _PREFILL_WGS_PER_CU != 4:
+        raise AssertionError(
+            f"prefill target is {_PREFILL_WGS_PER_CU} per CU, expected 4"
+        )
+    width, head_dim = 2048, 256
+    expected = {256: 16, 304: 19, 80: 5}
+    for num_cus, splits in expected.items():
+        block_n, threads, n_splits = _launch_config(64, width, 1, head_dim, num_cus)
+        if (block_n, threads, n_splits) != (32, 128, splits):
+            raise AssertionError(
+                f"{num_cus} CUs launched {(block_n, threads, n_splits)}, "
+                f"expected (32, 128, {splits})"
+            )
+        _, _, decode_splits = _launch_config(1, width, 1, head_dim, num_cus)
+        if decode_splits != 128:
+            raise AssertionError(
+                f"decode on {num_cus} CUs launched {decode_splits} splits, expected 128"
+            )
+    try:
+        _launch_config(64, width, 1, head_dim, 0)
+    except ValueError as exc:
+        if "num_cus" not in str(exc):
+            raise
+    else:
+        raise AssertionError("num_cus 0 was accepted")
+
+
 def test_paged_gqa_d128_decode_matches_oracle():
     """D=128 decode matches the fp32 oracle for group 16 and for one split.
 
@@ -2714,7 +2751,7 @@ def test_paged_gqa_d128_decode_matches_oracle():
     # (Hq, Hkv, rows, width, expected splits)
     cases = ((16, 1, 2, 64, 4), (16, 1, 2, 8, 1), (8, 1, 2, 8, 1))
     for hq, hkv, m, width, splits in cases:
-        _, _, n_splits = _launch_config(m, width, hkv, 128)
+        _, _, n_splits = _launch_config(m, width, hkv, 128, get_cu_num())
         if n_splits != splits:
             raise AssertionError(
                 f"Hq={hq} W={width} launched {n_splits} splits, expected {splits}"
@@ -3288,7 +3325,9 @@ def test_paged_gqa_large_negative_score_keeps_weight():
         indices = torch.full((1, width), -1, dtype=dtypes.i32, device=device)
         if not masked:
             indices[0, 0] = 0
-        _, _, n_splits = _launch_config(1, width, gqa.kv_heads, gqa.head_dim)
+        _, _, n_splits = _launch_config(
+            1, width, gqa.kv_heads, gqa.head_dim, get_cu_num()
+        )
         if (width == 16 and n_splits != 1) or (width == 2048 and n_splits < 2):
             raise AssertionError(
                 f"width {width} launched {n_splits} splits on {get_gfx()}"

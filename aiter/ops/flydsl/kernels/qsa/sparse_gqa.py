@@ -46,12 +46,13 @@ from aiter.ops.flydsl.kernels.kernels_common import (
 )
 from aiter.ops.flydsl.kernels.tensor_shim import buf_base_i64, buf_copy_atom
 
-# 256 CUs on gfx950 times four BN32 prefill workgroups each. Unlike the decode
-# bands below this one does not move with head_dim: halving D halves the LDS
-# tile, so residency alone predicts eight, but 8 per CU measured slower than 4
-# at D=128 on every M from 16 to 512. Whatever sets this number, it is not the
-# LDS footprint, and it is the same number at both head widths.
-_PREFILL_WGS = 256 * 4
+# BN32 prefill workgroups per CU. Unlike the decode bands below, this does
+# not move with head_dim: halving D halves the LDS tile, so residency alone
+# predicts eight, but 8 per CU measured slower than 4 at D=128 on every M
+# from 16 to 512. Whatever sets this number, it is not the LDS footprint,
+# and it is the same number at both head widths. The launch multiplies it
+# by the device CU count, so 256 CUs on gfx950 still targets 1024 workgroups.
+_PREFILL_WGS_PER_CU = 4
 # Decode workgroup width. The BN16 LDS maps are expressed per (token, D-chunk)
 # rather than per lane, so this is free to move between 128 and 256. BN16 is a
 # single subtile, so qk_split never engages and every wave recomputes the whole
@@ -72,7 +73,8 @@ _TINY_SPLITS = 128
 # head_dim and not the query count. Each ladder is exact for its own D and
 # within ~1% on the other shapes, where the two split counts measured tied.
 # Note the 64-split ceilings are 12 and 16, not 12 and 24 -- the doubling is
-# the direction, not the law.
+# the direction, not the law. This ladder is the gfx950 fit. gfx942 uses it
+# unchanged until a sweep on that arch moves the ceilings.
 _NARROW_HEAD_DIM = 128
 _DECODE_BANDS_NARROW = (4, 16)
 _DECODE_BANDS_WIDE = (2, 12)
@@ -104,9 +106,15 @@ def _ds_write2st64_b64(addr, data0, data1, offset0=0, offset1=16):
 
 
 def _launch_config(
-    rows: int, n_sel: int, n_kv_heads: int, head_dim: int
+    rows: int, n_sel: int, n_kv_heads: int, head_dim: int, num_cus: int
 ) -> tuple[int, int, int]:
-    """Return ``(BLOCK_N, threads, splits)`` using the tuned policy."""
+    """Return ``(BLOCK_N, threads, splits)`` using the tuned policy.
+
+    ``num_cus`` sizes the prefill split target. The decode ladder does not
+    read it. Callers pass the count; this does not query the device.
+    """
+    if num_cus < 1:
+        raise ValueError(f"num_cus must be positive, got {num_cus}")
     base_programs = rows * n_kv_heads
     # Split bands follow head width: D<=128 uses (4, 16), and wider D uses
     # (2, 12). The launch takes 128 splits, then 64, then 32, as
@@ -128,11 +136,11 @@ def _launch_config(
     #
     # Split so the grid lands on four workgroups per CU. Past that point
     # splitting buys no extra parallelism and still pays merge and
-    # address-chase duplication. See ``_PREFILL_WGS``: four is measured, and
-    # it is not the LDS residency limit it was once read as.
+    # address-chase duplication. See ``_PREFILL_WGS_PER_CU``: four is
+    # measured, and it is not the LDS residency limit it was once read as.
     else:
         block_n, threads = 32, 128
-        target_splits = max(1, _PREFILL_WGS // base_programs)
+        target_splits = max(1, (_PREFILL_WGS_PER_CU * num_cus) // base_programs)
 
     tiles = max(1, ceildiv(n_sel, block_n))
     max_useful_splits = 1 << (tiles.bit_length() - 1)
