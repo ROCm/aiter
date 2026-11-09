@@ -27,6 +27,7 @@ from aiter import dtypes, gemm_a16w16_asm, hipb_create_extension, hipb_mm, logge
 from aiter.jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
+from aiter.ops import gemm_a16w16_selector
 from aiter.ops.gemm_op_common import get_padded_m
 
 try:
@@ -236,6 +237,10 @@ def get_GEMM_A16W16_config(
     )
     cu_num = get_cu_num()
     gfx = get_gfx()
+    if config is None and gemm_a16w16_selector.enabled():
+        config = gemm_a16w16_selector.select(
+            M, N, K, bias, dtype, otype, scaleAB, bpreshuffle, gfx, cu_num, _run_config
+        )
     if config is None:
         default_config = {}
         if bpreshuffle:
@@ -673,6 +678,12 @@ solMap = {
     "flydsl": flydsl_gemm,
     "opus": opus_gemm,
 }
+
+
+def _run_config(config, inp, weights):
+    return solMap[config["libtype"]](
+        inp, weights, config["solidx"], None, inp.dtype, config=config
+    )
 
 
 class TunedGemm:
