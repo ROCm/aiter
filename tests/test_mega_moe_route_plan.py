@@ -292,7 +292,7 @@ def test_ep4_dispatch_cus_cover_two_expert_waves():
 
 @pytest.mark.parametrize("mtpr", (256, 512))
 def test_small_m_token_rows_live_in_the_payload_arena(mtpr):
-    """dedup_rows token rows sit past the fixed slots of the shared payload arena, inside u32 buffer offsets."""
+    """dedup_rows token rows sit past the fixed slots of the payload arena, inside u32 buffer offsets."""
     from aiter.ops.flydsl.kernels.mega_moe.mega_moe_small_m import (
         _TOKEN_REGION_END,
         SmallMRuntime,
@@ -314,3 +314,20 @@ def test_small_m_token_rows_live_in_the_payload_arena(mtpr):
     assert ep8[1] == 48 * (8 * mtpr) + 256
     assert ep4[1] == 96 * (4 * mtpr) + 256 + 4 * mtpr
     assert ep4[1] * ep4[2] <= _TOKEN_REGION_END
+
+
+def test_route_payload_sharing():
+    """The EP8 fused runtimes end with an all-rank barrier, so they share the instance's payload arena; the EP4
+    small- (tok_done) and large-input (comb_tok_wait) runtimes can end before their peers, so they keep their own."""
+    from aiter.ops.flydsl.kernels.mega_moe.mega_moe_large_m import LargeMRuntime
+    from aiter.ops.flydsl.kernels.mega_moe.mega_moe_small_m import SmallMRuntime
+
+    ep8 = dict(world_size=8, model_dim=7168, inter_dim=3072, experts=384, topk=6)
+    ep4 = dict(world_size=4, model_dim=5120, inter_dim=2304, experts=384, topk=6)
+    for mtpr in DEFAULT_SMALL_M_MTPRS:
+        assert SmallMRuntime.ends_all_ranks(max_tok_per_rank=mtpr, **ep8)
+        assert not SmallMRuntime.ends_all_ranks(max_tok_per_rank=mtpr, **ep4)
+    for mtpr in large_m_mtprs_for(world_size=8, model_dim=7168, inter_dim=3072):
+        assert LargeMRuntime.ends_all_ranks(max_tok_per_rank=mtpr, **ep8)
+    for mtpr in large_m_mtprs_for(world_size=4, model_dim=5120, inter_dim=2304):
+        assert not LargeMRuntime.ends_all_ranks(max_tok_per_rank=mtpr, **ep4)

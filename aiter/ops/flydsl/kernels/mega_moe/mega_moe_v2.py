@@ -197,7 +197,7 @@ class MegaMoEV2:
                 mega_scheme=mega_scheme,
                 swiglu_limit=self.swiglu_limit,
                 state_slots=self.large_m_state_slots,
-                payload_arena=self._payload_arena,
+                payload_arena=self._payload_arena if self._large_m_shares_payload else None,
                 s1_output_arena=self._s1_output_arena,
                 combine_input=self._combine_input,
                 # The large-input route quantizes its bf16 input into the staged quant buffers.
@@ -210,8 +210,9 @@ class MegaMoEV2:
         if self._bundle_plan.small_m_mtprs:
             from .mega_moe_small_m import SmallMRuntime
 
-            # Own protocol state and combine output; payload, GEMM1-output and
-            # combine-input storage come from the shared arenas; weights are shared by pointer.
+            # Own protocol state and combine output; GEMM1-output storage, and the payload and
+            # combine input of a runtime in _small_m_shared, come from the shared arenas;
+            # weights are shared by pointer.
             self._small_m_runtimes = [
                 SmallMRuntime(
                     rank=self.rank,
@@ -227,9 +228,9 @@ class MegaMoEV2:
                     w2_scale=self.w2_scale,
                     max_tok_per_rank=m,
                     swiglu_limit=self.swiglu_limit,
-                    payload_arena=self._payload_arena,
+                    payload_arena=self._payload_arena if m in self._small_m_shared else None,
                     s1_output_arena=self._s1_output_arena,
-                    combine_input=self._combine_input,
+                    combine_input=self._combine_input if m in self._small_m_shared else None,
                 )
                 for m in self._bundle_plan.small_m_mtprs
             ]
@@ -401,10 +402,19 @@ class MegaMoEV2:
         this data before it reads it and finishes reading it before the closing
         all-rank barrier of its call, so routes reuse one copy; each keeps its
         own counters, epochs and flags. Sized for the largest route.
+
+        A fused runtime whose launch can end before its peers finished reading
+        their payload (EP4 V4.1-Flash: comb_tok_wait, tok_done) keeps its own
+        payload: a rank that left it early may already dispatch its next call,
+        of any route, into its peers. The small-input runtimes also keep their
+        own combine input, whose rows their combine leaves poisoned
+        (bf16_head_tokens). The GEMM1 output is rank-local, so it stays shared.
         """
         self._payload_arena = None
         self._s1_output_arena = None
         self._combine_input = None
+        self._large_m_shares_payload = False
+        self._small_m_shared = ()
         plan = self._bundle_plan
         if not plan.small_m_mtprs and not plan.large_m:
             return
@@ -431,22 +441,34 @@ class MegaMoEV2:
             experts=self.experts,
             topk=self.topk,
         )
+        # Capacities of the routes sharing the payload arena, and of every route.
+        route_capacities = list(capacities)
         if plan.large_m:
             from .mega_moe_large_m import LargeMRuntime
 
-            capacities.append(
-                LargeMRuntime.payload_capacity(max_tok_per_rank=self.mtpr, **fused)
+            capacity = LargeMRuntime.payload_capacity(max_tok_per_rank=self.mtpr, **fused)
+            route_capacities.append(capacity)
+            self._large_m_shares_payload = LargeMRuntime.ends_all_ranks(
+                max_tok_per_rank=self.mtpr, **fused
             )
+            if self._large_m_shares_payload:
+                capacities.append(capacity)
         if plan.small_m_mtprs:
             from .mega_moe_small_m import SmallMRuntime
 
-            capacities += [
-                SmallMRuntime.payload_capacity(max_tok_per_rank=m, **fused)
+            self._small_m_shared = tuple(
+                m
                 for m in plan.small_m_mtprs
-            ]
+                if SmallMRuntime.ends_all_ranks(max_tok_per_rank=m, **fused)
+            )
+            for m in plan.small_m_mtprs:
+                capacity = SmallMRuntime.payload_capacity(max_tok_per_rank=m, **fused)
+                route_capacities.append(capacity)
+                if m in self._small_m_shared:
+                    capacities.append(capacity)
         self._payload_arena = GroupMajorPayloadArena(capacities)
         out_bytes, osd_bytes = stage1_output_nbytes(
-            max(nvm for nvm, _, _, _ in capacities), self.inter_dim, self._a_dtype
+            max(nvm for nvm, _, _, _ in route_capacities), self.inter_dim, self._a_dtype
         )
         self._s1_output_arena = (
             torch.zeros(out_bytes, dtype=torch.uint8, device=self.dev),
@@ -458,7 +480,7 @@ class MegaMoEV2:
         self._combine_input = FlyDSLDispatchCombineIntraNodeOp.allocate_combine_input(
             [
                 replace(cfg, max_num_inp_token_per_rank=m)
-                for m in (self.mtpr, *plan.small_m_mtprs)
+                for m in (self.mtpr, *self._small_m_shared)
             ]
         )
 
