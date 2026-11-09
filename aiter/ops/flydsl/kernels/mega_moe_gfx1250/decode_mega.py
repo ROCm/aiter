@@ -15,18 +15,25 @@ gfx950 small-M MegaMoE (ROCm/aiter#6881). Every CTA of an all-resident grid of
    token's bf16 row, loaded first, is quantized to the fp4 wire in registers
    meanwhile (per-1x32 MX with the HIP quant's RoundUp scale and amax floor,
    so the bytes match the staged wire); the row and its ``(meta, w)`` rowmap
-   pair then go straight into the slot with SCOPE_SYS stores. The wave that
-   finishes this rank's last route stores the generation into every
-   destination's ``src_done[rank]``.
-2. PLAN. CTA 0 alone polls the peers' ``src_done`` (hundreds of CTAs polling
+   pair then go straight into the slot with SCOPE_SYS stores. Once every slot
+   atomic of this rank has returned, the wave completing that count stores the
+   generation into every destination's ``reserved[rank]`` (its counters from
+   this rank are final); once every row has retired, the wave completing that
+   count stores it into ``src_done[rank]``. A step of at least
+   ``PREF_MIN_TOK`` tokens then has every CTA but 0 read the W1 slice its
+   first item most likely needs into cache (HBM is idle until the plan).
+2. PLAN. CTA 0 alone polls the peers' ``reserved`` (hundreds of CTAs polling
    one uncached line starve every access queued behind it), reads the expert
-   counts, publishes them in ``PLAN_REPS`` replicas and opens every CTA's own
-   gate line. Each CTA lays the m-tiles (expert-major, ``tile_m`` rows) out in
-   LDS from its replica.
+   counts and publishes them in ``PLAN_REPS`` replicas, each dword tagged with
+   the generation in one 64-bit store (16-row tiles) or followed by every
+   CTA's own gate line. Each CTA lays the m-tiles (expert-major, ``tile_m``
+   rows) out in LDS from its replica. CTA 0 then polls the peers'
+   ``src_done`` and opens the rows-landed gates.
 3. GEMM. One dynamic queue: every GEMM1 item ``(m, n)``, then every GEMM2
    item. A CTA's first item is static, later ones come from one agent claim
    each. GEMM1 is the stage-1 body of ``build_gemm_a8w4_tdm_task`` (act + fp4
-   quant into a2, stored SCOPE_DEV); the item completing an m-tile's
+   quant into a2, stored SCOPE_DEV); its A owners wait for the rows-landed
+   gate while its B owners stream W1, and the item completing an m-tile's
    ``g1_cnt`` publishes ``g1_ready[m] = gen``. A GEMM2 item's A owners wait for
    ``g1_ready`` while its B owners stream W2; its EP-scatter epilogue writes
    each weighted row into its token owner's ``comb_inp`` slot with SCOPE_SYS
@@ -216,10 +223,15 @@ GATE_SLEEP = 32
 #: Phase stamps per CTA under AITER_DMK_TRACE: start, ticket, produced,
 #: planned, GEMM1 done, GEMM2 done, combine flags seen, end. Slots 24-26 hold
 #: the CTA's GEMM item count, its last item's start and its first GEMM2
-#: item's start.
+#: item's start; slot 27 CTA 0's every-row-landed time (EARLY).
 TR_N = 28
-TR_ITEMS, TR_LAST_ITEM, TR_FIRST_G2 = 24, 25, 26
+TR_ITEMS, TR_LAST_ITEM, TR_FIRST_G2, TR_LANDED = 24, 25, 26, 27
 RT_N = 1024
+
+#: W1 prefetch (AITER_DMK_PREFETCH_KB): the fewest tokens of a step that runs
+#: it, and the 16 B loads each lane keeps in flight (deeper ran slower).
+PREF_MIN_TOK = 32
+PREF_DEPTH = 8
 
 #: Elements a reduce wave owns per item: 32 lanes x 16.
 RED_ELEMS = WAVE * 16
@@ -227,8 +239,9 @@ RED_ELEMS = WAVE * 16
 
 def dmk_ctl_arena_bytes(*, npes: int, experts_per_rank: int) -> int:
     """Bytes of the arena's ``dmk_ctl`` region: slot counters, then src_done,
-    comb_flag and started (``FLAG_SPAN`` apart)."""
-    return dmk_src_off(experts_per_rank) + 2 * FLAG_SPAN + npes * FLAG_STRIDE
+    comb_flag (``FLAG_SPAN`` apart), started and reserved (one line per
+    source each)."""
+    return dmk_src_off(experts_per_rank) + 2 * FLAG_SPAN + 2 * npes * FLAG_STRIDE
 
 
 def dmk_epr_pad(experts_per_rank: int) -> int:
@@ -270,13 +283,15 @@ def dmk_ctl_layout(
     gate_p = plan + PLAN_REPS * plan_slot
     gate_c = gate_p + int(workers) * GATE_STRIDE
     gate_s = gate_c + int(workers) * GATE_STRIDE
-    end = gate_s + int(workers) * GATE_STRIDE
+    gate_r = gate_s + int(workers) * GATE_STRIDE
+    end = gate_r + int(workers) * GATE_STRIDE
     lay = {
         "plan": plan,
         "plan_slot": plan_slot,
         "gate_p": gate_p,
         "gate_c": gate_c,
         "gate_s": gate_s,
+        "gate_r": gate_r,
     }
     if compact:
         segs = dmk_segs_pad(npes=npes, experts_per_rank=experts_per_rank)
@@ -393,6 +408,7 @@ def make_decode_mega(
     SRC_OFF = dmk_src_off(EPR)
     CF_OFF = SRC_OFF + FLAG_SPAN
     ST_OFF = SRC_OFF + 2 * FLAG_SPAN
+    RS_OFF = ST_OFF + npes * FLAG_STRIDE
     MT_PER_E = CAP // TM
     MT_CAP = int(mt_cap) if COMPACT else EPR * MT_PER_E
     N1 = 2 * I
@@ -408,6 +424,7 @@ def make_decode_mega(
     CTL_WORDS = _lay["words"]
     PLAN_W, PLAN_SLOT = _lay["plan"], _lay["plan_slot"]
     GATE_P, GATE_C, GATE_S = _lay["gate_p"], _lay["gate_c"], _lay["gate_s"]
+    GATE_R = _lay["gate_r"]
     if MT_CAP > 0xFFFF or (not COMPACT and CAP > 0xFFFF):
         raise ValueError("the packed plan holds m-tile ends and rows in 16 bits")
     SEGS_PAD = dmk_segs_pad(npes=npes, experts_per_rank=EPR)
@@ -472,6 +489,19 @@ def make_decode_mega(
     DEFER_SC = 0 if COMPACT else int(os.environ.get("AITER_DMK_DEFER_SCATTER", "1"))
     if TM >= 64:
         DEFER_SC = 0
+    # AITER_DMK_EARLY_PLAN (default 1): a source signals "reserved" once its
+    # slot atomics have returned, before its rows retire. CTA 0 plans from the
+    # counters as soon as every source reserved; GEMM items start and stream
+    # weights while their A owners wait for the rows-landed gate (every
+    # source's src_done). V4.1-Flash DEP4: -1.8 to -3.7 us/layer.
+    EARLY = 0 if COMPACT else int(os.environ.get("AITER_DMK_EARLY_PLAN", "1"))
+    # AITER_DMK_PREFETCH_KB (default 256, 0 = off): while the plan is pending,
+    # a step of at least PREF_MIN_TOK tokens has every CTA but 0 read the first
+    # N KB of the W1 slice its first item most likely needs, so that item finds
+    # it in cache. V4.1-Flash DEP4: -1.4 (tpr 32) to -4.9 (tpr 128) us/layer;
+    # below 32 tokens most guessed experts get no rows and it costs.
+    PREF_B = 0 if COMPACT else int(os.environ.get("AITER_DMK_PREFETCH_KB", "256")) * 1024
+    PREF_B = min(PREF_B, int(tile_n) * (H // 2))
     knob_sfx = "".join(
         f"_{name}{val}"
         for name, val, default in (
@@ -479,6 +509,8 @@ def make_decode_mega(
             ("hs", int(HS and not COMPACT), 0),
             ("pt", PLAN_TAG, 1 if TM <= 16 else 0),
             ("ds", DEFER_SC, 1),
+            ("ep", EARLY, 1),
+            ("pf", PREF_B // 1024, min(256 * 1024, int(tile_n) * (H // 2)) // 1024),
         )
         if val != default
     )
@@ -555,7 +587,7 @@ def make_decode_mega(
             a_row_stride_bytes=ROW,
             a_scale_row_stride_bytes=ROW,
             tile_meta=meta1_holder,
-            a_ready=ready1_holder if COMPACT else None,
+            a_ready=ready1_holder if (COMPACT or EARLY) else None,
             a_cache_modifier=POL_A1,
             c_cache_modifier=POL_C,
             **common,
@@ -759,7 +791,8 @@ def make_decode_mega(
                             * fx.Int32(RUN_STRIDE),
                             cache_modifier=SCOPE_SYS,
                         )
-                if lane < fx.Int32(4 if COMPACT else 3):
+                # Lane 3 resets the tally (large_m) or reserved (EARLY) count.
+                if lane < fx.Int32(4 if (COMPACT or EARLY) else 3):
                     buffer_store(
                         fx.Int32(0),
                         rsrc_ctl,
@@ -1620,6 +1653,31 @@ def make_decode_mega(
                             addr_ctl + fx.Int64(CTL_ERR * 4), fx.Int32(1)
                         )
             stamp(10)
+            if const_expr(EARLY):
+                # Every slot atomic of this wave has returned (its rows used
+                # the offsets), so the peers' counters hold this wave's routes:
+                # the wave completing the count tells every destination its
+                # counters from this rank are final, before any row retires.
+                res_before = fx.Int32(0)
+                if (n_mine > fx.Int32(0)) & (lane == fx.Int32(0)):
+                    res_before = fx.Int32(
+                        comm_ops.atomic_add_agent(
+                            addr_ctl + fx.Int64(CTL_TALLY * 4) + fx.Int64(par) * 128,
+                            n_mine,
+                        )
+                    )
+                res_before = _uniform(readlane(T.i32, arith.unwrap(res_before), 0))
+                res_last = (n_mine > fx.Int32(0)) & (res_before + n_mine == n_routes)
+                res_last = res_last | (
+                    (n_routes == fx.Int32(0))
+                    & (bid == fx.Int32(0))
+                    & (wave == fx.Int32(0))
+                )
+                if res_last & (lane < fx.Int32(npes)):
+                    comm_ops.store_i32_global_system_monotonic(
+                        peer_va(lane, off_ctl) + fx.Int64(RS_OFF + rank * FLAG_STRIDE),
+                        gen,
+                    )
             # Publish once this rank's last token has every route in place:
             # the stores above retire (SCOPE_SYS) before the count, and the
             # wave completing the count stores gen into every destination.
@@ -1644,6 +1702,47 @@ def make_decode_mega(
                 )
 
             stamp(2)
+            if const_expr(PREF_B):  # noqa: SIM102 - preserve DSL staging
+                # While the plan is pending HBM is idle: read the W1 slice this
+                # CTA's first item most likely needs (m-tile bid // NT1 is
+                # expert bid // NT1 when every expert before it has rows), so
+                # that item finds it in cache. Real loads, PREF_DEPTH x 16 B in
+                # flight per lane, folded into one word that is stored only on
+                # an impossible value (global_prefetch hints measured no gain).
+                e_p = bid // fx.Int32(NT1)
+                n_p = bid - e_p * fx.Int32(NT1)
+                if (
+                    (bid != fx.Int32(0))
+                    & (tok >= fx.Int32(PREF_MIN_TOK))
+                    & (e_p < fx.Int32(EPR))
+                ):
+                    w1_base = fx.Int64(fx.ptrtoint(fx.recast_iter(fx.Int8, arg_w1)))
+                    rsrc_w1p = create_buffer_resource_from_addr(
+                        w1_base
+                        + fx.Int64(e_p * fx.Int32(N1) + n_p * fx.Int32(tile_n))
+                        * fx.Int64(H // 2)
+                    )
+                    acc_p = fx.Int32(0)
+                    for p_off in range(
+                        tid * fx.Int32(16), PREF_B, 4 * WAVE * 16 * PREF_DEPTH
+                    ):
+                        vs = [
+                            fx.Vector(
+                                buffer_load(
+                                    rsrc_w1p,
+                                    (p_off + fx.Int32(q * 4 * WAVE * 16)) // fx.Int32(4),
+                                    vec_width=4,
+                                    dtype=T.i32,
+                                )
+                            )
+                            for q in range_constexpr(PREF_DEPTH)
+                        ]
+                        for v4 in vs:
+                            acc_p = acc_p ^ fx.Int32(v4[0])
+                    if acc_p == i32_rows + fx.Int32(0x5A5A5A5A):
+                        comm_ops.atomic_add_agent(
+                            addr_ctl + fx.Int64(CTL_ERR * 4), fx.Int32(0)
+                        )
 
             # ======================== 2. PLAN ========================
             # CTA 0 alone polls the peers' src_done (hundreds of CTAs polling
@@ -1661,7 +1760,9 @@ def make_decode_mega(
                         stamp(17)
                 else:
                     if wave == fx.Int32(0):
-                        poll_peer_flags(SRC_OFF, 2)
+                        # EARLY: the counters are final once every source
+                        # reserved; the rows-landed gate opens further down.
+                        poll_peer_flags(RS_OFF if EARLY else SRC_OFF, 2)
                         stamp(14)
                         cnts = []
                         for j in range_constexpr(EPR_CH):
@@ -1693,6 +1794,11 @@ def make_decode_mega(
                         if wave == fx.Int32(0):
                             open_gates(GATE_P, GATE_STRIDE)
                     stamp(17)
+                    if const_expr(EARLY):  # noqa: SIM102 - preserve DSL staging
+                        if wave == fx.Int32(0):
+                            poll_peer_flags(SRC_OFF, 2)
+                            stamp(TR_LANDED)
+                            open_gates(GATE_R, GATE_STRIDE)
             else:
                 if wave == fx.Int32(0):
                     follower_plan(GATE_S if COMPACT else GATE_P, 3)
@@ -1804,13 +1910,13 @@ def make_decode_mega(
                     i = u // fx.Int32(NT1)
                     n = u - i * fx.Int32(NT1)
                     e_, mt_idx, rows = decode_mtile(i)
-                    if const_expr(COMPACT):
+                    if const_expr(COMPACT or EARLY):
 
                         def a_ready1():
                             # The rows of every rank have landed (CTA 0 saw
                             # every src_done): only A owners wait, the W1
                             # prologue streams meanwhile.
-                            wait_gate(GATE_P, GATE_STRIDE, 7)
+                            wait_gate(GATE_P if COMPACT else GATE_R, GATE_STRIDE, 7)
 
                         set_meta1((e_, rows), a_ready1)
                     else:
@@ -1859,12 +1965,12 @@ def make_decode_mega(
                     i = v // fx.Int32(NT2)
                     n = v - i * fx.Int32(NT2)
                     e_, mt_idx, rows = decode_mtile(i)
-                    if const_expr(COMPACT):
+                    if const_expr(COMPACT or EARLY):
                         # GEMM2's epilogue loads its rows' rowmap pairs before
-                        # a_ready, and large_m starts its queue before the
-                        # peers' rows land: every wave waits for them first.
-                        # Once open, the gate costs one load per item.
-                        wait_gate(GATE_P, GATE_STRIDE, 7)
+                        # a_ready, and large_m / EARLY start the queue before
+                        # the peers' rows land: every wave waits for them
+                        # first. Once open, the gate costs one load per item.
+                        wait_gate(GATE_P if COMPACT else GATE_R, GATE_STRIDE, 7)
 
                     def a_ready(i=i):
                         if const_expr(PH & 16):
