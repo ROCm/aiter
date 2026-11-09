@@ -35,9 +35,11 @@ KV/index-cache writes).  For those cells ``plan.run`` writes the contract's
 preconditions of the framework's native post-prologue stage
 (``stages_native.attend_after_prologue``: attention over ``q``/``k``/``v`` with
 the just-written caches).  A caller that registered ``native_stage=`` on
-:func:`open_session` gets that post-prologue stage invoked after a successful
-launch, on the same stream; the runtime never imports ATOM, so the default is
-``None`` and the caller runs its own attention tail after the op returns.
+:func:`open_session` gets that **consumer continuation** invoked after a
+successful launch, on the same stream.  It is explicitly optional and is *not
+part of the op contract*: the runtime never imports ATOM, the default is
+``None``, and without it the caller runs its own attention tail after the op
+returns.
 
 Padded calls whose real local M falls into a *larger* prepared bucket (the
 framework's R16 pad-M selection) are served too: the runtime binds bucket-sized
@@ -51,10 +53,17 @@ is not part of this payload contract) and the small/large gaps of the profile --
 raise ``aiter.gemm_fusion.match.ContractError`` listing what was searched and
 what the framework coverage is.  There is **no unfused fallback** in this
 runtime: option A (the unfused composition owned by native) is the named
-follow-up in ``CONTRACT.md``.  OPEN ITEM with the contract owner: ``CONTRACT.md``
-§8 lists the one-stage large band as *fused native*; serving it needs a native
-post-exchange prologue stage (a new aiter kernel/op, not present in ``#6689``),
-so it is currently a coverage error here.
+follow-up in ``CONTRACT.md``.  DECIDED with the contract owner (Lead): option
+(a) -- ``CONTRACT.md`` §8 narrows its *fused native* coverage to exactly these
+prologue cells; the one-stage large/r19 band is named **Phase-2**: it needs an
+aiter-owned native post-exchange prologue op (or a contract split), which is
+*not* part of this runtime and must not be added here, so it stays a coverage
+error.
+
+The same rule is exposed as a cheap static query, :func:`sp_qkv_covers`: it
+answers "would a fused prologue plan match this call?" without creating a
+session, allocating, building or launching anything (safe from a consumer's
+``__init__``).
 
 Graph capture
 -------------
@@ -88,6 +97,7 @@ __all__ = [
     "open_session",
     "profile_name",
     "sp_qkv_available",
+    "sp_qkv_covers",
     "sp_qkv_native",
 ]
 
@@ -530,6 +540,21 @@ def profile_name() -> str:
     return os.environ.get(PROFILE_ENV) or DEFAULT_PROFILE
 
 
+def _match_ctx(
+    *, arch: str, cu: int, world: int, m: int, caps: frozenset, graph_mode: str
+) -> Any:
+    """Build the planner's ``MatchCtx`` (pure: no device/resource state)."""
+
+    return _gf().MatchCtx(
+        arch=arch,
+        cu=cu,
+        world=world,
+        m=m,
+        available=caps,
+        graph_mode=graph_mode,
+    )
+
+
 def sp_qkv_available() -> bool:
     """Whether the native fused path is usable in this process (CPU-checkable).
 
@@ -544,6 +569,57 @@ def sp_qkv_available() -> bool:
     except Exception:  # noqa: BLE001 - unavailability is a query, not an error
         return False
     return True
+
+
+def sp_qkv_covers(payload: Mapping) -> bool:
+    """Static, session-independent coverage query for the neutral op contract.
+
+    Answers exactly the planner's question -- "would a fused prologue plan match
+    this call?" -- using the same payload validation, spec, ``MatchCtx``,
+    profile and ``match_padded`` as :func:`sp_qkv_native`, but with **no
+    resource creation, no allocation, no build and no launch**, and without
+    touching the session cache.  It is safe to call from a consumer's
+    ``__init__`` and on every call: it **never raises** -- a missing framework/
+    MORI/profile, an invalid payload or an uncovered call returns ``False``.
+    ``True`` means "the planner would match a prologue plan"; the actual call can
+    still fail later at resource/kernel setup.
+    """
+
+    try:
+        if not isinstance(payload, Mapping):
+            return False
+        missing = [k for k in PAYLOAD_KEYS if k not in payload]
+        extra = [k for k in payload if k not in PAYLOAD_KEYS]
+        if missing or extra:
+            return False
+        mode = payload["mode"]
+        if mode not in MODES:
+            return False
+        _validate_payload(payload)  # structural + tensor contract; ffi-free
+        _, world = _world_rank(payload["group"])
+        if int(world) != _WORLD:
+            return False
+        profile = _load_profile(profile_name())
+        m = int(_shape(payload["x"])[0])
+        spec = _spec_for(mode, int(world), float(payload["eps"]))
+        ctx = _match_ctx(
+            arch=_detect_arch(),
+            cu=_detect_cu(),
+            world=int(world),
+            m=m,
+            caps=_detect_capabilities(),
+            graph_mode="eager",
+        )
+        plan, n_stages, bucket_m = _match_padded(spec, ctx, profile)
+        if plan is None or int(n_stages) < _PROLOGUE_STAGES:
+            return False
+        return not (
+            bucket_m is not None
+            and int(bucket_m) != m
+            and int(getattr(plan, "abi", 3)) < 3
+        )
+    except Exception:  # noqa: BLE001 - a coverage query must never raise
+        return False
 
 
 def _device_index_of(payload: Mapping) -> int:
@@ -657,8 +733,9 @@ def open_session(
 
     Optional warm-up hook for frameworks: creating the CCO comm/arena is heavy
     and collective, so doing it here (outside capture, all ranks in the same
-    order) keeps the first fused call cheap.  ``native_stage`` is an optional
-    callback invoked after a successful prologue launch -- the caller's native
+    order) keeps the first fused call cheap.  ``native_stage`` is an explicitly
+    optional **consumer continuation**, not part of the op contract: a callback
+    invoked after a successful prologue launch -- the caller's native
     post-prologue stage (the framework's ``attend_after_prologue`` semantics:
     attention over ``q``/``k``/``v`` with the caches the launch just wrote).  The
     runtime does not import ATOM and defaults to no callback.
@@ -1056,9 +1133,10 @@ def _run_native_stage(
     bucket: _Bucket,
     meta: dict,
 ) -> None:
-    """Invoke the optional caller-registered post-prologue stage.
+    """Invoke the optional caller-registered consumer continuation.
 
-    This is the seam for the framework's ``stages_native.attend_after_prologue``:
+    This is explicitly *not part of the op contract*: it is the seam for the
+    framework's ``stages_native.attend_after_prologue``,
     it consumes exactly the tensors the fused prologue just wrote (``q``/``k``/
     ``v``/``index_q`` and the caches) on the same stream.  The native runtime
     cannot import ATOM, so without a registered callback the caller runs its own
@@ -1108,12 +1186,12 @@ def sp_qkv_native(payload: Mapping) -> None:
     arch = _detect_arch()
     cu = _detect_cu()
     caps = _detect_capabilities()
-    ctx = _gf().MatchCtx(
+    ctx = _match_ctx(
         arch=arch,
         cu=cu,
         world=session.world,
         m=m,
-        available=caps,
+        caps=caps,
         graph_mode="capture" if capturing else "eager",
     )
     plan, n_stages, bucket_m = _match_padded(spec, ctx, session.profile)
@@ -1143,9 +1221,10 @@ def sp_qkv_native(payload: Mapping) -> None:
                     f"The matched plan {getattr(plan, 'vid', type(plan).__name__)!r} "
                     f"covers only {int(n_stages)} stage (GEMM + SP exchange): this "
                     "payload contract carries the prologue outputs q/k/v/index_q and "
-                    "the cache writes, so one-stage (large-band) plans are not served "
-                    "by the native prologue runtime (the caller's native attention "
-                    "stage owns that band)."
+                    "the cache writes. The one-stage large/16K band is Phase-2: it "
+                    "needs an aiter-owned native post-exchange prologue op (or a "
+                    "contract split), which is not part of this runtime, so it is "
+                    "not served by the native prologue path."
                 ),
             )
         )

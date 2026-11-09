@@ -9,7 +9,8 @@ replaced with fakes.  What is covered here is the runtime policy a GPU cannot
 easily test on a CPU box:
 
 * payload validation (structure vs tensor contract);
-* coverage-limited native errors (no plan / one-stage plan / pad bucket);
+* coverage-limited native errors (no plan / one-stage band / legacy pad plan)
+  and the static ``sp_qkv_covers`` gate (no resource/session/allocation);
 * session cache keying and ``open_session``/``close_session`` lifecycle;
 * prepare/bind outside graph capture, replay afterwards;
 * the per-process call-id counter (rank-uniform sequence, 18-bit mask);
@@ -228,6 +229,43 @@ def env(monkeypatch):
     rt._reset_for_testing()
 
 
+class CoversEnv:
+    """Real planner (profile + match_padded) but no resource/session/allocation."""
+
+    def __init__(self, monkeypatch):
+        self.created = []
+        self.allocated = []
+        self.cache_touched = []
+        monkeypatch.setattr(rt, "_world_rank", lambda group: (0, 4))
+        monkeypatch.setattr(rt, "_detect_arch", lambda: "gfx950")
+        monkeypatch.setattr(rt, "_detect_cu", lambda: 256)
+        monkeypatch.setattr(
+            rt,
+            "_detect_capabilities",
+            lambda: frozenset({"mori_cco", "sdma", "gfx950_sc_bypass"}),
+        )
+        monkeypatch.setattr(
+            rt, "_create_resources", lambda *args, **kwargs: self.created.append(args)
+        )
+        monkeypatch.setattr(rt, "_new_tensor", self._new_tensor)
+        monkeypatch.setattr(
+            rt, "_get_session", lambda *args, **kwargs: self.cache_touched.append(args)
+        )
+        monkeypatch.delenv(rt.PROFILE_ENV, raising=False)
+        rt._reset_for_testing()
+
+    def _new_tensor(self, shape, dtype_name, device=None):
+        self.allocated.append((shape, dtype_name))
+        return FakeTensor(shape, dtype_name, device=device)
+
+
+@pytest.fixture
+def covers_env(monkeypatch):
+    e = CoversEnv(monkeypatch)
+    yield e
+    rt._reset_for_testing()
+
+
 # ---------------------------------------------------------------------------
 # payload validation
 # ---------------------------------------------------------------------------
@@ -292,8 +330,48 @@ def test_coverage_error_for_one_stage_plan(env):
     env.plan = FakePlan()
     env.plan.vid = "sp_qkv.large.v1"
     env.plan.n_stages = 1
-    with pytest.raises(FakeContractError, match="one-stage"):
+    with pytest.raises(FakeContractError, match="Phase-2"):
         rt.sp_qkv_native(_payload())
+
+
+# ---------------------------------------------------------------------------
+# static coverage query (sp_qkv_covers)
+# ---------------------------------------------------------------------------
+def test_sp_qkv_covers_prologue_cells(covers_env):
+    for mode in rt.MODES:
+        for m in (1, 2, 16, 128, 256):
+            assert rt.sp_qkv_covers(_payload(mode, m)) is True, (mode, m)
+    # a static query: no session/resource/allocation, and no session-cache touch
+    assert covers_env.created == []
+    assert covers_env.allocated == []
+    assert covers_env.cache_touched == []
+    assert rt._SESSIONS == {}
+
+
+def test_sp_qkv_covers_one_stage_band_is_uncovered(covers_env):
+    for m in (512, 600, 1024, 8192, 9216):
+        assert rt.sp_qkv_covers(_payload("dense", m)) is False, m
+    assert covers_env.created == []
+    assert covers_env.allocated == []
+    assert covers_env.cache_touched == []
+    assert rt._SESSIONS == {}
+
+
+def test_sp_qkv_covers_never_raises(covers_env, monkeypatch):
+    assert rt.sp_qkv_covers({}) is False
+    assert rt.sp_qkv_covers(None) is False  # type: ignore[arg-type]
+    bad = _payload()
+    bad["x"] = FakeTensor((8, 4096), "float8_e4m3fn")
+    assert rt.sp_qkv_covers(bad) is False
+
+    def _no_profile(name):
+        raise RuntimeError("no profile in this process")
+
+    monkeypatch.setattr(rt, "_load_profile", _no_profile)
+    assert rt.sp_qkv_covers(_payload()) is False
+    assert covers_env.created == []
+    assert covers_env.allocated == []
+    assert rt._SESSIONS == {}
 
 
 def test_pad_bucket_uses_staging_outputs_and_copies_back(env):
