@@ -54,6 +54,8 @@ from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import (
     ROUTE_LARGE_M,
     ROUTE_SMALL_M,
     ROUTE_STAGED,
+    FusedStage1Knobs,
+    FusedStage2Knobs,
     fused_layout_supported,
     small_m_cu_supported,
 )
@@ -547,6 +549,7 @@ def _run_size(moe, x, weights, ids, ref_weights, args, rank, world, device):
                 args.large_m_state_slots,
                 args.layer_stress_cycles,
                 rank,
+                args.rtol,
             )
         if args.route_switch_rounds:
             _run_skewed_route_switch(
@@ -836,7 +839,7 @@ def _run_burst(moe, x, weights, ids, depth, rank):
         print(f"[BURST] completed={depth}/{depth}", flush=True)
 
 
-def _run_layer_slot_stress(moe, x, weights, ids, slots, cycles, rank):
+def _run_layer_slot_stress(moe, x, weights, ids, slots, cycles, rank, rtol):
     """Alternate routes and weight pointers across model-layer slots."""
     if slots < 61 or cycles <= 8:
         raise ValueError("layer-slot stress requires at least 61 slots and 9 cycles")
@@ -865,7 +868,11 @@ def _run_layer_slot_stress(moe, x, weights, ids, slots, cycles, rank):
     weights_b = weights.flip(0).contiguous()
     tokens = x.shape[0]
     # A few slots per cycle, covering both layers, are checked against the main path on the same
-    # binding: the large-M path matches it bit for bit.
+    # binding. With the default fused knobs (EP8 V4-Pro) the large-M path matches it bit for bit; a
+    # tuned layout (EP4 V4.1-Flash: FP8 combine rows, BF16 head tokens) sums in another order, so it
+    # is held to rtol, far below the error of a stale binding (layer B doubles W2).
+    config = moe._large_m._select_config(tokens)
+    exact = config.fused_stage1 == FusedStage1Knobs() and config.fused_stage2 == FusedStage2Knobs()
     checked_slots = {0, 1, slots - 1}
     checked = 0
 
@@ -890,14 +897,20 @@ def _run_layer_slot_stress(moe, x, weights, ids, slots, cycles, rank):
                 reference = _fwd(moe, x, route_weights, route_ids)[:tokens].clone()
             finally:
                 moe.set_large_m_enabled(True)
-            mismatched = (output != reference).any(dim=-1).sum().to(torch.int64)
             finite = torch.isfinite(output).all().to(torch.int64)
-            dist.all_reduce(mismatched)
             dist.all_reduce(finite, op=dist.ReduceOp.MIN)
-            if int(mismatched.item()) or not int(finite.item()):
+            if exact:
+                mismatched = (output != reference).any(dim=-1).sum().to(torch.int64)
+                dist.all_reduce(mismatched)
+                bad = int(mismatched.item())
+                detail = f"{bad} rows differ from"
+            else:
+                rel = _rel_l2(output, reference)
+                bad = rel > rtol
+                detail = f"relL2={rel:.6f} > {rtol} against"
+            if bad or not int(finite.item()):
                 raise AssertionError(
-                    f"layer cycle={cycle} slot={slot}: {int(mismatched.item())} rows "
-                    "differ from the main path on the same binding"
+                    f"layer cycle={cycle} slot={slot}: {detail} the main path on the same binding"
                 )
             checked += 1
     # The doubled W2 must change the result, or the comparisons above could not see a stale binding.
