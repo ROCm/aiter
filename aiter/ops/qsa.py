@@ -8,6 +8,7 @@ Consumers should import from here rather than from the backend-specific
 modules directly.
 """
 
+import functools
 from collections.abc import Sequence
 from dataclasses import replace as _dc_replace
 
@@ -104,14 +105,35 @@ def _stacked_decode_auto(q, compressed_k_cache, page_table) -> bool:
     )
 
 
-def _existing_route(
-    q, compressed_k_cache, page_table, allow_flydsl, compressed_k_scale
-):
-    """Which of aiter's existing native kernels takes this call (``None``: neither --
-    the pure-torch implementation serves a valid call, e.g. on a CPU device)."""
-    if not _on_gpu(q):
-        return None
-    if (
+#: Arches the FlyDSL page-16 prefill scorer (``qsa_flydsl_layout``) may be chosen on.
+#: It is an MFMA (bf16 16x16x16) kernel with wave64 shuffles, i.e. CDNA (gfx9) only: on
+#: gfx1250 LLVM aborts the whole process while compiling it (SIGABRT, "LLVM ERROR:
+#: Cannot select: intrinsic llvm.amdgcn.permlane32.swap"; reproduced compile-only with
+#: FlyDSL 0.3.4.1 and 0.4.0), so elsewhere the Triton scorer serves those calls.
+FLYDSL_PAGE16_ARCHS = ("gfx9",)
+
+
+@functools.cache
+def _cuda_arch(index: int) -> str:
+    return torch.cuda.get_device_properties(index).gcnArchName.split(":")[0]
+
+
+def _device_arch(device) -> str:
+    """``gfx...`` name of a GPU device (cached per device index)."""
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    return _cuda_arch(index)
+
+
+def _flydsl_page16_arch_ok(q) -> bool:
+    try:
+        return _device_arch(q.device).startswith(FLYDSL_PAGE16_ARCHS)
+    except Exception:  # noqa: BLE001 -- unknown arch: not the FlyDSL kernel
+        return False
+
+
+def _flydsl_page16(q, compressed_k_cache, page_table, allow_flydsl, compressed_k_scale):
+    """main's FlyDSL page-16 prefill predicate, plus the arch gate above."""
+    return (
         allow_flydsl
         and _HAS_FLYDSL
         and compressed_k_scale is None
@@ -121,6 +143,19 @@ def _existing_route(
         and page_table.stride(1) == 1
         and q.shape[2] >= 16
         and compressed_k_cache.shape[1] == _FLYDSL_PAGE_SIZE
+        and _flydsl_page16_arch_ok(q)
+    )
+
+
+def _existing_route(
+    q, compressed_k_cache, page_table, allow_flydsl, compressed_k_scale
+):
+    """Which of aiter's existing native kernels takes this call (``None``: neither --
+    the pure-torch implementation serves a valid call, e.g. on a CPU device)."""
+    if not _on_gpu(q):
+        return None
+    if _flydsl_page16(
+        q, compressed_k_cache, page_table, allow_flydsl, compressed_k_scale
     ):
         return _D.VID_FLYDSL_PAGE16
     dt = compressed_k_cache.dtype
@@ -153,16 +188,8 @@ def _existing_native(
     fp32 scale, MXFP4). ``stacked_decode=None`` resolves with
     :func:`_stacked_decode_auto`; True / False are passed to Triton as given.
     Caller-supplied ``logits`` / ``visible_groups`` are filled."""
-    if (
-        allow_flydsl
-        and _HAS_FLYDSL
-        and compressed_k_scale is None
-        and q.shape[0] > 256
-        and q.stride(2) == 1
-        and compressed_k_cache.stride(3) == 1
-        and page_table.stride(1) == 1
-        and q.shape[2] >= 16
-        and compressed_k_cache.shape[1] == _FLYDSL_PAGE_SIZE
+    if _flydsl_page16(
+        q, compressed_k_cache, page_table, allow_flydsl, compressed_k_scale
     ):
         divisor = q.shape[2] ** 0.5 if score_divisor is None else score_divisor
         columns = page_table.shape[1] * compressed_k_cache.shape[1]

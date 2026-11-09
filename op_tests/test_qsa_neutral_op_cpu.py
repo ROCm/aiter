@@ -559,7 +559,7 @@ class Decisions(base.Env):
         a[10] = True
         with mock.patch.object(Q, "_HAS_FLYDSL", True), mock.patch.object(
             Q, "_FLYDSL_PAGE_SIZE", 16, create=True
-        ):
+        ), mock.patch.object(Q, "_device_arch", lambda dev: "gfx950"):
             d = Q.explain(*a)
         self.assertEqual((d.path, d.vid), (D.PATH_NATIVE_TRITON, D.VID_FLYDSL_PAGE16))
 
@@ -999,6 +999,123 @@ class CacheKeyDeterminism(unittest.TestCase):
             self.assertEqual(res["fwd"], res["odd"])
             decg = [k for k in res["fwd"] if ".decg." in k]
             self.assertEqual(len(decg), 4)  # bf16 / fp8 x default / 3-row group
+
+
+LAYOUT_PY = os.path.join(
+    ROOT, "aiter", "ops", "flydsl", "kernels", "mqa_logits", "qsa_flydsl_layout.py"
+)
+#: compile-only (no device, no launch) of the FlyDSL page-16 prefill scorer for one arch
+_PAGE16_SCRIPT = r"""
+import sys, types
+import torch
+import flydsl.compiler as flyc
+import flydsl.expr as fx
+src = sys.argv[1]
+code = open(src).read().replace("from ..tensor_shim import _run_compiled", "")
+mod = types.ModuleType("qsa_flydsl_layout_probe")
+exec(compile(code, src, "exec"), mod.__dict__)
+rows, P, pages, reqs, width = 512, mod.PAGE_SIZE, 8, 1, 32
+cols = width * P
+i32 = torch.int32
+logits = torch.empty((rows, cols), dtype=torch.float32)
+flyc.compile(
+    mod._qsa_logits_layout_launch,
+    torch.zeros((rows, 4, 128), dtype=torch.bfloat16),
+    torch.zeros((pages, P, 1, 128), dtype=torch.bfloat16),
+    torch.zeros((reqs, width), dtype=i32),
+    torch.zeros(rows, dtype=i32),
+    torch.full((rows,), cols * 4 - 1, dtype=i32),
+    torch.full((reqs,), cols * 4, dtype=i32),
+    logits,
+    torch.empty(rows, dtype=i32),
+    torch.empty(rows, dtype=i32),
+    rows, cols, pages, reqs, width, (rows // 64) * (cols // 64),
+    1.0 / 128 ** 0.5,
+    fx.Stream(None),
+)
+print("PAGE16_COMPILE_OK")
+"""
+
+
+class FlydslPage16ArchGate(_Base):
+    """``native.flydsl_page16.v1`` (``qsa_flydsl_layout``, an MFMA / wave64 kernel) is
+    chosen only on gfx9 (CDNA) devices; on gfx1250 its compile aborts the process
+    (SIGABRT, ``LLVM ERROR: Cannot select: intrinsic llvm.amdgcn.permlane32.swap``), so
+    the native dispatch gives those calls to Triton."""
+
+    gpu = True
+
+    def _prefill(self):
+        a = nat.make_call(rows=300, requests=1, width=4, page=16, seed=31)
+        a[10] = True  # allow_flydsl
+        return a
+
+    def test_route_by_arch(self):
+        a = self._prefill()
+        for arch, vid in (
+            ("gfx942", D.VID_FLYDSL_PAGE16),
+            ("gfx950", D.VID_FLYDSL_PAGE16),
+            ("gfx1250", D.VID_TRITON),
+            ("gfx1100", D.VID_TRITON),
+        ):
+            with mock.patch.object(Q, "_HAS_FLYDSL", True), mock.patch.object(
+                Q, "_FLYDSL_PAGE_SIZE", 16, create=True
+            ), mock.patch.object(Q, "_device_arch", lambda dev, arch=arch: arch):
+                self.assertEqual(Q._existing_route(a[0], a[1], a[2], True, None), vid)
+                self.assertEqual(Q.explain(*a).vid, vid, arch)
+        with mock.patch.object(Q, "_HAS_FLYDSL", True), mock.patch.object(
+            Q, "_FLYDSL_PAGE_SIZE", 16, create=True
+        ), mock.patch.object(Q, "_device_arch", side_effect=RuntimeError("no device")):
+            self.assertEqual(
+                Q._existing_route(a[0], a[1], a[2], True, None), D.VID_TRITON
+            )
+
+    def test_gfx1250_call_runs_triton_not_flydsl(self):
+        a = self._prefill()
+        fly = mock.Mock(side_effect=AssertionError("FlyDSL page-16 on gfx1250"))
+        for configured in (False, True):
+            D._reset_for_testing()
+            if configured:
+                Q.configure(profile=PR.DEFAULT_PROFILE, source="test")
+            TRI.calls.clear()
+            with mock.patch.object(Q, "_HAS_FLYDSL", True), mock.patch.object(
+                Q, "_FLYDSL_PAGE_SIZE", 16, create=True
+            ), mock.patch.object(
+                Q, "qsa_paged_mqa_logits_flydsl", fly, create=True
+            ), mock.patch.object(
+                Q, "_device_arch", lambda dev: "gfx1250"
+            ):
+                out = Q.qsa_paged_mqa_logits(*a)
+            nat.assert_matches(self, out, nat.reference(*a[:6]), configured)
+            self.assertEqual(len(TRI.calls), 1, configured)
+        fly.assert_not_called()
+
+    @unittest.skipUnless(_has_flydsl(), "FlyDSL not installed (no-device container)")
+    def test_gate_matches_compile_outcome(self):
+        """Compile-only in a child process (an LLVM abort kills the process): every arch
+        the gate admits compiles, gfx1250 does not."""
+        out = {}
+        with tempfile.TemporaryDirectory() as tmp:
+            for arch in ("gfx950", "gfx1250"):
+                env = dict(os.environ, COMPILE_ONLY="1", FLYDSL_GPU_ARCH=arch)
+                env["FLYDSL_RUNTIME_CACHE_DIR"] = os.path.join(tmp, arch)
+                r = subprocess.run(
+                    [sys.executable, "-B", "-c", _PAGE16_SCRIPT, LAYOUT_PY],
+                    env=env,
+                    capture_output=True,
+                    check=False,
+                    text=True,
+                    timeout=1800,
+                )
+                out[arch] = (r.returncode, r.stdout + r.stderr)
+        ok950, log950 = out["gfx950"]
+        self.assertEqual(ok950, 0, log950[-2000:])
+        self.assertIn("PAGE16_COMPILE_OK", log950)
+        rc, log = out["gfx1250"]
+        self.assertNotEqual(rc, 0, "page-16 FlyDSL compiles on gfx1250: re-check gate")
+        self.assertIn("Cannot select", log, log[-2000:])
+        self.assertTrue("gfx950".startswith(Q.FLYDSL_PAGE16_ARCHS))
+        self.assertFalse("gfx1250".startswith(Q.FLYDSL_PAGE16_ARCHS))
 
 
 if __name__ == "__main__":

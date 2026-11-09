@@ -27,7 +27,7 @@ columns      = max(1, min(width * P, max_columns))        (width * P when max_co
 | workspace / lifetime | Fused: none per call (MTP-verify bucket staging planes are allocated at the class decision and owned by the decision cache). Native torch: one bounded tile workspace (65536 (row, column) elements, ~54 MiB at H=4, D=128) per decided class. Triton: as before (allocates its outputs). |
 | graph capture | Decide every class before capture (warm-up calls, or `explain(...)`) and `prewarm(...)` the fused kernels: a decided class is a dict lookup plus the implementation's launch, no host sync, no tensor reads, no environment reads; with caller outputs the native-torch path creates no tensor (dispatch-audited on CPU). A class first seen during capture decides on the host inside capture (allocations land in the graph pool). |
 | error behaviour | Never raises for a valid call: a call the fused path does not cover runs natively. Contract violations raise `ValueError` (the existing Triton error where Triton validates the call; `explain` reports `path == "invalid"`). A fused class whose first launch fails (compile / load error, before any device write) is re-decided natively with reason `fused_launch_error` (logged); later errors propagate. |
-| coverage | Fused: gfx1250 with 256 CUs, profile `qsa_page4_gfx1250_v1` (below). Existing native: Triton (any arch it supports), FlyDSL page-16 prefill (`allow_flydsl`, > 256 rows, bf16). Native torch: every other valid call on any torch device (CPU included). |
+| coverage | Fused: gfx1250 with 256 CUs, profile `qsa_page4_gfx1250_v1` (below). Existing native: Triton (any arch it supports), FlyDSL page-16 prefill (`allow_flydsl`, > 256 rows, bf16, gfx9 / CDNA devices only, see below). Native torch: every other valid call on any torch device (CPU included). |
 | non-goals | fused path on other arches / head shapes; MXFP4 / MXFP8 on the fused or torch path (Triton serves MXFP4); top-k selection / index expansion (`qsa_select_paged_tokens`). |
 
 ## Dispatch (per call class, decided once on the host)
@@ -35,9 +35,20 @@ columns      = max(1, min(width * P, max_columns))        (width * P when max_co
 | `Decision.path` | implementation | `vid` | when |
 |---|---|---|---|
 | `fused` | `aiter/ops/flydsl/kernels/mqa_logits/qsa_paged_mqa_logits_page4_gfx1250.py` via `aiter/ops/qsa_index_scorer/api.py` | `qsa.page<P>.<kind>.v1` | a profile is active and a verified entry covers the class |
-| `native-triton` | aiter's existing dispatch (unchanged) | `native.triton.v1` / `native.flydsl_page16.v1` | GPU tensors the existing kernels take |
+| `native-triton` | aiter's existing dispatch (unchanged except the arch gate below) | `native.triton.v1` / `native.flydsl_page16.v1` | GPU tensors the existing kernels take |
 | `native-torch` | `aiter/ops/qsa_index_scorer/native.py` (pure torch) | `native.torch.v1` | other valid calls (CPU, an fp8 dtype the arch's Triton does not use, ...) |
 | `invalid` | — (raises `ValueError`) | — | contract violation |
+
+**FlyDSL page-16 prefill arch gate.** `native.flydsl_page16.v1`
+(`aiter/ops/flydsl/kernels/mqa_logits/qsa_flydsl_layout.py`, the same kernel body as ATOM's
+`qsa_flydsl_layout`) is a bf16 MFMA 16x16x16 kernel with wave64 shuffles. On gfx1250 its compile
+aborts the whole process (SIGABRT, `LLVM ERROR: Cannot select: intrinsic
+llvm.amdgcn.permlane32.swap`; reproduced compile-only, no device, with FlyDSL 0.3.4.1 and 0.4.0;
+gfx950 compiles with both). The native dispatch therefore takes it only on devices whose arch
+starts with `aiter.ops.qsa.FLYDSL_PAGE16_ARCHS` (`("gfx9",)`, read once per device index);
+`allow_flydsl` calls on other devices (gfx1250, ...) run the Triton scorer.
+`FlydslPage16ArchGate.test_gate_matches_compile_outcome` re-checks the abort in a child process
+wherever FlyDSL is installed.
 
 **Stacked decode (`stacked_decode`).** A Triton scheduling hint; results agree within the
 tolerance either way. `None` (the default; ATOM passes only the 12 leading parameters) lets
