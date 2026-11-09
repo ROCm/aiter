@@ -480,6 +480,10 @@ def compile_gemm2_a16w4_port(
         "int4",
         "bf16",
     ), f"w_dtype must be 'mxfp4', 'int4' or 'bf16', got {w_dtype!r}"
+    if w_dtype in ("fp4", "int4") and (TILE_K <= 0 or TILE_K % 128):
+        raise ValueError(
+            f"{w_dtype} TILE_K must be a positive multiple of 128, got {TILE_K}"
+        )
     if epilog not in ("atomic", "reduce"):
         raise ValueError(f"epilog must be 'atomic' or 'reduce', got {epilog!r}")
     if reuse_lds and (

@@ -62,6 +62,128 @@ _SKIP = pytest.mark.skipif(
 )
 
 
+@pytest.mark.parametrize("stage", [1, 2])
+@pytest.mark.parametrize("weight_dtype", ["fp4", "int4"])
+@pytest.mark.parametrize("tile_k", [-128, 0, 16, 32, 64, 96, 192])
+def test_packed_k_tile_rejected_before_stage_compile(
+    monkeypatch, stage, weight_dtype, tile_k
+):
+    from aiter.ops.flydsl.kernels import moe_2stage_a16wmix as kernels
+
+    def unexpected_compile(**kwargs):
+        raise AssertionError("unsupported K tile reached the compiler")
+
+    monkeypatch.setattr(kernels, "get_rocm_arch", lambda: "gfx942")
+    monkeypatch.setattr(kernels, f"compile_gemm{stage}_a16w4_port", unexpected_compile)
+    common = {
+        "sorted_expert_ids": None,
+        "cumsum_tensor": None,
+        "NE": 8,
+        "D_HIDDEN": 256,
+        "D_INTER": 384,
+        "topk": 2,
+        "tile_n": 128 if stage == 1 else 256,
+        "tile_k": tile_k,
+        "w_dtype": weight_dtype,
+    }
+    with pytest.raises(ValueError, match="positive multiple of 128"):
+        if stage == 1:
+            kernels.flydsl_a16w4_gemm1(
+                a_bf16=None,
+                w1_u8=None,
+                w1_scale_u8=None,
+                m_indices=None,
+                inter_sorted_bf16=None,
+                n_tokens=3,
+                **common,
+            )
+        else:
+            kernels.flydsl_a16w4_gemm2(
+                inter_sorted_bf16=None,
+                w2_u8=None,
+                w2_scale_u8=None,
+                sorted_token_ids=None,
+                sorted_weights=None,
+                flat_out=None,
+                M_logical=3,
+                max_sorted=32,
+                **common,
+            )
+
+
+@pytest.mark.parametrize("stage", [1, 2])
+@pytest.mark.parametrize("arch", ["gfx942", "gfx950"])
+@pytest.mark.parametrize("weight_dtype", ["fp4", "int4"])
+@pytest.mark.parametrize("tile_k", [-128, 0, 16, 32, 64, 96, 192, 128, 256])
+def test_packed_k_tile_compile_boundary(monkeypatch, stage, arch, weight_dtype, tile_k):
+    from aiter.ops.flydsl.kernels.moe_2stage_a16wmix import gemm1, gemm2
+
+    module = gemm1 if stage == 1 else gemm2
+
+    def reached_ir_boundary(*args, **kwargs):
+        raise RuntimeError("reached IR construction")
+
+    monkeypatch.setattr(module.fx, "struct", reached_ir_boundary)
+    arguments = {
+        "NE": 8,
+        "D_INTER": 768,
+        "TILE_N": 128 if stage == 1 else 256,
+        "TILE_K": tile_k,
+        "w_dtype": weight_dtype,
+        "rocm_arch": arch,
+    }
+    if stage == 1:
+        compile_stage = module.compile_gemm1_a16w4_port
+        arguments.update(D_HIDDEN=768, TOPK=2)
+    else:
+        compile_stage = module.compile_gemm2_a16w4_port
+        arguments.update(N_OUT=256)
+    if tile_k in (128, 256):
+        with pytest.raises(RuntimeError, match="reached IR construction"):
+            compile_stage(**arguments)
+    else:
+        with pytest.raises(ValueError, match="positive multiple of 128"):
+            compile_stage(**arguments)
+
+
+@pytest.mark.parametrize("arch", ["gfx942", "gfx950"])
+@pytest.mark.parametrize(
+    "stage1_k,stage2_k",
+    [(16, 128), (64, 128), (128, 16), (128, 64), (0, 128), (128, 0), (128, 128)],
+)
+def test_explicit_moe_k_tiles_rejected_before_sort(
+    monkeypatch, arch, stage1_k, stage2_k
+):
+    import importlib
+
+    from aiter.jit.utils import chip_info
+
+    def reached_sort(*args, **kwargs):
+        raise RuntimeError("reached MoE sorting")
+
+    monkeypatch.setattr(chip_info, "get_gfx_runtime", lambda: arch)
+    monkeypatch.setattr(
+        importlib.import_module("aiter.fused_moe"), "moe_sorting", reached_sort
+    )
+    arguments = {
+        "hidden_states": torch.empty((3, 256), dtype=torch.bfloat16),
+        "w1": torch.empty((8, 768, 128), dtype=torch.uint8),
+        "w2": torch.empty((8, 256, 192), dtype=torch.uint8),
+        "w1_scale": torch.empty((8, 768, 8), dtype=torch.uint8),
+        "w2_scale": torch.empty((8, 256, 16), dtype=torch.uint8),
+        "topk_ids": torch.zeros((3, 2), dtype=torch.int32),
+        "topk_weights": torch.ones((3, 2), dtype=torch.float32),
+        "swiglu_limit": 10.0,
+        "tiles": A16W4Tiles(32, 128, stage1_k, 256, stage2_k),
+    }
+    if (stage1_k, stage2_k) == (128, 128):
+        with pytest.raises(RuntimeError, match="reached MoE sorting"):
+            flydsl_a16w4_moe(**arguments)
+    else:
+        with pytest.raises(ValueError, match="MXFP4 K tiles"):
+            flydsl_a16w4_moe(**arguments)
+
+
 @pytest.mark.parametrize("activation_bf16", [False, True])
 def test_compile_stage1_forwards_activation_bf16(monkeypatch, activation_bf16):
     from flydsl.runtime import device
@@ -1286,9 +1408,9 @@ def benchmark_moe_clamped_silu(
 
 
 @_SKIP
-@pytest.mark.parametrize("token", [1, 8, 33])
+@pytest.mark.parametrize("token,topk", [(1, 6), (3, 2), (8, 6), (33, 6)])
 @pytest.mark.parametrize("tile_m,reuse_lds", [(32, False), (32, True), (64, True)])
-def test_moe_clamped_silu(token, tile_m, reuse_lds):
+def test_moe_clamped_silu(token, topk, tile_m, reuse_lds):
     if reuse_lds and get_gfx() != "gfx942":
         pytest.skip("LDS reuse is qualified only on gfx942")
     result = benchmark_moe_clamped_silu(
@@ -1296,7 +1418,7 @@ def test_moe_clamped_silu(token, tile_m, reuse_lds):
         256,
         384,
         8,
-        6,
+        topk,
         True,
         logical_inter=288,
         tile_m=tile_m,

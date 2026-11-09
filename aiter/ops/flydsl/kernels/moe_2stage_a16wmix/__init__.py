@@ -120,6 +120,10 @@ def flydsl_a16w4_gemm1(
     BM = tile_m
     TILE_K = tile_k
     TILE_N = tile_n
+    if w_dtype in ("fp4", "int4") and (TILE_K <= 0 or TILE_K % 128):
+        raise ValueError(
+            f"{w_dtype} TILE_K must be a positive multiple of 128, got {TILE_K}"
+        )
     # Tile config is fully CSV/registry-driven: the caller resolves tile_n/tile_k/
     # k_wave/b_nt/xcd_swizzle from the tuned kernelName1 and always passes them.
     b_cache_mod = 2 if b_nt is None else b_nt
@@ -236,6 +240,10 @@ def flydsl_a16w4_gemm2(
     BM = tile_m
     TILE_N = tile_n
     TILE_K = tile_k
+    if w_dtype in ("fp4", "int4") and (TILE_K <= 0 or TILE_K % 128):
+        raise ValueError(
+            f"{w_dtype} TILE_K must be a positive multiple of 128, got {TILE_K}"
+        )
     # Tile config is CSV/registry-driven: the caller resolves tile_n/tile_k/b_nt/
     # xcd_swizzle from the tuned kernelName2 and always passes them.
     if D_INTER % TILE_K != 0:
@@ -390,6 +398,13 @@ def flydsl_a16w4_moe(
         )
         if tiles is None:
             tiles = A16W4Tiles(32, 128, 256, 256, 128)
+    if (
+        tiles.stage1_k <= 0
+        or tiles.stage1_k % 128
+        or tiles.stage2_k <= 0
+        or tiles.stage2_k % 128
+    ):
+        raise ValueError("MXFP4 K tiles must be positive multiples of 128")
     if (
         tiles.block_m not in (16, 32, 64, 128)
         or min(tiles.stage1_n, tiles.stage1_k, tiles.stage2_n, tiles.stage2_k) <= 0
