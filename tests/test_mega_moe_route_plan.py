@@ -111,7 +111,7 @@ def test_route_exclusions():
     assert plan.route_for(100, small_m=False) == (ROUTE_STAGED, 8192)
     assert plan.route_for(4096) == (ROUTE_LARGE_M, 8192)
     assert plan.route_for(4096, large_m=False) == (ROUTE_STAGED, 8192)
-    # Without a hint the instance plans for its capacity.
+    # MegaMoEV2 itself takes the staged route when a call passes no max_tokens.
     assert plan.route_for(plan.mtpr) == (ROUTE_LARGE_M, 8192)
     staged_only = _plan(8192, small=(), large=False)
     assert all(
@@ -179,3 +179,14 @@ def test_fused_configs_unchanged():
         )
     digest = hashlib.sha256(repr(sorted(table.items())).encode()).hexdigest()
     assert digest == _FUSED_DIGEST, table
+
+
+@pytest.mark.parametrize("mtpr", MTPRS)
+def test_no_hint_takes_staged(mtpr):
+    from aiter.ops.flydsl.kernels.mega_moe.mega_moe_v2 import MegaMoEV2
+
+    moe = object.__new__(MegaMoEV2)  # _route needs only the plan and the capacity
+    moe.mtpr, moe._bundle_plan, moe._large_m_excluded = mtpr, _plan(mtpr), False
+    for rows in sorted({0, 1, min(128, mtpr), mtpr}):
+        assert moe._route(rows, None) == (ROUTE_STAGED, mtpr)
+        assert moe._route(rows, None, small_m=False) == (ROUTE_STAGED, mtpr)
