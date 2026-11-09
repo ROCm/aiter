@@ -547,6 +547,16 @@ class _Stage1Fusion:
             self.launches[key] = launch
         return launch
 
+    @staticmethod
+    def _run(launch, args) -> None:
+        # Calling the @flyc.jit launcher rebuilds its cache key on every launch
+        # (~110 us/layer of host time in eager prefill). Its tensor arguments
+        # are layout-dynamic, so only their dtype and rank pick the artifact.
+        from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
+
+        spec = tuple((a.dtype, a.dim()) for a in args if isinstance(a, torch.Tensor))
+        _run_compiled(launch, *args, specialization_key=spec)
+
     def _precompile(self, launch_args, *, tile_m, group_m, stage1_act, quant_wmma_rep):
         from .compact_plan import compact_run_buffer_dwords
 
@@ -580,7 +590,7 @@ class _Stage1Fusion:
             )
             if id(launch) not in seen:
                 seen.add(id(launch))
-                launch(*launch_args(psum, send, runs, tsrc, 0))
+                self._run(launch, launch_args(psum, send, runs, tsrc, 0))
         torch.cuda.synchronize()
         d.res.arena._communicator.barrier()
 
@@ -716,8 +726,9 @@ class _Stage1Fusion:
             quant_wmma_rep=int(quant_wmma_rep),
             block_runs=block_runs,
         )
-        launch(
-            *launch_args(
+        self._run(
+            launch,
+            launch_args(
                 m_tile_map, bufs["send_list"], bufs["runs"], bufs["tile_src"], tokens
-            )
+            ),
         )
