@@ -191,11 +191,11 @@ def prepare_packaging():
 
 
 if is_develop_mode():
-    packages = ["aiter"]
+    packages = ["aiter", "aiter.plugin"]
     write_install_mode()
 else:
     prepare_packaging()
-    packages = ["aiter_meta", "aiter"]
+    packages = ["aiter_meta", "aiter", "aiter.plugin"]
 
 
 def _is_metadata_only():
