@@ -8,21 +8,27 @@ Exposes ``pa_prefill_sparse`` — grid ``(T, cdiv(H, BLOCK_H))``, one token
 and BLOCK_H heads per CTA. Same grid as the decode kernel. No split-K:
 prefill fills the GPU via the token dimension.
 
-Gfx950(`mla_gluon`) and others(Triton `_sparse_attn_prefill_kernel`, they
-take a 1-D ``(kv_indices, kv_indptr)`` pair over one pool.
+Gfx950 (the single-pass gluon kernel, or `mla_gluon`) and others (Triton
+`_sparse_attn_prefill_kernel`) take a 1-D ``(kv_indices, kv_indptr)`` pair
+over one pool.
 
 ``pa_prefill_sparse`` — a single entry that dispatches on arch:
 
     gfx1250 -> gluon ``_pa_prefill_sparse``           (two sources, native)
-    gfx950  -> gluon wrapper ``mla_gluon``            (single source)
+    gfx950  -> gluon ``_pa_prefill_sparse``           (single source, H=32, D=512, bf16)
+               else gluon wrapper ``mla_gluon``       (single source)
     else    -> triton ``_sparse_attn_prefill_kernel`` (single source)
 """
 
 import functools
 
+import numpy as np
 import torch
 import triton
 
+from aiter.ops.triton._gluon_kernels.gfx950.attention.pa_prefill_sparse import (
+    _pa_prefill_sparse as _pa_prefill_sparse_gfx950,
+)
 from aiter.ops.triton._gluon_kernels.gfx1250.attention.pa_prefill_sparse import (
     _pa_prefill_sparse as gluon_pa_prefill_sparse,
 )
@@ -33,6 +39,7 @@ from aiter.ops.triton.gluon.mla_gluon import (
     mla_gluon as gluon_mla_sparse_prefill,
 )
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.tuned_config_utils import get_tuned_kernel_config
 
@@ -78,9 +85,11 @@ def pa_prefill_sparse(
 ) -> torch.Tensor:
     """Sparse prefill attention over two KV sources with sink.
 
-    Dispatches on arch: gfx1250 -> gluon (two sources), gfx950 -> `mla_gluon`,
-    otherwise the Triton kernel. Only gfx1250 reads a second KV source; the
-    other two serve the prefix source alone and reject a non-empty extend.
+    Dispatches on arch: gfx1250 -> gluon (two sources), gfx950 -> a single-pass
+    gluon kernel for bf16 q and KV with H=32 and D=512 and at least the
+    config's MIN_TOKENS query rows, else `mla_gluon`; otherwise the Triton
+    kernel. Only gfx1250 reads a second KV source; the other two serve the
+    prefix source alone and reject any extend source.
 
     Meant for prefill-sized calls. The grid is one program per query token with
     no split over the KV slots, so a call with only a few query rows (a decode
@@ -103,8 +112,9 @@ def pa_prefill_sparse(
         softmax_scale:     float.
         has_invalid:       gfx1250 only: whether index lists may hold ``-1``
             sentinels (``None`` picks a heuristic). The Triton fallback always
-            skips ``-1`` and out-of-pool slots. gfx950 (``mla_gluon``) does not
-            check slot values: pass only valid slots there.
+            skips ``-1`` and out-of-pool slots. gfx950 does not check slot
+            values: pass only valid slots there. ``True`` keeps gfx950 on
+            ``mla_gluon``.
         out:               optional contiguous [T, H, D] buffer on q's device,
             same dtype as q; written in place and returned.
 
@@ -227,6 +237,17 @@ def pa_prefill_sparse(
             kv_indices_extend,
             kv_indptr_extend,
         )
+        if _use_single_pass(q, unified_kv, has_invalid):
+            _single_pass_prefill(
+                q,
+                unified_kv,
+                kv_indices_prefix,
+                kv_indptr_prefix,
+                attn_sink,
+                softmax_scale,
+                out,
+            )
+            return out
         gluon_mla_sparse_prefill(
             q,  # q_nope = combined-D query (RoPE folded in)
             None,  # q_pe unused in prefill mode
@@ -320,6 +341,83 @@ def pa_prefill_sparse(
             BLOCK_D=block_d,
         )
         return out
+
+
+# ---------------------------------------------------------------------------
+# gfx950 single-pass kernel
+# ---------------------------------------------------------------------------
+
+_LOG2E = 1.44269504089
+
+
+@functools.lru_cache
+def _single_pass_config() -> dict:
+    """Launch config of the gfx950 single-pass kernel, with its MIN_TOKENS bound.
+
+    Returns the cached dict: do not change it.
+    """
+    cfg_dir = resolve_config_dir("attention", "PA_PREFILL_SPARSE", backend="gluon")
+    return load_config_json(f"{cfg_dir}/DEFAULT.json")["_pa_prefill_sparse"]
+
+
+def _use_single_pass(
+    q: torch.Tensor, unified_kv: torch.Tensor, has_invalid: bool | None
+) -> bool:
+    """Whether the gfx950 single-pass kernel serves the call, else `mla_gluon`."""
+    T, H, D = q.shape
+    return (
+        H == 32
+        and D == 512
+        and q.dtype == torch.bfloat16
+        and unified_kv.dtype == torch.bfloat16
+        and unified_kv.dim() == 2
+        and unified_kv.shape[1] == D
+        and q.stride(2) == 1
+        and unified_kv.stride(1) == 1
+        and has_invalid is not True
+        and T >= _single_pass_config()["MIN_TOKENS"]
+    )
+
+
+@functools.lru_cache(maxsize=64)
+def _qk_scale(softmax_scale: float) -> float:
+    """fp32(softmax_scale) * fp32(log2(e)), rounded once in fp32."""
+    return float(np.float32(softmax_scale) * np.float32(_LOG2E))
+
+
+def _single_pass_prefill(
+    q: torch.Tensor,
+    unified_kv: torch.Tensor,
+    kv_indices: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    attn_sink: torch.Tensor | None,
+    softmax_scale: float,
+    out: torch.Tensor,
+) -> None:
+    """Launch the gfx950 single-pass kernel, one program per query row."""
+    T, H, _ = q.shape
+    cfg = _single_pass_config()
+    _LOGGER.info("PA_PREFILL_SPARSE gfx950 single-pass T=%d H=%d", T, H)
+    if attn_sink is not None:
+        attn_sink = attn_sink.to(torch.float32).contiguous()
+    _pa_prefill_sparse_gfx950[(T,)](
+        q,
+        unified_kv,
+        kv_indices,
+        kv_indptr,
+        attn_sink,
+        out,
+        q.stride(0),
+        q.stride(1),
+        unified_kv.stride(0),
+        out.stride(0),
+        out.stride(1),
+        _qk_scale(float(softmax_scale)),
+        H=H,
+        BLOCK_K=cfg["BLOCK_K"],
+        HAS_SINK=attn_sink is not None,
+        num_warps=cfg["num_warps"],
+    )
 
 
 # ---------------------------------------------------------------------------
