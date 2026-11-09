@@ -1,4 +1,3 @@
-import inspect
 import math
 
 import torch
@@ -15,21 +14,6 @@ from aiter.ops.triton.utils.types import e4m3_dtype
 float8_info = torch.finfo(e4m3_dtype)
 
 _MAX_PROPAGATE_NAN_ALL = gl.constexpr(PropagateNan.ALL)
-
-# tdm.async_gather takes a source column in upstream Triton (desc, rows, col, dst) but not in every gfx1250 build
-# (desc, rows, dst); _tdm_gather calls whichever this Triton has.
-_GATHER_TAKES_COL = gl.constexpr(
-    len(inspect.signature(gl.amd.gfx1250.tdm.async_gather).parameters) >= 6
-)
-
-
-@gluon.jit
-def _tdm_gather(desc, src_row_indices, dst):
-    if _GATHER_TAKES_COL:
-        gl.amd.gfx1250.tdm.async_gather(desc, src_row_indices, 0, dst)
-    else:
-        gl.amd.gfx1250.tdm.async_gather(desc, src_row_indices, dst)
-
 
 @gluon.constexpr_function
 def _tdm_ops_after(cfg, wait_count, later):
@@ -1042,16 +1026,24 @@ class TDMGatherKVLoader:
         src_row_indices = (k_offset * self.cfg.NUM_KV_HEADS + self.kv_head_idx).to(
             gl.int32
         )
-        _tdm_gather(self.k_desc, src_row_indices, self.k_shared.index(buffer_id))
+        gl.amd.gfx1250.tdm.async_gather(
+            self.k_desc, src_row_indices, self.k_shared.index(buffer_id)
+        )
         if self.cfg.KV_NVFP4:
-            _tdm_gather(self.k_scales_desc, src_row_indices, self.k_scales_shared.index(buffer_id))
+            gl.amd.gfx1250.tdm.async_gather(
+                self.k_scales_desc,
+                src_row_indices,
+                self.k_scales_shared.index(buffer_id),
+            )
 
     @gluon.jit
     def load_v_to_shared(self, v_offset, buffer_id=0):
         src_row_indices = (v_offset * self.cfg.NUM_KV_HEADS + self.kv_head_idx).to(
             gl.int32
         )
-        _tdm_gather(self.v_desc, src_row_indices, self.v_shared.index(buffer_id))
+        gl.amd.gfx1250.tdm.async_gather(
+            self.v_desc, src_row_indices, self.v_shared.index(buffer_id)
+        )
 
     @gluon.jit
     def load_k_from_shared(
