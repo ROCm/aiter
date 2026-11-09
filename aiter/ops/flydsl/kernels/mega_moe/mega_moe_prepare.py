@@ -6,7 +6,7 @@ import functools
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir.dialects import llvm  # raw asm: no fx wrapper (see _kcache_touch)
+from flydsl._mlir.dialects import llvm  # llvm.fake.use: no fx wrapper (_keep_alive)
 from flydsl.expr import arith, const_expr, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import ReductionOp, T
@@ -206,8 +206,9 @@ def _store_i32_monotonic(addr_i64, offset, val, syncscope):
     off = arith.unwrap(offset)
     off64 = fx.Uint64(fx.Uint32(off)) if off.type == T.i32 else fx.Int64(off)
     addr = fx.Int64(addr_i64) + fx.Int64(off64) * 4
+    ptr_type = fx.PointerType.get(fx.Int32.ir_type, fx.AddressSpace.Global, 4)
     fx.generic_store(
-        comm_ops._to_ptr_global(addr),
+        fx.inttoptr(ptr_type, fx.Int64(addr)),
         fx.Int32(val),
         memory_order=fx.AtomicOrdering.Monotonic,
         syncscope=syncscope,
@@ -234,15 +235,21 @@ def _store_i32_agent_relaxed(addr_i64, offset, val):
 # on a cold scalar-cache line.  One helper warp touches every 64-byte line of
 # the table while the owner is idle in its prologue barrier, so the later
 # per-phase loads hit.
-# Raw llvm.InlineAsmOp / llvm.inline_asm are used only here and for the
-# quant-steal opaque zero: fx has no wrapper for an operand-only
-# side-effecting asm, which is what keeps the scalar loads alive.
+# The loads have no real consumer, so each result is pinned with
+# llvm.fake.use (no fx wrapper; emits no instruction, same idiom as
+# mla_gfx1250 keep_alive) and the warp waits for them with lgkmcnt(0).
+
+
+def _keep_alive(vals):
+    """Keep each SSA value live up to here (llvm.fake.use)."""
+    for v in vals:
+        llvm.call_intrinsic(None, "llvm.fake.use", [v], [], [])
 
 
 def _kcache_touch(addr_table, num_dwords):
     """Load one dword of every 64-byte line of ``addr_table[0:num_dwords]``
-    and consume them in a side-effecting asm (forces the loads to land in
-    the scalar cache here; the result itself is discarded)."""
+    and keep them alive (forces the loads to land in the scalar cache
+    here; the result itself is discarded)."""
     table = ptr_buf_tensor(addr_table, fx.Int32)
     offsets = list(range(0, num_dwords, 16))
     if offsets[-1] != num_dwords - 1:
@@ -250,18 +257,20 @@ def _kcache_touch(addr_table, num_dwords):
     vals = [
         arith.unwrap(fx.Int32(buf_scalar_load(table, fx.Int32(dw)))) for dw in offsets
     ]
-    llvm.InlineAsmOp(None, vals, "", ",".join(["s"] * len(vals)), has_side_effects=True)
+    _keep_alive(vals)
+    fx.rocdl.s_waitcnt(lgkmcnt=0)
 
 
 def _kcache_touch_tables(addr_tables):
     """_kcache_touch of the first 64-byte line of each table, all loads
-    issued before the single consuming asm (one scalar-cache round trip)."""
+    issued before the single wait (one scalar-cache round trip)."""
     vals = []
     for addr_table in addr_tables:
         table = ptr_buf_tensor(addr_table, fx.Int32)
         for dw in (0, 15):
             vals.append(arith.unwrap(fx.Int32(buf_scalar_load(table, fx.Int32(dw)))))
-    llvm.InlineAsmOp(None, vals, "", ",".join(["s"] * len(vals)), has_side_effects=True)
+    _keep_alive(vals)
+    fx.rocdl.s_waitcnt(lgkmcnt=0)
 
 
 def _store_i32_sys_relaxed(addr_i64, offset, val):
@@ -318,10 +327,7 @@ def _wst4(buffer4, index, vec, *, wt_owner):
 
 @flyc.jit
 def _dpp_max_i32(value, ctrl):
-    remote = fx.rocdl.update_dpp(
-        T.i32, value.ir_value(), value.ir_value(), ctrl, 0xF, 0xF, False
-    )
-    remote = fx.Int32(remote)
+    remote = fx.Int32(update_dpp_i32(value, value, ctrl, 0xF, 0xF, False))
     return (remote > value).select(remote, value)
 
 
@@ -733,12 +739,8 @@ def _ll_own_finish(
 def _top2_step(m1, m2, ctrl):
     """Merge this lane's (max, second max) with its DPP partner's (disjoint
     lane sets for the xor-1/xor-2/half-mirror/mirror steps)."""
-    p1 = fx.Int32(
-        fx.rocdl.update_dpp(T.i32, m1.ir_value(), m1.ir_value(), ctrl, 0xF, 0xF, False)
-    )
-    p2 = fx.Int32(
-        fx.rocdl.update_dpp(T.i32, m2.ir_value(), m2.ir_value(), ctrl, 0xF, 0xF, False)
-    )
+    p1 = fx.Int32(update_dpp_i32(m1, m1, ctrl, 0xF, 0xF, False))
+    p2 = fx.Int32(update_dpp_i32(m2, m2, ctrl, 0xF, 0xF, False))
     hi = (p1 > m1).select(p1, m1)
     lo = (p1 > m1).select(m1, p1)
     o2 = (p2 > m2).select(p2, m2)
@@ -3636,18 +3638,14 @@ def _compile_fast_mega_moe_prepare(
                         steal_count = num_full - static_end
                         last_grab = steal_count + fx.Int32(quant_blocks - 1)
                         rewind = fx.Int32(0) - (steal_count + fx.Int32(quant_blocks))
-                        # Opaque (divergent-looking) zero offset: keeps LLVM's
-                        # atomic optimizer off the in-loop grab, whose
-                        # mbcnt/readfirstlane expansion forces an immediate
-                        # vmcnt(0) drain of wave 0.  The result is consumed
-                        # _QUANT_GRAB_AT chunks later instead.
-                        opaque0 = fx.Int32(
-                            llvm.inline_asm(
-                                T.i32, [], "v_mov_b32 $0, 0", "=v",
-                                has_side_effects=False,
-                            )
-                        )
-                        steal_addr_v = steal_addr + fx.Int64(opaque0)
+                        # In-loop grab address indexed by the issuing lane
+                        # (only tid 0 grabs, so it is exactly steal_addr).  A
+                        # tid-dependent address is divergent to LLVM, which
+                        # keeps the AMDGPU atomic optimizer off this atomic:
+                        # its mbcnt/readfirstlane expansion forces an
+                        # immediate vmcnt(0) drain of wave 0, whereas the
+                        # result is consumed _QUANT_GRAB_AT chunks later.
+                        steal_addr_v = steal_addr + fx.Int64(tid) * fx.Int64(4)
                     n_mine = (
                         static_end - quant_slot + fx.Int32(quant_blocks - 1)
                     ) // fx.Int32(quant_blocks)
