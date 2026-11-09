@@ -2465,8 +2465,9 @@ def build_fmha_fwd_prefill_a16w16_m32x8(
                     warp_idx=warp_idx,
                     **{k: _core_kwargs[k] for k in _EPILOGUE_KEYS},
                 )
-            elif q_len > fx.Int32(0):
+            elif (q_len > fx.Int32(0)) & tile_has_rows:
                 # Cross-attention tail: q_len>0 but kv_len==0 -> O=0, LSE=-inf (or sink).
+                # A tile past the queries has no row to fill, so it skips this too.
                 _zero_fill_attention(
                     v_hdim=V_HDIM,
                     gqa_ratio=GQA_RATIO,
