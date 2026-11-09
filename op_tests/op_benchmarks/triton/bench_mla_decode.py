@@ -189,7 +189,6 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
 
 def run_bench(args):
     torch.manual_seed(0)
-    torch.set_default_device(args.device)
     benchmark(args)
 
 

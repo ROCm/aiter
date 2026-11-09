@@ -10,6 +10,7 @@
 #include "aiter_dispatch.h"
 #include "aiter_stream.h"
 #include "cache.h"
+#include "quant_amax_floor.h"
 #include "hip_reduce.h"
 
 #include "attention_dtypes.h"
@@ -446,11 +447,12 @@ __global__ void reshape_and_cache_with_per_token_quant_kernel(
     }();
     float v_max = wave_reduce(v_local_max, f_max_f32);
 
-    constexpr float k_pertoken_quant_scale_eps = 1e-12f;
-    float k_token_scale = k_max / dtypeMax;
-    float v_token_scale = v_max / dtypeMax;
-    float k_token_scale_inverted = 1.0f / fmaxf(k_token_scale, k_pertoken_quant_scale_eps);
-    float v_token_scale_inverted = 1.0f / fmaxf(v_token_scale, k_pertoken_quant_scale_eps);
+    // Floored at the amax, not at the inverse: the scale stored for dequant is
+    // then the one the values were quantized with, and never zero.
+    float k_token_scale          = fmaxf(k_max, aiter::kAmaxFloor) / dtypeMax;
+    float v_token_scale          = fmaxf(v_max, aiter::kAmaxFloor) / dtypeMax;
+    float k_token_scale_inverted = 1.0f / k_token_scale;
+    float v_token_scale_inverted = 1.0f / v_token_scale;
 
 #pragma unroll
     for(int i_d = 0; i_d < local_dim_elems; i_d++)
@@ -603,8 +605,8 @@ __global__ void reshape_and_cache_with_block_quant_kernel(
     };
     auto f_max_f32 = [](float v_0_, float v_1_) { return __builtin_fmaxf(v_0_, v_1_); };
 
-    float k_max_val = 1e-6;
-    float v_max_val = 1e-6;
+    float k_max_val = aiter::kAmaxFloor;
+    float v_max_val = aiter::kAmaxFloor;
 #pragma unroll
     for(int id = 0; id < numtokens_in_block * head_size; id += blockDim.x)
     {
@@ -854,8 +856,8 @@ __global__ void reshape_and_cache_with_block_quant_kernel_for_asmpa(
     };
     auto f_max_f32 = [](float v_0_, float v_1_) { return __builtin_fmaxf(v_0_, v_1_); };
 
-    float k_max_val = 1e-6;
-    float v_max_val = 1e-6;
+    float k_max_val = aiter::kAmaxFloor;
+    float v_max_val = aiter::kAmaxFloor;
 #pragma unroll
     for(int id = 0; id < numtokens_in_block * head_size; id += blockDim.x)
     {
@@ -1865,7 +1867,7 @@ __global__ void indexer_qk_rope_quant_and_cache_kernel(
 
             const float q_fp8_max     = static_cast<float>(opus::finfo<cache_t>::max());
             const float q_inv_fp8_max = 1.0f / q_fp8_max;
-            float q_scale             = fmaxf(q_amax, 1e-10f) * q_inv_fp8_max;
+            float q_scale             = fmaxf(q_amax, aiter::kAmaxFloor) * q_inv_fp8_max;
             if(use_ue8m0)
             {
                 q_scale = exp2f(ceilf(log2f(q_scale)));
@@ -2630,8 +2632,9 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
     // a padded token has already returned, and a per-row descriptor keeps the
     // row offset scalar (~2% at H=128 T=1536).
     int64_t pos = positions[token_idx];
-    // A padded token whose Q is kept may carry a stale position: clamp it.
-    if(compute_all_q_rope)
+    // Clamp pos into the cos/sin cache. Padded tokens can carry stale positions.
+    // Per-entry callers may pass a short cache, like a NoPE model's one identity row.
+    if(PAGE_SIZE == 0 || compute_all_q_rope)
         pos = pos < 0 ? 0 : (pos >= max_position ? max_position - 1 : pos);
     const scalar_t* cos_base = cos_cache;
     const scalar_t* sin_base = sin_cache;
@@ -2829,7 +2832,7 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
     // and the unrolled loop counter, so it stays scalar; widening the block
     // with more threads instead made it thread-derived, pushed the address
     // chain into VGPRs and measured slower at every width.
-#if defined(__gfx1250__)
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
     // gfx1250: stage Q through the tensor engine, within the three tensor ops
     // a wave can hold in flight. A wave consumes only what it staged, so there
     // is no block barrier, just the tensor wait. The host sizes the dynamic
@@ -5423,7 +5426,7 @@ static int mla_rope_heads_per_block(int64_t num_tokens, int num_heads)
 // hpt x 256 nope plus min(hpt, 4) x 64 pe elements.
 static size_t mla_rope_tdm_lds_bytes(int hpt, size_t elem_size)
 {
-    static const bool tdm_arch = get_gpu_arch() == "gfx1250";
+    static const bool tdm_arch = (get_gpu_arch() == "gfx1250" || get_gpu_arch() == "gfx1250-strict");
     if(!tdm_arch || ((AITER_MLA_SEG_TDM_HPT_MASK >> hpt) & 1) == 0)
         return 0;
     return size_t(2) * (hpt * 256 + std::min(hpt, 4) * 64) * elem_size;

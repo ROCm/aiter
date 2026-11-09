@@ -49,7 +49,7 @@ def benchmark_fast_transpose(args):
 
     @triton.testing.perf_report([config])
     def _run(M, N, provider):
-        x = torch.randn(M, N, device="cuda").to(dtype)
+        x = torch.randn(M, N, dtype=torch.float32, device="cuda").to(dtype)
         fn = partial(
             _torch_transpose_2d if provider == "torch" else fast_transpose_2d, x
         )

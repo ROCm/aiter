@@ -82,6 +82,7 @@ def _fused_gemm_afp4wfp4_split_cat(
     EVEN_K: tl.constexpr,
     GRID_MN: tl.constexpr,
     cache_modifier: tl.constexpr,
+    NUM_XCDS: tl.constexpr,
 ):
     tl.assume(stride_a_m > 0)
     tl.assume(stride_a_k > 0)
@@ -105,7 +106,7 @@ def _fused_gemm_afp4wfp4_split_cat(
     # This is done in a grouped ordering to promote L2 data reuse.
     pid_unified = tl.program_id(axis=0)
     # remap so that XCDs get continous chunks of pids (of CHUNK_SIZE).
-    pid_unified = remap_xcd(pid_unified, GRID_MN * NUM_KSPLIT, NUM_XCDS=8)
+    pid_unified = remap_xcd(pid_unified, GRID_MN * NUM_KSPLIT, NUM_XCDS=NUM_XCDS)
 
     pid_k = pid_unified % NUM_KSPLIT
     pid = pid_unified // NUM_KSPLIT
@@ -264,7 +265,7 @@ def _fused_gemm_afp4wfp4_split_cat(
                 c1_ptr
                 + stride_c1_m * offs_c1_m[:, None]
                 + stride_c1_n * offs_c1_n[None, :]
-                + stride_c1_k * pid_k
+                + stride_c1_k * pid_k.to(tl.int64)
             )
             c1_mask = (offs_c1_m[:, None] < M) & (offs_c1_n[None, :] < N)
             tl.store(c1_ptrs, c, mask=c1_mask)
@@ -342,6 +343,7 @@ def _fused_gemm_afp4wfp4_preshuffle_split_cat(
     EVEN_K: tl.constexpr,
     GRID_MN: tl.constexpr,
     cache_modifier: tl.constexpr,
+    NUM_XCDS: tl.constexpr,
 ):
     tl.assume(stride_a_m > 0)
     tl.assume(stride_a_k > 0)
@@ -365,7 +367,7 @@ def _fused_gemm_afp4wfp4_preshuffle_split_cat(
     # This is done in a grouped ordering to promote L2 data reuse.
     pid_unified = tl.program_id(axis=0)
     # remap so that XCDs get continous chunks of pids (of CHUNK_SIZE).
-    pid_unified = remap_xcd(pid_unified, GRID_MN * NUM_KSPLIT, NUM_XCDS=8)
+    pid_unified = remap_xcd(pid_unified, GRID_MN * NUM_KSPLIT, NUM_XCDS=NUM_XCDS)
 
     pid_k = pid_unified % NUM_KSPLIT
     pid = pid_unified // NUM_KSPLIT
@@ -575,7 +577,7 @@ def _fused_gemm_afp4wfp4_preshuffle_split_cat(
                 c1_ptr
                 + stride_c1_m * offs_c1_m[:, None]
                 + stride_c1_n * offs_c1_n[None, :]
-                + stride_c1_k * pid_k
+                + stride_c1_k * pid_k.to(tl.int64)
             )
             c1_mask = (offs_c1_m[:, None] < M) & (offs_c1_n[None, :] < N)
             tl.store(c1_ptrs, c, mask=c1_mask)
@@ -646,7 +648,7 @@ def _fused_gemm_afp4wfp4_split_cat_reduce(
     offs_k = tl.arange(0, MAX_KSPLIT)
     c_ptrs = (
         c_ptr
-        + (offs_k[:, None, None] * stride_c_k)
+        + (offs_k[:, None, None].to(tl.int64) * stride_c_k)
         + (offs_m[None, :, None] * stride_c_m)
         + (offs_n[None, None, :] * stride_c_n)
     )

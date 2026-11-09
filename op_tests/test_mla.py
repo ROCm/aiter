@@ -6,11 +6,13 @@ import itertools
 import random
 
 import pandas as pd
+import pytest
 import torch
 
 import aiter
 from aiter import dtypes
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx, get_num_xcds
+from aiter.ops.triton.utils.device_info import get_num_sms
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
@@ -23,6 +25,138 @@ torch.set_printoptions(sci_mode=False)
 
 def check_support(dtype, kv_dtype, nhead):
     return not (dtype == dtypes.fp8 and kv_dtype == dtypes.bf16)
+
+
+def check_asm_decode_rejects_unsupported_widths():
+    """The gfx942/gfx950 decode kernels take no row width: they assume 576-wide
+    rows (656 bytes per packed byte-KV token, dense within a page) and 512-wide
+    outputs."""
+    batch_size, nhead, ctx_lens = 4, 16, 300
+    qo_indptr = torch.arange(batch_size + 1, dtype=torch.int)
+    kv_indptr = qo_indptr * ctx_lens
+    kv_indices = torch.arange(batch_size * ctx_lens, dtype=torch.int)
+    kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
+    scale = torch.ones(1, dtype=torch.float)
+
+    def decode(q, kv_buffer, v_head_dim=512):
+        out = torch.empty((batch_size, nhead, v_head_dim), dtype=torch.bfloat16)
+        aiter.mla.mla_decode_fwd(
+            q,
+            kv_buffer,
+            out,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_lens,
+            1,
+            q_scale=scale,
+            kv_scale=scale,
+        )
+
+    for dtype, kvtype in [
+        (torch.bfloat16, torch.bfloat16),
+        (torch.bfloat16, dtypes.fp8),
+        (dtypes.fp8, dtypes.fp8),
+    ]:
+        q = torch.randn((batch_size, nhead, 512)).to(dtype)
+        kv_buffer = torch.randn((batch_size * ctx_lens, 1, 1, 512)).to(kvtype)
+        with pytest.raises(RuntimeError, match="576-element MLA rows"):
+            decode(q, kv_buffer)
+
+    q = torch.randn((batch_size, nhead, 576), dtype=torch.bfloat16)
+    kv_buffer = torch.randn((batch_size * ctx_lens, 1, 1, 576), dtype=torch.bfloat16)
+    with pytest.raises(RuntimeError, match="only support v_head_dim 512"):
+        decode(q, kv_buffer, v_head_dim=256)
+    # 512 fp8 latent + 4 fp32 scales per token, without the 64 bf16 RoPE elements.
+    with pytest.raises(RuntimeError, match="byte KV must be"):
+        decode(q, torch.zeros((batch_size * ctx_lens, 528), dtype=torch.uint8))
+    # The right shape, but every page aliases a single byte.
+    with pytest.raises(RuntimeError, match=r"byte KV must be.*stride\(1\) 0 "):
+        decode(q, torch.zeros(1, dtype=torch.uint8).expand(batch_size * ctx_lens, 656))
+
+    # mla_decode_fwd sizes splitData from the output, so only a direct call can
+    # pair a 512-wide output with a narrower splitData.
+    num_kv_splits, num_kv_splits_indptr = aiter.mla.get_meta_param(
+        None, batch_size, batch_size * ctx_lens, nhead, 1, torch.bfloat16
+    )
+    with pytest.raises(RuntimeError, match="splitData with v_head_dim 512"):
+        aiter.mla_decode_stage1_asm_fwd(
+            q,
+            kv_buffer,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_lens,
+            num_kv_splits_indptr=num_kv_splits_indptr,
+            work_meta_data=None,
+            work_indptr=None,
+            work_info_set=None,
+            max_seqlen_q=1,
+            page_size=1,
+            nhead_kv=1,
+            softmax_scale=1.0 / 576**0.5,
+            splitData=torch.empty(
+                (batch_size, num_kv_splits, nhead, 256), dtype=torch.float
+            ),
+            splitLse=torch.empty(
+                (batch_size, num_kv_splits, nhead, 1), dtype=torch.float
+            ),
+            output=torch.empty((batch_size, nhead, 512), dtype=torch.bfloat16),
+        )
+
+
+def check_bf16_gqa32_merges_only_written_splits() -> None:
+    """bf16 gqa32 decode with more KV splits than a row's KV fills: stage 2 must
+    merge only the splits stage 1 wrote. The split buffers come from torch.empty,
+    so they are pre-filled with NaN to make an unwritten split visible."""
+    batch_size, nhead, num_kv_splits = 260, 32, 5
+    kv_lora_rank, qk_rope_head_dim = 512, 64
+    qk_head_dim = kv_lora_rank + qk_rope_head_dim
+    # 17-63 tokens per row: one or two 32-token tiles, never all 5 splits.
+    kv_lens = torch.randint(17, 64, (batch_size,), dtype=torch.int)
+    qo_indptr = torch.arange(batch_size + 1, dtype=torch.int)
+    kv_indptr = torch.zeros(batch_size + 1, dtype=torch.int)
+    kv_indptr[1:] = torch.cumsum(kv_lens, dim=0)
+    total_kv = int(kv_indptr[-1])
+    kv_indices = torch.randperm(total_kv, dtype=torch.int)
+    kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
+    q = torch.randn((batch_size, nhead, qk_head_dim), dtype=torch.bfloat16)
+    kv_buffer = torch.randn((total_kv, 1, 1, qk_head_dim), dtype=torch.bfloat16)
+    sm_scale = 1.0 / qk_head_dim**0.5
+
+    ref, _ = torch_mla_extend(
+        q,
+        kv_buffer.view(total_kv, 1, qk_head_dim),
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        sm_scale,
+        kv_lora_rank,
+        qk_rope_head_dim,
+        torch.bfloat16,
+    )
+
+    for shape in (
+        (batch_size, num_kv_splits, nhead, kv_lora_rank),
+        (batch_size, num_kv_splits, nhead, 1),
+    ):
+        torch.full(shape, float("nan"), dtype=torch.float)
+    out = torch.empty((batch_size, nhead, kv_lora_rank), dtype=torch.bfloat16)
+    aiter.mla.mla_decode_fwd(
+        q,
+        kv_buffer,
+        out,
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        kv_last_page_lens,
+        1,
+        sm_scale=sm_scale,
+        num_kv_splits=num_kv_splits,
+    )
+    assert torch.isfinite(out).all(), "merged a split that stage 1 never wrote"
+    checkAllclose(ref.float(), out.float(), msg="bf16 gqa32 short-KV multi-split")
+    cal_diff(ref, out, "bf16 gqa32 short-KV multi-split")
 
 
 def cal_diff(
@@ -669,7 +803,6 @@ def test_mla(
 
     # Gluon MLA decode test
     # Example: -c 16384 -b 64 128 -n 64,1 128,1 -d bf16 -kvd bf16
-    NUM_XCDS_GFX950 = 8
     BLOCK_H_GLUON = 64
     if (
         get_gfx() == "gfx950"
@@ -682,12 +815,14 @@ def test_mla(
         and batch_size in (64, 128, 256)
         and page_size == 1
     ):
+        # Match the wrapper's device-dependent split count.
+        num_xcds = get_num_xcds()
         base_grid = (
-            NUM_XCDS_GFX950
+            num_xcds
             * ((nhead + BLOCK_H_GLUON - 1) // BLOCK_H_GLUON)
-            * (batch_size // NUM_XCDS_GFX950)
+            * (batch_size // num_xcds)
         )
-        splits_needed = max(1, (256 + base_grid - 1) // base_grid)
+        splits_needed = max(1, (get_num_sms() + base_grid - 1) // base_grid)
         # Round up to a power of two: 1 << (n - 1).bit_length() for n >= 1.
         num_kv_splits = 1 << (splits_needed - 1).bit_length()
         # PIPELINE_STAGES=3, BLOCK_N=64 -> 192; mirror wrapper's bound.
@@ -923,6 +1058,13 @@ def main():
                 cp_world_size=1,
             )
         return
+
+    if get_gfx() in ("gfx942", "gfx950"):
+        check_asm_decode_rejects_unsupported_widths()
+        aiter.logger.info("mla_decode_stage1_asm_fwd width checks: passed")
+        check_bf16_gqa32_merges_only_written_splits()
+        aiter.logger.info("bf16 gqa32 short-KV multi-split merge: passed")
+
     for nhead, decode_qlen in args.nhead:
         df = []
         for dtype, kvtype, ctx_len, batch_size, split_per_batch in itertools.product(

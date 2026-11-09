@@ -80,9 +80,9 @@ def generate_gemm_a16w8_blockscale_inputs(
     scale_k = (K + block_shape_k - 1) // block_shape_k
 
     if layout[0] == "T":
-        x = torch.randn((M, K), dtype=torch.bfloat16).cuda() / 10
+        x = torch.randn((M, K), dtype=torch.bfloat16, device="cuda") / 10
     else:
-        x = torch.randn((K, M), dtype=torch.bfloat16).cuda().T / 10
+        x = torch.randn((K, M), dtype=torch.bfloat16, device="cuda").T / 10
 
     if layout[1] == "N":
         weight = (torch.rand((N, K), dtype=torch.float16, device="cuda") / 10).to(
@@ -108,7 +108,7 @@ def generate_gemm_a16w8_blockscale_inputs(
 
     y = None
     if output:
-        y = torch.empty((M, N), dtype=dtype, device="cuda").cuda()
+        y = torch.empty((M, N), dtype=dtype, device="cuda")
 
     return x, weight, weight_shuffled, w_scale, y
 

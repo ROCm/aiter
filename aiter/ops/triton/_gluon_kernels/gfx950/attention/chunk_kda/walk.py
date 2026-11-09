@@ -418,7 +418,7 @@ def _load_state(
         m = s_off >= 0
     return gl.amd.cdna4.buffer_load(
         state_ptr + slot * stride_state_n + s_head, s_off, mask=m, other=0.0
-    )
+    ).to(gl.float32)
 
 
 _walk_repr = make_kernel_repr(
@@ -879,7 +879,9 @@ def chunk_kda_walk_kernel(
             slot1 = i_n.to(gl.int64)
         if do_store:
             gl.amd.cdna4.buffer_store(
-                S, state_out_ptr + slot1 * stride_state_out_n + s_head, s_off
+                S.to(state_out_ptr.dtype.element_ty),
+                state_out_ptr + slot1 * stride_state_out_n + s_head,
+                s_off,
             )
 
 
