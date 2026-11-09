@@ -92,6 +92,7 @@ from . import tdm_prims as TDM
 from .compact_plan import (
     PLAN_RUN_ROWS,
     RUN_HDR_RUNS,
+    S1F_SHARED_FIRST,
     compact_run_capacity,
     compact_run_header_dwords,
     compact_tile_capacity,
@@ -208,9 +209,12 @@ def s1f_ctl_words(*, npes: int, tile_cap: int) -> int:
 #: 156.3 (2); 4096 P64 313.7, P48 314.0, P80 313.9 (2).
 #: Runs per claim: the tpr <= 1024 bucket uses 2 (was 8), from DSV4.1-Flash
 #: DEP4 on MI455X, MLPerf Endpoints agentic c512 (end to end, with the rest of
-#: the S1F defaults: +2.1% gen tok/s/GPU over S1F off).
+#: the S1F defaults: +2.1% gen tok/s/GPU over S1F off). The tpr <= 2048
+#: bucket uses 2 (was 8): DSV4.1-Flash EP4 zipf 0.2, tpr 1152 per layer
+#: rb2 296.5, rb4 299.0, rb8 301.0, rb16 304.7 us (2 runs each); rb1 298.2
+#: against rb8 300.2 in a second pair.
 S1F_PRODUCERS = (64, 64, 64, 64)
-S1F_BLOCK_RUNS = (4, 2, 8, 8)
+S1F_BLOCK_RUNS = (4, 2, 2, 8)
 
 
 def _tpr_bucket(tokens_per_rank: int) -> int:
@@ -634,6 +638,7 @@ def make_s1f_stage1(
     G = int(workers)
     P = int(producers)
     GM = int(group_m)
+    SHARED_FIRST = S1F_SHARED_FIRST if S1F_SHARED_FIRST < epr else 0
     N1 = 2 * int(inter_dim)
     assert N1 % tile_n == 0
     NT = N1 // tile_n
@@ -807,6 +812,7 @@ def make_s1f_stage1(
             f"s1f_stage1_p{P}_w{G}_gm{GM}_r{R}d{D}s{S}_ps{POLL_SLEEP}"
             + f"_mb{RBK}i{MB_ST_INFL}l{MB_LD_INFL}"
             + f"_poll{POLL}"
+            + (f"_sf{SHARED_FIRST}" if SHARED_FIRST else "")
             + (f"_ts{SPAN}" if SPAN != G else "")
             + f"_{g1_name}"
         )
@@ -1565,6 +1571,21 @@ def make_s1f_stage1(
             m_tiles = fx.Int32(
                 (m_tiles > fx.Int32(m_cap)).select(fx.Int32(m_cap), m_tiles)
             )
+            if const_expr(SHARED_FIRST):
+                # First m-tile of the last SHARED_FIRST local experts: expert
+                # starts are tile-aligned, so it is the end of the expert
+                # before them, rounded up.
+                rows_pre = fx.Int32(
+                    buffer_load(
+                        rsrc_psum_s,
+                        fx.Int32(epr - 1 - SHARED_FIRST),
+                        vec_width=1,
+                        is_scalar=True,
+                    )
+                )
+                rows_pre = fx.Int32((rows_pre < fx.Int32(0)).select(fx.Int32(0), rows_pre))
+                m_sh = (rows_pre + fx.Int32(tile_m - 1)) // fx.Int32(tile_m)
+                m_sh = fx.Int32((m_sh >= m_tiles).select(fx.Int32(0), m_sh))
             rsrc_tinfo = create_buffer_resource_from_addr(
                 addr_tile_src, num_records_bytes=4 * tile_cap
             )
@@ -1642,9 +1663,12 @@ def make_s1f_stage1(
                     (k == groups - fx.Int32(1)).select(gs_last, fx.Int32(GM))
                 )
                 rq = r // gsz
-                return (
-                    (k * fx.Int32(GM) + r - rq * gsz) << fx.Int32(_ITEM_N_BITS)
-                ) | rq
+                m_q = k * fx.Int32(GM) + r - rq * gsz
+                if const_expr(SHARED_FIRST):
+                    # Rotated to start at the shared experts' m-tiles.
+                    m_q = m_q + m_sh
+                    m_q = fx.Int32((m_q >= m_tiles).select(m_q - m_tiles, m_q))
+                return (m_q << fx.Int32(_ITEM_N_BITS)) | rq
 
             def q_head_bytes(xq):
                 return (fx.Int32(CTL_HEAD) + par * fx.Int32(32)) * fx.Int32(4)

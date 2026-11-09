@@ -18,7 +18,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import mori.cco.device.flydsl as cco
 from flydsl.expr import arith, const_expr, range_constexpr, rocdl
-from flydsl.expr.rocdl import readfirstlane, readlane, s_nop
+from flydsl.expr.rocdl import ballot, readfirstlane, readlane, s_nop
 from flydsl.expr.typing import Int32, Int64, T
 
 from aiter.ops.flydsl.kernels import communication_ops_utils as comm_ops
@@ -46,6 +46,17 @@ from . import tdm_prims as TDM
 from .config import _LANE_MASK as LANE_MASK
 from .config import _LOG2_WAVE_SIZE as LOG2_WAVE
 from .config import _WAVE_SIZE as WAVE
+
+#: S1F plan: the runs of the last AITER_S1F_SHARED_FIRST local experts (the
+#: LOCAL_REPLICA fused shared experts, whose rows never leave the rank) go
+#: first, and the S1F GEMM1 queue starts at their m-tiles, so GEMM1 has work
+#: before the remote rows land. 0 keeps the plain expert order. DSV4.1-Flash
+#: EP4 zipf 0.2, tpr 1152: stage-1 121.4 -> 116.3 us.
+S1F_SHARED_FIRST = int(os.environ.get("AITER_S1F_SHARED_FIRST", "1"))
+#: S1F plan: the tally counts the routes to this rank's shared expert (its last
+#: local expert, hit by every token) with one LDS atomic per wave instead of
+#: one per lane. Tally 3.9 -> 2.6 us at tpr 1152. AITER_PLAN_SHAGG=0 turns it off.
+PLAN_SHAGG = os.environ.get("AITER_PLAN_SHAGG", "1") == "1"
 
 PLAN_BLOCKS = 1
 PLAN_MAX_BLOCKS = 16
@@ -129,6 +140,14 @@ def compact_hist_stride(*, npes: int, experts_per_rank: int, max_routes: int) ->
 def compact_done_nbytes() -> int:
     """Two parity arrival counters (one i32 each)."""
     return 8
+
+
+def _popc(x):
+    from flydsl._mlir.dialects import llvm as _llvm
+
+    return fx.Int32(
+        _llvm.call_intrinsic(T.i32, "llvm.ctpop.i32", [arith.unwrap(fx.Int32(x))], [], [])
+    )
 
 
 def _tag_stale(v, tag):
@@ -378,6 +397,13 @@ def compile_tdm_compact_plan(
         kernel_name += f"_a{align_m}"
     s1f = bool(s1f)
     emit_runs = bool(emit_runs) or s1f
+    shared_first = S1F_SHARED_FIRST if s1f and S1F_SHARED_FIRST < epr else 0
+    if shared_first:
+        kernel_name += f"_sf{shared_first}"
+    shagg = PLAN_SHAGG and s1f
+    seg_sh = int(rank) * epr + epr - 1
+    if shagg:
+        kernel_name += "_sha"
     if s1f and (epr > 255 or tile_m > 0xFFFF):
         raise ValueError(
             "tile_info packs the expert in 8 bits and the tile's rows in 16"
@@ -644,9 +670,13 @@ def compile_tdm_compact_plan(
 
             def _run_seg(p):
                 """Run-order position -> (segment, dest): le outer, j inner."""
-                le = p // fx.Int32(npes)
-                d = p - le * fx.Int32(npes) + fx.Int32(rank)
+                lq = p // fx.Int32(npes)
+                d = p - lq * fx.Int32(npes) + fx.Int32(rank)
                 d = fx.Int32((d >= fx.Int32(npes)).select(d - fx.Int32(npes), d))
+                le = lq
+                if const_expr(shared_first):
+                    le = le + fx.Int32(epr - shared_first)
+                    le = fx.Int32((le >= fx.Int32(epr)).select(le - fx.Int32(epr), le))
                 return d * fx.Int32(epr) + le, d
 
             def _wave_positions(order, value_fn, emit_fn, total_fn=None):
@@ -745,7 +775,33 @@ def compile_tdm_compact_plan(
             local_e = expert - dest_pe * fx.Int32(epr)
             segment = dest_pe * fx.Int32(epr) + local_e
             intra = arith.constant(0)
-            if valid:
+            if const_expr(shagg):
+                # The wave's lanes on the shared-expert segment take
+                # consecutive slots off one atomic.
+                is_sh = valid & (segment == fx.Int32(seg_sh))
+                m_sh = fx.Int32(
+                    readfirstlane(T.i32, arith.unwrap(fx.Int32(ballot(T.i32, is_sh))))
+                )
+                lead = _popc((m_sh & (fx.Int32(0) - m_sh)) - fx.Int32(1))
+                lead = fx.Int32((m_sh != fx.Int32(0)).select(lead, fx.Int32(0)))
+                base_l = fx.Int32(0)
+                if (m_sh != fx.Int32(0)) & (lane_i == lead):
+                    base_l = fx.Int32(
+                        comm_ops.atomic_add_lds(
+                            lds_hist + fx.Int64(seg_sh * 4), _popc(m_sh)
+                        )
+                    )
+                base = fx.Int32(
+                    readlane(T.i32, arith.unwrap(base_l), arith.unwrap(lead))
+                )
+                below = (fx.Int32(1) << lane_i) - fx.Int32(1)
+                intra_sh = base + _popc(m_sh & below)
+                if valid & (segment != fx.Int32(seg_sh)):
+                    intra = comm_ops.atomic_add_lds(
+                        lds_hist + fx.Int64(segment) * 4, arith.constant(1)
+                    )
+                intra = fx.Int32(is_sh.select(intra_sh, fx.Int32(intra)))
+            elif valid:
                 intra = comm_ops.atomic_add_lds(
                     lds_hist + fx.Int64(segment) * 4, arith.constant(1)
                 )
@@ -1149,7 +1205,13 @@ def compile_tdm_compact_plan(
                         j_d = fx.Int32(
                             (j_d < fx.Int32(0)).select(j_d + fx.Int32(npes), j_d)
                         )
-                        p_me = safe_e * fx.Int32(npes) + j_d
+                        le_q = safe_e
+                        if const_expr(shared_first):
+                            le_q = le_q + fx.Int32(shared_first)
+                            le_q = fx.Int32(
+                                (le_q >= fx.Int32(epr)).select(le_q - fx.Int32(epr), le_q)
+                            )
+                        p_me = le_q * fx.Int32(npes) + j_d
                         _st(lds_ccl, p_me, c_me)
                         _st(lds_rcnt, p_me, _run_count(send, c_me))
                     if const_expr(s1f):  # noqa: SIM102
