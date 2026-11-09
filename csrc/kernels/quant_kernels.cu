@@ -24,8 +24,9 @@ const int32_t groupQuantBlockSize = 64;
 
 namespace aiter {
 
-// Host-side twin of the kernel's kTunedForThisArch, plus the CU count. Cached per device:
-// a gfx1250-only launch on another arch would leave most of the output unwritten.
+// Host-side twin of the kernel's kTunedForThisArch, plus the CU count, both read per device
+// (get_device_gfx / get_device_cu_num cache them): a gfx1250-only launch on another arch
+// would leave most of the output unwritten.
 struct DynGqDevice
 {
     bool tuned;

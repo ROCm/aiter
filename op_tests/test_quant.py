@@ -309,6 +309,11 @@ def _assert_tiled_paths_covered(g32_shapes, g128_shapes):
         return
     cu = torch.cuda.get_device_properties(torch.cuda.current_device())
     cu = cu.multi_processor_count
+    # The shapes are picked for the full 256-CU part; a partitioned or smaller one
+    # still runs every case, only this check is skipped.
+    if cu != 256:
+        aiter.logger.info("Skipping the tiled-path coverage check on %d CUs", cu)
+        return
 
     def pad8(v):
         return (v + 7) // 8 * 8
@@ -634,12 +639,6 @@ if "fp8_mx_nonfinite" in args.quant and get_gfx() in (
             (1 << 21) + 32, 512, dtypes.fp4x2, dtypes.bf16, shuffle, False
         )
         test_mxfp8_nonfinite_g128(1 << 20, 512, dtypes.bf16, shuffle, "mixed")
-    for (m, n), h_dtype, pattern in itertools.product(
-        ((40, 256), (1024, 7168)),
-        [dtypes.bf16, dtypes.fp16],
-        [None, "nan", "posinf", "neginf", "mixed"],
-    ):
-        test_mxfp8_m32k4(m, n, h_dtype, pattern)
     aiter.logger.info("fp8_1x32_e8m0 passed")
 if "fp8_mx_nonfinite" in args.quant and get_gfx() in (
     "gfx942",
@@ -655,6 +654,12 @@ if "fp8_mx_nonfinite" in args.quant and get_gfx() in (
             test_mxfp8_nonfinite(gs, shuffle, h_dtype, pattern)
         for amax_bits in [0x7F60, 0x7F61, 0x7F69, 0x7F7F]:
             test_mxfp8_large_finite(gs, shuffle, amax_bits)
+    for (m, n), h_dtype, pattern in itertools.product(
+        ((40, 256), (1024, 7168)),
+        [dtypes.bf16, dtypes.fp16],
+        [None, "nan", "posinf", "neginf", "mixed"],
+    ):
+        test_mxfp8_m32k4(m, n, h_dtype, pattern)
     # Stage-1 MoE quant + sort at topk 8: M = 256 is the last fused size, 288 splits.
     for m, h_dtype, pattern in itertools.product(
         (256, 288),
