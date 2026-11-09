@@ -49,7 +49,21 @@ _PAR = np.array([(g ^ (g >> 3)) & 1 for g in range(NGRAN)])
 _ROT = np.array(
     [[((b + c) & 7) >= 4 for b in range(PROBERS)] for c in range(8)], dtype=np.int64
 )
-_DOM = _ROT[3]
+#: hwreg(HW_REG_HW_ID2, offset 0, size 6): QUEUE_ID [3:0], PIPE_ID [5:4].
+_HW_ID2_QUEUE_PIPE = 24 | (0 << 6) | ((6 - 1) << 11)
+
+
+def launch_rotation():
+    """Rotation c of the running launch: workgroup b is on IOD domain ((b + c) & 7) >= 4.
+
+    The dispatch of a launch starts on the XCC its hardware queue slot selects:
+    c = 4 - PIPE_ID - 4 QUEUE_ID mod 8, up to one constant common to all slots,
+    which the probe's phase absorbs. Read from HW_ID2, it is the same for every
+    workgroup of a launch.
+    """
+    imm = arith.unwrap(fx.Int32(_HW_ID2_QUEUE_PIPE))
+    v = fx.Int32(_llvm.call_intrinsic(T.i32, "llvm.amdgcn.s.getreg", [imm], [], []))
+    return (fx.Int32(4) - (v >> fx.Int32(4)) - (v << fx.Int32(2))) & fx.Int32(7)
 
 
 def _timed_load(addr):
@@ -80,6 +94,9 @@ def _launch_probe(
     line: fx.Int32,
     stream: fx.Stream,
 ):
+    # The cache key follows only this body's globals, not the kernel's below.
+    _ = launch_rotation
+
     @flyc.kernel(name="iod_loc_probe", known_block_size=[32, 1, 1])
     def kernel(
         base: fx.Int64,
@@ -102,6 +119,11 @@ def _launch_probe(
                         rsrc,
                         arith.unwrap((bid * npg + p) * fx.Int32(NGRAN) + g),
                     )
+            buffer_store(
+                arith.unwrap(launch_rotation()),
+                rsrc,
+                arith.unwrap(fx.Int32(PROBERS * NGRAN) * npg + bid),
+            )
 
     kernel(base, lat, npg, line).launch(
         grid=(PROBERS, 1, 1), block=(32, 1, 1), stream=stream
@@ -129,13 +151,14 @@ def probe_phase(buf: torch.Tensor, npass: int = 4):
 
     Returns (phase u8[npg], weak pages, per-class agreement, rotation of every
     launch); phase is None when a workgroup class does not follow the domain
-    formula or fewer than ``npass`` launches after the warm-up land on c = 3.
+    formula or fewer than ``npass`` launches after the warm-up run at the
+    rotation ``launch_rotation`` reads from their hardware queue.
     """
     npg = buf.numel() * buf.element_size() // (2 << 20)
     assert buf.data_ptr() % (2 << 20) == 0 and npg > 0
     assert npass + 1 <= MAX_LAUNCHES
     dev = buf.device
-    lat = torch.zeros(PROBERS * npg * NGRAN, dtype=torch.int32, device=dev)
+    lat = torch.zeros(PROBERS * npg * NGRAN + PROBERS, dtype=torch.int32, device=dev)
     current = torch.cuda.current_stream(dev)
     stream = current
     est = []
@@ -148,17 +171,20 @@ def probe_phase(buf: torch.Tensor, npass: int = 4):
             _launch_probe, buf.data_ptr(), lat.data_ptr(), npg, line, fx.Stream(stream)
         )
         current.wait_stream(stream)
-        t = lat.view(PROBERS, npg, NGRAN).cpu().numpy()
+        h = lat.cpu().numpy()
+        t = h[: PROBERS * npg * NGRAN].reshape(PROBERS, npg, NGRAN)
         odd_fast = np.median(t[:, :, _PAR == 1], 2) < np.median(t[:, :, _PAR == 0], 2)
-        rotations.append(_rotation(odd_fast))
-        if rotations[-1] != 3:
+        c = int(h[-PROBERS])
+        rot = _rotation(odd_fast)
+        rotations.append(rot)
+        if rot != c & 3 or (h[-PROBERS:] != c).any():
             # Another stream is the only handle on which pipe the next launch takes.
             stream = torch.cuda.Stream(dev)
             continue
         if line == 0:
             continue
         # Odd granules are homed on 1 ^ phase: fast iff that is the prober's domain.
-        est.append(_DOM[:, None] ^ odd_fast.astype(np.int64))
+        est.append(_ROT[c][:, None] ^ odd_fast.astype(np.int64))
         if len(est) == npass:
             break
     if len(est) < npass:

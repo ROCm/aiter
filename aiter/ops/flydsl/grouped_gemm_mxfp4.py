@@ -252,23 +252,30 @@ def flydsl_grouped_gemm_a8w4_masked(
             (persistent_workers + cluster_n - 1) // cluster_n * cluster_n
         )
     waves_per_tensor_tdm = _select_num_waves_per_tensor_tdm(waves_per_tensor_tdm)
-    # AITER_MOE_LOC (GEMM1, weights placed by moe_shuffle_weight_iod at load
-    # time): 1 IOD-local B + domain-parity persistent schedule, 2 the
+    # AITER_MOE_LOC (GEMM1 / GEMM2 weights placed by moe_shuffle_weight_iod at
+    # load time): 1 IOD-local B + domain-parity persistent schedule, 2 the
     # remote-only control, 3 placed B on the stock schedule.
-    iod_loc = int(os.environ.get("AITER_MOE_LOC", "0")) if stage1_act else 0
+    iod_loc = int(os.environ.get("AITER_MOE_LOC", "0"))
     b_placed = loc_sched = 0
     if iod_loc not in (0, 1, 2, 3):
         raise ValueError("AITER_MOE_LOC must be 0, 1, 2 or 3")
     placed = None
-    if iod_loc and cluster_m == 1 and cluster_n == 1 and waves_per_tensor_tdm == 2:
+    if (
+        iod_loc
+        and cluster_m == 1
+        and cluster_n == 1
+        and waves_per_tensor_tdm == 2
+        and m_warp * n_warp == 4
+        # The schedule is persistent, which the EP scatter serves only unquantized.
+        and not (stage2_scatter is not None and stage2_scatter.combine_quant_bits)
+    ):
         from .iod_locality import lookup
 
-        placed = lookup(w, w_scales, N, K, tile_n, tile_k)
+        placed, b_placed = lookup(w, w_scales, N, K, tile_n, tile_k)
     if placed is None:
         iod_loc = 0
     if iod_loc:
         w = w_scales = placed
-        b_placed = 1
         if iod_loc in (1, 2):
             loc_sched = iod_loc
             # Four workers per CU: fewer leave the tail of the per-domain

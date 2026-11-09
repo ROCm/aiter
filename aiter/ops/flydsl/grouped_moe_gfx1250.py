@@ -1844,6 +1844,23 @@ def grouped_gemm_gfx1250_a8w4(
             _tdm_kw["n_warp"] = _base_nw
             _tdm_kw["m_warp2"] = _ov_mw2 if _ov_mw2 is not None else _base_mw
             _tdm_kw["n_warp2"] = _ov_nw2 if _ov_nw2 is not None else _base_nw
+        # A W2 placed by moe_shuffle_weight_iod serves its layout tiling and the
+        # one with tile_n halved (four waves, 1 x 4); GEMM2 keeps the tuned
+        # tile_n2 when it is one of them, so every token count reads the local copy.
+        if w2_scale is not None and os.environ.get("AITER_MOE_LOC", "0").strip() in (
+            "1",
+            "2",
+            "3",
+        ):
+            from .iod_locality import placed_tile
+
+            tile2 = placed_tile(w2, w2_scale)
+            if tile2 is not None:
+                ln, lk = tile2
+                if _tdm_kw.get("tile_n2") == ln // 2:
+                    ln, lk = ln // 2, lk * 2
+                _tdm_kw["tile_n2"], _tdm_kw["tile_k2"] = ln, lk
+                _tdm_kw["m_warp2"], _tdm_kw["n_warp2"] = 1, 4
         return _grouped_a8w4_tdm_moe(
             hidden_states,
             w1,

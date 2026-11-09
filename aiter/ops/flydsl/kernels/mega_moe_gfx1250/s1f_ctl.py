@@ -667,9 +667,11 @@ class _Stage1Fusion:
         # time: the per-XCC queues hand each XCC its IOD's n-tiles.
         placed = None
         if os.environ.get("AITER_MOE_LOC", "0").strip() == "1":
-            from aiter.ops.flydsl.iod_locality import lookup
+            from aiter.ops.flydsl.iod_locality import W13_TILE, lookup
 
-            placed = lookup(w, w_scales, N, K, 256, 256)
+            placed, ratio = lookup(w, w_scales, N, K, *W13_TILE)
+            if ratio != 1:
+                placed = None
         if placed is not None:
             w = w_scales = placed
 

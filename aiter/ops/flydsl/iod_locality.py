@@ -1,22 +1,27 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""IOD-local placement of GEMM1 weights on MI455X (gfx1250, SPX + NPS1).
+"""IOD-local placement of MoE GEMM weights on MI455X (gfx1250, SPX + NPS1).
 
 A 16 KiB granule at ``addr`` is homed on IOD domain
 ``a14 ^ a17 ^ a20 ^ phase[addr >> 21]``; the per-2 MiB-page phase is
 physical, so it is probed once per allocation (``kernels/iod_loc_probe``).
-Workgroup b runs on domain ``((b + 3) % 8) >= 4`` when the whole grid runs and
-the dispatch starts at rotation 3; the probe keeps only launches that do.
+Workgroup b runs on domain ``((b + c) % 8) >= 4``, c the rotation of its
+launch, which the kernels read at run time (``launch_rotation``).
 
-``place_w13`` (``aiter.ops.shuffle.moe_shuffle_weight_iod``, at weight-load
-time) re-lays the preshuffled W1 ([E, N/16, K/2*16] bytes) and its
-n32k4 scales ([E, N/32, K] bytes) into one buffer:
+``place_w13`` / ``place_w2`` (``aiter.ops.shuffle.moe_shuffle_weight_iod``,
+at weight-load time) re-lay a preshuffled weight ([E, N/16, K/2*16] bytes)
+and its n32k4 scales ([E, N/32, K] bytes) for one tile_n x tile_k layout
+tiling (tile_n * tile_k = 64 Ki) into one buffer:
 page 0 holds the int32 phase of every granule page (plus one pad entry),
 then for unit (expert e, n-tile nt) on domain nt % 2, local index
-lu = e * NT/2 + nt/2, its local granules lu * GPU + j hold
-j < 2 KT: B rows [8 (j % 2), 8 (j % 2) + 8) x 2048 B of k-tile j / 2,
+lu = e * NT/2 + nt/2, its local granules lu * GPU + j (GPU even) hold
+j < 2 KT, j = 4 (m / 2) + 2 h + m % 2: B rows [tile_n/32 h, ... + tile_n/32)
+x tile_k*8 B of k-tile m (half h, one wave's share),
 j >= 2 KT: the 2 KiB B-scale stages of k-tiles 8 (j - 2 KT) ... + 7.
+The k-tile pairs 2i, 2i + 1 of a half sit 32 KiB apart, so a GEMM tiled
+tile_n/2 x 2 tile_k reads the same buffer (``b_placed=2``) with one TDM load
+per wave and k-tile.
 """
 
 import logging
@@ -43,18 +48,27 @@ def _probe(buf: torch.Tensor, npass: int = 4):
 
 def gran_per_unit(K: int, tile_k: int) -> int:
     kt = (K + tile_k - 1) // tile_k
-    return 2 * kt + (kt + 7) // 8
+    g = 2 * kt + (kt + 7) // 8
+    return g + g % 2
 
 
 def supported(N, K, tile_n, tile_k) -> bool:
-    """Whether ``placed_w1`` / ``b_placed`` cover this GEMM1 tiling."""
+    """Whether a placed layout exists for this layout tiling."""
     return (
         tile_n * tile_k == 4 * GRAN
-        and tile_n % 64 == 0
+        and tile_n % 128 == 0
         and N % (2 * tile_n) == 0
-        and K % tile_k == 0
+        and K % (2 * tile_k) == 0
         and gran_per_unit(K, tile_k) <= LOCAL_PER_PAGE
     )
+
+
+def placed_ratio(layout, tile_n, tile_k):
+    """``b_placed`` for a GEMM tiled tile_n x tile_k on ``layout``, or 0."""
+    for r in (1, 2):
+        if (tile_n * r, tile_k) == (layout[0], layout[1] * r):
+            return r
+    return 0
 
 
 def _place(w, w_scales, E, N, K, tile_n, tile_k):
@@ -73,7 +87,7 @@ def _place(w, w_scales, E, N, K, tile_n, tile_k):
     if phase is None:
         logger.warning(
             "[iod_locality] workgroup classes off the IOD domain formula "
-            "(agreement %s, launch rotations %s); W1 %s stays unplaced",
+            "(agreement %s, launch rotations %s); weight %s stays unplaced",
             np.round(agree, 2).tolist(),
             rotations,
             tuple(w.shape),
@@ -82,9 +96,11 @@ def _place(w, w_scales, E, N, K, tile_n, tile_k):
     ph = torch.from_numpy(np.append(phase, phase[-1]).astype(np.int32))
     buf[: ph.numel() * 4].copy_(ph.view(torch.uint8))
 
-    # [E, N/16, KT, 2048] -> [E, NT, KT, 16 x 2048] -> two granules per k-tile.
+    # [E, N/16, KT, row] -> [E, NT, KT/2, k-tile 2i + q, half h, 16 KiB]
+    # -> granule j = 4 i + 2 h + q.
     b = w.reshape(E, nt, tile_n // 16, kt, bstage // (tile_n // 16))
-    b = b.permute(0, 1, 3, 2, 4).reshape(E, nt, 2 * kt, GRAN)
+    b = b.permute(0, 1, 3, 2, 4).reshape(E, nt, kt // 2, 2, 2, GRAN)
+    b = b.transpose(3, 4).reshape(E, nt, 2 * kt, GRAN)
     s = w_scales.reshape(-1).view(torch.uint8).reshape(E, nt, tile_n // 32, kt, -1)
     s = s.permute(0, 1, 3, 2, 4).reshape(E, nt, kt, sstage)
     sp = torch.zeros(E, nt, nsg * 8, sstage, dtype=torch.uint8, device=w.device)
@@ -104,9 +120,11 @@ def _place(w, w_scales, E, N, K, tile_n, tile_k):
     torch.cuda.synchronize()
     buf._iod_raw = raw
     logger.info(
-        "[iod_locality] placed W1 %s: %.3f GB, %d pages, weak %d, class agreement >= %.3f, "
-        "launch rotations %s",
+        "[iod_locality] placed weight %s for %dx%d tiles: %.3f GB, %d pages, weak %d, "
+        "class agreement >= %.3f, launch rotations %s",
         tuple(w.shape),
+        tile_n,
+        tile_k,
         buf.numel() / 1e9,
         npg,
         weak,
@@ -116,10 +134,12 @@ def _place(w, w_scales, E, N, K, tile_n, tile_k):
     return buf
 
 
-# The one tiling the placed layout serves (``b_placed``): every 16 KiB
-# granule is one wave's B half of a k-tile.
-PLACED_TILE_N = 256
-PLACED_TILE_K = 256
+# The layout tiling of each placed weight: every 16 KiB granule is one wave's
+# B half of a k-tile. It serves that tiling and the one with tile_n halved and
+# tile_k doubled (``placed_ratio``): GEMM1 runs 256 x 256 at every tuned token
+# count, GEMM2 512 x 128 or 256 x 256.
+W13_TILE = (256, 256)
+W2_TILE = (512, 128)
 
 
 def enabled() -> bool:
@@ -129,6 +149,28 @@ def enabled() -> bool:
     from aiter.jit.utils.chip_info import get_gfx
 
     return get_gfx() == "gfx1250"
+
+
+def _register(weight, scale, experts_cnt, tile):
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("IOD placement must run before CUDA graph capture")
+    E = int(experts_cnt or weight.shape[0])
+    N = int(weight.shape[-2])
+    K = int(weight.shape[-1]) * 2
+    if not supported(N, K, *tile):
+        return None
+    w = weight.detach().contiguous().view(torch.uint8)
+    sc = scale.detach().contiguous().reshape(-1).view(torch.int32)
+    key = (w.data_ptr(), sc.data_ptr())
+    hit = _PLACED.get(key)
+    if hit is not None:
+        return hit[0]
+    buf = _place(w, sc, E, N, K, *tile)
+    if buf is None:
+        return None
+    # Holding the sources keeps their addresses, the key, from being reused.
+    _PLACED[key] = (buf, w, sc, N, K, tile)
+    return buf
 
 
 def place_w13(w13: torch.Tensor, w13_scale: torch.Tensor, experts_cnt=None):
@@ -141,32 +183,30 @@ def place_w13(w13: torch.Tensor, w13_scale: torch.Tensor, experts_cnt=None):
     the shape has no placed layout or the probe finds pages whose IOD home
     does not follow the address formula.
     """
-    if torch.cuda.is_current_stream_capturing():
-        raise RuntimeError("IOD placement must run before CUDA graph capture")
-    E = int(experts_cnt or w13.shape[0])
-    N = int(w13.shape[-2])
-    K = int(w13.shape[-1]) * 2
-    if not supported(N, K, PLACED_TILE_N, PLACED_TILE_K):
+    return _register(w13, w13_scale, experts_cnt, W13_TILE)
+
+
+def place_w2(w2: torch.Tensor, w2_scale: torch.Tensor, experts_cnt=None):
+    """``place_w13`` for the shuffled GEMM2 weight, laid out for 512 x 128 tiles
+    (served to 256 x 256 as well)."""
+    return _register(w2, w2_scale, experts_cnt, W2_TILE)
+
+
+def placed_tile(w, w_scales):
+    """Layout (tile_n, tile_k) of the placed copy registered for (w, w_scales), or None."""
+    if not _PLACED:
         return None
-    w = w13.detach().contiguous().view(torch.uint8)
-    sc = w13_scale.detach().contiguous().reshape(-1).view(torch.int32)
-    key = (w.data_ptr(), sc.data_ptr())
-    hit = _PLACED.get(key)
-    if hit is not None:
-        return hit[0]
-    buf = _place(w, sc, E, N, K, PLACED_TILE_N, PLACED_TILE_K)
-    if buf is None:
-        return None
-    # Holding the sources keeps their addresses, the key, from being reused.
-    _PLACED[key] = (buf, w, sc, N, K)
-    return buf
+    hit = _PLACED.get((w.data_ptr(), w_scales.data_ptr()))
+    return None if hit is None else hit[5]
 
 
 def lookup(w, w_scales, N, K, tile_n, tile_k):
-    """The placed buffer registered for (w, w_scales), or None."""
-    if not _PLACED or tile_n != PLACED_TILE_N or tile_k != PLACED_TILE_K:
-        return None
+    """(placed buffer, ``b_placed``) registered for (w, w_scales) that serves a
+    tile_n x tile_k GEMM, or (None, 0)."""
+    if not _PLACED:
+        return None, 0
     hit = _PLACED.get((w.data_ptr(), w_scales.data_ptr()))
-    if hit is None or hit[3] != N or hit[4] != K:
-        return None
-    return hit[0]
+    if hit is None or hit[3:5] != (N, K):
+        return None, 0
+    r = placed_ratio(hit[5], tile_n, tile_k)
+    return (hit[0], r) if r else (None, 0)
