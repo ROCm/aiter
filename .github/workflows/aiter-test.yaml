@@ -63,9 +63,13 @@ jobs:
           image=rocm/rocm-terminal:latest
           docker pull "${image}"
 
+          AMD_RUNTIME_GPU_FLAGS="--runtime=amd -e AMD_VISIBLE_DEVICES=all"
+          if [ -f "/etc/podinfo/gha-render-devices" ]; then
+            AMD_RUNTIME_GPU_FLAGS="${AMD_RUNTIME_GPU_FLAGS} $(cat /etc/podinfo/gha-render-devices)"
+          fi
+
           docker run --rm \
-            --runtime=amd \
-            -e AMD_VISIBLE_DEVICES=all \
+            $AMD_RUNTIME_GPU_FLAGS \
             --name amd_runtime_smoke \
             "${image}" \
             bash -lc '
@@ -79,6 +83,9 @@ jobs:
               echo "=== amd-smi ==="
               amd-smi version || true
               amd-smi list
+
+              echo "=== torch HIP visibility ==="
+              python3 -c "import torch; count=torch.cuda.device_count(); print(f\"torch.cuda.is_available={torch.cuda.is_available()}\"); print(f\"torch.cuda.device_count={count}\"); [print(f\"torch.cuda.device[{idx}]={torch.cuda.get_device_name(idx)}\") for idx in range(count)]; raise SystemExit(\"No HIP devices visible through torch\") if count < 1 else None"
             '
 
   detect_aiter_test_scope:
@@ -866,6 +873,10 @@ jobs:
 
           if [[ "${RUNNER_NAME:-}" == linux-aiter-mi35x-1-toolkit-test* ]]; then
             GPU_DOCKER_FLAGS="--runtime=amd -e AMD_VISIBLE_DEVICES=all"
+            if [ -f "/etc/podinfo/gha-render-devices" ]; then
+              DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
+              GPU_DOCKER_FLAGS="$GPU_DOCKER_FLAGS $DEVICE_FLAG"
+            fi
           elif [ -f "/etc/podinfo/gha-render-devices" ]; then
             DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
             GPU_DOCKER_FLAGS="--device=/dev/kfd $DEVICE_FLAG"
