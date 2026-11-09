@@ -2187,3 +2187,137 @@ def test_unified_attn_split_rebalance_reduce_configs_k4v8(
     )
     assert not new[live].isnan().any()
     assert torch.equal(old[live].view(torch.int16), new[live].view(torch.int16))
+
+
+# Sequence lengths that are not a tile multiple, so the last tile of each overhangs
+# its last page. The zero-padded block table names block 0 there, and block 0 holds
+# NaN. The 2D kernel must not read it.
+@pytest.mark.parametrize("block_size", [16, 64])
+@pytest.mark.parametrize(
+    "q_dtype, kv_dtype", [(torch.bfloat16, torch.bfloat16), (e4m3_dtype, e4m3_dtype)]
+)
+@pytest.mark.parametrize("shuffled_kv_cache", [True, False])
+@torch.inference_mode()
+def test_unified_attn_2d_padded_block_table_gfx1250(
+    block_size: int,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    shuffled_kv_cache: bool,
+) -> None:
+    if not IS_DEVICE_ARCH_GFX12:
+        pytest.skip("gfx1250 Gluon 2D kernel")
+    head_size, num_heads = 256, (16, 2)
+    if not is_2d_gluon_available(
+        SimpleNamespace(
+            q_dtype=q_dtype,
+            kv_cache_dtype=kv_dtype,
+            softcap=None,
+            use_qq_bias=False,
+            use_alibi_slopes=False,
+            head_size=head_size,
+            head_size_v=head_size,
+            shuffled_kv_cache=shuffled_kv_cache,
+            block_size=block_size,
+            k_width=16 // kv_dtype.itemsize,
+        ),
+        "gluon",
+    ):
+        pytest.skip("2d gluon not available")
+    seq_lens = [(17, 37), (24, 130), (32, 200), (40, 333)]
+    (
+        query,
+        key_cache_orig,
+        value_cache_orig,
+        key_cache,
+        value_cache,
+        sinks,
+        output,
+        cu_query_lens,
+        kv_lens,
+        max_query_len,
+        max_kv_len,
+        scale,
+        window_size,
+        _,
+        _,
+        _,
+        q_descale,
+        k_descale,
+        v_descale,
+        output_scale,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        num_blocks=1024,
+        block_size=block_size,
+        head_size=head_size,
+        num_heads=num_heads,
+        q_dtype=q_dtype,
+        kv_dtype=kv_dtype,
+        shuffled_kv_cache=shuffled_kv_cache,
+        device="cuda",
+    )
+    # Pages 1, 2, ... in order; block 0 only in the padding of each row.
+    kv_lens_list = [s[1] for s in seq_lens]
+    pages = [(n + block_size - 1) // block_size for n in kv_lens_list]
+    block_tables = torch.zeros(
+        len(seq_lens), max(pages) + 4, dtype=torch.int32, device="cuda"
+    )
+    first = 1
+    for i, n in enumerate(pages):
+        block_tables[i, :n] = torch.arange(
+            first, first + n, dtype=torch.int32, device="cuda"
+        )
+        first += n
+    key_cache[0] = float("nan")
+    value_cache[0] = float("nan")
+
+    unified_attention(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=max_query_len,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window_size,
+        block_table=block_tables,
+        softcap=0,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        sinks=sinks,
+        output_scale=output_scale,
+        shuffled_kv_cache=shuffled_kv_cache,
+        backend="gluon",
+    )
+    assert torch.isfinite(output).all(), "the 2D kernel read block 0 past a sequence"
+
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache_orig,
+        value_cache=value_cache_orig,
+        query_lens=[s[0] for s in seq_lens],
+        kv_lens=kv_lens_list,
+        block_tables=block_tables,
+        scale=scale,
+        out_dtype=output.dtype,
+        sliding_window=None,
+        soft_cap=None,
+        sinks=sinks,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        output_scale=output_scale,
+    ).to(torch.float32)
+    output = output.to(torch.float32)
+    if kv_dtype.itemsize == 1:
+        # As test_triton_unified_attn: fp8 with descales allows 0.5% of elements out.
+        mismatch = torch.abs(output - ref_output) > 1.5e-1 + 1.5e-1 * torch.abs(
+            ref_output
+        )
+        assert mismatch.float().mean().item() < 0.005
+    else:
+        torch.testing.assert_close(output, ref_output, atol=1.5e-2, rtol=1e-2)
