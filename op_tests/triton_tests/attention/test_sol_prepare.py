@@ -226,23 +226,27 @@ def test_empty_row_rule_matches_the_guarded_form():
     """The unconditional empty-row term is equivalent to the `if empty.any()` version it replaced.
 
     Guarding it saved nothing but a cheap elementwise op, and cost a device sync and a graph break.
-    A flat proxy is constructed here so that the rule actually fires: with an all-equal proxy row
-    nothing exceeds mean + beta * std, so every row is empty and must fall back to its argmax.
+    The proxy row here is built so that the rule actually fires and has one right answer: block 0
+    sits far below the rest, which lifts mean + beta * std above every block, while block 5 stays
+    the unique maximum. Every row is then empty and must fall back to block 5.
     """
     batch, nhead, tiles, blocks, d = 1, 2, 3, 16, 128
-    q_mean = torch.ones(batch, tiles, nhead, d, device="cuda")
-    k_mean = torch.ones(batch, blocks, nhead, d, device="cuda")
-    k_mean[:, 5] += 1e-3  # one block wins the argmax
+    q_mean = torch.ones(batch, tiles, nhead, d, device="cuda", dtype=torch.float32)
+    k_mean = torch.ones(batch, blocks, nhead, d, device="cuda", dtype=torch.float32)
+    k_mean[:, 0] = 0.0  # proxy 0 against ~128: inflates the std past every block
+    k_mean[:, 5] += 1e-3  # still the unique argmax, ~0.26 std above the mean
 
-    selected = _sol_attn_route(q_mean, k_mean, BETA, partial_tail=False)
-    assert int(selected.sum(-1).min()) >= 1, "flat proxy must fall back to argmax"
-    assert bool(selected[..., 5].all()), "fallback must keep the highest-proxy block"
-
-    proxy = torch.einsum("bihd,bjhd->bhij", q_mean.float(), k_mean.float())
+    proxy = torch.einsum("bihd,bjhd->bhij", q_mean, k_mean)
     guarded = proxy > (
         proxy.mean(-1, keepdim=True)
         + BETA * proxy.std(-1, unbiased=False, keepdim=True)
     )
+    assert not bool(guarded.any()), "the threshold alone must clear every row"
+
+    selected = _sol_attn_route(q_mean, k_mean, BETA, partial_tail=False)
+    assert bool((selected.sum(-1) == 1).all()), "an empty row keeps exactly one block"
+    assert bool(selected[..., 5].all()), "fallback must keep the highest-proxy block"
+
     empty = ~guarded.any(dim=-1, keepdim=True)
     if bool(empty.any()):  # the host branch that used to be here
         guarded = guarded | (
