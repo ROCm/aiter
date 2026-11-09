@@ -16,6 +16,7 @@ from aiter.ops.flydsl.kernels.tensor_shim import (
     current_stream_arg,
     ptr_arg,
 )
+from aiter.ops.flydsl.moe_common import a16wmix_w_layout
 
 _KERNEL_PARAMS: dict[str, dict] = {}
 
@@ -778,8 +779,8 @@ def compile_flydsl_moe_stage1(
 ):
     """Compile stage1 kernel (cached via underlying lru_cache)."""
     # a16w-mix (bf16 A x {fp4 mxfp4, int4, bf16} W): build the ported gemm1
-    # (moe_2stage_a16wmix), consuming the standard GGUU W1+scale layout
-    # (w_layout="standard"), matching main. a16wi4 shares this compile entry so AOT
+    # (moe_2stage_a16wmix), consuming a16wmix_w_layout (GGUU / "standard" for
+    # SiTUv2), matching main. a16wi4 shares this compile entry so AOT
     # builds the same kernel the runtime early-return launches; its W1 is the
     # OLD-kernel int4 prep (pack_int8_to_packed_int4(shuffle_weight(w,(16,16)))) +
     # (E,G//2,N,2) bf16 scale.
@@ -801,7 +802,7 @@ def compile_flydsl_moe_stage1(
             xcd_swizzle=xcd_swizzle,
             waves_per_eu=waves_per_eu,
             w_dtype=b_dtype,
-            w_layout="standard",
+            w_layout=a16wmix_w_layout(act),
             k_wave=k_wave,
             # The kernel derives its gfx942 fallbacks (K=16 MFMA split, bf16 pack,
             # fp4 byte-LUT decode, LDS staging) from this arch string.
@@ -1697,7 +1698,7 @@ def _flydsl_moe_stage1_impl(
             situ_linear_beta=situ_linear_beta,
             swiglu_limit=runtime_swiglu_limit(swiglu_limit, _act),
             w_dtype=b_dtype,
-            w_layout="standard",
+            w_layout=a16wmix_w_layout(_act),
         )
         return inter_sorted
     # The gate/up (N) axis tile must divide inter_dim; for non-256-aligned

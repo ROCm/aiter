@@ -13,6 +13,23 @@ DEFAULT_SITUV2_BETA = 4.0
 DEFAULT_SITUV2_LINEAR_BETA = 25.0
 
 
+def a16wmix_w_layout(act: str) -> str:
+    """Layout the a16w-mix gemm1 port reads for this activation.
+
+    ``standard`` is the separated GGUU preshuffle
+    (``shuffle_weight_a16w4(w1, 16, False)``). ``guinterleave`` is the GUGU
+    preshuffle. SiTUv2 is ``standard``; the port ignores ``gate_mode``.
+    ``fused_moe`` rejects a caller layout that does not match this, so a
+    follow-up that teaches SiTUv2 to read GUGU changes the return value here
+    and the guard follows.
+    """
+    if act == "situv2":
+        return "standard"
+    # Silu and Swiglu on this port are GGUU as well. A Silu INTERLEAVE reader
+    # would return "guinterleave" for that activation only.
+    return "standard"
+
+
 def resolve_swiglu_limit(
     swiglu_limit: "object" = None,
 ) -> "tuple[float | None, str]":
