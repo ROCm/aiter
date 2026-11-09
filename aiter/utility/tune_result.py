@@ -182,21 +182,6 @@ class TuneResult(tuple):
         return (self.__class__, (self[0], self[1], self[2], self.watts))
 
 
-class TuneStatusResult(tuple):
-    """``mp_tuner(return_status=True)``'s 5-tuple, carrying watts like ``TuneResult``."""
-
-    def __new__(cls, info, us, err_ratio, status, detail="", watts=float("nan")):
-        obj = tuple.__new__(cls, (info, us, err_ratio, status, detail))
-        try:
-            obj.watts = float(watts)
-        except (TypeError, ValueError):
-            obj.watts = float("nan")
-        return obj
-
-    def __reduce__(self):
-        return (self.__class__, (*self, self.watts))
-
-
 def attach_power_columns(df, results):
     """Add each result's watts as a column. Only the power policy calls this.
 

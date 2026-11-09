@@ -120,8 +120,9 @@ class _FaultCase:
                 self.assertTrue(failed or us > 0, results)
 
     def test_typed_callers_get_a_status_per_candidate(self):
-        results = self._run(return_status=True)
-        for (_, name), us, _err, status, detail in results:
+        results, statuses = self._run(return_status=True)
+        self.assertEqual(len(statuses), len(results))
+        for ((_, name), us, _err), (status, detail) in zip(results, statuses):
             with self.subTest(name=name):
                 expected_status, detail_part = self.FAILED.get(name, ("ok", ""))
                 self.assertEqual(status, expected_status, results)
@@ -146,10 +147,10 @@ class TestWorkerDeath(_FaultCase, unittest.TestCase):
     """A candidate that kills its worker, with another shape queued behind it.
 
     The pool replaces the dead worker with a PID the GPU map does not know, so
-    the queued shape hits the stale map and restarts the pool. The dying
-    candidate must be failed rather than resubmitted, or every restart kills
-    the worker again. The timeout is far above the run time, so a pass shows
-    the dead worker was detected rather than timed out.
+    the queued shape can hit the stale map; it waits for the restart the death
+    triggers. The dying candidate must be failed rather than resubmitted, or
+    every restart kills the worker again. The timeout is far above the run
+    time, so a pass shows the dead worker was detected rather than timed out.
     """
 
     TIMEOUT = 600

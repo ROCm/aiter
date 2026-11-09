@@ -866,7 +866,7 @@ class TunerCommon:
         bestConfigs = []
 
         for el in rets:
-            info, us, max_err_ratio, *_ = el
+            info, us, max_err_ratio = el
             watts = getattr(el, "watts", float("nan"))
             grouped_rets[info[0]].append((info[1:], us, max_err_ratio, watts))
 
@@ -2281,7 +2281,7 @@ class GemmCommonTuner(TunerCommon):
         resultdf = pd.DataFrame(columns=self.columns)
         rows = []
         for el in results:
-            info, time, err_ratio, *_ = el
+            info, time, err_ratio = el
             keys, kernelId, splitK, kernelName = info
             # Resolve kernel name for both success and failure (profile CSV / debugging).
             # Treat missing/NA like "" so we always look up CK kernel names; otherwise NaN

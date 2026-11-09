@@ -7,12 +7,13 @@ import os
 import time
 from multiprocessing import TimeoutError as MPTimeoutError
 from queue import Empty
+from typing import Any, NamedTuple
 
 import torch
 
 from aiter import dtypes, logger
 from aiter.test_common import checkAllclose
-from aiter.utility.tune_result import TuneResult, TuneStatusResult
+from aiter.utility.tune_result import TuneResult
 from aiter_worker_limits import configure_worker_subprocesses
 
 _TASK_START_TIMES = None
@@ -141,20 +142,27 @@ def _candidate_failure_detail(exc: BaseException, limit: int = 300) -> str:
     return f"{type(exc).__name__}: {message}" if message else type(exc).__name__
 
 
+class _Candidate(NamedTuple):
+    """One candidate's outcome inside mp_tuner. Callers get a ``TuneResult``
+    and, with ``return_status``, a separate ``(status, detail)``."""
+
+    info: Any
+    us: float
+    err_ratio: float
+    status: str
+    detail: str = ""
+    watts: float = float("nan")
+
+
 def _format_worker_result(
-    info, us, max_err_ratio, status, return_status, detail="", watts=None
+    info, us, max_err_ratio, status, detail="", watts=float("nan")
 ):
-    result = (info, us, round(max_err_ratio, 4))
-    if return_status:
-        return TuneStatusResult(*result, status, detail, watts)
-    if watts is None:
-        return result
-    return TuneResult(*result, watts)
+    return _Candidate(info, us, round(max_err_ratio, 4), status, detail, watts)
 
 
-def _failed_result(task, status, detail, return_status):
+def _failed_result(task, status, detail):
     info = task[0] if len(task) > 0 else "unknown"
-    return _format_worker_result(info, float("inf"), 1.0, status, return_status, detail)
+    return _format_worker_result(info, float("inf"), 1.0, status, detail)
 
 
 # A group whose resubmissions keep faulting before measuring anything (e.g. its
@@ -184,13 +192,13 @@ def _measured_prefix(pending, measured):
     return [measured[_info_key(task[0])] for task in pending[:n]], pending[n:]
 
 
-def _split_after_fault(pending, measured, status, detail, return_status):
+def _split_after_fault(pending, measured, status, detail):
     """Results of a group stopped by a fault: what it measured, then the
     candidate that was running (the first unmeasured one) failed with
     ``status``, and the candidates still to run."""
     done, rest = _measured_prefix(pending, measured)
     if rest:
-        done.append(_failed_result(rest[0], status, detail, return_status))
+        done.append(_failed_result(rest[0], status, detail))
         rest = rest[1:]
     return done, rest
 
@@ -212,7 +220,6 @@ def worker(
     _arg_key_list=None,
     catastrophic_check=True,
     policy=None,
-    return_status=False,
 ):
     from aiter.test_common import run_perftest
     from aiter.utility.selection_policy import LATENCY
@@ -272,9 +279,7 @@ def worker(
             detail = f"timed 0 us in {max_retries + 1} runs"
         torch.cuda.synchronize()
         if us == -1 or res is None:
-            return _format_worker_result(
-                info, us, max_err_ratio, status, return_status, detail
-            )
+            return _format_worker_result(info, us, max_err_ratio, status, detail)
         if ref is not None:
             if isinstance(ref, torch.Tensor):
                 ref = [ref]
@@ -362,9 +367,7 @@ def worker(
             func, args, kwargs, device_index=gpu_id, kernel_us=us
         )
 
-    return _format_worker_result(
-        info, us, max_err_ratio, status, return_status, detail, watts
-    )
+    return _format_worker_result(info, us, max_err_ratio, status, detail, watts)
 
 
 def work_group(
@@ -375,7 +378,6 @@ def work_group(
     tasks,
     verbose=False,
     policy=None,
-    return_status=False,
     progress_queue=None,
 ):
     """Work group that processes a batch of related tasks."""
@@ -506,7 +508,7 @@ def work_group(
                     else "crash"
                 )
                 detail = f"failed before launch: {_candidate_failure_detail(e)}"
-                record(_failed_result(group_task[i], status, detail, return_status))
+                record(_failed_result(group_task[i], status, detail))
                 continue
 
             # Extract rtol, atol from rest if available, otherwise use defaults.
@@ -541,7 +543,6 @@ def work_group(
                 arg_key_list,
                 True,
                 policy,
-                return_status,
             )
 
             # Run worker with explicit GPU ID
@@ -599,20 +600,21 @@ def mp_tuner(
         policy: SelectionPolicy for the run; None uses the one the tuner activated
         final_timing: whether these times pick the winner (default: not fast_mode).
             Only a final timing pass is power-sampled.
-        return_status: Also return status and detail per candidate
+        return_status: Also return each candidate's status and detail
 
     A candidate that faults the GPU, kills its worker or hangs fails alone: the
     pool restarts and the group's remaining candidates are resubmitted, keeping
     what it had already measured.
 
     Returns:
-        One result per candidate, in task order: (info, latency, error_ratio).
-        With return_status, (info, latency, error_ratio, status, detail), where
-        status is one of ok, mismatch, unsupported, crash, timeout,
-        zero_time, oom_runtime, oom_preflight (outside a candidate's run, e.g.
-        generating inputs) or not_run (never run: its group kept faulting
-        before measuring anything). Either form carries ``.watts`` when the power
-        policy measured it; a typed result has ``.watts`` NaN otherwise.
+        One ``TuneResult`` per candidate, in task order: (info, latency,
+        error_ratio), with ``.watts`` when the power policy measured it, NaN
+        otherwise. With return_status, ``(results, statuses)``: statuses holds
+        one (status, detail) per result, in the same order, where status is
+        one of ok, mismatch, unsupported, crash, timeout, zero_time,
+        oom_runtime, oom_preflight (outside a candidate's run, e.g. generating
+        inputs) or not_run (never run: its group kept faulting before
+        measuring anything).
     """
     from aiter.utility.selection_policy import LATENCY, active_policy
 
@@ -638,7 +640,7 @@ def mp_tuner(
     parallel_num = mp_num
     start_idx = 0
     if not tasks:
-        return []
+        return ([], []) if return_status else []
     if mp_num == 1 and fast_mode == 0:
         shape_grouped = True
     # time.sleep(2)
@@ -713,16 +715,14 @@ def mp_tuner(
         """Fail the candidate group k was running when it faulted; True once
         nothing is left to resubmit."""
         drain_progress()
-        done, rest = _split_after_fault(
-            pending[k], progress_results, status, detail, return_status
-        )
+        done, rest = _split_after_fault(pending[k], progress_results, status, detail)
         barren_faults[k] = barren_faults[k] + 1 if len(done) <= 1 else 0
         if rest and barren_faults[k] >= _MAX_FAULTS_WITHOUT_PROGRESS:
             reason = (
                 f"not run: the group faulted {barren_faults[k]} times in a row "
                 f"before measuring anything (last: {status})"
             )
-            done += [_failed_result(t, "not_run", reason, return_status) for t in rest]
+            done += [_failed_result(t, "not_run", reason) for t in rest]
             rest = []
         settled[k].extend(done)
         pending[k] = rest
@@ -757,7 +757,6 @@ def mp_tuner(
                         ),
                         verbose,
                         policy,
-                        return_status,
                         progress_queue,
                     ),
                 ),
@@ -989,12 +988,7 @@ def mp_tuner(
         if not task_result:
             # Defensive fallback: keep output cardinality stable even if a task result is missing.
             task_result = settled[k] + [
-                _failed_result(
-                    task,
-                    "crash",
-                    "no result returned by the worker pool",
-                    return_status,
-                )
+                _failed_result(task, "crash", "no result returned by the worker pool")
                 for task in pending[k]
             ]
         if shape_grouped:
@@ -1027,4 +1021,7 @@ def mp_tuner(
         )
         logger.warning(summary)
 
-    return result
+    results = [TuneResult(c.info, c.us, c.err_ratio, c.watts) for c in result]
+    if return_status:
+        return results, [(c.status, c.detail) for c in result]
+    return results

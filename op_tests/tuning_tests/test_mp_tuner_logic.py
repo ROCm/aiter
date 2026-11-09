@@ -492,7 +492,8 @@ class TestZeroTiming(unittest.TestCase):
             result = tuner.worker(0, "candidate", lambda: None, [], {})
 
         self.assertEqual(run_perftest.call_count, 4)
-        self.assertEqual(result, ("candidate", -1, 1.0))
+        self.assertEqual(result[:3], ("candidate", -1, 1.0))
+        self.assertEqual(result.status, "zero_time")
 
 
 class TestShapeGroupedContract(unittest.TestCase):
@@ -540,22 +541,11 @@ class TestTypedCandidateStatus(unittest.TestCase):
         self.assertEqual(classify(ValueError("unsupported layout")), "unsupported")
         self.assertEqual(classify(RuntimeError("kernel launch failed")), "crash")
 
-    def test_status_extension_is_opt_in(self):
+    def test_a_worker_result_keeps_status_and_watts_through_pickling(self):
         result = self.tuner._format_worker_result
-        self.assertEqual(result("shape", 1.0, 0.0, "ok", False), ("shape", 1.0, 0.0))
-        self.assertEqual(
-            result("shape", -1, 1.0, "unsupported", True, "why"),
-            ("shape", -1, 1.0, "unsupported", "why"),
-        )
-
-    def test_typed_result_carries_watts_through_pickling(self):
-        result = self.tuner._format_worker_result
-        typed = pickle.loads(
-            pickle.dumps(result("shape", 1.0, 0.0, "ok", True, "", 512))
-        )
-        self.assertEqual(typed, ("shape", 1.0, 0.0, "ok", ""))
-        self.assertEqual(typed.watts, 512.0)
-        self.assertTrue(math.isnan(result("shape", 1.0, 0.0, "ok", True).watts))
+        record = pickle.loads(pickle.dumps(result("shape", 1.0, 0.0, "ok", "", 512)))
+        self.assertEqual(record, ("shape", 1.0, 0.0, "ok", "", 512))
+        self.assertTrue(math.isnan(result("shape", 1.0, 0.0, "ok").watts))
 
     def test_failure_detail_is_one_bounded_line_naming_the_exception(self):
         detail = self.tuner._candidate_failure_detail
@@ -583,17 +573,13 @@ class TestResumeAfterFault(unittest.TestCase):
         self.tuner = importlib.import_module("aiter.utility.mp_tuner")
 
     def test_measured_candidates_survive_and_the_rest_are_resubmitted(self):
-        for typed in (False, True):
-            with self.subTest(return_status=typed):
-                measured = {("s", "a"): (("s", "a"), 12.5, 0.0)}
-                done, rest = self.tuner._split_after_fault(
-                    self.GROUP, measured, "crash", "fault", typed
-                )
-                self.assertEqual(done[0], measured[("s", "a")])
-                failed = (("s", "b"), float("inf"), 1.0)
-                self.assertEqual(done[1], (*failed, "crash", "fault")[: len(done[1])])
-                self.assertEqual(len(done[1]), 5 if typed else 3)
-                self.assertEqual(rest, self.GROUP[2:])
+        measured = {("s", "a"): (("s", "a"), 12.5, 0.0)}
+        done, rest = self.tuner._split_after_fault(
+            self.GROUP, measured, "crash", "fault"
+        )
+        self.assertEqual(done[0], measured[("s", "a")])
+        self.assertEqual(done[1][:5], (("s", "b"), float("inf"), 1.0, "crash", "fault"))
+        self.assertEqual(rest, self.GROUP[2:])
 
     def test_a_measured_prefix_needs_no_resubmission(self):
         measured = {task[0]: (task[0], 1.0, 0.0) for task in self.GROUP}
@@ -649,7 +635,8 @@ class TestWorkGroupCandidateFailure(unittest.TestCase):
         tasks = [_fake_task("a"), _fake_task("b"), _fake_task("c")]
         tasks[1] = (tasks[1][0], boom, *tasks[1][2:])
         rets, queue = self.run_group(tasks)
-        self.assertEqual([us for _, us, _ in rets], [1.0, float("inf"), 1.0])
+        self.assertEqual([us for _, us, *_ in rets], [1.0, float("inf"), 1.0])
+        self.assertEqual(rets[1][3], "crash")
         self.assertEqual(queue, rets)
 
     def test_an_accelerator_fault_still_aborts_the_group(self):
@@ -771,7 +758,6 @@ def _faulting_work_group(
     tasks,
     verbose,
     policy,
-    return_status,
     queue,
 ):
     """Measures candidates in order and faults on any named 'fault*'."""
@@ -781,7 +767,7 @@ def _faulting_work_group(
     for task in tasks:
         if task[0][1].startswith("fault"):
             raise _accelerator_error()
-        ret = tuner._format_worker_result(task[0], 2.0, 0.0, "ok", return_status)
+        ret = tuner._format_worker_result(task[0], 2.0, 0.0, "ok")
         rets.append(ret)
         queue.put(ret)
     return rets
@@ -836,6 +822,14 @@ class TestMpTunerResubmission(unittest.TestCase):
         )
         self.assertEqual(submissions, [["a", "fault", "c", "d"], ["c", "d"]])
 
+    def test_statuses_come_as_a_separate_list_in_result_order(self):
+        (results, statuses), _ = self.run_tuner(["a", "fault", "c"], return_status=True)
+        self.assertEqual([len(r) for r in results], [3, 3, 3])
+        self.assertEqual([info[1] for info, *_ in results], ["a", "fault", "c"])
+        self.assertEqual([status for status, _ in statuses], ["ok", "crash", "ok"])
+        self.assertIn("AcceleratorError", statuses[1][1])
+        self.assertEqual(self.run_tuner([], return_status=True)[0], ([], []))
+
     def test_a_stale_pid_map_waits_for_the_restart_a_fault_triggers(self):
         attempts = []
 
@@ -846,14 +840,14 @@ class TestMpTunerResubmission(unittest.TestCase):
                     raise KeyError("pid not in GPU map")
             return _faulting_work_group(gpu_map, fast, err, in_data, tasks, *rest)
 
-        results, submissions = self.run_tuner(
+        (results, statuses), submissions = self.run_tuner(
             [("s1", "a"), ("s1", "b"), ("s2", "fault")],
             work_group=remapped_work_group,
             in_datas=[(2, None), (1, None)],
             return_status=True,
         )
         self.assertEqual(
-            [(info[1], status) for info, *_, status, _ in results],
+            [(info[1], status) for (info, *_), (status, _) in zip(results, statuses)],
             [("a", "ok"), ("b", "ok"), ("fault", "crash")],
         )
         # The fault fails once; s1 reruns only in the restart that fault caused.
@@ -862,13 +856,13 @@ class TestMpTunerResubmission(unittest.TestCase):
     def test_each_fault_consumes_a_candidate_until_the_budget(self):
         tuner = importlib.import_module("aiter.utility.mp_tuner")
         names = [f"fault{i}" for i in range(tuner._MAX_FAULTS_WITHOUT_PROGRESS + 2)]
-        results, submissions = self.run_tuner(names, return_status=True)
+        (_, statuses), submissions = self.run_tuner(names, return_status=True)
         budget = tuner._MAX_FAULTS_WITHOUT_PROGRESS
         self.assertEqual(
-            [status for *_, status, _ in results], ["crash"] * budget + ["not_run"] * 2
+            [status for status, _ in statuses], ["crash"] * budget + ["not_run"] * 2
         )
         self.assertEqual(len(submissions), budget)
-        self.assertIn("in a row", results[-1][4])
+        self.assertIn("in a row", statuses[-1][1])
 
     def test_a_shape_without_candidates_leaves_the_others_their_data(self):
         names = [("s1", "a"), ("s1", "b"), ("s3", "c")]

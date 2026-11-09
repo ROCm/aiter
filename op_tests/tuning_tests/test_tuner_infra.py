@@ -427,17 +427,6 @@ class TestPostProcess(unittest.TestCase):
         self.assertEqual(len(resultdf), 1)
         self.assertEqual(float(resultdf.iloc[0]["us"]), 5.0)
 
-    def test_typed_status_results(self):
-        """mp_tuner(return_status=True) appends (status, detail) to each result."""
-        tuner = _StubTuner.get()
-        rets = [
-            (*self._make_result((TEST_GFX, 304, 1, 1024, 512), 0, 0, 5.0), "ok", ""),
-            (*self._make_result((TEST_GFX, 304, 1, 1024, 512), 1, 0, 3.0), "ok", ""),
-        ]
-        resultdf = tuner.post_process(rets, self._make_args(), topk=1)
-        self.assertEqual(float(resultdf.iloc[0]["us"]), 3.0)
-        self.assertEqual(len(tuner.result_to_df(rets)), 2)
-
 
 class TestUpdateConfigFiles(unittest.TestCase):
     """Tests for TunerCommon.update_config_files (config merge/dedup)."""
