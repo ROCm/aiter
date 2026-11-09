@@ -62,6 +62,21 @@ _CONV_WIDTH = 4
 _SUPPORTED_ARCHS = ("gfx950", "gfx1250")
 # Dtypes that the gfx1250 kernel accepts for A_log, dt_bias and norm_weight.
 _GFX1250_PARAM_DTYPES = (torch.float32, torch.bfloat16)
+_CONFIG_NAME = "FUSED_GDN_DECODE_QKVZ"
+
+
+def _get_gfx1250_config(tokens: int) -> dict:
+    """Launch config of the gfx1250 kernel: ``num_warps`` (also the layout's NW)
+    and ``KL``, the lanes on each state tile row."""
+    from aiter.ops.triton.utils.config_utils import (
+        load_config_json,
+        resolve_config_dir,
+        select_leq_config,
+    )
+
+    config_dir = resolve_config_dir("fusions", _CONFIG_NAME, backend="gluon")
+    configs = load_config_json(f"{config_dir}/DEFAULT.json")
+    return select_leq_config(configs, tokens, prefix="T_LEQ_")
 
 
 def _uses_ratio_generic_kernel(
@@ -490,6 +505,8 @@ def fused_gdn_decode_qkvz(
 
         conv_width = 2 * head_k_dim + ratio * head_v_dim
         has_bias = conv_bias is not None
+        # 16 waves let two programs fit on one CU, the fastest at all batch sizes.
+        config = _get_gfx1250_config(tokens)
         _decode_group_ratio_gfx1250[(tokens * k_heads,)](
             projected_qkvz,
             projected_ba,
@@ -519,18 +536,16 @@ def fused_gdn_decode_qkvz(
             head_v_dim,
             ratio,
             1 << (conv_width - 1).bit_length(),
-            # NW, KL, KS: 16 waves, so two programs fit on one CU (the fastest
-            # at all batch sizes). 16 lanes on each tile row, and one 16 B
-            # access per lane (4 fp32 or 8 bf16).
-            16,
-            16,
-            16 // ssm_state.element_size(),
+            NW=config["num_warps"],
+            KL=config["KL"],
+            # One 16 B access per lane: 4 fp32 or 8 bf16 state elements.
+            KS=16 // ssm_state.element_size(),
             PAD_SLOT_ID=pad_slot_id,
             HAS_FP8=has_fp8,
             FLAT=flat,
             HAS_QSL=has_qsl,
             HAS_BIAS=has_bias,
-            num_warps=16,
+            num_warps=config["num_warps"],
         )
     elif _uses_ratio_generic_kernel(ratio, flat, has_qsl, ssm_state.dtype):
         # Ratio-generic kernel at every batch size; the bands below hardcode

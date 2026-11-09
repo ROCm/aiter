@@ -18,13 +18,15 @@ from triton.experimental.gluon import language as gl
 from aiter.ops.triton._gluon_kernels.gfx950.gated_delta_net.fused_gdn_decode_qkvz_ratio import (
     _dynamics,
     _epilogue,
+    _gating,
     _update,
 )
 from aiter.ops.triton._triton_kernels.common.activation import _silu
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 _ratio_repr = make_kernel_repr(
-    "_decode_group_ratio", ["RATIO", "NW", "KL", "KS", "HAS_FP8", "FLAT"]
+    "_decode_group_ratio",
+    ["RATIO", "NW", "KL", "KS", "HAS_FP8", "FLAT", "HAS_QSL", "HAS_BIAS"],
 )
 
 
@@ -74,31 +76,6 @@ def _conv_step(
     gl.store(history_ptr + conv_width_stride, h2, mask=live)
     gl.store(history_ptr + 2 * conv_width_stride, x.to(h2.dtype), mask=live)
     return activated.to(gl.bfloat16).to(gl.float32)  # bf16 boundary as in the reference
-
-
-@gluon.jit
-def _gating(
-    BA,
-    ALog,
-    DTBias,
-    ba_row,
-    head,
-    VH: gl.constexpr,
-    RATIO: gl.constexpr,
-    FLAT: gl.constexpr,
-):
-    """Gating inputs of one value head (loads only). Unlike the gfx950 helper, it
-    takes the row offset of a token-strided ``BA`` and accepts a bf16 ``A_log``."""
-    if FLAT:
-        b = gl.load(BA + ba_row + head).to(gl.float32)
-        a = gl.load(BA + ba_row + VH + head).to(gl.float32)
-    else:
-        offset = ba_row + (head // RATIO) * (2 * RATIO) + head % RATIO
-        b = gl.load(BA + offset).to(gl.float32)
-        a = gl.load(BA + offset + RATIO).to(gl.float32)
-    a_log = gl.load(ALog + head).to(gl.float32)
-    bias = gl.load(DTBias + head).to(gl.float32)
-    return b, a, a_log, bias
 
 
 @gluon.jit(repr=_ratio_repr)
@@ -164,25 +141,25 @@ def _decode_group_ratio(
     vrow = gl.arange(0, V, layout=gl.SliceLayout(1, tile_layout))
     state_offset = vrow[:, None] * K + k[None, :]
     head0 = group * RATIO
-    ba_row = token * ba_token_stride
+    # The row offsets are 64-bit: a token-strided row can start after element 2**31.
+    projection_row = Projection + token.to(gl.int64) * proj_token_stride
+    ba_row = BA + token.to(gl.int64) * ba_token_stride
     bs = ()
     as_ = ()
     logs = ()
     biases = ()
     for h in gl.static_range(RATIO):
-        b, a, a_log, bias = _gating(
-            BA, ALog, DtBias, ba_row, head0 + h, VH, RATIO, FLAT
-        )
+        # ba_row points at the token's row, so the row index is 0.
+        b, a, a_log, bias = _gating(ba_row, ALog, DtBias, 0, head0 + h, VH, RATIO, FLAT)
         bs = bs + (b,)
         as_ = as_ + (a,)
-        logs = logs + (a_log,)
+        logs = logs + (a_log.to(gl.float32),)  # A_log can be bf16
         biases = biases + (bias,)
-    proj_row = token * proj_token_stride
     if FLAT:
-        gate_ptr = Projection + proj_row + 2 * KH * K + VH * V + head0 * V + vrow
+        gate_ptr = projection_row + 2 * KH * K + VH * V + head0 * V + vrow
     else:
-        base = proj_row + group * group_width
-        gate_ptr = Projection + base + 2 * K + RATIO * V + vrow
+        base = group * group_width
+        gate_ptr = projection_row + base + 2 * K + RATIO * V + vrow
     gates = ()
     for h in gl.static_range(RATIO):
         gates = gates + (gl.load(gate_ptr + h * V).to(gl.float32),)
@@ -202,11 +179,11 @@ def _decode_group_ratio(
         ),
     )
     if FLAT:
-        proj_offset = proj_row + channel
+        proj_offset = channel
     else:
         proj_offset = base + cc
     x, w0, w1, w2, w3, conv_bias = _conv_inputs(
-        Projection, ConvWeight, ConvBias, proj_offset, channel, HAS_BIAS
+        projection_row, ConvWeight, ConvBias, proj_offset, channel, HAS_BIAS
     )
 
     # Nested, because HAS_QSL is constexpr: without it, QueryStartLoc is only a
