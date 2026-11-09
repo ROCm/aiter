@@ -392,8 +392,9 @@ def _column(row: dict, name: str) -> str:
 
 def parse_csv(csv_path: str) -> list[dict]:
     """One job per FlyDSL row of a tuned GEMM table: its shape and key cells,
-    ``m`` its tuned M and ``m_low`` the smallest M it serves (the previous
-    tuned M of its shape, plus one)."""
+    ``m`` its tuned M, ``m_low`` the smallest M it serves (the previous
+    tuned M of its shape, plus one) and ``tuned``, every tuned M of its shape
+    with its kernel's (tile_m, cluster_m)."""
     table = table_of(csv_path)
     if table is None:
         raise ValueError(
@@ -402,10 +403,10 @@ def parse_csv(csv_path: str) -> list[dict]:
         )
     with open(csv_path, newline="") as f:
         rows = list(csv.DictReader(line for line in f if not line.startswith("#")))
-    shapes: dict[tuple, list[int]] = {}
+    shapes: dict[tuple, dict[int, str]] = {}
     for row in rows:
         key = tuple(_column(row, c) for c in table.keys)
-        shapes.setdefault(key, []).append(_int(_column(row, "M")))
+        shapes.setdefault(key, {})[_int(_column(row, "M"))] = _column(row, "kernelName")
 
     jobs = []
     for row in rows:
@@ -426,6 +427,7 @@ def parse_csv(csv_path: str) -> list[dict]:
             "cu_num": _int(_column(row, "cu_num"), _DEFAULT_CU_NUM),
             "m": m,
             "m_low": max(smaller, default=0) + 1,
+            "tuned": tuple((tm, *_tiling(name)) for tm, name in shapes[key].items()),
             "n": _int(_column(row, "N")),
             "k": _int(_column(row, "K")),
         }
@@ -453,9 +455,16 @@ def _variants(table: Table, job: dict) -> list[dict]:
 
 # tile_m and cluster_m of a kernelName, as the gfx1250 name parsers read them.
 _TILING = re.compile(r"_t(\d+)x\d+x\d+_.*_cm(\d+)_cn")
-# Up to this M, untuned-shape heuristics are covered by 8 size classes per octave.
-_HEURISTIC_MAX_M = 4096
-_HEURISTIC_BLOCKS_PER_OCTAVE = 8
+# The untuned-shape heuristics' tile_m range, and the M tiles a tile below the
+# largest may span (_MAX_M_BLOCKS of the gfx1250 WMMA tuning lists).
+_HEURISTIC_TILE_M = (16, 256)
+_HEURISTIC_MAX_M_TILES = 32
+
+
+def _tiling(kernel_name: str) -> tuple[int, int]:
+    """(tile_m, cluster_m) of a kernelName, (0, 0) for one without them."""
+    match = _TILING.search(kernel_name)
+    return (int(match[1]), int(match[2])) if match else (0, 0)
 
 
 def scan_sizes(job: dict, low: int) -> list[int]:
@@ -463,6 +472,8 @@ def scan_sizes(job: dict, low: int) -> list[int]:
     from aiter.ops.gemm_op_common import get_padded_m
 
     high, n, k = job["m"], job["n"], job["k"]
+    tuned = {m: (tile_m, cluster_m) for m, tile_m, cluster_m in job["tuned"]}
+    padded_m = lambda m, gl: get_padded_m(m, n, k, gl)
     sizes = {low}
     sizes |= {
         v
@@ -470,22 +481,35 @@ def scan_sizes(job: dict, low: int) -> list[int]:
         for v in (1 << bit, (1 << bit) + 1)
         if low <= v < high
     }
-    match = _TILING.search(job["kernel_name"])
-    tile_m, cluster_m = (int(match[1]), int(match[2])) if match else (0, 0)
-    pieces = _lookup_pieces(lambda m, gl: get_padded_m(m, n, k, gl), low, high)
-    for start, end in pieces:
+    for start, end in _lookup_pieces(padded_m, low, high):
         sizes.add(start)
-        if tile_m:
-            window = math.lcm(*range(1, cluster_m + 1))
-            sizes |= _tile_sizes(start, end, tile_m, window)
-        # Octave (2^bit, 2^(bit+1)] of M, in blocks of 1/8 of its top.
-        for bit in range(_HEURISTIC_MAX_M.bit_length()):
-            first = max(start, (1 << bit) + (bit > 0))
-            stop = min(end, (2 << bit) + 1, _HEURISTIC_MAX_M + 1)
-            if first < stop:
-                block = max(1, (2 << bit) // _HEURISTIC_BLOCKS_PER_OCTAVE)
-                sizes |= _tile_sizes(first, stop, block, stop)
+        # The rows the padded-M lookup finds on this piece.
+        hits = [
+            tuned[m] for m in {padded_m(start, 0), padded_m(start, 1)} if m in tuned
+        ]
+        for tile_m, cluster_m in {_tiling(job["kernel_name"]), *hits}:
+            if tile_m:
+                window = math.lcm(*range(1, cluster_m + 1))
+                sizes |= _tile_sizes(start, end, tile_m, window)
+        # The heuristics pick where no row is found, or a found row may not launch.
+        if not hits or _TABLES[job["table"]].all_rows:
+            sizes |= _heuristic_sizes(start, end)
     return sorted(size for size in sizes if low <= size < high)
+
+
+def _heuristic_sizes(start: int, end: int) -> set[int]:
+    """Smallest, next and largest M of each ceil(M / tile_m) class of the
+    smallest heuristic tile still in play, per octave of [start, end)."""
+    smallest, largest = _HEURISTIC_TILE_M
+    sizes = set()
+    for bit in range((end - 1).bit_length()):
+        first, stop = max(start, (1 << bit) + (bit > 0)), min(end, (2 << bit) + 1)
+        if first < stop:
+            top = 2 << bit
+            block = top // _HEURISTIC_MAX_M_TILES
+            block = 1 if top <= smallest else min(largest, max(smallest, block))
+            sizes |= _tile_sizes(first, stop, block, stop)
+    return sizes
 
 
 def _lookup_pieces(padded_m, low: int, high: int) -> list[tuple[int, int]]:

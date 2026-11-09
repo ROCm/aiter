@@ -133,10 +133,11 @@ and launches them; every FlyDSL launch is compiled into the cache instead.
   compiles. Not every M is identified, only those `scan_sizes` names, where
   the runtime's choice can change: on each piece of the range where the
   padded-M lookup finds the same row, the first `lcm(1..cluster_m)` M-tile
-  counts of the row's kernel and the last (each ragged, at the other parity,
-  and full), up to M=4096 eight size classes per octave for the untuned-shape
-  heuristics, and every power of two (about 17K M instead of 2.27M, and the
-  same kernels as identifying every M). Then one M per set of kernels the
+  counts of the kernel of each row it finds and the last (each ragged, at the
+  other parity, and full); where it finds none (a sparse table), every size
+  class the untuned-shape heuristics tell apart; and every power of two
+  (about 15K M instead of 2.27M for the default tables, and the same kernels
+  as identifying every M). Then one M per set of kernels the
   row's own replay did not build is replayed for real, reported as `[SCAN]`. Bisecting between the two ends
   would miss kernels there, since the gfx1250 GEMMs fit cluster_m to the
   number of M tiles and specialize a ragged last tile: M=5120 and M=6144 can

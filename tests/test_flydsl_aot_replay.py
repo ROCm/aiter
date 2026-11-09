@@ -231,3 +231,32 @@ def test_gemm_scan_takes_each_tile_count_ragged_at_both_parities_and_full():
         *(257, 258, 512),  # count 2
         *(769, 770, 999),  # the last count, its tile not filled below 1000
     ]
+
+
+def test_gemm_scan_covers_the_heuristics_where_a_sparse_table_has_no_row(
+    monkeypatch,
+):
+    from aiter.aot.flydsl import gemm
+    from aiter.ops import gemm_op_common
+
+    monkeypatch.setattr(
+        gemm_op_common, "get_padded_m", lambda m, n, k, gl: _padded_m(m, gl, n)
+    )
+    job = {
+        "table": "a8w8_blockscale_mxscale_bpreshuffle_tuned_gemm",
+        "kernel_name": "flydsl_mxfp8_128_bpreshuffle_wmma_t256x256x128_cm1_cn1",
+        "m": 32768,
+        "n": 7168,
+        "k": 1024,
+    }
+    blocks = range(33, 127)  # the 256-row blocks in (8448, 32512]
+    # Above 8192, gl=1 pads to 8192: with no row there the heuristics pick,
+    # and they tell every 256-row block apart.
+    sparse = gemm.scan_sizes({**job, "tuned": ((1, 16, 1), (32768, 256, 1))}, 2)
+    assert all(any(b * 256 < m <= (b + 1) * 256 for m in sparse) for b in blocks)
+    # With a row at 8192 the lookup finds it there, and only that row's
+    # tile counts are scanned.
+    dense = gemm.scan_sizes(
+        {**job, "tuned": ((1, 16, 1), (8192, 256, 1), (32768, 256, 1))}, 8193
+    )
+    assert not all(any(b * 256 < m <= (b + 1) * 256 for m in dense) for b in blocks)
