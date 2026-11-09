@@ -74,19 +74,17 @@ def test_bf16_g1u1_fmoe_rows_cover_padded_m_4096():
     assert row_4096[0]["kernelName2"]
 
 
-def test_moe_sorting_opus_dpp_scan_scopes_gfx1201_replacement():
+def test_moe_sorting_opus_dpp_scan_has_gfx10_safe_fallback():
     source = _OPUS_SORTING_SOURCE.read_text()
     start = source.index("__device__ __forceinline__ int dpp_inclusive_scan_wave")
     end = source.index("template <int NumCtas>", start)
     helper = source[start:end]
 
-    assert "#if defined(__gfx1201__)" in helper
-    assert helper.index("__builtin_amdgcn_ds_bpermute") > helper.index(
-        "#if defined(__gfx1201__)"
-    )
-    assert helper.index("0x142") > helper.index("#else")
-    assert helper.index("0x143") > helper.index("#else")
-    assert "__builtin_amdgcn_ds_bpermute" in helper
+    assert "#if defined(__GFX9__)" in helper
+    assert helper.index("0x142") > helper.index("#if defined(__GFX9__)")
+    assert helper.index("0x143") > helper.index("#if defined(__GFX9__)")
+    assert helper.index("__builtin_amdgcn_readlane") > helper.index("#else")
+    assert "__builtin_amdgcn_wavefrontsize" in helper
 
 
 @pytest.mark.skipif(

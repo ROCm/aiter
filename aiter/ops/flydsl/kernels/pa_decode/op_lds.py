@@ -12,7 +12,7 @@ from flydsl.expr.typing import ReductionOp, T
 
 from .. import dpp_utils
 from ..kernels_common import create_llvm_ptr
-from ..moe_2stage_a16wmix.utils import _e8m0_byte_to_f32
+from ..mxfp4_gemm_common import _e8m0_byte_to_f32
 from ..tensor_shim import buf_base_i64, ptr_buf_tensor
 from ..utils import rcp_f32
 from .traits import MFMA_MNK, MXFP4_V_BF16_CHUNK_BYTES
