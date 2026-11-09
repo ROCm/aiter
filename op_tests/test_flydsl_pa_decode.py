@@ -1175,12 +1175,20 @@ _SELECT_INVALID = {
     "fp8-query-fp8-kv": ("gfx950", torch.float8_e4m3fn, torch.float8_e4m3fn),
     "fp8-query-bf16-kv": ("gfx950", torch.bfloat16, torch.float8_e4m3fn),
     "fnuz-kv-on-gfx950": ("gfx950", torch.float8_e4m3fnuz, torch.bfloat16),
+    "string-kv": ("gfx950", "fp8", torch.bfloat16),
+    "unmapped-kv": ("gfx950", torch.complex64, torch.bfloat16),
 }
 _SELECT_INVALID_CASES = [
     ("mxfp4-on-gfx942", ValueError, "MXFP4 PA decode requires gfx950"),
     ("fp8-query-fp8-kv", ValueError, "An FP8 query needs MXFP4 KV"),
     ("fp8-query-bf16-kv", ValueError, "BF16 KV requires a BF16 query"),
-    ("fnuz-kv-on-gfx950", ValueError, "FP8 KV on gfx950 must be Float8E4M3FN"),
+    (
+        "fnuz-kv-on-gfx950",
+        ValueError,
+        r"FP8 KV on gfx950 must be torch\.float8_e4m3fn, got torch\.float8_e4m3fnuz",
+    ),
+    ("string-kv", TypeError, "PA KV dtype must be a torch.dtype, got 'fp8'"),
+    ("unmapped-kv", ValueError, r"Unsupported PA KV dtype torch\.complex64"),
 ]
 
 

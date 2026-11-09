@@ -35,11 +35,34 @@ D256_PIPE_MAX_ROWS = 2 * MFMA_MNK
 # bytes are MXFP4 too.
 FP8_KV_DTYPES = (fx.Float8E4M3FN, fx.Float8E4M3FNUZ)
 MXFP4_KV_DTYPE = fx.Float4E2M1FNx2
+PA_KV_DTYPES = (*FP8_KV_DTYPES, fx.BFloat16, MXFP4_KV_DTYPE)
+PA_QUERY_DTYPES = (fx.Float16, fx.BFloat16, fx.Float8E4M3FN)
 
 
-def kv_fx_dtype(kv_dtype):
-    """FlyDSL element type of a KV cache dtype; uint8 (raw MXFP4 bytes) is MXFP4."""
-    return MXFP4_KV_DTYPE if kv_dtype == torch.uint8 else torch_to_fx_dtype(kv_dtype)
+def _pa_fx_dtype(role, dtype, supported):
+    if not isinstance(dtype, torch.dtype):
+        raise TypeError(f"PA {role} dtype must be a torch.dtype, got {dtype!r}")
+    try:
+        fx_dtype = torch_to_fx_dtype(dtype)
+    except ValueError:
+        fx_dtype = None
+    if fx_dtype not in supported:
+        raise ValueError(f"Unsupported PA {role} dtype {dtype}")
+    return fx_dtype
+
+
+def pa_fx_dtypes(kv_dtype, query_dtype):
+    """FlyDSL element types of the KV cache's and the query's torch dtypes.
+
+    ``torch.uint8`` KV is MXFP4: ``dtypes.fp4x2`` is uint8 on torch builds
+    without ``float4_e2m1fn_x2``. A value that is not a torch dtype, such as the
+    former ``"fp8"`` strings, raises TypeError; an unsupported dtype ValueError.
+    """
+    if kv_dtype == torch.uint8:
+        kv_fx = MXFP4_KV_DTYPE
+    else:
+        kv_fx = _pa_fx_dtype("KV", kv_dtype, PA_KV_DTYPES)
+    return kv_fx, _pa_fx_dtype("query", query_dtype, PA_QUERY_DTYPES)
 
 
 def d256_pipe(
@@ -147,7 +170,11 @@ class PaDecodeSchedule:
         mask_unowned_kv: bool = True,
         direct_output: bool = False,
     ) -> PaDecodeSchedule:
-        """Choose the existing policy from host-known grid and query bounds."""
+        """Choose the existing policy from host-known grid and query bounds.
+
+        ``kv_dtype`` and ``query_dtype`` are torch dtypes, as in
+        ``compile_pa_decode_tile``; this is their one conversion to FlyDSL types.
+        """
         if isinstance(work_capacity, bool) or not isinstance(work_capacity, int):
             raise TypeError("work_capacity must be a positive int")
         if work_capacity < 1:
@@ -156,16 +183,16 @@ class PaDecodeSchedule:
             raise NotImplementedError("Non-transposed key cache is not implemented")
         arch = str(get_rocm_arch()).split(":", 1)[0]
         is_gfx950 = "gfx95" in arch
-        kv_dtype = kv_fx_dtype(kv_dtype)
-        query_dtype = torch_to_fx_dtype(query_dtype)
-        if kv_dtype not in (*FP8_KV_DTYPES, fx.BFloat16, MXFP4_KV_DTYPE):
-            raise ValueError(f"Unsupported PA KV dtype {kv_dtype}")
+        kv_dtype, query_dtype = pa_fx_dtypes(kv_dtype, query_dtype)
+        if direct_output and kv_dtype != MXFP4_KV_DTYPE:
+            raise NotImplementedError("direct_output requires gfx1250 or MXFP4")
         # The MFMAs read FP8 as the arch's format: FNUZ on gfx942, OCP on gfx950.
         arch_fp8 = fx.Float8E4M3FN if is_gfx950 else fx.Float8E4M3FNUZ
         if kv_dtype in FP8_KV_DTYPES and kv_dtype != arch_fp8:
-            raise ValueError(f"FP8 KV on {arch} must be {arch_fp8}, got {kv_dtype}")
-        if query_dtype not in (fx.Float16, fx.BFloat16, fx.Float8E4M3FN):
-            raise ValueError(f"Unsupported PA query dtype {query_dtype}")
+            raise ValueError(
+                f"FP8 KV on {arch} must be {fx_to_torch_dtype(arch_fp8)}, "
+                f"got {fx_to_torch_dtype(kv_dtype)}"
+            )
         if kv_dtype == MXFP4_KV_DTYPE:
             if arch != "gfx950":
                 raise ValueError(f"MXFP4 PA decode requires gfx950; got {arch}")

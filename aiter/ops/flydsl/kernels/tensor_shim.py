@@ -416,13 +416,17 @@ _FX_TO_TORCH_DTYPE = {v: k for k, v in _TORCH_TO_FX_DTYPE.items()}
 
 
 def torch_to_fx_dtype(dtype):
-    """FlyDSL element type of a torch dtype; anything else is returned as is."""
+    """FlyDSL element type of a torch dtype.
+
+    Raises TypeError if ``dtype`` is not a ``torch.dtype`` and ValueError if
+    FlyDSL has no element type for it.
+    """
     if not isinstance(dtype, torch.dtype):
-        return dtype
+        raise TypeError(f"expected a torch.dtype, got {dtype!r}")
     try:
         return _TORCH_TO_FX_DTYPE[dtype]
     except KeyError:
-        raise TypeError(f"no FlyDSL element type for {dtype}") from None
+        raise ValueError(f"no FlyDSL element type for {dtype}") from None
 
 
 def fx_to_torch_dtype(dtype):
@@ -430,7 +434,7 @@ def fx_to_torch_dtype(dtype):
     try:
         return _FX_TO_TORCH_DTYPE[dtype]
     except KeyError:
-        raise TypeError(f"no torch dtype for {dtype}") from None
+        raise ValueError(f"no torch dtype for {dtype}") from None
 
 
 class TensorView:

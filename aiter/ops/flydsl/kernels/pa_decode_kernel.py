@@ -91,12 +91,11 @@ from .pa_decode.traits import (
     Gfx1250Traits,
     PaDecodeSchedule,
     PaDecodeTraits,
-    kv_fx_dtype,
+    pa_fx_dtypes,
 )
 from .tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
-    torch_to_fx_dtype,
 )
 
 __all__ = [
@@ -194,6 +193,14 @@ def compile_pa_decode_tile(
 ):
     """Select and cache a PA-decode kernel and launch wrapper.
 
+    ``kv_dtype`` is the KV cache's torch dtype: ``dtypes.fp8`` (the arch's e4m3
+    flavor: FNUZ on gfx942, OCP elsewhere), ``torch.bfloat16``, or
+    ``dtypes.fp4x2`` for MXFP4. ``dtypes.fp4x2`` is ``torch.uint8`` on torch
+    builds without ``float4_e2m1fn_x2``, so a uint8 ``kv_dtype`` also selects
+    MXFP4. ``query_dtype`` is the query's: f16 or bf16, or e4m3fn with MXFP4 KV.
+    Non-torch dtypes, such as the former ``"fp8"`` strings, raise TypeError;
+    unsupported dtypes and combinations raise ValueError.
+
     ``query_splits=None`` selects from host-known grid bounds; an explicit
     count overrides splitting and selects the matching prefetch policy.
     BF16 also selects the smallest query-length divisor that fits 64 KiB LDS;
@@ -245,10 +252,10 @@ def compile_pa_decode_tile(
     """
     if not trans_k:
         raise NotImplementedError("Non-transposed key cache is not implemented")
-    kv_dtype, query_dtype = kv_fx_dtype(kv_dtype), torch_to_fx_dtype(query_dtype)
     architecture = (architecture or get_gfx_runtime()).split(":", 1)[0]
     if architecture in ("gfx1250", "gfx1250-strict"):
-        if query_dtype not in (fx.Float16, fx.BFloat16) or kv_dtype not in (
+        kv_fx, query_fx = pa_fx_dtypes(kv_dtype, query_dtype)
+        if query_fx not in (fx.Float16, fx.BFloat16) or kv_fx not in (
             fx.Float8E4M3FN,
             fx.BFloat16,
         ):
@@ -261,7 +268,7 @@ def compile_pa_decode_tile(
             # per CTA. Other shapes retain fused queries and their KV reuse.
             query_splits = (
                 4
-                if kv_dtype == fx.BFloat16
+                if kv_fx == fx.BFloat16
                 and head_dim == 1024
                 and query_group_size == 16
                 and query_length == 4
@@ -275,12 +282,12 @@ def compile_pa_decode_tile(
             query_group_size=query_group_size,
             block_size=block_size,
             softmax_scale=softmax_scale,
-            query_dtype=_dtype_tag(query_dtype),
+            query_dtype=_dtype_tag(query_fx),
             per_token_kv=per_token_kv,
             query_length=query_length,
             trans_v=trans_v,
             sliding_window=sliding_window,
-            compute_dtype=_dtype_tag(kv_dtype),
+            compute_dtype=_dtype_tag(kv_fx),
             direct_output=direct_output and num_partitions == 1,
             query_splits=query_splits,
             merge_partitions=direct_output and num_partitions > 1,
@@ -290,8 +297,6 @@ def compile_pa_decode_tile(
         raise NotImplementedError(f"PA decode does not support {architecture}")
     if cluster_merge:
         raise NotImplementedError("cluster_merge requires gfx1250")
-    if direct_output and kv_dtype != MXFP4_KV_DTYPE:
-        raise NotImplementedError("direct_output requires gfx1250 or MXFP4")
     schedule = PaDecodeSchedule.select(
         head_dim=head_dim,
         query_group_size=query_group_size,
