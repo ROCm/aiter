@@ -1255,7 +1255,6 @@ parser.add_argument(
     "--deployments",
     type=str,
     nargs="+",
-    default=DEFAULT_DEPLOYMENTS,
     help="""MoE deployment file(s) whose fused_moe deployments aot_ep_profiles
     runs, each at every -m token count up to its max_tokens (default: the AOT
     build's, aiter/aot/flydsl/moe_deployments.json). Precompile the same files
@@ -1312,7 +1311,7 @@ for test in args.test:
             continue
         n_cases = 0
         for call, label, act in _aot_ep_deployments(
-            args.deployments, args.deployment_id
+            args.deployments or DEFAULT_DEPLOYMENTS, args.deployment_id
         ):
             ep_args = _deployment_ep_args(call, args.ep_mode)
             for m in args.token:
@@ -1342,7 +1341,7 @@ for test in args.test:
             )
             # The default files have nothing for some GPUs; a selection given
             # on the command line must check something.
-            if args.deployment_id or args.deployments != DEFAULT_DEPLOYMENTS:
+            if args.deployment_id or args.deployments is not None:
                 raise RuntimeError(
                     f"{test}: --deployments/--deployment-id select no EP "
                     f"deployment case {where}; list the ids with "
