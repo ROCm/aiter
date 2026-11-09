@@ -84,12 +84,16 @@ from unittest import mock
 
 from aiter.aot.flydsl.common import (
     aot_target_archs,
+    assert_targets_covered,
     check_replay_process,
     collect_aot_jobs,
     cu_num_to_arch,
     dedupe_jobs,
+    fail_build_on_missing_target_feature,
     get_max_workers,
+    is_strict_identity,
     replay_env,
+    resolve_target_arch,
     run_jobs_parallel,
     worker_waves,
 )
@@ -97,6 +101,7 @@ from aiter.aot.flydsl.deployments import DEFAULT_DEPLOYMENTS, FusedMoECall
 from aiter.aot.flydsl.deployments import load as load_deployments
 from aiter.aot.flydsl.replay import requested_kernels
 from aiter.jit.core import AITER_CONFIGS
+from aiter.jit.utils.build_targets import is_gfx1250_family
 from aiter_worker_limits import adopt_legacy_max_jobs
 
 # Keep the default AOT coverage aligned with runtime config resolution.
@@ -198,7 +203,7 @@ def _caller_gate_mode(row: dict):
     gu-interleaved layout."""
     from aiter.ops.flydsl.moe_common import GateMode
 
-    if job_arch(row) == "gfx1250":
+    if is_gfx1250_family(job_arch(row)):
         return GateMode.INTERLEAVE
     q_dtype_a, q_dtype_w = _name(row["q_dtype_a"]), _name(row["q_dtype_w"])
     mxfp8 = q_dtype_w in _FP8 and _name(row["q_type"]) == "per_1x32"
@@ -419,7 +424,7 @@ def _caller_inputs(job: dict) -> dict:
     q_dtype_w = _dtype(job["q_dtype_w"])
 
     if (
-        job_arch(job) == "gfx1250"
+        is_gfx1250_family(job_arch(job))
         and q_type == QuantType.per_1x32
         and q_dtype_w == dtypes.fp4x2
     ):
@@ -491,6 +496,20 @@ def _caller_inputs(job: dict) -> dict:
         else:
             w1_scale = empty(experts, 1, dtype=dtypes.fp32)
             w2_scale = empty(experts, 1, dtype=dtypes.fp32)
+    elif (
+        q_type == QuantType.No and q_dtype_a == dtypes.bf16 and q_dtype_w == dtypes.bf16
+    ):
+        # a16w16: bf16 activations and shuffle_weight (16,16) weights, no scale.
+        # get_flydsl_stage1_kernels_a16w16 / get_flydsl_stage2_kernels_a16w16
+        # register the names; _can_reroute_bf16_to_a16wmix (gated by
+        # _A16WMIX_BF16_ARCHS) / get_2stage_cfgs pick them at runtime
+        # (including _swiglu_limit_is_active). AOT only supplies the caller
+        # tensors; a flydsl_ CSV row is looked up by name even without a
+        # limit. PREBUILD_KERNELS=1 replays every flydsl_ row.
+        w1 = shuffle_weight(empty(experts, w1_rows, model_dim, dtype=q_dtype_w))
+        w2 = shuffle_weight(empty(experts, model_dim, inter_dim, dtype=q_dtype_w))
+        w1_scale = None
+        w2_scale = None
     else:
         raise NotImplementedError(
             f"no AOT input recipe for {q_type!s} with {q_dtype_a} x {q_dtype_w}"
@@ -564,11 +583,21 @@ def _replay(job: dict) -> None:
 @contextmanager
 def _without_device_queries():
     """Host queries whose C++ side reads the live device; their answers only
-    size buffers of HIP kernels the replay never launches."""
-    import aiter
+    size buffers of HIP kernels the replay never launches. The stage2 scratch
+    cache queries the stream, and would keep FakeTensors across replays."""
+    import torch
 
-    with mock.patch.object(
-        aiter, "moe_sorting_opus_get_workspace_size", lambda *_a, **_k: 0
+    import aiter
+    from aiter import fused_moe
+
+    def stage2_scratch(_slot, shape, dtype, device):
+        return torch.empty(shape, dtype=dtype, device=device)
+
+    with (
+        mock.patch.object(
+            aiter, "moe_sorting_opus_get_workspace_size", lambda *_a, **_k: 0
+        ),
+        mock.patch.object(fused_moe, "_stage2_scratch", stage2_scratch),
     ):
         yield
 
@@ -802,10 +831,30 @@ def run(
     archs whose replay failed."""
     jobs = _collect_jobs(csv_paths, deployments, edges)
     targets = aot_target_archs()
-    skipped = Counter(
-        job_arch(job) for job in jobs if targets and job_arch(job) not in targets
+    available = [job_arch(job) for job in jobs]
+    # Keep rows whose tuned arch shares a requested target's kernel family,
+    # retargeting each to the exact requested arch so it replays and compiles
+    # for that identity (a gfx1250 row serves a gfx1250-strict build -> 0xeb).
+    retargeted = []
+    skipped = Counter()
+    for job in jobs:
+        target = resolve_target_arch(job_arch(job), targets)
+        if target is None:
+            skipped[job_arch(job)] += 1
+            continue
+        # gfx1250-strict disables F4 WMMA (A0 errata); the fp4 mxfp4 rows are
+        # hollow on strict (fp8-activation a8w4 rows share the kernel name but
+        # are fine), so key on q_dtype_a. A0 falls back to runtime JIT.
+        if is_strict_identity(target) and _FP4 in str(job.get("q_dtype_a") or ""):
+            skipped[job_arch(job)] += 1
+            continue
+        if targets and target != job_arch(job):
+            job = {**job, "gfx": target}
+        retargeted.append(job)
+    jobs = retargeted
+    assert_targets_covered(
+        targets, available, [job_arch(job) for job in jobs], "FlyDSL MoE AOT"
     )
-    jobs = [job for job in jobs if job_arch(job) not in skipped]
     archs = sorted({job_arch(job) for job in jobs})
     rows = {
         tuple(job[f] for f in _ROW_KEY) for job in jobs if not job.get("deployment")
@@ -907,7 +956,21 @@ def main():
 
     if args.arch:
         jobs = _collect_jobs(csv_paths, deployments, edges)
-        jobs = [job for job in jobs if job_arch(job) == args.arch]
+        # args.arch is the exact requested target; keep family-matching rows
+        # and retarget them so they compile for that arch (strict -> 0xeb).
+        kept = []
+        for job in jobs:
+            if resolve_target_arch(job_arch(job), {args.arch}) != args.arch:
+                continue
+            # gfx1250-strict disables F4 WMMA (A0 errata): mxfp4 rows hollow.
+            if is_strict_identity(args.arch) and _FP4 in str(
+                job.get("q_dtype_a") or ""
+            ):
+                continue
+            if job_arch(job) != args.arch:
+                job = {**job, "gfx": args.arch}
+            kept.append(job)
+        jobs = kept
         sys.exit(1 if jobs and _replay_arch(jobs, args.arch) else 0)
 
     cache_dir = os.path.expanduser(
@@ -924,9 +987,10 @@ def main():
     print("=" * 72, flush=True)
 
     total_t0 = time.time()
-    failed_archs = run(
-        csv_paths, deployments=deployments, edges=edges, check=args.check
-    )
+    with fail_build_on_missing_target_feature():
+        failed_archs = run(
+            csv_paths, deployments=deployments, edges=edges, check=args.check
+        )
     print(f"\n  Total time:   {time.time() - total_t0:.1f}s")
     if failed_archs:
         print("Some replays failed. Check output above for details.")

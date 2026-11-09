@@ -11,6 +11,7 @@ the packed API; the work table is built inside the sparse custom op.
 
 import csv
 import functools
+import inspect
 import os
 from collections.abc import Callable
 from enum import IntEnum
@@ -24,7 +25,10 @@ from aiter.jit.utils.chip_info import get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.mha_v4_quant import (
     MHA_V4_HD256,
+    MHA_V4_KV_SCALE_LOOKAHEAD_ROWS,
+    MHA_V4_KV_TILE_ROWS,
     MHA_V4_LOG2E,
+    MHA_V4_MXFP4_K_SCALE_SLACK_BYTES,
     mha_v4_q_multiplier,
     mxfp4_k_view,
     mxfp4_v_view,
@@ -52,18 +56,28 @@ from aiter.ops.mha_v4_quant import (
     rotate_activation_hd128,
     rotate_activation_mxfp6_quant,
 )
-from aiter.ops.triton.attention.utils import block_attn_mask_to_ragged_lut
+from aiter.ops.triton.attention.utils import block_attn_mask_to_ragged_lut, lse_merge
+from aiter.ops.triton.utils._triton import arch_info
 
 __all__ = (
+    "MHA_V4_BLOCK_SPARSE_MODES",
     "MHA_V4_LOG2E",
+    "MHA_V4_SPARSE_MODE",
     "AttentionFormat",
     "AttentionPack",
     "AttentionScaleMode",
     "mha_v4",
+    "mha_v4_block_tile",
+    "mha_v4_block_tiles",
+    "mha_v4_block_tiles_in_any_precision",
+    "mha_v4_kv_splits",
     "mha_v4_kv_tile",
+    "mha_v4_kv_tile_for_q_tile",
     "mha_v4_mx_producers",
+    "mha_v4_operands",
     "mha_v4_packed",
     "mha_v4_q_multiplier",
+    "mha_v4_ragged_kv",
     "mha_v4_sparse_work_table",
     "mxfp4_k_view",
     "mxfp4_v_view",
@@ -93,6 +107,33 @@ __all__ = (
     "rotate_activation_mxfp6_quant",
     "scale_modes_for_formats",
 )
+
+
+def _launch_op(name: str):
+    """Register a kernel launcher as a custom op writing `out` and, if it takes one, `lse`, for
+    torch.compile.
+
+    Eager calls skip the op and run the body directly. A mutating custom op's Python dispatch
+    costs ~55 us per call, nearly all of it torch rebuilding the schema's argument list per
+    argument; that is most of the host time of a launch, and on a short sequence more than the
+    kernel itself.
+    """
+
+    def decorator(fn):
+        parameters = inspect.signature(fn).parameters
+        mutates = tuple(arg for arg in ("out", "lse") if arg in parameters)
+        op = torch.library.custom_op(name, mutates_args=mutates)(fn)
+
+        @functools.wraps(fn)
+        def launch(*args, **kwargs):
+            if torch.compiler.is_compiling():
+                return op(*args, **kwargs)
+            return fn(*args, **kwargs)
+
+        launch.register_fake = op.register_fake
+        return launch
+
+    return decorator
 
 
 def _mha_v4_sparse_work_table_fake(
@@ -152,7 +193,12 @@ class AttentionFormat(IntEnum):
 
 
 class AttentionPack(IntEnum):
-    """Stable IDs describing operand layouts within a numeric format."""
+    """Stable IDs for V's layout within its format, the manifest's v_pack column.
+
+    A format and scale mode do not pin a V layout: an MXFP4 V can be packed column-major for an
+    FP8 P operand or in the token order an FP6 P operand contracts over, and the kernels taking
+    the two are different rows.
+    """
 
     DEFAULT = 0
     V_FOR_FP6_P = 1
@@ -278,7 +324,9 @@ def mha_v4_mx_producers(
 _MHA_V4_Q_TILE = 256
 # mode=1 selects the sorted-sparse manifest rows; the launcher dispatches the same rows through
 # find_config(..., mode=1).
-_MHA_V4_SPARSE_MODE = 1
+_MHA_V4_DENSE_MODE = 0
+MHA_V4_SPARSE_MODE = 1
+MHA_V4_BLOCK_SPARSE_MODES = (MHA_V4_SPARSE_MODE,)
 
 # Shared-K component, relative to a typical K row, above which removing it improves quantization.
 # Real video models run to 0.67 (HunyuanVideo 1.5) and 0.76 (Wan) at the extreme, and on the one
@@ -287,6 +335,10 @@ _MHA_V4_SPARSE_MODE = 1
 # leaves every layer either model actually produces untouched.
 _K_SMOOTH_MIN_COMMON = 0.85
 _K_SMOOTH_SAMPLE_ROWS = 2048
+
+# Fewest keys kv_splits="auto" gives a split. A dense work-group spends ~8 us before its first key
+# and ~0.02 us per key at full occupancy, so a much shorter range is mostly overhead.
+_MHA_V4_MIN_KV_SPLIT_TOKENS = 512
 
 
 def native_fp8_format() -> AttentionFormat:
@@ -299,46 +351,397 @@ def native_fp8_format() -> AttentionFormat:
 
 
 @functools.cache
-def mha_v4_kv_tile() -> int:
-    """Return the KV tile of sorted-sparse MHA v4 rows on the active GPU.
+def mha_v4_kv_tile(operands=None, mode=None) -> int:
+    """Return the KV tile of the DEFAULT block-sparse MHA v4 geometry on the active GPU.
 
     Read from the same manifest the launcher dispatches on rather than restated here, so adding a
-    sparse row with a different tile cannot leave the two disagreeing. 256x128 on gfx950, 256x64 on
-    gfx942.
+    sparse row with a different tile cannot leave the two disagreeing. Narrowed by `operands` and
+    `mode` as mha_v4_kv_tile_for_q_tile is, which see, and which explains why naming a recipe is
+    not optional on an arch whose rows differ at this Q tile.
     """
-    return _mha_v4_kv_tile_from_manifest()
+    return mha_v4_block_tile(operands, mode)[1]
 
 
-# The read has to sit behind the guard, not just behind the cache above: Dynamo traces the body of a
-# cached function regardless of whether the cache is warm, and `open` is not traceable, so an
+@functools.cache
+def mha_v4_block_tile(operands=None, mode=None) -> tuple[int, int]:
+    """Return the default block-sparse (q_tile, kv_tile) for a recipe on the active GPU.
+
+    The default is that recipe's geometry at _MHA_V4_Q_TILE. An arch may ship a finer one -- gfx950
+    also has a 64x64 row for every recipe, for models routed more finely than their Q tile -- and
+    mha_v4_block_tiles() lists every geometry a recipe has.
+
+    `operands` is not optional in practice on gfx950, because its rows no longer agree on the KV
+    tile at this Q tile: BF16 and BF16/FP8 route on 64 tokens and everything else on 128. Asking
+    without them raises rather than picking one, since the caller is about to shape a mask to the
+    answer and a mask cut for the wrong block is not a near miss.
+    """
+    return (_MHA_V4_Q_TILE, mha_v4_kv_tile_for_q_tile(_MHA_V4_Q_TILE, operands, mode))
+
+
+@functools.cache
+def mha_v4_kv_tile_for_q_tile(q_tile: int, operands=None, mode=None) -> int:
+    """Return the KV tile the block-sparse rows serve at `q_tile`, or 0 if none does.
+
+    A Q tile pins the KV tile because the two are one kernel: the geometry is a property of the
+    manifest row, not a pair a caller may mix. Returning 0 rather than raising lets a caller offer
+    a geometry and fall back, which is the shape the validation in mha_v4_packed() wants.
+
+    Both filters are optional and both narrow what is being asked:
+
+    operands is what mha_v4_operands() builds -- the three formats, their three scale modes and V's
+    packing, which together are what picks a manifest row. It matters because an arch need not
+    serve every geometry in every precision: gfx942 has 256x64 rows for FP8 and INT8/FP8 only, so
+    asking without operands says 256x64 exists and asking with BF16 ones says it does not. The
+    scale modes are part of it and not an over-specification, since the FP8 and MXFP8 rows take
+    the same three formats and differ only there.
+
+    mode picks one of MHA_V4_BLOCK_SPARSE_MODES instead of answering for all of them. Left None
+    the modes are intersected rather than unioned, since a caller shaping a mask has not yet chosen
+    how to route it and a geometry is only safe when every mode can serve it.
+    """
+    return _mha_v4_kv_tile_for_q_tile_from_manifest(
+        q_tile,
+        *(_ANY_OPERANDS if operands is None else operands),
+        _ANY_MODE if mode is None else int(mode),
+    )
+
+
+def mha_v4_block_tiles(operands=None, mode=None) -> tuple[tuple[int, int], ...]:
+    """Every block-sparse (q_tile, kv_tile) the active GPU has kernels for, ascending.
+
+    Narrowed by `operands` and `mode` as mha_v4_kv_tile_for_q_tile is, which see.
+
+    Unlike the accessors above this reads the manifest unguarded, so it is NOT traceable -- it is
+    for choosing a geometry and for error messages, both of which happen outside a compiled region.
+    """
+    return tuple(
+        (q_tile, kv_tile)
+        for q_tile, kv_tile in (
+            (q_tile, mha_v4_kv_tile_for_q_tile(q_tile, operands, mode))
+            for q_tile in _mha_v4_block_q_tiles_from_manifest()
+        )
+        if kv_tile
+    )
+
+
+def mha_v4_operands(
+    q_format,
+    k_format,
+    v_format,
+    q_scale_mode,
+    k_scale_mode,
+    v_scale_mode,
+    v_pack=AttentionPack.DEFAULT,
+) -> tuple[int, ...]:
+    """The seven values that pick a manifest row, as ints, for the geometry queries above.
+
+    The six formats and scale modes, then V's AttentionPack. Plain ints rather than the enums so
+    the value is hashable for their caches and carryable through the torch.compile guard the
+    manifest read sits behind.
+    """
+    return (
+        int(q_format),
+        int(k_format),
+        int(v_format),
+        int(q_scale_mode),
+        int(k_scale_mode),
+        int(v_scale_mode),
+        int(v_pack),
+    )
+
+
+# Wildcards for the queries above, negative because every real format, scale mode, pack and mode
+# is not: 0 is a valid value for all of them, so it cannot stand for "unspecified".
+_ANY_OPERANDS = (-1,) * 7
+_ANY_MODE = -1
+
+
+# The reads have to sit behind the guard, not just behind the caches above: Dynamo traces the body
+# of a cached function regardless of whether the cache is warm, and `open` is not traceable, so an
 # unguarded read costs two graph breaks on every mha_v4(block_mask=...) trace and fails outright
-# under fullgraph=True. get_gfx() keeps its own rocminfo probe opaque the same way.
+# under fullgraph=True. get_gfx() keeps its own rocminfo probe opaque the same way. The guard only
+# carries scalars, which is why this is a query per Q tile rather than one call returning the set.
 @torch_compile_guard()
-def _mha_v4_kv_tile_from_manifest() -> int:
+def _mha_v4_kv_tile_for_q_tile_from_manifest(
+    q_tile: int,
+    q_format: int,
+    k_format: int,
+    v_format: int,
+    q_scale_mode: int,
+    k_scale_mode: int,
+    v_scale_mode: int,
+    v_pack: int,
+    mode: int,
+) -> int:
+    wanted = (
+        q_format,
+        k_format,
+        v_format,
+        q_scale_mode,
+        k_scale_mode,
+        v_scale_mode,
+        v_pack,
+    )
+
+    def serves(row):
+        return row[_ROW_TS_QO] == q_tile and all(
+            want < 0 or want == have for want, have in zip(wanted, row)
+        )
+
+    by_mode = _mha_v4_block_rows_from_manifest()
+    if mode != _ANY_MODE:
+        if mode not in by_mode:
+            raise ValueError(
+                f"mode={mode} is not block-sparse; MHA v4 geometry is a property of the "
+                f"{MHA_V4_BLOCK_SPARSE_MODES} rows"
+            )
+        by_mode = {mode: by_mode[mode]}
+    # Intersected rather than unioned: a caller that named no mode builds one mask and may route it
+    # either way, so a geometry is only usable when every mode can serve it. A mode this arch ships
+    # no rows for cannot be routed to at all, so it does not constrain the mask.
+    shipped = [rows for rows in by_mode.values() if rows] or [frozenset()]
+    kv_tiles = set.intersection(
+        *({row[_ROW_TS_KV] for row in rows if serves(row)} for rows in shipped)
+    )
+    if len(kv_tiles) > 1:
+        raise ValueError(
+            f"{get_gfx()} block-sparse rows disagree on ts_kv at ts_qo={q_tile} "
+            f"({sorted(kv_tiles)}); the mask geometry a caller builds is only well defined when "
+            "they agree"
+        )
+    return kv_tiles.pop() if kv_tiles else 0
+
+
+def mha_v4_block_tiles_in_any_precision(mode: int) -> tuple[tuple[int, int], ...]:
+    """Every (q_tile, kv_tile) this GPU has a `mode` row for, without collapsing precisions.
+
+    mha_v4_block_tiles() answers one KV tile per Q tile, which is what a caller shaping a mask
+    needs and is why it refuses where the rows disagree. This is for describing the hardware --
+    error messages and "is this tile buildable at all" checks -- which want the whole set and must
+    not raise on their way to reporting something else. It is no use for choosing a geometry: a
+    tile listed here may exist in a precision the caller is not running.
+    """
+    rows = _mha_v4_block_rows_from_manifest()[mode]
+    return tuple(sorted({(row[_ROW_TS_QO], row[_ROW_TS_KV]) for row in rows}))
+
+
+@functools.cache
+def mha_v4_ragged_kv(operands, mode, block_tile=None) -> bool:
+    """Whether the `mode` row for `operands` takes a key length that is not a multiple of its tile.
+
+    A ragged row masks the keys past the end of a short last block itself, so a caller hands it
+    the true key length; anything else needs K/V padded to a whole number of blocks, which
+    mha_v4_packed() checks and refuses. This is the answer a caller wants before deciding to pad,
+    since padding with zero keys is not free -- each one draws softmax weight exp(-max) rather
+    than none -- and the ragged rows make it unnecessary.
+
+    operands is what mha_v4_operands() builds and mode one of MHA_V4_BLOCK_SPARSE_MODES. Neither
+    is optional, because the capability belongs to one row: every gfx950 block-sparse row is
+    ragged, and gfx942 has no ragged row at all. block_tile defaults to the
+    geometry these operands dispatch at, as mha_v4_block_tile() answers it.
+    """
+    q_tile, kv_tile = (
+        mha_v4_block_tile(operands, mode) if block_tile is None else tuple(block_tile)
+    )
+    return bool(_mha_v4_ragged_kv_from_manifest(q_tile, kv_tile, *operands, int(mode)))
+
+
+def _mha_v4_block_q_tiles_from_manifest() -> tuple[int, ...]:
+    by_mode = _mha_v4_block_rows_from_manifest()
+    return tuple(sorted({row[_ROW_TS_QO] for rows in by_mode.values() for row in rows}))
+
+
+# A row as _mha_v4_block_rows_from_manifest stores it: mha_v4_operands()'s seven values, then the
+# geometry, then the ragged_kv capability. One order for both, so a filter can zip a query against
+# a row's head.
+_ROW_TS_QO, _ROW_TS_KV, _ROW_RAGGED_KV = 7, 8, 9
+
+
+@torch_compile_guard()
+def _mha_v4_ragged_kv_from_manifest(
+    q_tile: int,
+    kv_tile: int,
+    q_format: int,
+    k_format: int,
+    v_format: int,
+    q_scale_mode: int,
+    k_scale_mode: int,
+    v_scale_mode: int,
+    v_pack: int,
+    mode: int,
+) -> int:
+    """1 if the `mode` row for these operands and geometry masks a short last KV block, else 0."""
+    head = (
+        q_format,
+        k_format,
+        v_format,
+        q_scale_mode,
+        k_scale_mode,
+        v_scale_mode,
+        v_pack,
+        q_tile,
+        kv_tile,
+    )
+    rows = _mha_v4_block_rows_from_manifest()[mode]
+    return int(any(row[_ROW_RAGGED_KV] for row in rows if row[:_ROW_RAGGED_KV] == head))
+
+
+@functools.cache
+def _mha_v4_block_rows_from_manifest() -> dict[int, frozenset[tuple[int, ...]]]:
+    """Block-sparse manifest rows per mode, each as mha_v4_operands() + (ts_qo, ts_kv, ragged_kv).
+
+    The operands are carried because a geometry can be precision-specific; see
+    mha_v4_kv_tile_for_q_tile.
+    """
     gfx = get_gfx()
-    asm_dir = os.environ.get("AITER_ASM_DIR", os.path.join(AITER_ROOT_DIR, "hsa"))
-    manifest = os.path.join(asm_dir, gfx, "fmha_v4_fwd", "fmha_v4_fwd.csv")
-    tiles = set()
+    manifest = _mha_v4_manifest_path(gfx)
+    by_mode: dict[int, set[tuple[int, ...]]] = {
+        mode: set() for mode in MHA_V4_BLOCK_SPARSE_MODES
+    }
     try:
         with open(manifest, newline="") as handle:
             for row in csv.DictReader(
                 filter(lambda line: not line.startswith("#"), handle)
             ):
-                if int(row["mode"]) == _MHA_V4_SPARSE_MODE:
-                    tiles.add(int(row["ts_kv"]))
+                mode = int(row["mode"])
+                if mode in by_mode:
+                    by_mode[mode].add(
+                        mha_v4_operands(
+                            row["q_format"],
+                            row["k_format"],
+                            row["v_format"],
+                            row["q_scale_mode"],
+                            row["k_scale_mode"],
+                            row["v_scale_mode"],
+                            row.get("v_pack") or 0,
+                        )
+                        + (
+                            int(row["ts_qo"]),
+                            int(row["ts_kv"]),
+                            int(row.get("ragged_kv") or 0),
+                        )
+                    )
     except FileNotFoundError as error:
         raise ValueError(
-            f"no MHA v4 manifest for {gfx} at {manifest}; sorted-sparse MHA v4 is "
+            f"no MHA v4 manifest for {gfx} at {manifest}; block-sparse MHA v4 is "
             "unavailable on this GPU"
         ) from error
-    if not tiles:
-        raise ValueError(f"{gfx} has no sorted-sparse MHA v4 manifest row")
-    if len(tiles) > 1:
+    if not any(by_mode.values()):
         raise ValueError(
-            f"{gfx} sorted-sparse manifest rows disagree on ts_kv ({sorted(tiles)}); the "
-            "mask geometry a caller builds is only well defined when they agree"
+            f"{gfx} has no manifest row for any block-sparse mode "
+            f"{MHA_V4_BLOCK_SPARSE_MODES}"
         )
-    return tiles.pop()
+    return {mode: frozenset(rows) for mode, rows in by_mode.items()}
+
+
+def _mha_v4_manifest_path(gfx: str) -> str:
+    asm_dir = os.environ.get("AITER_ASM_DIR", os.path.join(AITER_ROOT_DIR, "hsa"))
+    return os.path.join(asm_dir, gfx, "fmha_v4_fwd", "fmha_v4_fwd.csv")
+
+
+@functools.cache
+def _mha_v4_dense_rows_from_manifest() -> frozenset[tuple[int, ...]]:
+    """Dense manifest rows, each as mha_v4_operands() + (hdim_q, ts_kv).
+
+    The head dimension is carried because the hd256 MX rows take the same operands as their hd128
+    rows on a different KV tile.
+    """
+    gfx = get_gfx()
+    manifest = _mha_v4_manifest_path(gfx)
+    rows: set[tuple[int, ...]] = set()
+    try:
+        with open(manifest, newline="") as handle:
+            for row in csv.DictReader(
+                filter(lambda line: not line.startswith("#"), handle)
+            ):
+                if int(row["mode"]) == _MHA_V4_DENSE_MODE:
+                    rows.add(
+                        mha_v4_operands(
+                            row["q_format"],
+                            row["k_format"],
+                            row["v_format"],
+                            row["q_scale_mode"],
+                            row["k_scale_mode"],
+                            row["v_scale_mode"],
+                            row.get("v_pack") or 0,
+                        )
+                        + (int(row["hdim_q"]), int(row["ts_kv"]))
+                    )
+    except FileNotFoundError as error:
+        raise ValueError(
+            f"no MHA v4 manifest for {gfx} at {manifest}; MHA v4 is unavailable on this GPU"
+        ) from error
+    return frozenset(rows)
+
+
+# Behind the guard for the reason _mha_v4_kv_tile_for_q_tile_from_manifest is: mha_v4 reads it
+# while resolving kv_splits, inside a compiled region.
+@torch_compile_guard()
+def _mha_v4_dense_kv_tile_from_manifest(
+    q_format: int,
+    k_format: int,
+    v_format: int,
+    q_scale_mode: int,
+    k_scale_mode: int,
+    v_scale_mode: int,
+    v_pack: int,
+    head_dim: int,
+) -> int:
+    head = (
+        q_format,
+        k_format,
+        v_format,
+        q_scale_mode,
+        k_scale_mode,
+        v_scale_mode,
+        v_pack,
+        head_dim,
+    )
+    kv_tiles = {
+        row[-1] for row in _mha_v4_dense_rows_from_manifest() if row[:-1] == head
+    }
+    if len(kv_tiles) > 1:
+        raise ValueError(
+            f"{get_gfx()} has dense rows on KV tiles {sorted(kv_tiles)} for one recipe"
+        )
+    return kv_tiles.pop() if kv_tiles else 0
+
+
+@functools.cache
+def _mha_v4_dense_kv_tile(operands, head_dim: int) -> int:
+    """The KV tile of the dense row for `operands` (mha_v4_operands()) at `head_dim`, or 0.
+
+    Not mha_v4_kv_tile(), which answers for the block-sparse rows: a dense row need not share
+    its recipe's sparse geometry.
+    """
+    return _mha_v4_dense_kv_tile_from_manifest(*operands, head_dim)
+
+
+def _head_major_k_scale(k_descale: Tensor, kv_tile: int) -> Tensor:
+    """Return the E8M0 K scales head-major, as the 64x64 MXFP8 and MXFP4 rows read them.
+
+    The producers write [b, sk, h_kv, 4], one row per token across every head, so a 64-token tile's
+    scales for one head sit on 64 cache lines; at long key lengths each of them misses L2. Head-major
+    puts them on two. The result keeps the logical shape and carries the layout in its strides,
+    which the launcher passes as the descale batch and head strides. Each head's run is padded to
+    whole tiles; the storage behind it covers the slack the launcher demands of MXFP4 K scales.
+    """
+    batch, sequence, heads, blocks = k_descale.shape
+    padded = -(-sequence // kv_tile) * kv_tile
+    slack_rows = (
+        -(-sequence // MHA_V4_KV_TILE_ROWS) * MHA_V4_KV_TILE_ROWS
+        + MHA_V4_KV_SCALE_LOOKAHEAD_ROWS
+        - sequence
+    )
+    image = batch * heads * padded * blocks
+    storage = k_descale.new_empty(
+        (image + slack_rows * heads * blocks + MHA_V4_MXFP4_K_SCALE_SLACK_BYTES,)
+    )
+    head_major = storage[:image].view(batch, heads, padded, blocks)
+    head_major[:, :, :sequence].copy_(k_descale.permute(0, 2, 1, 3))
+    if padded > sequence:
+        head_major[:, :, sequence:].zero_()
+    return head_major[:, :, :sequence].permute(0, 2, 1, 3)
 
 
 def _is_fp8_format(format: AttentionFormat) -> bool:
@@ -562,12 +965,12 @@ def _packed_lut_triple(
 
 
 def _block_mask_to_lut(
-    block_mask: Tensor, query: Tensor, key: Tensor
+    block_mask: Tensor, query: Tensor, key: Tensor, block_tile: tuple[int, int]
 ) -> tuple[Tensor, Tensor, Tensor]:
     batch, query_length, query_heads, _ = query.shape
     key_length = key.shape[1]
-    q_tiles = (query_length + _MHA_V4_Q_TILE - 1) // _MHA_V4_Q_TILE
-    kv_tile = mha_v4_kv_tile()
+    q_tile, kv_tile = block_tile
+    q_tiles = (query_length + q_tile - 1) // q_tile
     kv_tiles = (key_length + kv_tile - 1) // kv_tile
     # The conversion below counts selected blocks with an arithmetic sum but fills the index list
     # from truthiness, so anything other than bool can make lut_count disagree with the entries
@@ -584,7 +987,7 @@ def _block_mask_to_lut(
         if tuple(block_mask.shape) != expected:
             raise ValueError(
                 "block_mask must have shape [batch, heads, "
-                f"ceil(Sq/{_MHA_V4_Q_TILE}), ceil(Sk/{kv_tile})]; "
+                f"ceil(Sq/{q_tile}), ceil(Sk/{kv_tile})]; "
                 f"got {tuple(block_mask.shape)}, expected {expected}"
             )
     elif block_mask.dim() == 3:
@@ -592,7 +995,7 @@ def _block_mask_to_lut(
         if tuple(block_mask.shape) != expected:
             raise ValueError(
                 "block_mask must have shape [batch, "
-                f"ceil(Sq/{_MHA_V4_Q_TILE}), ceil(Sk/{kv_tile})] "
+                f"ceil(Sq/{q_tile}), ceil(Sk/{kv_tile})] "
                 f"or the 4-D per-head form; got {tuple(block_mask.shape)}, "
                 f"expected {expected}"
             )
@@ -662,7 +1065,7 @@ def _fmha_v4_fwd(
 ) -> None: ...
 
 
-@torch.library.custom_op("aiter::mha_v4_fwd_launch", mutates_args=("out", "lse"))
+@_launch_op("aiter::mha_v4_fwd_launch")
 def _mha_v4_fwd_launch(
     q: Tensor,
     k: Tensor,
@@ -748,13 +1151,15 @@ def _fmha_v4_fwd_sparse_fake(
     kv_block_indices: Tensor,
     lut_start: Tensor,
     lut_count: Tensor,
-    lse: Optional[Tensor],  # noqa: UP045
+    q_tile: int = 0,
+    kv_tile: int = 0,
+    lse: Optional[Tensor] = None,  # noqa: UP045
 ) -> None:
     del q, k, v, q_descale, k_descale, v_descale
     del q_format, k_format, v_format, v_pack
     del q_scale_mode, k_scale_mode, v_scale_mode, softmax_scale
-    del kv_block_indices, lut_start, lut_count, lse
-    del out
+    del kv_block_indices, lut_start, lut_count, q_tile, kv_tile
+    del out, lse
 
 
 @compile_ops(
@@ -781,11 +1186,13 @@ def _fmha_v4_fwd_sparse(
     kv_block_indices: Tensor,
     lut_start: Tensor,
     lut_count: Tensor,
-    lse: Optional[Tensor],  # noqa: UP045
+    q_tile: int = 0,
+    kv_tile: int = 0,
+    lse: Optional[Tensor] = None,  # noqa: UP045
 ) -> None: ...
 
 
-@torch.library.custom_op("aiter::mha_v4_fwd_sparse_launch", mutates_args=("out", "lse"))
+@_launch_op("aiter::mha_v4_fwd_sparse_launch")
 def _mha_v4_fwd_sparse_launch(
     q: Tensor,
     k: Tensor,
@@ -806,6 +1213,8 @@ def _mha_v4_fwd_sparse_launch(
     lut_start: Tensor,
     lut_count: Tensor,
     lse: Optional[Tensor],  # noqa: UP045
+    q_tile: int = 0,
+    kv_tile: int = 0,
 ) -> None:
     _fmha_v4_fwd_sparse(
         q,
@@ -826,6 +1235,8 @@ def _mha_v4_fwd_sparse_launch(
         kv_block_indices,
         lut_start,
         lut_count,
+        q_tile,
+        kv_tile,
         lse,
     )
 
@@ -851,11 +1262,13 @@ def _mha_v4_fwd_sparse_launch_fake(
     lut_start: Tensor,
     lut_count: Tensor,
     lse: Optional[Tensor],  # noqa: UP045
+    q_tile: int = 0,
+    kv_tile: int = 0,
 ) -> None:
-    del q, k, v, q_descale, k_descale, v_descale, out
+    del q, k, v, q_descale, k_descale, v_descale, out, lse
     del q_format, k_format, v_format, v_pack
     del q_scale_mode, k_scale_mode, v_scale_mode, softmax_scale
-    del kv_block_indices, lut_start, lut_count, lse
+    del kv_block_indices, lut_start, lut_count, q_tile, kv_tile
 
 
 # (q_format, v_format) rows whose code object implements the LSE epilogue. The kernels branch on
@@ -882,26 +1295,35 @@ _LSE_CAPABLE_QV = frozenset(
 )
 
 
-def _check_lse_capable(q_format: AttentionFormat, v_format: AttentionFormat) -> None:
-    """Reject LSE where the exported value has not been measured."""
+def _lse_unsupported(
+    q_format: AttentionFormat, v_format: AttentionFormat
+) -> Optional[str]:  # noqa: UP045
+    """Why MHA v4 cannot export the LSE for these operands, or None if it can."""
     arch = get_gfx()
     if arch != "gfx950":
         # The gfx942 objects do carry the epilogue, but they predate the frozen-max correction
         # and their LSE has never been compared against torch.logsumexp. O never reads LSE, so
         # passing every output test says nothing about it. Lift this once MI300 is measured.
-        raise NotImplementedError(f"MHA v4 LSE is not validated on {arch} yet")
+        return f"MHA v4 LSE is not validated on {arch} yet"
     if (q_format, v_format) not in _LSE_CAPABLE_QV:
-        raise NotImplementedError(
+        return (
             f"MHA v4 LSE is not implemented for Q={q_format.name} "
             f"V={v_format.name} yet"
         )
+    return None
+
+
+def _check_lse_capable(q_format: AttentionFormat, v_format: AttentionFormat) -> None:
+    """Reject LSE where the exported value has not been measured."""
+    reason = _lse_unsupported(q_format, v_format)
+    if reason is not None:
+        raise NotImplementedError(reason)
 
 
 # (q_format, v_format) rows whose code object consumes the seqlens_k kernarg. Every dense source
 # carries the load, but only these objects were rebuilt with it; the rest would silently attend
 # over the full padded key length, so they are rejected rather than left to return a wrong answer.
-# Ordered to mirror _LSE_CAPABLE_QV above so the two diff by eye. (FP8, FP8) covers both the fp8
-# and mxfp8 objects, which differ only by scale mode.
+# (FP8, FP8) covers both the fp8 and mxfp8 objects, which differ only by scale mode.
 _VARLEN_CAPABLE_QV = frozenset(
     {
         (AttentionFormat.BF16, AttentionFormat.BF16),
@@ -918,6 +1340,16 @@ _VARLEN_CAPABLE_QV = frozenset(
 )
 
 
+def _varlen_capable(q_format: AttentionFormat, v_format: AttentionFormat) -> bool:
+    """Whether the dense row for these operands takes per-batch key lengths.
+
+    Asks the live GPU, as the launcher dispatches on it, not get_gfx(), which follows GPU_ARCHS.
+    """
+    return (
+        arch_info.get_arch() == "gfx950" and (q_format, v_format) in _VARLEN_CAPABLE_QV
+    )
+
+
 def _check_varlen_capable(q_format: AttentionFormat, v_format: AttentionFormat) -> None:
     """Reject per-batch key lengths on rows whose code object ignores them."""
     arch = get_gfx()
@@ -925,7 +1357,7 @@ def _check_varlen_capable(q_format: AttentionFormat, v_format: AttentionFormat) 
         raise NotImplementedError(
             f"MHA v4 per-batch key lengths are not implemented on {arch} yet"
         )
-    if (q_format, v_format) not in _VARLEN_CAPABLE_QV:
+    if not _varlen_capable(q_format, v_format):
         raise NotImplementedError(
             f"MHA v4 per-batch key lengths are not implemented for "
             f"Q={q_format.name} V={v_format.name} yet"
@@ -935,7 +1367,9 @@ def _check_varlen_capable(q_format: AttentionFormat, v_format: AttentionFormat) 
 def _empty_lse(q: Tensor, return_lse: bool) -> Optional[Tensor]:  # noqa: UP045
     """An FP32 ``[batch, heads, Sq]`` LSE buffer for a BSHD ``q``, or None.
 
-    The kernel derives the LSE batch stride as heads * head stride, so this must stay contiguous.
+    [batch, head, query] rather than q's [batch, query, head]: the kernel writes one contiguous
+    row of queries per (batch, head), and derives the batch stride as heads * head stride, so this
+    must stay contiguous. It is also the layout flash-attn returns, which a ring merge expects.
     """
     if not return_lse:
         return None
@@ -980,6 +1414,7 @@ def mha_v4_packed(
     kv_block_indices: Optional[Tensor] = None,  # noqa: UP045
     lut_start: Optional[Tensor] = None,  # noqa: UP045
     lut_count: Optional[Tensor] = None,  # noqa: UP045
+    block_tile: Optional[tuple[int, int]] = None,  # noqa: UP045
 ) -> Union[Tensor, tuple[Tensor, Tensor]]:  # noqa: UP007
     """Launch non-causal MHA v4 over pre-quantized BSHD operands.
 
@@ -996,6 +1431,20 @@ def mha_v4_packed(
     peers carries an exponentially larger merge weight. Do not use it as an absolute
     quantity (entropy, perplexity) or to merge chunks across DIFFERENT recipes, where the
     per-recipe biases stop cancelling.
+    Only rows whose manifest lse column is 1 can write it; the launcher refuses the
+    others.
+
+    block_tile names the (q_tile, kv_tile) geometry the LUT was built for; it
+    defaults to this call's own operands' geometry, since gfx950's rows no longer
+    agree on the KV tile at a given Q tile. Pass 64x64
+    to route at a 64-token block with a 64-row query tile as well, which costs
+    throughput per token -- the same KV is re-read by four times as many query
+    tiles -- and only pays off if the finer blocks drop enough attention mass.
+    mha_v4_block_tiles() lists what the GPU has kernels for.
+
+    v_pack names V's layout within v_format. An MXFP4 or MXFP6 V packed by
+    quantize_v_mxfp4_fp6_p / quantize_v_mxfp6_fp6_p is AttentionPack.V_FOR_FP6_P; those rows
+    take an FP6 P operand and serve LSE and ragged KV in the sorted-sparse mode.
     """
     lut = _packed_lut_triple(kv_block_indices, lut_start, lut_count)
     if return_lse:
@@ -1086,21 +1535,62 @@ def mha_v4_packed(
     if lut is None:
         _mha_v4_fwd_launch(*launch_args, seqlens_k, lse)
     else:
-        kv_tile = mha_v4_kv_tile()
-        if k.shape[1] % kv_tile != 0:
-            raise ValueError(
-                "sorted-sparse MHA v4 requires key length padded to a "
-                f"multiple of {kv_tile}"
+        # Scalar query, not a membership test against mha_v4_block_tiles(): this sits on the
+        # torch.compile path, where only the guarded per-Q-tile read is traceable. Asked for these
+        # operands rather than for any, because a geometry can be precision-specific and the
+        # alternative is the launch failing on a missing row naming format codes and no tile.
+        operands = mha_v4_operands(
+            q_format,
+            k_format,
+            v_format,
+            q_scale_mode,
+            k_scale_mode,
+            v_scale_mode,
+            v_pack,
+        )
+        mode = MHA_V4_SPARSE_MODE
+        q_tile, kv_tile = (
+            mha_v4_block_tile(operands, mode)
+            if block_tile is None
+            else tuple(block_tile)
+        )
+        if block_tile is None and kv_tile == 0:
+            raise NotImplementedError(
+                f"block-sparse MHA v4 has no {get_gfx()} row for "
+                f"Q={q_format.name} K={k_format.name} V={v_format.name}"
             )
-        _mha_v4_fwd_sparse_launch(*launch_args, *lut, lse)
+        if kv_tile <= 0 or mha_v4_kv_tile_for_q_tile(q_tile, operands, mode) != kv_tile:
+            raise ValueError(
+                f"sorted-sparse MHA v4 has no {q_tile}x{kv_tile} kernel on this GPU for "
+                f"q={q_format.name} k={k_format.name} v={v_format.name}; those operands have "
+                f"{mha_v4_block_tiles(operands, mode)} and the GPU has "
+                f"{mha_v4_block_tiles_in_any_precision(mode)} in some precision"
+            )
+        if k.shape[1] % kv_tile != 0 and not _mha_v4_ragged_kv_from_manifest(
+            q_tile, kv_tile, *operands, mode
+        ):
+            raise ValueError(
+                f"sorted-sparse MHA v4 requires key length padded to a "
+                f"multiple of {kv_tile} for q={q_format.name} k={k_format.name} "
+                f"v={v_format.name} at {q_tile}x{kv_tile}"
+            )
+        if (
+            kv_tile == 64
+            and AttentionScaleMode(k_scale_mode) == AttentionScaleMode.E8M0_PER_1X32
+            and (_is_fp8_format(k_format) or k_format == AttentionFormat.MXFP4)
+        ):
+            launch_args = (
+                *launch_args[:4],
+                _head_major_k_scale(k_descale, kv_tile),
+                *launch_args[5:],
+            )
+        _mha_v4_fwd_sparse_launch(*launch_args, *lut, lse, q_tile, kv_tile)
     if return_lse:
         return out, lse
     return out
 
 
-@torch.library.custom_op(
-    "aiter::mha_v4_launch_mxfp4_coalesced_v3", mutates_args=("out", "lse")
-)
+@_launch_op("aiter::mha_v4_launch_mxfp4_coalesced_v3")
 def _launch_mxfp4_coalesced(
     q: Tensor,
     q_descale: Tensor,
@@ -1167,7 +1657,7 @@ def _launch_mxfp4_coalesced_fake(
     del v_format, v_pack, softmax_scale, seqlens_k, lse
 
 
-@torch.library.custom_op("aiter::mha_v4_launch_mxfp6_v3", mutates_args=("out", "lse"))
+@_launch_op("aiter::mha_v4_launch_mxfp6_v3")
 def _launch_mxfp6(
     q: Tensor,
     q_descale: Tensor,
@@ -1243,6 +1733,192 @@ def _launch_mxfp6_fake(
     del q, q_descale, k_raw, k_descale_raw, v_data, v_descale
     del sequence_k, heads, v_format, v_pack, softmax_scale, seqlens_k, lse
     del out
+
+
+@_launch_op("aiter::mha_v4_merge_kv_splits")
+def _merge_kv_splits(
+    partial_out: Tensor,
+    partial_lse: Tensor,
+    out: Tensor,
+    lse: Optional[Tensor],  # noqa: UP045
+) -> None:
+    lse_merge(partial_out, partial_lse, out, lse)
+
+
+@_merge_kv_splits.register_fake
+def _merge_kv_splits_fake(
+    partial_out: Tensor,
+    partial_lse: Tensor,
+    out: Tensor,
+    lse: Optional[Tensor],  # noqa: UP045
+) -> None:
+    del partial_out, partial_lse, out, lse
+
+
+# Recipes whose operands quantize to plain BSHD tensors under per-tensor scales, so a key range is
+# a view of them. The MX recipes pack K and V in tiles and pad their block scales past the sequence,
+# neither of which a range of rows can be cut from. Quantizing before the split also keeps the
+# scales global, and with them the LSE bias the same in every range, so it cancels in the merge;
+# quantized per range, FP8 moves it by up to 0.75 nats between ranges.
+_KV_SPLIT_RECIPES = frozenset(
+    {
+        _RawRecipeKind.BF16,
+        _RawRecipeKind.BF16_FP8,
+        _RawRecipeKind.INT8_FP8,
+        _RawRecipeKind.FP8,
+    }
+)
+
+
+def mha_v4_kv_splits(
+    batch: int,
+    query_length: int,
+    query_heads: int,
+    key_length: int,
+    device: Optional[torch.device] = None,  # noqa: UP045
+    *,
+    ragged: bool = False,
+) -> int:
+    """The KV split count mha_v4(kv_splits="auto") uses for these shapes on `device`.
+
+    A dense launch runs one work-group per (batch, head, 256-row query tile), so a short
+    sequence with few heads leaves most CUs idle: [1, 4352, 3] fills 51 of MI355X's 256.
+    The CU count is the device's own, so each SKU and partition mode gets its own split.
+    Splitting the keys into n ranges folded into the batch multiplies the grid by n at the cost
+    of a merge pass. This takes the largest n that divides the key length, still fits the grid
+    in one wave and leaves each range at least _MHA_V4_MIN_KV_SPLIT_TOKENS keys; a grid that
+    already fills the GPU gets 1, since further splits only add work-groups and merge traffic.
+    Only with no such divisor, at batch 1 and when `ragged` (operands whose dense row takes
+    per-batch key lengths), does it take the largest n that fits and let the last range take
+    the remainder.
+    """
+    work_groups = batch * query_heads * -(-query_length // _MHA_V4_Q_TILE)
+    cus = torch.cuda.get_device_properties(device).multi_processor_count
+    most = min(cus // max(work_groups, 1), key_length // _MHA_V4_MIN_KV_SPLIT_TOKENS)
+    for splits in range(most, 1, -1):
+        if key_length % splits == 0:
+            return splits
+    # A remainder builds seqlens_k with two kernels per call (~3 us replayed, ~14 us of host
+    # time), and past batch 1 the ranges stop being a view of K and V, whose copy costs more than
+    # splitting gains. On MI355X a divisor above half the fit was faster both replayed and eager;
+    # below half, replayed BF16 gained up to 17 us from the extra splits, but eager calls and
+    # replayed FP8 still favoured the divisor.
+    if ragged and batch == 1:
+        return max(most, 1)
+    return 1
+
+
+def _resolve_kv_splits(
+    kv_splits: Union[int, str],  # noqa: UP007
+    recipe: _RawRecipePlan,
+    q_format: AttentionFormat,
+    k_format: AttentionFormat,
+    v_format: AttentionFormat,
+    q: Tensor,
+    k: Tensor,
+    sparse: bool,
+    varlen: bool,
+) -> int:
+    capable = recipe.kind in _KV_SPLIT_RECIPES and (
+        recipe.kind != _RawRecipeKind.FP8 or _is_fp8_format(v_format)
+    )
+    if kv_splits == "auto":
+        # The ranges are merged by their LSE, so auto splits wherever the LSE gate admits these
+        # operands rather than naming an arch: lifting that gate for an arch enables both.
+        if (
+            not capable
+            or sparse
+            or varlen
+            or _lse_unsupported(q_format, v_format) is not None
+        ):
+            return 1
+        return mha_v4_kv_splits(
+            q.shape[0],
+            q.shape[1],
+            q.shape[2],
+            k.shape[1],
+            q.device,
+            ragged=_varlen_capable(q_format, v_format),
+        )
+    if isinstance(kv_splits, bool) or not isinstance(kv_splits, int) or kv_splits < 1:
+        raise ValueError(
+            f'kv_splits must be a positive int or "auto", got {kv_splits!r}'
+        )
+    if kv_splits == 1:
+        return 1
+    if sparse:
+        raise NotImplementedError("kv_splits does not combine with block_mask yet")
+    if varlen:
+        raise NotImplementedError("kv_splits does not combine with seqlens_k yet")
+    if not capable:
+        raise NotImplementedError(
+            f"kv_splits is implemented for per-tensor operands (BF16, BF16/FP8, INT8/FP8 and "
+            f"FP8/FP8), not recipe {recipe.kind.name} with V {v_format.name}"
+        )
+    _check_lse_capable(q_format, v_format)
+    # A range shorter than a KV tile still costs a whole tile, so splitting past one tile per
+    # range adds work-groups and merge traffic without adding parallelism. The merge also unrolls
+    # over the count, whose compile time grows steeply with it (13 s cold at 128 on MI355X).
+    kv_tile = _mha_v4_dense_kv_tile(
+        mha_v4_operands(
+            q_format, k_format, v_format, *recipe.scale_modes, recipe.v_pack
+        ),
+        q.shape[-1],
+    )
+    if kv_tile == 0:
+        raise NotImplementedError(
+            f"{get_gfx()} has no dense MHA v4 row for Q={q_format.name} "
+            f"K={k_format.name} V={v_format.name} to split"
+        )
+    most = max(k.shape[1] // kv_tile, 1)
+    if kv_splits > most:
+        raise ValueError(
+            f"kv_splits={kv_splits} must leave every key range at least one {kv_tile}-key "
+            f"tile: at most {most} for key length {k.shape[1]}"
+        )
+    if k.shape[1] % kv_splits and not _varlen_capable(q_format, v_format):
+        raise ValueError(
+            f"kv_splits={kv_splits} must divide the key length {k.shape[1]} for "
+            f"Q={q_format.name} V={v_format.name}, whose dense row takes no per-batch key "
+            "lengths to end a shorter range with"
+        )
+    return kv_splits
+
+
+def _repeat_queries(t: Tensor, splits: int) -> Tensor:
+    """[B, Sq, H, D] -> [B * splits, Sq, H, D], row b * splits + i = b; a view when B is 1."""
+    return (
+        t.unsqueeze(1)
+        .expand(t.shape[0], splits, *t.shape[1:])
+        .reshape(-1, *t.shape[1:])
+    )
+
+
+def _fold_key_ranges(t: Tensor, splits: int) -> Tensor:
+    """[B, Sk, H, D] -> [B * splits, span, H, D], row b * splits + i = range i of b.
+
+    Range i starts at key i * (Sk // splits) and is span = Sk - (splits - 1) * (Sk // splits)
+    keys long, so the ranges overlap by the remainder and the last one ends at Sk; when the
+    splits do not divide Sk, _key_range_lengths cuts every other range back to Sk // splits. A
+    view when B is 1 or the splits divide Sk, and a copy otherwise.
+    """
+    step = t.shape[1] // splits
+    span = t.shape[1] - (splits - 1) * step
+    # unfold rather than as_strided: Dynamo cannot trace the storage_offset() the latter needs.
+    ranges = t.unfold(1, span, step).movedim(-1, 2)
+    return ranges.reshape(-1, span, *t.shape[2:])
+
+
+def _key_range_lengths(
+    batch: int, splits: int, key_length: int, device: torch.device
+) -> Optional[Tensor]:  # noqa: UP045
+    """The seqlens_k ending each range of _fold_key_ranges, or None when they all end at span."""
+    step = key_length // splits
+    if key_length == step * splits:
+        return None
+    lengths = torch.full((batch * splits,), step, dtype=torch.int32, device=device)
+    lengths[splits - 1 :: splits] = key_length - (splits - 1) * step
+    return lengths
 
 
 def _k_mean(k: Tensor, kind: _RawRecipeKind) -> Optional[Tensor]:  # noqa: UP045
@@ -1346,6 +2022,8 @@ def mha_v4(
     k_scale_mode: Optional[AttentionScaleMode] = None,  # noqa: UP045
     v_scale_mode: Optional[AttentionScaleMode] = None,  # noqa: UP045
     seqlens_k: Optional[Tensor] = None,  # noqa: UP045
+    kv_splits: Union[int, str] = 1,  # noqa: UP007
+    block_tile: Optional[tuple[int, int]] = None,  # noqa: UP045
 ) -> Union[Tensor, tuple[Tensor, Tensor]]:  # noqa: UP007
     """Quantize BF16 BSHD operands and run non-causal MHA v4.
 
@@ -1355,10 +2033,14 @@ def mha_v4(
     K and V may have fewer heads than Q for GQA. The Q-to-KV head ratio must
     be a power of two no greater than 16; output retains Q's head count.
     ``block_mask`` is optional boolean tile metadata: ``[B, H, Qtiles, KVtiles]``
-    or ``[B, Qtiles, KVtiles]`` (broadcast heads). Geometry is 256x128 on gfx950
-    and 256x64 on gfx942. Sparse LUT rows are one per query head; K/V addressing
-    uses the GQA ratio. A row may select nothing: an all-False row is a no-op
-    that writes a zero output tile.
+    or ``[B, Qtiles, KVtiles]`` (broadcast heads). Its geometry is ``block_tile``,
+    defaulting to the geometry this call's own operands dispatch at: 256x64 on
+    gfx950 for BF16 and BF16/FP8, 256x128 there for everything else, 256x64 on
+    gfx942. gfx950 also accepts 64x64 for finer routing. Ask
+    mha_v4_block_tiles() with this call's operands rather than assuming: a
+    geometry need not exist in every precision. Sparse LUT rows are one
+    per query head; K/V addressing uses the GQA ratio. A row may select nothing:
+    an all-False row is a no-op that writes a zero output tile.
     With ``return_lse`` the call returns ``(out, lse)``, where ``lse`` is FP32
     ``[batch, heads, Sq]`` holding ``ln(sum exp(s - max)) + max`` over the scores the
     kernel actually computed, i.e. the QUANTIZED scores. Its error tracks the row max at
@@ -1368,6 +2050,22 @@ def mha_v4(
     peers carries an exponentially larger merge weight. Do not use it as an absolute
     quantity (entropy, perplexity) or to merge chunks across DIFFERENT recipes, where the
     per-recipe biases stop cancelling.
+    ``kv_splits`` splits the keys into that many ranges, run as extra batches of one launch
+    and merged by their LSE, for grids too small to fill the GPU: a short sequence with few
+    heads. ``"auto"`` picks the count with mha_v4_kv_splits() and falls back to 1 wherever
+    splitting is unsupported. Operands are quantized once, before the split, so per-tensor
+    scales stay global. For BF16, BF16/FP8, INT8/FP8 and FP8/FP8 operands wherever MHA v4
+    exports their LSE (gfx950 today), without ``block_mask`` or ``seqlens_k``. The ranges are
+    equal when the count divides the key length; otherwise the last one takes the remainder,
+    which needs operands that take per-batch key lengths (all four on gfx950), and any others
+    need a count that divides it. A count is at most the key length over the KV tile of the
+    operands' dense row (64 for BF16 and BF16/FP8 on gfx950, 128 for INT8/FP8 and FP8/FP8), so
+    every range holds at least one KV tile.
+    ``"auto"`` minimizes device time, so it is meant for HIP-graph-replayed or torch.compile'd
+    callers. A split adds ~35 us of host time per eager call (more with a remainder), mostly the
+    merge's Triton launch, and at the short sequences it targets an eager call is already bound
+    by host time: BF16/FP8 on MI355X at [1, 4352, 3, 128] took 40 us replayed at 4 splits
+    against 61 us unsplit, but 105 us eager against 66 us.
     """
     if return_lse:
         _check_lse_capable(q_format, v_format)
@@ -1391,6 +2089,17 @@ def mha_v4(
         sparse=sparse,
     )
     q_scale_mode, k_scale_mode, v_scale_mode = recipe.scale_modes
+    splits = _resolve_kv_splits(
+        kv_splits,
+        recipe,
+        q_format,
+        k_format,
+        v_format,
+        q,
+        k,
+        sparse,
+        seqlens_k is not None,
+    )
 
     # Every quantized K path fuses the subtraction into its rotation kernel, except INT8, whose
     # quantizer is still Triton and so needs a materialised K.
@@ -1405,11 +2114,34 @@ def mha_v4(
     lut_start: Optional[Tensor] = None  # noqa: UP045
     lut_count: Optional[Tensor] = None  # noqa: UP045
     if block_mask is not None:
-        lut_indices, lut_start, lut_count = _block_mask_to_lut(block_mask, q, k)
+        # This recipe's own geometry, not the arch's: the rows do not agree on the KV tile at a
+        # given Q tile, so the mask has to be cut to the tile these operands dispatch at.
+        if block_tile is None:
+            block_tile = mha_v4_block_tile(
+                mha_v4_operands(
+                    q_format,
+                    k_format,
+                    v_format,
+                    q_scale_mode,
+                    k_scale_mode,
+                    v_scale_mode,
+                    recipe.v_pack,
+                ),
+                MHA_V4_SPARSE_MODE,
+            )
+            if block_tile[1] == 0:
+                raise NotImplementedError(
+                    f"block-sparse MHA v4 has no {get_gfx()} row for "
+                    f"Q={q_format.name} K={k_format.name} V={v_format.name}"
+                )
+        lut_indices, lut_start, lut_count = _block_mask_to_lut(
+            block_mask, q, k, block_tile
+        )
     packed_lut = {
         "kv_block_indices": lut_indices,
         "lut_start": lut_start,
         "lut_count": lut_count,
+        "block_tile": block_tile,
     }
     # Set by the two recipes that reach the kernel through their own custom op instead of calling
     # mha_v4_packed directly; the shared tail below runs it.
@@ -1519,6 +2251,41 @@ def mha_v4(
     if launch is not None:
         lse_out = _empty_lse(q, return_lse)
         launch(lse_out)
+        if return_lse:
+            return out, _restore_k_mean_in_lse(lse_out, q, k_mean_lse, softmax_scale)
+        return out
+
+    if splits > 1:
+        q_split = _repeat_queries(q_quantized, splits)
+        k_split = _fold_key_ranges(k_quantized, splits)
+        v_split = _fold_key_ranges(v_quantized, splits)
+        # A BF16 operand is passed as its own (unread) descale, so it has to follow the fold.
+        if q_descale is q_quantized:
+            q_descale = q_split
+        if k_descale is k_quantized:
+            k_descale = k_split
+        if v_descale is v_quantized:
+            v_descale = v_split
+        partial_out, partial_lse = mha_v4_packed(
+            q_split,
+            k_split,
+            v_split,
+            q_descale,
+            k_descale,
+            v_descale,
+            q_format,
+            k_format,
+            v_format,
+            q_scale_mode,
+            k_scale_mode,
+            v_scale_mode,
+            softmax_scale=softmax_scale,
+            return_lse=True,
+            seqlens_k=_key_range_lengths(q.shape[0], splits, k.shape[1], q.device),
+            v_pack=recipe.v_pack,
+        )
+        lse_out = _empty_lse(q, return_lse)
+        _merge_kv_splits(partial_out, partial_lse, out, lse_out)
         if return_lse:
             return out, _restore_k_mean_in_lse(lse_out, q, k_mean_lse, softmax_scale)
         return out
