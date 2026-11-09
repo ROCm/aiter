@@ -36,10 +36,11 @@ each replaying its jobs in a pool of workers.
 For an arch in ``SCAN_ARCHS``, every size of a job's range is identified:
 replayed with its launches stopped at their cache identity
 (:func:`identified_kernels`, nothing compiled, and traced once per distinct
-launch), and one size per set of kernels not yet built is replayed for real. A runtime whose choices are not
-monotonic in the size needs that, as a gfx1250 GEMM's are: it fits cluster_m
-to the number of M tiles and specializes a ragged last tile, so M=5120 and
-M=6144 can request one kernel and M=5632 another.
+launch), and one size per set of kernels not yet built is replayed for real.
+A runtime whose choices are not monotonic in the size needs that, as a
+gfx1250 GEMM's are: it fits cluster_m to the number of M tiles and
+specializes a ragged last tile, so M=5120 and M=6144 can request one kernel
+and M=5632 another.
 
 Otherwise, where a job's two ends request different FlyDSL kernels, the sizes
 between them are bisected down to every size at which the runtime switches
