@@ -491,7 +491,16 @@ def test_pa_decode_fp16_bf16_case_policy(
 
 
 def _reference(
-    query, key, value, table, lengths, query_length, window, sinks, dtype=torch.float32
+    query,
+    key,
+    value,
+    table,
+    lengths,
+    query_length,
+    window,
+    sinks,
+    causal=True,
+    dtype=torch.float32,
 ):
     """Attention over logical KV in ``dtype``, independent of kernel Q/P rounding."""
     batch = lengths.numel()
@@ -511,10 +520,12 @@ def _reference(
         keys = key[pages, :, offsets].to(dtype)
         values = value[pages, :, offsets].to(dtype)
         scores = torch.einsum("qhgd,khd->qhgk", queries[seq], keys) * dim**-0.5
-        visible = length - query_length + 1 + positions
-        masked = tokens[None, :] >= visible[:, None]
+        # Row i sits at key position length - query_length + i.
+        distance = (length - query_length + positions)[:, None] - tokens[None, :]
+        masked = distance < 0 if causal else torch.zeros_like(distance, dtype=bool)
         if window > 0:
-            masked |= tokens[None, :] < (visible - window)[:, None]
+            # A non-causal window is two-sided: |distance| < window.
+            masked |= (distance if causal else distance.abs()) >= window
         scores.masked_fill_(masked[:, None, None, :], float("-inf"))
         denominator = torch.logsumexp(scores, dim=-1, keepdim=True)
         if sinks is not None:
@@ -523,7 +534,7 @@ def _reference(
             )
         probs = torch.exp(scores - denominator)
         # Empty query rows have no attention mass, including with -inf sinks.
-        probs.masked_fill_(visible[:, None, None, None] <= 0, 0)
+        probs.masked_fill_(masked.all(dim=-1)[:, None, None, None], 0)
         output[seq] = torch.einsum("qhgk,khd->qhgd", probs, values)
     return output.reshape_as(query).float()
 
@@ -816,6 +827,224 @@ _COMMON_CASES = [
         },
     ),
 ]
+# Non-causal blocks (e.g. DFlash draft blocks whose own keys are cached) let
+# every row see the whole context, so lengths below query_length leave no row
+# empty. FP8 P error over a handful of keys exceeds the tolerance, so random
+# FP8 cases keep lengths of 0, 1 or a few hundred; the FP8 one-hot case covers
+# short contexts exactly.
+_NONCAUSAL_CASES = [
+    (
+        "noncausal-q5-g4-d64",
+        {
+            "causal": False,
+            "query_length": 5,
+            "kv_heads": 2,
+            "group_size": 4,
+            "head_dim": 64,
+            "block_size": 16,
+            "lengths": (0, 1, 255, 256, 257, 1029),
+            "max_partitions": 3,
+        },
+    ),
+    (
+        "noncausal-q7-page128",
+        {
+            "causal": False,
+            "query_length": 7,
+            "kv_heads": 2,
+            "group_size": 4,
+            "head_dim": 64,
+            "block_size": 128,
+            "max_partitions": 5,
+            "sink_dtype": torch.float32,
+        },
+    ),
+    # Full and partial page-128 tiles at G16; this small plan splits the rows.
+    (
+        "noncausal-q4-g16-tile-edge",
+        {
+            "causal": False,
+            "query_length": 4,
+            "group_size": 16,
+            "block_size": 128,
+            "lengths": (1, 256, 257, 259, 260, 515),
+            "max_partitions": 2,
+        },
+    ),
+    (
+        "noncausal-q5-mixed-np96",
+        {
+            "causal": False,
+            "query_length": 5,
+            "kv_heads": 2,
+            "group_size": 4,
+            "head_dim": 64,
+            "block_size": 16,
+            "lengths": (97 * 256,) + (0, 1, 257, 1027) * 10,
+            "max_partitions": 96,
+            "budget": 4096,
+        },
+    ),
+    (
+        "noncausal-q5-g4-d64-page128",
+        {
+            "causal": False,
+            "query_length": 5,
+            "kv_heads": 2,
+            "group_size": 4,
+            "head_dim": 64,
+            "block_size": 128,
+            "lengths": (0, 1, 255, 256, 257, 1029, 3000),
+            "max_partitions": 8,
+        },
+    ),
+    # One query row sees the same keys either way, so both modes share a kernel.
+    (
+        "noncausal-q1",
+        {"causal": False, "group_size": 8, "block_size": 64, "max_partitions": 2},
+    ),
+    (
+        "noncausal-q1-window",
+        {
+            "causal": False,
+            "group_size": 8,
+            "block_size": 64,
+            "window": 100,
+            "lengths": (0, 1, 99, 100, 101, 1027),
+            "max_partitions": 2,
+        },
+    ),
+    # Two-sided windows keep each row's causal left edge. Lengths straddle
+    # W + query_length - 1, where the oldest row first loses keys, and tile edges.
+    (
+        "noncausal-window-q5-g4-d64",
+        {
+            "causal": False,
+            "query_length": 5,
+            "kv_heads": 2,
+            "group_size": 4,
+            "head_dim": 64,
+            "block_size": 16,
+            "window": 300,
+            "lengths": (0, 1, 255, 300, 304, 305, 557, 1029, 3000),
+            "max_partitions": 4,
+            "sink_dtype": torch.float32,
+        },
+    ),
+    # DFlash2 drafter geometry: GQA 4, head 128, window 2048, blocks of 8 and 16.
+    *[
+        (
+            f"noncausal-window2048-q{query_length}-page{page}",
+            {
+                "causal": False,
+                "query_length": query_length,
+                "kv_heads": 2,
+                "group_size": 4,
+                "block_size": page,
+                "window": 2048,
+                "lengths": tuple(
+                    length + query_length for length in (2047, 2048, 2303, 2304)
+                )
+                + (1, 9000),
+                "max_partitions": 8,
+            },
+        )
+        for query_length, page in ((8, 128), (16, 16))
+    ],
+]
+_FP8_NONCAUSAL_CASES = _NONCAUSAL_CASES + [
+    # One-hot tokens cover contexts shorter than the block exactly.
+    (
+        "noncausal-q5-short-one-hot",
+        {
+            "causal": False,
+            "query_length": 5,
+            "kv_heads": 2,
+            "group_size": 4,
+            "head_dim": 64,
+            "block_size": 16,
+            "lengths": (0, 1, 2, 3, 4, 5, 6, 17),
+            "max_partitions": 2,
+            "pattern": "one_hot_token",
+        },
+    ),
+    # Full tiles of the fused gfx950 per-token MTP4 schedule skip the mask. A
+    # 66-tile row keeps the plan wide enough that the query rows stay fused.
+    (
+        "noncausal-q4-g16-mtp4-fused",
+        {
+            "causal": False,
+            "query_length": 4,
+            "group_size": 16,
+            "block_size": 128,
+            "lengths": (65 * 256 + 3, 1, 256, 257, 259, 515),
+            "max_partitions": 64,
+            "budget": 4096,
+            "mtp4_fused": True,
+        },
+    ),
+    # Two KV heads keep a windowed MTP4 plan's query rows fused.
+    (
+        "noncausal-window-q4-g16-mtp4-fused",
+        {
+            "causal": False,
+            "query_length": 4,
+            "kv_heads": 2,
+            "group_size": 16,
+            "block_size": 128,
+            "window": 300,
+            "lengths": (65 * 256 + 3, 1, 256, 257, 259, 515),
+            "max_partitions": 64,
+            "budget": 4096,
+            "mtp4_fused": True,
+        },
+    ),
+    # One-hot tokens mark the keys each row sees, so a window edge one token off,
+    # or one shared by the block, fails. Window 3 ends before the newest row.
+    *[
+        (
+            f"noncausal-window{window}-q5-one-hot",
+            {
+                "causal": False,
+                "query_length": 5,
+                "kv_heads": 2,
+                "group_size": 4,
+                "head_dim": 64,
+                "block_size": 16,
+                "window": window,
+                "lengths": lengths,
+                "max_partitions": 3,
+                "pattern": "one_hot_token",
+            },
+        )
+        for window, lengths in (
+            (3, (1, 2, 3, 5, 7, 17, 260)),
+            (300, (4, 5, 6, 298, 299, 303, 304, 305, 600, 1029)),
+        )
+    ],
+    # Random keys hide a few edge keys of a 2048-key window; one-hot ones do not.
+    (
+        "noncausal-window2048-q16-one-hot",
+        {
+            "causal": False,
+            "query_length": 16,
+            "kv_heads": 2,
+            "group_size": 4,
+            "block_size": 16,
+            "window": 2048,
+            "lengths": (2062, 2063, 2064, 2318, 2319, 2320, 4111),
+            "max_partitions": 8,
+            "pattern": "one_hot_token",
+        },
+    ),
+]
+# The mask does not depend on the query dtype or V layout: the per-tensor and
+# per-token (tuned gfx950) schedules in BF16, and the FP16 / plain-V path.
+_FP8_NONCAUSAL_VARIANTS = (
+    (torch.bfloat16, "per-tensor", True),
+    (torch.bfloat16, "per-token", True),
+    (torch.float16, "per-tensor", False),
+)
 _FP8_CASES = _COMMON_CASES + [
     (
         "packed-mtp4",
@@ -903,6 +1132,7 @@ _FP8_CASES = _COMMON_CASES + [
     ("mtp8-g8-page128", {"query_length": 8, "block_size": 128, "max_partitions": 7}),
 ]
 _BF16_CASES = _COMMON_CASES + [
+    *_NONCAUSAL_CASES,
     (
         "mtp",
         {
@@ -946,6 +1176,16 @@ _BF16_CASES = _COMMON_CASES + [
         )
         for length, dim, splits in ((4, 512, 2), (4, 1024, 4), (3, 1024, 3))
     ],
+    (
+        "noncausal-head512-mtp-split2",
+        {
+            "causal": False,
+            "query_length": 4,
+            "group_size": 16,
+            "head_dim": 512,
+            "max_partitions": 4,
+        },
+    ),
     # Four 16-row query tiles at D64/D128 over page128 caches: on gfx1250, wave
     # pairs share two tiles and split every page, in each output mode. One
     # task per sequence runs window-masked, unmasked and causal pages in turn;
@@ -1059,6 +1299,33 @@ _BF16_CASES = _COMMON_CASES + [
     ],
     ("graph-workspace", {"query_length": 4, "max_partitions": 7, "capture": True}),
     (
+        "noncausal-graph-workspace",
+        {
+            "causal": False,
+            "query_length": 5,
+            "kv_heads": 2,
+            "group_size": 4,
+            "head_dim": 64,
+            "max_partitions": 7,
+            "capture": True,
+        },
+    ),
+    # A window narrower than the block ends W - 1 keys after each row.
+    (
+        "noncausal-window3-q5",
+        {
+            "causal": False,
+            "query_length": 5,
+            "kv_heads": 2,
+            "group_size": 4,
+            "head_dim": 64,
+            "block_size": 16,
+            "window": 3,
+            "lengths": (1, 2, 5, 7, 260, 1029),
+            "max_partitions": 3,
+        },
+    ),
+    (
         "loose-bound",
         {
             "block_size": 16,
@@ -1155,6 +1422,30 @@ _PIPE_CASES = [
         )
         for partitions in (81, 130)
     ),
+    # Without the causal mask each row of the one-hot pattern sees every token.
+    (
+        "d256-page64-q4-noncausal",
+        {
+            **_PIPE_BASE,
+            "causal": False,
+            "query_length": 4,
+            "lengths": (0, 1, 3, 65, 257, 2049),
+            "max_partitions": 4,
+            "pattern": "one_hot_token",
+        },
+    ),
+    (
+        "d256-page64-q4-noncausal-window",
+        {
+            **_PIPE_BASE,
+            "causal": False,
+            "query_length": 4,
+            "window": 70,
+            "lengths": (0, 1, 3, 65, 72, 73, 257, 2049),
+            "max_partitions": 4,
+            "pattern": "one_hot_token",
+        },
+    ),
     (
         "d256-page64-per-token",
         {
@@ -1170,6 +1461,18 @@ _PIPE_CASES = [
         {
             **_PIPE_BASE,
             "scale_mode": "per-token",
+            "query_length": 4,
+            "lengths": (0, 1, 65, 257, 2049),
+            "max_partitions": 4,
+            "pattern": "varied",
+        },
+    ),
+    (
+        "d256-page64-q4-per-token-noncausal",
+        {
+            **_PIPE_BASE,
+            "scale_mode": "per-token",
+            "causal": False,
             "query_length": 4,
             "lengths": (0, 1, 65, 257, 2049),
             "max_partitions": 4,
@@ -1574,18 +1877,30 @@ def _one_hot_kv(key, value, table, context, compute_type, tokens_per_channel=256
 
 def _check_pipe_policy(pa, case, arch, compile_kwargs):
     """Pin the selected specialization so a case cannot drift off its path."""
-    from aiter.ops.flydsl.kernels.pa_decode.traits import PaDecodeSchedule
+    from aiter.ops.flydsl.kernels.pa_decode.traits import (
+        PaDecodeSchedule,
+        PaDecodeTraits,
+    )
 
     assert compile_kwargs[-1]["wide_kv_addressing"] == case["wide"]
     if case["cluster"] is not None:
         expected = case["cluster"] if arch == "gfx1250" else 0
         assert compile_kwargs[-1]["cluster_merge"] == expected
+    schedule_kwargs = dict(compile_kwargs[-1])
+    schedule_kwargs.pop("architecture", None)
+    schedule_kwargs.pop("direct_output", None)
+    schedule_kwargs.pop("cluster_merge", None)
+    if case["mtp4_fused"] is not None:
+        tuned = (
+            arch == "gfx950"
+            and case["scale_mode"] == "per-token"
+            and case["query_dtype"] == torch.bfloat16
+        )
+        schedule = PaDecodeSchedule.select(**schedule_kwargs)
+        fused = PaDecodeTraits.create(schedule).MTP4_FUSED
+        assert fused == (tuned and case["mtp4_fused"])
     if case["pipe"]:
         # The cache key ends with (D256_PIPE, staged page ids).
-        schedule_kwargs = dict(compile_kwargs[-1])
-        schedule_kwargs.pop("architecture", None)
-        schedule_kwargs.pop("direct_output", None)
-        schedule_kwargs.pop("cluster_merge", None)
         pipe, staged = PaDecodeSchedule.select(**schedule_kwargs).cache_key[-2:]
         assert pipe == (arch == "gfx950")
         if pipe:
@@ -1612,6 +1927,20 @@ def _check_pipe_policy(pa, case, arch, compile_kwargs):
                 ("per-tensor", "per-token"),
                 (False, True),
             )
+        ],
+        *[
+            pytest.param(
+                dict(
+                    geometry,
+                    kv_dtype="fp8",
+                    query_dtype=dtype,
+                    scale_mode=scale_mode,
+                    trans_v=trans_v,
+                ),
+                id=f"fp8-{dtype}-{scale_mode}-{'transposed' if trans_v else 'plain'}-v-{name}",
+            )
+            for name, geometry in _FP8_NONCAUSAL_CASES
+            for dtype, scale_mode, trans_v in _FP8_NONCAUSAL_VARIANTS
         ],
         *[pytest.param(geometry, id=f"bf16-{name}") for name, geometry in _BF16_CASES],
         *[pytest.param(geometry, id=name) for name, geometry in _PIPE_CASES],
@@ -1692,6 +2021,8 @@ def test_pa_decode(case, device, monkeypatch):
             "ref_mean_min": None,
             "variants": False,
             "cluster": None,
+            "causal": True,
+            "mtp4_fused": None,
         },
         **case,
     )
@@ -1830,6 +2161,7 @@ def test_pa_decode(case, device, monkeypatch):
         "value_scale": value_scale,
         "sinks": sinks,
         "sliding_window": window,
+        "causal": case["causal"],
         "max_context_length": (
             None
             if case["max_context"] is None
@@ -1922,6 +2254,7 @@ def test_pa_decode(case, device, monkeypatch):
             query_length,
             window,
             sinks,
+            case["causal"],
             # The long peaked cases are the accuracy check of the P shift: fp64.
             torch.float64 if case["pattern"].startswith("peaked") else torch.float32,
         )

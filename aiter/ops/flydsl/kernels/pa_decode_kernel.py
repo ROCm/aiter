@@ -17,8 +17,9 @@ gfx1250 uses wave32 WMMA with native FP8 Q/P conversion or BF16 operands.
 Its four waves process 64- or 128-token compute tiles within each 256-token
 plan tile. Packed FP8 D128/D256 full-attention paths use K128 WMMA; other
 FP8 paths use K64 and BF16 uses K32. Four FP8 D128 query tiles over page128
-caches give each wave its own tile and keep P in registers. Supported layouts
-use TDM K/V transfers, with two LDS buffers where capacity permits.
+caches give each wave its own tile and keep P in registers, except in
+non-causal blocks of more than one token. Supported layouts use TDM K/V
+transfers, with two LDS buffers where capacity permits.
 One-partition plans can write final output directly. Plans with one task slot
 per sequence merge a sequence's few partitions in its last-arriving CTA, and
 plans whose sequences each fit one workgroup cluster merge within that
@@ -88,6 +89,7 @@ from .pa_decode.traits import (
     Gfx1250Traits,
     PaDecodeSchedule,
     PaDecodeTraits,
+    resolve_causal,
 )
 from .tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
@@ -179,6 +181,7 @@ def compile_pa_decode_tile(
     trans_k: bool = True,
     mask_unowned_kv: bool = True,
     cluster_merge: int = 0,
+    causal: bool = True,
 ):
     """Select and cache a PA-decode kernel and launch wrapper.
 
@@ -209,6 +212,8 @@ def compile_pa_decode_tile(
     ``work_capacity`` is a positive host integer matching the work plan.
     Positive ``sliding_window`` includes the query token.
     Plans cover the MTP window union; scores are masked per query row.
+    ``causal=False`` lets every query row see the whole context; its window is
+    two-sided, with the causal left edge, and so covers the same union.
     ``trans_k=False`` is not implemented.
     gfx1250 uses wave32 WMMA, native BF16 or OCP FP8, and its larger LDS budget.
     With ``direct_output`` a gfx1250 plan writes final output when sinks are
@@ -264,6 +269,7 @@ def compile_pa_decode_tile(
             query_splits=query_splits,
             merge_partitions=direct_output and num_partitions > 1,
             cluster_merge=cluster_merge,
+            causal=resolve_causal(causal, query_length),
         )
     if architecture not in ("gfx942", "gfx950"):
         raise NotImplementedError(f"PA decode does not support {architecture}")
@@ -293,6 +299,7 @@ def compile_pa_decode_tile(
         sliding_window=sliding_window,
         trans_k=trans_k,
         mask_unowned_kv=mask_unowned_kv,
+        causal=causal,
         direct_output=direct_output,
     )
     cached = _PA_DECODE_TILE_CACHE.get(schedule.cache_key)
@@ -539,6 +546,7 @@ def compile_gfx1250_pa_decode(
     query_splits=1,
     merge_partitions=False,
     cluster_merge=0,
+    causal=True,
 ):
     """Compile a gfx1250 tile kernel; merging partitions writes final output.
 
@@ -569,6 +577,7 @@ def compile_gfx1250_pa_decode(
         query_splits,
         merge_partitions,
         cluster_merge,
+        causal,
     )
     if compute_dtype not in ("fp8", "bf16"):
         raise ValueError(f"Unsupported gfx1250 PA compute dtype: {compute_dtype}")
