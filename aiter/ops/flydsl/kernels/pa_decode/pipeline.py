@@ -1987,7 +1987,6 @@ class Gfx1250Pipeline:
         q_operands,
         q_scales,
         packed_k_operands,
-        page_v_operands,
         vnorm,
     ):
         """Batch the two query tiles' shared-memory softmax exchanges."""
@@ -2091,6 +2090,9 @@ class Gfx1250Pipeline:
                 )
             maxima.append(new_max)
             corrections.append(corr)
+        # Keep V operands out of the two QK/max phases; prefetch them
+        # before the probability publication barrier for both PV updates.
+        page_v_operands = self.mem.page_v_operands(kv_off)
         gpu.barrier()
 
         next_state = []
@@ -2263,7 +2265,8 @@ class Gfx1250Pipeline:
                     ]
                     for n in range_constexpr(t.TOKENS // 64)
                 ]
-                page_v_operands = self.mem.page_v_operands(kv_off)
+                if const_expr(not t.paired_softmax):
+                    page_v_operands = self.mem.page_v_operands(kv_off)
             if const_expr(t.paired_softmax):
                 next_state = self.pair_tile(
                     token_base,
@@ -2272,7 +2275,6 @@ class Gfx1250Pipeline:
                     q_operands,
                     q_scales,
                     packed_k_operands,
-                    page_v_operands,
                     vnorm,
                 )
             else:
