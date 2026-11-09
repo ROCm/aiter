@@ -155,7 +155,3 @@ batch_size,next_n,heads,head_dim,kv_block_size,preshuffle,context_len
 48,1,32,128,32,True,15000
 64,1,32,128,32,True,2048
 64,1,32,128,32,True,15000
-128,1,32,128,32,True,2048
-128,1,32,128,32,True,15000
-256,1,32,128,32,True,2048
-256,1,32,128,32,True,15000
