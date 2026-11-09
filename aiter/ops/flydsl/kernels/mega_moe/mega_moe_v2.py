@@ -27,6 +27,7 @@ from .mega_moe_config import (
     LARGE_M_MTPRS,
     ROUTE_LARGE_M,
     ROUTE_SMALL_M,
+    ROUTE_STAGED,
     MegaMoEConfig,
     Stage1Config,
     build_mega_moe_bundle_plan,
@@ -278,10 +279,9 @@ class MegaMoEV2:
         the instance capacity alone, never on this rank's own row count.
         """
         if max_tokens is None:
-            # Without the row bound the plan keeps the staged route (or the small-input
-            # route when the whole capacity fits it): the large-input kernel is slower
-            # than staged below ~512 rows per rank, so it needs the caller's bound.
-            return self._bundle_plan.route_for(self.mtpr, small_m=small_m, large_m=False)
+            # Without the row bound a call keeps main's staged route (fixed-slot or
+            # compact); the fused routes need the caller's EP-wide bound.
+            return ROUTE_STAGED, self.mtpr
         max_tokens = int(max_tokens)
         if not run_tokens <= max_tokens <= self.mtpr:
             raise ValueError(
@@ -1102,8 +1102,7 @@ class MegaMoEV2:
 
         ``max_tokens``: rows of this call on its largest EP rank, counting graph
         padding, passed identically on every rank; it selects the route. None
-        plans for the instance capacity without the large-input route (staged, or
-        small-input when the capacity fits it).
+        takes the staged route (fixed-slot or compact), as before the fused routes.
 
         The output is a view of the route's combine buffer, valid until the next
         call. ``slice_output=False`` returns the whole buffer: as many rows as
