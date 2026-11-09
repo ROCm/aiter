@@ -3103,7 +3103,11 @@ void fused_dynamic_mx_quant_moe_sort_hip_bounded(aiter_tensor_t& output,
 // correctness.
 constexpr long MXFP4_MOE_SORT_COALESCED_LDS_WORK_MAX = 700000;
 
-template <int block_size, int num_rows, int thread_data_size = 16, int group_size = 32>
+template <int block_size,
+          int num_rows,
+          int thread_data_size = 16,
+          int group_size       = 32,
+          bool byte_tail       = false>
 __global__ void mxfp4_moe_sort_kernel(
     uint8_t* __restrict__ out_scale,
     uint8_t* __restrict__ scale,
@@ -3129,8 +3133,20 @@ __global__ void mxfp4_moe_sort_kernel(
     using vec_i = opus::vector_t<uint8_t, vec_size_i>;
     const int32_t scaleN_valid = (cols + group_size - 1) / group_size;
     const int32_t scaleN_pad   = ((scaleN_valid + 7) / 8) * 8;
-    auto buffer_scale =
-                opus::make_gmem<uint8_t>(scale, scale_per_row * num_tokens * topk * sizeof(uint8_t));
+    const int32_t scale_bytes = scale_per_row * num_tokens * topk * sizeof(uint8_t);
+    auto buffer_scale = opus::make_gmem<uint8_t>(scale, scale_bytes);
+    // The buffer range check is per dword. When a row is not a whole number of
+    // dwords (byte_tail), the last row's final load would read the dword holding
+    // its last in-range bytes as 0 (#7646), so that one load goes byte by byte.
+    auto load_scales = [&](int32_t offset) {
+        if constexpr(byte_tail)
+        {
+            if(offset + vec_size_i > scale_bytes)
+                return load_vector_nbytes<uint8_t, vec_size_i, 1, RT>(buffer_scale, offset);
+        }
+        return load_vector_nbytes<uint8_t, vec_size_i, load_chunk_bytes, RT>(buffer_scale,
+                                                                             offset);
+    };
 
     // Optimized store path: when one threadblock maps to exactly one 32-row
     // swizzle tile (num_rows == 32), we stage this block's scale bytes into
@@ -3207,8 +3223,7 @@ __global__ void mxfp4_moe_sort_kernel(
                 {
                     scale_offset = (int64_t)(token_idx * topk + topk_id) * scale_per_row;
                 }
-                vec_scale = load_vector_nbytes<uint8_t, vec_size_i, load_chunk_bytes, RT>(
-                    buffer_scale, scale_offset + scale_k);
+                vec_scale = load_scales(scale_offset + scale_k);
             }
 
             __syncthreads();
@@ -3268,8 +3283,7 @@ __global__ void mxfp4_moe_sort_kernel(
             {
                 scale_offset = (int64_t)(token_idx * topk + topk_id) * scale_per_row;
             }
-            vec_i vec_scale = load_vector_nbytes<uint8_t, vec_size_i, load_chunk_bytes, RT>(
-                buffer_scale, scale_offset + scale_k);
+            vec_i vec_scale = load_scales(scale_offset + scale_k);
 
             for(int j = 0; j < vec_size_i; j++)
             {
@@ -3294,13 +3308,21 @@ __global__ void mxfp4_moe_sort_kernel(
     dim3 const grid(num_tg);                                                            \
     /* The coalesced-store perf gate is computed inside the kernel from        */       \
     /* num_blocks + scaleN_pad (no extra launch arg / signature change).       */       \
-    mxfp4_moe_sort_kernel<BLOCK_SIZE, NUM_ROWS, THREAD_DATA, GROUP_SIZE>                \
-        <<<grid, dim3(BLOCK_SIZE), 0, stream>>>(                                        \
-            reinterpret_cast<uint8_t*>(out_scale.data_ptr()),                           \
-            reinterpret_cast<uint8_t*>(scale.data_ptr()),                               \
-            reinterpret_cast<int32_t*>(sorted_ids.data_ptr()),                          \
-            reinterpret_cast<int32_t*>(num_valid_ids.data_ptr()),                       \
-            token_num, cols, num_blocks, num_tg, topk);
+    auto launch_sort = [&](auto byte_tail) {                                            \
+        mxfp4_moe_sort_kernel<BLOCK_SIZE, NUM_ROWS, THREAD_DATA, GROUP_SIZE,            \
+                              decltype(byte_tail)::value>                               \
+            <<<grid, dim3(BLOCK_SIZE), 0, stream>>>(                                    \
+                reinterpret_cast<uint8_t*>(out_scale.data_ptr()),                       \
+                reinterpret_cast<uint8_t*>(scale.data_ptr()),                           \
+                reinterpret_cast<int32_t*>(sorted_ids.data_ptr()),                      \
+                reinterpret_cast<int32_t*>(num_valid_ids.data_ptr()),                   \
+                token_num, cols, num_blocks, num_tg, topk);                             \
+    };                                                                                  \
+    /* Only rows that are not a whole number of dwords need the byte tail.     */       \
+    if(((cols + GROUP_SIZE - 1) / GROUP_SIZE) % 4)                                      \
+        launch_sort(std::true_type{});                                                  \
+    else                                                                                \
+        launch_sort(std::false_type{});
 
 
 #define MXFP4_MOE_SORT_KERNEL_DISPATCH(cols_)                                                  \
