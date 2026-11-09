@@ -437,8 +437,8 @@ _INSTANCE_IMPL_HOST_TU_SPLIT_TEMPLATE = """#ifdef OPUS_FUSED_HOST_TU
 #include "{traits_header}"
 template<typename Traits{fwd_decl_kargs_tpl}>
 __global__ void {kernel_func}({fwd_decl_kargs_fnarg} kargs);
-#else
-#include "{pipeline_header}"
+{extra_forward_decls}#else
+{pipeline_includes}
 #endif"""
 
 
@@ -448,13 +448,18 @@ def instance_impl_host_tu_split(
     fwd_decl_kargs_tpl,
     kernel_func,
     fwd_decl_kargs_fnarg,
+    extra_forward_decls="",
 ):
+    headers = (
+        (pipeline_header,) if isinstance(pipeline_header, str) else pipeline_header
+    )
     return _INSTANCE_IMPL_HOST_TU_SPLIT_TEMPLATE.format(
         traits_header=traits_header,
-        pipeline_header=pipeline_header,
+        pipeline_includes="\n".join(f'#include "{header}"' for header in headers),
         fwd_decl_kargs_tpl=fwd_decl_kargs_tpl,
         kernel_func=kernel_func,
         fwd_decl_kargs_fnarg=fwd_decl_kargs_fnarg,
+        extra_forward_decls=extra_forward_decls + "\n" if extra_forward_decls else "",
     )
 
 

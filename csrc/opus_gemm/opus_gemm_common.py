@@ -7,7 +7,7 @@ import os
 import sys
 from dataclasses import asdict, dataclass, field
 from decimal import Decimal, InvalidOperation
-from itertools import product
+from itertools import chain, product
 
 
 def base_gfx_arch(gfx: str) -> str:
@@ -2881,15 +2881,104 @@ a8w8_mxscale_bmm_kernels_list = {
 }
 
 
-def _gfx950_co_image_path(path, entry):
-    root = os.environ.get("OPUS_GEN_CO_DIR") or os.path.dirname(path)
-    return os.path.join(root, "gfx950", entry["image"])
+# fmt: on
+
+
+_TAG = "a8w8_blockscale_mxscale_gemm_bpreshuffle"
+_INT32_MAX = 2**31 - 1
+_BP_ROOT = "opus_gemm_blockscale_mxscale_bpreshuffle_"
+_B_PREFIX = "opus_gemm_bpreshuffle_"
+_B_LDS_LIMIT = 160 * 1024
+_BPRESHUFFLE_CACHES = ((0, 0), (1, 17), (17, 1))
+_M_SMALL_STORE_CACHE_PAIRS = ((0, 2), (1, 2), (17, 2))
+GFX950_CO_KERNELS_JSON = os.path.join(
+    os.path.dirname(__file__), "gen_co", "co_kernels_gfx950.json"
+)
+a8w8_blockscale_mxscale_gemm_bpreshuffle_kernels_list = {}
+
+
+# Shared metadata and names
 
 
 def _bpreshuffle_name(config_name):
     # Omit only these default tail fields; keep geometry and nondefault policies.
     defaults = {"sn0", "sl0", "sched0", "compact0", "aheadauto", "out0"}
     return "_".join(part for part in config_name.split("_") if part not in defaults)
+
+
+def _bpreshuffle_cpp_traits(name, args):
+    return (
+        name
+        + "<"
+        + ", ".join(
+            str(value).lower() if isinstance(value, bool) else str(value)
+            for value in args
+        )
+        + ">"
+    )
+
+
+def _bpreshuffle_jit_name(family, bm, bn, bk, wm, wn, suffix):
+    # Same geometry fields and parameter ordering as the CO family names.
+    return (
+        f"{family}_jit_{64 * wm * wn}x{bm}x{bn}x{bk}_{wm}x{wn}"
+        f"_16x16x128_1x128x128_{suffix}"
+    )
+
+
+def _small_bpreshuffle_config_name(parameters, suffix, split):
+    parts = [
+        f"m{parameters['B_M']}n{parameters['B_N']}k{parameters['B_K']}",
+        f"w{parameters['T_M']}x{parameters['T_N']}",
+        suffix,
+    ]
+    wg, ca, cb = (parameters[key] for key in ("WG_PER_CU", "cachectl_a", "cachectl_b"))
+    if wg != 1:
+        parts.append(f"wg{wg}")
+    if ca or cb:
+        parts.append(f"ca{ca}cb{cb}")
+    if split != 1:
+        parts.append(f"sk{split}")
+    return "_".join(parts)
+
+
+def _bpreshuffle_instance(bm, bn, bk, wm, wn, wg=1, ca=0, cb=0, split=1):
+    return {
+        "BLOCK_SIZE": 64 * wm * wn,
+        "B_M": bm,
+        "B_N": bn,
+        "B_K": bk,
+        "T_M": wm,
+        "T_N": wn,
+        "W_M": 16,
+        "W_N": 16,
+        "W_K": 128,
+        "VEC_A": 16,
+        "VEC_B": 16,
+        "VEC_C": 4,
+        "GROUP_M": 1,
+        "GROUP_N": 128,
+        "GROUP_K": 128,
+        "WG_PER_CU": wg,
+        "cachectl_a": ca,
+        "cachectl_b": cb,
+        "kernel_tag": _TAG,
+        "output_dtypes": ["bf16_t"],
+        "arch_prefix": "gfx950",
+        "direct_only": split == 1,
+        "pad_m": True,
+        "has_oob": True,
+        "max_tensor_bytes": 2**63 - 1,
+        "splitk_workspace_dtype": "fp32_t" if split > 1 else None,
+    }
+
+
+# CO metadata
+
+
+def _gfx950_co_image_path(path, entry):
+    root = os.environ.get("OPUS_GEN_CO_DIR") or os.path.dirname(path)
+    return os.path.join(root, "gfx950", entry["image"])
 
 
 def _load_gfx950_co_kernels(path, require_image=True):
@@ -2902,7 +2991,9 @@ def _load_gfx950_co_kernels(path, require_image=True):
         kid = entry["kid"]
         if kid in entries:
             raise ValueError(f"Duplicate gfx950 CO kid {kid} in {path}")
-        entry.setdefault("block_size", 64 * entry["wave_layout"][0] * entry["wave_layout"][1])
+        entry.setdefault(
+            "block_size", 64 * entry["wave_layout"][0] * entry["wave_layout"][1]
+        )
         entry.setdefault("launch_bounds", [entry["block_size"], 1])
         entry["device_flags"] = list(entry["device_flags"])
         if "launches" in entry:
@@ -2937,10 +3028,15 @@ def _load_gfx950_co_kernels(path, require_image=True):
         if entry["pipeline"] in ("prefetch_b_vgpr", "prefetch_b_vgpr_overlap"):
             entry["short_symbol"] = symbol + "__short"
             entry["short_max_k"] = min(int(entry["traits"]["args"][6]), 16) * 128
-        config = {key: value for key, value in entry.items()
-                  if key not in ("kid", "configKey", "pin_variant", "pin_group", "pin_mask")}
+        config = {
+            key: value
+            for key, value in entry.items()
+            if key not in ("kid", "configKey", "pin_variant", "pin_group", "pin_mask")
+        }
         if image_configs.setdefault(entry["image"], config) != config:
-            raise ValueError(f"Different CO configurations share image name {entry['image']}")
+            raise ValueError(
+                f"Different CO configurations share image name {entry['image']}"
+            )
     return {
         kid: entry
         for kid, entry in entries.items()
@@ -2948,41 +3044,60 @@ def _load_gfx950_co_kernels(path, require_image=True):
     }
 
 
-GFX950_CO_KERNELS_JSON = os.path.join(
-    os.path.dirname(__file__), "gen_co", "co_kernels_gfx950.json"
-)
-gfx950_co_kernels_declared = _load_gfx950_co_kernels(
-    GFX950_CO_KERNELS_JSON, require_image=False
-)
-
-_TAG = "a8w8_blockscale_mxscale_gemm_bpreshuffle"
-_INT32_MAX = 2**31 - 1
-_BP_ROOT = "opus_gemm_blockscale_mxscale_bpreshuffle_"
-a8w8_blockscale_mxscale_gemm_bpreshuffle_kernels_list = {}
+# Prefetch B pipelines
 
 
-# JIT IDs are independent of CO availability and start at 100.
-_bpreshuffle_jit_kid_base = 100
-_BPRESHUFFLE_JIT_CACHES = ((0, 0), (1, 17), (17, 1))
+def _bpreshuffle_b_scale_columns(bm, bn, bk, wn, stages, wg):
+    """Choose one bounded scale capacity from the tile's per-CU LDS budget."""
+    threads = wn * 64
+    alignment = threads * 16
+    pitch = ((bm // 16 + 3) // 4) * 64
+    for columns in (64, 32, 16, 8, 4):
+        scale_bytes = ((bm * columns + alignment - 1) // alignment) * alignment
+        lds = stages * bm * bk + scale_bytes + threads * 4
+        if (
+            pitch * columns <= scale_bytes
+            and ((bn + 127) // 128) * (columns // 4) <= threads
+            and ((lds + 1279) // 1280 * 1280) * wg <= 160 * 1024
+        ):
+            return columns
+    raise ValueError(f"No runtime scale panel fits {(bm, bn, bk, wn, stages, wg)}")
 
 
-def _bpreshuffle_jit_configs(*, bms=(32, 48, 64, 96, 128), bns=(64, 128),
-                            wave_ns=(2, 4, 8), block_k=256, wgs=(1, 2)):
+def _bpreshuffle_jit_configs(
+    *,
+    bms=(32, 48, 64, 96, 128),
+    bns=(64, 128),
+    wave_ns=(2, 4, 8),
+    block_k=256,
+    wgs=(1, 2),
+):
     configs = product(
-        bms, bns, wave_ns,
-        ((2, 1), (3, 1), (3, 2), (4, 2)), wgs,
-        _BPRESHUFFLE_JIT_CACHES, (0, 2),
+        bms,
+        bns,
+        wave_ns,
+        ((2, 1), (3, 1), (3, 2), (4, 2)),
+        wgs,
+        _BPRESHUFFLE_CACHES,
+        (0, 2),
     )
     for bm, bn, wn, schedule, wg, caches, output in configs:
         stages, ahead = schedule
         ca, cb = caches
         threads = wn * 64
         mr, nr = bm // 16, bn // (wn * 16)
-        if (block_k not in (128, 256)
-                or bm <= 0 or bm % 16 or bn <= 0 or bn > 256
-                or wn not in (1, 2, 4, 8) or wg not in (1, 2)
-                or bn % (wn * 16) or (bm * block_k) % (threads * 16)
-                or mr * nr * 4 > 256):
+        if (
+            block_k not in (128, 256)
+            or bm <= 0
+            or bm % 16
+            or bn <= 0
+            or bn > 256
+            or wn not in (1, 2, 4, 8)
+            or wg not in (1, 2)
+            or bn % (wn * 16)
+            or (bm * block_k) % (threads * 16)
+            or mr * nr * 4 > 256
+        ):
             continue
         # Match the traits' packed-scale and per-CU LDS limits using the
         # runtime panel selected for this geometry, independently of K.
@@ -2991,88 +3106,6 @@ def _bpreshuffle_jit_configs(*, bms=(32, 48, 64, 96, 128), bns=(64, 128),
         except ValueError:
             continue
         yield bm, bn, wn, stages, ahead, wg, ca, cb, output, scale_cols
-
-
-def _bpreshuffle_cpp_traits(name, args):
-    return name + "<" + ", ".join(
-        str(value).lower() if isinstance(value, bool) else str(value) for value in args
-    ) + ">"
-
-
-def _bpreshuffle_jit_name(family, bm, bn, bk, wm, wn, suffix):
-    # Same geometry fields and parameter ordering as the CO family names.
-    return (f"{family}_jit_{64 * wm * wn}x{bm}x{bn}x{bk}_{wm}x{wn}"
-            f"_16x16x128_1x128x128_{suffix}")
-
-
-def _bpreshuffle_b_jit_suffix(stages, bd, wg, ca, cb, output, pub=0):
-    # Match CO labels: stages, prefetch distance, pin/address/cache,
-    # residency, publication, stream/static/compact flags, queue override, output.
-    return (f"p{stages}_bd{bd}_pinA0C0_xcd1_contig0"
-            f"_ca{ca}cb{cb}_wg{wg}_pub{pub}_sa0_sb0_compact0_aheadauto_out{output}")
-
-
-def _register_bpreshuffle_jit(entry, bm, bn, bk, wm, wn, max_k, *,
-                             wg=1, ca=0, cb=0):
-    global _next_bpreshuffle_jit_kid
-    kid = _next_bpreshuffle_jit_kid
-    _next_bpreshuffle_jit_kid += 1
-    if kid in gfx950_co_kernels_declared or kid in a8w8_blockscale_mxscale_gemm_bpreshuffle_kernels_list:
-        raise ValueError(f"duplicate gfx950 bpreshuffle kernel ID {kid}")
-    entry["kid"] = kid
-    a8w8_blockscale_mxscale_gemm_bpreshuffle_kernels_list[kid] = OpusGemmInstance(
-        BLOCK_SIZE=64 * wm * wn, B_M=bm, B_N=bn, B_K=bk,
-        T_M=wm, T_N=wn, W_M=16, W_N=16, W_K=128,
-        VEC_A=16, VEC_B=16, VEC_C=4, GROUP_M=1, GROUP_N=128, GROUP_K=128,
-        WG_PER_CU=wg, cachectl_a=ca, cachectl_b=cb,
-        kernel_tag=_TAG, output_dtypes=["bf16_t"], arch_prefix="gfx950",
-        direct_only=True, pad_m=True, has_oob=True, max_k=max_k,
-        max_tensor_bytes=2**63 - 1,
-        bpreshuffle_entry=entry,
-    )
-
-
-def _register_bpreshuffle_b_jit(bk, config, publish=None):
-    bm, bn, wn, stages, ahead, wg, ca, cb, output, scale_cols = config
-    family = "b_vgpr" if publish is None else "b_vgpr_overlap"
-    pipeline = "prefetch_" + family
-    args = (bm, bn, stages, ahead, cb, True, scale_cols, wn, wg, ca)
-    if publish is not None:
-        args += (output, bk, False, False, False, publish)
-    elif bk == 128:
-        args += (output, bk, False, False, False)
-    elif output:
-        args += (output,)
-    entry = {
-        "pipeline": pipeline,
-        "kernel": _BP_ROOT + pipeline + "_bulk_panel_kernel",
-        "traits": _bpreshuffle_cpp_traits(_BP_ROOT + pipeline + "_traits", args),
-        "config_name": _bpreshuffle_jit_name(
-            family, bm, bn, bk, 1, wn,
-            _bpreshuffle_b_jit_suffix(stages, ahead, wg, ca, cb, output,
-                                     0 if publish is None else publish)),
-        "headers": ("gfx950/opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",),
-    }
-    if publish is not None:
-        entry["traits_header"] = "gfx950/opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh"
-    entry["m_align"] = 16
-    _register_bpreshuffle_jit(
-        entry, bm, bn, bk, 1, wn, None, wg=wg, ca=ca, cb=cb,
-    )
-
-
-def _bpreshuffle_m_repeat_legal(bm, bn, wm, panel):
-    threads = wm * 2 * 64
-    if bm % (wm * 16) or bn % 32:
-        return False
-    em = bm // (wm * 16)
-    packs = (em + 3) // 4
-    lds = 264 * (bm + bn) + panel * (packs * wm * 64 + 4)
-    return not (
-        em < 2 or bn < wm * 2 * 16 or 64 % (packs * wm * 4)
-        or threads % panel or lds > 160 * 1024
-        or 2 * bm * (bn + 8) > lds or bm * bn % (threads * 8)
-    )
 
 
 def _bpreshuffle_b_vgpr_jit_configs():
@@ -3085,19 +3118,68 @@ def _bpreshuffle_b_vgpr_jit_configs():
         yield 128, config
 
 
-def _bpreshuffle_b_scale_columns(bm, bn, bk, wn, stages, wg):
-    """Choose one bounded scale capacity from the tile's per-CU LDS budget."""
-    threads = wn * 64
-    alignment = threads * 16
-    pitch = ((bm // 16 + 3) // 4) * 64
-    for columns in (64, 32, 16, 8, 4):
-        scale_bytes = ((bm * columns + alignment - 1) // alignment) * alignment
-        lds = stages * bm * bk + scale_bytes + threads * 4
-        if (pitch * columns <= scale_bytes
-                and ((bn + 127) // 128) * (columns // 4) <= threads
-                and ((lds + 1279) // 1280 * 1280) * wg <= 160 * 1024):
-            return columns
-    raise ValueError(f"No runtime scale panel fits {(bm, bn, bk, wn, stages, wg)}")
+def _bpreshuffle_b_jit_suffix(stages, bd, wg, ca, cb, output, pub=0):
+    # Match CO labels: stages, prefetch distance, pin/address/cache,
+    # residency, publication, stream/static/compact flags, queue override, output.
+    return (
+        f"p{stages}_bd{bd}_pinA0C0_xcd1_contig0"
+        f"_ca{ca}cb{cb}_wg{wg}_pub{pub}_sa0_sb0_compact0_aheadauto_out{output}"
+    )
+
+
+def _bpreshuffle_b_jit_entry(bk, config, publish=None):
+    bm, bn, wn, stages, ahead, wg, ca, cb, output, scale_cols = config
+    family = "b_vgpr" if publish is None else "b_vgpr_overlap"
+    pipeline = "prefetch_" + family
+    args = (bm, bn, stages, ahead, cb, True, scale_cols, wn, wg, ca)
+    if publish is not None:
+        args += (output, bk, False, False, False, publish)
+    elif bk == 128:
+        args += (output, bk, False, False, False)
+    elif output:
+        args += (output,)
+    entry = {
+        "pipeline": pipeline,
+        "traits": _bpreshuffle_cpp_traits(_BP_ROOT + pipeline + "_traits", args),
+        "config_name": _bpreshuffle_jit_name(
+            family,
+            bm,
+            bn,
+            bk,
+            1,
+            wn,
+            _bpreshuffle_b_jit_suffix(
+                stages, ahead, wg, ca, cb, output, 0 if publish is None else publish
+            ),
+        ),
+    }
+    if publish is not None:
+        entry["traits_header"] = (
+            "gfx950/opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh"
+        )
+    entry["m_align"] = 16
+    return _bpreshuffle_instance(bm, bn, bk, 1, wn, wg, ca, cb), entry
+
+
+# Pingpong LDS pipeline
+
+
+def _bpreshuffle_m_repeat_legal(bm, bn, wm, panel):
+    threads = wm * 2 * 64
+    if bm % (wm * 16) or bn % 32:
+        return False
+    em = bm // (wm * 16)
+    packs = (em + 3) // 4
+    lds = 264 * (bm + bn) + panel * (packs * wm * 64 + 4)
+    return not (
+        em < 2
+        or bn < wm * 2 * 16
+        or 64 % (packs * wm * 4)
+        or threads % panel
+        or lds > 160 * 1024
+        or 2 * bm * (bn + 8) > lds
+        or bm * bn % (threads * 8)
+    )
 
 
 def _bpreshuffle_m_repeat_jit_configs():
@@ -3108,7 +3190,7 @@ def _bpreshuffle_m_repeat_jit_configs():
         if not _bpreshuffle_m_repeat_legal(bm, bn, wm, panel):
             continue
         for gm, caches, fragments in product(
-            (0, 4, 8), _BPRESHUFFLE_JIT_CACHES, (False, True)
+            (0, 4, 8), _BPRESHUFFLE_CACHES, (False, True)
         ):
             yield bm, bn, wm, panel, gm, *caches, fragments, True, 8
 
@@ -3119,21 +3201,44 @@ def _bpreshuffle_m_repeat_jit_configs():
             schedules = ((4, 8), (8, 8), (0, 16), (0, 32))
             if panel == 256:
                 schedules = ((0, 8), *schedules)
-            for caches, fragments in product(_BPRESHUFFLE_JIT_CACHES, (False, True)):
+            for caches, fragments in product(_BPRESHUFFLE_CACHES, (False, True)):
                 for gm, gn in schedules:
                     yield bm, bn, wm, panel, gm, *caches, fragments, False, gn
 
     for bm, bn, wm, panel, policies in (
-        (128, 128, 2, 64, (
-            ((0, 0), (False,)), ((1, 17), (True,)), ((17, 1), (True,)),
-        )),
-        (192, 256, 4, 64, (
-            ((0, 0), (False, True)), ((1, 17), (False,)), ((17, 1), (False, True)),
-        )),
-        (192, 256, 4, 128, (
-            ((1, 17), (False, True)), ((17, 1), (True,)),
-        )),
-        (256, 256, 4, 64, tuple((cache, (True,)) for cache in _BPRESHUFFLE_JIT_CACHES)),
+        (
+            128,
+            128,
+            2,
+            64,
+            (
+                ((0, 0), (False,)),
+                ((1, 17), (True,)),
+                ((17, 1), (True,)),
+            ),
+        ),
+        (
+            192,
+            256,
+            4,
+            64,
+            (
+                ((0, 0), (False, True)),
+                ((1, 17), (False,)),
+                ((17, 1), (False, True)),
+            ),
+        ),
+        (
+            192,
+            256,
+            4,
+            128,
+            (
+                ((1, 17), (False, True)),
+                ((17, 1), (True,)),
+            ),
+        ),
+        (256, 256, 4, 64, tuple((cache, (True,)) for cache in _BPRESHUFFLE_CACHES)),
     ):
         if not _bpreshuffle_m_repeat_legal(bm, bn, wm, panel):
             raise ValueError(f"Illegal m-repeat geometry {(bm, bn, wm, panel)}")
@@ -3142,41 +3247,526 @@ def _bpreshuffle_m_repeat_jit_configs():
                 yield bm, bn, wm, panel, 0, *caches, fragments, False, 8
 
 
-_next_bpreshuffle_jit_kid = _bpreshuffle_jit_kid_base
-_bpreshuffle_b_configs = tuple(_bpreshuffle_b_vgpr_jit_configs())
-for _bk, _config in _bpreshuffle_b_configs:
-    _register_bpreshuffle_b_jit(_bk, _config)
+# Direct B pipeline
 
 
-for (_bm, _bn, _wm, _panel, _gm, _ca, _cb,
-     _fragments, _bounded, _gn) in _bpreshuffle_m_repeat_jit_configs():
-    _args = (_bm, _bn, _panel, _wm, _gm, _ca, _cb,
-             _fragments, _bounded, _gn)
-    _register_bpreshuffle_jit(
-        {
-            "pipeline": "pingpong_lds",
-            "kernel": "opus_gemm_bpreshuffle_pingpong_lds_kernel",
-            "traits": _bpreshuffle_cpp_traits("opus_gemm_bpreshuffle_pingpong_lds_traits", _args),
-            # sp=scale panel; K and its loop count are runtime values.
-            # gm/gn=tile grouping, ca/cb=cache, frag=fragment mode, bound=guard.
-            "config_name": _bpreshuffle_jit_name(
-                "m_repeat", _bm, _bn, 128, _wm, 2,
-                f"sp{_panel}"
-                f"_gm{_gm}_gn{_gn}_ca{_ca}cb{_cb}_frag{int(_fragments)}"
-                f"_bound{int(_bounded)}"),
-            "headers": ("gfx950/opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_m_repeat_gfx950.cuh",),
-            "grid_layout": "n_m", "m_align": 16,
-        },
-        _bm, _bn, 128, _wm, 2, _panel * 128, ca=_ca, cb=_cb,
+def _b_ceil_div(value, divisor):
+    return (value + divisor - 1) // divisor
+
+
+def _b_round_up(value, alignment):
+    return _b_ceil_div(value, alignment) * alignment
+
+
+def _direct_b_legal(bm, bn, bk, wm, wn, stages, ahead, wg, vec, ca=0, cb=0):
+    """Mirror B traits' normal ring, short-K arena and cache-bound scale windows."""
+    if (
+        wm not in (1, 2)
+        or wn not in (1, 2, 4, 8)
+        or wm * wn > 8
+        or bm <= 0
+        or bm % (wm * 16)
+        or bn <= 0
+        or bn > 256
+        or bn % (wn * 16)
+        or (bn % 128 if bn >= 128 else 128 % bn)
+        or bk not in (128, 256, 512)
+        or stages < 2
+        or stages > 8
+        or not 1 <= ahead < stages
+        or wg not in (1, 2)
+        or vec not in (1, 4, 16)
+        or ca not in (0, 1, 17)
+        or cb not in (0, 1, 2, 17)
+    ):
+        return False
+    threads, ks = 64 * wm * wn, bk // 128
+    a_bytes, short_a = _b_round_up(bm * bk, threads * 16), bm * bk
+    sb_rows = _b_ceil_div(bn, 128)
+    tile, schedule, caches = (bm, bn, bk, wm, wn), (stages, ahead, wg), (ca, cb)
+    config = tile + schedule + caches + (vec,)
+    core = tile + schedule + (vec,)
+    uniform = config == (64, 64, 128, 1, 4, 4, 2, 1, 0, 2, 4)
+    resident_six = core == (64, 128, 128, 1, 4, 6, 1, 1, 4) and caches in (
+        (0, 2),
+        (17, 1),
+    )
+    byte_scale = config == (32, 128, 128, 1, 4, 3, 1, 1, 17, 1, 1)
+    wide_scale = (
+        config
+        in (
+            (128, 256, 128, 1, 4, 3, 2, 1, 1, 17, 16),
+            (48, 128, 256, 1, 4, 3, 2, 2, 17, 1, 4),
+            (96, 128, 256, 1, 4, 2, 1, 2, 0, 0, 16),
+        )
+        or core
+        in (
+            (96, 128, 128, 1, 4, 4, 2, 1, 16),
+            (64, 128, 256, 1, 8, 3, 1, 1, 4),
+        )
+        or (
+            tile == (64, 128, 256, 1, 4)
+            and schedule == (3, 2, 2)
+            and caches == (0, 0)
+            and vec in (4, 16)
+        )
+    )
+    columns = 64 if bm <= 32 else 32
+    while columns * sb_rows > threads:
+        columns //= 2
+    while columns > 4:
+        sa = _b_ceil_div(bm * columns, threads * vec) * threads * max(4, vec)
+        if stages * a_bytes + sa + threads * 4 <= 80 * 1024:
+            break
+        columns //= 2
+    if wide_scale:
+        columns = 64
+    elif uniform or resident_six or byte_scale:
+        columns = 8
+    sa_bytes = _b_ceil_div(bm * columns, threads * vec) * threads * max(4, vec)
+    lds = stages * a_bytes + sa_bytes + threads * 4
+    capacity = min(8, max(stages, 72 * 1024 // a_bytes))
+    if resident_six or byte_scale:
+        capacity = stages
+    elif uniform:
+        capacity = stages - 1
+    elif (
+        tile == (64, 128, 128, 1, 4)
+        and (stages, ahead) == (3, 1)
+        and caches == (0, 0)
+        and (wg, vec) in ((1, 4), (2, 16))
+    ):
+        capacity = 3
+    short_columns = 4 if (bm, bn, bk, capacity) == (64, 128, 128, 3) else capacity * ks
+    short_sa = _b_ceil_div(bm * short_columns, threads * vec) * threads * max(4, vec)
+    sb_bytes = threads * 4
+    short_lds = capacity * short_a + short_sa + sb_bytes
+    mr, nr = bm // (wm * 16), bn // (wn * 16)
+    registers = 4 * mr * nr + 8 * ks * (mr + (ahead + 1) * nr) + 48
+    return not (
+        columns % ks
+        or sb_rows * columns > threads
+        or capacity < stages - 1
+        or sb_rows * short_columns > threads
+        or _b_round_up(lds, 1280) * wg > _B_LDS_LIMIT
+        or _b_round_up(short_lds, 1280) * wg > _B_LDS_LIMIT
+        or registers > (256 if wg == 2 else 512)
+        or 16 * (bn + 8) * 2 > lds
     )
 
 
-# Reuse the legal B-VGPR geometry/schedule sweep, with every publication point
-# before the final M repeat. Both pin switches remain disabled.
-for _bk, _config in _bpreshuffle_b_configs:
-    if _bk == 256:
-        for _publish in range(_config[0] // 16 - 1):
-            _register_bpreshuffle_b_jit(_bk, _config, _publish)
+def _direct_b_parameters():
+    """Search complete B tiles with queue, occupancy and scale policies bound."""
+    for bm, bn, bk in product(
+        (32, 48, 64, 80, 96, 128),
+        (64, 128, 256),
+        (128, 256, 512),
+    ):
+        if bk == 512 and (bm > 64 or bn != 64):
+            continue
+        occupancy = bm <= 96 and (bk <= 256 or bm <= 48)
+        for stages, ahead in ((2, 1), (3, 1), (3, 2)):
+            for wg in (1, 2) if occupancy else (1,):
+                vec = 4 if bm <= 32 else 16
+                vectors = (vec,)
+                if (
+                    (bm >= 48 and bn == 128 and bk <= 256)
+                    or (wg == 2 and bm <= 64 and bn <= 128 and bk == 256)
+                    or (bm <= 32 and bk == 512)
+                ):
+                    vectors = (4, 16)
+                for vec, (ca, cb) in product(vectors, _BPRESHUFFLE_CACHES):
+                    yield (bm, bn, bk, 1, 4, stages, ahead, wg, ca, cb, vec, 0, 1)
+
+    for bm, bn, bk in product((32, 48, 64, 96, 128), (32, 64, 128), (128, 256, 512)):
+        if bk == 512 and (bm > 48 or bn != 32):
+            continue
+        for (stages, ahead), (ca, cb) in product(((2, 1), (3, 2)), _BPRESHUFFLE_CACHES):
+            vec = 4 if bm <= 32 else 16
+            yield (bm, bn, bk, 1, 2, stages, ahead, 1, ca, cb, vec, 0, 1)
+
+    for bm, bn, bk in product((32, 48, 64), (128, 256), (128, 256)):
+        for (stages, ahead), wg, (ca, cb) in product(
+            ((2, 1), (3, 1), (3, 2)),
+            (1, 2),
+            _BPRESHUFFLE_CACHES,
+        ):
+            vectors = (
+                (4, 16) if bk == 256 and bn == 128 else ((4,) if bm <= 32 else (16,))
+            )
+            for vec in vectors:
+                yield (bm, bn, bk, 1, 8, stages, ahead, wg, ca, cb, vec, 0, 1)
+
+    for bm, bn, bk in product((16, 32), (16, 32, 64), (128, 256, 512)):
+        if bk == 512 and (bm > 16 or bn > 32):
+            continue
+        for (stages, ahead), wg, (ca, cb) in product(
+            ((2, 1), (3, 2)),
+            (1, 2),
+            _BPRESHUFFLE_CACHES,
+        ):
+            vec = 16 if bm == 16 and bk == 512 and wg == 2 else 4
+            yield (bm, bn, bk, 1, 1, stages, ahead, wg, ca, cb, vec, 0, 1)
+
+    for bm, bn, bk, wn, split in product(
+        (64, 128),
+        (128, 256),
+        (128, 256),
+        (2, 4),
+        (1, 2, 4),
+    ):
+        caches = _BPRESHUFFLE_CACHES if split == 1 else ((0, 0),)
+        for ca, cb in caches:
+            yield (bm, bn, bk, 2, wn, 2, 1, 1, ca, cb, 16, 0, split)
+
+    for bm, bn, bk, split in product(
+        (32, 48, 64, 96, 128),
+        (64, 128, 256),
+        (128, 256),
+        (2, 4),
+    ):
+        vec = 4 if bm <= 32 else 16
+        yield (bm, bn, bk, 1, 4, 2, 1, 1, 0, 0, vec, 0, split)
+
+    for bm, bn, bk in product((48, 64, 80, 96), (64, 128), (128, 256, 512)):
+        mr, nr = bm // 16, bn // 64
+        if mr <= 4 and nr == 1 and bk in (128, 512):
+            for ca, cb in _BPRESHUFFLE_CACHES:
+                yield (bm, bn, bk, 1, 4, 4, 1, 1, ca, cb, 16, 0, 1)
+        if bk == 128 and mr >= 4:
+            yield (bm, bn, bk, 1, 4, 4, 2, 1, 1, 1, 16, 0, 1)
+            if mr == 4:
+                yield (bm, bn, bk, 1, 4, 4, 2, 1, 0, 2, 4, 0, 1)
+        if bk <= 256 and mr <= 4:
+            for ca, cb in ((0, 2), (17, 1)):
+                yield (bm, bn, bk, 1, 4, 6, 1, 1, ca, cb, 4, 0, 1)
+        if bk == 128 and mr <= 4:
+            for vec, (ca, cb) in product((4, 16), _BPRESHUFFLE_CACHES):
+                yield (bm, bn, bk, 1, 2, 4, 3, 1, ca, cb, vec, 0, 1)
+
+    for bm, bn, wg, (stages, ahead) in product(
+        (16, 32),
+        (128, 256),
+        (1, 2),
+        ((2, 1), (3, 1)),
+    ):
+        yield (bm, bn, 128, 1, 4, stages, ahead, wg, 17, 1, 1, 0, 1)
+
+
+def _direct_b_jit_configs():
+    """Generate bounded resource strategies, then apply the C++ traits limits."""
+    seen = set()
+    for args in _direct_b_parameters():
+        if args in seen:
+            continue
+        seen.add(args)
+        bm, bn, bk, wm, wn, stages, ahead, wg, ca, cb, vec, _output, split = args
+        if not _direct_b_legal(bm, bn, bk, wm, wn, stages, ahead, wg, vec, ca, cb):
+            continue
+        parameters = _bpreshuffle_instance(bm, bn, bk, wm, wn, wg, ca, cb, split)
+        yield parameters, {
+            "traits": _bpreshuffle_cpp_traits(_B_PREFIX + "direct_b_traits", args),
+            "pipeline": "direct_b",
+            "config_name": _small_bpreshuffle_config_name(
+                parameters, f"p{stages}_bd{ahead}_sv{vec}", split
+            ),
+            "m_align": (
+                16
+                if vec == 4 and (cb == 2 or (bm >= 96 and (ca, cb) == (17, 1)))
+                else max(4, vec)
+            ),
+            "pad_n": False,
+            "split_k": split,
+        }
+
+
+# Staged B pipeline
+
+
+def _staged_b_resources(
+    bm, bn, wm, wn, panel, split, bk=128, cache_a=0, cache_b=0, group_m=0
+):
+    """Mirror the static constants and assertions of the small M traits."""
+    waves, threads = wm * wn, 64 * wm * wn
+    if (
+        min(bm, bn, wm, wn, panel) <= 0
+        or waves > 8
+        or bn > 256
+        or bk not in (128, 256, 512, 1024)
+        or bm % (wm * 16)
+        or bn % (wn * 16)
+        or threads % panel
+        or split not in (1, 2, 4)
+        or cache_a not in (0, 1, 17)
+        or cache_b not in (0, 1, 2, 17)
+        or group_m not in (0, 4)
+    ):
+        return None
+    em, en, ek = bm // (wm * 16), bn // (wn * 16), bk // 128
+    half_m = (bm * bk + threads * 16 - 1) // (threads * 16) * threads * 16 // bk
+    if half_m * bk % (threads * 16) or bn * bk % (threads * 16):
+        return None
+    packs = (em + 3) // 4
+    if 64 % (packs * wm * 4):
+        return None
+    a_stage = half_m * bk // 1024 * 1056
+    b_stage = bn * bk // 1024 * 1056
+    packed_pitch = packs * wm * 16 * 4
+    pitch = bm if bm <= 32 and bn <= 128 else packed_pitch
+    scale_bytes = panel * (pitch + 4)
+    geometry, policy = (bm, bn, bk, wm, wn), (panel, split, cache_a, cache_b, group_m)
+    if geometry == (16, 32, 128, 1, 2) and policy == (128, 1, 0, 0, 0):
+        stages = 4
+    elif (bm, bn, bk) == (32, 64, 128) and (
+        8 * (a_stage + b_stage) + scale_bytes <= _B_LDS_LIMIT
+    ):
+        stages = 8
+    else:
+        stages = 3 if 3 * (a_stage + b_stage) + scale_bytes <= _B_LDS_LIMIT else 2
+    if geometry == (32, 64, 128, 1, 2) and policy == (8, 1, 1, 17, 0):
+        resident_limit = 6
+    elif bm > 32:
+        resident_limit = 8
+    elif bk == 1024:
+        resident_limit = 2
+    elif panel <= 4:
+        resident_limit = 3
+    elif panel <= 8:
+        resident_limit = 8 if bk == 128 else (3 if bk == 256 else 2)
+    elif bk == 512 and panel <= 16:
+        resident_limit = 3
+    else:
+        resident_limit = 16 if bk == 128 else (8 if bk == 256 else 4)
+    if bm <= 32:
+        resident_panels = min(resident_limit, panel // ek)
+    elif bm in (64, 96) and (wm, bn, bk, wn, panel) == (2, 64, 128, 2, 4):
+        resident_panels = 3
+    elif bm == 48 and bn <= 64 and (bk, wm, wn, panel) == (128, 1, 2, 8):
+        resident_panels = 6
+    else:
+        resident_panels = 8
+    available_panels = (_B_LDS_LIMIT - scale_bytes) // (a_stage + b_stage)
+    resident = min(available_panels, resident_panels)
+    output = bm * (bn + 8) * 2 if split == 1 else 0
+    static_lds = stages * (a_stage + b_stage) + scale_bytes
+    registers = 4 * em * en + ek * (8 * (min(em, 3) + en) + 2 * packs) + 48
+    if resident < 2 or max(static_lds, output) > _B_LDS_LIMIT or registers > 512:
+        return None
+    return threads, em, pitch
+
+
+def _staged_b_jit_configs():
+    """Pair each wave tile with one main scale arena and a few resource profiles."""
+    seen = set()
+
+    def profile(geometry, panel, split, caches, group_m, bk):
+        bm, bn, wm, wn = geometry
+        ca, cb = caches
+        key = (bm, bn, wm, wn, panel, split, ca, cb, group_m, bk)
+        if (
+            key in seen
+            or _staged_b_resources(bm, bn, wm, wn, panel, split, bk, ca, cb, group_m)
+            is None
+        ):
+            return
+        seen.add(key)
+        values = (bm, bn, wm, wn, panel, split, ca, cb, group_m)
+        if bk != 128:
+            values += (bk,)
+        instance = _bpreshuffle_instance(bm, bn, bk, wm, wn, 1, ca, cb, split)
+        instance["max_k"] = split * panel * 128
+        yield instance, {
+            "traits": _bpreshuffle_cpp_traits(_B_PREFIX + "staged_b_traits", values),
+            "pipeline": "staged_b",
+            "config_name": _small_bpreshuffle_config_name(
+                instance, f"sp{panel}" + (f"_gm{group_m}" if group_m else ""), split
+            ),
+            "m_align": 1,
+            "pad_n": False,
+            "split_k": split,
+        }
+
+    wave_tiles = ((1, 1), (1, 2), (1, 4), (2, 1), (2, 2), (2, 4), (4, 2))
+    for bm, bn, (wm, wn) in product(
+        (16, 32, 48, 64, 96, 128, 192, 256), (16, 32, 64, 128, 256), wave_tiles
+    ):
+        geometry = (bm, bn, wm, wn)
+        block_ks = (128,)
+        if (
+            bm <= 128
+            and bn <= 128
+            and (wm >= 2 or (bm <= 32 and wm == 1 and wn == 2 and bn <= 64))
+        ):
+            block_ks += (256,)
+        if bm <= 32 and bn <= 64 and wm * wn <= 2:
+            block_ks += (512,)
+        for bk in block_ks:
+            panels = {
+                panel: resource
+                for panel in (16, 32, 64, 128, 256)
+                if (resource := _staged_b_resources(*geometry, panel, 1, bk))
+                is not None
+            }
+            if not panels:
+                continue
+            main_panel = max(panels)
+            threads, em, pitch = panels[main_panel]
+            normal_caches = _BPRESHUFFLE_CACHES
+            if bk == 512:
+                normal_caches = (
+                    _BPRESHUFFLE_CACHES + _M_SMALL_STORE_CACHE_PAIRS
+                    if bn <= 32
+                    else ((0, 0),)
+                )
+            for caches in normal_caches:
+                yield from profile(geometry, main_panel, 1, caches, 0, bk)
+            for split in (2, 4):
+                yield from profile(geometry, main_panel, split, (0, 0), 0, bk)
+            if bk == 128 and wm == 4 and wn == 2 and bm >= 128 and bn <= 128:
+                yield from profile(geometry, main_panel, 4, (1, 17), 0, bk)
+            if bk == 128 and wm == 4 and wn == 2 and bm >= 128 and bn >= 128:
+                yield from profile(geometry, main_panel, 1, (0, 0), 4, bk)
+
+            if (
+                (bk == 128 and bm >= 48 and bn >= 64)
+                or (bk == 256 and bm >= 128 and bn >= 128)
+                or (bk == 512 and bm <= 32 and bn <= 32)
+            ):
+                yield from profile(geometry, 16, 1, (0, 0), 0, bk)
+
+            if bk == 128 and bm >= 64 and bn >= 64:
+                budgets = (16 * 1024,) if wm == 4 else (8 * 1024,)
+                middle_caches = ((0, 0), (1, 17))
+            elif bk == 256 and bm >= 64:
+                budgets = (
+                    (8 * 1024, 16 * 1024)
+                    if em == 3
+                    else ((16 * 1024,) if em == 1 else (8 * 1024,))
+                )
+                middle_caches = _BPRESHUFFLE_CACHES
+            else:
+                budgets, middle_caches = (), ()
+            for budget in budgets:
+                fits = [panel for panel in panels if panel * pitch <= budget]
+                if fits:
+                    for caches in middle_caches:
+                        yield from profile(geometry, fits[-1], 1, caches, 0, bk)
+            if bk == 256 and bm <= 32 and wm == wn == 2:
+                yield from profile(geometry, threads // 4, 1, (1, 17), 0, bk)
+
+            if bk == 128 and bm <= 96 and bn <= 64 and wm * wn <= 4:
+                short_panels = (4, 8) if bm <= 32 else ((4,) if wm >= 2 else (8,))
+                for panel in short_panels:
+                    caches = _BPRESHUFFLE_CACHES
+                    if bm <= 32 and bn <= 32:
+                        caches += ((0, 2), (1, 2)) if panel == 4 else ((0, 2),)
+                    for pair in caches:
+                        yield from profile(geometry, panel, 1, pair, 0, bk)
+            elif bk == 256 and bm <= 32 and bn <= 32 and wm * wn <= 2:
+                for caches in ((0, 0), (0, 2)):
+                    yield from profile(geometry, 8, 1, caches, 0, bk)
+            elif bk == 512 and bm <= 32 and bn <= 32 and wm * wn <= 2:
+                for caches in ((0, 2), (17, 1), (17, 2)):
+                    yield from profile(geometry, 8, 1, caches, 0, bk)
+
+    # Append BK1024 after existing IDs.
+    for geometry in (
+        (16, 16, 1, 1),
+        (16, 32, 1, 1),
+        (16, 32, 1, 2),
+        (32, 16, 1, 1),
+        (32, 32, 1, 2),
+    ):
+        panel = 64 * geometry[2] * geometry[3]
+        for caches in _BPRESHUFFLE_CACHES + _M_SMALL_STORE_CACHE_PAIRS:
+            yield from profile(geometry, panel, 1, caches, 0, 1024)
+
+
+# Kernel registration
+
+
+def _register_bpreshuffle_jit(kid, parameters, entry):
+    if (
+        kid in gfx950_co_kernels_declared
+        or kid in a8w8_blockscale_mxscale_gemm_bpreshuffle_kernels_list
+    ):
+        raise ValueError(f"duplicate gfx950 bpreshuffle kernel ID {kid}")
+    pipeline = entry["pipeline"]
+    prefetch = pipeline.startswith("prefetch_")
+    small = pipeline in ("direct_b", "staged_b")
+    header = (
+        "b_vgpr"
+        if prefetch
+        else ("m_repeat" if pipeline == "pingpong_lds" else pipeline)
+    )
+    header = f"gfx950/opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_{header}_gfx950.cuh"
+    entry.update(
+        kid=kid,
+        kernel=(_BP_ROOT if prefetch else _B_PREFIX)
+        + pipeline
+        + ("_bulk_panel_kernel" if prefetch else "_kernel"),
+        headers=[header] if small else (header,),
+    )
+    if small:
+        parameters = {**parameters, "max_m": 1024}
+        entry.update(small_shape=True, config_name=f"{pipeline}_{entry['config_name']}")
+        if entry["split_k"] > 1:
+            entry["headers"].insert(0, "gfx950/splitk_reduce_gfx950.cuh")
+    a8w8_blockscale_mxscale_gemm_bpreshuffle_kernels_list[kid] = OpusGemmInstance(
+        **parameters,
+        bpreshuffle_entry=entry,
+    )
+
+
+def _bpreshuffle_jit_entries():
+    b_configs = tuple(_bpreshuffle_b_vgpr_jit_configs())
+    for bk, config in b_configs:
+        yield _bpreshuffle_b_jit_entry(bk, config)
+    for (
+        bm,
+        bn,
+        wm,
+        panel,
+        gm,
+        ca,
+        cb,
+        fragments,
+        bounded,
+        gn,
+    ) in _bpreshuffle_m_repeat_jit_configs():
+        parameters = _bpreshuffle_instance(bm, bn, 128, wm, 2, ca=ca, cb=cb)
+        parameters["max_k"] = panel * 128
+        yield parameters, {
+            "pipeline": "pingpong_lds",
+            "traits": _bpreshuffle_cpp_traits(
+                _B_PREFIX + "pingpong_lds_traits",
+                (bm, bn, panel, wm, gm, ca, cb, fragments, bounded, gn),
+            ),
+            "config_name": _bpreshuffle_jit_name(
+                "m_repeat",
+                bm,
+                bn,
+                128,
+                wm,
+                2,
+                f"sp{panel}_gm{gm}_gn{gn}_ca{ca}cb{cb}_frag{int(fragments)}_bound{int(bounded)}",
+            ),
+            "grid_layout": "n_m",
+            "m_align": 16,
+        }
+    for bk, config in b_configs:
+        if bk == 256:
+            for publish in range(config[0] // 16 - 1):
+                yield _bpreshuffle_b_jit_entry(bk, config, publish)
+
+
+gfx950_co_kernels_declared = _load_gfx950_co_kernels(
+    GFX950_CO_KERNELS_JSON, require_image=False
+)
+
+
+for _kid, (_parameters, _entry) in enumerate(_bpreshuffle_jit_entries(), start=100):
+    _register_bpreshuffle_jit(_kid, _parameters, _entry)
 
 
 for _kid, _entry in gfx950_co_kernels_declared.items():
@@ -3185,26 +3775,45 @@ for _kid, _entry in gfx950_co_kernels_declared.items():
     _bm, _bn, _bk = _entry["tile"]
     _wm, _wn = _entry["wave_layout"]
     a8w8_blockscale_mxscale_gemm_bpreshuffle_kernels_list[_kid] = OpusGemmInstance(
-        BLOCK_SIZE=_entry["block_size"], B_M=_bm, B_N=_bn, B_K=_bk,
-        T_M=_wm, T_N=_wn, W_M=16, W_N=16, W_K=128,
-        VEC_A=16, VEC_B=16, VEC_C=4, GROUP_M=1, GROUP_N=128, GROUP_K=128,
-        kernel_tag=_TAG, output_dtypes=["bf16_t"], arch_prefix="gfx950",
-        direct_only=True, pad_m=_entry.get("pad_m", True),
+        BLOCK_SIZE=_entry["block_size"],
+        B_M=_bm,
+        B_N=_bn,
+        B_K=_bk,
+        T_M=_wm,
+        T_N=_wn,
+        W_M=16,
+        W_N=16,
+        W_K=128,
+        VEC_A=16,
+        VEC_B=16,
+        VEC_C=4,
+        GROUP_M=1,
+        GROUP_N=128,
+        GROUP_K=128,
+        kernel_tag=_TAG,
+        output_dtypes=["bf16_t"],
+        arch_prefix="gfx950",
+        direct_only=True,
+        pad_m=_entry.get("pad_m", True),
         has_oob=_entry.get("pad_m", True),
         max_k=_entry.get("max_k", 16384),
         max_tensor_bytes=2**63 - 1 if _entry.get("wide_output") else _INT32_MAX,
-        bpreshuffle_co=_entry)
+        bpreshuffle_co=_entry,
+    )
 
 
-def candidate_kids_for_shape(gfx, m, n, k, outdtype="bf16", *, cu_num):
-    if str(gfx).lower().split(":", 1)[0] != "gfx950" or canonical_output_dtype(outdtype) != "bf16_t":
-        return []
-    selected = []
-    for kid, instance in sorted(get_registry("a8w8_blockscale_bpreshuffle", gfx, cu_num).items()):
-        if not a8w8_mxscale_bpreshuffle_supports_shape(instance, m, n, k):
-            continue
-        selected.append(kid)
-    return selected
+for _kid, (_parameters, _entry) in enumerate(
+    chain(_direct_b_jit_configs(), _staged_b_jit_configs()), start=6300
+):
+    _register_bpreshuffle_jit(_kid, _parameters, _entry)
+
+
+# Shape support
+
+
+def bpreshuffle_workspace_bytes(instance, m, n, k):
+    split = (instance.bpreshuffle_entry or {}).get("split_k", 1)
+    return 4 * split * m * n if split > 1 else 0
 
 
 def a8w8_mxscale_bpreshuffle_supports_shape(instance, m, n, k):
@@ -3214,27 +3823,53 @@ def a8w8_mxscale_bpreshuffle_supports_shape(instance, m, n, k):
         shapes = instance.bpreshuffle_co.get("supported_shapes")
         if shapes is not None:
             return [m, n, k] in shapes
-    if (min(m, n, k) <= 0 or m % instance.m_align or n % 128 or k % (split * instance.B_K)
-            or n % instance.B_N
-            or (instance.max_m is not None and m > instance.max_m)
-            or (instance.max_k is not None and k > instance.max_k)):
+    if (
+        min(m, n, k) <= 0
+        or m % instance.m_align
+        or n % 128
+        or k % (split * instance.B_K)
+        or n % instance.B_N
+        or (instance.max_m is not None and m > instance.max_m)
+        or (instance.max_k is not None and k > instance.max_k)
+    ):
         return False
     if max(m * k, n * k) > _INT32_MAX:
         return False
-    if instance.bpreshuffle_entry is not None and 2 * min(m, instance.B_M) * n > _INT32_MAX:
+    if (
+        instance.bpreshuffle_entry is not None
+        and 2 * min(m, instance.B_M) * n > _INT32_MAX
+    ):
         return False
-    if (instance.bpreshuffle_co is not None and instance.bpreshuffle_co.get("wide_output")
-            and 2 * ((min(m, instance.B_M) - 1) * n + instance.B_N) > _INT32_MAX):
+    if (
+        instance.bpreshuffle_co is not None
+        and instance.bpreshuffle_co.get("wide_output")
+        and 2 * ((min(m, instance.B_M) - 1) * n + instance.B_N) > _INT32_MAX
+    ):
         return False
     if entry.get("pipeline") == "staged_b" and 2 * instance.B_M * n > _INT32_MAX:
         return False
-    return max(2 * m * n, bpreshuffle_workspace_bytes(instance, m, n, k)) <= instance.max_tensor_bytes
+    return (
+        max(2 * m * n, bpreshuffle_workspace_bytes(instance, m, n, k))
+        <= instance.max_tensor_bytes
+    )
 
 
+def candidate_kids_for_shape(gfx, m, n, k, outdtype="bf16", *, cu_num):
+    if (
+        str(gfx).lower().split(":", 1)[0] != "gfx950"
+        or canonical_output_dtype(outdtype) != "bf16_t"
+    ):
+        return []
+    return [
+        kid
+        for kid, instance in sorted(
+            get_registry("a8w8_blockscale_bpreshuffle", gfx, cu_num).items()
+        )
+        if a8w8_mxscale_bpreshuffle_supports_shape(instance, m, n, k)
+    ]
 
-def bpreshuffle_workspace_bytes(instance, m, n, k):
-    split = (instance.bpreshuffle_entry or {}).get("split_k", 1)
-    return 4 * split * m * n if split > 1 else 0
+
+# fmt: off
 
 # combined list (used by production gen_instances / dispatch)
 gfx950_a16w16_kernels_list = {
@@ -3781,625 +4416,3 @@ def _opus_sidecar_path():
     from aiter.jit.core import bd_dir
 
     return os.path.join(bd_dir, "compiled_kids_opus.json")
-
-
-# Small pipelines: enumerate parameters within register and LDS limits.
-_B_PREFIX = "opus_gemm_bpreshuffle_"
-_B_LDS_LIMIT = 160 * 1024
-_B_CACHE_PAIRS = ((0, 0), (1, 17), (17, 1))
-
-
-def _b_ceil_div(value, divisor):
-    return (value + divisor - 1) // divisor
-
-
-def _b_round_up(value, alignment):
-    return _b_ceil_div(value, alignment) * alignment
-
-
-def _b_instance(bm, bn, bk, wm, wn, wg, ca, cb, split):
-    return {
-        "BLOCK_SIZE": 64 * wm * wn,
-        "B_M": bm,
-        "B_N": bn,
-        "B_K": bk,
-        "T_M": wm,
-        "T_N": wn,
-        "W_M": 16,
-        "W_N": 16,
-        "W_K": 128,
-        "VEC_A": 16,
-        "VEC_B": 16,
-        "VEC_C": 4,
-        "GROUP_M": 1,
-        "GROUP_N": 128,
-        "GROUP_K": 128,
-        "WG_PER_CU": wg,
-        "cachectl_a": ca,
-        "cachectl_b": cb,
-        "kernel_tag": "a8w8_blockscale_mxscale_gemm_bpreshuffle",
-        "output_dtypes": ["bf16_t"],
-        "arch_prefix": "gfx950",
-        "direct_only": split == 1,
-        "pad_m": True,
-        "has_oob": True,
-        "max_m": 1024,
-        "max_k": None,
-        "max_tensor_bytes": 2**63 - 1,
-        "splitk_workspace_dtype": "fp32_t" if split > 1 else None,
-        "bpreshuffle_co": None,
-    }
-
-
-def _b_workspace_entry(split):
-    return {
-        "host_kind": "reduce" if split > 1 else "tile",
-        "split_k": split,
-        "reduce_kernel": "splitk_reduce_kernel",
-    }
-
-
-def _b_normal_resources(bm, bn, bk, wm, wn, stages, ahead, wg, vec, ca=0, cb=0):
-    """Mirror B traits' normal ring, short-K arena and cache-bound scale windows."""
-    if (
-        wm not in (1, 2)
-        or wn not in (1, 2, 4, 8)
-        or wm * wn > 8
-        or bm <= 0
-        or bm % (wm * 16)
-        or bn <= 0
-        or bn > 256
-        or bn % (wn * 16)
-        or (bn % 128 if bn >= 128 else 128 % bn)
-        or bk not in (128, 256, 512)
-        or stages < 2
-        or stages > 8
-        or not 1 <= ahead < stages
-        or wg not in (1, 2)
-        or vec not in (1, 4, 16)
-        or ca not in (0, 1, 17)
-        or cb not in (0, 1, 2, 17)
-    ):
-        return None
-    threads, ks = 64 * wm * wn, bk // 128
-    a_bytes, short_a = _b_round_up(bm * bk, threads * 16), bm * bk
-    sb_rows = _b_ceil_div(bn, 128)
-    uniform = (bm, bn, bk, wm, wn, stages, ahead, wg, ca, cb, vec) == (
-        64,
-        64,
-        128,
-        1,
-        4,
-        4,
-        2,
-        1,
-        0,
-        2,
-        4,
-    )
-    resident_six = (bm, bn, bk, wm, wn, stages, ahead, wg, vec) == (
-        64,
-        128,
-        128,
-        1,
-        4,
-        6,
-        1,
-        1,
-        4,
-    ) and (ca, cb) in ((0, 2), (17, 1))
-    byte_scale = (bm, bn, bk, wm, wn, stages, ahead, wg, ca, cb, vec) == (
-        32,
-        128,
-        128,
-        1,
-        4,
-        3,
-        1,
-        1,
-        17,
-        1,
-        1,
-    )
-    wide_scale = (
-        (bm, bn, bk, wm, wn, stages, ahead, wg, ca, cb, vec)
-        == (128, 256, 128, 1, 4, 3, 2, 1, 1, 17, 16)
-        or (bm, bn, bk, wm, wn, stages, ahead, wg, ca, cb, vec)
-        == (48, 128, 256, 1, 4, 3, 2, 2, 17, 1, 4)
-        or (bm, bn, bk, wm, wn, stages, ahead, wg, vec)
-        == (96, 128, 128, 1, 4, 4, 2, 1, 16)
-        or (bm, bn, bk, wm, wn, stages, ahead, wg, ca, cb, vec)
-        == (96, 128, 256, 1, 4, 2, 1, 2, 0, 0, 16)
-        or (
-            (bm, bn, bk, wm, wn, stages, ahead, wg, ca, cb)
-            == (64, 128, 256, 1, 4, 3, 2, 2, 0, 0)
-            and vec in (4, 16)
-        )
-        or (bm, bn, bk, wm, wn, stages, ahead, wg, vec)
-        == (64, 128, 256, 1, 8, 3, 1, 1, 4)
-    )
-    columns = 64 if bm <= 32 else 32
-    while columns * sb_rows > threads:
-        columns //= 2
-    while columns > 4:
-        sa = _b_ceil_div(bm * columns, threads * vec) * threads * max(4, vec)
-        if stages * a_bytes + sa + threads * 4 <= 80 * 1024:
-            break
-        columns //= 2
-    if wide_scale:
-        columns = 64
-    elif uniform or resident_six or byte_scale:
-        columns = 8
-    sa_bytes = _b_ceil_div(bm * columns, threads * vec) * threads * max(4, vec)
-    lds = stages * a_bytes + sa_bytes + threads * 4
-    capacity = min(8, max(stages, 72 * 1024 // a_bytes))
-    if resident_six or byte_scale:
-        capacity = stages
-    elif uniform:
-        capacity = stages - 1
-    elif (bm, bn, bk, wm, wn, stages, ahead, ca, cb) == (
-        64,
-        128,
-        128,
-        1,
-        4,
-        3,
-        1,
-        0,
-        0,
-    ) and (wg, vec) in ((1, 4), (2, 16)):
-        capacity = 3
-    short_columns = 4 if (bm, bn, bk, capacity) == (64, 128, 128, 3) else capacity * ks
-    short_sa = _b_ceil_div(bm * short_columns, threads * vec) * threads * max(4, vec)
-    sb_bytes = threads * 4
-    short_lds = capacity * short_a + short_sa + sb_bytes
-    mr, nr = bm // (wm * 16), bn // (wn * 16)
-    registers = 4 * mr * nr + 8 * ks * (mr + (ahead + 1) * nr) + 48
-    if (
-        columns % ks
-        or sb_rows * columns > threads
-        or capacity < stages - 1
-        or sb_rows * short_columns > threads
-        or _b_round_up(lds, 1280) * wg > _B_LDS_LIMIT
-        or _b_round_up(short_lds, 1280) * wg > _B_LDS_LIMIT
-        or registers > (256 if wg == 2 else 512)
-        or 16 * (bn + 8) * 2 > lds
-    ):
-        return None
-    return {"lds_bytes": lds}
-
-
-def _b_strategy_args():
-    """Search complete B tiles with queue, occupancy and scale policies bound."""
-    for bm, bn, bk in product(
-        (32, 48, 64, 80, 96, 128),
-        (64, 128, 256),
-        (128, 256, 512),
-    ):
-        if bk == 512 and (bm > 64 or bn != 64):
-            continue
-        occupancy = bm <= 96 and (bk <= 256 or bm <= 48)
-        for stages, ahead in ((2, 1), (3, 1), (3, 2)):
-            for wg in (1, 2) if occupancy else (1,):
-                vec = 4 if bm <= 32 else 16
-                vectors = (vec,)
-                if (
-                    (bm >= 48 and bn == 128 and bk <= 256)
-                    or (wg == 2 and bm <= 64 and bn <= 128 and bk == 256)
-                    or (bm <= 32 and bk == 512)
-                ):
-                    vectors = (4, 16)
-                for vec, (ca, cb) in product(vectors, _B_CACHE_PAIRS):
-                    yield (bm, bn, bk, 1, 4, stages, ahead, wg, ca, cb, vec, 0, 1)
-
-    for bm, bn, bk in product((32, 48, 64, 96, 128), (32, 64, 128), (128, 256, 512)):
-        if bk == 512 and (bm > 48 or bn != 32):
-            continue
-        for (stages, ahead), (ca, cb) in product(((2, 1), (3, 2)), _B_CACHE_PAIRS):
-            vec = 4 if bm <= 32 else 16
-            yield (bm, bn, bk, 1, 2, stages, ahead, 1, ca, cb, vec, 0, 1)
-
-    for bm, bn, bk in product((32, 48, 64), (128, 256), (128, 256)):
-        for (stages, ahead), wg, (ca, cb) in product(
-            ((2, 1), (3, 1), (3, 2)),
-            (1, 2),
-            _B_CACHE_PAIRS,
-        ):
-            vectors = (
-                (4, 16) if bk == 256 and bn == 128 else ((4,) if bm <= 32 else (16,))
-            )
-            for vec in vectors:
-                yield (bm, bn, bk, 1, 8, stages, ahead, wg, ca, cb, vec, 0, 1)
-
-    for bm, bn, bk in product((16, 32), (16, 32, 64), (128, 256, 512)):
-        if bk == 512 and (bm > 16 or bn > 32):
-            continue
-        for (stages, ahead), wg, (ca, cb) in product(
-            ((2, 1), (3, 2)),
-            (1, 2),
-            _B_CACHE_PAIRS,
-        ):
-            vec = 16 if bm == 16 and bk == 512 and wg == 2 else 4
-            yield (bm, bn, bk, 1, 1, stages, ahead, wg, ca, cb, vec, 0, 1)
-
-    for bm, bn, bk, wn, split in product(
-        (64, 128),
-        (128, 256),
-        (128, 256),
-        (2, 4),
-        (1, 2, 4),
-    ):
-        caches = _B_CACHE_PAIRS if split == 1 else ((0, 0),)
-        for ca, cb in caches:
-            yield (bm, bn, bk, 2, wn, 2, 1, 1, ca, cb, 16, 0, split)
-
-    for bm, bn, bk, split in product(
-        (32, 48, 64, 96, 128),
-        (64, 128, 256),
-        (128, 256),
-        (2, 4),
-    ):
-        vec = 4 if bm <= 32 else 16
-        yield (bm, bn, bk, 1, 4, 2, 1, 1, 0, 0, vec, 0, split)
-
-    for bm, bn, bk in product((48, 64, 80, 96), (64, 128), (128, 256, 512)):
-        mr, nr = bm // 16, bn // 64
-        if mr <= 4 and nr == 1 and bk in (128, 512):
-            for ca, cb in _B_CACHE_PAIRS:
-                yield (bm, bn, bk, 1, 4, 4, 1, 1, ca, cb, 16, 0, 1)
-        if bk == 128 and mr >= 4:
-            yield (bm, bn, bk, 1, 4, 4, 2, 1, 1, 1, 16, 0, 1)
-            if mr == 4:
-                yield (bm, bn, bk, 1, 4, 4, 2, 1, 0, 2, 4, 0, 1)
-        if bk <= 256 and mr <= 4:
-            for ca, cb in ((0, 2), (17, 1)):
-                yield (bm, bn, bk, 1, 4, 6, 1, 1, ca, cb, 4, 0, 1)
-        if bk == 128 and mr <= 4:
-            for vec, (ca, cb) in product((4, 16), _B_CACHE_PAIRS):
-                yield (bm, bn, bk, 1, 2, 4, 3, 1, ca, cb, vec, 0, 1)
-
-    for bm, bn, wg, (stages, ahead) in product(
-        (16, 32),
-        (128, 256),
-        (1, 2),
-        ((2, 1), (3, 1)),
-    ):
-        yield (bm, bn, 128, 1, 4, stages, ahead, wg, 17, 1, 1, 0, 1)
-
-
-def _small_b_jit_configs():
-    """Generate bounded resource strategies, then apply the C++ traits limits."""
-    seen = set()
-    for args in _b_strategy_args():
-        if args in seen:
-            continue
-        seen.add(args)
-        bm, bn, bk, wm, wn, stages, ahead, wg, ca, cb, vec, _output, split = args
-        resources = _b_normal_resources(
-            bm, bn, bk, wm, wn, stages, ahead, wg, vec, ca, cb
-        )
-        if resources is None:
-            continue
-        yield _b_instance(bm, bn, bk, wm, wn, wg, ca, cb, split), dict(
-            traits=_bpreshuffle_cpp_traits(_B_PREFIX + "direct_b_traits", args),
-            pipeline="direct_b",
-            static_lds_bytes=resources["lds_bytes"],
-            m_align=(
-                16
-                if vec == 4 and (cb == 2 or (bm >= 96 and (ca, cb) == (17, 1)))
-                else max(4, vec)
-            ),
-            pad_n=False,
-            **_b_workspace_entry(split),
-        )
-
-
-_M_SMALL_STORE_CACHE_PAIRS = ((0, 2), (1, 2), (17, 2))
-
-
-def _m_normal_resources(
-    bm, bn, wm, wn, panel, split, bk=128, cache_a=0, cache_b=0, group_m=0
-):
-    """Mirror the static constants and assertions of the small M traits."""
-    waves, threads = wm * wn, 64 * wm * wn
-    if (
-        min(bm, bn, wm, wn, panel) <= 0
-        or waves > 8
-        or bn > 256
-        or bk not in (128, 256, 512, 1024)
-        or bm % (wm * 16)
-        or bn % (wn * 16)
-        or threads % panel
-        or split not in (1, 2, 4)
-        or cache_a not in (0, 1, 17)
-        or cache_b not in (0, 1, 2, 17)
-        or group_m not in (0, 4)
-    ):
-        return None
-    em, en, ek = bm // (wm * 16), bn // (wn * 16), bk // 128
-    half_m = (bm * bk + threads * 16 - 1) // (threads * 16) * threads * 16 // bk
-    if half_m * bk % (threads * 16) or bn * bk % (threads * 16):
-        return None
-    packs = (em + 3) // 4
-    if 64 % (packs * wm * 4):
-        return None
-    a_stage = half_m * bk // 1024 * 1056
-    b_stage = bn * bk // 1024 * 1056
-    packed_pitch = packs * wm * 16 * 4
-    pitch = bm if bm <= 32 and bn <= 128 else packed_pitch
-    scale_bytes = panel * (pitch + 4)
-    if (bm, bn, bk, wm, wn, panel, split, cache_a, cache_b, group_m) == (
-        16,
-        32,
-        128,
-        1,
-        2,
-        128,
-        1,
-        0,
-        0,
-        0,
-    ):
-        stages = 4
-    elif (bm, bn, bk) == (32, 64, 128) and (
-        8 * (a_stage + b_stage) + scale_bytes <= _B_LDS_LIMIT
-    ):
-        stages = 8
-    else:
-        stages = 3 if 3 * (a_stage + b_stage) + scale_bytes <= _B_LDS_LIMIT else 2
-    if (bm, bn, bk, wm, wn, panel, split, cache_a, cache_b, group_m) == (
-        32,
-        64,
-        128,
-        1,
-        2,
-        8,
-        1,
-        1,
-        17,
-        0,
-    ):
-        resident_limit = 6
-    elif bm > 32:
-        resident_limit = 8
-    elif bk == 1024:
-        resident_limit = 2
-    elif panel <= 4:
-        resident_limit = 3
-    elif panel <= 8:
-        resident_limit = 8 if bk == 128 else (3 if bk == 256 else 2)
-    elif bk == 512 and panel <= 16:
-        resident_limit = 3
-    else:
-        resident_limit = 16 if bk == 128 else (8 if bk == 256 else 4)
-    if bm <= 32:
-        resident_panels = min(resident_limit, panel // ek)
-    elif bm in (64, 96) and (wm, bn, bk, wn, panel) == (2, 64, 128, 2, 4):
-        resident_panels = 3
-    elif bm == 48 and bn <= 64 and (bk, wm, wn, panel) == (128, 1, 2, 8):
-        resident_panels = 6
-    else:
-        resident_panels = 8
-    available_panels = (_B_LDS_LIMIT - scale_bytes) // (a_stage + b_stage)
-    resident = min(available_panels, resident_panels)
-    output = bm * (bn + 8) * 2 if split == 1 else 0
-    static_lds = stages * (a_stage + b_stage) + scale_bytes
-    registers = 4 * em * en + ek * (8 * (min(em, 3) + en) + 2 * packs) + 48
-    if resident < 2 or max(static_lds, output) > _B_LDS_LIMIT or registers > 512:
-        return None
-    return {
-        "threads": threads,
-        "em": em,
-        "sfa_panel_pitch": pitch,
-        "normal_lds_bytes": max(static_lds, output),
-    }
-
-
-def _small_m_parameters():
-    """Pair each wave tile with one main scale arena and a few resource profiles."""
-    seen = set()
-
-    def profile(geometry, panel, split, caches, group_m, bk):
-        bm, bn, wm, wn = geometry
-        ca, cb = caches
-        key = (bm, bn, wm, wn, panel, split, ca, cb, group_m, bk)
-        if (
-            key in seen
-            or _m_normal_resources(bm, bn, wm, wn, panel, split, bk, ca, cb, group_m)
-            is None
-        ):
-            return ()
-        seen.add(key)
-        return ((*geometry, panel, split, caches, group_m, bk),)
-
-    wave_tiles = ((1, 1), (1, 2), (1, 4), (2, 1), (2, 2), (2, 4), (4, 2))
-    for bm, bn, (wm, wn) in product(
-        (16, 32, 48, 64, 96, 128, 192, 256), (16, 32, 64, 128, 256), wave_tiles
-    ):
-        geometry = (bm, bn, wm, wn)
-        block_ks = (128,)
-        if (
-            bm <= 128
-            and bn <= 128
-            and (wm >= 2 or (bm <= 32 and wm == 1 and wn == 2 and bn <= 64))
-        ):
-            block_ks += (256,)
-        if bm <= 32 and bn <= 64 and wm * wn <= 2:
-            block_ks += (512,)
-        for bk in block_ks:
-            panels = tuple(
-                panel
-                for panel in (16, 32, 64, 128, 256)
-                if _m_normal_resources(*geometry, panel, 1, bk) is not None
-            )
-            if not panels:
-                continue
-            main_panel = panels[-1]
-            resource = _m_normal_resources(*geometry, main_panel, 1, bk)
-            normal_caches = _B_CACHE_PAIRS
-            if bk == 512:
-                normal_caches = (
-                    _B_CACHE_PAIRS + _M_SMALL_STORE_CACHE_PAIRS
-                    if bn <= 32
-                    else ((0, 0),)
-                )
-            for caches in normal_caches:
-                yield from profile(geometry, main_panel, 1, caches, 0, bk)
-            for split in (2, 4):
-                yield from profile(geometry, main_panel, split, (0, 0), 0, bk)
-            if bk == 128 and wm == 4 and wn == 2 and bm >= 128 and bn <= 128:
-                yield from profile(geometry, main_panel, 4, (1, 17), 0, bk)
-            if bk == 128 and wm == 4 and wn == 2 and bm >= 128 and bn >= 128:
-                yield from profile(geometry, main_panel, 1, (0, 0), 4, bk)
-
-            if (
-                (bk == 128 and bm >= 48 and bn >= 64)
-                or (bk == 256 and bm >= 128 and bn >= 128)
-                or (bk == 512 and bm <= 32 and bn <= 32)
-            ):
-                yield from profile(geometry, 16, 1, (0, 0), 0, bk)
-
-            if bk == 128 and bm >= 64 and bn >= 64:
-                budgets = (16 * 1024,) if wm == 4 else (8 * 1024,)
-                middle_caches = ((0, 0), (1, 17))
-            elif bk == 256 and bm >= 64:
-                budgets = (
-                    (8 * 1024, 16 * 1024)
-                    if resource["em"] == 3
-                    else ((16 * 1024,) if resource["em"] == 1 else (8 * 1024,))
-                )
-                middle_caches = _B_CACHE_PAIRS
-            else:
-                budgets, middle_caches = (), ()
-            for budget in budgets:
-                fits = [
-                    panel
-                    for panel in panels
-                    if panel * resource["sfa_panel_pitch"] <= budget
-                ]
-                if fits:
-                    for caches in middle_caches:
-                        yield from profile(geometry, fits[-1], 1, caches, 0, bk)
-            if bk == 256 and bm <= 32 and wm == wn == 2:
-                yield from profile(
-                    geometry, resource["threads"] // 4, 1, (1, 17), 0, bk
-                )
-
-            if bk == 128 and bm <= 96 and bn <= 64 and wm * wn <= 4:
-                short_panels = (4, 8) if bm <= 32 else ((4,) if wm >= 2 else (8,))
-                for panel in short_panels:
-                    caches = _B_CACHE_PAIRS
-                    if bm <= 32 and bn <= 32:
-                        caches += ((0, 2), (1, 2)) if panel == 4 else ((0, 2),)
-                    for pair in caches:
-                        yield from profile(geometry, panel, 1, pair, 0, bk)
-            elif bk == 256 and bm <= 32 and bn <= 32 and wm * wn <= 2:
-                for caches in ((0, 0), (0, 2)):
-                    yield from profile(geometry, 8, 1, caches, 0, bk)
-            elif bk == 512 and bm <= 32 and bn <= 32 and wm * wn <= 2:
-                for caches in ((0, 2), (17, 1), (17, 2)):
-                    yield from profile(geometry, 8, 1, caches, 0, bk)
-
-    # Append BK1024 after existing IDs.
-    for geometry in (
-        (16, 16, 1, 1),
-        (16, 32, 1, 1),
-        (16, 32, 1, 2),
-        (32, 16, 1, 1),
-        (32, 32, 1, 2),
-    ):
-        panel = 64 * geometry[2] * geometry[3]
-        for caches in _B_CACHE_PAIRS + _M_SMALL_STORE_CACHE_PAIRS:
-            yield from profile(geometry, panel, 1, caches, 0, 1024)
-
-
-def _small_m_jit_configs():
-    """Generate distinct full traits with C++-owned runtime-K host resources."""
-    for (
-        bm,
-        bn,
-        wm,
-        wn,
-        panel,
-        split,
-        caches,
-        group_m,
-        bk,
-    ) in _small_m_parameters():
-        ca, cb = caches
-        values = (bm, bn, wm, wn, panel, split, ca, cb, group_m)
-        if bk != 128:
-            values += (bk,)
-        traits = _bpreshuffle_cpp_traits(_B_PREFIX + "staged_b_traits", values)
-        instance = _b_instance(bm, bn, bk, wm, wn, 1, ca, cb, split)
-        instance["max_k"] = split * panel * 128
-        entry = {
-            "traits": traits,
-            "pipeline": "staged_b",
-            "static_lds_bytes": _m_normal_resources(
-                bm, bn, wm, wn, panel, split, bk, ca, cb, group_m
-            )["normal_lds_bytes"],
-            "m_align": 1,
-            "pad_n": False,
-            **_b_workspace_entry(split),
-        }
-        yield instance, entry
-
-
-def _small_jit_configs():
-    """Generate each legal direct-B/staged-B configuration once."""
-    for generate in (_small_b_jit_configs, _small_m_jit_configs):
-        yield from generate()
-
-
-def _small_bpreshuffle_config_name(parameters, entry):
-    """Name the independent small pipelines by their variable resource axes."""
-    bm, bn, bk = (parameters[key] for key in ("B_M", "B_N", "B_K"))
-    wm, wn = parameters["T_M"], parameters["T_N"]
-    body = entry["traits"].split("<", 1)[1].rstrip(">")
-    values = tuple(int(value.strip()) for value in body.split(","))
-    pipeline = entry["pipeline"]
-    parts = [pipeline, f"m{bm}n{bn}k{bk}", f"w{wm}x{wn}"]
-    if pipeline == "direct_b":
-        parts += [f"p{values[5]}", f"bd{values[6]}", f"sv{values[10]}"]
-    elif pipeline == "staged_b":
-        parts.append(f"sp{values[4]}")
-        if values[8]:
-            parts.append(f"gm{values[8]}")
-    else:
-        raise ValueError(f"Unknown small pipeline: {pipeline}")
-    if parameters["WG_PER_CU"] != 1:
-        parts.append(f"wg{parameters['WG_PER_CU']}")
-    ca, cb = parameters["cachectl_a"], parameters["cachectl_b"]
-    if ca or cb:
-        parts.append(f"ca{ca}cb{cb}")
-    if entry["split_k"] != 1:
-        parts.append(f"sk{entry['split_k']}")
-    return "_".join(parts)
-
-
-def _install_small_shape_kernels():
-    tables = KERNEL_REGISTRY["a8w8_blockscale_bpreshuffle"]["gfx950"]
-    for kid, (parameters, entry) in enumerate(_small_jit_configs(), start=6300):
-        pipeline = entry["pipeline"]
-        config_name = _small_bpreshuffle_config_name(parameters, entry)
-        entry.update(
-            kid=kid,
-            small_shape=True,
-            config_name=config_name,
-            kernel=f"opus_gemm_bpreshuffle_{pipeline}_kernel",
-            headers=[
-                f"gfx950/opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_{pipeline}_gfx950.cuh"
-            ],
-        )
-        if entry.get("host_kind") == "reduce":
-            entry["headers"].insert(0, "gfx950/splitk_reduce_gfx950.cuh")
-        instance = OpusGemmInstance(**parameters, bpreshuffle_entry=entry)
-        for table in tables.values():
-            if kid in table:
-                raise ValueError(f"small-shape kid {kid} collides with the PR catalog")
-            table[kid] = instance
-        a8w8_blockscale_mxscale_gemm_bpreshuffle_kernels_list[kid] = instance
-
-
-_install_small_shape_kernels()
