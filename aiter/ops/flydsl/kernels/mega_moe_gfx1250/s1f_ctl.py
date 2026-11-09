@@ -316,8 +316,14 @@ class _Stage1Fusion:
         return self.enabled and not self.tile_reasons(align_m)
 
     def _g1_key(self):
+        # GEMM1 picks its CSV row by _get_padded_m(recv_bound), so the probe
+        # result holds for the whole bucket. Keying by the exact bound made
+        # every eager prefill step (a new token sum each time) probe and fall
+        # back instead of running the stage-1 kernel.
+        from aiter.ops.flydsl.grouped_moe_gfx1250 import _get_padded_m
+
         step = self.d._step
-        return (int(step.align_m), int(step.recv_bound))
+        return (int(step.align_m), int(_get_padded_m(int(step.recv_bound))))
 
     def _recv_too_big(self) -> bool:
         # The receive bound is identical on every rank.
