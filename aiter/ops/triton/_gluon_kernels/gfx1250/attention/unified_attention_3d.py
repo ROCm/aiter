@@ -1955,7 +1955,7 @@ def get_seq_metadata(
     seq_len = gl.load(seq_lens_ptr + seq_idx)
 
     if segm_tiles_ptr is not None:
-        # token split: every sequence's segments cover the same number of tiles,
+        # split rebalance: every sequence's segments cover the same number of tiles,
         # so a long sequence gets more segments rather than longer ones
         tiles_per_segment = gl.load(segm_tiles_ptr)
     else:
@@ -2065,7 +2065,7 @@ def _unified_attention_gluon_kernel_3d(
     k_scale_ptr,  # [1, ], float32
     v_scale_ptr,  # [1, ], float32v
     out_scale_ptr,  # [1, ], float32
-    segm_tiles_ptr,  # [1, ] int32 tiles a KV segment covers (token split), or None
+    segm_tiles_ptr,  # [1, ] int32 tiles a KV segment covers (split rebalance), or None
     softcap,  # float32
     num_seqs: gl.int32,  # int
     num_blocks: gl.int32,  # int

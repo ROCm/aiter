@@ -1019,7 +1019,7 @@ def reduce_segments(
     num_seqs,  # int
     num_query_heads: tl.constexpr,  # int
     out_scale_ptr,  # float32
-    segm_tiles_ptr,  # [1] int32 tiles a KV segment covers (token split), or None
+    segm_tiles_ptr,  # [1] int32 tiles a KV segment covers (split rebalance), or None
     output_stride_0: tl.int64,  # int
     output_stride_1: tl.int64,  # int, should be equal to head_size
     block_table_stride: tl.int64,  # int
@@ -1065,7 +1065,7 @@ def reduce_segments(
     # number of segments for this particular sequence
     num_segments = NUM_SEGMENTS_PER_SEQ
     if segm_tiles_ptr is not None:
-        # gfx1250 token split: every segment covers the same number of tiles
+        # gfx1250 split rebalance: every segment covers the same number of tiles
         tiles_per_segment = tl.load(segm_tiles_ptr)
         # create masks for subsequent loads
         act_num_segments = cdiv_fn(seq_len, tiles_per_segment * TILE_SIZE)
@@ -1256,7 +1256,7 @@ def _floor_div_pos(a, b: tl.constexpr):
 
 
 @triton.jit
-def gfx12_token_split_tiles(
+def unified_attention_3d_split_rebalance_kernel(
     seqused_k_ptr,  # [num_seqs]
     segm_tiles_ptr,  # [1] int32, out
     num_seqs,
@@ -1268,7 +1268,7 @@ def gfx12_token_split_tiles(
     MAX_TILES: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    """The gfx1250 token split's tiles per segment, in one program.
+    """The gfx1250 split rebalance's tiles per segment, in one program.
 
     The same integer arithmetic as the torch expression it replaces, so the
     result is bitwise the same for every input:

@@ -23,7 +23,7 @@ def reduce_segments_gluon(
     seq_lens_ptr,  # [num_seqs]
     num_query_heads,
     out_scale_ptr,  # float32 or None
-    segm_tiles_ptr,  # [1] int32 tiles a KV segment covers (token split), or None
+    segm_tiles_ptr,  # [1] int32 tiles a KV segment covers (split rebalance), or None
     output_stride_0,
     output_stride_1,
     H: gl.constexpr,
