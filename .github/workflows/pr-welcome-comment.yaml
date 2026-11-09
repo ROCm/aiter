@@ -23,13 +23,14 @@ jobs:
 
             **Runs automatically on every PR:**
             - ✅ Pre-checks (submodule verification, code formatting)
-            - ✅ Aiter op tests (gfx942 + gfx950)
+            - ✅ Aiter standard tests on MI35X
             - ✅ Triton tests on MI35X (only when \`aiter/ops/triton/**\` or related paths are changed)
 
             **Extended tests (opt-in via labels):**
 
             | Label | Tests |
             |-------|-------|
+            | \`ci:mi300x\` | Run Aiter standard tests on MI300X in PRs; main branch always runs them |
             | \`ci:gfx1250-ffm-triton\` | Run the five-shard gfx1250 FFM Triton test suite |
             | \`ci:triton-300x\` | Run an additional Triton test job on MI300X in PRs (added automatically when gfx942 configs change); main branch always runs both MI35X and MI300X |
             | \`ci:triton-355\` | Run the full Triton test suite on MI35X, not only the tests the change affects |
