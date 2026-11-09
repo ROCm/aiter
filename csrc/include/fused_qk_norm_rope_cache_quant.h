@@ -58,6 +58,8 @@ void fused_qk_norm_rope_cache_pts_quant_shuffle(aiter_tensor_t& qkv,
                                                 bool v_norm        = false,
                                                 std::optional<aiter_tensor_t> q_out_fp8 = std::nullopt,
                                                 std::optional<aiter_tensor_t> per_tensor_q_scale =
+                                                    std::nullopt,
+                                                std::optional<aiter_tensor_t> k_out_unquantized =
                                                     std::nullopt);
 
 void fused_qk_norm_rope_2way(aiter_tensor_t& q0,

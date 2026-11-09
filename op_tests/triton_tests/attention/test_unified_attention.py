@@ -313,6 +313,7 @@ def ref_paged_attn(
     v_descale: torch.Tensor | None = None,
     output_scale: torch.Tensor | None = None,
     causal: int = 1,
+    qq_bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     num_seqs = len(query_lens)
     _, block_size, num_kv_heads, head_size = key_cache.shape
@@ -359,6 +360,8 @@ def ref_paged_attn(
             mask |= sliding_window_mask
         if soft_cap is not None and soft_cap > 0:
             attn = soft_cap * torch.tanh(attn / soft_cap)
+        if qq_bias is not None:
+            attn[:, :, kv_len - query_len :] += qq_bias[:query_len, :query_len]
         if causal:
             attn.masked_fill_(mask, float("-inf"))
         if sinks is not None:
@@ -741,6 +744,283 @@ def test_triton_unified_attn(
         )
 
 
+# Query lengths that leave padded rows in the last query block (BLOCK_Q of 2/4/8),
+# on the 3D split-KV path (long KV) and the 2D path (KV <= 512).
+@pytest.mark.parametrize(
+    "num_heads, query_len, kv_len",
+    [
+        ((32, 8), 3, 4096),
+        ((32, 8), 4, 4096),
+        ((16, 1), 3, 4096),
+        ((32, 8), 3, 256),
+        ((32, 8), 5, 256),
+    ],
+)
+@torch.inference_mode()
+def test_triton_unified_attn_qq_bias_padded_query_rows(
+    num_heads: tuple[int, int], query_len: int, kv_len: int
+) -> None:
+    if DEVICE_ARCH == "gfx1250":
+        pytest.skip("gfx1250 Gluon kernel does not mask padded qq_bias rows")
+    seq_lens = [(query_len, kv_len)] * 2
+    (
+        query,
+        key_cache_orig,
+        value_cache_orig,
+        key_cache,
+        value_cache,
+        _sinks,
+        output,
+        cu_query_lens,
+        kv_lens,
+        max_query_len,
+        max_kv_len,
+        scale,
+        window_size,
+        block_tables,
+        *_,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        num_blocks=2048,
+        block_size=16,
+        head_size=128,
+        num_heads=num_heads,
+        device="cuda",
+    )
+    qq_bias = torch.randn(query_len, query_len, dtype=torch.float32, device="cuda")
+
+    unified_attention(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=max_query_len,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window_size,
+        block_table=block_tables,
+        softcap=0,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        qq_bias=qq_bias,
+        backend="triton",
+    )
+
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache_orig,
+        value_cache=value_cache_orig,
+        query_lens=[x[0] for x in seq_lens],
+        kv_lens=[x[1] for x in seq_lens],
+        block_tables=block_tables,
+        scale=scale,
+        out_dtype=output.dtype,
+        qq_bias=qq_bias,
+    )
+    torch.testing.assert_close(
+        output.to(torch.float32), ref_output.to(torch.float32), atol=1.5e-2, rtol=1e-2
+    )
+
+
+@pytest.mark.parametrize("seq_lens", [[(448, 1344)], [(400, 1200)]])
+@torch.inference_mode()
+def test_triton_unified_attn_3d_padded_query_rows_deterministic(
+    seq_lens: list[tuple[int, int]],
+) -> None:
+    """Split-KV prefill gives the same output on each run. With 3 query heads
+    for each KV head, BLOCK_M has rows past BLOCK_Q tokens. These rows must not
+    store the segment stats of the next q block."""
+    (
+        query,
+        _key_cache_orig,
+        _value_cache_orig,
+        key_cache,
+        value_cache,
+        _sinks,
+        output,
+        cu_query_lens,
+        kv_lens,
+        max_query_len,
+        max_kv_len,
+        scale,
+        window_size,
+        block_tables,
+        *_,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        num_blocks=64,
+        block_size=64,
+        head_size=64,
+        num_heads=(12, 4),
+        device="cuda",
+    )
+
+    def run() -> torch.Tensor:
+        out = torch.empty_like(output)
+        unified_attention(
+            q=query,
+            k=key_cache,
+            v=value_cache,
+            out=out,
+            cu_seqlens_q=cu_query_lens,
+            seqused_k=kv_lens,
+            max_seqlen_q=max_query_len,
+            max_seqlen_k=max_kv_len,
+            softmax_scale=scale,
+            causal=True,
+            window_size=window_size,
+            block_table=block_tables,
+            softcap=0,
+            q_descale=None,
+            k_descale=None,
+            v_descale=None,
+            backend="triton",
+        )
+        return out
+
+    expected = run()
+    for _ in range(20):
+        assert torch.equal(run(), expected)
+
+
+@pytest.mark.parametrize(
+    "seq_lens, num_heads, block_size, sliding_window",
+    [
+        ([(4, 3000), (8, 40000), (1, 9000)], (16, 2), 16, 2048),
+        ([(8, 8704)], (16, 2), 128, 2048),
+        ([(8, 582), (1, 582)], (16, 2), 64, 512),
+        ([(1, 8704)] * 4, (16, 2), 16, 2048),
+        ([(128, 1100)], (32, 32), 64, 1024),
+        ([(17, 1100)], (32, 32), 64, 1024),
+    ],
+)
+@torch.inference_mode()
+def test_triton_unified_attn_sw_verify_split(
+    seq_lens, num_heads, block_size, sliding_window
+):
+    if DEVICE_ARCH != "gfx950" or not _is_gluon_available():
+        pytest.skip("gfx950 gluon split dispatch")
+    query_lens = [q for q, _ in seq_lens]
+    kv_lens = [kv for _, kv in seq_lens]
+    max_q = max(query_lens)
+    q, k, v, _, _, sinks, out, cu_q, kv_lens_t, _, max_k, scale, window, table = (
+        generate_data(
+            seq_lens,
+            num_blocks=len(seq_lens) * -(-max(kv_lens) // block_size),
+            block_size=block_size,
+            num_heads=num_heads,
+            sliding_window=sliding_window,
+        )[:14]
+    )
+    sinks = sinks + 8.0
+    ref = ref_paged_attn(
+        q,
+        k,
+        v,
+        query_lens,
+        kv_lens,
+        table,
+        scale,
+        torch.bfloat16,
+        sliding_window,
+        sinks=sinks,
+    ).float()
+
+    first = [max(0, kv - ql - sliding_window + 1) // block_size for ql, kv in seq_lens]
+    width = (sliding_window + max_q + block_size - 2) // block_size + 1
+    index = torch.tensor(first, device="cuda")[:, None] + torch.arange(
+        width, device="cuda"
+    )
+    trimmed_lens = [kv - fb * block_size for kv, fb in zip(kv_lens, first)]
+    assert max(trimmed_lens) <= sliding_window + max_q + block_size - 2
+
+    for block_table, lens, max_seqlen_k in [
+        (table, kv_lens_t, max_k),
+        (
+            table.gather(1, index.clamp(max=table.shape[1] - 1)),
+            torch.tensor(trimmed_lens, dtype=torch.int32, device="cuda"),
+            max(trimmed_lens),
+        ),
+    ]:
+        out = torch.empty_like(out)
+        unified_attention(
+            q=q,
+            k=k,
+            v=v,
+            out=out,
+            cu_seqlens_q=cu_q,
+            max_seqlen_q=max_q,
+            seqused_k=lens,
+            max_seqlen_k=max_seqlen_k,
+            softmax_scale=scale,
+            causal=True,
+            window_size=window,
+            block_table=block_table,
+            softcap=0,
+            q_descale=None,
+            k_descale=None,
+            v_descale=None,
+            sinks=sinks,
+        )
+        torch.testing.assert_close(out.float(), ref, atol=1.5e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize(
+    "seq_lens, num_heads, block_size",
+    [
+        ([(8, 10246)], (16, 2), 8192),
+        ([(8, 6150), (1, 6150)], (8, 1), 4096),
+    ],
+)
+@torch.inference_mode()
+def test_triton_unified_attn_sw_split_no_sinks(seq_lens, num_heads, block_size):
+    # a page much longer than a tile leaves 32+ empty leading segments, a whole
+    # reduce chunk at head 256, which without sinks has no finite max
+    if DEVICE_ARCH != "gfx950" or not _is_gluon_available():
+        pytest.skip("gfx950 gluon split dispatch")
+
+    sliding_window = 2048
+    query_lens = [q for q, _ in seq_lens]
+    kv_lens = [kv for _, kv in seq_lens]
+    q, k, v, _, _, _, out, cu_q, kv_lens_t, max_q, max_k, scale, window, table = (
+        generate_data(
+            seq_lens,
+            num_blocks=len(seq_lens) * -(-max(kv_lens) // block_size),
+            block_size=block_size,
+            head_size=256,
+            num_heads=num_heads,
+            sliding_window=sliding_window,
+        )[:14]
+    )
+    ref = ref_paged_attn(
+        q, k, v, query_lens, kv_lens, table, scale, torch.bfloat16, sliding_window
+    ).float()
+
+    unified_attention(
+        q=q,
+        k=k,
+        v=v,
+        out=out,
+        cu_seqlens_q=cu_q,
+        max_seqlen_q=max_q,
+        seqused_k=kv_lens_t,
+        max_seqlen_k=max_k,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window,
+        block_table=table,
+        softcap=0,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+    )
+    torch.testing.assert_close(out.float(), ref, atol=1.5e-2, rtol=1e-2)
+
+
 @pytest.mark.parametrize(
     "seq_lens",
     [
@@ -1117,6 +1397,205 @@ def test_unified_attn_spec_verify_gfx1250(
         sliding_window=sliding_window,
         soft_cap=None,
         sinks=None,
+    )
+    assert not output.isnan().any()
+    torch.testing.assert_close(output, ref_output, atol=1.5e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("path", ["3d", "2d", "auto"])
+@pytest.mark.parametrize("shuffled_kv_cache", [True, False])
+@pytest.mark.parametrize("query_len", [4, 16, 32])
+@pytest.mark.parametrize("num_heads", [(16, 2), (4, 1)])
+@pytest.mark.parametrize("head_size", [128, 256])
+@pytest.mark.parametrize("block_size", [16, 64])
+@pytest.mark.parametrize("batch, num_pad", [(5, 0), (37, 3)])
+@torch.inference_mode()
+def test_unified_attn_equal_seqlen_q_gfx1250(
+    path: str,
+    shuffled_kv_cache: bool,
+    query_len: int,
+    num_heads: tuple[int, int],
+    head_size: int,
+    block_size: int,
+    batch: int,
+    num_pad: int,
+    monkeypatch,
+) -> None:
+    """equal_seqlen_q=True on gfx1250: the kernels index seq i's queries at rows
+    [i, i + 1) * max_seqlen_q instead of searching cu_seqlens_q. Covers one and
+    several query blocks a sequence (query_len * num_queries_per_kv against
+    BLOCK_M), both KV layouts, and trailing pad seqs as a DP-padded batch has
+    them: no query rows behind them and seqused_k == 0, which must neither
+    shift the real seqs' rows nor write past them."""
+    if DEVICE_ARCH != "gfx1250":
+        pytest.skip("gfx1250 Gluon kernels")
+    if path == "3d" and not shuffled_kv_cache:
+        pytest.skip("the gfx1250 3D Gluon kernel needs the shuffled KV cache")
+    if path == "auto" and not shuffled_kv_cache:
+        # short queries route to 3D, which without the shuffled cache is the Triton
+        # 3D kernel; it misses the reference here with or without equal_seqlen_q
+        pytest.skip("unshuffled short queries route to the Triton 3D kernel")
+    if path != "auto":
+        monkeypatch.setattr(
+            sys.modules[unified_attention.__module__],
+            "use_2d_kernel",
+            lambda params, backend="triton": path == "2d",
+        )
+    rng = random.Random(batch * 1000 + query_len)
+    seq_lens = [(query_len, rng.randint(query_len, 3000)) for _ in range(batch)]
+    (
+        query,
+        key_cache_orig,
+        value_cache_orig,
+        key_cache,
+        value_cache,
+        _sinks,
+        _output,
+        cu_query_lens,
+        kv_lens,
+        max_seqlen_q,
+        max_kv_len,
+        scale,
+        window_size,
+        block_tables,
+        *_,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        num_blocks=batch * (3000 // block_size + 1) + 64,
+        block_size=block_size,
+        head_size=head_size,
+        num_heads=num_heads,
+        shuffled_kv_cache=shuffled_kv_cache,
+        device="cuda",
+    )
+    num_tokens = batch * query_len
+    # Trailing pad seqs: cu_seqlens_q repeats the last offset, no KV, any block table.
+    cu_seqlens_q = torch.cat([cu_query_lens, cu_query_lens[-1:].repeat(num_pad)])
+    seqused_k = torch.cat(
+        [kv_lens, torch.zeros(num_pad, dtype=kv_lens.dtype, device=kv_lens.device)]
+    )
+    block_table = torch.cat([block_tables, block_tables[:1].repeat(num_pad, 1)])
+    # out is a view into a larger buffer: rows past the real tokens must stay intact.
+    sentinel = 7.0
+    out_buf = torch.full(
+        (num_tokens + (num_pad + 1) * query_len, num_heads[0], head_size),
+        sentinel,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    output = out_buf[:num_tokens]
+    unified_attention(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        out=output,
+        cu_seqlens_q=cu_seqlens_q,
+        seqused_k=seqused_k,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window_size,
+        block_table=block_table,
+        softcap=0,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        sinks=None,
+        shuffled_kv_cache=shuffled_kv_cache,
+        equal_seqlen_q=True,
+    )
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache_orig,
+        value_cache=value_cache_orig,
+        query_lens=[q for q, _ in seq_lens],
+        kv_lens=[k for _, k in seq_lens],
+        block_tables=block_tables,
+        scale=scale,
+        out_dtype=torch.bfloat16,
+    )
+    assert not output.isnan().any()
+    torch.testing.assert_close(output, ref_output, atol=1.5e-2, rtol=1e-2)
+    assert (out_buf[num_tokens:] == sentinel).all(), "wrote past the real tokens"
+
+
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        # uneven: a big chunk over a short context next to a few tokens over a long one
+        # -> 3D above the program cap, with the split widened
+        [(3000, 6000), (8, 20000)],
+        # even and long: two 4000-token chunks over 20k contexts -> 2D, wider block/tile
+        [(4000, 20000), (4000, 20000)],
+        # fresh prompts: untouched by the hint
+        [(2048, 2048), (1024, 1024)],
+    ],
+)
+@pytest.mark.parametrize("with_hint", [True, False])
+@torch.inference_mode()
+def test_unified_attn_attn_work_gfx1250(seq_lens, with_hint: bool) -> None:
+    """The optional attn_work hint (sum of q x (k - q / 2)) only steers the gfx1250
+    prefill routing and config; the output must match the reference either way."""
+    if DEVICE_ARCH != "gfx1250":
+        pytest.skip("gfx1250 Gluon kernels")
+    block_size, head_size, num_heads = 64, 256, (4, 1)
+    (
+        query,
+        key_cache_orig,
+        value_cache_orig,
+        key_cache,
+        value_cache,
+        _sinks,
+        output,
+        cu_query_lens,
+        kv_lens,
+        max_seqlen_q,
+        max_kv_len,
+        scale,
+        window_size,
+        block_tables,
+        *_,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        num_blocks=len(seq_lens) * (max(k for _, k in seq_lens) // block_size + 1) + 64,
+        block_size=block_size,
+        head_size=head_size,
+        num_heads=num_heads,
+        shuffled_kv_cache=True,
+        device="cuda",
+    )
+    attn_work = int(sum(q * (k - q / 2) for q, k in seq_lens)) if with_hint else None
+    unified_attention(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window_size,
+        block_table=block_tables,
+        softcap=0,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        sinks=None,
+        shuffled_kv_cache=True,
+        attn_work=attn_work,
+    )
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache_orig,
+        value_cache=value_cache_orig,
+        query_lens=[q for q, _ in seq_lens],
+        kv_lens=[k for _, k in seq_lens],
+        block_tables=block_tables,
+        scale=scale,
+        out_dtype=torch.bfloat16,
     )
     assert not output.isnan().any()
     torch.testing.assert_close(output, ref_output, atol=1.5e-2, rtol=1e-2)

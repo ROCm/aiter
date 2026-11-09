@@ -958,7 +958,9 @@ class AttentionProgram:
     ):
         casted_out = out.to(self.output_ptr.dtype.element_ty)
 
-        if USE_TDM and self.cfg.ARCH_NAME == "gfx1250":
+        if USE_TDM and (
+            self.cfg.ARCH_NAME == "gfx1250" or self.cfg.ARCH_NAME == "gfx1250-strict"
+        ):
             STORE_COLS: gl.constexpr = self.cfg.NUM_QUERIES_PER_KV * self.cfg.HEAD_SIZE
             o_smem_layout: gl.constexpr = gl.SwizzledSharedLayout(
                 vec=1, per_phase=1, max_phase=1, order=[1, 0]
@@ -1275,11 +1277,14 @@ def attention_loop_reordered(pgm, kv_loader, q, M, L, acc):
     """
     cfg: gl.constexpr = pgm.cfg
     # Merged TDM waits require 3 buffers so V_{i+1} can stay pending
-    MERGE_LOOP_TDM_WAITS: gl.constexpr = (
-        cfg.NUM_BUFFERS == 3 and pgm.cfg.ARCH_NAME == "gfx1250"
+    MERGE_LOOP_TDM_WAITS: gl.constexpr = cfg.NUM_BUFFERS == 3 and pgm.cfg.ARCH_NAME in (
+        "gfx1250",
+        "gfx1250-strict",
     )
     MERGE_EPI_TDM_WAITS: gl.constexpr = False
-    SPLIT_SOFTMAX0: gl.constexpr = pgm.cfg.ARCH_NAME == "gfx1250"
+    SPLIT_SOFTMAX0: gl.constexpr = (
+        pgm.cfg.ARCH_NAME == "gfx1250" or pgm.cfg.ARCH_NAME == "gfx1250-strict"
+    )
     SPLIT_SOFTMAX0_EPI: gl.constexpr = False
     # Buffer rotation: tile m lives in slot m%N (K and V use disjoint LDS regions).
     #   buf_tile_cur   -> tile i     ( i   %N)
@@ -1770,7 +1775,9 @@ def load_q(
     query_stride_0,
     USE_TDM_LOAD: gl.constexpr = False,
 ):
-    if USE_TDM_LOAD and cfg.ARCH_NAME == "gfx1250":
+    if USE_TDM_LOAD and (
+        cfg.ARCH_NAME == "gfx1250" or cfg.ARCH_NAME == "gfx1250-strict"
+    ):
         LOAD_COLS: gl.constexpr = cfg.NUM_QUERIES_PER_KV * cfg.HEAD_SIZE
         q_smem_layout: gl.constexpr = gl.SwizzledSharedLayout(
             vec=1, per_phase=1, max_phase=1, order=[1, 0]
@@ -1837,6 +1844,8 @@ unified_attention_gluon_kernel_2d_repr = make_kernel_repr(
         "HEAD_SIZE",
         "SLIDING_WINDOW",
         "ALL_DECODE",
+        "SPEC_DECODE",
+        "SEQLEN_Q",
         "SHUFFLED_KV_CACHE",
         "NUM_BUFFERS",
         "BLOCK_M",
@@ -1893,6 +1902,8 @@ def _unified_attention_gluon_kernel_2d(
     USE_LOAD_BUFFER_OP: gl.constexpr = False,
     USE_STORE_BUFFER_OP: gl.constexpr = False,
     ALL_DECODE: gl.constexpr = False,
+    SPEC_DECODE: gl.constexpr = False,  # every seq has SEQLEN_Q (> 1) queries
+    SEQLEN_Q: gl.constexpr = 1,  # the per-seq query count when SPEC_DECODE
     SHUFFLED_KV_CACHE: gl.constexpr = False,
     FP8_MIN: gl.constexpr = float8_info.min,
     FP8_MAX: gl.constexpr = float8_info.max,
@@ -1952,7 +1963,25 @@ def _unified_attention_gluon_kernel_2d(
         stride_v_cache_3,
     )
 
-    if not ALL_DECODE:
+    if SPEC_DECODE:
+        # Every seq holds SEQLEN_Q queries, so the launch has exactly
+        # Q_BLOCKS_PER_SEQ blocks per seq and the program id alone locates the
+        # seq and the query block: no binary search, and no empty blocks.
+        Q_BLOCKS_PER_SEQ: gl.constexpr = (SEQLEN_Q + BLOCK_Q - 1) // BLOCK_Q
+        if Q_BLOCKS_PER_SEQ == 1:
+            seq_idx = q_block_global_idx
+            q_block_local_idx: gl.int32 = 0
+        else:
+            seq_idx = q_block_global_idx // Q_BLOCKS_PER_SEQ
+            q_block_local_idx = q_block_global_idx % Q_BLOCKS_PER_SEQ
+        cur_batch_query_len: gl.int32 = SEQLEN_Q
+        cur_batch_in_all_start_index = seq_idx * SEQLEN_Q
+        # A pad seq (seqused_k == 0) need not have q/out rows behind it: under DP
+        # a rank's batch is padded past the rows it holds. Leave before q is read
+        # or out written; the search path does the same through its zero length.
+        if gl.load(seq_lens_ptr + seq_idx) == 0:
+            return
+    elif not ALL_DECODE:
         seq_idx = find_seq_idx(
             query_start_len_ptr, q_block_global_idx, num_seqs, cfg.BLOCK_Q
         )
