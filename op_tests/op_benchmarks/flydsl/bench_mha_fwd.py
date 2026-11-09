@@ -750,9 +750,16 @@ def main():
     )
     parser.add_argument(
         "--layout",
-        choices=["thd", "bshd"],
+        choices=["thd", "bshd", "paged"],
         default="thd",
         help="Layout for detailed-args mode (default thd).",
+    )
+    parser.add_argument(
+        "-p",
+        "--page-size",
+        type=int,
+        default=1,
+        help="KV cache page size for --layout paged (default 1).",
     )
     parser.add_argument(
         "-d",
@@ -888,6 +895,7 @@ def main():
                 "window": _parse_window(args.window),
                 "sink": args.sink,
                 "dtype": args.dtype or "bf16",
+                "page": args.page_size,
             }
         ]
     else:

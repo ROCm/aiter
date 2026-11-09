@@ -2497,8 +2497,6 @@ def build_fmha_fwd_prefill_a16w16_m32x8(
             stride_lse_head: fx.Int32,
             window_left: fx.Int32,
             window_right: fx.Int32,
-            max_seqlen_q: fx.Int32,
-            max_seqlen_k: fx.Int32,
             num_page_entries: fx.Int32,
             num_pool_rows: fx.Int32,
         ):
@@ -3167,8 +3165,6 @@ def _ensure_paged_kernel(
             stride_lse_head,
             window_left,
             window_right,
-            max_seqlen_q,
-            max_seqlen_k,
             num_page_entries,
             num_pool_rows,
         )
@@ -3549,7 +3545,7 @@ def flash_attn_paged_m32x8(
     lse=None,
     num_q_tiles_per_wave=None,
 ):
-    """Host entry — PAGED KV, qk_hdim in {64,128,256} / v_hdim in {64,128,256}, bf16 or fp16.
+    """Host entry — PAGED KV, qk_hdim in {64,128,192,256} / v_hdim in {64,128,256}, bf16 or fp16.
 
     ``k``/``v`` are the page pool, ``[num_blocks, page_size, nheads_k, hdim]`` (or
     ``[num_blocks, nheads_k, hdim]`` at page size 1). ``qo_indptr`` gives this batch's Q

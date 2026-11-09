@@ -821,7 +821,7 @@ def flydsl_flash_attn_paged_fwd(
     kv_indptr: torch.Tensor,
     kv_page_indices: torch.Tensor,
     *,
-    kv_last_page_lens: torch.Tensor | None = None,
+    kv_last_page_lens: torch.Tensor,
     max_seqlen_q: int | None = None,
     max_seqlen_k: int | None = None,
     softmax_scale: float | None = None,

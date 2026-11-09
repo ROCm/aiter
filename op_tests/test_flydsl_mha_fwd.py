@@ -1547,15 +1547,18 @@ def main():
             lse,
             sink,
             window,
-        ) in itertools.product(
-            [h for h in d_qk_v if _flydsl_serves(*h)],
-            thd_shapes,
-            paged_dtypes,
-            args.page_size,
-            causals,
-            lses,
-            sinks,
-            windows,
+        ) in _sample(
+            [
+                [h for h in d_qk_v if _flydsl_serves(*h)],
+                thd_shapes,
+                paged_dtypes,
+                args.page_size,
+                causals,
+                lses,
+                sinks,
+                windows,
+            ],
+            "paged",
         ):
             seqs_q, seqs_k, H_q, H_kv = shape
             rows.append(
