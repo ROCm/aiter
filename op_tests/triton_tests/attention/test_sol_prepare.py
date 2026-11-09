@@ -25,7 +25,12 @@ import torch._dynamo
 
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.triton.attention.sol_tilt import sol_jensen_cap, sol_q_abs_max
+from aiter.ops.triton.attention.sol_tilt import (
+    sol_jensen_cap,
+    sol_q_abs_max,
+    sol_tilt_factors,
+    sol_tilt_planes,
+)
 from aiter.ops.triton.attention.utils import (
     SOL_ATTN_TS_KV,
     SOL_ATTN_TS_QO,
@@ -890,6 +895,40 @@ def test_jensen_cap_scale_keeps_the_pooled_scale_backing(k_format, kv_tile, comp
     tail = _allocated_tail(scale)
     assert tail.numel() >= _allocated_tail(source).numel()
     assert not tail.any()
+
+
+@pytest.mark.parametrize("path", ["factors", "planes"])
+@pytest.mark.parametrize(
+    "v_shape",
+    [(1, 1024, 2, 128), (1, 4096, 2, 128), (2, 2048, 2, 128)],
+    ids=["shorter", "longer", "batch"],
+)
+def test_tilt_rejects_v_not_shaped_as_k(path, v_shape):
+    """The factor kernel loads V unmasked over K's extent, so a V shorter than K would be read
+    past its allocation; any other V shape is refused before the launch."""
+    fp8 = torch.float8_e4m3fn
+    kv_tile = SOL_ATTN_TS_KV
+    k = torch.randn(1, 2048, 2, 128, device="cuda").to(fp8)
+    v = torch.randn(v_shape, device="cuda").to(fp8)
+    q = torch.randn(1, 512, 2, 128, device="cuda").to(fp8)
+    mean = torch.zeros(1, k.shape[1] // kv_tile, 2, 128, device="cuda").to(fp8)
+    one = torch.ones(1, device="cuda")
+    with pytest.raises(ValueError, match="the tilt needs V shaped as K"):
+        if path == "factors":
+            sol_tilt_factors(q, k, v, one, one, one, mean, mean, 0.125, 2, kv_tile)
+        else:
+            sol_tilt_planes(
+                k,
+                v,
+                sol_q_abs_max(q),
+                mean,
+                mean,
+                0.125,
+                2,
+                kv_tile,
+                k_format="e4m3",
+                v_format="e4m3",
+            )
 
 
 def test_error_router_compiles_fullgraph_and_matches_eager():

@@ -428,6 +428,11 @@ def _tilt_factors(
             raise ValueError(
                 f"the tilt's factors take fp8, int8 or bf16 {name}, got {x.dtype}"
             )
+    # The factor kernel loads V unmasked over K's rows, heads and dims.
+    if v.shape != k.shape:
+        raise ValueError(
+            f"the tilt needs V shaped as K, got K {tuple(k.shape)} and V {tuple(v.shape)}"
+        )
     if not 1 <= rank <= d:
         raise ValueError(f"tilt rank must be in [1, {d}], got {rank}")
     full = seqlen_k // kv_tile
