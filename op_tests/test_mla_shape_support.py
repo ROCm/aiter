@@ -696,6 +696,34 @@ def test_planned_cp_mode_is_recorded_per_buffer(monkeypatch):
     assert _mla_planned_cp_round_robin(other) is False
 
 
+@pytest.mark.parametrize("first, replanned", [(False, True), (True, False)])
+def test_replanned_deep_copy_keeps_its_mode_for_the_next_copy(
+    monkeypatch, first, replanned
+):
+    # A deep copy replanned through a view must record the new mode for its own
+    # next deep copy too: the cell the copy carries is the one the replan updates.
+    monkeypatch.setattr(attention, "_get_mla_metadata_v1_impl", lambda *a, **k: None)
+    wmd = torch.zeros(2, dtype=torch.uint64)
+    idx = torch.zeros(3, dtype=torch.int32)
+
+    def plan(work_metadata_ptrs, cprr):
+        aiter.get_mla_metadata_v1(
+            *(idx, idx, idx, 96, 1, False, work_metadata_ptrs, *(idx,) * 5),
+            is_cp_round_robin=cprr,
+        )
+
+    plan(wmd, first)
+    snapshot = copy.deepcopy(wmd)
+    assert _mla_planned_cp_round_robin(snapshot) is first
+    plan(snapshot[:], replanned)
+    assert _mla_planned_cp_round_robin(snapshot) is replanned
+    assert _mla_planned_cp_round_robin(snapshot[:]) is replanned
+    assert _mla_planned_cp_round_robin(copy.deepcopy(snapshot)) is replanned
+    assert _mla_planned_cp_round_robin(copy.deepcopy(snapshot[:])) is None
+    # The buffer it was copied from is a separate buffer and keeps its own mode.
+    assert _mla_planned_cp_round_robin(wmd) is first
+
+
 def _cp_changes_head_fold(n, msq):
     plain, cprr = (
         get_mla_decode_shape_support(n, msq, dtypes.fp8, dtypes.fp8, **_cp(rr))

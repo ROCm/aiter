@@ -2605,7 +2605,18 @@ def _mla_planned_cp_cell(
         cells = {}
         setattr(storage, _MLA_PLANNED_CP_ATTR, cells)
     if cell is None:
-        cell = cells[work_metadata_ptrs.data_ptr()] = _MlaPlannedCp()
+        # A deep copy carries its cell on the tensor but not on its new storage.
+        # Adopt that cell for the same buffer address, so a replan through a view
+        # updates the one the copy (and its next deep copy) reads.
+        base = work_metadata_ptrs._base
+        cell = getattr(work_metadata_ptrs, _MLA_PLANNED_CP_ATTR, None)
+        if (
+            cell is None
+            and base is not None
+            and base.data_ptr() == work_metadata_ptrs.data_ptr()
+        ):
+            cell = getattr(base, _MLA_PLANNED_CP_ATTR, None)
+        cell = cells[work_metadata_ptrs.data_ptr()] = cell or _MlaPlannedCp()
     setattr(work_metadata_ptrs, _MLA_PLANNED_CP_ATTR, cell)
     return cell
 
