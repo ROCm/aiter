@@ -16,8 +16,10 @@ from .common import _ptr
 
 
 @functools.cache
-def sorted_sum(TOPK, N):
+def sorted_sum(TOPK, N, output_padding_bytes=0):
     assert N % 256 == 0
+    assert output_padding_bytes in (0, 32, 64, 128)
+    input_row_stride = N + output_padding_bytes // 2
     num_threads = 64 if N % 512 == 0 else 32
 
     @flyc.kernel(known_block_size=[num_threads, 1, 1])
@@ -25,6 +27,8 @@ def sorted_sum(TOPK, N):
         batch = fx.block_idx.x
         loc_ids += batch * TOPK
         token_locs = [loc_ids[topk] for topk in fx.range_constexpr(TOPK)]
+        # Sorting gives -1 to routes merged as repeated expert IDs of a token.
+        valid = [loc >= 0 for loc in token_locs]
 
         copy_bits = 128
         copy_atom = fx.make_copy_atom(fx.UniversalCopy(copy_bits), A.dtype)
@@ -39,7 +43,8 @@ def sorted_sum(TOPK, N):
         )
 
         token_ptrs = [
-            (A + fx.Int64(token_locs[topk]) * N) for topk in fx.range_constexpr(TOPK)
+            (A + fx.Int64(valid[topk].select(token_locs[topk], 0)) * input_row_stride)
+            for topk in fx.range_constexpr(TOPK)
         ]
 
         def load_atom(topk_id, off):
@@ -54,10 +59,9 @@ def sorted_sum(TOPK, N):
             column = col[0].to_py_value()
             frag = [load_atom(topk, column) for topk in fx.range_constexpr(TOPK)]
 
-            vec_sum = frag[0].load().to(fx.Float32)
+            vec_sum = valid[0].select(frag[0].load().to(fx.Float32), 0.0)
             for m in fx.range_constexpr(1, TOPK):
-                vec = frag[m].load().to(fx.Float32)
-                vec_sum += vec
+                vec_sum += valid[m].select(frag[m].load().to(fx.Float32), 0.0)
 
             vec_sum = vec_sum.to(dst.dtype)
 
@@ -88,66 +92,6 @@ def sorted_sum(TOPK, N):
             _ptr(A),
             _ptr(B),
             batch_size,
-            stream,
-        )
-
-    return callable
-
-
-@functools.cache
-def invert_sorted_ids(TOPK):
-    num_threads = 64
-
-    @flyc.kernel(known_block_size=[num_threads, 1, 1])
-    def invert_sorted_ids_kernel(
-        sorted_ids: fx.Pointer,
-        invert: fx.Pointer,
-        p_num_valid: fx.Pointer,
-        num_ids: fx.Uint32,
-        batch_size: fx.Uint32,
-    ):
-        batch = fx.block_idx.x
-        tid = fx.thread_idx.x
-        slot = batch * num_threads + tid
-        # Ignore the uninitialized tail beyond num_valid.
-        num_valid = p_num_valid[0].to(fx.Uint32)
-        if slot < num_valid:
-            sid = sorted_ids[slot].to(fx.Uint32)
-            tok_id = sid & 0xFFFFFF
-            top_id = sid >> 24
-            idx = tok_id * TOPK + top_id
-            if top_id < TOPK and tok_id < batch_size:
-                invert[idx] = fx.Uint32(slot)
-
-    @flyc.jit
-    def launch(
-        sorted_ids: fx.Pointer,
-        invert: fx.Pointer,
-        p_num_valid: fx.Pointer,
-        num_ids: fx.Uint32,
-        batch_size: fx.Uint32,
-        stream,
-    ):
-        grid_size = fxh.div_up(num_ids, num_threads)
-        invert_sorted_ids_kernel(
-            sorted_ids, invert, p_num_valid, num_ids, batch_size
-        ).launch(grid=(grid_size, 1, 1), block=(num_threads, 1, 1), stream=stream)
-
-    def callable(
-        sorted_ids: torch.Tensor,
-        invert: torch.Tensor,
-        num_valid: torch.Tensor,
-        num_ids: int,
-        batch_size: int,
-    ):
-        stream = torch.cuda.current_stream()
-        _run_compiled(
-            launch,
-            _ptr(sorted_ids),
-            _ptr(invert),
-            _ptr(num_valid),
-            fx.Uint32(num_ids),
-            fx.Uint32(batch_size),
             stream,
         )
 

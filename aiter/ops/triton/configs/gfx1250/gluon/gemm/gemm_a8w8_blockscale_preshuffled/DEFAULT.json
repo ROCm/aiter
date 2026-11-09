@@ -5,9 +5,10 @@
         "BLOCK_SIZE_K": 128,
         "GROUP_SIZE_M": 1,
         "num_warps": 4,
-        "num_stages": 2,
+        "NUM_BUFFERS": 2,
         "waves_per_eu": 2,
         "cache_modifier": null,
-        "NUM_KSPLIT": 1
+        "NUM_KSPLIT": 1,
+        "kernel_type": "bandwidth_bound"
     }
 }

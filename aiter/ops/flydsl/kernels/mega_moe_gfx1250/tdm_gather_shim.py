@@ -80,7 +80,7 @@ def _byte_offset_to_i64(offset):
 
 
 def _zero_dgroup_v8i32():
-    return fx.Vector.filled(8, 0, fx.Int32).ir_value()
+    return fx.full(8, 0, fx.Int32).ir_value()
 
 
 @dsl_loc_tracing
@@ -159,7 +159,7 @@ def make_tensor_gather_descriptor(
             | (enc_interval << 22)
             | (enc_amount << 25)
         )
-        g1_s0 = fx.Int32(upper) | (fx.Int32(workgroup_mask) & fx.Int32(0xFFFF))
+        g1_s0 = fx.Int32(upper) | (fx.Int32(workgroup_mask) & 0xFFFF)
 
     # tensor_dim0 (32 bits) packed into sgpr1[31:16] and sgpr2[15:0];
     # tensor_dim1 (32 bits) into sgpr2[31:16] and sgpr3[15:0].
@@ -169,10 +169,8 @@ def make_tensor_gather_descriptor(
 
     if _td1_is_runtime:
         td1 = fx.Int32(tensor_dim1)
-        g1_s2 = fx.Int32((tensor_dim0 >> 16) & 0xFFFF) | (
-            (td1 & fx.Int32(0xFFFF)) << 16
-        )
-        g1_s3 = (td1.shrui(fx.Int32(16)) & fx.Int32(0xFFFF)) | fx.Int32(row_width << 16)
+        g1_s2 = fx.Int32((tensor_dim0 >> 16) & 0xFFFF) | ((td1 & 0xFFFF) << 16)
+        g1_s3 = (td1.shrui(fx.Int32(16)) & 0xFFFF) | fx.Int32(row_width << 16)
     else:
         g1_s2 = fx.Int32(
             ((tensor_dim0 >> 16) & 0xFFFF) | ((tensor_dim1 & 0xFFFF) << 16)
@@ -185,7 +183,7 @@ def make_tensor_gather_descriptor(
     elif isinstance(gather_tile_dim1, int):
         g1_s4 = fx.Int32(gather_tile_dim1 & 0xFFFF)
     else:
-        g1_s4 = fx.Int32(gather_tile_dim1) & fx.Int32(0xFFFF)
+        g1_s4 = fx.Int32(gather_tile_dim1) & 0xFFFF
 
     # sgpr5: tensor_dim0_stride (dim0 stride = row stride in elements)
     g1_s5 = fx.Int32(stride & 0xFFFFFFFF)
