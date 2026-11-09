@@ -166,6 +166,18 @@ def get_GEMM_A16W16_tuned_config(
                 )
                 # None means the tuned CSV names a kernel absent from this
                 # catalog version; it is unrelated to FlyDSL import availability.
+                if flydsl_config is not None and flydsl_config["policy"] == "pr":
+                    from aiter.ops.flydsl.gemm_a16w16_projection import (
+                        projection_config,
+                    )
+
+                    expected = projection_config(M, N, K)
+                    if expected is None or any(
+                        flydsl_config[key] != value for key, value in expected.items()
+                    ):
+                        # Projection rows are exact-shape specializations, not
+                        # generic kernels that can serve padded-M lookups.
+                        continue
                 if flydsl_config is None:
                     logger.warning(
                         f"FlyDSL kernel '{config['kernelName']}' from tuned config is not "
@@ -689,7 +701,7 @@ def flydsl_gemm(
         and bias.dtype == inp.dtype
     ):
         fused_bias = bias
-    if skinny or flydsl_config["policy"] == "bs":
+    if skinny or flydsl_config["policy"] in ("bs", "pr"):
         policy = flydsl_config["policy"]
     else:
         policy = "ht" if flydsl_config["use_half_tile_interleaved"] else "ft"
