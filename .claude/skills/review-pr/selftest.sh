@@ -300,14 +300,15 @@ _drift_outside_a_repo() {
   # what `git archive HEAD | tar -x` produces. Checks whose inputs are absent skip and
   # still exit 0; what must not happen is the crash that an empty repo-root produced.
   # Reconstruct what the check actually needs -- the skill tree at its repo depth, plus
-  # the workflow it reads -- in a directory with no .git. Deliberately NOT `git archive`:
+  # the workflows it reads (the whole review-bot family, not just the one it read first)
+  # -- in a directory with no .git. Deliberately NOT `git archive`:
   # this suite is itself meant to run from an export, where there is no repo to archive
   # from, and a guard that only works inside a checkout cannot test leaving one.
   local t; t=$(mktemp -d)
   mkdir -p "$t/.claude/skills" "$t/.github/workflows"
   cp -r "$S" "$t/.claude/skills/review-pr"
   rm -rf "$t/.claude/skills/review-pr/reports"
-  cp "$S"/../../../.github/workflows/*review-bot.yml "$t/.github/workflows/" 2>/dev/null
+  cp "$S"/../../../.github/workflows/*review-bot*.yml "$t/.github/workflows/" 2>/dev/null
   ( cd /tmp && python3 "$t/.claude/skills/review-pr/check_prompts.py" >/dev/null 2>&1; echo $? )
   rm -rf "$t"
 }
@@ -354,6 +355,20 @@ ok=$((ok + qok)); bad=$((bad + qbad))
 if [ "$qg_rc" -ne 0 ] && [ "$qbad" -eq 0 ]; then
   why=$(printf '%s\n' "$qg" | grep -m1 -E 'Error|Traceback|No such file' | sed 's/^ *//' | cut -c1-110)
   echo "  ❌ queue_gate_test.py did not run — ${why:-exit $qg_rc}"; bad=$((bad + 1))
+fi
+
+echo "[gate watch]"
+# Same reason once more: a scheduled workflow never runs on a PR branch, and the failure it
+# watches for -- hosted runners starved -- cannot be reproduced on demand. Drive the shipping
+# script against a fake API and a fixed clock.
+gw=$(python3 "$S/gate_watch_test.py" 2>&1); gw_rc=$?
+printf '%s\n' "$gw" | grep -E '^  (✅|❌)' || true
+gok=$(printf '%s\n' "$gw" | grep -c '✅' || true)
+gbad=$(printf '%s\n' "$gw" | grep -c '❌' || true)
+ok=$((ok + gok)); bad=$((bad + gbad))
+if [ "$gw_rc" -ne 0 ] && [ "$gbad" -eq 0 ]; then
+  why=$(printf '%s\n' "$gw" | grep -m1 -E 'Error|Traceback|No such file' | sed 's/^ *//' | cut -c1-110)
+  echo "  ❌ gate_watch_test.py did not run — ${why:-exit $gw_rc}"; bad=$((bad + 1))
 fi
 
 echo "[notify handoff]"
