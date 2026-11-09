@@ -196,8 +196,9 @@ class MegaMoEV2:
                 # The large-input route quantizes its bf16 input into the staged quant buffers.
                 quant_buffers=(self._s1_quant_x, self._s1_quant_scale),
             )
-        # Compatibility switch for set_large_m_enabled(); routing stays with the plan.
-        self._large_m_excluded = False
+        # set_large_m_enabled(): None until called (calls without max_tokens stay
+        # staged), True sends such calls to the large-input route, False never uses it.
+        self._large_m_choice = None
         self._small_m_runtimes = []
         if self._bundle_plan.small_m_mtprs:
             from .mega_moe_small_m import SmallMRuntime
@@ -262,14 +263,15 @@ class MegaMoEV2:
         return self._large_m is not None
 
     def set_large_m_enabled(self, enabled: bool) -> None:
-        """Allow (True, the default) or exclude (False) the large-input route.
+        """Send the following calls without max_tokens to the large-input route (True)
+        or keep the large-input route out of every call (False).
 
-        A test aid kept for existing callers: the plan still picks the route, so
-        every rank must make the same choice before a call.
+        For callers of main's interface (e.g. SGLang): they choose the large-input
+        route per call from EP-wide counts, so every rank makes the same choice.
         """
         if enabled and self._large_m is None:
             raise RuntimeError("this instance has no large-input route")
-        self._large_m_excluded = not enabled
+        self._large_m_choice = bool(enabled)
 
     def _route(self, run_tokens, max_tokens, *, small_m=True):
         """(route, capacity) of this call; see MegaMoEBundlePlan.route_for.
@@ -280,7 +282,9 @@ class MegaMoEV2:
         """
         if max_tokens is None:
             # Without the row bound a call keeps main's staged route (fixed-slot or
-            # compact); the fused routes need the caller's EP-wide bound.
+            # compact), or the large-input route a caller turned on for such calls.
+            if self._large_m_choice and self._bundle_plan.large_m:
+                return ROUTE_LARGE_M, self.mtpr
             return ROUTE_STAGED, self.mtpr
         max_tokens = int(max_tokens)
         if not run_tokens <= max_tokens <= self.mtpr:
@@ -288,7 +292,7 @@ class MegaMoEV2:
                 f"max_tokens={max_tokens} must be in [{run_tokens} (this rank's rows), {self.mtpr}]"
             )
         return self._bundle_plan.route_for(
-            max_tokens, small_m=small_m, large_m=not self._large_m_excluded
+            max_tokens, small_m=small_m, large_m=self._large_m_choice is not False
         )
 
     def _fused_runtimes(self):

@@ -186,7 +186,24 @@ def test_no_hint_takes_staged(mtpr):
     from aiter.ops.flydsl.kernels.mega_moe.mega_moe_v2 import MegaMoEV2
 
     moe = object.__new__(MegaMoEV2)  # _route needs only the plan and the capacity
-    moe.mtpr, moe._bundle_plan, moe._large_m_excluded = mtpr, _plan(mtpr), False
+    moe.mtpr, moe._bundle_plan, moe._large_m_choice = mtpr, _plan(mtpr), None
     for rows in sorted({0, 1, min(128, mtpr), mtpr}):
         assert moe._route(rows, None) == (ROUTE_STAGED, mtpr)
         assert moe._route(rows, None, small_m=False) == (ROUTE_STAGED, mtpr)
+
+
+def test_set_large_m_enabled_keeps_mains_interface():
+    """Callers of main's interface (SGLang) switch the large-input route per call."""
+    from aiter.ops.flydsl.kernels.mega_moe.mega_moe_v2 import MegaMoEV2
+
+    moe = object.__new__(MegaMoEV2)
+    moe.mtpr, moe._bundle_plan, moe._large_m_choice = 8192, _plan(8192), None
+    moe._large_m = object()
+    assert moe._route(7, None) == (ROUTE_STAGED, 8192)
+    moe.set_large_m_enabled(True)
+    assert moe._route(7, None) == (ROUTE_LARGE_M, 8192)
+    assert moe._route(7, None, small_m=False) == (ROUTE_LARGE_M, 8192)
+    assert moe._route(7, 300) == (ROUTE_SMALL_M, 512)
+    moe.set_large_m_enabled(False)
+    assert moe._route(7, None) == (ROUTE_STAGED, 8192)
+    assert moe._route(4096, 4096) == (ROUTE_STAGED, 8192)
