@@ -544,6 +544,7 @@ def _validate_a8w8_public_contract(
     has_bias: bool,
     has_workspace: bool,
     split_k: int,
+    bpreshuffle_uses_workspace: bool = False,
 ) -> str:
     """Validate immutable options for the public A8W8 operation routers."""
     try:
@@ -601,7 +602,9 @@ def _validate_a8w8_public_contract(
             raise ValueError("OPUS a8w8_mxscale_bmm split_k=0 does not use workspace")
         return family
 
-    if has_workspace and family != _A8W8_BPRESHUFFLE_FAMILY:
+    if has_workspace and not (
+        family == _A8W8_BPRESHUFFLE_FAMILY and bpreshuffle_uses_workspace
+    ):
         raise ValueError(f"OPUS family {family} does not use workspace")
     if split_k != 0:
         raise ValueError(f"OPUS family {family} does not accept split_k")

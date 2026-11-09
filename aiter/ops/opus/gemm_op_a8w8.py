@@ -351,12 +351,7 @@ def _launch_a8w8_blockscale_bpreshuffle_gemm(
     """
     resolved_kid = kid
     if instance is None:
-        tensors = (XQ, WQ, Y, x_scale, w_scale)
-        if any(not isinstance(tensor, Tensor) for tensor in tensors):
-            raise TypeError(
-                "opus_gemm A8W8 blockscale bpreshuffle expects Tensor inputs"
-            )
-        if any(tensor.dim() != 2 for tensor in tensors):
+        if any(tensor.dim() != 2 for tensor in (XQ, WQ, Y, x_scale, w_scale)):
             raise ValueError(
                 "opus_gemm A8W8 blockscale bpreshuffle expects logical 2D "
                 "XQ/WQ/Y/x_scale/w_scale; this family is GEMM-only"
@@ -387,7 +382,7 @@ def _launch_a8w8_blockscale_bpreshuffle_gemm(
             launch_workspace = torch.empty(
                 (required_bytes // 4,), dtype=torch.float32, device=XQ.device
             )
-        # C++ validates tensor layouts and workspace; launchers reset counters.
+        # C++ validates tensor layouts and workspace.
     elif launch_workspace is not None:
         raise ValueError(f"OPUS bpreshuffle kid {resolved_kid} does not use workspace")
     _launch_a8w8_backend(

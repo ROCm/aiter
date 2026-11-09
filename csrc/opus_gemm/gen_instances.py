@@ -1481,7 +1481,7 @@ if __name__ == "__main__":
             instance = available.get(key)
             name = str(row.get("kernelName", ""))
             if instance is None or (
-                name not in ("", "nan", "None") and name != instance.name
+                name not in ("", "nan", "None") and not instance.matches_name(name)
             ):
                 continue
             csv_keys.add(key)

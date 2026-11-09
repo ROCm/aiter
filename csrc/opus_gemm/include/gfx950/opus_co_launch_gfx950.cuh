@@ -45,7 +45,8 @@ private:
 };
 inline AiterAsmKernelFast& co_kernel(const std::string& symbol, const std::string& image_name) {
     static SynchronizedCache<std::string, CoModule> cache;
-    return cache.get_or_create(image_name, [&]() { return CoModule(symbol, image_name); }).kernel;
+    const std::string cache_key = image_name + '\0' + symbol;
+    return cache.get_or_create(cache_key, [&]() { return CoModule(symbol, image_name); }).kernel;
 }
 } // namespace opus_gfx950_co
 template<class Kargs>

@@ -464,7 +464,7 @@ void opus_gemm_a8w8_blockscale_bpreshuffle_launch(
     int kid,
     std::optional<aiter_tensor_t> workspace)
 {
-  aiter_detail::AiterThrowGuard throw_guard;
+  aiter_detail::g_aiter_can_throw = true;
   constexpr const char* entry =
       "opus_gemm_a8w8_blockscale_bpreshuffle_launch";
   opus_check_a8_family_tensors(entry, XQ, WQ, Y);
