@@ -25,7 +25,9 @@ Tensor layout (see reduce.cu / mla.py):
 """
 
 import argparse
+import itertools
 import math
+import re
 
 import pandas as pd
 import torch
@@ -237,9 +239,53 @@ def build_reduce_problem(
     }
 
 
-def run_case(
-    splits_per_tile, num_heads, head_dim, out_dtype, qo_len=1, vectorized_ref=False
-):
+# head_dim -> default head-count sweep; the full compiled (heads, head_dim) matrix is
+# csrc/include/mla_reduce_cases.h.
+HEADS_FOR_DIM = {
+    # Kimi K3 TP2 uses the 48-head, 128-dimension reducer.
+    # Kimi K3 PP8 uses the 96-head, 128-dimension reducer.
+    # Kimi K3 TP8 (96 query heads / 8 ranks) MLA prefill uses the 12-head,
+    # 128-dimension reducer (nh12_hd128).
+    128: [1, 12, 16, 48, 96, 128],
+    512: [8, 16, 24, 128],
+}
+
+_SPLIT_ITEM = re.compile(r"^(?:(\d+)x)?(\d+)$")
+
+
+def parse_splits(splits):
+    """Expand a split-config spelling into per-tile split counts.
+
+    `splits` is a comma-separated list of per-tile split counts; an item `RxS`
+    stands for R tiles of S splits each. "8,5,7" -> [8, 5, 7],
+    "40x6" -> [6] * 40, "2,3x8" -> [2, 8, 8, 8]. Every count must be >= 1.
+    """
+    splits_per_tile = []
+    for item in str(splits).split(","):
+        m = _SPLIT_ITEM.match(item.strip())
+        if m is None:
+            raise argparse.ArgumentTypeError(
+                f"bad split config {splits!r}: item {item!r} is not S or RxS"
+            )
+        repeat = int(m.group(1)) if m.group(1) is not None else 1
+        count = int(m.group(2))
+        if repeat < 1 or count < 1:
+            raise argparse.ArgumentTypeError(
+                f"bad split config {splits!r}: tile and split counts must be >= 1"
+            )
+        splits_per_tile += [count] * repeat
+    return splits_per_tile
+
+
+def split_config_arg(splits):
+    """argparse type for -s/--splits: validate, keep the spelling as given."""
+    parse_splits(splits)
+    return splits.replace(" ", "")
+
+
+def run_case(splits, num_heads, head_dim, out_dtype, qo_len=1, vectorized_ref=False):
+    # `splits` is a split-config spelling (see parse_splits), e.g. "8,5,7" or "40x6".
+    splits_per_tile = parse_splits(splits)
     p = build_reduce_problem(
         splits_per_tile, num_heads, head_dim, out_dtype, qo_len=qo_len
     )
@@ -287,8 +333,13 @@ def run_case(
         gpu_lse,
     )
 
+    # Long uniform configs print as "40x[6]"; anything else prints in full.
+    if len(splits_per_tile) > 4 and len(set(splits_per_tile)) == 1:
+        label = f"{len(splits_per_tile)}x[{splits_per_tile[0]}]"
+    else:
+        label = str(splits_per_tile)
     tag = (
-        f"splits={splits_per_tile if len(splits_per_tile) <= 4 else f'{len(splits_per_tile)}x[{splits_per_tile[0]}]'}"
+        f"splits={label}"
         f" h={num_heads} dv={head_dim} {str(out_dtype).split('.')[-1]}"
     )
 
@@ -333,11 +384,7 @@ def run_case(
     bytes_total = read_bytes + write_bytes
 
     ret = {
-        "splits": (
-            str(splits_per_tile)
-            if len(splits_per_tile) <= 4
-            else f"{len(splits_per_tile)}x[{splits_per_tile[0]}]"
-        ),
+        "splits": label,
         "nhead": num_heads,
         "dv": head_dim,
         "dtype": str(out_dtype).split(".")[-1],
@@ -349,8 +396,110 @@ def run_case(
     return ok, ret
 
 
+def run_layout_case(
+    name,
+    num_heads,
+    head_dim,
+    out_dtype,
+    splits,
+    qo_len,
+    max_seqlen_q,
+    use_final_map,
+    sentinel_tiles=(),
+    pad_tiles=0,
+):
+    """Partial-map layouts the uniform builder never makes: no final map (rows
+    from the partial-map stride), a -1 tile whose single split already wrote its
+    output, a reduce_indptr tail padded for a CUDA-graph batch, and tiles with more
+    rows than max_seqlen_q, which take extra passes."""
+    device = "cuda"
+    indptr, pmap, fmap, num_partials, num_rows = [0], [], [], 0, 0
+    for t, s in enumerate(splits):
+        if t in sentinel_tiles:
+            pmap.append(-1)
+            indptr.append(indptr[-1] + 1)
+        else:
+            for _ in range(s):
+                pmap.append(num_partials)
+                num_partials += qo_len
+            indptr.append(indptr[-1] + s)
+        fmap.append([num_rows, num_rows + qo_len])
+        num_rows += qo_len
+    for _ in range(pad_tiles):
+        indptr.append(indptr[-1])
+        fmap.append([0, 0])
+    part_out = torch.randn(max(num_partials, 1), num_heads, head_dim, device=device)
+    part_lse = torch.randn(max(num_partials, 1), num_heads, device=device) * 4
+    # Rows the kernel must not write (the -1 tile's) keep this value.
+    untouched = 7.0
+    out = torch.full(
+        (num_rows, num_heads, head_dim), untouched, dtype=out_dtype, device=device
+    )
+    lse = torch.full((num_rows, num_heads), untouched, device=device)
+    ref_out, ref_lse = out.clone(), lse.clone()
+    for t in range(len(splits)):
+        slots = pmap[indptr[t] : indptr[t + 1]]
+        if slots == [-1]:
+            continue
+        if use_final_map:
+            q0, q1 = fmap[t]
+        else:
+            stride = slots[1] - slots[0] if len(slots) > 1 else 0
+            q0, q1 = t * stride, (t + 1) * stride
+        for r in range(q1 - q0):
+            idx = torch.tensor([slot + r for slot in slots], device=device)
+            max_lse = part_lse[idx].max(0).values
+            w = torch.exp(part_lse[idx] - max_lse)
+            ref_out[q0 + r] = (
+                (w.unsqueeze(-1) * part_out[idx]).sum(0) / w.sum(0).unsqueeze(-1)
+            ).to(out_dtype)
+            ref_lse[q0 + r] = max_lse + torch.log(w.sum(0))
+    as_i32 = lambda x: torch.tensor(x, dtype=torch.int32, device=device)
+    aiter.mla_reduce_v1(
+        part_out,
+        part_lse,
+        as_i32(indptr),
+        as_i32(fmap) if use_final_map else None,
+        as_i32(pmap),
+        max_seqlen_q,
+        max(splits),
+        out,
+        lse,
+    )
+    err_out = checkAllclose(
+        ref_out.float(), out.float(), rtol=2e-2, atol=2e-2, msg=f"[{name}] output"
+    )
+    err_lse = checkAllclose(ref_lse, lse, rtol=2e-2, atol=2e-2, msg=f"[{name}] lse")
+    return err_out == 0 and err_lse == 0
+
+
+LAYOUT_CASES = [
+    # name, heads, head_dim, splits, qo_len, max_seqlen_q, use_final_map, kwargs
+    ("no final map, 1 tile", 16, 512, [250], 8, 8, False, {}),
+    ("no final map, 3 tiles", 16, 512, [40, 40, 40], 2, 2, False, {}),
+    (
+        "-1 tile among 64-split tiles",
+        16,
+        512,
+        [64, 1, 64],
+        4,
+        4,
+        True,
+        {"sentinel_tiles": (1,)},
+    ),
+    ("2 live tiles, 30 padded", 16, 512, [128, 96], 6, 6, True, {"pad_tiles": 30}),
+    ("8 rows, max_seqlen_q 4", 16, 512, [64, 64], 8, 4, True, {}),
+    ("8 rows, max_seqlen_q 1", 16, 512, [200], 8, 1, True, {}),
+    ("8 rows, max_seqlen_q 3", 16, 128, [32, 32, 32], 8, 3, True, {}),
+    ("80 tiles", 16, 128, [16] * 80, 1, 1, True, {}),
+]
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Test mla_reduce_v1 kernel")
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="Test mla_reduce_v1 kernel",
+    )
     parser.add_argument(
         "-d",
         "--dtype",
@@ -365,39 +514,54 @@ def main():
         default=[128, 512],
         help="comma-separated head dims, e.g. 128 or 128,512 (default: 128,512)",
     )
+    parser.add_argument(
+        "-n",
+        "--heads",
+        type=int,
+        nargs="*",
+        default=None,
+        help="head counts swept for every --head_dim; each (heads, head_dim) pair\n"
+        "must be compiled (csrc/include/mla_reduce_cases.h) or the kernel errors.\n"
+        "Default: 128 -> 1 12 16 48 96 128, 512 -> 8 16 24 128.",
+    )
+    # Cover both kernel paths:
+    #   num_splits in [2,3]  -> simple impl
+    #   num_splits >= 4      -> massive impl (<=wave_size / <=4*wave_size buckets)
+    parser.add_argument(
+        "-s",
+        "--splits",
+        type=split_config_arg,
+        nargs="*",
+        default=[
+            "2",  # simple, single tile
+            "3,2",  # simple, multi tile
+            "4",  # massive, exactly threshold
+            "8,5,7",  # massive, ragged tiles
+            "33",  # massive, single large tile
+            "300",  # massive, exercises the >4*wave_size LDS-spill bucket
+            "2,4,16,64",  # mixed: simple + massive tiles
+            "40x6",  # many tiles -> exercises persistent-grid path
+        ],
+        help="split configs swept for every (dtype, head_dim, heads); one reduce\n"
+        "problem per config. A config is a comma-separated list of per-tile split\n"
+        "counts, one tile each; RxS is R tiles of S splits.\n"
+        "e.g. -s 300 8,5,7 40x6 2,3x8\n"
+        "Default: 2 3,2 4 8,5,7 33 300 2,4,16,64 40x6\n"
+        "-s/-n drive the single-row sweep; the multi-row and layout cases are fixed.",
+    )
     args = parser.parse_args()
 
     out_dtypes = [dtypes.bf16 if d == "bf16" else dtypes.fp16 for d in args.dtype]
     head_dims = args.head_dim
+    for head_dim in head_dims:
+        if not args.heads and head_dim not in HEADS_FOR_DIM:
+            parser.error(f"no default heads for --head_dim {head_dim}; pass --heads")
+    if not args.splits:
+        parser.error("--splits needs at least one config")
 
     # The kernel sizes its LDS scratch to max(CU_count, num_kv_splits), and the
     # test passes num_kv_splits = max(per-tile splits), so any split count is
     # safe regardless of device CU count.
-
-    # (head_dim -> supported head counts from MLA_REDUCE_ROUTER in reduce.cu)
-    heads_for_dim = {
-        # Kimi K3 TP2 uses the 48-head, 128-dimension reducer.
-        # Kimi K3 PP8 uses the 96-head, 128-dimension reducer.
-        # Kimi K3 TP8 (96 query heads / 8 ranks) MLA prefill uses the 12-head,
-        # 128-dimension reducer (nh12_hd128).
-        128: [1, 12, 16, 48, 96, 128],
-        512: [8, 16, 24, 128],
-    }
-
-    # Cover both kernel paths:
-    #   num_splits in [2,3]  -> simple impl
-    #   num_splits >= 4      -> massive impl (<=wave_size / <=4*wave_size buckets)
-    split_configs = [
-        [2],  # simple, single tile
-        [3, 2],  # simple, multi tile
-        [4],  # massive, exactly threshold
-        [8, 5, 7],  # massive, ragged tiles
-        [33],  # massive, single large tile
-        [300],  # massive, exercises the >4*wave_size LDS-spill bucket
-        [2, 4, 16, 64],  # mixed: simple + massive tiles
-    ] + [
-        [6] * 40
-    ]  # many tiles -> exercises persistent-grid path
 
     # multi-row tiles (qo_len > 1), decode/prefill-style:
     # (num_heads, splits, qo_len, vectorized_ref). A workgroup covers
@@ -405,20 +569,20 @@ def main():
     # switches to the persistent-grid kernel (4096 on a 256-CU gfx950).
     multi_row_cases = {
         128: [
-            (12, [3, 8], 3, False),  # 12 heads: simple + massive tiles
-            (16, [8, 4], 3, False),
+            (12, "3,8", 3, False),  # 12 heads: simple + massive tiles
+            (16, "8,4", 3, False),
             # 64 tiles x 64 rows: 4 workgroups per head/tile on 256 CUs, so each
             # massive-path workgroup reduces 16 rows back to back.
-            (12, [4] * 64, 64, True),
+            (12, "64x4", 64, True),
             # 12 x 512 = 6144 workgroups: the persistent-grid kernel on 256 and
             # 304 CUs, with 2 rows per work item.
-            (12, [4] * 512, 2, True),
+            (12, "512x4", 2, True),
         ],
         512: [
-            (16, [8, 4], 3, False),
+            (16, "8,4", 3, False),
             # 32 tiles x 64 splits x 32 rows: catches the missing barrier between rows
             # (#6731), which made this case fail every run on MI300X.
-            (16, [64] * 32, 32, True),
+            (16, "32x64", 32, True),
         ],
     }
 
@@ -426,14 +590,14 @@ def main():
     df = []
     for out_dtype in out_dtypes:
         for head_dim in head_dims:
-            for num_heads in heads_for_dim[head_dim]:
-                for splits in split_configs:
-                    ok, ret = run_case(splits, num_heads, head_dim, out_dtype)
-                    all_ok &= ok
-                    df.append(ret)
+            heads = args.heads or HEADS_FOR_DIM[head_dim]
+            for num_heads, splits in itertools.product(heads, args.splits):
+                ok, ret = run_case(splits, num_heads, head_dim, out_dtype)
+                all_ok &= ok
+                df.append(ret)
 
         for head_dim in head_dims:
-            for num_heads, splits, qo_len, vec_ref in multi_row_cases[head_dim]:
+            for num_heads, splits, qo_len, vec_ref in multi_row_cases.get(head_dim, []):
                 ok, ret = run_case(
                     splits,
                     num_heads,
@@ -444,6 +608,20 @@ def main():
                 )
                 all_ok &= ok
                 df.append(ret)
+
+        for name, heads, head_dim, splits, qo_len, max_q, use_fmap, kw in LAYOUT_CASES:
+            if head_dim in head_dims:
+                all_ok &= run_layout_case(
+                    name,
+                    heads,
+                    head_dim,
+                    out_dtype,
+                    splits,
+                    qo_len,
+                    max_q,
+                    use_fmap,
+                    **kw,
+                )
 
     df = pd.DataFrame(df)
     df_md = df.to_markdown(index=False)
