@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""MegaMoEV2 route selection: one plan picks the route of every call -- no GPU needed.
+"""MegaMoEV2 on gfx950: route selection, one plan picks the route of every call -- no GPU needed.
 
 Every EP rank must take the same route for a call, so the plan's choice may
-depend only on EP-wide inputs (the plan and the call's max_tokens). The 8-GPU
-behaviour of each route lives in op_tests/multigpu_tests/test_mega_moe_v2.py and
-test_mega_moe_small_m.py.
+depend only on EP-wide inputs (the plan and the call's max_tokens). The
+multi-GPU behaviour of each route (EP8 DeepSeek-V4-Pro, EP4 DeepSeek-V4.1-Flash)
+lives in op_tests/multigpu_tests/test_mega_moe_v2.py: --suite size for the
+pinned staged and large-input routes, --suite routes for the instance that
+serves all three.
 """
 
 import pytest
