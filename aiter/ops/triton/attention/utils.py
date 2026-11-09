@@ -15,7 +15,7 @@ from aiter.ops.triton._triton_kernels.attention.block_lut import (
     block_attn_mask_to_lut_kernel,
 )
 from aiter.ops.triton._triton_kernels.attention.lse_merge import _lse_merge_kernel
-from aiter.ops.triton._triton_kernels.attention.sol_attn_pool import (
+from aiter.ops.triton.attention.sol_attn_pool import (
     POOL_AUX_NONE,
     POOL_AUX_SQUARE_MEAN,
     POOL_AUX_VARIANCE,
