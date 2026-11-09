@@ -1922,8 +1922,9 @@ def test_bad_profile_argument_is_an_error():
 
 
 def test_no_implicit_env_profile_lookup_in_the_gemm_fusion_runtime():
-    """Audit pin: the only reader of AITER_GEMM_FUSION_PROFILE is profile.load_profile(None) (documented top-level convenience, used by
-    match_prefix(profile=None)); resources.py and every variant take the profile explicitly.
+    """Audit pin: the only readers of AITER_GEMM_FUSION_PROFILE are profile.load_profile(None) (documented top-level convenience, used by
+    match_prefix(profile=None)) and the provider-era native runtime (ops/.../runtime.py), which owns the neutral op's session/profile
+    policy; resources.py and every variant still take the profile explicitly.
     """
     import re
 
@@ -1947,8 +1948,9 @@ def test_no_implicit_env_profile_lookup_in_the_gemm_fusion_runtime():
                         hits.append((fn, m.group(0)))
     files = {f for f, _ in hits}
     assert files <= {
-        "profile.py"
-    }, hits  # resources.py / variants*.py / match.py must not read the env profile
+        "profile.py",
+        "runtime.py",
+    }, hits  # resources.py / variants*.py / match.py must not read the env profile; the neutral runtime owns it
     pr = _slurp(os.path.join(root, "gemm_fusion", "resources.py"), encoding="utf-8")
     assert "load_profile()" not in pr and "ENV_PROFILE" not in pr
 
