@@ -432,3 +432,80 @@ def test_flydsl_odd_tail_sink(block_q):
     sparse_mla_qblock_fwd_flydsl(q, kv, indices, out, block_q=block_q, attn_sink=sink)
     ref = _torch_flat(q, kv, indices, topk, sink)
     torch.testing.assert_close(ref.float(), out.float(), rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize("kernel", ["one_q", "qblock"])
+@pytest.mark.parametrize("case", ["sharp", "large_v", "duplicates_sink"])
+def test_flydsl_finite_stress(kernel, case):
+    torch.manual_seed(1215)
+    n_tok, topk, pool = 7, 2048, 131072
+    q = torch.randn(n_tok, H, D, dtype=torch.bfloat16, device="cuda")
+    kv = torch.randn(pool, D, dtype=torch.bfloat16, device="cuda")
+    indices = _indices("shared", n_tok, pool, topk)
+    sink = None
+    if case == "sharp":
+        q.mul_(16)
+    elif case == "large_v":
+        # A stale probability near 2**60 times V=2**100 overflows FP32.
+        # The existing rescale threshold must keep this finite BF16 case safe.
+        q.zero_()
+        q[..., 0] = 1
+        kv.zero_()
+        kv[:, 1] = 2.0**100
+        kv[16:topk, 0] = 944
+    else:
+        indices = (torch.arange(topk, dtype=torch.int32, device="cuda") % 256).repeat(
+            n_tok
+        )
+        sink = torch.linspace(-2, 2, H, dtype=torch.float32, device="cuda")
+    out = torch.empty_like(q)
+    fn = (
+        sparse_mla_one_query_fwd_flydsl
+        if kernel == "one_q"
+        else sparse_mla_qblock_fwd_flydsl
+    )
+    fn(q, kv, indices, out, kv_indptr=_indptr(n_tok, topk), attn_sink=sink)
+    ref = _torch_flat(q, kv, indices, topk, sink)
+    assert torch.isfinite(ref).all()
+    assert torch.isfinite(out).all()
+    _check_accuracy(ref.float(), out.float(), rtol=2e-3, atol=2e-3)
+
+
+def test_flydsl_prefill_odd_tail_sink():
+    torch.manual_seed(1215)
+    n_tok, topk, pool = 4097, 2048, 131072
+    q = torch.randn(n_tok, H, D, dtype=torch.bfloat16, device="cuda")
+    kv = torch.randn(pool, D, dtype=torch.bfloat16, device="cuda")
+    indices = _indices("random", n_tok, pool, topk)
+    sink = torch.randn(H, dtype=torch.float32, device="cuda")
+    out = torch.empty_like(q)
+    sparse_mla_one_query_fwd_flydsl(q, kv, indices, out, attn_sink=sink)
+    ref = torch.cat(
+        [
+            _torch_flat(
+                q[t : t + 128], kv, indices[t * topk : (t + 128) * topk], topk, sink
+            )
+            for t in range(0, n_tok, 128)
+        ]
+    )
+    assert torch.isfinite(out).all()
+    _check_accuracy(ref.float(), out.float(), rtol=2e-3, atol=2e-3)
+
+
+@pytest.mark.parametrize(
+    "n_tok,topk,prefill",
+    [(7, 2048, False), (4095, 2048, False), (4096, 2048, True), (4096, 64, False)],
+)
+def test_flydsl_prefill_selection(n_tok, topk, prefill, monkeypatch):
+    import aiter.ops.flydsl.sparse_mla_qblock_kernels as fly
+
+    class Selected(Exception):
+        pass
+
+    def compile_probe(block_q, has_sink, **kwargs):
+        assert kwargs == {"prefill": prefill}
+        raise Selected
+
+    monkeypatch.setattr(fly, "compile_sparse_mla_qblock", compile_probe)
+    with pytest.raises(Selected):
+        fly._launch(None, None, None, None, n_tok, topk, n_tok, 1, None, None)

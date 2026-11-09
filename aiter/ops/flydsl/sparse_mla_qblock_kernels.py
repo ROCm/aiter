@@ -170,7 +170,11 @@ def _launch(
     if not (0 < scale < float("inf")):
         raise ValueError("FlyDSL sparse MLA softmax_scale must be finite and positive")
     has_sink = attn_sink is not None
-    kernel = compile_sparse_mla_qblock(block_q, has_sink)
+    # Keep the short-request schedule. The throughput specialization is
+    # measured for packed topk=2048 prefill, not for smaller sparse lists.
+    kernel = compile_sparse_mla_qblock(
+        block_q, has_sink, prefill=n_tok >= 4096 and n_unique == 2048
+    )
     idx = idx.to(dtype=torch.int32).contiguous()
     if has_sink:
         attn_sink = attn_sink.reshape(-1).to(torch.float32).contiguous()

@@ -135,14 +135,15 @@ def _halves(v8, halves):
     ]
 
 
-@lru_cache(maxsize=8)
-def compile_sparse_mla_qblock(block_q, has_sink=False):
+@lru_cache(maxsize=16)
+def compile_sparse_mla_qblock(block_q, has_sink=False, prefill=False):
     if block_q not in (1, 2, 4):
         raise ValueError("BLOCK_Q must be 1, 2, or 4")
 
     BLOCK_Q = int(block_q)
     HAS_SINK = bool(has_sink)
     ONE_Q = BLOCK_Q == 1
+    PREFILL = bool(prefill)
     # The bf16 one-query path uses two waves to split the 512-wide contraction
     # and output. Q-block keeps one wave per query over a shared KV tile.
     NWARP = 2 if ONE_Q else BLOCK_Q
@@ -158,6 +159,7 @@ def compile_sparse_mla_qblock(block_q, has_sink=False):
     IDX_AHEAD = 0 if ONE_Q else IDX_AHEAD_QBLOCK
     module_name = (
         f"sparse_mla_mfma_bq{BLOCK_Q}_sink{int(HAS_SINK)}_d{HEAD_DIM}_h{NUM_HEADS}"
+        f"{'_prefill' if PREFILL else ''}"
     )
 
     # One-query fits 16 KB (4 CTAs/CU on gfx942): unpadded rows with the 16-B
@@ -241,7 +243,15 @@ def compile_sparse_mla_qblock(block_q, has_sink=False):
         n_tok_i = fx.Int32(n_tok)
         # Q-block: token of (query j, tile)
         tokens = _colmajor(BLOCK_Q, BIG)
-        if const_expr(ONE_Q):
+        if const_expr(ONE_Q and PREFILL):
+            # Interleave eight contiguous token runs. The resulting locality
+            # is measured on gfx942; a block-to-XCD placement is not assumed.
+            per = fx.get_scalar(fx.size(fx.get_(fx.get_shape(
+                fx.zipped_divide(_rowmajor(1, n_tok_i), (1, 8))
+            ), [1, 1])))
+            group_pos = fx.idx2crd(tile, _colmajor(8, BIG))
+            t_idx = fx.get_scalar(fx.crd2idx(group_pos, _rowmajor(8, per)))
+        elif const_expr(ONE_Q):
             t_idx = tile
         else:
             t_idx = fx.get_scalar(fx.crd2idx((warp, tile), tokens))
@@ -439,9 +449,12 @@ def compile_sparse_mla_qblock(block_q, has_sink=False):
                 )
 
             scores = [live.select(_elem(s_acc, i), neg_inf) for i in range_constexpr(4)]
-            m_w = scores[0]
-            for i in range_constexpr(1, 4):
-                m_w = (m_w > scores[i]).select(m_w, scores[i])
+            if const_expr(PREFILL):
+                m_w = fx.max(fx.max(scores[0], scores[1]), fx.max(scores[2], scores[3]))
+            else:
+                m_w = scores[0]
+                for i in range_constexpr(1, 4):
+                    m_w = (m_w > scores[i]).select(m_w, scores[i])
             # Lazy rescale: keep the stale head max until some lane's local max grows by
             # more than RESCALE_TAU (log2 units), so p <= 2**RESCALE_TAU. Only then is the
             # cross-lane head max needed. -inf - -inf is NaN -> no move.
@@ -574,6 +587,7 @@ def compile_sparse_mla_qblock(block_q, has_sink=False):
         n_tiles: fx.Int32,
         stream: fx.Stream,
     ):
+        grid_blocks = (n_tiles + 7) // 8 * 8 if const_expr(ONE_Q and PREFILL) else n_tiles
         sparse_mla_qblock_kernel(
             q_ptr,
             kv_ptr,
@@ -584,7 +598,7 @@ def compile_sparse_mla_qblock(block_q, has_sink=False):
             scale,
             sink_ptr,
         ).launch(
-            grid=(fx.Int64(n_tiles), 1, 1),
+            grid=(fx.Int64(grid_blocks), 1, 1),
             block=(BLOCK_THREADS, 1, 1),
             stream=stream,
         )
@@ -596,6 +610,7 @@ def compile_sparse_mla_qblock(block_q, has_sink=False):
         "llvm_options": {
             "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
             "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
+            **({"slp-threshold": 100000} if PREFILL else {}),
         },
     }
     return launch_sparse_mla_qblock
