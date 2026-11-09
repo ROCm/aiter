@@ -305,7 +305,12 @@ def get_flydsl_a16w16_configs(
                     if stride or nt
                 )
     skinny_configs = []
-    if dtype == out_dtype == torch.bfloat16 and not has_bias and 0 < m <= 128:
+    if (
+        dtype == torch.bfloat16
+        and out_dtype in (torch.bfloat16, torch.float32)
+        and not has_bias
+        and 0 < m <= 128
+    ):
         # The public wrapper and tuned-name parser already support skinny,
         # but the tuner previously generated only FT/HTI candidates.
         block_m = -(-m // 8) * 8

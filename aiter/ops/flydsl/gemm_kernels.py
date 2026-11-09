@@ -50,7 +50,7 @@ _HGEMM_KERNEL_RE = re.compile(
 # The skinny policy (kernels/gemm_a16w16_skinny_gfx950.py) reuses the HGEMM name
 # fields: t<block_m>x<block_n>x<block_k>x<stages> is its tile and LDS ring depth,
 # w1x1x<k_waves> the waves splitting K inside a workgroup. It has no split-K,
-# bias or fp32 output, and runs on gfx950 only.
+# bias, and runs on gfx950 only. Output may be bf16 or fp32.
 SKINNY_POLICY = "sk"
 
 
@@ -127,7 +127,7 @@ def get_flydsl_hgemm_kernel_params(name: str) -> dict | None:
         return None
     if policy == SKINNY_POLICY and (
         dtype != "bf16"
-        or out_dtype != "bf16"
+        or out_dtype not in ("bf16", "fp32")
         or match.group("split_k") != "1"
         or match.group("m_waves") != "1"
         or match.group("n_waves") != "1"
@@ -263,8 +263,6 @@ def flydsl_hgemm(
                 "The FlyDSL skinny HGEMM policy requires split_k=1, m_waves=1, "
                 "n_waves=1, group_m=0 and no bias"
             )
-        if out_dtype not in (None, a.dtype):
-            raise ValueError("The FlyDSL skinny HGEMM policy writes the input dtype")
         return gemm_a16w16_skinny(
             a,
             b,
@@ -275,6 +273,7 @@ def flydsl_hgemm(
             k_waves=k_waves,
             out=out,
             stream=launch_stream,
+            out_dtype=out_dtype,
         )
     if gfx in ("gfx1250", "gfx1250-strict"):
         if k_waves != 1:

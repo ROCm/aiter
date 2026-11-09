@@ -37,8 +37,6 @@ from aiter.test_common import (
     run_perftest,
 )
 
-torch.set_default_device("cuda")
-
 # Public wrapper currently supports gfx950 only. Positive allow-list: an unknown
 # new card must not silently run an unbuilt kernel.
 SUPPORTED_GFX = ["gfx950"]
@@ -85,6 +83,13 @@ _CONCURRENT_COPY_MNK = [(8192, 8192, 128)]
 # k_waves waves split; no split_k, M/N waves or group_m.
 # (m, n, k, block_m, block_n, block_k, stages, k_waves)
 _SKINNY = [
+    # Dense router dimensions from the supplied BF16 GEMM benchmark.
+    # Include masked M rows on both sides of the swapped-epilogue boundary.
+    (1, 896, 7168, 8, 16, 64, 4, 4),
+    (7, 896, 7168, 8, 16, 64, 4, 4),
+    (16, 896, 7168, 16, 16, 64, 4, 4),
+    (23, 896, 7168, 32, 16, 64, 3, 4),
+    (32, 896, 7168, 32, 16, 64, 3, 4),
     # GLM-5.2 o_proj decode (N=6144, K=2048): each block_m tier the tuned rows use,
     # at its top and with m well below it (rows >= m are masked, not computed)
     (1, 6144, 2048, 8, 24, 64, 4, 4),
@@ -197,16 +202,19 @@ def _atol_rtol(k, split_k, k_waves, dtype):
 
 
 @benchmark()
-def test_hgemm(m, n, k, dtype, policy, split_k):
+def test_hgemm(m, n, k, dtype, policy, split_k, out_dtype=None):
     tile = _tile_for(m, n, k, policy, split_k)
     assert tile is not None, f"no tuned tile for {(m, n, k, policy, split_k)}"
 
     torch.manual_seed(SEED)
     a = torch.empty((m, k), dtype=dtype, device="cuda").uniform_(-1, 1)
     w = torch.empty((n, k), dtype=dtype, device="cuda").uniform_(-1, 1)
-    # Dirty preallocated C, as the model passes out= a buffer it owns.
-    out = torch.randn((m, n), dtype=dtype, device="cuda")
-    ref = run_torch(a, w, dtype)
+    out_dtype = dtype if out_dtype is None else out_dtype
+    # The model owns a contiguous output. Guard both ends of that view.
+    storage = torch.full((m * n + 32,), 8192, dtype=out_dtype, device="cuda")
+    out = storage[16:-16].view(m, n)
+    out.normal_()
+    ref = run_torch(a, w, out_dtype)
 
     kwargs = {
         "block_m": tile["block_m"],
@@ -222,7 +230,7 @@ def test_hgemm(m, n, k, dtype, policy, split_k):
     }
 
     def _run_flydsl():
-        return flydsl_hgemm(a, w, out=out, **kwargs)
+        return flydsl_hgemm(a, w, out=out, out_dtype=out_dtype, **kwargs)
 
     out_mm = torch.empty_like(out)
 
@@ -230,15 +238,36 @@ def test_hgemm(m, n, k, dtype, policy, split_k):
         torch.mm(a, w.t(), out=out_mm)
         return out_mm
 
-    candidates = {"flydsl": _run_flydsl, "torch_mm": _run_torch_mm}
+    candidates = {"flydsl": _run_flydsl}
+    if out_dtype == dtype:
+        # Keep the existing torch.mm kernel comparison for same-dtype output.
+        candidates["torch_mm"] = _run_torch_mm
+    if policy == "sk" and out_dtype == dtypes.fp32 and (n, k) == (896, 7168):
+        # Existing FT candidate, with the same FP32 output contract.
+        ft_kwargs = dict(
+            block_m=16 if m <= 16 else 32,
+            block_n=32,
+            block_k=128,
+            stages=4,
+            split_k=7,
+            m_waves=1 if m <= 16 else 2,
+            n_waves=2,
+            k_waves=1,
+            group_m=0,
+            policy="ft",
+        )
+        out_ft = torch.empty_like(out)
+        candidates["flydsl_ft"] = lambda: flydsl_hgemm(
+            a, w, out=out_ft, out_dtype=out_dtype, **ft_kwargs
+        )
     if policy == "sk":
         # Decode GEMMs run inside a CUDA graph: capture one call and replay it.
         # The eager call first compiles the kernel outside the capture.
-        out_graph = torch.randn((m, n), dtype=dtype, device="cuda")
-        flydsl_hgemm(a, w, out=out_graph, **kwargs)
+        out_graph = torch.randn((m, n), dtype=out_dtype, device="cuda")
+        flydsl_hgemm(a, w, out=out_graph, out_dtype=out_dtype, **kwargs)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            flydsl_hgemm(a, w, out=out_graph, **kwargs)
+            flydsl_hgemm(a, w, out=out_graph, out_dtype=out_dtype, **kwargs)
         out_graph.normal_()
 
         def _run_flydsl_graph():
@@ -247,12 +276,33 @@ def test_hgemm(m, n, k, dtype, policy, split_k):
 
         candidates["flydsl_graph"] = _run_flydsl_graph
 
+        from aiter.tuned_gemm import flydsl_gemm
+
+        config = {
+            "kernelName": flydsl_hgemm_kernel_name(
+                dtype=dtype,
+                out_dtype=out_dtype,
+                config=dict(tile, policy="sk"),
+                has_bias=False,
+            )
+        }
+        parsed = get_flydsl_hgemm_kernel_params(config["kernelName"])
+        assert parsed is not None and parsed["out_dtype"] == (
+            "fp32" if out_dtype == dtypes.fp32 else "bf16"
+        )
+        out_tuned = torch.empty_like(out)
+        candidates["flydsl_tuned"] = lambda: flydsl_gemm(
+            a, w, 0, otype=out_dtype, config=config, out=out_tuned
+        )
+
     flops = 2 * m * n * k
     nbytes = (
         m * k * a.element_size() + n * k * w.element_size() + m * n * out.element_size()
     )
-    if policy == "sk":
-        # partials are summed in fp32 inside the workgroup: one bf16 rounding
+    if policy == "sk" and out_dtype == dtypes.fp32:
+        atol, rtol = 5e-4, 2e-4
+    elif policy == "sk":
+        # Partials are summed in FP32 inside the workgroup: one BF16 rounding.
         atol, rtol = _atol_rtol(k, 1, 1, dtype)
     else:
         atol, rtol = _atol_rtol(k, split_k, tile["k_waves"], dtype)
@@ -278,6 +328,43 @@ def test_hgemm(m, n, k, dtype, policy, split_k):
         ret[f"{name} TFLOPS"] = flops / us / 1e6
         ret[f"{name} TB/s"] = nbytes / us / 1e6
         ret[f"{name} err"] = err
+        if policy == "sk" and out_dtype == dtypes.fp32:
+            assert y.dtype == dtypes.fp32
+            assert err == 0, f"{name}: FP32 output mismatch {err}"
+            rms = ((y - ref).square().mean() / ref.square().mean()).sqrt().item()
+            assert rms < 2e-5, f"{name}: FP32 normalized RMSE {rms}"
+    assert torch.all(storage[:16] == 8192) and torch.all(storage[-16:] == 8192)
+    if policy == "sk" and out_dtype == dtypes.fp32:
+        # Alternate the output dtype on the same specialization key.
+        rounded = flydsl_hgemm(a, w, out_dtype=dtypes.bf16, **kwargs)
+        torch.testing.assert_close(rounded, ref.to(dtypes.bf16), rtol=0.01, atol=0.01)
+        assert not torch.equal(out, out.to(dtypes.bf16).float())
+        # Inference from out.dtype must select the FP32 specialization too.
+        inferred = flydsl_hgemm(a, w, out=out, **kwargs)
+        assert inferred.data_ptr() == out.data_ptr() and inferred.dtype == out_dtype
+        err = checkAllclose(
+            ref,
+            inferred,
+            rtol=rtol,
+            atol=atol,
+            tol_err_ratio=0,
+            msg="skinny inferred FP32",
+        )
+        assert err == 0
+        a.neg_()
+        changed_ref = run_torch(a, w, dtypes.fp32)
+        for _ in range(3):
+            out_graph.fill_(float("nan"))
+            graph.replay()
+            err = checkAllclose(
+                changed_ref,
+                out_graph,
+                rtol=rtol,
+                atol=atol,
+                tol_err_ratio=0,
+                msg="skinny FP32 changed-input graph",
+            )
+            assert err == 0
     return ret
 
 
@@ -357,14 +444,19 @@ def check_skinny_rejects():
         "M above block_m": {"m": 9, "n": 6144, "k": 2048},
         "bias": {"m": 4, "n": 6144, "k": 2048, "bias": True},
         "fp16 input": {"m": 4, "n": 6144, "k": 2048, "dtype": dtypes.fp16},
+        "fp16 output": {"m": 4, "n": 6144, "k": 2048, "out_dtype": dtypes.fp16},
     }
     for what, c in cases.items():
         dtype = c.get("dtype", dtypes.bf16)
-        a = torch.randn((c["m"], c["k"]), dtype=dtype)
-        w = torch.randn((c["n"], c["k"]), dtype=dtype)
-        bias = torch.randn((c["n"],), dtype=dtype) if c.get("bias") else None
+        a = torch.randn((c["m"], c["k"]), dtype=dtype, device="cuda")
+        w = torch.randn((c["n"], c["k"]), dtype=dtype, device="cuda")
+        bias = (
+            torch.randn((c["n"],), dtype=dtype, device="cuda")
+            if c.get("bias")
+            else None
+        )
         try:
-            flydsl_hgemm(a, w, bias=bias, **sk)
+            flydsl_hgemm(a, w, bias=bias, out_dtype=c.get("out_dtype"), **sk)
         except ValueError:
             continue
         raise AssertionError(f"skinny policy accepted an unsupported input: {what}")
@@ -373,13 +465,13 @@ def check_skinny_rejects():
     # here is a GPU memory fault rather than an exception
     host = {
         "b on cpu": lambda: flydsl_hgemm(
-            torch.randn((4, 2048), dtype=dtypes.bf16),
+            torch.randn((4, 2048), dtype=dtypes.bf16, device="cuda"),
             torch.randn((6144, 2048), dtype=dtypes.bf16, device="cpu"),
             **sk,
         ),
         "out on cpu": lambda: flydsl_hgemm(
-            torch.randn((4, 2048), dtype=dtypes.bf16),
-            torch.randn((6144, 2048), dtype=dtypes.bf16),
+            torch.randn((4, 2048), dtype=dtypes.bf16, device="cuda"),
+            torch.randn((6144, 2048), dtype=dtypes.bf16, device="cuda"),
             out=torch.empty((4, 6144), dtype=dtypes.bf16, device="cpu"),
             **sk,
         ),
@@ -391,8 +483,22 @@ def check_skinny_rejects():
             continue
         raise AssertionError(f"skinny policy accepted a host tensor: {what}")
 
+    a = torch.randn((4, 2048), dtype=dtypes.bf16, device="cuda")
+    w = torch.randn((6144, 2048), dtype=dtypes.bf16, device="cuda")
+    bad_outputs = (
+        torch.empty((4, 6144), dtype=dtypes.bf16, device="cuda"),
+        torch.empty((4, 6144), dtype=dtypes.fp16, device="cuda"),
+        torch.empty((6144, 4), dtype=dtypes.fp32, device="cuda").t(),
+    )
+    for out in bad_outputs:
+        try:
+            flydsl_hgemm(a, w, out=out, out_dtype=dtypes.fp32, **sk)
+        except ValueError:
+            continue
+        raise AssertionError("skinny FP32 accepted an incompatible output")
     aiter.logger.info(
-        "skinny policy rejects all %d unsupported inputs", len(cases) + len(host)
+        "skinny policy rejects all %d unsupported inputs",
+        len(cases) + len(host) + len(bad_outputs),
     )
 
 
@@ -426,8 +532,8 @@ def check_skinny_large_weight():
         "policy": "sk",
     }
     torch.manual_seed(SEED)
-    a = torch.empty((1, k), dtype=dtypes.bf16).uniform_(-1, 1)
-    w = torch.empty((n, k), dtype=dtypes.bf16).uniform_(-1, 1)
+    a = torch.empty((1, k), dtype=dtypes.bf16, device="cuda").uniform_(-1, 1)
+    w = torch.empty((n, k), dtype=dtypes.bf16, device="cuda").uniform_(-1, 1)
     y = flydsl_hgemm(a, w, **sk)
     atol, rtol = _atol_rtol(k, 1, 1, dtypes.bf16)
     checkAllclose(
@@ -850,7 +956,10 @@ def main():
         for m, n, k, policy, split_k, _tile in _all_rows():
             if (m, n, k) not in wanted:
                 continue
-            rows.append(test_hgemm(m, n, k, dtype, policy, split_k))
+            outputs = args.out_dtype if policy == "sk" else [dtype]
+            for out_dtype in outputs:
+                if out_dtype in (dtype, dtypes.fp32):
+                    rows.append(test_hgemm(m, n, k, dtype, policy, split_k, out_dtype))
         summarize(f"flydsl_hgemm {dtype}", rows)
         rows = [
             test_hgemm_concurrent_copy(m, n, k, dtype)
