@@ -244,18 +244,18 @@ def test_hgemm(m, n, k, dtype, policy, split_k, out_dtype=None):
         candidates["torch_mm"] = _run_torch_mm
     if policy == "sk" and out_dtype == dtypes.fp32 and (n, k) == (896, 7168):
         # Existing FT candidate, with the same FP32 output contract.
-        ft_kwargs = dict(
-            block_m=16 if m <= 16 else 32,
-            block_n=32,
-            block_k=128,
-            stages=4,
-            split_k=7,
-            m_waves=1 if m <= 16 else 2,
-            n_waves=2,
-            k_waves=1,
-            group_m=0,
-            policy="ft",
-        )
+        ft_kwargs = {
+            "block_m": 16 if m <= 16 else 32,
+            "block_n": 32,
+            "block_k": 128,
+            "stages": 4,
+            "split_k": 7,
+            "m_waves": 1 if m <= 16 else 2,
+            "n_waves": 2,
+            "k_waves": 1,
+            "group_m": 0,
+            "policy": "ft",
+        }
         out_ft = torch.empty_like(out)
         candidates["flydsl_ft"] = lambda: flydsl_hgemm(
             a, w, out=out_ft, out_dtype=out_dtype, **ft_kwargs

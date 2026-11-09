@@ -16,18 +16,18 @@ pytestmark = pytest.mark.skipif(get_gfx() != "gfx950", reason="skinny is gfx950 
 
 def _config(m):
     # Same wave-private ring for both epilogues, with room for FP32 partials.
-    return dict(
-        block_m=16 if m <= 16 else 32,
-        block_n=16,
-        block_k=64,
-        stages=3,
-        split_k=1,
-        m_waves=1,
-        n_waves=1,
-        k_waves=4,
-        group_m=0,
-        policy="sk",
-    )
+    return {
+        "block_m": 16 if m <= 16 else 32,
+        "block_n": 16,
+        "block_k": 64,
+        "stages": 3,
+        "split_k": 1,
+        "m_waves": 1,
+        "n_waves": 1,
+        "k_waves": 4,
+        "group_m": 0,
+        "policy": "sk",
+    }
 
 
 @pytest.mark.parametrize(
@@ -65,7 +65,7 @@ def test_output_contract(m, n, k, monkeypatch):
         monkeypatch.setattr(
             tuned_gemm,
             "get_GEMM_A16W16_config",
-            lambda **kwargs: {
+            lambda name=name, **kwargs: {
                 "libtype": "flydsl",
                 "solidx": 0,
                 "kernelName": name,
