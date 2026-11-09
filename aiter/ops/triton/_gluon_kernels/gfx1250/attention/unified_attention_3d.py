@@ -14,6 +14,11 @@ from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils.common_utils import strip_annotate
 from aiter.ops.triton.utils.types import e4m3_dtype
 
+# tdm.async_gather with whichever signature this Triton has (see unified_attention_2d.py)
+from aiter.ops.triton._gluon_kernels.gfx1250.attention.unified_attention_2d import (
+    _tdm_gather,
+)
+
 # from triton._C.libtriton.gluon_ir import make_cga_layout
 
 DEVICE_ARCH = arch_info.get_arch()
@@ -435,6 +440,10 @@ class AttentionConfig:
             or NUM_BLOCKS_GATHER_PER_TILE == 4
             or NUM_BLOCKS_GATHER_PER_TILE == 8
         )
+        # the NVFP4 scale descriptors and their loads exist only for one page per tile
+        assert (
+            KV_CACHE_DTYPE != "nvfp4" or NUM_BLOCKS_GATHER_PER_TILE == 1
+        ), "NVFP4 KV cache supports NUM_BLOCKS_GATHER_PER_TILE == 1 only"
 
         HEAD_SIZE_LOAD = HEAD_SIZE
         if self.QUERY_DTYPE == "nvfp4":
@@ -1398,12 +1407,7 @@ class AttentionProgram:
             src_row_indices = (block_idx * self.cfg.NUM_KV_HEADS + self.kv_head_idx).to(
                 gl.int32
             )
-            gl.amd.gfx1250.tdm.async_gather(
-                self.k_desc,
-                src_row_indices,
-                0,
-                self.k_shared.index(buffer_id),
-            )
+            _tdm_gather(self.k_desc, src_row_indices, self.k_shared.index(buffer_id))
 
     @gluon.jit
     def tdm_load_global_to_shared_v(self, block_idx, buffer_id):
@@ -1435,12 +1439,7 @@ class AttentionProgram:
             src_row_indices = (block_idx * self.cfg.NUM_KV_HEADS + self.kv_head_idx).to(
                 gl.int32
             )
-            gl.amd.gfx1250.tdm.async_gather(
-                self.v_desc,
-                src_row_indices,
-                0,
-                self.v_shared.index(buffer_id),
-            )
+            _tdm_gather(self.v_desc, src_row_indices, self.v_shared.index(buffer_id))
 
     @gluon.jit
     def compute_qk(self, k, q_scales, k_scales):
