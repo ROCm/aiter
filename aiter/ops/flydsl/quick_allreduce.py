@@ -1,17 +1,18 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Host launch for gfx942/gfx950 TP∈{2,4,8} INT4/INT6 all-reduce.
+"""Host launch for gfx942/gfx950 TP∈{2,4,8} INT4/INT5/INT6 all-reduce.
 
-Public type ``QuickAllReduceInt4``, with two interchangeable schedules selected
+Public type ``FlyQuickAllReduce``, with two interchangeable schedules selected
 by ``algorithm``. Both are two-shot -- reduce-scatter then all-gather -- so
 they are named for the topology of each lap instead:
 
 * ``"mesh"`` the default: fanout to all N-1 peers, twice.
 * ``"ring"`` 2(N-1) single-destination hops.
 
-Super-tile ST∈{1,8} on the mesh, ST∈{1,8,16,32} on the ring. INT4 nibble or
-INT6 bit-plane pair, both with group-16 E5M2 scales. Payload HBM is bf16.
+Super-tile ST∈{1,8} on the mesh, ST∈{1,8,16,32} on the ring. INT4 nibble,
+INT5 nibble+1-bit plane, or INT6 bit-plane pair, all with group-16 E5M2
+scales. INT5 is mesh-only. Payload HBM is bf16.
 
 The kernel configuration comes from a tuning ladder of ``TwoShotRung``, keyed
 on ``(arch, link, world_size)`` in ``allreduce_policy``.
@@ -45,35 +46,36 @@ from .allreduce_host_shared import (
 )
 from .allreduce_policy import (
     MIN_BATCH_BLOCKS,
+    PAYLOAD_ALIGN_BYTES,
+    QUANT_MIN_PAYLOAD_BYTES,
     RS_INT6_MIN_WORLD,
+    SUPPORTED_BLOCKS,
+    TwoShotRung,
     mesh_norm_ladder,
     mesh_st_ladder,
     resolve_link,
     ring_st_ladder,
+    select_rung,
 )
 from .kernels.comm.allreduce_shared import (
     BLOCK,
-    QUANT_MIN_PAYLOAD_BYTES,
-    SUPPORTED_BLOCKS,
     WORLD,
-    TwoShotRung,
     has_release_fence,
-    select_rung,
 )
-from .kernels.comm.quick_allreduce_int4 import (
+from .kernels.comm.quick_allreduce_mesh import (
     DEFAULT_ATOMS,
     DEFAULT_DIVISOR,
     MESH_CODECS,
     SUPER_TILES,
     clamp_grid_cap,
     latency_max_tiles,
-    make_quick_allreduce_int4_kernel,
+    make_quick_allreduce_mesh_kernel,
     max_payload_bytes,
     mesh_lds_bytes,
     mxfp4_scale_shape,
     tile_atoms_for,
 )
-from .kernels.comm.quick_allreduce_int4_ring import (
+from .kernels.comm.quick_allreduce_ring import (
     AG_CODECS,
     RING_SUPER_TILES,
     RS_CODECS,
@@ -98,7 +100,7 @@ DIVISOR_MAX = 128.0
 def _check_divisor(divisor: float) -> float:
     """One shared positive divisor. ``1`` disables the scaling."""
     msg = (
-        f"QuickAllReduceInt4 divisor must be a finite float in "
+        f"FlyQuickAllReduce divisor must be a finite float in "
         f"[{DIVISOR_MIN:g}, {DIVISOR_MAX:g}], got {divisor!r}"
     )
     try:
@@ -132,6 +134,8 @@ class _Algorithm:
     norm_ptr_args: int = 0
     # Whether the kernel takes the shared ``divisor`` as its last argument.
     has_divisor: bool = False
+    # Mesh carries one format on both laps. The ring may differ.
+    single_codec: bool = False
 
 
 def _build_mesh(
@@ -151,7 +155,7 @@ def _build_mesh(
             f"mesh algorithm has one wire format for both laps, got "
             f"rs_codec={rs_codec!r} != ag_codec={ag_codec!r}"
         )
-    return make_quick_allreduce_int4_kernel(
+    return make_quick_allreduce_mesh_kernel(
         world_size=world_size,
         super_tile=super_tile,
         grid=grid,
@@ -176,6 +180,7 @@ ALGORITHMS = {
         norm_ladder=mesh_norm_ladder,
         norm_ptr_args=NORM_PTR_ARGS,
         has_divisor=True,
+        single_codec=True,
     ),
     "ring": _Algorithm(
         name="ring",
@@ -199,15 +204,28 @@ def _resolve_codecs(algo, world_size, rs_codec, ag_codec):
     downgrade, not a restatement of the default.
 
     A codec the selected schedule cannot build raises. The per-N *default*
-    silently narrows to what the schedule supports -- the mesh has no INT6
-    path, so the ring's INT6 reduce-scatter default does not leak into it.
+    silently narrows to what the schedule supports.
 
-    The mesh has one wire format for both laps, so there ``rs_codec`` and
-    ``ag_codec`` follow each other: give either one and the other takes the
-    same value. Giving two different values raises when the kernel is built.
+    The mesh is single-codec: ``rs_codec`` and ``ag_codec`` follow each other,
+    so give either one and the other takes the same value, and giving two
+    different values raises. It stays on INT4 unless a caller names another
+    format, so the ring's INT6 reduce-scatter default does not leak into it.
     """
-    if algo.name == "mesh" and (rs_codec is None) != (ag_codec is None):
-        rs_codec = ag_codec = rs_codec if rs_codec is not None else ag_codec
+    if algo.single_codec:
+        if rs_codec is not None and ag_codec is not None and rs_codec != ag_codec:
+            raise ValueError(
+                f"{algo.name} algorithm carries one wire format, got "
+                f"rs_codec={rs_codec!r} != ag_codec={ag_codec!r}"
+            )
+        chosen = rs_codec if rs_codec is not None else ag_codec
+        if chosen is None:
+            chosen = "int4"
+        if chosen not in algo.rs_codecs:
+            raise ValueError(
+                f"rs_codec must be one of {algo.rs_codecs} for "
+                f"algorithm={algo.name!r}, got {chosen!r}"
+            )
+        return chosen, chosen
 
     rs_default = "int6" if world_size >= RS_INT6_MIN_WORLD else "int4"
 
@@ -234,7 +252,7 @@ def _resolve_codecs(algo, world_size, rs_codec, ag_codec):
 
 
 def batches_publishes(inbox_memory: str, algorithm: str, link: str) -> bool:
-    """Whether ``QuickAllReduceInt4`` batches publishes into super-tiles.
+    """Whether ``FlyQuickAllReduce`` batches publishes into super-tiles.
 
     Always with a release fence, where every publish is an L2 writeback. The
     PCIe ring batches without one too: each of its ``2(N-1)`` hops ends in a
@@ -243,8 +261,8 @@ def batches_publishes(inbox_memory: str, algorithm: str, link: str) -> bool:
     return has_release_fence(inbox_memory) or (algorithm == "ring" and link == "pcie")
 
 
-class QuickAllReduceInt4:
-    """IPC inbox + flag buffer and launch wrapper for ``quick_allreduce_int4``.
+class FlyQuickAllReduce:
+    """IPC inbox + flag buffer and launch wrapper for ``quick_allreduce_mesh``.
 
     Requires a non-NCCL, single-node process group for IPC metadata exchange.
 
@@ -312,9 +330,9 @@ class QuickAllReduceInt4:
         link = resolve_link(link)
         rs_codec, ag_codec = _resolve_codecs(algo, int(world_size), rs_codec, ag_codec)
         _validate_ipc_process_group(
-            group, rank=int(rank), world_size=world_size, owner="QuickAllReduceInt4"
+            group, rank=int(rank), world_size=world_size, owner="FlyQuickAllReduce"
         )
-        arch = require_arch(owner="QuickAllReduceInt4")
+        arch = require_arch(owner="FlyQuickAllReduce")
         if ladder is None:
             ladder = algo.st_ladder(world_size=world_size, link=link, arch=arch)
         if not ladder:
@@ -330,7 +348,7 @@ class QuickAllReduceInt4:
         inbox_flags, resolved_inbox = _resolve_inbox_flags(
             inbox_memory, world_size, link
         )
-        self._device_index = _cuda_index(device, owner="QuickAllReduceInt4")
+        self._device_index = _cuda_index(device, owner="FlyQuickAllReduce")
         self.group = group
         self.device = torch.device("cuda", self._device_index)
         self.rank = int(rank)
@@ -743,7 +761,7 @@ class QuickAllReduceInt4:
         self._check_norm(hidden * 2, hidden)
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
-                f"QuickAllReduceInt4: the fused RMSNorm at hidden={hidden} is "
+                f"FlyQuickAllReduce: the fused RMSNorm at hidden={hidden} is "
                 "not prepared, and preparing it builds IPC engines and compiles "
                 "kernels, which cannot run under CUDA graph capture; pass "
                 f"rmsnorm_hidden=({hidden},) to the constructor, or call "
@@ -938,7 +956,7 @@ class QuickAllReduceInt4:
         mxfp4=None,
     ):
         live_bytes = check_payload(
-            inp, out, device_index=self._device_index, owner="QuickAllReduceInt4"
+            inp, out, device_index=self._device_index, owner="FlyQuickAllReduce"
         )
         hidden = int(weight.numel())
         self._check_norm(live_bytes, hidden)
@@ -953,8 +971,11 @@ class QuickAllReduceInt4:
                 raise ValueError(f"{name} must be a bf16 tensor")
             if not t.is_cuda or t.device.index != self._device_index:
                 raise ValueError(f"{name} must be on cuda:{self._device_index}")
-            if not t.is_contiguous() or int(t.data_ptr()) % 16 != 0:
-                raise ValueError(f"{name} must be contiguous and 16-byte aligned")
+            if not t.is_contiguous() or int(t.data_ptr()) % PAYLOAD_ALIGN_BYTES:
+                raise ValueError(
+                    f"{name} must be contiguous and "
+                    f"{PAYLOAD_ALIGN_BYTES}-byte aligned"
+                )
         if residual.numel() != inp.numel() or residual_out.numel() != inp.numel():
             raise ValueError("residual/residual_out must match inp numel")
 
@@ -999,7 +1020,7 @@ class QuickAllReduceInt4:
         launch = self.norm_launch(cfg, hidden, gemma_norm, latency, mxfp4 is not None)
         if torch.cuda.is_current_stream_capturing() and not launcher_loaded(launch):
             raise RuntimeError(
-                f"QuickAllReduceInt4: fused build {kernel_symbol(launch)} is not "
+                f"FlyQuickAllReduce: fused build {kernel_symbol(launch)} is not "
                 "loaded, and loading it cannot run under CUDA graph capture"
             )
         self._launch_eng(
@@ -1060,16 +1081,16 @@ class QuickAllReduceInt4:
             not self._algo.has_divisor or "int4" not in (self.rs_codec, self.ag_codec)
         ):
             raise ValueError(
-                "QuickAllReduceInt4 divisor is only supported by the mesh "
+                "FlyQuickAllReduce divisor is only supported by the mesh "
                 f"algorithm with the int4 codec, got algorithm={self.algorithm!r}, "
                 f"rs_codec={self.rs_codec!r}, ag_codec={self.ag_codec!r}"
             )
 
     def allreduce(self, inp, out, stream=None, divisor: float = DEFAULT_DIVISOR):
-        """Two-shot INT4 all-reduce into ``out``.
+        """Two-shot all-reduce into ``out``, in this engine's wire codecs.
 
         ``stream=None`` uses the current PyTorch stream on this device.
-        ``divisor`` defaults to 1, which keeps the previous INT4 result.
+        ``divisor`` defaults to 1, which leaves the result unchanged.
         Loaded values are divided by it before the first pack, and the
         finished sum is multiplied by it once. Every rank must pass the same
         divisor; this is not checked, and a mismatch silently gives each rank
@@ -1079,11 +1100,11 @@ class QuickAllReduceInt4:
         divisor = _check_divisor(divisor)
         self._check_divisor_supported(divisor)
         live_bytes = check_payload(
-            inp, out, device_index=self._device_index, owner="QuickAllReduceInt4"
+            inp, out, device_index=self._device_index, owner="FlyQuickAllReduce"
         )
         if not self.is_beneficial(live_bytes):
             raise ValueError(
-                f"QuickAllReduceInt4.allreduce got a {live_bytes} B payload, "
+                f"FlyQuickAllReduce.allreduce got a {live_bytes} B payload, "
                 f"below the {self.min_bytes} B floor: at decode sizes this "
                 "kernel saves a few microseconds on a collective that is not "
                 "the bottleneck, and charges ~36 dB of SQNR for them. Route "
