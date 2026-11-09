@@ -172,8 +172,6 @@ def run_benchmark(args):
 
     # sparse_mla_fwd raises on an fp8 cache outside FP8_SCALAR_ARCHS, and
     # triton's harness does not catch it, so drop those series instead.
-    # "bf16" is the bf16 cache. "fp8-bf16" is the fp8 cache with bf16 dots,
-    # the middle of the three; "fp8" is the fp8 cache with fp8 dots.
     dot_vals = ["bf16"]
     dot_names = ["bf16 cache"]
     dot_styles = [("green", "-")]

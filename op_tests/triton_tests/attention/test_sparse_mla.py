@@ -249,13 +249,11 @@ def test_packed_cache_arch_gate(arch):
 
 
 def test_fp8_scalar_two_loop_rejected_off_packed_arch():
-    """fp8_scalar plus extra_kv used to skip the packed-arch gate and launch the
-    gluon kernel. The two-loop stays on the packed arch for every cache format.
-    Going through sparse_mla_fwd catches the gate losing that call site.
+    """The two-loop stays on the packed arch for every cache format, fp8_scalar
+    included.
 
-    Both segments are a real 3-D block pool. A 2-D cache fails the shape check
-    with an error that also says "two-loop", so it would still pass if the
-    arch gate were removed.
+    Both segments are a real 3-D block pool: a 2-D cache fails the shape check
+    with an error that also says "two-loop", so it would pass without the gate.
     """
     arch = arch_info.get_arch()
     if arch not in SUPPORTED_ARCHS or arch in smd.PACKED_ARCHS:
@@ -595,16 +593,12 @@ def test_sparse_mla_fp8_two_caches(one_alloc, mxfp8, splits):
 
 def test_fp8_dots_keep_the_softmax_tail():
     """Each query's first key scores 9 above the other 2047, which carry a fifth
-    of the output at p ~ 1e-4 each. That is below the smallest subnormal of both
-    e4m3 encodings (fnuz 2^-10, OCP 2^-9) unless P_SCALE lifts p before the PV
-    dot. With split-K off, one program quantizes every tail p after the max.
+    of the output at p ~ 1e-4 each, below both e4m3 encodings' smallest
+    subnormal unless P_SCALE lifts p before the PV dot; split-K is off so one
+    program quantizes every tail p after the max.
 
-    gfx942 scales by 128 and the tail survives. gfx950 leaves P_SCALE at 1, so
-    p is cast as itself and the tail flushes; the case still runs there.
-
-    has_invalid holds both archs on the generic kernel this PR changes. Every
-    index is valid, so the masked path reads the same rows, but without it
-    gfx950 takes the custom fp8 kernel (sparse_mla_fp8.py) instead.
+    has_invalid holds both archs on the generic kernel, which gfx950 would
+    otherwise skip for the custom fp8 kernel; every index here is valid.
     """
     arch = arch_info.get_arch()
     if arch not in FP8_SCALAR_ARCHS:
