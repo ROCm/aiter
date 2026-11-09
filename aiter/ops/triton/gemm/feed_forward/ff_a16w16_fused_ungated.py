@@ -6,7 +6,7 @@ import warnings
 import torch
 import triton
 
-from aiter.ops.triton._triton_kernels.activation import _get_activation_from_str
+from aiter.ops.triton._triton_kernels.common.activation import _get_activation_from_str
 from aiter.ops.triton._triton_kernels.gemm.feed_forward.ff_a16w16_fused_ungated import (
     _ff_a16w16_fused_ungated,
     _get_config,
@@ -43,7 +43,10 @@ def ff_a16w16_fused_ungated(
     """
 
     _LOGGER.info(
-        f"FF_A16W16_FUSED_UNGATED: x={tuple(x.shape)} w_up={tuple(w_up.shape)} w_down={tuple(w_down.shape) }"
+        "FF_A16W16_FUSED_UNGATED: x=%s w_up=%s w_down=%s",
+        tuple(x.shape),
+        tuple(w_up.shape),
+        tuple(w_down.shape),
     )
 
     # Shape checks
@@ -70,6 +73,11 @@ def ff_a16w16_fused_ungated(
 
     if config is None:
         config, _ = _get_config(M, N, K)
+
+    # NUM_KSPLIT is part of the GEMM config schema but this fused kernel has no
+    # selectable split-K; strip it (without mutating a caller-supplied dict) so
+    # it is not forwarded as an unknown kernel argument.
+    config = {k: v for k, v in config.items() if k != "NUM_KSPLIT"}
 
     grid = lambda META: (
         triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),

@@ -1,0 +1,13 @@
+{
+    "fused_kda_spec_parallel_v_kernel": {
+        "BV": 16,
+        "MIN_SPEC_TOKENS": 3,
+        "MIN_BATCH_FOR_WIDTH2": 16,
+        "num_warps": 2,
+        "num_stages": 2
+    },
+    "fused_kda_spec_finalize_kernel": {
+        "num_warps": 2,
+        "num_stages": 2
+    }
+}

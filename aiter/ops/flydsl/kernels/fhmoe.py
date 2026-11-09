@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Heterogeneous MoE facades for the shared MXFP4/FP8 kernel builders."""
+"""Heterogeneous MoE facades for MXFP4/MXFP8 routed and FP8 shared weights."""
 
 import functools
 
@@ -28,8 +28,6 @@ def compile_mixed_fhmoe_gemm1(
     b_dtype: str = "fp4",
     out_dtype: str = "f16",
     act: str = "silu",
-    situ_beta: float = 1.0,
-    situ_linear_beta: float = 1.0,
     use_cshuffle_epilog: bool | None = None,
     enable_bias: bool = False,
     model_dim_pad: int = 0,
@@ -43,10 +41,12 @@ def compile_mixed_fhmoe_gemm1(
     a_scale_one: bool = False,
     xcd_swizzle: int = 0,
     k_wave: int = 1,
+    v2_output_layout: bool = False,
     shared_expert_id: int,
+    clamp_shared: bool = True,
 ):
     """Compile a stage1 kernel with an FP8 shared expert."""
-    if shared_expert_id is None:
+    if shared_expert_id != experts - 1:
         raise ValueError(
             "FHMoE stage1 requires shared_expert_id == experts - 1; "
             f"got {shared_expert_id=} and {experts=}"
@@ -64,8 +64,6 @@ def compile_mixed_fhmoe_gemm1(
         b_dtype=b_dtype,
         out_dtype=out_dtype,
         act=act,
-        situ_beta=situ_beta,
-        situ_linear_beta=situ_linear_beta,
         use_cshuffle_epilog=use_cshuffle_epilog,
         enable_bias=enable_bias,
         model_dim_pad=model_dim_pad,
@@ -79,7 +77,9 @@ def compile_mixed_fhmoe_gemm1(
         a_scale_one=a_scale_one,
         xcd_swizzle=xcd_swizzle,
         k_wave=k_wave,
+        v2_output_layout=v2_output_layout,
         shared_expert_id=shared_expert_id,
+        clamp_shared=clamp_shared,
     )
 
 
@@ -110,9 +110,10 @@ def compile_mixed_fhmoe_gemm2(
     b_nt: int = 0,
     xcd_swizzle: int = 0,
     shared_expert_id: int,
+    use_global_a: bool = True,
 ):
     """Compile a stage2 kernel with an FP8 shared expert."""
-    if shared_expert_id is None:
+    if shared_expert_id != experts - 1:
         raise ValueError(
             "FHMoE stage2 requires shared_expert_id == experts - 1; "
             f"got {shared_expert_id=} and {experts=}"
@@ -138,6 +139,7 @@ def compile_mixed_fhmoe_gemm2(
         sort_block_m=sort_block_m,
         waves_per_eu=waves_per_eu,
         use_async_copy=use_async_copy,
+        use_global_a=use_global_a,
         cu_num_mul=cu_num_mul,
         b_nt=b_nt,
         xcd_swizzle=xcd_swizzle,

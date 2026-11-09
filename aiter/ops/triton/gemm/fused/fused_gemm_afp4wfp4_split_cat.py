@@ -11,6 +11,7 @@ from aiter.ops.triton._triton_kernels.gemm.fused.fused_gemm_afp4wfp4_split_cat i
     _fused_gemm_afp4wfp4_split_cat_reduce,
 )
 from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import get_splitk
+from aiter.ops.triton.utils.device_info import get_num_xcds
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
@@ -55,7 +56,12 @@ def fused_gemm_afp4wfp4_split_cat(
     NOTE: N must be D * (S1 + S2)
     """
     _LOGGER.info(
-        f"FUSED_GEMM_AFP4WFP4_SPLIT_CAT: x={tuple(x.shape)} w={tuple(w.shape)} y={tuple(y.shape)} x_scale={tuple(x_scale.shape)} w_scale={tuple(w_scale.shape)}"
+        "FUSED_GEMM_AFP4WFP4_SPLIT_CAT: x=%s w=%s y=%s x_scale=%s w_scale=%s",
+        tuple(x.shape),
+        tuple(w.shape),
+        tuple(y.shape),
+        tuple(x_scale.shape),
+        tuple(w_scale.shape),
     )
 
     M, K = x.shape
@@ -149,6 +155,7 @@ def fused_gemm_afp4wfp4_split_cat(
         w_scale.stride(0),
         w_scale.stride(1),
         **config,
+        NUM_XCDS=get_num_xcds(),
     )
 
     if config["NUM_KSPLIT"] > 1:
@@ -235,7 +242,12 @@ def fused_gemm_afp4wfp4_preshuffle_split_cat(
     NOTE: N must be D * (S1 + S2)
     """
     _LOGGER.info(
-        f"FUSED_GEMM_AFP4WFP4_PRESHUFFLE_SPLIT_CAT: x={tuple(x.shape)} w={tuple(w.shape)} y={tuple(y.shape)} x_scale={tuple(x_scale.shape)} w_scale={tuple(w_scale.shape)}"
+        "FUSED_GEMM_AFP4WFP4_PRESHUFFLE_SPLIT_CAT: x=%s w=%s y=%s x_scale=%s w_scale=%s",
+        tuple(x.shape),
+        tuple(w.shape),
+        tuple(y.shape),
+        tuple(x_scale.shape),
+        tuple(w_scale.shape),
     )
 
     M, K = x.shape
@@ -328,6 +340,7 @@ def fused_gemm_afp4wfp4_preshuffle_split_cat(
         w_scale.stride(0),
         w_scale.stride(1),
         **config,
+        NUM_XCDS=get_num_xcds(),
     )
 
     if config["NUM_KSPLIT"] > 1:

@@ -39,7 +39,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Update FILE_TIMES from recent runs
+      - name: Update split test times from recent runs
         id: update_times
         env:
           GH_TOKEN: ${{ github.token }}
@@ -49,7 +49,7 @@ jobs:
             --repo "${REPO}" \
             --runs-count "${RUNS_COUNT}" \
             --aggregate "${AGGREGATE}" \
-            --summary-path split-tests-update-summary.md
+            --summary-path "${RUNNER_TEMP}/split-tests-update-summary.md"
 
       - name: Dry run rebalance check (aiter)
         run: bash .github/scripts/split_tests.sh --shards 8 --test-type aiter --dry-run
@@ -62,12 +62,12 @@ jobs:
         run: |
           {
             echo "## Summary"
-            cat split-tests-update-summary.md
+            cat "${RUNNER_TEMP}/split-tests-update-summary.md"
             echo ""
             echo "## Test plan"
             echo "- [x] bash .github/scripts/split_tests.sh --shards 8 --test-type aiter --dry-run"
             echo "- [x] bash .github/scripts/split_tests.sh --shards 8 --test-type triton --dry-run"
-          } > pr-body.md
+          } > "${RUNNER_TEMP}/pr-body.md"
 
       - name: Generate PR GitHub App token
         if: steps.update_times.outputs.changed == 'true'
@@ -86,8 +86,14 @@ jobs:
         with:
           token: ${{ steps.pr_app_token.outputs.token }}
           branch: ci/update-split-tests-file-times
-          title: "CI: auto-update split test FILE_TIMES"
+          title: "CI: auto-update split test times"
           assignees: gyohuangxin
-          body-path: pr-body.md
-          commit-message: "CI: auto-update split test FILE_TIMES"
+          body-path: ${{ runner.temp }}/pr-body.md
+          # Without this the action commits every dirty file in the workspace,
+          # which is how its own PR body and summary reached the repo root in
+          # #5131. This job only ever means to change split test timing data.
+          add-paths: |
+            .github/split-test-times/aiter.tsv
+            .github/split-test-times/triton.tsv
+          commit-message: "CI: auto-update split test times"
           delete-branch: true

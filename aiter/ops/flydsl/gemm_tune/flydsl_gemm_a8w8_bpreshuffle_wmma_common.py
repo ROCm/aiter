@@ -7,12 +7,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from aiter.ops.flydsl.utils import get_shared_memory_per_block
+from aiter.jit.utils.chip_info import get_gfx, get_lds_capacity_bytes
 
 NAME_PREFIX = "flydsl_bpreshuffle_wmma"
 
 WMMA = 16  # WMMA M/N tile granularity
-LDS_BYTES = get_shared_memory_per_block(fallback_gfx="gfx1250")
+LDS_BYTES = get_lds_capacity_bytes(get_gfx())
 _MAX_WARP_TILE = 128
 _MAX_BLOCK_THREADS = 1024  # m_warp * n_warp * WAVE(32)
 
@@ -26,7 +26,7 @@ _TILE_K_OPTS = (128, 256, 512, 1024)
 _NUM_BUFFERS_OPTS = (2, 3, 4)
 _WARP_OPTS = ((1, 4), (2, 2), (4, 1))
 _CLUSTER_OPTS = ((1, 1),)
-_SPLIT_K = (1,)
+_SPLIT_K = (1, 2, 4, 8)
 
 _CLUSTER_MIN_DIM = 8192
 _CLUSTER_MIN_TILES = 32
@@ -90,13 +90,11 @@ def kernel_instance_estimated_lds_bytes(ki: WmmaKernelInstance) -> int:
     stage_pitch = _align_up(stage_bytes, 1024)
     arena_bytes = stage_pitch * ki.num_buffers
 
-    if ki.split_k == 1:  # split_k>1 uses the buffer/atomic store, no LDS D buffer
-        warp_tile_m = ki.tile_m // ki.m_warp
-        warp_tile_n = ki.tile_n // ki.n_warp
-        d_row_stride = warp_tile_n * _ELEM_BYTES_D + _LDS_PAD_D_BYTES
-        total_d_bytes = (ki.m_warp * ki.n_warp) * warp_tile_m * d_row_stride
-        return max(arena_bytes, total_d_bytes)
-    return arena_bytes
+    warp_tile_m = ki.tile_m // ki.m_warp
+    warp_tile_n = ki.tile_n // ki.n_warp
+    d_row_stride = warp_tile_n * _ELEM_BYTES_D + _LDS_PAD_D_BYTES
+    total_d_bytes = (ki.m_warp * ki.n_warp) * warp_tile_m * d_row_stride
+    return max(arena_bytes, total_d_bytes)
 
 
 def _build_kernels_list() -> dict[int, WmmaKernelInstance]:
@@ -137,7 +135,9 @@ def kernel_fits_shape(ki: WmmaKernelInstance, M: int, N: int, K: int) -> bool:
         return False
     if N % ki.tile_n != 0 or K % (ki.split_k * ki.tile_k) != 0:
         return False
-    if (K // ki.split_k) // ki.tile_k < ki.num_buffers:
+    # K=128 with two buffers needs no steady-loop iteration.
+    min_k_tiles = 1 if ki.num_buffers == 2 and K == ki.tile_k == 128 else ki.num_buffers
+    if (K // ki.split_k) // ki.tile_k < min_k_tiles:
         return False
     # M may be ragged; the kernel handles partial M tiles via OOB clamping,
     # so tile_m > M is legal (and needed for small-M decode shapes).

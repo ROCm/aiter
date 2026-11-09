@@ -4,8 +4,9 @@
 import triton
 import triton.language as tl
 
+from aiter.ops.triton._triton_kernels.common.pid_preprocessing import pid_grid
+from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid
 from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 
 _fused_gemm_a8w8_blockscale_mul_add_repr = make_kernel_repr(
@@ -158,7 +159,9 @@ def _fused_gemm_a8w8_blockscale_mul_add_kernel(
 
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
-        for k in range(pid_k * num_k_iter, (pid_k + 1) * num_k_iter):
+        # The last split can run past K, so stop at the last K block
+        k_end = tl.minimum((pid_k + 1) * num_k_iter, tl.cdiv(K, BLOCK_SIZE_K))
+        for k in range(pid_k * num_k_iter, k_end):
             # Load the next block of A and B, generate a mask by checking the K dimension.
             # If it is out of bounds, set it to 0.
             if EVEN_K:
@@ -166,12 +169,12 @@ def _fused_gemm_a8w8_blockscale_mul_add_kernel(
                 b = tl.load(b_ptrs, cache_modifier=cache_modifier)
             else:
                 a = tl.load(
-                    a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0
+                    a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0
                 )
                 b = tl.load(
                     b_ptrs,
                     mask=offs_k[:, None] < K - k * BLOCK_SIZE_K,
-                    other=0,
+                    other=0.0,
                     cache_modifier=cache_modifier,
                 )
 
@@ -234,7 +237,7 @@ def _fused_gemm_a8w8_blockscale_mul_add_kernel(
             c_ptr
             + stride_cm * offs_cm[:, None]
             + stride_cn * offs_cn[None, :]
-            + pid_k * stride_ck
+            + pid_k.to(tl.int64) * stride_ck
         )
         tl.store(c_ptrs, c, mask=c_mask)
 
@@ -290,7 +293,7 @@ def _fused_gemm_a8w8_blockscale_mul_add_reduce_kernel(
     offs_k = tl.arange(0, MAX_KSPLIT)
     c_in_ptrs = (
         c_in_ptr
-        + (offs_k[:, None, None] * stride_c_in_k)
+        + (offs_k[:, None, None].to(tl.int64) * stride_c_in_k)
         + (offs_m[None, :, None] * stride_c_in_m)
         + (offs_n[None, None, :] * stride_c_in_n)
     )
@@ -298,7 +301,7 @@ def _fused_gemm_a8w8_blockscale_mul_add_reduce_kernel(
     if ACTUAL_KSPLIT == MAX_KSPLIT:
         c = tl.load(c_in_ptrs)
     else:
-        c = tl.load(c_in_ptrs, mask=offs_k[:, None, None] < ACTUAL_KSPLIT)
+        c = tl.load(c_in_ptrs, mask=offs_k[:, None, None] < ACTUAL_KSPLIT, other=0.0)
     c = tl.sum(c, axis=0)
 
     if IS_A_SCALAR and IS_A_TENSOR:
@@ -340,6 +343,15 @@ def _get_config(
     M: int,
     N: int,
     K: int,
+    fuse_type: int = 0,
 ):
-
+    # On gfx950 the dedicated FUSED-GEMM-A8W8_BLOCKSCALE-MUL_ADD family recovers
+    # this op's large-M regression (M > 512 -> the "any" bucket) with a fast
+    # 64x64 tile. That same tile is numerically correct for fuse_type=0 (a*Y + b) but
+    # is miscompiled by Triton 3.8 for fuse_type=1 (a*b + Y) (fails correctness), so
+    # fuse_type=1 must fall back to the base GEMM-A8W8_BLOCKSCALE config (128x128), which is
+    # correct. fuse_type=1 therefore does not get the large-M speedup.
+    if arch_info.get_arch() == "gfx950" and fuse_type == 0:
+        return get_gemm_config("FUSED-GEMM-A8W8_BLOCKSCALE-MUL_ADD", M, N, K)
+    # fuse_type=1 on gfx950 (64x64 miscompiles) and all other arches use the base.
     return get_gemm_config("GEMM-A8W8_BLOCKSCALE", M, N, K)

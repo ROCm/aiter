@@ -57,6 +57,10 @@ def create_random_logits(
             random_bottom_bits & last_10_bits_mask
         )
         logits = logits_bits.view(dtype)
+    else:
+        # Without this the shared epilogue below reads an unassigned `logits`
+        # and fails with an UnboundLocalError pointing at the wrong line.
+        raise ValueError(f"unimplemented data_generation {data_generation!r}")
     for i, end in enumerate(row_ends):
         logits[i, end:] = float("-inf")
     return logits
@@ -426,8 +430,13 @@ def test_top_k_per_row_prefill(
     print(f"\n{'='*80}")
     print("Running Fast Kernel performance test (101 iterations)...")
     print(f"{'='*80}")
-    us_fast = 1e6  # Default large value
-    if get_gfx() == "gfx942":
+    # top_k_per_row_prefill_fast only has a gfx942 implementation. Anywhere
+    # else it is never launched, so indices_fast keeps the -1 fill it was
+    # allocated with; comparing that buffer or deriving a speedup from it
+    # reports a kernel failure that never happened.
+    fast_supported = get_gfx() == "gfx942"
+    us_fast = None
+    if fast_supported:
         _, us_fast = run_top_k_per_row_prefill_fast(
             logits,
             row_starts,
@@ -439,12 +448,15 @@ def test_top_k_per_row_prefill(
             logits.stride(1),
         )
         print(f"Fast Kernel performance test completed: {us_fast:.2f} us")
+    else:
+        print(f"Skipped: no fast kernel for {get_gfx()}")
 
     # Print indices_fast results
-    print(f"\n{'='*80}")
-    print("indices_fast all results")
-    print(f"{'='*80}")
-    print(f"indices_fast first 10 numbers: {indices_fast[0, :10]}")
+    if fast_supported:
+        print(f"\n{'='*80}")
+        print("indices_fast all results")
+        print(f"{'='*80}")
+        print(f"indices_fast first 10 numbers: {indices_fast[0, :10]}")
 
     # Run reference implementation
     torch_indices = logits.topk(min(top_k, max(row_ends)), dim=-1)[1]
@@ -465,22 +477,27 @@ def test_top_k_per_row_prefill(
     )
 
     # Compare results for fast version
-    print(f"\n{'='*80}")
-    print("Comparing Fast Kernel results...")
-    print(f"{'='*80}")
-    all_close_fast = False
-    all_close_fast = compare_topk_results(
-        logits, indices_fast, torch_indices, row_starts, row_ends, top_k
-    )
-    print(
-        f"Fast Kernel comparison completed: {'Passed' if all_close_fast else 'Failed'}"
-    )
+    all_close_fast = None
+    if fast_supported:
+        print(f"\n{'='*80}")
+        print("Comparing Fast Kernel results...")
+        print(f"{'='*80}")
+        all_close_fast = compare_topk_results(
+            logits, indices_fast, torch_indices, row_starts, row_ends, top_k
+        )
+        print(
+            f"Fast Kernel comparison completed: {'Passed' if all_close_fast else 'Failed'}"
+        )
 
-    # Calculate speedup
-    speedup = us_standard / us_fast if us_fast > 0 else 0.0
-    # Calculate improvement percentage
+    # A zero (or missing) timing is not a measurement. speedup stays None,
+    # and every consumer below has to check fast_timed, not just
+    # fast_supported: the kernel can have run on gfx942 and still report 0 us.
+    fast_timed = fast_supported and us_fast is not None and us_fast > 0
+    speedup = us_standard / us_fast if fast_timed else None
     improvement_pct = (
-        (us_standard - us_fast) / us_standard * 100 if us_standard > 0 else 0.0
+        (us_standard - us_fast) / us_standard * 100
+        if fast_timed and us_standard > 0
+        else None
     )
 
     # ANSI color codes
@@ -488,11 +505,17 @@ def test_top_k_per_row_prefill(
     GREEN = "\033[92m"
     RESET = "\033[0m"
 
-    # Determine which version is faster
-    faster_is_standard = us_standard < us_fast
-    standard_color = GREEN if faster_is_standard else RED
-    fast_color = GREEN if not faster_is_standard else RED
-    speedup_color = GREEN if speedup > 1.0 else RED
+    # Determine which version is faster. Colors that compare the two timings
+    # are only valid once both timings are real numbers.
+    if fast_timed:
+        faster_is_standard = us_standard < us_fast
+        standard_color = GREEN if faster_is_standard else RED
+        fast_color = GREEN if not faster_is_standard else RED
+        speedup_color = GREEN if speedup > 1.0 else RED
+    else:
+        standard_color = GREEN
+        fast_color = RESET
+        speedup_color = RESET
 
     # Print comparison
     print(f"\n{'='*80}")
@@ -502,11 +525,24 @@ def test_top_k_per_row_prefill(
     print(
         f"  Standard version: {standard_color}{us_standard:.2f} us{RESET}, correct={all_close_standard}"
     )
-    print(
-        f"  Fast version:     {fast_color}{us_fast:.2f} us{RESET}, correct={all_close_fast}"
-    )
-    print(f"  Speedup:          {speedup_color}{speedup:.3f}x{RESET}")
-    print(f"  Improvement:      {speedup_color}{improvement_pct:.2f}%{RESET}")
+    if fast_supported:
+        print(
+            f"  Fast version:     {fast_color}{us_fast:.2f} us{RESET}, correct={all_close_fast}"
+        )
+        if fast_timed:
+            print(f"  Speedup:          {speedup_color}{speedup:.3f}x{RESET}")
+            # improvement divides by us_standard, so a zero standard timing
+            # leaves it None even though fast_timed is true.
+            if improvement_pct is None:
+                print("  Improvement:      n/a (standard kernel reported 0 us)")
+            else:
+                print(
+                    f"  Improvement:      {speedup_color}{improvement_pct:.2f}%{RESET}"
+                )
+        else:
+            print("  Speedup:          n/a (fast kernel reported 0 us)")
+    else:
+        print(f"  Fast version:     not implemented for {get_gfx()}")
     print(f"{'='*80}\n")
 
     # measure performance
@@ -516,8 +552,10 @@ def test_top_k_per_row_prefill(
     ret["data_generation"] = data_generation
     ret["us_standard"] = us_standard
     ret["us_fast"] = us_fast
-    ret["speedup"] = f"{speedup:.2f}x"
-    ret["improvement_pct"] = f"{improvement_pct:.2f}%"
+    ret["speedup"] = None if speedup is None else f"{speedup:.2f}x"
+    ret["improvement_pct"] = (
+        None if improvement_pct is None else f"{improvement_pct:.2f}%"
+    )
     ret["all_close_standard"] = all_close_standard
     ret["all_close_fast"] = all_close_fast
     return ret
@@ -572,12 +610,11 @@ parser.add_argument(
     "--data_generation",
     type=str,
     default=["10LSBits"],
-    choices=["random", "10LSBits", "load_pt", "threshold_bin_data"],
+    choices=["random", "10LSBits"],
     nargs="+",
     help="""Specify method for generating logits.
     e.g.: -d random
-          -d threshold_bin_data
-          -d load_pt (requires --pt-file)""",
+          -d 10LSBits""",
 )
 
 parser.add_argument(

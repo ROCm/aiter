@@ -24,19 +24,17 @@ It supports page size = 1.
 # https://github.com/ModelTC/lightllm/blob/96353e868a840db4d103138caf15ed9dbea8c186/lightllm/models/deepseek2/triton_kernel/gqa_flash_decoding_stage2.py
 
 import functools
-import json
 
 import triton
 import triton.language as tl
 
-from aiter.ops.triton._triton_kernels.activation import _tanh
-from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton._triton_kernels.common.activation import _tanh
+from aiter.ops.triton._triton_kernels.common.pid_preprocessing import remap_xcd
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-from aiter.ops.triton.utils._triton.pid_preprocessing import remap_xcd
-from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
+from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
 
 _fwd_grouped_kernel_stage1_rope_repr = make_kernel_repr(
-    "_fwd_grouped_kernel_stage1_rope",
+    "mla_decode_rope_fwd_grouped_kernel_stage1",
     [
         "rotary_dim",
         "kv_lora_rank",
@@ -92,12 +90,15 @@ def _fwd_grouped_kernel_stage1_rope(
     logit_cap: tl.constexpr,
     USE_ROPE: tl.constexpr,
     IS_NEOX_STYLE: tl.constexpr,
+    NUM_XCDS: tl.constexpr,
 ):
     pid = tl.program_id(0)
     num_q_head_blk = tl.cdiv(q_head_num, BLOCK_H)
 
     pid_head_kv_split = pid % (num_q_head_blk * NUM_KV_SPLITS)
-    pid_head_kv_split = remap_xcd(pid_head_kv_split, (num_q_head_blk * NUM_KV_SPLITS))
+    pid_head_kv_split = remap_xcd(
+        pid_head_kv_split, (num_q_head_blk * NUM_KV_SPLITS), NUM_XCDS=NUM_XCDS
+    )
 
     cur_head_id = pid_head_kv_split % num_q_head_blk
     split_kv_id = (pid_head_kv_split // num_q_head_blk) % NUM_KV_SPLITS
@@ -328,7 +329,7 @@ def _fwd_grouped_kernel_stage1_rope(
 
 
 _fwd_kernel_stage2_repr = make_kernel_repr(
-    "_fwd_kernel_stage2",
+    "mla_decode_rope_fwd_kernel_stage2",
     [
         "NUM_KV_SPLITS",
         "BLOCK_DV",
@@ -354,10 +355,11 @@ def _fwd_kernel_stage2(
     Lv: tl.constexpr,
     batch: tl.constexpr,
     head_num: tl.constexpr,
+    NUM_XCDS: tl.constexpr,
 ):
     pid = tl.program_id(0)
 
-    pid = remap_xcd(pid, batch * head_num)
+    pid = remap_xcd(pid, batch * head_num, NUM_XCDS=NUM_XCDS)
     cur_batch = pid % batch
     cur_head = (pid // batch) % head_num
 
@@ -404,12 +406,5 @@ def _fwd_kernel_stage2(
 
 @functools.lru_cache(maxsize=1024)
 def _get_config():
-    if not hasattr(_get_config, "_config_dict"):
-        dev = arch_info.get_arch()
-        _get_config._config_dict = {}
-        fpath = f"{AITER_TRITON_CONFIGS_PATH}/{dev}-MLA_DECODE_ROPE-DEFAULT.json"
-        with open(fpath, "r") as file:
-            config = json.load(file)
-        _get_config._config_dict = config
-
-    return _get_config._config_dict
+    cfg_dir = resolve_config_dir("attention", "MLA_DECODE_ROPE", backend="triton")
+    return load_config_json(f"{cfg_dir}/DEFAULT.json")

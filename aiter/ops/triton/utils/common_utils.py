@@ -36,9 +36,42 @@ def switch_to_contiguous_if_needed(x: torch.Tensor) -> torch.Tensor:
     return x.contiguous()
 
 
+def max_addressable_bytes(t: torch.Tensor) -> int:
+    span = 1
+    for size, stride in zip(t.shape, t.stride()):
+        if size > 1:
+            span += (size - 1) * stride
+    return span * t.element_size()
+
+
 def serialize_dict(d: dict) -> str:
     return json.dumps(d)
 
 
 def deserialize_str(s: str) -> dict:
     return json.loads(s)
+
+
+def strip_annotate(cls):
+    """
+    Neutralize '__annotate__' so Triton's aggregate hash walker skips it.
+
+    Triton's '@aggregate' builds 'hash_attrs' from 'inspect.getmembers'.
+    On Python 3.14 (PEP 649) that yields the compiler-generated annotate
+    function, and the JIT's 'record_reference' rejects it with
+    "Unsupported function referenced".
+
+    'strip_annotate' can be used like below to remove the problematic attribute:
+
+        @aggregate
+        @strip_annotate
+        class MyLoader:
+            field: gl.constexpr
+
+    No-op on Python < 3.14.
+
+    Fixed upstream in triton-lang/triton main (PR #9529), but NOT in any 3.7.x release.
+    """
+    _ = cls.__annotations__
+    cls.__annotate__ = None
+    return cls

@@ -1,20 +1,44 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import importlib.util
 import os
 from typing import Any
 
 import torch
 from torch import Generator, Tensor
 
-from ..jit.core import AITER_META_DIR, CK_DIR, ENABLE_CK, compile_ops
-from ..jit.utils.chip_info import get_cu_num, get_gfx
+from ..jit.core import (
+    AITER_META_DIR,
+    CK_DIR,
+    ENABLE_CK,
+    compile_ops,
+    is_experimental_enabled,
+)
+from ..jit.utils.asm_guard import is_gfx1250_asm_supported, require_gfx1250_asm
+from ..jit.utils.chip_info import get_cu_num, get_gfx, get_gfx_runtime
 from ..jit.utils.mha_recipes import (
+    _ck_targets_flag,
     compose_mha_fwd_variant_suffix_and_filter,
     get_mha_varlen_prebuild_variants_by_names,
 )
 from ..jit.utils.torch_guard import torch_compile_guard
 from ..utility import dtypes
+
+_FLYDSL_AVAILABLE = importlib.util.find_spec("flydsl") is not None
+
+
+def _fmha_kv_byte_extent_ge_u32(
+    max_seqlen_k: int, k: torch.Tensor, v: torch.Tensor
+) -> bool:
+    """True when per-head KV row byte extent reaches the 32-bit buffer-offset limit.
+
+    dim -3 is the token axis in both layouts this is called with: dense BSHD
+    [B, S, H, D] and packed varlen THD [total, H, D].
+    """
+    k_bytes = int(max_seqlen_k) * int(k.stride(-3)) * k.element_size()
+    v_bytes = int(max_seqlen_k) * int(v.stride(-3)) * v.element_size()
+    return k_bytes >= (1 << 32) or v_bytes >= (1 << 32)
 
 
 def cmdGenFunc_mha_fwd(
@@ -97,7 +121,8 @@ def cmdGenFunc_mha_fwd(
 
     blob_gen_cmd = [
         f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd "
-        "--receipt 100 --filter {} --output_dir {{}}".format(filter),
+        "--receipt 100 --filter {} --output_dir {{}}".format(filter)
+        + _ck_targets_flag(),
     ]
     return {
         "md_name": md_name,
@@ -248,8 +273,32 @@ def gen_mha_fwd_native_splitkv_fake_tensors(
     return o, lse
 
 
+# torch-free kernel entry: the C++ TU takes aiter_tensor_t views and writes into
+# caller-allocated buffers, so all outputs/scratch are allocated Python-side (see
+# mha_fwd_native_splitkv below) and passed in.
 @compile_ops(
     "module_mha_fwd_native_splitkv",
+    fc_name="mha_fwd_native_splitkv",
+    develop=True,
+)
+def _mha_fwd_native_splitkv(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    o: Tensor,
+    lse: Tensor,
+    scratch_o: Tensor,
+    scratch_lse: Tensor,
+    softmax_scale: float,
+    causal: bool,
+    return_lse: bool,
+    num_splits: int,
+) -> None: ...
+
+
+@torch_compile_guard(
+    mutates_args=["out"],
+    device="cuda",
     gen_fake=gen_mha_fwd_native_splitkv_fake_tensors,
 )
 def mha_fwd_native_splitkv(
@@ -261,7 +310,49 @@ def mha_fwd_native_splitkv(
     causal: bool,
     return_lse: bool,
     num_splits: int,
-) -> tuple[Tensor, Tensor]: ...
+) -> tuple[Tensor, Tensor]:
+    # @torch_compile_guard registers this as torch.ops.aiter.mha_fwd_native_splitkv
+    # (opaque under torch.compile via the gen_fake above) *and* rebinds this module
+    # name to the op dispatcher, so callers keep writing the plain Python name.
+    # This eager impl allocates every buffer (the de-torched kernel can no longer
+    # allocate) and calls the void kernel.
+    batch_size, seqlen_q, nhead_q, hdim = q.shape
+    G = int(num_splits)
+    o = (
+        out
+        if out is not None
+        else torch.empty(
+            (batch_size, seqlen_q, nhead_q, hdim), dtype=q.dtype, device=q.device
+        )
+    )
+    lse = (
+        torch.empty(
+            (batch_size, nhead_q, seqlen_q), dtype=torch.float32, device=q.device
+        )
+        if return_lse
+        else torch.empty((0,), dtype=torch.float32, device=q.device)
+    )
+    # split-major fp32 scratch: [G,B,Hq,Sq,D] partial-O + [G,B,Hq,Sq] partial-LSE.
+    scratch_o = torch.empty(
+        (G, batch_size, nhead_q, seqlen_q, hdim), dtype=torch.float32, device=q.device
+    )
+    scratch_lse = torch.empty(
+        (G, batch_size, nhead_q, seqlen_q), dtype=torch.float32, device=q.device
+    )
+    _mha_fwd_native_splitkv(
+        q,
+        k,
+        v,
+        o,
+        lse,
+        scratch_o,
+        scratch_lse,
+        softmax_scale,
+        causal,
+        return_lse,
+        num_splits,
+    )
+    return o, lse
 
 
 def gen_fmha_v3_fwd_fake_tensors(
@@ -321,6 +412,7 @@ def gen_fmha_fwd_bf16_opus_fwd_fake(
     out: Tensor,
     causal: bool,
     softmax_scale: float,
+    lse: Tensor | None = None,
     seqstart_q: Tensor | None = None,
     seqstart_k: Tensor | None = None,
     seqstart_q_pad: Tensor | None = None,
@@ -334,12 +426,11 @@ def gen_fmha_fwd_bf16_opus_fwd_fake(
 # OPUS gfx950 bf16 forward (shared entry point): low-level @compile_ops stub bound to
 # the pybind symbol via fc_name. Dispatches by head dim in C++ to the symmetric D=128
 # kernel (batch only) or the asymmetric D_QK=192/D_V=128 kernel (batch + group/varlen).
-# Writes `out` in place, returns None.
+# Writes `out` (and `lse`, when given) in place, returns None.
 @compile_ops(
     "module_fmha_fwd_bf16_opus",
     fc_name="fmha_fwd_bf16_opus_fwd",
     gen_fake=gen_fmha_fwd_bf16_opus_fwd_fake,
-    develop=True,
 )
 def _fmha_fwd_bf16_opus_fwd(
     q: Tensor,
@@ -348,6 +439,7 @@ def _fmha_fwd_bf16_opus_fwd(
     out: Tensor,
     causal: bool,
     softmax_scale: float,
+    lse: Tensor | None = None,
     seqstart_q: Tensor | None = None,
     seqstart_k: Tensor | None = None,
     seqstart_q_pad: Tensor | None = None,
@@ -364,26 +456,38 @@ def fmha_fwd_bf16_opus_fwd(
     softmax_scale: float,
     causal: bool,
     out: Tensor | None = None,
-) -> Tensor:
+    return_lse: bool = False,
+    lse: Tensor | None = None,
+) -> Tensor | tuple[Tensor, Tensor]:
     """Public wrapper for the OPUS gfx950 bf16 dense (batch) forward (D=128 and
     D_QK=192/D_V=128). q/k/v are dense bshd [B, S, H, D]; allocates `out`
     ([B, S, H_q, D_v]) if needed and forwards. The kernel applies `softmax_scale`
-    to Q·K^T internally, handles GQA fan-out, and produces no LSE.
+    to Q·K^T internally and handles GQA fan-out.
+
+    `lse` is an output buffer for the log-sum-exp of the scaled scores ([B, H_q, S]
+    float32, natural log; rows that see no keys get -inf), filled when supplied and
+    allocated here when `return_lse` is set. Like `out` it does not change the return
+    type on its own: only `return_lse` does, and then the return is `(out, lse)`.
 
     Varlen / packed inputs go through `fmha_fwd_bf16_opus_varlen_fwd` instead.
     """
     v_head_dim = v.size(-1)
+    batch, q_seq_len, q_head_num = q.size(0), q.size(1), q.size(2)
 
     if out is None:
-        batch, q_seq_len, q_head_num = q.size(0), q.size(1), q.size(2)
         out = torch.empty(
             (batch, q_seq_len, q_head_num, v_head_dim),
             dtype=q.dtype,
             device=q.device,
         )
 
-    _fmha_fwd_bf16_opus_fwd(q, k, v, out, bool(causal), float(softmax_scale))
-    return out
+    if return_lse and lse is None:
+        lse = torch.empty(
+            (batch, q_head_num, q_seq_len), dtype=torch.float32, device=q.device
+        )
+
+    _fmha_fwd_bf16_opus_fwd(q, k, v, out, bool(causal), float(softmax_scale), lse=lse)
+    return (out, lse) if return_lse else out
 
 
 def fmha_fwd_bf16_opus_varlen_fwd(
@@ -399,11 +503,19 @@ def fmha_fwd_bf16_opus_varlen_fwd(
     out: Tensor | None = None,
     seqstart_q_pad: Tensor | None = None,
     seqstart_k_pad: Tensor | None = None,
-) -> Tensor:
+    return_lse: bool = False,
+    lse: Tensor | None = None,
+) -> Tensor | tuple[Tensor, Tensor]:
     """Public wrapper for the OPUS gfx950 bf16 group/varlen forward (D_QK=192/D_V=128
     only). q/k/v are packed [total, H, D]; allocates `out` ([total_q, H_q, D_v]) if
-    needed and forwards. The kernel applies `softmax_scale` to Q·K^T internally,
-    handles GQA fan-out, and produces no LSE.
+    needed and forwards. The kernel applies `softmax_scale` to Q·K^T internally and
+    handles GQA fan-out.
+
+    `lse` is an output buffer for the log-sum-exp of the scaled scores ([H_q, total_q]
+    float32, natural log), filled when supplied and allocated here when `return_lse` is
+    set. Like `out` it does not change the return type on its own: only `return_lse`
+    does, and then the return is `(out, lse)`. Rows that see no keys get -inf; rows in
+    the padding gaps of a KV-padded layout are left untouched.
 
     seqstart_q / seqstart_k          : cumulative REAL sequence lengths (int32, len
                                        num_groups+1; drive masks / tile counts).
@@ -412,12 +524,15 @@ def fmha_fwd_bf16_opus_varlen_fwd(
     max_seqlen_q / max_seqlen_k      : upper bounds driving the grid.
     """
     v_head_dim = v.size(-1)
+    total_q, q_head_num = q.size(0), q.size(1)
 
     if out is None:
-        total_q, q_head_num = q.size(0), q.size(1)
         out = torch.empty(
             (total_q, q_head_num, v_head_dim), dtype=q.dtype, device=q.device
         )
+
+    if return_lse and lse is None:
+        lse = torch.empty((q_head_num, total_q), dtype=torch.float32, device=q.device)
 
     seqstart_q = seqstart_q.to(torch.int32).contiguous()
     seqstart_k = seqstart_k.to(torch.int32).contiguous()
@@ -433,6 +548,7 @@ def fmha_fwd_bf16_opus_varlen_fwd(
         out,
         bool(causal),
         float(softmax_scale),
+        lse,
         seqstart_q,
         seqstart_k,
         seqstart_q_pad if seqstart_q_pad is not None else seqstart_q,
@@ -440,7 +556,7 @@ def fmha_fwd_bf16_opus_varlen_fwd(
         int(max_seqlen_q),
         int(max_seqlen_k),
     )
-    return out
+    return (out, lse) if return_lse else out
 
 
 # ---------------------------------------------------------------------------
@@ -499,6 +615,7 @@ def fmha_fwd_with_sink_asm(
         allocated even when `return_lse=False`; in that case the contents are
         undefined and callers should ignore the returned `lse`.
     """
+    require_gfx1250_asm("fmha_fwd_with_sink_asm")
     batch, q_seq_len, q_head_num, _qk_head_dim = q.shape
     v_head_dim = v.size(3)
 
@@ -573,8 +690,9 @@ def fmha_fwd_with_sink_varlen_asm(
       * cu_seqlens_q/k : int32 [batch+1] cumulative (cu[batch] == total)
 
     Contract details:
-      * The varlen kernel carries NO strides; q/k/v/out MUST be densely packed,
-        so this wrapper calls `.contiguous()` defensively.
+      * D64 / D128 take no strides: q/k/v are made dense, `out` must be dense.
+      * D192x128 and D256 take strides: q/k/v/out are used in place as views; the
+        dispatchers only send tensors `_can_impl_fmha_varlen_asm_d192_strides` accepts.
       * `max_seqlen_q` is the maximum per-batch Q sequence length (caller-
         supplied, e.g. flash_attn_varlen convention) -- it sets the launch tile
         count; the kernel early-exits tiles beyond each batch's actual length.
@@ -583,7 +701,10 @@ def fmha_fwd_with_sink_varlen_asm(
       * The kernel always accesses `ptr_LSE`, so an LSE buffer is always
         allocated even when `return_lse=False`; in that case ignore the result.
     """
-    q, k, v = (x.contiguous() for x in (q, k, v))
+    require_gfx1250_asm("fmha_fwd_with_sink_varlen_asm")
+    strided = (q.size(-1), v.size(-1)) in ((192, 128), (256, 256))
+    if not strided:
+        q, k, v = (x.contiguous() for x in (q, k, v))
     cu_seqlens_q = cu_seqlens_q.to(torch.int32).contiguous()
     cu_seqlens_k = cu_seqlens_k.to(torch.int32).contiguous()
 
@@ -612,6 +733,302 @@ def fmha_fwd_with_sink_varlen_asm(
         bool(return_lse),
     )
     return out, lse
+
+
+def _can_impl_fmha_fwd_asm_d256_strides(q, k, v, out=None) -> bool:
+    """True if the batch-mode D256 kernels can address the bshd q/k/v and output
+    views (mirrors the C++ check): unit last-dim stride, token stride in (0, 2^24)
+    bytes, head and batch strides in (0, 2^31) bytes; a dim of size 1 is never
+    stepped, so its stride is free.  With `out` None the output is the dense
+    [b, sq, hq, dv] buffer `fmha_fwd_with_sink_asm` allocates, checked as such."""
+    limits = (0x7FFFFFFF, (1 << 24) - 1, 0x7FFFFFFF)  # batch, seq, head
+    views = [(x.shape, x.stride(), x.element_size()) for x in (q, k, v)]
+    if out is None:
+        b, sq, hq, dv = (*q.shape[:3], v.shape[-1])
+        views.append(
+            ((b, sq, hq, dv), (sq * hq * dv, hq * dv, dv, 1), q.element_size())
+        )
+    else:
+        views.append((out.shape, out.stride(), out.element_size()))
+    for shape, strides, esz in views:
+        if strides[-1] != 1:
+            return False
+        for n, st, lim in zip(shape[:3], strides[:3], limits):
+            if n > 1 and not 0 < st * esz <= lim:
+                return False
+    return True
+
+
+def _can_impl_fmha_varlen_asm_d192_strides(
+    q, k, v, out=None, dense_last_dim_later=False
+) -> bool:
+    """True if the D192x128 / D256 kernels can use q/k/v (and `out`) in place
+    (mirrors the C++ check): unit last-dim stride, token stride in (0, 2^24) bytes,
+    head stride in (0, 2^31) bytes.
+
+    dense_last_dim_later: skip the last-dim check of q/k/v (not of `out`);
+    `_flash_attn_varlen_forward` fixes q/k/v with `maybe_contiguous` and checks
+    again, but uses `out` as given.
+    """
+    for x in (q, k, v) if out is None else (q, k, v, out):
+        s = x.stride()
+        if s[-1] != 1:
+            if dense_last_dim_later and x is not out:
+                continue
+            return False
+        esz = x.element_size()
+        if not (0 < s[0] * esz < (1 << 24) and 0 < s[1] * esz <= 0x7FFFFFFF):
+            return False
+    return True
+
+
+# ---------------------------------------------------------------------------
+# fmha_fwd_fp8_varlen_asm (gfx1250) — FP8 (e4m3fn) per-tensor-descale varlen
+# forward, qk head dim 192 / v head dim 128, bf16 output.
+#
+# Separate from the bf16 varlen ASM path: its own kernarg ABI (136 B, the bf16
+# D192x128 strided layout with q/k/v descale pointers), its own C++ translation
+# unit (csrc/py_itfs_cu/asm_fmha_fwd_fp8_varlen.cu) and kernels
+# (hsa/gfx1250/fmha_fwd_fp8_varlen).  P is rounded to fp8 before PV and the row
+# sum is taken over the rounded P, so the LSE is the log of that sum, an
+# approximation of the exact log-sum-exp.
+# ---------------------------------------------------------------------------
+@compile_ops(
+    "module_fmha_fwd_fp8_varlen_asm",
+    fc_name="fmha_fwd_fp8_varlen_asm",
+    ffi_type="ctypes",
+)
+def _fmha_fwd_fp8_varlen_asm(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    q_descale: Tensor,
+    k_descale: Tensor,
+    v_descale: Tensor,
+    out: Tensor,
+    lse: Tensor,
+    cu_seqlens_q: Tensor,
+    cu_seqlens_k: Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    softmax_scale: float,
+    is_causal: bool,
+    return_lse: bool,
+) -> None: ...
+
+
+def fmha_fwd_fp8_varlen_asm(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    q_descale: Tensor,
+    k_descale: Tensor,
+    v_descale: Tensor,
+    cu_seqlens_q: Tensor,
+    cu_seqlens_k: Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    softmax_scale: float | None = None,
+    is_causal: bool = False,
+    return_lse: bool = False,
+    out: Tensor | None = None,
+) -> tuple[Tensor, Tensor]:
+    """Public wrapper: varlen / packed FP8 ASM forward (gfx1250), D192x128.
+
+    Layout is packed [token, head, dim] (THD), batch folded into the token axis:
+      * q   : (total_q, nheads,   192) float8_e4m3fn
+      * k   : (total_k, nheads_k, 192) float8_e4m3fn
+      * v   : (total_k, nheads_k, 128) float8_e4m3fn
+      * q/k/v_descale : one fp32 element each (per-tensor dequant scale)
+      * out : (total_q, nheads, 128) bf16
+      * lse : (total_q, nheads, 1) fp32, natural log
+      * cu_seqlens_q/k : int32 [batch+1] cumulative (cu[batch] == total)
+
+    q/k/v/out are used in place through their strides (contiguous last dim;
+    `_can_impl_fmha_varlen_asm_d192_strides` lists the limits).  `max_seqlen_q` sets
+    the launch tile count; with `max_seqlen_k`, the head count and the batch it
+    also picks the launch order (csrc/py_itfs_cu/asm_fmha_fwd_fp8_varlen.cu).  Causal is
+    bottom-right aligned.  The kernel always writes `lse`.
+    """
+    require_gfx1250_asm("fmha_fwd_fp8_varlen_asm")
+    if softmax_scale is None:
+        softmax_scale = q.size(-1) ** (-0.5)
+    cu_seqlens_q = cu_seqlens_q.to(torch.int32).contiguous()
+    cu_seqlens_k = cu_seqlens_k.to(torch.int32).contiguous()
+
+    total_q, q_head_num, _qk_head_dim = q.shape
+    v_head_dim = v.size(2)
+
+    if out is None:
+        out = torch.empty(
+            (total_q, q_head_num, v_head_dim), dtype=torch.bfloat16, device=q.device
+        )
+
+    lse = torch.empty((total_q, q_head_num, 1), dtype=torch.float32, device=q.device)
+
+    _fmha_fwd_fp8_varlen_asm(
+        q,
+        k,
+        v,
+        q_descale,
+        k_descale,
+        v_descale,
+        out,
+        lse,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        int(max_seqlen_q),
+        int(max_seqlen_k),
+        float(softmax_scale),
+        bool(is_causal),
+        bool(return_lse),
+    )
+    return out, lse
+
+
+# ---------------------------------------------------------------------------
+# gfx1250 varlen ASM forward: one gate for both kernels.
+#
+# flash_attn_varlen_func asks it to send a call to the ASM ahead of FlyDSL,
+# _flash_attn_varlen_forward asks it to pick the kernel, and
+# flash_attn_varlen_fp8_pertensor_func asks it to bypass Triton when CK is
+# disabled.  All of them pass the same arguments, so a call gets the same answer
+# everywhere, and each site makes one call.  Which accepted bf16 calls
+# flash_attn_varlen_func still offers to FlyDSL first is a routing choice, kept
+# apart in _prefer_flydsl_over_gfx1250_bf16_varlen_asm.
+# ---------------------------------------------------------------------------
+_GFX1250_VARLEN_ASM_BF16 = 1  # fmha_fwd_with_sink_varlen_asm
+_GFX1250_VARLEN_ASM_FP8 = 2  # fmha_fwd_fp8_varlen_asm
+# (hdim_q, hdim_v) the gfx1250 bf16 ASM backward (fmha_v3_bwd / fmha_v3_varlen_bwd)
+# serves.
+_GFX1250_BWD_HDIMS = ((64, 64), (128, 128), (192, 128))
+
+
+def _probe_gfx1250_asm_device() -> bool:
+    # The running GPU, not the build target: get_gfx() follows GPU_ARCHS, which
+    # can name another arch (or several) than the device in use.
+    try:
+        arch = get_gfx_runtime()
+    except Exception:  # noqa: BLE001 - no GPU to probe (e.g. a build host)
+        return False
+    return arch in ("gfx1250", "gfx1250-strict") and is_gfx1250_asm_supported()
+
+
+# Probed once at import, like asm_guard._ASM_SUPPORTED: the dispatch sites read a
+# module-level constant, which costs nothing per call and stays a plain constant
+# under torch.compile.
+_IS_GFX1250_ASM_DEVICE = _probe_gfx1250_asm_device()
+
+
+def _select_gfx1250_fmha_fwd_varlen_asm(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    out: Tensor | None,
+    *,
+    causal: bool,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    window_size_left: int,
+    window_size_right: int,
+    sink_size: int,
+    sink_ptr: Tensor | None,
+    q_descale: Tensor | None,
+    k_descale: Tensor | None,
+    v_descale: Tensor | None,
+    dropout_p: float,
+    logits_soft_cap: float,
+    bias: Tensor | None,
+    alibi_slopes: Tensor | None,
+    block_table: Tensor | None,
+    cu_seqlens_q_padded: Tensor | None,
+    cu_seqlens_k_padded: Tensor | None,
+    return_softmax: bool,
+    dense_last_dim_later: bool = False,
+) -> int:
+    """Which gfx1250 varlen ASM forward serves the call: _GFX1250_VARLEN_ASM_BF16,
+    _GFX1250_VARLEN_ASM_FP8, or 0 for neither.
+
+    Windows and the sink-token span follow _flash_attn_varlen_forward and CK: a
+    negative value, or one at or beyond max_seqlen_k, is unlimited, and causal
+    ignores the right window.  dense_last_dim_later: skip the last-dim stride
+    check, for callers ahead of the `maybe_contiguous` in
+    _flash_attn_varlen_forward.  Cheap checks first, strides last.
+    """
+    if not _IS_GFX1250_ASM_DEVICE:
+        return 0
+    hdim_q, hdim_v = q.shape[-1], v.shape[-1]
+    if q.dtype == dtypes.bf16:
+        # fmha_fwd_with_sink_varlen_asm: D64 / D128 dense, D192x128 / D256 strided.
+        if q_descale is not None or k_descale is not None or v_descale is not None:
+            return 0
+        if (hdim_q, hdim_v) in ((192, 128), (256, 256)):
+            strided = True
+        elif hdim_q in (64, 128) and hdim_v == hdim_q:
+            strided = False
+        else:
+            return 0
+        # Sink logits: the D64 binaries always read the sink buffer (a null one
+        # would be dereferenced); the D128 / D192x128 / D256 binaries never read it.
+        if (sink_ptr is not None) != (hdim_q == 64):
+            return 0
+        kind = _GFX1250_VARLEN_ASM_BF16
+    elif q.dtype == torch.float8_e4m3fn:
+        # fmha_fwd_fp8_varlen_asm: D192x128, per-tensor fp32 descales, bf16 out.
+        if k.dtype != q.dtype or v.dtype != q.dtype:
+            return 0
+        if q.dim() != 3 or k.dim() != 3 or v.dim() != 3:
+            return 0
+        if hdim_q != 192 or k.shape[-1] != 192 or hdim_v != 128:
+            return 0
+        if sink_ptr is not None or (out is not None and out.dtype != torch.bfloat16):
+            return 0
+        for d in (q_descale, k_descale, v_descale):
+            if (
+                d is None
+                or d.dtype != torch.float32
+                or d.numel() != 1
+                or d.device != q.device
+            ):
+                return 0
+        strided = True
+        kind = _GFX1250_VARLEN_ASM_FP8
+    else:
+        return 0
+    nhead_q, nhead_k = q.shape[-2], k.shape[-2]
+    if nhead_q <= 0 or nhead_k <= 0 or nhead_q % nhead_k != 0:
+        return 0
+    # Attention options: plain or causal (bottom-right) attention only.
+    if max_seqlen_q <= 0 or return_softmax:
+        return 0
+    if dropout_p != 0.0 or logits_soft_cap != 0.0:
+        return 0
+    if 0 <= window_size_left < max_seqlen_k:
+        return 0
+    if not causal and 0 <= window_size_right < max_seqlen_k:
+        return 0
+    if sink_size != 0 and sink_size < max_seqlen_k:
+        return 0
+    if bias is not None or alibi_slopes is not None or block_table is not None:
+        return 0
+    if cu_seqlens_q_padded is not None or cu_seqlens_k_padded is not None:
+        return 0
+    # Strides last: the most expensive check.
+    if strided and not _can_impl_fmha_varlen_asm_d192_strides(
+        q, k, v, out, dense_last_dim_later
+    ):
+        return 0
+    return kind
+
+
+def _prefer_flydsl_over_gfx1250_bf16_varlen_asm(q: Tensor, causal: bool) -> bool:
+    """bf16 calls the gfx1250 varlen ASM takes but flash_attn_varlen_func offers to
+    FlyDSL first: non-causal D64 / D128, and D64 / D128 / D192x128 with
+    AITER_ENABLE_EXPERIMENTAL (then the bshd and thd routers agree).  Not D256."""
+    hdim_q = q.size(-1)
+    if is_experimental_enabled() and hdim_q in (64, 128, 192):
+        return True
+    return not causal and hdim_q in (64, 128)
 
 
 # ---------------------------------------------------------------------------
@@ -678,6 +1095,7 @@ def fmha_fwd_mxfp8_asm(
         (out, lse). The kernel always touches the lse buffer; when
         return_lse=False its contents are undefined and should be ignored.
     """
+    require_gfx1250_asm("fmha_fwd_mxfp8_asm")
     batch, q_seq_len, q_head_num, qk_head_dim = q.shape
     v_head_dim = v.size(3)
 
@@ -1123,13 +1541,14 @@ def cmdGenFunc_mha_bwd(
 
     blob_gen_cmd = [
         f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d bwd "
-        "--receipt 300 --filter {} --output_dir {{}}".format(filter),
+        "--receipt 300 --filter {} --output_dir {{}}".format(filter)
+        + _ck_targets_flag(),
         f"{AITER_META_DIR}/hsa/codegen.py -m fmha_v3_bwd --output_dir {{}}",
     ]
     return {
         "md_name": md_name,
         "blob_gen_cmd": blob_gen_cmd,
-        "flags_extra_cc": ["'-DONLY_FAV3=0'"],
+        "flags_extra_cc": ["-DONLY_FAV3=0"],
     }
 
 
@@ -1381,13 +1800,14 @@ def cmdGenFunc_mha_varlen_bwd(
 
     blob_gen_cmd = [
         f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d bwd "
-        "--receipt 400 --filter {} --output_dir {{}}".format(filter),
+        "--receipt 400 --filter {} --output_dir {{}}".format(filter)
+        + _ck_targets_flag(),
         f"{AITER_META_DIR}/hsa/codegen.py -m fmha_v3_bwd --output_dir {{}}",
     ]
     return {
         "md_name": md_name,
         "blob_gen_cmd": blob_gen_cmd,
-        "flags_extra_cc": ["'-DONLY_FAV3=0'"],
+        "flags_extra_cc": ["-DONLY_FAV3=0"],
     }
 
 
@@ -1420,20 +1840,20 @@ def cmdGenFunc_mha_batch_prefill(
     # Per-page descale for KV_BLOCKSCALE mode (Q per-tensor, K/V per-page)
     # Mutually exclusive with k_descale/v_descale
     kv_block_descale: Tensor | None = None,  # [num_block, num_kv_head, 2]
-    sink_ptr: Tensor | None = None,
-    gen: Generator | None = None,
     kv_last_page_lens: Tensor | None = None,
     block_table: Tensor | None = None,
     seqlen_k: Tensor | None = None,
+    sink_ptr: Tensor | None = None,
+    gen: Generator | None = None,
 ):
     # causal=true is the same as causal=false in this case
     causal = is_causal
-    if max_seqlen_q == 1 and alibi_slopes is None:
+    if max_seqlen_q == 1 and alibi_slopes is None and sink_ptr is None:
         causal = False
-        if window_size_left >= max_seqlen_k:
-            window_size_left = -1
-        if window_size_right >= max_seqlen_k:
-            window_size_right = -1
+    if window_size_left >= max_seqlen_k:
+        window_size_left = -1
+    if window_size_right >= max_seqlen_k:
+        window_size_right = -1
     md_name = "mha_batch_prefill"
     filter_fwd = "*"  # get_fwd_blobs()
     if q.dtype == torch.float16:
@@ -1460,7 +1880,13 @@ def cmdGenFunc_mha_batch_prefill(
     else:
         md_name += "_alibi"
         filter_fwd += "_alibi*"
-    if not causal and window_size_left == -1 and window_size_right == -1:
+    has_mask = (
+        causal
+        or window_size_left != -1
+        or window_size_right != -1
+        or sink_ptr is not None
+    )
+    if not has_mask:
         md_name += "_nmask"
         filter_fwd += "_nmask*"
     else:
@@ -1489,11 +1915,7 @@ def cmdGenFunc_mha_batch_prefill(
         # PERTENSOR: per-tensor quantization
         md_name += "_pertensor"
         filter_fwd += "_pertensor*"
-    # Sink only applies when there is a causal/window mask; full attention
-    # (window_size_left==-1 and window_size_right==-1) ignores sink_size.
-    has_effective_sink = sink_size > 0 and (
-        causal or not (window_size_left == -1 and window_size_right == -1)
-    )
+    has_effective_sink = sink_ptr is not None or (sink_size > 0 and has_mask)
     if has_effective_sink:
         md_name += "_sink"
         filter_fwd += "_sink*"
@@ -1814,6 +2236,12 @@ def _flash_attn_forward(
         )
         ret = ret and (nhead_q % nhead_k == 0)
         ret = ret and (not swa)
+        # The fmha_v3_fwd ASM kernels take no sink arguments: dispatching a call
+        # with sink_ptr or sink_size to them would silently drop the sink term.
+        # `not swa` does not exclude sinks, since a window that covers the whole
+        # sequence is reset to -1 above, so route any sink request to CK
+        # (mha_fwd), which applies sinks under both causal and window masks.
+        ret = ret and (sink_size == 0 and sink_ptr is None)
         ret = ret and (q.dtype == dtypes.bf16 or is_fmha_v3_fp8())
         ret = ret and (cu_seqlens_q is None and cu_seqlens_kv is None)
         # FP8 ASM kernels assemble the GQA-shift from a fixed log2 table
@@ -1821,18 +2249,25 @@ def _flash_attn_forward(
         if is_fmha_v3_fp8():
             gqa_ratio = nhead_q // nhead_k
             ret = ret and ((gqa_ratio & (gqa_ratio - 1)) == 0)
+        if hdim_q == 192 and hdim_v == 128:
+            ret = ret and not _fmha_kv_byte_extent_ge_u32(seqlen_k, k, v)
         return ret
 
     def can_impl_fmha_fwd_with_sink_asm():
         # gfx1250 ASM bf16 forward (fmha_fwd_with_sink_asm).  Single-shot batched
         # (no varlen / dropout / swa / quant / alibi / bias).  Sink logits
         # (per-Q-head fp32) supported; sink-token (sink_size) not supported.
-        ret = get_gfx() == "gfx1250"
+        ret = get_gfx() in ("gfx1250", "gfx1250-strict") and is_gfx1250_asm_supported()
         ret = ret and (q.dtype == dtypes.bf16)
-        ret = ret and (hdim_q in (64, 128))
+        ret = ret and (hdim_q in (64, 128, 256))
         ret = ret and (hdim_v == hdim_q)
         ret = ret and (nhead_q % nhead_k == 0)
         ret = ret and (not swa)
+        # Windows by the CK convention (>= seqlen_k is -1 here): the kernels mask
+        # only bottom-right causal, so no left window, and no right window without
+        # causal.
+        ret = ret and window_size_left < 0
+        ret = ret and (causal or window_size_right < 0)
         ret = ret and (sink_size == 0)
         ret = ret and (alibi_slopes is None and bias is None)
         ret = ret and (dropout_p == 0.0)
@@ -1852,10 +2287,15 @@ def _flash_attn_forward(
         #   binary would dereference.  To preserve flash_attn_func's documented
         #   `sink_ptr is None` semantics we keep requiring an explicit sink for
         #   D64 here and fall back to CK otherwise.
-        if hdim_q == 128:
+        #
+        #   D256 kernels compile ENABLE_SINK=0 like D128, and take only the
+        #   strides `_can_impl_fmha_fwd_asm_d256_strides` accepts.
+        if hdim_q in (128, 256):
             ret = ret and (sink_ptr is None)
         elif hdim_q == 64:
             ret = ret and (sink_ptr is not None)
+        if hdim_q == 256:
+            ret = ret and _can_impl_fmha_fwd_asm_d256_strides(q, k, v, out)
         return ret
 
     def can_impl_fmha_fwd_mxfp8_asm():
@@ -1863,7 +2303,7 @@ def _flash_attn_forward(
         # (e4m3) q/k/v with microscaling (e8m0) block-scale descale buffers.
         # The e8m0 descale dtype is what distinguishes MXFP8 from the per-tensor
         # fp8 path (is_fmha_v3_fp8, which uses fp32 descales on gfx942/gfx950).
-        ret = get_gfx() == "gfx1250"
+        ret = get_gfx() in ("gfx1250", "gfx1250-strict") and is_gfx1250_asm_supported()
         ret = ret and (q.dtype == dtypes.fp8)
         ret = ret and (
             q_descale is not None and k_descale is not None and v_descale is not None
@@ -1933,24 +2373,23 @@ def _flash_attn_forward(
             return False
         # KV byte extent >= 2^32 wraps the kernel's 32-bit async-load soffset; fall back to
         # v3/CK. Actual seqlen stride (layout-aware, matches the C++ guard).
-        return not seqlen_k * k.stride(1) * k.element_size() >= 1 << 32
+        kv_stride = max(k.stride(1), v.stride(1))
+        return not seqlen_k * kv_stride * k.element_size() >= 1 << 32
 
     def _can_impl_fmha_fwd_hd192_v128_bf16_opus():
         # OPUS gfx950 dense D_QK=192 / D_V=128 bf16 forward. Enabled by DEFAULT (no env)
         if int(os.environ.get("AITER_DISABLE_FMHA_OPUS", "0")) != 0:
             return False
-        if not (hdim_q == 192 and hdim_v == 128):
-            return False
-        # KV byte extent >= 2^32 wraps the kernel's 32-bit async-load soffset (same as D=128).
-        if seqlen_k * k.stride(1) * k.element_size() >= (1 << 32):
-            return False
-        return not seqlen_k * v.stride(1) * v.element_size() >= 1 << 32
+        # Any KV extent: the kernel rebases the buffer descriptor per KV tile, so the
+        # 32-bit buffer-offset limit no longer bounds the per-head KV row.
+        return hdim_q == 192 and hdim_v == 128
 
     def can_impl_fmha_fwd_bf16_opus():
-        # Shared eligibility for the OPUS gfx950 bf16 forward kernels (inference-only:
-        # no LSE/dropout mask, so it must never capture return_lse / the autograd path).
-        # Cheapest / most-selective gates first so the per-head-dim helpers (which read
-        # env vars) are only evaluated once the common conditions already hold.
+        # Shared eligibility for the OPUS gfx950 bf16 forward kernels. LSE is supported
+        # ([B, H_q, S] fp32, natural log), so return_lse no longer disqualifies the path;
+        # the dropout mask (return_softmax) still does. Cheapest / most-selective gates
+        # first so the per-head-dim helpers (which read env vars) are only evaluated once
+        # the common conditions already hold.
         ret = get_gfx() == "gfx950"
         ret = ret and (q.dtype == dtypes.bf16)
         ret = ret and (nhead_q % nhead_k == 0)
@@ -1960,7 +2399,7 @@ def _flash_attn_forward(
         ret = ret and (window_size_left == -1 and window_size_right == -1)
         ret = ret and (sink_size == 0 and sink_ptr is None)
         ret = ret and (q_descale is None and k_descale is None and v_descale is None)
-        ret = ret and (not return_lse) and (not return_softmax)
+        ret = ret and (not return_softmax)
         ret = ret and (
             _can_impl_fmha_fwd_hd128_bf16_opus()
             or _can_impl_fmha_fwd_hd192_v128_bf16_opus()
@@ -2048,8 +2487,13 @@ def _flash_attn_forward(
         rng_state = torch.empty((2,), dtype=torch.int64, device=q.device)
     elif can_impl_fmha_fwd_bf16_opus():
         # OPUS gfx950 dense forward (shared entry point; dispatches D=128 vs
-        # D_QK=192/D_V=128 in C++ by head dim). Inference-only: the lse/S_dmask/rng
-        # slots are unused placeholders (gate guarantees not return_lse/return_softmax).
+        # D_QK=192/D_V=128 in C++ by head dim). The S_dmask/rng slots stay unused
+        # placeholders (the gate guarantees no dropout mask).
+        softmax_lse = torch.empty(
+            (batch_size, nhead_q, seqlen_q) if return_lse else (0,),
+            dtype=torch.float32,
+            device=q.device,
+        )
         out_ = fmha_fwd_bf16_opus_fwd(
             q,
             k,
@@ -2057,8 +2501,8 @@ def _flash_attn_forward(
             softmax_scale=float(softmax_scale),
             causal=bool(causal),
             out=out,
+            lse=softmax_lse if return_lse else None,
         )
-        softmax_lse = torch.empty((0,), dtype=torch.float32, device=q.device)
         S_dmask = torch.empty((0,), dtype=torch.float32, device=q.device)
         rng_state = torch.empty((2,), dtype=torch.int64, device=q.device)
     elif can_impl_fmha_v3_fwd() and seqlen_q > 128:  # Prefer CK for decode cases
@@ -2382,7 +2826,8 @@ def _flash_attn_backward(
 
     _, seqlen_q, nhead_q, hdim_q = q.shape
     _, seqlen_k, nhead_k, hdim_v = v.shape
-    swa = (window_size_left > 0) or (window_size_right > 0)
+    # a left size of 0 is a window too, it keeps only the diagonal
+    swa = (window_size_left >= 0) or (window_size_right > 0)
 
     # only 1 block when sk <= 256, thus deterministic
     is_950_1block = (
@@ -2399,19 +2844,44 @@ def _flash_attn_backward(
         ret &= bias is None
         ret &= dbias is None
         ret &= dropout_p == 0.0
+        # the v3 kernels take no sink, so d_sink would be left unwritten
+        ret &= sink is None and d_sink is None
         ret &= not deterministic or is_950_1block
         ret &= nhead_q % nhead_k == 0
         ret &= (
-            (hdim_q > 64 and hdim_q <= 128) or (hdim_q == 192 and hdim_v == 128)
+            (hdim_q > 64 and hdim_q <= 128 and hdim_q == hdim_v)
+            or (hdim_q == 192 and hdim_v == 128)
         ) and hdim_q % 8 == 0
-        ret &= not swa
+        # sliding window kernels are hd128 only
+        ret &= not swa or hdim_q <= 128
+        return ret
+
+    def can_impl_fmha_v3_bwd_gfx1250():
+        # fmha_v3_bwd has no CK fallback, so this must match the gfx1250 kernel
+        # set exactly: bf16, no mask or bottom-right causal, no hdim padding.
+        wl = -1 if window_size_left >= seqlen_k else window_size_left
+        wr = -1 if window_size_right >= seqlen_k else window_size_right
+        ret = get_gfx() == "gfx1250" and is_gfx1250_asm_supported()
+        ret &= q.dtype == dtypes.bf16
+        ret &= alibi_slopes is None
+        ret &= bias is None
+        ret &= dbias is None
+        ret &= dropout_p == 0.0
+        ret &= (hdim_q, hdim_v) in _GFX1250_BWD_HDIMS
+        ret &= nhead_q % nhead_k == 0
+        ret &= wl == -1 and (causal or wr == -1)
+        ret &= sink is None and d_sink is None
         return ret
 
     can_impl_fmha_v3_bwd_ |= can_impl_fmha_v3_bwd_gfx950()
+    # ck fmha bwd has optimization for seqlen_q <= 16; gfx1250 builds no such ck tiles
+    can_impl_fmha_v3_bwd_ &= seqlen_q > 16
+    can_impl_fmha_v3_bwd_ |= can_impl_fmha_v3_bwd_gfx1250()
+    # gfx1250 backward only ships a32 (atomic32=1)
+    if get_gfx() == "gfx1250":
+        is_v3_atomic_fp32 = True
 
-    if (
-        can_impl_fmha_v3_bwd_ and seqlen_q > 16
-    ):  # ck fmha bwd has optimization for seqlen_q <= 16
+    if can_impl_fmha_v3_bwd_:
         if dq is not None:
             dq.zero_()
         (
@@ -2658,6 +3128,9 @@ def flash_attn_func(
     cu_seqlens_kv: torch.Tensor | None = None,
     sink_ptr: Tensor | None = None,
     num_splits: int = 0,
+    q_descale: torch.Tensor | None = None,
+    k_descale: torch.Tensor | None = None,
+    v_descale: torch.Tensor | None = None,
 ):
     """dropout_p should be set to 0.0 during evaluation
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in KV with fewer heads
@@ -2714,6 +3187,59 @@ def flash_attn_func(
             The output of softmax (possibly with different scaling). It also encodes the dropout
             pattern (negative means that location was dropped, nonnegative means it was kept).
     """
+    # FlyDSL path returns result if supported, None otherwise. window_size[2] (sink
+    # size) is unsupported: the FlyDSL gate rejects it, and this screen keeps it off
+    # the path so a sink-token request is never silently dropped.
+    _descales = (q_descale, k_descale, v_descale)
+    _has_any_descale = any(d is not None for d in _descales)
+    if _has_any_descale and not all(d is not None for d in _descales):
+        raise ValueError(
+            "FP8 attention requires q_descale, k_descale, and v_descale together"
+        )
+
+    # The FlyDSL forward returns a plain tensor with no autograd graph, so it must
+    # not take requests that need gradients.
+    is_grad = torch.is_grad_enabled() and any(x.requires_grad for x in [q, k, v])
+    if (
+        _FLYDSL_AVAILABLE
+        and not is_grad
+        and cu_seqlens_q is None
+        and cu_seqlens_kv is None
+        and num_splits <= 1
+        and (len(window_size) < 3 or window_size[2] == 0)
+    ):
+        from .flydsl.fmha_kernels import flydsl_flash_attn_batch_fwd
+
+        _flydsl_result = flydsl_flash_attn_batch_fwd(
+            q,
+            k,
+            v,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            return_lse=return_lse,
+            dropout_p=dropout_p,
+            window_size=window_size,
+            bias=bias,
+            alibi_slopes=alibi_slopes,
+            deterministic=deterministic,
+            return_attn_probs=return_attn_probs,
+            sink=sink_ptr,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+        )
+        if _flydsl_result is not None:
+            return _flydsl_result
+
+    # Neither fallback below consumes descales, so a request that got here with them
+    # would be served unscaled. Say so rather than return a wrong answer.
+    if _has_any_descale:
+        raise RuntimeError(
+            "batched prequantized FP8 attention is served only by the gfx1250 FlyDSL "
+            "kernel; this configuration fell through to a backend without descale "
+            "support"
+        )
+
     if not ENABLE_CK:
         from .triton.attention.mha import flash_attn_func as flash_attn_func_triton
 
@@ -2833,9 +3359,25 @@ def _flash_attn_varlen_forward(
             (hdim_q == 128 and hdim_v == 128)
             or (hdim_q == 192 and hdim_v == 128)
             or (hdim_q == 256 and hdim_v == 256 and is_fmha_v3_fp8())
+            or (
+                hdim_q == 256
+                and hdim_v == 256
+                and q.dtype == dtypes.bf16
+                and get_gfx() == "gfx950"
+                and nhead_q == nhead_k
+                and sink_size == 0
+                and sink_ptr is None
+            )
         )
         ret = ret and (nhead_q % nhead_k == 0)
         ret = ret and (not swa)
+        # The fmha_v3_varlen_fwd ASM kernels take no sink arguments: dispatching
+        # a call with sink_ptr or sink_size to them would silently drop the sink
+        # term. `not swa` does not exclude sinks, since a window that covers the
+        # whole sequence is reset to -1 above, so route any sink request to CK
+        # (mha_varlen_fwd), which applies sinks under both causal and window
+        # masks.
+        ret = ret and (sink_size == 0 and sink_ptr is None)
         ret = ret and (q.dtype == dtypes.bf16 or is_fmha_v3_fp8())
         ret = ret and logits_soft_cap == 0.0
         # FP8 ASM kernels assemble the GQA-shift from a fixed log2 table
@@ -2843,46 +3385,15 @@ def _flash_attn_varlen_forward(
         if is_fmha_v3_fp8():
             gqa_ratio = nhead_q // nhead_k
             ret = ret and ((gqa_ratio & (gqa_ratio - 1)) == 0)
-        return ret
-
-    def can_impl_fmha_fwd_with_sink_varlen_asm():
-        # gfx1250 ASM bf16 packed/varlen forward (fmha_fwd_with_sink_varlen_asm).
-        # Packed THD (batch folded into the token axis); no dropout / swa /
-        # quant / alibi / bias / paged (block_table) / logits-soft-cap.  Sink
-        # logits (per-Q-head fp32) supported; sink-token (sink_size) not.
-        ret = get_gfx() == "gfx1250"
-        ret = ret and (q.dtype == dtypes.bf16)
-        ret = ret and (hdim_q in (64, 128))
-        ret = ret and (hdim_v == hdim_q)
-        ret = ret and (nhead_q % nhead_k == 0)
-        ret = ret and (not swa)
-        ret = ret and (sink_size == 0)
-        ret = ret and (alibi_slopes is None and bias is None)
-        ret = ret and (dropout_p == 0.0)
-        ret = ret and (logits_soft_cap == 0.0)
-        ret = ret and (block_table is None)
-        # The varlen ASM wrapper carries no physical-padding arrays; route any
-        # padded-cu request to CK (mha_varlen_fwd) which understands them.
-        ret = ret and (cu_seqlens_q_padded is None and cu_seqlens_k_padded is None)
-        ret = ret and (q_descale is None and k_descale is None and v_descale is None)
-        # Per-hdim sink eligibility (mirrors the fixed-batch path):
-        #   D128 (`_rxy`) binaries compile ENABLE_SINK=0 and ignore the sink
-        #   buffer, so routing a caller's sink_ptr to them would silently drop
-        #   the sink term -- fall back to CK whenever sink_ptr is set.
-        #   D64  (`_rxy_sink`) binaries compile ENABLE_SINK=1 and ALWAYS read
-        #   SINK, so calling with sink_ptr=None would dereference a null pointer
-        #   -- require an explicit sink for D64 and fall back to CK otherwise.
-        if hdim_q == 128:
-            ret = ret and (sink_ptr is None)
-        elif hdim_q == 64:
-            ret = ret and (sink_ptr is not None)
+        if hdim_q == 192 and hdim_v == 128 and block_table is None:
+            ret = ret and not _fmha_kv_byte_extent_ge_u32(max_seqlen_k, k, v)
         return ret
 
     def can_impl_fmha_fwd_hd192_v128_bf16_opus_varlen():
         # OPUS gfx950 group/varlen D_QK=192 / D_V=128 bf16 forward. Enabled by DEFAULT
-        # (no env). Packed THD q/k/v; supports KV padding (cu_seqlens_*_padded) and
-        # cross-attention (causal bottom-right aligned). Inference-only: no LSE / dropout
-        # / bias / alibi / swa / sink / quant / paged.
+        # (no env). Packed THD q/k/v; supports KV padding (cu_seqlens_*_padded),
+        # cross-attention (causal bottom-right aligned) and LSE ([H_q, total_q] fp32,
+        # natural log). No dropout / bias / alibi / swa / sink / quant / paged.
         # AITER_DISABLE_FMHA_OPUS=1 force-disables it (fall back to v3/CK; for A/B).
         if int(os.environ.get("AITER_DISABLE_FMHA_OPUS", "0")) != 0:
             return False
@@ -2897,15 +3408,47 @@ def _flash_attn_varlen_forward(
         ret = ret and (sink_size == 0 and sink_ptr is None)
         ret = ret and (q_descale is None and k_descale is None and v_descale is None)
         ret = ret and (block_table is None)
-        ret = ret and (not return_lse) and (not return_softmax)
+        ret = ret and (not return_softmax)
+        ret = ret and (max_seqlen_q > 0 and max_seqlen_k > 0)
         return ret
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
+    gfx1250_asm = 0
+    if _IS_GFX1250_ASM_DEVICE:
+        gfx1250_asm = _select_gfx1250_fmha_fwd_varlen_asm(
+            q,
+            k,
+            v,
+            out,
+            causal=causal,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            window_size_left=window_size_left,
+            window_size_right=window_size_right,
+            sink_size=sink_size,
+            sink_ptr=sink_ptr,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            dropout_p=dropout_p,
+            logits_soft_cap=logits_soft_cap,
+            bias=bias,
+            alibi_slopes=alibi_slopes,
+            block_table=block_table,
+            cu_seqlens_q_padded=cu_seqlens_q_padded,
+            cu_seqlens_k_padded=cu_seqlens_k_padded,
+            return_softmax=return_softmax,
+        )
 
     if can_impl_fmha_fwd_hd192_v128_bf16_opus_varlen():
         # OPUS gfx950 group/varlen D=192 path. cu_seqlens_* are the REAL cumulative
         # lengths (masks / tile counts); cu_seqlens_*_padded are the PHYSICAL row
         # offsets (KV padding). When no padded arrays are given, physical == real.
+        softmax_lse = torch.empty(
+            (nhead_q, q.size(0)) if return_lse else (0,),
+            dtype=torch.float32,
+            device=q.device,
+        )
         out = fmha_fwd_bf16_opus_varlen_fwd(
             q,
             k,
@@ -2919,18 +3462,17 @@ def _flash_attn_varlen_forward(
             seqstart_k_pad=cu_seqlens_k_padded,
             max_seqlen_q=int(max_seqlen_q),
             max_seqlen_k=int(max_seqlen_k),
+            lse=softmax_lse if return_lse else None,
         )
-        softmax_lse = torch.empty((0,), dtype=torch.float32, device=q.device)
         S_dmask = torch.empty((0,), dtype=torch.float32, device=q.device)
         rng_state = torch.empty((2,), dtype=torch.int64, device=q.device)
-    elif can_impl_fmha_fwd_with_sink_varlen_asm():
-        # gfx1250 packed/varlen ASM bf16 path.  q/k/v are packed THD; the kernel
-        # requires dense packing (the wrapper calls `.contiguous()` defensively)
-        # and carries no strides.  softmax_scale is forwarded as-is (the kernel
-        # applies it internally to Q·K^T).  sink_ptr is passed through verbatim;
-        # `can_impl_fmha_fwd_with_sink_varlen_asm` already enforces the per-hdim
-        # (D128→no sink, D64→sink) contract so we never feed a null sink to a
-        # D64 binary that unconditionally reads it.
+    elif gfx1250_asm == _GFX1250_VARLEN_ASM_BF16:
+        # gfx1250 packed/varlen ASM bf16 path (THD; D192x128 / D256 take strided
+        # views).  softmax_scale is forwarded as-is (the kernel applies it
+        # internally to Q·K^T).  sink_ptr is passed through verbatim; the gate
+        # already enforces the per-hdim (D128 / D192x128 / D256 → no sink, D64 →
+        # sink) contract so we never feed a null sink to a D64 binary that
+        # unconditionally reads it.
         out, lse_asm = fmha_fwd_with_sink_varlen_asm(
             q,
             k,
@@ -2945,9 +3487,38 @@ def _flash_attn_varlen_forward(
             out,
         )
         # The ASM kernel writes packed lse (total_q, nheads, 1); the varlen API
-        # convention (mha_varlen_fwd) is (nheads, total_q).  Reshape so callers
-        # and the autograd backward see a consistent layout regardless of path.
-        softmax_lse = lse_asm.squeeze(-1).transpose(0, 1).contiguous()
+        # convention (mha_varlen_fwd) is (nheads, total_q).  Made contiguous only
+        # when it is returned: FlashAttnVarlenFunc needs return_lse for backward.
+        softmax_lse = lse_asm.squeeze(-1).transpose(0, 1)
+        if return_lse:
+            softmax_lse = softmax_lse.contiguous()
+        S_dmask = torch.empty((0,), dtype=torch.float32, device=q.device)
+        rng_state = torch.empty((2,), dtype=torch.int64, device=q.device)
+    elif gfx1250_asm == _GFX1250_VARLEN_ASM_FP8:
+        # gfx1250 packed/varlen ASM fp8 path (D192x128, per-tensor descales,
+        # strided views used in place).  Output is bf16; softmax_scale is
+        # forwarded as-is and the descales are applied inside the kernel.
+        out, lse_asm = fmha_fwd_fp8_varlen_asm(
+            q,
+            k,
+            v,
+            q_descale,
+            k_descale,
+            v_descale,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            float(softmax_scale),
+            bool(causal),
+            bool(return_lse),
+            out,
+        )
+        # packed (total_q, nheads, 1) -> the varlen API's (nheads, total_q),
+        # copied only when it is returned (as in the bf16 branch above)
+        softmax_lse = lse_asm.squeeze(-1).transpose(0, 1)
+        if return_lse:
+            softmax_lse = softmax_lse.contiguous()
         S_dmask = torch.empty((0,), dtype=torch.float32, device=q.device)
         rng_state = torch.empty((2,), dtype=torch.int64, device=q.device)
     elif can_impl_fmha_v3_fwd():
@@ -3139,19 +3710,103 @@ def _flash_attn_varlen_backward(
         # ret &= bias is None
         # ret &= dbias is None
         ret &= dropout_p == 0.0
+        # the v3 kernels take no sink, so d_sink would be left unwritten
+        ret &= sink is None and d_sink is None
         ret &= deterministic == False
         ret &= hdim_q == hdim_v
         ret &= nhead_q % nhead_k == 0
-        ret &= hdim_q > 64 and hdim_q <= 128 and hdim_q % 8 == 0
-        ret &= not swa
+        ret &= (hdim_q > 64 and hdim_q <= 128 and hdim_q % 8 == 0) or hdim_q == 256
+        # sliding window kernels are hd128 only
+        ret &= not swa or hdim_q <= 128
+        if hdim_q == 256:
+            ret &= not causal
+            ret &= window_size_left == -1 and window_size_right == -1
+            ret &= nhead_q == nhead_k
+            ret &= q.dtype == dtypes.bf16
 
         return ret
 
-    can_impl_fmha_v3_bwd_ = can_impl_fmha_v3_bwd() or can_impl_fmha_v3_bwd_gfx950()
+    def can_impl_fmha_v3_bwd_gfx1250():
+        # fmha_v3_varlen_bwd has no CK fallback, so this must match the gfx1250
+        # kernel set exactly: bf16, no mask or bottom-right causal, no hdim padding.
+        ret = get_gfx() == "gfx1250" and is_gfx1250_asm_supported()
+        ret &= q.dtype == dtypes.bf16
+        ret &= alibi_slopes is None
+        ret &= dropout_p == 0.0
+        ret &= (hdim_q, hdim_v) in _GFX1250_BWD_HDIMS
+        ret &= nhead_q % nhead_k == 0
+        ret &= window_size_left == -1 and (causal or window_size_right == -1)
+        ret &= sink is None and d_sink is None
+
+        return ret
+
+    def can_impl_fmha_bwd_flydsl():
+        # d_qk=192 / d_v=128 causal varlen self-attention -- the shape family both
+        # `can_impl_fmha_v3_bwd*` gates exclude by requiring hdim_q == hdim_v.
+        # `deterministic` is absent on purpose: the kernel uses no atomics and
+        # writes each of dq/dk/dv exactly once, so it is deterministic either way.
+        ret = get_gfx() == "gfx942"
+        ret &= alibi_slopes is None
+        ret &= dropout_p == 0.0
+        ret &= hdim_q == 192 and hdim_v == 128
+        ret &= nhead_q == nhead_k
+        ret &= not swa
+        ret &= causal
+        ret &= sink is None and d_sink is None
+        ret &= cu_seqlens_q_padded is None and cu_seqlens_k_padded is None
+        # Self-attention: one cu_seqlens drives both bounds. Comparing values
+        # would need a device sync, so distinct-but-equal tensors are rejected
+        # rather than synced on.
+        ret &= cu_seqlens_q.data_ptr() == cu_seqlens_k.data_ptr()
+        ret &= max_seqlen_q == max_seqlen_k
+        ret &= all(x.dtype == dtypes.bf16 for x in (q, k, v, out, dout))
+        ret &= all(x.is_contiguous() for x in (q, k, v, out, dout))
+        # dq/dk/dv are optional here; the launcher allocates contiguous ones when
+        # they are None.
+        ret &= all(x is None or x.is_contiguous() for x in (dq, dk, dv))
+
+        return ret
+
+    can_impl_fmha_v3_bwd_ = (
+        can_impl_fmha_v3_bwd()
+        or can_impl_fmha_v3_bwd_gfx950()
+        or can_impl_fmha_v3_bwd_gfx1250()
+    )
+    # gfx950 hd256 backward uses a16 (atomic32=0)
+    if get_gfx() == "gfx950" and hdim_q == 256:
+        is_v3_atomic_fp32 = False
+    # gfx1250 backward only ships a32 (atomic32=1)
+    if get_gfx() == "gfx1250":
+        is_v3_atomic_fp32 = True
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
+    # Evaluated after maybe_contiguous: the gate checks contiguity.
+    can_impl_fmha_bwd_flydsl_ = _FLYDSL_AVAILABLE and can_impl_fmha_bwd_flydsl()
 
-    if can_impl_fmha_v3_bwd_:
+    if can_impl_fmha_bwd_flydsl_:
+        from .flydsl.fmha_kernels import flydsl_flash_attn_varlen_bwd
+
+        (
+            dq,
+            dk,
+            dv,
+            softmax_d,
+        ) = flydsl_flash_attn_varlen_bwd(
+            dout,
+            q,
+            k,
+            v,
+            out,
+            softmax_lse,
+            dq,
+            dk,
+            dv,
+            cu_seqlens_q,
+            max_seqlen_q,
+            max_seqlen_k,
+            softmax_scale,
+        )
+    elif can_impl_fmha_v3_bwd_:
         (
             dq,
             dk,
@@ -3255,6 +3910,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         is_v3_atomic_fp32: bool | None = True,
         how_v3_bf16_cvt: int | None = 1,
         sink_ptr=None,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
     ):
         is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
         if softmax_scale is None:
@@ -3286,9 +3944,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             sink_size=window_size[2] if len(window_size) > 2 else 0,
             bias=bias,
             alibi_slopes=alibi_slopes,
-            q_descale=None,
-            k_descale=None,
-            v_descale=None,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
             return_lse=return_lse,
             return_softmax=return_softmax and dropout_p > 0,
             how_v3_bf16_cvt=how_v3_bf16_cvt,
@@ -3396,7 +4054,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         # is_grad_enabled,
         # cu_seqlens_q_padded, cu_seqlens_k_padded,
         # is_v3_atomic_fp32, how_v3_bf16_cvt,
-        # sink_ptr (fwd-only sink scores; not differentiable via autograd.
+        # sink_ptr, q_descale, k_descale, v_descale
+        # (fwd-only inputs; not differentiable via autograd.
         #           bwd sink gradient d_sink is computed inside mha_varlen_bwd kernel,
         #           not returned here as a positional gradient.)
         # We only have gradients for q,k,v (dq,dk,dv) and possibly bias (dbias). Others are None.
@@ -3427,6 +4086,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             None,  # is_v3_atomic_fp32
             None,  # how_v3_bf16_cvt
             None,  # sink_ptr (not differentiable; bwd uses sink/d_sink args separately)
+            None,  # q_descale
+            None,  # k_descale
+            None,  # v_descale
         )
 
 
@@ -3455,6 +4117,9 @@ def flash_attn_varlen_func(
     cu_seqlens_q_padded: torch.Tensor | None = None,
     cu_seqlens_k_padded: torch.Tensor | None = None,
     sink_ptr: Tensor | None = None,
+    q_descale: torch.Tensor | None = None,
+    k_descale: torch.Tensor | None = None,
+    v_descale: torch.Tensor | None = None,
 ):
     if block_table is not None and (
         cu_seqlens_q_padded is not None or cu_seqlens_k_padded is not None
@@ -3519,39 +4184,96 @@ def flash_attn_varlen_func(
             The output of softmax (possibly with different scaling). It also encodes the dropout
             pattern (negative means that location was dropped, nonnegative means it was kept).
     """
+    descales = (q_descale, k_descale, v_descale)
+    has_any_descale = any(descale is not None for descale in descales)
+    has_all_descales = all(descale is not None for descale in descales)
+    if has_any_descale and not has_all_descales:
+        raise ValueError(
+            "FP8 attention requires q_descale, k_descale, and v_descale together"
+        )
 
-    # Try the PR3039 gfx1250 prefill ASM path before FlyDSL can claim it.
-    def can_try_gfx1250_fmha_fwd_with_sink_varlen_asm():
-        # Keep this public-router gate intentionally narrow so the PR3039
-        # prefill ASM path can be measured without changing decode or other
-        # FlyDSL/CK coverage.
-        if get_gfx() != "gfx1250" or q.dtype != dtypes.bf16:
-            return False
-        hdim_q = q.shape[-1]
-        hdim_v = v.shape[-1]
-        nhead_q = q.shape[-2]
-        nhead_k = k.shape[-2]
-        if hdim_q not in (64, 128) or hdim_v != hdim_q:
-            return False
-        if nhead_q % nhead_k != 0:
-            return False
-        if not causal or dropout_p != 0.0 or logits_soft_cap != 0.0:
-            return False
-        if window_size[0] != -1 or window_size[1] != -1:
-            return False
-        sink_size = window_size[2] if len(window_size) > 2 else 0
-        if sink_size != 0:
-            return False
-        if bias is not None or alibi_slopes is not None or block_table is not None:
-            return False
-        if cu_seqlens_q_padded is not None or cu_seqlens_k_padded is not None:
-            return False
-        if hdim_q == 64:
-            return sink_ptr is not None
-        return sink_ptr is None
+    # gfx1250 varlen ASM goes ahead of FlyDSL.  _flash_attn_varlen_forward asks
+    # the same gate with the arguments FlashAttnVarlenFunc passes it, so an
+    # accepted call is served by that ASM kernel.
+    # A call that needs gradients goes to the ASM forward only for head dims the
+    # gfx1250 ASM backward has; FlyDSL below takes none.
+    is_grad = torch.is_grad_enabled() and any(x.requires_grad for x in [q, k, v])
+    if _IS_GFX1250_ASM_DEVICE:
+        gfx1250_asm = _select_gfx1250_fmha_fwd_varlen_asm(
+            q,
+            k,
+            v,
+            out,
+            causal=causal,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            window_size_left=window_size[0],
+            window_size_right=window_size[1],
+            sink_size=window_size[2] if len(window_size) > 2 else 0,
+            sink_ptr=sink_ptr,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            dropout_p=dropout_p,
+            logits_soft_cap=logits_soft_cap,
+            bias=bias,
+            alibi_slopes=alibi_slopes,
+            block_table=block_table,
+            cu_seqlens_q_padded=cu_seqlens_q_padded,
+            cu_seqlens_k_padded=cu_seqlens_k_padded,
+            return_softmax=return_attn_probs and dropout_p > 0,
+            dense_last_dim_later=True,  # _flash_attn_varlen_forward fixes it
+        )
+        if gfx1250_asm == _GFX1250_VARLEN_ASM_FP8 or (
+            gfx1250_asm == _GFX1250_VARLEN_ASM_BF16
+            and not _prefer_flydsl_over_gfx1250_bf16_varlen_asm(q, causal)
+            and not (is_grad and (q.size(-1), v.size(-1)) not in _GFX1250_BWD_HDIMS)
+        ):
+            return FlashAttnVarlenFunc.apply(
+                q,
+                k,
+                v,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                min_seqlen_q,
+                dropout_p,
+                softmax_scale,
+                logits_soft_cap,
+                causal,
+                window_size,
+                bias,
+                alibi_slopes,
+                deterministic,
+                return_lse,
+                return_attn_probs,
+                block_table,
+                out,
+                torch.is_grad_enabled(),
+                cu_seqlens_q_padded,
+                cu_seqlens_k_padded,
+                True,
+                how_v3_bf16_cvt,
+                sink_ptr,
+                q_descale,
+                k_descale,
+                v_descale,
+            )
 
-    if can_try_gfx1250_fmha_fwd_with_sink_varlen_asm():
-        return FlashAttnVarlenFunc.apply(
+    # The FlyDSL forward returns a plain tensor with no autograd graph, so it must
+    # not take requests that need gradients (is_grad above).
+    if (
+        _FLYDSL_AVAILABLE
+        and not is_grad
+        and (len(window_size) < 3 or window_size[2] == 0)
+        and cu_seqlens_q_padded is None
+        and cu_seqlens_k_padded is None
+        and logits_soft_cap == 0.0
+    ):
+        from .flydsl.fmha_kernels import flydsl_flash_attn_varlen_fwd
+
+        _flydsl_result = flydsl_flash_attn_varlen_fwd(
             q,
             k,
             v,
@@ -3559,55 +4281,30 @@ def flash_attn_varlen_func(
             cu_seqlens_k,
             max_seqlen_q,
             max_seqlen_k,
-            min_seqlen_q,
-            dropout_p,
-            softmax_scale,
-            logits_soft_cap,
-            causal,
-            window_size,
-            bias,
-            alibi_slopes,
-            deterministic,
-            return_lse,
-            return_attn_probs,
-            block_table,
-            out,
-            torch.is_grad_enabled(),
-            cu_seqlens_q_padded,
-            cu_seqlens_k_padded,
-            True,
-            how_v3_bf16_cvt,
-            sink_ptr,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            return_lse=return_lse,
+            dropout_p=dropout_p,
+            window_size=window_size,
+            bias=bias,
+            alibi_slopes=alibi_slopes,
+            deterministic=deterministic,
+            return_attn_probs=return_attn_probs,
+            block_table=block_table,
+            out=out,
+            sink=sink_ptr,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
         )
-
-    # FlyDSL path returns result if supported, None otherwise.
-    from .flydsl.fmha_kernels import flydsl_flash_attn_varlen_func
-
-    _flydsl_result = flydsl_flash_attn_varlen_func(
-        q,
-        k,
-        v,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        max_seqlen_q,
-        max_seqlen_k,
-        softmax_scale=softmax_scale,
-        causal=causal,
-        return_lse=return_lse,
-        dropout_p=dropout_p,
-        window_size=window_size,
-        bias=bias,
-        alibi_slopes=alibi_slopes,
-        deterministic=deterministic,
-        return_attn_probs=return_attn_probs,
-        block_table=block_table,
-        out=out,
-        sink=sink_ptr,
-    )
-    if _flydsl_result is not None:
-        return _flydsl_result
+        if _flydsl_result is not None:
+            return _flydsl_result
 
     if not ENABLE_CK:
+        if has_all_descales:
+            raise RuntimeError(
+                "prequantized FP8 attention with descales requires ENABLE_CK=1"
+            )
         from .triton.attention.mha import (
             flash_attn_varlen_func as flash_attn_varlen_func_triton,
         )
@@ -3660,6 +4357,9 @@ def flash_attn_varlen_func(
         True,
         how_v3_bf16_cvt,
         sink_ptr,
+        q_descale,
+        k_descale,
+        v_descale,
     )
 
 
@@ -4036,7 +4736,38 @@ def flash_attn_varlen_fp8_pertensor_func(
     softmax_scale=None,
     sink_ptr=None,
 ):
-    if not ENABLE_CK and sink_ptr is None:
+    # The gfx1250 FP8 D192x128 ASM kernel is reached through
+    # _flash_attn_varlen_forward, which takes it before CK; with CK disabled,
+    # go there only for calls that kernel accepts (same gate, same arguments).
+    use_fp8_varlen_asm = _IS_GFX1250_ASM_DEVICE and (
+        _select_gfx1250_fmha_fwd_varlen_asm(
+            q,
+            k,
+            v,
+            None,
+            causal=causal,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            window_size_left=int(window_size[0]),
+            window_size_right=int(window_size[1]),
+            sink_size=int(window_size[2]) if len(window_size) == 3 else 0,
+            sink_ptr=sink_ptr,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            dropout_p=0.0,
+            logits_soft_cap=logits_soft_cap,
+            bias=None,
+            alibi_slopes=None,
+            block_table=None,
+            cu_seqlens_q_padded=None,
+            cu_seqlens_k_padded=None,
+            return_softmax=False,
+            dense_last_dim_later=True,  # _flash_attn_varlen_forward fixes it
+        )
+        == _GFX1250_VARLEN_ASM_FP8
+    )
+    if not ENABLE_CK and sink_ptr is None and not use_fp8_varlen_asm:
         from .triton.attention.mha_v3 import (
             flash_attn_varlen_func as flash_attn_varlen_func_v3_triton,
         )

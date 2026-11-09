@@ -66,10 +66,37 @@ def test_gemm(b, m, n, k, dtype, layout):
             "sgd,grd->sgr" if layout == "mbn" else "sgd,grd->gsr", o_sgd, weight
         ),
     }
-    # CK is arch-limited (gfx942/gfx950) and only supports a contiguous input; on
-    # the mbn (transposed mbk) input it returns wrong results. Skip it otherwise.
-    if layout == "bmn" and get_gfx() in CK_SUPPORTED_GFX:
+    # CK is arch-limited (gfx942/gfx950). It reads the operands' strides, so it runs
+    # on the transposed mbk input too and no longer has to be skipped for it.
+    #
+    # Two entries, because the two halves are reachable by different calls. The
+    # helper allocates its own contiguous output, so it can only exercise the INPUT
+    # strides. Placement needs the op called directly with a preallocated output
+    # whose outer strides are not those of a contiguous [b, m, n] -- constructed
+    # explicitly rather than with empty_like, whose layout preservation depends on
+    # the source being non-overlapping and dense, and asserted below so that a
+    # future change cannot quietly leave this testing nothing.
+    if get_gfx() in CK_SUPPORTED_GFX:
         gemm_funcs["ck"] = lambda: aiter.batched_gemm_bf16_CK(x, weight)
+        if layout == "mbn":
+            # A size-1 dimension constrains no stride, so the model's own form --
+            # a transposed view of a contiguous [m, b, n] -- is contiguous
+            # whenever m or b is 1, and the placement case would quietly become
+            # the contiguous one. Pad the row stride for those shapes instead:
+            # a different non-contiguity, equally real, and either form leaves
+            # the innermost dimension unit-stride as the wrapper requires.
+            if m > 1 and b > 1:
+                y_ck = torch.empty(m, b, n, dtype=dtypes.bf16).transpose(0, 1)
+            else:
+                y_ck = torch.empty(b, m, n + 1, dtype=dtypes.bf16)[:, :, :n]
+            # [1, 1, n] has no non-contiguous form with a unit innermost stride,
+            # and is the only shape exempt from the guard.
+            assert not y_ck.is_contiguous() or (
+                b == 1 and m == 1
+            ), "the placement case needs a strided out"
+        else:
+            y_ck = torch.empty(b, m, n, dtype=dtypes.bf16)
+        gemm_funcs["ck_out"] = lambda: aiter.batched_gemm_bf16(x, weight, y_ck)
     # batched GEMM b x ([m,k] @ [n,k]^T -> [m,n]):
     #   FLOPs   = 2 * b * m * n * k  (multiply-add)
     #   bytes   = (x + weight + out) elements * dtype size

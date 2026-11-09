@@ -11,8 +11,9 @@ retry_cmd() {
     while true; do
         if "$@"; then
             return 0
+        else
+            rc=$?
         fi
-        rc=$?
         if [[ "$attempt" -ge "$max_attempts" ]]; then
             echo "Command failed after ${attempt} attempts: $*"
             return "$rc"

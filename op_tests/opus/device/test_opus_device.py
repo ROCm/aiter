@@ -365,19 +365,12 @@ class OpusDeviceLib:
         fn.argtypes = [_VP, _VP, _VP, _I]
         fn(self._ptr(Input), self._ptr(Workspace), self._ptr(Result), int(n_chunks))
 
-    # -- tdm_window 2-slot GEMM (gfx1250) --
-    def run_tdm_gfx1250(self, A, B, C, stride_a, stride_b, stride_c):
-        fn = self._lib.run_tdm_gfx1250
-        fn.restype = None
-        fn.argtypes = [_VP, _VP, _VP, _I, _I, _I]
-        fn(
-            self._ptr(A),
-            self._ptr(B),
-            self._ptr(C),
-            int(stride_a),
-            int(stride_b),
-            int(stride_c),
-        )
+    # -- tdm functional coverage (gfx1250) --
+    def run_tdm_feature_suite(self):
+        fn = self._lib.run_tdm_feature_suite
+        fn.restype = _I
+        fn.argtypes = []
+        return int(fn())
 
 
 def _get_gpu_arch():
@@ -986,11 +979,22 @@ def test_mxfp4_16x16x128(mod):
 _WMMA_SCALE_ARCHS = {"gfx1250"}
 
 
+def _wmma_scale_unavailable(mod, variant, arch):
+    """Whether to skip a wmma_scale variant, on either of the two grounds it can be
+    absent: the arch has no such instruction, or setup.py left test_wmma_scale.cu out of
+    the .so. The second needs checking too -- every launcher here is looked up by name at
+    call time, so a missing one raises out of the whole run instead of skipping one test.
+    """
+    if arch not in _WMMA_SCALE_ARCHS:
+        print(f"  SKIP: {variant} requires {_WMMA_SCALE_ARCHS}, got '{arch}'")
+        return True
+    return _skip_if_missing_symbol(mod, f"run_{variant}", variant)
+
+
 def _test_wmma_scale_fp8(mod, variant, bx16=False):
     """Test WMMA scale fp8 (16x16x128 f8f6f4). Returns 0 on pass, 1 on fail."""
     arch = _get_gpu_arch()
-    if arch not in _WMMA_SCALE_ARCHS:
-        print(f"  SKIP: {variant} requires {_WMMA_SCALE_ARCHS}, got '{arch}'")
+    if _wmma_scale_unavailable(mod, variant, arch):
         return 0
     M, N, K = 16, 16, 128
     device = torch.device("cuda")
@@ -1018,8 +1022,7 @@ def _test_wmma_scale_fp8(mod, variant, bx16=False):
 def _test_wmma_scale_fp4(mod, variant, M, N, K, bx16=False):
     """Test WMMA scale fp4. Returns 0 on pass, 1 on fail."""
     arch = _get_gpu_arch()
-    if arch not in _WMMA_SCALE_ARCHS:
-        print(f"  SKIP: {variant} requires {_WMMA_SCALE_ARCHS}, got '{arch}'")
+    if _wmma_scale_unavailable(mod, variant, arch):
         return 0
     device = torch.device("cuda")
     torch.manual_seed(54321)
@@ -1056,8 +1059,7 @@ def _test_wmma_scale_fp4(mod, variant, M, N, K, bx16=False):
 def _test_tiled_wmma_scale_fp8(mod, variant):
     """Test tiled WMMA scale fp8 via make_tiled_mma (C = A @ B^T)."""
     arch = _get_gpu_arch()
-    if arch not in _WMMA_SCALE_ARCHS:
-        print(f"  SKIP: {variant} requires {_WMMA_SCALE_ARCHS}, got '{arch}'")
+    if _wmma_scale_unavailable(mod, variant, arch):
         return 0
     M, N, K = 16, 16, 128
     device = torch.device("cuda")
@@ -1113,8 +1115,7 @@ def test_tiled_wmma_scale_16x16x128_fp8(mod):
 def _test_tiled_wmma_scale_fp8_multi(mod, variant, M, N, K):
     """Test tiled WMMA scale fp8 with multiple waves (C = A @ B^T)."""
     arch = _get_gpu_arch()
-    if arch not in _WMMA_SCALE_ARCHS:
-        print(f"  SKIP: {variant} requires {_WMMA_SCALE_ARCHS}, got '{arch}'")
+    if _wmma_scale_unavailable(mod, variant, arch):
         return 0
     device = torch.device("cuda")
     fp8_dtype = _get_fp8_dtype()
@@ -1171,8 +1172,7 @@ def _pack_bx32_scales(exponents):
 def _test_wmma_scale_fp8_with_scaling(mod, variant, bx16=False):
     """Test WMMA scale fp8 with random per-row/col E8M0 scale values."""
     arch = _get_gpu_arch()
-    if arch not in _WMMA_SCALE_ARCHS:
-        print(f"  SKIP: {variant} requires {_WMMA_SCALE_ARCHS}, got '{arch}'")
+    if _wmma_scale_unavailable(mod, variant, arch):
         return 0
     M, N, K = 16, 16, 128
     device = torch.device("cuda")
@@ -2645,51 +2645,38 @@ def test_wb_streamk_reduce(mod):
     return 0
 
 
-def test_tdm_gfx1250(mod):
-    """Test opus::tdm_window 2-slot ping-pong GEMM (gfx1250 only).
+def test_tdm_feature_suite(mod):
+    """Functional coverage for opus::tdm on gfx1250: element sizes, tile ranks 2..5,
+    gather/scatter, runtime descriptor state, padding, multicast and clamping.
 
-    Kernel is specialized for M=32, N=64 and K = positive multiple of 128.
-    Threshold scales with K (fp16 accumulation noise grows ~linearly).
+    The checks are byte-exact against tile geometry and run on the C++ side, which owns
+    the buffers and prints a line per check; this returns the number that failed. Stating
+    the same expected layouts again in torch would give two descriptions of one geometry
+    that have to be kept in agreement, and the copy that drifted would be this one.
     """
     if _get_gpu_arch() not in {"gfx1250"}:
-        print("  SKIP: test_tdm_gfx1250 (gfx1250 only)")
+        print("  SKIP: test_tdm_feature_suite (gfx1250 only)")
         return 0
-    if _skip_if_missing_symbol(mod, "run_tdm_gfx1250", "test_tdm_gfx1250"):
+    if _skip_if_missing_symbol(mod, "run_tdm_feature_suite", "test_tdm_feature_suite"):
         return 0
 
-    device = torch.device("cuda")
-    M, N = 32, 64
-    failures = 0
-    for K in [128, 256, 384, 512]:
-        torch.manual_seed(K)
-        # RCR layout: A row-major [M,K], B row-major [N,K] (consumed as K-contig)
-        a_fp32 = torch.empty(M, K, device=device, dtype=torch.float32).uniform_(
-            0.0, 1.0
-        )
-        b_fp32 = torch.empty(N, K, device=device, dtype=torch.float32).uniform_(
-            -0.5, 0.5
-        )
-        a = a_fp32.to(torch.float16)
-        b = b_fp32.to(torch.float16)
-        c = torch.empty(M, N, device=device, dtype=torch.float16)
+    import sys
 
-        mod.run_tdm_gfx1250(a, b, c, stride_a=K, stride_b=K, stride_c=N)
-
-        # Reference: C = A @ B^T (B is row-major NxK -> use transpose).
-        ref = (a_fp32 @ b_fp32.t()).to(torch.float16).to(torch.float32)
-        got = c.to(torch.float32)
-        max_abs = (ref - got).abs().max().item()
-        threshold = max(1e-2, 5e-5 * K)
-        if max_abs > threshold:
-            print(
-                f"  FAIL: tdm_move_2slot K={K} max_abs={max_abs:.4f} (thr={threshold:.4f})"
-            )
-            failures += 1
-        else:
-            print(
-                f"  PASS: tdm_move_2slot K={K} max_abs={max_abs:.4f} (thr={threshold:.4f})"
-            )
-    return failures
+    sys.stdout.flush()
+    failures = mod.run_tdm_feature_suite()
+    # Negative means the suite declined to run because the device is not gfx1250. The
+    # arch gate above should already have caught that, so this is the second of two
+    # answers to the same question -- kept because they are established differently: this
+    # one from the device pass that was actually compiled, that one from a name torch
+    # reports.
+    if failures < 0:
+        print("  SKIP: test_tdm_feature_suite (device is not gfx1250)")
+        return 0
+    if failures:
+        print(f"  FAIL: tdm_feature_suite ({failures} checks failed)")
+        return 1
+    print("  PASS: tdm_feature_suite")
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -2791,7 +2778,7 @@ def main():
     failures += test_mdiv(mod)
     failures += test_wb_cumulative(mod)
     failures += test_wb_streamk_reduce(mod)
-    failures += test_tdm_gfx1250(mod)
+    failures += test_tdm_feature_suite(mod)
 
     if failures:
         print(f"\n{failures} test(s) FAILED")

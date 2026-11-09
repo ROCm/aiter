@@ -11,9 +11,19 @@ Simulates async_result behavior without GPU/multiprocessing to verify:
 Run: python3 -m unittest op_tests.test_mp_tuner_logic -v
 """
 
+import importlib
+import multiprocessing as mp
+import os
+import subprocess
+import sys
 import time
 import unittest
 from multiprocessing import TimeoutError as MPTimeoutError
+
+
+def _wait_for_release(release, value):
+    release.wait(timeout=5)
+    return value
 
 
 class FakeAsyncResult:
@@ -289,6 +299,143 @@ class TestAcceleratorError(unittest.TestCase):
         self.assertIn(0, completed_ids)
         self.assertIn(1, completed_ids)
         self.assertNotIn(2, completed_ids, "Task 2 not reached due to break")
+
+
+class TestTaskExecutionTiming(unittest.TestCase):
+
+    def test_queued_task_has_no_elapsed_execution_time(self):
+        tuner = importlib.import_module("aiter.utility.mp_tuner")
+        elapsed_since_start = getattr(tuner, "_elapsed_since_task_start", None)
+
+        self.assertIsNotNone(
+            elapsed_since_start,
+            "mp_tuner must calculate timeout from the worker execution start",
+        )
+        self.assertIsNone(elapsed_since_start([0.0], 0, now=100.0))
+        self.assertEqual(elapsed_since_start([55.0], 0, now=100.0), 45.0)
+
+    def test_worker_records_start_only_when_task_leaves_queue(self):
+        tuner = importlib.import_module("aiter.utility.mp_tuner")
+        init_start_times = getattr(tuner, "_init_task_start_times", None)
+        run_with_tracking = getattr(tuner, "_run_with_start_tracking", None)
+
+        self.assertIsNotNone(init_start_times)
+        self.assertIsNotNone(run_with_tracking)
+
+        ctx = mp.get_context("spawn")
+        start_times = ctx.RawArray("d", 2)
+        manager = ctx.Manager()
+        release = manager.Event()
+        pool = ctx.Pool(1, initializer=init_start_times, initargs=(start_times,))
+        try:
+            first = pool.apply_async(
+                run_with_tracking, (0, _wait_for_release, (release, "first"))
+            )
+            second = pool.apply_async(
+                run_with_tracking, (1, _wait_for_release, (release, "second"))
+            )
+
+            deadline = time.monotonic() + 5
+            while start_times[0] == 0 and time.monotonic() < deadline:
+                time.sleep(0.01)
+
+            self.assertGreater(start_times[0], 0)
+            self.assertEqual(
+                start_times[1],
+                0,
+                "Queued task must not get a start timestamp",
+            )
+
+            release.set()
+            self.assertEqual(first.get(timeout=5), "first")
+            self.assertEqual(second.get(timeout=5), "second")
+            self.assertGreater(start_times[1], 0)
+        finally:
+            release.set()
+            pool.terminate()
+            pool.join()
+            manager.shutdown()
+
+
+class TestTaskStartTimeReset(unittest.TestCase):
+
+    def test_reset_clears_only_the_given_slots(self):
+        tuner = importlib.import_module("aiter.utility.mp_tuner")
+        reset_start_times = getattr(tuner, "_reset_task_start_times", None)
+
+        self.assertIsNotNone(
+            reset_start_times,
+            "submitting a task must clear its start-time slot, otherwise a "
+            "resubmitted task is judged against the previous attempt's timestamp",
+        )
+        slots = [11.0, 22.0, 33.0]
+        reset_start_times(slots, [0, 2])
+        self.assertEqual(list(slots), [0, 22.0, 0])
+
+    def test_reset_clears_worker_pids(self):
+        tuner = importlib.import_module("aiter.utility.mp_tuner")
+        slots, pids = [11.0, 22.0], [101, 202]
+        tuner._reset_task_start_times(slots, [1], pids)
+        self.assertEqual(pids, [101, 0])
+
+
+class TestTaskWorkerExit(unittest.TestCase):
+
+    def test_exited_worker_is_detected(self):
+        tuner = importlib.import_module("aiter.utility.mp_tuner")
+        worker_exited = getattr(tuner, "_task_worker_exited", None)
+        self.assertIsNotNone(
+            worker_exited,
+            "a task whose worker died (e.g. GPU fault) must not wait for the timeout",
+        )
+        proc = subprocess.Popen([sys.executable, "-c", "pass"])
+        proc.wait()
+        self.assertTrue(worker_exited([proc.pid], 0))
+        self.assertFalse(worker_exited([os.getpid()], 0))
+        self.assertFalse(worker_exited([0], 0), "a queued task has no worker yet")
+
+    def test_worker_pid_recorded_when_task_starts(self):
+        tuner = importlib.import_module("aiter.utility.mp_tuner")
+        ctx = mp.get_context("spawn")
+        start_times = ctx.RawArray("d", 1)
+        pids = ctx.RawArray("i", 1)
+        pool = ctx.Pool(
+            1,
+            initializer=tuner._init_task_start_times,
+            initargs=(start_times, pids),
+        )
+        try:
+            worker_pid = pool.apply_async(
+                tuner._run_with_start_tracking, (0, os.getpid, ())
+            ).get(timeout=60)
+            self.assertEqual(pids[0], worker_pid)
+            self.assertGreater(start_times[0], 0)
+        finally:
+            pool.terminate()
+            pool.join()
+
+
+class TestWorkerErrorRatio(unittest.TestCase):
+
+    def test_nonfinite_error_ratio_is_rejected(self):
+        tuner = importlib.import_module("aiter.utility.mp_tuner")
+        merge_error_ratio = getattr(tuner, "_merge_error_ratio", None)
+
+        self.assertIsNotNone(
+            merge_error_ratio,
+            "worker must reject non-finite comparator error ratios",
+        )
+        for observed in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(observed=observed):
+                self.assertEqual(merge_error_ratio(0.0, observed), 1.0)
+
+    def test_finite_error_ratio_keeps_maximum(self):
+        tuner = importlib.import_module("aiter.utility.mp_tuner")
+        merge_error_ratio = getattr(tuner, "_merge_error_ratio", None)
+
+        self.assertIsNotNone(merge_error_ratio)
+        self.assertEqual(merge_error_ratio(0.1, 0.2), 0.2)
+        self.assertEqual(merge_error_ratio(0.2, 0.1), 0.2)
 
 
 if __name__ == "__main__":

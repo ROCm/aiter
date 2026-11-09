@@ -17,8 +17,10 @@ import triton
 import triton.language as tl
 from torch import Tensor
 
+from aiter.ops.triton.utils.device_info import get_num_sms
+
 if TYPE_CHECKING:
-    from .iris import IrisCommContext
+    from aiter.ops.triton.comms.iris import IrisCommContext
 
 
 # If we got here, iris is available
@@ -163,7 +165,7 @@ def all_gather(
     block_m: int = 64,
     block_n: int = 64,
     group_size_m: int = 8,
-    num_sms: int = 256,
+    num_sms: int | None = 256,
 ) -> Tensor:
     """
     Perform all-gather along the M (row) dimension.
@@ -179,7 +181,8 @@ def all_gather(
         block_m (int): Block size for M dimension. Default: 64
         block_n (int): Block size for N dimension. Default: 64
         group_size_m (int): Group size for swizzling. Default: 8
-        num_sms (int): Number of SMs to use (persistent kernel). Default: 256
+        num_sms (int | None): Persistent grid size. Default: 256.
+            None uses the current device's CU count.
 
     Returns:
         Tensor: Full tensor of shape [M, N] where M = M_shard * world_size
@@ -210,13 +213,20 @@ def all_gather(
     M = M_shard * world_size
 
     logger.info(
-        f"Rank {cur_rank}/{world_size}: All-gather M_shard={M_shard}, N={N} -> M={M}"
+        "Rank %d/%d: All-gather M_shard=%d, N=%d -> M=%d",
+        cur_rank,
+        world_size,
+        M_shard,
+        N,
+        M,
     )
 
     # Allocate output buffer in IRIS shared memory
     full_output = iris_ctx.zeros((M, N), dtype=input_shard.dtype)
 
     # Launch kernel
+    if num_sms is None:
+        num_sms = get_num_sms()
     grid = (num_sms,)
     _all_gather_kernel[grid](
         input_shard,
@@ -245,7 +255,7 @@ def all_gather(
     iris_ctx.barrier()
 
     logger.info(
-        f"Rank {cur_rank}: All-gather complete, output shape: {full_output.shape}"
+        "Rank %d: All-gather complete, output shape: %s", cur_rank, full_output.shape
     )
 
     return full_output

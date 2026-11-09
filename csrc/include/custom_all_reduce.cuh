@@ -17,13 +17,18 @@
  */
 #include "aiter_hip_common.h"
 #include "hip_float8.h"
+#include "mx_quant_utils.h"
 #include "opus/opus.hpp"
+#include "quant_amax_floor.h"
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
+#include <algorithm>
+#include <cstdint>
 #include <iostream>
 #include <limits>
 #include <map>
+#include <memory>
 #include <string>
 #include <type_traits>
 #include <unordered_map>
@@ -312,17 +317,21 @@ DINLINE P* get_tmp_buf(volatile Signal* sg)
     return (P*)(((Signal*)sg) + 1);
 }
 
-template <typename T, int ngpus, bool is_broadcast_reg_outptr = false>
-__global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage_naive(RankData* _input_dp,
-                                                                           RankData* _output_dp,
-                                                                           RankSignals sg,
+// HAS_RESIDUAL adds residual (identical on every rank) to the reduced value
+// after it has rounded to T, matching all-reduce followed by a separate add.
+template <typename T, int ngpus, bool is_broadcast_reg_outptr = false, bool HAS_RESIDUAL = false>
+__global__ void __launch_bounds__(512, 1)
+    cross_device_reduce_2stage_naive(RankData* _input_dp,
+                                     RankData* _output_dp,
+                                     RankSignals sg,
 #ifndef USE_ROCM
-                                                                           volatile
+                                     volatile
 #endif
-                                                                           Signal* self_sg,
-                                                                           T* __restrict__ result,
-                                                                           int rank,
-                                                                           int size)
+                                     Signal* self_sg,
+                                     T* __restrict__ result,
+                                     int rank,
+                                     int size,
+                                     const T* __restrict__ residual = nullptr)
 {
     constexpr int pack_size = 16 / sizeof(T);
     int tid                 = blockIdx.x * blockDim.x + threadIdx.x;
@@ -339,7 +348,8 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage_naive(RankD
     for(int i = 0; i < ngpus; i++)
     {
         int target = (rank + i) % ngpus;
-        ptrs[i]    = (const P*)_input_dp->ptrs[target];
+        // Keep the sum order independent of the reduce-scatter owner.
+        ptrs[i]    = (const P*)_input_dp->ptrs[i];
         tmps[i]    = get_tmp_buf<P>(sg.signals[target]);
     }
     auto tmp_out = tmps[0];
@@ -364,8 +374,11 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage_naive(RankD
             int gather_from_rank = ((rank + i) % ngpus);
             if(gather_from_rank == ngpus - 1 || idx < part)
             {
-                int dst_idx           = gather_from_rank * part + idx;
-                ((P*)result)[dst_idx] = tmps[i][idx];
+                int dst_idx = gather_from_rank * part + idx;
+                P reduced   = tmps[i][idx];
+                if constexpr(HAS_RESIDUAL)
+                    packed_assign_add<T, pack_size>(reduced, ((const P*)residual)[dst_idx]);
+                ((P*)result)[dst_idx] = reduced;
             }
         }
     }
@@ -373,17 +386,20 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage_naive(RankD
 
 #define THREAD_NUM 512
 
-template <typename T, int ngpus, bool is_broadcast_reg_outptr = false>
-__global__ void __launch_bounds__(512, 1) cross_device_reduce_1stage(RankData* _input_dp,
-                                                                     RankData* _output_dp,
-                                                                     RankSignals sg,
+// HAS_RESIDUAL: see cross_device_reduce_2stage_naive.
+template <typename T, int ngpus, bool is_broadcast_reg_outptr = false, bool HAS_RESIDUAL = false>
+__global__ void __launch_bounds__(512, 1)
+    cross_device_reduce_1stage(RankData* _input_dp,
+                               RankData* _output_dp,
+                               RankSignals sg,
 #ifndef USE_ROCM
-                                                                     volatile
+                               volatile
 #endif
-                                                                     Signal* self_sg,
-                                                                     T* __restrict__ result,
-                                                                     int rank,
-                                                                     int size)
+                               Signal* self_sg,
+                               T* __restrict__ result,
+                               int rank,
+                               int size,
+                               const T* __restrict__ residual = nullptr)
 {
     constexpr int pack_size = 16 / sizeof(T);
     using P                 = typename opus::vector_t<T, pack_size>;
@@ -393,6 +409,8 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_1stage(RankData* _
     // note: we don't reorder the address so the accumulation order is the same
     // for all ranks, ensuring bitwise identical results
     auto dp     = *_input_dp;
+    // When ngpus does not divide THREAD_NUM (e.g. 6), the last THREAD_NUM %
+    // ngpus threads get warp_id == ngpus: they only join the barriers.
     int warp_id = threadIdx.x / tnum_gpu;
     int lane_id = threadIdx.x % tnum_gpu;
 
@@ -418,7 +436,7 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_1stage(RankData* _
     int buf  = 0;
     int idx0 = start;
 
-    if(idx0 < size)
+    if(warp_id < ngpus && idx0 < size)
     {
         P val                                       = ((const P**)&dp.ptrs[0])[warp_id][idx0];
         tmp_smem[buf][warp_id * tnum_gpu + lane_id] = val;
@@ -454,6 +472,16 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_1stage(RankData* _
                     acc[j] += upcast_s(vg[j]);
             }
 
+            if constexpr(HAS_RESIDUAL)
+            {
+                // Round the reduced value to T before the add, like the
+                // 2-stage kernels and all-reduce followed by a separate add.
+                P res = ((const P*)residual)[cur_idx];
+#pragma unroll
+                for(int j = 0; j < pack_size; ++j)
+                    acc[j] = upcast_s(downcast_s<T>(acc[j])) + upcast_s(res[j]);
+            }
+
             // store result
             P out;
 #pragma unroll
@@ -467,7 +495,7 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_1stage(RankData* _
         // 2. ALL warps prefetch NEXT buffer
         //    (including warp 0; safe to issue after reduction)
         // =======================================================
-        if(next_idx < size)
+        if(warp_id < ngpus && next_idx < size)
         {
             P nxt = ((const P**)&dp.ptrs[0])[warp_id][next_idx];
             tmp_smem[next_buf][warp_id * tnum_gpu + lane_id] = nxt;
@@ -480,17 +508,24 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_1stage(RankData* _
     end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
-template <typename T, int ngpus, bool is_broadcast_reg_outptr = false>
-__global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage(RankData* _input_dp,
-                                                                     RankData* _output_dp,
-                                                                     RankSignals sg,
+// HAS_RESIDUAL: see cross_device_reduce_2stage_naive.
+template <typename T,
+          int ngpus,
+          bool is_broadcast_reg_outptr = false,
+          bool has_tail                = false,
+          bool HAS_RESIDUAL            = false>
+__global__ void __launch_bounds__(512, 1)
+    cross_device_reduce_2stage(RankData* _input_dp,
+                               RankData* _output_dp,
+                               RankSignals sg,
 #ifndef USE_ROCM
-                                                                     volatile
+                               volatile
 #endif
-                                                                     Signal* self_sg,
-                                                                     T* __restrict__ result,
-                                                                     int rank,
-                                                                     int size)
+                               Signal* self_sg,
+                               T* __restrict__ result,
+                               int rank,
+                               int size,
+                               const T* __restrict__ residual = nullptr)
 {
     constexpr int pack_size = 16 / sizeof(T);
     constexpr int tnum_gpu  = THREAD_NUM / ngpus;
@@ -511,13 +546,20 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage(RankData* _
     for(int i = 0; i < ngpus; i++)
     {
         int target = (rank + i) % ngpus;
-        ptrs[i]    = (const P*)_input_dp->ptrs[target];
+        // Keep the sum order independent of the reduce-scatter owner.
+        ptrs[i]    = (const P*)_input_dp->ptrs[i];
         tmps[i]    = get_tmp_buf<P>(sg.signals[target]);
     }
     auto tmp_out = tmps[0];
     start_sync<ngpus>(sg, self_sg, rank);
-    // stage 1: reduce scatter
-    for(int idx = start + tid; idx < end; idx += stride)
+    // stage 1: reduce scatter. The optimized dispatch has equal rank partitions.
+    int loop_end = end;
+    if constexpr(has_tail)
+    {
+        loop_end -= (end - start) % tnum_gpu;
+    }
+    int idx = start + tid;
+    for(; idx < loop_end; idx += stride)
     {
         *(reinterpret_cast<P*>(&tmp_smem[0]) + threadIdx.x) = ptrs[warp_id][idx];
         __syncthreads();
@@ -551,6 +593,15 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage(RankData* _
         }
         __syncthreads();
     }
+    if constexpr(has_tail)
+    {
+        // Preserve the full-tile loop and its barriers. The remaining packs are
+        // reduced by their original owner threads without shared memory.
+        if(warp_id == 0 && idx < end)
+        {
+            tmp_out[idx - start] = packed_reduce<P, ngpus, A>(ptrs, idx);
+        }
+    }
     end_sync<ngpus>(sg, self_sg, rank);
 
     // stage 2: allgather. Note: it's important to match the tid between
@@ -560,12 +611,17 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage(RankData* _
     // ranks.
     for(int idx = tid; idx < largest_part; idx += stride)
     {
-        int dst_idx           = (warp_id + rank) % ngpus * part + idx;
-        ((P*)result)[dst_idx] = tmps[warp_id][idx];
+        int dst_idx = (warp_id + rank) % ngpus * part + idx;
+        P reduced   = tmps[warp_id][idx];
+        if constexpr(HAS_RESIDUAL)
+            packed_assign_add<T, pack_size>(reduced, ((const P*)residual)[dst_idx]);
+        ((P*)result)[dst_idx] = reduced;
     }
 }
 
-template <typename T, int ngpus, bool is_broadcast_reg_outptr = false>
+// HAS_RESIDUAL: see cross_device_reduce_2stage_naive; the reducing rank adds it
+// before sending.
+template <typename T, int ngpus, bool is_broadcast_reg_outptr = false, bool HAS_RESIDUAL = false>
 __global__ void __launch_bounds__(512, 1)
     cross_device_reduce_2stage_write_mode(RankData* _input_dp,
                                           RankData* _output_dp,
@@ -576,7 +632,8 @@ __global__ void __launch_bounds__(512, 1)
                                           Signal* self_sg,
                                           T* __restrict__ result,
                                           int rank,
-                                          int size)
+                                          int size,
+                                          const T* __restrict__ residual = nullptr)
 {
     constexpr int pack_size = 16 / sizeof(T);
     constexpr int tnum_gpu  = THREAD_NUM / ngpus;
@@ -619,12 +676,16 @@ __global__ void __launch_bounds__(512, 1)
 
     // stage 2: reduce scatter & write result to remote rank
     end = rank != ngpus - 1 ? part : size - part * (ngpus - 1);
-    for(int idx = tid; idx < end; idx += stride)
+    // Uniform trip count, see cross_device_reduce_2stage.
+    int loop_end = (end + stride - 1) / stride * stride;
+    for(int idx = tid; idx < loop_end; idx += stride)
     {
-        *(reinterpret_cast<P*>(&tmp_smem[0]) + threadIdx.x) = tmp_out[warp_id * part + idx];
+        bool active = idx < end;
+        if(active)
+            *(reinterpret_cast<P*>(&tmp_smem[0]) + threadIdx.x) = tmp_out[warp_id * part + idx];
         __syncthreads();
         // cal add in first 64 threads
-        if(warp_id == 0)
+        if(warp_id == 0 && active)
         {
             A add_reg;
 #pragma unroll
@@ -649,9 +710,13 @@ __global__ void __launch_bounds__(512, 1)
             {
                 write_reg[i] = downcast_s<T>(add_reg[i]);
             }
+            if constexpr(HAS_RESIDUAL)
+                packed_assign_add<T, pack_size>(write_reg, ((const P*)residual)[rank * part + idx]);
             *(reinterpret_cast<P*>(&res_smem[0]) + lane_id) = write_reg;
         }
         __syncthreads();
+        if(!active)
+            continue;
         // send data to remote rank
         if(is_broadcast_reg_outptr)
         {
@@ -740,6 +805,66 @@ __global__ void __launch_bounds__(512, 1) allgather_vec(
     end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
+// Up to this many tensors gathered by one allgatherv launch.
+constexpr int kAllGatherVMax = 4;
+
+// One launch, one rank barrier, for the first-dim all-gather of several
+// tensors whose row counts may differ per rank. Rank w holds `rows[w]` rows of
+// every tensor; tensor t's rows are `row_bytes[t]` bytes, read at `in_off[t]`
+// past rank w's `dp[t]` pointer and written to the contiguous `out[t]` from
+// row `row_start[w]`.
+struct AllGatherVArgs
+{
+    const RankData* dp[kAllGatherVMax];
+    int64_t in_off[kAllGatherVMax];
+    uint8_t* out[kAllGatherVMax];
+    int64_t row_bytes[kAllGatherVMax];
+    int64_t rows[8];
+    int64_t row_start[8];
+    int n;
+};
+
+template <int ngpus>
+__global__ void __launch_bounds__(512, 1)
+    allgatherv(AllGatherVArgs args, RankSignals sg, Signal* self_sg, int rank)
+{
+    using P                = opus::vector_t<uint32_t, 4>;
+    constexpr int tnum_gpu = THREAD_NUM / ngpus;
+    int warp_id            = threadIdx.x / tnum_gpu;
+    int lane_id            = threadIdx.x % tnum_gpu;
+    int tid                = blockIdx.x * tnum_gpu + lane_id;
+    int stride             = gridDim.x * tnum_gpu;
+    start_sync<ngpus>(sg, self_sg, rank);
+
+    for(int t = 0; t < args.n; ++t)
+    {
+        const int64_t row_bytes = args.row_bytes[t];
+        // Under 2 GiB a rank (checked on the host), so 32-bit indices.
+        const int bytes = static_cast<int>(args.rows[warp_id] * row_bytes);
+        const uint8_t* src =
+            static_cast<const uint8_t*>(args.dp[t]->ptrs[warp_id]) + args.in_off[t];
+        uint8_t* dst = args.out[t] + args.row_start[warp_id] * row_bytes;
+        // 16-byte units when every rank's slice stays 16-byte aligned in the
+        // output, 4-byte words otherwise.
+        if(row_bytes % 16 == 0)
+        {
+            for(int idx = tid; idx < bytes / 16; idx += stride)
+            {
+                reinterpret_cast<P*>(dst)[idx] = reinterpret_cast<const P*>(src)[idx];
+            }
+        }
+        else
+        {
+            for(int idx = tid; idx < bytes / 4; idx += stride)
+            {
+                reinterpret_cast<uint32_t*>(dst)[idx] =
+                    reinterpret_cast<const uint32_t*>(src)[idx];
+            }
+        }
+    }
+    end_sync<ngpus, true>(sg, self_sg, rank);
+}
+
 template <typename T, int ngpus>
 __global__ void __launch_bounds__(512, 1) allgather_lastdim(RankData* _dp,
                                                             RankSignals sg,
@@ -804,8 +929,8 @@ __global__ void __launch_bounds__(512, 1) reduce_scatter_split_first_dim(
 #pragma unroll
     for(int i = 0; i < ngpus; i++)
     {
-        int target = (rank + i) % ngpus;
-        ptrs[i]    = (const P*)_dp->ptrs[target];
+        // Keep the sum order independent of the reduce-scatter owner.
+        ptrs[i] = (const P*)_dp->ptrs[i];
     }
     start_sync<ngpus>(sg, self_sg, rank);
 
@@ -837,8 +962,8 @@ __global__ void __launch_bounds__(256, 1) reduce_scatter_split_lastdim_naive(
 #pragma unroll
   for (int i = 0; i < ngpus; ++i)
   {
-    int target = (rank + i) % ngpus;
-    ptrs[i] = (const T*)_dp->ptrs[target];
+    // Keep the sum order independent of the reduce-scatter owner.
+    ptrs[i] = (const T*)_dp->ptrs[i];
   }
   start_sync<ngpus>(sg, self_sg, rank);
   for (int i = index; i < size; i += blockDim.x * gridDim.x)
@@ -877,8 +1002,8 @@ __global__ void __launch_bounds__(256, 1) reduce_scatter_split_lastdim(
 #pragma unroll
   for (int i = 0; i < ngpus; ++i)
   {
-    int target = (rank + i) % ngpus;
-    ptrs[i] = (const P*)_dp->ptrs[target];
+    // Keep the sum order independent of the reduce-scatter owner.
+    ptrs[i] = (const P*)_dp->ptrs[i];
   }
   start_sync<ngpus>(sg, self_sg, rank);
   for (int i = index; i < size; i += blockDim.x * gridDim.x)
@@ -908,8 +1033,8 @@ __global__ void __launch_bounds__(256, 1) reduce_scatter_split_middim_naive(
 #pragma unroll
   for (int i = 0; i < ngpus; ++i)
   {
-    int target = (rank + i) % ngpus;
-    ptrs[i] = (const T*)_dp->ptrs[target];
+    // Keep the sum order independent of the reduce-scatter owner.
+    ptrs[i] = (const T*)_dp->ptrs[i];
   }
   start_sync<ngpus>(sg, self_sg, rank);
   for (int i = index; i < size; i += blockDim.x * gridDim.x)
@@ -949,8 +1074,8 @@ __global__ void __launch_bounds__(256, 1) reduce_scatter_split_middim(
 #pragma unroll
   for (int i = 0; i < ngpus; ++i)
   {
-    int target = (rank + i) % ngpus;
-    ptrs[i] = (const P*)_dp->ptrs[target];
+    // Keep the sum order independent of the reduce-scatter owner.
+    ptrs[i] = (const P*)_dp->ptrs[i];
   }
   start_sync<ngpus>(sg, self_sg, rank);
   for (int i = index; i < size; i += blockDim.x * gridDim.x)
@@ -1201,7 +1326,8 @@ __global__ __forceinline__ void __launch_bounds__(512, 1) allReduceQuantFp8(
     for(int i = 0; i < ngpus; i++)
     {
         int target = (rank + i) % ngpus;
-        ptrs[i]    = (const inp_pack*)_dp->ptrs[target];
+        // Keep the sum order independent of the reduce-scatter owner.
+        ptrs[i]    = (const inp_pack*)_dp->ptrs[i];
         tmps[i]    = get_tmp_buf<fp8_pack>(sg.signals[target]);
     }
     auto tmp_out = tmps[0];
@@ -1285,18 +1411,25 @@ __global__ void __launch_bounds__(512, 1) reduce_scatter_cross_device_store(
     start_sync<ngpus>(sg, self_sg, rank);
 
     int part = m * valid_pack_count / ngpus;
-    for(int idx = tid; idx < part; idx += gridDim.x * tnum_gpu)
+    // Uniform trip count, see cross_device_reduce_2stage.
+    int stride   = gridDim.x * tnum_gpu;
+    int loop_end = (part + stride - 1) / stride * stride;
+    for(int idx = tid; idx < loop_end; idx += stride)
     {
-        int flat_idx = rank * part + idx;
-        int row      = flat_idx / valid_pack_count;
-        int col      = flat_idx % valid_pack_count;
-        int input_idx = row * input_pack_count + col;
-        // cross device read by all warp
-        P input_reg                                         = ptrs[warp_id][input_idx];
-        *(reinterpret_cast<P*>(&tmp_smem[0]) + threadIdx.x) = input_reg;
+        bool active = idx < part;
+        if(active)
+        {
+            int flat_idx  = rank * part + idx;
+            int row       = flat_idx / valid_pack_count;
+            int col       = flat_idx % valid_pack_count;
+            int input_idx = row * input_pack_count + col;
+            // cross device read by all warp
+            P input_reg                                         = ptrs[warp_id][input_idx];
+            *(reinterpret_cast<P*>(&tmp_smem[0]) + threadIdx.x) = input_reg;
+        }
         __syncthreads();
         // calculate and save in first warp
-        if(warp_id == 0)
+        if(warp_id == 0 && active)
         {
             A add_reg;
 #pragma unroll
@@ -1323,6 +1456,8 @@ __global__ void __launch_bounds__(512, 1) reduce_scatter_cross_device_store(
             *(reinterpret_cast<P*>(&tmp_smem[0]) + lane_id) = add_rslt;
         }
         __syncthreads();
+        if(!active)
+            continue;
 
         // cross device store
         P rslt                           = *(reinterpret_cast<P*>(&tmp_smem[0]) + lane_id);
@@ -1369,7 +1504,10 @@ DINLINE void smemReduceSum(float* smem_addr)
  * input case n dim should be divided by 4096 with dtype bf16
  * and should be divided by 2048 with dtype fp32
  * */
-template <typename T, int tnum, int n_loop, bool GEMMA_NORM = false>
+// ROW_OPTS=false keeps the plain path (residual add, every row normalized).
+// ROW_OPTS=true skips the residual add if skip_residual and normalizes only the
+// first norm_rows rows; residual_out still gets every row.
+template <typename T, int tnum, int n_loop, bool GEMMA_NORM = false, bool ROW_OPTS = false>
 __global__ void __launch_bounds__(tnum, 1)
     local_device_load_rmsnorm_naive(RankSignals sg,
                                     T* __restrict__ residual_inp,
@@ -1379,7 +1517,9 @@ __global__ void __launch_bounds__(tnum, 1)
                                     float eps,
                                     int rank,
                                     int m,
-                                    int n)
+                                    int n,
+                                    int norm_rows      = std::numeric_limits<int>::max(),
+                                    bool skip_residual = false)
 {
     constexpr int pack_size = 16 / sizeof(T);
     using P                 = typename opus::vector_t<T, pack_size>;
@@ -1389,28 +1529,52 @@ __global__ void __launch_bounds__(tnum, 1)
 
     for(int bid = blockIdx.x; bid < m; bid += gridDim.x)
     {
-        float square_sum = 0.0f;
+        const bool do_norm = !ROW_OPTS || bid < norm_rows;
+        float square_sum   = 0.0f;
         A rms_inp_f32[n_loop];
         P w_arr[n_loop];
 #pragma unroll
         for(int n_iter = 0; n_iter < n_loop; ++n_iter)
         {
-            int read_idx        = bid * n_loop * blockDim.x + n_iter * blockDim.x + threadIdx.x;
-            P reduce_out_pack   = tmps[read_idx];
-            P residual_inp_pack = *(reinterpret_cast<P*>(residual_inp) + read_idx);
-            w_arr[n_iter] = *(reinterpret_cast<P*>(weight) + n_iter * blockDim.x + threadIdx.x);
+            int read_idx      = bid * n_loop * blockDim.x + n_iter * blockDim.x + threadIdx.x;
+            P reduce_out_pack = tmps[read_idx];
+            P residual_inp_pack;
+            if(!ROW_OPTS || !skip_residual)
+                residual_inp_pack = *(reinterpret_cast<P*>(residual_inp) + read_idx);
+            if constexpr(!ROW_OPTS)
+                w_arr[n_iter] = *(reinterpret_cast<P*>(weight) + n_iter * blockDim.x + threadIdx.x);
             A reduce_pack;
 #pragma unroll
             for(int i = 0; i < pack_size; ++i)
             {
-                float res_inp          = upcast_s(residual_inp_pack[i]);
-                float ar_out           = upcast_s(reduce_out_pack[i]);
-                float rms_inp          = res_inp + ar_out;
+                float rms_inp = upcast_s(reduce_out_pack[i]);
+                if(!ROW_OPTS || !skip_residual)
+                    rms_inp += upcast_s(residual_inp_pack[i]);
                 rms_inp_f32[n_iter][i] = rms_inp;
                 reduce_pack[i]         = rms_inp * rms_inp;
             }
-            square_sum += packReduce<AddFunctor, float, pack_size>(reduce_pack);
+            if constexpr(ROW_OPTS)
+            {
+                // Write residual_out here so rows that skip the norm still get it.
+                if(do_norm)
+                {
+                    w_arr[n_iter] =
+                        *(reinterpret_cast<P*>(weight) + n_iter * blockDim.x + threadIdx.x);
+                    square_sum += packReduce<AddFunctor, float, pack_size>(reduce_pack);
+                }
+                P rmsnorm_inp;
+#pragma unroll
+                for(int i = 0; i < pack_size; ++i)
+                    rmsnorm_inp[i] = downcast_s<T>(rms_inp_f32[n_iter][i]);
+                *(reinterpret_cast<P*>(residual_out) + read_idx) = rmsnorm_inp;
+            }
+            else
+            {
+                square_sum += packReduce<AddFunctor, float, pack_size>(reduce_pack);
+            }
         }
+        if(!do_norm)
+            continue;
         smem[threadIdx.x] = square_sum;
         __syncthreads();
         smemReduceSum<tnum>(&smem[0]);
@@ -1424,16 +1588,17 @@ __global__ void __launch_bounds__(tnum, 1)
 #pragma unroll
             for(int i = 0; i < pack_size; ++i)
             {
-                float x_f32     = rms_inp_f32[n_iter][i];
-                float w_f32     = upcast_s(w_arr[n_iter][i]);
+                float x_f32 = rms_inp_f32[n_iter][i];
+                float w_f32 = upcast_s(w_arr[n_iter][i]);
                 if constexpr(GEMMA_NORM)
                     w_f32 += 1.0f;
                 rmsnorm_inp[i]  = downcast_s<T>(x_f32);
                 rmsnorm_rslt[i] = downcast_s<T>(x_f32 * w_f32 * denom);
             }
             int write_idx = bid * n_loop * blockDim.x + n_iter * blockDim.x + threadIdx.x;
-            *(reinterpret_cast<P*>(results) + write_idx)      = rmsnorm_rslt;
-            *(reinterpret_cast<P*>(residual_out) + write_idx) = rmsnorm_inp;
+            *(reinterpret_cast<P*>(results) + write_idx) = rmsnorm_rslt;
+            if constexpr(!ROW_OPTS)
+                *(reinterpret_cast<P*>(residual_out) + write_idx) = rmsnorm_inp;
         }
     }
 }
@@ -1442,7 +1607,8 @@ __global__ void __launch_bounds__(tnum, 1)
  * block size can be 256 and 512
  * corresponding 2048 and 4096 elem per block
  * */
-template <typename T, int tnum, int n_loop, bool GEMMA_NORM = false>
+// ROW_OPTS: see local_device_load_rmsnorm_naive.
+template <typename T, int tnum, int n_loop, bool GEMMA_NORM = false, bool ROW_OPTS = false>
 __global__ void __launch_bounds__(tnum, 1) local_device_load_rmsnorm(RankSignals sg,
                                                                      T* __restrict__ residual_inp,
                                                                      T* __restrict__ residual_out,
@@ -1452,20 +1618,23 @@ __global__ void __launch_bounds__(tnum, 1) local_device_load_rmsnorm(RankSignals
                                                                      int rank,
                                                                      int m,
                                                                      int n,
-                                                                     int out_hidden_dim)
+                                                                     int out_hidden_dim,
+                                                                     int norm_rows = std::numeric_limits<int>::max(),
+                                                                     bool skip_residual = false)
 {
     constexpr int pack_size = 16 / sizeof(T);
     using P                 = typename opus::vector_t<T, pack_size>;
     using A                 = typename opus::vector_t<opus::fp32_t, pack_size>;
     __shared__ float smem[tnum];
     P* tmps = get_tmp_buf<P>(sg.signals[rank]);
-    int in_pack_count       = n / pack_size;
-    int out_pack_count      = out_hidden_dim / pack_size;
-    int tail_pack_count     = out_pack_count - in_pack_count;
+    int in_pack_count   = n / pack_size;
+    int out_pack_count  = out_hidden_dim / pack_size;
+    int tail_pack_count = out_pack_count - in_pack_count;
 
     for(int bid = blockIdx.x; bid < m; bid += gridDim.x)
     {
-        float square_sum = 0.0f;
+        const bool do_norm = !ROW_OPTS || bid < norm_rows;
+        float square_sum   = 0.0f;
         A rms_inp_f32[n_loop];
         P w_arr[n_loop];
 #pragma unroll
@@ -1473,23 +1642,46 @@ __global__ void __launch_bounds__(tnum, 1) local_device_load_rmsnorm(RankSignals
         {
             if(n_iter * tnum + threadIdx.x < in_pack_count)
             {
-                int read_idx        = bid * in_pack_count + n_iter * tnum + threadIdx.x;
-                P reduce_out_pack   = tmps[read_idx];
-                P residual_inp_pack = *(reinterpret_cast<P*>(residual_inp) + read_idx);
-                w_arr[n_iter]       = *(reinterpret_cast<P*>(weight) + n_iter * tnum + threadIdx.x);
+                int read_idx      = bid * in_pack_count + n_iter * tnum + threadIdx.x;
+                P reduce_out_pack = tmps[read_idx];
+                P residual_inp_pack;
+                if(!ROW_OPTS || !skip_residual)
+                    residual_inp_pack = *(reinterpret_cast<P*>(residual_inp) + read_idx);
+                if constexpr(!ROW_OPTS)
+                    w_arr[n_iter] = *(reinterpret_cast<P*>(weight) + n_iter * tnum + threadIdx.x);
                 A reduce_pack;
 #pragma unroll
                 for(int i = 0; i < pack_size; ++i)
                 {
-                    float ar_out           = upcast_s(reduce_out_pack[i]);
-                    float res_inp          = upcast_s(residual_inp_pack[i]);
-                    float rms_inp          = ar_out + res_inp;
+                    float rms_inp = upcast_s(reduce_out_pack[i]);
+                    if(!ROW_OPTS || !skip_residual)
+                        rms_inp += upcast_s(residual_inp_pack[i]);
                     rms_inp_f32[n_iter][i] = rms_inp;
                     reduce_pack[i]         = rms_inp * rms_inp;
                 }
-                square_sum += packReduce<AddFunctor, float, pack_size>(reduce_pack);
+                if constexpr(ROW_OPTS)
+                {
+                    // Write residual_out here so rows that skip the norm still get it.
+                    if(do_norm)
+                    {
+                        w_arr[n_iter] =
+                            *(reinterpret_cast<P*>(weight) + n_iter * tnum + threadIdx.x);
+                        square_sum += packReduce<AddFunctor, float, pack_size>(reduce_pack);
+                    }
+                    P rmsnorm_inp;
+#pragma unroll
+                    for(int i = 0; i < pack_size; ++i)
+                        rmsnorm_inp[i] = downcast_s<T>(rms_inp_f32[n_iter][i]);
+                    *(reinterpret_cast<P*>(residual_out) + read_idx) = rmsnorm_inp;
+                }
+                else
+                {
+                    square_sum += packReduce<AddFunctor, float, pack_size>(reduce_pack);
+                }
             }
         }
+        if(!do_norm)
+            continue;
         smem[threadIdx.x] = square_sum;
         __syncthreads();
         smemReduceSum<tnum>(&smem[0]);
@@ -1505,8 +1697,8 @@ __global__ void __launch_bounds__(tnum, 1) local_device_load_rmsnorm(RankSignals
 #pragma unroll
                 for(int i = 0; i < pack_size; ++i)
                 {
-                    float x_f32     = rms_inp_f32[n_iter][i];
-                    float w_f32     = upcast_s(w_arr[n_iter][i]);
+                    float x_f32 = rms_inp_f32[n_iter][i];
+                    float w_f32 = upcast_s(w_arr[n_iter][i]);
                     if constexpr(GEMMA_NORM)
                         w_f32 += 1.0f;
                     rmsnorm_inp[i]  = downcast_s<T>(x_f32);
@@ -1515,7 +1707,8 @@ __global__ void __launch_bounds__(tnum, 1) local_device_load_rmsnorm(RankSignals
                 int read_idx         = bid * in_pack_count + n_iter * tnum + threadIdx.x;
                 int output_write_idx = bid * out_pack_count + n_iter * tnum + threadIdx.x;
                 *(reinterpret_cast<P*>(results) + output_write_idx) = rmsnorm_rslt;
-                *(reinterpret_cast<P*>(residual_out) + read_idx)    = rmsnorm_inp;
+                if constexpr(!ROW_OPTS)
+                    *(reinterpret_cast<P*>(residual_out) + read_idx) = rmsnorm_inp;
             }
         }
         for(int tail_offset = threadIdx.x; tail_offset < tail_pack_count; tail_offset += blockDim.x)
@@ -1727,7 +1920,77 @@ __device__ __forceinline__ float ar_mxfp4_quant_scale(uint8_t scale_e8m0)
     return v.f;
 }
 
-template <typename P, typename A, typename T, int PACK_SIZE>
+// Rotates each 32-element group by the normalized Sylvester Hadamard matrix, then
+// quantizes it exactly as per_1x32_f4_quant_hip(hadamard_rotate=True) does on the
+// normed output in T: same butterfly order, same RoundUp e8m0 scale, same FP4 convert.
+// The group is spread over 32 / PACK_SIZE consecutive lanes, so the butterfly stages
+// below PACK_SIZE run in registers and the rest exchange with __shfl_xor.
+template <typename T, int PACK_SIZE, typename A>
+__device__ __forceinline__ void ar_mxfp4_hadamard32_quant(const A& out,
+                                                          int lane_in_group,
+                                                          uint8_t* __restrict__ packed,
+                                                          uint8_t& scale_e8m0)
+{
+    constexpr int threads_per_group = 32 / PACK_SIZE;
+    static_assert(32 % PACK_SIZE == 0);
+    float v[PACK_SIZE];
+#pragma unroll
+    for(int i = 0; i < PACK_SIZE; ++i)
+        v[i] = upcast_s(downcast_s<T>(out[i]));
+#pragma unroll
+    for(int h = 1; h < PACK_SIZE; h <<= 1)
+    {
+#pragma unroll
+        for(int i = 0; i < PACK_SIZE; i += 2 * h)
+        {
+#pragma unroll
+            for(int j = i; j < i + h; ++j)
+            {
+                const float a = v[j];
+                const float b = v[j + h];
+                v[j]          = a + b;
+                v[j + h]      = a - b;
+            }
+        }
+    }
+#pragma unroll
+    for(int lane_mask = 1; lane_mask < threads_per_group; lane_mask <<= 1)
+    {
+        const bool upper = (lane_in_group & lane_mask) != 0;
+#pragma unroll
+        for(int i = 0; i < PACK_SIZE; ++i)
+        {
+            const float other = __shfl_xor(v[i], lane_mask, threads_per_group);
+            v[i]              = upper ? other - v[i] : v[i] + other;
+        }
+    }
+    constexpr float kInvSqrt32 = 0.17677669529663687f;
+    float amax                 = aiter::kAmaxFloor;
+#pragma unroll
+    for(int i = 0; i < PACK_SIZE; ++i)
+    {
+        v[i] = upcast_s(downcast_s<T>(v[i] * kInvSqrt32));
+        amax = fmaxf(amax, fabsf(v[i]));
+    }
+    for(int stride = threads_per_group / 2; stride > 0; stride >>= 1)
+        amax = fmaxf(amax, __shfl_xor(amax, stride, threads_per_group));
+
+    const float dq_scale =
+        aiter::fp_f32_to_e8m0_scale<aiter::kDefaultMxScaleRoundMode, aiter::MxDtype::FP4_E2M1>(
+            amax);
+    scale_e8m0 = static_cast<uint8_t>((__builtin_bit_cast(uint32_t, dq_scale) >> 23) & 0xFFu);
+#pragma unroll
+    for(int i = 0; i < PACK_SIZE; i += 2)
+        packed[i / 2] = __builtin_bit_cast(
+            uint8_t, opus::fp32_to_fp4_packed_x2(opus::fp32x2_t{v[i], v[i + 1]}, dq_scale));
+}
+
+template <typename P,
+          typename A,
+          typename T,
+          int PACK_SIZE,
+          bool GEMMA_NORM = false,
+          bool HADAMARD32 = false>
 __device__ __forceinline__ void ar_fusion_epilogue_mxfp4(
     A& in,
     P& weight,
@@ -1745,7 +2008,7 @@ __device__ __forceinline__ void ar_fusion_epilogue_mxfp4(
     constexpr int MXFP4_GROUP_SIZE = 32;
     A out;
 
-    ar_fusion_epilogue_rms_norm<P, A, A, float, PACK_SIZE>(
+    ar_fusion_epilogue_rms_norm<P, A, A, float, PACK_SIZE, 32, GEMMA_NORM>(
         out, in, weight, eps, hidden_dim, block_size);
 
     if(bf16_output != nullptr && active)
@@ -1761,6 +2024,23 @@ __device__ __forceinline__ void ar_fusion_epilogue_mxfp4(
     int group_id                    = threadIdx.x / threads_per_group;
     int lane_in_group               = threadIdx.x % threads_per_group;
     int num_groups                  = hidden_dim / MXFP4_GROUP_SIZE;
+
+    if constexpr(HADAMARD32)
+    {
+        uint8_t packed[PACK_SIZE / 2];
+        uint8_t scale_e8m0;
+        ar_mxfp4_hadamard32_quant<T, PACK_SIZE>(out, lane_in_group, packed, scale_e8m0);
+        if(active)
+        {
+            int byte_idx = tidx * (hidden_dim / 2) + (threadIdx.x * PACK_SIZE) / 2;
+#pragma unroll
+            for(int i = 0; i < PACK_SIZE / 2; ++i)
+                output[byte_idx + i] = packed[i];
+            if(lane_in_group == 0)
+                scale_out[tidx * num_groups + group_id] = scale_e8m0;
+        }
+        return;
+    }
 
     auto fn = [](float a, float b) { return a > b ? a : b; };
     float local_max = 0.0f;
@@ -2143,13 +2423,30 @@ __global__ void __launch_bounds__(1024, 1)
     end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
+// Calls launch(TRANSPOSE_SCALE tag, GEMMA_NORM tag) with the two runtime flags
+// of the per-group quant launchers turned into compile-time constants.
+template <typename Launch>
+inline void per_group_launch_flags(Launch&& launch, bool transpose_scale, bool gemma_norm)
+{
+    auto by_gemma = [&](auto ts_tag) {
+        if(gemma_norm)
+            launch(ts_tag, std::true_type{});
+        else
+            launch(ts_tag, std::false_type{});
+    };
+    if(transpose_scale)
+        by_gemma(std::true_type{});
+    else
+        by_gemma(std::false_type{});
+}
+
 template <typename T, typename OutT, int NGPUS>
 void allreduce_fusion_kernel_1stage_per_group_launcher(
     RankData* _dp, RankSignals sg, Signal* self_sg, int rank,
     T* residual_inp, T* residual_out, OutT* output, T* weight,
     float* scale_out, int size, int hidden_dim, int group_size,
     float eps, hipStream_t stream, T* bf16_output = nullptr,
-    bool transpose_scale = false)
+    bool transpose_scale = false, bool gemma_norm = false)
 {
     auto pack_size  = 16 / sizeof(T);
     int block_size  = hidden_dim / pack_size;
@@ -2159,24 +2456,22 @@ void allreduce_fusion_kernel_1stage_per_group_launcher(
     // Grid-stride launch: cap blocks at kMaxBlocks so m > kMaxBlocks still works
     // (the kernel loops `for(tidx = blockIdx.x; tidx < token_num; tidx += gridDim.x)`).
     dim3 grid(std::min(m, kMaxBlocks));
-    // TRANSPOSE_SCALE picked once at the host so the scale-store index math is
-    // resolved at compile time inside the kernel.
-    auto launch = [&](auto ts_tag) {
+    // TRANSPOSE_SCALE and GEMMA_NORM picked once at the host so the scale-store
+    // index math and the (1 + w) weight are resolved at compile time.
+    auto launch = [&](auto ts_tag, auto gn_tag) {
         constexpr bool TRANSPOSE_SCALE = decltype(ts_tag)::value;
-        allreduce_fusion_kernel_1stage_per_group<T, OutT, NGPUS, /*GEMMA_NORM=*/false, TRANSPOSE_SCALE>
+        constexpr bool GEMMA_NORM      = decltype(gn_tag)::value;
+        allreduce_fusion_kernel_1stage_per_group<T, OutT, NGPUS, GEMMA_NORM, TRANSPOSE_SCALE>
             <<<grid, block, 0, stream>>>(_dp, sg, self_sg, rank,
                                          residual_inp, residual_out,
                                          output, weight, scale_out,
                                          size, hidden_dim, group_size, eps,
                                          bf16_output);
     };
-    if(transpose_scale)
-        launch(std::true_type{});
-    else
-        launch(std::false_type{});
+    per_group_launch_flags(launch, transpose_scale, gemma_norm);
 }
 
-template <typename T, int ngpus>
+template <typename T, int ngpus, bool GEMMA_NORM = false, bool HADAMARD32 = false>
 __global__ void __launch_bounds__(1024, 1)
     allreduce_fusion_kernel_1stage_mxfp4(RankData* _dp,
                                          RankSignals sg,
@@ -2246,14 +2541,14 @@ __global__ void __launch_bounds__(1024, 1)
             weight_p = *reinterpret_cast<P*>(weight + access_id_in_token);
         }
         int padded_block_size = (int)blockDim.x;
-        ar_fusion_epilogue_mxfp4<P, A, T, pack_size>(
+        ar_fusion_epilogue_mxfp4<P, A, T, pack_size, GEMMA_NORM, HADAMARD32>(
             acc, weight_p, hidden_dim, eps, idx, tidx, padded_block_size,
             output, scale_out, active, bf16_output);
     }
     end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
-template <typename T, int NGPUS>
+template <typename T, int NGPUS, bool GEMMA_NORM = false, bool HADAMARD32 = false>
 void allreduce_fusion_kernel_1stage_mxfp4_launcher(
     RankData* _dp, RankSignals sg, Signal* self_sg, int rank,
     T* residual_inp, T* residual_out, uint8_t* output, T* weight,
@@ -2266,7 +2561,7 @@ void allreduce_fusion_kernel_1stage_mxfp4_launcher(
     int m           = size / hidden_dim;
     dim3 block(padded_size);
     dim3 grid(std::min(m, kMaxBlocks));
-    allreduce_fusion_kernel_1stage_mxfp4<T, NGPUS>
+    allreduce_fusion_kernel_1stage_mxfp4<T, NGPUS, GEMMA_NORM, HADAMARD32>
         <<<grid, block, 0, stream>>>(_dp, sg, self_sg, rank,
                                      residual_inp, residual_out,
                                      output, weight, scale_out,
@@ -2285,7 +2580,7 @@ void allreduce_fusion_kernel_1stage_mxfp4_launcher(
 //   * keeps the stage-1 numerics identical to the per-group 2-stage kernel
 //     (sum in fp32, downcast to T before storing in tmp), which matches the
 //     unfused (allreduce -> RMSNorm -> dynamic_mxfp4_quant) reference.
-template <typename T, int ngpus>
+template <typename T, int ngpus, bool GEMMA_NORM = false, bool HADAMARD32 = false>
 __global__ void __launch_bounds__(1024, 1)
     allreduce_fusion_kernel_2stage_mxfp4(RankData* _dp,
                                          RankSignals sg,
@@ -2382,13 +2677,13 @@ __global__ void __launch_bounds__(1024, 1)
             for(int v = 0; v < pack_size; ++v)
                 acc[v] = upcast_s(vec[v]);
         }
-        ar_fusion_epilogue_mxfp4<P, A, T, pack_size>(
+        ar_fusion_epilogue_mxfp4<P, A, T, pack_size, GEMMA_NORM, HADAMARD32>(
             acc, weight_p, hidden_dim, eps, idx, tidx, padded_block_size,
             output, scale_out, active, bf16_output);
     }
 }
 
-template <typename T, int NGPUS>
+template <typename T, int NGPUS, bool GEMMA_NORM = false, bool HADAMARD32 = false>
 void allreduce_fusion_kernel_2stage_mxfp4_launcher(
     RankData* _dp, RankSignals sg, Signal* self_sg, int rank,
     T* residual_inp, T* residual_out, uint8_t* output, T* weight,
@@ -2408,7 +2703,7 @@ void allreduce_fusion_kernel_2stage_mxfp4_launcher(
     token_num = std::min(token_num, kMaxBlocks);
     dim3 numBlocks(token_num);
     size_t smem_size = padded_block_size * sizeof(typename opus::vector_t<T, PACK_SIZE>);
-    allreduce_fusion_kernel_2stage_mxfp4<T, NGPUS>
+    allreduce_fusion_kernel_2stage_mxfp4<T, NGPUS, GEMMA_NORM, HADAMARD32>
         <<<numBlocks, threadsPerBlock, smem_size, stream>>>(
             _dp, sg, self_sg, rank,
             residual_inp, residual_out, output, weight, scale_out,
@@ -2620,22 +2915,22 @@ __global__ void __launch_bounds__(1024, 1)
 
             float sum2 = 0.0f;
             if (is_q_t0) {
-                sum2 = *reinterpret_cast<float*>(&tmps[rank][tidx * 2 + 0]);
+                // Sum in rank order so every rank gets the same denominator.
+                sum2 = *reinterpret_cast<float*>(&tmps[0][tidx * 2 + 0]);
 #pragma unroll
                 for(int r = 1; r < ngpus; ++r)
                 {
-                    int target = (rank + r) % ngpus;
-                    auto peer_vec = tmps[target][tidx * 2 + 0];
+                    auto peer_vec = tmps[r][tidx * 2 + 0];
                     sum2 += *reinterpret_cast<float*>(&peer_vec);
                 }
                 smem[0] = sum2;
             } else if (is_k_t0) {
-                sum2 = *reinterpret_cast<float*>(&tmps[rank][tidx * 2 + 1]);
+                // Sum in rank order so every rank gets the same denominator.
+                sum2 = *reinterpret_cast<float*>(&tmps[0][tidx * 2 + 1]);
 #pragma unroll
                 for(int r = 1; r < ngpus; ++r)
                 {
-                    int target = (rank + r) % ngpus;
-                    auto peer_vec = tmps[target][tidx * 2 + 1];
+                    auto peer_vec = tmps[r][tidx * 2 + 1];
                     sum2 += *reinterpret_cast<float*>(&peer_vec);
                 }
                 smem[1] = sum2;
@@ -2766,7 +3061,9 @@ __global__ void __launch_bounds__(1024, 1)
                                    int size,
                                    int hidden_dim,
                                    float eps,
-                                   T* __restrict__ bf16_output = nullptr)
+                                   T* __restrict__ bf16_output = nullptr,
+                                   int norm_rows      = std::numeric_limits<int>::max(),
+                                   bool skip_residual = false)
 {
     constexpr int pack_size = 16 / sizeof(T);
     int block_size          = hidden_dim / pack_size;
@@ -2831,18 +3128,30 @@ __global__ void __launch_bounds__(1024, 1)
         idx += gridDim.x * hidden_dim, tidx += gridDim.x)
     {
         P vec = tmps[rank][idx / pack_size];
-        P res = *reinterpret_cast<P*>(residual_inp + idx);
-#pragma unroll
-        for(int v = 0; v < pack_size; ++v)
-        {
-            vec[v] += res[v];
-        }
-        *reinterpret_cast<P*>(residual_out + idx) = vec;
+        // Add the residual in fp32 and normalize that sum, as the 1-stage kernel
+        // does; only residual_out is rounded to T.
 #pragma unroll
         for(int v = 0; v < pack_size; ++v)
         {
             acc[v] = upcast_s(vec[v]);
         }
+        if(!skip_residual)
+        {
+            P res = *reinterpret_cast<P*>(residual_inp + idx);
+#pragma unroll
+            for(int v = 0; v < pack_size; ++v)
+            {
+                acc[v] += upcast_s(res[v]);
+            }
+        }
+#pragma unroll
+        for(int v = 0; v < pack_size; ++v)
+        {
+            vec[v] = downcast_s<T>(acc[v]);
+        }
+        *reinterpret_cast<P*>(residual_out + idx) = vec;
+        if(tidx >= norm_rows)
+            continue;
         ar_fusion_epilogue<P, A, T, OutT, pack_size, GEMMA_NORM>(
             acc, weight_p, hidden_dim, eps, idx, tidx, block_size, output, scale_out,
             /*active=*/true, bf16_output);
@@ -2863,11 +3172,15 @@ void allreduce_fusion_kernel_2stage_launcher(RankData* _dp,
                                              int hidden_dim,
                                              float eps,
                                              hipStream_t stream,
-                                             T* bf16_output = nullptr)
+                                             T* bf16_output     = nullptr,
+                                             int num_norm_rows  = -1,
+                                             bool skip_residual = false)
 {
     constexpr int PACK_SIZE = 16 / sizeof(T);
     int BLOCK_SIZE          = hidden_dim / PACK_SIZE;
     int token_num           = size / hidden_dim;
+    // num_norm_rows < 0 normalizes every row.
+    int norm_rows = (num_norm_rows < 0 || num_norm_rows > token_num) ? token_num : num_norm_rows;
     dim3 threadsPerBlock(BLOCK_SIZE);
     token_num = std::min(token_num, kMaxBlocks);
     dim3 numBlocks(token_num);
@@ -2885,11 +3198,13 @@ void allreduce_fusion_kernel_2stage_launcher(RankData* _dp,
                                                             size,
                                                             hidden_dim,
                                                             eps,
-                                                            bf16_output);
+                                                            bf16_output,
+                                                            norm_rows,
+                                                            skip_residual);
 }
 
 // Per-group quant variant of the 2-stage kernel.
-template <typename T, typename OutT, int ngpus, bool TRANSPOSE_SCALE = false>
+template <typename T, typename OutT, int ngpus, bool GEMMA_NORM = false, bool TRANSPOSE_SCALE = false>
 __global__ void __launch_bounds__(1024, 1)
     allreduce_fusion_kernel_2stage_per_group(RankData* _dp,
                                              RankSignals sg,
@@ -2971,7 +3286,7 @@ __global__ void __launch_bounds__(1024, 1)
 #pragma unroll
         for(int v = 0; v < pack_size; ++v)
             acc[v] = upcast_s(vec[v]);
-        ar_fusion_epilogue_per_group<P, A, T, OutT, pack_size, /*GEMMA_NORM=*/false, TRANSPOSE_SCALE>(
+        ar_fusion_epilogue_per_group<P, A, T, OutT, pack_size, GEMMA_NORM, TRANSPOSE_SCALE>(
             acc, weight_p, hidden_dim, eps, idx, tidx, block_size,
             group_size, output, scale_out, /*active=*/true, bf16_output,
             m);
@@ -2984,7 +3299,7 @@ void allreduce_fusion_kernel_2stage_per_group_launcher(
     T* residual_inp, T* residual_out, OutT* output, T* weight,
     float* scale_out, int size, int hidden_dim, int group_size,
     float eps, hipStream_t stream, T* bf16_output = nullptr,
-    bool transpose_scale = false)
+    bool transpose_scale = false, bool gemma_norm = false)
 {
     constexpr int PACK_SIZE = 16 / sizeof(T);
     int BLOCK_SIZE          = hidden_dim / PACK_SIZE;
@@ -2993,18 +3308,16 @@ void allreduce_fusion_kernel_2stage_per_group_launcher(
     token_num = std::min(token_num, kMaxBlocks);
     dim3 numBlocks(token_num);
     size_t smem_size = BLOCK_SIZE * sizeof(typename opus::vector_t<T, PACK_SIZE>);
-    auto launch = [&](auto ts_tag) {
+    auto launch = [&](auto ts_tag, auto gn_tag) {
         constexpr bool TRANSPOSE_SCALE = decltype(ts_tag)::value;
-        allreduce_fusion_kernel_2stage_per_group<T, OutT, NGPUS, TRANSPOSE_SCALE>
+        constexpr bool GEMMA_NORM      = decltype(gn_tag)::value;
+        allreduce_fusion_kernel_2stage_per_group<T, OutT, NGPUS, GEMMA_NORM, TRANSPOSE_SCALE>
             <<<numBlocks, threadsPerBlock, smem_size, stream>>>(
                 _dp, sg, self_sg, rank,
                 residual_inp, residual_out, output, weight, scale_out,
                 size, hidden_dim, group_size, eps, bf16_output);
     };
-    if(transpose_scale)
-        launch(std::true_type{});
-    else
-        launch(std::false_type{});
+    per_group_launch_flags(launch, transpose_scale, gemma_norm);
 }
 
 template <typename T, typename OutT, bool GEMMA_NORM = false>
@@ -3052,7 +3365,7 @@ __global__ void __launch_bounds__(1024, 1)
 }
 
 // Per-group quant variant of the naive local device load kernel.
-template <typename T, typename OutT, bool TRANSPOSE_SCALE = false>
+template <typename T, typename OutT, bool GEMMA_NORM = false, bool TRANSPOSE_SCALE = false>
 __global__ void __launch_bounds__(1024, 1)
     local_device_load_rmsnorm_quant_per_group_naive(RankSignals sg,
                                                     int rank,
@@ -3088,7 +3401,7 @@ __global__ void __launch_bounds__(1024, 1)
 #pragma unroll
         for(int v = 0; v < pack_size; ++v)
             acc[v] = upcast_s(vec[v]);
-        ar_fusion_epilogue_per_group<P, A, T, OutT, pack_size, /*GEMMA_NORM=*/false, TRANSPOSE_SCALE>(
+        ar_fusion_epilogue_per_group<P, A, T, OutT, pack_size, GEMMA_NORM, TRANSPOSE_SCALE>(
             acc, weight_p, hidden_dim, eps, idx, tidx, block_size,
             group_size, output, scale_out, /*active=*/true, bf16_output,
             m);
@@ -3111,7 +3424,8 @@ void allreduce_fusion_kernel_split_per_group_launcher(RankData* _dp,
                                                       float eps,
                                                       hipStream_t stream,
                                                       T* bf16_output = nullptr,
-                                                      bool transpose_scale = false)
+                                                      bool transpose_scale = false,
+                                                      bool gemma_norm      = false)
 {
     // step 1: reduce-scatter + allgather cross device store (same as per-token)
     dim3 block(512);
@@ -3141,17 +3455,15 @@ void allreduce_fusion_kernel_split_per_group_launcher(RankData* _dp,
     int nblocks             = size / hidden_dim;
     dim3 threadsPerBlock(BLOCK_SIZE);
     dim3 numBlocks(nblocks);
-    auto launch = [&](auto ts_tag) {
+    auto launch = [&](auto ts_tag, auto gn_tag) {
         constexpr bool TRANSPOSE_SCALE = decltype(ts_tag)::value;
-        local_device_load_rmsnorm_quant_per_group_naive<T, OutT, TRANSPOSE_SCALE>
+        constexpr bool GEMMA_NORM      = decltype(gn_tag)::value;
+        local_device_load_rmsnorm_quant_per_group_naive<T, OutT, GEMMA_NORM, TRANSPOSE_SCALE>
             <<<numBlocks, threadsPerBlock, 0, stream>>>(
                 sg, rank, residual_inp, residual_out, output, weight, scale_out,
                 size, hidden_dim, group_size, eps, bf16_output);
     };
-    if(transpose_scale)
-        launch(std::true_type{});
-    else
-        launch(std::false_type{});
+    per_group_launch_flags(launch, transpose_scale, gemma_norm);
 }
 
 template <typename T, typename OutT, int NGPUS, bool GEMMA_NORM = false>
@@ -3343,6 +3655,1034 @@ __global__ void __launch_bounds__(1024, 1) allreduce_mhc_post_large_m_kernel(
     end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
+// ===========================================================================
+// LL / LL128 low-latency small-message all-reduce (gfx9 POC kernels)
+// ===========================================================================
+// Two flag-in-data, zero-GPU-barrier all-reduce kernels for small messages:
+//   * ar_ll_gfx9       — LL, 16B lines carrying 8B payload + epoch flags.
+//   * ar_ll128_unroll2 — LL128, 128B/16-lane lines, 15 payload words + 1 flag.
+// Both stage into a per-rank scratch that peers write into and the owner polls
+// (spinning on a per-epoch flag), then reduce in fp32. On this port the scratch
+// is NOT independently allocated: it reuses the meta/Signal buffer's post-Signal
+// region (the same region the 2-stage kernel uses as tmp), which is already
+// IPC-exchanged at construction. A peer's scratch base is therefore
+// (char*)sg_.signals[peer] + sizeof(Signal). LL and 2-stage never run on the
+// same message concurrently, and the per-epoch flag + double-buffered banks keep
+// scratch reuse safe across CUDA-graph replay.
+
+constexpr int    kLLMaxRanks       = 8;      // gfx9 supports up to 8 ranks
+constexpr size_t kLLPocSlotCapPk   = 16384;  // per-rank slot cap in 8B packets (<=128KB msg)
+// LL sub-region size in the reused scratch: 2 banks * ngpus * slotCap * 16B.
+// Sized for the worst case (kLLMaxRanks) so the LL128 sub-region can start after
+// it at a fixed offset regardless of world size.
+constexpr size_t kLLPocRegionBytes =
+    (size_t)2 * kLLMaxRanks * kLLPocSlotCapPk * sizeof(uint4);
+// Max message (bytes) the LL128 fast path serves; bounds its dynamic scratch.
+constexpr size_t kLL128PocCapBytes = (size_t)4 * 1024 * 1024;
+
+// 16-byte LL line: two (4B data, 4B flag) pairs carrying 8B of payload.
+union LLPackedMsg
+{
+    struct
+    {
+        uint32_t data0;
+        uint32_t flag0;
+        uint32_t data1;
+        uint32_t flag1;
+    };
+    uint4 raw;
+};
+static_assert(sizeof(LLPackedMsg) == 16, "LLPackedMsg must be exactly 16 bytes");
+
+// gfx9 16B single-transaction store/load: a 16B vector via nontemporal
+// store/load lowers to a single global_store/load_dwordx4 (nt).
+using llx_v4u = __attribute__((__vector_size__(4 * sizeof(unsigned int)))) unsigned int;
+
+DINLINE void ll_store_b128(uint32_t* dst, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3)
+{
+    union
+    {
+        llx_v4u  v;
+        uint32_t w[4];
+    } u;
+    u.w[0] = a0;
+    u.w[1] = a1;
+    u.w[2] = a2;
+    u.w[3] = a3;
+    __builtin_nontemporal_store(u.v, reinterpret_cast<llx_v4u*>(dst));
+    asm volatile("" ::: "memory");
+}
+
+template <typename T>
+DINLINE void remote_store_b128(uint32_t* dst, opus::vector_t<T, 16 / sizeof(T)> data)
+{
+  union
+  {
+    llx_v4u v;
+    T w[16 / sizeof(T)];
+  } u;
+#pragma unroll
+  for (int i = 0; i < 16 / sizeof(T); ++i)
+  {
+    u.w[i] = data[i];
+  }
+  __builtin_nontemporal_store(u.v, reinterpret_cast<llx_v4u*>(dst));
+  asm volatile("" ::: "memory");
+}
+
+template <typename T>
+DINLINE void remote_load_b128(const uint32_t* src, opus::vector_t<T, 16 / sizeof(T)>& data)
+{
+  asm volatile("" ::: "memory");
+  union
+  {
+    llx_v4u v;
+    T w[16 / sizeof(T)];
+  } u;
+  u.v = __builtin_nontemporal_load(reinterpret_cast<llx_v4u*>(const_cast<uint32_t*>(src)));
+#pragma unroll
+  for (int i = 0; i < 16 / sizeof(T); ++i)
+  {
+    data[i] = u.w[i];
+  }
+}
+
+DINLINE void ll_load_b128(
+    const uint32_t* src, uint32_t& o0, uint32_t& o1, uint32_t& o2, uint32_t& o3)
+{
+    asm volatile("" ::: "memory");
+    union
+    {
+        llx_v4u  v;
+        uint32_t w[4];
+    } u;
+    u.v = __builtin_nontemporal_load(reinterpret_cast<llx_v4u*>(const_cast<uint32_t*>(src)));
+    o0  = u.w[0];
+    o1  = u.w[1];
+    o2  = u.w[2];
+    o3  = u.w[3];
+}
+
+// LL flat all-reduce. 1D grid over 8-byte packets.
+//
+// Phase 1 (publish): rank writes its full sendbuff into every peer's scratch at
+// slot[rank], as LL lines carrying the epoch flag.
+// Phase 2 (reduce): rank polls its own scratch slots for the other ranks
+// (waiting on the flag), sums them with its own sendbuff (fp32 accumulation),
+// and writes recvbuff. Self is read directly from sendbuff.
+//
+// Graph-safe device epoch: each block owns a persistent device flag
+// block_flags[blockIdx.x] that the kernel itself bumps. Scratch is
+// double-buffered (bank = epoch & 1); the per-epoch flag disambiguates stale
+// lines, so no clearing is needed and it survives CUDA-graph replay.
+template <typename T, int ngpus, int BLOCK_SIZE = 256>
+__global__ void __launch_bounds__(BLOCK_SIZE) ar_ll_gfx9(
+    T* const* __restrict__ peer_scratch, // ngpus scratch bases (device table)
+    T* __restrict__ recvbuff,
+    const T* __restrict__ sendbuff,
+    size_t nPk,          // number of 8-byte packets = bytes / 8
+    int rank,
+    uint32_t* __restrict__ block_flags, // device array[gridDim.x], persisted
+    size_t slotStridePk = kLLPocSlotCapPk) // per-rank slot capacity in packets
+{
+    constexpr int LP = 8 / sizeof(T); // elements per 8-byte payload
+    using PL         = typename opus::vector_t<T, LP>;
+    using AL         = typename opus::vector_t<opus::fp32_t, LP>;
+    const size_t slot = slotStridePk;
+
+    __shared__ uint32_t s_flag;
+    if(threadIdx.x == 0)
+    {
+        uint32_t f = block_flags[blockIdx.x] + 1u;
+        if(f == 0u)
+            f = 1u; // flag is never 0 (0 == cleared scratch)
+        s_flag = f;
+    }
+    __syncthreads();
+    const uint32_t flag        = s_flag;
+    const size_t   bankOffPkts = (size_t)(flag & 1u) * (size_t)ngpus * slot;
+
+    const size_t gtid   = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t stride = (size_t)gridDim.x * blockDim.x;
+
+    const uint32_t* in = reinterpret_cast<const uint32_t*>(sendbuff);
+
+    // Phase 1: publish my payload into every peer's slot[rank].
+    for(size_t pk = gtid; pk < nPk; pk += stride)
+    {
+        const uint32_t d0 = in[2 * pk];
+        const uint32_t d1 = in[2 * pk + 1];
+#pragma unroll
+        for(int r = 1; r < ngpus; ++r)
+        {
+            int          peer = (rank + r) % ngpus;
+            LLPackedMsg* dst  = reinterpret_cast<LLPackedMsg*>(peer_scratch[peer]) +
+                               bankOffPkts + (size_t)rank * slot;
+            ll_store_b128(reinterpret_cast<uint32_t*>(&dst[pk]), d0, flag, d1, flag);
+        }
+    }
+
+    // Phase 2: poll my slots for the other ranks, reduce with my own data.
+    LLPackedMsg* myBase =
+        reinterpret_cast<LLPackedMsg*>(peer_scratch[rank]) + bankOffPkts;
+    for(size_t pk = gtid; pk < nPk; pk += stride)
+    {
+        PL selfv = *reinterpret_cast<const PL*>(&in[2 * pk]);
+        AL acc;
+#pragma unroll
+        for(int j = 0; j < LP; ++j)
+            acc[j] = upcast_s(selfv[j]);
+
+        uint32_t load_reg[ngpus - 1][4];
+        volatile LLPackedMsg* src[ngpus - 1];
+#pragma unroll
+        for (int i = 1; i < ngpus; ++i)
+        {
+          int peer = (i - 1) + (i - 1 >= rank);
+          src[i - 1] = myBase + (size_t)peer * slot;
+        }
+        bool still_loop;
+        do
+        {
+          still_loop = false;
+#pragma unroll
+          for (int i = 0; i < ngpus - 1; ++i)
+          {
+            ll_load_b128(
+                reinterpret_cast<const uint32_t*>(const_cast<LLPackedMsg*>(&src[i][pk])),
+                load_reg[i][0], load_reg[i][1], load_reg[i][2], load_reg[i][3]
+            );
+          }
+#pragma unroll
+          for (int i = 0; i < ngpus - 1; ++i)
+          {
+            still_loop = still_loop || load_reg[i][1] != flag;
+            still_loop = still_loop || load_reg[i][3] != flag;
+          }
+        } while (still_loop);
+#pragma unroll
+        for (int i = 0; i < ngpus - 1; ++i)
+        {
+          const uint32_t w[2] = {load_reg[i][0], load_reg[i][2]};
+          PL pv = *reinterpret_cast<const PL*>(w);
+#pragma unroll
+          for (int j = 0; j < LP; ++j)
+          {
+            // Insert the local value at its rank, not before all peers.
+            if(i == 0 && rank != 0)
+                acc[j] = upcast_s(pv[j]);
+            else
+                acc[j] += upcast_s(pv[j]);
+            if(i + 1 == rank)
+                acc[j] += upcast_s(selfv[j]);
+          }
+        }
+
+        PL ov;
+#pragma unroll
+        for(int j = 0; j < LP; ++j)
+            ov[j] = downcast_s<T>(acc[j]);
+        reinterpret_cast<PL*>(recvbuff)[pk] = ov;
+    }
+
+    if(threadIdx.x == 0)
+        block_flags[blockIdx.x] = flag;
+}
+
+// ---------------------------------------------------------------------------
+// LL128: 128B / 16-lane lines, 15 payload words + 1 flag word. Same
+// double-buffered scratch model as ar_ll_gfx9 above; only the line geometry
+// (128B / 16 lanes) and the paired-b128 access pattern differ.
+// ---------------------------------------------------------------------------
+
+constexpr int    kLL128MaxBlocks = 80;
+constexpr int    kLL128LineElems = 16;
+constexpr int    kLL128DataElems = 15;
+constexpr int    kLL128FlagElem  = 15;
+constexpr int    kLL128Lanes     = 16;
+// Per-rank slot stride in uint32 words, sized for kLL128PocCapBytes so that
+// consecutive calls of different sizes never overlap a peer's unread slots.
+constexpr int    kLL128SlotStride = (int)((kLL128PocCapBytes + 239) / 240) * 128 * 2 / 4;
+
+struct LLLine128
+{
+    uint64_t w[kLL128LineElems];
+};
+static_assert(sizeof(LLLine128) == 128, "LLLine128 must be exactly 128 bytes");
+
+__host__ __device__ __forceinline__ size_t ll128NumLines(size_t nWords)
+{
+    return (nWords + (size_t)kLL128DataElems - 1) / (size_t)kLL128DataElems;
+}
+
+// Add two 8B payload words element-wise in fp32 (matches ar_ll_gfx9 accumulate).
+template <typename T>
+DINLINE uint64_t ll128_add_word(uint64_t a, uint64_t b)
+{
+    constexpr int LP = 8 / sizeof(T);
+    using PL         = typename opus::vector_t<T, LP>;
+    PL pa = *reinterpret_cast<const PL*>(&a);
+    PL pb = *reinterpret_cast<const PL*>(&b);
+    PL pr;
+#pragma unroll
+    for(int j = 0; j < LP; ++j)
+        pr[j] = downcast_s<T>(upcast_s(pa[j]) + upcast_s(pb[j]));
+    uint64_t r;
+    __builtin_memcpy(&r, &pr, 8);
+    return r;
+}
+
+// Per-block epoch (graph-safe).
+DINLINE uint32_t ll128EpochBegin(const uint32_t* __restrict__ epochDev,
+                                 int flatBlockId,
+                                 uint32_t& s_flag)
+{
+    if(threadIdx.x == 0)
+    {
+        uint32_t f = epochDev[flatBlockId] + 1u;
+        if(f == 0u)
+            f = 2u; // skip 0 sentinel; preserve bank parity
+        s_flag = f;
+    }
+    __syncthreads();
+    return s_flag;
+}
+
+DINLINE void ll128EpochEnd(uint32_t* __restrict__ epochDev,
+                           int flatBlockId,
+                           int total,
+                           int epochLen,
+                           uint32_t flag)
+{
+    if(threadIdx.x == 0)
+    {
+        for(int e = flatBlockId; e < epochLen; e += total)
+            epochDev[e] = flag;
+    }
+}
+template <typename T>
+__device__ void ll128_store_b128(opus::vector_t<T, 16 / sizeof(T)> data, uint32_t* dst)
+{
+  union
+  {
+    llx_v4u v;
+    opus::vector_t<T, 16 / sizeof(T)> vec;
+  } u;
+  u.vec = data;
+  __builtin_nontemporal_store(u.v, reinterpret_cast<llx_v4u*>(dst));
+  asm volatile("" ::: "memory");
+}
+
+template <typename T>
+__device__ void ll128_load_b128(opus::vector_t<T, 16 / sizeof(T)>& data, uint32_t* src)
+{
+  asm volatile("" ::: "memory");
+  union
+  {
+    llx_v4u v;
+    opus::vector_t<T, 16 / sizeof(T)> vec;
+  } u;
+  u.v = __builtin_nontemporal_load(reinterpret_cast<llx_v4u*>(const_cast<uint32_t*>(src)));
+  data = u.vec;
+}
+
+DINLINE void ll128_check_flag(uint32_t& flag0, uint32_t& flag1, uint32_t* src)
+{
+  asm volatile("" ::: "memory");
+  union
+  {
+    llx_v4u v;
+    uint32_t w[4];
+  } u;
+  u.v = __builtin_nontemporal_load(reinterpret_cast<llx_v4u*>(const_cast<uint32_t*>(src)));
+  flag0 = u.w[2];
+  flag1 = u.w[3];
+}
+
+template <typename T>
+__device__ void loadDataFromHBMToReg(
+    int group_index, int lane_index, int total_group, int last_group_pack_num, uint32_t flag,
+    const T* hbm_buffer, opus::vector_t<T, 16 / sizeof(T)> (&dst_reg)[2]
+)
+{
+  using P = opus::vector_t<T, 16 / sizeof(T)>;
+  constexpr int pack_per_group = 15;
+  if (group_index != total_group - 1)
+  {
+    dst_reg[0] = *(reinterpret_cast<const P*>(hbm_buffer) + group_index * pack_per_group + lane_index);
+    if (lane_index < 7)
+    {
+      dst_reg[1] = *(reinterpret_cast<const P*>(hbm_buffer) + group_index * pack_per_group + lane_index + 8);
+    }
+    else
+    {
+#pragma unroll
+      for (int i = 0; i < 4; ++i)
+      {
+        *(reinterpret_cast<uint32_t*>(&dst_reg[1]) + i) = flag;
+      }
+    }
+  }
+  else // last group
+  {
+    if (lane_index < last_group_pack_num)
+    {
+      dst_reg[0] = *(reinterpret_cast<const P*>(hbm_buffer) + group_index * pack_per_group + lane_index);
+    }
+    else
+    {
+#pragma unroll
+      for (int i = 0; i < 4; ++i)
+      {
+        *(reinterpret_cast<uint32_t*>(&dst_reg[0]) + i) = 0;
+      }
+    }
+
+    if (lane_index < last_group_pack_num - 8)
+    {
+      dst_reg[1] = *(reinterpret_cast<const P*>(hbm_buffer) + group_index * pack_per_group + 8 + lane_index);
+    }
+    else if (lane_index == 7)
+    {
+#pragma unroll
+      for (int i = 0; i < 4; ++i)
+      {
+        *(reinterpret_cast<uint32_t*>(&dst_reg[1]) + i) = flag;
+      }
+    }
+    else
+    {
+#pragma unroll
+      for (int i = 0; i < 4; ++i)
+      {
+        *(reinterpret_cast<uint32_t*>(&dst_reg[1]) + i) = 0;
+      }
+    }
+  }
+
+  if (lane_index == 7)
+  {
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+    {
+      dst_reg[1][i] = dst_reg[0][4 + i];
+      dst_reg[0][4 + i] = dst_reg[1][4 + i];
+    }
+  }
+}
+
+#define LL128_MAX_BLOCK_NUM 192
+
+// LL128 unroll2 1-shot all-reduce. 2B dtype only (fp16 / bf16). 8-lane groups,
+// 15-pack lines. Internally resets the per-block epoch up to LL128_MAX_BLOCK_NUM.
+template <typename T, int ngpus, int block_size>
+__global__ void __launch_bounds__(block_size) ar_ll128_unroll2(
+    const T* __restrict__ input, T* __restrict__ output,
+    T* const* __restrict__ peer_scratch, uint32_t* __restrict__ graph_safe_flag,
+    int self_rank, int size
+)
+{
+  constexpr int pack_size = 16 / sizeof(T);
+  using P = opus::vector_t<T, pack_size>;
+  using A = opus::vector_t<opus::fp32_t, pack_size>;
+
+  constexpr int group_per_block = block_size / 8;
+  constexpr int pack_per_group = 15;
+  constexpr int bytes_per_group = 240;
+  int total_bytes = size * sizeof(T);
+  int total_pack = total_bytes / 16;
+  int total_group = (total_bytes + bytes_per_group - 1) / bytes_per_group;
+  int lane_id = threadIdx.x % 8;
+  int group_id = threadIdx.x / 8;
+  int g_index = blockIdx.x * group_per_block + group_id;
+  int stride = gridDim.x * group_per_block;
+  int last_group_pack_num = total_pack % 15 == 0 ? 15 : total_pack % 15;
+
+  __shared__ uint32_t s_flag;
+  const uint32_t flag = ll128EpochBegin(graph_safe_flag, blockIdx.x, s_flag);
+  int bank_offset = (flag & 1u) * ngpus * kLL128SlotStride;
+
+  for (int idx = g_index; idx < total_group; idx += stride)
+  {
+    P inp_reg[2];
+    loadDataFromHBMToReg<T>(idx, lane_id, total_group, last_group_pack_num, flag, input, inp_reg);
+#pragma unroll
+    for (int i = 1; i < ngpus; ++i)
+    {
+      int peer = (self_rank + i) % ngpus;
+      uint32_t* scratch_dst = reinterpret_cast<uint32_t*>(peer_scratch[peer])
+                              + bank_offset
+                              + self_rank * kLL128SlotStride
+                              + idx * 8 * 2 * 4 + lane_id * 4;
+      ll128_store_b128<T>(inp_reg[0], scratch_dst);
+      ll128_store_b128<T>(inp_reg[1], scratch_dst + 8 * 4);
+    }
+  }
+
+  uint32_t* self_scratch = reinterpret_cast<uint32_t*>(peer_scratch[self_rank]) + bank_offset;
+  for (int idx = g_index; idx < total_group; idx += stride)
+  {
+    P inp_reg[2];
+    loadDataFromHBMToReg<T>(idx, lane_id, total_group, last_group_pack_num, flag, input, inp_reg);
+    A reduce_rslt_f32[2];
+#pragma unroll
+    for (int i = 0; i < pack_size; ++i)
+    {
+      reduce_rslt_f32[0][i] = upcast_s(inp_reg[0][i]);
+      reduce_rslt_f32[1][i] = upcast_s(inp_reg[1][i]);
+    }
+    uint32_t* scratch_base[ngpus - 1];
+    uint32_t* scratch_flag_addr[2][ngpus - 1];
+#pragma unroll
+    for (int i = 1; i < ngpus; ++i)
+    {
+      int peer = (i - 1) + (i - 1 >= self_rank);
+      scratch_base[i - 1] = self_scratch + peer * kLL128SlotStride + idx * 8 * 2 * 4;
+      scratch_flag_addr[0][i - 1] = scratch_base[i - 1] + 7 * 4;
+      scratch_flag_addr[1][i - 1] = scratch_flag_addr[0][i - 1] + 8 * 4;
+    }
+    uint32_t s_f[2][2 * (ngpus - 1)];
+    bool still_loop;
+    do
+    {
+      still_loop = false;
+#pragma unroll
+      for (int i = 0; i < ngpus - 1; ++i)
+      {
+        ll128_check_flag(s_f[0][2 * i], s_f[0][2 * i + 1], scratch_flag_addr[0][i]);
+      }
+#pragma unroll
+      for (int i = 0; i < ngpus - 1; ++i)
+      {
+        still_loop = still_loop || s_f[0][2 * i] != flag;
+        still_loop = still_loop || s_f[0][2 * i + 1] != flag;
+      }
+    } while (still_loop);
+    P reduce_elem[ngpus - 1];
+#pragma unroll
+    for (int i = 0; i < ngpus - 1; ++i)
+    {
+      ll128_load_b128<T>(reduce_elem[i], scratch_base[i] + lane_id * 4);
+#pragma unroll
+      for (int j = 0; j < pack_size; ++j)
+      {
+        if(i == 0 && self_rank != 0)
+            reduce_rslt_f32[0][j] = upcast_s(reduce_elem[i][j]);
+        else
+            reduce_rslt_f32[0][j] += upcast_s(reduce_elem[i][j]);
+        if(i + 1 == self_rank)
+            reduce_rslt_f32[0][j] += upcast_s(inp_reg[0][j]);
+      }
+    }
+
+    do
+    {
+      still_loop = false;
+#pragma unroll
+      for (int i = 0; i < ngpus - 1; ++i)
+      {
+        ll128_check_flag(s_f[1][2 * i], s_f[1][2 * i + 1], scratch_flag_addr[1][i]);
+      }
+#pragma unroll
+      for (int i = 0; i < ngpus - 1; ++i)
+      {
+        still_loop = still_loop || s_f[1][2 * i] != flag;
+        still_loop = still_loop || s_f[1][2 * i + 1] != flag;
+      }
+    } while (still_loop);
+#pragma unroll
+    for (int i = 0; i < ngpus - 1; ++i)
+    {
+      ll128_load_b128<T>(reduce_elem[i], scratch_base[i] + lane_id * 4 + 8 * 4);
+#pragma unroll
+      for (int j = 0; j < pack_size; ++j)
+      {
+        if(i == 0 && self_rank != 0)
+            reduce_rslt_f32[1][j] = upcast_s(reduce_elem[i][j]);
+        else
+            reduce_rslt_f32[1][j] += upcast_s(reduce_elem[i][j]);
+        if(i + 1 == self_rank)
+            reduce_rslt_f32[1][j] += upcast_s(inp_reg[1][j]);
+      }
+    }
+
+    // write output
+    P reduce_rslt[2];
+#pragma unroll
+    for (int i = 0; i < 2; ++i)
+    {
+#pragma unroll
+      for (int j = 0; j < pack_size; ++j)
+      {
+        reduce_rslt[i][j] = downcast_s<T>(reduce_rslt_f32[i][j]);
+      }
+    }
+    if (lane_id == 7)
+    {
+#pragma unroll
+      for (int i = 0; i < pack_size / 2; ++i)
+      {
+        reduce_rslt[0][pack_size / 2 + i] = reduce_rslt[1][i];
+      }
+    }
+    bool is_last_group = (idx == total_group - 1);
+    if (!is_last_group || lane_id < last_group_pack_num)
+    {
+      *(reinterpret_cast<P*>(output) + idx * pack_per_group + lane_id) = reduce_rslt[0];
+    }
+    if (lane_id != 7 && (!is_last_group || lane_id + 8 < last_group_pack_num))
+    {
+      *(reinterpret_cast<P*>(output) + idx * pack_per_group + lane_id + 8) = reduce_rslt[1];
+    }
+  }
+  ll128EpochEnd(graph_safe_flag, blockIdx.x, gridDim.x, LL128_MAX_BLOCK_NUM, flag);
+}
+
+// ===========================================================================
+// Lamport all-reduce: one-shot and two-shot wave split (2-byte dtypes, wave64)
+// ===========================================================================
+// Push-only, barrier-free all-reduce. Every rank writes its data straight into
+// its peers' inboxes (a separate uncached IPC buffer, see initLamport) and only
+// polls its own. The data is its own signal: an inbox starts as the 0xffff
+// sentinel (NaN in bf16 and fp16), real data never carries it
+// (lamportCanonicalize turns 0xffff into 0x7fff, also NaN), so a 16B slot has
+// arrived once none of its half-words is 0xffff. Half-words are checked one by
+// one, so a slot that lands in pieces is fine.
+//
+// Inbox: [kLamportBuffers][ngpus source ranks][positions] of 16B, with
+// kLamportMaxPacks positions for the one-shot and lamportTwoShotMaxPart(ngpus)
+// for each two-shot inbox. A rank only ever writes slot[its rank] of a peer's
+// inbox, so every position has one writer and one reader. The own slot is
+// never written.
+//
+// Rounds: every block has a rank-local round counter c in {0, 1, 2}; round c
+// uses buffer c and, at its end, re-arms buffer (c+2)%3 to the sentinel. No
+// rank finishes round c without every peer's round c data, so ranks are at
+// most one round apart, every peer's round c-1 data has been read when buffer
+// (c+2)%3 is re-armed, nobody writes it again before round c+2, and the kernel
+// boundary orders the re-arm before this rank's next sends. Every lane of a
+// launched block re-arms, even past the message: a position used last round
+// but not in this one would otherwise keep stale data. A block always covers
+// the same kLamportWaveSize positions, so a block id's counter is the same on
+// every rank whatever the message size, and a launch is one round (no
+// grid-stride loop), which caps the message (see the run functions). A launch
+// may have more blocks than the GPU holds at once (up to 1024 at TP2 for a 2MB
+// two-shot); that is fine, as a block only waits for the blocks of the same id
+// on the other ranks, never for another block of its own launch.
+//
+// Sums run in fp32 in rank order 0..ngpus-1 and round once, so every rank gets
+// the same bits.
+//
+// Wave split: a block is ngpus waves over the same kLamportWaveSize positions;
+// wave w talks to rank (rank + w) % ngpus only, so wave 0 is this rank, each
+// lane waits for one cross-GPU store instead of ngpus - 1, and a wave whose
+// data has arrived stops polling.
+// ===========================================================================
+constexpr int kLamportBuffers   = 3;
+constexpr int kLamportMaxPacks  = 512 * 80; // positions per inbox slot (640KB of 2-byte data)
+constexpr int kLamportWaveSize  = 64;       // positions per block, one per lane of a wave64
+constexpr int kLamportMaxBlocks = kLamportMaxPacks / kLamportWaveSize;
+
+// Largest two-shot message: the largest the dispatch takes (2MB at TP2, see
+// CustomAllreduce::lamportKernel); TP4 / TP8 stop at 1MB there, the rest is
+// for the forced kernel in the tuning sweeps. The inboxes are sized from it,
+// so raising a dispatch cap past it means raising it too. The one-shot keeps
+// kLamportMaxPacks positions (640KB).
+constexpr int64_t kLamportTwoShotMaxBytes = 2ll << 20;
+
+// two-shot positions per chunk, i.e. per rank, of the largest message
+inline constexpr int64_t lamportTwoShotMaxPart(int ngpus)
+{
+    return kLamportTwoShotMaxBytes / 16 / ngpus;
+}
+
+// two-shot round counters, one per block of the largest message
+inline constexpr int64_t lamportTwoShotMaxBlocks(int ngpus)
+{
+    return lamportTwoShotMaxPart(ngpus) / kLamportWaveSize;
+}
+
+// The one-shot inbox: [kLamportBuffers][ngpus][kLamportMaxPacks] of 16B.
+inline constexpr int64_t lamportInboxBytes(int ngpus)
+{
+    return (int64_t)kLamportBuffers * ngpus * kLamportMaxPacks * 16;
+}
+
+// One two-shot inbox: [kLamportBuffers][ngpus][lamportTwoShotMaxPart(ngpus)]
+// of 16B, 3 * kLamportTwoShotMaxBytes = 6MB for any ngpus.
+inline constexpr int64_t lamportTwoShotInboxBytes(int ngpus)
+{
+    return (int64_t)kLamportBuffers * ngpus * lamportTwoShotMaxPart(ngpus) * 16;
+}
+
+// A rank's lamport IPC buffer: the one-shot inbox, then the two-shot
+// reduce-scatter inbox and all-gather inbox (TP2 / TP4 / TP8: 15.75 / 19.5 /
+// 27MB).
+inline constexpr int64_t lamportBufferBytes(int ngpus)
+{
+    return lamportInboxBytes(ngpus) + 2 * lamportTwoShotInboxBytes(ngpus);
+}
+
+struct __align__(16) LamportPeers
+{
+    void* ptrs[8];
+};
+
+// bit 15 of every half-word of w that is the 0xffff sentinel
+DINLINE uint32_t lamportSentinelMask(uint32_t w)
+{
+    uint32_t x   = ~w;                                    // w_h == 0xffff <=> x_h == 0
+    uint32_t tmp = ((x & 0x7fff7fff) + 0x7fff7fff) | x;   // bit 15 = (x_h != 0), no carry out
+    return (tmp & 0x80008000) ^ 0x80008000;
+}
+
+// 0xffff -> 0x7fff, both NaN, so real data never looks like the sentinel
+DINLINE uint32_t lamportCanonicalize(uint32_t w) { return w ^ lamportSentinelMask(w); }
+
+// Spin on one 16B inbox slot until none of its half-words is the sentinel.
+template <typename V>
+DINLINE V lamportPollSlot(const V* slot_ptr)
+{
+    V slot_val;
+    uint32_t wait_mask;
+    do
+    {
+        // without the memory clobber the load is hoisted out of the loop
+        asm volatile("" ::: "memory");
+        slot_val  = __builtin_nontemporal_load(slot_ptr);
+        wait_mask = 0;
+#pragma unroll
+        for(int j = 0; j < 4; ++j)
+            wait_mask |= lamportSentinelMask(slot_val[j]);
+    } while(wait_mask != 0);
+    return slot_val;
+}
+
+/*
+ * One-shot: wave w loads the block's packs, pushes them into slot[rank] of the
+ * inbox of rank peer = (rank + w) % ngpus, polls slot[peer] of its own inbox
+ * and puts what it got into LDS by source rank. Wave 0 puts its own packs
+ * there. After one __syncthreads wave 0 sums in rank order and writes the
+ * output while the other waves re-arm their slot.
+ */
+template <typename T, int ngpus>
+__global__ void __launch_bounds__(ngpus * kLamportWaveSize, 1) lamportAllReduceWaveSplit(
+    const T* __restrict__ input,
+    T* __restrict__ result,
+    LamportPeers peers,
+    uint32_t* __restrict__ round_counter, // [kLamportMaxBlocks], rank-local
+    int rank,
+    int num_packs) // 16B packs in the message
+{
+    static_assert(sizeof(T) == 2, "sentinel 0xffff is only defined for 2-byte dtypes");
+    constexpr int pack_size        = 16 / sizeof(T);
+    constexpr int64_t buffer_packs = (int64_t)ngpus * kLamportMaxPacks;
+    using P        = typename opus::vector_t<T, pack_size>;
+    using A        = typename opus::vector_t<opus::fp32_t, pack_size>;
+    using ui32x4_t = __attribute__((__vector_size__(4 * sizeof(uint32_t)))) uint32_t;
+    union pack
+    {
+        P data;
+        ui32x4_t i;
+    };
+
+    __shared__ uint32_t s_round;
+    __shared__ P s_data[ngpus][kLamportWaveSize]; // by source rank
+    if(threadIdx.x == 0)
+        s_round = round_counter[blockIdx.x];
+    __syncthreads();
+    const uint32_t round = s_round;
+    const uint32_t rearm = (round + 2) % kLamportBuffers;
+
+    // wave-uniform, so the branches below are scalar and the pointers SGPRs
+    const int wave_id    = __builtin_amdgcn_readfirstlane(threadIdx.x / kLamportWaveSize);
+    const int lane_id    = threadIdx.x % kLamportWaveSize;
+    const int peer       = (rank + wave_id) % ngpus;
+    const int pack_id    = blockIdx.x * kLamportWaveSize + lane_id;
+    const bool is_active = pack_id < num_packs;
+
+    ui32x4_t* self_inbox = reinterpret_cast<ui32x4_t*>(peers.ptrs[rank]);
+    ui32x4_t* peer_inbox = reinterpret_cast<ui32x4_t*>(peers.ptrs[peer]);
+
+    if(is_active)
+    {
+        // every wave loads the same packs, the repeats mostly hit the cache
+        pack pack_val;
+        pack_val.data = *(reinterpret_cast<const P*>(input) + pack_id);
+#pragma unroll
+        for(int j = 0; j < 4; ++j)
+            pack_val.i[j] = lamportCanonicalize(pack_val.i[j]);
+
+        if(wave_id != 0)
+        {
+            __builtin_nontemporal_store(
+                pack_val.i,
+                peer_inbox + round * buffer_packs + rank * kLamportMaxPacks + pack_id);
+            pack_val.i = lamportPollSlot(self_inbox + round * buffer_packs +
+                                         peer * kLamportMaxPacks + pack_id);
+        }
+        s_data[peer][lane_id] = pack_val.data;
+    }
+    __syncthreads();
+
+    if(wave_id != 0)
+    {
+        // re-arm slot[peer] of last round's buffer, on every lane
+        const ui32x4_t sentinel{0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu};
+        __builtin_nontemporal_store(
+            sentinel, self_inbox + rearm * buffer_packs + peer * kLamportMaxPacks + pack_id);
+    }
+    else if(is_active)
+    {
+        A acc;
+#pragma unroll
+        for(int i = 0; i < ngpus; ++i)
+        {
+            const P rank_data = s_data[i][lane_id];
+#pragma unroll
+            for(int j = 0; j < pack_size; ++j)
+                acc[j] = i == 0 ? upcast_s(rank_data[j]) : acc[j] + upcast_s(rank_data[j]);
+        }
+        P out_val;
+#pragma unroll
+        for(int j = 0; j < pack_size; ++j)
+            out_val[j] = downcast_s<T>(acc[j]);
+        *(reinterpret_cast<P*>(result) + pack_id) = out_val;
+    }
+
+    if(threadIdx.x == 0)
+        round_counter[blockIdx.x] = (round + 1) % kLamportBuffers;
+}
+
+/*
+ * Two-shot: the message is ngpus chunks of `part` packs, chunk j is reduced on
+ * rank j. Position t = kLamportWaveSize * blockIdx.x + lane, t < part, stands
+ * for pack j * part + t of every chunk j, on every rank.
+ *   reduce-scatter: wave w loads pack t of chunk peer = (rank + w) % ngpus,
+ *     pushes it into slot[rank] of peer's rs inbox and polls slot[peer] of its
+ *     own, where peer put its copy of this rank's chunk. Wave 0 loads this
+ *     rank's chunk. All of it goes to LDS by source rank, one __syncthreads.
+ *   all-gather: every wave sums the LDS entries in rank order itself (same
+ *     bits in every wave, no second sync). Wave 0 writes this rank's chunk of
+ *     the output; wave w pushes the sum into slot[rank] of peer's ag inbox,
+ *     polls slot[peer] of its own and writes peer's chunk.
+ * peers.ptrs[i] is rank i's rs inbox, its ag inbox follows. Both inboxes use
+ * the block's one round counter. Ranks stay at most one round apart: nobody
+ * finishes round c without every peer's round c ag data. A rank may still be
+ * waiting for round c-1 ag data while a peer is in round c, but by then it has
+ * sent everything of round c-1, so the peer's re-arm at the end of round c is
+ * still safe.
+ */
+template <typename T, int ngpus>
+__global__ void __launch_bounds__(ngpus * kLamportWaveSize, 1) lamportAllReduceTwoShotWaveSplit(
+    const T* __restrict__ input,
+    T* __restrict__ result,
+    LamportPeers peers,
+    uint32_t* __restrict__ round_counter, // [lamportTwoShotMaxBlocks(ngpus)], rank-local
+    int rank,
+    int part) // packs per chunk, the message is ngpus * part packs
+{
+    static_assert(sizeof(T) == 2, "sentinel 0xffff is only defined for 2-byte dtypes");
+    constexpr int pack_size = 16 / sizeof(T);
+    // positions per inbox slot; packs from one buffer to the next, and from
+    // the rs inbox to the ag inbox
+    constexpr int64_t max_part     = lamportTwoShotMaxPart(ngpus);
+    constexpr int64_t buffer_packs = ngpus * max_part;
+    constexpr int64_t inbox_packs  = kLamportBuffers * buffer_packs;
+    using P        = typename opus::vector_t<T, pack_size>;
+    using A        = typename opus::vector_t<opus::fp32_t, pack_size>;
+    using ui32x4_t = __attribute__((__vector_size__(4 * sizeof(uint32_t)))) uint32_t;
+    union pack
+    {
+        P data;
+        ui32x4_t i;
+    };
+
+    __shared__ uint32_t s_round;
+    __shared__ P s_data[ngpus][kLamportWaveSize]; // by source rank
+    if(threadIdx.x == 0)
+        s_round = round_counter[blockIdx.x];
+    __syncthreads();
+    const uint32_t round = s_round;
+    const uint32_t rearm = (round + 2) % kLamportBuffers;
+
+    const int wave_id    = __builtin_amdgcn_readfirstlane(threadIdx.x / kLamportWaveSize);
+    const int lane_id    = threadIdx.x % kLamportWaveSize;
+    const int peer       = (rank + wave_id) % ngpus;
+    const int pos        = blockIdx.x * kLamportWaveSize + lane_id;
+    const bool is_active = pos < part;
+
+    ui32x4_t* self_inbox = reinterpret_cast<ui32x4_t*>(peers.ptrs[rank]);
+    ui32x4_t* peer_inbox = reinterpret_cast<ui32x4_t*>(peers.ptrs[peer]);
+    // this round's slot written in peer's inbox, and the one polled in mine
+    const int64_t send_off = round * buffer_packs + rank * max_part + pos;
+    const int64_t recv_off = round * buffer_packs + peer * max_part + pos;
+
+    // reduce-scatter
+    if(is_active)
+    {
+        pack pack_val;
+        pack_val.data = *(reinterpret_cast<const P*>(input) + (int64_t)peer * part + pos);
+#pragma unroll
+        for(int j = 0; j < 4; ++j)
+            pack_val.i[j] = lamportCanonicalize(pack_val.i[j]);
+
+        if(wave_id != 0)
+        {
+            __builtin_nontemporal_store(pack_val.i, peer_inbox + send_off);
+            pack_val.i = lamportPollSlot(self_inbox + recv_off);
+        }
+        s_data[peer][lane_id] = pack_val.data;
+    }
+    __syncthreads();
+
+    // all-gather
+    if(is_active)
+    {
+        A acc;
+#pragma unroll
+        for(int i = 0; i < ngpus; ++i)
+        {
+            const P rank_data = s_data[i][lane_id];
+#pragma unroll
+            for(int j = 0; j < pack_size; ++j)
+                acc[j] = i == 0 ? upcast_s(rank_data[j]) : acc[j] + upcast_s(rank_data[j]);
+        }
+        pack sum_val;
+#pragma unroll
+        for(int j = 0; j < pack_size; ++j)
+            sum_val.data[j] = downcast_s<T>(acc[j]);
+        // peers would take a 0xffff sum for "not arrived"; this rank's output
+        // uses the same canonical bits
+#pragma unroll
+        for(int j = 0; j < 4; ++j)
+            sum_val.i[j] = lamportCanonicalize(sum_val.i[j]);
+
+        if(wave_id == 0)
+        {
+            *(reinterpret_cast<P*>(result) + (int64_t)rank * part + pos) = sum_val.data;
+        }
+        else
+        {
+            __builtin_nontemporal_store(sum_val.i, peer_inbox + inbox_packs + send_off);
+            sum_val.i = lamportPollSlot(self_inbox + inbox_packs + recv_off);
+            *(reinterpret_cast<P*>(result) + (int64_t)peer * part + pos) = sum_val.data;
+        }
+    }
+
+    if(wave_id != 0)
+    {
+        // re-arm slot[peer] of last round's buffer in both inboxes, on every lane
+        const ui32x4_t sentinel{0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu};
+        const int64_t rearm_off = rearm * buffer_packs + peer * max_part + pos;
+        __builtin_nontemporal_store(sentinel, self_inbox + rearm_off);
+        __builtin_nontemporal_store(sentinel, self_inbox + inbox_packs + rearm_off);
+    }
+
+    if(threadIdx.x == 0)
+        round_counter[blockIdx.x] = (round + 1) % kLamportBuffers;
+}
+
+// What CustomAllreduce::allreduce() runs for a message; none keeps the
+// original dispatch (LL / LL128 / 1-stage / 2-stage).
+enum class LamportKernel : int
+{
+    none     = 0,
+    one_shot = 1, // lamportAllReduceWaveSplit
+    two_shot = 2, // lamportAllReduceTwoShotWaveSplit
+};
+
+// Device state of the lamport path, owned by CustomAllreduce (initLamport).
+// The one-shot and the two-shot have their own inboxes and round counters.
+struct LamportState
+{
+    LamportPeers one_shot_peers{};        // every rank's one-shot inbox
+    LamportPeers two_shot_peers{};        // every rank's rs inbox, its ag inbox follows
+    uint32_t* d_one_shot_round = nullptr; // [kLamportMaxBlocks], rank-local
+    uint32_t* d_two_shot_round = nullptr; // [lamportTwoShotMaxBlocks(world_size)], rank-local
+    int rank                   = 0;
+    int world_size             = 0;
+
+    ~LamportState()
+    {
+        if(d_one_shot_round)
+            (void)hipFree(d_one_shot_round);
+        if(d_two_shot_round)
+            (void)hipFree(d_two_shot_round);
+    }
+
+    // largest message of one launch, in bytes
+    static constexpr int64_t oneShotMaxBytes() { return (int64_t)kLamportMaxPacks * 16; }
+    static constexpr int64_t twoShotMaxBytes() { return kLamportTwoShotMaxBytes; }
+
+    // the message must be whole 16B packs, at most oneShotMaxBytes()
+    template <typename T>
+    void runOneShot(hipStream_t stream, const T* input, T* output, int64_t numel)
+    {
+        const int64_t bytes     = numel * (int64_t)sizeof(T);
+        const int64_t num_packs = bytes / 16;
+        if(bytes % 16 != 0 || num_packs > kLamportMaxPacks)
+            throw std::runtime_error("lamport one-shot: " + std::to_string(bytes) +
+                                     "B is not whole 16B packs within " +
+                                     std::to_string(oneShotMaxBytes()) + "B");
+        if(num_packs == 0)
+            return;
+        const int num_blocks = (int)((num_packs + kLamportWaveSize - 1) / kLamportWaveSize);
+        launch<T>(true, stream, input, output, num_blocks, (int)num_packs);
+    }
+
+    // the message must split into world_size chunks of whole 16B packs, at
+    // most twoShotMaxBytes()
+    template <typename T>
+    void runTwoShot(hipStream_t stream, const T* input, T* output, int64_t numel)
+    {
+        const int64_t bytes = numel * (int64_t)sizeof(T);
+        const int64_t part  = bytes / 16 / world_size;
+        if(bytes % (16 * world_size) != 0 || part > lamportTwoShotMaxPart(world_size))
+            throw std::runtime_error("lamport two-shot: " + std::to_string(bytes) +
+                                     "B is not " + std::to_string(world_size) +
+                                     " chunks of whole 16B packs within " +
+                                     std::to_string(twoShotMaxBytes()) + "B");
+        if(part == 0)
+            return;
+        const int num_blocks = (int)((part + kLamportWaveSize - 1) / kLamportWaveSize);
+        launch<T>(false, stream, input, output, num_blocks, (int)part);
+    }
+
+    private:
+    template <typename T>
+    void launch(bool is_one_shot,
+                hipStream_t stream,
+                const T* input,
+                T* output,
+                int num_blocks,
+                int count)
+    {
+#define LAUNCH_LAMPORT(NGPUS)                                                           \
+    case NGPUS:                                                                         \
+        if(is_one_shot)                                                                 \
+            lamportAllReduceWaveSplit<T, NGPUS>                                         \
+                <<<num_blocks, NGPUS * kLamportWaveSize, 0, stream>>>(                  \
+                    input, output, one_shot_peers, d_one_shot_round, rank, count);      \
+        else                                                                            \
+            lamportAllReduceTwoShotWaveSplit<T, NGPUS>                                  \
+                <<<num_blocks, NGPUS * kLamportWaveSize, 0, stream>>>(                  \
+                    input, output, two_shot_peers, d_two_shot_round, rank, count);      \
+        break;
+
+        switch(world_size)
+        {
+            LAUNCH_LAMPORT(2)
+            LAUNCH_LAMPORT(4)
+            LAUNCH_LAMPORT(8)
+        default:
+            throw std::runtime_error("lamport all-reduce supports 2, 4 or 8 ranks, not " +
+                                     std::to_string(world_size));
+        }
+#undef LAUNCH_LAMPORT
+    }
+};
+
 class CustomAllreduce
 {
     public:
@@ -3362,6 +4702,20 @@ class CustomAllreduce
     std::vector<void*> graph_unreg_output_buffers_;
     // a map from IPC handles to opened IPC pointers
     std::map<IPC_KEY, char*> ipc_handles_;
+
+    // LL / LL128 fast-path staging (reuses the meta buffer's post-Signal region,
+    // already IPC-exchanged via sg_). Device table of per-rank scratch bases,
+    // computed in the constructor from sg_.signals[]; no second IPC exchange.
+    //   [0, world_size_)              -> LL   scratch bases (signals[i]+sizeof(Signal))
+    //   [world_size_, 2*world_size_)  -> LL128 scratch bases (+ kLLPocRegionBytes)
+    void**    d_ll_scratch_peers_    = nullptr;
+    // Rank-local per-block epoch arrays (not exchanged). Allocated at init time
+    // (not during graph capture) so the LL kernels are graph-capture safe.
+    uint32_t* d_ll_poc_block_flags_  = nullptr; // array[kMaxBlocks]
+    uint32_t* d_ll128_unroll2_epoch_ = nullptr; // array[LL128_MAX_BLOCK_NUM]
+
+    // Lamport path of allreduce() (initLamport); null keeps the original dispatch.
+    std::unique_ptr<LamportState> lamport_;
 
     template <typename T>
     T* local_tmp_reduced_ptr() const
@@ -3407,6 +4761,34 @@ class CustomAllreduce
             }
             sg_.signals[i] = rank_sg;
         }
+        init_ll_fast_path_();
+    }
+
+    // LL / LL128 fast-path init. Builds the device scratch-base table from the
+    // already-exchanged sg_.signals[] (peer scratch = post-Signal region of each
+    // peer's meta buffer) and allocates the rank-local per-block epoch arrays.
+    // Runs at construction (never during graph capture) so replays never malloc.
+    void init_ll_fast_path_()
+    {
+        std::vector<void*> peers(2 * world_size_);
+        for(int i = 0; i < world_size_; ++i)
+        {
+            char* base =
+                reinterpret_cast<char*>(const_cast<Signal*>(sg_.signals[i])) + sizeof(Signal);
+            peers[i]               = base;                       // LL scratch base
+            peers[world_size_ + i] = base + kLLPocRegionBytes;   // LL128 scratch base
+        }
+        HIP_CALL(hipMalloc(&d_ll_scratch_peers_, sizeof(void*) * 2 * world_size_));
+        HIP_CALL(hipMemcpy(d_ll_scratch_peers_, peers.data(),
+                           sizeof(void*) * 2 * world_size_, hipMemcpyHostToDevice));
+
+        HIP_CALL(hipMalloc((void**)&d_ll_poc_block_flags_, sizeof(uint32_t) * kMaxBlocks));
+        HIP_CALL(hipMemset(d_ll_poc_block_flags_, 0, sizeof(uint32_t) * kMaxBlocks));
+
+        HIP_CALL(hipMalloc((void**)&d_ll128_unroll2_epoch_,
+                           sizeof(uint32_t) * LL128_MAX_BLOCK_NUM));
+        HIP_CALL(hipMemset(d_ll128_unroll2_epoch_, 0,
+                           sizeof(uint32_t) * LL128_MAX_BLOCK_NUM));
     }
 
     char* open_ipc_handle(const void* ipc_handle)
@@ -3539,6 +4921,9 @@ class CustomAllreduce
             HIP_CALL(hipStreamIsCapturing(stream, &status));
             if(status == hipStreamCaptureStatusActive)
             {
+                // Inputs grow up and outputs grow down; guard so they cannot alias.
+                check_rank_data_capacity(graph_unreg_input_buffers_.size() +
+                                         graph_unreg_output_buffers_.size() + 1);
                 ptrs = d_rank_data_base_ + graph_unreg_input_buffers_.size();
                 graph_unreg_input_buffers_.push_back(input);
             }
@@ -3567,9 +4952,10 @@ class CustomAllreduce
             HIP_CALL(hipStreamIsCapturing(stream, &status));
             if(status == hipStreamCaptureStatusActive)
             {
-                // For graph mode, collect output addresses
-                ptrs = d_rank_data_base_ + graph_unreg_input_buffers_.size() +
-                       graph_unreg_output_buffers_.size();
+                // Reserve top-down: the input count still grows during capture.
+                check_rank_data_capacity(graph_unreg_input_buffers_.size() +
+                                         graph_unreg_output_buffers_.size() + 1);
+                ptrs = d_rank_data_end_ - 1 - graph_unreg_output_buffers_.size();
                 graph_unreg_output_buffers_.push_back(output);
             }
             else
@@ -3624,7 +5010,7 @@ class CustomAllreduce
         for(int i = 0; i < num_output_buffers; i++)
         {
             auto self_ptr = graph_unreg_output_buffers_[i];
-            auto& rd      = rank_data[num_input_buffers + i];
+            auto& rd      = rank_data[num_input_buffers + i];  // staging only
             for(int j = 0; j < world_size_; j++)
             {
                 if(j != rank_)
@@ -3640,14 +5026,24 @@ class CustomAllreduce
                     rd.ptrs[j] = self_ptr;
                 }
             }
-            output_buffers_[self_ptr] = d_rank_data_base_ + num_input_buffers + i;
         }
 
-        HIP_CALL(hipMemcpy(d_rank_data_base_,
-                           rank_data.data(),
-                           sizeof(RankData) * total_buffers,
-                           hipMemcpyHostToDevice));
-        d_rank_data_base_ += total_buffers;
+        if(num_input_buffers > 0)
+        {
+            HIP_CALL(hipMemcpy(d_rank_data_base_,
+                               rank_data.data(),
+                               sizeof(RankData) * num_input_buffers,
+                               hipMemcpyHostToDevice));
+        }
+        for(int i = 0; i < num_output_buffers; i++)
+        {
+            HIP_CALL(hipMemcpy(d_rank_data_end_ - 1 - i,
+                               &rank_data[num_input_buffers + i],
+                               sizeof(RankData),
+                               hipMemcpyHostToDevice));
+        }
+        d_rank_data_base_ += num_input_buffers;
+        d_rank_data_end_ -= num_output_buffers;
         graph_unreg_input_buffers_.clear();
         graph_unreg_output_buffers_.clear();
     }
@@ -3723,6 +5119,240 @@ class CustomAllreduce
      * Not quite sure the underlying reason, but my guess is that too many SMs
      * will cause contention on NVLink bus.
      */
+
+    // -----------------------------------------------------------------------
+    // LL / LL128 small-message fast paths (gfx9 POC). Staging scratch reuses the
+    // meta buffer's post-Signal region (peer bases in d_ll_scratch_peers_, built
+    // at construction from sg_.signals[]); no separate alloc / IPC exchange. NOT
+    // wired into the size-based dispatch below yet — that lands in step 2 once
+    // the bench thresholds are in. The caller must keep the message within the
+    // LL / LL128 caps (kLLPocSlotCapPk / kLL128PocCapBytes) so the scratch fits
+    // the reused tmp region (2 * max_size).
+    // -----------------------------------------------------------------------
+    template <typename T>
+    void allreduce_ll_poc(hipStream_t stream, const T* input, T* output,
+                          int numel, int threads_per_block = 256)
+    {
+        const size_t bytes = (size_t)numel * sizeof(T);
+        if(bytes % 8 != 0)
+            throw std::runtime_error(
+                "allreduce_ll_poc: byte count must be a multiple of 8");
+        const size_t nPk     = bytes >> 3;
+        const size_t slotCap = kLLPocSlotCapPk;
+        if(nPk > slotCap)
+            throw std::runtime_error(
+                "allreduce_ll_poc: packet count exceeds scratch slot capacity");
+
+        int blocks = std::min<int>(
+            kMaxBlocks, (int)((nPk + threads_per_block - 1) / threads_per_block));
+        if(blocks < 1)
+            blocks = 1;
+
+        T* const* peers = reinterpret_cast<T* const*>(d_ll_scratch_peers_);
+
+#define LAUNCH_LL_POC(NGPUS, BS)                                             \
+    ar_ll_gfx9<T, NGPUS, BS><<<blocks, BS, 0, stream>>>(                     \
+        peers, output, input, nPk, rank_, d_ll_poc_block_flags_, slotCap)
+
+#define DISPATCH_LL_POC_BS(NGPUS)                                            \
+    switch(threads_per_block)                                               \
+    {                                                                        \
+    case 256: LAUNCH_LL_POC(NGPUS, 256); break;                             \
+    case 512: LAUNCH_LL_POC(NGPUS, 512); break;                             \
+    case 1024: LAUNCH_LL_POC(NGPUS, 1024); break;                           \
+    default:                                                                 \
+        throw std::invalid_argument(                                        \
+            "allreduce_ll_poc: threads_per_block must be 256, 512 or 1024"); \
+    }
+
+        switch(world_size_)
+        {
+        case 2: DISPATCH_LL_POC_BS(2); break;
+        case 4: DISPATCH_LL_POC_BS(4); break;
+        case 8: DISPATCH_LL_POC_BS(8); break;
+        default:
+            throw std::runtime_error(
+                "allreduce_ll_poc only supports world_size in (2,4,8). Actual = " +
+                std::to_string(world_size_));
+        }
+
+#undef DISPATCH_LL_POC_BS
+#undef LAUNCH_LL_POC
+    }
+
+    // LL128 unroll2 1-shot all-reduce. 2-byte dtype only (fp16 / bf16). The
+    // scratch uses a fixed per-rank stride sized for kLL128PocCapBytes, so it
+    // spans 2 * ngpus * kLL128SlotStride words of the reused tmp buffer.
+    template <typename T>
+    void allreduce_ll128_unroll2(hipStream_t stream, const T* input, T* output,
+                                 int numel, int threads_per_block = 512)
+    {
+        static_assert(sizeof(T) == 2,
+                      "allreduce_ll128_unroll2 only supports 2-byte dtypes");
+        const size_t bytes = (size_t)numel * sizeof(T);
+        if(bytes % 16 != 0)
+            throw std::runtime_error(
+                "allreduce_ll128_unroll2: byte count must be a multiple of 16");
+        if(bytes > kLL128PocCapBytes)
+            throw std::runtime_error(
+                "allreduce_ll128_unroll2: message " + std::to_string(bytes) +
+                "B exceeds LL128 fast-path cap " +
+                std::to_string(kLL128PocCapBytes) + "B");
+
+        constexpr int bytesPerGroup = 240; // 15 packs * 16B
+        const int     totalGroup = (int)((bytes + bytesPerGroup - 1) / bytesPerGroup);
+
+        T* const* peers =
+            reinterpret_cast<T* const*>(d_ll_scratch_peers_ + world_size_);
+
+#define LAUNCH_LL128_UNROLL2(NGPUS, BS)                                          \
+    do                                                                          \
+    {                                                                           \
+        constexpr int groupsPerBlock = (BS) / 8;                                \
+        int           blocks         = std::min<int>(                           \
+            LL128_MAX_BLOCK_NUM, (totalGroup + groupsPerBlock - 1) / groupsPerBlock); \
+        if(blocks < 1)                                                          \
+            blocks = 1;                                                         \
+        ar_ll128_unroll2<T, NGPUS, BS><<<blocks, (BS), 0, stream>>>(            \
+            input, output, peers, d_ll128_unroll2_epoch_, rank_, numel);        \
+    } while(0)
+
+#define DISPATCH_LL128_UNROLL2_BS(NGPUS)                                        \
+    switch(threads_per_block)                                                   \
+    {                                                                           \
+    case 256: LAUNCH_LL128_UNROLL2(NGPUS, 256); break;                          \
+    case 512: LAUNCH_LL128_UNROLL2(NGPUS, 512); break;                          \
+    case 1024: LAUNCH_LL128_UNROLL2(NGPUS, 1024); break;                        \
+    default:                                                                    \
+        throw std::invalid_argument(                                            \
+            "allreduce_ll128_unroll2: threads_per_block must be 256, 512 or "   \
+            "1024");                                                            \
+    }
+
+        switch(world_size_)
+        {
+        case 2: DISPATCH_LL128_UNROLL2_BS(2); break;
+        case 4: DISPATCH_LL128_UNROLL2_BS(4); break;
+        case 8: DISPATCH_LL128_UNROLL2_BS(8); break;
+        default:
+            throw std::runtime_error(
+                "allreduce_ll128_unroll2 only supports world_size in (2,4,8). "
+                "Actual = " +
+                std::to_string(world_size_));
+        }
+
+#undef DISPATCH_LL128_UNROLL2_BS
+#undef LAUNCH_LL128_UNROLL2
+    }
+
+    // 1-/2-stage crossover of the use_new kernels. Neither is set when the peers
+    // are not fully connected.
+    void select_ar_stage(size_t bytes, bool& call_1stage, bool& call_2stage) const
+    {
+        call_1stage =
+            world_size_ == 2 || (full_nvlink_ && ((world_size_ <= 4 && bytes < 160 * 1024) ||
+                                                  (world_size_ <= 8 && bytes < 80 * 1024)));
+        call_2stage = !call_1stage && full_nvlink_;
+    }
+
+    // Write-mode switch, shared by allreduce and allreduce_residual.
+    bool select_ar_write_mode(size_t bytes) const
+    {
+        // Cached: get_gpu_arch() re-queries the driver on every call.
+        static const bool is_gfx942 = get_gpu_arch() == "gfx942";
+        return world_size_ == 8 && bytes > 512 * 4096 * 2 && is_gfx942;
+    }
+
+    // -----------------------------------------------------------------------
+    // Lamport path of allreduce(). self_ptr is this rank's buffer of
+    // lamportBufferBytes(world_size_) bytes (uncached), handles/offsets every
+    // rank's IPC handle for theirs. The buffer is filled with the sentinel
+    // here, so the caller must barrier across ranks after this returns and
+    // before the first all-reduce: otherwise a fast peer's first round could be
+    // wiped by this memset. Must run outside graph capture.
+    // -----------------------------------------------------------------------
+    void initLamport(void* self_ptr, const hipIpcMemHandle_t* handles, const int64_t* offsets)
+    {
+        if(lamport_)
+            throw std::runtime_error("initLamport: already initialized");
+        if(world_size_ != 2 && world_size_ != 4 && world_size_ != 8)
+            throw std::invalid_argument("initLamport: world size must be 2, 4 or 8");
+        auto state        = std::make_unique<LamportState>();
+        state->rank       = rank_;
+        state->world_size = world_size_;
+        for(int i = 0; i < world_size_; i++)
+        {
+            char* base = i == rank_ ? static_cast<char*>(self_ptr)
+                                    : open_ipc_handle(&handles[i]) + offsets[i];
+            state->one_shot_peers.ptrs[i] = base;
+            state->two_shot_peers.ptrs[i] = base + lamportInboxBytes(world_size_);
+        }
+        HIP_CALL(hipMemset(self_ptr, 0xff, lamportBufferBytes(world_size_)));
+        HIP_CALL(hipMalloc((void**)&state->d_one_shot_round, sizeof(uint32_t) * kLamportMaxBlocks));
+        HIP_CALL(hipMemset(state->d_one_shot_round, 0, sizeof(uint32_t) * kLamportMaxBlocks));
+        const size_t two_shot_round_bytes = sizeof(uint32_t) * lamportTwoShotMaxBlocks(world_size_);
+        HIP_CALL(hipMalloc((void**)&state->d_two_shot_round, two_shot_round_bytes));
+        HIP_CALL(hipMemset(state->d_two_shot_round, 0, two_shot_round_bytes));
+        HIP_CALL(hipDeviceSynchronize());
+        lamport_ = std::move(state);
+    }
+
+    // Which lamport kernel allreduce() runs for a 2-byte message of numel
+    // elements, none keeps the original dispatch. Every rank must get the same
+    // answer, so it depends only on the message and the group.
+    //
+    // Ranges come from CUDA-graph sweeps (test_custom_allreduce_lamport.py,
+    // bf16, H 7168 / 8192, registered and copy-in capture) on MI308X (gfx942)
+    // and MI350X (gfx950). One set of ranges serves both archs, bounded by
+    // gfx950, where the original dispatch catches up on large messages:
+    //   TP2        one-shot up to 128KB (8 tokens), two-shot up to 2MB
+    //   TP4 / TP8  one-shot up to 64KB (4 tokens),  two-shot up to 1MB
+    // Registered input, lamport over the original dispatch inside the ranges:
+    //   gfx950  TP2 1.03-1.23x, TP4 1.00-1.39x, TP8 1.02-1.53x
+    //   gfx942  TP2 1.02-1.23x, TP4 1.04-1.46x, TP8 1.13-1.47x
+    // Just past them on gfx950 the original dispatch is as fast or faster
+    // (TP2 0.99x at 3.5MB, TP4 0.98x at 1.75MB, TP8 0.98x at 2MB) and stays
+    // so up to 64MB (TP8 down to 0.90x), so it runs there. Two-shot was still
+    // 1.01-1.27x faster above these caps on gfx942; that gain is given up.
+    // The forced kernels (lamportAllReduce) take up to oneShotMaxBytes()
+    // (640KB) and twoShotMaxBytes() (2MB), for the sweeps.
+    LamportKernel lamportKernel(int64_t numel) const
+    {
+        if(!lamport_)
+            return LamportKernel::none;
+        const int64_t bytes  = numel * 2;
+        // one-shot in (0, one_shot_max], then two-shot in (one_shot_max, two_shot_max]
+        const int64_t one_shot_max = world_size_ == 2 ? 128 * 1024 : 64 * 1024;
+        const int64_t two_shot_max =
+            std::min(world_size_ == 2 ? int64_t(2) << 20 : int64_t(1) << 20,
+                     lamport_->twoShotMaxBytes());
+        if(bytes <= one_shot_max)
+            return LamportKernel::one_shot;
+        if(bytes <= two_shot_max && bytes % (16 * world_size_) == 0)
+            return LamportKernel::two_shot;
+        return LamportKernel::none;
+    }
+
+    // The lamport kernel allreduce() runs for numel elements of elem_size
+    // bytes; all_reduce() in custom_all_reduce.cu asks it too, to skip the
+    // copy-in for exactly these messages.
+    LamportKernel lamportDispatch(int64_t numel, int64_t elem_size, bool use_new) const
+    {
+        return elem_size == 2 && use_new ? lamportKernel(numel) : LamportKernel::none;
+    }
+
+    // Runs one lamport kernel; LamportKernel::none does nothing.
+    template <typename T>
+    void runLamport(hipStream_t stream, const T* input, T* output, int64_t numel, LamportKernel kernel)
+    {
+        if(kernel != LamportKernel::none && !lamport_)
+            throw std::runtime_error("runLamport: initLamport was not called");
+        if(kernel == LamportKernel::one_shot)
+            lamport_->runOneShot<T>(stream, input, output, numel);
+        else if(kernel == LamportKernel::two_shot)
+            lamport_->runTwoShot<T>(stream, input, output, numel);
+    }
+
     template <typename T>
     void allreduce(hipStream_t stream,
                    T* input,
@@ -3747,6 +5377,75 @@ class CustomAllreduce
         throw std::runtime_error("max supported block limit is " + std::to_string(kMaxBlocks) +
                                  ". Got " + std::to_string(block_limit));
 
+    // Lamport one-shot / two-shot, ahead of every other path (see
+    // lamportKernel). It reads only this rank's input, so the registered input,
+    // the copy-in pool and an unregistered input all work, and it records no
+    // graph buffer.
+    if constexpr(sizeof(T) == 2)
+    {
+        const LamportKernel lamport_kernel = lamportDispatch(size, sizeof(T), use_new);
+        if(lamport_kernel != LamportKernel::none)
+        {
+            runLamport<T>(stream, input, output, size, lamport_kernel);
+            return;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // LL / LL128 small-message fast path (gfx9). Routes small messages to the
+    // ar_ll_gfx9 / ar_ll128_unroll2 kernels per measured thresholds; anything
+    // larger falls through to the existing 1-/2-stage dispatch below. Staging
+    // scratch reuses the meta buffer's post-Signal region (see
+    // allreduce_ll_poc / allreduce_ll128_unroll2), which assumes the tmp region
+    // (2 * max_size) comfortably exceeds the fast-path scratch (worst case
+    // ~38 MiB at tp4); true for the default max_size (1 GiB).
+    //
+    // `size` here is still the element count (numel); it is divided down to
+    // 16-byte packs only after this block. Thresholds were measured on bf16, so
+    // the path is gated to 2-byte dtypes (if constexpr also keeps the LL128
+    // 2-byte static_assert out of the fp32 instantiation). numel notation a*b
+    // mirrors the (tokens, hidden) bench shapes.
+    if constexpr(sizeof(T) == 2)
+    {
+        if(use_new && !is_broadcast_reg_outptr)
+        {
+            const int numel    = size;
+            int       ll_bs    = 0; // >0 -> LL    with this block size
+            int       ll128_bs = 0; // >0 -> LL128 with this block size
+            if(world_size_ == 8)
+            {
+                if(numel <= 4 * 8192)
+                    ll_bs = 256;
+            }
+            else if(world_size_ == 4)
+            {
+                if(numel <= 4 * 7168)
+                    ll_bs = 256;
+                else if(numel <= 4 * 8192)
+                    ll128_bs = 256;
+            }
+            else if(world_size_ == 2)
+            {
+                if(numel <= 4 * 8192)
+                    ll_bs = 256;
+                else if(numel <= 16 * 8192)
+                    ll128_bs = 256;
+                else if(numel <= 64 * 7168)
+                    ll128_bs = 512;
+            }
+            if(ll_bs)
+            {
+                allreduce_ll_poc<T>(stream, input, output, numel, ll_bs);
+                return;
+            }
+            if(ll128_bs)
+            {
+                allreduce_ll128_unroll2<T>(stream, input, output, numel, ll128_bs);
+                return;
+            }
+        }
+    }
+
     RankData* input_ptrs  = get_buffer_RD(stream, input);
     RankData* output_ptrs = nullptr;
     if(is_broadcast_reg_outptr)
@@ -3760,31 +5459,11 @@ class CustomAllreduce
     // use new version of allreduce kernel
     if(use_new)
     {
-        hipDevice_t dev;
-        hipDeviceProp_t dev_prop;
-        hipGetDevice(&dev);
-        hipGetDeviceProperties(&dev_prop, dev);
-        std::string arch    = dev_prop.gcnArchName;
         bool use_write_mode = false;
 
-        int blocks       = 16;
-        bool call_1stage = false;
-        bool call_2stage = false;
-        if(world_size_ == 2)
-        {
-            call_1stage = true;
-        }
-        else if(full_nvlink_)
-        {
-            if((world_size_ <= 4 && bytes < 160 * 1024) || (world_size_ <= 8 && bytes < 80 * 1024))
-            {
-                call_1stage = true;
-            }
-            else
-            {
-                call_2stage = true;
-            }
-        }
+        int blocks = 16;
+        bool call_1stage, call_2stage;
+        select_ar_stage(bytes, call_1stage, call_2stage);
         if(call_1stage)
         {
             blocks = std::min(kMaxBlocks,
@@ -3795,36 +5474,37 @@ class CustomAllreduce
             blocks = std::min(kMaxBlocks,
                               (size / world_size_ + (threads / world_size_) - 1) /
                                   (threads / world_size_));
-            if(world_size_ == 8 && bytes > 512 * 4096 * 2 &&
-               arch.find("gfx942") != std::string::npos)
-            {
-                use_write_mode = true;
-            }
+            use_write_mode = select_ar_write_mode(bytes);
         }
 
-#define KL(ngpus, name)                                                       \
-    do                                                                        \
-    {                                                                         \
-        if(is_broadcast_reg_outptr)                                           \
-        {                                                                     \
-            name<T, ngpus, true><<<blocks, threads, 0, stream>>>(             \
-                input_ptrs, output_ptrs, sg_, self_sg_, output, rank_, size); \
-        }                                                                     \
-        else                                                                  \
-        {                                                                     \
-            name<T, ngpus, false><<<blocks, threads, 0, stream>>>(            \
-                input_ptrs, output_ptrs, sg_, self_sg_, output, rank_, size); \
-        }                                                                     \
+#define KL(ngpus, name, ...)                                                                  \
+    do                                                                                        \
+    {                                                                                         \
+        if(is_broadcast_reg_outptr)                                                           \
+        {                                                                                     \
+            name<T, ngpus, true __VA_OPT__(, ) __VA_ARGS__><<<blocks, threads, 0, stream>>>(  \
+                input_ptrs, output_ptrs, sg_, self_sg_, output, rank_, size);                 \
+        }                                                                                     \
+        else                                                                                  \
+        {                                                                                     \
+            name<T, ngpus, false __VA_OPT__(, ) __VA_ARGS__><<<blocks, threads, 0, stream>>>( \
+                input_ptrs, output_ptrs, sg_, self_sg_, output, rank_, size);                 \
+        }                                                                                     \
     } while(0)
 
 #define DISPATCH_REDUCE(ngpus, name)                      \
     do                                                    \
     {                                                     \
+        /* these kernels need ngpus to divide 512 */      \
         if(bytes % (ngpus * 16) == 0 && world_size_ != 6) \
         {                                                 \
             if(use_write_mode)                            \
             {                                             \
                 KL(ngpus, name##_write_mode);             \
+            }                                             \
+            else if(size % THREAD_NUM != 0)               \
+            {                                             \
+                KL(ngpus, name, true);                    \
             }                                             \
             else                                          \
             {                                             \
@@ -3904,6 +5584,91 @@ class CustomAllreduce
 #undef KL
 }
 
+// allreduce plus a residual that is identical on every rank. Same 1-/2-stage
+// and write-mode switches as allreduce, without its LL variants.
+template <typename T>
+void allreduce_residual(hipStream_t stream,
+                        T* input,
+                        T* output,
+                        const T* residual,
+                        int size,
+                        bool is_broadcast_reg_outptr,
+                        int threads = 512)
+{
+    auto d = 16 / sizeof(T);
+    if(size % d != 0)
+        throw std::runtime_error(
+            "custom allreduce residual requires input length to be multiple of " +
+            std::to_string(d));
+
+    RankData* input_ptrs = get_buffer_RD(stream, input);
+
+    auto bytes = size * sizeof(T);
+    size /= d;
+
+    bool call_1stage, call_2stage;
+    select_ar_stage(bytes, call_1stage, call_2stage);
+    if(!call_1stage && !call_2stage)
+        throw std::runtime_error("allreduce_residual requires fully connected peers");
+    bool use_write_mode = call_2stage && select_ar_write_mode(bytes);
+    // Only the write-mode kernel writes to peer outputs.
+    RankData* output_ptrs =
+        use_write_mode && is_broadcast_reg_outptr ? get_output_buffer_RD(stream, output) : nullptr;
+    int per_rank = call_1stage ? size : size / world_size_;
+    int blocks =
+        std::min(kMaxBlocks, (per_rank + (threads / world_size_) - 1) / (threads / world_size_));
+
+#define KL_RES(ngpus, name, bcast, ...)                             \
+name<T, ngpus, bcast, __VA_ARGS__><<<blocks, threads, 0, stream>>>( \
+    input_ptrs, output_ptrs, sg_, self_sg_, output, rank_, size, residual)
+
+    // The warp-split kernels need THREAD_NUM % ngpus == 0 (not TP6) and, for
+    // 2-stage, the same pack count on every rank; the rest go naive. TP6 does
+    // not instantiate the warp-split kernels. TP2 is always 1-stage
+    // (select_ar_stage), so it instantiates only that kernel. Write mode is TP8 only.
+#define RESIDUAL_CASE(ngpus)                                                   \
+case ngpus: {                                                                  \
+    if constexpr(ngpus == 2)                                                   \
+        KL_RES(ngpus, cross_device_reduce_1stage, false, true);                \
+    else if constexpr(ngpus == 6)                                              \
+        KL_RES(ngpus, cross_device_reduce_2stage_naive, false, true);          \
+    else if(call_2stage && bytes % (ngpus * 16) != 0)                          \
+        KL_RES(ngpus, cross_device_reduce_2stage_naive, false, true);          \
+    else if(call_1stage)                                                       \
+        KL_RES(ngpus, cross_device_reduce_1stage, false, true);                \
+    else if constexpr(ngpus == 8)                                              \
+    {                                                                          \
+        if(use_write_mode && is_broadcast_reg_outptr)                          \
+            KL_RES(ngpus, cross_device_reduce_2stage_write_mode, true, true);  \
+        else if(use_write_mode)                                                \
+            KL_RES(ngpus, cross_device_reduce_2stage_write_mode, false, true); \
+        else if(size % THREAD_NUM != 0)                                        \
+            KL_RES(ngpus, cross_device_reduce_2stage, false, true, true);      \
+        else                                                                   \
+            KL_RES(ngpus, cross_device_reduce_2stage, false, false, true);     \
+    }                                                                          \
+    else if(size % THREAD_NUM != 0)                                            \
+        KL_RES(ngpus, cross_device_reduce_2stage, false, true, true);          \
+    else                                                                       \
+        KL_RES(ngpus, cross_device_reduce_2stage, false, false, true);         \
+    break;                                                                     \
+}
+
+    switch(world_size_)
+    {
+        RESIDUAL_CASE(2)
+        RESIDUAL_CASE(4)
+        RESIDUAL_CASE(6)
+        RESIDUAL_CASE(8)
+    default:
+        throw std::runtime_error("custom allreduce only supports num gpus in (2,4,6,8). Actual num "
+                                 "gpus = " +
+                                 std::to_string(world_size_));
+    }
+#undef RESIDUAL_CASE
+#undef KL_RES
+}
+
 // reduce_scatter dispatch. Python wrapper is responsible for:
 //   - normalizing dim < 0
 //   - rejecting shapes where n (or k, for kFirst) % ngpus != 0
@@ -3942,7 +5707,7 @@ void dispatchReduceScatter(hipStream_t stream, T* input, T* output,
             reduce_scatter_split_first_dim<T, 2>
                 <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, range);
             break;
-        default: printf("reduce_scatter world_size error!\n");
+        default: throw std::runtime_error("reduce_scatter world_size error");
         }
         break;
     }
@@ -3968,7 +5733,7 @@ void dispatchReduceScatter(hipStream_t stream, T* input, T* output,
         case 8: LAUNCH_LAST(8); break;
         case 4: LAUNCH_LAST(4); break;
         case 2: LAUNCH_LAST(2); break;
-        default: printf("reduce_scatter world_size error!\n");
+        default: throw std::runtime_error("reduce_scatter world_size error");
         }
 #undef LAUNCH_LAST
         break;
@@ -3994,12 +5759,12 @@ void dispatchReduceScatter(hipStream_t stream, T* input, T* output,
         case 8: LAUNCH_MID(8); break;
         case 4: LAUNCH_MID(4); break;
         case 2: LAUNCH_MID(2); break;
-        default: printf("reduce_scatter world_size error!\n");
+        default: throw std::runtime_error("reduce_scatter world_size error");
         }
 #undef LAUNCH_MID
         break;
     }
-    default: printf("reduce_scatter split_dim error!\n");
+    default: throw std::runtime_error("reduce_scatter split_dim error");
     }
 }
 
@@ -4007,6 +5772,12 @@ template <typename T>
 void dispatchAllGather(
     hipStream_t stream, T* input, T* output, int size, int last_dim_size, int gather_dim)
 {
+    // Idle DP-attention groups can have empty shards. There is no payload to exchange,
+    // and launching zero blocks would leave an error for the next operator to report.
+    if(size == 0)
+    {
+        return;
+    }
     RankData* ptrs = get_buffer_RD(stream, input);
     auto d         = 16 / sizeof(T);
     dim3 block(512);
@@ -4032,7 +5803,7 @@ void dispatchAllGather(
                 allgather_naive<T, 2>
                     <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size);
                 break;
-            default: printf("allgather world_size error\n");
+            default: throw std::runtime_error("allgather world_size error");
             }
         }
         else
@@ -4055,7 +5826,7 @@ void dispatchAllGather(
                 allgather_vec<T, 2>
                     <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size);
                 break;
-            default: printf("allgather world_size error\n");
+            default: throw std::runtime_error("allgather world_size error");
             }
         }
     }
@@ -4079,10 +5850,68 @@ void dispatchAllGather(
             allgather_lastdim<T, 2><<<grid, block, 0, stream>>>(
                 ptrs, sg_, self_sg_, output, rank_, size, last_dim_size);
             break;
-        default: printf("allgather world_size error\n");
+        default: throw std::runtime_error("allgather world_size error");
         }
     }
 }
+
+// First-dim all-gather of `n` tensors in one launch, rank w contributing
+// `rows[w]` rows of each: tensor i's rows are `row_bytes[i]` bytes (a multiple
+// of 4), read at `in_off[i]` past `inputs[i]` -- a buffer resolved like any
+// other collective input (registered, or bound in capture) -- and written to
+// `outputs[i]` in rank order.
+void dispatchAllGatherV(hipStream_t stream,
+                        int n,
+                        void* const* inputs,
+                        const int64_t* in_off,
+                        void* const* outputs,
+                        const int64_t* row_bytes,
+                        const int64_t* rows)
+{
+    AllGatherVArgs args{};
+    args.n           = n;
+    int64_t max_rows = 0, start = 0;
+    for(int w = 0; w < world_size_; ++w)
+    {
+        args.rows[w]      = rows[w];
+        args.row_start[w] = start;
+        start += rows[w];
+        max_rows = std::max(max_rows, rows[w]);
+    }
+    int64_t units = 0;
+    for(int i = 0; i < n; ++i)
+    {
+        const int64_t bytes = max_rows * row_bytes[i];
+        // The kernel walks a rank's slice with 32-bit indices.
+        AITER_CHECK(row_bytes[i] % 4 == 0 && bytes <= INT32_MAX,
+                    "allgatherv needs rows of a multiple of 4 bytes, under 2 GiB a rank");
+        args.dp[i]        = get_buffer_RD(stream, inputs[i]);
+        args.in_off[i]    = in_off[i];
+        args.out[i]       = static_cast<uint8_t*>(outputs[i]);
+        args.row_bytes[i] = row_bytes[i];
+        units             = std::max(units, row_bytes[i] % 16 == 0 ? bytes / 16 : bytes / 4);
+    }
+    // Sized by every rank's row counts, so all ranks launch the same grid:
+    // the barrier flags are kept per block, kMaxBlocks of them.
+    int tnum_per_block = 512 / world_size_;
+    int64_t block_num  = (units + tnum_per_block - 1) / tnum_per_block;
+    dim3 grid(static_cast<int>(std::clamp<int64_t>(block_num, 1, kMaxBlocks)));
+    dim3 block(512);
+    switch(world_size_)
+    {
+    case 8: allgatherv<8><<<grid, block, 0, stream>>>(args, sg_, self_sg_, rank_); break;
+    case 4: allgatherv<4><<<grid, block, 0, stream>>>(args, sg_, self_sg_, rank_); break;
+    case 2: allgatherv<2><<<grid, block, 0, stream>>>(args, sg_, self_sg_, rank_); break;
+    default: throw std::runtime_error("allgatherv world_size error");
+    }
+}
+
+// Max rows for the single-kernel 2-stage fused AR+RMSNorm. It runs one block
+// per row with the grid capped at kMaxBlocks, so above kMaxBlocks rows blocks
+// loop over rows and reduce-scatter + local RMSNorm is faster. MI355X TP4,
+// bf16, hidden 7168: 1.08-1.10x at <= 80 rows, 0.94x at 88, 0.79x at 8192.
+// TP2/TP8 use the TP4 value until measured.
+static constexpr int kFusedArRms2StageMaxRows = kMaxBlocks;
 
 template <typename T>
 void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
@@ -4097,8 +5926,18 @@ void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
                                    int n,
                                    int out_n,
                                    bool use_1stage,
-                                   bool gemma_norm = false)
+                                   bool gemma_norm    = false,
+                                   int num_norm_rows  = -1,
+                                   bool skip_residual = false)
 {
+    // The 1-stage kernel always adds the residual and normalizes every row.
+    if(use_1stage && (skip_residual || (num_norm_rows >= 0 && num_norm_rows < m)))
+    {
+        throw std::runtime_error("fused allreduce rmsnorm: skip_residual and num_norm_rows < m "
+                                 "require use_1stage=false");
+    }
+    if(num_norm_rows < 0 || num_norm_rows > m)
+        num_norm_rows = m;
     auto d   = 16 / sizeof(T);
     int size = m * n;
     if(size % d != 0)
@@ -4170,6 +6009,32 @@ void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
         return;                                                                            \
     }
 
+    // Single-kernel 2-stage fused AR+RMSNorm: each block owns complete tokens
+    // in both stages, so RMSNorm folds into the allgather. Other shapes take
+    // reduce-scatter + local RMSNorm below. The block must be whole 32-lane
+    // groups: ar_fusion_epilogue_block_reduce drops a partial one.
+    const int fused_block_size = n / pack_size;
+    const bool use_fused_2stage =
+        !use_1stage && out_n == n && input_hidden_dim == n && m <= kFusedArRms2StageMaxRows &&
+        fused_block_size >= world_size_ && fused_block_size % world_size_ == 0 &&
+        fused_block_size % 32 == 0 && fused_block_size <= 1024;
+    if(use_fused_2stage)
+    {
+        fusedAllReduceRMSNorm2Stage<T>(stream,
+                                       ptrs,
+                                       residual_inp,
+                                       residual_out,
+                                       output,
+                                       weight,
+                                       eps,
+                                       size,
+                                       n,
+                                       gemma_norm,
+                                       num_norm_rows,
+                                       skip_residual);
+        return;
+    }
+
     // step 1, run reduce-scatter + allgather cross device save
     dim3 block(512);
     int block_num = ((size / world_size_) + 512 - 1) / 512;
@@ -4196,212 +6061,67 @@ void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
 
 #undef MAYBE_DISPATCH_1S_KERNEL
 
-    // step 2, run allgather local device load + rmsnorm
-    int n_bytes  = n * sizeof(T);
-    auto setGrid = [&](int naive_grid_size, const void* kernel_ptr) {
-        int occupancy;
-        hipOccupancyMaxActiveBlocksPerMultiprocessor(&occupancy, kernel_ptr, block.x, 0);
-        grid.x = naive_grid_size < num_cu * occupancy ? naive_grid_size : num_cu * occupancy;
-    };
-
-#define launch_fused_allreduce_rmsnorm_pad(template_kernel, gemma_template_kernel)                            \
-    do                                                                                 \
-    {                                                                                  \
-        if(gemma_norm)                                                                 \
-        {                                                                              \
-            auto kernel_ptr = reinterpret_cast<const void*>(gemma_template_kernel);     \
-            setGrid(naive_grid_size, kernel_ptr);                                      \
-            gemma_template_kernel<<<grid, block, 0, stream>>>(                         \
-                sg_, residual_inp, residual_out, output, weight, eps, rank_, m, n, out_n); \
-        }                                                                              \
-        else                                                                           \
-        {                                                                              \
-            auto kernel_ptr = reinterpret_cast<const void*>(template_kernel);           \
-            setGrid(naive_grid_size, kernel_ptr);                                      \
-            template_kernel<<<grid, block, 0, stream>>>(                               \
-                sg_, residual_inp, residual_out, output, weight, eps, rank_, m, n, out_n); \
-        }                                                                              \
-    } while(0)
-
-#define launch_fused_allreduce_rmsnorm(template_kernel, gemma_template_kernel)                         \
-    do                                                                          \
-    {                                                                           \
-        if(gemma_norm)                                                          \
-        {                                                                       \
-            auto kernel_ptr = reinterpret_cast<const void*>(gemma_template_kernel); \
-            setGrid(naive_grid_size, kernel_ptr);                               \
-            gemma_template_kernel<<<grid, block, 0, stream>>>(                  \
-                sg_, residual_inp, residual_out, output, weight, eps, rank_, m, n); \
-        }                                                                       \
-        else                                                                    \
-        {                                                                       \
-            auto kernel_ptr = reinterpret_cast<const void*>(template_kernel);    \
-            setGrid(naive_grid_size, kernel_ptr);                               \
-            template_kernel<<<grid, block, 0, stream>>>(                        \
-                sg_, residual_inp, residual_out, output, weight, eps, rank_, m, n); \
-        }                                                                       \
-    } while(0)
-
-    // n_packs = number of vectorized elements per row
-    constexpr int ar_pack_size = 16 / sizeof(T);
-    int n_packs                = n / ar_pack_size;
-    if(out_n != n)
-    {
-        if(n_packs >= 256)
-        {
-            int n_loop          = (n_packs + 511) / 512;
-            int naive_grid_size = m;
-            switch(n_loop)
-            {
-            case 1:
-                launch_fused_allreduce_rmsnorm_pad((local_device_load_rmsnorm<T, 512, 1, false>), (local_device_load_rmsnorm<T, 512, 1, true>));
-                break;
-            case 2:
-                launch_fused_allreduce_rmsnorm_pad((local_device_load_rmsnorm<T, 512, 2, false>), (local_device_load_rmsnorm<T, 512, 2, true>));
-                break;
-            case 3:
-                launch_fused_allreduce_rmsnorm_pad((local_device_load_rmsnorm<T, 512, 3, false>), (local_device_load_rmsnorm<T, 512, 3, true>));
-                break;
-            case 4:
-                launch_fused_allreduce_rmsnorm_pad((local_device_load_rmsnorm<T, 512, 4, false>), (local_device_load_rmsnorm<T, 512, 4, true>));
-                break;
-            default:
-                throw std::runtime_error(
-                    "fused allreduce rmsnorm pad: n too large, m=" + std::to_string(m) +
-                    " n=" + std::to_string(n) + " n_loop=" + std::to_string(n_loop));
-            }
-        }
-        else if(n_packs >= 64)
-        {
-            block.x             = 256;
-            int n_loop          = (n_packs + 255) / 256;
-            int naive_grid_size = m;
-            switch(n_loop)
-            {
-            case 1:
-                launch_fused_allreduce_rmsnorm_pad((local_device_load_rmsnorm<T, 256, 1, false>), (local_device_load_rmsnorm<T, 256, 1, true>));
-                break;
-            case 2:
-                launch_fused_allreduce_rmsnorm_pad((local_device_load_rmsnorm<T, 256, 2, false>), (local_device_load_rmsnorm<T, 256, 2, true>));
-                break;
-            default:
-                throw std::runtime_error(
-                    "fused allreduce rmsnorm pad: n too large for tnum=256, m=" +
-                    std::to_string(m) + " n=" + std::to_string(n) +
-                    " n_loop=" + std::to_string(n_loop));
-            }
-        }
-        else
-        {
-            throw std::runtime_error(
-                "fused allreduce rmsnorm pad: n too small, m=" + std::to_string(m) +
-                " n=" + std::to_string(n) + " n_packs=" + std::to_string(n_packs) +
-                " (need n_packs >= 64, i.e. n >= " + std::to_string(64 * ar_pack_size) + ")");
-        }
-        return;
-    }
-    // Choose tnum (block size, must be power of 2) and n_loop
-    // local_device_load_rmsnorm handles bounds check for n_packs < tnum * n_loop
-    if(n_packs >= 256)
-    {
-        // tnum=512, n_loop = ceil(n_packs / 512)
-        int n_loop          = (n_packs + 511) / 512;
-        int naive_grid_size = m;
-        if(n_packs == 512 * n_loop)
-        {
-            // exact fit -> use naive (no bounds check, slightly faster)
-            switch(n_loop)
-            {
-            case 1:
-                launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm_naive<T, 512, 1, false>), (local_device_load_rmsnorm_naive<T, 512, 1, true>));
-                break;
-            case 2:
-                launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm_naive<T, 512, 2, false>), (local_device_load_rmsnorm_naive<T, 512, 2, true>));
-                break;
-            case 3:
-                launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm_naive<T, 512, 3, false>), (local_device_load_rmsnorm_naive<T, 512, 3, true>));
-                break;
-            case 4:
-                launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm_naive<T, 512, 4, false>), (local_device_load_rmsnorm_naive<T, 512, 4, true>));
-                break;
-            default:
-                throw std::runtime_error(
-                    "fused allreduce rmsnorm: n too large, m=" + std::to_string(m) +
-                    " n=" + std::to_string(n) + " n_loop=" + std::to_string(n_loop));
-            }
-        }
-        else
-        {
-            // non-exact -> use bounds-checked version
-            switch(n_loop)
-            {
-            case 1:
-                launch_fused_allreduce_rmsnorm_pad((local_device_load_rmsnorm<T, 512, 1, false>), (local_device_load_rmsnorm<T, 512, 1, true>));
-                break;
-            case 2:
-                launch_fused_allreduce_rmsnorm_pad((local_device_load_rmsnorm<T, 512, 2, false>), (local_device_load_rmsnorm<T, 512, 2, true>));
-                break;
-            case 3:
-                launch_fused_allreduce_rmsnorm_pad((local_device_load_rmsnorm<T, 512, 3, false>), (local_device_load_rmsnorm<T, 512, 3, true>));
-                break;
-            case 4:
-                launch_fused_allreduce_rmsnorm_pad((local_device_load_rmsnorm<T, 512, 4, false>), (local_device_load_rmsnorm<T, 512, 4, true>));
-                break;
-            default:
-                throw std::runtime_error(
-                    "fused allreduce rmsnorm: n too large, m=" + std::to_string(m) +
-                    " n=" + std::to_string(n) + " n_loop=" + std::to_string(n_loop));
-            }
-        }
-    }
-    else if(n_packs >= 64)
-    {
-        block.x             = 256;
-        int n_loop          = (n_packs + 255) / 256;
-        int naive_grid_size = m;
-        if(n_packs == 256 * n_loop)
-        {
-            switch(n_loop)
-            {
-            case 1:
-                launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm_naive<T, 256, 1, false>), (local_device_load_rmsnorm_naive<T, 256, 1, true>));
-                break;
-            case 2:
-                launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm_naive<T, 256, 2, false>), (local_device_load_rmsnorm_naive<T, 256, 2, true>));
-                break;
-            default:
-                throw std::runtime_error(
-                    "fused allreduce rmsnorm: n too large for tnum=256, m=" + std::to_string(m) +
-                    " n=" + std::to_string(n) + " n_loop=" + std::to_string(n_loop));
-            }
-        }
-        else
-        {
-            switch(n_loop)
-            {
-            case 1:
-                launch_fused_allreduce_rmsnorm_pad((local_device_load_rmsnorm<T, 256, 1, false>), (local_device_load_rmsnorm<T, 256, 1, true>));
-                break;
-            case 2:
-                launch_fused_allreduce_rmsnorm_pad((local_device_load_rmsnorm<T, 256, 2, false>), (local_device_load_rmsnorm<T, 256, 2, true>));
-                break;
-            default:
-                throw std::runtime_error(
-                    "fused allreduce rmsnorm: n too large for tnum=256, m=" + std::to_string(m) +
-                    " n=" + std::to_string(n) + " n_loop=" + std::to_string(n_loop));
-            }
-        }
-    }
+    // step 2, run allgather local device load + rmsnorm. Plain callers use the
+    // ROW_OPTS=false kernels (main's code path).
+    if(skip_residual || num_norm_rows < m)
+        localRMSNorm<T, true>(stream,
+                              residual_inp,
+                              residual_out,
+                              output,
+                              weight,
+                              eps,
+                              m,
+                              n,
+                              out_n,
+                              gemma_norm,
+                              num_norm_rows,
+                              skip_residual,
+                              num_cu);
     else
-    {
-        throw std::runtime_error(
-            "fused allreduce rmsnorm: n too small, m=" + std::to_string(m) +
-            " n=" + std::to_string(n) + " n_packs=" + std::to_string(n_packs) +
-            " (need n_packs >= 64, i.e. n >= " + std::to_string(64 * ar_pack_size) + ")");
-    }
-
-#undef launch_fused_allreduce_rmsnorm_pad
+        localRMSNorm<T, false>(stream,
+                               residual_inp,
+                               residual_out,
+                               output,
+                               weight,
+                               eps,
+                               m,
+                               n,
+                               out_n,
+                               gemma_norm,
+                               num_norm_rows,
+                               skip_residual,
+                               num_cu);
 }
+
+// Defined after the class, so that the instances AITER_CUSTOM_AR_EXT_INSTANCES
+// declares extern compile only in custom_all_reduce_ext.cu.
+template <typename T>
+void fusedAllReduceRMSNorm2Stage(hipStream_t stream,
+                                 RankData* ptrs,
+                                 T* residual_inp,
+                                 T* residual_out,
+                                 T* output,
+                                 T* weight,
+                                 float eps,
+                                 int size,
+                                 int n,
+                                 bool gemma_norm,
+                                 int num_norm_rows,
+                                 bool skip_residual);
+template <typename T, bool ROW_OPTS>
+void localRMSNorm(hipStream_t stream,
+                  T* residual_inp,
+                  T* residual_out,
+                  T* output,
+                  T* weight,
+                  float eps,
+                  int m,
+                  int n,
+                  int out_n,
+                  bool gemma_norm,
+                  int num_norm_rows,
+                  bool skip_residual,
+                  uint32_t num_cu);
 
 template <typename T, typename QT>
 void dispatchFusedAllReduceRMSNormQuant(hipStream_t stream,
@@ -4521,7 +6241,8 @@ void dispatchFusedAllReduceRMSNormQuantPerGroup(hipStream_t stream,
                                                 int group_size,
                                                 bool use_1stage,
                                                 T* bf16_output = nullptr,
-                                                bool transpose_scale = false)
+                                                bool transpose_scale = false,
+                                                bool gemma_norm      = false)
 {
     auto d   = 16 / sizeof(T);
     int size = m * n;
@@ -4598,7 +6319,7 @@ void dispatchFusedAllReduceRMSNormQuantPerGroup(hipStream_t stream,
         allreduce_fusion_kernel_1stage_per_group_launcher<T, QT, NGPUS>(                   \
             ptrs, sg_, self_sg_, rank_,                                                     \
             residual_inp, residual_out, output, weight, scale_out,                          \
-            size, n, group_size, eps, stream, bf16_output, transpose_scale);               \
+            size, n, group_size, eps, stream, bf16_output, transpose_scale, gemma_norm);   \
         return;                                                                             \
     }                                                                                      \
     else if(n_constrain && (size * sizeof(T) <= 512 * 1024))                               \
@@ -4606,7 +6327,7 @@ void dispatchFusedAllReduceRMSNormQuantPerGroup(hipStream_t stream,
         allreduce_fusion_kernel_2stage_per_group_launcher<T, QT, NGPUS>(                   \
             ptrs, sg_, self_sg_, rank_,                                                     \
             residual_inp, residual_out, output, weight, scale_out,                          \
-            size, n, group_size, eps, stream, bf16_output, transpose_scale);               \
+            size, n, group_size, eps, stream, bf16_output, transpose_scale, gemma_norm);   \
         return;                                                                             \
     }                                                                                      \
     else if(n_constrain)                                                                   \
@@ -4614,7 +6335,7 @@ void dispatchFusedAllReduceRMSNormQuantPerGroup(hipStream_t stream,
         allreduce_fusion_kernel_split_per_group_launcher<T, QT, NGPUS>(                    \
             ptrs, sg_, self_sg_, rank_,                                                     \
             residual_inp, residual_out, output, weight, scale_out,                          \
-            size, n, group_size, eps, stream, bf16_output, transpose_scale);               \
+            size, n, group_size, eps, stream, bf16_output, transpose_scale, gemma_norm);   \
         return;                                                                             \
     }                                                                                      \
     else                                                                                   \
@@ -4648,7 +6369,9 @@ void dispatchFusedAllReduceRMSNormQuantMXFP4(hipStream_t stream,
                                              int m,
                                              int n,
                                              bool use_1stage,
-                                             T* bf16_output = nullptr)
+                                             T* bf16_output = nullptr,
+                                             bool gemma_norm = false,
+                                             bool hadamard_rotate = false)
 {
     auto d   = 16 / sizeof(T);
     int size = m * n;
@@ -4684,20 +6407,40 @@ void dispatchFusedAllReduceRMSNormQuantMXFP4(hipStream_t stream,
             "size*sizeof(T) <= 512 KiB)");
     }
 
-#define DISPATCH_AR_FUSION_MXFP4_KERNEL(NGPUS)                                              \
+#define DISPATCH_AR_FUSION_MXFP4_KERNEL_IMPL(NGPUS, GEMMA, HADAMARD)                        \
     if(can_1stage)                                                                           \
     {                                                                                        \
-        allreduce_fusion_kernel_1stage_mxfp4_launcher<T, NGPUS>(                             \
+        allreduce_fusion_kernel_1stage_mxfp4_launcher<T, NGPUS, GEMMA, HADAMARD>(            \
             ptrs, sg_, self_sg_, rank_, residual_inp, residual_out, output, weight,           \
             scale_out, size, n, eps, stream, bf16_output);                                    \
         return;                                                                              \
     }                                                                                        \
     else                                                                                     \
     {                                                                                        \
-        allreduce_fusion_kernel_2stage_mxfp4_launcher<T, NGPUS>(                             \
+        allreduce_fusion_kernel_2stage_mxfp4_launcher<T, NGPUS, GEMMA, HADAMARD>(            \
             ptrs, sg_, self_sg_, rank_, residual_inp, residual_out, output, weight,           \
             scale_out, size, n, eps, stream, bf16_output);                                    \
         return;                                                                              \
+    }
+
+#define DISPATCH_AR_FUSION_MXFP4_KERNEL_HADAMARD(NGPUS, GEMMA)                              \
+    if(hadamard_rotate)                                                                      \
+    {                                                                                        \
+        DISPATCH_AR_FUSION_MXFP4_KERNEL_IMPL(NGPUS, GEMMA, true)                             \
+    }                                                                                        \
+    else                                                                                     \
+    {                                                                                        \
+        DISPATCH_AR_FUSION_MXFP4_KERNEL_IMPL(NGPUS, GEMMA, false)                            \
+    }
+
+#define DISPATCH_AR_FUSION_MXFP4_KERNEL(NGPUS)                                              \
+    if(gemma_norm)                                                                           \
+    {                                                                                        \
+        DISPATCH_AR_FUSION_MXFP4_KERNEL_HADAMARD(NGPUS, true)                                \
+    }                                                                                        \
+    else                                                                                     \
+    {                                                                                        \
+        DISPATCH_AR_FUSION_MXFP4_KERNEL_HADAMARD(NGPUS, false)                               \
     }
 
     switch(world_size_)
@@ -4711,6 +6454,8 @@ void dispatchFusedAllReduceRMSNormQuantMXFP4(hipStream_t stream,
             std::to_string(world_size_));
     }
 #undef DISPATCH_AR_FUSION_MXFP4_KERNEL
+#undef DISPATCH_AR_FUSION_MXFP4_KERNEL_HADAMARD
+#undef DISPATCH_AR_FUSION_MXFP4_KERNEL_IMPL
 }
 
 template <typename T, bool FUSE_ROPE>
@@ -4888,12 +6633,226 @@ void dispatchAllReduceMhcPostSplit(hipStream_t stream,
 
 ~CustomAllreduce()
 {
+    if(d_ll_scratch_peers_)
+        (void)hipFree(d_ll_scratch_peers_);
+    if(d_ll_poc_block_flags_)
+        (void)hipFree(d_ll_poc_block_flags_);
+    if(d_ll128_unroll2_epoch_)
+        (void)hipFree(d_ll128_unroll2_epoch_);
     for(auto [_, ptr] : ipc_handles_)
     {
         HIP_CALL(hipIpcCloseMemHandle(ptr));
     }
 }
 };
+
+template <typename T>
+void CustomAllreduce::fusedAllReduceRMSNorm2Stage(hipStream_t stream,
+                                                  RankData* ptrs,
+                                                  T* residual_inp,
+                                                  T* residual_out,
+                                                  T* output,
+                                                  T* weight,
+                                                  float eps,
+                                                  int size,
+                                                  int n,
+                                                  bool gemma_norm,
+                                                  int num_norm_rows,
+                                                  bool skip_residual)
+{
+    using Launcher = decltype(&allreduce_fusion_kernel_2stage_launcher<T, T, 2>);
+    Launcher launcher;
+#define FUSED_2STAGE_LAUNCHER(NGPUS)                                         \
+    (gemma_norm ? allreduce_fusion_kernel_2stage_launcher<T, T, NGPUS, true> \
+                : allreduce_fusion_kernel_2stage_launcher<T, T, NGPUS, false>)
+    switch(world_size_)
+    {
+    case 8: launcher = FUSED_2STAGE_LAUNCHER(8); break;
+    case 4: launcher = FUSED_2STAGE_LAUNCHER(4); break;
+    case 2: launcher = FUSED_2STAGE_LAUNCHER(2); break;
+    default:
+        throw std::runtime_error("fused allreduce rmsnorm: unsupported world_size=" +
+                                 std::to_string(world_size_));
+    }
+#undef FUSED_2STAGE_LAUNCHER
+    launcher(ptrs,
+             sg_,
+             self_sg_,
+             rank_,
+             residual_inp,
+             residual_out,
+             output,
+             weight,
+             nullptr,
+             size,
+             n,
+             eps,
+             stream,
+             nullptr,
+             num_norm_rows,
+             skip_residual);
+}
+
+// ROW_OPTS selects the local RMSNorm kernels' row options (skip_residual,
+// num_norm_rows < m); every launch passes them, ROW_OPTS=false kernels ignore them.
+template <typename T, bool ROW_OPTS>
+void CustomAllreduce::localRMSNorm(hipStream_t stream,
+                                   T* residual_inp,
+                                   T* residual_out,
+                                   T* output,
+                                   T* weight,
+                                   float eps,
+                                   int m,
+                                   int n,
+                                   int out_n,
+                                   bool gemma_norm,
+                                   int num_norm_rows,
+                                   bool skip_residual,
+                                   uint32_t num_cu)
+{
+    dim3 block(512);
+    dim3 grid;
+    auto setGrid = [&](int naive_grid_size, const void* kernel_ptr) {
+        int occupancy;
+        hipOccupancyMaxActiveBlocksPerMultiprocessor(&occupancy, kernel_ptr, block.x, 0);
+        grid.x = naive_grid_size < num_cu * occupancy ? naive_grid_size : num_cu * occupancy;
+    };
+    auto launch_local_rmsnorm = [&](auto kernel, int naive_grid_size, auto... dims) {
+        setGrid(naive_grid_size, reinterpret_cast<const void*>(kernel));
+        hipLaunchKernelGGL(kernel,
+                           grid,
+                           block,
+                           0,
+                           stream,
+                           sg_,
+                           residual_inp,
+                           residual_out,
+                           output,
+                           weight,
+                           eps,
+                           rank_,
+                           m,
+                           n,
+                           dims...,
+                           num_norm_rows,
+                           skip_residual);
+    };
+#define LAUNCH_LOCAL_RMSNORM(KERNEL, TNUM, NLOOP, ...)                    \
+do                                                                        \
+{                                                                         \
+    if(gemma_norm)                                                        \
+        launch_local_rmsnorm(KERNEL<T, TNUM, NLOOP, true, ROW_OPTS>,      \
+                             naive_grid_size __VA_OPT__(, ) __VA_ARGS__); \
+    else                                                                  \
+        launch_local_rmsnorm(KERNEL<T, TNUM, NLOOP, false, ROW_OPTS>,     \
+                             naive_grid_size __VA_OPT__(, ) __VA_ARGS__); \
+} while(0)
+
+    // n_packs = number of vectorized elements per row
+    constexpr int ar_pack_size = 16 / sizeof(T);
+    int n_packs                = n / ar_pack_size;
+    if(out_n != n)
+    {
+        if(n_packs >= 256)
+        {
+            int n_loop          = (n_packs + 511) / 512;
+            int naive_grid_size = m;
+            switch(n_loop)
+            {
+            case 1: LAUNCH_LOCAL_RMSNORM(local_device_load_rmsnorm, 512, 1, out_n); break;
+            case 2: LAUNCH_LOCAL_RMSNORM(local_device_load_rmsnorm, 512, 2, out_n); break;
+            case 3: LAUNCH_LOCAL_RMSNORM(local_device_load_rmsnorm, 512, 3, out_n); break;
+            case 4: LAUNCH_LOCAL_RMSNORM(local_device_load_rmsnorm, 512, 4, out_n); break;
+            default:
+                throw std::runtime_error(
+                    "fused allreduce rmsnorm pad: n too large, m=" + std::to_string(m) +
+                    " n=" + std::to_string(n) + " n_loop=" + std::to_string(n_loop));
+            }
+        }
+        else if(n_packs >= 64)
+        {
+            // 64 <= n_packs < 256 is one pass of 256 threads (n_loop 1).
+            block.x             = 256;
+            int naive_grid_size = m;
+            LAUNCH_LOCAL_RMSNORM(local_device_load_rmsnorm, 256, 1, out_n);
+        }
+        else
+        {
+            throw std::runtime_error(
+                "fused allreduce rmsnorm pad: n too small, m=" + std::to_string(m) +
+                " n=" + std::to_string(n) + " n_packs=" + std::to_string(n_packs) +
+                " (need n_packs >= 64, i.e. n >= " + std::to_string(64 * ar_pack_size) + ")");
+        }
+        return;
+    }
+    // Choose tnum (block size, must be power of 2) and n_loop
+    // local_device_load_rmsnorm handles bounds check for n_packs < tnum * n_loop
+    if(n_packs >= 256)
+    {
+        // tnum=512, n_loop = ceil(n_packs / 512)
+        int n_loop          = (n_packs + 511) / 512;
+        int naive_grid_size = m;
+        if(n_packs == 512 * n_loop)
+        {
+            // exact fit -> use naive (no bounds check, slightly faster)
+            switch(n_loop)
+            {
+            case 1: LAUNCH_LOCAL_RMSNORM(local_device_load_rmsnorm_naive, 512, 1); break;
+            case 2: LAUNCH_LOCAL_RMSNORM(local_device_load_rmsnorm_naive, 512, 2); break;
+            case 3: LAUNCH_LOCAL_RMSNORM(local_device_load_rmsnorm_naive, 512, 3); break;
+            case 4: LAUNCH_LOCAL_RMSNORM(local_device_load_rmsnorm_naive, 512, 4); break;
+            default:
+                throw std::runtime_error(
+                    "fused allreduce rmsnorm: n too large, m=" + std::to_string(m) +
+                    " n=" + std::to_string(n) + " n_loop=" + std::to_string(n_loop));
+            }
+        }
+        else
+        {
+            // non-exact -> use bounds-checked version
+            switch(n_loop)
+            {
+            case 1: LAUNCH_LOCAL_RMSNORM(local_device_load_rmsnorm, 512, 1, out_n); break;
+            case 2: LAUNCH_LOCAL_RMSNORM(local_device_load_rmsnorm, 512, 2, out_n); break;
+            case 3: LAUNCH_LOCAL_RMSNORM(local_device_load_rmsnorm, 512, 3, out_n); break;
+            case 4: LAUNCH_LOCAL_RMSNORM(local_device_load_rmsnorm, 512, 4, out_n); break;
+            default:
+                throw std::runtime_error(
+                    "fused allreduce rmsnorm: n too large, m=" + std::to_string(m) +
+                    " n=" + std::to_string(n) + " n_loop=" + std::to_string(n_loop));
+            }
+        }
+    }
+    else if(n_packs >= 64)
+    {
+        // 64 <= n_packs < 256 is one pass of 256 threads (n_loop 1) and never
+        // an exact fit, so it takes the bounds-checked kernel.
+        block.x             = 256;
+        int naive_grid_size = m;
+        LAUNCH_LOCAL_RMSNORM(local_device_load_rmsnorm, 256, 1, out_n);
+    }
+    else
+    {
+        throw std::runtime_error(
+            "fused allreduce rmsnorm: n too small, m=" + std::to_string(m) +
+            " n=" + std::to_string(n) + " n_packs=" + std::to_string(n_packs) +
+            " (need n_packs >= 64, i.e. n >= " + std::to_string(64 * ar_pack_size) + ")");
+    }
+
+#undef LAUNCH_LOCAL_RMSNORM
+}
+
+// These instances compile only in csrc/kernels/custom_all_reduce_ext.cu, in
+// parallel with custom_all_reduce.cu, which sees them as extern.
+#define AITER_CUSTOM_AR_EXT_INSTANCES(EXTERN, T)                                       \
+    EXTERN template void CustomAllreduce::fusedAllReduceRMSNorm2Stage<T>(               \
+        hipStream_t, RankData*, T*, T*, T*, T*, float, int, int, bool, int, bool);      \
+    EXTERN template void CustomAllreduce::localRMSNorm<T, true>(                        \
+        hipStream_t, T*, T*, T*, T*, float, int, int, int, bool, int, bool, uint32_t);
+AITER_CUSTOM_AR_EXT_INSTANCES(extern, opus::fp32_t)
+AITER_CUSTOM_AR_EXT_INSTANCES(extern, opus::fp16_t)
+AITER_CUSTOM_AR_EXT_INSTANCES(extern, opus::bf16_t)
+
 /**
  * To inspect PTX/SASS, copy paste this header file to compiler explorer and add
  a template instantiation:

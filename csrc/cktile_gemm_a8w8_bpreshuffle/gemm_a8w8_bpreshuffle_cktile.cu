@@ -11,7 +11,14 @@
 using RowwiseKernel = torch::Tensor (*)(
     torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, int);
 
-using RowwiseKernelMap = GemmDispatchMap<RowwiseKernel>;
+struct RowwiseDispatchEntry
+{
+    RowwiseKernel kernel;
+    bool supports_m_padding;
+    bool supports_k_padding;
+};
+
+using RowwiseKernelMap = GemmDispatchMap<RowwiseDispatchEntry>;
 
 template <typename DDataType, typename EDataType = DDataType>
 RowwiseKernel rowwise_heuristic_dispatch(int M, int N, int K)
@@ -30,7 +37,7 @@ static constexpr int nextPow2(unsigned int num)
 }
 
 template <typename DDataType, typename EDataType = DDataType>
-RowwiseKernel rowwise_dispatch(int M, int N, int K)
+RowwiseKernel rowwise_dispatch(int M, int N, int K, int lookup_k)
 {
     // For a given shape, either find the best kernel via lookup or heuristic.
     // For many small M shapes, we bucket them to the next largest kernel.
@@ -55,33 +62,35 @@ RowwiseKernel rowwise_dispatch(int M, int N, int K)
     const std::string_view gfx = get_device_gfx();
 
     // First check if this shape(M,N,K) is available in the direct lookup.
-    auto it = lookup.find({gfx, cu_num, M, N, K});
+    auto it = lookup.find({gfx, cu_num, M, N, lookup_k});
     // If we found an optimal kernel, use it.
-    if(it != lookup.end())
+    if(it != lookup.end() && (K == lookup_k || it->second.supports_k_padding))
     {
-        return it->second;
+        return it->second.kernel;
     }
 
     int padded_m = M;
 
     // Fine-grained search
-    padded_m = getPaddedM(M, N, K, 0);
+    padded_m = getPaddedM(M, N, lookup_k, 0);
     // Second check if this shape(padded_m,N,K) is available in the direct lookup.
-    it = lookup.find({gfx, cu_num, padded_m, N, K});
+    it = lookup.find({gfx, cu_num, padded_m, N, lookup_k});
     // If we found an optimal kernel, use it.
-    if(it != lookup.end())
+    if(it != lookup.end() && it->second.supports_m_padding &&
+       (K == lookup_k || it->second.supports_k_padding))
     {
-        return it->second;
+        return it->second.kernel;
     }
 
     // Coarse-grained search
-    padded_m = getPaddedM(M, N, K, 1);
+    padded_m = getPaddedM(M, N, lookup_k, 1);
     // Third check if this shape(padded_m,N,K) is available in the direct lookup.
-    it = lookup.find({gfx, cu_num, padded_m, N, K});
+    it = lookup.find({gfx, cu_num, padded_m, N, lookup_k});
     // If we found an optimal kernel, use it.
-    if(it != lookup.end())
+    if(it != lookup.end() && it->second.supports_m_padding &&
+       (K == lookup_k || it->second.supports_k_padding))
     {
-        return it->second;
+        return it->second.kernel;
     }
 
     // Otherwise, use heuristics.
@@ -113,11 +122,11 @@ torch::Tensor gemm_a8w8_bpreshuffle_cktile(torch::Tensor& XQ,
 
     if(x_scale.dtype() == at::ScalarType::Float && Y.dtype() == at::ScalarType::Half)
     {
-        rowwise_dispatch<F32, F16>(M, N, WQK)(XQ, WQ, x_scale, w_scale, Y, KBatch);
+        rowwise_dispatch<F32, F16>(M, N, K, WQK)(XQ, WQ, x_scale, w_scale, Y, KBatch);
     }
     else if(x_scale.dtype() == at::ScalarType::Float && Y.dtype() == at::ScalarType::BFloat16)
     {
-        rowwise_dispatch<F32, B16>(M, N, WQK)(XQ, WQ, x_scale, w_scale, Y, KBatch);
+        rowwise_dispatch<F32, B16>(M, N, K, WQK)(XQ, WQ, x_scale, w_scale, Y, KBatch);
     }
     else
     {

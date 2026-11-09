@@ -3,7 +3,6 @@
 
 #include <torch/all.h>
 #include <ATen/hip/HIPContext.h>
-#include "py_itfs_common.h"
 #include "mha_common.h"
 #include "mha_bwd.h"
 
@@ -250,7 +249,7 @@ std::vector<at::Tensor> fmha_v3_bwd(const at::Tensor &dout,         // [b, sq, h
                                 false,  // use_dbias
                                 false,  // has_dropout
                                 false,  // store_randval
-                                false,  // deterministic
+                                deterministic,
 
                                 q.data_ptr(),
                                 k.data_ptr(),
