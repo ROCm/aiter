@@ -521,6 +521,13 @@ l_preshuffle = (
     args.ck_preshuffle if isinstance(args.ck_preshuffle, list) else [args.ck_preshuffle]
 )
 l_apre = args.apre if isinstance(args.apre, list) else [args.apre]
+if args.w_scale_block == "32x32" and get_gfx() not in (
+    "gfx950",
+    "gfx1250",
+    "gfx1250-strict",
+):
+    print(f"skip: native 32x32 E8M0 preshuffle is unsupported on {get_gfx()}")
+    sys.exit(0)
 if args.w_scale_block == "32x32" and (False in l_preshuffle or True in l_apre):
     parser.error("--w-scale-block 32x32 needs --ck_preshuffle True and no --apre")
 

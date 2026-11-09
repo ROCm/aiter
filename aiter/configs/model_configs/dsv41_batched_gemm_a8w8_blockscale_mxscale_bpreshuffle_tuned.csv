@@ -29,4 +29,4 @@ gfx1250,256,8,384,1024,4096,32x32,flydsl,-1,1,11.131,flydsl_bmm_mxfp8_32_wmma_t1
 gfx1250,256,8,400,1024,4096,32x32,flydsl,-1,1,12.302,flydsl_bmm_mxfp8_32_wmma_t128x128x256_mw2_nw2_nb3_sk1_cm1_cn1,2181.97,4.33,0.0
 gfx1250,256,8,480,1024,4096,32x32,flydsl,-1,1,12.227,flydsl_bmm_mxfp8_32_wmma_t128x128x256_mw2_nw2_nb4_sk1_cm1_cn1,2634.49,4.67,0.0
 gfx1250,256,8,768,1024,4096,32x32,flydsl,-1,1,15.643,flydsl_bmm_mxfp8_32_wmma_t256x128x256_mw2_nw2_nb3_sk1_cm1_cn1,3294.65,4.56,0.0
-gfx1250,256,8,16384,1024,4096,32x32,flydsl,-1,1,177.696,flydsl_mxfp8_32_bpreshuffle_compute_wmma_t256x256x128_mw2_nw2_nb2_sk1_cm4_cn2_ps2,6187.6,4.72,0.0
+gfx1250,256,8,16384,1024,4096,32x32,flydsl,-1,1,178.768,flydsl_mxfp8_32_bpreshuffle_compute_wmma_t256x256x128_mw2_nw2_nb2_sk1_cm4_cn2_ps2,6150.49,4.69,0.0
