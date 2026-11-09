@@ -174,6 +174,14 @@ check tool). The path is kept (rather than renamed) because the profile `feature
   launch.
 - `QSA_*` kernel switches are read at kernel import time; a non-default value makes every call
   native (`kernel_env_mismatch`).
-- Kernel evidence is on flydsl 0.3.4.1; main pins flydsl 0.4.2 (the AOT measurement above ran on
-  0.4.0). GPU behaviour of the converged dispatch, AOT on a GPU host and the GPU cache-hit check
-  are not verified in this revision.
+- FlyDSL versions. GPU evidence (golden, perf) is on flydsl 0.3.4.1; main pins flydsl 0.4.2.
+  Compile-only, no device, all 276 default / routable specializations (138 specs × int32 / int64
+  positions, P 4 / 8 / 16, bf16 / fp8): flydsl **0.4.0** emits byte-identical final ISA to 0.3.4.1
+  (276 / 276), so the 0.3.4.1 evidence carries to 0.4.0. flydsl **0.4.1** builds all 276 with the
+  same kernel names and LDS and 0 WMMA-hazard violations, but the ISA differs in every build
+  (instruction count −18 % … +5 %, median −2 %; VGPRs change in 184 builds; the 92 builds of
+  the default routes: −16 % … +2 % instructions, VGPR −4 … +28, at most 248, no scratch; opt-in
+  variants e.g. `QSA_FP8_EARLY=1` 168 → 266 VGPRs, `QSA_BF16_PATH=scalar` scratch 28 → 92 B): numerics and
+  performance on ≥ 0.4.1 (incl. 0.4.2, not available offline) are not verified on a GPU. GPU
+  behaviour of the converged dispatch, AOT on a GPU host and the GPU cache-hit check are not
+  verified in this revision.
