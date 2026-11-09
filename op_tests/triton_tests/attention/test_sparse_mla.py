@@ -601,6 +601,10 @@ def test_fp8_dots_keep_the_softmax_tail():
 
     gfx942 scales by 128 and the tail survives. gfx950 leaves P_SCALE at 1, so
     p is cast as itself and the tail flushes; the case still runs there.
+
+    has_invalid holds both archs on the generic kernel this PR changes. Every
+    index is valid, so the masked path reads the same rows, but without it
+    gfx950 takes the custom fp8 kernel (sparse_mla_fp8.py) instead.
     """
     arch = arch_info.get_arch()
     if arch not in FP8_SCALAR_ARCHS:
@@ -637,6 +641,7 @@ def test_fp8_dots_keep_the_softmax_tail():
         kv_scale=ks,
         qk_rope_head_dim=0,
         dot_precision="fp8",
+        has_invalid=True,
         kv_splits=1,
     )
     e = rel_err(out, ref)
