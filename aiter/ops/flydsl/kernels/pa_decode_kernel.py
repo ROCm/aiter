@@ -774,6 +774,8 @@ def compile_gfx1250_pa_decode(
                     )
                     for j in range_constexpr(wave_pages)
                 ] + [fx.Int32(fx.rocdl.readfirstlane(T.i32, tbl[row]))]
+                # The scheduler would still place the loads after the wait.
+                fx.rocdl.sched_barrier(0)
                 length = fx.max(task_context, fx.Int32(0))
                 steps = (length + t.TOKENS - 1) // t.TOKENS
                 count = fx.min((steps + chunk - 1) // chunk, fx.Int32(t.cluster_merge))
