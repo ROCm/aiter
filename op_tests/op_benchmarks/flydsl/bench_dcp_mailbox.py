@@ -1,14 +1,16 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Graph time of the FlyDSL DCP mailbox combine and query gather.
+"""Graph time of the FlyDSL DCP mailbox and optional vLLM baselines.
 
 Run on one node with 8 GPUs:
 
     WORLD=8 python3 op_tests/op_benchmarks/flydsl/bench_dcp_mailbox.py
+    VLLM_BASELINE=1 TOKENS=8,16 WORLD=8 python3 .../bench_dcp_mailbox.py
 """
 
 import os
+import statistics
 
 import torch
 import torch.distributed as dist
@@ -26,11 +28,26 @@ from aiter.ops.flydsl.dcp_mailbox import (
 class _Group:
     def __init__(self, cpu_group, rank, world):
         self.cpu_group = cpu_group
+        self.device_group = dist.group.WORLD
         self.rank_in_group = rank
         self.world_size = world
 
 
-def _graph_us(fn, reps=29, runs=2):
+def _standard_gather(query, world):
+    """Match GroupCoordinator's all-gather along the head dimension."""
+    shape = tuple(query.shape)
+    gathered = torch.empty(
+        (world * shape[0],) + shape[1:], dtype=query.dtype, device=query.device
+    )
+    dist.all_gather_into_tensor(gathered, query)
+    return (
+        gathered.reshape((world,) + shape)
+        .movedim(0, 1)
+        .reshape(shape[0], world * shape[1], shape[2])
+    )
+
+
+def _graph_us(fn, sync_group, reps=29, runs=10):
     s = torch.cuda.Stream()
     with torch.cuda.stream(s):
         for _ in range(3):
@@ -42,21 +59,23 @@ def _graph_us(fn, reps=29, runs=2):
             fn()
     torch.cuda.synchronize()
     # Every rank waits on its peers, so align the ranks before the timed replay.
-    dist.barrier()
-    g.replay()
-    torch.cuda.synchronize()
-    dist.barrier()
+    dist.barrier(group=sync_group)
     samples = []
     for _ in range(runs):
-        dist.barrier()
+        dist.barrier(group=sync_group)
         start, end = torch.cuda.Event(True), torch.cuda.Event(True)
         start.record()
         g.replay()
         end.record()
         end.synchronize()
         samples.append(start.elapsed_time(end) * 1000.0 / reps)
-        dist.barrier()
-    return sum(samples) / len(samples), max(samples) - min(samples)
+        dist.barrier(group=sync_group)
+    return statistics.median(samples), min(samples), max(samples)
+
+
+def _fmt(samples):
+    median, low, high = samples
+    return f"{median:.2f} [{low:.2f}, {high:.2f}]"
 
 
 def worker(rank, world):
@@ -66,69 +85,212 @@ def worker(rank, world):
     dist.init_process_group("nccl", rank=rank, world_size=world)
     group = _Group(dist.new_group(backend="gloo"), rank, world)
     try:
-        tokens, hl = int(os.environ.get("TOKENS", "16")), 12
-        max_tokens = max(tokens, 64)
-        for dim in (128, 512, 576):
-            cws = CombineWorkspace(group, torch.device("cuda"), hl, dim, max_tokens)
-            out = torch.randn(
-                tokens, world * hl, dim, device="cuda", dtype=torch.bfloat16
+        baseline = os.environ.get("VLLM_BASELINE") == "1"
+        if baseline:
+            from vllm.config import VllmConfig, set_current_vllm_config
+            from vllm.model_executor.layers.attention.mla_attention import (
+                _DecodeConcatQuantFP8,
             )
-            lse = torch.randn(tokens, world * hl, device="cuda", dtype=torch.float32)
-            combine_us, combine_spread = _graph_us(
-                lambda w=cws, o=out, s=lse: dcp_lse_combine(w, o, s, return_lse=True)
+            from vllm.model_executor.layers.quantization.utils.quant_utils import (
+                GroupShape,
+            )
+            from vllm.v1.attention.ops.dcp import dcp_a2a_lse_reduce
+
+            with set_current_vllm_config(VllmConfig()):
+                quant = _DecodeConcatQuantFP8(
+                    static=True,
+                    group_shape=GroupShape.PER_TENSOR,
+                    compile_native=True,
+                )
+
+        hl = 12
+        token_counts = [
+            int(value) for value in os.environ.get("TOKENS", "8,16").split(",")
+        ]
+        gen = torch.Generator(device="cuda")
+        gen.manual_seed(200 + rank)
+        for tokens in token_counts:
+            max_tokens = max(tokens, 64)
+            if baseline:
+                dim = 512
+                out = torch.randn(
+                    tokens,
+                    world * hl,
+                    dim,
+                    device="cuda",
+                    dtype=torch.bfloat16,
+                    generator=gen,
+                )
+                lse = torch.randn(
+                    tokens,
+                    world * hl,
+                    device="cuda",
+                    dtype=torch.float32,
+                    generator=gen,
+                )
+                combine = _graph_us(
+                    lambda out=out, lse=lse: dcp_a2a_lse_reduce(
+                        out, lse, group, return_lse=True
+                    ),
+                    group.cpu_group,
+                )
+                query = torch.randn(
+                    tokens,
+                    hl,
+                    dim,
+                    device="cuda",
+                    dtype=torch.bfloat16,
+                    generator=gen,
+                )
+                gather = _graph_us(
+                    lambda query=query: _standard_gather(query, world),
+                    group.cpu_group,
+                )
+                nope_dim, pe_dim = 512, 64
+                nope = torch.randn(
+                    tokens,
+                    hl,
+                    nope_dim,
+                    device="cuda",
+                    dtype=torch.bfloat16,
+                    generator=gen,
+                )
+                pe = torch.randn(
+                    tokens,
+                    hl,
+                    pe_dim,
+                    device="cuda",
+                    dtype=torch.bfloat16,
+                    generator=gen,
+                )
+                scale = torch.tensor([2.0], device="cuda", dtype=torch.float32)
+                quant_gather = _graph_us(
+                    lambda nope=nope, pe=pe, scale=scale: _standard_gather(
+                        quant(nope, pe, scale), world
+                    ),
+                    group.cpu_group,
+                )
+                if rank == 0:
+                    print(
+                        f"DCP_VLLM_BASELINE combine ranks={world} tokens={tokens} "
+                        f"heads={hl} dim={dim} a2a={_fmt(combine)} us",
+                        flush=True,
+                    )
+                    print(
+                        f"DCP_VLLM_BASELINE gather ranks={world} tokens={tokens} "
+                        f"heads={hl} dim={dim} all_gather={_fmt(gather)} us",
+                        flush=True,
+                    )
+                    print(
+                        f"DCP_VLLM_BASELINE quant_gather ranks={world} "
+                        f"tokens={tokens} heads={hl} dim={nope_dim + pe_dim} "
+                        f"quant_all_gather={_fmt(quant_gather)} us",
+                        flush=True,
+                    )
+                continue
+
+            for dim in (128, 512, 576):
+                cws = CombineWorkspace(group, torch.device("cuda"), hl, dim, max_tokens)
+                out = torch.randn(
+                    tokens,
+                    world * hl,
+                    dim,
+                    device="cuda",
+                    dtype=torch.bfloat16,
+                    generator=gen,
+                )
+                lse = torch.randn(
+                    tokens,
+                    world * hl,
+                    device="cuda",
+                    dtype=torch.float32,
+                    generator=gen,
+                )
+                combine = _graph_us(
+                    lambda w=cws, o=out, s=lse: dcp_lse_combine(
+                        w, o, s, return_lse=True
+                    ),
+                    group.cpu_group,
+                )
+                if rank == 0:
+                    print(
+                        f"DCP_MAILBOX_BENCH combine ranks={world} tokens={tokens} "
+                        f"heads={hl} dim={dim} mailbox={_fmt(combine)} us",
+                        flush=True,
+                    )
+                cws.close()
+
+            dim = 512
+            gws = GatherWorkspace(
+                group,
+                torch.device("cuda"),
+                hl,
+                dim,
+                torch.bfloat16,
+                world * hl,
+                max_tokens,
+            )
+            query = torch.randn(
+                tokens,
+                hl,
+                dim,
+                device="cuda",
+                dtype=torch.bfloat16,
+                generator=gen,
+            )
+            gather = _graph_us(
+                lambda gws=gws, query=query: dcp_query_gather(gws, query),
+                group.cpu_group,
             )
             if rank == 0:
                 print(
-                    f"DCP_MAILBOX_BENCH combine ranks={world} tokens={tokens} "
-                    f"heads={hl} dim={dim} mailbox={combine_us:.2f}±"
-                    f"{combine_spread:.2f} us",
+                    f"DCP_MAILBOX_BENCH gather ranks={world} tokens={tokens} "
+                    f"heads={hl} dim={dim} mailbox={_fmt(gather)} us",
                     flush=True,
                 )
-            cws.close()
-        dim = 512
-        gws = GatherWorkspace(
-            group,
-            torch.device("cuda"),
-            hl,
-            dim,
-            torch.bfloat16,
-            world * hl,
-            max_tokens,
-        )
-        query = torch.randn(tokens, hl, dim, device="cuda", dtype=torch.bfloat16)
-        gather_us, gather_spread = _graph_us(lambda: dcp_query_gather(gws, query))
-        if rank == 0:
-            print(
-                f"DCP_MAILBOX_BENCH gather ranks={world} tokens={tokens} "
-                f"heads={hl} dim={dim} mailbox={gather_us:.2f}±{gather_spread:.2f} us",
-                flush=True,
-            )
-        gws.close()
+            gws.close()
 
-        nope_dim, pe_dim = 512, 64
-        qws = GatherWorkspace(
-            group,
-            torch.device("cuda"),
-            hl,
-            nope_dim + pe_dim,
-            torch.float8_e4m3fn,
-            world * hl,
-            max_tokens,
-        )
-        nope = torch.randn(tokens, hl, nope_dim, device="cuda", dtype=torch.bfloat16)
-        pe = torch.randn(tokens, hl, pe_dim, device="cuda", dtype=torch.bfloat16)
-        scale = torch.tensor([2.0], device="cuda", dtype=torch.float32)
-        quant_us, quant_spread = _graph_us(
-            lambda: dcp_quant_query_gather(qws, nope, pe, scale)
-        )
-        if rank == 0:
-            print(
-                f"DCP_MAILBOX_BENCH quant_gather ranks={world} tokens={tokens} "
-                f"heads={hl} dim={nope_dim + pe_dim} mailbox={quant_us:.2f}±"
-                f"{quant_spread:.2f} us",
-                flush=True,
+            nope_dim, pe_dim = 512, 64
+            qws = GatherWorkspace(
+                group,
+                torch.device("cuda"),
+                hl,
+                nope_dim + pe_dim,
+                torch.float8_e4m3fn,
+                world * hl,
+                max_tokens,
             )
-        qws.close()
+            nope = torch.randn(
+                tokens,
+                hl,
+                nope_dim,
+                device="cuda",
+                dtype=torch.bfloat16,
+                generator=gen,
+            )
+            pe = torch.randn(
+                tokens,
+                hl,
+                pe_dim,
+                device="cuda",
+                dtype=torch.bfloat16,
+                generator=gen,
+            )
+            scale = torch.tensor([2.0], device="cuda", dtype=torch.float32)
+            quant_gather = _graph_us(
+                lambda qws=qws, nope=nope, pe=pe, scale=scale: (
+                    dcp_quant_query_gather(qws, nope, pe, scale)
+                ),
+                group.cpu_group,
+            )
+            if rank == 0:
+                print(
+                    f"DCP_MAILBOX_BENCH quant_gather ranks={world} tokens={tokens} "
+                    f"heads={hl} dim={nope_dim + pe_dim} "
+                    f"mailbox={_fmt(quant_gather)} us",
+                    flush=True,
+                )
+            qws.close()
     finally:
         dist.destroy_process_group()
 
