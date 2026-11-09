@@ -211,3 +211,18 @@ try:
 except (ImportError, AttributeError):
     # Iris or triton not available, skip import
     IRIS_COMM_AVAILABLE = False
+
+
+def __getattr__(name: str):
+    """Lazy public exports that must not run at ``import aiter`` time.
+
+    ``sp_qkv_fused`` is the neutral SP4 QKV op; importing
+    ``aiter.ops.gemm_fusion`` eagerly would pull the fusion framework (and its
+    JIT/profile machinery) into every aiter import, so resolve it on first
+    attribute access instead.
+    """
+    if name == "sp_qkv_fused":
+        from aiter.ops.gemm_fusion.sp_qkv.op import sp_qkv_fused
+
+        return sp_qkv_fused
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
