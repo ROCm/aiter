@@ -19,7 +19,7 @@ columns      = max(1, min(width * P, max_columns))        (width * P when max_co
 | field | contract |
 |---|---|
 | op name / version | `qsa_paged_mqa_logits`, `OP_CONTRACT_VERSION = 1` (`aiter.ops.qsa`). Backend-neutral; the backend is a dispatch decision (`explain(...).path` / `.vid`). |
-| public signature | `qsa_paged_mqa_logits(q, compressed_k_cache, page_table, token_to_request, query_positions, context_lens, compress_ratio=4, score_divisor=None, max_columns=None, row_starts=None, allow_flydsl=False, compressed_k_scale=None, stacked_decode=False, *, logits=None, visible_groups=None) -> tuple[Tensor, Tensor]`. The 12 leading parameters are the frozen ATOM scorer's (names, order, defaults); `stacked_decode` (13th positional) is main's Triton scheduling hint; `logits` / `visible_groups` are optional caller-owned output buffers (keyword-only). Existing 11-argument and keyword callers (`qsa_select_paged_tokens`, ...) are unchanged. |
+| public signature | `qsa_paged_mqa_logits(q, compressed_k_cache, page_table, token_to_request, query_positions, context_lens, compress_ratio=4, score_divisor=None, max_columns=None, row_starts=None, allow_flydsl=False, compressed_k_scale=None, stacked_decode=None, *, logits=None, visible_groups=None) -> tuple[Tensor, Tensor]`. The 12 leading parameters are the frozen ATOM scorer's (names, order, defaults); `stacked_decode` (13th positional) is main's Triton scheduling hint, default `None` = aiter decides (see "stacked decode" below; main's default was `False`); `logits` / `visible_groups` are optional caller-owned output buffers (keyword-only). Existing 11-argument and keyword callers (`qsa_select_paged_tokens`, ...) are unchanged. |
 | dtypes | `q` bf16 / fp16 / fp32; `compressed_k_cache` unquantized in q's dtype, FP8 E4M3 (`dtypes.fp8` of the arch) + `compressed_k_scale` fp32 `[pages, P, 1]`, or MXFP4 + E8M0 scale (Triton); metadata int32 / int64. |
 | shapes / layouts | `q [rows, heads, head_dim]`; cache `[pages, P, 1, head_dim]`; `page_table [requests, width]`; `token_to_request`, `query_positions [rows]`, `context_lens [requests]` 1-D contiguous. Fused path additionally: `heads = 4`, `head_dim = 128`, `P in {4, 8, 16}`, `ratio = 4`, `divisor = sqrt(128)`, contiguous 16-B aligned `q`, contiguous 128-B aligned cache, a profile row / rule / bucket covering (rows, requests, columns, width, P, dtype). |
 | outputs / mutation | returns `logits` fp32 `[rows, columns]` and `visible_groups` int32 `[rows]` (the caller's buffers when supplied, filled in place); `row_starts`, if given, is zero-filled. Inputs are never written; outputs must not alias inputs. |
@@ -38,6 +38,19 @@ columns      = max(1, min(width * P, max_columns))        (width * P when max_co
 | `native-triton` | aiter's existing dispatch (unchanged) | `native.triton.v1` / `native.flydsl_page16.v1` | GPU tensors the existing kernels take |
 | `native-torch` | `aiter/ops/qsa_index_scorer/native.py` (pure torch) | `native.torch.v1` | other valid calls (CPU, an fp8 dtype the arch's Triton does not use, ...) |
 | `invalid` | — (raises `ValueError`) | — | contract violation |
+
+**Stacked decode (`stacked_decode`).** A Triton scheduling hint; results agree within the
+tolerance either way. `None` (the default; ATOM passes only the 12 leading parameters) lets
+aiter decide: a call served by `native.triton.v1` asks Triton for main's stacked decode scorer
+(heads stacked into the MFMA M dimension, a request's keys read once per call) exactly when ATOM's
+own scorer stacks heads with `ATOM_QSA_STACKED_DECODE_SCORER` at its default (on): at most 256
+rows, `q`, cache and page table contiguous in their last dimension, power-of-two `heads`, and a
+power-of-two `head_dim >= 16`; Triton then also needs the arch's `stacked_decode` tile
+(gfx942 / gfx950 / gfx1250) and `BMT * heads >= 16`, as ATOM's scorer does, and otherwise scores
+the call unstacked. Explicit `True` / `False` are passed to Triton as given
+(`qsa_select_paged_tokens` keeps its own default `False` and passes it explicitly). The fused
+and native-torch paths ignore the hint. `explain(...).detail` of a `native.triton.v1` decision
+ends with the hint (`stacked_decode=auto:True`, `auto:False`, `True`, `False`).
 
 `Decision.reason` is `ok` for `fused`, otherwise why the fused path did not take the class
 (`disabled`, `kill_switch`, `profile_unusable`, `fused_launch_error`, or one of the profile reasons

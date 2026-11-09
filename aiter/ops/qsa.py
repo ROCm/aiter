@@ -9,6 +9,7 @@ modules directly.
 """
 
 from collections.abc import Sequence
+from dataclasses import replace as _dc_replace
 
 import torch
 
@@ -79,6 +80,30 @@ def _on_gpu(t) -> bool:
     return t.is_cuda
 
 
+#: Row limit of the stacked Triton decode scorer (the Triton wrapper's own limit).
+STACKED_DECODE_MAX_ROWS = 256
+
+
+def _stacked_decode_auto(q, compressed_k_cache, page_table) -> bool:
+    """``stacked_decode=None`` (the default): aiter decides. True for the calls ATOM's
+    own scorer stacks heads for (``ATOM_QSA_STACKED_DECODE_SCORER``, on by default):
+    at most 256 rows, rows contiguous in the head dim (q, cache, page table), a
+    power-of-two head count and a power-of-two ``head_dim >= 16``. The Triton wrapper
+    then also needs the arch's ``stacked_decode`` tile (gfx942 / gfx950 / gfx1250 have
+    one) and ``BMT * heads >= 16``, as ATOM's scorer does; otherwise it scores the call
+    as with ``stacked_decode=False``."""
+    heads, head_dim = q.shape[1], q.shape[2]
+    return (
+        q.shape[0] <= STACKED_DECODE_MAX_ROWS
+        and q.stride(2) == 1
+        and compressed_k_cache.stride(3) == 1
+        and page_table.stride(1) == 1
+        and heads & (heads - 1) == 0
+        and head_dim & (head_dim - 1) == 0
+        and head_dim >= 16
+    )
+
+
 def _existing_route(
     q, compressed_k_cache, page_table, allow_flydsl, compressed_k_scale
 ):
@@ -119,13 +144,15 @@ def _existing_native(
     row_starts=None,
     allow_flydsl=False,
     compressed_k_scale=None,
-    stacked_decode=False,
+    stacked_decode=None,
     logits=None,
     visible_groups=None,
 ):
     """aiter's native dispatch as before the fused path: the FlyDSL page-16 prefill
     scorer for large ``allow_flydsl`` batches, otherwise Triton (bf16/fp16/fp32, fp8 +
-    fp32 scale, MXFP4). Caller-supplied ``logits`` / ``visible_groups`` are filled."""
+    fp32 scale, MXFP4). ``stacked_decode=None`` resolves with
+    :func:`_stacked_decode_auto`; True / False are passed to Triton as given.
+    Caller-supplied ``logits`` / ``visible_groups`` are filled."""
     if (
         allow_flydsl
         and _HAS_FLYDSL
@@ -161,6 +188,8 @@ def _existing_native(
             row_starts,
         )
         return logits, visible_groups
+    if stacked_decode is None:
+        stacked_decode = _stacked_decode_auto(q, compressed_k_cache, page_table)
     out_logits, out_visible = _triton_qsa_paged_mqa_logits(
         q,
         compressed_k_cache,
@@ -198,7 +227,7 @@ def qsa_paged_mqa_logits(
     row_starts: torch.Tensor | None = None,
     allow_flydsl: bool = False,
     compressed_k_scale: torch.Tensor | None = None,
-    stacked_decode: bool = False,
+    stacked_decode: bool | None = None,
     *,
     logits: torch.Tensor | None = None,
     visible_groups: torch.Tensor | None = None,
@@ -215,8 +244,12 @@ def qsa_paged_mqa_logits(
     page_size, max_columns))``; ``visible = clamp(min((pos + 1) // ratio, ctx //
     ratio), 0)``; ``logits[t, c] = sum_h relu(q[t, h] . k[c]) / divisor`` for ``c <
     visible`` on a valid page, else ``-inf``; ``row_starts`` (if given) zero-filled.
-    The 12 leading parameters are the frozen ATOM scorer's; ``stacked_decode`` is a
-    Triton scheduling hint; ``logits`` / ``visible_groups`` are optional output buffers.
+    The 12 leading parameters are the frozen ATOM scorer's; ``logits`` /
+    ``visible_groups`` are optional output buffers. ``stacked_decode`` is a Triton
+    scheduling hint (results agree within tolerance either way): ``None`` (default)
+    lets aiter decide -- decode-sized calls (<= 256 rows, contiguous, power-of-two
+    heads / head_dim) take the stacked decode scorer, as ATOM's own scorer does by
+    default; ``True`` / ``False`` are honoured as given.
 
     Implementation (a dispatch decision, per call class, decided once on the host):
     the fused FlyDSL gfx1250 kernels when a profile is active (:func:`configure`,
@@ -319,14 +352,18 @@ def explain(
     row_starts=None,
     allow_flydsl=False,
     compressed_k_scale=None,
-    stacked_decode=False,
+    stacked_decode=None,
     *,
     logits=None,
     visible_groups=None,
 ) -> Decision:
     """``Decision(path, reason, vid, ...)`` for this call's class without running it
     (``path`` in ``fused`` / ``native-triton`` / ``native-torch``; ``invalid`` for a
-    contract violation). Decides and caches the class like the first call would."""
+    contract violation). Decides and caches the class like the first call would. A
+    ``native.triton.v1`` decision's ``detail`` ends with the ``stacked_decode`` hint
+    passed to Triton (``stacked_decode=auto:True`` / ``auto:False`` / ``True`` /
+    ``False``)."""
+    d = None
     if _D._ACTIVE is None and isinstance(q, torch.Tensor):
         try:
             vid = _existing_route(
@@ -336,26 +373,45 @@ def explain(
             vid = None
         if vid is not None:
             reason = "kill_switch" if _D._ORIGIN.startswith("kill") else "disabled"
-            return Decision(_D.PATH_NATIVE_TRITON, reason, vid, _D._ORIGIN)
-    return _D.explain(
-        _existing_native,
-        _existing_route,
-        q,
-        compressed_k_cache,
-        page_table,
-        token_to_request,
-        query_positions,
-        context_lens,
-        compress_ratio,
-        score_divisor,
-        max_columns,
-        row_starts,
-        allow_flydsl,
-        compressed_k_scale,
-        stacked_decode,
-        logits,
-        visible_groups,
-    )
+            d = Decision(_D.PATH_NATIVE_TRITON, reason, vid, _D._ORIGIN)
+    if d is None:
+        d = _explain_decide(
+            q,
+            compressed_k_cache,
+            page_table,
+            token_to_request,
+            query_positions,
+            context_lens,
+            compress_ratio,
+            score_divisor,
+            max_columns,
+            row_starts,
+            allow_flydsl,
+            compressed_k_scale,
+            stacked_decode,
+            logits,
+            visible_groups,
+        )
+    if d.path == _D.PATH_NATIVE_TRITON and d.vid == _D.VID_TRITON:
+        if stacked_decode is None:
+            try:
+                auto = _stacked_decode_auto(q, compressed_k_cache, page_table)
+                hint = f"auto:{auto}"
+            except Exception:  # noqa: BLE001
+                hint = "auto:?"
+        else:
+            hint = str(bool(stacked_decode))
+        detail = (
+            f"{d.detail}; stacked_decode={hint}"
+            if d.detail
+            else f"stacked_decode={hint}"
+        )
+        d = _dc_replace(d, detail=detail)
+    return d
+
+
+def _explain_decide(*args) -> Decision:
+    return _D.explain(_existing_native, _existing_route, *args)
 
 
 def status() -> dict:

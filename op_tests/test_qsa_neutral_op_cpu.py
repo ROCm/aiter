@@ -162,8 +162,9 @@ def load_qsa(plugin=None):
 
 Q, TRI = load_qsa()
 ATOM12 = API.ATOM_SCORER_SIGNATURE
-#: aiter main a0c4b69c ``aiter.ops.qsa.qsa_paged_mqa_logits`` (13 positional parameters)
-MAIN13 = (*ATOM12, ("stacked_decode", False))
+#: aiter main a0c4b69c ``aiter.ops.qsa.qsa_paged_mqa_logits`` (13 positional parameters);
+#: ``stacked_decode`` now defaults to None = aiter decides (main: False; see StackedAuto)
+MAIN13 = (*ATOM12, ("stacked_decode", None))
 
 
 def _clean_env(**extra):
@@ -352,6 +353,77 @@ class DefaultOff(_Base):
             Q.qsa_paged_mqa_logits(*a)
 
 
+class StackedAuto(_Base):
+    """``stacked_decode=None`` (the default; ATOM passes only the 12 leading
+    parameters): aiter asks Triton for main's stacked decode scorer on the calls ATOM's
+    own scorer stacks heads for (``ATOM_QSA_STACKED_DECODE_SCORER``, on by default):
+    rows <= 256, contiguous rows, power-of-two heads and head_dim >= 16 (Triton then
+    applies the arch tile and ``BMT * heads >= 16``). Explicit True / False pass
+    through unchanged; ``qsa_select_paged_tokens`` keeps passing its own False."""
+
+    gpu = True
+
+    def _hint(self, a, *extra, **kw):
+        TRI.calls.clear()
+        out = Q.qsa_paged_mqa_logits(*a, *extra, **kw)
+        nat.assert_matches(self, out, nat.reference(*a[:6], scale=a[11]))
+        self.assertEqual(len(TRI.calls), 1, TRI.calls)
+        return TRI.calls[0]["stacked_decode"]
+
+    def test_default_is_auto_and_explicit_values_pass_through(self):
+        for fmt in ("bf16", "fp8"):
+            a = nat.make_call(rows=12, requests=3, width=5, fmt=fmt, seed=21)
+            self.assertIs(self._hint(a), True, fmt)  # ATOM's 12 positional args
+            self.assertIs(self._hint(a, None), True, fmt)
+            self.assertIs(self._hint(a, True), True, fmt)
+            self.assertIs(self._hint(a, False), False, fmt)
+            self.assertIs(self._hint(a, stacked_decode=False), False, fmt)
+        b = nat.make_call(rows=12, requests=3, width=5, seed=21)
+        for n in (11, 6):  # main's 11-argument calls; tensors only
+            TRI.calls.clear()
+            out = Q.qsa_paged_mqa_logits(*b[:n])
+            nat.assert_matches(self, out, nat.reference(*b[:6]), n)
+            self.assertEqual(TRI.calls, [{"rows": 12, "stacked_decode": True}], n)
+
+    def test_auto_predicate_is_atoms(self):
+        def case(**kw):
+            return nat.make_call(requests=3, width=5, seed=22, **kw)
+
+        a = case(rows=256)
+        self.assertIs(self._hint(a), True, "256 rows")
+        self.assertIs(self._hint(case(rows=257)), False, "257 rows")
+        self.assertIs(self._hint(case(rows=257), True), True, "explicit")
+        self.assertIs(self._hint(case(rows=8, heads=3)), False, "heads 3")
+        self.assertIs(self._hint(case(rows=8, heads=2)), True, "heads 2 (Triton: M)")
+        self.assertIs(self._hint(case(rows=8, dim=48)), False, "head_dim 48")
+        self.assertIs(self._hint(case(rows=8, dim=8)), False, "head_dim 8")
+        self.assertIs(self._hint(case(rows=8, dim=64)), True, "head_dim 64")
+        b = case(rows=8)
+        q = torch.empty(8, 4, 256, dtype=b[0].dtype)[..., ::2]
+        q.copy_(b[0])
+        b[0] = q  # q.stride(2) == 2
+        self.assertIs(self._hint(b), False, "strided q")
+        b = case(rows=8)
+        b[2] = b[2].t().contiguous().t()  # page_table.stride(1) != 1
+        self.assertIs(self._hint(b), False, "strided page table")
+
+    def test_explain_names_the_hint(self):
+        a = nat.make_call(rows=12, requests=3, width=5, seed=23)
+        self.assertTrue(Q.explain(*a).detail.endswith("stacked_decode=auto:True"))
+        self.assertTrue(
+            Q.explain(*a, stacked_decode=False).detail.endswith("stacked_decode=False")
+        )
+        b = nat.make_call(rows=300, requests=3, width=5, seed=23)
+        self.assertTrue(Q.explain(*b).detail.endswith("stacked_decode=auto:False"))
+        self.gpu = False  # native-torch: no Triton hint
+        self.assertNotIn("stacked_decode", Q.explain(*a).detail)
+
+    def test_select_paged_tokens_keeps_its_explicit_false(self):
+        a = nat.make_call(rows=12, requests=3, width=5, seed=24)
+        Q.qsa_select_paged_tokens(*a[:6], 8, 4)
+        self.assertEqual([c["stacked_decode"] for c in TRI.calls], [False])
+
+
 class Decisions(base.Env):
     """Profile configured; kernel injected; device faked as gfx1250 / 256 CUs."""
 
@@ -460,6 +532,26 @@ class Decisions(base.Env):
                 API, "launch", side_effect=RuntimeError("x")
             ), self.assertRaises(RuntimeError):
                 Q.qsa_paged_mqa_logits(*a)
+
+    def test_uncovered_decode_class_takes_stacked_triton(self):
+        """A decode class the profile does not cover runs main's stacked Triton
+        decode scorer without the caller passing ``stacked_decode``."""
+        for page in (4, 16):
+            for fmt in ("bf16", "fp8"):
+                a = self._call(page, fmt, rows=64, requests=16)
+                a[7] = 8.0  # divisor the golden does not cover
+                TRI.calls.clear()
+                d = Q.explain(*a)
+                self.assertEqual(
+                    (d.path, d.reason, d.vid),
+                    (D.PATH_NATIVE_TRITON, "divisor_uncovered", D.VID_TRITON),
+                )
+                self.assertTrue(d.detail.endswith("stacked_decode=auto:True"), d)
+                Q.qsa_paged_mqa_logits(*a)
+                Q.qsa_paged_mqa_logits(*a, False)
+                self.assertEqual(
+                    [c["stacked_decode"] for c in TRI.calls], [True, False], (page, fmt)
+                )
 
     def test_allow_flydsl_page16_route_is_existing_native(self):
         a = base.call_args(rows=512, requests=1, width=16, columns=4096, page=16)
