@@ -17,6 +17,8 @@ from aiter.jit.utils.chip_info import get_lds_capacity_bytes
 from aiter.ops.flydsl.kernels.gemm_common_gfx1250 import (
     make_lds_copy_ops,
     pipeline_fence,
+    pipeline_fence_signal,
+    pipeline_fence_wait,
     workgroup_barrier,
 )
 from aiter.ops.flydsl.kernels.gfx1250_cluster import compute_mcast_masks
@@ -71,6 +73,7 @@ def launch_gemm_a8w8(
     k_tail: Constexpr[bool] = False,
     arg_scale_out: fx.Pointer = _NULL_SCALE_PTR,
     fuse_quant_out: Constexpr[bool] = False,
+    pipelined: Constexpr[int] = -1,
 ):
     # fuse_quant_out: the bf16 C tile is group-32 MXFP8-quantized in the
     # epilogue instead of written as bf16. arg_c carries the e4m3 [M,B,N]
@@ -145,6 +148,21 @@ def launch_gemm_a8w8(
             f"cluster={cluster_m}x{cluster_n}"
         )
     use_cluster = cluster_m > 1 or cluster_n > 1
+    # pipelined: software-pipelined K loop (LDS reads of the next k-step and
+    # the TDM refill overlap this k-step's WMMAs, across K-tiles too).  It
+    # needs mxfp8_32, no scale preload, no cluster, split_k 1, at least two
+    # 128-deep k-steps per K-tile, and K-tiles >= num_buffers (both runners
+    # check that).  -1 picks it whenever that holds and the two fragment
+    # sets it keeps in flight are small; 1 asks for it (an error if it does
+    # not apply), 0 keeps the single-fence loop.
+    pipe_ok = (
+        mx32 and not preload and not use_cluster and split_k == 1 and tile_k >= 256
+    )
+    if pipelined == 1 and not pipe_ok:
+        raise ValueError(
+            "[FlyDSL gfx1250] the pipelined K loop needs mxfp8_32, no scale "
+            "preload, no cluster, split_k 1 and tile_k >= 256"
+        )
     WMMA_M = WMMA_N = 16
     WMMA_K = 128
     WAVE = 32
@@ -159,6 +177,12 @@ def launch_gemm_a8w8(
     sb_loads = wmma_n_rep // 2 if sb_opsel else wmma_n_rep
     n_acc = wmma_m_rep * wmma_n_rep
     num_waves = m_warp * n_warp
+    if pipelined == -1:
+        # Accumulators plus two in-flight fragment sets, in VGPRs per lane.
+        pipelined = int(
+            pipe_ok and n_acc * 8 + 2 * (wmma_m_rep + wmma_n_rep) * 16 <= 512
+        )
+    pipelined = bool(pipelined)
     block = num_waves * WAVE
 
     LDS_PAD_A = 16
@@ -239,6 +263,7 @@ def launch_gemm_a8w8(
         + ("_aspre" if a_scale_preshuffled else "")
         + ("_bs32x32" if b_scale_32x32 else "")
         + ("_ktail" if k_tail else "")
+        + ("_pl" if pipelined else "")
     )
 
     @flyc.kernel(name=kernel_name, known_block_size=[block, 1, 1])
@@ -930,27 +955,233 @@ def launch_gemm_a8w8(
             preload_scales()
         if const_expr(use_cluster):
             cluster.cluster_barrier()
-        for i in range_constexpr(num_buffers - 1):
+        for i in range_constexpr(num_buffers if pipelined else num_buffers - 1):
             issue(i, i)
-        n_steady = K_TILES - (num_buffers - 1)
-        for kt in range(n_steady):
-            s = kt % num_buffers
-            pbuf = _buf_ptr(s)
-            buf = _bidx(pbuf)
-            pipeline_fence(outstanding=(num_buffers - 2), use_cluster=False)
-            compute_ktile(buf, _scale_buf(pbuf, kt), kt + (num_buffers - 1))
-            if const_expr(use_cluster) and kt % num_buffers == num_buffers - 1:
-                cluster.cluster_barrier()
         scale_regs = None
-        for j in range_constexpr(num_buffers - 1):
-            kt = n_steady + j
-            s = kt % num_buffers
-            pbuf = _buf_ptr(s)
-            buf = _bidx(pbuf)
-            pipeline_fence(outstanding=(num_buffers - 2 - j), use_cluster=False)
-            if const_expr(not is_mxscale and j == num_buffers - 2):
-                scale_regs = issue_ptpc_scale_loads()
-            compute_ktile(buf, _scale_buf(pbuf, kt), None)
+        if const_expr(not pipelined):
+            n_steady = K_TILES - (num_buffers - 1)
+            for kt in range(n_steady):
+                s = kt % num_buffers
+                pbuf = _buf_ptr(s)
+                buf = _bidx(pbuf)
+                pipeline_fence(outstanding=(num_buffers - 2), use_cluster=False)
+                compute_ktile(buf, _scale_buf(pbuf, kt), kt + (num_buffers - 1))
+                if const_expr(use_cluster) and kt % num_buffers == num_buffers - 1:
+                    cluster.cluster_barrier()
+            for j in range_constexpr(num_buffers - 1):
+                kt = n_steady + j
+                s = kt % num_buffers
+                pbuf = _buf_ptr(s)
+                buf = _bidx(pbuf)
+                pipeline_fence(outstanding=(num_buffers - 2 - j), use_cluster=False)
+                if const_expr(not is_mxscale and j == num_buffers - 2):
+                    scale_regs = issue_ptpc_scale_loads()
+                compute_ktile(buf, _scale_buf(pbuf, kt), None)
+        else:
+            # Software-pipelined K loop. The fragments of k-step g+1 are read
+            # from LDS while the WMMAs of k-step g run, across K-tile
+            # boundaries too, so LDS reads, WMMAs and the TDM refill overlap.
+            # The fence before tile kt+1 is split: a wave signals once it has
+            # drained its LDS reads of tile kt and its own TDM of tile kt+1 has
+            # landed, issues half of the last k-step's WMMAs, then waits, reads
+            # the first fragments of tile kt+1, refills the stage tile kt held
+            # with tile kt+num_buffers and issues the other half. Every
+            # accumulator still sees its k-steps in the same order with the
+            # same operands, so the result is bit-identical to the loop above.
+            _MMA_ORDER = [
+                (wm, (wmma_n_rep - 1 - wn) if (wm % 2 == 1) else wn)
+                for wm in range(wmma_m_rep)
+                for wn in range(wmma_n_rep)
+            ]
+            N_MMA = len(_MMA_ORDER)
+            _HALF = N_MMA // 2
+            _NLD = wmma_m_rep * DS_A + wmma_n_rep * DS_B + sa_loads + sb_loads
+            # Per-stage LDS read bases are formed a whole tile ahead: VALU
+            # address math right before the boundary reads would make them
+            # wait for every WMMA still in flight.
+            early = (
+                not a_preshuffle and not a_scale_preshuffled and warp_tile_n % 32 == 0
+            )
+            if const_expr(early):
+                _a_lane = fx.Int32((wmb + lane16) * A_LDS_ROW + kgrp * 16)
+                _b_lane = fx.Int32(
+                    STAGE_A + (wnb // 16) * B_LDS_ROW + kgrp * 256 + lane16 * 16
+                )
+                _sa_lane = fx.Int32(
+                    SA_OFF
+                    + (wmb + (lane if sa_opsel else lane16)) * (tile_k // 128) * 4
+                )
+                if const_expr(b_scale_32x32):
+                    _sb_lane = fx.Int32(SB_OFF + (wnb // 32) * (tile_k // 128) * 4)
+                else:
+                    _sb_lane = fx.Int32(SB_OFF + ((wnb // 32) * SC_WORDS + lane16) * 4)
+
+            def _bases(stage_idx):
+                b = fx.Int32(stage_idx)
+                return [b + _a_lane, b + _b_lane, b + _sa_lane, b + _sb_lane]
+
+            def _join4(v):
+                v01 = v[0].shuffle(v[1], list(range(8)))
+                v23 = v[2].shuffle(v[3], list(range(8)))
+                return v01.shuffle(v23, list(range(16)))
+
+            def _ld_a(buf, wm, ks):
+                if const_expr(not early):
+                    return load_a(buf, wm, ks)
+                c0 = wm * 16 * A_LDS_ROW + ks * WMMA_K
+                return _join4(
+                    [
+                        Vec(lds_load_b128(buf[0], c0 + 32 * j))
+                        for j in range_constexpr(4)
+                    ]
+                )
+
+            def _ld_b(buf, wn, ks):
+                if const_expr(not early):
+                    return load_b(buf, wn, ks)
+                c0 = wn * B_LDS_ROW + ks * 2048
+                return _join4(
+                    [
+                        Vec(lds_load_b128(buf[1], c0 + 512 * j))
+                        for j in range_constexpr(4)
+                    ]
+                )
+
+            def _ld_sa(buf, wm, ks):
+                if const_expr(not early):
+                    return load_sa(buf, buf, wm, ks)
+                rows = wm * 32 if sa_opsel else wm * 16
+                return lds_load_b32(buf[2], (rows * (tile_k // 128) + ks) * 4)[0]
+
+            def _ld_sb(buf, wn, ks):
+                if const_expr(not early):
+                    return load_sb(buf, buf, wn, ks)
+                if const_expr(b_scale_32x32):
+                    c = ((wn // 2) * (tile_k // 128) + ks) * 4
+                else:
+                    c = ((wn // 2) * SC_WORDS + ks * 32 + (wn % 2) * 16) * 4
+                return lds_load_b32(buf[3], c)[0]
+
+            def _load_frags(buf, ks):
+                sb_k = [_ld_sb(buf, wn, ks) for wn in range_constexpr(sb_loads)]
+                sa_k = [_ld_sa(buf, wm, ks) for wm in range_constexpr(sa_loads)]
+                wt = [
+                    _rmem(16, _ld_b(buf, wn, ks)) for wn in range_constexpr(wmma_n_rep)
+                ]
+                act = [
+                    _rmem(16, _ld_a(buf, wm, ks)) for wm in range_constexpr(wmma_m_rep)
+                ]
+                return wt, act, sa_k, sb_k
+
+            def _mmas(fr, lo, hi):
+                wt, act, sa_k, sb_k = fr
+                for q in range_constexpr(lo, hi):
+                    wm, wn = _MMA_ORDER[q]
+                    _mma(
+                        wm * wmma_n_rep + wn,
+                        wm,
+                        wn,
+                        wt[wn],
+                        act[wm],
+                        sa_k[wm // 2 if sa_opsel else wm],
+                        sb_k[wn // 2 if sb_opsel else wn],
+                    )
+
+            # First k-step fragments of the current tile, carried across the
+            # tile loop (and its LDS read bases when formed early).
+            car_wt = [
+                fx.make_rmem_tensor(16, fx.Int32) for _ in range_constexpr(wmma_n_rep)
+            ]
+            car_act = [
+                fx.make_rmem_tensor(16, fx.Int32) for _ in range_constexpr(wmma_m_rep)
+            ]
+            car_sa = fx.make_rmem_tensor(sa_loads, fx.Int32)
+            car_sb = fx.make_rmem_tensor(sb_loads, fx.Int32)
+            car_base = fx.make_rmem_tensor(4, fx.Int32) if const_expr(early) else None
+
+            def _put(fr):
+                wt, act, sa_k, sb_k = fr
+                for i in range_constexpr(wmma_n_rep):
+                    car_wt[i].store(wt[i].load())
+                for i in range_constexpr(wmma_m_rep):
+                    car_act[i].store(act[i].load())
+                car_sa.store(Vec.from_elements(list(sa_k)))
+                car_sb.store(Vec.from_elements(list(sb_k)))
+
+            def _get():
+                va, vb = car_sa.load(), car_sb.load()
+                return (
+                    [_rmem(16, car_wt[i].load()) for i in range_constexpr(wmma_n_rep)],
+                    [_rmem(16, car_act[i].load()) for i in range_constexpr(wmma_m_rep)],
+                    [va[i] for i in range_constexpr(sa_loads)],
+                    [vb[i] for i in range_constexpr(sb_loads)],
+                )
+
+            def _stage_bases(kt):
+                if const_expr(early):
+                    return _bases(_bidx(_buf_ptr(kt % num_buffers)))
+                return _bidx(_buf_ptr(kt % num_buffers))
+
+            def tile(kt, wait_cnt, refill, last):
+                if const_expr(early):
+                    cbv = car_base.load()
+                    buf = [cbv[i] for i in range_constexpr(4)]
+                else:
+                    buf = _stage_bases(kt)
+                if const_expr(not last):
+                    nbuf = _stage_bases(kt + 1)
+                cur = _get()
+                for ks in range_constexpr(K_WS):
+                    rocdl.sched_barrier(0)
+                    if const_expr(ks + 1 < K_WS):
+                        nxt = _load_frags(buf, ks + 1)
+                        rocdl.s_wait_dscnt(_NLD)
+                        rocdl.sched_barrier(0)
+                        _mmas(cur, 0, N_MMA)
+                        cur = nxt
+                    else:
+                        rocdl.s_wait_dscnt(0)
+                        rocdl.sched_barrier(0)
+                        if const_expr(not last):
+                            pipeline_fence_signal(
+                                outstanding=wait_cnt, use_cluster=False
+                            )
+                            rocdl.sched_barrier(0)
+                            _mmas(cur, 0, _HALF)
+                            rocdl.sched_barrier(0)
+                            pipeline_fence_wait(use_cluster=False)
+                            if const_expr(refill):
+                                issue(kt % num_buffers, kt + num_buffers)
+                            nxt = _load_frags(nbuf, 0)
+                            rocdl.sched_barrier(0)
+                            _mmas(cur, _HALF, N_MMA)
+                            _put(nxt)
+                            if const_expr(early):
+                                car_base.store(Vec.from_elements(nbuf))
+                        else:
+                            _mmas(cur, 0, N_MMA)
+                rocdl.sched_barrier(0)
+
+            # All num_buffers stages are in flight; tile 0 lands first.
+            rocdl.s_wait_tensorcnt(num_buffers - 1)
+            workgroup_barrier(use_cluster=False)
+            buf0 = _stage_bases(0)
+            if const_expr(early):
+                car_base.store(Vec.from_elements(buf0))
+            _put(_load_frags(buf0, 0))
+            # Tile kt refills its stage with tile kt + num_buffers; the last
+            # num_buffers tiles have nothing left to load, so their fences wait
+            # for fewer outstanding TDM tiles.
+            n_steady = K_TILES - num_buffers
+            for kt in range(n_steady):
+                tile(kt, num_buffers - 2, True, False)
+            for j in range_constexpr(num_buffers):
+                tile(
+                    n_steady + j,
+                    max(num_buffers - 2 - j, 0),
+                    False,
+                    j == num_buffers - 1,
+                )
 
         accs = None
         if const_expr(is_mxscale):
