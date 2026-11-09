@@ -9,12 +9,18 @@ import pytest
 import torch
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
-from aiter.ops.flydsl.grouped_moe_gfx1250 import (
-    _get_compiled_route_psum_herd,
-    herd_route_psum_remap,
+from aiter.ops.flydsl.herd_topk import (
+    _run_finalize,
+    herd_finalize_candidates,
+    herd_route_psum,
+    herd_topk_candidates,
 )
-from aiter.ops.flydsl.herd_topk import herd_finalize_candidates, herd_topk_candidates
 from aiter.ops.flydsl.kernels.herd_topk import build_herd_finalize_module
+from aiter.ops.flydsl.kernels.moe_herd_route_psum import (
+    HERD_ROUTE_BLOCK,
+    build_herd_route_psum_module,
+)
+from aiter.ops.flydsl.kernels.tensor_shim import wave_size_of
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="requires an AMD GPU"
@@ -35,13 +41,14 @@ def _reference(ids, values, experts, scale):
     return kept, weights * scale
 
 
-def _candidates(tokens, experts, topk, softmax=False):
+def _candidates(tokens, experts, topk, softmax=False, hot=False):
     generator = torch.Generator(device="cuda").manual_seed(1250 + tokens)
-    ids = (
-        torch.rand(tokens, experts, device="cuda", generator=generator)
-        .topk(topk + 1, dim=1)
-        .indices.int()
-    )
+    scores = torch.rand(tokens, experts, device="cuda", generator=generator)
+    if hot:
+        # Every row holds the same K+1 experts, in its own order: they tie on
+        # popularity and each takes up to one route per row.
+        scores[:, : topk + 1] += 1
+    ids = scores.topk(topk + 1, dim=1).indices.int()
     # Tied weights exercise the expert-ID tiebreak.
     values = torch.randint(1, 5, ids.shape, device="cuda", generator=generator).float()
     return ids, values.softmax(1) if softmax else values
@@ -119,34 +126,6 @@ def test_route_skips_unrouted_pad_rows(valid):
     assert rows[:valid].unique().numel() == valid * topk
 
 
-@pytest.mark.parametrize("experts,topk", [(128, 4), (256, 6), (512, 16)])
-def test_grouped_route_psum_reuses_kernel_across_batches(experts, topk):
-    if get_gfx_runtime() not in ("gfx950", "gfx1250"):
-        pytest.skip("requires gfx950 or gfx1250")
-    launch = _get_compiled_route_psum_herd(topk, False)
-    cache_keys = None
-    for tokens in (1, 16, 32, 64, 128):
-        ids, values = _candidates(tokens, experts, topk)
-        kept, weights = _reference(ids, values, experts, 2.5)
-        counts, rows, psum, gather_weights = herd_route_psum_remap(
-            ids, values, experts, tokens, 32, 2.5
-        )
-        hist = torch.bincount(kept.flatten().long(), minlength=experts)
-        padded = (hist + 31) // 32 * 32
-        starts = padded.cumsum(0) - padded
-        torch.testing.assert_close(counts.long(), hist, rtol=0, atol=0)
-        torch.testing.assert_close(psum.long(), starts + hist, rtol=0, atol=0)
-        torch.testing.assert_close(gather_weights, weights, rtol=2e-5, atol=1e-6)
-        lower = starts[kept.long()]
-        assert ((rows >= lower) & (rows < lower + hist[kept.long()])).all()
-        assert rows.unique().numel() == tokens * topk
-        assert _get_compiled_route_psum_herd(topk, False) is launch
-        if cache_keys is None:
-            cache_keys = tuple(launch._mem_cache)
-            assert len(cache_keys) == 1
-        assert tuple(launch._mem_cache) == cache_keys
-
-
 def _pad_candidates(ids, values, count, unrouted):
     """The candidates as a router under num_valid_rows leaves them: rows past
     `count` routed to -1 with weight 0, or left as they are."""
@@ -157,23 +136,119 @@ def _pad_candidates(ids, values, count, unrouted):
     return ids, values
 
 
-@pytest.mark.parametrize("experts,topk", [(128, 4), (256, 6)])
-@pytest.mark.parametrize("unrouted", [True, False])
-def test_grouped_route_psum_skips_pad_rows(experts, topk, unrouted):
-    """Rows past num_valid_rows stay out of the popularity and take no grouped
-    row whatever their candidates hold; the count is read on device."""
-    if get_gfx_runtime() not in ("gfx950", "gfx1250"):
-        pytest.skip("requires gfx950 or gfx1250")
+def _finalize(ids, values, experts, count):
+    """The HERD finalize at up to 1024 rows, rows past `count` as padding.
+    herd_finalize_candidates covers only 256 rows at 512 experts or fewer."""
+    rows, kp1 = ids.shape
+    weights = torch.empty(rows, kp1 - 1, device="cuda", dtype=torch.float32)
+    kept = torch.empty_like(weights, dtype=torch.int32)
+    valid = torch.tensor([count], device="cuda", dtype=torch.int32)
+    _run_finalize(
+        ids,
+        values,
+        weights,
+        kept,
+        rows,
+        experts,
+        kp1 - 1,
+        True,
+        2.5,
+        False,
+        HERD_ROUTE_BLOCK,
+        torch.cuda.current_stream(),
+        num_valid_rows=valid,
+    )
+    return weights, kept
+
+
+def _check_route_psum(outputs, ids, values, experts, tile_m, count):
+    """herd_route_psum over the first `count` rows of candidates: the HERD
+    finalize's routes and weights bit for bit, laid out in tile-aligned expert
+    bands that the kept routes fill once each. The other rows are padding."""
     from aiter.ops.flydsl.kernels.moe_route_maps import DROPPED_ROUTE_ROW
 
-    tokens = 64
+    weights, kept, counts, rows, psum = outputs
+    topk = kept.shape[1]
+    finalized_weights, finalized = _finalize(ids, values, experts, count)
+    torch.testing.assert_close(kept, finalized, rtol=0, atol=0)
+    torch.testing.assert_close(weights, finalized_weights, rtol=0, atol=0)
+    if count:
+        expected, expected_weights = _reference(
+            ids[:count], values[:count], experts, 2.5
+        )
+    else:
+        expected = ids.new_empty(0, topk)
+        expected_weights = values.new_empty(0, topk)
+    torch.testing.assert_close(kept[:count], expected, rtol=0, atol=0)
+    torch.testing.assert_close(weights[:count], expected_weights, rtol=2e-5, atol=1e-6)
+    hist = torch.bincount(expected.flatten().long(), minlength=experts)
+    padded = (hist + tile_m - 1) // tile_m * tile_m
+    starts = padded.cumsum(0) - padded
+    torch.testing.assert_close(counts.long(), hist, rtol=0, atol=0)
+    torch.testing.assert_close(psum.long(), starts + hist, rtol=0, atol=0)
+    # Slots within an expert follow atomic order: check the bands, not the rows.
+    expert, row = expected.long(), rows[:count].long()
+    offset = row - starts[expert]
+    assert ((offset >= 0) & (offset < hist[expert])).all()
+    assert row.unique().numel() == count * topk
+    assert (kept[count:] == -1).all()
+    assert (weights[count:] == 0).all()
+    assert (rows[count:] == DROPPED_ROUTE_ROW).all()
+
+
+@pytest.mark.parametrize("hot", [False, True])
+@pytest.mark.parametrize(
+    "experts,topk", [(128, 4), (256, 6), (512, 8), (896, 16), (1024, 16)]
+)
+def test_herd_route_psum_reuses_kernel_across_batches(experts, topk, hot):
+    if get_gfx_runtime() != "gfx1250":
+        pytest.skip("the HERD route runs in the gfx1250 grouped MoE")
+    wave = wave_size_of(torch.cuda.current_device())
+    launch = build_herd_route_psum_module(topk, experts, False, wave)
+    compiled = None
+    for tokens, tile_m in (
+        (1, 32),
+        (16, 16),
+        (128, 32),
+        (129, 64),
+        (512, 32),
+        (HERD_ROUTE_BLOCK, 128),
+    ):
+        ids, values = _candidates(tokens, experts, topk, hot=hot)
+        outputs = herd_route_psum(values, ids, experts, tile_m, 2.5)
+        _check_route_psum(outputs, ids, values, experts, tile_m, tokens)
+        if compiled is None:
+            compiled = launch._cf
+        assert launch._cf is compiled
+
+
+def test_herd_route_psum_casts_candidates():
+    """int64 ids and BF16 values route as their int32 and FP32 copies do: the
+    copies stay alive until the launch reads them."""
+    if get_gfx_runtime() != "gfx1250":
+        pytest.skip("the HERD route runs in the gfx1250 grouped MoE")
+    tokens, experts, topk = 256, 128, 4
+    # Small integer values, exact in BF16.
+    ids, values = _candidates(tokens, experts, topk)
+    outputs = herd_route_psum(values.bfloat16(), ids.long(), experts, 32, 2.5)
+    _check_route_psum(outputs, ids, values, experts, 32, tokens)
+
+
+@pytest.mark.parametrize("experts,topk", [(128, 4), (896, 16)])
+@pytest.mark.parametrize("unrouted", [True, False])
+def test_herd_route_psum_valid_rows_follow_graph_replay(experts, topk, unrouted):
+    """Rows past num_valid_rows stay out of the popularity and take no grouped
+    row whatever their candidates hold; the count is read on device."""
+    if get_gfx_runtime() != "gfx1250":
+        pytest.skip("the HERD route runs in the gfx1250 grouped MoE")
+    tokens, tile_m = HERD_ROUTE_BLOCK, 32
     ids, values = _candidates(tokens, experts, topk)
     cand_ids, cand_values = ids.clone(), values.clone()
     valid = torch.tensor([tokens], device="cuda", dtype=torch.int32)
 
     def run():
-        return herd_route_psum_remap(
-            cand_ids, cand_values, experts, tokens, 32, 2.5, num_valid_rows=valid
+        return herd_route_psum(
+            cand_values, cand_ids, experts, tile_m, 2.5, num_valid_rows=valid
         )
 
     run()
@@ -184,32 +259,14 @@ def test_grouped_route_psum_skips_pad_rows(experts, topk, unrouted):
     torch.cuda.current_stream().wait_stream(stream)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        counts, rows, psum, gather_weights = run()
-    for count in (tokens, 41, 0):
+        outputs = run()
+    for count in (tokens, 641, 129, 41, 0):
         padded_ids, padded_values = _pad_candidates(ids, values, count, unrouted)
         cand_ids.copy_(padded_ids)
         cand_values.copy_(padded_values)
         valid.fill_(count)
         graph.replay()
-        if count:
-            kept, weights = _reference(ids[:count], values[:count], experts, 2.5)
-        else:
-            kept = ids.new_empty(0, topk)
-            weights = values.new_empty(0, topk)
-        hist = torch.bincount(kept.flatten().long(), minlength=experts)
-        padded = (hist + 31) // 32 * 32
-        starts = padded.cumsum(0) - padded
-        torch.testing.assert_close(counts.long(), hist, rtol=0, atol=0)
-        torch.testing.assert_close(psum.long(), starts + hist, rtol=0, atol=0)
-        torch.testing.assert_close(
-            gather_weights[:count], weights, rtol=2e-5, atol=1e-6
-        )
-        lower = starts[kept.long()]
-        real = rows[:count]
-        assert ((real >= lower) & (real < lower + hist[kept.long()])).all()
-        assert real.unique().numel() == count * topk
-        assert (rows[count:] == DROPPED_ROUTE_ROW).all()
-        assert (gather_weights[count:] == 0).all()
+        _check_route_psum(outputs, ids, values, experts, tile_m, count)
 
 
 @pytest.mark.parametrize("experts,topk", [(128, 4), (256, 6), (896, 16)])
@@ -311,9 +368,9 @@ def test_legacy_herd_valid_rows_follow_graph_replay(monkeypatch):
 
 
 @pytest.mark.parametrize("gfx", ["gfx950", "gfx1250"])
-@pytest.mark.parametrize("tokens", [128, 129])
-@pytest.mark.parametrize("drop", ["0", "1"])
-def test_herd_topk_is_only_for_gfx1250(monkeypatch, gfx, tokens, drop):
+@pytest.mark.parametrize("tokens", [128, 129, 1025])
+@pytest.mark.parametrize("experts,topk", [(128, 4), (896, 16)])
+def test_herd_topk_is_only_for_gfx1250(monkeypatch, gfx, tokens, experts, topk):
     from aiter import ActivationType, QuantType
     from aiter.ops.flydsl.moe_common import GateMode
     from aiter.utility import dtypes
@@ -321,8 +378,7 @@ def test_herd_topk_is_only_for_gfx1250(monkeypatch, gfx, tokens, drop):
     moe = importlib.import_module("aiter.fused_moe")
     grouped = importlib.import_module("aiter.ops.flydsl.grouped_moe_gfx1250")
     monkeypatch.setattr(moe, "get_gfx", lambda: gfx)
-    monkeypatch.setenv("AITER_HERD_FUSED_DROP", drop)
-    experts, topk, dim = 128, 4, 256
+    dim = 256
     ids, values = _candidates(tokens, experts, topk)
     hidden = torch.zeros(tokens, dim, device="cuda", dtype=torch.bfloat16)
     w1 = torch.empty(experts, 2 * dim, dim // 2, device="cuda", dtype=dtypes.fp4x2)
@@ -334,52 +390,46 @@ def test_herd_topk_is_only_for_gfx1250(monkeypatch, gfx, tokens, drop):
         return torch.zeros_like(hidden)
 
     monkeypatch.setattr(grouped, "grouped_gemm_gfx1250_a8w4", mock_grouped)
+
+    def run():
+        moe.fused_moe(
+            hidden,
+            w1,
+            w2,
+            values,
+            ids,
+            activation=ActivationType.Silu,
+            quant_type=QuantType.per_1x32,
+            quant_dtype_a=dtypes.fp8,
+            gate_mode=GateMode.INTERLEAVE.value,
+            herd_topk=topk,
+            herd_routed_scaling_factor=2.5,
+        )
+
     if gfx != "gfx1250":
-        # Reject before candidate finalize or grouped MoE, regardless of drop.
+        # Reject before candidate finalize or grouped MoE, at any expert count.
         herd = importlib.import_module("aiter.ops.flydsl.herd_topk")
         finalize_calls = []
         monkeypatch.setattr(
             herd, "herd_finalize_candidates", lambda *args: finalize_calls.append(args)
         )
         with pytest.raises(ValueError, match="herd_topk is supported only on gfx1250"):
-            moe.fused_moe(
-                hidden,
-                w1,
-                w2,
-                values,
-                ids,
-                activation=ActivationType.Silu,
-                quant_type=QuantType.per_1x32,
-                quant_dtype_a=dtypes.fp8,
-                gate_mode=GateMode.INTERLEAVE.value,
-                herd_topk=topk,
-                herd_routed_scaling_factor=2.5,
-            )
+            run()
         assert not calls and not finalize_calls
         return
-    moe.fused_moe(
-        hidden,
-        w1,
-        w2,
-        values,
-        ids,
-        activation=ActivationType.Silu,
-        quant_type=QuantType.per_1x32,
-        quant_dtype_a=dtypes.fp8,
-        gate_mode=GateMode.INTERLEAVE.value,
-        herd_topk=topk,
-        herd_routed_scaling_factor=2.5,
-    )
+    if tokens > HERD_ROUTE_BLOCK:
+        # Past the HERD route's one workgroup; AITER_FLYDSL_HERD_MAX_M keeps
+        # such steps off HERD.
+        with pytest.raises(ValueError, match="at most 1024 tokens"):
+            run()
+        assert not calls
+        return
+    run()
+    # The grouped MoE drops the candidates at any expert count.
     selected, weights, selected_topk = calls[-1]
-    if drop == "0":
-        expected_ids, expected_weights = _reference(ids, values, experts, 2.5)
-        assert selected_topk == 0
-        torch.testing.assert_close(selected, expected_ids, rtol=0, atol=0)
-        torch.testing.assert_close(weights, expected_weights, rtol=2e-5, atol=1e-6)
-    else:
-        assert selected_topk == topk
-        torch.testing.assert_close(selected, ids, rtol=0, atol=0)
-        torch.testing.assert_close(weights, values, rtol=0, atol=0)
+    assert selected_topk == topk
+    torch.testing.assert_close(selected, ids, rtol=0, atol=0)
+    torch.testing.assert_close(weights, values, rtol=0, atol=0)
 
 
 def _moe_weights(experts, dim, generator):
@@ -427,13 +477,14 @@ def _logits_diff(actual, expected):
 
 
 @pytest.mark.parametrize("tokens", [16, 128])
-def test_fused_moe_outputs_match_router_drop(monkeypatch, tokens):
+# Both drop inside the grouped MoE route.
+@pytest.mark.parametrize("experts,topk", [(128, 4), (896, 16)])
+def test_fused_moe_outputs_match_router_drop(tokens, experts, topk):
     if get_gfx_runtime() not in ("gfx950", "gfx1250"):
         pytest.skip("HERD MoE supports gfx950 and gfx1250")
     from aiter.fused_moe import fused_moe
 
-    monkeypatch.setenv("AITER_HERD_FUSED_DROP", "1")
-    experts, topk, dim = 128, 4, 512
+    dim = 512
     generator = torch.Generator(device="cuda").manual_seed(2713)
     w1, w2, kwargs = _moe_weights(experts, dim, generator)
     hidden = (
@@ -481,13 +532,11 @@ def test_fused_moe_outputs_match_router_drop(monkeypatch, tokens):
         result = run()
     graph.replay()
     check_output(result)
-    monkeypatch.setenv("AITER_HERD_FUSED_DROP", "0")
-    check_output(run())
 
 
-@pytest.mark.parametrize("drop", ["0", "1"])
+@pytest.mark.parametrize("experts,topk", [(128, 4), (896, 16)])
 @pytest.mark.parametrize("unrouted", [True, False])
-def test_fused_moe_herd_skips_pad_rows(monkeypatch, drop, unrouted):
+def test_fused_moe_herd_skips_pad_rows(experts, topk, unrouted):
     """fused_moe(herd_topk) under num_local_tokens: the real rows match a MoE
     over them alone, the pad rows come out zero, and a replayed CUDA graph
     follows each step's count."""
@@ -495,8 +544,7 @@ def test_fused_moe_herd_skips_pad_rows(monkeypatch, drop, unrouted):
         pytest.skip("K+1 HERD candidates reach fused_moe only on gfx1250")
     from aiter.fused_moe import fused_moe
 
-    monkeypatch.setenv("AITER_HERD_FUSED_DROP", drop)
-    experts, topk, dim, tokens = 128, 4, 512, 64
+    dim, tokens = 512, 64
     generator = torch.Generator(device="cuda").manual_seed(6938)
     w1, w2, kwargs = _moe_weights(experts, dim, generator)
     hidden = (
