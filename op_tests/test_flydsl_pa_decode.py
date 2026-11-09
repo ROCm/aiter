@@ -993,6 +993,30 @@ _FP8_CASES = _COMMON_CASES + [
     ("mtp8-g8-page128", {"query_length": 8, "block_size": 128, "max_partitions": 7}),
 ]
 _BF16_CASES = _COMMON_CASES + [
+    # Fixed runs of tiles, as for FP8; one-CTA grids stage two pages a step.
+    (
+        "cluster16-runs-page128",
+        {
+            "group_size": 16,
+            "block_size": 128,
+            "lengths": (8192, 0, 1, 129, 1000, 4097, 7777, 8191),
+            "max_partitions": 16,
+            "capture": True,
+            "cluster": 16,
+            "cluster_runs": True,
+        },
+    ),
+    (
+        "cluster9-runs-page128-bs1",
+        {
+            "group_size": 16,
+            "block_size": 128,
+            "lengths": (2049,),
+            "max_partitions": 16,
+            "cluster": 9,
+            "cluster_runs": True,
+        },
+    ),
     (
         "mtp",
         {

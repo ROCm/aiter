@@ -802,7 +802,8 @@ def compile_gfx1250_pa_decode(
                             T.i32, tbl[row + fx.min(page + j, max_blocks - 1)]
                         )
                     )
-                    for j in range_constexpr(t.TOKENS // t.block_size)
+                    # BF16 wave pipelines stage two pages up front.
+                    for j in range_constexpr(max(t.TOKENS // t.block_size, 2))
                 ] + [fx.Int32(fx.rocdl.readfirstlane(T.i32, tbl[row]))]
                 # Keep the loads ahead of the length's wait.
                 fx.rocdl.sched_barrier(0)

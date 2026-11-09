@@ -761,9 +761,9 @@ class Gfx1250Bf16Pipeline:
         self.merge = Gfx1250PartitionMerge(ctx, self.mem)
 
     @flyc.jit
-    def _stage(self, token_base, end, buffer, slot):
+    def _stage(self, token_base, end, buffer, slot, preload=None):
         if token_base < end:
-            self.mem.stage_bf16_page(token_base, buffer, slot)
+            self.mem.stage_bf16_page(token_base, buffer, slot, preload)
 
     @flyc.jit
     def run(self):
@@ -824,7 +824,10 @@ class Gfx1250Bf16Pipeline:
         pages = step // 128
         page_bytes = 128 * t.head_dim * 2
         for p in range_constexpr(pages):
-            self._stage(begin + p * 128, end, fx.Int32(0), p)
+            self._stage(begin + p * 128, end, fx.Int32(0), p, p)
+        if const_expr(t.cluster_runs):
+            # Preloaded page ids cover the first step only.
+            ctx.stage_pages = None
         for token_i, state in range(begin, end, step, init=initial):
             token_base = fx.Int32(token_i)
             buffer = ((token_base - begin) // step) % 2
@@ -1224,10 +1227,13 @@ class Gfx1250Bf16WavePipeline:
             )
         # Keep the Q loads ahead of the first page's table lookup.
         fx.rocdl.sched_barrier(0)
-        self.mem.stage_bf16_page(begin, fx.Int32(0))
+        self.mem.stage_bf16_page(begin, fx.Int32(0), preload=0)
         # After the query loads, which the first page's QK waits for too.
         if begin + 128 < end:
-            self.mem.stage_bf16_page(begin + 128, fx.Int32(1))
+            self.mem.stage_bf16_page(begin + 128, fx.Int32(1), preload=1)
+        if const_expr(t.cluster_runs):
+            # Preloaded page ids cover the first two pages only.
+            ctx.stage_pages = None
         pages = (end - begin) // 128
         split = (
             begin
