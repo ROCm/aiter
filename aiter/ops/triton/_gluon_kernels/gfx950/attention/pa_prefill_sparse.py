@@ -127,7 +127,6 @@ def _pa_prefill_sparse(
     row = gl.where(n > 0, idx_ptr + beg, indptr_ptr)
     n_tiles = (n + BLOCK_K - 1) // BLOCK_K
     cols_g = gl.arange(0, BLOCK_K, layout=gl.SliceLayout(1, gather_l))
-    cols_c = gl.arange(0, BLOCK_K, layout=gl.SliceLayout(0, mfma_l))
     d_g = gl.arange(0, D, layout=gl.SliceLayout(0, gather_l))
     q0, q1, q2, q3 = _load_q(q_ptr, r, stride_qt, stride_qh, H, dot_a)
     a0 = gl.zeros([H, DC], gl.float32, layout=mfma_l)
@@ -154,6 +153,10 @@ def _pa_prefill_sparse(
         s = gl.amd.cdna4.mfma(q1, _k_chunk(tile, 1, dot_b), s)
         s = gl.amd.cdna4.mfma(q2, _k_chunk(tile, 2, dot_b), s)
         s = gl.amd.cdna4.mfma(q3, _k_chunk(tile, 3, dot_b), s)
+        # Built per tile, not hoisted out of the loop: hoisted, the kernel ran
+        # up to 5 % slower with Triton 3.8 on some index lists (no difference
+        # with Triton 3.7).
+        cols_c = gl.arange(0, BLOCK_K, layout=gl.SliceLayout(0, mfma_l))
         s = gl.where((j * BLOCK_K + cols_c < n)[None, :], s, float("-inf"))
         m_new = gl.maximum(m, gl.max(s, axis=1) * qk_scale)
         p = gl.exp2(s * qk_scale - m_new[:, None])
