@@ -13,8 +13,9 @@ from aiter.ops.triton.quant.fused_fp8_quant import (
     fused_silu_mul_fp8_per_tensor_static_quant,
 )
 from aiter.test_common import (
-    checkAllclose,
+    assertAllclose,
 )
+from op_tests.triton_tests.utils.types import with_default_dtype
 
 rocm_aiter_fp8_dtype = rocm_aiter.dtypes.fp8
 
@@ -226,7 +227,7 @@ def test_rmsnorm_quant_fuse(m, n):
     x_shape = (m, n)
     dtype = torch.bfloat16
     x = torch.randn(x_shape, dtype=dtype, device="cuda")
-    w = torch.ones(n, dtype=dtype).cuda()
+    w = torch.ones(n, dtype=dtype, device="cuda")
 
     DTYPE_MAX = (
         torch.finfo(rocm_fp8_dtype).max
@@ -248,8 +249,8 @@ def test_rmsnorm_quant_fuse(m, n):
         x, w, x_scale, eps, rocm_fp8_dtype
     )
 
-    checkAllclose(rms_out, rms_out_ref)
-    checkAllclose(fp8_x.to(torch.float32), fp8_x_ref.to(torch.float32))
+    assertAllclose(rms_out, rms_out_ref)
+    assertAllclose(fp8_x.to(torch.float32), fp8_x_ref.to(torch.float32))
 
 
 def _assert_transpose_scale_layout(
@@ -491,12 +492,12 @@ def generate_fused_reduce_act_mul_fp8_group_quant(
     N2: int = 1,
 ):
     if SPK == 1:
-        x = torch.randn((M, N1 * 2), dtype=dtype).cuda() / 10
+        x = torch.randn((M, N1 * 2), dtype=dtype, device="cuda") / 10
     else:
-        x = torch.randn((SPK, M, N1 * 2), dtype=torch.float32).cuda() / 10
+        x = torch.randn((SPK, M, N1 * 2), dtype=torch.float32, device="cuda") / 10
     x2 = None
     if SPK > 1:
-        x2 = torch.randn((SPK, M, N2), dtype=torch.float32).cuda() / 10
+        x2 = torch.randn((SPK, M, N2), dtype=torch.float32, device="cuda") / 10
 
     return x, x2
 
@@ -541,6 +542,32 @@ def test_fused_reduce_act_mul_fp8_group_quant(
     torch.testing.assert_close(y_upcast_torch, y_upcast_triton, atol=0.1, rtol=0.1)
 
 
+def test_fused_reduce_act_mul_fp8_group_quant_dtype_none():
+    """With dtype=None, y2 has the dtype of x2, not the default dtype."""
+    torch.manual_seed(0)
+    group_size = 128
+    dtype_quant = aiter.dtypes.fp8
+    x, x2 = generate_fused_reduce_act_mul_fp8_group_quant(32, 256, SPK=4, N2=256)
+    _, y2_torch = run_torch_reduce_act_mul_fp8_group_quant(
+        x, x2, "silu", x2.dtype, dtype_quant, group_size
+    )
+
+    # x2 is float32, the usual default dtype. A float64 default makes the test
+    # fail if y2 takes the default dtype.
+    with with_default_dtype(torch.float64):
+        _, y2_triton = fused_reduce_act_mul_fp8_group_quant(
+            x,
+            activation="silu",
+            x2=x2,
+            group_size=group_size,
+            dtype_quant=dtype_quant,
+            dtype=None,
+        )
+
+    assert y2_triton.dtype == x2.dtype
+    torch.testing.assert_close(y2_triton, y2_torch)
+
+
 def run_torch_reduce_rms_fp8_group_quant(
     x1, w1, eps1, x2, w2, eps2, res1, x3, dtype_quant, dtype, group_size
 ):
@@ -582,7 +609,17 @@ def generate_fused_reduce_rms_quant_data(M, N1, N2, N3, SPK, dtype=torch.bfloat1
 
 @pytest.mark.parametrize("M", [1, 32, 256, 8192])
 @pytest.mark.parametrize(
-    "N1, N2, N3", [(128, 128, 128), (1536, 512, 64), (7168, 7168, 7168)]
+    "N1, N2, N3",
+    [
+        (128, 128, 128),
+        (1536, 512, 64),
+        (7168, 7168, 7168),
+        # N2 != N1 with non-power-of-2 N2 (inp2 needs its own column mask)
+        (128, 192, 64),
+        (256, 192, 64),
+        (1536, 576, 64),
+        (1536, 7168, 64),
+    ],
 )
 @pytest.mark.parametrize("SPK", [1, 4, 14])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
@@ -788,4 +825,4 @@ def test_silu_mul_quant_fuse(m, n):
     fp8_x_ref = silu_mul_fp8_quantization_ref(x, x_scale, rocm_fp8_dtype)
     fp8_x = triton_silu_mul_fp8_quantization_fuse(x, x_scale, rocm_fp8_dtype)
 
-    checkAllclose(fp8_x.to(torch.float32), fp8_x_ref.to(torch.float32))
+    assertAllclose(fp8_x.to(torch.float32), fp8_x_ref.to(torch.float32))

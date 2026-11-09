@@ -17,6 +17,19 @@ def calc_diff(x: torch.Tensor, y: torch.Tensor):
     return 1 - sim
 
 
+def check_logits(logits, ref_logits, where="", check_mask=True, tol=1e-3):
+    ref_neginf_mask = ref_logits == float("-inf")
+    if check_mask:
+        assert torch.equal(logits == float("-inf"), ref_neginf_mask), f"mask {where}"
+    if ref_neginf_mask.all():
+        return  # nothing left to compare
+    diff = calc_diff(
+        logits.masked_fill(ref_neginf_mask, 0),
+        ref_logits.masked_fill(ref_neginf_mask, 0),
+    )
+    assert diff < tol, f"{where}{diff=}"
+
+
 def ceil_to_ue8m0(x: torch.Tensor):
     assert x.view(-1).amax().item() > 0
     return torch.pow(2.0, torch.ceil(torch.log2(x.abs())))
@@ -114,9 +127,9 @@ def test_fp8_mqa_logits(
     q = torch.randn(s_q, num_heads, head_dim, device="cuda", dtype=torch.bfloat16)
     kv = torch.randn(s_k, head_dim, device="cuda", dtype=torch.bfloat16)
     kv_fp8, scales = per_custom_dims_cast_to_fp8(kv, (0,), False)
-    kv = (kv_fp8.to(torch.float32) * scales.reshape(-1, 1)).to(torch.bfloat16)
+    kv = kv_fp8.to(torch.float32) * scales.reshape(-1, 1)
     weights = torch.randn(s_q, num_heads, device="cuda", dtype=torch.float32)
-    # to respect the aseert in generate_cp_test_data
+    # to respect the assert in generate_cp_test_data
     if disable_cp or s_k % s_q != 0 or s_q % 2 != 0:
         ks = torch.zeros(s_q, dtype=torch.int, device="cuda")
         ke = torch.arange(s_q, dtype=torch.int, device="cuda") + (s_k - s_q)
@@ -124,63 +137,34 @@ def test_fp8_mqa_logits(
         ks, ke = generate_cp_test_data(s_q, s_k)
 
     q_fp8 = q.to(e4m3_type)
-    kv_fp8, scales = per_custom_dims_cast_to_fp8(kv, (0,), False)
+    q = q_fp8.to(torch.float32)
 
     ref_logits, _ref_cost = ref_fp8_mqa_logits(
         q=q, kv=kv, weights=weights, cu_seqlen_ks=ks, cu_seqlen_ke=ke
     )
 
     logits = fp8_mqa_logits(q_fp8, kv_fp8, scales, weights, ks, ke, clean_logits)
-
-    # If clean_logits is not set, clean the rest for testing
-    if not clean_logits:
-        assert logits.size() == (s_q, s_k)
-        tmp = torch.full((s_q, s_k), float("-inf"), device="cuda")
-        for i in range(s_q):
-            tmp[i, ks[i] : ke[i]] = logits[i, : ke[i] - ks[i]]
-        logits = tmp
-
-    ref_neginf_mask = ref_logits == float("-inf")
-    neginf_mask = logits == float("-inf")
-    assert torch.equal(neginf_mask, ref_neginf_mask)
-    ref_logits = ref_logits.masked_fill(ref_neginf_mask, 0)
-    logits = logits.masked_fill(neginf_mask, 0)
-    diff = calc_diff(logits, ref_logits)
-    if ref_neginf_mask.all():
-        return  # nothing left to compare
-    assert diff < 1e-3, f"{diff=}"
-
-
-def ref_fp8_mqa_logits_row(q_row, kv, weight_row, start, end):
-    """One row of the reference, so s_k can be large.
-
-    ref_fp8_mqa_logits materializes [num_heads, s_q, s_k], which is hundreds of
-    GB at the shapes below; per row it is [num_heads, s_k].
-    """
-    score = (q_row.float() @ kv.float().T).relu()
-    row = (score * weight_row.unsqueeze(-1)).sum(dim=0)
-    out = torch.full_like(row, float("-inf"))
-    out[start:end] = row[start:end]
-    return out
+    assert logits.size() == (s_q, s_k)
+    check_logits(logits, ref_logits, check_mask=clean_logits, tol=1e-4)
 
 
 @pytest.mark.parametrize("s_q, s_k", [(8192, 65664), (8192, 98304)])
-@pytest.mark.parametrize("num_heads", [32])
+@pytest.mark.parametrize("num_heads", [32, 64])
 @pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize("clean_logits", [True, False])
 @torch.inference_mode()
 def test_fp8_mqa_logits_logits_past_2gib(
-    s_q: int, s_k: int, num_heads: int, head_dim: int
+    s_q: int, s_k: int, num_heads: int, head_dim: int, clean_logits: bool
 ) -> None:
     """Prefill shapes whose fp32 logits tensor exceeds 2 GiB.
 
-    The gluon path picks BLOCK_M=2 for s_q > 4096, and that only compiles when
-    buffer stores are in use. An over-conservative buffer-store gate therefore
-    either aborts the AMDGCN backend at JIT time or silently falls back to one
-    query row per workgroup. Neither is reachable from the shapes above: they
-    top out four orders of magnitude below the limit.
+    Tests for potential buffer store/load issues and split-k.
     """
+    # logit bytes with alignment
     logits_bytes = s_q * ((s_k + 255) // 256 * 256) * 4
-    assert logits_bytes > 2 * 1024**3, "shape does not exercise the gate"
+    # the previous parametrization's logits are still held by the caching
+    # allocator, and they are the same size as this one's
+    torch.cuda.empty_cache()
     free, _ = torch.cuda.mem_get_info()
     if free < logits_bytes * 2:
         pytest.skip(f"needs {logits_bytes * 2 / 2**30:.1f} GiB free")
@@ -197,16 +181,72 @@ def test_fp8_mqa_logits_logits_past_2gib(
     q_fp8 = q.to(e4m3_type)
     kv_fp8, scales = per_custom_dims_cast_to_fp8(kv, (0,), False)
 
-    logits = fp8_mqa_logits(q_fp8, kv_fp8, scales, weights, ks, ke, clean_logits=True)
+    logits = fp8_mqa_logits(
+        q_fp8, kv_fp8, scales, weights, ks, ke, clean_logits=clean_logits
+    )
     assert logits.shape == (s_q, s_k)
 
-    # Sample rows across the grid: first, last, and the BLOCK_M=2 block seam.
-    for i in (0, 1, s_q // 2, s_q // 2 + 1, s_q - 1):
-        ref_row = ref_fp8_mqa_logits_row(q[i], kv, weights[i], int(ks[i]), int(ke[i]))
-        got_row = logits[i]
-        ref_mask = ref_row == float("-inf")
-        assert torch.equal(got_row == float("-inf"), ref_mask), f"mask mismatch row {i}"
-        diff = calc_diff(
-            got_row.masked_fill(ref_mask, 0), ref_row.masked_fill(ref_mask, 0)
+    # Slicing to reduce memory usage when testing
+    ROWS_PER_CHECK = 32
+    for a in range(0, s_q, ROWS_PER_CHECK):
+        b = min(a + ROWS_PER_CHECK, s_q)
+        ref_logits, _ = ref_fp8_mqa_logits(
+            q=q[a:b],
+            kv=kv,
+            weights=weights[a:b],
+            cu_seqlen_ks=ks[a:b],
+            cu_seqlen_ke=ke[a:b],
         )
-        assert diff < 1e-3, f"row {i}: {diff=}"
+        check_logits(
+            logits[a:b], ref_logits, where=f"rows {a}:{b}: ", check_mask=clean_logits
+        )
+
+
+@pytest.mark.parametrize("cu_start", [1, 128, 2529])
+@pytest.mark.parametrize("num_heads", [32, 64])
+@pytest.mark.parametrize("head_dim", [64])
+@torch.inference_mode()
+def test_fp8_mqa_logits_nonzero_cu_start(
+    cu_start: int, num_heads: int, head_dim: int
+) -> None:
+    """Regression: rows whose kv window does not start at column 0 -- under
+    vLLM, every row of the 2nd+ prefill request packed into one indexer
+    chunk. The epilogue store masks scaled start_ind by BLOCK_KV."""
+    torch.manual_seed(0)
+    block_kv = 128  # BLOCK_KV on gfx1250
+    seg_lens = [
+        n * block_kv + tail
+        for n in range(6)
+        for tail in (0, 37)
+        if n * block_kv + tail > 0
+    ]
+    s_q = len(seg_lens)
+    s_k = cu_start + max(seg_lens)
+
+    q = torch.randn(s_q, num_heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    kv = torch.randn(s_k, head_dim, device="cuda", dtype=torch.bfloat16)
+    kv_fp8, scales = per_custom_dims_cast_to_fp8(kv, (0,), False)
+    kv = kv_fp8.to(torch.float32) * scales.reshape(-1, 1)
+    weights = torch.randn(s_q, num_heads, device="cuda", dtype=torch.float32)
+
+    ks = torch.full((s_q,), cu_start, dtype=torch.int, device="cuda")
+    ke = ks + torch.tensor(seg_lens, dtype=torch.int, device="cuda")
+
+    q_fp8 = q.to(e4m3_type)
+    q = q_fp8.to(torch.float32)
+
+    # kv_fp8/scales are the kernel's KV; kv is what they dequantize to, so the
+    # reference works from the same values. Re-quantizing kv here would rebind
+    # kv_fp8/scales and hand the kernel a slightly different KV.
+    ref_logits, _ref_cost = ref_fp8_mqa_logits(
+        q=q, kv=kv, weights=weights, cu_seqlen_ks=ks, cu_seqlen_ke=ke
+    )
+    logits = fp8_mqa_logits(q_fp8, kv_fp8, scales, weights, ks, ke, True)
+
+    ref_neginf_mask = ref_logits == float("-inf")
+    neginf_mask = logits == float("-inf")
+    assert torch.equal(neginf_mask, ref_neginf_mask)
+    ref_logits = ref_logits.masked_fill(ref_neginf_mask, 0)
+    logits = logits.masked_fill(neginf_mask, 0)
+    diff = calc_diff(logits, ref_logits)
+    assert diff < 1e-4, f"{diff=}"

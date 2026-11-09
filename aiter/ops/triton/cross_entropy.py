@@ -72,7 +72,7 @@ def cross_entropy_forward(
         ``_input`` and already contains the gradient (to be scaled by
         ``grad_output`` in the backward pass).
     """
-    _LOGGER.info(f"CROSS_ENTROPY_FORWARD: input={tuple(_input.shape)}")
+    _LOGGER.info("CROSS_ENTROPY_FORWARD: input=%s", tuple(_input.shape))
     B, SQ, V = _input.shape
     n_rows = B * SQ
     if target.numel() != n_rows:
@@ -211,7 +211,7 @@ def cross_entropy_forward_chunked(
     Returns:
         ``(loss, _input)`` where *loss* is ``[B, SQ]`` or a scalar.
     """
-    _LOGGER.info(f"CROSS_ENTROPY_FORWARD_CHUNKED: input={tuple(_input.shape)}")
+    _LOGGER.info("CROSS_ENTROPY_FORWARD_CHUNKED: input=%s", tuple(_input.shape))
     if chunk_rows < 1:
         raise ValueError(f"chunk_rows must be >= 1, got {chunk_rows}")
 
@@ -354,7 +354,7 @@ def cross_entropy_backward(
     Returns:
         Gradient w.r.t. the logits, same shape as ``_input``.
     """
-    _LOGGER.info(f"CROSS_ENTROPY_BACKWARD: input={tuple(_input.shape)}")
+    _LOGGER.info("CROSS_ENTROPY_BACKWARD: input=%s", tuple(_input.shape))
     B, SQ, V = _input.shape
     n_rows = B * SQ
 

@@ -2,9 +2,8 @@ name: AITER Release Automation
 
 on:
   schedule:
-    # GitHub cron cannot express "every 14 days" directly. Trigger weekly and
-    # gate the release jobs below against a fixed 14-day cadence.
-    - cron: '0 6 * * 1'
+    - cron: '0 1 * * 1'
+      timezone: 'America/Chicago'
   push:
     tags:
       - 'v*'
@@ -29,10 +28,6 @@ on:
         default: true
       force_rebuild:
         description: 'Build and upload even if the GitHub Release already has the expected wheel assets.'
-        type: boolean
-        default: false
-      skip_biweekly_gate:
-        description: 'For manual testing only, ignore the every-two-week schedule gate.'
         type: boolean
         default: false
 
@@ -86,48 +81,12 @@ jobs:
           INPUT_RELEASE_REF: ${{ github.event.inputs.release_ref || 'main' }}
           CREATE_MISSING_REFS: ${{ github.event.inputs.create_missing_refs || true }}
           FORCE_REBUILD: ${{ github.event.inputs.force_rebuild || false }}
-          SKIP_BIWEEKLY_GATE: ${{ github.event.inputs.skip_biweekly_gate || false }}
-          EXPECTED_WHEEL_COUNT: '6'
-          RELEASE_CADENCE_ANCHOR: '2026-08-31'
+          EXPECTED_WHEEL_COUNT: '8'
         run: |
           set -euo pipefail
 
           should_run=true
           skip_reason=""
-
-          if [ "${EVENT_NAME}" = "schedule" ] && [ "${SKIP_BIWEEKLY_GATE}" != "true" ]; then
-            today="$(date -u +%Y-%m-%d)"
-            anchor_seconds="$(date -u -d "${RELEASE_CADENCE_ANCHOR}" +%s)"
-            today_seconds="$(date -u -d "${today}" +%s)"
-            days_since_anchor=$(( (today_seconds - anchor_seconds) / 86400 ))
-            cadence_offset=$(( days_since_anchor % 14 ))
-
-            if [ "${cadence_offset}" -ne 0 ]; then
-              should_run=false
-              skip_reason="Not on the 14-day release cadence anchored at ${RELEASE_CADENCE_ANCHOR}."
-            fi
-          fi
-
-          if [ "${should_run}" != "true" ]; then
-            {
-              echo "should_run=${should_run}"
-              echo "skip_reason=${skip_reason}"
-              echo "release_tag="
-              echo "release_branch="
-              echo "release_version="
-              echo "release_kind="
-              echo "previous_tag="
-              echo "expected_wheel_count=${EXPECTED_WHEEL_COUNT}"
-            } >> "${GITHUB_OUTPUT}"
-
-            {
-              echo "## Release Target"
-              echo "- Should run: ${should_run}"
-              echo "- Skip reason: ${skip_reason}"
-            } >> "${GITHUB_STEP_SUMMARY}"
-
-            exit 0
-          fi
 
           git fetch --force --tags origin
           git fetch --force origin '+refs/heads/*:refs/remotes/origin/*'
@@ -284,10 +243,22 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        rocm_version:
-          - '7.0'
-          - '7.1'
-          - '7.2'
+        include:
+          - rocm_version: '7.2'
+            torch_index_url: ''
+            torch_pin: ''
+          # download.pytorch.org lacks these torch builds for ROCm 7.14+, so take
+          # AMD's (7.14 is only on the legacy multi-arch index). Pin exactly:
+          # each index serves every ROCm flavor of a torch version.
+          - rocm_version: '7.14'
+            torch_index_url: 'https://repo.amd.com/rocm/whl-multi-arch/'
+            torch_pin: '2.12.0+rocm7.14.1'
+          - rocm_version: '10.0'
+            torch_index_url: 'https://stable.repo.amd.com/rocm/whl-next/'
+            torch_pin: '2.13.0+rocm10.0.0'
+          - rocm_version: '10.1'
+            torch_index_url: 'https://stable.repo.amd.com/rocm/whl-next/'
+            torch_pin: '2.13.0+rocm10.1.0'
     uses: ./.github/workflows/aiter-release.yaml
     with:
       release_type: none
@@ -302,6 +273,8 @@ jobs:
       docker_login: false
       commit: ${{ needs.prepare.outputs.release_tag }}
       artifact_suffix: rocm${{ matrix.rocm_version }}
+      torch_index_url: ${{ matrix.torch_index_url }}
+      torch_pin: ${{ matrix.torch_pin }}
     permissions:
       id-token: write
       contents: read
@@ -346,7 +319,7 @@ jobs:
             exit 1
           fi
 
-          for rocm in rocm7.0 rocm7.1 rocm7.2; do
+          for rocm in rocm7.2 rocm7.14 rocm10.0 rocm10.1; do
             for py in cp310 cp312; do
               count="$(find release-wheels -type f -name "*${RELEASE_VERSION}+${rocm}.manylinux.2.28-*${py}-${py}-*.whl" | wc -l | tr -d ' ')"
               if [ "${count}" -ne 1 ]; then
@@ -370,7 +343,7 @@ jobs:
             heading="AITER ${RELEASE_TAG} - post release"
             scope="Post release on top of the ${RELEASE_BRANCH} release line."
           else
-            heading="AITER ${RELEASE_TAG} - bi-weekly release"
+            heading="AITER ${RELEASE_TAG} - weekly release"
             scope="Scheduled release from ${RELEASE_BRANCH}."
           fi
 
@@ -384,7 +357,7 @@ jobs:
             echo "## Wheels"
             echo
             echo "Prebuilt manylinux_2_28 wheels, \`GPU_ARCHS=gfx942;gfx950\`:"
-            echo "- ROCm 7.0 / 7.1 / 7.2 x cp310 / cp312 (${EXPECTED_WHEEL_COUNT} wheels)"
+            echo "- ROCm 7.2 / 7.14 / 10.0 / 10.1 x cp310 / cp312 (${EXPECTED_WHEEL_COUNT} wheels)"
             echo
             echo "Wheel assets are uploaded after the release page is created."
             echo
@@ -444,7 +417,7 @@ jobs:
           rows = []
           seen = set()
           pattern = re.compile(
-              rf"{re.escape(release_version)}\+rocm(?P<rocm>7\.[0-2])\.manylinux\.2\.28-"
+              rf"{re.escape(release_version)}\+rocm(?P<rocm>\d+\.\d+)\.manylinux\.2\.28-"
               r"(?P<py>cp3(?:10|12))-(?P=py)-"
           )
           for asset in wheels:
@@ -460,14 +433,14 @@ jobs:
 
           expected = {
               (rocm, py)
-              for rocm in ("7.0", "7.1", "7.2")
+              for rocm in ("7.2", "7.14", "10.0", "10.1")
               for py in ("cp310", "cp312")
           }
           missing = expected - seen
           if missing:
               raise SystemExit(f"Missing wheel assets: {sorted(missing)}")
 
-          rows.sort(key=lambda row: (row[0], row[1]))
+          rows.sort(key=lambda row: (tuple(int(p) for p in row[0].split(".")), row[1]))
 
           generated = Path("generated-notes.md").read_text().strip()
           generated = generated.replace("## What's Changed", "## Changes", 1)
@@ -476,7 +449,7 @@ jobs:
               heading = f"AITER {release_tag} - post release"
               scope = f"Post release on top of the `{release_branch}` release line."
           else:
-              heading = f"AITER {release_tag} - bi-weekly release"
+              heading = f"AITER {release_tag} - weekly release"
               scope = f"Scheduled release from `{release_branch}`."
 
           lines = [

@@ -10,6 +10,7 @@ from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a16w16_atomic import (
     _get_config,
 )
 from aiter.ops.triton.utils.common_utils import deserialize_str, serialize_dict
+from aiter.ops.triton.utils.device_info import get_num_xcds
 from aiter.ops.triton.utils.gemm_config_utils import add_default_gemm_config_params
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
@@ -22,6 +23,7 @@ def gemm_a16w16_atomic_fake_tensor(
     dtype: torch.dtype | None = torch.bfloat16,
     y: torch.Tensor | None = None,
     config: str | None = None,
+    accumulate: bool = False,
 ) -> torch.Tensor:
     if y is None:
         M, _ = x.shape
@@ -37,6 +39,7 @@ def gemm_a16w16_atomic_(
     dtype: torch.dtype | None = torch.bfloat16,
     y: torch.Tensor | None = None,
     config: str | None = None,
+    accumulate: bool = False,
 ) -> torch.Tensor:
     """
     Computes 16 bit matrix multiplication Y = X @ W^T using atomic operations for split-K reduction.
@@ -47,15 +50,19 @@ def gemm_a16w16_atomic_(
         dtype (Optional[torch.dtype]): Output datatype (BF16 or FP16).
             Note: BF16 atomic aggregation may have slight precision loss.
         y (Optional[torch.Tensor]): Pre-allocated output tensor with shape (M, N).
-            Must be zero-initialized for split-K (NUM_KSPLIT > 1).
+            Must be zero-initialized for split-K (NUM_KSPLIT > 1) unless
+            accumulate is set.
         config (Optional[str]): Kernel tuning parameters (BLOCK_SIZE_M, BLOCK_SIZE_N,
             BLOCK_SIZE_K, GROUP_SIZE_M, NUM_KSPLIT, cache_modifier).
+        accumulate (bool): Compute Y += X @ W^T into the given y instead of
+            overwriting it. Without split-K the sum is taken in fp32 and y is
+            rounded once.
 
     Returns:
         y (torch.Tensor): Output with shape (M, N).
     """
     _LOGGER.info(
-        f"GEMM_A16W16_ATOMIC: x.shape={tuple(x.shape)}, w.shape={tuple(w.shape)} "
+        "GEMM_A16W16_ATOMIC: x.shape=%s, w.shape=%s ", tuple(x.shape), tuple(w.shape)
     )
 
     w = w.T
@@ -71,7 +78,9 @@ def gemm_a16w16_atomic_(
     # with the canonical defaults (the shipped JSONs always carry both).
     add_default_gemm_config_params(config)
 
-    if y is None:
+    if accumulate:
+        assert y is not None, "accumulate=True adds into a caller-provided y"
+    elif y is None:
         # atomic add requires 0 tensor
         if config["NUM_KSPLIT"] == 1:
             y = torch.empty((M, N), dtype=dtype, device=x.device)
@@ -99,7 +108,9 @@ def gemm_a16w16_atomic_(
         w.stride(1),
         y.stride(0),
         y.stride(1),
+        ACCUMULATE=accumulate,
         **config,
+        NUM_XCDS=get_num_xcds(),
     )
 
     return y
@@ -111,6 +122,7 @@ def gemm_a16w16_atomic(
     dtype: torch.dtype | None = torch.bfloat16,
     y: torch.Tensor | None = None,
     config: dict | None = None,
+    accumulate: bool = False,
 ) -> torch.Tensor:
     config_hashable = serialize_dict(config) if config else None
-    return gemm_a16w16_atomic_(x, w, dtype, y, config_hashable)
+    return gemm_a16w16_atomic_(x, w, dtype, y, config_hashable, accumulate)

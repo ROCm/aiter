@@ -13,7 +13,7 @@ set -euo pipefail
 # Per-invocation scratch dir. Fixed /tmp paths collide: two reviews running at once
 # overwrite each other's pr.diff between the write and the read, and the second review
 # silently analyses the first one's diff under its own PR number. Observed.
-WORK=$(mktemp -d /tmp/review-pr-XXXXXX)
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/review-pr-XXXXXX")
 PROJECT_ROOT=$(git rev-parse --show-toplevel) || {
   echo "review-pr must run inside the repository that owns .claude/skills" >&2
   exit 1
@@ -458,8 +458,15 @@ if [ -z "$VALIDATION_REPORT" ] \
 fi
 
 if [ -n "$VALIDATION_REPORT" ]; then
+  # Every integrity check below is fail-closed: evidence that does not match this PR is
+  # never consumed. But rejecting evidence must not delete the review that would have
+  # carried it -- a stale report, or a missing optional dependency, aborted the run and
+  # produced no card at all, which reads to a human exactly like the bot being down.
+  # So: capture the rejection, record why in the outcome file, and fall through to the
+  # no-evidence branch. The card then says validation did not run, and names the reason.
+  set +e
   python3 - "$WORK/pr_meta.json" "$WORK/base_head.txt" "$WORK/pr.diff" "$SCHEMA" \
-    "$VALIDATION_REPORT" "$WORK/validation_report.json" <<'PY'
+    "$VALIDATION_REPORT" "$WORK/validation_report.json" <<'PY' 2>"$WORK/validation_rejected.txt"
 import hashlib
 import json
 import pathlib
@@ -710,7 +717,23 @@ elif perf["status"] in {"pass", "fail"}:
 else:
     print(f"perf stage: skip — {perf.get('note', 'no reason recorded')}")
 PY
-else
+  _CONSUME_RC=$?
+  set -e
+  if [ "$_CONSUME_RC" -ne 0 ]; then
+    # `|| true`: this file runs `set -euo pipefail`, so a rejection that wrote nothing
+    # makes grep exit 1 and kills the handler that exists to keep the review alive.
+    _why=$(grep -v "^$" "$WORK/validation_rejected.txt" 2>/dev/null | tail -1 || true)
+    cat "$WORK/validation_rejected.txt" >&2 2>/dev/null || true
+    rm -f "$WORK/validation_report.json"
+    printf "validation evidence was produced but rejected before use: %s\n" \
+      "${_why:-the consumer failed without a message}" \
+      >"$WORK/auto_validation_outcome.txt"
+    echo "validation evidence rejected; the review continues static-only" >&2
+    VALIDATION_REPORT=""
+  fi
+fi
+
+if [ -z "$VALIDATION_REPORT" ]; then
   # Distinguish the reasons there is no report. "Not applicable" and "required but missing"
   # are different facts about the PR, and collapsing them into one sentence is what made the
   # old verdict line uninformative. Triage's blocker explains the runs never attempted; the
@@ -905,9 +928,11 @@ rm -f "$WORK/.err"
 # breakage happens.
 git -C "$PROJECT_ROOT" cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null \
   || git -C "$PROJECT_ROOT" fetch -q "$REPO_URL" "$BASE_SHA" 2>/dev/null || true
-# Day-old worktrees are finished reviews; drop them, or this accumulates 182M each.
+# Day-old worktrees are finished reviews; drop them, or this accumulates 182M each. Scoped
+# to this box's scratch base (${TMPDIR:-/tmp}) so a user worktree merely named review-pr-*
+# elsewhere is never force-removed.
 git -C "$PROJECT_ROOT" worktree list --porcelain 2>/dev/null \
-  | sed -n 's|^worktree \(/tmp/review-pr-.*\)$|\1|p' \
+  | sed -n "s|^worktree \(${TMPDIR:-/tmp}/review-pr-.*\)\$|\1|p" \
   | while IFS= read -r w; do
       # `if`, not an `&&` chain: the chain's status is the loop's, so a worktree NEWER
       # than a day made the while return 1 and `set -euo pipefail` kill the script, before
@@ -933,6 +958,71 @@ else
     | tee "$WORK/merge_target.txt"
 fi
 
+# ---- Size + reviewer roster: Step 7.8's inputs. Size comes from pr_meta.json's files
+# list (the design gate recomputes it from the same source, so this file is for the
+# reviewer to read, not to trust). The roster is this PR's reviewers plus the authors who
+# last touched the changed paths, read from the merge-target worktree at BASE_SHA -- the
+# people whose code this PR edits, not whoever a drifted CODEOWNERS file names.
+# noreply.github.com emails reduce to handles. The PR author is excluded: routing a review
+# back to its author is a no-op the design gate rejects. Both files are advisory; a
+# failure here degrades Step 7.8 to "no roster to route to", so it must not kill the run.
+python3 - "$WORK/pr_meta.json" > "$WORK/size.txt" <<'PYEOF' || echo "0 lines / 0 files (size unavailable)" > "$WORK/size.txt"
+import json, sys
+files = json.load(open(sys.argv[1])).get("files") or []
+lines = sum(f.get("additions", 0) + f.get("deletions", 0) for f in files)
+print(f"{lines} lines / {len(files)} files")
+PYEOF
+{
+  echo "# Candidate reviewers for the Human routing line (Step 7.8)."
+  echo "# This PR's reviewers + authors of the changed paths at the merge target."
+  echo "# One person per line; the design gate matches routed names against these lines."
+  python3 - "$WORK/pr_meta.json" "$TARGET_WT" <<'PYEOF' || echo "# (roster unavailable)"
+import json, os, re, subprocess, sys
+meta = json.load(open(sys.argv[1]))
+wt = sys.argv[2]
+a = meta.get("author")
+author = a.get("login", "") if isinstance(a, dict) else str(a or "")
+seen, out = set(), []
+def add(name):
+    name = (name or "").strip().lstrip("@")
+    # A routed design question lands in a bot's void: copilot-pull-request-reviewer
+    # "reviews" PRs on this repo, so it rides in through the reviews field and a roster
+    # that admits it green-lights routing the judgment to nobody. Same filter the
+    # inline-comment collector already uses.
+    if name and name.lower() not in ("ghost", "invalid-email-address", author.lower()) \
+       and "copilot" not in name.lower() and "bot" not in name.lower() \
+       and "[bot]" not in name.lower() and name.lower() not in seen and len(out) < 30:
+        seen.add(name.lower())
+        out.append(name)
+for r in meta.get("reviews") or []:
+    ra = r.get("author")
+    add(ra.get("login") if isinstance(ra, dict) else str(ra or ""))
+paths = [f.get("path") for f in (meta.get("files") or []) if f.get("path")]
+
+def log_authors(path_args):
+    p = subprocess.run(
+        ["git", "-C", wt, "log", "--format=%an|%ae", "-n", "200", "--"] + path_args,
+        capture_output=True, text=True, check=False)
+    for line in (p.stdout or "").splitlines():
+        name, _, email = line.partition("|")
+        m = re.match(r"(\d+\+)?([A-Za-z0-9-]+)@users\.noreply\.github\.com$", email.strip())
+        add(m.group(2) if m else name.strip())
+
+if wt and os.path.isdir(wt) and paths:
+    log_authors(paths)
+    if not out:
+        # A brand-new file has no git-log authors, so a PR that is all new files routes
+        # nowhere exactly when it is newest (found on a 10-PR dry-run: two new kernel
+        # files, no reviews, empty roster). Widen to the parents -- the authors of the
+        # code this PR sits among are the next-best judges of its design.
+        parents = sorted({os.path.dirname(p) for p in paths if os.path.dirname(p)})
+        if parents:
+            log_authors(parents)
+for name in out:
+    print(name)
+PYEOF
+} > "$WORK/reviewers.txt"
+
 echo
 echo "WORK=$WORK"
 # Naming a file that was not written sends the reviewer looking for it. evidence.txt is
@@ -940,6 +1030,6 @@ echo "WORK=$WORK"
 echo "artifacts: pr.diff pr_meta.json base_head.txt rules.txt rules_expanded.txt \
 test_quality.txt twins.txt ci_coverage.txt perf_claims.txt struct_abi.txt comment_only.txt \
 guards.txt siblings.txt kernel_tests.txt applies.txt symbols.txt merge_target.txt \
-flydsl_bounds.txt aot_pairing.txt \
+flydsl_bounds.txt aot_pairing.txt size.txt reviewers.txt \
 validation_requirement.json \
 auto_validation_outcome.txt${HAVE_EVIDENCE:+ evidence.txt}"

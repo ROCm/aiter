@@ -15,6 +15,7 @@ from ..jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG, compile_ops
 from ..jit.utils.chip_info import get_cu_num
 from ..jit.utils.chip_info import get_gfx_runtime as get_gfx
 from ..utility import dtypes
+from .gemm_op_mixed_mxfp import _get_device_gfx_cu
 
 # The mxfp6 (E2M3, per-1x32 blockscale) asm gemm shares the a4w4 kernarg ABI.
 # Its packed operand/scale layouts are produced by the helpers below and must
@@ -27,6 +28,7 @@ _SCALE_GROUP_SIZE = 32
 _PADK = 2  # K-padding steps (of 128) baked into the packed A/B layout
 _PACKED_TILE_BYTES = 24576
 _SCALE_TILE_BYTES = 1024
+_MAX_BUFFER_BYTES = 1 << 31
 _PACK_LAYOUT = "mxfp6_c0c1_256_padk2"
 _SHORT_K_SWIZZLE_LIMIT = 48 * _K_TILE
 _GROUPED_SWIZZLE_MAX_M = 16 * 32 * _TILE
@@ -34,18 +36,25 @@ _GROUPED_SWIZZLE_MAX_N = 64 * _TILE
 _BATCHED_PACK_MIN_ELEMENTS = 32 * 1024 * 1024
 _BATCHED_PACK_BLOCK_M = 64
 _BATCHED_PACK_K_BLOCKS = _K_TILE // _SCALE_GROUP_SIZE
-_QUANT_BACKEND = (
-    os.environ.get("AITER_MXFP6_QUANT_BACKEND", "").strip().lower() or "auto"
+
+
+def _normalize_quant_backend(value: str) -> str:
+    backend = value.strip().lower() or "auto"
+    if backend == "triton":
+        raise ValueError(
+            "AITER_MXFP6_QUANT_BACKEND=triton is not a safe public backend; "
+            "use auto (default) or hip"
+        )
+    if backend not in {"auto", "hip"}:
+        raise ValueError(
+            "AITER_MXFP6_QUANT_BACKEND must be one of auto or hip, " f"got {backend!r}"
+        )
+    return backend
+
+
+_QUANT_BACKEND = _normalize_quant_backend(
+    os.environ.get("AITER_MXFP6_QUANT_BACKEND", "")
 )
-if _QUANT_BACKEND not in {"auto", "hip", "triton"}:
-    raise ValueError(
-        "AITER_MXFP6_QUANT_BACKEND must be one of auto, hip, or triton, "
-        f"got {_QUANT_BACKEND!r}"
-    )
-try:
-    _IS_GFX950 = torch.cuda.is_available() and get_gfx() == "gfx950"
-except (KeyError, RuntimeError):
-    _IS_GFX950 = False
 _TUNED_CONFIG_KEY_COLUMNS = ("gfx", "cu_num", "M", "N", "K")
 _TUNED_CONFIG_NUMERIC_COLUMNS = ("cu_num", "M", "N", "K", "splitK")
 _TUNED_CONFIG_COLUMNS = frozenset(
@@ -61,10 +70,87 @@ _TUNED_CONFIG_COLUMNS = frozenset(
 )
 
 
+@functools.lru_cache(maxsize=16)
+def _is_gfx950_device_index(device_index: int) -> bool:
+    properties = torch.cuda.get_device_properties(device_index)
+    arch = str(getattr(properties, "gcnArchName", "")).split(":", 1)[0]
+    return arch == "gfx950"
+
+
+@torch.compiler.assume_constant_result
+def _compiled_is_gfx950_device(device_index: int) -> bool:
+    return _is_gfx950_device_index(device_index)
+
+
+def _is_gfx950_device(device: torch.device) -> bool:
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return False
+    device_index = torch.cuda.current_device() if device.index is None else device.index
+    if torch.compiler.is_compiling():
+        return _compiled_is_gfx950_device(device_index)
+    return _is_gfx950_device_index(device_index)
+
+
 @compile_ops("module_quant", fc_name="quant_mxfp6_gemm_hip", develop=True)
 def quant_mxfp6_gemm_hip_out(
     input: Tensor, packed: Tensor, packed_scale: Tensor
 ) -> None: ...
+
+
+_native_quant_mxfp6_gemm_hip_out = quant_mxfp6_gemm_hip_out
+
+
+def _launch_quant_mxfp6_gemm_hip_out(
+    input: Tensor, packed: Tensor, packed_scale: Tensor
+) -> None:
+    """Call the validated native op without an unnecessary device switch."""
+    if (
+        torch.compiler.is_compiling()
+        or input.device.index == torch.cuda.current_device()
+    ):
+        _native_quant_mxfp6_gemm_hip_out(input, packed, packed_scale)
+        return
+    with torch.cuda.device(input.device):
+        _native_quant_mxfp6_gemm_hip_out(input, packed, packed_scale)
+
+
+def quant_mxfp6_gemm_hip_out(
+    input: Tensor, packed: Tensor, packed_scale: Tensor
+) -> None:
+    """Quantize into caller-provided gfx950 GEMM-layout buffers."""
+    if input.ndim != 2:
+        raise ValueError(
+            f"quant_mxfp6_gemm_hip_out expects a 2D input, got {input.ndim}D"
+        )
+    if input.dtype not in {torch.bfloat16, torch.float16}:
+        raise ValueError("quant_mxfp6_gemm_hip_out expects a bfloat16 or float16 input")
+    if not input.is_cuda or not packed.is_cuda or not packed_scale.is_cuda:
+        raise ValueError("quant_mxfp6_gemm_hip_out requires GPU tensors")
+    if input.device != packed.device or input.device != packed_scale.device:
+        raise ValueError("quant_mxfp6_gemm_hip_out requires tensors on one GPU")
+    if not input.is_contiguous():
+        raise ValueError("quant_mxfp6_gemm_hip_out requires a contiguous input")
+    if packed.dtype != torch.uint8 or packed_scale.dtype != torch.uint8:
+        raise ValueError("quant_mxfp6_gemm_hip_out requires uint8 output buffers")
+    if not packed.is_contiguous() or not packed_scale.is_contiguous():
+        raise ValueError("quant_mxfp6_gemm_hip_out requires contiguous outputs")
+    rows, K = input.shape
+    if rows <= 0 or K <= 0:
+        raise ValueError(
+            f"quant_mxfp6_gemm_hip_out requires positive dimensions, got {(rows, K)}"
+        )
+    expected_packed, expected_scale = mxfp6_gemm_pack_size(rows, K)
+    if packed.numel() != expected_packed or packed_scale.numel() != expected_scale:
+        raise ValueError(
+            "quant_mxfp6_gemm_hip_out buffers have wrong size: "
+            f"got ({packed.numel()}, {packed_scale.numel()}), "
+            f"expected ({expected_packed}, {expected_scale})"
+        )
+    if not torch.compiler.is_compiling() and (
+        packed.data_ptr() % 16 or packed_scale.data_ptr() % 16
+    ):
+        raise ValueError("quant_mxfp6_gemm_hip_out requires 16-byte-aligned outputs")
+    _launch_quant_mxfp6_gemm_hip_out(input, packed, packed_scale)
 
 
 # ---------------------------------------------------------------------------
@@ -107,6 +193,8 @@ def _hadamard32_np() -> np.ndarray:
 
 _HAD32_NP = _hadamard32_np()
 _HAD32_T: dict[torch.device, Tensor] = {}
+_HADAMARD_SAFETY_THRESHOLD = float.fromhex("0x1p123")
+_HADAMARD_SAFETY_SHIFT = 3.0
 
 
 def _had32_t(device: torch.device) -> Tensor:
@@ -125,6 +213,21 @@ def _rotate_k32_torch(x: Tensor) -> Tensor:
     return (
         x.float().reshape(R, K // _SCALE_GROUP_SIZE, _SCALE_GROUP_SIZE) @ h
     ).reshape(R, K)
+
+
+def _rotate_k32_quant_work(x: Tensor) -> tuple[Tensor, Tensor]:
+    """Return overflow-safe H32 work values and per-block exponent shifts."""
+    R, K = x.shape
+    blocks = x.float().reshape(R, K // _SCALE_GROUP_SIZE, _SCALE_GROUP_SIZE)
+    input_amax = blocks.abs().amax(dim=2)
+    safety_shift = torch.where(
+        input_amax >= _HADAMARD_SAFETY_THRESHOLD,
+        _HADAMARD_SAFETY_SHIFT,
+        0.0,
+    )
+    work = blocks * torch.exp2(-safety_shift).unsqueeze(-1)
+    h = _had32_t(x.device).to(torch.bfloat16).float()
+    return (work @ h).reshape(R, K), safety_shift
 
 
 def _rotate_k32_np(x: np.ndarray) -> np.ndarray:
@@ -445,21 +548,22 @@ def quant_mxfp6_torch(x: Tensor) -> tuple[Tensor, Tensor]:
             "quant_mxfp6_torch requires K to be a positive multiple of "
             f"{_SCALE_GROUP_SIZE}, got {x.shape[1]}"
         )
-    x = x.float()
-    x = _rotate_k32_torch(x)
+    x, safety_shift = _rotate_k32_quant_work(x)
     R, K = x.shape
     NB = K // _SCALE_GROUP_SIZE
     blk = x.reshape(R, NB, _SCALE_GROUP_SIZE)
     amax = blk.abs().amax(dim=2)
     safe = torch.where(amax > 0, amax, torch.ones_like(amax))
     exp = torch.floor(torch.log2(safe))
-    scale_exp = torch.clamp(exp - _E2M3_MAX_EXP, -127, 127)
-    scale_exp = torch.where(amax > 0, scale_exp, torch.zeros_like(scale_exp))
+    work_scale_exp = torch.clamp(exp - _E2M3_MAX_EXP, -127, 127)
+    work_scale_exp = torch.where(
+        amax > 0, work_scale_exp, torch.zeros_like(work_scale_exp)
+    )
+    scale_exp = torch.clamp(work_scale_exp + safety_shift, -127, 127)
+    conversion_scale_exp = scale_exp - safety_shift
     scales = (scale_exp + 127).to(torch.uint8)
 
-    scaled = blk / torch.pow(torch.tensor(2.0, device=x.device), scale_exp).unsqueeze(
-        -1
-    )
+    scaled = blk * torch.exp2(-conversion_scale_exp).unsqueeze(-1)
     # arithmetic E2M3 round-to-nearest (identical to the fused Triton _e2m3_dev)
     a = scaled.abs().clamp(max=7.5)
     isn = a >= 1.0
@@ -495,8 +599,21 @@ def _pack32_torch(blocks: Tensor) -> Tensor:
 
 
 def pack_big_torch(codes: Tensor, padK: int = _PADK) -> Tensor:
-    dev = codes.device
+    if codes.ndim != 2:
+        raise ValueError(
+            f"pack_big_torch expects 2D [rows, K] codes, got {codes.ndim}D"
+        )
+    if codes.dtype != torch.uint8:
+        raise ValueError(f"pack_big_torch expects uint8 codes, got {codes.dtype}")
     R, K = codes.shape
+    if R <= 0 or K <= 0 or R % _TILE or K % _K_TILE:
+        raise ValueError(
+            f"pack_big_torch requires positive rows%{_TILE}=0 and "
+            f"K%{_K_TILE}=0, got rows={R}, K={K}"
+        )
+    if not isinstance(padK, int) or isinstance(padK, bool) or padK < 0:
+        raise ValueError(f"pack_big_torch requires padK >= 0, got {padK!r}")
+    dev = codes.device
     nt, nk = R // _TILE, K // _K_TILE
     rb = torch.arange(16, device=dev).repeat_interleave(64)
     L = torch.arange(64, device=dev).repeat(16)
@@ -522,8 +639,26 @@ def pack_big_torch(codes: Tensor, padK: int = _PADK) -> Tensor:
 
 
 def pack_scale_torch(S: Tensor, rows: int, padK: int = _PADK) -> Tensor:
+    if S.ndim != 2:
+        raise ValueError(
+            f"pack_scale_torch expects 2D [rows, K/32] scales, got {S.ndim}D"
+        )
+    if S.dtype != torch.uint8:
+        raise ValueError(f"pack_scale_torch expects uint8 scales, got {S.dtype}")
+    scale_rows, NB = S.shape
+    if rows <= 0 or rows % _TILE or scale_rows != rows:
+        raise ValueError(
+            f"pack_scale_torch requires matching positive rows%{_TILE}=0, "
+            f"got rows={rows}, scale_rows={scale_rows}"
+        )
+    if NB <= 0 or NB % (_K_TILE // _SCALE_GROUP_SIZE):
+        raise ValueError(
+            "pack_scale_torch requires K/32 to be a positive multiple of "
+            f"{_K_TILE // _SCALE_GROUP_SIZE}, got {NB}"
+        )
+    if not isinstance(padK, int) or isinstance(padK, bool) or padK < 0:
+        raise ValueError(f"pack_scale_torch requires padK >= 0, got {padK!r}")
     dev = S.device
-    _R, NB = S.shape
     nt, nk = rows // _TILE, NB // 4
     off = torch.arange(_SCALE_TILE_BYTES, device=dev)
     su = off // 512
@@ -595,6 +730,7 @@ def clear_gemm_a6w6_config_cache() -> None:
     """Clear cached tuning data after a tuner updates the CSV."""
     _load_gemm_a6w6_configs.cache_clear()
     get_GEMM_A6W6_config.cache_clear()
+    _get_device_gfx_cu.cache_clear()
 
 
 def _default_gemm_a6w6_kernel(M: int, N: int, K: int) -> str:
@@ -662,24 +798,138 @@ def get_GEMM_A6W6_config(
     return None
 
 
-def _select_gemm_a6w6_kernel(M: int, N: int, K: int, kernelName: str | None) -> str:
+@torch.compiler.assume_constant_result
+def _compiled_gemm_a6w6_configs(
+    device_index: int,
+) -> tuple[tuple[int, int, int, str], ...]:
+    """Snapshot current-device A6W6 tuning rows as compile-time constants."""
+    tuned_file = os.path.abspath(AITER_CONFIGS.AITER_CONFIG_GEMM_A6W6_FILE)
+    configs = _load_gemm_a6w6_configs(tuned_file)
+    try:
+        gfx, cu_num = _get_device_gfx_cu(device_index)
+    except (AssertionError, IndexError, KeyError, RuntimeError):
+        return ()
+    return tuple(
+        (M, N, K, str(config["kernelName"]))
+        for (config_gfx, config_cu, M, N, K), config in configs.items()
+        if config_gfx == gfx and config_cu == cu_num
+    )
+
+
+def _select_gemm_a6w6_kernel(
+    M: int,
+    N: int,
+    K: int,
+    kernelName: str | None,
+    device: torch.device | None = None,
+) -> str:
     if kernelName:
         return kernelName
+    if torch.compiler.is_compiling():
+        device_index = (
+            torch.cuda.current_device()
+            if device is None or device.index is None
+            else device.index
+        )
+        configs = _compiled_gemm_a6w6_configs(device_index)
+        for tuned_M, tuned_N, tuned_K, tuned_kernel in configs:
+            if M == tuned_M and N == tuned_N and K == tuned_K:
+                return tuned_kernel
+        padM, padN, padK = (
+            _ceil(M, _TILE),
+            _ceil(N, _TILE),
+            _ceil(K, _K_TILE),
+        )
+        for tuned_M, tuned_N, tuned_K, tuned_kernel in configs:
+            if padM == tuned_M and padN == tuned_N and padK == tuned_K:
+                return tuned_kernel
+        return _default_gemm_a6w6_kernel(M, N, K)
     config = get_GEMM_A6W6_config(M, N, K)
     if config is not None:
         return str(config["kernelName"])
     return _default_gemm_a6w6_kernel(M, N, K)
 
 
-def mxfp6_gemm_pack_size(rows: int, K: int) -> tuple[int, int]:
-    """Return packed operand and scale element counts for quant_mxfp6_gemm."""
+def _compute_mxfp6_gemm_pack_layout(rows: int, K: int) -> tuple[int, int, int, int]:
+    """Validate one logical shape and return padding plus packed sizes."""
+    if rows <= 0 or K <= 0:
+        raise ValueError(
+            f"mxfp6_gemm_pack_size requires positive dimensions, got {(rows, K)}"
+        )
     padR, padK = _ceil(rows, _TILE), _ceil(K, _K_TILE)
     nt = padR // _TILE
     nk_pad = padK // _K_TILE + _PADK
-    return (
+    sizes = (
         nt * nk_pad * _PACKED_TILE_BYTES,
         nt * nk_pad * _SCALE_TILE_BYTES,
     )
+    if max(sizes) > _MAX_BUFFER_BYTES:
+        raise ValueError("mxfp6_gemm_pack_size exceeds the kernel's 2 GiB range")
+    return padR, padK, *sizes
+
+
+@functools.lru_cache(maxsize=1024)
+def _cached_mxfp6_gemm_pack_layout(rows: int, K: int) -> tuple[int, int, int, int]:
+    return _compute_mxfp6_gemm_pack_layout(rows, K)
+
+
+def _mxfp6_gemm_pack_layout(rows: int, K: int) -> tuple[int, int, int, int]:
+    if torch.compiler.is_compiling():
+        return _compute_mxfp6_gemm_pack_layout(rows, K)
+    return _cached_mxfp6_gemm_pack_layout(int(rows), int(K))
+
+
+def mxfp6_gemm_pack_size(rows: int, K: int) -> tuple[int, int]:
+    """Return packed operand and scale element counts for quant_mxfp6_gemm."""
+    _, _, packed_size, scale_size = _mxfp6_gemm_pack_layout(rows, K)
+    return packed_size, scale_size
+
+
+def _launch_quant_mxfp6_gemm_triton(
+    w: Tensor,
+    packed: Tensor,
+    packed_scale: Tensor,
+    rows: int,
+    K: int,
+    padK: int,
+    is_gfx950: bool,
+) -> None:
+    x = w
+    if padK != K:
+        x = torch.nn.functional.pad(x, (0, padK - K))
+    x = x.contiguous()
+    NB = padK // _SCALE_GROUP_SIZE
+    NK_PAD = padK // _K_TILE + _PADK
+    if is_gfx950 and rows * padK >= _BATCHED_PACK_MIN_ELEMENTS:
+        BM = _BATCHED_PACK_BLOCK_M
+        NSTEP = NB // _BATCHED_PACK_K_BLOCKS
+        grid = ((rows + BM - 1) // BM * NSTEP,)
+        _quant_pack_4block_kernel[grid](
+            x,
+            packed,
+            packed_scale,
+            rows,
+            NSTEP,
+            NK_PAD,
+            x.stride(0),
+            _had32_t(x.device),
+            BLOCK_M=BM,
+            num_warps=4,
+        )
+    else:
+        BM = 128
+        grid = ((rows + BM - 1) // BM * NB,)
+        _quant_pack_kernel[grid](
+            x,
+            packed,
+            packed_scale,
+            rows,
+            NB,
+            NK_PAD,
+            x.stride(0),
+            _had32_t(x.device),
+            BLOCK_M=BM,
+        )
 
 
 def quant_mxfp6_gemm_out(
@@ -691,8 +941,13 @@ def quant_mxfp6_gemm_out(
             f"quant_mxfp6_gemm_out expects a 2D [rows, K] tensor, got {w.ndim}D"
         )
     rows, K = w.shape
-    padK = _ceil(K, _K_TILE)
-    expected_packed, expected_scale = mxfp6_gemm_pack_size(rows, K)
+    _, _, expected_packed, expected_scale = _mxfp6_gemm_pack_layout(rows, K)
+    if packed.dtype != torch.uint8 or packed_scale.dtype != torch.uint8:
+        raise ValueError("quant_mxfp6_gemm_out requires uint8 output buffers")
+    if not packed.is_contiguous() or not packed_scale.is_contiguous():
+        raise ValueError("quant_mxfp6_gemm_out requires contiguous output buffers")
+    if w.device != packed.device or w.device != packed_scale.device:
+        raise ValueError("quant_mxfp6_gemm_out requires tensors on one device")
     if packed.numel() != expected_packed or packed_scale.numel() != expected_scale:
         raise ValueError(
             "quant_mxfp6_gemm_out buffers have wrong size: "
@@ -700,57 +955,27 @@ def quant_mxfp6_gemm_out(
             f"expected ({expected_packed}, {expected_scale})"
         )
     w = w.detach()
+    is_gfx950 = _is_gfx950_device(w.device)
     hip_supported = (
-        w.is_cuda and w.dtype in {torch.bfloat16, torch.float16} and _IS_GFX950
+        w.is_cuda and w.dtype in {torch.bfloat16, torch.float16} and is_gfx950
     )
     use_hip = hip_supported and _QUANT_BACKEND in {"auto", "hip"}
     if use_hip:
-        quant_mxfp6_gemm_hip_out(w.contiguous(), packed, packed_scale)
+        if not torch.compiler.is_compiling() and (
+            packed.data_ptr() % 16 or packed_scale.data_ptr() % 16
+        ):
+            raise ValueError(
+                "quant_mxfp6_gemm_out requires 16-byte-aligned HIP outputs"
+            )
+        # This path has already validated the output contract above. Avoid
+        # repeating the public wrapper's checks and pack-size calculation on
+        # every dynamic activation quantization.
+        _launch_quant_mxfp6_gemm_hip_out(w.contiguous(), packed, packed_scale)
         return packed, packed_scale
     if _QUANT_BACKEND == "hip":
         raise RuntimeError(
             "AITER_MXFP6_QUANT_BACKEND=hip requires a bf16/fp16 gfx950 CUDA/HIP tensor"
         )
-    if _HAS_TRITON and w.is_cuda:
-        x = w
-        if padK != K:
-            x = torch.nn.functional.pad(x, (0, padK - K))
-        x = (
-            x.contiguous()
-        )  # rotation is fused inside the kernel (no fp32 [M,K] pre-pass)
-        NB = padK // _SCALE_GROUP_SIZE
-        NK_PAD = padK // _K_TILE + _PADK
-        if _IS_GFX950 and rows * padK >= _BATCHED_PACK_MIN_ELEMENTS:
-            BM = _BATCHED_PACK_BLOCK_M
-            NSTEP = NB // _BATCHED_PACK_K_BLOCKS
-            grid = ((rows + BM - 1) // BM * NSTEP,)
-            _quant_pack_4block_kernel[grid](
-                x,
-                packed,
-                packed_scale,
-                rows,
-                NSTEP,
-                NK_PAD,
-                x.stride(0),
-                _had32_t(x.device),
-                BLOCK_M=BM,
-                num_warps=4,
-            )
-        else:
-            BM = 128
-            grid = ((rows + BM - 1) // BM * NB,)
-            _quant_pack_kernel[grid](
-                x,
-                packed,
-                packed_scale,
-                rows,
-                NB,
-                NK_PAD,
-                x.stride(0),
-                _had32_t(x.device),
-                BLOCK_M=BM,
-            )
-        return packed, packed_scale
 
     tmp_packed, tmp_scale = quant_mxfp6_gemm(w)
     packed.copy_(tmp_packed)
@@ -763,45 +988,51 @@ def quant_mxfp6_gemm(w: Tensor) -> tuple[Tensor, Tensor]:
 
     Rows are represented in a multiple-of-256 layout and K is zero-padded to a
     multiple of 128 so any GEMM shape maps onto the kernel's 256x256 / 128-K
-    tiling. Row-padding slots and the two trailing ABI K-guard tiles are not
-    consumed by the kernel and their contents are intentionally unspecified.
+    tiling. Row-padding slots affect only discarded output rows, and the two
+    trailing ABI K-guard tiles are not accumulated. Their contents are
+    intentionally unspecified to avoid a separate fill kernel.
 
     Returns (packed uint8, packed_scale uint8) torch tensors on w.device.
-    Works identically for both A and B operands. Runs entirely on the GPU.
+    Works identically for both A and B operands.
     """
     if w.ndim != 2:
         raise ValueError(
             f"quant_mxfp6_gemm expects a 2D [rows, K] tensor, got {w.ndim}D"
         )
     rows, K = w.shape
-    padR, padK = _ceil(rows, _TILE), _ceil(K, _K_TILE)
+    padR, padK, packed_size, scale_size = _mxfp6_gemm_pack_layout(rows, K)
     w = w.detach()
-    has_gpu_packer = w.is_cuda and (
-        _HAS_TRITON
-        or (
-            _IS_GFX950
-            and w.dtype in {torch.bfloat16, torch.float16}
-            and _QUANT_BACKEND in {"auto", "hip"}
-        )
+    is_gfx950 = _is_gfx950_device(w.device)
+    use_hip = (
+        w.is_cuda
+        and w.dtype in {torch.bfloat16, torch.float16}
+        and is_gfx950
+        and _QUANT_BACKEND in {"auto", "hip"}
     )
-    if has_gpu_packer:
-        NK_PAD = padK // _K_TILE + _PADK
-        nt = padR // _TILE
-        # The Triton packer writes every logical K tile.  The ASM bounds
-        # accumulation with K; _PADK is addressable pipeline-guard spacing, not
-        # data.  Leave guard and row-padding slots unspecified to avoid a fill
-        # launch on every activation quantization in inference.
+    if use_hip:
+        # The packer writes every logical K tile. The ASM bounds accumulation
+        # with K; _PADK is addressable pipeline-guard spacing, not data. Leave
+        # guard and row-padding slots unspecified to avoid a fill launch on
+        # every activation quantization in inference.
         packed = torch.empty(
-            nt * NK_PAD * _PACKED_TILE_BYTES,
+            packed_size,
             dtype=torch.uint8,
             device=w.device,
         )
         packed_scale = torch.empty(
-            (nt * NK_PAD * _SCALE_TILE_BYTES,),
+            scale_size,
             dtype=torch.uint8,
             device=w.device,
         )
-        return quant_mxfp6_gemm_out(w, packed, packed_scale)
+        # These buffers were allocated from the validated pack sizes above,
+        # so the public caller-buffer checks would only duplicate work.
+        _launch_quant_mxfp6_gemm_hip_out(w.contiguous(), packed, packed_scale)
+        return packed, packed_scale
+    if _QUANT_BACKEND == "hip":
+        raise RuntimeError(
+            "AITER_MXFP6_QUANT_BACKEND=hip requires a bf16/fp16 "
+            "gfx950 CUDA/HIP tensor"
+        )
     # torch fallback (no triton / cpu)
     if padR != rows or padK != K:
         wp = torch.zeros((padR, padK), dtype=w.dtype, device=w.device)
@@ -827,7 +1058,7 @@ def _gemm_a6w6_asm(
     A_scale: Tensor,  # packed e8m0 blob
     B_scale: Tensor,  # packed e8m0 blob
     out: Tensor,  # Out:[M, N] bf16
-    K: int,  # logical contraction dim
+    K: int,  # padded contraction dim consumed by the packed layout
     kernelName: str | None = None,
     alpha: float = 1.0,
 ) -> None: ...
@@ -887,7 +1118,7 @@ def gemm_a6w6(
         )
     if float(alpha) != 1.0:
         raise ValueError("gemm_a6w6 currently supports only alpha=1.0.")
-    selected_kernel = _select_gemm_a6w6_kernel(M, N, K, kernelName)
+    selected_kernel = _select_gemm_a6w6_kernel(M, N, K, kernelName, device=A.device)
     padM, padN, padK = _ceil(M, _TILE), _ceil(N, _TILE), _ceil(K, _K_TILE)
     out = torch.empty((padM, padN), dtype=dtype, device=A.device)
     gemm_a6w6_asm(A, B, A_scale, B_scale, out, padK, selected_kernel, alpha)

@@ -27,28 +27,44 @@ _gemm_a16w16_compute_bound_repr = make_kernel_repr(
 )
 
 
+# TDM encodes log2(pad interval in dwords) - 1 in a 3-bit field, so the
+# interval cannot exceed 2^8 = 256 dwords (TDMUtility.cpp createTDMDescriptor
+# asserts log2PadIntervalDwords <= 8).
+_MAX_PAD_INTERVAL_DWORDS = 256
+
+
+def _pad_interval(extent, elem_bits):
+    """Largest encodable pad interval, in elements, not exceeding `extent`."""
+    return min(extent, _MAX_PAD_INTERVAL_DWORDS * 32 // elem_bits)
+
+
 def create_shared_layouts(
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
     BLOCK_K: gl.constexpr,
     LAYOUT: gl.constexpr,
+    elem_bits: int = 16,
+    elem_bits_b: int | None = None,
 ):
+    """elem_bits sizes A's pad interval; elem_bits_b sizes B's (defaults to elem_bits)."""
+    if elem_bits_b is None:
+        elem_bits_b = elem_bits
     if LAYOUT[0] == "T":
         SHARED_LAYOUT_A: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-            [[BLOCK_K, 8]], [BLOCK_M, BLOCK_K], [1, 0]
+            [[_pad_interval(BLOCK_K, elem_bits), 8]], [BLOCK_M, BLOCK_K], [1, 0]
         )
     else:
         SHARED_LAYOUT_A: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-            [[BLOCK_M, 8]], [BLOCK_K, BLOCK_M], [1, 0]
+            [[_pad_interval(BLOCK_M, elem_bits), 8]], [BLOCK_K, BLOCK_M], [1, 0]
         )
 
     if LAYOUT[1] == "T":
         SHARED_LAYOUT_B: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-            [[BLOCK_N, 16]], [BLOCK_K, BLOCK_N], [1, 0]
+            [[_pad_interval(BLOCK_N, elem_bits_b), 16]], [BLOCK_K, BLOCK_N], [1, 0]
         )
     else:
         SHARED_LAYOUT_B: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-            [[BLOCK_K, 8]], [BLOCK_N, BLOCK_K], [1, 0]
+            [[_pad_interval(BLOCK_K, elem_bits_b), 8]], [BLOCK_N, BLOCK_K], [1, 0]
         )
 
     return (SHARED_LAYOUT_A, SHARED_LAYOUT_B)
@@ -373,13 +389,22 @@ def _gemm_a16w16_bandwidth_bound_kernel(
         0, BLOCK_N, layout=gl.SliceLayout(0, WMMA_LAYOUT)
     )
 
-    offs_c = stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
+    # buffer_store offsets are 32-bit, so offsets from c_ptr itself drop every
+    # store past 2**31 bytes of C; rebase C to this block in int64 instead.
+    c_base = (
+        c_ptr
+        + (pid_m * BLOCK_M).to(gl.int64) * stride_cm
+        + (pid_n * BLOCK_N).to(gl.int64) * stride_cn
+    )
+    offs_c = stride_cm * (offs_cm[:, None] - pid_m * BLOCK_M) + stride_cn * (
+        offs_cn[None, :] - pid_n * BLOCK_N
+    )
 
     mask_c = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
 
     # Store
     gl.amd.gfx1250.buffer_store(
-        accumulator.to(c_ptr.type.element_ty), c_ptr, offs_c, mask=mask_c
+        accumulator.to(c_ptr.type.element_ty), c_base, offs_c, mask=mask_c
     )
 
 

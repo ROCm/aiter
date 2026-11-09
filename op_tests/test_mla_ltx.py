@@ -1,14 +1,17 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""MLA decode: large page_id, KV byte offset, and >4GB pools (gfx950 asm).
+"""MLA decode: large page_id, KV byte offset, and >4 GiB pools (gfx942/gfx950 asm).
 
-Compares torch golden vs mla_decode_fwd (gfx950 asm).
+Compares torch golden vs mla_decode_fwd.
 Follows op_tests/test_quant.py layout (aiter-op-test SKILL).
 
 Examples:
   python op_tests/test_mla_ltx.py
+    # default on gfx942: 16 BF16 cases (16/128 heads, ps+nps, boundary+split-KV)
     # default on gfx950: PR global-load .co sweep (8 presets, ps, boundary+page16m)
+  python op_tests/test_mla_ltx.py --suites kv_address --ps nps
+    # gfx942: stage-1 only; use --ps ps for persistent only (8 cases each)
   python op_tests/test_mla_ltx.py --preset qh64_fp8_q1 --ps ps --lse off --page-base 19000000 --ctx 4
   python op_tests/test_mla_ltx.py --preset qh16_fp8_q1 qh64_bf16_q1 --suites boundary --ps ps --lse off
   python op_tests/test_mla_ltx.py --suites page16m -d fp8 -kvd fp8 -n 16,1 --ps ps --lse off --ctx 4
@@ -34,7 +37,7 @@ from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
 
-SUPPORTED_GFX = ["gfx950"]
+SUPPORTED_GFX = ["gfx942", "gfx950"]
 
 # --- Fixed MLA layout (decode absorb, page_size=1) ---
 KV_LORA_RANK = 512
@@ -86,6 +89,7 @@ class PointCase:
     ctx_len: int
     label: str
     suite: str
+    max_split: int = 1
 
 
 @dataclass
@@ -148,11 +152,13 @@ PRESETS: dict[str, PresetConfig] = {
     "qh16_bf16_q8": (dtypes.bf16, dtypes.bf16, 16, 8),
     "qh32_bf16_q4": (dtypes.bf16, dtypes.bf16, 32, 4),
     "qh64_bf16_q1": (dtypes.bf16, dtypes.bf16, 64, 1),
+    "qh128_bf16_q1": (dtypes.bf16, dtypes.bf16, 128, 1),
     # legacy aliases
     "qh16_fp8": (dtypes.fp8, dtypes.fp8, 16, 1),
     "qh64_bf16": (dtypes.bf16, dtypes.bf16, 64, 1),
 }
 DEFAULT_PRESET = "qh16_fp8_q1"
+GFX942_PRESETS = ("qh16_bf16_q1", "qh128_bf16_q1")
 
 # PR #4452 global-load .co: decode presets reachable via ps+lse off (skip cprr;
 # skip qh16_fp8_q4 nps -> unrefreshed qh64_qseqlen4 alias in mla_asm.csv).
@@ -210,6 +216,17 @@ def _point_cases_for(h: Harness) -> list[PointCase]:
         PointCase(PAGE_ID_16M, SUB_KV_TILE, "page_id_16m_ctx128", "page16m"),
         PointCase(1 << 24, ctx, "page_id_2p24", "page16m"),
         PointCase(19_000_000, ctx, "page_id_19m", "page16m"),
+    ]
+
+
+def _kv_address_cases(h: Harness) -> list[PointCase]:
+    # A BF16 row starts below 4 GiB but straddles it at page 3,728,270.
+    boundary = (1 << 32) // h.bytes_per_page
+    return [
+        PointCase(boundary - 1, 1, "below4g", "kv_address"),
+        PointCase(boundary, 1, "straddling4g", "kv_address"),
+        PointCase(boundary + 1, 1, "above4g", "kv_address"),
+        PointCase(boundary + 1, 256, "above4g-splitkv", "kv_address", max_split=4),
     ]
 
 
@@ -384,6 +401,12 @@ def run_asm_mla_decode(
     if persistent:
         kw["num_kv_splits"] = max_split
         kw.update(_build_persistent_metadata(qo_indptr, kv_indptr, kv_lens, max_split))
+    elif get_gfx() == "gfx942":
+        # Preserve the requested splits even for short regression sequences.
+        kw["num_kv_splits"] = max_split
+        kw["num_kv_splits_indptr"] = torch.tensor(
+            [0, max_split], dtype=torch.int, device="cuda"
+        )
     aiter.mla.mla_decode_fwd(
         q_asm,
         kv_view,
@@ -465,12 +488,17 @@ def test_mla_ltx(
     kv_dtype,
     nhead,
     decode_qlen,
+    check_kv_address=False,
 ):
     apply_config(q_dtype, kv_dtype, nhead, decode_qlen)
     if _KV_POOL is None:
         raise RuntimeError("KV pool not initialized; call from main() only")
 
     pool, num_pages = _KV_POOL
+    if check_kv_address:
+        return _check_kv_address(
+            pool, page_base, ctx_len, label, persistent, return_lse, max_split
+        )
     pb = None if page_base == SEQ_PAGE_BASE else page_base
     qo, kv_i, kv_x = _make_indptr(ctx_len, pb)
 
@@ -525,6 +553,67 @@ def test_mla_ltx(
     return ret
 
 
+def _check_kv_address(
+    pool, page_base, ctx_len, label, persistent, return_lse, max_split
+):
+    """ROCm/aiter#5826: compare identical KV data at low and high offsets."""
+    mode = "persistent" if persistent else "stage1"
+    name = f"{label}-{mode}-{HARNESS.nhead}"
+    generator = torch.Generator(device="cpu").manual_seed(42)
+    q_cpu = torch.randn(
+        1, HARNESS.nhead, QK_HEAD_DIM, generator=generator, device="cpu"
+    ).to(torch.bfloat16)
+    kv_cpu = torch.randn(ctx_len, QK_HEAD_DIM, generator=generator, device="cpu").to(
+        torch.bfloat16
+    )
+    # Independent of GPU page indexing, including the reference's KV reads.
+    scores = (q_cpu[0].float() @ kv_cpu.float().T) * (QK_HEAD_DIM**-0.5)
+    reference = (torch.softmax(scores, dim=-1) @ kv_cpu[:, :V_HEAD_DIM].float())[None]
+    q = q_cpu.cuda()
+    source = kv_cpu.cuda().view(ctx_len, NHEAD_KV, QK_HEAD_DIM)
+    pool[SAFE_PAGE_BASE : SAFE_PAGE_BASE + ctx_len].copy_(source)
+    placed = pool[page_base : page_base + ctx_len]
+    placed.copy_(source)
+    torch.testing.assert_close(placed.cpu().view_as(kv_cpu), kv_cpu, rtol=0, atol=0)
+
+    ret = {"gfx": get_gfx(), "label": label, "passed": True}
+    try:
+        for control, pool_view, page in (
+            ("low-offset control", pool, SAFE_PAGE_BASE),
+            ("same-byte rebased control", placed, 0),
+            ("pool-global page indices", pool, page_base),
+        ):
+            qo, kv_i, kv_x = _make_indptr(ctx_len, page)
+            out = torch.full(
+                (1, HARNESS.nhead, V_HEAD_DIM),
+                float("nan"),
+                dtype=torch.bfloat16,
+                device="cuda",
+            )
+            run_asm_mla_decode(
+                q,
+                pool_view,
+                pool_view.shape[0],
+                out,
+                qo,
+                kv_i,
+                kv_x,
+                persistent=bool(persistent),
+                return_lse=bool(return_lse),
+                max_split=max_split,
+            )
+            torch.testing.assert_close(
+                out.float().cpu(), reference, atol=2e-2, rtol=2e-2, msg=control
+            )
+    except AssertionError as exc:
+        ret["passed"] = False
+        ret["failure"] = str(exc)
+        print(f"FAIL {name}: {exc}", flush=True)
+    else:
+        print(f"PASS {name}", flush=True)
+    return ret
+
+
 def _parse_persistent(values: list[str]) -> list[bool]:
     out: list[bool] = []
     for v in values:
@@ -559,13 +648,15 @@ def _sweep_rows(
     decode_qlen,
     persistent_modes: list[bool],
     lse_modes: list[bool],
-    max_splits: list[int],
+    max_splits: list[int] | None,
 ) -> list[dict]:
     rows: list[dict] = []
     for c in points:
         ctx = ctx_override if ctx_override > 0 else c.ctx_len
         for persistent, lse, max_split in itertools.product(
-            persistent_modes, lse_modes, max_splits
+            persistent_modes,
+            lse_modes,
+            max_splits if max_splits is not None else [c.max_split],
         ):
             rows.append(
                 test_mla_ltx(
@@ -579,11 +670,12 @@ def _sweep_rows(
                     kv_dtype,
                     nhead,
                     decode_qlen,
+                    check_kv_address=c.suite == "kv_address",
                 )
             )
     for ctx, label in seq:
         for persistent, lse, max_split in itertools.product(
-            persistent_modes, lse_modes, max_splits
+            persistent_modes, lse_modes, max_splits if max_splits is not None else [1]
         ):
             rows.append(
                 test_mla_ltx(
@@ -603,7 +695,8 @@ def _sweep_rows(
 
 
 def main():
-    if len(sys.argv) == 1 and get_gfx() in SUPPORTED_GFX:
+    gfx = get_gfx()
+    if len(sys.argv) == 1 and gfx == "gfx950":
         sys.argv.extend(
             [
                 "--preset",
@@ -618,14 +711,15 @@ def main():
             ]
         )
 
-    if get_gfx() not in SUPPORTED_GFX:
-        aiter.logger.warning("mla_ltx unsupported on %s; skipping", get_gfx())
+    if gfx not in SUPPORTED_GFX:
+        aiter.logger.warning("mla_ltx unsupported on %s; skipping", gfx)
         return
 
-    _dq, _dkv, _dn, _dql = PRESETS[DEFAULT_PRESET]
+    is_gfx942 = gfx == "gfx942"
+    _dq, _dkv, _dn, _dql = PRESETS[GFX942_PRESETS[0] if is_gfx942 else DEFAULT_PRESET]
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,
-        description="MLA decode large page_id / >4GB KV pool (gfx950 asm)",
+        description="MLA decode large page_id / >4 GiB KV pool (gfx942/gfx950 asm)",
     )
     parser.add_argument(
         "--preset",
@@ -639,8 +733,9 @@ def main():
         "--suite",
         dest="suites",
         nargs="*",
-        default=[],
-        choices=["boundary", "over4g", "pa_window", "mega", "page16m"],
+        default=["kv_address"] if is_gfx942 else [],
+        choices=["boundary", "over4g", "pa_window", "mega", "page16m"]
+        + (["kv_address"] if is_gfx942 else []),
         help="case groups to sweep (empty = all groups)",
     )
     parser.add_argument(
@@ -666,7 +761,7 @@ def main():
         "--nhead",
         type=dtypes.str2tuple,
         nargs="*",
-        default=[(_dn, _dql)],
+        default=[(16, 1), (128, 1)] if is_gfx942 else [(_dn, _dql)],
         help="nhead,decode_qlen tuples (same as test_mla.py -n)",
     )
     parser.add_argument(
@@ -674,14 +769,14 @@ def main():
         "--ps",
         dest="persistent",
         nargs="*",
-        default=["ps"],
-        help="ps / nps sweep (default ps only; --ps is alias of --persistent)",
+        default=["nps", "ps"] if is_gfx942 else ["ps"],
+        help="ps / nps sweep (default: both on gfx942, ps on gfx950)",
     )
     parser.add_argument(
         "--lse",
         nargs="*",
-        default=["off", "on"],
-        help="on / off sweep (default both)",
+        default=["off"] if is_gfx942 else ["off", "on"],
+        help="on / off sweep (default: off on gfx942, both on gfx950)",
     )
     parser.add_argument(
         "--ctx",
@@ -701,8 +796,8 @@ def main():
         "--num-kv-splits",
         type=int,
         nargs="*",
-        default=[1],
-        help="persistent num_kv_splits sweep",
+        default=None,
+        help="split counts (default: 4 for the kv_address split-KV case, 1 otherwise)",
     )
     parser.add_argument(
         "--mega-ctx",
@@ -727,10 +822,20 @@ def main():
             )
         ]
 
+    if is_gfx942 and any(
+        row not in [PRESETS[p] for p in GFX942_PRESETS] for row in config_rows
+    ):
+        parser.error(
+            "gfx942 coverage requires BF16 Q/KV, 16 or 128 heads, and decode_qlen=1"
+        )
+
+    address_results = []
     for q_dtype, kv_dtype, nhead, decode_qlen in config_rows:
         apply_config(q_dtype, kv_dtype, nhead, decode_qlen)
         global _POINT_CASES, _SEQUENTIAL_CASES, _KV_POOL
         _POINT_CASES = _point_cases_for(HARNESS)
+        if is_gfx942:
+            _POINT_CASES.extend(_kv_address_cases(HARNESS))
         _SEQUENTIAL_CASES = [(HARNESS.mega_ctx_len(), "sequential_mega_over4g", "mega")]
 
         points = _filter_points(args.suites)
@@ -751,12 +856,24 @@ def main():
                     break
 
         for ctx_override in ctx_overrides:
+            needed_pages = _need_num_pages(points, seq, ctx_override)
             num_pages = int(
                 os.environ.get(
                     "MLA_PAGE_OOB_NUM_PAGES",
-                    str(_need_num_pages(points, seq, ctx_override)),
+                    str(needed_pages),
                 )
             )
+            if any(c.suite == "kv_address" for c in points):
+                if num_pages < needed_pages:
+                    parser.error(
+                        f"kv_address requires at least {needed_pages} KV pages"
+                    )
+                free_bytes, _ = torch.cuda.mem_get_info()
+                if free_bytes < _pool_bytes(num_pages) + (1 << 30):
+                    aiter.logger.warning(
+                        "SKIP kv_address: requires a 4 GiB pool plus 1 GiB of workspace"
+                    )
+                    continue
             aiter.logger.info(
                 "mla_ltx config=%s suites=%s pages=%d pool_GiB=%.2f",
                 HARNESS.summary(),
@@ -785,6 +902,7 @@ def main():
                 lse_modes,
                 args.num_kv_splits,
             )
+            address_results.extend(row for row in rows if "passed" in row)
             df = pd.DataFrame(rows)
             aiter.logger.info(
                 "mla_ltx summary (markdown):\n%s", df.to_markdown(index=False)
@@ -792,6 +910,14 @@ def main():
             del _KV_POOL
             _KV_POOL = None
             torch.cuda.empty_cache()
+
+    if address_results:
+        failed = sum(not row["passed"] for row in address_results)
+        print(
+            f"gfx942 KV addressing: {len(address_results) - failed} passed, {failed} failed"
+        )
+        if failed:
+            raise AssertionError(f"{failed} KV-address cases failed")
 
 
 if __name__ == "__main__":

@@ -54,6 +54,30 @@ void all_gather(fptr_t _fa,
                 int64_t dim,
                 int64_t reg_inp_ptr,
                 int64_t reg_inp_bytes);
+void fused_allreduce_rmsnorm(fptr_t _fa,
+                             const aiter_tensor_t& inp,
+                             const aiter_tensor_t& res_inp,
+                             const aiter_tensor_t& res_out,
+                             const aiter_tensor_t& out,
+                             const aiter_tensor_t& w,
+                             double eps,
+                             int64_t reg_ptr,
+                             int64_t reg_bytes,
+                             bool use_1stage,
+                             bool gemma_norm);
+void fused_allreduce_rmsnorm_quant(fptr_t _fa,
+                                   const aiter_tensor_t& inp,
+                                   const aiter_tensor_t& res_inp,
+                                   const aiter_tensor_t& res_out,
+                                   const aiter_tensor_t& out,
+                                   const aiter_tensor_t& scale_out,
+                                   const aiter_tensor_t& w,
+                                   double eps,
+                                   int64_t reg_ptr,
+                                   int64_t reg_bytes,
+                                   bool use_1stage,
+                                   bool gemma_norm,
+                                   int64_t bf16_out_ptr);
 void p2p_bw_test(fptr_t _fa,
                   const aiter_tensor_t& inp,
                   const aiter_tensor_t& out,
@@ -69,7 +93,7 @@ void reduce_scatter(fptr_t _fa,
                     int64_t split_dim,
                     int64_t reg_ptr, int64_t reg_bytes);
 void dispose(fptr_t _fa);
-int64_t meta_size();
+int64_t meta_size(int64_t world_size);
 // register_input/output_buffer receive direct device pointers per rank.
 void register_input_buffer(fptr_t _fa,
                            int64_t self_ptr,
@@ -90,6 +114,11 @@ int64_t get_graph_buffer_count(fptr_t _fa);
 void get_graph_buffer_ptrs(fptr_t _fa, int64_t ptrs_out);
 void register_graph_buffers(fptr_t _fa,
                             const std::vector<int64_t>& ptrs_per_rank);
+// IPC transport variants (ROCm >= 7.15): captured buffers as handles+offsets.
+void get_graph_buffer_ipc_meta(fptr_t _fa, int64_t handle_out, int64_t offset_out);
+void register_graph_buffers_ipc(fptr_t _fa,
+                                const std::vector<int64_t>& handle_ptrs,
+                                const std::vector<int64_t>& offset_ptrs);
 void start_sync_latency(fptr_t _fa, int64_t blocks);
 void end_sync_latency(fptr_t _fa, int64_t blocks);
 void two_sync_latency(fptr_t _fa, int64_t blocks);

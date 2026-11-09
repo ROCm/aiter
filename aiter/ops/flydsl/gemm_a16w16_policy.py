@@ -8,14 +8,17 @@ from dataclasses import dataclass
 
 import torch
 
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx, get_lds_capacity_bytes
 
+from .gemm_a16w16_band import band_stream_config
 from .kernels.gemm_a16w16_gfx950 import (
     GEMM_A16W16_DTYPE_BF16,
     GEMM_A16W16_DTYPE_FP16,
     GEMM_A16W16_DTYPE_FP32,
     make_gemm_a16w16_param_and_validate,
 )
+from .kernels.gemm_a16w16_kernel_gfx1250 import LDS_PAD_A, LDS_PAD_B
+from .kernels.gemm_a16w16_skinny_gfx950 import skinny_config_error
 
 __all__ = ["GemmConfigPruner", "get_flydsl_a16w16_configs"]
 
@@ -65,11 +68,9 @@ class GemmConfigPruner:
             * config["block_n"]
             * self.element_bytes,
         )
-        lds_per_cu = getattr(
-            props,
-            "shared_memory_per_multiprocessor",
-            props.shared_memory_per_block,
-        )
+        # A workgroup may occupy the whole per-CU LDS here, so the capacity the
+        # chip table reports per workgroup is also the per-CU figure.
+        lds_per_cu = get_lds_capacity_bytes()
         resident = (
             min(
                 props.max_threads_per_multi_processor // props.warp_size // waves,
@@ -127,6 +128,76 @@ class GemmConfigPruner:
         return [config for index, config in enumerate(kept) if index in keep]
 
 
+# Tiles of the gfx1250 kernel (gemm_a16w16_gfx1250) as (block_m, block_n, block_k,
+# m_waves, n_waves). They hold the config of every gfx1250 FlyDSL row in the BF16
+# tuned CSVs, which come from sweeps over BF16 shapes from M = 1 to 16384.
+_GFX1250_TILES = (
+    (16, 16, 256, 1, 1),
+    (16, 64, 256, 1, 2),
+    (16, 128, 256, 1, 2),
+    (64, 64, 128, 4, 2),
+    (64, 64, 256, 4, 2),
+    (64, 128, 128, 2, 2),
+    (128, 128, 32, 2, 4),
+    (128, 128, 64, 2, 2),
+    (128, 256, 64, 2, 4),
+    (256, 128, 64, 4, 2),
+    (256, 256, 64, 2, 4),
+    (256, 256, 128, 2, 2),
+    (256, 256, 128, 2, 4),
+)
+
+
+def gfx1250_lds_bytes(block_m, block_n, block_k, stages, split_k):
+    """LDS of gemm_a16w16_gfx1250: every stage holds a padded A and B tile."""
+    a_elems = block_m * (block_k + LDS_PAD_A) + LDS_PAD_A
+    b_elems = block_n * (block_k + LDS_PAD_B) + LDS_PAD_B
+    # Split-K adds a 16-byte-aligned flag.
+    return stages * (a_elems + b_elems) * 2 + (16 if split_k > 1 else 0)
+
+
+def _gfx1250_configs(m: int, n: int, k: int):
+    lds_bytes = get_lds_capacity_bytes("gfx1250")
+    split_k_candidates = [1]
+    split_k_candidates.extend(split_k for split_k in range(2, 9) if k % split_k == 0)
+    configs = []
+    for (
+        (block_m, block_n, block_k, m_waves, n_waves),
+        stages,
+        split_k,
+        half,
+    ) in itertools.product(
+        _GFX1250_TILES, range(2, 7), split_k_candidates, (False, True)
+    ):
+        if gfx1250_lds_bytes(block_m, block_n, block_k, stages, split_k) > lds_bytes:
+            continue
+        # The split-K reduction code grows with the accumulators per wave: with 64 of
+        # them (256x256 on 2x2 waves) one candidate compiled for minutes, and no gfx1250
+        # row uses split-K with more than 2.
+        if split_k > 1 and (block_m // m_waves // 16) * (block_n // n_waves // 16) > 4:
+            continue
+        # The prologue fills stages - 1 buffers from each split's K range.
+        if -(-(k // split_k) // block_k) < stages - 1:
+            continue
+        configs.append(
+            {
+                "block_m": block_m,
+                "block_n": block_n,
+                "block_k": block_k,
+                "stages": stages,
+                "split_k": split_k,
+                "m_waves": m_waves,
+                "n_waves": n_waves,
+                # The gfx1250 kernel has no slice-K and ignores group_m.
+                "k_waves": 1,
+                "group_m": 0,
+                "use_half_tile_interleaved": half,
+            }
+        )
+    device_props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    return GemmConfigPruner(m, n, k, device_props, 2).prune(configs)
+
+
 def get_flydsl_a16w16_configs(
     m: int,
     n: int,
@@ -137,13 +208,15 @@ def get_flydsl_a16w16_configs(
 ):
     """Generate and validate the shape-aware policy catalog used by tuning."""
 
-    if make_gemm_a16w16_param_and_validate is None:
-        return []
-    if get_gfx() != "gfx950":
-        return []
     if dtype not in (torch.float16, torch.bfloat16):
         return []
     if out_dtype not in (dtype, torch.float32):
+        return []
+    if get_gfx() in ("gfx1250", "gfx1250-strict"):
+        return _gfx1250_configs(m, n, k)
+    if make_gemm_a16w16_param_and_validate is None:
+        return []
+    if get_gfx() != "gfx950":
         return []
 
     split_k_candidates = [1]
@@ -178,6 +251,7 @@ def get_flydsl_a16w16_configs(
     )
     out_dtype_id = GEMM_A16W16_DTYPE_FP32 if out_dtype == torch.float32 else in_dtype_id
     valid_configs = []
+    memory_configs = []
     is_large_gemm = m >= 4096 and n >= 4096 and k >= 4096
     for config in configs:
         if is_large_gemm:
@@ -196,7 +270,10 @@ def get_flydsl_a16w16_configs(
         elif not config["use_half_tile_interleaved"]:
             mma_m_iters = config["block_m"] // config["m_waves"] // 16
             mma_n_iters = config["block_n"] // config["n_waves"] // 16
-            if mma_m_iters > 4 or mma_n_iters > 4:
+            # Decode tiles can stream a wider N panel per wave. The old
+            # four-repeat cutoff excluded 128x96 / 4x1-wave candidates.
+            max_n_iters = 8 if m <= 128 and m <= config["block_m"] else 4
+            if mma_m_iters > 4 or mma_n_iters > max_n_iters:
                 continue
 
         validation_config = {
@@ -217,4 +294,44 @@ def get_flydsl_a16w16_configs(
             is not None
         ):
             valid_configs.append(config)
-    return valid_configs
+            # Stagger is a measured option, never a global default. At small
+            # M, a single row tile streams B; preserve the original catalog
+            # and let tuning race stagger and B cache policy against the original.
+            if m <= 128 and m <= config["block_m"]:
+                memory_configs.extend(
+                    {**config, "k_stagger": stride, "b_non_temporal": nt}
+                    for stride in (0, 1, 3)
+                    for nt in (False, True)
+                    if stride or nt
+                )
+    skinny_configs = []
+    if dtype == out_dtype == torch.bfloat16 and not has_bias and 0 < m <= 128:
+        # The public wrapper and tuned-name parser already support skinny,
+        # but the tuner previously generated only FT/HTI candidates.
+        block_m = -(-m // 8) * 8
+        for block_n, block_k, stages, k_waves in itertools.product(
+            (16, 24, 32, 48, 64, 72, 80, 96), (32, 64, 128), (2, 3, 4, 6), (2, 4, 8)
+        ):
+            if skinny_config_error(n, k, block_m, block_n, block_k, stages, k_waves):
+                continue
+            skinny_configs.append(
+                {
+                    "block_m": block_m,
+                    "block_n": block_n,
+                    "block_k": block_k,
+                    "stages": stages,
+                    "split_k": 1,
+                    "m_waves": 1,
+                    "n_waves": 1,
+                    "k_waves": k_waves,
+                    "group_m": 0,
+                    "use_half_tile_interleaved": False,
+                    "policy": "sk",
+                }
+            )
+    band_configs = []
+    if dtype == out_dtype == torch.bfloat16 and not has_bias:
+        config = band_stream_config(m, n, k)
+        if config is not None and device_props.multi_processor_count == 256:
+            band_configs.append(config)
+    return valid_configs + memory_configs + skinny_configs + band_configs

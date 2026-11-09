@@ -33,6 +33,7 @@ from aiter.ops.triton._triton_kernels.attention.mla_decode_rope import (
     _fwd_kernel_stage2,
     _get_config,
 )
+from aiter.ops.triton.utils.device_info import get_num_xcds
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
@@ -108,6 +109,7 @@ def _decode_grouped_att_m_fwd_rope(
         USE_ROPE=use_rope,
         IS_NEOX_STYLE=is_neox_style,
         **config,
+        NUM_XCDS=get_num_xcds(),
     )
 
 
@@ -140,6 +142,7 @@ def _decode_softmax_reducev_fwd(
         head_num=head_num,
         batch=batch,
         **config,
+        NUM_XCDS=get_num_xcds(),
     )
 
 
@@ -196,8 +199,12 @@ def decode_attention_fwd_grouped_rope(
         torch.Tensor: Output tensor o with shape (batch, num_q_heads, v_head_dim).
     """
     _LOGGER.info(
-        f"DECODE_ATTENTION_FWD_GROUPED_ROPE:  q={tuple(q.shape)}  k_buffer={tuple(k_buffer.shape)}  v_buffer={tuple(v_buffer.shape)} "
-        + f"k_pe_tokens={tuple(k_pe_tokens.shape) if k_pe_tokens is not None else None} cos_sin_cache={tuple(cos_sin_cache.shape) if cos_sin_cache is not None else None}"
+        "DECODE_ATTENTION_FWD_GROUPED_ROPE:  q=%s  k_buffer=%s  v_buffer=%s k_pe_tokens=%s cos_sin_cache=%s",
+        tuple(q.shape),
+        tuple(k_buffer.shape),
+        tuple(v_buffer.shape),
+        tuple(k_pe_tokens.shape) if k_pe_tokens is not None else None,
+        tuple(cos_sin_cache.shape) if cos_sin_cache is not None else None,
     )
     if config is None:
         # _get_config() returns the shared cached dict and the launch helpers

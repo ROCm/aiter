@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import itertools
 import math
 
 import torch
@@ -343,6 +344,39 @@ def generate_qkv(
             dq_pad_fn,
             dk_pad_fn,
         )
+
+
+def quantize_fp8_per_bh(x, fp8_dtype, cu_seqlens=None):
+    """Per-(batch, head) symmetric fp8 quantization.
+
+    Arguments:
+        x: 4D [batch, seqlen, heads, head_dim] (bshd), or 3D
+            [total_tokens, heads, head_dim] (thd), in which case cu_seqlens
+            supplies the batch axis.
+        fp8_dtype: target fp8 dtype, e.g. torch.float8_e4m3fn.
+        cu_seqlens: (batch + 1,) cumulative sequence lengths. Required for thd,
+            ignored for bshd.
+    Return:
+        x_fp8: quantized tensor, same shape as x.
+        descale: fp32 dequant scalars (amax / fp8_max), one per (batch, head) of
+            x itself with no grouping across heads -- so a query yields
+            [batch, nheads_q] while key/value yield [batch, nheads_k].
+    """
+    fp8_max = torch.finfo(fp8_dtype).max
+    if x.dim() == 4:
+        amax = x.abs().amax(dim=(1, 3)).float().clamp(min=1e-9)  # [batch, heads]
+        x_fp8 = (x * (fp8_max / amax)[:, None, :, None]).to(fp8_dtype)
+        return x_fp8, amax / fp8_max
+    if x.dim() == 3:
+        assert cu_seqlens is not None, "thd input requires cu_seqlens"
+        segments, descales = [], []
+        for start, end in itertools.pairwise(cu_seqlens.tolist()):
+            seg = x[start:end]
+            amax = seg.abs().amax(dim=(0, 2)).float().clamp(min=1e-9)  # [heads]
+            segments.append((seg * (fp8_max / amax).unsqueeze(-1)).to(fp8_dtype))
+            descales.append(amax / fp8_max)
+        return torch.cat(segments), torch.stack(descales)
+    raise ValueError(f"expected a 4D (bshd) or 3D (thd) tensor, got shape {x.shape}")
 
 
 def construct_local_mask(

@@ -1,0 +1,54 @@
+{
+    "any": {
+        "BLOCK_K": 64,
+        "BLOCK_M": 64,
+        "BLOCK_N": 32,
+        "GROUP_SIZE_M": 4,
+        "num_stages": 1,
+        "num_warps": 4
+    },
+    "M_LEQ_1024": {
+        "BLOCK_K": 64,
+        "BLOCK_M": 16,
+        "BLOCK_N": 32,
+        "GROUP_SIZE_M": 4,
+        "num_stages": 1,
+        "num_warps": 2
+    },
+    "M_LEQ_4096": {
+        "BLOCK_K": 64,
+        "BLOCK_M": 64,
+        "BLOCK_N": 64,
+        "GROUP_SIZE_M": 4,
+        "num_stages": 1,
+        "num_warps": 4
+    },
+    "shapes": {
+        "N=1,C=64,D=8,H=24,W=24,K=64,T=3,R=3,S=3,sd=2,sh=2,sw=2,pd=1,ph=1,pw=1,dd=1,dh=1,dw=1": {
+            "BLOCK_M": 16,
+            "BLOCK_N": 16,
+            "BLOCK_K": 64,
+            "GROUP_SIZE_M": 16,
+            "num_warps": 1,
+            "num_stages": 2,
+            "waves_per_eu": 0
+        },
+        "N=1,C=384,D=3,H=46,W=51,K=384,T=3,R=3,S=3,sd=1,sh=1,sw=1,pd=0,ph=0,pw=0,dd=1,dh=1,dw=1": {
+            "BLOCK_K": 32,
+            "BLOCK_M": 64,
+            "BLOCK_N": 64,
+            "GROUP_SIZE_M": 1,
+            "num_stages": 1,
+            "num_warps": 4,
+            "waves_per_eu": 2
+        },
+        "N=1,C=96,D=6,H=354,W=394,K=96,T=3,R=3,S=3,sd=1,sh=1,sw=1,pd=0,ph=0,pw=0,dd=1,dh=1,dw=1": {
+            "BLOCK_K": 32,
+            "BLOCK_M": 128,
+            "BLOCK_N": 32,
+            "GROUP_SIZE_M": 8,
+            "num_stages": 1,
+            "num_warps": 4
+        }
+    }
+}

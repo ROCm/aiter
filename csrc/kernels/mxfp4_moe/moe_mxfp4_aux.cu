@@ -76,6 +76,24 @@ Fn aux_find(const std::unordered_map<std::string, Fn>& table,
 
 }  // namespace
 
+bool mxfp4_moe_sort_internal_is_supported(
+    int64_t NE,
+    int64_t TOPK,
+    int64_t D_HIDDEN,
+    int64_t MB,
+    bool zero_init)
+{
+    const std::string key = (zero_init ? "aux_sortzi_NE" : "aux_sortonly_NE")
+        + std::to_string(NE) + "_TOPK" + std::to_string(TOPK)
+        + "_MB" + std::to_string(MB) + "_H" + std::to_string(D_HIDDEN);
+    if (zero_init) {
+        const auto& table = sort_only_zi_lookup();
+        return table.find(key) != table.end();
+    }
+    const auto& table = sort_only_lookup();
+    return table.find(key) != table.end();
+}
+
 
 void mxfp4_moe_sort_quant_kernel(
     aiter_tensor_t& a_input,
@@ -135,7 +153,8 @@ void mxfp4_moe_sort_kernel(
     int64_t D_HIDDEN,
     int64_t D_INTER,
     int64_t MB,
-    int64_t prologue)
+    int64_t prologue,
+    std::optional<aiter_tensor_t> num_local_tokens)
 {
     (void)D_INTER;
     HipDeviceGuard guard(topk_ids.device_id);
@@ -150,6 +169,14 @@ void mxfp4_moe_sort_kernel(
         workspace_bytes  = static_cast<long long>(bf16_zero_workspace.numel())
                          * static_cast<long long>(bf16_zero_workspace.element_size());
     }
+
+    // [1] int32 on device; only the inline_quant (MB=16) sort reads it.
+    const int32_t* num_local_tokens_ptr =
+        num_local_tokens.has_value()
+            ? static_cast<const int32_t*>(num_local_tokens.value().data_ptr())
+            : nullptr;
+    AITER_CHECK(prologue == 0 || num_local_tokens_ptr == nullptr,
+                "mxfp4_moe_sort (threestage): num_local_tokens is unsupported");
 
     if (prologue == 1 /* threestage */) {
         // Caller-provided int32 scratch (was torch::empty here before de-torch):
@@ -185,7 +212,7 @@ void mxfp4_moe_sort_kernel(
             static_cast<int32_t*>(cumsum_tensor.data_ptr()), static_cast<int32_t*>(reverse_sorted.data_ptr()),
             static_cast<float*>(sorted_weights.data_ptr()),
             static_cast<int32_t*>(m_indices.data_ptr()),
-            bf16_zero_ptr, bf16_zero_ws_ptr, workspace_bytes);
+            bf16_zero_ptr, bf16_zero_ws_ptr, workspace_bytes, num_local_tokens_ptr);
     } else {
         const std::string key = "aux_sortonly_NE" + std::to_string(NE)
             + "_TOPK" + std::to_string(TOPK) + "_MB" + std::to_string(MB)
@@ -196,7 +223,7 @@ void mxfp4_moe_sort_kernel(
             static_cast<int32_t*>(sorted_token_ids.data_ptr()), static_cast<int32_t*>(sorted_expert_ids.data_ptr()),
             static_cast<int32_t*>(cumsum_tensor.data_ptr()), static_cast<int32_t*>(reverse_sorted.data_ptr()),
             static_cast<float*>(sorted_weights.data_ptr()),
-            static_cast<int32_t*>(m_indices.data_ptr()));
+            static_cast<int32_t*>(m_indices.data_ptr()), num_local_tokens_ptr);
     }
 }
 
@@ -271,6 +298,7 @@ void mxfp4_moe_scatter_reduce_kernel(
     HipDeviceGuard guard(flat_out.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
     const int M = static_cast<int>(out.size(0));
+    const int max_sorted = static_cast<int>(flat_out.size(0));
 
     // nt_hints on only at BM=128: large M is DRAM-bound, smaller M fits L2.
     const int nt = (MB >= 128) ? 1 : 0;
@@ -278,7 +306,7 @@ void mxfp4_moe_scatter_reduce_kernel(
     const std::string key = "aux_scatter_H" + std::to_string(D_HIDDEN)
         + "_TOPK" + std::to_string(TOPK) + "_NT" + std::to_string(nt);
     aux_find(scatter_reduce_lookup(), key, "mxfp4_moe_scatter_reduce")(
-        stream, M,
+        stream, M, max_sorted,
         flat_out.data_ptr(),
         static_cast<int32_t*>(reverse_sorted.data_ptr()),
         static_cast<float*>(sorted_weights.data_ptr()),
@@ -302,13 +330,14 @@ void mxfp4_moe_scatter_reduce_q_kernel(
     HipDeviceGuard guard(flat_out_q.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
     const int M = static_cast<int>(out.size(0));
+    const int max_sorted = static_cast<int>(flat_out_q.size(0));
 
     const int nt = (MB >= 128) ? 1 : 0;
 
     const std::string key = "aux_scatterq_H" + std::to_string(D_HIDDEN)
         + "_TOPK" + std::to_string(TOPK) + "_NT" + std::to_string(nt);
     aux_find(scatter_reduce_q_lookup(), key, "mxfp4_moe_scatter_reduce_q")(
-        stream, M,
+        stream, M, max_sorted,
         flat_out_q.data_ptr(), flat_out_scale.data_ptr(),
         static_cast<int32_t*>(reverse_sorted.data_ptr()),
         static_cast<float*>(sorted_weights.data_ptr()),

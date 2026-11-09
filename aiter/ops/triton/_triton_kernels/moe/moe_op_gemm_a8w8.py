@@ -5,10 +5,10 @@ import torch
 import triton
 import triton.language as tl
 
+from aiter.ops.triton._triton_kernels.common.pid_preprocessing import pid_grid
 from aiter.ops.triton._triton_kernels.moe.activations import _swiglu
 from aiter.ops.triton._triton_kernels.moe.quant_moe import _compute_static_fp8_quant
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid
 
 
 def matmul_launch_metadata(grid, kernel, args):
@@ -105,6 +105,45 @@ def unswizzle_mx_scale_cdna4(
     return x
 
 
+@triton.jit
+def _halve_k(x, w, a_sc, b_sc):
+    # Split one tile into its two K halves (not split-K across programs):
+    # x [M, K], w [K, N], a_sc [M, S], b_sc [S, N].
+    M: tl.constexpr = x.shape[0]
+    K: tl.constexpr = x.shape[1]
+    N: tl.constexpr = w.shape[1]
+    S: tl.constexpr = a_sc.shape[1]
+    x0, x1 = tl.split(tl.permute(tl.reshape(x, (M, 2, K // 2)), (0, 2, 1)))
+    w0, w1 = tl.split(tl.permute(tl.reshape(w, (2, K // 2, N)), (1, 2, 0)))
+    a0, a1 = tl.split(tl.permute(tl.reshape(a_sc, (M, 2, S // 2)), (0, 2, 1)))
+    b0, b1 = tl.split(tl.permute(tl.reshape(b_sc, (2, S // 2, N)), (1, 2, 0)))
+    return x0, x1, w0, w1, a0, a1, b0, b1
+
+
+@triton.jit
+def _fnuz_mx_dot(acc, x, w, x_scales, w_scales, MX_SCALE_BLOCK_K: tl.constexpr):
+    # gfx942 has no MX MFMA: run an FP8 dot per 32-wide K slice and apply its
+    # E8M0 scales to the fp32 result.
+    a_sc = (x_scales.to(tl.uint32) << 23).to(tl.float32, bitcast=True)
+    b_sc = tl.trans((w_scales.to(tl.uint32) << 23).to(tl.float32, bitcast=True))
+    if MX_SCALE_BLOCK_K == 1:
+        acc += tl.dot(x, w, input_precision="ieee") * a_sc * b_sc
+    elif MX_SCALE_BLOCK_K == 2:
+        x0, x1, w0, w1, a0, a1, b0, b1 = _halve_k(x, w, a_sc, b_sc)
+        acc += tl.dot(x0, w0, input_precision="ieee") * a0 * b0
+        acc += tl.dot(x1, w1, input_precision="ieee") * a1 * b1
+    else:
+        tl.static_assert(MX_SCALE_BLOCK_K == 4, "fnuz MXFP8 needs BLOCK_K <= 128")
+        xa, xb, wa, wb, aa, ab, ba, bb = _halve_k(x, w, a_sc, b_sc)
+        x0, x1, w0, w1, a0, a1, b0, b1 = _halve_k(xa, wa, aa, ba)
+        x2, x3, w2, w3, a2, a3, b2, b3 = _halve_k(xb, wb, ab, bb)
+        acc += tl.dot(x0, w0, input_precision="ieee") * a0 * b0
+        acc += tl.dot(x1, w1, input_precision="ieee") * a1 * b1
+        acc += tl.dot(x2, w2, input_precision="ieee") * a2 * b2
+        acc += tl.dot(x3, w3, input_precision="ieee") * a3 * b3
+    return acc
+
+
 _moe_gemm_a8w8_repr = make_kernel_repr(
     "_moe_gemm_a8w8",
     [
@@ -120,6 +159,7 @@ _moe_gemm_a8w8_repr = make_kernel_repr(
         "N_EXPTS_ACT",
         "APPLY_SWIGLU",
         "SWIGLU_ADD_RESIDUAL",
+        "USE_FNUZ",
     ],
 )
 
@@ -147,6 +187,8 @@ def _moe_gemm_a8w8(
     X_static_scale,
     W_static_scale,
     Quant_static_scale,
+    X_token_scale,
+    W_expt_scale,
     B,
     stride_b_e,  # Bias
     Gammas,
@@ -182,6 +224,9 @@ def _moe_gemm_a8w8(
     SPLIT_K: tl.constexpr,
     W_CACHE_MODIFIER: tl.constexpr,
     UPCAST_INDICES: tl.constexpr = False,
+    # Use fnuz FP8 (float8_e4m3fnuz / gfx942) instead of OCP FP8 (float8e4nv / gfx950).
+    # When True, replaces tl.dot_scaled with manual E8M0→fp32 dequant + tl.dot.
+    USE_FNUZ: tl.constexpr = False,
 ):
     tl.assume(stride_y_k >= 0)
     tl.assume(stride_y_m >= 0)
@@ -211,7 +256,10 @@ def _moe_gemm_a8w8(
     MX_PACK_DIVISOR: tl.constexpr = 32
     w_type: tl.constexpr = W.dtype.element_ty
     if is_w_microscaled:
-        tl.static_assert(w_type == tl.float8e4nv, "mx_weight_ptr must be float8e4nv")
+        tl.static_assert(
+            w_type == tl.float8e4nv or (USE_FNUZ and w_type == tl.float8e4b8),
+            "mx_weight_ptr must be float8e4nv (OCP) or float8e4b8/fnuz when USE_FNUZ=True",
+        )
         tl.static_assert(
             WMxScale.dtype.element_ty == tl.uint8, "mx_scale_ptr must be uint8"
         )
@@ -221,7 +269,10 @@ def _moe_gemm_a8w8(
         )
     x_type: tl.constexpr = X.dtype.element_ty
     if is_x_microscaled:
-        tl.static_assert(x_type == tl.float8e4nv, "mx_act_ptr must be float8e4nv")
+        tl.static_assert(
+            x_type == tl.float8e4nv or (USE_FNUZ and x_type == tl.float8e4b8),
+            "mx_act_ptr must be float8e4nv (OCP) or float8e4b8/fnuz when USE_FNUZ=True",
+        )
         tl.static_assert(
             XMxScale.dtype.element_ty == tl.uint8, "mx_scale_ptr must be uint8"
         )
@@ -278,6 +329,11 @@ def _moe_gemm_a8w8(
         GatherIndx += start_m
         # no needs to bounds-check here because `offs_x_m` wraps around M dim
         offs_x_m = tl.load(GatherIndx + offs_x_m) // N_EXPTS_ACT
+    if X_token_scale is not None:
+        if GatherIndx is None:
+            offs_x_scale_m = start_m + offs_x_m
+        else:
+            offs_x_scale_m = offs_x_m
     offs_x_k = BLOCK_K * pid_k + tl.arange(0, BLOCK_K)
     XPtrs = (
         X
@@ -358,9 +414,14 @@ def _moe_gemm_a8w8(
         else:
             w_scales = tl.full((BLOCK_N, MX_SCALE_BLOCK_K), 127, dtype=tl.uint8)
 
-        acc = tl.dot_scaled(
-            x, x_scales, "e4m3", w, w_scales, "e4m3", acc=acc, fast_math=True
-        )
+        if USE_FNUZ and not is_x_microscaled and not is_w_microscaled:
+            acc += tl.dot(x, w, input_precision="ieee")
+        elif USE_FNUZ:
+            acc = _fnuz_mx_dot(acc, x, w, x_scales, w_scales, MX_SCALE_BLOCK_K)
+        else:
+            acc = tl.dot_scaled(
+                x, x_scales, "e4m3", w, w_scales, "e4m3", acc=acc, fast_math=True
+            )
 
         if is_w_microscaled:
             WMxScalePtrs += (PACKED_MX_BLOCK * SPLIT_K) * stride_w_mx_k
@@ -399,15 +460,26 @@ def _moe_gemm_a8w8(
         else:
             w_scales = tl.full((BLOCK_N, MX_SCALE_BLOCK_K), 127, dtype=tl.uint8)
 
-        acc = tl.dot_scaled(
-            x, x_scales, "e4m3", w, w_scales, "e4m3", acc=acc, fast_math=True
-        )
+        if USE_FNUZ and not is_x_microscaled and not is_w_microscaled:
+            acc += tl.dot(x, w, input_precision="ieee")
+        elif USE_FNUZ:
+            acc = _fnuz_mx_dot(acc, x, w, x_scales, w_scales, MX_SCALE_BLOCK_K)
+        else:
+            acc = tl.dot_scaled(
+                x, x_scales, "e4m3", w, w_scales, "e4m3", acc=acc, fast_math=True
+            )
 
     # scalar fp8 scale
     if X_static_scale is not None:
         acc = acc * tl.load(X_static_scale)
     if W_static_scale is not None:
         acc = acc * tl.load(W_static_scale)
+    # per-token / per-expert fp8 scales
+    if X_token_scale is not None:
+        x_token_sc = tl.load(X_token_scale + offs_x_scale_m.to(index_type))
+        acc = acc * x_token_sc[:, None]
+    if W_expt_scale is not None:
+        acc = acc * tl.load(W_expt_scale + expt_id)
     # bias
     offs_m = BLOCK_M * block_id + tl.arange(0, BLOCK_M)
     offs_y_n = BLOCK_N * pid_n + tl.arange(0, BLOCK_N)
@@ -418,8 +490,8 @@ def _moe_gemm_a8w8(
         if pid_k == 0:
             bias = tl.load(BPtrs, mask=mask_n, other=0, cache_modifier=W_CACHE_MODIFIER)
         else:
-            bias = tl.full([BLOCK_N], 0, dtype=tl.float32)
-        acc = acc + bias[None, :]
+            bias = tl.zeros([BLOCK_N], dtype=B.dtype.element_ty)
+        acc = acc + bias.to(tl.float32)[None, :]
     if APPLY_SWIGLU and SPLIT_K == 1:
         out = _swiglu(acc, alpha, limit, ADD_RESIDUAL=SWIGLU_ADD_RESIDUAL)
         tl.static_assert(

@@ -12,13 +12,21 @@ import pandas as pd
 import torch
 
 import aiter
-from aiter import dtypes
+from aiter import dtypes, presorted_moe
 from aiter.aot.flydsl.common import override_env, run_only_env
+from aiter.fhmoe_contract import FHMOE_BUFFER_MAX_BYTES
 from aiter.fused_moe import (
+    AsmMoeMode,
+    _flydsl_route_output_nbytes,
+    _is_flydsl_stage2,
+    _stage2_runtime_uses_route_reduce,
+    cktile_moe_stage1,
+    cktile_moe_stage2,
     fused_moe,
     fused_topk,
     get_2stage_cfgs,
     get_padded_M,
+    resolve_activation_dtype,
     torch_moe_stage1,
     torch_moe_stage2,
 )
@@ -29,7 +37,12 @@ from aiter.int4_utils import (
 from aiter.jit.core import AITER_CONFIGS
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.ops.flydsl.kernels.mega_moe_gfx1250.types import Stage2ScatterContext
-from aiter.ops.flydsl.moe_common import GateMode
+from aiter.ops.flydsl.moe_common import (
+    DEFAULT_SITUV2_BETA,
+    DEFAULT_SITUV2_LINEAR_BETA,
+    GateMode,
+)
+from aiter.ops.opus.moe_stage2_a8w4 import _route_workspace_token_capacity
 from aiter.ops.quant import per_1x32_f8_scale_f8_quant, per_1x32_i4_quant
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 from aiter.utility import fp4_utils
@@ -51,6 +64,36 @@ from aiter.ops.shuffle import (
 )
 
 logger = logging.getLogger(__name__)
+
+_DEFAULT_MOE_2STAGE_TOKENS = [
+    1,
+    3,
+    5,
+    16,
+    32,
+    64,
+    128,
+    256,
+    1024,
+    4096,
+    8192,
+    163840,
+]
+_STANDARD_MOE_2STAGE_TOKENS = [1, 16, 32, 64, 128, 256, 1024, 4096]
+
+# The default script behavior must keep the historical full sweep. CI can opt
+# into the reduced representative-token standard profile, while the explicit
+# "full" profile preserves the parsed CLI arguments unchanged.
+AITER_MOE_2STAGE_CI_PROFILE = os.environ.get(
+    "AITER_MOE_2STAGE_CI_PROFILE", "default"
+).lower()
+
+if AITER_MOE_2STAGE_CI_PROFILE == "standard":
+    logger.info("moe_2stage active CI profile: standard")
+elif AITER_MOE_2STAGE_CI_PROFILE == "full":
+    logger.info("moe_2stage active CI profile: full")
+else:
+    logger.info("moe_2stage active CI profile: default")
 
 torch.int4 = getattr(torch, "int4", torch.uint32)
 torch.set_default_device("cuda")
@@ -98,11 +141,18 @@ def test_fmoe(
     beta=None,
     linear_beta=None,
     kernel_bench=False,
+    disable_stage1_bias=False,
     disable_stage2_bias=False,
     ref_dtype="bf16",
+    gate_up_layout: bool | None = None,
 ):
     if get_gfx() not in ["gfx950"] and qType in [aiter.QuantType.per_1x32]:
         return
+    if actType == aiter.ActivationType.Situv2:
+        beta = DEFAULT_SITUV2_BETA if beta is None else float(beta)
+        linear_beta = (
+            DEFAULT_SITUV2_LINEAR_BETA if linear_beta is None else float(linear_beta)
+        )
     torch_quant = aiter.get_torch_quant(qType)
     # mxfp8 (a8w8): per-1x32 e8m0 microscale on both fp8 activation and fp8 weight.
     is_mxfp8 = (
@@ -122,6 +172,8 @@ def test_fmoe(
     else:
         w1 = torch.randn((E, inter_dim, model_dim), dtype=dtype)
         exp_bias1 = torch.clamp(torch.randn((E * inter_dim), dtype=dtype), -1.0, 1.0)
+    if disable_stage1_bias:
+        exp_bias1 = None
     w2 = torch.randn((E, model_dim, inter_dim), dtype=dtype)
     if intermediate_pad != 0:
         w2[:, :, -intermediate_pad:] = 0
@@ -269,8 +321,8 @@ def test_fmoe(
         qType == aiter.QuantType.per_1x32
         and reference_aq_dtype == dtypes.bf16
         and WQDType == dtypes.fp4x2
-        and actType == aiter.ActivationType.Situv2
-    ):  # a16w4 SiTUv2: served by the ported FlyDSL kernel (no per-expert bias).
+        and actType in (aiter.ActivationType.Situv2, aiter.ActivationType.Relu2)
+    ):  # a16w4 SiTUv2 / Relu2: no per-expert bias supported by these kernels.
         # Key on reference_aq_dtype (runtime dispatch), not the declared AQDType:
         # a SiTUv2 case declared a8w4/a4w4 still runs as a16w4 without the env opt-in.
         exp_bias1 = exp_bias2 = None
@@ -334,7 +386,7 @@ def test_fmoe(
     ):  # a16w4 / a8w4
         # a16w4 (bf16/fp16 act) uses standard GGUU (gate_up=False), matching main;
         # a8w4 (fp8 act) keeps the gate/up-interleaved GUGU (gate_up=True).
-        _w1_gu = AQDType == dtypes.fp8
+        _w1_gu = (AQDType == dtypes.fp8) if gate_up_layout is None else gate_up_layout
         w1_qt_aiter = shuffle_weight_a16w4(w1_qt_aiter, 16, _w1_gu)
         w1_scale_aiter = shuffle_scale_a16w4(w1_scale, E, _w1_gu)
         w2_qt_aiter = shuffle_weight_a16w4(w2_qt_aiter, 16, False)
@@ -409,9 +461,7 @@ def test_fmoe(
         w1_bias=exp_bias1,
         doweight=doweight_stage1,
         swiglu_limit=swiglu_limit,
-        # pr1 torch_moe_stage1 exposes situ_beta/situ_linear_beta (no None
-        # handling); mirror the kernel's None -> 1.0 mapping so the reference
-        # matches fused_moe for SiTUv2 (harmless for other activations).
+        # SiTUv2 defaults were resolved above; other activations ignore these values.
         situ_beta=1.0 if beta is None else float(beta),
         situ_linear_beta=1.0 if linear_beta is None else float(linear_beta),
     )
@@ -615,20 +665,7 @@ parser.add_argument(
     "--tokenNum",
     type=int,
     nargs="*",
-    default=[
-        1,
-        3,
-        5,
-        16,
-        32,
-        64,
-        128,
-        256,
-        1024,
-        4096,
-        8192,
-        163840,
-    ],
+    default=_DEFAULT_MOE_2STAGE_TOKENS,
     help="""Number of tokens.
     e.g.: -t 1024""",
 )
@@ -711,6 +748,26 @@ parser.add_argument(
     e.g.: -hip 0,0""",
 )
 parser.add_argument(
+    "--stage1-bias",
+    type=dtypes.str2bool,
+    nargs="*",
+    default=[True],
+    help="""Whether CLI-generated cases include a random per-expert stage-1
+    bias. Default is [True] for backward compatibility. Use
+    --stage1-bias f for bias-free models, or --stage1-bias t f to test both.
+    FLAT MXFP4 assembly kernels do not apply this bias.""",
+)
+parser.add_argument(
+    "--stage2-bias",
+    type=dtypes.str2bool,
+    nargs="*",
+    default=[True],
+    help="""Whether CLI-generated cases include a random per-expert stage-2
+    bias. Default is [True] for backward compatibility. Use
+    --stage2-bias f for bias-free models, or --stage2-bias t f to test both.
+    FLAT MXFP4 assembly kernels do not apply this bias.""",
+)
+parser.add_argument(
     "--no-flydsl-csv",
     action="store_true",
     help="Skip validating FlyDSL/Opus shapes from tuned fmoe CSVs.",
@@ -743,14 +800,14 @@ parser.add_argument(
     "--beta",
     type=float,
     default=None,
-    help="SiTUv2 gate scale param (beta). Default None -> 1.0. Only affects SiTUv2.",
+    help="SiTUv2 gate scale param (beta). Default None uses the kernel default (4.0).",
 )
 parser.add_argument(
     "--linear-beta",
     type=float,
     default=None,
-    help="SiTUv2 up (linear) scale param (linear_beta). Default None -> 1.0. "
-    "Only affects SiTUv2.",
+    help="SiTUv2 up (linear) scale param (linear_beta). "
+    "Default None uses the kernel default (25.0).",
 )
 parser.add_argument(
     "--kernel",
@@ -772,6 +829,15 @@ parser.add_argument(
 
 args = parser.parse_args()
 
+ci_profile = os.environ.get("AITER_MOE_2STAGE_CI_PROFILE", "default").lower()
+if ci_profile == "standard":
+    # Standard CI keeps the representative-token sweep but must not disable the
+    # FlyDSL/Opus CSV validation path; that would silently weaken the check.
+    args.tokenNum = _STANDARD_MOE_2STAGE_TOKENS
+# Outside the "standard" profile, preserve whatever argparse already parsed:
+# the historical full-sweep default when "-t"/"--tokenNum" is omitted, or the
+# caller's explicit token selection otherwise. Neither "full" nor the unset/
+# "default" profile should discard an explicit "-t" override.
 
 l_quant = [l_quant[args.quant]] if args.quant is not None else l_quant
 
@@ -814,7 +880,7 @@ def _row_to_kwargs(row):
     inter_dim = int(row["inter_dim"])
     # Tuned CSV rows do not carry gate mode explicitly. Infer the runtime mode
     # from the selected activation/weight dtype layout used by fused_moe.
-    gate_mode = _effective_gate_mode(aq_dtype, wq_dtype)
+    gate_mode = _effective_gate_mode(q_type, aq_dtype, wq_dtype)
     return {
         "dtype": _str2dtype(row["dtype"]),
         "token": int(row["token"]),
@@ -850,10 +916,20 @@ def _iter_csv_cases():
             continue
         kernel_name1 = str(row.get("kernelName1", "") or "")
         kernel_name2 = str(row.get("kernelName2", "") or "")
+        post_reduce = row.get("flat", AsmMoeMode.SORTED) == AsmMoeMode.POST_REDUCE
+        # ASM 1-stage emsort/flat rows dispatch through fused_moe too;
+        # include them so the test harness exercises the emsort path. Only
+        # per_1x32 (MXFP4) ASM rows: the other ASM families (per_Token,
+        # per_1x128 blockscale fp8, ...) quantize weights differently and
+        # test_fmoe's host-side quant paths do not cover them.
         if (
             "flydsl_" not in kernel_name1
             and "flydsl_" not in kernel_name2
             and not kernel_name1.startswith("opus_moe1_")
+            and not (
+                (kernel_name1.startswith("_ZN5aiter") or post_reduce)
+                and str(row.get("q_type", "")) == "QuantType.per_1x32"
+            )
         ):
             continue
         if args.csv_filter:
@@ -915,9 +991,18 @@ def _iter_csv_cases():
         # Targeted configs and env-selected SiTUv2 modes have no pre-registered
         # AOT cache entry, so let those cases compile on demand.
         kwargs["check_aot_cache"] = (
-            args.csv_filter is None and kwargs["actType"] != aiter.ActivationType.Situv2
+            args.csv_filter is None
+            and not post_reduce
+            and kwargs["actType"] != aiter.ActivationType.Situv2
         )
-        kwargs["disable_stage2_bias"] = kernel_name2.startswith("opus_")
+        # Only Swiglu callers pass an expert bias; the AOT cache has no bias
+        # variant for other activations.
+        kwargs["disable_stage1_bias"] = kwargs["actType"] != aiter.ActivationType.Swiglu
+        kwargs["disable_stage2_bias"] = (
+            post_reduce
+            or kernel_name2.startswith("opus_")
+            or kwargs["disable_stage1_bias"]
+        )
         yield kwargs, {
             "kernelName1": kernel_name1,
             "kernelName2": kernel_name2,
@@ -943,7 +1028,7 @@ def _situv2_beta_kwargs(act_type):
     return {}
 
 
-def _effective_gate_mode(aq_dtype, wq_dtype):
+def _effective_gate_mode(q_type, aq_dtype, wq_dtype):
     # a16w4 (bf16 A x mxfp4 W) SiTUv2 is served by the ported FlyDSL kernel via
     # fused_moe_'s SEPARATED dispatch; keep it in SEPARATED (bf16 activation) so
     # the abf16_wfp4 rows exercise that kernel instead of downgrading to a8w4/fp8.
@@ -955,13 +1040,21 @@ def _effective_gate_mode(aq_dtype, wq_dtype):
     if aq_dtype == dtypes.fp8 and wq_dtype == dtypes.fp4x2:
         return GateMode.INTERLEAVE.value
     # mxfp8 (a8w8) uses the gate-up interleave stage1 path as well.
-    if aq_dtype == dtypes.fp8 and wq_dtype == dtypes.fp8:
+    if (
+        q_type == aiter.QuantType.per_1x32
+        and aq_dtype == dtypes.fp8
+        and wq_dtype == dtypes.fp8
+    ):
         return GateMode.INTERLEAVE.value
     return GateMode.SEPARATED.value
 
 
 def _effective_swiglu_limit(quant_type, aq_dtype, wq_dtype, swiglu_limit):
-    if (quant_type, aq_dtype, wq_dtype) in (_PER1X32_BF16_FP4, _PER1X32_FP8_FP4):
+    if (quant_type, aq_dtype, wq_dtype) in (
+        _PER1X32_BF16_FP4,
+        _PER1X32_FP8_FP4,
+        _PER1X32_FP4_FP4,
+    ):
         return swiglu_limit
     return None
 
@@ -1027,6 +1120,86 @@ def _moe_2stage_reference_workspace_gib(kwargs):
     )
 
 
+def _moe_2stage_route_workspace_skip_reason(kwargs):
+    """Return a reason when effective route-reduce exceeds 32-bit addressing."""
+    token = kwargs["token"]
+    model_dim = kwargs["model_dim"]
+    topk = kwargs["topk"]
+    q_dtype_a = resolve_activation_dtype(
+        kwargs["qType"],
+        kwargs["WQDType"],
+        activation=kwargs["actType"],
+        gate_mode=kwargs["gateMode"],
+        M=token,
+        hidden_dtype=kwargs["dtype"],
+        gfx=get_gfx(),
+    )
+    if q_dtype_a is None:
+        return None
+    is_shuffled = not (
+        kwargs["WQDType"] == dtypes.fp4x2
+        and kwargs["AQDType"] == dtypes.fp4x2
+        and not kwargs.get("preshuffle", False)
+    )
+    supports_expert_bias = (
+        kwargs["qType"] == aiter.QuantType.per_1x32
+        and kwargs["WQDType"] == dtypes.fp4x2
+        and kwargs["AQDType"] in (dtypes.bf16, dtypes.fp16, dtypes.fp8)
+        and kwargs["actType"] != aiter.ActivationType.Situv2
+    )
+    try:
+        metadata = get_2stage_cfgs(
+            get_padded_M(token),
+            model_dim,
+            kwargs["inter_dim"],
+            kwargs["E"],
+            topk,
+            kwargs["dtype"],
+            q_dtype_a,
+            kwargs["WQDType"],
+            kwargs["qType"],
+            kwargs["use_g1u1"],
+            kwargs["actType"],
+            kwargs["doweight_stage1"],
+            kwargs.get("hidden_pad", 0),
+            kwargs.get("intermediate_pad", 0),
+            is_shuffled,
+            kwargs["gateMode"],
+            situ_beta=kwargs.get("beta", 1.0),
+            situ_linear_beta=kwargs.get("linear_beta", 1.0),
+            swiglu_limit=kwargs.get("swiglu_limit"),
+            opus_weights_shuffled=is_shuffled,
+            has_stage1_bias=supports_expert_bias,
+            has_stage2_bias=(
+                supports_expert_bias and not kwargs.get("disable_stage2_bias", False)
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001
+        aiter.logger.warning(
+            "moe_2stage: failed to resolve stage2 mode during preflight; "
+            "continuing to runtime validation: %s",
+            exc,
+        )
+        return None
+    if not _is_flydsl_stage2(metadata.stage2):
+        return None
+    if not _stage2_runtime_uses_route_reduce(metadata.stage2, token, model_dim):
+        return None
+    route_bytes = _flydsl_route_output_nbytes(
+        metadata.stage2,
+        token,
+        topk,
+        model_dim,
+        torch.empty((), dtype=kwargs["dtype"]).element_size(),
+    )
+    if route_bytes <= FHMOE_BUFFER_MAX_BYTES:
+        return None
+    return (
+        f"FlyDSL stage2 reduce workspace {route_bytes / (1024**3):.1f} GiB "
+        "exceeds the current 32-bit buffer-addressing limit"
+    )
+
+
 def _format_moe_2stage_case(kwargs):
     return (
         f"token={kwargs['token']}, dim=({kwargs['model_dim']},{kwargs['inter_dim']}), "
@@ -1037,6 +1210,10 @@ def _format_moe_2stage_case(kwargs):
 
 
 def _moe_2stage_skip_reason(kwargs):
+    route_workspace_reason = _moe_2stage_route_workspace_skip_reason(kwargs)
+    if route_workspace_reason is not None:
+        return route_workspace_reason
+
     # Set AITER_MOE_2STAGE_MAX_FREE_MEMORY_FRACTION=0 to run manually.
     max_free_memory_fraction = float(
         os.environ.get("AITER_MOE_2STAGE_MAX_FREE_MEMORY_FRACTION", "0.8")
@@ -1083,6 +1260,7 @@ def _iter_legacy_cases():
         wq_dtype,
         doweight_stage1,
         act_type,
+        use_g1u1=True,
         **over,
     ):
         return dict(
@@ -1093,11 +1271,11 @@ def _iter_legacy_cases():
             E=args.expert,
             topk=args.topk,
             actType=act_type,
-            gateMode=_effective_gate_mode(aq_dtype, wq_dtype),
+            gateMode=_effective_gate_mode(quant_type, aq_dtype, wq_dtype),
             qType=quant_type,
             AQDType=aq_dtype,
             WQDType=wq_dtype,
-            use_g1u1=True,
+            use_g1u1=use_g1u1,
             doweight_stage1=doweight_stage1,
             strict_accuracy=False,
             check_aot_cache=False,
@@ -1112,25 +1290,43 @@ def _iter_legacy_cases():
         (quant_type, aq_dtype, wq_dtype),
         (model_dim, inter_dim),
         doweight_stage1,
-    ) in itertools.product(args.dtype, l_quant, args.dim, args.doweight_stage1):
+        stage1_bias,
+        stage2_bias,
+    ) in itertools.product(
+        args.dtype,
+        l_quant,
+        args.dim,
+        args.doweight_stage1,
+        args.stage1_bias,
+        args.stage2_bias,
+    ):
         triple = (quant_type, aq_dtype, wq_dtype)
 
         if triple == _PER1X32_BF16_FP4:
+            bf16_fp4_acts = [
+                act_type
+                for act_type in args.act
+                if act_type in (aiter.ActivationType.Swiglu, aiter.ActivationType.Relu2)
+            ] or [aiter.ActivationType.Swiglu]
             for hidden_pad, intermediate_pad in args.hidden_intermediate_pad:
-                for m in args.tokenNum:
-                    yield _kw(
-                        dtype,
-                        m,
-                        model_dim,
-                        inter_dim,
-                        quant_type,
-                        aq_dtype,
-                        wq_dtype,
-                        doweight_stage1,
-                        aiter.ActivationType.Swiglu,
-                        hidden_pad=hidden_pad,
-                        intermediate_pad=intermediate_pad,
-                    ), extras
+                for act_type in bf16_fp4_acts:
+                    for m in args.tokenNum:
+                        yield _kw(
+                            dtype,
+                            m,
+                            model_dim,
+                            inter_dim,
+                            quant_type,
+                            aq_dtype,
+                            wq_dtype,
+                            doweight_stage1,
+                            act_type,
+                            use_g1u1=(act_type != aiter.ActivationType.Relu2),
+                            hidden_pad=hidden_pad,
+                            intermediate_pad=intermediate_pad,
+                            disable_stage1_bias=not stage1_bias,
+                            disable_stage2_bias=not stage2_bias,
+                        ), extras
         elif triple == _PER1X32_FP8_FP4:
             for hidden_pad, intermediate_pad in args.hidden_intermediate_pad:
                 for act_type in args.act:
@@ -1147,27 +1343,37 @@ def _iter_legacy_cases():
                             act_type,
                             hidden_pad=hidden_pad,
                             intermediate_pad=intermediate_pad,
+                            disable_stage1_bias=not stage1_bias,
+                            disable_stage2_bias=not stage2_bias,
                             **_situv2_beta_kwargs(act_type),
                         ), extras
         elif triple == _PER1X32_FP4_FP4:
             for preshuffle in args.preshuffle:
                 for act_type in args.act:
+                    if act_type == aiter.ActivationType.Relu2:
+                        continue
                     for m in args.tokenNum:
-                        yield _kw(
-                            dtype,
-                            m,
-                            model_dim,
-                            inter_dim,
-                            quant_type,
-                            aq_dtype,
-                            wq_dtype,
-                            doweight_stage1,
-                            act_type,
-                            preshuffle=preshuffle,
-                            hidden_pad=0,
-                            intermediate_pad=0,
-                            **_situv2_beta_kwargs(act_type),
-                        ), extras
+                        yield (
+                            _kw(
+                                dtype,
+                                m,
+                                model_dim,
+                                inter_dim,
+                                quant_type,
+                                aq_dtype,
+                                wq_dtype,
+                                doweight_stage1,
+                                act_type,
+                                use_g1u1=True,
+                                preshuffle=preshuffle,
+                                hidden_pad=0,
+                                intermediate_pad=0,
+                                disable_stage1_bias=not stage1_bias,
+                                disable_stage2_bias=not stage2_bias,
+                                **_situv2_beta_kwargs(act_type),
+                            ),
+                            extras,
+                        )
         elif triple == _PER1X32_BF16_I4:
             for m in args.tokenNum:
                 yield _kw(
@@ -1180,6 +1386,8 @@ def _iter_legacy_cases():
                     wq_dtype,
                     doweight_stage1,
                     aiter.ActivationType.Silu,
+                    disable_stage1_bias=not stage1_bias,
+                    disable_stage2_bias=not stage2_bias,
                 ), extras
         else:
             for act_type in args.act:
@@ -1191,18 +1399,722 @@ def _iter_legacy_cases():
                 ):
                     continue
                 for m in args.tokenNum:
-                    yield _kw(
-                        dtype,
-                        m,
-                        model_dim,
-                        inter_dim,
-                        quant_type,
-                        aq_dtype,
-                        wq_dtype,
-                        doweight_stage1,
-                        act_type,
-                        **_situv2_beta_kwargs(act_type),
-                    ), extras
+                    yield (
+                        _kw(
+                            dtype,
+                            m,
+                            model_dim,
+                            inter_dim,
+                            quant_type,
+                            aq_dtype,
+                            wq_dtype,
+                            doweight_stage1,
+                            act_type,
+                            use_g1u1=(act_type != aiter.ActivationType.Relu2),
+                            disable_stage1_bias=not stage1_bias,
+                            disable_stage2_bias=not stage2_bias,
+                            **_situv2_beta_kwargs(act_type),
+                        ),
+                        extras,
+                    )
+
+
+def test_route_workspace_token_capacity():
+    cases = (
+        (1, 1),
+        (247, 256),
+        (256, 256),
+        (257, 512),
+        (32768, 32768),
+        (32769, 65536),
+        (65536, 65536),
+        (65537, 131072),
+        (117626, 131072),
+        (128332, 131072),
+        (131072, 131072),
+        (131073, 262144),
+    )
+    for token_num, expected_capacity in cases:
+        assert _route_workspace_token_capacity(token_num) == expected_capacity
+
+    for token_num in (0, -1):
+        try:
+            _route_workspace_token_capacity(token_num)
+        except ValueError as error:
+            assert "must be positive" in str(error)
+        else:
+            raise AssertionError(f"expected ValueError for token_num={token_num}")
+
+    aiter.logger.info("moe_2stage: route workspace capacity passed")
+
+
+def test_presorted_moe_hook():
+    """register_presorted_moe() lets a caller's BM=16 route+sort replace fused_moe's.
+
+    Kimi-K3 A4W4 TP=8 decode (BM=16 aux sort). test_fmoe checks each batch with
+    fused_moe's own sort (moe_sorting) and with a registered presort (presorted)
+    against the torch reference; the presorted run must never reach moe_sorting.
+    The timed candidates (moe_sorting, presorted, and presorted output=, which
+    passes a caller-zeroed output as SGLang does) share one routing whose presort
+    is built beforehand, so only fused_moe is timed, and both presorted calls are
+    checked element-wise against the own sort at every batch. The summary table
+    has one row per batch with us/TFLOPS/TB/s per timed candidate, "ref err"
+    (test_fmoe's logits_diff vs the torch reference) for moe_sorting and
+    presorted, and "own err" (diff vs the own sort on the timed routing) for both
+    presorted calls. Its eager summed kernel time does not rank the two presorted
+    calls (a GPU idle gap before GEMM1 skews it); graph replay does. Then the
+    contract: a reused-address moe_buf is zeroed, a 2-byte-aligned output is
+    copied back while a 4-byte-aligned one is used in place, and a registration
+    that does not match the call is ignored and still consumed, so it never
+    leaks into a later call, even when fused_moe exits before sorting.
+    """
+    global fused_moe
+    fm = aiter.fused_moe
+    E, topk, model_dim, inter_dim = 896, 16, 3584, 384
+    dtype = dtypes.bf16
+
+    def presort(topk_ids, topk_weights, moe_buf=None):
+        ids, weights, experts, num_valid, _, m_indices, reverse = fm._adaptive_moe_sort(
+            topk_ids, topk_weights, E, topk_ids.shape[1], 16, model_dim, emit_aux=True
+        )
+        return {
+            "sorted_token_ids": ids,
+            "sorted_weights": weights,
+            "sorted_expert_ids": experts,
+            "num_valid_ids": num_valid,
+            "m_indices": m_indices,
+            "reverse_sorted": reverse,
+            "topk_ids_ptr": topk_ids.data_ptr(),
+            "topk_weights_ptr": topk_weights.data_ptr(),
+            "M": topk_ids.shape[0],
+            "block_m": 16,
+            "num_experts": E,
+            "topk": topk_ids.shape[1],
+            "moe_buf_zeroed": moe_buf is not None,
+            "moe_buf_ptr": 0 if moe_buf is None else moe_buf.data_ptr(),
+        }
+
+    real_fused_moe = fused_moe
+    real_sorting = fm.moe_sorting
+    sort_calls = []
+
+    def counting_sorting(*a, **kw):
+        sort_calls.append(1)
+        return real_sorting(*a, **kw)
+
+    # Accuracy only: test_fmoe times rotated copies of its inputs, so the presort
+    # is built inside each call here and test_fmoe's timings are not used.
+    def presorted_fused_moe(hidden, w1, w2, topk_weights, topk_ids, **kw):
+        fm.register_presorted_moe(presort(topk_ids, topk_weights))
+        return real_fused_moe(hidden, w1, w2, topk_weights, topk_ids, **kw)
+
+    torch_quant = aiter.get_torch_quant(aiter.QuantType.per_1x32)
+
+    def prep(w):
+        q, scale = torch_quant(w, quant_dtype=dtypes.fp4x2)
+        q = q.view(*w.shape[:-1], w.shape[-1] // 2)
+        scale = scale.view(*w.shape[:-1], w.shape[-1] // 32)
+        n_rows = scale.shape[0] * scale.shape[1]
+        return (
+            shuffle_weight(q.view(dtypes.fp4x2), (16, 16)),
+            fp4_utils.e8m0_shuffle(scale.view(n_rows, -1)).view(*scale.shape[:2], -1),
+        )
+
+    torch.manual_seed(0)
+    w1, w1_scale = prep(torch.randn((E, inter_dim * 2, model_dim), dtype=dtype) / 10)
+    w2, w2_scale = prep(torch.randn((E, model_dim, inter_dim), dtype=dtype) / 10)
+    kwargs = {
+        "w1_scale": w1_scale,
+        "w2_scale": w2_scale,
+        "quant_type": aiter.QuantType.per_1x32,
+        "activation": aiter.ActivationType.Situv2,
+        "quant_dtype_a": dtypes.fp4x2,
+    }
+
+    def route(token):
+        hidden = torch.randn((token, model_dim), dtype=dtype) / 10
+        gating = torch.randn((token, E), dtype=dtype)
+        return (hidden, *fused_topk(hidden, gating, topk, True))
+
+    # Atomic bf16 accumulation alone moves fused_moe by up to ~2e-5 run to run.
+    def calc_diff(x, y):
+        x, y = x.double(), y.double()
+        return float(1 - 2 * (x * y).sum() / (x * x + y * y).sum())
+
+    def check_close(ref, out, what):
+        # Element-wise first, so a low-magnitude row cannot hide behind the
+        # aggregate score. Atomic bf16 accumulation moves single elements by up to
+        # two bf16 steps (measured max abs 3.9e-3 at |ref| ~0.4, three runs), well
+        # inside the test_fmoe tolerances used here; a buffer that was not zeroed
+        # (1e3 fill) misses by orders of magnitude.
+        mismatch = checkAllclose(
+            ref.float(), out.float(), rtol=1e-2, atol=1e-2, msg=what, printLog=False
+        )
+        assert mismatch == 0, f"{what}: {mismatch:.2%} of elements out of tolerance"
+        diff = calc_diff(ref, out)
+        assert diff < 1e-4, f"{what}: diff {diff}"
+
+    # The timed calls. As SGLang makes them, the router's sort (and its zeroing
+    # of the output fused_moe accumulates into) runs before fused_moe, so neither
+    # is timed; a caller-zeroed buffer just accumulates across the timed calls.
+    def own_sort(aux, hidden, topk_weights, topk_ids, buf):
+        return real_fused_moe(hidden, w1, w2, topk_weights, topk_ids, **kwargs)
+
+    def presorted(aux, hidden, topk_weights, topk_ids, buf):
+        fm.register_presorted_moe(aux)
+        return real_fused_moe(hidden, w1, w2, topk_weights, topk_ids, **kwargs)
+
+    def caller_zeroed(aux, hidden, topk_weights, topk_ids, buf):
+        fm.register_presorted_moe(aux)
+        return real_fused_moe(
+            hidden, w1, w2, topk_weights, topk_ids, output=buf, **kwargs
+        )
+
+    timed = {
+        "moe_sorting": own_sort,
+        "presorted": presorted,
+        "presorted output=": caller_zeroed,
+    }
+
+    candidates = {"moe_sorting": real_fused_moe, "presorted": presorted_fused_moe}
+    rows = []
+    try:
+        fm.moe_sorting = counting_sorting
+        with override_env("AITER_SITUV2_A8W4", None), override_env(
+            "AITER_SITUV2_A4W4", "1"
+        ):
+            # 512 is past the Opus crossover (3 * M * topk >= 4 * E), where
+            # fused_moe's own BM=16 sort is Opus rather than the adaptive one.
+            for token in (1, 4, 512):
+                # gate+up+down GEMMs per route; bytes are bf16 hidden in/out plus
+                # the fp4x2 weights and e8m0 scales of at most token*topk experts.
+                flops = 2 * 3 * token * topk * model_dim * inter_dim
+                w_vals = 3 * model_dim * inter_dim
+                act_bytes = 2 * token * model_dim * dtype.itemsize
+                w_bytes = min(E, token * topk) * (w_vals // 2 + w_vals // 32)
+                nbytes = act_bytes + w_bytes
+                row = {
+                    "token": token,
+                    "model_dim": model_dim,
+                    "inter_dim": inter_dim,
+                    "E": E,
+                    "topk": topk,
+                    "gfx": get_gfx(),
+                }
+                for name, fn in candidates.items():
+                    # test_fmoe calls this module's fused_moe.
+                    fused_moe = fn
+                    sort_calls.clear()
+                    torch.manual_seed(token)
+                    ret = test_fmoe(
+                        dtype=dtype,
+                        token=token,
+                        model_dim=model_dim,
+                        inter_dim=inter_dim,
+                        E=E,
+                        topk=topk,
+                        actType=aiter.ActivationType.Situv2,
+                        gateMode=GateMode.SEPARATED.value,
+                        qType=aiter.QuantType.per_1x32,
+                        AQDType=dtypes.fp4x2,
+                        WQDType=dtypes.fp4x2,
+                        use_g1u1=True,
+                        check_aot_cache=False,
+                    )
+                    fused_moe = real_fused_moe
+                    if name == "presorted":
+                        assert not sort_calls, f"token={token}: presort unused"
+                    else:
+                        assert sort_calls, f"token={token}: BM=16 aux path did not sort"
+                    # test_fmoe compares with the torch reference and fails when
+                    # checkAllclose misses and logits_diff (1 - cosine similarity,
+                    # recorded as ref err) exceeds 0.01.
+                    row[f"{name} ref err"] = ret["logits_diff"]
+                    gc.collect()
+                    torch.cuda.empty_cache()
+
+                # On these inputs both presorted calls must match fused_moe's own
+                # sort element-wise (a differential check; test_fmoe above is the
+                # torch-reference one, on its own inputs).
+                hidden, topk_weights, topk_ids = route(token)
+                buf = torch.zeros((token, model_dim), dtype=dtype)
+                own = own_sort(None, hidden, topk_weights, topk_ids, buf)
+                sort_calls.clear()
+                aux = presort(topk_ids, topk_weights)
+                out = presorted(aux, hidden, topk_weights, topk_ids, buf)
+                check_close(own, out, f"token={token} presorted")
+                row["presorted own err"] = calc_diff(own, out)
+                aux_zeroed = presort(topk_ids, topk_weights, moe_buf=buf)
+                out = caller_zeroed(aux_zeroed, hidden, topk_weights, topk_ids, buf)
+                assert out is buf, f"token={token}: caller output not used"
+                check_close(own, out, f"token={token} presorted output=")
+                row["presorted output= own err"] = calc_diff(own, out)
+                # num_rotate_args=1: run_perftest otherwise times deep copies of
+                # its tensor arguments, whose topk_ids no longer match the
+                # registered presort, so the call would fall back to moe_sorting.
+                for name, fn in timed.items():
+                    reg = aux_zeroed if name == "presorted output=" else aux
+                    sort_calls.clear()
+                    _, us = run_perftest(
+                        fn, reg, hidden, topk_weights, topk_ids, buf, num_rotate_args=1
+                    )
+                    sorted_ = bool(sort_calls)
+                    assert sorted_ == (
+                        name == "moe_sorting"
+                    ), f"token={token}: {name} timed with moe_sorting={sorted_}"
+                    row[f"{name} us"] = us
+                    row[f"{name} TFLOPS"] = flops / us / 1e6
+                    row[f"{name} TB/s"] = nbytes / us / 1e6
+                rows.append(row)
+    finally:
+        fused_moe = real_fused_moe
+        fm.moe_sorting = real_sorting
+        fm.register_presorted_moe(None)
+    aiter.logger.info(
+        "moe_2stage presorted MoE hook summary (markdown):\n%s",
+        pd.DataFrame(rows).to_markdown(index=False),
+    )
+
+    torch.manual_seed(0)
+    token = 1
+    hidden, topk_weights, topk_ids = route(token)
+
+    try:
+        fm.moe_sorting = counting_sorting
+        ref = fused_moe(hidden, w1, w2, topk_weights, topk_ids, **kwargs)
+
+        # Without output=, the buffer fused_moe allocates is zeroed even when it
+        # lands at the address the registration names as caller-zeroed (the
+        # allocator can hand back a freed block). Stand in a dirty buffer for
+        # that allocation.
+        stale = torch.full((token, model_dim), 1e3, dtype=dtype)
+        aux = presort(topk_ids, topk_weights, moe_buf=stale)
+        real_empty = torch.empty
+        handed = []
+
+        def dirty_empty(*a, **kw):
+            t = real_empty(*a, **kw)
+            if not handed and t.shape == stale.shape and t.dtype == dtype:
+                handed.append(t)
+                return stale
+            return t
+
+        fm.register_presorted_moe(aux)
+        try:
+            torch.empty = dirty_empty
+            out = fused_moe(hidden, w1, w2, topk_weights, topk_ids, **kwargs)
+        finally:
+            torch.empty = real_empty
+        assert handed and out is stale, "presort did not allocate its own moe_buf"
+        check_close(ref, out, "reused-address moe_buf was not zeroed")
+
+        # An output at an odd bf16 element (2-byte aligned) cannot be the atomic
+        # moe_buf (GEMM2's 4-byte atomics fault on it): fused_moe uses a fresh
+        # one and copies back. A 4-byte-aligned one is used in place.
+        real_return = fm._return_output
+        copies = []
+
+        def tracking_return(ret, output):
+            copies.append(output is not None and ret is not output)
+            return real_return(ret, output)
+
+        for offset, copied in ((1, True), (2, False)):
+            pool = torch.empty(token * model_dim + offset, dtype=dtype)
+            buf = pool[offset:].view(token, model_dim)
+            sort_calls.clear()
+            copies.clear()
+            fm.register_presorted_moe(presort(topk_ids, topk_weights))
+            try:
+                fm._return_output = tracking_return
+                out = fused_moe(
+                    hidden, w1, w2, topk_weights, topk_ids, output=buf, **kwargs
+                )
+            finally:
+                fm._return_output = real_return
+            assert out is buf and not sort_calls
+            assert copies == [copied], f"{2 * offset}-byte offset: copied={copies}"
+            check_close(ref, out, f"{2 * offset}-byte-aligned output")
+
+        # Registered for another topk_ids or topk_weights tensor: ignored, and
+        # consumed.
+        for key in ("topk_ids_ptr", "topk_weights_ptr"):
+            sort_calls.clear()
+            aux = presort(topk_ids, topk_weights)
+            aux[key] = topk_ids.clone().data_ptr()
+            fm.register_presorted_moe(aux)
+            fused_moe(hidden, w1, w2, topk_weights, topk_ids, **kwargs)
+            assert len(sort_calls) == 1, f"a presort with a stale {key} was used"
+            assert (
+                getattr(presorted_moe._PRESORTED_MOE, "aux", None) is None
+            ), "not consumed"
+
+        # A call that fails before sorting still consumes the registration.
+        fm.register_presorted_moe(presort(topk_ids, topk_weights))
+        bad = torch.empty((token + 1, model_dim), dtype=dtype)
+        try:
+            fused_moe(hidden, w1, w2, topk_weights, topk_ids, output=bad, **kwargs)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("a wrong-shape output was accepted")
+        assert (
+            getattr(presorted_moe._PRESORTED_MOE, "aux", None) is None
+        ), "not consumed on error"
+    finally:
+        fm.moe_sorting = real_sorting
+        fm.register_presorted_moe(None)
+    torch.cuda.synchronize()
+    aiter.logger.info("moe_2stage: presorted MoE hook contract passed")
+
+
+def test_presorted_moe_wrapper_error():
+    """A fused_moe call rejected in the public wrapper still drops a registration.
+
+    activation must be an ActivationType; a str fails in the wrapper before the
+    custom op (which normally consumes the registration) runs, on both the
+    routed and the FHMoE (shared-expert) paths. CommFusedMoeRuntime.run, which
+    calls _fused_moe_impl directly, must drop it too when it rejects its
+    arguments. Rejected before any MoE kernel launches.
+    """
+    from aiter.ops.comm_fused_moe_runtime import CommFusedMoeRuntime
+
+    fm = aiter.fused_moe
+    x = torch.zeros((1, 1))
+    ids = torch.zeros((1, 1), dtype=torch.int32)
+    try:
+        for extra in ({}, {"shared_expert_id": 0}):
+            fm.register_presorted_moe({"M": 1})
+            try:
+                fused_moe(x, x, x, x, ids, activation="silu", **extra)
+            except AttributeError:
+                pass
+            else:
+                raise AssertionError(f"activation='silu' was accepted ({extra})")
+            assert (
+                getattr(presorted_moe._PRESORTED_MOE, "aux", None) is None
+            ), f"registration left live after a wrapper error ({extra})"
+        runtime_errors = {
+            "negative reduce_scatter_sizes": {"reduce_scatter_sizes": [-1]},
+            "both before_stage2 callbacks": {
+                "before_stage2": lambda: x,
+                "before_stage2_for_rows": lambda rows: x,
+            },
+        }
+        for case, kwargs in runtime_errors.items():
+            fm.register_presorted_moe({"M": 1})
+            try:
+                CommFusedMoeRuntime(runners=None).run(
+                    shared_partial=None, hidden_states=x, **kwargs
+                )
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"{case} were accepted")
+            assert (
+                getattr(presorted_moe._PRESORTED_MOE, "aux", None) is None
+            ), f"registration left live after a CommFusedMoeRuntime error ({case})"
+    finally:
+        fm.register_presorted_moe(None)
+    aiter.logger.info("moe_2stage: presorted MoE wrapper-error contract passed")
+
+
+def _presorted_aux_stub(ids, weights, E, block_m=16):
+    """A registration whose sort tensors have the BM=16 aux-sort layout.
+
+    Sized like fused_moe._adaptive_moe_sort; contents are left unset, since the
+    matcher only checks the layout and no kernel reads them.
+    """
+    M, topk = ids.shape
+    BM = presorted_moe.PRESORTED_MOE_BLOCK_M
+    max_sorted = presorted_moe.aux_sort_capacity(M, topk, E, BM)
+    i32 = dtypes.i32
+    return {
+        "sorted_token_ids": torch.empty(max_sorted, dtype=i32, device=ids.device),
+        "sorted_weights": torch.empty(max_sorted, dtype=dtypes.fp32, device=ids.device),
+        "sorted_expert_ids": torch.empty(
+            max_sorted // BM, dtype=i32, device=ids.device
+        ),
+        "num_valid_ids": torch.empty(2, dtype=i32, device=ids.device),
+        "m_indices": torch.empty(max_sorted, dtype=i32, device=ids.device),
+        "reverse_sorted": torch.empty(M * topk, dtype=i32, device=ids.device),
+        "topk_ids_ptr": ids.data_ptr(),
+        "topk_weights_ptr": weights.data_ptr(),
+        "M": M,
+        "block_m": block_m,
+        "num_experts": E,
+        "topk": topk,
+    }
+
+
+def test_presorted_moe_layout_mismatch():
+    """A presort whose sort tensors break the BM=16 aux-sort layout is ignored.
+
+    The aux-sort stages size their buffers from sorted_token_ids and read the
+    other five tensors by sorted row, 16-row block or route, so a registration
+    with a wrong dtype, device, length or a missing tensor must fall back to
+    fused_moe's own sort rather than reach a kernel. No MoE kernel launch.
+    """
+    M, E, topk = 4, 8, 2
+    ids = torch.zeros((M, topk), dtype=torch.int32)
+    weights = torch.zeros((M, topk))
+    good = _presorted_aux_stub(ids, weights, E)
+    max_sorted = good["sorted_token_ids"].numel()
+
+    def match(aux):
+        return presorted_moe.match_presorted_moe(
+            aux, ids, weights, block_m=16, num_experts=E, topk=topk
+        )
+
+    def resized(key, n, dtype=None):
+        t = good[key]
+        return torch.empty(n, dtype=dtype or t.dtype, device=t.device)
+
+    assert match(good) is not None, "a well-formed presort was rejected"
+    # sorted_weights / m_indices may be longer than sorted_token_ids.
+    longer = {
+        **good,
+        "sorted_weights": resized("sorted_weights", max_sorted + 16),
+        "m_indices": resized("m_indices", max_sorted + 16),
+    }
+    assert match(longer) is not None, "over-long weights or m_indices were rejected"
+
+    i32_keys = (
+        "sorted_token_ids",
+        "sorted_expert_ids",
+        "num_valid_ids",
+        "m_indices",
+        "reverse_sorted",
+    )
+    bad_cases = {
+        **{f"missing {k}": {k: None} for k in i32_keys + ("sorted_weights",)},
+        **{f"int64 {k}": {k: good[k].to(torch.int64)} for k in i32_keys},
+        "bf16 sorted_weights": {"sorted_weights": good["sorted_weights"].bfloat16()},
+        # meta stands in for "another device" without needing a second GPU.
+        "sorted_token_ids on another device": {
+            "sorted_token_ids": torch.empty(max_sorted, dtype=dtypes.i32, device="meta")
+        },
+        "non-contiguous m_indices": {
+            "m_indices": resized("m_indices", 2 * max_sorted)[::2]
+        },
+        "sorted_expert_ids not one per 16 rows": {
+            "sorted_expert_ids": resized("sorted_expert_ids", max_sorted // 16 + 1)
+        },
+        "BM=32 block count": {
+            "sorted_expert_ids": resized("sorted_expert_ids", max_sorted // 32)
+        },
+        "short sorted_weights": {
+            "sorted_weights": resized("sorted_weights", max_sorted - 1)
+        },
+        "short m_indices": {"m_indices": resized("m_indices", max_sorted - 16)},
+        "short reverse_sorted": {
+            "reverse_sorted": resized("reverse_sorted", M * topk - 1)
+        },
+        "long reverse_sorted": {
+            "reverse_sorted": resized("reverse_sorted", M * topk + 1)
+        },
+        "one-element num_valid_ids": {"num_valid_ids": resized("num_valid_ids", 1)},
+        # Same element count, but the stages read shape[0] as the row count.
+        "2-D sorted_token_ids": {
+            "sorted_token_ids": good["sorted_token_ids"].view(16, max_sorted // 16)
+        },
+        "2-D reverse_sorted": {"reverse_sorted": good["reverse_sorted"].view(M, topk)},
+        # Self-consistent, but too small to hold every route plus block padding.
+        "undersized sort": {
+            "sorted_token_ids": resized("sorted_token_ids", 16),
+            "sorted_weights": resized("sorted_weights", 16),
+            "m_indices": resized("m_indices", 16),
+            "sorted_expert_ids": resized("sorted_expert_ids", 1),
+        },
+        "empty sort": {
+            "sorted_token_ids": resized("sorted_token_ids", 0),
+            "sorted_expert_ids": resized("sorted_expert_ids", 0),
+        },
+    }
+    for name, change in bad_cases.items():
+        aux = {**good, **change}
+        for key, value in change.items():
+            if value is None:
+                del aux[key]
+        assert match(aux) is None, f"presort with {name} was accepted"
+    aiter.logger.info(
+        "moe_2stage: presorted MoE layout contract passed (%d mismatches)",
+        len(bad_cases),
+    )
+
+
+def test_presorted_moe_output_overlap():
+    """A presort is ignored when output overlaps one of its sort tensors.
+
+    The stages zero or write output while still reading the sort tensors, so
+    the call must fall back to fused_moe's own sort. No MoE kernel launch.
+    """
+    M, E, topk, model_dim = 4, 8, 2, 8
+    ids = torch.zeros((M, topk), dtype=torch.int32)
+    weights = torch.zeros((M, topk))
+    aux = _presorted_aux_stub(ids, weights, E)
+
+    def match(output):
+        return presorted_moe.match_presorted_moe(
+            aux, ids, weights, block_m=16, num_experts=E, topk=topk, output=output
+        )
+
+    own = torch.empty((M, model_dim), dtype=dtypes.bf16)
+    assert match(own) is not None, "a presort with a separate output was rejected"
+    for key in presorted_moe._PRESORTED_MOE_SORT_KEYS:
+        t = aux[key]
+        backing = torch.empty(t.nbytes + M * model_dim * 2, dtype=torch.uint8)
+        aux[key] = backing[: t.nbytes].view(t.dtype)
+        # a contiguous output that starts inside the sort tensor
+        inside = backing[t.nbytes - 2 :][: M * model_dim * 2].view(dtypes.bf16)
+        assert match(inside.view(M, model_dim)) is None, f"output overlapping {key}"
+        aux[key] = t
+    aiter.logger.info("moe_2stage: presorted MoE output-overlap contract passed")
+
+
+def test_presorted_moe_block_m():
+    """Only a BM=16 presort is accepted; another block_m falls back to fused_moe's sort.
+
+    kimik3_a4w4_tuned_fmoe.csv also routes BM=32 tiles through the aux-sort path,
+    so a registration labelled block_m=32 that matches the call must still be
+    ignored. Checks the matcher fused_moe uses; no MoE kernel launches.
+    """
+    M, E, topk = 4, 8, 2
+    ids = torch.zeros((M, topk), dtype=torch.int32)
+    weights = torch.zeros((M, topk))
+
+    def match(block_m):
+        aux = _presorted_aux_stub(ids, weights, E, block_m=block_m)
+        return presorted_moe.match_presorted_moe(
+            aux, ids, weights, block_m=block_m, num_experts=E, topk=topk
+        )
+
+    assert match(16) is not None, "a matching BM=16 presort was rejected"
+    assert match(32) is None, "a BM=32 presort was accepted"
+    # BM=16 kernels, but a caller's block_size_M hands the stages another size.
+    aux = _presorted_aux_stub(ids, weights, E)
+    for stage_block_m, ok in ((16, True), (32, False)):
+        got = presorted_moe.match_presorted_moe(
+            aux,
+            ids,
+            weights,
+            block_m=16,
+            num_experts=E,
+            topk=topk,
+            stage_block_m=stage_block_m,
+        )
+        assert (got is not None) == ok, f"block_size_M={stage_block_m}: {ok=}"
+    aiter.logger.info("moe_2stage: presorted MoE block_m contract passed")
+
+
+def test_presorted_moe_masked_call():
+    """A presort is ignored when the call passes expert_mask or num_local_tokens.
+
+    The presort covers every row of topk_ids with no expert mask, while
+    moe_sorting honors both, so such calls must fall back to moe_sorting.
+    Checks the matcher fused_moe uses; no MoE kernel launches.
+    """
+    M, E, topk = 4, 8, 2
+    ids = torch.zeros((M, topk), dtype=torch.int32)
+    weights = torch.zeros((M, topk))
+    aux = _presorted_aux_stub(ids, weights, E)
+
+    def match(**kw):
+        return presorted_moe.match_presorted_moe(
+            aux, ids, weights, block_m=16, num_experts=E, topk=topk, **kw
+        )
+
+    assert match() is not None, "a matching unmasked presort was rejected"
+    limit = torch.tensor([M - 1], dtype=torch.int32)
+    assert match(num_local_tokens=limit) is None, "presort used with num_local_tokens"
+    mask = torch.ones((E,), dtype=torch.int32)
+    assert match(expert_mask=mask) is None, "presort used with expert_mask"
+    aiter.logger.info("moe_2stage: presorted MoE masked-call contract passed")
+
+
+def test_presorted_moe_ignored_is_logged():
+    """A registration fused_moe ignores is logged once per reason, naming it.
+
+    A caller whose aux omits a key (here topk_weights_ptr) would otherwise lose
+    the presort on every call with nothing to show for it. Checks the matcher
+    fused_moe uses; no MoE kernel launches.
+    """
+    fm = aiter.fused_moe
+    M, E, topk = 4, 8, 2
+    ids = torch.zeros((M, topk), dtype=torch.int32)
+    weights = torch.zeros((M, topk))
+    aux = _presorted_aux_stub(ids, weights, E)
+    del aux["topk_weights_ptr"]
+
+    class Collect(logging.Handler):
+        def __init__(self):
+            super().__init__(logging.WARNING)
+            self.messages = []
+
+        def emit(self, record):
+            self.messages.append(record.getMessage())
+
+    collect = Collect()
+    presorted_moe._PRESORTED_MOE_IGNORED.clear()
+    fm.logger.addHandler(collect)
+    try:
+        for _ in range(3):
+            assert (
+                presorted_moe.match_presorted_moe(
+                    aux, ids, weights, block_m=16, num_experts=E, topk=topk
+                )
+                is None
+            ), "a presort without topk_weights_ptr was accepted"
+    finally:
+        fm.logger.removeHandler(collect)
+    ignored = [m for m in collect.messages if "registered presort ignored" in m]
+    assert len(ignored) == 1, f"expected one log line, got {ignored}"
+    assert "no topk_weights_ptr" in ignored[0], ignored[0]
+    aiter.logger.info("moe_2stage: presorted MoE ignored-registration log passed")
+
+
+# Module scope: registering the op again in the same process raises.
+_CONSUMED_PRESORT_LAYERS = []
+
+
+@torch.library.custom_op("aiter_test::consume_presort", mutates_args=())
+def _consume_presort(x: torch.Tensor) -> torch.Tensor:
+    aux = presorted_moe.pop_presorted_moe()
+    _CONSUMED_PRESORT_LAYERS.append(aux and aux["layer"])
+    return x + 1
+
+
+@_consume_presort.register_fake
+def _(x):
+    return torch.empty_like(x)
+
+
+def test_presorted_moe_compile_order():
+    """Under torch.compile each registration still reaches the next consumer.
+
+    dynamo defers a traced thread-local store until its graph has run, so a
+    compiled loop of register + MoE layer would hand every layer the previous
+    step's last registration. A stand-in custom op consumes it the way
+    fused_moe_ does; no MoE kernel launches.
+    """
+    fm = aiter.fused_moe
+    seen = _CONSUMED_PRESORT_LAYERS
+
+    def layers(x):
+        for layer in range(3):
+            fm.register_presorted_moe({"layer": layer})
+            x = _consume_presort(x)
+        return x
+
+    compiled = torch.compile(layers, backend="aot_eager")
+    try:
+        for _ in range(2):
+            seen.clear()
+            compiled(torch.zeros(4))
+            assert seen == [0, 1, 2], f"registrations reached layers as {seen}"
+    finally:
+        fm.register_presorted_moe(None)
+        torch._dynamo.reset()
+    aiter.logger.info("moe_2stage: presorted MoE torch.compile order passed")
 
 
 def test_bm16_tiled_scale_boundary():
@@ -1387,6 +2299,142 @@ def test_output_buffer_contract():
     aiter.logger.info("moe_2stage: output buffer contract passed")
 
 
+def test_swiglu_mxfp4_nonsplit_nobias_dispatch():
+    if get_gfx() != "gfx950":
+        aiter.logger.info(
+            "skip SwiGLU MXFP4 non-split no-bias dispatch test on %s", get_gfx()
+        )
+        return
+    model_dim, inter_dim, E, topk = 6144, 1536, 129, 5
+    for gate_up_layout in (True, False):
+        for token in (128, 255, 256, 257, 512):
+            runtime_aq_dtype = dtypes.fp8 if token >= 256 else dtypes.bf16
+            metadata = get_2stage_cfgs(
+                get_padded_M(token),
+                model_dim,
+                inter_dim,
+                E,
+                topk,
+                torch.bfloat16,
+                runtime_aq_dtype,
+                dtypes.fp4x2,
+                aiter.QuantType.per_1x32,
+                True,
+                aiter.ActivationType.Swiglu,
+                False,
+                0,
+                0,
+                True,
+                GateMode.INTERLEAVE.value,
+                has_stage1_bias=False,
+                has_stage2_bias=False,
+                gate_up_interleave=gate_up_layout,
+            )
+            stage1_func = getattr(metadata.stage1, "func", metadata.stage1)
+            stage2_func = getattr(metadata.stage2, "func", metadata.stage2)
+            assert stage1_func is cktile_moe_stage1, (
+                f"{gate_up_layout=} {token=}: expected CK-Tile stage1, got "
+                f"{stage1_func!r}"
+            )
+            assert stage2_func is cktile_moe_stage2, (
+                f"{gate_up_layout=} {token=}: expected CK-Tile stage2, got "
+                f"{stage2_func!r}"
+            )
+            dispatched_split_k = metadata.stage1.keywords["split_k"]
+            if gate_up_layout:
+                assert dispatched_split_k == 1, (
+                    f"{token=}: gate_up_layout=True (GUGU) must dispatch to the "
+                    f"fused split_k=1 gate-up kernel, got split_k={dispatched_split_k}"
+                )
+            else:
+                assert dispatched_split_k >= 2, (
+                    f"{token=}: gate_up_layout=False (GGUU) must dispatch to "
+                    f"split_k>=2 (NoBias_swiglu_SplitK path), got "
+                    f"split_k={dispatched_split_k}; this is the bf16/fp16-activation "
+                    "accuracy bug this PR originally fixed -- see PR discussion."
+                )
+            assert metadata.has_bias is False
+            assert metadata.stage2_has_bias is False
+
+            torch.manual_seed(0)
+            test_fmoe(
+                dtype=torch.bfloat16,
+                token=token,
+                model_dim=model_dim,
+                inter_dim=inter_dim,
+                E=E,
+                topk=topk,
+                actType=aiter.ActivationType.Swiglu,
+                gateMode=GateMode.INTERLEAVE.value,
+                qType=aiter.QuantType.per_1x32,
+                AQDType=dtypes.fp8 if token >= 256 else dtypes.bf16,
+                WQDType=dtypes.fp4x2,
+                use_g1u1=True,
+                preshuffle=True,
+                strict_accuracy=True,
+                check_aot_cache=False,
+                disable_stage1_bias=True,
+                disable_stage2_bias=True,
+                gate_up_layout=gate_up_layout,
+            )
+    aiter.logger.info(
+        "moe_2stage: SwiGLU MXFP4 non-split no-bias dispatch regression test "
+        "(layout x M sweep) passed"
+    )
+
+
+def test_swiglu_mxfp4_untagged_layout_dispatch():
+    """Callers that never tag w1.gate_up_interleave (None) -- ATOM's MiniMax-M3, for
+    one -- must keep the CK-Tile split-k route with the standard post-activation
+    layout for bf16 activations. MiniMax-M3-MXFP4 at TP8 (per-rank MoE call:
+    model_dim 6144, inter_dim 512, intermediate_pad 0) fell through to the
+    unshuffled-weights fallback instead and decoded garbage until max tokens."""
+    if get_gfx() != "gfx950":
+        aiter.logger.info(
+            "skip SwiGLU MXFP4 untagged-layout dispatch test on %s", get_gfx()
+        )
+        return
+    model_dim, inter_dim, intermediate_pad, E, topk = 6144, 512, 0, 129, 5
+    for token in (1, 8, 32, 128):
+        metadata = get_2stage_cfgs(
+            get_padded_M(token),
+            model_dim,
+            inter_dim,
+            E,
+            topk,
+            torch.bfloat16,
+            dtypes.bf16,
+            dtypes.fp4x2,
+            aiter.QuantType.per_1x32,
+            True,
+            aiter.ActivationType.Swiglu,
+            False,
+            0,
+            intermediate_pad,
+            True,
+            GateMode.SEPARATED.value,
+            swiglu_limit=7.0,
+            opus_weights_shuffled=True,
+            gate_up_interleave=None,
+        )
+        stage1_func = getattr(metadata.stage1, "func", metadata.stage1)
+        assert (
+            stage1_func is cktile_moe_stage1
+        ), f"{token=}: expected CK-Tile stage1, got {stage1_func!r}"
+        layout = metadata.stage1.keywords.get("post_activation_layout")
+        assert layout == "standard", (
+            f"{token=}: untagged gate/up layout with bf16 activations must keep "
+            f"post_activation_layout='standard', got {layout!r}"
+        )
+        assert metadata.stage1.keywords["split_k"] >= 2, (
+            f"{token=}: expected the CK-Tile split-k route, got "
+            f"split_k={metadata.stage1.keywords['split_k']}"
+        )
+    aiter.logger.info(
+        "moe_2stage: SwiGLU MXFP4 untagged-layout dispatch regression test passed"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
@@ -1399,11 +2447,15 @@ def _iter_with_env(case_iter, **env_overrides):
 
 
 _case_iters = []
+test_route_workspace_token_capacity()
 if args.bm16_scale_boundary:
     test_bm16_tiled_scale_boundary()
 else:
     test_output_buffer_contract()
-    if not args.no_flydsl_csv:
+    test_swiglu_mxfp4_nonsplit_nobias_dispatch()
+    test_swiglu_mxfp4_untagged_layout_dispatch()
+    # Skip unrelated tuned-CSV validation for an explicit CLI quant sweep.
+    if not args.no_flydsl_csv and args.quant is None:
         _case_iters.append(
             _iter_with_env(
                 _iter_csv_cases(),
@@ -1413,6 +2465,23 @@ else:
         )
     if not args.no_legacy:
         _case_iters.append(_iter_legacy_cases())
+    test_presorted_moe_wrapper_error()
+    test_presorted_moe_block_m()
+    test_presorted_moe_output_overlap()
+    test_presorted_moe_masked_call()
+    test_presorted_moe_layout_mismatch()
+    test_presorted_moe_ignored_is_logged()
+    test_presorted_moe_compile_order()
+    # The hook test quantizes E=896 weights and times three candidates; skip it
+    # for an explicit CLI quant sweep, like the tuned-CSV validation above.
+    if args.quant is not None:
+        aiter.logger.info("skipping presorted MoE hook test for a --quant sweep")
+    elif get_gfx() == "gfx950":
+        test_presorted_moe_hook()
+    else:
+        aiter.logger.warning(
+            "%s: skipping presorted MoE hook test (a4w4 is gfx950-only)", get_gfx()
+        )
 case_iter = itertools.chain(*_case_iters)
 
 _csv_out = os.environ.get("AITER_TUNED_OP_BENCH_CSV", "tuned_op_bench.csv")

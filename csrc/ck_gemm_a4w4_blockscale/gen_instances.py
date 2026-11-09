@@ -50,20 +50,21 @@ class gemm_a4w4_blockscale_codegen:
 #include "gemm_a4w4_blockscale_common.cuh"
 
 template <typename CDataType>
-torch::Tensor
+aiter_tensor_t&
 {k.name}(
-    torch::Tensor &XQ,
-    torch::Tensor &WQ,
-    torch::Tensor &x_scale,
-    torch::Tensor &w_scale,
-    torch::Tensor &Y,
-    int splitK
+    aiter_tensor_t &XQ,
+    aiter_tensor_t &WQ,
+    aiter_tensor_t &x_scale,
+    aiter_tensor_t &w_scale,
+    aiter_tensor_t &Y,
+    int splitK,
+    hipStream_t stream
     )
 {{{{
     // The smallest kernel we have available. Works well for memory bound shapes.
 
     // Check if this input needs to be padded.
-    int M = size_to_dim_(XQ.dim() - 1, XQ.sizes());
+    int M = XQ.size(0); // 2D: [M, K/2]
     int N = WQ.size(0);
     int K = WQ.size(1);
     // TODO - padding
@@ -90,7 +91,7 @@ torch::Tensor
             ck::BlockGemmPipelineVersion::v{k.PIPELINE_VERSION},
             ck::tensor_operation::device::GemmSpecialization::{{GemmSpec}}>;
         // Run kernel instance.
-        return gemm_a4w4_blockscale_impl<CDataType, DeviceGemmInstance>(XQ, WQ, x_scale, w_scale, Y, splitK);
+        return gemm_a4w4_blockscale_impl<CDataType, DeviceGemmInstance>(XQ, WQ, x_scale, w_scale, Y, splitK, stream);
 """
         if self.istune:
             INSTANCE_IMPL_str = INSTANCE_IMPL.format(
@@ -120,14 +121,15 @@ torch::Tensor
 
 #include "impl/{name}.cuh"
 
-template torch::Tensor
+template aiter_tensor_t&
 {name}<{dtypes}>(
-    torch::Tensor &XQ,
-    torch::Tensor &WQ,
-    torch::Tensor &x_scale,
-    torch::Tensor &w_scale,
-    torch::Tensor &Y,
-    int splitK
+    aiter_tensor_t &XQ,
+    aiter_tensor_t &WQ,
+    aiter_tensor_t &x_scale,
+    aiter_tensor_t &w_scale,
+    aiter_tensor_t &Y,
+    int splitK,
+    hipStream_t stream
     );
 
 """
@@ -221,19 +223,20 @@ template torch::Tensor
 #ifdef USE_ROCM
 
 #include <cstdlib>
-
-#include <torch/extension.h>
+#include <hip/hip_runtime.h>
+#include "aiter_tensor.h"
 """
         MAINFEST_template = """
 template <typename CDataType>
-torch::Tensor
+aiter_tensor_t&
 {kernel_name}(
-    torch::Tensor &XQ,
-    torch::Tensor &WQ,
-    torch::Tensor &x_scale,
-    torch::Tensor &w_scale,
-    torch::Tensor &Y,
-    int splitK);
+    aiter_tensor_t &XQ,
+    aiter_tensor_t &WQ,
+    aiter_tensor_t &x_scale,
+    aiter_tensor_t &w_scale,
+    aiter_tensor_t &Y,
+    int splitK,
+    hipStream_t stream);
 """
         MAINFEST_end = """
 
@@ -268,20 +271,36 @@ torch::Tensor
 def get_tune_dict(tune_dict_csv):
     if os.path.exists(tune_dict_csv):
         df = pd.read_csv(tune_dict_csv)
-        # The a4w4 tuned CSV mixes CK kernels and ASM kernels in one file with
-        # no libtype column.  The Python dispatcher in
-        # aiter/ops/gemm_op_a4w4.py routes ASM rows by
-        # kernelName.startswith("_ZN") (mangled C++ symbol of the ASM kernel);
-        # apply the same filter here so the CK codegen sees only CK rows and
-        # build_tune_dict's strict validation stays effective on genuine CK
-        # references.
-        df = df[~df["kernelName"].astype(str).str.startswith("_ZN")]
-        return build_tune_dict(
-            df,
+        # Other backends share the CSV but must never enter the CK registry.
+        external = ("_ZN", "triton_", "flydsl_")
+        ck_rows = df[~df["kernelName"].astype(str).str.startswith(external)]
+        registry = build_tune_dict(
+            ck_rows,
             default_kernels_dict,
             kernels_list,
             kernels_by_name=kernels_by_name,
         )
+        # A foreign row can retain its old CK choice for unsupported calls.
+        # Collect that registry separately: identical shape keys must not hide
+        # another CK instance before the name-keyed header is emitted.
+        if "fallbackKernelName" in df.columns:
+            fallback = df.copy()
+            fallback["kernelName"] = (
+                fallback["fallbackKernelName"].fillna("").astype(str)
+            )
+            fallback = fallback[
+                (fallback["kernelName"] != "")
+                & (fallback["kernelName"] != "0")
+                & ~fallback["kernelName"].str.startswith(external)
+            ]
+            extra = build_tune_dict(
+                fallback,
+                {},
+                kernels_list,
+                kernels_by_name=kernels_by_name,
+            )
+            registry.update({k.name: k for k in extra.values()})
+        return registry
     return default_kernels_dict
 
 

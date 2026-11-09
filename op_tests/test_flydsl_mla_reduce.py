@@ -129,7 +129,7 @@ def build_irregular_inputs(
     q_start = torch.arange(num_tiles, dtype=torch.int32, device=device) * M
     fmap = torch.stack([q_start, q_start + M], dim=1).contiguous()
     for t, s in enumerate(splits_per_tile):
-        if int(s) <= 1:
+        if int(s) < 1:
             fmap[t, 0] = 1 << 24
             fmap[t, 1] = (1 << 24) + M
 
@@ -221,7 +221,7 @@ def torch_ref_gather(
     pld = pl.double()
     for t in range(num_tiles):
         s0, s1 = indptr_h[t], indptr_h[t + 1]
-        if s1 - s0 <= 1:
+        if s1 - s0 < 1:
             continue
         q_start = fmap_h[t][0]
         if num_final_rows is not None and (q_start < 0 or q_start >= num_final_rows):
@@ -678,6 +678,8 @@ _IRREGULAR_SCENARIOS = [
     ("variable_splits", [4, 32, 8, 64], 1, 1),
     ("gapped_pmap", [8, 8, 8, 8], 4, 1),
     ("empty_middle", [8, 0, 16, 8], 1, 1),
+    ("single_split", [1, 8, 1, 0], 1, 1),
+    ("single_split_m4", [1, 8], 1, 4),
     ("mlds_boundary", [300], 1, 1),
     ("mlds_max", [304], 1, 1),
     ("pool_oversize", [8, 304], 8, 1),

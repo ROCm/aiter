@@ -13,9 +13,13 @@ Run: python3 -m unittest op_tests.test_mp_tuner_logic -v
 
 import importlib
 import multiprocessing as mp
+import os
+import subprocess
+import sys
 import time
 import unittest
 from multiprocessing import TimeoutError as MPTimeoutError
+from unittest.mock import patch
 
 
 def _wait_for_release(release, value):
@@ -368,6 +372,68 @@ class TestTaskStartTimeReset(unittest.TestCase):
         slots = [11.0, 22.0, 33.0]
         reset_start_times(slots, [0, 2])
         self.assertEqual(list(slots), [0, 22.0, 0])
+
+    def test_reset_clears_worker_pids(self):
+        tuner = importlib.import_module("aiter.utility.mp_tuner")
+        slots, pids = [11.0, 22.0], [101, 202]
+        tuner._reset_task_start_times(slots, [1], pids)
+        self.assertEqual(pids, [101, 0])
+
+
+class TestTaskWorkerExit(unittest.TestCase):
+
+    def test_exited_worker_is_detected(self):
+        tuner = importlib.import_module("aiter.utility.mp_tuner")
+        worker_exited = getattr(tuner, "_task_worker_exited", None)
+        self.assertIsNotNone(
+            worker_exited,
+            "a task whose worker died (e.g. GPU fault) must not wait for the timeout",
+        )
+        proc = subprocess.Popen([sys.executable, "-c", "pass"])
+        proc.wait()
+        self.assertTrue(worker_exited([proc.pid], 0))
+        self.assertFalse(worker_exited([os.getpid()], 0))
+        self.assertFalse(worker_exited([0], 0), "a queued task has no worker yet")
+
+    def test_worker_pid_recorded_when_task_starts(self):
+        tuner = importlib.import_module("aiter.utility.mp_tuner")
+        ctx = mp.get_context("spawn")
+        start_times = ctx.RawArray("d", 1)
+        pids = ctx.RawArray("i", 1)
+        pool = ctx.Pool(
+            1,
+            initializer=tuner._init_task_start_times,
+            initargs=(start_times, pids),
+        )
+        try:
+            worker_pid = pool.apply_async(
+                tuner._run_with_start_tracking, (0, os.getpid, ())
+            ).get(timeout=60)
+            self.assertEqual(pids[0], worker_pid)
+            self.assertGreater(start_times[0], 0)
+        finally:
+            pool.terminate()
+            pool.join()
+
+
+class TestZeroTiming(unittest.TestCase):
+
+    def test_zero_after_retries_is_marked_failed(self):
+        tuner = importlib.import_module("aiter.utility.mp_tuner")
+        measured_result = object()
+
+        with (
+            patch(
+                "aiter.test_common.run_perftest",
+                return_value=(measured_result, 0),
+            ) as run_perftest,
+            patch.object(tuner.torch.cuda, "set_device"),
+            patch.object(tuner.torch.cuda, "synchronize"),
+        ):
+            result = tuner.worker(0, "candidate", lambda: None, [], {})
+
+        self.assertEqual(run_perftest.call_count, 4)
+        self.assertEqual(result, ("candidate", -1, 1.0))
 
 
 class TestWorkerErrorRatio(unittest.TestCase):

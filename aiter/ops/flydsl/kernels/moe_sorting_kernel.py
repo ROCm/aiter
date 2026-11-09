@@ -117,7 +117,7 @@ def _zero_moe_buf_grid_stride(moe_buf_it, gid_v4, stride_v4, total_v4, oob_idx):
     """Grid-stride loop zeroing moe_buf via vectorized (4xi32) stores."""
     c_one = fx.Int32(1)
     niters = (total_v4 + stride_v4 - c_one) // stride_v4
-    c_zero_v4 = fx.Vector.filled(4, 0, fx.Int32)
+    c_zero_v4 = fx.full(4, 0, fx.Int32)
     c4 = fx.Int32(4)
     for _z in range(fx.Int32(0), niters, fx.Int32(1)):
         idx = gid_v4 + fx.Int32(_z) * stride_v4
@@ -356,7 +356,7 @@ def _compile_moe_sorting_oneshot(
                 moe_buf_it,
                 zero_gid_v4,
                 zero_stride_v4,
-                i32_moe_buf_elems >> fx.Int32(2),
+                i32_moe_buf_elems >> 2,
                 c_oob_idx,
             )
 
@@ -384,14 +384,15 @@ def _compile_moe_sorting_oneshot(
 
                 global_idx = token_id * c_topk + topk_slot
                 eid = _gld(topk_ids_it, global_idx)
+                should_store = is_valid & (eid >= c_zero_i32) & (eid < c_E)
 
                 # mesh[token_id, eid] = topk_slot + 1 (valid threads only).
                 # Invalid threads must NOT write to mesh[0] — that would race
                 # with a valid write to (token=0, expert=0).
                 mesh_addr = token_id * c_smem_cols + eid
                 last_mesh_idx = fx.Int32(sub_tokens * smem_cols - 1)
-                safe_mesh_addr = is_valid.select(mesh_addr, last_mesh_idx)
-                val = is_valid.select(topk_slot + c_one_i32, c_zero_i32)
+                safe_mesh_addr = should_store.select(mesh_addr, last_mesh_idx)
+                val = should_store.select(topk_slot + c_one_i32, c_zero_i32)
                 _lds_store_raw(mesh_mr, val, safe_mesh_addr)
             gpu.barrier()
 
@@ -1030,6 +1031,7 @@ def _compile_moe_sorting_multiphase(
             token_id = safe_flat // c_topk
             topk_slot = safe_flat % c_topk
             eid = _gld(topk_it, safe_flat)
+            valid = valid & (eid >= c_zero) & (eid < fx.Int32(E))
             byte_offset = eid * i32_mesh_stride + token_id
             val_i8 = fx.Int32(topk_slot + c_one).to(fx.Int8)
             if valid:
@@ -1247,7 +1249,7 @@ def _compile_moe_sorting_multiphase(
 
         mesh_row_i32_base = (eid * i32_mesh_stride) >> fx.Int32(2)
 
-        i32_words_per_row = i32_mesh_stride >> fx.Int32(2)
+        i32_words_per_row = i32_mesh_stride >> 2
 
         tokens_ = i32_tokens
         if has_local_tokens:
@@ -1259,7 +1261,7 @@ def _compile_moe_sorting_multiphase(
         # the full static row width used by Phase 1's clear.
         i32_scan_words_per_row = (tokens_ + fx.Int32(3)) >> fx.Int32(2)
 
-        clear_niters = (i32_words_per_row + fx.Int32(P0V2_BLOCK - 1)) >> fx.Int32(9)
+        clear_niters = (i32_words_per_row + fx.Int32(P0V2_BLOCK - 1)) >> 9
         total_assignments = tokens_ * c_topk
         scatter_niters = (total_assignments + fx.Int32(P0V2_BLOCK - 1)) >> fx.Int32(9)
         count_niters = (i32_scan_words_per_row + fx.Int32(P0V2_BLOCK - 1)) >> fx.Int32(
@@ -1460,7 +1462,7 @@ def _compile_moe_sorting_multiphase(
                 moe_buf_it,
                 zero_gid_v4,
                 zero_stride_v4,
-                i32_moe_buf_elems >> fx.Int32(2),
+                i32_moe_buf_elems >> 2,
                 c_oob_idx,
             )
 

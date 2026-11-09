@@ -14,6 +14,7 @@ from functools import lru_cache
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+import torch
 from flydsl.expr import range_constexpr
 from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch
@@ -26,8 +27,70 @@ from aiter.utility.mx_types import (
 )
 
 from .quant_utils import emit_mx_e8m0_scale
+from .tensor_shim import _to_raw
 
 _AS_GLOBAL = fx.AddressSpace.Global
+
+
+_NEG_INF = float("-inf")
+_PRESHUFFLE_TILE = 16
+
+
+def _ptr_at_byte_off(tensor, base_i64):
+    """Global byte pointer at ``tensor``'s base + ``base_i64`` (64-bit byte offset).
+
+    Used to fold a slot/block rebase into the pointer handed to
+    ``ptr_buf_tensor``, which re-derives the descriptor's element type -- so the
+    i8 carrier type here only carries the address and the ptrtoint/inttoptr
+    roundtrip folds away pre-ISA, keeping the emitted V# identical to the old
+    ``buf_tensor(base_i64=...)`` descriptor.
+    """
+    pt = fx.PointerType.get(T.i8, address_space=fx.AddressSpace.Global, alignment=1)
+    return fx.inttoptr(
+        pt, fx.Int64(fx.ptrtoint(fx.get_iter(tensor))) + fx.Int64(base_i64)
+    )
+
+
+@lru_cache(maxsize=1)
+def _fp8_const():
+    """Resolve lazily: setup.py imports kernels before module_aiter_core is built."""
+    from aiter.utility import dtypes as aiter_dtypes
+
+    fp8_dtype = aiter_dtypes.fp8
+    fp8_max = float(torch.finfo(fp8_dtype).max)
+    return fp8_dtype, fp8_max
+
+
+def _fexp_f32(x, c_log2e):
+    """exp(x) while preserving the operands' arithmetic and fastmath semantics."""
+    return fx.rocdl.exp2(T.f32, _to_raw(x * c_log2e))
+
+
+def _wave_reduce_add(x, log2_wave, wave_size):
+    """Butterfly sum for typed fp32 operands."""
+    w = fx.Float32(x)
+    for sh_exp in range_constexpr(log2_wave):
+        off = wave_size // (2 << sh_exp)
+        peer = w.shuffle_xor(off, wave_size)
+        w = w + peer
+    return w
+
+
+def _wave_reduce_max(x, log2_wave, wave_size):
+    """Butterfly maximum for typed fp32 operands."""
+    w = fx.Float32(x)
+    for sh_exp in range_constexpr(log2_wave):
+        off = wave_size // (2 << sh_exp)
+        peer = w.shuffle_xor(off, wave_size)
+        w = fx.max(w, peer)
+    return w
+
+
+def _split_state(state, vec_width):
+    m_lane = list(state[:vec_width])
+    kv_lane = list(state[vec_width : 2 * vec_width])
+    w_lane = list(state[2 * vec_width : 3 * vec_width])
+    return m_lane, kv_lane, w_lane
 
 
 @lru_cache(maxsize=1)
@@ -53,7 +116,7 @@ def state_slot_byte_offset(slot, slot_stride_f32_elems):
     """
     slot_i64 = fx.Int64(fx.Int32(slot))
     stride_i64 = fx.Int64(fx.Int32(slot_stride_f32_elems))
-    return (slot_i64 * stride_i64 * fx.Int64(4)).ir_value()  # x sizeof(f32)
+    return (slot_i64 * stride_i64 * 4).ir_value()  # x sizeof(f32)
 
 
 def block_base_bytes_i64(physical_block, block_stride, elem_bytes: int = 1):
@@ -155,8 +218,8 @@ def emit_group_fp8_nm_asm_scatter(
     e8m0 = emit_mx_e8m0_scale(
         amax_g.ir_value(), mode=_MX_DEFAULT_MODE, dtype=group_fp8_mx_dtype()
     )
-    quant_exp = fx.Int32(254) - fx.Int32(e8m0)
-    inv_scale = (quant_exp << fx.Int32(23)).bitcast(fx.Float32)
+    quant_exp = 254 - fx.Int32(e8m0)
+    inv_scale = (quant_exp << 23).bitcast(fx.Float32)
 
     # -- nope lanes: scaled fp8 + group-leader dup e8m0 byte --
     # Guarded bodies live in local @flyc.jit helpers so a plain `if` lowers to
@@ -189,10 +252,10 @@ def emit_group_fp8_nm_asm_scatter(
             # VEC fp8 bytes = VEC//4 i32 dwords at byte offset nope_off.
             _global_ptr(out_base_i64, nope_off, i32, VEC).store(store_vec)
 
-            if (lane & fx.Int32(RTS - 1)) == fx.Int32(0):
+            if (lane & fx.Int32(RTS - 1)) == 0:
                 e8m0_i8 = fx.Int32(e8m0).to(fx.Int8)
                 group_id = lane >> fx.Int32(log2_rts)
-                sc_off = cache_base + fx.Int32(NOPE) + group_id * fx.Int32(2)
+                sc_off = cache_base + fx.Int32(NOPE) + group_id * 2
                 # e8m0 duplicated x2: one i8 byte at sc_off and sc_off+1.
                 sc_ptr = _global_ptr(out_base_i64, sc_off, T.i8, 1)
                 sc_ptr[0] = e8m0_i8
@@ -211,7 +274,7 @@ def emit_group_fp8_nm_asm_scatter(
             dwr = (VEC + 1) // 2
             rope_i32 = rope_bf16.bitcast(fx.Int32)  # -> vec<dwr x i32>
             # bf16 element offset -> byte offset (x2). dwr i32 dwords per rope row.
-            krope_byte = krope_off << fx.Int32(1)
+            krope_byte = krope_off << 1
             if dwr <= 4:
                 # VEC<=8 (wave64): single dwordx{dwr} store.
                 _global_ptr(krope_base_i64, krope_byte, i32, 4 * dwr).store(rope_i32)
@@ -222,8 +285,6 @@ def emit_group_fp8_nm_asm_scatter(
                     [rope_i32[k + 4] for k in range(4)], fx.Int32
                 )
                 _global_ptr(krope_base_i64, krope_byte, i32, 16).store(lo)
-                _global_ptr(krope_base_i64, krope_byte + fx.Int32(16), i32, 16).store(
-                    hi
-                )
+                _global_ptr(krope_base_i64, krope_byte + 16, i32, 16).store(hi)
 
     _rope_lanes()

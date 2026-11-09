@@ -28,7 +28,7 @@ from flydsl.runtime.device import get_rocm_arch
 
 from aiter.jit.core import AITER_CONFIGS
 
-from ..triton._triton_kernels.gated_delta_rule.utils import (
+from ..triton._triton_kernels.gated_delta_net.utils import (
     GatedDeltaRulePrefillMetadata,
     build_gated_delta_rule_prefill_metadata,
     prepare_chunk_offsets,

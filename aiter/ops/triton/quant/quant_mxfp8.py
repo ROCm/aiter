@@ -59,7 +59,7 @@ def convert_to_mxfp8(
         arbitrary shapes).  Quantising the same tensor through both will produce
         different bits — see the kernel file header for the rationale.
     """
-    _LOGGER.info(f"CONVERT_TO_MXFP8: x={tuple(x.shape)}")
+    _LOGGER.info("CONVERT_TO_MXFP8: x=%s", tuple(x.shape))
     if fp8_dtype not in (torch.float8_e4m3fn, torch.float8_e5m2):
         raise ValueError(
             f"fp8_dtype must be torch.float8_e4m3fn or torch.float8_e5m2, got {fp8_dtype}"
@@ -154,7 +154,7 @@ def convert_from_mxfp8(
     Returns:
         Dequantized tensor with output_dtype.
     """
-    _LOGGER.info(f"CONVERT_FROM_MXFP8: x={tuple(x.shape)}")
+    _LOGGER.info("CONVERT_FROM_MXFP8: x=%s", tuple(x.shape))
     # The ASM path (v_cvt_scalef32_*) is gfx950-only and _unpack_fp8 only accepts
     # e4m3fn input; anything else must take the portable path.
     asm_supported = arch_info.get_arch() == "gfx950" and x.dtype == torch.float8_e4m3fn

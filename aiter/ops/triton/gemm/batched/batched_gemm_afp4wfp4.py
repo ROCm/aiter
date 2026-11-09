@@ -50,7 +50,11 @@ def batched_gemm_afp4wfp4(
         torch.Tensor: Output batch with shape (B, M, N).
     """
     _LOGGER.info(
-        f"BATCHED_GEMM_AFP4WFP4: x={tuple(x.shape)} w={tuple(w.shape)} x_scale={tuple(x.shape)} w_scale={tuple(w.shape)}"
+        "BATCHED_GEMM_AFP4WFP4: x=%s w=%s x_scale=%s w_scale=%s",
+        tuple(x.shape),
+        tuple(w.shape),
+        tuple(x.shape),
+        tuple(w.shape),
     )
 
     assert arch_info.is_fp4_avail(), "MXFP4 is not available on your device"
