@@ -51,6 +51,29 @@ from .tensor_shim import (
 )
 
 
+def _batched_m288_silu_fma(pairs, *, limit_f32, neg_limit_f32, range_constexpr):
+    """Keep the clamps and tanh pipeline; fuse the sigmoid-gate product."""
+    gs, us = [], []
+    for i in range_constexpr(len(pairs)):
+        gs.append(fx.Float32(fx.minnumf(fx.Float32(pairs[i][0]), limit_f32)) * fx.Float32(0.5))
+        us.append(fx.Float32(rocdl.fmed3(
+            T.f32, _raw(pairs[i][1]), _raw(neg_limit_f32), _raw(limit_f32))))
+    rocdl.sched_barrier(0)
+    th, results = [None] * len(pairs), [None] * len(pairs)
+    chunk = 4
+    for c in range_constexpr((len(pairs) + chunk - 1) // chunk):
+        lo, hi = c * chunk, min((c + 1) * chunk, len(pairs))
+        for i in range_constexpr(lo, hi):
+            th[i] = fx.Float32(rocdl.tanh(T.f32, _raw(gs[i])))
+        rocdl.sched_barrier(0)
+        if c > 0:
+            for i in range_constexpr((c - 1) * chunk, lo):
+                results[i] = fx.Float32(fx.fma(gs[i], th[i], gs[i])) * us[i]
+    for i in range_constexpr(((len(pairs) - 1) // chunk) * chunk, len(pairs)):
+        results[i] = fx.Float32(fx.fma(gs[i], th[i], gs[i])) * us[i]
+    return results
+
+
 def is_explicit_vgpr_partition_available():
     """Return whether this FlyDSL build supports explicit register placement."""
     return callable(getattr(rocdl, "sched_vgpr", None)) or callable(
@@ -403,6 +426,10 @@ def launch_gemm_a8w4_tdm(
     skip_initial_cluster_sync = fp4_prefill and bool(next_stage_on) and not tdm_as_in_prologue
     pinned_fp4_prefill = fp4_prefill and explicit_vgpr_partition
     resident_ring_addresses = pinned_fp4_prefill and bool(next_stage_on) and not rolled_drain
+    m288_gemm1_opt = bool(m288_prefill and quant_gemm1_prefill and explicit_vgpr_partition)
+    m288_ep_index = all((m288_gemm1_opt, K == 7168, n_experts == 96,
+                          cluster_n == 4, cluster_m == 4,
+                          quant_wmma_rep == 9, has_bias == 0))
     checked_recip_expert = (pinned_fp4_prefill or
                             (use_spec_prefill_opt and explicit_vgpr_partition
                              and stage1_act == 1 and bool(stage1_quant_out))) and 1 < n_experts <= 65536
@@ -547,6 +574,8 @@ def launch_gemm_a8w4_tdm(
     _epq = f"_epq{ep_quant_bits}" if ep_quant_bits else ""
     _persistent = f"_pw{persistent_workers}" if persistent_workers else ""
     _drain = "_rolleddrain" if rolled_drain else ""
+    _g1opt = ("_g1opt_fma8_epidxbase_fake2dslead2" if m288_ep_index else
+              ("_g1opt_epifma8" if m288_gemm1_opt else ""))
     _early_timeout = "_et0" if not TDM_EARLY_TIMEOUT else ""
     _kname = (
         f"a8w4_tdm_{_afp}{_a_layout}"
@@ -557,7 +586,7 @@ def launch_gemm_a8w4_tdm(
         f"{_b_tdm_th}{_waves_per_tensor}{_ep}{_epq}"
         f"{_mma_group}{_ds_first}"
         f"{_explicit_vgpr_partition}{_planar_lds}"
-        f"{_interleaved_lds_load}{_persistent}{_drain}{_early_timeout}"
+        f"{_interleaved_lds_load}{_persistent}{_drain}{_early_timeout}{_g1opt}"
     )
 
     # Compile the static path directly, preserving its launch ABI and the
@@ -1392,9 +1421,14 @@ def launch_gemm_a8w4_tdm(
         def zero_resident_accumulators():
             rocdl.sched_barrier(0)
             for idx in range_constexpr(n_acc):
-                c_frags[idx].store(Vec(rocdl.sched_vgpr(
+                zero = Vec(rocdl.sched_vgpr(
                     fx.constant_vector(0.0, T.vec(WMMA_VECTOR_DWORDS, T.f32)),
-                    256 + idx * WMMA_VECTOR_DWORDS)))
+                    256 + idx * WMMA_VECTOR_DWORDS))
+                c_frags[idx].store(zero)
+                if const_expr(m288_ep_index):
+                    # Keep a use of the complete pinned vector at this point.
+                    # A separate unary use is needed for every C fragment.
+                    llvm_dialect.FakeUseOp([zero.ir_value()])
             rocdl.sched_barrier(0)
 
         def init_accumulators():
@@ -1775,7 +1809,7 @@ def launch_gemm_a8w4_tdm(
                     TDM_PER if (prefetch_kt is not None and ksl + 1 == kws) else 0,
                     schedule_slots,
                 )
-                first_ds = min((8 if resident_ring_addresses else 5) if use_spec_prefill_opt else sched_ds_first, future_schedule[0])
+                first_ds = min(2 if m288_ep_index else ((8 if resident_ring_addresses else 5) if use_spec_prefill_opt else sched_ds_first), future_schedule[0])
                 for i in range_constexpr(schedule_slots):
                     if const_expr(tdm_schedule[i] > 0):
                         rocdl.sched_vmem(tdm_schedule[i])
@@ -2015,10 +2049,13 @@ def launch_gemm_a8w4_tdm(
                     # Mid-compute prefetch: better for prefill. PRE is both the tiles
                     # resident before the loop and the issue lead; the carry adds one.
                     PRE = num_buffers if next_stage_on else num_buffers - 1
-                    for i in range_constexpr(PRE):
+                    for i in range_constexpr(2 if m288_ep_index else PRE):
                         issue(i, i)
                     if const_expr(early_zero_acc):
                         zero_resident_accumulators()
+                    if const_expr(m288_ep_index):
+                        for i in range_constexpr(2, PRE):
+                            issue(i, i)
                     if const_expr(not use_spec_prefill_opt):
                         init_accumulators()
                     n_steady = K_TILES - PRE
@@ -2274,6 +2311,19 @@ def launch_gemm_a8w4_tdm(
                         )
                     return row * STORE_N + col
 
+                if const_expr(m288_ep_index):
+                    # M16/K32 factors are uniform or constant; retain
+                    # one lane base instead of reconstructing signed
+                    # row/column quotients after each conversion.
+                    payload_lds_lane_base = (
+                        wave_m * (wmma_m_rep * 16 * STORE_N)
+                        + wave_n * (warp_tile_n // 4 * 16)
+                        + lane16 * 16 + kgrp * 2
+                    )
+                def quant_m288_byte_offset(wm, wn):
+                    return (payload_lds_lane_base + wm * (16 * STORE_N)
+                            + (wn // 4) * 256 + (wn % 4) * 4)
+
                 for wm in range_constexpr(wmma_m_rep):
                     # A 16-row block entirely past this expert's valid rows has its
                     # output OOB-clamped away, so skip its work. Wave-uniform, so
@@ -2319,17 +2369,26 @@ def launch_gemm_a8w4_tdm(
                                 )
                             else:
                                 # Clamp successive slices without extending every pair's live range.
-                                activation_chunk = (4 if quant_gemm1_prefill and resident_ring_addresses
-                                                    else len(pairs))
+                                activation_chunk = (8 if m288_gemm1_opt and not is_swiglu else
+                                                    (4 if quant_gemm1_prefill and resident_ring_addresses
+                                                     else len(pairs)))
                                 all_vals = []
                                 for act_begin in range_constexpr(0, len(pairs), activation_chunk):
-                                    all_vals += batched_silu_swiglu(
-                                        pairs[act_begin:act_begin + activation_chunk],
-                                        swiglu=is_swiglu,
-                                        limit_f32=f32_swiglu_limit,
-                                        neg_limit_f32=neg_limit,
-                                        range_constexpr=range_constexpr,
-                                    )
+                                    if const_expr(m288_gemm1_opt and not is_swiglu):
+                                        all_vals += _batched_m288_silu_fma(
+                                            pairs[act_begin:act_begin + activation_chunk],
+                                            limit_f32=f32_swiglu_limit,
+                                            neg_limit_f32=neg_limit,
+                                            range_constexpr=range_constexpr,
+                                        )
+                                    else:
+                                        all_vals += batched_silu_swiglu(
+                                            pairs[act_begin:act_begin + activation_chunk],
+                                            swiglu=is_swiglu,
+                                            limit_f32=f32_swiglu_limit,
+                                            neg_limit_f32=neg_limit,
+                                            range_constexpr=range_constexpr,
+                                        )
 
                             scale_f32, e8m0_byte = emit_amax_e8m0_native_scale(
                                 all_vals,
@@ -2369,12 +2428,14 @@ def launch_gemm_a8w4_tdm(
                                     col_fp4_1 = (wnb + wn1 * 16) // 4 + kgrp * 2
                                     lds_store_b16(
                                         stC_idx,
-                                        quant_byte_offset(row_rel, col_fp4_0),
+                                        (quant_m288_byte_offset(wm, wn0) if m288_ep_index
+                                         else quant_byte_offset(row_rel, col_fp4_0)),
                                         packed_i32,
                                     )
                                     lds_store_b16(
                                         stC_idx,
-                                        quant_byte_offset(row_rel, col_fp4_1),
+                                        (quant_m288_byte_offset(wm, wn1) if m288_ep_index
+                                         else quant_byte_offset(row_rel, col_fp4_1)),
                                         packed_i32 >> fx.Int32(16),
                                     )
                             else:
