@@ -83,6 +83,7 @@ from aiter.ops.flydsl.kernels.buffer_ops import (
     create_buffer_resource_from_addr,
 )
 from aiter.ops.flydsl.kernels.gemm_common_gfx1250 import workgroup_barrier
+from aiter.ops.flydsl.kernels.iod_loc_probe import launch_rotation
 from aiter.ops.flydsl.kernels.mxfp4_preshuffle_gfx1250_tdm import (
     build_gemm_a8w4_tdm_task,
     launch_gemm_a8w4_tdm,
@@ -649,7 +650,8 @@ def make_s1f_stage1(
     assert N1 % tile_n == 0
     NT = N1 // tile_n
     # IOD-placed W1 (iod_locality.placed_w1): XCC x is on IOD domain
-    # ((x + 3) % 8) >= 4, which holds n-tiles of that parity.
+    # ((x + c) % 8) >= 4, c the launch's rotation, which holds n-tiles of that
+    # parity.
     assert not LOC or (XQ and NT % 2 == 0), "iod_loc needs xcc_queues, even NT"
     if NT > _ITEM_N_MASK + 1:
         raise ValueError(
@@ -1664,6 +1666,7 @@ def make_s1f_stage1(
             # without a claim. XQ: queue x per XCC, its consumer l starts on
             # item l of queue x; each queue's first SQ items are static.
             SQ = CB if XQ else G - P
+            loc_c = launch_rotation() if const_expr(LOC) else None
             groups = (m_tiles + fx.Int32(GM - 1)) // fx.Int32(GM)
             gs_last = m_tiles - (groups - fx.Int32(1)) * fx.Int32(GM)
 
@@ -1671,7 +1674,7 @@ def make_s1f_stage1(
                 if const_expr(LOC):
                     # Queue xq: the m-tiles of its rank r among the 4 queues of
                     # its domain d, the n-tiles of parity d.
-                    r = ((xq + fx.Int32(3)) & fx.Int32(N_XCC - 1)) & fx.Int32(3)
+                    r = ((xq + loc_c) & fx.Int32(N_XCC - 1)) & fx.Int32(3)
                     mx = fx.Int32(
                         (m_tiles > r).select(
                             (m_tiles - r + fx.Int32(3)) // fx.Int32(4), fx.Int32(0)
@@ -1691,7 +1694,7 @@ def make_s1f_stage1(
 
             def q_code(xq, w):
                 if const_expr(LOC):
-                    xr = (xq + fx.Int32(3)) & fx.Int32(N_XCC - 1)
+                    xr = (xq + loc_c) & fx.Int32(N_XCC - 1)
                     j = w // fx.Int32(NT // 2)
                     n = (w - j * fx.Int32(NT // 2)) * fx.Int32(2) + (xr >> fx.Int32(2))
                     return (
@@ -1758,10 +1761,10 @@ def make_s1f_stage1(
                     xq_c = (xq0 + i) & fx.Int32(N_XCC - 1)
                     if const_expr(LOC):
                         # Same-domain queues first, then the other domain's.
-                        xr0 = (xq0 + fx.Int32(3)) & fx.Int32(N_XCC - 1)
+                        xr0 = (xq0 + loc_c) & fx.Int32(N_XCC - 1)
                         d_c = (xr0 >> fx.Int32(2)) ^ (i >> fx.Int32(2))
                         xr_c = d_c * fx.Int32(4) + (((xr0 & fx.Int32(3)) + i) & fx.Int32(3))
-                        xq_c = (xr_c + fx.Int32(5)) & fx.Int32(N_XCC - 1)
+                        xq_c = (xr_c - loc_c) & fx.Int32(N_XCC - 1)
                     code_s = claim_resolve(xq_c, claim_issue(xq_c))
                     xq_s = xq_c
                     i = i + fx.Int32(1)
