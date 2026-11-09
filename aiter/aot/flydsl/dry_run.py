@@ -213,7 +213,6 @@ def dry_run(
     env = {
         "COMPILE_ONLY": "1",
         "FLYDSL_GPU_ARCH": arch,
-        "ARCH": arch,
         "GPU_ARCHS": arch,
         "CU_NUM": str(cu_num),
     }
