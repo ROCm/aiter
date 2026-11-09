@@ -113,6 +113,28 @@ def test_the_dry_run_answers_a_launch_s_raw_stream_query(monkeypatch):
         assert isinstance(tensor_shim.current_stream_arg(), fx.Stream)
 
 
+def test_the_dry_run_builds_capture_scoped_scratch_without_asking_hip(monkeypatch):
+    """A split-K GEMM's cached semaphores ask HIP which capture the stream is in;
+    with the GPUs hidden that fails, and a replay never captures."""
+    from aiter.utility import graph_alloc
+
+    def no_gpu(_stream):
+        raise RuntimeError("hipStreamGetCaptureInfo failed with error 100")
+
+    monkeypatch.setattr(graph_alloc, "_capture_id", no_gpu)
+    calls = []
+
+    @graph_alloc.capture_scoped_cache
+    def zeros(device):
+        calls.append(device)
+        return torch.zeros(4, dtype=torch.int32, device=device)
+
+    with dry_run("gfx950", 256):
+        device = torch.device("cuda", 0)
+        assert zeros(device) is zeros(device)
+    assert calls == [device]
+
+
 def test_per_arch_replays_get_the_command_line(monkeypatch):
     argv = ["--shape", "12:12:192:128", "--check"]
     forwarded = []

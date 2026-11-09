@@ -179,3 +179,24 @@ def test_scatter_reduce_last_row_and_all_skipped(mb):
     _run_scatter(flat, rs, weights, out, topk, mb)
     torch.testing.assert_close(out[0], torch.zeros_like(out[0]), rtol=0, atol=0)
     torch.testing.assert_close(out[1], torch.full_like(out[1], 2), rtol=0, atol=0)
+
+
+def test_stage2_scratch_never_shares_live_memory(monkeypatch):
+    """The reused scatter/reduce scratch must not alias across slots (fp4 target
+    and scale) or streams, and must not be handed to a graph being captured."""
+    import aiter.fused_moe as fm
+
+    monkeypatch.setattr(fm, "_STAGE2_SCRATCH", {})
+    dev = torch.device("cuda", torch.cuda.current_device())
+    target = fm._stage2_scratch("target", (64, 64), torch.uint8, dev)
+    scale = fm._stage2_scratch("scale", (64, 4), torch.uint8, dev)
+    assert target.data_ptr() != scale.data_ptr()
+    with torch.cuda.stream(torch.cuda.Stream(dev)):
+        other = fm._stage2_scratch("target", (64, 64), torch.uint8, dev)
+    assert other.data_ptr() != target.data_ptr()
+
+    fm._STAGE2_SCRATCH.clear()
+    g, stream = torch.cuda.CUDAGraph(), torch.cuda.Stream(dev)
+    with torch.cuda.stream(stream), torch.cuda.graph(g, stream=stream):
+        fm._stage2_scratch("target", (64, 64), torch.uint8, dev).fill_(1)
+    assert not fm._STAGE2_SCRATCH
