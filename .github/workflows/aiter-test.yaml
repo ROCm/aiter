@@ -868,13 +868,7 @@ jobs:
           set -ex
           echo "Starting container: aiter_test"
 
-          if [[ "${RUNNER_NAME:-}" == linux-aiter-mi35x-1-toolkit-test* ]]; then
-            GPU_DOCKER_FLAGS="--runtime=amd -e AMD_VISIBLE_DEVICES=all"
-            if [ -f "/etc/podinfo/gha-render-devices" ]; then
-              DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
-              GPU_DOCKER_FLAGS="$GPU_DOCKER_FLAGS $DEVICE_FLAG"
-            fi
-          elif [ -f "/etc/podinfo/gha-render-devices" ]; then
+          if [ -f "/etc/podinfo/gha-render-devices" ]; then
             DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
             GPU_DOCKER_FLAGS="--device=/dev/kfd $DEVICE_FLAG"
           else
