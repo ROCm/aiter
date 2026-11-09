@@ -146,7 +146,9 @@ def _popc(x):
     from flydsl._mlir.dialects import llvm as _llvm
 
     return fx.Int32(
-        _llvm.call_intrinsic(T.i32, "llvm.ctpop.i32", [arith.unwrap(fx.Int32(x))], [], [])
+        _llvm.call_intrinsic(
+            T.i32, "llvm.ctpop.i32", [arith.unwrap(fx.Int32(x))], [], []
+        )
     )
 
 
@@ -1209,7 +1211,9 @@ def compile_tdm_compact_plan(
                         if const_expr(shared_first):
                             le_q = le_q + fx.Int32(shared_first)
                             le_q = fx.Int32(
-                                (le_q >= fx.Int32(epr)).select(le_q - fx.Int32(epr), le_q)
+                                (le_q >= fx.Int32(epr)).select(
+                                    le_q - fx.Int32(epr), le_q
+                                )
                             )
                         p_me = le_q * fx.Int32(npes) + j_d
                         _st(lds_ccl, p_me, c_me)

@@ -1583,7 +1583,9 @@ def make_s1f_stage1(
                         is_scalar=True,
                     )
                 )
-                rows_pre = fx.Int32((rows_pre < fx.Int32(0)).select(fx.Int32(0), rows_pre))
+                rows_pre = fx.Int32(
+                    (rows_pre < fx.Int32(0)).select(fx.Int32(0), rows_pre)
+                )
                 m_sh = (rows_pre + fx.Int32(tile_m - 1)) // fx.Int32(tile_m)
                 m_sh = fx.Int32((m_sh >= m_tiles).select(fx.Int32(0), m_sh))
             rsrc_tinfo = create_buffer_resource_from_addr(
