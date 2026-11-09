@@ -276,7 +276,9 @@ class Gfx1250ClusterMerge:
         group = max(1, 128 // (t.cluster_merge * elems))
         lane = fx.Int32(gpu.thread_id("x")) % t.WAVE
         kv_query = fx.Int32(gpu.block_id("y"))
-        kv_h = kv_query // t.query_splits
+        kv_h = (
+            fx.Int32(0) if const_expr(t.single_kv_head) else kv_query // t.query_splits
+        )
         rows = t.rows * t.query_splits
         pmax = fx.recast_iter(fx.Float32, self.pmax)
         psum = fx.recast_iter(fx.Float32, self.psum)

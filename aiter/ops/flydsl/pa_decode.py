@@ -165,6 +165,21 @@ def launch_pa_decode_ps_reduce(
         pairs=pairs,
         parallel_groups=groups,
         num_xcds=num_xcds,
+        paired_output=bool(
+            arch in ("gfx1250", "gfx1250-strict")
+            and pairs
+            and output.dtype in (torch.bfloat16, torch.float16)
+            and output.data_ptr() % 4 == 0
+            and all(
+                stride % 2 == 0
+                for stride in (
+                    stride_output_bs,
+                    stride_output_len,
+                    stride_output_kv_head,
+                    stride_output_group_size,
+                )
+            )
+        ),
     )
     sink_ptr = (
         flyc.from_c_void_p(_flydsl_pointer_dtype(output.dtype), 0)
@@ -438,7 +453,10 @@ def pa_decode(
     max_context_length: int | None = None,
     mask_unowned_kv: bool = True,
 ) -> None:
-    """Decode FP8 or BF16 K/V using 256-token compute tiles.
+    """Decode FP8 or BF16 K/V using reusable GPU work tiles.
+
+    ``context_partition_size=256`` is the legacy compatibility argument.
+    Work metadata records its own 128/256-token unit; scratch capacity is unchanged.
 
     Supports page sizes 16/64/128. BF16 head dimensions are multiples of 64
     up to 1024; FP8 supports 64 and multiples of 128 up to 1024.
@@ -926,13 +944,13 @@ def pa_decode(
     max_partitions = min(
         num_partitions,
         work_plan.capacity,
-        max(1, -(-schedule_context_length // KV_COMPUTE_BLOCK)),
+        max(1, -(-schedule_context_length // work_plan.tile_tokens)),
     )
     if sliding_window > 0:
         # Bound the unaligned MTP window without shrinking the reusable plan.
         window_tiles = (
-            sliding_window + query_length - 2 + KV_COMPUTE_BLOCK - 1
-        ) // KV_COMPUTE_BLOCK + 1
+            sliding_window + query_length - 2 + work_plan.tile_tokens - 1
+        ) // work_plan.tile_tokens + 1
         max_partitions = min(max_partitions, window_tiles)
     # gfx1250 tile kernels write final output for one-partition plans and for
     # plans with one task slot per sequence: single tasks store directly, and
@@ -984,6 +1002,12 @@ def pa_decode(
         else 0
     )
 
+    use_cluster_tasks = bool(
+        cluster_merge
+        and work_plan.cluster_info is not None
+        and cluster_merge <= work_plan.cluster_task_stride
+    )
+
     # Bound byte offsets as well as element indices for 16-bit BF16 caches.
     cache_extent = max(
         key_cache.numel() * key_cache.element_size(),
@@ -1017,6 +1041,13 @@ def pa_decode(
             trans_k=trans_k,
             mask_unowned_kv=mask_unowned_kv,
             cluster_merge=cluster_merge,
+            plan_tile_tokens=work_plan.tile_tokens,
+            cluster_task_stride=(
+                work_plan.cluster_task_stride if use_cluster_tasks else 0
+            ),
+            packed_scale_heads=bool(
+                cluster_merge and per_token_kv and stride_ks_head == block_size
+            ),
         )
 
     total_rows = query_length * query_group_size
@@ -1119,7 +1150,20 @@ def pa_decode(
             stride_ks_head,
             int(query.stride(0)),
             int(query.stride(1)),
-            ptr_arg(work_plan.work_info, fx.Int32),
+            ptr_arg(
+                (
+                    context_lengths
+                    if one_partition_output
+                    and sliding_window == 0
+                    and num_seqs <= 4 * num_compute_units
+                    else (
+                        work_plan.cluster_info
+                        if use_cluster_tasks
+                        else work_plan.work_info
+                    )
+                ),
+                fx.Int32,
+            ),
             work_plan.capacity,
             *merge_args,
             s,
