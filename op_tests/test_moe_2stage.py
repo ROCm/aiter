@@ -6,6 +6,7 @@ import gc
 import itertools
 import logging
 import os
+import sys
 from contextlib import ExitStack, nullcontext
 
 import pandas as pd
@@ -2539,9 +2540,9 @@ def test_swiglu_oai_flat_dispatch():
         16: None,
     }
 
-    def dispatched_kernel(token, gate_mode=GateMode.SEPARATED.value, **kw):
+    def dispatched_kernel_metadata(token, gate_mode=GateMode.SEPARATED.value, **kw):
         kw = {"gate_up_interleave": False, **kw}
-        metadata = get_2stage_cfgs(
+        return get_2stage_cfgs(
             get_padded_M(token),
             6144,
             768,
@@ -2561,6 +2562,9 @@ def test_swiglu_oai_flat_dispatch():
             opus_weights_shuffled=True,
             **kw,
         )
+
+    def dispatched_kernel(token, **kw):
+        metadata = dispatched_kernel_metadata(token, **kw)
         if not (metadata.run_1stage and metadata.flat):
             return None
         return metadata.stage1.keywords.get("kernelName")
@@ -2577,6 +2581,65 @@ def test_swiglu_oai_flat_dispatch():
     ):
         got = dispatched_kernel(1, **fallback)
         assert got is None, f"{fallback}: asm row must be discarded, got {got}"
+
+    # The FLAT kernels read raw top-k routing. A SwiGLU 1-stage row with no
+    # kernel name (or not flat=1) would get host-sorted ids, so it must fall
+    # back instead of letting fmoe_g1u1 pick a FLAT kernel heuristically.
+    fused_moe_mod = sys.modules["aiter.fused_moe"]
+    primary = fused_moe_mod.cfg_2stages[0]
+    row_key = next(
+        k
+        for k, v in primary.items()
+        if v.get("kernelName1") == _SWIGLU_OAI_16X32
+        and k[2:7] == (1, 6144, 768, 129, 5)
+    )
+    tuned_row = primary[row_key]
+    try:
+        for override in (
+            {"kernelName1": ""},
+            {"kernelName1": float("nan")},
+            {"flat": AsmMoeMode.SORTED.value},
+        ):
+            primary[row_key] = {**tuned_row, **override}
+            get_2stage_cfgs.cache_clear()
+            metadata = dispatched_kernel_metadata(1)
+            assert (
+                not metadata.run_1stage
+            ), f"{override}: SwiGLU asm row must be discarded"
+    finally:
+        primary[row_key] = tuned_row
+        get_2stage_cfgs.cache_clear()
+    assert dispatched_kernel(1) == _SWIGLU_OAI_16X32
+
+    # fmoe_g1u1 itself rejects an unnamed SwiGLU OAI launch before kernel lookup.
+    dev = torch.device("cuda")
+    E, model_dim, inter_dim = 2, 512, 128
+
+    def fp4(*shape):
+        return torch.zeros(shape, dtype=torch.uint8, device=dev).view(dtypes.fp4x2)
+
+    u8 = torch.zeros(1, dtype=torch.uint8, device=dev)
+    try:
+        aiter.fmoe_g1u1(
+            torch.empty((1, model_dim), dtype=torch.bfloat16, device=dev),
+            torch.zeros((1, model_dim), dtype=torch.bfloat16, device=dev),
+            fp4(E, inter_dim * 2, model_dim // 2),
+            fp4(E, model_dim, inter_dim // 2),
+            torch.zeros(16, dtype=torch.int32, device=dev),
+            torch.zeros(16, dtype=torch.float32, device=dev),
+            torch.zeros(1, dtype=torch.int32, device=dev),
+            torch.zeros(2, dtype=torch.int32, device=dev),
+            1,
+            u8,
+            u8,
+            u8,
+            "",
+            activation=aiter.ActivationType.Swiglu.value,
+        )
+    except RuntimeError as e:
+        assert "explicit kernel name" in str(e), e
+    else:
+        raise AssertionError("fmoe_g1u1 must reject an unnamed SwiGLU OAI launch")
     aiter.logger.info("moe_2stage: SwiGLU OAI FLAT dispatch regression test passed")
 
 

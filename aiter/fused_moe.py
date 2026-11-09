@@ -4604,13 +4604,27 @@ def get_2stage_cfgs(
     # GGUU (separated) gate/up weights and have no per-expert bias input. The
     # 1-stage launch does not forward bias or swiglu_limit, so a row that does
     # not match the call would silently compute a different function.
+    # They also read raw top-k routing (flat=1). Only a named flat=1 row makes
+    # fused_moe skip the host moe_sorting; an unnamed row would let fmoe_g1u1
+    # pick a FLAT kernel heuristically and hand it host-sorted ids.
     if (
         cfg is not None
         and cfg.get("run_1stage", False)
         and activation == ActivationType.Swiglu
     ):
+        swiglu_kernel1 = cfg.get("kernelName1", "")
+        if not isinstance(swiglu_kernel1, str):  # pandas reads a blank cell as NaN
+            swiglu_kernel1 = ""
+        try:
+            swiglu_flat = int(cfg.get("flat", AsmMoeMode.SORTED))
+        except (TypeError, ValueError):  # blank (NaN) flat cell
+            swiglu_flat = AsmMoeMode.SORTED
         unsupported = None
-        if has_stage1_bias or has_stage2_bias:
+        if not swiglu_kernel1.strip():
+            unsupported = "empty kernelName1 (FLAT kernels need an explicit name)"
+        elif swiglu_flat != AsmMoeMode.NO_SORT:
+            unsupported = f"flat={cfg.get('flat')} (FLAT kernels need flat=1)"
+        elif has_stage1_bias or has_stage2_bias:
             unsupported = "per-expert bias"
         elif swiglu_limit is not None and float(swiglu_limit) != 7.0:
             unsupported = f"swiglu_limit={swiglu_limit} (kernel uses 7.0)"
