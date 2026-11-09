@@ -649,11 +649,12 @@ class TDMGatherKVLoader:
             )
             return i * self.cfg.NUM_KV_BLOCKS + offs
         else:
-            # TODO: mod may not be cheap here, find a better way to clamp indices
+            # Clamp ids past the row, as TDMKVLoader does: they only prefetch tiles that
+            # the loop does not read.
             offs = i * self.cfg.NUM_KV_BLOCKS + gl.arange(
                 0, self.cfg.NUM_KV_BLOCKS, layout=self.kv_cfg.gather_ids_layout
             )
-            offs = offs % self.block_table_stride
+            offs = gl.minimum(offs, self.block_table_stride - 1)
             # TODO: it is unlikely but do we have a risk of int32 overflow?
             return gl.load(self.block_tables_ptr_shifted + offs)
 
