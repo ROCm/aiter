@@ -183,13 +183,14 @@ def opus_candidates(m, n, k, *, cu_num):
                 if bm < 64 or wn < 2:
                     continue
             selected.add(kid)
-    small = sum(
-        bool((registry[kid].bpreshuffle_entry or {}).get("small_shape"))
+    pipeline_counts = Counter(
+        (registry[kid].bpreshuffle_entry or {}).get("pipeline", "co")
         for kid in selected
     )
     print(
         f"[OPUS search] shape={(m, n, k)} legal={len(legal)} "
-        f"small={small} candidates={len(selected)}",
+        f"direct_b={pipeline_counts['direct_b']} staged_b={pipeline_counts['staged_b']} "
+        f"candidates={len(selected)}",
         flush=True,
     )
     return [(kid, registry[kid]) for kid in sorted(selected)]
@@ -342,7 +343,16 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
         "errRatio": 0.05,
         "batch": 100,
         "profile_file": "",
+        "config_env_name": "AITER_CONFIG_GEMM_A8W8_MXFP8_BPRESHUFFLE",
     }
+
+    def get_arg_defaults(self):
+        defaults = super().get_arg_defaults()
+        if getattr(self, "_mxscale_table", False):
+            defaults["config_env_name"] = (
+                "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE"
+            )
+        return defaults
 
     def getKernelName(self, kernelId):
         # Pipeline id ranges are disjoint (8-wave ids start at 1_000_000).
@@ -350,6 +360,22 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
             if kernelId in pipe.kernels_list:
                 return pipe.kernels_list[kernelId].name
         return None
+
+    def _clear_op_caches(self):
+        from aiter.ops import gemm_op_a8w8 as op
+
+        for cached in (
+            op._get_mxfp8_bpreshuffle_config,
+            op._load_mxfp8_bpreshuffle_tuned,
+            op._mxfp8_bpreshuffle_tuned_nk,
+            op.get_mxscale_bpreshuffle_config,
+            op._load_mxscale_bpreshuffle_tuned,
+            op._mxscale_bpreshuffle_tuned_nk,
+        ):
+            cached.cache_clear()
+        op._CKGEMM_CONFIG_CACHE.clear()
+        op._CKGEMM_HAS_GFX.clear()
+        op._MXSCALE_UNTUNED_REPORTED.clear()
 
     def _setup_specific_arguments(self):
         self.parser.add_argument(
@@ -453,6 +479,74 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
 
     def calculate(self, results, bpes=(1, 1, 2)):
         return super().calculate(results, bpes=(1, 1, 2))
+
+    def run_config(self, args):
+        from aiter.ops.gemm_op_a8w8 import (
+            gemm_a8w8_blockscale_bpreshuffle,
+            gemm_a8w8_mxfp8_bpreshuffle,
+            get_mxscale_bpreshuffle_config,
+        )
+        from aiter.test_common import checkAllclose, run_perftest
+
+        if args.mxscale_table and self.get_gfx() == "gfx950":
+            configs = (
+                get_mxscale_bpreshuffle_config(
+                    int(row.M),
+                    int(row.N),
+                    int(row.K),
+                    getattr(row, "w_scale_block", W_SCALE_BLOCK),
+                )
+                for row in self.untunedf.itertuples()
+            )
+            ensure_opus_kids_compiled(
+                {
+                    int(config["kernelId"])
+                    for config in configs
+                    if config is not None and config["libtype"] == "opus"
+                },
+                cu_num=self.get_cu_num(),
+            )
+        run = (
+            gemm_a8w8_blockscale_bpreshuffle
+            if args.mxscale_table
+            else gemm_a8w8_mxfp8_bpreshuffle
+        )
+        results = []
+        for i in range(len(self.untunedf)):
+            row = self.untunedf.iloc[i]
+            M, N, K = int(row["M"]), int(row["N"]), int(row["K"])
+            block = row.get("w_scale_block", W_SCALE_BLOCK)
+            shape_str = f"({M}, {N}, {K}, {block})"
+            allowed, allowed_desc = self._get_run_config_err_ratio_limit(row, args)
+            try:
+                d = generate_data(M, N, K, 0, block)
+                out, us = run_perftest(
+                    run,
+                    d["x"],
+                    d["weight_shuffle"],
+                    d["x_scale"],
+                    d["w_scale"],
+                    num_warmup=args.warmup,
+                    num_iters=args.iters,
+                )
+                err_ratio = checkAllclose(
+                    out,
+                    run_torch(d["x_deq"], d["w_deq"]),
+                    msg=f"run_config {shape_str}",
+                )
+                status = (
+                    "ok"
+                    if err_ratio <= allowed
+                    else f"mismatch:err_ratio={err_ratio:.6g}(>{allowed_desc})"
+                )
+                results.append({"shape": shape_str, "e2e_us": us, "status": status})
+            except Exception as e:  # noqa: BLE001
+                results.append(
+                    {"shape": shape_str, "e2e_us": -1, "status": f"error:{e}"}
+                )
+            finally:
+                torch.cuda.empty_cache()
+        return results
 
     def tune(self, untunedf, tunedf, args):
         gfx = self.get_gfx()

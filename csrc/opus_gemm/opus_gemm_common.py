@@ -2926,13 +2926,13 @@ def _bpreshuffle_jit_name(family, bm, bn, bk, wm, wn, suffix):
     )
 
 
-def _small_bpreshuffle_config_name(parameters, suffix, split):
+def _bpreshuffle_config_name(instance, suffix, split):
     parts = [
-        f"m{parameters['B_M']}n{parameters['B_N']}k{parameters['B_K']}",
-        f"w{parameters['T_M']}x{parameters['T_N']}",
+        f"m{instance.B_M}n{instance.B_N}k{instance.B_K}",
+        f"w{instance.T_M}x{instance.T_N}",
         suffix,
     ]
-    wg, ca, cb = (parameters[key] for key in ("WG_PER_CU", "cachectl_a", "cachectl_b"))
+    wg, ca, cb = instance.WG_PER_CU, instance.cachectl_a, instance.cachectl_b
     if wg != 1:
         parts.append(f"wg{wg}")
     if ca or cb:
@@ -2942,35 +2942,80 @@ def _small_bpreshuffle_config_name(parameters, suffix, split):
     return "_".join(parts)
 
 
-def _bpreshuffle_instance(bm, bn, bk, wm, wn, wg=1, ca=0, cb=0, split=1):
-    return {
-        "BLOCK_SIZE": 64 * wm * wn,
-        "B_M": bm,
-        "B_N": bn,
-        "B_K": bk,
-        "T_M": wm,
-        "T_N": wn,
-        "W_M": 16,
-        "W_N": 16,
-        "W_K": 128,
-        "VEC_A": 16,
-        "VEC_B": 16,
-        "VEC_C": 4,
-        "GROUP_M": 1,
-        "GROUP_N": 128,
-        "GROUP_K": 128,
-        "WG_PER_CU": wg,
-        "cachectl_a": ca,
-        "cachectl_b": cb,
-        "kernel_tag": _TAG,
-        "output_dtypes": ["bf16_t"],
-        "arch_prefix": "gfx950",
-        "direct_only": split == 1,
-        "pad_m": True,
-        "has_oob": True,
-        "max_tensor_bytes": 2**63 - 1,
-        "splitk_workspace_dtype": "fp32_t" if split > 1 else None,
-    }
+def _bpreshuffle_instance(
+    bm,
+    bn,
+    bk,
+    wm,
+    wn,
+    wg=1,
+    ca=0,
+    cb=0,
+    split=1,
+    *,
+    entry=None,
+    co=None,
+    max_k=None,
+    max_m=None,
+    name_suffix=None,
+):
+    """Build a JIT or CO instance with the shared bpreshuffle geometry."""
+    instance = OpusGemmInstance(
+        co["block_size"] if co is not None else 64 * wm * wn,
+        bm,
+        bn,
+        bk,
+        wm,
+        wn,
+        16,
+        16,
+        128,
+        16,
+        16,
+        4,
+        1,
+        128,
+        128,
+        _TAG,
+        ["bf16_t"],
+        WG_PER_CU=wg,
+        cachectl_a=ca if co is None else -1,
+        cachectl_b=cb if co is None else -1,
+        arch_prefix="gfx950",
+        direct_only=split == 1,
+        pad_m=co.get("pad_m", True) if co is not None else True,
+        has_oob=co.get("pad_m", True) if co is not None else True,
+        max_k=co.get("max_k", 16384) if co is not None else max_k,
+        max_m=max_m,
+        max_tensor_bytes=(
+            _INT32_MAX if co is not None and not co.get("wide_output") else 2**63 - 1
+        ),
+        splitk_workspace_dtype="fp32_t" if split > 1 else None,
+        bpreshuffle_co=co,
+        bpreshuffle_entry=entry,
+    )
+    if entry is not None:
+        pipeline = entry["pipeline"]
+        prefetch = pipeline.startswith("prefetch_")
+        header = (
+            "b_vgpr"
+            if prefetch
+            else ("m_repeat" if pipeline == "pingpong_lds" else pipeline)
+        )
+        header = f"gfx950/opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_{header}_gfx950.cuh"
+        entry.update(
+            kernel=(_BP_ROOT if prefetch else _B_PREFIX)
+            + pipeline
+            + ("_bulk_panel_kernel" if prefetch else "_kernel"),
+            headers=(
+                ("gfx950/splitk_reduce_gfx950.cuh", header) if split > 1 else (header,)
+            ),
+        )
+        if name_suffix is not None:
+            entry["config_name"] = f"{pipeline}_" + _bpreshuffle_config_name(
+                instance, name_suffix, split
+            )
+    return instance
 
 
 # CO metadata
@@ -3118,16 +3163,7 @@ def _bpreshuffle_b_vgpr_jit_configs():
         yield 128, config
 
 
-def _bpreshuffle_b_jit_suffix(stages, bd, wg, ca, cb, output, pub=0):
-    # Match CO labels: stages, prefetch distance, pin/address/cache,
-    # residency, publication, stream/static/compact flags, queue override, output.
-    return (
-        f"p{stages}_bd{bd}_pinA0C0_xcd1_contig0"
-        f"_ca{ca}cb{cb}_wg{wg}_pub{pub}_sa0_sb0_compact0_aheadauto_out{output}"
-    )
-
-
-def _bpreshuffle_b_jit_entry(bk, config, publish=None):
+def _bpreshuffle_b_jit_instance(bk, config, publish=None):
     bm, bn, wn, stages, ahead, wg, ca, cb, output, scale_cols = config
     family = "b_vgpr" if publish is None else "b_vgpr_overlap"
     pipeline = "prefetch_" + family
@@ -3148,9 +3184,8 @@ def _bpreshuffle_b_jit_entry(bk, config, publish=None):
             bk,
             1,
             wn,
-            _bpreshuffle_b_jit_suffix(
-                stages, ahead, wg, ca, cb, output, 0 if publish is None else publish
-            ),
+            f"p{stages}_bd{ahead}_pinA0C0_xcd1_contig0_ca{ca}cb{cb}_wg{wg}"
+            f"_pub{0 if publish is None else publish}_sa0_sb0_compact0_aheadauto_out{output}",
         ),
     }
     if publish is not None:
@@ -3158,7 +3193,7 @@ def _bpreshuffle_b_jit_entry(bk, config, publish=None):
             "gfx950/opus_gemm_traits_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh"
         )
     entry["m_align"] = 16
-    return _bpreshuffle_instance(bm, bn, bk, 1, wn, wg, ca, cb), entry
+    return _bpreshuffle_instance(bm, bn, bk, 1, wn, wg, ca, cb, entry=entry)
 
 
 # Pingpong LDS pipeline
@@ -3453,7 +3488,7 @@ def _direct_b_parameters():
         yield (bm, bn, 128, 1, 4, stages, ahead, wg, 17, 1, 1, 0, 1)
 
 
-def _direct_b_jit_configs():
+def _direct_b_jit_instances():
     """Generate bounded resource strategies, then apply the C++ traits limits."""
     seen = set()
     for args in _direct_b_parameters():
@@ -3463,13 +3498,9 @@ def _direct_b_jit_configs():
         bm, bn, bk, wm, wn, stages, ahead, wg, ca, cb, vec, _output, split = args
         if not _direct_b_legal(bm, bn, bk, wm, wn, stages, ahead, wg, vec, ca, cb):
             continue
-        parameters = _bpreshuffle_instance(bm, bn, bk, wm, wn, wg, ca, cb, split)
-        yield parameters, {
+        entry = {
             "traits": _bpreshuffle_cpp_traits(_B_PREFIX + "direct_b_traits", args),
             "pipeline": "direct_b",
-            "config_name": _small_bpreshuffle_config_name(
-                parameters, f"p{stages}_bd{ahead}_sv{vec}", split
-            ),
             "m_align": (
                 16
                 if vec == 4 and (cb == 2 or (bm >= 96 and (ca, cb) == (17, 1)))
@@ -3478,6 +3509,20 @@ def _direct_b_jit_configs():
             "pad_n": False,
             "split_k": split,
         }
+        yield _bpreshuffle_instance(
+            bm,
+            bn,
+            bk,
+            wm,
+            wn,
+            wg,
+            ca,
+            cb,
+            split,
+            entry=entry,
+            max_m=1024,
+            name_suffix=f"p{stages}_bd{ahead}_sv{vec}",
+        )
 
 
 # Staged B pipeline
@@ -3486,7 +3531,7 @@ def _direct_b_jit_configs():
 def _staged_b_resources(
     bm, bn, wm, wn, panel, split, bk=128, cache_a=0, cache_b=0, group_m=0
 ):
-    """Mirror the static constants and assertions of the small M traits."""
+    """Mirror the static constants and assertions of the staged B traits."""
     waves, threads = wm * wn, 64 * wm * wn
     if (
         min(bm, bn, wm, wn, panel) <= 0
@@ -3555,7 +3600,7 @@ def _staged_b_resources(
     return threads, em, pitch
 
 
-def _staged_b_jit_configs():
+def _staged_b_jit_instances():
     """Pair each wave tile with one main scale arena and a few resource profiles."""
     seen = set()
 
@@ -3573,18 +3618,28 @@ def _staged_b_jit_configs():
         values = (bm, bn, wm, wn, panel, split, ca, cb, group_m)
         if bk != 128:
             values += (bk,)
-        instance = _bpreshuffle_instance(bm, bn, bk, wm, wn, 1, ca, cb, split)
-        instance["max_k"] = split * panel * 128
-        yield instance, {
+        entry = {
             "traits": _bpreshuffle_cpp_traits(_B_PREFIX + "staged_b_traits", values),
             "pipeline": "staged_b",
-            "config_name": _small_bpreshuffle_config_name(
-                instance, f"sp{panel}" + (f"_gm{group_m}" if group_m else ""), split
-            ),
             "m_align": 1,
             "pad_n": False,
             "split_k": split,
         }
+        yield _bpreshuffle_instance(
+            bm,
+            bn,
+            bk,
+            wm,
+            wn,
+            1,
+            ca,
+            cb,
+            split,
+            entry=entry,
+            max_k=split * panel * 128,
+            max_m=1024,
+            name_suffix=f"sp{panel}" + (f"_gm{group_m}" if group_m else ""),
+        )
 
     wave_tiles = ((1, 1), (1, 2), (1, 4), (2, 1), (2, 2), (2, 4), (4, 2))
     for bm, bn, (wm, wn) in product(
@@ -3685,43 +3740,10 @@ def _staged_b_jit_configs():
 # Kernel registration
 
 
-def _register_bpreshuffle_jit(kid, parameters, entry):
-    if (
-        kid in gfx950_co_kernels_declared
-        or kid in a8w8_blockscale_mxscale_gemm_bpreshuffle_kernels_list
-    ):
-        raise ValueError(f"duplicate gfx950 bpreshuffle kernel ID {kid}")
-    pipeline = entry["pipeline"]
-    prefetch = pipeline.startswith("prefetch_")
-    small = pipeline in ("direct_b", "staged_b")
-    header = (
-        "b_vgpr"
-        if prefetch
-        else ("m_repeat" if pipeline == "pingpong_lds" else pipeline)
-    )
-    header = f"gfx950/opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_{header}_gfx950.cuh"
-    entry.update(
-        kid=kid,
-        kernel=(_BP_ROOT if prefetch else _B_PREFIX)
-        + pipeline
-        + ("_bulk_panel_kernel" if prefetch else "_kernel"),
-        headers=[header] if small else (header,),
-    )
-    if small:
-        parameters = {**parameters, "max_m": 1024}
-        entry.update(small_shape=True, config_name=f"{pipeline}_{entry['config_name']}")
-        if entry["split_k"] > 1:
-            entry["headers"].insert(0, "gfx950/splitk_reduce_gfx950.cuh")
-    a8w8_blockscale_mxscale_gemm_bpreshuffle_kernels_list[kid] = OpusGemmInstance(
-        **parameters,
-        bpreshuffle_entry=entry,
-    )
-
-
-def _bpreshuffle_jit_entries():
+def _bpreshuffle_jit_instances():
     b_configs = tuple(_bpreshuffle_b_vgpr_jit_configs())
     for bk, config in b_configs:
-        yield _bpreshuffle_b_jit_entry(bk, config)
+        yield _bpreshuffle_b_jit_instance(bk, config)
     for (
         bm,
         bn,
@@ -3734,9 +3756,7 @@ def _bpreshuffle_jit_entries():
         bounded,
         gn,
     ) in _bpreshuffle_m_repeat_jit_configs():
-        parameters = _bpreshuffle_instance(bm, bn, 128, wm, 2, ca=ca, cb=cb)
-        parameters["max_k"] = panel * 128
-        yield parameters, {
+        entry = {
             "pipeline": "pingpong_lds",
             "traits": _bpreshuffle_cpp_traits(
                 _B_PREFIX + "pingpong_lds_traits",
@@ -3754,10 +3774,13 @@ def _bpreshuffle_jit_entries():
             "grid_layout": "n_m",
             "m_align": 16,
         }
+        yield _bpreshuffle_instance(
+            bm, bn, 128, wm, 2, ca=ca, cb=cb, entry=entry, max_k=panel * 128
+        )
     for bk, config in b_configs:
         if bk == 256:
             for publish in range(config[0] // 16 - 1):
-                yield _bpreshuffle_b_jit_entry(bk, config, publish)
+                yield _bpreshuffle_b_jit_instance(bk, config, publish)
 
 
 gfx950_co_kernels_declared = _load_gfx950_co_kernels(
@@ -3765,8 +3788,18 @@ gfx950_co_kernels_declared = _load_gfx950_co_kernels(
 )
 
 
-for _kid, (_parameters, _entry) in enumerate(_bpreshuffle_jit_entries(), start=100):
-    _register_bpreshuffle_jit(_kid, _parameters, _entry)
+for _first_kid, _instances in (
+    (100, _bpreshuffle_jit_instances()),
+    (6300, chain(_direct_b_jit_instances(), _staged_b_jit_instances())),
+):
+    for _kid, _instance in enumerate(_instances, start=_first_kid):
+        if (
+            _kid in gfx950_co_kernels_declared
+            or _kid in a8w8_blockscale_mxscale_gemm_bpreshuffle_kernels_list
+        ):
+            raise ValueError(f"duplicate gfx950 bpreshuffle kernel ID {_kid}")
+        _instance.bpreshuffle_entry["kid"] = _kid
+        a8w8_blockscale_mxscale_gemm_bpreshuffle_kernels_list[_kid] = _instance
 
 
 for _kid, _entry in gfx950_co_kernels_declared.items():
@@ -3774,38 +3807,9 @@ for _kid, _entry in gfx950_co_kernels_declared.items():
         raise ValueError(f"gfx950 CO ID {_kid} collides with a JIT ID")
     _bm, _bn, _bk = _entry["tile"]
     _wm, _wn = _entry["wave_layout"]
-    a8w8_blockscale_mxscale_gemm_bpreshuffle_kernels_list[_kid] = OpusGemmInstance(
-        BLOCK_SIZE=_entry["block_size"],
-        B_M=_bm,
-        B_N=_bn,
-        B_K=_bk,
-        T_M=_wm,
-        T_N=_wn,
-        W_M=16,
-        W_N=16,
-        W_K=128,
-        VEC_A=16,
-        VEC_B=16,
-        VEC_C=4,
-        GROUP_M=1,
-        GROUP_N=128,
-        GROUP_K=128,
-        kernel_tag=_TAG,
-        output_dtypes=["bf16_t"],
-        arch_prefix="gfx950",
-        direct_only=True,
-        pad_m=_entry.get("pad_m", True),
-        has_oob=_entry.get("pad_m", True),
-        max_k=_entry.get("max_k", 16384),
-        max_tensor_bytes=2**63 - 1 if _entry.get("wide_output") else _INT32_MAX,
-        bpreshuffle_co=_entry,
+    a8w8_blockscale_mxscale_gemm_bpreshuffle_kernels_list[_kid] = _bpreshuffle_instance(
+        _bm, _bn, _bk, _wm, _wn, wg=2, co=_entry
     )
-
-
-for _kid, (_parameters, _entry) in enumerate(
-    chain(_direct_b_jit_configs(), _staged_b_jit_configs()), start=6300
-):
-    _register_bpreshuffle_jit(_kid, _parameters, _entry)
 
 
 # Shape support

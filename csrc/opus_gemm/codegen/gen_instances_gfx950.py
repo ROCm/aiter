@@ -3279,7 +3279,7 @@ def gen_mxscale_bpreshuffle_instance(
     else:
         entry = k.bpreshuffle_entry
         kernel, alias = entry["kernel"], f"{k.name}_Traits"
-        small = entry.get("small_shape", False)
+        dynamic_lds = entry["pipeline"] in ("direct_b", "staged_b")
         split_k = entry.get("split_k", 1)
         if split_k > 1:
             workspace_extra = ",\n    aiter_tensor_t &workspace"
@@ -3295,10 +3295,10 @@ def gen_mxscale_bpreshuffle_instance(
         ]
         if k.max_k is not None:
             checks.append(f"k <= {k.max_k}")
-        if small:
+        if dynamic_lds:
             checks.extend((f"m <= {k.max_m}", f"k / {k.B_K} >= {split_k}"))
         checks.append(f"2ULL * (m < {k.B_M} ? m : {k.B_M}) * n <= INT32_MAX")
-        if small and entry["pipeline"] == "staged_b":
+        if dynamic_lds and entry["pipeline"] == "staged_b":
             checks.append(f"2ULL * {k.B_M} * n <= INT32_MAX")
         input_limit = min(2147483647, k.max_tensor_bytes)
         output_bytes = 4 * split_k if split_k > 1 else 2
@@ -3327,7 +3327,7 @@ def gen_mxscale_bpreshuffle_instance(
         condition, grid_setup = None, ""
         if b_pipeline:
             condition = "k <= (Traits::SCALE_COLS < 16 ? Traits::SCALE_COLS : 16) * Traits::GROUP_K"
-        if small:
+        if dynamic_lds:
             grid = (
                 "dim3(n / Traits::B_N, (m + Traits::B_M - 1) / Traits::B_M, Traits::SPLIT_K)"
                 if split_k > 1
@@ -3357,10 +3357,12 @@ def gen_mxscale_bpreshuffle_instance(
         {call.format(mode=", true")}
     else
         {call.format(mode=", false")}"""
-        params = ", bool ShortK" if small else (", bool Short" if b_pipeline else "")
+        params = (
+            ", bool ShortK" if dynamic_lds else (", bool Short" if b_pipeline else "")
+        )
         modes = (
             (", true", ", false")
-            if small
+            if dynamic_lds
             else ((", false", ", true") if b_pipeline else ("",))
         )
         device_decl = "".join(
@@ -3376,7 +3378,9 @@ def gen_mxscale_bpreshuffle_instance(
         device_source = f"""{host_tu_split}
 struct {alias} : {entry["traits"]} {{}};
 """
-        setup = "auto stream = aiter::getCurrentHIPStream();\n    " if small else ""
+        setup = (
+            "auto stream = aiter::getCurrentHIPStream();\n    " if dynamic_lds else ""
+        )
         if split_k > 1:
             setup += f"""static_assert(Traits::SPLIT_K > 1);
     const size_t workspace_numel = opus_checked_extent_product(
@@ -3393,14 +3397,14 @@ struct {alias} : {entry["traits"]} {{}};
         stream>>>(args.ptr_c, reinterpret_cast<__bf16*>(Y.data_ptr()), Traits::SPLIT_K, 1, elements, 1, 1, elements, nullptr, 0);"""
         else:
             setup += f"""const unsigned tiles_m = (m + Traits::B_M - 1) / Traits::B_M;
-    const unsigned tiles_n = n / Traits::B_N{", tiles = tiles_m * tiles_n" if not small else ""};
+    const unsigned tiles_n = n / Traits::B_N{", tiles = tiles_m * tiles_n" if not dynamic_lds else ""};
     """
 
         body = f"""{shape_check}
     using Traits = {alias};
     {setup}{launch}"""
         extra_includes = (
-            "" if small and split_k == 1 else '#include "opus_gemm_common.cuh"'
+            "" if dynamic_lds and split_k == 1 else '#include "opus_gemm_common.cuh"'
         )
         host_header = ""
     preamble = instance_impl_preamble(
