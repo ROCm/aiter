@@ -437,6 +437,7 @@ def pa_decode(
     work_plan: PADecodePlan | None = None,
     max_context_length: int | None = None,
     mask_unowned_kv: bool = True,
+    kv_layout: str = "vectorized",
 ) -> None:
     """Decode FP8 or BF16 K/V using 256-token compute tiles.
 
@@ -532,6 +533,11 @@ def pa_decode(
     tiny boundary-tile-only calls); the caller must then keep those bytes and
     scales finite. gfx1250 ignores it and always requires finite bytes.
 
+    ``kv_layout="linear"`` (gfx950, BF16 K/V) takes contiguous
+    [num_blocks, block_size, num_kv_heads, head_size] key and
+    [num_blocks, block_size, num_kv_heads, value_head_size] value caches, the
+    unified-attention layout, at block sizes 16, 64 or 128.
+
     GPU lengths and table entries are not checked. Callers must ensure
     0 <= context_lengths[i] <= block_tables.shape[1] * block_size and used
     block indices in [0, min(key_cache.shape[0], value_cache.shape[0])).
@@ -590,7 +596,14 @@ def pa_decode(
                 f"{name} must be {expected}, got shape {tuple(tensor.shape)}"
             )
 
+    if kv_layout not in ("vectorized", "linear"):
+        raise ValueError(
+            f"kv_layout must be 'vectorized' or 'linear', got {kv_layout!r}"
+        )
+    linear_kv = kv_layout == "linear"
     if mxfp4:
+        if linear_kv:
+            raise NotImplementedError("MXFP4 KV supports only its packed page layout")
         if query_length != 1:
             raise NotImplementedError(
                 f"MXFP4 KV supports query_length 1, got {query_length}"
@@ -623,7 +636,12 @@ def pa_decode(
             max_context_length,
         )
 
-    trans_k = key_cache.dim() == 5
+    if linear_kv and (key_cache.dim(), value_cache.dim()) != (4, 4):
+        raise ValueError(
+            "linear key_cache and value_cache must be 4D "
+            "[num_blocks, block_size, num_kv_heads, dim]"
+        )
+    trans_k = linear_kv or key_cache.dim() == 5
     if not trans_k:
         raise NotImplementedError("Non-transposed key cache is not implemented")
 
@@ -651,8 +669,13 @@ def pa_decode(
             f"context_lengths.shape[0] ({num_seqs})"
         )
 
-    trans_v = value_cache.dim() == 5
-    num_blocks, num_kv_heads, num_hgroups, block_size, hgroup_width = key_cache.shape
+    trans_v = linear_kv or value_cache.dim() == 5
+    if linear_kv:
+        num_blocks, block_size, num_kv_heads, key_dim = key_cache.shape
+    else:
+        num_blocks, num_kv_heads, num_hgroups, block_size, hgroup_width = (
+            key_cache.shape
+        )
     if num_kv_heads < 1:
         raise ValueError(
             f"key_cache must contain at least one KV head, got {num_kv_heads}"
@@ -673,6 +696,8 @@ def pa_decode(
             f"on {arch}, got {compute_type}"
         )
     vector_width = 8 if is_bf16_kv else 16
+    if linear_kv and not (is_bf16_kv and arch == "gfx950"):
+        raise NotImplementedError("linear KV layout requires BF16 K/V on gfx950")
 
     # Enforce the tile geometry and the reducer's 1024-thread limit.
     if not (
@@ -692,7 +717,14 @@ def pa_decode(
                 else "are 64 and multiples of 128 in [128, 1024] on gfx1250"
             )
         )
-    if num_hgroups != head_dim // vector_width or hgroup_width != vector_width:
+    if linear_kv:
+        if key_dim != head_dim:
+            raise ValueError(
+                "linear key_cache shape must be "
+                "[num_blocks, block_size, num_kv_heads, head_dim], "
+                f"got {tuple(key_cache.shape)} for head_dim={head_dim}"
+            )
+    elif num_hgroups != head_dim // vector_width or hgroup_width != vector_width:
         raise ValueError(
             "key_cache shape must be "
             f"[num_blocks, num_kv_heads, head_dim // {vector_width}, "
@@ -706,7 +738,16 @@ def pa_decode(
 
     if is_bf16_kv and arch not in ("gfx1250", "gfx1250-strict") and not trans_v:
         raise ValueError("BF16 KV requires the vectorized 5D value_cache layout")
-    if trans_v:
+    if linear_kv:
+        v_num_blocks, v_block_size, v_num_kv_heads, v_head_dim = value_cache.shape
+        if v_head_dim != value_dim or v_block_size != block_size:
+            raise ValueError(
+                "linear value_cache shape must be "
+                "[num_blocks, block_size, num_kv_heads, value_dim], "
+                f"got {tuple(value_cache.shape)} for block_size={block_size}, "
+                f"value_dim={value_dim}"
+            )
+    elif trans_v:
         v_num_blocks, v_num_kv_heads = value_cache.shape[:2]
         expected_v_tail = (block_size // vector_width, value_dim, vector_width)
         if tuple(value_cache.shape[2:]) != expected_v_tail:
@@ -1027,6 +1068,7 @@ def pa_decode(
             trans_k=trans_k,
             mask_unowned_kv=mask_unowned_kv,
             cluster_merge=cluster_merge,
+            linear_kv=linear_kv,
         )
 
     total_rows = query_length * query_group_size

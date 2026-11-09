@@ -12,6 +12,45 @@ from flydsl.expr import arith, const_expr, gpu, range_constexpr
 
 from .traits import LOG2E, MFMA_MNK, WAVE
 
+# Consecutive workgroup ids go round-robin over the XCDs, each with its own L2.
+NUM_XCDS = 8
+# Tasks per XCD whose query splits are interleaved (measured on gfx950).
+SPLIT_TASKS_PER_XCD = 16
+
+
+def cta_coords(traits, width):
+    """(x, y) task coordinates of this CTA in a ``width``-wide plan grid.
+
+    The query splits of one (KV head, partition) task read the same K/V. In
+    the grid's x-fastest order a split starts a whole grid row after the
+    previous one, once a large grid has evicted the K/V from L2. Instead the
+    splits of SPLIT_TASKS_PER_XCD tasks per XCD take ids close together on one
+    XCD, so the later splits hit its L2. Ids past the last whole block keep a
+    task-major order.
+    """
+    bx = fx.Int32(gpu.block_id("x"))
+    by = fx.Int32(gpu.block_id("y"))
+    group = traits.query_splits
+    # The schedule picks more than four splits only for KV work below two
+    # waves of CUs; there the remap measured slower.
+    if const_expr(
+        group == 1 or group > 4 or traits.batch_first_plan_grid or traits.DIRECT
+    ):
+        return bx, by
+    # A KV head owns group * width consecutive ids. A block of span of them
+    # holds whole tasks: id offset r is split r // tasks of task r % tasks.
+    tasks = NUM_XCDS * SPLIT_TASKS_PER_XCD
+    span = tasks * group
+    local = fx.Uint32(by % group) * fx.Uint32(width) + fx.Uint32(bx)
+    r = local % span
+    remapped = local - r + (r % tasks) * group + r // tasks
+    full = fx.Uint32(width) * group // span * span
+    task = (local < full).select(remapped, local)
+    return (
+        fx.Int32(task // group),
+        by - by % group + fx.Int32(task % group),
+    )
+
 
 class PaDecodeContext:
     def __init__(
@@ -37,8 +76,15 @@ class PaDecodeContext:
         planned_start,
         planned_end,
         planned_context,
+        cta=None,
     ):
         self.traits = traits
+        # (partition, KV-head * query_splits + split) of this CTA's task.
+        self.cta = (
+            (fx.Int32(gpu.block_id("x")), fx.Int32(gpu.block_id("y")))
+            if cta is None
+            else cta
+        )
         self.shared_storage = shared_storage
         self.pmax_ptr = pmax_ptr
         self.psum_ptr = psum_ptr
@@ -66,7 +112,7 @@ class PaDecodeContext:
         self.warp = self.tid // WAVE  # 0..NWARP-1
         self.lane = self.tid - self.warp * WAVE  # 0..63
         self.seq = self.planned_seq
-        self.kv_query = fx.Int32(gpu.block_id("y"))
+        cta_x, self.kv_query = self.cta
         self.kv_h = self.kv_query // self.traits.query_splits
         self.query_begin = (
             self.kv_query % self.traits.query_splits
@@ -81,7 +127,7 @@ class PaDecodeContext:
             capacity = fx.Int32(fx.Uint32(gpu.grid_dim.x) * fx.Uint32(gpu.grid_dim.z))
             self.partial_slot = self.kv_h * capacity + self.part
         else:
-            self.part = fx.Int32(gpu.block_id("x"))
+            self.part = cta_x
             self.partial_slot = self.kv_h * fx.Int32(gpu.grid_dim.x) + self.part
 
     def init_query_mapping(self):

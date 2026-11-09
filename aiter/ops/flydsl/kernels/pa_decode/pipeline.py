@@ -24,6 +24,7 @@ from .traits import (
     FP8_RESIDUAL_TOKENS,
     KV_COMPUTE_BLOCK,
     LOG2E,
+    MFMA_ACC_ELEMS,
     MFMA_MNK,
     MXFP4_P_EXP_SHIFT,
     WAVE,
@@ -74,7 +75,7 @@ class PaDecodePipeline:
             # Bound the latest visible key across this CTA's query positions,
             # including early queries in long verification blocks.
             query_end = (
-                fx.block_idx.y % self.traits.query_splits + 1
+                self.ctx.cta[1] % self.traits.query_splits + 1
             ) * self.traits.QUERIES_PER_CTA
             visible_end = self.ctx.planned_context - (
                 self.traits.query_length - query_end
@@ -176,13 +177,30 @@ class PaDecodePipeline:
             self.traits.V_SLOT
         ]  # this tile's V pages, as one PAGES_PER_CHUNK-wide i32 vector
         tok0 = tt * self.traits.TILE_TOK
-        # Interleave MFMA with VALU/LDS or page16 V loads.
-        if const_expr(
-            (not self.traits.per_token_kv and multi_query) or self.traits.PAGE16_VPIPE
+        prefetch_in_qk = (
+            multi_query and self.traits.K_PREFETCH_IN_QK and not self.policy.single_tile
+        )
+        # Interleave MFMA with VALU/LDS or page16 V loads. The QK prefetch
+        # places its loads with group barriers, which IGLP would override.
+        if (
+            const_expr(
+                (not self.traits.per_token_kv and multi_query)
+                or self.traits.PAGE16_VPIPE
+            )
+            and not prefetch_in_qk
         ):
             fx.rocdl.iglp_opt(0)
 
         tt1 = tt + 1
+        # The page-table branch precedes the V loads, leaving them in the QK
+        # block where their issue can interleave with the MFMAs.
+        prefetch_pages = None
+        if const_expr(prefetch_in_qk):
+            # Loads past the partition reread this tile: they are unused, and
+            # a branch between the MFMAs would split their schedule.
+            prefetch_pages = self.kv.k_tile_pages(
+                (tt1 < self.ctx.part_end).select(tt1, tt)
+            )
 
         cur_kv_buf = self.kv.scale_buffer_offset(tt)
 
@@ -214,6 +232,7 @@ class PaDecodePipeline:
         elif const_expr(
             (self.traits.M_TILES > 1 and not self.traits.MTP4_FUSED)
             or (self.traits.prefetch_v and not self.traits.SCALES_BEFORE_CURRENT_V)
+            or self.traits.linear_kv
         ):
             v_vh_shared = [
                 self.kv.load_v(v_page_cur, vh)
@@ -244,6 +263,7 @@ class PaDecodePipeline:
                 q_scale_vec,
                 q_ops_all,
                 mask_tail,
+                prefetch_pages,
             )
         if const_expr(self.traits.MXFP4):
             # Masks tail scores/V by tile_valid at runtime, so it ignores mask_tail.
@@ -280,6 +300,7 @@ class PaDecodePipeline:
         q_scale_vec,
         q_ops_all,
         mask_tail,
+        prefetch_pages=None,
     ):
         """Publish all query maxima together, then consume shared K/V per query."""
         single_tile = self.policy.single_tile
@@ -299,8 +320,42 @@ class PaDecodePipeline:
                 for a in range_constexpr(self.traits.NCHUNK)
             ]
 
+        k_carried = k_cur
+        if const_expr(self.traits.LDS_K):
+            k_cur = self.kv.read_k_lds()
+        prefetch_in_qk = prefetch_pages is not None
+        if const_expr(prefetch_in_qk):
+            frags = [[] for _ in range_constexpr(self.traits.M_TILES)]
+            k_prefetched = []
+            n_sub = self.traits.N_SUBCHUNKS
+            for a in range_constexpr(self.traits.NCHUNK):
+                for m in range_constexpr(self.traits.M_TILES):
+                    acc = fx.full(MFMA_ACC_ELEMS, 0.0, fx.Float32)
+                    if const_expr(a < self.policy.qk_chunks):
+                        acc = self.gemm.mfma(
+                            k_cur, q_ops_all, a * n_sub, m * n_sub, n_sub, acc
+                        )
+                    frags[m].append(fx.Vector(acc))
+                page = fx.Int32(
+                    prefetch_pages[(a * MFMA_MNK) // self.traits.block_size]
+                )
+                k_prefetched.extend(self.kv.load_k_chunk(page, a))
+            # Spread this tile's V loads and the next tile's K loads (16 B
+            # each) over the QK MFMAs instead of queueing them in bursts.
+            n_loads = len(k_prefetched) // 2 + (
+                self.traits.VHE_CHUNKS
+                * self.traits.PAGES_PER_CHUNK
+                * self.traits.STEPS_PER_CHUNK
+            )
+            k_prefetched = fx.Vector.from_elements(k_prefetched, dtype=fx.Int64)
+            for _ in range_constexpr(n_loads):
+                fx.rocdl.sched_group_barrier(fx.rocdl.mask_mfma, 2, 0)
+                fx.rocdl.sched_group_barrier(fx.rocdl.mask_vmem_rd, 1, 0)
         for m in range_constexpr(self.traits.M_TILES):
-            frag_Ss = self.gemm.qk(k_cur, q_ops_all, m)
+            if const_expr(prefetch_in_qk):
+                frag_Ss = frags[m]
+            else:
+                frag_Ss = self.gemm.qk(k_cur, q_ops_all, m)
 
             scale = (
                 self.ctx.scale_qk
@@ -321,13 +376,16 @@ class PaDecodePipeline:
         k_next = (
             fx.full(self.traits.NCHUNK * self.traits.N_SUBCHUNKS, 0, fx.Int64)
             if const_expr(self.traits.MTP4_FUSED)
-            else k_cur
+            else k_carried
         )
         if const_expr(not single_tile) and tt1 < self.ctx.part_end:
             if const_expr(self.traits.MTP4_FUSED):
                 # Defer K until P packing releases saved score registers.
                 phys_vec1 = self.kv.fetch_v_pages(tt1)
                 self.kv.stage_scales(phys_vec1, self.kv.scale_buffer_offset(tt1), tt1)
+            elif const_expr(prefetch_in_qk):
+                k_next = k_prefetched
+                self.kv.fetch_v_pages(tt1)
             else:
                 k_next, phys_vec1 = self.kv.load_k(tt1)
                 self.kv.fetch_v_pages(tt1)
@@ -413,6 +471,8 @@ class PaDecodePipeline:
                 )
                 corr_b = fx.full(self.traits.OP_ELEMS, fx.Float32(corr_reg), fx.Float32)
                 for vh in range_constexpr(self.traits.VHE_CHUNKS):
+                    if const_expr(m == 0):
+                        v_vh_shared[vh] = self.kv.v_operands(v_vh_shared[vh], vh)
                     if const_expr(mask_tail and m == 0):
                         v_vh_shared[vh] = self.kv.mask_v_chunk(
                             v_vh_shared[vh], v_masks, tile_valid
@@ -511,6 +571,8 @@ class PaDecodePipeline:
                 if const_expr(mask_tail and m == 0):
                     v_masks = self.kv.tail_masks(tile_valid)
                 for vh in range_constexpr(self.traits.VHE_CHUNKS):
+                    if const_expr(m == 0):
+                        v_vh_shared[vh] = self.kv.v_operands(v_vh_shared[vh], vh)
                     if const_expr(mask_tail and m == 0):
                         v_vh_shared[vh] = self.kv.mask_v_chunk(
                             v_vh_shared[vh], v_masks, tile_valid
@@ -671,7 +733,7 @@ class PaDecodePipeline:
             corr_b.append(
                 fx.full(self.traits.OP_ELEMS, fx.Float32(corr_reg[m]), fx.Float32)
             )
-        if const_expr(self.traits.prefetch_v):
+        if const_expr(self.traits.prefetch_v or self.traits.linear_kv):
             v_vh_batch = v_vh_shared
         else:
             v_vh_batch = [
@@ -686,7 +748,7 @@ class PaDecodePipeline:
         # vh outer, m inner: each M-tile is a separate accumulator chain on the
         # same V operand.
         for vh in range_constexpr(self.traits.VHE_CHUNKS):
-            v_vh = v_vh_batch[vh]
+            v_vh = self.kv.v_operands(v_vh_batch[vh], vh)
             if const_expr(mask_tail):
                 v_vh = self.kv.mask_v_chunk(v_vh, v_masks, tile_valid)
             for m in range_constexpr(self.traits.M_TILES):

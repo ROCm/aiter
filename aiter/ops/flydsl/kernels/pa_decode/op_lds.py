@@ -5,6 +5,7 @@
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl._mlir.dialects import rocdl as mlir_rocdl
 from flydsl.compiler.protocol import dsl_size_of
 from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr import math as fmath
@@ -15,7 +16,14 @@ from ..kernels_common import create_llvm_ptr
 from ..mxfp4_gemm_common import _e8m0_byte_to_f32
 from ..tensor_shim import buf_base_i64, ptr_buf_tensor
 from ..utils import rcp_f32
-from .traits import MFMA_MNK, MXFP4_V_BF16_CHUNK_BYTES
+from .traits import (
+    LINEAR_V_GROUP_BYTES,
+    LINEAR_V_ROW_BYTES,
+    LINEAR_V_WAVE_BYTES,
+    MFMA_MNK,
+    MXFP4_V_BF16_CHUNK_BYTES,
+    WAVE,
+)
 
 
 def _gptr(base, elem_ty, align):
@@ -389,6 +397,13 @@ class PaDecodeKVLoader:
             self.traits.KV_VECTOR_WIDTH,
             self.traits.KV_EXTENT,
         )
+        if const_expr(self.traits.LDS_K):
+            self.k_base = buf_base_i64(self.ctx.key_cache_ptr)
+            # The copy's LDS address goes through M0, so it must be wave-uniform.
+            self.k_lds_warp = fx.Int32(fx.rocdl.readfirstlane(T.i32, self.ctx.warp))
+            self.k_lds_wave = self.traits.sLinearK_off + self.k_lds_warp * (
+                self.traits.TOK_PER_WARP * self.traits.head_dim * 2
+            )
 
     def kv_address(self, phys, page_elems, rest):
         if const_expr(self.traits.BUFFER_KV):
@@ -556,6 +571,13 @@ class PaDecodeKVLoader:
         return fetched_vec
 
     def read_v_pages(self):
+        if const_expr(self.traits.linear_kv):
+            # Each wave reads V of the whole tile, so it keeps every chunk's pages.
+            return self.lds.load(
+                self.traits.sVPage_off,
+                fx.Int32,
+                self.traits.NWARP * self.traits.PAGES_PER_CHUNK,
+            )
         off = self.traits.sVPage_off + self.ctx.rgroup * (
             self.traits.PAGES_PER_CHUNK * 4
         )
@@ -669,7 +691,19 @@ class PaDecodeKVLoader:
         ops = []
         for qkhe in range_constexpr(self.traits.QKHE_LOOP):
             he_idx = qkhe * self.traits.RGROUP_QUARTERS + self.ctx.rgroup
-            if const_expr(self.traits.is_bf16_kv):
+            if const_expr(self.traits.linear_kv):
+                # [blocks, page, kv_heads, head_dim]: 8 dims of one token.
+                for qkr in range_constexpr(2):
+                    base = self.kv_address(
+                        phys,
+                        self.ctx.n_kv * self.traits.head_dim * self.traits.block_size,
+                        (within_page_tok * self.ctx.n_kv + self.ctx.kv_h)
+                        * self.traits.head_dim
+                        + (he_idx * 2 + qkr) * 8,
+                    )
+                    w = self.load_k_vector(base)
+                    ops.extend([w[0], w[1]])
+            elif const_expr(self.traits.is_bf16_kv):
                 for qkr in range_constexpr(2):
                     he8_idx = he_idx * 2 + qkr
                     base = self.kv_address(
@@ -852,7 +886,60 @@ class PaDecodeKVLoader:
             ops.append(fx.Vector(r).bitcast(fx.Int64)[0])
         return ops
 
+    def _k_lds_chunk(self, tok, chunk):
+        """LDS byte offset of 16 B chunk ``chunk`` of wave token ``tok``: rows are
+        unpadded and the chunk index is XORed with (tok >> 1) & 7, so the sixteen
+        tokens of one QK read land on distinct banks."""
+        cpr = self.traits.head_dim // 8
+        return (
+            self.k_lds_wave
+            + tok * (cpr * 16)
+            + (fx.Int32(chunk) ^ ((tok >> 1) & fx.Int32(7))) * 16
+        )
+
+    def stage_k_lds(self, phys):
+        """Copy this wave's K rows of page ``phys`` to its LDS buffer as one async
+        group. Lane l of copy i writes LDS chunk 64 i + l and reads the global
+        chunk the swizzle puts there, so each copy reads whole rows."""
+        t = self.traits
+        c = self.ctx
+        cpr = t.head_dim // 8
+        page_tok0 = (self.k_lds_warp * t.TOK_PER_WARP) % t.block_size
+        for i in range_constexpr(t.TOK_PER_WARP * cpr // WAVE):
+            slot = c.lane + i * WAVE
+            tok = slot // cpr
+            chunk = (slot % cpr) ^ ((tok >> 1) & fx.Int32(7))
+            elem = self.kv_address(
+                phys,
+                c.n_kv * t.head_dim * t.block_size,
+                ((page_tok0 + tok) * c.n_kv + c.kv_h) * t.head_dim + chunk * 8,
+            )
+            src = create_llvm_ptr(self.k_base + fx.Int64(elem) * fx.Int64(2), 1)
+            dst = fx.to_llvm_ptr(
+                self.lds.pointer(self.k_lds_wave + i * (WAVE * 16), fx.Int32)
+            )
+            mlir_rocdl.global_load_async_lds(src, dst, 16, 0)
+        fx.rocdl.asyncmark()
+
+    def read_k_lds(self):
+        """The tile's K operands from the wave's LDS rows, in ``load_k_chunk`` order."""
+        t = self.traits
+        c = self.ctx
+        fx.rocdl.wait_asyncmark(0)
+        flat = []
+        for a in range_constexpr(t.NCHUNK):
+            tok = a * MFMA_MNK + c.lane16
+            for qkhe in range_constexpr(t.QKHE_LOOP):
+                for qkr in range_constexpr(2):
+                    chunk = (qkhe * t.RGROUP_QUARTERS + c.rgroup) * 2 + qkr
+                    w = self.lds.load(self._k_lds_chunk(tok, chunk), fx.Int64, 2)
+                    flat.extend([w[0], w[1]])
+        return fx.Vector.from_elements(flat, dtype=fx.Int64)
+
     def load_k_from_pages(self, phys_vec):
+        if const_expr(self.traits.LDS_K):
+            self.stage_k_lds(fx.Int32(phys_vec[0]))
+            return fx.full(self.traits.NCHUNK * self.traits.N_SUBCHUNKS, 0, fx.Int64)
         flat = []
         for a in range_constexpr(self.traits.NCHUNK):
             phys = fx.Int32(phys_vec[(a * MFMA_MNK) // self.traits.block_size])
@@ -862,7 +949,7 @@ class PaDecodeKVLoader:
 
         return fx.Vector.from_elements(flat, dtype=fx.Int64)
 
-    def load_k(self, tt_i32):
+    def k_tile_pages(self, tt_i32):
         base_page = (
             tt_i32 * self.traits.TILE_TOK // self.traits.block_size
         )  # tile start is page-aligned
@@ -871,14 +958,99 @@ class PaDecodeKVLoader:
             + (self.ctx.warp * self.traits.TOK_PER_WARP) // self.traits.block_size,
             self.traits.PAGES_PER_CHUNK,
         )
-        phys_vec = (
+        return (
             fx.Vector.from_elements([fetched], dtype=fx.Int32)
             if const_expr(self.traits.PAGES_PER_CHUNK == 1)
             else fx.Vector(fetched)
         )
+
+    def load_k(self, tt_i32):
+        phys_vec = self.k_tile_pages(tt_i32)
         return self.load_k_from_pages(phys_vec), phys_vec
 
+    def _load_v_linear(self, pages, vh):
+        """Raw rows of chunk ``vh`` from [blocks, page, kv_heads, value_dim] V.
+
+        The wave loads its 16 dims of all 256 tile tokens as 16 B rows: per
+        32-token step, lane l holds token l // 2, dims (l % 2) * 8 .. +7.
+        ``v_operands`` turns them into PV operands, so the loads can be issued a
+        phase before their transpose.
+        """
+        t = self.traits
+        c = self.ctx
+        head_group = (vh * t.VHE_SIZE) // 16 + c.warp
+        row = c.lane // 2
+        half = c.lane % 2
+        page_elems = t.block_size * c.n_kv * t.value_dim
+        rows = []
+        for step in range_constexpr(t.TILE_TOK // 32):
+            chunk = step // 2
+            tok = (step % 2) * 32 + row  # within the 64-token chunk
+            if const_expr(t.PAGES_PER_CHUNK == 1):
+                phys = fx.Int32(pages[chunk])
+            else:
+                sub = (step % 2) * (32 // t.block_size)
+                phys = fx.Int32(pages[chunk * t.PAGES_PER_CHUNK + sub])
+                for s in range_constexpr(1, 32 // t.block_size):
+                    phys = (row >= s * t.block_size).select(
+                        fx.Int32(pages[chunk * t.PAGES_PER_CHUNK + sub + s]), phys
+                    )
+            within_page = (chunk * t.TOK_PER_WARP + tok) % t.block_size
+            base = self.kv_address(
+                phys,
+                page_elems,
+                (within_page * c.n_kv + c.kv_h) * t.value_dim
+                + head_group * 16
+                + half * 8,
+            )
+            w = self.load_v_vector(base)
+            rows.extend([w[0], w[1]])
+        return rows
+
+    def v_operands(self, v, vh):
+        """PV operands of chunk ``vh`` from ``load_v``'s result.
+
+        Linear V stages its raw rows in the wave's LDS and reads them back
+        transposed, in the vectorized order: lane (rgroup, lane16) operand i
+        holds tokens rgroup * 64 + 4i .. +3 of dim head_group * 16 + lane16.
+        Other layouts already load operands.
+        """
+        if const_expr(not self.traits.linear_kv):
+            return v
+        t = self.traits
+        c = self.ctx
+        wave_off = t.sLinearV_off + c.warp * LINEAR_V_WAVE_BYTES
+        for step in range_constexpr(t.TILE_TOK // 32):
+            self.lds.store(
+                wave_off
+                + (step // 2) * LINEAR_V_GROUP_BYTES
+                + ((step % 2) * 32 + c.lane // 2) * LINEAR_V_ROW_BYTES
+                + (c.lane % 2) * 16,
+                fx.Int64,
+                fx.Vector.from_elements([v[2 * step], v[2 * step + 1]], dtype=fx.Int64),
+            )
+        # ds_read_b64_tr_b16: lane 4k + q of each 16-lane group addresses token
+        # 4i + k, dims 4q..4q+3; lane j receives dim j of the four tokens.
+        lane_off = (
+            wave_off
+            + c.rgroup * LINEAR_V_GROUP_BYTES
+            + (c.lane16 // 4) * LINEAR_V_ROW_BYTES
+            + (c.lane16 % 4) * 8
+        )
+        ops = []
+        for i in range_constexpr(t.NVOPS):
+            r = fx.rocdl.ds_read_tr16_b64(
+                fx.Vector.make_type(4, fx.BFloat16),
+                fx.to_llvm_ptr(
+                    self.lds.pointer(lane_off + 4 * i * LINEAR_V_ROW_BYTES, fx.BFloat16)
+                ),
+            ).result
+            ops.append(fx.Vector(r).bitcast(fx.Int64)[0])
+        return ops
+
     def load_v(self, phys_row, vh):
+        if const_expr(self.traits.linear_kv):
+            return self._load_v_linear(phys_row, vh)
         head_group = ((vh * self.traits.VHE_SIZE) // 16) + self.ctx.warp
         head_element = head_group * 16 + self.ctx.lane16
         ops = []

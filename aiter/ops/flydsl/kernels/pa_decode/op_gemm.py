@@ -21,7 +21,22 @@ class PaDecodeGemm:
 
     def mfma(self, a_ops, b_ops, a_base, b_base, k_packs, acc):
         if const_expr(self.traits.PV_BF16):
-            for pack in range_constexpr(k_packs):
+            wide = k_packs // 2 if const_expr(self.traits.WIDE_BF16_MFMA) else 0
+            for inst in range_constexpr(wide):
+                # Both operands take lane group l // 16 for the K index, so
+                # pairing the same two packs in A and B permutes K consistently.
+                a_pack = fx.Vector.from_elements(
+                    [a_ops[a_base + 2 * inst], a_ops[a_base + 2 * inst + 1]],
+                    dtype=fx.Int64,
+                ).bitcast(fx.BFloat16)
+                b_pack = fx.Vector.from_elements(
+                    [b_ops[b_base + 2 * inst], b_ops[b_base + 2 * inst + 1]],
+                    dtype=fx.Int64,
+                ).bitcast(fx.BFloat16)
+                acc = fx.rocdl.mfma_f32_16x16x32_bf16(
+                    T.f32x4, [a_pack, b_pack, acc, 0, 0, 0]
+                )
+            for pack in range_constexpr(2 * wide, k_packs):
                 # Keep four BF16 values packed in i64 through the pipeline,
                 # exposing the instruction's i16x4 operands only here.
                 a_pack = fx.Vector.from_elements(

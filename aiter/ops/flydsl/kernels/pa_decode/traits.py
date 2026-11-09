@@ -27,6 +27,12 @@ MXFP4_V_BF16_CHUNK_BYTES = 16 * 16 * 16
 # Keeps the f32 O accumulator from overflowing; the epilogue undoes it.
 MXFP4_P_EXP_SHIFT = 20
 BF16_LDS_LIMIT_BYTES = 64 * 1024
+# Linear BF16 V: a wave's 256 tokens x 16 dims for one PV chunk. Each 64-token
+# rgroup run is padded by 128 B so the transpose reads of rgroups 0/1 and 2/3
+# fall in disjoint bank halves.
+LINEAR_V_ROW_BYTES = 16 * 2
+LINEAR_V_GROUP_BYTES = 64 * LINEAR_V_ROW_BYTES + 128
+LINEAR_V_WAVE_BYTES = 4 * LINEAR_V_GROUP_BYTES
 MXFP4_LDS_LIMIT_BYTES = 160 * 1024
 PAGE_ID_STAGE_LIMIT = 4096  # i32 page ids, 16 KiB of LDS.
 D256_PIPE_MAX_ROWS = 2 * MFMA_MNK
@@ -93,13 +99,14 @@ def stage_page_capacity(
     return max(256, 1 << max(pages - 1, 0).bit_length())
 
 
-def _bf16_lds_bytes(head_dim, query_rows, block_size):
+def _bf16_lds_bytes(head_dim, query_rows, block_size, linear_kv=False):
     """Match the untuned BF16 Q/P alias and cross-wave scratch layout."""
     m_tiles = (query_rows + MFMA_MNK - 1) // MFMA_MNK
     qp_bytes = max(m_tiles * MFMA_MNK * head_dim * 2, MFMA_MNK * (512 + 16))
     max_sum_bytes = (m_tiles + 1) * MFMA_MNK * 5 * 4
     pages_per_chunk = (64 + block_size - 1) // block_size
-    return qp_bytes + max_sum_bytes + 4 * pages_per_chunk * 4
+    staging = 4 * LINEAR_V_WAVE_BYTES + 16 if linear_kv else 0
+    return qp_bytes + max_sum_bytes + 4 * pages_per_chunk * 4 + staging
 
 
 @dataclass(frozen=True)
@@ -164,6 +171,7 @@ class PaDecodeSchedule:
         trans_k: bool = True,
         mask_unowned_kv: bool = True,
         direct_output: bool = False,
+        linear_kv: bool = False,
     ) -> PaDecodeSchedule:
         """Choose the existing policy from host-known grid and query bounds."""
         if isinstance(work_capacity, bool) or not isinstance(work_capacity, int):
@@ -194,10 +202,17 @@ class PaDecodeSchedule:
                 raise ValueError("BF16 KV requires a BF16 query")
             if per_token_kv:
                 raise ValueError("BF16 KV does not use quantization scales")
-            if not trans_v:
+            if not trans_v and not linear_kv:
                 raise ValueError("BF16 KV requires a vectorized-5D value cache")
         elif query_dtype == "fp8":
             raise ValueError("An FP8 query needs MXFP4 KV")
+        if linear_kv and not (
+            arch == "gfx950" and is_bf16_kv and block_size in (16, 64, 128)
+        ):
+            raise ValueError(
+                "linear [blocks, page, kv_heads, dim] KV requires gfx950 BF16 KV "
+                "and page size 16, 64 or 128"
+            )
         asymmetric_value = value_dim != head_dim
         if asymmetric_value and not (
             arch in ("gfx942", "gfx950")
@@ -291,6 +306,7 @@ class PaDecodeSchedule:
                         head_dim,
                         query_length // splits * query_group_size,
                         block_size,
+                        linear_kv,
                     )
                     <= BF16_LDS_LIMIT_BYTES
                 ]
@@ -321,13 +337,19 @@ class PaDecodeSchedule:
                 # one-query group when no candidate fits the LDS limit.
             elif asymmetric_value:
                 # Include serial KV work when a small partition budget gives
-                # each task many tiles. Two M-tiles then amortize K/V loads.
+                # each task many tiles. Wider CTAs then amortize K/V loads.
                 kv_work = split_workgroups
                 if sliding_window == 0 and max_context_length is not None:
                     kv_work = num_seqs * num_kv_heads * max(1, context_tiles)
-                target_rows = MFMA_MNK * (
-                    2 if sliding_window == 0 and kv_work >= 2 * num_compute_units else 1
-                )
+                # Each M-tile more per CTA cuts the K/V streams; BF16 gains at
+                # every context, FP8 only once KV work fills the CUs.
+                m_tiles = 1
+                if sliding_window == 0:
+                    if is_bf16_kv or kv_work >= 4 * num_compute_units:
+                        m_tiles = 4
+                    elif kv_work >= 2 * num_compute_units:
+                        m_tiles = 2
+                target_rows = MFMA_MNK * m_tiles
                 queries_per_cta = max(1, target_rows // query_group_size)
                 query_splits = max(1, ceildiv(query_length, queries_per_cta))
                 # Preserve CTA parallelism and choose only divisors of Qlen.
@@ -363,6 +385,7 @@ class PaDecodeSchedule:
                         head_dim,
                         (query_length // query_splits) * query_group_size,
                         block_size,
+                        linear_kv,
                     )
                     > BF16_LDS_LIMIT_BYTES
                 ):
@@ -385,7 +408,10 @@ class PaDecodeSchedule:
         assert query_length % query_splits == 0, "query_splits must divide query_length"
         if is_bf16_kv:
             lds_bytes = _bf16_lds_bytes(
-                head_dim, (query_length // query_splits) * query_group_size, block_size
+                head_dim,
+                (query_length // query_splits) * query_group_size,
+                block_size,
+                linear_kv,
             )
             if lds_bytes > BF16_LDS_LIMIT_BYTES:
                 raise ValueError(
@@ -423,7 +449,9 @@ class PaDecodeSchedule:
             not D256_PIPE or query_splits == 1
         ), "the head-256 page-16/64 pipe keeps all query rows in one CTA"
         stage_pages = 0
-        if (D256_PIPE or kv_dtype == "mxfp4") and max_context_length is not None:
+        if (
+            D256_PIPE or kv_dtype == "mxfp4" or asymmetric_value
+        ) and max_context_length is not None:
             stage_pages = stage_page_capacity(
                 num_seqs,
                 work_capacity,
@@ -503,6 +531,7 @@ class PaDecodeSchedule:
             kv_dtype,
             bool(mask_unowned_kv),
             direct_output,
+            bool(linear_kv),
             D256_PIPE,
             stage_pages,
         )
@@ -542,6 +571,7 @@ class PaDecodeTraits:
     buffer_plan_output: bool
     D256_PIPE: bool
     stage_page_capacity: int
+    linear_kv: bool
 
     # Element formats and instruction policy.
     FP8: type
@@ -553,6 +583,10 @@ class PaDecodeTraits:
     PV_BF16: bool
     MXFP4: bool
     sMxfp4VBf16_off: int
+    sLinearV_off: int
+    LDS_K: bool
+    K_PREFETCH_IN_QK: bool
+    sLinearK_off: int
     KV_DTYPE: type
     KV_VECTOR_WIDTH: int
     QP_ELEM_BYTES: int
@@ -561,6 +595,7 @@ class PaDecodeTraits:
     FP8_WINDOW_RESIDUAL: bool
     WIDE_FP8_MFMA: bool
     PACKS_PER_MFMA: int
+    WIDE_BF16_MFMA: bool
     MTP4_FUSED: bool
     MTP4_PREFETCH_V: bool
     BUFFER_KV: bool
@@ -651,6 +686,7 @@ class PaDecodeTraits:
             kv_dtype,
             mask_unowned_kv,
             DIRECT,
+            linear_kv,
             D256_PIPE,
             stage_page_capacity,
         ) = cache_key
@@ -737,6 +773,10 @@ class PaDecodeTraits:
         PACK_K = BF16_PACK_K if PV_BF16 else FP8_PACK_K
         MFMA_K = 128 if WIDE_FP8_MFMA else PACK_K
         PACKS_PER_MFMA = MFMA_K // PACK_K
+        # gfx950 runs 16x16x16 BF16 MFMA at half rate; 16x16x32 takes two packs.
+        # Wider heads already exhaust the register file, and the aligned
+        # 4-VGPR operands make D512 register allocation abort.
+        WIDE_BF16_MFMA = PV_BF16 and is_gfx950 and head_dim <= 256
         MTP4_FUSED = PER_TOKEN_WIDE and M_TILES == 4
         MTP4_PREFETCH_V = MTP4_FUSED and (
             block_size == 16 or not wide_kv_addressing or BUFFER_KV
@@ -870,6 +910,33 @@ class PaDecodeTraits:
                     f"MXFP4 PA needs {total_bytes} LDS bytes, over the "
                     f"{MXFP4_LDS_LIMIT_BYTES} B of gfx950"
                 )
+        # Wave-private staging for the linear-V transpose reads (16 B aligned).
+        sLinearV_off = (total_bytes + 15) // 16 * 16
+        if linear_kv:
+            total_bytes = sLinearV_off + NWARP * LINEAR_V_WAVE_BYTES
+        # Wave-private linear K rows: a wave's tokens lie in one page, so they
+        # copy to LDS as whole rows and QK reads its operands there.
+        sLinearK_off = (total_bytes + 15) // 16 * 16
+        LDS_K = (
+            linear_kv
+            and block_size >= TOK_PER_WARP
+            and M_TILES > 1
+            and not D256_PIPE
+            and sLinearK_off + NWARP * TOK_PER_WARP * head_dim * 2
+            <= MXFP4_LDS_LIMIT_BYTES
+        )
+        if LDS_K:
+            total_bytes = sLinearK_off + NWARP * TOK_PER_WARP * head_dim * 2
+        # Register-K multi-query tiles issue each chunk's next-tile K loads as
+        # soon as QK has consumed it, overlapping them with the remaining MFMAs.
+        K_PREFETCH_IN_QK = (
+            is_bf16_kv
+            and M_TILES > 1
+            and not LDS_K
+            and not MTP4_FUSED
+            and not D256_PIPE
+            and not per_token_kv
+        )
 
         return cls(
             cache_key=cache_key,
@@ -891,6 +958,7 @@ class PaDecodeTraits:
             buffer_plan_output=buffer_plan_output,
             D256_PIPE=D256_PIPE,
             stage_page_capacity=stage_page_capacity,
+            linear_kv=linear_kv,
             FP8=FP8,
             FP8_MAX=FP8_MAX,
             Q_DTYPE=Q_DTYPE,
@@ -900,6 +968,10 @@ class PaDecodeTraits:
             PV_BF16=PV_BF16,
             MXFP4=MXFP4,
             sMxfp4VBf16_off=sMxfp4VBf16_off,
+            sLinearV_off=sLinearV_off,
+            LDS_K=LDS_K,
+            K_PREFETCH_IN_QK=K_PREFETCH_IN_QK,
+            sLinearK_off=sLinearK_off,
             KV_DTYPE=KV_DTYPE,
             KV_VECTOR_WIDTH=KV_VECTOR_WIDTH,
             QP_ELEM_BYTES=QP_ELEM_BYTES,
@@ -908,6 +980,7 @@ class PaDecodeTraits:
             FP8_WINDOW_RESIDUAL=FP8_WINDOW_RESIDUAL,
             WIDE_FP8_MFMA=WIDE_FP8_MFMA,
             PACKS_PER_MFMA=PACKS_PER_MFMA,
+            WIDE_BF16_MFMA=WIDE_BF16_MFMA,
             MTP4_FUSED=MTP4_FUSED,
             MTP4_PREFETCH_V=MTP4_PREFETCH_V,
             BUFFER_KV=BUFFER_KV,

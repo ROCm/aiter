@@ -842,6 +842,57 @@ _ASYMMETRIC_BASE = {
     # Empty rows, short-context residuals, and page/tile boundaries.
     "lengths": (0, 1, 7, 8, 16, 17, 32, 33, 63, 64, 65, 255, 256, 257, 1027),
 }
+# MiMo V2.6 speculative verification: QLen8, GQA16, one KV head, Q/K192-V128,
+# full causal attention. 54000 is not page aligned for either page size.
+_MIMO_SKEWED_LENGTHS = (54000, 0, 1, 63, 64, 65, 127, 128, 129, 255, 257, 2049)
+_MIMO_SKEWED_LENGTHS += (4097, 8191, 16383, 16384)
+_MIMO_BASE = dict(_ASYMMETRIC_BASE, sink_dtype=None, capture=False, max_partitions=None)
+_MIMO_CASES = [
+    *[
+        (
+            f"mimo-page{page}-b{batch}-c{length}",
+            dict(
+                _MIMO_BASE,
+                block_size=page,
+                lengths=(length,) * batch,
+                capture=batch == 16 and length == 16384,
+            ),
+        )
+        for page in (64, 128)
+        for batch in (1, 8, 15, 16)
+        for length in (4096, 16384, 54000)
+    ],
+    *[
+        (
+            f"mimo-page{page}-skewed-b{len(lengths)}",
+            dict(_MIMO_BASE, block_size=page, lengths=lengths, capture=True),
+        )
+        for page in (64, 128)
+        for lengths in (_MIMO_SKEWED_LENGTHS[:15], _MIMO_SKEWED_LENGTHS)
+    ],
+]
+# Linear [blocks, page, kv_heads, dim] caches beyond the MiMo geometry.
+_LINEAR_CASES = [
+    ("d128-page16", {"group_size": 8, "block_size": 16, "max_partitions": 4}),
+    (
+        "d128-mtp4-page128",
+        {"query_length": 4, "group_size": 16, "block_size": 128, "max_partitions": 7},
+    ),
+    (
+        "asymmetric-kv2-gqa8-page64-w128",
+        dict(_ASYMMETRIC_BASE, kv_heads=2, group_size=8, window=128, max_partitions=4),
+    ),
+    (
+        "mimo-page128-large-address",
+        dict(
+            _MIMO_BASE,
+            block_size=128,
+            lengths=(54000, 1, 129, 4097),
+            wide=True,
+            capture=True,
+        ),
+    ),
+]
 _ASYMMETRIC_WINDOW_CASES = [
     (
         f"asymmetric-window-{window}",
@@ -1857,6 +1908,24 @@ def _check_pipe_policy(pa, case, arch, compile_kwargs):
             for name, geometry in _FP8_HEAD_CASES
         ],
         *[pytest.param(geometry, id=f"bf16-{name}") for name, geometry in _BF16_CASES],
+        *[pytest.param(geometry, id=f"bf16-{name}") for name, geometry in _MIMO_CASES],
+        *[
+            pytest.param(dict(geometry, kv_layout="linear"), id=f"bf16-linear-{name}")
+            for name, geometry in _MIMO_CASES + _LINEAR_CASES
+        ],
+        *[
+            pytest.param(
+                dict(
+                    geometry,
+                    kv_dtype="fp8",
+                    scale_mode=scale_mode,
+                ),
+                id=f"fp8-{scale_mode}-{name}",
+            )
+            for name, geometry in _MIMO_CASES
+            if "skewed" in name
+            for scale_mode in ("per-tensor", "per-token")
+        ],
         pytest.param(
             dict(
                 _ASYMMETRIC_GENERAL_CASES[1][1],
@@ -1964,6 +2033,7 @@ def test_pa_decode(case, device, monkeypatch):
             "ref_mean_min": None,
             "variants": False,
             "cluster": None,
+            "kv_layout": "vectorized",
         },
         **case,
     )
@@ -2078,18 +2148,22 @@ def test_pa_decode(case, device, monkeypatch):
         logical_key = key.float() * (1.0 if key_scale is None else key_scale)
         logical_value = value.float() * (1.0 if value_scale is None else value_scale)
         pages = key.shape[0]
-        key_cache = (
-            key.reshape(pages, kv_heads, page, head_dim // vector, vector)
-            .permute(0, 1, 3, 2, 4)
-            .contiguous()
-        )
-        value_cache = (
-            value.reshape(pages, kv_heads, page // vector, vector, value_dim)
-            .permute(0, 1, 2, 4, 3)
-            .contiguous()
-            if case["trans_v"]
-            else value.permute(0, 1, 3, 2).contiguous()
-        )
+        if case["kv_layout"] == "linear":
+            key_cache = key.permute(0, 2, 1, 3).contiguous()
+            value_cache = value.permute(0, 2, 1, 3).contiguous()
+        else:
+            key_cache = (
+                key.reshape(pages, kv_heads, page, head_dim // vector, vector)
+                .permute(0, 1, 3, 2, 4)
+                .contiguous()
+            )
+            value_cache = (
+                value.reshape(pages, kv_heads, page // vector, vector, value_dim)
+                .permute(0, 1, 2, 4, 3)
+                .contiguous()
+                if case["trans_v"]
+                else value.permute(0, 1, 3, 2).contiguous()
+            )
     device_table = table
     if case["wide"]:
         # Move both caches past 2 GiB; keep logical KV/table small for the oracle.
@@ -2116,6 +2190,7 @@ def test_pa_decode(case, device, monkeypatch):
         )
         sinks[0], sinks[-1] = float("-inf"), float("inf")
     options = {
+        **({"kv_layout": "linear"} if case["kv_layout"] == "linear" else {}),
         "compute_type": compute_type,
         "key_scale": key_scale,
         "value_scale": value_scale,
