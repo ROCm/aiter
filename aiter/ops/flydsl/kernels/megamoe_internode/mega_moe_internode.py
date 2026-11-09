@@ -2,9 +2,10 @@
 """MegaMoE across two MI355 nodes (EP16, A4W4 or A8W4).
 
 The public forward methods take BF16 or prequantized input, FP32 routing
-weights and INT32 expert IDs. Each call uses exactly ``max_tok_per_rank``
-rows; callers pad unused rows with zero input/weights and expert ID -1,
-then slice the returned BF16 output to their active row count.
+weights and INT32 expert IDs. Calls accept up to ``max_tok_per_rank`` rows,
+including zero rows. Input records pad unused rows with zero input/weights
+and expert ID -1; communication retains its fixed capacity. By default the
+returned BF16 output contains only the active input rows.
 
 A forward quantizes input into rail records, then launches Stage1
 (dispatch, GEMM1, activation and requantization) and fused Stage2
@@ -21,6 +22,7 @@ and ``mega_moe_internode_config.py`` resolves per-shape tune parameters.
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -238,8 +240,10 @@ class MegaMoEInternode:
 
     Extra keyword arguments beyond MegaMoEV2's:
 
-    * ``activation``: ``"silu"`` (``swiglu_limit`` > 0 clamps it) or
-      ``"situv2"``;
+    * ``act``: ``"silu"`` (``swiglu_limit`` > 0 clamps it) or ``"situv2"``;
+      ``activation`` is a compatible alias;
+    * ``situ_beta`` / ``situ_linear_beta``: positive SiTUv2 gate/up saturation
+      coefficients, both defaulting to 1;
     * ``comm_quant``: ``"fp8"`` (default) sends the cross-node rail payload
       as FP8 with 1x32 E8M0 scales, ``"none"`` sends BF16;
     * ``communicator``: a ``mori.cco`` Communicator owned by the caller
@@ -257,16 +261,21 @@ class MegaMoEInternode:
     def __init__(self, *, rank: int, world_size: int, model_dim: int, inter_dim: int, experts: int,
         topk: int, quant: str, w1: torch.Tensor, w1_scale: torch.Tensor, w2: torch.Tensor,
         w2_scale: torch.Tensor, max_tok_per_rank: int, mega_scheme: str = "fixedslot",
-        swiglu_limit: float = 0.0, fanout_masks: tuple[int, ...] = (), activation: str = "silu",
-        comm_quant: str = "fp8", communicator=None, max_routes_per_token_per_rank: int | None = None):
+        swiglu_limit: float = 0.0, fanout_masks: tuple[int, ...] = (), activation: str | None = None,
+        comm_quant: str = "fp8", communicator=None, max_routes_per_token_per_rank: int | None = None,
+        act: str | None = None, situ_beta: float = 1.0, situ_linear_beta: float = 1.0):
     # fmt: on
         del mega_scheme
+        if act is not None and activation is not None and act != activation:
+            raise ValueError("act and activation must agree when both are provided")
+        activation = str(act if act is not None else "silu" if activation is None else activation)
         route_cap = topk if max_routes_per_token_per_rank is None else max_routes_per_token_per_rank
         self._validate_args(
             rank=rank, world_size=world_size, model_dim=model_dim, inter_dim=inter_dim,
             experts=experts, topk=topk, quant=quant, max_tok_per_rank=max_tok_per_rank,
             swiglu_limit=swiglu_limit, fanout_masks=fanout_masks, activation=activation,
             comm_quant=comm_quant, route_cap=route_cap,
+            situ_beta=situ_beta, situ_linear_beta=situ_linear_beta,
         )
         if not dist.is_available() or not dist.is_initialized():
             raise RuntimeError("torch.distributed must be initialized before MegaMoEInternode")
@@ -283,6 +292,9 @@ class MegaMoEInternode:
         self.mtpr = int(max_tok_per_rank)
         self.swiglu_limit = float(swiglu_limit)
         self.activation = str(activation)
+        self.act = self.activation
+        self.situ_beta = float(situ_beta)
+        self.situ_linear_beta = float(situ_linear_beta)
         self.quant = str(quant).lower()
         self._activation_dtype = "fp8" if self.quant == "a8w4" else "fp4"
         self.comm_quant = str(comm_quant)
@@ -378,6 +390,8 @@ class MegaMoEInternode:
                 split_local=bool(self._s1_tile["split_local"]),
                 activation=self.activation,
                 swiglu_limit=(self.swiglu_limit or None),
+                situ_beta=self.situ_beta,
+                situ_linear_beta=self.situ_linear_beta,
                 waves=s1_waves,
                 group_ready=self._single_kernel,
             )
@@ -396,7 +410,7 @@ class MegaMoEInternode:
     @staticmethod
     def _validate_args(*, rank, world_size, model_dim, inter_dim, experts, topk, quant,
                        max_tok_per_rank, swiglu_limit, fanout_masks, activation, comm_quant,
-                       route_cap) -> None:
+                       route_cap, situ_beta=1.0, situ_linear_beta=1.0) -> None:
         if str(quant).lower() not in ("a4w4", "a8w4"):
             raise ValueError("MegaMoEInternode supports quant=a4w4 or a8w4")
         if int(world_size) != WORLD_SIZE:
@@ -419,6 +433,11 @@ class MegaMoEInternode:
             raise ValueError("max_routes_per_token_per_rank must be in [1, topk]")
         if str(activation) not in ("silu", "situv2"):
             raise ValueError("activation must be 'silu' or 'situv2'")
+        if str(activation) == "situv2" and any(
+            not math.isfinite(float(v)) or float(v) <= 0
+            for v in (situ_beta, situ_linear_beta)
+        ):
+            raise ValueError("situv2 requires finite positive situ_beta / situ_linear_beta")
         # 0.0 = no clamp; > 0 only applies to silu (DSV4: gate <= L, -L <= up <= L).
         if float(swiglu_limit) != 0.0 and (str(activation) != "silu" or float(swiglu_limit) < 0):
             raise ValueError("swiglu_limit must be 0.0, or positive with silu")
@@ -549,6 +568,9 @@ class MegaMoEInternode:
         """
         hidden, mtpr, topk = self.model_dim, self.mtpr, self.topk
         self._record_quant = get_rail_record_quant(hidden, topk, self._activation_dtype)
+        self._record_quant_padded = get_rail_record_quant(
+            hidden, topk, self._activation_dtype, pad_tokens=mtpr
+        )
         rec, off_q, off_s, off_i, off_w = self._record_quant.layout
         base = int(self._runtime.window.local_ptr) + int(
             self.layout.stage1.offset("dispatch_staging", parity=0))
@@ -723,7 +745,10 @@ class MegaMoEInternode:
     def _init_launchers(self) -> None:
         """Fix the specialization once; compiled callables belong to this instance."""
         self._compiled = {}
-        self._launchers = {"record_quant": self._record_quant}
+        self._launchers = {
+            "record_quant": self._record_quant,
+            "record_quant_padded": self._record_quant_padded,
+        }
         if self._single_kernel:
             self._launchers["single"] = compile_single_kernel(
                 self._stage1, self._k1_compile, self._k2_compile, WORKER_BLOCKS
@@ -762,27 +787,43 @@ class MegaMoEInternode:
 
     def quantize(self, x_bf16: torch.Tensor):
         """Return MXFP4 ``[T, H/2]`` or MXFP8 ``[T, H]`` and E8M0 ``[T, H/32]``."""
+        if x_bf16.dtype != torch.bfloat16 or not x_bf16.is_contiguous():
+            raise ValueError("x_bf16 must be contiguous bfloat16")
+        tokens = self._input_rows(x_bf16, self.model_dim)
+        if x_bf16.device != self.device:
+            raise ValueError(f"x_bf16 is on {x_bf16.device}, expected {self.device}")
+        if tokens == 0:
+            payload_dtype = torch.float8_e4m3fn if self.quant == "a8w4" else _FP4_DTYPES[-1]
+            return (
+                torch.empty((0, self.layout.stage1.wire.payload_bytes), dtype=payload_dtype, device=self.device),
+                torch.empty((0, self.model_dim // 32), dtype=torch.uint8, device=self.device),
+            )
         return per_1x32_mx_quant(x_bf16, quant_mode=self._activation_dtype)
 
     def forward(self, x_bf16, wts, topk_ids, *, stream=None, slice_output=True):
-        """Return this rank's BF16 output rows for BF16 input ``[mtpr, H]``."""
+        """Return this rank's BF16 output for ``[T, H]``, with ``0 <= T <= mtpr``.
+
+        Every rank still participates at the compiled communication capacity.
+        ``slice_output=False`` exposes the full capacity, including zero pad rows.
+        """
         if x_bf16.dtype != torch.bfloat16 or not x_bf16.is_contiguous():
             raise ValueError("x_bf16 must be contiguous bfloat16")
-        if tuple(x_bf16.shape) != (self.mtpr, self.model_dim):
-            raise ValueError(f"x_bf16 must be [{self.mtpr}, {self.model_dim}], got {tuple(x_bf16.shape)}")
+        tokens = self._input_rows(x_bf16, self.model_dim)
         self._check_routing(x_bf16, wts, topk_ids)
         launch_stream = self._fx_stream(stream)
         # One launch quantizes x and packs it with ids/weights into the records.
         args = (
             x_bf16.data_ptr(), topk_ids.data_ptr(), wts.data_ptr(), self._rec_q.data_ptr(),
-            self.mtpr, self._quant_grid, launch_stream,
+            tokens, self._quant_grid, launch_stream,
         )
-        compiled = self._compiled.get("record_quant")
+        name = "record_quant" if tokens == self.mtpr else "record_quant_padded"
+        compiled = self._compiled.get(name)
         if compiled is None or env.compile.compile_only:
-            self._compile_launcher("record_quant", args)
+            self._compile_launcher(name, args)
         else:
             compiled(*args)
-        return self._run(wts, topk_ids, launch_stream, slice_output)
+        out = self._run(wts, topk_ids, launch_stream, slice_output)
+        return out[:tokens] if slice_output and tokens != self.mtpr else out
 
     def forward_prequant(self, x_q, scales, wts, topk_ids, *, stream=None, slice_output=True):
         """Same as :meth:`forward` for input already quantized by :meth:`quantize`."""
@@ -790,29 +831,45 @@ class MegaMoEInternode:
         payload_cols = self.layout.stage1.wire.payload_bytes
         if x_q.dtype not in payload_dtype or not x_q.is_contiguous():
             raise ValueError(f"x_q must be contiguous {self._activation_dtype} payload, got {x_q.dtype}")
-        if tuple(x_q.shape) != (self.mtpr, payload_cols):
-            raise ValueError(f"x_q must be [{self.mtpr}, {payload_cols}], got {tuple(x_q.shape)}")
+        tokens = self._input_rows(x_q, payload_cols)
         if (scales.dtype != torch.uint8 or not scales.is_contiguous()
-                or tuple(scales.shape) != (self.mtpr, self.model_dim // 32)):
-            raise ValueError(f"scales must be contiguous uint8 E8M0 [{self.mtpr}, {self.model_dim // 32}]")
+                or tuple(scales.shape) != (tokens, self.model_dim // 32)):
+            raise ValueError(f"scales must be contiguous uint8 E8M0 [{tokens}, {self.model_dim // 32}]")
+        if scales.device != self.device:
+            raise ValueError(f"scales is on {scales.device}, expected {self.device}")
         self._check_routing(x_q, wts, topk_ids)
         if stream is not None and not isinstance(stream, torch.cuda.Stream):
             raise ValueError("forward_prequant needs stream=None or a torch.cuda.Stream")
         # The copies into the records must be ordered before stage1 on the same stream.
         with torch.cuda.stream(stream if stream is not None else torch.cuda.current_stream()):
-            self._rec_q.copy_(x_q.view(torch.uint8))
-            self._rec_scale.copy_(scales)
-            self._rec_ids.copy_(topk_ids)
-            self._rec_weights.copy_(wts)
-        return self._run(wts, topk_ids, self._fx_stream(stream), slice_output)
+            if tokens:
+                self._rec_q[:tokens].copy_(x_q.view(torch.uint8))
+                self._rec_scale[:tokens].copy_(scales)
+                self._rec_ids[:tokens].copy_(topk_ids)
+                self._rec_weights[:tokens].copy_(wts)
+            if tokens < self.mtpr:
+                self._rec_q[tokens:].zero_()
+                self._rec_scale[tokens:].fill_(127)
+                self._rec_ids[tokens:].fill_(-1)
+                self._rec_weights[tokens:].zero_()
+        out = self._run(wts, topk_ids, self._fx_stream(stream), slice_output)
+        return out[:tokens] if slice_output and tokens != self.mtpr else out
 
     forward_bf16 = forward
     __call__ = forward
 
+    def _input_rows(self, x, cols) -> int:
+        if len(x.shape) != 2 or int(x.shape[1]) != cols:
+            raise ValueError(f"input must have shape [T, {cols}], got {tuple(x.shape)}")
+        tokens = int(x.shape[0])
+        if not 0 <= tokens <= self.mtpr:
+            raise ValueError(f"input rows must be in [0, {self.mtpr}], got {tokens}")
+        return tokens
+
     def _check_routing(self, x, wts, topk_ids) -> None:
         if self._closed:
             raise RuntimeError("MegaMoEInternode is closed")
-        shape = (self.mtpr, self.topk)
+        shape = (int(x.shape[0]), self.topk)
         if wts.dtype != torch.float32 or not wts.is_contiguous() or tuple(wts.shape) != shape:
             raise ValueError(f"wts must be contiguous float32 {list(shape)}")
         if topk_ids.dtype != torch.int32 or not topk_ids.is_contiguous() or tuple(topk_ids.shape) != shape:

@@ -23,6 +23,8 @@ GMM1, SiLU and A4 requant.  Partial expert tails are padded and published only
 after the eight communication EOS signals are acquired.
 """
 
+import math
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import mori.cco.device.flydsl as cco
@@ -97,6 +99,8 @@ def _compile_stage1(
     split_local: bool = False,
     activation: str = "silu",
     swiglu_limit: float | None = None,
+    situ_beta: float = 1.0,
+    situ_linear_beta: float = 1.0,
     waves: int = 4,
     group_ready: bool = False,
 ):
@@ -181,6 +185,11 @@ def _compile_stage1(
         raise ValueError("Stage-1 requires BN=256 and BM in (32, 64, 128)")
     if activation not in ("silu", "situv2"):
         raise ValueError("Stage-1 activation must be silu or situv2")
+    situ_beta, situ_linear_beta = float(situ_beta), float(situ_linear_beta)
+    if activation == "situv2" and any(
+        not math.isfinite(v) or v <= 0 for v in (situ_beta, situ_linear_beta)
+    ):
+        raise ValueError("Stage-1 situv2 requires finite positive beta / linear_beta")
     if swiglu_limit is not None and (
         activation != "silu" or not float(swiglu_limit) > 0.0
     ):
@@ -367,6 +376,11 @@ def _compile_stage1(
     # extra consumers,或并行封尾 / static g0)。
     kernel_name = (
         f"megamoe_stage1_{activation}"
+        + (
+            f"_b{str(situ_beta).replace('.', 'p')}_lb{str(situ_linear_beta).replace('.', 'p')}"
+            if activation == "situv2" and (situ_beta, situ_linear_beta) != (1.0, 1.0)
+            else ""
+        )
         + ("_a8w4" if A_DTYPE == "fp8" else "")
         + (
             ""
@@ -2242,9 +2256,8 @@ def _compile_stage1(
                 NE=LOCAL_EXPERTS,
                 act=activation,
                 swiglu_limit=swiglu_limit,
-                # Match fused_moe's FlyDSL defaults and the Kimi K3 reference.
-                situ_beta=1.0,
-                situ_linear_beta=1.0,
+                situ_beta=situ_beta,
+                situ_linear_beta=situ_linear_beta,
                 NW=WAVES,
                 aqout_row_base=H1_ROW_BASE,
                 h1_wt=group_ready,

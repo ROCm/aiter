@@ -123,7 +123,9 @@ def parse_args(argv=None):
     p.add_argument("--inter-dim", type=int)
     p.add_argument("--experts", type=int)
     p.add_argument("--topk", type=int)
-    p.add_argument("--activation", choices=("silu", "situv2"))
+    p.add_argument("--activation", "--act", choices=("silu", "situv2"))
+    p.add_argument("--situ-beta", type=float, default=1.0)
+    p.add_argument("--situ-linear-beta", type=float, default=1.0)
     p.add_argument("--tpr-list", default="512", help="tokens per rank, comma separated")
     p.add_argument(
         "--fixtures",
@@ -536,6 +538,8 @@ class MoriSmallOp:
         rank,
         *,
         swiglu_limit,
+        situ_beta=1.0,
+        situ_linear_beta=1.0,
         a8w4_weights=None,
         separated_weights=False,
     ):
@@ -548,6 +552,8 @@ class MoriSmallOp:
 
         self.torch, self.quant, self.shape, self.shared = torch, quant, shape, shared
         self.rank = rank
+        self.situ_beta = float(situ_beta)
+        self.situ_linear_beta = float(situ_linear_beta)
         self._native_a8_reference = quant == "a8w4" and separated_weights
         self.blocks, self.rdma_blocks = MORI_BLOCKS[quant]
         if quant == "a4w4":
@@ -672,6 +678,12 @@ class MoriSmallOp:
                 dtype=torch.bfloat16,
                 swiglu_limit=self.swiglu_limit,
                 gate_mode=self.gate_mode,
+                **(
+                    {"beta": self.situ_beta, "linear_beta": self.situ_linear_beta}
+                    if self.shape.activation == "situv2"
+                    and (self.situ_beta, self.situ_linear_beta) != (1.0, 1.0)
+                    else {}
+                ),
             )
         result = self.op.combine(
             local_out,
@@ -738,7 +750,13 @@ class MoriSmallOp:
                 continue
             gate, up = (x[row] @ w1[expert].T).chunk(2, dim=-1)
             if shape.activation == "situv2":
-                activated = torch.tanh(gate) * torch.sigmoid(gate) * torch.tanh(up)
+                activated = (
+                    self.situ_beta
+                    * torch.tanh(gate / self.situ_beta)
+                    * torch.sigmoid(gate)
+                    * self.situ_linear_beta
+                    * torch.tanh(up / self.situ_linear_beta)
+                )
             else:
                 if self.swiglu_limit > 0:
                     gate, up = gate.clamp(max=self.swiglu_limit), up.clamp(
@@ -1028,6 +1046,8 @@ class Runner:
                 self.rank,
                 swiglu_limit=net["swiglu_limit"],
                 separated_weights=True,
+                situ_beta=args.situ_beta,
+                situ_linear_beta=args.situ_linear_beta,
             )
         if "fused" in args.paths:
             rec["fused"] = self.run_fused(shape, shared, cap, reference, fixture)
@@ -1044,6 +1064,8 @@ class Runner:
                     self.rank,
                     swiglu_limit=net["swiglu_limit"],
                     a8w4_weights=self.a8w4_weights,
+                    situ_beta=args.situ_beta,
+                    situ_linear_beta=args.situ_linear_beta,
                 )
             )
             rec["smallop"] = self.run_smallop(shape, small, fixture)
@@ -1081,7 +1103,9 @@ class Runner:
                 w2_scale=w.w2_scale,
                 max_tok_per_rank=tokens,
                 swiglu_limit=self.net["swiglu_limit"],
-                activation=shape.activation,
+                act=shape.activation,
+                situ_beta=args.situ_beta,
+                situ_linear_beta=args.situ_linear_beta,
                 comm_quant=args.comm_quant,
                 communicator=self.comm,
                 max_routes_per_token_per_rank=cap,
@@ -1090,6 +1114,9 @@ class Runner:
         op = make_op()
         res = {
             "quant": args.fused_quant,
+            "act": op.act,
+            "situ_beta": op.situ_beta,
+            "situ_linear_beta": op.situ_linear_beta,
             "reference": (
                 "mori_dispatch_pytorch_a8_mlp_mori_combine"
                 if args.fused_quant == "a8w4"
@@ -1156,7 +1183,8 @@ class Runner:
                 self.time_path(res, graph, f"fused_t{tokens}_{fixture}")
                 if do_check:
                     replay_vs("after_timing", eager, 1e-2)
-                    ok = checks[-1]["ok"]
+                    self.check_variable_rows(op, shared, res)
+                    ok = all(c["ok"] for c in checks)
             res["ok"] = ok
             if self.rank == 0 and self.guard:
                 res["config_problems"] = check_fused_config(
@@ -1172,6 +1200,49 @@ class Runner:
             dist.barrier()
             op.close()
         return res
+
+    def check_variable_rows(self, op, shared, res):
+        """Compare unequal rank-local lengths to explicitly padded input."""
+        torch, dist = self.torch, self.dist
+        lengths = (0, 1, op.mtpr // 2, max(0, op.mtpr - 1), op.mtpr)
+        tokens = lengths[self.rank % len(lengths)]
+        x = torch.zeros_like(shared.x)
+        ids = torch.full_like(shared.topk_ids, -1)
+        weights = torch.zeros_like(shared.route_weights)
+        x[:tokens].copy_(shared.x[:tokens])
+        ids[:tokens].copy_(shared.topk_ids[:tokens])
+        weights[:tokens].copy_(shared.route_weights[:tokens])
+        expected = op.forward(x, weights, ids, slice_output=False).clone()
+        actual = op.forward(
+            x[:tokens], weights[:tokens], ids[:tokens], slice_output=False
+        )
+        torch.cuda.synchronize(self.device)
+        res["checks"].append(
+            self.rel_l2("variable_rows_full_output", expected, actual, 1e-2)
+        )
+        res["rank_input_rows"] = self.gather(tokens)
+        q, scales = op.quantize(x[:tokens])
+        for label, call in (
+            (
+                "variable_rows",
+                lambda: op.forward(x[:tokens], weights[:tokens], ids[:tokens]),
+            ),
+            (
+                "variable_rows_prequant",
+                lambda: op.forward_prequant(q, scales, weights[:tokens], ids[:tokens]),
+            ),
+        ):
+            graph, out = capture_graph(torch, dist, call, self.device)
+            shapes_ok = self.gather(tuple(out.shape) == (tokens, op.model_dim))
+            if not all(shapes_ok):
+                raise AssertionError(f"{label}: output shape did not follow input rows")
+            for replay in range(2):
+                graph.replay()
+                torch.cuda.synchronize(self.device)
+                res["checks"].append(
+                    self.rel_l2(f"{label}_replay{replay}", expected[:tokens], out, 1e-2)
+                )
+            del graph
 
     def run_smallop(self, shape, path, fixture):
         res = {"quant": path.quant}
