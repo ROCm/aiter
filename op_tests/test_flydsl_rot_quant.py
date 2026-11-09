@@ -26,7 +26,6 @@ SUPPORTED_GFX = ["gfx950"]
 # it reads past K, so its result depends on the padding. The gemm check stays
 # within N >= 256 and K % 256 == 0.
 GEMM_MIN_N = 256
-MOE_BLOCK_M = 32
 
 
 def run_torch(x, rs, shuffle):
@@ -45,19 +44,24 @@ def run_torch(x, rs, shuffle):
     return xq.view(torch.uint8), xs.view(torch.uint8)
 
 
-def run_torch_moe_sort(x, rs, sorted_ids, num_valid_ids):
+def run_torch_moe_sort(x, rs, sorted_ids, num_valid_ids, topk):
     """run_torch, with each valid route's scales copied to its sorted row and
-    swizzled as mxfp4_moe_sort_fwd lays them out. Also returns those rows."""
+    swizzled as mxfp4_moe_sort_fwd lays them out, padding columns 0. A route is
+    valid when its token is below M and its slot below topk: a sort with
+    num_local_tokens pads with topk << 24 | count. Also returns the valid rows
+    and their tokens."""
     m, k = x.shape
     xq, xs = run_torch(x, rs, False)
-    valid = int(num_valid_ids[0])
-    token = (sorted_ids[:valid] & 0xFFFFFF).long()
-    rows = torch.arange(valid)[token < m]
+    ids = sorted_ids[: int(num_valid_ids[0])].long()
+    token, slot = ids & 0xFFFFFF, (ids >> 24) & 0xFF
+    rows = torch.nonzero((token < m) & (slot < topk)).flatten()
+    token = token[rows]
     sorted_rows = (sorted_ids.shape[0] + 31) // 32 * 32
     cols = (k // 32 + 7) // 8 * 8
     sorted_xs = torch.zeros(((sorted_rows + 255) // 256 * 256, cols), dtype=torch.uint8)
-    sorted_xs[rows, : k // 32] = xs[token[token < m]]
-    return xq, shuffle_scale(sorted_xs).view(-1, cols)[:sorted_rows], rows
+    sorted_xs[rows, : k // 32] = xs[token]
+    sorted_xs = shuffle_scale(sorted_xs).view(-1, cols)[:sorted_rows]
+    return xq, sorted_xs, rows, token
 
 
 def scale_mask(shape, rows, cols, shuffle):
@@ -95,34 +99,35 @@ def make_input(m, k):
 @benchmark()
 def test_rot_quant(m, k, rs, shuffle):
     x = make_input(m, k)
-    zero_row, tiny_row, nan_row = ZERO_ROW, TINY_ROW, NAN_ROW
     rows = torch.arange(m)
     ref_q, ref_s = run_torch(x, rs, shuffle)
 
-    # The padding columns of the CK layout are compared too, the padding rows
-    # are uninitialized.
+    # (op, fp4 rows, scale rows, scale columns compared). The padding columns
+    # of the CK layout are compared too, the padding rows are uninitialized.
     candidates = {
         "flydsl": (
-            lambda: flydsl_rot_quant(x, rs, shuffle_scales=shuffle),
-            rows != nan_row,
+            lambda: flydsl_rot_quant(x, rotation_size=rs, shuffle=shuffle),
+            rows != NAN_ROW,
             rows,
+            ref_s.shape[1],
         )
     }
     if rs == 32:
         # #6734 fuses the same rotation. It floors amax (scale 0x5C for zero
         # groups), leaves the padding columns unwritten, and its NaN group
         # bytes are arbitrary, so those rows and columns are left out.
-        hip_rows = (rows != zero_row) & (rows != tiny_row) & (rows != nan_row)
+        hip_rows = (rows != ZERO_ROW) & (rows != TINY_ROW) & (rows != NAN_ROW)
         candidates["hip"] = (
             lambda: per_1x32_f4_quant_hip(x, shuffle=shuffle, hadamard_rotate=True),
             hip_rows,
             rows[hip_rows],
+            k // 32,
         )
 
     flops = m * k * int(math.log2(rs))  # butterfly adds
     nbytes = m * k * x.element_size() + m * k // 2 + m * k // 32
     ret = {"gfx": get_gfx()}
-    for name, (fn, q_rows, s_rows) in candidates.items():
+    for name, (fn, q_rows, s_rows, s_cols) in candidates.items():
         (xq, xs), us = run_perftest(fn)
         # Packed bytes: any difference is a bug, so compare exactly.
         err = assertAllclose(
@@ -134,14 +139,13 @@ def test_rot_quant(m, k, rs, shuffle):
             mask=q_rows.unsqueeze(1),
             msg=f"{name}: fp4",
         )
-        cols = k // 32 if name == "hip" else ref_s.shape[1]
         assertAllclose(
             ref_s.to(dtypes.fp32),
             xs.view(torch.uint8).to(dtypes.fp32),
             rtol=0,
             atol=0,
             tol_err_ratio=0,
-            mask=scale_mask(ref_s.shape, s_rows, cols, shuffle),
+            mask=scale_mask(ref_s.shape, s_rows, s_cols, shuffle),
             msg=f"{name}: e8m0",
         )
         ret[f"{name} us"] = us
@@ -165,7 +169,7 @@ def test_rot_quant_gemm_a4w4(m, n, k, rs):
     ref = dequant(ref_q, ref_s) @ dequant(wq, ws.view(torch.uint8)).T
 
     def run():
-        xq, xs = flydsl_rot_quant(x, rs, shuffle_scales=True)
+        xq, xs = flydsl_rot_quant(x, rotation_size=rs, shuffle=True)
         return gemm_a4w4(xq, wq_shuffled, xs, ws_shuffled, dtype=dtypes.bf16)
 
     out, us = run_perftest(run)
@@ -175,33 +179,55 @@ def test_rot_quant_gemm_a4w4(m, n, k, rs):
     nbytes = m * k * x.element_size() + n * k // 2 + n * k // 32 + m * n * 2
     return {
         "gfx": get_gfx(),
-        "us": us,
-        "TFLOPS": 2 * m * n * k / us / 1e6,
-        "TB/s": nbytes / us / 1e6,
-        "err": err,
+        "flydsl us": us,
+        "flydsl TFLOPS": 2 * m * n * k / us / 1e6,
+        "flydsl TB/s": nbytes / us / 1e6,
+        "flydsl err": err,
     }
 
 
 @benchmark()
-def test_rot_quant_moe_sort(m, k, rs, experts, topk):
+def test_rot_quant_moe_sort(m, k, rs, experts, topk, block_m, counted):
     """The MoE stage-1 input: scales sorted by moe_sorting's sorted_ids. Only
-    the valid routes' rows are defined, so only they are compared."""
+    the valid routes' rows are defined, so only they are compared, padding
+    columns included. `counted` sorts only the first half of the tokens through
+    num_local_tokens, whose padding slots name a real token."""
     x = make_input(m, k)
     ids = torch.rand((m, experts)).topk(topk, dim=1).indices.to(dtypes.i32)
+    local = torch.tensor([max(m // 2, 1)], dtype=dtypes.i32) if counted else None
     sorted_ids, _, _, num_valid_ids, _ = moe_sorting(
-        ids, torch.rand((m, topk)), experts, k, dtypes.bf16, MOE_BLOCK_M
+        ids,
+        torch.rand((m, topk)),
+        experts,
+        k,
+        dtypes.bf16,
+        block_m,
+        num_local_tokens=local,
     )
-    ref_q, ref_s, live_rows = run_torch_moe_sort(x, rs, sorted_ids, num_valid_ids)
+    ref_q, ref_s, live_rows, live_tokens = run_torch_moe_sort(
+        x, rs, sorted_ids, num_valid_ids, topk
+    )
     (xq, xs), us = run_perftest(
-        flydsl_rot_quant_moe_sort, x, sorted_ids, num_valid_ids, topk, MOE_BLOCK_M, rs
+        flydsl_rot_quant_moe_sort,
+        x,
+        sorted_ids,
+        num_valid_ids,
+        m,
+        topk,
+        block_m,
+        rotation_size=rs,
     )
+    # Tokens without a valid route may be left unwritten.
+    q_rows = torch.zeros(m, dtype=torch.bool)
+    q_rows[live_tokens] = True
+    q_rows[NAN_ROW : NAN_ROW + 1] = False
     err = assertAllclose(
         ref_q.to(dtypes.fp32),
         xq.view(torch.uint8).to(dtypes.fp32),
         rtol=0,
         atol=0,
         tol_err_ratio=0,
-        mask=(torch.arange(m) != NAN_ROW).unsqueeze(1),
+        mask=q_rows.unsqueeze(1),
         msg="flydsl: fp4",
     )
     assertAllclose(
@@ -210,16 +236,16 @@ def test_rot_quant_moe_sort(m, k, rs, experts, topk):
         rtol=0,
         atol=0,
         tol_err_ratio=0,
-        mask=scale_mask(ref_s.shape, live_rows, k // 32, True),
+        mask=scale_mask(ref_s.shape, live_rows, ref_s.shape[1], True),
         msg="flydsl: sorted e8m0",
     )
     nbytes = m * k * x.element_size() + m * k // 2 + m * topk * k // 32
     return {
         "gfx": get_gfx(),
-        "us": us,
-        "TFLOPS": m * k * int(math.log2(rs)) / us / 1e6,
-        "TB/s": nbytes / us / 1e6,
-        "err": err,
+        "flydsl us": us,
+        "flydsl TFLOPS": m * k * int(math.log2(rs)) / us / 1e6,
+        "flydsl TB/s": nbytes / us / 1e6,
+        "flydsl err": err,
     }
 
 
@@ -233,7 +259,16 @@ def test_rot_quant_rejects_bad_input():
         "non-contiguous": lambda: flydsl_rot_quant(x[:, ::2]),
         "3D": lambda: flydsl_rot_quant(x.view(2, 32, 4096)),
         "K % RS": lambda: flydsl_rot_quant(x[:, :96].contiguous()),
-        "RS=16": lambda: flydsl_rot_quant(x, 16),
+        "rotation_size=16": lambda: flydsl_rot_quant(x, rotation_size=16),
+        # A stage-2 input has M * topk rows.
+        "token_num": lambda: flydsl_rot_quant_moe_sort(
+            x,
+            torch.zeros(1, dtype=dtypes.i32),
+            torch.ones(1, dtype=dtypes.i32),
+            8,
+            8,
+            32,
+        ),
     }
     for name, fn in cases.items():
         try:
@@ -314,6 +349,22 @@ def main():
         help="""Routing top-k of the MoE check.
     e.g.: -t 8""",
     )
+    parser.add_argument(
+        "--block_m",
+        type=int,
+        nargs="*",
+        default=[16, 32, 64],
+        help="""moe_sorting block size of the MoE check.
+    e.g.: --block_m 32""",
+    )
+    parser.add_argument(
+        "--counted",
+        type=dtypes.str2bool,
+        nargs="*",
+        default=[False, True],
+        help="""Sort with num_local_tokens (half of M) in the MoE check.
+    e.g.: --counted true""",
+    )
     args = parser.parse_args()
 
     df = [
@@ -338,9 +389,9 @@ def main():
     )
 
     df = [
-        test_rot_quant_moe_sort(m, k, rs, experts, topk)
-        for rs, k, experts, topk, m in itertools.product(
-            args.rs, args.k, args.experts, args.topk, args.m
+        test_rot_quant_moe_sort(m, k, rs, experts, topk, block_m, counted)
+        for rs, k, experts, topk, block_m, counted, m in itertools.product(
+            args.rs, args.k, args.experts, args.topk, args.block_m, args.counted, args.m
         )
         if k % rs == 0 and topk <= experts
     ]

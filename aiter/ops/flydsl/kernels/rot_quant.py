@@ -90,6 +90,11 @@ def _ck_scale_offset(row, col, padded_cols):
     )
 
 
+def _padded_scale_cols(K):
+    """Scale columns of the CK layout: K // 32 padded to a multiple of 8."""
+    return (K // MX_GROUP + 7) // 8 * 8
+
+
 def _fold(RS):
     """When 1/sqrt(RS) is a power of two (RS=64) it is applied to the group's
     amax and to the conversion exponent instead of to every element. Scaling
@@ -148,17 +153,15 @@ def _store_fp4(xq_grp, words):
     fx.copy(fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Int32), xq_frag, xq_grp)
 
 
-def _no_slp(launch):
-    # SLP packs the butterflies into v_pk_add_f32, and the moves its aligned
-    # register pairs need cost up to 24% on MI350X; its best case was 6%.
-    launch.compile_hints.setdefault("llvm_options", {})["vectorize-slp"] = False
-    return launch
+# SLP packs the butterflies into v_pk_add_f32, and the moves its aligned
+# register pairs need cost up to 24% on MI350X; its best case was 6%.
+NO_SLP = {"vectorize-slp": False}
 
 
 @cache
 def _build_rot_quant(K: int, RS: int, shuffle_scales: bool):
     scale_cols = K // MX_GROUP
-    padded_scale_cols = (scale_cols + 7) // 8 * 8
+    padded_scale_cols = _padded_scale_cols(K)
 
     @flyc.kernel(known_block_size=[BLOCK, 1, 1])
     def rot_quant_kernel(
@@ -209,7 +212,8 @@ def _build_rot_quant(K: int, RS: int, shuffle_scales: bool):
             grid=(grid_x, 1, 1), block=(BLOCK, 1, 1), stream=stream
         )
 
-    return _no_slp(launch)
+    launch.compile_hints["llvm_options"] = dict(NO_SLP)
+    return launch
 
 
 # 16 waves per CTA for the MoE kernel: most of its (row, group) threads find a
@@ -221,7 +225,7 @@ MOE_BLOCK = 1024
 @cache
 def _build_rot_quant_moe_sort(K: int, RS: int, block: int):
     scale_cols = K // MX_GROUP
-    padded_scale_cols = (scale_cols + 7) // 8 * 8
+    padded_scale_cols = _padded_scale_cols(K)
 
     @flyc.kernel(known_block_size=[block, 1, 1])
     def rot_quant_moe_sort_kernel(
@@ -231,25 +235,41 @@ def _build_rot_quant_moe_sort(K: int, RS: int, block: int):
         sorted_ids: fx.Pointer,
         num_valid_ids: fx.Pointer,
         num_tokens: fx.Int32,
+        topk: fx.Int32,
     ):
         # One thread per (sorted row, group). A token is quantized once for
         # each of its routes; all of them write the same fp4 bytes. Rows past
-        # num_valid_ids and the padding rows of each expert block (token ==
-        # num_tokens) are skipped; all lanes of a block share the row.
+        # num_valid_ids and the padding rows of each expert block are skipped:
+        # their id is num_tokens, or with num_local_tokens topk << 24 | count,
+        # a real token in an out-of-range slot. All lanes of a block share the
+        # row.
         t = fx.block_idx.x * block + fx.thread_idx.x
         row = t // scale_cols
         col = t % scale_cols
         # Read sorted_ids only below num_valid_ids, which bounds its length.
         if row < num_valid_ids[0]:
-            token = sorted_ids[row] & 0xFFFFFF
-            if token < num_tokens:
-                grp = token * scale_cols + col
-                num_groups = num_tokens * scale_cols
-                e8m0, words = _rot_quant_group(
-                    _group_slice(x, num_groups, MX_GROUP, VEC, grp), RS
-                )
-                _store_fp4(_group_slice(xq, num_groups, MX_GROUP // 8, 4, grp), words)
-                xs[_ck_scale_offset(row, col, padded_scale_cols)] = e8m0.to(fx.Int8)
+            route = sorted_ids[row]
+            token = route & 0xFFFFFF
+            if token < num_tokens:  # noqa: SIM102 - preserve DSL staging
+                if (route >> 24) & 0xFF < topk:
+                    grp = token * scale_cols + col
+                    num_groups = num_tokens * scale_cols
+                    e8m0, words = _rot_quant_group(
+                        _group_slice(x, num_groups, MX_GROUP, VEC, grp), RS
+                    )
+                    _store_fp4(
+                        _group_slice(xq, num_groups, MX_GROUP // 8, 4, grp), words
+                    )
+                    off = _ck_scale_offset(row, col, padded_scale_cols)
+                    xs[off] = e8m0.to(fx.Int8)
+                    if const_expr(  # noqa: SIM102 - preserve DSL staging
+                        padded_scale_cols > scale_cols
+                    ):
+                        # Pad columns get 0, as mxfp4_moe_sort_fwd writes them.
+                        if col == scale_cols - 1:
+                            for pad in range_constexpr(scale_cols, padded_scale_cols):
+                                off = _ck_scale_offset(row, pad, padded_scale_cols)
+                                xs[off] = fx.Int8(0)
 
     @flyc.jit
     def launch(
@@ -259,19 +279,23 @@ def _build_rot_quant_moe_sort(K: int, RS: int, block: int):
         sorted_ids: fx.Pointer,
         num_valid_ids: fx.Pointer,
         num_tokens: fx.Int32,
+        topk: fx.Int32,
         grid_x: fx.Int32,
         stream: fx.Stream,
     ):
         rot_quant_moe_sort_kernel(
-            x, xq, xs, sorted_ids, num_valid_ids, num_tokens
+            x, xq, xs, sorted_ids, num_valid_ids, num_tokens, topk
         ).launch(grid=(grid_x, 1, 1), block=(block, 1, 1), stream=stream)
 
-    return _no_slp(launch)
+    launch.compile_hints["llvm_options"] = dict(NO_SLP)
+    return launch
 
 
-def _check_input(x, RS):
-    if RS not in SUPPORTED_RS:
-        raise ValueError(f"RS must be one of {SUPPORTED_RS}, got {RS}")
+def _check_input(x, rotation_size):
+    if rotation_size not in SUPPORTED_RS:
+        raise ValueError(
+            f"rotation_size must be one of {SUPPORTED_RS}, got {rotation_size}"
+        )
     if x.dim() != 2:
         raise ValueError(f"x must be 2D [M, K], got shape {tuple(x.shape)}")
     if x.dtype != torch.bfloat16:
@@ -279,8 +303,8 @@ def _check_input(x, RS):
     if not x.is_contiguous():
         raise ValueError("x must be contiguous")
     M, K = x.shape
-    if K % RS:
-        raise ValueError(f"K={K} must be a multiple of RS={RS}")
+    if K % rotation_size:
+        raise ValueError(f"K={K} must be a multiple of rotation_size={rotation_size}")
     # The kernel addresses x with signed 32-bit byte offsets.
     if x.numel() * x.element_size() >= 2**31:
         raise ValueError(f"x is too large for 32-bit offsets: {tuple(x.shape)}")
@@ -290,32 +314,35 @@ def _check_input(x, RS):
     return M, K
 
 
-def flydsl_rot_quant(x: torch.Tensor, RS: int = 64, shuffle_scales: bool = False):
+def flydsl_rot_quant(
+    x: torch.Tensor, *, rotation_size: int = 64, shuffle: bool = False
+):
     """Fused block-diagonal Hadamard rotation + MXFP4 quantization.
 
     Quantizes ``(x.view(M, K // RS, RS).float() @ (H / sqrt(RS))).to(bf16)``
-    to MXFP4 with aiter's default RoundUp e8m0 scale, where ``H`` is the
-    Sylvester Hadamard matrix ``scipy.linalg.hadamard(RS)``; the result equals
-    ``per_1x32_f4_quant`` applied to that rotated tensor. The weight must be
-    rotated by the same matrix so that ``(x H)(w H)^T = x w^T``.
+    to MXFP4 with aiter's default RoundUp e8m0 scale, where ``RS`` is
+    ``rotation_size`` and ``H`` the Sylvester Hadamard matrix
+    ``scipy.linalg.hadamard(RS)``; the result equals ``per_1x32_f4_quant``
+    applied to that rotated tensor. The weight must be rotated by the same
+    matrix so that ``(x H)(w H)^T = x w^T``.
 
     Args:
         x: contiguous bf16 ``[M, K]``.
-        RS: rotation size, one of ``SUPPORTED_RS``; ``K`` must be a multiple.
-        shuffle_scales: write the scales in the CK layout of
+        rotation_size: one of ``SUPPORTED_RS``; ``K`` must be a multiple.
+        shuffle: write the scales in the CK layout of
             ``aiter.ops.shuffle.shuffle_scale`` instead of row-major.
 
     Returns:
         ``(xq, xs)`` as from ``per_1x32_f4_quant_hip``: ``xq`` is fp4x2
         ``[M, K // 2]``. ``xs`` is e8m0, ``[M, K // 32]``, or with
-        ``shuffle_scales=True`` ``[ceil256(M), ceil8(K // 32)]``, where the
-        padding columns hold 1.0 as in ``shuffle_scale`` and the padding rows
-        are left uninitialized.
+        ``shuffle=True`` ``[ceil256(M), ceil8(K // 32)]``, where the padding
+        columns hold 1.0 as in ``shuffle_scale`` and the padding rows are left
+        uninitialized.
     """
-    M, K = _check_input(x, RS)
+    M, K = _check_input(x, rotation_size)
     xq = torch.empty((M, K // 2), dtype=dtypes.fp4x2, device=x.device)
-    if shuffle_scales:
-        scale_shape = ((M + 255) // 256 * 256, (K // MX_GROUP + 7) // 8 * 8)
+    if shuffle:
+        scale_shape = ((M + 255) // 256 * 256, _padded_scale_cols(K))
     else:
         scale_shape = (M, K // MX_GROUP)
     xs = torch.empty(scale_shape, dtype=dtypes.fp8_e8m0, device=x.device)
@@ -323,15 +350,16 @@ def flydsl_rot_quant(x: torch.Tensor, RS: int = 64, shuffle_scales: bool = False
         return xq, xs
 
     num_groups = M * (K // MX_GROUP)
-    _run_compiled(
-        _build_rot_quant(K, RS, shuffle_scales),
-        ptr_arg(x, fx.BFloat16),
-        ptr_arg(xq, fx.Int32),
-        ptr_arg(xs, fx.Int8),
-        num_groups,
-        (num_groups + BLOCK - 1) // BLOCK,
-        torch.cuda.current_stream(x.device),
-    )
+    with torch.cuda.device(x.device):
+        _run_compiled(
+            _build_rot_quant(K, rotation_size, shuffle),
+            ptr_arg(x, fx.BFloat16),
+            ptr_arg(xq, fx.Int32),
+            ptr_arg(xs, fx.Int8),
+            num_groups,
+            (num_groups + BLOCK - 1) // BLOCK,
+            torch.cuda.current_stream(x.device),
+        )
     return xq, xs
 
 
@@ -339,38 +367,53 @@ def flydsl_rot_quant_moe_sort(
     x: torch.Tensor,
     sorted_ids: torch.Tensor,
     num_valid_ids: torch.Tensor,
+    token_num: int,
     topk: int,
     block_size: int,
-    RS: int = 64,
+    *,
+    rotation_size: int = 64,
 ):
     """:func:`flydsl_rot_quant` for the MoE stage-1 input, with the scales
     sorted for the MoE GEMMs.
 
-    Equals ``fused_dynamic_mxfp4_quant_moe_sort`` applied to the rotated
-    tensor of :func:`flydsl_rot_quant`, without that op's amax floor:
-    ``sorted_ids``, ``num_valid_ids`` and ``block_size`` come from
-    ``moe_sorting`` and ``topk`` is the routing top-k.
+    Takes the leading arguments of ``fused_dynamic_mxfp4_quant_moe_sort`` and
+    equals it applied to the rotated tensor of :func:`flydsl_rot_quant`,
+    without that op's amax floor: ``sorted_ids``, ``num_valid_ids`` and
+    ``block_size`` come from ``moe_sorting`` (with or without
+    ``num_local_tokens``), ``token_num`` is ``M`` and ``topk`` is the routing
+    top-k.
 
     Returns:
-        ``(xq, xs)``: ``xq`` is fp4x2 ``[M, K // 2]`` in token order. ``xs`` is
-        e8m0 ``[ceil32(len(sorted_ids)), ceil8(K // 32)]`` in the layout of
-        ``mxfp4_moe_sort_fwd``; only the rows of valid routes are defined.
+        ``(xq, xs)``: ``xq`` is fp4x2 ``[M, K // 2]`` in token order; the rows
+        of tokens with no valid route may be left unwritten. ``xs`` is e8m0
+        ``[ceil32(len(sorted_ids)), ceil8(K // 32)]`` in the layout of
+        ``mxfp4_moe_sort_fwd``; only the rows of valid routes are defined, and
+        their padding columns hold 0 as there.
     """
-    M, K = _check_input(x, RS)
+    M, K = _check_input(x, rotation_size)
+    if M != token_num:
+        raise ValueError(f"x has {M} rows, expected token_num={token_num}")
     # The fused kernel quantizes a token once per route, so past this much work
     # one rotation pass plus mxfp4_moe_sort_fwd is faster (MI350X, E=128,
-    # topk=8, K=2048-7168). mxfp4_moe_sort_fwd zeroes the last token's final
-    # scales when K // 32 is not a multiple of 4, so those K stay fused.
-    if M * topk * K > 1 << 21 and (K // MX_GROUP) % 4 == 0:
+    # topk=8, K=2048-7168).
+    if M * topk * K > 1 << 21:
         from aiter.ops.quant import mxfp4_moe_sort_fwd
 
-        xq, xs = flydsl_rot_quant(x, RS)
-        return xq, mxfp4_moe_sort_fwd(xs, sorted_ids, num_valid_ids, M, K)
+        xq, xs = flydsl_rot_quant(x, rotation_size=rotation_size)
+        # mxfp4_moe_sort_fwd drops the last token's final scales when K // 32
+        # is not a multiple of 4 (#7646). Zero columns up to a multiple of 4
+        # avoid that and change nothing else: it writes padding columns as 0.
+        pad = -(K // MX_GROUP) % 4
+        if pad:
+            xs = torch.nn.functional.pad(xs.view(torch.uint8), (0, pad))
+            xs = xs.view(dtypes.fp8_e8m0)
+        cols = K + pad * MX_GROUP
+        return xq, mxfp4_moe_sort_fwd(xs, sorted_ids, num_valid_ids, M, cols)
 
     xq = torch.empty((M, K // 2), dtype=dtypes.fp4x2, device=x.device)
     sorted_rows = sorted_ids.shape[0]
     xs = torch.empty(
-        ((sorted_rows + 31) // 32 * 32, (K // MX_GROUP + 7) // 8 * 8),
+        ((sorted_rows + 31) // 32 * 32, _padded_scale_cols(K)),
         dtype=dtypes.fp8_e8m0,
         device=x.device,
     )
@@ -380,15 +423,17 @@ def flydsl_rot_quant_moe_sort(
     # blocks, so valid rows never exceed M * topk * block_size.
     rows = min(sorted_rows, M * topk * block_size)
     threads = rows * (K // MX_GROUP)
-    _run_compiled(
-        _build_rot_quant_moe_sort(K, RS, MOE_BLOCK),
-        ptr_arg(x, fx.BFloat16),
-        ptr_arg(xq, fx.Int32),
-        ptr_arg(xs, fx.Int8),
-        ptr_arg(sorted_ids, fx.Int32),
-        ptr_arg(num_valid_ids, fx.Int32),
-        M,
-        (threads + MOE_BLOCK - 1) // MOE_BLOCK,
-        torch.cuda.current_stream(x.device),
-    )
+    with torch.cuda.device(x.device):
+        _run_compiled(
+            _build_rot_quant_moe_sort(K, rotation_size, MOE_BLOCK),
+            ptr_arg(x, fx.BFloat16),
+            ptr_arg(xq, fx.Int32),
+            ptr_arg(xs, fx.Int8),
+            ptr_arg(sorted_ids, fx.Int32),
+            ptr_arg(num_valid_ids, fx.Int32),
+            M,
+            topk,
+            (threads + MOE_BLOCK - 1) // MOE_BLOCK,
+            torch.cuda.current_stream(x.device),
+        )
     return xq, xs
