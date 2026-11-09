@@ -374,7 +374,29 @@ def test_sp_qkv_covers_never_raises(covers_env, monkeypatch):
     assert rt._SESSIONS == {}
 
 
-def test_pad_bucket_uses_staging_outputs_and_copies_back(env):
+BOUND_TENSORS = (
+    "w_scale",
+    "k_cache",
+    "v_cache",
+    "k_scale",
+    "v_scale",
+    "q_norm_w",
+    "k_norm_w",
+    "cos_cache",
+    "sin_cache",
+)
+"""Payload entries the plan binds by pointer (caller outputs are NOT bound)."""
+
+
+def _relink_bound(dst, src):
+    """Reuse the bound tensors of ``src`` in ``dst`` (only per-call tensors differ)."""
+
+    for name in BOUND_TENSORS:
+        dst[name] = src[name]
+    return dst
+
+
+def test_staging_outputs_and_copy_back_for_pad_bucket(env):
     env.bucket = 16  # bucket M=16, real local m=8 => T_real=32, T_bucket=64
     payload = _payload(m=8)
     rt.sp_qkv_native(payload)
@@ -390,11 +412,41 @@ def test_pad_bucket_uses_staging_outputs_and_copies_back(env):
     assert len(env.plan.prepares) == 1
 
 
-def test_exact_bucket_binds_caller_outputs_without_copy(env):
+def test_exact_bucket_also_uses_runtime_staging(env):
     payload = _payload(m=8)
     rt.sp_qkv_native(payload)
-    assert env.plan.prepares[0]["outs"]["q"] is payload["q"]
-    assert env.copies == []
+    prepared = env.plan.prepares[0]["outs"]
+    assert prepared["q"].shape[0] == 32  # bucket T == real T here
+    assert prepared["q"] is not payload["q"]
+    assert all(call[1] is not payload["q"] for call in env.copies)  # src is staging
+    assert [call[2] for call in env.copies] == [32, 32, 32]
+    assert env.copies[0][0] is payload["q"]  # ...dst is the caller's tensor
+
+
+def test_shared_output_buffer_across_layers(env):
+    env.bucket = 16
+    g = object()
+    p1 = _payload(m=8, group=g)
+    rt.sp_qkv_native(p1)
+    p2 = _relink_bound(_payload(m=8, group=g), p1)  # different per-layer output tensors
+    env.copies.clear()
+    rt.sp_qkv_native(p2)  # same session/binding: caller outputs are not bound
+    assert env.plan.prepares == [env.plan.prepares[0]]  # prepared once
+    assert len(env.copies) == 3
+    assert env.copies[0][0] is p2["q"]
+
+
+def test_same_bucket_different_real_m_copies_per_call(env):
+    env.bucket = 16
+    p8 = _payload(m=8)
+    rt.sp_qkv_native(p8)
+    assert [call[2] for call in env.copies] == [32, 32, 32]
+    env.copies.clear()
+    p12 = _relink_bound(_payload(m=12), p8)  # same bucket, a different real m
+    rt.sp_qkv_native(p12)
+    assert len(env.plan.prepares) == 1  # one binding serves the bucket
+    assert [call[2] for call in env.copies] == [48, 48, 48]
+    assert env.copies[0][0] is p12["q"]
 
 
 # ---------------------------------------------------------------------------
@@ -450,10 +502,10 @@ def test_prepare_before_capture_refusal_then_replay(env):
     assert len(env.plan.runs) == 2
 
 
-def test_moved_binding_rejected(env):
+def test_moved_bound_pointer_rejected(env):
     payload = _payload()
     rt.sp_qkv_native(payload)
-    payload["q"] = FakeTensor((32, 16, 128), "bfloat16")  # a moved bound output
+    payload["k_cache"] = FakeTensor((2, 1, 8, 128, 16), "float8_e4m3fn")
     with pytest.raises(FakeContractError, match="moved"):
         rt.sp_qkv_native(payload)
 
@@ -537,10 +589,15 @@ def test_native_stage_callback_invoked(env):
         calls.append(kwargs)
 
     g = object()
+    payload = _payload(group=g)
     rt.open_session(group=g, native_stage=stage)
-    rt.sp_qkv_native(_payload(group=g))
+    rt.sp_qkv_native(payload)
     assert len(calls) == 1
     assert set(calls[0]["outs"]) == {"q", "k", "v"}
+    # the continuation consumes the runtime staging (real rows first), not the
+    # caller's public output tensors
+    assert calls[0]["outs"]["q"] is not payload["q"]
+    assert calls[0]["outs"]["q"].shape[0] == 32
     assert calls[0]["meta"]["positions"] is not None
     rt.sp_qkv_native(_payload())  # default session: no callback
     assert len(calls) == 1

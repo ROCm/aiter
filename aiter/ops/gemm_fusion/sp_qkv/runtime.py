@@ -41,11 +41,16 @@ part of the op contract*: the runtime never imports ATOM, the default is
 ``None``, and without it the caller runs its own attention tail after the op
 returns.
 
-Padded calls whose real local M falls into a *larger* prepared bucket (the
-framework's R16 pad-M selection) are served too: the runtime binds bucket-sized
-staging outputs once and copies the real rows back to the caller's tensors after
-every launch (device-side, capturable), so the caller's public outputs stay
-``T = 4*real M``.
+**Output staging (binding rule):** the runtime always owns bucket-sized
+output staging and binds *those* (never the caller's tensors).  After every
+launch it copies the real ``T = 4*real local M`` rows back to the caller's public
+outputs on the same stream (device-side, capturable).  Consequences: caller
+output buffers, views and row ranges are irrelevant to the binding -- layers may
+share one bucket-sized buffer (or pass disjoint row-range views) and only the
+per-call row count matters; one binding per ``(mode, bucket M)`` per session is
+enough, and it covers exact buckets and pad hits alike.  The staging cost is
+bounded and lazy: it exists only for matched buckets that are actually prepared
+(small-band T_bucket <= 1024 rows; the Phase-2 large band is not served).
 
 Calls outside this fused coverage -- the **one-stage** plan family
 (``sp_qkv.large.v1``: GEMM + SP exchange only, whose remaining prologue/attention
@@ -173,11 +178,8 @@ class _Bucket:
     bucket_m: int
     prepared: bool = False
     outs: dict[str, Any] = field(default_factory=dict)
-    payload_outs: dict[str, Any] = field(default_factory=dict)
     staging: Any = None
     abi: int = 3
-    pad_copy: bool = False
-    rows: int = 0
     bound_ptrs: tuple = ()
     prepared_once: bool = False
 
@@ -583,6 +585,17 @@ def sp_qkv_covers(payload: Mapping) -> bool:
     MORI/profile, an invalid payload or an uncovered call returns ``False``.
     ``True`` means "the planner would match a prologue plan"; the actual call can
     still fail later at resource/kernel setup.
+
+    Tensor placeholders are enough: this query reads only shape/dtype/numel and
+    ``w.is_contiguous`` from the payload -- never data, device or pointers -- so
+    the per-call tensors may be structurally valid meta/empty tensors while the
+    bound weights/norm-weights/caches are real.  What it *does* need is a live
+    GPU/ROCm/MORI context (``_detect_arch``/``_detect_cu``/``_detect_capabilities``)
+    and a real SP ``group`` (or the initialized default process group).  The
+    answer is for the row count of ``x``: pass a placeholder whose first dimension
+    is the local M being asked about (>= 1; a 0-row placeholder is rejected), or
+    query distinct M/buckets -- a placeholder sized only to the deployment's
+    largest local rows answers that largest M, not every smaller call.
     """
 
     try:
@@ -878,13 +891,14 @@ def _outs_of(payload: Mapping) -> dict:
 
 
 def _staging_outs(payload: Mapping, bucket_m: int) -> dict:
-    """Bucket-sized output buffers for a padded call.
+    """Bucket-sized runtime output staging, always the bound output tensors.
 
-    The plan's geometry is the *bucket* M (a launch with a smaller real m writes
-    the bucket's T rows), while the public contract's outputs are caller-sized
-    (T = 4*real M).  For a pad hit the runtime binds these bucket-sized staging
-    outputs once (outside capture) and copies the real rows back to the caller's
-    tensors after every launch (device-side, capturable).
+    The plan's geometry is the *bucket* M (a launch with a smaller real m still
+    writes up to the bucket's T rows), while the public contract's outputs are
+    caller-sized (T = 4*real M).  The runtime binds these buffers once per
+    ``(mode, bucket)`` (outside capture) and copies the real rows back to the
+    caller's tensors after every launch (device-side, capturable), so caller
+    output buffers/views/row ranges never take part in the binding.
     """
 
     dev = getattr(payload["q"], "device", None)
@@ -902,7 +916,7 @@ def _staging_outs(payload: Mapping, bucket_m: int) -> dict:
 
 
 def _copy_rows(dst: Any, src: Any, rows: int) -> None:
-    """Copy the real output rows of a padded launch back to the caller tensors."""
+    """Copy the real output rows of a launch back to a caller output tensor."""
 
     dst[:rows].copy_(src[:rows])
 
@@ -986,6 +1000,7 @@ def _ptr_tuple(
     """
 
     names = (
+        "w_scale",
         "k_cache",
         "v_cache",
         "k_scale",
@@ -1042,9 +1057,12 @@ def _prepare_bucket(
     if abi < 3:
         staging = _make_staging(payload, bucket_m)
         _stage_inputs(staging, payload)
-    payload_outs = _outs_of(payload)
-    pad_copy = bucket_m != m
-    bind_outs = _staging_outs(payload, bucket_m) if pad_copy else payload_outs
+    if m > bucket_m:  # pragma: no cover - match_padded never returns this
+        raise RuntimeError(
+            f"sp_qkv native runtime: real local M={m} exceeds the matched bucket "
+            f"M={bucket_m}"
+        )
+    bind_outs = _staging_outs(payload, bucket_m)
     meta = _meta_of(payload, staging)
     prep = getattr(plan, "prepare", None)
     if callable(prep):
@@ -1062,12 +1080,9 @@ def _prepare_bucket(
         bucket_m=bucket_m,
         prepared=True,
         outs=bind_outs,
-        payload_outs=payload_outs,
         staging=staging,
         abi=abi,
-        pad_copy=pad_copy,
-        rows=_WORLD * m,
-        bound_ptrs=_ptr_tuple(payload, include_outputs=not pad_copy, outs=bind_outs),
+        bound_ptrs=_ptr_tuple(payload, include_outputs=False, outs=bind_outs),
         prepared_once=True,
     )
     return bucket
@@ -1121,9 +1136,14 @@ def _run_plan(
         stream=payload["stream"],
         call_id=call_id,
     )
-    if bucket.pad_copy:
-        for name, dst in bucket.payload_outs.items():
-            _copy_rows(dst, bucket.outs[name], bucket.rows)
+    rows = _WORLD * int(_shape(payload["x"])[0])
+    if rows > _WORLD * bucket.bucket_m:  # pragma: no cover - prepare guard covers it
+        raise RuntimeError(
+            f"sp_qkv native runtime: real T={rows} exceeds the bucket's "
+            f"T={_WORLD * bucket.bucket_m}"
+        )
+    for name, dst in _outs_of(payload).items():
+        _copy_rows(dst, bucket.outs[name], rows)
     return meta
 
 
@@ -1140,10 +1160,10 @@ def _run_native_stage(
     it consumes exactly the tensors the fused prologue just wrote (``q``/``k``/
     ``v``/``index_q`` and the caches) on the same stream.  The native runtime
     cannot import ATOM, so without a registered callback the caller runs its own
-    attention tail after :func:`sp_qkv_native` returns.  For a padded call the
-    callback receives the bucket-sized staging outputs (the first
-    ``T = 4*real local M`` rows are the real ones); the copy-back to the caller's
-    public outputs has already been enqueued on the same stream.
+    attention tail after :func:`sp_qkv_native` returns.  The callback receives
+    the bucket-sized runtime staging outputs (the first ``T = 4*real local M``
+    rows are the real ones); the copy-back to the caller's public outputs has
+    already been enqueued on the same stream.
     """
 
     callback = session.native_stage
@@ -1269,8 +1289,11 @@ def sp_qkv_native(payload: Mapping) -> None:
         plan = bucket.plan
 
     # A moved binding is a silent wrong write: detect it before the launch.
+    # (Caller output tensors are deliberately not part of `bound_ptrs`: the
+    # runtime binds its own staging and copies real rows into whatever the caller
+    # passed, so output buffers/views/rows are free to vary.)
     if (
-        _ptr_tuple(payload, include_outputs=not bucket.pad_copy, outs=bucket.outs)
+        _ptr_tuple(payload, include_outputs=False, outs=bucket.outs)
         != bucket.bound_ptrs
     ):
         _fail(
