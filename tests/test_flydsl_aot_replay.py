@@ -178,3 +178,25 @@ def test_a4w4_csv_rows_reach_flydsl_through_public_replay(monkeypatch):
                 assert kernels, job
     finally:
         get_GEMM_config.cache_clear()
+
+
+def test_projection_public_entries_reach_all_aot_kernels():
+    from aiter.tuned_gemm import gemm_a16w16, gemm_a16w16_out
+
+    with dry_run("gfx950", 256, python_ops=True):
+        for n, k in ((3584, 7168), (7168, 3584), (4480, 7168)):
+            a = torch.empty(256, k, device="cuda", dtype=torch.bfloat16)
+            b = torch.empty(n, k, device="cuda", dtype=torch.bfloat16)
+            out = torch.empty(256, n, device="cuda", dtype=torch.bfloat16)
+            with replay.identified_kernels() as allocating:
+                gemm_a16w16(a, b)
+            with replay.identified_kernels() as preallocated:
+                gemm_a16w16_out(a, b, out)
+            assert allocating == preallocated
+            assert len(allocating) == (1 if n == 7168 else 2)
+
+
+def test_the_dry_run_enters_stream_context_without_gpu_runtime():
+    with dry_run("gfx950", 256):
+        with torch.cuda.stream(torch.cuda.current_stream()):
+            assert torch.empty(4, device="cuda").device.type == "cuda"

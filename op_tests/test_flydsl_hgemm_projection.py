@@ -95,6 +95,11 @@ def test_projection(m, n, k, dtype, out_dtype):
         a, w, 0, otype=out_dtype, out=y, config={"kernelName": name}
     )
     _check(ref, dispatched, "tuned projection dispatcher")
+    from aiter.tuned_gemm import gemm_a16w16, gemm_a16w16_out
+
+    gemm_a16w16_out(a, w, y)
+    _check(ref, y, "public out dispatcher")
+    _check(ref, gemm_a16w16(a, w), "public allocating dispatcher")
     candidates = {
         "flydsl_ft": lambda: flydsl_hgemm(a, w, out=y, out_dtype=out_dtype, **old),
         "flydsl_projection": lambda: flydsl_hgemm(
@@ -153,6 +158,23 @@ def test_projection(m, n, k, dtype, out_dtype):
     torch.cuda.synchronize()
     for (aa, ww), yy in zip(inputs, outputs):
         _check(run_torch(aa, ww, out_dtype), yy, "concurrent stream graphs")
+
+    # Two graphs captured on one stream may later replay on distinct streams.
+    # Prewarm scratch first: graph-local buffers must not reuse the eager one.
+    captured_together = []
+    capture_stream = streams[0]
+    for (aa, ww), yy in zip(inputs, outputs):
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g, stream=capture_stream):
+            flydsl_hgemm(aa, ww, out=yy, stream=capture_stream, **kwargs)
+        captured_together.append(g)
+    for _ in range(20):
+        for st, g in zip(streams, captured_together):
+            with torch.cuda.stream(st):
+                g.replay()
+    torch.cuda.synchronize()
+    for (aa, ww), yy in zip(inputs, outputs):
+        _check(run_torch(aa, ww, out_dtype), yy, "same-capture-stream graphs")
 
     cold_stream = torch.cuda.Stream()
     cold_stream.wait_stream(torch.cuda.current_stream())

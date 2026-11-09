@@ -221,6 +221,8 @@ def dry_run(
             (CompiledArtifact, "_ensure_engine", _forbid),
             (torch.cuda, "current_stream", lambda *_a, **_k: stream),
             (torch.cuda, "Stream", _Stream),
+            # Fake streams have no runtime stream_id and no device work.
+            (torch.cuda, "stream", lambda *_a, **_k: nullcontext()),
             (torch.cuda, "Event", _Event),
             (torch.cuda, "current_device", lambda: 0),
             (torch.cuda, "device", _Device),

@@ -11,7 +11,7 @@ import torch
 from flydsl.expr import range_constexpr
 
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.utility.graph_alloc import persistent_alloc
+from aiter.utility import graph_alloc
 
 from .kernels.tensor_shim import _run_compiled, ptr_arg
 
@@ -75,10 +75,11 @@ def projection_name_supported(params):
 
 
 @functools.cache
-def _workspace(device, stream, m, n, splits):
+def _workspace(device, stream, capture_id, m, n, splits):
     # Fully overwritten, no initialization or semaphore. Never evict: graphs
-    # may retain pointers. Different streams cannot alias mutable partials.
-    with persistent_alloc(device):
+    # may retain pointers. Distinct captures can replay concurrently, even if
+    # captured on the same stream; they must not share mutable partials.
+    with graph_alloc.persistent_alloc(device):
         return torch.empty((splits, m, n), device=device, dtype=torch.float32)
 
 
@@ -165,7 +166,18 @@ def gemm_a16w16_projection(a, b, out, bias, out_dtype, stream, config):
     row = _PROJECTIONS[m, n, k]
     splits = row[6]
     with torch.cuda.stream(stream):
-        partial = _workspace(a.device, stream, m, n, splits) if splits > 1 else out
+        partial = (
+            _workspace(
+                a.device,
+                stream,
+                graph_alloc._capture_id(stream.cuda_stream),
+                m,
+                n,
+                splits,
+            )
+            if splits > 1
+            else out
+        )
         exe = build_projection(m, n, k, *row)
         _run_compiled(
             exe,
