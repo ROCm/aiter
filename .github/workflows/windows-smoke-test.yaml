@@ -95,7 +95,10 @@ jobs:
 
           python --version
           python -m venv $venv
-          $python = Join-Path $venv "Scripts\python.exe"
+          $venvScripts = Join-Path $venv "Scripts"
+          $python = Join-Path $venvScripts "python.exe"
+          $env:PATH = "$venvScripts;$env:PATH"
+          $venvScripts | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
           & $python --version
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -117,7 +120,9 @@ jobs:
         run: |
           $ErrorActionPreference = "Continue"
           $venv = Join-Path $env:RUNNER_TEMP "aiter-windows-smoke"
-          $python = Join-Path $venv "Scripts\python.exe"
+          $venvScripts = Join-Path $venv "Scripts"
+          $python = Join-Path $venvScripts "python.exe"
+          $env:PATH = "$venvScripts;$env:PATH"
 
           & $python -m pip install --upgrade `
             -r requirements.txt `
@@ -125,6 +130,9 @@ jobs:
             "setuptools_scm<10" `
             triton-windows `
             numpy
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          ninja --version
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
           $verifyRocm = @'
@@ -162,7 +170,9 @@ jobs:
         run: |
           $ErrorActionPreference = "Continue"
           $venv = Join-Path $env:RUNNER_TEMP "aiter-windows-smoke"
-          $python = Join-Path $venv "Scripts\python.exe"
+          $venvScripts = Join-Path $venv "Scripts"
+          $python = Join-Path $venvScripts "python.exe"
+          $env:PATH = "$venvScripts;$env:PATH"
           $logPath = Join-Path $env:RUNNER_TEMP "windows-smoke-test.log"
 
           & $python -m pytest -q -s op_tests/windows 2>&1 | Tee-Object -FilePath $logPath
