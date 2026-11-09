@@ -125,8 +125,8 @@ def _gate_up_batch(
     if act == "silu" and swiglu_limit is None:
         return _silu_mul_batch(gs, us)
     if act == "silu":
-        # silu + clamp(DSV4):gate<=L, -L<=up<=L 后走同一个 exp2+rcp 的 SiLU。
-        # batched_silu_swiglu 用 v_tanh(gfx1250 才有),gfx950 编译失败。
+        # SiLU with DSV4 clamping: gate <= L and -L <= up <= L, then exp2 + rcp.
+        # batched_silu_swiglu uses v_tanh, available only on gfx1250; gfx950 compilation fails.
         limit = float(swiglu_limit)
         if math.isinf(limit):
             return _silu_mul_batch(gs, us)
@@ -215,7 +215,7 @@ def _gemm1_body_sc2(
     BN_INT = BN // 2
     b_aux = 2
     M_REPS = BM // 16
-    # 每 wave 的 16 列 N 子块数:4(gate/up 各两个)。
+    # Four 16-column N subtiles per wave: two each for gate and up.
     NJ = BN // 64
     assert BN == 256, f"GMM1 BN must be 256, got {BN}"
     assert BM in (32, 64, 128), f"GMM1 BM must be 32, 64 or 128, got {BM}"
@@ -283,10 +283,11 @@ def _gemm1_body_sc2(
     bscale_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Int32)
     bscale_reg_lay = fx.make_layout(1, 1)
 
-    # LDS alias scopes。A 的 LDS DMA 计入 vmcnt;
-    # LLVM 在任何 LDS 读写前,对没有 alias.scope 的访问保守地等全部在途的 LDS DMA,
-    # 于是每步 A 的 ds_read 前被插 vmcnt(0)(ATT:GMM1 41% 周期),A 两步预取形同虚设。
-    # 每个 A 槽一个 scope、A-scale 区一个 scope,读写都带上,LLVM 只等同槽的 DMA。
+    # LDS alias scopes: A's LDS DMA contributes to vmcnt. Without alias.scope,
+    # LLVM conservatively waits for all outstanding LDS DMA before LDS accesses.
+    # This inserts vmcnt(0) before each A ds_read (41% of GMM1 cycles in ATT),
+    # defeating the two-step A prefetch. Give each A slot and the A-scale region
+    # a separate scope on both reads and writes, so LLVM waits only for that slot's DMA.
     from flydsl._mlir import ir as _ir
 
     _dom = '#llvm.alias_scope_domain<id = distinct[0]<>, description = "gmm1_lds">'
@@ -300,7 +301,7 @@ def _gemm1_body_sc2(
             + "]"
         )
     )
-    _scopes = [_sc[i] for i in range(kAStages + 1)]  # [A 槽 0..kAStages-1, A-scale]
+    _scopes = [_sc[i] for i in range(kAStages + 1)]  # [A slots 0..kAStages-1, A-scale]
 
     def _scope_attrs(idx):
         return {
@@ -338,7 +339,7 @@ def _gemm1_body_sc2(
         b_load_s_base.append(rocdl.readfirstlane(T.i32, v))
 
     # -- b_scale_s_base / _hi (HIP 418-429) -----------------------------------
-    # B-scale 一个字覆盖相邻两个 16 列 n0:本 wave 的两个 n0 正好一对。
+    # One B-scale word covers two adjacent 16-column n0 blocks, exactly this wave's pair.
     np_gate = n_block_idx * fx.Int32(BN // 64) + (wave // fx.Int32(2) if W8 else wave)
     bs_shift = (wave % fx.Int32(2)) * fx.Int32(8) if W8 else None
     np_list = [np_gate, np_gate + fx.Int32(N_OUT // 64)]
@@ -373,7 +374,7 @@ def _gemm1_body_sc2(
                 lane_col = lane_mod_8 * fx.Int32(16)
             voffset = (lane_col ^ mask) + cached_actual_row[sub] * fx.Int32(A_ROW_BYTES)
             off = fx.Int32(slot * (BM * KH_TILE)) + lds_row * fx.Int32(KH_TILE)
-            # 同 mxfp4_gemm2._issue_a_load_lds:LDS 基址 wave 一致,每 lane 16B 依次落位。
+            # As in mxfp4_gemm2._issue_a_load_lds: a wave-uniform LDS base, with 16B per lane.
             rocdl.raw_ptr_buffer_load_lds(
                 aq_rsrc,
                 _lds_ptr3(_lds_base_i32, off),
@@ -438,9 +439,9 @@ def _gemm1_body_sc2(
         out = []
         for sub in range_constexpr(kSubBlocks):
             if const_expr(W8):
-                # 常量项(sub、kt)放在 *4 之外,才能折进 ds_read 的 offset 立即数;
-                # 否则每个 (kt, sub) 的地址各占一个 VGPR,8-wave 的 256 上限下全被溢出,
-                # 每次 scratch reload 还附带 vmcnt(0),会排空 B 预取。
+                # Keep constant terms (sub, kt) outside *4 so they fold into ds_read immediates.
+                # Otherwise each (kt, sub) address needs a VGPR and spills at the 8-wave limit of 256.
+                # Each scratch reload also inserts vmcnt(0), draining the B prefetch pipeline.
                 lds_b = (lane_div_16 * fx.Int32(16) + lane_mod_16) * fx.Int32(
                     4
                 ) + fx.Int32((sub * kAS_per_chunk_dw + kt * 64) * 4)
@@ -461,13 +462,14 @@ def _gemm1_body_sc2(
             )
         return out
 
-    # ascale_gather:A-scale 按源 token 行主序存放(每行 K/32 字节,由 stage1
-    # 每 (token, dest) 连续写一次),这里按 arg_mind 取两行(n_lane、n_lane+16)
-    # 各 8 字节,拼成 DMA 版本在 LDS 里的 BM32 预排布:
+    # ascale_gather: A-scale is stored in source-token row-major order, K/32 bytes
+    # per row, written contiguously once per (token, dest) by Stage1. Use arg_mind
+    # to fetch 8 bytes from each of two rows (n_lane, n_lane+16) and form the DMA
+    # path's BM32 LDS layout:
     #   dword(ku, k_lane, n_lane) = [A[8ku+k], B[8ku+k], A[8ku+4+k], B[8ku+4+k]]
-    # (字节序 = ikxdl*2 + im_a,与 stage1 fanout 的散写同一公式)。
-    # global load 在序章最前面发、LDS 写在序章之后,由序章末尾的
-    # _wait_lds_barrier(lgkmcnt(0)+barrier)保证先写后读。
+    # Byte order is ikxdl*2 + im_a, matching Stage1 fanout's scatter formula.
+    # Issue the global load at the start of the prologue and write LDS afterward.
+    # The final _wait_lds_barrier(lgkmcnt(0)+barrier) orders writes before reads.
     _GS_ITEMS = kSubBlocks * 16 * K_TILES_TOTAL
     _GS_THREADS = NW * 64
     _GS_PASS = (_GS_ITEMS + _GS_THREADS - 1) // _GS_THREADS
@@ -489,7 +491,8 @@ def _gemm1_body_sc2(
             da = ra * fx.Int32(_GS_ROW_DW) + ku * fx.Int32(2)
             db = rb * fx.Int32(_GS_ROW_DW) + ku * fx.Int32(2)
             if const_expr(W8):
-                # 8-wave:只带一个 LDS 字节基址过序章(k*16 dw 作立即数),少占 2 个 VGPR/遍。
+                # 8-wave: carry one LDS byte base through the prologue; k*16 dwords is immediate.
+                # This saves two VGPRs per iteration.
                 sub = (
                     sub * fx.Int32(kAS_per_chunk_dw) + ku * fx.Int32(64) + n_lane
                 ) * fx.Int32(4)
@@ -508,7 +511,7 @@ def _gemm1_body_sc2(
 
     def gather_a_scale_write(loads):
         m8 = fx.Int32(0xFF)
-        # 越界的工作项已夹到第 0 项:写同一位置同一值,无分支。
+        # Out-of-range work items clamp to item 0 and write the same value without a branch.
         for sub, n_lane, ku, a_lo, a_hi, b_lo, b_hi in loads:
             for k in range_constexpr(4):
                 sh = fx.Int32(8 * k)
@@ -567,7 +570,7 @@ def _gemm1_body_sc2(
             )
             bs_slot[mw] = r.load()[0]
             if const_expr(W8):
-                # n0 对里本 wave 是奇数个 → 字节 1/3 移到 0/2,in_b 恒 0
+                # For the odd n0 in the pair, move bytes 1/3 to 0/2; in_b is always 0.
                 bs_slot[mw] = fx.Int32(bs_slot[mw]) >> bs_shift
 
     mfma_ty = T.f32x4
@@ -649,31 +652,34 @@ def _gemm1_body_sc2(
                 ],
             )
 
-    # 每个 K 步 B 发出的 vmem 条数:4 个 j x 2 个 half 的 dwordx4 + 2 条 B-scale。
+    # B vmem instructions per K step: 4 j x 2 halves of dwordx4, plus 2 B-scale loads.
     _B_VMEM_PER_STEP = NJW * 2 + 2
 
-    # 裸 s_barrier(仅 scoped 路径)。gpu.barrier() 降成
-    # fence release(workgroup, LDS) + s_barrier + fence acquire;SIMemoryLegalizer 在该
-    # release fence 上发 S_WAITCNT_lds_direct,SIInsertWaitcnts 把它换成「等全部在途 LDS DMA」
-    # (通用 LDS 槽,不看 alias scope),并入前面那条显式 s_waitcnt:vmcnt(24) 被收紧成
-    # vmcnt(10),即 A(kt+2) 被迫提前一步落地(ISA 28 处全是 vmcnt(10) lgkmcnt(0))。
-    # 这里跨 wave 可见性已由显式 vmcnt(N)+lgkmcnt(0) 保证,fence 不提供额外必需的顺序。
+    # Use bare s_barrier only on the scoped path. gpu.barrier() lowers to an LDS
+    # workgroup release fence, s_barrier, and acquire fence. SIMemoryLegalizer emits
+    # S_WAITCNT_lds_direct for the release fence; SIInsertWaitcnts turns this into
+    # a wait for all outstanding LDS DMA, ignoring alias scopes. Merging it with
+    # the explicit s_waitcnt tightens vmcnt(24) to vmcnt(10), forcing A(kt+2) to
+    # finish one step early (28 ISA sites become vmcnt(10) lgkmcnt(0)). Explicit
+    # vmcnt(N)+lgkmcnt(0) already provides cross-wave visibility; no extra fence is needed.
 
     def _wait_lds_barrier(vmcnt):
-        # 同 mega_moe/gemm_util.wait_lds_barrier:lgkmcnt(0) 等本 wave 的 ds_read 读完,
-        # vmcnt(N) 等本步开头发出的 A DMA 落地(之后发的 N 条 B 预取继续飞),再 barrier。
+        # As in mega_moe/gemm_util.wait_lds_barrier: lgkmcnt(0) completes this wave's
+        # ds_read, and vmcnt(N) completes the A DMA issued at this step's start.
+        # The N later B prefetch instructions remain in flight; then synchronize waves.
         fx.rocdl.s_waitcnt(vmcnt=vmcnt, lgkmcnt=0)
         rocdl.s_barrier()
 
-    # MegaMoEv2 do_tile 的同步写法(每步末尾一把 wait_lds_barrier),A 三级、DMA 提前两步:
-    #   第 kt 步开头把 A(kt+2) 搬进槽 (kt+2)%3 —— 该槽上一步已被全体 wave 读完
-    #   (上一步末尾的 lgkmcnt(0)+barrier 保证);
-    #   第 kt 步末尾只等 A(kt+1) 落地,它之后发出的 B(kt+1)、A(kt+2)、B(kt+2) 继续飞。
-    # A 走 LDS DMA,每个 wave 只搬 1/4 行却读全部行,两个条件缺一不可。
+    # Follow MegaMoEv2 do_tile: wait_lds_barrier at each step's end, three A stages,
+    # and DMA two steps ahead. At step kt, load A(kt+2) into slot (kt+2)%3, which
+    # all waves finished reading at the previous step's lgkmcnt(0)+barrier.
+    # At step kt's end, wait only for A(kt+1); the later B(kt+1), A(kt+2), and
+    # B(kt+2) remain in flight. Each wave loads one quarter of the rows via LDS DMA
+    # but reads all rows, so both completion and cross-wave synchronization are required.
     _A_DMA_PER_STEP = kDmaW
 
     def _vmcnt_after_a(kt_next):
-        # A(kt_next) 之后按程序序发出的 vmem 条数:B(kt_next),以及(若存在)A(kt_next+1)、B(kt_next+1)
+        # vmem issued after A(kt_next): B(kt_next), plus A(kt_next+1) and B(kt_next+1) if present.
         n = _B_VMEM_PER_STEP
         if kt_next + 1 < K_TILES_TOTAL:
             n += _A_DMA_PER_STEP + _B_VMEM_PER_STEP
@@ -726,7 +732,8 @@ def _gemm1_body_sc2(
     gpu.barrier()
 
     # lds_acc reuses the s_aq region (offset 0) as an f32 accumulator.
-    # 累加器行距 BN+4(不做列异或),消掉尾声 LDS 的 bank 冲突;_bm_constants 已按 BN+4 定 LDS。
+    # A BN+4 row stride without column XOR removes epilogue LDS bank conflicts.
+    # _bm_constants already sizes LDS for BN+4.
     _epi_swz_selfcheck(BM, BN)
     ACC_STRIDE = BN + _EPI_ACC_PAD
     acc_layout = fx.make_layout((BM, BN), (ACC_STRIDE, 1))
@@ -943,18 +950,22 @@ def _gemm1_body_sc2(
 _gemm1_body = _gemm1_body_sc2
 
 
-# 尾声 f32 累加器的 LDS 去 bank 冲突排布(只作用于 BN=256)。
-# 旧排布 (BM,BN):(BN,1):写(每 lane 1 个 f32,16 列 x 4 行、行距 4)四行同 bank -> 64 bank 下 4 路;
-# 读(ds_read_b128)按 CDNA4 文档的 4 相位(每相位 16 lane:T0-3,T12-15,T20-23,T24-27 等,
-# 即两行 m、各两个 wave_grp)-> 2 路。
-# 新排布:只把行距改成 BN+4 dword,不做列异或。行 r 相对 r+1 错开 4 bank(一个 16B 块):
-#   写:行 4k 错开 16k bank,64 lane 覆盖 64 个不同 bank;
-#   读:每相位两行各占偶数/奇数 16B 块,正好铺满 64 bank(CDNA3 32 bank 的 8 相位分组也无冲突)。
-# 注意:按 wave_grp 做 16B 块异或在文档相位分组下会把读冲突重新引回 2 路(已用 selfcheck 模型核过)。
-# 逻辑位置不变,数值逐位不变;地址仍是「lane 基址 + 编译期常量」。LDS 多 BM*4*4 字节(BM=128: +2KB)。
+# Bank-conflict-free LDS layout for the f32 epilogue accumulator (BN=256 only).
+# The old (BM,BN):(BN,1) layout writes one f32 per lane across 16 columns x 4 rows.
+# Four rows hit the same bank, causing four-way conflicts with 64 banks.
+# ds_read_b128 has two-way conflicts in CDNA4's four documented phases:
+# 16 lanes per phase (T0-3,T12-15,T20-23,T24-27, etc.), two m rows and two wave_grp.
+# The new layout uses a BN+4 dword row stride without column XOR. Adjacent
+# rows shift by four banks (one 16B block). Write row 4k shifts by 16k banks,
+# so 64 lanes cover all 64 banks. Each read phase's two rows occupy even/odd
+# 16B blocks, covering 64 banks; CDNA3's eight phases on 32 banks are also conflict-free.
+# XOR by wave_grp would reintroduce two-way read conflicts under these phase
+# groups, as verified by the self-check model. Logical values remain bitwise
+# identical, and addresses remain lane base + compile-time constant. Extra
+# LDS is BM*4*4 bytes (2KB for BM=128).
 _EPI_ACC_PAD = 4
 
-# ds_read_b128 的相位 lane 分组(nod-ai amdgpu_kernel_optimization_guide.md,实测所得)。
+# ds_read_b128 lane phases from nod-ai amdgpu_kernel_optimization_guide.md measurements.
 _B128_PHASES_CDNA4 = (
     (0, 1, 2, 3, 12, 13, 14, 15, 20, 21, 22, 23, 24, 25, 26, 27),
     (32, 33, 34, 35, 44, 45, 46, 47, 52, 53, 54, 55, 56, 57, 58, 59),
@@ -972,8 +983,11 @@ _EPI_SWZ_CHECKED = set()
 
 
 def _epi_swz_selfcheck(BM, BN):
-    """编译期(纯 python 整数)核对:按 _gemm1_body_sc2 尾声的写/读地址公式、行距 BN+4,
-    b128 读 16B 对齐,写(b32,64 lane 单相位 / 32 lane 两相位)与读(CDNA4 4 相位 / CDNA3 8 相位)无冲突。"""
+    """Check the _gemm1_body_sc2 epilogue addresses using compile-time Python integers.
+    With a BN+4 stride, b128 reads are 16B-aligned. Writes (b32, one phase of 64
+    lanes or two phases of 32 lanes) and reads (four CDNA4 phases or eight CDNA3
+    phases) have no bank conflicts.
+    """
     key = (BM, BN)
     if key in _EPI_SWZ_CHECKED:
         return
@@ -1028,7 +1042,8 @@ def _epi_swz_selfcheck(BM, BN):
 
 
 def _bm_constants(BM, BN, KH_TILE, K_TILES_TOTAL):
-    # 生产流水 A 三级(DMA 提前两步)。LDS 不涨:A 三级+scale = BM*496B < 累加器复用区 BM*BN*4。
+    # The production pipeline uses three A stages with DMA two steps ahead.
+    # LDS does not grow: three A stages plus scales use BM*496B, below BM*BN*4 reuse space.
     kAStages = 3
     kSubBlocks = BM // 32
     kMChunks = kmchunks_for(BM)

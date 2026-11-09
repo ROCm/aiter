@@ -94,7 +94,7 @@ def _compile_stage1(
     *,
     rank: int,
     stage2_window_offset: int = 0,
-    fanout_shards: int = 2,
+    fanout_ctas_per_dest: int = 2,
     data_send_ctas: int = 0,
     split_local: bool = False,
     activation: str = "silu",
@@ -115,7 +115,7 @@ def _compile_stage1(
     inside that same window.  The launcher performs exactly one GPU launch.
     """
 
-    # split_local 两条 GMM1 路径各自的配套开关(由 tune 表的 split_local 列选定)。
+    # Select the GMM1 path and its associated switches from the tune table's split_local column.
     split_local = bool(split_local)
     worker_blocks = WORKER_BLOCKS
     early_local_gmm = split_local
@@ -128,16 +128,19 @@ def _compile_stage1(
     # repeated L2 writeback; consumers acquire once per job to preserve weight reuse.
     # Keep constexpr guards outside runtime guards: FlyDSL rewrites them separately.
     tile_ready = lite_sync = fan_wt = not split_local
-    # ready_q(split 路径):组满即入就绪队列。dispatch 每批报到达行数,凑满 32*G 行的那次
-    # 原子的发起者把物理组号追加进 dest 的 gmm1_ready_q;sealer 段 1/段 2 再追加本地/远端的
-    # 尾组。GMM1 消费者做完自己的 fanout 就从队列领 job,不再等 h1_local_eos/h1_queue_eos 两道门。
-    # 到达计数要求载荷/元数据写穿(同 tile_ready),所以连带打开 fan_wt。
-    # 不 split(static_g0)时尾组由「补差额」入队:预约终值后消费者 0 给每个尾组加上缺的行数,
-    # 到达计数与补差额谁最后把组凑满 GROUP_ROWS,谁入队(见 _rq_pad_tails)。
+    # ready_q: enqueue a group as soon as it fills. Dispatch reports arriving rows
+    # in batches; the atomic that reaches 32*G rows appends the physical group ID
+    # to the destination's gmm1_ready_q. Sealer phases 1/2 append local/remote tails.
+    # GMM1 consumers claim jobs after their own fanout, without waiting for both
+    # h1_local_eos and h1_queue_eos. Arrival counts require write-through payload
+    # and metadata, as tile_ready does, so also enable fan_wt.
+    # Without split (static_g0), consumer 0 pads tail arrival counts after all
+    # reservations complete. Whichever atomic fills GROUP_ROWS enqueues the group;
+    # see _rq_pad_tails.
     ready_q = True
     if ready_q:
         fan_wt = True
-    # buffer_store cache_modifier(pre-gfx12 编码):1=sc0(GLC) 16=sc1(SCC) 2=nt(SLC)。
+    # buffer_store cache_modifier, pre-gfx12 encoding: 1=sc0(GLC), 16=sc1(SCC), 2=nt(SLC).
     _WT_META = 17 if fan_wt else 0
     _WT_PAY = 19 if fan_wt else 0
 
@@ -210,10 +213,10 @@ def _compile_stage1(
         raise ValueError(
             f"Stage-1 max_tokens must be in [1, {MAX_FUSED_TOKENS_PER_RANK}]"
         )
-    if fanout_shards < 1 or GPUS_PER_NODE * fanout_shards > worker_blocks:
+    if fanout_ctas_per_dest < 1 or GPUS_PER_NODE * fanout_ctas_per_dest > worker_blocks:
         # Fanout may borrow waiting compute CTAs; the whole grid must stay resident.
         raise ValueError(
-            "fanout_shards must satisfy 1 <= GPUS_PER_NODE*shards <= "
+            "fanout_ctas_per_dest must satisfy 1 <= GPUS_PER_NODE*shards <= "
             f"{worker_blocks}"
         )
     if not 0 <= int(rank) < WORLD:
@@ -235,15 +238,17 @@ def _compile_stage1(
     remote_node = 1 - node
     remote_source_rank = remote_node * GPUS_PER_NODE + local_rank
     stage2_window_offset = int(stage2_window_offset)
-    # rail_soa 的 SoA 排布(发送端 dispatch_staging[p] 与接收端 remote_dispatch_rx[p] 共用)。
+    # rail_soa layout shared by dispatch_staging[p] and remote_dispatch_rx[p].
     from .quant import rail_record_layout as _rail_record_layout
 
     REC_BYTES, REC_Q, REC_S, REC_I, REC_W = _rail_record_layout(HIDDEN, TOPK, A_DTYPE)
     RAIL_QPS = 4
-    # fanout 按 (dest, shard) 分到 CTA;T0(CCO 收发 + credit + seal)不兼做 dest0 的分片,
-    # 所以至少要 2 个分片。
-    if fanout_shards < 2:
-        raise ValueError("fanout_shards must be >= 2 (T0 does not take a fanout shard)")
+    # Assign fanout CTAs by (dest, shard). T0 handles CCO, credits, and sealing,
+    # so it cannot also handle a dest0 shard; at least two shards are required.
+    if fanout_ctas_per_dest < 2:
+        raise ValueError(
+            "fanout_ctas_per_dest must be >= 2 (T0 does not take a fanout shard)"
+        )
     if stage2_window_offset < 0 or stage2_window_offset % 4096:
         raise ValueError(
             "stage2_window_offset must be non-negative and 4096-byte aligned"
@@ -251,49 +256,56 @@ def _compile_stage1(
 
     wire = layout.wire
     record_bytes = wire.record_bytes
-    # GMM1 的两条路径由 split_local 选:
-    # split:本地来源行(fan1)和远端来源行(fan2)各自计数、各自成组,sealer 分两段封尾:
-    #   段 1 在 8 个 local_eos 后封本地组(h1 段基址 0),段 2 在全部 comm_eos 后封远端组。
-    #   满组在 fanout 期间入队;两段 sealer 分别发布尾组。
-    #   h1_local_eos 保证本地段封尾先于最终置换/远端段封尾。
-    #   fan2_shards:每个 dest 只有 fanout_shard < fan2_shards 的 fan CTA 做 fan2(按新步长
-    #   分 token),其余 fan CTA 做完 fan1 直接进 GMM1 本地段,把等 rail 的空档让给本地组。
-    #   lazy_pad:段 1 不补本地组的尾行就发布 h1_local_eos,改由段 2 的 sealer 补。GMM1 只经
-    #   tile_row_input 取 A,且是带界 buffer load;补齐前那些行里是上一代/初值的合法行号,
-    #   算出来的 h1 行只会被 stage2 用 INVALID_SOURCE/权重 0 丢掉,而这两项在 stage1 结束前补齐。
-    #   extra_consumers:ticket 1..COMPUTE_FIRST-1 里除 finisher 以外的 CTA 做完 fan 也进 GMM1。
-    #   consumer_index 仍是 [0, 消费者数) 上的双射:额外的排在原来那段之后。
-    # 不 split:
-    #   static_g0:每个 expert 的第 0 组固定放在物理组 e(tile [e*G, e*G+G)),由各 GPU 的
-    #   初始化者在发布 launch_ready 前写好 map/tile_expert/map_ready,tile_alloc 从 LE*G 起;只有
-    #   溢出组(组号>=1)才远端认领。0 行的 expert 也占满一组(全 pad、source 无效)。
-    #   封尾按 expert×SPL 线程并行(_seal_pad_par、_seal_perm(par=True))。
-    # 两条路径共用:GMM1 按物理组写 h1,封尾额外写逆置换 tile_src_of_dst,stage2 按它间接读 A;
-    # rail 发帖 CTA(ticket _POST_LO.._POST_HI)先发帖、不分 fan token。
+    # split_local selects between two GMM1 paths.
+    # Split: count and group local-source fan1 rows separately from remote-source
+    # fan2 rows. Sealer phase 1 seals local groups after eight local_eos values,
+    # using h1 base 0; phase 2 seals remote groups after all comm_eos values.
+    # Full groups enqueue during fanout, and each sealer phase publishes its tails.
+    # h1_local_eos orders local sealing before final permutation and remote sealing.
+    # fan2_shards: only fanout_shard < fan2_shards handles fan2, using that token
+    # stride. Other fan CTAs enter local GMM1 after fan1, using rail wait time for compute.
+    # lazy_pad: phase 1 publishes h1_local_eos without padding local tail rows;
+    # phase 2 pads them. GMM1 reads A only through bounds-checked tile_row_input.
+    # Before padding, these entries contain valid initial/previous-generation row
+    # IDs. Stage2 discards their h1 values using INVALID_SOURCE and zero weights,
+    # both installed before Stage1 completes.
+    # extra_consumers: tickets 1..COMPUTE_FIRST-1, except the finisher, also enter
+    # GMM1 after fanout. consumer_index remains a bijection over all consumers,
+    # with extra consumers appended after the original range.
+    # Without split: static_g0 fixes expert e's first group at physical group e,
+    # tiles [e*G,e*G+G). Before launch_ready, each GPU initializer sets its map,
+    # tile_expert, and map_ready, and starts tile_alloc at LE*G. Only overflow
+    # groups are claimed remotely. Even a zero-row expert owns one fully padded
+    # group with invalid sources. Seal tails in parallel over expert*SPL threads
+    # using _seal_pad_par and _seal_perm(par=True).
+    # Both paths write h1 by physical group and seal the inverse tile_src_of_dst
+    # map for Stage2's indirect A reads. Rail posting CTAs (_POST_LO.._POST_HI)
+    # post first and do not receive fanout tokens.
     data_send_ctas = int(data_send_ctas)
     if data_send_ctas not in (0, 32, 64):
         raise ValueError("data_send_ctas must be 0, 32 or 64")
-    SEND_FIRST = GPUS_PER_NODE * fanout_shards
+    SEND_FIRST = GPUS_PER_NODE * fanout_ctas_per_dest
     SEND_END = SEND_FIRST + data_send_ctas
     if data_send_ctas and (WAVES != 8 or SEND_END > worker_blocks):
         raise ValueError("copy roles require eight waves and a resident grid")
     F2S = int(fan2_shards)
-    if F2S and F2S > fanout_shards - 1:
-        raise ValueError("fan2_shards must be <= fanout_shards - 1")
+    if F2S and F2S > fanout_ctas_per_dest - 1:
+        raise ValueError("fan2_shards must be <= fanout_ctas_per_dest - 1")
     _FIN_TICKET = local_rank
     _XC = (
         [t for t in range(1, COMPUTE_FIRST) if t != _FIN_TICKET]
         if extra_consumers
         else []
     )
-    # QP q 由 ticket q+1 发帖(T0 不发)。
+    # Ticket q+1 posts QP q; T0 does not post.
     _POST_LO, _POST_HI = 1, RAIL_QPS + 1
-    # 段 1 放在哪个 fan CTA(ticket = 8*_SEG1_SHARD + local_rank)。dest0 的分片号整体减 1、
-    # 发帖 CTA 不分 token,所以这些 rank 要再往后挪一格才在 fan2 池外。
+    # Phase 1 runs on fan ticket 8*_SEG1_SHARD + local_rank. dest0 shard IDs shift
+    # down by one, and posting CTAs have no tokens, so shift those ranks one more
+    # slot to place them outside the fan2 pool.
     _SEG1_SHARD = 1
     if F2S:
         _s1 = F2S + (1 if local_rank == 0 or _POST_LO <= local_rank < _POST_HI else 0)
-        if _s1 < fanout_shards:
+        if _s1 < fanout_ctas_per_dest:
             _SEG1_SHARD = _s1
     if REC_BYTES > record_bytes:
         raise ValueError("rail record does not fit one dispatch_staging record slot")
@@ -306,15 +318,16 @@ def _compile_stage1(
     max_route_tiles = layout.max_route_tiles
     max_tiles_per_expert = layout.max_tiles_per_expert
     GR_N = max_route_tiles // G + 1  # h1_grp_sync words per half (see layout)
-    # GMM1 的 N 块宽 = arena 的 block_n(256;128 在实测的每个 shape 上都更慢)。job 数按 GNB 算。
+    # GMM1 N width is arena.block_n (256; 128 was slower for every tested shape).
+    # Count jobs using GNB.
     GBN = BN
     GNB = (2 * INTER) // GBN
 
     kh_tile = BK if A_DTYPE == "fp8" else BK // 2
     k_tiles_total = k_tiles_total_for(HIDDEN, BK)
-    # LDS 按 GMM1 实际的 M tiling 算,不是 arena 的 tile 粒度:G>1 时
-    # _gemm1_body 以 BM*G 行跑,累加器要 BM*G*BN*4 字节。按 BM 算会
-    # 静默写越界(G=2 实测 relL2=1.55)。
+    # Size LDS for GMM1's actual M tile, not the arena tile. With G>1, _gemm1_body
+    # processes BM*G rows and needs BM*G*BN*4 accumulator bytes. Sizing for BM
+    # silently writes out of bounds (measured relL2=1.55 at G=2).
     _, _, _, lds_bytes = _bm_constants(GBM, BN, kh_tile, k_tiles_total)
     assert lds_bytes % 16 == 0
     NC_MBOX_DW = lds_bytes // 4  # Ready-queue job broadcast after all GEMM1 LDS.
@@ -371,9 +384,10 @@ def _compile_stage1(
     class SharedStorage:
         raw: fx.Array[fx.Uint8, lds_alloc_bytes, 16]
 
-    # 名字只带随 shape / tune 表变化的编译期参数;写死的开关不进名字。
-    # split_local 一项代表它那一整套配套开关(early local GMM / fan2 / lazy pad /
-    # extra consumers,或并行封尾 / static g0)。
+    # Names include only compile-time parameters that vary by shape or tune table.
+    # Fixed switches are omitted. split_local represents its associated switches:
+    # early local GMM, fan2, lazy padding, and extra consumers, or parallel sealing
+    # and static group 0.
     kernel_name = (
         f"megamoe_stage1_{activation}"
         + (
@@ -392,13 +406,13 @@ def _compile_stage1(
         + f"_cf{COMPUTE_FIRST}"
         + (f"_bm{BM}" if BM != 32 else "")
         + (f"_tg{G}" if G != 1 else "")
-        + (f"_fos{fanout_shards}" if fanout_shards != 1 else "")
+        + (f"_fos{fanout_ctas_per_dest}" if fanout_ctas_per_dest != 1 else "")
         + (f"_ds{data_send_ctas}_wtpub" if data_send_ctas else "")
         + ("_slg" if split_local else "_nsl")
         + (f"_w{WAVES}" if WAVES != 4 else "")
         + ("_gr" if group_ready else "")
         + ("_rq_bounded_ac1_mgloop_c1" if ready_q else "")
-        # rail 的 CQ 轮询按 CCQE 模式编译
+        # Compile rail CQ polling in CCQE mode.
         + ("_ccqe" if _rail_ccqe() else "")
     )
 
@@ -421,9 +435,9 @@ def _compile_stage1(
         if const_expr(lds_raw is None):
             lds_raw = fx.SharedAllocator().allocate(SharedStorage).peek().raw.ptr
         arena_window = cco.Window(arena_win)
-        # cco_lsa_ptr(w, peer, off) = winBase + peer*(stride4G<<32) + off:
-        # 每次调用都要从 window 结构里重新读两个字段(ATT 里 ~6.5% 的 route 时间)。
-        # 入口算一次基址和对端步长,之后对端地址只剩整数运算。
+        # cco_lsa_ptr(w, peer, off) = winBase + peer*(stride4G<<32) + off.
+        # Each call reloads two window fields (~6.5% of routing time in ATT).
+        # Cache the base and peer stride at entry; later peer addresses use integer arithmetic.
         arena_lsa_base = fx.Int64(arena_window.lsa_ptr(fx.Int32(0), fx.Int64(0)))
         arena_lsa_stride = (
             fx.Int64(arena_window.lsa_ptr(fx.Int32(1), fx.Int64(0))) - arena_lsa_base
@@ -446,9 +460,9 @@ def _compile_stage1(
             fx.ptr_store(Vec.from_elements([ticket_lane], fx.Int64), ticket_ptr)
         gpu.barrier()
         ticket64 = Vec(ticket_view.load())[0]
-        # generation 在 device 上从到达票推出来(CUDA graph replay 时 host 参数
-        # 是冻结的):entry_count 每个 CTA 加一,每次 forward 恰好一次 launch、
-        # worker_blocks 个 CTA。
+        # Derive generation on device from entry tickets because CUDA graph replay
+        # freezes host arguments. Each CTA increments entry_count once; each forward
+        # launches this kernel once with worker_blocks CTAs.
         generation = ticket64 // fx.Int64(worker_blocks) + fx.Int64(1)
         parity = fx.Int64(generation & fx.Int64(1))
         control_generation = generation
@@ -476,15 +490,16 @@ def _compile_stage1(
         is_cco = ticket == fx.Int32(CCO_TICKET)
         is_comm = ticket < fx.Int32(COMM_CTAS)
 
-        # spin_relaxed:轮询用 relaxed load,循环外补一次 acquire(调用方负责)。
+        # spin_relaxed uses relaxed polling; the caller performs one acquire afterward.
         _pl32 = comm.load_i32_global_system_relaxed
         _spin = comm.spin_until_ge_i64_system_rx
 
         def _cta_acquire():
-            """自旋之后整个 CTA 的 system acquire:barrier → 只由 wave0 做(一次 buffer_inv)→ barrier。
+            """Acquire for the whole CTA after polling: barrier, wave0 acquire, barrier.
 
-            vL1D 每 CU 一份、L2 每 XCD 一份,一次失效覆盖整个 CTA(原来 4 个 wave 各失效一次)。
-            第二个 barrier 保证其它 wave 的后续读在失效之后;先 barrier 是因为有的点每个 wave 各自自旋。
+            vL1D is shared per CU and L2 per XCD, so one buffer_inv covers the entire CTA
+            instead of one per wave. The second barrier orders other waves' reads after
+            invalidation. The first is needed where waves finish polling independently.
             """
             gpu.barrier()
             if wave == fx.Int32(0):
@@ -492,11 +507,12 @@ def _compile_stage1(
             gpu.barrier()
 
         def _rail_post(post_qp, with_credit):
-            """rail_soa:一个 wave 为 QP post_qp 发它那段 token 的 record。
+            """Post QP post_qp's token records from one wave using rail_soa.
 
-            整段一个 PUT + 本 QP 负责的 ready 字 + 一次门铃,不等完成;请求存进
-            remote_chunk_request[post_qp] 由发起方稍后回收。with_credit:先等本 QP
-            在 g-2(同 parity)的 credit(T0 自己在外面统一等过)。
+            Issue one PUT for the segment, this QP's ready words, and one doorbell without
+            waiting. Save the request in remote_chunk_request[post_qp] for later reaping.
+            with_credit waits for this QP's generation g-2 credit on the same parity;
+            T0 has already waited for all credits outside this helper.
             """
             src_base = fx.Int64(off("dispatch_staging"))
             comm.fence_system_release()
@@ -529,8 +545,8 @@ def _compile_stage1(
                     fx.Int64(nr * fx.Int32(REC_BYTES)),
                     aggregate=True,
                 )
-            # 消费者只等 chunk 0 的 num_qp 个 ready 字;每个 QP 至少置一个且在
-            # 自己的数据之后(同 QP 内有序)⇒ 全部数据已到。
+            # Consumers wait only for chunk 0's num_qp ready words. Each QP publishes at
+            # least one ready word after its ordered data writes, so all data has arrived.
             for w in range_constexpr(layout.num_qp):
                 if post_qp == fx.Int32(w % RAIL_QPS):
                     _rail.put_value(
@@ -550,9 +566,9 @@ def _compile_stage1(
                     request,
                 )
 
-        # 角色到达计数。kernel 挂死时 host 读不到任何"完成后"的东西,但 CCO
-        # window 的 local_ptr 是 host 可读的 —— 所以把计数直接打进 arena,
-        # host 在 launch 之后不同步地轮询读,就能看出哪个角色一个 CTA 都没到。
+        # Role arrival counters remain host-readable through the CCO window's local_ptr
+        # even if the kernel hangs. Write them directly into the arena so the host can
+        # poll after launch without synchronizing and identify roles with no arriving CTA.
 
         # Owner initializes only counters/metadata.  Payload and generation
         # arrays are overwrite-before-publish and never need a hot-path memset.
@@ -590,13 +606,13 @@ def _compile_stage1(
                     buffer_ops.buffer_store(fx.Int32(0), _jh_res, fx.Int32(0))
                     buffer_ops.buffer_store(fx.Int32(0), _jh_res, fx.Int32(16))
                     if const_expr(ready_q):
-                        # word 8 = 就绪队列写入位置,word 9 = 消费者领 job 头。
+                        # word 8: ready queue write head; word 9: consumer job claim head.
                         buffer_ops.buffer_store(fx.Int32(0), _jh_res, fx.Int32(8))
                         buffer_ops.buffer_store(fx.Int32(0), _jh_res, fx.Int32(9))
                 if ntokens != fx.Int32(MAX_TOKENS):
                     comm.atomic_add_system(error_addr, fx.Int32(1))
             if const_expr(static_g0):
-                # 静态第 0 组:上面 tx0 刚把 tile_alloc 清零(同线程程序序在前),这里改成 LE*G。
+                # Static group 0: tx0 just cleared tile_alloc in this thread; now set it to LE*G.
                 if tx == fx.Int32(0):
                     buffer_ops.buffer_store(
                         fx.Int32(LOCAL_EXPERTS * G),
@@ -626,8 +642,9 @@ def _compile_stage1(
                         fx.Int64(generation),
                     )
                 if const_expr(tile_ready):
-                    # 组到达计数、预约计数(word0..7 本 rank 各 dest 的 fan CTA 完成数,word16 来源数)、
-                    # 静态组的 expert id;都在 launch_ready 发布前清好。
+                    # Clear group arrival and reservation counts before publishing launch_ready.
+                    # Words 0..7 count this rank's completed fan CTAs by destination; word 16 counts
+                    # sources. Also initialize the static groups' expert IDs.
                     tr_done = buffer_ops.create_buffer_resource_from_addr(
                         local_addr("tile_row_done")
                     )
@@ -653,7 +670,7 @@ def _compile_stage1(
                                 tr_e,
                             )
             if const_expr(ready_q and not tile_ready):
-                # 组到达计数:launch_ready 发布前清零(dispatch 等 dest 的 launch_ready 后才原子加)。
+                # Clear group arrivals before launch_ready; dispatch waits for it before atomics.
                 rq_done = buffer_ops.create_buffer_resource_from_addr(
                     local_addr("tile_row_done")
                 )
@@ -668,7 +685,8 @@ def _compile_stage1(
                 if tx < fx.Int32(2 * GPUS_PER_NODE):
                     jd = tx % fx.Int32(GPUS_PER_NODE)
                     jn = (jd == fx.Int32(0)).select(
-                        fx.Int32(fanout_shards - 1), fx.Int32(fanout_shards)
+                        fx.Int32(fanout_ctas_per_dest - 1),
+                        fx.Int32(fanout_ctas_per_dest),
                     )
                     buffer_ops.buffer_store(
                         jn,
@@ -681,7 +699,7 @@ def _compile_stage1(
             gpu.barrier()
             if tx == fx.Int32(0):
                 comm.fence_system_release()
-                # pub_relaxed:一次 fence 放行全部清零,两条门值不必各自再做整 L2 写回。
+                # pub_relaxed: one fence publishes all clears, avoiding an L2 writeback per gate store.
                 _pub_st = comm.store_i64_global_system_relaxed
                 _pub_st(
                     arena_ptr + fx.Int64(off("epoch_gate")),
@@ -695,37 +713,37 @@ def _compile_stage1(
                     control_generation,
                 )
             _cta_acquire()
-        # 目的端预计算放置 —— 第 1 步:算计数并交换。
+        # Destination placement, step 1: compute and exchange counts.
         #
-        # 计数只依赖 topk_ids,kernel 入口就有,所以整个 plan 可以和量化
-        # (实测 ~93us)并行跑完;payload 阶段拿到的就是纯算术偏移,不再需要
-        # 每条 route 一次跨设备原子(现状是 expert_count 原子 + tile 认领/自旋)。
+        # Counts depend only on topk_ids, available at entry. The plan can run alongside
+        # quantization (~93us measured), leaving arithmetic offsets for payload transfer
+        # instead of per-route cross-device expert_count atomics and tile claims/spins.
         #
-        # node 间只有 rail 一条路,所以只让**计数**过一跳 rail:发给同序号
-        # 伙伴,由它在自己 node 内散给 8 个目的端。行基址完全不过 rail ——
-        # 目的端把它留在自己 arena 里,node 内的推送方和 rail 转发方都直接
-        # LSA 读,于是远端源根本不需要知道行基址,省掉了回程那一跳。
+        # Inter-node traffic uses the rail. Send only counts to the same-index peer,
+        # which fans them out to eight destinations on its node. Destinations keep
+        # row bases in their own arenas, readable via LSA by local producers and rail
+        # forwarders. Remote sources need no row bases, eliminating the return rail hop.
         #
-        # 计数不需要清零:每个源只写自己那一行,再把 plan_count_ready[src]
-        # 置成 generation,目的端等 `== generation`,天然免疫上一代的残留。
-        # A bounded producer CTA pool owns tokens in a strided schedule.  At
-        # capacity 128 this is identical to the historical one-CTA-per-token
-        # mapping; larger capacities reuse the same resident CTA for later
-        # tokens instead of increasing the resident grid.
-        # split fanout 原先把 token 直接写成 ticket,循环每轮重搬同一个
-        # token:512 个只落 128 个,且从 ticket 起算(token 0..7 无人写)。
-        # 那是 MORI「128 token / 一 CTA 一 token / 单轮」的形状。
-        # Four waves own four QPs.  Each chunk is one aggregate PUT per QP plus
-        # a trailing ready value and one flush/doorbell.  The same CTA receives
-        # the reciprocal chunk and performs selected-rank proxy fan-out.
+        # Counts need no clearing: each source owns its row and publishes generation
+        # in plan_count_ready[src]. Destinations wait for equality with generation,
+        # so stale previous-generation counts cannot satisfy the wait.
+        # A bounded producer CTA pool owns tokens in a strided schedule. At capacity
+        # 128 this matches the historical one-CTA-per-token mapping; larger capacities
+        # reuse resident CTAs for later tokens rather than growing the grid.
+        # The original split fanout used ticket as the token every iteration, writing
+        # only 128 of 512 tokens and skipping tokens 0..7. That mapping assumed MORI's
+        # 128-token, one-CTA-per-token, single-iteration shape.
+        # Four waves own four QPs. Each chunk is one aggregate PUT per QP plus a
+        # trailing ready value and one flush/doorbell. The same CTA receives the
+        # reciprocal chunk and performs selected-rank proxy fanout.
         if is_cco:
             # One wave per QP; with more waves than QPs the extra waves repeat
             # a QP's waits (reads only).
             qp = wave % fx.Int32(layout.num_qp) if WAVES > layout.num_qp else wave
 
-            # credit_async:对端对 g-2(同 parity)那批数据的消费确认改到
-            # 这里等 —— 只有覆盖对端同一块 remote_dispatch_rx 之前才需要。
-            # 本 kernel 末尾不再等对端 credit(那要等对端整个 fan2 做完)。
+            # credit_async waits here for the peer's generation g-2 consumption credit,
+            # just before overwriting the same remote_dispatch_rx parity plane.
+            # Do not wait at kernel exit, which would require all peer fan2 work to finish.
             if lane == fx.Int32(0):
                 for cchunk in range(
                     fx.Int32(0), fx.Int32(dispatch_chunks), fx.Int32(1)
@@ -735,18 +753,17 @@ def _compile_stage1(
                         + fx.Int64(cchunk * fx.Int32(layout.num_qp) + qp) * fx.Int64(8),
                         generation - fx.Int64(2),
                     )
-            # rail_soa:发送源是 k1 之前的 rail_record_quant 直接写进注册窗口
-            # (dispatch_staging 的 parity-0 平面)的 token 连续 record
-            # [q|scale|ids|weights|pad],REC 字节/token。每个 QP 负责一段连续
-            # token,整段一个 PUT + 一个 ready 字 + 一次门铃,不等完成(请求在
-            # 末尾 credit 段回收)。WQE 的投递成本 ~15µs 与大小无关(TS3/TS5),
-            # 所以不再按字段拆 PUT。发送源单缓冲:本次 PUT 在本 kernel 末尾等掉,
-            # 下一次量化在其后。
-            # QP 由 ticket 1..RAIL_QPS 的发帖 CTA 发(见 fanout 入口),T0 不发。
+            # rail_soa reads contiguous [q|scale|ids|weights|pad] records, REC bytes/token,
+            # written by rail_record_quant into dispatch_staging's registered parity-0 plane.
+            # Each QP sends one contiguous token segment: one PUT, one ready word, and one
+            # doorbell. Reap requests at the final credit phase. WQE posting costs ~15us
+            # independent of size (TS3/TS5), so avoid separate PUTs by field.
+            # The source is single-buffered: complete this PUT at kernel exit before the
+            # next quantization. Tickets 1..RAIL_QPS post QPs at fanout entry; T0 does not.
             comm.fence_system_release()
 
-            # 全部发完之后一次性等齐,acquire fence 在批边界做一次。
-            # rail_soa 只置 chunk 0 的 ready 字。
+            # After posting all transfers, wait for the batch with one acquire fence.
+            # rail_soa publishes only chunk 0 ready words.
             if lane == fx.Int32(0):
                 _spin(
                     local_addr("remote_chunk_ready") + fx.Int64(qp) * fx.Int64(8),
@@ -757,15 +774,15 @@ def _compile_stage1(
             rx_all = buffer_ops.create_buffer_resource_from_addr(
                 local_addr("remote_dispatch_rx")
             )
-            # agent: CCO CTA用256线程跨步解析全部远端token；capacity大于
-            # THREADS时不能只处理首批256条record。
+            # agent: the 256-thread CCO CTA parses all remote tokens with a strided loop.
+            # Capacities above THREADS must process more than the first 256 records.
             for token in range(tx, ntokens, fx.Int32(THREADS)):
                 remote_record_available = fx.Int32(1)
                 remote_slot_mask = fx.Int32(0)
                 if remote_record_available != fx.Int32(0):
-                    # token 每 lane 不同:描述符必须是标量,按 token 建描述符会被
-                    # 编译成 readfirstlane 瀑布循环(ATT5:每次 load 最多 64 轮,
-                    # T0 在这里耗 ~230k 周期)。整个 rx 区一个描述符 + lane 偏移。
+                    # Token IDs vary by lane, but descriptors must be scalar. Per-token descriptors
+                    # generate readfirstlane waterfall loops (ATT5: up to 64 iterations per load,
+                    # ~230k T0 cycles here). Use one RX descriptor with lane-specific offsets.
                     record_dword = token * fx.Int32(REC_BYTES // 4) + fx.Int32(
                         REC_I // 4
                     )
@@ -810,7 +827,7 @@ def _compile_stage1(
             )
 
         def _tr_resv_signal(dest, cnt):
-            """tile_ready:本 CTA 对 dest 的预约(P2)全部完成;本 rank 对 dest 的最后一个 fan CTA 通知 dest。"""
+            """Publish tile_ready after P2 completes for this rank's last fan CTA to dest."""
             tr_prev = fx.Int32(
                 comm.atomic_add_agent(
                     local_addr("gmm1_job_head") + fx.Int64(dest) * fx.Int64(4),
@@ -827,8 +844,9 @@ def _compile_stage1(
                 )
 
         def _rq_push(dest, pg):
-            """ready_q:把 dest 上的物理组 pg 追加进它的就绪队列(调用方保证组内数据已落地)。
-            dest=None:本 GPU。"""
+            """Append physical group pg to dest's ready queue after its data is visible.
+            dest=None selects this GPU.
+            """
             rq_h = (
                 local_addr("gmm1_job_head")
                 if dest is None
@@ -853,8 +871,10 @@ def _compile_stage1(
             return valid.select(value, fx.Int64(0))
 
         def _rq_seal_tails(EO):
-            """ready_q 封尾:本类(EO=0 本地 / LE 远端)每个 expert 的不满尾组入队(满组已在
-            dispatch 里入过)。调用方已 acquire 到本类的全部到达(计数为终值)。"""
+            """Enqueue each expert's partial tail group for EO=0 (local) or EO=LE (remote).
+            Dispatch already enqueued full groups. The caller has acquired all arrivals
+            for this segment, so counts are final.
+            """
             if tx < fx.Int32(LOCAL_EXPERTS):
                 rq_c = buffer_ops.buffer_load(
                     buffer_ops.create_buffer_resource_from_addr(
@@ -885,7 +905,7 @@ def _compile_stage1(
                     _rq_push(None, rq_pg)
 
         def _alloc_tiles_for(count):
-            """一个 expert 实际被分配的 tile 数(向上取整到 G 的倍数)。"""
+            """Return an expert's allocated tile count, rounded up to a multiple of G."""
             n = (count + fx.Int32(BM - 1)) // fx.Int32(BM)
             if const_expr(G > 1):
                 n = ((n + fx.Int32(G - 1)) // fx.Int32(G)) * fx.Int32(G)
@@ -894,12 +914,11 @@ def _compile_stage1(
             return n
 
         def _claim_tile_group(dest, map_index, local_expert, map_ready):
-            """一次认领 G 个物理相邻 tile,发布 G 个 map 槽,返回组首 physical。
+            """Claim G adjacent physical tiles, publish G map slots, and return the base.
 
-            tile_alloc 每次固定加 G,所以返回值必然是 G 的倍数 —— 这正是
-            GMM1 能把 [base, base+G) 当作一个 BM*G 行 m_block 的前提。
-            组内后续 logical tile 的首行会落到 else 分支上自旋等 map_ready,
-            和原来「非首行等首行」的路径完全一致。
+            tile_alloc always increments by G, so bases are G-aligned. GMM1 can therefore
+            treat [base,base+G) as one BM*G-row m_block. Later logical tiles in the group
+            wait for map_ready in the else branch, as non-first rows did previously.
             """
             base = fx.Int32(
                 comm.atomic_add_system(_peer_addr(dest, "tile_alloc"), fx.Int32(G))
@@ -922,7 +941,7 @@ def _compile_stage1(
                     local_expert, expert_res, phys, cache_modifier=_WT_META
                 )
             if const_expr((tile_ready or ready_q) and G > 1):
-                # ready_q:local_expert 已是本类(本地/远端)内的 expert 号,GMM1 按它取权重。
+                # local_expert is relative to the local/remote segment; GMM1 uses it for weights.
                 buffer_ops.buffer_store(
                     local_expert,
                     buffer_ops.create_buffer_resource_from_addr(
@@ -932,36 +951,39 @@ def _compile_stage1(
                     cache_modifier=_WT_META,
                 )
             if const_expr(fan_wt):
-                # 上面全是写穿:等它们完成即对端可见,不必整 L2 写回。
+                # These stores are write-through; completion makes them peer-visible without an L2 writeback.
                 fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
             for j in range_constexpr(G):
-                # claim_relaxed:上面一次 fence 已放行 map/tile_expert,G 条 release store 各带一次整 L2 写回。
+                # claim_relaxed: one fence already publishes map/tile_expert; G release stores
+                # would each trigger a full L2 writeback.
                 (comm.store_i64_global_system_relaxed)(
                     map_ready + fx.Int64(j * 8), generation
                 )
             return base
 
-        # route_gbatch:照 MegaMoEv2 emit_dispatch_group 的领位方式。一个 CTA 一批
-        # _GB_NB = THREADS/TOPK 个 token,每线程一个 (token, slot);LDS 原子给片内
-        # 序号,每个 (dest, expert) 只做一次 system 原子领一段连续行,段内若含组头
-        # 就由领段的线程认领整组。ATT12:逐 record 路径 72% 周期是 s_barrier 陪等
-        # 单线程串行链(mask 16 次串行 load、A1 原子、A2 map_ready)。
-        # 每批 4 个 barrier;批末不需要 barrier:下一批 P0/P1 只写 CNT/HIT,
-        # 它们的读者(P2/P3)都在本批 P3 末的 barrier 之前;P4 只读 ROW,
-        # 而 ROW 只在下一批 P3 写,中间隔着三个 barrier。
-        # 每批 token 数:受 THREADS//TOPK(每线程一个 (token, slot))和 GROUP_ROWS(一批每
-        # expert 最多跨一个组头)两头限制,并取 WAVES 的倍数(P3 按 wave 均分 record)。
-        # TOPK 不整除 THREADS 时末尾 THREADS-_GB_LANES 个线程在 P1 里不参与。
+        # route_gbatch follows MegaMoEv2 emit_dispatch_group. Each CTA batches
+        # _GB_NB=THREADS/TOPK tokens, one (token, slot) per thread. LDS atomics assign
+        # batch-local positions; one system atomic per (dest, expert) reserves a
+        # contiguous row segment. Its owner claims any group head in that segment.
+        # In ATT12, per-record routing spent 72% of cycles at s_barrier waiting for a
+        # serial chain: 16 mask loads, the A1 atomic, and A2 map_ready.
+        # There are four barriers per batch; no final barrier is needed. Next-batch
+        # P0/P1 writes only CNT/HIT, whose P2/P3 readers precede this batch's P3 barrier.
+        # P4 reads ROW, which next-batch P3 overwrites only after three barriers.
+        # Limit batch tokens by THREADS//TOPK and GROUP_ROWS, so an expert crosses at
+        # most one group head. Round to a multiple of WAVES for even P3 record assignment.
+        # When TOPK does not divide THREADS, the last THREADS-_GB_LANES threads skip P1.
         _GB_NB = min(THREADS // TOPK, GROUP_ROWS) // WAVES * WAVES
         _GB_LANES = _GB_NB * TOPK
-        # weights 相对 ids 的 dword 距离:record 内是 16B 补齐后的 REC_W-REC_I,
-        # ids_first 的连续 [ids|weights] 数组里是 TOPK。
+        # Dword distance from IDs to weights: (REC_W-REC_I) after record alignment,
+        # or TOPK in the contiguous ids_first [ids|weights] array.
         _GB_WDW_REC = (REC_W - REC_I) // 4
         _GB_CNT = 16
         _GB_BASE = _GB_CNT + LOCAL_EXPERTS
         _GB_HIT = _GB_BASE + LOCAL_EXPERTS
         _GB_PH = _GB_HIT + _GB_NB
-        # meta_opt:本 CTA 在 P2 自己认领的组(组号, 物理基址),解析时不必远端查。
+        # meta_opt caches (group ID, physical base) for groups this CTA claimed in P2.
+        # Parsing can then avoid remote map lookups.
         _GB_OWN = _GB_PH + 2 * LOCAL_EXPERTS
         _GB_OWNB = _GB_OWN + LOCAL_EXPERTS
         _GB_UNITS = payload_dwords // 4
@@ -997,11 +1019,11 @@ def _compile_stage1(
             resv_last=None,
             resv_n=None,
         ):
-            # rs:AoS record 描述符(每 token REC_BYTES);本批 token = tok0 + r*tstride。
-            # split_local 下远端来源(remote=True)用 expert_count/map 的后半 [LE,2LE):
-            # 与本地来源分开计数、分开成组;物理 tile 仍从同一个 tile_alloc 认领。
+            # rs describes REC_BYTES-byte AoS records; batch token IDs are tok0+r*tstride.
+            # In split_local, remote=True uses expert_count/map's [LE,2LE) half, counting
+            # and grouping separately from local rows while sharing the same tile_alloc.
             _EO = LOCAL_EXPERTS if (split_local and remote) else 0
-            # P0:清本批计数和 token 命中标记。
+            # P0: clear batch counts and token hit flags.
             if tx < fx.Int32(LOCAL_EXPERTS):
                 _gb_st(fx.Int32(_GB_CNT) + tx, fx.Int32(0))
             if (tx >= fx.Int32(LOCAL_EXPERTS)) & (
@@ -1009,17 +1031,17 @@ def _compile_stage1(
             ):
                 _gb_st(fx.Int32(_GB_HIT - LOCAL_EXPERTS) + tx, fx.Int32(0))
             gpu.barrier()
-            # P1:每线程一个 (token, slot),命中本 dest 的取片内序号。
+            # P1: one (token, slot) per thread; assign a batch-local position for hits on dest.
             r = tx // fx.Int32(TOPK)
             slot = tx % fx.Int32(TOPK)
             tok = tok0 + r * tstride
             live = tok < ntokens
             if const_expr(_GB_LANES < THREADS):
-                # 多出的线程 r == _GB_NB 会落到下一批的 token 上,必须整体失效。
+                # Extra threads with r == _GB_NB point into the next batch and must be invalidated.
                 live = live & (tx < fx.Int32(_GB_LANES))
             rec_dw = live.select(tok, fx.Int32(0)) * fx.Int32(REC_BYTES // 4)
-            # ids 的 dword 基址:record 内的 REC_I,或 ids_first 的连续数组(每 token
-            # [ids|weights])。weights 在其后 _gb_wdw 个 dword(record 内 ids 段 16B 补齐)。
+            # ID dword base: REC_I in records, or token*[ids|weights] in ids_first storage.
+            # Weights follow by _gb_wdw dwords; record IDs are padded to 16B.
             id0 = rec_dw + fx.Int32(REC_I // 4)
             _gb_wdw = _GB_WDW_REC
             expert = buffer_ops.buffer_load(rs, id0 + slot, vec_width=1, dtype=T.i32)
@@ -1036,9 +1058,9 @@ def _compile_stage1(
                 )
                 _gb_st(fx.Int32(_GB_HIT) + r, fx.Int32(1))
             if const_expr(emit_masks):  # noqa: SIM102
-                # 原 producer 循环唯一有用的产出:stage2 的本地平面掩码(每 token 一次,
-                # 语义与原 producer 逐字相同)。dest0 的分片合起来恰好覆盖全部 token。
-                # stage2 在 k2 之后跑,流序即可见,不需要 fence。
+                # Retain the original producer loop's Stage2 local-plane mask, once per token
+                # with identical semantics. dest0 shards collectively cover all tokens.
+                # Stage2 runs after k2 on the same stream, so no fence is needed.
                 if (dest == fx.Int32(0)) & (slot == fx.Int32(0)) & live:
                     m_lslot = fx.Int32(0)
                     m_err = fx.Int32(0)
@@ -1061,7 +1083,8 @@ def _compile_stage1(
                         fx.Int32(node * MAX_TOKENS) + tok,
                     )
             gpu.barrier()
-            # P2:每 expert 一次 system 原子领段;段内的组头由本线程认领(不等任何东西)。
+            # P2: reserve one segment per expert with a system atomic. This thread claims
+            # any group heads in its segment without waiting.
             if tx < fx.Int32(LOCAL_EXPERTS):
                 n = _gb_ld(fx.Int32(_GB_CNT) + tx)
                 if n > fx.Int32(0):
@@ -1095,12 +1118,12 @@ def _compile_stage1(
                         head += fx.Int32(GROUP_ROWS)
             gpu.barrier()
             if const_expr(tile_ready and resv_last is not None):  # noqa: SIM102
-                # P2 的系统原子都已返回(上面的 barrier 前);fan2 最后一批之后不会再有预约。
+                # P2 system atomics completed before the barrier. No reservations follow fan2's last batch.
                 if resv_last & (tx == fx.Int32(0)):
                     _tr_resv_signal(dest, resv_n)
-            # P3:命中线程等 map_ready、写元数据;然后每个 wave 拷自己那几个 record 的 payload。
-            # 先发出本 wave 全部 record 的 payload/scale load(与下面的组基址解析重叠),
-            # 解析完再统一 store。
+            # P3: hit threads wait for map_ready and write metadata; each wave copies its records.
+            # Issue all payload/scale loads for the wave first, overlapping group-base
+            # resolution, then store the results after resolution completes.
             _pl = []
 
             def _issue_payload_loads():
@@ -1131,11 +1154,12 @@ def _compile_stage1(
 
             if const_expr(not data_send_ctas):
                 _issue_payload_loads()
-            # 每 expert 一个线程解析本批段落 [seg, seg+n) 涉及的至多 2 个组的物理基址
-            # (组头认领都已在 P2 完成,这里只等不认领)。逐行的远端 map 读没了。
-            # 每 expert 两个线程并发解析(j=0 首组,j=1 末组);末组与首组相同时 j=1 不做。
-            # 本 CTA 在 P2 认领的组直接用 LDS 里的基址,只有别人认领的组才远端等+读。
-            # 最坏由 4 次串行远端往返降到 2 次;认领都在 P2 完成,这里只等不认领。
+            # Resolve physical bases for at most two groups covered by [seg,seg+n).
+            # P2 already claimed group heads, so this phase only waits, avoiding per-row
+            # remote map reads. Two threads per expert resolve the first/last groups;
+            # skip j=1 when both are the same. For groups this CTA claimed in P2, use
+            # cached LDS bases; only other CTAs' groups require remote waits and reads.
+            # This reduces worst-case serial remote round trips from four to two.
             if tx < fx.Int32(2 * LOCAL_EXPERTS):
                 mo_e = tx % fx.Int32(LOCAL_EXPERTS)
                 mo_j = tx // fx.Int32(LOCAL_EXPERTS)
@@ -1147,7 +1171,7 @@ def _compile_stage1(
                     gidx = (mo_j == fx.Int32(0)).select(g_first, g_last)
                     if (mo_j == fx.Int32(0)) | (g_last != g_first):
                         ph = fx.Int32(0)
-                        # static_g0:第 0 组的物理基址是 e*G,不等也不读远端 map
+                        # static_g0 fixes the first group's base at e*G, without remote map reads or waits.
                         sg_hit = gidx == fx.Int32(-1)
                         if const_expr(static_g0):
                             sg_hit = gidx == fx.Int32(0)
@@ -1261,9 +1285,9 @@ def _compile_stage1(
             if const_expr(data_send_ctas):
                 _send_enqueue(tok0, tstride, dest, src_base, remote)
             elif const_expr(tile_ready or ready_q):
-                # 本批的行元数据/载荷(各 wave 的远端 store)落地后,按组报到达行数。
-                # 段 [seg, seg+n) 至多跨 2 个组(_GB_PH 只解析首/末组,同一前提)。
-                # ready_q:把组凑满(到达 GROUP_ROWS)的那次原子的发起者负责入队。
+                # Report group arrivals after all waves' remote metadata/payload stores complete.
+                # [seg,seg+n) spans at most two groups, as assumed by _GB_PH's first/last resolution.
+                # The atomic that reaches GROUP_ROWS is responsible for enqueueing the group.
                 fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
                 gpu.barrier()
                 if tx < fx.Int32(LOCAL_EXPERTS):
@@ -1601,14 +1625,17 @@ def _compile_stage1(
                                 _send_join_done(dest, True)
                         _send_join_done(dest)
 
-        # early_local_gmm:封尾的 pad/组表按 expert×SPL 线程并行(原来每 expert 一个线程串行,
-        # F8T2 段 1 pad ~12µs、组表+发布 ~11µs,且在本地 GMM1 的关键路径上)。
+        # early_local_gmm seals padding and group maps over expert*SPL threads instead
+        # of serially per expert. F8T2 phase 1 padding took ~12us and map/publication
+        # ~11us, both on local GMM1's critical path.
         SPL = max(1, min(8, THREADS // max(1, LOCAL_EXPERTS)))
 
         def _seal_pad_par(EO):
-            """_seal_pad 的并行版,只用于不 split 的路径(lite_sync、static_g0)。
-            线程 (e, l):expert e 的每个 pad tile 里第 l, l+SPL, ... 行。
-            sealer 已 acquire 全部 comm_eos,map 都已发布,不再逐 tile 自旋 map_ready。"""
+            """Parallel _seal_pad for the non-split path (lite_sync, static_g0).
+            Thread (e,l) handles rows l,l+SPL,... of each padded tile for expert e.
+            The sealer has acquired all comm_eos values, so maps are published and
+            per-tile map_ready polling is unnecessary.
+            """
             expert_count = buffer_ops.create_buffer_resource_from_addr(
                 local_addr("expert_count")
             )
@@ -1644,7 +1671,8 @@ def _compile_stage1(
                     fallback_input = buffer_ops.buffer_load(
                         inputs, head_physical * fx.Int32(BM), vec_width=1, dtype=T.i32
                     )
-                    # static_g0:0 行的 expert 首行从未写过:pad 指向第 0 个 source 行(source 无效,结果不被读)
+                    # static_g0: a zero-row expert has no first row. Point padding at source row 0;
+                    # its source is invalid, so the computed result is never consumed.
                     fallback_input = (count > fx.Int32(0)).select(
                         fallback_input, fx.Int32(0)
                     )
@@ -1658,7 +1686,7 @@ def _compile_stage1(
                         buffer_ops.buffer_store(fx.Float32(0.0), weights, dst)
 
         def _seal_pad(EO):
-            """补齐 expert_count[EO:EO+LE] 这一类行的尾 tile/空 tile(EO=0 本地或全部,EO=LE 远端)。"""
+            """Pad tail/empty tiles for expert_count[EO:EO+LE], EO=0 local/all or EO=LE remote."""
             expert_count = buffer_ops.create_buffer_resource_from_addr(
                 local_addr("expert_count")
             )
@@ -1666,8 +1694,8 @@ def _compile_stage1(
                 count = buffer_ops.buffer_load(
                     expert_count, tx + fx.Int32(EO), vec_width=1, dtype=T.i32
                 )
-                # G>1 时一个 expert 认领的 tile 数被抬到 G 的倍数,所以要补的
-                # 不只是最后一个真实 tile 的尾巴,还有整组里多出来的空 tile。
+                # With G>1, allocated tiles round up to a multiple of G. Pad both the last
+                # real tile's tail rows and any extra empty tiles in the group.
                 real_tiles = (count + fx.Int32(BM - 1)) // fx.Int32(BM)
                 alloc_tiles = (
                     (real_tiles + fx.Int32(G - 1)) // fx.Int32(G)
@@ -1698,10 +1726,9 @@ def _compile_stage1(
                     weights = buffer_ops.create_buffer_resource_from_addr(
                         local_addr("tile_row_weight")
                     )
-                    # fallback 取本 expert 第 0 个 tile 的第 0 行:整组多出来的
-                    # 空 tile 自己的第 0 行从来没有到达过,不能拿它当 fallback。
-                    # 走到这里 count>0(否则 alloc_tiles==0,循环为空),所以
-                    # logical tile 0 一定存在且已填。
+                    # Use row 0 of this expert's first tile as fallback. Extra empty tiles never
+                    # received their own row 0. Here count>0; otherwise alloc_tiles is zero and
+                    # the loop is empty. Logical tile 0 therefore exists and is populated.
                     head_physical = buffer_ops.buffer_load(
                         tile_map_res,
                         (tx + fx.Int32(EO)) * fx.Int32(max_tiles_per_expert),
@@ -1724,11 +1751,14 @@ def _compile_stage1(
                         buffer_ops.buffer_store(fx.Float32(0.0), weights, dst)
 
         def _seal_perm(segs, base_segs, check_tiles, publish_seg, par=False):
-            """expert-major 置换。segs:每个 expert 依次拼接的 map 行段(0=本地/全部,
-            LE=远端);base_segs:排在整个视图前面的段(split_local 非 h1_phys 的远端段
-            以本地段总数为基址)。h1_phys+split_local 时 segs=(0, LE):每个 expert 连续,
-            组内先本地组后远端组。par:线程 (e, l) 做 expert e 的第 l, l+SPL, ... 个 tile/组
-            (每条 lane 自己重算前缀和),把每 expert 串行的 load→store 依赖链缩成 1/SPL。"""
+            """Build the expert-major permutation.
+            segs concatenates map segments per expert: 0 is local/all, LE is remote.
+            base_segs precedes the whole view; with split_local and no h1_phys, remote
+            segments start after the total local tile count. For h1_phys+split_local,
+            segs=(0,LE) keeps each expert contiguous, with local groups before remote groups.
+            With par, thread (e,l) handles tiles/groups l,l+SPL,... for expert e and
+            recomputes prefix sums, shortening serial load/store chains by a factor of SPL.
+            """
             PS = SPL if par else 1
             pe = tx // fx.Int32(PS)
             pl = tx - pe * fx.Int32(PS)
@@ -1767,12 +1797,12 @@ def _compile_stage1(
                         all_tiles = all_tiles + n
                 if tx == fx.Int32(0):
                     if const_expr(check_tiles is not None):  # noqa: SIM102
-                        # Sum ceil(ceil(count/BM)/G)*G(全部段)必须等于 tile_alloc:
-                        # 每次认领固定分配 G 个 tile,所以置换仍是双射。
+                        # Sum ceil(ceil(count/BM)/G)*G over all segments must equal tile_alloc.
+                        # Each claim allocates exactly G tiles, so the permutation remains a bijection.
                         if seg_base + all_tiles != check_tiles:
                             comm.atomic_add_system(error_addr, fx.Int32(1))
                     if const_expr(publish_seg):
-                        # 本地段 tile 数(F5 的本地 job 数由它推出)。
+                        # Local-segment tile count, used to derive F5's local job count.
                         buffer_ops.buffer_store(
                             all_tiles,
                             buffer_ops.create_buffer_resource_from_addr(
@@ -1783,8 +1813,8 @@ def _compile_stage1(
                 tile_map = buffer_ops.create_buffer_resource_from_addr(
                     local_addr("expert_tile_map")
                 )
-                # 按组的两张表只在 G>1 的 layout 里有 region;G=1 时连 resource
-                # 都不能建(trace 期就 KeyError),用处也都在 const_expr(G > 1) 里。
+                # The two group maps have regions only when G>1. Even resource construction
+                # raises KeyError during tracing at G=1; all uses stay inside const_expr(G > 1).
                 group_e_res = (
                     buffer_ops.create_buffer_resource_from_addr(
                         local_addr("tile_expert_group")
@@ -1816,10 +1846,10 @@ def _compile_stage1(
                         buffer_ops.buffer_store(pe, sorted_e_res, dst)
                         buffer_ops.buffer_store(src, inv_res, dst)
                     if const_expr(G > 1):
-                        # GMM1 的 m_block 是「组」,expert id 和目的地都要按组
-                        # 再给一份。run_base 是 G 倍数的前缀和,组首 src 由整组
-                        # 认领得到,所以两边都对齐到 G。单独一个按组的循环:
-                        # 不在归纳变量上做 %,也不在循环体里做条件写。
+                        # GMM1 uses groups as m_blocks, so provide group-level expert IDs and destinations.
+                        # run_base is a G-aligned prefix sum, and source bases come from whole-group
+                        # claims, aligning both sides to G. Use a separate group loop without modulo
+                        # on the induction variable or conditional stores in its body.
                         for jg in range(pl, my_tiles // fx.Int32(G), fx.Int32(PS)):
                             j0 = jg * fx.Int32(G)
                             head_src = buffer_ops.buffer_load(
@@ -1833,12 +1863,15 @@ def _compile_stage1(
                     run_base = run_base + my_tiles
 
         def _seal_seg1():
-            """split_local 段 1:等 8 个 local_eos(本 node 全部来源的 fan1 推完),补齐本地组,
-            写本地段 tile 数(以及 early_local_gmm 的本地组表 + h1_local_eos)。
-            early_local_gmm 下由 ticket>=8 的 fan CTA 调用,打点 7=本地 EOS 齐 8=pad 完 9=发布
-            (消费者只用 3/4/5/6;非 early_local_gmm 时调用者是 sealer,槽 7..9 与 T0 冲突,不打)。"""
-            # 段 1:8 个 local_eos 齐 = 全部本地来源行已落位,本地组计数定了。
-            # 封本地组(pad + h1 段基址 0 的置换),再去等全局 comm_eos 封远端组。
+            """Seal split_local phase 1 after eight local_eos values confirm all local fan1.
+            Pad local groups and publish their tile count plus early_local_gmm's group
+            map and h1_local_eos. In early_local_gmm, fan CTAs with ticket>=8 call this:
+            marker 7 means local EOS complete, 8 padding complete, and 9 published.
+            Consumers use only 3/4/5/6. Otherwise the sealer calls it without markers,
+            because slots 7..9 would conflict with T0.
+            """
+            # Phase 1: eight local_eos values mean all local rows have arrived and counts are final.
+            # Seal local padding/permutation at h1 base 0, then wait for comm_eos to seal remote groups.
             if tx == fx.Int32(0):
                 for peer in range_constexpr(GPUS_PER_NODE):
                     _spin(
@@ -1848,16 +1881,17 @@ def _compile_stage1(
             _cta_acquire()
             fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
             gpu.barrier()
-            # h1_phys 下排序视图整体在段 2 算(每个 expert 先本地组后远端组);
-            # 这里只发布本地段 tile 数。否则本地段自成一段、段基址 0。
+            # With h1_phys, phase 2 builds the full sorted view, local then remote per expert.
+            # Publish only the local tile count here; otherwise local tiles form a segment at base 0.
             if tx == fx.Int32(0):
                 _lt = fx.Int32(0)
                 _cr = buffer_ops.create_buffer_resource_from_addr(
                     local_addr("expert_count")
                 )
-                # local_defer:末尾 D 个 expert 的本地组不进本地段。消费者的本地上界和远端段起点
-                # 都由 tile_alloc[1] 推出,组表布局不变,这些组就落在远端段开头,
-                # 和它们的远端组一起在同一次权重读里做(远端段本来就要把权重全读一遍)。
+                # local_defer excludes the last D experts' local groups from the local segment.
+                # Consumers derive its bound and the remote start from tile_alloc[1], keeping
+                # group-map layout unchanged. These groups start the remote segment and share
+                # a weight read with their remote groups, which already require all weights.
                 for e in range_constexpr(LOCAL_EXPERTS):
                     _lt = _lt + _alloc_tiles_for(
                         buffer_ops.buffer_load(
@@ -1878,25 +1912,26 @@ def _compile_stage1(
             if const_expr(early_local_gmm):  # noqa: SIM102
                 if tx == fx.Int32(0):
                     comm.fence_system_release()
-                    # fence 已经把前面的写整体放行;release store 会再做一次整 L2 写回。
+                    # The fence already published prior writes; a release store would write back L2 again.
                     (comm.store_i64_global_system_relaxed)(
                         local_addr("h1_local_eos"), generation
                     )
 
         dest = fx.Int32(0)
         # Shard each destination's fanout across CTAs to hide peer round trips.
-        is_fanout = ticket < fx.Int32(GPUS_PER_NODE * fanout_shards)
-        # T0(CCO 收发 + credit + seal)是关键路径,不再兼做 dest0
-        # 的 0 号分片;dest0 由其余 fanout_shards-1 个分片分掉。
+        is_fanout = ticket < fx.Int32(GPUS_PER_NODE * fanout_ctas_per_dest)
+        # T0 handles CCO, credits, and sealing on the critical path. Exclude it from
+        # dest0 shard 0; distribute dest0 over the remaining fanout_ctas_per_dest-1 shards.
         is_fanout = is_fanout & (ticket != fx.Int32(0))
         if is_fanout:
-            fan_stride = fx.Int32(fanout_shards)
+            fan_stride = fx.Int32(fanout_ctas_per_dest)
             dest = ticket % fx.Int32(GPUS_PER_NODE)
             fanout_shard = ticket // fx.Int32(GPUS_PER_NODE)
             d0 = dest == fx.Int32(0)
             fanout_shard = d0.select(fanout_shard - fx.Int32(1), fanout_shard)
-            fan_stride = d0.select(fx.Int32(fanout_shards - 1), fan_stride)
-            # 干活用的分片号/token 步长;完成计数仍用 fan_stride(含不分 token 的发帖 CTA)。
+            fan_stride = d0.select(fx.Int32(fanout_ctas_per_dest - 1), fan_stride)
+            # Shard ID/token stride for actual work; completion still uses fan_stride,
+            # including posting CTAs with no tokens.
             fan_wshard = fanout_shard
             fan_tstride = fan_stride
             pn_dest = (dest >= fx.Int32(_POST_LO)) & (dest < fx.Int32(_POST_HI))
@@ -1906,7 +1941,7 @@ def _compile_stage1(
                 fx.Int32(1 << 20),
                 pn_dest.select(fanout_shard - fx.Int32(1), fanout_shard),
             )
-            # 每个 QP 一个 CTA 投递+敲门铃(照 kernel2 的 DBCTAS):ticket q 发 QP q。
+            # One CTA posts and rings each QP's doorbell, as kernel2 DBCTAS does: ticket q handles QP q.
             if ((ticket >= fx.Int32(_POST_LO)) & (ticket < fx.Int32(_POST_HI))) & (
                 wave == fx.Int32(0)
             ):
@@ -1926,9 +1961,9 @@ def _compile_stage1(
                     emit_masks=True,
                 )
             if const_expr(split_local):
-                # local_eos:本源 rank 给 dest 的 fan1(本地来源那一半)全部推完。
-                # 与 comm_eos 同一套分片计数+减法复位,计数器在 [8,16);只经 xGMI,
-                # 不依赖 rail,所以不引入新的跨节点等待环。
+                # local_eos means this source rank's local fan1 half is complete for dest.
+                # Use comm_eos-style shard counting and subtractive reset in counters [8,16).
+                # It travels only over xGMI, independent of the rail, adding no inter-node wait cycle.
                 fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
                 gpu.barrier()
                 if tx == fx.Int32(0):
@@ -1989,13 +2024,13 @@ def _compile_stage1(
                     resv_n=fan_stride,
                 )
             if const_expr(tile_ready):  # noqa: SIM102
-                # 一批都没轮到的 fan CTA(发帖 CTA 等)也要报一次,计数才凑满 fan_stride。
+                # Fan CTAs with no batch, including posting CTAs, must still report once to reach fan_stride.
                 if (fan_wshard >= f2_end) & (tx == fx.Int32(0)):
                     _tr_resv_signal(dest, fan_stride)
             fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
             gpu.barrier()
-            # 在发布本分片之前回收自己的数据请求:consumed 到齐前必然完成,
-            # T0 的 credit 段不会和这里同时轮询同一个 QP 的 CQ。
+            # Reap this CTA's data request before publishing its shard. It must complete
+            # before all consumed credits arrive, so T0's credit phase cannot poll the same QP CQ concurrently.
             if (ticket >= fx.Int32(_POST_LO)) & (ticket < fx.Int32(_POST_HI)):
                 if wave == fx.Int32(0):
                     post_qp = ticket - fx.Int32(1)
@@ -2007,9 +2042,9 @@ def _compile_stage1(
                     )
                     _rail.wait(dev_comm, post_qp, post_req)
                 gpu.barrier()
-            # k1 一律不碰 fanout_shard_done / comm_eos /
-            # remote_chunk_consumed:这三者都描述「本 dest 的全部 record
-            # 都推完了」,而 k1 只推完了本地来源那一半。
+            # k1 never touches fanout_shard_done, comm_eos, or remote_chunk_consumed.
+            # They describe all destination records completing, whereas k1 completes only
+            # the local-source half.
             if tx == fx.Int32(0):
                 if const_expr(data_send_ctas):
                     _send_join_done(dest)
@@ -2024,15 +2059,15 @@ def _compile_stage1(
                             local_addr("send_job_eos"), generation
                         )
                 else:
-                    # 每个 dest 的最后一个分片才发 EOS 和信用原子:
-                    # remote_chunk_consumed 的每个字必须恰好累到
-                    # GPUS_PER_NODE,分片不能各加一次。用减法复位
-                    # (和 stage2 到达协议同一手法),不依赖下一代的清零。
-                    # 本分片所有远端写(上面已 drain+barrier)经这条
-                    # system release RMW 发布;最后到达者经它的
-                    # acquire 看到全部分片,再由下面的 release 传给 comm_eos。
-                    # fan_wt:本分片的远端写都是写穿且已在上面 s_waitcnt(0) 完成,
-                    # 不需要 release 的整 L2 写回;读端仍在看到 comm_eos 后 acquire。
+                    # Only the final shard per destination publishes EOS and increments credit.
+                    # Each remote_chunk_consumed word must reach exactly GPUS_PER_NODE, not one
+                    # increment per shard. Reset by subtraction, as Stage2's arrival protocol does,
+                    # rather than relying on next-generation clearing.
+                    # The system release RMW publishes this shard's drained remote writes. Its
+                    # acquire lets the final arrival observe all shards, then the following
+                    # release publishes completion through comm_eos.
+                    # With fan_wt, stores are write-through and complete at s_waitcnt(0), avoiding
+                    # release's full L2 writeback. Readers still acquire after observing comm_eos.
                     _prev = fx.Int32(
                         (
                             comm.atomic_add_system
@@ -2053,9 +2088,9 @@ def _compile_stage1(
                         )
                     if _publish:
                         if const_expr(lite_sync):
-                            # 上面 acq_rel RMW 的 release 已放行本 CTA 的写,acquire 已看到其它分片;
-                            # consumed 只被本 GPU 的 T0 读(system load + acquire fence),fan 读 rx 已在
-                            # s_waitcnt(0) 完成,credit 与之无竞争 ⇒ relaxed 原子即可。
+                            # The acq_rel RMW already published this CTA's writes and acquired other shards.
+                            # Only local T0 reads consumed, using a system load and acquire fence. Fan RX
+                            # reads completed at s_waitcnt(0), so credit has no race and a relaxed atomic suffices.
                             for consume_index in range_constexpr(
                                 dispatch_chunks * layout.num_qp
                             ):
@@ -2163,8 +2198,8 @@ def _compile_stage1(
         # one covers a local source rank and its aligned remote source rank.
         if is_sealer:
             if const_expr(early_local_gmm):
-                # 段 1 由 ticket 8+local_rank 的 fan CTA 在它的 fan1 之后做(见 fanout 段);
-                # 段 2 的置换/sortcopy 读本地 pad 行,必须排在段 1 之后。
+                # Fan ticket 8+local_rank runs phase 1 after its fan1 work; see fanout.
+                # Phase 2 permutation/sortcopy reads local padding and must follow phase 1.
                 if tx == fx.Int32(0):
                     (comm.spin_until_ge_i64_sleep_rx)(
                         local_addr("h1_local_eos"), generation, 127
@@ -2178,14 +2213,14 @@ def _compile_stage1(
                     _spin(local_addr("comm_eos") + fx.Int64(peer * 8), generation)
             _cta_acquire()
             if const_expr(split_local):
-                # 远端组;本地组的尾行是 lazy_pad 留到这里补的。
+                # Remote groups; also fill local tails deferred by lazy_pad.
                 _seal_pad(LOCAL_EXPERTS)
                 _seal_pad(0)
             else:
                 _seal_pad_par(0)
             fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
             gpu.barrier()
-            # sealer 内部分段(槽 5..7 本是 T0 专用;rank0 的 sealer 就是 T0,会覆盖,分析时丢掉 rank0/8)
+            # Sealer subphases reuse T0 slots 5..7. Rank 0's sealer is T0, so omit ranks 0/8 in analysis.
             finish_scratch = fx.recast_iter(fx.Int32, lds_raw)
             if tx == fx.Int32(0):
                 tiles = buffer_ops.buffer_load(
@@ -2224,7 +2259,7 @@ def _compile_stage1(
                     fx.Int32(0),
                 )
                 comm.fence_system_release()
-                # fence 已经把前面的写整体放行;release store 会再做一次整 L2 写回。
+                # The fence already published prior writes; a release store would write back L2 again.
                 (comm.store_i64_global_system_relaxed)(
                     local_addr("h1_queue_eos"), generation
                 )
@@ -2288,21 +2323,22 @@ def _compile_stage1(
                         )
 
         # GMM1 consumers.
-        # GMM1 消费者本来只有 ticket >= ESSENTIAL_CTAS 的 120 个,8 个 comm
-        # 和 128 个 producer 干完自己的活就退出,整个 GMM1 阶段(实测 797us,
-        # 占 stage1 的 46%)里 136/256 个 CTA 是空的。所有 CTA 本来就是在
-        # EOS 门口一起放行的,所以让它们全部参与不改变任何顺序。
-        # 记账((consumer_index, consumer_count) 闭式)本来就是通用的。
+        # Originally only 120 tickets >= ESSENTIAL_CTAS computed GMM1. Eight comm and
+        # 128 producer CTAs exited after their work, leaving 136/256 CTAs idle throughout
+        # GMM1 (~797us, 46% of Stage1). All CTAs already crossed the same EOS gate,
+        # so allowing them all to compute preserves ordering. The closed-form
+        # (consumer_index, consumer_count) bookkeeping already supports this mapping.
         is_compute = ticket >= fx.Int32(COMPUTE_FIRST)
         for _xt in _XC:
             is_compute = is_compute | (ticket == fx.Int32(_xt))
         if is_compute:
             if const_expr(ready_q and not split_local):  # noqa: SIM102
-                # 不 split:预约终值(各来源 fan CTA 的 P2 全部完成)后 expert_count 是终值,
-                # 消费者 0 给每个 expert 的尾组(static_g0 下 0 行的 expert 是整组 pad)补上缺的行数。
-                # 补差额与到达计数加在同一个字上,恰好凑满 GROUP_ROWS 的那次原子负责入队;
-                # 尾行的 tile_row_* 由 sealer 稍后补齐(GMM1 只经带界的 tile_row_input 取 A,
-                # pad 行算出的 h1 被 stage2 按 INVALID_SOURCE/权重 0 丢掉)。
+                # Without split, expert_count is final once all source fan CTAs finish P2.
+                # Consumer 0 adds missing rows to each tail group's arrival count, including
+                # the fully padded static_g0 group for zero-row experts. Padding and real
+                # arrivals update the same word; the atomic reaching GROUP_ROWS enqueues it.
+                # The sealer later fills tile_row_* tails. GMM1 uses bounds-checked tile_row_input;
+                # Stage2 discards padded h1 values through INVALID_SOURCE and zero weights.
                 if ticket == fx.Int32(COMPUTE_FIRST):
                     if tx == fx.Int32(0):
                         pd_rf = fx.Int32(
@@ -2356,8 +2392,9 @@ def _compile_stage1(
                             if pd_old + pd_add == fx.Int32(GROUP_ROWS):
                                 _rq_push(None, pd_ph // fx.Int32(G))
             if const_expr(ready_q):
-                # 就绪队列:领 job j → 队列项 q = j // GNB;等该项写入(generation 标记),
-                # 或全局封尾后 q 超出总组数(退出)。信箱在 GMM1 LDS 之后,不与 A 环重叠。
+                # Claim job j and queue entry q=j//GNB. Wait for its generation marker, or
+                # exit once global sealing confirms q exceeds the total groups. The mailbox
+                # follows GMM1 LDS without overlapping the A ring.
                 rq_box = fx.add_offset(fx.recast_iter(fx.Int32, lds_raw), NC_MBOX_DW)
                 rq_view = fx.make_view(rq_box, fx.make_layout(1, 1))
                 rq_qa = local_addr("gmm1_ready_q")
@@ -2371,7 +2408,7 @@ def _compile_stage1(
                         rq_valid = rq_q < fx.Int32(GR_N)
                         rq_safe_q = rq_valid.select(rq_q, fx.Int32(0))
                         rq_ea = rq_qa + fx.Int64(rq_safe_q) * fx.Int64(8)
-                        # 0 = 等待,1 = 项已写入,3 = 看到全局封尾(acquire 后再判)。
+                        # 0: waiting; 1: entry published; 3: global sealing observed (recheck after acquire).
                         rq_v = _rq_entry(rq_ea, rq_valid)
                         rq_e = fx.Int64(
                             comm.load_i64_global_system_relaxed(
@@ -2444,8 +2481,8 @@ def _compile_stage1(
                         _run_gemm1_job(rq_job)
                     rq_go = rq_has
             if tx == fx.Int32(0):
-                # 融合版里 248 个 CTA 做完 fanout 就停在这里等全局封尾;
-                # 退避轮询,不和仍在 fanout/发 credit 的 CTA 抢访存。
+                # In the fused path, 248 CTAs wait here after fanout for global sealing.
+                # Back off polling to avoid competing with active fanout and credit CTAs for memory.
                 (comm.spin_until_ge_i64_sleep_rx)(
                     local_addr("h1_queue_eos"), generation, 127
                 )
@@ -2503,8 +2540,8 @@ def _compile_stage1(
             w1scale,
             ntokens,
             value_attrs={
-                # 256 个 4-wave CTA、每 CU 一个:=2 的提示只会把 VGPR 压到 256,
-                # GMM1 主循环出现 scratch 溢出(K3 TPR128 7 个、DSV4 TPR256 29 个)。
+                # With 256 four-wave CTAs, one per CU, the =2 hint caps VGPRs at 256 and causes
+                # scratch spills in GMM1 (7 for K3 TPR128 and 29 for DSV4 TPR256).
                 "rocdl.waves_per_eu": WAVES // 4,
                 "rocdl.flat_work_group_size": f"{THREADS},{THREADS}",
             },

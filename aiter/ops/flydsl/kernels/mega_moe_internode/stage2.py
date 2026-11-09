@@ -1,32 +1,33 @@
 # SPDX-License-Identifier: MIT
 """Stage2 of MegaMoEInternode: two kernels.
 
-kernel1 (``megamoe_k1_*``): GEMM2 + weighted push into the node-local
-plane-slot inbox.  The GEMM2 core (``gemm2_compute_v2``) is MegaMoEV2's; this file adds the
-EP16 epilogue that sends each weighted BF16 row to the GPU with the owner's
-local index on this node and publishes its arrival flag.
+kernel1 (``megamoe_k1_*``) computes GEMM2 and pushes weighted BF16 rows into
+the node-local plane-slot inbox. It uses MegaMoEV2's ``gemm2_compute_v2`` core;
+the EP16 epilogue targets the GPU with the owner's local index on this node
+and publishes its arrival flag.
 
-kernel2 (``megamoe_k2_*``): node 内归约 -> RAIL 发送 -> node 间归约 + unpermute 输出。
-和 kernel1 是两个独立 kernel、独立 ABI,共用同一份 CCO 初始化。
+kernel2 (``megamoe_k2_*``) reduces within the node, sends over the rail, then
+reduces across nodes and unpermutes output. It has a separate kernel and ABI
+from kernel1, sharing the same CCO initialization.
 
-三个阶段,所有 CTA 依次经过,没有固定角色分区:
+All CTAs pass through three phases rather than keeping fixed role partitions:
 
-  阶段 1  每个 CTA 静态认领若干 chunk。读 plane_slot_inbox,按 slot mask
-          归约成每 token 的 node partial 写 node_accumulator;属于
-          remote_plane 的 chunk 归约完后,**由同一个 CTA** 直接
-          put(aggregate=True) 写 WQE,不敲门铃,然后给 wqe_posted[qp] 加一。
-          同一个 CTA 拥有整个 chunk,所以 put 的源地址天然连续。
+  Phase 1: Each CTA owns chunks, reads plane_slot_inbox with slot masks, and
+           writes per-token node partials to node_accumulator. For remote-plane
+           chunks, the same CTA posts a contiguous aggregate PUT WQE without
+           ringing the doorbell, then increments wqe_posted[qp].
 
-  阶段 2  前 NUM_QP 个 CTA 各带一个 QP(wave0):等本 QP 的 WQE 全部写入
-          (wqe_posted[qp]),给对端发各 chunk 的 return_group_ready,再
-          flush 一次(敲门铃)。QP 之间没有顺序要求,不需要 barrier。
+  Phase 2: The first NUM_QP CTAs each handle one QP in wave0. Wait for that
+           QP's WQEs, publish return_group_ready for its chunks, and flush once
+           to ring the doorbell. QPs need no ordering or shared barrier.
 
-  阶段 3  所有 CTA 降级为 node 间归约。节点内累加阶段 1 已完成,
-          remote_partial_rx 里是对端已累加好的 partial,所以这里只做
-          相加 + unpermute 写出。按 chunk 到达驱动,不做全局 barrier。
+  Phase 3: All CTAs perform inter-node reduction. Phase 1 already reduced node
+           partials; remote_partial_rx contains the peer's reduced values.
+           Add and unpermute on chunk arrival without a global barrier.
 
-shape 一律参数化,不写死。tokens 不被 num_qp*chunk 整除时走尾块路径 ——
-参考实现是靠整除约束回避尾块的("no tail transport here"),这里不保留那条。
+Shapes are parameterized. Handle tail chunks when tokens is not divisible
+by num_qp*chunk, rather than imposing the reference implementation's
+"no tail transport here" divisibility restriction.
 """
 
 import flydsl.compiler as flyc
@@ -564,7 +565,7 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
         + ("ro" if SD_RO else "") + ("_trpub" if TRK else "")
         + (f"s{SD_S}n{SD_NS}" if sdma and SD_NS else "")
         + "_de_" + "_".join(str(v) for v in epoch_planes)
-        # 符号名里不能有 '-':负步长写成 m 前缀
+        # Symbols cannot contain '-'; encode negative strides with an m prefix.
         + f"_ad{'m' if arrival_delta_step < 0 else ''}{abs(arrival_delta_step)}"
         + f"_atm{int(a_tile_map_plane)}"
 
@@ -593,10 +594,9 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
         lane = tx_i32 % fx.Int32(64)
         wave = rocdl.readfirstlane(T.i32, tx_i32 // fx.Int32(64))
 
-        # Stage-1 k1 wrote epoch_gate earlier on this stream.
-        # relaxed、agent scope:epoch_gate 是同一 stream 上更早的 kernel 写的,
-        # kernel 边界已保证可见。system acquire 会带 buffer_inv,每个 CTA 入口
-        # 冲一次 L2,persistent GEMM2 靠 L2 复用 w2,实测 +97us。
+        # Stage1 wrote epoch_gate earlier on this stream; the kernel boundary provides
+        # visibility, so use a relaxed agent-scope load. A system acquire adds
+        # buffer_inv at every CTA entry, disrupting GEMM2's L2 weight reuse (+97us measured).
         i64_generation = fx.Int64(rocdl.readfirstlane(
             T.i64,
             fx.Int64(comm.load_i64_global_agent_relaxed(i64_generation)).ir_value()))
@@ -648,9 +648,9 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
                     issue_a_load_lds_dt(arg_aq, lds_base_i32, slot, slot, m_row0, wave, lane,
                         KH_TILE_A, k_bytes, BM=GBM, NW=WAVES, a_dtype=a_dtype)
 
-        # a_tile_map:A(h1)按物理 tile 存放,排序后的第 t 个 32 行 tile 的数据在
-        # 物理 tile a_tile_map[t]。只有 A/A-scale 走这层间接;expert id、srcmap、
-        # 输出位置仍按排序后的行号。
+        # a_tile_map maps sorted 32-row tile t to its physical A(h1) tile.
+        # Only A/A-scale use this indirection; expert IDs, srcmap, and output positions
+        # still use sorted row indices.
         a_map_buf = ptr_buf_tensor(arg_a_tile_map, fx.Int32)
         if const_expr(sdma):
             sd_tb_buf = ptr_buf_tensor(arg_sd_tb, fx.Int32)
@@ -1581,14 +1581,14 @@ def run_mega_moe_stage2(arg_aq, arg_ascale, arg_bq, arg_bscale, arg_eids, arg_cu
 THREADS = 256
 
 
-# scratch 布局(i32 槽位)。
-SCRATCH_WQE_POSTED = 0          # [num_qp]   已写入 WQE 的 chunk 数
-SCRATCH_RAIL_REQ = 16           # [num_qp] i64:part 1 敲门铃的 request,part 2 回收
+# Scratch layout in i32 slots.
+SCRATCH_WQE_POSTED = 0          # [num_qp] Number of chunks with posted WQEs.
+SCRATCH_RAIL_REQ = 16           # [num_qp] i64: request rung in part 1 and reaped in part 2.
 SCRATCH_SDMA_EPOCH = 48         # SDMA stage2: forwards finished (signal running totals)
-SCRATCH_FINAL_DONE = 65         # 阶段 3 的完成计数
-SCRATCH_CHUNK_DONE = 256        # [2][max_chunks] 每个 (plane,chunk) 的完成计数
-SCRATCH_P3_DONE = 512           # [max_chunks] 阶段3 每个 chunk 的 CTA 完成计数
-SCRATCH_WORDS = 1024            # 宿主侧 scratch 的长度,编译期据此校验越界
+SCRATCH_FINAL_DONE = 65         # Phase 3 completion count.
+SCRATCH_CHUNK_DONE = 256        # [2][max_chunks] Completion counts by (plane, chunk).
+SCRATCH_P3_DONE = 512           # [max_chunks] Phase 3 CTA completion counts per chunk.
+SCRATCH_WORDS = 1024            # Host scratch length, checked for overflow at compile time.
 
 
 def _ceil_div(a, b):
@@ -1596,7 +1596,7 @@ def _ceil_div(a, b):
 
 
 def _ceil_div_rt(a, b):
-    """运行时向上取整。尾块就是从这里来的,不再要求整除。"""
+    """Compute runtime ceiling division, supporting tail chunks without divisibility."""
     return (a + b - fx.Int32(1)) // b
 
 
@@ -1625,10 +1625,10 @@ def _fp8_scale_for_leader(is_leader, local_max):
 
 
 def _fp8_encode8(vals, lane, *, VEC):
-    """VEC 个 f32 -> (打包好的 i32 列表, 本块 e8m0, 本 lane 是否块 leader)。
+    """Convert VEC f32 values to packed i32 words, E8M0 scale, and block-leader flag.
 
-    逐字照搬 kernel1 的 push 端(p2p_scatter_epilog)。VEC=8 时一个
-    32 元素的尺度块正好跨 4 个 lane,所以块内求最大值要跨 lane^1、lane^2。
+    Match kernel1's p2p_scatter_epilog push path. For VEC=8, each 32-element scale
+    block spans four lanes, so reduce maxima across lane^1 and lane^2.
     """
     group_lanes = 32 // VEC
     local_max = fabs_f32(vals[0])
@@ -1698,10 +1698,10 @@ def _fp8_encode8_quad(vals):
 
 
 def _fp8_decode8(packed2, scale_f32):
-    """2 个 i32(8 个 e4m3 字节) + 该块的 e8m0 尺度 -> Vector(8, f32)。
+    """Decode two i32 words (eight E4M3 bytes) and their E8M0 scale to Vector(8, f32).
 
-    照搬 moe_reduce.py:133-140 的形态(同格式):cvt_pk_f32_fp8 一次吃一个 32 位
-    源加一个 word 选择位,所以 2 个 i32 要 4 次调用才出 8 个 f32。
+    Follow moe_reduce.py:133-140. cvt_pk_f32_fp8 accepts one 32-bit source and a
+    word selector, requiring four calls to decode two i32 words into eight f32 values.
     """
     _v2f32 = T.vec(2, T.f32)
     w = fx.Vector(packed2)
@@ -1746,28 +1746,28 @@ def compile_stage2_node_combine(
     rail_idx_off: int = 0,
     rail_idx_plane: int = 0,
 ):
-    """构建 kernel2。threads:CTA 宽度(fused 8-wave 时随 kernel1 取 512)。所有 *_off 是相对 window local_ptr 的字节偏移。
+    """Build kernel2 with a threads-wide CTA (512 for the fused 8-wave path).
 
-    generation 从 window 里 stage1 的 epoch_gate(epoch_off)读(同一条 stream
-    上 stage1 已写好),*_off 传 parity 0 的偏移,
-    kernel 自己按 generation & 1 加上 parity_planes 里对应的平面大小。
-    CUDA graph capture 后每次 replay 才能拿到当代的 generation/parity。
-    parity_planes 顺序: inbox, slot_mask, accumulator, rx, partial_ready,
-    group_ready, consumed, arrival。
+    All *_off values are byte offsets relative to window local_ptr. Stage1 writes
+    epoch_gate at epoch_off earlier on the same stream; read it for generation.
+    Offsets refer to parity 0. Add each parity_planes size when generation & 1
+    selects parity 1, so captured graph replays read the current generation/parity.
+    parity_planes order: inbox, slot_mask, accumulator, rx, partial_ready,
+    group_ready, consumed, arrival.
     """
     parity_planes = tuple(int(v) for v in parity_planes)
     if epoch_off <= 0 or len(parity_planes) != 8:
         raise ValueError("kernel2 needs the epoch_gate offset and eight parity_planes")
 
     if hidden <= 0 or hidden % 512:
-        # 512 而非 256:一个 wave 一次覆盖 64 lane x 8 bf16 = 512 列,不整除时
-        # 尾部那几列不会被写。上游本来就保证整除(bench/ABI 要求 hidden 在
-        # [1024,8192] 且能被 512 整除),这里显式挡住,免得直接调用时静默少写。
+        # Require divisibility by 512, not 256: one wave covers 64 lanes x 8 BF16 values.
+        # Otherwise tail columns would go unwritten. The upstream ABI already requires
+        # hidden in [1024,8192] divisible by 512; also reject invalid direct calls here.
         raise ValueError("hidden must be a positive multiple of 512")
     if max_tokens <= 0:
         raise ValueError("max_tokens must be positive")
-    # 每个 *_off 都必须是 window 相对(已含 stage2_offset)。传成 region 相对
-    # 不会崩也不会报错,只会把跨节点写落到别处 —— 一定要在编译期挡掉。
+    # Every *_off must be window-relative and include stage2_offset. Region-relative
+    # offsets silently redirect inter-node writes, so reject them at compile time.
     for _name in ("inbox_off", "slot_mask_off", "accumulator_off", "rx_off",
                   "partial_ready_off", "group_ready_off"):
         if int(locals()[_name]) < int(s2_window_off):
@@ -1776,8 +1776,8 @@ def compile_stage2_node_combine(
                 "kernel2 要的是相对 window local_ptr 的偏移")
     if int(num_qp) not in (1, 2, 4, 8):
         raise ValueError("num_qp must be one of 1,2,4,8")
-    # 参考实现是 qp = wave。wave 数多于 QP 时有 wave 没活干,少于 QP 时
-    # 一个 wave 顺序带 num_qp//waves 个 QP —— 两者都要求整除。
+    # The reference maps QP to wave. Extra waves idle when waves>QPs; otherwise
+    # each wave handles num_qp//waves QPs sequentially. Both mappings require divisibility.
     THREADS = int(threads)
     if THREADS not in (256, 512):
         raise ValueError(f"kernel2 threads must be 256 or 512, got {THREADS}")
@@ -1792,21 +1792,22 @@ def compile_stage2_node_combine(
         raise ValueError(
             "arrival_off 小于 s2_window_off,看起来是 region 相对偏移")
     if return_chunk_tokens < 4:
-        # return_group_ready 只有 max_tokens/4 个槽位,粒度不能比 4 更细。
+        # return_group_ready has only max_tokens/4 slots; its granularity cannot be below four.
         raise ValueError("return_chunk_tokens must be >= 4")
 
     HIDDEN = int(hidden)
     MAX_TOKENS = int(max_tokens)
     TOPK = int(topk)
     CHUNK = int(return_chunk_tokens)
-    # ceil,而不是整除:CHUNK*TOPK 小于 threads 时(比如 CHUNK=8)也要跑一轮,
-    # 多出来的线程靠下面的上界判断落空。之前写成整除,CHUNK 一调就编译失败。
+    # Use ceiling division: even CHUNK*TOPK < threads (for example, CHUNK=8) needs
+    # one iteration. Bounds checks discard extra threads. Floor division previously
+    # caused compilation failures when CHUNK changed.
     NUM_QP = int(num_qp)
     WAVES = THREADS // 64
-    RECORD_BYTES = HIDDEN * 2               # 一个 token 的 BF16 partial,无 header
-    # inbox 的记录宽度和 RECORD_BYTES 是两回事:RECORD_BYTES 只用于 rail 的
-    # put/get(每 token 一条 accumulator),inbox 是每 (token, topk slot) 一条,
-    # 由 kernel1 的 token_nbytes 定宽。两者可以独立量化。
+    RECORD_BYTES = HIDDEN * 2               # One token's BF16 partial, without a header.
+    # RECORD_BYTES describes rail PUT/GET bytes per token accumulator. Inbox rows
+    # are per (token, topk slot), sized by kernel1 token_nbytes; these formats can
+    # be quantized independently.
     # kernel1: row_base = slot * token_nbytes, token_nbytes = N_OUT + N_OUT//32
     if rail_quant not in ("none", "fp8_blockwise_1x32"):
         raise ValueError(
@@ -1816,38 +1817,39 @@ def compile_stage2_node_combine(
     if RAIL_FP8:
         if HIDDEN % 32:
             raise ValueError("fp8 rail 要求 hidden 能被 32 整除(e8m0 块大小)")
-        # RECORD_BYTES 是 put/get 的每 token 字节数,量化后直接减半 ——
-        # rail 上 78us 的线速载荷就是被这一行砍掉的。
+        # Quantization halves RECORD_BYTES per token for PUT/GET, reducing the rail's
+        # measured 78us line-rate payload cost.
         RECORD_BYTES = HIDDEN + HIDDEN // 32
         if RECORD_BYTES % 8:
             raise ValueError(
                 f"rail 行宽 {RECORD_BYTES} 不是 8 的倍数,put 源地址会错位")
     INBOX_ROW_BYTES = (HIDDEN * 2)
-    # 每 plane 的 inbox 字节;整个 inbox(2 plane)>= 2 GiB 时按 plane 建描述符。
+    # Inbox bytes per plane; use separate descriptors when the two-plane inbox is >=2GiB.
     INBOX_PLANE_BYTES = MAX_TOKENS * TOPK * INBOX_ROW_BYTES
     INBOX_PER_PLANE = 2 * INBOX_PLANE_BYTES >= 1 << 31
     if INBOX_PLANE_BYTES >= 1 << 31:
         raise ValueError("inbox plane exceeds the 32-bit buffer-resource range")
     ACC_ROW_BYTES = RECORD_BYTES
     if INBOX_ROW_BYTES % 8:
-        # 每 lane 取 VEC 个值要落成一次 dwordx2/x4,行首必须 8 字节对齐。
+        # VEC values per lane use one dwordx2/x4 load, requiring 8B-aligned row starts.
         raise ValueError(
             f"inbox 行宽 {INBOX_ROW_BYTES} 不是 8 的倍数,向量化 load 会错位")
-    VEC = 8                                 # 每 lane 8 个 bf16 = 16 B
-    RED_BATCH = min(int(topk), 8)           # 归约每批在途的 topk load 数
+    VEC = 8                                 # Eight BF16 values per lane = 16B.
+    RED_BATCH = min(int(topk), 8)           # Outstanding top-k loads per reduction batch.
     RED_BATCHES = _ceil_div(int(topk), RED_BATCH)
     # Reduce units interleaved per wave step (see the reduce loop).  The 4-wave
     # fused stage2 keeps 1: its VGPRs bound kernel1's CTAs per CU.  8 waves: at
     # most 24 row loads in flight per wave (K3, RED_BATCH 8: U=4 ran 7-70x slow
     # in 4 of 8 TPR1024 cases, U=2 0 of 6; DSv4.1, RED_BATCH 6: U=4 clean).
     RED_U = (4 if 4 * RED_BATCH <= 24 else 2) if THREADS == 512 else 1
-    CHUNKS_PER_WAVE = HIDDEN // (64 * VEC)  # 一个 wave 覆盖 512 列
+    CHUNKS_PER_WAVE = HIDDEN // (64 * VEC)  # One wave covers 512 columns.
     CHUNK_ITERS = _ceil_div(CHUNKS_PER_WAVE, WAVES)
-    # 阶段1 的工作单元:一个 (plane, token, hidden 分片) 由**一个 wave** 做完。
-    # HPARTS 就是 CHUNKS_PER_WAVE —— 每片正好 512 列,所以没有掩码浪费
-    # (按 chunk 分片的老路子是 4 wave x 2 轮 = 8 个槽装 7 份活,1/8 空转)。
+    # Phase 1 assigns each (plane, token, hidden partition) to one wave.
+    # HPARTS=CHUNKS_PER_WAVE gives exactly 512 columns per partition, avoiding
+    # masked idle work. The old chunk mapping used four waves x two iterations
+    # for seven useful slots, leaving one eighth idle.
     HPARTS = CHUNKS_PER_WAVE
-    # chunk 完成计数:[plane][chunk],给 rail 的 put 找"最后一个写完的 wave"。
+    # [plane][chunk] completion counts identify the last wave to post the rail PUT.
     MAX_CHUNKS = _ceil_div(MAX_TOKENS, CHUNK)
     if (SCRATCH_CHUNK_DONE + 2 * MAX_CHUNKS > SCRATCH_P3_DONE
             or SCRATCH_P3_DONE + MAX_CHUNKS > SCRATCH_WORDS):
@@ -1862,7 +1864,7 @@ def compile_stage2_node_combine(
     kernel_name = (
         f"megamoe_k2_h{HIDDEN}_t{MAX_TOKENS}_k{TOPK}"
         f"_qp{NUM_QP}_c{CHUNK}_w{WAVES}"
-        # rail 的 CQ 轮询按 CCQE 模式编译,模式必须进 kernel 名(= flydsl 缓存键)
+        # Include rail CQ CCQE polling mode in the kernel name, which is the FlyDSL cache key.
         + ("_ccqe" if _rail_ccqe() else "")
         + ("_qr8" if RAIL_FP8 else "")
         + f"_de{epoch_off}_" + "_".join(str(v) for v in parity_planes)
@@ -1913,7 +1915,7 @@ def compile_stage2_node_combine(
         lane = tx % fx.Int32(64)
 
 
-        # 同 kernel1:relaxed 读(不带 buffer_inv),readfirstlane 留在 SGPR。
+        # As in kernel1: relaxed load without buffer_inv; readfirstlane keeps the value in SGPRs.
         generation = fx.Int64(rocdl.readfirstlane(
             T.i64,
             fx.Int64(comm.load_i64_global_agent_relaxed(
@@ -1936,12 +1938,12 @@ def compile_stage2_node_combine(
         arrival_ptr = arena_ptr + _arrival_off
         group_ready_ptr = arena_ptr + _group_ready_off
 
-        # node_dest_slot_mask 是**本 rank 的 stage1** 写的(stage1.py:891/:1487
-        # 都是本地 buffer_store),和 kernel2 同 rank 同 stream 串行 —— 没有任何
-        # 跨 GPU 时序,所以不需要 system scope 的绕缓存读。原来两处都用
-        # load_i32_global_system_relaxed:等待循环里每个 (token,slot) 读一次
-        # (同一个 token 重复 16 次),归约循环里每个工作单元读一次,加起来近
-        # 10 万次不可缓存的读。
+        # This rank's Stage1 writes node_dest_slot_mask with local buffer_store
+        # (stage1.py:891/:1487). kernel2 follows on the same rank and stream, with no
+        # cross-GPU ordering dependency, so cache-bypassing system loads are unnecessary.
+        # Previously both sites used load_i32_global_system_relaxed: once per (token,slot)
+        # while waiting, repeating a token up to 16 times, and once per reduction unit,
+        # for nearly 100,000 uncacheable reads.
         mask_rsrc = buffer_ops.create_buffer_resource_from_addr(
             mask_ptr, num_records_bytes=fx.Int32(2 * MAX_TOKENS * 4))
         if const_expr(not INBOX_PER_PLANE):
@@ -1962,20 +1964,20 @@ def compile_stage2_node_combine(
 
         @flyc.jit
         def _wait_ready_relaxed(addr, expected):
-            """cco 的 wait_ready 每次轮询都是 acquire load,每条带一次 L2
-            invalidate。到达标志是**批量**等待(每 chunk 512 个,还被 ~10 个 CTA
-            各查一遍),绝大多数一看就已就绪 —— 为此付 8 万次 invalidate,实测
-            +39us。轮询改 relaxed,acquire 由调用方在 barrier 之后做**一次**。
+            """Poll arrival flags with relaxed loads; the caller acquires once after its barrier.
+
+            CCO wait_ready acquires and invalidates L2 on every poll. Batched waits check
+            512 flags per chunk, repeated by about ten CTAs, usually finding them ready.
+            Avoid roughly 80,000 invalidations and their measured 39us overhead.
             """
             word = fx.Int64(comm.load_i64_global_system_relaxed(addr))
             while word < expected:
                 word = fx.Int64(comm.load_i64_global_system_relaxed(addr))
-        # 阶段 1:归约 + 写 WQE
-        # Reduce the remote plane first and ring its rail as soon as it is
-        # posted, so the transfer runs under the local plane's reduce.  G CTAs
-        # share each chunk and count completion once per CTA, retaining overlap
-        # between memory operations. Per-unit waits would serialize this
-        # bandwidth path.
+        # Phase 1: reduce and post WQEs.
+        # Reduce the remote plane first and ring its rail as soon as it is posted,
+        # overlapping transfer with local-plane reduction. G CTAs share each chunk
+        # and report completion once per CTA, preserving memory-operation overlap.
+        # Per-unit waits would serialize this bandwidth path.
         _PLANES = (remote_plane, 1 - remote_plane)
         _rail_req = fx.Int64(0)
         # Every node peer's kernel1 publishes once, at its end (word = its
@@ -2016,8 +2018,8 @@ def compile_stage2_node_combine(
           _pi = _PIS[_pii]
           plane = _PLANES[_pi]
           if const_expr(INBOX_PER_PLANE):
-              # mtpr > 4096:整个 inbox 超出 i32 的 num_records(掩码越界读不再返回 0),
-              # 每个 plane 单独一个描述符,记录号按 plane 内的 token 算。
+              # At mtpr>4096, the full inbox exceeds i32 num_records and masked out-of-range
+              # reads stop returning zero. Use one descriptor per plane with plane-local token indices.
               inbox_rsrc_p = buffer_ops.create_buffer_resource_from_addr(
                   inbox_ptr + fx.Int64(plane * INBOX_PLANE_BYTES),
                   num_records_bytes=fx.Int32(INBOX_PLANE_BYTES))
@@ -2049,14 +2051,13 @@ def compile_stage2_node_combine(
                       _sm.append(_ok_u[_j].select(fx.Int32(buffer_ops.buffer_load(
                           mask_rsrc, _tix[_j], vec_width=1, dtype=T.i32)), fx.Int32(0)))
                       _tot.append(fx.Vector.filled(VEC, 0.0, Float32))
-                  # MegaMoEv2 的流水(intranode_kernel.py:1010-1085):K 个
-                  # load 先全部攒进 list,一个都不当场消费,发完才累加。
-                  # 有效性走掩码不走分支 —— buffer_load(mask=) 把越界偏移
-                  # 设成 0x7FFFFFFF,硬件边界检查返回 0。
-                  # Loads go out RED_BATCH slots at a time (per unit), accumulated
-                  # before the next batch: all TOPK at once held 64 VGPRs of loads
-                  # and put kernel2 at 117 VGPRs, which pushes a fused stage2
-                  # kernel below kernel1's five CTAs per CU.
+                  # Follow MegaMoEv2's pipeline (intranode_kernel.py:1010-1085): issue loads into
+                  # a list before accumulation, using masks rather than branches for validity.
+                  # buffer_load(mask=) maps invalid offsets to 0x7FFFFFFF, returning zero through
+                  # hardware bounds checks. Issue RED_BATCH slots per unit and accumulate before
+                  # the next batch. Loading all TOPK at once held 64 VGPRs of values, taking
+                  # kernel2 to 117 VGPRs and reducing fused Stage2 occupancy below kernel1's
+                  # five CTAs per CU.
                   for _rb in range_constexpr(RED_BATCHES):
                       if const_expr(sdma):
                           # inv first for the whole batch, then the rows.
@@ -2139,9 +2140,9 @@ def compile_stage2_node_combine(
                                       BFloat16).to(Float32)
                       if const_expr(_rb + 1 < RED_BATCHES):
                           rocdl.sched_barrier(0)
-                  # 【设计点:accumulator 不写穿】ACCUM_WT=1(sc0|sc1 写穿,
-                  # 省掉每 chunk 那次 fence_system_release 的整 L2 写回)实测
-                  # 194.5 vs 195.6 —— 零收益,开关已删,这里恒用默认策略。
+                  # Keep the default accumulator store policy. ACCUM_WT=1 used sc0|sc1
+                  # write-through to avoid per-chunk fence_system_release L2 writeback, but
+                  # measured 194.5 versus 195.6 with no meaningful gain; the switch was removed.
                   _acm = 0
                   for _j in range_constexpr(RED_U):
                       totals = _tot[_j]
@@ -2156,19 +2157,17 @@ def compile_stage2_node_combine(
                               fx.Vector.from_elements(_w, fx.Int32),
                               accum_rsrc, _abyte // fx.Int32(4),
                               mask=_ok_u[_j], cache_modifier=_acm)
-                          # 尺度字节用 mask 而不是 if:分支里做 store 没问题,
-                          # 但掩码版不产生分歧,省一次 exec mask 往返。
+                          # Mask the scale-byte store rather than branching, avoiding divergence and an exec-mask round trip.
                           buffer_ops.buffer_store(
                               _e8m0.to(fx.Int8), accum_rsrc,
                               token_index * fx.Int32(ACC_ROW_BYTES)
                               + fx.Int32(HIDDEN) + col // fx.Int32(32),
                               mask=_is_ldr & _ok_u[_j], cache_modifier=_acm)
-                      # 17 = sc0|sc1(SIDefines.h:593 的 pre-gfx12 编码,GLC=SC0=1、
-                      # SCC=SC1=16):写穿到系统一致点。NIC 要读 node_accumulator,
-                      # 默认策略下这些写是脏在本 rank 的 L2 里,得靠下面那次
-                      # fence_system_release 的 buffer_wbl2(整 L2 写回)刷出去 ——
-                      # 每 chunk 一次。写穿之后那次 fence 就不需要了。
-                      # 和 kernel1 payload 用 pay_cm=19 是同一条路子。
+                      # 17=sc0|sc1 in pre-gfx12 encoding (SIDefines.h:593, GLC=SC0=1, SCC=SC1=16).
+                      # Write-through reaches the system coherence point for NIC reads of
+                      # node_accumulator. Default stores leave dirty data in local L2, requiring
+                      # fence_system_release's full buffer_wbl2 writeback once per chunk.
+                      # Write-through removes that requirement, as kernel1 payload pay_cm=19 does.
                       if const_expr(not RAIL_FP8):
                           out = fx.Vector.from_elements(
                               [fx.Float32(totals[i])
@@ -2180,9 +2179,9 @@ def compile_stage2_node_combine(
                               (token_index * fx.Int32(HIDDEN) + col)
                               // fx.Int32(2),
                               mask=_ok_u[_j], cache_modifier=_acm)
-              # token 段模式:本 CTA 的字节范围是连续的,自己发自己的 put,
-              # Drain this CTA's stores before its acq_rel arrival. The last
-              # arrival observes every partial before posting the chunk's WQE.
+              # Token-segment mode gives this CTA a contiguous byte range for its PUT.
+              # Drain this CTA's stores before its acq_rel arrival. The last arrival observes
+              # every partial before posting the chunk's WQE.
               fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
               gpu.barrier()
               cnt_idx = fx.Int32(SCRATCH_CHUNK_DONE + plane * MAX_CHUNKS) + ck
@@ -2192,8 +2191,8 @@ def compile_stage2_node_combine(
                       prev = fx.Int32(comm.atomic_add_agent_acq_rel(
                           arg_scratch + fx.Int64(cnt_idx) * fx.Int64(4),
                           fx.Int32(1)))
-                  # prev 只在 lane0 有效;广播成 wave uniform,下面那个 if 才
-                  # 能整 wave 一起进(put 是 warp 级 collective)。
+                  # prev is valid only in lane0. Broadcast it so the entire wave enters the
+                  # following branch together; PUT is a warp-level collective.
                   prev = fx.Int32(rocdl.readfirstlane(T.i32, prev.ir_value()))
                   if (prev + fx.Int32(1)) == n_cta:
                       # Publish the whole chunk to the NIC with one system fence.
@@ -2202,8 +2201,8 @@ def compile_stage2_node_combine(
                           comm.store_i32_system(
                               arg_scratch, cnt_idx, fx.Int32(0))
                           # Phase 3 reads only the chunk's first token.
-                          # relaxed:上面那次 fence 已经把 writeback 做了,
-                          # release store 会再来一遍 buffer_wbl2。
+                          # Use a relaxed store: the preceding fence already wrote back data;
+                          # a release store would issue buffer_wbl2 again.
                           comm.store_i64_global_system_relaxed(
                               ready_ptr
                               + fx.Int64(fx.Int32(plane * MAX_TOKENS) + ck_first)
@@ -2256,8 +2255,8 @@ def compile_stage2_node_combine(
                           arg_scratch + fx.Int64(SCRATCH_RAIL_REQ * 4)
                           + fx.Int64(bx) * fx.Int64(8), _rail_req)
         if const_expr(part != 1):
-          # 阶段 2:rail 返回 —— the doorbell rang after the remote plane; reap
-          # the completion here, after the local plane's reduce.
+          # Phase 2: reap rail completion. The remote plane already rang the doorbell;
+          # reap here after local-plane reduction.
           if const_expr(TRC):
            # Token-ready: this QP's owner waits until all of its batches are
            # posted (by whichever CTA completed them), covers the rest with
@@ -2295,7 +2294,7 @@ def compile_stage2_node_combine(
                 comm.store_i32_system(
                     arg_scratch, fx.Int32(SCRATCH_WQE_POSTED) + bx,
                     fx.Int32(0))
-          # 阶段 3:所有 CTA 做 node 间归约 + unpermute
+          # Phase 3: all CTAs perform inter-node reduction and unpermute output.
           # Both node partials are already reduced. Add and unpermute them;
           # synchronize once per CTA/chunk and distribute its work across waves.
           if const_expr(TRC):
@@ -2311,8 +2310,8 @@ def compile_stage2_node_combine(
             ck_first = ck * fx.Int32(CHUNK)
             ck_tok = _min_rt(fx.Int32(CHUNK), local_tokens - ck_first)
             if tx == fx.Int32(0):
-                # ready 位是阶段1 按整个 chunk 一起发布的,所以等首 token 即可,
-                # 不用逐个等 32 次。
+                # Phase 1 publishes readiness for the whole chunk together, so wait only on
+                # its first token instead of performing 32 separate waits.
                 if const_expr(not TRC):
                     _wait_ready_relaxed(
                         ready_ptr
@@ -2383,9 +2382,9 @@ def compile_stage2_node_combine(
                 ).to(BFloat16).bitcast(fx.Int32)
                 buffer_ops.buffer_store(
                     result, out_rsrc, out_index // fx.Int32(2))
-            # 每 CTA 每 chunk 一次。FINAL_DONE 是**本 GPU 内**的计数(CTA0 在
-            # 收尾里读它),所以增量走 agent scope 就够 —— 系统可见性只在把信用
-            # 发给对端那一刻才需要,那里本来就有一次 release。
+            # Increment once per CTA/chunk. FINAL_DONE is local to this GPU, read by CTA0
+            # at finalization, so agent scope suffices. System visibility is needed only
+            # when sending peer credits, which already performs a release.
             fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
             gpu.barrier()
             if tx == fx.Int32(0):
@@ -2400,18 +2399,18 @@ def compile_stage2_node_combine(
                         ck_tok)
           fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
           gpu.barrier()
-          # 收尾:return_consumed 信用交换
-          # remote_partial_rx 只有 2 个 parity 槽,第 N 代和第 N+2 代共用同一块。
-          # 没有这个握手,两端代数可以自由漂移;而 wait_ready 是 >= 语义,对端跑快
-          # 两代时它写的新 ready 会同时满足我们对旧代的等待 —— 不挂死,直接读到
-          # 写了一半的 buffer。所以这一步不是可选的优化。
+          # Finalization: exchange return_consumed credits.
+          # remote_partial_rx has two parity slots, reused by generations N and N+2.
+          # Without this handshake, nodes can drift by two generations and newer ready
+          # values satisfy the old generation's >= wait, exposing a partially written
+          # buffer without a hang. The handshake is therefore required for correctness.
           if bx == fx.Int32(0):
             done_ptr = arg_scratch + fx.Int64(SCRATCH_FINAL_DONE) * fx.Int64(4)
             if tx == fx.Int32(0):
                 done = fx.Int32(comm.load_i32_global_system(done_ptr))
                 while done < local_tokens:
                     done = fx.Int32(comm.load_i32_global_system(done_ptr))
-                # 本代计数已满,减回去,下一代重新从 0 开始。
+                # Subtract the completed generation's count so the next starts from zero.
                 comm.atomic_add_system_acq_rel(
                     done_ptr, fx.Int32(0) - local_tokens)
                 if const_expr(sdma):
@@ -2424,7 +2423,7 @@ def compile_stage2_node_combine(
                         arg_scratch + fx.Int64(SCRATCH_SDMA_EPOCH * 4), fx.Int32(1))
             gpu.barrier()
             if wave == fx.Int32(0):
-                # "你发给我的那块我读完了" -> 对端可以复用它的发送源。
+                # Acknowledge reading the peer's payload so it can reuse its send source.
                 _rail.put_value(dev_comm, fx.Int32(0), fx.Int32(remote_node),
                                 arena_win, _consumed_off, generation,
                                 aggregate=True)
@@ -2434,9 +2433,9 @@ def compile_stage2_node_combine(
                 _consumed_req = _rail.flush_async(
                     dev_comm, fx.Int32(0), fx.Int32(remote_node))
                 if lane == fx.Int32(0):
-                    # 反过来等对端的信用:确认我们写进它 rx 的那块已被读完,
-                    # 下一代才可以再往同一个 parity 槽写。system-acquire 是
-                    # 必须的:这个字是对端 NIC 写的。
+                    # Wait for peer credit confirming our writes into its RX buffer were consumed
+                    # before reusing that parity slot. System acquire is required because the
+                    # peer NIC writes this credit word.
                     _credit_ptr = arena_ptr + _consumed_off
                     _credit = fx.Int64(
                         comm.load_i64_global_system(_credit_ptr))

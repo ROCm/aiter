@@ -50,7 +50,7 @@ from .mega_moe_internode_config import (
     STAGE2_SDMA_REMOTE_ONLY,
     STAGE2_SDMA_SEND_ROWS_PER_ROUTE,
     STAGE2_TOKEN_READY,
-    lookup_stage2_tune,
+    lookup_tune,
     resolve_gemm2_bm,
     resolve_gemm2_bn,
     resolve_gemm2_cu,
@@ -163,7 +163,7 @@ def build_window_layout(
     tile_group: int,
     comm_quant: str = "fp8",
     data_send_ctas: int = 0,
-    fanout_shards: int = 16,
+    fanout_ctas_per_dest: int = 16,
     quant: str = "a4w4",
 ) -> TwoKernelArenaLayout:
     """Stage1 and Stage2 layouts sharing one registered window.
@@ -209,7 +209,7 @@ def build_window_layout(
                     - 1
                 )
                 // max(8, min(512 // topk, TILE_M * tile_group) // 8 * 8)
-                + fanout_shards
+                + fanout_ctas_per_dest
             )
             if data_send_ctas
             else 0
@@ -237,6 +237,33 @@ class MegaMoEInternode:
     ``rank`` is the global EP rank; tensors are allocated on the current CUDA
     device.  ``torch.distributed`` must be initialized (it carries the CCO
     unique id when no ``communicator`` is given).
+
+    Deployment environment: set these before constructing the operator or
+    a caller-supplied CCO communicator. The values below are examples from
+    the tested Ionic cluster. Configure socket interfaces, NIC type, RDMA
+    device names and GID index for the actual environment on each node::
+
+        export GLOO_SOCKET_IFNAME=enp193s0f1np1
+        export MORI_SOCKET_IFNAME=enp193s0f1np1
+        export MORI_DEVICE_NIC=ionic
+        export MORI_RDMA_DEVICES='^rocep193s0f0,rocep193s0f1'
+        export MORI_IB_GID_INDEX=1
+        export MORI_ENABLE_SDMA=1
+
+    ``GLOO_SOCKET_IFNAME`` applies when the application uses Gloo for its
+    process group. The ``^`` RDMA device list excludes the named front-end
+    HCAs; select the back-end devices matching the GPU-to-rail topology.
+    ``MORI_ENABLE_SDMA=1`` enables CCO SDMA resources. The paired tune table
+    and built-in rules still select the xGMI/SDMA path for each capacity.
+    Set it before CCO initialization, including an externally created
+    communicator; changing it before a later forward does not add queues.
+
+    Optional: ``FLYDSL_RUNTIME_ENABLE_CACHE=1`` enables the compilation cache.
+    ``AITER_CONFIG_MEGAMOE_INTERNODE`` overrides the paired tune CSV; without
+    it, the operator loads ``aiter/configs/mega_moe_internode_tuned.csv``.
+    Internal features use constructor arguments, tuning or built-in rules.
+    The CCO path sizes its own memory from the configured capacity and does
+    not require ``MORI_SHMEM_HEAP_SIZE`` or dispatch/combine environment flags.
 
     Extra keyword arguments beyond MegaMoEV2's:
 
@@ -323,7 +350,7 @@ class MegaMoEInternode:
             token=rows, model_dim=self.model_dim, inter_dim=self.inter_dim,
             expert=self.epr, topk=self.topk,
         )
-        s2_tuned = self._lookup_stage2_tune(rows)
+        s2_tuned = self._lookup_tune(rows)
         self._gemm2_bn, _ = resolve_gemm2_bn(s2_tuned or None)
         gemm2_cu, _ = resolve_gemm2_cu(s2_tuned or None)
         self._gemm2_cu = gemm2_cu or WORKER_BLOCKS
@@ -359,7 +386,7 @@ class MegaMoEInternode:
             tile_group=self._s1_tile["tile_group"], comm_quant=self.comm_quant,
             quant=self.quant,
             data_send_ctas=int(self._s1_tile["data_send_ctas"]),
-            fanout_shards=int(self._s1_tile["fanout_shards"]),
+            fanout_ctas_per_dest=int(self._s1_tile["fanout_ctas_per_dest"]),
         )
         # One NIC MR covers the rail prefix; past ~1 GiB rail writes stop
         # landing (ionic). Refuse here instead of hanging in k2.
@@ -385,7 +412,7 @@ class MegaMoEInternode:
                 self.layout.stage1, self.layout.stage2,
                 rank=self.rank,
                 stage2_window_offset=self.layout.stage2_offset,
-                fanout_shards=int(self._s1_tile["fanout_shards"]),
+                fanout_ctas_per_dest=int(self._s1_tile["fanout_ctas_per_dest"]),
                 data_send_ctas=int(self._s1_tile["data_send_ctas"]),
                 split_local=bool(self._s1_tile["split_local"]),
                 activation=self.activation,
@@ -476,11 +503,11 @@ class MegaMoEInternode:
         if bad:
             raise ValueError(f"invalid A4W4 weight sizes in bytes: {', '.join(bad)}")
 
-    def _lookup_stage2_tune(self, rows: int) -> dict:
+    def _lookup_tune(self, rows: int) -> dict:
         try:
             from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 
-            tuned = lookup_stage2_tune(
+            tuned = lookup_tune(
                 gfx=get_gfx_runtime(), cu_num=get_cu_num(), token=rows,
                 model_dim=self.model_dim, inter_dim=self.inter_dim,
                 expert=self.epr, topk=self.topk,

@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: MIT
-"""rail_soa 的发送源:1x32 MXFP4 量化直接写成按 token 连续的 rail record。
+"""Build rail_soa send records directly from 1x32 MXFP4 quantization.
 
-record(每 token REC 字节,位于注册窗口 dispatch_staging 的 parity-0 平面):
-    [q  H/2 B | scale H/32 B | topk_ids TOPK*4 B | route_weights TOPK*4 B | pad]
-k1 的 T0 按 QP 切 token 段,每段一个 PUT 发出,不再有零散的 scale/ids/weights PUT
-(每个 WQE 的投递成本 ~15µs,与大小无关)。量化数学与 mega_moe/quant.py 的 fp4
-路径逐条相同,q/scale 逐位一致。
+Each token has a contiguous REC-byte record in dispatch_staging's parity-0 plane:
+    [q H/2 B | scale H/32 B | topk_ids TOPK*4 B | route_weights TOPK*4 B | pad]
+k1 T0 partitions tokens by QP and sends one PUT per segment, avoiding separate
+scale/ID/weight PUTs. Posting each WQE costs about 15 microseconds regardless
+of payload size. Quantization matches the fp4 path in mega_moe/quant.py
+instruction for instruction; q and scale are bitwise identical.
 """
 
 import flydsl.compiler as flyc
@@ -24,13 +25,14 @@ from ..tensor_shim import buf_copy_load, buf_copy_store, ptr_buf_tensor
 
 
 def rail_record_layout(hidden: int, topk: int, activation_dtype: str = "fp4"):
-    """(REC_BYTES, off_q, off_scale, off_ids, off_weights),全部 16B 对齐。"""
+    """Return (REC_BYTES, off_q, off_scale, off_ids, off_weights), all 16B-aligned."""
     if activation_dtype not in ("fp4", "fp8"):
         raise ValueError("activation_dtype must be fp4 or fp8")
     off_q = 0
     off_s = off_q + hidden // (1 if activation_dtype == "fp8" else 2)
     off_i = off_s + hidden // 32
-    # ids 段补齐到 16B:topk*4 不是 16 的倍数时(如 topk=6),weights 起点仍对齐。
+    # Pad IDs to 16B so weights stay aligned even when topk*4 is not a multiple of 16.
+    # For example, topk=6 still gives an aligned weights offset.
     off_w = off_i + (topk * 4 + 15) // 16 * 16
     end = off_w + topk * 4
     rec = (end + 255) // 256 * 256
@@ -82,7 +84,7 @@ def build_rail_record_quant(
                 out_q = ptr_buf_tensor(out, fx.Int32, unit_elems=4)
                 out_scale = ptr_buf_tensor(out, fx.Uint8)
                 out_meta = ptr_buf_tensor(out, fx.Int32)
-                # 与 quant.py fp4 路径相同的数学。
+                # Use the same arithmetic as quant.py's fp4 path.
                 in_vec = group_id * fx.Int32(GROUP * 2 // 16)
                 act = []
                 local_max = fx.Float32(1e-10)
@@ -157,7 +159,7 @@ def build_rail_record_quant(
                             fx.Int32,
                             unit_elems=4,
                         )
-                # 每 token 前 2*topk 个 group 线程顺带把 ids / weights 写进 record。
+                # The first 2*topk group threads per token also write IDs and weights into the record.
                 if gi < fx.Int32(topk):
                     ids_buf = ptr_buf_tensor(topk_ids, fx.Int32)
                     out_meta[(rec_base + fx.Int32(off_i)) // fx.Int32(4) + gi] = (

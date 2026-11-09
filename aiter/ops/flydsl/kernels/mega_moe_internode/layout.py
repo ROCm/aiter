@@ -165,8 +165,8 @@ class Stage1DispatchWire:
 
     @property
     def records_per_chunk(self) -> int:
-        # chunk 是信令粒度不是缓冲上限:staging/rx 都按 max_tokens 整块注册。
-        # 一个 rank 一个 chunk 时 WQE/门铃数最少(k1 -9%)。
+        # chunk controls signaling granularity; staging/rx register the full max_tokens buffer.
+        # One chunk per rank minimizes WQEs and doorbells (k1 latency reduced by 9%).
         if self.max_tokens > 0:
             capacity = max(self.num_qp, self.max_tokens)
         else:
@@ -215,13 +215,15 @@ class Stage1ArenaLayout:
     block_n: int
     parity_depth: int
     num_qp: int
-    # GMM1 把 tile_group 个物理相邻的 block_m 行 tile 当作一个 m_block。
-    # arena 的 tile 粒度仍是 block_m(Stage2 / MegaMoEv2 的 SBM 依赖它),
-    # 只有 GMM1 的 M 方向 tiling 变成 block_m*tile_group。
+    # GMM1 treats tile_group physically adjacent block_m-row tiles as one m_block.
+    # Arena tiles remain block_m rows, as Stage2 / MegaMoEv2 SBM requires.
+    # Only GMM1 M tiling changes to block_m*tile_group.
     tile_group: int
-    # 目的端预计算放置:计数先过 rail(只依赖 topk_ids,入口就有),目的端
-    # 算出每个 (源 rank, 本地 expert) 的行基址并留在自己 arena 里,node 内
-    # 的推送方/转发方直接 LSA 读。payload 阶段因此没有任何跨设备原子。
+    # Precompute placement at the destination. Send counts over the rail first;
+    # only topk_ids are needed, so this can start immediately. Each destination
+    # stores row bases for (source rank, local expert) in its arena. Intra-node
+    # producers and forwarders read them through LSA, avoiding cross-device atomics
+    # during payload transfer.
     regions: tuple[Stage1ArenaRegion, ...]
     total_bytes: int
     activation_dtype: str = "fp4"
@@ -243,11 +245,11 @@ class Stage1ArenaLayout:
 
     @property
     def max_tiles_per_expert(self) -> int:
-        # Also tolerate repeated exact expert IDs.  Normal top-k output is
-        # unique, but sizing the small map for the full route capacity avoids
-        # turning that assumption into an unchecked memory-safety contract.
-        # 成对认领按 tile_group 整组分配,所以每个 expert 的 map 槽位数必须
-        # 向上取整到 tile_group 的倍数,否则最后一组会越界写进下一个 expert。
+        # Also tolerate repeated exact expert IDs. Normal top-k output is unique,
+        # but sizing the small map for full route capacity avoids an unchecked
+        # memory-safety assumption. Paired claims allocate whole tile_group groups,
+        # so round each expert's map slots up to a multiple of tile_group to prevent
+        # the last group from overwriting the next expert's slots.
         n = (self.route_capacity + self.block_m - 1) // self.block_m
         g = self.tile_group
         return ((n + g - 1) // g) * g
@@ -259,7 +261,7 @@ class Stage1ArenaLayout:
         # as the existing conservative bound does.
         return (
             self.route_capacity + self.block_m - 1
-        ) // self.block_m + 2 * self.local_experts * self.tile_group  # 本地/远端各自按 G 补齐
+        ) // self.block_m + 2 * self.local_experts * self.tile_group  # Pad local and remote segments separately to G.
 
     @property
     def max_route_rows(self) -> int:
@@ -439,17 +441,18 @@ class Stage1ArenaLayout:
                 64,
             ),
             # Eight source-local communication roles write expert tiles on each
-            # destination rank.  One EOS slot covers the aligned pair of source
+            # destination rank. One EOS slot covers the aligned pair of source
             # ranks (local node + remote node), hence exactly eight EOS values.
-            # [0,8) = comm_eos(本地+远端两半都推完);[8,16) = local_eos(split_local:
-            # 该源 rank 的 fan1 已推完,只覆盖本地来源那一半)。
+            # [0,8): comm_eos, both local and remote halves are complete.
+            # [8,16): local_eos in split_local, this source rank's fan1 local half is complete.
             ("comm_eos", (parity_depth, 2 * gpus_per_node), torch.int64, 64),
             ("launch_ready", (parity_depth,), torch.int64, 64),
-            # fanout 分片后,每个目的 rank 的分片完成计数;最后一个分片
-            # 负责发 comm_eos 和信用原子。shards==1 时不使用。
-            # [8,16) = split_local 下 fan1 完成的分片计数(发 local_eos)。
+            # Per-destination shard completion counts. The last shard publishes comm_eos
+            # and the credit atomic; unused when shards==1. In split_local, [8,16) counts
+            # completed fan1 shards for publishing local_eos.
             ("fanout_shard_done", (parity_depth, 2 * gpus_per_node), torch.int32, 64),
-            # split_local:[0,LE) 本地来源行计数,[LE,2LE) 远端来源行计数(各自成组)。
+            # split_local: [0,LE) counts local-source rows; [LE,2LE) counts remote-source rows.
+            # Each segment forms its own groups.
             ("expert_count", (parity_depth, 2 * local_experts), torch.int32, 64),
             (
                 "expert_tile_map",
@@ -463,7 +466,7 @@ class Stage1ArenaLayout:
                 torch.int64,
                 64,
             ),
-            # word1 = split_local 下本地段的 tile 数(段 1 封尾后写)。
+            # word1: tile count of the split_local local segment, written after phase 1 sealing.
             ("tile_alloc", (parity_depth, 2), torch.int32, 64),
             ("tile_row_done", (parity_depth, max_route_tiles), torch.int32, 64),
             ("tile_expert", (parity_depth, max_route_tiles), torch.int32, 64),
@@ -511,7 +514,8 @@ class Stage1ArenaLayout:
             ("error_count", (1,), torch.int32, 64),
             # GEMM2 reads expert-major IDs and maps them to physical activation
             # tiles, so sorting never copies the quantized activation payload.
-            # h1_phys:tile_dst_of_src 的逆(排序后第 t 个 tile 的物理 tile);stage2 按它读 A。
+            # h1_phys is the inverse of tile_dst_of_src: the physical tile for sorted tile t.
+            # Stage2 uses it to read A.
             ("tile_src_of_dst", (parity_depth, max_route_tiles), torch.int32, 64),
             # Local sealing must precede final metadata publication. Job heads
             # also contain reservation counters; their cache-line spacing is ABI.
@@ -520,8 +524,8 @@ class Stage1ArenaLayout:
         ]
 
         if tile_group > 1:
-            # GMM1 以「组」为 m_block,expert-major 的目的地也必须按组给出。
-            # 只在开启时追加,默认配置的 arena 偏移逐字节不变。
+            # GMM1 uses groups as m_blocks, so expert-major destinations must also use groups.
+            # Append this only when enabled, preserving the default arena offsets byte for byte.
             for _gname in ("tile_expert_group",):
                 specs.append(
                     (
@@ -544,8 +548,9 @@ class Stage1ArenaLayout:
             )
         )
 
-        # split 路径的 GMM1 就绪队列:每项 (generation << 32) | 物理组号,generation 即有效标记,
-        # 不需要每代清零;写入位置由 gmm1_job_head word 8 的原子分配。
+        # Split-path GMM1 ready queue: (generation << 32) | physical group ID.
+        # generation marks validity, avoiding per-generation clearing. An atomic on
+        # gmm1_job_head word 8 allocates each queue write position.
         specs.append(
             (
                 "gmm1_ready_q",
@@ -583,11 +588,13 @@ class Stage1ArenaLayout:
                 ]
             )
 
-        # 被 RDMA(rail GDA)读写的 region 排在窗口最前,其后预留 stage2 整块(embed_stage2_bytes),
-        # 再放其余(LSA/本地,按 max_route_rows 放大的大块都在这里)。CCO 的 GDA 把整窗注册成一个
-        # iova=0 的 MR、raddr=窗口偏移;ionic 单 MR 有效范围有限(实测 rail 目标落在 ~1.07GiB 之后的写
-        # 全部不落地,10-08 TPR1024 random 挂死)。这样 RDMA 偏移只随 tokens 增长,与路由上限无关。
-        # 所有 kernel/host 都按名字取偏移,顺序可以随意调;stage1 仍从窗口偏移 0 开始。
+        # Place RDMA (rail GDA) regions first in the window, reserve embed_stage2_bytes,
+        # then place other LSA/local regions, including those scaled by max_route_rows.
+        # CCO GDA registers the whole window as one MR with iova=0 and window-relative
+        # raddr. Ionic's single-MR range is limited: writes past roughly 1.07GiB did
+        # not land, causing the October 8 TPR1024 random hang. This ordering makes
+        # RDMA offsets scale with tokens rather than route capacity. Host and kernels
+        # resolve offsets by name, so regions can be reordered; Stage1 still starts at 0.
         _rdma_first = (
             "dispatch_staging",
             "remote_dispatch_rx",
@@ -672,7 +679,7 @@ class TwoKernelArenaLayout:
     def compose(
         cls, stage1: Stage1ArenaLayout, stage2: object, *, alignment: int = 4096
     ) -> TwoKernelArenaLayout:
-        # stage2 嵌在 stage1 的 RDMA 前缀之后(见 Stage1ArenaLayout.create 的 embed_stage2_bytes)。
+        # Embed Stage2 after Stage1's RDMA prefix; see Stage1ArenaLayout.create embed_stage2_bytes.
         slot = stage1.region("stage2_embed")
         if slot.nbytes < int(stage2.total_bytes) or slot.offset % alignment:
             raise ValueError("stage2_embed slot is smaller than stage2 or misaligned")
@@ -908,8 +915,8 @@ class Stage2ArenaLayout:
             ),
         ]
 
-        # rail(RDMA)读写的 region 排在 stage2 最前(源 node_accumulator、目标 remote_partial_rx/
-        # return_group_ready/return_consumed),原因见 Stage1ArenaLayout.create 的说明。
+        # Place rail RDMA regions first in Stage2: source node_accumulator and targets
+        # remote_partial_rx, return_group_ready, and return_consumed. See Stage1ArenaLayout.create.
         _rdma_first = (
             "node_accumulator",
             "remote_partial_rx",

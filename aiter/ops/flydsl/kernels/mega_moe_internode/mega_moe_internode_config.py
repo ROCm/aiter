@@ -1,106 +1,46 @@
 # SPDX-License-Identifier: MIT
-"""Per-shape tune tables of MegaMoEInternode: Stage1 (dispatch + GMM1 tiling) and
-Stage2 (GEMM2 tile / grid and the rail chunk).
+"""Paired Stage1/Stage2 tuning for MegaMoEInternode.
 
-Both tables use the key ``aiter/fused_moe.py`` uses for its tuned tables
-(``gfx, cu_num, token, model_dim, inter_dim, expert, topk``), with ``token`` the
-GEMM row count ``max_tok_per_rank * topk`` (not the per-rank token count) and
-``expert`` the per-rank expert count.  Resolution is table > built-in rule, so an
-absent table never breaks a run; there is no per-field env override.  A sweep
-points ``AITER_CONFIG_MEGAMOE_INTERNODE_STAGE1`` / ``..._STAGE2`` at its own copy of
-a table, so every swept value is recorded in a file.
+Load ``aiter/configs/mega_moe_internode_tuned.csv``, or the file selected by
+``AITER_CONFIG_MEGAMOE_INTERNODE``. One row configures both stages. Missing
+shapes use built-in rules; both stages reject a row whose split path does
+not match the shape. There are no per-field environment overrides.
 
-Stage1 table (``megamoe_internode_stage1_tuned.csv``)
-=====================================================
+The key follows the MegaMoE TP table naming: ``gfx, cu_num, model_dim,
+inter_dim, experts, topk, tokens``. ``tokens`` is the per-rank input capacity,
+not tokens*topk. ``experts`` is the routed-expert count per EP rank. Internal
+lookup functions still accept GEMM rows as ``token`` and divide by topk.
 
-Four columns decide how Stage1 runs a shape:
+Stage1 parameters:
+* ``tile_group``: G adjacent 32-row arena tiles form one GMM1 M tile of 32*G.
+  The arena's 32-row granularity stays fixed; G also controls map allocation.
+* ``split_local``: split local/remote-source groups and start local GMM1 early.
+  The current shape rule selects split at tokens>=1024. Each path derives its
+  associated scheduling, sealing, and padding switches from this setting.
+* ``fanout_ctas_per_dest``: Stage1 fanout-role CTA slots per destination GPU.
+  Eight destinations reserve 8*N slots. T0 occupies destination 0's first slot
+  for CCO/credits/sealing; rail posting slots also skip token copies. These
+  CTAs can join GMM1 after their communication work. Unsplit accepts 2..31,
+  defaulting to 16; split accepts 17..31, defaulting to 17. Missing or invalid
+  values fall back without discarding other valid fields.
+* ``data_send_ctas``: 0 copies metadata and payload together; 32 or 64 reserves
+  a separate payload-send pool. Metadata plus payload pools must fit 256 CTAs.
 
-``tile_group`` (G)
-    The arena tile stays ``block_m`` = 32 rows (Stage2 and MegaMoEv2's SBM depend
-    on that grain), but ``tile_alloc`` hands out G physically adjacent tiles per
-    claim and GMM1 runs one m_block of ``32 * G`` rows over them.  G is also an
-    arena-layout parameter (map slots are rounded up to G), so it must be known
-    before ``Stage1ArenaLayout.create``.
-``split_local`` (0/1)
-    Which GMM1 path runs (below).
-``fanout_shards``
-    Fan-out CTAs per destination GPU. Defaults to 17 on the split path and
-    16 unsplit when absent or invalid. Unsplit accepts 2..31; split accepts 17..31.
-``data_send_ctas`` (0/32/64)
-    Payload-send CTAs shared by the fanout roles. Zero keeps metadata and
-    payload together; 32 or 64 separates their work through a send queue.
+Stage2 parameters:
+* ``gemm2_bm``: M tile. 0 selects the path-dependent default: 64 for xGMI,
+  128 for SDMA, or 32 when remote-first fusion/tile-group alignment prevents
+  the larger tile. SDMA rows retain 0 so a missing SDMA queue can safely fall
+  back to the xGMI tile. An explicit tile above 32 must divide 32*tile_group.
+* ``gemm2_bn``: GEMM2 N tile, 128 or 256.
+* ``gemm2_cu``: persistent grid; 0 uses the operator's worker_blocks.
+* ``return_chunk_tokens``: token granularity of rail chunks/readiness signals.
+* ``intra_comm``: xgmi or sdma; SDMA requires the fused remote-first split path.
 
-Knobs every measured shape set to the same value are constants in the Stage1
-kernel, not columns: GMM1's N block = 256 (128 was slower on every shape
-measured, e.g. +32us at K3 TPR128) and the first GMM1 worker ticket = 8 (the old
-essential-CTA count measured 44-87us slower on every shape tried).
-
-The built-in rule is a fallback fitted to measurements, not a model.  The
-weight-re-read model (smallest G minimising ``ceil(rows / 32G)``) was measured
-wrong on the current Stage1: K3 2026-09-29 (47+50, fused_stage1 us)
-
-    rows/expert   G=1     G=2     G=4
-    36.6 (TPR128) 296.3   348.4   344.3   <- model picked G=2, the slowest
-    73   (TPR256) 493.5   378.4   368.9
-    146  (TPR512) 685.2   617.6   407.6
-
-so the rule is G=1 up to ``_G1_MAX_ROWS`` rows per expert and G=4 above it.
-G=2 is never picked by default (it also hung once on DSV4 TPR512).  G=8 does
-not fit: the 256-row accumulator needs 256 KB of LDS.
-
-``split_local``
-    Whether Stage1 splits each expert into a local-source and a remote-source
-    group and starts GMM1 on the local group before the remote rows arrive
-    (split_local + early_local_gmm and the switches that depend on it).  Each
-    group gets its own tiles, so GMM1 reads every expert's weights once per
-    group.  When one m_block (32 * G <= 128 rows) holds all of an expert's rows,
-    the unsplit path reads the weights once and that beats the overlap; above
-    that both paths re-read and the overlap wins.  46+47, 2026-10-06, Stage1 us:
-
-        shape     rows/expert   split (G table)   unsplit (G)
-        K3 128      36.6          297.8 (1)         242.4 (2)
-        K3 256      73            370.1 (4)         281.3 (4)
-        K3 512      146           395.1 (4)         459.2 (4)
-        DSV4 128    32            269.7 (1)         207.9 (1)
-        DSV4 256    64            304.1 (4)         262.7 (2)
-        DSV4 512    128           331.5 (4)         283.5 (4)
-
-    In the single kernel (2026-11-05, 46+50, end-to-end us, split -> unsplit,
-    random / eplb) the cut moved to a per-rank token count: unsplit wins below
-    TPR 1024, split from 1024 up (``_SPLIT_MIN_TPR``):
-
-        K3 256       811 -> 650 / 734 -> 565      DSv4.1 512   593 -> 534 / 506 -> 469
-        K3 512       982 -> 841 / 782 -> 898      DSv4.1 1024  789 -> 795 / 584 -> 664
-        K3 1024     1363 -> 1238 / 1293 -> 1288   DSv4.1 2048 1085 -> 1338 / 974 -> 1138
-        K3 2048     1707 -> 2135 / 1890 -> 2053   DSv4.1 4096 1746 -> 2391 / 1679 -> 2109
-        K3 4096     2972 -> 3980 / 3102 -> 4001
-
-    (K3 512 eplb is the one loss below the cut; at TPR >= 2048 unsplit also gives
-    up the SDMA push and remote-first GEMM2, which need the split.)
-
-    The G=1/G=4 rule above was measured on the split path (a G=2 split pads each
-    half to 64 rows, which is why it lost); unsplit takes the smallest G whose
-    m_block holds the rows.  The operator derives each path's companion
-    switches from this value (split: early_local_gmm, fan2_shards, lazy_pad,
-    extra_consumers; unsplit: static_g0, seal_fast); split without
-    early_local_gmm was measured a net loss.
-
-Stage2 table (``megamoe_internode_stage2_tuned.csv``)
-=====================================================
-
-``return_chunk_tokens`` is genuinely shape-dependent: CHUNK sets the rail packet
-size (32 beat 16 by 8.8us at token=8192) and the optimum moves with the token
-count, so a single process-wide setting cannot hold the right answer for every
-shape.  The rail queue count was 8 on every measured shape and is the constant
-``NUM_QP``.
-
-``gemm2_bn`` is kernel1's GEMM2 N tile (128 or 256) and ``gemm2_cu`` kernel1's
-persistent grid (0 = the operator's worker_blocks).  ``gemm2_bm`` (optional
-column; empty = the rule in ``resolve_gemm2_bm``) is the GEMM2 M tile of the
-fused stage2: 32*GS rows = GS consecutive 32-row arena tiles of one Stage1 tile
-group, so GS must divide the shape's Stage1 ``tile_group``.  ``intra_comm``
-(optional column: ``xgmi`` / ``sdma``; empty = the rule in
-``resolve_stage2_sdma``) is how the fused stage2 moves its intra-node rows.
+``us`` is informational and never affects selection. Measured rows record
+A4W4 full-forward GPU event latency, including quantization and communication,
+for EPLB: warmup 10, 40 samples per rank, mean of all 16 per-rank minima.
+No redundant configuration tag is stored: the parameter columns already
+describe the chosen configuration.
 """
 
 from __future__ import annotations
@@ -112,7 +52,7 @@ import threading
 
 logger = logging.getLogger(__name__)
 
-_KEY_FIELDS = ("gfx", "cu_num", "token", "model_dim", "inter_dim", "expert", "topk")
+_KEY_FIELDS = ("gfx", "cu_num", "model_dim", "inter_dim", "experts", "topk", "tokens")
 
 
 class _TuneTable:
@@ -175,11 +115,11 @@ class _TuneTable:
         key = (
             str(gfx),
             int(cu_num),
-            int(token),
             int(model_dim),
             int(inter_dim),
             int(expert),
             int(topk),
+            int(token) // int(topk),
         )
         path = self.path()
         with self._lock:
@@ -209,9 +149,9 @@ _G1_MAX_ROWS = 48
 # Split from this many tokens per rank up (token / topk; see ``split_local`` above).
 _SPLIT_MIN_TPR = 1024
 # The split path reserves 16 remote fanout shards plus the CCO ticket.
-_FANOUT_SHARDS = {0: 16, 1: 17}
+_FANOUT_CTAS_PER_DEST = {0: 16, 1: 17}
 # T0 keeps its CCO role, so dest0 needs another shard; leave compute CTAs free.
-FANOUT_SHARDS_MIN, FANOUT_SHARDS_MAX = 2, 31
+FANOUT_CTAS_PER_DEST_MIN, FANOUT_CTAS_PER_DEST_MAX = 2, 31
 
 
 def _validate_stage1(row: dict, where: str) -> None:
@@ -228,22 +168,13 @@ def _validate_stage1(row: dict, where: str) -> None:
     ds = int(row.get("data_send_ctas", 0))
     if ds not in (0, 32, 64):
         raise ValueError(f"{where}: data_send_ctas must be 0, 32 or 64 (got {ds})")
-    minimum = 17 if row["split_local"] else FANOUT_SHARDS_MIN
-    fs = row.get("fanout_shards")
-    if fs is None or not minimum <= fs <= FANOUT_SHARDS_MAX:
-        fs = default_fanout_shards(row["split_local"])
-    row["fanout_shards"] = fs
+    minimum = 17 if row["split_local"] else FANOUT_CTAS_PER_DEST_MIN
+    fs = row.get("fanout_ctas_per_dest")
+    if fs is None or not minimum <= fs <= FANOUT_CTAS_PER_DEST_MAX:
+        fs = default_fanout_ctas_per_dest(row["split_local"])
+    row["fanout_ctas_per_dest"] = fs
     if ds and fs * 8 + ds > 256:
         raise ValueError(f"{where}: metadata plus data roles exceed the resident grid")
-
-
-STAGE1_TABLE = _TuneTable(
-    "AITER_CONFIG_MEGAMOE_INTERNODE_STAGE1",
-    "megamoe_internode_stage1_tuned.csv",
-    ("tile_group", "split_local"),
-    _validate_stage1,
-    optional_fields=(("fanout_shards", 0), ("data_send_ctas", 0)),
-)
 
 
 def default_split_local(token: int, topk: int) -> int:
@@ -266,9 +197,9 @@ def default_tile_group(token: int, expert: int, split_local: int = 1) -> int:
     return 1 if rows <= _G1_MAX_ROWS else 4
 
 
-def default_fanout_shards(split_local: int) -> int:
+def default_fanout_ctas_per_dest(split_local: int) -> int:
     """Safe default shared by table validation and shape-rule fallback."""
-    return _FANOUT_SHARDS[int(bool(split_local))]
+    return _FANOUT_CTAS_PER_DEST[int(bool(split_local))]
 
 
 def resolve_stage1_tile(
@@ -281,7 +212,7 @@ def resolve_stage1_tile(
     gfx: str | None = None,
     cu_num: int | None = None,
 ) -> dict:
-    """Return ``{"tile_group", "split_local", "fanout_shards", "source"}`` for this
+    """Return ``{"tile_group", "split_local", "fanout_ctas_per_dest", "source"}`` for this
     shape; ``source`` is ``table`` or ``default`` (the built-in rule).  The kernel
     name (``_tg{G}``, ``_fos{N}``, ``_slg``) remains the ground truth for what ran.
 
@@ -301,7 +232,7 @@ def resolve_stage1_tile(
             chip_gfx, chip_cu = _chip()
             gfx = chip_gfx if gfx is None else gfx
             cu_num = chip_cu if cu_num is None else cu_num
-        tuned = STAGE1_TABLE.lookup(
+        tuned = lookup_tune(
             gfx=gfx,
             cu_num=cu_num,
             token=token,
@@ -318,12 +249,21 @@ def resolve_stage1_tile(
         logger.debug("Stage1 tune lookup failed; using built-in rules", exc_info=True)
         tuned = None
     if tuned is not None and int(tuned["split_local"]) == split:
-        out, source = dict(tuned), "table"
+        out = {
+            key: tuned[key]
+            for key in (
+                "tile_group",
+                "split_local",
+                "fanout_ctas_per_dest",
+                "data_send_ctas",
+            )
+        }
+        source = "table"
     else:
         out = {
             "split_local": split,
             "tile_group": default_tile_group(token, expert, split),
-            "fanout_shards": default_fanout_shards(split),
+            "fanout_ctas_per_dest": default_fanout_ctas_per_dest(split),
             "data_send_ctas": 0,
         }
         source = "default"
@@ -459,17 +399,28 @@ def _validate_stage2(row: dict, where: str) -> None:
         )
 
 
-STAGE2_TABLE = _TuneTable(
-    "AITER_CONFIG_MEGAMOE_INTERNODE_STAGE2",
-    "megamoe_internode_stage2_tuned.csv",
-    ("return_chunk_tokens", "gemm2_bn", "gemm2_cu"),
-    _validate_stage2,
+def _validate_tune(row: dict, where: str) -> None:
+    """Validate the paired Stage1 and Stage2 parameters in one CSV row."""
+    _validate_stage1(row, where)
+    _validate_stage2(row, where)
+
+
+TUNE_TABLE = _TuneTable(
+    "AITER_CONFIG_MEGAMOE_INTERNODE",
+    "mega_moe_internode_tuned.csv",
+    ("tile_group", "split_local", "return_chunk_tokens", "gemm2_bn", "gemm2_cu"),
+    _validate_tune,
     # 0 / "" = the built-in rule
-    optional_fields=(("gemm2_bm", 0), ("intra_comm", "")),
+    optional_fields=(
+        ("fanout_ctas_per_dest", 0),
+        ("data_send_ctas", 0),
+        ("gemm2_bm", 0),
+        ("intra_comm", ""),
+    ),
 )
 
 
-def lookup_stage2_tune(
+def lookup_tune(
     *,
     gfx: str,
     cu_num: int,
@@ -479,12 +430,13 @@ def lookup_stage2_tune(
     expert: int,
     topk: int,
 ) -> dict | None:
-    """Return ``{"return_chunk_tokens", "gemm2_bn", "gemm2_cu"}`` or ``None``.
+    """Return one paired configuration, or None when the shape/path has no row.
 
-    ``expert`` is the per-rank routed-expert count and ``inter_dim`` the global
-    one, matching ``kimik3_a4w4_tuned_fmoe.csv``.
+    ``token`` is the GEMM row count (tokens per rank times topk); the CSV uses
+    per-rank ``tokens``. ``expert`` maps to the per-rank ``experts`` column.
+    Stage1 and Stage2 share the row and the same split-path compatibility check.
     """
-    return STAGE2_TABLE.lookup(
+    row = TUNE_TABLE.lookup(
         gfx=gfx,
         cu_num=cu_num,
         token=token,
@@ -493,12 +445,15 @@ def lookup_stage2_tune(
         expert=expert,
         topk=topk,
     )
+    if row is not None and row["split_local"] != default_split_local(token, topk):
+        return None
+    return row
 
 
 def resolve_gemm2_bn(tuned: dict | None) -> tuple[int, str]:
     """GEMM2 N tile and its source: table > default.
 
-    ``tuned`` is the ``lookup_stage2_tune`` result (``None`` on a miss); the
+    ``tuned`` is the ``lookup_tune`` result (``None`` on a miss); the
     caller already has it, so this does not look the table up again.
     """
     if tuned:
