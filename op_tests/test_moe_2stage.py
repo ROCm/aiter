@@ -2572,6 +2572,9 @@ def run_blockscale_limit_cases():
     rows = [
         test_blockscale_swiglu_limit(token, limit)
         for token, limit in itertools.product((1, 32, 1024), (1.0, 7.0, None))
+        # Without a limit, token > 32 takes the untuned ASM 1-stage default,
+        # which picks a flat kernel for sorted inputs at model_dim 256 on gfx942.
+        if limit is not None or token <= 32
     ]
     aiter.logger.info(
         "blockscale SiLU limit summary (markdown):\n%s",
