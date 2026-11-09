@@ -18,11 +18,13 @@ change.
 A row tuned at M also serves the M between the previous tuned M of its shape
 and M, and some compile-time parameters follow the actual M (a4w4's cluster_m
 and bounded-M variants, mxfp8's split-K and cluster fallbacks), so every row
-is replayed at its M and at the smaller M it serves. On gfx1250 every one of
-those M is identified without compiling, and one M per set of kernels they
-request is replayed (``SCAN_ARCHS``, ``replay.py``): bisecting between the two
-ends would not do there, as cluster_m is the largest that divides M's tile
-count, so the kernels change and change back as M grows. Rows of other archs
+is replayed at its M and at the smaller M it serves. On gfx1250 those M are
+identified without compiling at the sizes where the runtime's choice can
+change (:func:`scan_sizes`: tile-count edges, padded-M lookup pieces, the
+heuristics' size classes), and one M per set of kernels they request is
+replayed (``SCAN_ARCHS``, ``replay.py``): bisecting between the two ends
+would not do there, as cluster_m is the largest that divides M's tile count,
+so the kernels change and change back as M grows. Rows of other archs
 are replayed at the smallest M they serve and bisected between the two ends
 where they request different kernels. Either way that also reaches the FlyDSL
 heuristic kernels the runtime falls back to below a shape's smallest tuned M.
@@ -45,6 +47,8 @@ Environment variables:
 from __future__ import annotations
 
 import csv
+import itertools
+import math
 import os
 import re
 from collections.abc import Callable
@@ -56,7 +60,8 @@ from aiter.jit.core import AITER_CONFIGS
 LABEL = "GEMM"
 AOT_ARCH_DEFAULT = "gfx950"
 # Archs whose GEMMs pick kernels non-monotonically in M: cluster_m is fitted to
-# the number of M tiles, and a ragged last tile is a variant of its own.
+# the number of M tiles, and a ragged last tile is a variant of its own. Their
+# rows are scanned at the sizes scan_sizes() names.
 SCAN_ARCHS = ("gfx1250",)
 # The runtime's own limits at an M inside a row's range (``replay.py``): for
 # some untuned M, gemm_a8w8_blockscale_abpreshuffle has no FlyDSL kernel that
@@ -444,6 +449,80 @@ def _variants(table: Table, job: dict) -> list[dict]:
     if table.caller in (_a8w8_blockscale, _a8w8_blockscale_bpreshuffle):
         return [{"outdtype": f"torch.{name}"} for name in ("bfloat16", "float16")]
     return [{}]
+
+
+# tile_m and cluster_m of a kernelName, as the gfx1250 name parsers read them.
+_TILING = re.compile(r"_t(\d+)x\d+x\d+_.*_cm(\d+)_cn")
+# Up to this M, untuned-shape heuristics are covered by 8 size classes per octave.
+_HEURISTIC_MAX_M = 4096
+_HEURISTIC_BLOCKS_PER_OCTAVE = 8
+
+
+def scan_sizes(job: dict, low: int) -> list[int]:
+    """The M in [low, job's M) where the runtime's kernel choice can change."""
+    from aiter.ops.gemm_op_common import get_padded_m
+
+    high, n, k = job["m"], job["n"], job["k"]
+    sizes = {low}
+    sizes |= {
+        v
+        for bit in range(high.bit_length())
+        for v in (1 << bit, (1 << bit) + 1)
+        if low <= v < high
+    }
+    match = _TILING.search(job["kernel_name"])
+    tile_m, cluster_m = (int(match[1]), int(match[2])) if match else (0, 0)
+    pieces = _lookup_pieces(lambda m, gl: get_padded_m(m, n, k, gl), low, high)
+    for start, end in pieces:
+        sizes.add(start)
+        if tile_m:
+            window = math.lcm(*range(1, cluster_m + 1))
+            sizes |= _tile_sizes(start, end, tile_m, window)
+        # Octave (2^bit, 2^(bit+1)] of M, in blocks of 1/8 of its top.
+        for bit in range(_HEURISTIC_MAX_M.bit_length()):
+            first = max(start, (1 << bit) + (bit > 0))
+            stop = min(end, (2 << bit) + 1, _HEURISTIC_MAX_M + 1)
+            if first < stop:
+                block = max(1, (2 << bit) // _HEURISTIC_BLOCKS_PER_OCTAVE)
+                sizes |= _tile_sizes(first, stop, block, stop)
+    return sorted(size for size in sizes if low <= size < high)
+
+
+def _lookup_pieces(padded_m, low: int, high: int) -> list[tuple[int, int]]:
+    """[start, end) pieces of [low, high) on which the padded-M lookup finds the same row."""
+    cuts = {low, high}
+
+    def split(a: int, pa: int, b: int, pb: int) -> None:
+        if pa != pb and b - a == 1:
+            cuts.add(b)
+        elif pa != pb:
+            mid = (a + b) // 2
+            pm = padded_m(mid, 1)
+            split(a, pa, mid, pm)
+            split(mid, pm, b, pb)
+
+    if high - low >= 2:
+        split(low, padded_m(low, 1), high - 1, padded_m(high - 1, 1))
+    if padded_m(high - 1, 0) >= high:
+        first, last = low, high - 1
+        while first < last:
+            mid = (first + last) // 2
+            if padded_m(mid, 0) >= high:
+                last = mid
+            else:
+                first = mid + 1
+        cuts.add(first)
+    return list(itertools.pairwise(sorted(cuts)))
+
+
+def _tile_sizes(start: int, end: int, tile: int, window: int) -> set[int]:
+    """Smallest, next and largest M of the first ``window`` tile counts and the last."""
+    first, last = -(-start // tile), -(-(end - 1) // tile)
+    sizes = set()
+    for count in {*range(first, min(last, first + window - 1) + 1), last}:
+        lo, hi = max(start, (count - 1) * tile + 1), min(end - 1, count * tile)
+        sizes |= {lo, min(lo + 1, hi), hi}
+    return sizes
 
 
 def replay(job: dict) -> None:

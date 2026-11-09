@@ -26,20 +26,23 @@ A module provides
 - optionally ``config_env(csv_paths)``, the environment that points the
   runtime's tuned-config lookups at the given tables,
   ``configure(parser)`` for options of its own, ``SCAN_ARCHS``, the archs
-  whose jobs have every size identified, and ``REFUSALS``, the limits the
-  runtime meets at sizes inside a row's range (both below).
+  whose jobs have their sizes identified, ``scan_sizes(job, low)``, the
+  sizes of a job's range to identify there (default: every one), and
+  ``REFUSALS``, the limits the runtime meets at sizes inside a row's range
+  (all below).
 
 Its ``python -m`` entry is :func:`main`, and ``setup.py``'s build runs
 :func:`run_default`. Both run one process per target arch (``replay_env``),
 each replaying its jobs in a pool of workers.
 
-For an arch in ``SCAN_ARCHS``, every size of a job's range is identified:
-replayed with its launches stopped at their cache identity
-(:func:`identified_kernels`, nothing compiled), and one size per set of
-kernels not yet built is replayed for real. A runtime whose choices are not
-monotonic in the size needs that, as a gfx1250 GEMM's are: it fits cluster_m
-to the number of M tiles and specializes a ragged last tile, so M=5120 and
-M=6144 can request one kernel and M=5632 another.
+For an arch in ``SCAN_ARCHS``, the sizes of a job's range that
+``scan_sizes`` names (every size without it) are identified: replayed with
+their launches stopped at their cache identity (:func:`identified_kernels`,
+nothing compiled), and one size per set of kernels not yet built is replayed
+for real. A runtime whose choices are not monotonic in the size needs that,
+as a gfx1250 GEMM's are: it fits cluster_m to the number of M tiles and
+specializes a ragged last tile, so M=5120 and M=6144 can request one kernel
+and M=5632 another.
 
 Otherwise, where a job's two ends request different FlyDSL kernels, the sizes
 between them are bisected down to every size at which the runtime switches
@@ -69,7 +72,7 @@ import time
 import traceback
 import zlib
 from collections import Counter
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import AbstractContextManager, contextmanager
 from typing import Any
 
@@ -281,7 +284,7 @@ def _bisect(module, job: dict, kernels: dict, low: int, high: int) -> list[dict]
     ]
 
 
-def _kernel_sets(module: Any, job: dict, sizes: range) -> dict:
+def _kernel_sets(module: Any, job: dict, sizes: Iterable[int]) -> dict:
     """The FlyDSL kernels the runtime requests at each of ``sizes``, identified
     without compiling: each distinct set, or for a size the call fails at its
     error with the numbers masked, mapped to the first size to request it."""
@@ -315,13 +318,24 @@ def _kernel_sets(module: Any, job: dict, sizes: range) -> dict:
     return found
 
 
+def _scan_sizes(module: Any, job: dict, low: int) -> Iterator[int]:
+    """The sizes of a job's range to identify: those ``module.scan_sizes``
+    names, else every one. Lazy, so that they are named inside the dry run
+    that identifies them, as the runtime helpers they may use (e.g.
+    ``get_padded_m``) need its fake device."""
+    scan_sizes = getattr(module, "scan_sizes", None)
+    yield from scan_sizes(job, low) if scan_sizes else range(low, job["m"])
+
+
 def _scan(module: Any, job: dict, low: int, built: frozenset) -> list[dict]:
-    """Identify every size from ``low`` up to the job's own, and replay one
+    """Identify the sizes from ``low`` up to the job's own (those
+    ``module.scan_sizes(job, low)`` names, else every one), and replay one
     size per set of kernels ``built`` lacks, and one per kind of failure (which
     :func:`replay_job` then reports as it reports any probe)."""
     built = set(built)
     probes = []
-    for outcome, size in _kernel_sets(module, job, range(low, job["m"])).items():
+    sizes = _scan_sizes(module, job, low)
+    for outcome, size in _kernel_sets(module, job, sizes).items():
         if isinstance(outcome, frozenset) and outcome <= built:
             continue
         result, kernels = replay_job(module, {**job, "m": size}, probe=True)

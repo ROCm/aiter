@@ -178,3 +178,56 @@ def test_a4w4_csv_rows_reach_flydsl_through_public_replay(monkeypatch):
                 assert kernels, job
     finally:
         get_GEMM_config.cache_clear()
+
+
+def test_a_scan_identifies_only_the_sizes_the_module_names():
+    seen = []
+    module = _module(lambda job: seen.append(job["m"]))
+    module.scan_sizes = lambda job, low: [low, 7, job["m"] - 1]
+    with mock.patch.object(replay, "replay_job") as replayed:
+        replay._scan(module, {**_JOB, "m": 16}, 3, frozenset())
+    assert seen == [3, 7, 15]
+    # No size requested a kernel the row's replay lacks: none is replayed.
+    replayed.assert_not_called()
+
+
+def _padded_m(m, gl, n=7168):
+    """getPaddedM (csrc/py_itfs_cu/gemm_common.cu)."""
+    pow2 = 1 << (m - 1).bit_length()
+    if gl == 1:
+        return 8192 if m > 8192 and n > 4096 else pow2
+    if m < 16:
+        return pow2
+    limits = ((256, 16), (1024, 32), (4096, 64))
+    grain = next((g for limit, g in limits if m <= limit), 128)
+    return -(-m // grain) * grain
+
+
+def test_gemm_scan_splits_a_range_where_the_padded_lookup_changes():
+    from aiter.aot.flydsl import gemm
+
+    # Above 8192 (N > 4096) gl=1 pads to 8192; only the top 128-row block pads
+    # (gl=0) to the row's own M.
+    assert gemm._lookup_pieces(_padded_m, 8193, 16384) == [
+        (8193, 16257),
+        (16257, 16384),
+    ]
+    # gl=1 changes at each power of two; 100 pads to 112 (gl=0), past the range.
+    assert gemm._lookup_pieces(_padded_m, 5, 100) == [
+        (5, 9),
+        (9, 17),
+        (17, 33),
+        (33, 65),
+        (65, 97),
+        (97, 100),
+    ]
+
+
+def test_gemm_scan_takes_each_tile_count_ragged_at_both_parities_and_full():
+    from aiter.aot.flydsl import gemm
+
+    assert sorted(gemm._tile_sizes(1, 1000, 256, 2)) == [
+        *(1, 2, 256),  # count 1
+        *(257, 258, 512),  # count 2
+        *(769, 770, 999),  # the last count, its tile not filled below 1000
+    ]
