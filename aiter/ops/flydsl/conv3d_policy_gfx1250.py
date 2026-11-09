@@ -50,6 +50,8 @@ BASELINE_TILES = (
 
 MAX_N_ACC = 32
 MIN_WAVES = 2
+# Tile shapes appended by grid fill when the area-first order underfills the device.
+FILL_SHAPES = 6
 
 
 def is_legal_tile_gfx1250(tile_m, tile_n, wave_m, wave_n, block_rows):
@@ -103,6 +105,32 @@ def _ceil_div(value, divisor):
 
 def _n_fill(tile_n, kg):
     return kg / (_ceil_div(kg, tile_n) * tile_n)
+
+
+def _grid_fill(blocks, num_cu):
+    return blocks / (_ceil_div(blocks, num_cu) * num_cu)
+
+
+def _fill_extras(scored, num_cu, seen):
+    """Every variant of the FILL_SHAPES (tile_m, tile_n) that fill the CUs best.
+
+    Fill is rounded to one decimal so near-equal fills fall back to the
+    area-first order rather than to small differences in block count.
+    """
+    by_fill = sorted(
+        scored,
+        key=lambda item: (-round(_grid_fill(item[0][2], num_cu), 1), *item[0][1:]),
+    )
+    shapes, extras = [], []
+    for _, config in by_fill:
+        shape = config[:2]
+        if shape not in shapes:
+            if len(shapes) == FILL_SHAPES:
+                continue
+            shapes.append(shape)
+        if config not in seen:
+            extras.append(config)
+    return extras
 
 
 def _block_rows_for(tile_m):
@@ -186,6 +214,10 @@ def get_flydsl_conv3d_configs_gfx1250(
     configs = [config for _, config in scored[:max_configs]]
 
     seen = set(configs)
+    # Area first leaves small problems with a few large blocks and idle CUs.
+    if scored and scored[0][0][2] < num_cu:
+        configs += _fill_extras(scored, num_cu, seen)
+        seen = set(configs)
     for tile_m, tile_n, wave_m, wave_n, block_rows in BASELINE_TILES:
         if not is_legal_tile_gfx1250(tile_m, tile_n, wave_m, wave_n, block_rows):
             continue

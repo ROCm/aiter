@@ -199,7 +199,11 @@ python3 -m pytest op_tests/tuning_tests/test_config_shape_collision.py
 - **Description**: Cap on enumerated candidates per shape. The kernel's own
   candidate table and heuristic ladder are unioned in on top of the cap, and so
   is the tile the shape would borrow from another tuned resolution of its layer,
-  so the tuned pick can never come out worse than the shipped default.
+  so the tuned pick can never come out worse than the shipped default. On
+  gfx1250 the cap keeps the largest tiles first; when even the top candidate
+  leaves CUs without a block, every variant of the six tile shapes that fill
+  the CUs best is added on top as well (small-M layers such as the Wan2.1
+  encoder mid block, M = 3128 at 368x544).
 
 ### `--pipelines`
 - **Type**: comma list of `num_buffers:main_loop_unroll`
