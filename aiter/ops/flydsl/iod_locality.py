@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""IOD-local placement of MoE GEMM weights on MI455X (gfx1250, SPX + NPS1).
+"""IOD-local placement of MoE GEMM weights on gfx1250 (SPX + NPS1).
 
 A 16 KiB granule at ``addr`` is homed on IOD domain
 ``a14 ^ a17 ^ a20 ^ phase[addr >> 21]``; the per-2 MiB-page phase is
