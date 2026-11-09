@@ -882,6 +882,21 @@ _LINEAR_CASES = [
         "asymmetric-kv2-gqa8-page64-w128",
         dict(_ASYMMETRIC_BASE, kv_heads=2, group_size=8, window=128, max_partitions=4),
     ),
+    # Plain decode and shorter MTP drafts: every query-length layout.
+    *[
+        (
+            f"mimo-mtp{query_length}-page{page}-skewed",
+            dict(
+                _MIMO_BASE,
+                query_length=query_length,
+                block_size=page,
+                lengths=_MIMO_SKEWED_LENGTHS,
+                capture=True,
+            ),
+        )
+        for query_length in range(1, 8)
+        for page in (64, 128)
+    ],
     (
         "mimo-page128-large-address",
         dict(

@@ -1,20 +1,26 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025-2026 FlyDSL Project Contributors
 
-"""Eight-wave ping-pong PA decode tile kernel for gfx950 BF16 linear KV.
+"""Ping-pong PA decode tile kernel for gfx950 BF16 linear KV.
 
 One CTA owns a task's full query block (``query_length * 16`` rows of one KV
-head). Wave ``w`` owns row block ``w % 4`` (32 rows, two queries) and token
-half ``w // 4`` of each 64-token tile, so the two waves of a SIMD form a
-ping-pong pair over the same rows. K/V tiles stream into an LDS ring by async
-DMA; each wave keeps its own online softmax, P stays in registers (the QK
-accumulator layout is PV's B operand), and the two token halves merge through
-LDS at the end into the shared reducer's partial layout.
+head) and streams 64-token K/V tiles into an LDS ring by async DMA. Its waves
+split the block into row blocks of ``M_TILES`` 16-row tiles and each tile's
+tokens into token slots of 16 or 32 tokens; wave ``w`` owns row block
+``w % ROW_BLOCKS`` and token slot ``w // ROW_BLOCKS``, so the waves sharing a
+SIMD work on the same rows. Each wave keeps its own online softmax, P stays in
+registers (the QK accumulator layout is PV's B operand), and the token slots
+merge through LDS at the end into the shared reducer's partial layout.
+Query lengths that do not fill the last row block pad it; padded rows are
+computed but never stored.
 """
+
+import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
+from flydsl._mlir.dialects import rocdl as mlir_rocdl
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import T
@@ -25,9 +31,8 @@ from .pa_decode.traits import KV_COMPUTE_BLOCK, LOG2E, WAVE
 from .tensor_shim import buf_base_i64, buf_scalar_load, ptr_buf_tensor
 from .utils import rcp_f32
 
-ROW_BLOCKS = 4
-SLOT_TOKENS = 32
-ROWS_PER_WAVE = 32
+TILE = 64
+MAX_QUERY_LENGTH = 8
 # Scores may exceed the row's reference max by 2**RESCALE_LOG2 before P is
 # rescaled; BF16 P and f32 l and O hold that range.
 RESCALE_LOG2 = 8.0
@@ -44,6 +49,25 @@ def _uni64(v):
     lo = _uni(fx.Int32(v & fx.Int64(0xFFFFFFFF)))
     hi = _uni(fx.Int32(v >> 32))
     return (fx.Int64(hi) << 32) | (fx.Int64(lo) & fx.Int64(0xFFFFFFFF))
+
+
+def _aux(value):
+    return ir.IntegerAttr.get(ir.IntegerType.get_signless(32), value)
+
+
+def pingpong_layout(query_length):
+    """(M_TILES, ROW_BLOCKS, CHUNKS): 16-row tiles per wave, row blocks, and
+    16-token chunks per wave; a 64-token tile has 64 // (16 * CHUNKS) slots."""
+    override = os.environ.get("PP_LAYOUT")
+    if override:
+        return tuple(int(x) for x in override.split(","))
+    if query_length == 1:
+        return 1, 1, 1
+    if query_length == 2:
+        return 2, 1, 1
+    if query_length <= 4:
+        return 2, 2, 1
+    return 2, 4, 2
 
 
 def pingpong_supported(
@@ -69,11 +93,11 @@ def pingpong_supported(
         and not per_token_kv
         and sliding_window == 0
         and query_group_size == 16
-        and query_length * query_group_size == ROW_BLOCKS * ROWS_PER_WAVE
+        and 1 <= query_length <= MAX_QUERY_LENGTH
         and head_dim % 32 == 0
         and head_dim <= 256
         and value_dim % 16 == 0
-        and block_size % 64 == 0
+        and block_size % TILE == 0
     )
 
 
@@ -87,25 +111,23 @@ def compile_pa_decode_pingpong(
     softmax_scale,
     stages=None,
     pair_ctas=0,
-    token_slots=None,
 ):
-    import os
-
     stages = stages or int(os.environ.get("PP_STAGES", "3"))
     prio = int(os.environ.get("PP_PRIO", "0"))
     pair_ctas = int(os.environ.get("PP_PAIR", pair_ctas))
     pair_tasks = pair_ctas > 0
-    token_slots = token_slots or int(os.environ.get("PP_SLOTS", "2"))
     nocompute = int(os.environ.get("PP_NOCOMPUTE", "0"))
     dma_aux = int(os.environ.get("PP_AUX", "2"))
-    stagger = int(os.environ.get("PP_STAGGER", "0")) and token_slots > 1
-    NWAVES = ROW_BLOCKS * token_slots
-    TILE = SLOT_TOKENS * token_slots
+    M, R, CH = pingpong_layout(query_length)
+    SLOT_TOKENS = 16 * CH
+    S = TILE // SLOT_TOKENS
+    NWAVES = R * S
     D = head_dim
     DV = value_dim
     GQA = query_group_size
     QLEN = query_length
     ROWS = QLEN * GQA
+    assert R * M * 16 >= ROWS, "layout must cover every query row"
     key = (
         D,
         DV,
@@ -116,10 +138,9 @@ def compile_pa_decode_pingpong(
         stages,
         prio,
         pair_ctas,
-        token_slots,
         nocompute,
         dma_aux,
-        stagger,
+        (M, R, CH),
     )
     if key in _CACHE:
         return _CACHE[key]
@@ -131,17 +152,24 @@ def compile_pa_decode_pingpong(
     K_STAGE = TILE * K_ROW
     V_STAGE = TILE * V_ROW
     STAGE = K_STAGE + V_STAGE
-    K_COPIES = TILE * K_CPR // WAVE // NWAVES
-    V_COPIES = TILE * V_CPR // WAVE // NWAVES
-    assert K_COPIES * WAVE * NWAVES == TILE * K_CPR
-    assert V_COPIES * WAVE * NWAVES == TILE * V_CPR
+    # LDS DMAs may land out of issue order, so a partial vmcnt wait does not
+    # cover the oldest tile. Waves form ISSUERS groups that take turns per
+    # tile; a group's previous tile is its only one in flight when it waits.
+    ISSUERS = stages - 1
+    GROUP_WAVES = NWAVES // ISSUERS
+    assert GROUP_WAVES * ISSUERS == NWAVES, "issuer groups must split the waves"
+    K_COPIES = TILE * K_CPR // WAVE // GROUP_WAVES
+    V_COPIES = TILE * V_CPR // WAVE // GROUP_WAVES
+    assert K_COPIES * WAVE * GROUP_WAVES == TILE * K_CPR
+    assert V_COPIES * WAVE * GROUP_WAVES == TILE * V_CPR
     KK = D // 32
     NB = DV // 16
     TILES_PER_PLAN = KV_COMPUTE_BLOCK // TILE
-    # Merge scratch per row block: O [2 queries][16 rows][DV] f32, then m and l.
-    MERGE_O = 2 * 16 * DV * 4
-    MERGE_RB = MERGE_O + 2 * 2 * 16 * 4
-    total_bytes = max(stages * STAGE, ROW_BLOCKS * MERGE_RB if token_slots > 1 else 0)
+    # Merge scratch per (token slot > 0, row block): O [M][16 rows][DV] f32,
+    # then m and l per row.
+    MERGE_O = M * 16 * DV * 4
+    MERGE_RB = MERGE_O + 2 * M * 16 * 4
+    total_bytes = max(stages * STAGE, (S - 1) * R * MERGE_RB)
     scale_log2 = float(softmax_scale) * LOG2E
 
     @fx.struct
@@ -153,7 +181,7 @@ def compile_pa_decode_pingpong(
 
     kernel_name = (
         f"pa_decode_pingpong_kvbf16_d{D}_v{DV}_bs{block_size}_gqa{GQA}_mtp{QLEN}"
-        f"_s{stages}_p{prio}_c{pair_ctas}_t{token_slots}_n{nocompute}_a{dma_aux}_g{int(bool(stagger))}"
+        f"_m{M}r{R}c{CH}_s{stages}_p{prio}_c{pair_ctas}_n{nocompute}_a{dma_aux}"
     )
 
     @flyc.jit
@@ -184,10 +212,14 @@ def compile_pa_decode_pingpong(
         lane = tid % WAVE
         g = lane // 16
         l16 = lane % 16
-        ts = warp // ROW_BLOCKS
-        rb = warp % ROW_BLOCKS
+        ts = warp // R
+        rb = warp % R
+        issuer = warp // GROUP_WAVES
+        group_warp = warp % GROUP_WAVES
         neg_inf = fx.Float32(float("-inf"))
         zero = fx.Float32(0.0)
+        # Query of each of the wave's M tiles; padded tiles reuse the last query.
+        queries = [rb * M + m for m in range_constexpr(M)]
 
         # Q: B operand of QK, lane (g, l16) holds head l16, dims 32kk + 8g.
         q_buf = ptr_buf_tensor(query_ptr, fx.BFloat16)
@@ -195,8 +227,11 @@ def compile_pa_decode_pingpong(
         q_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
         q_reg = fx.make_rmem_tensor(fx.make_layout(8, 1), fx.BFloat16)
         q_ops = []
-        for m in range_constexpr(2):
-            q_row = seq * QLEN + rb * 2 + m
+        for m in range_constexpr(M):
+            q_idx = queries[m]
+            if const_expr(R * M > QLEN):
+                q_idx = (q_idx < QLEN).select(q_idx, QLEN - 1)
+            q_row = seq * QLEN + q_idx
             head = kv_h * GQA + l16
             row_elem = q_row * stride_q_row + head * stride_q_head + g * 8
             ops_m = []
@@ -228,7 +263,7 @@ def compile_pa_decode_pingpong(
         def dma_offsets(copies, cpr, tok_bytes, swizzle):
             offs = []
             for j in range_constexpr(copies):
-                pos = (warp * copies + j) * WAVE + lane
+                pos = (group_warp * copies + j) * WAVE + lane
                 tok = pos // cpr
                 offs.append(tok * tok_bytes + ((pos % cpr) ^ swizzle(tok)) * 16)
             return offs
@@ -254,7 +289,9 @@ def compile_pa_decode_pingpong(
             )
             for j in range_constexpr(copies):
                 dst = fx.to_llvm_ptr(
-                    lds.pointer(lds_off + (warp * copies + j) * (WAVE * 16), fx.Int32)
+                    lds.pointer(
+                        lds_off + (group_warp * copies + j) * (WAVE * 16), fx.Int32
+                    )
                 )
                 fx.rocdl.raw_ptr_buffer_load_async_lds(
                     rs,
@@ -263,7 +300,7 @@ def compile_pa_decode_pingpong(
                     voffs[j].ir_value(),
                     fx.Int32(0).ir_value(),
                     fx.Int32(0).ir_value(),
-                    aux=ir.IntegerAttr.get(ir.IntegerType.get_signless(32), dma_aux),
+                    aux=_aux(dma_aux),
                 )
 
         def issue(tile, stage):
@@ -299,7 +336,7 @@ def compile_pa_decode_pingpong(
             )
 
         for s in range_constexpr(stages - 1):
-            if t_begin + s < t_end:
+            if (issuer == s) & (t_begin + s < t_end):
                 issue(t_begin + s, s)
 
         # Loop-invariant LDS read offsets within a stage.
@@ -307,7 +344,7 @@ def compile_pa_decode_pingpong(
         qq = l16 % 4
         k_rd = []
         v_rd = []
-        for c in range_constexpr(2):
+        for c in range_constexpr(CH):
             tok = ts * SLOT_TOKENS + c * 16 + l16
             swz = (tok >> 1) & 7
             k_rd.append(
@@ -325,12 +362,15 @@ def compile_pa_decode_pingpong(
                 ]
             )
 
-        # Raw-score state: m is a row-uniform reference, rescaled only when a
-        # score exceeds it by RESCALE_LOG2 in the log2 domain; l is per lane.
-        init = [neg_inf, neg_inf, zero, zero] + [
-            fx.full(4, 0.0, fx.Float32) for _ in range_constexpr(2 * NB)
-        ]
-        limit = [context - QLEN + rb * 2 + m for m in range_constexpr(2)]
+        # Raw-score state [m (M), l (M), O (M * NB)]: m is a row-uniform
+        # reference, rescaled only when a score exceeds it by RESCALE_LOG2 in
+        # the log2 domain; l is per lane.
+        init = (
+            [neg_inf] * M
+            + [zero] * M
+            + [fx.full(4, 0.0, fx.Float32) for _ in range_constexpr(M * NB)]
+        )
+        limit = [context - QLEN + queries[m] for m in range_constexpr(M)]
         rescale_raw = RESCALE_LOG2 / scale_log2
 
         def scaled_ref(m_raw):
@@ -340,7 +380,7 @@ def compile_pa_decode_pingpong(
             out_m = []
             out_l = []
             out_o = []
-            for m in range_constexpr(2):
+            for m in range_constexpr(M):
                 rmax = lmax[m]
                 for sh in (16, 32):
                     rmax = fx.maxnumf(rmax, rmax.shuffle_xor(sh, WAVE))
@@ -352,45 +392,40 @@ def compile_pa_decode_pingpong(
                     )
                 )
                 out_m.append(m_new)
-                out_l.append(st[2 + m] * corr)
+                out_l.append(st[M + m] * corr)
                 corr_b = fx.full(4, corr, fx.Float32)
-                out_o.extend(st[4 + m * NB + nb] * corr_b for nb in range_constexpr(NB))
+                out_o.extend(
+                    st[2 * M + m * NB + nb] * corr_b for nb in range_constexpr(NB)
+                )
             return out_m + out_l + out_o
 
         def step(it, state, masked):
             rel = it - t_begin
             stage = rel % stages
-            # The ring's DMAs are the loop's only VMEM ops: per wave
-            # K_COPIES + V_COPIES per tile, NBUF - 2 tiles may stay in flight.
-            vm_pending = (K_COPIES + V_COPIES) * (stages - 2)
-            fx.rocdl.s_waitcnt(vmcnt=vm_pending)
+            if issuer == rel % ISSUERS:
+                fx.rocdl.s_waitcnt(vmcnt=0)
             gpu.barrier()
             nxt = it + (stages - 1)
             nxt_stage = (rel + (stages - 1)) % stages
-            if const_expr(stagger):
-                # Token half 1 runs half a tile behind: its X barrier is half
-                # 0's Y barrier, after which neither half still reads tile it - 1.
-                if (ts == 1) & (nxt < t_end):
-                    issue(nxt, nxt_stage)
-            else:
-                if nxt < t_end:
-                    issue(nxt, nxt_stage)
+            # Tile it + ISSUERS has tile it's issuers.
+            if (issuer == rel % ISSUERS) & (nxt < t_end):
+                issue(nxt, nxt_stage)
 
             stage_off = stage * STAGE
             if const_expr(nocompute):
                 return list(state)
 
-            # QK: lane (g, l16) of chunk c holds token 32ts + 16c + 4g + i, row l16.
-            s_acc = [[None, None], [None, None]]
+            # QK: lane (g, l16) of chunk c holds token slot + 16c + 4g + i, row l16.
+            s_acc = [[None] * CH for _ in range_constexpr(M)]
             if const_expr(prio):
                 fx.rocdl.s_setprio(1)
-            for c in range_constexpr(2):
-                for m in range_constexpr(2):
+            for c in range_constexpr(CH):
+                for m in range_constexpr(M):
                     s_acc[m][c] = fx.full(4, 0.0, fx.Float32)
                 for kk in range_constexpr(KK):
                     w = lds.load(stage_off + k_rd[c][kk], fx.Int64, 2)
                     k_op = w.bitcast(fx.BFloat16)
-                    for m in range_constexpr(2):
+                    for m in range_constexpr(M):
                         s_acc[m][c] = fx.Vector(
                             fx.rocdl.mfma_f32_16x16x32_bf16(
                                 T.f32x4, [k_op, q_ops[m][kk], s_acc[m][c], 0, 0, 0]
@@ -398,18 +433,13 @@ def compile_pa_decode_pingpong(
                         )
             if const_expr(prio):
                 fx.rocdl.s_setprio(0)
-            if const_expr(stagger):
-                fx.rocdl.s_waitcnt(vmcnt=vm_pending)
-                gpu.barrier()
-                if (ts == 0) & (nxt < t_end):
-                    issue(nxt, nxt_stage)
 
             lane_tok = it * TILE + ts * SLOT_TOKENS + g * 4
             scores = []
             lmax = []
-            for m in range_constexpr(2):
+            for m in range_constexpr(M):
                 vals = []
-                for c in range_constexpr(2):
+                for c in range_constexpr(CH):
                     for i in range_constexpr(4):
                         v = fx.Float32(s_acc[m][c][i])
                         if const_expr(masked):
@@ -422,16 +452,16 @@ def compile_pa_decode_pingpong(
                     mx = fx.maxnumf(mx, v)
                 scores.append(vals)
                 lmax.append(mx)
-            over = (lmax[0] > state[0] + fx.Float32(rescale_raw)) | (
-                lmax[1] > state[1] + fx.Float32(rescale_raw)
-            )
+            over = lmax[0] > state[0] + fx.Float32(rescale_raw)
+            for m in range_constexpr(1, M):
+                over = over | (lmax[m] > state[m] + fx.Float32(rescale_raw))
             st = list(state)
             if fx.Int64(fx.rocdl.ballot(T.i64, over.ir_value())) != fx.Int64(0):
                 st = rescale(st, lmax)
 
             p_ops = []
             l_new = []
-            for m in range_constexpr(2):
+            for m in range_constexpr(M):
                 neg_ref = -scaled_ref(st[m])
                 p = [
                     fx.Float32(
@@ -441,7 +471,7 @@ def compile_pa_decode_pingpong(
                     )
                     for v in scores[m]
                 ]
-                psum = st[2 + m]
+                psum = st[M + m]
                 for v in p:
                     psum = psum + v
                 l_new.append(psum)
@@ -452,147 +482,180 @@ def compile_pa_decode_pingpong(
             # PV: V^T (dims x tokens) by P (tokens x rows); the transpose read
             # gives lane j dim j of tokens 4g + k, k = 0..3, in its 16-lane group.
             o_acc = [
-                [st[4 + m * NB + nb] for nb in range_constexpr(NB)]
-                for m in range_constexpr(2)
+                [st[2 * M + m * NB + nb] for nb in range_constexpr(NB)]
+                for m in range_constexpr(M)
             ]
             if const_expr(prio):
                 fx.rocdl.s_setprio(1)
             for nb in range_constexpr(NB):
-                halves = []
-                for c in range_constexpr(2):
+                parts = []
+                for c in range_constexpr(CH):
                     r = fx.rocdl.ds_read_tr16_b64(
                         fx.Vector.make_type(4, fx.BFloat16),
                         fx.to_llvm_ptr(
                             lds.pointer(stage_off + v_rd[c][nb], fx.BFloat16)
                         ),
                     ).result
-                    halves.append(fx.Vector(r))
-                v_op = fx.Vector.from_elements(
-                    [
-                        halves[c][i]
-                        for c in range_constexpr(2)
-                        for i in range_constexpr(4)
-                    ],
-                    dtype=fx.BFloat16,
-                )
-                for m in range_constexpr(2):
-                    o_acc[m][nb] = fx.Vector(
-                        fx.rocdl.mfma_f32_16x16x32_bf16(
-                            T.f32x4, [v_op, p_ops[m], o_acc[m][nb], 0, 0, 0]
+                    parts.append(fx.Vector(r))
+                for m in range_constexpr(M):
+                    if const_expr(CH == 2):
+                        v_op = fx.Vector.from_elements(
+                            [
+                                parts[c][i]
+                                for c in range_constexpr(2)
+                                for i in range_constexpr(4)
+                            ],
+                            dtype=fx.BFloat16,
                         )
-                    )
+                        o_acc[m][nb] = fx.Vector(
+                            fx.rocdl.mfma_f32_16x16x32_bf16(
+                                T.f32x4, [v_op, p_ops[m], o_acc[m][nb], 0, 0, 0]
+                            )
+                        )
+                    else:
+                        o_acc[m][nb] = fx.Vector(
+                            fx.rocdl.mfma_f32_16x16x16bf16_1k(
+                                T.f32x4,
+                                [
+                                    parts[0].bitcast(fx.Int16),
+                                    p_ops[m].bitcast(fx.Int16),
+                                    o_acc[m][nb],
+                                    0,
+                                    0,
+                                    0,
+                                ],
+                            )
+                        )
             if const_expr(prio):
                 fx.rocdl.s_setprio(0)
             return (
-                [st[0], st[1]]
+                st[:M]
                 + l_new
                 + [
                     o_acc[m][nb]
-                    for m in range_constexpr(2)
+                    for m in range_constexpr(M)
                     for nb in range_constexpr(NB)
                 ]
             )
 
-        if const_expr(stagger):  # noqa: SIM102 - static guard around a dynamic if
-            if ts == 1:
-                fx.rocdl.s_waitcnt(vmcnt=(K_COPIES + V_COPIES) * (stages - 2))
-                gpu.barrier()
         for tile_i, state in range(t_begin, t_split, 1, init=init):
             interior = yield step(fx.Int32(tile_i), state, False)
         for tile_i, state in range(t_split, t_end, 1, init=interior):
             results = yield step(fx.Int32(tile_i), state, True)
-        if const_expr(stagger):  # noqa: SIM102 - static guard around a dynamic if
-            if ts == 0:
-                gpu.barrier()
 
         final = results
         fx.rocdl.s_waitcnt(vmcnt=0)
         gpu.barrier()
 
-        m_fin = [final[0] * fx.Float32(scale_log2), final[1] * fx.Float32(scale_log2)]
+        m_fin = [final[m] * fx.Float32(scale_log2) for m in range_constexpr(M)]
         l_fin = []
-        for m in range_constexpr(2):
-            lr = final[2 + m]
+        for m in range_constexpr(M):
+            lr = final[M + m]
             for sh in (16, 32):
                 lr = lr + lr.shuffle_xor(sh, WAVE)
             l_fin.append(lr)
         o_fin = [
-            [final[4 + m * NB + nb] for nb in range_constexpr(NB)]
-            for m in range_constexpr(2)
+            [final[2 * M + m * NB + nb] for nb in range_constexpr(NB)]
+            for m in range_constexpr(M)
         ]
 
-        rb_off = rb * MERGE_RB
+        def scratch(slot_i):
+            return ((slot_i - 1) * R + rb) * MERGE_RB
 
         def write_partial():
-            for m in range_constexpr(2):
+            base = scratch(ts)
+            for m in range_constexpr(M):
                 for nb in range_constexpr(NB):
                     lds.store(
-                        rb_off + ((m * 16 + l16) * DV + nb * 16 + g * 4) * 4,
+                        base + ((m * 16 + l16) * DV + nb * 16 + g * 4) * 4,
                         fx.Float32,
                         o_fin[m][nb],
                     )
                 # Every lane group holds the row's m and l; duplicate stores agree.
                 lds.store(
-                    rb_off + MERGE_O + (m * 16 + l16) * 4,
+                    base + MERGE_O + (m * 16 + l16) * 4,
                     fx.Float32,
                     fx.Vector.from_elements([m_fin[m]], dtype=fx.Float32),
                 )
                 lds.store(
-                    rb_off + MERGE_O + 128 + (m * 16 + l16) * 4,
+                    base + MERGE_O + M * 64 + (m * 16 + l16) * 4,
                     fx.Float32,
                     fx.Vector.from_elements([l_fin[m]], dtype=fx.Float32),
                 )
 
         def merge_store():
-            pmax = fx.recast_iter(fx.Float32, pmax_ptr)
-            psum = fx.recast_iter(fx.Float32, psum_ptr)
-            pout = fx.recast_iter(fx.BFloat16, pout_ptr)
             partial = kv_h * work_capacity + slot
-            for m in range_constexpr(2):
-                m1 = neg_inf
-                l1 = zero
-                if const_expr(token_slots > 1):
-                    m1 = lds.load(rb_off + MERGE_O + (m * 16 + l16) * 4, fx.Float32, 1)[
-                        0
-                    ]
-                    l1 = lds.load(
-                        rb_off + MERGE_O + 128 + (m * 16 + l16) * 4, fx.Float32, 1
-                    )[0]
-                m0 = m_fin[m]
-                mm = fx.maxnumf(m0, m1)
+            # Per-partial resources: padded rows land past them and are dropped.
+            pout_rs = create_buffer_resource_from_addr(
+                _uni64(buf_base_i64(pout_ptr) + fx.Int64(partial) * (ROWS * DV * 2)),
+                num_records_bytes=ROWS * DV * 2,
+            )
+            pmax_rs = create_buffer_resource_from_addr(
+                _uni64(buf_base_i64(pmax_ptr) + fx.Int64(partial) * (ROWS * 4)),
+                num_records_bytes=ROWS * 4,
+            )
+            psum_rs = create_buffer_resource_from_addr(
+                _uni64(buf_base_i64(psum_ptr) + fx.Int64(partial) * (ROWS * 4)),
+                num_records_bytes=ROWS * 4,
+            )
+            soff = fx.Int32(0).ir_value()
+            for m in range_constexpr(M):
+                ms = [m_fin[m]]
+                ls = [l_fin[m]]
+                for j in range_constexpr(1, S):
+                    base = scratch(j)
+                    ms.append(
+                        lds.load(base + MERGE_O + (m * 16 + l16) * 4, fx.Float32, 1)[0]
+                    )
+                    ls.append(
+                        lds.load(
+                            base + MERGE_O + M * 64 + (m * 16 + l16) * 4, fx.Float32, 1
+                        )[0]
+                    )
+                mm = ms[0]
+                for v in ms[1:]:
+                    mm = fx.maxnumf(mm, v)
                 safe = (mm > neg_inf).select(mm, zero)
-                w0 = fx.Float32(fx.exp2(m0 - safe, fastmath="fast"))
-                w1 = fx.Float32(fx.exp2(m1 - safe, fastmath="fast"))
-                lt = l_fin[m] * w0 + l1 * w1
+                ws = [fx.Float32(fx.exp2(v - safe, fastmath="fast")) for v in ms]
+                lt = ls[0] * ws[0]
+                for j in range_constexpr(1, S):
+                    lt = lt + ls[j] * ws[j]
                 inv = (lt > zero).select(fx.Float32(rcp_f32(lt)), zero)
-                w0b = fx.full(4, w0 * inv, fx.Float32)
-                w1b = fx.full(4, w1 * inv, fx.Float32)
-                row = (rb * 2 + m) * GQA + l16
-                base = (partial * ROWS + row) * DV
+                wb = [fx.full(4, w * inv, fx.Float32) for w in ws]
+                row = queries[m] * GQA + l16
                 for nb in range_constexpr(NB):
-                    o = o_fin[m][nb] * w0b
-                    if const_expr(token_slots > 1):
+                    o = o_fin[m][nb] * wb[0]
+                    for j in range_constexpr(1, S):
                         o1 = lds.load(
-                            rb_off + ((m * 16 + l16) * DV + nb * 16 + g * 4) * 4,
+                            scratch(j) + ((m * 16 + l16) * DV + nb * 16 + g * 4) * 4,
                             fx.Float32,
                             4,
                         )
-                        o = o + o1 * w1b
-                    o = o.to(fx.BFloat16)
-                    fx.ptr_store(o, fx.add_offset(pout, base + nb * 16 + g * 4))
-                fx.ptr_store(
-                    fx.Vector.from_elements(
-                        [mm * fx.Float32(1.0 / LOG2E)], dtype=fx.Float32
-                    ),
-                    fx.add_offset(pmax, partial * ROWS + row),
+                        o = o + o1 * wb[j]
+                    mlir_rocdl.raw_ptr_buffer_store(
+                        o.to(fx.BFloat16).ir_value(),
+                        pout_rs,
+                        fx.Int32((row * DV + nb * 16 + g * 4) * 2).ir_value(),
+                        soff,
+                        aux=_aux(0),
+                    )
+                mlir_rocdl.raw_ptr_buffer_store(
+                    fx.Float32(mm * fx.Float32(1.0 / LOG2E)).ir_value(),
+                    pmax_rs,
+                    fx.Int32(row * 4).ir_value(),
+                    soff,
+                    aux=_aux(0),
                 )
-                fx.ptr_store(
-                    fx.Vector.from_elements([lt], dtype=fx.Float32),
-                    fx.add_offset(psum, partial * ROWS + row),
+                mlir_rocdl.raw_ptr_buffer_store(
+                    fx.Float32(lt).ir_value(),
+                    psum_rs,
+                    fx.Int32(row * 4).ir_value(),
+                    soff,
+                    aux=_aux(0),
                 )
 
-        if const_expr(token_slots > 1):
-            if ts == 1:
+        if const_expr(S > 1):
+            if ts > 0:
                 write_partial()
             gpu.barrier()
             if ts == 0:
@@ -659,12 +722,14 @@ def compile_pa_decode_pingpong(
                 fx.add_offset(fx.recast_iter(fx.Float32, psum_ptr), row),
             )
             pout = fx.recast_iter(fx.BFloat16, pout_ptr)
-            for j in range_constexpr(ROWS * DV // 8 // (NWAVES * WAVE)):
+            chunks = ROWS * DV // 8
+            for j in range_constexpr(-(-chunks // (NWAVES * WAVE))):
+                idx = j * NWAVES * WAVE + tid
+                # Overflow lanes rewrite the last chunk with the same zeros.
+                idx = (idx < chunks).select(idx, chunks - 1)
                 fx.ptr_store(
                     fx.full(8, 0.0, fx.BFloat16),
-                    fx.add_offset(
-                        pout, partial * (ROWS * DV) + (j * NWAVES * WAVE + tid) * 8
-                    ),
+                    fx.add_offset(pout, partial * (ROWS * DV) + idx * 8),
                 )
 
         if const_expr(pair_tasks):
@@ -772,7 +837,8 @@ def compile_pa_decode_pingpong(
                 stream=stream,
             )
 
-    pa_decode_pingpong_launch.compile_hints["waves_per_eu"] = 2
+    if NWAVES == 8:
+        pa_decode_pingpong_launch.compile_hints["waves_per_eu"] = 2
     compiled = {
         "launch": pa_decode_pingpong_launch,
         "kernel": pa_decode_pingpong_kernel,
