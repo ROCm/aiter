@@ -245,7 +245,7 @@ def compile_pa_decode_tile(
             else 0
         )
         if query_splits is None:
-            small_fp8_mtp = (
+            bounded_fp8_mtp = (
                 kv_dtype == "fp8"
                 and per_token_kv
                 and query_dtype == "bf16"
@@ -260,26 +260,29 @@ def compile_pa_decode_tile(
                 and plan_tile_tokens == 256
                 and num_seqs <= 3
                 and max_context_length is not None
-                and 4096 < max_context_length <= 8192
+                and 4096 < max_context_length <= 32768
                 and num_partitions >= tile_bound
                 and work_capacity >= num_seqs * tile_bound
             )
-            # Split the measured spilling BF16 specialization into one Q tile
-            # per CTA. Small bounded FP8 MTP grids also expose one Q tile per
-            # CTA; larger grids retain the four-query tile's KV reuse.
+            # Short bounded FP8 MTP grids expose one Q tile per CTA. Medium
+            # grids keep two queries together to preserve some KV reuse.
+            # The measured spilling BF16 specialization also uses split4.
             query_splits = (
-                4
-                if small_fp8_mtp
-                or (
-                    kv_dtype == "bf16"
-                    and head_dim == 1024
-                    and query_group_size == 16
-                    and query_length == 4
-                    and block_size == 128
-                    and trans_v
-                    and sliding_window == 0
+                (4 if max_context_length <= 8192 else 2)
+                if bounded_fp8_mtp
+                else (
+                    4
+                    if (
+                        kv_dtype == "bf16"
+                        and head_dim == 1024
+                        and query_group_size == 16
+                        and query_length == 4
+                        and block_size == 128
+                        and trans_v
+                        and sliding_window == 0
+                    )
+                    else 1
                 )
-                else 1
             )
         # Capacity covers every row's upper tile bound, so each visible
         # tile gets its own task even with empty/mixed rows.

@@ -1363,6 +1363,53 @@ _PIPE_BASE = {
 _PIPE_CASES = [
     *[
         (
+            f"fp8-medium-mtp-auto-{name}",
+            {
+                "kv_dtype": "fp8",
+                "query_dtype": torch.bfloat16,
+                "scale_mode": "per-token",
+                "trans_v": True,
+                "group_size": 16,
+                "block_size": 128,
+                "query_length": 4,
+                "lengths": (32768, 1, 16385),
+                "max_partitions": 256,
+                "max_context": 32768,
+                "tile_tokens": 256,
+                "capture": True,
+                "expected_splits": splits,
+                **extra,
+            },
+        )
+        for name, extra, splits in (
+            ("upper-bound", {"task_limit": 128}, 2),
+            (
+                "lower-bound",
+                {"lengths": (8193, 1, 8192), "max_context": 8193, "task_limit": 64},
+                2,
+            ),
+            (
+                "middle-bound",
+                {"lengths": (16384, 1, 8193), "max_context": 16384, "task_limit": 64},
+                2,
+            ),
+            ("past-upper", {"max_context": 32769, "table_width": 257}, 1),
+            ("unknown-bound", {"max_context": None, "table_width": 2048}, 1),
+            ("batch1", {"lengths": (32768,)}, 2),
+            ("batch2", {"lengths": (32768, 16385)}, 2),
+            ("batch4", {"lengths": (32768, 1, 16385, 8193)}, 1),
+            ("limited-parts", {"max_partitions": 64}, 1),
+            ("limited-capacity", {"budget": 256}, 1),
+            ("window", {"window": 4096}, 1),
+            ("scalar-scales", {"scale_mode": "per-tensor"}, 1),
+            ("bf16", {"kv_dtype": "bf16", "scale_mode": "none"}, 1),
+            ("unit128", {"tile_tokens": 128}, 1),
+            ("fp16-query", {"query_dtype": torch.float16}, 1),
+            ("plain-v", {"trans_v": False}, 1),
+        )
+    ],
+    *[
+        (
             f"fp8-short-mtp-auto-{name}",
             {
                 "kv_dtype": "fp8",
@@ -1384,7 +1431,7 @@ _PIPE_CASES = [
         for name, extra, splits in (
             ("split4", {"task_limit": 32}, 4),
             ("unknown-bound", {"max_context": None, "table_width": 2048}, 1),
-            ("wide-bound", {"max_context": 32768, "table_width": 256}, 1),
+            ("wide-bound", {"max_context": 65536, "table_width": 512}, 1),
             ("scalar-scales", {"scale_mode": "per-tensor"}, 1),
             ("bf16", {"kv_dtype": "bf16", "scale_mode": "none"}, 1),
             ("batch4", {"lengths": (8192, 1, 4353, 4099)}, 1),
