@@ -8,8 +8,10 @@ from flydsl._mlir import ir
 from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import T
 
-from ..tensor_shim import _to_raw
 from .traits import MFMA_ACC_ELEMS
+
+# e8m0 byte 127 (2**0) in all four scale bytes: the scaled MFMA applies no scaling.
+UNIT_E8M0_SCALES = 0x7F7F7F7F
 
 
 class PaDecodeGemm:
@@ -17,7 +19,7 @@ class PaDecodeGemm:
         self.traits = traits
 
     def mfma(self, a_ops, b_ops, a_base, b_base, k_packs, acc):
-        if const_expr(self.traits.is_bf16_kv):
+        if const_expr(self.traits.PV_BF16):
             for pack in range_constexpr(k_packs):
                 # Keep four BF16 values packed in i64 through the pipeline,
                 # exposing the instruction's i16x4 operands only here.
@@ -55,9 +57,9 @@ class PaDecodeGemm:
                         0,
                         0,
                         0,
-                        fx.Int32(0x7F7F7F7F),
+                        fx.Int32(UNIT_E8M0_SCALES),
                         0,
-                        fx.Int32(0x7F7F7F7F),
+                        fx.Int32(UNIT_E8M0_SCALES),
                     ],
                 )
         else:
@@ -94,6 +96,35 @@ class PaDecodeGemm:
             frag_Ss.append(fx.Vector(acc))
         return frag_Ss
 
+    def qk_mxfp4(self, k_raw, k_scales, q_op, q_scale_byte):
+        """QK of one MXFP4 K tile: per 16-token chunk one scaled MFMA, A = packed
+        E2M1 K (lane: 16 B = one E8M0 group, its scale byte), B = E4M3 Q (``q_op``)
+        scaled by the e8m0 byte ``q_scale_byte``, so the f32 accumulator never exceeds
+        the logit by more than the 2x left in the mantissa of the query scale."""
+        frag_Ss = []
+        for a in range_constexpr(self.traits.NCHUNK):
+            a_k = fx.Vector.from_elements(
+                [fx.Int32(k_raw[a * 5 + 1 + i]) for i in range_constexpr(4)]
+                + [fx.Int32(0) for _ in range_constexpr(4)],
+                dtype=fx.Int32,
+            )
+            acc = fx.rocdl.mfma_scale_f32_16x16x128_f8f6f4(
+                T.f32x4,
+                [
+                    a_k,
+                    q_op,
+                    fx.full(MFMA_ACC_ELEMS, 0.0, fx.Float32),
+                    4,
+                    0,
+                    0,
+                    k_scales[a],
+                    0,
+                    q_scale_byte,
+                ],
+            )
+            frag_Ss.append(fx.Vector(acc))
+        return frag_Ss
+
     def pv(self, v_ops, p_ops):
         acc = fx.full(MFMA_ACC_ELEMS, 0.0, fx.Float32)
         acc = self.mfma(v_ops, p_ops, 0, 0, self.traits.NVOPS, acc)
@@ -106,9 +137,9 @@ class Gfx1250Gemm:
         if const_expr(bf16):
             result = fx.rocdl.wmma_f32_16x16x32_bf16(
                 fx.Vector.make_type(8, fx.Float32),
-                _to_raw(a),
-                _to_raw(b),
-                _to_raw(acc),
+                fx.as_ir_value(a),
+                fx.as_ir_value(b),
+                fx.as_ir_value(acc),
                 modC=ir.Attribute.parse("#rocdl<wmma_c_modifier none>"),
                 reuseA=False,
                 reuseB=False,
@@ -120,9 +151,9 @@ class Gfx1250Gemm:
         else:
             result = fx.rocdl.wmma_f32_16x16x64_fp8_fp8(
                 fx.Vector.make_type(8, fx.Float32),
-                _to_raw(a),
-                _to_raw(b),
-                _to_raw(acc),
+                fx.as_ir_value(a),
+                fx.as_ir_value(b),
+                fx.as_ir_value(acc),
                 modC=ir.Attribute.parse("#rocdl<wmma_c_modifier none>"),
                 reuseA=False,
                 reuseB=False,

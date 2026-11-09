@@ -228,6 +228,12 @@ def _e8m0_from_amax(amax_f32, max_norm=6.0):
     return e8m0, qscale
 
 
+def _e8m0_byte_to_f32(packed_i32, byte_pos):
+    shift = byte_pos * fx.Int32(8)
+    b = packed_i32.shrui(shift) & fx.Int32(0xFF)
+    return (b << fx.Int32(23)).bitcast(fx.Float32)
+
+
 def _inline_e8m0(amax_u16_i32, max_norm=6.0):
     bits = (fx.Int32(amax_u16_i32) & 0xFFFF) << 16
     return _e8m0_roundup(bits.bitcast(fx.Float32), max_norm=max_norm)
