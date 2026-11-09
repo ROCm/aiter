@@ -33,9 +33,7 @@ from .base import (
 # `_combine_tile` walks these down until the tile fits a given topk.
 _COMBINE_TOKENS_PER_BLOCK = 16
 _COMBINE_CHUNKS_PER_ITER = 1
-# The MXFP8 wire wants a larger C: its scale plane puts only C*8 bytes in a TDM
-# row, so a small C makes that load pull a whole cache line per row for a
-# handful of bytes.
+# The MX wires want a larger C: at the bf16 tile their reduce runs 4-14% slower.
 _COMBINE_QUANT_TOKENS_PER_BLOCK = 8
 _COMBINE_QUANT_CHUNKS_PER_ITER = 4
 
@@ -49,8 +47,7 @@ def _combine_tile(*, topk, hidden_dim, quant_bits):
 
     T then takes the tile as high as the LDS budget allows, since trips per block
     is what keeps the prefetch pipeline fed. LDS grows as T*topk, so a large topk
-    trades height away: topk=8 on the mxfp8 wire needs 164KB at the preferred
-    T=8 and lands on T=7.
+    trades height away: topk=8 on the mxfp8 wire lands on T=4.
     """
     n_chunks = hidden_dim // _COMBINE_CHUNK_ELEMS
     max_chunks, max_toks = (

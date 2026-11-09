@@ -162,8 +162,11 @@ CLAUSE = 110
 # the parenthetical says which kind of evidence is behind the line, so matching on the bare
 # word keeps every variant. Perf has no counterpart on an ATOM card and is aiter's own; it
 # belongs in the summary for the same reason Validation does, since "NOT RUN" and "NO
-# REGRESSION" are different facts and neither is a finding.
-STATUS_PREFIXES = ("Review", "Validation", "Perf")
+# REGRESSION" are different facts and neither is a finding. Size/Design/Human are Step 7.8's
+# routing lines: they are status, not findings, and a `Human:` routing that fell into the
+# findings block would read as one more finding instead of the judgment this review routed
+# to a person.
+STATUS_PREFIXES = ("Review", "Validation", "Perf", "Size", "Design", "Human")
 
 
 def pr_diff(pr):
