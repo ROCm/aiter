@@ -35,8 +35,8 @@ each replaying its jobs in a pool of workers.
 
 For an arch in ``SCAN_ARCHS``, every size of a job's range is identified:
 replayed with its launches stopped at their cache identity
-(:func:`identified_kernels`, traced but nothing compiled), and one size per
-set of kernels not yet built is replayed for real. A runtime whose choices are not
+(:func:`identified_kernels`, nothing compiled, and traced once per distinct
+launch), and one size per set of kernels not yet built is replayed for real. A runtime whose choices are not
 monotonic in the size needs that, as a gfx1250 GEMM's are: it fits cluster_m
 to the number of M tiles and specializes a ragged last tile, so M=5120 and
 M=6144 can request one kernel and M=5632 another.
@@ -60,6 +60,7 @@ broke must not pass for the runtime refusing a size.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import importlib
 import os
 import re
@@ -110,17 +111,52 @@ class _Identified(BaseException):
     ``except Exception`` on the way out of FlyDSL takes it for an error."""
 
 
+def _frozen(value) -> tuple:
+    """``value`` with its type, by value where hashable, else by repr."""
+    try:
+        hash(value)
+    except TypeError:
+        return type(value), repr(value)
+    return type(value), value
+
+
+def _trace_identity(jit, sig, bound) -> tuple:
+    """What a FlyDSL trace of ``jit`` depends on besides the launcher itself:
+    the IR types of its runtime arguments (static shape, stride and dtype
+    included), its Constexpr values, the compile hints and the target. Two
+    launches of one ``jit`` that agree on these trace to the same IR."""
+    from flydsl.compiler import jit_function
+
+    _, jit_args, dsl_types, constexprs = jit_function.convert_to_jit_arguments(
+        sig, bound
+    )
+    hints = jit._effective_compile_hints()
+    return (
+        jit,
+        tuple(str(t) for t in jit_function.get_ir_types(jit_args)),
+        tuple(dsl_types),
+        tuple(sorted((k, _frozen(v)) for k, v in constexprs.items())),
+        tuple(sorted((k, _frozen(v)) for k, v in hints.items())),
+        _frozen(jit_function.get_backend().target),
+    )
+
+
 @contextmanager
-def requested_kernels(*, stop: bool = False) -> Iterator[set]:
+def requested_kernels(*, stop: bool = False, memo: dict | None = None) -> Iterator[set]:
     """Collect the cache identity of every FlyDSL launch a replay reaches, as
     FlyDSL itself derives it for its cache lookup. With ``stop``, a launch
     ends there: it is traced, but nothing is compiled or read from the cache,
-    and the launcher gets the None a COMPILE_ONLY launch returns.
+    and the launcher gets the None a COMPILE_ONLY launch returns. A ``memo``
+    (with ``stop``) maps :func:`_trace_identity` to the key it traced to, so
+    that a launch whose trace inputs were seen before is not traced again: a
+    scan identifies thousands of sizes that request a handful of kernels.
+    Share one only among launches under one environment (one dry run).
 
-    Hooks two private names of FlyDSL's ``jit_function`` module:
+    Hooks private names of FlyDSL's ``jit_function`` module:
     ``JitFunction._compile_or_execute``, which every launch (``__call__``,
-    ``flyc.compile``) goes through, and ``_artifact_cache_key``, which it
-    calls once after tracing. Should either be renamed, entering this
+    ``flyc.compile``) goes through, ``_artifact_cache_key``, which it calls
+    once after tracing, and, for a ``memo``, ``JitFunction._trace`` and the
+    argument conversion it starts with. Should one be renamed, entering this
     fails; should a launch stop deriving its key there, it raises
     :class:`ReplayHookBroken`."""
     from unittest import mock
@@ -131,17 +167,37 @@ def requested_kernels(*, stop: bool = False) -> Iterator[set]:
     kernels = set()
     build_key = jit_function._artifact_cache_key
     dispatch = JitFunction._compile_or_execute
+    trace = JitFunction._trace
     derived = depth = 0
+    pending = None
 
     def record(*args, **kwargs):
-        nonlocal derived
+        nonlocal derived, pending
         key = build_key(*args, **kwargs)
         kernels.add(key)
         derived += 1
+        if pending is not None:
+            memo[pending] = key
+            pending = None
         # Only a launch is stopped; host code may derive a key itself.
         if stop and depth:
             raise _Identified
         return key
+
+    def traced(self, ctx, sig, bound, *args, **kwargs):
+        nonlocal derived, pending
+        identity = _trace_identity(self, sig, bound)
+        key = memo.get(identity)
+        if key is not None:
+            kernels.add(key)
+            derived += 1
+            raise _Identified
+        pending = identity
+        try:
+            return trace(self, ctx, sig, bound, *args, **kwargs)
+        except BaseException:
+            pending = None
+            raise
 
     def launch(self, *args, **kwargs):
         nonlocal depth
@@ -161,16 +217,21 @@ def requested_kernels(*, stop: bool = False) -> Iterator[set]:
             )
         return result
 
-    with (
+    patches = [
         mock.patch.object(jit_function, "_artifact_cache_key", record),
         mock.patch.object(JitFunction, "_compile_or_execute", launch),
-    ):
+    ]
+    if stop and memo is not None:
+        patches.append(mock.patch.object(JitFunction, "_trace", traced))
+    with contextlib.ExitStack() as patched:
+        for patch in patches:
+            patched.enter_context(patch)
         yield kernels
 
 
-def identified_kernels() -> AbstractContextManager[set]:
+def identified_kernels(memo: dict | None = None) -> AbstractContextManager[set]:
     """:func:`requested_kernels` with every launch stopped at its cache key."""
-    return requested_kernels(stop=True)
+    return requested_kernels(stop=True, memo=memo)
 
 
 def replay_job(
@@ -292,6 +353,7 @@ def _kernel_sets(module: Any, job: dict, sizes: range) -> dict:
 
     arch = job_arch(job, _default_arch(module))
     found: dict = {}
+    memo: dict = {}
     logger = logging.getLogger("aiter")
     level = logger.level
     # The runtime warns at every untuned size, and a scan visits thousands.
@@ -299,7 +361,7 @@ def _kernel_sets(module: Any, job: dict, sizes: range) -> dict:
     try:
         with dry_run(arch, int(job.get("cu_num") or 0), python_ops=True):
             for size in sizes:
-                with identified_kernels() as kernels:
+                with identified_kernels(memo) as kernels:
                     try:
                         module.replay({**job, "m": size})
                         outcome = frozenset(kernels)
