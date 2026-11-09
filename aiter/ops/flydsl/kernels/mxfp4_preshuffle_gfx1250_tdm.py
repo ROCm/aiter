@@ -102,6 +102,11 @@ if DISABLE_CLUSTER_SYNC not in (0, 1):
     raise ValueError("AITER_FLYDSL_DISABLE_CLUSTER_SYNC must be 0 or 1")
 if TDM_EARLY_TIMEOUT not in (0, 1):
     raise ValueError("AITER_FLYDSL_TDM_EARLY_TIMEOUT must be 0 or 1")
+# Experiment (moe_exp): a cluster barrier before every K-tile TDM issue, so the
+# workgroups of a cluster send their A cluster loads at the same time.
+A_CLUSTER_BARRIER = int(os.environ.get("AITER_FLYDSL_A_CLUSTER_BARRIER", "0"))
+if A_CLUSTER_BARRIER not in (0, 1):
+    raise ValueError("AITER_FLYDSL_A_CLUSTER_BARRIER must be 0 or 1")
 # Experiment only (moe_exp): the FP4 stage1 epilogue (gemm1 with fused activation
 # and MX quantization) converts the accumulators straight to FP4 with scale 1.0,
 # stages them in LDS and TDM-stores them. No clamp, activation, block amax or
@@ -289,6 +294,7 @@ def launch_gemm_a8w4_tdm(
         has_bias,
         TDM_DESCRIPTOR_VERSION,
         TDM_EARLY_TIMEOUT,
+        A_CLUSTER_BARRIER,
         stage1_quant_out,
         quant_wmma_rep,
         cluster_n,
@@ -483,6 +489,8 @@ def launch_gemm_a8w4_tdm(
     _persistent = f"_pw{persistent_workers}" if persistent_workers else ""
     _drain = "_rolleddrain" if rolled_drain else ""
     _early_timeout = "_et0" if not TDM_EARLY_TIMEOUT else ""
+    a_cluster_barrier_on = bool(A_CLUSTER_BARRIER and cluster_n > 1)
+    _early_timeout += "_abar" if a_cluster_barrier_on else ""
     simple_epi = bool(SIMPLE_EPI and stage1_quant_out and stage1_act and a_is_fp4)
     _simple_epi = "_simpleepi" if simple_epi else ""
     _kname = (
@@ -998,6 +1006,10 @@ def launch_gemm_a8w4_tdm(
             return pred
 
         def issue(s, kt, my_jobs=None):
+            if const_expr(a_cluster_barrier_on):
+                # Every wave of every workgroup reaches each issue point, so the
+                # barrier is matched; peers issue the same loads (see docstring).
+                cluster_sync()
             base_i8 = fx.recast_iter(p8_shared, base_ptr)
             # Only the last tile is ragged: a prologue kt picks its extent at
             # compile time, a loop kt selects it with one scalar compare.
