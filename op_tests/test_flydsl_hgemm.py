@@ -1222,6 +1222,140 @@ def check_tdm_contracts(dtype):
         )
 
 
+def check_tdm_workspace_reuse(dtype):
+    """Fixed partial buffers must not expose a prior invocation across streams."""
+    import flydsl.expr as fx
+
+    from aiter.ops.flydsl.kernels.gemm_a16w16_tdm_gfx1250 import (
+        GEMM_DTYPE_BF16,
+        GEMM_DTYPE_FP16,
+        build_gemm_gfx1250,
+    )
+    from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, ptr_arg
+
+    dtype_id = GEMM_DTYPE_BF16 if dtype == dtypes.bf16 else GEMM_DTYPE_FP16
+    elem = fx.BFloat16 if dtype == dtypes.bf16 else fx.Float16
+    # Covers partial M/N tiles and both layout/schedule choices. Atomic uses
+    # the original independent protocol and is covered by test_hgemm_tdm.
+    for split_k, (layout, interleave) in itertools.product(
+        (3, 8, 9), (("nt", False), ("nt", True), ("nn", False))
+    ):
+        m, n, k = 137, 144, 128 * split_k
+        bm, bn, bk, stages = 64, 64, 64, 2
+        launch = build_gemm_gfx1250(
+            dtype_id,
+            bm,
+            bn,
+            bk,
+            stages,
+            1,
+            1,
+            0,
+            True,
+            layout == "nt",
+            16,
+            16,
+            32,
+            split_k,
+            interleave,
+            False,
+            device_id=torch.cuda.current_device(),
+        )
+        slots = ((m + bm - 1) // bm) * ((n + bn - 1) // bn) * split_k * bm * bn
+        streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+        buffers = []
+        for _ in streams:
+            a, a_guard = _guarded_matrix(m, k, dtype)
+            if layout == "nt":
+                b, b_guard = _guarded_matrix(n, k, dtype)
+            else:
+                b_transposed, b_guard = _guarded_matrix(k, n, dtype)
+                b = b_transposed.t()
+            out, out_guard = _guarded_matrix(m, n, dtype)
+            storage = torch.full((slots + 512,), 17, device="cuda", dtype=dtype)
+            workspace = storage[256:-256]
+            bias = torch.zeros(n, device="cuda", dtype=dtype)
+            buffers.append(
+                (a, b, out, workspace, bias, a_guard, b_guard, out_guard, storage)
+            )
+
+        def run(buf, stream, launch=launch, m=m, n=n, k=k, layout=layout):
+            a, b, out, workspace, bias, *_ = buf
+            _run_compiled(
+                launch,
+                ptr_arg(a, elem),
+                ptr_arg(b, elem),
+                ptr_arg(out, elem),
+                ptr_arg(bias, elem),
+                ptr_arg(workspace, elem),
+                m,
+                n,
+                k,
+                a.stride(0),
+                b.stride(0) if layout == "nt" else b.stride(1),
+                out.stride(0),
+                fx.Stream(stream.cuda_stream),
+            )
+
+        # Initialize and compile outside capture, with allocation dependencies.
+        for stream, buf in zip(streams, buffers):
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                buf[0].zero_()
+                buf[1].zero_()
+                run(buf, stream)
+        for stream in streams:
+            stream.synchronize()
+        graphs = [torch.cuda.CUDAGraph(), torch.cuda.CUDAGraph()]
+        try:
+            for graph, stream, buf in zip(graphs, streams, buffers):
+                with torch.cuda.graph(graph, stream=stream):
+                    run(buf, stream)
+            for repeat in range(8):
+                expected = []
+                for index, (graph, stream, buf) in enumerate(
+                    zip(graphs, streams, buffers)
+                ):
+                    a, b, out, workspace, bias, *_ = buf
+                    with torch.cuda.stream(stream):
+                        # Every split contributes distinct, exactly representable
+                        # values. Change all inputs between replay invocations.
+                        a.zero_()
+                        b.zero_()
+                        rf = (
+                            (torch.arange(m, device="cuda") + repeat + index) % 3 - 1
+                        ).to(dtype)
+                        cf = (
+                            (torch.arange(n, device="cuda") + 2 * repeat + index) % 3
+                            - 1
+                        ).to(dtype)
+                        for part in range(split_k):
+                            a[:, part * 128] = rf * (part + 1) / 16
+                            b[:, part * 128] = cf / 16
+                        bias.copy_(cf * (1 if repeat % 2 else -1) / 8)
+                        expected.append(run_torch_tdm(a, b, bias, dtype, split_k))
+                        out.fill_(float("nan"))
+                        workspace.fill_(float("nan"))
+                        graph.replay()
+                for stream in streams:
+                    stream.synchronize()
+                for buf, ref in zip(buffers, expected):
+                    a, b, out, workspace, bias, ag, bg, og, storage = buf
+                    torch.testing.assert_close(out, ref, atol=0, rtol=0)
+                    assert torch.isfinite(workspace).all()
+                    _assert_guards(ag, k)
+                    _assert_guards(bg, k if layout == "nt" else n)
+                    _assert_guards(og, n)
+                    assert torch.all(storage[:256] == 17)
+                    assert torch.all(storage[-256:] == 17)
+        finally:
+            for stream in streams:
+                stream.synchronize()
+            for graph in graphs:
+                graph.reset()
+    aiter.logger.info("TDM fixed-workspace concurrent replay passed for %s", dtype)
+
+
 def summarize(title, rows):
     df = pd.DataFrame(rows)
     if df.empty:
@@ -1315,6 +1449,7 @@ def main():
             ]
             summarize(f"TDM tuned dispatch {dtype}", dispatch_rows)
             check_tdm_contracts(dtype)
+            check_tdm_workspace_reuse(dtype)
         return
     torch.set_default_device("cuda")
     wanted = set(args.mnk)

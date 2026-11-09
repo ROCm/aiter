@@ -6,6 +6,8 @@ import functools
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl._mlir import ir
+from flydsl._mlir.dialects import llvm as mlir_llvm
 from flydsl.expr import const_expr, llvm, range_constexpr, rocdl, tdm_ops
 from flydsl.expr.rocdl.cluster import cluster_barrier
 from flydsl.expr.typing import T
@@ -23,6 +25,54 @@ SUPPORTED_MMA = {GEMM_DTYPE_BF16: ((16, 16, 32),), GEMM_DTYPE_FP16: ((16, 16, 32
 GEMM_DTYPE_BITS = {GEMM_DTYPE_BF16: 16, GEMM_DTYPE_FP16: 16}
 FRAGMENT_LOAD_BITS = 128
 STORE_VEC_BITS = 128
+
+
+def _workspace_pointer(pointer, element_offset, element_bytes):
+    address = fx.Int64(fx.ptrtoint(pointer)) + fx.Int64(element_offset) * element_bytes
+    return mlir_llvm.IntToPtrOp(
+        mlir_llvm.PointerType.get(address_space=1), address.ir_value()
+    ).result
+
+
+def _workspace_scope():
+    return mlir_llvm.MetadataAsValueOp(
+        ir.Attribute.parse('#llvm.md_node<#llvm.md_string<"agent">>')
+    ).result
+
+
+def _store_partial_available(pointer, offset, values):
+    """Publish one naturally aligned, same-dtype 16-byte partial at agent scope."""
+    packed = mlir_llvm.BitcastOp(T.vec(4, T.i32), values.ir_value()).res
+    mlir_llvm.call_intrinsic(
+        None,
+        "llvm.amdgcn.av.store.b128",
+        [_workspace_pointer(pointer, offset, 2), packed, _workspace_scope()],
+        [],
+        [],
+    )
+
+
+def _load_partial_visible(pointer, offset, dtype):
+    """Read exactly one agent-visible 16-byte partial, not a cache-wide acquire."""
+    packed = mlir_llvm.call_intrinsic(
+        T.vec(4, T.i32),
+        "llvm.amdgcn.av.load.b128",
+        [_workspace_pointer(pointer, offset, 2), _workspace_scope()],
+        [],
+        [],
+    )
+    return fx.Vector(mlir_llvm.BitcastOp(T.vec(8, dtype.ir_type), packed).res)
+
+
+def _order_partial_accesses(ordering):
+    # AV stores/loads supply availability/visibility at the accessed locations.
+    # Keep release/acquire ordering around the cluster execution barrier without
+    # cache-wide make-available/make-visible operations. Do not use this fence
+    # with ordinary unscoped memory accesses or the packed-atomic C path.
+    fence = mlir_llvm.FenceOp(ordering, syncscope="agent")
+    fence.operation.attributes["llvm.mmra"] = ir.Attribute.parse(
+        '#llvm.mmra_tag<"amdgcn-av":"none">'
+    )
 
 
 def _validate_interleaved_tile(
@@ -1012,35 +1062,30 @@ def build_gemm_gfx1250(
                     shared_out + row * c_pitch + col,
                     result_type=T.vec(out_vec_elems, out_dtype.ir_type),
                 )
-                partial = (
-                    workspace
-                    + fx.Int64(block_id) * (split_k * tile_elems)
+                partial_offset = (
+                    fx.Int64(block_id) * (split_k * tile_elems)
                     + fx.Int64(k_rank) * tile_elems
-                    + row * block_n
-                    + col
+                    + offset
                 )
-                fx.make_view(partial, fx.make_layout(out_vec_elems, 1)).store(values)
-            # Publish same-dtype partials before another workgroup reads them.
-            llvm.memory_fence(syncscope="agent", ordering=fx.AtomicOrdering.Release)
+                _store_partial_available(workspace, partial_offset, values)
+            # Every lane publishes its own complete 16-byte partial before the
+            # workgroup+cluster barrier. Every reducer lane then uses AV loads.
+            # Keep the cluster barrier; only remove redundant cache maintenance.
+            rocdl.s_wait_storecnt(0)
+            _order_partial_accesses(mlir_llvm.AtomicOrdering.release)
             cluster_barrier()
-            llvm.memory_fence(syncscope="agent", ordering=fx.AtomicOrdering.Acquire)
+            _order_partial_accesses(mlir_llvm.AtomicOrdering.acquire)
             if k_rank == 0:
                 for i in range_constexpr(tile_elems // (threads * out_vec_elems)):
                     offset = (i * threads + tid) * out_vec_elems
                     row, col = (offset // block_n, offset % block_n)
-                    total = fx.ptr_load(
-                        workspace
-                        + fx.Int64(block_id) * (split_k * tile_elems)
-                        + offset,
-                        result_type=T.vec(out_vec_elems, out_dtype.ir_type),
-                    ).to(fx.Float32)
-                    for part in range_constexpr(split_k - 1):
-                        partial = fx.ptr_load(
-                            workspace
-                            + fx.Int64(block_id) * (split_k * tile_elems)
-                            + (part + 1) * tile_elems
-                            + offset,
-                            result_type=T.vec(out_vec_elems, out_dtype.ir_type),
+                    base = fx.Int64(block_id) * (split_k * tile_elems) + offset
+                    total = _load_partial_visible(workspace, base, out_dtype).to(
+                        fx.Float32
+                    )
+                    for part in range_constexpr(1, split_k):
+                        partial = _load_partial_visible(
+                            workspace, base + part * tile_elems, out_dtype
                         )
                         total = total + partial.to(fx.Float32)
                     commit_output(total, row, col)
