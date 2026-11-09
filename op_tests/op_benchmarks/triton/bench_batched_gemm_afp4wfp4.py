@@ -1,3 +1,4 @@
+import functools
 import math
 import sys
 
@@ -10,8 +11,10 @@ from aiter.ops.triton.gemm.batched.batched_gemm_afp4wfp4 import (
 from aiter.ops.triton.utils._triton import arch_info
 from op_tests.op_benchmarks.triton.utils.argparse import (
     add_argparse_ff,
+    get_do_bench_graph_kwargs,
     get_ff_args,
     get_parser,
+    get_rot_bufs_kwargs,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     batched_model_benchmark_shapes,
@@ -20,16 +23,28 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_shape_benchmark_object,
     print_vgpr,
 )
+from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
+    RotatingBufferBench,
+)
 from op_tests.triton_tests.gemm.batched.test_batched_gemm_afp4wfp4 import (
     generate_batched_gemm_afp4wfp4_inputs,
 )
 
 
 def bench_gemm_fn(
-    batch: int, M: int, N: int, K: int, metric: str, layout: str, model_name=None
+    bencher: RotatingBufferBench,
+    batch: int,
+    M: int,
+    N: int,
+    K: int,
+    metric: str,
+    layout: str,
+    model_name=None,
 ):
     c_dtype = torch.bfloat16
-    x, w, x_scale, w_scale, y = generate_batched_gemm_afp4wfp4_inputs(
+
+    _p_gen = functools.partial(
+        generate_batched_gemm_afp4wfp4_inputs,
         batch,
         M,
         N,
@@ -38,23 +53,28 @@ def bench_gemm_fn(
         layout=layout,
         output=True,
     )
-    # print(f"M: {M}, N: {N}, K: {K}, x.shape: {x.shape}, x.stride(): {x.stride()}, w.shape: {w.shape}, w.stride(): {w.stride()}")
+    _out_vals_keys = ["x", "w", "x_scales", "w_scales", "y"]
+
+    rot_bufs = bencher.build_pool([_p_gen], [_out_vals_keys])
+
+    kernel_fn = functools.partial(batched_gemm_afp4wfp4, dtype=c_dtype)
+
     # flops
     flops = 2.0 * M * N * K * batch
-    # memory transfer
-    mem_read = x.numel() * x.element_size() + w.numel() * w.element_size()
+    # memory transfer. x/w are e2m1, packed two values per byte (K // 2 wide);
+    # the scale tensors keep their own numel (one scale per 32 K-elements,
+    # which doesn't reduce to a clean M/N/K product).
+    mem_read = (batch * M * K // 2) * rot_bufs[0]["x"].element_size() + (
+        batch * N * K // 2
+    ) * rot_bufs[0]["w"].element_size()
     mem_read += (
-        x_scale.numel() * x_scale.element_size()
-        + w_scale.numel() * w_scale.element_size()
+        rot_bufs[0]["x_scales"].numel() * rot_bufs[0]["x_scales"].element_size()
+        + rot_bufs[0]["w_scales"].numel() * rot_bufs[0]["w_scales"].element_size()
     )
-    mem_write = (M * N) * 2  # TODO: Fix for c_dtype != bf16
+    mem_write = (batch * M * N) * rot_bufs[0]["y"].element_size()
     mem = mem_read + mem_write
 
-    ms = triton.testing.do_bench(
-        lambda: batched_gemm_afp4wfp4(x, w, x_scale, w_scale, c_dtype, y),
-        warmup=25,
-        rep=100,
-    )
+    ms = bencher.bench(kernel_fn)
 
     # Return exactly one scalar depending on which metric is active
     if metric == "time":
@@ -77,6 +97,10 @@ def run_model_benchmark(args):
         model_benchmark_shapes_fn=batched_model_benchmark_shapes,
     )
 
+    bencher = RotatingBufferBench.from_dict(
+        {**get_rot_bufs_kwargs(args), **get_do_bench_graph_kwargs(args)}
+    )
+
     @triton.testing.perf_report([benchmark])
     def bench_batched_gemm_afp4wfp4(
         M, hidden_dim, intermediate_dim, batch, metric, layer, model_name=None, **kwargs
@@ -94,7 +118,15 @@ def run_model_benchmark(args):
             K = math.ceil(K / args.tp)
         # print(f"Layer: {layer}, B: {batch}, M: {M}, N: {N}, K: {K}, hidden_dim: {hidden_dim}, intermediate_dim: {intermediate_dim}")
 
-        return bench_gemm_fn(batch, M, N, K, metric, layout=args.layout)
+        return bench_gemm_fn(
+            bencher,
+            batch,
+            M,
+            N,
+            K,
+            metric,
+            layout=args.layout,
+        )
 
     bench_batched_gemm_afp4wfp4.run(save_path="." if args.o else None, print_data=True)
 
@@ -106,9 +138,21 @@ def run_shape_benchmark(args):
         x_names=["batch", "M", "N", "K"],
     )
 
+    bencher = RotatingBufferBench.from_dict(
+        {**get_rot_bufs_kwargs(args), **get_do_bench_graph_kwargs(args)}
+    )
+
     @triton.testing.perf_report([benchmark])
     def bench_batched_gemm_afp4wfp4(batch, M, N, K, metric, **kwargs):
-        return bench_gemm_fn(batch, M, N, K, metric, layout=args.layout)
+        return bench_gemm_fn(
+            bencher,
+            batch,
+            M,
+            N,
+            K,
+            metric,
+            layout=args.layout,
+        )
 
     bench_batched_gemm_afp4wfp4.run(save_path="." if args.o else None, print_data=True)
 

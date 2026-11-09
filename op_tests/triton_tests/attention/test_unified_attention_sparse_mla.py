@@ -54,33 +54,42 @@ def generate_test_data(
     random.seed(t.seed)
     torch.manual_seed(t.seed)
     torch.cuda.manual_seed(t.seed)
-    torch.backends.cudnn.deterministic = True
 
     assert t.h_q % t.h_kv == 0
 
-    cache_seqlens_cpu = torch.full((t.b,), t.s_k, dtype=torch.int32, device="cpu")
+    cache_seqlens = torch.full((t.b,), t.s_k, dtype=torch.int32, device="cuda")
     if t.is_varlen:
         for i in range(t.b):
-            cache_seqlens_cpu[i] = max(random.normalvariate(t.s_k, t.s_k / 2), t.s_q)
+            cache_seqlens[i] = max(random.normalvariate(t.s_k, t.s_k / 2), t.s_q)
 
     if t.have_zero_seqlen_k:
-        zeros_mask = torch.randn(t.b, dtype=torch.float32, device="cpu") > 0
-        cache_seqlens_cpu[zeros_mask] = 0
+        zeros_mask = torch.randn(t.b, dtype=torch.float32, device="cuda") > 0
+        cache_seqlens[zeros_mask] = 0
 
+    cache_seqlens_cpu = cache_seqlens.cpu()
     max_seqlen = cache_seqlens_cpu.max().item()
     max_seqlen_pad = cdiv(max_seqlen, 256) * 256
-    cache_seqlens = cache_seqlens_cpu.cuda()
 
-    q = torch.randn(t.b, t.s_q, t.h_q, t.d)
+    q = torch.randn(t.b, t.s_q, t.h_q, t.d, dtype=torch.float32, device="cuda")
     q.clamp_(min=-1.0, max=1.0)
 
     block_table = torch.arange(
-        t.b * max_seqlen_pad // t.block_size, dtype=torch.int32
+        t.b * max_seqlen_pad // t.block_size, dtype=torch.int32, device="cuda"
     ).view(t.b, max_seqlen_pad // t.block_size)
-    block_table = block_table.view(-1)[torch.randperm(block_table.numel())].view(
-        t.b, -1
+    block_table = block_table.view(-1)[
+        torch.randperm(block_table.numel(), device="cuda")
+    ].view(t.b, -1)
+    blocked_k = (
+        torch.randn(
+            block_table.numel(),
+            t.block_size,
+            t.h_kv,
+            t.d,
+            dtype=torch.float32,
+            device="cuda",
+        )
+        / 10
     )
-    blocked_k = torch.randn(block_table.numel(), t.block_size, t.h_kv, t.d) / 10
     blocked_k.clamp_(min=-1.0, max=1.0)
 
     if t.topk is None:
@@ -95,31 +104,33 @@ def generate_test_data(
             block_table[i][cur_num_blocks:] = 2147480000
         return cache_seqlens, q, block_table, blocked_k, None, None
     else:
-        block_table_cpu = block_table.cpu()
-        abs_indices = torch.empty(t.b, t.s_q, t.topk, dtype=torch.int32, device="cpu")
+        abs_indices = torch.empty(t.b, t.s_q, t.topk, dtype=torch.int32, device="cuda")
         indices_in_kvcache = torch.empty(
-            t.b, t.s_q, t.topk, dtype=torch.int32, device="cpu"
+            t.b, t.s_q, t.topk, dtype=torch.int32, device="cuda"
         )
         for i in range(t.b):
             # Generate indices
             for j in range(t.s_q):
                 cur_abs_indices = torch.randperm(
-                    int(cache_seqlens_cpu[i].item()), device="cpu"
+                    int(cache_seqlens_cpu[i].item()), device="cuda"
                 )[: t.topk]
-                cur_blocked_indices = block_table_cpu[
+                cur_blocked_indices = block_table[
                     i, cur_abs_indices // t.block_size
                 ] * t.block_size + (cur_abs_indices % t.block_size)
                 if len(cur_abs_indices) < t.topk:
                     pad_len = t.topk - len(cur_abs_indices)
                     cur_abs_indices = torch.cat(
-                        [cur_abs_indices, torch.full((pad_len,), -1, device="cpu")]
+                        [cur_abs_indices, torch.full((pad_len,), -1, device="cuda")]
                     )
                     cur_blocked_indices = torch.cat(
-                        [cur_blocked_indices, torch.full((pad_len,), -1, device="cpu")]
+                        [
+                            cur_blocked_indices,
+                            torch.full((pad_len,), -1, device="cuda"),
+                        ]
                     )
 
                 # Mask KV
-                perm = torch.randperm(t.topk, device="cpu")
+                perm = torch.randperm(t.topk, device="cuda")
                 cur_abs_indices = cur_abs_indices[perm]
                 cur_blocked_indices = cur_blocked_indices[perm]
 
@@ -136,18 +147,15 @@ def generate_test_data(
         all_indices = list(set(all_indices))
         if -1 in all_indices:
             all_indices.remove(-1)
-        all_indices = torch.tensor(all_indices, dtype=torch.int32, device="cpu")
+        all_indices = torch.tensor(all_indices, dtype=torch.int32, device="cuda")
 
         blocked_k = blocked_k.view(-1, t.h_kv, t.d)
         nonused_indices_mask = torch.ones(
-            blocked_k.size(0) * blocked_k.size(1), dtype=torch.bool, device="cpu"
+            blocked_k.size(0) * blocked_k.size(1), dtype=torch.bool, device="cuda"
         )
         nonused_indices_mask[all_indices] = False
         blocked_k[nonused_indices_mask, :, :] = float("nan")
         blocked_k = blocked_k.view(-1, t.block_size, t.h_kv, t.d)
-
-        abs_indices = abs_indices.to(q.device)
-        indices_in_kvcache = indices_in_kvcache.to(q.device)
 
         return cache_seqlens, q, block_table, blocked_k, abs_indices, indices_in_kvcache
 
@@ -167,7 +175,7 @@ def reference_torch(
     """
 
     def get_topk_attn_mask(s_q: int, s_k: int, indices: torch.Tensor):
-        mask = torch.zeros(s_q, s_k, dtype=torch.bool)
+        mask = torch.zeros(s_q, s_k, dtype=torch.bool, device=indices.device)
         for i in range(s_q):
             cur_indices = indices[i]
             valid_indices = cur_indices[cur_indices != -1]
@@ -194,13 +202,13 @@ def reference_torch(
         kv[kv != kv] = 0.0  # noqa: PLR0124
         attn_weight = query @ kv.transpose(-2, -1)  # [h_q, s_q, s_k]
         if (is_causal and query.size(1) > 1) or indices is not None:
-            mask = torch.ones(s_q, s_k, dtype=torch.bool)
+            mask = torch.ones(s_q, s_k, dtype=torch.bool, device=query.device)
             if is_causal:
                 assert indices is None
                 mask = mask.tril(diagonal=s_k - s_q)
             if indices is not None:
                 mask &= get_topk_attn_mask(s_q, s_k, indices)
-            attn_bias = torch.zeros(s_q, s_k, dtype=torch.float)
+            attn_bias = torch.zeros(s_q, s_k, dtype=torch.float, device=query.device)
             attn_bias.masked_fill_(mask.logical_not(), float("-inf"))
             attn_weight += attn_bias.to(q.dtype)
         # attn_weight /= math.sqrt(query.size(-1))
@@ -218,7 +226,7 @@ def reference_torch(
     block_size = blocked_k.size(1)
     h_kv = blocked_k.size(2)
     cache_seqlens_cpu = cache_seqlens.cpu()
-    out_ref = torch.empty(b, s_q, h_q, dv, dtype=torch.float32)
+    out_ref = torch.empty(b, s_q, h_q, dv, dtype=torch.float32, device=q.device)
     for i in range(b):
         cur_len = cache_seqlens_cpu[i].item()
         cur_num_blocks = cdiv(cur_len, block_size)
@@ -256,12 +264,6 @@ def chunk_input(
     cu_query_lens = torch.tensor(
         [0] + query_lens, dtype=torch.int32, device="cuda"
     ).cumsum(dim=0, dtype=torch.int32)
-    cache_seqlens = cache_seqlens.to("cuda")
-    q_new = q_new.to("cuda")
-    block_table = block_table.to("cuda")
-    blocked_k = blocked_k.to("cuda")
-    abs_indices = abs_indices.to("cuda")
-    indices_in_kvcache = indices_in_kvcache.to("cuda")
     return (
         cu_query_lens,
         max_q_len,
@@ -353,7 +355,7 @@ def test_triton_unified_attn(
         lora_dim,
     )
 
-    ref_output = ref_output.to(output.device).to(q.dtype)
+    ref_output = ref_output.to(q.dtype)
     output = output.reshape(ref_output.shape)
 
     atol, rtol = 1.5e-2, 1e-2

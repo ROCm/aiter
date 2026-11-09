@@ -89,24 +89,30 @@ def _rows_with_inf_and_extrema(batch_size, hiddensize, topk, case, dtype):
     "signed_zero": high entries are randn, low entries are -0.0 or +0.0.
     """
     n_high = torch.arange(batch_size, device=DEVICE) % (2 * topk)
-    rank = torch.rand(batch_size, hiddensize, device=DEVICE).argsort(dim=1)
+    rank = torch.rand(
+        batch_size, hiddensize, dtype=torch.float32, device=DEVICE
+    ).argsort(dim=1)
     rank = rank.argsort(dim=1)  # rank[r, c]: position of column c in a random order
     is_low = rank >= n_high[:, None]
     shape = (batch_size, hiddensize)
     if case == "masked":
-        high = torch.randn(shape, device=DEVICE)
-        low = torch.full(shape, float("-inf"), device=DEVICE)
+        high = torch.randn(shape, dtype=torch.float32, device=DEVICE)
+        low = torch.full(shape, float("-inf"), dtype=torch.float32, device=DEVICE)
     elif case == "signed_zero":
-        high = torch.randn(shape, device=DEVICE)
-        pool = torch.tensor([-0.0, 0.0], device=DEVICE)
+        high = torch.randn(shape, dtype=torch.float32, device=DEVICE)
+        pool = torch.tensor([-0.0, 0.0], dtype=torch.float32, device=DEVICE)
         low = pool[torch.randint(0, pool.numel(), shape, device=DEVICE)]
     else:
         finfo = torch.finfo(dtype)
         pool = torch.tensor(
-            [finfo.min, -1.0, -0.0, 0.0, 1.0, finfo.max, float("inf")], device=DEVICE
+            [finfo.min, -1.0, -0.0, 0.0, 1.0, finfo.max, float("inf")],
+            dtype=torch.float32,
+            device=DEVICE,
         )
         high = pool[torch.randint(0, pool.numel(), shape, device=DEVICE)]
-        pool = torch.tensor([float("-inf"), finfo.min], device=DEVICE)
+        pool = torch.tensor(
+            [float("-inf"), finfo.min], dtype=torch.float32, device=DEVICE
+        )
         low = pool[torch.randint(0, pool.numel(), shape, device=DEVICE)]
     return torch.where(is_low, low, high).to(dtype)
 

@@ -43,20 +43,28 @@ def make_inputs(B, T, H, device):
         "v": dense(),
         "g": dense(),
         "beta": in_proj[..., 4 * H * D + D : 4 * H * D + D + H],
-        "A_log": torch.log(torch.empty(H, device=device).uniform_(1, 16)),
-        "dt_bias": torch.randn(H * D, device=device),
+        "A_log": torch.log(
+            torch.empty(H, dtype=torch.float32, device=device).uniform_(1, 16)
+        ),
+        "dt_bias": torch.randn(H * D, dtype=torch.float32, device=device),
         "cu_seqlens": torch.arange(0, total + 1, T, dtype=torch.int32, device=device),
     }
 
 
-def traffic_bytes(B, T, H, stage):
+def traffic_bytes(B, T, H, stage, device, state_dtype=torch.float32):
     D = K3_HEAD_DIM
     tok = B * T * H * D * 2  # one [T, H, 128] bf16 tensor
     nt = B * triton.cdiv(T, CHUNK_SIZE) * H
     ws = (
         3 * tok + tok // 2 + nt * D * (CHUNK_SIZE * 2 + 4)
     )  # qg, w, u, aqk, kg_t, decay
-    state = B * H * D * D * 4
+    state = (
+        B
+        * H
+        * D
+        * D
+        * torch.tensor([], dtype=state_dtype, device=device).element_size()
+    )
     prepare = 4 * tok + B * T * H * 2 + ws
     walk = ws + tok + 2 * state
     return {"prepare": prepare, "walk": walk, "total": prepare + walk}[stage]
@@ -107,6 +115,7 @@ def _bench_graph(fn, graph_ms, n_replays):
 
 
 def benchmark(args):
+    state_dtype = torch.bfloat16 if args.state_dtype == "bf16" else torch.float32
     lines = ["gluon", "gluon_prepare"] + [f"gluon_walk:{c}" for c in args.walk_configs]
     if "triton" in args.backends:
         lines.append("triton")
@@ -133,7 +142,9 @@ def benchmark(args):
     def bench_chunk_kda(H, B, T, provider):
         torch.manual_seed(0)
         inp = make_inputs(B, T, H, args.device)
-        state = torch.randn(B, H, K3_HEAD_DIM, K3_HEAD_DIM, device=args.device)
+        state = torch.randn(
+            B, H, K3_HEAD_DIM, K3_HEAD_DIM, dtype=state_dtype, device=args.device
+        )
         idx = torch.arange(B, dtype=torch.int32, device=args.device)
         has_init = torch.ones(B, dtype=torch.bool, device=args.device)
         paged = {
@@ -206,7 +217,7 @@ def benchmark(args):
         ms = _time(fn, args)
         if args.metric == "time":
             return ms * 1e3
-        return traffic_bytes(B, T, H, stage) / ms * 1e-9
+        return traffic_bytes(B, T, H, stage, args.device, state_dtype) / ms * 1e-9
 
     bench_chunk_kda.run(
         save_path="." if args.o else None, print_data=True, show_plots=False
@@ -221,6 +232,7 @@ def parse_args():
     parser.add_argument("--batch_sizes", type=int, nargs="+", default=[1, 3, 8])
     parser.add_argument("--seq_lens", type=int, nargs="+", default=[1024, 4096])
     parser.add_argument("--num_heads", type=int, nargs="+", default=K3_NUM_HEADS)
+    parser.add_argument("--state_dtype", default="fp32", choices=["fp32", "bf16"])
     parser.add_argument(
         "--walk_configs",
         nargs="+",
