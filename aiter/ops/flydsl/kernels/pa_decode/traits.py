@@ -186,8 +186,9 @@ class PaDecodeSchedule:
         kv_dtype, query_dtype = pa_fx_dtypes(kv_dtype, query_dtype)
         if direct_output and kv_dtype != MXFP4_KV_DTYPE:
             raise NotImplementedError("direct_output requires gfx1250 or MXFP4")
-        # The MFMAs read FP8 as the arch's format: FNUZ on gfx942, OCP on gfx950.
-        arch_fp8 = fx.Float8E4M3FN if is_gfx950 else fx.Float8E4M3FNUZ
+        # The MMAs read FP8 as the arch's format: FNUZ on gfx94x, OCP elsewhere
+        # (gfx950, and gfx1250, whose schedule the tests still query).
+        arch_fp8 = fx.Float8E4M3FNUZ if "gfx94" in arch else fx.Float8E4M3FN
         if kv_dtype in FP8_KV_DTYPES and kv_dtype != arch_fp8:
             raise ValueError(
                 f"FP8 KV on {arch} must be {fx_to_torch_dtype(arch_fp8)}, "
