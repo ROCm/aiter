@@ -13,6 +13,7 @@ from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import (
     is_fp8,
     remap_xcd,
 )
+from aiter.ops.triton.utils.device_info import get_num_xcds
 from aiter.ops.triton.utils.tuned_config_utils import autotune_configs
 
 PREPROCESS_AUTOTUNE_KEYS = [
@@ -4653,7 +4654,7 @@ def attention_backward_triton_impl(
     IS_FP8 = is_fp8([q, k, v])
     if IS_FP8:
         arch = get_arch()
-        if not arch.supports_fp8:
+        if not arch.supports_any_fp8:
             raise RuntimeError(f"{arch.name} does not support FP8")
         FP8_MAX = torch.finfo(q.dtype).max
 
@@ -4811,7 +4812,7 @@ def attention_backward_triton_impl(
         seqlen = max(max_seqlen_q, max_seqlen_k)
 
         arch = get_arch()
-        num_xcd = 1 if arch.is_rdna else 8
+        num_xcd = 1 if arch.is_rdna else get_num_xcds()
 
         def grid(META):
             return (
