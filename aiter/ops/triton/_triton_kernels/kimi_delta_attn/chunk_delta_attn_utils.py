@@ -127,7 +127,9 @@ def upload_ints(
             "capturing so it is cached."
         )
     stream = torch.cuda.current_stream(device)
-    host = torch.tensor(values, dtype=dtype).pin_memory()
+    # On the CPU explicitly: under a CUDA default device a bare ``torch.tensor``
+    # is a CUDA tensor, and only CPU tensors can be pinned.
+    host = torch.tensor(values, dtype=dtype, device="cpu").pin_memory()
     return host.to(device, non_blocking=True), stream
 
 
