@@ -4,6 +4,7 @@
 import math
 
 import triton.experimental.gluon.language as gl
+from triton._C.libtriton.gluon_ir import make_cga_layout
 from triton.experimental import gluon
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
@@ -45,32 +46,62 @@ def create_shared_layouts(
     LAYOUT: gl.constexpr,
     elem_bits: int = 16,
     elem_bits_b: int | None = None,
+    ctas_per_cga=(1, 1),
+    cga_a=(),
+    cga_b=(),
 ):
-    """elem_bits sizes A's pad interval; elem_bits_b sizes B's (defaults to elem_bits)."""
+    """elem_bits sizes A's pad interval; elem_bits_b sizes B's (defaults to elem_bits).
+
+    For a workgroup cluster, BLOCK_M/BLOCK_N are cluster-wide, cga_a/cga_b are the CTA bases of
+    the A ([M, K]) and B ([K, N]) operand layouts, and each pad interval is bounded by the
+    per-CTA extent of the inner dimension.
+    """
     if elem_bits_b is None:
         elem_bits_b = elem_bits
+    cta_m = BLOCK_M // ctas_per_cga[0]
+    cta_n = BLOCK_N // ctas_per_cga[1]
+    swap = lambda bases: [[y, x] for x, y in bases]
     if LAYOUT[0] == "T":
         SHARED_LAYOUT_A: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-            [[_pad_interval(BLOCK_K, elem_bits), 8]], [BLOCK_M, BLOCK_K], [1, 0]
+            [[_pad_interval(BLOCK_K, elem_bits), 8]],
+            [BLOCK_M, BLOCK_K],
+            [1, 0],
+            list(cga_a),
         )
     else:
         SHARED_LAYOUT_A: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-            [[_pad_interval(BLOCK_M, elem_bits), 8]], [BLOCK_K, BLOCK_M], [1, 0]
+            [[_pad_interval(cta_m, elem_bits), 8]],
+            [BLOCK_K, BLOCK_M],
+            [1, 0],
+            swap(cga_a),
         )
 
     if LAYOUT[1] == "T":
         SHARED_LAYOUT_B: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-            [[_pad_interval(BLOCK_N, elem_bits_b), 16]], [BLOCK_K, BLOCK_N], [1, 0]
+            [[_pad_interval(cta_n, elem_bits_b), 16]],
+            [BLOCK_K, BLOCK_N],
+            [1, 0],
+            list(cga_b),
         )
     else:
         SHARED_LAYOUT_B: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-            [[_pad_interval(BLOCK_K, elem_bits_b), 8]], [BLOCK_N, BLOCK_K], [1, 0]
+            [[_pad_interval(BLOCK_K, elem_bits_b), 8]],
+            [BLOCK_N, BLOCK_K],
+            [1, 0],
+            swap(cga_b),
         )
 
     return (SHARED_LAYOUT_A, SHARED_LAYOUT_B)
 
 
-def create_wmma_layouts(num_warps):
+def create_store_layout(BLOCK_M, BLOCK_N, ctas_per_cga=(1, 1), cga_layout=()):
+    """LDS staging layout of C for the TDM store (acc -> LDS -> HBM)."""
+    return gl.PaddedSharedLayout.with_identity_for(
+        [[BLOCK_N // ctas_per_cga[1], 8]], [BLOCK_M, BLOCK_N], [1, 0], list(cga_layout)
+    )
+
+
+def create_wmma_layouts(num_warps, ctas_per_cga=(1, 1)):
     warp_bases = []
     for i in range(int(math.log2(num_warps))):
         if i == 0:
@@ -79,8 +110,18 @@ def create_wmma_layouts(num_warps):
             warp_bases.append((1 << (i - 1), 0))
     warp_bases = tuple(warp_bases)
 
+    # A workgroup cluster of CTAS_M x CTAS_N CTAs shares one cluster-wide tile. The operand
+    # layouts derived from this have zero CTA bases on the axis they do not split, so their
+    # TDM loads multicast to the peers.
+    cga_layout = []
+    if tuple(ctas_per_cga) != (1, 1):
+        cga_layout = make_cga_layout(list(ctas_per_cga), list(ctas_per_cga), [0, 1])
     wmma_layout = gl.amd.AMDWMMALayout(
-        version=3, transposed=True, warp_bases=warp_bases, instr_shape=[16, 16, 32]
+        version=3,
+        transposed=True,
+        warp_bases=warp_bases,
+        instr_shape=[16, 16, 32],
+        cga_layout=cga_layout,
     )
     operand_a = gl.DotOperandLayout(operand_index=0, parent=wmma_layout, k_width=8)
     operand_b = gl.DotOperandLayout(operand_index=1, parent=wmma_layout, k_width=8)
@@ -115,11 +156,39 @@ def _gemm_a16w16_bandwidth_bound_kernel(
     activation: gl.constexpr,
     USE_ACTIVATION: gl.constexpr,
     ADD_BIAS: gl.constexpr,
+    NUM_CTAS: gl.constexpr = 1,
+    GROUP_SIZE_M: gl.constexpr = 0,
+    B2B_WMMA: gl.constexpr = 0,
+    TDM_STORE: gl.constexpr = 0,
+    SHARED_LAYOUT_C: gl.constexpr = None,
 ):
+    """NUM_CTAS > 1 runs one cluster-wide BLOCK_M x BLOCK_N tile per workgroup cluster (the
+    layouts carry the CTA split). GROUP_SIZE_M > 0 orders the tiles in groups of that many tile
+    rows. B2B_WMMA issues WMMAs back to back. TDM_STORE writes C through LDS with one TDM store.
+    """
+    if B2B_WMMA:
+        # back-to-back WMMA issue: HW_REG_WAVE_SCHED_MODE bit 2
+        gl.inline_asm_elementwise(
+            "s_setreg_imm32_b32 hwreg(HW_REG_WAVE_SCHED_MODE, 2, 1), 1; v_mov_b32 $0, 0;",
+            constraints="=v",
+            args=[],
+            dtype=gl.int32,
+            is_pure=False,
+            pack=1,
+        )
+
     pid = gl.program_id(axis=0)
     num_pid_m = gl.cdiv(M, BLOCK_M)
-    pid_m = pid % num_pid_m
-    pid_n = pid // num_pid_m
+    if GROUP_SIZE_M == 0:
+        pid_m = pid % num_pid_m
+        pid_n = pid // num_pid_m
+    else:
+        num_pid_n = gl.cdiv(N, BLOCK_N)
+        group_size = GROUP_SIZE_M * num_pid_n
+        first_m = (pid // group_size) * GROUP_SIZE_M
+        group_m = min(num_pid_m - first_m, GROUP_SIZE_M)
+        pid_m = first_m + (pid % group_size) % group_m
+        pid_n = (pid % group_size) // group_m
 
     # Descriptors start at this block's (M, N) offset by biasing the base
     # pointer — subsequent async_loads use [0, 0] and step only along K.
@@ -221,6 +290,12 @@ def _gemm_a16w16_bandwidth_bound_kernel(
 
         load_idx += 1
 
+    # In a cluster, the TDM load that refills a slot writes the slot in every peer. Each CTA
+    # arrives after its last LDS read of a slot and waits before the load that refills it, so no
+    # TDM wait sits between an arrive and the next wait.
+    if NUM_CTAS > 1:
+        gl.amd.gfx1250.cluster.arrive()
+
     # Main pipeline loop
     num_k_tiles = gl.cdiv(K, BLOCK_K)
 
@@ -231,6 +306,8 @@ def _gemm_a16w16_bandwidth_bound_kernel(
     # the loop and install the true remaining extent with set_bounds so the TDM
     # engine zero-fills past K instead of reading out of bounds.
     for _ in range(num_k_tiles - (NUM_BUFFERS - 1) - 1):
+        if NUM_CTAS > 1:
+            gl.amd.gfx1250.cluster.wait()
         gl.amd.gfx1250.tdm.async_load(
             a_desc, [0, 0], a_buffer.index(load_idx % NUM_BUFFERS)
         )
@@ -282,6 +359,8 @@ def _gemm_a16w16_bandwidth_bound_kernel(
             )
 
         accumulator = gl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
+        if NUM_CTAS > 1:
+            gl.amd.gfx1250.cluster.arrive()
 
         compute_idx += 1
 
@@ -308,6 +387,8 @@ def _gemm_a16w16_bandwidth_bound_kernel(
             b_desc, set_bounds=[N - pid_n * BLOCK_N, K - k_main]
         )
 
+    if NUM_CTAS > 1:
+        gl.amd.gfx1250.cluster.wait()
     gl.amd.gfx1250.tdm.async_load(
         a_desc, [0, 0], a_buffer.index(load_idx % NUM_BUFFERS)
     )
@@ -340,6 +421,9 @@ def _gemm_a16w16_bandwidth_bound_kernel(
         )
 
     accumulator = gl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
+    if NUM_CTAS > 1:
+        gl.amd.gfx1250.cluster.arrive()
+        gl.amd.gfx1250.cluster.wait()
 
     compute_idx += 1
 
@@ -370,6 +454,11 @@ def _gemm_a16w16_bandwidth_bound_kernel(
         accumulator = gl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
         compute_idx += 1
 
+    if NUM_CTAS > 1:
+        # keep every CTA resident until all peers are done with its LDS
+        gl.amd.gfx1250.cluster.arrive()
+        gl.amd.gfx1250.cluster.wait()
+
     # Bias
     if ADD_BIAS:
         offs_bias = pid_n * BLOCK_N + gl.arange(
@@ -382,30 +471,49 @@ def _gemm_a16w16_bandwidth_bound_kernel(
     if USE_ACTIVATION:
         accumulator = activation(accumulator)
 
-    offs_cm = pid_m * BLOCK_M + gl.arange(
-        0, BLOCK_M, layout=gl.SliceLayout(1, WMMA_LAYOUT)
-    )
-    offs_cn = pid_n * BLOCK_N + gl.arange(
-        0, BLOCK_N, layout=gl.SliceLayout(0, WMMA_LAYOUT)
-    )
+    if TDM_STORE:
+        # C through LDS and one TDM store; the descriptor bounds clip a partial M/N tile
+        c_buffer = gl.allocate_shared_memory(
+            c_ptr.type.element_ty, shape=[BLOCK_M, BLOCK_N], layout=SHARED_LAYOUT_C
+        )
+        c_buffer.store(accumulator.to(c_ptr.type.element_ty))
+        gl.barrier()
+        c_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=c_ptr,
+            shape=(M, N),
+            strides=(stride_cm, stride_cn),
+            block_shape=(BLOCK_M, BLOCK_N),
+            layout=SHARED_LAYOUT_C,
+        )
+        gl.amd.gfx1250.tdm.async_store(
+            c_desc, [pid_m * BLOCK_M, pid_n * BLOCK_N], c_buffer
+        )
+        gl.amd.gfx1250.tdm.async_wait(0)
+    else:
+        offs_cm = pid_m * BLOCK_M + gl.arange(
+            0, BLOCK_M, layout=gl.SliceLayout(1, WMMA_LAYOUT)
+        )
+        offs_cn = pid_n * BLOCK_N + gl.arange(
+            0, BLOCK_N, layout=gl.SliceLayout(0, WMMA_LAYOUT)
+        )
 
-    # buffer_store offsets are 32-bit, so offsets from c_ptr itself drop every
-    # store past 2**31 bytes of C; rebase C to this block in int64 instead.
-    c_base = (
-        c_ptr
-        + (pid_m * BLOCK_M).to(gl.int64) * stride_cm
-        + (pid_n * BLOCK_N).to(gl.int64) * stride_cn
-    )
-    offs_c = stride_cm * (offs_cm[:, None] - pid_m * BLOCK_M) + stride_cn * (
-        offs_cn[None, :] - pid_n * BLOCK_N
-    )
+        # buffer_store offsets are 32-bit, so offsets from c_ptr itself drop every
+        # store past 2**31 bytes of C; rebase C to this block in int64 instead.
+        c_base = (
+            c_ptr
+            + (pid_m * BLOCK_M).to(gl.int64) * stride_cm
+            + (pid_n * BLOCK_N).to(gl.int64) * stride_cn
+        )
+        offs_c = stride_cm * (offs_cm[:, None] - pid_m * BLOCK_M) + stride_cn * (
+            offs_cn[None, :] - pid_n * BLOCK_N
+        )
 
-    mask_c = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+        mask_c = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
 
-    # Store
-    gl.amd.gfx1250.buffer_store(
-        accumulator.to(c_ptr.type.element_ty), c_base, offs_c, mask=mask_c
-    )
+        # Store
+        gl.amd.gfx1250.buffer_store(
+            accumulator.to(c_ptr.type.element_ty), c_base, offs_c, mask=mask_c
+        )
 
 
 @gluon.jit(repr=_gemm_a16w16_compute_bound_repr)

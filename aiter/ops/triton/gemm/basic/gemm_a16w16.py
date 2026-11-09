@@ -364,7 +364,11 @@ def gemm_a16w16_(
         from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_a16w16 import (
             _KERNEL_MAP,
             create_shared_layouts,
+            create_store_layout,
             create_wmma_layouts,
+        )
+        from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_mxfp4 import (
+            cluster_shape,
         )
 
         assert (
@@ -393,6 +397,15 @@ def gemm_a16w16_(
         NUM_BUFFERS = config.get("NUM_BUFFERS", 2)
         num_warps = config["num_warps"]
         waves_per_eu = config.get("waves_per_eu", 0)
+        # bandwidth_bound only: workgroup cluster (BLOCK_M/BLOCK_N are then cluster-wide),
+        # grouped tile order, back-to-back WMMA and a TDM store of C
+        num_ctas = config.get("num_ctas", 1)
+        bw_options = {
+            "NUM_CTAS": num_ctas,
+            "GROUP_SIZE_M": config.get("GROUP_SIZE_M", 0),
+            "B2B_WMMA": config.get("B2B_WMMA", 0),
+            "TDM_STORE": config.get("TDM_STORE", 0),
+        }
 
         num_k_tiles = triton.cdiv(K, BLOCK_K)
         _MIN_BUFFERS = {"bandwidth_bound": 1, "compute_bound": 2}
@@ -442,10 +455,27 @@ def gemm_a16w16_(
         if y is None:
             y = torch.empty((M, N), dtype=dtype, device=x.device)
 
-        wmma_layout, operand_a, operand_b = create_wmma_layouts(num_warps)
+        if kernel_type != "bandwidth_bound":
+            assert num_ctas == 1 and not any(
+                v for k, v in bw_options.items() if k != "NUM_CTAS"
+            ), f"num_ctas and {list(bw_options)} need kernel_type='bandwidth_bound'"
+            bw_options = {}
+        ctas_per_cga = cluster_shape(num_ctas, BLOCK_M, BLOCK_N)
+        wmma_layout, operand_a, operand_b = create_wmma_layouts(num_warps, ctas_per_cga)
         shared_a, shared_b = create_shared_layouts(
-            BLOCK_M, BLOCK_N, BLOCK_K, layout, x.element_size() * 8
+            BLOCK_M,
+            BLOCK_N,
+            BLOCK_K,
+            layout,
+            x.element_size() * 8,
+            ctas_per_cga=ctas_per_cga,
+            cga_a=operand_a.cga_layout,
+            cga_b=operand_b.cga_layout,
         )
+        if bw_options.get("TDM_STORE"):
+            bw_options["SHARED_LAYOUT_C"] = create_store_layout(
+                BLOCK_M, BLOCK_N, ctas_per_cga, wmma_layout.cga_layout
+            )
 
         grid = (triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N), 1)
 
@@ -482,7 +512,9 @@ def gemm_a16w16_(
             activation=_get_activation_from_str(activation) if activation else None,
             USE_ACTIVATION=activation is not None,
             ADD_BIAS=(bias is not None),
+            **bw_options,
             num_warps=num_warps,
+            num_ctas=num_ctas,
             waves_per_eu=waves_per_eu,
         )
 
