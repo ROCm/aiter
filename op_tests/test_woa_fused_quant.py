@@ -6,7 +6,8 @@
 The `wo_a` GEMM writes bf16 `y`, which ATOM then `quantize_fp8`s (group-32,
 amax floored 1e-10, ceil_pow2(amax/448)) before `wo_b`. `y_scale_out=` folds
 that quant into the GEMM epilogue. This checks the fused (y8, y_scale) are
-byte-identical to quantize_fp8 of the unfused bf16 output.
+byte-identical to quantize_fp8 of the unfused bf16 output. M above 1024 runs
+the compute-bound kernel on both paths.
 
 Run (gfx1250):
     python op_tests/test_woa_fused_quant.py
@@ -96,7 +97,7 @@ def main():
         print(f"fused-quant epilogue is gfx1250-only; skipping on {get_gfx()}")
         return 0
     p = argparse.ArgumentParser()
-    p.add_argument("-s", type=str, default="16,48,128,256")
+    p.add_argument("-s", type=str, default="16,48,128,256,1025,2048")
     p.add_argument("-b", type=int, default=2)
     p.add_argument("-n", type=int, default=1024)
     p.add_argument("-k", type=int, default=4096)

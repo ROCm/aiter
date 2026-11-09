@@ -38,6 +38,8 @@ from aiter.jit.utils.chip_info import get_cu_num, get_gfx, get_lds_capacity_byte
 
 from .mxfp8_bpreshuffle_gemm_gfx1250 import (
     BASE_NAME_SUFFIX_RE,
+    MX32_COMPUTE_WMMA_NAME_PREFIX,
+    compute_kernel_k_pair,
     is_compute_wmma_kernel_name,
     run_gemm_a8w8_mxfp8_32_bpreshuffle_gfx1250,
 )
@@ -367,6 +369,43 @@ def _pick_bmm_mx32_cache_clear() -> None:
 
 pick_bmm_mx32_kernel_name.cache_clear = _pick_bmm_mx32_cache_clear
 
+# Untuned prefill-sized M runs the compute-bound 256x256 kernel: it fills the
+# GPU with 256-row tiles, while decode-sized M keeps the generic batched kernel
+# and its tuned rows. cluster_m 1 fits every M-tile count; no persistent tiles,
+# so the fused-quant epilogue can run on it too.
+_BMM_MX32_COMPUTE_MIN_M = 1024  # exclusive
+_BMM_MX32_COMPUTE_TILE_N, _BMM_MX32_COMPUTE_TILE_K = 256, 128
+_BMM_MX32_COMPUTE_NB, _BMM_MX32_COMPUTE_CN = 2, 4
+_BMM_MX32_COMPUTE_NAME = (
+    f"{MX32_COMPUTE_WMMA_NAME_PREFIX}_t256x{_BMM_MX32_COMPUTE_TILE_N}"
+    f"x{_BMM_MX32_COMPUTE_TILE_K}_mw2_nw2_nb{_BMM_MX32_COMPUTE_NB}_sk1"
+    f"_cm1_cn{_BMM_MX32_COMPUTE_CN}"
+)
+
+
+@functools.lru_cache(maxsize=1024)
+def pick_bmm_mx32_compute_kernel_name(b: int, m: int, n: int, k: int) -> str | None:
+    """Compute-bound kernelName for an untuned prefill-sized batched mxfp8_32
+    shape, or None: M <= ``_BMM_MX32_COMPUTE_MIN_M`` (decode) and shapes the
+    kernel cannot take keep the generic batched kernel."""
+    if b < 1 or m <= _BMM_MX32_COMPUTE_MIN_M:
+        return None
+    tn, tk, nb = (
+        _BMM_MX32_COMPUTE_TILE_N,
+        _BMM_MX32_COMPUTE_TILE_K,
+        _BMM_MX32_COMPUTE_NB,
+    )
+    k_tiles = k // tk
+    if (
+        n % (tn * _BMM_MX32_COMPUTE_CN)
+        or k % tk
+        or k < 512
+        or k_tiles < nb
+        or k_tiles % compute_kernel_k_pair(nb, tn)
+    ):
+        return None
+    return _BMM_MX32_COMPUTE_NAME
+
 
 def _check_bmm_operands(
     tag: str, XQ: Tensor, WQ: Tensor, Out: Tensor, fused_fp8_out: bool = False
@@ -449,6 +488,9 @@ def run_bmm_a8w8_mxfp8_32_gfx1250(
     buffer and ``y_scale_out`` the row-major ``[M, (B*N)//32]`` e8m0 scale, the
     ``(x, x_scale)`` pair a downstream native-quant GEMM reads. Bit-matches a
     standalone ATOM ``quantize_fp8`` of the bf16 output.
+
+    Without ``kernel_name``, a prefill-sized M runs the compute-bound kernel
+    (``pick_bmm_mx32_compute_kernel_name``), fused quant included.
     """
     fused = y_scale_out is not None
     m, b, n, k, out_dtype = _check_bmm_operands(
@@ -478,7 +520,11 @@ def run_bmm_a8w8_mxfp8_32_gfx1250(
     w_shape = (b, n // 32, k_blocks) if w_scale_32x32 else (b, n, k_blocks)
     _check_e8m0(w_scale, "w_scale", "FlyDSL gfx1250 bmm", w_shape)
 
-    name = kernel_name or pick_bmm_mx32_kernel_name(b, m, n, k, w_scale_32x32)
+    name = (
+        kernel_name
+        or pick_bmm_mx32_compute_kernel_name(b, m, n, k)
+        or pick_bmm_mx32_kernel_name(b, m, n, k, w_scale_32x32)
+    )
     if is_compute_wmma_kernel_name(name):
         if m:
             from aiter.utility import dtypes
@@ -492,6 +538,7 @@ def run_bmm_a8w8_mxfp8_32_gfx1250(
                 name,
                 w_scale_32x32=w_scale_32x32,
                 batch=b,
+                y_scale_out=y_scale_out,
             )
         return Out
     cfg = parse_bmm_mx32_kernel_name(name)
