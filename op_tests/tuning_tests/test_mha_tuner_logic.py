@@ -360,7 +360,7 @@ class TestMeasurement(unittest.TestCase):
         )
         with (
             mock.patch.object(tuner, "candidate_field", return_value=["ck"]),
-            mock.patch.object(_TUNER, "mp_tuner", return_value=[]) as run,
+            mock.patch.object(_TUNER, "mp_tuner", return_value=([], [])) as run,
             mock.patch("builtins.print"),
         ):
             tuner.tune(pd.DataFrame([_key_row(**overrides)]), None, args)
@@ -376,13 +376,75 @@ class TestMeasurement(unittest.TestCase):
         rows = pd.DataFrame([_key_row(logits_soft_cap=30.0), _key_row()])
         with (
             mock.patch.object(tuner, "candidate_field", side_effect=[[], ["ck"]]),
-            mock.patch.object(_TUNER, "mp_tuner", return_value=[]) as run,
+            mock.patch.object(_TUNER, "mp_tuner", return_value=([], [])) as run,
             mock.patch("builtins.print"),
         ):
             tuner.tune(rows, None, args)
         tasks, group_sizes = run.call_args.args[:2]
         self.assertEqual([task.info[1] for task in tasks], ["ck"])
         self.assertEqual(len(group_sizes), 1)
+
+    def test_each_result_carries_its_status_and_detail(self):
+        from aiter.utility.tune_result import TuneResult
+
+        tuner = _tuner()
+        args = argparse.Namespace(
+            warmup=3, iters=7, mp=1, errRatio=0.0, timeout=60, verbose=False
+        )
+        info = (tuple(_key_row().values()), "ck", "")
+        returned = ([TuneResult(info, 12.0, 0.0)], [("crash", "AcceleratorError")])
+        with (
+            mock.patch.object(tuner, "candidate_field", return_value=["ck"]),
+            mock.patch.object(_TUNER, "mp_tuner", return_value=returned),
+            mock.patch("builtins.print"),
+        ):
+            rets = tuner.tune(pd.DataFrame([_key_row()]), None, args)
+        self.assertEqual(rets, [(info, 12.0, 0.0, "crash", "AcceleratorError")])
+
+    def test_run_config_reads_the_rows_dispatch_serves_this_gpu(self):
+        # A blank cell reads back from the CSV as NaN.
+        own, blank = "mi355x", float("nan")
+        cases = {
+            "its own model's": ([own, blank, "mi300x"], [own]),
+            "else those without a model": ([blank, "mi300x"], [None]),
+            "else the alphabetically first other model's": (
+                ["mi350x", "mi300x"],
+                ["mi300x"],
+            ),
+            "a table without the column": (None, [None]),
+        }
+        tuner = _tuner()
+        for name, (models, want) in cases.items():
+            with self.subTest(name):
+                table = pd.DataFrame(
+                    [_problem_row(gpu_model=model) for model in models or [own]]
+                    + [_problem_row(cu_num=304)],
+                    columns=list(MHA_FWD_TUNING_KEY_FIELDS),
+                )
+                if models is None:
+                    table = table.drop(columns="gpu_model")
+                with (
+                    mock.patch.object(tuner, "get_gfx", return_value="gfx950"),
+                    mock.patch.object(tuner, "get_gpu_model", return_value=own),
+                    mock.patch.object(tuner, "get_cu_num", return_value=256),
+                ):
+                    rows = tuner._rows_for_this_gpu(table)
+                models_read = rows.get("gpu_model", pd.Series([None] * len(rows)))
+                self.assertEqual(
+                    [m if isinstance(m, str) else None for m in models_read], want
+                )
+
+    def test_verification_leaves_the_model_to_dispatch(self):
+        tuner = _tuner()
+        with (
+            mock.patch.object(tuner, "get_gfx", return_value="gfx950"),
+            mock.patch.object(tuner, "get_gpu_model", return_value="mi355x"),
+            mock.patch.object(tuner, "get_cu_num", return_value=256),
+        ):
+            self.assertEqual(
+                tuner._hardware_mismatch(_problem_row(gpu_model="mi350x")), ""
+            )
+            self.assertIn("cu_num", tuner._hardware_mismatch(_problem_row(cu_num=304)))
 
     def test_candidates_are_timed_on_kernel_time(self):
         (task,) = self.tasks()

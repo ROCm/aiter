@@ -25,6 +25,7 @@ import pandas as pd
 import torch
 
 from aiter.jit.core import AITER_CONFIG_MHA_FWD
+from aiter.jit.utils import chip_info
 from aiter.ops.mha import (
     flash_attn_varlen_func,
     fmha_fwd_bf16_opus_varlen_fwd,
@@ -40,16 +41,18 @@ from aiter.ops.mha_fwd_policy import (
     MHA_FWD_TRITON_BACKENDS,
     MHA_FWD_TUNING_KEY_FIELDS,
     MHA_FWD_UNTUNED_CSV,
+    TUNING_HARDWARE_FIELDS,
     MhaFwdProblem,
     as_bool,
     clear_mha_fwd_tuning_cache,
     config_digest,
+    mha_fwd_serving_hardware,
     triton_config,
     triton_unsupported_reason,
 )
 from aiter.test_common import run_perftest
 from aiter.utility import dispatch_verification
-from aiter.utility.base_tuner import TunerCommon, _write_csv_atomic
+from aiter.utility.base_tuner import TunerCommon, _key_text, _write_csv_atomic
 from aiter.utility.mp_tuner import mp_tuner
 
 
@@ -586,6 +589,35 @@ class MhaFwdTuner(TunerCommon):
                 [tuple(key) not in tuned for key in self.untunedf.itertuples(False)]
             ].reset_index(drop=True)
 
+    def get_gpu_model(self):
+        return chip_info.get_gpu_model(torch.cuda.current_device())
+
+    def _live_hardware(self):
+        # Unlike the shared tuner's tables, MHA rows are keyed on the model.
+        return {**super()._live_hardware(), "gpu_model": self.get_gpu_model}
+
+    def _rows_for_this_gpu(self, tunedf):
+        """The rows dispatch serves this GPU from ``tunedf``, by the same
+        fallback for a model without rows of its own."""
+        cells = tunedf.reindex(columns=list(TUNING_HARDWARE_FIELDS)).fillna("")
+        prefixes = [
+            tuple(_key_text(cell).lower() for cell in row)
+            for row in cells.itertuples(index=False, name=None)
+        ]
+        live = self._live_hardware()
+        local = tuple(
+            _key_text(live[field]()).lower() for field in TUNING_HARDWARE_FIELDS
+        )
+        serving = mha_fwd_serving_hardware(set(prefixes), local)
+        return tunedf[[prefix == serving for prefix in prefixes]]
+
+    def _hardware_mismatch(self, row) -> str:
+        # A row from another model, or from none, can serve this GPU, and rows
+        # get here only from _rows_for_this_gpu or stamped with this GPU's model.
+        return super()._hardware_mismatch(
+            {field: value for field, value in row.items() if field != "gpu_model"}
+        )
+
     def stamp_hardware(self, frame: pd.DataFrame) -> pd.DataFrame:
         """``frame`` with the hardware columns set to this GPU's; a shape list
         naming other hardware is refused rather than tuned under it."""
@@ -690,7 +722,7 @@ class MhaFwdTuner(TunerCommon):
             group_sizes.append((len(field), ()))
         if not tasks:
             return []
-        return mp_tuner(
+        results, statuses = mp_tuner(
             tasks,
             group_sizes,
             args.mp,
@@ -701,6 +733,7 @@ class MhaFwdTuner(TunerCommon):
             verbose=args.verbose,
             return_status=True,
         )
+        return [(*result, *status) for result, status in zip(results, statuses)]
 
     @staticmethod
     def _resolved_config(problem: MhaFwdProblem, backend: str) -> str:
