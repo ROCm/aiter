@@ -22,9 +22,11 @@ owns BLOCK_M tokens and a slice of columns of all four streams, post-mixes them 
 stores the bf16 residual, writes the collapse un-normalised while the tile is in
 registers, and accumulates its slice of the projection (bf16 MFMA against fn split into
 bf16 hi + lo) and of the two square sums into one partial row per (token, slice). The
-reduce kernel finishes one token per program: it sums the partial rows, computes the
-gates (Sinkhorn with the hardware reciprocal) and applies the RMSNorm to the staged
-collapse in place.
+reduce kernel runs one program per (token, BLOCK_C columns). Each program sums the
+token's square-sum partials and applies the RMSNorm to its columns of the staged
+collapse in place. The program of the first column block also sums the projection
+partials and computes the gates (Sinkhorn with the hardware reciprocal). At decode
+sizes a token's columns are no longer normalised by a single program in sequence.
 """
 
 import triton
@@ -246,66 +248,77 @@ def _mhc_fused_post_pre_delayed_rmsnorm_reduce_kernel(
     NUM_SINKHORN_ITERS: tl.constexpr,
     BLOCK_C: tl.constexpr,
 ):
-    """Grid (T,): one program per token."""
-    tl.static_assert(H % BLOCK_C == 0, "the norm loop has no column mask")
+    """Grid (T, H // BLOCK_C). Program (t, c) normalises columns
+    [c * BLOCK_C, (c + 1) * BLOCK_C) of token t, and program (t, 0) also computes the
+    token's gates.
+
+    Every program sums the same NUM_KSPLIT square-sum partials in the same order, so
+    they all use the same rstd. Each value is computed as in a single-program loop over
+    the columns, so the results are bitwise the same."""
+    tl.static_assert(H % BLOCK_C == 0, "the norm has no column mask")
     KSPLIT_POW2: tl.constexpr = triton.next_power_of_2(NUM_KSPLIT)
     t = tl.program_id(0).to(tl.int64)
+    c = tl.program_id(1)
     ks = tl.arange(0, KSPLIT_POW2)
     ks_mask = ks < NUM_KSPLIT
     row = (t * NUM_KSPLIT + ks) * 32  # this token's partial rows are contiguous
-    r4 = tl.arange(0, 4)
-    r16 = tl.arange(0, 16)
 
-    pre_p = tl.sum(
-        tl.load(
-            partial_ptr + row[:, None] + r4[None, :], mask=ks_mask[:, None], other=0.0
-        ),
-        0,
-    )
-    post_p = tl.sum(
-        tl.load(
-            partial_ptr + row[:, None] + 4 + r4[None, :],
-            mask=ks_mask[:, None],
-            other=0.0,
-        ),
-        0,
-    )
-    comb_p = tl.sum(
-        tl.load(
-            partial_ptr + row[:, None] + 8 + r16[None, :],
-            mask=ks_mask[:, None],
-            other=0.0,
-        ),
-        0,
-    )
-    sq_r = tl.sum(tl.load(partial_ptr + row + 24, mask=ks_mask, other=0.0), 0)
     sq_x = tl.sum(tl.load(partial_ptr + row + 25, mask=ks_mask, other=0.0), 0)
-
-    rstd = tl.math.rsqrt(sq_r * (1.0 / (4 * H)) + rms_eps)
-    s0 = tl.load(scale_ptr)
-    s1 = tl.load(scale_ptr + 1)
-    s2 = tl.load(scale_ptr + 2)
-    pre = tl.sigmoid(pre_p * rstd * s0 + tl.load(base_ptr + r4)) + hc_pre_eps
-    tl.store(next_pre_ptr + t * 4 + r4, pre)
-    post = tl.sigmoid(post_p * rstd * s1 + tl.load(base_ptr + 4 + r4)) * hc_post_mult
-    tl.store(post_out_ptr + t * 4 + r4, post)
-
-    # Sinkhorn in the reference's order: row softmax, + eps, / (colsum + eps), then
-    # NUM_SINKHORN_ITERS - 1 rounds of / (rowsum + eps), / (colsum + eps); fast_dividef is the
-    # hardware reciprocal (v_rcp_f32, 1 ulp) instead of the exact division sequence
-    A = tl.reshape(comb_p * rstd * s2 + tl.load(base_ptr + 8 + r16), (4, 4))
-    P = tl.exp(A - tl.max(A, axis=1)[:, None])
-    P = libdevice.fast_dividef(P, tl.sum(P, axis=1)[:, None]) + hc_sinkhorn_eps
-    P = libdevice.fast_dividef(P, tl.sum(P, axis=0)[None, :] + hc_sinkhorn_eps)
-    for _ in range(NUM_SINKHORN_ITERS - 1):
-        P = libdevice.fast_dividef(P, tl.sum(P, axis=1)[:, None] + hc_sinkhorn_eps)
-        P = libdevice.fast_dividef(P, tl.sum(P, axis=0)[None, :] + hc_sinkhorn_eps)
-    tl.store(comb_out_ptr + t * 16 + r16, tl.reshape(P, (16,)))
-
     rstd_n = tl.math.rsqrt(sq_x * (1.0 / H) + norm_eps)
-    for c0 in range(0, H, BLOCK_C):
-        rc = c0 + tl.arange(0, BLOCK_C)
-        xp = layer_input_ptr + t * H + rc
-        xv = tl.load(xp).to(tl.float32)
-        w = tl.load(norm_w_ptr + rc).to(tl.float32)
-        tl.store(xp, ((xv * rstd_n) * w).to(tl.bfloat16))
+    rc = c * BLOCK_C + tl.arange(0, BLOCK_C)
+    xp = layer_input_ptr + t * H + rc
+    xv = tl.load(xp).to(tl.float32)
+    w = tl.load(norm_w_ptr + rc).to(tl.float32)
+    tl.store(xp, ((xv * rstd_n) * w).to(tl.bfloat16))
+
+    if c == 0:
+        r4 = tl.arange(0, 4)
+        r16 = tl.arange(0, 16)
+        pre_p = tl.sum(
+            tl.load(
+                partial_ptr + row[:, None] + r4[None, :],
+                mask=ks_mask[:, None],
+                other=0.0,
+            ),
+            0,
+        )
+        post_p = tl.sum(
+            tl.load(
+                partial_ptr + row[:, None] + 4 + r4[None, :],
+                mask=ks_mask[:, None],
+                other=0.0,
+            ),
+            0,
+        )
+        comb_p = tl.sum(
+            tl.load(
+                partial_ptr + row[:, None] + 8 + r16[None, :],
+                mask=ks_mask[:, None],
+                other=0.0,
+            ),
+            0,
+        )
+        sq_r = tl.sum(tl.load(partial_ptr + row + 24, mask=ks_mask, other=0.0), 0)
+
+        rstd = tl.math.rsqrt(sq_r * (1.0 / (4 * H)) + rms_eps)
+        s0 = tl.load(scale_ptr)
+        s1 = tl.load(scale_ptr + 1)
+        s2 = tl.load(scale_ptr + 2)
+        pre = tl.sigmoid(pre_p * rstd * s0 + tl.load(base_ptr + r4)) + hc_pre_eps
+        tl.store(next_pre_ptr + t * 4 + r4, pre)
+        post = (
+            tl.sigmoid(post_p * rstd * s1 + tl.load(base_ptr + 4 + r4)) * hc_post_mult
+        )
+        tl.store(post_out_ptr + t * 4 + r4, post)
+
+        # Sinkhorn in the reference's order: row softmax, + eps, / (colsum + eps), then
+        # NUM_SINKHORN_ITERS - 1 rounds of / (rowsum + eps), / (colsum + eps); fast_dividef is the
+        # hardware reciprocal (v_rcp_f32, 1 ulp) instead of the exact division sequence
+        A = tl.reshape(comb_p * rstd * s2 + tl.load(base_ptr + 8 + r16), (4, 4))
+        P = tl.exp(A - tl.max(A, axis=1)[:, None])
+        P = libdevice.fast_dividef(P, tl.sum(P, axis=1)[:, None]) + hc_sinkhorn_eps
+        P = libdevice.fast_dividef(P, tl.sum(P, axis=0)[None, :] + hc_sinkhorn_eps)
+        for _ in range(NUM_SINKHORN_ITERS - 1):
+            P = libdevice.fast_dividef(P, tl.sum(P, axis=1)[:, None] + hc_sinkhorn_eps)
+            P = libdevice.fast_dividef(P, tl.sum(P, axis=0)[None, :] + hc_sinkhorn_eps)
+        tl.store(comb_out_ptr + t * 16 + r16, tl.reshape(P, (16,)))

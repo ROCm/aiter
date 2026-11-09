@@ -137,7 +137,7 @@ def mhc_fused_post_pre_delayed_rmsnorm(
         num_stages=config["num_stages"],
     )
 
-    _mhc_fused_post_pre_delayed_rmsnorm_reduce_kernel[(T,)](
+    _mhc_fused_post_pre_delayed_rmsnorm_reduce_kernel[(T, H // config["BLOCK_C"])](
         partial,
         hc_scale,
         hc_base,
