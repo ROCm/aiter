@@ -86,8 +86,8 @@ NETWORKS = {
         "topk": 6,
         "activation": "silu",
         "swiglu_limit": 10.0,
-        "smallop_quant": "a8w4",
-        "fmoe_csv": "aiter/configs/model_configs/dsv41_fp8fp4_tuned_fmoe.csv",
+        "smallop_quant": "a4w4",
+        "fmoe_csv": "aiter/configs/model_configs/dsv41_fp4_tuned_fmoe.csv",
     },
 }
 EP_SIZE, GPUS_PER_NODE = 16, 8
@@ -265,6 +265,8 @@ def resolve_network(args):
             net[key] = getattr(args, key)
     if args.smallop_quant:
         net["smallop_quant"] = args.smallop_quant
+        if args.network == "dsv41_flash" and args.smallop_quant == "a8w4":
+            net["fmoe_csv"] = "aiter/configs/model_configs/dsv41_fp8fp4_tuned_fmoe.csv"
     if args.fmoe_csv:
         net["fmoe_csv"] = args.fmoe_csv
     return net
@@ -1241,6 +1243,39 @@ class Runner:
                 torch.cuda.synchronize(self.device)
                 res["checks"].append(
                     self.rel_l2(f"{label}_replay{replay}", expected[:tokens], out, 1e-2)
+                )
+            del graph
+
+        # Every rank may be empty simultaneously. Poison the complete output
+        # before replay so an empty return cannot hide unwritten capacity rows.
+        zeros = torch.zeros_like(expected)
+        empty_x, empty_weights, empty_ids = x[:0], weights[:0], ids[:0]
+        empty_q, empty_scales = op.quantize(empty_x)
+        for label, call in (
+            (
+                "all_empty_rows",
+                lambda: op.forward(
+                    empty_x, empty_weights, empty_ids, slice_output=False
+                ),
+            ),
+            (
+                "all_empty_rows_prequant",
+                lambda: op.forward_prequant(
+                    empty_q,
+                    empty_scales,
+                    empty_weights,
+                    empty_ids,
+                    slice_output=False,
+                ),
+            ),
+        ):
+            graph, out = capture_graph(torch, dist, call, self.device)
+            for replay in range(2):
+                out.fill_(7.0)
+                graph.replay()
+                torch.cuda.synchronize(self.device)
+                res["checks"].append(
+                    self.rel_l2(f"{label}_replay{replay}", zeros, out, 1e-2)
                 )
             del graph
 
