@@ -933,5 +933,69 @@ class TestGroupedFmoeResultToCsv(unittest.TestCase):
         self.assertEqual({k: tuner._csv_text(k) for k in cases}, cases)
 
 
+class TestGpuModelKey(unittest.TestCase):
+    """Tuned rows keyed by gpu_model must not mix SKUs of one arch."""
+
+    def test_products_sharing_an_arch_get_distinct_models(self):
+        from aiter.jit.utils.chip_info import normalize_gpu_model
+
+        cases = {
+            "AMD Instinct MI300X": "mi300x",
+            "AMD Instinct MI325X": "mi325x",
+            "AMD Instinct MI355X": "mi355x",
+            "Radeon RX 7900": "radeon-rx-7900",
+            "": "unknown",
+        }
+        self.assertEqual({k: normalize_gpu_model(k) for k in cases}, cases)
+
+    def test_a_name_without_a_model_falls_back_to_the_pci_product(self):
+        from unittest import mock
+
+        import torch
+
+        from aiter.jit.utils import chip_info
+
+        def model(name, from_pci):
+            chip_info.get_gpu_model.cache_clear()
+            with (
+                mock.patch.object(torch.cuda, "get_device_name", return_value=name),
+                mock.patch.object(torch.cuda, "get_device_properties"),
+                mock.patch.object(
+                    chip_info, "_gpu_model_from_pci", return_value=from_pci
+                ) as pci,
+            ):
+                return chip_info.get_gpu_model(0), pci.called
+
+        try:
+            self.assertEqual(model("AMD Radeon Graphics", "mi355x"), ("mi355x", True))
+            self.assertEqual(
+                model("AMD Radeon Graphics", None), ("amd-radeon-graphics", True)
+            )
+            self.assertEqual(model("AMD Instinct MI355X", "mi350x"), ("mi355x", False))
+        finally:
+            chip_info.get_gpu_model.cache_clear()
+
+    def test_the_pci_product_prefers_subsystem_device_then_device(self):
+        import io
+        from types import SimpleNamespace
+        from unittest import mock
+
+        from aiter.jit.utils import chip_info
+
+        properties = SimpleNamespace(pci_domain_id=0, pci_bus_id=3, pci_device_id=0)
+
+        def model(subsystem_device, device):
+            ids = {"subsystem_device": subsystem_device, "device": device}
+            with mock.patch(
+                "builtins.open",
+                side_effect=lambda path, **_: io.StringIO(ids[path.rsplit("/", 1)[1]]),
+            ):
+                return chip_info._gpu_model_from_pci(properties)
+
+        self.assertEqual(model("0x75a3", "0x75b0"), "mi355x")
+        self.assertEqual(model("0x1002", "0x75a0"), "mi350x")
+        self.assertIsNone(model("0x1002", "0x1234"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
