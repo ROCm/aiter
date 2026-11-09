@@ -120,11 +120,13 @@ def _frozen(value) -> tuple:
     return type(value), value
 
 
-def _trace_identity(jit, sig, bound) -> tuple:
+def _trace_identity(jit, sig, bound, bound_self) -> tuple:
     """What a FlyDSL trace of ``jit`` depends on besides the launcher itself:
-    the IR types of its runtime arguments (static shape, stride and dtype
-    included), its Constexpr values, the compile hints and the target. Two
-    launches of one ``jit`` that agree on these trace to the same IR."""
+    the object it is bound to, the IR types of its runtime arguments (static
+    shape, stride and dtype included), its Constexpr values, the compile hints
+    and the target. Two launches of one ``jit`` that agree on these trace to
+    the same IR, provided the trace reads no other state that changes between
+    them (as FlyDSL's own key assumed before 0.5.0)."""
     from flydsl.compiler import jit_function
 
     _, jit_args, dsl_types, constexprs = jit_function.convert_to_jit_arguments(
@@ -133,6 +135,7 @@ def _trace_identity(jit, sig, bound) -> tuple:
     hints = jit._effective_compile_hints()
     return (
         jit,
+        _frozen(bound_self),
         tuple(str(t) for t in jit_function.get_ir_types(jit_args)),
         tuple(dsl_types),
         tuple(sorted((k, _frozen(v)) for k, v in constexprs.items())),
@@ -184,23 +187,19 @@ def requested_kernels(*, stop: bool = False, memo: dict | None = None) -> Iterat
             raise _Identified
         return key
 
-    def traced(self, ctx, sig, bound, *args, **kwargs):
+    def traced(self, ctx, sig, bound, bound_self, *args, **kwargs):
         nonlocal derived, pending
-        identity = _trace_identity(self, sig, bound)
+        identity = _trace_identity(self, sig, bound, bound_self)
         key = memo.get(identity)
         if key is not None:
             kernels.add(key)
             derived += 1
             raise _Identified
         pending = identity
-        try:
-            return trace(self, ctx, sig, bound, *args, **kwargs)
-        except BaseException:
-            pending = None
-            raise
+        return trace(self, ctx, sig, bound, bound_self, *args, **kwargs)
 
     def launch(self, *args, **kwargs):
-        nonlocal depth
+        nonlocal depth, pending
         before = derived
         depth += 1
         try:
@@ -209,6 +208,9 @@ def requested_kernels(*, stop: bool = False, memo: dict | None = None) -> Iterat
             return None
         finally:
             depth -= 1
+            # A launch that failed between its trace and its key memoizes
+            # nothing.
+            pending = None
         # A launch inside another one's trace is inlined and derives no key.
         if not depth and derived == before:
             raise ReplayHookBroken(
