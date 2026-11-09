@@ -52,7 +52,7 @@ dict-shaped tensor bags, no `res`/`profile`/`bucket`/`variant`/`call_id` policy 
 | `w` | fp8 e4m3fn **(16,16)-preshuffled**, contiguous `[rows >= N, 6144]` |
 | `w_scale` | fp32, `[N]` or `[N, 1]`, contiguous, rows may be >= `N` |
 | `q_norm_w`, `k_norm_w` | fp32 `[128]` Gemma-RMSNorm weights |
-| `cos_cache`, `sin_cache` | bf16 `[max_pos, 32]` (rotary dim 64 = 32 pairs) |
+| `cos_cache`, `sin_cache` | bf16, 32 values per position (rotary dim 64 = 32 pairs). The golden layout is separate `[max_pos, 32]` tensors, but the kernels index both with the single `cos_stride_pos = cos_cache.stride(0)`: split halves of one `[max_pos, 64]` tensor with equal positive `stride(0)` work, provided the host's stride checks hold (`stride(0) % 8 == 0`, `> 0`, 16 B-aligned). Only that stride is used — contiguity is not required. |
 | `positions`, `slot_mapping` | int64, at least `T` entries; pad rows are position 0 / slot `-1` and skip cache writes |
 | `k_cache`, `v_cache` | fp8 golden-shuffle KV caches; page 128 for dense, page 16 for indexer/reuse |
 | `k_scale`, `v_scale` | fp32 KV cache scales |
@@ -95,8 +95,15 @@ silent wrong result, so the native path rejects it in `inputs.py` before binding
   index cache), plus `k_cache`/`v_cache`/`index_cache` for tokens whose `slot_mapping >= 0`
   (slot `-1` skips cache writes).
 - Does **not** allocate or return workspace, scales, caches or metadata.
+- **Caller output buffers are not bound.** The native runtime always owns bucket-sized
+  staging outputs internally, binds those, and after every launch copies the real
+  `T = 4*real local M` rows back into the caller's `q`/`k`/`v`/`index_q` on the same
+  stream (device-side, capturable). A caller may therefore share one bucket-sized output
+  buffer across layers, or pass disjoint row-range views: only the caller's *declared*
+  output shape matters, not its pointer/row range. The `prepare`/pointer-stability rule
+  below applies to the internally bound staging/caches/weights, not to caller outputs.
 - Aliasing: the caller owns all tensors; outputs must be distinct from inputs where the
-  kernels assume so. Moving a bound pointer after `prepare` is an error (see §scale/lifetime).
+  kernels assume so.
 
 ## 5. Tolerance and determinism
 
@@ -120,8 +127,13 @@ silent wrong result, so the native path rejects it in `inputs.py` before binding
   reset/gate machinery. None of that is caller state.
 - **`prepare`/bind must run outside graph capture.** The caller must complete at least one
   warm-up call outside capture before capturing; a first call inside capture is an error.
-  Pointers for all bound tensors (scales, outputs, metadata including caches) must not move
-  after binding; `x`/`w` are per-launch kernargs and may vary.
+  Pointers for all **internally bound** tensors (staging outputs, scales, weights and caches)
+  must not move after binding; `x`/`w` and the caller's output buffers are per-launch/row
+  copies, not bound pointers (see §4). In particular the implementation always binds its own
+  bucket-sized staging outputs and copies the real rows into whatever output tensors the
+  current call passed, so a consumer may share one output buffer across layers (or pass
+  disjoint row-range views, or differently-sized real M on the same bucket) without creating
+  a new binding or changing the bound pointer set.
 - Resource lifetime is process/device/group scoped; teardown/reset is the implementation's
   responsibility (the provider interface has no lifecycle hook yet — a named interface gap,
   see skill §7). The op itself never allocates device workspace.
@@ -218,7 +230,13 @@ def profile_name() -> str: ...                  # optional provenance of the act
 ```
 `op.py` re-exports the predicate as `sp_qkv_covers(...)` with the same flat arguments;
 it builds the payload and returns `False` when the runtime/predicate is unavailable or
-the mode is unknown. `aiter.sp_qkv_covers` is the lazy public spelling.
+the mode is unknown. `aiter.sp_qkv_covers` is the lazy public spelling. The predicate
+is static and session-independent: it reads only shape/dtype/numel (and `w`
+contiguity), never data/device/pointers, and creates no resources, allocations,
+builds or launches. It still needs a live GPU/ROCm/MORI context and a real SP `group`
+(or the initialized default process group); its answer is for `x.shape[0]` (a 0-row
+placeholder is rejected — a placeholder sized only to the deployment's largest M
+answers that M, not smaller calls).
 
 Any mismatch with these names/shapes must be reported before the P1 wiring lands (the
 op module is intentionally importable before `runtime.py` exists; the first call raises a
