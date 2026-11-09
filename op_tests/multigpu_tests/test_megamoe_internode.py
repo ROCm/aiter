@@ -306,7 +306,7 @@ def fixture_route(fixture, topk):
 
 
 def stage1_tile(net, tpr):
-    from aiter.ops.flydsl.kernels.megamoe_internode.mega_moe_internode_config import (
+    from aiter.ops.flydsl.kernels.mega_moe_internode.mega_moe_internode_config import (
         resolve_stage1_tile,
     )
 
@@ -322,7 +322,7 @@ def stage1_tile(net, tpr):
 def stage2_tile(net, tpr):
     """GEMM2 (kernel1) N tile, resolved exactly as the operator does."""
     from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
-    from aiter.ops.flydsl.kernels.megamoe_internode.mega_moe_internode_config import (
+    from aiter.ops.flydsl.kernels.mega_moe_internode.mega_moe_internode_config import (
         lookup_stage2_tune,
         resolve_gemm2_bm,
         resolve_gemm2_bn,
@@ -1077,7 +1077,7 @@ class Runner:
         return rec
 
     def run_fused(self, shape, shared, cap, reference, fixture):
-        from aiter.ops.flydsl.kernels.megamoe_internode import MegaMoEInternode
+        from aiter.ops.flydsl.kernels.mega_moe_internode import MegaMoEInternode
 
         torch, dist, args, device = self.torch, self.dist, self.args, self.device
         tokens = shape.tokens
