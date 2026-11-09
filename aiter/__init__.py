@@ -225,4 +225,8 @@ def __getattr__(name: str):
         from aiter.ops.gemm_fusion.sp_qkv.op import sp_qkv_fused
 
         return sp_qkv_fused
+    if name == "sp_qkv_covers":
+        from aiter.ops.gemm_fusion.sp_qkv.op import sp_qkv_covers
+
+        return sp_qkv_covers
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

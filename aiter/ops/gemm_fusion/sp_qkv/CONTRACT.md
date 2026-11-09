@@ -135,7 +135,7 @@ silent wrong result, so the native path rejects it in `inputs.py` before binding
 | `mode` not in `{"dense","indexer","reuse"}` | `ValueError` from the public op before any runtime/provider call |
 | mode-specific required tensors missing (`k`/`v` for dense/reuse; index tensors for indexer) | `ValueError` from the public op |
 | dtype/shape/stride/layout/positions violation on the native path | `ContractError` from `inputs.py` (before binding; no partial device write) |
-| valid call outside the native fused coverage | **coverage error today**: `ContractError` (skill §5 option B); see §8 |
+| valid call outside the native fused coverage (`M > 256` today) | **coverage error today**: `ContractError` (skill §5 option B); see §8; `sp_qkv_covers` returns False |
 | `aiter.plugin` absent | op still imports and calls native (guarded decorator); no provider dispatch |
 | provider declines a call | native serves it (normal operation) |
 | provider `select`/candidate errors before `run` | only that provider is removed; next enabled provider is asked, else native |
@@ -145,36 +145,55 @@ silent wrong result, so the native path rejects it in `inputs.py` before binding
 
 ## 8. Coverage matrix
 
-Covered and certified on **gfx950 / MI355X**, SP world **4**, local `M = x.shape[0]`,
-`T = 4*M`:
+Fused-native coverage today is the **prologue cells the native runtime can actually
+serve**. Those are the active profile's 2-stage (small/prologue) plans, including pad
+hits into their buckets. For the default profile (`minimax_m3_sp4_gfx950_v1`, 123 rows)
+the fused-native range is **local `M = 1..256` for all three modes**: the exact prologue
+buckets `{1, 2, 4, 8, 12, 16, 32, 64, 128, 256}` per mode plus every `m` that pads into
+one of those buckets. The alternate r19 profile does not add fused-native prologue cells
+beyond the 2-stage plans it serves.
 
-| mode | M coverage (fused native) | notes |
+Covered on **gfx950 / MI355X**, SP world **4**, local `M = x.shape[0]`, `T = 4*M`:
+
+| mode | fused-native M coverage today | notes |
 |---|---|---|
-| dense | small cells `1..128`; large cells `1024..8192`; alternate r19 profile adds `8193..16384` measured band | large pad buckets: 512 (floor 386), 768 (floors dense 700 / indexer 600 / reuse 513), 1024 (floor 769), exact P1 grid 1024..8192 step 256 |
-| indexer | same | N = 9856; index cache writes |
-| reuse | same | indexer GEMM, compact exchange (F = 2304), no index writes |
+| dense | `1..256` (2-stage prologue cells incl. pad hits) | exact buckets `{1,2,4,8,12,16,32,64,128,256}` + pad hits; prologue inserts/writes |
+| indexer | `1..256` (same) | N = 9856; index cache writes |
+| reuse | `1..256` (same) | indexer GEMM, compact exchange (F = 2304), no index writes |
 
-The alternate r19 profile is opt-in and selectable by an explicit profile path; it does not
-change the default profile's coverage or bytes. `M` values between the small and large
-bands (`129..1023`) and above `16384` are **native unfused** calls in the current
-framework and are therefore outside the fused native coverage.
+Any `M` outside `1..256` is a **coverage error** today (`ContractError`), not a silent
+fallback; callers must gate on `sp_qkv_covers(...)` before selecting the fused path.
+`sp_qkv_covers` returns `False` for the uncovered band, and `sp_qkv_native` raises for it.
+
+### Phase-2 coverage / follow-up (the one-stage large and r19 band)
+
+The one-stage `sp_qkv.large.v1` plans (r13/r18, `M = 512..8192`) and the r19 ABI-7 plans
+(`M = 9216..16384`) implement **GEMM + SP exchange only**. This contract's payload also
+carries the prologue outputs and cache writes (`q`/`k`/`v`/`index_q`, head norm + RoPE +
+KV/index-cache insert), so serving the coarse contract for those `M` values needs a
+**native post-exchange prologue stage** first. Today that prologue is ATOM-owned Triton
+(`atom/model_ops/triton_fused_qkv_norm_rope_cache.py` + `aiter.fused_qknorm_idxrqknorm`),
+not an aiter native stage; importing it into this HIP PR would be a second backend
+(one backend per PR), so it is deliberately out of scope here.
+
+Two honest follow-ups, to be settled by the framework owners:
+
+1. **(i) new aiter-owned prologue op/stage** wired behind the native runtime, then extend
+   this contract's coverage to the one-stage large/r19 band; or
+2. **(ii) split the contract** into `sp_qkv_gemm_exchange` (covers `M 512..16384`,
+   including the r19 alternate profile) plus a separate prologue op — the skill's open
+   question #1 (`framework-to-provider.md` §9).
+
+Until either lands, `sp_qkv_covers(...)` is `False` for the one-stage large/r19 band and
+`sp_qkv_native(...)` raises `ContractError`; option A (an unfused fallback owned by
+native, so the native path serves every valid call) remains the named follow-up for the
+general path.
 
 **Explicit phase statement:** *the native path is coverage-limited today (skill §5 option
-B); option A (an unfused fallback owned by native, so `sp_qkv_fused`'s native path serves
-every valid call) is the named follow-up.* Until option A lands, a provider may decline a
-call only when native can serve it; otherwise the call is a coverage error, not a silent
-fallback.
-
-### Non-goals (deliberately not served)
-
-- No `res`, `profile`, `bucket`, `variant`, `call_id` or tuner arguments in the public
-  contract; those are implementation policy.
-- No profile selection/tuning in the op; the native default profile is internal and the
-  alternate r19 profile is selected by the framework/provider path, never by the op call.
-- No CPU/other-arch fallback, no world != 4, no SP group topology negotiation.
-- No unfused fallback yet (option A follow-up; §8).
-- No graph capture of `prepare`/bind; no arbitrary output allocation.
-- A provider may not redefine the contract, enable itself, or ship an `aiter` module.
+B: prologue cells `M 1..256` for the default profile); option A (an unfused fallback owned
+by native) is the named follow-up.* A provider may decline a call only when native can
+serve it; otherwise the call is a coverage error, not a silent fallback. Consumers must
+use `sp_qkv_covers` to decide whether to route a call to this op.
 
 ## 9. Provider payload (native handoff)
 
@@ -193,9 +212,13 @@ assumes:
 
 ```python
 def sp_qkv_native(payload: dict) -> None: ...   # fused/native selection, resources, prepare/run
+def sp_qkv_covers(payload: dict) -> bool: ...   # cheap, non-executing coverage predicate (P0 surface)
 def sp_qkv_available() -> bool: ...             # optional readiness query used by callers/providers
 def profile_name() -> str: ...                  # optional provenance of the active profile
 ```
+`op.py` re-exports the predicate as `sp_qkv_covers(...)` with the same flat arguments;
+it builds the payload and returns `False` when the runtime/predicate is unavailable or
+the mode is unknown. `aiter.sp_qkv_covers` is the lazy public spelling.
 
 Any mismatch with these names/shapes must be reported before the P1 wiring lands (the
 op module is intentionally importable before `runtime.py` exists; the first call raises a

@@ -21,6 +21,21 @@ removed (replaced by the direct import) once the interface stack lands.
 The payload passed to the native runtime uses the contract argument names as keys and
 the signature order as its order.  The runtime owns profile/variant/resource selection
 and the fused-vs-unfused policy; see ``CONTRACT.md`` for the full contract sheet.
+
+Coverage predicate
+------------------
+``sp_qkv_covers(...)`` takes the same flat arguments and asks the runtime
+``sp_qkv_covers(payload)`` whether the fused-native path covers the call.  It is a
+cheap, no-allocation/no-launch gate for consumers (ATOM's mode-B binding must gate on
+it before selecting a call path); it returns ``False`` when the runtime or the
+predicate is unavailable.  It does not change ``sp_qkv_native``'s behaviour:
+uncovered calls still raise ``ContractError`` when executed.
+
+**Coverage today:** the fused-native coverage is the prologue cells the runtime can
+serve (2-stage plans: the profile's prologue buckets + pad hits, i.e. local ``m``
+``1..256`` for the default profile, all three modes).  The one-stage large / r19 band
+(``m`` 512..16384) needs a native post-exchange prologue stage first; it is Phase-2
+coverage, not served today (see CONTRACT.md §8).
 """
 
 from __future__ import annotations
@@ -29,7 +44,7 @@ import inspect
 from collections.abc import Mapping
 from typing import Any
 
-__all__ = ["sp_qkv_fused"]
+__all__ = ["sp_qkv_covers", "sp_qkv_fused"]
 
 MODES = ("dense", "indexer", "reuse")
 
@@ -57,13 +72,11 @@ except ImportError:  # pragma: no cover - the current main / PR head
         return _decorate
 
 
-# `runtime.py` (owned by the runtime implementor) may not be present yet; resolve it
-# lazily on the first call so this module imports on every checkout.  Tests and the
-# provider integration can replace `runtime` with a fake module.
-try:  # pragma: no cover - branch selected by the checkout
-    from . import runtime
-except ImportError:  # pragma: no cover - runtime.py lands separately
-    runtime = None
+# `runtime.py` (owned by the runtime implementor) is resolved lazily on the first call:
+# importing the op / querying coverage must not import the framework eagerly or create
+# a session.  Tests and the provider integration can replace `runtime` with a fake
+# module before the first call.
+runtime = None
 
 
 def _native_runtime() -> Any:
@@ -167,11 +180,17 @@ def sp_qkv_fused(
     unlike tuner/profile/bucket policy.  Returns ``None``; every output and cache tensor
     is written in place.
 
-    The native path is **coverage-limited today** (skill §5 option B: calls outside the
-    fused native cells raise instead of silently taking a different implementation);
-    option A (an unfused fallback owned by native) is the named follow-up.  A provider
-    may decline any call and native serves it; once a provider's ``run`` starts, an
-    exception propagates and is never retried natively.
+    The native path is **coverage-limited today** (skill §5 option B): the fused-native
+    coverage is the prologue cells the runtime serves (default profile: local m 1..256,
+    all modes); the one-stage large / r19 band is Phase-2 coverage that needs the
+    post-exchange prologue to become an aiter-owned native stage/op first.  Calls
+    outside coverage raise ``ContractError`` instead of silently taking a different
+    implementation; option A (an unfused fallback owned by native) is the named
+    follow-up.  A provider may decline any call and native serves it; once a provider's
+    ``run`` starts, an exception propagates and is never retried natively.
+
+    Use :func:`sp_qkv_covers` (same flat arguments) for a cheap, non-executing coverage
+    check before selecting a call path.
     """
 
     _validate_mode(mode)
@@ -185,7 +204,144 @@ def sp_qkv_fused(
         index_cache=index_cache,
     )
 
-    payload = {
+    _native_runtime().sp_qkv_native(
+        _build_payload(
+            q=q,
+            x=x,
+            x_scale=x_scale,
+            w=w,
+            w_scale=w_scale,
+            q_norm_w=q_norm_w,
+            k_norm_w=k_norm_w,
+            cos_cache=cos_cache,
+            sin_cache=sin_cache,
+            positions=positions,
+            slot_mapping=slot_mapping,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            mode=mode,
+            k=k,
+            v=v,
+            index_q=index_q,
+            index_q_norm_w=index_q_norm_w,
+            index_k_norm_w=index_k_norm_w,
+            index_cache=index_cache,
+            eps=eps,
+            group=group,
+            stream=stream,
+        )
+    )
+
+
+def sp_qkv_covers(
+    q,
+    x,
+    x_scale,
+    w,
+    w_scale,
+    q_norm_w,
+    k_norm_w,
+    cos_cache,
+    sin_cache,
+    positions,
+    slot_mapping,
+    k_cache,
+    v_cache,
+    k_scale,
+    v_scale,
+    *,
+    mode,
+    k=None,
+    v=None,
+    index_q=None,
+    index_q_norm_w=None,
+    index_k_norm_w=None,
+    index_cache=None,
+    eps=1e-6,
+    group=None,
+    stream=None,
+) -> bool:
+    """Cheap, non-executing fused-native coverage predicate for the same call.
+
+    Builds the same flat payload as :func:`sp_qkv_fused` and delegates to
+    ``runtime.sp_qkv_covers(payload)``.  No allocation, no launch, no prepare, no
+    provider selection.  Returns ``False`` for an unknown ``mode``, a missing runtime,
+    or a runtime without the predicate; an invalid mode never raises (it is simply not
+    covered).  This is the gate ATOM's mode-B binding uses before choosing a path.
+    """
+
+    if mode not in MODES:
+        return False
+    try:
+        runtime_module = _native_runtime()
+    except ImportError:
+        return False
+    predicate = getattr(runtime_module, "sp_qkv_covers", None)
+    if predicate is None:
+        return False
+    payload = _build_payload(
+        q=q,
+        x=x,
+        x_scale=x_scale,
+        w=w,
+        w_scale=w_scale,
+        q_norm_w=q_norm_w,
+        k_norm_w=k_norm_w,
+        cos_cache=cos_cache,
+        sin_cache=sin_cache,
+        positions=positions,
+        slot_mapping=slot_mapping,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        mode=mode,
+        k=k,
+        v=v,
+        index_q=index_q,
+        index_q_norm_w=index_q_norm_w,
+        index_k_norm_w=index_k_norm_w,
+        index_cache=index_cache,
+        eps=eps,
+        group=group,
+        stream=stream,
+    )
+    return bool(predicate(payload))
+
+
+def _build_payload(
+    *,
+    q,
+    x,
+    x_scale,
+    w,
+    w_scale,
+    q_norm_w,
+    k_norm_w,
+    cos_cache,
+    sin_cache,
+    positions,
+    slot_mapping,
+    k_cache,
+    v_cache,
+    k_scale,
+    v_scale,
+    mode,
+    k,
+    v,
+    index_q,
+    index_q_norm_w,
+    index_k_norm_w,
+    index_cache,
+    eps,
+    group,
+    stream,
+):
+    """The flat native payload: contract names, signature order, optional values None."""
+
+    return {
         "q": q,
         "x": x,
         "x_scale": x_scale,
@@ -212,7 +368,6 @@ def sp_qkv_fused(
         "group": group,
         "stream": stream,
     }
-    _native_runtime().sp_qkv_native(payload)
 
 
 # The real route() decorator already stamps __aiter_plugin_op__ on its wrapper; make the
@@ -231,4 +386,7 @@ if _PLUGIN_ROUTE_PRESENT:  # pragma: no branch - exercised only with the interfa
 assert (
     inspect.signature(sp_qkv_fused).parameters["mode"].kind
     is inspect.Parameter.KEYWORD_ONLY
+)
+assert list(inspect.signature(sp_qkv_covers).parameters.values()) == list(
+    inspect.signature(sp_qkv_fused).parameters.values()
 )

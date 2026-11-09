@@ -90,10 +90,16 @@ INDEXER = {
 class FakeRuntime:
     def __init__(self):
         self.payloads = []
+        self.cover_payloads = []
+        self.cover_result = True
 
     def sp_qkv_native(self, payload):
         self.payloads.append(payload)
         return "native-ok"
+
+    def sp_qkv_covers(self, payload):
+        self.cover_payloads.append(payload)
+        return self.cover_result
 
     def sp_qkv_available(self):
         return True
@@ -323,6 +329,9 @@ def test_contract_sheet_exists_and_names_the_coverage_limitation():
         "option B",
         "option A",
         "unfused fallback",
+        "Phase-2",
+        "sp_qkv_covers",
+        "prologue",
         "prepare",
         "graph capture",
         "provider",
@@ -474,7 +483,54 @@ def test_fake_provider_decline_falls_back_to_native(monkeypatch, fake_runtime):
 
 
 # ---------------------------------------------------------------------------
-# 6. the op is exported lazily from aiter
+# 6. coverage predicate: cheap, non-executing, same flat args
+# ---------------------------------------------------------------------------
+def test_coverage_predicate_has_the_same_flat_signature(op):
+    fused = inspect.signature(op.sp_qkv_fused)
+    covers = inspect.signature(op.sp_qkv_covers)
+    assert list(covers.parameters.values()) == list(fused.parameters.values())
+    assert covers.return_annotation in (bool, "bool")
+
+
+def test_coverage_predicate_delegates_the_payload_without_executing(op, fake_runtime):
+    fake_runtime.cover_result = True
+    assert op.sp_qkv_covers(**DENSE, mode="dense") is True
+    assert fake_runtime.payloads == [], "covers() must not call sp_qkv_native"
+    assert len(fake_runtime.cover_payloads) == 1
+    payload = fake_runtime.cover_payloads[0]
+    assert list(payload) == POSITIONAL + KEYWORD_ONLY
+    assert [payload[name] for name in POSITIONAL] == [
+        DENSE[name] for name in POSITIONAL
+    ]
+    assert payload["mode"] == "dense"
+
+    fake_runtime.cover_result = False
+    assert op.sp_qkv_covers(**DENSE, mode="dense") is False
+
+
+def test_coverage_predicate_is_false_when_the_runtime_lacks_it(op, monkeypatch):
+    monkeypatch.setattr(op, "runtime", types.SimpleNamespace())
+    assert op.sp_qkv_covers(**DENSE, mode="dense") is False
+
+
+def test_coverage_predicate_says_false_for_an_unknown_mode_without_a_runtime_call(
+    op, fake_runtime
+):
+    assert op.sp_qkv_covers(**DENSE, mode="bogus") is False
+    assert fake_runtime.cover_payloads == []
+
+
+def test_coverage_predicate_is_exported_lazily(monkeypatch):
+    monkeypatch.delitem(sys.modules, OP_MODULE, raising=False)
+    import aiter
+
+    fn = aiter.sp_qkv_covers
+    assert fn.__name__ == "sp_qkv_covers"
+    assert fn is importlib.import_module(OP_MODULE).sp_qkv_covers
+
+
+# ---------------------------------------------------------------------------
+# 7. the op is exported lazily from aiter
 # ---------------------------------------------------------------------------
 def test_aiter_exports_sp_qkv_fused_lazily(monkeypatch):
     monkeypatch.delitem(sys.modules, OP_MODULE, raising=False)
