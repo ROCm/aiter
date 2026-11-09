@@ -130,7 +130,11 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
 
     if(num_rows != nullptr)
     {
-        ori_rows = static_cast<int64_t>(*num_rows) * num_cols_factor;
+        const int64_t requested_rows = static_cast<int64_t>(*num_rows) * num_cols_factor;
+        // Replay may change the live count, but cannot enlarge the allocation.
+        ori_rows = requested_rows < ori_rows ? requested_rows : ori_rows;
+        if(ori_rows <= 0)
+            return;
     }
     static constexpr int num_thread_per_group = group_size / thread_data_size;
     const int lane_in_group  = threadIdx.x % num_thread_per_group;
@@ -1721,6 +1725,97 @@ static void dynamic_per_group_quant_m32k4(aiter_tensor_t& out,
         launch(opus::fp8_t{}, std::integral_constant<int, 8>{}, std::integral_constant<int, 1>{});
 }
 
+// gfx950 scheduling for large MXFP8 allocations with device-resident live rows.
+namespace gfx950_mxfp8_quant {
+
+// One thread owns a group of 32 values and advances through the live prefix.
+// The capped grid avoids launching idle workgroups for graph-padded allocations.
+template <typename DTYPE_I, int block_size = 256>
+__global__ void __launch_bounds__(block_size)
+quantize_live_rows(opus::fp8_t* __restrict__ out,
+                   uint8_t* __restrict__ scale,
+                   DTYPE_I const* __restrict__ input,
+                   int32_t ori_cols,
+                   int64_t oob_size,
+                   int32_t const* __restrict__ num_rows)
+{
+    constexpr int32_t group_size       = 32;
+    constexpr int32_t thread_data_size = 32;
+    using vec_i                        = opus::vector_t<DTYPE_I, thread_data_size>;
+
+    const int64_t rows = static_cast<int64_t>(*num_rows);
+    const int32_t scale_n = ori_cols / group_size;
+    // FP8 output bytes also bound the input groups and raw E8M0 scale stores.
+    const int64_t max_groups = oob_size / group_size;
+    const int64_t requested_groups = rows * scale_n;
+    const int64_t total_groups = requested_groups < 0 ? 0 :
+        (requested_groups < max_groups ? requested_groups : max_groups);
+    const int64_t group_stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
+
+    auto buffer_o = opus::make_gmem<opus::fp8_t>(out, oob_size);
+
+    for(int64_t group_id = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+        group_id < total_groups;
+        group_id += group_stride)
+    {
+        const vec_i thread_data =
+            *reinterpret_cast<vec_i const*>(input + group_id * group_size);
+        float abs_max = aiter::kAmaxFloor;
+#pragma unroll
+        for(int j = 0; j < thread_data_size; ++j)
+        {
+            abs_max = max(abs_max, abs(static_cast<float>(thread_data[j])));
+        }
+
+        constexpr aiter::MxDtype kMxDtype = aiter::MxDtype::FP8_E4M3;
+        const float row_scale =
+            aiter::fp_f32_to_e8m0_scale<aiter::kDefaultMxScaleRoundMode, kMxDtype>(
+                abs_max);
+        scale[group_id] =
+            (__builtin_bit_cast(uint32_t, row_scale) >> 23) & 0b11111111;
+
+        const float inv_scale = 1.0f / row_scale;
+        store_vector<opus::fp8_t,
+                     DTYPE_I,
+                     thread_data_size,
+                     RT,
+                     false,
+                     WARP_SIZE,
+                     1,
+                     opus::fp8_t>(
+            buffer_o, thread_data, group_id * group_size, inv_scale);
+    }
+}
+
+template <typename Input>
+inline bool try_launch(opus::fp8_t* out,
+                       uint8_t* scales,
+                       const Input* input,
+                       int rows,
+                       int cols,
+                       int64_t oob_size,
+                       const int32_t* num_rows,
+                       hipStream_t stream)
+{
+    // Buffer stores use signed 32-bit offsets. Leave larger allocations on
+    // the ordinary path; input address arithmetic remains 64-bit in the kernel.
+    if(oob_size > INT32_MAX || get_device_gfx() != "gfx950")
+        return false;
+    constexpr int block_size = 256;
+    const int grid = get_device_cu_num() * 2;
+    const int64_t groups = static_cast<int64_t>(rows) * (cols / 32);
+    // Small allocations do not amortize the persistent loop. The work cutoff
+    // is expressed in complete grid strides, independently of model geometry.
+    if(groups < static_cast<int64_t>(grid) * block_size * 8)
+        return false;
+    quantize_live_rows<Input, block_size><<<grid, block_size, 0, stream>>>(
+        out, scales, input, cols, oob_size, num_rows);
+    return true;
+}
+
+} // namespace gfx950_mxfp8_quant
+
+
 // Canonical dynamic per-group scaled quant. Accepts fp8 / i8 / fp4x2 output;
 // the per-group scale layout is selected by ``scales.dtype()``:
 //   * AITER_DTYPE_fp8_e8m0 / u8 -> e8m0 byte scale (one byte per group of
@@ -1870,6 +1965,27 @@ void dynamic_per_group_scaled_quant(aiter_tensor_t& out,         // [..., d]
             AITER_DISPATCH_FLOATING16_TYPES_rmTorch(
                 input.dtype(), "dynamic_per_group_scaled_quant_kernel", [&] {
                     using input_dtype = typename aiter::hip2opus<scalar_t>::type;
+                    if constexpr(std::is_same_v<out_t, opus::fp8_t> && _GS == 32 &&
+                                 ee && !ss && !hh)
+                    {
+                        // Reuse the existing live-row API. Strided, shuffled,
+                        // replicated-row and other scale formats keep their dispatch.
+                        if(num_rows_ptr != nullptr && num_rows_factor == 1 &&
+                           num_rows->is_gpu() && num_rows->dtype() == AITER_DTYPE_i32 &&
+                           num_rows->numel() == 1 && num_rows->device_id == input.device_id &&
+                           input.is_contiguous() && out.is_contiguous() &&
+                           scales.is_contiguous() &&
+                           cols % 32 == 0 && out.numel() == input.numel() &&
+                           scales.numel() == input.numel() / 32 &&
+                           reinterpret_cast<uintptr_t>(input.data_ptr()) %
+                                   alignof(opus::vector_t<input_dtype, 32>) == 0 &&
+                           gfx950_mxfp8_quant::try_launch(
+                               reinterpret_cast<opus::fp8_t*>(out.data_ptr()),
+                               reinterpret_cast<uint8_t*>(scales.data_ptr()),
+                               reinterpret_cast<const input_dtype*>(input.data_ptr()),
+                               rows, cols, out.numel(), num_rows_ptr, stream))
+                            return;
+                    }
                     // Opt in only on the measured d01 configuration. Other gfx1250
                     // machines already run this workload faster with the default path.
                     if constexpr(std::is_same_v<input_dtype, opus::bf16_t> &&
@@ -1977,6 +2093,7 @@ void dynamic_per_group_scaled_quant(aiter_tensor_t& out,         // [..., d]
             with_e8m0(std::false_type{});
     )
 }
+
 
 // Backward-compat thin forwarder. Asserts fp4x2/u8 output and delegates to
 // the dtype-aware canonical entry. Existing callers (Python compile_ops
