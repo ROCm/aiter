@@ -783,6 +783,11 @@ class FmoeTuner(TunerCommon):
                     "--swiglu_limit is only supported by the default fmoe tuner "
                     "(MXFP4 uses AITER_MXFP4_TUNE_SWIGLU_LIMIT)"
                 )
+            if args.run_config or args.compare:
+                self.parser.error(
+                    "--swiglu_limit does not support --run_config or --compare; "
+                    "their benchmark and reference would run unclamped"
+                )
             if os.path.abspath(self.get_out_file(args.tune_file)) == os.path.abspath(
                 self.get_out_file(self.ARG_DEFAULTS["tune_file"])
             ):
