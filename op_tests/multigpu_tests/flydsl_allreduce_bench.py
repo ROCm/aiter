@@ -598,7 +598,6 @@ class FusedCase:
     hidden: int
     tokens: int
     rung: object
-    top: bool
 
 
 def fused_ladder_cases(
@@ -638,7 +637,7 @@ def fused_ladder_cases(
             if first > last:
                 continue
             for nbytes in sorted({first, last}):
-                cases.append(FusedCase(hidden, nbytes // row, rung, nbytes == last))
+                cases.append(FusedCase(hidden, nbytes // row, rung))
     return cases
 
 

@@ -2305,6 +2305,23 @@ _FUSED_PAD_CASES = (
     (8, 64, 7680, "tp8-7680pad8192-widest-block"),
 )
 
+#: Case list for the fp16 bit-exact test. The widest-block case above needs
+#: 115 KiB of mesh LDS on the fp16 wire (TP8/block-1024) when gfx942 has 64 KiB.
+#: On gfx942, we use the widest fp16 block that fits: block 896 (TP2, 6656 -> 7168).
+#: The INT4 sqnr test keeps ``_FUSED_PAD_CASES`` (its TP8/7680 tile is 32 KiB).
+_FUSED_PAD_EXACT_CASES = (
+    _FUSED_PAD_CASES
+    if ARCH != "gfx942"
+    else tuple(
+        (
+            c
+            if c != (8, 64, 7680, "tp8-7680pad8192-widest-block")
+            else (2, 64, 6656, "tp2-6656pad7168-widest-942-block")
+        )
+        for c in _FUSED_PAD_CASES
+    )
+)
+
 # (tp, tokens, hidden) of the lossless one-live-rank residual equality.
 _FUSED_EXACT_CASES = ((2, 512, 4096),)
 
@@ -2494,20 +2511,63 @@ def _run_ahead_case(tp: int, algorithm: str) -> tuple[int, int] | None:
     return (pick[0][0], pick[0][1]) if pick else None
 
 
-def _fused_rung_fails(rows: list[dict], case: fab.FusedCase) -> list[str]:
+def _fused_expected_st(
+    rung,
+    *,
+    live_bytes: int,
+    block: int,
+    world_size: int,
+    batched: bool,
+    cu_count: int,
+) -> int:
+    """Mirror of ``FlyQuickAllReduceRMSNorm._pick_cfg``: the super-tile the
+    fused engine runs *live_bytes* on at a width whose geometry gives *block*.
+    """
+    want = rung.super_tile
+    if want == 1:
+        return 1
+    num_tiles = _num_tiles(live_bytes, block)
+    if batched:
+        return want if num_tiles >= want else 1
+    grid = clamp_grid_cap(
+        rung.grid_cap,
+        arch=ARCH,
+        world_size=world_size,
+        super_tile=want,
+        cu_count=cu_count,
+        block=block,
+    )
+    return want if num_tiles > grid else 1
+
+
+def _fused_rung_fails(
+    rows: list[dict],
+    case: fab.FusedCase,
+    *,
+    world_size: int,
+    batched: bool,
+    cu_count: int,
+) -> list[str]:
     """The run took the instance of the rung the shape is meant to reach: its
-    low-latency build, and its super-tile where the rung is ST=1, or where the
-    payload is the end of its slice (an ST>1 rung falls back to ST=1 below the
-    tile count that fills the grid)."""
+    low-latency build, and the super-tile its tile count selects. An ST>1 rung
+    falls back to ST=1 below the tile count that fills the grid."""
     rung, fails = case.rung, []
-    want_st = f"_st{rung.super_tile}_"
     for r in rows:
         if r["low_latency"] != rung.low_latency:
             fails.append(
                 f"rank {r['rank']}: low_latency={r['low_latency']}, the rung has "
                 f"{rung.low_latency}"
             )
-        if (rung.super_tile == 1 or case.top) and want_st not in r["variant"]:
+        expect = _fused_expected_st(
+            rung,
+            live_bytes=r["tokens"] * r["hidden"] * 2,
+            block=r["block"],
+            world_size=world_size,
+            batched=batched,
+            cu_count=cu_count,
+        )
+        want_st = f"_st{expect}_"
+        if want_st not in r["variant"]:
             fails.append(
                 f"rank {r['rank']}: ran {r['variant']}, not {want_st} of the rung "
                 f"{rung}"
@@ -2531,6 +2591,11 @@ def test_quick_allreduce_rmsnorm_shipped(tp, algorithm):
         unfused=True,
         mxfp4=True,
     )
+    # The super-tile a payload reaches depends on the host: whether publishes
+    # batch (inbox type and link) and the resident-clamped grid (CU count).
+    link = fly_policy.detect_link()
+    batched = batches_publishes(_resolve_inbox_flags("auto", tp)[1], algorithm, link)
+    cu_count = int(torch.cuda.get_device_properties(0).multi_processor_count)
     fails, rows_all = [], []
     for *case, c in walk:
         rows = batch[tuple(case)]
@@ -2542,7 +2607,9 @@ def test_quick_allreduce_rmsnorm_shipped(tp, algorithm):
                 + _fused_disagree_fails(rows)
                 + _fused_unfused_fails(rows)
                 + _fused_mxfp4_fails(rows)
-                + _fused_rung_fails(rows, c)
+                + _fused_rung_fails(
+                    rows, c, world_size=tp, batched=batched, cu_count=cu_count
+                )
             )
         ]
     _check(f"tp{tp} {algorithm}", fails)
@@ -2639,7 +2706,7 @@ def test_quick_allreduce_rmsnorm_padded_is_bit_exact(
     """
     batch = _fused_batch(
         (tp, "pad", algorithm),
-        [(t, h) for w, t, h, _ in _FUSED_PAD_CASES if w == tp],
+        [(t, h) for w, t, h, _ in _FUSED_PAD_EXACT_CASES if w == tp],
         algorithm=algorithm,
         codecs=("fp16", "fp16"),
         solo=True,
@@ -3828,6 +3895,7 @@ def _verify_fused(tps, algos, extended: bool) -> None:
     """The fused (all-reduce + residual add + RMSNorm) verify sweeps. The
     mesh-only rows need the mesh among the requested schedules."""
     pad = [c for c in _FUSED_PAD_CASES if c[0] in tps]
+    pad_exact = [c for c in _FUSED_PAD_EXACT_CASES if c[0] in tps]
     mesh = "mesh" in algos
     _summarize(
         "flydsl quick allreduce rmsnorm shipped instances",
@@ -3842,7 +3910,9 @@ def _verify_fused(tps, algos, extended: bool) -> None:
             test_quick_allreduce_rmsnorm_padded_is_bit_exact(
                 tp, tokens, hidden, label, algorithm
             )
-            for (tp, tokens, hidden, label), algorithm in itertools.product(pad, algos)
+            for (tp, tokens, hidden, label), algorithm in itertools.product(
+                pad_exact, algos
+            )
         ],
     )
     _summarize(
