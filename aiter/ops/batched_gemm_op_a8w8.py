@@ -475,10 +475,46 @@ def batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant(
         )
     y8 = torch.empty((m, g, n), dtype=dtypes.fp8, device=x.device)
     y_scale = torch.empty((m, g * n // 32), dtype=torch.float8_e8m0fnu, device=x.device)
+    from .opus._arch import _device_arch_and_cu
+
+    gfx, cu_num = _device_arch_and_cu(x.device)
     run_bmm_a8w8_mxfp8(
-        x, wo_a, x_scale, w_scale, y8, y_scale_out=y_scale.view(torch.uint8)
+        x,
+        wo_a,
+        x_scale,
+        w_scale,
+        y8,
+        kernel_name=_fused_quant_tuned_kernel(g, m, n, k, w_scale_block, gfx, cu_num),
+        y_scale_out=y_scale.view(torch.uint8),
     )
     return y8, y_scale
+
+
+@functools.lru_cache(maxsize=1024)
+def _fused_quant_tuned_kernel(
+    g: int, m: int, n: int, k: int, w_scale_block: str, gfx: str, cu_num: int
+) -> str | None:
+    """The preshuffle table's flydsl batched mxfp8_32 kernel for this shape, the
+    one the bf16 entry runs, so both entries share the tuned tile; None (the
+    runner's own choice) when there is no such row."""
+    from .flydsl import batched_gemm_a8w8_gfx1250 as bmm_gfx1250
+
+    cfg = lookup_mxscale_bmm_config(
+        g,
+        m,
+        n,
+        k,
+        w_scale_block=w_scale_block,
+        bpreshuffle=True,
+        gfx=gfx,
+        cu_num=cu_num,
+    )
+    if cfg is None or cfg["libtype"] != "flydsl":
+        return None
+    name = cfg["kernelName"]
+    if bmm_gfx1250.parse_bmm_mx32_kernel_name(name) is None:
+        return None
+    return name
 
 
 def batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant_supported(
