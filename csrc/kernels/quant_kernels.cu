@@ -3103,6 +3103,12 @@ void fused_dynamic_mx_quant_moe_sort_hip_bounded(aiter_tensor_t& output,
 // correctness.
 constexpr long MXFP4_MOE_SORT_COALESCED_LDS_WORK_MAX = 700000;
 
+// Bytes per buffer load of a mxfp4_moe_sort_kernel thread's scale bytes.
+__host__ __device__ constexpr int mxfp4_moe_sort_load_bytes(int vec_size)
+{
+    return vec_size % 16 == 0 ? 16 : (vec_size % 8 == 0 ? 8 : (vec_size % 4 == 0 ? 4 : 2));
+}
+
 template <int block_size,
           int num_rows,
           int thread_data_size = 16,
@@ -3126,18 +3132,16 @@ __global__ void mxfp4_moe_sort_kernel(
     int scale_k              = threadIdx.x % threads_per_row * thread_data_size;
     const int scale_per_row = (cols + group_size - 1) / group_size;
     static constexpr int32_t vec_size_i = thread_data_size;
-    static constexpr int32_t load_chunk_bytes =
-        (sizeof(uint8_t) * vec_size_i % 16 == 0 ? 16
-                                                : (sizeof(uint8_t) * vec_size_i % 8 == 0 ? 8 
-                                                : (sizeof(uint8_t) * vec_size_i % 4 == 0 ? 4 : 2)));
+    static constexpr int32_t load_chunk_bytes = mxfp4_moe_sort_load_bytes(vec_size_i);
     using vec_i = opus::vector_t<uint8_t, vec_size_i>;
     const int32_t scaleN_valid = (cols + group_size - 1) / group_size;
     const int32_t scaleN_pad   = ((scaleN_valid + 7) / 8) * 8;
     const int32_t scale_bytes = scale_per_row * num_tokens * topk * sizeof(uint8_t);
     auto buffer_scale = opus::make_gmem<uint8_t>(scale, scale_bytes);
-    // The buffer range check is per dword. When a row is not a whole number of
-    // dwords (byte_tail), the last row's final load would read the dword holding
-    // its last in-range bytes as 0 (#7646), so that one load goes byte by byte.
+    // When the last row's final load crosses the end of the scales (byte_tail),
+    // the buffer range check reads some of its in-range bytes as 0: the dword
+    // holding them on gfx9 (#7646), the whole load if the check is per access.
+    // That one load goes byte by byte.
     auto load_scales = [&](int32_t offset) {
         if constexpr(byte_tail)
         {
@@ -3318,8 +3322,8 @@ __global__ void mxfp4_moe_sort_kernel(
                 reinterpret_cast<int32_t*>(num_valid_ids.data_ptr()),                   \
                 token_num, cols, num_blocks, num_tg, topk);                             \
     };                                                                                  \
-    /* Only rows that are not a whole number of dwords need the byte tail.     */       \
-    if(((cols + GROUP_SIZE - 1) / GROUP_SIZE) % 4)                                      \
+    /* Only rows whose last load crosses the row end need the byte tail.      */       \
+    if(((cols + GROUP_SIZE - 1) / GROUP_SIZE) % mxfp4_moe_sort_load_bytes(THREAD_DATA)) \
         launch_sort(std::true_type{});                                                  \
     else                                                                                \
         launch_sort(std::false_type{});

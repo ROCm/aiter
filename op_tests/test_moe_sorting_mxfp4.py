@@ -634,14 +634,16 @@ for _qd, _tokens, _bound in itertools.product(
 
 
 # ---------------------------------------------------------------------------
-# Row tails of the scale sort when model_dim / 32 is not a multiple of 4.
+# Row tails of the scale sort.
 #
-# Each thread reads its part of a scale row in 4- to 16-byte loads. The last
-# row's final load runs past the end of the scale buffer, and the buffer range
-# check is per dword, so the dword holding that row's last in-range bytes read
-# as 0 and the last route lost its final scales (#7646). One model_dim per
-# dispatch bucket, both stages; 30000 tokens take the scatter store of the
-# 32-row buckets.
+# Each thread reads its part of a scale row in 2- to 16-byte loads. When a row
+# ends inside a load, the last row's final load runs past the end of the scale
+# buffer, and the buffer range check read the dword holding that row's last
+# in-range bytes as 0, so the last route lost its final scales (#7646). Row
+# lengths with 1-3 bytes past a dword in every dispatch bucket, a row shorter
+# than one load (96), and a whole-dword row that ends inside an 8-byte load
+# (1152); both stages; 30000 tokens take the scatter store of the 32-row
+# buckets.
 # ---------------------------------------------------------------------------
 _TAIL_EXPERTS, _TAIL_TOPK = 64, 8
 
@@ -672,7 +674,9 @@ def _check_tail_scales(model_dim, tokens, stage):
 
 
 for _dim, _tokens, _stage in itertools.product(
-    (320, 800, 1888, 2880, 5824, 7232, 12352), (1, 5, 300), ("stage1", "stage2")
+    (96, 224, 320, 800, 1152, 1888, 2880, 5824, 7232, 12352),
+    (1, 5, 300),
+    ("stage1", "stage2"),
 ):
     _check_tail_scales(_dim, _tokens, _stage)
 _check_tail_scales(2880, 30000, "stage1")
