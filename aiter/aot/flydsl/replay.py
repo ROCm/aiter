@@ -74,12 +74,15 @@ from contextlib import AbstractContextManager, contextmanager
 from typing import Any
 
 from aiter.aot.flydsl.common import (
+    STRICT_ERRATA_TABLES,
     aot_target_archs,
     assert_targets_covered,
     check_replay_process,
     collect_aot_jobs,
     cu_num_to_arch,
+    fail_build_on_missing_target_feature,
     get_max_workers,
+    is_strict_identity,
     replay_env,
     resolve_target_arch,
     run_jobs_parallel,
@@ -580,6 +583,13 @@ def main(module_name: str, description: str) -> None:
             cur = job_arch(job, _default_arch(module))
             if resolve_target_arch(cur, {args.arch}) != args.arch:
                 continue
+            # gfx1250-strict disables the WMMA features these tables need
+            # (A0 errata); compiled for strict they are hollow, so skip them.
+            if (
+                is_strict_identity(args.arch)
+                and job.get("table") in STRICT_ERRATA_TABLES
+            ):
+                continue
             if cur != args.arch:
                 job = {**job, "gfx": args.arch}
             kept.append(job)
@@ -600,7 +610,8 @@ def main(module_name: str, description: str) -> None:
     print("=" * 72, flush=True)
 
     started = time.time()
-    failed_archs = run(module_name, jobs, argv, env=_child_env(module, csv_paths))
+    with fail_build_on_missing_target_feature():
+        failed_archs = run(module_name, jobs, argv, env=_child_env(module, csv_paths))
     print(f"\n  Total time:   {time.time() - started:.1f}s")
     if failed_archs:
         print("Some replays failed. Check output above for details.")

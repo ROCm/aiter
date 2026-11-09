@@ -7,9 +7,11 @@ import math
 import os
 import re
 import shutil
+import statistics
 import subprocess
 import sys
 import textwrap
+import time
 
 import pandas as pd
 import torch
@@ -20,6 +22,7 @@ import aiter.ops.mha_v4 as mha_v4_module
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.mha_v4 import (
+    MHA_V4_SPARSE_MODE,
     AttentionFormat,
     AttentionPack,
     AttentionScaleMode,
@@ -27,7 +30,9 @@ from aiter.ops.mha_v4 import (
     _RawRecipeKind,
     _resolve_raw_recipe,
     mha_v4,
+    mha_v4_kv_splits,
     mha_v4_kv_tile,
+    mha_v4_operands,
     mha_v4_packed,
     native_fp8_format,
     scale_modes_for_formats,
@@ -39,7 +44,9 @@ from aiter.ops.mha_v4_quant import (
     MHA_V4_MXFP4_K_SCALE_SLACK_BYTES,
     MHA_V4_MXFP4_V_SCALE_SLACK_BYTES,
     MHA_V4_MXFP4_V_SCALE_TILE_BYTES,
+    MHA_V4_MXFP6_FP6_P_V_SCALE_SLACK_BYTES,
     MHA_V4_MXFP6_V_BUFFER_SLACK_BYTES,
+    MHA_V4_QUERY_TILE_ROWS,
     mha_v4_q_multiplier,
     mxfp4_k_view,
     mxfp4_v_view,
@@ -50,6 +57,7 @@ from aiter.ops.mha_v4_quant import (
     quantize_mxfp4_k,
     quantize_mxfp4_q,
     quantize_mxfp6_k,
+    quantize_mxfp6_q,
     quantize_mxfp8_k,
     quantize_mxfp8_q,
     quantize_v_fp8,
@@ -59,6 +67,7 @@ from aiter.ops.mha_v4_quant import (
     rotate_activation_hd128,
     rotate_activation_mxfp6_quant,
 )
+from aiter.ops.triton.attention.utils import block_attn_mask_to_ragged_lut
 from aiter.ops.triton.quant.mxfp6_fmha_pack import (
     _v_direct_kvtab,
     fp6_k_raw_buffer_sizes,
@@ -118,12 +127,15 @@ def _rotate_hd128_reference(value):
 
 # Dynamo caches compiled entries per code object and this file compiles mha_v4 under many format
 # combinations, so a shared cache drifts toward the recompile limit and whichever check compiles
-# last fails under fullgraph. The kv-tile cache is cleared because patched_attr restores get_gfx
-# but not a tile it may have warmed, and a stale tile is wrong mask geometry rather than an error.
-_CHECKS = CheckRegistry(
-    setup=torch._dynamo.reset,
-    teardown=lambda: mha_v4_module.mha_v4_kv_tile.cache_clear(),
-)
+# last fails under fullgraph. The kv-tile caches are cleared because patched_attr restores get_gfx
+# but not a tile it may have warmed, and a stale tile is wrong mask geometry or a wrong kv_splits
+# bound rather than an error.
+def _clear_kv_tile_caches():
+    mha_v4_module.mha_v4_kv_tile.cache_clear()
+    mha_v4_module._mha_v4_dense_kv_tile.cache_clear()
+
+
+_CHECKS = CheckRegistry(setup=torch._dynamo.reset, teardown=_clear_kv_tile_caches)
 
 
 def test_attention_format_ids_are_stable():
@@ -1115,6 +1127,14 @@ def test_mha_v4_dispatchable_objects_bound_their_scale_gathers(arch):
             if line.strip() and not line.startswith("#")
         ]
     header, rows = rows[0], rows[1:]
+    # Skipped explicitly: the gfx950 sorted-sparse objects (every geometry) predate the
+    # bounded-gather rebuild and still fetch MX scales with global loads. They are safe only
+    # because MHA_V4_QUERY_TILE_ROWS padding and the launcher's Q backing-storage check are
+    # kept for them. Drop this exclusion, and that padding, once they are rebuilt.
+    if arch == "gfx950":
+        rows = [
+            row for row in rows if int(row[header.index("mode")]) != MHA_V4_SPARSE_MODE
+        ]
     co_names = sorted({row[header.index("co_name")] for row in rows})
     assert co_names, f"no dispatchable fmha_v4 rows for {arch}"
 
@@ -1144,27 +1164,61 @@ def test_mha_v4_dispatchable_objects_bound_their_scale_gathers(arch):
 
 
 @skipif(get_gfx() != "gfx950", reason="gfx950 scale gather validation")
-@parametrize("sequence", [1, 128, 129, 257, 512])
+@parametrize("sequence", [1, 255, 256, 257, 513])
 @parametrize(
     "quantize",
-    [quantize_v_mxfp4_fp6_p],
-    ids=["fp6_p"],
+    [
+        param(lambda t: quantize_mxfp8_q(t, 1.0), id="mxfp8"),
+        param(lambda t: quantize_mxfp4_q(t, 1.0), id="mxfp4"),
+        param(lambda t: quantize_mxfp6_q(t, 1.0), id="mxfp6"),
+    ],
 )
-def test_mha_v4_mxfp4_v_scale_backing_storage_covers_lookahead_tiles(
-    quantize, sequence
-):
-    """The MXFP4 Q/K rows gather V scales two 512-byte tiles ahead of the running tile.
+def test_mha_v4_q_scale_backing_storage_covers_query_tile(quantize, sequence):
+    """The gfx950 sorted-sparse Q-scale gather addresses all 256 rows of the tile it is running.
 
-    The lead does not shrink at the end of the sequence, so the last tiles address scale bytes
-    past the final one whatever the length. Measured on gfx950: 1023 trailing mapped bytes still
-    fault, 1024 do not.
+    A partial final tile therefore reads past the logical sequence, so the backing storage must
+    cover the padded tile and read as zero. Without it those loads walk off the tensor and fault
+    the GPU at an unrelated later synchronization. The dense objects bound this gather in their
+    buffer descriptor; the sparse ones predate that and rely on this padding.
     """
     heads = 3
     value = torch.randn((2, sequence, heads, 128), device="cuda", dtype=torch.bfloat16)
     _, scale = quantize(value)
 
-    slack = MHA_V4_MXFP4_V_SCALE_SLACK_BYTES
-    assert slack == 2 * MHA_V4_MXFP4_V_SCALE_TILE_BYTES
+    padded = -(-sequence // MHA_V4_QUERY_TILE_ROWS) * MHA_V4_QUERY_TILE_ROWS
+    slack = (padded - sequence) * heads * 4
+    assert scale.shape == (2, sequence, heads, 4)
+    assert scale.is_contiguous()
+    assert scale.untyped_storage().nbytes() == scale.numel() + slack
+    assert torch.equal(
+        scale.as_strided((slack,), (1,), scale.numel()),
+        torch.zeros(slack, device="cuda", dtype=torch.uint8),
+    )
+
+
+@skipif(get_gfx() != "gfx950", reason="gfx950 scale gather validation")
+@parametrize("sequence", [1, 128, 129, 257, 512])
+@parametrize(
+    ("quantize", "slack"),
+    [
+        param(quantize_v_mxfp4_fp6_p, MHA_V4_MXFP4_V_SCALE_SLACK_BYTES, id="mxfp4"),
+        param(
+            quantize_v_mxfp6_fp6_p, MHA_V4_MXFP6_FP6_P_V_SCALE_SLACK_BYTES, id="mxfp6"
+        ),
+    ],
+)
+def test_mha_v4_mx_v_scale_backing_storage_covers_the_64x64_gather(
+    quantize, slack, sequence
+):
+    """The 64x64 sparse MX-V rows gather V scales through a raw pointer, 512 bytes from the first
+    token of each 64-token block. A block in the second half of a 128-token scale tile reads 256
+    bytes past it, so the producers back the last tile with zeroed slack.
+    """
+    heads = 3
+    value = torch.randn((2, sequence, heads, 128), device="cuda", dtype=torch.bfloat16)
+    _, scale = quantize(value)
+
+    assert slack >= MHA_V4_MXFP4_V_SCALE_TILE_BYTES // 2
     assert scale.is_contiguous()
     assert scale.untyped_storage().nbytes() == scale.numel() + slack
     assert torch.equal(
@@ -1177,26 +1231,6 @@ def test_mha_v4_mxfp4_v_scale_backing_storage_covers_lookahead_tiles(
 @skipif(get_gfx() != "gfx950", reason="gfx950 LSE")
 def test_mha_v4_rejects_unsupported_contracts():
     q = torch.empty((1, 128, 2, 128), device="cuda", dtype=torch.bfloat16)
-    # LSE ships for every measured format row, dense and sorted-sparse alike; a row outside that
-    # set is rejected rather than left to export a value nothing has compared against. Off gfx950
-    # the architecture gate fires first, so that is the message to expect there.
-    block_mask = torch.ones((1, 2, 1, 1), device="cuda", dtype=torch.bool)
-    lse_rejection = (
-        "not implemented for Q=FP4_E2M1"
-        if get_gfx() == "gfx950"
-        else "LSE is not validated on"
-    )
-    with expect_raises(NotImplementedError, match=lse_rejection):
-        mha_v4(
-            q,
-            q,
-            q,
-            AttentionFormat.MXFP4,
-            AttentionFormat.MXFP4,
-            AttentionFormat.FP8,
-            return_lse=True,
-            block_mask=block_mask,
-        )
     with expect_raises(ValueError, match="matching Q and K formats"):
         mha_v4(
             q,
@@ -1331,12 +1365,12 @@ def test_mha_v4_dense_lse_under_gqa(q_format, v_format, gqa_ratio):
     ("q_format", "v_format", "max_spread"),
     [
         (AttentionFormat.BF16, AttentionFormat.BF16, 0.05),
-        (AttentionFormat.BF16, AttentionFormat.FP8, 0.05),
-        (AttentionFormat.INT8, AttentionFormat.FP8, 0.05),
-        (AttentionFormat.FP8, AttentionFormat.FP8, 0.75),
-        (AttentionFormat.FP8, AttentionFormat.MXFP6, 0.75),
+        (AttentionFormat.BF16, native_fp8_format(), 0.05),
+        (AttentionFormat.INT8, native_fp8_format(), 0.05),
+        (native_fp8_format(), native_fp8_format(), 0.75),
+        (native_fp8_format(), AttentionFormat.MXFP6, 0.75),
         (AttentionFormat.MXFP4, AttentionFormat.MXFP4, 0.35),
-        (AttentionFormat.MXFP6_E2M3, AttentionFormat.FP8, 0.35),
+        (AttentionFormat.MXFP6_E2M3, native_fp8_format(), 0.35),
         (AttentionFormat.MXFP6_E2M3, AttentionFormat.MXFP6, 0.35),
         (AttentionFormat.MXFP6_E2M3, AttentionFormat.MXFP4, 0.35),
     ],
@@ -1382,6 +1416,314 @@ def test_mha_v4_lse_bias_is_constant_across_key_chunks(q_format, v_format, max_s
 
     spread = max(biases) - min(biases)
     assert spread < max_spread, f"per-chunk bias {biases} spans {spread:.4f} nats"
+
+
+_KV_SPLIT_FORMATS = [
+    (AttentionFormat.BF16,) * 3,
+    (AttentionFormat.BF16, AttentionFormat.BF16, AttentionFormat.FP8),
+    (AttentionFormat.INT8, AttentionFormat.INT8, AttentionFormat.FP8),
+    (AttentionFormat.FP8,) * 3,
+]
+
+
+def _patched_cu_count(cus):
+    return patched_attr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device=None: type("Props", (), {"multi_processor_count": cus})(),
+    )
+
+
+@skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 LSE")
+@parametrize("formats", _KV_SPLIT_FORMATS)
+@parametrize("splits", [2, 3, 4])
+@parametrize(
+    "batch,query_length,key_length,query_heads,kv_heads",
+    [
+        param(1, 1000, 1024, 3, 3, id="b1"),
+        param(2, 333, 768, 4, 2, id="b2-gqa"),
+        param(2, 333, 1001, 4, 2, id="b2-gqa-remainder"),
+    ],
+)
+def test_mha_v4_kv_splits_match_the_unsplit_call(
+    formats, splits, batch, query_length, key_length, query_heads, kv_heads
+):
+    """Splitting the keys costs no accuracy against full-precision attention.
+
+    Operands are quantized once, before the split, so the scales and the LSE bias are those of
+    the unsplit call. The result is still not the unsplit one: each partial output is rounded to
+    BF16, and a quantized P is scaled by its range's running max rather than the row's. The keys
+    escalate along the sequence so the ranges carry very different softmax mass, and a range
+    weighted by anything other than its true LSE shows up as a large error. A count that does
+    not divide the keys ends the shorter ranges through seqlens_k, on the operands that take it.
+    """
+    torch.manual_seed(47)
+    q = torch.randn(
+        (batch, query_length, query_heads, 128), device="cuda", dtype=torch.bfloat16
+    )
+    ramp = torch.linspace(1.0, 4.0, key_length, device="cuda").view(1, -1, 1, 1)
+    k = (torch.randn((batch, key_length, kv_heads, 128), device="cuda") * ramp).to(
+        torch.bfloat16
+    )
+    v = torch.randn_like(k)
+    ratio = query_heads // kv_heads
+    scores = (
+        torch.einsum(
+            "bshd,bthd->bhst", q.float(), k.float().repeat_interleave(ratio, dim=2)
+        )
+        * 128**-0.5
+    )
+    reference_lse = torch.logsumexp(scores, dim=-1)
+    reference = torch.einsum(
+        "bhst,bthd->bshd",
+        torch.softmax(scores, dim=-1),
+        v.float().repeat_interleave(ratio, dim=2),
+    )
+
+    def errors(out, lse):
+        output = (out.float() - reference).norm() / reference.norm()
+        return output.item(), (lse - reference_lse).abs().max().item()
+
+    if key_length % splits and not mha_v4_module._varlen_capable(
+        formats[0], formats[2]
+    ):
+        with expect_raises(ValueError, match="divide the key length"):
+            mha_v4(q, k, v, *formats, kv_splits=splits)
+        return
+    unsplit = errors(*mha_v4(q, k, v, *formats, return_lse=True))
+    actual, actual_lse = mha_v4(q, k, v, *formats, return_lse=True, kv_splits=splits)
+    split = errors(actual, actual_lse)
+
+    assert torch.equal(mha_v4(q, k, v, *formats, kv_splits=splits), actual)
+    assert split[0] < unsplit[0] * 1.1 + 1e-3, (split, unsplit)
+    # The split moves the LSE error by noise on the order of the recipe's own quantization error
+    # (~0.003 nats for BF16, 0.2-0.6 for INT8 and FP8 Q/K), so it is bounded relative to it.
+    assert split[1] < unsplit[1] * 1.1 + 2e-2, (split, unsplit)
+
+
+def test_mha_v4_kv_splits_auto_fills_one_wave():
+    """The grid grows to the CU count and no further, in a count that divides the keys if any."""
+    with _patched_cu_count(256):
+        # 3 heads x 17 query tiles is 51 work-groups: 5 fit, but 4352 splits evenly into 4.
+        assert mha_v4_kv_splits(1, 4352, 3, 4352) == 4
+        assert mha_v4_kv_splits(1, 4096, 3, 4096) == 4
+        # 32 heads already fill two waves.
+        assert mha_v4_kv_splits(1, 4352, 32, 4352) == 1
+        # A prime key length has no even split.
+        assert mha_v4_kv_splits(1, 4352, 3, 4349) == 1
+        # Ranges stay at least 512 keys long.
+        assert mha_v4_kv_splits(1, 256, 1, 1536) == 3
+        assert mha_v4_kv_splits(1, 256, 1, 1000) == 1
+        # Operands that take per-batch key lengths still prefer a divisor, and only at batch 1
+        # fall back to letting the last range take the rest.
+        assert mha_v4_kv_splits(1, 4352, 3, 4352, ragged=True) == 4
+        assert mha_v4_kv_splits(1, 4352, 3, 4349, ragged=True) == 5
+        assert mha_v4_kv_splits(1, 256, 1, 1000, ragged=True) == 1
+        assert mha_v4_kv_splits(2, 4352, 1, 4352, ragged=True) == 4
+        assert mha_v4_kv_splits(2, 4352, 1, 4349, ragged=True) == 1
+
+
+@parametrize(
+    "batch,key_length,splits",
+    [(1, 1024, 4), (1, 1001, 3), (2, 1024, 4), (2, 1001, 3)],
+)
+def test_mha_v4_kv_splits_fold_every_key_once(batch, key_length, splits):
+    """Each range starts where the last one ends, and only an uneven batched fold copies."""
+    k = torch.randn((batch, key_length, 2, 128), device="cuda", dtype=torch.bfloat16)
+    ranges = mha_v4_module._fold_key_ranges(k, splits)
+    lengths = mha_v4_module._key_range_lengths(batch, splits, key_length, k.device)
+    if lengths is None:
+        lengths = torch.full((batch * splits,), ranges.shape[1], dtype=torch.int32)
+    lengths = lengths.tolist()
+
+    for b in range(batch):
+        keys = [
+            ranges[b * splits + i, : lengths[b * splits + i]] for i in range(splits)
+        ]
+        assert torch.equal(torch.cat(keys), k[b])
+    view = ranges.untyped_storage().data_ptr() == k.untyped_storage().data_ptr()
+    assert view == (batch == 1 or key_length % splits == 0)
+
+
+@parametrize(
+    "cus,splits",
+    [
+        param(304, 16, id="MI300X"),
+        param(256, 16, id="MI355X"),
+        param(228, 8, id="MI300A"),
+        param(80, 4, id="MI308X"),
+    ],
+)
+def test_mha_v4_kv_splits_auto_follows_the_cu_count(cus, splits):
+    """Each SKU sizes the split by its own CU count: 16 work-groups fill a different wave on each."""
+    with _patched_cu_count(cus):
+        assert mha_v4_kv_splits(1, 4096, 1, 8192) == splits
+
+
+def test_mha_v4_kv_splits_follow_the_lse_gate():
+    """The ranges merge by their LSE, so where the LSE gate refuses, auto is 1 and a count raises."""
+    q = torch.randn((1, 1024, 1, 128), device="cuda", dtype=torch.bfloat16)
+    bf16 = (AttentionFormat.BF16,) * 3
+    with patched_attr(mha_v4_module, "get_gfx", lambda: "gfx942"):
+        recipe = mha_v4_module._resolve_raw_recipe(
+            *bf16, None, None, None, sparse=False
+        )
+
+        assert (
+            mha_v4_module._resolve_kv_splits("auto", recipe, *bf16, q, q, False, False)
+            == 1
+        )
+        with expect_raises(NotImplementedError, match="not validated on gfx942"):
+            mha_v4(q, q, q, *bf16, kv_splits=2)
+
+
+def _recipe_operands(*formats):
+    """mha_v4_operands() for a per-tensor recipe in its canonical scale modes and V packing."""
+    return mha_v4_operands(*formats, *scale_modes_for_formats(*formats))
+
+
+@skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 LSE")
+def test_mha_v4_kv_splits_auto_leaves_unsupported_calls_unsplit():
+    """auto is a performance hint: where splitting is unsupported it must run the plain call."""
+    torch.manual_seed(59)
+    q = torch.randn((1, 1024, 1, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    formats = (AttentionFormat.MXFP4,) * 3
+
+    assert torch.equal(
+        mha_v4(q, k, v, *formats, kv_splits="auto"), mha_v4(q, k, v, *formats)
+    )
+    bf16 = (AttentionFormat.BF16,) * 3
+    kv_tile = mha_v4_kv_tile(_recipe_operands(*bf16), MHA_V4_SPARSE_MODE)
+    mask = torch.ones(
+        (1, 1024 // 256, 1024 // kv_tile), device="cuda", dtype=torch.bool
+    )
+    assert torch.equal(
+        mha_v4(q, k, v, *bf16, block_mask=mask, kv_splits="auto"),
+        mha_v4(q, k, v, *bf16, block_mask=mask),
+    )
+
+
+@skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 LSE")
+@parametrize(
+    "kwargs,error,match",
+    [
+        param({"kv_splits": 0}, ValueError, "positive int", id="zero"),
+        param({"kv_splits": "many"}, ValueError, "positive int", id="string"),
+        param(
+            {"kv_splits": 1025},
+            ValueError,
+            "at least one 64-key tile: at most 16",
+            id="more-than-keys",
+        ),
+        # The bound is the recipe's own dense KV tile: 64 keys for BF16, 128 for FP8.
+        param(
+            {"kv_splits": 17},
+            ValueError,
+            "at least one 64-key tile: at most 16",
+            id="shorter-than-a-bf16-tile",
+        ),
+        param(
+            {"kv_splits": 9, "formats": (AttentionFormat.FP8,) * 3},
+            ValueError,
+            "at least one 128-key tile: at most 8",
+            id="shorter-than-an-fp8-tile",
+        ),
+        param(
+            {"kv_splits": 2, "block_mask": torch.ones((1, 4, 8), dtype=torch.bool)},
+            NotImplementedError,
+            "block_mask",
+            id="block-mask",
+        ),
+        param(
+            {"kv_splits": 2, "seqlens_k": torch.tensor([512], dtype=torch.int32)},
+            NotImplementedError,
+            "seqlens_k",
+            id="seqlens-k",
+        ),
+        param(
+            {"kv_splits": 2, "formats": (AttentionFormat.MXFP4,) * 3},
+            NotImplementedError,
+            "per-tensor",
+            id="mxfp4",
+        ),
+        param(
+            {
+                "kv_splits": 2,
+                "formats": (
+                    AttentionFormat.FP8,
+                    AttentionFormat.FP8,
+                    AttentionFormat.MXFP6,
+                ),
+            },
+            NotImplementedError,
+            "per-tensor",
+            id="fp8-mxfp6",
+        ),
+    ],
+)
+def test_mha_v4_kv_splits_rejects_what_it_cannot_split(kwargs, error, match):
+    q = torch.randn((1, 1024, 1, 128), device="cuda", dtype=torch.bfloat16)
+    kwargs = dict(kwargs)
+    formats = kwargs.pop("formats", (AttentionFormat.BF16,) * 3)
+    for name in ("block_mask", "seqlens_k"):
+        if name in kwargs:
+            kwargs[name] = kwargs[name].cuda()
+    with expect_raises(error, match=match):
+        mha_v4(q, q, q, *formats, **kwargs)
+
+
+@skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 LSE")
+def test_mha_v4_kv_splits_allow_one_kv_tile_per_range():
+    """The bound is inclusive: a count leaving exactly one KV tile per range still splits."""
+    torch.manual_seed(67)
+    q = torch.randn((1, 1024, 1, 128), device="cuda", dtype=torch.bfloat16)
+    bf16 = (AttentionFormat.BF16,) * 3
+    splits = 1024 // mha_v4_module._mha_v4_dense_kv_tile(_recipe_operands(*bf16), 128)
+
+    out = mha_v4(q, q, q, *bf16, kv_splits=splits)
+
+    assert not torch.isnan(out).any()
+    torch.testing.assert_close(out, mha_v4(q, q, q, *bf16), atol=2e-2, rtol=2e-2)
+
+
+@skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 LSE")
+def test_mha_v4_kv_splits_need_a_divisor_without_per_batch_key_lengths():
+    """Every recipe kv_splits takes has per-batch key lengths on gfx950, so a row without them is
+    simulated: its last range has no way to end short, and a count must divide the keys.
+    """
+    q = torch.randn((1, 1024, 1, 128), device="cuda", dtype=torch.bfloat16)
+    formats = (AttentionFormat.FP8,) * 3
+    with patched_attr(mha_v4_module, "_varlen_capable", lambda *formats: False):
+        with expect_raises(ValueError, match="divide the key length"):
+            mha_v4(q, q, q, *formats, kv_splits=3)
+        assert mha_v4(q, q, q, *formats, kv_splits=4).shape == q.shape
+
+
+@skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 LSE")
+@parametrize(
+    "formats",
+    [
+        param((AttentionFormat.BF16,) * 3, id="BF16"),
+        param((AttentionFormat.FP8,) * 3, id="FP8"),
+    ],
+)
+def test_mha_v4_kv_splits_compile_parity(formats):
+    torch._dynamo.reset()
+    torch.manual_seed(61)
+    q = torch.randn((1, 1024, 3, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+
+    eager = mha_v4(q, k, v, *formats, return_lse=True, kv_splits=4)
+    compiled = torch.compile(mha_v4, fullgraph=True)(
+        q, k, v, *formats, return_lse=True, kv_splits=4
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(eager[0], compiled[0])
+    assert torch.equal(eager[1], compiled[1])
 
 
 @skipif(get_gfx() != "gfx950", reason="gfx950 LSE")
@@ -1477,10 +1819,57 @@ def test_mha_v4_packed_rejects_wrong_scale_recipe():
         )
 
 
+@skipif(get_gfx() != "gfx950", reason="gfx950 LSE")
+def test_mha_v4_packed_rejects_overlapping_lse_views():
+    """An expanded [1, 1, Sq] buffer has strides [0, 0, 1], so every (batch, head) row would write
+    the same Sq floats. The dense and the sparse launch must both refuse it, and still take a
+    contiguous buffer of the same shape."""
+    batch, heads, sequence = 2, 3, 256
+    q = torch.randn(
+        (batch, sequence, heads, 128), device="cuda", dtype=torch.bfloat16
+    ).to(torch.float8_e4m3fn)
+    scale = torch.ones(1, device="cuda", dtype=torch.float32)
+    fp8, per_tensor = AttentionFormat.FP8, AttentionScaleMode.F32_PER_TENSOR
+    q_tile, kv_tile = 256, 128
+    mask = torch.ones(
+        (batch, heads, sequence // q_tile, sequence // kv_tile),
+        device="cuda",
+        dtype=torch.bool,
+    )
+    indices, start, count = block_attn_mask_to_ragged_lut(
+        mask, num_heads=heads, return_none_if_dense=False
+    )
+    sparse = {
+        "kv_block_indices": indices,
+        "lut_start": start,
+        "lut_count": count,
+        "block_tile": (q_tile, kv_tile),
+    }
+
+    def launch(lse, **lut):
+        args = (q, q, q, scale, scale, scale, fp8, fp8, fp8, per_tensor, per_tensor)
+        mha_v4_packed(*args, per_tensor, lse=lse, return_lse=True, **lut)
+        torch.cuda.synchronize()
+
+    overlapping = torch.empty((1, 1, sequence), device="cuda").expand(
+        batch, heads, sequence
+    )
+    assert overlapping.stride() == (0, 0, 1)
+    for lut in ({}, sparse):
+        with expect_raises(RuntimeError, match="LSE must be contiguous"):
+            launch(overlapping, **lut)
+        launch(torch.empty((batch, heads, sequence), device="cuda"), **lut)
+
+
 @skipif(get_gfx() != "gfx950", reason="gfx950 MXFP8 validation")
 def test_mha_v4_packed_accepts_mxfp8_scale_recipe():
     q = torch.zeros((1, 128, 2, 128), device="cuda", dtype=torch.float8_e4m3fn)
-    qk_scale = torch.ones((1, 128, 2, 4), device="cuda", dtype=torch.uint8)
+    # The launcher requires Q-scale backing for the whole 256-row query tile, so back the view
+    # with those rows.
+    scale_storage = torch.ones(
+        MHA_V4_QUERY_TILE_ROWS * 2 * 4, device="cuda", dtype=torch.uint8
+    )
+    qk_scale = scale_storage[: 128 * 2 * 4].view(1, 128, 2, 4)
     v_scale = torch.ones(1, device="cuda", dtype=torch.float32)
     mha_v4_packed(
         q,
@@ -1559,12 +1948,13 @@ def test_mha_v4_packed_rejects_wrong_mxfp4_k_layout():
 
 
 @skipif(get_gfx() != "gfx950", reason="gfx950 MX scale validation")
-def test_mha_v4_packed_rejects_unbacked_mx_scales():
-    """An external caller passing exact-size scales would fault the speculative gathers.
+def test_mha_v4_packed_rejects_unbacked_mxfp4_k_scales():
+    """An external caller passing an exact-size MXFP4 K scale would fault the speculative gather.
 
     clone() keeps the logical shape the size checks look at but drops the producer's
     zeroed slack, which is exactly the shape of a caller-supplied tensor. Q is not checked:
-    its gather is bounded by a buffer descriptor, so it needs no slack.
+    its gather is bounded by a buffer descriptor, so it needs no slack. V is checked on the
+    64x64 rows only; see test_mha_v4_packed_mx_v_scales_need_backing_only_on_64x64_rows.
     """
     torch.manual_seed(5)
     value = torch.randn((1, 257, 2, 128), device="cuda", dtype=torch.bfloat16)
@@ -1572,7 +1962,7 @@ def test_mha_v4_packed_rejects_unbacked_mx_scales():
     mxfp4_q, mxfp4_q_scale = quantize_mxfp4_q(value, 1.0)
     mxfp4_raw, mxfp4_k_scale = quantize_mxfp4_k(value)
     mxfp4_v_raw, mxfp4_v_scale = quantize_v_mxfp4_fp6_p(value)
-    with expect_raises(RuntimeError, match="speculative tile gather"):
+    with expect_raises(RuntimeError, match="MX K descale needs"):
         mha_v4_packed(
             mxfp4_q,
             mxfp4_k_view(mxfp4_raw, mxfp4_k_scale),
@@ -1588,21 +1978,83 @@ def test_mha_v4_packed_rejects_unbacked_mx_scales():
             AttentionScaleMode.E8M0_PER_1X32,
         )
 
-    with expect_raises(RuntimeError, match="MX V descale needs"):
-        mha_v4_packed(
-            mxfp4_q,
-            mxfp4_k_view(mxfp4_raw, mxfp4_k_scale),
-            mxfp4_v_view(mxfp4_v_raw, mxfp4_v_scale, value.shape[1]),
-            mxfp4_q_scale,
-            mxfp4_k_scale,
-            mxfp4_v_scale.clone(),
-            AttentionFormat.MXFP4,
-            AttentionFormat.MXFP4,
-            AttentionFormat.MXFP4,
-            AttentionScaleMode.E8M0_PER_1X32,
-            AttentionScaleMode.E8M0_PER_1X32,
-            AttentionScaleMode.E8M0_PER_1X32,
+
+def _mx_fp6_p_packed_operands(fmt, queries, keys):
+    """Producer-built (q, k, v, q_descale, k_descale, v_descale) for an MX FP6-P recipe."""
+    batch, sequence, heads, _ = keys.shape
+    if fmt == AttentionFormat.MXFP4:
+        q, q_scale = quantize_mxfp4_q(queries, 1.0)
+        k_raw, k_scale = quantize_mxfp4_k(keys)
+        v_raw, v_scale = quantize_v_mxfp4_fp6_p(keys)
+        k, v = mxfp4_k_view(k_raw, k_scale), mxfp4_v_view(v_raw, v_scale, sequence)
+        return q, k, v, q_scale, k_scale, v_scale
+    q, q_scale = quantize_mxfp6_q(queries, 1.0)
+    k_raw, k_scale_raw = quantize_mxfp6_k(keys)
+    k, k_scale = mxfp6_k_view(k_raw, k_scale_raw, batch, sequence, heads)
+    v, v_scale = quantize_v_mxfp6_fp6_p(keys)
+    return q, k, v, q_scale, k_scale, v_scale
+
+
+@skipif(get_gfx() != "gfx950", reason="gfx950 MX scale validation")
+@parametrize("fmt", [AttentionFormat.MXFP4, AttentionFormat.MXFP6])
+def test_mha_v4_packed_mx_v_scales_need_backing_only_on_64x64_rows(fmt):
+    """Only the 64x64 sparse rows gather V scales through a raw pointer.
+
+    A 64-token block reads the 512 scale bytes from its first token, so with one 128-token tile
+    and only the second block selected the gather ends 256 bytes past the tensor. clone() keeps
+    the logical shape and drops the producer's slack, which is the shape of a caller-supplied
+    tensor. The dense and 256x128 rows bound the gather with a buffer descriptor, so the compact
+    scale is the same launch to them.
+    """
+    torch.manual_seed(5)
+    keys = torch.randn((1, 128, 1, 128), device="cuda", dtype=torch.bfloat16)
+    queries = torch.randn((1, 256, 1, 128), device="cuda", dtype=torch.bfloat16)
+    q, k, v, q_scale, k_scale, v_scale = _mx_fp6_p_packed_operands(fmt, queries, keys)
+    compact = v_scale.clone()
+    assert compact.untyped_storage().nbytes() == compact.numel()
+    modes = (AttentionScaleMode.E8M0_PER_1X32,) * 3
+
+    def launch(v_descale, **sparse):
+        out = mha_v4_packed(
+            q,
+            k,
+            v,
+            q_scale,
+            k_scale,
+            v_descale,
+            fmt,
+            fmt,
+            fmt,
+            *modes,
+            v_pack=AttentionPack.V_FOR_FP6_P,
+            **sparse,
         )
+        torch.cuda.synchronize()
+        return out
+
+    def lut(q_tile, kv_tile, blocks):
+        mask = torch.zeros(
+            (1, 1, 256 // q_tile, 128 // kv_tile), device="cuda", dtype=torch.bool
+        )
+        mask[..., blocks] = True
+        indices, start, count = block_attn_mask_to_ragged_lut(
+            mask, num_heads=1, return_none_if_dense=False
+        )
+        return {
+            "kv_block_indices": indices,
+            "lut_start": start,
+            "lut_count": count,
+            "block_tile": (q_tile, kv_tile),
+        }
+
+    assert torch.equal(launch(compact), launch(v_scale))
+    default = lut(256, 128, [0])
+    assert torch.equal(launch(compact, **default), launch(v_scale, **default))
+
+    fine = lut(64, 64, [1])
+    assert torch.isfinite(launch(v_scale, **fine)).all()
+    with expect_raises(RuntimeError, match="64x64 kernel's speculative tile gather"):
+        launch(compact, **fine)
 
 
 @skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 validation")
@@ -2127,13 +2579,77 @@ def _verdict(err):
     return "warning" if err <= _TOL_ERR_RATIO else "failed"
 
 
+_KV_SPLIT_RECIPES = ("bf16", "bf16fp8", "i8fp8", "fp8")
+_GRAPH_CALLS, _GRAPH_SAMPLES = 10, 100
+_EAGER_CALLS, _EAGER_SAMPLES = 20, 50
+
+
+def _graph_us(fn):
+    """Median us per call over replays of one HIP graph holding back-to-back calls."""
+    for _ in range(3):
+        output = fn()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        for _ in range(_GRAPH_CALLS):
+            fn()
+    for _ in range(5):
+        graph.replay()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    samples = []
+    for _ in range(_GRAPH_SAMPLES):
+        start.record()
+        graph.replay()
+        end.record()
+        end.synchronize()
+        samples.append(start.elapsed_time(end) * 1e3 / _GRAPH_CALLS)
+    return output, statistics.median(samples)
+
+
+def _eager_us(fn):
+    """Median us per call of back-to-back eager calls: issue to synchronize, and issue alone."""
+    for _ in range(10):
+        output = fn()
+    torch.cuda.synchronize()
+    e2e, host = [], []
+    for _ in range(_EAGER_SAMPLES):
+        start = time.perf_counter()
+        for _ in range(_EAGER_CALLS):
+            fn()
+        issued = time.perf_counter()
+        torch.cuda.synchronize()
+        done = time.perf_counter()
+        e2e.append((done - start) * 1e6 / _EAGER_CALLS)
+        host.append((issued - start) * 1e6 / _EAGER_CALLS)
+    return output, statistics.median(e2e), statistics.median(host)
+
+
+def _kv_splits_arg(value):
+    return value if value == "auto" else int(value)
+
+
 @benchmark()
-def benchmark_mha_v4(batch, sequence_q, sequence_k, heads, head_dim, dtype):
+def benchmark_mha_v4(
+    batch,
+    sequence_q,
+    sequence_k,
+    heads,
+    head_dim,
+    dtype,
+    kv_splits=1,
+    timing="profiler",
+):
     """Benchmark every dense MHA v4 recipe against one Torch reference.
 
     All recipes are timed side by side because they differ only in how Q/K/V are quantized, so
     the interesting number is what each costs at the same shape and what it costs in accuracy.
     The quantized rows time their quantizers too, since that is what mha_v4 runs per call.
+
+    `timing` picks what "us" means: "profiler" is the device time of one call's kernels,
+    "graph" the median over HIP-graph replays of _GRAPH_CALLS back-to-back calls, and "eager"
+    the median issue-to-synchronize time of _EAGER_CALLS back-to-back calls, with the time to
+    issue them alone as "host us". Any `kv_splits` but 1 times only the recipes that split.
     """
     softmax_scale = head_dim**-0.5
     torch.manual_seed(batch + sequence_q + sequence_k + heads)
@@ -2157,6 +2673,13 @@ def benchmark_mha_v4(batch, sequence_q, sequence_k, heads, head_dim, dtype):
     if head_dim != 128:
         # Only all-MXFP6 and all-MXFP4 have kernels past hd128; the rest would raise.
         recipes = {name: recipes[name] for name in ("mxfp6", "mxfp4")}
+    if kv_splits != 1:
+        recipes = {
+            name: formats
+            for name, formats in recipes.items()
+            if name in _KV_SPLIT_RECIPES
+        }
+    out = torch.empty_like(q)
     candidates = {
         name: (
             lambda q_format=q_format, v_format=v_format: mha_v4(
@@ -2167,6 +2690,8 @@ def benchmark_mha_v4(batch, sequence_q, sequence_k, heads, head_dim, dtype):
                 q_format,
                 v_format,
                 softmax_scale=softmax_scale,
+                out=out,
+                kv_splits=kv_splits,
             )
         )
         for name, (q_format, v_format) in recipes.items()
@@ -2177,7 +2702,21 @@ def benchmark_mha_v4(batch, sequence_q, sequence_k, heads, head_dim, dtype):
     nbytes = elements * q.element_size()
     ret = {"gfx": get_gfx()}
     for name, candidate in candidates.items():
-        output, us = run_perftest(candidate)
+        if timing == "graph":
+            output, us = _graph_us(candidate)
+        elif timing == "eager":
+            output, us, ret[f"{name} host us"] = _eager_us(candidate)
+        else:
+            output, us = run_perftest(candidate)
+        if kv_splits == "auto":
+            q_format, v_format = recipes[name]
+            ret[f"{name} splits"] = mha_v4_kv_splits(
+                batch,
+                sequence_q,
+                heads,
+                sequence_k,
+                ragged=mha_v4_module._varlen_capable(q_format, v_format),
+            )
         # Quantized recipes are expected to land well outside a bitwise bound; the err column is
         # what carries their accuracy, so compare loosely and let the number speak.
         # catastrophic_check turns NaN/Inf or delta > ref_max/2 into an AssertionError; catching it
@@ -2225,22 +2764,60 @@ def main():
     parser.add_argument(
         "-d", "--dtype", type=dtypes.str2Dtype, nargs="*", default=[dtypes.bf16]
     )
+    parser.add_argument(
+        "--kv-splits",
+        type=_kv_splits_arg,
+        nargs="*",
+        default=[1],
+        help='KV split counts, each a positive int or "auto"; any but 1 times only\n'
+        "the recipes that split (bf16, bf16fp8, i8fp8, fp8)",
+    )
+    parser.add_argument(
+        "--timing",
+        choices=["profiler", "graph", "eager"],
+        nargs="*",
+        default=["profiler"],
+        help="profiler: device time of one call's kernels\n"
+        f"graph: median over HIP-graph replays of {_GRAPH_CALLS} back-to-back calls\n"
+        f"eager: median issue-to-synchronize time of {_EAGER_CALLS} back-to-back calls,\n"
+        '       plus the time to issue them alone as "host us"',
+    )
     args = parser.parse_args()
 
     rows = []
-    for batch, sequence_q, sequence_k, heads, head_dim, dtype in itertools.product(
+    for (
+        batch,
+        sequence_q,
+        sequence_k,
+        heads,
+        head_dim,
+        dtype,
+        kv_splits,
+        timing,
+    ) in itertools.product(
         args.batch,
         args.sequence_q,
         args.sequence_k,
         args.heads,
         args.head_dim,
         args.dtype,
+        args.kv_splits,
+        args.timing,
     ):
         if dtype != dtypes.bf16:
             aiter.logger.warning("MHA v4 dense benchmark skips dtype %s", dtype)
             continue
         rows.append(
-            benchmark_mha_v4(batch, sequence_q, sequence_k, heads, head_dim, dtype)
+            benchmark_mha_v4(
+                batch,
+                sequence_q,
+                sequence_k,
+                heads,
+                head_dim,
+                dtype,
+                kv_splits,
+                timing,
+            )
         )
     if rows:
         frame = pd.DataFrame(rows)
@@ -2400,6 +2977,26 @@ def test_mha_v4_seqlens_k_at_full_length_is_the_dense_result():
     assert torch.equal(dense, full)
 
 
+def _i8fp8_sparse_kv_tile():
+    """The KV tile of the INT8/FP8 sparse row, which a mask for that recipe has to be cut to."""
+    fp8 = native_fp8_format()
+    formats = (AttentionFormat.INT8, AttentionFormat.INT8, fp8)
+    return mha_v4_kv_tile(_recipe_operands(*formats), MHA_V4_SPARSE_MODE)
+
+
+@skipif(get_gfx() != "gfx950", reason="gfx950 per-batch key lengths")
+def test_mha_v4_varlen_gate_follows_the_live_gpu_not_gpu_archs():
+    """GPU_ARCHS can name another build target, but the launcher dispatches on the live GPU."""
+    formats = (AttentionFormat.BF16, AttentionFormat.BF16)
+    with patched_attr(mha_v4_module, "get_gfx", lambda: "gfx942"):
+        assert mha_v4_module._varlen_capable(*formats)
+        torch._dynamo.reset()
+        gate = torch.compile(
+            lambda x: x + mha_v4_module._varlen_capable(*formats), fullgraph=True
+        )
+        assert gate(torch.zeros(1, device="cuda")).item() == 1
+
+
 @skipif(get_gfx() != "gfx950", reason="dense varlen is a gfx950 row")
 def test_mha_v4_rejects_unusable_seqlens_k():
     """Off gfx950 the capability gate preempts these, so the dtype and shape messages
@@ -2425,7 +3022,9 @@ def test_mha_v4_rejects_unusable_seqlens_k():
             AttentionFormat.INT8,
             native_fp8_format(),
             block_mask=torch.ones(
-                (2, 4, 1, 256 // mha_v4_kv_tile()), device="cuda", dtype=torch.bool
+                (2, 4, 1, 256 // _i8fp8_sparse_kv_tile()),
+                device="cuda",
+                dtype=torch.bool,
             ),
             seqlens_k=torch.ones(2, device="cuda", dtype=torch.int32),
         )
@@ -2539,12 +3138,12 @@ def test_mha_v4_varlen_capable_rows_load_the_seqlens_k_kernarg(arch):
 
 
 def check_lse_capable_objects(arch="gfx950"):
-    """Every dense row _LSE_CAPABLE_QV claims must really read the LSE kernarg.
+    """Every row whose manifest declares `lse` must really read the LSE kernarg.
 
-    Same hole as the varlen gate: the key is (q_format, v_format) alone, so a pair that gains a
-    second object inherits the claim. O never reads LSE, so every output test still passes while
-    the returned LSE is whatever the buffer held. Matched on the kernarg load rather than a bare
-    literal, and calibrated against a pre-LSE object, which reads neither 0x40 nor 0x100.
+    The launcher honours return_lse on the column alone, so a row that declares it without being
+    rebuilt passes every output test -- O never reads LSE -- while the returned LSE is whatever
+    the buffer held. Matched on the kernarg load rather than a bare literal, and calibrated
+    against a pre-LSE object, which reads neither 0x40 nor 0x100.
     """
     asm_dir = os.environ.get(
         "AITER_ASM_DIR", os.path.join(mha_v4_module.AITER_ROOT_DIR, "hsa")
@@ -2557,19 +3156,10 @@ def check_lse_capable_objects(arch="gfx950"):
             if line.strip() and not line.startswith("#")
         ]
     header, rows = rows[0], rows[1:]
-    q_at, v_at = header.index("q_format"), header.index("v_format")
-    mode_at, co_at = header.index("mode"), header.index("co_name")
+    lse_at, co_at = header.index("lse"), header.index("co_name")
 
-    claimed = sorted(
-        {
-            row[co_at]
-            for row in rows
-            if row[mode_at] == "0"
-            and (AttentionFormat(int(row[q_at])), AttentionFormat(int(row[v_at])))
-            in mha_v4_module._LSE_CAPABLE_QV
-        }
-    )
-    assert claimed, f"no dense {arch} rows are claimed LSE-capable"
+    claimed = sorted({row[co_at] for row in rows if row[lse_at] == "1"})
+    assert claimed, f"no {arch} rows declare lse"
 
     silent = []
     for name in claimed:
@@ -2585,7 +3175,7 @@ def check_lse_capable_objects(arch="gfx950"):
         ):
             silent.append(name)
     assert not silent, (
-        f"{arch} rows claimed in _LSE_CAPABLE_QV never load the LSE kernarg: {silent}; "
+        f"{arch} rows declaring lse never load the LSE kernarg: {silent}; "
         "they would return whatever the LSE buffer already held"
     )
     aiter.logger.info(
