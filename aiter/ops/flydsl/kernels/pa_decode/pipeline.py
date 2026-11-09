@@ -20,7 +20,7 @@ from .op_gemm import Gfx1250Gemm, PaDecodeGemm
 from .op_lds import Gfx1250Memory, PaDecodeKVLoader, PaDecodeLds, PaDecodeQueryLoader
 from .op_merge import Gfx1250PartitionMerge
 from .op_softmax import PaDecodeSoftmax
-from .traits import KV_COMPUTE_BLOCK, LOG2E, MFMA_MNK
+from .traits import KV_COMPUTE_BLOCK, LOG2E, MFMA_MNK, MXFP4_P_EXP_SHIFT, WAVE
 
 
 class PaDecodePipeline:
@@ -32,7 +32,7 @@ class PaDecodePipeline:
         self.query = PaDecodeQueryLoader(ctx, self.lds, self.gemm)
         self.kv = PaDecodeKVLoader(ctx, self.lds)
         self.softmax = PaDecodeSoftmax(ctx, self.lds, self.kv, self.gemm)
-        self.epilogue = PaDecodeEpilogue(ctx)
+        self.epilogue = PaDecodeEpilogue(ctx, self.lds)
 
     @flyc.jit
     def run(self):
@@ -53,15 +53,21 @@ class PaDecodePipeline:
             self.kv.stage_page_ids()
             gpu.barrier()
         k_pf0 = self.kv.prefetch_first()
+        if const_expr(self.traits.MXFP4):
+            v_page_pf0 = self.kv.mxfp4_prefetch("v")
         self.ctx.init_scales(self.kv.key_scale, self.kv.value_scale)
         self.query.stage(q_units_prefetched)
         gpu.barrier()
-        v_page_pf0 = self.kv.read_v_pages()
+        if const_expr(not self.traits.MXFP4):
+            v_page_pf0 = self.kv.read_v_pages()
         q_ops_all = self.query.load_operands()
         self.softmax.init_mask()
         self.ctx.init_causal_offsets()
         o_final = self.mainloop(k_pf0, v_page_pf0, q_ops_all)
-        self.epilogue.store(o_final)
+        if const_expr(self.traits.MXFP4):
+            self.epilogue.store_mxfp4(o_final)
+        else:
+            self.epilogue.store(o_final)
 
     @flyc.jit
     def mainloop(self, k_pf0, v_page_pf0, q_ops_all):
@@ -183,6 +189,11 @@ class PaDecodePipeline:
                 q_scale_vec,
                 q_ops_all,
                 mask_tail,
+            )
+        if const_expr(self.traits.MXFP4):
+            # Masks tail scores/V by tile_valid at runtime, so it ignores mask_tail.
+            return self.single_query_tile_mxfp4(
+                ostate, k_cur, tt1, tile_valid, q_ops_all
             )
         return self.single_query_tile(
             ostate,
@@ -651,6 +662,94 @@ class PaDecodePipeline:
             next_state.extend([*o_acc[m], m_new[m], l_new[m]])
         return next_state
 
+    @flyc.jit
+    def single_query_tile_mxfp4(
+        self,
+        ostate,
+        k_cur,
+        tt1,
+        tile_valid,
+        q_ops_all,
+    ):
+        """MXFP4 tile: one wave, its own 64 tokens, all 128 dims: QK, online softmax,
+        PV with P in registers (no barrier). Next-tile K/V loads are issued early;
+        the four waves merge once after the loop."""
+        t = self.traits
+        o_acc = [ostate[t.o_slot(0, vh)] for vh in range_constexpr(t.VHE_CHUNKS)]
+        m_prev = ostate[t.m_slot(0)]
+        l_prev = ostate[t.l_slot(0)]
+        v_raw = ostate[t.V_SLOT]
+        # Unconditional: a branch around the loads makes the compiler's vmcnt counts
+        # assume they were skipped and drain them at issue. The last tile re-reads itself.
+        base = self.kv.mxfp4_base(
+            self.kv.mxfp4_pages(fx.min(tt1, self.ctx.part_end - 1))
+        )
+        k_scales = [
+            self.kv.mxfp4_e8m0_byte(k_cur[a * 5]) for a in range_constexpr(t.NCHUNK)
+        ]
+        # q_scale = 2**e * mantissa: 2**e is Q's e8m0 MFMA scale, the mantissa is applied
+        # after, so the accumulator holds the logit, not the e4m3-normalized (up to 448x) one.
+        q_bits = self.lds.load(
+            self.lds.row_offset(t.sQscale_off, self.ctx.lane16, 1, fx.Float32),
+            fx.Int32,
+            1,
+        )[0]
+        q_mantissa = fx.Vector.from_elements(
+            [(q_bits & fx.Int32(0x7FFFFF)) | fx.Int32(0x3F800000)], dtype=fx.Int32
+        ).bitcast(fx.Float32)[0]
+        frag_Ss = self.gemm.qk_mxfp4(k_cur, k_scales, q_ops_all[0], q_bits >> 23)
+        k_next = self.kv.mxfp4_load("k", base)
+        # Widen V while the softmax runs.
+        for a in range_constexpr(t.NCHUNK):
+            self.kv.mxfp4_stage_v_bf16(v_raw, a, tile_valid)
+        scale_b = fx.full(4, self.ctx.scale_qk * q_mantissa, fx.Float32)
+        scores = [frag_Ss[a] * scale_b for a in range_constexpr(t.NCHUNK)]
+        if tile_valid < t.TILE_TOK:  # only a sequence's last tile has masked tokens
+            thr, _ = self.softmax.row_thresholds(tile_valid, None, 0)
+            neg4 = fx.full(4, float("-inf"), fx.Float32)
+            scores = [
+                self.softmax.score_mask(a, thr, None).select(scores[a], neg4)
+                for a in range_constexpr(t.NCHUNK)
+            ]
+        nnan = self.ctx.fm_nnan
+        m_tile = scores[0].reduce(ReductionOp.MAX, fastmath=nnan)
+        for a in range_constexpr(1, t.NCHUNK):
+            m_tile = fx.maxnumf(
+                m_tile, scores[a].reduce(ReductionOp.MAX, fastmath=nnan), fastmath=nnan
+            )
+        for sh in (16, 32):
+            m_tile = fx.maxnumf(m_tile, m_tile.shuffle_xor(sh, WAVE), fastmath=nnan)
+        m_new = fx.maxnumf(m_prev, m_tile, fastmath=nnan)
+        # Relative to 0 while nothing is valid yet: no -inf - -inf.
+        safe = fx.Float32((m_new > self.ctx.NEG_INF).select(m_new, self.ctx.ZERO_F))
+        safe_b = fx.full(4, safe, fx.Float32)
+        alpha = fx.Float32(fx.exp2(m_prev - safe, fastmath="fast"))
+        probs = [
+            fx.Vector(fx.exp2(scores[a] - safe_b, fastmath="fast"))
+            for a in range_constexpr(t.NCHUNK)
+        ]
+        l_new = l_prev * alpha
+        for a in range_constexpr(t.NCHUNK):
+            l_new = l_new + probs[a].reduce(ReductionOp.ADD)  # this lane's tokens
+        # S^T[token 4g+v][head] is already the PV B operand layout. P is scaled by
+        # 2**-MXFP4_P_EXP_SHIFT (l_new is not); ``store_mxfp4`` restores it.
+        p_shift = fx.full(4, 2.0**-MXFP4_P_EXP_SHIFT, fx.Float32)
+        p_ops = [
+            (probs[a] * p_shift).to(fx.BFloat16).bitcast(fx.Int64)[0]
+            for a in range_constexpr(t.NCHUNK)
+        ]
+        # V loads follow K's by part of a tile so the bursts do not queue together.
+        v_next = self.kv.mxfp4_load("v", base)
+        alpha_b = fx.full(t.OP_ELEMS, alpha, fx.Float32)
+        o_acc = [o_acc[vh] * alpha_b for vh in range_constexpr(t.VHE_CHUNKS)]
+        for a in range_constexpr(t.NCHUNK):
+            v_ops = self.kv.mxfp4_read_staged_v_bf16(a)
+            for vh in range_constexpr(t.VHE_CHUNKS):
+                o_acc[vh] = fx.Vector(
+                    self.gemm.mfma([v_ops[vh]], [p_ops[a]], 0, 0, 1, o_acc[vh])
+                )
+        return [k_next, v_next, *o_acc, m_new, l_new]
+
 
 class Gfx1250Bf16Pipeline:
     """Four waves share packed BF16 pages and retain Q/PV operands."""
@@ -907,6 +1006,9 @@ class Gfx1250Bf16WavePipeline:
         self.ctx, self.t = ctx, ctx.traits
         self.mem = Gfx1250Memory(ctx)
         self.merge = Gfx1250PartitionMerge(ctx, self.mem)
+        # Bytes between eight-element chunks: K's eight dims span a page's
+        # 128 tokens, V's eight tokens span the head. Both are 2048 at D128.
+        self.k_chunk, self.v_chunk = 128 * 16, self.t.head_dim * 16
 
     @flyc.jit
     def _stage_next(self, token_base, begin, end, buffer):
@@ -923,15 +1025,15 @@ class Gfx1250Bf16WavePipeline:
         else:
             tdm_ops.tensor_wait(0)
 
-    def _operand(self, base, offset):
+    def _operand(self, base, offset, chunk_bytes):
         # Half-wave h holds eight-element chunks h and h + 2 of a 32-wide
-        # contraction slice; packed K and transposed V both space chunks
-        # 2048 bytes apart.
+        # contraction slice. Packed K spaces chunks a 128-token page apart
+        # (2048 bytes); transposed V spaces them a head row apart (16 D bytes).
         words = []
         for j in range_constexpr(2):
             pointer = fx.recast_iter(
                 fx.PointerType.get(fx.Int32.ir_type, fx.AddressSpace.Shared, 16),
-                fx.add_offset(self.mem.base, base + offset + 4096 * j),
+                fx.add_offset(self.mem.base, base + offset + 2 * chunk_bytes * j),
             )
             fragment = fx.Vector(
                 fx.ptr_load(pointer, result_type=fx.Vector.make_type(4, fx.Int32))
@@ -960,7 +1062,7 @@ class Gfx1250Bf16WavePipeline:
         ]
         for i in range_constexpr(4):
             for d in range_constexpr(t.head_dim // 32):
-                k = self._operand(kbase, 8192 * d + 256 * i)
+                k = self._operand(kbase, 4 * self.k_chunk * d + 256 * i, self.k_chunk)
                 for m in range_constexpr(2):
                     tiles[m][i] = Gfx1250Gemm.mma(
                         k, q_operands[m][d], tiles[m][i], 32, True
@@ -1043,7 +1145,11 @@ class Gfx1250Bf16WavePipeline:
             )
         for d in range_constexpr(t.head_dim // 16):
             for s in range_constexpr(2):
-                v = self._operand(vbase, t.k_bytes + 8192 * s + 256 * d)
+                v = self._operand(
+                    vbase,
+                    t.k_bytes + 4 * self.v_chunk * s + 256 * d,
+                    self.v_chunk,
+                )
                 for m in range_constexpr(2):
                     outs[m][d] = Gfx1250Gemm.mma(
                         v, p_operands[m][s], outs[m][d], 32, True
@@ -1112,9 +1218,10 @@ class Gfx1250Bf16WavePipeline:
             begin
             + fx.max(fx.min((unmasked_end - begin) // 128, pages), fx.Int32(0)) * 128
         )
-        lanes = t.q_bytes + ctx.half * 2048 + ctx.lane16 * 16
-        kbase = lanes + part * 64 * 16
-        vbase = lanes + part * 8 * 2048
+        k_lanes = t.q_bytes + ctx.half * self.k_chunk + ctx.lane16 * 16
+        v_lanes = t.q_bytes + ctx.half * self.v_chunk + ctx.lane16 * 16
+        kbase = k_lanes + part * 64 * 16
+        vbase = v_lanes + part * 8 * self.v_chunk
         bases = ((kbase, kbase + t.kv_stride), (vbase, vbase + t.kv_stride))
         initial = []
         for _ in range_constexpr(2):
@@ -1269,6 +1376,8 @@ class Gfx1250WavePipeline:
 
     def __init__(self, ctx):
         self.ctx, self.t = ctx, ctx.traits
+        # One K128 WMMA spans each query tile's QK contraction.
+        assert self.t.head_dim == 128, "the FP8 wave pipeline requires D128"
         self.mem = Gfx1250Memory(ctx)
         self.merge = Gfx1250PartitionMerge(ctx, self.mem)
 
