@@ -27,14 +27,14 @@ FRAGMENT_LOAD_BITS = 128
 STORE_VEC_BITS = 128
 
 
-def _workspace_pointer(pointer, element_offset, element_bytes):
+def _global_pointer(pointer, element_offset, element_bytes):
     address = fx.Int64(fx.ptrtoint(pointer)) + fx.Int64(element_offset) * element_bytes
     return mlir_llvm.IntToPtrOp(
         mlir_llvm.PointerType.get(address_space=1), address.ir_value()
     ).result
 
 
-def _workspace_scope():
+def _agent_scope():
     return mlir_llvm.MetadataAsValueOp(
         ir.Attribute.parse('#llvm.md_node<#llvm.md_string<"agent">>')
     ).result
@@ -46,7 +46,7 @@ def _store_partial_available(pointer, offset, values):
     mlir_llvm.call_intrinsic(
         None,
         "llvm.amdgcn.av.store.b128",
-        [_workspace_pointer(pointer, offset, 2), packed, _workspace_scope()],
+        [_global_pointer(pointer, offset, 2), packed, _agent_scope()],
         [],
         [],
     )
@@ -57,22 +57,47 @@ def _load_partial_visible(pointer, offset, dtype):
     packed = mlir_llvm.call_intrinsic(
         T.vec(4, T.i32),
         "llvm.amdgcn.av.load.b128",
-        [_workspace_pointer(pointer, offset, 2), _workspace_scope()],
+        [_global_pointer(pointer, offset, 2), _agent_scope()],
         [],
         [],
     )
     return fx.Vector(mlir_llvm.BitcastOp(T.vec(8, dtype.ir_type), packed).res)
 
 
-def _order_partial_accesses(ordering):
+def _order_av_accesses(ordering):
     # AV stores/loads supply availability/visibility at the accessed locations.
     # Keep release/acquire ordering around the cluster execution barrier without
-    # cache-wide make-available/make-visible operations. Do not use this fence
-    # with ordinary unscoped memory accesses or the packed-atomic C path.
+    # cache-wide make-available/make-visible operations. Agent-scope atomics
+    # supply the same access-local guarantees. Never pair this fence with
+    # ordinary unscoped memory accesses.
     fence = mlir_llvm.FenceOp(ordering, syncscope="agent")
     fence.operation.attributes["llvm.mmra"] = ir.Attribute.parse(
         '#llvm.mmra_tag<"amdgcn-av":"none">'
     )
+
+
+def _zero_output_available(pointer, width):
+    """Publish aligned BF16 pairs without writing beyond the guarded N edge."""
+    addr = fx.to_llvm_ptr(pointer)
+    if const_expr(width == 8):
+        mlir_llvm.call_intrinsic(
+            None,
+            "llvm.amdgcn.av.store.b128",
+            [addr, fx.full(4, 0, fx.Int32).ir_value(), _agent_scope()],
+            [],
+            [],
+        )
+    else:
+        # Supported FlyDSL LLVM builds provide b128 AV operations, but not
+        # necessarily b32. An agent-scope atomic store also supplies
+        # store-available semantics; exactly one aligned BF16 pair is zeroed.
+        mlir_llvm.StoreOp(
+            fx.Int32(0).ir_value(),
+            addr,
+            alignment=4,
+            ordering=mlir_llvm.AtomicOrdering.monotonic,
+            syncscope="agent",
+        )
 
 
 def _validate_interleaved_tile(
@@ -528,21 +553,20 @@ def build_gemm_gfx1250(
                         + col
                     )
                     if row_start + block_m <= m and col_start + block_n <= n:
-                        fx.make_view(
-                            destination, fx.make_layout(out_vec_elems, 1)
-                        ).store(fx.full(out_vec_elems, 0.0, out_dtype))
+                        _zero_output_available(destination, out_vec_elems)
                     else:
                         for pair in range_constexpr(out_vec_elems // 2):
                             if (
                                 row_start + row < m
                                 and col_start + col + pair * 2 + 1 < n
                             ):
-                                fx.make_view(
-                                    destination + pair * 2, fx.make_layout(2, 1)
-                                ).store(fx.full(2, 0.0, out_dtype))
-            llvm.memory_fence(syncscope="agent", ordering=fx.AtomicOrdering.Release)
+                                _zero_output_available(destination + pair * 2, 2)
+            # Rank 0 publishes C before any split updates it. Every update
+            # below is an agent-scope atomic RMW (load-visible/store-available).
+            rocdl.s_wait_storecnt(0)
+            _order_av_accesses(mlir_llvm.AtomicOrdering.release)
             cluster_barrier()
-            llvm.memory_fence(syncscope="agent", ordering=fx.AtomicOrdering.Acquire)
+            _order_av_accesses(mlir_llvm.AtomicOrdering.acquire)
         if const_expr(interleave):
             fragment_words = frag_elems * elem_bits // 32
             quadrant_steps = half_m_steps * half_n_steps
@@ -936,17 +960,6 @@ def build_gemm_gfx1250(
 
         tile_elems = block_m * block_n
         if const_expr(split_k_atomic):
-            output_view = fx.make_view(
-                out, fx.make_layout((m, n), (c_leading_stride, 1))
-            )
-            # Each pair is explicitly M/N-masked below; the host bounds the
-            # complete strided byte footprint to the buffer offset range.
-            output_buffer = rocdl.make_buffer_tensor(output_view)
-            atomic_atom = fx.make_copy_atom(
-                rocdl.BufferAtomicPkAdd(out_dtype), out_dtype
-            )
-            pair_layout = fx.make_layout(2, 1)
-            pair_fragment = fx.make_rmem_tensor(pair_layout, out_dtype)
             for i in range_constexpr(tile_elems // (threads * out_vec_elems)):
                 offset = (i * threads + tid) * out_vec_elems
                 row, col = (offset // block_n, offset % block_n)
@@ -957,21 +970,33 @@ def build_gemm_gfx1250(
                 for pair in range_constexpr(out_vec_elems // 2):
                     pair_col = col_start + col + pair * 2
                     if row_start + row < m and pair_col + 1 < n:
-                        pair_fragment.store(
-                            fx.Vector.from_elements(
-                                [values[pair * 2], values[pair * 2 + 1]], out_dtype
-                            )
+                        pair_value = fx.Vector.from_elements(
+                            [values[pair * 2], values[pair * 2 + 1]], out_dtype
                         )
-                        destination = fx.make_view(
-                            fx.get_iter(output_buffer)
-                            + (row_start + row) * c_leading_stride
-                            + pair_col,
-                            pair_layout,
+                        destination = (
+                            out
+                            + fx.Int64(row_start + row) * c_leading_stride
+                            + pair_col
                         )
-                        fx.copy(atomic_atom, pair_fragment, destination)
-            llvm.memory_fence(syncscope="agent", ordering=fx.AtomicOrdering.Release)
+                        # LLVM models the packed BF16 pair as a single scoped
+                        # atomic, preserving per-update BF16 rounding.
+                        mlir_llvm.AtomicRMWOp(
+                            mlir_llvm.AtomicBinOp.fadd,
+                            fx.to_llvm_ptr(destination),
+                            pair_value.ir_value(),
+                            mlir_llvm.AtomicOrdering.monotonic,
+                            syncscope="agent",
+                            alignment=4,
+                        )
+            # Await completion of the scoped atomic updates. Their own accesses
+            # publish C; no cache-wide writeback of unrelated memory is needed.
+            rocdl.s_wait_storecnt(0)
+            rocdl.s_wait_loadcnt(0)
+            _order_av_accesses(mlir_llvm.AtomicOrdering.release)
             if const_expr(has_bias):
+                pair_layout = fx.make_layout(2, 1)
                 cluster_barrier()
+                # Bias reads remain ordinary loads, so retain their full acquire.
                 llvm.memory_fence(syncscope="agent", ordering=fx.AtomicOrdering.Acquire)
                 if k_rank == 0:
                     for i in range_constexpr(tile_elems // (threads * out_vec_elems)):
@@ -1072,9 +1097,9 @@ def build_gemm_gfx1250(
             # workgroup+cluster barrier. Every reducer lane then uses AV loads.
             # Keep the cluster barrier; only remove redundant cache maintenance.
             rocdl.s_wait_storecnt(0)
-            _order_partial_accesses(mlir_llvm.AtomicOrdering.release)
+            _order_av_accesses(mlir_llvm.AtomicOrdering.release)
             cluster_barrier()
-            _order_partial_accesses(mlir_llvm.AtomicOrdering.acquire)
+            _order_av_accesses(mlir_llvm.AtomicOrdering.acquire)
             if k_rank == 0:
                 for i in range_constexpr(tile_elems // (threads * out_vec_elems)):
                     offset = (i * threads + tid) * out_vec_elems

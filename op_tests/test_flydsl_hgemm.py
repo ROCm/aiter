@@ -1235,10 +1235,12 @@ def check_tdm_workspace_reuse(dtype):
 
     dtype_id = GEMM_DTYPE_BF16 if dtype == dtypes.bf16 else GEMM_DTYPE_FP16
     elem = fx.BFloat16 if dtype == dtypes.bf16 else fx.Float16
-    # Covers partial M/N tiles and both layout/schedule choices. Atomic uses
-    # the original independent protocol and is covered by test_hgemm_tdm.
-    for split_k, (layout, interleave) in itertools.product(
-        (3, 8, 9), (("nt", False), ("nt", True), ("nn", False))
+    # Cover partial M/N tiles and both layout/schedule choices with fixed
+    # workspace buffers and, for BF16, repeatedly reinitialized atomic output.
+    for split_k, (layout, interleave), atomic in itertools.product(
+        (3, 8, 9),
+        (("nt", False), ("nt", True), ("nn", False)),
+        (False, True) if dtype == dtypes.bf16 else (False,),
     ):
         m, n, k = 137, 144, 128 * split_k
         bm, bn, bk, stages = 64, 64, 64, 2
@@ -1258,7 +1260,7 @@ def check_tdm_workspace_reuse(dtype):
             32,
             split_k,
             interleave,
-            False,
+            atomic,
             device_id=torch.cuda.current_device(),
         )
         slots = ((m + bm - 1) // bm) * ((n + bn - 1) // bn) * split_k * bm * bn
@@ -1342,7 +1344,8 @@ def check_tdm_workspace_reuse(dtype):
                 for buf, ref in zip(buffers, expected):
                     a, b, out, workspace, bias, ag, bg, og, storage = buf
                     torch.testing.assert_close(out, ref, atol=0, rtol=0)
-                    assert torch.isfinite(workspace).all()
+                    if not atomic:
+                        assert torch.isfinite(workspace).all()
                     _assert_guards(ag, k)
                     _assert_guards(bg, k if layout == "nt" else n)
                     _assert_guards(og, n)
