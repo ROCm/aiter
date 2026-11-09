@@ -25,7 +25,9 @@ Tensor layout (see reduce.cu / mla.py):
 """
 
 import argparse
+import itertools
 import math
+import re
 
 import pandas as pd
 import torch
@@ -237,9 +239,53 @@ def build_reduce_problem(
     }
 
 
-def run_case(
-    splits_per_tile, num_heads, head_dim, out_dtype, qo_len=1, vectorized_ref=False
-):
+# head_dim -> default head-count sweep; the full compiled (heads, head_dim) matrix is
+# csrc/include/mla_reduce_cases.h.
+HEADS_FOR_DIM = {
+    # Kimi K3 TP2 uses the 48-head, 128-dimension reducer.
+    # Kimi K3 PP8 uses the 96-head, 128-dimension reducer.
+    # Kimi K3 TP8 (96 query heads / 8 ranks) MLA prefill uses the 12-head,
+    # 128-dimension reducer (nh12_hd128).
+    128: [1, 12, 16, 48, 96, 128],
+    512: [8, 16, 24, 128],
+}
+
+_SPLIT_ITEM = re.compile(r"^(?:(\d+)x)?(\d+)$")
+
+
+def parse_splits(splits):
+    """Expand a split-config spelling into per-tile split counts.
+
+    `splits` is a comma-separated list of per-tile split counts; an item `RxS`
+    stands for R tiles of S splits each. "8,5,7" -> [8, 5, 7],
+    "40x6" -> [6] * 40, "2,3x8" -> [2, 8, 8, 8]. Every count must be >= 1.
+    """
+    splits_per_tile = []
+    for item in str(splits).split(","):
+        m = _SPLIT_ITEM.match(item.strip())
+        if m is None:
+            raise argparse.ArgumentTypeError(
+                f"bad split config {splits!r}: item {item!r} is not S or RxS"
+            )
+        repeat = int(m.group(1)) if m.group(1) is not None else 1
+        count = int(m.group(2))
+        if repeat < 1 or count < 1:
+            raise argparse.ArgumentTypeError(
+                f"bad split config {splits!r}: tile and split counts must be >= 1"
+            )
+        splits_per_tile += [count] * repeat
+    return splits_per_tile
+
+
+def split_config_arg(splits):
+    """argparse type for -s/--splits: validate, keep the spelling as given."""
+    parse_splits(splits)
+    return splits.replace(" ", "")
+
+
+def run_case(splits, num_heads, head_dim, out_dtype, qo_len=1, vectorized_ref=False):
+    # `splits` is a split-config spelling (see parse_splits), e.g. "8,5,7" or "40x6".
+    splits_per_tile = parse_splits(splits)
     p = build_reduce_problem(
         splits_per_tile, num_heads, head_dim, out_dtype, qo_len=qo_len
     )
@@ -287,8 +333,13 @@ def run_case(
         gpu_lse,
     )
 
+    # Long uniform configs print as "40x[6]"; anything else prints in full.
+    if len(splits_per_tile) > 4 and len(set(splits_per_tile)) == 1:
+        label = f"{len(splits_per_tile)}x[{splits_per_tile[0]}]"
+    else:
+        label = str(splits_per_tile)
     tag = (
-        f"splits={splits_per_tile if len(splits_per_tile) <= 4 else f'{len(splits_per_tile)}x[{splits_per_tile[0]}]'}"
+        f"splits={label}"
         f" h={num_heads} dv={head_dim} {str(out_dtype).split('.')[-1]}"
     )
 
@@ -333,11 +384,7 @@ def run_case(
     bytes_total = read_bytes + write_bytes
 
     ret = {
-        "splits": (
-            str(splits_per_tile)
-            if len(splits_per_tile) <= 4
-            else f"{len(splits_per_tile)}x[{splits_per_tile[0]}]"
-        ),
+        "splits": label,
         "nhead": num_heads,
         "dv": head_dim,
         "dtype": str(out_dtype).split(".")[-1],
@@ -449,7 +496,10 @@ LAYOUT_CASES = [
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Test mla_reduce_v1 kernel")
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="Test mla_reduce_v1 kernel",
+    )
     parser.add_argument(
         "-d",
         "--dtype",
@@ -464,39 +514,54 @@ def main():
         default=[128, 512],
         help="comma-separated head dims, e.g. 128 or 128,512 (default: 128,512)",
     )
+    parser.add_argument(
+        "-n",
+        "--heads",
+        type=int,
+        nargs="*",
+        default=None,
+        help="head counts swept for every --head_dim; each (heads, head_dim) pair\n"
+        "must be compiled (csrc/include/mla_reduce_cases.h) or the kernel errors.\n"
+        "Default: 128 -> 1 12 16 48 96 128, 512 -> 8 16 24 128.",
+    )
+    # Cover both kernel paths:
+    #   num_splits in [2,3]  -> simple impl
+    #   num_splits >= 4      -> massive impl (<=wave_size / <=4*wave_size buckets)
+    parser.add_argument(
+        "-s",
+        "--splits",
+        type=split_config_arg,
+        nargs="*",
+        default=[
+            "2",  # simple, single tile
+            "3,2",  # simple, multi tile
+            "4",  # massive, exactly threshold
+            "8,5,7",  # massive, ragged tiles
+            "33",  # massive, single large tile
+            "300",  # massive, exercises the >4*wave_size LDS-spill bucket
+            "2,4,16,64",  # mixed: simple + massive tiles
+            "40x6",  # many tiles -> exercises persistent-grid path
+        ],
+        help="split configs swept for every (dtype, head_dim, heads); one reduce\n"
+        "problem per config. A config is a comma-separated list of per-tile split\n"
+        "counts, one tile each; RxS is R tiles of S splits.\n"
+        "e.g. -s 300 8,5,7 40x6 2,3x8\n"
+        "Default: 2 3,2 4 8,5,7 33 300 2,4,16,64 40x6\n"
+        "-s/-n drive the single-row sweep; the multi-row and layout cases are fixed.",
+    )
     args = parser.parse_args()
 
     out_dtypes = [dtypes.bf16 if d == "bf16" else dtypes.fp16 for d in args.dtype]
     head_dims = args.head_dim
+    for head_dim in head_dims:
+        if not args.heads and head_dim not in HEADS_FOR_DIM:
+            parser.error(f"no default heads for --head_dim {head_dim}; pass --heads")
+    if not args.splits:
+        parser.error("--splits needs at least one config")
 
     # The kernel sizes its LDS scratch to max(CU_count, num_kv_splits), and the
     # test passes num_kv_splits = max(per-tile splits), so any split count is
     # safe regardless of device CU count.
-
-    # (head_dim -> supported head counts from MLA_REDUCE_ROUTER in reduce.cu)
-    heads_for_dim = {
-        # Kimi K3 TP2 uses the 48-head, 128-dimension reducer.
-        # Kimi K3 PP8 uses the 96-head, 128-dimension reducer.
-        # Kimi K3 TP8 (96 query heads / 8 ranks) MLA prefill uses the 12-head,
-        # 128-dimension reducer (nh12_hd128).
-        128: [1, 12, 16, 48, 96, 128],
-        512: [8, 16, 24, 128],
-    }
-
-    # Cover both kernel paths:
-    #   num_splits in [2,3]  -> simple impl
-    #   num_splits >= 4      -> massive impl (<=wave_size / <=4*wave_size buckets)
-    split_configs = [
-        [2],  # simple, single tile
-        [3, 2],  # simple, multi tile
-        [4],  # massive, exactly threshold
-        [8, 5, 7],  # massive, ragged tiles
-        [33],  # massive, single large tile
-        [300],  # massive, exercises the >4*wave_size LDS-spill bucket
-        [2, 4, 16, 64],  # mixed: simple + massive tiles
-    ] + [
-        [6] * 40
-    ]  # many tiles -> exercises persistent-grid path
 
     # multi-row tiles (qo_len > 1), decode/prefill-style:
     # (num_heads, splits, qo_len, vectorized_ref). A workgroup covers
@@ -504,30 +569,30 @@ def main():
     # switches to the persistent-grid kernel (4096 on a 256-CU gfx950).
     multi_row_cases = {
         128: [
-            (12, [3, 8], 3, False),  # 12 heads: simple + massive tiles
-            (16, [8, 4], 3, False),
+            (12, "3,8", 3, False),  # 12 heads: simple + massive tiles
+            (16, "8,4", 3, False),
             # 64 tiles x 64 rows: 4 workgroups per head/tile on 256 CUs, so each
             # massive-path workgroup reduces 16 rows back to back.
-            (12, [4] * 64, 64, True),
+            (12, "64x4", 64, True),
             # 12 x 512 = 6144 workgroups: the persistent-grid kernel on 256 and
             # 304 CUs, with 2 rows per work item.
-            (12, [4] * 512, 2, True),
+            (12, "512x4", 2, True),
         ],
-        512: [(16, [8, 4], 3, False)],
+        512: [(16, "8,4", 3, False)],
     }
 
     all_ok = True
     df = []
     for out_dtype in out_dtypes:
         for head_dim in head_dims:
-            for num_heads in heads_for_dim[head_dim]:
-                for splits in split_configs:
-                    ok, ret = run_case(splits, num_heads, head_dim, out_dtype)
-                    all_ok &= ok
-                    df.append(ret)
+            heads = args.heads or HEADS_FOR_DIM[head_dim]
+            for num_heads, splits in itertools.product(heads, args.splits):
+                ok, ret = run_case(splits, num_heads, head_dim, out_dtype)
+                all_ok &= ok
+                df.append(ret)
 
         for head_dim in head_dims:
-            for num_heads, splits, qo_len, vec_ref in multi_row_cases[head_dim]:
+            for num_heads, splits, qo_len, vec_ref in multi_row_cases.get(head_dim, []):
                 ok, ret = run_case(
                     splits,
                     num_heads,
