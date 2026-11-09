@@ -43,6 +43,30 @@ _TILT_B_HEADROOM = 400.0 / 448.0
 _TILT_SCALE_ROW_TILE = 128
 
 
+def _backed_scale_copy(scale: torch.Tensor) -> torch.Tensor:
+    """A contiguous copy of a pooled E8M0 K scale, backed by zeroed rows past its end.
+
+    clone() would copy only the view and drop those rows, which the kernel still reads: the Sol
+    rows take the scale _TILT_SCALE_ROW_TILE rows at a time, and the MXFP4 K reader also runs the
+    producer's lookahead rows and slack past them. The backing covers both.
+    """
+    from aiter.ops.mha_v4_quant import (
+        MHA_V4_KV_SCALE_LOOKAHEAD_ROWS,
+        MHA_V4_MXFP4_K_SCALE_SLACK_BYTES,
+        block_scale_storage,
+    )
+
+    copy = block_scale_storage(
+        scale,
+        *scale.shape,
+        _TILT_SCALE_ROW_TILE,
+        lookahead_rows=MHA_V4_KV_SCALE_LOOKAHEAD_ROWS,
+        extra=MHA_V4_MXFP4_K_SCALE_SLACK_BYTES,
+    )
+    copy.copy_(scale)
+    return copy
+
+
 def _check_unit_stride(name: str, x: torch.Tensor) -> None:
     if x.stride(-1) != 1:
         raise ValueError(f"{name} needs a unit-stride head dim")
@@ -220,7 +244,7 @@ def sol_jensen_cap(
 
     if block_scaled:
         per_nat = 0.5 * (softmax_scale / q_multiplier) ** 2
-        var, var_scale = mean_k_var, mean_k_var_scale.clone()
+        var, var_scale = mean_k_var, _backed_scale_copy(mean_k_var_scale)
     else:
         per_nat = (
             0.5
@@ -239,7 +263,7 @@ def sol_jensen_cap(
             gain,
             q_descale if q_descale is not None else gain,
             k_descale if k_descale is not None else gain,
-            mean_k_var_scale if block_scaled else gain,
+            scale_io,
             scale_io,
             per_nat,
             math.log(kv_tile),
