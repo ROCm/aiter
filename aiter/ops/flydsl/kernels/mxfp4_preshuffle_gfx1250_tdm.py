@@ -174,13 +174,20 @@ def launch_gemm_a8w4_tdm(
     shared_b: Constexpr[int] = 0,
     arg_shared_b: fx.Pointer = None,
     arg_shared_scale_b: fx.Tensor = None,
+    shared_mode: Constexpr[int] = 2,
+    shared_rows: fx.Int32 = 0,
 ):
     """Launch the grouped contiguous-M a8w4 MoE GEMM for gfx1250.
 
     ``shared_b`` (FHMoE): the last expert is a shared expert whose B is fp8
-    (MXFP8) at ``arg_shared_b``, row-major [N, K], with its e8m0 scales in the
-    routed B-scale layout at ``arg_shared_scale_b``. Its tiles run an fp8-B
-    specialization of the tile body; every other tile runs the routed body.
+    (MXFP8) at ``arg_shared_b``, in the routed weight preshuffle, with its e8m0
+    scales in the routed B-scale layout at ``arg_shared_scale_b``. Its tiles run
+    an fp8-B specialization of the tile body; every other tile runs the routed
+    body. ``shared_mode`` sets how a shared tile runs: 0 at full tile_n; 1 as
+    two tile_n / 2 passes in one workgroup; 2 as two tile_n / 2 workgroups, the
+    second in extra blocks ahead of the routed grid (``shared_rows``: the
+    shared expert's rows, which sizes them). Modes 1 and 2 keep the B stage and
+    the B registers of a routed tile.
 
     ``cluster_m`` and ``cluster_n`` explicitly select the physical workgroup
     cluster. Peers along N share A, while expert-compatible peers along M can
@@ -253,6 +260,28 @@ def launch_gemm_a8w4_tdm(
     # Keep the experiment switch as an override while normal dispatch obtains
     # both cluster dimensions from the tuned configuration.
     cluster_m = 1 if FORCE_1X4_CLUSTER else cluster_m
+    # FHMoE: a shared tile covers tile_n / SH_SPLIT columns a pass. The half
+    # tile must keep 32-column wave slices, whole TDM owner splits and whole MX
+    # output blocks.
+    TILE_N = tile_n
+    _sh_half = tile_n // 2
+    _sh_half_ok = (
+        _sh_half % (32 * n_warp) == 0
+        and (_sh_half // 32) % max(2, num_waves_per_tensor_tdm) == 0
+        and (
+            not (stage1_quant_out and stage1_act) or (_sh_half // n_warp // 16) % 4 == 0
+        )
+    )
+    SH_SPLIT = (
+        2
+        if (
+            shared_b
+            and _sh_half_ok
+            and (shared_mode == 1 or (shared_mode == 2 and cluster_m == 1))
+        )
+        else 1
+    )
+    SH_GRID = int(SH_SPLIT == 2 and shared_mode == 2 and cluster_m == 1)
     cache_tag = (
         K,
         tile_m,
@@ -295,6 +324,8 @@ def launch_gemm_a8w4_tdm(
         persistent_workers,
         rolled_drain,
         shared_b,
+        SH_SPLIT,
+        SH_GRID,
     )
     _ = cache_tag
     if enable_ep_scatter:
@@ -349,10 +380,14 @@ def launch_gemm_a8w4_tdm(
     B_LDS_ROW = PACK_TK * 16
     STAGE_A = ceildiv(tile_m * A_LDS_ROW, 16) * 16
     STAGE_B = ceildiv((tile_n // 16) * B_LDS_ROW, 16) * 16
-    # FHMoE: the shared expert's fp8 B tile sits row-major in LDS, as A does
-    # (tile_k bytes a row plus a pad). A stage then holds the larger B layout.
-    B_ROW_SH = tile_k + LDS_PAD_A
-    STAGE_B = max(STAGE_B, ceildiv(tile_n * B_ROW_SH, 16) * 16) if shared_b else STAGE_B
+    # FHMoE: the shared expert's fp8 B has the routed preshuffle, 16-row groups
+    # of tile_k bytes a row. At SH_SPLIT 2 its B stage is the routed one.
+    B_LDS_ROW_SH = tile_k * 16
+    STAGE_B = (
+        max(STAGE_B, ceildiv((tile_n // SH_SPLIT // 16) * B_LDS_ROW_SH, 16) * 16)
+        if shared_b
+        else STAGE_B
+    )
 
     SC_INNER = tile_k // 4
     SB_SUPERS = tile_n // 32
@@ -465,7 +500,11 @@ def launch_gemm_a8w4_tdm(
     _epq = f"_epq{ep_quant_bits}" if ep_quant_bits else ""
     _persistent = f"_pw{persistent_workers}" if persistent_workers else ""
     _drain = "_rolleddrain" if rolled_drain else ""
-    _shared = "_shfp8" if shared_b else ""
+    _shared = (
+        "_shfp8" + ("" if SH_SPLIT == 1 else ("_ngrid" if SH_GRID else "_n2pass"))
+        if shared_b
+        else ""
+    )
     _kname = (
         f"a8w4_tdm_{_afp}"
         f"_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}"
@@ -528,6 +567,27 @@ def launch_gemm_a8w4_tdm(
         assert TILES_PER_GROUP % cluster_m == 0
         total_n_tiles = ceildiv(i32_n, tile_n)
         total_m_tiles = ceildiv(schedule_rows if persistent_workers else i32_m, tile_m)
+        # FHMoE, SH_GRID: the first blocks run the second N halves of the shared
+        # expert's tiles. The routed grid follows, and a shared tile in it runs
+        # the first N half. Both halves then start in the first workgroup wave.
+        sh_half = fx.Int32(0)
+        if const_expr(SH_GRID):
+            sh_map = fx.recast_iter(
+                fx.PointerType.get(
+                    elem_ty=fx.Int32.ir_type,
+                    address_space=fx.AddressSpace.Global,
+                    alignment=4,
+                ),
+                arg_m_tile_map,
+            )
+            sh_first = (sh_map[n_experts - 2] + tile_m - 1) // tile_m
+            sh_end = (sh_map[n_experts - 1] + tile_m - 1) // tile_m
+            sh_tiles = sh_end - sh_first
+            sh_blocks = fx.Int32(fx.grid_dim.x) - total_m_tiles * total_n_tiles
+            sh_bid = fx.Int32(bid_x)
+            in_extra = sh_bid < sh_blocks
+            sh_half = in_extra.select(fx.Int32(1), fx.Int32(0))
+            bid_x = in_extra.select(fx.Int32(0), sh_bid - sh_blocks)
         swz_id = bid_x // cluster_n if cluster_n > 1 else bid_x
         local_n = bid_x - swz_id * cluster_n if cluster_n > 1 else 0
         n_units = total_n_tiles // cluster_n if cluster_n > 1 else total_n_tiles
@@ -549,6 +609,15 @@ def launch_gemm_a8w4_tdm(
             if cluster_n > 1
             else n_unit * tile_n
         )
+        if const_expr(SH_GRID):
+            # Rotate the valid M tiles so the shared expert's come first.
+            m_rot = (m_tile < sh_tiles).select(
+                sh_first + m_tile,
+                (m_tile < sh_end).select(m_tile - sh_tiles, m_tile),
+            )
+            m_tile = in_extra.select(sh_first + sh_bid // total_n_tiles, m_rot)
+            blk_m = m_tile * tile_m
+            blk_n = in_extra.select((sh_bid % total_n_tiles) * tile_n, blk_n)
         # A always follows the existing 1x4 direction: one M row broadcasts
         # across the four N columns, even when the physical cluster is 4x4.
         a_mcast_mask = (
@@ -592,8 +661,20 @@ def launch_gemm_a8w4_tdm(
         )
         base_ptr = _smem.allocate(ARENA_B)._ptr
 
-        def _tile_body(SHB):
-            """One tile. SHB: the FHMoE shared expert's fp8-B specialization."""
+        blk_n_tile, blk_n64_tile = blk_n, blk_n64
+
+        def _tile_body(SHB, half=0):
+            """One tile. SHB: the FHMoE shared expert's fp8-B specialization; at
+            SH_SPLIT 2 it covers N half ``half`` of the tile."""
+            tile_n = TILE_N // SH_SPLIT if SHB else TILE_N
+            warp_tile_n = tile_n // n_warp
+            wmma_n_rep = warp_tile_n // WMMA_N
+            n_acc = wmma_m_rep * wmma_n_rep
+            output_n_rep = warp_tile_n // 16
+            SB_SUPERS = tile_n // 32
+            split = SHB and SH_SPLIT > 1
+            blk_n = blk_n_tile + half * tile_n if split else blk_n_tile
+            blk_n64 = fx.Int64(blk_n) if split else blk_n64_tile
             eb64 = fx.Int64(expert)
             B_BATCH_ROWS = n64 // 16
             N_SUPERS = ceildiv(n64, 32)
@@ -722,8 +803,8 @@ def launch_gemm_a8w4_tdm(
                 _ep_lsa1 = fx.Int64(ep_win.lsa_ptr(fx.Int32(1), 0))
             b_outer_row = eb64 * B_BATCH_ROWS + blk_n64 // 16
             a_off0 = blk_m64 * A_GROW
-            # FHMoE shared expert: one fp8 B, row-major, K bytes a row.
-            b_off0 = blk_n64 * K if SHB else b_outer_row * Kp16
+            # FHMoE shared expert: one fp8 B, 16-row groups of K * 16 bytes.
+            b_off0 = (blk_n64 // 16) * (K * 16) if SHB else b_outer_row * Kp16
             sb_off0 = (blk_n64 // 32) * SB_OUTER_STRIDE + (0 if SHB else sb_batch_off)
             assert num_waves_per_tensor_tdm in (
                 1,
@@ -869,17 +950,16 @@ def launch_gemm_a8w4_tdm(
             add_tdm_loads(
                 gB_base,
                 b_off0,
-                K if SHB else Kp16,
+                K * 16 if SHB else Kp16,
                 None,
-                tile_k if SHB else PACK_TK * 16,
-                tile_n if SHB else tile_n // 16,
+                B_LDS_ROW_SH if SHB else PACK_TK * 16,
+                tile_n // 16,
                 on_i32=False,
                 lds_off=B_LDS_OFF,
                 lds_stage=B_LDS_STAGE,
-                lds_row=B_ROW_SH if SHB else B_LDS_ROW,
-                k_adv=tile_k if SHB else PACK_TK * 16,
+                lds_row=B_LDS_ROW_SH if SHB else B_LDS_ROW,
+                k_adv=B_LDS_ROW_SH if SHB else PACK_TK * 16,
                 wv=waves[1],
-                pad=(tile_k, LDS_PAD_A) if SHB else None,
                 wg_mask=b_mcast_mask,
                 cache_modifier=tdm_b_th,
             )
@@ -1041,9 +1121,9 @@ def launch_gemm_a8w4_tdm(
             # can pin, and a compile-time part that folds into ds_load's offset:.
             lds_a_lane_off = (wmb + lane16) * A_LDS_ROW + kgrp * 16
             lds_b_lane_off = (
-                (wnb + lane16) * B_ROW_SH + kgrp * 16
-                if SHB
-                else (wnb // 16) * B_LDS_ROW + kgrp * 256 + lane16 * 16
+                (wnb // 16) * (B_LDS_ROW_SH if SHB else B_LDS_ROW)
+                + kgrp * 256
+                + lane16 * 16
             )
             assert wmma_m_rep == 1 or wmma_m_rep % 2 == 0
             sa_lane = lane16 if wmma_m_rep == 1 else lane
@@ -1108,10 +1188,11 @@ def launch_gemm_a8w4_tdm(
 
             def load_b(base, wn, ksl):
                 if const_expr(SHB):
-                    # fp8 B rows load as fp8 A rows do: four b128 a lane, 16 dwords.
-                    off = wn * 16 * B_ROW_SH + ksl * WMMA_K
+                    # fp8 B: a k128 step is eight 16-byte chunks of 16 rows; a
+                    # lane takes chunks kgrp + 2j, j < 4 -- 16 dwords.
+                    off = wn * B_LDS_ROW_SH + ksl * 2048
                     v = [
-                        Vec(lds_load_b128(base, fx.Int32(off + 32 * j)))
+                        Vec(lds_load_b128(base, fx.Int32(off + 512 * j)))
                         for j in range_constexpr(4)
                     ]
                     return (
@@ -2384,7 +2465,14 @@ def launch_gemm_a8w4_tdm(
         # expert only the routed body exists, so the kernel is the plain one.
         if const_expr(shared_b):
             if expert == n_experts - 1:
-                _tile_body(True)
+                if const_expr(SH_GRID):
+                    _tile_body(True, sh_half)
+                else:
+                    for h in range_constexpr(SH_SPLIT):
+                        if const_expr(h > 0):
+                            # The next pass's loads reuse the stored C's LDS.
+                            workgroup_barrier()
+                        _tile_body(True, h)
             else:
                 _tile_body(False)
         else:
@@ -2475,11 +2563,12 @@ def launch_gemm_a8w4_tdm(
         arg_shared_b if shared_b else arg_b,
         fx.get_iter(arg_shared_scale_b if shared_b else arg_scale_b),
     )
+    sh_blocks = ceildiv(shared_rows, tile_m) * n_tiles if SH_GRID else 0
     grid = (
         (
             persistent_workers
             if persistent_workers
-            else ((m_tiles + cluster_m - 1) // cluster_m) * n_tiles
+            else ((m_tiles + cluster_m - 1) // cluster_m) * n_tiles + sh_blocks
         ),
         cluster_m,
         1,

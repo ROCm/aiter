@@ -1160,8 +1160,8 @@ def _grouped_a8w4_tdm_moe(
         if _is_fp4:
             raise ValueError("an fp8 shared expert needs fp8 activations (a8w4)")
         sw1, sw2, sw1s, sw2s = shared
-        sh1 = {"shared_w": sw1, "shared_w_scales": sw1s}
-        sh2 = {"shared_w": sw2, "shared_w_scales": sw2s}
+        sh1 = {"shared_w": sw1, "shared_w_scales": sw1s, "shared_rows": token_num}
+        sh2 = {"shared_w": sw2, "shared_w_scales": sw2s, "shared_rows": token_num}
         persistent_workers = persistent_workers2 = 0
 
     if _fuse_quant:
@@ -1526,12 +1526,13 @@ def fhmoe_shared_weights(
 
     The shared expert is expert ``E - 1``: a dummy row of the routed weights,
     which the grouped GEMMs never read. Each token routes to it, with the shared
-    expert gate as its top-k weight. Its weights are fp8 e4m3, row-major:
-    ``shared_w1`` [1, 2*I, D] with gate / up rows interleaved as the routed w1
-    (``interleave_gate_up_rows``), ``shared_w2`` [1, D, I]. The scales are e8m0
-    per 32 along K in the routed scale layout:
-    ``moe_shuffle_scale(raw, experts_cnt=1, is_guinterleave=True)`` for w1 and
-    ``moe_shuffle_scale(raw, experts_cnt=1)`` for w2.
+    expert gate as its top-k weight. Its weights are fp8 e4m3 in the routed
+    weight layout: ``shared_w1`` [1, 2*I, D] is
+    ``moe_shuffle_weight(raw, experts_cnt=1, is_guinterleave=True, gate_up=True)``
+    and ``shared_w2`` [1, D, I] is ``moe_shuffle_weight(raw, experts_cnt=1)``.
+    The scales are e8m0 per 32 along K in the routed scale layout:
+    ``moe_shuffle_scale(raw, experts_cnt=1, is_guinterleave=True, gate_up=True)``
+    for w1 and ``moe_shuffle_scale(raw, experts_cnt=1)`` for w2.
 
     Returns (w1 bytes [2*I, D], w2 bytes [D, I], w1 scales, w2 scales).
     """
