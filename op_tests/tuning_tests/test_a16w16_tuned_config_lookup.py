@@ -285,6 +285,124 @@ class TestTdmPolicyContract(unittest.TestCase):
             self.assertTrue(all(not c["split_k_atomic"] for c in odd))
 
 
+class TestTdmSearchPruning(unittest.TestCase):
+    @staticmethod
+    def _config(**updates):
+        c = {
+            "block_m": 32,
+            "block_n": 32,
+            "block_k": 128,
+            "stages": 2,
+            "split_k": 1,
+            "m_waves": 1,
+            "n_waves": 1,
+            "k_waves": 1,
+            "group_m": 0,
+            "interleave": False,
+            "split_k_atomic": False,
+        }
+        c.update(updates)
+        return c
+
+    @staticmethod
+    def _pruner(m=256, n=256, k=4096, cu=256, layout="nt"):
+        from types import SimpleNamespace
+
+        from aiter.ops.flydsl.gemm_a16w16_policy import GemmConfigPruner
+
+        props = SimpleNamespace(
+            multi_processor_count=cu,
+            warp_size=32,
+            max_threads_per_multi_processor=2048,
+        )
+        return GemmConfigPruner(
+            m, n, k, props, 2, tdm=True, b_k_contiguous=layout == "nt"
+        )
+
+    def test_wave_split_stage_envelope_and_reduction_pairs(self):
+        import itertools
+
+        from aiter.ops.flydsl.gemm_a16w16_policy import _prune_gfx1250_tdm_configs
+
+        configs = [
+            self._config(
+                stages=st,
+                split_k=sk,
+                m_waves=mw,
+                n_waves=nw,
+                interleave=interleave,
+                split_k_atomic=atomic,
+            )
+            for st, sk, (mw, nw), interleave in itertools.product(
+                range(2, 10),
+                (1, 2, 3, 4, 6, 9),
+                ((1, 1), (1, 2), (2, 2), (2, 4), (4, 4)),
+                (False, True),
+            )
+            for atomic in ((False,) if sk == 1 else (False, True))
+        ]
+        snapshots = [dict(c) for c in configs]
+        pruner = self._pruner()
+        kept = _prune_gfx1250_tdm_configs(configs, pruner)
+        self.assertTrue(kept)
+        self.assertLess(len(kept), len(configs) // 2)
+        self.assertEqual(configs, snapshots, "pruning must not mutate configs")
+        # Single-wave layouts survive every split's wave envelope.
+        single_wave = [c for c in kept if c["m_waves"] * c["n_waves"] == 1]
+        self.assertEqual({c["split_k"] for c in single_wave}, {1, 6, 9})
+        self.assertEqual({c["stages"] for c in single_wave}, {2, 3, 8, 9})
+        self.assertEqual({c["interleave"] for c in kept}, {False, True})
+        self.assertIn(1, {c["m_waves"] * c["n_waves"] for c in kept})
+        self.assertIn(4, {c["m_waves"] * c["n_waves"] for c in kept})
+        paired = {}
+        for c in kept:
+            key = tuple(sorted((k, v) for k, v in c.items() if k != "split_k_atomic"))
+            paired.setdefault(key, set()).add(c["split_k_atomic"])
+        for key, flags in paired.items():
+            self.assertEqual(
+                flags, {False} if dict(key)["split_k"] == 1 else {False, True}
+            )
+
+    def test_fractional_tail_savings_and_nonempty_fallback(self):
+        from aiter.ops.flydsl.gemm_a16w16_policy import _prune_gfx1250_tdm_configs
+
+        fractional = self._config(block_m=48)
+        regular = self._config(block_m=64)
+        configs = [fractional, regular]
+        self.assertEqual(
+            _prune_gfx1250_tdm_configs(configs, self._pruner(m=96)), configs
+        )
+        self.assertEqual(
+            _prune_gfx1250_tdm_configs(configs, self._pruner(m=128)), [regular]
+        )
+        self.assertEqual(
+            _prune_gfx1250_tdm_configs([fractional], self._pruner(m=128)), [fractional]
+        )
+        self.assertEqual(_prune_gfx1250_tdm_configs([], self._pruner()), [])
+
+    def test_order_independent_membership_and_input_order(self):
+        import itertools
+
+        from aiter.ops.flydsl.gemm_a16w16_policy import _prune_gfx1250_tdm_configs
+
+        configs = [
+            self._config(stages=st, split_k=sk, m_waves=mw, n_waves=nw)
+            for st, sk, mw, nw in itertools.product(
+                range(2, 10), (1, 2, 3, 4, 6, 9), (1, 2, 4), (1, 2, 4)
+            )
+        ]
+        for cu in (128, 256):
+            for layout in ("nt", "nn"):
+                with self.subTest(cu=cu, layout=layout):
+                    pruner = self._pruner(cu=cu, layout=layout)
+                    kept = _prune_gfx1250_tdm_configs(configs, pruner)
+                    reversed_kept = _prune_gfx1250_tdm_configs(
+                        list(reversed(configs)), pruner
+                    )
+                    self.assertEqual(kept, list(reversed(reversed_kept)))
+                    self.assertTrue(all(not c["split_k_atomic"] for c in kept))
+
+
 class TestGfx950FlydslMemoryCandidates(unittest.TestCase):
     """Keep wide decode panels and the existing skinny backend in the catalog."""
 

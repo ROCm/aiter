@@ -4,6 +4,7 @@
 """Shape-aware policy selection for the FlyDSL A16W16 GEMM."""
 
 import itertools
+from collections import defaultdict
 from dataclasses import dataclass
 
 import torch
@@ -218,6 +219,91 @@ def _gfx1250_configs(m: int, n: int, k: int):
     return GemmConfigPruner(m, n, k, device_props, 2).prune(configs)
 
 
+def _prune_gfx1250_tdm_configs(configs, pruner):
+    """Keep a shape/resource envelope of the *legal* new TDM candidates.
+
+    This is a tuning heuristic, not a kernel validity restriction. Existing
+    tuned names remain executable, and the legacy ft/ht catalog is untouched.
+    No timings, model names, shape lookup table or first-N candidate cap enter
+    selection. Keep input order so equivalent inputs produce stable catalogs.
+    """
+    if not configs:
+        return configs
+
+    def groups(candidates, ignored):
+        result = defaultdict(list)
+        for config in candidates:
+            key = tuple(sorted((k, v) for k, v in config.items() if k not in ignored))
+            result[key].append(config)
+        return result.values()
+
+    def select(candidates, selected):
+        return [config for config in candidates if id(config) in selected]
+
+    # Fractional tiles are useful at tails. Keep them when they save >=1/8 of
+    # padded rows/columns over rounding the tile up to a power of two. Otherwise
+    # the power-of-two family supplies the regular tiling representatives.
+    def useful_tile(size, dim):
+        if size & (size - 1) == 0:
+            return True
+        rounded = 1 << (size - 1).bit_length()
+        padded = pruner._ceil_div(dim, size) * size
+        regular = pruner._ceil_div(dim, rounded) * rounded
+        return 8 * padded <= 7 * regular
+
+    kept = [
+        c
+        for c in configs
+        if useful_tile(c["block_m"], pruner.m) and useful_tile(c["block_n"], pruner.n)
+    ]
+    # Very small/irregular domains may have only fractional legal tiles after
+    # the earlier IOU filter. Never turn a nonempty catalog into no candidates.
+    if not kept:
+        kept = list(configs)
+
+    selected = set()
+    for group in groups(kept, {"m_waves", "n_waves", "split_k_atomic"}):
+        by_waves = defaultdict(list)
+        for c in group:
+            by_waves[c["m_waves"] * c["n_waves"]].append(c)
+        low, high = min(by_waves), max(by_waves)
+        occupancy = {
+            waves: max(pruner._occupancy(c) for c in candidates)
+            for waves, candidates in by_waves.items()
+        }
+        peak = max(occupancy.values())
+        saturated = min(
+            waves for waves, value in occupancy.items() if value >= peak - 1e-9
+        )
+        # Occupancy alone over-favors waves on tiny GEMMs. Preserve the low
+        # launch/LDS traffic end, its neighbor, a 4-wave middle point, and the
+        # smallest wave count reaching peak estimated residency/grid coverage.
+        wave_counts = {low, min(2 * low, high), 4, saturated}
+        selected.update(
+            id(c) for c in group if c["m_waves"] * c["n_waves"] in wave_counts
+        )
+    kept = select(kept, selected)
+
+    selected = set()
+    for group in groups(kept, {"split_k", "split_k_atomic"}):
+        splits = sorted({c["split_k"] for c in group})
+        # Split1 avoids reduction entirely. Two largest legal partitions retain
+        # underfilled-grid alternatives, including non-power-of-two split-K.
+        # Grouping by tile/stages means K-tail and prologue legality stay intact.
+        split_counts = {1, *splits[-2:]}
+        selected.update(id(c) for c in group if c["split_k"] in split_counts)
+    kept = select(kept, selected)
+
+    selected = set()
+    for group in groups(kept, {"stages", "split_k_atomic"}):
+        depths = sorted({c["stages"] for c in group})
+        # Preserve both occupancy-friendly shallow and latency-hiding deep
+        # schedules. Do not hard-code a stage ceiling from one model's K.
+        stage_counts = set(depths[:2] + depths[-2:])
+        selected.update(id(c) for c in group if c["stages"] in stage_counts)
+    return select(kept, selected)
+
+
 def _gfx1250_tdm_configs(m, n, k, dtype, layout="nt"):
     from .kernels.gemm_a16w16_tdm_gfx1250 import (
         GEMM_DTYPE_BF16,
@@ -315,6 +401,7 @@ def _gfx1250_tdm_configs(m, n, k, dtype, layout="nt"):
         except ValueError:
             # Invalid tile/partition combinations are expected during enumeration.
             continue
+    valid_configs = _prune_gfx1250_tdm_configs(valid_configs, pruner)
     for config in valid_configs:
         config.pop("mma_m")
         config.pop("mma_n")
