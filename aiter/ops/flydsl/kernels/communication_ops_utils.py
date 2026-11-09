@@ -36,6 +36,7 @@ __all__ = [
     "atomic_add_agent_one_as",
     "atomic_add_global_at",
     "atomic_add_lds",
+    "atomic_or_global_at",
     "atomic_add_system",
     "atomic_add_workgroup",
     "buffer_load_i32",
@@ -88,6 +89,7 @@ _TAGGED_POLL_MAX = 12
 CACHE_DEVICE = 16
 CACHE_SYSTEM = 17
 DIAG_TICKS = 10 * 100_000_000
+TIMEOUT_BIT = -2147483648
 
 
 def buffer_resource(address):
@@ -219,11 +221,10 @@ class TaggedMailbox:
                     missing = missing | (seen < self.expected_epoch).select(
                         1 << rank, 0
                     )
-                bo.buffer_store(
-                    missing,
-                    buffer_resource(self.diagnostic),
-                    2,
-                    cache_modifier=CACHE_DEVICE,
+                atomic_or_global_at(
+                    self.diagnostic + 8,
+                    missing | fx.Int32(TIMEOUT_BIT),
+                    syncscope=fx.rocdl.SyncScope.Agent,
                 )
 
             values = _spin_tagged_bounded(load_all, pending, on_timeout)
@@ -614,6 +615,12 @@ def atomic_add_global_at(addr_i64, val, syncscope="one-as"):
     )
     ptr = _to_ptr_global(addr_i64, dtype, dtype.width // 8)
     return fx.atomic_add(ptr, dtype(val), syncscope=syncscope)
+
+
+def atomic_or_global_at(addr_i64, val, syncscope="one-as"):
+    """Monotonic global fetch-or with configurable agent/system visibility."""
+    ptr = _to_ptr_global(addr_i64, fx.Int32, 4)
+    return fx.atomic_or(ptr, fx.Int32(val), syncscope=syncscope)
 
 
 def atomic_add_agent(addr_i64, val):

@@ -48,9 +48,9 @@ from aiter.ops.flydsl.kernels.communication_ops_utils import (
 from aiter.ops.flydsl.kernels.kernels_common import LOG2E
 
 MAX_THREADS = 1024
-TAG_SLOTS = 256
 NEG_INF = float("-inf")
 POS_INF = float("inf")
+RANK_MASK = (1 << 31) - 1
 _STREAM = fx.Stream(None)
 _BUILDS: dict = {}
 
@@ -67,6 +67,7 @@ class CombineBuild:
     ret_lse: bool
     debug: bool
     token_tile: int
+    row_mask: bool
 
 
 def _token_tile(tokens):
@@ -108,6 +109,7 @@ ABI = KernelAbi(
         "res_lse",
         "seq_lens",
         "qsl",
+        "row_counts",
         "peers",
         "rank",
         "state",
@@ -199,11 +201,11 @@ def _poll_combine(
 
 @flyc.jit
 def _push_epoch(bid, tid, e, targets):
-    """Debug builds only: CTA 0 lane ``p`` publishes epoch ``e`` to peer ``p``."""
+    """Debug builds publish ``e + 1``, so zero always means never arrived."""
     for dest in range_constexpr(len(targets)):
         if (bid == 0) & (tid == dest):
             bo.buffer_store(
-                e,
+                e + 1,
                 buffer_resource(targets[dest]),
                 0,
                 cache_modifier=CACHE_SYSTEM,
@@ -245,7 +247,7 @@ def build(key: CombineBuild):
     name = (
         f"aiter_dcp_lse_combine_t{key.tokens}_n{n}_h{hl}_d{d}_m{mt}"
         f"_s{key.seqs}_e{int(key.base_e)}_l{int(key.ret_lse)}"
-        f"_g{int(key.debug)}_bt{tile}"
+        f"_g{int(key.debug)}_r{int(key.row_mask)}_bt{tile}"
     )
 
     @flyc.kernel(name=name, known_block_size=[threads, 1, 1])
@@ -262,6 +264,7 @@ def build(key: CombineBuild):
         res_lse: Int64,
         seq_lens: Int64,
         qsl: Int64,
+        row_counts: Int64,
         peers: Int64,
         rank: Int32,
         state: Int64,
@@ -286,10 +289,10 @@ def build(key: CombineBuild):
         if const_expr(key.debug):
             _push_epoch(bid, tid, e, epoch_targets)
         mb = TaggedMailbox(
-            (e % (1 << 22)) * TAG_SLOTS,
+            e % (1 << 30),
             debug=key.debug,
             epoch_addresses=epoch_sources,
-            expected_epoch=e,
+            expected_epoch=e + 1,
             diagnostic=state,
         )
         put, put_words, poll = mb.put, mb.put_words, mb.poll
@@ -334,6 +337,10 @@ def build(key: CombineBuild):
                     empty = _row_empty(b, key.seqs, seq_lens, qsl)
                     for dest in range_constexpr(n):
                         lv[dest] = empty.select(fx.Float32(NEG_INF), lv[dest])
+                if const_expr(key.row_mask):
+                    empty = buffer_load_i32(row_counts, b) == 0
+                    for dest in range_constexpr(n):
+                        lv[dest] = empty.select(fx.Float32(NEG_INF), lv[dest])
                 for dest in range_constexpr(n):
                     if tid == dest:
                         put(lsep[dest], slot, lv[dest])
@@ -375,6 +382,7 @@ def _jit(key, combine, nblk, threads, keyed):
         res_lse: Int64,
         seq_lens: Int64,
         qsl: Int64,
+        row_counts: Int64,
         peers: Int64,
         rank: Int32,
         state: Int64,
@@ -394,6 +402,7 @@ def _jit(key, combine, nblk, threads, keyed):
             res_lse,
             seq_lens,
             qsl,
+            row_counts,
             peers,
             rank,
             state,
@@ -407,8 +416,10 @@ def _jit(key, combine, nblk, threads, keyed):
 class CombineWorkspace:
     """Peer buffer and epoch for one (heads per rank, dim).
 
-    ``state`` is [epoch, CTAs done, missing-rank mask]. Every rank launches in
-    the same order. ``debug=True`` enables a bounded diagnostic poll.
+    Every rank must issue the identical call sequence, including warmup and
+    capture. One extra call can silently misalign every later result.
+
+    ``debug=True`` enables bounded eager diagnostics and cannot be graph-captured.
     """
 
     def __init__(self, group, device, heads, dim, max_tokens, debug=False):
@@ -417,6 +428,8 @@ class CombineWorkspace:
         self.group = group.cpu_group
         self.device = device
         self.debug = bool(debug)
+        if self.debug and self.ranks > 31:
+            raise ValueError("debug diagnostics support at most 31 ranks")
         self.heads = heads
         self.dim = dim
         self.max_tokens = max_tokens
@@ -451,14 +464,19 @@ def dcp_lse_combine(
     base_e: bool = True,
     seq_lens: torch.Tensor | None = None,
     query_start_loc: torch.Tensor | None = None,
+    row_counts: torch.Tensor | None = None,
     res: torch.Tensor | None = None,
 ):
     """Combine ``out`` [tokens, ranks * heads, dim] bf16 and ``lse`` [tokens, ranks * heads].
 
     Returns this rank's heads [tokens, heads, dim]. With ``return_lse``, also
     returns the combined LSE [tokens, heads]. ``base_e`` selects natural-log LSE.
-    ``seq_lens`` and ``query_start_loc`` mask empty local KV rows. ``dim`` must
-    be a multiple of 4 with ``4 * ranks <= dim <= 4 * MAX_THREADS``.
+    ``seq_lens`` with ``query_start_loc`` masks empty requests. ``row_counts``
+    masks rows with no locally owned keys. ``dim`` must be a multiple of 4 with
+    ``4 * ranks <= dim <= 4 * MAX_THREADS``.
+
+    Every rank must issue the identical call sequence. One extra call can
+    silently misalign every later result.
     """
     tokens, heads, dim = out.shape[0], ws.heads, ws.dim
     assert out.shape[1] == ws.ranks * heads and out.shape[2] == dim
@@ -471,10 +489,15 @@ def dcp_lse_combine(
         )
     if (seq_lens is None) != (query_start_loc is None):
         raise ValueError("seq_lens and query_start_loc must be provided together")
+    if row_counts is not None and (
+        row_counts.dtype != torch.int32
+        or row_counts.shape != (tokens,)
+        or not row_counts.is_contiguous()
+    ):
+        raise ValueError("row_counts must be contiguous int32 with shape [tokens]")
+    _prepare_debug(ws)
     if res is None:
         res = out.new_empty((tokens, heads, dim))
-    if ws.debug:
-        ws.state[2].zero_()
     res_lse = torch.empty(
         (tokens, heads) if return_lse else (1,), device=out.device, dtype=torch.float32
     )
@@ -490,6 +513,7 @@ def dcp_lse_combine(
         ret_lse=return_lse,
         debug=ws.debug,
         token_tile=_token_tile(tokens),
+        row_mask=row_counts is not None,
     )
     build(key)(
         out.data_ptr(),
@@ -504,16 +528,31 @@ def dcp_lse_combine(
         res_lse.data_ptr(),
         0 if seq_lens is None else seq_lens.data_ptr(),
         0 if query_start_loc is None else query_start_loc.data_ptr(),
+        0 if row_counts is None else row_counts.data_ptr(),
         ws.peers.addresses.data_ptr(),
         ws.rank,
         ws.state.data_ptr(),
         stream=torch.cuda.current_stream(),
     )
-    if ws.debug:
-        torch.cuda.synchronize(out.device)
-        missing = int(ws.state[2].item())
-        if missing:
-            raise RuntimeError(f"DCP mailbox peers missing at epoch: 0x{missing:x}")
+    _check_debug(ws)
     if return_lse:
         return res, res_lse
     return res
+
+
+def _prepare_debug(ws) -> None:
+    if not ws.debug:
+        return
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("DCP mailbox debug diagnostics do not support graph capture")
+    ws.state[2].zero_()
+
+
+def _check_debug(ws) -> None:
+    if not ws.debug:
+        return
+    torch.cuda.synchronize(ws.device)
+    diagnostic = int(ws.state[2].item()) & 0xFFFFFFFF
+    if diagnostic:
+        missing = diagnostic & RANK_MASK
+        raise RuntimeError(f"DCP mailbox timeout: missing ranks=0x{missing:x}")

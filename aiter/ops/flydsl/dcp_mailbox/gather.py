@@ -21,7 +21,12 @@ from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import Int32, Int64, T
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
-from aiter.ops.flydsl.dcp_mailbox.combine import TAG_SLOTS, _finish, _push_epoch
+from aiter.ops.flydsl.dcp_mailbox.combine import (
+    _check_debug,
+    _finish,
+    _prepare_debug,
+    _push_epoch,
+)
 from aiter.ops.flydsl.dcp_mailbox.common import (
     KernelAbi,
     bf2_f32,
@@ -115,8 +120,10 @@ def build(key: GatherBuild):
     if key in _BUILDS:
         return _BUILDS[key]
     n, hl, w, mt = key.ranks, key.heads, key.words, key.max_tokens
-    assert w % 2 == 0 and w <= 2 * THREADS, w
-    assert key.nope % 8 == 0
+    if w % 2 or w > 2 * THREADS:
+        raise ValueError(f"gather words per head must be even and <= 256, got {w}")
+    if key.nope % 8:
+        raise ValueError(f"quantized no-PE dimension must divide 8, got {key.nope}")
     tile = key.token_tile
     nblk = ((key.tokens + tile - 1) // tile) * hl
     lay = peer_layout(n, mt, hl, w)
@@ -162,10 +169,10 @@ def build(key: GatherBuild):
         if const_expr(key.debug):
             _push_epoch(bid, tid, e, epoch_targets)
         mb = TaggedMailbox(
-            (e % (1 << 22)) * TAG_SLOTS,
+            e % (1 << 30),
             debug=key.debug,
             epoch_addresses=epoch_sources,
-            expected_epoch=e,
+            expected_epoch=e + 1,
             diagnostic=state,
         )
         put_words, poll = mb.put_words, mb.poll
@@ -301,8 +308,10 @@ def _jit(key, gather, nblk, keyed):
 class GatherWorkspace:
     """Peer buffer, epoch, and the persistent gathered query.
 
-    ``state`` is [epoch, CTAs done, missing-rank mask]. ``debug=True`` enables
-    a bounded diagnostic poll.
+    Every rank must issue the identical call sequence, including warmup and
+    capture. One extra call can silently misalign every later result.
+
+    ``debug=True`` enables bounded eager diagnostics and cannot be graph-captured.
     """
 
     def __init__(
@@ -313,8 +322,11 @@ class GatherWorkspace:
         self.group = group.cpu_group
         self.device = device
         self.debug = bool(debug)
+        if self.debug and self.ranks > 31:
+            raise ValueError("debug diagnostics support at most 31 ranks")
         self.heads = heads
         self.dim = dim
+        self.dtype = dtype
         self.words = dim * torch.empty((), dtype=dtype).element_size() // 4
         self.pad_heads = pad_heads
         self.max_tokens = max_tokens
@@ -362,8 +374,7 @@ def _launch(ws, key, args):
         )
     if key.fold and (key.qlen <= 0 or key.tokens % key.qlen):
         raise ValueError("folded gather requires qlen > 0 and tokens divisible by qlen")
-    if ws.debug:
-        ws.state[2].zero_()
+    _prepare_debug(ws)
     out = ws.folded_buffer(key.fold) if key.fold else ws.gathered
     build(key)(
         *args,
@@ -375,11 +386,7 @@ def _launch(ws, key, args):
     )
     if key.phase == 1:
         return None
-    if ws.debug:
-        torch.cuda.synchronize(ws.device)
-        missing = int(ws.state[2].item())
-        if missing:
-            raise RuntimeError(f"DCP mailbox peers missing at epoch: 0x{missing:x}")
+    _check_debug(ws)
     if key.fold:
         physical = out[: key.tokens * key.fold].view(
             key.tokens // key.qlen, key.fold, key.qlen, 16, ws.dim
@@ -398,8 +405,16 @@ def dcp_query_gather(
     The plain result is a view of the workspace buffer. A folded result is
     reordered to token-major layout. ``plan`` may set ``fold`` and ``qlen`` for
     the 16-head store layout. ``phase`` is 0 (push and poll), 1 (push), or 2
-    (poll).
+    (poll). BF16 supports head dimensions through 512.
+
+    Every rank must issue the identical call sequence. One extra call can
+    silently misalign every later result.
     """
+    if ws.words > 2 * THREADS:
+        raise ValueError(
+            f"{ws.dtype} query gather supports at most 256 words per head; "
+            f"dim {ws.dim} needs {ws.words}"
+        )
     esz = query.element_size()
     key = GatherBuild(
         tokens=query.shape[0],
@@ -438,6 +453,9 @@ def dcp_quant_query_gather(
 
     The output is fp8 [tokens, ranks * heads, L + P], scaled by the per-tensor
     ``scale``. ``plan`` and ``phase`` match ``dcp_query_gather``.
+
+    Every rank must issue the identical call sequence. One extra call can
+    silently misalign every later result.
     """
     arch = get_gfx_runtime().split(":", 1)[0]
     if arch != "gfx950":
