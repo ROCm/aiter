@@ -1095,10 +1095,16 @@ def flydsl_qsa_paged_gqa_supported(
         return (
             f"page_table must be int32 [n_req, n_pages], got {tuple(page_table.shape)}"
         )
-    # The tile does not depend on the CU count, and this gate runs with no
-    # device. The split count is discarded.
+    # The tile does not depend on the CU count or the arch, and this gate
+    # runs with no device. The split count is discarded. gfx950 is only
+    # the stand-in arch for that discarded count.
     block_n, block_threads, _ = _launch_config(
-        int(q.shape[0]), int(indices.shape[1]), n_kv_heads, head_dim, num_cus=1
+        int(q.shape[0]),
+        int(indices.shape[1]),
+        n_kv_heads,
+        head_dim,
+        1,
+        "gfx950",
     )
     coverage = _paged_gqa_coverage_reason(head_dim, block_n, block_threads)
     if coverage is not None:
@@ -1218,7 +1224,7 @@ def flydsl_qsa_paged_gqa(
     if num_cus is None:
         num_cus = int(get_cu_num())
     block_n, block_threads, n_splits = _launch_config(
-        rows, n_sel, n_kv_heads, head_dim, num_cus
+        rows, n_sel, n_kv_heads, head_dim, num_cus, arch
     )
     if n_splits == 1:
         # The split kernel stores straight into out. A caller workspace

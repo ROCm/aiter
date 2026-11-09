@@ -46,13 +46,19 @@ from aiter.ops.flydsl.kernels.kernels_common import (
 )
 from aiter.ops.flydsl.kernels.tensor_shim import buf_base_i64, buf_copy_atom
 
-# BN32 prefill workgroups per CU. Unlike the decode bands below, this does
-# not move with head_dim: halving D halves the LDS tile, so residency alone
-# predicts eight, but 8 per CU measured slower than 4 at D=128 on every M
-# from 16 to 512. Whatever sets this number, it is not the LDS footprint,
-# and it is the same number at both head widths. The launch multiplies it
-# by the device CU count, so 256 CUs on gfx950 still targets 1024 workgroups.
+# BN32 prefill workgroups per CU on gfx950, and on gfx942 when D <= 128.
+# Halving D halves the LDS tile, so residency alone predicts eight, but 8
+# per CU measured slower than 4 at D=128 on every M from 16 to 512, on
+# gfx950 and again on gfx942. gfx950 keeps 4 at D=256 too. The launch
+# multiplies the count by the device CU count, so 256 CUs on gfx950 still
+# targets 1024 workgroups.
 _PREFILL_WGS_PER_CU = 4
+# gfx942 D=256. A 64 KiB LDS holds three of those tiles, not four. CUDA-event
+# medians on a 304-CU MI300X, budget-saturated width 2051: 3 per CU beat 4
+# at M=64 (58 us vs 71 us) and M=128 (104 us vs 136 us). The 2-split launch
+# 4 selects at M=256 was slower than one split (257 us vs 219 us). D=128 on
+# the same GPU still prefers 4 (M=128, 53 us vs 59 us).
+_PREFILL_WGS_PER_CU_GFX942_WIDE = 3
 # Decode workgroup width. The BN16 LDS maps are expressed per (token, D-chunk)
 # rather than per lane, so this is free to move between 128 and 256. BN16 is a
 # single subtile, so qk_split never engages and every wave recomputes the whole
@@ -78,6 +84,18 @@ _TINY_SPLITS = 128
 _NARROW_HEAD_DIM = 128
 _DECODE_BANDS_NARROW = (4, 16)
 _DECODE_BANDS_WIDE = (2, 12)
+
+
+def _prefill_wgs_per_cu(arch: str, head_dim: int) -> int:
+    """BN32 prefill workgroups per CU for this arch and head width.
+
+    gfx950 is 4 at both widths. gfx942 uses 3 when D > 128 and 4 otherwise.
+    """
+    if arch == "gfx942" and head_dim > _NARROW_HEAD_DIM:
+        return _PREFILL_WGS_PER_CU_GFX942_WIDE
+    return _PREFILL_WGS_PER_CU
+
+
 # Empty running max, masked score, and empty-split LSE. fastmath "fast"
 # includes ninf, so a compare against this value is emitted with fastmath
 # none and the max itself is tagged nnan only. A fully masked row keeps
@@ -106,12 +124,18 @@ def _ds_write2st64_b64(addr, data0, data1, offset0=0, offset1=16):
 
 
 def _launch_config(
-    rows: int, n_sel: int, n_kv_heads: int, head_dim: int, num_cus: int
+    rows: int,
+    n_sel: int,
+    n_kv_heads: int,
+    head_dim: int,
+    num_cus: int,
+    arch: str,
 ) -> tuple[int, int, int]:
     """Return ``(BLOCK_N, threads, splits)`` using the tuned policy.
 
-    ``num_cus`` sizes the prefill split target. The decode ladder does not
-    read it. Callers pass the count; this does not query the device.
+    ``num_cus`` and ``arch`` size the prefill split target. The decode
+    ladder does not read them. Callers pass both; this does not query
+    the device.
     """
     if num_cus < 1:
         raise ValueError(f"num_cus must be positive, got {num_cus}")
@@ -134,13 +158,13 @@ def _launch_config(
     # reason: the grid is unchanged, so the extra residency headroom BN32
     # unlocks goes unused at these shapes.
     #
-    # Split so the grid lands on four workgroups per CU. Past that point
-    # splitting buys no extra parallelism and still pays merge and
-    # address-chase duplication. See ``_PREFILL_WGS_PER_CU``: four is
-    # measured, and it is not the LDS residency limit it was once read as.
+    # Split so the grid lands on the tuned workgroups per CU. Past that
+    # point splitting buys no extra parallelism and still pays merge and
+    # address-chase duplication. See ``_prefill_wgs_per_cu``.
     else:
         block_n, threads = 32, 128
-        target_splits = max(1, (_PREFILL_WGS_PER_CU * num_cus) // base_programs)
+        per_cu = _prefill_wgs_per_cu(arch, head_dim)
+        target_splits = max(1, (per_cu * num_cus) // base_programs)
 
     tiles = max(1, ceildiv(n_sel, block_n))
     max_useful_splits = 1 << (tiles.bit_length() - 1)
