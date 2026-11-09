@@ -838,9 +838,6 @@ class TunerCommon:
     def get_gfx(self):
         return chip_info.get_gfx_runtime()
 
-    def get_gpu_model(self):
-        return chip_info.get_gpu_model(torch.cuda.current_device())
-
     def post_process(self, rets, args, topk=-1, fast_mode=False):
         """post process, post process all results to return topk results"""
         from aiter.utility.tune_result import TuneResult
@@ -1037,7 +1034,6 @@ class TunerCommon:
     def _live_hardware(self):
         return {
             "gfx": self.get_gfx,
-            "gpu_model": self.get_gpu_model,
             "cu_num": self.get_cu_num,
         }
 
@@ -1049,13 +1045,7 @@ class TunerCommon:
             if value is None or str(value).strip() == "":
                 continue
             live = resolve()
-            if field == "gpu_model":
-                same = chip_info.normalize_gpu_model(
-                    value
-                ) == chip_info.normalize_gpu_model(live)
-            else:
-                same = _key_text(value).lower() == _key_text(live).lower()
-            if not same:
+            if _key_text(value).lower() != _key_text(live).lower():
                 return f"row is keyed on {field}={value}, this GPU is {live}"
         return ""
 
@@ -2020,14 +2010,6 @@ class TunerCommon:
                     tunedf = tunedf[tunedf["gfx"].astype(str) == str(gfx)]
                 if "cu_num" in tunedf.columns:
                     tunedf = tunedf[tunedf["cu_num"] == cu]
-                if "gpu_model" in tunedf.columns:
-                    # A blank gpu_model is a row from before the column existed.
-                    models = tunedf["gpu_model"].fillna("").astype(str).str.strip()
-                    live = chip_info.normalize_gpu_model(self.get_gpu_model())
-                    tunedf = tunedf[
-                        (models == "")
-                        | (models.map(chip_info.normalize_gpu_model) == live)
-                    ]
                 self.untunedf = tunedf.drop_duplicates(subset=self.keys).reset_index(
                     drop=True
                 )

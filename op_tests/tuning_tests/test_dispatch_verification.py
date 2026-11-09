@@ -213,9 +213,6 @@ class TestTunerCommonRunConfig(_StubFamily):
             def get_gfx(self):
                 return "gfx950"
 
-            def get_gpu_model(self):
-                return "mi355x"
-
             def get_cu_num(self):
                 return 256
 
@@ -344,16 +341,16 @@ class TestTunerCommonRunConfig(_StubFamily):
     def test_a_row_keyed_on_another_gpu_fails_without_spawning(self):
         tuner = self.make_tuner()
         args = argparse.Namespace(warmup=1, iters=1, timeout=60)
-        row = {"m": 128, "backend": "triton", "gpu_model": "mi300x"}
+        row = {"m": 128, "backend": "triton", "cu_num": 304}
         with mock.patch("aiter.utility.dispatch_verification.verify_dispatch") as spawn:
             verification = tuner.verify_dispatch(row, self.config("triton"), args)
         spawn.assert_not_called()
         self.assertEqual(verification.status, "failed")
-        self.assertIn("gpu_model=mi300x", verification.detail)
+        self.assertIn("cu_num=304", verification.detail)
 
     def test_a_row_keyed_like_this_gpu_matches_despite_csv_formatting(self):
         tuner = self.make_tuner()
-        row = {"gfx": "gfx950", "gpu_model": "AMD Instinct MI355X", "cu_num": 256.0}
+        row = {"gfx": "GFX950", "cu_num": 256.0}
         self.assertEqual(tuner._hardware_mismatch(row), "")
         self.assertIn("cu_num", tuner._hardware_mismatch({**row, "cu_num": 304.0}))
 
