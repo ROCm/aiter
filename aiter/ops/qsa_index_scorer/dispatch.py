@@ -203,7 +203,9 @@ def _api():
 # Call classes
 # ---------------------------------------------------------------------------
 def _tk(t):
-    return None if t is None else (t.shape, t.stride(), t.dtype, t.device)
+    if t is None:
+        return None
+    return t.shape, t.dtype, t.is_contiguous(), t.is_cuda
 
 
 def class_key(
@@ -224,20 +226,22 @@ def class_key(
     visible_groups,
 ):
     """Everything a decision depends on, from tensor metadata only (no tensor reads, no
-    sync): shapes, strides, dtypes, devices, the cache base address (stable for a KV
-    cache; the fused router depends on its alignment), q / scale alignment classes,
-    the scalar arguments and output-buffer layouts. Raises for non-tensor arguments."""
+    sync): shapes, dtypes, contiguity (every implementation's choice depends on
+    contiguity, not on the strides themselves), GPU placement and q's device, the
+    cache base address (stable for a KV cache; the fused router keys on its
+    alignment), q / scale alignment classes, the scalar arguments and output-buffer
+    layouts. Raises for non-tensor arguments."""
     c, s = compressed_k_cache, compressed_k_scale
     return (
         q.shape,
-        q.stride(),
         q.dtype,
+        q.is_contiguous(),
         q.device,
         q.data_ptr() & 15,
         c.shape,
-        c.stride(),
         c.dtype,
-        c.device,
+        c.is_contiguous(),
+        c.is_cuda,
         c.data_ptr(),
         None if s is None else (_tk(s), s.data_ptr() & 3),
         _tk(page_table),
@@ -250,8 +254,8 @@ def class_key(
         compress_ratio,
         score_divisor,
         max_columns,
-        bool(allow_flydsl),
-        bool(stacked_decode),
+        allow_flydsl,
+        stacked_decode,
     )
 
 

@@ -41,10 +41,17 @@ columns      = max(1, min(width * P, max_columns))        (width * P when max_co
 
 `Decision.reason` is `ok` for `fused`, otherwise why the fused path did not take the class
 (`disabled`, `kill_switch`, `profile_unusable`, `fused_launch_error`, or one of the profile reasons
-below). The class key is built from tensor metadata only (shapes, strides, dtypes, devices, the
-cache base address and q / scale alignment, the scalar arguments, output-buffer layouts); the
+below). The class key is built from tensor metadata only (shapes, dtypes, contiguity, GPU
+placement and q's device, the cache base address and q / scale alignment, the scalar arguments,
+output-buffer layouts); the
 cache keeps at most 4096 classes (FIFO). With the fused path off (default), GPU calls go straight
 to the existing dispatch: no class key, no decision cache, no FlyDSL import.
+
+Host cost of the dispatch layer (Windows CPU box, AMD Family 25, Python 3.14.7, torch 2.15 CPU,
+median of 7 × 20000 calls; kernel work not included): fused off, GPU call → route predicate
+0.20 µs before the existing dispatch; decided class (key + lookup) 3.2 µs, against 7.2 µs for one
+`inspect.Signature.bind` of the op (`test_hot_path_cost_below_one_signature_bind` asserts only
+this ratio). Under CUDA-graph replay neither cost exists.
 
 ## Policy (`aiter.ops.qsa`, process-global, idempotent)
 

@@ -555,6 +555,32 @@ class ClassCache(_Base):
             nat.assert_matches(self, (lg, vg), nat.reference(*a[:6], scale=a[11]))
             D._CLASSES.clear()
 
+    def test_hot_path_cost_below_one_signature_bind(self):
+        """Machine-independent ratio (absolute µs printed, never asserted): a decided
+        class costs less host time than one ``inspect.Signature.bind`` of the op."""
+        import time
+
+        a = nat.make_call(rows=64, requests=16, width=16, seed=0)
+        args = (*a, False, None, None)
+        D._entry(Q._existing_native, Q._existing_route, args)
+        sig = inspect.signature(Q.qsa_paged_mqa_logits)
+
+        def best(fn, n=5000):
+            out = []
+            for _ in range(5):
+                t0 = time.perf_counter()
+                for _ in range(n):
+                    fn()
+                out.append((time.perf_counter() - t0) / n)
+            return min(out)
+
+        hit = best(lambda: D._entry(Q._existing_native, Q._existing_route, args))
+        bind = best(lambda: sig.bind(*a))
+        print(
+            f"decided-class lookup {hit * 1e6:.2f} us, Signature.bind {bind * 1e6:.2f} us"
+        )
+        self.assertLess(hit, bind)
+
     def test_bounded(self):
         with mock.patch.object(D, "MAX_CLASSES", 3):
             for r in range(1, 7):
