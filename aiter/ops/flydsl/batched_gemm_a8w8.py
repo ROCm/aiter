@@ -70,8 +70,10 @@ def bmm_a8w8_mxfp8_fused_quant_supported(
 ) -> bool:
     """Whether this arch's kernel for a w_scale block can fuse the output
     group-32 MXFP8 quant into its epilogue (``y_scale_out=``). Only the gfx1250
-    batched mxfp8_32 runner does."""
-    entry = _RUNNERS.get((get_gfx(), w_scale_block, x_scale_transposed))
+    batched mxfp8_32 runner does. The lookup goes through ``base_gfx_arch``,
+    the same mapping ``_runner`` uses, so gfx1250-strict selects that runner
+    instead of missing the table and looking like an unsupported shape."""
+    entry = _RUNNERS.get((base_gfx_arch(get_gfx()), w_scale_block, x_scale_transposed))
     return entry is not None and entry[:2] == _GFX1250_MX32
 
 
