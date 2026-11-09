@@ -9,7 +9,7 @@ from einops import rearrange
 
 import aiter
 from aiter import dtypes, pertoken_quant
-from aiter.fused_moe import fused_topk, moe_sorting, torch_moe
+from aiter.fused_moe import fused_moe, fused_topk, moe_sorting, torch_moe
 from aiter.ops.shuffle import shuffle_weight
 from aiter.test_common import checkAllclose, run_perftest
 
@@ -178,6 +178,7 @@ def test_fmoe(
     quant="No",
     use_g1u1=False,
     shared_E=0,
+    via_fused_moe=False,
 ):
     input = torch.randn((token, model_dim), dtype=dtype)
     if use_g1u1:
@@ -273,6 +274,23 @@ def test_fmoe(
     # msg = '111'
     # checkAllclose(out_ref, out_ref2, rtol=0.01, atol=100, msg=msg)
 
+    if via_fused_moe:
+        # End-to-end path with no tuned row: the heuristic must not hand a
+        # host-sorted call to a flat (NO_SORT) asm kernel.
+        out_asm = fused_moe(
+            input,
+            shuffle_weight(w1_q, layout=(16, 16)),
+            shuffle_weight(w2_q, layout=(16, 16)),
+            topk_weights,
+            topk_ids,
+            w1_scale=w1_scale.view(E, w1.shape[1] // 128, -1),
+            w2_scale=w2_scale.view(E, model_dim // 128, -1),
+            quant_type=aiter.QuantType.per_128x128,
+            activation=aiter.ActivationType.Silu,
+        )
+        torch.cuda.synchronize()
+        checkAllclose(out_ref, out_asm, rtol=0.05, atol=0.05, msg="fused_moe")
+        return
     out_asm, us_ref = run_perftest(
         asm_moe_test,
         a1_q,
@@ -362,3 +380,20 @@ for dtype in args.dtype:
                     quant="No",
                     use_g1u1=True,
                 )
+
+# Regression: with no tuned row, model_dim 256 used to pick the flat (NO_SORT)
+# 16x128 row for host-sorted inputs and fault on gfx942.
+if aiter.get_gfx() == "gfx942":
+    m = 1024
+    test_fmoe(
+        dtypes.d_dtypes["bf16"],
+        m,
+        256,
+        256,
+        (128, 128),
+        8,
+        2,
+        quant="No",
+        use_g1u1=True,
+        via_fused_moe=True,
+    )

@@ -365,8 +365,13 @@ static bool ps_grid_fits(const CFG::mapped_type& cfg, int inter_dim)
 
 // model_dim must be a multiple of the kernel's dim_align and at least its dim_min
 // (0 = unconstrained).
-static bool kernel_fits(
-    const CFG::mapped_type& cfg, int vskip, int smf, int block_size_M, int inter_dim, int model_dim)
+static bool kernel_fits(const CFG::mapped_type& cfg,
+                        int vskip,
+                        int smf,
+                        int block_size_M,
+                        int inter_dim,
+                        int model_dim,
+                        bool allow_no_sort = true)
 {
     if(cfg.smf != smf || inter_dim % cfg.subGU_n != 0 ||
        model_dim % std::max(cfg.dim_align, 1) != 0 || model_dim < cfg.dim_min ||
@@ -374,8 +379,10 @@ static bool kernel_fits(
         return false;
     // flat==1 rows are the 16xN tiles. Their subGU_m is 16 and vskip is 0, so the
     // checks below would hide the only rows that divide inter_dim such as 160 and 320.
+    // Callers that sort on the host (blockscale) must not get a NO_SORT row: it reads
+    // the sorted buffers as raw topk data.
     if(cfg.flat == static_cast<int>(AsmMoeMode::NO_SORT))
-        return true;
+        return allow_no_sort;
     return cfg.vskip == vskip && block_size_M == cfg.subGU_m &&
            cfg.flat == static_cast<int>(AsmMoeMode::SORTED);
 }
@@ -386,7 +393,8 @@ FMoeKernel* get_heuristic_kernel(int inter_dim,
                                  int smf                 = 0,
                                  std::string kernel_name = "",
                                  int block_size_M        = 32,
-                                 int model_dim           = 0)
+                                 int model_dim           = 0,
+                                 bool allow_no_sort      = true)
 {
     FMoeKernel* impl_ptr        = nullptr;
     uint32_t num_cu             = get_num_cu_func();
@@ -407,7 +415,7 @@ FMoeKernel* get_heuristic_kernel(int inter_dim,
             if(el.first.find(arch_id) != 0)
                 continue;
             const auto& cfg = el.second;
-            if(kernel_fits(cfg, vskip, smf, block_size_M, inter_dim, model_dim))
+            if(kernel_fits(cfg, vskip, smf, block_size_M, inter_dim, model_dim, allow_no_sort))
             {
                 tg_num = inter_dim / cfg.subGU_n *
                          sub_X_cnt; // how many thread_groups are needed to handle inter_dim
@@ -1139,7 +1147,8 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
                                         0,
                                         kernel_name_str,
                                         block_size_M,
-                                        down->size(1));
+                                        down->size(1),
+                                        false);
         impl_ptr->launch_kernel<1, 2, false>(out,
                                              input,
                                              gate,
@@ -1176,7 +1185,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT(fmoe_fp8_blockscale_g1u1_has_kernel,
     int vskip           = get_vskip();
     for(const auto& el : *config_map)
         if(el.first.find(arch_id) == 0 &&
-           kernel_fits(el.second, vskip, 0, block_size_M, inter_dim, model_dim))
+           kernel_fits(el.second, vskip, 0, block_size_M, inter_dim, model_dim, false))
             return 1;
     return 0;
 }
