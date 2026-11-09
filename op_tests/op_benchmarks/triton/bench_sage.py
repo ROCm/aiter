@@ -1370,10 +1370,15 @@ def _make_kernel_runner_impl(
             return mha_v4_packed(*tensors, **packed_sparse, **kwargs)
         extra = sol_cache.get("kwargs")
         if extra is None:
+            q_source, k_source = q_bshd, k_bshd
+            if SOL_KERNELS[sol_kernel][2] is not None and not args.hadamard_rotate:
+                # A packed row's fused quantizer rotates Q and K, so its exact operands come from
+                # the pre-rotated pair; routing and pooling must see that same pair.
+                q_source, k_source = cancel_internal_qk_rotation(q_bshd, k_bshd)
             extra = _sol_packed_kwargs(
                 sol_kernel,
                 tensors,
-                (q_bshd, k_bshd, v_bshd),
+                (q_source, k_source, v_bshd),
                 args.beta,
                 block_mask,
             )
