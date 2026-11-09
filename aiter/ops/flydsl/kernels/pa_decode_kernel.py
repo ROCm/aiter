@@ -56,6 +56,8 @@ and LDS movement, MFMA/WMMA, softmax and output operations.
 this module keeps the compilation API and launch wrappers.
 """
 
+import os
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.compiler.kernel_function import CompilationContext
@@ -65,7 +67,7 @@ from flydsl.runtime.device import check_smem_capacity
 from aiter.jit.utils.chip_info import get_gfx_runtime
 
 from .pa_decode import implementation_cache_tag
-from .pa_decode.context import PaDecodeContext
+from .pa_decode.context import PaDecodeContext, cta_coords
 from .pa_decode.op_merge import (
     CLUSTER_PARTITIONS,
     MERGE_HEAD_DIM,
@@ -90,6 +92,7 @@ from .pa_decode.traits import (
     PaDecodeSchedule,
     PaDecodeTraits,
 )
+from .pa_decode_pingpong import compile_pa_decode_pingpong, pingpong_supported
 from .tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
@@ -129,6 +132,7 @@ def _pa_decode_tile_kernel_name(
     stage_pages=0,
     merge_partitions=False,
     cluster_merge=0,
+    linear_kv=False,
 ):
     """Trace-visible symbol carrying the main compile-time constants."""
     name = (
@@ -137,7 +141,9 @@ def _pa_decode_tile_kernel_name(
     )
     if per_token_kv:
         name += "_pertoken"
-    if not trans_v:
+    if linear_kv:
+        name += "_linear"
+    elif not trans_v:
         name += "_vplain"
     if sliding_window:
         name += f"_sw{sliding_window}"
@@ -181,6 +187,7 @@ def compile_pa_decode_tile(
     trans_k: bool = True,
     mask_unowned_kv: bool = True,
     cluster_merge: int = 0,
+    linear_kv: bool = False,
 ):
     """Select and cache a PA-decode kernel and launch wrapper.
 
@@ -232,10 +239,14 @@ def compile_pa_decode_tile(
     ``wide_kv_addressing`` protects
     offsets at 2 GiB; ``kv_buffer_u32`` proves both FP8 caches are below 4 GiB
     and permits unsigned buffer offsets instead of i64.
+    ``linear_kv`` (gfx950, BF16) reads K/V caches in the linear
+    [blocks, block_size, kv_heads, dim] layout instead of the vectorized ones.
     """
     if not trans_k:
         raise NotImplementedError("Non-transposed key cache is not implemented")
     architecture = (architecture or get_gfx_runtime()).split(":", 1)[0]
+    if linear_kv and architecture != "gfx950":
+        raise NotImplementedError("linear KV requires gfx950")
     if architecture in ("gfx1250", "gfx1250-strict"):
         if value_dim not in (None, head_dim):
             raise NotImplementedError("asymmetric value width requires gfx942/gfx950")
@@ -275,6 +286,43 @@ def compile_pa_decode_tile(
         raise NotImplementedError("cluster_merge requires gfx1250")
     if direct_output and kv_dtype != "mxfp4":
         raise NotImplementedError("direct_output requires gfx1250 or MXFP4")
+    # Live 256-token plan tiles: bounded by the capacity and, when known, the
+    # dense work of max_context_length.
+    live_tiles = work_capacity
+    if max_context_length is not None:
+        live_tiles = min(
+            live_tiles, num_seqs * -(-max_context_length // KV_COMPUTE_BLOCK)
+        )
+    live_tiles *= num_kv_heads
+    pingpong = os.environ.get("FLYDSL_PA_PINGPONG")
+    if (
+        pingpong != "0"
+        and query_splits is None
+        and (pingpong == "1" or 4 * live_tiles >= 3 * num_compute_units)
+        and pingpong_supported(
+            architecture=architecture,
+            kv_dtype=kv_dtype,
+            query_dtype=query_dtype,
+            linear_kv=linear_kv,
+            head_dim=head_dim,
+            value_dim=value_dim,
+            query_group_size=query_group_size,
+            query_length=query_length,
+            block_size=block_size,
+            per_token_kv=per_token_kv,
+            sliding_window=sliding_window,
+        )
+    ):
+        return compile_pa_decode_pingpong(
+            head_dim=head_dim,
+            value_dim=head_dim if value_dim is None else value_dim,
+            query_group_size=query_group_size,
+            query_length=query_length,
+            block_size=block_size,
+            softmax_scale=(head_dim**-0.5 if softmax_scale is None else softmax_scale),
+            # One CTA per CU: fuse task pairs when live tasks can exceed the CUs.
+            pair_ctas=(-(-work_capacity // 2) if live_tiles > num_compute_units else 0),
+        )
     schedule = PaDecodeSchedule.select(
         head_dim=head_dim,
         value_dim=value_dim,
@@ -299,6 +347,7 @@ def compile_pa_decode_tile(
         trans_k=trans_k,
         mask_unowned_kv=mask_unowned_kv,
         direct_output=direct_output,
+        linear_kv=linear_kv,
     )
     cached = _PA_DECODE_TILE_CACHE.get(schedule.cache_key)
     if cached is not None:
@@ -336,6 +385,8 @@ def compile_pa_decode_tile(
         planned_start: fx.Int32,
         planned_end: fx.Int32,
         planned_context: fx.Int32,
+        cta_x: fx.Int32,
+        cta_y: fx.Int32,
     ):
         _ = _pa_decode_cache_tag
         ctx = PaDecodeContext(
@@ -360,6 +411,7 @@ def compile_pa_decode_tile(
             planned_start,
             planned_end,
             planned_context,
+            cta=(cta_x, cta_y),
         )
         PaDecodePipeline(ctx).run()
 
@@ -376,6 +428,7 @@ def compile_pa_decode_tile(
         query_splits=traits.query_splits,
         direct_output=traits.DIRECT,
         stage_pages=traits.stage_page_capacity if traits.MXFP4 else 0,
+        linear_kv=traits.linear_kv,
     )
 
     @flyc.kernel(name=kernel_name, known_block_size=(traits.BLOCK_THREADS, 1, 1))
@@ -396,7 +449,10 @@ def compile_pa_decode_tile(
         stride_q_head: fx.Int32,
         work_info_ptr: fx.Pointer,
         num_sequences: fx.Int32,
+        work_capacity: fx.Int32,
     ):
+        cta = cta_coords(traits, work_capacity)
+
         def _run_task(seq, start, end, context):
             _pa_decode_tile_task(
                 pmax_ptr,
@@ -418,6 +474,8 @@ def compile_pa_decode_tile(
                 start,
                 end,
                 context,
+                cta[0],
+                cta[1],
             )
 
         # Skip cleared padding records: no scratch writes or Q loads.
@@ -428,7 +486,7 @@ def compile_pa_decode_tile(
                 + fx.Uint32(gpu.block_id("z"))
             )
         else:
-            slot = fx.Int32(gpu.block_id("x"))
+            slot = cta[0]
         work = fx.recast_iter(fx.Int32, work_info_ptr)
         if const_expr(traits.DIRECT):
             # One task per sequence, no plan: ``work_info`` is the context lengths.
@@ -504,6 +562,7 @@ def compile_pa_decode_tile(
                 stride_q_head,
                 work_info,
                 num_seqs,
+                work_capacity,
             ).launch(
                 grid=(
                     (
