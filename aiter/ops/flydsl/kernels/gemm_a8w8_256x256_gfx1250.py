@@ -64,12 +64,18 @@ def launch_gemm_a8w8_256x256(
     bounded_m: Constexpr[bool] = True,
     a_scale_preshuffled: Constexpr[bool] = False,
     k_tiles_class: Constexpr[int] = 2,
+    b_scale_32x32: Constexpr[bool] = False,
+    batched: Constexpr[bool] = False,
+    batch: fx.Int32 = 1,
 ):
     """N must be a multiple of ``tile_n * cluster_n``; M is unrestricted (a
     multiple of 2 when ``a_preshuffle``); K must be divisible by 128 and at
     least 512 per split. ``k_tiles_class`` buckets the K-tiles per split:
     0 for <= 16, 1 for <= 64, 2 above; long K loops keep the early merge
-    timeout on A/B and the plain K-loop schedule, which run faster there."""
+    timeout on A/B and the plain K-loop schedule, which run faster there.
+    ``b_scale_32x32``: the mxfp8_32 B scale is row-major ``[N/32, K/32]``.
+    ``batched``: A ``[M, batch, K]``, A scale ``[M, batch, K/32]``, B and its
+    scale ``[batch, ...]``, C ``[M, batch, N]``."""
 
     assert (tile_m, tile_n, tile_k, m_warp, n_warp, num_buffers) in (
         (256, 256, 128, 2, 2, 4),
@@ -106,6 +112,10 @@ def launch_gemm_a8w8_256x256(
     mx32 = block_size == 32
     assert mx32 or block_size == 128, f"block_size must be 32 or 128, got {block_size}"
     assert not a_scale_preshuffled or mx32, "a_scale_preshuffled is mxfp8_32 only"
+    assert not b_scale_32x32 or mx32, "b_scale_32x32 is mxfp8_32 only"
+    assert not batched or (
+        mx32 and split_k == 1 and not a_preshuffle and not a_scale_preshuffled
+    ), "batched needs mxfp8_32, split_k=1 and row-major A and A scale"
     SA_SUPERS = tile_m // 32
     SB_SUPERS = tile_n // 32
     K_WS = tile_k // WMMA_K
@@ -147,7 +157,8 @@ def launch_gemm_a8w8_256x256(
         if mx32
         else SC_K * (((tile_m + 15) // 16) * 16)
     )
-    STAGE_SB = SB_SUPERS * SUPER_K if mx32 else ((N_BLOCKS + 15) // 16) * 16
+    SB_ROW = SUPER_K // 32 if b_scale_32x32 else SUPER_K
+    STAGE_SB = SB_SUPERS * SB_ROW if mx32 else ((N_BLOCKS + 15) // 16) * 16
     # B first so it keeps a 64-KiB-aligned base; the rest packs behind it.
     PLANAR_B_BASE = 0
     PLANAR_A_BASE = PLANAR_B_BASE + num_buffers * STAGE_B
@@ -233,6 +244,8 @@ def launch_gemm_a8w8_256x256(
         + (f"_ps{persistent_n_tiles}" if persistent_n_tiles > 1 else "")
         + ("_fsk" if cluster_splitk else "")
         + ("_aspre" if a_scale_preshuffled else "")
+        + ("_bs32x32" if b_scale_32x32 else "")
+        + ("_mbn" if batched else "")
     )
 
     def _run_tile(
@@ -267,7 +280,7 @@ def launch_gemm_a8w8_256x256(
             kt_base = fx.Int64(split_idx) * fx.Int64(K_TILES)
         else:
             split_idx = fx.Int32(0)
-            m_chunk = bid_z
+            m_chunk = fx.Int32(0) if const_expr(batched) else bid_z
             kt_base = fx.Int64(0)
         wave = rocdl.readfirstlane(T.i32, tid // WAVE)
         lane = tid % WAVE
@@ -329,16 +342,29 @@ def launch_gemm_a8w8_256x256(
         a_off0 = blk_m64 * lda64 + k_elem0 * A_PAIR
         b_off0 = (blk_n64 // 16) * Kp16 + k_elem0 * 16
         if const_expr(mx32):
+            sa_row64 = (
+                fx.Int64(i32_stride_ascale_k) if const_expr(batched) else k64 // 32
+            )
             sa_off0 = (
                 (blk_m64 // 32) * k64 + k_elem0
                 if const_expr(a_scale_preshuffled)
-                else blk_m64 * (k64 // 32) + k_elem0 // 32
+                else blk_m64 * sa_row64 + k_elem0 // 32
             )
-            sb_off0 = (blk_n64 // 32) * k64 + k_elem0
+            sb_k64 = k64 // 32 if const_expr(b_scale_32x32) else k64
+            sb_off0 = (blk_n64 // 32) * sb_k64 + (
+                k_elem0 // 32 if const_expr(b_scale_32x32) else k_elem0
+            )
         else:
             scale_k0 = kt_base * K_WS
             sa_off0 = blk_m64 + scale_k0 * fx.Int64(i32_stride_ascale_k)
             sb_off0 = (blk_n64 // 128) * (k64 // 128) + scale_k0
+        if const_expr(batched):
+            bat = fx.Int64(bid_z)
+            n64 = fx.Int64(i32_n)
+            a_off0 = a_off0 + bat * k64
+            b_off0 = b_off0 + bat * n64 * k64
+            sa_off0 = sa_off0 + bat * (k64 // 32)
+            sb_off0 = sb_off0 + bat * (n64 // 32) * sb_k64
         b_tile_shift = sb_tile_shift = fx.Int32(0)
         if const_expr(c_relocate):
             # The next persistent tile differs only in its N block. Byte deltas are
@@ -347,7 +373,9 @@ def launch_gemm_a8w8_256x256(
             n_adv = fx.Int32(fx.grid_dim.y) * tile_n
             b_tile_shift = n_adv * i32_k
             if const_expr(mx32):
-                sb_tile_shift = (n_adv // 32) * i32_k
+                sb_tile_shift = (n_adv // 32) * (
+                    i32_k // 32 if const_expr(b_scale_32x32) else i32_k
+                )
             else:
                 sb_tile_shift = (n_adv // 128) * (i32_k // 128)
             pref_on = fx.Int64(n_adv) * k64 + (
@@ -367,11 +395,15 @@ def launch_gemm_a8w8_256x256(
                 if const_expr(a_scale_preshuffled)
                 else (tile_m, SA_PANEL_WIDTH)
             )
-            SB_SHAPE = (SB_SUPERS, SUPER_K)
+            SB_SHAPE = (SB_SUPERS, SB_ROW)
             SA_LDS_STRIDE = SUPER_K if const_expr(a_scale_preshuffled) else SA_PANEL_ROW
-            SB_LDS_STRIDE = SUPER_K
-            sa_gstride = i32_k if const_expr(a_scale_preshuffled) else i32_k // 32
-            sb_gstride = i32_k
+            SB_LDS_STRIDE = SB_ROW
+            sa_gstride = (
+                i32_k
+                if const_expr(a_scale_preshuffled)
+                else (i32_stride_ascale_k if const_expr(batched) else i32_k // 32)
+            )
+            sb_gstride = i32_k // 32 if const_expr(b_scale_32x32) else i32_k
             sa_bound = sa_oob
             sa_step = SUPER_K if const_expr(a_scale_preshuffled) else SA_PANEL_WIDTH
             sb_step = SUPER_K
@@ -667,7 +699,9 @@ def launch_gemm_a8w8_256x256(
                 ),
             )
             sb_byte = fx.index_cast(
-                T.index, (sb_col // 32) * SUPER_K + (sb_col % 32) * 4
+                T.index,
+                (sb_col // 32) * SB_ROW
+                + (0 if const_expr(b_scale_32x32) else (sb_col % 32) * 4),
             )
         else:
             sa_sel = ((wmb + lane) % 4) * 0x01010101
@@ -694,7 +728,11 @@ def launch_gemm_a8w8_256x256(
                 if const_expr(mx32)
                 else par * (STAGE_SA // SC_K)
             )
-            sc_par_b = par * tile_k if const_expr(mx32) else par
+            sc_par_b = (
+                par * (tile_k // 32 if const_expr(b_scale_32x32) else tile_k)
+                if const_expr(mx32)
+                else par
+            )
             stage_sa_addr.append(
                 _planar_base(PLANAR_SA_BASE, STAGE_SA, slot) + sa_byte + sc_par_a
             )
@@ -773,7 +811,7 @@ def launch_gemm_a8w8_256x256(
 
         def _stage_load_sb_raw(stage, sn):
             if const_expr(mx32):
-                return lds_load_b32(stage_sb_addr[stage], sn * SUPER_K)[0]
+                return lds_load_b32(stage_sb_addr[stage], sn * SB_ROW)[0]
             return lds_load_b32(stage_sb_addr[stage], 0)[0]
 
         def _sa_of(word):
@@ -1507,6 +1545,8 @@ def launch_gemm_a8w8_256x256(
             fx.PointerType.get(partial_elem.ir_type, arg_c.address_space),
             arg_c,
         )
+        if const_expr(batched):
+            gC_base = fx.add_offset(gC_base, bat * n64)
         if const_expr(c_relocate):
             wave_i = fx.Int32(wave)
             q_offs = []
@@ -1682,7 +1722,7 @@ def launch_gemm_a8w8_256x256(
     capped = (pow2 < m_run_max).select(pow2, fx.Int32(m_run_max))
     # A cluster spans consecutive bid_x, so the x extent must stay a whole number of cluster rows.
     fits_cluster = (capped % fx.Int32(cluster_m)) == 0
-    if const_expr(cluster_splitk):
+    if const_expr(cluster_splitk or batched):
         # Keep grid.z exclusively for K so every tile's splits belong to the
         # same hardware cluster, including grids with more than 32 M tiles.
         m_run = gx
@@ -1692,7 +1732,7 @@ def launch_gemm_a8w8_256x256(
         )
     m_chunks = gx // m_run
     gy_launch = gy // persistent_n_tiles if const_expr(persistent_n_tiles > 1) else gy
-    grid_arg = (m_run, gy_launch, m_chunks * split_k)
+    grid_arg = (m_run, gy_launch, batch if const_expr(batched) else m_chunks * split_k)
     # Runtime N/K shape checks belong to the caller.
     cluster_arg = (cluster_m, cluster_n, cluster_k)
     kernel_gemm_a8w8_256x256(

@@ -36,7 +36,11 @@ from torch import Tensor
 
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx, get_lds_capacity_bytes
 
-from .mxfp8_bpreshuffle_gemm_gfx1250 import BASE_NAME_SUFFIX_RE
+from .mxfp8_bpreshuffle_gemm_gfx1250 import (
+    BASE_NAME_SUFFIX_RE,
+    is_compute_wmma_kernel_name,
+    run_gemm_a8w8_mxfp8_32_bpreshuffle_gfx1250,
+)
 
 BLOCK_K = 128
 BLOCK_N = 128
@@ -445,6 +449,21 @@ def run_bmm_a8w8_mxfp8_32_gfx1250(
     _check_e8m0(w_scale, "w_scale", "FlyDSL gfx1250 bmm", w_shape)
 
     name = kernel_name or pick_bmm_mx32_kernel_name(b, m, n, k, w_scale_32x32)
+    if is_compute_wmma_kernel_name(name):
+        if m:
+            from aiter.utility import dtypes
+
+            run_gemm_a8w8_mxfp8_32_bpreshuffle_gfx1250(
+                XQ[:, 0],
+                WQ[0],
+                x_scale[:, 0].view(dtypes.fp8_e8m0),
+                w_scale[0].view(dtypes.fp8_e8m0),
+                Out[:, 0],
+                name,
+                w_scale_32x32=w_scale_32x32,
+                batch=b,
+            )
+        return Out
     cfg = parse_bmm_mx32_kernel_name(name)
     if cfg is None:
         raise ValueError(f"[FlyDSL gfx1250 bmm] unrecognised kernelName: {name!r}")
