@@ -289,6 +289,24 @@ class TestPostProcess(unittest.TestCase):
         self.assertEqual(len(resultdf), 1)
         self.assertEqual(float(resultdf.iloc[0]["us"]), 7.0)
 
+    def test_nan_between_valid_times_does_not_break_selection(self):
+        """A NaN timing must not disturb the order of the valid candidates."""
+        tuner = _StubTuner.get()
+        args = self._make_args()
+        shape = (TEST_GFX, 304, 1, 1024, 512)
+        for times in (
+            [8.0, float("nan"), 5.0],
+            [9.0, float("nan"), 8.0, 5.0],
+        ):
+            rets = [
+                self._make_result(shape, kid, 0, us, err=0.0)
+                for kid, us in enumerate(times)
+            ]
+            resultdf = tuner.post_process(rets, args, topk=1)
+            self.assertEqual(len(resultdf), 1)
+            self.assertEqual(float(resultdf.iloc[0]["us"]), 5.0)
+            self.assertEqual(int(resultdf.iloc[0]["kernelId"]), len(times) - 1)
+
     def test_all_zero_measurements_produce_failed_fallback(self):
         tuner = _StubTuner.get()
         args = self._make_args()

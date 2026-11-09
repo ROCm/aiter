@@ -780,11 +780,18 @@ class TunerCommon:
 
         for info_key, time_list in grouped_results:
             tol_err_ratio = args.errRatio
-            sorted_time = sorted(time_list, key=lambda x: policy.rank(x[1], x[3]))
+            # Drop invalid candidates before sorting: a NaN timing makes every
+            # comparison False, so sorting first leaves the list out of order.
+            valid_time = [
+                (info_ex, us, max_err_ratio, watts)
+                for info_ex, us, max_err_ratio, watts in time_list
+                if max_err_ratio <= tol_err_ratio and math.isfinite(us) and us > 0
+            ]
             filtered_time = [
                 (info_ex, round(us, 4), max_err_ratio, watts)
-                for info_ex, us, max_err_ratio, watts in sorted_time
-                if max_err_ratio <= tol_err_ratio and math.isfinite(us) and us > 0
+                for info_ex, us, max_err_ratio, watts in sorted(
+                    valid_time, key=lambda x: policy.rank(x[1], x[3])
+                )
             ]
             if len(filtered_time) == 0:
                 logger.error(
@@ -802,7 +809,7 @@ class TunerCommon:
             if not best_config:
                 logger.info(f"No kernel can be used for {info_key}")
                 best_config = [
-                    TuneResult((info_key, *sorted_time[0][0]), self.INVALID_TIME, 1.0)
+                    TuneResult((info_key, *time_list[0][0]), self.INVALID_TIME, 1.0)
                 ]
             bestConfigs.extend(best_config)
         resultdf = policy.attach_columns(self.result_to_df(bestConfigs), bestConfigs)
