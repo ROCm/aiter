@@ -48,6 +48,16 @@ KIMI_K3_EXPERTS_PER_RANK = 112
 # are tuned in their own right.
 R1_MODEL_DIM, R1_INTER_DIM = 7168, 2048
 V4_MODEL_DIM, V4_INTER_DIM = 7168, 3072
+# EP4 DeepSeek-V4.1-Flash: (world_size, experts_per_rank, model_dim, inter_dim).
+V41_FLASH_EP4_LAYOUT = (4, 96, 5120, 2304)
+# (world_size, model_dim, inter_dim, experts, topk) of the layouts the fused (small- and large-input) kernels
+# serve: EP8 DeepSeek-V4-Pro and EP4 DeepSeek-V4.1-Flash.
+FUSED_LAYOUTS = frozenset(
+    {
+        (8, V4_MODEL_DIM, V4_INTER_DIM, 8 * REFERENCE_EXPERTS_PER_RANK, 6),
+        (4, 5120, 2304, 4 * 96, 6),
+    }
+)
 K3_MODEL_DIM, K3_INTER_DIM = 3584, 3072
 # EPLB redundant-expert profiles (r32 / r64) share V4-Pro's shape and FP4
 # prelude but have no per-bucket tuner of their own.
@@ -428,22 +438,26 @@ def fused_layout_supported(
     act: str = "silu",
     fanout_masks: tuple[int, ...] = (),
 ) -> bool:
-    """Whether the small- and large-input fused kernels support this layout.
+    """Whether the fused kernels support this layout: one of FUSED_LAYOUTS, a8w4 on gfx950.
 
-    Both bake in the EP8 DeepSeek-V4 a8w4 shape on gfx950.
+    The small-input kernel serves every such layout; the large-input kernel the
+    capacities large_m_mtprs_for() gives it.
     """
     return (
         arch.split(":", 1)[0] == "gfx950"
-        and world_size == 8
-        and model_dim == V4_MODEL_DIM
-        and inter_dim == V4_INTER_DIM
-        and experts == world_size * REFERENCE_EXPERTS_PER_RANK
-        and topk == 6
+        and (world_size, model_dim, inter_dim, experts, topk) in FUSED_LAYOUTS
         and quant == "a8w4"
         and swiglu_limit == 10.0
         and act == "silu"
         and not fanout_masks
     )
+
+
+def large_m_mtprs_for(*, world_size: int, model_dim: int, inter_dim: int) -> tuple[int, ...]:
+    """Instance capacities the large-input kernel is built for on a FUSED_LAYOUTS layout."""
+    if (world_size, model_dim, inter_dim) == (8, V4_MODEL_DIM, V4_INTER_DIM):
+        return LARGE_M_MTPRS
+    return ()
 
 
 def small_m_cu_supported(num_cu: int) -> bool:
@@ -1396,14 +1410,15 @@ def build_mega_moe_bundle_plan(
 SMALL_M_BM64_MIN_BUCKET = 256
 
 
-def _small_m_stage1(bucket: int) -> Stage1Config:
+def _small_m_stage1(bucket: int, expert_waves: int = 1) -> Stage1Config:
     grid_mult = max(1, bucket // 4) if bucket <= 16 else 3
     return Stage1Config(
         sort_block_m=64 if bucket >= SMALL_M_BM64_MIN_BUCKET else 32,
         tile_n=256 if bucket <= 8 else 128,
         num_waves=4,
         grid_mult=grid_mult,
-        num_dispatch_cu=_fixed_dispatch_cu(bucket),
+        # A layout with more than 64 experts a rank gives every 64-expert wave its own producers.
+        num_dispatch_cu=min(224, _fixed_dispatch_cu(bucket) * expert_waves),
         mfma_amajor=False,
         async_a_copy=False,
         use_tile_resource=bucket <= 16,
@@ -1424,13 +1439,13 @@ def _small_m_stage2(bucket: int) -> Stage2Config:
     )
 
 
-def _large_m_config() -> MegaMoEConfig:
+def _large_m_config(expert_waves: int = 1) -> MegaMoEConfig:
     stage1 = Stage1Config(
         sort_block_m=128,
         tile_n=512,
         num_waves=8,
         grid_mult=1,
-        num_dispatch_cu=96,
+        num_dispatch_cu=96 * expert_waves,
         mfma_amajor=True,
         async_a_copy=True,
         use_tile_resource=True,
@@ -1449,24 +1464,108 @@ def _large_m_config() -> MegaMoEConfig:
     return MegaMoEConfig(stage1=stage1, stage2=stage2, p2p_quant="fp8_blockwise_1x32")
 
 
-@cache
-def _fused_config(bucket: int, mtpr: int) -> MegaMoEConfig:
-    if mtpr in LARGE_M_MTPRS:
-        return _large_m_config()
-    return MegaMoEConfig(
-        stage1=_small_m_stage1(bucket), stage2=_small_m_stage2(bucket), p2p_quant="none"
+def _tune_v41_flash_ep4_small(config: MegaMoEConfig, bucket: int) -> MegaMoEConfig:
+    """EP4 DeepSeek-V4.1-Flash small-input kernel (96 experts per rank), measured on gfx950."""
+    # One dispatch row per (token, destination) instead of per route: the XGMI-bound dispatch sends ~45% fewer
+    # rows (-3% at 128 tokens, -6% at 512, neutral at 1-32). The plan reaches every CTA in one hop: the plan CTA
+    # writes it through to memory and publishes the flag without an L2 writeback, and each CTA waits on the flag
+    # itself instead of behind its XCD's acquire and republish (-1.8% at 1 token, neutral at 8-512). Every CTA
+    # builds the plan from the expert counts itself once the sources are done, so GEMM1 starts without the plan
+    # CTA's metadata stores and flag hop, and takes its tile metadata from LDS (-3% at 1 token, -2% at 8, -1.2% at
+    # 32, -0.3..-0.6% at 128-512); the counters' reset point moves to the combine. With at most 8 route-carrying
+    # producers (1-2 tokens), each one adds its share of the source flag to every destination after its own
+    # drain, skipping the last-producer counter hop (-1.5% at 1 token, -1% at 2, neutral at 16; 24 producers at 16
+    # tokens: +1.3%). These change what the ranks of a launch exchange, and the ranks of a launch may pick
+    # different buckets: every bucket sets them, as it sets the runtime's per-token counters (used by the
+    # tok_done buckets, cleared by every launch) and the BF16 rows of the first tokens (sender and combine agree).
+    stage1 = replace(
+        config.fused_stage1, dedup_rows=True, plan_direct=True, plan_wt=True, plan_local=True, direct_done=8,
+        tok_counters=True, bf16_head_tokens=4,
+        # GEMM2 keeps the pointers it reads from the dispatch table in SGPRs: every load of its K-loop sat in a
+        # waterfall loop (-1.6..-2.4% at 1-32 tokens, where the GEMM2 K-loop is latency-bound; -0.7..-0.1% at
+        # 64-128). The 64-row tiles of 256-512 tokens spill with it (+5..+7%).
+        g2_uniform=bucket <= 128,
     )
+    if bucket <= 4:
+        # GEMM1 runs one round of tiles, so its epilogue is on the critical path: the large-input lean epilogue
+        # (8 columns a lane, no serial store waits, fast SiLU) cuts 3% at 1 and 4 tokens (neutral at 8-16).
+        # The combine takes a token once its routes' GEMM2 rows are counted on it, not after every rank's last CTA
+        # publishes its flag: the ticket -> flag -> reduce hops leave the tail (-3% at 1 token, -2.2% at 2 and 4
+        # with the lane-fed scatter it needs; +0.8% at 8, +1.6% at 16, +2.9% at 128 from the per-unit drains).
+        stage1 = replace(stage1, epi_evec=8, epi_lean=3, g2_epi_lean=2, tok_done=True)
+    config = replace(config, fused_stage1=stage1)
+    if bucket == 1:
+        # Streaming GEMM1 weight loads, as the larger buckets (-8%). Head pointers in SGPRs: 160 -> 17 waterfall
+        # loops, 244 -> 217 VGPR (-2%; neutral at 4-128 tokens, +4% at 256-512). GEMM2 scatter rows take their ids,
+        # weights and peer bases from lanes (-1.1%; -0.7% at 4 tokens, neutral at 16-128). GEMM1 loads a K-step's A
+        # rows two steps ahead into registers and W1 two steps ahead in a fully unrolled K-loop, one wave a SIMD
+        # (-2.4%; either alone, or W1 ahead in the rolled loop, is slower).
+        return replace(
+            config,
+            stage1=replace(config.stage1, b_nt=3, waves_per_eu_hint=1),
+            fused_stage1=replace(stage1, head_uniform=True, g1_a_ahead=2, g1_lookahead=2),
+        )
+    if bucket == 16:
+        # Half the GEMM1 n-tiles (tile_n 256, -3.5%) and GEMM2 block_n 256 (-3%): longer weight slabs per tile.
+        return replace(
+            config, stage1=replace(config.stage1, tile_n=256), stage2=replace(config.stage2, block_n=256)
+        )
+    if bucket == 128:
+        # Half the GEMM1 n-tiles of tile_n 128: each streams a longer W1 slab (-4%).
+        return replace(config, stage1=replace(config.stage1, tile_n=256))
+    if bucket == 512:
+        # Half the CTAs leave GEMM1 for GEMM2 after a claim past half their XCD's GEMM1 slice: the XGMI-bound
+        # GEMM2 scatter starts while GEMM1 still runs (-2.7%; a quarter: +1.1%, neutral to +1.2% at 128 tokens).
+        return replace(config, fused_stage2=replace(config.fused_stage2, early_k=2, early_p=8))
+    return config
 
 
-def select_fused_config(tokens: int, mtpr: int) -> MegaMoEConfig:
+def _is_v41_flash_ep4(world_size, experts_per_rank, model_dim, inter_dim) -> bool:
+    return (world_size, experts_per_rank, model_dim, inter_dim) == V41_FLASH_EP4_LAYOUT
+
+
+@cache
+def _fused_config(
+    bucket: int, mtpr: int, world_size: int, experts_per_rank: int, model_dim: int, inter_dim: int
+) -> MegaMoEConfig:
+    ep4 = _is_v41_flash_ep4(world_size, experts_per_rank, model_dim, inter_dim)
+    expert_waves = (experts_per_rank + 63) // 64
+    if mtpr in LARGE_M_MTPRS:
+        return _large_m_config(expert_waves)
+    config = MegaMoEConfig(
+        stage1=_small_m_stage1(bucket, expert_waves),
+        stage2=_small_m_stage2(bucket),
+        p2p_quant="none",
+    )
+    return _tune_v41_flash_ep4_small(config, bucket) if ep4 else config
+
+
+def select_fused_config(
+    tokens: int,
+    mtpr: int,
+    *,
+    world_size: int = 8,
+    experts_per_rank: int = REFERENCE_EXPERTS_PER_RANK,
+    model_dim: int = V4_MODEL_DIM,
+    inter_dim: int = V4_INTER_DIM,
+) -> MegaMoEConfig:
     """Small-input (MTPR <= SMALL_M_MAX_MTPR) or large-input (MTPR in LARGE_M_MTPRS)
-    config for ``tokens`` rows on a rank; an idle rank takes the 1-token config."""
+    config of a fused_layout_supported() layout (default: EP8 DeepSeek-V4-Pro) for
+    ``tokens`` rows on a rank; an idle rank takes the 1-token config."""
     if mtpr <= 0 or mtpr & (mtpr - 1):
         raise ValueError(f"mtpr={mtpr} must be a positive power of two")
-    if mtpr > SMALL_M_MAX_MTPR and mtpr not in LARGE_M_MTPRS:
+    large_mtprs = large_m_mtprs_for(world_size=world_size, model_dim=model_dim, inter_dim=inter_dim)
+    if mtpr > SMALL_M_MAX_MTPR and mtpr not in large_mtprs:
         raise ValueError(f"no small- or large-input config for mtpr={mtpr}")
     if not 0 <= tokens <= mtpr:
         raise ValueError(f"tokens={tokens} must be in [0, {mtpr}]")
+    if not 0 < experts_per_rank <= 128:
+        raise ValueError(f"experts_per_rank must be in [1, 128], got {experts_per_rank}")
     return _fused_config(
-        nearest_token_bucket(max(tokens, 1), FUSED_TOKEN_BUCKETS), mtpr
+        nearest_token_bucket(max(tokens, 1), FUSED_TOKEN_BUCKETS),
+        mtpr,
+        world_size,
+        experts_per_rank,
+        model_dim,
+        inter_dim,
     )
