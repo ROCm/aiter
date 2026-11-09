@@ -612,6 +612,7 @@ def _grouped_a8w4_tdm_moe(
     situ_linear_beta=1.0,
     a1_scale=None,
     allow_gather_defer=True,
+    shared=None,
 ):
     import functools
 
@@ -1153,6 +1154,15 @@ def _grouped_a8w4_tdm_moe(
     _fuse_quant = _b1 is None and not disable_gemm1_requant
     w1_u8 = _grouped_weight_uint8(w1)
     w1s_i32 = w1_scale.reshape(-1).view(torch.int32)
+    # FHMoE (see fhmoe_shared_weights): the last expert's tiles read fp8 weights.
+    sh1 = sh2 = {}
+    if shared is not None:
+        if _is_fp4:
+            raise ValueError("an fp8 shared expert needs fp8 activations (a8w4)")
+        sw1, sw2, sw1s, sw2s = shared
+        sh1 = {"shared_w": sw1, "shared_w_scales": sw1s}
+        sh2 = {"shared_w": sw2, "shared_w_scales": sw2s}
+        persistent_workers = persistent_workers2 = 0
 
     if _fuse_quant:
         # Pre-allocate MX payload + preshuffled e8m0 scale for gemm1 output.
@@ -1189,6 +1199,7 @@ def _grouped_a8w4_tdm_moe(
             out_is_f16=out_is_f16,
             a_is_fp4=_a_is_fp4,
             stage1_act=stage1_act,
+            **sh1,
             bias=_b1,
             swiglu_limit=sl,
             num_buffers=num_buffers,
@@ -1231,6 +1242,7 @@ def _grouped_a8w4_tdm_moe(
             out_is_f16=out_is_f16,
             a_is_fp4=_a_is_fp4,
             stage1_act=stage1_act,
+            **sh1,
             bias=_b1,
             swiglu_limit=sl,
             num_buffers=num_buffers,
@@ -1280,6 +1292,7 @@ def _grouped_a8w4_tdm_moe(
         out_is_f16=out_is_f16,
         a_is_fp4=_a_is_fp4,
         stage1_act=0,
+        **sh2,
         bias=_b2,
         num_buffers=num_buffers2,
         persistent_workers=persistent_workers2,
@@ -1358,6 +1371,7 @@ def _grouped_a8w4_tdm_moe(
                         out_is_f16=out_is_f16,
                         a_is_fp4=_a_is_fp4,
                         stage1_act=stage1_act,
+                        **sh1,
                         bias=_b1,
                         swiglu_limit=sl,
                         num_buffers=num_buffers,
@@ -1402,6 +1416,7 @@ def _grouped_a8w4_tdm_moe(
                         out_is_f16=out_is_f16,
                         a_is_fp4=_a_is_fp4,
                         stage1_act=stage1_act,
+                        **sh1,
                         bias=_b1,
                         swiglu_limit=sl,
                         num_buffers=num_buffers,
@@ -1442,6 +1457,7 @@ def _grouped_a8w4_tdm_moe(
                     out_is_f16=out_is_f16,
                     a_is_fp4=_a_is_fp4,
                     stage1_act=0,
+                    **sh2,
                     bias=_b2,
                     num_buffers=num_buffers2,
                     persistent_workers=persistent_workers2,
@@ -1497,6 +1513,64 @@ def _grouped_a8w4_tdm_moe(
     return moe_out
 
 
+def fhmoe_shared_weights(
+    w1: torch.Tensor,
+    shared_w1: torch.Tensor,
+    shared_w2: torch.Tensor,
+    shared_w1_scale: torch.Tensor,
+    shared_w2_scale: torch.Tensor,
+    shared_expert_id: int,
+    clamp_shared: bool = True,
+):
+    """Check the gfx1250 FHMoE shared expert and return its grouped-GEMM operands.
+
+    The shared expert is expert ``E - 1``: a dummy row of the routed weights,
+    which the grouped GEMMs never read. Each token routes to it, with the shared
+    expert gate as its top-k weight. Its weights are fp8 e4m3, row-major:
+    ``shared_w1`` [1, 2*I, D] with gate / up rows interleaved as the routed w1
+    (``interleave_gate_up_rows``), ``shared_w2`` [1, D, I]. The scales are e8m0
+    per 32 along K in the routed scale layout:
+    ``moe_shuffle_scale(raw, experts_cnt=1, is_guinterleave=True)`` for w1 and
+    ``moe_shuffle_scale(raw, experts_cnt=1)`` for w2.
+
+    Returns (w1 bytes [2*I, D], w2 bytes [D, I], w1 scales, w2 scales).
+    """
+    from aiter import dtypes
+
+    tensors = (shared_w1, shared_w2, shared_w1_scale, shared_w2_scale)
+    if any(t is None for t in tensors):
+        raise ValueError("FHMoE needs shared_w1, shared_w2 and both scales")
+    experts = w1.shape[0]
+    if shared_expert_id != experts - 1:
+        raise ValueError(
+            f"FHMoE needs shared_expert_id == E - 1 = {experts - 1}, "
+            f"got {shared_expert_id}"
+        )
+    if not clamp_shared:
+        raise NotImplementedError("gfx1250 FHMoE has no unclamped shared SiLU")
+    if shared_w1.dtype != dtypes.fp8 or shared_w2.dtype != dtypes.fp8:
+        raise ValueError(f"FHMoE shared weights must be {dtypes.fp8}")
+    two_inter, model_dim = shared_w1.shape[-2:]
+    model_dim2, inter = shared_w2.shape[-2:]
+    if two_inter != 2 * inter or model_dim != model_dim2:
+        raise ValueError(
+            f"FHMoE shared weights: w1 {tuple(shared_w1.shape)} does not match "
+            f"w2 {tuple(shared_w2.shape)}"
+        )
+    for name, t, rows, k in (
+        ("shared_w1_scale", shared_w1_scale, two_inter, model_dim),
+        ("shared_w2_scale", shared_w2_scale, model_dim, inter),
+    ):
+        if t.numel() * t.element_size() != rows * (k // 32):
+            raise ValueError(f"{name}: {rows * (k // 32)} e8m0 bytes expected")
+    return (
+        shared_w1.view(torch.uint8).reshape(two_inter, model_dim),
+        shared_w2.view(torch.uint8).reshape(model_dim, inter),
+        shared_w1_scale.reshape(-1).view(torch.int32),
+        shared_w2_scale.reshape(-1).view(torch.int32),
+    )
+
+
 def grouped_gemm_gfx1250_a8w4(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -1529,8 +1603,11 @@ def grouped_gemm_gfx1250_a8w4(
     a1_scale: torch.Tensor | None = None,
     num_valid_routes: torch.Tensor | None = None,
     allow_gather_defer: bool = True,
+    shared=None,
 ):
     """Grouped a8w4/a4w4 MoE on the TDM batched GEMM (gfx1250).
+
+    ``shared``: the FHMoE shared expert, from ``fhmoe_shared_weights``.
 
     ``w1`` MUST be GUGU: gate/up row-interleaved ([g0,u0,g1,u1,...]), i.e. what
     ``moe_shuffle_weight(..., is_guinterleave=True, gate_up=True)`` produces.
@@ -1846,6 +1923,7 @@ def grouped_gemm_gfx1250_a8w4(
             situ_linear_beta=situ_linear_beta,
             a1_scale=a1_scale,
             allow_gather_defer=allow_gather_defer,
+            shared=shared,
             **_tdm_kw,
         )
 
@@ -1856,6 +1934,8 @@ def grouped_gemm_gfx1250_a8w4(
     # TODO(aot): AOT has no coverage for the TDM batched GEMM
     # (batched_gemm_mxfp4); grouped kernels are JIT-compiled at first use
     # until that is added back.
+    if shared is not None:
+        raise NotImplementedError("FHMoE needs the grouped TDM MoE path")
     return None
 
 

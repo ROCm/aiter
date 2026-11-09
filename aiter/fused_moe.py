@@ -1181,6 +1181,50 @@ def fused_moe(
                 "FHMoE shared-expert dispatch does not support "
                 + ", ".join(unsupported)
             )
+        if get_gfx() == "gfx1250":
+            # The grouped TDM MoE; the shared expert's tiles run on fp8 B.
+            from aiter.ops.flydsl.grouped_moe_gfx1250 import fhmoe_shared_weights
+
+            shared = fhmoe_shared_weights(
+                w1,
+                shared_w1,
+                shared_w2,
+                shared_w1_scale,
+                shared_w2_scale,
+                shared_expert_id,
+                clamp_shared,
+            )
+            return _fused_moe_impl(
+                hidden_states=hidden_states,
+                w1=w1,
+                w2=w2,
+                topk_weight=topk_weight,
+                topk_ids=topk_ids,
+                expert_mask=expert_mask,
+                activation=activation.value,
+                quant_type=quant_type.value,
+                doweight_stage1=doweight_stage1,
+                w1_scale=w1_scale,
+                w2_scale=w2_scale,
+                a1_scale=a1_scale,
+                a2_scale=a2_scale,
+                block_size_M=block_size_M or -1,
+                num_local_tokens=num_local_tokens,
+                moe_sorting_dispatch_policy=moe_sorting_dispatch_policy,
+                dtype=dtype,
+                hidden_pad=hidden_pad,
+                intermediate_pad=intermediate_pad,
+                bias1=bias1,
+                bias2=bias2,
+                swiglu_limit=swiglu_limit,
+                beta=beta,
+                linear_beta=linear_beta,
+                gate_mode=GateMode(gate_mode).value,
+                output=output,
+                quant_dtype_a=fhmoe_quant_dtype_a,
+                num_valid_routes=num_valid_routes,
+                _shared=shared,
+            )
         weights = (w1, w2, shared_w1, shared_w2)
         if routed_mxfp8 and any(
             weight is not None and not getattr(weight, "is_shuffled", False)
@@ -1460,6 +1504,7 @@ def _fused_moe_impl(
     quant_dtype_a: torch.dtype | None = None,
     quant_dtype_a2: torch.dtype | None = None,
     num_valid_routes: torch.Tensor | None = None,
+    _shared=None,
     *,
     _q_dtype_a: torch.dtype | None = None,
     _metadata_transform: Callable | None = None,
@@ -1575,8 +1620,11 @@ def _fused_moe_impl(
             # A deferred gather-reduce (defer_gather_reduce) leaves nothing to
             # copy into a caller's buffer.
             allow_gather_defer=output is None,
+            shared=_shared,
         )
 
+    if _shared is not None and grouped_a8w4_out is None:
+        raise NotImplementedError("gfx1250 FHMoE needs the grouped TDM MoE path")
     if grouped_a8w4_out is not None:
         return _return_output(grouped_a8w4_out, output)
     # A caller's deferred top-k (defer_topk_softmax) is due before anything

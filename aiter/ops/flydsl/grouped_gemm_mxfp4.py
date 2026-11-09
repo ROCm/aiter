@@ -149,11 +149,17 @@ def flydsl_grouped_gemm_a8w4_masked(
     a_scale_row_stride_bytes=0,
     persistent_workers=0,
     rolled_drain=0,
+    shared_w=None,
+    shared_w_scales=None,
 ):
     """Launch a contiguous-M grouped GEMM, optionally with persistent workers.
 
     A positive persistent_workers bounds the grid independently of the routing
     buffer capacity. Workers traverse the live device-side tile range.
+
+    ``shared_w`` / ``shared_w_scales`` (FHMoE): the last of ``n_experts`` is a
+    shared expert with fp8 weights, row-major [N, K], and e8m0 scales in the
+    routed B-scale layout (see ``grouped_moe_gfx1250.fhmoe_shared_scales``).
     """
     launch_gemm_a8w4_tdm = _launch_gemm_a8w4_tdm()
 
@@ -269,5 +275,11 @@ def flydsl_grouped_gemm_a8w4_masked(
         lds_soa_load_interleave=int(lds_soa_load_interleave),
         persistent_workers=persistent_workers,
         rolled_drain=rolled_drain,
+        # Without a shared expert the kernel ignores these: pass the routed B.
+        shared_b=int(shared_w is not None),
+        arg_shared_b=ptr_arg(w if shared_w is None else shared_w),
+        arg_shared_scale_b=(
+            w_scales if shared_w_scales is None else shared_w_scales
+        ).view(torch.int32),
     )
     return out
