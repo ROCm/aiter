@@ -1157,12 +1157,24 @@ def fused_moe(
         raise ValueError("clamp_shared=False requires FHMoE shared-expert dispatch")
     if has_shared_expert:
         routed_mxfp8 = w1 is not None and w1.dtype == dtypes.fp8
+        # gfx1250: the grouped TDM MoE takes MXFP4 routed experts with an fp8
+        # shared expert and quantizes the activations itself. Other inputs keep
+        # the common FHMoE path.
+        grouped_fhmoe = (
+            get_gfx() == "gfx1250"
+            and w1 is not None
+            and w1.dtype in (dtypes.fp4x2, torch.uint8)
+            and shared_w1 is not None
+            and shared_w1.dtype == dtypes.fp8
+            and a1_scale is None
+            and a2_scale is None
+        )
         unsupported = []
         if stage2_scatter is not None:
             unsupported.append("stage2_scatter")
         if quant_type_a is not None:
             unsupported.append("quant_type_a")
-        if get_gfx() == "gfx1250":
+        if grouped_fhmoe:
             # The routed experts keep their activation dtype (MXFP4 by default);
             # the fp8 shared expert reads the same activations.
             fhmoe_quant_dtype_a = (
@@ -1190,7 +1202,7 @@ def fused_moe(
                 "FHMoE shared-expert dispatch does not support "
                 + ", ".join(unsupported)
             )
-        if get_gfx() == "gfx1250":
+        if grouped_fhmoe:
             # The grouped TDM MoE; the shared expert's tiles run on fp8 B.
             from aiter.ops.flydsl.grouped_moe_gfx1250 import fhmoe_shared_weights
 
