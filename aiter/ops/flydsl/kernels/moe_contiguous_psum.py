@@ -580,8 +580,11 @@ def build_moe_contiguous_psum_remap_ep_module():
     return launch_psum_remap_ep
 
 
-def build_moe_route_psum_fused_module():
+def build_moe_route_psum_fused_module(shared_expert: int = -1, topk: int = 0):
     """JIT launcher: single-workgroup fused route + atomic + psum + remap.
+
+    ``shared_expert`` >= 0 (FHMoE, with ``topk``): a route to that expert takes
+    slot ``route // topk`` (its token), as ``build_moe_topids_to_rows_module``.
 
     For small token counts every route fits in one workgroup, so the three
     pre-GEMM launches (route-maps, contiguous-psum, remap) collapse into one
@@ -594,7 +597,11 @@ def build_moe_route_psum_fused_module():
     """
 
     @flyc.kernel(
-        name="moe_route_psum_fused",
+        name=(
+            "moe_route_psum_fused"
+            if shared_expert < 0
+            else f"moe_route_psum_fused_sh{shared_expert}"
+        ),
         known_block_size=[MAX_EXPERTS_PER_BLOCK, 1, 1],
     )
     def route_psum_fused_kernel(
@@ -649,6 +656,10 @@ def build_moe_route_psum_fused_module():
             incr = is_drop.select(c0_i32, c1_i32)
             ptr = lds_cnt + eff_e
             slot = fx.atomic_add(ptr, incr, syncscope="workgroup")
+            if const_expr(shared_expert >= 0):
+                slot = (e == fx.Int32(shared_expert)).select(
+                    fx.Int32(fx.Uint32(route_i32) // fx.Uint32(topk)), slot
+                )
             row = fx.Uint32(slot) + fx.Uint32(eff_e) * fx.Uint32(max_m)
             rows_p[route_i32] = is_drop.select(dropped_row, row)
         gpu.barrier()

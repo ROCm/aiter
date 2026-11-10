@@ -2482,10 +2482,10 @@ def _get_compiled_fused_route_quant_scatter_st_ksplit(
 
 @functools.cache
 @fast_jit_result
-def _get_compiled_topids_to_rows():
+def _get_compiled_topids_to_rows(shared_expert: int = -1, topk: int = 0):
     from aiter.ops.flydsl.kernels.moe_route_maps import build_moe_topids_to_rows_module
 
-    return build_moe_topids_to_rows_module()
+    return build_moe_topids_to_rows_module(shared_expert, topk)
 
 
 @functools.cache
@@ -2532,8 +2532,12 @@ def flydsl_moe_topids_to_rows(
     num_valid_routes: torch.Tensor | None = None,
     ep_rowmap: torch.Tensor | None = None,
     contiguous_expert_mask: bool = False,
+    shared_expert: int = -1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build masked-layout route rows and per-expert counts.
+
+    ``shared_expert`` >= 0 (FHMoE; TP path only): that expert's routes take their
+    token as slot, so its rows are in token order.
 
     When ``g2l_lut`` is given, ``topk_ids`` are treated as GLOBAL expert ids and
     remapped to local buckets on-device (EP fusion): ``g2l_lut[global] -> local``
@@ -2669,7 +2673,11 @@ def flydsl_moe_topids_to_rows(
             stream=torch.cuda.current_stream(),
         )
     else:
-        topids_to_rows_kernel = _get_compiled_topids_to_rows()
+        topids_to_rows_kernel = (
+            _get_compiled_topids_to_rows()
+            if shared_expert < 0
+            else _get_compiled_topids_to_rows(int(shared_expert), int(topk))
+        )
         topids_to_rows_kernel(
             ptr_arg(topk_ids.to(torch.int32).reshape(-1)),
             ptr_arg(counter),
@@ -3556,9 +3564,7 @@ def flydsl_moe_fused_quant_preshuffle(
                 # one-pass kernel. Write one compact e8m0 row per token plus the
                 # row -> route map, then rebuild the interleaved layout with
                 # whole-line stores.
-                compact = torch.empty(
-                    (token_num, Ws), dtype=torch.uint8, device=device
-                )
+                compact = torch.empty((token_num, Ws), dtype=torch.uint8, device=device)
                 # Never initialised: the rebuild validates every entry against
                 # topids_to_rows, so padding rows keep their bytes untouched.
                 row_to_route = torch.empty(n_rows, dtype=torch.int32, device=device)
@@ -3679,7 +3685,11 @@ def flydsl_moe_fused_quant_preshuffle(
 
                 # scale_k_per_tile only names the module; the layout ignores it.
                 flydsl_moe_preshuffle_scale(
-                    scale_dst, E, max_m, wmma_rep=wmma_rep, scale_k_per_tile=4,
+                    scale_dst,
+                    E,
+                    max_m,
+                    wmma_rep=wmma_rep,
+                    scale_k_per_tile=4,
                     out=out_scale,
                 )
             return out_payload, out_scale

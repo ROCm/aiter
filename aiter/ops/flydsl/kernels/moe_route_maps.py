@@ -128,8 +128,12 @@ def build_moe_route_maps_module():
     return launch_route_maps
 
 
-def build_moe_topids_to_rows_module():
+def build_moe_topids_to_rows_module(shared_expert: int = -1, topk: int = 0):
     """JIT launcher: builds topids_to_rows only (no rows_to_tokens inverse).
+
+    ``shared_expert`` >= 0 (FHMoE, with ``topk``): a route to that expert takes
+    slot ``route // topk`` (its token) instead of the counter's, so the shared
+    segment's rows are in token order; the counter still counts it.
 
     A route whose expert id is negative -- the top-k writes -1 for every slot of
     a row past ``num_valid_rows`` (a graph bucket's pad rows) -- claims no slot
@@ -138,7 +142,9 @@ def build_moe_topids_to_rows_module():
     with the raw -1 wrote past it and sent the gather a garbage row.
     """
 
-    @flyc.kernel(name="moe_route")
+    @flyc.kernel(
+        name="moe_route" if shared_expert < 0 else f"moe_route_sh{shared_expert}"
+    )
     def route_kernel(
         topk_ids: fx.Pointer,
         atomic_buffer: fx.Pointer,
@@ -163,6 +169,10 @@ def build_moe_topids_to_rows_module():
             incr = is_drop.select(c0_i32, c1_i32)
             ptr = _i32_ptr(atomic_buffer) + eff_e
             slot = fx.atomic_add(ptr, incr, syncscope="agent")
+            if const_expr(shared_expert >= 0):
+                slot = (e == fx.Int32(shared_expert)).select(
+                    fx.Int32(route // fx.Uint32(topk)), slot
+                )
             row = fx.Uint32(slot) + fx.Uint32(eff_e) * fx.Uint32(max_m)
             out_p[route] = is_drop.select(dropped_row, row)
 

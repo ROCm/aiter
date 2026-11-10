@@ -628,6 +628,13 @@ def _grouped_a8w4_tdm_moe(
     device = hidden_states.device
     token_num, topk = topk_ids.shape
     enable_ep_scatter = stage2_scatter is not None
+    # FHMoE bf16 shared activations: the shared expert (E - 1) routed in token
+    # order, so its tiles read hidden_states rows directly.
+    _sh_bf16 = (
+        shared is not None
+        and os.environ.get("AITER_FHMOE_SHARED_ACT", "bf16") == "bf16"
+    )
+    _sh_token_order = int(E) - 1 if _sh_bf16 else -1
     _compact_ctx = _flydsl_dispatch_context()
     _compact = bool(
         _compact_ctx is not None and getattr(_compact_ctx, "compact_layout", False)
@@ -896,10 +903,12 @@ def _grouped_a8w4_tdm_moe(
         elif _route_psum_fused:
             # Same alignment as contiguous_psum_remap below.
             _masked_m, topids_to_rows, psum = fused_route_psum_remap(
-                topk_ids, E, max_m, _align_m
+                topk_ids, E, max_m, _align_m, shared_expert=_sh_token_order
             )
         else:
-            _masked_m, topids_to_rows = flydsl_moe_topids_to_rows(topk_ids, E, max_m)
+            _masked_m, topids_to_rows = flydsl_moe_topids_to_rows(
+                topk_ids, E, max_m, shared_expert=_sh_token_order
+            )
     # EP gemm2-fused scatter: the ep_rowmap was allocated (and sentinel-filled by
     # the route kernel) above; build the scatter params dict for contiguous_psum_remap.
     ep_scatter_params = None
@@ -1161,27 +1170,25 @@ def _grouped_a8w4_tdm_moe(
         sh1 = {"shared_w": sw1, "shared_w_scales": sw1s, "shared_rows": token_num}
         sh2 = {"shared_w": sw2, "shared_w_scales": sw2s, "shared_rows": token_num}
         persistent_workers = persistent_workers2 = 0
-        if os.environ.get("AITER_FHMOE_SHARED_ACT", "bf16") == "bf16":
-            # The shared expert on bf16 activations: its stage-1 A is this
-            # call's hidden rows in the shared segment's row order (the shared
-            # route is the last top-k column), its stage-1 SiLU output a bf16
-            # side buffer that stage 2 reads.
-            if topids_to_rows is None or int(tile_m2) != int(tile_m):
+        if _sh_bf16:
+            # The shared expert on bf16 activations. Routed in token order (see
+            # _sh_token_order), its segment's row r is token r: its stage-1 A is
+            # hidden_states itself and its stage-1 SiLU output a bf16 side
+            # buffer in token order, which stage 2 reads.
+            if (
+                topids_to_rows is None
+                or _prepared_a1 is not None
+                or int(tile_m2) != int(tile_m)
+                or hidden_states.dtype != torch.bfloat16
+            ):
                 raise NotImplementedError(
-                    "FHMoE bf16 shared activations need the TP row map and "
-                    "equal stage tile_m"
+                    "FHMoE bf16 shared activations need the TP route kernels, "
+                    "bf16 hidden states and equal stage tile_m"
                 )
-            rows_sh = (int(token_num) + int(tile_m) - 1) // int(tile_m) * int(tile_m)
-            sh_row0 = (psum[E - 2 : E - 1].long() + tile_m - 1) // tile_m * tile_m
-            idx = topids_to_rows[:, -1].long() - sh_row0
-            idx = torch.where((idx >= 0) & (idx < rows_sh), idx, rows_sh)
-            x_sh = torch.zeros(
-                (rows_sh + 1, model_dim), dtype=torch.bfloat16, device=device
-            )
-            x_sh.index_copy_(0, idx, hidden_states.reshape(-1, model_dim))
             act_sh = torch.empty(
-                (rows_sh + 1, inter_dim), dtype=torch.bfloat16, device=device
+                (int(token_num), inter_dim), dtype=torch.bfloat16, device=device
             )
+            x_sh = hidden_states.reshape(-1, model_dim).contiguous()
             sh1 = dict(sh1, shared_a=x_sh, shared_c=act_sh)
             sh2 = dict(sh2, shared_a=act_sh)
 
@@ -2022,13 +2029,13 @@ def _get_compiled_contiguous_psum_remap():
 
 @functools.cache
 @fast_jit_result
-def _get_compiled_route_psum_fused():
+def _get_compiled_route_psum_fused(shared_expert: int = -1, topk: int = 0):
     """Compile and cache the single-TG fused route+atomic+psum+remap kernel."""
     from aiter.ops.flydsl.kernels.moe_contiguous_psum import (
         build_moe_route_psum_fused_module,
     )
 
-    return build_moe_route_psum_fused_module()
+    return build_moe_route_psum_fused_module(shared_expert, topk)
 
 
 # One workgroup handles every route. NUMEL is advisory -- the route sweep is
@@ -2044,6 +2051,7 @@ def fused_route_psum_remap(
     experts: int,
     max_m: int,
     tile_m: int,
+    shared_expert: int = -1,
 ):
     """Single-launch route+atomic+psum+remap for small token counts.
 
@@ -2069,7 +2077,11 @@ def fused_route_psum_remap(
     masked_m = torch.empty(experts, dtype=torch.int32, device=device)
     starts = torch.empty(experts, dtype=torch.int32, device=device)
     psum = torch.empty(experts, dtype=torch.int32, device=device)
-    launch = _get_compiled_route_psum_fused()
+    launch = (
+        _get_compiled_route_psum_fused()
+        if shared_expert < 0
+        else _get_compiled_route_psum_fused(int(shared_expert), int(topk))
+    )
     launch(
         ptr_arg(topk_ids.to(torch.int32).reshape(-1)),
         ptr_arg(topids_to_rows),
