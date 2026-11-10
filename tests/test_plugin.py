@@ -53,6 +53,22 @@ def _route_add(native_calls: list[tuple[int, int]]):
     return add
 
 
+def _enabled_but_unable(monkeypatch, name: str = "aklr") -> _Provider:
+    """An enabled provider that cannot serve ``test.add`` version 1.
+
+    Dispatch records a Decision only while at least one provider is enabled, so
+    a test about the record itself has to reach that state. This is the cheapest
+    one that still routes native: the provider is installed and enabled, and
+    declares another contract version, so it is never asked.
+    """
+
+    provider = _Provider(name)
+    provider.op_versions = {"test.add": {7}}
+    monkeypatch.setattr(plugin, "_entry_points", lambda: (_EntryPoint(name, provider),))
+    plugin.configure(enable=(name,), source="test")
+    return provider
+
+
 def _candidate(provider: str, result: int = 100) -> plugin.KernelCandidate:
     return plugin.KernelCandidate(
         provider=provider,
@@ -78,14 +94,19 @@ def test_no_provider_uses_native_path_and_discovers_lazily(monkeypatch):
     assert discovery_calls == 0
     assert add(2, right=3) == 5
     assert add(4) == 5
-    assert discovery_calls == 1
     assert native_calls == [(2, 3), (4, 1)]
-    assert plugin.last_decision() == plugin.Decision(
+    assert discovery_calls == 0, (
+        "nothing is enabled, so no answer about who is installed can change "
+        "this call: dispatch must not pay to find out"
+    )
+    assert plugin.last_decision() is None, "nothing enabled, nothing recorded"
+    assert plugin.explain("test.add", 2, 3).decision == plugin.Decision(
         op=plugin.Op("test.add", 1),
         route="native",
         reason="no-provider",
         config_source="default-deny",
-    )
+    ), "the read still answers in full, and is what pays for discovery"
+    assert discovery_calls == 1
 
 
 def test_disabled_plugins_do_not_trigger_discovery(monkeypatch):
@@ -252,7 +273,8 @@ def test_installed_provider_is_not_enabled_by_default(monkeypatch):
     assert add(2, 3) == 5
     assert native_calls == [(2, 3)]
     assert provider.select_calls == 0
-    assert plugin.last_decision().reason == "provider-not-enabled"
+    assert plugin.last_decision() is None, "nothing enabled, nothing recorded"
+    assert plugin.explain("test.add", 2, 3).decision.reason == "provider-not-enabled"
 
     plugin.configure(enable=("aklr",), source="test")
     assert add(2, 3) == 100
@@ -525,7 +547,10 @@ def test_config_source_names_the_layer_that_produced_the_route(monkeypatch):
     add = _route_add([])
 
     assert add(2, 3) == 5
-    assert plugin.last_decision().config_source == "default-deny"
+    assert plugin.last_decision() is None
+    assert (
+        plugin.explain("test.add", 2, 3).decision.config_source == "default-deny"
+    ), "the layer is still named, by the read rather than the record"
 
     plugin.configure(enable=["aklr"], source="vllm rocm 2026.11")
     assert add(2, 3) == 100
@@ -650,22 +675,26 @@ def test_explain_rejects_an_unrouted_op():
 
 
 def test_decision_counts_include_native_routes(monkeypatch):
+    _enabled_but_unable(monkeypatch)
     add = _route_add([])
 
     add(2, 3)
     add(4, 5)
 
-    assert plugin.decision_counts() == {("test.add", "native", "no-provider", None): 2}
+    assert plugin.decision_counts() == {
+        ("test.add", "native", "provider-op-unsupported", None): 2
+    }
 
 
-def test_on_decision_is_called_inline_for_every_route():
+def test_on_decision_is_called_inline_for_every_route(monkeypatch):
     seen = []
     plugin.on_decision(seen.append)
+    _enabled_but_unable(monkeypatch)
     add = _route_add([])
 
     add(2, 3)
 
-    assert [decision.reason for decision in seen] == ["no-provider"]
+    assert [decision.reason for decision in seen] == ["provider-op-unsupported"]
 
 
 def test_a_broken_callback_is_swallowed_logged_once_and_counted(monkeypatch):
@@ -676,6 +705,7 @@ def test_a_broken_callback_is_swallowed_logged_once_and_counted(monkeypatch):
         raise RuntimeError("telemetry is broken")
 
     plugin.on_decision(broken)
+    _enabled_but_unable(monkeypatch)
     add = _route_add([])
 
     assert add(2, 3) == 5, "a telemetry bug must never break a kernel launch"
@@ -707,6 +737,10 @@ def test_route_changes_are_logged_once_per_generation(monkeypatch):
 
     assert len(infos) == 1, "one line per generation, not per call"
     assert "test.add" in infos[0]
+    assert "('native', None, None) -> ('provider', 'aklr', 'kernel-1')" in infos[0], (
+        "the moment a framework takes an op over is the one route change an "
+        "operator most needs in the log, so it must not read as a first baseline"
+    )
 
 
 def _provider_at(api_version: int, name: str = "aklr"):
@@ -1045,8 +1079,67 @@ def test_an_enabled_provider_that_cannot_serve_is_told_apart_from_none(monkeypat
 
     plugin.configure(enable=(), source="test")
     assert add(2, 3) == 5
-    assert plugin.last_decision().reason == "provider-not-enabled"
-    assert plugin.explain("test.add", 2, 3).declines == {}
+    assert plugin.last_decision() is None, (
+        "turning routing off must not leave the provider route readable behind "
+        "it; a stale answer is worse than none"
+    )
+    explained = plugin.explain("test.add", 2, 3)
+    assert explained.decision.reason == "provider-not-enabled"
+    assert explained.declines == {}
+
+
+def test_nothing_enabled_is_the_same_state_to_a_caller_as_the_kill_switch(
+    monkeypatch,
+):
+    """The two ways of saying "no provider can serve" must behave alike.
+
+    Dispatch treats them as one branch for cost, so everything observable has to
+    agree too: no record, no callback, no discovery, and the native result. What
+    differs is only what a read reports -- the kill switch says the feature is
+    off, an empty enable list says nothing was turned on -- and ``explain()``
+    still answers in both.
+    """
+
+    discovery_calls = 0
+
+    def entry_points():
+        nonlocal discovery_calls
+        discovery_calls += 1
+        return (_EntryPoint("aklr", _Provider("aklr", _candidate("aklr"))),)
+
+    monkeypatch.setattr(plugin, "_entry_points", entry_points)
+    seen = []
+    plugin.on_decision(seen.append)
+    native_calls = []
+    add = _route_add(native_calls)
+
+    # Enabled first, so there is a provider decision on record to go stale.
+    plugin.configure(enable=("aklr",), source="test")
+    assert add(2, 3) == 100
+    assert plugin.last_decision().route == "provider"
+
+    for turn_off in (
+        lambda: plugin.configure(enable=(), source="test"),
+        lambda: (
+            monkeypatch.setenv("AITER_PLUGINS", "0"),
+            plugin.configure(enable=("aklr",), source="test"),
+            plugin.reload_config(),
+        ),
+    ):
+        seen.clear()
+        before = discovery_calls
+        turn_off()
+
+        assert add(2, 3) == 5, "the native path still runs, and still returns"
+        assert plugin.last_decision() is None, "the provider route must not linger"
+        assert seen == [], "a call that cannot be routed produces no decision"
+        assert discovery_calls == before, "and never asks who is installed"
+
+    monkeypatch.delenv("AITER_PLUGINS")
+    plugin.reload_config()
+    assert (
+        plugin.explain("test.add", 2, 3).decision.route == "provider"
+    ), "none of this is one-way: the read is right again the moment it can be"
 
 
 def test_a_name_enabled_without_an_installed_provider_says_so(monkeypatch):
@@ -1078,7 +1171,8 @@ def test_the_environment_cannot_enable_a_provider(monkeypatch):
     add = _route_add([])
 
     assert add(2, 3) == 5, "a provider the environment named must not serve"
-    decision = plugin.last_decision()
+    assert plugin.last_decision() is None
+    decision = plugin.explain("test.add", 2, 3).decision
     assert decision.route == "native"
     assert decision.config_source == "default-deny"
     assert provider.select_calls == 0
@@ -1221,3 +1315,152 @@ def test_the_first_provider_to_fail_is_the_one_named(monkeypatch):
     assert (
         plugin.explain("test.add", 2, 3).decision.provider == "aaa"
     ), "explain must name the same provider dispatch did"
+
+
+def test_resetting_for_tests_keeps_the_ops_routed_by_importing_aiter(monkeypatch):
+    """Those belong to the process, not to whichever test ran first."""
+
+    monkeypatch.setattr(plugin, "_imported_routes", None)
+    production = plugin._RoutedOp(
+        plugin.Op("production.op", 1),
+        inspect.signature(lambda x: x),
+        lambda *a, **k: ((), {}),
+        {},
+    )
+    plugin._routed_ops["production.op"] = production
+
+    plugin._reset_for_testing()  # first call captures the import-time set
+    assert "production.op" in plugin._routed_ops
+
+    _route_add([])
+    assert "test.add" in plugin._routed_ops
+
+    plugin._reset_for_testing()
+    assert "production.op" in plugin._routed_ops, "import-time routes survive"
+    assert "test.add" not in plugin._routed_ops, "test routes do not"
+
+
+def test_an_op_whose_contract_never_moved_says_nothing_about_versions(monkeypatch):
+    """The number should appear where it carries information, not everywhere."""
+
+    provider = _Provider("aklr", _candidate("aklr"))
+    plugin.configure(enable=("aklr",), source="test")
+    monkeypatch.setattr(
+        plugin, "_entry_points", lambda: (_EntryPoint("aklr", provider),)
+    )
+
+    @plugin.route(op="test.add")  # no version=
+    def add(left: int, right: int = 1) -> int:
+        return left + right
+
+    assert add(2, 3) == 100
+    assert plugin.last_decision().op == plugin.Op("test.add", 1)
+
+
+def test_a_provider_may_name_ops_without_versions(monkeypatch):
+    """Naming an op means the current contract, which most providers mean."""
+
+    provider = _Provider("aklr", _candidate("aklr"))
+    provider.op_versions = {"test.add"}  # a set of names, not a mapping
+    plugin.configure(enable=("aklr",), source="test")
+    monkeypatch.setattr(
+        plugin, "_entry_points", lambda: (_EntryPoint("aklr", provider),)
+    )
+
+    assert _route_add([])(2, 3) == 100
+    assert plugin.last_decision().provider == "aklr"
+
+
+def test_naming_an_op_does_not_claim_the_ops_it_did_not_name(monkeypatch):
+    provider = _Provider("aklr", _candidate("aklr"))
+    provider.op_versions = {"something.else"}
+    plugin.configure(enable=("aklr",), source="test")
+    monkeypatch.setattr(
+        plugin, "_entry_points", lambda: (_EntryPoint("aklr", provider),)
+    )
+
+    assert _route_add([])(2, 3) == 5
+    assert provider.select_calls == 0
+
+
+def test_a_kernel_that_cannot_take_the_contract_is_refused(monkeypatch):
+    """The failure this prevents is silent, which is why it is worth a check.
+
+    Argument counts line up by accident often enough: a kernel written for a
+    write-out contract, handed a functional one, treats the input tensor as its
+    output buffer and corrupts it without raising.
+    """
+
+    warnings = []
+    monkeypatch.setattr(
+        plugin.logger, "warning", lambda fmt, *rest: warnings.append(fmt % rest)
+    )
+
+    def wrong_shape(out, left, right, extra):  # four parameters, wrong contract
+        out.append(left)
+
+    provider = _Provider(
+        "aklr",
+        plugin.KernelCandidate(
+            provider="aklr",
+            kernel_id="mismatched",
+            artifact_digest="sha256:abc",
+            run=wrong_shape,
+        ),
+    )
+    plugin.configure(enable=("aklr",), source="test")
+    monkeypatch.setattr(
+        plugin, "_entry_points", lambda: (_EntryPoint("aklr", provider),)
+    )
+    native_calls = []
+
+    assert _route_add(native_calls)(2, 3) == 5, "it falls back rather than running"
+    assert native_calls == [(2, 3)]
+    assert plugin.last_decision().reason == "contract-mismatch"
+    assert plugin.last_decision().provider == "aklr"
+    assert "does not take this contract" in warnings[0]
+
+
+def test_a_forwarding_kernel_is_accepted(monkeypatch):
+    """``*args, **kwargs`` genuinely accepts the call, so it must pass."""
+
+    provider = _Provider(
+        "aklr",
+        plugin.KernelCandidate(
+            provider="aklr",
+            kernel_id="forwarder",
+            artifact_digest="sha256:abc",
+            run=lambda *args, **kwargs: 100,
+        ),
+    )
+    plugin.configure(enable=("aklr",), source="test")
+    monkeypatch.setattr(
+        plugin, "_entry_points", lambda: (_EntryPoint("aklr", provider),)
+    )
+
+    assert _route_add([])(2, 3) == 100
+
+
+def test_the_kill_switch_hides_a_decision_taken_before_it(monkeypatch):
+    """Not just "this call decided nothing" -- nothing is being decided."""
+
+    provider = _Provider("aklr", _candidate("aklr"))
+    plugin.configure(enable=("aklr",), source="test")
+    monkeypatch.setattr(
+        plugin, "_entry_points", lambda: (_EntryPoint("aklr", provider),)
+    )
+    add = _route_add([])
+
+    assert add(2, 3) == 100
+    assert plugin.last_decision().provider == "aklr"
+
+    # Turned off without calling anything afterwards: the record is still
+    # there, and it now describes a world that does not hold.
+    monkeypatch.setenv("AITER_PLUGINS", "0")
+    plugin.reload_config()
+
+    assert plugin.last_decision() is None
+
+    monkeypatch.delenv("AITER_PLUGINS")
+    plugin.reload_config()
+    assert plugin.last_decision().provider == "aklr", "and it was not destroyed"

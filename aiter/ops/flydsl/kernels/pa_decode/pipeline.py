@@ -21,7 +21,14 @@ from .op_gemm import Gfx1250Gemm, PaDecodeGemm
 from .op_lds import Gfx1250Memory, PaDecodeKVLoader, PaDecodeLds, PaDecodeQueryLoader
 from .op_merge import Gfx1250PartitionMerge
 from .op_softmax import PaDecodeSoftmax
-from .traits import KV_COMPUTE_BLOCK, LOG2E, MFMA_MNK, MXFP4_P_EXP_SHIFT, WAVE
+from .traits import (
+    KV_COMPUTE_BLOCK,
+    LOG2E,
+    MFMA_MNK,
+    MXFP4_KV_DTYPE,
+    MXFP4_P_EXP_SHIFT,
+    WAVE,
+)
 
 
 class PaDecodePipeline:
@@ -111,7 +118,7 @@ class PaDecodePipeline:
         Past the context the table load is pinned to page 0, which a tile
         never consumes.
         """
-        base_page = tt * (self.traits.TILE_TOK // self.traits.block_size)
+        base_page = tt * (KV_COMPUTE_BLOCK // self.traits.block_size)
         k_page = self.kv.load_pages(
             base_page
             + (self.ctx.warp * self.traits.TOK_PER_WARP) // self.traits.block_size
@@ -230,7 +237,7 @@ class PaDecodePipeline:
             [v_carried[vh * t.NVOPS + i] for i in range_constexpr(t.NVOPS)]
             for vh in range_constexpr(t.VHE_CHUNKS)
         ]
-        tile_valid = self.ctx.context_len - tt * t.TILE_TOK
+        tile_valid = self.ctx.context_len - tt * KV_COMPUTE_BLOCK
 
         # K chunk groups outer: each K chunk dies after its last M-tile.
         frags = [[None] * t.NCHUNK for _m in range_constexpr(t.M_TILES)]
@@ -341,12 +348,15 @@ class PaDecodePipeline:
             self.kv.store_scales(scale_stores)
         else:
             k_pf0 = self.kv.prefetch_first()
-            if const_expr(self.traits.MXFP4):
+            if const_expr(self.traits.kv_dtype == MXFP4_KV_DTYPE):
                 v_page_pf0 = self.kv.mxfp4_prefetch("v")
             self.ctx.init_scales(self.kv.key_scale, self.kv.value_scale)
             self.query.stage(q_units_prefetched)
         gpu.barrier()
-        if const_expr(not self.traits.MXFP4 and not self.traits.FP8_MTP4_PAGES_AHEAD):
+        if const_expr(
+            self.traits.kv_dtype != MXFP4_KV_DTYPE
+            and not self.traits.FP8_MTP4_PAGES_AHEAD
+        ):
             v_page_pf0 = self.kv.read_v_pages()
         q_ops_all = (
             None
@@ -356,13 +366,15 @@ class PaDecodePipeline:
         self.softmax.init_mask()
         self.ctx.init_causal_offsets()
         o_final = self.mainloop(k_pf0, v_page_pf0, q_ops_all, pages1)
-        if const_expr(self.traits.MXFP4 and self.traits.DUAL_GROUP):
+        if const_expr(
+            (self.traits.kv_dtype == MXFP4_KV_DTYPE) and self.traits.DUAL_GROUP
+        ):
             # Lane-wise (O, max, sum) merge, then group 0's four-wave merge;
             # its barrier passes once group 1's waves have ended.
             o_final = self.merge_groups(o_final)
             if self.ctx.group == 0:
                 self.epilogue.store_mxfp4(o_final)
-        elif const_expr(self.traits.MXFP4):
+        elif const_expr(self.traits.kv_dtype == MXFP4_KV_DTYPE):
             self.epilogue.store_mxfp4(o_final)
         elif const_expr(self.traits.DUAL_GROUP):
             o_final = self.merge_groups(o_final)
@@ -424,7 +436,7 @@ class PaDecodePipeline:
             )
         merged[t.m_slot(0)] = m
         merged[t.l_slot(0)] = o_final[t.l_slot(0)] * a0 + fx.Float32(ml[1]) * a1
-        if const_expr(t.MXFP4):
+        if const_expr(t.kv_dtype == MXFP4_KV_DTYPE):
             # The MXFP4 store merges its waves through LDS that overlaps the
             # merge slots: every lane reads its slot first.
             gpu.barrier()
@@ -538,7 +550,7 @@ class PaDecodePipeline:
         v_page_cur = ostate[
             self.traits.V_SLOT
         ]  # this tile's V pages, as one PAGES_PER_CHUNK-wide i32 vector
-        tok0 = tt * self.traits.TILE_TOK
+        tok0 = tt * KV_COMPUTE_BLOCK
         # Interleave MFMA with VALU/LDS or page16 V loads.
         if const_expr(
             (not self.traits.per_token_kv and multi_query) or self.traits.PAGE16_VPIPE
@@ -589,7 +601,7 @@ class PaDecodePipeline:
             ]
 
         q_scale_vec = None
-        if const_expr(self.traits.M_TILES > 1 and not self.traits.is_bf16_kv):
+        if const_expr(self.traits.M_TILES > 1 and self.traits.kv_dtype != fx.BFloat16):
             q_scale_vec = self.lds.load(
                 self.traits.sQscale_off
                 + self.ctx.lane16 * (self.traits.M_TILES * self.traits.f32),
@@ -614,7 +626,7 @@ class PaDecodePipeline:
                 mask_tail,
                 has_next,
             )
-        if const_expr(self.traits.MXFP4):
+        if const_expr(self.traits.kv_dtype == MXFP4_KV_DTYPE):
             # Masks tail scores/V by tile_valid at runtime, so it ignores mask_tail.
             return self.single_query_tile_mxfp4(
                 ostate, k_cur, tt1, tile_valid, q_ops_all
@@ -689,7 +701,7 @@ class PaDecodePipeline:
 
             scale = (
                 self.ctx.scale_qk
-                if const_expr(self.traits.is_bf16_kv)
+                if const_expr(self.traits.kv_dtype == fx.BFloat16)
                 else self.ctx.scale_qk * fx.Float32(q_scale_vec[m])
             )
             masked_chunks = self.softmax.multi_scores(
@@ -1082,7 +1094,7 @@ class PaDecodePipeline:
             and self.traits.sliding_window == 0
         )
         for m in range_constexpr(self.traits.M_TILES):
-            if const_expr(self.traits.is_bf16_kv):
+            if const_expr(self.traits.kv_dtype == fx.BFloat16):
                 scale = self.ctx.scale_qk
             elif const_expr(self.traits.M_TILES > 1):
                 scale = self.ctx.scale_qk * fx.Float32(q_scale_vec[m])
@@ -1240,7 +1252,9 @@ class PaDecodePipeline:
             self.kv.mxfp4_stage_v_bf16(v_raw, a, tile_valid)
         scale_b = fx.full(4, self.ctx.scale_qk * q_mantissa, fx.Float32)
         scores = [frag_Ss[a] * scale_b for a in range_constexpr(t.NCHUNK)]
-        if tile_valid < t.TILE_TOK:  # only a sequence's last tile has masked tokens
+        if (
+            tile_valid < KV_COMPUTE_BLOCK
+        ):  # only a sequence's last tile has masked tokens
             thr, _ = self.softmax.row_thresholds(tile_valid, None, 0)
             neg4 = fx.full(4, float("-inf"), fx.Float32)
             scores = [
