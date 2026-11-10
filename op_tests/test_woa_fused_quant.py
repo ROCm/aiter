@@ -22,6 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
 
 from aiter import dtypes
+from aiter.jit.utils.build_targets import base_gfx_arch
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.batched_gemm_a8w8_gfx1250 import run_bmm_a8w8_mxfp8_32_gfx1250
 from aiter.ops.shuffle import shuffle_weight
@@ -90,9 +91,10 @@ def run_case(b, m, n, k):
 
 
 def main():
-    if get_gfx() != "gfx1250":
+    # Same fold supported() uses: gfx1250-strict shares the gfx1250 kernel.
+    if base_gfx_arch(get_gfx()) != "gfx1250":
         print(f"fused-quant epilogue is gfx1250-only; skipping on {get_gfx()}")
-        return
+        return 0
     p = argparse.ArgumentParser()
     p.add_argument("-s", type=str, default="16,48,128,256")
     p.add_argument("-b", type=int, default=2)
@@ -104,8 +106,12 @@ def main():
         sc, fp, _tot = run_case(a.b, m, a.n, a.k)
         if sc != 0 or fp > 0:
             bad += 1
-    print("ALL BIT-EXACT" if bad == 0 else f"{bad} shape(s) mismatched")
+    if bad:
+        print(f"{bad} shape(s) mismatched")
+        return 1
+    print("ALL BIT-EXACT")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
