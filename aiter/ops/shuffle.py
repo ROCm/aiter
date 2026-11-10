@@ -5,6 +5,7 @@ import torch
 import torch.nn.functional as F
 
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.moe_nvfp4_common import scale_gs
 
 
 def _moe_tile_shuffle(
@@ -454,6 +455,25 @@ def shuffle_scale_a16w4(
     return shuffle_scale(
         src, experts_cnt=experts_cnt, is_guinterleave=True, gate_up=gate_up
     )
+
+
+def shuffle_scale_nvfp4_moe(src: torch.Tensor) -> torch.Tensor:
+    """gfx950 NVFP4 MoE (aiter.ops.moe_nvfp4) E4M3 block-scale preshuffle.
+
+    [E, N, K/16] -> [E][N/16][K/128/GS][64][GS/2][4] bytes, GS =
+    scale_gs(K / 128): per 16-row N tile and K-tile pair the 64 lanes x
+    4 bytes of one scale load, GS/2 pairs per group. An odd K-tile count gets zero
+    scales for the missing K-tile.
+    """
+    x_type = src.dtype
+    s = src.view(torch.uint8)
+    if s.shape[2] % 16:
+        s = F.pad(s, (0, 16 - s.shape[2] % 16))
+    E, N, KS = s.shape
+    s = s.view(E, N // 16, 16, KS // 16, 2, 4, 2).permute(0, 1, 3, 5, 2, 4, 6)
+    gps = scale_gs(KS // 8) // 2
+    s = s.reshape(E, N // 16, -1, gps, 64, 4).permute(0, 1, 2, 4, 3, 5)
+    return s.contiguous().view(x_type)
 
 
 def pack_int8_to_packed_int4(x_shuf_i8: torch.Tensor) -> torch.Tensor:

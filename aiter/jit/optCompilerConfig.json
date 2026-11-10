@@ -776,7 +776,7 @@
     },
     "module_moe_nvfp4": {
         "srcs": [
-            "f'{AITER_CSRC_DIR}/kernels/nvfp4_moe/moe_nvfp4_instances.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/nvfp4_moe/moe_nvfp4_entry.cu'",
             "f'{AITER_CSRC_DIR}/kernels/nvfp4_moe/moe_nvfp4.cu'",
             "f'{AITER_CSRC_DIR}/pybind/moe_nvfp4_pybind.cu'"
         ],
@@ -791,7 +791,7 @@
         ],
         "verbose": "False",
         "torch_exclude": "True",
-        "blob_gen_cmd": "''",
+        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/kernels/nvfp4_moe/gen_instances.py --working_path {{}}'",
         "is_experimental": "True"
     },
     "module_fmha_fwd_bf16_opus": {

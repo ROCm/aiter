@@ -1,16 +1,16 @@
 // NVFP4 MoE GEMM: LDS-DMA weight ring with X in an LDS ring fed by DMA (X_DMA, stage 1 only).
 //
 // Weights and weight scales go global -> LDS by buffer_load ... lds (nt) into a wave-private ring
-// of NS = Cfg::wbuf K-tile stages. The DMA is inline asm, so the compiler's waitcnt pass does not
-// tie the ds_reads to it; each stage waits with a constant vmcnt (dma_vmcnt). Stage s = K-tile s:
+// of NS = Cfg::wbuf K-tile stages. The DMA is inline asm, so it issues in program order; each
+// stage waits with a constant vmcnt (dma_vmcnt) that counts on that order. Stage s = K-tile s:
 // NT W blocks (1 KB); GS 2 (pair layout): even stages also carry the NT scale pair blocks (256 B,
 // one pair per two K-tiles), so the ring is NS / 2 pair slots of NT 2304 B per wave; GS > 2: the
 // pair slots hold only W (NT 2048 B) and one group slot of NT KB per wave (GS 4: NT 512 B) takes
 // the scale group (one buffer_load_dword{x3,x4} ... lds per tile and group, read once per group).
 // Stage c: wait for c, ds_read it, refill its slot with stage c + NS, compute. The gathered X rows
 // go by DMA into a WG-shared ring of XS = Cfg::xbuf K-tiles, synced by s_barrier per stage.
-// Cfg::xg: row-contiguous X DMA lanes (8 lanes per 128 B line, XOR-swizzled LDS slots), with the
-// XCD remap of the kernel. Cfg::xbf16: X(s) goes global -> VGPR where its DMA would be issued;
+// Cfg::xcdremap: row-contiguous X DMA lanes (8 lanes per 128 B line, XOR-swizzled LDS slots), with
+// the XCD remap of the kernel. Cfg::inbf16: X(s) goes global -> VGPR where its DMA would be issued;
 // stage s - 1, after the W refill and the MFMAs of weight tile 0, waits for it, casts it to f16
 // and writes the own blocks of the X ring (the X ring holds f16 as with the f16 X DMA).
 #pragma once
@@ -29,17 +29,17 @@ DEV v4i dma_desc(const void* p, int n = -1)
 // of scale pairs at GS 2), GS > 2: + the scale group slot (NT KB, GS 4: NT / 2 KB)
 constexpr int dma_wave_ring_bytes(const Cfg& c)
 {
-    return c.wbuf / 2 * c.nt * (c.gs > 2 ? 2048 : 2304) +
-           (c.gs > 2 ? c.nt * (c.gs == 4 ? 512 : 1024) : 0);
+    return c.wbuf / 2 * c.n_tiles * (c.gs > 2 ? 2048 : 2304) +
+           (c.gs > 2 ? c.n_tiles * (c.gs == 4 ? 512 : 1024) : 0);
 }
 // X DMA blocks per wave and stage (4 MT blocks of 1 KB per K-tile over the WN waves)
-constexpr int dma_x_blocks(const Cfg& c) { return (4 * c.mt + c.wn - 1) / c.wn; }
+constexpr int dma_x_blocks(const Cfg& c) { return (4 * c.m_tiles + c.waves - 1) / c.waves; }
 // LDS v4i of a kernel: the W rings of all waves, the X ring and a spare X block (WN does not
 // divide 4 MT: the waves without a block of their own DMA into it)
 constexpr int dma_lds_v4(const Cfg& c)
 {
-    return (c.wn * dma_wave_ring_bytes(c) + c.mt * 4 * 1024 * c.xbuf +
-            ((4 * c.mt) % c.wn ? DMA_X_SLOTS * 16 : 0)) /
+    return (c.waves * dma_wave_ring_bytes(c) + c.m_tiles * 4 * 1024 * c.xbuf +
+            ((4 * c.m_tiles) % c.waves ? DMA_X_SLOTS * 16 : 0)) /
            16;
 }
 // Stages at the end that issue no W or X refill past the last K-tile (even)
@@ -57,8 +57,10 @@ constexpr int dma_peeled(const Cfg& c)
 
 // LDS DMA of BYTES (16, 12 or 4) per lane to LDS byte address m0 + 16 lane (4 B: m0 + 4 lane;
 // 12 B: the 4th dword is skipped). NONTEMP: nontemporal (only 16 B may be plain, for X rows).
-// HALF (16 B nt): lanes 0 .. 31 only, a GS-4 scale group block (512 B, 8 B per lane) copied as
-// is (there is no 8 B LDS DMA).
+// HALF (16 B nt): a GS-4 scale group block is 512 B, half of a 64-lane 16 B DMA, and there is no
+// 8 B LDS DMA, so lanes 0 .. 31 copy 16 B each with exec_hi cleared for this one instruction.
+// The asm sets exec itself: a C branch (lane < 32) adds a compare, s_and_saveexec and
+// s_cbranch_execz and splits the unrolled stage into basic blocks.
 #define NVFP4_MOE_DMA_ASM(LOAD, MOD)                                                               \
     asm volatile("s_mov_b32 m0, %3\n\ts_nop 0\n\t" LOAD " %0, %1, %2 offen" MOD " lds"             \
                  ::"v"(voff), "s"(desc), "s"(soff), "s"(m0)                                        \
@@ -134,12 +136,19 @@ static bool dma_k_fits(int K)
 // K loop of one wave on the LDS-DMA weight ring (X_DMA): the whole K, stage = K-tile, in cycles
 // of GS stages (compile-time scale group phase and pair parity), the end cycles peeled.
 template <Cfg C, int MA>
-DEV void dma_k_loop(const Params& p, int mblk, int e, const WaveIds& w, const Sources<C.nt>& src,
-                    Routing<C.mt>& rt, v4f (&acc)[C.nt][C.mt], v4i* ring)
+DEV void dma_k_loop(const Params& p,
+                    int mblk,
+                    int e,
+                    const WaveIds& w,
+                    const Sources<C.n_tiles>& src,
+                    Routing<C.m_tiles>& rt,
+                    v4f (&acc)[C.n_tiles][C.m_tiles],
+                    v4i* ring)
 {
-    constexpr int MT = C.mt, NT = C.nt, WN = C.wn, NS = C.wbuf, XS = C.xbuf, GS = C.gs;
-    constexpr bool XG = C.xg, XBF16 = C.xbf16;
-    static_assert(C.x == X_DMA && C.s1 && C.wk == 1 && C.kc == 1 && C.kt == 0, "DMA ring");
+    constexpr int MT = C.m_tiles, NT = C.n_tiles, WN = C.waves, NS = C.wbuf, XS = C.xbuf, GS = C.gs;
+    constexpr bool XCDREMAP = C.xcdremap, INBF16 = C.inbf16;
+    static_assert(C.x == X_DMA && C.s1 && C.ksplit == 1 && C.chunk_k_tiles == 1 && C.k_tiles == 0,
+                  "DMA ring");
     static_assert(NS % 2 == 0 && NS >= 2, "LDS ring: even NS");
     // GS > 2: one scale group slot per wave (after the pair slots), refilled with W(GS g) at stage
     // GS g - NS, after the read of group g - 1 (at its first stage GS (g - 1))
@@ -153,10 +162,10 @@ DEV void dma_k_loop(const Params& p, int mblk, int e, const WaveIds& w, const So
     constexpr int X_DMAS          = dma_x_blocks(C);
     constexpr int X_STAGE_V4      = 4 * MT * DMA_X_SLOTS; // one X ring stage
     static_assert(XS >= 2 && XS <= NS + 3, "X ring");
-    // XBF16: register ring of X(s), slot s % X_REGS (X(s) is loaded at stage s - XS + 1 and cast
+    // INBF16: register ring of X(s), slot s % X_REGS (X(s) is loaded at stage s - XS + 1 and cast
     // at stage s - 1). The slot is compile-time in the cycle: X_REGS divides GS.
-    static_assert(!XBF16 || (XS >= 3 && XS <= NS + 2 && GS % (XS - 1) == 0), "bad XBF16");
-    constexpr int X_REGS = XBF16 ? XS - 1 : 1;
+    static_assert(!INBF16 || (XS >= 3 && XS <= NS + 2 && GS % (XS - 1) == 0), "bad INBF16");
+    constexpr int X_REGS = INBF16 ? XS - 1 : 1;
     const int k_tiles    = p.K / 128;
     const int lane       = w.lane;
     const int wave_n     = w.wave_n;
@@ -221,17 +230,17 @@ DEV void dma_k_loop(const Params& p, int mblk, int e, const WaveIds& w, const So
         const int unit        = wave_n + WN * j;
         const bool unit_valid = unit < 4 * MT;
         const int row_half = unit & 1, col_half = unit >> 1 & 1, m = unit_valid ? unit >> 2 : 0;
-        // XG: lanes 8 r .. 8 r + 7 load the 128 B of row r (one line per 8 lanes), column
+        // XCDREMAP: lanes 8 r .. 8 r + 7 load the 128 B of row r (one line per 8 lanes), column
         // (lane & 7) ^ r, so slot 8 r + (s ^ r) = row r, column s
-        const int dma_row = XG ? lane >> 3 : lane & 7;
+        const int dma_row = XCDREMAP ? lane >> 3 : lane & 7;
         const int t       = p.sorted_ids[mblk * BM + m * 16 + 8 * row_half + dma_row] & 0xffffff;
         x_dma_dst[j]      = unit_valid ? unit * DMA_X_SLOTS * 16 : XS * X_STAGE_V4 * 16;
         // padding rows / unused tiles load an out-of-range row (zeros)
         const int row = t < p.T && m < MA && unit_valid ? t : x_rows;
         x_dma_voff[j] =
-            row * p.K * 2 + 128 * col_half + 16 * (XG ? (lane & 7) ^ (lane >> 3) : lane >> 3);
+            row * p.K * 2 + 128 * col_half + 16 * (XCDREMAP ? (lane & 7) ^ (lane >> 3) : lane >> 3);
     }
-    // XBF16: x_cast(s, slot, vmcnt) waits for X(s) in register slot slot (the wait asm takes the
+    // INBF16: x_cast(s, slot, vmcnt) waits for X(s) in register slot slot (the wait asm takes the
     // registers, so the casts cannot move above it), casts it and writes the own X ring blocks
     v4i x_regs[X_REGS][X_DMAS];
     auto x_cast = [&](int s, int slot, auto vmcnt) {
@@ -246,12 +255,13 @@ DEV void dma_k_loop(const Params& p, int mblk, int e, const WaveIds& w, const So
                 x_ring[x_dma_dst[j] / 16 + s % XS * X_STAGE_V4 + lane] =
                     cast_bf16x8_f16(x_regs[slot][j]);
     };
-    // X(s) DMA into the X ring; XBF16: X(s) load into register slot slot
+    // X(s) DMA into the X ring; INBF16: X(s) load into register slot slot (asm too: for a builtin
+    // load the compiler waits vmcnt(0) before the first use, draining the W DMAs issued after it)
     auto dma_x = [&](int s, int slot) {
 #pragma unroll
         for(int j = 0; j < X_DMAS; j++)
         {
-            if constexpr(XBF16)
+            if constexpr(INBF16)
                 asm volatile("buffer_load_dwordx4 %0, %1, %2, %3 offen"
                              : "=v"(x_regs[slot][j])
                              : "v"(x_dma_voff[j]), "s"(x_desc), "s"(s * 256));
@@ -262,14 +272,14 @@ DEV void dma_k_loop(const Params& p, int mblk, int e, const WaveIds& w, const So
         }
     };
     // X read offsets (16 B slots) of the lane within a stage per q: row r = lane_col & 7, column
-    // s = 4 (lane_group & 1) + q in slot 8 s + r (XG: 8 r + (s ^ r))
+    // s = 4 (lane_group & 1) + q in slot 8 s + r (XCDREMAP: 8 r + (s ^ r))
     int x_read_off[4];
 #pragma unroll
     for(int q = 0; q < 4; q++)
     {
         const int r = w.lane_col & 7, s = 4 * (w.lane_group & 1) + q;
         x_read_off[q] = (2 * (w.lane_group >> 1) + (w.lane_col >> 3)) * DMA_X_SLOTS +
-                        (XG ? 8 * r + (s ^ r) : 8 * s + r);
+                        (XCDREMAP ? 8 * r + (s ^ r) : 8 * s + r);
     }
 
 #pragma unroll
@@ -291,7 +301,7 @@ DEV void dma_k_loop(const Params& p, int mblk, int e, const WaveIds& w, const So
         if constexpr(K + NS + 1 >= 0)
             dma_w(K + NS + 1, IntConst<1>{}, false);
     });
-    if constexpr(XBF16)
+    if constexpr(INBF16)
         x_cast(0, 0, IntConst<dma_vmcnt<NT, X_DMAS, NS, XS, GS, true>(-1, 0, true)>{});
 
     uint32_t w_scale[NT];                    // scale pairs of the current K-tile pair
@@ -299,7 +309,7 @@ DEV void dma_k_loop(const Params& p, int mblk, int e, const WaveIds& w, const So
     // a main-loop stage relative to K-tiles - NS (see dma_vmcnt), phase 0
     constexpr int MAIN_STAGE = -GS * (NS + XS + 4);
     // stage c, POS = c % GS (scale group phase; pair half POS & 1), LEFT stages after c (-1: at
-    // least the peeled end): wait + barrier, X refill, read, W refill, compute. XBF16: X(c + 1)
+    // least the peeled end): wait + barrier, X refill, read, W refill, compute. INBF16: X(c + 1)
     // is cast after the MFMAs of weight tile 0.
     auto stage = [&](int c, auto pos, auto left) {
         constexpr int POS = pos.value, LEFT = left.value, PAR = POS & 1;
@@ -307,7 +317,7 @@ DEV void dma_k_loop(const Params& p, int mblk, int e, const WaveIds& w, const So
         constexpr bool X_REFILL = LEFT < 0 || LEFT >= XS - 1; // X(c + XS - 1) exists
         constexpr int R = LEFT < 0 ? MAIN_STAGE + nonneg_mod(POS + NS, GS) : NS - 1 - LEFT;
         constexpr int X_CAST_VMCNT =
-            XBF16 && LEFT != 0 ? dma_vmcnt<NT, X_DMAS, NS, XS, GS>(R, R + 1, true) : -1;
+            INBF16 && LEFT != 0 ? dma_vmcnt<NT, X_DMAS, NS, XS, GS>(R, R + 1, true) : -1;
         constexpr int NWAIT = dma_vmcnt<NT, X_DMAS, NS, XS, GS>(R - 1, R);
         static_assert(NWAIT >= 0, "vmcnt");
         // own X / W DMAs of stage c and own reads of stage c - 1 done; after the barrier those

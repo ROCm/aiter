@@ -18,17 +18,17 @@ struct Chunk
 // X rows 8 (q % 2) + l % 8 x 128 B (column half q / 2), scattered to the B-operand order by the
 // LDS store. The XK MA active rows of a stage go to the waves as in AITER gemm2: UW = min(WN, 4)
 // waves share the 4 loads of a row (wave quarter wave_n % UW), WN / UW row groups split the rows
-// (rows wave_n / UW + WN / UW t). bf16 X (stage-1 X_STREAM _xbf16): cast to f16 at the LDS store.
+// (rows wave_n / UW + WN / UW t). bf16 X (stage-1 X_STREAM _inbf16): cast to f16 at the LDS store.
 template <Cfg C, int MA, int XK>
 struct XLdsUnits
 {
-    static constexpr int MT       = C.mt;
-    static constexpr int UW       = C.wn < 4 ? C.wn : 4;
-    static constexpr int GROUPS   = C.wn / UW;
+    static constexpr int MT       = C.m_tiles;
+    static constexpr int UW       = C.waves < 4 ? C.waves : 4;
+    static constexpr int GROUPS   = C.waves / UW;
     static constexpr int ROWS     = (XK * MT + GROUPS - 1) / GROUPS; // rows per wave (at MA MT)
     static constexpr int PER_WAVE = ROWS * (4 / UW);
     static constexpr int STAGE_V4 = XK * MT * 4 * 64; // LDS v4i of a stage
-    static_assert(C.wn % UW == 0 && 4 % UW == 0, "X LDS loads: waves");
+    static_assert(C.waves % UW == 0 && 4 % UW == 0, "X LDS loads: waves");
     int row_off[MT][2]; // X byte offset of the lane's row 8 h + l % 8 of m tile m, + its column
     int lds_lane;       // LDS v4i index of the lane within a row
     int quarter, group; // wave_n % UW, wave_n / UW
@@ -46,7 +46,7 @@ struct XLdsUnits
             }
         lds_lane = (w.lane >> 3 & 3) * 64 + (w.lane & 7) + 16 * (w.lane >> 5);
         // WN <= 4: one row group, rows compile-time (wave_n < WN is unknown to the compiler)
-        quarter = C.wn == UW ? w.wave_n : w.wave_n % UW;
+        quarter = C.waves == UW ? w.wave_n : w.wave_n % UW;
         group   = GROUPS == 1 ? 0 : w.wave_n / UW;
     }
     // load j of the wave: row t = j / (4 / UW) of the wave, quarter a = j % (4 / UW)
@@ -83,7 +83,7 @@ struct XLdsUnits
         for(int j = 0; j < PER_WAVE; j++)
             if(const Unit a = unit(j); a.on)
                 stage[(a.i * MT + a.m) * 256 + 8 * (a.q & 1) + 32 * (a.q >> 1) + lds_lane] =
-                    C.xbf16 ? cast_bf16x8_f16(r[j]) : r[j];
+                    C.inbf16 ? cast_bf16x8_f16(r[j]) : r[j];
     }
 };
 
@@ -96,19 +96,19 @@ struct NoXUnits
     __device__ __forceinline__ void store(const v4i (&)[1], v4i*) const {}
 };
 
-// Number of distinct group phases (kt_begin % GS) of the WK wave slices of SLICE K-tiles.
-constexpr bool slice_phase_used(int wk, int slice, int gs, int ph)
+// Number of distinct group phases (kt_begin % GS) of the ksplit wave slices of SLICE K-tiles.
+constexpr bool slice_phase_used(int ksplit, int slice, int gs, int ph)
 {
-    for(int k = 0; k < wk; k++)
+    for(int k = 0; k < ksplit; k++)
         if(k * slice % gs == ph)
             return true;
     return false;
 }
-constexpr int slice_phases(int wk, int slice, int gs)
+constexpr int slice_phases(int ksplit, int slice, int gs)
 {
     int n = 0;
     for(int ph = 0; ph < gs; ph++)
-        n += slice_phase_used(wk, slice, gs, ph);
+        n += slice_phase_used(ksplit, slice, gs, ph);
     return n;
 }
 
@@ -122,8 +122,9 @@ constexpr int reg_k_unit(const Cfg& c) { return c.x == X_STREAM ? reg_cycle(c) :
 // LDS v4i of the X ring / block (X_STREAM, X_RESIDENT)
 constexpr int x_lds_v4(const Cfg& c)
 {
-    return c.x == X_STREAM ? c.xbuf * c.kc * c.mt * 4 * 64
-                           : c.x == X_RESIDENT ? c.kt * c.mt * 4 * 64 : 0;
+    return c.x == X_STREAM     ? c.xbuf * c.chunk_k_tiles * c.m_tiles * 4 * 64
+           : c.x == X_RESIDENT ? c.k_tiles * c.m_tiles * 4 * 64
+                               : 0;
 }
 
 // Waves per EU hint: X_RESIDENT blocks of 2+ m tiles in WGs of at most 4 waves ask for the waves
@@ -133,10 +134,10 @@ constexpr int x_lds_v4(const Cfg& c)
 // hint; 32x512 waves8 would spill).
 constexpr int waves_hint(const Cfg& c)
 {
-    if(c.x != X_RESIDENT || c.mt < 2 || c.wn > 4)
+    if(c.x != X_RESIDENT || c.m_tiles < 2 || c.waves > 4)
         return c.occ;
     const int lds   = 16 * (x_lds_v4(c) > c_tile_v4(c) ? x_lds_v4(c) : c_tile_v4(c)) + 16;
-    const int waves = 163840 / lds * c.wn / 4;
+    const int waves = 163840 / lds * c.waves / 4;
     const int w     = waves < 3 ? waves : 3;
     return w > c.occ ? w : c.occ;
 }
@@ -146,57 +147,66 @@ constexpr int waves_hint(const Cfg& c)
 // fenced groups spill: 32x256 KT 6 at occupancy 3, 1.08-1.15x).
 constexpr bool fence_offsets(const Cfg& c)
 {
-    const int vgprs = 4 * c.wbuf * c.kc * c.nt + 16 * c.kc * c.mt + 4 * c.nt * c.mt;
+    const int vgprs = 4 * c.wbuf * c.chunk_k_tiles * c.n_tiles + 16 * c.chunk_k_tiles * c.m_tiles +
+                      4 * c.n_tiles * c.m_tiles;
     return c.x != X_RESIDENT || vgprs <= 512 / waves_hint(c);
 }
 
 // K loop of one wave on the register weight ring. The wave reduces the K slice kt_begin ..
-// kt_begin + slice - 1 (slice = K-tiles / WK) in chunks of KC K-tiles; chunk c is issued
+// kt_begin + slice - 1 (slice = K-tiles / C.ksplit) in chunks of KC K-tiles; chunk c is issued
 // P = lookahead(C) chunks ahead: weights, the scale groups whose first K-tile it holds (unless
-// C.up: all groups of the slice loaded up front, before the routing) and, for X_REG, its X.
-// Compile-time K (C.kt): one fully unrolled walk per slice start phase kt_begin % GS (the last
+// C.upfront: all groups of the slice loaded up front, before the routing) and, for X_REG, its X.
+// Compile-time K (C.k_tiles): one fully unrolled walk per slice start phase kt_begin % GS (the last
 // chunk may be shorter); runtime K: cycles of reg_cycle(C) chunks, whole groups per wave.
 // Load order: X first with bf16 X (X lands and is cast while the weights are in flight); else
 // at GS 2 weights, scales, X; else weights, X, scales.
 template <Cfg C, int MA>
-DEV void reg_k_loop(const Params& p, int mblk, int e, const WaveIds& w, const Sources<C.nt>& src,
-                    Routing<C.mt>& rt, v4f (&acc)[C.nt][C.mt], v4i* x_lds, float (&rw)[C.mt])
+DEV void reg_k_loop(const Params& p,
+                    int mblk,
+                    int e,
+                    const WaveIds& w,
+                    const Sources<C.n_tiles>& src,
+                    Routing<C.m_tiles>& rt,
+                    v4f (&acc)[C.n_tiles][C.m_tiles],
+                    v4i* x_lds,
+                    float (&rw)[C.m_tiles])
 {
-    constexpr int MT = C.mt, NT = C.nt, KC = C.kc, R = C.wbuf, P = lookahead(C);
+    constexpr int MT = C.m_tiles, NT = C.n_tiles, KC = C.chunk_k_tiles, R = C.wbuf,
+                  P  = lookahead(C);
     constexpr int GS = C.gs, GPS = GS / 2;
-    constexpr bool CT    = C.kt > 0;
-    constexpr int SLICE  = CT ? C.kt / C.wk : 0;
+    constexpr bool CT    = C.k_tiles > 0;
+    constexpr int SLICE  = CT ? C.k_tiles / C.ksplit : 0;
     constexpr bool LDS_X = C.x != X_REG;
-    constexpr bool CAST  = C.xbf16 && C.x == X_REG;
-    static_assert(C.x != X_DMA && (!C.xbf16 || C.x == X_REG || (C.x == X_STREAM && C.s1)),
+    constexpr bool CAST  = C.inbf16 && C.x == X_REG;
+    static_assert(C.x != X_DMA && (!C.inbf16 || C.x == X_REG || (C.x == X_STREAM && C.s1)),
                   "register ring X placement; bf16 X: X_REG or stage-1 X_STREAM");
-    static_assert(!CT || C.kt % C.wk == 0, "compile-time K: whole wave slices");
+    static_assert(!CT || C.k_tiles % C.ksplit == 0, "compile-time K: whole wave slices");
     static_assert(CT || KC % 2 == 0, "runtime K: whole scale pairs per chunk");
-    static_assert(!C.up || (CT && (SLICE % GS == 0 || C.wk == 1)),
+    static_assert(!C.upfront || (CT && (SLICE % GS == 0 || C.ksplit == 1)),
                   "up front: compile-time K, slices of whole groups");
-    static_assert(!LDS_X || C.wk == 1, "X in LDS: no K split");
-    static_assert(C.x != X_RESIDENT || (CT && C.kt % KC == 0), "resident X: whole chunks");
+    static_assert(!LDS_X || C.ksplit == 1, "X in LDS: no K split");
+    static_assert(C.x != X_RESIDENT || (CT && C.k_tiles % KC == 0), "resident X: whole chunks");
     static_assert(C.x != X_STREAM || C.xbuf >= 2, "X stream: at least 2 LDS stages");
-    const int k_tiles  = CT ? C.kt : p.K / 128;
-    const int slice    = CT ? SLICE : k_tiles / C.wk;
+    const int k_tiles  = CT ? C.k_tiles : p.K / 128;
+    const int slice    = CT ? SLICE : k_tiles / C.ksplit;
     const int kt_begin = w.wave_k * slice;
 
     constexpr int NUP = (SLICE + GS - 1) / GS; // up front: groups of the slice
-    uint32_t up[C.up ? NUP * GPS : 1][NT];
+    uint32_t sc_upfront[C.upfront ? NUP * GPS : 1][NT];
     // X_REG: the sorted id loads go first (the X rows gate the first X loads)
     int sid[MT];
     if constexpr(C.x == X_REG)
         read_sorted_ids<MT>(sid, p, mblk, w.lane_col);
-    if constexpr(C.up)
+    if constexpr(C.upfront)
     {
-        int up_off[NUP][NT];
+        int upfront_off[NUP][NT];
         static_for<NUP>([&](auto q) {
-            scale_group_offsets<GPS>(up_off[q.value], src, kt_begin / GS + q.value);
+            scale_group_offsets<GPS>(upfront_off[q.value], src, kt_begin / GS + q.value);
         });
         if constexpr(fence_offsets(C))
             sched_fence();
         static_for<NUP>([&](auto q) {
-            load_scale_group<GPS>(up, src, up_off[q.value], q.value * GPS);
+            load_scale_group<GPS>(sc_upfront, src, upfront_off[q.value], q.value * GPS);
         });
     }
     if constexpr(C.x == X_REG)
@@ -215,7 +225,7 @@ DEV void reg_k_loop(const Params& p, int mblk, int e, const WaveIds& w, const So
             x_lane_off[m] = (row * p.K + 32 * w.lane_group) * 2;
         }
     }
-    constexpr int XK = C.x == X_RESIDENT ? C.kt : KC; // K-tiles per X LDS stage
+    constexpr int XK = C.x == X_RESIDENT ? C.k_tiles : KC; // K-tiles per X LDS stage
     using Units = std::conditional_t<LDS_X, XLdsUnits<C, MA, XK>, NoXUnits>;
     const Units units(p, mblk, w);
     v4i x_regs[C.x == X_STREAM ? R : 1][Units::PER_WAVE];
@@ -227,14 +237,14 @@ DEV void reg_k_loop(const Params& p, int mblk, int e, const WaveIds& w, const So
         constexpr int HEAD = CT ? 0 : reg_head(C);
         constexpr int END  = CT ? NC : P; // fewest peeled end steps
         constexpr int NG   = CT ? (PH + SLICE + GS - 1) / GS : 0; // groups of the slice
-        constexpr int BANK = CT ? (C.up ? 1 : NG * GPS) : CYC * KC / 2;
+        constexpr int BANK = CT ? (C.upfront ? 1 : NG * GPS) : CYC * KC / 2;
         constexpr int NB   = !CT && P > 0 ? 2 : 1; // banks: this cycle's pairs (+ the next's)
         uint32_t bank[NB][BANK][NT];
         Chunk<MT, NT, KC> ring[R];
         int kt0 = kt_begin;
         // a phase-specific copy of kt_begin: otherwise the identical loads of the phase walks
         // are hoisted above the phase branch
-        if constexpr(CT && slice_phases(C.wk, SLICE, GS) > 1)
+        if constexpr(CT && slice_phases(C.ksplit, SLICE, GS) > 1)
             asm volatile("; phase %1" : "+s"(kt0) : "n"(PH));
         const int g0 = (int)((uint32_t)kt0 / GS);
         auto len     = [](int pos) { return CT && SLICE - pos * KC < KC ? SLICE - pos * KC : KC; };
@@ -245,9 +255,9 @@ DEV void reg_k_loop(const Params& p, int mblk, int e, const WaveIds& w, const So
             Chunk<MT, NT, KC>& r = ring[POS % R];
             const int kt         = kt0 + c * KC;
             // f(u, g, p0) for each scale group g of the chunk (slot u, first bank pair p0)
-            constexpr int NGU = CT ? (C.up ? 1 : NG) : KC / 2;
+            constexpr int NGU = CT ? (C.upfront ? 1 : NG) : KC / 2;
             auto groups       = [&](auto f) {
-                if constexpr(CT && !C.up)
+                if constexpr(CT && !C.upfront)
                     static_for<NG>([&](auto q) {
                         constexpr int FIRST = q.value == 0 ? 0 : q.value * GS - PH;
                         if constexpr(FIRST / KC == POS)
@@ -335,8 +345,8 @@ DEV void reg_k_loop(const Params& p, int mblk, int e, const WaveIds& w, const So
                 uint32_t sc[NT];
 #pragma unroll
                 for(int j = 0; j < NT; j++)
-                    if constexpr(C.up)
-                        sc[j] = up[T / 2][j];
+                    if constexpr(C.upfront)
+                        sc[j] = sc_upfront[T / 2][j];
                     else
                         sc[j] = bank[0][T / 2][j];
                 mma_ktile<MT, NT, MA, T & 1, CAST>(r.w[i.value], sc, r.x[i.value], acc);
@@ -379,7 +389,7 @@ DEV void reg_k_loop(const Params& p, int mblk, int e, const WaveIds& w, const So
         // prologue: X block (X_RESIDENT), chunks 0 .. P - 1, X stage 0 (X_STREAM)
         if constexpr(C.x == X_RESIDENT)
             units.load(x_regs[0], src.x_desc, 0);
-        if constexpr(C.up && C.x == X_REG)
+        if constexpr(C.upfront && C.x == X_REG)
             asm volatile("" ::"v"(x_lane_off[0])); // the first weights wait for the routing
         static_for<P>([&](auto u) {
             if constexpr(!CT || u.value < NC)
@@ -414,8 +424,8 @@ DEV void reg_k_loop(const Params& p, int mblk, int e, const WaveIds& w, const So
     {
         const int phase = (int)((uint32_t)kt_begin % GS);
         static_for<GS>([&](auto ph) {
-            if constexpr(slice_phase_used(C.wk, SLICE, GS, ph.value))
-                if(slice_phases(C.wk, SLICE, GS) == 1 || phase == ph.value)
+            if constexpr(slice_phase_used(C.ksplit, SLICE, GS, ph.value))
+                if(slice_phases(C.ksplit, SLICE, GS) == 1 || phase == ph.value)
                     walk(ph);
         });
     }

@@ -4,15 +4,15 @@
 // a C lane holds 4 consecutive output features of one token.
 //
 // Weight decode: NVFP4 exact. fp4 -> f16 via v_cvt_scalef32_pk_f16_fp4, then times the E4M3
-// scale in f16 (exact: <= 6 significant bits). Activations f16; with Cfg::xbf16 (fallback
+// scale in f16 (exact: <= 6 significant bits). Activations f16; with Cfg::inbf16 (fallback
 // path, any sort) the kernel reads the bf16 activations and casts them to f16 itself.
 //
-// Weight tile layout: [E][NTILE][KT][64 lanes][16 B]; lane l = 16 g + c holds row 16 nt + c,
-// k in [128 kt + 32 g, +32) (raw packed fp4 bytes).
+// Weight tile layout: [E][NTILE][KT][64 lanes][16 B]; in tile i, K-tile j, lane l = 16 g + c holds
+// row 16 i + c, k in [128 j + 32 g, +32) (raw packed fp4 bytes).
 // Weight scale layout (GS layout, GS = 2 GPS K-tiles per group, GS 2 .. 8): [E][NTILE][KTP /
 // GPS][64 lanes][4 GPS B], KTP = ceil(KT / 2) K-tile pairs (odd KT: the last half zero); the
 // dword of pair p is dword p % GPS of group p / GPS. GS 2 is the pair layout, GS 6 the SG
-// layout. One layout per weight tensor (rule c3, aiter/ops/moe_nvfp4.py scale_gs).
+// layout. One layout per weight tensor (scale_gs, aiter/jit/utils/moe_nvfp4_common.py).
 #pragma once
 #include <hip/hip_runtime.h>
 #include <stdint.h>
@@ -30,7 +30,7 @@ typedef __bf16 v2bf __attribute__((ext_vector_type(2)));
 
 struct Params
 {
-    const uint8_t* x;    // activations: f16 [rows, K] (bf16 [T, K] with Cfg::xbf16)
+    const uint8_t* x;    // activations: f16 [rows, K] (bf16 [T, K] with Cfg::inbf16)
     const uint8_t* w;    // weight tiles
     const uint8_t* w_sc; // weight scales (GS layout)
     const float* inv_gs; // stage1: [E][2] (gate, up); stage2: [E]
@@ -38,7 +38,7 @@ struct Params
     const float* sorted_w;
     const int* sorted_eids;
     const int* num_valid;
-    uint8_t* out; // stage1: x_inter f16 [T*topk, I]; stage2: bf16 [T, H]
+    uint8_t* out; // stage1: x_inter f16 [T*topk, I]; stage2: f16 (Cfg::outbf16: bf16) [T, H]
     int T, topk;
     int K;      // reduction length
     int ntiles; // weight row tiles per expert (stage1: 2I/16, stage2: H/16)
@@ -57,27 +57,54 @@ enum XPlace
     X_DMA
 };
 
-// One kernel instance. Parsed from its name (parse_cfg); see moe_nvfp4_names.inc.
+// One kernel instance. Its name is the config (kernel_name in aiter/jit/utils/moe_nvfp4_common.py);
+// gen_instances.py writes the Cfg literal of each name.
 struct Cfg
 {
-    bool s1     = false;  // stage 1: gate/up + SwiGLU-OAI; else stage 2: down + bf16 atomics
-    int x       = X_REG;  // XPlace
-    int mt      = 0;      // 16-row m tiles per block (BM = 16 mt)
-    int nt      = 0;      // weight tiles per wave (stage 1: nt / 2 gate + nt / 2 up)
-    int wn      = 1;      // waves along N
-    int wk      = 1;      // waves along K (partial sums reduced in LDS)
-    int kc      = 1;      // K-tiles per weight chunk (X_DMA: 1)
-    int wbuf    = 1;      // weight buffers: register chunks, or (X_DMA) LDS K-tile stages
-    int xbuf    = 0;      // X LDS ring stages (X_STREAM, X_DMA)
-    int kt      = 0;      // compile-time K-tiles (0: K from Params)
-    int gs      = 2;      // K-tiles per weight scale group (the tensor's layout)
-    bool up     = false;  // scale groups of the wave's K slice loaded up front
-    bool tight  = false;  // sched_barrier after every chunk load and compute
-    bool xbf16  = false;  // X is bf16 (cast in the kernel)
-    bool xg     = false;  // XCD remap of the block order (+ row-contiguous X DMA lanes)
-    bool staged = false;  // stage 2: route weights early, all C reads before the atomics
-    int occ     = 1;      // waves per EU hint
+    bool s1           = false; // stage 1: gate/up + SwiGLU-OAI; else stage 2: down + output atomics
+    int x             = X_REG; // XPlace
+    int m_tiles       = 0;     // 16-row m tiles per block (BM = 16 m_tiles)
+    int n_tiles       = 0;     // weight tiles per wave (stage 1: half gate, half up)
+    int waves         = 1;     // waves along N
+    int ksplit        = 1;     // waves along K (partial sums reduced in LDS)
+    int chunk_k_tiles = 1;     // K-tiles per weight chunk (X_DMA: 1)
+    int wbuf          = 1;     // weight buffers: register chunks, or (X_DMA) LDS K-tile stages
+    int xbuf          = 0;     // X LDS ring stages (X_STREAM, X_DMA)
+    int k_tiles       = 0;     // compile-time K-tiles (0: K from Params)
+    int gs            = 2;     // K-tiles per weight scale group (the tensor's layout)
+    bool upfront      = false; // scale groups of the wave's K slice loaded up front
+    bool tight        = false; // sched_barrier after every chunk load and compute
+    bool inbf16       = false; // X is bf16 (cast in the kernel)
+    bool xcdremap     = false; // XCD remap of the block order (+ row-contiguous X DMA lanes)
+    bool staged       = false; // stage 2: route weights early, all C reads before the atomics
+    int occ           = 1;     // waves per EU hint
+    bool outbf16      = false; // stage 2: bf16 output (else f16)
 };
+
+// Field combinations the kernels implement. Names are checked by parse_kernel
+// (aiter/jit/utils/moe_nvfp4_common.py); this also covers a Cfg written by hand.
+constexpr bool cfg_valid(const Cfg& c)
+{
+    // tile sizes: at least one 16-row m tile, one weight tile per wave, one K-tile per chunk
+    if(c.m_tiles < 1 || c.n_tiles < 1 || c.chunk_k_tiles < 1)
+        return false;
+    // counts: at least one wave, K slice, weight buffer, wave per EU
+    if(c.waves < 1 || c.ksplit < 1 || c.wbuf < 1 || c.occ < 1)
+        return false;
+    // the DMA X ring is stage 1 only, the resident X block stage 2 only
+    if((c.x == X_DMA && !c.s1) || (c.x == X_RESIDENT && c.s1))
+        return false;
+    // X LDS ring stages exactly for the ring placements (xstream, xdma)
+    if((c.xbuf > 0) != (c.x == X_STREAM || c.x == X_DMA))
+        return false;
+    // scale group: 2, 4, 6 or 8 K-tiles (the scale layouts)
+    if(c.gs < 2 || c.gs > 8 || c.gs % 2)
+        return false;
+    // bf16 output only in stage 2 (stage 1 writes f16 x_inter)
+    if(c.outbf16 && c.s1)
+        return false;
+    return true;
+}
 
 // Chunks loaded ahead of the one being computed: register X loads the next chunk into a free
 // buffer before the compute (pre), LDS X refills the buffer just computed (post), the DMA ring
@@ -90,7 +117,7 @@ constexpr int lookahead(const Cfg& c) { return c.x == X_REG ? c.wbuf - 1 : c.wbu
 constexpr int reg_unit(const Cfg& c)
 {
     int u = 1;
-    while(u * c.kc % c.gs)
+    while(u * c.chunk_k_tiles % c.gs)
         u++;
     return u;
 }
@@ -100,109 +127,6 @@ constexpr int reg_cycle(const Cfg& c)
     while(m % c.wbuf)
         m += reg_unit(c);
     return m;
-}
-
-// ---------------------------------------------------------------- kernel names
-// Name grammar: s1 | s2, then <16 mt>x<16 nt wn>, then xreg | xstream | xres | xdma (x), then
-// one token per non-default Cfg field, joined by '_', in this order:
-//   ksplit<wk>, waves<wn>, wbuf<wbuf>x<128 kc>, xbuf<xbuf>, kdim<128 kt>, gs<gs>, upfront,
-//   tight, occ<occ>, xcdremap (xg), staged, xbf16.
-// A missing x token and default-valued, repeated, out-of-order or unknown tokens are errors:
-// one name per Cfg.
-// Not constexpr: a call in parse_cfg makes a bad name a compile error.
-void nvfp4_moe_bad_kernel_name();
-
-constexpr bool name_token_is(const char* b, const char* e, const char* w)
-{
-    for(; b < e; b++, w++)
-        if(*w != *b)
-            return false;
-    return *w == 0;
-}
-// b .. e = w followed by digits (v), or by digits 'x' digits (v, v2); no leading zeros
-constexpr bool
-name_token_num(const char* b, const char* e, const char* w, int& v, int* v2 = nullptr)
-{
-    for(; *w; b++, w++)
-        if(b == e || *w != *b)
-            return false;
-    auto digits = [&](int& out) {
-        if(b == e || *b < '1' || *b > '9')
-            return false;
-        out = 0;
-        while(b < e && *b >= '0' && *b <= '9')
-            out = out * 10 + (*b++ - '0');
-        return true;
-    };
-    if(!digits(v))
-        return false;
-    if(!v2)
-        return b == e;
-    return b < e && *b++ == 'x' && digits(*v2) && b == e;
-}
-
-constexpr Cfg parse_cfg(const char* name)
-{
-    Cfg c{};
-    int bm = 0, bn = 0, wbuf_k = 128, kdim = 0, last = -1; // last: order of the last token
-    bool ok = true;
-    for(const char* b = name;; b++)
-    {
-        const char* e = b;
-        while(*e && *e != '_')
-            e++;
-        int order = -1;
-        if(name_token_is(b, e, "s1") || name_token_is(b, e, "s2"))
-            c.s1 = b[1] == '1', order = 0;
-        else if(name_token_num(b, e, "", bm, &bn))
-            order = 1;
-        else if(name_token_is(b, e, "xreg"))
-            c.x = X_REG, order = 2;
-        else if(name_token_is(b, e, "xstream"))
-            c.x = X_STREAM, order = 2;
-        else if(name_token_is(b, e, "xres"))
-            c.x = X_RESIDENT, order = 2;
-        else if(name_token_is(b, e, "xdma"))
-            c.x = X_DMA, order = 2;
-        else if(name_token_num(b, e, "ksplit", c.wk))
-            ok &= c.wk > 1, order = 3;
-        else if(name_token_num(b, e, "waves", c.wn))
-            ok &= c.wn > 1, order = 4;
-        else if(name_token_num(b, e, "wbuf", c.wbuf, &wbuf_k))
-            ok &= c.wbuf > 1 || wbuf_k > 128, order = 5;
-        else if(name_token_num(b, e, "xbuf", c.xbuf))
-            order = 6;
-        else if(name_token_num(b, e, "kdim", kdim))
-            order = 7;
-        else if(name_token_num(b, e, "gs", c.gs))
-            ok &= c.gs != 2, order = 8;
-        else if(name_token_is(b, e, "upfront"))
-            c.up = true, order = 9;
-        else if(name_token_is(b, e, "tight"))
-            c.tight = true, order = 10;
-        else if(name_token_num(b, e, "occ", c.occ))
-            ok &= c.occ > 1, order = 11;
-        else if(name_token_is(b, e, "xcdremap"))
-            c.xg = true, order = 12;
-        else if(name_token_is(b, e, "staged"))
-            c.staged = true, order = 13;
-        else if(name_token_is(b, e, "xbf16"))
-            c.xbf16 = true, order = 14;
-        ok &= order > last && (last >= 2 || order == last + 1); // s1 | s2, tile, x, then the rest
-        last = order;
-        if(!*e)
-            break;
-        b = e;
-    }
-    c.mt = bm / 16;
-    c.nt = bn / 16 / c.wn;
-    c.kc = wbuf_k / 128;
-    c.kt = kdim / 128;
-    if(!ok || last < 2 || bm % 16 || bn % (16 * c.wn) || c.mt < 1 || c.nt < 1 || c.kc < 1 ||
-       wbuf_k % 128 || kdim % 128 || (c.x == X_DMA && !c.s1) || (c.x == X_RESIDENT && c.s1) ||
-       (c.xbuf > 0) != (c.x == X_STREAM || c.x == X_DMA) || c.gs % 2 || c.gs > 8)
-        nvfp4_moe_bad_kernel_name();
-    return c;
 }
 
 // ---------------------------------------------------------------- inline asm
@@ -255,7 +179,7 @@ DEV void static_for(F&& f)
 }
 
 // ---------------------------------------------------------------- block start
-// N block of the WG when Cfg::xg or Cfg::staged (set by the kernel).
+// N block of the WG when Cfg::xcdremap or Cfg::staged (set by the kernel).
 __shared__ int lds_n_block;
 // The hardware dispatches the WGs of a grid round-robin over the XCDs: WG i runs on XCD
 // i % NUM_XCDS.
@@ -342,7 +266,7 @@ DEV v8h decode_fp4x8(uint32_t d, v2h sc)
     return v8h{e0[0], e0[1], e1[0], e1[1], e2[0], e2[1], e3[0], e3[1]};
 }
 
-// 8 bf16 -> 8 f16, rounded to nearest even (the fused sort's cast and the xbf16 kernels').
+// 8 bf16 -> 8 f16, rounded to nearest even (the fused sort's cast and the inbf16 kernels').
 DEV v4i cast_bf16x8_f16(v4i bf16x8)
 {
     v4i f16x8;
@@ -387,11 +311,16 @@ DEV void mma_ktile(const v4i (&w)[NT], const uint32_t (&sc)[NT], v8h (&x)[MT][4]
     }
 }
 
+// GPT-OSS style SwiGLU: gate clamped above at LIMIT, up clamped to [-LIMIT, LIMIT],
+// sigmoid(ALPHA * gate).
+constexpr float SWIGLU_OAI_LIMIT = 7.0f;
+constexpr float SWIGLU_OAI_ALPHA = 1.702f;
+
 DEV float swiglu_oai(float gate, float up)
 {
-    gate = fminf(gate, 7.0f);
-    up   = fminf(fmaxf(up, -7.0f), 7.0f);
-    return gate / (1.0f + __expf(-1.702f * gate)) * (up + 1.0f);
+    gate = fminf(gate, SWIGLU_OAI_LIMIT);
+    up   = fminf(fmaxf(up, -SWIGLU_OAI_LIMIT), SWIGLU_OAI_LIMIT);
+    return gate / (1.0f + __expf(-SWIGLU_OAI_ALPHA * gate)) * (up + 1.0f);
 }
 
 // ---------------------------------------------------------------- wave, routing, sources
@@ -405,11 +334,11 @@ DEV WaveIds wave_ids()
     WaveIds w;
     w.lane         = threadIdx.x & 63;
     const int wave = __builtin_amdgcn_readfirstlane(threadIdx.x >> 6);
-    w.wave_k       = wave % C.wk;
-    w.wave_n       = wave / C.wk;
+    w.wave_k       = wave % C.ksplit;
+    w.wave_n       = wave / C.ksplit;
     w.lane_group   = w.lane >> 4;
     w.lane_col     = w.lane & 15;
-    w.nblock       = C.xg || C.staged ? lds_n_block : (int)blockIdx.x;
+    w.nblock       = C.xcdremap || C.staged ? lds_n_block : (int)blockIdx.x;
     return w;
 }
 
@@ -419,12 +348,12 @@ DEV int weight_tile(const Params& p, const WaveIds& w, int j)
 {
     if constexpr(C.s1)
     {
-        constexpr int GATE_TILES = C.nt / 2;
-        const int gate = (w.nblock * C.wn + w.wave_n) * GATE_TILES + j % GATE_TILES;
+        constexpr int GATE_TILES = C.n_tiles / 2;
+        const int gate           = (w.nblock * C.waves + w.wave_n) * GATE_TILES + j % GATE_TILES;
         return j < GATE_TILES ? gate : p.n_out / 16 + gate;
     }
     else
-        return (w.nblock * C.wn + w.wave_n) * C.nt + j;
+        return (w.nblock * C.waves + w.wave_n) * C.n_tiles + j;
 }
 
 // Routing of the lane's rows 16 m + lane_col of block mblk.
@@ -479,17 +408,17 @@ struct Sources
     int w_off[NT], s_off[NT];
 };
 template <Cfg C>
-DEV Sources<C.nt> make_sources(const Params& p, int e, const WaveIds& w, int k_tiles)
+DEV Sources<C.n_tiles> make_sources(const Params& p, int e, const WaveIds& w, int k_tiles)
 {
     const int ktp = (k_tiles + 1) / 2;
     const int x_rows = C.s1 ? p.T : p.T * p.topk;
-    Sources<C.nt> s;
+    Sources<C.n_tiles> s;
     s.w_desc = make_buffer_desc(p.w + (size_t)e * p.ntiles * k_tiles * 1024);
     s.s_desc = make_buffer_desc(p.w_sc + (size_t)e * p.ntiles * ktp * 256);
     // padding rows load from row x_rows (out of range: zeros)
     s.x_desc = make_buffer_desc(p.x, x_rows * p.K * 2);
 #pragma unroll
-    for(int j = 0; j < C.nt; j++)
+    for(int j = 0; j < C.n_tiles; j++)
     {
         const int tile = weight_tile<C>(p, w, j);
         s.w_off[j]     = tile * k_tiles * 1024;
@@ -579,20 +508,20 @@ DEV void k_steps(int n, F&& f)
 }
 
 // ---------------------------------------------------------------- K reduction, epilogues
-// WK > 1: partial sums of waves wave_k > 0 go through LDS (partial, (WK - 1) WN NT MT 64
-// v4f) to wave_k == 0. Returns false for the waves that are done.
+// ksplit > 1: partial sums of waves wave_k > 0 go through LDS (partial, (ksplit - 1) waves
+// n_tiles m_tiles 64 v4f) to wave_k == 0. Returns false for the waves that are done.
 template <Cfg C, int MA>
-DEV bool k_reduce(v4f (&acc)[C.nt][C.mt], const WaveIds& w, v4f* partial)
+DEV bool k_reduce(v4f (&acc)[C.n_tiles][C.m_tiles], const WaveIds& w, v4f* partial)
 {
-    if constexpr(C.wk == 1)
+    if constexpr(C.ksplit == 1)
         return true;
     auto at = [&](int k, int j, int m) {
-        return ((((k - 1) * C.wn + w.wave_n) * C.nt + j) * C.mt + m) * 64 + w.lane;
+        return ((((k - 1) * C.waves + w.wave_n) * C.n_tiles + j) * C.m_tiles + m) * 64 + w.lane;
     };
     if(w.wave_k > 0)
     {
 #pragma unroll
-        for(int j = 0; j < C.nt; j++)
+        for(int j = 0; j < C.n_tiles; j++)
 #pragma unroll
             for(int m = 0; m < MA; m++)
                 partial[at(w.wave_k, j, m)] = acc[j][m];
@@ -600,9 +529,9 @@ DEV bool k_reduce(v4f (&acc)[C.nt][C.mt], const WaveIds& w, v4f* partial)
     __syncthreads();
     if(w.wave_k > 0)
         return false;
-    for(int k = 1; k < C.wk; k++)
+    for(int k = 1; k < C.ksplit; k++)
 #pragma unroll
-        for(int j = 0; j < C.nt; j++)
+        for(int j = 0; j < C.n_tiles; j++)
 #pragma unroll
             for(int m = 0; m < MA; m++)
                 acc[j][m] += partial[at(k, j, m)];
@@ -611,14 +540,17 @@ DEV bool k_reduce(v4f (&acc)[C.nt][C.mt], const WaveIds& w, v4f* partial)
 
 // Stage 1: SwiGLU-OAI of the gate / up tiles, f16 x_inter rows.
 template <Cfg C, int MA>
-DEV void s1_epilogue(const Params& p, const v4f (&acc)[C.nt][C.mt], int e,
-                     const Routing<C.mt>& rt, const WaveIds& w)
+DEV void s1_epilogue(const Params& p,
+                     const v4f (&acc)[C.n_tiles][C.m_tiles],
+                     int e,
+                     const Routing<C.m_tiles>& rt,
+                     const WaveIds& w)
 {
-    constexpr int GATE_TILES = C.nt / 2;
+    constexpr int GATE_TILES = C.n_tiles / 2;
     const float inv_gs_gate  = p.inv_gs[2 * e];
     const float inv_gs_up    = p.inv_gs[2 * e + 1];
     const int I              = p.n_out;
-    const int n_begin        = (w.nblock * C.wn + w.wave_n) * 16 * GATE_TILES;
+    const int n_begin        = (w.nblock * C.waves + w.wave_n) * 16 * GATE_TILES;
 #pragma unroll
     for(int m = 0; m < MA; m++)
     {
@@ -649,7 +581,7 @@ constexpr int c_row_floats(int nt) { return 16 * nt + 4; }
 // LDS v4i of the stage-2 C tiles of all waves
 constexpr int c_tile_v4(const Cfg& c)
 {
-    return c.s1 ? 0 : (c.wn * 16 * c.mt * c_row_floats(c.nt) + 3) / 4;
+    return c.s1 ? 0 : (c.waves * 16 * c.m_tiles * c_row_floats(c.n_tiles) + 3) / 4;
 }
 
 // Stage 2 route weights of the lane's rows, times the expert's inverse global scale
@@ -662,11 +594,12 @@ DEV void read_route_weights(float (&rw)[MT], const Params& p, int e, int mblk, i
         rw[m] = p.sorted_w[mblk * 16 * MT + m * 16 + lane_col] * inv_gs;
 }
 
-// Stage 2: acc * route weight -> the wave's LDS C rows (c_lds), wave-local transpose, then bf16
-// atomics: one instruction covers 64 consecutive output columns of 64 / (8 NT) rows instead of
-// 16 rows x 16 B. C.staged: every C value and row token of the wave is read before the first
-// atomic. Other NT (not 1, 2, 4 or 8k): an instruction covers the largest divisor of the 8 NT
-// column pairs that is <= 64, whole rows; the lanes past the last whole row store nothing.
+// Stage 2: acc * route weight -> the wave's LDS C rows (c_lds), wave-local transpose, then f16
+// (C.outbf16: bf16) atomics: one instruction covers 64 consecutive output columns of 64 / (8 NT)
+// rows instead of 16 rows x 16 B. C.staged: every C value and row token of the wave is read before
+// the first atomic. Other NT (not 1, 2, 4 or 8k): an instruction covers the largest divisor of
+// the 8 NT column pairs that is <= 64, whole rows; the lanes past the last whole row store
+// nothing.
 constexpr int s2_inst_pairs(int col_pairs)
 {
     int d = col_pairs < 64 ? col_pairs : 64;
@@ -675,10 +608,14 @@ constexpr int s2_inst_pairs(int col_pairs)
     return d;
 }
 template <Cfg C, int MA>
-DEV void s2_epilogue(const Params& p, const v4f (&acc)[C.nt][C.mt], const float (&rw)[C.mt],
-                     const Routing<C.mt>& rt, float* c_lds, const WaveIds& w)
+DEV void s2_epilogue(const Params& p,
+                     const v4f (&acc)[C.n_tiles][C.m_tiles],
+                     const float (&rw)[C.m_tiles],
+                     const Routing<C.m_tiles>& rt,
+                     float* c_lds,
+                     const WaveIds& w)
 {
-    constexpr int NT         = C.nt;
+    constexpr int NT         = C.n_tiles;
     constexpr int C_STRIDE   = c_row_floats(NT);
     constexpr int COL_PAIRS  = 8 * NT;
     constexpr int INST_PAIRS = s2_inst_pairs(COL_PAIRS);    // column pairs per instruction
@@ -687,7 +624,7 @@ DEV void s2_epilogue(const Params& p, const v4f (&acc)[C.nt][C.mt], const float 
     constexpr int ROW_STEPS  = 16 * MA / INST_ROWS;
     constexpr int COL_STEPS  = COL_PAIRS / INST_PAIRS;
     static_assert(16 % INST_ROWS == 0, "the rows of an instruction are in one 16-row tile");
-    int out_token[C.mt]; // token of row 16 m + lane_col, -1: padding (no store)
+    int out_token[C.m_tiles]; // token of row 16 m + lane_col, -1: padding (no store)
 #pragma unroll
     for(int m = 0; m < MA; m++)
     {
@@ -699,8 +636,8 @@ DEV void s2_epilogue(const Params& p, const v4f (&acc)[C.nt][C.mt], const float 
     }
     __syncwarp(); // lanes read C rows written by other lanes of the wave
     const int col_pair = w.lane % INST_PAIRS;
-    const int n_begin  = (w.nblock * C.wn + w.wave_n) * NT * 16;
-    int row_token[ROW_STEPS], packed[ROW_STEPS][COL_STEPS]; // packed: bf16 x2
+    const int n_begin  = (w.nblock * C.waves + w.wave_n) * NT * 16;
+    int row_token[ROW_STEPS], packed[ROW_STEPS][COL_STEPS]; // packed: f16 (C.outbf16: bf16) x2
     auto read_row = [&](int r) {
         // IDLE: the lanes past the last whole row read that row and store nothing
         const int row = r * INST_ROWS + (IDLE ? min(w.lane / INST_PAIRS, INST_ROWS - 1)
@@ -714,8 +651,10 @@ DEV void s2_epilogue(const Params& p, const v4f (&acc)[C.nt][C.mt], const float 
         {
             const int col  = 2 * (col_pair + h * INST_PAIRS);
             const float2 f = *(const float2*)(c_lds + row * C_STRIDE + col);
-            const v2bf a   = {(__bf16)f.x, (__bf16)f.y};
-            packed[r][h]   = __builtin_bit_cast(int, a);
+            if constexpr(C.outbf16)
+                packed[r][h] = __builtin_bit_cast(int, v2bf{(__bf16)f.x, (__bf16)f.y});
+            else
+                packed[r][h] = __builtin_bit_cast(int, v2h{(_Float16)f.x, (_Float16)f.y});
         }
     };
     auto store_row = [&](int r) {
@@ -724,9 +663,13 @@ DEV void s2_epilogue(const Params& p, const v4f (&acc)[C.nt][C.mt], const float 
             for(int h = 0; h < COL_STEPS; h++)
             {
                 const uint32_t col = n_begin + 2 * (col_pair + h * INST_PAIRS);
-                __builtin_amdgcn_global_atomic_fadd_v2bf16(
-                    (v2bf*)(p.out + ((uint32_t)row_token[r] * p.n_out + col) * 2),
-                    __builtin_bit_cast(v2bf, packed[r][h]));
+                uint8_t* dst       = p.out + ((uint32_t)row_token[r] * p.n_out + col) * 2;
+                if constexpr(C.outbf16)
+                    __builtin_amdgcn_global_atomic_fadd_v2bf16(
+                        (v2bf*)dst, __builtin_bit_cast(v2bf, packed[r][h]));
+                else
+                    __builtin_amdgcn_global_atomic_fadd_v2f16(
+                        (v2h*)dst, __builtin_bit_cast(v2h, packed[r][h]));
             }
     };
     if constexpr(C.staged)

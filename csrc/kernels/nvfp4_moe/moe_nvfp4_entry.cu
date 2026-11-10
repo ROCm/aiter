@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// Compiles the MiniMax-M3 NVFP4 MoE kernels (moe_nvfp4_kernels.hip) and wraps
-// their struct-based launchers in pointer/scalar entry points, so the
-// aiter_tensor_t layer (moe_nvfp4.cu) never needs the kernel file's Params /
-// PrepParams layouts. This TU includes no aiter or ck_tile header on purpose: the
-// kernel file defines short macros (DEV, KERNEL, ...) and vector typedefs that are not
-// meant to share a TU with them.
+// Wraps the struct-based launchers of the MiniMax-M3 NVFP4 MoE kernels (the fused
+// sort, moe_nvfp4_sort.hip, and the generated kernel table, gen_instances.py) in
+// pointer/scalar entry points, so the aiter_tensor_t layer (moe_nvfp4.cu) never needs
+// the kernel file's Params / PrepParams layouts. This TU includes no aiter or ck_tile
+// header on purpose: the kernel file defines short macros (DEV, KERNEL, ...) and vector
+// typedefs that are not meant to share a TU with them.
 #include "moe_nvfp4_kernels.hip"
+#include "moe_nvfp4_sort.hip"
 
 #include "moe_nvfp4_entry.h"
 
@@ -16,6 +17,8 @@ int moe_nvfp4_entry_num_cfgs() { return moe_nvfp4_kernels_num_cfgs(); }
 const char* moe_nvfp4_entry_cfg_name(int i) { return moe_nvfp4_kernels_cfg_name(i); }
 
 void moe_nvfp4_entry_cfg_info(int i, int* out) { moe_nvfp4_kernels_cfg_info(i, out); }
+
+int moe_nvfp4_entry_cfg_fits(int i, int K) { return moe_nvfp4_kernels_cfg_fits(i, K); }
 
 int moe_nvfp4_entry_sort(const void* x,
                          void* x_f16,
@@ -53,7 +56,7 @@ int moe_nvfp4_entry_sort(const void* x,
     return moe_nvfp4_kernels_sort(&p, stream);
 }
 
-int moe_nvfp4_entry_gemm(int cfg,
+int moe_nvfp4_entry_gemm(int kernel,
                          const void* x,
                          const void* w,
                          const void* w_sc,
@@ -88,5 +91,5 @@ int moe_nvfp4_entry_gemm(int cfg,
     p.K           = K;
     p.ntiles      = ntiles;
     p.n_out       = n_out;
-    return moe_nvfp4_kernels_launch(cfg, &p, grid_x, grid_y, stream);
+    return moe_nvfp4_kernels_launch(kernel, &p, grid_x, grid_y, stream);
 }
