@@ -573,6 +573,9 @@ def _worker(local_rank, world, port, failures):
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
     dist.init_process_group("gloo", rank=local_rank, world_size=world)
+    # Import aiter's MegaMoE package before mori so its mori JIT arch pin
+    # (MORI_GPU_ARCHS from the real ISA) applies to the kernels mori builds here.
+    import aiter.ops.flydsl.kernels.mega_moe_gfx1250  # noqa: F401
     from mori.cco import Communicator
 
     uid = [Communicator.get_unique_id() if local_rank == 0 else None]
