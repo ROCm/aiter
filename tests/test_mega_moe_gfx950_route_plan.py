@@ -136,12 +136,72 @@ def test_route_exclusions():
 def test_large_m_capacities_per_layout():
     shape = dict(world_size=8, model_dim=7168, inter_dim=3072)
     assert large_m_mtprs_for(**shape) == LARGE_M_MTPRS
-    # EP4 V4.1-Flash: the large-input kernel only at the MTPR its tune was measured at.
-    assert large_m_mtprs_for(world_size=4, model_dim=5120, inter_dim=2304) == (8192,)
-    select_fused_config(8192, 8192, **V41_FLASH_EP4_SHAPE)
-    for mtpr in (1024, 2048, 4096, 16384):
-        with pytest.raises(ValueError):
-            select_fused_config(mtpr, mtpr, **V41_FLASH_EP4_SHAPE)
+    # EP4 V4.1-Flash: the same capacities, all with the tune measured at 8192.
+    assert large_m_mtprs_for(world_size=4, model_dim=5120, inter_dim=2304) == LARGE_M_MTPRS
+    tuned = _knob_table(select_fused_config(8192, 8192, **V41_FLASH_EP4_SHAPE))
+    for mtpr in LARGE_M_MTPRS:
+        for tokens in (0, 1, LARGE_M_MIN_TOKENS, mtpr):
+            assert _knob_table(select_fused_config(tokens, mtpr, **V41_FLASH_EP4_SHAPE)) == tuned, (mtpr, tokens)
+    with pytest.raises(ValueError):
+        select_fused_config(32768, 32768, **V41_FLASH_EP4_SHAPE)
+
+
+@pytest.mark.parametrize("mtpr", MTPRS)
+def test_ep4_route_for_every_max_tokens(mtpr):
+    """EP4 V4.1-Flash: small-input up to 512 rows a rank, large-input from 513 at every large capacity."""
+    plan = build_mega_moe_bundle_plan(
+        mtpr,
+        experts_per_rank=96,
+        model_dim=5120,
+        inter_dim=2304,
+        world_size=4,
+        small_m_mtprs=DEFAULT_SMALL_M_MTPRS,
+        large_m=mtpr in large_m_mtprs_for(world_size=4, model_dim=5120, inter_dim=2304),
+    )
+    assert plan.large_m == (mtpr in LARGE_M_MTPRS)
+    for max_tokens in sorted({0, 1, 256, 257, 512, 513, 768, 1024, mtpr - 1, mtpr}):
+        if not 0 <= max_tokens <= mtpr:
+            continue
+        route, capacity = plan.route_for(max_tokens)
+        if max_tokens <= plan.small_m_mtprs[-1]:
+            assert route == ROUTE_SMALL_M, max_tokens
+        elif plan.large_m:
+            assert (route, capacity) == (ROUTE_LARGE_M, mtpr), max_tokens
+        else:
+            assert (route, capacity) == (ROUTE_STAGED, mtpr), max_tokens
+        assert plan.route_for(max_tokens, large_m=False)[0] != ROUTE_LARGE_M
+
+
+@pytest.mark.parametrize("layout", ("ep8", "ep4"))
+def test_large_m_buffers_fit_32bit_offsets(layout):
+    """Every large-input capacity keeps its buffer-resource views inside 32-bit offsets and its encodings in
+    their bit fields (the kernel and LargeMRuntime raise past them; this pins the margin)."""
+    from aiter.ops.flydsl.kernels.mega_moe.mega_moe_large_m import LargeMRuntime, large_m_kernel_specs
+
+    world_size, epr, model_dim, inter_dim = (8, 48, 7168, 3072) if layout == "ep8" else (4, 96, 5120, 2304)
+    for mtpr in large_m_mtprs_for(world_size=world_size, model_dim=model_dim, inter_dim=inter_dim):
+        config = select_fused_config(
+            mtpr, mtpr, world_size=world_size, experts_per_rank=epr, model_dim=model_dim, inter_dim=inter_dim
+        )
+        num_valid_max = LargeMRuntime.payload_capacity(
+            world_size=world_size, model_dim=model_dim, inter_dim=inter_dim, experts=world_size * epr, topk=6,
+            max_tok_per_rank=mtpr,
+        )[0]
+        s2_spec, _ = large_m_kernel_specs(
+            config, model_dim=model_dim, inter_dim=inter_dim, topk=6, rank=0, npes=world_size, mtpr=mtpr,
+            experts_per_rank=epr, num_valid_max=num_valid_max,
+        )
+        spec = dict(s2_spec)
+        assert spec["comb_inp_nbytes"] < 1 << 31, (layout, mtpr)
+        assert world_size * mtpr <= 1 << 24, (layout, mtpr)
+        k1, k2 = config.fused_stage1, config.fused_stage2
+        if k1.tag_counts:
+            assert mtpr < 1 << 16
+        if k1.bucket_pairs:
+            assert world_size * epr * mtpr * 4 < 1 << 31, (layout, mtpr)
+        if k2.scale_stage:
+            nbytes = spec["max_g2_m_blocks"] * (model_dim // spec["BN"]) * spec["BM"] * 16
+            assert nbytes < 1 << 31, (layout, mtpr)
 
 
 def test_large_m_capacity_validated():
