@@ -14,7 +14,8 @@ Two layers:
     ``bench_qsa_flash_next_paged_gqa`` (decode ``M<=8`` and a separate prefill table;
     ``--gqa`` is one rank: 24,2 / 12,1 / 6,1 / 3,1),
     ``bench_qsa_flash_next_paged_gqa_prefill_step`` (the aiter#7556 comparison
-    step: 8192 rows, five requests, TP2 heads, index width 2051, wide K/V),
+    step: 8192 rows, five requests, plus that write-up's single-request
+    ``(rows, prefix)`` table, TP2 heads, index width 2051, wide K/V),
     ``bench_qsa_flash_next_e2e`` / ``bench_qsa_gluon_parity_e2e`` (indexer through
     GQA; Gluon-parity keeps both head counts),
     ``bench_qsa_flash_next_e2e_graph`` (HIP graph replay at decode).
@@ -543,6 +544,21 @@ _FOUR_GIB = 1 << 32
 _PREFILL_STEP_ROWS = 8192
 _PREFILL_STEP_REQUESTS = 5
 _PREFILL_STEP_HEADS = (12, 1)
+# aiter#7556's single-request table: query rows, then cached prefix tokens.
+# One request, same heads and index width as the five-request step. A prefix
+# of 0 is that chunk with nothing cached ahead of it. 132096 is the long
+# context, including the 256-row chunk that write-up measured slower.
+_PREFILL_PREFIX_SHAPES = (
+    (8192, 0),
+    (8192, 8192),
+    (8192, 32768),
+    (8192, 132096),
+    (1024, 0),
+    (1024, 132096),
+    (768, 0),
+    (256, 0),
+    (256, 132096),
+)
 
 
 def _widen_cache(cache: torch.Tensor) -> torch.Tensor:
@@ -4286,6 +4302,20 @@ def test_prefill_step_query_lens_match_the_7556_row_count():
         raise AssertionError(f"prefill-step lengths {lens} do not sum to 8192")
     if max(lens) - min(lens) > 1:
         raise AssertionError(f"prefill-step lengths {lens} are not an even split")
+    if _PREFILL_PREFIX_SHAPES != (
+        (8192, 0),
+        (8192, 8192),
+        (8192, 32768),
+        (8192, 132096),
+        (1024, 0),
+        (1024, 132096),
+        (768, 0),
+        (256, 0),
+        (256, 132096),
+    ):
+        raise AssertionError(
+            f"prefix shapes {_PREFILL_PREFIX_SHAPES} drifted from the #7556 table"
+        )
 
 
 def _pack_request_kv(requests, page_size, device):
@@ -4316,6 +4346,23 @@ def _pack_request_kv(requests, page_size, device):
     return torch.cat(k_pages, dim=0), torch.cat(v_pages, dim=0), kv_table
 
 
+def _prefill_step_bytes(rows: int, n_req: int, prefix: int) -> int:
+    """Bytes one request of this step holds beside the two wide parents.
+
+    The oracle builds one request at a time. Its indexer dots are
+    ``[n, 4, n_blocks]`` fp32 and its GQA reference gathers the selected
+    ``[n, 2051, Hk, D]`` K and V in fp32. The wide parents are the span,
+    not the live pages.
+    """
+    n = max(_prefill_step_query_lens(rows, n_req))
+    ctx = prefix + n
+    n_blocks = ctx // FLASH_NEXT_INDEXER.compress_ratio
+    dots = n * FLASH_NEXT_INDEXER.n_heads * n_blocks * 4
+    gather = 2 * n * FLASH_NEXT_INDEXER.index_width * 256 * 4
+    dense = 2 * ctx * 256 * 4
+    return 2 * _FOUR_GIB + dots + gather + dense
+
+
 @benchmark()
 def bench_qsa_flash_next_paged_gqa_prefill_step(
     rows,
@@ -4326,16 +4373,22 @@ def bench_qsa_flash_next_paged_gqa_prefill_step(
     kv_heads,
     rotate=0,
     cache_layout="wide",
+    prefix=0,
 ):
     """The aiter#7556 comparison step, timed as sparse GQA only.
 
     8192 query rows, five requests, TP2 heads ``(12, 1)``, head dim 256, and
-    an index width of 2051. K and V are paged views. ``cache_layout="wide"``
-    gives them the span past 4 GiB that selects the 64-bit gather; the live
-    pages are this step's contexts. The indexer is not timed. Its oracle
-    top-k only builds the token ids, one request at a time, because a single
-    ``[8192, 2051]`` gather in fp32 does not fit beside the wide caches.
+    an index width of 2051. The same call with one request and ``prefix``
+    covers that write-up's single-request table: ``prefix`` cached tokens,
+    then this request's query rows. K and V are paged views.
+    ``cache_layout="wide"`` gives them the span past 4 GiB that selects the
+    64-bit gather; the live pages are this step's contexts. The indexer is
+    not timed. Its oracle top-k only builds the token ids, one request at a
+    time, because a single ``[8192, 2051]`` gather in fp32 does not fit
+    beside the wide caches.
     """
+    if prefix < 0:
+        raise ValueError(f"prefix must be non-negative, got {prefix}")
     idx = FLASH_NEXT_INDEXER
     gqa = _flash_next_gqa(n_heads, kv_heads)
     device = torch.device("cuda")
@@ -4346,7 +4399,8 @@ def bench_qsa_flash_next_paged_gqa_prefill_step(
     refs = []
     kv = []
     for req, n in enumerate(query_lens):
-        n_blocks = n // idx.compress_ratio
+        ctx = prefix + n
+        n_blocks = ctx // idx.compress_ratio
         q_indexer = torch.randn(
             n, idx.n_heads, idx.head_dim, dtype=dtype, device=device
         ).contiguous()
@@ -4354,10 +4408,10 @@ def bench_qsa_flash_next_paged_gqa_prefill_step(
         q_gqa = torch.randn(
             n, gqa.n_heads, gqa.head_dim, dtype=dtype, device=device
         ).contiguous()
-        k = torch.randn(n, gqa.kv_heads, gqa.head_dim, dtype=dtype, device=device)
-        v = torch.randn(n, gqa.kv_heads, gqa.head_dim, dtype=dtype, device=device)
-        qpos = _query_positions(n, n, device)
-        slen = torch.full((1,), n, dtype=dtypes.i32, device=device)
+        k = torch.randn(ctx, gqa.kv_heads, gqa.head_dim, dtype=dtype, device=device)
+        v = torch.randn(ctx, gqa.kv_heads, gqa.head_dim, dtype=dtype, device=device)
+        qpos = _query_positions(n, ctx, device)
+        slen = torch.full((1,), ctx, dtype=dtypes.i32, device=device)
         one_req = torch.zeros(n, dtype=dtypes.i32, device=device)
         ref = qsa_oracle(
             q_indexer,
@@ -4416,7 +4470,10 @@ def bench_qsa_flash_next_paged_gqa_prefill_step(
         out.to(dtypes.fp32),
         rtol=1e-2,
         atol=1e-2,
-        msg="paged GQA 8192-row five-request prefill vs oracle GQA",
+        msg=(
+            "paged GQA prefill step vs oracle GQA "
+            f"(rows={rows}, requests={n_req}, prefix={prefix})"
+        ),
     )
     return {
         "gfx": get_gfx(),
@@ -5817,41 +5874,50 @@ def main():
                 df.to_markdown(index=False),
             )
 
-        # The #7556 comparison step is one fixed shape, not a cross product
-        # with the decode/prefill grid. ``--page-size`` and ``--rotate`` still
-        # apply. The span is always the wide one that row was measured on.
+        # The #7556 comparison step, then that write-up's single-request
+        # (rows, prefix) table. Not a cross product with the decode/prefill
+        # grid. ``--page-size`` and ``--rotate`` still apply. The span is
+        # always the wide one those rows were measured on.
         step_heads = _PREFILL_STEP_HEADS
+        step_shapes = ((_PREFILL_STEP_ROWS, _PREFILL_STEP_REQUESTS, 0),) + tuple(
+            (n_rows, 1, prefix) for n_rows, prefix in _PREFILL_PREFIX_SHAPES
+        )
         step_rows = []
-        for page_size, rotate in itertools.product(args.page_size, args.rotate):
+        for (n_rows, n_req, prefix), page_size, rotate in itertools.product(
+            step_shapes, args.page_size, args.rotate
+        ):
             free, _total = torch.cuda.mem_get_info()
-            # Two wide K/V parents, plus one request's fp32 reference gather.
-            need = 2 * _FOUR_GIB + (6 << 30)
+            need = _prefill_step_bytes(n_rows, n_req, prefix)
             if free < need:
                 aiter.logger.warning(
-                    "skip QSA Flash-Next 8192-row five-request prefill: "
-                    "need %s bytes, %s free",
+                    "skip QSA Flash-Next prefill step rows=%s requests=%s "
+                    "prefix=%s: need %s bytes, %s free",
+                    n_rows,
+                    n_req,
+                    prefix,
                     need,
                     free,
                 )
                 continue
             row = bench_qsa_flash_next_paged_gqa_prefill_step(
-                _PREFILL_STEP_ROWS,
-                _PREFILL_STEP_REQUESTS,
+                n_rows,
+                n_req,
                 page_size,
                 dtype,
                 step_heads[0],
                 step_heads[1],
                 rotate,
+                prefix=prefix,
             )
             _raise_if_paged_gqa_above_tolerance(
-                row["paged_gqa err"], _PREFILL_STEP_ROWS, _PREFILL_STEP_ROWS
+                row["paged_gqa err"], n_rows, prefix + n_rows
             )
             step_rows.append(row)
         if step_rows:
             df = pd.DataFrame(step_rows)
             aiter.logger.info(
-                "QSA Flash-Next FlyDSL sparse GQA 8192-row five-request "
-                "prefill summary (markdown):\n%s",
+                "QSA Flash-Next FlyDSL sparse GQA prefill-step summary "
+                "(markdown):\n%s",
                 df.to_markdown(index=False),
             )
 
