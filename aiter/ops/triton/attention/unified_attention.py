@@ -1744,19 +1744,3 @@ def _unified_attention_3d_gfx950(
         partial_m=segm_max if split else None,
         partial_l=segm_expsum if split else None,
     )
-
-
-# AITER_UA_FAST_LAUNCH=1: record-and-replay host fast path (see unified_attention_utils.py).
-# A plan is keyed on the call's arguments only (scalar values; tensor dtype, shape,
-# strides, device, alignment; which arguments alias). Module state is not in the key:
-# once a plan exists, anything that changes what unified_attention would do without
-# changing its arguments -- a constant edited at runtime, a monkeypatched routing
-# function or kernel, a config table reloaded mid-process -- is not seen, and the old
-# plan is replayed. In a server this state is fixed after import, so the arguments
-# decide the path; runtime-tunable routing state must go into the arguments. Tests
-# that steer the internals must keep the normal path (see the autouse fixture in
-# op_tests/triton_tests/attention/test_unified_attention.py).
-if __import__("os").environ.get("AITER_UA_FAST_LAUNCH", "1") == "1":
-    from aiter.ops.triton.utils.unified_attention_utils import wrap_fast_launch
-
-    unified_attention = wrap_fast_launch(unified_attention)
