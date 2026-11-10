@@ -10,13 +10,18 @@ import pytest
 import torch
 
 from aiter.ops.triton.attention.unified_attention import (
+    _gfx1250_use_tdm_store,
     _is_gluon_available,
     is_2d_gluon_available,
     unified_attention,
 )
+from aiter.ops.triton.utils import unified_attention_utils
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.shuffle import shuffle_scale_batched, shuffle_weight
 from aiter.ops.triton.utils.types import e4m3_dtype
+from aiter.ops.triton.utils.unified_attention_utils import (
+    get_unified_attention_config,
+)
 from aiter.test_common import checkAllclose
 from op_tests.triton_tests.quant.test_quant_mxfp4 import (
     torch_dynamic_mxfp4_quant,
@@ -1120,12 +1125,175 @@ def test_unified_attn_spec_verify_gfx1250(
     torch.testing.assert_close(output, ref_output, atol=1.5e-2, rtol=1e-2)
 
 
+def test_gfx1250_ua2d_register_store_gate() -> None:
+    """Check the register-store boundary and its tuning on any machine."""
+    b, f, e, u = torch.bfloat16, torch.float16, e4m3_dtype, torch.uint8
+    # name, q head, v head, G, page, q, kv, out, q len, tdm, tile
+    cases = [
+        ("bf16", 64, 64, 8, 64, b, b, b, 1, False, 64),
+        ("fp16 q/kv", 64, 64, 8, 64, f, f, b, 1, False, 64),
+        ("fp8 q/kv", 64, 64, 8, 64, e, e, b, 1, False, 128),
+        ("bf16 q fp8 kv", 64, 64, 8, 64, b, e, b, 1, False, 64),
+        ("nvfp4 kv", 64, 64, 8, 64, b, u, b, 1, False, 64),
+        ("q head 64 v 32", 64, 32, 8, 64, b, b, b, 1, True, 64),
+        ("q head 32 v 64", 32, 64, 8, 64, b, b, b, 1, True, 64),
+        ("fp8 asymmetric", 64, 32, 8, 64, e, e, b, 1, True, 128),
+        ("fp16 out", 64, 64, 8, 64, b, b, f, 1, True, 64),
+        ("tp2", 64, 64, 4, 64, b, b, b, 1, True, 64),
+        ("page 16", 64, 64, 8, 16, b, b, b, 1, True, 64),
+        ("extend", 64, 64, 8, 64, b, b, b, 128, True, 64),
+    ]
+    for case in cases:
+        name, hq, hv, group, page, q_dtype, kv_dtype, out_dtype, q_len, tdm, tile = case
+        params = SimpleNamespace(
+            head_size=hq,
+            head_size_v=hv,
+            max_seqlen_q=q_len,
+            max_seqlen_k=4096,
+            sliding_window=0,
+            shuffled_kv_cache=True,
+            q_dtype=q_dtype,
+            kv_cache_dtype=kv_dtype,
+            block_size=page,
+            num_queries_per_kv=group,
+            all_decode=q_len == 1,
+            out=SimpleNamespace(dtype=out_dtype),
+        )
+        config = get_unified_attention_config(
+            "attn_2d", params, backend="gluon", arch="gfx1250"
+        )
+        assert config["TILE_SIZE"] == tile, name
+        assert _gfx1250_use_tdm_store(params, config) is tdm, name
+        assert "USE_TDM_STORE" not in config, name
+        if tdm:
+            config["USE_TDM_STORE"] = False
+            assert _gfx1250_use_tdm_store(params, config) is True, name
+
+    rows = [
+        ("bf16", b, b, 64),
+        ("fp16 q/kv", f, f, 64),
+        ("fp8 q/kv", e, e, 128),
+        ("bf16 q fp8 kv", b, e, 64),
+        ("nvfp4 kv", b, u, 64),
+    ]
+
+    def params(group, q_dtype, kv_dtype, window=0, seq_k=4096, shuffled=True):
+        return SimpleNamespace(
+            head_size=64,
+            head_size_v=64,
+            max_seqlen_q=1,
+            max_seqlen_k=seq_k,
+            sliding_window=window,
+            shuffled_kv_cache=shuffled,
+            q_dtype=q_dtype,
+            kv_cache_dtype=kv_dtype,
+            block_size=64,
+            num_queries_per_kv=group,
+            all_decode=True,
+            out=SimpleNamespace(dtype=b),
+        )
+
+    def lookup(p):
+        return get_unified_attention_config(
+            "attn_2d", p, backend="gluon", arch="gfx1250"
+        )
+
+    # The store flag must survive changes to window, KV length, and shuffle axes.
+    for name, qd, kd, tile in rows:
+        for window in (0, 128):
+            for seq_k in (1024, 4096):
+                for shuffled in (False, True):
+                    tag = f"{name} sw={window} sk={seq_k} shuffled={shuffled}"
+                    p = params(8, qd, kd, window, seq_k, shuffled)
+                    cfg = lookup(p)
+                    assert _gfx1250_use_tdm_store(p, cfg) is False, tag
+                    assert "USE_TDM_STORE" not in cfg, tag
+                    assert cfg["TILE_SIZE"] == tile, tag
+
+    # The flagged entries copy the tuning of the entries they replace. The G=4
+    # shape resolves to those entries, so a retune of one of them shows up here.
+    for name, qd, kd, _tile in rows:
+        flagged = lookup(params(8, qd, kd))
+        original = lookup(params(4, qd, kd))
+        assert flagged.pop("USE_TDM_STORE", True) is False, name
+        assert "USE_TDM_STORE" not in original, name
+        assert flagged == original, name
+
+    invalid_flags = [
+        ("missing", None),
+        ("null", None),
+        ("true", True),
+        ("zero", 0),
+        ("one", 1),
+        ("string", "false"),
+        ("list", []),
+        ("object", {}),
+    ]
+    for name, qd, kd, _tile in rows:
+        p = params(8, qd, kd)
+        for label, value in invalid_flags:
+            cfg = lookup(p)
+            if label == "missing":
+                cfg.pop("USE_TDM_STORE")
+            else:
+                cfg["USE_TDM_STORE"] = value
+            with pytest.raises(ValueError, match="USE_TDM_STORE=false"):
+                _gfx1250_use_tdm_store(p, cfg)
+            assert "USE_TDM_STORE" not in cfg, (name, label)
+
+
+def test_gfx1250_ua2d_unflagged_specific_config(monkeypatch) -> None:
+    """Reject a more specific tuning leaf that hides the safe store flag."""
+    params = SimpleNamespace(
+        head_size=64,
+        head_size_v=64,
+        max_seqlen_q=1,
+        max_seqlen_k=4096,
+        sliding_window=128,
+        shuffled_kv_cache=False,
+        q_dtype=torch.bfloat16,
+        kv_cache_dtype=torch.bfloat16,
+        block_size=64,
+        num_queries_per_kv=8,
+        all_decode=True,
+        out=SimpleNamespace(dtype=torch.bfloat16),
+    )
+    table, axes, cfg_dir = unified_attention_utils._load("attn_2d", "gluon", "gfx1250")
+    table = dict(table)
+    table["D_EQ_64.Q_LEQ_1.SW"] = dict(table["Q_LEQ_1"])
+    monkeypatch.setattr(
+        unified_attention_utils, "_load", lambda *args: (table, axes, cfg_dir)
+    )
+    unified_attention_utils._get_unified_attention_config_cached.cache_clear()
+    try:
+        cfg = get_unified_attention_config(
+            "attn_2d", params, backend="gluon", arch="gfx1250"
+        )
+        assert "USE_TDM_STORE" not in cfg
+        with pytest.raises(ValueError, match="USE_TDM_STORE=false"):
+            _gfx1250_use_tdm_store(params, cfg)
+    finally:
+        unified_attention_utils._get_unified_attention_config_cached.cache_clear()
+
+
 @pytest.mark.parametrize("num_seqs", [4, 64])
+@pytest.mark.parametrize(
+    "dtype, shuffled",
+    [
+        (torch.bfloat16, False),
+        (torch.bfloat16, True),
+        (torch.float16, False),
+        (e4m3_dtype, False),
+    ],
+)
 @torch.inference_mode()
-def test_gfx1250_gluon_ua2d_decode_register_store(num_seqs: int) -> None:
-    """All-decode gpt-oss shapes take the 2D register store: head 64, 8 query
-    heads per KV head, page 64, bf16 out, sliding window. The output must match
-    the reference, and CUDA graph replays must match the eager call bitwise."""
+def test_gfx1250_gluon_ua2d_decode_register_store(
+    num_seqs: int, dtype: torch.dtype, shuffled: bool, monkeypatch
+) -> None:
+    """Check public decode routing, both store flags, and numerical results.
+
+    Graph replays must match the eager output bitwise.
+    """
     if DEVICE_ARCH != "gfx1250":
         pytest.skip(f"gfx1250 Gluon 2D kernel only, not {DEVICE_ARCH}")
 
@@ -1133,12 +1301,12 @@ def test_gfx1250_gluon_ua2d_decode_register_store(num_seqs: int) -> None:
     seq_lens = [(1, random.randint(1, 4096)) for _ in range(num_seqs)]
     (
         query,
-        _key_cache_orig,
-        _value_cache_orig,
+        key_cache_orig,
+        value_cache_orig,
         key_cache,
         value_cache,
         _sinks,
-        _output,
+        output,
         cu_query_lens,
         kv_lens,
         max_query_len,
@@ -1154,10 +1322,31 @@ def test_gfx1250_gluon_ua2d_decode_register_store(num_seqs: int) -> None:
         head_size=64,
         num_heads=(64, 8),
         sliding_window=128,
-        q_dtype=torch.bfloat16,
-        kv_dtype=torch.bfloat16,
+        q_dtype=dtype,
+        kv_dtype=dtype,
+        shuffled_kv_cache=shuffled,
+        use_q_descale=False,
+        use_kv_descale=False,
         device="cuda",
     )
+
+    module = sys.modules[unified_attention.__module__]
+    kernel = module._unified_attention_kernel_2d_gfx1250
+    launches = []
+
+    class CheckedLaunch:
+        def __getitem__(self, grid):
+            launch = kernel[grid]
+
+            def checked(**kwargs):
+                assert kwargs["USE_TDM_STORE"] is False
+                assert kwargs["USE_STORE_BUFFER_OP"] is False
+                launches.append(grid)
+                return launch(**kwargs)
+
+            return checked
+
+    monkeypatch.setattr(module, "_unified_attention_kernel_2d_gfx1250", CheckedLaunch())
 
     def run(out):
         unified_attention(
@@ -1178,15 +1367,17 @@ def test_gfx1250_gluon_ua2d_decode_register_store(num_seqs: int) -> None:
             k_descale=None,
             v_descale=None,
             sinks=None,
+            shuffled_kv_cache=shuffled,
             backend="gluon",
         )
 
-    eager = torch.empty_like(query)
+    eager = torch.empty_like(output)
     run(eager)
+    assert launches, "public wrapper did not launch the gfx1250 Gluon 2D kernel"
     ref_output = ref_paged_attn(
         query=query,
-        key_cache=key_cache,
-        value_cache=value_cache,
+        key_cache=key_cache_orig,
+        value_cache=value_cache_orig,
         query_lens=[q for q, _ in seq_lens],
         kv_lens=[k for _, k in seq_lens],
         block_tables=block_tables,
@@ -1196,9 +1387,10 @@ def test_gfx1250_gluon_ua2d_decode_register_store(num_seqs: int) -> None:
         soft_cap=None,
         sinks=None,
     )
-    torch.testing.assert_close(eager, ref_output, atol=1.5e-2, rtol=1e-2)
+    atol, rtol = (1.5e-1, 1.5e-1) if dtype == e4m3_dtype else (1.5e-2, 1e-2)
+    torch.testing.assert_close(eager, ref_output, atol=atol, rtol=rtol)
 
-    graph_out = torch.empty_like(query)
+    graph_out = torch.empty_like(output)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         run(graph_out)

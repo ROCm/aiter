@@ -813,6 +813,31 @@ _reduce_segments_{arch}(
 """
 
 
+def _gfx1250_use_tdm_store(params: _UAParams, config: dict) -> bool:
+    """Require register stores for reviewed gfx1250 decode shapes.
+
+    Reject an unsafe config for those shapes; other shapes keep TDM stores.
+    """
+    use_tdm_store = config.pop("USE_TDM_STORE", None)
+    reviewed = (
+        params.head_size == 64
+        and params.head_size_v == 64
+        and params.num_queries_per_kv == 8
+        and params.block_size == 64
+        and params.out.dtype == torch.bfloat16
+        and params.all_decode
+    )
+    if not reviewed:
+        return True
+    if use_tdm_store is not False:
+        raise ValueError(
+            "gfx1250 2D decode requires USE_TDM_STORE=false for head sizes 64, "
+            "8 query heads per KV head, page size 64, and bf16 output; "
+            "fix the selected unified-attention config"
+        )
+    return False
+
+
 def _unified_attention_2d_gfx1250(params: _UAParams):
     """
     Internal wrapper for the gfx1250 gluon kernel.
@@ -825,6 +850,9 @@ def _unified_attention_2d_gfx1250(params: _UAParams):
     assert params.softcap == 0, "Softcap is not supported"
 
     config = get_unified_attention_config("attn_2d", params, backend="gluon")
+    # TDM stores of LDS-staged output can corrupt gfx1250 decode rows under load.
+    # Require the reviewed register-store config before launch.
+    USE_TDM_STORE = _gfx1250_use_tdm_store(params, config)
     NUM_SEQS = params.num_seqs
     TILE_SIZE = config["TILE_SIZE"]
     BLOCK_M = max(config["BLOCK_M"], triton.next_power_of_2(params.num_queries_per_kv))
@@ -862,19 +890,7 @@ def _unified_attention_2d_gfx1250(params: _UAParams):
     # buffer ops need the tensor to fit a 32-bit offset; gfx1250 loads through TDM
     MAX_INT32 = 2**31 - 1
     USE_STORE_BUFFER_OP = params.out.nelement() * params.out.element_size() <= MAX_INT32
-    # gpt-oss shapes (head 64, 8 queries per kv head, page 64, bf16 out): store the output from registers with plain
-    # global stores. The TDM store of an LDS-staged tile can read LDS before the wave's ds_stores are visible to it
-    # on gfx1250 (s_wait_dscnt 0 is not enough), which corrupts served attention rows under load. Other shapes keep
-    # the TDM store until the register path is reviewed for them.
-    REGISTER_STORE = (
-        params.head_size == 64
-        and params.head_size_v == 64
-        and params.num_queries_per_kv == 8
-        and params.block_size == 64
-        and params.out.dtype == torch.bfloat16
-        and params.all_decode  # extend keeps the TDM store: the register path is not deterministic there (TP1 heads)
-    )
-    if REGISTER_STORE:
+    if not USE_TDM_STORE:
         USE_STORE_BUFFER_OP = False  # gl.store, not the CDNA4 buffer_store, on gfx1250
     _unified_attention_kernel_2d_gfx1250[(params.num_kv_heads, total_query_blocks)](
         query_ptr=params.q,
@@ -926,7 +942,7 @@ def _unified_attention_2d_gfx1250(params: _UAParams):
         REMOVE_INDIRECT_ACCESS=False,
         NUM_BUFFERS=config["NUM_BUFFERS"],
         LOOP_VARIANT=loop_variant,
-        USE_TDM_STORE=not REGISTER_STORE,
+        USE_TDM_STORE=USE_TDM_STORE,
         enable_fp_fusion=True,
     )
 

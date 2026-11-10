@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2026-2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
 """Loads tuning configs for unified attention.
 
@@ -64,6 +64,7 @@ _AXIS_KIND = {
     "D": "num",  # head_size
     "Q": "num",  # max_seqlen_q; Q_LEQ_1 is decode
     "BS": "num",  # block_size, the KV page size
+    "G": "num",  # num_queries_per_kv, query heads per KV head
     "SW": "bool",  # sliding_window > 0
     "SKLT": "bool",  # max_seqlen_k < 2048
     "SHUF": "bool",  # shuffled_kv_cache
@@ -220,11 +221,13 @@ def _axis_values(
     block_size,
     q_dtype,
     kv_dtype,
+    num_queries_per_kv,
 ) -> dict:
     return {
         "D": head_size,
         "Q": max_seqlen_q,
         "BS": block_size,
+        "G": num_queries_per_kv,
         "SW": sliding_window > 0,
         "SKLT": max_seqlen_k < 2048,
         "SHUF": shuffled_kv_cache,
@@ -267,6 +270,7 @@ def _get_unified_attention_config_cached(
     q_dtype: torch.dtype,
     kv_dtype: torch.dtype,
     block_size: int,
+    num_queries_per_kv: int,
     backend: str,
     arch: str | None,
 ) -> dict:
@@ -284,6 +288,7 @@ def _get_unified_attention_config_cached(
         block_size,
         q_dtype,
         kv_dtype,
+        num_queries_per_kv,
     )
     _, config = _lookup(table, axes, values)
     return compute_tile_params(config, block_size)
@@ -319,6 +324,7 @@ def get_unified_attention_config(
         params.q_dtype,
         params.kv_cache_dtype,
         params.block_size,
+        params.num_queries_per_kv,
         backend,
         arch,
     )
@@ -339,6 +345,7 @@ def explain(op: str, params, backend: str = "triton", arch: str | None = None) -
         params.block_size,
         params.q_dtype,
         params.kv_cache_dtype,
+        params.num_queries_per_kv,
     )
     key, config = _lookup(table, axes, values)
     derived = compute_segment_params(
