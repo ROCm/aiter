@@ -393,8 +393,17 @@ def _single_pass_unsupported(
 
 @functools.lru_cache(maxsize=64)
 def _qk_scale(softmax_scale: float) -> float:
-    """fp32(softmax_scale) * fp32(log2(e)), rounded once in fp32."""
-    return float(np.float32(softmax_scale) * np.float32(_LOG2E))
+    """fp32(softmax_scale) * fp32(log2(e)), rounded once in fp32.
+
+    A product in [0, the smallest normal fp32) becomes that value: the kernel
+    masks the scores past a row's last key to -inf before scaling them, and
+    -inf * 0 is NaN. Masked scores stay -inf, and for scores below 1e8 every
+    other exponent s * qk_scale - m is within 1e-30 of 0: each key weighs 1, as
+    at 0.
+    """
+    tiny = float(np.finfo(np.float32).tiny)
+    qk_scale = float(np.float32(softmax_scale) * np.float32(_LOG2E))
+    return tiny if 0.0 <= qk_scale < tiny else qk_scale
 
 
 def _single_pass_prefill(

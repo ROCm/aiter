@@ -568,14 +568,16 @@ def test_pa_prefill_sparse_single_source(H, dtype, with_sink):
 
 
 # gfx950 single-pass kernel: partial last tiles, short rows, and empty rows,
-# which must write zeros into the NaN-filled out. mla_gluon sees 64 CUs here,
-# as under a CU_NUM setting or a compute partition: at H=32 it would run each
-# of these calls in one key split and leave the empty rows unwritten, and at
-# H=64 it would assert, T not being a multiple of 64.
+# which must write zeros into the NaN-filled out, also at softmax_scale=0,
+# where a masked score times the scale must not become NaN. mla_gluon sees 64
+# CUs here, as under a CU_NUM setting or a compute partition: at H=32 it would
+# run each of these calls in one key split and leave the empty rows unwritten,
+# and at H=64 it would assert, T not being a multiple of 64.
+@pytest.mark.parametrize("scale", [512**-0.5, 0.0], ids=["scaled", "zero-scale"])
 @pytest.mark.parametrize("with_sink", [True, False])
 @pytest.mark.parametrize("H", [32, 64])
 @pytest.mark.parametrize("T", [300, 48])
-def test_pa_prefill_sparse_gfx950_single_pass(T, H, with_sink, monkeypatch):
+def test_pa_prefill_sparse_gfx950_single_pass(T, H, with_sink, scale, monkeypatch):
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
     if DEVICE_ARCH != "gfx950":
@@ -590,7 +592,6 @@ def test_pa_prefill_sparse_gfx950_single_pass(T, H, with_sink, monkeypatch):
     # output past the tolerance.
     sink = torch.randn(H, dtype=torch.float32, device=dev) + 5 if with_sink else None
     _, indptr, indices = _ragged_rows(T, max_len, num_kv, dev)
-    scale = D**-0.5
 
     ref = _sparse_prefill_attn_torch(
         q, kv, indices, indptr, None, None, None, sink, scale
