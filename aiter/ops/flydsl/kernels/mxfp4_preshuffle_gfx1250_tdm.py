@@ -287,16 +287,36 @@ def launch_gemm_a8w4_tdm(
             or (_sh_half // n_warp // 16) % 4 == 0
         )
     )
+    # shared_a16: a quarter-width shared tile keeps its bf16 A stage inside the
+    # routed A + B stage (bf16 A is 4x the routed fp4 A; the fp8 B quarter is half
+    # the routed fp4 B), so the kernel's LDS -- and the routed tiles' occupancy --
+    # does not grow. Its wave slices are 16-column multiples and its 16-row B
+    # groups split whole across the TDM owners.
+    _sh_q = tile_n // 4
+    _sh_q_wave = _sh_q // n_warp
+    _a_routed = ceildiv(tile_m * ((tile_k // 2 if a_is_fp4 else tile_k) + 16), 16) * 16
+    _ab_routed = _a_routed + tile_n * tile_k // 2
+    SH_A_STAGE = ceildiv(tile_m * (tile_k * 2 + 16), 16) * 16
+    _sh_quarter_ok = bool(
+        shared_a16
+        and not planar_lds_on
+        and SH_A_STAGE + _sh_q * tile_k <= _ab_routed
+        and _sh_q % (16 * n_warp) == 0
+        and (_sh_q_wave % 32 == 0 or _sh_q_wave == 16)
+        and (_sh_q // 16) % max(2, num_waves_per_tensor_tdm) == 0
+    )
     SH_SPLIT = (
-        2
+        (4 if _sh_quarter_ok else 2)
         if (
             shared_b
-            and _sh_half_ok
+            and (_sh_quarter_ok or _sh_half_ok)
             and (shared_mode == 1 or (shared_mode == 2 and cluster_m == 1))
         )
         else 1
     )
-    SH_GRID = int(SH_SPLIT == 2 and shared_mode == 2 and cluster_m == 1)
+    SH_GRID = int(SH_SPLIT > 1 and shared_mode == 2 and cluster_m == 1)
+    # The bf16 shared A sits in the routed stage (no A-stage growth).
+    SH_A16_INPLACE = int(shared_a16 and SH_SPLIT == 4)
     cache_tag = (
         K,
         tile_m,
@@ -398,7 +418,9 @@ def launch_gemm_a8w4_tdm(
     # shared_a16: a shared tile's A stage is bf16 rows (tile_k * 2 bytes plus a pad).
     A_LDS_ROW_SH = tile_k * 2 + LDS_PAD_A
     STAGE_A = (
-        max(STAGE_A, ceildiv(tile_m * A_LDS_ROW_SH, 16) * 16) if shared_a16 else STAGE_A
+        max(STAGE_A, ceildiv(tile_m * A_LDS_ROW_SH, 16) * 16)
+        if shared_a16 and not SH_A16_INPLACE
+        else STAGE_A
     )
     ACT_NDW_RT, A_ROW_B_RT, A_LDS_ROW_RT, A_KSTEP_RT = (
         ACT_NDW,
@@ -453,6 +475,7 @@ def launch_gemm_a8w4_tdm(
     PLANAR_END = PLANAR_B_OFF + num_buffers * STAGE_B
     A_LDS_OFF = PLANAR_A_OFF if planar_lds_on else 0
     B_LDS_OFF = PLANAR_B_OFF if planar_lds_on else STAGE_A
+    B_LDS_OFF_RT = B_LDS_OFF
     SA_LDS_OFF = PLANAR_SA_OFF if planar_lds_on else STAGE_A + STAGE_B
     SB_LDS_OFF = PLANAR_SB_OFF if planar_lds_on else STAGE_A + STAGE_B + STAGE_SA
     A_LDS_STAGE = STAGE_A if planar_lds_on else PITCH
@@ -530,7 +553,15 @@ def launch_gemm_a8w4_tdm(
     _drain = "_rolleddrain" if rolled_drain else ""
     _shared = (
         "_shfp8"
-        + ("" if SH_SPLIT == 1 else ("_ngrid" if SH_GRID else "_n2pass"))
+        + (
+            ""
+            if SH_SPLIT == 1
+            else (
+                ("_ngrid" if SH_SPLIT == 2 else f"_ngrid{SH_SPLIT}")
+                if SH_GRID
+                else f"_n{SH_SPLIT}pass"
+            )
+        )
         + ("_a16" if shared_a16 else "")
         + ("hw" if shared_a16 and FHMOE_HW_SCALE else "")
         if shared_b
@@ -619,7 +650,12 @@ def launch_gemm_a8w4_tdm(
             sh_blocks = fx.Int32(fx.grid_dim.x) - total_m_tiles * total_n_tiles
             sh_bid = fx.Int32(bid_x)
             in_extra = sh_bid < sh_blocks
-            sh_half = in_extra.select(fx.Int32(1), fx.Int32(0))
+            # The extra blocks are SH_SPLIT - 1 parts of [shared m tile][n tile].
+            sh_per_part = sh_blocks // (SH_SPLIT - 1)
+            sh_per_part = (sh_per_part > 0).select(sh_per_part, fx.Int32(1))
+            x_part = sh_bid // sh_per_part
+            x_rem = sh_bid - x_part * sh_per_part
+            sh_half = in_extra.select(x_part + 1, fx.Int32(0))
             bid_x = in_extra.select(fx.Int32(0), sh_bid - sh_blocks)
         swz_id = bid_x // cluster_n if cluster_n > 1 else bid_x
         local_n = bid_x - swz_id * cluster_n if cluster_n > 1 else 0
@@ -648,9 +684,9 @@ def launch_gemm_a8w4_tdm(
                 sh_first + m_tile,
                 (m_tile < sh_end).select(m_tile - sh_tiles, m_tile),
             )
-            m_tile = in_extra.select(sh_first + sh_bid // total_n_tiles, m_rot)
+            m_tile = in_extra.select(sh_first + x_rem // total_n_tiles, m_rot)
             blk_m = m_tile * tile_m
-            blk_n = in_extra.select((sh_bid % total_n_tiles) * tile_n, blk_n)
+            blk_n = in_extra.select((x_rem % total_n_tiles) * tile_n, blk_n)
         # A always follows the existing 1x4 direction: one M row broadcasts
         # across the four N columns, even when the physical cluster is 4x4.
         a_mcast_mask = (
@@ -711,6 +747,7 @@ def launch_gemm_a8w4_tdm(
             A_LDS_ROW = A_LDS_ROW_SH if SH16 else A_LDS_ROW_RT
             A_KSTEP = 256 if SH16 else A_KSTEP_RT
             stage1_quant_out = 0 if SH16 else STAGE1_QUANT_OUT_RT
+            B_LDS_OFF = SH_A_STAGE if (SH16 and SH_A16_INPLACE) else B_LDS_OFF_RT
             warp_tile_n = tile_n // n_warp
             wmma_n_rep = warp_tile_n // WMMA_N
             n_acc = wmma_m_rep * wmma_n_rep
@@ -1099,6 +1136,7 @@ def launch_gemm_a8w4_tdm(
                 lds_row=SC_INNER,
                 k_adv=SC_INNER * 4,
                 wv=waves[3],
+                split_inner=SB_SUPERS < len(waves[3]),
             )
 
             # Wave ids are runtime, so one stream serves every wave and one test per
@@ -1189,8 +1227,14 @@ def launch_gemm_a8w4_tdm(
             )
             # One full-wave load covers both 16-column halves of an N32 scale
             # super-row. WMMA opsel_a selects lane 0:15 or 16:31 for each wn.
-            assert warp_tile_n % 32 == 0, "load_sb split requires a 32-aligned wnb"
-            lds_sb_lane_off = ((wnb // 32) * SC_INNER + (lane16 if SH16 else lane)) * 4
+            assert warp_tile_n % 32 == 0 or (
+                SH16 and warp_tile_n == 16
+            ), "load_sb split requires a 32-aligned wnb"
+            lds_sb_lane_off = (
+                ((wnb // 32) * SC_INNER + (wnb % 32) + lane16) * 4
+                if SH16
+                else ((wnb // 32) * SC_INNER + lane) * 4
+            )
 
             LdsAddr = namedtuple("LdsAddr", "a b sa sb")
 
@@ -2719,7 +2763,9 @@ def launch_gemm_a8w4_tdm(
         arg_shared_a if shared_a16 else arg_a,
         arg_shared_c if shared_a16 else arg_a,
     )
-    sh_blocks = ceildiv(shared_rows, tile_m) * n_tiles if SH_GRID else 0
+    sh_blocks = (
+        ceildiv(shared_rows, tile_m) * n_tiles * (SH_SPLIT - 1) if SH_GRID else 0
+    )
     grid = (
         (
             persistent_workers
