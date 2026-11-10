@@ -24,6 +24,14 @@
             "num_warps": 4,
             "waves_per_eu": 1
         },
+        "causal_long": {
+            "BLOCK_M": 256,
+            "BLOCK_N": 128,
+            "num_warps": 4,
+            "waves_per_eu": 1
+        },
+        "causal_small_max_seqlen_k": 4096,
+        "causal_long_min_seqlen_k": 8192,
         "short": {
             "BLOCK_M": 256,
             "BLOCK_N": 128,
