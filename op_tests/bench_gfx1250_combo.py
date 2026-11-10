@@ -256,7 +256,7 @@ and reports one rank:
                  hidden 7168, inter 2048, a4w4. Every token routes to the
                  shared expert; the other 8 follow the UT's routing.
     mla_decode   test_mla_decode_pagesize64.test_mla at -n 128,1: Q fp8
-                 [batch, 128, 576], page64 kv-shuffled fp8 KV, 1K..16K context.
+                 [batch, 128, 576], page64 kv-shuffled fp8 KV, 256..24K context.
     mla_prefill  test_fmha_fwd_with_sink_varlen_asm's perf case: causal,
                  128 heads, qk 192 / v 128, bf16, 1024-token sequences.
 
@@ -645,12 +645,14 @@ _DSR1_MOE_CONFIG = {
     "activation": "silu",
     "use_bias": False,
 }
-# MLPerf DSR1 averages 804 input / 4043 output tokens.
-_DSR1_MLA_DECODE_CTX = (1024, 2048, 4096, 8192, 16384)
-# Cases past this many KV tokens are skipped: the UT keeps bf16 staging and an
-# fp32 reference copy of the whole cache, which stops fitting one GPU, and the
-# recipe's KV pool is far smaller anyway.
-_DSR1_MLA_DECODE_MAX_KV_TOKENS = 16384 * 1024
+# DSR1 MLA is dense (no index top-k, no sliding window), so a decode step reads
+# each sequence's whole context. Over the MLPerf dataset with max_tokens=20000,
+# decode-step context is p1 320, p50 3482, p99 18741, max 21526.
+_DSR1_MLA_DECODE_CTX = (256, 512, 1024, 2048, 4096, 8192, 16384, 24576)
+# Cases past this many KV tokens are skipped. The UT holds about 6 KB per KV
+# token (bf16 staging, fp8 cache and reference, fp32 reference copy), ~200 GB
+# here; twice that no longer fits one GPU.
+_DSR1_MLA_DECODE_MAX_KV_TOKENS = 32 * 1024 * 1024
 # One prefill step, up to the recipe's max_num_batched_tokens (12288) and one
 # tier past it, packed as 1024-token sequences.
 _DSR1_MLA_PREFILL_TOKENS = _tokens((1024, 2048, 4096, 8192, 12288, 16384))
