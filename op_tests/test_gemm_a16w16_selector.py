@@ -23,6 +23,7 @@ parser.add_argument("--csv", default=None, help="write the per-shape table here"
 args = parser.parse_args()
 
 os.environ.setdefault("AITER_GEMM_A16W16_SELECTOR", "1")
+os.environ.setdefault("AITER_GEMM_A16W16_SELECTOR_CACHE", "0")
 if not args.tuned:
     empty = tempfile.NamedTemporaryFile("w", suffix="_bf16_tuned_gemm.csv", delete=False)
     empty.write("gfx,cu_num,M,N,K,bias,dtype,outdtype,scaleAB,bpreshuffle,libtype,solidx,splitK,"
@@ -78,6 +79,44 @@ def main():
     if args.csv:
         df.to_csv(args.csv, index=False)
     assert ok.all(), "a selector pick failed the result check"
+    check_pick_cache(shapes[0])
+
+
+def check_pick_cache(shape):
+    """A timed top-2 pick is written to the pick cache, and a fresh selector reuses it
+    without running a kernel; a stamp change empties the file."""
+    m, n, k = shape
+    bf16 = str(torch.bfloat16)
+    gfx, cu = tuned_gemm.get_gfx(), tuned_gemm.get_cu_num()
+    path = os.path.join(tempfile.mkdtemp(), "picks.csv")
+    os.environ.update({gs.ENV: "1", gs.ENV_CACHE: path, gs.ENV_TOPK: "2"})
+
+    def select(run):
+        return gs.select(m, n, k, False, bf16, bf16, False, False, gfx, cu, run)
+
+    def no_run(*_):
+        raise AssertionError("a cached pick ran a kernel")
+
+    try:
+        gs.get_selector.cache_clear()
+        first = select(tuned_gemm._run_config)
+        gs.get_selector.cache_clear()
+        again = select(no_run)
+        assert again == first, (first, again)
+        os.environ[gs.ENV_TOPK] = "3"
+        gs.get_selector.cache_clear()
+        assert len(gs.get_selector(gfx, cu).cache.rows) == 1
+        with open(path) as f:
+            lines = f.read().splitlines()
+        with open(path, "w") as f:
+            f.write("\n".join(["# {}"] + lines[1:]) + "\n")
+        gs.get_selector.cache_clear()
+        assert not gs.get_selector(gfx, cu).cache.rows, "a stale stamp kept its rows"
+        print(f"pick cache: ({m}, {n}, {k}) -> {first and first['selector']} reused from {path}")
+    finally:
+        for v in (gs.ENV_CACHE, gs.ENV_TOPK):
+            os.environ.pop(v, None)
+        gs.get_selector.cache_clear()
 
 
 if __name__ == "__main__":

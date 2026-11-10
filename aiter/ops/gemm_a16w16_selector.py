@@ -17,8 +17,15 @@ today's default chain whenever the tuned CSV has no row for the shape. Per new s
 ``AITER_GEMM_A16W16_SELECTOR_TOPK=k`` (default 1) times the top k once on the GPU at the
 shape's first call and keeps the fastest; ``AITER_GEMM_A16W16_SELECTOR_CHECK=1`` checks each
 timed candidate's result against an fp32 reference and skips a failing one. Neither runs
-during CUDA-graph capture, where the top 1 is used. ``AITER_GEMM_A16W16_SELECTOR_LOG=<csv>``
-appends one row per decided shape.
+during CUDA-graph capture, where the top 1 is used. The timed calls are replayed from a
+captured HIP graph, so launch overhead is excluded as it is in a graph-captured model
+(``AITER_GEMM_A16W16_SELECTOR_TIMER=events`` times eager calls queued behind a GPU sleep).
+``AITER_GEMM_A16W16_SELECTOR_LOG=<csv>`` appends one row per decided shape.
+
+Decided shapes persist in a pick cache (``AITER_GEMM_A16W16_SELECTOR_CACHE``: default
+``<aiter JIT dir>/gemm_a16w16_selector_picks.csv``, ``0`` turns it off). Its first line
+stamps the artifact, aiter commit, ROCm and torch; any change empties the file. A cached
+pick is reused when it was timed with at least the current top k and check setting.
 
 Scope: the artifact's gfx and CU count, bf16 in and out, no bias, no scaleAB, no preshuffle.
 """
@@ -42,6 +49,8 @@ ENV = "AITER_GEMM_A16W16_SELECTOR"
 ENV_TOPK = "AITER_GEMM_A16W16_SELECTOR_TOPK"
 ENV_CHECK = "AITER_GEMM_A16W16_SELECTOR_CHECK"
 ENV_LOG = "AITER_GEMM_A16W16_SELECTOR_LOG"
+ENV_TIMER = "AITER_GEMM_A16W16_SELECTOR_TIMER"
+ENV_CACHE = "AITER_GEMM_A16W16_SELECTOR_CACHE"
 ARTIFACT_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "configs",
@@ -230,8 +239,14 @@ class Eligibility:
         if opus_idx:
             try:
                 self.opus_tm = _opus_tune_module()
+                built = _opus_built_kids()
                 for i in opus_idx:
-                    self.opus.append((i, int(cands[i]["solidx"]), int(cands[i]["splitK"])))
+                    if int(cands[i]["solidx"]) in built:
+                        self.opus.append((i, int(cands[i]["solidx"]), int(cands[i]["splitK"])))
+                skipped = sorted({int(cands[i]["solidx"]) for i in opus_idx} - built)
+                if skipped:
+                    logger.info(f"[gemm_a16w16_selector] Opus kids {skipped} are not compiled "
+                                "in the Opus module; not offered")
             except Exception as e:  # noqa: BLE001  no csrc/ in this install: Opus never offered
                 logger.warning(f"[gemm_a16w16_selector] Opus candidates disabled: {e}")
         self.skinny = np.array([i for i, x in enumerate(lib) if x == "skinny"], np.int64)
@@ -316,6 +331,23 @@ def _opus_tune_module():
     return opus_gemm_tune
 
 
+def _opus_built_kids():
+    """Kids compiled into the installed Opus module: the subset-compile sidecar when its
+    receipt matches the .so, else the arch's default compile floor (always built). A tuned
+    row's kid is compiled because the build reads the tuned CSVs; a selector pick is not."""
+    from aiter.jit import core
+    from aiter.jit.utils.chip_info import get_gfx
+    from aiter.jit.utils.jit_cache import compiled_kids_are_current
+    from opus_gemm_common import _opus_sidecar_path, default_compiled_kids_for_arch
+
+    sidecar = _opus_sidecar_path()
+    artifact = os.path.join(core.get_user_jit_dir(), "module_deepgemm_opus.so")
+    if compiled_kids_are_current(sidecar, artifact, ()):
+        with open(sidecar) as f:
+            return {int(x) for x in json.load(f)}
+    return set(default_compiled_kids_for_arch({get_gfx().lower()}))
+
+
 class Selector:
     def __init__(self, artifact, props=None, is_skinny=None):
         meta = artifact["meta"]
@@ -324,6 +356,8 @@ class Selector:
         self.features = artifact["features"]
         self.cands = artifact["candidates"]
         self.ids = [c["id"] for c in self.cands]
+        self.index = {c: i for i, c in enumerate(self.ids)}
+        self.cache = None
         self.static = {k: np.array([np.nan if v is None else v for v in vals], np.float64)
                        for k, vals in artifact["static"].items()}
         self.forest = Forest(artifact["trees"])
@@ -396,6 +430,119 @@ def _artifact_path(gfx, cu_num):
     return v if v != "1" else os.path.join(ARTIFACT_DIR, f"{gfx}_cu{cu_num}.json")
 
 
+def _aiter_commit():
+    import subprocess
+
+    import aiter
+
+    try:
+        return subprocess.run(
+            ["git", "-C", os.path.dirname(os.path.abspath(aiter.__file__)), "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=10, check=True).stdout.strip()
+    except Exception:  # noqa: BLE001  not a checkout
+        import importlib.metadata as md
+
+        try:
+            return md.version("amd-aiter")
+        except md.PackageNotFoundError:
+            return "unknown"
+
+
+class PickCache:
+    """Decided shapes on disk, one CSV per node, shared by every process under a file lock.
+
+    The first line stamps what a pick depends on; a file with another stamp is emptied."""
+
+    COLS = ["gfx", "cu_num", "M", "N", "K", "dtype", "otype", "pick", "rank", "eligible",
+            "timed", "check", "timer", "timed_us"]
+
+    def __init__(self, path, stamp):
+        self.path, self.rows = path, {}
+        self.line = "# " + json.dumps(stamp, sort_keys=True)
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        with self._lock():
+            first = ""
+            if os.path.exists(path):
+                with open(path, newline="") as f:
+                    first = f.readline().rstrip("\n")
+                    if first == self.line:
+                        for r in csv.DictReader(f):
+                            self.rows[self.key(r)] = r
+            if first != self.line:
+                if first:
+                    logger.info(f"[gemm_a16w16_selector] pick cache {path} has another stamp; "
+                                "emptied")
+                tmp = f"{path}.{os.getpid()}.tmp"
+                with open(tmp, "w", newline="") as f:
+                    f.write(self.line + "\n")
+                    csv.writer(f).writerow(self.COLS)
+                os.replace(tmp, path)
+
+    @staticmethod
+    def key(r):
+        return tuple(str(r[c]) for c in ("gfx", "cu_num", "M", "N", "K", "dtype", "otype"))
+
+    def _lock(self):
+        import contextlib
+        import fcntl
+
+        @contextlib.contextmanager
+        def held():
+            with open(self.path + ".lock", "a") as f:
+                fcntl.flock(f, fcntl.LOCK_EX)
+                try:
+                    yield
+                finally:
+                    fcntl.flock(f, fcntl.LOCK_UN)
+
+        return held()
+
+    def get(self, key, topk, check, timer):
+        """A row decided at least as thoroughly as (topk, check) now ask for, or None."""
+        r = self.rows.get(tuple(map(str, key)))
+        if r is None:
+            return None
+        need = topk if (topk > 1 or check) else 0
+        if int(r["timed"]) < need or int(r["check"]) < int(check):
+            return None
+        return r if not need or r["timer"] == timer else None
+
+    def put(self, row):
+        row = {c: row.get(c, "") for c in self.COLS}
+        old = self.rows.get(self.key(row))
+        if old is not None and int(old["timed"]) > int(row["timed"]):
+            return
+        with self._lock():
+            with open(self.path, newline="") as f:
+                if f.readline().rstrip("\n") != self.line:
+                    return
+            with open(self.path, "a", newline="") as f:
+                csv.writer(f).writerow([row[c] for c in self.COLS])
+        self.rows[self.key(row)] = {c: str(v) for c, v in row.items()}
+
+
+def _pick_cache(artifact_path):
+    v = os.environ.get(ENV_CACHE, "")
+    if v == "0":
+        return None
+    import hashlib
+
+    import torch
+
+    from aiter.jit.core import get_user_jit_dir
+
+    path = v or os.path.join(get_user_jit_dir(), "gemm_a16w16_selector_picks.csv")
+    with open(artifact_path, "rb") as f:
+        sha = hashlib.sha256(f.read()).hexdigest()
+    stamp = {"format": 1, "artifact": sha, "aiter": _aiter_commit(),
+             "rocm": torch.version.hip, "torch": torch.__version__}
+    try:
+        return PickCache(path, stamp)
+    except OSError as e:
+        logger.warning(f"[gemm_a16w16_selector] pick cache {path} unusable ({e}); not cached")
+        return None
+
+
 @functools.lru_cache(maxsize=1)
 def get_selector(gfx, cu_num):
     path = _artifact_path(gfx, cu_num)
@@ -408,15 +555,69 @@ def get_selector(gfx, cu_num):
         logger.warning(f"[gemm_a16w16_selector] {path} is for {sel.meta['gfx']} with "
                        f"{sel.meta['cu_num']} CUs, not {gfx} with {cu_num}; using the default chain")
         return None
+    sel.cache = _pick_cache(path)
     logger.info(f"[gemm_a16w16_selector] loaded {path} ({len(sel.cands)} candidates, "
-                f"{len(sel.forest.roots)} trees) in {(time.perf_counter() - t0) * 1e3:.0f} ms")
+                f"{len(sel.forest.roots)} trees) in {(time.perf_counter() - t0) * 1e3:.0f} ms"
+                + (f"; pick cache {sel.cache.path} ({len(sel.cache.rows)} shapes)"
+                   if sel.cache else ""))
     return sel
 
 
-def _trial(configs, m, n, k, run, check):
+def _events_us(cfg, copies, run):
+    """Median µs of _TIMED_CALLS eager calls, all queued behind a GPU sleep so launch
+    overhead does not reach the GPU timeline."""
+    import torch
+
+    ev = [(torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
+          for _ in range(_TIMED_CALLS)]
+    torch.cuda.synchronize()
+    torch.cuda._sleep(20_000_000)
+    for j, (s, e) in enumerate(ev):
+        x, w = copies[j % len(copies)]
+        s.record()
+        run(cfg, x, w)
+        e.record()
+    torch.cuda.synchronize()
+    t = sorted(s.elapsed_time(e) * 1e3 for s, e in ev)
+    return t[_TIMED_CALLS // 2]
+
+
+def _graph_us(cfg, copies, run, replays=5):
+    """Mean µs per call of _TIMED_CALLS back-to-back calls captured in one HIP graph
+    (median over replays), or None when the config cannot be captured."""
+    import torch
+
+    g = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(g):
+            for j in range(_TIMED_CALLS):
+                x, w = copies[j % len(copies)]
+                run(cfg, x, w)
+    except Exception as e:  # noqa: BLE001
+        logger.info(f"[gemm_a16w16_selector] {cfg['selector']} not graph-capturable "
+                    f"({type(e).__name__}); timing eager calls")
+        torch.cuda.synchronize()
+        return None
+    g.replay()
+    ev = [(torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
+          for _ in range(replays)]
+    torch.cuda.synchronize()
+    torch.cuda._sleep(20_000_000)
+    for s, e in ev:
+        s.record()
+        g.replay()
+        e.record()
+    torch.cuda.synchronize()
+    t = sorted(s.elapsed_time(e) * 1e3 / _TIMED_CALLS for s, e in ev)
+    g.reset()
+    return t[replays // 2]
+
+
+def _trial(configs, m, n, k, run, check, timer="graph"):
     """Time each config once on random inputs (rotated copies, a warm-up pass over them,
-    then _TIMED_CALLS calls); with check, drop a config whose result is off. Returns
-    (index of the fastest passing config or None, per-config median µs or None)."""
+    then _TIMED_CALLS calls, replayed from a HIP graph or eager); with check, drop a config
+    whose result is off. Returns (index of the fastest passing config or None, per-config
+    µs or None)."""
     import torch
 
     dev = torch.cuda.current_device()
@@ -438,18 +639,8 @@ def _trial(configs, m, n, k, run, check):
                     continue
             for x, w in copies:
                 run(cfg, x, w)
-            ev = [(torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
-                  for _ in range(_TIMED_CALLS)]
-            torch.cuda.synchronize()
-            torch.cuda._sleep(20_000_000)
-            for j, (s, e) in enumerate(ev):
-                x, w = copies[j % ncopy]
-                s.record()
-                run(cfg, x, w)
-                e.record()
-            torch.cuda.synchronize()
-            t = sorted(s.elapsed_time(e) * 1e3 for s, e in ev)
-            us.append(t[_TIMED_CALLS // 2])
+            t = _graph_us(cfg, copies, run) if timer == "graph" else None
+            us.append(t if t is not None else _events_us(cfg, copies, run))
         except Exception as e:  # noqa: BLE001  a failing kernel is skipped, as in the tuner
             logger.warning(f"[gemm_a16w16_selector] {cfg['selector']} failed on "
                            f"({m}, {n}, {k}): {type(e).__name__}: {str(e)[:120]}")
@@ -468,38 +659,63 @@ def select(M, N, K, bias, dtype, otype, scaleAB, bpreshuffle, gfx, cu_num, run):
     sel = get_selector(gfx, cu_num)
     if sel is None:
         return None
+    topk = max(1, int(os.environ.get(ENV_TOPK, "1")))
+    check = os.environ.get(ENV_CHECK, "0") not in ("", "0")
+    timer = "events" if os.environ.get(ENV_TIMER, "graph") == "events" else "graph"
+    key = (gfx, cu_num, M, N, K, str(dtype), str(otype))
+    hit = sel.cache.get(key, topk, check, timer) if sel.cache else None
+    if hit is not None and (hit["pick"] == "" or hit["pick"] in sel.index):
+        cfg = sel.config(sel.index[hit["pick"]]) if hit["pick"] else None
+        logger.info(f"[gemm_a16w16_selector] M:{M}, N:{N}, K:{K} untuned: "
+                    f"{hit['pick'] or 'default chain'} (pick cache)")
+        _log(M, N, K, hit["pick"], hit["rank"], hit["eligible"], 0, 0, hit["timed_us"], "",
+             "cache", hit["timer"])
+        return cfg
     t0 = time.perf_counter()
     order, scores = sel.rank(M, N, K)
     rank_ms = (time.perf_counter() - t0) * 1e3
     if not len(order):
         return None
-    topk = max(1, int(os.environ.get(ENV_TOPK, "1")))
-    check = os.environ.get(ENV_CHECK, "0") not in ("", "0")
     kept, us, trial_ms = 0, [], 0.0
     import torch
 
-    if (topk > 1 or check) and not torch.cuda.is_current_stream_capturing():
+    timed = (topk > 1 or check) and not torch.cuda.is_current_stream_capturing()
+    if timed:
         cfgs = [sel.config(i) for i in order[:topk]]
         t1 = time.perf_counter()
-        kept, us = _trial(cfgs, M, N, K, run, check)
+        kept, us = _trial(cfgs, M, N, K, run, check, timer)
         trial_ms = (time.perf_counter() - t1) * 1e3
-        if kept is None:
-            logger.warning(f"[gemm_a16w16_selector] no timed candidate passed for ({M}, {N}, {K}); "
-                           "using the default chain")
-            return None
+    us_txt = ";".join("" if u is None else f"{u:.2f}" for u in us)
+    top5 = ";".join(sel.ids[i] for i in order[:5])
+    row = dict(zip(PickCache.COLS[:7], key), eligible=len(order), timed=len(us) if timed else 0,
+               check=int(check and timed), timer=timer if timed else "", timed_us=us_txt)
+    if kept is None:
+        logger.warning(f"[gemm_a16w16_selector] no timed candidate passed for ({M}, {N}, {K}); "
+                       "using the default chain")
+        if sel.cache:
+            sel.cache.put(dict(row, pick="", rank=""))
+        _log(M, N, K, "", "", len(order), rank_ms, trial_ms, us_txt, top5, "timed", timer)
+        return None
     cfg = sel.config(order[kept])
     logger.info(f"[gemm_a16w16_selector] M:{M}, N:{N}, K:{K} untuned: {cfg['selector']} "
                 f"(rank {kept + 1} of {len(order)} eligible, {rank_ms:.1f} ms"
                 + (f", timed top {len(us)} in {trial_ms:.0f} ms" if us else "") + ")")
-    path = os.environ.get(ENV_LOG)
-    if path:
-        new = not os.path.exists(path)
-        with open(path, "a", newline="") as f:
-            w = csv.writer(f)
-            if new:
-                w.writerow(["M", "N", "K", "pick", "rank", "eligible", "rank_ms", "trial_ms",
-                            "timed_us", "top5"])
-            w.writerow([M, N, K, cfg["selector"], kept + 1, len(order), round(rank_ms, 3),
-                        round(trial_ms, 1), ";".join("" if u is None else f"{u:.2f}" for u in us),
-                        ";".join(sel.ids[i] for i in order[:5])])
+    if sel.cache:
+        sel.cache.put(dict(row, pick=cfg["selector"], rank=kept + 1))
+    _log(M, N, K, cfg["selector"], kept + 1, len(order), rank_ms, trial_ms, us_txt, top5,
+         "timed" if timed else "ranked", timer if timed else "")
     return cfg
+
+
+def _log(M, N, K, pick, rank, eligible, rank_ms, trial_ms, timed_us, top5, source, timer):
+    path = os.environ.get(ENV_LOG)
+    if not path:
+        return
+    new = not os.path.exists(path)
+    with open(path, "a", newline="") as f:
+        w = csv.writer(f)
+        if new:
+            w.writerow(["M", "N", "K", "pick", "rank", "eligible", "rank_ms", "trial_ms",
+                        "timed_us", "top5", "source", "timer"])
+        w.writerow([M, N, K, pick, rank, eligible, round(float(rank_ms), 3),
+                    round(float(trial_ms), 1), timed_us, top5, source, timer])
