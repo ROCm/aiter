@@ -10,7 +10,6 @@ buffer. ``nope > 0`` quantizes cat(ql_nope, q_pe) to fp8 with one per-tensor sca
 handles one or more tokens for one local head.
 """
 
-import os
 from dataclasses import dataclass
 
 import flydsl.compiler as flyc
@@ -34,6 +33,7 @@ from aiter.ops.flydsl.dcp_mailbox.common import (
     key_tuple,
     pair_layout,
     pair_span,
+    token_tile,
 )
 from aiter.ops.flydsl.dcp_mailbox.common import (
     peer_bytes as peer_storage_bytes,
@@ -73,17 +73,6 @@ class GatherBuild:
     phase: int = 0
     debug: bool = False
     token_tile: int = 1
-
-
-def _token_tile(tokens):
-    override = int(os.environ.get("AITER_DCP_MAILBOX_TOKEN_TILE", "0"))
-    if override > 0:
-        return override
-    if tokens >= 192:
-        return 8
-    if tokens >= 96:
-        return 4
-    return 2 if tokens >= 48 else 1
 
 
 def peer_layout(ranks, max_tokens, heads, words):
@@ -264,7 +253,8 @@ def build(key: GatherBuild):
                             buffer_resource(gq),
                             at,
                         )
-        _finish(tid, state, e, nblk)
+        if const_expr(key.phase != 1):
+            _finish(tid, state, e, nblk)
 
     return _jit(key, gather, nblk, keyed)
 
@@ -410,6 +400,10 @@ def dcp_query_gather(
     Every rank must issue the identical call sequence. One extra call can
     silently misalign every later result.
     """
+    if query.device != ws.gathered.device:
+        raise ValueError("query and workspace must use the same device")
+    if query.dtype != ws.dtype or query.shape[1:] != (ws.heads, ws.dim):
+        raise ValueError("query dtype and [heads, dim] must match the workspace")
     if ws.words > 2 * THREADS:
         raise ValueError(
             f"{ws.dtype} query gather supports at most 256 words per head; "
@@ -427,7 +421,7 @@ def dcp_query_gather(
         qlen=0 if plan is None else plan.qlen,
         phase=phase,
         debug=ws.debug,
-        token_tile=_token_tile(query.shape[0]),
+        token_tile=token_tile(query.shape[0]),
     )
     args = (
         query.data_ptr(),
@@ -457,6 +451,12 @@ def dcp_quant_query_gather(
     Every rank must issue the identical call sequence. One extra call can
     silently misalign every later result.
     """
+    if any(tensor.device != ws.gathered.device for tensor in (nope, pe, scale)):
+        raise ValueError("nope, pe, scale, and workspace must use the same device")
+    if nope.shape[:2] != pe.shape[:2] or nope.shape[1] != ws.heads:
+        raise ValueError("nope and pe must have matching [tokens, heads]")
+    if nope.shape[2] + pe.shape[2] != ws.dim:
+        raise ValueError("nope and pe dimensions must sum to the workspace dim")
     arch = get_gfx_runtime().split(":", 1)[0]
     if arch != "gfx950":
         raise RuntimeError(
@@ -475,7 +475,7 @@ def dcp_quant_query_gather(
         qlen=0 if plan is None else plan.qlen,
         phase=phase,
         debug=ws.debug,
-        token_tile=_token_tile(nope.shape[0]),
+        token_tile=token_tile(nope.shape[0]),
     )
     args = (
         nope.data_ptr(),

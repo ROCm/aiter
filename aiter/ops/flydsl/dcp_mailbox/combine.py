@@ -9,7 +9,6 @@ its own heads and applies the LSE weights. One CTA owns one or more tokens for
 one local head, and each of its ``dim / 4`` threads owns four head values.
 """
 
-import os
 from dataclasses import dataclass
 
 import flydsl.compiler as flyc
@@ -20,6 +19,7 @@ from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import Int32, Int64, T
 
 from aiter.ops.flydsl.dcp_mailbox.common import (
+    EPOCH_MASK,
     KernelAbi,
     bf2_f32,
     bf16_pair,
@@ -27,6 +27,7 @@ from aiter.ops.flydsl.dcp_mailbox.common import (
     key_tuple,
     pair_layout,
     pair_span,
+    token_tile,
 )
 from aiter.ops.flydsl.dcp_mailbox.common import (
     peer_bytes as peer_storage_bytes,
@@ -68,17 +69,6 @@ class CombineBuild:
     debug: bool
     token_tile: int
     row_mask: bool
-
-
-def _token_tile(tokens):
-    override = int(os.environ.get("AITER_DCP_MAILBOX_TOKEN_TILE", "0"))
-    if override > 0:
-        return override
-    if tokens >= 192:
-        return 8
-    if tokens >= 96:
-        return 4
-    return 2 if tokens >= 48 else 1
 
 
 def peer_layout(ranks, max_tokens, heads, dim):
@@ -226,7 +216,7 @@ def _finish(tid, state, e, nblk):
                 cache_modifier=CACHE_DEVICE,
             )
             bo.buffer_store(
-                e + 1,
+                (e + 1) & fx.Int32(EPOCH_MASK),
                 buffer_resource(state),
                 0,
                 cache_modifier=CACHE_DEVICE,
@@ -482,6 +472,8 @@ def dcp_lse_combine(
     assert out.shape[1] == ws.ranks * heads and out.shape[2] == dim
     assert lse.shape == (tokens, ws.ranks * heads)
     assert out.dtype == torch.bfloat16 and lse.dtype == torch.float32
+    if out.device != lse.device or out.device != ws.peers.bytes.device:
+        raise ValueError("out, lse, and workspace must use the same device")
     assert dim % 4 == 0 and 4 * ws.ranks <= dim <= 4 * MAX_THREADS, dim
     if tokens > ws.max_tokens:
         raise ValueError(
@@ -489,6 +481,13 @@ def dcp_lse_combine(
         )
     if (seq_lens is None) != (query_start_loc is None):
         raise ValueError("seq_lens and query_start_loc must be provided together")
+    for name, tensor in (
+        ("seq_lens", seq_lens),
+        ("query_start_loc", query_start_loc),
+        ("row_counts", row_counts),
+    ):
+        if tensor is not None and tensor.device != out.device:
+            raise ValueError(f"{name} must use the output device")
     if row_counts is not None and (
         row_counts.dtype != torch.int32
         or row_counts.shape != (tokens,)
@@ -512,7 +511,7 @@ def dcp_lse_combine(
         base_e=base_e,
         ret_lse=return_lse,
         debug=ws.debug,
-        token_tile=_token_tile(tokens),
+        token_tile=token_tile(tokens),
         row_mask=row_counts is not None,
     )
     build(key)(

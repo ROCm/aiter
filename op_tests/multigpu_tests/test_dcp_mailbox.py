@@ -20,7 +20,7 @@ from aiter.ops.flydsl.dcp_mailbox import (
     dcp_query_gather,
 )
 from aiter.ops.flydsl.dcp_mailbox.combine import peer_layout
-from aiter.ops.flydsl.dcp_mailbox.common import epoch_offset
+from aiter.ops.flydsl.dcp_mailbox.common import EPOCH_MASK, epoch_offset
 
 
 class _Group:
@@ -50,14 +50,14 @@ def _row_empty(tokens, seq_lens, qsl):
     return (rows >= qsl[-1]) | (seq_lens[seq] == 0)
 
 
-def worker(rank, world):
+def worker(rank, world, tokens):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ.setdefault("MASTER_PORT", "29741")
     torch.cuda.set_device(rank)
     dist.init_process_group("nccl", rank=rank, world_size=world)
     group = _Group(dist.new_group(backend="gloo"), rank, world)
     try:
-        tokens, hl = int(os.environ.get("TOKENS", "8")), 12
+        hl = 12
         max_tokens = max(tokens, 64)
         gen = torch.Generator(device="cuda")
         gen.manual_seed(100 + rank)
@@ -148,6 +148,30 @@ def worker(rank, world):
         dist.all_gather(parts, query)
         exp_q = torch.cat(parts, dim=1)
         torch.testing.assert_close(got, exp_q)
+
+        for _ in range(2):
+            split_query = torch.randn(
+                tokens, hl, dim, device="cuda", dtype=torch.bfloat16, generator=gen
+            )
+            assert dcp_query_gather(gws, split_query, phase=1) is None
+            split_got = dcp_query_gather(gws, split_query, phase=2)
+            split_parts = [torch.empty_like(split_query) for _ in range(world)]
+            dist.all_gather(split_parts, split_query)
+            torch.testing.assert_close(split_got, torch.cat(split_parts, dim=1))
+
+        gws.state[0].fill_(EPOCH_MASK - 2)
+        gws.state[1].zero_()
+        torch.cuda.synchronize()
+        dist.barrier(group=group.cpu_group)
+        for _ in range(6):
+            wrap_query = torch.randn(
+                tokens, hl, dim, device="cuda", dtype=torch.bfloat16, generator=gen
+            )
+            wrap_got = dcp_query_gather(gws, wrap_query)
+            wrap_parts = [torch.empty_like(wrap_query) for _ in range(world)]
+            dist.all_gather(wrap_parts, wrap_query)
+            torch.testing.assert_close(wrap_got, torch.cat(wrap_parts, dim=1))
+        assert int(gws.state[0].item()) == 3
 
         nope_w, pe_w = 512, 64
         qdim = nope_w + pe_w
@@ -288,7 +312,10 @@ def main():
         print(f"SKIP DCP_MAILBOX: unsupported architecture {arch}", flush=True)
         return
     world = int(os.environ.get("WORLD", "8"))
-    mp.spawn(worker, args=(world,), nprocs=world, join=True)
+    token_counts = [int(value) for value in os.environ.get("TOKENS", "8,99").split(",")]
+    for index, tokens in enumerate(token_counts):
+        os.environ["MASTER_PORT"] = str(29741 + index)
+        mp.spawn(worker, args=(world, tokens), nprocs=world, join=True)
 
 
 if __name__ == "__main__":

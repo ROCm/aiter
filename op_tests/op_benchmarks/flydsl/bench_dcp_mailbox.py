@@ -7,6 +7,10 @@ Run on one node with 8 GPUs:
 
     WORLD=8 python3 op_tests/op_benchmarks/flydsl/bench_dcp_mailbox.py
     VLLM_BASELINE=1 TOKENS=8,16 WORLD=8 python3 .../bench_dcp_mailbox.py
+
+The vLLM arm requires commit a2bcb5657a881a002e79d0adab3c6b5e39436121
+(``nightly-rocm100-a2bcb565...``). Its ``dcp_a2a_lse_reduce`` is the
+pack -> ``all_to_all_single`` -> unpack/combine chain.
 """
 
 import os

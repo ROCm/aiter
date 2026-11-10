@@ -11,6 +11,7 @@ import enum
 import functools
 import hashlib
 import inspect
+import os
 from dataclasses import dataclass, fields
 from pathlib import Path
 
@@ -18,6 +19,7 @@ import flydsl.expr as fx
 
 PAIR_BYTES = 8
 EPOCH_BYTES = 4
+EPOCH_MASK = (1 << 30) - 1
 
 _SCALARS = (int, float, bool, str, enum.Enum)
 _ROOT = Path(__file__).resolve().parent
@@ -75,6 +77,18 @@ def epoch_offset(layout) -> int:
 def peer_bytes(layout, ranks) -> int:
     """Return two pair parities plus one i32 epoch slot per rank."""
     return epoch_offset(layout) + ranks * EPOCH_BYTES
+
+
+def token_tile(tokens: int) -> int:
+    """Select tokens per CTA; ``AITER_DCP_MAILBOX_TOKEN_TILE`` overrides it."""
+    override = int(os.environ.get("AITER_DCP_MAILBOX_TOKEN_TILE", "0"))
+    if override > 0:
+        return override
+    if tokens >= 192:
+        return 8
+    if tokens >= 96:
+        return 4
+    return 2 if tokens >= 48 else 1
 
 
 def _python_params(fn) -> tuple[str, ...]:

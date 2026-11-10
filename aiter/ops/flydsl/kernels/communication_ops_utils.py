@@ -120,16 +120,16 @@ def memrealtime():
 
 
 @ASTRewriter.transform
-def _spin_tagged_bounded(load_all, pending, on_timeout):
+def _spin_tagged_bounded(load_all, pending, on_timeout, initial_late):
     """Poll for at most ``DIAG_TICKS`` and record a diagnostic on timeout."""
     start = memrealtime()
     values = load_all()
-    late = fx.Int32(0)
+    late = initial_late
     while pending(values) & (late == 0):
         fx.rocdl.s_sleep(1)
         values = load_all()
         late = (memrealtime() - start > DIAG_TICKS).select(fx.Int32(1), fx.Int32(0))
-    if late != 0:
+    if (late != 0) & (initial_late == 0):
         on_timeout()
     return values
 
@@ -227,7 +227,10 @@ class TaggedMailbox:
                     syncscope=fx.rocdl.SyncScope.Agent,
                 )
 
-            values = _spin_tagged_bounded(load_all, pending, on_timeout)
+            initial_late = (
+                buffer_load_i32(self.diagnostic, 2, cache_modifier=CACHE_DEVICE) < 0
+            ).select(fx.Int32(1), fx.Int32(0))
+            values = _spin_tagged_bounded(load_all, pending, on_timeout, initial_late)
         else:
             values = _spin_tagged(load_all, pending)
         out, index = [], 0
