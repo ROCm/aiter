@@ -1253,17 +1253,26 @@ MHC_SEAM_HIDDEN_SIZE = 5120
 # and token: post, collapse and the pre GEMM partials); from it the persistent fused
 # kernel (512-column chunks, ~11 us fixed cost). Every wave of the few-token kernel reads
 # its fn slice, so its time grows with T; on MI300X / MI325X (304 CUs) the two cross at
-# about 60 tokens. Both are followed by the ASM gates. This switch and the fused kernel's
-# grid (CUs / 10 token ranges) were timed on 304-CU parts only; on gfx942 parts or
-# partitions with fewer CUs the results are the same, the speed is not tuned.
+# about 60 tokens. Both are followed by the ASM gates. The fused kernel's fixed time does
+# not depend on the CU count while the few-token kernel's time per CU does, so with fewer
+# CUs the switch moves down with them: on 80-CU MI308X the two cross between 16 and 17
+# tokens (see _mhc_seam_small_max_t). The fused grid (CUs / 10 token ranges, one
+# workgroup per CU) is fastest on both: more token ranges each reload their fn chunk.
 MHC_SEAM_SMALL_MAX_T = 60
 MHC_SEAM_SMALL_SLICE = 128
 MHC_SEAM_FUSED_CHUNK = 512
 # From this many tokens the new residual no longer fits in the 256 MB MALL, and
-# nontemporal stores are about 1 % faster.
+# nontemporal stores are about 1 % faster. With fewer than 304 CUs (MI308X) they are
+# never slower and up to 3 % faster from 40 to 512 tokens, so they are always used.
 MHC_SEAM_STORE_NT_MIN_T = 8192
 # Tokens per launch: keeps every tensor under 4 GiB (the kernels use 32-bit offsets).
 MHC_SEAM_MAX_T_PER_LAUNCH = 65536
+
+
+def _mhc_seam_small_max_t(num_cu: int) -> int:
+    """Tokens per launch below which the few-token kernel runs: MHC_SEAM_SMALL_MAX_T on
+    304-CU parts, about one token per 5 CUs with fewer (17 on 80-CU MI308X)."""
+    return MHC_SEAM_SMALL_MAX_T if num_cu >= 304 else num_cu // 5 + 1
 
 
 @compile_ops("module_mhc_seam_asm", fc_name="mhc_seam_fused_asm", ffi_type="ctypes")
@@ -1427,7 +1436,7 @@ def mhc_fused_post_pre_delayed(
 
     Runs the ASM kernels of hsa/gfx942/mhc_seam in two launches: one kernel for the
     post, the collapse and the split-K partials of the pre GEMM (below
-    MHC_SEAM_SMALL_MAX_T tokens one short wave per 128-column slice and token, from it a
+    _mhc_seam_small_max_t tokens one short wave per 128-column slice and token, from it a
     persistent kernel over 512-column chunks), then the gates from the partials.
 
     Supported only on gfx942 with 4 residual streams and hidden_size 5120
@@ -1436,7 +1445,7 @@ def mhc_fused_post_pre_delayed(
     configurations: ``mhc_fused_post_pre_delayed_rmsnorm`` (Triton, folds the RMSNorm)
     or ``mhc_post`` + ``mhc_pre``. Tensors with another shape or device raise
     ValueError, another dtype TypeError; inputs need not be contiguous. The kernel
-    switch and grid were timed on 304-CU parts (MI300X, MI325X).
+    switch and grid were timed on 304-CU parts (MI300X, MI325X) and 80-CU MI308X.
 
     Args:
         residual: (T, 4, H) bf16 residual streams entering the seam.
@@ -1555,6 +1564,8 @@ def _mhc_seam_asm_launch(
     """
     m, hc_mult, hidden_size = residual.shape
     device = residual.device
+    num_cu = get_cu_num()
+    small_max = _mhc_seam_small_max_t(num_cu)
     gate_args = (
         hc_scale,
         hc_base,
@@ -1578,12 +1589,13 @@ def _mhc_seam_asm_launch(
         gates_out = (post_mix[t0:t1], comb_mix[t0:t1], next_pre_mix[t0:t1])
         # part[s, t, 0:24]: the mixes of column slice s, part[s, t, 24]: its sum of
         # squares; slices of 128 columns (few-token kernel) or 512 (fused kernel)
-        small = n < MHC_SEAM_SMALL_MAX_T
+        small = n < small_max
         sl = MHC_SEAM_SMALL_SLICE if small else MHC_SEAM_FUSED_CHUNK
         part = torch.empty(hidden_size // sl, n, 32, dtype=dtypes.fp32, device=device)
         seam_out = (residual_out[t0:t1], layer_input[t0:t1], part)
         if small:
             mhc_seam_small_asm(*seam_out, *seam_in, fn)
         else:
-            mhc_seam_fused_asm(*seam_out, *seam_in, fn, 0, n >= MHC_SEAM_STORE_NT_MIN_T)
+            store_nt = n >= MHC_SEAM_STORE_NT_MIN_T or num_cu < 304
+            mhc_seam_fused_asm(*seam_out, *seam_in, fn, 0, store_nt)
         mhc_seam_gates_asm(*gates_out, part, *gate_args)
