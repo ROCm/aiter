@@ -7,18 +7,20 @@ RFC #7240's first milestone asks for hot-path cost to be *measured*, not
 designed, so this prints the numbers as well as asserting on them. CPU-only; no
 GPU and no provider kernel is involved.
 
-Two gates, because they fail for different reasons:
+One gate, and it is machine-independent: the whole aiter-side overhead must
+cost less than a single ``Signature.bind`` of the same signature, measured in
+the same process. Dispatch used to be dominated by exactly that call, so this
+fails the moment a generic bind, a per-call ``getenv``, or a rebuilt provider
+list comes back -- on any hardware, because both sides of the comparison scale
+with the machine.
 
-* a machine-independent one -- the whole aiter-side overhead must cost less than
-  a single ``Signature.bind`` of the same signature, measured in the same
-  process. Dispatch used to be dominated by exactly that call, so this fails the
-  moment a generic bind, a per-call ``getenv``, or a rebuilt provider list comes
-  back, on any hardware.
-* an absolute ceiling, to catch a gross regression that somehow keeps the ratio.
+Absolute numbers are printed, not asserted. A hosted runner measures roughly
+1.7x what a dedicated machine does: an absolute ceiling set from one of them
+goes red on the other, and a gate that goes red for reasons unrelated to the
+change teaches people to ignore it. This file had a 4us ceiling for exactly one
+CI run before proving that point at 4.212us.
 
-The design budget is 1us. It is reported rather than asserted until CI runner
-hardware is characterised: a budget that goes red on a slow runner teaches
-people to ignore the gate.
+The design budget of 1us is reported for the same reason.
 """
 
 from __future__ import annotations
@@ -33,7 +35,6 @@ import pytest
 from aiter import plugin
 
 BUDGET_US = 1.0
-CEILING_US = 4.0
 REPEAT = 5
 NUMBER = 20_000
 
@@ -126,13 +127,13 @@ def test_dispatch_overhead_is_within_budget(monkeypatch, capsys):
         print(f"  AITER_PLUGINS=0        {killed - native:7.3f}us overhead")
         print(f"  one Signature.bind     {generic_bind:7.3f}us")
         print(f"  budget {BUDGET_US}us: {'met' if overhead <= BUDGET_US else 'MISSED'}")
+        print(f"  overhead is {overhead / generic_bind:.2f} of one Signature.bind")
 
     assert overhead < generic_bind, (
         f"aiter-side overhead ({overhead:.3f}us) must cost less than a single "
         f"Signature.bind ({generic_bind:.3f}us); dispatch has regressed to "
         f"generic canonicalization or per-call environment reads"
     )
-    assert overhead < CEILING_US, f"overhead {overhead:.3f}us exceeds {CEILING_US}us"
 
 
 def test_the_generated_binder_is_in_use():
