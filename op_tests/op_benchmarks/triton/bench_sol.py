@@ -33,7 +33,7 @@ Usage:
     python bench_sol.py                           # fp8, 720p, Ulysses 1 and 8
     python bench_sol.py --resolution 480p --ulysses 8
     python bench_sol.py --recipe f6f8 mxfp6_fp6p --block-tile all --jensen
-    python bench_sol.py --recipe all --sparsity 0.5 0.8 1.0 --markdown
+    python bench_sol.py --recipe all --sparsity 0.5 0.8 1.0 --markdown sol.md
 """
 
 import argparse
@@ -45,6 +45,7 @@ from typing import NamedTuple
 import torch
 import triton
 
+from aiter import logger
 from aiter.ops.mha_v4 import (
     MHA_V4_SOL_MODE,
     MHA_V4_SPARSE_MODE,
@@ -424,11 +425,20 @@ def run_recipe(name, recipe, degree, tokens, args):
 
     operands = build_operands(seqlen, heads, recipe)
     dense_ms = _time_dense(operands, args.warmup, args.rep)
-    print(
-        f"\n=== Wan 2.2 self-attn, Ulysses {degree}: "
-        f"{heads} heads x {seqlen} tokens x d{WAN_HEAD_DIM}, {name} ===\n"
-        f"{tokens} real tokens padded to {seqlen}, {dense_flops / 1e12:.1f} TFLOP dense, "
-        f"dense (mode 0) {dense_ms:.4f} ms"
+    logger.info(
+        "=== Wan 2.2 self-attn, Ulysses %d: %d heads x %d tokens x d%d, %s ===",
+        degree,
+        heads,
+        seqlen,
+        WAN_HEAD_DIM,
+        name,
+    )
+    logger.info(
+        "%d real tokens padded to %d, %.1f TFLOP dense, dense (mode 0) %.4f ms",
+        tokens,
+        seqlen,
+        dense_flops / 1e12,
+        dense_ms,
     )
 
     rows = []
@@ -448,16 +458,25 @@ def run_recipe(name, recipe, degree, tokens, args):
         if args.jensen:
             header += f" {'+jensen(ms)':>12} {'delta':>8}"
         header += f" {'sol vs dense':>13}"
-        print(
-            f"\n{q_tile}x{kv_tile}: {num_q_tiles} query tiles x {num_kv_blocks} KV blocks"
-            + (
-                f", KV ranges of {args.kv_range_tokens} tokens"
-                if args.kv_range_tokens
-                else ""
+        if args.kv_range_tokens:
+            logger.info(
+                "%dx%d: %d query tiles x %d KV blocks, KV ranges of %d tokens",
+                q_tile,
+                kv_tile,
+                num_q_tiles,
+                num_kv_blocks,
+                args.kv_range_tokens,
             )
-        )
-        print(header)
-        print("-" * len(header))
+        else:
+            logger.info(
+                "%dx%d: %d query tiles x %d KV blocks",
+                q_tile,
+                kv_tile,
+                num_q_tiles,
+                num_kv_blocks,
+            )
+        logger.info("%s", header)
+        logger.info("%s", "-" * len(header))
         for sparsity in args.sparsity:
             torch.manual_seed(int(sparsity * 1000))
             mask = (
@@ -483,17 +502,23 @@ def run_recipe(name, recipe, degree, tokens, args):
             del mask
             torch.cuda.empty_cache()
             sparse_ms, sol_ms = point["sparse_ms"], point["sol_ms"]
-            line = (
-                f"{sparsity:>9.1f} {100 * point['density']:>7.1f}% {sparse_ms:>11.4f}"
-                f" {sol_ms:>13.4f} {(sol_ms / sparse_ms - 1) * 100:>+7.1f}%"
-            )
+            line = "%9.1f %7.1f%% %11.4f %13.4f %+7.1f%%"
+            values = [
+                sparsity,
+                100 * point["density"],
+                sparse_ms,
+                sol_ms,
+                (sol_ms / sparse_ms - 1) * 100,
+            ]
             if args.jensen:
-                line += (
-                    f" {point['jensen_ms']:>12.4f}"
-                    f" {(point['jensen_ms'] / sparse_ms - 1) * 100:>+7.1f}%"
-                )
-            line += f" {dense_ms / sol_ms:>12.2f}x"
-            print(line)
+                line += " %12.4f %+7.1f%%"
+                values += [
+                    point["jensen_ms"],
+                    (point["jensen_ms"] / sparse_ms - 1) * 100,
+                ]
+            line += " %12.2fx"
+            values.append(dense_ms / sol_ms)
+            logger.info(line, *values)
             rows.append(
                 {
                     "recipe": name,
@@ -512,8 +537,8 @@ def run_recipe(name, recipe, degree, tokens, args):
     return rows
 
 
-def print_markdown(rows, jensen):
-    """One table over every point, for pasting into a PR description."""
+def write_markdown(rows, jensen, path):
+    """Write one table over every point to `path`, for pasting into a PR description."""
     columns = [
         "recipe",
         "tile",
@@ -527,8 +552,10 @@ def print_markdown(rows, jensen):
     if jensen:
         columns += ["Sol+Jensen ms", "Sol+Jensen vs sparse"]
     columns += ["dense ms", "Sol vs dense"]
-    print("\n| " + " | ".join(columns) + " |")
-    print("|" + "|".join("---" for _ in columns) + "|")
+    lines = [
+        "| " + " | ".join(columns) + " |",
+        "|" + "|".join("---" for _ in columns) + "|",
+    ]
     for row in rows:
         cells = [
             row["recipe"],
@@ -546,7 +573,9 @@ def print_markdown(rows, jensen):
                 f"{(row['jensen_ms'] / row['sparse_ms'] - 1) * 100:+.1f}%",
             ]
         cells += [f"{row['dense_ms']:.3f}", f"{row['dense_ms'] / row['sol_ms']:.2f}x"]
-        print("| " + " | ".join(cells) + " |")
+        lines.append("| " + " | ".join(cells) + " |")
+    with open(path, "w", encoding="utf-8") as table:
+        table.write("\n".join(lines) + "\n")
 
 
 def main() -> int:
@@ -605,8 +634,8 @@ def main() -> int:
     )
     parser.add_argument(
         "--markdown",
-        action="store_true",
-        help="finish with one markdown table over every point",
+        metavar="PATH",
+        help="also write one markdown table over every point to PATH",
     )
     args = parser.parse_args()
 
@@ -628,7 +657,8 @@ def main() -> int:
         for name in names:
             rows += run_recipe(name, recipes[name], degree, tokens, args)
     if args.markdown:
-        print_markdown(rows, args.jensen)
+        write_markdown(rows, args.jensen, args.markdown)
+        logger.info("wrote the markdown table to %s", args.markdown)
     return 0
 
 
