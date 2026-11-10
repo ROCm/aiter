@@ -1280,9 +1280,24 @@ def _wave_sum_uniform_i32(value, lane):
 
 @flyc.jit
 def _emit_plan(
-    *, num_waves, fz_npes, fz_epr, fz_k, fz_mtpr, fz_rank, fz_tile_m, fz_total_experts, addr_disp,
-    parity, expected,
-    dispatch_blocks, group_blocks, group_done_slot, group_phase_base, payload_chunk_rows, tile_state_stride,
+    *,
+    num_waves,
+    fz_npes,
+    fz_epr,
+    fz_k,
+    fz_mtpr,
+    fz_rank,
+    fz_tile_m,
+    fz_total_experts,
+    addr_disp,
+    parity,
+    expected,
+    dispatch_blocks,
+    group_blocks,
+    group_done_slot,
+    group_phase_base,
+    payload_chunk_rows,
+    tile_state_stride,
     fused_scratch=None,
     defer_plan_ready=False,
     early_fill=None,
@@ -1292,6 +1307,7 @@ def _emit_plan(
     wt_owner,
 ):
     """Build a destination-owned compact plan in one producer-only CTA."""
+
     def dp(i):
         return _sload_table_i64(addr_disp, int(i))
 
@@ -1374,7 +1390,8 @@ def _emit_plan(
     # Non-fused: the BLOCK_HIST prefix rounds are spread over warps 1..7
     # (one 64-segment round each) instead of all on warp 1.
     split_prefix = (
-        (not fused) and count_lds is not None
+        (not fused)
+        and count_lds is not None
         and (total_segments + 63) // 64 <= num_waves - 1
     )
     remote_count_matrices = []
@@ -1384,8 +1401,7 @@ def _emit_plan(
         remote_count_bases.append(remote_base)
         remote_count_matrices.append(ptr_buf_tensor(remote_base, fx.Int32))
     push_no_drain = (
-        fused and fz_tile_m == 32
-        and prefix_scratch is not None and defer_plan_ready
+        fused and fz_tile_m == 32 and prefix_scratch is not None and defer_plan_ready
     )
     if tid < fx.Int32(fz_npes):
         _store_i32_sys_relaxed(
@@ -1401,9 +1417,10 @@ def _emit_plan(
             segment_count = fx.Int32(fx.ptr_load(fused_scratch + fx.Int64(segment)))
         else:
             for group_block in range_constexpr(group_blocks):
-                segment_count = segment_count + block_hist[
-                    fx.Int32(group_block * total_segments) + segment
-                ]
+                segment_count = (
+                    segment_count
+                    + block_hist[fx.Int32(group_block * total_segments) + segment]
+                )
         _wst(local_hist, segment, segment_count, wt_owner=wt_owner)
         if const_expr(split_prefix):
             fx.ptr_store(segment_count, count_lds + fx.Int64(segment))
@@ -1417,15 +1434,11 @@ def _emit_plan(
                 segment_count | cur_tag_bits,
             )
         for destination in range_constexpr(fz_npes):
-            own_group_column = segment == fx.Int32(
-                fz_total_experts + destination
-            )
+            own_group_column = segment == fx.Int32(fz_total_experts + destination)
             _store_i32_sys_relaxed(
                 remote_count_bases[destination],
                 fx.Int32(fz_rank * total_segments) + segment,
-                own_group_column.select(
-                    segment_count, segment_count | cur_tag_bits
-                ),
+                own_group_column.select(segment_count, segment_count | cur_tag_bits),
             )
     early_prefix = prefix_scratch is not None
     if const_expr(early_prefix):
@@ -1437,7 +1450,10 @@ def _emit_plan(
         assert fused
         if warp == fx.Int32(num_waves - 1):
             _fused_prefix_warp(
-                fused_scratch, prefix_scratch, pair_base, lane,
+                fused_scratch,
+                prefix_scratch,
+                pair_base,
+                lane,
                 total_segments=total_segments,
                 wt_owner=wt_owner,
             )
@@ -1501,10 +1517,7 @@ def _emit_plan(
             group_source_counts = []
             group_count = fx.Int32(0)
             group_member = valid_expert & (
-                (
-                    (local_fanout_mask >> fx.Int64(safe_expert))
-                    & fx.Int64(1)
-                )
+                ((local_fanout_mask >> fx.Int64(safe_expert)) & fx.Int64(1))
                 != fx.Int64(0)
             )
             plan_normal_loaded = own_normal_counts
@@ -1521,12 +1534,12 @@ def _emit_plan(
                 group_source_counts.append(source_group_count)
                 group_count = group_count + source_group_count
 
-            group_num_tiles = (
-                group_count + fx.Int32(fz_tile_m - 1)
-            ) // fx.Int32(fz_tile_m)
-            normal_num_tiles = (
-                normal_count + fx.Int32(fz_tile_m - 1)
-            ) // fx.Int32(fz_tile_m)
+            group_num_tiles = (group_count + fx.Int32(fz_tile_m - 1)) // fx.Int32(
+                fz_tile_m
+            )
+            normal_num_tiles = (normal_count + fx.Int32(fz_tile_m - 1)) // fx.Int32(
+                fz_tile_m
+            )
             num_tiles = group_num_tiles + normal_num_tiles
             chunk_max = _wave_max_uniform_i32(
                 valid_expert.select(num_tiles, fx.Int32(0)),
@@ -1546,149 +1559,166 @@ def _emit_plan(
             # dispatch, so every section's tiles share one ready-word init.
             assert payload_chunk_rows % fz_tile_m == 0
             if valid_expert:
-              # group_source_counts are zero off the pair, so
-              # group_num_tiles == 0 there (same as skipping the section).
-              _init_sections_ready_merged(
-                  a_tile_ready,
-                  a_tile_expected,
-                  group_source_counts,
-                  normal_source_counts,
-                  group_row_base,
-                  group_num_tiles,
-                  normal_num_tiles,
-                  fz_npes=fz_npes,
-                  payload_chunk_rows=payload_chunk_rows,
-                  fz_tile_m=fz_tile_m,
-                  wt_owner=wt_owner,
-              )
-              _wst(expert_tile_end, local_expert, (
-                  local_row_base + padded_rows
-              ) // fx.Int32(fz_tile_m), wt_owner=wt_owner)
+                # group_source_counts are zero off the pair, so
+                # group_num_tiles == 0 there (same as skipping the section).
+                _init_sections_ready_merged(
+                    a_tile_ready,
+                    a_tile_expected,
+                    group_source_counts,
+                    normal_source_counts,
+                    group_row_base,
+                    group_num_tiles,
+                    normal_num_tiles,
+                    fz_npes=fz_npes,
+                    payload_chunk_rows=payload_chunk_rows,
+                    fz_tile_m=fz_tile_m,
+                    wt_owner=wt_owner,
+                )
+                _wst(
+                    expert_tile_end,
+                    local_expert,
+                    (local_row_base + padded_rows) // fx.Int32(fz_tile_m),
+                    wt_owner=wt_owner,
+                )
 
             last_lane = min(63, fz_epr - expert_chunk * 64 - 1)
-            row_carry = row_carry + fx.Int32(fx.rocdl.readlane(T.i32, inclusive_rows, last_lane))
-
+            row_carry = row_carry + fx.Int32(
+                fx.rocdl.readlane(T.i32, inclusive_rows, last_lane)
+            )
 
         if lane == fx.Int32(0):
             _wst(num_valid_buffer, fx.Int32(0), row_carry, wt_owner=wt_owner)
             _wst(
-                max_expert_tiles_buffer, fx.Int32(0), max_expert_tiles,
+                max_expert_tiles_buffer,
+                fx.Int32(0),
+                max_expert_tiles,
                 wt_owner=wt_owner,
             )
         fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
     else:
-      if warp == fx.Int32(2):
-        _configure_payload_geometry_fast(
-            a_lh,
-            a_payload_chunks_per_destination,
-            a_payload_blocks_per_destination,
-            lane,
-            fz_npes=fz_npes,
-            fz_epr=fz_epr,
-            fz_total_experts=fz_total_experts,
-            payload_chunk_rows=payload_chunk_rows,
-            dispatch_blocks=dispatch_blocks,
-            lds_hist=fused_scratch if push_no_drain else None,
-            wt_owner=wt_owner,
-        )
-      if const_expr(early_fill is not None):
-        early_fill()
-      if const_expr(split_prefix):
-        for rnd in range_constexpr((total_segments + 63) // 64):
-          if warp == fx.Int32(1 + rnd):
-            _block_prefix_round(
-                count_lds, block_hist, pair_base, lane, rnd,
-                total_segments=total_segments, group_blocks=group_blocks,
-                write_block=not groups_self_prefix,
+        if warp == fx.Int32(2):
+            _configure_payload_geometry_fast(
+                a_lh,
+                a_payload_chunks_per_destination,
+                a_payload_blocks_per_destination,
+                lane,
+                fz_npes=fz_npes,
+                fz_epr=fz_epr,
+                fz_total_experts=fz_total_experts,
+                payload_chunk_rows=payload_chunk_rows,
+                dispatch_blocks=dispatch_blocks,
+                lds_hist=fused_scratch if push_no_drain else None,
                 wt_owner=wt_owner,
             )
-      if const_expr((not early_prefix) and (not split_prefix)):  # noqa: SIM102
-        if warp == fx.Int32(1):
-          # Global-segment exclusive prefix, segment-strided: lane l owns
-          # segments r*64 + l, so every BLOCK_HIST row access is one coalesced
-          # wave load/store and the group_blocks loads of a round are all in
-          # flight together (instead of group_blocks dependent load->store
-          # round trips per lane-owned segment).  The next round's loads are
-          # issued before this round's stores (same buffer: the compiler
-          # cannot hoist them past the stores itself).
-          seg_rounds = (total_segments + 63) // 64
-          round_counts = []
-          for rnd in range_constexpr(seg_rounds):
-              seg = fx.Int32(rnd * 64) + lane
-              valid_seg = seg < fx.Int32(total_segments)
-              safe_seg = valid_seg.select(seg, fx.Int32(0))
-              if const_expr(fused):
-                  seg_count = fx.Int32(fx.ptr_load(fused_scratch + fx.Int64(safe_seg)))
-              else:
-                  seg_count = local_hist[safe_seg]
-              round_counts.append(valid_seg.select(seg_count, fx.Int32(0)))
+        if const_expr(early_fill is not None):
+            early_fill()
+        if const_expr(split_prefix):
+            for rnd in range_constexpr((total_segments + 63) // 64):
+                if warp == fx.Int32(1 + rnd):
+                    _block_prefix_round(
+                        count_lds,
+                        block_hist,
+                        pair_base,
+                        lane,
+                        rnd,
+                        total_segments=total_segments,
+                        group_blocks=group_blocks,
+                        write_block=not groups_self_prefix,
+                        wt_owner=wt_owner,
+                    )
+        if const_expr((not early_prefix) and (not split_prefix)):  # noqa: SIM102
+            if warp == fx.Int32(1):
+                # Global-segment exclusive prefix, segment-strided: lane l owns
+                # segments r*64 + l, so every BLOCK_HIST row access is one coalesced
+                # wave load/store and the group_blocks loads of a round are all in
+                # flight together (instead of group_blocks dependent load->store
+                # round trips per lane-owned segment).  The next round's loads are
+                # issued before this round's stores (same buffer: the compiler
+                # cannot hoist them past the stores itself).
+                seg_rounds = (total_segments + 63) // 64
+                round_counts = []
+                for rnd in range_constexpr(seg_rounds):
+                    seg = fx.Int32(rnd * 64) + lane
+                    valid_seg = seg < fx.Int32(total_segments)
+                    safe_seg = valid_seg.select(seg, fx.Int32(0))
+                    if const_expr(fused):
+                        seg_count = fx.Int32(
+                            fx.ptr_load(fused_scratch + fx.Int64(safe_seg))
+                        )
+                    else:
+                        seg_count = local_hist[safe_seg]
+                    round_counts.append(valid_seg.select(seg_count, fx.Int32(0)))
 
-          def _load_block_counts(rnd):
-              seg = fx.Int32(rnd * 64) + lane
-              safe_seg = (seg < fx.Int32(total_segments)).select(seg, fx.Int32(0))
-              return [
-                  block_hist[fx.Int32(group_block * total_segments) + safe_seg]
-                  for group_block in range_constexpr(group_blocks)
-              ]
+                def _load_block_counts(rnd):
+                    seg = fx.Int32(rnd * 64) + lane
+                    safe_seg = (seg < fx.Int32(total_segments)).select(seg, fx.Int32(0))
+                    return [
+                        block_hist[fx.Int32(group_block * total_segments) + safe_seg]
+                        for group_block in range_constexpr(group_blocks)
+                    ]
 
-          # When the groups self-prefix they may still be reading the raw
-          # BLOCK_HIST counts after GROUP_DONE, so only PAIR_BASE is written.
-          pending = None
-          if const_expr((not fused) and (not groups_self_prefix)):
-              pending = _load_block_counts(0)
-          seg_carry = fx.Int32(0)
-          for rnd in range_constexpr(seg_rounds):
-              seg = fx.Int32(rnd * 64) + lane
-              valid_seg = seg < fx.Int32(total_segments)
-              seg_count = round_counts[rnd]
-              seg_incl = _wave_inclusive_scan_i32(seg_count, lane)
-              source_prefix = seg_carry + seg_incl - seg_count
-              seg_carry = seg_carry + fx.Int32(fx.rocdl.readlane(T.i32, seg_incl, 63))
-              current = pending
-              if const_expr(
-                  (not fused) and (not groups_self_prefix) and rnd + 1 < seg_rounds
-              ):
-                  pending = _load_block_counts(rnd + 1)
-              if valid_seg:
-                  _wst(pair_base, seg, source_prefix, wt_owner=wt_owner)
-                  if const_expr(fused):
-                      # The fused fill reads its per-segment base from LDS.
-                      fx.ptr_store(source_prefix, fused_scratch + fx.Int64(seg))
-                  elif const_expr(not groups_self_prefix):
-                      block_prefix = source_prefix
-                      for group_block in range_constexpr(group_blocks):
-                          _wst(
-                              block_hist,
-                              fx.Int32(group_block * total_segments) + seg,
-                              block_prefix,
-                              wt_owner=wt_owner,
-                          )
-                          block_prefix = block_prefix + current[group_block]
-      # Every warp observes COUNT_DONE itself and performs its own system
-      # acquire, so the per-destination offset derivation below overlaps
-      # warp 0's local plan instead of waiting for it at a CTA barrier.
-      if warp == fx.Int32(2):
-          _plan_meta_warp(
-              addr_pair_config,
-              a_se,
-              a_trb,
-              a_tib,
-              a_sm,
-              parity,
-              lane,
-              a_bc,
-              poll_tag,
-              a_cd,
-              fz_npes=fz_npes,
-              fz_epr=fz_epr,
-              fz_rank=fz_rank,
-              fz_tile_m=fz_tile_m,
-              fz_total_experts=fz_total_experts,
-              fz_mtpr=fz_mtpr,
-              count_stride=count_stride,
-              tag_shift=tag_shift,
-              wt_owner=wt_owner,
-          )
+                # When the groups self-prefix they may still be reading the raw
+                # BLOCK_HIST counts after GROUP_DONE, so only PAIR_BASE is written.
+                pending = None
+                if const_expr((not fused) and (not groups_self_prefix)):
+                    pending = _load_block_counts(0)
+                seg_carry = fx.Int32(0)
+                for rnd in range_constexpr(seg_rounds):
+                    seg = fx.Int32(rnd * 64) + lane
+                    valid_seg = seg < fx.Int32(total_segments)
+                    seg_count = round_counts[rnd]
+                    seg_incl = _wave_inclusive_scan_i32(seg_count, lane)
+                    source_prefix = seg_carry + seg_incl - seg_count
+                    seg_carry = seg_carry + fx.Int32(
+                        fx.rocdl.readlane(T.i32, seg_incl, 63)
+                    )
+                    current = pending
+                    if const_expr(
+                        (not fused)
+                        and (not groups_self_prefix)
+                        and rnd + 1 < seg_rounds
+                    ):
+                        pending = _load_block_counts(rnd + 1)
+                    if valid_seg:
+                        _wst(pair_base, seg, source_prefix, wt_owner=wt_owner)
+                        if const_expr(fused):
+                            # The fused fill reads its per-segment base from LDS.
+                            fx.ptr_store(source_prefix, fused_scratch + fx.Int64(seg))
+                        elif const_expr(not groups_self_prefix):
+                            block_prefix = source_prefix
+                            for group_block in range_constexpr(group_blocks):
+                                _wst(
+                                    block_hist,
+                                    fx.Int32(group_block * total_segments) + seg,
+                                    block_prefix,
+                                    wt_owner=wt_owner,
+                                )
+                                block_prefix = block_prefix + current[group_block]
+        # Every warp observes COUNT_DONE itself and performs its own system
+        # acquire, so the per-destination offset derivation below overlaps
+        # warp 0's local plan instead of waiting for it at a CTA barrier.
+        if warp == fx.Int32(2):
+            _plan_meta_warp(
+                addr_pair_config,
+                a_se,
+                a_trb,
+                a_tib,
+                a_sm,
+                parity,
+                lane,
+                a_bc,
+                poll_tag,
+                a_cd,
+                fz_npes=fz_npes,
+                fz_epr=fz_epr,
+                fz_rank=fz_rank,
+                fz_tile_m=fz_tile_m,
+                fz_total_experts=fz_total_experts,
+                fz_mtpr=fz_mtpr,
+                count_stride=count_stride,
+                tag_shift=tag_shift,
+                wt_owner=wt_owner,
+            )
     # Destination w is derived by warp w (w >= 1) concurrently with warp 0's
     # local plan; destination 0 goes to warp 3 (it has no other local work).
     assert 4 < fz_npes <= num_waves == 8
@@ -1800,9 +1830,21 @@ def _load_pair_table_lane(addr_pair_config, parity, lane, *, fz_npes):
 
 
 def _classify_regs_batch(
-    token_batch, peers, lane, topk_slot, active_slot, pair_vals, count_scratch,
+    token_batch,
+    peers,
+    lane,
+    topk_slot,
+    active_slot,
+    pair_vals,
+    count_scratch,
     i32_cur_tok,
-    *, fz_npes, fz_k, fz_epr, fz_total_experts, route_group_shift, packed_topk6_metadata,
+    *,
+    fz_npes,
+    fz_k,
+    fz_epr,
+    fz_total_experts,
+    route_group_shift,
+    packed_topk6_metadata,
 ):
     """Branch-free route classification of one 8-token batch (epr <= 64, topk <= 8).
 
@@ -1871,7 +1913,6 @@ def _classify_regs_batch(
             segment | (member_slots << fx.Int32(10)) | (intra_rank << fx.Int32(18))
         )
     return count_it.select(packed_segment, fx.Int32(-1))
-
 
 
 @flyc.jit
@@ -1964,8 +2005,18 @@ def _tok_wave_slots(peers, sub, *, fz_k, split, slots_per_wave):
 
 
 def _tok_classify_routes(
-    token_ok, peers, wave_slots, pair_lane_packed, count_scratch, lane,
-    *, fz_npes, fz_k, fz_epr, fz_total_experts, packed_topk6_metadata,
+    token_ok,
+    peers,
+    wave_slots,
+    pair_lane_packed,
+    count_scratch,
+    lane,
+    *,
+    fz_npes,
+    fz_k,
+    fz_epr,
+    fz_total_experts,
+    packed_topk6_metadata,
 ):
     """Per-lane (token) classification of this wave's routes.
 
@@ -1978,12 +2029,17 @@ def _tok_classify_routes(
     """
     # The slot-split waves (split > 1) own only k/split routes each; the
     # per-route compare form is shorter there.
-    if const_expr(
-        fz_npes > 32 or fz_npes * fz_k > 64 or wave_slots[0][2] is None
-    ):
+    if const_expr(fz_npes > 32 or fz_npes * fz_k > 64 or wave_slots[0][2] is None):
         return _tok_classify_routes_cmp(
-            token_ok, peers, wave_slots, pair_lane_packed, count_scratch, lane,
-            fz_npes=fz_npes, fz_k=fz_k, fz_epr=fz_epr,
+            token_ok,
+            peers,
+            wave_slots,
+            pair_lane_packed,
+            count_scratch,
+            lane,
+            fz_npes=fz_npes,
+            fz_k=fz_k,
+            fz_epr=fz_epr,
             fz_total_experts=fz_total_experts,
             packed_topk6_metadata=packed_topk6_metadata,
         )
@@ -2013,9 +2069,7 @@ def _tok_classify_routes(
         local_expert = safe_expert - destination * fx.Int32(fz_epr)
         live = valid & ((packed & fx.Int32(1 << 16)) != fx.Int32(0))
         is_a = live & (local_expert == (packed & fx.Int32(0xFF)))
-        is_b = live & (
-            local_expert == ((packed >> fx.Int32(8)) & fx.Int32(0xFF))
-        )
+        is_b = live & (local_expert == ((packed >> fx.Int32(8)) & fx.Int32(0xFF)))
         hit = is_a | is_b
         dest_bit = fx.Int32(1) << destination
         mask_a = mask_a | is_a.select(dest_bit, fx.Int32(0))
@@ -2033,12 +2087,23 @@ def _tok_classify_routes(
             j = len(out)
             valid, safe_expert, destination, _packed, is_a, hit = info[j]
         else:
-            valid, safe_expert, destination, _, is_a, hit = None, None, None, None, None, None
+            valid, safe_expert, destination, _, is_a, hit = (
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
             for idx in range_constexpr(fz_k):
                 cur = info[idx]
                 if valid is None:
                     valid, safe_expert, destination, is_a, hit = (
-                        cur[0], cur[1], cur[2], cur[4], cur[5]
+                        cur[0],
+                        cur[1],
+                        cur[2],
+                        cur[4],
+                        cur[5],
                     )
                 else:
                     pick = slot == fx.Int32(idx)
@@ -2076,8 +2141,18 @@ def _tok_classify_routes(
 
 
 def _tok_classify_routes_cmp(
-    token_ok, peers, wave_slots, pair_lane_packed, count_scratch, lane,
-    *, fz_npes, fz_k, fz_epr, fz_total_experts, packed_topk6_metadata,
+    token_ok,
+    peers,
+    wave_slots,
+    pair_lane_packed,
+    count_scratch,
+    lane,
+    *,
+    fz_npes,
+    fz_k,
+    fz_epr,
+    fz_total_experts,
+    packed_topk6_metadata,
 ):
     """Per-lane (token) classification of this wave's routes."""
     count_segments = fz_total_experts + fz_npes
@@ -2156,9 +2231,27 @@ def _tok_pad8(vals):
 
 @flyc.jit
 def _tok_count_batch(
-    wave_active, token_ok, sub, p0, p1, p2, p3, p4, p5, p6, p7, pair_lane_packed,
-    count_scratch, lane,
-    *, fz_npes, fz_k, fz_epr, fz_total_experts, packed_topk6_metadata, split,
+    wave_active,
+    token_ok,
+    sub,
+    p0,
+    p1,
+    p2,
+    p3,
+    p4,
+    p5,
+    p6,
+    p7,
+    pair_lane_packed,
+    count_scratch,
+    lane,
+    *,
+    fz_npes,
+    fz_k,
+    fz_epr,
+    fz_total_experts,
+    packed_topk6_metadata,
+    split,
     slots_per_wave,
 ):
     q0 = fx.Int32(-1)
@@ -2173,13 +2266,21 @@ def _tok_count_batch(
         peers = [p0, p1, p2, p3, p4, p5, p6, p7][:fz_k]
         q0, q1, q2, q3, q4, q5, q6, q7 = _tok_pad8(
             _tok_classify_routes(
-                token_ok, peers,
+                token_ok,
+                peers,
                 _tok_wave_slots(
-                    peers, sub, fz_k=fz_k, split=split,
+                    peers,
+                    sub,
+                    fz_k=fz_k,
+                    split=split,
                     slots_per_wave=slots_per_wave,
                 ),
-                pair_lane_packed, count_scratch, lane,
-                fz_npes=fz_npes, fz_k=fz_k, fz_epr=fz_epr,
+                pair_lane_packed,
+                count_scratch,
+                lane,
+                fz_npes=fz_npes,
+                fz_k=fz_k,
+                fz_epr=fz_epr,
                 fz_total_experts=fz_total_experts,
                 packed_topk6_metadata=packed_topk6_metadata,
             )
@@ -2189,9 +2290,24 @@ def _tok_count_batch(
 
 @flyc.jit
 def _tok_count_rest(
-    start, pass_tokens, token_off, sub, lane, idx_vec, idx_buffer, route_segment,
-    pair_lane_packed, count_scratch, i32_cur_tok,
-    *, fz_npes, fz_k, fz_epr, fz_total_experts, packed_topk6_metadata, split,
+    start,
+    pass_tokens,
+    token_off,
+    sub,
+    lane,
+    idx_vec,
+    idx_buffer,
+    route_segment,
+    pair_lane_packed,
+    count_scratch,
+    i32_cur_tok,
+    *,
+    fz_npes,
+    fz_k,
+    fz_epr,
+    fz_total_experts,
+    packed_topk6_metadata,
+    split,
     slots_per_wave,
 ):
     for token_base in range(start, i32_cur_tok, pass_tokens):
@@ -2203,15 +2319,24 @@ def _tok_count_rest(
             peers, sub, fz_k=fz_k, split=split, slots_per_wave=slots_per_wave
         )
         segs = _tok_classify_routes(
-            token_ok, peers, wave_slots, pair_lane_packed, count_scratch, lane,
-            fz_npes=fz_npes, fz_k=fz_k, fz_epr=fz_epr,
+            token_ok,
+            peers,
+            wave_slots,
+            pair_lane_packed,
+            count_scratch,
+            lane,
+            fz_npes=fz_npes,
+            fz_k=fz_k,
+            fz_epr=fz_epr,
             fz_total_experts=fz_total_experts,
             packed_topk6_metadata=packed_topk6_metadata,
         )
         for j in range_constexpr(slots_per_wave):
             slot = wave_slots[j][0]
             _pred_store_i32(
-                route_segment, safe_token * fx.Int32(fz_k) + slot, segs[j],
+                route_segment,
+                safe_token * fx.Int32(fz_k) + slot,
+                segs[j],
                 token_ok & (slot < fx.Int32(fz_k)),
             )
 
@@ -2232,65 +2357,91 @@ def _tok_lane_geometry(num_waves, prepare_blocks, fz_k):
 
 
 def _tok_prefetch(
-    *, num_waves, fz_npes, fz_k, fz_total_experts, addr_disp, i32_cur_tok,
-    addr_in_idx, count_scratch, prepare_blocks,
+    *,
+    num_waves,
+    fz_npes,
+    fz_k,
+    fz_total_experts,
+    addr_disp,
+    i32_cur_tok,
+    addr_in_idx,
+    count_scratch,
+    prepare_blocks,
 ):
     """Issue the token-per-lane count's global loads (top-k rows and BOTH
     parities' fanout-pair table rows) and zero the LDS histogram before the
     owner's parity/epoch block, so their latency overlaps it.  The CTA
     barrier that publishes parity also orders the LDS zeroing."""
-    addr_pair_config = _sload_table_i64(
-        addr_disp, int(DispatchSlot.FANOUT_PAIR_CONFIG)
-    )
+    addr_pair_config = _sload_table_i64(addr_disp, int(DispatchSlot.FANOUT_PAIR_CONFIG))
     idx_buffer = ptr_buf_tensor(
         addr_in_idx, fx.Int32, num_records_bytes=_idx_bytes(i32_cur_tok, fz_k)
     )
     idx_vec = {
         2: ptr_buf_tensor(
-            addr_in_idx, fx.Int32, unit_elems=2, unit_stride=1,
+            addr_in_idx,
+            fx.Int32,
+            unit_elems=2,
+            unit_stride=1,
             num_records_bytes=_idx_bytes(i32_cur_tok, fz_k),
         ),
         4: ptr_buf_tensor(
-            addr_in_idx, fx.Int32, unit_elems=4, unit_stride=1,
+            addr_in_idx,
+            fx.Int32,
+            unit_elems=4,
+            unit_stride=1,
             num_records_bytes=_idx_bytes(i32_cur_tok, fz_k),
         ),
     }
     tid = fx.thread_idx.x
-    _, _, _, lane, _, _, token_off = _tok_lane_geometry(
-        num_waves, prepare_blocks, fz_k
-    )
+    _, _, _, lane, _, _, token_off = _tok_lane_geometry(num_waves, prepare_blocks, fz_k)
     pair0 = _load_pair_table_lane(addr_pair_config, fx.Int32(0), lane, fz_npes=fz_npes)
     pair1 = _load_pair_table_lane(addr_pair_config, fx.Int32(1), lane, fz_npes=fz_npes)
     token_ok = token_off < i32_cur_tok
     safe_token = token_ok.select(token_off, fx.Int32(0))
     peers = _tok_load_row(idx_vec, idx_buffer, safe_token, fz_k)
     _zero_lds_i32(
-        count_scratch, tid, fx.Int32(num_waves * 64),
+        count_scratch,
+        tid,
+        fx.Int32(num_waves * 64),
         count_segments=fz_total_experts + fz_npes,
     )
     return peers, pair0, pair1
 
 
 def _emit_fused_count_tok(
-    *, num_waves, fz_npes, fz_k, fz_epr, fz_total_experts, addr_disp, i32_cur_tok,
-    addr_in_idx, parity, count_scratch,
-    prepare_blocks=1, prefetched=None,
+    *,
+    num_waves,
+    fz_npes,
+    fz_k,
+    fz_epr,
+    fz_total_experts,
+    addr_disp,
+    i32_cur_tok,
+    addr_in_idx,
+    parity,
+    count_scratch,
+    prepare_blocks=1,
+    prefetched=None,
 ):
     """Token-per-lane fused count; returns the first-pass packed segments."""
     a_route_segment = _sload_table_i64(addr_disp, int(DispatchSlot.ROUTE_SEGMENT))
-    addr_pair_config = _sload_table_i64(
-        addr_disp, int(DispatchSlot.FANOUT_PAIR_CONFIG)
-    )
+    addr_pair_config = _sload_table_i64(addr_disp, int(DispatchSlot.FANOUT_PAIR_CONFIG))
     idx_buffer = ptr_buf_tensor(
         addr_in_idx, fx.Int32, num_records_bytes=_idx_bytes(i32_cur_tok, fz_k)
     )
     idx_vec = {
         2: ptr_buf_tensor(
-            addr_in_idx, fx.Int32, unit_elems=2, unit_stride=1,
+            addr_in_idx,
+            fx.Int32,
+            unit_elems=2,
+            unit_stride=1,
             num_records_bytes=_idx_bytes(i32_cur_tok, fz_k),
         ),
         4: ptr_buf_tensor(
-            addr_in_idx, fx.Int32, unit_elems=4, unit_stride=1,
+            addr_in_idx,
+            fx.Int32,
+            unit_elems=4,
+            unit_stride=1,
             num_records_bytes=_idx_bytes(i32_cur_tok, fz_k),
         ),
     }
@@ -2326,28 +2477,60 @@ def _emit_fused_count_tok(
         wave_active = wave_active & (sub * fx.Int32(slots_per_wave) < fx.Int32(fz_k))
     segs = list(
         _tok_count_batch(
-            wave_active, token_ok, sub, *_tok_pad8(peers), pair_lane_packed,
-            count_scratch, lane,
-            fz_npes=fz_npes, fz_k=fz_k, fz_epr=fz_epr,
+            wave_active,
+            token_ok,
+            sub,
+            *_tok_pad8(peers),
+            pair_lane_packed,
+            count_scratch,
+            lane,
+            fz_npes=fz_npes,
+            fz_k=fz_k,
+            fz_epr=fz_epr,
             fz_total_experts=fz_total_experts,
             packed_topk6_metadata=packed_topk6_metadata,
-            split=split, slots_per_wave=slots_per_wave,
+            split=split,
+            slots_per_wave=slots_per_wave,
         )
     )[:slots_per_wave]
     _tok_count_rest(
-        fx.Int32(pass_tokens), fx.Int32(pass_tokens), token_off, sub, lane, idx_vec,
-        idx_buffer, route_segment, pair_lane_packed, count_scratch, i32_cur_tok,
-        fz_npes=fz_npes, fz_k=fz_k, fz_epr=fz_epr, fz_total_experts=fz_total_experts,
+        fx.Int32(pass_tokens),
+        fx.Int32(pass_tokens),
+        token_off,
+        sub,
+        lane,
+        idx_vec,
+        idx_buffer,
+        route_segment,
+        pair_lane_packed,
+        count_scratch,
+        i32_cur_tok,
+        fz_npes=fz_npes,
+        fz_k=fz_k,
+        fz_epr=fz_epr,
+        fz_total_experts=fz_total_experts,
         packed_topk6_metadata=packed_topk6_metadata,
-        split=split, slots_per_wave=slots_per_wave,
+        split=split,
+        slots_per_wave=slots_per_wave,
     )
     fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
     fx.barrier()
     return segs
 
 
-def _tok_fill_routes(token, token_ok, slots, segs, pair_order, count_scratch, *,
-                     fz_k, fz_total_experts, packed_topk6, wt_owner):
+def _tok_fill_routes(
+    token,
+    token_ok,
+    slots,
+    segs,
+    pair_order,
+    count_scratch,
+    *,
+    fz_k,
+    fz_total_experts,
+    packed_topk6,
+    wt_owner,
+):
     fills = []
     for j in range_constexpr(len(slots)):
         slot = slots[j]
@@ -2381,9 +2564,20 @@ def _tok_slot_ids(sub, *, split, slots_per_wave):
 
 @flyc.jit
 def _tok_fill_rest(
-    start, pass_tokens, token_off, sub, pair_order, route_segment, count_scratch,
+    start,
+    pass_tokens,
+    token_off,
+    sub,
+    pair_order,
+    route_segment,
+    count_scratch,
     i32_cur_tok,
-    *, fz_k, fz_total_experts, packed_topk6, split, slots_per_wave,
+    *,
+    fz_k,
+    fz_total_experts,
+    packed_topk6,
+    split,
+    slots_per_wave,
     wt_owner,
 ):
     for token_base in range(start, i32_cur_tok, pass_tokens):
@@ -2398,15 +2592,30 @@ def _tok_fill_rest(
             seg = route_segment[safe_token * fx.Int32(fz_k) + safe_slot]
             segs.append(slot_ok.select(seg, fx.Int32(-1)))
         _tok_fill_routes(
-            token, token_ok, slots, segs, pair_order, count_scratch, fz_k=fz_k,
-            fz_total_experts=fz_total_experts, packed_topk6=packed_topk6,
+            token,
+            token_ok,
+            slots,
+            segs,
+            pair_order,
+            count_scratch,
+            fz_k=fz_k,
+            fz_total_experts=fz_total_experts,
+            packed_topk6=packed_topk6,
             wt_owner=wt_owner,
         )
 
 
 def _emit_fused_fill_tok(
-    *, num_waves, fz_npes, fz_k, fz_total_experts, addr_disp, i32_cur_tok, count_scratch,
-    segments, prepare_blocks=1,
+    *,
+    num_waves,
+    fz_npes,
+    fz_k,
+    fz_total_experts,
+    addr_disp,
+    i32_cur_tok,
+    count_scratch,
+    segments,
+    prepare_blocks=1,
     wt_owner,
 ):
     pair_order = ptr_buf_tensor(
@@ -2423,17 +2632,31 @@ def _emit_fused_fill_tok(
     pass_tokens = groups * 64
     token_ok = token_off < i32_cur_tok
     _tok_fill_routes(
-        token_off, token_ok,
+        token_off,
+        token_ok,
         _tok_slot_ids(sub, split=split, slots_per_wave=slots_per_wave),
-        segments, pair_order, count_scratch, fz_k=fz_k,
-        fz_total_experts=fz_total_experts, packed_topk6=packed_topk6,
+        segments,
+        pair_order,
+        count_scratch,
+        fz_k=fz_k,
+        fz_total_experts=fz_total_experts,
+        packed_topk6=packed_topk6,
         wt_owner=wt_owner,
     )
     _tok_fill_rest(
-        fx.Int32(pass_tokens), fx.Int32(pass_tokens), token_off, sub, pair_order,
-        route_segment, count_scratch, i32_cur_tok,
-        fz_k=fz_k, fz_total_experts=fz_total_experts, packed_topk6=packed_topk6,
-        split=split, slots_per_wave=slots_per_wave,
+        fx.Int32(pass_tokens),
+        fx.Int32(pass_tokens),
+        token_off,
+        sub,
+        pair_order,
+        route_segment,
+        count_scratch,
+        i32_cur_tok,
+        fz_k=fz_k,
+        fz_total_experts=fz_total_experts,
+        packed_topk6=packed_topk6,
+        split=split,
+        slots_per_wave=slots_per_wave,
         wt_owner=wt_owner,
     )
 
@@ -2473,15 +2696,37 @@ def _group_load_rows(chunk_base, token_stride, lane, idx_buffer, i32_cur_tok, *,
 
 
 def _group_classify_rows(
-    chunk_base, token_stride, rows, lane, topk_slot, active_slot, pair_vals,
-    route_segment, count_scratch, i32_cur_tok,
-    *, fz_npes, fz_k, fz_epr, fz_total_experts, packed_topk6_metadata,
+    chunk_base,
+    token_stride,
+    rows,
+    lane,
+    topk_slot,
+    active_slot,
+    pair_vals,
+    route_segment,
+    count_scratch,
+    i32_cur_tok,
+    *,
+    fz_npes,
+    fz_k,
+    fz_epr,
+    fz_total_experts,
+    packed_topk6_metadata,
 ):
     for b in range_constexpr(_GROUP_COUNT_PF):
         _group_classify_one(
-            chunk_base + fx.Int32(b) * token_stride, rows[b], lane, topk_slot,
-            active_slot, pair_vals, route_segment, count_scratch, i32_cur_tok,
-            fz_npes=fz_npes, fz_k=fz_k, fz_epr=fz_epr,
+            chunk_base + fx.Int32(b) * token_stride,
+            rows[b],
+            lane,
+            topk_slot,
+            active_slot,
+            pair_vals,
+            route_segment,
+            count_scratch,
+            i32_cur_tok,
+            fz_npes=fz_npes,
+            fz_k=fz_k,
+            fz_epr=fz_epr,
             fz_total_experts=fz_total_experts,
             packed_topk6_metadata=packed_topk6_metadata,
         )
@@ -2489,18 +2734,38 @@ def _group_classify_rows(
 
 @flyc.jit
 def _group_classify_one(
-    token_batch, row, lane, topk_slot, active_slot, pair_vals,
-    route_segment, count_scratch, i32_cur_tok,
-    *, fz_npes, fz_k, fz_epr, fz_total_experts, packed_topk6_metadata,
+    token_batch,
+    row,
+    lane,
+    topk_slot,
+    active_slot,
+    pair_vals,
+    route_segment,
+    count_scratch,
+    i32_cur_tok,
+    *,
+    fz_npes,
+    fz_k,
+    fz_epr,
+    fz_total_experts,
+    packed_topk6_metadata,
 ):
     # Wave-uniform skip of batches past cur_tok (small buckets): the
     # classification code of empty prefetched batches is never executed.
     if token_batch < i32_cur_tok:
         safe_slot = active_slot.select(topk_slot, fx.Int32(0))
         cached_segment = _classify_regs_batch(
-            token_batch, row, lane, topk_slot, active_slot, pair_vals,
-            count_scratch, i32_cur_tok,
-            fz_npes=fz_npes, fz_k=fz_k, fz_epr=fz_epr,
+            token_batch,
+            row,
+            lane,
+            topk_slot,
+            active_slot,
+            pair_vals,
+            count_scratch,
+            i32_cur_tok,
+            fz_npes=fz_npes,
+            fz_k=fz_k,
+            fz_epr=fz_epr,
             fz_total_experts=fz_total_experts,
             route_group_shift=3,
             packed_topk6_metadata=packed_topk6_metadata,
@@ -2514,16 +2779,35 @@ def _group_classify_one(
 
 @flyc.jit
 def _group_classify_held(
-    token_batch, row, lane, topk_slot, active_slot, pair_vals,
-    count_scratch, i32_cur_tok,
-    *, fz_npes, fz_k, fz_epr, fz_total_experts, packed_topk6_metadata,
+    token_batch,
+    row,
+    lane,
+    topk_slot,
+    active_slot,
+    pair_vals,
+    count_scratch,
+    i32_cur_tok,
+    *,
+    fz_npes,
+    fz_k,
+    fz_epr,
+    fz_total_experts,
+    packed_topk6_metadata,
 ):
     held = fx.Int32(-1)
     if token_batch < i32_cur_tok:
         held = _classify_regs_batch(
-            token_batch, row, lane, topk_slot, active_slot, pair_vals,
-            count_scratch, i32_cur_tok,
-            fz_npes=fz_npes, fz_k=fz_k, fz_epr=fz_epr,
+            token_batch,
+            row,
+            lane,
+            topk_slot,
+            active_slot,
+            pair_vals,
+            count_scratch,
+            i32_cur_tok,
+            fz_npes=fz_npes,
+            fz_k=fz_k,
+            fz_epr=fz_epr,
             fz_total_experts=fz_total_experts,
             route_group_shift=3,
             packed_topk6_metadata=packed_topk6_metadata,
@@ -2532,10 +2816,25 @@ def _group_classify_held(
 
 
 def _group_count_held(
-    token_batch0, token_stride, lane, topk_slot, active_slot,
-    idx_buffer, addr_pair_config, parity, count_scratch,
-    i32_cur_tok, tid, block_threads,
-    *, fz_npes, fz_k, fz_epr, fz_total_experts, packed_topk6_metadata, count_segments,
+    token_batch0,
+    token_stride,
+    lane,
+    topk_slot,
+    active_slot,
+    idx_buffer,
+    addr_pair_config,
+    parity,
+    count_scratch,
+    i32_cur_tok,
+    tid,
+    block_threads,
+    *,
+    fz_npes,
+    fz_k,
+    fz_epr,
+    fz_total_experts,
+    packed_topk6_metadata,
+    count_segments,
 ):
     """_group_count_regs when ONE prefetch chunk covers every token (cur_tok
     <= fz_mtpr <= _GROUP_COUNT_PF * token_stride): the packed segments stay in
@@ -2556,20 +2855,40 @@ def _group_count_held(
     ]
     held = []
     for b in range_constexpr(_GROUP_COUNT_PF):
-        held.append(fx.Int32(_group_classify_held(
-            token_batch0 + fx.Int32(b) * token_stride, rows0[b], lane, topk_slot,
-            active_slot, pair_vals, count_scratch, i32_cur_tok,
-            fz_npes=fz_npes, fz_k=fz_k, fz_epr=fz_epr,
-            fz_total_experts=fz_total_experts,
-            packed_topk6_metadata=packed_topk6_metadata,
-        )))
+        held.append(
+            fx.Int32(
+                _group_classify_held(
+                    token_batch0 + fx.Int32(b) * token_stride,
+                    rows0[b],
+                    lane,
+                    topk_slot,
+                    active_slot,
+                    pair_vals,
+                    count_scratch,
+                    i32_cur_tok,
+                    fz_npes=fz_npes,
+                    fz_k=fz_k,
+                    fz_epr=fz_epr,
+                    fz_total_experts=fz_total_experts,
+                    packed_topk6_metadata=packed_topk6_metadata,
+                )
+            )
+        )
     return held
 
 
 @flyc.jit
 def _group_fill_held_one(
-    token, packed_segment, safe_slot, active_slot, a_pair_order, count_scratch,
-    *, fz_k, fz_total_experts, packed_topk6_metadata,
+    token,
+    packed_segment,
+    safe_slot,
+    active_slot,
+    a_pair_order,
+    count_scratch,
+    *,
+    fz_k,
+    fz_total_experts,
+    packed_topk6_metadata,
 ):
     if const_expr(packed_topk6_metadata):
         emit = active_slot & (packed_segment >= fx.Int32(0))
@@ -2593,10 +2912,26 @@ def _group_fill_held_one(
 
 @flyc.jit
 def _group_count_regs(
-    token_batch0, token_stride, lane, topk_slot, active_slot,
-    idx_buffer, route_segment, addr_pair_config, parity, count_scratch,
-    i32_cur_tok, tid, block_threads,
-    *, fz_npes, fz_k, fz_epr, fz_total_experts, packed_topk6_metadata, count_segments,
+    token_batch0,
+    token_stride,
+    lane,
+    topk_slot,
+    active_slot,
+    idx_buffer,
+    route_segment,
+    addr_pair_config,
+    parity,
+    count_scratch,
+    i32_cur_tok,
+    tid,
+    block_threads,
+    *,
+    fz_npes,
+    fz_k,
+    fz_epr,
+    fz_total_experts,
+    packed_topk6_metadata,
+    count_segments,
 ):
     pair_lane_packed = _load_pair_table_lane(
         addr_pair_config, parity, lane, fz_npes=fz_npes
@@ -2612,9 +2947,19 @@ def _group_count_regs(
         for d in range_constexpr(fz_npes)
     ]
     _group_classify_rows(
-        token_batch0, token_stride, rows0, lane, topk_slot, active_slot, pair_vals,
-        route_segment, count_scratch, i32_cur_tok,
-        fz_npes=fz_npes, fz_k=fz_k, fz_epr=fz_epr,
+        token_batch0,
+        token_stride,
+        rows0,
+        lane,
+        topk_slot,
+        active_slot,
+        pair_vals,
+        route_segment,
+        count_scratch,
+        i32_cur_tok,
+        fz_npes=fz_npes,
+        fz_k=fz_k,
+        fz_epr=fz_epr,
         fz_total_experts=fz_total_experts,
         packed_topk6_metadata=packed_topk6_metadata,
     )
@@ -2624,13 +2969,22 @@ def _group_count_regs(
             chunk_base, token_stride, lane, idx_buffer, i32_cur_tok, fz_k=fz_k
         )
         _group_classify_rows(
-            chunk_base, token_stride, rows, lane, topk_slot, active_slot, pair_vals,
-            route_segment, count_scratch, i32_cur_tok,
-            fz_npes=fz_npes, fz_k=fz_k, fz_epr=fz_epr,
+            chunk_base,
+            token_stride,
+            rows,
+            lane,
+            topk_slot,
+            active_slot,
+            pair_vals,
+            route_segment,
+            count_scratch,
+            i32_cur_tok,
+            fz_npes=fz_npes,
+            fz_k=fz_k,
+            fz_epr=fz_epr,
             fz_total_experts=fz_total_experts,
             packed_topk6_metadata=packed_topk6_metadata,
         )
-
 
 
 def _gsp_enabled(prefix_lds, count_segments, group_blocks, num_waves):
@@ -2653,8 +3007,16 @@ def _spin_counter_reached(addr_i64, target):
 
 @flyc.jit
 def _group_self_bases(
-    a_block_hist, before_lds, total_lds, producer_slot, lane, warp,
-    *, num_waves, group_blocks, count_segments,
+    a_block_hist,
+    before_lds,
+    total_lds,
+    producer_slot,
+    lane,
+    warp,
+    *,
+    num_waves,
+    group_blocks,
+    count_segments,
 ):
     """Wave w reduces BLOCK_HIST rows g = w, w + num_waves, ... with dwordx4
     lane = 4-segment loads: LDS before[s] += count[g][s] for g < own slot,
@@ -2727,8 +3089,20 @@ def _group_base_round(before_lds, total_lds, lane, rnd, *, count_segments):
 
 @flyc.jit
 def _emit_group(
-    *, num_waves, fz_npes, fz_k, fz_epr, fz_total_experts, addr_disp, i32_cur_tok, addr_in_idx,
-    dispatch_blocks, group_done_slot, producer_slot, parity, expected,
+    *,
+    num_waves,
+    fz_npes,
+    fz_k,
+    fz_epr,
+    fz_total_experts,
+    addr_disp,
+    i32_cur_tok,
+    addr_in_idx,
+    dispatch_blocks,
+    group_done_slot,
+    producer_slot,
+    parity,
+    expected,
     count_scratch=None,
     group_phase_base=None,
     addr_expected=None,
@@ -2737,6 +3111,7 @@ def _emit_group(
     prefix_lds=None,
 ):
     """Count and group disjoint route spans across payload producer CTAs."""
+
     def dp(i):
         return _sload_table_i64(addr_disp, int(i))
 
@@ -2758,6 +3133,7 @@ def _emit_group(
     packed_topk6_metadata = fz_k <= 6 and count_segments <= 512
     assert count_scratch is not None
     gsp = _gsp_enabled(prefix_lds, count_segments, dispatch_blocks, num_waves)
+
     def record_count(segment):
         scratch_addr = fx.Int64(fx.ptrtoint(count_scratch))
         return fx.Int32(
@@ -2783,12 +3159,7 @@ def _emit_group(
     token_stride = fx.Int32(dispatch_blocks * num_waves * tokens_per_wave)
     topk_slot = lane & fx.Int32(route_group_width - 1)
     active_slot = topk_slot < fx.Int32(fz_k)
-    group_regs = (
-        large_bucket
-        and fz_epr <= 64
-        and 0 < fz_k <= 8
-        and fz_npes <= 64
-    )
+    group_regs = large_bucket and fz_epr <= 64 and 0 < fz_k <= 8 and fz_npes <= 64
     held_static_stride = dispatch_blocks * num_waves * tokens_per_wave
     group_held = (
         group_regs
@@ -2798,66 +3169,89 @@ def _emit_group(
     held = None
     if const_expr(group_held):
         held = _group_count_held(
-            token_batch0, token_stride, lane, topk_slot, active_slot,
-            idx_buffer, addr_pair_config, parity, count_scratch,
-            i32_cur_tok, tid, block_threads,
-            fz_npes=fz_npes, fz_k=fz_k, fz_epr=fz_epr,
+            token_batch0,
+            token_stride,
+            lane,
+            topk_slot,
+            active_slot,
+            idx_buffer,
+            addr_pair_config,
+            parity,
+            count_scratch,
+            i32_cur_tok,
+            tid,
+            block_threads,
+            fz_npes=fz_npes,
+            fz_k=fz_k,
+            fz_epr=fz_epr,
             fz_total_experts=fz_total_experts,
             packed_topk6_metadata=packed_topk6_metadata,
             count_segments=count_segments,
         )
     elif const_expr(group_regs):
         _group_count_regs(
-            token_batch0, token_stride, lane, topk_slot, active_slot,
-            idx_buffer, route_segment, addr_pair_config, parity, count_scratch,
-            i32_cur_tok, tid, block_threads,
-            fz_npes=fz_npes, fz_k=fz_k, fz_epr=fz_epr,
+            token_batch0,
+            token_stride,
+            lane,
+            topk_slot,
+            active_slot,
+            idx_buffer,
+            route_segment,
+            addr_pair_config,
+            parity,
+            count_scratch,
+            i32_cur_tok,
+            tid,
+            block_threads,
+            fz_npes=fz_npes,
+            fz_k=fz_k,
+            fz_epr=fz_epr,
             fz_total_experts=fz_total_experts,
             packed_topk6_metadata=packed_topk6_metadata,
             count_segments=count_segments,
         )
     else:
-      for segment in range(tid, count_segments, block_threads):
-        fx.ptr_store(fx.Int32(0), count_scratch + fx.Int64(segment))
-      fx.barrier()
-      for token_batch in range(token_batch0, i32_cur_tok, token_stride):
-        token = token_batch + (lane >> fx.Int32(route_group_shift))
-        active_route = active_slot & (token < i32_cur_tok)
-        safe_token = (token < i32_cur_tok).select(token, fx.Int32(0))
-        safe_slot = active_slot.select(topk_slot, fx.Int32(0))
-        route = safe_token * fx.Int32(fz_k) + safe_slot
-        expert = idx_buffer[route]
-        valid = active_route & (expert >= fx.Int32(0))
-        valid = valid & (expert < fx.Int32(fz_total_experts))
-        safe_expert = valid.select(expert, fx.Int32(0))
-        segment, emit, member_slots = _classify_fanout_wave_route(
-            safe_expert,
-            expert,
-            lane,
-            addr_pair_config,
-            parity,
-            fz_k=fz_k,
-            fz_epr=fz_epr,
-            fz_total_experts=fz_total_experts,
-            fz_npes=fz_npes,
-        )
-        cached_segment = fx.Int32(-1)
-        if valid & emit:
-            intra_rank = record_count(segment)
-            if const_expr(packed_topk6_metadata):
-                cached_segment = (
-                    segment
-                    | (member_slots << fx.Int32(9))
-                    | (intra_rank << fx.Int32(15))
-                )
-            else:
-                cached_segment = (
-                    segment
-                    | (member_slots << fx.Int32(10))
-                    | (intra_rank << fx.Int32(18))
-                )
-        if active_route:
-            route_segment[route] = cached_segment
+        for segment in range(tid, count_segments, block_threads):
+            fx.ptr_store(fx.Int32(0), count_scratch + fx.Int64(segment))
+        fx.barrier()
+        for token_batch in range(token_batch0, i32_cur_tok, token_stride):
+            token = token_batch + (lane >> fx.Int32(route_group_shift))
+            active_route = active_slot & (token < i32_cur_tok)
+            safe_token = (token < i32_cur_tok).select(token, fx.Int32(0))
+            safe_slot = active_slot.select(topk_slot, fx.Int32(0))
+            route = safe_token * fx.Int32(fz_k) + safe_slot
+            expert = idx_buffer[route]
+            valid = active_route & (expert >= fx.Int32(0))
+            valid = valid & (expert < fx.Int32(fz_total_experts))
+            safe_expert = valid.select(expert, fx.Int32(0))
+            segment, emit, member_slots = _classify_fanout_wave_route(
+                safe_expert,
+                expert,
+                lane,
+                addr_pair_config,
+                parity,
+                fz_k=fz_k,
+                fz_epr=fz_epr,
+                fz_total_experts=fz_total_experts,
+                fz_npes=fz_npes,
+            )
+            cached_segment = fx.Int32(-1)
+            if valid & emit:
+                intra_rank = record_count(segment)
+                if const_expr(packed_topk6_metadata):
+                    cached_segment = (
+                        segment
+                        | (member_slots << fx.Int32(9))
+                        | (intra_rank << fx.Int32(15))
+                    )
+                else:
+                    cached_segment = (
+                        segment
+                        | (member_slots << fx.Int32(10))
+                        | (intra_rank << fx.Int32(18))
+                    )
+            if active_route:
+                route_segment[route] = cached_segment
 
     # Only the LDS counts must be complete at the barrier; the ROUTE_SEGMENT
     # stores drain together with the BLOCK_HIST stores below.
@@ -2886,8 +3280,14 @@ def _emit_group(
             fx.ptr_store(fx.Int32(0), prefix_lds + fx.Int64(segment))
         fx.barrier()
         _group_self_bases(
-            a_block_hist, count_scratch, prefix_lds, producer_slot, lane, warp,
-            num_waves=num_waves, group_blocks=dispatch_blocks,
+            a_block_hist,
+            count_scratch,
+            prefix_lds,
+            producer_slot,
+            lane,
+            warp,
+            num_waves=num_waves,
+            group_blocks=dispatch_blocks,
             count_segments=count_segments,
         )
         fx.rocdl.s_waitcnt(lgkmcnt=0)
@@ -2896,64 +3296,71 @@ def _emit_group(
         for rnd in range_constexpr(seg_rounds_g):
             if warp == fx.Int32(rnd % num_waves):
                 _group_base_round(
-                    count_scratch, prefix_lds, lane, rnd,
+                    count_scratch,
+                    prefix_lds,
+                    lane,
+                    rnd,
                     count_segments=count_segments,
                 )
         fx.rocdl.s_waitcnt(lgkmcnt=0)
         fx.barrier()
     else:
-      if tid == fx.Int32(0):
-        comm_ops.atomic_add_agent(a_group_done, fx.Int32(1))
-        comm_ops.wait_i32_until_equals(
-            a_pair_ready + fx.Int64(parity) * fx.Int64(4), expected
-        )
-        comm_ops.fence_agent_acquire()
-      fx.barrier()
+        if tid == fx.Int32(0):
+            comm_ops.atomic_add_agent(a_group_done, fx.Int32(1))
+            comm_ops.wait_i32_until_equals(
+                a_pair_ready + fx.Int64(parity) * fx.Int64(4), expected
+            )
+            comm_ops.fence_agent_acquire()
+        fx.barrier()
 
-      for segment in range(tid, count_segments, block_threads):
-        block_index = producer_slot * fx.Int32(count_segments) + segment
-        block_base = block_hist[block_index]
-        fx.ptr_store(block_base, count_scratch + fx.Int64(segment))
-      fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
-      fx.barrier()
+        for segment in range(tid, count_segments, block_threads):
+            block_index = producer_slot * fx.Int32(count_segments) + segment
+            block_base = block_hist[block_index]
+            fx.ptr_store(block_base, count_scratch + fx.Int64(segment))
+        fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
+        fx.barrier()
     if const_expr(group_held):
         safe_slot_h = active_slot.select(topk_slot, fx.Int32(0))
         for b in range_constexpr(_GROUP_COUNT_PF):
             _group_fill_held_one(
-                token_batch0 + fx.Int32(b) * token_stride
+                token_batch0
+                + fx.Int32(b) * token_stride
                 + (lane >> fx.Int32(route_group_shift)),
-                held[b], safe_slot_h, active_slot, a_pair_order, count_scratch,
-                fz_k=fz_k, fz_total_experts=fz_total_experts,
+                held[b],
+                safe_slot_h,
+                active_slot,
+                a_pair_order,
+                count_scratch,
+                fz_k=fz_k,
+                fz_total_experts=fz_total_experts,
                 packed_topk6_metadata=packed_topk6_metadata,
             )
     else:
-      for token_batch in range(
-          token_batch0, i32_cur_tok, token_stride
-      ):
-          token = token_batch + (lane >> fx.Int32(route_group_shift))
-          active_route = active_slot & (token < i32_cur_tok)
-          safe_token = (token < i32_cur_tok).select(token, fx.Int32(0))
-          safe_slot = active_slot.select(topk_slot, fx.Int32(0))
-          route = safe_token * fx.Int32(fz_k) + safe_slot
-          packed_segment = route_segment[route]
-          if const_expr(packed_topk6_metadata):
-              emit = active_route & (packed_segment >= fx.Int32(0))
-              segment = packed_segment & fx.Int32(0x1FF)
-              member_slots = (packed_segment >> fx.Int32(9)) & fx.Int32(0x3F)
-              intra_rank = (packed_segment >> fx.Int32(15)) & fx.Int32(0xFFFF)
-          else:
-              emit = active_route & (packed_segment != fx.Int32(-1))
-              segment = packed_segment & fx.Int32(0x3FF)
-              member_slots = (packed_segment >> fx.Int32(10)) & fx.Int32(0xFF)
-              intra_rank = (packed_segment >> fx.Int32(18)) & fx.Int32(0x3FFF)
-          if emit:
-              block_base = fx.ptr_load(count_scratch + fx.Int64(segment))
-              position = block_base + intra_rank
-              shared_group = segment >= fx.Int32(fz_total_experts)
-              group_entry = token | (member_slots << fx.Int32(24))
-              pair_entry = shared_group.select(group_entry, route)
-              # Agent-coherent (sc1) store; see _store_i32_agent_relaxed.
-              _store_i32_agent_relaxed(a_pair_order, position, pair_entry)
+        for token_batch in range(token_batch0, i32_cur_tok, token_stride):
+            token = token_batch + (lane >> fx.Int32(route_group_shift))
+            active_route = active_slot & (token < i32_cur_tok)
+            safe_token = (token < i32_cur_tok).select(token, fx.Int32(0))
+            safe_slot = active_slot.select(topk_slot, fx.Int32(0))
+            route = safe_token * fx.Int32(fz_k) + safe_slot
+            packed_segment = route_segment[route]
+            if const_expr(packed_topk6_metadata):
+                emit = active_route & (packed_segment >= fx.Int32(0))
+                segment = packed_segment & fx.Int32(0x1FF)
+                member_slots = (packed_segment >> fx.Int32(9)) & fx.Int32(0x3F)
+                intra_rank = (packed_segment >> fx.Int32(15)) & fx.Int32(0xFFFF)
+            else:
+                emit = active_route & (packed_segment != fx.Int32(-1))
+                segment = packed_segment & fx.Int32(0x3FF)
+                member_slots = (packed_segment >> fx.Int32(10)) & fx.Int32(0xFF)
+                intra_rank = (packed_segment >> fx.Int32(18)) & fx.Int32(0x3FFF)
+            if emit:
+                block_base = fx.ptr_load(count_scratch + fx.Int64(segment))
+                position = block_base + intra_rank
+                shared_group = segment >= fx.Int32(fz_total_experts)
+                group_entry = token | (member_slots << fx.Int32(24))
+                pair_entry = shared_group.select(group_entry, route)
+                # Agent-coherent (sc1) store; see _store_i32_agent_relaxed.
+                _store_i32_agent_relaxed(a_pair_order, position, pair_entry)
 
     # Every lane's sc1 stores have completed (agent-visible) before the
     # barrier, so the GROUP_DONE arrival below needs no agent release fence
@@ -2979,11 +3386,8 @@ def _emit_group(
             )
 
 
-
 # Fused owner: the epoch-state resets go out as one multi-lane store.
 _EPOCH_STORE_LANES = 14
-
-
 
 
 def _fast_prepare_supported(npes, epr, topk):
@@ -3421,9 +3825,7 @@ def _compile_fast_mega_moe_prepare(
             launch_grid = prepare_blocks + quant_blocks + 1
 
     quant_steal = (
-        quant_dpp
-        and _QUANT_STEAL_ROUNDS > 0
-        and prepare_blocks <= quant_cu_capacity
+        quant_dpp and _QUANT_STEAL_ROUNDS > 0 and prepare_blocks <= quant_cu_capacity
     )
 
     # Small-P buckets (decode / small prefill) run the single-CTA fused
@@ -3431,9 +3833,7 @@ def _compile_fast_mega_moe_prepare(
     # PAIR_READY -> fill round trip costs more than the owner counting a few
     # extra 64-token batches itself.  The launch geometry (grid, entry slot,
     # generation math) is unchanged; the P group CTAs retire immediately.
-    fused_p1 = (
-        prepare_blocks <= _FUSED_MAX_P
-    )
+    fused_p1 = prepare_blocks <= _FUSED_MAX_P
     tok_extra = _TOK_DUMMY_SEGS if fused_p1 else 0
     # Decode (tile_m 32): epoch loads + count prefetch issued before the
     # ticket atomic (see kernel()).
@@ -3460,8 +3860,6 @@ def _compile_fast_mega_moe_prepare(
         + ("_fp1" if 1 < prepare_blocks <= _FUSED_MAX_P else "")
     )
 
-
-
     @flyc.kernel(name=kernel_name, known_block_size=[block_threads, 1, 1])
     def kernel(
         addr_disp: fx.Int64,
@@ -3480,6 +3878,7 @@ def _compile_fast_mega_moe_prepare(
         prefix_scratch = lds.prefix_scratch.ptr
         bcast_scratch = lds.bcast.ptr
         ticket_view = fx.make_view(ticket_scratch, fx.make_layout(1, 1))
+
         def disp_ptr(slot):
             return _sload_table_i64(addr_disp, int(slot))
 
@@ -3523,13 +3922,16 @@ def _compile_fast_mega_moe_prepare(
             if (tid >> fx.Int32(6)) == fx.Int32(num_waves - 1):
                 _kcache_touch(addr_disp, DISPATCH_TABLE_SIZE * 2)
             if (tid >> fx.Int32(6)) == fx.Int32(num_waves - 2):
-                _kcache_touch_tables([
-                    disp_ptr(p2p_slot) for p2p_slot in (
-                        DispatchSlot.P2P_COUNT_MATRIX,
-                        DispatchSlot.P2P_COUNT_DONE,
-                        DispatchSlot.P2P_PLAN_READY,
-                    )
-                ])
+                _kcache_touch_tables(
+                    [
+                        disp_ptr(p2p_slot)
+                        for p2p_slot in (
+                            DispatchSlot.P2P_COUNT_MATRIX,
+                            DispatchSlot.P2P_COUNT_DONE,
+                            DispatchSlot.P2P_PLAN_READY,
+                        )
+                    ]
+                )
         if const_expr(pre_ticket):
             # Decode fused path: every role is self-contained (the owner
             # counts, plans and publishes alone; quant CTAs only stride their
@@ -3641,7 +4043,9 @@ def _compile_fast_mega_moe_prepare(
                         use_s0 = n_mine == fx.Int32(0)
                         cur = use_s0.select(static_end + s0, cur)
                         cur_ok = cur_ok | (use_s0 & (s0 < steal_count))
-                    lbase = cur_ok.select(cur * fx.Int32(blk_chunks), total_chunks) + tid
+                    lbase = (
+                        cur_ok.select(cur * fx.Int32(blk_chunks), total_chunks) + tid
+                    )
                     oob_pair = fx.Vector.from_elements(
                         [fx.Int32(0), fx.Int32(0)], fx.Int32
                     )
@@ -3657,7 +4061,11 @@ def _compile_fast_mega_moe_prepare(
                     for u in range_constexpr(_QUANT_CHUNKS_IN_FLIGHT):
                         if const_expr(u >= K):
                             buf_copy_store(
-                                quant_out8, total_chunks, oob_pair, fx.Int32, unit_elems=2
+                                quant_out8,
+                                total_chunks,
+                                oob_pair,
+                                fx.Int32,
+                                unit_elems=2,
                             )
                         raws.append(
                             buf_copy_load(
@@ -3693,7 +4101,9 @@ def _compile_fast_mega_moe_prepare(
                         nxt_ok = j1 < n_mine
                         if const_expr(quant_steal):
                             if (tid == fx.Int32(0)) & need_grab:
-                                fx.ptr_store(g, bcast_scratch + fx.Int64(j1 & fx.Int32(1)))
+                                fx.ptr_store(
+                                    g, bcast_scratch + fx.Int64(j1 & fx.Int32(1))
+                                )
                                 if g == last_grab:
                                     comm_ops.atomic_add_agent(steal_addr, rewind)
                             if need_grab:
@@ -3703,7 +4113,10 @@ def _compile_fast_mega_moe_prepare(
                             )
                             nxt = nxt_ok.select(nxt, static_end + s1)
                             nxt_ok = nxt_ok | (s1 < steal_count)
-                        nbase = nxt_ok.select(nxt * fx.Int32(blk_chunks), total_chunks) + tid
+                        nbase = (
+                            nxt_ok.select(nxt * fx.Int32(blk_chunks), total_chunks)
+                            + tid
+                        )
                         new_raws = []
                         for u in range_constexpr(K):
                             new_raws.append(
@@ -3730,7 +4143,9 @@ def _compile_fast_mega_moe_prepare(
                                 )
                             )
                             fx.rocdl.sched_barrier(0)
-                        quant_scale32[cur * fx.Int32(blk_chunks // 16) + scale_off] = sel
+                        quant_scale32[cur * fx.Int32(blk_chunks // 16) + scale_off] = (
+                            sel
+                        )
                         raws = new_raws
                         cur = nxt
                         cur_ok = nxt_ok
@@ -3794,10 +4209,16 @@ def _compile_fast_mega_moe_prepare(
                         expected0 = pre_expected0
                         expected1 = pre_expected1
                     else:
-                      if epoch_pred:
-                        old_parity = comm_ops.load_i32_system(addr_parity, fx.Int32(0))
-                        expected0 = comm_ops.load_i32_system(addr_expected, fx.Int32(0))
-                        expected1 = comm_ops.load_i32_system(addr_expected, fx.Int32(1))
+                        if epoch_pred:
+                            old_parity = comm_ops.load_i32_system(
+                                addr_parity, fx.Int32(0)
+                            )
+                            expected0 = comm_ops.load_i32_system(
+                                addr_expected, fx.Int32(0)
+                            )
+                            expected1 = comm_ops.load_i32_system(
+                                addr_expected, fx.Int32(1)
+                            )
                     tok_pre = pre_tok
                     if const_expr(not pre_ticket):
                         tok_pre = _tok_prefetch(
@@ -3812,35 +4233,41 @@ def _compile_fast_mega_moe_prepare(
                             prepare_blocks=prepare_blocks,
                         )
                     if epoch_pred:
-                      # The 14 epoch-state resets are independent relaxed
-                      # write-through stores: one lane each, ONE store
-                      # instruction instead of 14 on lane 0.
-                      parity_lane = old_parity ^ fx.Int32(1)
-                      previous_expected = (parity_lane == fx.Int32(0)).select(
-                          expected0, expected1
-                      )
-                      expected_lane = previous_expected + fx.Int32(npes)
-                      st_addr = work_head + fx.Int64(
-                          (tid - fx.Int32(2)) * fx.Int32(16 * 4)
-                      )
-                      st_val = fx.Int32(0)
-                      for lane_id, lane_addr, lane_val in (
-                          (0, addr_expected + fx.Int64(parity_lane) * fx.Int64(4),
-                           expected_lane),
-                          (1, payload_ready_rows, fx.Int32(tile_m)),
-                          (10, work_tail, fx.Int32(0)),
-                          (11, ready_tile_tail + fx.Int64(parity_lane) * fx.Int64(4),
-                           fx.Int32(0)),
-                          (12, addr_parity, parity_lane),
-                          (13, epoch_gate, gate_epoch),
-                      ):
-                          is_lane = tid == fx.Int32(lane_id)
-                          st_addr = is_lane.select(lane_addr, st_addr)
-                          st_val = is_lane.select(lane_val, st_val)
-                      _store_i32_sys_relaxed(st_addr, fx.Int32(0), st_val)
-                      if tid == fx.Int32(0):
-                          fx.ptr_store(parity_lane, bcast_scratch)
-                          fx.ptr_store(expected_lane, bcast_scratch + fx.Int64(1))
+                        # The 14 epoch-state resets are independent relaxed
+                        # write-through stores: one lane each, ONE store
+                        # instruction instead of 14 on lane 0.
+                        parity_lane = old_parity ^ fx.Int32(1)
+                        previous_expected = (parity_lane == fx.Int32(0)).select(
+                            expected0, expected1
+                        )
+                        expected_lane = previous_expected + fx.Int32(npes)
+                        st_addr = work_head + fx.Int64(
+                            (tid - fx.Int32(2)) * fx.Int32(16 * 4)
+                        )
+                        st_val = fx.Int32(0)
+                        for lane_id, lane_addr, lane_val in (
+                            (
+                                0,
+                                addr_expected + fx.Int64(parity_lane) * fx.Int64(4),
+                                expected_lane,
+                            ),
+                            (1, payload_ready_rows, fx.Int32(tile_m)),
+                            (10, work_tail, fx.Int32(0)),
+                            (
+                                11,
+                                ready_tile_tail + fx.Int64(parity_lane) * fx.Int64(4),
+                                fx.Int32(0),
+                            ),
+                            (12, addr_parity, parity_lane),
+                            (13, epoch_gate, gate_epoch),
+                        ):
+                            is_lane = tid == fx.Int32(lane_id)
+                            st_addr = is_lane.select(lane_addr, st_addr)
+                            st_val = is_lane.select(lane_val, st_val)
+                        _store_i32_sys_relaxed(st_addr, fx.Int32(0), st_val)
+                        if tid == fx.Int32(0):
+                            fx.ptr_store(parity_lane, bcast_scratch)
+                            fx.ptr_store(expected_lane, bcast_scratch + fx.Int64(1))
                     if const_expr(not pre_ticket):  # noqa: SIM102
                         if (tid >> fx.Int32(6)) == fx.Int32(num_waves - 1):
                             _kcache_touch(addr_disp, DISPATCH_TABLE_SIZE * 2)
