@@ -67,14 +67,10 @@ def get_mla_varlen_config(causal, seqlen_k, total_q, num_heads) -> dict:
         programs = -(-total_q // cfg["BLOCK_M"]) * num_heads
         num_sms = get_num_sms()
         if programs < num_sms or (
-            programs < 2 * num_sms
-            and seqlen_k <= configs["causal_small_max_seqlen_k"]
+            programs < 2 * num_sms and seqlen_k <= configs["causal_small_max_seqlen_k"]
         ):
-            # under two waves of short rows: 4 warps on the 128-row tile fill the
-            # CUs better than 2
             cfg = configs["causal_small"]
         elif seqlen_k >= configs["causal_long_min_seqlen_k"]:
-            # long KV: a 256-row tile halves the K/V reads per query row
             cfg = configs["causal_long"]
         return dict(cfg, NUM_SPLITS=1)
     if seqlen_k <= configs["short_max_seqlen_k"]:
@@ -348,14 +344,7 @@ def mha_fwd_mla_varlen(
         o_k = out.unsqueeze(0)
         lse_k = (out if lse_out is None else lse_out).unsqueeze(0)
     wmma_layout, wmma_layout_pe = _mla_varlen_layouts(BLOCK_M, cfg["num_warps"])
-    # Row sums from the fp8-rounded P on the matrix cores (P x ones, as the ASM
-    # kernel does): o = sum(P8 V) / sum(P8) stays exactly consistent, and so do
-    # the split-KV partials, but the LSE becomes log(sum(P8)), an approximation of
-    # the exact log-sum-exp. Keep the fp32 row sums when the caller needs the LSE
-    # or merges with an external (o_init, lse_init).
-    fast_rowsum = bool(
-        cfg.get("ROWSUM_MMA", lse_out is None and o_init is None)
-    )
+    fast_rowsum = bool(cfg.get("ROWSUM_MMA", lse_out is None and o_init is None))
     _mha_fwd_mla_varlen[(num_qblk * num_heads, num_splits)](
         q,
         k,
@@ -401,7 +390,7 @@ def mha_fwd_mla_varlen(
         WMMA_LAYOUT_PE=wmma_layout_pe,
         PV_SPLIT_K=fast_rowsum,
         ROWSUM_MMA=fast_rowsum,
-        K3=bool(cfg.get("K3", True)),
+        NUM_K_BUFFERS=int(cfg.get("NUM_K_BUFFERS", 3)),
         EARLY_K=bool(cfg.get("EARLY_K", True)),
         num_warps=cfg["num_warps"],
         waves_per_eu=cfg["waves_per_eu"],
