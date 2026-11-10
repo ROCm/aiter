@@ -322,7 +322,7 @@ class PaDecodeSchedule:
             or (
                 TUNED_PER_TOKEN and QUERIES_PER_CTA == 1 and 8 <= query_group_size <= 16
             )
-            or (TUNED_SCALAR and block_size == 128 and TOTAL_ROWS <= MFMA_MNK)
+            or (TUNED_SCALAR and TOTAL_ROWS <= MFMA_MNK)
         )
         # Keep the tuned page/scale layout selection separate from V prefetch.
         PER_TOKEN_M1 = (
