@@ -24,3 +24,32 @@ def run_in_subprocess(child_code: str, timeout: int = 180):
         env=env,
         check=False,
     )
+
+
+def is_gpu_memory_fault(rc: int, stderr: str) -> bool:
+    """Detect HSA GPU memory-fault death.
+
+    Empirically on ROCm 7.2.0 / MI300X the signal is SIGABRT (-6); on
+    ROCm 7.x with different coredump-tool config it can be SIGPIPE (-13).
+    Match on (process killed by ANY signal) AND (HSA fault keyword in
+    stderr) -- both conditions must hold to avoid false positives from
+    unrelated SIGPIPE / SIGABRT.
+    """
+    killed_by_signal = (rc < 0) or (128 <= rc < 256)
+    if not killed_by_signal:
+        return False
+    msg = stderr.lower()
+    return "memory access fault" in msg or "hsa_status_error_memory_fault" in msg
+
+
+def assert_no_gpu_memory_fault(result, fault_message: str):
+    """Assert that a child from `run_in_subprocess` exited cleanly.
+
+    `fault_message` describes the bug that a GPU memory fault indicates."""
+    stderr_tail = result.stderr[-2048:]
+    assert not is_gpu_memory_fault(
+        result.returncode, result.stderr
+    ), f"{fault_message} (rc={result.returncode}):\n{stderr_tail}"
+    assert (
+        result.returncode == 0
+    ), f"child failed (rc={result.returncode}):\n{stderr_tail}"

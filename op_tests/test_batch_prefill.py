@@ -18,7 +18,7 @@ from aiter import dtypes, per_tensor_quant
 from aiter.test_common import (
     perftest,
 )
-from op_tests.gpu_fault_subprocess import run_in_subprocess
+from op_tests.gpu_fault_subprocess import is_gpu_memory_fault, run_in_subprocess
 
 
 def skip_test_if(condition: bool, reason: str) -> bool:
@@ -3664,20 +3664,6 @@ def make_guarded_int32_tensor(values, device: int = 0):
 # Subprocess isolation is REQUIRED: GPU memory fault sends SIGABRT/SIGPIPE to
 # the entire process; no try/except in pytest can catch it.
 # ---------------------------------------------------------------------------
-def _aick1171_fault_signature(rc: int, stderr: str) -> bool:
-    """Detect HSA GPU memory-fault death.
-
-    Empirically on ROCm 7.2.0 / MI300X the signal is SIGABRT (-6); on
-    ROCm 7.x with different coredump-tool config it can be SIGPIPE (-13).
-    Match on (process killed by ANY signal) AND (HSA fault keyword in
-    stderr) -- both conditions must hold to avoid false positives from
-    unrelated SIGPIPE / SIGABRT.
-    """
-    killed_by_signal = (rc < 0) or (128 <= rc < 256)
-    if not killed_by_signal:
-        return False
-    msg = stderr.lower()
-    return "memory access fault" in msg or "hsa_status_error_memory_fault" in msg
 
 
 # The OOB read at page_idx[128] overruns the kv_page_indices buffer (not
@@ -3786,7 +3772,7 @@ def test_batch_prefill_aick1171_hard_fault_via_guard_page(total_blocks):
 
     result = run_in_subprocess(child_code)
 
-    if _aick1171_fault_signature(result.returncode, result.stderr):
+    if is_gpu_memory_fault(result.returncode, result.stderr):
         pytest.fail(
             "AICK-1171 hard fault detected -- V prefetch read past "
             "kv_page_indices buffer end and hit guard page.\n"
