@@ -77,6 +77,11 @@ def ff_a16w16_fused_gated(
     if config is None:
         config, _ = _get_config(M, N, K)
 
+    # NUM_KSPLIT is part of the GEMM config schema but this fused kernel has no
+    # selectable split-K; strip it (without mutating a caller-supplied dict) so
+    # it is not forwarded as an unknown kernel argument.
+    config = {k: v for k, v in config.items() if k != "NUM_KSPLIT"}
+
     grid = lambda META: (
         triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
     )

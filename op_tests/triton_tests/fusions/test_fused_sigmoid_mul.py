@@ -170,7 +170,7 @@ def test_fused_sigmoid_mul_row_strided(n_tokens, dtype, x_layout, use_explicit_o
 def test_fused_sigmoid_mul_rejects_non_2d_strided():
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
-    x = torch.randn(4, 8, 32, device="cuda")[:, :, :16]
-    gate = torch.randn(4, 8, 16, device="cuda")
+    x = torch.randn(4, 8, 32, device="cuda", dtype=torch.float32)[:, :, :16]
+    gate = torch.randn(4, 8, 16, device="cuda", dtype=torch.float32)
     with pytest.raises(AssertionError, match="2-D"):
         fused_sigmoid_mul(x, gate)

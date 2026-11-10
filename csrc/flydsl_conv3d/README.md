@@ -80,6 +80,22 @@ python3 csrc/flydsl_conv3d/conv3d_tune.py \
   -o aiter/configs/model_configs/qwenimage_vae_bf16_tuned_conv3d.csv
 ```
 
+   On gfx1250 the K loop's software pipeline is tuned too, the way the gfx1250
+   GEMM tuner sweeps `stages` and `main_loop_unroll`. Timing every tile with
+   every pipeline multiplies the GPU time, so do it in two passes: tiles at the
+   default pipeline, keeping every candidate (`-o2`), then the pipeline
+   variants on each shape's fastest tiles only:
+
+```bash
+M=aiter/configs/model_configs
+python3 csrc/flydsl_conv3d/conv3d_tune.py -i $M/wan21_vae_bf16_untuned_conv3d.csv \
+  -o /tmp/wan_tiles.csv -o2 /tmp/wan_tiles_all.csv
+python3 csrc/flydsl_conv3d/conv3d_tune.py -i $M/wan21_vae_bf16_untuned_conv3d.csv \
+  -o $M/wan21_vae_gfx1250_bf16_tuned_conv3d.csv \
+  --tiles_from /tmp/wan_tiles_all.csv --tiles_topk 4 \
+  --pipelines 2:0,2:1,3:0,3:1,4:0,4:1 --tile_ks 32,64,96,128 --patches 0,1
+```
+
    Write winners into the per-model file, never into
    `aiter/configs/bf16_tuned_conv3d.csv`. That one and its untuned sibling ship
    header-only and back the merge `AITER_CONFIG_CONV3D_BF16` performs:
@@ -104,6 +120,18 @@ python3 csrc/flydsl_conv3d/conv3d_tune.py \
    VAEs. That is a constant per shape, so the ranking is unaffected, but the
    three columns are a floor rather than a kernel figure and are not
    comparable with another implementation's kernel-only numbers.
+
+   gfx1250 rows also carry `block_r` (output rows of the R x C block),
+   `num_buffers` (LDS ring depth, i.e. prefetch distance),
+   `main_loop_unroll` (two K tiles per `scf.for` trip), `tile_k` (channels
+   per K tile, a multiple of 32 that divides C/groups padded to 32; one
+   `tensor_wait` + barrier per K tile) and `patch` (kH x kW input reuse: one
+   TDM patch of (R + kH - 1) x (C + kW - 1) pixels per (kT, channel) group,
+   read by all kH * kW taps). `num_buffers` is the value that ran: the runtime
+   clamps a request to the LDS capacity and the K-tile count (and, with
+   `patch`, to kH * kW), and the tuner records the clamped value. Rows without
+   these columns, or with empty cells, run 2 buffers, no unroll, `tile_k=32`
+   and no patch.
 
    `splitK` is **not** swept: `_resolve_splitk` derives it per candidate and the
    tuner pins that value so the column records what ran. Every row of both VAE
@@ -171,7 +199,46 @@ python3 -m pytest op_tests/tuning_tests/test_config_shape_collision.py
 - **Description**: Cap on enumerated candidates per shape. The kernel's own
   candidate table and heuristic ladder are unioned in on top of the cap, and so
   is the tile the shape would borrow from another tuned resolution of its layer,
-  so the tuned pick can never come out worse than the shipped default.
+  so the tuned pick can never come out worse than the shipped default. On
+  gfx1250 the cap keeps the largest tiles first; when even the top candidate
+  leaves CUs without a block, every variant of the six tile shapes that fill
+  the CUs best is added on top as well (small-M layers such as the Wan2.1
+  encoder mid block, M = 3128 at 368x544).
+
+### `--pipelines`
+- **Type**: comma list of `num_buffers:main_loop_unroll`
+- **Default**: `2:0`
+- **Description**: gfx1250 only. Every tile candidate is timed once per pair,
+  e.g. `3:1` is three LDS buffers with the main loop unrolled two K tiles per
+  trip. Pairs that clamp to the same buffer count for a shape are timed once.
+
+### `--tile_ks`
+- **Type**: comma list of ints
+- **Default**: `32`
+- **Description**: gfx1250 only. K tile widths every tile and pipeline is timed
+  with. A width that does not divide the shape's padded C/groups is skipped
+  there, and so is a variant whose LDS would not fit even at 2 buffers.
+
+### `--patches`
+- **Type**: `0`, `1` or `0,1`
+- **Default**: `0`
+- **Description**: gfx1250 only. Time every tile, pipeline and K tile width
+  without and/or with kH x kW patch reuse. `1` is skipped where the shape
+  cannot take it (kH * kW == 1, H/W stride > 1, split-K) and runs without
+  main-loop unroll (the patch loop unrolls the taps of a group instead). Patch
+  variants that run 2 buffers with `tile_k` > 32 are skipped: they spill VGPRs
+  on most tiles. The kernel compiles those configs with post-RA scheduling
+  off: otherwise LLVM's post-RA scheduler can move a last-use scratch reload
+  above another reload of the same spill slot, which then reads stale data
+  (one of them faulted on gfx1250 that way).
+
+### `--tiles_from` / `--tiles_topk`
+- **Type**: path / int
+- **Default**: none / 4
+- **Description**: gfx1250 only. Replace the policy's tile candidates with each
+  shape's `--tiles_topk` fastest correct tiles in a profile CSV written by an
+  earlier run's `-o2`. A shape the profile does not cover falls back to the
+  policy's candidates, with a warning.
 
 ## Common Options
 
@@ -202,9 +269,15 @@ Tolerable error ratio against the `torch.nn.functional.conv3d` reference
 (default 0.0, not the usual 0.05). The reference is bf16 rather than fp32 on
 purpose: the tuner needs to catch a config that computes the wrong thing, not to
 measure bf16 rounding, and a matching rounding regime puts every correct
-candidate at exactly 0. Raise it only to investigate a specific failure --
-`op_tests/test_flydsl_conv_implicit.py` fails on any mismatched element, so a
-row tuned under a looser bar is a row that test will reject.
+candidate at exactly 0. Each candidate is scored by `strict_compare`, which
+returns 1.0 on any element outside tolerance: `mp_tuner` rounds the ratio to 4
+decimals, so a plain ratio would pass thousands of wrong elements as 0.0. On
+gfx1250 the output buffer is NaN-filled before every candidate, so an element a
+kernel never writes fails it as well; gfx950 candidates allocate their own
+output and get no such check. That makes this flag a pass/fail switch: anything
+below 1.0 behaves like 0.0, and 1.0 lets a wrong candidate win. Use 1.0 only to
+investigate, never for a shipped table -- `op_tests/test_flydsl_conv_implicit.py`
+fails on any mismatched element, so such a row is one that test will reject.
 
 ### `--timeout`
 Per-task watchdog in seconds (default 1800). A worker killed by a GPU

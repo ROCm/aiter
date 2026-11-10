@@ -184,6 +184,7 @@ def tensor_model_parallel_fused_allreduce_rmsnorm_quant(
     emit_bf16: bool = False,
     transpose_scale: bool = False,
     gemma_norm: bool = False,
+    hadamard_rotate: bool = False,
 ):
     """Fused tensor-parallel all-reduce + RMSNorm + quantization.
 
@@ -198,14 +199,19 @@ def tensor_model_parallel_fused_allreduce_rmsnorm_quant(
     column-major layout ``(num_groups, M)`` viewed as ``(M, num_groups)``,
     matching what ``gemm_a8w8_blockscale_preshuffle`` expects.
 
-    ``gemma_norm`` (per-token and per-group) normalizes with ``x * (1 + w)``
-    from the raw ``weight_``; MXFP4 does not support it.
+    ``gemma_norm`` normalizes with ``x * (1 + w)`` from the raw ``weight_``.
+
+    ``hadamard_rotate`` (MXFP4 only) quantizes the normed output rotated per
+    32-element group, as ``per_1x32_f4_quant_hip(..., hadamard_rotate=True)``
+    does; the bf16 side output stays unrotated.
     """
     _assert_no_custom_group("tensor_model_parallel_fused_allreduce_rmsnorm_quant")
 
     # Enum -> string up front (trace-safe) so downstream string guards match
     # under torch.compile instead of falling to the untraced pybind path.
     quant_type = _canonical_fused_ar_rms_quant_type(quant_type)
+    if hadamard_rotate and quant_type != "mxfp4":
+        raise ValueError("hadamard_rotate is MXFP4-only")
 
     # Per-group has its own traceable torch.library method; the generic path would
     # hit raw pybind and graph-break.
@@ -233,6 +239,7 @@ def tensor_model_parallel_fused_allreduce_rmsnorm_quant(
         emit_bf16=emit_bf16,
         transpose_scale=transpose_scale,
         gemma_norm=gemma_norm,
+        hadamard_rotate=hadamard_rotate,
     )
 
 
@@ -243,6 +250,8 @@ def tensor_model_parallel_fused_allreduce_rmsnorm_mxfp4_quant(
     eps: float,
     prefill_support: bool = False,
     emit_bf16: bool = False,
+    gemma_norm: bool = False,
+    hadamard_rotate: bool = False,
 ):
     return tensor_model_parallel_fused_allreduce_rmsnorm_quant(
         input_,
@@ -252,6 +261,8 @@ def tensor_model_parallel_fused_allreduce_rmsnorm_mxfp4_quant(
         prefill_support,
         quant_type="mxfp4",
         emit_bf16=emit_bf16,
+        gemma_norm=gemma_norm,
+        hadamard_rotate=hadamard_rotate,
     )
 
 
@@ -292,6 +303,8 @@ def tensor_model_parallel_fused_qknorm_allreduce_rope(
 
 
 def tensor_model_parallel_custom_all_gather(input_: torch.Tensor) -> torch.Tensor:
+    """The TP group's custom all-gather; raises where it has no kernel (see
+    `GroupCoordinator.custom_all_gather`)."""
     _assert_no_custom_group("tensor_model_parallel_custom_all_gather")
     return get_tp_group().custom_all_gather(input_)
 

@@ -17,7 +17,7 @@ from aiter.ops.triton.utils.types import e4m3_dtype
 # from triton._C.libtriton.gluon_ir import make_cga_layout
 
 DEVICE_ARCH = arch_info.get_arch()
-IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250",)
+IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250", "gfx1250-strict")
 MMA_operation: gl.constexpr = (
     gl.amd.gfx1250.wmma if gl.constexpr(IS_DEVICE_ARCH_GFX12) else gl.amd.cdna4.mfma
 )
@@ -1456,9 +1456,11 @@ class AttentionProgram:
     @gluon.jit
     def softmax_part0(self, S, M):
         m_ij = gl.maximum(M, gl.max(S, axis=1))
-        # m_ij = gl.where(m_ij > float("-inf"), m_ij, 0.0)
-        p = gl.exp2(S - m_ij[:, None])
-        alpha = gl.exp2(M - m_ij)
+        # A row can see no key in this segment when q_len > 1 (a segment past
+        # its causal horizon); shift it by 0 so p and alpha are 0, not NaN.
+        m_shift = gl.where(m_ij > float("-inf"), m_ij, 0.0)
+        p = gl.exp2(S - m_shift[:, None])
+        alpha = gl.exp2(M - m_shift)
         return p, alpha, m_ij
 
     # @gluon.jit
@@ -1916,6 +1918,8 @@ unified_attention_gluon_kernel_3d_repr = make_kernel_repr(
         "waves_per_eu",
         "num_stages",
         "ALL_DECODE",
+        "SPEC_DECODE",
+        "SEQLEN_Q",
         "SHUFFLED_KV_CACHE",
         "QUERY_DTYPE",
         "KV_CACHE_DTYPE",
@@ -1981,6 +1985,8 @@ def _unified_attention_gluon_kernel_3d(
     num_ctas: gl.constexpr = 1,  # int
     NUM_BLOCKS_GATHER_PER_TILE: gl.constexpr = 1,  # int NUM_BLOCKS_GATHER_PER_TILE > 1 for TDM gather mode
     ALL_DECODE: gl.constexpr = False,  # bool
+    SPEC_DECODE: gl.constexpr = False,  # bool, every seq has SEQLEN_Q (> 1) queries
+    SEQLEN_Q: gl.constexpr = 1,  # int, the per-seq query count when SPEC_DECODE
     SHUFFLED_KV_CACHE: gl.constexpr = False,
     K_WIDTH: gl.constexpr = 0,  # int
     SCALE_K_WIDTH: gl.constexpr = 16,  # int
@@ -2035,6 +2041,19 @@ def _unified_attention_gluon_kernel_3d(
         q_block_local_idx: gl.int32 = 0
         cur_batch_query_len: gl.int32 = 1
         cur_batch_in_all_start_index: gl.int32 = q_block_global_idx
+    elif SPEC_DECODE:
+        # Every seq holds SEQLEN_Q queries, so the launch has exactly
+        # Q_BLOCKS_PER_SEQ blocks per seq and the program id alone locates the
+        # seq and the query block: no binary search, and no empty blocks.
+        Q_BLOCKS_PER_SEQ: gl.constexpr = (SEQLEN_Q + BLOCK_Q - 1) // BLOCK_Q
+        if Q_BLOCKS_PER_SEQ == 1:
+            seq_idx = q_block_global_idx
+            q_block_local_idx: gl.int32 = 0
+        else:
+            seq_idx = q_block_global_idx // Q_BLOCKS_PER_SEQ
+            q_block_local_idx = q_block_global_idx % Q_BLOCKS_PER_SEQ
+        cur_batch_query_len: gl.int32 = SEQLEN_Q
+        cur_batch_in_all_start_index = seq_idx * SEQLEN_Q
     else:
         seq_idx = find_seq_idx(
             query_start_len_ptr, q_block_global_idx, num_seqs, cfg.BLOCK_Q, True
@@ -2324,6 +2343,23 @@ def _unified_attention_gluon_kernel_3d(
         S = S * qk_factor
 
         S = pgm.apply_softcap(S)
+        if not cfg.ALL_DECODE:
+            # With q_len > 1 the rows of a query block have different causal
+            # horizons, so a tile before the last can hold keys past an early
+            # row's horizon. Decode has one query per block and skips this.
+            tile_offset = (
+                j * cfg.TILE_SIZE
+                + gl.arange(
+                    0,
+                    cfg.TILE_SIZE,
+                    layout=gl.SliceLayout(0, cfg.QK_WMMA_UNPACKED_LAYOUT),
+                )[None, :]
+            )
+            S = gl.where(
+                tile_offset < pgm.context_len + pgm.query_pos_qk + 1,
+                S,
+                float("-inf"),
+            )
         if need_addtional_mask:
             seq_mask = seq_offset < pgm.context_len + pgm.query_pos_qk + 1
             S = pgm.apply_addtional_mask_qk(
@@ -2378,7 +2414,9 @@ def _unified_attention_gluon_kernel_3d(
     S = S * qk_factor
 
     S = pgm.apply_softcap(S)
-    seq_mask = seq_offset < pgm.context_len + pgm.query_pos_qk + 1
+    seq_mask = (seq_offset < pgm.context_len + pgm.query_pos_qk + 1) & (
+        pgm.tile_end > pgm.tile_start
+    )
     S = gl.where(seq_mask, S, float("-inf"))
     if need_addtional_mask:
         S = pgm.apply_addtional_mask_qk(S, seq_offset, alibi_slope, qq_bias_row_ptrs)
