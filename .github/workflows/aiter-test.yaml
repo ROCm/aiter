@@ -742,6 +742,23 @@ jobs:
     runs-on: ${{ matrix.runner }}
 
     steps:
+      - name: Prepare persistent runner workspace
+        run: |
+          set +e
+          echo "Preparing workspace: ${GITHUB_WORKSPACE}"
+          docker exec aiter_test bash -lc "chown -R $(id -u):$(id -g) /workspace || true" || true
+          docker rm -f aiter_test >/dev/null 2>&1 || true
+
+          if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+            sudo chown -R "$(id -u):$(id -g)" "${GITHUB_WORKSPACE}" || true
+          elif command -v docker >/dev/null 2>&1; then
+            docker run --rm \
+              -v "${GITHUB_WORKSPACE}:/workspace" \
+              --entrypoint bash \
+              "${DOCKER_IMAGE}" \
+              -lc "chown -R $(id -u):$(id -g) /workspace || true" || true
+          fi
+
       - name: Checkout code
         uses: actions/checkout@v4
         with:
@@ -955,6 +972,7 @@ jobs:
         run: |
           set -ex
           echo "Starting container: aiter_test"
+          docker rm -f aiter_test || true
 
           if [ -f "/etc/podinfo/gha-render-devices" ]; then
             DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
@@ -1200,6 +1218,7 @@ jobs:
       - name: Cleanup container
         if: always()
         run: |
+          docker exec aiter_test bash -lc "chown -R $(id -u):$(id -g) /workspace || true" || true
           docker rm -f aiter_test || true
           # Self-hosted runners are persistent: drop the registry credentials
           # written by the "Docker login" step so they do not outlive this job
@@ -1277,6 +1296,23 @@ jobs:
     runs-on: ${{ matrix.runner }}
 
     steps:
+      - name: Prepare persistent runner workspace
+        run: |
+          set +e
+          echo "Preparing workspace: ${GITHUB_WORKSPACE}"
+          docker exec aiter_test bash -lc "chown -R $(id -u):$(id -g) /workspace || true" || true
+          docker rm -f aiter_test >/dev/null 2>&1 || true
+
+          if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+            sudo chown -R "$(id -u):$(id -g)" "${GITHUB_WORKSPACE}" || true
+          elif command -v docker >/dev/null 2>&1; then
+            docker run --rm \
+              -v "${GITHUB_WORKSPACE}:/workspace" \
+              --entrypoint bash \
+              "${DOCKER_IMAGE}" \
+              -lc "chown -R $(id -u):$(id -g) /workspace || true" || true
+          fi
+
       - name: Checkout code
         uses: actions/checkout@v4
         with:
@@ -1391,6 +1427,7 @@ jobs:
         run: |
           set -ex
           echo "Starting container: aiter_test"
+          docker rm -f aiter_test || true
 
           if [ -f "/etc/podinfo/gha-render-devices" ]; then
             DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
@@ -1578,6 +1615,7 @@ jobs:
       - name: Cleanup container
         if: always()
         run: |
+          docker exec aiter_test bash -lc "chown -R $(id -u):$(id -g) /workspace || true" || true
           docker rm -f aiter_test || true
           # Self-hosted runners are persistent: drop the registry credentials
           # written by the "Docker login" step so they do not outlive this job
