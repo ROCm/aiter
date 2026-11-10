@@ -1073,6 +1073,14 @@ class PaDecodePipeline:
         scales = []
         masked_chunks = []
         v_scale_vecs = None
+        # Single-query head-256 decode without a window: only the task's
+        # peeled last tile can hold tokens past the context, so interior tiles
+        # skip the score mask. (On the page-16 V pipe the masks are free.)
+        score_mask = mask_tail or not (
+            self.traits.D256_PIPE
+            and self.traits.query_length == 1
+            and self.traits.sliding_window == 0
+        )
         for m in range_constexpr(self.traits.M_TILES):
             if const_expr(self.traits.is_bf16_kv):
                 scale = self.ctx.scale_qk
@@ -1084,7 +1092,14 @@ class PaDecodePipeline:
                 )
             scales.append(scale)
             chunks, v_scale_vecs = self.softmax.single_scores(
-                frag_Ss[m], scale, tile_valid, window_left, cur_kv_buf, scale_bounds, m
+                frag_Ss[m],
+                scale,
+                tile_valid,
+                window_left,
+                cur_kv_buf,
+                scale_bounds,
+                m,
+                score_mask,
             )
             masked_chunks.append(chunks)
         gpu.barrier()
@@ -1111,6 +1126,7 @@ class PaDecodePipeline:
                 cur_kv_buf,
                 norm_factor_b,
                 m,
+                score_mask,
             )
             m_new.append(m_new_m)
             corr_reg.append(corr_m)

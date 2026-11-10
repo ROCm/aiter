@@ -270,8 +270,18 @@ class PaDecodeSoftmax:
         return m_new_saved
 
     def single_scores(
-        self, frag_Ss, scale, tile_valid, window_left, cur_kv_buf, bounds, m
+        self,
+        frag_Ss,
+        scale,
+        tile_valid,
+        window_left,
+        cur_kv_buf,
+        bounds,
+        m,
+        masked=True,
     ):
+        """``masked=False``: the tile holds no token past any row's bound, so
+        the score mask is skipped (single-query decode, interior tiles)."""
         thr, window_thr = self.row_thresholds(tile_valid, window_left, m)
         neg4 = fx.full(
             4,
@@ -295,14 +305,20 @@ class PaDecodeSoftmax:
                     scaled_frag = scaled_frag * scale_b
                     masked_chunks.append(
                         self.score_mask(a, thr, window_thr).select(scaled_frag, neg4)
+                        if const_expr(masked)
+                        else scaled_frag
                     )
                 else:
                     scaled_frags.append(scaled_frag)
         else:
             if const_expr(self.traits.M1_SCALE_BEFORE_MASK):
                 masked_chunks = [
-                    self.score_mask(a, thr, window_thr).select(
-                        frag_Ss[a] * scale_b, neg4
+                    (
+                        self.score_mask(a, thr, window_thr).select(
+                            frag_Ss[a] * scale_b, neg4
+                        )
+                        if const_expr(masked)
+                        else frag_Ss[a] * scale_b
                     )
                     for a in range_constexpr(self.traits.NCHUNK)
                 ]
@@ -310,7 +326,11 @@ class PaDecodeSoftmax:
                 scaled_frags = frag_Ss
         if const_expr(not self.traits.M1_SCALE_BEFORE_MASK):
             masked_chunks = [
-                self.score_mask(a, thr, window_thr).select(scaled_frags[a], neg4)
+                (
+                    self.score_mask(a, thr, window_thr).select(scaled_frags[a], neg4)
+                    if const_expr(masked)
+                    else scaled_frags[a]
+                )
                 for a in range_constexpr(self.traits.NCHUNK)
             ]
         # pass 1: per-warp max for this qhead
@@ -649,6 +669,7 @@ class PaDecodeSoftmax:
         cur_kv_buf,
         norm_factor_b,
         m,
+        masked=True,
     ):
         # pass 2: global max over warps -> exp -> fp8 P pack (-> sP) -> sum.
         # M-tile m owns its Lmax, P and Lsum slots.
@@ -683,6 +704,10 @@ class PaDecodeSoftmax:
         for a in range_constexpr(self.traits.NCHUNK):
             if const_expr(self.traits.M1_SCALE_BEFORE_MASK):
                 Pa = fx.Vector(fx.exp2(masked_chunks[a] - m_new_b, fastmath="fast"))
+            elif const_expr(not masked):
+                Pa = fx.Vector(
+                    fx.exp2(masked_chunks[a] * scale - m_new_b, fastmath="fast")
+                )
             else:
                 # Finite mask sentinels require an explicit zero probability.
                 valid_a = masked_chunks[a] > fx.full(4, -1e29, fx.Float32)
