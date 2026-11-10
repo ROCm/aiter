@@ -72,6 +72,10 @@ def compile_pa_decode_ps_reduce(
     publishes the softmax weights to LDS, each group sums a contiguous chunk
     and group 0 adds the partials.
 
+    gfx950 replaces the ladder with one 32-partition rung whose loads issue
+    together, and above 32 live partitions issues each group's loads before
+    the weight barrier, as gfx1250 does.
+
     On gfx1250, rungs of more than 16 partitions split their loads across up
     to four groups: ``parallel_groups`` of them for register-only CTAs. Group 0
     still adds every weighted partial in partition order, so the result
@@ -140,6 +144,13 @@ def compile_pa_decode_ps_reduce(
     else:
         block = [wave, group_waves * groups, 1]
         dual_rungs = (1, 2, 4, 8, 16, DUAL_REGISTER_PARTITIONS)
+        if architecture == "gfx950":
+            # LLVM hoists a ladder's shared leading loads above the rung
+            # branch and waits on them there, then trickles the rest in small
+            # batches: 32 live partitions took several serial L2 round trips.
+            # One rung issues every load at once; partitions past the count
+            # read zeros from the per-sequence buffer bound.
+            dual_rungs = (DUAL_REGISTER_PARTITIONS,)
         # Group g owns partitions [g * R, (g + 1) * R) for the selected rung R.
         # Above 32 live partitions the first rung covers up to 64.
         per_group = -(-partitions // groups)
@@ -287,7 +298,8 @@ def compile_pa_decode_ps_reduce(
         else:
             unit = fx.thread_idx.x
         if fx.const_expr(
-            architecture in ("gfx1250", "gfx1250-strict") and (dual or groups > 1)
+            architecture in ("gfx1250", "gfx1250-strict", "gfx950")
+            and (dual or groups > 1)
         ):
             storage = fx.SharedAllocator().allocate(SharedStorage).peek()
 
@@ -379,6 +391,9 @@ def compile_pa_decode_ps_reduce(
             logits = [None] * rung
             for part in order:
                 logits[part] = _load_logits(fx.Int32(part), unit)
+            if fx.const_expr(architecture == "gfx950" and dual):
+                # Keep every statistics and partial load ahead of the waits.
+                fx.rocdl.sched_barrier(0)
             # Wave32 reductions broadcast statistics to every output lane,
             # including lanes without a live partition.
             offsets = _shuffle_offsets(
@@ -588,7 +603,11 @@ def compile_pa_decode_ps_reduce(
                         ladder_acc = _bottom_first(dual_rungs, _reduce_register, unit)
                         _store(ladder_acc, unit)
             else:
-                if fx.const_expr(architecture in ("gfx1250", "gfx1250-strict")):
+                # gfx950's LDS path otherwise loads partials only after the
+                # weight barrier, a second serial round trip.
+                if fx.const_expr(
+                    architecture in ("gfx1250", "gfx1250-strict", "gfx950")
+                ):
                     lds_acc = _top_first(lds_rungs, _reduce_lds_rung, unit, groups)
                 else:
                     lds_acc = _reduce_lds()
