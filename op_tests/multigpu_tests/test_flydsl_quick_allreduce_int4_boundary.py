@@ -31,10 +31,7 @@ set_start_method("spawn", force=True)
 
 from aiter.ops.flydsl.kernels.comm.allreduce_shared import WORLD
 
-try:
-    ARCH = get_gfx()
-except (KeyError, RuntimeError):
-    ARCH = None
+ARCH = get_gfx()
 SUPPORTED_ARCHS = ("gfx942", "gfx950")
 POST_EPS = 1e-6
 PRE_EPS = 1e-5
@@ -185,12 +182,8 @@ def _spawn(tp, cases):
             for rank in range(tp)
         ]
         ranks = [f.get(timeout=timeout) for f in futs]
-    except Exception:
-        pool.terminate()
-        raise
-    else:
-        pool.close()
     finally:
+        pool.terminate()
         pool.join()
     return ranks
 

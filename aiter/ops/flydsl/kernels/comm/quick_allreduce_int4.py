@@ -439,9 +439,7 @@ def make_quick_allreduce_int4_kernel(
         NORM_GROUP = (
             tile_atoms
             if NORM_LATENCY
-            else 2
-            if (world_size, super_tile) == (8, 1)
-            else 1
+            else 2 if (world_size, super_tile) == (8, 1) else 1
         )
     else:
         PackStorage = make_pack_storage(pack_i32)
@@ -940,24 +938,45 @@ def make_quick_allreduce_int4_kernel(
                 total = total + fx.Float32(fx.ptr_load(base + (w * tile_atoms + row)))
             return fmath.rsqrt(total * fx.Float32(INV_HIDDEN) + eps)
 
-        def _boundary_store_tile(tile, sub, own):
-            """Plain INT4 store, then the two-norm residual boundary.
+        def _boundary_branch_atoms(tile, sub, own):
+            """The reduced tile as bf16 atoms, rounded as the plain store rounds.
 
-            The store is the plain all-reduce epilogue, so the post-norm sees
-            the same bf16 values. ``out`` holds that branch only until the
-            pre-norm overwrites it. ``new_stream`` is the fp32 blend.
+            Peers' atoms are decoded from their all-gather packets. Our own
+            chunk is *own* (ST=1, still in registers), or was stored to
+            ``out`` by the reduce-scatter loop (ST=8) and is read back.
             """
-            _store_tile_atoms(tile, _recv_all_gather(sub, own))
-            rocdl.s_waitcnt(vmcnt=0)
-            gpu.barrier()
+            xbs = []
+            for atom in range_constexpr(tile_atoms):
+                src, k = atom // rank_atoms, atom % rank_atoms
+                if const_expr(src != self_rank):
+                    words, scale = _recv_quantized(
+                        PHASE_ALL_GATHER, fx.Int32(src), sub, k
+                    )
+                    xbs.append(
+                        _atom_f16_to_bf16(
+                            _codec_dequant(c, words, _ag_scale(scale), tid)
+                        )
+                    )
+                elif const_expr(own is not None):
+                    xbs.append(_atom_f16_to_bf16(own[k]))
+                else:
+                    xbs.append(_load_atom_bf16(out_rsrc, _atom_soff(tile, atom)))
+            return xbs
+
+        def _boundary_store_tile(tile, sub, own):
+            """Two-norm residual boundary over one reduced tile.
+
+            The reduced branch stays in registers as the bf16 values the plain
+            all-reduce would store; it is never written. The post-norm sums
+            are reduced per tile, then each row is blended and pre-normed with
+            its fp32 ``new_stream`` held in registers, so ``new_stream`` is
+            written once and not read back.
+            """
+            xbs = _boundary_branch_atoms(tile, sub, own)
 
             sq = fx.Float32(0.0)
             for atom in range_constexpr(tile_atoms):
-                x = (
-                    _load_atom_bf16(out_rsrc, _atom_soff(tile, atom))
-                    .bitcast(fx.BFloat16)
-                    .to(fx.Float32)
-                )
+                x = fx.Vector(xbs[atom]).bitcast(fx.BFloat16).to(fx.Float32)
                 if const_expr(POST_HAS_WEIGHT and POST_INPUT_SCALE):
                     x = x * _bf16_weight8(weight_rsrc, atom, post_gain)
                 sq = sq + (x * x).reduce(ReductionOp.ADD)
@@ -965,50 +984,56 @@ def make_quick_allreduce_int4_kernel(
                     sq = _park_sum(sq, atom // ATOMS_PER_ROW, red_ptr)
             gpu.barrier()
 
-            pre_sq = fx.Float32(0.0)
-            for atom in range_constexpr(tile_atoms):
-                row = atom // ATOMS_PER_ROW
-                if const_expr(atom % ATOMS_PER_ROW == 0):
-                    rstd = _row_rstd(row, red_ptr, norm_eps)
-                soff = _atom_soff(tile, atom)
-                x = _load_atom_bf16(out_rsrc, soff).bitcast(fx.BFloat16).to(fx.Float32)
-                if const_expr(POST_HAS_WEIGHT):
-                    post_w = _bf16_weight8(weight_rsrc, atom, post_gain)
-                    if const_expr(POST_INPUT_SCALE):
-                        x = x * post_w
-                y = x * fx.full(8, rstd, fx.Float32)
-                if const_expr(POST_HAS_WEIGHT and not POST_INPUT_SCALE):
-                    y = y * post_w
-                stream = _load_f32x8(stream_rsrc, _fp32_soff(tile, atom), soff)
-                if const_expr(GATE_STREAM):
-                    alpha = _coeff8(alpha_rsrc, atom)
-                else:
-                    alpha = fx.full(8, alpha_scalar, fx.Float32)
-                beta = _coeff8(beta_rsrc, atom)
-                new_stream = alpha * stream + beta * y
-                _store_f32x8(new_stream_rsrc, _fp32_soff(tile, atom), soff, new_stream)
-                z = new_stream
-                if const_expr(PRE_HAS_WEIGHT and PRE_INPUT_SCALE):
-                    z = z * _bf16_weight8(pre_weight_rsrc, atom, pre_gain)
-                pre_sq = pre_sq + (z * z).reduce(ReductionOp.ADD)
-                if const_expr((atom + 1) % ATOMS_PER_ROW == 0):
-                    pre_sq = _park_sum(pre_sq, row, red_pre_ptr)
-            gpu.barrier()
+            for row in range_constexpr(ROWS_PER_TILE):
+                rstd = _row_rstd(row, red_ptr, norm_eps)
+                streams = []
+                pre_sq = fx.Float32(0.0)
+                for j in range_constexpr(ATOMS_PER_ROW):
+                    atom = row * ATOMS_PER_ROW + j
+                    soff = _atom_soff(tile, atom)
+                    x = fx.Vector(xbs[atom]).bitcast(fx.BFloat16).to(fx.Float32)
+                    if const_expr(POST_HAS_WEIGHT):
+                        post_w = _bf16_weight8(weight_rsrc, atom, post_gain)
+                        if const_expr(POST_INPUT_SCALE):
+                            x = x * post_w
+                    y = x * fx.full(8, rstd, fx.Float32)
+                    if const_expr(POST_HAS_WEIGHT and not POST_INPUT_SCALE):
+                        y = y * post_w
+                    stream = _load_f32x8(stream_rsrc, _fp32_soff(tile, atom), soff)
+                    if const_expr(GATE_STREAM):
+                        alpha = _coeff8(alpha_rsrc, atom)
+                    else:
+                        alpha = fx.full(8, alpha_scalar, fx.Float32)
+                    beta = _coeff8(beta_rsrc, atom)
+                    new_stream = alpha * stream + beta * y
+                    _store_f32x8(
+                        new_stream_rsrc, _fp32_soff(tile, atom), soff, new_stream
+                    )
+                    streams.append(new_stream)
+                    z = new_stream
+                    if const_expr(PRE_HAS_WEIGHT and PRE_INPUT_SCALE):
+                        z = z * _bf16_weight8(pre_weight_rsrc, atom, pre_gain)
+                    pre_sq = pre_sq + (z * z).reduce(ReductionOp.ADD)
+                _park_sum(pre_sq, row, red_pre_ptr)
+                gpu.barrier()
 
-            for atom in range_constexpr(tile_atoms):
-                row = atom // ATOMS_PER_ROW
-                if const_expr(atom % ATOMS_PER_ROW == 0):
-                    pre_rstd = _row_rstd(row, red_pre_ptr, pre_eps)
-                soff = _atom_soff(tile, atom)
-                z = _load_f32x8(new_stream_rsrc, _fp32_soff(tile, atom), soff)
-                if const_expr(PRE_HAS_WEIGHT):
-                    pre_w = _bf16_weight8(pre_weight_rsrc, atom, pre_gain)
-                    if const_expr(PRE_INPUT_SCALE):
+                pre_rstd = _row_rstd(row, red_pre_ptr, pre_eps)
+                for j in range_constexpr(ATOMS_PER_ROW):
+                    atom = row * ATOMS_PER_ROW + j
+                    z = streams[j]
+                    if const_expr(PRE_HAS_WEIGHT):
+                        pre_w = _bf16_weight8(pre_weight_rsrc, atom, pre_gain)
+                        if const_expr(PRE_INPUT_SCALE):
+                            z = z * pre_w
+                    z = z * fx.full(8, pre_rstd, fx.Float32)
+                    if const_expr(PRE_HAS_WEIGHT and not PRE_INPUT_SCALE):
                         z = z * pre_w
-                z = z * fx.full(8, pre_rstd, fx.Float32)
-                if const_expr(PRE_HAS_WEIGHT and not PRE_INPUT_SCALE):
-                    z = z * pre_w
-                _store_atom_bf16(out_rsrc, soff, z.to(fx.BFloat16).bitcast(fx.Int32))
+                    _store_atom_bf16(
+                        out_rsrc,
+                        _atom_soff(tile, atom),
+                        z.to(fx.BFloat16).bitcast(fx.Int32),
+                    )
+            # The next tile's partials reuse ``red``.
             gpu.barrier()
 
         def _epilogue(tile, sub, res_pref=None, own=None):

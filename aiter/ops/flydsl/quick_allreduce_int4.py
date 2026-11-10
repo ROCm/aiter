@@ -1179,8 +1179,8 @@ class QuickAllReduceInt4:
         """INT4 all-reduce fused with a two-norm residual boundary.
 
         The post-norm consumes the bf16 values a plain ``allreduce`` would
-        have stored. ``out`` is that buffer until the pre-norm overwrites it,
-        so the reduced branch is not a result. In fp32::
+        have stored, kept in registers: the reduced branch is never written
+        to memory. In fp32::
 
             new_stream = alpha * residual_stream + beta * post_norm(reduced)
             out = pre_norm(new_stream)
