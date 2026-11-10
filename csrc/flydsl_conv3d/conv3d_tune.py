@@ -34,6 +34,7 @@ from aiter.ops.flydsl import flydsl_conv_implicit
 from aiter.ops.flydsl.conv3d_gfx1250 import (
     _clamp_num_buffers,
     _resolve_splitk_gfx1250,
+    fold_hw_gfx1250,
     prepare_operands_gfx1250,
     run_conv3d_gfx1250,
 )
@@ -202,6 +203,8 @@ def generate_data_gfx1250(
     groups,
     has_bias,
     padding,
+    stride,
+    dilation,
     out_dhw=None,
     seed=0,
     device=None,
@@ -220,7 +223,7 @@ def generate_data_gfx1250(
     """
     data = generate_data(n, c, d, h, w, k, kt, kh, kw, groups, has_bias, seed, device)
     x_tune, w_tune, w_packed = prepare_operands_gfx1250(
-        data["x"], data["weight"], padding, groups
+        data["x"], data["weight"], padding, groups, stride=stride, dilation=dilation
     )
     out = None
     if out_dhw is not None:
@@ -599,6 +602,12 @@ class Conv3dTuner(TunerCommon):
         else:
             cgp = _pad_channels(c // groups)
         crs = cgp * kt * kh * kw
+        # The window the kernel runs: a folded conv (fold_hw_gfx1250) is kT x 1 x 1.
+        kkh, kkw = kh, kw
+        if is_1250 and fold_hw_gfx1250(
+            c, groups, kh, kw, *params["stride"][1:], *params["dilation"][1:]
+        ):
+            crs, kkh, kkw = cgp * kt, 1, 1
 
         def splitk_for(tile, block_rows):
             # Use the policy's CU count and the runtime's final legality gate.
@@ -713,7 +722,13 @@ class Conv3dTuner(TunerCommon):
                     tile_m, tile_n, wave_m, wave_n, block_rows
                 )
                 gen = generate_data_gfx1250
-                gen_args = (*shape_args, params["padding"], tuple(out_dhw))
+                gen_args = (
+                    *shape_args,
+                    params["padding"],
+                    params["stride"],
+                    params["dilation"],
+                    tuple(out_dhw),
+                )
                 fn = run_flydsl_conv3d_gfx1250
                 fn_keys = ["x_tune", "w_tune", "w_packed", "bias", "out"]
                 output_keys = ("out",)
@@ -729,8 +744,8 @@ class Conv3dTuner(TunerCommon):
                         continue
                     tiles_per_split = (crs // tk) // max(1, sk)
                     if patch:
-                        nb0 = min(nb0, kh * kw)
-                        if patch_unsupported_gfx1250(kh, kw, sh, sw, sk, nb0):
+                        nb0 = min(nb0, kkh * kkw)
+                        if patch_unsupported_gfx1250(kkh, kkw, sh, sw, sk, nb0):
                             continue
                         unroll = False  # the patch loop unrolls the taps
                     nb = _clamp_num_buffers(
@@ -739,7 +754,7 @@ class Conv3dTuner(TunerCommon):
                         tile,
                         block_rows,
                         tile_k=tk,
-                        patch=(kh, kw, dh, dw) if patch else None,
+                        patch=(kkh, kkw, dh, dw) if patch else None,
                     )
                     if patch and nb == 2 and tk > CGP_ALIGN:
                         # The only patch variants that spilled VGPRs on the
@@ -755,8 +770,8 @@ class Conv3dTuner(TunerCommon):
                             tile_m,
                             tile_n,
                             block_rows,
-                            kh,
-                            kw,
+                            kkh,
+                            kkw,
                             dh,
                             dw,
                             num_buffers=nb,

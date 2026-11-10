@@ -133,6 +133,15 @@ python3 csrc/flydsl_conv3d/conv3d_tune.py -i $M/wan21_vae_bf16_untuned_conv3d.cs
    these columns, or with empty cells, run 2 buffers, no unroll, `tile_k=32`
    and no patch.
 
+   A gfx1250 conv whose kH x kW window fits one padded channel tile
+   (kH * kW * C/groups <= 32, groups 1, unit H/W stride and dilation, e.g.
+   C = 3 with 3 x 3) runs folded: the host writes channel (r * kW + s) * C + c
+   of each output pixel from input (h + r, w + s, c), and the kernel is a
+   kT x 1 x 1 conv over 32 channels. Its row keeps the caller's kH x kW as
+   the key; the tuner times the folded kernel. An NCDHW input with zeros
+   padding (symmetric on H/W, none on D) is transposed, padded and folded in
+   one FlyDSL pass.
+
    `splitK` is **not** swept: `_resolve_splitk` derives it per candidate and the
    tuner pins that value so the column records what ran. Every row of both VAE
    tables is `splitK=1`, and structurally so rather than by default -- a split
