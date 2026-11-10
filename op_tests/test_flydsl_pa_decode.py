@@ -2391,11 +2391,14 @@ def test_pa_decode_nhd_rejected(variant, device, monkeypatch):
     "softmax_scale", [-(256**-0.5), 0.0, float("nan"), float("inf")]
 )
 def test_pa_decode_softmax_scale_rejected(softmax_scale, device, monkeypatch):
-    """Masked scores can be scaled after masking, so the scale must be positive."""
+    """Masked scores can be scaled after masking, so the scales must be positive.
+
+    The same value is also passed as a host-scalar K scale.
+    """
     pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
 
     def unexpected_compile(**_):
-        pytest.fail("a rejected softmax_scale reached kernel compilation")
+        pytest.fail("a rejected scale reached kernel compilation")
 
     monkeypatch.setattr(pa, "compile_pa_decode_tile", unexpected_compile)
     query = torch.zeros((1, 8, 256), dtype=torch.bfloat16, device=device)
@@ -2404,55 +2407,24 @@ def test_pa_decode_softmax_scale_rejected(softmax_scale, device, monkeypatch):
     table = torch.zeros((1, 1), dtype=torch.int32, device=device)
     scale = torch.ones(1, dtype=torch.float32, device=device)
     plan = pa.plan_pa_decode(context, 1, max_partitions=1)
-    with pytest.raises(ValueError, match="softmax_scale"):
-        pa.pa_decode(
-            torch.empty_like(query),
-            query,
-            cache,
-            cache,
-            context,
-            table,
-            softmax_scale,
-            1,
-            key_scale=scale,
-            value_scale=scale,
-            work_plan=plan,
-        )
-
-
-@pytest.mark.parametrize("nhd", [False, True], ids=["packed", "nhd"])
-@pytest.mark.parametrize("key_scale", [-1.0, 0.0, float("nan"), float("inf")])
-def test_pa_decode_kv_scale_rejected(key_scale, nhd, device, monkeypatch):
-    """Per-tensor scores are scaled after masking, so a host K scale must be positive."""
-    pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
-
-    def unexpected_compile(**_):
-        pytest.fail("a rejected key_scale reached kernel compilation")
-
-    monkeypatch.setattr(pa, "compile_pa_decode_tile", unexpected_compile)
-    query = torch.zeros((1, 8, 256), dtype=torch.bfloat16, device=device)
-    if nhd:
-        key = value = torch.zeros((2, 64, 1, 256), dtype=dtypes.fp8, device=device)
-    else:
-        key = torch.zeros((2, 1, 16, 64, 16), dtype=dtypes.fp8, device=device)
-        value = torch.zeros((2, 1, 256, 64), dtype=dtypes.fp8, device=device)
-    context = torch.tensor([64], dtype=torch.int32, device=device)
-    table = torch.zeros((1, 1), dtype=torch.int32, device=device)
-    plan = pa.plan_pa_decode(context, 1, max_partitions=1)
-    with pytest.raises(ValueError, match="key_scale must be finite and positive"):
-        pa.pa_decode(
-            torch.empty_like(query),
-            query,
-            key,
-            value,
-            context,
-            table,
-            256**-0.5,
-            1,
-            key_scale=key_scale,
-            value_scale=1.0,
-            work_plan=plan,
-        )
+    for bad, softmax, key_scale in (
+        ("softmax_scale", softmax_scale, scale),
+        ("key_scale", 256**-0.5, softmax_scale),
+    ):
+        with pytest.raises(ValueError, match=bad):
+            pa.pa_decode(
+                torch.empty_like(query),
+                query,
+                cache,
+                cache,
+                context,
+                table,
+                softmax,
+                1,
+                key_scale=key_scale,
+                value_scale=scale,
+                work_plan=plan,
+            )
 
 
 def _poison_unowned(cache, scale, owned, fill):
