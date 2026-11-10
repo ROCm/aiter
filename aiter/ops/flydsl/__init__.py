@@ -12,13 +12,16 @@ from aiter.fused_moe_registry import register_fused_moe_impl
 
 from .moe_common import GateMode
 
-_MIN_FLYDSL_VERSION = Version("0.2.4")
+# 0.5.0 keys the JIT cache on the traced IR; aiter no longer adds its own key
+# material to separate configs, so an older FlyDSL would share their binaries.
+_MIN_FLYDSL_VERSION = Version("0.5.0")
 
 installed_flydsl_version = getattr(_flydsl, "__version__", None)
 if installed_flydsl_version is None:
     raise ImportError("`flydsl` is importable but its version cannot be determined.")
 
-_base_version = Version(installed_flydsl_version.split("+")[0])
+# base_version drops dev/local suffixes, so 0.5.0.dev1018 and 0.5.0+abc pass.
+_base_version = Version(Version(installed_flydsl_version).base_version)
 if _base_version < _MIN_FLYDSL_VERSION:
     raise ImportError(
         "Unsupported `flydsl` version: "
@@ -35,6 +38,7 @@ _LAZY_IMPORTS = {
         ".fp8_mqa_logits_kernels",
         "KERNEL_VARIANTS",
     ),
+    "OneShotAllReduce": (".one_shot_allreduce", "OneShotAllReduce"),
     "DenseGemmConfig": (".gemm_a16wfp4", "DenseGemmConfig"),
     "QuickAllReduceInt4": (".quick_allreduce_int4", "QuickAllReduceInt4"),
     "PreshuffledA16WFP4Weight": (
@@ -195,6 +199,7 @@ __all__ = [
     "DenseGemmConfig",
     "Fp4MqaPlan",
     "GateMode",
+    "OneShotAllReduce",
     "PreshuffledA16WFP4Weight",
     "QuickAllReduceInt4",
     "a16wfp4_shape_supported",

@@ -11,7 +11,8 @@ import torch
 
 import aiter
 from aiter import dtypes
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx, get_num_xcds
+from aiter.ops.triton.utils.device_info import get_num_sms
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
@@ -156,6 +157,43 @@ def check_bf16_gqa32_merges_only_written_splits() -> None:
     assert torch.isfinite(out).all(), "merged a split that stage 1 never wrote"
     checkAllclose(ref.float(), out.float(), msg="bf16 gqa32 short-KV multi-split")
     cal_diff(ref, out, "bf16 gqa32 short-KV multi-split")
+
+
+def check_fp8_gqa16_multi_tile_output() -> None:
+    """gfx950 fp8 gqa16 decode, one row with 3 KV tiles, after a cache flush.
+    A wave must not refill an LDS KV slot while another wave still reads V
+    from it. A cache flush before each call makes this race likely."""
+    nhead, kv_lora_rank, qk_head_dim, num_kv = 16, 512, 576, 65536
+    sm_scale = 1.0 / 16
+    one = torch.ones(1, dtype=torch.float)
+    q = (torch.randn((1, nhead, qk_head_dim)) * 3).to(dtypes.fp8)
+    kv_buffer = torch.randn((num_kv, qk_head_dim)).to(dtypes.fp8)
+    flush = torch.zeros(64 << 20)
+    out = torch.empty((1, nhead, kv_lora_rank), dtype=torch.bfloat16)
+    num_bad = 0
+    for kv_len in range(257, 385):
+        kv_indices = torch.randperm(num_kv)[:kv_len].int()
+        flush.sum()
+        aiter.mla.mla_decode_fwd(
+            q,
+            kv_buffer.view(-1, 1, 1, qk_head_dim),
+            out,
+            torch.arange(2, dtype=torch.int),
+            torch.tensor([0, kv_len], dtype=torch.int),
+            kv_indices,
+            torch.ones(1, dtype=torch.int),
+            1,
+            sm_scale=sm_scale,
+            q_scale=one,
+            kv_scale=one,
+            num_kv_splits=1,
+            num_kv_splits_indptr=torch.tensor([0, 1], dtype=torch.int),
+        )
+        k = kv_buffer[kv_indices.long()].float()
+        ref = torch.softmax(q[0].float() @ k.T * sm_scale, -1) @ k[:, :kv_lora_rank]
+        err = (out[0].float() - ref).abs().max() / ref.abs().max()
+        num_bad += int(err > 0.05)
+    assert num_bad == 0, f"{num_bad} of 128 rows wrong after a cache flush"
 
 
 def cal_diff(
@@ -802,7 +840,6 @@ def test_mla(
 
     # Gluon MLA decode test
     # Example: -c 16384 -b 64 128 -n 64,1 128,1 -d bf16 -kvd bf16
-    NUM_XCDS_GFX950 = 8
     BLOCK_H_GLUON = 64
     if (
         get_gfx() == "gfx950"
@@ -815,12 +852,14 @@ def test_mla(
         and batch_size in (64, 128, 256)
         and page_size == 1
     ):
+        # Match the wrapper's device-dependent split count.
+        num_xcds = get_num_xcds()
         base_grid = (
-            NUM_XCDS_GFX950
+            num_xcds
             * ((nhead + BLOCK_H_GLUON - 1) // BLOCK_H_GLUON)
-            * (batch_size // NUM_XCDS_GFX950)
+            * (batch_size // num_xcds)
         )
-        splits_needed = max(1, (256 + base_grid - 1) // base_grid)
+        splits_needed = max(1, (get_num_sms() + base_grid - 1) // base_grid)
         # Round up to a power of two: 1 << (n - 1).bit_length() for n >= 1.
         num_kv_splits = 1 << (splits_needed - 1).bit_length()
         # PIPELINE_STAGES=3, BLOCK_N=64 -> 192; mirror wrapper's bound.
@@ -1062,6 +1101,9 @@ def main():
         aiter.logger.info("mla_decode_stage1_asm_fwd width checks: passed")
         check_bf16_gqa32_merges_only_written_splits()
         aiter.logger.info("bf16 gqa32 short-KV multi-split merge: passed")
+    if get_gfx() == "gfx950":
+        check_fp8_gqa16_multi_tile_output()
+        aiter.logger.info("fp8 gqa16 multi-tile decode: passed")
 
     for nhead, decode_qlen in args.nhead:
         df = []

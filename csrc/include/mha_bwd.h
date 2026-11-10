@@ -326,8 +326,8 @@ struct __attribute__((packed)) fmha_bwd_odo_args
 };
 
 // dq_shuffle & dq_convert post process kernel args
-// The head/batch strides are 64-bit because gfx1250 loads them as such; the other archs read the
-// low 32 bits.
+// The head/batch strides are 64-bit because gfx1250 loads them as such, and gfx950 the dq_acc
+// ones; the other archs read the low 32 bits.
 struct __attribute__((packed)) fmha_bwd_post_kernel_args
 {
     void* ptr_dq_acc;

@@ -244,11 +244,8 @@ def _opus_fwd(gfx: str, op_gfx950, op_gfx1250):
     )
 
 
-# Split-K cuts each token's keys over num_kv_splits workgroups and folds them in a second
-# launch. While its workgroups fit in one wave (past it a split loses), a launch takes about
-# one workgroup's walk: a token's keys over the splits, in whole KV tiles. A split adds c0
-# keys for the reduce and c1 keys per partial row, N * H * S of them. Auto takes the count
-# that minimizes the sum.
+# Auto split cost in keys: one workgroup's walk (a token's keys over S splits, in whole KV tiles),
+# plus c0 + c1 * N * H * S to fold when split.
 class _SplitFit(NamedTuple):
     heads_per_wg: int
     kv_tile: int
@@ -256,16 +253,17 @@ class _SplitFit(NamedTuple):
     counts: tuple  # the split counts auto picks from
     c0: float
     c1: float
+    packed: float = 1.0  # walk factor past one workgroup per CU
 
 
 # The reduce gives each split a lane of one wave, so a wave32 arch caps the count.
 _MAX_KV_SPLITS = 32
 _ANY_COUNT = tuple(range(2, _MAX_KV_SPLITS + 1))
+# Split counts a gfx1250 v4.1 cluster folds in-kernel.
+_CLUSTER_COUNT = (2, 4, 8, 16)
 
-# (arch, kernel) -> fit. gfx950 fit on MI355X over topk 384-4096, N 8-768, H 16-128 and
-# 1-32 splits; gfx1250 over topk 512-4096, N 8-256, H 16-128 and 1-32 splits. v41_a8w4
-# 16mx1_16nx4 reuses the v41_a8w8 fit; its 16mx4_64nx1 is fit over topk 512-4096, N 8-256
-# and H 32-128.
+# (arch, kernel) -> fit over H 16-128, topk 384-4096 and N 8-768 on gfx950, topk 512-4096 and
+# N 8-256 on gfx1250. v41_a8w4_16mx1_16nx4 reuses the v41_a8w8 fit.
 _KV_SPLIT_FIT = {
     ("gfx950", "v4_a16w16_16mx1_16nx4"): _SplitFit(16, 64, 2, _ANY_COUNT, 90, 0.043),
     ("gfx950", "v4_a16w16_16mx8_32nx1"): _SplitFit(128, 32, 1, _ANY_COUNT, 0, 0.012),
@@ -281,8 +279,10 @@ _KV_SPLIT_FIT = {
     ("gfx1250", "v4_a8w8_16mx1_16nx4"): _SplitFit(16, 64, 1, _ANY_COUNT, 200, 0.12),
     ("gfx1250", "v4_a8w8_32mx1_16nx4"): _SplitFit(32, 64, 1, _ANY_COUNT, 200, 0.06),
     ("gfx1250", "v4_a8w8_16mx4_64nx1"): _SplitFit(64, 64, 1, _ANY_COUNT, 200, 0.06),
-    ("gfx1250", "v41_a8w8_16mx1_16nx4"): _SplitFit(16, 64, 1, _ANY_COUNT, 270, 0.10),
-    ("gfx1250", "v41_a8w8_16mx4_64nx1"): _SplitFit(64, 64, 1, _ANY_COUNT, 290, 0.045),
+    ("gfx1250", "v41_a8w8_16mx1_16nx4"): _SplitFit(
+        16, 64, 2, _CLUSTER_COUNT, 275, 0.03, 1.75
+    ),
+    ("gfx1250", "v41_a8w8_16mx4_64nx1"): _SplitFit(64, 64, 1, _CLUSTER_COUNT, 0, 0.05),
 }
 
 
@@ -305,10 +305,13 @@ def _auto_kv_splits(fit: _SplitFit, n: int, h: int, nnz: int, cu_num: int) -> in
     if n == 0:
         return 1
     keys = nnz / n
-    max_splits = fit.wgs_per_cu * cu_num // (n * -(-h // fit.heads_per_wg))
+    blocks = n * -(-h // fit.heads_per_wg)
+    max_splits = fit.wgs_per_cu * cu_num // blocks
 
     def cost(s: int) -> float:
         walk = -(-math.ceil(keys / s) // fit.kv_tile) * fit.kv_tile
+        if s > 1 and blocks * s > cu_num:
+            walk *= fit.packed
         return walk + (fit.c0 + fit.c1 * n * h * s if s > 1 else 0)
 
     return min([1, *(s for s in fit.counts if s <= max_splits)], key=cost)
@@ -809,7 +812,8 @@ def mla_sparse_prefill_v41(
       softmax_scale:     float scalar applied to the QK^T scores.
       out:               Optional ``[T, H, 512]`` bf16 output buffer; allocated
         if ``None``.
-      num_kv_splits:     as in :func:`mla_sparse_prefill` (opus only).
+      num_kv_splits:     as in :func:`mla_sparse_prefill` (opus only); on gfx1250,
+        2, 4, 8 or 16 fold in the same launch.
       backend:           ``"opus"`` or ``None``.
 
     Returns:
