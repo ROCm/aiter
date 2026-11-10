@@ -303,13 +303,24 @@ class PaDecodeSchedule:
                 # task to a few tiles, so windowed MTP splits on busier grids:
                 # FP8 always into single M-tiles, BF16 while four fit per CU.
                 if kv_dtype == fx.BFloat16:
-                    if query_length % 2 == 0 and 2 * split_workgroups <= (
-                        4 * num_compute_units
-                        if sliding_window > 0
-                        else (
-                            2 * num_compute_units
-                            if head_dim <= 64
-                            else num_compute_units
+                    if query_length % 2 == 0 and (
+                        2 * split_workgroups
+                        <= (
+                            4 * num_compute_units
+                            if sliding_window > 0
+                            else (
+                                2 * num_compute_units
+                                if head_dim <= 64
+                                else num_compute_units
+                            )
+                        )
+                        # Four D128 M-tiles hold 360 VGPRs; on busy grids two
+                        # split-major CTAs of two M-tiles share K/V and fit two
+                        # per CU (D192 and two-M-tile rows measured slower).
+                        or (
+                            head_dim == 128
+                            and query_length * query_group_size >= 4 * MFMA_MNK
+                            and split_workgroups > num_compute_units
                         )
                     ):
                         query_splits = 2
