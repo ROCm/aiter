@@ -3445,7 +3445,9 @@ def flash_attn_a8w8_m32x8_supported(
     elif block_table is not None:
         return False
     sink_supported = sink is None or (
-        torch.is_tensor(sink) and sink.dtype == torch.float32 and sink.shape == (num_q,)
+        torch.is_tensor(sink)
+        and sink.dtype == torch.float32
+        and sink.device == q.device
     )
     return (
         qk_hdim in SUPPORTED_QK_HDIM

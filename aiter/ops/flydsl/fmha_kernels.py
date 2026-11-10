@@ -861,6 +861,9 @@ def flydsl_flash_attn_paged_fwd(
     # return wrong numbers, so each one falls through.
     if logits_soft_cap != 0.0 or block_table is not None or seqlen_k is not None:
         return None
+    # Q is ragged thd-style [total_q, nheads_q, hdim]; the kernel indexes it as such.
+    if q.dim() != 3:
+        return None
     if any(t.stride(-1) != 1 for t in (q, k, v)):
         return None
     _metadata = (qo_indptr, kv_indptr, kv_page_indices, kv_last_page_lens)
@@ -871,6 +874,16 @@ def flydsl_flash_attn_paged_fwd(
         or t.stride(0) != 1
         or t.device != q.device
         for t in _metadata
+    ):
+        return None
+    # Batch comes from qo_indptr; the KV side must cover it. Lower bounds only, so an
+    # oversized preallocated buffer still dispatches. kv_page_indices is left to the
+    # kernel: checking it needs kv_indptr[-1], a device read that would sync here.
+    _batch = qo_indptr.numel() - 1
+    if (
+        _batch < 1
+        or kv_indptr.numel() < _batch + 1
+        or kv_last_page_lens.numel() < _batch
     ):
         return None
     if (

@@ -787,6 +787,11 @@ def _is_paged_layout_supported(k, v, kv_indptr, kv_page_indices, kv_last_page_le
     """The page pool and its metadata, as the gather loader needs them."""
     if k.dim() != v.dim() or k.dim() not in (3, 4):
         return False
+    # Launch geometry and the pool row count come from K alone, and the V view is built
+    # with K's row count, so a V pool with fewer blocks, a smaller page or fewer heads
+    # reads the wrong rows and runs off the end. hdim may still differ between them.
+    if k.shape[:-1] != v.shape[:-1]:
+        return False
     meta = (kv_indptr, kv_page_indices, kv_last_page_lens)
     if any(t is None for t in meta) or any(t.dtype != torch.int32 for t in meta):
         return False
