@@ -66,6 +66,15 @@ from aiter.ops.opus import moe_stage2_a8w4 as _opus_a8w4
 from aiter.ops.opus.moe_stage1_a8w4 import (
     opus_a8w4_stage1_wrapper as _opus_a8w4_stage1_wrapper,
 )
+from aiter.presorted_moe import (  # noqa: F401  register_presorted_moe is public
+    aux_sort_capacity,
+    bytes_overlap,
+    drop_presort_on_error,
+    match_presorted_moe,
+    pop_presorted_moe,
+    presorted_moe_ignored,
+    register_presorted_moe,
+)
 
 
 @functools.lru_cache(maxsize=1)
@@ -343,8 +352,7 @@ def _adaptive_moe_sort(
     device = topk_ids.device
     M = topk_ids.shape[0]
     BM = block_size
-    active = min(num_experts, M * topk)
-    max_sorted = (((M * topk + active * (BM - 1)) + BM - 1) // BM) * BM
+    max_sorted = aux_sort_capacity(M, topk, num_experts, BM)
 
     sorted_token_ids = torch.empty(max_sorted, dtype=dtypes.i32, device=device)
     sorted_expert_ids = torch.empty(max_sorted // BM, dtype=dtypes.i32, device=device)
@@ -408,6 +416,7 @@ def _adaptive_moe_sort(
 #     ... + reduce mode (non-EP)                yes        buffer is born in fused_moe_2stages
 #     FLAT 1stage (tuned flat=1/2)              no         kernel needs 8 spare bytes past the rows
 #     adaptive-aux sort (a4w4, atomic)          no         parameter not threaded yet
+#     caller presort (register_presorted_moe)   yes        zeroed here unless caller did
 #     grouped a4w4/a8w4 (gfx1250)               no         callee has no out param
 #
 # Not in-place => _return_output copies, so the contract holds either way;
@@ -433,10 +442,7 @@ def _validate_output_buffer_no_overlap(output, hidden_states):
     if output is None:
         return
     # Accumulate mode zeroes the output rows before stage1 reads hidden_states.
-    if (
-        output.data_ptr() < hidden_states.data_ptr() + hidden_states.nbytes
-        and hidden_states.data_ptr() < output.data_ptr() + output.nbytes
-    ):
+    if bytes_overlap(output, hidden_states):
         raise RuntimeError(
             "output overlaps hidden_states, which moe_sorting zeroes before stage1 "
             "reads it"
@@ -1136,6 +1142,7 @@ def resolve_activation_dtype(
     return q_dtype_a
 
 
+@drop_presort_on_error
 def fused_moe(
     hidden_states,
     w1,  # [expert(local_expert:EP), inter_dim*2, dim] N,K
@@ -1526,6 +1533,9 @@ def _fused_moe_impl(
     _stage2_override: Callable | None = None,
     _enforce_metadata_block_size: bool = False,
 ) -> torch.Tensor:
+    # Consume a caller's presort first, so every path (including early returns
+    # and errors) clears it.
+    presorted_aux = pop_presorted_moe()
     # We do such convert since custom_op schema restriction on block_size_M, and Enum type
     activation = ActivationType(activation)
     quant_type = QuantType(quant_type)
@@ -1552,6 +1562,13 @@ def _fused_moe_impl(
         if expert_mask is not None or stage2_scatter is not None or doweight_stage1:
             raise ValueError(
                 "HERD routing requires unmasked routes and doweight_stage1=False"
+            )
+        from aiter.ops.flydsl.kernels.moe_herd_route_psum import HERD_ROUTE_BLOCK
+
+        if M > HERD_ROUTE_BLOCK:
+            raise ValueError(
+                f"herd_topk takes at most {HERD_ROUTE_BLOCK} tokens, got {M}; "
+                "AITER_FLYDSL_HERD_MAX_M must not exceed it"
             )
         topk = herd_topk
     E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
@@ -1591,25 +1608,6 @@ def _fused_moe_impl(
         output, (M, model_dim), dtype, hidden_states.device
     )
     _validate_output_buffer_no_overlap(output, hidden_states)
-    if herd_topk:
-        from aiter.ops.flydsl.grouped_moe_gfx1250 import (
-            _FUSED_ROUTE_PSUM_MAX_EXPERTS,
-        )
-        from aiter.ops.flydsl.herd_topk import herd_finalize_candidates
-
-        # The grouped MoE drops inside its one-workgroup route kernel, which
-        # keeps one LDS slot per expert; wider MoEs finish HERD here instead.
-        if E > _FUSED_ROUTE_PSUM_MAX_EXPERTS:
-            # Pad rows past num_local_tokens leave as ids -1, which the grouped
-            # MoE route skips like any other unrouted row.
-            topk_weight, topk_ids = herd_finalize_candidates(
-                topk_weight,
-                topk_ids,
-                E,
-                herd_routed_scaling_factor,
-                num_valid_rows=num_local_tokens,
-            )
-            herd_topk = 0
     quant_type = quant_remap.get(quant_type, quant_type)
     q_dtype_w = w1.dtype
     q_dtype_a = resolve_activation_dtype(
@@ -1897,6 +1895,8 @@ def _fused_moe_impl(
             f"{metadata.block_m}; moe_sorting and both gemm tiles share this size"
         )
     block_size_M = metadata.block_m if block_size_M is None else block_size_M
+    if presorted_aux and not metadata.output_aux:
+        presorted_moe_ignored("the selected MoE pipeline takes no BM=16 aux sort")
     asm_mode = AsmMoeMode(metadata.flat)
     if metadata.full_impl is not None:
         full_output = metadata.full_impl(
@@ -2042,32 +2042,80 @@ def _fused_moe_impl(
             if _is_mxmoe_opus_metadata(metadata)
             else parse_g2_kname_any(_kn2)["atomic"]
         )
-        # BM16's adaptive sort already emits routes and zeroes the output without
-        # quantizing. Keep the Opus crossover for the configured aux pipeline.
-        sorting_ret = moe_sorting(
+        # The presort layout has to match both the selected kernels' tile size
+        # and the block size the stages are given, which a caller's
+        # block_size_M can override.
+        presorted = match_presorted_moe(
+            presorted_aux,
             topk_ids,
             topk_weight,
-            global_E,
-            model_dim,
-            dtype,
-            block_size_M,
-            expert_mask,
-            num_local_tokens,
-            return_local_topk_ids=need_local_topk_ids,
-            accumulate=_atomic and not runtime_stage2_reduce,
-            output_aux=metadata.output_aux,
+            block_m=metadata.block_m,
+            num_experts=global_E,
+            topk=topk,
+            stage_block_m=block_size_M,
+            expert_mask=expert_mask,
+            num_local_tokens=num_local_tokens,
             output=output,
         )
-        (
-            sorted_ids,
-            sorted_weights,
-            sorted_expert_ids,
-            num_valid_ids,
-            moe_buf,
-            sort_m_indices,
-            sort_reverse_sorted,
-        ) = sorting_ret[:7]
-        local_topk_ids = sorting_ret[7] if need_local_topk_ids else None
+        if presorted is not None:
+            sorted_ids = presorted["sorted_token_ids"]
+            sorted_weights = presorted["sorted_weights"]
+            sorted_expert_ids = presorted["sorted_expert_ids"]
+            num_valid_ids = presorted["num_valid_ids"]
+            sort_m_indices = presorted["m_indices"]
+            sort_reverse_sorted = presorted["reverse_sorted"]
+            if _atomic and not runtime_stage2_reduce:
+                # Atomic GEMM2 accumulates with 4-byte atomics and faults on an
+                # output at an odd bf16 element, so such an output gets a fresh
+                # moe_buf and _return_output copies back.
+                in_place = output is not None and output.data_ptr() % 4 == 0
+                moe_buf = (
+                    output
+                    if in_place
+                    else torch.empty(
+                        (M, model_dim), dtype=dtype, device=topk_ids.device
+                    )
+                )
+                # Atomic GEMM2 needs a zeroed destination; skip the zeroing only
+                # if the caller zeroed this exact output. A buffer allocated here
+                # can reuse a freed block at the same address, so always zero it.
+                if not (
+                    in_place
+                    and presorted.get("moe_buf_zeroed")
+                    and int(presorted.get("moe_buf_ptr", 0)) == output.data_ptr()
+                ):
+                    moe_buf.zero_()
+            else:
+                moe_buf = torch.empty((0, 0), dtype=dtype, device=topk_ids.device)
+            local_topk_ids = None
+        else:
+            # BM16's adaptive sort already emits routes and zeroes the output
+            # without quantizing. Keep the Opus crossover for the configured aux
+            # pipeline.
+            sorting_ret = moe_sorting(
+                topk_ids,
+                topk_weight,
+                global_E,
+                model_dim,
+                dtype,
+                block_size_M,
+                expert_mask,
+                num_local_tokens,
+                return_local_topk_ids=need_local_topk_ids,
+                accumulate=_atomic and not runtime_stage2_reduce,
+                output_aux=metadata.output_aux,
+                output=output,
+            )
+            (
+                sorted_ids,
+                sorted_weights,
+                sorted_expert_ids,
+                num_valid_ids,
+                moe_buf,
+                sort_m_indices,
+                sort_reverse_sorted,
+            ) = sorting_ret[:7]
+            local_topk_ids = sorting_ret[7] if need_local_topk_ids else None
     elif fused_sort_quant:
         (
             sorted_ids,
@@ -2527,6 +2575,8 @@ fused_moe_1stage_dict = {
     {
         (ActivationType.Silu,    QuantType.per_1x32,   dtypes.bf16,   dtypes.fp4x2,  dtypes.fp4x2,    True,   False) : aiter.fmoe_g1u1,
         (ActivationType.Situv2,  QuantType.per_1x32,   dtypes.bf16,   dtypes.bf16,   dtypes.fp4x2,    True,   False) : aiter.fmoe_g1u1,
+        (ActivationType.Swiglu,  QuantType.per_1x32,   dtypes.bf16,   dtypes.fp4x2,  dtypes.fp4x2,    True,   False) : aiter.fmoe_g1u1,
+        (ActivationType.Swiglu,  QuantType.per_1x32,   dtypes.bf16,    dtypes.bf16,  dtypes.fp4x2,    True,   False) : aiter.fmoe_g1u1,
         (ActivationType.Silu,   QuantType.per_1x128,   dtypes.bf16,     dtypes.fp8,    dtypes.fp8,    True,   False) : aiter.fmoe_fp8_blockscale_g1u1,
         (ActivationType.Gelu,   QuantType.per_1x128,   dtypes.bf16,     dtypes.fp8,    dtypes.fp8,    True,   False) : aiter.fmoe_fp8_blockscale_g1u1,
         (ActivationType.Silu,   QuantType.per_Token,   dtypes.bf16,    dtypes.bf16,   dtypes.bf16,   False,   False) : aiter.fmoe,
@@ -4531,18 +4581,63 @@ def get_2stage_cfgs(
             f"{keys} in {tune_file}"
         )
 
-    # Asm 1-stage kernels exist for Silu/Gelu and for gfx950 MXFP4 SiTUv2 FLAT.
+    # Asm 1-stage kernels exist for Silu/Gelu and for gfx950 MXFP4 SiTUv2 and
+    # SwiGLU OAI FLAT.
     if (
         cfg is not None
         and cfg.get("run_1stage", False)
         and activation
-        not in (ActivationType.Silu, ActivationType.Gelu, ActivationType.Situv2)
+        not in (
+            ActivationType.Silu,
+            ActivationType.Gelu,
+            ActivationType.Situv2,
+            ActivationType.Swiglu,
+        )
     ):
         cfg = None
         logger.warning(
             f"[fused_moe] discarding 1-stage tuned config for unsupported "
             f"activation {activation}; using default heuristics"
         )
+
+    # The SwiGLU OAI FLAT asm kernels hard-code alpha=1.702 / limit=7.0, take
+    # GGUU (separated) gate/up weights and have no per-expert bias input. The
+    # 1-stage launch does not forward bias or swiglu_limit, so a row that does
+    # not match the call would silently compute a different function.
+    # They also read raw top-k routing (flat=1). Only a named flat=1 row makes
+    # fused_moe skip the host moe_sorting; an unnamed row would let fmoe_g1u1
+    # pick a FLAT kernel heuristically and hand it host-sorted ids.
+    if (
+        cfg is not None
+        and cfg.get("run_1stage", False)
+        and activation == ActivationType.Swiglu
+    ):
+        swiglu_kernel1 = cfg.get("kernelName1", "")
+        if not isinstance(swiglu_kernel1, str):  # pandas reads a blank cell as NaN
+            swiglu_kernel1 = ""
+        try:
+            swiglu_flat = int(cfg.get("flat", AsmMoeMode.SORTED))
+        except (TypeError, ValueError):  # blank (NaN) flat cell
+            swiglu_flat = AsmMoeMode.SORTED
+        unsupported = None
+        if not swiglu_kernel1.strip():
+            unsupported = "empty kernelName1 (FLAT kernels need an explicit name)"
+        elif swiglu_flat != AsmMoeMode.NO_SORT:
+            unsupported = f"flat={cfg.get('flat')} (FLAT kernels need flat=1)"
+        elif has_stage1_bias or has_stage2_bias:
+            unsupported = "per-expert bias"
+        elif swiglu_limit is not None and float(swiglu_limit) != 7.0:
+            unsupported = f"swiglu_limit={swiglu_limit} (kernel uses 7.0)"
+        elif gate_mode != GateMode.SEPARATED:
+            unsupported = f"gate mode {gate_mode.value!r}"
+        elif gate_up_interleave:
+            unsupported = "gate/up-interleaved (GUGU) weights"
+        if unsupported is not None:
+            cfg = None
+            logger.warning(
+                f"[fused_moe] discarding SwiGLU OAI 1-stage asm config for {keys}: "
+                f"unsupported {unsupported}; using default heuristics"
+            )
 
     use_non_temporal_load = False
     if cfg is None or bypass_tuned_config:
@@ -5858,7 +5953,14 @@ def fused_moe_2stages(
     return moe_out if _stage2_override is None else stage2_output
 
 
-def torch_moe_act(act_input, torch_act, inter_dim):
+def torch_moe_act(act_input, torch_act, inter_dim, activation=None):
+    # OAI SwiGLU is a gated (g1u1) activation with its own formula; it has no
+    # single-input torch_act, so it must never reach torch_act below.
+    if activation == ActivationType.Swiglu:
+        if act_input.shape[-1] != 2 * inter_dim:
+            raise NotImplementedError("ActivationType.Swiglu requires g1u1 weights")
+        gate, up = act_input.split([inter_dim, inter_dim], dim=-1)
+        return swiglu(gate, up)
     if act_input.shape[-1] == inter_dim:
         return torch_act(act_input)
     else:
@@ -5992,7 +6094,9 @@ def torch_moe(
                 sub_tokens = sub_tokens * (fc1_smooth_scale[E_id])
 
             act_input = sub_tokens @ (w1[E_id].transpose(0, 1))
-            act_out = torch_moe_act(act_input, torch_act, inter_dim)
+            act_out = torch_moe_act(
+                act_input, torch_act, inter_dim, activation=activation
+            )
             if fc2_smooth_scale is not None:
                 act_out = act_out * (fc2_smooth_scale[E_id])
             out[mask] = act_out @ (w2[E_id].transpose(0, 1))
