@@ -17,7 +17,7 @@ This is the explicit FlyDSL-side test complementing the routed a16w4 rows of
 API.
 
 Run:
-    pytest op_tests/flydsl_tests/test_flydsl_moe_a16wfp4.py -q
+    python3 -m pytest -q op_tests/test_flydsl_moe_a16wfp4.py
 """
 
 import pytest
@@ -126,3 +126,119 @@ def test_flydsl_a16wfp4_situv2_e2e(
     assert not out.isnan().any().item(), "a16w4 SiTUv2 output contains NaN"
     ld = _cos_diff(ref.float(), out.float())
     assert ld < 1e-2, f"a16w4 SiTUv2 cos/logits_diff too large: {ld:.3e}"
+
+
+def _layout_case(gate_up, E=16, token=1, model_dim=3584, inter_dim=384, topk=16):
+    """Small a16w4 SiTUv2 problem, with w1 in the requested preshuffle."""
+    dtype = dtypes.bf16
+    torch.manual_seed(0)
+    inp = torch.randn((token, model_dim), dtype=dtype, device="cuda")
+    w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtype, device="cuda")
+    w2 = torch.randn((E, model_dim, inter_dim), dtype=dtype, device="cuda")
+    score = torch.randn((token, E), dtype=dtype, device="cuda")
+    topk_weights, topk_ids = fused_topk(inp, score, topk, True)
+
+    tq = aiter.get_torch_quant(QuantType.per_1x32)
+    w1_qt, w1_scale = tq(w1, quant_dtype=dtypes.fp4x2)
+    w2_qt, w2_scale = tq(w2, quant_dtype=dtypes.fp4x2)
+    w1_qt = w1_qt.view(E, inter_dim * 2, model_dim // 2)
+    w2_qt = w2_qt.view(E, model_dim, inter_dim // 2)
+    return {
+        "inp": inp,
+        "token": token,
+        "topk": topk,
+        "inter_dim": inter_dim,
+        "dtype": dtype,
+        "topk_weights": topk_weights,
+        "topk_ids": topk_ids,
+        "w1_qt": w1_qt,
+        "w2_qt": w2_qt,
+        "w1_scale_e": w1_scale.view(E, inter_dim * 2, model_dim // 32),
+        "w2_scale_e": w2_scale.view(E, model_dim, inter_dim // 32),
+        "w1": shuffle_weight_a16w4(w1_qt, 16, gate_up),
+        "w2": shuffle_weight_a16w4(w2_qt, 16, False),
+        "w1_scale": shuffle_scale_a16w4(w1_scale, E, gate_up),
+        "w2_scale": shuffle_scale_a16w4(w2_scale, E, False),
+    }
+
+
+def _call_fused(case, gate_mode):
+    return fused_moe(
+        case["inp"],
+        case["w1"],
+        case["w2"],
+        case["topk_weights"],
+        case["topk_ids"],
+        w1_scale=case["w1_scale"],
+        w2_scale=case["w2_scale"],
+        quant_type=QuantType.per_1x32,
+        activation=ActivationType.Situv2,
+        doweight_stage1=False,
+        gate_mode=gate_mode,
+        beta=4.0,
+        linear_beta=25.0,
+    )
+
+
+@_SKIP
+def test_a16w4_situv2_rejects_interleave_gate_mode():
+    """GGUU bytes with gate_mode=INTERLEAVE is the layout the port does not read."""
+    case = _layout_case(gate_up=False)
+    assert case["w1"].gate_up_interleave is False
+    with pytest.raises(NotImplementedError, match="gate/up-interleaved"):
+        _call_fused(case, GateMode.INTERLEAVE.value)
+
+
+@_SKIP
+def test_a16w4_situv2_rejects_tagged_gugu_w1():
+    """shuffle_weight_a16w4(..., True) tags GUGU; SEPARATED does not make it readable."""
+    case = _layout_case(gate_up=True)
+    assert case["w1"].gate_up_interleave is True
+    with pytest.raises(NotImplementedError, match="gate/up-interleaved"):
+        _call_fused(case, GateMode.SEPARATED.value)
+
+
+@_SKIP
+def test_a16w4_situv2_untagged_gugu_runs_and_disagrees():
+    """Dropping the tag hides GUGU bytes. The port then runs and the output is wrong.
+
+    Layout errors are not detectable from the bytes, which is why callers have
+    to keep the tag. logits_diff > 0.5 is the observed near-orthogonal result.
+    """
+    case = _layout_case(gate_up=True)
+    w1 = case["w1"].detach().clone()
+    w1.is_shuffled = True
+    assert getattr(w1, "gate_up_interleave", None) is None
+    case["w1"] = w1
+
+    ref_dtype = case["dtype"]
+    o1 = torch_moe_stage1(
+        case["inp"].to(ref_dtype),
+        case["w1_qt"].view(dtypes.fp4x2),
+        case["w2_qt"].view(dtypes.fp4x2),
+        case["topk_weights"],
+        case["topk_ids"],
+        dtype=ref_dtype,
+        activation=ActivationType.Situv2,
+        quant_type=QuantType.per_1x32,
+        a1_scale=None,
+        w1_scale=case["w1_scale_e"],
+        doweight=False,
+        situ_beta=4.0,
+        situ_linear_beta=25.0,
+    )
+    ref = torch_moe_stage2(
+        o1.view(case["token"], case["topk"], case["inter_dim"]),
+        case["w1_qt"].view(dtypes.fp4x2),
+        case["w2_qt"].view(dtypes.fp4x2),
+        case["topk_weights"],
+        case["topk_ids"],
+        dtype=ref_dtype,
+        quant_type=QuantType.per_1x32,
+        w2_scale=case["w2_scale_e"],
+        a2_scale=None,
+        doweight=True,
+    )
+    out = _call_fused(case, GateMode.SEPARATED.value)
+    ld = _cos_diff(ref.float(), out.float())
+    assert ld > 0.5, f"untagged GUGU was not detected by the score: {ld:.3e}"
