@@ -23,7 +23,8 @@ reads), nine 1M-token requests whose packed K/V exceed 4 GiB (the last, a
 4 GiB - 1 MiB limit (raw direct, and union with gated raw direct at 768 rows on
 gfx942 and 1536 rows on gfx950), ragged batches with an empty request, HK > 1
 (HK = 16 with over 4096 tasks to route), T = 256/768/1024 selections and constant
-Q/K whose logits sit near +1e11 on the union path (``large_logits``).
+Q/K whose logits sit near +1e11 on the union path (``large_logits``; on gfx950 the
+2048-row chunk, which must run union tiles there).
 Each graph case captures a layout on its own stream, replays it after rewriting
 its indices in place, then again after another layout grows the stream's scratch
 arena, which must keep the captured scratch allocated. The
@@ -145,17 +146,23 @@ FUNCTIONAL_CASES = {
 }
 # name -> (shape as above, (Q, K)): constant Q/K and V = 1, so O = 1. Logits near
 # +1e11 check union centering, which an FMA against the rounded row max overflowed.
+# The 768-row prefill takes union tiles on gfx942 and direct tiles only on gfx950;
+# the 2048-row chunk clears gfx950's 1536-row union gate.
 CONSTANT_CASES = {
     "large_logits_prefill_768": (((768,), (0,), 1, "shared", 512), (65536.0, 66048.0)),
+    "large_logits_chunk_2048_ctx_30720": (
+        ((2048,), (28672,), 1, "shared", 512),
+        (65536.0, 66048.0),
+    ),
 }
 # Performance: one full prefill of 1k-32k tokens, plus the 12000-token serving prompt.
 PERF_CASES = {
     f"prefill_{tokens}": ((tokens,), (0,), 1, "correlated", 512)
     for tokens in (1024, 2048, 4096, 8192, 12000, 16384, 32768)
 }
-# Layouts of the strided, kv_slots and graph cases only (last, so earlier cases keep
-# their seeds): the 1024-row chunk takes union tiles on gfx942 only, the 2048-row chunks
-# also clear gfx950's 1536-row union gate.
+# Layouts of the strided, kv_slots and graph cases, also run as functional cases (last,
+# so earlier cases keep their seeds): the 1024-row chunk takes union tiles on gfx942
+# only, the 2048-row chunks also clear gfx950's 1536-row union gate.
 STRIDE_LAYOUTS = {
     "hk2_chunk_1024_ctx_8192": ((1024,), (7168,), 2, "shared", 512),
     "chunk_2048_ctx_30720": ((2048,), (28672,), 1, "shared", 512),
@@ -183,9 +190,13 @@ UNION_CASES = {
 CASES = {
     **FUNCTIONAL_CASES,
     **PERF_CASES,
-    **{name: shape for name, (shape, _) in CONSTANT_CASES.items()},
+    "large_logits_prefill_768": CONSTANT_CASES["large_logits_prefill_768"][0],
     **STRIDE_LAYOUTS,
     **UNION_CASES,
+    # last, as above
+    "large_logits_chunk_2048_ctx_30720": CONSTANT_CASES[
+        "large_logits_chunk_2048_ctx_30720"
+    ][0],
 }
 # Layouts whose calls must keep union tiles on gfx950, and those that must build a union
 # plan there whose direct side reads the raw K/V (gated raw direct); gfx942's route is
@@ -194,6 +205,7 @@ UNION_LAYOUTS = {
     "chunk_2048_ctx_30720",
     "hk2_chunk_2048_ctx_8192",
     "ragged_4_rows_2986",
+    "large_logits_chunk_2048_ctx_30720",
 }
 RAW_DIRECT_LAYOUTS = {"chunk_1536_ctx_8386560"}
 # name -> (RAW_DIRECT_LAYOUTS layout, route forced through AITER_QSA_PLATFORM): every
@@ -1571,7 +1583,7 @@ def main():
     for suite, cases, test in (
         (
             "functional",
-            [*FUNCTIONAL_CASES, *CONSTANT_CASES, *UNION_CASES],
+            [*FUNCTIONAL_CASES, *CONSTANT_CASES, *STRIDE_LAYOUTS, *UNION_CASES],
             test_qsa_sparse_attention,
         ),
         ("route", list(ROUTE_CASES), test_qsa_route),
