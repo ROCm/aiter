@@ -311,7 +311,22 @@ def compile_pa_decode_tile(
 
     @fx.struct
     class SharedStorage:
-        buf: fx.Array[fx.Int32, traits.total_bytes // 4, 16]
+        buf: fx.Array[
+            fx.Int32,
+            (
+                max(
+                    2 * traits.GROUP_LDS_BYTES,
+                    # Dual-group merge: (O, m, l) per group-1 lane.
+                    traits.BLOCK_THREADS
+                    * (traits.VHE_CHUNKS * traits.OP_ELEMS + 2)
+                    * 4,
+                )
+                if traits.DUAL_GROUP
+                else traits.total_bytes
+            )
+            // 4,
+            16,
+        ]
 
     @flyc.jit
     def _pa_decode_tile_task(
@@ -374,9 +389,9 @@ def compile_pa_decode_tile(
         query_splits=traits.query_splits,
         direct_output=traits.DIRECT,
         stage_pages=traits.stage_page_capacity if traits.MXFP4 else 0,
-    )
+    ) + ("_dual" if traits.DUAL_GROUP else "")
 
-    @flyc.kernel(name=kernel_name, known_block_size=(traits.BLOCK_THREADS, 1, 1))
+    @flyc.kernel(name=kernel_name, known_block_size=(traits.CTA_THREADS, 1, 1))
     def pa_decode_tile_kernel(
         pmax_ptr: fx.Pointer,
         psum_ptr: fx.Pointer,
@@ -431,9 +446,9 @@ def compile_pa_decode_tile(
             )
             out = fx.recast_iter(traits.Q_DTYPE, pout_ptr)
             for it in range_constexpr(
-                -(-traits.CTA_ROWS * row_units // traits.BLOCK_THREADS)
+                -(-traits.CTA_ROWS * row_units // traits.CTA_THREADS)
             ):
-                unit = tid + it * traits.BLOCK_THREADS
+                unit = tid + it * traits.CTA_THREADS
                 if unit < traits.CTA_ROWS * row_units:
                     row = first_row + unit // row_units
                     query_pos = row // traits.query_group_size
@@ -563,7 +578,7 @@ def compile_pa_decode_tile(
                         1,
                     )
                 ),
-                block=(traits.BLOCK_THREADS, 1, 1),
+                block=(traits.CTA_THREADS, 1, 1),
                 stream=stream,
             )
 

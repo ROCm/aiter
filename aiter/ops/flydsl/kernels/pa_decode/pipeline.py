@@ -321,7 +321,7 @@ class PaDecodePipeline:
         self.ctx.init_context_length()
         self.kv.init_page_table()
         self.ctx.init_partition_bounds()
-        self.lds.allocate()
+        self.lds.allocate(self.ctx.group)
         self.kv.init_scale_loaders()
         if const_expr(self.traits.stage_page_capacity):
             self.kv.stage_page_ids()
@@ -358,8 +358,67 @@ class PaDecodePipeline:
         o_final = self.mainloop(k_pf0, v_page_pf0, q_ops_all, pages1)
         if const_expr(self.traits.MXFP4):
             self.epilogue.store_mxfp4(o_final)
+        elif const_expr(self.traits.DUAL_GROUP):
+            o_final = self.merge_groups(o_final)
+            if self.ctx.group == 0:
+                self.epilogue.store(o_final)
         else:
             self.epilogue.store(o_final)
+
+    def publish_group_state(self, o_final, slot):
+        """Write this lane's (O, m, l) at byte ``slot`` of the whole allocation."""
+        t = self.traits
+        for vh in range_constexpr(t.VHE_CHUNKS):
+            fx.ptr_store(
+                o_final[t.o_slot(0, vh)],
+                self.lds.root_pointer(slot + vh * t.OP_ELEMS * 4, fx.Float32),
+            )
+        fx.ptr_store(
+            fx.Vector.from_elements(
+                [o_final[t.m_slot(0)], o_final[t.l_slot(0)]], dtype=fx.Float32
+            ),
+            self.lds.root_pointer(slot + t.VHE_CHUNKS * t.OP_ELEMS * 4, fx.Float32),
+        )
+
+    @flyc.jit
+    def merge_groups(self, o_final):
+        """Fold dual group 1's online-softmax state into group 0's.
+
+        Lanes of both groups hold the same rows and head dims. After a barrier
+        retires every tile's LDS use, group 1 publishes (O, m, l) per lane over
+        the whole allocation; group 0 rescales both to the shared maximum.
+        """
+        t = self.traits
+        n = t.VHE_CHUNKS * t.OP_ELEMS
+        slot = self.ctx.tid * ((n + 2) * 4)
+        gpu.barrier()
+        if self.ctx.group == 1:
+            self.publish_group_state(o_final, slot)
+        gpu.barrier()
+        ml = fx.ptr_load(
+            self.lds.root_pointer(slot + n * 4, fx.Float32),
+            result_type=fx.Vector.make_type(2, fx.Float32),
+        )
+        m0 = o_final[t.m_slot(0)]
+        m1 = fx.Float32(ml[0])
+        m = fx.maxnumf(m0, m1)
+        safe = (m > self.ctx.NEG_INF).select(m, self.ctx.ZERO_F)
+        a0 = fx.Float32(fx.exp2(m0 - safe, fastmath="fast"))
+        a1 = fx.Float32(fx.exp2(m1 - safe, fastmath="fast"))
+        merged = list(o_final)
+        a0_b = fx.full(t.OP_ELEMS, a0, fx.Float32)
+        a1_b = fx.full(t.OP_ELEMS, a1, fx.Float32)
+        for vh in range_constexpr(t.VHE_CHUNKS):
+            o1 = fx.ptr_load(
+                self.lds.root_pointer(slot + vh * t.OP_ELEMS * 4, fx.Float32),
+                result_type=fx.Vector.make_type(t.OP_ELEMS, fx.Float32),
+            )
+            merged[t.o_slot(0, vh)] = (
+                o_final[t.o_slot(0, vh)] * a0_b + fx.Vector(o1) * a1_b
+            )
+        merged[t.m_slot(0)] = m
+        merged[t.l_slot(0)] = o_final[t.l_slot(0)] * a0 + fx.Float32(ml[1]) * a1
+        return merged
 
     def fp8_mtp4_prefetch(self):
         """First tile's scales and K, then the next tile's page ids.
@@ -413,6 +472,25 @@ class PaDecodePipeline:
             o_final = self.tile(
                 init_state, fx.Int32(self.ctx.part_start), multi_query, q_ops_all, True
             )
+        elif const_expr(self.traits.DUAL_GROUP):
+            # Group tiles part_start + 2j; only the peeled last one can hold
+            # the task's tail or lie past it.
+            for loop_j, ostate in range(0, self.ctx.dual_iters - 1, 1, init=init_state):
+                next_state = self.tile(
+                    ostate,
+                    self.ctx.part_start + fx.Int32(loop_j) * 2,
+                    multi_query,
+                    q_ops_all,
+                    False,
+                )
+                results = yield next_state
+            o_final = self.tile(
+                results,
+                self.ctx.part_start + 2 * (self.ctx.dual_iters - 1),
+                multi_query,
+                q_ops_all,
+                True,
+            )
         else:
             # Only a sequence's last tile reads rows past its context, so the
             # loop leaves out the V tail mask and the task's last tile is
@@ -457,7 +535,7 @@ class PaDecodePipeline:
         ):
             fx.rocdl.iglp_opt(0)
 
-        tt1 = tt + 1
+        tt1 = tt + (2 if const_expr(self.traits.DUAL_GROUP) else 1)
 
         cur_kv_buf = self.kv.scale_buffer_offset(tt)
 

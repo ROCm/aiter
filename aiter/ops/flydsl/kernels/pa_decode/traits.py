@@ -382,6 +382,8 @@ class PaDecodeSchedule:
             kv_dtype,
             bool(mask_unowned_kv),
             direct_output,
+            # At most one CTA per CU: room for two four-wave groups per CTA.
+            split_workgroups * query_splits <= num_compute_units,
             D256_PIPE,
             stage_pages,
         )
@@ -486,6 +488,9 @@ class PaDecodeTraits:
     STEPS_PER_PAGE: int
     STEPS_PER_CHUNK: int
     BLOCK_THREADS: int
+    DUAL_GROUP: bool
+    GROUP_LDS_BYTES: int
+    CTA_THREADS: int
     K_SLOT: int
     V_SLOT: int
     STATE_PER_M: int
@@ -541,6 +546,7 @@ class PaDecodeTraits:
             kv_dtype,
             mask_unowned_kv,
             DIRECT,
+            SPARSE_GRID,
             D256_PIPE,
             stage_page_capacity,
         ) = cache_key
@@ -853,6 +859,25 @@ class PaDecodeTraits:
             NWARP_PAD * f32 if per_token_kv else 0
         )  # m-independent: one cross-warp slot
         total_bytes = sVScaleMax_off + sVScaleMax_bytes
+        # gfx950 one-partition decode tasks walk all of a sequence's tiles in
+        # one CTA (sparse grids: at most one CTA per CU). Two four-wave groups take alternate tiles, each with its own
+        # LDS copy, and merge once at the end, so each SIMD interleaves two
+        # independent tile chains.
+        DUAL_GROUP = (
+            is_gfx950
+            and (DIRECT or _num_partitions == 1)
+            and SPARSE_GRID
+            and not MXFP4
+            # The head-256 pipe's waves leave no room for a second group.
+            and not D256_PIPE
+            and not per_token_kv
+            and query_length == 1
+            and sliding_window == 0
+            and M_TILES == 1
+            and not single_tile_plan
+            and not BF16_MTP_FUSED
+            and not MTP4_FUSED
+        )
         # Page ids for the task's tiles, one i32 each, staged before the loop.
         sPages_off = total_bytes
         total_bytes += stage_page_capacity * 4
@@ -866,8 +891,13 @@ class PaDecodeTraits:
                     f"{MXFP4_LDS_LIMIT_BYTES} B of gfx950"
                 )
 
+        GROUP_LDS_BYTES = (total_bytes + 15) // 16 * 16
+        CTA_THREADS = BLOCK_THREADS * (2 if DUAL_GROUP else 1)
         return cls(
             cache_key=cache_key,
+            DUAL_GROUP=DUAL_GROUP,
+            GROUP_LDS_BYTES=GROUP_LDS_BYTES,
+            CTA_THREADS=CTA_THREADS,
             head_dim=head_dim,
             query_group_size=query_group_size,
             block_size=block_size,

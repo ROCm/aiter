@@ -43,11 +43,26 @@ class PaDecodeLds:
         self.traits = traits
         self.storage_type = storage_type
 
-    def allocate(self):
+    def allocate(self, group=None):
         # Keep an ir.Value pointer for use inside scf control flow;
         # the Python SharedStorage handle cannot cross that boundary.
         lds = fx.SharedAllocator().allocate(self.storage_type).peek()
         self.base = fx.recast_iter(fx.Uint8, lds.buf.ptr)  # byte-addressed base
+        self.root = self.base
+        if group is not None:
+            # Each dual group addresses its own copy of the layout.
+            self.base = fx.add_offset(
+                self.base,
+                fx.make_int_tuple(group * self.traits.GROUP_LDS_BYTES),
+            )
+
+    def root_pointer(self, byte_off, elem_ty):
+        """Like ``pointer`` but from the start of the whole allocation."""
+        p = fx.add_offset(self.root, fx.make_int_tuple(byte_off))
+        ptr_ty = fx.PointerType.get(
+            elem_ty.ir_type, fx.AddressSpace.Shared, dsl_size_of(elem_ty)
+        )
+        return fx.recast_iter(ptr_ty, p)
 
     def pointer(self, byte_off, elem_ty):
         # Restore element alignment lost by the byte-base recast.
