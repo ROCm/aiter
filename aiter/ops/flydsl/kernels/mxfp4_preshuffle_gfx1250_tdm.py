@@ -50,6 +50,9 @@ from .tensor_shim import (
     AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE,
 )
 
+# FlyDSL 0.5 moved the register-placement API into rocdl.experimental.
+sched_vgpr = getattr(getattr(rocdl, "experimental", rocdl), "sched_vgpr", None)
+
 
 def place_vgpr(storage, start):
     """Pin SSA consumers without competing constraints on writes."""
@@ -63,7 +66,7 @@ def place_vgpr(storage, start):
             self.start = start
 
         def load(self):
-            return Vec(rocdl.sched_vgpr(self.storage.load(), self.start, soft=False))
+            return Vec(sched_vgpr(self.storage.load(), self.start, soft=False))
 
         def store(self, value):
             return self.storage.store(value)
@@ -356,9 +359,7 @@ def build_gemm_a8w4_tdm_task(
     wmma_n_rep = warp_tile_n // WMMA_N
     n_acc = wmma_m_rep * wmma_n_rep
     is_prefill = tile_m == tile_n == tile_k == 256
-    USE_EXPLICIT_VGPR_PARTITION = bool(
-        is_prefill and callable(getattr(rocdl, "sched_vgpr", None))
-    )
+    USE_EXPLICIT_VGPR_PARTITION = bool(is_prefill and callable(sched_vgpr))
     hyper_params = HYPER_PARAMS["a4w4" if a_is_fp4 else "a8w4"][
         "prefill" if is_prefill else "default"
     ]
