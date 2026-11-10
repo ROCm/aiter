@@ -142,6 +142,8 @@ def flydsl_a16w4_gemm1(
     the W-load cache modifier (0=cached, 2=nt), taken as-is (nt when unset).
 
     ``situ_beta``/``situ_linear_beta`` (SiTUv2 only) are runtime f32 scalars (nothing baked).
+    ``swiglu_limit`` is the SiLU / SwiGLU / SiTUv2 clamp bound; SiLU treats a
+    falsy or +inf limit as no clamp (``runtime_swiglu_limit``).
 
     ``a_dtype="fp8"`` (gfx942, mxfp4 W, standard layout): ``a_bf16`` holds per-token
     e4m3fnuz activations, ``a_scale`` their ``[n_tokens]`` f32 scales and ``w1_sref``
@@ -254,6 +256,7 @@ def flydsl_a16w4_gemm2(
     w_dtype="fp4",
     persist=None,
     epilog="atomic",
+    use_valid_token_count=False,
     a_dtype="bf16",
     a_scale=None,
     w2_sref=None,
@@ -318,6 +321,7 @@ def flydsl_a16w4_gemm2(
         rocm_arch=str(get_rocm_arch()),
         epilog=epilog,
         topk=topk,
+        use_valid_token_count=use_valid_token_count,
         **_non_default_a_dtype(a_dtype),
     )
     grid = gemm2_a16w4_grid(

@@ -25,6 +25,7 @@ from flydsl.expr.typing import T
 from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.ops.flydsl.kernels.layout_utils import crd2idx
 from aiter.ops.flydsl.kernels.mxfp4_gemm_common import (
+    _e8m0_byte_to_f32,
     _global_i32_buffer_tiles,
     _global_i32_buffer_view,
     global_typed_ptr,
@@ -151,12 +152,6 @@ def _int4_nibble_to_bf16x8(raw_i32, scale_f32, *, is_gfx942=False, old_pack=Fals
         ]
     v4i32 = fx.Vector.from_elements([_raw(x) for x in i32s], fx.Int32)
     return v4i32.bitcast(fx.BFloat16)  # v8bf16
-
-
-def _e8m0_byte_to_f32(packed_i32, byte_pos):
-    shift = byte_pos * fx.Int32(8)
-    b = packed_i32.shrui(shift) & fx.Int32(0xFF)
-    return (b << fx.Int32(23)).bitcast(fx.Float32)
 
 
 def _a16w4_swizzle_xor16(row, col_bytes, k_blocks16, *, enable=False):

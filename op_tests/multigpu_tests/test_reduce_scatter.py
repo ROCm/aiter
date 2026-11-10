@@ -111,7 +111,7 @@ def reduce_scatter_sweep(
     returned rather than asserted here: every rank must walk the full case
     list so the collectives stay aligned across ranks.
 
-    force_fallback: set AITER_CUSTOM_AR_MAX_SIZE=0 so the custom kernel is
+    force_fallback: set AITER_CUSTOM_RS_MAX_SIZE=0 so the custom kernel is
     disabled and every reduce_scatter takes the pynccl fallback path in
     CudaCommunicator.reduce_scatter. This exercises the non-zero-dim fallback
     that used to mis-lay-out its result (movedim direction + discarded
@@ -120,7 +120,7 @@ def reduce_scatter_sweep(
     device = torch.device(f"cuda:{rankID}")
     torch.cuda.set_device(device)
     if force_fallback:
-        os.environ["AITER_CUSTOM_AR_MAX_SIZE"] = "0"
+        os.environ["AITER_CUSTOM_RS_MAX_SIZE"] = "0"
     logger.info(f"RANK: {rankID} {tp_size} init_process_group...")
     set_custom_all_reduce(True)
     init_distributed_environment(
