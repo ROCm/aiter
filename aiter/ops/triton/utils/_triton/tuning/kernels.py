@@ -23,7 +23,7 @@ torch / aiter / op_tests are imported inside the functions only.
 To add a kernel, copy the nearest function below, change its inputs and launch, and register
 it with its config family and where its gluon path exists:
 
-    @kernel("GEMM-FOO", gluon_archs=("gfx1250",), gluon_default_archs=("gfx1250",))
+    @kernel("GEMM-FOO", gluon_archs=("gfx1250", "gfx1250-strict",), gluon_default_archs=("gfx1250", "gfx1250-strict",))
     def gemm_foo(shape, backend):
         import torch
 
@@ -43,6 +43,7 @@ it with its config family and where its gluon path exists:
 """
 
 import argparse
+import math
 import os
 import sys
 from collections.abc import Callable
@@ -123,10 +124,19 @@ def flops(shape):
     return 2.0 * shape.get("B", 1) * shape["M"] * shape["N"] * shape["K"]
 
 
-def resolve_installed(spec, shape, backend):
-    """The installed config for this shape (raw JSON bucket) and is_tuned, through the real loader."""
+# resolve_installed(cu_num=_DEVICE_CU): what the wrapper's config=None path reads on this device
+_DEVICE_CU = object()
+
+
+def resolve_installed(spec, shape, backend, cu_num=_DEVICE_CU):
+    """The installed config for this shape (raw JSON bucket) and is_tuned, through the real loader.
+
+    cu_num is the tree: by default what the wrapper's config=None path reads on this device;
+    None the default tree; a CU count its <cu_num>cu/ tree (the --cu-dir install scope).
+    """
     from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 
+    scope = {} if cu_num is _DEVICE_CU else {"cu_num": cu_num}
     return get_gemm_config(
         spec.config_name,
         shape["M"],
@@ -135,14 +145,31 @@ def resolve_installed(spec, shape, backend):
         bounds=spec.bounds,
         backend=backend,
         B=shape.get("B"),
+        **scope,
     )
 
 
-def seed_table(spec, backend, shape_nk):
-    """(path, table) to install into: this shape's own file, else a new DEFAULT_FALLBACK table."""
-    from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
+def installed_baseline(spec, shape, backend, keys, cu_num=None):
+    """The installed config of the tree a sweep installs into (cu_num as in resolve_installed)
+    -> (config with only the family's keys, is_tuned, dropped keys, explicit). explicit: the
+    launch must pass this config, because the wrapper's config=None path reads another tree on
+    this device, or keys had to be dropped."""
+    installed, is_tuned = resolve_installed(spec, shape, backend, cu_num=cu_num)
+    config = {k: v for k, v in installed.items() if k in keys}
+    dropped = sorted(k for k in installed if k not in keys)
+    explicit = bool(dropped) or installed != resolve_installed(spec, shape, backend)[0]
+    return config, is_tuned, dropped, explicit
 
-    config_dir = resolve_config_dir("gemm", spec.config_name, backend=backend)
+
+def seed_table(spec, backend, shape_nk, cu_num=None):
+    """(path, table) to install into: this shape's own file, else a new DEFAULT_FALLBACK table,
+    both in the tree cu_num picks (space.config_tree): nothing is read from another tree.
+    """
+    from space import config_tree
+
+    from aiter.ops.triton.utils.config_utils import load_config_json
+
+    config_dir = config_tree(spec, backend, cu_num)
     path = f"{config_dir}/{specialized_filename(spec.config_name, shape_nk)}"
     table = load_config_json(path, required=False)
     if table is not None:
@@ -157,15 +184,16 @@ def seed_table(spec, backend, shape_nk):
     }
 
 
-def family_bounds(spec, backend, shape_nk):
+def family_bounds(spec, backend, shape_nk, cu_num=None):
     """The M bounds the loader walks for this shape: the kernel's explicit bounds, else the
-    served file's M_BOUNDS, else the standard list."""
+    served file's M_BOUNDS (in the tree cu_num picks), else the standard list."""
     from aiter.ops.triton.utils.gemm_config_utils import STANDARD_M_BOUNDS
 
     if spec.bounds:
         return tuple(spec.bounds)
     return tuple(
-        seed_table(spec, backend, shape_nk)[1].get("M_BOUNDS") or STANDARD_M_BOUNDS
+        seed_table(spec, backend, shape_nk, cu_num)[1].get("M_BOUNDS")
+        or STANDARD_M_BOUNDS
     )
 
 
@@ -182,8 +210,14 @@ def add_splitk_block_size(config, K):
 @kernel(
     "BATCHED_GEMM-A16W16",
     dims=("B", "M", "N", "K"),
-    gluon_archs=("gfx1250",),
-    gluon_default_archs=("gfx1250",),
+    gluon_archs=(
+        "gfx1250",
+        "gfx1250-strict",
+    ),
+    gluon_default_archs=(
+        "gfx1250",
+        "gfx1250-strict",
+    ),
     gluon_ignored_keys=("GROUP_SIZE_M", "matrix_instr_nonkdim"),
 )
 def batched_gemm_bf16(shape, backend):
@@ -226,9 +260,64 @@ def batched_gemm_bf16(shape, backend):
 
 
 @kernel(
+    "FUSED-BF16-BMM-CAT-QUANT-PAD-MLA",
+    dims=("B", "M", "N", "K"),
+    backend_kwarg=False,
+)
+def fused_bf16_bmm_cat_quant_pad_mla(shape, backend):
+    """B: query heads per rank, N: kv_lora_rank, K: qk_nope_head_dim."""
+    import torch
+
+    from aiter.ops.triton.fusions.fused_bf16_bmm_cat_quant_pad_mla import (
+        fused_bf16_bmm_cat_quant_pad_mla as fused,
+    )
+    from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
+    from op_tests.triton_tests.fusions.test_fused_bf16_bmm_cat_quant_pad_mla import (
+        generate_inputs,
+        vllm_fp8_max,
+    )
+
+    B, M, N, K = shape["B"], shape["M"], shape["N"], shape["K"]
+    q_nope, w_uk_t, q_pe = generate_inputs(M, B, kv_lora=N, d_nope=K)
+    q_scale = torch.ones((), dtype=torch.float32, device="cuda")
+    # a multiple of 16 heads for the asm MLA decode, and of B for the wrapper
+    padded_heads = math.lcm(B, 16)
+    out = torch.empty(
+        (M, padded_heads, N + q_pe.shape[-1]),
+        dtype=get_fp8_e4m3_dtype(),
+        device="cuda",
+    )
+    fp8_max = vllm_fp8_max()
+
+    def call(config, q_nope, w_uk_t, q_pe, q_scale, out):
+        return fused(
+            q_nope,
+            w_uk_t,
+            q_pe,
+            q_scale,
+            padded_heads,
+            out=out,
+            fp8_max=fp8_max,
+            config=config,
+        )
+
+    def should_skip(config):
+        block_sizes = (config[f"BLOCK_SIZE_{d}"] for d in "MNK")
+        return min(block_sizes) < 16  # tl.dot needs 16-wide tiles
+
+    return call, (q_nope, w_uk_t, q_pe, q_scale, out), should_skip
+
+
+@kernel(
     "GEMM-A16W16",
-    gluon_archs=("gfx1250",),
-    gluon_default_archs=("gfx1250",),
+    gluon_archs=(
+        "gfx1250",
+        "gfx1250-strict",
+    ),
+    gluon_default_archs=(
+        "gfx1250",
+        "gfx1250-strict",
+    ),
     gluon_ignored_keys=("persistent",),
 )
 def gemm_a16w16(shape, backend):
@@ -269,7 +358,15 @@ def gemm_a16w16(shape, backend):
 
 
 @kernel(
-    "GEMM-A16W16-PERSISTENT", gluon_archs=("gfx1250",), gluon_default_archs=("gfx1250",)
+    "GEMM-A16W16-PERSISTENT",
+    gluon_archs=(
+        "gfx1250",
+        "gfx1250-strict",
+    ),
+    gluon_default_archs=(
+        "gfx1250",
+        "gfx1250-strict",
+    ),
 )
 def gemm_a16w16_persistent(shape, backend):
     import torch
@@ -504,8 +601,11 @@ def gemm_a8w8(shape, backend):
 @kernel(
     "GEMM-A8W8_BLOCKSCALE",
     bits=(8, 8),
-    gluon_archs=("gfx950", "gfx1250"),
-    gluon_default_archs=("gfx1250",),
+    gluon_archs=("gfx950", "gfx1250", "gfx1250-strict"),
+    gluon_default_archs=(
+        "gfx1250",
+        "gfx1250-strict",
+    ),
     gluon_candidates={
         "num_stages": [2, 3, 4, 6]
     },  # gfx950 gluon reads it as NUM_STAGES, at least 2
@@ -558,8 +658,14 @@ def gemm_a8w8_blockscale(shape, backend):
 @kernel(
     "GEMM-A8W8_BLOCKSCALE_PRESHUFFLED",
     bits=(8, 8),
-    gluon_archs=("gfx1250",),
-    gluon_default_archs=("gfx1250",),
+    gluon_archs=(
+        "gfx1250",
+        "gfx1250-strict",
+    ),
+    gluon_default_archs=(
+        "gfx1250",
+        "gfx1250-strict",
+    ),
 )
 def gemm_a8w8_blockscale_preshuffle(shape, backend):
     import torch
@@ -728,8 +834,14 @@ def mxfp4_cta_split(config):
     "GEMM-AFP4WFP4_PRESHUFFLED",
     bits=(4, 4),
     cta_split=mxfp4_cta_split,
-    gluon_archs=("gfx1250",),
-    gluon_default_archs=("gfx1250",),
+    gluon_archs=(
+        "gfx1250",
+        "gfx1250-strict",
+    ),
+    gluon_default_archs=(
+        "gfx1250",
+        "gfx1250-strict",
+    ),
     backend_kwarg=False,
     bounds=(4, 8, 16, 31, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192),
 )
@@ -789,8 +901,14 @@ def gemm_afp4wfp4_preshuffle(shape, backend):
 @kernel(
     "GEMM-AFP8WFP8_PRESHUFFLED",
     bits=(8, 8),
-    gluon_archs=("gfx1250",),
-    gluon_default_archs=("gfx1250",),
+    gluon_archs=(
+        "gfx1250",
+        "gfx1250-strict",
+    ),
+    gluon_default_archs=(
+        "gfx1250",
+        "gfx1250-strict",
+    ),
 )
 def gemm_afp8wfp8_preshuffle(shape, backend):
     import torch
@@ -844,3 +962,40 @@ def gemm_afp8wfp8_preshuffle(shape, backend):
         )  # clusters only there
 
     return call, (x, w_kernel, x_scales_kernel, w_scales, y), should_skip
+
+
+@kernel("GEMM-AFP8WFP8_A32_W1X32", bits=(8, 8), backend_kwarg=False)
+def gemm_afp8wfp8_a32_w1x32(shape, backend):
+    import torch
+
+    from aiter.ops.triton.gemm.basic.gemm_afp8wfp8 import gemm_afp8wfp8 as gemm
+    from op_tests.triton_tests.gemm.basic.test_gemm_afp8wfp8 import generate_inputs
+
+    M, N, K = shape["M"], shape["N"], shape["K"]
+    x, w, _, _, x_scales, _ = generate_inputs(M, N, K, x_scale_group_size=32)
+    # MXFP8: one E8M0 weight scale per 1x32 block (the generator makes 128x128)
+    w_scales = torch.randint(125, 130, (N, K // 32), dtype=torch.uint8, device=x.device)
+    y = torch.empty((M, N), dtype=torch.bfloat16, device=x.device)
+
+    def call(config, x, w, x_scales, w_scales, y):
+        return gemm(
+            x,
+            w,
+            x_scales,
+            w_scales,
+            dtype=torch.bfloat16,
+            y=y,
+            config=config,
+            x_scale_group_size=32,
+            w_scale_group_size=(1, 32),
+        )
+
+    def should_skip(config):
+        if config["BLOCK_SIZE_K"] < 64:
+            return True  # the kernel asserts BLOCK_SIZE_K >= 64
+        if config["NUM_KSPLIT"] == 1:
+            # the split-K reduce keys are unused without split-K
+            return config["FUSED_SPLITK"] or config["REDUCE_BLOCK_SIZE_M"] != 32
+        return False
+
+    return call, (x, w, x_scales, w_scales, y), should_skip

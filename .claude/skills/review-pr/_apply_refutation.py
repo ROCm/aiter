@@ -1,4 +1,4 @@
-"""Drop the findings the independent refuter KILLED from the card, so the seven gates see only
+"""Drop the findings the independent refuter KILLED from the card, so the eight gates see only
 what survived. In the interactive review flow a human removes KILLED findings by hand before
 finalizing; run_one.sh calls this to do it headlessly -- without it, the very first review whose
 refuter kills a finding (its designed job) fails triage.py's independent gate and loses the whole
