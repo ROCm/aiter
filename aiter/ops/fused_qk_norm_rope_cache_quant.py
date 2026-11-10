@@ -5,6 +5,7 @@ import torch
 from torch import Tensor
 
 from ..jit.core import compile_ops
+from ..plugin import route as _route
 from ..utility.dtypes import get_dtype_fp8
 
 
@@ -36,6 +37,7 @@ def _fused_qk_norm_rope_cache_quant_shuffle_hip(
 ) -> None: ...
 
 
+@_route(op="fused_qk_norm_rope_cache_quant_shuffle", version=1)
 def fused_qk_norm_rope_cache_quant_shuffle(
     q: Tensor,
     k: Tensor,
