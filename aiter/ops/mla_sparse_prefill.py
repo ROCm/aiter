@@ -717,6 +717,9 @@ def mla_sparse_prefill_v4(
     every call, into new tensors, by
     :func:`aiter.ops.triton.mla_v4_kv_rescale.to_dma_kv_layout`; callers whose
     caches are already in that layout pass ``kv_dma_layout=True`` to skip it.
+    QK^T takes its RoPE in bf16 from ``q_rope`` and ``unified_kv_rope`` /
+    ``kv_rope``, so those must hold the rows' real RoPE; the rows' fp8 RoPE feeds
+    only P*V.
 
     Args:
       q_nope:            ``[T, H, 512]`` NoPE (fp8: 448 values, 14 E8M0 scales, pad).

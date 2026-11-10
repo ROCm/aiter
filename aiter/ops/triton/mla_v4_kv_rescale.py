@@ -203,7 +203,8 @@ def fold_rope_into_nope(kv_nope: torch.Tensor, kv_rope: torch.Tensor) -> None:
     rows are then 512 B, so one 1024 B DMA chunk covers exactly two of them.
 
     The consumer must therefore treat the KV scale as a constant 2^0 rather
-    than reading the (now overwritten) trailer, and consume RoPE as fp8.
+    than reading the (now overwritten) trailer, and consume V's RoPE as fp8
+    (the OPUS kernel takes QK^T's RoPE in bf16 from the RoPE source).
     """
     assert kv_nope.shape[0] == kv_rope.shape[0]
     assert kv_nope.shape[1] == _D_PADDED and kv_rope.shape[1] == 64

@@ -747,8 +747,8 @@ __device__ inline int dma_tile_offset(int t, int d) {
 // DMA-staged variant. Expects a cache re-based upstream to a unit per-D-block
 // scale with RoPE folded into slots [448, 512) of the NoPE row
 // (aiter/ops/triton/mla_v4_kv_rescale.py), so each NoPE row is the complete
-// 512-wide fp8 row -- K for QK^T and V for P*V -- and one DMA stages all of it
-// without touching VGPRs.
+// 512-wide fp8 row -- V for P*V, and K's NoPE for QK^T -- and one DMA stages all
+// of it without touching VGPRs. QK^T's RoPE stays bf16, from the RoPE source.
 // K keeps the logical rows make_layout_kv_indices assigns and V keeps the
 // logical order the register-staged path delivers, so the score mask, P
 // exchange, P gather remap and value mask are all shared with that path.
@@ -774,10 +774,8 @@ __device__ void mla_v4_prefill_accum_dma(
     asm volatile("" : "+v"(lane_id));  // break CSE
     const int warp_id = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
 
-    // QK^T's RoPE comes from the folded fp8 copy in the tile (Q's is packed into
-    // v_q_nope by the caller), so neither bf16 RoPE input is read here.
-    (void)kv_rope_ptr;
-    (void)v_q_rope;
+    // QK^T's RoPE runs as a bf16 MFMA on v_q_rope and the bf16 RoPE source; the
+    // tile's fp8 RoPE slots feed only V.
 
     auto s_m  = make_smem(reinterpret_cast<D_ACC*>(smem_ml));
     auto s_l  = make_smem(reinterpret_cast<D_ACC*>(smem_ml) + T::T_N * T::W_M);
@@ -826,6 +824,26 @@ __device__ void mla_v4_prefill_accum_dma(
     // Unit KV scale after the upstream re-base: every E8M0 byte is 127.
     constexpr int scale_k = 0x7F7F7F7F;
 
+    // Each wave's 16 QK^T rows of bf16 K RoPE, loaded straight into registers.
+    // One set: the next tile's load goes out once QK^T has read this one, and
+    // still has the softmax and P*V to land.
+    auto mma0_rope = make_tiled_mma<D_ROPE, D_ROPE, D_ACC>(
+        seq<T::GEMM0_E_M, T::GEMM0_E_N, T::GEMM0_ROPE_E_K>{},
+        seq<T::T_M, T::T_N, T::T_K>{},
+        seq<T::W_M, T::W_N, T::W_K_ROPE>{},
+        mfma_adaptor_swap_ab{});
+    const D_ROPE* p_k_rope = reinterpret_cast<const D_ROPE*>(kv_rope_ptr);
+    auto u_rk_rope = make_layout_rk_rope<T>(lane_id);
+    auto load_k_rope = [&](int page) {
+        return global_load<T::VEC_KV_ROPE>(
+            p_k_rope + static_cast<int64_t>(page) * kargs.stride_kv_rope_page, u_rk_rope);
+    };
+    auto rope_page = [&](int tile_idx) {
+        const int idx = tile_idx * T::KV_TILE_SIZE + k_row;
+        return idx < valid_kv_len ? kv_indices[page_idx_begin + idx] : 0;
+    };
+    decltype(load_k_rope(0)) v_k_rope;
+
     // DMA the raw fp8 rows of one tile straight into LDS buffer BUF. One
     // address per half; the 128 B D slices ride in the instruction offset,
     // which the hardware also adds to the LDS destination, so M0 backs it out.
@@ -861,10 +879,14 @@ __device__ void mla_v4_prefill_accum_dma(
     // to land.
     int dpage[T::DMA_HALVES];
     static_for<T::DMA_HALVES>([&](auto h) { dpage[h.value] = dma_page(0, h.value); });
+    int rpage = rope_page(0);
     s_waitcnt_vmcnt(0_I);
-    if (num_kv_tiles > 0)
+    if (num_kv_tiles > 0) {
         issue_dma(number<0>{}, dpage);
+        v_k_rope = load_k_rope(rpage);
+    }
     static_for<T::DMA_HALVES>([&](auto h) { dpage[h.value] = dma_page(1, h.value); });
+    rpage = rope_page(1);
 
     // One tile on buffer CUR; unrolled for both buffers below so every LDS
     // offset is compile-time apart from the per-lane bases.
@@ -891,11 +913,15 @@ __device__ void mla_v4_prefill_accum_dma(
         });
         s_waitcnt_lgkmcnt(0_I);
 
-        // ──── GEMM0: S = Q·Kᵀ, NoPE and RoPE in one scaled fp8 chain ────
+        // ──── GEMM0: S = Q·Kᵀ, NoPE in the scaled fp8 chain, then RoPE in bf16 ────
         clear(v_s);
         static_for<T::GEMM0_NOPE_E_K>([&](auto ek) {
             v_s = mma0_nope.step_k(ek, v_q_nope, v_k_nope, v_s, scale_q, scale_k, ek, ek);
         });
+        v_s = mma0_rope(v_q_rope, v_k_rope, v_s);
+        if (tile_idx + 1 < num_kv_tiles)
+            v_k_rope = load_k_rope(rpage);
+        rpage = rope_page(tile_idx + 2);
 
         // ──── Cross-warp online softmax ────
         attn_mask_oob_score<T>(v_s, valid_kv_len, tile_idx, warp_id, lane_id);
@@ -1004,43 +1030,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void opus_mla_v4_prefill_a8w
     // NoPE mx scales (fp8 E8M0, one per 32-elem K block).
     auto u_q_mxscl = make_layout_q_mxscl<T>(lane_id);
     auto v_q_mxscl = load<1>(g_q_nope, u_q_mxscl + T::D_NOPE_SIZE);
-#if defined(OPUS_MLA_V4_DMA)
-    // QK^T's RoPE runs inside the scaled NoPE MFMA, against the fp8 RoPE folded
-    // into K's slots [448, 512). Q's RoPE goes MXFP8 1x32 into the same slots of
-    // step 3: lane (head, group g) holds RoPE D [16g, 16g + 16), and K-blocks 2
-    // and 3 of the step -- RoPE blocks 0 and 1 -- take their scales from groups
-    // 2 and 3.
-    {
-        const int g = lane_id / T::W_M, head = lane_id % T::W_M;
-        vector_t<D_ROPE, 16> qr;
-        auto qr8 = reinterpret_cast<vector_t<D_ROPE, 8>*>(&qr);
-        qr8[0] = load<8>(g_q_rope, head * kargs.stride_q_rope_h + g * 16);
-        qr8[1] = load<8>(g_q_rope, head * kargs.stride_q_rope_h + g * 16 + 8);
-        auto qf = cast<D_ACC>(qr);
-        D_ACC amax = 0.0f;
-        static_for<16>([&](auto i) { amax = max(amax, __builtin_fabsf(qf[i.value])); });
-        amax = max(amax, __shfl_xor(amax, 16));  // groups 2b, 2b+1 share RoPE block b
-        // E8M0 placing the block max in (224, 448], as the NoPE quantizer does.
-        int e = 0;
-        if (amax > 0.0f) {
-            int k;
-            const float m = __builtin_frexpf(amax / 448.0f, &k);
-            e = (m == 0.5f) ? k - 1 : k;
-            if (amax * __builtin_ldexpf(1.0f, -e) > 448.0f)
-                ++e;
-            e = min(max(e, -127), 127);
-        }
-        const D_ACC inv = __builtin_ldexpf(1.0f, -e);
-        static_for<16>([&](auto i) { qf[i.value] *= inv; });
-        auto q8 = cast<D_NOPE>(qf);
-        static_for<16>([&](auto i) { v_q_nope[q_nope_vals + i.value] = q8[i.value]; });
-        const int e_blk0 = __shfl_xor(e, 32);  // group 2 supplies block 0, held by groups 0/1
-        if (g >= 2)
-            v_q_mxscl[3] = __builtin_bit_cast(D_NOPE, static_cast<unsigned char>((g == 2 ? e_blk0 : e) + 127));
-    }
-#else
     v_q_mxscl[3] = (lane_id >= 32) ? static_cast<D_NOPE>(0) : v_q_mxscl[3];
-#endif
     int scale_q = reinterpret_cast<int&>(v_q_mxscl);
 
     // Output accumulator and online-softmax state.
