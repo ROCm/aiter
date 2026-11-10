@@ -664,14 +664,16 @@ class PaDecodeKVLoader:
             self.traits.sVScale_off, a, buf_off
         )
 
-    def load_k_chunk(self, phys, a):
+    def load_k_chunk(self, phys, a, qkhe_lo=0, qkhe_hi=None):
         # K token = warp*TOK_PER_WARP + a*MFMA_MNK + lane16, matching the
         # softmax mask and probability-word scatter.
         within_page_tok = (
             self.ctx.warp * self.traits.TOK_PER_WARP + a * MFMA_MNK + self.ctx.lane16
         ) % self.traits.block_size
         ops = []
-        for qkhe in range_constexpr(self.traits.QKHE_LOOP):
+        if qkhe_hi is None:
+            qkhe_hi = self.traits.QKHE_LOOP
+        for qkhe in range_constexpr(qkhe_lo, qkhe_hi):
             he_idx = qkhe * self.traits.RGROUP_QUARTERS + self.ctx.rgroup
             if const_expr(self.traits.kv_dtype == fx.BFloat16):
                 for qkr in range_constexpr(2):
@@ -1024,9 +1026,21 @@ class PaDecodeKVLoader:
         if const_expr(self.traits.kv_dtype == MXFP4_KV_DTYPE):
             self.mxfp4_init()
             return self.mxfp4_prefetch("k")
-        k_pf0 = fx.full(self.traits.NCHUNK * self.traits.N_SUBCHUNKS, 0, fx.Int64)
+        if const_expr(self.traits.STREAM_KV):
+            # K streams within the tile; carry this warp's page ids instead.
+            k_pf0 = fx.full(self.traits.PAGES_PER_CHUNK, 0, fx.Int32)
+        else:
+            k_pf0 = fx.full(self.traits.NCHUNK * self.traits.N_SUBCHUNKS, 0, fx.Int64)
         if self.ctx.part_start < self.ctx.part_end:
-            if const_expr(self.traits.D256_PIPE and self.traits.per_token_kv):
+            if const_expr(self.traits.STREAM_KV):
+                k_pf0 = self.fetch_v_pages(self.ctx.part_start)
+                if const_expr(self.traits.per_token_kv):
+                    self.stage_scales(
+                        k_pf0,
+                        self.scale_buffer_offset(fx.Int32(self.ctx.part_start)),
+                        self.ctx.part_start,
+                    )
+            elif const_expr(self.traits.D256_PIPE and self.traits.per_token_kv):
                 # Put scales ahead of K on vmcnt, so waiting for their LDS
                 # writes does not also drain the first K prefetch.
                 phys_vec0 = self.fetch_v_pages(self.ctx.part_start)

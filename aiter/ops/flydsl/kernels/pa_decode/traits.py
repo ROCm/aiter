@@ -29,6 +29,14 @@ MXFP4_P_EXP_SHIFT = 20
 BF16_LDS_LIMIT_BYTES = 64 * 1024
 MXFP4_LDS_LIMIT_BYTES = 160 * 1024
 PAGE_ID_STAGE_LIMIT = 4096  # i32 page ids, 16 KiB of LDS.
+# gfx942 K/V streaming (PaDecodeTraits.STREAM_KV): lane K-row bytes from which
+# one or several M-tiles stream, head groups per K load piece, K pieces and V
+# head chunks in flight.
+STREAM_KV_ROW_BYTES = 384
+STREAM_KV_MTILES_ROW_BYTES = 1024
+STREAM_K_GROUPS = 4
+STREAM_K_DEPTH = 2
+STREAM_V_DEPTH = 4
 D256_PIPE_MAX_ROWS = 2 * MFMA_MNK
 # KV cache formats as FlyDSL element types of the cache tensors' torch dtypes.
 # MXFP4 is E2M1 pairs with one E8M0 scale per 32 values; raw uint8 views of its
@@ -459,6 +467,7 @@ class PaDecodeTraits:
     MTP4_PREFETCH_V: bool
     BUFFER_KV: bool
     PAGE16_VPIPE: bool
+    STREAM_KV: bool
     REUSE_KV_PAGES: bool
     SCALES_BEFORE_CURRENT_V: bool
     M1_SCALE_BEFORE_MASK: bool
@@ -624,6 +633,17 @@ class PaDecodeTraits:
         )
         TUNE_PAGE128 = block_size == 128 and (PER_TOKEN_M1 or TUNED_SCALAR)
         PAGE16_VPIPE = prefetch_v and block_size == 16
+        # gfx942 spills a whole next-tile K prefetch plus the tile's V gather
+        # once a lane's K row reaches STREAM_KV_ROW_BYTES; stream K and V per
+        # chunk instead. MTP M-tiles share each streamed chunk.
+        STREAM_KV = (
+            not is_gfx950
+            and kv_dtype != MXFP4_KV_DTYPE
+            and not MTP4_FUSED
+            and not prefetch_v
+            and head_dim * QP_ELEM_BYTES
+            >= (STREAM_KV_ROW_BYTES if M_TILES == 1 else STREAM_KV_MTILES_ROW_BYTES)
+        )
         REUSE_KV_PAGES = PER_TOKEN_M1 or (D256_PIPE and per_token_kv)
         SCALES_BEFORE_CURRENT_V = (
             WIDE_FP8_MFMA and PER_TOKEN_M1 and (block_size == 16 or not trans_v)
@@ -634,7 +654,7 @@ class PaDecodeTraits:
         # publishes all of them.
         P_BUFFERS = (
             M_TILES
-            if MTP4_FUSED or D256_PIPE
+            if MTP4_FUSED or D256_PIPE or STREAM_KV
             else 2 if TUNE_PAGE128 and M_TILES == 3 else 1
         )
         # PV uses V=A, P=B: output [head-dim, query-row=lane16].
@@ -780,6 +800,7 @@ class PaDecodeTraits:
             MTP4_PREFETCH_V=MTP4_PREFETCH_V,
             BUFFER_KV=BUFFER_KV,
             PAGE16_VPIPE=PAGE16_VPIPE,
+            STREAM_KV=STREAM_KV,
             REUSE_KV_PAGES=REUSE_KV_PAGES,
             SCALES_BEFORE_CURRENT_V=SCALES_BEFORE_CURRENT_V,
             M1_SCALE_BEFORE_MASK=M1_SCALE_BEFORE_MASK,

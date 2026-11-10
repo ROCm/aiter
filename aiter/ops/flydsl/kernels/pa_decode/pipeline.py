@@ -23,9 +23,13 @@ from .op_softmax import PaDecodeSoftmax
 from .traits import (
     KV_COMPUTE_BLOCK,
     LOG2E,
+    MFMA_ACC_ELEMS,
     MFMA_MNK,
     MXFP4_KV_DTYPE,
     MXFP4_P_EXP_SHIFT,
+    STREAM_K_DEPTH,
+    STREAM_K_GROUPS,
+    STREAM_V_DEPTH,
     WAVE,
 )
 
@@ -164,7 +168,11 @@ class PaDecodePipeline:
                 for vh in range_constexpr(self.traits.VHE_CHUNKS)
             ]
         elif const_expr(
-            (self.traits.M_TILES > 1 and not self.traits.MTP4_FUSED)
+            (
+                self.traits.M_TILES > 1
+                and not self.traits.MTP4_FUSED
+                and not self.traits.STREAM_KV
+            )
             or (self.traits.prefetch_v and not self.traits.SCALES_BEFORE_CURRENT_V)
         ):
             v_vh_shared = [
@@ -182,6 +190,20 @@ class PaDecodePipeline:
             )
 
         # All query tiles share one K/V tile; each path retains its publication barriers.
+        if const_expr(multi_query and self.traits.STREAM_KV):
+            return self.stream_multi_query_tile(
+                ostate,
+                k_cur,
+                v_page_cur,
+                tt1,
+                tile_valid,
+                window_left,
+                cur_kv_buf,
+                scale_bounds,
+                q_scale_vec,
+                q_ops_all,
+                mask_tail,
+            )
         if const_expr(multi_query):
             return self.multi_query_tile(
                 ostate,
@@ -503,6 +525,143 @@ class PaDecodePipeline:
         return next_state
 
     @flyc.jit
+    def stream_multi_query_tile(
+        self,
+        ostate,
+        k_cur,
+        v_page_cur,
+        tt1,
+        tile_valid,
+        window_left,
+        cur_kv_buf,
+        scale_bounds,
+        q_scale_vec,
+        q_ops_all,
+        mask_tail,
+    ):
+        """STREAM_KV with several M-tiles: K and V stream once for all of them.
+
+        Every M-tile packs P into a private slot behind one barrier, so each V
+        head chunk is loaded once and feeds every M-tile's PV.
+        """
+        t = self.traits
+        next_state = [None, None]
+        k_scale_shared = None
+        if const_expr(t.per_token_kv):
+            v_scale_A = [
+                self.kv.load_scale(t.sVScale_off, a, cur_kv_buf)
+                for a in range_constexpr(t.NCHUNK)
+            ]
+            self.softmax.stage_v_scale_max(v_scale_A, scale_bounds)
+            k_scale_shared = [
+                self.kv.load_scale(t.sKScale_off, a, cur_kv_buf)
+                for a in range_constexpr(t.NCHUNK)
+            ]
+        # k_cur holds this warp's page ids; fetch the next tile's first.
+        k_next = k_cur
+        if const_expr(not t.single_tile_plan) and tt1 < self.ctx.part_end:
+            k_next = self.kv.fetch_v_pages(tt1)
+            if const_expr(t.per_token_kv):
+                self.kv.stage_scales(k_next, self.kv.scale_buffer_offset(tt1), tt1)
+        next_state[t.K_SLOT] = k_next
+        frag_all = self.stream_qk(k_cur, q_ops_all)
+        masked_chunks_saved = [None] * t.M_TILES
+        for m in range_constexpr(t.M_TILES):
+            scale = (
+                self.ctx.scale_qk
+                if const_expr(t.kv_dtype == fx.BFloat16)
+                else self.ctx.scale_qk * fx.Float32(q_scale_vec[m])
+            )
+            masked_chunks = self.softmax.multi_scores(
+                frag_all[m], scale, k_scale_shared, tile_valid, window_left, m
+            )
+            self.softmax.stage_row_max(
+                masked_chunks, self.softmax.lmax_offset(m), scale, True
+            )
+            masked_chunks_saved[m] = masked_chunks
+        gpu.barrier()
+        v_page_next = v_page_cur
+        if const_expr(not t.single_tile_plan) and tt1 < self.ctx.part_end:
+            v_page_next = self.kv.read_v_pages()
+        next_state[t.V_SLOT] = v_page_next
+        v_scale_shared = None
+        v_max_scaled = None
+        norm_factor_b = None
+        if const_expr(t.per_token_kv):
+            v_scale_shared = [
+                self.kv.load_scale(t.sVScale_off, a, cur_kv_buf)
+                for a in range_constexpr(t.NCHUNK)
+            ]
+            v_max_scaled, norm_factor_b = self.softmax.v_scale_normalization()
+        m_new = []
+        corr_reg = []
+        for m in range_constexpr(t.M_TILES):
+            m_new_m, corr_m = self.softmax.pack_multi(
+                masked_chunks_saved[m],
+                m,
+                ostate[t.m_slot(m)],
+                t.sP_off + m * MFMA_MNK * t.SP_ROW_BYTES,
+                t.sLsum_off + m * MFMA_MNK * t.NWARP_PAD * t.f32,
+                v_scale_shared,
+                cur_kv_buf,
+                norm_factor_b,
+            )
+            m_new.append(m_new_m)
+            corr_reg.append(corr_m)
+        gpu.barrier()
+        o_acc = []
+        l_new = []
+        p_ops = []
+        corr_b = []
+        for m in range_constexpr(t.M_TILES):
+            o_acc.append(
+                [ostate[t.o_slot(m, vh)] for vh in range_constexpr(t.VHE_CHUNKS)]
+            )
+            gsum = self.lds.load_wave(
+                t.sLsum_off + m * MFMA_MNK * t.NWARP_PAD * t.f32, self.ctx.lane16
+            ).reduce(ReductionOp.ADD)
+            l_new.append(
+                gsum
+                if const_expr(t.single_tile_plan)
+                else ostate[t.l_slot(m)] * corr_reg[m] + gsum
+            )
+            p_ops.append(
+                self.lds.load(
+                    t.sP_off
+                    + m * MFMA_MNK * t.SP_ROW_BYTES
+                    + self.ctx.lane16 * t.SP_ROW_BYTES
+                    + self.ctx.rgroup * 64 * t.QP_ELEM_BYTES,
+                    fx.Int64,
+                    t.NVOPS,
+                )
+            )
+            corr_b.append(fx.full(t.OP_ELEMS, fx.Float32(corr_reg[m]), fx.Float32))
+        v_masks = self.kv.tail_masks(tile_valid) if const_expr(mask_tail) else None
+        depth = STREAM_V_DEPTH
+        v_bufs = {}
+        for vh in range_constexpr(min(depth, t.VHE_CHUNKS)):
+            v_bufs[vh] = self.kv.load_v(v_page_cur, vh)
+        for vh in range_constexpr(t.VHE_CHUNKS):
+            if const_expr(vh + depth < t.VHE_CHUNKS):
+                v_bufs[vh + depth] = self.kv.load_v(v_page_cur, vh + depth)
+            v_vh = v_bufs.pop(vh)
+            if const_expr(mask_tail):
+                v_vh = self.kv.mask_v_chunk(v_vh, v_masks, tile_valid)
+            for m in range_constexpr(t.M_TILES):
+                op = self.gemm.pv(v_vh, p_ops[m])
+                if const_expr(t.per_token_kv):
+                    op = op * fx.full(t.OP_ELEMS, v_max_scaled, fx.Float32)
+                o_acc[m][vh] = (
+                    op
+                    if const_expr(t.single_tile_plan)
+                    else o_acc[m][vh] * corr_b[m] + op
+                )
+            fx.rocdl.sched_barrier(0)
+        for m in range_constexpr(t.M_TILES):
+            next_state.extend([*o_acc[m], m_new[m], l_new[m]])
+        return next_state
+
+    @flyc.jit
     def single_query_tile(
         self,
         ostate,
@@ -539,12 +698,24 @@ class PaDecodePipeline:
         l_prev = [
             ostate[self.traits.l_slot(m)] for m in range_constexpr(self.traits.M_TILES)
         ]
-        frag_Ss = [
-            self.gemm.qk(k_cur, q_ops_all, m)
-            for m in range_constexpr(self.traits.M_TILES)
-        ]
         k_next = k_cur
-        if const_expr(not self.traits.single_tile_plan) and tt1 < self.ctx.part_end:
+        if const_expr(self.traits.STREAM_KV):
+            # k_cur holds this warp's page ids; fetch the next tile's first so
+            # the page-table wait does not drain the K stream.
+            if const_expr(not self.traits.single_tile_plan) and tt1 < self.ctx.part_end:
+                k_next = self.kv.fetch_v_pages(tt1)
+                if const_expr(self.traits.per_token_kv):
+                    self.kv.stage_scales(k_next, self.kv.scale_buffer_offset(tt1), tt1)
+            frag_Ss = self.stream_qk(k_cur, q_ops_all)
+        else:
+            frag_Ss = [
+                self.gemm.qk(k_cur, q_ops_all, m)
+                for m in range_constexpr(self.traits.M_TILES)
+            ]
+        if (
+            const_expr(not self.traits.single_tile_plan and not self.traits.STREAM_KV)
+            and tt1 < self.ctx.part_end
+        ):
             if const_expr(self.traits.REUSE_KV_PAGES):
                 # Stage scales before K so scale waits cannot drain K;
                 # page16 defers K until the P barrier.
@@ -638,36 +809,106 @@ class PaDecodePipeline:
             corr_b.append(
                 fx.full(self.traits.OP_ELEMS, fx.Float32(corr_reg[m]), fx.Float32)
             )
-        if const_expr(self.traits.prefetch_v):
-            v_vh_batch = v_vh_shared
-        else:
-            v_vh_batch = [
-                self.kv.load_v(v_page_cur, vh)
-                for vh in range_constexpr(self.traits.VHE_CHUNKS)
-            ]
-        v_masks = self.kv.tail_masks(tile_valid) if const_expr(mask_tail) else None
-        if const_expr(not mask_tail and self.traits.block_size >= 64):
-            # Without the tail-mask branch, the scheduler sinks page64/128 V
-            # loads next to their PV MFMAs and exposes their latency.
-            fx.rocdl.sched_barrier(0)
-        # vh outer, m inner: each M-tile is a separate accumulator chain on the
-        # same V operand.
-        for vh in range_constexpr(self.traits.VHE_CHUNKS):
-            v_vh = v_vh_batch[vh]
-            if const_expr(mask_tail):
-                v_vh = self.kv.mask_v_chunk(v_vh, v_masks, tile_valid)
-            for m in range_constexpr(self.traits.M_TILES):
-                op = self.gemm.pv(v_vh, p_ops[m])
+        if const_expr(self.traits.STREAM_KV):
+            v_masks = self.kv.tail_masks(tile_valid) if const_expr(mask_tail) else None
+            # STREAM_V_DEPTH head chunks in flight; one fence per chunk keeps
+            # the scheduler from hoisting every V load.
+            depth = STREAM_V_DEPTH
+            v_bufs = {}
+            for vh in range_constexpr(min(depth, self.traits.VHE_CHUNKS)):
+                v_bufs[vh] = self.kv.load_v(v_page_cur, vh)
+            for vh in range_constexpr(self.traits.VHE_CHUNKS):
+                if const_expr(vh + depth < self.traits.VHE_CHUNKS):
+                    v_bufs[vh + depth] = self.kv.load_v(v_page_cur, vh + depth)
+                v_vh = v_bufs.pop(vh)
+                if const_expr(mask_tail):
+                    v_vh = self.kv.mask_v_chunk(v_vh, v_masks, tile_valid)
+                op = self.gemm.pv(v_vh, p_ops[0])
                 if const_expr(self.traits.per_token_kv):
                     op = op * fx.full(self.traits.OP_ELEMS, v_max_scaled, fx.Float32)
-                o_acc[m][vh] = (
+                o_acc[0][vh] = (
                     op
                     if const_expr(self.traits.single_tile_plan)
-                    else o_acc[m][vh] * corr_b[m] + op
+                    else o_acc[0][vh] * corr_b[0] + op
                 )
+                fx.rocdl.sched_barrier(0)
+        else:
+            if const_expr(self.traits.prefetch_v):
+                v_vh_batch = v_vh_shared
+            else:
+                v_vh_batch = [
+                    self.kv.load_v(v_page_cur, vh)
+                    for vh in range_constexpr(self.traits.VHE_CHUNKS)
+                ]
+            v_masks = self.kv.tail_masks(tile_valid) if const_expr(mask_tail) else None
+            if const_expr(not mask_tail and self.traits.block_size >= 64):
+                # Without the tail-mask branch, the scheduler sinks page64/128 V
+                # loads next to their PV MFMAs and exposes their latency.
+                fx.rocdl.sched_barrier(0)
+            # vh outer, m inner: each M-tile is a separate accumulator chain on the
+            # same V operand.
+            for vh in range_constexpr(self.traits.VHE_CHUNKS):
+                v_vh = v_vh_batch[vh]
+                if const_expr(mask_tail):
+                    v_vh = self.kv.mask_v_chunk(v_vh, v_masks, tile_valid)
+                for m in range_constexpr(self.traits.M_TILES):
+                    op = self.gemm.pv(v_vh, p_ops[m])
+                    if const_expr(self.traits.per_token_kv):
+                        op = op * fx.full(
+                            self.traits.OP_ELEMS, v_max_scaled, fx.Float32
+                        )
+                    o_acc[m][vh] = (
+                        op
+                        if const_expr(self.traits.single_tile_plan)
+                        else o_acc[m][vh] * corr_b[m] + op
+                    )
         for m in range_constexpr(self.traits.M_TILES):
             next_state.extend([*o_acc[m], m_new[m], l_new[m]])
         return next_state
+
+    def stream_qk(self, phys_vec, q_ops_all):
+        """QK of every M-tile, K loaded in pieces of STREAM_K_GROUPS head groups
+        with STREAM_K_DEPTH pieces in flight; returns [M-tile][chunk] scores."""
+        t = self.traits
+        packs_per_group = t.N_SUBCHUNKS // t.QKHE_LOOP
+        piece = min(STREAM_K_GROUPS, t.QKHE_LOOP)
+        pieces = [
+            (a, lo, min(lo + piece, t.QKHE_LOOP))
+            for a in range_constexpr(t.NCHUNK)
+            for lo in range_constexpr(0, t.QKHE_LOOP, piece)
+        ]
+        loaded = {}
+
+        def issue(i):
+            a, lo, hi = pieces[i]
+            phys = fx.Int32(phys_vec[(a * MFMA_MNK) // t.block_size])
+            loaded[i] = self.kv.load_k_chunk(phys, a, lo, hi)
+
+        accs = [
+            [
+                fx.full(MFMA_ACC_ELEMS, 0.0, fx.Float32)
+                for _ in range_constexpr(t.NCHUNK)
+            ]
+            for _ in range_constexpr(t.M_TILES)
+        ]
+        for i in range_constexpr(min(STREAM_K_DEPTH, len(pieces))):
+            issue(i)
+        for i in range_constexpr(len(pieces)):
+            if i + STREAM_K_DEPTH < len(pieces):
+                issue(i + STREAM_K_DEPTH)
+            a, lo, hi = pieces[i]
+            k_ops = loaded.pop(i)
+            for m in range_constexpr(t.M_TILES):
+                accs[m][a] = self.gemm.mfma(
+                    k_ops,
+                    q_ops_all,
+                    0,
+                    m * t.N_SUBCHUNKS + lo * packs_per_group,
+                    (hi - lo) * packs_per_group,
+                    accs[m][a],
+                )
+            fx.rocdl.sched_barrier(0)
+        return [[fx.Vector(acc) for acc in row] for row in accs]
 
     @flyc.jit
     def single_query_tile_mxfp4(
