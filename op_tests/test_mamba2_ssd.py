@@ -12,11 +12,7 @@ import torch.nn.functional as F
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx_runtime
-from aiter.ops.flydsl.mamba2_ssd import (
-    SUPPORTED_GFX,
-    mamba2_chunk_backward_flydsl,
-    mamba2_chunk_forward_flydsl,
-)
+from aiter.ops.flydsl.mamba2_ssd import SUPPORTED_GFX, mamba_chunk_scan_combined
 from aiter.test_common import (
     benchmark,
     checkAllclose,
@@ -37,14 +33,14 @@ _TERM_TOL = 2**-6  # ~4 bf16 ulps of an element's summed |terms|
 def _ref_decay_cumsum(a, dt, chunk_size):
     """Per-chunk cumsum of a * dt."""
     B, T, H = dt.shape
-    decay = (a * dt.float()).view(B, T // chunk_size, chunk_size, H)
+    decay = (a * dt).view(B, T // chunk_size, chunk_size, H)
     return decay.cumsum(dim=2).view(B, T, H)
 
 
 def _ref_pass_state(x, b, dt, decay_cumsum, init_state, chunk_size):
     """Chunk-entry states and final state."""
     H, G = x.shape[2], b.shape[2]
-    x, b, dt = x.float(), b.float().repeat_interleave(H // G, dim=2), dt.float()
+    b = b.repeat_interleave(H // G, dim=2)
     hid, hiddens = init_state, []
     for ci in range(x.shape[1] // chunk_size):
         hiddens.append(hid.clone())
@@ -60,9 +56,8 @@ def _ref_pass_state(x, b, dt, decay_cumsum, init_state, chunk_size):
 def _ref_out(x, b, c, d, dt, decay_cumsum, hiddens, chunk_size):
     """Fused chunk output."""
     H, G = x.shape[2], b.shape[2]
-    x, dt = x.float(), dt.float()
-    b = b.float().repeat_interleave(H // G, dim=2)
-    c = c.float().repeat_interleave(H // G, dim=2)
+    b = b.repeat_interleave(H // G, dim=2)
+    c = c.repeat_interleave(H // G, dim=2)
     out = torch.zeros_like(x)
     for ci in range(hiddens.shape[2]):
         sl = slice(ci * chunk_size, (ci + 1) * chunk_size)
@@ -74,22 +69,23 @@ def _ref_out(x, b, c, d, dt, decay_cumsum, hiddens, chunk_size):
         causal = torch.ones(cb.shape[-2:], dtype=torch.bool, device=cb.device).tril()
         seg = torch.where(causal, dc[..., None] - dc[..., None, :], -torch.inf)
         cb = cb * torch.exp(seg)
-        y = (cc * torch.exp(dc[..., None])) @ hiddens[:, :, ci].float().transpose(
-            -1, -2
-        )
+        y = (cc * torch.exp(dc[..., None])) @ hiddens[:, :, ci].transpose(-1, -2)
         y = y + cb @ (dtc[..., None] * xc) + d[None, :, None, None] * xc
         out[:, sl] = y.transpose(1, 2)
     return out
 
 
-def run_torch(x, a, b, c, d, dt, init_state, chunk_size):
-    """Chunked Mamba-2 forward reference, in fp32."""
+def run_torch(x, a, b, c, d, dt, init_state, chunk_size, dtype=dtypes.fp32):
+    """Chunked Mamba-2 forward reference, computed in ``dtype``."""
+    x, a, b, c, d, dt, init_state = (
+        t.to(dtype) for t in (x, a, b, c, d, dt, init_state)
+    )
     decay_cumsum = _ref_decay_cumsum(a, dt, chunk_size)
     hiddens, final_state = _ref_pass_state(
         x, b, dt, decay_cumsum, init_state, chunk_size
     )
     out = _ref_out(x, b, c, d, dt, decay_cumsum, hiddens, chunk_size)
-    return out.to(x.dtype), final_state
+    return out, final_state
 
 
 def _bf16_ulp(x):
@@ -111,6 +107,7 @@ def make_inputs(B, T, G, H, N, P, L, dtype):
     dt0 = F.softplus(torch.randn(B, L, H, dtype=dtype))
     a0 = -torch.empty(H, dtype=dtypes.fp32).uniform_(1, 16)
     zeros = torch.zeros(B, H, P, N, dtype=dtypes.fp32)
+    x0, b0, dt0 = x0.float(), b0.float(), dt0.float()
     _, init_state = _ref_pass_state(x0, b0, dt0, (a0 * dt0).cumsum(dim=1), zeros, L)
     return x, a, b, c, d, dt, init_state
 
@@ -132,8 +129,8 @@ def test_mamba2_chunk_forward(
     ref_out, ref_state = run_torch(x, a, b, c, d, dt, init_state, L)
 
     candidates = {
-        "flydsl": lambda: mamba2_chunk_forward_flydsl(
-            x, a, b, c, d, dt, init_state, chunk_size=L
+        "flydsl": lambda: mamba_chunk_scan_combined(
+            x, dt, a, b, c, L, D=d, initial_states=init_state, return_final_states=True
         ),
     }
     if chunk_simple_gla is not None:
@@ -208,11 +205,13 @@ def test_mamba2_chunk_forward(
 
 
 def run_torch_backward(x, a, b, c, d, dt, init_state, dout, dfinal_state, chunk_size):
-    """Gradients of the fp32 reference by autograd (reference only, not timed)."""
-    leaves = [t.detach().float().requires_grad_() for t in (x, a, b, c, d, dt)]
-    h0 = init_state.detach().float().requires_grad_()
-    out, final = run_torch(*leaves, h0, chunk_size)
-    torch.autograd.backward([out, final], [dout.float(), dfinal_state.float()])
+    """Gradients of the reference by autograd, in fp64: fp32 PyTorch is less
+    accurate than the kernel's fp32 gradients (da, dinit)."""
+    f64 = torch.float64
+    leaves = [t.detach().to(f64).requires_grad_() for t in (x, a, b, c, d, dt)]
+    h0 = init_state.detach().to(f64).requires_grad_()
+    out, final = run_torch(*leaves, h0, chunk_size, dtype=f64)
+    torch.autograd.backward([out, final], [dout.to(f64), dfinal_state.to(f64)])
     return [t.grad for t in leaves] + [h0.grad]  # dx, da, db, dc, dd, ddt, dinit
 
 
@@ -234,9 +233,16 @@ def test_mamba2_chunk_backward(
     dfinal = 0.1 * torch.randn_like(init_state)
     ref = run_torch_backward(x, a, b, c, d, dt, init_state, dout, dfinal, L)
 
+    # Time the backward alone: build the graph once, replay it.
+    leaves = [t.detach().clone().requires_grad_() for t in (x, a, b, c, d, dt)]
+    h0 = init_state.detach().clone().requires_grad_()
+    lx, la, lb, lc, ld, ldt = leaves
+    out, final = mamba_chunk_scan_combined(
+        lx, ldt, la, lb, lc, L, D=ld, initial_states=h0, return_final_states=True
+    )
     candidates = {
-        "flydsl": lambda: mamba2_chunk_backward_flydsl(
-            x, a, b, c, d, dt, init_state, dout, dfinal, chunk_size=L
+        "flydsl": lambda: torch.autograd.grad(
+            [out, final], [*leaves, h0], [dout, dfinal], retain_graph=True
         ),
     }
     if chunk_simple_gla is not None:
@@ -278,7 +284,7 @@ def test_mamba2_chunk_backward(
         candidates["fla_triton"] = fla_fn
 
     names = ["dx", "da", "db", "dc", "dd", "ddt", "dinit"]
-    FP32_GRADS = ("da", "dd", "dinit")
+    FP32_GRADS = ("da", "dd", "dinit")  # the fp32 inputs a, d, init_state
     ret = {"gfx": get_gfx_runtime()}
     for name, fn in candidates.items():
         grads, us = run_perftest(fn)
@@ -292,7 +298,7 @@ def test_mamba2_chunk_backward(
             errs.append(
                 checkAllclose(
                     r,
-                    g.to(dtypes.fp32),
+                    g.to(r.dtype),
                     rtol=rtol,
                     atol=atol,
                     tol_err_ratio=_TOL_ERR_RATIO,
@@ -305,6 +311,111 @@ def test_mamba2_chunk_backward(
         ret[f"{name} us"] = us
         ret[f"{name} err"] = max(errs)
     return ret
+
+
+def _ref_sequence(x, dt, a, b, c, d, h0):
+    """Exact (unchunked) SSD of one sequence: x [T, H, P], dt [T, H] (processed),
+    b / c [T, G, N], h0 [H, P, N] -> out [T, H, P], final state [H, P, N]."""
+    T, H, _ = x.shape
+    b = b.repeat_interleave(H // b.shape[1], 1)
+    c = c.repeat_interleave(H // c.shape[1], 1)
+    cum = (a * dt).cumsum(0)
+    causal = torch.ones(T, T, dtype=torch.bool).tril()[..., None]
+    seg = torch.where(causal, cum[:, None] - cum[None], -torch.inf).exp()
+    out = torch.einsum("tsh,shp->thp", torch.einsum("thn,shn->tsh", c, b) * seg * dt, x)
+    out = (
+        out
+        + torch.einsum("thn,hpn->thp", c, h0) * cum.exp()[..., None]
+        + d[:, None] * x
+    )
+    last = cum[-1] if T else torch.zeros_like(a)
+    w = (last - cum).exp() * dt
+    final = h0 * last.exp()[:, None, None] + torch.einsum("th,thp,thn->hpn", w, x, b)
+    return out, final
+
+
+def run_torch_varlen(x, dt, a, b, c, d, dt_bias, h0, lens):
+    """Packed batch reference: each sequence from its own initial state."""
+    dt = F.softplus(dt + dt_bias)
+    starts = [0, *itertools.accumulate(lens)]
+    outs, finals = [], []
+    for i, (t0, t1) in enumerate(itertools.pairwise(starts)):
+        o, f = _ref_sequence(
+            x[0, t0:t1], dt[0, t0:t1], a, b[0, t0:t1], c[0, t0:t1], d, h0[i]
+        )
+        outs.append(o)
+        finals.append(f)
+    return torch.cat(outs)[None], torch.stack(finals)
+
+
+@benchmark()
+def test_mamba2_chunk_scan_varlen(
+    seq_lens, num_groups, num_heads, state_size, head_size, chunk_size, dtype
+):
+    """Packed ragged sequences (incl. empty and 1-token ones) with dt_bias and
+    softplus, forward and every gradient, against the exact per-sequence scan."""
+    G, H, N, P, L = num_groups, num_heads, state_size, head_size, chunk_size
+    T, S = sum(seq_lens), len(seq_lens)
+    x = F.silu(torch.randn(1, T, H, P, dtype=dtype))
+    b = F.silu(torch.randn(1, T, G, N, dtype=dtype))
+    c = F.silu(torch.randn(1, T, G, N, dtype=dtype))
+    dt = torch.randn(1, T, H, dtype=dtypes.fp32)
+    a = -torch.empty(H, dtype=dtypes.fp32).uniform_(1, 16)
+    d = torch.randn(H, dtype=dtypes.fp32)
+    dt_bias = 0.5 * torch.randn(H, dtype=dtypes.fp32)
+    h0 = 0.1 * torch.randn(S, H, P, N, dtype=dtypes.fp32)
+    cu_seqlens = torch.tensor([0, *itertools.accumulate(seq_lens)], dtype=torch.int32)
+    inputs = (x, dt, a, b, c, d, dt_bias, h0)
+    dout = torch.randn_like(x)
+    dstates = 0.1 * torch.randn_like(h0)
+
+    ref_leaves = [t.detach().double().requires_grad_() for t in inputs]  # see above
+    ref_out, ref_states = run_torch_varlen(*ref_leaves, seq_lens)
+    torch.autograd.backward([ref_out, ref_states], [dout.double(), dstates.double()])
+
+    leaves = [t.detach().clone().requires_grad_() for t in inputs]
+    lx, ldt, la, lb, lc, ld, lbias, lh0 = leaves
+
+    def fwd():
+        return mamba_chunk_scan_combined(
+            lx,
+            ldt,
+            la,
+            lb,
+            lc,
+            L,
+            D=ld,
+            dt_bias=lbias,
+            initial_states=lh0,
+            cu_seqlens=cu_seqlens,
+            dt_softplus=True,
+            return_varlen_states=True,
+        )
+
+    (out, states), us = run_perftest(fwd)
+    torch.autograd.backward([out, states], [dout, dstates])
+
+    checks = {"out": (ref_out, out), "states": (ref_states, states)}
+    names = ["dx", "ddt", "da", "db", "dc", "dd", "ddt_bias", "dinit"]
+    checks.update({n: (r.grad, g.grad) for n, r, g in zip(names, ref_leaves, leaves)})
+    errs = {}
+    for name, (r, g) in checks.items():
+        scale = r.abs().max().item()
+        if g.dtype == dtypes.fp32 and name != "states":  # fp32 grads: fp32 accuracy
+            rtol, atol = 1e-3, 1e-4 * scale
+        else:
+            rtol, atol = 2e-2, 2e-2 + _bf16_ulp(scale)
+        errs[name] = checkAllclose(
+            r,
+            g.to(r.dtype),
+            rtol=rtol,
+            atol=atol,
+            tol_err_ratio=_TOL_ERR_RATIO,
+            msg=name,
+        )
+    bad = {n: e for n, e in errs.items() if e > _TOL_ERR_RATIO}
+    assert not bad, f"mismatch ratios {bad}"
+    return {"gfx": get_gfx_runtime(), "fwd us": us, "err": max(errs.values())}
 
 
 def main():
@@ -353,19 +464,32 @@ def main():
     parser.add_argument(
         "--direction",
         nargs="*",
-        default=["fwd", "bwd"],
-        choices=["fwd", "bwd"],
-        help="forward and / or backward",
+        default=["fwd", "bwd", "varlen"],
+        choices=["fwd", "bwd", "varlen"],
+        help="forward, backward, and / or packed ragged sequences (fwd + bwd)",
+    )
+    parser.add_argument(
+        "--seq_lens",
+        type=dtypes.str2tuple,
+        default=(100, 37, 0, 300, 1, 512),
+        help="ragged sequence lengths of the varlen case",
     )
     args = parser.parse_args()
 
     tests = {"fwd": test_mamba2_chunk_forward, "bwd": test_mamba2_chunk_backward}
     for direction, dtype in itertools.product(args.direction, args.dtype):
-        df = []
-        for b, t, (g, h, n, p), cs in itertools.product(
-            args.batch, args.num_tokens, args.shape, args.chunk_size
-        ):
-            df.append(tests[direction](b, t, g, h, n, p, cs, dtype))
+        if direction == "varlen":
+            df = [
+                test_mamba2_chunk_scan_varlen(args.seq_lens, g, h, n, p, cs, dtype)
+                for (g, h, n, p), cs in itertools.product(args.shape, args.chunk_size)
+            ]
+        else:
+            df = [
+                tests[direction](b, t, g, h, n, p, cs, dtype)
+                for b, t, (g, h, n, p), cs in itertools.product(
+                    args.batch, args.num_tokens, args.shape, args.chunk_size
+                )
+            ]
         df = pd.DataFrame(df)
         aiter.logger.info(
             "mamba2_chunk %s summary (markdown):\n%s",

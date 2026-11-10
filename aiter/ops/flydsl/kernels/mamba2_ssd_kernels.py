@@ -145,7 +145,7 @@ def _load_op(view, off, n):
 
 
 def build_chunk_cumsum(num_heads, chunk_size, block_h):
-    """dt[b, t, h] -> decay[b, h, t] (f32, log2 units) and dt_bht[b, h, t] (f32)."""
+    """dt[b, t, h] (f32) -> decay[b, h, t] (f32, log2 units) and dt_bht[b, h, t]."""
     H, L, BH = num_heads, chunk_size, block_h
 
     @flyc.kernel
@@ -157,7 +157,7 @@ def build_chunk_cumsum(num_heads, chunk_size, block_h):
         num_tokens: Int32,
     ):
         a_r = ptr_buf_tensor(a, fx.Float32)
-        dt_r = ptr_buf_tensor(dt, fx.BFloat16)
+        dt_r = ptr_buf_tensor(dt, fx.Float32)
         dec_w = ptr_buf_tensor(decay, fx.Float32)
         dtw = ptr_buf_tensor(dt_bht, fx.Float32)
 
@@ -209,7 +209,8 @@ def build_fwd_pass_state(
     backward=False,
     state_f32=False,
 ):
-    """Carry the state across chunks; one wave owns a (16*rm) x (16*rn) state tile.
+    """Carry the state across chunks; one wave owns a (16*rm) x (16*rn) state tile
+    of one (sequence, head), walking that sequence's chunks (``seq_chunks``).
 
     ``backward`` runs the adjoint recurrence instead: chunks in reverse order,
     with ``x`` <- dout, ``b`` <- c and weights ``w[t] = exp2(d[t])``, giving the
@@ -260,6 +261,7 @@ def build_fwd_pass_state(
         init_state: fx.Tensor,
         hiddens: fx.Tensor,
         final_state: fx.Tensor,
+        seq_chunks: fx.Tensor,
         num_tokens: Int32,
     ):
         x_rows = _row_view(x)
@@ -269,6 +271,7 @@ def build_fwd_pass_state(
         init_r = ptr_buf_tensor(init_state, fx.Float32)
         hid_w = ptr_buf_tensor(hiddens, STATE_ELEM)
         fin_w = ptr_buf_tensor(final_state, fx.Float32)
+        seq_r = ptr_buf_tensor(seq_chunks, fx.Int32)
         lds = _lds_base(SharedStorage)
 
         lane = fx.thread_idx.x
@@ -276,21 +279,24 @@ def build_fwd_pass_state(
         hi = lane // 16
         p0 = fx.block_idx.x * BP
         n0 = fx.block_idx.y * BN
-        bh = fx.block_idx.z
-        batch = bh // H
-        h = bh % H
+        seq = fx.block_idx.z // H
+        h = fx.block_idx.z % H
         g = h // HPG
+        # Tokens are one flat run of whole chunks; sequence ``seq`` owns chunks
+        # seq_chunks[seq] .. seq_chunks[seq + 1] - 1.
         num_chunks = num_tokens // L
+        c_first = fx.Int32(seq_r[seq])
+        seq_chunk_count = fx.Int32(seq_r[seq + 1]) - c_first
 
-        tok_base = bh * num_tokens  # [b, h, t] row of decay / dt
+        tok_base = h * num_tokens  # [h, t] row of decay / dt
         x_row = H * P
         b_row = G * N
 
         def chunk_of(it):
             c = it // SPC
             if const_expr(backward):
-                c = num_chunks - 1 - c
-            return c
+                c = seq_chunk_count - 1 - c
+            return c_first + c
 
         def load_slab(it):
             """Global -> registers for slab ``it``: x / B tiles (128-bit), weights,
@@ -298,7 +304,7 @@ def build_fwd_pass_state(
             """
             c, step = chunk_of(it), it % SPC
             t0 = c * L + step * SL
-            row0 = batch * num_tokens + t0
+            row0 = t0
             xv = []
             for k in range_constexpr(SL * BP // (8 * WAVE)):
                 u = lane + k * WAVE
@@ -350,7 +356,7 @@ def build_fwd_pass_state(
         def state_off(i, j, si):
             return (p0 + TILE * i + W.acc_row(si, hi)) * N + n0 + TILE * j + l16
 
-        state_base = bh * (P * N)
+        state_base = (seq * H + h) * (P * N)
         accs = []
         for i in range_constexpr(rm):
             for j in range_constexpr(rn):
@@ -364,7 +370,7 @@ def build_fwd_pass_state(
                     )
                 )
 
-        num_slabs = num_chunks * SPC
+        num_slabs = seq_chunk_count * SPC
         store_slab(*load_slab(fx.Int32(0)))
         gpu.barrier()
 
@@ -373,7 +379,7 @@ def build_fwd_pass_state(
             s_accs = _carried(state)
             if it % SPC == 0:
                 # State entering the chunk (leaving it, for backward).
-                hid_base = (bh * num_chunks + chunk_of(it)) * (P * N)
+                hid_base = (h * num_chunks + chunk_of(it)) * (P * N)
                 for i in range_constexpr(rm):
                     for j in range_constexpr(rn):
                         acc = s_accs[i * rn + j]
@@ -439,14 +445,23 @@ def build_fwd_pass_state(
         init_state: fx.Tensor,
         hiddens: fx.Tensor,
         final_state: fx.Tensor,
+        seq_chunks: fx.Tensor,
         num_tokens: Int32,
-        batch: Int32,
+        num_seqs: Int32,
         stream: fx.Stream,
     ):
         fwd_pass_state_kernel(
-            x, b, decay, dt_bht, init_state, hiddens, final_state, num_tokens
+            x,
+            b,
+            decay,
+            dt_bht,
+            init_state,
+            hiddens,
+            final_state,
+            seq_chunks,
+            num_tokens,
         ).launch(
-            grid=(P // BP, N // BN, fx.Int64(batch * H)),
+            grid=(P // BP, N // BN, fx.Int64(num_seqs * H)),
             block=(WAVE, 1, 1),
             stream=stream,
         )

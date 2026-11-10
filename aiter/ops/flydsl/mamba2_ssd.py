@@ -1,21 +1,22 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Mamba-2 SSD chunked forward and backward (FlyDSL).
+"""Mamba-2 SSD chunked scan (FlyDSL), forward and backward.
 
-Contract::
+``mamba_chunk_scan_combined`` takes the arguments of ``mamba_ssm``'s function of
+the same name, including variable-length batches (``cu_seqlens``), and is
+differentiable.
 
-    x    [B, T, H, P] bf16      a  [H] f32        d [H] f32
-    b, c [B, T, G, N] bf16      dt [B, T, H] bf16 (post-softplus)
-    init_state [B, H, P, N] f32
-    -> out [B, T, H, P] bf16, final_state [B, H, P, N] f32
-
-Tile configs are autotuned once per shape (tune once, cache, launch); set ``AITER_MAMBA2_AUTOTUNE=0`` to use the defaults.
+Internally every batch is one flat run of whole chunks: each sequence starts a
+new chunk, and a ragged sequence's last chunk is padded with ``dt = 0`` tokens,
+which change neither the state nor any gradient. Tile configs are autotuned
+once per shape bucket; set ``AITER_MAMBA2_AUTOTUNE=0`` to use the defaults.
 """
 
 import functools
 import itertools
 import math
 import os
+from dataclasses import dataclass
 
 import flydsl.expr as fx
 import torch
@@ -28,6 +29,13 @@ from aiter.jit.utils.chip_info import (
     get_lds_capacity_bytes,
 )
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
+from aiter.ops.triton._triton_kernels.gated_delta_net.gated_delta_rule_utils import (
+    tensor_cache,
+)
+from aiter.ops.triton._triton_kernels.gated_delta_net.utils.index import (
+    prepare_chunk_offsets,
+    prepare_lens,
+)
 
 from .kernels.mamba2_ssd_kernels import (
     MAX_THREADS,
@@ -107,14 +115,20 @@ def _out(device, H, G, P, N, L, rp, ku, persistent):
     return build_compute_out(get_gfx_runtime(), H, G, P, N, L, rp, ku, persistent)
 
 
-def _tuning_key(*args):
-    return tuple(
-        (
-            (tuple(arg.shape), tuple(arg.stride()), arg.dtype, str(arg.device))
-            if torch.is_tensor(arg)
-            else arg
-        )
-        for arg in args
+def _tuning_key(x, b, num_seqs, *flags):
+    """Shape bucket: varlen batches vary in length, so token and sequence counts
+    are rounded up to powers of two."""
+
+    def bucket(n):
+        return 1 << max(n - 1, 0).bit_length()
+
+    return (
+        x.shape[1:],
+        b.shape[1:],
+        bucket(x.shape[0]),
+        bucket(num_seqs),
+        x.device,
+        *flags,
     )
 
 
@@ -143,105 +157,122 @@ _MAX_BUFFER_BYTES = 2**31
 MAX_CHUNK_SIZE = MAX_THREADS // WAVE * TILE
 
 
-def _check_inputs(x, a, b, c, d, dt, init_state, chunk_size, state_bytes=2):
-    """Reject inputs the kernels would index out of bounds; see the contract."""
-    gfx = get_gfx_runtime()
-    if gfx not in SUPPORTED_GFX:
-        raise RuntimeError(f"mamba2 FlyDSL kernels support {SUPPORTED_GFX}; got {gfx}")
-    if x.dim() != 4 or b.dim() != 4:
-        raise ValueError(f"x and b must be 4-D, got {x.dim()}-D and {b.dim()}-D")
-    batch_size, num_tokens, num_heads, head_size = x.shape
-    num_groups, state_size = b.shape[2], b.shape[3]
-    expected = {
-        "b": (batch_size, num_tokens, num_groups, state_size),
-        "c": (batch_size, num_tokens, num_groups, state_size),
-        "dt": (batch_size, num_tokens, num_heads),
-        "a": (num_heads,),
-        "d": (num_heads,),
-        "init_state": (batch_size, num_heads, head_size, state_size),
-    }
-    given = {"b": b, "c": c, "dt": dt, "a": a, "d": d, "init_state": init_state}
-    for name, shape in expected.items():
-        if tuple(given[name].shape) != shape:
-            raise ValueError(
-                f"{name} must have shape {shape}, got {tuple(given[name].shape)}"
-            )
-    if not 0 < chunk_size <= MAX_CHUNK_SIZE or num_tokens % chunk_size:
-        raise ValueError(
-            f"chunk_size must be in (0, {MAX_CHUNK_SIZE}] and divide num_tokens"
-        )
-    if chunk_size % 16 or head_size % 16 or state_size % 16:
-        raise ValueError("chunk_size, head_size and state_size must be multiples of 16")
-    if num_heads % num_groups:
-        raise ValueError("num_heads must be a multiple of num_groups")
-    for t in (x, b, c, dt):
-        if t.dtype != torch.bfloat16 or not t.is_contiguous():
-            raise ValueError("x, b, c, dt must be contiguous bf16")
-    for t in (a, b, c, d, dt, init_state):
-        if t.device != x.device:
-            raise ValueError("all inputs must be on x's device")
+@dataclass(frozen=True)
+class _Layout:
+    """Where each token sits in the padded flat chunk layout."""
+
+    real_tokens: int  # cu_seqlens[-1]
+    num_tokens: int  # padded: num_chunks * chunk_size
+    seq_chunks: torch.Tensor  # int32 [S + 1], first chunk of each sequence
+    dst: torch.Tensor | None  # padded position of each token; None if no padding
+
+
+@tensor_cache  # one layout per cu_seqlens tensor, shared by every layer
+def _layout(cu_seqlens, chunk_size):
+    lens = prepare_lens(cu_seqlens)
+    offsets = prepare_chunk_offsets(cu_seqlens, chunk_size)
+    first, last, shortest, ragged, num_chunks = torch.stack(  # one host sync
+        [
+            cu_seqlens[0],
+            cu_seqlens[-1],
+            lens.min(),
+            (lens % chunk_size).any(),
+            offsets[-1],
+        ]
+    ).tolist()
+    if first != 0 or shortest < 0:
+        raise ValueError("cu_seqlens must start at 0 and never decrease")
+    dst = None
+    if ragged:  # repeat_interleave, as empty sequences have no position 0
+        seq = torch.repeat_interleave(torch.arange(len(lens), device=lens.device), lens)
+        pos = torch.arange(last, device=lens.device) - cu_seqlens[seq]
+        dst = offsets[seq] * chunk_size + pos
+    return _Layout(last, num_chunks * chunk_size, offsets.int(), dst)
+
+
+@functools.lru_cache(maxsize=64)
+def _uniform_layout(batch, seqlen, chunk_size, device):
+    """Layout of ``batch`` equal-length sequences, without a host sync."""
+    per_seq = -(-seqlen // chunk_size)
+    offsets = torch.arange(batch + 1, device=device, dtype=torch.int32) * per_seq
+    dst = None
+    if seqlen % chunk_size:
+        rows = torch.arange(batch, device=device)[:, None] * (per_seq * chunk_size)
+        dst = (rows + torch.arange(seqlen, device=device)).flatten()
+    return _Layout(batch * seqlen, batch * per_seq * chunk_size, offsets, dst)
+
+
+def _pad(t, layout):
+    """[T, ...] -> [num_tokens, ...], zero padding."""
+    if layout.dst is None:
+        return t
+    return t.new_zeros(layout.num_tokens, *t.shape[1:]).index_copy(0, layout.dst, t)
+
+
+def _unpad(t, layout):
+    return t if layout.dst is None else t.index_select(0, layout.dst)
+
+
+def _check_buffers(
+    num_tokens, num_heads, head_size, num_groups, state_size, num_chunks
+):
     # Buffer descriptors use 32-bit byte offsets over the whole buffer.
-    hidden_bytes = (
-        batch_size
-        * num_heads
-        * (num_tokens // chunk_size)
-        * head_size
-        * state_size
-        * state_bytes
-    )
     largest = max(
-        x.nbytes, b.nbytes, batch_size * num_heads * num_tokens * 4, hidden_bytes
+        num_tokens * num_heads * head_size * 2,
+        num_tokens * num_groups * state_size * 2,
+        num_heads * num_tokens * 4,
+        num_heads * num_chunks * head_size * state_size * 4,  # fp32 in the backward
     )
     if largest >= _MAX_BUFFER_BYTES:
         raise ValueError(
             f"a {largest}-byte buffer exceeds the {_MAX_BUFFER_BYTES}-byte limit of "
-            "32-bit buffer offsets; split the batch or the heads"
+            "32-bit buffer offsets; split the batch"
         )
 
 
 def _chunk_cumsum(a, dt, chunk_size, stream):
-    """dt:[b,t,h] -> (decay_bht [b,h,t], dt_bht [b,h,t]), decay in log2 units."""
-    batch_size, num_tokens, num_heads = dt.shape
-    decay_bht = dt.new_empty(batch_size, num_heads, num_tokens, dtype=torch.float32)
-    dt_bht = torch.empty_like(decay_bht)
+    """dt [T, H] f32 -> (decay [H, T] in log2 units, dt [H, T])."""
+    num_tokens, num_heads = dt.shape
+    decay_ht = dt.new_empty(num_heads, num_tokens, dtype=torch.float32)
+    dt_ht = torch.empty_like(decay_ht)
     _run_compiled(
         _cumsum(dt.device.index, num_heads, chunk_size),
         a,
         dt,
-        decay_bht,
-        dt_bht,
+        decay_ht,
+        dt_ht,
         num_tokens,
         num_tokens // chunk_size,
-        batch_size,
+        1,
         stream,
     )
-    return decay_bht, dt_bht
+    return decay_ht, dt_ht
 
 
-def _fwd_pass_state(
+def _pass_state(
     x,
     b,
-    dt_bht,
-    decay_bht,
+    dt_ht,
+    decay_ht,
     init_state,
+    layout,
     chunk_size,
     stream,
     config,
     backward=False,
-    state_dtype=None,
+    state_dtype=torch.bfloat16,
 ):
-    """Return chunk-entry states (x.dtype unless ``state_dtype``) and the fp32
-    final state. With ``backward``, x / b / init_state are dout / c / dfinal_state
-    and this returns the per-chunk state gradients and the initial-state gradient.
-    """
-    state_dtype = x.dtype if state_dtype is None else state_dtype
-    batch_size, num_tokens, num_heads, head_size = x.shape
-    num_groups, state_size = b.shape[2], b.shape[3]
+    """Walk each sequence's chunks; return the state entering every chunk and each
+    sequence's final state. With ``backward`` (x, b, init_state = dout, c,
+    dfinal_state) the walk runs in reverse and returns the state gradients."""
+    num_tokens, num_heads, head_size = x.shape
+    num_groups, state_size = b.shape[1], b.shape[2]
     num_chunks = num_tokens // chunk_size
     hiddens = x.new_empty(
-        batch_size, num_heads, num_chunks, head_size, state_size, dtype=state_dtype
+        num_heads, num_chunks, head_size, state_size, dtype=state_dtype
     )
     final_state = torch.empty_like(init_state)
+    num_seqs = init_state.shape[0]
 
     def launch(cfg):
         _run_compiled(
@@ -260,25 +291,26 @@ def _fwd_pass_state(
             ),
             x,
             b,
-            decay_bht,
-            dt_bht,
+            decay_ht,
+            dt_ht,
             init_state,
             hiddens,
             final_state,
+            layout.seq_chunks,
             num_tokens,
-            batch_size,
+            num_seqs,
             stream,
         )
 
     configs = list(_state_configs(head_size, state_size, chunk_size))
-    key = _tuning_key(x, b, init_state, chunk_size, backward, state_dtype)
-    launch(_tuned_config("fwd_pass_state", key, configs, launch, config))
+    key = _tuning_key(x, b, num_seqs, chunk_size, backward, state_dtype)
+    launch(_tuned_config("pass_state", key, configs, launch, config))
     return hiddens, final_state
 
 
-def _compute_out(x, b, c, d, dt_bht, decay_bht, hiddens, chunk_size, stream, config):
-    batch_size, num_tokens, num_heads, head_size = x.shape
-    num_groups, state_size = b.shape[2], b.shape[3]
+def _compute_out(x, b, c, d, dt_ht, decay_ht, hiddens, chunk_size, stream, config):
+    num_tokens, num_heads, head_size = x.shape
+    num_groups, state_size = b.shape[1], b.shape[2]
     out = torch.empty_like(x)
     num_chunks = num_tokens // chunk_size
 
@@ -286,8 +318,7 @@ def _compute_out(x, b, c, d, dt_bht, decay_bht, hiddens, chunk_size, stream, con
         if cfg["persistent"]:
             num_programs = cfg["occupancy"] * get_cu_num()
         else:
-            num_programs = batch_size * num_chunks * num_heads * head_size
-            num_programs //= 16 * cfg["rp"]
+            num_programs = num_chunks * num_heads * head_size // (16 * cfg["rp"])
         _run_compiled(
             _out(
                 x.device.index,
@@ -304,59 +335,32 @@ def _compute_out(x, b, c, d, dt_bht, decay_bht, hiddens, chunk_size, stream, con
             b,
             c,
             d,
-            decay_bht,
-            dt_bht,
+            decay_ht,
+            dt_ht,
             hiddens,
             out,
             num_tokens,
-            batch_size,
+            1,
             num_programs,
             stream,
         )
 
     configs = list(_out_configs(head_size, state_size, chunk_size))
-    key = _tuning_key(x, b, chunk_size)
+    key = _tuning_key(x, b, 1, chunk_size)
     launch(_tuned_config("compute_out", key, configs, launch, config))
     return out
 
 
-def mamba2_chunk_forward_flydsl(
-    x, a, b, c, d, dt, init_state, chunk_size=64, config=None
-):
-    """Return the output and fp32 final state; chunk-entry states are kept in
-    c.dtype."""
-    _check_inputs(x, a, b, c, d, dt, init_state, chunk_size)
-    if x.shape[1] == 0:  # nothing to scan: the state passes through
-        return torch.empty_like(x), init_state.float().clone()
-    head_size, state_size = x.shape[3], b.shape[3]
-    if config is not None:
-        config = {**default_config(head_size, state_size, chunk_size), **config}
-
-    a = a.float().contiguous()
-    d = d.float().contiguous()
-    init_state = init_state.float().contiguous()
-    with torch.cuda.device(x.device):
-        stream = fx.Stream(torch.cuda.current_stream(x.device))
-        decay_bht, dt_bht = _chunk_cumsum(a, dt, chunk_size, stream)
-        hiddens, final_state = _fwd_pass_state(
-            x, b, dt_bht, decay_bht, init_state, chunk_size, stream, config
-        )
-        out = _compute_out(
-            x, b, c, d, dt_bht, decay_bht, hiddens, chunk_size, stream, config
-        )
-    return out, final_state
-
-
 def _chunked(t, chunk_size):
-    """[B, T, H, ...] -> [B, H, num_chunks, chunk_size, ...]."""
-    B, T, H = t.shape[:3]
-    return t.reshape(B, T // chunk_size, chunk_size, H, *t.shape[3:]).movedim(3, 1)
+    """[T, H, ...] -> [1, H, num_chunks, chunk_size, ...]."""
+    T, H = t.shape[:2]
+    return t.reshape(T // chunk_size, chunk_size, H, *t.shape[2:]).movedim(2, 0)[None]
 
 
 def _unchunked(t):
-    """[B, H, num_chunks, chunk_size, ...] -> [B, T, H, ...]."""
-    B, H, nc, L = t.shape[:4]
-    return t.movedim(1, 3).reshape(B, nc * L, H, *t.shape[4:])
+    """[1, H, num_chunks, chunk_size, ...] -> [T, H, ...]."""
+    H, nc, L = t.shape[1:4]
+    return t[0].movedim(0, 2).reshape(nc * L, H, *t.shape[4:])
 
 
 def _chunk_grads(x, a, b, c, d, dt_bht, decay_bht, hiddens, dout, dhiddens, L):
@@ -369,12 +373,12 @@ def _chunk_grads(x, a, b, c, d, dt_bht, decay_bht, hiddens, dout, dhiddens, L):
     within a chunk -- is re-centred to sum to exactly zero, as the exact
     gradient does.
     """
-    B, T, H, _ = x.shape
-    G, N = b.shape[2], b.shape[3]
+    T, H, _ = x.shape
+    B, G, N = 1, b.shape[1], b.shape[2]
     HPG = H // G
     X, DO = _chunked(x.float(), L), _chunked(dout.float(), L)
-    Bm = _chunked(b.float().repeat_interleave(HPG, 2), L)
-    Cm = _chunked(c.float().repeat_interleave(HPG, 2), L)
+    Bm = _chunked(b.float().repeat_interleave(HPG, 1), L)
+    Cm = _chunked(c.float().repeat_interleave(HPG, 1), L)
     DT = dt_bht.view(B, H, T // L, L)
     dec = decay_bht.view(B, H, T // L, L) * math.log(2.0)  # log2 -> natural units
     gl = dec[..., -1]
@@ -411,83 +415,259 @@ def _chunk_grads(x, a, b, c, d, dt_bht, decay_bht, hiddens, dout, dhiddens, L):
     ddt = ddt + dd_rev * a[None, :, None, None]
     da = (DT * dd_rev).sum((0, 2, 3))
 
-    db = _unchunked(db).reshape(B, T, G, HPG, N).sum(3)
-    dc = _unchunked(dc).reshape(B, T, G, HPG, N).sum(3)
+    db = _unchunked(db).reshape(T, G, HPG, N).sum(2)
+    dc = _unchunked(dc).reshape(T, G, HPG, N).sum(2)
     return _unchunked(dx), da, db, dc, dD.sum(0), _unchunked(ddt)
 
 
-def mamba2_chunk_backward_flydsl(
-    x, a, b, c, d, dt, init_state, dout, dfinal_state, chunk_size=64, config=None
-):
-    """Return dx, da, db, dc, dd, ddt and the initial-state gradient.
-
-    The chunk states (fp32) and the state gradients (the forward recurrence run
-    in reverse) come from the FlyDSL pass_state kernel.
-    """
-    _check_inputs(x, a, b, c, d, dt, init_state, chunk_size, state_bytes=4)
-    if (
-        dout.shape != x.shape
-        or dout.dtype != torch.bfloat16
-        or not dout.is_contiguous()
-        or dout.device != x.device
-    ):
-        raise ValueError("dout must be contiguous bf16 shaped like x, on x's device")
-    if dfinal_state.shape != init_state.shape or dfinal_state.device != x.device:
-        raise ValueError("dfinal_state must be shaped like init_state, on x's device")
-    if x.shape[1] == 0:  # no tokens: only the state gradient passes through
-        z = torch.zeros_like
-        return (
-            z(x),
-            z(a, dtype=torch.float32),
-            z(b),
-            z(c),
-            z(d, dtype=torch.float32),
-            z(dt),
-            dfinal_state.float().clone(),
-        )
-    head_size, state_size = x.shape[3], b.shape[3]
-    if config is not None:
-        config = {**default_config(head_size, state_size, chunk_size), **config}
-
-    a = a.float().contiguous()
-    d = d.float().contiguous()
-    init_state = init_state.float().contiguous()
-    dfinal_state = dfinal_state.float().contiguous()
+def _forward(x, dt, a, b, c, d, init_state, layout, chunk_size, config):
     with torch.cuda.device(x.device):
         stream = fx.Stream(torch.cuda.current_stream(x.device))
-        decay_bht, dt_bht = _chunk_cumsum(a, dt, chunk_size, stream)
-        hiddens, _ = _fwd_pass_state(
+        decay_ht, dt_ht = _chunk_cumsum(a, dt, chunk_size, stream)
+        hiddens, final_state = _pass_state(
+            x, b, dt_ht, decay_ht, init_state, layout, chunk_size, stream, config
+        )
+        out = _compute_out(
+            x, b, c, d, dt_ht, decay_ht, hiddens, chunk_size, stream, config
+        )
+    return out, final_state
+
+
+def _backward(x, dt, a, b, c, d, init_state, dout, dfinal, layout, chunk_size, config):
+    """Chunk states (fp32) and state gradients come from the pass_state kernel run
+    both ways; the per-chunk gradients are computed from them in torch."""
+    with torch.cuda.device(x.device):
+        stream = fx.Stream(torch.cuda.current_stream(x.device))
+        decay_ht, dt_ht = _chunk_cumsum(a, dt, chunk_size, stream)
+        fp32 = {"state_dtype": torch.float32}
+        hiddens, _ = _pass_state(
             x,
             b,
-            dt_bht,
-            decay_bht,
+            dt_ht,
+            decay_ht,
             init_state,
+            layout,
             chunk_size,
             stream,
             config,
-            state_dtype=torch.float32,
+            **fp32,
         )
-        dhiddens, dinit_state = _fwd_pass_state(
+        dhiddens, dinit = _pass_state(
             dout,
             c,
-            dt_bht,
-            decay_bht,
-            dfinal_state,
+            dt_ht,
+            decay_ht,
+            dfinal,
+            layout,
             chunk_size,
             stream,
             config,
             backward=True,
-            state_dtype=torch.float32,
+            **fp32,
         )
+        # pass_state keeps states as [H, C, P, N]; the torch stage wants [1, H, C, ...].
         dx, da, db, dc, dd, ddt = _chunk_grads(
-            x, a, b, c, d, dt_bht, decay_bht, hiddens, dout, dhiddens, chunk_size
+            x,
+            a,
+            b,
+            c,
+            d,
+            dt_ht[None],
+            decay_ht[None],
+            hiddens[None],
+            dout,
+            dhiddens[None],
+            chunk_size,
         )
-    return (
-        dx.to(x.dtype),
-        da,
-        db.to(b.dtype),
-        dc.to(c.dtype),
-        dd,
-        ddt.to(dt.dtype),
-        dinit_state,
+    return dx.to(x.dtype), ddt, da, db.to(b.dtype), dc.to(c.dtype), dd, dinit
+
+
+class _ChunkScan(torch.autograd.Function):
+    """Scan over the padded flat layout: x [T, H, P], dt [T, H] f32, b / c [T, G, N],
+    a / d [H] f32, init_state [S, H, P, N] f32 -> out, final_state [S, H, P, N]."""
+
+    @staticmethod
+    def forward(ctx, x, dt, a, b, c, d, init_state, layout, chunk_size, config):
+        ctx.save_for_backward(x, dt, a, b, c, d, init_state)
+        ctx.layout, ctx.chunk_size, ctx.config = layout, chunk_size, config
+        return _forward(x, dt, a, b, c, d, init_state, layout, chunk_size, config)
+
+    @staticmethod
+    def backward(ctx, dout, dfinal):
+        x, dt, a, b, c, d, init_state = ctx.saved_tensors
+        dout = torch.zeros_like(x) if dout is None else dout.to(x.dtype).contiguous()
+        dfinal = torch.zeros_like(init_state) if dfinal is None else dfinal.float()
+        grads = _backward(
+            x,
+            dt,
+            a,
+            b,
+            c,
+            d,
+            init_state,
+            dout,
+            dfinal.contiguous(),
+            ctx.layout,
+            ctx.chunk_size,
+            ctx.config,
+        )
+        return (*grads, None, None, None)
+
+
+def _cu_seqlens(x, cu_seqlens, seq_idx):
+    """Packed sequences' cu_seqlens, or None for a batch of equal-length rows."""
+    batch = x.shape[0]
+    if cu_seqlens is None and seq_idx is None:
+        return None
+    if batch != 1:
+        raise ValueError("packed sequences (cu_seqlens / seq_idx) need batch size 1")
+    if cu_seqlens is None:
+        counts = torch.bincount(seq_idx[0].long())
+        cu_seqlens = torch.cat([counts.new_zeros(1), counts.cumsum(0)])
+    if cu_seqlens.dim() != 1 or cu_seqlens.numel() < 2 or cu_seqlens.device != x.device:
+        raise ValueError("cu_seqlens must be 1-D with >= 2 entries, on x's device")
+    return cu_seqlens
+
+
+def _check_inputs(x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, num_seqs):
+    gfx = get_gfx_runtime()
+    if gfx not in SUPPORTED_GFX:
+        raise RuntimeError(f"mamba2 FlyDSL kernels support {SUPPORTED_GFX}; got {gfx}")
+    if x.dim() != 4 or B.dim() != 4:
+        raise ValueError(f"x and B must be 4-D, got {x.dim()}-D and {B.dim()}-D")
+    batch, seqlen, nheads, headdim = x.shape
+    ngroups, dstate = B.shape[2], B.shape[3]
+    expected = {
+        "dt": (dt, (batch, seqlen, nheads)),
+        "A": (A, (nheads,)),
+        "B": (B, (batch, seqlen, ngroups, dstate)),
+        "C": (C, (batch, seqlen, ngroups, dstate)),
+        "z": (z, x.shape),
+        "dt_bias": (dt_bias, (nheads,)),
+        "initial_states": (initial_states, (num_seqs, nheads, headdim, dstate)),
+    }
+    if D is not None:
+        expected["D"] = (D, (nheads,) if D.dim() == 1 else (nheads, headdim))
+    for name, (t, shape) in expected.items():
+        if t is None:
+            continue
+        if tuple(t.shape) != tuple(shape):
+            raise ValueError(
+                f"{name} must have shape {tuple(shape)}, got {tuple(t.shape)}"
+            )
+        if t.device != x.device:
+            raise ValueError(f"{name} must be on x's device")
+    if not 0 < chunk_size <= MAX_CHUNK_SIZE or chunk_size % 16:
+        raise ValueError(
+            f"chunk_size must be a multiple of 16 in [16, {MAX_CHUNK_SIZE}]"
+        )
+    if headdim % 16 or dstate % 16:
+        raise ValueError("headdim and dstate must be multiples of 16")
+    if nheads % ngroups:
+        raise ValueError("nheads must be a multiple of ngroups")
+    for name, t in (("x", x), ("B", B), ("C", C)):
+        if t.dtype != torch.bfloat16:
+            raise ValueError(f"{name} must be bf16, got {t.dtype}")
+
+
+def mamba_chunk_scan_combined(
+    x,
+    dt,
+    A,
+    B,
+    C,
+    chunk_size,
+    D=None,
+    z=None,
+    dt_bias=None,
+    initial_states=None,
+    seq_idx=None,
+    cu_seqlens=None,
+    dt_softplus=False,
+    dt_limit=(0.0, float("inf")),
+    return_final_states=False,
+    return_varlen_states=False,
+    config=None,
+):
+    """Mamba-2 SSD scan with ``mamba_ssm.ops.triton.ssd_combined``'s interface.
+
+    x [b, l, h, p], dt [b, l, h], A [h], B / C [b, l, g, n] (x, B, C in bf16),
+    D [h] or [h, p], z [b, l, h, p], dt_bias [h], initial_states [s, h, p, n]
+    with s = b, or the number of sequences when packed. Packed sequences (b = 1)
+    are given by ``cu_seqlens`` [s + 1] or ``seq_idx`` [1, l]; each starts from its
+    own initial state. Returns ``out`` [b, l, h, p], plus the final state of each
+    batch row (``return_final_states``) and of each packed sequence
+    (``return_varlen_states``), in fp32.
+    """
+    batch, seqlen, nheads, headdim = x.shape
+    cu = _cu_seqlens(x, cu_seqlens, seq_idx)
+    num_seqs = batch if cu is None else cu.numel() - 1
+    _check_inputs(x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, num_seqs)
+    if return_varlen_states and cu_seqlens is None and seq_idx is None:
+        raise ValueError("return_varlen_states needs cu_seqlens or seq_idx")
+    dstate = B.shape[3]
+
+    dt = dt.float()
+    if dt_bias is not None:
+        dt = dt + dt_bias.float()
+    if dt_softplus:
+        dt = torch.nn.functional.softplus(dt)
+    if tuple(dt_limit) != (0.0, float("inf")):
+        dt = dt.clamp(*dt_limit)
+    if initial_states is None:
+        initial_states = x.new_zeros(
+            num_seqs, nheads, headdim, dstate, dtype=torch.float32
+        )
+    d_head = (
+        D.float() if D is not None and D.dim() == 1 else A.new_zeros(nheads).float()
     )
+
+    if cu is None:
+        layout = _uniform_layout(batch, seqlen, chunk_size, x.device)
+    else:
+        layout = _layout(cu, chunk_size)
+    if layout.real_tokens != batch * seqlen:
+        raise ValueError(f"cu_seqlens must end at seqlen={seqlen}")
+    num_tokens = batch * seqlen
+    _check_buffers(
+        layout.num_tokens,
+        nheads,
+        headdim,
+        B.shape[2],
+        dstate,
+        layout.num_tokens // chunk_size,
+    )
+    if config is not None:
+        config = {**default_config(headdim, dstate, chunk_size), **config}
+
+    def flat(t):
+        return _pad(t.reshape(num_tokens, *t.shape[2:]).contiguous(), layout)
+
+    if num_tokens == 0:
+        out, states = x.new_empty(x.shape), initial_states.float()
+    else:
+        out, states = _ChunkScan.apply(
+            flat(x),
+            flat(dt),
+            A.float().contiguous(),
+            flat(B),
+            flat(C),
+            d_head,
+            initial_states.float().contiguous(),
+            layout,
+            chunk_size,
+            config,
+        )
+        out = _unpad(out, layout).reshape(x.shape)
+    if D is not None and D.dim() == 2:
+        out = out + (x * D.to(x.dtype)).to(out.dtype)
+    if z is not None:
+        out = out * torch.nn.functional.silu(z.to(out.dtype))
+    results = [out]
+    if return_final_states:
+        results.append(
+            states if cu_seqlens is None and seq_idx is None else states[-1:]
+        )
+    if return_varlen_states:
+        results.append(states)
+    return results[0] if len(results) == 1 else tuple(results)
