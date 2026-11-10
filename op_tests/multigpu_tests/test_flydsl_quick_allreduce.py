@@ -39,7 +39,8 @@ overridden on every rung of the shipping ladder (``KNOB_CASES``), including
 the narrow blocks where a VMEM store-data hazard once showed up; the fp16
 transport over a matrix of pinned ``super_tile``/``block``; and
 ``test_quick_allreduce_pinned_codec`` -- the ring with its wire formats
-pinned per lap: all-INT4 at TP8, and one lap lossless to isolate the other.
+pinned per lap: all-INT4 at TP8, and one lap lossless to isolate the other;
+and the mesh on its opt-in INT5 and INT6 wire formats at TP4 and TP8.
 
 Every row also checks that all ranks wrote bit-identical output: each rank
 decodes every chunk from the same packets, its own included -- its own from the
@@ -234,15 +235,28 @@ EDGE_CASES = (
     (8, "ring", 512, 5120, "degenerate"),
 )
 
-# (tp, tokens, hidden, rs_codec, ag_codec), ring algo only. ``--extended``
-# only: production leaves both laps at the per-world default.
+# (tp, algorithm, tokens, hidden, rs_codec, ag_codec). ``--extended`` only:
+# production leaves both laps at the per-world default.
 PINNED_CODEC_CASES = (
-    (8, 512, 5120, "int4", "int4"),
+    (8, "ring", 512, 5120, "int4", "int4"),
     # The ring's shipping default at TP8 (RS_INT6_MIN_WORLD), pinned as well.
-    (8, 512, 5120, "int6", "int4"),
-    (8, 512, 5120, "fp16", "int4"),
-    (8, 512, 5120, "int4", "fp16"),
+    (8, "ring", 512, 5120, "int6", "int4"),
+    (8, "ring", 512, 5120, "fp16", "int4"),
+    (8, "ring", 512, 5120, "int4", "fp16"),
+    # The mesh's opt-in wire formats, on a decode payload and on the top of
+    # the mesh window, which TP8 serves from its ST=8 rung.
+    *(
+        (tp, "mesh", tokens, hidden, codec, codec)
+        for tp in (4, 8)
+        for codec in ("int5", "int6")
+        for tokens, hidden in ((512, 5120), (TOP_PAYLOAD_BYTES // _ROW_BYTES, HIDDEN))
+    ),
 )
+
+# The mesh's pinned INT5/INT6 floors, ~1.5 dB under what each delivers at
+# TP4/TP8 (gfx950: INT5 24.8-25.1 dB, INT6 30.8-31.1 dB), so a wider codec
+# that decodes at INT4 quality fails.
+MESH_PINNED_SQNR_MIN_DB = {"int5": 23.0, "int6": 29.0}
 
 # (tp, algorithm, tokens, hidden, super_tile, block) on the lossless
 # fp16 wire, with the geometry pinned. ``--extended`` only: a default run
@@ -1595,17 +1609,23 @@ def test_quick_allreduce_divisor(tokens, hidden, tp, fill, divisor):
 
 
 @benchmark()
-def test_quick_allreduce_pinned_codec(tokens, hidden, tp, rs_codec, ag_codec):
-    """The ring with both laps' wire formats pinned; correctness only."""
-    key = _key(tp, algorithm="ring", rs_codec=rs_codec, ag_codec=ag_codec)
+def test_quick_allreduce_pinned_codec(
+    tokens, hidden, tp, algorithm, rs_codec, ag_codec
+):
+    """One schedule with both laps' wire formats pinned; correctness only."""
+    key = _key(tp, algorithm=algorithm, rs_codec=rs_codec, ag_codec=ag_codec)
     rows = _result(key, (tokens, hidden, "normal", False))
-    label = f"tp={tp} ring {tokens}x{hidden} rs={rs_codec} ag={ag_codec}"
+    label = f"tp={tp} {algorithm} {tokens}x{hidden} rs={rs_codec} ag={ag_codec}"
+    if algorithm == "mesh":
+        floor = MESH_PINNED_SQNR_MIN_DB[rs_codec]
+    else:
+        floor = SQNR_MIN_DB_TP8_INT4_RING
     _check_sqnr(
         label,
         rows,
-        floor=SQNR_MIN_DB_TP8_INT4_RING,
-        expected_st=_shipping_st(rows, tokens * hidden * 2, "ring", tp),
-        algorithm="ring",
+        floor=floor,
+        expected_st=_shipping_st(rows, tokens * hidden * 2, algorithm, tp),
+        algorithm=algorithm,
     )
     _check(
         label,
@@ -1877,10 +1897,10 @@ def _verify(args, tps, algos, dts, link) -> None:
         _register(_ship_key(tp, algorithm, None), (tokens, hidden, fill, False))
     pinned = []
     if args.extended:
-        pinned = [c for c in PINNED_CODEC_CASES if (c[0], "ring") in plans]
-    for tp, tokens, hidden, rs, ag in pinned:
+        pinned = [c for c in PINNED_CODEC_CASES if (c[0], c[1]) in plans]
+    for tp, algorithm, tokens, hidden, rs, ag in pinned:
         _register(
-            _key(tp, algorithm="ring", rs_codec=rs, ag_codec=ag),
+            _key(tp, algorithm=algorithm, rs_codec=rs, ag_codec=ag),
             (tokens, hidden, "normal", False),
         )
     # The fp16 wire through each production schedule's own ladder, on the
@@ -1967,8 +1987,8 @@ def _verify(args, tps, algos, dts, link) -> None:
     _summarize(
         "flydsl quick allreduce pinned codec",
         [
-            test_quick_allreduce_pinned_codec(tokens, hidden, tp, rs, ag)
-            for tp, tokens, hidden, rs, ag in pinned
+            test_quick_allreduce_pinned_codec(tokens, hidden, tp, algorithm, rs, ag)
+            for tp, algorithm, tokens, hidden, rs, ag in pinned
         ],
     )
     _summarize(
