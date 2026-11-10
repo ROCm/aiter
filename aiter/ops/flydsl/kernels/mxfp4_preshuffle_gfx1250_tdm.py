@@ -66,6 +66,9 @@ LDS_SOA_LOAD_INTERLEAVE = os.environ.get("LDS_SOA_LOAD_INTERLEAVE")
 if LDS_SOA_LOAD_INTERLEAVE is not None:
     LDS_SOA_LOAD_INTERLEAVE = int(LDS_SOA_LOAD_INTERLEAVE)
 FORCE_1X4_CLUSTER = int(os.environ.get("AITER_FLYDSL_FORCE_1X4_CLUSTER", "0"))
+# FHMoE bf16 shared tile: convert its fp8 B with the cvt's own e8m0 scale (one
+# instruction per 8 values) instead of an unscaled cvt and an f32 multiply.
+FHMOE_HW_SCALE = int(os.environ.get("AITER_FHMOE_HW_SCALE", "1"))
 DISABLE_CLUSTER_SYNC = int(os.environ.get("AITER_FLYDSL_DISABLE_CLUSTER_SYNC", "0"))
 if MMA_GROUP < 1 or MMA_FIRST_GROUP < 1:
     raise ValueError("AITER_FLYDSL_MMA_GROUP values must be positive")
@@ -529,6 +532,7 @@ def launch_gemm_a8w4_tdm(
         "_shfp8"
         + ("" if SH_SPLIT == 1 else ("_ngrid" if SH_GRID else "_n2pass"))
         + ("_a16" if shared_a16 else "")
+        + ("hw" if shared_a16 and FHMOE_HW_SCALE else "")
         if shared_b
         else ""
     )
@@ -1316,6 +1320,18 @@ def launch_gemm_a8w4_tdm(
                 # cvt and an exact power-of-two multiply (both fit bf16 exactly).
                 from flydsl.expr.rocdl import cvt_scale_pk8_f32_fp8
 
+                if const_expr(FHMOE_HW_SCALE):
+                    # One cvt with the e8m0 in the scale operand's byte 0.
+                    from flydsl.expr.rocdl import cvt_scale_pk8_bf16_fp8
+
+                    return Vec(
+                        cvt_scale_pk8_bf16_fp8(
+                            T.vec(8, T.bf16),
+                            Vec.from_elements(dwords, fx.Int32).ir_value(),
+                            fx.Int32(e8m0).ir_value(),
+                            0,
+                        )
+                    )
                 unscaled = cvt_scale_pk8_f32_fp8(
                     T.vec(8, T.f32),
                     Vec.from_elements(dwords, fx.Int32).ir_value(),
