@@ -2831,6 +2831,20 @@ def _bwd_preprocess(
     IS_VARLEN: tl.constexpr,
     IS_FP8: tl.constexpr,
 ):
+    # Cast strides to int64 to prevent int32 overflow for large sequences (>2^31 elements).
+    # Keeps function signature unchanged to retain 32-bit vectorized load specialization.
+    stride_ob = tl.cast(stride_ob, tl.int64)
+    stride_oh = tl.cast(stride_oh, tl.int64)
+    stride_om = tl.cast(stride_om, tl.int64)
+    stride_od = tl.cast(stride_od, tl.int64)
+    stride_dob = tl.cast(stride_dob, tl.int64)
+    stride_doh = tl.cast(stride_doh, tl.int64)
+    stride_dom = tl.cast(stride_dom, tl.int64)
+    stride_dod = tl.cast(stride_dod, tl.int64)
+    stride_delta_b = tl.cast(stride_delta_b, tl.int64)
+    stride_delta_h = tl.cast(stride_delta_h, tl.int64)
+    stride_delta_m = tl.cast(stride_delta_m, tl.int64)
+
     pid_m = tl.program_id(0)
     bid = tl.program_id(1)
     hid = tl.program_id(2)
@@ -3469,6 +3483,7 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
     DEBUG_TRITON_DETAIL: tl.constexpr,
     NUM_XCD: tl.constexpr = 1,
 ):
+<<<<<<< HEAD:aiter/ops/triton/_triton_kernels/attention/dao_ai/bwd.py
     # The forward's dropout state, read on the device: no host sync, and capture stays legal.
     if ENABLE_DROPOUT:
         philox_seed = tl.load(rng_state)
@@ -3476,6 +3491,55 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
     else:
         philox_seed = 0
         philox_offset_base = 0
+=======
+    # Cast strides to int64 to prevent int32 overflow for large sequences (>2^31 elements).
+    # Keeps function signature unchanged to retain 32-bit vectorized load specialization.
+    stride_qb = tl.cast(stride_qb, tl.int64)
+    stride_qh = tl.cast(stride_qh, tl.int64)
+    stride_qm = tl.cast(stride_qm, tl.int64)
+    stride_qd = tl.cast(stride_qd, tl.int64)
+    stride_kb = tl.cast(stride_kb, tl.int64)
+    stride_kh = tl.cast(stride_kh, tl.int64)
+    stride_kn = tl.cast(stride_kn, tl.int64)
+    stride_kd = tl.cast(stride_kd, tl.int64)
+    stride_vb = tl.cast(stride_vb, tl.int64)
+    stride_vh = tl.cast(stride_vh, tl.int64)
+    stride_vn = tl.cast(stride_vn, tl.int64)
+    stride_vd = tl.cast(stride_vd, tl.int64)
+    stride_dqb = tl.cast(stride_dqb, tl.int64)
+    stride_dqh = tl.cast(stride_dqh, tl.int64)
+    stride_dqm = tl.cast(stride_dqm, tl.int64)
+    stride_dqd = tl.cast(stride_dqd, tl.int64)
+    stride_dkb = tl.cast(stride_dkb, tl.int64)
+    stride_dkh = tl.cast(stride_dkh, tl.int64)
+    stride_dkn = tl.cast(stride_dkn, tl.int64)
+    stride_dkd = tl.cast(stride_dkd, tl.int64)
+    stride_dvb = tl.cast(stride_dvb, tl.int64)
+    stride_dvh = tl.cast(stride_dvh, tl.int64)
+    stride_dvn = tl.cast(stride_dvn, tl.int64)
+    stride_dvd = tl.cast(stride_dvd, tl.int64)
+    stride_lse_b = tl.cast(stride_lse_b, tl.int64)
+    stride_lse_h = tl.cast(stride_lse_h, tl.int64)
+    stride_lse_m = tl.cast(stride_lse_m, tl.int64)
+    stride_delta_b = tl.cast(stride_delta_b, tl.int64)
+    stride_delta_h = tl.cast(stride_delta_h, tl.int64)
+    stride_delta_m = tl.cast(stride_delta_m, tl.int64)
+    stride_dob = tl.cast(stride_dob, tl.int64)
+    stride_doh = tl.cast(stride_doh, tl.int64)
+    stride_dom = tl.cast(stride_dom, tl.int64)
+    stride_dod = tl.cast(stride_dod, tl.int64)
+    stride_dropoutb = tl.cast(stride_dropoutb, tl.int64)
+    stride_dropouth = tl.cast(stride_dropouth, tl.int64)
+    stride_dropoutm = tl.cast(stride_dropoutm, tl.int64)
+    stride_dropoutn = tl.cast(stride_dropoutn, tl.int64)
+    if IS_FP8:
+        stride_descale_q_z = tl.cast(stride_descale_q_z, tl.int64)
+        stride_descale_k_z = tl.cast(stride_descale_k_z, tl.int64)
+        stride_descale_v_z = tl.cast(stride_descale_v_z, tl.int64)
+    stride_az = tl.cast(stride_az, tl.int64)
+    stride_ah = tl.cast(stride_ah, tl.int64)
+
+>>>>>>> 34a3c41b9 ([Triton] Cast strides to int64 in MHA backward kernels to prevent overflow):aiter/ops/triton/_triton_kernels/flash_attn_triton_amd/bwd.py
     # program ids
     hkid = tl.program_id(0)
     pid = tl.program_id(1)
@@ -4109,6 +4173,7 @@ def bwd_kernel_fused_noncausal(
     DEBUG_TRITON_DETAIL: tl.constexpr,
     NUM_XCD: tl.constexpr = 1,
 ):
+<<<<<<< HEAD:aiter/ops/triton/_triton_kernels/attention/dao_ai/bwd.py
     # The forward's dropout state, read on the device: no host sync, and capture stays legal.
     if ENABLE_DROPOUT:
         philox_seed = tl.load(rng_state)
@@ -4116,6 +4181,55 @@ def bwd_kernel_fused_noncausal(
     else:
         philox_seed = 0
         philox_offset_base = 0
+=======
+    # Cast strides to int64 to prevent int32 overflow for large sequences (>2^31 elements).
+    # Keeps function signature unchanged to retain 32-bit vectorized load specialization.
+    stride_qb = tl.cast(stride_qb, tl.int64)
+    stride_qh = tl.cast(stride_qh, tl.int64)
+    stride_qm = tl.cast(stride_qm, tl.int64)
+    stride_qd = tl.cast(stride_qd, tl.int64)
+    stride_kb = tl.cast(stride_kb, tl.int64)
+    stride_kh = tl.cast(stride_kh, tl.int64)
+    stride_kn = tl.cast(stride_kn, tl.int64)
+    stride_kd = tl.cast(stride_kd, tl.int64)
+    stride_vb = tl.cast(stride_vb, tl.int64)
+    stride_vh = tl.cast(stride_vh, tl.int64)
+    stride_vn = tl.cast(stride_vn, tl.int64)
+    stride_vd = tl.cast(stride_vd, tl.int64)
+    stride_dqb = tl.cast(stride_dqb, tl.int64)
+    stride_dqh = tl.cast(stride_dqh, tl.int64)
+    stride_dqm = tl.cast(stride_dqm, tl.int64)
+    stride_dqd = tl.cast(stride_dqd, tl.int64)
+    stride_dkb = tl.cast(stride_dkb, tl.int64)
+    stride_dkh = tl.cast(stride_dkh, tl.int64)
+    stride_dkn = tl.cast(stride_dkn, tl.int64)
+    stride_dkd = tl.cast(stride_dkd, tl.int64)
+    stride_dvb = tl.cast(stride_dvb, tl.int64)
+    stride_dvh = tl.cast(stride_dvh, tl.int64)
+    stride_dvn = tl.cast(stride_dvn, tl.int64)
+    stride_dvd = tl.cast(stride_dvd, tl.int64)
+    stride_lse_b = tl.cast(stride_lse_b, tl.int64)
+    stride_lse_h = tl.cast(stride_lse_h, tl.int64)
+    stride_lse_m = tl.cast(stride_lse_m, tl.int64)
+    stride_delta_b = tl.cast(stride_delta_b, tl.int64)
+    stride_delta_h = tl.cast(stride_delta_h, tl.int64)
+    stride_delta_m = tl.cast(stride_delta_m, tl.int64)
+    stride_dob = tl.cast(stride_dob, tl.int64)
+    stride_doh = tl.cast(stride_doh, tl.int64)
+    stride_dom = tl.cast(stride_dom, tl.int64)
+    stride_dod = tl.cast(stride_dod, tl.int64)
+    stride_dropoutb = tl.cast(stride_dropoutb, tl.int64)
+    stride_dropouth = tl.cast(stride_dropouth, tl.int64)
+    stride_dropoutm = tl.cast(stride_dropoutm, tl.int64)
+    stride_dropoutn = tl.cast(stride_dropoutn, tl.int64)
+    if IS_FP8:
+        stride_descale_q_z = tl.cast(stride_descale_q_z, tl.int64)
+        stride_descale_k_z = tl.cast(stride_descale_k_z, tl.int64)
+        stride_descale_v_z = tl.cast(stride_descale_v_z, tl.int64)
+    stride_az = tl.cast(stride_az, tl.int64)
+    stride_ah = tl.cast(stride_ah, tl.int64)
+
+>>>>>>> 34a3c41b9 ([Triton] Cast strides to int64 in MHA backward kernels to prevent overflow):aiter/ops/triton/_triton_kernels/flash_attn_triton_amd/bwd.py
     # program ids
     hkid = tl.program_id(0)
     pid = tl.program_id(1)
