@@ -371,6 +371,11 @@ class PaDecodeSchedule:
                 raise NotImplementedError(
                     "MXFP4 PA supports head_dim 128, block 128, one M-tile"
                 )
+        # gfx942: more CTAs than CUs hold work, so occupancy outweighs a
+        # single CTA's latency (V prefetch, STREAM_KV, WAVES_PER_EU_2).
+        gfx942_busy = (
+            "gfx94" in arch and split_workgroups * query_splits > num_compute_units
+        )
         # Prefetch supported single-M query tiles independently of grid size.
         prefetch_v = (
             D256_PIPE
@@ -379,12 +384,22 @@ class PaDecodeSchedule:
             )
             or (TUNED_SCALAR and block_size == 128 and TOTAL_ROWS <= MFMA_MNK)
             # gfx942: issuing a single M-tile's V loads at the tile start hides
-            # them behind QK and softmax (FP8 to D256, BF16 page16 D128).
+            # them behind QK and softmax (FP8 to D256, BF16 page16 D128). FP8
+            # per-tensor page128 vectorized V only gains on busy grids.
             or (
                 "gfx94" in arch
                 and M_TILES == 1
                 and (
-                    (kv_dtype in FP8_KV_DTYPES and head_dim <= 256)
+                    (
+                        kv_dtype in FP8_KV_DTYPES
+                        and head_dim <= 256
+                        and (
+                            gfx942_busy
+                            or per_token_kv
+                            or block_size != 128
+                            or not trans_v
+                        )
+                    )
                     or (
                         kv_dtype == fx.BFloat16 and block_size == 16 and head_dim <= 128
                     )
@@ -402,11 +417,6 @@ class PaDecodeSchedule:
                 or partition_workgroups <= num_compute_units
                 or (single_tile_plan and split_workgroups <= 2 * num_compute_units)
             )
-        )
-        # gfx942: more CTAs than CUs hold work, so occupancy outweighs a
-        # single CTA's latency (see STREAM_KV and WAVES_PER_EU_2).
-        gfx942_busy = (
-            "gfx94" in arch and split_workgroups * query_splits > num_compute_units
         )
         cache_key = (
             head_dim,
