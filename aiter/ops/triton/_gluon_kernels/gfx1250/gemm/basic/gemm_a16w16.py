@@ -1125,8 +1125,9 @@ def _gemm_a16w16_compute_bound_cluster_kernel(
     pid_m = pid % num_pid_m
     pid_n = pid // num_pid_m
 
-    a_base = a_ptr + pid_m * BLOCK_M * stride_am
-    b_base = b_ptr + pid_n * BLOCK_N * stride_bn
+    # int64: the tile offsets pass 2**31 elements for large inputs.
+    a_base = a_ptr + (pid_m * BLOCK_M).to(gl.int64) * stride_am
+    b_base = b_ptr + (pid_n * BLOCK_N).to(gl.int64) * stride_bn
     if LAYOUT[0] == "T":
         a_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
             base=a_base,
