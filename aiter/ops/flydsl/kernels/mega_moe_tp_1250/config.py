@@ -138,6 +138,13 @@ class LaunchCfg:
     # write-through stores, so their signal needs no system-scope writeback (a whole
     # cache flush: ~30 us at 1024 tokens of DSv4.1)
     rs_wt: bool = False
+    # AR two-step (with rs_q8): the reduced rows peers pull (Y2) as int8 + e8m0 per 32,
+    # half the Y2 bytes (bandwidth-bound at big M); every rank keeps the same values
+    y_q8: bool = False
+    # AR (not local_hist): placement quantizes each token's x row once and stores it to
+    # its TOPK slots; no AG quantization pass, no xq round trip
+    q_place: bool = False
+    y2_unroll: int = 2  # AR two-step: Y2 (remote pull) units a wave loads at once (2: -1~5%)
 
     @property
     def align_m(self) -> int:

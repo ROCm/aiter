@@ -312,6 +312,15 @@ class MegaMoeTP1250Engine:
         cfg = dataclasses.replace(cfg, ar=True, rs_pull=False, ag_split=False,
                                   rs_wt=os.environ.get("MEGA_RS_WT", "1") == "1",
                                   ar_two=cfg.ar_two or T > AR_TWO_MIN)
+        # with int8 RS partials (>= 4096 tokens), Y2's pulled rows int8 too (MEGA_Y_Q8=0:
+        # off) and 4 units a wave in flight: -2~5% (logits_diff ~1.4e-4 vs ~7.6e-5)
+        # placement quantizes each token once into its slots (no AG pass, no xq round
+        # trip; MEGA_Q_PLACE=0: off): -1~2% at 2048..16384
+        if (not cfg.local_hist and not cfg.q_once and not cfg.self_place
+                and os.environ.get("MEGA_Q_PLACE", "1") == "1"):
+            cfg = dataclasses.replace(cfg, q_place=True)
+        if cfg.ar_two and cfg.rs_q8 and os.environ.get("MEGA_Y_Q8", "1") == "1":
+            cfg = dataclasses.replace(cfg, y_q8=True, y2_unroll=max(cfg.y2_unroll, 4))
         return self.forward(x, topk_weights, topk_ids, out=out, cfg=cfg, _m_override=True)
 
     def poll_errors(self) -> int:
