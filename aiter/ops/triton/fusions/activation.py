@@ -177,8 +177,8 @@ def act_mul_and_fp8_group_quant(
         A tuple of (x_fp8, scales). x_fp8 has the shape (M, N // 2). scales is fp32 with
         the shape (M, cdiv(N // 2, group_size)).
 
-    On gfx942, ``M_LEQ_*`` entries select ``BLOCK_SIZE_N`` and the launch options.
-    Other architectures use one group for each program.
+    On gfx942 and gfx950, ``M_LEQ_*`` entries select ``BLOCK_SIZE_N`` and the launch
+    options. Other architectures use one group for each program.
     """
     _LOGGER.info(
         "ACT_MUL_FP8_GROUP_QUANT: x=%s activation=%s", tuple(x.shape), activation

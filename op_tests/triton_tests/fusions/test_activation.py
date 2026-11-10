@@ -227,10 +227,12 @@ class _LaunchRecorder:
 @pytest.mark.parametrize("M", [1, 4097])
 @pytest.mark.parametrize("N", FP8_GROUP_QUANT_N)
 def test_act_mul_and_fp8_group_quant_launch(monkeypatch, M: int, N: int):
-    # gfx942 has a tuned config. Other architectures keep one group for each program.
+    # gfx942 and gfx950 have a tuned config. Other architectures keep one group for
+    # each program.
     config_dir = resolve_config_dir("fusions", "ACT_MUL_AND_FP8_GROUP_QUANT")
     configs = load_config_json(
-        f"{config_dir}/DEFAULT.json", required=arch_info.get_arch() == "gfx942"
+        f"{config_dir}/DEFAULT.json",
+        required=arch_info.get_arch() in ("gfx942", "gfx950"),
     )
     recorder = _LaunchRecorder()
     monkeypatch.setattr(
