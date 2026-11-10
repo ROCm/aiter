@@ -63,6 +63,32 @@ class TestA16W16TunedConfigLookup(unittest.TestCase):
         self.assertIsNone(tuned_config)
         self.assertEqual(config["libtype"], "torch")
 
+    def test_default_config_is_logged_only_when_asked(self):
+        for flag in (0, 1):
+            with (
+                self.subTest(AITER_LOG_TUNED_CONFIG=flag),
+                mock.patch.object(tuned, "AITER_LOG_TUNED_CONFIG", flag),
+                self.assertLogs(tuned.logger, "DEBUG") as logs,
+            ):
+                # assertLogs needs one record; keep it out of the check below.
+                tuned.logger.debug("sentinel")
+                _, config = self._lookup({})
+            self.assertEqual(config["libtype"], "torch")
+            untuned = [m for m in logs.output if "not found tuned config" in m]
+            self.assertEqual(len(untuned), flag)
+
+    def test_cache_holds_a_serving_working_set(self):
+        # Every M up to a 16384-token prefill budget, for four linear shapes.
+        shapes = [(N + 64 * i, K) for i in range(4)]
+        self._lookup({})
+        tuned.get_GEMM_A16W16_config.cache_clear()
+        for _ in range(2):
+            for m in range(1, 16385):
+                for n, k in shapes:
+                    tuned.get_GEMM_A16W16_config(m, n, k, False, BF16, BF16)
+        info = tuned.get_GEMM_A16W16_config.cache_info()
+        self.assertEqual((info.misses, info.hits), (4 * 16384, 4 * 16384))
+
 
 class TestGfx1250FlydslCandidates(unittest.TestCase):
     """GemmA16W16Tuner's FlyDSL candidates on gfx1250, with the device mocked."""

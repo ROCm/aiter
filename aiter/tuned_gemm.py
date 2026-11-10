@@ -243,7 +243,9 @@ def get_GEMM_A16W16_tuned_config(
     return None
 
 
-@functools.lru_cache(maxsize=4096)
+# Keyed on M: 65536 entries hold every M up to a 16384-token batch budget
+# (vLLM's default on MI355X) for four linear shapes.
+@functools.lru_cache(maxsize=65536)
 def get_GEMM_A16W16_config(
     M: int,
     N: int,
@@ -313,9 +315,10 @@ def get_GEMM_A16W16_config(
             else:
                 default_config["libtype"] = "torch"
                 default_config["solidx"] = 0
-        logger.info(
-            f"shape is M:{M}, N:{N}, K:{K} {dtype=} {otype=} {bias=}, {scaleAB=}, {bpreshuffle=}, not found tuned config in {AITER_CONFIGS.AITER_CONFIG_GEMM_BF16_FILE}, will use default config! using {default_config['libtype']} solution:{default_config['solidx']}"
-        )
+        if AITER_LOG_TUNED_CONFIG:
+            logger.info(
+                f"shape is M:{M}, N:{N}, K:{K} {dtype=} {otype=} {bias=}, {scaleAB=}, {bpreshuffle=}, not found tuned config in {AITER_CONFIGS.AITER_CONFIG_GEMM_BF16_FILE}, will use default config! using {default_config['libtype']} solution:{default_config['solidx']}"
+            )
         return default_config
 
     return config
