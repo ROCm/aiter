@@ -11,6 +11,8 @@ import os
 import threading
 import time
 
+from aiter.utility.tune_result import EAGER_SAMPLE, GRAPH_SAMPLE, PowerReading
+
 logger = logging.getLogger(__name__)
 
 
@@ -398,8 +400,8 @@ def kernel_call(func, args, kwargs):
 
 def measure_kernel(
     call, device_index: int | None = None, kernel_us: float | None = None
-) -> float:
-    """Package watts while ``call`` runs back to back.
+) -> PowerReading:
+    """Package watts while ``call`` runs back to back, tagged with how they were sampled.
 
     This is the one place a tune reads package power. ``call`` launches the
     kernel the timer measured and nothing else. ``kernel_us`` is that call's
@@ -407,12 +409,17 @@ def measure_kernel(
 
     The call is captured into a CUDA graph holding ~GRAPH_SPAN_US of work and
     the graph is replayed, so the window holds the kernel with no host launch
-    gaps. A call that cannot be captured (host sync, CPU-side work) is
-    launched eagerly instead, and the reading is corrected for launch gaps
-    (``active_watts``).
+    gaps; the reading's ``sample`` is ``graph``. Capture fails only for a call
+    that synchronizes with the host (for example ``.item()`` or a copy to the
+    CPU). CPU-side work in the call does not fail capture: it runs once while
+    capturing and is not part of the replay. A call that fails capture is
+    launched eagerly instead, the reading is corrected for launch gaps
+    (``active_watts``), and its ``sample`` is ``eager``; ranking keeps eager
+    readings behind graph readings.
     ``AITER_POWER_GRAPH=0`` is a temporary rollback switch to the eager path
-    while graph sampling is new; it is not a tuning knob. NaN means the sensor
-    could not be read, the call raised, or the window was too idle to tell.
+    while graph sampling is new; it is not a tuning knob. NaN (with an empty
+    ``sample``) means the sensor could not be read, the call raised, or the
+    window was too idle to tell.
     """
     if device_index is None:
         try:
@@ -429,22 +436,29 @@ def measure_kernel(
         if captured is not None:
             graph, launches = captured
             try:
-                return float(
+                return _reading(
                     measure_package_watts(
                         graph.replay,
                         device_index=device_index,
                         kernel_us=None if kernel_us is None else kernel_us * launches,
-                    )
+                    ),
+                    GRAPH_SAMPLE,
                 )
             finally:
                 _sync_cuda()
                 graph.reset()
-        return float(
-            measure_package_watts(call, device_index=device_index, kernel_us=kernel_us)
+        return _reading(
+            measure_package_watts(call, device_index=device_index, kernel_us=kernel_us),
+            EAGER_SAMPLE,
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning("package power measurement failed: %s", exc)
-        return float("nan")
+        return PowerReading(float("nan"))
+
+
+def _reading(watts, sample: str) -> PowerReading:
+    watts = float(watts)
+    return PowerReading(watts, "" if math.isnan(watts) else sample)
 
 
 # GPU work captured per graph. A replay's own launch costs ~10-20 us, so ~1 ms

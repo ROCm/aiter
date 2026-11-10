@@ -1014,6 +1014,69 @@ class TestMoePowerRanking(unittest.TestCase):
         self.assertEqual(ranked.iloc[0]["kernelName1"], "measured")
         self.assertTrue(pd.isna(ranked.iloc[1]["energy"]))
 
+    def test_pair_with_an_eager_stage_ranks_behind_graph_pairs(self):
+        import pandas as pd
+
+        from aiter.utility.selection_policy import POWER
+        from csrc.ck_gemm_moe_2stages_codegen.gemm_moe_tune import rank_moe_pairs
+
+        def pair(name, watts, sample1, sample2="graph", us2=10.0):
+            return {
+                "kernelName1": name,
+                "us1": 10.0,
+                "us2": us2,
+                "us": 10.0 + us2,
+                "watts1": watts,
+                "watts2": watts,
+                "power_sample1": sample1,
+                "power_sample2": sample2,
+            }
+
+        ranked = rank_moe_pairs(
+            pd.DataFrame(
+                [
+                    pair("eager_cheap", 100.0, "graph", "eager"),
+                    pair("graph_hot", 900.0, "graph"),
+                    pair("graph_cool", 500.0, "graph"),
+                    # Stage 2 did not run, so its blank sample does not count.
+                    pair("one_stage", 600.0, "graph", "", us2=0.0),
+                ]
+            ),
+            POWER,
+        )
+        self.assertEqual(
+            list(ranked["kernelName1"]),
+            ["one_stage", "graph_cool", "graph_hot", "eager_cheap"],
+        )
+        self.assertEqual(
+            list(ranked["power_sample"]), ["graph", "graph", "graph", "eager"]
+        )
+
+    def test_all_eager_pairs_rank_by_energy(self):
+        import pandas as pd
+
+        from aiter.utility.selection_policy import POWER
+        from csrc.ck_gemm_moe_2stages_codegen.gemm_moe_tune import rank_moe_pairs
+
+        pairs = pd.DataFrame(
+            [
+                {
+                    "kernelName1": name,
+                    "us1": 10.0,
+                    "us2": 10.0,
+                    "us": 20.0,
+                    "watts1": watts,
+                    "watts2": watts,
+                    "power_sample1": "eager",
+                    "power_sample2": "eager",
+                }
+                for name, watts in (("hot", 800.0), ("cool", 300.0))
+            ]
+        )
+        self.assertEqual(
+            list(rank_moe_pairs(pairs, POWER)["kernelName1"]), ["cool", "hot"]
+        )
+
 
 class TestPowerSelectionGaps(unittest.TestCase):
     def test_candidate_beats_uses_energy_only_in_power_mode(self):
@@ -1452,6 +1515,99 @@ class TestPowerTableSeparation(unittest.TestCase):
                 package_power.measure_kernel(call, 0, 20.0)
             capture.assert_not_called()
             self.assertEqual(seen[-1], (call, 20.0))
+
+    def test_power_reading_records_graph_or_eager(self):
+        import math
+        import pickle
+
+        from aiter.utility import package_power
+        from aiter.utility.tune_result import PowerReading
+
+        class Graph:
+            def replay(self):
+                pass
+
+            def reset(self):
+                pass
+
+        readings = iter([500.0, 300.0, float("nan")])
+
+        def window(fn, device_index=0, kernel_us=None):
+            return next(readings)
+
+        with (
+            mock.patch.object(package_power, "measure_package_watts", window),
+            mock.patch.object(package_power, "_sync_cuda"),
+            mock.patch.dict(os.environ, {"AITER_POWER_GRAPH": "1"}),
+        ):
+            with mock.patch.object(
+                package_power, "_capture_graph", return_value=(Graph(), 50)
+            ):
+                graph = package_power.measure_kernel(lambda: None, 0, 20.0)
+            with mock.patch.object(package_power, "_capture_graph", return_value=None):
+                eager = package_power.measure_kernel(lambda: None, 0, 20.0)
+                unread = package_power.measure_kernel(lambda: None, 0, 20.0)
+        self.assertEqual((graph, graph.sample), (500.0, "graph"))
+        self.assertEqual((eager, eager.sample), (300.0, "eager"))
+        self.assertTrue(math.isnan(unread))
+        self.assertEqual(unread.sample, "")
+        restored = pickle.loads(pickle.dumps(eager))
+        self.assertIsInstance(restored, PowerReading)
+        self.assertEqual((restored, restored.sample), (300.0, "eager"))
+
+    def test_eager_readings_rank_behind_graph_readings(self):
+        import pickle
+
+        import pandas as pd
+
+        from aiter.utility.selection_policy import POWER
+        from aiter.utility.tune_result import (
+            PowerReading,
+            TuneResult,
+            sort_by_energy_then_latency,
+        )
+
+        graph = {"us": 10.0, "watts": 600.0, "power_sample": "graph"}
+        eager = {"us": 10.0, "watts": 200.0, "power_sample": "eager"}
+        unmeasured = {"us": 1.0, "watts": float("nan")}
+        self.assertIs(POWER.best([eager, graph, unmeasured]), graph)
+        self.assertTrue(POWER.beats(eager, graph))
+        self.assertFalse(POWER.beats(graph, eager))
+        self.assertIs(POWER.best([unmeasured, eager]), eager)
+        cooler_eager = {"us": 10.0, "watts": 150.0, "power_sample": "eager"}
+        self.assertIs(POWER.best([eager, cooler_eager]), cooler_eager)
+        # A bare PowerReading carries its own sample (the K5 sweep's dict).
+        self.assertLess(
+            POWER.rank(10.0, PowerReading(600.0, "graph")),
+            POWER.rank(10.0, PowerReading(200.0, "eager")),
+        )
+
+        result = TuneResult(("k",), 10.0, 0.0, PowerReading(200.0, "eager"))
+        self.assertEqual(result.power_sample, "eager")
+        self.assertEqual(pickle.loads(pickle.dumps(result)).power_sample, "eager")
+        frame = pd.DataFrame(
+            [
+                {"name": "eager", "us": 10.0, "watts": 200.0, "power_sample": "eager"},
+                {"name": "none", "us": 1.0, "watts": float("nan"), "power_sample": ""},
+                {"name": "graph", "us": 10.0, "watts": 600.0, "power_sample": "graph"},
+            ]
+        )
+        self.assertEqual(
+            list(sort_by_energy_then_latency(frame)["name"]),
+            ["graph", "eager", "none"],
+        )
+
+    def test_record_keeps_the_sample_next_to_watts(self):
+        from aiter.utility.selection_policy import POWER
+        from aiter.utility.tune_result import PowerReading
+
+        candidate = {"us": 10.0}
+        with mock.patch.object(
+            type(POWER), "measure", return_value=PowerReading(250.0, "eager")
+        ):
+            POWER.record(candidate, "watts", lambda: None, kernel_us=10.0)
+        self.assertEqual(candidate["watts"], 250.0)
+        self.assertEqual(candidate["power_sample"], "eager")
 
     def test_power_sample_times_the_call_when_no_us_is_given(self):
         from aiter.utility import package_power

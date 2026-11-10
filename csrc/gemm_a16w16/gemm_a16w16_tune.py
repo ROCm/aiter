@@ -920,6 +920,7 @@ class GemmA16W16Tuner(GemmCommonTuner):
                     us,
                     err_ratio,
                     getattr(el, "watts", float("nan")),
+                    getattr(el, "power_sample", ""),
                 )
             )
         return result

@@ -18,6 +18,30 @@ MIXED_CONDITION = "mixed"
 # Power-tuned tables live here so the model_configs/ shape merge never ranks a
 # power row against a latency row.
 POWER_CONFIG_DIRNAME = "power_configs"
+# How a candidate's watts were sampled. Eager launches read lower than a graph
+# replay of the same kernel, so the two are ranked in separate tiers.
+POWER_SAMPLE_COLUMN = "power_sample"
+GRAPH_SAMPLE = "graph"
+EAGER_SAMPLE = "eager"
+
+
+class PowerReading(float):
+    """Package watts that also records how they were sampled (``sample``)."""
+
+    def __new__(cls, watts, sample=""):
+        obj = float.__new__(cls, watts)
+        obj.sample = sample
+        return obj
+
+    def __reduce__(self):
+        return (self.__class__, (float(self), self.sample))
+
+
+def power_sample_of(watts, sample=None) -> str:
+    """``sample`` when given, else the one a ``PowerReading`` carries, else empty."""
+    if sample is None or (isinstance(sample, float) and math.isnan(sample)):
+        sample = getattr(watts, "sample", "")
+    return str(sample or "")
 
 
 def normalize_select(value) -> str:
@@ -109,36 +133,50 @@ def candidate_beats(current, challenger, select_power: bool) -> bool:
             return row.get(name, float("nan"))
         return getattr(row, name, float("nan"))
 
-    current_rank = selection_rank(
-        _field(current, "us"), _field(current, "watts"), select_power
-    )
-    challenger_rank = selection_rank(
-        _field(challenger, "us"), _field(challenger, "watts"), select_power
-    )
-    return challenger_rank < current_rank
+    def _rank(row):
+        return selection_rank(
+            _field(row, "us"),
+            _field(row, "watts"),
+            select_power,
+            _field(row, POWER_SAMPLE_COLUMN),
+        )
+
+    return _rank(challenger) < _rank(current)
 
 
 def sort_by_energy_then_latency(frame, us_col="us", watts_col="watts"):
-    """Order by package energy, then by latency.
+    """Order by sample tier, then package energy, then latency.
 
-    Unmeasured watts sort as infinite cost, so they stay behind any measured
-    row and, among themselves, keep the lowest ``us``. Dedup must run after
-    this sort: a cost-only sort leaves every NaN row tied and a stable order
-    then keeps whichever candidate arrived first.
+    The tiers are the ones ``selection_rank`` uses: graph-sampled rows, then
+    eager-sampled rows (``power_sample``), then unmeasured rows by ``us``.
+    Dedup must run after this sort: a cost-only sort leaves every NaN row tied
+    and a stable order then keeps whichever candidate arrived first.
     """
-    cost = [
-        efficiency_cost(us, watts)
-        for us, watts in zip(frame[us_col], frame[watts_col], strict=True)
-    ]
+    samples = (
+        frame[POWER_SAMPLE_COLUMN]
+        if POWER_SAMPLE_COLUMN in frame.columns
+        else [""] * len(frame)
+    )
+    cost, tier = [], []
+    for us, watts, sample in zip(frame[us_col], frame[watts_col], samples, strict=True):
+        rank = selection_rank(us, watts, True, sample)
+        tier.append(rank[0])
+        cost.append(efficiency_cost(us, watts))
     return (
-        frame.assign(_energy_cost=cost)
-        .sort_values(["_energy_cost", us_col], kind="mergesort")
-        .drop(columns="_energy_cost")
+        frame.assign(_sample_tier=tier, _energy_cost=cost)
+        .sort_values(["_sample_tier", "_energy_cost", us_col], kind="mergesort")
+        .drop(columns=["_sample_tier", "_energy_cost"])
     )
 
 
-def selection_rank(us, watts, select_power: bool):
-    """Sort key. Latency mode is lowest us. Power mode is us*watts, with unmeasured rows last by us."""
+def selection_rank(us, watts, select_power: bool, power_sample=None):
+    """Sort key. Latency mode is lowest us.
+
+    Power mode is us*watts in three tiers: graph-sampled candidates, then
+    eager-sampled ones (they read low, so a cheap eager reading must not beat
+    a graph reading), then unmeasured ones by us. ``power_sample`` defaults to
+    the one ``watts`` carries as a ``PowerReading``.
+    """
     try:
         us_f = float(us)
     except (TypeError, ValueError):
@@ -147,7 +185,9 @@ def selection_rank(us, watts, select_power: bool):
         return (0, us_f)
     cost = efficiency_cost(us_f, watts)
     if math.isinf(cost):
-        return (1, us_f)
+        return (2, us_f)
+    if power_sample_of(watts, power_sample) == EAGER_SAMPLE:
+        return (1, cost)
     return (0, cost)
 
 
@@ -170,8 +210,9 @@ def power_columns(result, tflops):
 class TuneResult(tuple):
     """3-tuple plus package power in watts, so existing unpacking keeps working."""
 
-    def __new__(cls, info, us, err_ratio, watts=float("nan")):
+    def __new__(cls, info, us, err_ratio, watts=float("nan"), power_sample=None):
         obj = tuple.__new__(cls, (info, us, err_ratio))
+        obj.power_sample = power_sample_of(watts, power_sample)
         try:
             obj.watts = float(watts)
         except (TypeError, ValueError):
@@ -179,7 +220,10 @@ class TuneResult(tuple):
         return obj
 
     def __reduce__(self):
-        return (self.__class__, (self[0], self[1], self[2], self.watts))
+        return (
+            self.__class__,
+            (self[0], self[1], self[2], self.watts, self.power_sample),
+        )
 
 
 def attach_power_columns(df, results):
@@ -206,6 +250,11 @@ def attach_power_columns(df, results):
     if "watts" not in df.columns:
         df = df.copy()
         df["watts"] = watts
+    if POWER_SAMPLE_COLUMN not in df.columns:
+        df = df.copy()
+        df[POWER_SAMPLE_COLUMN] = [
+            getattr(el, POWER_SAMPLE_COLUMN, "") or "" for el in results
+        ]
     return df
 
 
