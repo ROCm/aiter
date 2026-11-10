@@ -109,5 +109,9 @@ csrc/opus_gemm/gen_co/**/asm/
 /pr-body.md
 /split-tests-update-summary.md
 
+# Local GPU benchmark dumps and disassembled kernels.
+/flydsl_pin_vgpr/
+/best.s
+
 # Merge-conflict backups, which git writes next to the file being merged.
 *.orig

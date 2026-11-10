@@ -1486,6 +1486,8 @@ def _run_csv_file(args, csv_path: str) -> None:
 
 
 def main() -> None:
+    global AITER_MOE_EXPERT_BALANCE
+
     if not is_gfx1250():
         print("skipping: requires gfx1250")
         sys.exit(0)
@@ -1517,6 +1519,12 @@ def main() -> None:
         "once per value, e.g. --tokens 64 128 256",
     )
     parser.add_argument("--topk", type=int, default=8)
+    parser.add_argument(
+        "--balanced-routing",
+        action="store_true",
+        help="route tokens evenly across experts (same as "
+        "AITER_MOE_EXPERT_BALANCE=true)",
+    )
     parser.add_argument("--model-dim", type=int, default=7168)
     parser.add_argument("--inter-dim", type=int, default=256)
     parser.add_argument("--warmup", type=int, default=5)
@@ -1590,6 +1598,8 @@ def main() -> None:
         "miss raises. Pass this flag to allow runtime JIT compilation.",
     )
     args = parser.parse_args()
+    if args.balanced_routing:
+        AITER_MOE_EXPERT_BALANCE = True
     data_init_list = args.data_init or ["constant", "uniform"]
     scale_init_list = args.scale_init or ["constant", "auto"]
     if len(data_init_list) == 1:
