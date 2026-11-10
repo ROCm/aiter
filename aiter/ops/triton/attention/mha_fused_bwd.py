@@ -197,6 +197,7 @@ def flash_attn_fused_backward(
         BLOCK_D_MODEL_POW2=BLOCK_D_MODEL_POW2,
         IS_VARLEN=IS_VARLEN,
         IS_FP8=IS_FP8,
+        enable_fp_fusion=True,
     )
     # dropout_mask
     use_dropout = dropout_p > 0.0
@@ -269,6 +270,7 @@ def flash_attn_fused_backward(
             USE_INT64_STRIDES=USE_INT64_STRIDES,
             NUM_XCD=get_num_xcds(),
             **config_dkdvdq,
+            enable_fp_fusion=True,
         )
     else:
         # in non causal inner loop over grouped q heads
@@ -317,6 +319,7 @@ def flash_attn_fused_backward(
             FP8_MAX=FP8_MAX,
             USE_INT64_STRIDES=USE_INT64_STRIDES,
             **config_dkdvdq,
+            enable_fp_fusion=True,
         )
 
     return delta

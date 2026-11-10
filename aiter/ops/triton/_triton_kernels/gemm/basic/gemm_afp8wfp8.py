@@ -4,8 +4,11 @@
 import triton
 import triton.language as tl
 
+from aiter.ops.triton._triton_kernels.common.pid_preprocessing import (
+    pid_grid,
+    remap_xcd,
+)
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
 from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 
 _gemm_afp8wfp8_repr = make_kernel_repr(
@@ -73,6 +76,7 @@ def _gemm_afp8wfp8_kernel(
     waves_per_eu: tl.constexpr,
     matrix_instr_nonkdim: tl.constexpr,
     cache_modifier: tl.constexpr,
+    NUM_XCDS: tl.constexpr,
     B_SCALE_N_GROUP: tl.constexpr = 128,
     B_SCALE_K_GROUP: tl.constexpr = 128,
     N_FIRST: tl.constexpr = False,
@@ -125,7 +129,7 @@ def _gemm_afp8wfp8_kernel(
         pid_m = pid // num_pid_n
         pid_n = pid % num_pid_n
     elif NUM_KSPLIT == 1:
-        pid = remap_xcd(pid, GRID_MN, NUM_XCDS=8)
+        pid = remap_xcd(pid, GRID_MN, NUM_XCDS=NUM_XCDS)
         pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
     else:
         pid_m = pid // num_pid_n
@@ -190,13 +194,13 @@ def _gemm_afp8wfp8_kernel(
                 a_scales_ptr + offs_asm[:, None] + offs_ask[None, :] * stride_ask
             )
             if EVEN_K:
-                a_scales = tl.load(a_scale_ptrs, mask=offs_am[:, None] < M, other=127)
+                a_scales = tl.load(a_scale_ptrs, mask=offs_am[:, None] < M, other=0)
             else:
                 a_scale_mask = offs_scale_k_a[None, :] < (
                     K // SCALE_GROUP_SIZE - k * (BLOCK_SIZE_K // SCALE_GROUP_SIZE)
                 )
                 a_scales = tl.load(
-                    a_scale_ptrs, mask=a_scale_mask & (offs_am[:, None] < M), other=127
+                    a_scale_ptrs, mask=a_scale_mask & (offs_am[:, None] < M), other=0
                 )
 
             # ---- Load and broadcast B scales (BLOCK_SIZE_N, BLOCK_SIZE_K // 32) ----
@@ -212,7 +216,7 @@ def _gemm_afp8wfp8_kernel(
                 b_scales = tl.load(
                     b_scale_ptrs,
                     mask=offs_bn[:, None] < N,
-                    other=127,
+                    other=0,
                     cache_modifier=cache_modifier,
                 )
             else:
@@ -223,7 +227,7 @@ def _gemm_afp8wfp8_kernel(
                 b_scales = tl.load(
                     b_scale_ptrs,
                     mask=b_scale_mask & (offs_bn[:, None] < N),
-                    other=127,
+                    other=0,
                     cache_modifier=cache_modifier,
                 )
 
@@ -270,7 +274,7 @@ def _gemm_afp8wfp8_kernel(
             c_ptr
             + stride_cm * offs_cm[:, None]
             + stride_cn * offs_cn[None, :]
-            + pid_k * stride_ck
+            + pid_k.to(tl.int64) * stride_ck
         )
         c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
         if FUSED_SPLITS > 1:
@@ -444,14 +448,14 @@ def _gemm_afp8wfp8_packed_kernel(
             + rows[:, None] * stride_asm
             + (ag // (A_SCALE_K_GROUP // 32)) * stride_ask,
             (rows[:, None] < M) & (ag < groups),
-            other=127,
+            other=0,
         )
         b_code = tl.load(
             b_scale_ptr
             + (cols[:, None] // B_SCALE_N_GROUP) * stride_bsn
             + (bg // (B_SCALE_K_GROUP // 32)) * stride_bsk,
             (cols[:, None] < N) & (bg < groups),
-            other=127,
+            other=0,
             cache_modifier=B_CACHE_MODIFIER,
         )
         accumulator = tl.dot_scaled(
@@ -544,6 +548,7 @@ def _gemm_afp8wfp8_preshuffle_kernel(
     waves_per_eu: tl.constexpr,
     matrix_instr_nonkdim: tl.constexpr,
     cache_modifier: tl.constexpr,
+    NUM_XCDS: tl.constexpr,
 ):
     """
     Preshuffle variant of _gemm_afp8wfp8_kernel. Weight tensor has been shuffled
@@ -576,7 +581,7 @@ def _gemm_afp8wfp8_preshuffle_kernel(
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
 
     if NUM_KSPLIT == 1:
-        pid = remap_xcd(pid, GRID_MN, NUM_XCDS=8)
+        pid = remap_xcd(pid, GRID_MN, NUM_XCDS=NUM_XCDS)
         pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
     else:
         pid_m = pid // num_pid_n
@@ -641,7 +646,7 @@ def _gemm_afp8wfp8_preshuffle_kernel(
                 a_scale_mask = offs_scale_k_a[None, :] < (
                     K // SCALE_GROUP_SIZE - k * (BLOCK_SIZE_K // SCALE_GROUP_SIZE)
                 )
-                a_scales = tl.load(a_scale_ptrs, mask=a_scale_mask, other=127)
+                a_scales = tl.load(a_scale_ptrs, mask=a_scale_mask, other=0)
 
             # Load and broadcast B scales (computed from absolute K).
             offs_bsk = (k_base + offs_scale_k_a * SCALE_GROUP_SIZE) // B_SCALE_K_GROUP
@@ -659,7 +664,7 @@ def _gemm_afp8wfp8_preshuffle_kernel(
                 b_scales = tl.load(
                     b_scale_ptrs,
                     mask=b_scale_mask,
-                    other=127,
+                    other=0,
                     cache_modifier=cache_modifier,
                 )
 
@@ -712,7 +717,7 @@ def _gemm_afp8wfp8_preshuffle_kernel(
             c_ptr
             + stride_cm * offs_cm[:, None]
             + stride_cn * offs_cn[None, :]
-            + pid_k * stride_ck
+            + pid_k.to(tl.int64) * stride_ck
         )
         c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
         tl.store(c_ptrs, c, mask=c_mask)

@@ -259,6 +259,7 @@ def fused_allreduce_rmsnorm_quant_per_group_fake(
     group_size: int = 128,
     prefill_support: bool = False,
     transpose_scale: bool = False,
+    gemma_norm: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Meta/fake for the fused AR+RMSNorm+per-group-FP8-quant op.
 
@@ -275,6 +276,7 @@ def fused_allreduce_rmsnorm_quant_per_group_fake(
     """
     from aiter.utility.dtypes import fp8
 
+    del gemma_norm
     M = inp.shape[0]
     K = inp.shape[-1]
     num_groups = K // group_size
@@ -299,13 +301,21 @@ def fused_allreduce_rmsnorm_quant_per_group_(
     group_size: int = 128,
     prefill_support: bool = False,
     transpose_scale: bool = False,
+    gemma_norm: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     assert group_name in _groups, f"Group {group_name} is not found."
     group = _groups[group_name]()
     if group is None:
         raise ValueError(f"Group {group_name} is destroyed.")
     return group._fused_allreduce_rmsnorm_quant_per_group_out_place(
-        inp, res_inp, w, eps, group_size, prefill_support, transpose_scale
+        inp,
+        res_inp,
+        w,
+        eps,
+        group_size,
+        prefill_support,
+        transpose_scale,
+        gemma_norm=gemma_norm,
     )
 
 
@@ -318,6 +328,7 @@ def fused_allreduce_rmsnorm_quant_per_group_emit_bf16_fake(
     group_size: int = 128,
     prefill_support: bool = False,
     transpose_scale: bool = False,
+    gemma_norm: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Meta/fake for fused AR+RMSNorm+per-group-FP8-quant with emit_bf16.
 
@@ -328,6 +339,7 @@ def fused_allreduce_rmsnorm_quant_per_group_emit_bf16_fake(
     """
     from aiter.utility.dtypes import fp8
 
+    del gemma_norm
     M = inp.shape[0]
     K = inp.shape[-1]
     num_groups = K // group_size
@@ -353,6 +365,7 @@ def fused_allreduce_rmsnorm_quant_per_group_emit_bf16_(
     group_size: int = 128,
     prefill_support: bool = False,
     transpose_scale: bool = False,
+    gemma_norm: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     assert group_name in _groups, f"Group {group_name} is not found."
     group = _groups[group_name]()
@@ -367,6 +380,7 @@ def fused_allreduce_rmsnorm_quant_per_group_emit_bf16_(
         prefill_support,
         transpose_scale,
         emit_bf16=True,
+        gemma_norm=gemma_norm,
     )
 
 
@@ -813,9 +827,12 @@ class GroupCoordinator:
         emit_bf16: bool = False,
         transpose_scale: bool = False,
         gemma_norm: bool = False,
+        hadamard_rotate: bool = False,
     ):
         # quant_type arrives already canonicalized to a string ("per_token"/
         # "per_group"/"mxfp4") from the public API and the mxfp4 helper.
+        if hadamard_rotate and quant_type != "mxfp4":
+            raise ValueError("hadamard_rotate is MXFP4-only")
         if quant_type == "per_token" and group_size == 128:
             # Both paths go through torch.library-registered ops so they lower
             # into the compiled graph (Dynamo-traceable + CUDAGraph-capturable).
@@ -853,6 +870,7 @@ class GroupCoordinator:
             emit_bf16=emit_bf16,
             transpose_scale=transpose_scale,
             gemma_norm=gemma_norm,
+            hadamard_rotate=hadamard_rotate,
         )
 
     def fused_allreduce_rmsnorm_quant_per_group(
@@ -865,6 +883,7 @@ class GroupCoordinator:
         prefill_support: bool = False,
         emit_bf16: bool = False,
         transpose_scale: bool = False,
+        gemma_norm: bool = False,
     ):
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
@@ -889,6 +908,7 @@ class GroupCoordinator:
                 group_size=group_size,
                 prefill_support=prefill_support,
                 transpose_scale=transpose_scale,
+                gemma_norm=gemma_norm,
             )
         return fused_allreduce_rmsnorm_quant_per_group_emit_bf16_(
             input_,
@@ -899,6 +919,7 @@ class GroupCoordinator:
             group_size=group_size,
             prefill_support=prefill_support,
             transpose_scale=transpose_scale,
+            gemma_norm=gemma_norm,
         )
 
     def fused_qknorm_allreduce(
@@ -947,6 +968,8 @@ class GroupCoordinator:
         eps: float,
         prefill_support: bool = False,
         emit_bf16: bool = False,
+        gemma_norm: bool = False,
+        hadamard_rotate: bool = False,
     ):
         return self.fused_allreduce_rmsnorm_quant(
             input_,
@@ -956,6 +979,8 @@ class GroupCoordinator:
             prefill_support,
             quant_type="mxfp4",
             emit_bf16=emit_bf16,
+            gemma_norm=gemma_norm,
+            hadamard_rotate=hadamard_rotate,
         )
 
     def _fused_allreduce_rmsnorm_out_place(
@@ -1012,6 +1037,7 @@ class GroupCoordinator:
         prefill_support: bool = False,
         transpose_scale: bool = False,
         emit_bf16: bool = False,
+        gemma_norm: bool = False,
     ):
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
@@ -1024,6 +1050,7 @@ class GroupCoordinator:
             prefill_support=prefill_support,
             transpose_scale=transpose_scale,
             emit_bf16=emit_bf16,
+            gemma_norm=gemma_norm,
         )
 
     def _fused_qknorm_allreduce_out_place(
@@ -1070,11 +1097,20 @@ class GroupCoordinator:
         ca_comm = self.device_communicator.ca_comm
         assert ca_comm is not None
         assert not ca_comm.disabled
+        if not ca_comm._has_gather_scatter_kernel():
+            raise RuntimeError(
+                f"custom all-gather has no kernel for {self.world_size} ranks: "
+                "check should_custom_ag() first, or use all_gather(use_custom=True), "
+                "which falls back to NCCL"
+            )
         out = ca_comm.custom_all_gather(input_, dim)
         assert out is not None
         return out
 
     def custom_all_gather(self, input_: torch.Tensor) -> torch.Tensor:
+        """The custom all-gather, with no NCCL fallback: raises at group sizes
+        it has no kernel for (6 ranks off gfx1250). Callers check
+        `should_custom_ag()` first; `all_gather(use_custom=True)` falls back."""
         return outplace_all_gather(input_, group_name=self.unique_name)
 
     # didn't support dim in custom reduce_scatter
@@ -1159,9 +1195,17 @@ class GroupCoordinator:
         input_size = input_.size()
 
         is_last_dim = dim == input_.dim() - 1
-        can_use_custom = use_custom and (
-            dim == 0
-            or (is_last_dim and input_size[-1] * input_.element_size() % 16 == 0)
+        # A group built without a device communicator (the world group) has none.
+        dc = self.device_communicator
+        ca_comm = dc.ca_comm if (use_custom and dc is not None) else None
+        can_use_custom = (
+            use_custom
+            # No custom all-gather kernel for this group size (6 ranks).
+            and (ca_comm is None or ca_comm._has_gather_scatter_kernel())
+            and (
+                dim == 0
+                or (is_last_dim and input_size[-1] * input_.element_size() % 16 == 0)
+            )
         )
 
         if can_use_custom:

@@ -1,8 +1,11 @@
 import triton
 import triton.language as tl
 
+from aiter.ops.triton._triton_kernels.common.pid_preprocessing import (
+    pid_grid,
+    remap_xcd,
+)
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
 from aiter.ops.triton.utils.gemm_config_utils import (
     compute_splitk_params,
     get_gemm_config,
@@ -69,6 +72,7 @@ def _gemm_a16_w16_kernel(
     use_activation: tl.constexpr,
     ADD_BIAS: tl.constexpr,
     SKIP_REDUCE: tl.constexpr,
+    NUM_XCDS: tl.constexpr,
 ):
     """Kernel for computing the matmul C = A x B.
     A has shape (M, K), B has shape (K, N) and C has shape (M, N)
@@ -88,7 +92,9 @@ def _gemm_a16_w16_kernel(
     pid_unified = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-    pid_unified = remap_xcd(pid_unified, num_pid_m * num_pid_n * NUM_KSPLIT, NUM_XCDS=8)
+    pid_unified = remap_xcd(
+        pid_unified, num_pid_m * num_pid_n * NUM_KSPLIT, NUM_XCDS=NUM_XCDS
+    )
     pid_k = pid_unified % NUM_KSPLIT
     pid = pid_unified // NUM_KSPLIT
 
@@ -169,7 +175,7 @@ def _gemm_a16_w16_kernel(
             c_ptr
             + stride_cm * offs_cm[:, None]
             + stride_cn * offs_cn[None, :]
-            + pid_k * stride_ck
+            + pid_k.to(tl.int64) * stride_ck
         )
         if EVEN_MN:
             tl.store(c_ptrs, c)

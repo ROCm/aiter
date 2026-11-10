@@ -8,7 +8,10 @@ import triton
 from aiter.ops.triton.attention.unified_attention import unified_attention
 from aiter.ops.triton.utils.types import e4m3_dtype
 from op_tests.op_benchmarks.triton.utils.argparse import get_parser
-from op_tests.triton_tests.attention.test_unified_attention import ref_paged_attn
+from op_tests.triton_tests.attention.test_unified_attention import (
+    ref_paged_attn,
+    shuffle_kv_cache,
+)
 
 FP8_TYPE = e4m3_dtype
 FP8_MAX = torch.finfo(FP8_TYPE).max
@@ -28,7 +31,7 @@ def default_benchmark_configs():
 def quantize_to_fp8(tensor):
     """Per-tensor symmetric FP8 quantization. Returns (quantized, descale)."""
     abs_max = tensor.abs().amax().clamp(min=1e-9)
-    descale = (abs_max / FP8_MAX).to(torch.float32).unsqueeze(0).cuda()
+    descale = (abs_max / FP8_MAX).to(torch.float32).unsqueeze(0)
     quantized = (tensor * (FP8_MAX / abs_max)).to(FP8_TYPE)
     return quantized, descale
 
@@ -83,13 +86,9 @@ def make_inputs(
     )
 
     max_num_blocks_per_seq = (max_kv_len + block_size - 1) // block_size
-    block_tables = torch.randint(
-        0,
-        num_blocks,
-        (num_seqs, max_num_blocks_per_seq),
-        dtype=torch.int32,
-        device="cuda",
-    )
+    block_tables = torch.randperm(
+        num_seqs * max_num_blocks_per_seq, dtype=torch.int32, device="cuda"
+    ).reshape(num_seqs, max_num_blocks_per_seq)
     cu_query_lens = torch.tensor(
         [0] + query_lens,
         dtype=torch.int32,
@@ -148,6 +147,8 @@ def _mode_label(args):
         parts.append("bf16")
     if args.fp8_output:
         parts.append("fp8out")
+    if args.shuffled_kv_cache:
+        parts.append("shuffled")
     return "_".join(parts) + "_fwd"
 
 
@@ -249,10 +250,7 @@ def run_benchmark(custom, args):
 
         block_size = args.block_size if args.block_size else 512
         max_num_blocks_per_seq = (seqlens_k.max().item() + block_size - 1) // block_size
-        min_required_blocks = BATCH * max_num_blocks_per_seq
-        num_blocks = (
-            args.num_blocks if args.num_blocks else max(min_required_blocks * 4, 2048)
-        )
+        num_blocks = max(BATCH * max_num_blocks_per_seq, 2048)
 
         inputs = make_inputs(
             seq_lens=list(zip(seqlens_q.tolist(), seqlens_k.tolist())),
@@ -272,6 +270,16 @@ def run_benchmark(custom, args):
         v_tensor = (
             inputs["v_fp8"] if (args.fp8 or args.fp8_kv) else inputs["value_cache"]
         )
+        # The kernel reads the shuffled layout; the reference below still uses
+        # the unshuffled caches held in `inputs`.
+        if args.shuffled_kv_cache:
+            assert (
+                D_HEAD == D_HEAD_V
+            ), "Shuffled KV cache requires equal Q/K and V head sizes"
+            assert (
+                block_size >= 16 and block_size & (block_size - 1) == 0
+            ), "Shuffled KV cache requires a power-of-2 block size >= 16"
+            k_tensor, v_tensor = shuffle_kv_cache(k_tensor, v_tensor)
 
         window_size = (
             (args.sliding_window - 1, 0)
@@ -298,17 +306,32 @@ def run_benchmark(custom, args):
                 k_descale=inputs["k_descale"],
                 v_descale=inputs["v_descale"],
                 output_scale=inputs["out_scale"],
+                shuffled_kv_cache=args.shuffled_kv_cache,
+                equal_seqlen_q=args.equal_seqlen_q,
                 backend=args.backend,
             )
+
+        if args.equal_seqlen_q:
+            assert (
+                seqlens_q == seqlens_q[0]
+            ).all(), "-equal_seqlen_q needs equal query lengths"
 
         ms = triton.testing.do_bench_cudagraph(fn)
 
         if args.test:
             fn()
             ref_output = ref_paged_attn(
-                query=inputs["query"],
-                key_cache=inputs["key_cache"],
-                value_cache=inputs["value_cache"],
+                query=inputs["q_fp8"] if args.fp8 else inputs["query"],
+                key_cache=(
+                    inputs["k_fp8"]
+                    if (args.fp8 or args.fp8_kv)
+                    else inputs["key_cache"]
+                ),
+                value_cache=(
+                    inputs["v_fp8"]
+                    if (args.fp8 or args.fp8_kv)
+                    else inputs["value_cache"]
+                ),
                 query_lens=inputs["query_lens"],
                 kv_lens=inputs["kv_lens"],
                 block_tables=inputs["block_tables"],
@@ -338,15 +361,33 @@ def run_benchmark(custom, args):
 
         cu_query_lens = inputs["cu_query_lens"]
         num_contexts = len(cu_query_lens) - 1
+        # Kernel disables windowing for non-positive values (SLIDING_WINDOW > 0).
+        window = (
+            args.sliding_window
+            if args.sliding_window is not None and args.sliding_window > 0
+            else None
+        )
         total_flops = 0.0
+        total_k = 0
         for i in range(num_contexts):
             sq = (cu_query_lens[i + 1] - cu_query_lens[i]).item()
             sk = seqlens_k[i].item()
-            valid = sq * sk - ((sq**2 - sq) / 2)
+            if window is None:
+                valid = sq * sk - ((sq**2 - sq) / 2)
+                kv_read = sk
+            else:
+                # With a sliding window each of the sq (causal) queries attends to
+                # at most `window` keys, so count windowed causal pairs instead of
+                # the full triangle. Query i (0-indexed within the block) attends
+                # to min(sk - sq + i + 1, window) keys.
+                idx = torch.arange(sq, device=seqlens_k.device)
+                valid = torch.clamp(sk - sq + 1 + idx, max=window).sum().item()
+                # Keys streamed from HBM = union of all query windows.
+                kv_read = min(sk, sq - 1 + window)
             total_flops += valid * HQ * (D_HEAD + D_HEAD_V) * 2.0
+            total_k += kv_read
 
         total_q = cu_query_lens[-1].item()
-        total_k = seqlens_k.sum().item()
         q_bytes = total_q * HQ * D_HEAD * q_tensor.element_size()
         k_bytes = total_k * HK * D_HEAD * k_tensor.element_size()
         v_bytes = total_k * HK * D_HEAD_V * v_tensor.element_size()
@@ -391,9 +432,6 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("-d", type=int, default=0, help="Q/K head size")
     parser.add_argument("-dv", type=int, default=0, help="V head size (defaults to -d)")
-    parser.add_argument(
-        "-num_blocks", type=int, default=0, help="KV cache blocks (0=auto)"
-    )
     parser.add_argument("-block_size", type=int, default=0, help="KV cache block size")
     parser.add_argument(
         "-test",
@@ -406,6 +444,13 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         default=False,
         help="Use equal sequence lengths (no varlen); default is random varlen",
+    )
+    parser.add_argument(
+        "-equal_seqlen_q",
+        action="store_true",
+        default=False,
+        help="Tell unified_attention every seq has the same query length "
+        "(spec-decode verify); needs -equal_seqlens",
     )
     parser.add_argument(
         "-fp8",
@@ -446,12 +491,13 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Sliding window size (default: disabled)",
     )
+
     parser.add_argument(
-        "-backend",
-        type=str,
-        default=None,
-        choices=["triton", "gluon"],
-        help="Kernel backend",
+        "--shuffled_kv_cache",
+        "-shuffled_kv_cache",
+        action="store_true",
+        default=False,
+        help="Pre-shuffle the KV cache into the layout the gluon kernels expect",
     )
 
     return parser.parse_args(args=args)

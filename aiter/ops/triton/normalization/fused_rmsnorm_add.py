@@ -6,7 +6,7 @@ import torch
 import triton
 
 from aiter.jit.utils.torch_guard import torch_compile_guard
-from aiter.ops.triton._gluon_kernels.gfx1250.norm.fused_rmsnorm_add import (
+from aiter.ops.triton._gluon_kernels.gfx1250.normalization.fused_rmsnorm_add import (
     _gluon_fused_rms_kernel,
 )
 from aiter.ops.triton._triton_kernels.normalization.fused_rmsnorm_add import (
@@ -57,7 +57,7 @@ def _fused_rmsnorm_add_core(x, weight, epsilon, res1):
         res1_stride_m = res1.stride(0)
         out_res1_stride_m = out_res1.stride(0)
 
-    if get_arch() == "gfx1250":
+    if get_arch() in ("gfx1250", "gfx1250-strict"):
 
         BLOCK_SIZE_M = 1
         grid = (triton.cdiv(M, BLOCK_SIZE_M),)

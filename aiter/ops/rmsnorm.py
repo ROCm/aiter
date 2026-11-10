@@ -5,7 +5,9 @@ import torch
 from torch import Tensor
 
 from ..jit.core import compile_ops
+from ..jit.utils.chip_info import get_gfx_runtime
 from ..jit.utils.torch_guard import torch_compile_guard
+from ..plugin import route as _route
 from .quant import get_dtype_max
 
 # opus is the sole rmsnorm backend (fp16/bf16/fp32, any hidden). Only group_size/
@@ -390,14 +392,28 @@ def _use_hip_common(input: Tensor, use_model_sensitive_rmsnorm: int) -> bool:
     # module_rmsnorm_quant (add_rmsnorm_quant_kernel); opus handles the rest (fp32, T5,
     # hidden>8192, non-2-D) that the CK module_rmsnorm used to cover. Keeping the hot path
     # on the HIP kernel avoids a perf regression vs main (opus generic is slower here).
+    # The HIP kernel moves each row in 16-byte vectors and relies on the buffer bounds
+    # check to drop the part of the last vector that lies past the row. On gfx1250 that
+    # check drops the whole vector, so the last N % 8 elements are never read or written.
     return (
         use_model_sensitive_rmsnorm == 0
         and input.dim() == 2
         and input.element_size() == 2
         and input.shape[-1] <= 8192
+        and (
+            input.shape[-1] % 8 == 0
+            or get_gfx_runtime() not in ("gfx1250", "gfx1250-strict")
+        )
     )
 
 
+# Routed here rather than on either public spelling or on a backend binding.
+# rms_norm and rmsnorm2d_fwd are two public names for one op and both call this
+# directly, so this is where the op begins; the HIP and opus choice is made
+# below it, so a provider sees the op rather than one backend's share of it.
+# Version 2: version 1 was the HIP binding's write-out contract, which is a
+# different shape, not an older spelling of this one.
+@_route(op="rmsnorm", version=2)
 def _rms_norm_fwd_dispatch(
     input, weight, epsilon, use_model_sensitive_rmsnorm
 ) -> Tensor:
@@ -433,6 +449,7 @@ def rmsnorm2d_fwd(
     return _rms_norm_fwd_dispatch(input, weight, epsilon, use_model_sensitive_rmsnorm)
 
 
+@_route(op="rmsnorm_with_add", version=1)
 @torch_compile_guard(
     mutates_args=["out", "residual_out"], gen_fake=lambda *a, **k: None
 )
@@ -594,6 +611,7 @@ def add_rmsnorm_quant(
     group_size: int = 0,
     shuffle_scale: bool = False,
     gemma_norm: bool = False,
+    scale_layout_m32k4: bool = False,
 ) -> None: ...
 
 
@@ -619,7 +637,16 @@ def rmsnorm_quant(
     group_size: int = 0,
     shuffle_scale: bool = False,
     gemma_norm: bool = False,
-) -> None: ...
+    scale_layout_m32k4: bool = False,
+) -> None:
+    """Fused RMSNorm + quant.
+
+    ``scale_layout_m32k4=True`` (fp8 ``out``, e8m0 ``scale``, ``group_size == 32``)
+    writes the scale directly in the gfx1250 MXFP8 ASM GEMM A-scale layout, i.e.
+    the bytes of :func:`aiter.ops.shuffle.shuffle_mxfp8fp4_scale`. ``scale`` must
+    be a contiguous ``(pad32(M), N // 32)`` byte tensor; the kernel writes the pad
+    rows as 0x7F. ``shuffle_scale`` is ignored.
+    """
 
 
 @compile_ops("module_rmsnorm_quant", develop=True)

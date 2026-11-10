@@ -17,6 +17,7 @@ from flydsl.compiler.protocol import extract_to_ir_values
 from flydsl.expr import ptrtoint, range_constexpr
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
+from flydsl.utils import env
 
 from aiter.ops.flydsl.kernels.kernels_common import get_warp_size
 
@@ -35,7 +36,7 @@ AITER_FLYDSL_KERNARG_PRELOAD_COUNT = int(
 # kernels. Disabled by default; set AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE=1
 # to enable it.
 AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE = bool(
-    int(os.environ.get("AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE", "0"))
+    int(os.environ.get("AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE", "1"))
 )
 
 _PRELOAD_COMPILE_LOCK = threading.RLock()
@@ -144,7 +145,21 @@ def ptr_buf_tensor(
 
 
 def buf_copy_atom(unit_bytes, elem=fx.Int32, cache_modifier=0):
-    """Copy atom for a ``unit_bytes``-wide buffer access (0=cached, 2=nt)."""
+    """Copy atom for a ``unit_bytes``-wide buffer access (0=cached, 2=nt).
+
+    ``cache_modifier`` is the instruction's raw aux/CPOL field, and its width is
+    architecture-dependent: two bits (sc0, nt) on CDNA3, but gfx1250 puts scope
+    bits above them and passes values like ``CPOL_DEV`` (0x10). It is therefore
+    NOT range-checked here -- a bound that fits one generation rejects a legal
+    value on another, which is what happened when this was briefly capped at 3
+    and five gfx1250 mxfp8 GEMM kernels stopped building. Callers that know
+    their own encoding bound it themselves; the M3 scorers do.
+    """
+    if unit_bytes not in _BUF_COPY_ATOM:
+        raise ValueError(
+            f"unit_bytes {unit_bytes} is not a buffer access width; "
+            f"expected one of {sorted(_BUF_COPY_ATOM)}"
+        )
     return fx.make_copy_atom(_BUF_COPY_ATOM[unit_bytes](cache_modifier), elem)
 
 
@@ -157,21 +172,14 @@ def buf_scalar_load(t, index, cache_modifier=0):
 
     The layout API has no scalar spelling: ``t[i]`` and every ``BufferCopy*``
     atom lower to ``rocdl.raw.ptr.buffer.load`` (VGPR), and ROCDL exposes no
-    ``s.buffer.load`` op to wrap. Hence the raw intrinsic, whose resource
-    operand is a v4i32 rather than the opaque buffer descriptor pointer.
+    ``s.buffer.load`` op to wrap. Reuse the scalar buffer path, which emits the
+    intrinsic with its required v4i32 resource operand.
     """
-    rsrc = _to_raw(fx.rocdl.get_buffer_rsrc(fx.get_iter(t)))
-    rsrc_v4 = llvm.bitcast(
-        ir.VectorType.get([4], T.i32),
-        llvm.ptrtoint(ir.IntegerType.get_signless(128), rsrc),
-    )
-    return llvm.call_intrinsic(
-        T.i32,
-        "llvm.amdgcn.s.buffer.load.i32",
-        # The intrinsic offset is in bytes; `index` counts dwords.
-        [rsrc_v4, _to_raw(fx.Int32(index) * 4), _to_raw(fx.Int32(cache_modifier))],
-        [],
-        [],
+    from aiter.ops.flydsl.kernels import buffer_ops
+
+    rsrc = fx.rocdl.get_buffer_rsrc(fx.get_iter(t))
+    return buffer_ops.buffer_load(
+        rsrc, index, vec_width=1, is_scalar=True, cache_modifier=cache_modifier
     )
 
 
@@ -269,6 +277,18 @@ def check_e8m0(
         raise RuntimeError(f"[{owner}] {name} must be contiguous")
 
 
+# Resolve the optional API once, but query its device/stream on every call.
+# This is not a stream cache: graph capture and thread-local stream switches
+# must still be observed. Older torch builds keep the public API fallback.
+_get_current_raw_stream = getattr(torch._C, "_cuda_getCurrentRawStream", None)
+
+
+def current_stream_arg():
+    if _get_current_raw_stream is None:
+        return torch.cuda.current_stream()
+    return fx.Stream(_get_current_raw_stream(torch.cuda.current_device()))
+
+
 def ptr_arg(t: torch.Tensor, dtype=None):
     """Wrap a torch.Tensor as an fx.Pointer (PointerJitArg) for kernel launch."""
     if dtype is None:
@@ -295,15 +315,33 @@ def _compile_and_run(exe, *args):
         raise
 
 
-def _run_compiled(exe, *args):
+def _run_compiled(exe, *args, specialization_key=None):
     """First call: ``flyc.compile(exe, *args)`` compiles **and** executes the kernel.
     Subsequent calls: fast dispatch via the cached ``CompiledFunction``.
+
+    A specialization key gives a multi-constexpr JitFunction one compiled
+    callable per configuration. Factory-style launchers should leave it unset.
     """
-    cf = getattr(exe, "_cf", None)
+    if env.compile.compile_only:
+        # A callable warmed during execution must not dispatch when a later
+        # preload switches to compile-only. Preserve it for execution to resume.
+        _compile_and_run(exe, *args)
+        return
+    if specialization_key is None:
+        cf = getattr(exe, "_cf", None)
+    else:
+        cache = getattr(exe, "_cf_by_specialization", None)
+        cf = cache.get(specialization_key) if cache is not None else None
     if cf is not None:
         cf(*args)
         return
-    exe._cf = _compile_and_run(exe, *args)
+    cf = _compile_and_run(exe, *args)
+    if specialization_key is None:
+        exe._cf = cf
+    else:
+        if not hasattr(exe, "_cf_by_specialization"):
+            exe._cf_by_specialization = {}
+        exe._cf_by_specialization[specialization_key] = cf
 
 
 def _preload_compiled(exe, *args):
@@ -347,6 +385,56 @@ def get_dtype_str(dtype):
         return "f16"
     elif dtype == torch.bfloat16:
         return "bf16"
+
+
+# torch dtype -> FlyDSL element type. float4_e2m1fn_x2 is a byte of two E2M1 values,
+# as Float4E2M1FNx2; dtypes the installed torch or FlyDSL lacks are skipped.
+_TORCH_TO_FX_DTYPE = {
+    torch.float64: fx.Float64,
+    torch.float32: fx.Float32,
+    torch.float16: fx.Float16,
+    torch.bfloat16: fx.BFloat16,
+    torch.bool: fx.Boolean,
+    torch.int8: fx.Int8,
+    torch.uint8: fx.Uint8,
+    torch.int16: fx.Int16,
+    torch.int32: fx.Int32,
+    torch.int64: fx.Int64,
+}
+for _torch_name, _fx_name in (
+    ("float8_e4m3fn", "Float8E4M3FN"),
+    ("float8_e4m3fnuz", "Float8E4M3FNUZ"),
+    ("float8_e5m2", "Float8E5M2"),
+    ("float8_e5m2fnuz", "Float8E5M2FNUZ"),
+    ("float8_e8m0fnu", "Float8E8M0FNU"),
+    ("float4_e2m1fn_x2", "Float4E2M1FNx2"),
+):
+    if hasattr(torch, _torch_name) and hasattr(fx, _fx_name):
+        _TORCH_TO_FX_DTYPE[getattr(torch, _torch_name)] = getattr(fx, _fx_name)
+del _torch_name, _fx_name
+_FX_TO_TORCH_DTYPE = {v: k for k, v in _TORCH_TO_FX_DTYPE.items()}
+
+
+def torch_to_fx_dtype(dtype):
+    """FlyDSL element type of a torch dtype.
+
+    Raises TypeError if ``dtype`` is not a ``torch.dtype`` and ValueError if
+    FlyDSL has no element type for it.
+    """
+    if not isinstance(dtype, torch.dtype):
+        raise TypeError(f"expected a torch.dtype, got {dtype!r}")
+    try:
+        return _TORCH_TO_FX_DTYPE[dtype]
+    except KeyError:
+        raise ValueError(f"no FlyDSL element type for {dtype}") from None
+
+
+def fx_to_torch_dtype(dtype):
+    """torch dtype of a FlyDSL element type, the inverse of ``torch_to_fx_dtype``."""
+    try:
+        return _FX_TO_TORCH_DTYPE[dtype]
+    except KeyError:
+        raise ValueError(f"no torch dtype for {dtype}") from None
 
 
 class TensorView:

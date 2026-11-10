@@ -8,13 +8,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from aiter.jit.utils.chip_info import get_gfx, get_lds_capacity_bytes
-from aiter.ops.flydsl.mxfp8_128_bpreshuffle_gemm_gfx1250 import (
+from aiter.ops.flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import (
     COMPUTE_WMMA_NAME_PREFIX as COMPUTE_NAME_PREFIX,
 )
-from aiter.ops.flydsl.mxfp8_128_bpreshuffle_gemm_gfx1250 import (
+from aiter.ops.flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import (
     WMMA_NAME_PREFIX as NAME_PREFIX,
 )
-from aiter.ops.flydsl.mxfp8_128_bpreshuffle_gemm_gfx1250 import (
+from aiter.ops.flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import (
     cluster_m_grid_ok,
     compute_kernel_k_pair,
 )
@@ -263,7 +263,9 @@ def kernel_fits_shape(ki: WmmaKernelInstance, M: int, N: int, K: int) -> bool:
         return False
     if N % ki.tile_n != 0 or K % (ki.split_k * ki.tile_k) != 0:
         return False
-    if (K // ki.split_k) // ki.tile_k < ki.num_buffers:
+    # Generic K=128 with two buffers needs no steady-loop iteration.
+    min_k_tiles = 1 if ki.num_buffers == 2 and K == ki.tile_k == 128 else ki.num_buffers
+    if (K // ki.split_k) // ki.tile_k < min_k_tiles:
         return False
     # M may be ragged; the kernel handles partial M tiles via OOB clamping,
     # so tile_m > M is legal (and needed for small-M decode shapes).

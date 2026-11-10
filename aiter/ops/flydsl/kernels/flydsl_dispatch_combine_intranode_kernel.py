@@ -17,7 +17,6 @@ from flydsl.expr.rocdl import (
     cvt_scalef32_pk_f32_fp4,
     cvt_scalef32_pk_fp4_f32,
     ds_bpermute,
-    readfirstlane,
     readlane,
 )
 from flydsl.expr.typing import Stream
@@ -38,22 +37,13 @@ from .communication_ops_utils import (
     wait_i32_until_equals,
     wait_i32_until_greater_than,
     wait_i64_until_equals,
+    wave_uniform_i64,
 )
-
-# Bump when generated kernel shape changes.
-_DISPATCH_COMBINE_JIT_SCHEMA_VERSION = "v10-stage2-blockwise-fp8-scale-prefetch"
 
 # Stage-3 switches from narrow step=64 to wide step=128/256 above this threshold.
 _S3_WIDE_PATH_THRESHOLD_I32 = 895
 # AMDGPU cache modifier used by Stage-3 buffer loads/stores.
 _SLC_CACHE = 2
-
-
-def _wave_uniform_i64(addr):
-    v = fx.Uint64(addr)
-    lo = readfirstlane(T.i32, fx.Uint32(v))  # low 32 bits
-    hi = readfirstlane(T.i32, fx.Uint32(v >> 32))  # high 32 bits (unsigned shift)
-    return (fx.Uint64(hi) << 32) | fx.Uint64(lo)
 
 
 def _pack_f32x4_to_fp8(v4f32):
@@ -435,6 +425,7 @@ def make_combine_kernel(
     fp8_direct_cast: bool = False,
     blockwise_fp8_transport: bool = False,
     max_recv: int | None = None,
+    mask_topk_ids: bool = False,
 ):
     """Build the intranode combine ``@flyc.kernel``.
 
@@ -460,6 +451,8 @@ def make_combine_kernel(
         raise ValueError(
             "blockwise_fp8_transport and fp8_direct_cast are mutually exclusive"
         )
+    if mask_topk_ids and (not skip_stage1 or zero_copy):
+        raise ValueError("mask_topk_ids requires skip_stage1=True without zero_copy")
     _xfer_bf16_to_fp8 = fp8_direct_cast
     _transport_dtype = torch.float8_e4m3fn if _xfer_bf16_to_fp8 else data_type
 
@@ -496,7 +489,7 @@ def make_combine_kernel(
             return accum_val.to(fx.BFloat16).bitcast(fx.Int32)
 
         def _zero_accum():
-            return Vec.filled(4, 0.0, fx.Float32)
+            return fx.full(4, 0.0, fx.Float32)
 
     elif _is_fp4:
 
@@ -531,7 +524,7 @@ def make_combine_kernel(
             return old
 
         def _zero_accum():
-            return Vec.filled(8, 0.0, fx.Float32)
+            return fx.full(8, 0.0, fx.Float32)
 
     elif hidden_elem_size == 2:  # bf16
 
@@ -546,7 +539,7 @@ def make_combine_kernel(
             return accum_val.to(fx.BFloat16).bitcast(fx.Int32)[0]
 
         def _zero_accum():
-            return Vec.filled(2, 0.0, fx.Float32)
+            return fx.full(2, 0.0, fx.Float32)
 
     elif hidden_elem_size == 4:  # f32
 
@@ -583,7 +576,7 @@ def make_combine_kernel(
             return _pack_f32x4_to_fp8(accum_val)
 
         def _zero_accum():
-            return Vec.filled(4, 0.0, fx.Float32)
+            return fx.full(4, 0.0, fx.Float32)
 
     def _accum_experts(vals):
         """Reduce the k per-expert i32 partials into one merged i32 (widen to f32,
@@ -957,12 +950,14 @@ def make_combine_kernel(
             if const_expr(skip_stage1 and not zero_copy):
                 # Fused-upstream Stage 3: caller plain-stored per-(tok_id, k_slot)
                 # partials (no tok_map decode; zero_copy excluded, keeps decode).
+                # mask_topk_ids: addr_inp_tok_map is the caller's int32 top-k id
+                # table; a -1 slot was never dispatched, so its partial is stale.
                 for k_slot in range_constexpr(experts_per_token):
                     slot_idx = tok_id * experts_per_token + k_slot
                     expert_tok_off = fx.Int64(slot_idx) * nbytes
                     expert_tok_addr = addr_shmem_tok + expert_tok_off
                     # Warp-uniform base -> SGPR (avoids per-lane waterfall).
-                    expert_tok_addr = _wave_uniform_i64(expert_tok_addr)
+                    expert_tok_addr = wave_uniform_i64(expert_tok_addr)
                     expert_rsrcs.append(
                         create_buffer_resource_from_addr(expert_tok_addr)
                     )
@@ -972,7 +967,13 @@ def make_combine_kernel(
                                 expert_tok_addr + fx.Int64(hidden_dim)
                             )
                         )
-                    expert_vlds.append(fx.Boolean(1))
+                    if const_expr(mask_topk_ids):
+                        topk_id = buffer_load(
+                            _rsrc_tok_map, slot_idx, vec_width=1, dtype=T.i32
+                        )
+                        expert_vlds.append(topk_id >= 0)
+                    else:
+                        expert_vlds.append(fx.Boolean(1))
             else:
                 # Baseline Stage 3: decode (peer_pe, dest_lid) from dest_tok_map and
                 # read each shmem_comb_inp slot (scalar loads; coalescer fuses dwords).
@@ -1001,7 +1002,7 @@ def make_combine_kernel(
                     # Warp-uniform base -> SGPR (avoids per-lane waterfall).
                     expert_rsrcs.append(
                         create_buffer_resource_from_addr(
-                            _wave_uniform_i64(expert_tok_addr)
+                            wave_uniform_i64(expert_tok_addr)
                         )
                     )
                     expert_vlds.append(vld_k)
@@ -1059,9 +1060,7 @@ def make_combine_kernel(
                                     scale_raws[u][k_slot],
                                 )
                             )
-                            scales[u].append(
-                                (sc_i32 << fx.Int32(23)).bitcast(fx.Float32)
-                            )
+                            scales[u].append((sc_i32 << 23).bitcast(fx.Float32))
 
                 if const_expr(_xfer_bf16_to_fp8 or blockwise_fp8_transport):
                     out_off = tok_id * out_n_i32 + ec_abs * 2
@@ -1143,7 +1142,7 @@ def make_combine_kernel(
                             wt_pe_base = fx.memref_load(_lds_p2p_wt_bases, wt_safe_pe)
                             wt_src_off = fx.Int64(wt_safe_dtok) * weight_bytes
                             wt_rsrc = create_buffer_resource_from_addr(
-                                _wave_uniform_i64(wt_pe_base + wt_src_off)
+                                wave_uniform_i64(wt_pe_base + wt_src_off)
                             )
                         else:
                             wt_src_off = (
@@ -1151,7 +1150,7 @@ def make_combine_kernel(
                                 * weight_bytes
                             )
                             wt_rsrc = create_buffer_resource_from_addr(
-                                _wave_uniform_i64(addr_shmem_wts + wt_src_off)
+                                wave_uniform_i64(addr_shmem_wts + wt_src_off)
                             )
                         wt_val = buffer_load(wt_rsrc, lane, vec_width=1, dtype=T.f32)
                         if const_expr(npes >= experts_per_token):
@@ -1200,23 +1199,6 @@ def make_dispatch_jit(
         max_recv=max_recv,
     )
 
-    # Closure vars keying the JIT cache: every IR-affecting input must appear
-    # here or a config change reuses a stale hsaco. Keep in sync with combine.
-    _key_rank, _key_npes, _key_block_num = rank, npes, block_num
-    _key_warp_per_block = warp_num_per_block
-    _key_max_tok = max_tok_per_rank
-    _key_std_moe = enable_std_moe
-    _key_max_recv = max_recv if max_recv is not None else npes * max_tok_per_rank
-    # str(torch.dtype): _collect_closure_scalar_vals only whitelists primitive
-    # scalars; a raw torch.dtype would drop out of the key.
-    _key_data_type = str(data_type)
-    _key_hidden_dim = hidden_dim
-    _key_experts_per_token = experts_per_token
-    _key_experts_per_rank = experts_per_rank
-    _key_scale_dim = scale_dim
-    _key_scale_type_size = scale_type_size
-    _key_schema_version = _DISPATCH_COMBINE_JIT_SCHEMA_VERSION
-
     @flyc.jit
     def dispatch_launch(
         addr_inp_tok: fx.Int64,
@@ -1247,22 +1229,6 @@ def make_dispatch_jit(
         inp_cur_tok: fx.Int32,
         stream: Stream = Stream(None),  # noqa: B008
     ):
-        _ = (
-            _key_rank,
-            _key_npes,
-            _key_block_num,
-            _key_warp_per_block,
-            _key_max_tok,
-            _key_std_moe,
-            _key_max_recv,
-            _key_data_type,
-            _key_hidden_dim,
-            _key_experts_per_token,
-            _key_experts_per_rank,
-            _key_scale_dim,
-            _key_scale_type_size,
-            _key_schema_version,
-        )
         kernel(
             addr_inp_tok,
             addr_inp_idx,
@@ -1316,6 +1282,7 @@ def make_combine_jit(
     fp8_direct_cast: bool = False,
     blockwise_fp8_transport: bool = False,
     max_recv=None,
+    mask_topk_ids: bool = False,
 ):
     """Build the JIT launcher for ``make_combine_kernel``. ``data_type`` is the
     external dtype (symmetric I/O); ``fp8_direct_cast`` enables bf16-external /
@@ -1340,22 +1307,8 @@ def make_combine_jit(
         fp8_direct_cast=fp8_direct_cast,
         blockwise_fp8_transport=blockwise_fp8_transport,
         max_recv=max_recv,
+        mask_topk_ids=mask_topk_ids,
     )
-
-    # JIT cache key (mirrors the dispatch launcher above; keep in sync).
-    _key_rank, _key_npes, _key_block_num = rank, npes, block_num
-    _key_warp_per_block = warp_num_per_block
-    _key_max_tok = max_tok_per_rank
-    _key_weights = enable_weights
-    _key_std_moe = enable_std_moe
-    _key_zero_copy = zero_copy
-    _key_skip_s1 = skip_stage1
-    _key_fp8_direct_cast = bool(fp8_direct_cast)
-    _key_blockwise_fp8_transport = bool(blockwise_fp8_transport)
-    _key_max_recv = max_recv if max_recv is not None else npes * max_tok_per_rank
-    # See dispatch launcher for the ``str(torch.dtype)`` rationale.
-    _key_data_type = str(data_type)
-    _key_schema_version = _DISPATCH_COMBINE_JIT_SCHEMA_VERSION
 
     @flyc.jit
     def combine_launch(
@@ -1380,22 +1333,6 @@ def make_combine_jit(
         cur_rank_num_token: fx.Int32,
         stream: Stream = Stream(None),  # noqa: B008
     ):
-        _ = (
-            _key_rank,
-            _key_npes,
-            _key_block_num,
-            _key_warp_per_block,
-            _key_max_tok,
-            _key_weights,
-            _key_std_moe,
-            _key_zero_copy,
-            _key_skip_s1,
-            _key_fp8_direct_cast,
-            _key_blockwise_fp8_transport,
-            _key_max_recv,
-            _key_data_type,
-            _key_schema_version,
-        )
         kernel(
             addr_inp_tok,
             addr_shmem_tok,

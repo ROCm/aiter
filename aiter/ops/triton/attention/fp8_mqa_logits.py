@@ -21,7 +21,7 @@ if TRITON_GE_36:
             from aiter.ops.triton._gluon_kernels.gfx950.attention.fp8_mqa_logits import (
                 _gluon_fp8_mqa_logits_kernel,
             )
-        elif arch == "gfx1250":
+        elif arch in ("gfx1250", "gfx1250-strict"):
             from aiter.ops.triton._gluon_kernels.gfx1250.attention.fp8_mqa_logits import (
                 _gluon_fp8_mqa_logits_kernel,
             )
@@ -207,6 +207,7 @@ def fp8_mqa_logits(
             num_stages=num_stages,
             waves_per_eu=2,
             matrix_instr_nonkdim=matrix_instr_nonkdim,
+            enable_fp_fusion=True,
         )
     else:
         # The buffer path keeps the row strides 32-bit and re-bases the pointer
@@ -331,6 +332,7 @@ def fp8_mqa_logits(
             num_warps=num_warps,
             waves_per_eu=waves_per_eu,
             **other,
+            enable_fp_fusion=True,
         )
 
     return logits

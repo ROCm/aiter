@@ -27,6 +27,24 @@ import triton.language as tl
 
 from aiter.ops.triton.rope.rope import _get_gptj_rotated_x, _get_neox_rotated_x
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.utils.config_utils import (
+    load_config_json,
+    resolve_config_dir,
+    select_leq_config,
+)
+
+
+def _get_config(num_local_heads: int) -> dict | None:
+    """Launch options over ``num_local_heads``: the smallest ``HEADS_LEQ_<x> >= heads``,
+    else ``any``. None on arches that ship no table."""
+    table = load_config_json(
+        resolve_config_dir("fusions", "FUSED_REDUCE_QK_NORM_ROPE_SWA_WRITE")
+        + "/DEFAULT.json",
+        required=False,
+    )
+    if table is None:
+        return None
+    return select_leq_config(table, num_local_heads, prefix="HEADS_LEQ_")
 
 
 @triton.jit
