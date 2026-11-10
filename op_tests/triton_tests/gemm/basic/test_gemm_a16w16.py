@@ -285,3 +285,32 @@ def test_gemm_a16w16_persistent_output(M: int, N: int, K: int, layout, output, b
         )
 
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
+
+
+@pytest.mark.parametrize("M, N, K", get_fewer_x_vals() + [(8192, 1792, 3584)])
+@pytest.mark.parametrize("strided", [False, True])
+@pytest.mark.parametrize("kernel_type", ["bandwidth_bound", "compute_bound"])
+def test_gemm_a16_w16_accumulate(M: int, N: int, K: int, strided, kernel_type):
+    """accumulate=True adds X @ W^T into y in place, like torch.addmm_."""
+    if not is_gluon_supported():
+        pytest.skip("Gluon not supported on this architecture")
+
+    x, w, _, _, _ = generate_gemm_a16w16_inputs(
+        M, N, K, dtype=torch.bfloat16, output=False
+    )
+    # strided: y is a column slice of a wider output, as in a TP shard.
+    base = torch.randn(
+        (M, 2 * N if strided else N), dtype=torch.bfloat16, device="cuda"
+    )
+    base_before = base.clone()
+    y = base[:, N:] if strided else base
+    torch_out = torch.addmm(y.float(), x.float(), w.float().T).to(torch.bfloat16)
+
+    out = gemm_a16w16(
+        x, w, y=y, backend="gluon", kernel_type=kernel_type, accumulate=True
+    )
+
+    assert out.data_ptr() == y.data_ptr()
+    torch.testing.assert_close(y, torch_out, atol=1e-1, rtol=1e-2)
+    if strided:
+        torch.testing.assert_close(base[:, :N], base_before[:, :N], atol=0, rtol=0)

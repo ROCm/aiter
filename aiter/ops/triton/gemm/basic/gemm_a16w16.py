@@ -57,6 +57,7 @@ def gemm_a16w16_fake_tensor(
     kernel_type: str = "bandwidth_bound",
     backend: str | None = None,
     persistent: bool = False,
+    accumulate: bool = False,
 ) -> torch.Tensor:
     M, K = x.shape
     N, _ = w.shape
@@ -84,6 +85,7 @@ def gemm_a16w16_(
     kernel_type: str = "bandwidth_bound",
     backend: str | None = None,
     persistent: bool = False,
+    accumulate: bool = False,
 ) -> torch.Tensor:
     """
     Computes 16 bit matrix multiplication Y = X @ W^T
@@ -105,6 +107,9 @@ def gemm_a16w16_(
         kernel_type (str): [gluon only] Kernel variant ("bandwidth_bound", "compute_bound").
         backend (Optional[str]): "triton", "gluon", or None (auto-detect).
         persistent (bool): Use the persistent kernel, NUM_SMS workgroups
+        accumulate (bool): [gluon only, not persistent] Add the result to y in
+            place: y = y + act(X @ W^T + bias). The add is in fp32, with one
+            rounding to the y dtype. y must be given.
 
     Returns:
         torch.Tensor: Output with shape (M, N) or (NUM_KSPLIT, M, N) if skip_reduce=True.
@@ -118,6 +123,12 @@ def gemm_a16w16_(
         "triton",
         "gluon",
     ), f"Unknown backend '{backend}', must be 'triton' or 'gluon'"
+
+    if accumulate:
+        assert y is not None, "accumulate=True adds into y, so y must be given"
+        assert (
+            backend == "gluon" and not persistent
+        ), "accumulate=True is supported only by the non-persistent gluon kernels"
 
     assert x.shape[1] == w.shape[1], (
         f"x is (M, K)={tuple(x.shape)} and w is "
@@ -482,6 +493,7 @@ def gemm_a16w16_(
             activation=_get_activation_from_str(activation) if activation else None,
             USE_ACTIVATION=activation is not None,
             ADD_BIAS=(bias is not None),
+            ACCUMULATE=accumulate,
             num_warps=num_warps,
             waves_per_eu=waves_per_eu,
         )
@@ -587,6 +599,7 @@ def gemm_a16w16(
     kernel_type: str = "bandwidth_bound",
     backend: str | None = None,
     persistent: bool = False,
+    accumulate: bool = False,
 ):
     """
     Computes 16 bit matrix multiplication Y = X @ W^T
@@ -613,4 +626,5 @@ def gemm_a16w16(
         kernel_type,
         backend,
         persistent,
+        accumulate,
     )

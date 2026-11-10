@@ -115,6 +115,7 @@ def _gemm_a16w16_bandwidth_bound_kernel(
     activation: gl.constexpr,
     USE_ACTIVATION: gl.constexpr,
     ADD_BIAS: gl.constexpr,
+    ACCUMULATE: gl.constexpr = False,
 ):
     pid = gl.program_id(axis=0)
     num_pid_m = gl.cdiv(M, BLOCK_M)
@@ -402,6 +403,11 @@ def _gemm_a16w16_bandwidth_bound_kernel(
 
     mask_c = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
 
+    # Accumulate: add the current C tile in fp32, so C += A @ B
+    if ACCUMULATE:
+        c_old = gl.amd.gfx1250.buffer_load(c_base, offs_c, mask=mask_c, other=0.0)
+        accumulator = accumulator + c_old.to(gl.float32)
+
     # Store
     gl.amd.gfx1250.buffer_store(
         accumulator.to(c_ptr.type.element_ty), c_base, offs_c, mask=mask_c
@@ -436,6 +442,7 @@ def _gemm_a16w16_compute_bound_kernel(
     activation: gl.constexpr,
     USE_ACTIVATION: gl.constexpr,
     ADD_BIAS: gl.constexpr,
+    ACCUMULATE: gl.constexpr = False,
 ):
     """Local-load pipelining across K-tiles.
 
@@ -829,6 +836,22 @@ def _gemm_a16w16_compute_bound_kernel(
     # Activation
     if USE_ACTIVATION:
         accumulator = activation(accumulator)
+
+    # Accumulate: add the current C tile in fp32, so C += A @ B
+    if ACCUMULATE:
+        offs_cm = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, WMMA_LAYOUT))
+        offs_cn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, WMMA_LAYOUT))
+        c_base = (
+            c_ptr
+            + (pid_m * BLOCK_M).to(gl.int64) * stride_cm
+            + (pid_n * BLOCK_N).to(gl.int64) * stride_cn
+        )
+        offs_c = stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
+        mask_c = (pid_m * BLOCK_M + offs_cm[:, None] < M) & (
+            pid_n * BLOCK_N + offs_cn[None, :] < N
+        )
+        c_old = gl.amd.gfx1250.buffer_load(c_base, offs_c, mask=mask_c, other=0.0)
+        accumulator = accumulator + c_old.to(gl.float32)
 
     # TDM Store: accumulator → shared memory → global memory
     SHARED_LAYOUT_C: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
