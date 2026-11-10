@@ -14,16 +14,49 @@ from aiter.ops.triton.moe.moe_routing.routing import RoutingData
 from aiter.ops.triton.moe.reduce import reduce_grouped
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.logger import AiterTritonLogger
-from aiter.ops.triton.utils.moe_common import can_overflow_int32
-from aiter.ops.triton.utils.moe_config_utils import get_moe_dispatch, m2bucket
+from aiter.ops.triton.utils.moe_config_utils import get_moe_dispatch
 
 _LOGGER = AiterTritonLogger()
 
-_SUPPORTED_ARCHS = ("gfx1250",)
+_GLUON_SUPPORTED_ARCHS = ("gfx1250",)
+
+
+def is_gluon_available():
+    """True when the gluon backend supports the current GPU architecture.
+
+    The match is exact. A substring match would also accept gfx1250-strict,
+    which this op does not tune, test or benchmark.
+    """
+    try:
+        return get_arch() in _GLUON_SUPPORTED_ARCHS
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def can_overflow_int32(tensor: torch.Tensor):
+    max_int32 = (1 << 31) - 1
+    offset = 0
+    for i in range(tensor.ndim):
+        offset += (tensor.shape[i] - 1) * tensor.stride(i)
+    return offset > max_int32
 
 
 def should_upcast_indices(*args):
     return any(tensor is not None and can_overflow_int32(tensor) for tensor in args)
+
+
+def m2bucket(m):
+    if m <= 8:
+        return "tiny"
+    if m <= 32:
+        return "small"
+    if m <= 128:
+        return "medium"
+    if m <= 256:
+        return "medium2"
+    if m <= 512:
+        return "large"
+    return "xlarge"
 
 
 def allocate_output(
@@ -137,10 +170,12 @@ def moe_gemm_a16w16(
     Returns:
         torch.Tensor: Output with shape (num_tokens, N) or, with swiglu, (num_tokens, N // 2)
     """
+    # Read the arch first. A get_arch() call inside the assert message would
+    # re-raise the exception that is_gluon_available() catches, and hide it.
     arch = get_arch()
-    assert arch in _SUPPORTED_ARCHS, (
-        f"moe_gemm_a16w16 is only implemented for {_SUPPORTED_ARCHS}, got {arch}. "
-        "There is no triton fallback for this op."
+    assert is_gluon_available(), (
+        f"moe_gemm_a16w16 is only implemented for {_GLUON_SUPPORTED_ARCHS}, got "
+        f"{arch}. There is no triton fallback for this op."
     )
     if backend is not None:
         assert (
