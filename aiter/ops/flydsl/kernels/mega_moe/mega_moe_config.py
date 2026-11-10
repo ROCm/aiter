@@ -454,11 +454,12 @@ def fused_layout_supported(
 
 
 def large_m_mtprs_for(*, world_size: int, model_dim: int, inter_dim: int) -> tuple[int, ...]:
-    """Instance capacities the large-input kernel is built for on a FUSED_LAYOUTS layout."""
-    if (world_size, model_dim, inter_dim) == (8, V4_MODEL_DIM, V4_INTER_DIM):
-        return LARGE_M_MTPRS
-    # EP4 V4.1-Flash: the capacity its large-input tune was measured at.
-    return (8192,)
+    """Instance capacities the large-input kernel is built for on a FUSED_LAYOUTS layout.
+
+    Every fused layout takes LARGE_M_MTPRS: each layout's large-input config is one tune at every capacity
+    (its knobs follow a launch's rows, not the capacity; see _tune_v41_flash_ep4_large).
+    """
+    return LARGE_M_MTPRS
 
 
 def small_m_cu_supported(num_cu: int) -> bool:
@@ -1522,7 +1523,13 @@ def _tune_v41_flash_ep4_small(config: MegaMoEConfig, bucket: int) -> MegaMoEConf
 
 
 def _tune_v41_flash_ep4_large(config: MegaMoEConfig) -> MegaMoEConfig:
-    """EP4 DeepSeek-V4.1-Flash large-input kernel at MTPR 8192 (96 experts per rank), measured on gfx950."""
+    """EP4 DeepSeek-V4.1-Flash large-input kernel (96 experts per rank), measured on gfx950 at MTPR 8192.
+
+    It serves every capacity in LARGE_M_MTPRS unchanged: the thresholds below are rows a rank of the launch
+    (payload_small_tokens, presend_rows, the early_p_mid bound) and the payload geometry is sized by the plan, so a
+    launch of N rows runs the same schedule at any capacity >= N. The capacity only sizes buffers (pair-order
+    buckets, row stamps, P2P rows), all inside the 32-bit buffer offsets up to 16384 (LargeMRuntime checks them).
+    """
     # One payload producer per destination leaves its ~16 MB a ~750 us copy at 2048 tokens a rank;
     # 12 split the destination's experts (-24%). XCD-affine GEMM2 claims share each W2 slab in one
     # XCD's L2 across the expert's m-blocks (-5%). 128-byte P2P rows keep each GEMM2 scatter store

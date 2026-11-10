@@ -3157,6 +3157,8 @@ class LargeMRuntime:
         routes = self.mtpr * self.topk
         if self._select_config(self.mtpr).fused_stage1.bucket_pairs:
             routes = max(routes, self.world_size * self.epr * self.mtpr)
+        if routes * 4 >= _BUFFER_OFFSET_ABI_BYTES:
+            raise ValueError("the large-input pair order exceeds the 32-bit buffer-resource ABI")
         return torch.empty(routes, dtype=torch.int32, device=self.dev)
 
     def _allocate_dispatch_workspace(self, op, metadata_blocks, pair_order):
@@ -3420,6 +3422,8 @@ class LargeMRuntime:
                 npes=self.world_size, mtpr=self.mtpr, experts_per_rank=self.epr, num_valid_max=nvm,
             )[0])
             nbytes = spec["max_g2_m_blocks"] * (self.model_dim // spec["BN"]) * spec["BM"] * 16
+            if nbytes >= _BUFFER_OFFSET_ABI_BYTES:
+                raise ValueError("the GEMM2 scale staging buffer exceeds the 32-bit buffer-resource ABI")
             self._fused_scale_stage = torch.empty(nbytes, dtype=torch.uint8, device=self.dev)
         self._fused_comb_ctr_arena = self._s1_op._sym(
             (self.state_slots, 4), torch.int32
