@@ -105,26 +105,28 @@ def check_asm_decode_rejects_unsupported_widths():
         )
 
 
-def check_bf16_gqa32_merges_only_written_splits() -> None:
-    """bf16 gqa32 decode with more KV splits than a row's KV fills: stage 2 must
-    merge only the splits stage 1 wrote. The split buffers come from torch.empty,
-    so they are pre-filled with NaN to make an unwritten split visible."""
-    batch_size, nhead, num_kv_splits = 260, 32, 5
+def check_merges_only_written_splits(dtype, nhead: int, tile: int) -> None:
+    """Decode with more KV splits than a row's KV fills: stage 2 must merge only
+    the splits stage 1 wrote. Stage 1 deals `tile`-token KV tiles to the splits.
+    The split buffers come from torch.empty, so they are pre-filled with NaN to
+    make an unwritten split visible."""
+    batch_size, num_kv_splits = 260, 5
     kv_lora_rank, qk_rope_head_dim = 512, 64
     qk_head_dim = kv_lora_rank + qk_rope_head_dim
-    # 17-63 tokens per row: one or two 32-token tiles, never all 5 splits.
-    kv_lens = torch.randint(17, 64, (batch_size,), dtype=torch.int)
+    # One or two tiles per row, never all 5 splits.
+    kv_lens = torch.randint(tile // 2 + 1, 2 * tile, (batch_size,), dtype=torch.int)
     qo_indptr = torch.arange(batch_size + 1, dtype=torch.int)
     kv_indptr = torch.zeros(batch_size + 1, dtype=torch.int)
     kv_indptr[1:] = torch.cumsum(kv_lens, dim=0)
     total_kv = int(kv_indptr[-1])
     kv_indices = torch.randperm(total_kv, dtype=torch.int)
     kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
-    q = torch.randn((batch_size, nhead, qk_head_dim), dtype=torch.bfloat16)
-    kv_buffer = torch.randn((total_kv, 1, 1, qk_head_dim), dtype=torch.bfloat16)
+    q = torch.randn((batch_size, nhead, qk_head_dim)).to(dtype)
+    kv_buffer = torch.randn((total_kv, 1, 1, qk_head_dim)).to(dtype)
     sm_scale = 1.0 / qk_head_dim**0.5
+    scale = torch.ones(1, dtype=torch.float) if dtype == dtypes.fp8 else None
 
-    ref, _ = torch_mla_extend(
+    ref, ref_lse = torch_mla_extend(
         q,
         kv_buffer.view(total_kv, 1, qk_head_dim),
         qo_indptr,
@@ -134,6 +136,7 @@ def check_bf16_gqa32_merges_only_written_splits() -> None:
         kv_lora_rank,
         qk_rope_head_dim,
         torch.bfloat16,
+        is_causal=False,
     )
 
     for shape in (
@@ -142,7 +145,7 @@ def check_bf16_gqa32_merges_only_written_splits() -> None:
     ):
         torch.full(shape, float("nan"), dtype=torch.float)
     out = torch.empty((batch_size, nhead, kv_lora_rank), dtype=torch.bfloat16)
-    aiter.mla.mla_decode_fwd(
+    _, lse = aiter.mla.mla_decode_fwd(
         q,
         kv_buffer,
         out,
@@ -153,10 +156,55 @@ def check_bf16_gqa32_merges_only_written_splits() -> None:
         1,
         sm_scale=sm_scale,
         num_kv_splits=num_kv_splits,
+        q_scale=scale,
+        kv_scale=scale,
+        return_lse=True,
     )
-    assert torch.isfinite(out).all(), "merged a split that stage 1 never wrote"
-    checkAllclose(ref.float(), out.float(), msg="bf16 gqa32 short-KV multi-split")
-    cal_diff(ref, out, "bf16 gqa32 short-KV multi-split")
+    msg = f"{dtype} gqa{nhead} short-KV multi-split"
+    assert torch.isfinite(out).all(), f"{msg}: merged a split stage 1 never wrote"
+    assert torch.isfinite(lse).all(), f"{msg}: merged a split stage 1 never wrote"
+    tol = 5e-2 if dtype == dtypes.fp8 else 1e-2
+    checkAllclose(ref.float(), out.float(), rtol=tol, atol=tol, msg=msg)
+    checkAllclose(ref_lse, lse, msg=f"{msg} lse")
+    cal_diff(ref, out, msg, use_fp8=dtype == dtypes.fp8)
+    cal_diff(ref_lse, lse, f"{msg} lse")
+
+
+def check_fp8_gqa16_multi_tile_output() -> None:
+    """gfx950 fp8 gqa16 decode, one row with 3 KV tiles, after a cache flush.
+    A wave must not refill an LDS KV slot while another wave still reads V
+    from it. A cache flush before each call makes this race likely."""
+    nhead, kv_lora_rank, qk_head_dim, num_kv = 16, 512, 576, 65536
+    sm_scale = 1.0 / 16
+    one = torch.ones(1, dtype=torch.float)
+    q = (torch.randn((1, nhead, qk_head_dim)) * 3).to(dtypes.fp8)
+    kv_buffer = torch.randn((num_kv, qk_head_dim)).to(dtypes.fp8)
+    flush = torch.zeros(64 << 20)
+    out = torch.empty((1, nhead, kv_lora_rank), dtype=torch.bfloat16)
+    num_bad = 0
+    for kv_len in range(257, 385):
+        kv_indices = torch.randperm(num_kv)[:kv_len].int()
+        flush.sum()
+        aiter.mla.mla_decode_fwd(
+            q,
+            kv_buffer.view(-1, 1, 1, qk_head_dim),
+            out,
+            torch.arange(2, dtype=torch.int),
+            torch.tensor([0, kv_len], dtype=torch.int),
+            kv_indices,
+            torch.ones(1, dtype=torch.int),
+            1,
+            sm_scale=sm_scale,
+            q_scale=one,
+            kv_scale=one,
+            num_kv_splits=1,
+            num_kv_splits_indptr=torch.tensor([0, 1], dtype=torch.int),
+        )
+        k = kv_buffer[kv_indices.long()].float()
+        ref = torch.softmax(q[0].float() @ k.T * sm_scale, -1) @ k[:, :kv_lora_rank]
+        err = (out[0].float() - ref).abs().max() / ref.abs().max()
+        num_bad += int(err > 0.05)
+    assert num_bad == 0, f"{num_bad} of 128 rows wrong after a cache flush"
 
 
 def cal_diff(
@@ -1062,8 +1110,13 @@ def main():
     if get_gfx() in ("gfx942", "gfx950"):
         check_asm_decode_rejects_unsupported_widths()
         aiter.logger.info("mla_decode_stage1_asm_fwd width checks: passed")
-        check_bf16_gqa32_merges_only_written_splits()
+        check_merges_only_written_splits(torch.bfloat16, nhead=32, tile=32)
         aiter.logger.info("bf16 gqa32 short-KV multi-split merge: passed")
+    if get_gfx() == "gfx950":
+        check_fp8_gqa16_multi_tile_output()
+        aiter.logger.info("fp8 gqa16 multi-tile decode: passed")
+        check_merges_only_written_splits(dtypes.fp8, nhead=16, tile=128)
+        aiter.logger.info("fp8 gqa16 short-KV multi-split merge: passed")
 
     for nhead, decode_qlen in args.nhead:
         df = []
