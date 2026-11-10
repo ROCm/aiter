@@ -1,13 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""QSA sparse prefill on gfx942: BF16 D256 sparse attention over packed K/V.
+"""QSA sparse prefill on gfx942 and gfx950: BF16 D256 sparse attention over packed K/V.
 
 Public entry for the ``sparse_prefill_*`` kernels in ``kernels/qsa/``. Each call
 recovers the selected four-token blocks (FlyDSL K1-K3), routes every query tile to
 the union kernel (queries of a tile share one compact block list with exact
 per-query membership) or to the direct kernel (one query per wave over its own
 blocks), and writes O in place. Plans and scratch are private. K/V may also be a
-token pool read in place through a slot table.
+token pool read in place through a slot table, and on gfx950 their rows may be
+strided (an interleaved K|V cache read in place).
 """
 
 import math
@@ -37,6 +38,9 @@ __all__ = ["flydsl_qsa_sparse_prefill"]
 # Kernels use unsigned 32-bit buffer byte offsets; the 1 MiB margin keeps out-of-range
 # sentinels plus their lane offsets from wrapping.
 _MAX_SPAN = 2**32 - 2**20
+# Kernels form a four-row K/V block's extent and offsets (up to 4 x a row's bytes) as
+# 32-bit values: a row stride below 2**28 elements keeps them below 2**31.
+_MAX_KV_STRIDE = 2**28
 
 
 def _union_min_rows(group):
@@ -46,6 +50,30 @@ def _union_min_rows(group):
 
 def _aligned(nbytes):
     return -(-nbytes // SCRATCH_ALIGN) * SCRATCH_ALIGN
+
+
+def _kv_stride(tensor):
+    """Elements between the rows of K or V [rows, heads, 256], or None unless every row
+    holds dense [heads, 256] values, 16-byte aligned, before the next row starts, and
+    the next row starts fewer than _MAX_KV_STRIDE elements on. Size-1 dims have no
+    stride of their own (torch's contiguity rule): one row is dense."""
+    rows, heads, dim = tensor.shape
+    stride = tensor.stride(0) if rows > 1 else heads * dim
+    if (
+        tensor.stride(2) != 1
+        or (heads > 1 and tensor.stride(1) != dim)
+        or stride < heads * dim
+        or stride % 8
+        or stride >= _MAX_KV_STRIDE
+    ):
+        return None
+    return stride
+
+
+def _span_bytes(rows, stride, heads):
+    """Bytes from the first of rows BF16 [heads, 256] rows, stride elements apart, to the
+    end of the last."""
+    return ((rows - 1) * stride + heads * 256) * 2 if rows else 0
 
 
 class _Arena:
@@ -75,7 +103,9 @@ _arenas = weakref.WeakValueDictionary()
 
 
 class _Workspace:
-    def __init__(self, q, k, v, indices, query_lens, prefix_lens, scale, kv_slots=None):
+    def __init__(
+        self, q, k, v, indices, query_lens, prefix_lens, scale, kv_stride, kv_slots=None
+    ):
         topk = (indices.shape[1] - 3) // 4
         q_lens = np.asarray(query_lens, dtype=np.int64)
         lengths = q_lens + np.asarray(prefix_lens, dtype=np.int64)
@@ -83,7 +113,7 @@ class _Workspace:
         positions = np.arange(len(sequence)) + (lengths - np.cumsum(q_lens))[sequence]
         slotted = kv_slots is not None
         # Past this pool span raw direct byte offsets no longer reach every row.
-        wide = slotted and k.numel() * k.element_size() > _MAX_SPAN
+        wide = slotted and _span_bytes(k.shape[0], kv_stride, k.shape[1]) > _MAX_SPAN
         self.metadata = {
             "query_lens": query_lens,
             "prefix_lens": prefix_lens,
@@ -92,6 +122,7 @@ class _Workspace:
             "query_positions": prepare.upload(positions, q.device),
             "max_seqlen_k": int(lengths.max(initial=0)),
             "wide": wide,
+            "kv_stride": kv_stride,
         }
         self.captured = False
         self.block_indices = None
@@ -247,17 +278,22 @@ def flydsl_qsa_sparse_prefill(
     at a multiple of four (paged pools whose pages are a multiple of four tokens
     satisfy this), and the result is the same as for K/V packed by those slots. A
     pool may exceed 4 GiB (raw direct then uses 64-bit loads); slot values are not
-    validated. Hot calls rebuild the selection: per-layout plans share one private
-    per-stream scratch arena. out is optional and must not overlap Q/K/V, indices or
-    kv_slots. Warm the same stream and layout before graph capture. Captured
-    workspaces stay pinned for graph pointer lifetime and share their stream's
-    scratch: do not replay them concurrently with each other or with that stream's
-    calls. Each kernel variant compiles on its first use: a few seconds with empty
-    FlyDSL caches. One GPU per process (TP uses separate workers).
+    validated. On gfx950, K/V may be strided views: every row holds dense [HK, 256]
+    values and rows sit one 16-byte aligned stride >= HK x 256 and < 2**28 elements
+    apart, the same for K and V (e.g. the halves of one interleaved K|V record per
+    token, read in place); each stride compiles its own kernels. Hot calls rebuild
+    the selection: per-layout plans share one private per-stream scratch arena. out
+    is optional and must not overlap Q/K/V, indices or kv_slots. Warm the same
+    stream and layout before graph capture. Captured workspaces stay pinned for graph
+    pointer lifetime and share their stream's scratch: do not replay them
+    concurrently with each other or with that stream's calls. Each kernel variant
+    compiles on its first use, a few seconds with empty FlyDSL caches; none is
+    prebuilt (PREBUILD_KERNELS / AOT do not cover QSA). One GPU per process (TP uses
+    separate workers).
     """
     global _device
     if q.ndim != 3 or k.ndim != 3 or v.ndim != 3:
-        raise ValueError("Q/K/V must be contiguous BF16 [tokens, heads, 256]")
+        raise ValueError("Q/K/V must be BF16 [tokens, heads, 256]")
     if isinstance(softmax_scale, (torch.Tensor, bool)):
         raise TypeError("softmax_scale must be a host scalar or None")
     scale = 0.0625 if softmax_scale is None else float(softmax_scale)
@@ -297,18 +333,19 @@ def flydsl_qsa_sparse_prefill(
     ):
         raise ValueError("Host query/prefix lengths must describe the packed Q/K/V")
     if q.device.type != "cuda" or torch.version.hip is None:
-        raise ValueError("QSA sparse attention requires ROCm gfx942")
+        raise ValueError("QSA sparse attention requires ROCm gfx942 or gfx950")
     for tensor in (q, k, v):
         if (
             tensor.dtype != torch.bfloat16
             or tensor.device != q.device
             or tensor.layout != torch.strided
-            or not tensor.is_contiguous()
             or tensor.shape[-1] != 256
         ):
-            raise ValueError("Q/K/V must be contiguous BF16 [tokens, heads, 256]")
+            raise ValueError("Q/K/V must be BF16 [tokens, heads, 256]")
         if tensor.data_ptr() % 16:
             raise ValueError("Q/K/V require 16-byte alignment")
+    if not q.is_contiguous():
+        raise ValueError("Q must be contiguous")
     if (
         k.shape != v.shape
         or q.shape[1] <= 0
@@ -318,17 +355,28 @@ def flydsl_qsa_sparse_prefill(
         raise ValueError(
             "K/V must match and Q heads must be a positive multiple of KV heads"
         )
+    stride = _kv_stride(k)
+    if stride is None or _kv_stride(v) != stride:
+        raise ValueError(
+            "K/V rows must hold dense [heads, 256] values one 16-byte aligned stride "
+            ">= heads x 256 and < 2**28 elements apart, the same for K and V"
+        )
     if q.shape[1] // k.shape[1] > 16:
         raise ValueError("At most 16 Q heads per KV head fit the direct fallback wave")
     # K/V are addressed per request, so only each request's K (or V) span is bounded,
-    # not the packed total: about 8M context tokens at HK1, 4M at HK2. A slot-table
-    # pool is addressed from its base instead.
+    # not the packed total: about 8M context tokens at HK1, 4M at HK2 (dense rows). A
+    # slot-table pool is addressed from its base instead.
     tokens = max(map(sum, zip(query_lens, prefix_lens)), default=0)
-    span = q.numel() if kv_slots is not None else max(q.numel(), tokens * k.stride(0))
-    if span * q.element_size() > _MAX_SPAN:
+    span = q.numel() * q.element_size()
+    if kv_slots is None:
+        span = max(span, _span_bytes(tokens, stride, k.shape[1]))
+    if span > _MAX_SPAN:
         raise ValueError("Q and each request's K/V require byte spans <= 2**32 - 2**20")
-    if get_gfx_runtime() != "gfx942":
-        raise ValueError("QSA sparse attention requires gfx942")
+    if get_gfx_runtime() not in ("gfx942", "gfx950"):
+        raise ValueError("QSA sparse attention requires gfx942 or gfx950")
+    # Strided rows are validated on gfx950 only.
+    if stride != k.shape[1] * 256 and get_gfx_runtime() != "gfx950":
+        raise ValueError("Strided K/V rows are supported on gfx950 only")
     topk = (indices.shape[-1] - 3) // 4 if indices.ndim else 0
     if (
         indices.shape != (q.shape[0], 4 * topk + 3)
@@ -354,12 +402,14 @@ def flydsl_qsa_sparse_prefill(
     ):
         raise ValueError("out must be aligned, contiguous and match Q")
     begin, end = out.data_ptr(), out.data_ptr() + out.numel() * out.element_size()
-    sources = (q, k, v, indices) + (() if kv_slots is None else (kv_slots,))
-    for source in sources:
-        if (
-            begin < source.data_ptr() + source.numel() * source.element_size()
-            and source.data_ptr() < end
-        ):
+    # Strided K/V rows span more bytes than they hold.
+    kv_bytes = _span_bytes(k.shape[0], stride, k.shape[1])
+    sources = [(k.data_ptr(), kv_bytes), (v.data_ptr(), kv_bytes)] + [
+        (source.data_ptr(), source.numel() * source.element_size())
+        for source in (q, indices) + (() if kv_slots is None else (kv_slots,))
+    ]
+    for pointer, size in sources:
+        if begin < pointer + size and pointer < end:
             raise ValueError("out must not overlap Q/K/V, indices or kv_slots")
     if q.shape[0] == 0:
         return out
@@ -379,6 +429,8 @@ def flydsl_qsa_sparse_prefill(
             topk,
             # Pool rows: they set the raw direct extent and the WIDE path.
             None if kv_slots is None else k.shape[0],
+            # Row stride: every kernel that reads K/V compiles it in.
+            stride,
         )
         workspace = _workspaces.get(key)
         if workspace is None:
@@ -387,7 +439,7 @@ def flydsl_qsa_sparse_prefill(
                     "Warm attention on this stream and layout before graph capture"
                 )
             workspace = _Workspace(
-                q, k, v, indices, query_lens, prefix_lens, scale, kv_slots
+                q, k, v, indices, query_lens, prefix_lens, scale, stride, kv_slots
             )
             _workspaces[key] = workspace
             for stale in list(_workspaces):
