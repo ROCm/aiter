@@ -451,6 +451,24 @@ class PaDecodeSchedule:
                 or (single_tile_plan and split_workgroups <= 2 * num_compute_units)
             )
         )
+        # gfx942 split CTAs launch split-major, so a task's splits dispatch
+        # together instead of after every slot of the previous split. BF16
+        # head-dim splits forced by LDS only gain when tasks are long.
+        split_major = (
+            "gfx94" in arch
+            and query_splits > 1
+            and (
+                kv_dtype in FP8_KV_DTYPES
+                or head_dim <= 256
+                or (
+                    max_context_length is not None
+                    and max_tiles_per_task(
+                        num_seqs, work_capacity, num_partitions, max_context_length
+                    )
+                    >= 4
+                )
+            )
+        )
         cache_key = (
             head_dim,
             query_group_size,
@@ -472,6 +490,7 @@ class PaDecodeSchedule:
             bool(mask_unowned_kv),
             direct_output,
             gfx942_busy,
+            split_major,
             D256_PIPE,
             stage_pages,
         )
@@ -532,6 +551,7 @@ class PaDecodeTraits:
     WAVES_PER_EU_2: bool
     GFX942_Q_EARLY: bool
     PAGES_EARLY: bool
+    SPLIT_MAJOR: bool
     REUSE_KV_PAGES: bool
     SCALES_BEFORE_CURRENT_V: bool
     M1_SCALE_BEFORE_MASK: bool
@@ -616,6 +636,7 @@ class PaDecodeTraits:
             mask_unowned_kv,
             DIRECT,
             gfx942_busy,
+            SPLIT_MAJOR,
             D256_PIPE,
             stage_page_capacity,
         ) = cache_key
@@ -927,6 +948,7 @@ class PaDecodeTraits:
                     or (M_TILES == 2 and kv_dtype in FP8_KV_DTYPES)
                 )
             ),
+            SPLIT_MAJOR=SPLIT_MAJOR,
             GFX942_Q_EARLY=(
                 not is_gfx950 and kv_dtype != MXFP4_KV_DTYPE and not STREAM_KV
             ),

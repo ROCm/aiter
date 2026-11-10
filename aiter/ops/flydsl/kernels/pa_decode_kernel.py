@@ -441,7 +441,7 @@ def compile_pa_decode_tile(
 
         # Skip cleared padding records: no scratch writes or Q loads.
         # This CTA-uniform guard keeps every task barrier convergent.
-        slot = fx.Int32(gpu.block_id("x"))
+        slot = fx.Int32(gpu.block_id("y" if traits.SPLIT_MAJOR else "x"))
         work = fx.recast_iter(fx.Int32, work_info_ptr)
         if const_expr(traits.DIRECT):
             # One task per sequence, no plan: ``work_info`` is the context lengths.
@@ -517,7 +517,11 @@ def compile_pa_decode_tile(
                 work_info,
                 num_seqs,
             ).launch(
-                grid=(work_capacity, num_kv_heads * traits.query_splits, 1),
+                grid=(
+                    (num_kv_heads * traits.query_splits, work_capacity, 1)
+                    if traits.SPLIT_MAJOR
+                    else (work_capacity, num_kv_heads * traits.query_splits, 1)
+                ),
                 block=(traits.BLOCK_THREADS, 1, 1),
                 stream=stream,
             )
