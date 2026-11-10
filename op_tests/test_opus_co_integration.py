@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Integration coverage for gfx1250 pre-built OPUS A16W16 kernels."""
+"""Integration coverage for OPUS COs and gfx950 MXFP8 bpreshuffle kernels."""
 
 from __future__ import annotations
 
@@ -31,6 +31,8 @@ from csrc.opus_gemm.opus_gemm_common import (
     GFX1250_SPLITK_FUSE_KIDS,
     OPUS_KERNEL_TAGS_BY_ARCH_FAMILY,
     _load_co_kernels,
+    a8w8_mxscale_bpreshuffle_supports_shape,
+    bpreshuffle_workspace_bytes,
     co_image_path,
     get_kernel_instance,
     gfx1250_4wave_co_kernels_list,
@@ -528,6 +530,151 @@ def test_gfx1250_tuner_selects_co_without_split_k(monkeypatch):
     instance = gfx1250_4wave_co_kernels_list[min(GFX1250_4WAVE_CO_KIDS)]
     assert candidate_splitK(64, 128, 4096, 1, 256, instance) == [0]
     assert not kid_rejects_shape(instance, 65, 129, 4097)
+
+
+@pytest.mark.parametrize(
+    "n,supported", [(262016, True), (262144, False), (262272, False)]
+)
+def test_gfx950_bpreshuffle_workspace_bound(n, supported):
+    instance = get_kernel_instance(
+        "gfx950", "a8w8_blockscale_bpreshuffle", 7991, cu_num=256
+    )
+    assert bpreshuffle_workspace_bytes(instance, 1024, n, 512) == 16 * 1024 * n
+    assert a8w8_mxscale_bpreshuffle_supports_shape(instance, 1024, n, 512) is supported
+
+
+@pytest.fixture(scope="module")
+def _gfx950_device():
+    if _runtime_arch() != "gfx950":
+        pytest.skip("requires gfx950 hardware")
+    device = torch.device("cuda", torch.cuda.current_device())
+    cu_num = torch.cuda.get_device_properties(device).multi_processor_count
+    with pytest.MonkeyPatch.context() as patch:
+        patch.syspath_prepend(
+            str(Path(__file__).resolve().parents[1] / "csrc" / "opus_gemm")
+        )
+        from opus_gemm_tune import _ensure_kids_compiled
+
+        _ensure_kids_compiled(
+            [7987, 7991, 7997, 8279],
+            family="a8w8_blockscale_bpreshuffle",
+            gfx="gfx950",
+            cu_num=cu_num,
+        )
+    return device
+
+
+@pytest.mark.parametrize(
+    "kid,m,k",
+    [
+        (7997, 16, 768),
+        (7997, 16, 896),
+        (7997, 16, 1024),
+        (7997, 32, 1024),
+        (7997, 33, 1024),
+        (8279, 32, 1024),
+        (8279, 32, 1152),
+        (8279, 32, 1536),
+        (8279, 32, 1664),
+        (8279, 33, 1536),
+        (7987, 16, 2048),
+        (7987, 16, 2176),
+        (7991, 16, 6144),
+        (7991, 33, 6144),
+    ],
+)
+def test_gfx950_staged_b_capacity_matches_torch(kid, m, k, _gfx950_device):
+    from aiter.ops.shuffle import shuffle_weight
+
+    device = _gfx950_device
+    generator = torch.Generator(device=device).manual_seed(kid + m + k)
+    x = (torch.randint(0, 2, (m, k), device=device, generator=generator) * 2 - 1).to(
+        torch.float32
+    ) * 0.125
+    w = (torch.randint(0, 2, (128, k), device=device, generator=generator) * 2 - 1).to(
+        torch.float32
+    ) * 0.25
+    a_exp = torch.randint(-1, 2, (m, k // 128), device=device, generator=generator)
+    b_exp = torch.randint(-1, 2, (1, k // 128), device=device, generator=generator)
+    a_scale = torch.exp2(a_exp.float()).repeat_interleave(128, 1)
+    b_scale = (
+        torch.exp2(b_exp.float()).repeat_interleave(128, 0).repeat_interleave(128, 1)
+    )
+    reference = ((x * a_scale) @ (w * b_scale).T).to(torch.bfloat16)
+    y = torch.full((m, 128), float("nan"), device=device, dtype=torch.bfloat16)
+    actual = opus_gemm(
+        x.to(torch.float8_e4m3fn),
+        shuffle_weight(w.to(torch.float8_e4m3fn), layout=(16, 16)),
+        y,
+        family="a8w8_blockscale_bpreshuffle",
+        layout="bpreshuffle",
+        kid=kid,
+        x_scale=(a_exp.T.contiguous() + 127).to(torch.uint8).T,
+        w_scale=(b_exp + 127).to(torch.uint8),
+    )
+    assert actual is y
+    torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "kid,m,n,k", [(7997, 16, 128, 1024), (8279, 32, 16384, 1536), (7991, 16, 128, 6144)]
+)
+def test_gfx950_mxscale_tuned_dispatch(kid, m, n, k, _gfx950_device, monkeypatch):
+    from aiter import dtypes
+    from aiter.ops import gemm_op_a8w8 as gemm
+    from aiter.ops.opus import gemm_op_a8w8 as opus_a8w8
+    from aiter.ops.shuffle import shuffle_weight
+
+    calls = []
+    raw = opus_a8w8._opus_gemm_a8w8_blockscale_bpreshuffle_launch_raw
+
+    def capture(*args):
+        calls.append(args[5])
+        return raw(*args)
+
+    monkeypatch.setattr(
+        gemm,
+        "get_mxscale_bpreshuffle_config",
+        lambda *args: {"libtype": "opus", "kernelId": kid},
+    )
+    monkeypatch.setattr(
+        opus_a8w8, "_opus_gemm_a8w8_blockscale_bpreshuffle_launch_raw", capture
+    )
+    device = _gfx950_device
+    x = torch.full((m, k), 0.125, device=device).to(torch.float8_e4m3fn)
+    w = torch.full((n, k), 0.25, device=device).to(torch.float8_e4m3fn)
+    x_scale = torch.full((k // 128, m), 127, device=device, dtype=torch.uint8).T
+    w_scale = torch.full((n // 128, k // 128), 127, device=device, dtype=torch.uint8)
+    y = torch.full((m, n), float("nan"), device=device, dtype=torch.bfloat16)
+    actual = gemm.gemm_a8w8_blockscale_bpreshuffle(
+        x,
+        shuffle_weight(w, layout=(16, 16)),
+        x_scale.view(dtypes.fp8_e8m0),
+        w_scale.view(dtypes.fp8_e8m0),
+        out=y,
+    )
+    assert actual is y
+    assert calls == [kid]
+    torch.testing.assert_close(actual, torch.full_like(y, k / 32), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("n", [262144, 262272])
+def test_gfx950_splitk_host_rejects_descriptor_overflow(n, _gfx950_device):
+    from aiter.ops.opus.gemm_op_a8w8 import (
+        _opus_gemm_a8w8_blockscale_bpreshuffle_launch_raw,
+    )
+
+    device = _gfx950_device
+    x = torch.empty((1, 1024, 512), device=device, dtype=torch.float8_e4m3fn)
+    w = torch.empty((1, n, 512), device=device, dtype=torch.float8_e4m3fn)
+    y = torch.empty((1, 1024, n), device=device, dtype=torch.bfloat16)
+    x_scale = torch.empty((1024, 4), device=device, dtype=torch.uint8)
+    w_scale = torch.empty((n // 128, 4), device=device, dtype=torch.uint8)
+    workspace = torch.empty(4, device=device, dtype=torch.float32)
+    with pytest.raises(RuntimeError, match="split-K workspace exceeds reducer limits"):
+        _opus_gemm_a8w8_blockscale_bpreshuffle_launch_raw(
+            x, w, x_scale, w_scale, y, 7991, workspace
+        )
 
 
 if __name__ == "__main__":

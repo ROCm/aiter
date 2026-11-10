@@ -3337,11 +3337,12 @@ def gen_mxscale_bpreshuffle_instance(
             stream = "stream"
             condition = "Traits::short_k(k)"
             if entry["pipeline"] == "staged_b":
+                lds = "Traits::lds_bytes(k, m)"
                 grid_setup = f"""const bool ring8 = Traits::ring8_eligible(m, k);
-    const bool short_k = !ring8 && Traits::short_k(k);
+    const bool short_k = !ring8 && Traits::short_k(k, m);
     const dim3 main_grid = ring8 ? dim3(n / Traits::RING8_BLOCK_N, (m + Traits::RING8_BLOCK_M - 1) / Traits::RING8_BLOCK_M, Traits::SPLIT_K) : {grid};
     const dim3 main_threads(ring8 ? Traits::RING8_BLOCK_SIZE : Traits::BLOCK_SIZE);
-    const size_t main_lds = ring8 ? Traits::ring8_lds_bytes(k) : (short_k ? Traits::resident_a_lds_bytes(k) : {lds});
+    const size_t main_lds = ring8 ? Traits::ring8_lds_bytes(k) : (short_k ? Traits::resident_a_lds_bytes(k, m) : {lds});
     """
                 grid = "main_grid"
                 threads = "main_threads"
@@ -3385,7 +3386,7 @@ struct {alias} : {entry["traits"]} {{}};
             setup += f"""static_assert(Traits::SPLIT_K > 1);
     const size_t workspace_numel = opus_checked_extent_product(
         {{Traits::SPLIT_K, size_t(m), size_t(n)}}, "{k.name}");
-    AITER_CHECK(m * n <= INT32_MAX && workspace_numel <= {k.max_tensor_bytes} / sizeof(float),
+    AITER_CHECK(m * n <= INT32_MAX && workspace_numel <= UINT32_MAX / sizeof(float) && workspace_numel <= {k.max_tensor_bytes} / sizeof(float),
                 "split-K workspace exceeds reducer limits");
     args.ptr_c = opus_validate_workspace(
         workspace, Y, AITER_DTYPE_fp32, workspace_numel, 16, "{k.name}");

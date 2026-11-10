@@ -2886,6 +2886,7 @@ a8w8_mxscale_bmm_kernels_list = {
 
 _TAG = "a8w8_blockscale_mxscale_gemm_bpreshuffle"
 _INT32_MAX = 2**31 - 1
+_UINT32_MAX = 2**32 - 1
 _BP_ROOT = "opus_gemm_blockscale_mxscale_bpreshuffle_"
 _B_PREFIX = "opus_gemm_bpreshuffle_"
 _B_LDS_LIMIT = 160 * 1024
@@ -3852,9 +3853,10 @@ def a8w8_mxscale_bpreshuffle_supports_shape(instance, m, n, k):
         return False
     if entry.get("pipeline") == "staged_b" and 2 * instance.B_M * n > _INT32_MAX:
         return False
+    workspace_bytes = bpreshuffle_workspace_bytes(instance, m, n, k)
     return (
-        max(2 * m * n, bpreshuffle_workspace_bytes(instance, m, n, k))
-        <= instance.max_tensor_bytes
+        workspace_bytes <= _UINT32_MAX
+        and max(2 * m * n, workspace_bytes) <= instance.max_tensor_bytes
     )
 
 
