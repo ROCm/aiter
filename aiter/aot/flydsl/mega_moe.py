@@ -81,8 +81,9 @@ K3_SITU_LINEAR_BETA = 25.0
 # DeepSeek-V4.1-Flash EP4 deployment profile (epr96, d5120 / i2304, a8w4 only:
 # the fused routes are a8w4). Its MTPRs are those of ATOM's instances: decode
 # (128: staged + small-input 256) and prefill (8192 and 16384: staged +
-# small-input + large-input). The large-input kernel is also built at 1024,
-# 2048 and 4096, which no ATOM instance uses; --mtpr builds them.
+# small-input + large-input). The large-input route also exists at 1024, 2048
+# and 4096; no ATOM instance uses those, so the default build leaves them out
+# and --mtpr builds them on request.
 V41_FLASH_WORLD_SIZE = 4
 V41_FLASH_EXPERTS_PER_RANKS = (96,)
 V41_FLASH_MODEL_DIM = 5120
