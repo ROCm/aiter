@@ -56,11 +56,10 @@ from aiter.ops.triton.utils.types import e4m3_dtype
 
 _CONFIG_NAME = "UNIFIED-ATTENTION"
 
-# Candidate D3 (default off): AITER_GFX1250_UA3D_NHD_CFG='{"SEGMENTS_PER_CU": 16, "num_stages": 1, ...}' overrides the
-# kv_split (SEGMENTS_PER_CU / MIN_SEGMENTS / MAX_SEGMENTS) and attn_3d (num_warps / num_stages / waves_per_eu) entries
-# of the gfx1250 Triton 3D split-KV decode path for the plain (non-shuffled) bf16 q + bf16 KV cache only, which today
-# falls to the tables' generic "any" entries.  Unset = unchanged lookup.  Arithmetic and kernel source are unchanged;
-# only the KV split count and launch/pipelining parameters move.
+# AITER_GFX1250_UA3D_NHD_CFG='{"SEGMENTS_PER_CU": 16, "num_stages": 3, ...}' overrides the
+# kv_split (SEGMENTS_PER_CU / MIN_SEGMENTS / MAX_SEGMENTS) and attn_3d (num_warps / num_stages / waves_per_eu)
+# entries of the gfx1250 Triton 3D split-KV decode path for plain (non-shuffled) bf16 or fp8 q / KV.
+# Unset keeps the DEFAULT.json entries. Arithmetic and kernel source are unchanged.
 _UA3D_NHD_KEYS = {"kv_split": ("SEGMENTS_PER_CU", "MIN_SEGMENTS", "MAX_SEGMENTS"),
                   "attn_3d": ("num_warps", "num_stages", "waves_per_eu")}
 
