@@ -927,7 +927,7 @@ class AttentionProgram:
         # Tiles j < safe_tile_end have all KV positions within causal range
         # for every query row, so apply_mask_qk can be skipped.
         min_causal_pos = context_len + q_block_local_idx * cfg.BLOCK_Q
-        safe_tile_end = (min_causal_pos + 1) // cfg.BLOCK_SIZE
+        safe_tile_end = (min_causal_pos + 1) // cfg.TILE_SIZE
         safe_tile_end = gl.minimum(safe_tile_end, tile_end)
         safe_tile_end = gl.maximum(safe_tile_end, tile_start)
 
@@ -2346,22 +2346,24 @@ def _unified_attention_gluon_kernel_3d(
         if not cfg.ALL_DECODE:
             # With q_len > 1 the rows of a query block have different causal
             # horizons, so a tile before the last can hold keys past an early
-            # row's horizon. Decode has one query per block and skips this.
-            tile_offset = (
-                j * cfg.TILE_SIZE
-                + gl.arange(
-                    0,
-                    cfg.TILE_SIZE,
-                    layout=gl.SliceLayout(0, cfg.QK_WMMA_UNPACKED_LAYOUT),
-                )[None, :]
-            )
-            S = gl.where(
-                tile_offset < pgm.context_len + pgm.query_pos_qk + 1,
-                S,
-                float("-inf"),
-            )
+            # row's horizon. Tiles before safe_tile_end are visible to every
+            # row of the block and skip the mask. Decode has one query per block
+            # and skips this.
+            if j >= pgm.safe_tile_end:
+                tile_offset = (
+                    j * cfg.TILE_SIZE
+                    + gl.arange(
+                        0,
+                        cfg.TILE_SIZE,
+                        layout=gl.SliceLayout(0, cfg.QK_WMMA_UNPACKED_LAYOUT),
+                    )[None, :]
+                )
+                S = gl.where(
+                    tile_offset < pgm.context_len + pgm.query_pos_qk + 1,
+                    S,
+                    float("-inf"),
+                )
         if need_addtional_mask:
-            seq_mask = seq_offset < pgm.context_len + pgm.query_pos_qk + 1
             S = pgm.apply_addtional_mask_qk(
                 S, seq_offset, alibi_slope, qq_bias_row_ptrs
             )
