@@ -27,6 +27,13 @@
   "supersedes": [],
   "version": 1
  },
+ "mla_decode_fwd_v4_nm_ps": {
+  "fingerprint": "1fb9fb43fb0838c0",
+  "signature": "q_packed:positional, q_rope:positional, kv_packed:positional, kv_rope:positional, kv_indptr:positional, kv_page_indices:positional, sink:positional, workspace:positional:MlaV4NmPsWorkspace, out:positional=None, return_lse:positional=False, lse:positional=None",
+  "source": "aiter/mla.py",
+  "supersedes": [],
+  "version": 1
+ },
  "mla_sparse_prefill_v41": {
   "fingerprint": "63be8e18a2184035",
   "signature": "q:positional:torch.Tensor, q_scale:positional:torch.Tensor, unified_kv:positional:torch.Tensor, unified_kv_scale:positional:torch.Tensor, kv_indices_prefix:positional:torch.Tensor, kv_indptr_prefix:positional:torch.Tensor, kv:positional:torch.Tensor, kv_scale:positional:torch.Tensor, kv_indices_extend:positional:torch.Tensor, kv_indptr_extend:positional:torch.Tensor, attn_sink:positional:torch.Tensor | None, softmax_scale:positional:float, out:positional:torch.Tensor | None=None, num_kv_splits:positional:int | None=None, backend:positional:str | None=None, -> torch.Tensor",
