@@ -1159,6 +1159,7 @@ def _run_moe_reduction(
     topk_weights=None,
     fp8_scale_blk=None,
     fp8_pitch_align=None,
+    is_fp4=False,
     *,
     streaming_loads=False,
 ):
@@ -1194,7 +1195,12 @@ def _run_moe_reduction(
     # reduced (fp8 * e8m0) -> out.dtype. Dense dtypes reduce the contiguous
     # X[tokens, topk, model_dim]. out_dtype_str is only used by the fp8 path.
     out_dtype_str = _reduce_dtype_str
-    if is_fp8:
+    if is_fp4:
+        # fp4 route-out: [rows, model_dim/2 + model_dim/32] (pitch-aligned) uint8.
+        _reduce_dtype_str = "fp4"
+        out_dtype_str = "bf16" if out.dtype == torch.bfloat16 else "f16"
+        X = target
+    elif is_fp8:
         from .kernels.mxfp4_gemm_common import FP8OUT_PITCH_ALIGN, fp8out_scale_blk
 
         _reduce_dtype_str = "fp8"
@@ -1235,7 +1241,7 @@ def _run_moe_reduction(
         out_dtype_str=out_dtype_str,
         use_weight=use_weight,
         scale_blk=fp8_scale_blk if is_fp8 else None,
-        pitch_align=fp8_pitch_align if is_fp8 else None,
+        pitch_align=fp8_pitch_align if (is_fp8 or is_fp4) else None,
         streaming_loads=streaming_loads,
     )
     _run_compiled(

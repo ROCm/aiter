@@ -404,3 +404,15 @@ def fp8out_row_bytes(model_dim, scale_blk=None, pitch_align=FP8OUT_PITCH_ALIGN):
     if align <= 0:
         return pitch
     return ((pitch + align - 1) // align) * align
+
+
+def fp4out_row_bytes(model_dim, pitch_align=FP8OUT_PITCH_ALIGN):
+    """MXFP4 route row: model_dim/2 packed e2m1 bytes, then one e8m0 per 32 columns."""
+    model_dim = int(model_dim)
+    if model_dim % FP8OUT_SCALE_BLK:
+        raise ValueError(
+            f"model_dim {model_dim} must be a multiple of {FP8OUT_SCALE_BLK}"
+        )
+    pitch = model_dim // 2 + model_dim // FP8OUT_SCALE_BLK
+    align = int(pitch_align)
+    return pitch if align <= 0 else ((pitch + align - 1) // align) * align
