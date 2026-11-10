@@ -27,8 +27,8 @@ names the interface.
 `tests/plugin_contracts.json` holds the committed signature of every routed op,
 and the contract gate fails any PR that moves one without a version bump — so
 it is the one description that cannot drift from what dispatch actually hands
-you. **If your op is not in that file it is not routed**, and there is nothing
-to serve yet; `plugin.status()['routed_ops']` says the same at runtime.
+you. **If your op is not in that file it is not routed** — there is nothing to
+serve, and `plugin.status()['routed_ops']` says the same at runtime.
 
 ```json
 "rmsnorm": {"signature": "input:positional, weight:positional, epsilon:positional, ...",
@@ -50,22 +50,27 @@ The target may be an instance or a zero-argument factory. Anything with a
 ```python
 _SELECTORS = {"rmsnorm": _select_rmsnorm, "rmsnorm_with_add": _select_rmsnorm_with_add}
 
+
 class Provider:
     name = "mylib"
     api_versions = {plugin.API_VERSION}
-    op_versions = set(_SELECTORS)          # derive it; a hand-written list drifts
+    op_versions = set(_SELECTORS)  # derive it; a hand-written list drifts
 
     def select(self, op, args, kwargs):
         selector = _SELECTORS.get(op.name)
         return selector(args) if selector else None
 
+
 def _select_rmsnorm(args):
-    value, weight, epsilon, _sensitive = args   # AITER applies defaults first
+    value, weight, epsilon, _sensitive = args  # AITER applies defaults first
     if my_rms_norm.fallback_reason(value, weight, epsilon):
-        return None                             # declining is normal
+        return None  # declining is normal
     return plugin.KernelCandidate(
-        provider="mylib", kernel_id="rms_norm@1.0",
-        artifact_digest="sha256:...", run=_run_rmsnorm)
+        provider="mylib",
+        kernel_id="rms_norm@1.0",
+        artifact_digest="sha256:...",
+        run=_run_rmsnorm,
+    )
 ```
 
 AITER canonicalizes the call and applies the contract's defaults **before**
@@ -78,9 +83,8 @@ error, routed native — instead of reading the wrong index quietly.
 ## A worked example you can read
 
 AKLR (https://github.com/AMD-AGI/AKLR) is the first library ported onto this
-interface, and it is public. Its adapter is in review as
-[AMD-AGI/AKLR#95](https://github.com/AMD-AGI/AKLR/pull/95) — read it there
-rather than on `main`, where it has not landed yet:
+interface, and it is public. Its adapter lives in
+[`aklr/plugins/aiter/`](https://github.com/AMD-AGI/AKLR/tree/main/aklr/plugins/aiter):
 
 - **`aklr/plugins/aiter/__init__.py`** — one selector per contract unpacking by
   name, declines routed through the library's own `fallback_reason()`, and the
@@ -88,7 +92,7 @@ rather than on `main`, where it has not landed yet:
   bug that shaped it).
 - **`aklr/plugins/aiter/REPRODUCING.md`** — install, enable, serve and verify,
   written so somebody who was not involved can repeat it, with the steps that
-  are not yet possible stated as such.
+  are not possible on a given host stated as such.
 
 Every rule below is something that port either got wrong first or had to design
 around. Read the adapter next to this file; the two were written together.
@@ -101,7 +105,7 @@ around. Read the adapter next to this file; the two were written together.
    its own. Seven arguments were about to reach a six-argument kernel. Pick the
    `run` by the op name you are answering for, never by a layout flag.
 
-2. **Arity is not meaning.** The candidate check compares parameter counts, so
+1. **Arity is not meaning.** The candidate check compares parameter counts, so
    two contracts with the same arity and different semantics both pass it:
 
    ```
@@ -112,7 +116,7 @@ around. Read the adapter next to this file; the two were written together.
    A kernel bound to the wrong one reads a scale tensor as a RoPE component,
    silently, with every gate green. One op name, one contract, one `run`.
 
-3. **Match hardware on `gcnArchName`, never on the device name.** On MI355X
+1. **Match hardware on `gcnArchName`, never on the device name.** On MI355X
    under `rocm/atom-dev` with torch 2.10.0+rocm7.2.4:
 
    ```
@@ -123,22 +127,22 @@ around. Read the adapter next to this file; the two were written together.
    A provider matching by device name loaded zero kernels and declined every
    call — the interface looks broken while behaving exactly as specified.
 
-4. **`select()` returns, it does not raise, and it is pure.** `explain()` runs
+1. **`select()` returns, it does not raise, and it is pure.** `explain()` runs
    `select()` without executing anything; side effects there make the dry run a
    lie. Raising is isolated and recorded, but it costs the call. `None` is the
    supported no.
 
-5. **Once `run()` starts, errors propagate.** AITER will not fall back
+1. **Once `run()` starts, errors propagate.** AITER will not fall back
    mid-flight: a retry could repeat side effects or hide a broken kernel behind
    a correct-looking result. Fail loudly inside `run`.
 
-6. **Report only numbers you can attribute.** Offline validation timings were
+1. **Report only numbers you can attribute.** Offline validation timings were
    measured on shapes you chose, often as a ratio. AITER labels what it records
    with the conditions of the call in front of it, so such a number arrives
    attached to a shape it never ran on. Omit it; a number that looks sourced and
    is not is harder to catch than a missing one.
 
-7. **Declining is not failing.** Cannot serve this dtype, shape or arch? Return
+1. **Declining is not failing.** Cannot serve this dtype, shape or arch? Return
    `None`, cheaply, every time. `explain()` shows the decline and
    `decision_counts()` counts it. Neither is an error state.
 
@@ -149,19 +153,47 @@ catches the whole class of rule-2 defects before any hardware is involved:
 
 ```python
 import ast, json
+
 base = json.load(open("tests/plugin_contracts.json"))
-arity = {k: len([p for p in v["signature"].split(" -> ")[0].split(", ") if p.strip()])
-         for k, v in base.items()}
+arity = {
+    op: len([p for p in c["signature"].split(" -> ")[0].split(", ") if p.strip()])
+    for op, c in base.items()
+}
+
 tree = ast.parse(open("mylib/aiter_provider.py").read())
-# for each selector: the tuple it unpacks must have len == arity[op]
+fns = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+table = next(
+    n.value
+    for n in tree.body
+    if isinstance(n, ast.Assign) and getattr(n.targets[0], "id", "") == "_SELECTORS"
+)
+
+for op_node, fn_node in zip(table.keys, table.values):
+    op, fn = op_node.value, fns[fn_node.id]
+    unpack = next(
+        (
+            st
+            for st in fn.body
+            if isinstance(st, ast.Assign) and isinstance(st.targets[0], ast.Tuple)
+        ),
+        None,
+    )
+    got = len(unpack.targets[0].elts) if unpack else None
+    assert (
+        got == arity[op]
+    ), f"{op}: contract takes {arity[op]}, {fn.name} unpacks {got}"
+print("every selector matches its contract")
 ```
+
+It reads the selector table, not a list you maintain by hand, so a contract
+that grows a parameter fails here on the next run rather than at a customer.
 
 **Then ask the interface, not the kernel:**
 
 ```python
 plugin.configure(source="port check", enable=["mylib"])
-plugin.status()                      # found? enabled? which ops are routed?
-plugin.explain("rmsnorm", *args)     # would-be decision + why each provider declined
+plugin.status()  # found? enabled? which ops are routed?
+plugin.explain("rmsnorm", *args)  # would-be decision + why each provider declined
 ```
 
 `status()['skipped_providers']` carries the reason a wheel was rejected
@@ -191,7 +223,7 @@ refuses to do.
 **When your dispatcher cannot name the kernel.** This is the common case on a
 first port: the library knows which kernel file served a call, but exposes no
 id. Do not paper over it with the contract id and move on — the field then
-says "rms_norm@1.0" for every kernel that ever serves that contract, and the
+says "rms\_norm@1.0" for every kernel that ever serves that contract, and the
 provenance is worthless exactly when you need it. Add a read-only accessor on
 your side; until then, record the contract id **and leave a TODO naming what is
 missing**, so the next reader knows the digest does not distinguish kernels.
@@ -206,7 +238,7 @@ workspace serves GPU-ordered calls; concurrent calls need one each; allocate it
 outside a graph capture). Honour that documentation — it is part of the
 contract, and getting it wrong corrupts another call rather than failing yours.
 
-**What the interface does not offer today is a hook for resources of your own**
+**The interface offers no hook for resources of your own**
 that outlive a call: no `prepare()`, no `reset()`, no `release()`. Two
 consequences worth knowing before you design around them:
 
@@ -219,8 +251,8 @@ consequences worth knowing before you design around them:
   them on entry rather than on exit.
 
 If your library needs those verbs, say so on
-[RFC #7240](https://github.com/ROCm/aiter/issues/7240) — the design exists and
-has not been proposed, and a second library asking is what would move it.
+[RFC #7240](https://github.com/ROCm/aiter/issues/7240). The design exists; a
+second library asking is what moves it.
 
 ## Enablement and the kill switch
 
