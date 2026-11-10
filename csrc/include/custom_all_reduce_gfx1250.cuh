@@ -158,10 +158,6 @@ DINLINE opus::fp32_t downcast_s<opus::fp32_t>(opus::fp32_t val)
 constexpr int    kLLMaxRanks       = kMaxNgpusAr;
 // Route to LL when bytes <= this (matches RCCL DDA_ALLREDUCE_LL_THRESHOLD).
 constexpr size_t kLLArMaxBytes     = 4194304;           // 4 MiB
-// The LL two-shot all-reduce takes over from the one-shot LL from this size
-// (MI455X, TP8 across two trays and TP4 within one: the one-shot is ahead below
-// about a megabyte, the two-shot above).
-constexpr size_t kLL2sMinBytes     = 1048576;           // 1 MiB
 // Narrower rows do not amortize the extra launches of two-stage fused AR.
 constexpr int kArRmsTwoStageMinHidden = 6144;
 // Hard per-message payload cap (one slot). Comfortably above the routing
@@ -223,6 +219,13 @@ constexpr size_t ar2sMaxBytes(int ngpus)
     return ngpus == 4 || ngpus == 8 ? (size_t)8 * 1024 * 1024 : 0;
 }
 
+// The smallest message the LL two-shot takes over from the one-shot at, from
+// MI455X measurements, bf16 in a CUDA graph:
+// - TP8, two trays: the one-shot is ahead at 0.72 MB (14.1 vs 17.0 us), the
+//   two-shot from 0.82 MB (17.5 vs 19.4 us).
+// - TP4, one tray: the two are level at about 1 MiB.
+constexpr size_t ar2sMinBytes(int ngpus) { return ngpus == 8 ? (size_t)768 * 1024 : (size_t)1024 * 1024; }
+
 // The LL two-shot's own scratch, after the AR + RMSNorm shard. It is apart from
 // the LL scratch, so a change to either kernel's layout, capacity or epochs
 // leaves the other alone. Two banks, each a reduce-scatter region and an
@@ -237,6 +240,16 @@ constexpr size_t ar2sScratchOffset(int ngpus)
 {
     return arRmsShardOffset(ngpus) + kArRmsShardBytes;
 }
+
+// Lines a source's slot takes in a region of the two-shot's scratch: a chunk of
+// ar2sMaxBytes / ngpus in 12-byte units, rounded to 4 KiB. A slot that does not
+// start on a cache-line boundary costs ~3 us a call (MI455X, measured).
+constexpr size_t ar2sSrcLines(int ngpus)
+{
+    return ngpus == 0 ? 0 : ((ar2sMaxBytes(ngpus) / 4 / ngpus + 2) / 3 + 255) / 256 * 256;
+}
+static_assert(8 * ar2sSrcLines(8) <= ar2sRegionPk(8) && 4 * ar2sSrcLines(4) <= ar2sRegionPk(4),
+              "every source's slot must fit the two-shot's regions");
 
 // gfx1250 128-bit global load/store at *system* scope ("" == system). A single
 // 16B transaction keeps a line's data and flags atomic w.r.t. a peer reader.
@@ -295,35 +308,94 @@ DINLINE void ll_load_b128(
 #endif
 }
 
-// LL flat all-reduce. 1D grid over 8-byte packets.
+// LL all-reduce lines and roles (both kernels below).
 //
-// Phase 1 (publish): rank writes its full sendbuff into every peer's scratch at
-// slot[rank], as LL lines carrying the epoch flag.
-// Phase 2 (reduce): rank polls its own scratch slots for the other ranks
-// (waiting on the flag), sums them with its own sendbuff (fp32 accumulation),
-// and writes recvbuff. Self is read directly from sendbuff.
+// A 16-byte line is one ll_store_b128 and is read with one ll_load_b128, so a
+// single flag guards it: words 0-2 carry 12 bytes of payload and word 3 the
+// epoch. A rank so moves 1.33 x its payload on the wire, where lines of 8 bytes
+// and two flags moved 2 x. A word holds 4 / sizeof(T) elements, a 12-byte unit
+// three words.
+//
+// On gfx1250 a load issued after a remote store in the same wave returns only
+// once that store has completed, about a fabric round trip, while a peer's line
+// lands about half a round trip after it was sent. So the waves that send never
+// poll, and a wave that does both polls before it sends: a poll sees a line as
+// soon as it lands. The peer bases are read once, before any store, and indexed
+// by k = 1..ngpus-1 (peer (rank + k) % ngpus) at compile time, so no table read
+// sits between two remote stores (it would wait for the store before it).
+//
+// Every element is summed in fp32 in rank order 0..ngpus-1 with the local value
+// at its own rank and rounded to T once, by both kernels, so the result does
+// not depend on which kernel reduced it or on which rank.
 //
 // Graph-safe device epoch: a persistent device array block_flags[kMaxBlocks]
 // that the kernel itself bumps (mirrors Signal::_flag). The grid size and block
-// size follow the message size, so the block that owns a packet changes between
+// size follow the message size, so the block that owns a unit changes between
 // calls of different sizes. Every launch therefore writes its epoch to all
 // kMaxBlocks entries, including those of blocks it did not launch, so all
 // blocks always start the next call on one shared epoch. Scratch is
 // double-buffered (bank = epoch & 1) with a fixed per-rank slot stride; the
 // per-epoch flag disambiguates stale lines, so no clearing is needed and it
 // survives CUDA-graph replay.
-template <typename T, int ngpus>
-__global__ void __launch_bounds__(512, 1) ar_ll_gfx1250(
+
+template <typename T>
+DINLINE void ll_add_word(opus::fp32_t (&a)[2], uint32_t w, bool first)
+{
+    if constexpr(sizeof(T) == 4)
+    {
+        T v;
+        __builtin_memcpy(&v, &w, 4);
+        const opus::fp32_t f = upcast_s(v);
+        a[0] = first ? f : a[0] + f;
+    }
+    else
+    {
+        const uint16_t h[2] = {(uint16_t)(w & 0xffffu), (uint16_t)(w >> 16)};
+#pragma unroll
+        for(int e = 0; e < 2; ++e)
+        {
+            T v;
+            __builtin_memcpy(&v, &h[e], 2);
+            const opus::fp32_t f = upcast_s(v);
+            a[e] = first ? f : a[e] + f;
+        }
+    }
+}
+
+template <typename T>
+DINLINE uint32_t ll_pack_word(const opus::fp32_t (&a)[2])
+{
+    uint32_t w;
+    if constexpr(sizeof(T) == 4)
+    {
+        const T v = downcast_s<T>(a[0]);
+        __builtin_memcpy(&w, &v, 4);
+    }
+    else
+    {
+        const T lo = downcast_s<T>(a[0]), hi = downcast_s<T>(a[1]);
+        uint16_t h[2];
+        __builtin_memcpy(&h[0], &lo, 2);
+        __builtin_memcpy(&h[1], &hi, 2);
+        w = (uint32_t)h[0] | ((uint32_t)h[1] << 16);
+    }
+    return w;
+}
+
+// LL one-shot all-reduce. Block = 2 x W threads: the first W send, the other W
+// poll. A sender takes U units a round (all its loads, then all its remote
+// stores); a poller one unit at a time. Unit i of rank r goes to slot r of every
+// peer's LL scratch; the poller of unit i polls the other ranks' slots in one
+// batch, sums them with its own input and writes recvbuff.
+template <typename T, int ngpus, int U>
+__global__ void __launch_bounds__(1024, 1) ar_ll_gfx1250(
     T* const* __restrict__ peer_scratch, // ngpus scratch bases (device table)
     T* __restrict__ recvbuff,
     const T* __restrict__ sendbuff,
-    size_t nPk,          // number of 8-byte packets = bytes / 8
+    uint32_t n32,        // 32-bit words in the message
     int rank,
     uint32_t* __restrict__ block_flags) // device array[kMaxBlocks], persisted
 {
-    constexpr int LP = 8 / sizeof(T); // elements per 8-byte payload
-    using PL         = typename opus::vector_t<T, LP>;
-    using AL         = typename opus::vector_t<opus::fp32_t, LP>;
     constexpr size_t slot = kLLPackCapacity;
 
     __shared__ uint32_t s_flag;
@@ -335,70 +407,81 @@ __global__ void __launch_bounds__(512, 1) ar_ll_gfx1250(
         s_flag = f;
     }
     __syncthreads();
-    const uint32_t flag        = s_flag;
-    const size_t   bankOffPkts = (size_t)(flag & 1u) * (size_t)ngpus * slot;
+    const uint32_t flag = s_flag;
 
-    const size_t gtid   = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    const size_t stride = (size_t)gridDim.x * blockDim.x;
-
-    const uint32_t* in = reinterpret_cast<const uint32_t*>(sendbuff);
-
-    // Phase 1: publish my payload into every peer's slot[rank].
-    for(size_t pk = gtid; pk < nPk; pk += stride)
-    {
-        const uint32_t d0 = in[2 * pk];
-        const uint32_t d1 = in[2 * pk + 1];
+    LLPackedMsg* base[ngpus]; // base[k]: this bank of rank (rank + k) % ngpus
 #pragma unroll
-        for(int r = 1; r < ngpus; ++r)
-        {
-            int          peer = (rank + r) % ngpus;
-            LLPackedMsg* dst  = reinterpret_cast<LLPackedMsg*>(peer_scratch[peer]) +
-                               bankOffPkts + (size_t)rank * slot;
-            ll_store_b128(reinterpret_cast<uint32_t*>(&dst[pk]), d0, flag, d1, flag);
-        }
-    }
+    for(int k = 0; k < ngpus; ++k)
+        base[k] = reinterpret_cast<LLPackedMsg*>(peer_scratch[(rank + k) % ngpus]) +
+                  (size_t)(flag & 1u) * ngpus * slot;
 
-    // Phase 2: poll my slots for the other ranks, reduce with my own data.
-    LLPackedMsg* myBase =
-        reinterpret_cast<LLPackedMsg*>(peer_scratch[rank]) + bankOffPkts;
-    for(size_t pk = gtid; pk < nPk; pk += stride)
+    const uint32_t W      = blockDim.x / 2;
+    const uint32_t nU     = (n32 + 2) / 3;
+    const uint32_t first  = blockIdx.x * W + threadIdx.x % W;
+    const uint32_t stride = gridDim.x * W;
+    const uint32_t* in    = reinterpret_cast<const uint32_t*>(sendbuff);
+    uint32_t* out         = reinterpret_cast<uint32_t*>(recvbuff);
+
+    if(threadIdx.x < W)
     {
-        PL selfv = *reinterpret_cast<const PL*>(&in[2 * pk]);
-        AL acc;
-
-        // Sum in rank order, with the local value at its own rank, so every
-        // receiver rounds the same element the same way.
-        for(int r = 0; r < ngpus; ++r)
+        for(uint32_t b = first; b < nU; b += stride * U)
         {
-            PL pv = selfv;
-            if(r != rank)
+            uint32_t d[U][3];
+#pragma unroll
+            for(int u = 0; u < U; ++u)
             {
-                volatile LLPackedMsg* src = myBase + (size_t)r * slot;
-                uint32_t d0, f0, d1, f1;
-                do
-                {
-                    ll_load_b128(
-                        reinterpret_cast<const uint32_t*>(const_cast<LLPackedMsg*>(&src[pk])),
-                        d0, f0, d1, f1);
-                } while(f0 != flag || f1 != flag);
-
-                const uint32_t w[2] = {d0, d1};
-                pv                  = *reinterpret_cast<const PL*>(w);
+                const uint32_t i = b + u * stride;
+#pragma unroll
+                for(int q = 0; q < 3; ++q)
+                    d[u][q] = i < nU && 3 * i + q < n32 ? in[3 * i + q] : 0u;
             }
 #pragma unroll
-            for(int j = 0; j < LP; ++j)
-                acc[j] = r == 0 ? upcast_s(pv[j]) : acc[j] + upcast_s(pv[j]);
-        }
-
-        PL ov;
+            for(int k = 1; k < ngpus; ++k)
 #pragma unroll
-        for(int j = 0; j < LP; ++j)
-            ov[j] = downcast_s<T>(acc[j]);
-        reinterpret_cast<PL*>(recvbuff)[pk] = ov;
+                for(int u = 0; u < U; ++u)
+                {
+                    const uint32_t i = b + u * stride;
+                    if(i < nU)
+                        ll_store_b128(reinterpret_cast<uint32_t*>(base[k] + (size_t)rank * slot + i),
+                                      d[u][0], d[u][1], d[u][2], flag);
+                }
+        }
+    }
+    else
+    {
+        for(uint32_t i = first; i < nU; i += stride)
+        {
+            uint32_t s[3];
+#pragma unroll
+            for(int q = 0; q < 3; ++q)
+                s[q] = 3 * i + q < n32 ? in[3 * i + q] : 0u;
+            uint32_t w[ngpus][4];
+            uint32_t pending = ((1u << ngpus) - 1u) & ~(1u << rank);
+            while(pending)
+            {
+#pragma unroll
+                for(int r = 0; r < ngpus; ++r)
+                    if(pending & (1u << r))
+                        ll_load_b128(reinterpret_cast<const uint32_t*>(base[0] + (size_t)r * slot + i),
+                                     w[r][0], w[r][1], w[r][2], w[r][3]);
+#pragma unroll
+                for(int r = 0; r < ngpus; ++r)
+                    if((pending & (1u << r)) && w[r][3] == flag)
+                        pending &= ~(1u << r);
+            }
+            opus::fp32_t acc[3][2];
+#pragma unroll
+            for(int r = 0; r < ngpus; ++r)
+#pragma unroll
+                for(int q = 0; q < 3; ++q)
+                    ll_add_word<T>(acc[q], r == rank ? s[q] : w[r][q], r == 0);
+#pragma unroll
+            for(int q = 0; q < 3; ++q)
+                if(3 * i + q < n32)
+                    out[3 * i + q] = ll_pack_word<T>(acc[q]);
+        }
     }
 
-    // Entry blockIdx.x + k * gridDim.x is written by thread k, so the epoch
-    // fan-out costs one store per thread even for a single-block launch.
     for(int e = blockIdx.x + threadIdx.x * gridDim.x; e < kMaxBlocks;
         e += gridDim.x * blockDim.x)
         block_flags[e] = flag;
@@ -407,38 +490,31 @@ __global__ void __launch_bounds__(512, 1) ar_ll_gfx1250(
 // ---------------------------------------------------------------------------
 // LL two-shot all-reduce: reduce-scatter + all-gather over LL lines
 // ---------------------------------------------------------------------------
-// The input splits into ngpus chunks of chunk_pk 8-byte packets; rank c owns
-// chunk c. The same LL lines as ar_ll_gfx1250, in a scratch of its own
-// (ar2sScratchOffset) with epochs of its own (block_flags), double-banked by
-// epoch parity. In a bank, the reduce-scatter region holds slot s = 0..ngpus-1
-// of chunk_pk lines each, and the all-gather region, ar2sRegionPk lines on,
-// holds the same slots: ngpus * chunk_pk <= ar2sRegionPk(ngpus).
-//   1. send packet j of every other chunk c to rank c's reduce-scatter slot[rank]
-//   2. poll the ngpus - 1 contributions to the own chunk, reduce them with the
-//      own one in fp32 in rank order, write the own chunk of recvbuff and push
-//      it to every peer's all-gather slot[rank]
-//   3. poll the other ranks' reduced packets into recvbuff
-// Every rank moves 2 * (ngpus - 1) / ngpus * bytes of payload (LL lines double
-// it) against (ngpus - 1) * bytes for ar_ll_gfx1250, for one more fabric round
-// trip: it wins above about a megabyte.
-// gfx1250 stalls a wave before it overwrites the data VGPRs of a remote store
-// still in flight, and a load issued after a remote store returns only once the
-// store has completed (about a fabric round trip). So a phase loads all it
-// needs, then issues all its stores back to back, each from its own VGPRs.
-// A thread owns packet index j in every phase and on every rank, and does all
-// its sends before it polls, so all-resident blocks cannot deadlock.
+// The message splits into ngpus chunks of cw words; rank c owns chunk c. The
+// lines live in a scratch of its own (ar2sScratchOffset) with epochs of its own
+// (block_flags), double-banked by epoch parity. In a bank, the reduce-scatter
+// region holds slot s of rank s's lines at s * ar2sSrcLines, and the all-gather
+// region, ar2sRegionPk lines on, the same. Block = 3 x W threads in three wave
+// groups, each taking unit j of every chunk:
+//   0: send unit j of every other chunk c to rank c's reduce-scatter slot[rank]
+//   1: poll the ngpus - 1 contributions to unit j of the own chunk, reduce them
+//      with the own one in rank order, write it to recvbuff and send it to every
+//      peer's all-gather slot[rank] (its polls come before its stores)
+//   2: poll the other ranks' unit j into recvbuff
+// Every rank moves 2 * (ngpus - 1) / ngpus * bytes of payload (the lines add a
+// third) against (ngpus - 1) * bytes for the one-shot, for one more fabric
+// latency: it wins from ar2sMinBytes.
 template <typename T, int ngpus>
-__global__ void __launch_bounds__(512) ar_2s_ll_gfx1250(
+__global__ void __launch_bounds__(768) ar_2s_ll_gfx1250(
     T* const* __restrict__ peer_scratch, // ngpus two-shot scratch bases (device table)
     T* __restrict__ recvbuff,
     const T* __restrict__ sendbuff,
-    size_t chunk_pk,     // 8-byte packets per chunk = bytes / (8 * ngpus)
+    uint32_t cw,         // 32-bit words a chunk = message words / ngpus
     int rank,
     uint32_t* __restrict__ block_flags) // device array[kMaxBlocks], persisted
 {
-    constexpr int LP = 8 / sizeof(T); // elements per 8-byte packet
-    using PL         = typename opus::vector_t<T, LP>;
     constexpr size_t region = ar2sRegionPk(ngpus);
+    constexpr size_t src    = ar2sSrcLines(ngpus);
 
     __shared__ uint32_t s_flag;
     if(threadIdx.x == 0)
@@ -449,97 +525,101 @@ __global__ void __launch_bounds__(512) ar_2s_ll_gfx1250(
         s_flag = f;
     }
     __syncthreads();
-    const uint32_t flag   = s_flag;
-    const size_t   rsOff  = (size_t)(flag & 1u) * 2 * region;
-    const size_t   agOff  = rsOff + region;
-    const size_t   stride = (size_t)gridDim.x * blockDim.x;
+    const uint32_t flag = s_flag;
 
-    const uint2* in = reinterpret_cast<const uint2*>(sendbuff);
-    uint2* out      = reinterpret_cast<uint2*>(recvbuff);
-    const LLPackedMsg* myBase = reinterpret_cast<const LLPackedMsg*>(peer_scratch[rank]);
+    LLPackedMsg* rs[ngpus]; // rs[k]: this bank's reduce-scatter region of rank (rank + k) % ngpus
+#pragma unroll
+    for(int k = 0; k < ngpus; ++k)
+        rs[k] = reinterpret_cast<LLPackedMsg*>(peer_scratch[(rank + k) % ngpus]) +
+                (size_t)(flag & 1u) * 2 * region;
 
-    // Sends and all-gather polls visit peers as k = 1..ngpus-1, peer
-    // (rank + k) % ngpus; the reduce polls every slot s = 0..ngpus-1. Either
-    // way the register arrays below are indexed at compile time only.
-    for(size_t j = (size_t)blockIdx.x * blockDim.x + threadIdx.x; j < chunk_pk; j += stride)
+    const uint32_t W      = blockDim.x / 3;
+    const uint32_t role   = threadIdx.x / W;
+    const uint32_t nU     = (cw + 2) / 3;
+    const uint32_t first  = blockIdx.x * W + threadIdx.x % W;
+    const uint32_t stride = gridDim.x * W;
+    const uint32_t* in    = reinterpret_cast<const uint32_t*>(sendbuff);
+    uint32_t* out         = reinterpret_cast<uint32_t*>(recvbuff);
+    const auto word = [&](int c, uint32_t i) { return i < cw ? in[(size_t)c * cw + i] : 0u; };
+
+    for(uint32_t j = first; j < nU; j += stride)
     {
-        uint2 d[ngpus];
-#pragma unroll
-        for(int k = 1; k < ngpus; ++k)
-            d[k] = in[(size_t)((rank + k) % ngpus) * chunk_pk + j];
-        const uint2 mine = in[(size_t)rank * chunk_pk + j];
-#pragma unroll
-        for(int k = 1; k < ngpus; ++k)
+        if(role == 0)
         {
-            const int c      = (rank + k) % ngpus;
-            LLPackedMsg* dst = reinterpret_cast<LLPackedMsg*>(peer_scratch[c]) + rsOff +
-                               (size_t)rank * chunk_pk + j;
-            ll_store_b128(reinterpret_cast<uint32_t*>(dst), d[k].x, flag, d[k].y, flag);
-        }
-
-        // Slot s holds rank s's packet j of this rank's chunk. The own slot
-        // carries nothing for this call; it is loaded as well, which keeps the
-        // loads free of branches, but its flags and data go unused.
-        uint32_t w[ngpus][4];
-        bool ready;
-        do
-        {
-#pragma unroll
-            for(int s = 0; s < ngpus; ++s)
-                ll_load_b128(reinterpret_cast<const uint32_t*>(
-                                 myBase + rsOff + (size_t)s * chunk_pk + j),
-                             w[s][0], w[s][1], w[s][2], w[s][3]);
-            ready = true;
-#pragma unroll
-            for(int s = 0; s < ngpus; ++s)
-                ready = ready && (s == rank || (w[s][1] == flag && w[s][3] == flag));
-        } while(!ready);
-
-        // Sum in rank order with the local value at its own rank, as every other
-        // custom all-reduce does: an element's bits depend neither on which rank
-        // owns its chunk nor on whether this kernel or the one-shot reduced it.
-        opus::fp32_t acc[LP];
-#pragma unroll
-        for(int s = 0; s < ngpus; ++s)
-        {
-            const uint32_t pw[2] = {s == rank ? mine.x : w[s][0],
-                                    s == rank ? mine.y : w[s][2]};
-            const PL pv          = *reinterpret_cast<const PL*>(pw);
-#pragma unroll
-            for(int q = 0; q < LP; ++q)
-                acc[q] = s == 0 ? upcast_s(pv[q]) : acc[q] + upcast_s(pv[q]);
-        }
-        PL ov;
-#pragma unroll
-        for(int q = 0; q < LP; ++q)
-            ov[q] = downcast_s<T>(acc[q]);
-        const uint2 r = *reinterpret_cast<const uint2*>(&ov);
-#pragma unroll
-        for(int k = 1; k < ngpus; ++k)
-        {
-            const int p      = (rank + k) % ngpus;
-            LLPackedMsg* dst = reinterpret_cast<LLPackedMsg*>(peer_scratch[p]) + agOff +
-                               (size_t)rank * chunk_pk + j;
-            ll_store_b128(reinterpret_cast<uint32_t*>(dst), r.x, flag, r.y, flag);
-        }
-        out[(size_t)rank * chunk_pk + j] = r;
-
-        uint32_t g[ngpus][4];
-        do
-        {
+            uint32_t d[ngpus][3];
 #pragma unroll
             for(int k = 1; k < ngpus; ++k)
-                ll_load_b128(reinterpret_cast<const uint32_t*>(
-                                 myBase + agOff + (size_t)((rank + k) % ngpus) * chunk_pk + j),
-                             g[k][0], g[k][1], g[k][2], g[k][3]);
-            ready = true;
+#pragma unroll
+                for(int q = 0; q < 3; ++q)
+                    d[k][q] = word((rank + k) % ngpus, 3 * j + q);
 #pragma unroll
             for(int k = 1; k < ngpus; ++k)
-                ready = ready && g[k][1] == flag && g[k][3] == flag;
-        } while(!ready);
+                ll_store_b128(reinterpret_cast<uint32_t*>(rs[k] + (size_t)rank * src + j),
+                              d[k][0], d[k][1], d[k][2], flag);
+        }
+        else if(role == 1)
+        {
+            uint32_t mine[3];
 #pragma unroll
-        for(int k = 1; k < ngpus; ++k)
-            out[(size_t)((rank + k) % ngpus) * chunk_pk + j] = make_uint2(g[k][0], g[k][2]);
+            for(int q = 0; q < 3; ++q)
+                mine[q] = word(rank, 3 * j + q);
+            uint32_t w[ngpus][4];
+            uint32_t pending = ((1u << ngpus) - 1u) & ~(1u << rank);
+            while(pending)
+            {
+#pragma unroll
+                for(int s = 0; s < ngpus; ++s)
+                    if(pending & (1u << s))
+                        ll_load_b128(reinterpret_cast<const uint32_t*>(rs[0] + (size_t)s * src + j),
+                                     w[s][0], w[s][1], w[s][2], w[s][3]);
+#pragma unroll
+                for(int s = 0; s < ngpus; ++s)
+                    if((pending & (1u << s)) && w[s][3] == flag)
+                        pending &= ~(1u << s);
+            }
+            opus::fp32_t acc[3][2];
+#pragma unroll
+            for(int s = 0; s < ngpus; ++s)
+#pragma unroll
+                for(int q = 0; q < 3; ++q)
+                    ll_add_word<T>(acc[q], s == rank ? mine[q] : w[s][q], s == 0);
+            uint32_t r[3];
+#pragma unroll
+            for(int q = 0; q < 3; ++q)
+                r[q] = ll_pack_word<T>(acc[q]);
+#pragma unroll
+            for(int k = 1; k < ngpus; ++k)
+                ll_store_b128(reinterpret_cast<uint32_t*>(rs[k] + region + (size_t)rank * src + j),
+                              r[0], r[1], r[2], flag);
+#pragma unroll
+            for(int q = 0; q < 3; ++q)
+                if(3 * j + q < cw)
+                    out[(size_t)rank * cw + 3 * j + q] = r[q];
+        }
+        else
+        {
+            uint32_t g[ngpus][4];
+            uint32_t pending = ((1u << ngpus) - 1u) & ~(1u << rank);
+            while(pending)
+            {
+#pragma unroll
+                for(int s = 0; s < ngpus; ++s)
+                    if(pending & (1u << s))
+                        ll_load_b128(reinterpret_cast<const uint32_t*>(rs[0] + region + (size_t)s * src + j),
+                                     g[s][0], g[s][1], g[s][2], g[s][3]);
+#pragma unroll
+                for(int s = 0; s < ngpus; ++s)
+                    if((pending & (1u << s)) && g[s][3] == flag)
+                        pending &= ~(1u << s);
+            }
+#pragma unroll
+            for(int s = 0; s < ngpus; ++s)
+                if(s != rank)
+#pragma unroll
+                    for(int q = 0; q < 3; ++q)
+                        if(3 * j + q < cw)
+                            out[(size_t)s * cw + 3 * j + q] = g[s][q];
+        }
     }
 
     for(int e = blockIdx.x + threadIdx.x * gridDim.x; e < kMaxBlocks;
@@ -1577,23 +1657,19 @@ public:
         return ll_enabled() && bytes <= kLLArMaxBytes && world_size_ <= kLLMaxRanks;
     }
 
-    // Whether allreduce of this size takes the LL two-shot kernel: from where it
-    // overtakes the one-shot LL up to its measured cap at this world size
-    // (ar2sMaxBytes, 0 where it does not run), in whole packets per chunk.
+    // Whether allreduce of this size takes the LL two-shot kernel: four ranks or
+    // more, from where it overtakes the one-shot (ar2sMinBytes) up to its cap
+    // (ar2sMaxBytes, 0 where it does not run), in whole words per chunk.
     bool use_2s_ll(size_t bytes) const
     {
-        return ll_enabled() && world_size_ <= kLLMaxRanks && bytes >= kLL2sMinBytes &&
-               bytes <= ar2sMaxBytes(world_size_) && bytes % (8 * (size_t)world_size_) == 0;
+        return ll_enabled() && world_size_ <= kLLMaxRanks && bytes >= ar2sMinBytes(world_size_) &&
+               bytes <= ar2sMaxBytes(world_size_) && bytes % (4 * (size_t)world_size_) == 0;
     }
 
     // Whether allreduce of this size reads its input in place (no copy-in).
     bool ar_reads_in_place(size_t bytes) const { return use_2s_ll(bytes) || use_ll(bytes); }
 
-    // Threads per block for the LL kernels at `units` threads of work: 256
-    // while that is at most one block per CU, else 512. On MI455X at TP8 a
-    // second block per CU costs more than the wider block (one-shot, 0.57 MB:
-    // 20.0 us with 256 threads, 17.8 with 512).
-    static int ll_threads_for(size_t units)
+    static int cu_count()
     {
         static const int cus = []() {
             int dev = 0, n = 0;
@@ -1603,8 +1679,13 @@ public:
                 n = 256;
             return n;
         }();
-        return units <= (size_t)cus * 256 ? 256 : 512;
+        return cus;
     }
+
+    // Senders (and as many pollers) a block for the LL one-shot at `units` units
+    // of work: 256 while one block a CU covers them, else 512. On MI455X a
+    // second block a CU costs more than the wider block.
+    static int ll_threads_for(size_t units) { return units <= (size_t)cu_count() * 256 ? 256 : 512; }
 
     // Whether the LL small-message fast path is enabled. On by default; set
     // AITER_CUSTOM_AR_DISABLE_LL=1 to force the naive kernel for all sizes.
@@ -1657,43 +1738,63 @@ public:
         HIP_CALL(hipMemset(d_2s_block_flags_, 0, sizeof(uint32_t) * kMaxBlocks));
     }
 
-    // LL small-message all-reduce. Reads `input` locally, pushes to peer scratch,
-    // reduces into `output`. numel is the element count; bytes must be a multiple
-    // of 16 and <= kLLScratchCapBytes (guaranteed by the routing threshold).
+    // LL one-shot all-reduce (see ar_ll_gfx1250). Reads `input` in place.
+    // numel is the element count; bytes must be a multiple of 16 and <=
+    // kLLScratchCapBytes (guaranteed by the routing threshold). Past one block a
+    // CU of 512 senders, a sender takes 2 or 4 units.
     template <typename T>
     void allreduce_ll(hipStream_t stream, const T* input, T* output, int numel)
     {
         ensure_ll_tables_();
         const size_t bytes = (size_t)numel * sizeof(T);
-        const size_t nPk   = bytes >> 3; // 8 payload bytes per packet
-
-        const int threads = (bytes < 65536) ? 512 : ll_threads_for(nPk);
-        int blocks = std::min<int>(kMaxBlocks, (int)((nPk + threads - 1) / threads));
-        if(blocks < 1)
-            blocks = 1;
+        const uint32_t n32 = (uint32_t)(bytes / 4);
+        const size_t   nU  = ((size_t)n32 + 2) / 3; // 12-byte units
+        const size_t   cap = std::min<size_t>(cu_count(), kMaxBlocks);
+        const int      W   = ll_threads_for(nU);
+        int U = 1;
+        while(U < 4 && (nU + (size_t)W * U - 1) / ((size_t)W * U) > cap)
+            U *= 2;
+        const int blocks = std::max(1, std::min<int>(kMaxBlocks,
+            (int)((nU + (size_t)W * U - 1) / ((size_t)W * U))));
 
         T* const* peers = reinterpret_cast<T* const*>(d_ll_peers_);
-#define LAUNCH_LL(NG) \
-        ar_ll_gfx1250<T, NG><<<blocks, threads, 0, stream>>>( \
-            peers, output, input, nPk, rank_, d_ll_block_flags_)
+#define LAUNCH_LL_U(NG, UU) \
+        ar_ll_gfx1250<T, NG, UU><<<blocks, 2 * W, 0, stream>>>( \
+            peers, output, input, n32, rank_, d_ll_block_flags_)
+#define LAUNCH_LL(NG)            \
+        if(U == 1)               \
+        {                        \
+            LAUNCH_LL_U(NG, 1);  \
+        }                        \
+        else if(U == 2)          \
+        {                        \
+            LAUNCH_LL_U(NG, 2);  \
+        }                        \
+        else                     \
+        {                        \
+            LAUNCH_LL_U(NG, 4);  \
+        }
         DISPATCH_NGPUS_1250(world_size_, LAUNCH_LL);
 #undef LAUNCH_LL
+#undef LAUNCH_LL_U
     }
 
     // LL two-shot all-reduce (see ar_2s_ll_gfx1250); use_2s_ll(bytes) holds.
+    // Three groups of 128 threads a block while one block a CU covers a chunk,
+    // then of 256.
     template <typename T>
     void allreduce_2s_ll(hipStream_t stream, const T* input, T* output, int numel)
     {
         ensure_2s_tables_();
-        const size_t bytes    = (size_t)numel * sizeof(T);
-        const size_t chunk_pk = bytes / (8 * (size_t)world_size_);
-        const int threads = ll_threads_for(chunk_pk);
-        const int blocks =
-            std::max(1, std::min<int>(kMaxBlocks, (int)((chunk_pk + threads - 1) / threads)));
+        const size_t   bytes = (size_t)numel * sizeof(T);
+        const uint32_t cw    = (uint32_t)(bytes / 4 / world_size_);
+        const size_t   nU    = ((size_t)cw + 2) / 3;
+        const int      W     = nU <= (size_t)cu_count() * 128 ? 128 : 256;
+        const int blocks = std::max(1, std::min<int>(kMaxBlocks, (int)((nU + W - 1) / W)));
         T* const* peers = reinterpret_cast<T* const*>(d_2s_peers_);
 #define LAUNCH_2S_LL(NG) \
-        ar_2s_ll_gfx1250<T, NG><<<blocks, threads, 0, stream>>>( \
-            peers, output, input, chunk_pk, rank_, d_2s_block_flags_)
+        ar_2s_ll_gfx1250<T, NG><<<blocks, 3 * W, 0, stream>>>( \
+            peers, output, input, cw, rank_, d_2s_block_flags_)
         DISPATCH_NGPUS_1250(world_size_, LAUNCH_2S_LL);
 #undef LAUNCH_2S_LL
     }
