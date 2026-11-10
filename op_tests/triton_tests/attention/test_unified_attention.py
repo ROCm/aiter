@@ -28,6 +28,27 @@ DEVICE_ARCH = arch_info.get_arch()
 IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250",)
 
 
+@pytest.fixture(autouse=True)
+def _no_fast_launch_replay(monkeypatch):
+    """Every test here takes the normal unified_attention path.
+
+    The AITER_UA_FAST_LAUNCH plan cache is keyed on the call's arguments only, so a
+    test that monkeypatches module state (use_2d_kernel, constants, kernel spies)
+    and calls again with same-shaped tensors would replay the plan an earlier call
+    recorded and silently skip the path it means to test. A cache that never holds
+    a plan keeps every call on the normal path; test_unified_attn_fast_launch puts a
+    real cache back."""
+    from aiter.ops.triton.utils import unified_attention_utils as uau
+
+    if hasattr(uau, "_plans"):
+
+        class _NoPlans(dict):
+            def __setitem__(self, key, value):
+                pass
+
+        monkeypatch.setattr(uau, "_plans", _NoPlans())
+
+
 def shuffle_kv_cache(
     key_cache: torch.Tensor,
     value_cache: torch.Tensor,
@@ -2314,3 +2335,97 @@ def test_unified_attn_split_rebalance_reduce_configs_k4v8(
     )
     assert not new[live].isnan().any()
     assert torch.equal(old[live].view(torch.int16), new[live].view(torch.int16))
+
+
+@pytest.mark.parametrize(
+    "seq_lens, gate",
+    [
+        ([(4, 1328), (4, 523), (4, 37), (4, 20011), (4, 8192)] * 3, True),  # verify, 3D
+        ([(1, 1328), (1, 523), (1, 9000)] * 4, False),  # decode, 3D
+        ([(478, 478), (600, 3600), (1500, 1500)], True),  # prefill, 2D
+    ],
+)
+@torch.inference_mode()
+def test_unified_attn_fast_launch(seq_lens, gate: bool, monkeypatch) -> None:
+    """AITER_UA_FAST_LAUNCH: the first eager call with a key records its launches,
+    later calls with the same key replay them with this call's tensors. The replay
+    must give bitwise the normal path's output for new data in the same shapes
+    (new Q, new context lengths in seqused_k, a new output buffer), and a call
+    under CUDA-graph capture must bypass it."""
+    if DEVICE_ARCH != "gfx1250":
+        pytest.skip("A8K4V8 runs on the gfx1250 Gluon kernels")
+    from aiter.ops.triton.utils import unified_attention_utils as uau
+
+    if not hasattr(unified_attention, "__wrapped__"):
+        pytest.skip("AITER_UA_FAST_LAUNCH=0: unified_attention is not wrapped")
+    monkeypatch.setattr(uau, "_plans", {})
+    stats = uau.fast_launch_stats
+    num_heads, head_size = (16, 2), 256
+    torch.manual_seed(0)
+    inp, run = _k4v8_gate_inputs(seq_lens, num_heads, 128, head_size)
+    tokens = inp["q_fp8"].shape[0]
+    width = num_heads[0] * head_size
+    kw = {}
+    if gate:
+        qkvg = 3 * torch.randn(
+            tokens, 2 * width + 1024, dtype=torch.bfloat16, device="cuda"
+        )
+        kw["output_gate"] = qkvg[:, :width]
+
+    def call(fn):
+        out = torch.full(
+            (tokens, num_heads[0], head_size),
+            float("nan"),
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        monkeypatch.setattr(sys.modules[__name__], "unified_attention", fn)
+        run(out, **kw)
+        return out
+
+    wrapped, plain = unified_attention, unified_attention.__wrapped__
+    before = dict(stats)
+    first = call(wrapped)  # records
+    assert stats["miss"] == before["miss"] + 1
+    assert len(uau._plans) == 1
+    assert next(iter(uau._plans.values()))[0] is not uau._NOT_REPLAYABLE
+    assert torch.equal(first, call(plain))
+
+    # new data in the same shapes: Q, the context lengths (device data the kernels
+    # read; max_seqlen_k is a key scalar and stays), and the gate
+    for step in range(2):
+        inp["q_fp8"].copy_(
+            (torch.randn_like(inp["q_fp8"], dtype=torch.float32) * 2).to(
+                inp["q_fp8"].dtype
+            )
+        )
+        lens = inp["kv_lens"]
+        q_lens = torch.tensor([q for q, _ in seq_lens], device=lens.device)
+        lens.copy_(torch.maximum(lens - 17 * (step + 1), q_lens).to(lens.dtype))
+        if gate:
+            kw["output_gate"].normal_()
+        hits = stats["hit"]
+        replayed = call(wrapped)
+        assert stats["hit"] == hits + 1, "same key did not replay"
+        ref = call(plain)
+        assert not replayed.isnan().any()
+        assert torch.equal(replayed, ref)
+
+    # a different scalar is a different key: recorded, not replayed
+    misses = stats["miss"]
+    inp["scale"] = inp["scale"] * 0.5
+    call(wrapped)
+    assert stats["miss"] == misses + 1
+
+    # CUDA-graph capture never records or replays
+    out = torch.empty(
+        tokens, num_heads[0], head_size, dtype=torch.bfloat16, device="cuda"
+    )
+    monkeypatch.setattr(sys.modules[__name__], "unified_attention", wrapped)
+    run(out, **kw)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    bypass = stats["bypass"]
+    with torch.cuda.graph(graph):
+        run(out, **kw)
+    assert stats["bypass"] == bypass + 1
