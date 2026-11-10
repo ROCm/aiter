@@ -12,7 +12,7 @@ pytest.importorskip("flydsl")
 
 import aiter.ops.flydsl.pa_decode as pa
 import aiter.ops.triton.attention.unified_attention as triton_ua
-from aiter.ops.flydsl import unified_attention as flydsl_ua
+from aiter.ops.flydsl import unified_attention_bf16 as flydsl_ua
 from aiter.ops.unified_attention import unified_attention
 
 pytestmark = pytest.mark.skipif(
@@ -192,7 +192,7 @@ def _unsupported_cases():
         return (q, k, v, out, cu, used, table.int().contiguous()), {}, "page size"
 
     def window(args):
-        return args, {"window_size": (127, 0)}, "full attention"
+        return args, {"window_size": (127, 5)}, "causal left window"
 
     def softcap(args):
         return args, {"softcap": 30.0}, "softcap"
@@ -212,9 +212,9 @@ def test_unsupported_falls_back_or_raises(mutate, route_spy):
     with pytest.raises(RuntimeError, match=match):
         _call(*args, backend="flydsl", **kw)
     assert route_spy == []
-    if match == "sinks":
-        return  # Triton handles ragged queries, but this oracle does not.
-    # Only causal configurations reach Triton, which handles windows itself.
+    if match in ("sinks", "causal left window"):
+        return  # Triton handles these, but this oracle does not.
+    # Only causal configurations reach Triton.
     _call(*args, **kw)
     assert route_spy == ["triton"]
 

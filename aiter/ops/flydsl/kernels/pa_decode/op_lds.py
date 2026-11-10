@@ -936,38 +936,6 @@ class PaDecodeKVLoader:
                     flat.extend([w[0], w[1]])
         return fx.Vector.from_elements(flat, dtype=fx.Int64)
 
-    def load_k_from_pages(self, phys_vec):
-        if const_expr(self.traits.LDS_K):
-            self.stage_k_lds(fx.Int32(phys_vec[0]))
-            return fx.full(self.traits.NCHUNK * self.traits.N_SUBCHUNKS, 0, fx.Int64)
-        flat = []
-        for a in range_constexpr(self.traits.NCHUNK):
-            phys = fx.Int32(phys_vec[(a * MFMA_MNK) // self.traits.block_size])
-            flat.extend(self.load_k_chunk(phys, a))
-        if const_expr(self.traits.head_dim == 64):
-            fx.rocdl.sched_vmem(len(flat) // 2)
-
-        return fx.Vector.from_elements(flat, dtype=fx.Int64)
-
-    def k_tile_pages(self, tt_i32):
-        base_page = (
-            tt_i32 * self.traits.TILE_TOK // self.traits.block_size
-        )  # tile start is page-aligned
-        fetched = self.load_pages(
-            base_page
-            + (self.ctx.warp * self.traits.TOK_PER_WARP) // self.traits.block_size,
-            self.traits.PAGES_PER_CHUNK,
-        )
-        return (
-            fx.Vector.from_elements([fetched], dtype=fx.Int32)
-            if const_expr(self.traits.PAGES_PER_CHUNK == 1)
-            else fx.Vector(fetched)
-        )
-
-    def load_k(self, tt_i32):
-        phys_vec = self.k_tile_pages(tt_i32)
-        return self.load_k_from_pages(phys_vec), phys_vec
-
     def _load_v_linear(self, pages, vh):
         """Raw rows of chunk ``vh`` from [blocks, page, kv_heads, value_dim] V.
 
@@ -1047,6 +1015,38 @@ class PaDecodeKVLoader:
             ).result
             ops.append(fx.Vector(r).bitcast(fx.Int64)[0])
         return ops
+
+    def load_k_from_pages(self, phys_vec):
+        if const_expr(self.traits.LDS_K):
+            self.stage_k_lds(fx.Int32(phys_vec[0]))
+            return fx.full(self.traits.NCHUNK * self.traits.N_SUBCHUNKS, 0, fx.Int64)
+        flat = []
+        for a in range_constexpr(self.traits.NCHUNK):
+            phys = fx.Int32(phys_vec[(a * MFMA_MNK) // self.traits.block_size])
+            flat.extend(self.load_k_chunk(phys, a))
+        if const_expr(self.traits.head_dim == 64):
+            fx.rocdl.sched_vmem(len(flat) // 2)
+
+        return fx.Vector.from_elements(flat, dtype=fx.Int64)
+
+    def k_tile_pages(self, tt_i32):
+        base_page = (
+            tt_i32 * self.traits.TILE_TOK // self.traits.block_size
+        )  # tile start is page-aligned
+        fetched = self.load_pages(
+            base_page
+            + (self.ctx.warp * self.traits.TOK_PER_WARP) // self.traits.block_size,
+            self.traits.PAGES_PER_CHUNK,
+        )
+        return (
+            fx.Vector.from_elements([fetched], dtype=fx.Int32)
+            if const_expr(self.traits.PAGES_PER_CHUNK == 1)
+            else fx.Vector(fetched)
+        )
+
+    def load_k(self, tt_i32):
+        phys_vec = self.k_tile_pages(tt_i32)
+        return self.load_k_from_pages(phys_vec), phys_vec
 
     def load_v(self, phys_row, vh):
         if const_expr(self.traits.linear_kv):

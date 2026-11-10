@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""FlyDSL routes behind the public unified-attention entry point.
+"""FlyDSL BF16 routes behind the public unified-attention entry point.
 
 Validated route: BF16 paged attention on gfx950 with the linear
 ``[blocks, page, kv_heads, dim]`` KV cache, the MiMo V2.6 global attention
@@ -702,9 +702,10 @@ def unified_attention_flydsl(
     rows are then taken from the tensor shapes. Otherwise ``cu_seqlens_q`` is
     read on the GPU and must cover q. ``seqused_k`` holds KV lengths including
     the query tokens, as for Triton; each must be at least its query count.
-    With ``explicit`` an unprepared graph capture raises instead of declining.
+    With ``explicit``, a declined configuration or an unprepared graph capture
+    raises RuntimeError naming the cause instead of returning None.
     """
-    route, _ = _route(
+    route, reason = _route(
         q,
         k,
         v,
@@ -730,6 +731,11 @@ def unified_attention_flydsl(
         skip_reduce,
     )
     if route is None:
+        if explicit:
+            raise RuntimeError(
+                "FlyDSL unified_attention does not support this configuration: "
+                f"{reason}"
+            )
         return None
     if route in ("window", "window_varlen"):
         return _unified_attention_window(
