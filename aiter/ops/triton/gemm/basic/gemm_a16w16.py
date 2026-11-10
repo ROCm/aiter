@@ -20,6 +20,7 @@ from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a16w16_persistent import (
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.common_utils import deserialize_str, serialize_dict
+from aiter.ops.triton.utils.device_info import get_num_xcds
 from aiter.ops.triton.utils.gemm_config_utils import (
     clamp_num_buffers,
     compute_splitk_params,
@@ -30,7 +31,10 @@ from aiter.ops.triton.utils.logger import AiterTritonLogger
 _LOGGER = AiterTritonLogger()
 
 
-_GLUON_SUPPORTED_ARCHS = ("gfx1250",)
+_GLUON_SUPPORTED_ARCHS = (
+    "gfx1250",
+    "gfx1250-strict",
+)
 
 
 def _is_gluon_available():
@@ -268,6 +272,7 @@ def gemm_a16w16_(
                 SKIP_REDUCE=bool(skip_reduce),
                 NUM_SMS=NUM_WGS,
                 NUM_PID_N=num_pid_n,
+                NUM_XCDS=get_num_xcds(),
                 num_warps=num_warps,
                 num_stages=num_stages,
                 waves_per_eu=waves_per_eu,
@@ -346,6 +351,7 @@ def gemm_a16w16_(
             ADD_BIAS=(bias is not None),
             SKIP_REDUCE=False,
             NUM_WGS=NUM_WGS,
+            NUM_XCDS=get_num_xcds(),
             **config,
         )
 
@@ -530,6 +536,7 @@ def gemm_a16w16_(
         ADD_BIAS=(bias is not None),
         SKIP_REDUCE=skip_reduce,
         **config,
+        NUM_XCDS=get_num_xcds(),
     )
 
     if config["NUM_KSPLIT"] > 1:

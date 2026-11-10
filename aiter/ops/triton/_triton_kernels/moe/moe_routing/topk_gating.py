@@ -21,6 +21,7 @@ def _exact_sigmoid_biased_topk(
     routed_scaling,
     N_EXPERTS: tl.constexpr,
     TOPK: tl.constexpr,
+    TOPK_PAD: tl.constexpr,  # next power of two of TOPK
     BLOCK_N: tl.constexpr,
     NEED_RENORM: tl.constexpr,
     HAS_NUM_VALID_ROWS: tl.constexpr,
@@ -37,9 +38,9 @@ def _exact_sigmoid_biased_topk(
     choice = tl.where(mask, scores + bias, float("-inf"))
     choice = tl.where(choice == choice, choice, float("-inf"))  # noqa: PLR0124
 
-    slots = tl.arange(0, TOPK)
-    selected_ids = tl.zeros((TOPK,), dtype=tl.int32)
-    selected_weights = tl.zeros((TOPK,), dtype=tl.float32)
+    slots = tl.arange(0, TOPK_PAD)
+    selected_ids = tl.zeros((TOPK_PAD,), dtype=tl.int32)
+    selected_weights = tl.zeros((TOPK_PAD,), dtype=tl.float32)
 
     # Match the legacy gfx1250 wave32 float4-LDS reduction order. Vectors are
     # assigned round-robin to lanes and local positions retain source order.
@@ -71,10 +72,10 @@ def _exact_sigmoid_biased_topk(
         selected_ids = tl.where(pad, -1, selected_ids)
         selected_weights = tl.where(pad, 0.0, selected_weights)
 
-    row_mask = row < n_rows
-    tl.store(ids_ptr + row * stride_ids + slots, selected_ids, mask=row_mask)
+    slot_mask = (row < n_rows) & (slots < TOPK)
+    tl.store(ids_ptr + row * stride_ids + slots, selected_ids, mask=slot_mask)
     tl.store(
         weights_ptr + row * stride_weights + slots,
         selected_weights,
-        mask=row_mask,
+        mask=slot_mask,
     )
