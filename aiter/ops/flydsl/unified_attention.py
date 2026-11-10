@@ -35,8 +35,8 @@ _GQA = 16
 _PAGE_SIZES = (64, 128)
 _MAX_QUERY_LENGTH = 8
 _MAX_BATCH = 4096
-# Query rows per varlen pseudo-sequence.
-_QUERY_BLOCK = 8
+# Queries per varlen pseudo-sequence.
+_QUERY_BLOCK = int(os.environ.get("PP_VL_QB", "16"))
 # Varlen pseudo-sequences the planner's LDS holds on gfx950 (160 KiB).
 _MAX_PSEUDO_SEQS = 40000
 
