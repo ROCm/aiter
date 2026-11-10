@@ -17,6 +17,14 @@ shuffle_weight+e8m0_shuffle W layout. Shared low-level helpers live in
 
 Launch args are raw device pointers (``fx.Int64``); tensors passed as
 ``.data_ptr()``.
+
+Optional shared expert (both stages): a dense expert that every token uses. Its
+weights are raw bf16: ``shared_w1`` ``[2*D_INTER, D_HIDDEN]`` (gate|up) and
+``shared_w2`` ``[D_HIDDEN, D_INTER]``, each preshuffled with
+``shuffle_weight(w, layout=(16, 16))``. ``shared_inter_bf16`` ``[n_tokens, D_INTER]``
+holds its intermediate between the stages. Its tiles take the first program ids. The
+routed tiles and the sort do not change. Stage 2 adds the shared output into
+``flat_out`` at weight 1.0 (atomic epilog). Only gfx950 is validated.
 """
 
 import torch
@@ -24,10 +32,17 @@ from flydsl.runtime.device import get_rocm_arch
 
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
-from .gemm1 import compile_gemm1_a16w4_port, gemm1_a16w4_grid
+from .gemm1 import (
+    a16w4_default_shared_tile_n,
+    a16w4_shared_tiles,
+    compile_gemm1_a16w4_port,
+    gemm1_a16w4_grid,
+)
 from .gemm2 import compile_gemm2_a16w4_port, gemm2_a16w4_grid
 
 __all__ = [
+    "a16w4_default_shared_tile_n",
+    "a16w4_shared_tiles",
     "compile_gemm1_a16w4_port",
     "compile_gemm2_a16w4_port",
     "flydsl_a16w4_gemm1",
@@ -36,6 +51,33 @@ __all__ = [
     "gemm1_a16w4_grid",
     "gemm2_a16w4_grid",
 ]
+
+
+def _shared_kw(shared_tile_n, **tile):
+    # Pass the shared-tile kwargs only when set: the compile_gemm{1,2}_a16w4_port
+    # functools.cache keys then stay equal to moe_kernels.py's direct calls.
+    if shared_tile_n is None:
+        return {}
+    return {"shared_tile_n": shared_tile_n, **{k: v for k, v in tile.items() if v}}
+
+
+def _check_shared(device, **tensors):
+    """Check the shared-expert inputs; ``tensors`` maps name -> (tensor, min numel)."""
+    from aiter.jit.utils import chip_info
+
+    if chip_info.get_gfx_runtime() != "gfx950":
+        raise NotImplementedError("the a16w4 shared expert is validated on gfx950 only")
+    for name, (t, numel) in tensors.items():
+        if (
+            t.dtype != torch.bfloat16
+            or not t.is_contiguous()
+            or t.numel() < numel
+            or t.device != device
+        ):
+            raise ValueError(
+                f"{name} must be a contiguous bf16 tensor of >= {numel} elements on "
+                f"{device}, got {t.dtype} {tuple(t.shape)} on {t.device}"
+            )
 
 
 # gfx942 (CDNA3) lacks K=32 mfma_f32_16x16x32_bf16 + v_cvt_pk_bf16_f32 -> K=16 MFMA +
@@ -76,6 +118,12 @@ def flydsl_a16w4_gemm1(
     activation_bf16=False,
     prefetch=1,
     stream=None,
+    shared_w1=None,
+    shared_inter_bf16=None,
+    shared_tile_n=None,
+    shared_tile_m=None,
+    shared_tile_k=None,
+    shared_k_wave=None,
 ):
     """a16w4/a16wi4/a16w16 fused stage1: gate+up GEMM + SiLU -> bf16 intermediate.
 
@@ -107,6 +155,9 @@ def flydsl_a16w4_gemm1(
     clamp(up, -limit, limit)`` with runtime ``swiglu_limit > 0``; +inf disables
     the clamp. ``activation_bf16=True`` rounds both GEMM accumulators to bf16
     before this activation. Plain ``silu`` and the default rounding are unchanged.
+
+    ``shared_w1`` / ``shared_inter_bf16`` (together): the shared-expert prologue (see
+    the module docstring); ``shared_tile_n`` defaults to ``a16w4_default_shared_tile_n``.
     """
     if k_batch != 1:
         raise NotImplementedError(f"a16w4 gemm1 only supports k_batch=1, got {k_batch}")
@@ -140,6 +191,23 @@ def flydsl_a16w4_gemm1(
             f"a16w4 gemm1 requires D_INTER % TILE_N({TILE_N}) == 0, got D_INTER={D_INTER}"
         )
 
+    shared = shared_w1 is not None or shared_inter_bf16 is not None
+    sh_tn = None
+    shared_tiles = 0
+    if shared:
+        if shared_w1 is None or shared_inter_bf16 is None:
+            raise ValueError("shared_w1 and shared_inter_bf16 must be given together")
+        _check_shared(
+            a_bf16.device,
+            shared_w1=(shared_w1, 2 * D_INTER * D_HIDDEN),
+            shared_inter_bf16=(shared_inter_bf16, n_tokens * D_INTER),
+        )
+        sh_tn = shared_tile_n or a16w4_default_shared_tile_n(
+            TILE_N, D_INTER, step=16 * (4 // (shared_k_wave or k_wave))
+        )
+        shared_tiles = a16w4_shared_tiles(
+            shared_tile_m or BM, n_tokens=n_tokens, N=D_INTER, shared_tile_n=sh_tn
+        )
     launch = compile_gemm1_a16w4_port(
         BM=BM,
         D_HIDDEN=D_HIDDEN,
@@ -158,9 +226,21 @@ def flydsl_a16w4_gemm1(
         activation_bf16=activation_bf16,
         rocm_arch=str(get_rocm_arch()),
         prefetch=prefetch,
+        **_shared_kw(
+            sh_tn,
+            shared_tile_m=shared_tile_m,
+            shared_tile_k=shared_tile_k,
+            shared_k_wave=shared_k_wave,
+        ),
     )
     max_m_blocks = int(sorted_expert_ids.numel())
-    grid = gemm1_a16w4_grid(BM, INTER=D_INTER, TILE_N=TILE_N, max_m_blocks=max_m_blocks)
+    grid = gemm1_a16w4_grid(
+        BM,
+        INTER=D_INTER,
+        TILE_N=TILE_N,
+        max_m_blocks=max_m_blocks,
+        shared_tiles=shared_tiles,
+    )
     # SiTUv2 beta/linear_beta + swiglu_limit -> runtime f32 scalars (host precomputes
     # reciprocals; no device rcp). swiglu_limit is the SiTUv2 clamp bound (+inf =
     # no clamp), matching the a8w4/mixed_moe situv2 clamp so a16w4 == a8w4.
@@ -170,6 +250,7 @@ def flydsl_a16w4_gemm1(
         raise ValueError(
             f"situ_beta/situ_linear_beta must be > 0, got {_beta!r}/{_lbeta!r}"
         )
+    shared_ptrs = (shared_w1.data_ptr(), shared_inter_bf16.data_ptr()) if shared else ()
     _run_compiled(
         launch,
         a_bf16.data_ptr(),
@@ -186,6 +267,7 @@ def flydsl_a16w4_gemm1(
         1.0 / _lbeta,
         float(swiglu_limit),
         inter_sorted_bf16.data_ptr(),
+        *shared_ptrs,
         torch.cuda.current_stream() if stream is None else stream,
     )
     return inter_sorted_bf16
@@ -220,6 +302,11 @@ def flydsl_a16w4_gemm2(
     use_valid_token_count=False,
     stream=None,
     reuse_lds=False,
+    shared_inter_bf16=None,
+    shared_w2=None,
+    shared_tile_n=None,
+    shared_tile_m=None,
+    shared_tile_k=None,
 ):
     """a16w4/a16wi4/a16w16 fused stage2 (down-proj). Consumes the bf16 [sorted_size,
     D_INTER] intermediate; scatters routing-weighted bf16 into ``flat_out``.
@@ -233,6 +320,10 @@ def flydsl_a16w4_gemm2(
     the K-loop barrier. It is opt-in; existing calls retain their LDS allocation.
     Only gfx942 MXFP4 weights with the atomic epilogue are qualified for reuse;
     other architectures, weight formats and epilogues retain the default path.
+
+    ``shared_inter_bf16`` / ``shared_w2`` (together, atomic epilog): the shared-expert
+    prologue adds ``shared_inter_bf16 [M_logical, D_INTER] @ shared_w2^T`` into every
+    token; ``shared_tile_n`` defaults to ``a16w4_default_shared_tile_n``.
     """
     if k_batch != 1:
         raise NotImplementedError(f"a16w4 gemm2 only supports k_batch=1, got {k_batch}")
@@ -263,6 +354,23 @@ def flydsl_a16w4_gemm2(
     # close the E896 gap (padded launch's empty CTAs early-return ~free), kept as an
     # opt-in building block.
     _persist = False if persist is None else bool(persist)
+    shared = shared_w2 is not None or shared_inter_bf16 is not None
+    sh_tn = None
+    shared_tiles = 0
+    if shared:
+        if shared_w2 is None or shared_inter_bf16 is None:
+            raise ValueError("shared_w2 and shared_inter_bf16 must be given together")
+        if epilog != "atomic":
+            raise ValueError("the shared-expert prologue needs epilog='atomic'")
+        _check_shared(
+            flat_out.device,
+            shared_w2=(shared_w2, D_HIDDEN * D_INTER),
+            shared_inter_bf16=(shared_inter_bf16, int(M_logical) * D_INTER),
+        )
+        sh_tn = shared_tile_n or a16w4_default_shared_tile_n(TILE_N, D_HIDDEN, step=64)
+        shared_tiles = a16w4_shared_tiles(
+            shared_tile_m or BM, n_tokens=M_logical, N=D_HIDDEN, shared_tile_n=sh_tn
+        )
     launch = compile_gemm2_a16w4_port(
         BM=BM,
         NE=NE,
@@ -280,10 +388,17 @@ def flydsl_a16w4_gemm2(
         topk=topk,
         reuse_lds=reuse_lds,
         use_valid_token_count=use_valid_token_count,
+        **_shared_kw(sh_tn, shared_tile_m=shared_tile_m, shared_tile_k=shared_tile_k),
     )
     grid = gemm2_a16w4_grid(
-        BM, N_OUT=D_HIDDEN, TILE_N=TILE_N, max_m_blocks=max_m_blocks, persist=_persist
+        BM,
+        N_OUT=D_HIDDEN,
+        TILE_N=TILE_N,
+        max_m_blocks=max_m_blocks,
+        persist=_persist,
+        shared_tiles=shared_tiles,
     )
+    shared_ptrs = (shared_inter_bf16.data_ptr(), shared_w2.data_ptr()) if shared else ()
     _run_compiled(
         launch,
         inter_sorted_bf16.data_ptr(),
@@ -297,6 +412,7 @@ def flydsl_a16w4_gemm2(
         int(max_m_blocks),
         int(grid),
         flat_out.data_ptr(),
+        *shared_ptrs,
         torch.cuda.current_stream() if stream is None else stream,
     )
     return flat_out

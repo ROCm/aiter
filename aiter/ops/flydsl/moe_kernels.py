@@ -48,7 +48,8 @@ def _warn_tile_override(axis: str, inter_dim: int, requested: int, resolved: int
 
 
 _SUFFIX_RE = re.compile(
-    r"(?:_kw(?P<kw>\d+))?(?P<fp4>_fp4)?(?P<fp8>_fp8)?(?:_sbm(?P<sbm>\d+))?$"
+    r"(?:_kw(?P<kw>\d+))?(?P<fp4>_fp4)?(?P<fp8>_fp8)?(?:_sbm(?P<sbm>\d+))?"
+    r"(?:_sh(?P<shm>\d+)x(?P<shn>\d+)x(?P<shk>\d+)(?:kw(?P<shkw>\d+))?)?$"
 )
 
 
@@ -188,10 +189,26 @@ def resolve_flydsl_stage1_tile_n(inter_dim: int, tile_n: int) -> int:
     return tile_n
 
 
+def a16w4_shared_tile_from_params(params: dict) -> dict:
+    """Return the ``_sh`` suffix fields of parsed kernel params as ``shared_tile``."""
+    keys = ("shared_tile_m", "shared_tile_n", "shared_tile_k", "shared_k_wave")
+    return {k: params[k] for k in keys if params.get(k) is not None}
+
+
+def _a16w4_shared_tile(shared_tile: dict | None, stage: int) -> dict:
+    """Return the ``flydsl_a16w4_gemm{stage}`` shared-tile kwargs (stage 2: no k_wave)."""
+    tile = dict(shared_tile or {})
+    if stage == 2:
+        tile.pop("shared_k_wave", None)
+    return tile
+
+
 def get_flydsl_kernel_params(name: str) -> dict | None:
     """Lookup kernel params by name.
 
     Strips ``_kw{N}`` / ``_fp4`` / ``_fp8`` / ``_sbm{N}`` suffixes transparently.
+    ``_sh{M}x{N}x{K}[kw{W}]`` gives the a16w4 shared-expert tile (``shared_tile_m/n/k``,
+    ``shared_k_wave``). The kernel uses it only when the call gives shared weights.
     """
     params = _KERNEL_PARAMS.get(name)
     if params is not None:
@@ -210,6 +227,12 @@ def get_flydsl_kernel_params(name: str) -> dict | None:
                 extra["out_dtype"] = "fp8"
             if m.group("sbm") is not None:
                 extra["sort_block_m"] = int(m.group("sbm"))
+            if m.group("shm") is not None:
+                extra["shared_tile_m"] = int(m.group("shm"))
+                extra["shared_tile_n"] = int(m.group("shn"))
+                extra["shared_tile_k"] = int(m.group("shk"))
+                if m.group("shkw") is not None:
+                    extra["shared_k_wave"] = int(m.group("shkw"))
             return {**params, **extra}
     return None
 
@@ -1602,6 +1625,9 @@ def _flydsl_moe_stage1_impl(
     k_wave: int = 1,
     v2_output_layout: bool = False,
     activation_bf16: bool = False,
+    shared_w1_bf16: torch.Tensor | None = None,
+    shared_inter_bf16: torch.Tensor | None = None,
+    shared_tile: dict | None = None,
     _compile_kernel=compile_flydsl_moe_stage1,
     _build_mx_args=_s1_args_fp4,
 ):
@@ -1676,6 +1702,12 @@ def _flydsl_moe_stage1_impl(
         waves_per_eu if (waves_per_eu is not None and int(waves_per_eu) > 1) else None
     )
     _is_a16w_port = a_dtype == "bf16" and b_dtype in ("fp4", "int4", "bf16")
+    _shared = shared_w1_bf16 is not None or shared_inter_bf16 is not None
+    if _shared and not _is_a16w_port:
+        raise NotImplementedError(
+            "the bf16 shared expert runs only on the a16w-mix (bf16 activation) "
+            f"stage-1 kernels, not a_dtype={a_dtype} b_dtype={b_dtype}"
+        )
     if _is_a16w_port:
         from aiter.ops.flydsl.kernels.moe_2stage_a16wmix import flydsl_a16w4_gemm1
 
@@ -1718,6 +1750,9 @@ def _flydsl_moe_stage1_impl(
             w_dtype=b_dtype,
             w_layout="standard",
             activation_bf16=activation_bf16,
+            shared_w1=shared_w1_bf16,
+            shared_inter_bf16=shared_inter_bf16,
+            **_a16w4_shared_tile(shared_tile, 1),
         )
         return inter_sorted
     # The gate/up (N) axis tile must divide inter_dim; for non-256-aligned
@@ -2077,6 +2112,9 @@ def flydsl_moe_stage1(
     k_wave: int = 1,
     v2_output_layout: bool = False,
     activation_bf16: bool = False,
+    shared_w1_bf16: torch.Tensor | None = None,
+    shared_inter_bf16: torch.Tensor | None = None,
+    shared_tile: dict | None = None,
 ):
     """Fused gate+up GEMM (MOE stage1).
 
@@ -2135,6 +2173,9 @@ def flydsl_moe_stage1(
         k_wave=k_wave,
         v2_output_layout=v2_output_layout,
         activation_bf16=activation_bf16,
+        shared_w1_bf16=shared_w1_bf16,
+        shared_inter_bf16=shared_inter_bf16,
+        shared_tile=shared_tile,
     )
 
 
@@ -2171,11 +2212,20 @@ def _flydsl_moe_stage2_impl(
     expert_mask: torch.Tensor | None = None,
     topk_ids: torch.Tensor | None = None,
     use_valid_token_count: bool = False,
+    shared_w2_bf16: torch.Tensor | None = None,
+    shared_inter_bf16: torch.Tensor | None = None,
+    shared_tile: dict | None = None,
     _compile_kernel=compile_flydsl_moe_stage2,
     _build_mx_args=_s2_args_fp4,
 ) -> torch.Tensor:
     """Run stage2 with injectable compiler and launch-argument builders."""
 
+    _shared = shared_w2_bf16 is not None or shared_inter_bf16 is not None
+    if _shared and not (a_dtype == "bf16" and b_dtype in ("fp4", "int4", "bf16")):
+        raise NotImplementedError(
+            "the bf16 shared expert runs only on the a16w-mix (bf16 activation) "
+            f"stage-2 kernels, not a_dtype={a_dtype} b_dtype={b_dtype}"
+        )
     if a_dtype == "bf16" and b_dtype in ("fp4", "int4", "bf16"):
         # a16w-mix down-proj (a16w4 mxfp4 / a16wi4 int4 / a16w16 bf16). Default
         # atomic-scatters into the caller's moe_sorting-zeroed `out`. Explicit
@@ -2248,6 +2298,9 @@ def _flydsl_moe_stage2_impl(
             w_dtype=b_dtype,
             epilog=_epilog,
             use_valid_token_count=use_valid_token_count,
+            shared_inter_bf16=shared_inter_bf16,
+            shared_w2=shared_w2_bf16,
+            **_a16w4_shared_tile(shared_tile, 2),
         )
         if _epilog == "reduce":
             _run_moe_reduction(
@@ -2500,6 +2553,9 @@ def flydsl_moe_stage2(
     expert_mask: torch.Tensor | None = None,
     topk_ids: torch.Tensor | None = None,
     use_valid_token_count: bool = False,
+    shared_w2_bf16: torch.Tensor | None = None,
+    shared_inter_bf16: torch.Tensor | None = None,
+    shared_tile: dict | None = None,
 ) -> torch.Tensor:
     """Down-projection GEMM (MOE stage2). Supports atomic/reduce modes.
 
@@ -2557,6 +2613,9 @@ def flydsl_moe_stage2(
         expert_mask=expert_mask,
         topk_ids=topk_ids,
         use_valid_token_count=use_valid_token_count,
+        shared_w2_bf16=shared_w2_bf16,
+        shared_inter_bf16=shared_inter_bf16,
+        shared_tile=shared_tile,
     )
 
 
