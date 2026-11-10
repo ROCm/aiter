@@ -26,7 +26,7 @@ import torch
 import aiter
 from aiter import ActivationType, QuantType, dtypes
 from aiter.fused_moe import fused_moe, fused_topk, torch_moe_stage1, torch_moe_stage2
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.flydsl.moe_common import GateMode
 from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
 from aiter.test_common import benchmark, checkAllclose, run_perftest
@@ -34,7 +34,7 @@ from aiter.test_common import benchmark, checkAllclose, run_perftest
 SUPPORTED_GFX = ["gfx950"]
 
 _SKIP = pytest.mark.skipif(
-    get_gfx() not in SUPPORTED_GFX,
+    get_gfx_runtime() not in SUPPORTED_GFX,
     reason="fused_moe(deterministic=True) requires gfx950",
 )
 
@@ -388,7 +388,7 @@ def test_fused_moe_mxfp4(token, model_dim, inter_dim, E, topk):
         2 * token * model_dim
     )
 
-    ret = {"gfx": get_gfx()}
+    ret = {"gfx": get_gfx_runtime()}
     for name, deterministic in candidates.items():
         # One copy of the arguments: rotating copies of every expert's weights
         # would not fit, and the weights exceed the caches anyway.
@@ -412,9 +412,10 @@ test_fused_moe_mxfp4.__test__ = False
 
 
 def main():
-    if get_gfx() not in SUPPORTED_GFX:
+    if get_gfx_runtime() not in SUPPORTED_GFX:
         aiter.logger.warning(
-            "fused_moe(deterministic=True) unsupported on %s; skipping", get_gfx()
+            "fused_moe(deterministic=True) unsupported on %s; skipping",
+            get_gfx_runtime(),
         )
         return 0
 
