@@ -48,9 +48,17 @@ class PaDecodeEpilogue:
             )
 
     def _emit(self, o_norm, sub, global_row):
-        if const_expr(self.traits.DIRECT):
-            # One task per row: the output has the query's row/head strides,
-            # query positions flattened into rows.
+        if const_expr(self.traits.DIRECT and self.traits.query_length == 1):
+            # One task per row: the output has the query's strides.
+            head = self.ctx.kv_h * self.traits.query_group_size + global_row
+            offset = (
+                self.ctx.seq * self.ctx.stride_q_row
+                + head * self.ctx.stride_q_head
+                + sub * self.traits.OP_ELEMS
+            )
+            fx.ptr_store(o_norm, fx.add_offset(self.pout, offset))
+        elif const_expr(self.traits.DIRECT):
+            # Query positions are flattened into the CTA's rows.
             query_pos = global_row // self.traits.query_group_size
             head = self.ctx.kv_h * self.traits.query_group_size + (
                 global_row - query_pos * self.traits.query_group_size
