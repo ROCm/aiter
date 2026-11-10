@@ -45,11 +45,16 @@
     },
     "M_LEQ_512": {
         "BLOCK_M": 128,
-        "BLOCK_N": 64,
+        "BLOCK_N": 256,
         "BLOCK_K": 256,
-        "NUM_BUFFERS": 3,
+        "NUM_BUFFERS": 2,
         "num_warps": 4,
-        "kernel_type": "bandwidth_bound"
+        "kernel_type": "bandwidth_bound",
+        "waves_per_eu": 1,
+        "num_ctas": 4,
+        "GROUP_SIZE_M": 2,
+        "B2B_WMMA": 1,
+        "TDM_STORE": 1
     },
     "any": {
         "BLOCK_M": 256,

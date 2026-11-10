@@ -166,6 +166,8 @@ def _gemm_a16w16_bandwidth_bound_kernel(
     layouts carry the CTA split). GROUP_SIZE_M > 0 orders the tiles in groups of that many tile
     rows. B2B_WMMA issues WMMAs back to back. TDM_STORE writes C through LDS with one TDM store.
     """
+    # A cluster with a single LDS slot hangs under repeated launches.
+    gl.static_assert(NUM_CTAS == 1 or NUM_BUFFERS >= 2, "a cluster needs NUM_BUFFERS >= 2")
     if B2B_WMMA:
         # back-to-back WMMA issue: HW_REG_WAVE_SCHED_MODE bit 2
         gl.inline_asm_elementwise(
@@ -478,6 +480,11 @@ def _gemm_a16w16_bandwidth_bound_kernel(
         )
         c_buffer.store(accumulator.to(c_ptr.type.element_ty))
         gl.barrier()
+        if NUM_CTAS > 1:
+            # Every CTA of the cluster must be past its K loop before any CTA issues the TDM
+            # store of C; without this barrier C is intermittently corrupted (~2.5% of runs).
+            gl.amd.gfx1250.cluster.arrive()
+            gl.amd.gfx1250.cluster.wait()
         c_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
             base=c_ptr,
             shape=(M, N),

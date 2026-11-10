@@ -431,6 +431,10 @@ def gemm_a16w16_(
             depth_cap = num_k_tiles - _DEPTH_SLACK.get(kernel_type, 0)
 
         NUM_BUFFERS = min(NUM_BUFFERS, depth_cap)
+        assert num_ctas == 1 or NUM_BUFFERS >= 2, (
+            f"num_ctas={num_ctas} needs NUM_BUFFERS >= 2, got {NUM_BUFFERS} "
+            f"(K={K}, BLOCK_K={BLOCK_K}); use a smaller BLOCK_K or num_ctas=1"
+        )
 
         w = w.T
 
