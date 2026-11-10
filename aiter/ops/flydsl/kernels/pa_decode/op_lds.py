@@ -6,7 +6,7 @@
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.compiler.protocol import dsl_size_of
-from flydsl.expr import const_expr, range_constexpr
+from flydsl.expr import arith, const_expr, range_constexpr
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import ReductionOp, T
 
@@ -174,8 +174,35 @@ class PaDecodeQueryLoader:
     def local_absmax(self, q_unit):
         if const_expr(self.traits.Q_ABSMAX_F32):
             return fmath.absf(q_unit.to(fx.Float32)).reduce(ReductionOp.MAX)
-        else:
-            return fmath.absf(q_unit).reduce(ReductionOp.MAX).to(fx.Float32)
+        if const_expr(
+            self.traits.IS_GFX950
+            and self.traits.Q_IN_DTYPE in (fx.BFloat16, fx.Float16)
+            and q_unit.shape[0] % 2 == 0
+        ):
+            # |x| of a 16-bit float orders like its sign-cleared bit pattern,
+            # so a packed 16-bit integer max over whole words replaces the
+            # per-element widen-and-max; one conversion follows.
+            words = q_unit.bitcast(fx.Int32)
+            m = None
+            for i in range_constexpr(q_unit.shape[0] // 2):
+                mag = fx.Vector.from_elements(
+                    [fx.Int32(words[i]) & fx.Int32(0x7FFF7FFF)], dtype=fx.Int32
+                ).bitcast(fx.Int16)
+                m = (
+                    mag
+                    if m is None
+                    else fx.Vector(arith.maxsi(fx.as_ir_value(m), fx.as_ir_value(mag)))
+                )
+            m = fx.Int32(m.bitcast(fx.Int32)[0])
+            high = fx.Int32(fx.Uint32(m) >> 16)
+            low = m & fx.Int32(0xFFFF)
+            mx = (low > high).select(low, high)
+            return (
+                fx.Vector.from_elements([mx], dtype=fx.Int32)
+                .bitcast(self.traits.Q_IN_DTYPE)[0]
+                .to(fx.Float32)
+            )
+        return fmath.absf(q_unit).reduce(ReductionOp.MAX).to(fx.Float32)
 
     @flyc.jit
     def quantize_row(self, m, q_row_off, q_units):

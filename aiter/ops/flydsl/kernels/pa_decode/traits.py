@@ -488,6 +488,7 @@ class PaDecodeTraits:
     STEPS_PER_PAGE: int
     STEPS_PER_CHUNK: int
     BLOCK_THREADS: int
+    IS_GFX950: bool
     DUAL_GROUP: bool
     GROUP_LDS_BYTES: int
     CTA_THREADS: int
@@ -898,6 +899,7 @@ class PaDecodeTraits:
         CTA_THREADS = BLOCK_THREADS * (2 if DUAL_GROUP else 1)
         return cls(
             cache_key=cache_key,
+            IS_GFX950=is_gfx950,
             DUAL_GROUP=DUAL_GROUP,
             GROUP_LDS_BYTES=GROUP_LDS_BYTES,
             CTA_THREADS=CTA_THREADS,
