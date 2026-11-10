@@ -60,8 +60,6 @@ def _can_use_gfx1250_exact_sigmoid_topk(
         and gating_output.stride(1) == 1
         and gating_output.stride(0) >= experts
     )
-    # An FP32 bias with BF16 logits has no wave32 HIP path: the HIP kernel
-    # takes a bias of another dtype only on its wave64 register top-k path.
     bias_ok = (
         correction_bias.shape == (experts,)
         and correction_bias.dtype in (torch.bfloat16, torch.float32)
@@ -83,6 +81,30 @@ def _can_use_gfx1250_exact_sigmoid_topk(
     if not input_ok or not bias_ok or not outputs_ok or not same_device:
         return False
     return get_gfx_runtime() in ("gfx1250", "gfx1250-strict")
+
+
+# E = 128 * waves for biased_grouped_topk_hip's wave32 multi-wave kernel.
+_GFX1250_REG_MW_EXPERTS = {512, 768, 896, 1024}
+
+
+def _gfx1250_reg_mw_fits(
+    gating_output: torch.Tensor,
+    correction_bias: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+) -> bool:
+    """Whether a call that passed _can_use_gfx1250_exact_sigmoid_topk fits the
+    multi-wave kernel of biased_grouped_topk_hip, which beats the Triton one."""
+    return (
+        gating_output.shape[1] in _GFX1250_REG_MW_EXPERTS
+        and topk_ids.shape[1] <= 16
+        # Rows and bias are read as 4-element vectors.
+        and gating_output.stride(0) % 4 == 0
+        and gating_output.data_ptr() % (4 * gating_output.element_size()) == 0
+        and correction_bias.data_ptr() % (4 * correction_bias.element_size()) == 0
+        # The HIP op writes both outputs with the row stride of topk_ids.
+        and topk_weights.stride(0) == topk_ids.stride(0)
+    )
 
 
 def _gfx1250_exact_sigmoid_topk(
@@ -383,6 +405,12 @@ def biased_grouped_topk(
         num_expert_group == 1
         and topk_group == 1
         and _can_use_gfx1250_exact_sigmoid_topk(
+            gating_output,
+            correction_bias,
+            topk_weights,
+            topk_ids,
+        )
+        and not _gfx1250_reg_mw_fits(
             gating_output,
             correction_bias,
             topk_weights,

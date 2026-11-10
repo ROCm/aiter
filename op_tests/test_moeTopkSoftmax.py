@@ -271,11 +271,12 @@ def test_biased_grouped_topk(
     num_iters=101,
     num_warmup=2,
     gating_output=None,
+    bias_dtype=None,
 ):
     ret = {}
     if gating_output is None:
         gating_output = torch.randn((token, expert), dtype=dtype)
-    correction_bias = torch.randn((expert,), dtype=dtype)
+    correction_bias = torch.randn((expert,), dtype=bias_dtype or dtype)
 
     (w_ref, id_ref, score_ref), us_ref = run_perftest(
         aiter.biased_grouped_topk_torch,
@@ -386,6 +387,8 @@ def test_grouped_topk_stable(
     strided_output,
     num_expert_group=1,
     topk_group=1,
+    bias_dtype=None,
+    strided_input=False,
 ):
     mode_id = {"biased": 0, "sigmoid": 1, "softmax": 2}[mode]
     pattern_id = {
@@ -396,6 +399,7 @@ def test_grouped_topk_stable(
         "all_nan": 4,
         "masked_scores": 5,
         "all_zero_sigmoid": 6,
+        "forty_way_tie": 7,
     }[pattern]
     torch.manual_seed(
         5632 + token * 17 + expert * 3 + topk + mode_id * 1009 + pattern_id * 101
@@ -432,6 +436,23 @@ def test_grouped_topk_stable(
             raise AssertionError("all_zero_sigmoid is not a softmax pattern")
         gating.fill_(-100)
         bias.zero_()
+    elif pattern == "forty_way_tie":
+        # More tied candidates than a wave32 lane keeps in one register slot,
+        # fewer than the 64 the register paths stage.
+        gating.fill_(-4)
+        hot = torch.rand((token, expert)).argsort(dim=1)[:, :40]
+        gating.scatter_(1, hot, 0.0)
+        bias.zero_()
+
+    # The reference below reads gating and bias as they are here.
+    run_gating, run_bias = gating, bias
+    if strided_input:
+        # Rows of a wider buffer, as a fused projection leaves the logits.
+        backing = torch.empty((token, expert + 128), dtype=dtype)
+        run_gating = backing[:, 64 : 64 + expert]
+        run_gating.copy_(gating)
+    if bias_dtype is not None:
+        run_bias = bias.to(bias_dtype)
 
     def make_output(dtype):
         if strided_output:
@@ -443,8 +464,8 @@ def test_grouped_topk_stable(
     if mode == "biased":
         _, us = run_perftest(
             aiter.biased_grouped_topk_hip,
-            gating,
-            bias,
+            run_gating,
+            run_bias,
             w,
             ids,
             num_expert_group,
@@ -457,7 +478,7 @@ def test_grouped_topk_stable(
     else:
         _, us = run_perftest(
             aiter.grouped_topk,
-            gating,
+            run_gating,
             w,
             ids,
             num_expert_group,
@@ -1024,6 +1045,36 @@ aiter.logger.info(
     "moeTopkSoftmax_reg_biased_grouped_topk summary (markdown):\n%s", df_md
 )
 
+# wave32 multi-wave register path (E = 128 * waves), which reads the bias in
+# the logits' dtype or in fp32.
+df = []
+for token in (1, 32, 160, 2048):
+    for expert, topk, bias_dtype in (
+        (512, 8, None),
+        (768, 8, None),
+        (896, 16, None),
+        (896, 16, dtypes.fp32),
+        (1024, 16, None),
+    ):
+        ret = test_biased_grouped_topk(
+            token,
+            expert,
+            1,
+            topk,
+            1,
+            True,
+            dtypes.bf16,
+            num_iters=args.iters,
+            num_warmup=args.warmup,
+            bias_dtype=bias_dtype,
+        )
+        df.append(ret)
+df = pd.DataFrame(df)
+df_md = df.to_markdown(index=False)
+aiter.logger.info(
+    "moeTopkSoftmax_reg_mw_biased_grouped_topk summary (markdown):\n%s", df_md
+)
+
 # Compare regular register cases with the LDS path and cover degenerate rows
 # where the register fallback must produce unique, inert expert slots.
 stable_cases = [
@@ -1053,10 +1104,53 @@ stable_cases = [
     (1, 256, 8, dtypes.bf16, "softmax", True, "all_nan", False),
     (1, 256, 8, dtypes.bf16, "biased", True, "all_zero_sigmoid", False),
     (1, 256, 8, dtypes.bf16, "sigmoid", False, "all_zero_sigmoid", False),
+    # wave32 multi-wave register path: E = 128 * waves, topk <= 16.
+    (1, 896, 16, dtypes.bf16, "biased", True, "random", False),  # Kimi-K3 router
+    (160, 896, 16, dtypes.bf16, "biased", True, "random", True),
+    (64, 896, 1, dtypes.bf16, "biased", True, "random", False),
+    (64, 512, 8, dtypes.bf16, "biased", False, "random", True),
+    (64, 768, 4, dtypes.bf16, "biased", True, "random", False),
+    (64, 1024, 9, dtypes.bf16, "biased", True, "random", False),
+    (64, 896, 16, dtypes.bf16, "biased", True, "forty_way_tie", False),
+    (64, 1024, 5, dtypes.bf16, "biased", False, "forty_way_tie", True),
+    (1, 896, 16, dtypes.bf16, "biased", True, "all_equal", False),
+    (1, 896, 16, dtypes.bf16, "biased", True, "sixteen_way_tie", False),
+    (1, 896, 16, dtypes.bf16, "biased", True, "one_finite", False),
+    (1, 896, 16, dtypes.bf16, "biased", True, "all_nan", False),
+    (1, 896, 16, dtypes.bf16, "biased", True, "all_zero_sigmoid", False),
 ]
 df = pd.DataFrame([test_grouped_topk_stable(*case) for case in stable_cases])
 aiter.logger.info(
     "moeTopkSoftmax_reg_stable summary (markdown):\n%s",
+    df.to_markdown(index=False),
+)
+
+# Kimi-K3's router hands over an FP32 bias and logits in rows of a wider
+# buffer; the reference reads the same values as contiguous BF16.
+df = pd.DataFrame(
+    [
+        test_grouped_topk_stable(
+            token,
+            expert,
+            topk,
+            dtypes.bf16,
+            "biased",
+            True,
+            pattern,
+            False,
+            bias_dtype=dtypes.fp32,
+            strided_input=strided_input,
+        )
+        for token, expert, topk, pattern, strided_input in (
+            (160, 896, 16, "random", True),
+            (64, 1024, 9, "random", True),
+            (64, 896, 16, "forty_way_tie", False),
+            (1, 896, 16, "one_finite", False),
+        )
+    ]
+)
+aiter.logger.info(
+    "moeTopkSoftmax_reg_fp32_bias_stable summary (markdown):\n%s",
     df.to_markdown(index=False),
 )
 
