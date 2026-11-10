@@ -35,11 +35,12 @@ each replaying its jobs in a pool of workers.
 
 For an arch in ``SCAN_ARCHS``, every size of a job's range is identified:
 replayed with its launches stopped at their cache identity
-(:func:`identified_kernels`, nothing compiled), and one size per set of
-kernels not yet built is replayed for real. A runtime whose choices are not
-monotonic in the size needs that, as a gfx1250 GEMM's are: it fits cluster_m
-to the number of M tiles and specializes a ragged last tile, so M=5120 and
-M=6144 can request one kernel and M=5632 another.
+(:func:`identified_kernels`, nothing compiled, and traced once per distinct
+launch), and one size per set of kernels not yet built is replayed for real.
+A runtime whose choices are not monotonic in the size needs that, as a
+gfx1250 GEMM's are: it fits cluster_m to the number of M tiles and
+specializes a ragged last tile, so M=5120 and M=6144 can request one kernel
+and M=5632 another.
 
 Otherwise, where a job's two ends request different FlyDSL kernels, the sizes
 between them are bisected down to every size at which the runtime switches
@@ -60,6 +61,7 @@ broke must not pass for the runtime refusing a size.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import importlib
 import os
 import re
@@ -74,12 +76,17 @@ from contextlib import AbstractContextManager, contextmanager
 from typing import Any
 
 from aiter.aot.flydsl.common import (
+    STRICT_ERRATA_TABLES,
     aot_target_archs,
+    assert_targets_covered,
     check_replay_process,
     collect_aot_jobs,
     cu_num_to_arch,
+    fail_build_on_missing_target_feature,
     get_max_workers,
+    is_strict_identity,
     replay_env,
+    resolve_target_arch,
     run_jobs_parallel,
     worker_waves,
 )
@@ -96,7 +103,7 @@ def job_arch(job: dict, default: str = "gfx950") -> str:
 
 class ReplayHookBroken(RuntimeError):
     """A FlyDSL launch derived no cache key in
-    ``JitFunction._build_full_cache_key``: the FlyDSL internals the replay
+    ``jit_function._artifact_cache_key``: the FlyDSL internals the replay
     hooks into have changed, and it would miss the launch's kernel."""
 
 
@@ -105,40 +112,95 @@ class _Identified(BaseException):
     ``except Exception`` on the way out of FlyDSL takes it for an error."""
 
 
+def _frozen(value) -> tuple:
+    """``value`` with its type, by value where hashable, else by repr."""
+    try:
+        hash(value)
+    except TypeError:
+        return type(value), repr(value)
+    return type(value), value
+
+
+def _trace_identity(jit, sig, bound, bound_self) -> tuple:
+    """What a FlyDSL trace of ``jit`` depends on besides the launcher itself:
+    the object it is bound to, the IR types of its runtime arguments (static
+    shape, stride and dtype included), its Constexpr values, the compile hints
+    and the target. Two launches of one ``jit`` that agree on these trace to
+    the same IR, provided the trace reads no other state that changes between
+    them (as FlyDSL's own key assumed before 0.5.0)."""
+    from flydsl.compiler import jit_function
+
+    _, jit_args, dsl_types, constexprs = jit_function.convert_to_jit_arguments(
+        sig, bound
+    )
+    hints = jit._effective_compile_hints()
+    return (
+        jit,
+        _frozen(bound_self),
+        tuple(str(t) for t in jit_function.get_ir_types(jit_args)),
+        tuple(dsl_types),
+        tuple(sorted((k, _frozen(v)) for k, v in constexprs.items())),
+        tuple(sorted((k, _frozen(v)) for k, v in hints.items())),
+        _frozen(jit_function.get_backend().target),
+    )
+
+
 @contextmanager
-def requested_kernels(*, stop: bool = False) -> Iterator[set]:
+def requested_kernels(*, stop: bool = False, memo: dict | None = None) -> Iterator[set]:
     """Collect the cache identity of every FlyDSL launch a replay reaches, as
     FlyDSL itself derives it for its cache lookup. With ``stop``, a launch
-    ends there: nothing is traced, compiled or read from the cache, and the
-    launcher gets the None a COMPILE_ONLY launch returns.
+    ends there: it is traced, but nothing is compiled or read from the cache,
+    and the launcher gets the None a COMPILE_ONLY launch returns. A ``memo``
+    (with ``stop``) maps :func:`_trace_identity` to the key it traced to, so
+    that a launch whose trace inputs were seen before is not traced again: a
+    scan identifies thousands of sizes that request a handful of kernels.
+    Share one only among launches under one environment (one dry run).
 
-    Hooks two private names of FlyDSL's ``JitFunction``:
-    ``_compile_or_execute``, which every launch (``__call__``,
-    ``flyc.compile``) goes through, and ``_build_full_cache_key``, which it
-    calls once before tracing. Should either be renamed, entering this
+    Hooks private names of FlyDSL's ``jit_function`` module:
+    ``JitFunction._compile_or_execute``, which every launch (``__call__``,
+    ``flyc.compile``) goes through, ``_artifact_cache_key``, which it calls
+    once after tracing, and, for a ``memo``, ``JitFunction._trace`` and the
+    argument conversion it starts with. Should one be renamed, entering this
     fails; should a launch stop deriving its key there, it raises
     :class:`ReplayHookBroken`."""
     from unittest import mock
 
+    from flydsl.compiler import jit_function
     from flydsl.compiler.jit_function import JitFunction
 
     kernels = set()
-    build_key = JitFunction._build_full_cache_key
+    build_key = jit_function._artifact_cache_key
     dispatch = JitFunction._compile_or_execute
+    trace = JitFunction._trace
     derived = depth = 0
+    pending = None
 
-    def record(self, *args, **kwargs):
-        nonlocal derived
-        key = build_key(self, *args, **kwargs)
-        kernels.add((self.manager_key, key))
+    def record(*args, **kwargs):
+        nonlocal derived, pending
+        key = build_key(*args, **kwargs)
+        kernels.add(key)
         derived += 1
+        if pending is not None:
+            memo[pending] = key
+            pending = None
         # Only a launch is stopped; host code may derive a key itself.
         if stop and depth:
             raise _Identified
         return key
 
+    def traced(self, ctx, sig, bound, bound_self, *args, **kwargs):
+        nonlocal derived, pending
+        identity = _trace_identity(self, sig, bound, bound_self)
+        key = memo.get(identity)
+        if key is not None:
+            kernels.add(key)
+            derived += 1
+            raise _Identified
+        pending = identity
+        return trace(self, ctx, sig, bound, bound_self, *args, **kwargs)
+
     def launch(self, *args, **kwargs):
-        nonlocal depth
+        nonlocal depth, pending
         before = derived
         depth += 1
         try:
@@ -147,24 +209,32 @@ def requested_kernels(*, stop: bool = False) -> Iterator[set]:
             return None
         finally:
             depth -= 1
+            # A launch that failed between its trace and its key memoizes
+            # nothing.
+            pending = None
         # A launch inside another one's trace is inlined and derives no key.
         if not depth and derived == before:
             raise ReplayHookBroken(
                 f"FlyDSL launched {self.func.__name__} without deriving its "
-                "cache key in JitFunction._build_full_cache_key"
+                "cache key in jit_function._artifact_cache_key"
             )
         return result
 
-    with (
-        mock.patch.object(JitFunction, "_build_full_cache_key", record),
+    patches = [
+        mock.patch.object(jit_function, "_artifact_cache_key", record),
         mock.patch.object(JitFunction, "_compile_or_execute", launch),
-    ):
+    ]
+    if stop and memo is not None:
+        patches.append(mock.patch.object(JitFunction, "_trace", traced))
+    with contextlib.ExitStack() as patched:
+        for patch in patches:
+            patched.enter_context(patch)
         yield kernels
 
 
-def identified_kernels() -> AbstractContextManager[set]:
+def identified_kernels(memo: dict | None = None) -> AbstractContextManager[set]:
     """:func:`requested_kernels` with every launch stopped at its cache key."""
-    return requested_kernels(stop=True)
+    return requested_kernels(stop=True, memo=memo)
 
 
 def replay_job(
@@ -286,6 +356,7 @@ def _kernel_sets(module: Any, job: dict, sizes: range) -> dict:
 
     arch = job_arch(job, _default_arch(module))
     found: dict = {}
+    memo: dict = {}
     logger = logging.getLogger("aiter")
     level = logger.level
     # The runtime warns at every untuned size, and a scan visits thousands.
@@ -293,7 +364,7 @@ def _kernel_sets(module: Any, job: dict, sizes: range) -> dict:
     try:
         with dry_run(arch, int(job.get("cu_num") or 0), python_ops=True):
             for size in sizes:
-                with identified_kernels() as kernels:
+                with identified_kernels(memo) as kernels:
                     try:
                         module.replay({**job, "m": size})
                         outcome = frozenset(kernels)
@@ -455,13 +526,25 @@ def run(
     module = importlib.import_module(module_name)
     arch_of = Counter(job_arch(job, _default_arch(module)) for job in jobs)
     targets = aot_target_archs()
+    # Map each tuned arch to the exact requested target in its kernel family
+    # (gfx1250 -> gfx1250-strict for a strict build), so a gfx1250-tuned row is
+    # replayed and compiled for the exact strict target (ELF mach 0xeb, not
+    # gfx1250 0x49). A tuned arch whose family GPU_ARCHS does not request is
+    # skipped; a requested family present in the tables but dropped is a hard
+    # error (an empty/partial wheel reported as success).
+    resolved = {arch: resolve_target_arch(arch, targets) for arch in arch_of}
     for arch, count in sorted(arch_of.items()):
-        if targets and arch not in targets:
+        if resolved[arch] is None:
             print(
                 f"  [SKIP] {count} {module.LABEL} jobs for {arch}, which GPU_ARCHS omits"
             )
-    archs = sorted(arch for arch in arch_of if not targets or arch in targets)
-    total = sum(arch_of[arch] for arch in archs)
+    target_of: Counter = Counter()
+    for arch, count in arch_of.items():
+        if resolved[arch] is not None:
+            target_of[resolved[arch]] += count
+    archs = sorted(target_of)
+    assert_targets_covered(targets, list(arch_of), archs, f"FlyDSL {module.LABEL} AOT")
+    total = sum(target_of.values())
     print(
         f"[aiter] FlyDSL {module.LABEL} replay: {total} jobs, "
         f"archs {', '.join(archs) or '-'}",
@@ -470,7 +553,7 @@ def run(
     if not archs:
         return 0
     failed = 0
-    waves = worker_waves(get_max_workers(total), {a: arch_of[a] for a in archs})
+    waves = worker_waves(get_max_workers(total), dict(target_of))
     for wave in waves:
         replays = []
         for arch, share in wave.items():
@@ -558,9 +641,25 @@ def main(module_name: str, description: str) -> None:
     jobs = _jobs(module, csv_paths, args)
 
     if args.arch:
-        jobs = [
-            job for job in jobs if job_arch(job, _default_arch(module)) == args.arch
-        ]
+        # args.arch is the exact requested target; keep rows whose tuned arch
+        # shares its family and retarget each so it compiles for that arch
+        # (a gfx1250 row -> gfx1250-strict -> 0xeb).
+        kept = []
+        for job in jobs:
+            cur = job_arch(job, _default_arch(module))
+            if resolve_target_arch(cur, {args.arch}) != args.arch:
+                continue
+            # gfx1250-strict disables the WMMA features these tables need
+            # (A0 errata); compiled for strict they are hollow, so skip them.
+            if (
+                is_strict_identity(args.arch)
+                and job.get("table") in STRICT_ERRATA_TABLES
+            ):
+                continue
+            if cur != args.arch:
+                job = {**job, "gfx": args.arch}
+            kept.append(job)
+        jobs = kept
         failed = jobs and replay_arch(module_name, jobs, args.arch, module.LABEL)
         sys.exit(1 if failed else 0)
 
@@ -577,7 +676,8 @@ def main(module_name: str, description: str) -> None:
     print("=" * 72, flush=True)
 
     started = time.time()
-    failed_archs = run(module_name, jobs, argv, env=_child_env(module, csv_paths))
+    with fail_build_on_missing_target_feature():
+        failed_archs = run(module_name, jobs, argv, env=_child_env(module, csv_paths))
     print(f"\n  Total time:   {time.time() - started:.1f}s")
     if failed_archs:
         print("Some replays failed. Check output above for details.")

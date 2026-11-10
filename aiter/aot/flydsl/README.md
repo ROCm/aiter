@@ -11,8 +11,10 @@ compiles them up front so the runtime JIT path hits the cache.
 | `gemm.py` | Every FlyDSL kernel the tuned GEMM tables reach, by replaying each table's public GEMM entry (see below) |
 | `conv.py` | conv3d implicit-GEMM kernels and the NCDHW->NDHWC pre-transpose, by replaying `flydsl_conv_implicit` |
 | `chunk_gdn_h.py` | chunk-gdn-h opt (K5) kernels, by replaying `chunk_gated_delta_rule_fwd_h_flydsl_opt` |
+| `gdn_fused_prefill.py` | gfx950 single-kernel GDN prefill, by replaying `gdn_fused_prefill_fwd` per head shape in `DEFAULT_SHAPES` |
 | `mega_moe.py` | MegaMoE A8W4 and A4W4 bundles of every deployment profile, by preloading `MegaMoEV2` itself (see below) |
 | `fmha_fp8.py` | gfx950 FP8 flash-attention forward, by replaying `flydsl_flash_attn_fp8_func` per head shape in `DEFAULT_SHAPES` |
+| `pa_decode_plan.py` | PA decode planner, every batch bucket, block size and window mode up to each arch's LDS limit, by replaying `plan_pa_decode` (see below) |
 | `mxfp4_moe.py` | Not part of the AOT build; the MXFP4 tuner's `--fast-scan` precompiles its candidates with it |
 | `common.py` | Job collection, the deadlock-free fork pool, `run_aot` (what `setup.py` runs), and cache-hit checking logic |
 | `replay.py` | The shared driver of the replaying modules other than MoE/MegaMoE: per-arch processes, worker batches, size scans and bisection, `--check` |
@@ -96,15 +98,24 @@ variant of the profile's bundle plan.
   is tuned per GPU model.
 - `quantize()` is replayed too: `preload_aot_bundles()` leaves it out, but
   fixed-slot `forward` and the per-stage benchmarks call it.
+- The MTPR 8192 jobs build the instance with `AITER_MEGA_SMALL_M=1` and
+  `AITER_MEGA_LARGE_M=1`. Where the runtime's eligibility checks accept the
+  profile (DeepSeek-V4-Pro EP8 a8w4), `preload_aot_bundles()` then also loads
+  the small-input kernel of every token bucket (MTPR 256 and 512) and the
+  large-input persistent kernel.
+- `--check` compiles nothing: with `FLYDSL_RUNTIME_RUN_ONLY=1`, any kernel the
+  replay reaches but the cache lacks fails the job, which tests that the runtime's
+  cache keys hit the artifacts the build produced.
 - Like the MoE replay, it runs in a process of its own, started with
   `GPU_ARCHS=gfx950` and `AITER_AOT_REPLAY=1`; both
   `python -m aiter.aot.flydsl.mega_moe` and `setup.py` start it that way. It
   is skipped when `GPU_ARCHS` names targets without gfx950.
 
-### How `gemm.py`, `conv.py`, `chunk_gdn_h.py` and `fmha_fp8.py` work
+### How `gemm.py`, `conv.py`, `chunk_gdn_h.py`, `gdn_fused_prefill.py` and `fmha_fp8.py` work
 
 They follow `moe.py`: none restates launch logic. Each turns a tuned row (or,
-for `fmha_fp8.py`, a configured head shape) into what a caller passes the op's
+for `gdn_fused_prefill.py` and `fmha_fp8.py`, a configured head shape) into
+what a caller passes the op's
 public entry, as FakeTensors, and `replay.py` calls that entry inside
 `dry_run`. The runtime looks the row up, picks and parameterizes its kernels
 and launches them; every FlyDSL launch is compiled into the cache instead.
@@ -134,6 +145,9 @@ and launches them; every FlyDSL launch is compiled into the cache instead.
 - `chunk_gdn_h.py` replays each row at its batch shape, with `g` head- and
   token-major and a dense and indexed initial state, and each of those layouts
   over batch sizes the table never measured, where the BV rule decides.
+- `gdn_fused_prefill.py` replays each head shape with and without
+  `track_state` and `has_initial_state` (compile-time flags), over batch
+  sizes from 1 sequence up, bisected where the wrapper's BV rule switches.
 - `fmha_fp8.py` replays a grid of batch sizes and sequence lengths per head
   shape, bisecting between grid points where the wrapper switches kernels.
   Between grid points of the batch and query length the wrapper can still
@@ -141,6 +155,10 @@ and launches them; every FlyDSL launch is compiled into the cache instead.
   query length 5675 and key/value length 66157 splits 11 ways), so each
   launcher it can pick at all is replayed too, with its tile and split count
   pinned through the wrapper's own overrides.
+- `pa_decode_plan.py` replays `plan_pa_decode` at the largest batch of
+  each bucket, at each task capacity where the block size can change and
+  with and without a window. Capacity stops at the batch times the CU
+  count, so each arch replays with the most CUs any of its devices has.
 - Ops with a Python body behind `torch_compile_guard` run that body under
   `dry_run(python_ops=True)`, so a replay can enter at a public op; C++ ops
   still dispatch to their fakes.
@@ -200,6 +218,10 @@ python -m aiter.aot.flydsl.conv
 # chunk-gdn-h
 python -m aiter.aot.flydsl.chunk_gdn_h
 
+# single-kernel GDN prefill (DEFAULT_SHAPES, or ad hoc H:Hg)
+python -m aiter.aot.flydsl.gdn_fused_prefill
+python -m aiter.aot.flydsl.gdn_fused_prefill --shape 48:16
+
 # MegaMoE profile bundles (all token buckets and all eight ranks)
 python -m aiter.aot.flydsl.mega_moe
 
@@ -220,6 +242,20 @@ per rank, layout `varlen_cross` for the chunked-prefill serving path).
 python -m aiter.aot.flydsl.fmha_fp8
 # ad hoc shape, without editing DEFAULT_SHAPES
 python -m aiter.aot.flydsl.fmha_fp8 --shape 12:12:192:128
+```
+
+The PA decode planner compiles one kernel per batch bucket (1, 2, 4, ...,
+clipped to the arch's LDS), block size (64 to 1024 threads, from the plan's
+task capacity) and dense/windowed mode; batch, capacity, partition cap and
+window are passed at launch, and `max_batch_size` only bounds the batch.
+`run_aot` replays the whole set up to each arch's LDS limit (16256 on gfx942,
+40832 on gfx950, 81792 on gfx1250), so it serves every `max_batch_size`.
+
+```bash
+# every planner kernel up to each arch's LDS limit, as the wheel build does
+python -m aiter.aot.flydsl.pa_decode_plan
+# one arch
+GPU_ARCHS=gfx950 python -m aiter.aot.flydsl.pa_decode_plan
 ```
 
 The gfx1250 MoE build imports aiter, so it needs aiter's C++ core module. An
@@ -373,11 +409,14 @@ python op_tests/test_moe_2stage.py
   is refreshed to the right version.
 - **`ReplayHookBroken`, or an `AttributeError` on `JitFunction`, after a FlyDSL
   upgrade**: the replay learns each launch's cache key by hooking two private
-  methods of FlyDSL's `JitFunction`, `_compile_or_execute` and
-  `_build_full_cache_key` (`replay.requested_kernels`). A release that renames
+  names of FlyDSL's `jit_function` module, `JitFunction._compile_or_execute`
+  and `_artifact_cache_key` (`replay.requested_kernels`). A release that renames
   either fails every replay with an `AttributeError`; one whose launches stop
-  deriving their key in `_build_full_cache_key` fails them with
-  `ReplayHookBroken`. Update `requested_kernels` for that release.
+  deriving their key in `_artifact_cache_key` fails them with
+  `ReplayHookBroken`. A scan (`SCAN_ARCHS`) also hooks `JitFunction._trace` and
+  its `convert_to_jit_arguments` / `get_ir_types`, to trace each distinct
+  launch once (`replay._trace_identity`). Update `requested_kernels` for that
+  release.
 - **Worker OOM / killed (exitcode -9)**: abnormal exits are auto-retried
   (`AITER_FLYDSL_AOT_MAX_RETRIES`) and the default worker count is already
   bounded by the shared CPU and memory policy. If it still happens,

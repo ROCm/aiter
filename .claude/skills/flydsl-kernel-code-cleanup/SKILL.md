@@ -524,6 +524,10 @@ _run_compiled(compiled["launch"],
 - Reuse `tensor_shim._run_compiled`; don't add a second copy in wrapper modules.
 - Worth it for small kernels in tight loops, not cold one-shot launches. Arg
   order/types must match the compiled signature — verify.
+- A `@cache` factory returning a JitFunction is not a compiled cache; wrap its
+  call in `_run_compiled` (no `specialization_key` — the factory fixes the
+  config). Only a shared JitFunction with varying Constexpr args needs a key,
+  and the key is just those Constexpr values.
 
 ---
 
