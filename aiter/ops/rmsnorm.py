@@ -7,6 +7,7 @@ from torch import Tensor
 from ..jit.core import compile_ops
 from ..jit.utils.chip_info import get_gfx_runtime
 from ..jit.utils.torch_guard import torch_compile_guard
+from ..plugin import route as _route
 from .quant import get_dtype_max
 
 # opus is the sole rmsnorm backend (fp16/bf16/fp32, any hidden). Only group_size/
@@ -399,10 +400,20 @@ def _use_hip_common(input: Tensor, use_model_sensitive_rmsnorm: int) -> bool:
         and input.dim() == 2
         and input.element_size() == 2
         and input.shape[-1] <= 8192
-        and (input.shape[-1] % 8 == 0 or get_gfx_runtime() != "gfx1250")
+        and (
+            input.shape[-1] % 8 == 0
+            or get_gfx_runtime() not in ("gfx1250", "gfx1250-strict")
+        )
     )
 
 
+# Routed here rather than on either public spelling or on a backend binding.
+# rms_norm and rmsnorm2d_fwd are two public names for one op and both call this
+# directly, so this is where the op begins; the HIP and opus choice is made
+# below it, so a provider sees the op rather than one backend's share of it.
+# Version 2: version 1 was the HIP binding's write-out contract, which is a
+# different shape, not an older spelling of this one.
+@_route(op="rmsnorm", version=2)
 def _rms_norm_fwd_dispatch(
     input, weight, epsilon, use_model_sensitive_rmsnorm
 ) -> Tensor:
@@ -438,6 +449,7 @@ def rmsnorm2d_fwd(
     return _rms_norm_fwd_dispatch(input, weight, epsilon, use_model_sensitive_rmsnorm)
 
 
+@_route(op="rmsnorm_with_add", version=1)
 @torch_compile_guard(
     mutates_args=["out", "residual_out"], gen_fake=lambda *a, **k: None
 )

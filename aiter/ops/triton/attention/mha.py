@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import functools
 import math
 import os
 import warnings
@@ -10,7 +11,11 @@ import torch
 import triton
 import triton.language as tl
 from packaging.version import Version
+from triton.experimental.gluon import language as gl
 
+from aiter.ops.triton._gluon_kernels.gfx950.attention.mha import (
+    _MIN_PIPE_BLOCKS as _GLUON_MIN_PIPE_BLOCKS,
+)
 from aiter.ops.triton._gluon_kernels.gfx950.attention.mha import (
     _attn_fwd as _gluon_attn_fwd,
 )
@@ -48,10 +53,26 @@ _USE_FUSED_BWD_KERNEL = False
 
 def is_gluon_available() -> bool:
     """True when the Gluon MHA forward kernel can actually run on this device."""
-    if not _TRITON_GE_36:
+    if not _TRITON_GE_36 or not hasattr(gl, "map_elementwise"):
         return False
     arch = get_arch() or ""
     return any(supported in arch for supported in _GLUON_SUPPORTED_ARCHS)
+
+
+@functools.cache
+def is_gluon_async_copy_ok(
+    head_dim_pow2, pe_head_dim, block_n, num_warps, elem_bits, stride_align
+) -> bool:
+    """True when the Gluon kernel can async-copy every K/V tile of this launch.
+
+    A pure function of the launch shape; the kernel's constexpr_function costs
+    tens of microseconds per call from host code, so make it cached.
+    """
+    return bool(
+        _gluon_kv_async_copy_ok(
+            head_dim_pow2, pe_head_dim, block_n, num_warps, elem_bits, stride_align
+        )
+    )
 
 
 _MHA_BACKENDS = ("triton", "gluon")
@@ -205,7 +226,7 @@ def gluon_forward_unsupported_reason(
     if not is_gluon_available():
         return (
             f"Gluon MHA backend requires one of {_GLUON_SUPPORTED_ARCHS} with "
-            f"Triton>=3.6 (arch={get_arch()!r}, triton={triton.__version__})"
+            f"Gluon map_elementwise support (arch={get_arch()!r}, triton={triton.__version__})"
         )
     if dropout_p and dropout_p != 0.0:
         return "Gluon MHA backend does not support dropout"
@@ -264,8 +285,8 @@ def _gluon_flash_attn_forward(
         q, k, v: query / key / value tensors (layout per the mode above).
         sm_scale: QK^T scale.
         causal: whether to apply a (bottom-right aligned) causal mask.
-        window_size: (left, right) local attention window. Only a left window is
-            supported, so right must be -1.
+        window_size: (left, right) local attention window. A zero right bound
+            selects causal attention. Positive right bounds require causal=True.
         return_lse: allocate and write the log-sum-exp. When False the kernel
             skips the LSE epilogue entirely.
         return_softmax: also write out the per-block softmax probabilities.
@@ -290,16 +311,23 @@ def _gluon_flash_attn_forward(
 
     assert is_gluon_available(), (
         f"Gluon MHA backend requires one of {_GLUON_SUPPORTED_ARCHS} with "
-        f"Triton>=3.6 (arch={get_arch()!r}, triton={triton.__version__})"
+        f"Gluon map_elementwise support (arch={get_arch()!r}, triton={triton.__version__})"
     )
     assert q.shape[-1] == k.shape[-1], "q/k head_dim mismatch"
     # Unless q is pre-scaled, the kernel takes the row max of the unscaled scores,
     # which needs a nonnegative scale.
     assert sm_scale >= 0, f"Gluon MHA requires sm_scale >= 0 (got {sm_scale})"
 
-    if int(window_size[1]) != -1:
-        raise ValueError("window_size_right is not supported yet in the Gluon Backend")
-    sliding_window = _get_sliding_window_size(window_size)
+    right = int(window_size[1])
+    if right == 0:
+        causal = True
+    elif right != -1 and not (causal and right > 0):
+        raise ValueError("Gluon MHA requires right=-1, right=0, or causal attention")
+    sliding_window = max(int(window_size[0]), -1)
+    seqlen_k_max = int(max_seqlen_k) if varlen else k.shape[1]
+    if sliding_window >= seqlen_k_max - 1:
+        # This bound includes every key, even for the last query row.
+        sliding_window = -1
 
     IS_FP8 = types._is_fp8(q)
     FP8_MAX = torch.finfo(q.dtype).max if IS_FP8 else 0.0
@@ -323,11 +351,12 @@ def _gluon_flash_attn_forward(
     if config is None:
         config = _get_gluon_config(
             is_fp8=IS_FP8,
+            is_fp32=q.dtype == torch.float32,
             has_pe=pe_head_dim > 0,
             causal=causal,
             v_head_dim=v_head_dim,
             sliding_window=sliding_window,
-            seqlen_k=int(max_seqlen_k) if varlen else k.shape[1],
+            seqlen_k=seqlen_k_max,
         )
     config = dict(config)
     BLOCK_M = config.pop("BLOCK_M")
@@ -359,7 +388,10 @@ def _gluon_flash_attn_forward(
     # Pad to a vectorizable head dim
     head_size_og = v_head_dim
     if head_size_og % 8 != 0:
-        pad = 8 - head_size_og % 8
+        # FP8 needs 16 elements for 128-bit async copies. Keep already aligned
+        # heads unchanged: adding pad kernels to them costs more than it saves.
+        pad_multiple = 16 if IS_FP8 else 8
+        pad = (-head_size_og) % pad_multiple
         warnings.warn(
             f"Gluon MHA is padding q/k/v from head_dim {head_size_og} to "
             f"{head_size_og + pad} so the head-axis accesses vectorize. This costs "
@@ -392,12 +424,12 @@ def _gluon_flash_attn_forward(
     # not want LSE so the kernel can drop the epilogue store.
     if return_lse:
         if varlen:
-            softmax_lse = torch.zeros(
+            softmax_lse = torch.empty(
                 (q.shape[0], num_q_heads), device=q.device, dtype=torch.float32
             )
             lse_strides = (0, softmax_lse.stride(1), softmax_lse.stride(0))
         else:
-            softmax_lse = torch.zeros(
+            softmax_lse = torch.empty(
                 (batch, num_q_heads, seqlen_q), device=q.device, dtype=torch.float32
             )
             lse_strides = softmax_lse.stride()
@@ -436,64 +468,51 @@ def _gluon_flash_attn_forward(
         0 if pe_head_dim == 0 else max(triton.next_power_of_2(pe_head_dim), 16)
     )
     assert (pe_head_dim == 0 and BLOCK_DMODEL_PE_POW2 == 0) or (
-        v_head_dim == BLOCK_DMODEL_POW2 and pe_head_dim == BLOCK_DMODEL_PE_POW2
+        head_size_og == BLOCK_DMODEL_POW2 and pe_head_dim == BLOCK_DMODEL_PE_POW2
     ), "Positional encoding support requires NOPE and PE head sizes to be unpadded powers of 2."
+    # fp8's 32x32x64 MFMA contracts 64 at a time.
     assert (not IS_FP8) or (
-        IS_FP8 and pe_head_dim == 0
-    ), "Positional encoding doesn't support FP8."
-    # FP8 uses 32x32x64 (K=64) scaled MFMA, so the PE head size must be a multiple of 64.
-    # TODO: Enable this assert if the assert above is ever lifted.
-    # assert (not IS_FP8) or (
-    #     pe_head_dim % 64 == 0
-    # ), "FP8 positional encoding requires the PE head size to be a multiple of 64."
+        pe_head_dim % 64 == 0
+    ), "FP8 positional encoding requires the PE head size to be a multiple of 64."
 
-    # K and V only ever reach LDS by global->LDS async copy, whose lanes each move one
-    # 128- or 32-bit chunk that has to be aligned to its own size.  kv_stride_align is
-    # the largest power of two, in elements, dividing every K/V stride that reaches a
-    # chunk's address -- batch, head and sequence alike, since all three are summed
-    # into it -- or 0 when the last axis is not contiguous, which the copy's
-    # addressing cannot express at all.  The base pointers have to be 16-byte
-    # aligned too: Triton only proves pointer alignment at that granularity.  A K/V
-    # pair the copy cannot take (an odd-strided, permuted or misaligned view) is
-    # copied into fresh contiguous buffers here, once, rather than giving the kernel
-    # a second, register-staged load path; a fresh contiguous tensor always
-    # qualifies, because the head dim is already padded to a multiple of 8 above.
-    def _kv_stride_align(k_strides, v_strides):
-        if k_strides[3] != 1 or v_strides[3] != 1:
+    # K/V reach LDS only by async copy: contiguous last axis, 16-byte-aligned base,
+    # strides aligned to the copy's vector.  A K or V that fails is copied to a
+    # contiguous buffer, which always qualifies (the head dim is padded to 8 above).
+    def _stride_align(t, strides):
+        if strides[3] != 1 or t.data_ptr() % 16 != 0:
             return 0
-        return math.gcd(16, *k_strides[:3], *v_strides[:3])
+        return math.gcd(16, *strides[:3])
 
-    def _kv_copy_ok(align):
-        return (
-            k.data_ptr() % 16 == 0
-            and v.data_ptr() % 16 == 0
-            and _gluon_kv_async_copy_ok(
-                BLOCK_DMODEL_POW2,
-                BLOCK_DMODEL_PE_POW2,
-                BLOCK_N,
-                config["num_warps"],
-                k.element_size() * 8,
-                align,
-            )
-        )
-
-    kv_stride_align = _kv_stride_align(k_strides, v_strides)
-    if not _kv_copy_ok(kv_stride_align):
+    def _contiguous(t):
         # clone, not .contiguous(): a contiguous view at a misaligned offset has to
         # move too, and .contiguous() would hand it back unchanged.
-        k = k.clone(memory_format=torch.contiguous_format)
-        v = v.clone(memory_format=torch.contiguous_format)
+        t = t.clone(memory_format=torch.contiguous_format)
         if varlen:
-            k_strides = (0, k.stride(1), k.stride(0), k.stride(2))
-            v_strides = (0, v.stride(1), v.stride(0), v.stride(2))
-        else:
-            k_strides = (k.stride(0), k.stride(2), k.stride(1), k.stride(3))
-            v_strides = (v.stride(0), v.stride(2), v.stride(1), v.stride(3))
-        kv_stride_align = _kv_stride_align(k_strides, v_strides)
-        assert _kv_copy_ok(kv_stride_align), (
-            f"Gluon MHA cannot async-copy K/V for head_dim={v_head_dim}, "
-            f"BLOCK_N={BLOCK_N}, num_warps={config['num_warps']}"
-        )
+            return t, (0, t.stride(1), t.stride(0), t.stride(2))
+        return t, (t.stride(0), t.stride(2), t.stride(1), t.stride(3))
+
+    kv_async_args = (
+        BLOCK_DMODEL_POW2,
+        BLOCK_DMODEL_PE_POW2,
+        BLOCK_N,
+        config["num_warps"],
+        k.element_size() * 8,
+    )
+    # Checked per tensor, so only the one that fails is copied.  The copy predicate
+    # only gets easier as the alignment grows, so two passing tensors pass together.
+    k_align = _stride_align(k, k_strides)
+    if not is_gluon_async_copy_ok(*kv_async_args, k_align):
+        k, k_strides = _contiguous(k)
+        k_align = _stride_align(k, k_strides)
+    v_align = _stride_align(v, v_strides)
+    if not is_gluon_async_copy_ok(*kv_async_args, v_align):
+        v, v_strides = _contiguous(v)
+        v_align = _stride_align(v, v_strides)
+    kv_stride_align = min(k_align, v_align)
+    assert is_gluon_async_copy_ok(*kv_async_args, kv_stride_align), (
+        f"Gluon MHA cannot async-copy K/V for head_dim={v_head_dim}, "
+        f"BLOCK_N={BLOCK_N}, num_warps={config['num_warps']}"
+    )
 
     # Largest power of two, capped at the 128-bit load width, that divides every
     # head-axis stride. gcd against a power of two can only return a power of two,
@@ -502,6 +521,19 @@ def _gluon_flash_attn_forward(
 
     grid = (batch * num_q_heads * triton.cdiv(seqlen_q, BLOCK_M), 1)
 
+    # Eager FP8 keeps runtime lengths and scale to avoid register spills.
+    # Other modes specialize them to simplify the dense pipeline.
+    specialize = not IS_FP8 or bool(config.get("LAZY_RESCALE_THRESHOLD"))
+    # Causal lazy rescale with constant lengths spills on a Q/K head of 128+, so
+    # pass runtime lengths when the pipelined loop runs.  Windows and short K stay
+    # faster with constants.
+    specialize_seqlen = specialize and not (
+        causal
+        and sliding_window < 0
+        and qk_head_dim >= 128
+        and bool(config.get("LAZY_RESCALE_THRESHOLD"))
+        and seqlen_k_max >= _GLUON_MIN_PIPE_BLOCKS.value * BLOCK_N + BLOCK_M
+    )
     _gluon_attn_fwd[grid](
         q,
         k,
@@ -513,11 +545,11 @@ def _gluon_flash_attn_forward(
         descale_k,
         descale_v,
         sink,
-        sm_scale,
+        gl.constexpr(sm_scale) if specialize else sm_scale,
         cu_seqlens_q,
         cu_seqlens_k,
-        seqlen_q,
-        seqlen_k,
+        gl.constexpr(seqlen_q) if specialize_seqlen else seqlen_q,
+        gl.constexpr(seqlen_k) if specialize_seqlen else seqlen_k,
         *q_strides,
         *k_strides,
         *v_strides,
@@ -580,6 +612,7 @@ def _flash_attn_forward(
     descale_v: torch.Tensor | None = None,
     sink: torch.Tensor | None = None,
     config: dict[str, any] | None = None,
+    out_dtype: torch.dtype | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, int, int]:
 
     if bias is not None:
@@ -597,12 +630,13 @@ def _flash_attn_forward(
     FP8_MAX: tl.constexpr = torch.finfo(q.dtype).max
     is_varlen = cu_seqlens_q is not None
 
-    if IS_FP8:
-        o = torch.zeros(
-            (q.shape[:-1] + v.shape[-1:]), dtype=torch.float32, device=q.device
+    if out_dtype is None:
+        out_dtype = torch.float32 if IS_FP8 else q.dtype
+    if out_dtype not in (torch.float32, torch.bfloat16, torch.float16):
+        raise ValueError(
+            f"out_dtype must be float32, bfloat16 or float16, got {out_dtype}"
         )
-    else:
-        o = torch.zeros((q.shape[:-1] + v.shape[-1:]), dtype=q.dtype, device=q.device)
+    o = torch.zeros((q.shape[:-1] + v.shape[-1:]), dtype=out_dtype, device=q.device)
     if is_varlen:
         # Layout is thd.
         # q and k are [total_tokens, num_head, head_dim_qk].
@@ -699,6 +733,9 @@ def _flash_attn_forward(
         assert (
             not IS_FP8
         ), "dao_ai impl does not support FP8. Use the default impl or FA3 path."
+        assert (
+            out_dtype == q.dtype
+        ), f"Output and input must have the same dtype in dao_ai impl, got out_dtype={out_dtype} and q.dtype={q.dtype}."
         if is_varlen:
             o, softmax_lse, s_dmask, _ = flash_attn_2.varlen_fwd(
                 q,
@@ -1064,6 +1101,15 @@ def flash_attn_func(
     v_descale=None,
     config: dict[str, any] | None = None,
     backend: Literal["triton", "gluon"] | None = "triton",
+    *,
+    q_mx_scale: torch.Tensor | None = None,
+    k_mx_scale: torch.Tensor | None = None,
+    v_mx_scale: torch.Tensor | None = None,
+    mx_p_scale: int = 127,
+    q_block_descale: torch.Tensor | None = None,
+    k_block_descale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
+    p_scale: float = 1.0,
 ):
     """dropout_p should be set to 0.0 during evaluation
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in KV with fewer heads
@@ -1118,6 +1164,28 @@ def flash_attn_func(
             with q_descale/k_descale/v_descale. Note that the Gluon backend fills
             in S_dmask even at dropout_p == 0, where the Triton backend leaves it
             zeroed.
+        q_mx_scale, k_mx_scale, v_mx_scale: keyword-only e8m0 scales for MXFP8
+            q/k/v. When all three are set, this call runs the gfx950 MXFP8 Triton
+            kernel and does not enter the default Triton or Gluon path. Each scale
+            is shaped (batch, seqlen/32, nheads, headdim/32). q/k/v stay in
+            (batch, seqlen, nheads, headdim) and are pre-quantized e4m3. The
+            output is bf16. This mode is forward-only and rejects dropout, bias,
+            sink, sliding window, and backend="gluon". Leaving these arguments
+            unset keeps the existing behavior.
+        mx_p_scale: keyword-only softmax-probability scale for the MXFP8 path.
+            Defaults to 127. It is only used when the MXFP8 scales are set.
+        q_block_descale, k_block_descale, v_scale: keyword-only. When all three
+            are set, this call runs the block-scale FP8 Triton kernel and does
+            not enter the default Triton or Gluon path. q_block_descale is
+            (batch, num_q_heads, cdiv(seqlen_q, 64)) and k_block_descale is
+            (batch, num_k_heads, cdiv(seqlen_k, 64)), one fp32 descale per 64
+            tokens. v_scale is a single fp32 tensor scale. q/k/v are
+            pre-quantized fp8 in the usual (batch, seqlen, nheads, headdim)
+            layout, and the output is bf16. This mode is forward-only and rejects
+            dropout, bias, alibi, sink, sliding window, return_attn_probs, and
+            backend="gluon". Leaving these arguments unset keeps the existing behavior.
+        p_scale: keyword-only softmax-probability scale for the block-scale
+            path. Defaults to 1.0. It is only used when the block scales are set.
     Return:
         out: (batch_size, seqlen, nheads, headdim).
         softmax_lse [optional, if return_lse=True]: (batch_size, nheads, seqlen). The
@@ -1127,6 +1195,93 @@ def flash_attn_func(
             The output of softmax (possibly with different scaling). It also encodes the dropout
             pattern (negative means that location was dropped, nonnegative means it was kept).
     """
+    if (
+        q_mx_scale is not None
+        or k_mx_scale is not None
+        or v_mx_scale is not None
+        or mx_p_scale != 127
+    ):
+        if _resolve_backend(backend) == "gluon":
+            raise ValueError("MXFP8 attention is supported on the triton backend only.")
+        if q_mx_scale is None or k_mx_scale is None or v_mx_scale is None:
+            raise ValueError(
+                "MXFP8 attention requires q_mx_scale, k_mx_scale, and v_mx_scale."
+            )
+        if any(
+            tensor is not None and getattr(tensor, "requires_grad", False)
+            for tensor in (q, k, v, q_mx_scale, k_mx_scale, v_mx_scale)
+        ):
+            raise RuntimeError(
+                "MXFP8 attention on flash_attn_func is forward-only. "
+                "dq/dk/dv cannot be attached to fp8 q/k/v."
+            )
+        if dropout_p:
+            raise ValueError("MXFP8 attention does not support dropout.")
+        if bias is not None:
+            raise ValueError("MXFP8 attention does not support bias.")
+        if sink is not None:
+            raise ValueError("MXFP8 attention does not support sink.")
+        if int(window_size[0]) != -1 or int(window_size[1]) != -1:
+            raise ValueError("MXFP8 attention does not support sliding window.")
+        from aiter.ops.triton.attention.mxfp8_attention import (
+            mxfp8_attention_forward,
+        )
+
+        out, softmax_lse, exp_scores = mxfp8_attention_forward(
+            q,
+            k,
+            v,
+            q_scale=q_mx_scale,
+            k_scale=k_mx_scale,
+            v_scale=v_mx_scale,
+            p_scale=mx_p_scale,
+            sm_scale=_get_softmax_scale(q, softmax_scale),
+            alibi_slopes=alibi_slopes,
+            causal=causal,
+            return_softmax=return_attn_probs,
+            layout="bshd",
+        )
+        return _pack_attn_returns(
+            out.detach(),
+            softmax_lse,
+            exp_scores,
+            return_lse,
+            return_attn_probs,
+        )
+
+    if (
+        q_block_descale is not None
+        or k_block_descale is not None
+        or v_scale is not None
+        or p_scale != 1.0
+    ):
+        if _resolve_backend(backend) == "gluon":
+            raise ValueError(
+                "Block-scale FP8 attention is supported on the triton backend only."
+            )
+        from aiter.ops.triton.attention.block_scale_fp8_attention import (
+            block_scale_fp8_attention,
+        )
+
+        return block_scale_fp8_attention(
+            q,
+            k,
+            v,
+            q_block_descale,
+            k_block_descale,
+            v_scale,
+            dropout_p=dropout_p,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            bias=bias,
+            alibi_slopes=alibi_slopes,
+            return_lse=return_lse,
+            return_attn_probs=return_attn_probs,
+            sink=sink,
+            p_scale=p_scale,
+        )
+
     backend = _resolve_backend(backend)
     _LOGGER.info(
         "FLASH_ATTN [%s]:  q=%s  k=%s  v=%s",
