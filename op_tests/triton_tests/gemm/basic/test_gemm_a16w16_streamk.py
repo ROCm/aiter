@@ -339,3 +339,22 @@ def test_layout_builders(per_cta, ctas, expect_a_interval, expect_b_interval):
     # with_identity_for needs the cluster-wide shape, not the per-CTA tile.
     assert shared_a.shape == [BM * ctas[0], BK]
     assert shared_b.shape == [BK, BN * ctas[1]]
+
+
+@pytest.mark.parametrize("num_warps", [1, 2, 4, 8])
+@pytest.mark.parametrize("BM", [16, 32, 64, 128, 256])
+@pytest.mark.parametrize("BN", [16, 32, 64, 128, 256])
+def test_plan_warps_always_uses_every_warp(BM: int, BN: int, num_warps: int):
+    """plan_warps must spread exactly num_warps warps over the tile.
+
+    A layout that carries fewer warps than the launch is rejected by the
+    compiler ("Layout has 2 warps per CTA, but the context requires 4"). That
+    made the 16x16, 16x32 and 32x16 per-CTA tiles fail to build at 4 warps,
+    because both dimensions held one WMMA sub-tile and the surplus warps were
+    dropped instead of replicated.
+    """
+    from aiter.ops.triton._gluon_kernels.gfx1250.layouts import plan_warps
+
+    wpc_m, wpc_n = plan_warps(BM, BN, num_warps)
+    assert wpc_m * wpc_n == num_warps
+    assert wpc_m >= 1 and wpc_n >= 1
