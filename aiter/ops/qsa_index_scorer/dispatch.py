@@ -81,13 +81,20 @@ class Decision:
 
 
 class _Entry:
-    __slots__ = ("decision", "first", "fused", "run")
+    __slots__ = ("decision", "first", "fused", "run", "timed")
 
     def __init__(self, decision: Decision, run: Callable, fused=None):
         self.decision = decision
         self.run = run
         self.fused = fused  # api.Decision of a fused class
         self.first = fused is not None
+        self.timed = True  # first launch of the class not yet timed (any path)
+
+
+#: a class's first launch slower than this on the host (JIT compile / load) is logged
+SLOW_FIRST_MS = float(os.environ.get("AITER_QSA_SLOW_FIRST_MS", "20") or 20)
+#: host-side first-launch accounting (``status()["first_launch"]``)
+_FIRST = {"classes": 0, "slow": 0, "slow_ms_total": 0.0, "worst": []}
 
 
 # ---------------------------------------------------------------------------
@@ -435,9 +442,43 @@ def call(existing, existing_route, *args):
     ``logits``, ``visible_groups`` (positional). First call of a class decides on the
     host; later calls are a dict lookup plus the implementation's launch."""
     e = _entry(existing, existing_route, args)
-    if e.first:
-        return _first_fused(e, existing, existing_route, args)
+    if e.timed:
+        return _timed_first(e, existing, existing_route, args)
     return e.run(*args)
+
+
+def _timed_first(e: _Entry, existing, existing_route, args):
+    """First launch of a class on any path: host time (a JIT compile or code-object load
+    happens here, synchronously); slow ones are logged with the class shape so a serving
+    run shows which classes still compile after prewarm / AOT."""
+    import time
+
+    e.timed = False
+    t0 = time.perf_counter()
+    out = _first_fused(e, existing, existing_route, args) if e.first else e.run(*args)
+    ms = (time.perf_counter() - t0) * 1e3
+    _FIRST["classes"] += 1
+    if ms >= SLOW_FIRST_MS:
+        q, cache, pt = args[0], args[1], args[2]
+        shape = (
+            f"rows={q.shape[0]} requests={pt.shape[0]} width={pt.shape[1]} "
+            f"page={cache.shape[1]} cache={str(cache.dtype).replace('torch.', '')}"
+        )
+        _FIRST["slow"] += 1
+        _FIRST["slow_ms_total"] += ms
+        worst = _FIRST["worst"]
+        worst.append((round(ms, 1), e.decision.path, e.decision.vid, shape))
+        worst.sort(reverse=True)
+        del worst[8:]
+        logger.warning(
+            "[aiter] qsa_paged_mqa_logits: first launch of a %s class took %.1f ms on "
+            "the host (JIT compile/load not covered by prewarm/AOT): vid=%s %s",
+            e.decision.path,
+            ms,
+            e.decision.vid,
+            shape,
+        )
+    return out
 
 
 def _first_fused(e: _Entry, existing, existing_route, args):
@@ -538,6 +579,7 @@ def status() -> dict[str, Any]:
         "env": {PROFILE_ENV: _ENV[0], FUSED_ENV: _ENV[1]},
         "profile_error": _PROFILE_ERROR,
         "classes": len(_CLASSES),
+        "first_launch": {**_FIRST, "worst": list(_FIRST["worst"])},
         "paths": paths,
         "kernel_sha256": None,
         "profile_kernel_sha256": None,
