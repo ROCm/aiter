@@ -4100,8 +4100,8 @@ def _check_deterministic_supported(
                 ),
             ),
             (
-                # Stage 1 splits the hidden dimension into two K waves of 256-wide
-                # tiles.
+                # Only multiples of 512 have been validated with the deterministic
+                # kernels.
                 model_dim % 512 != 0,
                 f"hidden size {model_dim} (a multiple of 512 only)",
             ),
@@ -4157,10 +4157,11 @@ def _deterministic_metadata(
     The tuned MXFP4 configurations change the stage-1 K waves, the fused fp4
     output and the stage-2 kernel family (v1 / v2 layout, tile_k 128 / 256) with
     the token count, and each changes how a row's sums are split. Deterministic
-    mode always runs stage 1 with two K waves and tile_k 256, and stage 2 with
-    the non-atomic reduce epilogue instead of atomic adds of the top-k partials,
-    without split-K, skipping dropped routes in the reduction. Only the tile height grows with the token count, which does
-    not change a row's reduction.
+    mode always runs stage 1 with a single K wave (k_wave 1; the _w2 in the
+    kernel name is waves_per_eu 2) and tile_k 256, and stage 2 with the
+    non-atomic reduce epilogue instead of atomic adds of the top-k partials,
+    without split-K, skipping dropped routes in the reduction. Only the tile
+    height grows with the token count, which does not change a row's reduction.
     """
     from aiter.ops.flydsl.moe_kernels import get_flydsl_kernel_params
 
