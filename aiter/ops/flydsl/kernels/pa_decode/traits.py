@@ -378,6 +378,18 @@ class PaDecodeSchedule:
                 TUNED_PER_TOKEN and QUERIES_PER_CTA == 1 and 8 <= query_group_size <= 16
             )
             or (TUNED_SCALAR and block_size == 128 and TOTAL_ROWS <= MFMA_MNK)
+            # gfx942: issuing a single M-tile's V loads at the tile start hides
+            # them behind QK and softmax (FP8 to D256, BF16 page16 D128).
+            or (
+                "gfx94" in arch
+                and M_TILES == 1
+                and (
+                    (kv_dtype in FP8_KV_DTYPES and head_dim <= 256)
+                    or (
+                        kv_dtype == fx.BFloat16 and block_size == 16 and head_dim <= 128
+                    )
+                )
+            )
         )
         # Keep the tuned page/scale layout selection separate from V prefetch.
         PER_TOKEN_M1 = (
