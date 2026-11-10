@@ -584,7 +584,9 @@ def test_pa_prefill_sparse_gfx950_single_pass(T, H, with_sink):
     torch.manual_seed(0)
     q = torch.randn(T, H, D, dtype=torch.bfloat16, device=dev)
     kv = torch.randn(num_kv, D, dtype=torch.bfloat16, device=dev)
-    sink = torch.randn(H, dtype=torch.float32, device=dev) if with_sink else None
+    # Sinks near the rows' log-denominators, so that a sink added once per key
+    # split moves the output past the tolerance.
+    sink = torch.randn(H, dtype=torch.float32, device=dev) + 5 if with_sink else None
     _, indptr, indices = _ragged_rows(T, max_len, num_kv, dev)
     scale = D**-0.5
 
