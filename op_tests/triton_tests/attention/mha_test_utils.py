@@ -1,8 +1,17 @@
+from types import SimpleNamespace
+
 import pytest
 import torch
 
 from aiter.ops.triton.attention.mha import gluon_forward_unsupported_reason
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
+from aiter.test_mha_common import (
+    attention_ref,
+    generate_qkv,
+    generate_random_padding_mask,
+    quantize_fp8_per_bh,
+)
 
 
 def skip_if_gluon_unsupported(backend: str, **feature_flags):
@@ -70,3 +79,78 @@ def pad_rearrange_dropout_mask(
             ]
 
     return padded_dropout_mask
+
+
+def make_varlen_fp8_inputs(
+    batch: int,
+    seqlen_q: int,
+    seqlen_k: int,
+    num_q_heads: int,
+    num_k_heads: int,
+    head_sz: int,
+    dtype=torch.bfloat16,
+):
+    """Random padded varlen q/k/v, plus their per-(batch, head) fp8 quantization."""
+    torch.manual_seed(20)
+    torch.cuda.empty_cache()
+    q = torch.randn((batch, seqlen_q, num_q_heads, head_sz), device="cuda", dtype=dtype)
+    k = torch.randn((batch, seqlen_k, num_k_heads, head_sz), device="cuda", dtype=dtype)
+    v = torch.randn((batch, seqlen_k, num_k_heads, head_sz), device="cuda", dtype=dtype)
+    query_padding_mask = generate_random_padding_mask(
+        seqlen_q, batch, "cuda", mode="random"
+    )
+    key_padding_mask = generate_random_padding_mask(
+        seqlen_k, batch, "cuda", mode="random"
+    )
+    (
+        q_unpad,
+        k_unpad,
+        v_unpad,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        q,
+        k,
+        v,
+        output_pad_fn,
+        _,
+        _,
+    ) = generate_qkv(q, k, v, query_padding_mask, key_padding_mask, kvpacked=False)
+
+    # generate_qkv returns grad-tracking tensors; detach so the quantization below
+    # doesn't build an autograd graph for this forward-only kernel.
+    fp8_dtype = get_fp8_e4m3_dtype()
+    q_fp8, q_descale = quantize_fp8_per_bh(q_unpad.detach(), fp8_dtype, cu_seqlens_q)
+    k_fp8, k_descale = quantize_fp8_per_bh(k_unpad.detach(), fp8_dtype, cu_seqlens_k)
+    v_fp8, v_descale = quantize_fp8_per_bh(v_unpad.detach(), fp8_dtype, cu_seqlens_k)
+    return SimpleNamespace(
+        q=q,
+        k=k,
+        v=v,
+        query_padding_mask=query_padding_mask,
+        key_padding_mask=key_padding_mask,
+        q_fp8=q_fp8,
+        k_fp8=k_fp8,
+        v_fp8=v_fp8,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        output_pad_fn=output_pad_fn,
+    )
+
+
+def varlen_fp8_reference(inputs, causal: bool):
+    out, _, _ = attention_ref(
+        inputs.q,
+        inputs.k,
+        inputs.v,
+        query_padding_mask=inputs.query_padding_mask,
+        key_padding_mask=inputs.key_padding_mask,
+        causal=causal,
+    )
+    return out
