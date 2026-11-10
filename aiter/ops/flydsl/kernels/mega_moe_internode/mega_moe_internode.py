@@ -230,10 +230,36 @@ class _CcoRuntime:
     owns_communicator: bool
 
 
+def _close_cco_resources(
+    *, memory=None, window=None, dev_comm=None, context=None, device=None
+) -> None:
+    """Attempt every release in dependency order and propagate the first error."""
+    if context is not None:
+        # MORI owns and tracks these resources; its context closes all of them.
+        callbacks = [lambda: context.__exit__(None, None, None)]
+    else:
+        callbacks = [r.close for r in (dev_comm, window, memory) if r is not None]
+    if device is not None:
+        callbacks.insert(0, lambda: torch.cuda.synchronize(device))
+    error = None
+    for callback in callbacks:
+        try:
+            callback()
+        except Exception as exc:
+            logger.exception("MegaMoEInternode resource cleanup failed")
+            if error is None:
+                error = exc
+    if error is not None:
+        raise error
+
+
 class MegaMoEInternode:
     """Fused dispatch, GEMM1, GEMM2 and combine over two nodes (EP16).
 
     One in-flight forward per instance, on one stream, as with MegaMoEV2.
+    The instance must outlive any CUDA graphs that capture its forwards.
+    Captured weights are retained until :meth:`close`. Callers keep input and
+    routing tensors alive while asynchronous execution or a captured graph uses them.
     ``rank`` is the global EP rank; tensors are allocated on the current CUDA
     device.  ``torch.distributed`` must be initialized (it carries the CCO
     unique id when no ``communicator`` is given).
@@ -327,6 +353,7 @@ class MegaMoEInternode:
         self.comm_quant = str(comm_quant)
         self.max_routes_per_token_per_rank = int(route_cap)
         self.device = torch.device("cuda", torch.cuda.current_device())
+        self._graph_weights: dict[int, torch.Tensor] = {}
         device_cus = torch.cuda.get_device_properties(self.device).multi_processor_count
         self._device_cus = device_cus
         # The software grid barriers of the persistent kernels need every CTA
@@ -430,7 +457,10 @@ class MegaMoEInternode:
             torch.cuda.synchronize(self.device)
             self._runtime.communicator.barrier()
         except Exception:
-            self.close()
+            try:
+                self.close()
+            except Exception:
+                logger.exception("MegaMoEInternode cleanup failed after initialization error")
             raise
     # construction
 
@@ -477,15 +507,19 @@ class MegaMoEInternode:
         """Point the next forwards at another layer's weights (same layouts as
         the constructor).  One instance serves every shape-identical MoE layer;
         the kernels read the weight addresses as runtime arguments, so a CUDA
-        graph captured after this call keeps that layer's addresses."""
+        graph captured after this call keeps that layer's addresses. Captured
+        weights, including internal contiguous copies, stay alive until close.
+        Callers must order weight preparation before the forward's stream."""
+        if self._closed:
+            raise RuntimeError("MegaMoEInternode is closed")
         for name, tensor in (("w1", w1), ("w1_scale", w1_scale), ("w2", w2), ("w2_scale", w2_scale)):
             if tensor.device != self.device:
                 raise ValueError(f"{name} is on {tensor.device}, expected {self.device}")
         self._check_weight_bytes(w1, w1_scale, w2, w2_scale)
-        self._w1 = _as_bytes(w1)
-        self._w1_scale = _as_bytes(w1_scale)
-        self._w2 = _as_bytes(w2)
-        self._w2_scale = _as_bytes(w2_scale)
+        # Prepare every view/copy before replacing the old binding. A failed
+        # conversion must not leave Stage1 and Stage2 on different weights.
+        weights = tuple(_as_bytes(t) for t in (w1, w1_scale, w2, w2_scale))
+        self._w1, self._w1_scale, self._w2, self._w2_scale = weights
         self._k1_ptrs["arg_bq"] = self._w2.data_ptr()
         self._k1_ptrs["arg_bscale"] = self._w2_scale.data_ptr()
 
@@ -545,6 +579,7 @@ class MegaMoEInternode:
     def _build_cco_runtime(self, communicator, *, context) -> _CcoRuntime:
         from mori.cco import GDA_CONNECTION_RAIL, CCODevCommRequirements
 
+        memory = window = dev_comm = None
         try:
             memory = communicator.alloc_mem(self.layout.total_bytes)
             # Only the RDMA prefix is registered with the NIC; node-local LSA
@@ -581,8 +616,11 @@ class MegaMoEInternode:
             return _CcoRuntime(context, communicator, memory, window, dev_comm,
                                owns_communicator=context is not None)
         except Exception:
-            if context is not None:
-                context.__exit__(None, None, None)
+            try:
+                _close_cco_resources(
+                    memory=memory, window=window, dev_comm=dev_comm, context=context)
+            except Exception:
+                logger.exception("MegaMoEInternode CCO cleanup failed after initialization error")
             raise
 
     def _init_input_records(self) -> None:
@@ -915,7 +953,21 @@ class MegaMoEInternode:
             return fx.Stream(stream)
         return stream
 
+    def _record_weight_usage(self, stream) -> None:
+        """Keep raw-pointer weights valid for eager launches and captured graphs."""
+        stream = getattr(stream, "value", stream)
+        if not isinstance(stream, torch.cuda.Stream):
+            stream = torch.cuda.ExternalStream(0 if stream is None else stream, device=self.device)
+        weights = (self._w1, self._w1_scale, self._w2, self._w2_scale)
+        with torch.cuda.stream(stream):
+            if torch.cuda.is_current_stream_capturing():
+                self._graph_weights.update((w.data_ptr(), w) for w in weights)
+            else:
+                for weight in weights:
+                    weight.record_stream(stream)
+
     def _run(self, wts, topk_ids, stream, slice_output):
+        self._record_weight_usage(stream)
         runtime = self._runtime
         window = runtime.window
         s1_args = (
@@ -962,17 +1014,26 @@ class MegaMoEInternode:
             return
         self._closed = True
         runtime, self._runtime = self._runtime, None
-        if runtime is None:
-            return
-        torch.cuda.synchronize(self.device)
-        if runtime.owns_communicator:
-            # Leaving the context releases window, memory and dev_comm too.
-            runtime.context.__exit__(None, None, None)
-        else:
-            # The caller's Communicator outlives us: release only our own objects.
-            runtime.dev_comm.close()
-            runtime.window.close()
-            runtime.memory.close()
+        try:
+            if runtime is not None:
+                _close_cco_resources(
+                    memory=runtime.memory, window=runtime.window, dev_comm=runtime.dev_comm,
+                    context=runtime.context if runtime.owns_communicator else None,
+                    device=self.device)
+        finally:
+            self._graph_weights.clear()
+            # Drop private CUDA allocations and borrowed window views too.
+            # A caller-held output view still owns its ordinary torch storage.
+            for name in (
+                "_w1", "_w1_scale", "_w2", "_w2_scale", "_output",
+                "_rec_q", "_rec_scale", "_rec_ids", "_rec_weights",
+                "_k1_trb", "_k1_arrival_count", "_k1_peer_table", "_k2_scratch",
+                "_sd_send", "_sd_tile_base", "_sd_plan", "_sd_cdone",
+                "_tr_mcnt", "_tr_sdprog",
+            ):
+                self.__dict__.pop(name, None)
+            for name in ("_compiled", "_launchers", "_k1_ptrs"):
+                getattr(self, name, {}).clear()
 
     def __enter__(self) -> Self:
         return self
