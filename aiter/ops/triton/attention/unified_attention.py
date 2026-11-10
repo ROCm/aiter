@@ -1,5 +1,6 @@
 # The kernels in this file are adapted from vLLM:
 # https://github.com/vllm-project/vllm/blob/main/vllm/attention/ops/triton_unified_attention.py
+import os
 from typing import NamedTuple
 
 import torch
@@ -192,23 +193,96 @@ def _gfx950_split_params(params: _UAParams):
         block_m = max(block_m, triton.next_power_of_2(q_rows))
     block_q = block_m // params.num_queries_per_kv
     num_q_blocks = params.num_tokens // block_q + params.num_seqs
+    if params.max_seqlen_q <= block_q:
+        # the launch shrinks to one query block per sequence (ONE_Q_BLOCK)
+        num_q_blocks = params.num_seqs
     return params._replace(num_2d_prgms=num_q_blocks * params.num_kv_heads)
 
 
-_SW_SPLIT_MAX_Q = 16
+def _gfx950_short_query(params: _UAParams):
+    """Short bf16 queries that the split grid launches as one block per sequence.
+
+    The split grid sizes BLOCK_M to the query group, so each sequence is one
+    query block with no masked rows, where the 2d grid's BLOCK_M 128 leaves
+    half of them empty. Measured for head size 64 only, and only while the
+    batch does not oversubscribe the GPU: from SHORT_MAX_PROGRAMS_PER_CU
+    programs per CU (kv_tile) the launch is memory bound, and the split grid's
+    smaller BLOCK_M has fewer warps per program to hide it (gpt-oss, q=8, 512
+    sequences: 11 % slower than the 2d grid).
+    """
+    if not (
+        not params.all_decode
+        and params.q_dtype == torch.bfloat16
+        and params.head_size <= 64
+        and params.max_seqlen_q * params.num_queries_per_kv <= 128
+    ):
+        return False
+    policy = get_unified_attention_config("kv_tile", params, backend="gluon")
+    programs = params.num_seqs * params.num_kv_heads
+    return programs < policy["SHORT_MAX_PROGRAMS_PER_CU"] * params.num_sms
+
+
+def _gfx950_tile_size(params: _UAParams, tile: int):
+    """Widen the KV tile to 128 for full attention when each program walks a
+    long KV run and the grid leaves room on the CUs.
+
+    With 16-token pages both loaders gather per token for a 64-key tile, so a
+    program pays a fixed cost per tile; a 128-key tile halves the tile count.
+    That only pays off over a long run (>= 2048 keys per program, 1536 for
+    short queries on the split grid; shorter runs lose the deeper prologue)
+    and while the wider tile's doubled LDS does not cost co-residency: past
+    one program per CU for decode, and on the 2d grid past one program per CU
+    dense or two shuffled. Short queries on the split grid (see
+    _gfx950_short_query) widen at any program count they are used at. Sliding
+    windows keep the 64-key tile. Measured for bf16 and head size 64 only; at
+    head 256 the wider tile is slower.
+    """
+    if (
+        params.sliding_window > 0
+        or params.q_dtype != torch.bfloat16
+        or params.head_size > 64
+        or params.max_seqlen_q * params.num_queries_per_kv > 128
+    ):
+        return tile
+    # the thresholds and the wide tile size are tuned in configs/ (kv_tile)
+    policy = get_unified_attention_config("kv_tile", params, backend="gluon")
+    num_segments = get_unified_attention_config(
+        "kv_split", _gfx950_split_params(params), backend="gluon"
+    )["NUM_SEGMENTS"]
+    short = _gfx950_short_query(params)
+    min_keys = (
+        policy["TILE_WIDE_MIN_KEYS_SHORT"] if short else policy["TILE_WIDE_MIN_KEYS"]
+    )
+    if params.max_seqlen_k < min_keys * num_segments:
+        return tile
+    programs = params.num_seqs * params.num_kv_heads * num_segments
+    per_cu = policy["TILE_WIDE_PROGRAMS_PER_CU"]
+    if params.all_decode:
+        wide = programs <= per_cu * params.num_sms
+    elif short:
+        wide = True
+    elif params.shuffled_kv_cache:
+        wide = programs < policy["TILE_WIDE_SHUFFLED_PROGRAMS_PER_CU"] * params.num_sms
+    else:
+        wide = programs < per_cu * params.num_sms
+    return max(tile, policy["TILE_WIDE"]) if wide else tile
 
 
 def _gfx950_split_grid(params: _UAParams):
     """Decode, and batches too small to fill the GPU, take the split grid."""
     if params.all_decode:
         return True
-    # the split carves only the window, so a full table splits like a trimmed one
-    if params.sliding_window > 0 and not (
-        params.max_seqlen_q <= _SW_SPLIT_MAX_Q
-        and params.max_seqlen_q * params.num_queries_per_kv <= 128
+    if _gfx950_short_query(params):
+        # the split grid beats the 2d one (BLOCK_M 128) even unsplit
+        return True
+    if params.sliding_window > 0 and (
+        params.max_seqlen_q * params.num_queries_per_kv > 128
     ):
         return False
-    # unsplit, the 2d grid is faster
+    # A window reaching here is not a short bf16 query at head 64 (those return
+    # above): it is a head size above 64, or an fp8 query. It takes the split
+    # grid only when the split has more than one segment, and otherwise keeps
+    # the 2d grid.
     config = get_unified_attention_config(
         "kv_split", _gfx950_split_params(params), backend="gluon"
     )
@@ -538,6 +612,8 @@ def unified_attention(
         # and keeps its tuned tile.
         if shuffled_kv_cache and not use_gluon_3d:
             TILE_SIZE = block_size
+        elif use_gluon_3d and DEVICE_ARCH == "gfx950":
+            TILE_SIZE = _gfx950_tile_size(params, config["TILE_SIZE"])
         else:
             TILE_SIZE = CONFIG_TILE_SIZE
 
@@ -891,6 +967,7 @@ def _reduce_segments_triton(
         TILE_SIZE=TILE_SIZE,
         SLIDING_WINDOW=params.sliding_window,
         BLOCK_Q=None,
+        ALL_SEGMENTS=params.sliding_window > 0,
         **config,
         enable_fp_fusion=True,
     )
@@ -1232,11 +1309,27 @@ def _unified_attention_gfx950(
     BLOCK_Q = BLOCK_M // params.num_queries_per_kv
     assert BLOCK_Q >= 1
 
+    # every sequence fits one query block: launch exactly one per sequence.
+    # This trusts max_seqlen_q. An underestimate drops query rows (the
+    # previous grid covered them). AITER_UNIFIED_ATTN_CHECK_SEQLENS=1 asserts.
+    one_q_block = not params.all_decode and params.max_seqlen_q <= BLOCK_Q
+    if one_q_block and os.environ.get("AITER_UNIFIED_ATTN_CHECK_SEQLENS") == "1":
+        # Reading the lengths syncs the device, so the check stays opt-in.
+        starts = params.cu_seqlens_q[: params.num_seqs + 1]
+        longest = int((starts[1:] - starts[:-1]).max().item())
+        assert longest <= BLOCK_Q, (
+            f"max_seqlen_q={params.max_seqlen_q} fits one query block of "
+            f"{BLOCK_Q}, but a sequence has {longest} query tokens; those "
+            "rows would be dropped"
+        )
     if params.all_decode:
         total_query_blocks = params.num_seqs
         grid = (total_query_blocks, params.num_kv_heads)
     else:
-        total_query_blocks = params.num_tokens // BLOCK_Q + params.num_seqs
+        if one_q_block:
+            total_query_blocks = params.num_seqs
+        else:
+            total_query_blocks = params.num_tokens // BLOCK_Q + params.num_seqs
         grid = (params.num_kv_heads, total_query_blocks)
     if NUM_SEGMENTS > 1:
         grid = grid + (NUM_SEGMENTS,)
@@ -1303,6 +1396,7 @@ def _unified_attention_gfx950(
         USE_STORE_BUFFER_OP=USE_STORE_BUFFER_OP,
         num_warps=num_warps,
         ALL_DECODE=params.all_decode,
+        ONE_Q_BLOCK=one_q_block,
         CAUSAL=params.causal,
         # useful for debugging when needed
         REMOVE_INDIRECT_ACCESS=False,
@@ -1326,7 +1420,7 @@ def _unified_attention_2d_gfx950(params: _UAParams):
         params,
         config,
         BLOCK_M=BLOCK_M,
-        TILE_SIZE=config["TILE_SIZE"],
+        TILE_SIZE=_gfx950_tile_size(params, config["TILE_SIZE"]),
         num_warps=config["num_warps"],
     )
 
