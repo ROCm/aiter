@@ -891,7 +891,10 @@ _gluon_fp8_mqa_logits_kernel_repr = make_kernel_repr(
 )
 
 
-@gluon.jit(repr=_gluon_fp8_mqa_logits_kernel_repr)
+@gluon.jit(
+    repr=_gluon_fp8_mqa_logits_kernel_repr,
+    do_not_specialize=["seq_len", "seq_len_kv", "num_kv_splits"],
+)
 def _gluon_fp8_mqa_logits_kernel(
     Q_ptr,  # fp8e4m3 [seq_len, NUM_HEADS, HEAD_SIZE]
     KV_ptr,  # fp8e4m3 [seq_len_kv, HEAD_SIZE]
