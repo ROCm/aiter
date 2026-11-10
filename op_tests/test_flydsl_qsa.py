@@ -54,7 +54,7 @@ import torch.nn.functional as F
 
 import aiter
 from aiter import dtypes
-from aiter.jit.utils.chip_info import get_cu_num, get_gfx
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx, get_gfx_runtime
 from aiter.ops.flydsl import qsa_paged
 from aiter.ops.flydsl.kernels.kernels_common import get_warp_size
 from aiter.ops.flydsl.kernels.qsa.indexer_select import _K
@@ -69,6 +69,8 @@ from aiter.ops.flydsl.kernels.topk.topk_per_row_decode_persistent import (
 )
 from aiter.ops.flydsl.qsa_paged import (
     _expand_block_ids,
+    _union_prefill,
+    _union_prefill_reason,
     flydsl_qsa_paged_gqa,
     flydsl_qsa_paged_gqa_supported,
     qsa_indexer_block_ids,
@@ -561,6 +563,17 @@ _PREFILL_PREFIX_SHAPES = (
 )
 
 
+def _round_page_stride(page_stride: int, token_stride: int) -> int:
+    """Round up to a whole number of 4-token rows and of 8 elements.
+
+    8 elements is the gather alignment the indexer and paged GQA require.
+    Whole 4-token rows are what the sparse prefill slot-table pool requires,
+    and a serving pool's pages are whole token rows too.
+    """
+    align = math.lcm(8, 4 * token_stride)
+    return -(-page_stride // align) * align
+
+
 def _widen_cache(cache: torch.Tensor) -> torch.Tensor:
     """The same pages, with a page stride that puts the span just past 4 GiB.
 
@@ -569,8 +582,7 @@ def _widen_cache(cache: torch.Tensor) -> torch.Tensor:
     few pages and a stride that lands the last page just past 4 GiB selects
     the wide compile. A one-page cache gains an unreferenced trailing page,
     because a size of 1 ignores its stride. The parent holds the span and no
-    more. Page stride is a multiple of 8 elements, which is the gather
-    alignment the indexer and paged GQA already require.
+    more. The page stride is rounded by ``_round_page_stride``.
     """
     if cache.ndim != 4:
         raise ValueError(
@@ -588,9 +600,7 @@ def _widen_cache(cache: torch.Tensor) -> torch.Tensor:
     # span = (gaps * page_stride + page_elems) * elem, and it must exceed 4 GiB.
     min_elems = (_FOUR_GIB + elem) // elem
     page_stride = (min_elems - page_elems + gaps - 1) // gaps
-    page_stride = max(page_stride, page_elems)
-    if page_stride % 8:
-        page_stride += 8 - (page_stride % 8)
+    page_stride = _round_page_stride(max(page_stride, page_elems), token_stride)
     span_elems = gaps * page_stride + page_elems
     parent = cache.new_empty(span_elems)
     parent.zero_()
@@ -765,9 +775,7 @@ def _wide_rotation_views(view: torch.Tensor, copies: int) -> list[torch.Tensor]:
     page_stride = int(view.stride(0))
     pitch = page_elems if page_elems % 8 == 0 else page_elems + (8 - page_elems % 8)
     if copies * pitch > page_stride:
-        page_stride = copies * pitch
-        if page_stride % 8:
-            page_stride += 8 - page_stride % 8
+        page_stride = _round_page_stride(copies * pitch, token_stride)
     span_elems = (n_pages - 1) * page_stride + (copies - 1) * pitch + page_elems
     parent = view.new_empty(span_elems)
     packed = view.contiguous().reshape(n_pages, page_elems)
@@ -4318,6 +4326,95 @@ def test_prefill_step_query_lens_match_the_7556_row_count():
         )
 
 
+def test_paged_gqa_prefill_with_lengths_runs_union(monkeypatch):
+    """Host lengths send a gfx950 prefill at the row threshold to union.
+
+    Two requests with distinct prefixes split the threshold's rows unevenly,
+    on shuffled pages. The call with lengths must take the union path, the
+    call without must not, and both match the fp32 oracle from NaN outputs.
+    """
+    if not torch.cuda.is_available() or get_gfx_runtime() != "gfx950":
+        pytest.skip("union prefill dispatch is gfx950 only")
+    idx = FLASH_NEXT_INDEXER
+    gqa = _flash_next_gqa(*_PREFILL_STEP_HEADS)
+    device = torch.device("cuda")
+    rows = qsa_paged._UNION_PREFILL_MIN_ROWS
+    query_lens = (rows - 200, 200)
+    prefix_lens = (64, 2052)
+    torch.manual_seed(3)
+    queries, indices, refs, kv = [], [], [], []
+    for n, prefix in zip(query_lens, prefix_lens):
+        ctx = prefix + n
+        q_indexer = torch.randn(
+            n, idx.n_heads, idx.head_dim, dtype=dtypes.bf16, device=device
+        )
+        k_bar = torch.randn(
+            ctx // idx.compress_ratio, idx.head_dim, dtype=dtypes.bf16, device=device
+        )
+        q = torch.randn(n, gqa.n_heads, gqa.head_dim, dtype=dtypes.bf16, device=device)
+        k = torch.randn(
+            ctx, gqa.kv_heads, gqa.head_dim, dtype=dtypes.bf16, device=device
+        )
+        v = torch.randn(
+            ctx, gqa.kv_heads, gqa.head_dim, dtype=dtypes.bf16, device=device
+        )
+        ref = qsa_oracle(
+            q_indexer,
+            k_bar,
+            q,
+            k,
+            v,
+            _query_positions(n, ctx, device),
+            torch.full((1,), ctx, dtype=dtypes.i32, device=device),
+            torch.zeros(n, dtype=dtypes.i32, device=device),
+            idx,
+            gqa,
+            score_scale=FLASH_NEXT_SCORE_SCALE,
+            out_dtype=dtypes.fp32,
+        )
+        queries.append(q)
+        indices.append(ref.indices)
+        refs.append(ref.output)
+        kv.append((k, v))
+    q = torch.cat(queries)
+    index = torch.cat(indices).contiguous()
+    ref = torch.cat(refs)
+    token_to_req = torch.cat(
+        [
+            torch.full((n,), r, dtype=dtypes.i32, device=device)
+            for r, n in enumerate(query_lens)
+        ]
+    )
+    k_cache, v_cache, table = _pack_request_kv(kv, 16, device)
+    calls = []
+    union = qsa_paged._union_prefill
+    monkeypatch.setattr(
+        qsa_paged,
+        "_union_prefill",
+        lambda *args: calls.append(args) or union(*args),
+    )
+    for lengths, routed in (((query_lens, prefix_lens), 1), ((None, None), 0)):
+        calls.clear()
+        out = flydsl_qsa_paged_gqa(
+            q,
+            k_cache,
+            v_cache,
+            index,
+            table,
+            token_to_req,
+            torch.full_like(q, float("nan")),
+            query_lens=lengths[0],
+            prefix_lens=lengths[1],
+        )
+        if len(calls) != routed:
+            raise AssertionError(f"lengths {lengths} ran union {len(calls)} times")
+        err = checkAllclose(
+            ref, out.to(dtypes.fp32), rtol=1e-2, atol=1e-2, msg=f"lengths {lengths}"
+        )
+        if err != 0:
+            raise AssertionError(f"lengths {lengths}: err={err} vs the oracle")
+
+
 def _pack_request_kv(requests, page_size, device):
     """Pack per-request ``[S, Hk, D]`` K/V into one pool and a ``[n_req, P]`` table.
 
@@ -4463,29 +4560,58 @@ def bench_qsa_flash_next_paged_gqa_prefill_step(
     nbytes = (
         rows * gqa.n_heads * gqa.head_dim * 2 + 2 * w * gqa.kv_heads * gqa.head_dim
     ) * dtype.itemsize
-    gqa_args = (q_gqa, k_cache, v_cache, indices_cat, kv_table, token_to_req)
-    out, us = _time(flydsl_qsa_paged_gqa, *gqa_args, rotate=rotate)
-    err = checkAllclose(
-        ref,
-        out.to(dtypes.fp32),
-        rtol=1e-2,
-        atol=1e-2,
-        msg=(
-            "paged GQA prefill step vs oracle GQA "
-            f"(rows={rows}, requests={n_req}, prefix={prefix})"
-        ),
+    # A NaN out: rows a candidate leaves unwritten fail the comparison.
+    out_buf = torch.full_like(q_gqa, float("nan"))
+    gqa_args = (q_gqa, k_cache, v_cache, indices_cat, kv_table, token_to_req, out_buf)
+    prefix_lens = (prefix,) * n_req
+    scale = gqa.head_dim**-0.5
+
+    def _union(q, k_cache, v_cache, indices, kv_table, _token_to_req, out):
+        return _union_prefill(
+            q,
+            k_cache,
+            v_cache,
+            indices,
+            kv_table,
+            query_lens,
+            prefix_lens,
+            out,
+            scale,
+        )
+
+    # union ignores the dispatch row threshold, so every row count times it.
+    candidates = {"paged_gqa": flydsl_qsa_paged_gqa}
+    reason = _union_prefill_reason(
+        q_gqa, k_cache, indices_cat, kv_table, query_lens, prefix_lens
     )
-    return {
+    if reason is None:
+        candidates["union"] = _union
+    else:
+        aiter.logger.warning("prefill step skips union: %s", reason)
+    ret = {
         "gfx": get_gfx(),
         "query_lens": ",".join(str(n) for n in query_lens),
         "width": w_alloc,
         "valid%": 100.0 * w / w_alloc,
         "cache_span_gib": _span_gib(k_cache),
-        "paged_gqa us": us,
-        "paged_gqa TFLOPS": flops / us / 1e6,
-        "paged_gqa TB/s": nbytes / us / 1e6,
-        "paged_gqa err": err,
     }
+    for name, fn in candidates.items():
+        out, us = _time(fn, *gqa_args, rotate=rotate)
+        err = checkAllclose(
+            ref,
+            out.to(dtypes.fp32),
+            rtol=1e-2,
+            atol=1e-2,
+            msg=(
+                f"{name} prefill step vs oracle GQA "
+                f"(rows={rows}, requests={n_req}, prefix={prefix})"
+            ),
+        )
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = flops / us / 1e6
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = err
+    return ret
 
 
 def test_indexer_gluon_parity_set_equality_published_indexer_point():
@@ -5909,9 +6035,11 @@ def main():
                 rotate,
                 prefix=prefix,
             )
-            _raise_if_paged_gqa_above_tolerance(
-                row["paged_gqa err"], n_rows, prefix + n_rows
-            )
+            for name in ("paged_gqa", "union"):
+                if f"{name} err" in row:
+                    _raise_if_paged_gqa_above_tolerance(
+                        row[f"{name} err"], n_rows, prefix + n_rows
+                    )
             step_rows.append(row)
         if step_rows:
             df = pd.DataFrame(step_rows)

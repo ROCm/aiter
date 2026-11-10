@@ -25,10 +25,12 @@ split
 partials are FP32. Expand+tail and the sigmoid gate stay unfused.
 
 ``qsa_layer`` runs the indexer,
-``qsa_expand_block_indices``, and sparse GQA. A rank-3 query pair missing
-from the measured table logs once. A query that is not rank 3 is not a
-table miss; the indexer or sparse GQA reports it. Sigmoid and partial
-RoPE stay outside the layer.
+``qsa_expand_block_indices``, and sparse GQA. Host ``query_lens`` and
+``prefix_lens`` are forwarded to sparse GQA, so a gfx950 prefill of at
+least 512 rows can run the sparse prefill kernels. A rank-3 query pair
+missing from the measured table logs once. A query that is not rank 3 is
+not a table miss; the indexer or sparse GQA reports it. Sigmoid and
+partial RoPE stay outside the layer.
 """
 
 import functools
@@ -66,6 +68,7 @@ from .kernels.topk.topk_launch import _launch_key
 from .kernels.topk.topk_per_row_decode_persistent import (
     build_topk_per_row_decode_one_workgroup_module,
 )
+from .qsa_sparse_prefill import flydsl_qsa_sparse_prefill
 from .topk.topk_per_row import (
     _ONE_WORKGROUP_MAX_ROW_WIDTH,
     flydsl_top_k_per_row_decode,
@@ -1150,6 +1153,99 @@ def _take_paged_gqa_workspace(workspace, n_splits, rows, n_q_heads, head_dim, de
     return partial_out, partial_lse
 
 
+# Rows from which a gfx950 prefill with host lengths runs the sparse prefill
+# kernels. At TP2 heads (12, 1) they tie the split kernel at 384 rows and win
+# from 512 rows, with or without a 132096-token prefix.
+_UNION_PREFILL_MIN_ROWS = 512
+_UNION_PREFILL_TOPKS = (256, 512, 768, 1024)
+
+
+def _union_prefill_reason(q, k_cache, indices, page_table, query_lens, prefix_lens):
+    """Why these tensors cannot run the sparse prefill kernels, or None if they can.
+
+    The row count is not checked here. ``q``, ``k_cache``, ``indices`` and
+    ``page_table`` have passed ``flydsl_qsa_paged_gqa_supported``.
+    """
+    if query_lens is None or prefix_lens is None:
+        return "host query_lens and prefix_lens are required"
+    query_lens = tuple(query_lens)
+    prefix_lens = tuple(prefix_lens)
+    n_req = len(query_lens)
+    if not n_req or len(prefix_lens) != n_req or n_req > page_table.shape[0]:
+        return "host lengths must name one page-table row per request"
+    if any(type(n) is not int or n < 0 for n in query_lens + prefix_lens):
+        return "host lengths must be non-negative ints"
+    if sum(query_lens) != q.shape[0]:
+        return f"query_lens sum to {sum(query_lens)}, not {q.shape[0]} rows"
+    if q.shape[2] != 256:
+        return f"head_dim must be 256, got {q.shape[2]}"
+    topk = (indices.shape[1] - 3) // 4
+    if indices.shape[1] != 4 * topk + 3 or topk not in _UNION_PREFILL_TOPKS:
+        return f"indices width must be 4T+3 with T in 256..1024, got {indices.shape[1]}"
+    n_pages, page_size, n_kv_heads, head_dim = k_cache.shape
+    if page_size % 4:
+        return f"page_size must be a multiple of 4, got {page_size}"
+    page_stride, token_stride, head_stride, _ = k_cache.stride()
+    if n_kv_heads > 1 and head_stride != head_dim:
+        return f"each token must hold dense [H, D], got strides {k_cache.stride()}"
+    if token_stride < n_kv_heads * head_dim:
+        return f"token stride {token_stride} overlaps the next token"
+    # The pool is read as token rows: every page must start on a 4-row block.
+    if n_pages > 1 and page_stride % (4 * token_stride):
+        return (
+            f"page stride {page_stride} is not a multiple of 4 token rows "
+            f"of {token_stride}"
+        )
+    page_rows = page_stride // token_stride if n_pages > 1 else page_size
+    if n_pages * page_rows >= 2**31:
+        return f"{n_pages} pages of {page_rows} rows overflow int32 slots"
+    if get_gfx_runtime() != "gfx950" and token_stride != n_kv_heads * head_dim:
+        return "strided token rows run on gfx950 only"
+    widest = max(p + n for p, n in zip(prefix_lens, query_lens))
+    if -(-widest // page_size) > page_table.shape[1]:
+        return f"a {widest}-token context overruns {page_table.shape[1]} table pages"
+    return None
+
+
+def _union_prefill(
+    q, k_cache, v_cache, indices, page_table, query_lens, prefix_lens, out, scale
+):
+    """Sparse prefill kernels over the paged cache, read as a slot-table pool.
+
+    Rows are request-major: request ``r`` owns ``query_lens[r]`` rows, the
+    last positions of a ``prefix_lens[r] + query_lens[r]`` context in page
+    table row ``r``. Each row's first ``4 * min(v // 4, T)`` index columns
+    hold distinct complete blocks of its ``v``-token window, then the tail
+    tokens, then -1, which is the ``qsa_expand_block_indices`` layout when no
+    selected block is -1. The layout is not validated.
+    """
+    query_lens = tuple(query_lens)
+    prefix_lens = tuple(prefix_lens)
+    n_pages, page_size, n_kv_heads, head_dim = k_cache.shape
+    page_stride, token_stride, head_stride, _ = k_cache.stride()
+    page_rows = page_stride // token_stride if n_pages > 1 else page_size
+    contexts = [p + n for p, n in zip(prefix_lens, query_lens)]
+    n_req = len(contexts)
+    table_pages = -(-max(contexts) // page_size)
+    offsets = torch.arange(page_size, dtype=torch.int32, device=q.device)
+    rows = page_table[:n_req, :table_pages] * page_rows
+    rows = (rows.unsqueeze(-1) + offsets).reshape(n_req, table_pages * page_size)
+    kv_slots = torch.cat([rows[r, :ctx] for r, ctx in enumerate(contexts)])
+    pool = ((n_pages - 1) * page_rows + page_size, n_kv_heads, head_dim)
+    pool_strides = (token_stride, head_stride, 1)
+    return flydsl_qsa_sparse_prefill(
+        q,
+        k_cache.as_strided(pool, pool_strides),
+        v_cache.as_strided(pool, pool_strides),
+        indices,
+        query_lens=query_lens,
+        prefix_lens=prefix_lens,
+        softmax_scale=scale,
+        out=out,
+        kv_slots=kv_slots,
+    )
+
+
 def flydsl_qsa_paged_gqa(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -1161,6 +1257,9 @@ def flydsl_qsa_paged_gqa(
     softmax_scale: float | None = None,
     workspace: tuple[torch.Tensor, torch.Tensor] | None = None,
     num_cus: int | None = None,
+    *,
+    query_lens: tuple[int, ...] | None = None,
+    prefix_lens: tuple[int, ...] | None = None,
 ) -> torch.Tensor:
     """Write sparse GQA ``o [M, Hq, D]`` from paged K/V.
 
@@ -1170,6 +1269,13 @@ def flydsl_qsa_paged_gqa(
     the prefill split target uses. ``None`` reads ``get_cu_num()``. A
     caller that compiles more than one arch in one process passes the
     count for that arch, because ``get_cu_num()`` is cached for the process.
+
+    Host ``query_lens`` and ``prefix_lens`` per request let a gfx950 prefill
+    of at least ``_UNION_PREFILL_MIN_ROWS`` rows run the sparse prefill kernels,
+    under the row order and index layout ``_union_prefill`` requires. They
+    do not read ``token_to_req`` or ``workspace``, and they must be warmed on
+    the stream and lengths before graph capture. Other shapes stay on the
+    split kernel.
     """
     reason = flydsl_qsa_paged_gqa_supported(q, k_cache, v_cache, indices, page_table)
     if reason is not None:
@@ -1207,6 +1313,25 @@ def flydsl_qsa_paged_gqa(
     indices = indices.contiguous()
     page_table = page_table.contiguous()
     token_to_req = token_to_req.contiguous()
+    if (
+        arch == "gfx950"
+        and rows >= _UNION_PREFILL_MIN_ROWS
+        and _union_prefill_reason(
+            q, k_cache, indices, page_table, query_lens, prefix_lens
+        )
+        is None
+    ):
+        return _union_prefill(
+            q,
+            k_cache,
+            v_cache,
+            indices,
+            page_table,
+            query_lens,
+            prefix_lens,
+            out,
+            softmax_scale,
+        )
     # Unsigned 32-bit V# span. Exactly 4 GiB still fits: the last byte
     # offset is 2^32 - 1. Python ints do not wrap. A strided view spans
     # more than its numel.
@@ -1291,6 +1416,9 @@ def qsa_layer(
     score_scale: float | None = None,
     softmax_scale: float | None = None,
     scores: torch.Tensor | None = None,
+    *,
+    query_lens: tuple[int, ...] | None = None,
+    prefix_lens: tuple[int, ...] | None = None,
 ) -> torch.Tensor:
     """Run one QSA layer: indexer select, expand+tail, sparse GQA.
 
@@ -1347,6 +1475,10 @@ def qsa_layer(
             FlyDSL budget of 512 blocks.
         compress_ratio: block size. The default, and the FlyDSL value, is 4.
         score_scale, softmax_scale: see above.
+        query_lens, prefix_lens: host lengths per request, forwarded to
+            ``flydsl_qsa_paged_gqa``. On gfx950, a prefill of at least 512
+            rows whose lengths and index layout pass ``_union_prefill_reason``
+            runs the sparse prefill kernels. ``None`` keeps the split kernel.
 
     A span past 4 GiB on a cache selects the wide gather compile. An empty
     query writes a zero ``out`` and does not launch paged GQA. An empty
@@ -1431,4 +1563,6 @@ def qsa_layer(
         token_to_req,
         out=out,
         softmax_scale=softmax_scale,
+        query_lens=query_lens,
+        prefix_lens=prefix_lens,
     )
