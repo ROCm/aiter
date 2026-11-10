@@ -2080,15 +2080,16 @@ def test_gfx12_split_rebalance_tiles(num_seqs, dtype, num_kv_heads, tile_size):
     ],
 )
 @torch.inference_mode()
-def test_unified_attn_split_reduce_k4v8(
+def test_unified_attn_split_rebalance_reduce_k4v8(
     seq_lens, gate: bool, select: bool, monkeypatch
 ):
-    """reduce_segments_split_gluon (split_reduce=True) against the Triton
-    reduce_segments it replaces, on the 3D kernel's own partials under the gfx1250
-    split rebalance (MIN_TILES 16 / MAX_TILES 128 as Qwen3.5 runs it). Another fp32 summation order, so not bitwise: the bf16 outputs match
-    to within 2 ulps of the output (1e-6 of the values that differ), and the gate /
-    row-selection epilogue is bitwise the Triton reduce's epilogue applied to the
-    new reduce."""
+    """The split rebalance reduce (reduce_segments_split_rebalance_gluon, always on for
+    the split-rebalanced launch) against the Triton reduce_segments it replaces, on the
+    3D kernel's own partials under the gfx1250 split rebalance (MIN_TILES 16 /
+    MAX_TILES 128 as Qwen3.5 runs it). Another fp32 summation order, so not bitwise:
+    the bf16 outputs match to within 2 ulps of the output (1e-6 of the values that
+    differ), and the gate / row-selection epilogue is bitwise the Triton reduce's
+    epilogue applied to the new reduce."""
     if DEVICE_ARCH != "gfx1250":
         pytest.skip("A8K4V8 runs on the gfx1250 Gluon kernels")
     from op_tests.op_benchmarks.triton import bench_unified_attention as bench
@@ -2128,7 +2129,7 @@ def test_unified_attn_split_reduce_k4v8(
         kw["output_rows"] = (inp["cu_query_lens"][1:] - 1).to(torch.int64)
         rows_out = len(seq_lens)
 
-    def run(split_reduce):
+    def run():
         out = torch.full(
             (rows_out, num_heads[0], head_size),
             float("nan"),
@@ -2155,24 +2156,30 @@ def test_unified_attn_split_reduce_k4v8(
             shuffled_kv_cache=True,
             equal_seqlen_q=True,
             backend="gluon",
-            split_reduce=split_reduce,
             **kw,
         )
         return out
 
     calls = []
-    kernel = module._reduce_segments_split_kernel_gfx1250
+    kernel = module._reduce_segments_split_rebalance_kernel_gfx1250
 
     class _Spy:
         def __getitem__(self, grid):
             calls.append(grid)
             return kernel[grid]
 
-    monkeypatch.setattr(module, "_reduce_segments_split_kernel_gfx1250", _Spy())
-    old = run(False)
+    monkeypatch.setattr(
+        module, "_reduce_segments_split_rebalance_kernel_gfx1250", _Spy()
+    )
+    with monkeypatch.context() as m:
+        # the reference: the Triton reduce_segments
+        m.setattr(
+            module, "is_reduce_split_rebalance_gluon_available", lambda *a, **k: False
+        )
+        old = run()
     assert not calls
-    new = run(True)
-    assert calls, "split_reduce=True did not take reduce_segments_split_gluon"
+    new = run()
+    assert calls, "the split rebalance reduce did not run"
     assert not new.isnan().any()
     a, b = old.float(), new.float()
     differ = a != b
@@ -2180,8 +2187,8 @@ def test_unified_attn_split_reduce_k4v8(
     assert differ.float().mean().item() < 1e-3
     assert torch.allclose(a, b, rtol=2 * 2**-8, atol=1e-5)
     print(
-        f"split reduce vs Triton reduce: {int(differ.sum())}/{differ.numel()} outputs"
-        f" differ, max |diff| {(a - b).abs().max().item():.3g}"
+        f"split rebalance reduce vs Triton reduce: {int(differ.sum())}/"
+        f"{differ.numel()} outputs differ, max |diff| {(a - b).abs().max().item():.3g}"
     )
 
 
@@ -2189,24 +2196,24 @@ def test_unified_attn_split_reduce_k4v8(
 @pytest.mark.parametrize(
     "seq_lens",
     [
-        # MTP-3 verify rows at the agentic contexts: 1-37 live segments of the token
-        # split's 128 (one pass), and 69 / 128 live (two and four passes)
+        # MTP-3 verify rows at the agentic contexts: 1-37 live segments of the split
+        # rebalance's 128 (one pass), and 69 / 128 live (two and four passes)
         [(4, 35000), (4, 9000), (4, 74000), (4, 130), (4, 56000), (4, 2049)],
         [(4, 140000), (4, 262000), (4, 65536), (4, 65537)],
         # drafter decode, one row a sequence, and a zero-length pad sequence
         [(1, 41000), (1, 9001), (1, 23456), (1, 3), (1, 65000), (1, 2048), (1, 0)],
     ],
 )
-@pytest.mark.parametrize("config", [None, (64, 0, 2), (64, 64, 1), (32, 16, 4)])
+@pytest.mark.parametrize("config", [(64, 0, 2), (64, 64, 1), (32, 16, 4)])
 @torch.inference_mode()
-def test_unified_attn_split_reduce_oneshot_k4v8(
+def test_unified_attn_split_rebalance_reduce_configs_k4v8(
     seq_lens, config, gate: bool, select: bool, monkeypatch
 ):
-    """reduce_segments_split_oneshot_gluon (split_reduce_oneshot=True) is bitwise
-    reduce_segments_split_gluon (the same statistics reduction, the same merge steps in
-    the same order), on the 3D kernel's own partials under the gfx1250 token split, with
-    and without the gate / row-selection epilogue, speculative or not, over one or
-    several LDS passes."""
+    """The split rebalance reduce's (CHUNK, SPEC, NUM_WARPS) does not change its output:
+    bitwise the default config's (the same statistics reduction, the same SB-segment
+    merge steps in the same order), on the 3D kernel's own partials under the gfx1250
+    split rebalance, with and without the gate / row-selection epilogue, speculative or
+    not, over one or several LDS passes."""
     if DEVICE_ARCH != "gfx1250":
         pytest.skip("A8K4V8 runs on the gfx1250 Gluon kernels")
     from op_tests.op_benchmarks.triton import bench_unified_attention as bench
@@ -2215,8 +2222,6 @@ def test_unified_attn_split_reduce_oneshot_k4v8(
     monkeypatch.setattr(module, "_GFX12_UA_SPLIT_REBALANCE_MIN_TILES", 16)
     monkeypatch.setattr(module, "_GFX12_UA_SPLIT_REBALANCE_MAX_TILES", 128)
     monkeypatch.setattr(module, "use_2d_kernel", lambda params, backend="triton": False)
-    if config is not None:
-        monkeypatch.setattr(module, "_GFX12_SPLIT_REDUCE_ONESHOT_CONFIG", config)
     torch.manual_seed(0)
     block_size, head_size, num_heads = 128, 256, (16, 2)
     num_blocks = sum((k + block_size - 1) // block_size for _, k in seq_lens) + 16
@@ -2249,7 +2254,7 @@ def test_unified_attn_split_reduce_oneshot_k4v8(
         kw["output_rows"] = (inp["cu_query_lens"][1:] - 1).to(torch.int64)
         rows_out = len(seq_lens)
 
-    def run(oneshot):
+    def run():
         out = torch.full(
             (rows_out, num_heads[0], head_size),
             float("nan"),
@@ -2276,25 +2281,33 @@ def test_unified_attn_split_reduce_oneshot_k4v8(
             shuffled_kv_cache=True,
             equal_seqlen_q=True,
             backend="gluon",
-            split_reduce=True,
-            split_reduce_oneshot=oneshot,
             **kw,
         )
         return out
 
+    def run_config(config):
+        chunk, spec, num_warps = config
+        with monkeypatch.context() as m:
+            m.setattr(module, "_GFX12_UA_SPLIT_REBALANCE_REDUCE_CHUNK", chunk)
+            m.setattr(module, "_GFX12_UA_SPLIT_REBALANCE_REDUCE_SPEC", spec)
+            m.setattr(module, "_GFX12_UA_SPLIT_REBALANCE_REDUCE_NUM_WARPS", num_warps)
+            return run()
+
     calls = []
-    kernel = module._reduce_segments_split_oneshot_kernel_gfx1250
+    kernel = module._reduce_segments_split_rebalance_kernel_gfx1250
 
     class _Spy:
         def __getitem__(self, grid):
             calls.append(grid)
             return kernel[grid]
 
-    monkeypatch.setattr(module, "_reduce_segments_split_oneshot_kernel_gfx1250", _Spy())
-    old = run(False)
-    assert not calls
-    new = run(True)
-    assert calls, "split_reduce_oneshot=True did not take the one-shot reduce"
+    monkeypatch.setattr(
+        module, "_reduce_segments_split_rebalance_kernel_gfx1250", _Spy()
+    )
+    old = run()
+    assert len(calls) == 1, "the split rebalance reduce did not run"
+    new = run_config(config)
+    assert len(calls) == 2, "the split rebalance reduce did not run"
     # a zero-length (pad) sequence's rows are NaN either way
     live = torch.tensor(
         [k > 0 for q, k in seq_lens for _ in range(1 if select else q)], device="cuda"

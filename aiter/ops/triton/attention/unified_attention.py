@@ -37,19 +37,19 @@ try:
 except:  # noqa: E722
     _unified_attention_kernel_2d_gfx1250 = None
 try:
+    from aiter.ops.triton._gluon_kernels.gfx1250.attention import (
+        unified_attention_reduce as _gfx1250_reduce,
+    )
     from aiter.ops.triton._gluon_kernels.gfx1250.attention.unified_attention_reduce import (
         reduce_segments_gluon as _reduce_segments_kernel_gfx1250,
     )
-    from aiter.ops.triton._gluon_kernels.gfx1250.attention.unified_attention_reduce import (
-        reduce_segments_split_gluon as _reduce_segments_split_kernel_gfx1250,
-    )
-    from aiter.ops.triton._gluon_kernels.gfx1250.attention.unified_attention_reduce import (
-        reduce_segments_split_oneshot_gluon as _reduce_segments_split_oneshot_kernel_gfx1250,
+
+    _reduce_segments_split_rebalance_kernel_gfx1250 = (
+        _gfx1250_reduce.reduce_segments_split_rebalance_gluon
     )
 except:  # noqa: E722
     _reduce_segments_kernel_gfx1250 = None
-    _reduce_segments_split_kernel_gfx1250 = None
-    _reduce_segments_split_oneshot_kernel_gfx1250 = None
+    _reduce_segments_split_rebalance_kernel_gfx1250 = None
 
 # gfx950
 try:
@@ -82,20 +82,26 @@ _GFX12_UA_SPLIT_REBALANCE = 2048
 _GFX12_UA_SPLIT_REBALANCE_MIN_TILES = 16
 _GFX12_UA_SPLIT_REBALANCE_MAX_TILES = 256
 _GFX12_UA_SPLIT_REBALANCE_MAX_KV_LEN = 262144
-# Opt-in (or unified_attention(split_reduce=True)): the gfx1250 decode / spec-decode
-# reduce of a split wider than the in-wave gluon reduce takes (the split rebalance's 128-256
-# segments) runs reduce_segments_split_gluon instead of the Triton reduce_segments:
-# one program per (query token, head), the sequence from the token without a search,
-# only the live segments read, their partials by TDM through double-buffered LDS.
-# Qwen3.5 c=1024 verify (340 tokens, 16 heads, d 256, 10k-150k-token contexts,
-# 128-segment grid, ~12 live): 21 -> 7.7 us. Not bitwise the Triton reduce (another
-# fp32 summation order): ~0.005% of the bf16 outputs one rounding step apart.
-_GFX12_SPLIT_REDUCE = os.environ.get("AITER_GFX12_SPLIT_REDUCE", "0") == "1"
-# (SB segments a step, NUM_BUF LDS buffers, num_warps) of reduce_segments_split_gluon
-_GFX12_SPLIT_REDUCE_CONFIG = tuple(
-    int(x)
-    for x in os.environ.get("AITER_GFX12_SPLIT_REDUCE_CONFIG", "8,2,1").split(",")
-)
+# The split rebalance reduce, always on for a split-rebalanced launch: the gfx1250
+# decode / spec-decode reduce of the rebalance's 128-256 segments (wider than the
+# in-wave gluon reduce takes) runs reduce_segments_split_rebalance_gluon instead of
+# the Triton reduce_segments: one program per (query token, head), the sequence from
+# the token without a search, only the live segments read, all loads (partials and
+# maxima by TDM into LDS, statistics, output gate) in flight in one round trip.
+# Qwen3.5 a8k4v8 (16 / 2 heads, d 256), reduce alone: c=1024 verify (340 tokens,
+# 10k-150k-token contexts, 128-segment grid) 21 us in the Triton reduce -> 7.7 us
+# with the loads one step ahead; one round trip then 3.0-6.0 -> 2.0-3.4 us under graph
+# replay (verify and draft, 1-8 sequences of 15k-110k tokens).
+# Not bitwise the Triton reduce (another fp32 summation order): ~0.005% of the bf16
+# outputs one rounding step apart. SB segments a merge step (sets the summation
+# order); CHUNK segments a pass loads (a multiple of SB), SPEC of them before the
+# context length (a multiple of SB, <= CHUNK); NUM_WARPS when the value head size is a
+# multiple of 32 * NUM_WARPS, else 1. The output is bitwise the same for every CHUNK,
+# SPEC and NUM_WARPS.
+_GFX12_UA_SPLIT_REBALANCE_REDUCE_SB = 8
+_GFX12_UA_SPLIT_REBALANCE_REDUCE_CHUNK = 64
+_GFX12_UA_SPLIT_REBALANCE_REDUCE_SPEC = 32
+_GFX12_UA_SPLIT_REBALANCE_REDUCE_NUM_WARPS = 2
 
 # attn_3d config keys that steer use_2d_kernel on gfx1250 rather than the launch:
 # MAX_QUERY_ROWS_PER_CU overrides the short-query bound above, and
@@ -119,20 +125,6 @@ _GFX12_ROUTING_KEYS = (
 _UA2D_FUSED_EPILOGUE = os.environ.get("AITER_UA2D_FUSED_EPILOGUE", "1") == "1"
 _UA2D_FUSED_EPILOGUE_MIN_KV = int(
     os.environ.get("AITER_UA2D_FUSED_EPILOGUE_MIN_KV", "16384")
-)
-# Opt-in (or unified_attention(split_reduce_oneshot=True)), with the split reduce:
-# reduce_segments_split_oneshot_gluon in its place, bitwise the same output. Its loads
-# (the first CHUNK segments' partials, the statistics, the output gate) are all in
-# flight at once instead of a chain of dependent round trips.
-_GFX12_SPLIT_REDUCE_ONESHOT = (
-    os.environ.get("AITER_GFX12_SPLIT_REDUCE_ONESHOT", "0") == "1"
-)
-# (CHUNK segments a pass loads, SPEC of them before the context length, num_warps)
-_GFX12_SPLIT_REDUCE_ONESHOT_CONFIG = tuple(
-    int(x)
-    for x in os.environ.get("AITER_GFX12_SPLIT_REDUCE_ONESHOT_CONFIG", "64,32,2").split(
-        ","
-    )
 )
 
 
@@ -474,12 +466,6 @@ def unified_attention(
     # output_rows[r] (every token still attends and its KV is read as usual).
     output_gate: torch.Tensor | None = None,
     output_rows: torch.Tensor | None = None,
-    # gfx1250: the split-KV reduce of decode / spec-decode verify (equal_seqlen_q)
-    # through reduce_segments_split_gluon; None follows AITER_GFX12_SPLIT_REDUCE.
-    split_reduce: bool | None = None,
-    # with the split reduce: reduce_segments_split_oneshot_gluon (bitwise the same
-    # output, its loads in one round trip); None follows AITER_GFX12_SPLIT_REDUCE_ONESHOT.
-    split_reduce_oneshot: bool | None = None,
 ):
     assert causal, "Only causal attention is supported"
 
@@ -798,16 +784,11 @@ def unified_attention(
             and backend == "gluon"
             and not epilogue
         )
-        if split_reduce is None:
-            split_reduce = _GFX12_SPLIT_REDUCE
-        if split_reduce_oneshot is None:
-            split_reduce_oneshot = _GFX12_SPLIT_REDUCE_ONESHOT
-        if (
-            split_reduce
-            and not use_gluon_reduce
-            and is_reduce_split_gluon_available(params, NUM_SEGMENTS, backend)
+        # The split rebalance's launch (segm_tiles) takes the split rebalance reduce.
+        if segm_tiles is not None and is_reduce_split_rebalance_gluon_available(
+            params, NUM_SEGMENTS, backend
         ):
-            _reduce_segments_split_gfx1250(
+            _reduce_segments_split_rebalance_gfx1250(
                 params._replace(out=final_out),
                 segm_output,
                 segm_max,
@@ -817,7 +798,6 @@ def unified_attention(
                 segm_tiles=segm_tiles,
                 output_gate=output_gate,
                 output_rows=output_rows,
-                oneshot=split_reduce_oneshot,
             )
         elif use_gluon_reduce:
             if DEVICE_ARCH in ("gfx1250", "gfx1250-strict"):
@@ -961,19 +941,21 @@ def is_reduce_gluon_available(params: _UAParams, NUM_SEGMENTS, backend: str):
     return use_gluon and use_gluon_arch
 
 
-def is_reduce_split_gluon_available(params: _UAParams, NUM_SEGMENTS, backend: str):
-    """reduce_segments_split_gluon: gfx1250, every sequence the same query length
-    (decode or spec-decode verify), head size = value head size, a power of 2."""
-    _, _, num_warps = _GFX12_SPLIT_REDUCE_CONFIG
+def is_reduce_split_rebalance_gluon_available(
+    params: _UAParams, NUM_SEGMENTS, backend: str
+):
+    """reduce_segments_split_rebalance_gluon: gfx1250, every sequence the same query
+    length (decode or spec-decode verify), head size = value head size, a power of 2
+    and a multiple of 32, and a power-of-2 segment count."""
     d = params.head_size_v
     return (
-        DEVICE_ARCH == "gfx1250"
+        DEVICE_ARCH in ("gfx1250", "gfx1250-strict")
         and backend == "gluon"
-        and _reduce_segments_split_kernel_gfx1250 is not None
+        and _reduce_segments_split_rebalance_kernel_gfx1250 is not None
         and (params.all_decode or params.spec_decode)
         and d == params.head_size
         and d & (d - 1) == 0
-        and d % (32 * num_warps) == 0
+        and d % 32 == 0
         and triton.next_power_of_2(NUM_SEGMENTS) == NUM_SEGMENTS
     )
 
@@ -1541,7 +1523,7 @@ def _reduce_segments_gfx1250(
     )
 
 
-def _reduce_segments_split_gfx1250(
+def _reduce_segments_split_rebalance_gfx1250(
     params: _UAParams,
     segm_output,
     segm_max,
@@ -1551,49 +1533,18 @@ def _reduce_segments_split_gfx1250(
     segm_tiles=None,
     output_gate=None,
     output_rows=None,
-    oneshot=False,
 ):
     num_rows = params.num_tokens if output_rows is None else output_rows.shape[0]
     if num_rows == 0:
         return
-    sb, num_buf, num_warps = _GFX12_SPLIT_REDUCE_CONFIG
-    sb = min(sb, NUM_SEGMENTS)
-    if oneshot and _reduce_segments_split_oneshot_kernel_gfx1250 is not None:
-        chunk, spec, oneshot_warps = _GFX12_SPLIT_REDUCE_ONESHOT_CONFIG
-        chunk = max(sb, min(chunk, NUM_SEGMENTS) // sb * sb)
-        if params.head_size_v % (32 * oneshot_warps) == 0:
-            _reduce_segments_split_oneshot_kernel_gfx1250[
-                (num_rows, params.num_query_heads)
-            ](
-                params.out,
-                segm_output,
-                segm_max,
-                segm_expsum,
-                params.seqused_k,
-                params.num_seqs,
-                segm_tiles,
-                params.output_scale,
-                output_gate,
-                output_gate.stride(0) if output_gate is not None else 0,
-                output_rows,
-                params.out.stride(0),
-                params.out.stride(1),
-                H=params.num_query_heads,
-                S=NUM_SEGMENTS,
-                D=params.head_size_v,
-                TILE_SIZE=TILE_SIZE,
-                SEQLEN_Q=1 if params.all_decode else int(params.max_seqlen_q),
-                SB=sb,
-                CHUNK=chunk,
-                SPEC=min(spec, chunk) // sb * sb,
-                NUM_WARPS=oneshot_warps,
-                IS_FP8_OUT=(params.out.dtype == e4m3_dtype),
-                FP8_MIN=torch.finfo(e4m3_dtype).min,
-                FP8_MAX=torch.finfo(e4m3_dtype).max,
-                num_warps=oneshot_warps,
-            )
-            return
-    _reduce_segments_split_kernel_gfx1250[(num_rows, params.num_query_heads)](
+    sb = min(_GFX12_UA_SPLIT_REBALANCE_REDUCE_SB, NUM_SEGMENTS)
+    chunk = _GFX12_UA_SPLIT_REBALANCE_REDUCE_CHUNK
+    chunk = max(sb, min(chunk, NUM_SEGMENTS) // sb * sb)
+    spec = min(_GFX12_UA_SPLIT_REBALANCE_REDUCE_SPEC, chunk) // sb * sb
+    num_warps = _GFX12_UA_SPLIT_REBALANCE_REDUCE_NUM_WARPS
+    if params.head_size_v % (32 * num_warps) != 0:
+        num_warps = 1
+    _reduce_segments_split_rebalance_kernel_gfx1250[(num_rows, params.num_query_heads)](
         params.out,
         segm_output,
         segm_max,
@@ -1613,7 +1564,8 @@ def _reduce_segments_split_gfx1250(
         TILE_SIZE=TILE_SIZE,
         SEQLEN_Q=1 if params.all_decode else int(params.max_seqlen_q),
         SB=sb,
-        NUM_BUF=num_buf,
+        CHUNK=chunk,
+        SPEC=spec,
         NUM_WARPS=num_warps,
         IS_FP8_OUT=(params.out.dtype == e4m3_dtype),
         FP8_MIN=torch.finfo(e4m3_dtype).min,
