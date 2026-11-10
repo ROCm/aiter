@@ -5,13 +5,16 @@
 
 """AOT pre-compilation for the FlyDSL paged-attention decode planner.
 
-``plan_pa_decode`` compiles one kernel per batch bucket, block size and
-dense/windowed mode; batch, capacity, partition cap and window are runtime
-values, and ``max_batch_size`` only bounds the batch. The kernels therefore
-form a finite set per arch. This module replays ``plan_pa_decode`` itself on
-FakeTensors inside :func:`aiter.aot.flydsl.dry_run.dry_run` (see
-``replay.py``): for each bucket, at its largest batch, and at each task
-capacity where the block size can change, dense and windowed.
+``plan_pa_decode`` compiles one kernel per batch bucket, block size,
+dense/windowed mode and context partition size; batch, capacity, partition cap
+and window are runtime values, and ``max_batch_size`` only bounds the batch.
+The kernels therefore form a finite set per arch. This module replays
+``plan_pa_decode`` itself on FakeTensors inside
+:func:`aiter.aot.flydsl.dry_run.dry_run` (see ``replay.py``): for each bucket,
+at its largest batch, and at each task capacity where the block size can
+change, dense and windowed, for every partition size the arch supports (128
+and 256 tokens on gfx1250, 256 elsewhere), and for 128-token plans with one
+and with several query tokens per row.
 
 Buckets are 1, 2, 4, ... clipped to the arch's LDS limit (16256 on gfx942,
 40832 on gfx950, 81792 on gfx1250), and a bucket's largest batch reaches every
@@ -41,9 +44,12 @@ _BLOCK_STEPS = (64, 128, 256, 512, 1024)
 
 
 def jobs_for_arch(arch: str) -> list[dict]:
-    """A job per bucket, block-size step and window mode of ``arch``."""
+    """A job per bucket, block size, window mode, partition size and query mode."""
     from aiter.jit.utils.chip_info import get_lds_capacity_bytes
-    from aiter.ops.flydsl.kernels.pa_decode_plan import _lds_max_batch
+    from aiter.ops.flydsl.kernels.pa_decode_plan import (
+        _lds_max_batch,
+        context_partition_sizes,
+    )
 
     cu_num = AOT_ARCHS[arch]
     max_batch = _lds_max_batch(get_lds_capacity_bytes(arch))
@@ -54,19 +60,25 @@ def jobs_for_arch(arch: str) -> list[dict]:
         capacities = {min(max(step, batch), batch * cu_num) for step in _BLOCK_STEPS}
         for capacity in sorted(capacities):
             for windowed in (False, True):
-                jobs.append(
-                    {
-                        "kernel_name": (
-                            f"pa_decode_plan_b{batch}_c{capacity}"
-                            f"_{'window' if windowed else 'dense'}"
-                        ),
-                        "gfx": arch,
-                        "cu_num": cu_num,
-                        "batch": batch,
-                        "capacity": capacity,
-                        "windowed": windowed,
-                    }
-                )
+                for partition in context_partition_sizes(arch):
+                    # 128-token plans also specialize on multi-query rows.
+                    for multi_query in (False, True) if partition < 256 else (False,):
+                        jobs.append(
+                            {
+                                "kernel_name": (
+                                    f"pa_decode_plan_b{batch}_c{capacity}"
+                                    f"_{'window' if windowed else 'dense'}"
+                                    f"_cp{partition}{'_mq' if multi_query else ''}"
+                                ),
+                                "gfx": arch,
+                                "cu_num": cu_num,
+                                "batch": batch,
+                                "capacity": capacity,
+                                "windowed": windowed,
+                                "context_partition_size": partition,
+                                "multi_query": multi_query,
+                            }
+                        )
     return jobs
 
 
@@ -88,7 +100,9 @@ def replay(job: dict) -> None:
         max_partitions=-(-capacity // batch),
         max_batch_size=batch,
         workgroup_budget=capacity,
+        context_partition_size=job["context_partition_size"],
         sliding_window=int(job["windowed"]),
+        query_length=2 if job["multi_query"] else 1,
     )
 
 

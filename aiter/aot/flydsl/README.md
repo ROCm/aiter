@@ -14,7 +14,7 @@ compiles them up front so the runtime JIT path hits the cache.
 | `gdn_fused_prefill.py` | gfx950 single-kernel GDN prefill, by replaying `gdn_fused_prefill_fwd` per head shape in `DEFAULT_SHAPES` |
 | `mega_moe.py` | MegaMoE A8W4 and A4W4 bundles of every deployment profile, by preloading `MegaMoEV2` itself (see below) |
 | `fmha_fp8.py` | gfx950 FP8 flash-attention forward, by replaying `flydsl_flash_attn_fp8_func` per head shape in `DEFAULT_SHAPES` |
-| `pa_decode_plan.py` | PA decode planner, every batch bucket, block size and window mode up to each arch's LDS limit, by replaying `plan_pa_decode` (see below) |
+| `pa_decode_plan.py` | PA decode planner, every batch bucket, block size, window mode and context partition size up to each arch's LDS limit, by replaying `plan_pa_decode` (see below) |
 | `mxfp4_moe.py` | Not part of the AOT build; the MXFP4 tuner's `--fast-scan` precompiles its candidates with it |
 | `common.py` | Job collection, the deadlock-free fork pool, `run_aot` (what `setup.py` runs), and cache-hit checking logic |
 | `replay.py` | The shared driver of the replaying modules other than MoE/MegaMoE: per-arch processes, worker batches, size scans and bisection, `--check` |
@@ -156,9 +156,11 @@ and launches them; every FlyDSL launch is compiled into the cache instead.
   launcher it can pick at all is replayed too, with its tile and split count
   pinned through the wrapper's own overrides.
 - `pa_decode_plan.py` replays `plan_pa_decode` at the largest batch of
-  each bucket, at each task capacity where the block size can change and
-  with and without a window. Capacity stops at the batch times the CU
-  count, so each arch replays with the most CUs any of its devices has.
+  each bucket, at each task capacity where the block size can change, with
+  and without a window, at each context partition size of the arch, and for
+  128-token plans with one and with several query tokens.
+  Capacity stops at the batch times the CU count, so each arch replays with
+  the most CUs any of its devices has.
 - Ops with a Python body behind `torch_compile_guard` run that body under
   `dry_run(python_ops=True)`, so a replay can enter at a public op; C++ ops
   still dispatch to their fakes.
@@ -246,8 +248,10 @@ python -m aiter.aot.flydsl.fmha_fp8 --shape 12:12:192:128
 
 The PA decode planner compiles one kernel per batch bucket (1, 2, 4, ...,
 clipped to the arch's LDS), block size (64 to 1024 threads, from the plan's
-task capacity) and dense/windowed mode; batch, capacity, partition cap and
-window are passed at launch, and `max_batch_size` only bounds the batch.
+task capacity), dense/windowed mode and context partition size (128 and 256
+tokens on gfx1250, 256 elsewhere), and for 128-token plans whether rows hold
+several query tokens; batch, capacity, partition cap and window are passed at
+launch, and `max_batch_size` only bounds the batch.
 `run_aot` replays the whole set up to each arch's LDS limit (16256 on gfx942,
 40832 on gfx950, 81792 on gfx1250), so it serves every `max_batch_size`.
 

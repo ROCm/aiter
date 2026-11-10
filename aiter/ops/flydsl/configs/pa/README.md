@@ -41,8 +41,9 @@ tensors with `tune=True, config_dir="/tmp/pa-configs"` before inference or graph
 capture. Subsequent calls with the same `config_dir` use saved results by default.
 `FLYDSL_AUTOTUNE=1` remains available to force searches through the Python API.
 FlyDSL owns the JSON format, candidate benchmarking, selection, and cache
-persistence. Cache keys retain attention geometry, execution modes, CU count,
-PA source contents, and native toolchain/environment/device fingerprints.
+persistence. Cache keys retain attention geometry, execution modes, context
+partition size, CU count, PA source contents, and native
+toolchain/environment/device fingerprints.
 
 To use a custom cache directory, set `FLYDSL_AUTOTUNE_CACHE_DIR` before importing
 the PA tuning module. This overrides the full cache directory, so the file is

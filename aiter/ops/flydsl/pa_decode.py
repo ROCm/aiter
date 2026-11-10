@@ -20,12 +20,15 @@ from aiter.utility import dtypes
 
 from .kernels.pa_decode_kernel import (
     CLUSTER_PARTITIONS,
-    KV_COMPUTE_BLOCK,
     MERGE_HEAD_DIM,
     MERGE_PARTITIONS,
     compile_pa_decode_tile,
 )
-from .kernels.pa_decode_plan import PADecodePlan
+from .kernels.pa_decode_plan import (
+    PADecodePlan,
+    context_partition_sizes,
+    partition_bound,
+)
 from .kernels.pa_decode_plan import plan_pa_decode as plan_pa_decode  # noqa: PLC0414
 from .kernels.pa_decode_reduce import (
     DUAL_REGISTER_PARTITIONS,
@@ -342,6 +345,9 @@ def _pa_decode_mxfp4(
             work_capacity=capacity,
             max_context_length=schedule_context_length,
             direct_output=direct,
+            context_partition_size=(
+                256 if work_plan is None else work_plan.context_partition_size
+            ),
         )
     pmax = psum = pout = output
     if not direct:
@@ -423,7 +429,7 @@ def pa_decode(
     softmax_scale: float,
     query_length: int,
     *,
-    context_partition_size: int = 256,
+    context_partition_size: int | None = None,
     compute_type: torch.dtype | None = None,
     query_scale: torch.Tensor = None,
     key_scale: torch.Tensor = None,  # [num_blocks, num_kv_heads, kv_block_size, 1]
@@ -438,7 +444,13 @@ def pa_decode(
     max_context_length: int | None = None,
     mask_unowned_kv: bool = True,
 ) -> None:
-    """Decode FP8 or BF16 K/V using 256-token compute tiles.
+    """Decode FP8 or BF16 K/V using planned context partitions.
+
+    The work plan sets the context partition size. Plans support 256 tokens on
+    all targets and 128 tokens on gfx1250. New gfx1250 plans default to 128
+    when they have at least 16 task slots per sequence (160 for several query
+    tokens) and to 256 otherwise; gfx942/gfx950 plans use 256. ``context_partition_size`` may restate the
+    plan's size.
 
     Supports page sizes 16/64/128. BF16 head dimensions are multiples of 64
     up to 1024; FP8 supports 64 and multiples of 128 up to 1024.
@@ -457,9 +469,9 @@ def pa_decode(
     in BF16 and softmax statistics and MFMA accumulation stay in FP32.
     gfx942/gfx950 BF16 automatically splits query positions to keep each CTA
     within 64 KiB of LDS; a single query's GQA rows must fit that limit. gfx1250
-    splits BF16 D1024/G16/MTP4 with transposed page128 caches and full attention
-    into separate query CTAs. Q/K and V/output
-    head dimensions must match.
+    splits large BF16 query tiles according to head dimension, query rows and
+    planned task bounds. Both V layouts and sliding windows are supported;
+    QL3 can split three ways. Q/K and V/output head dimensions must match.
     ALiBi and externally quantized queries are unsupported.
 
     MTP lengths include the query tokens and use dense causal masking.
@@ -540,11 +552,6 @@ def pa_decode(
     )
     if not isinstance(work_plan, PADecodePlan) and not (mxfp4 and work_plan is None):
         raise TypeError("work_plan must be a PADecodePlan")
-    if context_partition_size != KV_COMPUTE_BLOCK:
-        raise NotImplementedError(
-            "pa_decode only supports context_partition_size=256, "
-            f"got {context_partition_size}"
-        )
     if query_scale is not None:
         raise NotImplementedError(
             "pa_decode does not support externally quantized FP8 queries"
@@ -604,6 +611,13 @@ def pa_decode(
                 "MXFP4 KV takes compute_type None, uint8 or fp4x2, "
                 f"got {compute_type}"
             )
+        if context_partition_size is not None and (
+            type(context_partition_size) is not int or context_partition_size != 256
+        ):
+            raise NotImplementedError(
+                "MXFP4 KV supports context_partition_size 256, "
+                f"got {context_partition_size}"
+            )
         return _pa_decode_mxfp4(
             output,
             query,
@@ -659,6 +673,20 @@ def pa_decode(
         raise NotImplementedError(
             f"pa_decode only supports gfx942, gfx950 and gfx1250, got {arch}"
         )
+    if context_partition_size is not None:
+        if type(context_partition_size) is not int:
+            raise TypeError("context_partition_size must be an int")
+        supported_sizes = context_partition_sizes(arch)
+        if context_partition_size not in supported_sizes:
+            raise NotImplementedError(
+                f"pa_decode supports context_partition_size in {supported_sizes} "
+                f"on {arch}, got {context_partition_size}"
+            )
+        if context_partition_size != work_plan.context_partition_size:
+            raise ValueError(
+                "context_partition_size must match work_plan.context_partition_size"
+            )
+    context_partition_size = work_plan.context_partition_size
     is_bf16_kv = key_cache.dtype == torch.bfloat16
     kv_dtype = "bf16" if is_bf16_kv else "fp8"
     expected_kv_dtype = torch.bfloat16 if is_bf16_kv else dtypes.fp8
@@ -926,14 +954,13 @@ def pa_decode(
     max_partitions = min(
         num_partitions,
         work_plan.capacity,
-        max(1, -(-schedule_context_length // KV_COMPUTE_BLOCK)),
+        partition_bound(
+            context_partition_size,
+            schedule_context_length,
+            sliding_window,
+            query_length,
+        ),
     )
-    if sliding_window > 0:
-        # Bound the unaligned MTP window without shrinking the reusable plan.
-        window_tiles = (
-            sliding_window + query_length - 2 + KV_COMPUTE_BLOCK - 1
-        ) // KV_COMPUTE_BLOCK + 1
-        max_partitions = min(max_partitions, window_tiles)
     # gfx1250 tile kernels write final output for one-partition plans and for
     # plans with one task slot per sequence: single tasks store directly, and
     # sequences given slots freed by empty ones merge in their last-arriving
@@ -1014,6 +1041,7 @@ def pa_decode(
             max_context_length=schedule_context_length,
             sliding_window=sliding_window,
             direct_output=direct_output,
+            context_partition_size=context_partition_size,
             trans_k=trans_k,
             mask_unowned_kv=mask_unowned_kv,
             cluster_merge=cluster_merge,

@@ -14,19 +14,20 @@ BF16 K/V use vector-8 caches and native BF16 Q/K/P/V MFMA operands, with
 f32 softmax state and accumulation. BF16 KV does not use quantization scales.
 
 gfx1250 uses wave32 WMMA with native FP8 Q/P conversion or BF16 operands.
-Its four waves process 64- or 128-token compute tiles within each 256-token
-plan tile. Packed FP8 D128/D256 full-attention paths use K128 WMMA; other
-FP8 paths use K64 and BF16 uses K32. Four FP8 D128 query tiles over page128
-caches give each wave its own tile and keep P in registers. Supported layouts
-use TDM K/V transfers, with two LDS buffers where capacity permits.
+Its four waves process 64- or 128-token compute tiles within each 128- or
+256-token plan partition. Packed FP8 D128/D256 full-attention paths use K128
+WMMA; other FP8 paths use K64 and BF16 uses K32. Four FP8 D128 query tiles over
+page128 caches give each wave its own tile and keep P in registers. Supported
+layouts use TDM K/V transfers, with two LDS buffers where capacity permits.
 One-partition plans can write final output directly. Plans with one task slot
 per sequence merge a sequence's few partitions in its last-arriving CTA, and
 plans whose sequences each fit one workgroup cluster merge within that
 cluster; other plans use the shared partition reducer.
-BF16 transposed page128 caches at D64/D128/D256 use a packed-page pipeline
-with resident Q and fused PV accumulation; D256 is limited to 32 query rows.
-Page16 BF16 caches at these dimensions retain vector-8 packing in LDS while
-using the 64-token pipeline.
+BF16 page128 caches at D64/D128/D256 use a packed-page pipeline with resident Q
+and fused PV accumulation; D256 is limited to 32 query rows, and plain V caches
+require D64/D128 with two to four query tiles. Page16 BF16 caches at these
+dimensions retain vector-8 packing in LDS while using the 64-token pipeline.
+Both V layouts are gathered into the same packed LDS order.
 
 MXFP4 K/V (``kv_dtype="mxfp4"``, gfx950, head_dim 128, page 128, one query token a
 row) share this scaffolding and have their own tile: QK is one scaled MFMA (fp4 K x
@@ -88,6 +89,7 @@ from .pa_decode.traits import (
     PaDecodeSchedule,
     PaDecodeTraits,
 )
+from .pa_decode_plan import context_partition_sizes
 from .tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
@@ -127,6 +129,7 @@ def _pa_decode_tile_kernel_name(
     stage_pages=0,
     merge_partitions=False,
     cluster_merge=0,
+    context_partition_size=256,
 ):
     """Trace-visible symbol carrying the main compile-time constants."""
     name = (
@@ -149,6 +152,7 @@ def _pa_decode_tile_kernel_name(
         name += "_merge"
     if cluster_merge:
         name += f"_cluster{cluster_merge}"
+    name += f"_cp{context_partition_size}"
     return name
 
 
@@ -178,6 +182,7 @@ def compile_pa_decode_tile(
     trans_k: bool = True,
     mask_unowned_kv: bool = True,
     cluster_merge: int = 0,
+    context_partition_size: int,
 ):
     """Select and cache a PA-decode kernel and launch wrapper.
 
@@ -206,6 +211,9 @@ def compile_pa_decode_tile(
     lengths -- one task per sequence, the output written directly with the query's
     row/head strides (an empty row is zero-filled).
     ``work_capacity`` is a positive host integer matching the work plan.
+    ``context_partition_size`` must equal the work plan's partition size. It has
+    no default because launches cannot detect a mismatch: plan records count
+    partitions, so a different size silently skips or repeats context.
     Positive ``sliding_window`` includes the query token.
     Plans cover the MTP window union; scores are masked per query row.
     ``trans_k=False`` is not implemented.
@@ -233,20 +241,31 @@ def compile_pa_decode_tile(
     if not trans_k:
         raise NotImplementedError("Non-transposed key cache is not implemented")
     architecture = (architecture or get_gfx_runtime()).split(":", 1)[0]
+    if architecture not in ("gfx942", "gfx950", "gfx1250", "gfx1250-strict"):
+        raise NotImplementedError(f"PA decode does not support {architecture}")
+    supported_sizes = context_partition_sizes(architecture)
+    if type(context_partition_size) is not int:
+        raise TypeError("context_partition_size must be an int")
+    if context_partition_size not in supported_sizes:
+        raise NotImplementedError(
+            f"{architecture} supports context_partition_size in {supported_sizes}, "
+            f"got {context_partition_size}"
+        )
     if architecture in ("gfx1250", "gfx1250-strict"):
         if query_splits is None:
-            # Split the measured spilling BF16 specialization into one Q tile
-            # per CTA. Other shapes retain fused queries and their KV reuse.
-            query_splits = (
-                4
-                if kv_dtype == "bf16"
-                and head_dim == 1024
-                and query_group_size == 16
-                and query_length == 4
-                and block_size == 128
-                and trans_v
-                and sliding_window == 0
-                else 1
+            query_splits = Gfx1250Traits.select_query_splits(
+                head_dim=head_dim,
+                query_group_size=query_group_size,
+                query_length=query_length,
+                kv_dtype=kv_dtype,
+                block_size=block_size,
+                sliding_window=sliding_window,
+                num_seqs=num_seqs,
+                num_kv_heads=num_kv_heads,
+                num_compute_units=num_compute_units,
+                work_capacity=work_capacity,
+                context_partition_size=context_partition_size,
+                max_context_length=max_context_length,
             )
         return compile_gfx1250_pa_decode(
             head_dim=head_dim,
@@ -261,11 +280,10 @@ def compile_pa_decode_tile(
             compute_dtype=kv_dtype,
             direct_output=direct_output and num_partitions == 1,
             query_splits=query_splits,
+            context_partition_size=context_partition_size,
             merge_partitions=direct_output and num_partitions > 1,
             cluster_merge=cluster_merge,
         )
-    if architecture not in ("gfx942", "gfx950"):
-        raise NotImplementedError(f"PA decode does not support {architecture}")
     if cluster_merge:
         raise NotImplementedError("cluster_merge requires gfx1250")
     if direct_output and kv_dtype != "mxfp4":
@@ -533,6 +551,7 @@ def compile_gfx1250_pa_decode(
     compute_dtype="fp8",
     direct_output=False,
     query_splits=1,
+    context_partition_size,
     merge_partitions=False,
     cluster_merge=0,
 ):
@@ -548,8 +567,12 @@ def compile_gfx1250_pa_decode(
     ``merge_partitions`` partial storage must be eight-byte aligned for its
     device-scope atomic accesses; the host wrapper falls back for offset views.
     """
-    if query_splits not in (1, 2, 4) or query_length % query_splits:
-        raise ValueError("query_splits must be 1, 2, or 4 and divide query_length")
+    if type(context_partition_size) is not int or (
+        context_partition_size not in context_partition_sizes("gfx1250")
+    ):
+        raise ValueError("gfx1250 context_partition_size must be 128 or 256")
+    if query_splits not in (1, 2, 3, 4) or query_length % query_splits:
+        raise ValueError("query_splits must be 1, 2, 3, or 4 and divide query_length")
     t = Gfx1250Traits(
         head_dim,
         query_group_size,
@@ -563,6 +586,7 @@ def compile_gfx1250_pa_decode(
         compute_dtype,
         direct_output,
         query_splits,
+        context_partition_size,
         merge_partitions,
         cluster_merge,
     )
@@ -607,9 +631,13 @@ def compile_gfx1250_pa_decode(
         sliding_window=sliding_window,
         query_splits=query_splits,
         direct_output=direct_output,
+        context_partition_size=context_partition_size,
         merge_partitions=merge_partitions,
         cluster_merge=cluster_merge,
     )
+
+    if t.fp8_batched_softmax:
+        kernel_name += f"_sm{t.m_tiles}"
 
     # Every argument that reducer-fed and direct-output kernels read fits in
     # the 30 user SGPRs (120 bytes) that preload kernel arguments, ahead of
