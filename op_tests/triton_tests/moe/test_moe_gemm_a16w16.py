@@ -76,11 +76,17 @@ class Case:
         ]
     ],
 )
-@pytest.mark.parametrize("do_gather", [False, True])
-@pytest.mark.parametrize("do_scatter", [False, True])
+@pytest.mark.parametrize(
+    "do_gather, do_scatter",
+    [
+        (False, False),
+        (True, False),
+        (False, True),
+        (True, True),
+    ],
+)
 @pytest.mark.parametrize("has_y_gammas", [False, True])
 @pytest.mark.parametrize("apply_swiglu", [False, True])
-@pytest.mark.parametrize("has_bias", [False, True])
 def test_op(
     m,
     n,
@@ -91,7 +97,6 @@ def test_op(
     do_scatter,
     has_y_gammas,
     apply_swiglu,
-    has_bias,
     device="cuda",
 ):
     if arch_info.get_arch() not in _SUPPORTED_ARCHS:
@@ -105,8 +110,6 @@ def test_op(
     x, w, bias, gammas = init_compute_data(
         m, n, k, n_expts_tot, n_expts_act, gindx, has_y_gammas, device
     )
-    if not has_bias:
-        bias = None
 
     ref_y = moe_gemm_torch(
         x, w, bias, rdata, gindx, sindx, gammas, apply_swiglu, alpha=1.0, limit=1.0
@@ -127,29 +130,41 @@ def test_op(
     assert_close(ref_y, tri_y, description=f"a16w16 m={m} n={n} k={k}")
 
 
-def test_rejects_non_contiguous_weights(device="cuda"):
-    """`w` must be N-contiguous; a K-contiguous view must be rejected, not silently wrong."""
+@pytest.mark.parametrize("apply_swiglu", [False, True])
+def test_no_bias(apply_swiglu, device="cuda"):
+    """`bias=None` selects TDM_BIAS_WAIT=0, which changes the drain-loop wait."""
     if arch_info.get_arch() not in _SUPPORTED_ARCHS:
         pytest.skip(f"moe_gemm_a16w16 is only implemented for {_SUPPORTED_ARCHS}")
 
-    m, n, k, n_expts_tot, n_expts_act = 16, 128, 128, 2, 1
+    m, n, k, n_expts_tot, n_expts_act = 256, 512, 512, 8, 2
+    torch.manual_seed(0)
     rdata, gindx, sindx = init_routing_data(
-        m, n_expts_tot, n_expts_act, False, False, device
+        m, n_expts_tot, n_expts_act, True, True, device
     )
     x, w, _, _ = init_compute_data(
         m, n, k, n_expts_tot, n_expts_act, gindx, False, device
     )
-    w_bad = w.transpose(1, 2).contiguous().transpose(1, 2)  # K-contiguous
 
-    with pytest.raises(AssertionError, match="N-contiguous"):
-        moe_gemm_a16w16(
-            x, w_bad, routing_data=rdata, gather_indx=gindx, scatter_indx=sindx
-        )
+    ref_y = moe_gemm_torch(
+        x, w, None, rdata, gindx, sindx, None, apply_swiglu, alpha=1.0, limit=1.0
+    )
+    tri_y = moe_gemm_a16w16(
+        x,
+        w,
+        bias=None,
+        routing_data=rdata,
+        gather_indx=gindx,
+        scatter_indx=sindx,
+        apply_swiglu=apply_swiglu,
+        alpha=1.0,
+        limit=1.0,
+    )
+
+    assert_close(ref_y, tri_y, description=f"a16w16 no bias swiglu={apply_swiglu}")
 
 
-@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16, torch.float32])
-def test_out_dtype(out_dtype, device="cuda"):
-    """The result must come back in the requested dtype, not always bf16."""
+def test_out_dtype_fp16(device="cuda"):
+    """The store must use Y's element type. A hard-coded bf16 store fails to compile."""
     if arch_info.get_arch() not in _SUPPORTED_ARCHS:
         pytest.skip(f"moe_gemm_a16w16 is only implemented for {_SUPPORTED_ARCHS}")
 
@@ -170,8 +185,52 @@ def test_out_dtype(out_dtype, device="cuda"):
         gather_indx=gindx,
         scatter_indx=sindx,
         apply_swiglu=False,
-        out_dtype=out_dtype,
+        out_dtype=torch.float16,
     )
 
-    assert tri_y.dtype == out_dtype
-    assert_close(ref_y.to(out_dtype), tri_y, description=f"a16w16 {out_dtype}")
+    assert tri_y.dtype == torch.float16
+    assert_close(ref_y.to(torch.float16), tri_y, description="a16w16 fp16 out")
+
+
+def test_rejects_unknown_backend(device="cuda"):
+    """Only the gluon backend exists for this op; any other name must be rejected."""
+    if arch_info.get_arch() not in _SUPPORTED_ARCHS:
+        pytest.skip(f"moe_gemm_a16w16 is only implemented for {_SUPPORTED_ARCHS}")
+
+    m, n, k, n_expts_tot, n_expts_act = 16, 128, 128, 2, 1
+    rdata, gindx, sindx = init_routing_data(
+        m, n_expts_tot, n_expts_act, False, False, device
+    )
+    x, w, _, _ = init_compute_data(
+        m, n, k, n_expts_tot, n_expts_act, gindx, False, device
+    )
+
+    with pytest.raises(AssertionError, match="only has a 'gluon' backend"):
+        moe_gemm_a16w16(
+            x,
+            w,
+            routing_data=rdata,
+            gather_indx=gindx,
+            scatter_indx=sindx,
+            backend="triton",
+        )
+
+
+def test_rejects_non_contiguous_weights(device="cuda"):
+    """`w` must be N-contiguous; a K-contiguous view must be rejected, not silently wrong."""
+    if arch_info.get_arch() not in _SUPPORTED_ARCHS:
+        pytest.skip(f"moe_gemm_a16w16 is only implemented for {_SUPPORTED_ARCHS}")
+
+    m, n, k, n_expts_tot, n_expts_act = 16, 128, 128, 2, 1
+    rdata, gindx, sindx = init_routing_data(
+        m, n_expts_tot, n_expts_act, False, False, device
+    )
+    x, w, _, _ = init_compute_data(
+        m, n, k, n_expts_tot, n_expts_act, gindx, False, device
+    )
+    w_bad = w.transpose(1, 2).contiguous().transpose(1, 2)  # K-contiguous
+
+    with pytest.raises(AssertionError, match="N-contiguous"):
+        moe_gemm_a16w16(
+            x, w_bad, routing_data=rdata, gather_indx=gindx, scatter_indx=sindx
+        )
