@@ -7,7 +7,8 @@ Arms are the adaptive kernel (`adaptive`), the single-launch kernel (`single`),
 the FlyDSL one-block kernel (`oneblock`) and the C++ one-block kernel (`hip`).
 `main` is not timed: each record names the arm main's dispatch picks for the
 cell, so its time is that arm's. Every arm is checked against `torch.topk`
-after the eager call and after each graph replay.
+after the eager call and, untimed after the timers, after each of 3 replays of
+a one-call graph, the output poisoned before each.
 
 Two timers, both on CUDA graphs:
   t1  16 calls per graph, 30 replays, GPU time per call, median of 3
@@ -46,7 +47,7 @@ from pathlib import Path
 
 import torch
 
-HARNESS_VERSION = 2
+HARNESS_VERSION = 3
 ROWS = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512)
 KS = (256, 512, 1024, 2048, 4096)
 DIAG_WIDTHS = (4096, 8192, 16384, 20000, 32768, 65536, 131072, 262144, 524288, 1048576)
@@ -229,6 +230,24 @@ def timer1(call, copies=16, iters=30, inner=3) -> list[float]:
     return runs
 
 
+def validate(call, x, seq_lens, out, k, replays=3) -> bool:
+    """Untimed: `check` after each replay of a one-call graph, `out` poisoned before
+    each one, so neither an eager warm-up nor a later replay can hide a bad one."""
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g, stream=stream):
+        call()
+    good = True
+    for _ in range(replays):
+        out.fill_(-2)
+        g.replay()
+        torch.cuda.synchronize()
+        good = good and check(x, seq_lens, out, k)
+    del g
+    return good
+
+
 def timer2(call, reps=31, warmup=3) -> list[float]:
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
@@ -387,23 +406,20 @@ def run_cell(
             torch.cuda.synchronize()
             ok = check(x, sl, out, cell.k)
             if "t1" in timers:
-                out.fill_(-2)
                 runs = timer1(call)
-                ok = ok and check(x, sl, out, cell.k)
                 rec.update(
                     t1=round(statistics.median(runs), 3),
                     t1_runs=[round(v, 3) for v in runs],
                 )
             if "t2" in timers:
-                out.fill_(-2)
                 runs = timer2(call)
-                ok = ok and check(x, sl, out, cell.k)
                 q = statistics.quantiles(runs, n=10)
                 rec.update(
                     t2=round(statistics.median(runs), 3),
                     t2_p10=round(q[0], 3),
                     t2_p90=round(q[-1], 3),
                 )
+            ok = ok and validate(call, x, sl, out, cell.k)
             rec.update(supported=True, correct=bool(ok))
         # Recorded, not raised, so one cell cannot end a sweep.
         except Exception as exc:  # noqa: BLE001
