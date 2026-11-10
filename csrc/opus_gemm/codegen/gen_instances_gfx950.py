@@ -3226,6 +3226,18 @@ def gen_mxscale_bpreshuffle_instance(
         entry = k.bpreshuffle_co
         symbol = entry["symbol"]
         grid_setup = f'AITER_CHECK(m % {k.m_align} == 0 && n % {k.B_N} == 0 && k % {k.B_K} == 0, "shape is unsupported by this CO");\n'
+        # Some COs bake shape-dependent strides into the device code. Enforce
+        # their manifest contract here, including for direct exact-kid callers.
+        supported_shapes = entry.get("supported_shapes")
+        if supported_shapes is not None:
+            allowed_shapes = (
+                " || ".join(
+                    f"(m == {sm} && n == {sn} && k == {sk})"
+                    for sm, sn, sk in supported_shapes
+                )
+                or "false"
+            )
+            grid_setup += f'    AITER_CHECK({allowed_shapes}, "shape is not declared for this CO");\n'
         if entry.get("grid_layout") in ("xcd", "linear"):
             grid_x = (
                 "((tiles + 7) / 8) * 8" if entry["grid_layout"] == "xcd" else "tiles"

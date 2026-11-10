@@ -62,6 +62,7 @@ from aiter.utility.base_tuner import GemmCommonTuner
 from aiter.utility.mp_tuner import mp_tuner
 
 TUNED_FILE = "aiter/configs/model_configs/dsv4_a8w8_mxfp8_bpreshuffle_tuned_gemm.csv"
+MXSCALE_TUNED_FILE = "aiter/configs/model_configs/dsv4_a8w8_blockscale_mxscale_bpreshuffle_tuned_gemm.csv"
 # The block of a shape list without a w_scale_block column, and of a tuned
 # table from before the column.
 W_SCALE_BLOCK = "1x32"
@@ -574,7 +575,17 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
         "errRatio": 0.05,
         "batch": 100,
         "profile_file": "",
+        "config_env_name": "AITER_CONFIG_GEMM_A8W8_MXFP8_BPRESHUFFLE",
     }
+
+    def get_arg_defaults(self):
+        defaults = super().get_arg_defaults()
+        if getattr(self, "_mxscale_table", False):
+            defaults.update(
+                tune_file=MXSCALE_TUNED_FILE,
+                config_env_name="AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE",
+            )
+        return defaults
 
     def getKernelName(self, kernelId):
         # Pipeline id ranges are disjoint (8-wave ids start at 1_000_000).
@@ -605,9 +616,31 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
 
     def pre_process(self, args):
         self._mxscale_table = args.mxscale_table
+        if self._mxscale_table and args.tune_file == TUNED_FILE:
+            args.tune_file = MXSCALE_TUNED_FILE
         if args.libtype == "opus" and not self._mxscale_table:
             self.parser.error("OPUS tuning requires --mxscale_table")
         super().pre_process(args)
+
+    def _clear_op_caches(self):
+        from aiter.ops import gemm_op_a8w8 as op
+
+        if getattr(self, "_mxscale_table", False):
+            op.get_mxscale_bpreshuffle_config.cache_clear()
+            op._load_mxscale_bpreshuffle_tuned.cache_clear()
+            op._mxscale_bpreshuffle_tuned_nk.cache_clear()
+            op._MXSCALE_UNTUNED_REPORTED.clear()
+        else:
+            op._get_mxfp8_bpreshuffle_config.cache_clear()
+            op._load_mxfp8_bpreshuffle_tuned.cache_clear()
+            op._mxfp8_bpreshuffle_tuned_nk.cache_clear()
+
+    def _restore_config_env(self, env_name, old_val, old_rebuild=0):
+        super()._restore_config_env(env_name, old_val, old_rebuild)
+        from aiter.jit.core import AITER_CONFIGS
+
+        AITER_CONFIGS.get_config_file.cache_clear()
+        self._clear_op_caches()
 
     def _bmm_seeds_mxfp8(self):
         """bmm seeds of a gfx950 1x32 shape in this op's table: ({(N, K):
@@ -685,6 +718,66 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
 
     def calculate(self, results, bpes=(1, 1, 2)):
         return super().calculate(results, bpes=(1, 1, 2))
+
+    def run_config(self, args):
+        from aiter.ops.gemm_op_a8w8 import (
+            gemm_a8w8_blockscale_bpreshuffle,
+            gemm_a8w8_mxfp8_bpreshuffle,
+        )
+        from aiter.test_common import checkAllclose, run_perftest
+
+        production_op = (
+            gemm_a8w8_blockscale_bpreshuffle
+            if self._mxscale_table
+            else gemm_a8w8_mxfp8_bpreshuffle
+        )
+        results = []
+        for _, row in self.untunedf.iterrows():
+            m, n, k = int(row["M"]), int(row["N"]), int(row["K"])
+            block = row.get("w_scale_block", W_SCALE_BLOCK)
+            shape = f"({m}, {n}, {k}, {block})"
+            allowed, allowed_desc = self._get_run_config_err_ratio_limit(row, args)
+            try:
+                if not self._mxscale_table and block != W_SCALE_BLOCK:
+                    raise ValueError(
+                        f"{block} production validation requires --mxscale_table"
+                    )
+                data = generate_data(m, n, k, 0, block)
+                if self.get_gfx() == "gfx1250" and block == W_SCALE_BLOCK:
+                    from aiter.ops.shuffle import shuffle_mxfp8fp4_scale
+
+                    data["w_scale"] = shuffle_mxfp8fp4_scale(data["w_scale"])
+                output, us = run_perftest(
+                    production_op,
+                    data["x"],
+                    data["weight_shuffle"],
+                    data["x_scale"],
+                    data["w_scale"],
+                    out=data["out"],
+                    num_warmup=args.warmup,
+                    num_iters=args.iters,
+                )
+                if not math.isfinite(us) or us <= 0:
+                    raise RuntimeError(f"invalid production timing {us}")
+                err = checkAllclose(
+                    run_torch(data["x_deq"], data["w_deq"]),
+                    output,
+                    msg=f"run_config {shape}",
+                    catastrophic_check=True,
+                )
+                status = (
+                    "ok"
+                    if err <= allowed
+                    else f"mismatch:err_ratio={err:.6g}(>{allowed_desc})"
+                )
+                results.append({"shape": shape, "e2e_us": us, "status": status})
+            except Exception as error:  # noqa: BLE001
+                results.append(
+                    {"shape": shape, "e2e_us": -1, "status": f"error:{error}"}
+                )
+            finally:
+                torch.cuda.empty_cache()
+        return results
 
     def tune(self, untunedf, tunedf, args):
         gfx = self.get_gfx()

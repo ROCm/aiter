@@ -1278,6 +1278,17 @@ def _gemm_mxscale_bpreshuffle(XQ, WQ, x_scale, w_scale, Y):
             f"mxscale bpreshuffle row {config['libtype']}/{config['kernelId']} "
             f"has no implementation"
         )
+    if Y.dtype != dtypes.bf16:
+        # OPUS and the gfx950 BMM write BF16 only. The mxpsh runner supports
+        # FP16 and consumes the same raw E8M0 scales and preshuffled weights.
+        from .flydsl.mxscale_preshuffle_kernels import run_gemm_a8w8_mxfp8_gfx950
+
+        kernel_name = (
+            str(config["kernelName"]) if backend == MXSCALE_MXFP8_KERNEL_ID else None
+        )
+        return run_gemm_a8w8_mxfp8_gfx950(
+            XQ, WQ, x_scale, w_scale, Y, kernel_name, w_scale_block
+        )
     if backend == MXSCALE_MXFP8_KERNEL_ID:
         from .flydsl.mxscale_preshuffle_kernels import run_gemm_a8w8_mxfp8_gfx950
 
