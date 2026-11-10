@@ -4,6 +4,7 @@
 """Benchmark the gfx1250 Gluon MoE GEMM with 16-bit activations and weights."""
 
 import argparse
+import functools
 import sys
 
 import torch
@@ -12,9 +13,21 @@ from aiter import logger
 from aiter.ops.triton.moe.moe_op_gemm_a16w16 import moe_gemm_a16w16
 from aiter.ops.triton.moe.moe_routing.routing import routing
 from aiter.ops.triton.utils._triton.arch_info import get_arch
-from op_tests.op_benchmarks.triton.utils.benchmark_utils import do_bench_aiter_triton
+from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
+    RotatingBufferBench,
+)
 
 _SUPPORTED_ARCHS = ("gfx1250",)
+
+# Names the values make_inputs returns, so the pool entry is the kernel's kwargs.
+_INPUT_KEYS = [
+    "x",
+    "w",
+    "routing_data",
+    "gather_indx",
+    "scatter_indx",
+    "apply_swiglu",
+]
 
 # (n, k, n_expts_tot, n_expts_act)
 DEFAULT_SHAPES = [
@@ -32,28 +45,24 @@ def make_inputs(m, n, k, n_expts_tot, n_expts_act, apply_swiglu, device):
     routing_data.gate_scal = None
     x = torch.randn((m, k), dtype=torch.bfloat16, device=device)
     w = torch.randn((n_expts_tot, k, n), dtype=torch.bfloat16, device=device)
-    return {
-        "x": x,
-        "w": w,
-        "routing_data": routing_data,
-        "gather_indx": gather_idx,
-        "scatter_indx": scatter_idx,
-        "apply_swiglu": apply_swiglu,
-    }
+    return x, w, routing_data, gather_idx, scatter_idx, apply_swiglu
 
 
 def run_shape(m, n, k, n_expts_tot, n_expts_act, args, device):
-    rot_bufs = [
-        make_inputs(m, n, k, n_expts_tot, n_expts_act, args.swiglu, device)
-        for _ in range(args.rotating_buffers)
-    ]
-    ms = do_bench_aiter_triton(
+    # Pin the pool length to --rotating-buffers, which the shape loop sizes.
+    bencher = RotatingBufferBench()
+    bencher.min_pool_len = args.rotating_buffers
+    bencher.max_pool_len = args.rotating_buffers
+    gen = functools.partial(
+        make_inputs, m, n, k, n_expts_tot, n_expts_act, args.swiglu, device
+    )
+    rot_bufs = bencher.build_pool([gen], [_INPUT_KEYS])
+    ms = bencher.bench(
         moe_gemm_a16w16,
-        rot_bufs,
         warmup_iters=args.warmup,
+        warmup_replays=args.warmup_replays,
         kernels_per_graph=args.kernels_per_graph,
         num_replays=args.replays,
-        warmup_replays=args.warmup_replays,
     )
 
     # each routed token does one (k x n) matvec
