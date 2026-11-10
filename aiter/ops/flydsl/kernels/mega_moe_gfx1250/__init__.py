@@ -19,14 +19,14 @@ def _pin_mori_jit_arch():
     if os.environ.get("MORI_GPU_ARCHS"):
         return
     try:
-        import torch
+        from aiter.jit.utils.chip_info import get_gfx_runtime  # rocminfo, no HIP init
 
-        if torch.cuda.is_available():
-            arch = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
-            if arch:
-                os.environ["MORI_GPU_ARCHS"] = arch
+        arch = get_gfx_runtime()
     except Exception:  # noqa: BLE001 -- no GPU: leave mori's own detection
-        pass
+        return
+    # Only the A0 case; every other GPU keeps mori's own detection unchanged.
+    if arch == "gfx1250-strict":
+        os.environ["MORI_GPU_ARCHS"] = arch
 
 
 _pin_mori_jit_arch()

@@ -18,19 +18,21 @@ def _pin_flydsl_target_arch():
     if os.environ.get("FLYDSL_GPU_ARCH"):
         return
     try:
-        import torch
+        from aiter.jit.utils.chip_info import get_gfx_runtime  # rocminfo, no HIP init
 
-        if torch.cuda.is_available():
-            arch = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
-            if arch:
-                os.environ["FLYDSL_GPU_ARCH"] = arch
+        arch = get_gfx_runtime()
     except Exception:  # noqa: BLE001 -- no GPU: keep FlyDSL's own detection
-        pass
+        return
+    # Only the A0 case; every other GPU (and any deliberate
+    # HSA_OVERRIDE_GFX_VERSION) keeps FlyDSL's own detection unchanged.
+    if arch == "gfx1250-strict":
+        os.environ["FLYDSL_GPU_ARCH"] = arch
 
 
 _pin_flydsl_target_arch()
 
 import flydsl as _flydsl  # noqa: E402
+
 from packaging.version import Version
 
 from aiter.fused_moe_registry import register_fused_moe_impl

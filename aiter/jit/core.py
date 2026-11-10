@@ -21,6 +21,7 @@ from packaging.version import Version, parse
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, f"{this_dir}/utils/")
+from build_targets import base_gfx_arch
 from chip_info import _detect_native, get_gfx, get_gfx_list, get_gfx_runtime
 from cpp_extension import _jit_compile, executable_path, get_hip_version
 from file_baton import FileBaton
@@ -1576,16 +1577,23 @@ def build_module(
         flags_cc += flags_extra_cc
         flags_hip += flags_extra_hip
         archs = validate_and_update_archs()
-        # GPU_ARCHS may name a sibling of the running GPU (e.g. gfx1250 on an
-        # MI450 A0 that reports gfx1250-strict). _needs_arch_rebuild() rebuilds
-        # for the running arch, so the build must target it too, or the
-        # rebuilt .so still lacks its code and fails to load.
+        # GPU_ARCHS may name only the base family of the running GPU (gfx1250
+        # on an MI450 A0, which reports gfx1250-strict). _needs_arch_rebuild()
+        # rebuilds for the running arch, so the build must target it too, or the
+        # rebuilt .so still lacks its code and fails to load. Only that variant
+        # case is touched: any other GPU_ARCHS (including deliberate cross-builds
+        # for a different arch) is used exactly as given.
         if "native" not in archs:
             try:
                 runtime_arch = get_gfx_runtime()
             except Exception:  # noqa: BLE001 -- no GPU visible: keep GPU_ARCHS
                 runtime_arch = None
-            if runtime_arch and runtime_arch not in archs:
+            if (
+                runtime_arch
+                and runtime_arch not in archs
+                and base_gfx_arch(runtime_arch) != runtime_arch
+                and base_gfx_arch(runtime_arch) in archs
+            ):
                 archs = archs + [runtime_arch]
         flags_hip += [f"--offload-arch={arch}" for arch in archs]
         flags_hip = sorted(set(flags_hip))  # remove same flags
