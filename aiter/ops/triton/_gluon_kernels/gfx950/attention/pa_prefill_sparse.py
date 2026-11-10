@@ -13,7 +13,8 @@ tiles, m starts at -FLT_MAX, p is rounded to bf16 for the PV product and l sums
 the fp32 p. The optional sink is one more key with value zero, added after the last
 tile. A row with no slots writes zeros.
 
-One program computes one query row for all H heads, the last rows first. Each
+One program computes one query row for H heads, the last rows first; with
+HEAD_GROUPS > 1, HEAD_GROUPS programs share a row, H heads each. Each
 tile is copied from the pool straight into one LDS buffer (128 bits per lane,
 64-bit offsets), then feeds the QK and PV MFMAs.
 
@@ -63,20 +64,37 @@ def _v_chunk(tile, c: gl.constexpr, dot_b: gl.constexpr):
     )
 
 
+@gluon.jit
+def _row_and_group(HEAD_GROUPS: gl.constexpr, NUM_XCDS: gl.constexpr):
+    # A row's head groups run at program ids L, L + NUM_XCDS, ..: on one XCD,
+    # so the later groups hit the first one's gathers in L2. The last
+    # T % NUM_XCDS rows run their groups at adjacent ids. Rows run last first.
+    L = gl.program_id(0)
+    T = gl.num_programs(0) // HEAD_GROUPS
+    full = T // NUM_XCDS * NUM_XCDS * HEAD_GROUPS
+    if L < full:
+        row = L // (NUM_XCDS * HEAD_GROUPS) * NUM_XCDS + L % NUM_XCDS
+        hg = L // NUM_XCDS % HEAD_GROUPS
+    else:
+        row = full // HEAD_GROUPS + (L - full) // HEAD_GROUPS
+        hg = (L - full) % HEAD_GROUPS
+    return T - 1 - row, hg
+
+
 _pa_prefill_sparse_repr = make_kernel_repr(
     "_pa_prefill_sparse",
-    ["H", "BLOCK_K", "HAS_SINK"],
+    ["H", "HEAD_GROUPS", "BLOCK_K", "HAS_SINK"],
 )
 
 
 @gluon.jit(repr=_pa_prefill_sparse_repr)
 def _pa_prefill_sparse(
-    q_ptr,  # [T, H, 512] bf16
+    q_ptr,  # [T, HEAD_GROUPS * H, 512] bf16
     kv_ptr,  # [S, 512] bf16
     idx_ptr,  # [nnz] int32, slots into kv
     indptr_ptr,  # [T + 1] int32
-    sink_ptr,  # [H] fp32, read only if HAS_SINK
-    o_ptr,  # [T, H, 512] bf16
+    sink_ptr,  # [HEAD_GROUPS * H] fp32, read only if HAS_SINK
+    o_ptr,  # [T, HEAD_GROUPS * H, 512] bf16
     stride_qt,
     stride_qh,
     stride_kv,
@@ -84,6 +102,8 @@ def _pa_prefill_sparse(
     stride_oh,
     qk_scale,  # fp32(scale) * fp32(log2(e))
     H: gl.constexpr,
+    HEAD_GROUPS: gl.constexpr,
+    NUM_XCDS: gl.constexpr,
     BLOCK_K: gl.constexpr,
     HAS_SINK: gl.constexpr,
 ):
@@ -118,7 +138,14 @@ def _pa_prefill_sparse(
     )
 
     tile = gl.allocate_shared_memory(gl.bfloat16, [BLOCK_K, D], kv_sl)
-    r = gl.num_programs(0) - 1 - gl.program_id(0)
+    if HEAD_GROUPS == 1:
+        r = gl.num_programs(0) - 1 - gl.program_id(0)
+    else:
+        r, hg = _row_and_group(HEAD_GROUPS, NUM_XCDS)
+        q_ptr += hg * H * stride_qh
+        o_ptr += hg * H * stride_oh
+        if HAS_SINK:
+            sink_ptr += hg * H
     beg = gl.load(indptr_ptr + r)
     n = gl.load(indptr_ptr + r + 1) - beg
     last = gl.maximum(n - 1, 0)

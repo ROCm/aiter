@@ -40,6 +40,7 @@ from aiter.ops.triton.gluon.mla_gluon import (
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
+from aiter.ops.triton.utils.device_info import get_num_xcds
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.tuned_config_utils import get_tuned_kernel_config
 
@@ -90,9 +91,10 @@ def pa_prefill_sparse(
     otherwise the Triton kernel. Only gfx1250 reads a second KV source; the
     other two serve the prefix source alone and reject any extend source.
 
-    Meant for prefill-sized calls. The grid is one program per query token with
-    no split over the KV slots, so a call with only a few query rows (a decode
-    step) leaves most of the GPU idle; use a split-KV decode kernel for those.
+    Meant for prefill-sized calls. The grid is one program per query token and
+    block of heads with no split over the KV slots, so a call with only a few
+    query rows (a decode step) leaves most of the GPU idle; use a split-KV
+    decode kernel for those.
 
     Args:
         q:                 [T, H, D] BF16/FP16 — queries.
@@ -363,10 +365,12 @@ def _single_pass_config() -> dict:
     return load_config_json(f"{cfg_dir}/DEFAULT.json")["_pa_prefill_sparse"]
 
 
-# The kernel computes 32 heads per program, so H=64 runs it twice, once per
-# half of the heads: one 64-head program measured slower than two 32-head
-# launches.
-_LAUNCH_HEADS = 32
+# The kernel computes 32 heads per program, so at H=64 two programs share each
+# query row, one per half of the heads, in one launch. The kernel places a
+# row's two programs on one XCD, so the second one's KV gathers can hit the
+# first one's in L2: on random slots over a 1 GiB pool, half as many KV reads
+# miss L2 as with one launch per half. One 64-head program measured slower.
+_GROUP_HEADS = 32
 _SINGLE_PASS_HEADS = (32, 64)
 
 
@@ -415,34 +419,35 @@ def _single_pass_prefill(
     softmax_scale: float,
     out: torch.Tensor,
 ) -> None:
-    """Launch the gfx950 single-pass kernel: one program per query row, once
-    per _LAUNCH_HEADS heads."""
+    """Launch the gfx950 single-pass kernel once: a program per query row and
+    _GROUP_HEADS heads."""
     T, H, _ = q.shape
+    groups = H // _GROUP_HEADS
     cfg = _single_pass_config()
     _LOGGER.info("PA_PREFILL_SPARSE gfx950 single-pass T=%d H=%d", T, H)
     if attn_sink is not None:
         attn_sink = attn_sink.to(torch.float32).contiguous()
-    for h0 in range(0, H, _LAUNCH_HEADS):
-        heads = slice(h0, h0 + _LAUNCH_HEADS)
-        q_h, out_h = q[:, heads], out[:, heads]
-        _pa_prefill_sparse_gfx950[(T,)](
-            q_h,
-            unified_kv,
-            kv_indices,
-            kv_indptr,
-            attn_sink[heads] if attn_sink is not None else None,
-            out_h,
-            q_h.stride(0),
-            q_h.stride(1),
-            unified_kv.stride(0),
-            out_h.stride(0),
-            out_h.stride(1),
-            _qk_scale(float(softmax_scale)),
-            H=_LAUNCH_HEADS,
-            BLOCK_K=cfg["BLOCK_K"],
-            HAS_SINK=attn_sink is not None,
-            num_warps=cfg["num_warps"],
-        )
+    _pa_prefill_sparse_gfx950[(T * groups,)](
+        q,
+        unified_kv,
+        kv_indices,
+        kv_indptr,
+        attn_sink,
+        out,
+        q.stride(0),
+        q.stride(1),
+        unified_kv.stride(0),
+        out.stride(0),
+        out.stride(1),
+        _qk_scale(float(softmax_scale)),
+        H=_GROUP_HEADS,
+        HEAD_GROUPS=groups,
+        # one compile for every device at H=32, where no row is shared
+        NUM_XCDS=get_num_xcds() if groups > 1 else 1,
+        BLOCK_K=cfg["BLOCK_K"],
+        HAS_SINK=attn_sink is not None,
+        num_warps=cfg["num_warps"],
+    )
 
 
 # ---------------------------------------------------------------------------
