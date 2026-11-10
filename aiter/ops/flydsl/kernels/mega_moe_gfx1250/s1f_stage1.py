@@ -799,8 +799,6 @@ def make_s1f_stage1(
             + (f"_ts{SPAN}" if SPAN != G else "")
             + f"_{g1_name}"
         )
-        # Keep the separate-kernel launcher in this cache key's dependency set.
-        _ = launch_gemm_a8w4_tdm
 
         @flyc.kernel(name=kname, known_block_size=[block, 1, 1])
         def kernel(

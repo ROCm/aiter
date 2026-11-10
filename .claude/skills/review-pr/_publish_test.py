@@ -56,6 +56,9 @@ CARD = """## aiter PR #9999 — a card
 Review (advisory): ⚠️ NEEDS WORK
 Validation (deterministic): N/A — no runtime surface changed
 Perf (advisory): NOT RUN — no idle GPU on this box
+Size: 12 lines / 2 files
+Design (advisory): NONE — a tooling-only change inside the existing skill layout
+Human: N/A — no design decision to route
 
 ⚠️ [verified] aiter/ops/shuffle.py:23 imports `_FLYDSL_USE_HERD` — **Author must** pin it.
 
@@ -285,13 +288,22 @@ def test_summary_indexes_every_anchored_finding(report, monkeypatch):
 def test_summary_carries_every_status_line_aiter_cards_have(report, monkeypatch):
     """aiter's card writes `Review (advisory):` where ATOM's writes `Review:`, and adds a
     Perf line ATOM has no counterpart for. Matching ATOM's literal prefixes would drop all
-    three, leaving a summary with no verdict in it at all."""
+    three, leaving a summary with no verdict in it at all. Step 7.8 adds Size / Design
+    (advisory) / Human: a `Human:` routing that fell into the findings block would read as
+    one more finding instead of the judgment this review routed to a person."""
     monkeypatch.setattr(_publish, "_api_raw", lambda *a, **k: DIFF)
     body = _publish.review_payload("9999")["body"]
     assert "Review (advisory): ⚠️ NEEDS WORK" in body
     assert "Validation (deterministic): N/A — no runtime surface changed" in body
     assert "Perf (advisory): NOT RUN — no idle GPU on this box" in body
+    assert "Size: 12 lines / 2 files" in body
+    assert "Design (advisory): NONE — a tooling-only change" in body
+    assert "Human: N/A — no design decision to route" in body
     assert "aiter-bot review pr=9999 head=deadbeef" in body
+    # and none of them may become an inline comment: they are status, not findings
+    comments = _publish.review_payload("9999")["comments"]
+    assert not [c for c in comments
+                if c["body"].lstrip().startswith(("Size:", "Design", "Human:"))]
 
 
 def test_card_md_is_not_rewritten(report, monkeypatch):

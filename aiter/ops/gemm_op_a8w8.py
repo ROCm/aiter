@@ -30,6 +30,7 @@ from ..ops.gemm_op_common import (
     mxscale_w_scale_block,
     with_mxscale_w_scale_block,
 )
+from ..plugin import route as _route
 from ..utility import dtypes
 from ..utility.graph_alloc import capture_scoped_cache, persistent_alloc
 from .mxfp8fp4gemm_common import (
@@ -1285,6 +1286,7 @@ def _gemm_mxscale_bpreshuffle(XQ, WQ, x_scale, w_scale, Y):
     return Y
 
 
+@_route(op="gemm_a8w8_blockscale")
 @torch_compile_guard(mutates_args=[], gen_fake=gemm_a8w8_blockscale_fake)
 def gemm_a8w8_blockscale(
     XQ: Tensor,
@@ -1491,6 +1493,12 @@ def _warn_blockscale_asm_row_not_bf16(n: int, k: int, dtype: torch.dtype):
     )
 
 
+# AITER exposes the shuffled-b weight layout as its own public function. It is a
+# layout, not a backend, so the name is allowed here -- but the two are not
+# independent: gemm_a8w8_blockscale with isBpreshuffled delegates to this one's
+# E8M0 route. Whether they should converge is #7150's question, not this one's;
+# routing them as they are keeps this pilot out of a public API change.
+@_route(op="gemm_a8w8_blockscale_bpreshuffle")
 @torch_compile_guard(gen_fake=gemm_a8w8_blockscale_bpreshuffle_fake)
 def gemm_a8w8_blockscale_bpreshuffle(
     XQ: Tensor,

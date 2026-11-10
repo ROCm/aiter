@@ -254,6 +254,7 @@ def fused_qk_norm_rope_cache_pts_quant_shuffle(
     v_norm: bool = False,
     q_out_fp8: Tensor | None = None,
     per_tensor_q_scale: Tensor | None = None,
+    k_out_unquantized: Tensor | None = None,
 ) -> None: ...
 
 

@@ -2495,7 +2495,13 @@ def build_fmha_fwd_prefill_a8w8_m32x8(
                 _v_descale = None
 
             # An empty batch must not enter the core: kv_len==0 would write O/0 = NaN.
-            if (q_len > fx.Int32(0)) & (kv_len > fx.Int32(0)):
+            # Nor a tile past this batch's queries: grid.x is sized by max_seqlen_q, so a
+            # shorter sequence's trailing tiles own no packed row. They would stream the
+            # whole KV band with every row masked and store nothing. The condition is
+            # uniform across the workgroup's waves, so they skip together.
+            first_row = _m_tile_idx() * fx.Int32(_block_m(NUM_Q_TILES))
+            tile_has_rows = first_row < q_len * fx.Int32(GQA_RATIO)
+            if (q_len > fx.Int32(0)) & (kv_len > fx.Int32(0)) & tile_has_rows:
                 _core_kwargs = {
                     "qk_hdim": QK_HDIM,
                     "v_hdim": V_HDIM,
@@ -2579,8 +2585,9 @@ def build_fmha_fwd_prefill_a8w8_m32x8(
                     warp_idx=warp_idx,
                     **{k: _core_kwargs[k] for k in _EPILOGUE_KEYS},
                 )
-            elif q_len > fx.Int32(0):
+            elif (q_len > fx.Int32(0)) & tile_has_rows:
                 # Cross-attention tail: q_len>0 but kv_len==0 -> O=0, LSE=-inf (or sink).
+                # A tile past the queries has no row to fill, so it skips this too.
                 _zero_fill_attention(
                     v_hdim=V_HDIM,
                     gqa_ratio=GQA_RATIO,

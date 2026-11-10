@@ -9,7 +9,7 @@ from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import ReductionOp
 
 from ..utils import rcp_f32
-from .traits import MFMA_ACC_ELEMS, MFMA_MNK, WAVE
+from .traits import KV_COMPUTE_BLOCK, MFMA_ACC_ELEMS, MFMA_MNK, WAVE
 
 
 class PaDecodeSoftmax:
@@ -121,9 +121,7 @@ class PaDecodeSoftmax:
                 ],
                 dtype=fx.Float32,
             )
-            needs_mask = (
-                tile_valid < self.traits.TILE_TOK + self.traits.query_length - 1
-            )
+            needs_mask = tile_valid < KV_COMPUTE_BLOCK + self.traits.query_length - 1
             if const_expr(self.traits.sliding_window > 0):
                 needs_mask = needs_mask | (window_left > 0)
             if needs_mask:
@@ -341,7 +339,7 @@ class PaDecodeSoftmax:
         for a in range_constexpr(self.traits.NCHUNK):
             Pa = fx.Vector(fx.exp2(masked_chunks[a] - m_new_b, fastmath="fast"))
             ls = ls + Pa.reduce(ReductionOp.ADD)
-            if const_expr(self.traits.is_bf16_kv):
+            if const_expr(self.traits.kv_dtype == fx.BFloat16):
                 p_scaled = Pa
             elif const_expr(self.traits.per_token_kv):
                 v_sc = (
@@ -354,7 +352,7 @@ class PaDecodeSoftmax:
                 p_scaled = Pa * fx.full(4, self.traits.FP8_MAX, fx.Float32)
             words.append(
                 p_scaled.to(fx.BFloat16)
-                if const_expr(self.traits.is_bf16_kv)
+                if const_expr(self.traits.kv_dtype == fx.BFloat16)
                 else self.gemm.fp8_words(p_scaled)[0]
             )
 
@@ -366,7 +364,7 @@ class PaDecodeSoftmax:
         )
         # Scatter P words in the interleave expected by PV reads.
         for a in range_constexpr(self.traits.NCHUNK):
-            if const_expr(self.traits.is_bf16_kv):
+            if const_expr(self.traits.kv_dtype == fx.BFloat16):
                 self.lds.store(p_off0 + a * MFMA_MNK * 2, fx.BFloat16, words[a])
             else:
                 self.lds.store(
@@ -444,7 +442,7 @@ class PaDecodeSoftmax:
                     zero4_p,
                 )
             ls = ls + Pa.reduce(ReductionOp.ADD)
-            if const_expr(self.traits.is_bf16_kv):
+            if const_expr(self.traits.kv_dtype == fx.BFloat16):
                 p_scaled = Pa
             elif const_expr(self.traits.per_token_kv):
                 v_scale_this = (
@@ -457,7 +455,7 @@ class PaDecodeSoftmax:
                 p_scaled = Pa * fx.full(4, self.traits.FP8_MAX, fx.Float32)
             words.append(
                 p_scaled.to(fx.BFloat16)
-                if const_expr(self.traits.is_bf16_kv)
+                if const_expr(self.traits.kv_dtype == fx.BFloat16)
                 else self.gemm.fp8_words(p_scaled)[0]
             )
         p_off0 = (
@@ -467,7 +465,7 @@ class PaDecodeSoftmax:
             * self.traits.QP_ELEM_BYTES
         )
         for a in range_constexpr(self.traits.NCHUNK):
-            if const_expr(self.traits.is_bf16_kv):
+            if const_expr(self.traits.kv_dtype == fx.BFloat16):
                 self.lds.store(p_off0 + a * MFMA_MNK * 2, fx.BFloat16, words[a])
             else:
                 self.lds.store(

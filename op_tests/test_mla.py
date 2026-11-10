@@ -159,6 +159,43 @@ def check_bf16_gqa32_merges_only_written_splits() -> None:
     cal_diff(ref, out, "bf16 gqa32 short-KV multi-split")
 
 
+def check_fp8_gqa16_multi_tile_output() -> None:
+    """gfx950 fp8 gqa16 decode, one row with 3 KV tiles, after a cache flush.
+    A wave must not refill an LDS KV slot while another wave still reads V
+    from it. A cache flush before each call makes this race likely."""
+    nhead, kv_lora_rank, qk_head_dim, num_kv = 16, 512, 576, 65536
+    sm_scale = 1.0 / 16
+    one = torch.ones(1, dtype=torch.float)
+    q = (torch.randn((1, nhead, qk_head_dim)) * 3).to(dtypes.fp8)
+    kv_buffer = torch.randn((num_kv, qk_head_dim)).to(dtypes.fp8)
+    flush = torch.zeros(64 << 20)
+    out = torch.empty((1, nhead, kv_lora_rank), dtype=torch.bfloat16)
+    num_bad = 0
+    for kv_len in range(257, 385):
+        kv_indices = torch.randperm(num_kv)[:kv_len].int()
+        flush.sum()
+        aiter.mla.mla_decode_fwd(
+            q,
+            kv_buffer.view(-1, 1, 1, qk_head_dim),
+            out,
+            torch.arange(2, dtype=torch.int),
+            torch.tensor([0, kv_len], dtype=torch.int),
+            kv_indices,
+            torch.ones(1, dtype=torch.int),
+            1,
+            sm_scale=sm_scale,
+            q_scale=one,
+            kv_scale=one,
+            num_kv_splits=1,
+            num_kv_splits_indptr=torch.tensor([0, 1], dtype=torch.int),
+        )
+        k = kv_buffer[kv_indices.long()].float()
+        ref = torch.softmax(q[0].float() @ k.T * sm_scale, -1) @ k[:, :kv_lora_rank]
+        err = (out[0].float() - ref).abs().max() / ref.abs().max()
+        num_bad += int(err > 0.05)
+    assert num_bad == 0, f"{num_bad} of 128 rows wrong after a cache flush"
+
+
 def cal_diff(
     x: torch.Tensor, y: torch.Tensor, name: str, use_fp8: bool = False
 ) -> None:
@@ -1064,6 +1101,9 @@ def main():
         aiter.logger.info("mla_decode_stage1_asm_fwd width checks: passed")
         check_bf16_gqa32_merges_only_written_splits()
         aiter.logger.info("bf16 gqa32 short-KV multi-split merge: passed")
+    if get_gfx() == "gfx950":
+        check_fp8_gqa16_multi_tile_output()
+        aiter.logger.info("fp8 gqa16 multi-tile decode: passed")
 
     for nhead, decode_qlen in args.nhead:
         df = []

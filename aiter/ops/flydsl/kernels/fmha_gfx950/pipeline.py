@@ -430,44 +430,6 @@ class DualwaveSwpFp8Traits:
     BODY_VARIANT: str = "default"
     GQA_PACK_M: bool = False
 
-    @property
-    def cache_tag(self):
-        """The independent builder arguments, and nothing derived from them.
-
-        Derived traits must remain functions of this key so distinct binaries cannot
-        share a cache entry.
-        """
-        base = (
-            "fp8_e4m3_dualwave_swp",
-            self.NUM_HEADS_Q,
-            self.NUM_HEADS_KV,
-            self.HEAD_DIM,
-            self.HEAD_DIM_V,
-            self.BLOCK_M,
-            self.CAUSAL,
-            self.DAZ,
-            self.DUALWAVE_SWP_LAZY_RESCALE,
-            self.DUALWAVE_SWP_RESCALE_THRESHOLD,
-            self.DUALWAVE_SWP_SETPRIO,
-            self.DUALWAVE_SWP_ENABLE_STAGGER,
-            self.NUM_KV_SPLITS,
-            self.VARLEN,
-            self.CROSS_SEQLEN,
-            self.BATCH_INTERLEAVE_GROUP,
-            self.RETURN_LSE,
-        )
-        # Suffix only for non-default flags so dense tags (and AOT artifacts keyed
-        # on them) stay unchanged.
-        if self.PAGED:
-            base += (("paged", self.K_SHUFFLED, self.V_SHUFFLED),)
-        if self.OUT_F16:
-            base += (("out_f16",),)
-        if self.BODY_VARIANT != "default":
-            base += ((self.BODY_VARIANT,),)
-        if self.GQA_PACK_M:
-            base += (("gqa_pack_m",),)
-        return base
-
 
 def _make_dualwave_swp_fp8_traits(
     num_heads,
