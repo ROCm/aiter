@@ -60,12 +60,12 @@ def _run_projection(
         ptr_arg(weight),
         ptr_arg(scale_ptr),
         ptr_arg(weight_scale.reshape(-1)),
-        # BF16 never reads the descale pointers.
-        ptr_arg(k_out_scale if output_fp8 else cache),
-        ptr_arg(v_out_scale if output_fp8 else cache),
         cache.shape[0],
         m,
         0.0 if scale_is_ptr else float(activation_scale),
+        # BF16 never reads the descale pointers.
+        ptr_arg(k_out_scale if output_fp8 else cache),
+        ptr_arg(v_out_scale if output_fp8 else cache),
         fx.Stream(torch.cuda.current_stream(device=cache.device)),
     )
     projection_spec = (n_heads, int(scale_is_ptr), cluster_n, int(output_fp8))
