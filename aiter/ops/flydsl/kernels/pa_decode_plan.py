@@ -315,7 +315,8 @@ def plan_pa_decode(
     """Build/refresh GPU work metadata on the current stream without readback.
 
     Allocate outside graph capture; pass ``plan`` to refresh buffers in place.
-    The budget counts task slots across KV heads before query splitting.
+    The budget counts task slots across KV heads before query splitting. It
+    defaults to two slots per CU, or one on gfx950 when ``query_length`` > 1.
     Each nonempty sequence gets at least one task. Elsewhere the remaining
     slots go to sequences in proportion to their tiles. On gfx950, batches that
     fit one row per planner thread instead give a sequence of t tiles
@@ -335,8 +336,8 @@ def plan_pa_decode(
 
     Lengths include MTP tokens. Positive windows include each query's position;
     nonpositive windows disable them. Plans cover the MTP window union: match
-    the window and query length when decoding or refreshing. Dense plans ignore
-    query length.
+    the window and query length when decoding or refreshing. Dense plans use
+    query length only for the gfx950 default budget.
     """
     if not isinstance(sliding_window, int):
         raise TypeError("sliding_window must be an int")
@@ -384,7 +385,15 @@ def plan_pa_decode(
         raise ValueError(f"max_partitions must be in [1, {num_compute_units}]")
     if plan is None:
         if workgroup_budget is None:
-            workgroup_budget = 2 * num_compute_units
+            # gfx950 multi-query tasks quantize and stage every query row, so
+            # one slot per CU, with longer tasks, pays that cost less often.
+            slots_per_cu = (
+                1
+                if query_length > 1
+                and properties.gcnArchName.split(":", 1)[0] == "gfx950"
+                else 2
+            )
+            workgroup_budget = slots_per_cu * num_compute_units
         if workgroup_budget < 1:
             raise ValueError("workgroup_budget must be positive")
         capacity = min(
