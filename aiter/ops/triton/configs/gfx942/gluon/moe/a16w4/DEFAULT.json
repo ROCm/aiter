@@ -1,0 +1,42 @@
+{
+    "bm16_n1536_k5120": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_warps": 8
+    },
+    "bm16_n768_k5120": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_warps": 8
+    },
+    "bm16_n5120_k768": {
+        "block_n": 128,
+        "block_k": 256,
+        "num_warps": 4
+    },
+    "bm16_n5120_k384": {
+        "block_n": 128,
+        "block_k": 128,
+        "num_warps": 4
+    },
+    "bm32_n1536_k5120": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_warps": 8
+    },
+    "bm32_n768_k5120": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_warps": 8
+    },
+    "bm32_n5120_k768": {
+        "block_n": 128,
+        "block_k": 256,
+        "num_warps": 4
+    },
+    "bm32_n5120_k384": {
+        "block_n": 128,
+        "block_k": 128,
+        "num_warps": 4
+    }
+}

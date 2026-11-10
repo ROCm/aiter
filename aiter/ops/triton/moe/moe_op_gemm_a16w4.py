@@ -2,7 +2,6 @@
 # original code https://github.com/triton-lang/triton/blob/main/python/triton_kernels/triton_kernels/matmul_details/_matmul.py
 
 import itertools
-import os
 from functools import lru_cache
 
 import torch
@@ -63,6 +62,21 @@ def can_overflow_int32(tensor: torch.Tensor):
 
 def should_upcast_indices(*args):
     return any(tensor is not None and can_overflow_int32(tensor) for tensor in args)
+
+
+def _gfx942_gluon_weight_layout_ok(w, w_scales):
+    """The gfx942 Gluon kernel addresses the packed fp4 tile as uint16 with 16-byte vector
+    loads along K and, for K-contiguous scales, 4-byte vectors of e8m0 scales: the base
+    pointers and the per-column / per-expert strides must keep those alignments. Contiguous
+    (E, N, K/2) weights viewed as (E, K/2, N) satisfy this whenever K % 128 == 0; padded or
+    offset views may not, and go to the Triton kernel instead."""
+    if w.data_ptr() % 16 or w.stride(-1) % 16 or w.stride(0) % 16:
+        return False
+    if w_scales.stride(-2) == 1 and (
+        w_scales.data_ptr() % 4 or w_scales.stride(-1) % 4 or w_scales.stride(0) % 4
+    ):
+        return False
+    return True
 
 
 def allocate_output(
@@ -325,19 +339,15 @@ def get_kernel_config_gluon_gfx942(m, n, k, routing_data):
     # long-K projections (gate-up: K = hidden size) at decode block sizes: wider K tile, 8 warps
     gateup_decode = k % 512 == 0 and k >= 2048
 
-    if block_m == 16:
-        block_n = 128
-        block_k = 512 if gateup_decode else block_k_decode
-        num_warps = 8 if gateup_decode else 4
-        grid_m = routing_data.n_blocks(m, block_m)
-        grid_n = triton.cdiv(n, block_n)
-        grid = grid_m * grid_n * split_k
-        while block_n > 16 * num_warps and grid < 256:
-            block_n = block_n // 2
-            grid_m = routing_data.n_blocks(m, block_m)
-            grid_n = triton.cdiv(n, block_n)
-            grid = grid_m * grid_n * split_k
-    elif block_m == 32:
+    # Swept entries ship in configs/gfx942/gluon/moe/a16w4/DEFAULT.json, keyed like the
+    # Triton table (block_m is the dispatch key, fixed by routing, not a tunable); the
+    # heuristic below generalises them to unkeyed shapes.
+    tuned = get_moe_dispatch("A16W4", "gfx942", "gluon").get(f"bm{block_m}_n{n}_k{k}")
+    if tuned is not None and k % tuned["block_k"] == 0:
+        block_n = tuned["block_n"]
+        block_k = tuned["block_k"]
+        num_warps = tuned["num_warps"]
+    elif block_m <= 32:
         block_n = 128
         block_k = 512 if gateup_decode else block_k_decode
         num_warps = 8 if gateup_decode else 4
@@ -349,6 +359,16 @@ def get_kernel_config_gluon_gfx942(m, n, k, routing_data):
         block_n = 256
         block_k = 128
         num_warps = 8
+
+    if block_m == 16:
+        grid_m = routing_data.n_blocks(m, block_m)
+        grid_n = triton.cdiv(n, block_n)
+        grid = grid_m * grid_n * split_k
+        while block_n > 16 * num_warps and grid < 256:
+            block_n = block_n // 2
+            grid_m = routing_data.n_blocks(m, block_m)
+            grid_n = triton.cdiv(n, block_n)
+            grid = grid_m * grid_n * split_k
 
     return {
         "block_m": block_m,
@@ -364,12 +384,6 @@ def get_kernel_config_gluon_gfx942(m, n, k, routing_data):
         "matrix_instr_nonkdim": 16,
         "kpack": 1,
     }
-
-
-# AITER_A16W4_GFX942_W_LDS=1 stages the fp4 weight tile through LDS with coalesced global loads
-# (2 columns x 128 B per quarter-wave); default loads it straight into the operand layout
-# (16 columns x 16 B per quarter-wave). Experimental switch, pending A/B on hardware.
-_GFX942_W_VIA_LDS = os.environ.get("AITER_A16W4_GFX942_W_LDS", "0") == "1"
 
 
 @lru_cache(maxsize=64)
@@ -528,9 +542,15 @@ def moe_gemm_a16w4(
             config = get_kernel_config_gluon_gfx1250(M, N, K, routing_data)
         elif get_arch() == "gfx942":
             # Gluon kernel: linear (unswizzled) e8m0 scales, K-contiguous fp4 weights,
-            # K a multiple of the tile; everything else goes to the Triton kernel.
+            # K a multiple of the tile, vector-load-aligned strides; everything else
+            # goes to the Triton kernel.
             config = None
-            if swizzle_mx_scale is None and w.stride(-2) == 1 and K % 128 == 0:
+            if (
+                swizzle_mx_scale is None
+                and w.stride(-2) == 1
+                and K % 128 == 0
+                and _gfx942_gluon_weight_layout_ok(w, w_scales)
+            ):
                 config = get_kernel_config_gluon_gfx942(M, N, K, routing_data)
                 if config is not None and K % (config["block_k"] * config["split_k"]) != 0:
                     config = None
@@ -621,7 +641,7 @@ def moe_gemm_a16w4(
 
     # launch kernel
     if backend == "gluon" and get_arch() == "gfx942":
-        load_x, load_w, load_s, mfma_layout, load_w_coal = _gfx942_layouts_cached(
+        load_x, load_w, load_s, mfma_layout = _gfx942_layouts_cached(
             config["block_m"], config["block_n"], config["block_k"], config["num_warps"]
         )
         _moe_gemm_a16w4_gluon_gfx942[(grid,)](
@@ -672,8 +692,6 @@ def moe_gemm_a16w4(
             LOAD_W=load_w,
             LOAD_S=load_s,
             MFMA_LAYOUT=mfma_layout,
-            LOAD_W_COAL=load_w_coal,
-            W_VIA_LDS=_GFX942_W_VIA_LDS,
             UPCAST_INDICES=should_upcast_indices(x, w, y),
             num_warps=config["num_warps"],
             num_stages=config["num_stages"],
