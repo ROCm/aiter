@@ -632,10 +632,10 @@ kernel_unified_attention_3d_repr = make_kernel_repr(
         "waves_per_eu",
         "num_stages",
         "ALL_DECODE",
+        "CAUSAL",
         "SHUFFLED_KV_CACHE",
         "IS_Q_FP8",
         "IS_KV_FP8",
-        "CAUSAL",
     ],
 )
 
@@ -694,11 +694,11 @@ def kernel_unified_attention_3d(
     num_stages: tl.constexpr,  # int
     NUM_SEGMENTS_PER_SEQ: tl.constexpr,  # int
     ALL_DECODE: tl.constexpr = False,  # bool
+    CAUSAL: tl.constexpr = True,  # bool
     SHUFFLED_KV_CACHE: tl.constexpr = False,  # bool
     K_WIDTH: tl.constexpr = 0,  # int
     IS_Q_FP8: tl.constexpr = False,  # bool
     IS_KV_FP8: tl.constexpr = False,  # bool
-    CAUSAL: tl.constexpr = True,  # bool
 ):
     # the launcher rejects a window for non-causal calls; keep -O from skipping it
     tl.static_assert(
