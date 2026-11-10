@@ -204,17 +204,47 @@ class PaDecodeQueryLoader:
             )
         return fmath.absf(q_unit).reduce(ReductionOp.MAX).to(fx.Float32)
 
+    def _packed_absmax(self):
+        return (
+            self.traits.IS_GFX950
+            and not self.traits.Q_ABSMAX_F32
+            and self.traits.Q_IN_DTYPE in (fx.BFloat16, fx.Float16)
+            and self.traits.QLOAD_UNIT % 2 == 0
+        )
+
+    def row_absmax(self, q_units):
+        """max |q| over this row's 16 lanes, as f32."""
+        if const_expr(not self._packed_absmax()):
+            absmax = self.local_absmax(q_units[0])
+            for u in range_constexpr(1, self.traits.N_QLOADS):
+                absmax = fx.maxnumf(absmax, self.local_absmax(q_units[u]))
+            for sh in (8, 4, 2, 1):
+                absmax = fx.maxnumf(absmax, dpp_utils.dpp_xor_f32(absmax, sh))
+            return absmax
+        # Non-negative f32 values order like their bits: reduce the bits with
+        # integer max, whose DPP forms fold into the max (rotate by 8 and 4
+        # within the row, then the two quad swaps, cover all 16 lanes).
+        bits = None
+        for u in range_constexpr(self.traits.N_QLOADS):
+            b = fx.Int32(
+                fx.Vector.from_elements(
+                    [self.local_absmax(q_units[u])], dtype=fx.Float32
+                ).bitcast(fx.Int32)[0]
+            )
+            bits = (
+                b
+                if bits is None
+                else fx.Int32(arith.maxui(fx.as_ir_value(bits), fx.as_ir_value(b)))
+            )
+        for ctrl in (0x128, 0x124, 0x4E, 0xB1):  # row_ror:8, row_ror:4, quad swaps
+            other = fx.Int32(dpp_utils.update_dpp_i32(bits, bits, ctrl, 0xF, 0xF, True))
+            bits = fx.Int32(arith.maxui(fx.as_ir_value(bits), fx.as_ir_value(other)))
+        return fx.Vector.from_elements([bits], dtype=fx.Int32).bitcast(fx.Float32)[0]
+
     @flyc.jit
     def quantize_row(self, m, q_row_off, q_units):
         """Each M-tile owns disjoint rows; only scale publication needs a lane guard."""
-        absmax = self.local_absmax(q_units[0])
-        for u in range_constexpr(1, self.traits.N_QLOADS):
-            absmax = fx.maxnumf(
-                absmax,
-                self.local_absmax(q_units[u]),
-            )
-        for sh in (8, 4, 2, 1):
-            absmax = fx.maxnumf(absmax, dpp_utils.dpp_xor_f32(absmax, sh))
+        absmax = self.row_absmax(q_units)
 
         q_scale = absmax * fx.Float32(1.0 / self.traits.FP8_MAX)
         if const_expr(self.traits.MXFP4):
