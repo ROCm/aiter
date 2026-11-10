@@ -453,21 +453,25 @@ class PaDecodeSchedule:
         )
         # gfx942 split CTAs launch split-major, so a task's splits dispatch
         # together instead of after every slot of the previous split. BF16
-        # head-dim splits forced by LDS only gain when tasks are long.
-        split_major = (
-            "gfx94" in arch
-            and query_splits > 1
-            and (
-                kv_dtype in FP8_KV_DTYPES
-                or head_dim <= 256
-                or (
-                    max_context_length is not None
-                    and max_tiles_per_task(
-                        num_seqs, work_capacity, num_partitions, max_context_length
+        # head-dim splits forced by LDS only gain when tasks are long. Several
+        # KV heads launch head-major on small grids, where the plan's empty
+        # slots otherwise delay every head after the first.
+        split_major = "gfx94" in arch and (
+            (
+                query_splits > 1
+                and (
+                    kv_dtype in FP8_KV_DTYPES
+                    or head_dim <= 256
+                    or (
+                        max_context_length is not None
+                        and max_tiles_per_task(
+                            num_seqs, work_capacity, num_partitions, max_context_length
+                        )
+                        >= 4
                     )
-                    >= 4
                 )
             )
+            or (num_kv_heads > 1 and not gfx942_busy)
         )
         cache_key = (
             head_dim,
