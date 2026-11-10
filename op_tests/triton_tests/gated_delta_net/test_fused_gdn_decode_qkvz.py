@@ -30,7 +30,7 @@ ATOL = 0.05
 FP8_DTYPE = torch.float8_e4m3fn
 FP8_MAX = 448.0
 
-# One batch per dispatch branch in the wrapper, rather than a scaled ladder --
+# One batch per gfx950 dispatch branch in the wrapper, rather than a scaled ladder --
 # sizes within a branch are duplicates of each other:
 #   1    -> _fused_decode,       grid (batch, k_heads)
 #   32   -> _fused_decode_tiled, B32=True, flattened 1-D grid
@@ -41,6 +41,19 @@ FP8_MAX = 448.0
 _BATCHES = [1, 32, 64, 127, 128, 256]
 # The recurrent state pool may be fp32 or bf16; the update runs in fp32 either way.
 _STATE_DTYPES = [torch.float32, torch.bfloat16]
+# The tensor operands of the op, in the order of its positional arguments.
+_OPERANDS = (
+    "projected_qkvz",
+    "projected_ba",
+    "conv_state",
+    "ssm_state",
+    "ssm_state_indices",
+    "conv_weight",
+    "conv_bias",
+    "A_log",
+    "dt_bias",
+    "norm_weight",
+)
 
 
 def split_qkvz(projected_qkvz, num_k_heads, num_v_heads, head_k_dim, head_v_dim):
@@ -671,21 +684,7 @@ def test_fused_gdn_decode_supported_rejects_cpu_optional_operands():
 
     batch = 4
     ops = to_flat_layout(make_inputs(batch, num_k_heads=16, ratio=3))
-    args = [
-        ops[k]
-        for k in (
-            "projected_qkvz",
-            "projected_ba",
-            "conv_state",
-            "ssm_state",
-            "ssm_state_indices",
-            "conv_weight",
-            "conv_bias",
-            "A_log",
-            "dt_bias",
-            "norm_weight",
-        )
-    ]
+    args = [ops[k] for k in _OPERANDS]
     vh, vd = ops["num_v_heads"], ops["head_v_dim"]
     qsl = torch.arange(batch + 1, dtype=torch.int32, device=device)
     out = torch.empty(batch, vh, vd, dtype=torch.bfloat16, device=device)
@@ -901,21 +900,8 @@ def test_fused_gdn_decode_determinism():
 # gating parameters, all against the same reference.
 # --------------------------------------------------------------------------
 
-_OPERANDS = (
-    "projected_qkvz",
-    "projected_ba",
-    "conv_state",
-    "ssm_state",
-    "ssm_state_indices",
-    "conv_weight",
-    "conv_bias",
-    "A_log",
-    "dt_bias",
-    "norm_weight",
-)
 
-
-def _run_and_compare(fused_gdn_decode_qkvz, inp, run_inp, qkvz_layout, **kwargs):
+def _run_and_compare(fused_gdn_decode_qkvz, inp, run_inp, qkvz_layout):
     """Reference on ``inp`` (interleaved), kernel on ``run_inp``; compares the
     output and both state pools."""
     ref_inp = {
@@ -928,7 +914,6 @@ def _run_and_compare(fused_gdn_decode_qkvz, inp, run_inp, qkvz_layout, **kwargs)
         norm_eps=run_inp["norm_eps"],
         quant_dtype=None,
         qkvz_layout=qkvz_layout,
-        **kwargs,
     )
     assert quant is None and scales is None
     torch.testing.assert_close(out.float(), ref_norm.float(), atol=ATOL, rtol=ATOL)
@@ -941,7 +926,6 @@ def _run_and_compare(fused_gdn_decode_qkvz, inp, run_inp, qkvz_layout, **kwargs)
         atol=ATOL,
         rtol=ATOL,
     )
-    return out
 
 
 @pytest.mark.parametrize("has_bias", [True, False])
@@ -997,8 +981,9 @@ def test_fused_gdn_decode_gfx1250_param_dtypes(dtype):
 
 
 def test_fused_gdn_decode_supported_arch_contract():
-    """The gfx1250-only capabilities are reported per arch, not assumed: gfx950
-    rejects them with a reason and gfx1250 accepts them."""
+    """The gfx1250-only inputs are reported per arch, not assumed: gfx950 rejects
+    them with a reason and gfx1250 accepts them. Both archs reject projection rows
+    that are not dense and a conv bias that is not [channels]."""
     _import_op()
     _requires_gluon_arch()
     from aiter.ops.triton.gated_delta_net.fused_gdn_decode_qkvz import (
@@ -1008,21 +993,31 @@ def test_fused_gdn_decode_supported_arch_contract():
 
     inp = to_flat_layout(make_inputs(4, num_k_heads=4, ratio=2))
     args = {k: inp[k] for k in _OPERANDS}
-    wide = torch.zeros(
-        4, inp["projected_qkvz"].shape[1] + 64, dtype=torch.bfloat16, device=device
-    )
-    variants = {
-        "no conv bias": {"conv_bias": None},
-        "strided projections": {
-            "projected_qkvz": wide[:, : inp["projected_qkvz"].shape[1]]
-        },
-        "bf16 A_log": {"A_log": inp["A_log"].to(torch.bfloat16)},
-    }
-    for name, change in variants.items():
-        ok, reason = fused_gdn_decode_qkvz_supported(
+
+    def supported(change):
+        return fused_gdn_decode_qkvz_supported(
             *{**args, **change}.values(), qkvz_layout="flat"
         )
+
+    assert supported({}) == (True, "")
+    width = inp["projected_qkvz"].shape[1]
+    wide = torch.zeros(4, 2 * width, dtype=torch.bfloat16, device=device)
+    # Each change with a word that the reason must contain.
+    gfx1250_only = [
+        ({"conv_bias": None}, "bias"),
+        ({"projected_qkvz": wide[:, :width]}, "projected_qkvz"),
+        ({"A_log": inp["A_log"].to(torch.bfloat16)}, "A_log"),
+    ]
+    rejected = [
+        ({"projected_qkvz": wide[:, ::2]}, "projected_qkvz"),
+        ({"conv_bias": inp["conv_bias"][:-1]}, "conv bias must be"),
+    ]
+    for change, word in gfx1250_only:
+        ok, reason = supported(change)
         if get_arch() == "gfx1250":
-            assert ok, (name, reason)
+            assert ok, (word, reason)
         else:
-            assert not ok and reason, name
+            assert not ok and word in reason, (word, reason)
+    for change, word in rejected:
+        ok, reason = supported(change)
+        assert not ok and word in reason, (word, reason)

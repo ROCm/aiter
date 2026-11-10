@@ -21,7 +21,7 @@ them.
 Usage:
     python3 bench_fused_gdn_decode_qkvz.py
     python3 bench_fused_gdn_decode_qkvz.py --batch 1,32,256 --no-fp8
-    # Qwen3.5-35B-A3B at TP4 on gfx1250: flat packing, bf16 state, 30 calls per graph
+    # Qwen3.5-35B-A3B TP4 shape on gfx1250: flat packing, bf16 state, 30 calls per graph
     python3 bench_fused_gdn_decode_qkvz.py --layout flat --state-dtype bf16 --no-fp8 \\
         --graph-kernels-per-graph 30
 """
@@ -46,7 +46,7 @@ from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
 )
 
 # Peak theoretical HBM bandwidth, bytes/s.
-_PEAK_BW = {"gfx1250": 18.64e12, "gfx950": 8.0e12, "gfx942": 5.3e12}
+_PEAK_BW = {"gfx950": 8.0e12, "gfx942": 5.3e12}
 _SUPPORTED_ARCHS = ("gfx950", "gfx1250")
 _HEAD_DIM = 128
 _CONV_WIDTH = 4

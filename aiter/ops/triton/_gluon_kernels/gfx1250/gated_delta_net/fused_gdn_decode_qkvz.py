@@ -8,8 +8,8 @@ This is the gfx950 ``_decode_group_ratio`` kernel for the wave32 layouts and buf
 instructions of gfx1250. It imports the helpers of that kernel that do not depend
 on the arch. One program updates the value heads of one (token, key-head group),
 one head at a time. Thus it keeps only one ``[V, K]`` state tile in registers, and
-two 16-wave programs fit on one CU. The kernel also accepts token-strided
-projections and no conv bias."""
+more programs fit on one CU. The kernel also accepts token-strided projections
+and no conv bias."""
 
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl

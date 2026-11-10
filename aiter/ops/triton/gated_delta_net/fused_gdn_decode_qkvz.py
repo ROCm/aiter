@@ -116,8 +116,8 @@ def _gluon_supported() -> tuple[bool, str]:
     3.7 builds where ``triton.experimental.gluon`` imports fine but the layout
     ops fail to compile. The decode kernels are built from exactly those
     primitives -- ``gl.BlockedLayout``, ``gl.convert_layout``, ``gl.amd.slice``
-    and ``gl.amd.cdna3.buffer_load``/``store`` -- so the gate is an explicit
-    ``>= 3.8`` version check, not just an import probe.
+    and the ``gl.amd`` buffer loads and stores of each arch -- so the gate is an
+    explicit ``>= 3.8`` version check, not just an import probe.
     """
     try:
         import triton
@@ -505,7 +505,6 @@ def fused_gdn_decode_qkvz(
 
         conv_width = 2 * head_k_dim + ratio * head_v_dim
         has_bias = conv_bias is not None
-        # 16 waves let two programs fit on one CU, the fastest at all batch sizes.
         config = _get_gfx1250_config(tokens)
         _decode_group_ratio_gfx1250[(tokens * k_heads,)](
             projected_qkvz,
