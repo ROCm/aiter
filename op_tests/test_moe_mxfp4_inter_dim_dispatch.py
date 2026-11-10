@@ -84,6 +84,10 @@ def _dispatch(
     ],
 )
 def test_mxfp4_swiglu_dispatch_by_inter_dim_alignment(inter_dim, want):
+    # gfx942 CK-Tile cannot apply swiglu_limit, so every SwiGLU shape the
+    # a16w4 FlyDSL port accepts (inter_dim % 128 == 0) uses that port.
+    if get_gfx() == "gfx942" and inter_dim % 128 == 0:
+        want = "flydsl"
     meta = _dispatch(inter_dim=inter_dim)
     got = (_stage_backend(meta.stage1), _stage_backend(meta.stage2))
     assert got == (want, want)

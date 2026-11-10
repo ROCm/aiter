@@ -126,3 +126,82 @@ def test_flydsl_a16wfp4_situv2_e2e(
     assert not out.isnan().any().item(), "a16w4 SiTUv2 output contains NaN"
     ld = _cos_diff(ref.float(), out.float())
     assert ld < 1e-2, f"a16w4 SiTUv2 cos/logits_diff too large: {ld:.3e}"
+
+
+@_SKIP
+@pytest.mark.parametrize("inter_dim", [256, 384])
+@pytest.mark.parametrize("swiglu_limit", [1.0, 7.0])
+def test_flydsl_a16wfp4_swiglu_limit_e2e(inter_dim, swiglu_limit):
+    """gfx942 SwiGLU, including 256-aligned inter_dim, applies swiglu_limit.
+
+    inter_dim=256 used to stay on CK-Tile, which has no limit argument.
+    """
+    if get_gfx() != "gfx942":
+        pytest.skip("swiglu_limit reroute is gfx942-only")
+    token, model_dim, E, topk = 4, 256, 4, 2
+    dtype = dtypes.bf16
+    torch.manual_seed(0)
+    torch.cuda.manual_seed(0)
+
+    inp = torch.randn((token, model_dim), dtype=dtype, device="cuda") * 3
+    w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtype, device="cuda")
+    w2 = torch.randn((E, model_dim, inter_dim), dtype=dtype, device="cuda")
+    score = torch.randn((token, E), dtype=dtype, device="cuda")
+    topk_weights, topk_ids = fused_topk(inp, score, topk, True)
+
+    tq = aiter.get_torch_quant(QuantType.per_1x32)
+    w1_qt, w1_scale = tq(w1, quant_dtype=dtypes.fp4x2)
+    w2_qt, w2_scale = tq(w2, quant_dtype=dtypes.fp4x2)
+    w1_qt = w1_qt.view(E, inter_dim * 2, model_dim // 2)
+    w2_qt = w2_qt.view(E, model_dim, inter_dim // 2)
+    w1_scale_e = w1_scale.view(E, inter_dim * 2, model_dim // 32)
+    w2_scale_e = w2_scale.view(E, model_dim, inter_dim // 32)
+
+    o1 = torch_moe_stage1(
+        inp.to(dtype),
+        w1_qt.view(dtypes.fp4x2),
+        w2_qt.view(dtypes.fp4x2),
+        topk_weights,
+        topk_ids,
+        dtype=dtype,
+        activation=ActivationType.Swiglu,
+        quant_type=QuantType.per_1x32,
+        w1_scale=w1_scale_e,
+        doweight=False,
+        swiglu_limit=swiglu_limit,
+    )
+    ref = torch_moe_stage2(
+        o1.view(token, topk, inter_dim),
+        w1_qt.view(dtypes.fp4x2),
+        w2_qt.view(dtypes.fp4x2),
+        topk_weights,
+        topk_ids,
+        dtype=dtype,
+        quant_type=QuantType.per_1x32,
+        w2_scale=w2_scale_e,
+        doweight=True,
+    )
+
+    w1_gui = shuffle_weight_a16w4(w1_qt, 16, False)
+    w2_gui = shuffle_weight_a16w4(w2_qt, 16, False)
+    w1_scale_gui = shuffle_scale_a16w4(w1_scale, E, False)
+    w2_scale_gui = shuffle_scale_a16w4(w2_scale, E, False)
+
+    out = fused_moe(
+        inp,
+        w1_gui,
+        w2_gui,
+        topk_weights,
+        topk_ids,
+        w1_scale=w1_scale_gui,
+        w2_scale=w2_scale_gui,
+        quant_type=QuantType.per_1x32,
+        activation=ActivationType.Swiglu,
+        doweight_stage1=False,
+        gate_mode=GateMode.SEPARATED.value,
+        swiglu_limit=swiglu_limit,
+    )
+
+    assert not out.isnan().any().item(), "a16w4 SwiGLU output contains NaN"
+    ld = _cos_diff(ref.float(), out.float())
+    assert ld < 1e-2, f"a16w4 SwiGLU cos/logits_diff too large: {ld:.3e}"
