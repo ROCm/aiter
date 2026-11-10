@@ -13,6 +13,8 @@ from ..kernels.kernels_common import get_warp_size
 from ..kernels.topk.radix_topk_one_block import (
     _COMPACT_CAPACITY,
     _MAX_ROW_ELEMENTS,
+    _long_row_block_threads,
+    _row_cache_enabled,
     build_radix_topk_one_block_module,
 )
 from ..kernels.topk.topk_launch import run_topk_launcher
@@ -476,14 +478,20 @@ def flydsl_radix_topk_one_block(
     wave_size = get_warp_size(arch)
     stream = torch.cuda.current_stream(logits.device)
     short_rows = width <= _COMPACT_CAPACITY
-    if num_rows <= _SHORT_ROWS_1024_THREAD_MAX_ROWS:
-        block_threads = 1024
-    elif short_rows:
-        block_threads = 256
-    elif is_decode and arch in _LONG_ROWS_512_THREAD_ARCHES:
-        block_threads = 512
+    if short_rows:
+        block_threads = 1024 if num_rows <= _SHORT_ROWS_1024_THREAD_MAX_ROWS else 256
     else:
-        block_threads = 1024
+        block_threads = _long_row_block_threads(k, stable, arch, num_rows)
+        # Decode rows the row cache does not take at 512 threads still go to
+        # 512-thread blocks past _SHORT_ROWS_1024_THREAD_MAX_ROWS rows.
+        if (
+            block_threads == 1024
+            and is_decode
+            and arch in _LONG_ROWS_512_THREAD_ARCHES
+            and num_rows > _SHORT_ROWS_1024_THREAD_MAX_ROWS
+            and not _row_cache_enabled(k, 512, stable, False, arch)
+        ):
+            block_threads = 512
     launcher = build_radix_topk_one_block_module(
         k,
         block_threads=block_threads,
