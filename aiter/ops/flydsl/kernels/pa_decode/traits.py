@@ -30,9 +30,10 @@ BF16_LDS_LIMIT_BYTES = 64 * 1024
 MXFP4_LDS_LIMIT_BYTES = 160 * 1024
 PAGE_ID_STAGE_LIMIT = 4096  # i32 page ids, 16 KiB of LDS.
 # gfx942 K/V streaming (PaDecodeTraits.STREAM_KV): lane K-row bytes from which
-# a single M-tile streams on busy grids and from which every tile streams, head
-# groups per K load piece, K pieces and V head chunks in flight.
+# a single or two M-tiles stream on busy grids and from which every tile
+# streams, head groups per K load piece, K pieces and V head chunks in flight.
 STREAM_KV_ROW_BYTES = 384
+STREAM_KV_TWO_MTILE_ROW_BYTES = 256
 STREAM_KV_MTILES_ROW_BYTES = 1024
 STREAM_K_GROUPS = 4
 STREAM_K_DEPTH = 2
@@ -668,9 +669,10 @@ class PaDecodeTraits:
         # gfx942 spills a whole next-tile K prefetch plus the tile's V gather
         # once a lane's K row reaches STREAM_KV_MTILES_ROW_BYTES; stream K and
         # V per chunk instead. MTP M-tiles share each streamed chunk. From
-        # STREAM_KV_ROW_BYTES a single M-tile no longer spills but runs at one
-        # wave per SIMD; streaming trades its K prefetch for occupancy, which
-        # only pays when more CTAs than CUs hold work.
+        # STREAM_KV_ROW_BYTES a single M-tile (STREAM_KV_TWO_MTILE_ROW_BYTES
+        # for two) no longer spills but runs at one wave per SIMD; streaming
+        # trades its K prefetch for occupancy, which only pays when more CTAs
+        # than CUs hold work.
         kv_row_bytes = head_dim * QP_ELEM_BYTES
         STREAM_KV = (
             not is_gfx950
@@ -681,6 +683,11 @@ class PaDecodeTraits:
                 kv_row_bytes >= STREAM_KV_MTILES_ROW_BYTES
                 or (
                     M_TILES == 1 and gfx942_busy and kv_row_bytes >= STREAM_KV_ROW_BYTES
+                )
+                or (
+                    M_TILES == 2
+                    and gfx942_busy
+                    and kv_row_bytes >= STREAM_KV_TWO_MTILE_ROW_BYTES
                 )
             )
         )
