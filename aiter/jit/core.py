@@ -544,6 +544,13 @@ class AITER_CONFIG:
 
         # Numeric columns compare as numbers, so 256 and 256.0 are one shape.
         comparable = merge_df.apply(as_numbers)
+        if has_tag:
+            # Lookups skip flydsl_fallback rows and serve every other row
+            # whatever its _tag, keeping the first per shape, so as a key the
+            # tag separates only those two kinds of row.
+            comparable["_tag"] = (
+                merge_df["_tag"].astype(str).str.strip().eq("flydsl_fallback")
+            )
         duplicated_mask = comparable.duplicated(subset=dedup_keys, keep=False)
         if not duplicated_mask.any():
             return
@@ -568,7 +575,11 @@ class AITER_CONFIG:
         if "select" in dup_rows.columns and "aiter" in sys.modules:
             from aiter.utility.power_configs import power_merge_conflict
 
-            conflict = power_merge_conflict(dup_rows, dedup_keys)
+            # Group by the tag as the check above does, not by its label.
+            conflict = power_merge_conflict(
+                dup_rows.assign(_tag=comparable["_tag"]) if has_tag else dup_rows,
+                dedup_keys,
+            )
         if conflict:
             # Ranking these rows against each other would compare watts from
             # different clocks or caps, or energy against latency. Keep every

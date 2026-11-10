@@ -365,6 +365,23 @@ class TestConfigShapeCollision(unittest.TestCase):
         self.assertIsNotNone(err, "256 and 256.0 were not seen as one shape")
         self.assertIn("duplicate shape", err.lower())
 
+    def test_merge_keys_tag_as_live_or_fallback(self):
+        """Lookups skip flydsl_fallback rows and serve every other row whatever
+        its _tag, so two live rows for one shape collide even when their labels
+        differ: here a label against the 0 the merge fills into a table without
+        the column. A fallback row may sit beside the live one."""
+        model = "gfx,cu_num,M,N,K,us\ngfx950,256,1,64,128,20.0\n"
+        for tag, collides in (("fused_expert", True), ("flydsl_fallback", False)):
+            with self.subTest(tag=tag):
+                err, _, _, _ = self._merge_synthetic(
+                    f"gfx,cu_num,M,N,K,us,_tag\ngfx950,256,1,64,128,10.0,{tag}\n",
+                    model,
+                )
+                if collides:
+                    self.assertIn("duplicate shape", (err or "").lower())
+                else:
+                    self.assertIsNone(err, err)
+
     def test_dedup_keeps_lowest_us_despite_unparseable_cell(self):
         """A written us that is not a number, here nan on an unrelated row, must
         not turn the lowest-us pick into a text sort, which keeps 10.5 over 9.5

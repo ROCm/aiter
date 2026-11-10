@@ -30,7 +30,9 @@ CSVs, or touch anything under `aiter/configs/**`.
    are present.** Never hand-pick key columns — they come from the family's
    `*_untuned_*.csv` header, exactly as runtime derives them (`update_config_files`
    appends `cu_num` if absent, `gfx` only when a `gfx` column exists in the merge,
-   and `_tag` only when a `_tag` column exists). Do not assume `M,N,K` alone: e.g.
+   and `_tag` only when a `_tag` column exists; it tells apart only
+   `flydsl_fallback` rows, which lookups skip, and live rows, whatever their
+   label). Do not assume `M,N,K` alone: e.g.
    `a8w8` also keys on
    `q_dtype_w`, `bf16` on `bias,dtype,outdtype,scaleAB,bpreshuffle`, `fmoe` on the
    full `token,model_dim,inter_dim,expert,topk,act_type,dtype,q_dtype_*,q_type,
