@@ -420,8 +420,19 @@ def _byte_ranges(tensor: torch.Tensor) -> list[tuple[int, int]]:
     return [(begin, begin + tensor.numel() * size)]
 
 
+def _is_fake(tensor: torch.Tensor) -> bool:
+    """A FakeTensor (AOT dry run), whose ``data_ptr`` is not an address."""
+    return type(tensor).__name__ == "FakeTensor"
+
+
 def _overlaps(lhs: torch.Tensor, rhs: torch.Tensor) -> bool:
     """Check if two tensors overlap in memory, row by row for a strided A."""
+    if (_is_fake(lhs) or _is_fake(rhs)) and (
+        lhs.untyped_storage()._cdata != rhs.untyped_storage()._cdata
+    ):
+        # The AOT dry run's data_ptr is storage identity plus offset: ranges of
+        # two storages are not comparable, and two storages never alias.
+        return False
     return any(
         lhs_begin < rhs_end and rhs_begin < lhs_end
         for lhs_begin, lhs_end in _byte_ranges(lhs)

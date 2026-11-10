@@ -435,6 +435,65 @@ def check_tuned_row_other_layouts() -> None:
         _assert_output(out, ref)
 
 
+_RUN_ONLY_PROBE = """
+import sys, torch
+from aiter.tuned_gemm import tgemm
+m, n, k = (int(v) for v in sys.argv[1:4])
+w = torch.randn(n, k, dtype=torch.bfloat16, device="cuda")
+x = torch.randn(m, k, dtype=torch.bfloat16, device="cuda")
+wide = torch.zeros(m, k + 64, dtype=torch.bfloat16, device="cuda")
+wide[:, :k] = x
+for a in (x, wide[:, :k]):
+    tgemm.mm(a, w)
+torch.cuda.synchronize()
+"""
+
+
+def check_decode_aot_run_only() -> None:
+    """The AOT build covers what the runtime selects for a decode row.
+
+    A row stride other than K selects a kernel of its own (``strided_a``).
+    One decode row is precompiled into a fresh cache, then a fresh process
+    with ``FLYDSL_RUNTIME_RUN_ONLY=1`` (no JIT) runs both a packed and a
+    column-slice A; either one missing from the cache raises there.
+    """
+    import csv
+    import os
+    import subprocess
+    import sys
+    import tempfile
+
+    rows = [key for key in _shipped_decode_rows() if key[2] > 1 and not key[5]]
+    key = rows[0]
+    row = get_GEMM_A16W16_config_()[key]
+    columns = ("gfx", "cu_num", "M", "N", "K", "bias", "dtype", "outdtype")
+    columns += ("scaleAB", "bpreshuffle")
+    with tempfile.TemporaryDirectory() as tmp:
+        table = os.path.join(tmp, "decode_bf16_tuned_gemm.csv")
+        with open(table, "w", newline="") as stream:
+            fields = columns + ("libtype", "solidx", "splitK", "us", "kernelName")
+            writer = csv.writer(stream)
+            writer.writerow(fields)
+            writer.writerow(list(key) + [row[name] for name in fields[len(key) :]])
+        env = dict(os.environ, FLYDSL_RUNTIME_CACHE_DIR=os.path.join(tmp, "cache"))
+        compiled = subprocess.run(
+            [sys.executable, "-m", "aiter.aot.flydsl.gemm", "--csv", table],
+            env=dict(env, GPU_ARCHS=ARCH),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert compiled.returncode == 0, compiled.stdout + compiled.stderr
+        probe = subprocess.run(
+            [sys.executable, "-c", _RUN_ONLY_PROBE, *map(str, key[2:5])],
+            env=dict(env, FLYDSL_RUNTIME_RUN_ONLY="1", AITER_CONFIG_GEMM_BF16=table),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert probe.returncode == 0, probe.stdout + probe.stderr
+
+
 CORRECTNESS_CASES = (
     check_wave_no_bias,
     check_wave_bias_and_odd_tails,
@@ -445,6 +504,7 @@ CORRECTNESS_CASES = (
     check_strided_activation,
     check_strided_activation_overlap,
     check_tuned_row_other_layouts,
+    check_decode_aot_run_only,
 )
 
 
