@@ -2752,32 +2752,6 @@ def compile_mixed_moe_gemm1_common(
                 f32_swiglu_limit,
             )
 
-    cache_tag = (
-        module_name,
-        a_dtype,
-        b_dtype,
-        out_dtype,
-        tile_m,
-        tile_n,
-        tile_k,
-        doweight_stage1,
-        act,
-        enable_bias,
-        model_dim_pad,
-        inter_dim_pad,
-        use_cshuffle_epilog,
-        persist_m,
-        use_async_copy,
-        waves_per_eu,
-        k_batch,
-        gate_mode,
-        a_scale_one,
-        xcd_swizzle,
-        v2_output_layout,
-    )
-    if heterogeneous_b:
-        cache_tag += (shared_expert_id,)
-
     def _launch_mixed_moe_gemm1(
         arg_out: fx.Pointer,
         arg_x: fx.Pointer,
@@ -2803,7 +2777,6 @@ def compile_mixed_moe_gemm1_common(
         f32_swiglu_limit: fx.Float32,
         stream: fx.Stream,
     ):
-        _ = cache_tag
         # LDS bytes are tracked automatically by the fly SharedAllocator; no
         # manual finalize is needed.
         ctx = CompilationContext.get_current()
@@ -4962,31 +4935,6 @@ def compile_mixed_moe_gemm2_common(
                 i32_size_expert_ids_in,
             )
 
-    cache_tag = (
-        module_name,
-        a_dtype,
-        b_dtype,
-        out_dtype,
-        tile_m,
-        tile_n,
-        tile_k,
-        doweight_stage2,
-        accumulate,
-        enable_bias,
-        model_dim_pad,
-        inter_dim_pad,
-        use_cshuffle_epilog,
-        persist_m,
-        _sort_block_m,
-        cu_num if persistent else 0,
-        waves_per_eu,
-        use_async_copy,
-        use_global_a,
-        xcd_swizzle,
-    )
-    if heterogeneous_b:
-        cache_tag += (shared_expert_id,)
-
     def _launch_mixed_moe_gemm2(
         arg_out: fx.Pointer,
         arg_x: fx.Pointer,
@@ -5007,7 +4955,6 @@ def compile_mixed_moe_gemm2_common(
         i32_size_expert_ids_in: fx.Int32,
         stream: fx.Stream,
     ):
-        _ = cache_tag
         # LDS bytes are tracked automatically by the fly SharedAllocator; no
         # manual finalize is needed.
         ctx = CompilationContext.get_current()
