@@ -329,6 +329,8 @@ class Arms:
 def environment() -> dict:
     import flydsl
 
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+
     props = torch.cuda.get_device_properties(0)
     src = {}
     for arm, files in _ARM_SOURCES.items():
@@ -339,7 +341,7 @@ def environment() -> dict:
     return {
         "harness": HARNESS_VERSION,
         "device": props.name,
-        "arch": props.gcnArchName.split(":")[0],
+        "arch": get_gfx_runtime(),
         "cu": props.multi_processor_count,
         "torch": torch.__version__,
         "rocm": torch.version.hip,
