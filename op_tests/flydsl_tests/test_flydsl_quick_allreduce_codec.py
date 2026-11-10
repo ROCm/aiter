@@ -587,3 +587,7 @@ def test_mesh_mirrors_a_single_named_lap(lap, codec):
 def test_mesh_rejects_two_different_laps():
     with pytest.raises(ValueError, match="one wire format"):
         _resolve("mesh", 8, rs="int6", ag="int4")
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))
