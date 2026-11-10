@@ -853,6 +853,38 @@ def test_decode_mixed_node():
     print("[decode_mixed_node] PASS")
 
 
+def test_decode_cu_num_lowers_never_raises():
+    """`CU_NUM` may lower the decode CU count but not raise it past the card, so
+    the gate never picks a larger card's bands nor sizes a grid for absent CUs."""
+    cases = [
+        # gfx, multi_processor_count, CU_NUM, expected
+        ("gfx942:sramecc+:xnack-", 80, None, 80),
+        ("gfx942:sramecc+:xnack-", 80, "64", 64),
+        ("gfx942:sramecc+:xnack-", 80, "304", 80),
+        # RDNA reports WGPs, two CUs each in the default WGP mode.
+        ("gfx1100", 48, None, 96),
+        ("gfx1100", 48, "304", 96),
+    ]
+    unset = ("CU_NUM", "GPU_ENABLE_WGP_MODE")
+    for gfx, count, cu_num, expected in cases:
+        props = mock.Mock(gcnArchName=gfx, multi_processor_count=count)
+        env = {k: v for k, v in os.environ.items() if k not in unset}
+        if cu_num is not None:
+            env["CU_NUM"] = cu_num
+        on_env = mock.patch.dict(os.environ, env, clear=True)
+        on_card = mock.patch.object(
+            torch.cuda, "get_device_properties", return_value=props
+        )
+        chip_info.get_cu_num_device.cache_clear()
+        try:
+            with on_env, on_card:
+                got = chip_info.get_cu_num_device(0)
+        finally:
+            chip_info.get_cu_num_device.cache_clear()
+        assert got == expected, (gfx, count, cu_num, got)
+    print("[decode_cu_num_lowers_never_raises] PASS")
+
+
 def test_decode_no_bound_skips_gate():
     """Without `max_row_len`, or with one below 1, the FlyDSL entry runs the
     single-launch kernel without asking the gate; with one it asks."""
@@ -2681,6 +2713,7 @@ def run_decode(args):
 def run_adaptive():
     test_decode_bound_gate()
     test_decode_mixed_node()
+    test_decode_cu_num_lowers_never_raises()
     test_decode_no_bound_skips_gate()
     test_decode_bound_below_one()
     card = (get_gfx_runtime(), get_cu_num_device(torch.cuda.current_device()))
