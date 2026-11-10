@@ -409,6 +409,32 @@ def check_strided_activation_overlap() -> None:
     _assert_output(in_gap, run_torch(a, b))
 
 
+def check_tuned_row_other_layouts() -> None:
+    """A tuned decode row does not narrow the layouts `tgemm.mm` accepts.
+
+    The row is picked from shape and dtype alone. An activation with a
+    non-unit column stride or column-major weights are layouts the decode
+    kernels refuse, so the call must fall back and still give the right C,
+    with and without ``out=``.
+    """
+    rows = [key for key in _shipped_decode_rows() if key[2] > 1 and not key[5]]
+    m, n, k = rows[0][2], rows[0][3], rows[0][4]
+    a, b = _inputs(m, n, k)
+    ref = run_torch(a, b)
+    wide = torch.zeros((m, 2 * k), device="cuda", dtype=a.dtype)
+    wide[:, ::2] = a
+    layouts = {
+        "A with column stride 2": (wide[:, ::2], b),
+        "column-major B": (a, b.T.contiguous().T),
+    }
+    for name, (inp, weights) in layouts.items():
+        assert not flydsl_gemm_kernels.decode_layout_supported(inp, weights), name
+        _assert_output(tgemm.mm(inp, weights), ref)
+        out = _output(m, n)
+        assert tgemm.mm(inp, weights, out=out) is out, name
+        _assert_output(out, ref)
+
+
 CORRECTNESS_CASES = (
     check_wave_no_bias,
     check_wave_bias_and_odd_tails,
@@ -418,6 +444,7 @@ CORRECTNESS_CASES = (
     check_tuned_rows_dispatch,
     check_strided_activation,
     check_strided_activation_overlap,
+    check_tuned_row_other_layouts,
 )
 
 

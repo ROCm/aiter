@@ -731,8 +731,12 @@ def flydsl_gemm(
     ), "FlyDSL hgemm does not support scaling yet."
     flydsl_gemm_kernels = _get_flydsl_gemm_kernels()
     if is_flydsl_decode_config(config):
+        # The row was picked from shape and dtype only; a layout the decode
+        # kernels do not take goes to torch, as an untuned shape would.
+        if not flydsl_gemm_kernels.decode_layout_supported(inp, weights, bias, out):
+            return torch_gemm(inp, weights, solidx, bias, otype, config=config, out=out)
         return flydsl_gemm_kernels.flydsl_decode_gemm(
-            inp, weights, config["kernelName"], bias=bias
+            inp, weights, config["kernelName"], bias=bias, out=out
         )
     flydsl_config = _flydsl_hgemm_kernel_params(config["kernelName"])
     skinny = flydsl_config["policy"] == flydsl_gemm_kernels.SKINNY_POLICY

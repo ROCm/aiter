@@ -57,6 +57,7 @@ __all__ = [
     "WaveDecodeConfig",
     "check_flydsl_decode_row",
     "compile_gemm_decode_bf16",
+    "decode_layout_supported",
     "flydsl_decode_gemm",
     "flydsl_hgemm",
     "flydsl_hgemm_kernel_name",
@@ -609,6 +610,31 @@ def check_flydsl_decode_row(
     if got != want:
         return f"kernel identity {got} does not match the call {want}"
     return None
+
+
+def decode_layout_supported(
+    inp: torch.Tensor,
+    weights: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+) -> bool:
+    """True when the operands' layouts are ones the decode kernels accept.
+
+    The layout half of ``validate_gemm_decode_tensors``: A row-major with a
+    unit column stride (any row stride ``>= K``), B and ``out`` packed, bias
+    contiguous. A tuned decode row is chosen from shape and dtype alone, so a
+    caller uses this to fall back instead of raising on other layouts.
+    """
+    if inp.dim() != 2 or weights.dim() != 2:
+        return False
+    m, k = inp.shape
+    if inp.stride(1) != 1 or (m > 1 and inp.stride(0) < k):
+        return False
+    if weights.stride() != (k, 1):
+        return False
+    if bias is not None and not bias.is_contiguous():
+        return False
+    return out is None or out.stride() == (weights.shape[0], 1)
 
 
 def flydsl_decode_gemm(
