@@ -302,24 +302,14 @@ def _refill_mxfp6_scale_tails(
     from aiter.ops.triton.quant import mxfp6_fmha_pack as fp6
 
     batch, rows, heads, _ = scale.shape
-    tiles = -(-rows // 128)
-    if not scale.is_contiguous() or records.stride(2) != tiles * fp6._K_TILE_BYTES:
+    tiles = -(-rows // fp6.FP6_K_TILE_TOKENS)
+    if not scale.is_contiguous() or records.stride(2) != tiles * fp6.FP6_K_TILE_BYTES:
         raise ValueError(
             "an MXFP6 K scale is a contiguous image of the rows the records were packed from"
         )
-    size = batch * heads * tiles * fp6._K_TILE_BYTES + fp6.FP6_K_BUFFER_SLACK_BYTES
+    size = batch * heads * tiles * fp6.FP6_K_TILE_BYTES + fp6.FP6_K_BUFFER_SLACK_BYTES
     flat = records.as_strided((size,), (1,)).clone()
-    fp6._fill_k_scale_tail_kernel[(batch * heads * tiles,)](
-        scale.view(-1),
-        flat,
-        rows,
-        heads,
-        tiles,
-        TILE_BYTES=fp6._K_TILE_BYTES,
-        SCALE_TAIL_OFFSET=fp6._K_SCALE_TAIL_OFFSET,
-        BLOCK=1024,
-        num_warps=4,
-    )
+    fp6.fill_fp6_k_scale_tails(flat, scale)
     return flat.as_strided(records.shape, records.stride())
 
 
