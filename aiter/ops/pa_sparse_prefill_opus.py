@@ -284,6 +284,9 @@ def pa_sparse_prefill_fp8_opus(
     served layout are converted to it on every call, into new tensors, by
     :func:`aiter.ops.triton.mla_v4_kv_rescale.to_dma_kv_layout`; callers whose
     caches are already in that layout pass ``kv_dma_layout=True`` to skip it.
+    QK^T takes its RoPE in bf16 from ``q_rope`` and ``unified_kv_rope`` /
+    ``kv_rope``, so those must hold the rows' real RoPE; the rows' fp8 RoPE feeds
+    only P*V.
 
     Args:
       q_nope:            ``[T, H, 512]`` fp8 query without positional encoding.
