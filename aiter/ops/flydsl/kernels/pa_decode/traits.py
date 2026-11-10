@@ -408,6 +408,10 @@ class PaDecodeSchedule:
         gfx942_busy = (
             "gfx94" in arch and split_workgroups * query_splits > num_compute_units
         )
+        # Two waves per SIMD only pay when two CTAs per CU have work.
+        gfx942_two_per_cu = (
+            gfx942_busy and split_workgroups * query_splits >= 2 * num_compute_units
+        )
         # Prefetch supported single-M query tiles independently of grid size.
         prefetch_v = (
             D256_PIPE
@@ -500,6 +504,7 @@ class PaDecodeSchedule:
             bool(mask_unowned_kv),
             direct_output,
             gfx942_busy,
+            gfx942_two_per_cu,
             split_major,
             D256_PIPE,
             stage_pages,
@@ -646,6 +651,7 @@ class PaDecodeTraits:
             mask_unowned_kv,
             DIRECT,
             gfx942_busy,
+            gfx942_two_per_cu,
             SPLIT_MAJOR,
             D256_PIPE,
             stage_page_capacity,
@@ -760,7 +766,7 @@ class PaDecodeTraits:
         # without spilling.
         WAVES_PER_EU_2 = (
             not is_gfx950
-            and gfx942_busy
+            and gfx942_two_per_cu
             and (
                 (
                     kv_dtype in FP8_KV_DTYPES
