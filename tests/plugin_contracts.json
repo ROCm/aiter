@@ -13,6 +13,13 @@
   "supersedes": [],
   "version": 1
  },
+ "mla_decode_fwd_v4_nm_ps": {
+  "fingerprint": "1fb9fb43fb0838c0",
+  "signature": "q_packed:positional, q_rope:positional, kv_packed:positional, kv_rope:positional, kv_indptr:positional, kv_page_indices:positional, sink:positional, workspace:positional:MlaV4NmPsWorkspace, out:positional=None, return_lse:positional=False, lse:positional=None",
+  "source": "aiter/mla.py",
+  "supersedes": [],
+  "version": 1
+ },
  "pertoken_quant": {
   "fingerprint": "ffb84335bd354c41",
   "signature": "x:positional, scale:positional=None, x_scale:positional=None, scale_dtype:positional=dtypes.fp32, quant_dtype:positional=dtypes.i8, dtypeMax:positional=None",

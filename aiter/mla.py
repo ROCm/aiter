@@ -31,6 +31,7 @@ from aiter.ops.attention import (
     _MlaHeadPlanKind,
     mla_ps64_qh128_fp8_asm_fwd,
 )
+from aiter.plugin import route as _route
 
 _FLYDSL_MLA_REDUCE_TARGET_GFX = ("gfx942", "gfx950")
 _FLYDSL_MLA_REDUCE_TARGET_H = 16
@@ -2664,6 +2665,7 @@ def mla_decode_fwd_v4_nm(
     return logits, attn_lse
 
 
+@_route(op="mla_decode_fwd_v4_nm_ps", version=1)
 def mla_decode_fwd_v4_nm_ps(
     q_packed,  # [N, 128, 512] FP8 packed Q+e8m0
     q_rope,  # [N, 128, 64] BF16

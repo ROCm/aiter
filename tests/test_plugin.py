@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import inspect
 from dataclasses import dataclass
-from typing import Any, ClassVar
+from typing import Any, ClassVar, NamedTuple
 
 import pytest
 
@@ -601,6 +601,75 @@ def test_no_dataclass_field_has_a_default_python_3_11_would_reject():
         "these defaults are unhashable, so 3.11's dataclasses refuse the class "
         f"and `import aiter` fails there: {', '.join(offenders)} -- use "
         "field(default_factory=...)"
+    )
+
+
+class _Workspace(NamedTuple):
+    """Shaped like `MlaV4NmPsWorkspace`: a handle the caller owns and passes in."""
+
+    o_acc: object
+    lse_acc: object
+    desc: object
+
+
+def test_a_caller_owned_workspace_reaches_the_provider_unchanged(monkeypatch):
+    """A contract can carry a workspace, and this is what that has to mean.
+
+    #7240 says a caller-owned handle is supported. Until an op with one was
+    routed that was an assertion nobody had executed, and the question it hides
+    is concrete: dispatch canonicalizes arguments through generated code, so a
+    `NamedTuple` could plausibly arrive rebuilt, flattened into its fields, or
+    copied. Any of those breaks the ownership the pattern exists for -- the
+    provider would be writing into scratch the caller cannot read back.
+
+    It arrives as the same object. `is`, not `==`, is the whole assertion.
+    """
+
+    seen = {}
+
+    @plugin.route(op="test.with_workspace", version=1)
+    def with_workspace(query, keys, workspace, out=None, return_lse=False):
+        return "native"
+
+    class Serving:
+        name = "wsprov"
+        api_versions: ClassVar[set] = {plugin.API_VERSION}
+        op_versions: ClassVar[dict] = {"test.with_workspace": {1}}
+
+        def select(self, op, args, kwargs):
+            seen["select"] = args
+
+            def run(*call_args, **call_kwargs):
+                seen["run"] = call_args
+                return "provider"
+
+            return plugin.KernelCandidate(
+                provider="wsprov",
+                kernel_id="ws-1",
+                artifact_digest="sha256:abc",
+                run=run,
+            )
+
+    monkeypatch.setattr(
+        plugin, "_entry_points", lambda: (_EntryPoint("wsprov", Serving()),)
+    )
+    plugin.configure(enable=("wsprov",), source="test")
+
+    workspace = _Workspace("o_acc", "lse_acc", "desc")
+    assert with_workspace("Q", "K", workspace, out="OUT", return_lse=True) == "provider"
+
+    assert seen["select"][2] is workspace, (
+        "select() received a different object than the caller passed; a "
+        "caller-owned workspace that is rebuilt on the way in is not caller-owned"
+    )
+    assert seen["run"][2] is workspace, "run() received a rebuilt workspace"
+    assert seen["select"][2]._fields == ("o_acc", "lse_acc", "desc"), (
+        "the workspace was flattened or coerced; a provider indexing it by "
+        "field would break"
+    )
+    assert seen["select"][3:] == ("OUT", True), (
+        "defaults past the workspace stopped being canonicalized into "
+        "positional arguments"
     )
 
 
