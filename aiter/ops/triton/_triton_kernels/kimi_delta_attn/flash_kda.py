@@ -1096,12 +1096,12 @@ def _build_metadata(
     """K1's chunk indices and the descriptors for the segmented recurrence.
 
     Returns ``(chunk_indices, desc, seq_seg_off, num_segs, max_segs_per_seq,
-    stream)``. ``chunk_indices`` is ``prepare_chunk_indices``' ``[NT, 2]`` table.
+    ticket)``. ``chunk_indices`` is ``prepare_chunk_indices``' ``[NT, 2]`` table.
     ``desc`` is a ``[6, num_segs]`` int32 tensor holding, per segment: the
     global chunk index it starts at (indexing the K1 workspace), its chunk
     count, its first and one-past-last token, its sequence, and whether it ends
-    that sequence. All three share one buffer and one non-blocking upload, made
-    on ``stream`` (see ``wait_for_upload``).
+    that sequence. All three share one buffer and one non-blocking upload, whose
+    ``ticket`` is what ``wait_for_upload`` takes.
 
     Cached on the sequence bounds, so the layers of a forward pass share the
     Python loop and the upload.
@@ -1134,7 +1134,7 @@ def _build_metadata(
         chunk_base + nchunks + tok_base + tok_end + seq_id + is_last
     )
     buf[off_at:] = seq_seg_off
-    dev_buf, stream = upload_ints(buf, torch.int32, device)
+    dev_buf, ticket = upload_ints(buf, torch.int32, device)
 
     max_per_seq = max(
         seq_seg_off[i + 1] - seq_seg_off[i] for i in range(len(seq_seg_off) - 1)
@@ -1145,7 +1145,7 @@ def _build_metadata(
         dev_buf[off_at:],
         num_segs,
         max_per_seq,
-        stream,
+        ticket,
     )
 
 
@@ -1333,11 +1333,11 @@ def flash_kda_fwd(
         chunks_per_seg = n_chunks_max
     segmented = n_chunks_max > chunks_per_seg
 
-    built_indices, desc, seq_seg_off, num_segs, max_segs, upload_stream = (
+    built_indices, desc, seq_seg_off, num_segs, max_segs, upload_ticket = (
         _build_metadata(seqs, C, chunks_per_seg, dev)
     )
     # The three tables are views of one buffer, which built_indices starts.
-    wait_for_upload(upload_stream, built_indices)
+    wait_for_upload(upload_ticket, built_indices)
     if cu_seqlens is not None:
         if chunk_indices is None:
             chunk_indices = built_indices

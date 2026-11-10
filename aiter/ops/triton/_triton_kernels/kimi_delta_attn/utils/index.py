@@ -11,6 +11,7 @@ import torch
 import triton
 
 from aiter.ops.triton._triton_kernels.kimi_delta_attn.chunk_delta_attn_utils import (
+    UploadTicket,
     tensor_cache,
     upload_ints,
     wait_for_upload,
@@ -54,9 +55,9 @@ def _chunk_indices_from_bounds(
     chunk_size: int,
     dtype: torch.dtype,
     device: torch.device,
-) -> tuple[torch.Tensor, torch.cuda.Stream]:
-    indices, stream = upload_ints(chunk_index_pairs(seqs, chunk_size), dtype, device)
-    return indices.view(-1, 2), stream
+) -> tuple[torch.Tensor, UploadTicket]:
+    indices, ticket = upload_ints(chunk_index_pairs(seqs, chunk_size), dtype, device)
+    return indices.view(-1, 2), ticket
 
 
 def prepare_chunk_indices(
@@ -81,11 +82,11 @@ def prepare_chunk_indices(
     Cached on the bounds, so the layers of a forward pass share one upload even
     when each passes a new tensor.
     """
-    indices, stream = _chunk_indices_from_bounds(
+    indices, ticket = _chunk_indices_from_bounds(
         seq_bounds(cu_seqlens, cu_seqlens_cpu),
         chunk_size,
         cu_seqlens.dtype,
         cu_seqlens.device,
     )
-    wait_for_upload(stream, indices)
+    wait_for_upload(ticket, indices)
     return indices
