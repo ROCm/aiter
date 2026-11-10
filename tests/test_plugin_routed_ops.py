@@ -10,6 +10,9 @@ they can gate every PR without a GPU runner (see tests/conftest.py).
 
 from __future__ import annotations
 
+import gc
+import subprocess
+import sys
 from dataclasses import dataclass
 from inspect import signature
 from typing import Any, ClassVar
@@ -427,6 +430,145 @@ def test_the_capture_time_decision_is_what_every_replay_runs(tmp_path, monkeypat
 
 
 @requires_cuda
+def _capture_cold(fn):
+    """Capture ``fn`` with no warm-up, so its first call lands inside.
+
+    The opposite of ``_capture``. What a framework does to an op its warmup
+    pass does not reach -- a decode-only op under a prefill-only dummy batch is
+    the shape ATOM already hit, which is why ``capture_cudagraph()`` calls
+    ``warmup_exchange()`` before recording.
+    """
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = fn()
+    return graph, out
+
+
+@requires_cuda
+def test_a_provider_allocating_on_its_first_call_inside_a_capture_keeps_it(
+    tmp_path, monkeypatch
+):
+    """Lazy allocation under capture is safe, and the memory is the provider's.
+
+    Worth pinning because the intuition runs the other way: capture-time
+    allocations are widely assumed to land in the graph's private pool and die
+    with it. They do not when the provider holds the reference -- measured on
+    gfx950 at 16 MiB, same address after the graph is gone.
+
+    The consequence is what this says to a provider author: you do not have to
+    pre-allocate to be correct. What you must not do is read a result back,
+    which the next test covers.
+    """
+
+    _install_reference_provider(tmp_path, monkeypatch)
+    plugin.configure(enable=("refprov",), source="test")
+    weight = torch.rand(8, device="cuda")
+    value = torch.rand(2, 8, device="cuda")
+
+    scratch = {}
+
+    def allocate_then_call():
+        if "t" not in scratch:
+            # The provider's lazy init, standing in for a tuning table or a
+            # workspace: it happens on the first call, which is this one.
+            scratch["t"] = torch.empty(1 << 20, dtype=torch.float32, device="cuda")
+            scratch["ptr"] = scratch["t"].data_ptr()
+        return aiter.rmsnorm2d_fwd(value, weight, 1e-6)
+
+    graph, _ = _capture_cold(allocate_then_call)
+    assert plugin.last_decision().route == "provider"
+
+    for _ in range(3):
+        graph.replay()
+    torch.cuda.synchronize()
+
+    del graph
+    gc.collect()
+    torch.cuda.synchronize()
+
+    assert scratch["t"].data_ptr() == scratch["ptr"], (
+        "the allocation moved or was freed with the graph; a provider that "
+        "allocates lazily under capture would be left holding a dangling buffer"
+    )
+    scratch["t"][:4].fill_(1.0)
+    torch.cuda.synchronize()
+    assert scratch["t"][:4].tolist() == [1.0, 1.0, 1.0, 1.0]
+
+
+_CAPTURE_READBACK_PROBE = """
+import torch
+
+x = torch.rand(16, device="cuda")
+graph = torch.cuda.CUDAGraph()
+side = torch.cuda.Stream()
+side.wait_stream(torch.cuda.current_stream())
+with torch.cuda.stream(side):
+    x.mul(2)
+torch.cuda.current_stream().wait_stream(side)
+torch.cuda.synchronize()
+
+try:
+    with torch.cuda.graph(graph):
+        x[0].item()          # the readback a provider's logging or assert would do
+    print("NOT_REFUSED")
+except Exception as error:
+    print("REFUSED", type(error).__name__)
+
+# Whatever the error said, is anything still usable?
+try:
+    torch.rand(8, device="cuda")
+    print("CONTEXT_SURVIVED")
+except Exception as error:
+    print("CONTEXT_POISONED", type(error).__name__)
+"""
+
+
+@requires_cuda
+def test_a_readback_under_capture_is_refused_and_takes_the_context_with_it():
+    """Run in a subprocess, because proving this ruins the process that proves it.
+
+    A provider's first call can land inside a capture (see the test above), and
+    the ordinary contents of a lazy init -- a log line with `.item()`, an assert
+    on a checksum, a `synchronize()` after setup -- read a result back. A capture
+    records instructions without executing them, so there is nothing to read.
+
+    What makes this worth a test rather than a line of documentation is the
+    second assertion. The refusal is not recoverable: the CUDA context is left
+    unusable, and the next unrelated allocation fails with a message naming
+    neither capture nor the provider. A provider author sees the symptom
+    somewhere else entirely.
+
+    Subprocess isolation is not fastidiousness. Run this inline and every CUDA
+    test after it in this file fails, including ones that have nothing to do
+    with plugins -- which is exactly how the behaviour was found.
+
+    Measured on gfx950 / torch 2.10.0+rocm7.2.4. If a future ROCm or PyTorch
+    makes readback under capture legal, or recoverable, this goes red and the
+    obligation stated in #7240 should be revisited.
+    """
+
+    result = subprocess.run(
+        [sys.executable, "-c", _CAPTURE_READBACK_PROBE],
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=False,  # the probe reports through stdout; a non-zero exit is
+    )  # itself a result, not a reason to raise here
+    out = result.stdout
+
+    assert "REFUSED" in out, (
+        f"reading a result back inside a capture was accepted; "
+        f"#7240's provider obligation rests on it being refused. stdout={out!r} "
+        f"stderr={result.stderr[-400:]!r}"
+    )
+    assert "CONTEXT_POISONED" in out, (
+        "the capture failure was recoverable -- the context survived. That is "
+        "better than what #7240 documents, and the RFC should be corrected "
+        f"rather than this test relaxed. stdout={out!r}"
+    )
+
+
 def test_turning_a_provider_off_does_not_reach_an_already_captured_graph(
     tmp_path, monkeypatch
 ):
