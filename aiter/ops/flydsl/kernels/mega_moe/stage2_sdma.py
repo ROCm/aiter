@@ -998,8 +998,10 @@ class MegaMoESdmaStage2:
         moe, op, lay = self.moe, self.moe._s1_op, self.layout
         nvm = int(moe._s1_nvm)
         return (
-            moe._s1_out.view(torch.uint8).view(-1),
-            moe.w2.view(torch.uint8).view(-1),
+            # A and B by address: the Stage1 output can pass the 2^31 elements a
+            # tensor argument's i32 size holds (see gemm2_8wave.fp8_buffer_at).
+            fx.Int64(moe._s1_out.data_ptr()),
+            fx.Int64(moe.w2.data_ptr()),
             moe._s1_osd.view(-1),
             moe.w2_scale.view(torch.uint8).view(-1),
             (nvm + 255) // 256 * 256,

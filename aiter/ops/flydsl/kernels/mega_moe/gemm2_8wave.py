@@ -49,14 +49,13 @@ from ..gemm_a8w8_8wave import (
     G2SLoader,
     S2RLoader,
     compute_global_swizzle,
-    make_fp8_buffer_tensor,
     wait_barrier,
 )
 from ..kernels_common import set_slp_vectorize_once_used
 from ..mxfp4_gemm_common import _fabs_f32 as fabs_f32
 from ..mxfp4_gemm_common import global_typed_ptr, lds_typed_ptr, lds_vec_load
 from ..tensor_shim import ptr_buf_tensor
-from .dispatch import _wave_inclusive_scan_i32, _wave_reduce_max_i32
+from .dispatch import _wave_inclusive_scan_i32
 from .quant import _FP8_E4M3_INV_MAX_POS_BITS
 from .stage2_sdma import (
     CDONE_STRIDE,
@@ -227,63 +226,111 @@ class MxMfma:
 # --- 256-row tiles of the expert segments --------------------------------------------
 
 
+def expert_rounds(experts):
+    """Rounds of 64 lanes that cover ``experts`` local experts (lane l of round r holds
+    expert ``64 * r + l``)."""
+    return (experts + 63) // 64
+
+
 def tile_table(tile_end, lane_id, *, SBM, experts):
-    """Per-lane 256-row tile counts of the local experts (lane e: expert e), from
-    Prepare's cumulative SBM-tile ends. Returns the per-lane values and the tile total.
+    """256-row tile counts of the local experts, from Prepare's cumulative SBM-tile ends.
+
+    One round of 64 lanes per 64 experts: lane l of round r holds expert ``64 * r + l``.
+    Returns, per round, ``(prev, seg, tiles, cum)`` -- the expert's first SBM tile, its
+    padded rows, its 256-row tiles and the inclusive running tile count over all experts
+    -- and the tile total.
     """
     ends = global_typed_ptr(tile_end, T.i32)
-    ok = lane_id < fx.Int32(experts)
-    li = ok.select(lane_id, fx.Int32(0))
-    end_l = ends[li]
-    prev_l = (ok & (lane_id > fx.Int32(0))).select(
-        ends[(li > fx.Int32(0)).select(li - fx.Int32(1), fx.Int32(0))], fx.Int32(0)
-    )
-    seg_l = ok.select((end_l - prev_l) * fx.Int32(SBM), fx.Int32(0))
-    tiles_l = (seg_l + fx.Int32(255)) >> fx.Int32(8)
-    cum_l = _wave_inclusive_scan_i32(tiles_l, lane_id)
-    total = fx.Int32(
-        rocdl.readfirstlane(
-            T.i32, fx.Int32(rocdl.ds_bpermute(T.i32, fx.Int32(63 * 4), cum_l))
+    rounds = []
+    carry = fx.Int32(0)
+    for r in range_constexpr(expert_rounds(experts)):
+        e = lane_id + fx.Int32(r * 64)
+        ok = e < fx.Int32(experts)
+        ei = ok.select(e, fx.Int32(0))
+        end_l = ends[ei]
+        prev_l = (ok & (e > fx.Int32(0))).select(
+            ends[(ei > fx.Int32(0)).select(ei - fx.Int32(1), fx.Int32(0))], fx.Int32(0)
         )
-    )
-    return (prev_l, seg_l, tiles_l, cum_l), total
+        seg_l = ok.select((end_l - prev_l) * fx.Int32(SBM), fx.Int32(0))
+        tiles_l = (seg_l + fx.Int32(255)) >> fx.Int32(8)
+        cum_l = _wave_inclusive_scan_i32(tiles_l, lane_id) + carry
+        # The last lane's inclusive count carries into the next round.
+        carry = fx.Int32(
+            rocdl.readfirstlane(
+                T.i32, fx.Int32(rocdl.ds_bpermute(T.i32, fx.Int32(63 * 4), cum_l))
+            )
+        )
+        rounds.append((prev_l, seg_l, tiles_l, cum_l))
+    return rounds, carry
 
 
-def tile_table_to_lds(values, tab_lds, lane_id):
-    """Park the per-lane table in LDS (every wave writes the same values), so the
-    persistent loop does not keep it in VGPRs."""
+def tile_table_lds_bytes(experts):
+    """LDS of the tile table: four i32 fields per expert slot of every round."""
+    return 4 * expert_rounds(experts) * 64 * 4
+
+
+def tile_table_to_lds(rounds, tab_lds, lane_id):
+    """Park the table in LDS (every wave writes the same values), so the persistent
+    loop does not keep it in VGPRs. Field f of expert e sits at ``f * slots + e``."""
     p = lds_typed_ptr(tab_lds, T.i32)
-    for i, v in enumerate(values):
-        p[fx.Int32(i * 64) + lane_id] = v
+    slots = len(rounds) * 64
+    for r, values in enumerate(rounds):
+        for f, v in enumerate(values):
+            p[fx.Int32(f * slots + r * 64) + lane_id] = v
 
 
 def tile_find(tab_lds, j, lane_id, *, SBM, experts):
     """(row_base, expert, valid_rows) of 256-row tile ``j`` -- LDS and wave ops only."""
     p = lds_typed_ptr(tab_lds, T.i32)
-    prev_l, seg_l, tiles_l, cum_l = [
-        fx.Int32(p[fx.Int32(i * 64) + lane_id]) for i in range(4)
-    ]
-    ok = lane_id < fx.Int32(experts)
-    before = _wave_reduce_max_i32(
-        (ok & (cum_l <= j)).select(lane_id + fx.Int32(1), fx.Int32(0)), lane_id
-    )
+    slots = expert_rounds(experts) * 64
+    # The running count is non-decreasing over the experts, so the experts whose tiles
+    # all come before tile j are a prefix, and their number is the expert holding j.
+    before = fx.Int32(0)
+    for r in range_constexpr(expert_rounds(experts)):
+        cum_l = fx.Int32(p[fx.Int32(3 * slots + r * 64) + lane_id])
+        done = ((lane_id + fx.Int32(r * 64)) < fx.Int32(experts)) & (cum_l <= j)
+        before = before + fx.Int32(fx.math.ctpop(fx.Int64(rocdl.ballot(T.i64, done))))
     e = fx.Int32(rocdl.readfirstlane(T.i32, before))
     e = (e < fx.Int32(experts)).select(e, fx.Int32(experts - 1))
 
-    def from_lane(v):
+    def field(f):
+        # Every lane reads the same word: an LDS broadcast.
         return fx.Int32(
-            rocdl.readfirstlane(
-                T.i32, fx.Int32(rocdl.ds_bpermute(T.i32, e * fx.Int32(4), v))
-            )
+            rocdl.readfirstlane(T.i32, fx.Int32(p[fx.Int32(f * slots) + e]))
         )
 
-    t_in = j - from_lane(cum_l - tiles_l)
-    row_base = from_lane(prev_l * fx.Int32(SBM)) + t_in * fx.Int32(256)
-    left = from_lane(seg_l) - t_in * fx.Int32(256)
+    prev_e, seg_e, tiles_e, cum_e = field(0), field(1), field(2), field(3)
+    t_in = j - (cum_e - tiles_e)
+    row_base = prev_e * fx.Int32(SBM) + t_in * fx.Int32(256)
+    left = seg_e - t_in * fx.Int32(256)
     valid = (left > fx.Int32(256)).select(
         fx.Int32(256), (left > fx.Int32(0)).select(left, fx.Int32(0))
     )
     return row_base, e, valid
+
+
+def fp8_buffer_at(base, nbytes, fp8_ir_t):
+    """An fp8 buffer view of ``nbytes`` from the i64 address ``base``.
+
+    Each tile gets its own descriptor based at its first A row / B row, so the offsets
+    the loads add stay within the tile (at most 256 rows x K) whatever the tile's
+    position: ``row_base * K`` in i32 overflows once a rank holds 2^31 / K rows (about
+    700K at K = 3072, reached by EP8 with 16K tokens per rank all routed to one rank),
+    and one descriptor over the whole buffer cannot cover more than 4 GiB anyway. For
+    the same reason the kernel takes A and B as addresses, not tensors: a tensor
+    argument carries its element count as an i32, which the Stage1 output exceeds at
+    EP8 with 16K tokens per rank (rows sized for every route of every rank, ~2.4 GB).
+    """
+    t_i8 = ptr_buf_tensor(base, fx.Int8, num_records_bytes=nbytes)
+    iter_i8 = fx.get_iter(t_i8)
+    f8_ptr_ty = fx.PointerType.get(
+        elem_ty=fp8_ir_t,
+        address_space=rocdl.TargetAddressSpace.BufferDesc,
+        alignment=16,
+    )
+    return fx.Tensor(
+        fx.make_view(fx.recast_iter(f8_ptr_ty, iter_i8), fx.get_layout(t_i8))
+    )
 
 
 # --- Small helpers -------------------------------------------------------------------
@@ -431,8 +478,11 @@ def compile_gemm2_8wave_sdma(
     gemm_ctas = grid_ctas - 1
     log2_max_tok = max_tok.bit_length() - 1
 
-    epi_bytes = 128 * 256 + 128 * 8 + 3 * 256 * 4 + 4 * 64 * 4
-    assert 4 * (a_lds_size + b_lds_size) + epi_bytes <= LDS_LIMIT_BYTES
+    tab_bytes = tile_table_lds_bytes(experts)
+    epi_bytes = 128 * 256 + 128 * 8 + 3 * 256 * 4 + tab_bytes
+    assert (
+        4 * (a_lds_size + b_lds_size) + epi_bytes <= LDS_LIMIT_BYTES
+    ), f"{experts} local experts: the tile table takes {tab_bytes} B of LDS, too many"
 
     kname = (
         f"mega_moe_gemm2_8wave_sdma_n{N}_k{K}_e{experts}_t{topk}_p{npes}_m{max_tok}_s{SBM}"
@@ -457,12 +507,12 @@ def compile_gemm2_8wave_sdma(
         E_orow: fx.Array[fx.Float8E4M3FN, 256 * 4, 16]  # out_row per tile row
         E_src: fx.Array[fx.Float8E4M3FN, 256 * 4, 16]  # packed srcmap word per tile row
         E_wts: fx.Array[fx.Float8E4M3FN, 256 * 4, 16]  # routing weight per tile row
-        E_tab: fx.Array[fx.Float8E4M3FN, 4 * 64 * 4, 16]  # the tile table
+        E_tab: fx.Array[fx.Float8E4M3FN, tab_bytes, 16]  # the tile table
 
     @flyc.kernel(name=kname, known_block_size=[512, 1, 1])
     def kernel(
-        A: fx.Tensor,
-        B_T: fx.Tensor,
+        a_ptr: fx.Int64,
+        b_ptr: fx.Int64,
         A_scale: fx.Tensor,
         B_scale: fx.Tensor,
         c_m: fx.Int32,
@@ -486,6 +536,8 @@ def compile_gemm2_8wave_sdma(
         F8_IR_t = fx.Float8E4M3FN.ir_type
         n_blocks = fx.Int32(N // BLOCK_N)
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
+        a_base = _uniform_i64(a_ptr)
+        b_base = _uniform_i64(b_ptr)
 
         def lds_addr(arr):
             return fx.Int32(fx.ptrtoint(arr.ptr))
@@ -513,16 +565,36 @@ def compile_gemm2_8wave_sdma(
             )
             b_row_block = expert * n_blocks + block_n
 
-            A0_gl_offset = row_base * K
-            A1_gl_offset = (row_base + LDS_BLOCK_M) * K
-            B0_gl_offset = (b_row_block * BLOCK_N) * (K // 2)
-            B1_gl_offset = (b_row_block * BLOCK_N + LDS_BLOCK_N) * (K // 2)
+            # Descriptors based at the tile (see fp8_buffer_at): the offsets below are
+            # within it. The A one ends where the buffer does (rows past c_m read zero,
+            # as with one descriptor over the whole buffer).
+            a_rows = c_m - row_base
+            a_rows = (a_rows < fx.Int32(BLOCK_M)).select(a_rows, fx.Int32(BLOCK_M))
+            a_rows = (a_rows > fx.Int32(0)).select(a_rows, fx.Int32(0))
+            # The backend turns this clamp into v_med3_i32, a VALU-only op. That
+            # would put the descriptor in VGPRs and wrap every A load in a
+            # waterfall loop, so move the value back to an SGPR.
+            a_rows = fx.Int32(rocdl.readfirstlane(T.i32, a_rows))
             a_div = fx.logical_divide(
-                make_fp8_buffer_tensor(A, F8_IR_t), fx.make_layout(1, 1)
+                fp8_buffer_at(
+                    a_base + fx.Int64(row_base) * fx.Int64(K),
+                    fx.Int64(a_rows) * fx.Int64(K),
+                    F8_IR_t,
+                ),
+                fx.make_layout(1, 1),
             )
             b_div = fx.logical_divide(
-                make_fp8_buffer_tensor(B_T, F8_IR_t), fx.make_layout(1, 1)
+                fp8_buffer_at(
+                    b_base + fx.Int64(b_row_block) * fx.Int64(BLOCK_N * (K // 2)),
+                    fx.Int64(BLOCK_N * (K // 2)),
+                    F8_IR_t,
+                ),
+                fx.make_layout(1, 1),
             )
+            A0_gl_offset = fx.Int32(0)
+            A1_gl_offset = fx.Int32(LDS_BLOCK_M * K)
+            B0_gl_offset = fx.Int32(0)
+            B1_gl_offset = fx.Int32(LDS_BLOCK_N * (K // 2))
             gl_off_a = compute_global_swizzle(
                 lane_id, wave_id, K, N_LDS_ROUNDS, preshuffled=False
             )
@@ -965,8 +1037,8 @@ def compile_gemm2_8wave_sdma(
         def gemm_role():
             tab_lds = lds_addr(lds.E_tab)
             lane = fx.thread_idx.x % fx.Int32(64)
-            values, n_tiles = tile_table(tile_end, lane, SBM=SBM, experts=experts)
-            tile_table_to_lds(values, tab_lds, lane)
+            rounds, n_tiles = tile_table(tile_end, lane, SBM=SBM, experts=experts)
+            tile_table_to_lds(rounds, tab_lds, lane)
             lds_barrier()
             for w in range(
                 fx.block_idx.x - fx.Int32(1),
@@ -983,8 +1055,8 @@ def compile_gemm2_8wave_sdma(
 
     @flyc.jit
     def launch(
-        A: fx.Tensor,
-        B_T: fx.Tensor,
+        a_ptr: fx.Int64,
+        b_ptr: fx.Int64,
         A_scale: fx.Tensor,
         B_scale: fx.Tensor,
         c_m: fx.Int32,
@@ -1005,8 +1077,8 @@ def compile_gemm2_8wave_sdma(
         stream: fx.Stream,
     ):
         kernel(
-            A,
-            B_T,
+            a_ptr,
+            b_ptr,
             A_scale,
             B_scale,
             c_m,
