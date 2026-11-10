@@ -197,11 +197,6 @@ def apply_mask_varlen_mla(
     CAUSAL,
     EVEN_N,
 ):
-    """One compare + select per score. Causal: key j is visible to row i iff
-    j <= i + CAUSAL_OFFSET; for every stored row (i < SEQLEN_Q) that bound is
-    <= SEQLEN_K - 1, so the out-of-range key mask is implied and dropped. Rows
-    past SEQLEN_Q are never stored, and K/V past SEQLEN_K are zero-filled by
-    the bounded TDM loads."""
     offs_n = (
         tile_n * BLOCK_N
         + subtile * (BLOCK_N // 2)
@@ -814,7 +809,7 @@ def _mha_fwd_mla_varlen(
     WMMA_LAYOUT_PE: gl.constexpr,
     PV_SPLIT_K: gl.constexpr = False,
     ROWSUM_MMA: gl.constexpr = False,
-    K3: gl.constexpr = False,
+    NUM_K_BUFFERS: gl.constexpr = 2,
     EARLY_K: gl.constexpr = False,
 ):
     L: gl.constexpr = WMMA_LAYOUT
@@ -824,8 +819,6 @@ def _mha_fwd_mla_varlen(
     PL: gl.constexpr = gl.DotOperandLayout(0, L, 8)
     VL: gl.constexpr = gl.DotOperandLayout(1, L, 8)
     HN: gl.constexpr = BLOCK_N // 2
-    # PV_SPLIT_K: P x V as (P[:, :HN] @ V[:HN] + P[:, HN:] @ V[HN:]) on 16x16x64 WMMAs,
-    # so each P half goes to fp8 right after its exp and its fp32 copy dies early.
     PL2: gl.constexpr = gl.DotOperandLayout(0, LPE, 8)
     VL2: gl.constexpr = gl.DotOperandLayout(1, LPE, 8)
     HV: gl.constexpr = HEAD_DIM_V // 2
@@ -934,13 +927,13 @@ def _mha_fwd_mla_varlen(
         layout=KPE_SL,
     )
     k_smem = gl.allocate_shared_memory(
-        k_ptr.type.element_ty, [3 if K3 else 2, BLOCK_N, HEAD_DIM], K_SL
+        k_ptr.type.element_ty, [NUM_K_BUFFERS, BLOCK_N, HEAD_DIM], K_SL
     )
     v_smem = gl.allocate_shared_memory(
         v_ptr.type.element_ty, [2, BLOCK_N, HEAD_DIM_V], V_SL
     )
     k_pe_smem = gl.allocate_shared_memory(
-        k_pe_ptr.type.element_ty, [3 if K3 else 2, BLOCK_N, PE_DIM], KPE_SL
+        k_pe_ptr.type.element_ty, [NUM_K_BUFFERS, BLOCK_N, PE_DIM], KPE_SL
     )
 
     if HAS_SCALES:
@@ -1034,39 +1027,42 @@ def _mha_fwd_mla_varlen(
         p0 = gl.exp2(qk0_shifted)
         if PV_SPLIT_K:
             if ROWSUM_MMA:
-                # l = rowsum(fp8 P) on the matrix cores: P_half @ ones (16 equal columns)
-                ones_v = gl.full([HN, 16], 1.0, gl.float32, VL2).to(v_ptr.type.element_ty)
-                l_acc = gl.zeros([BLOCK_M, 16], gl.float32, LPE) + gl.convert_layout(
-                    l_i, gl.SliceLayout(1, LPE)
-                )[:, None]
+                ones_v = gl.full([HN, 16], 1.0, gl.float32, VL2).to(
+                    v_ptr.type.element_ty
+                )
+                l_acc = (
+                    gl.zeros([BLOCK_M, 16], gl.float32, LPE)
+                    + gl.convert_layout(l_i, gl.SliceLayout(1, LPE))[:, None]
+                )
             else:
                 s0 = gl.sum(p0, 1)
             p0 = gl.convert_layout(p0.to(v_ptr.type.element_ty), PL2)
         gl.barrier()
-        tdm_load_k(k_desc, k_smem, tb + 2, BLOCK_N, HEAD_DIM, 1, 2 if K3 else 0, tb + 2 < te)
-        tdm_load_k(k_pe_desc, k_pe_smem, tb + 2, BLOCK_N, PE_DIM, 1, 2 if K3 else 0, tb + 2 < te)
+        tdm_load_k(
+            k_desc, k_smem, tb + 2, BLOCK_N, HEAD_DIM, 1, 2 % NUM_K_BUFFERS, tb + 2 < te
+        )
+        tdm_load_k(
+            k_pe_desc,
+            k_pe_smem,
+            tb + 2,
+            BLOCK_N,
+            PE_DIM,
+            1,
+            2 % NUM_K_BUFFERS,
+            tb + 2 < te,
+        )
         gl.amd.gfx1250.tdm.async_wait(2)
         gl.barrier()
         k0 = local_load_k(k_smem, 1, 0, BLOCK_N, HEAD_DIM, KL, SLOT=True)
         kp0 = local_load_k(k_pe_smem, 1, 0, BLOCK_N, PE_DIM, KPEL, SLOT=True)
         for c in range(tb, te - 1):
             cb = (c - tb) % 2
-            # K/K_pe slots: tile t lives in slot (t - tb) % NK. With 3 slots the
-            # stage2 TDM write of tile c+3 reuses tile c's slot, last read in the
-            # previous iteration and already fenced by the barrier at loop top.
-            if K3:
-                kc1 = (c + 1 - tb) % 3
-                kc2 = (c + 2 - tb) % 3
-                kc3 = (c - tb) % 3
-            else:
-                kc1 = 1 - cb
-                kc2 = cb
-                kc3 = 1 - cb
+            kc1 = (c + 1 - tb) % NUM_K_BUFFERS
+            kc2 = (c + 2 - tb) % NUM_K_BUFFERS
+            kc3 = (c + 3 - tb) % NUM_K_BUFFERS
             gl.barrier()
             with gl.amd.warp_pipeline_stage("stage0"):
                 if EARLY_K:
-                    # load K half 1 before the WMMAs that read K half 0, so the two
-                    # never share registers (no write-after-read wait on the WMMA)
                     k1 = local_load_k(k_smem, kc1, 1, BLOCK_N, HEAD_DIM, KL, SLOT=True)
                     kp1 = local_load_k(
                         k_pe_smem, kc1, 1, BLOCK_N, PE_DIM, KPEL, SLOT=True
@@ -1099,7 +1095,10 @@ def _mha_fwd_mla_varlen(
                     v00 = vb.slice(0, HN, dim=0).slice(0, HV, dim=1).load(layout=VL2)
                     v10 = vb.slice(HN, HN, dim=0).slice(0, HV, dim=1).load(layout=VL2)
                     if ROWSUM_MMA:
-                        l_acc = l_acc * gl.convert_layout(alpha, gl.SliceLayout(1, LPE))[:, None]
+                        l_acc = (
+                            l_acc
+                            * gl.convert_layout(alpha, gl.SliceLayout(1, LPE))[:, None]
+                        )
                     else:
                         l_i = gl.fma(l_i, alpha, s0 + s1)
                 else:
@@ -1107,7 +1106,7 @@ def _mha_fwd_mla_varlen(
                     p = concat_subtile(p0, p1)
                     l_i = gl.fma(l_i, alpha, gl.sum(p, 1))
                     p_quant = gl.convert_layout(p.to(v_ptr.type.element_ty), PL)
-            if not K3:
+            if NUM_K_BUFFERS < 3:
                 gl.barrier()
             with gl.amd.warp_pipeline_stage("stage2"):
                 if PV_SPLIT_K:
@@ -1122,9 +1121,7 @@ def _mha_fwd_mla_varlen(
                 else:
                     acc0 = gl.amd.gfx1250.wmma(p_quant, v0, acc0)
                     v1 = local_load_v(v_smem, cb, 1, BLOCK_N, HEAD_DIM_V, VL, SLOT=True)
-                tdm_load_k(
-                    k_desc, k_smem, c + 3, BLOCK_N, HEAD_DIM, 1, kc3, c + 3 < te
-                )
+                tdm_load_k(k_desc, k_smem, c + 3, BLOCK_N, HEAD_DIM, 1, kc3, c + 3 < te)
                 tdm_load_k(
                     k_pe_desc, k_pe_smem, c + 3, BLOCK_N, PE_DIM, 1, kc3, c + 3 < te
                 )
@@ -1163,7 +1160,9 @@ def _mha_fwd_mla_varlen(
             with gl.amd.warp_pipeline_stage("stage3"):
                 if EARLY_K:
                     k0 = local_load_k(k_smem, kc2, 0, BLOCK_N, HEAD_DIM, KL, SLOT=True)
-                    kp0 = local_load_k(k_pe_smem, kc2, 0, BLOCK_N, PE_DIM, KPEL, SLOT=True)
+                    kp0 = local_load_k(
+                        k_pe_smem, kc2, 0, BLOCK_N, PE_DIM, KPEL, SLOT=True
+                    )
                 if PV_SPLIT_K:
                     a1 = gl.convert_layout(acc1, LPE)
                     a1 = gl.amd.gfx1250.wmma(p0, v01, a1)
@@ -1172,7 +1171,9 @@ def _mha_fwd_mla_varlen(
                     acc1 = gl.amd.gfx1250.wmma(p_quant, v1, acc1)
                 if not EARLY_K:
                     k0 = local_load_k(k_smem, kc2, 0, BLOCK_N, HEAD_DIM, KL, SLOT=True)
-                    kp0 = local_load_k(k_pe_smem, kc2, 0, BLOCK_N, PE_DIM, KPEL, SLOT=True)
+                    kp0 = local_load_k(
+                        k_pe_smem, kc2, 0, BLOCK_N, PE_DIM, KPEL, SLOT=True
+                    )
                 m_ij = fast_maximum(m_i, m_row)
                 m_use = gl.where(m_ij == float("-inf"), 0.0, m_ij)
                 qk0_shifted = qk0 * qk_scale - m_use[:, None]
@@ -1193,7 +1194,9 @@ def _mha_fwd_mla_varlen(
         if PV_SPLIT_K:
             p1 = gl.convert_layout(p1.to(v_ptr.type.element_ty), PL2)
             if ROWSUM_MMA:
-                l_acc = l_acc * gl.convert_layout(alpha, gl.SliceLayout(1, LPE))[:, None]
+                l_acc = (
+                    l_acc * gl.convert_layout(alpha, gl.SliceLayout(1, LPE))[:, None]
+                )
                 l_acc = gl.amd.gfx1250.wmma(p0, ones_v, l_acc)
                 l_acc = gl.amd.gfx1250.wmma(p1, ones_v, l_acc)
                 l_i = gl.convert_layout(gl.max(l_acc, 1), gl.SliceLayout(1, L))
@@ -1202,11 +1205,27 @@ def _mha_fwd_mla_varlen(
                 l_i = gl.fma(l_i, alpha, s0 + s1)
             vb = v_smem.index(last)
             a0 = gl.convert_layout(acc0, LPE)
-            a0 = gl.amd.gfx1250.wmma(p0, vb.slice(0, HN, dim=0).slice(0, HV, dim=1).load(layout=VL2), a0)
-            acc0 = gl.convert_layout(gl.amd.gfx1250.wmma(p1, vb.slice(HN, HN, dim=0).slice(0, HV, dim=1).load(layout=VL2), a0), L)
+            a0 = gl.amd.gfx1250.wmma(
+                p0, vb.slice(0, HN, dim=0).slice(0, HV, dim=1).load(layout=VL2), a0
+            )
+            acc0 = gl.convert_layout(
+                gl.amd.gfx1250.wmma(
+                    p1, vb.slice(HN, HN, dim=0).slice(0, HV, dim=1).load(layout=VL2), a0
+                ),
+                L,
+            )
             a1 = gl.convert_layout(acc1, LPE)
-            a1 = gl.amd.gfx1250.wmma(p0, vb.slice(0, HN, dim=0).slice(HV, HV, dim=1).load(layout=VL2), a1)
-            acc1 = gl.convert_layout(gl.amd.gfx1250.wmma(p1, vb.slice(HN, HN, dim=0).slice(HV, HV, dim=1).load(layout=VL2), a1), L)
+            a1 = gl.amd.gfx1250.wmma(
+                p0, vb.slice(0, HN, dim=0).slice(HV, HV, dim=1).load(layout=VL2), a1
+            )
+            acc1 = gl.convert_layout(
+                gl.amd.gfx1250.wmma(
+                    p1,
+                    vb.slice(HN, HN, dim=0).slice(HV, HV, dim=1).load(layout=VL2),
+                    a1,
+                ),
+                L,
+            )
         else:
             v0 = local_load_v(v_smem, last, 0, BLOCK_N, HEAD_DIM_V, VL, SLOT=True)
             v1 = local_load_v(v_smem, last, 1, BLOCK_N, HEAD_DIM_V, VL, SLOT=True)
