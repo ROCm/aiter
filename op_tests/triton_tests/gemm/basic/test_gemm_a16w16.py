@@ -61,6 +61,7 @@ def get_x_vals():
     x_vals += [(3, 5, 2)]  # irregular shape
     x_vals += [(1024 * v, 1024 * v, 1024 * v) for v in (1, 2, 4, 5, 8)]
     x_vals += [(2**i, 256, 7168) for i in range(5, 9)]  # DSR1 router GEMM
+    x_vals += [(512, 2048, 7168)]  # DSv4-Pro CSA compressor GEMM
     # GPT-OSS-120B attention projections
     x_vals += [(2**i, 5120, 2880) for i in range(5, 9)]  # GPTOSS QKV input projection
     x_vals += [(2048, 5120, 2880)]  # GPTOSS QKV @ M=2048
