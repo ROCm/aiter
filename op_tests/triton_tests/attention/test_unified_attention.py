@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import triton
 
 from aiter.ops.triton.attention.unified_attention import (
     _is_gluon_available,
@@ -15,6 +16,7 @@ from aiter.ops.triton.attention.unified_attention import (
     unified_attention,
 )
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.device_info import get_num_sms
 from aiter.ops.triton.utils.shuffle import shuffle_scale_batched, shuffle_weight
 from aiter.ops.triton.utils.types import e4m3_dtype
 from aiter.test_common import checkAllclose
@@ -379,6 +381,25 @@ def ref_paged_attn(
         out = out / output_scale
 
     return out.to(out_dtype)
+
+
+def _assert_request_rel_l2(output, ref_output, seq_lens, bound=2e-2):
+    """Bound each request's relative L2 error against the reference.
+
+    Long-KV outputs are small, so a fixed atol would pass all-zero rows.
+    gfx950 measures ~0.0025; one dropped 64-token KV tile gives ~0.06.
+    A zero-length request (a padded slot) must give zero rows.
+    """
+    start = 0
+    for q_len, kv_len in seq_lens:
+        out_rows = output[start : start + q_len].float()
+        ref_rows = ref_output[start : start + q_len].float()
+        start += q_len
+        if kv_len == 0:
+            assert torch.equal(out_rows, torch.zeros_like(out_rows)), "kv_len 0"
+            continue
+        rel_err = ((out_rows - ref_rows).norm() / ref_rows.norm()).item()
+        assert rel_err < bound, f"kv_len {kv_len}: relative L2 error {rel_err:.4f}"
 
 
 @pytest.mark.parametrize(
@@ -1019,6 +1040,399 @@ def test_triton_unified_attn_sw_split_no_sinks(seq_lens, num_heads, block_size):
         v_descale=None,
     )
     torch.testing.assert_close(out.float(), ref, atol=1.5e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        # speculative-decode verify: a few query tokens per sequence, long KV;
+        # each batch has a short request, where a causal result is far off
+        [(4, 8704)] * 3 + [(4, 40)],
+        [(5, 1328), (5, 37), (5, 8192)],
+        [(8, 16384), (8, 48)],
+        # prefill and mixed batches
+        [(512, 512)],
+        [(1, 15), (12, 133), (567, 600), (34, 345), (777, 777)],
+        # decode
+        [(1, 1328), (1, 523), (1, 2011)],
+    ],
+)
+@pytest.mark.parametrize("num_heads", [(8, 2), (8, 8)])
+@pytest.mark.parametrize("head_size", [64, 128])
+@pytest.mark.parametrize("block_size", [16, 128])
+@pytest.mark.parametrize(
+    "q_dtype, kv_dtype, use_q_descale, use_kv_descale",
+    [
+        (torch.bfloat16, torch.bfloat16, False, False),
+        (torch.bfloat16, e4m3_dtype, False, True),
+        (e4m3_dtype, e4m3_dtype, True, True),
+    ],
+)
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
+@torch.inference_mode()
+def test_unified_attn_non_causal(
+    seq_lens: list[tuple[int, int]],
+    num_heads: tuple[int, int],
+    head_size: int,
+    block_size: int,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    use_q_descale: bool,
+    use_kv_descale: bool,
+    backend: str,  # "triton" | "gluon"
+) -> None:
+    """With causal=False every query token attends to all keys of its sequence."""
+    if backend == "gluon" and not _is_gluon_available():
+        pytest.skip(f"skip gluon backend, not available on {DEVICE_ARCH}")
+    # Non-causal gluon calls run the Triton kernels; one shape checks that gate.
+    if backend == "gluon" and (head_size, block_size, num_heads) != (64, 128, (8, 2)):
+        pytest.skip("non-causal gluon calls run the Triton kernels")
+    query_lens = [x[0] for x in seq_lens]
+    kv_lens_list = [x[1] for x in seq_lens]
+    (
+        query,
+        key_cache_orig,
+        value_cache_orig,
+        key_cache,
+        value_cache,
+        _sinks,
+        output,
+        cu_query_lens,
+        kv_lens,
+        max_query_len,
+        max_kv_len,
+        scale,
+        window_size,
+        block_tables,
+        _maybe_quant_query,
+        _query_scales,
+        q_descale,
+        k_descale,
+        v_descale,
+        _output_scale,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        num_blocks=len(seq_lens) * -(-max(kv_lens_list) // block_size),
+        block_size=block_size,
+        head_size=head_size,
+        num_heads=num_heads,
+        q_dtype=q_dtype,
+        kv_dtype=kv_dtype,
+        out_dtype=torch.bfloat16,
+        use_q_descale=use_q_descale,
+        use_kv_descale=use_kv_descale,
+        device="cuda",
+    )
+
+    unified_attention(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=max_query_len,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=False,
+        window_size=window_size,
+        block_table=block_tables,
+        softcap=0,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        backend=backend,
+    )
+
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache_orig,
+        value_cache=value_cache_orig,
+        query_lens=query_lens,
+        kv_lens=kv_lens_list,
+        block_tables=block_tables,
+        scale=scale,
+        out_dtype=torch.bfloat16,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        causal=0,
+    )
+
+    atol, rtol = 1.5e-2, 1e-2
+    if kv_dtype.itemsize == 1 or q_dtype.itemsize == 1:
+        atol, rtol = 1.5e-1, 1.5e-1
+    torch.testing.assert_close(
+        output.to(torch.float32), ref_output.to(torch.float32), atol=atol, rtol=rtol
+    )
+    # A query that misses a few of thousands of keys stays inside the elementwise
+    # tolerance, so also bound each request's relative L2 error. For the short
+    # requests a causal result is at least 0.14 off.
+    rel_bound = 5e-2 if q_dtype.itemsize == 1 else 2e-2
+    _assert_request_rel_l2(output, ref_output, seq_lens, bound=rel_bound)
+
+
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        # speculative-decode verify, with a short request a causal result misses
+        [(4, 8704)] * 3 + [(4, 40)],
+        # prefill and mixed batches
+        [(1, 15), (12, 133), (567, 600), (34, 345), (777, 777)],
+        # max_seqlen_k <= 512 selects the 2D kernel; the batches above take 3D
+        # on a gfx950 with all its CUs
+        [(1, 15), (12, 133), (100, 345), (512, 512)],
+    ],
+)
+@pytest.mark.parametrize(
+    "kv_dtype, use_kv_descale", [(torch.bfloat16, False), (e4m3_dtype, True)]
+)
+# The logits are about N(0, 1), so a cap of 50 would not bend them.
+@pytest.mark.parametrize("soft_cap", [None, 2.0])
+@pytest.mark.parametrize("use_sinks", [False, True])
+@pytest.mark.parametrize("shuffled_kv_cache", [False, True])
+@torch.inference_mode()
+def test_unified_attn_non_causal_features(
+    seq_lens: list[tuple[int, int]],
+    kv_dtype: torch.dtype,
+    use_kv_descale: bool,
+    soft_cap: float | None,
+    use_sinks: bool,
+    shuffled_kv_cache: bool,
+    monkeypatch,
+) -> None:
+    """Non-causal attention also takes sinks, a softcap and a shuffled KV cache;
+    those run on the Triton kernels, as the Gluon kernels are causal-only."""
+    block_size = 128
+    (
+        query,
+        key_cache_orig,
+        value_cache_orig,
+        key_cache,
+        value_cache,
+        sinks,
+        output,
+        cu_query_lens,
+        kv_lens,
+        max_query_len,
+        max_kv_len,
+        scale,
+        window_size,
+        block_tables,
+        _maybe_quant_query,
+        _query_scales,
+        q_descale,
+        k_descale,
+        v_descale,
+        _output_scale,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        num_blocks=len(seq_lens) * -(-max(kv for _, kv in seq_lens) // block_size),
+        block_size=block_size,
+        head_size=64,
+        num_heads=(8, 2),
+        kv_dtype=kv_dtype,
+        out_dtype=torch.bfloat16,
+        shuffled_kv_cache=shuffled_kv_cache,
+        use_kv_descale=use_kv_descale,
+        device="cuda",
+    )
+    sinks = sinks if use_sinks else None
+
+    # record which kernel ran, so a heuristic change cannot drop a path silently
+    module = sys.modules[unified_attention.__module__]
+    launches = []
+    for name in ("_unified_attention_2d_triton", "_unified_attention_3d_triton"):
+        launch = getattr(module, name)
+
+        def spy(params, *args, _name=name, _launch=launch):
+            launches.append(_name)
+            return _launch(params, *args)
+
+        monkeypatch.setattr(module, name, spy)
+
+    unified_attention(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=max_query_len,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=False,
+        window_size=window_size,
+        block_table=block_tables,
+        softcap=soft_cap if soft_cap is not None else 0,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        sinks=sinks,
+        shuffled_kv_cache=shuffled_kv_cache,
+    )
+
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache_orig,
+        value_cache=value_cache_orig,
+        query_lens=[q for q, _ in seq_lens],
+        kv_lens=[kv for _, kv in seq_lens],
+        block_tables=block_tables,
+        scale=scale,
+        out_dtype=torch.bfloat16,
+        soft_cap=soft_cap,
+        sinks=sinks,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        causal=0,
+    )
+
+    if DEVICE_ARCH == "gfx950":
+        # 2D for short KV, and for more than 4 programs per CU in the 2D grid (4
+        # query tokens of a KV head each); a partitioned gfx950 has fewer CUs
+        num_2d_prgms = (query.shape[0] // 4 + len(seq_lens)) * 2
+        use_3d = max_kv_len > 512 and num_2d_prgms <= 4 * get_num_sms()
+        kernel = f"_unified_attention_{3 if use_3d else 2}d_triton"
+        assert launches == [kernel], launches
+
+    atol, rtol = (1.5e-1, 1.5e-1) if kv_dtype.itemsize == 1 else (1.5e-2, 1e-2)
+    torch.testing.assert_close(
+        output.to(torch.float32), ref_output.to(torch.float32), atol=atol, rtol=rtol
+    )
+    _assert_request_rel_l2(output, ref_output, seq_lens)
+
+
+# sglang passes (sliding_window_size - 1, 0), which is (-1, 0) without a window
+@pytest.mark.parametrize("window_size", [(-1, -1), (-1, 0)])
+@pytest.mark.parametrize("query_len", [4, 1], ids=["verify", "decode"])
+@torch.inference_mode()
+def test_unified_attn_non_causal_no_window(
+    window_size: tuple[int, int], query_len: int
+) -> None:
+    """Non-causal attention takes both forms of "no window"."""
+    block_size = 128
+    seq_lens = [(query_len, 8704)] * 3 + [(query_len, 40)]
+    (
+        query,
+        key_cache_orig,
+        value_cache_orig,
+        key_cache,
+        value_cache,
+        _,
+        output,
+        cu_query_lens,
+        kv_lens,
+        max_query_len,
+        max_kv_len,
+        scale,
+        _,
+        block_tables,
+        _,
+        _,
+        q_descale,
+        k_descale,
+        v_descale,
+        _,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        num_blocks=len(seq_lens) * triton.cdiv(8704, block_size),
+        block_size=block_size,
+        head_size=64,
+        num_heads=(8, 2),
+        kv_dtype=e4m3_dtype,
+        out_dtype=torch.bfloat16,
+        device="cuda",
+    )
+
+    unified_attention(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=max_query_len,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=False,
+        window_size=window_size,
+        block_table=block_tables,
+        softcap=0,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+    )
+
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache_orig,
+        value_cache=value_cache_orig,
+        query_lens=[q for q, _ in seq_lens],
+        kv_lens=[kv for _, kv in seq_lens],
+        block_tables=block_tables,
+        scale=scale,
+        out_dtype=torch.bfloat16,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        causal=0,
+    )
+    _assert_request_rel_l2(output, ref_output, seq_lens)
+
+
+@pytest.mark.parametrize(
+    "window_size, unsupported, match",
+    [
+        ((255, 0), None, "sliding window"),
+        ((-1, -1), "alibi", "ALiBi"),
+        ((-1, -1), "qq_bias", "query-query bias"),
+        ((-1, -1), "fp4_q", "fp4 Q"),
+        ((-1, -1), "fp4_kv", "fp4 Q or KV"),
+    ],
+    ids=["left_window", "alibi", "qq_bias", "fp4_q", "fp4_kv"],
+)
+# a decode batch runs on the causal kernels, but it must reject them too
+@pytest.mark.parametrize("query_len", [2, 1], ids=["verify", "decode"])
+def test_unified_attn_non_causal_rejects_unsupported(
+    window_size: tuple[int, int], unsupported: str | None, match: str, query_len: int
+) -> None:
+    q_dtype = torch.uint8 if unsupported == "fp4_q" else torch.bfloat16
+    kv_dtype = torch.uint8 if unsupported == "fp4_kv" else torch.bfloat16
+    q = torch.empty(query_len, 1, 64, dtype=q_dtype, device="cuda")
+    kv = torch.empty(1, 16, 1, 64, dtype=kv_dtype, device="cuda")
+    alibi = (
+        torch.ones(1, dtype=torch.float32, device="cuda")
+        if unsupported == "alibi"
+        else None
+    )
+    qq_bias = (
+        torch.zeros(query_len, query_len, dtype=torch.float32, device="cuda")
+        if unsupported == "qq_bias"
+        else None
+    )
+    with pytest.raises(ValueError, match=match):
+        unified_attention(
+            q=q,
+            k=kv,
+            v=kv,
+            out=torch.empty(query_len, 1, 64, dtype=torch.bfloat16, device="cuda"),
+            cu_seqlens_q=torch.tensor([0, query_len], dtype=torch.int32, device="cuda"),
+            seqused_k=torch.tensor([2], dtype=torch.int32, device="cuda"),
+            max_seqlen_q=query_len,
+            max_seqlen_k=2,
+            softmax_scale=1.0,
+            causal=False,
+            window_size=window_size,
+            block_table=torch.zeros(1, 1, dtype=torch.int32, device="cuda"),
+            softcap=0,
+            q_descale=None,
+            k_descale=None,
+            v_descale=None,
+            alibi_slopes=alibi,
+            qq_bias=qq_bias,
+        )
 
 
 @pytest.mark.parametrize(
