@@ -914,7 +914,7 @@ def _conv3d_impl(
     # gfx1250: separate TDM+WMMA backend (host pre-pad, NDHWC, C aligned to 32).
     # Use the already-normalized x / pad_mode / (pt,ph,pw) so asymmetric and
     # non-zero modes that were materialized above are not padded twice.
-    if _current_gfx() == "gfx1250":
+    if _current_gfx() in ("gfx1250", "gfx1250-strict"):
         from .conv3d_gfx1250 import run_conv3d_gfx1250
 
         return run_conv3d_gfx1250(

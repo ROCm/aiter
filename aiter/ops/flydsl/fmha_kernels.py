@@ -735,7 +735,7 @@ def flydsl_flash_attn_varlen_fwd(
                 out=out,
                 return_lse=return_lse,
             )
-    elif gfxip == "gfx1250":
+    elif gfxip in ("gfx1250", "gfx1250-strict"):
         # 8-bit Q/K/V go to the a8w8 sibling, which writes bf16 output; everything
         # else to a16w16, whose output follows the input.
         _is_b8 = q.dtype in _A8W8_GFX1250_IN_DTYPES
@@ -1039,7 +1039,7 @@ def flydsl_flash_attn_batch_fwd(
             )
     # deterministic is a backward-only flag (this forward is atomic-free), and
     # flash_attn_func defaults it True -- gating on it would reject every request.
-    elif gfxip == "gfx1250" and q.dim() == 4:
+    elif gfxip in ("gfx1250", "gfx1250-strict") and q.dim() == 4:
         _is_b8 = q.dtype in _A8W8_GFX1250_IN_DTYPES
         # a8w8 applies per-tensor fp32 descales (gfx950's contract); a16w16 has none,
         # and a partial set is ambiguous, so both fall through.
