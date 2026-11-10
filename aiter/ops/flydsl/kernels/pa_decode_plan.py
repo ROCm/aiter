@@ -199,6 +199,122 @@ def compile_pa_decode_plan(max_batch, threads, windowed):
     return launch
 
 
+@cache
+def compile_query_block_map(max_batch, threads, query_block):
+    """Split varlen queries into blocks of ``query_block`` in sequence order.
+
+    Slot p of ``query_map`` gets (first query row, sequence, valid queries, 0)
+    and ``contexts[p]`` the KV tokens its last query sees; slots past the last
+    block get no queries and no context. Batch and capacity are runtime values.
+    """
+    scan_blocks = fx.coop.BlockScan[fx.Int32, threads]
+
+    @fx.struct
+    class EndStorage:
+        ends: fx.Array[fx.Int32, max_batch, 16]
+
+    lookup_bits = (max_batch - 1).bit_length()
+
+    def blocks_of(cu, seq):
+        return (cu[seq + 1] - cu[seq] + (query_block - 1)) // query_block
+
+    @flyc.kernel(known_block_size=[threads, 1, 1])
+    def query_block_map_kernel(
+        cu_seqlens_ptr: fx.Pointer,
+        lengths_ptr: fx.Pointer,
+        map_ptr: fx.Pointer,
+        contexts_ptr: fx.Pointer,
+        batch: fx.Int32,
+        capacity: fx.Int32,
+        num_tokens: fx.Int32,
+    ):
+        tid = fx.thread_idx.x
+        cu = ptr_buf_tensor(cu_seqlens_ptr)
+        lengths = ptr_buf_tensor(lengths_ptr)
+        query_map = ptr_buf_tensor(map_ptr)
+        contexts = ptr_buf_tensor(contexts_ptr)
+        smem = fx.SharedAllocator()
+        scan_storage = smem.allocate(scan_blocks.SharedStorage).peek()
+        block_ends = smem.allocate(EndStorage).peek().ends
+        rows = (batch + threads - 1) // threads
+        row_begin = fx.min(fx.Int32(tid) * rows, batch)
+        row_end = fx.min(row_begin + rows, batch)
+        thread_blocks = fx.Int32(0)
+        for seq in range(row_begin, row_end):
+            thread_blocks = thread_blocks + blocks_of(cu, seq)
+        row_start, _ = scan_blocks.exclusive_with_aggregate(
+            thread_blocks, fx.ReductionOp.ADD, storage=scan_storage
+        )
+        for seq in range(row_begin, row_end):
+            row_start = row_start + blocks_of(cu, seq)
+            block_ends[seq] = row_start
+        fx.gpu.barrier()
+
+        last_row = fx.max(num_tokens - 1, 0)
+        total_blocks = block_ends[batch - 1]
+        for slot in range(tid, capacity, threads):
+            seq = fx.Int32(-1)
+            for bit in fx.range_constexpr(lookup_bits - 1, -1, -1):
+                candidate = seq + (1 << bit)
+                if candidate < batch:  # noqa: SIM102 -- guard the LDS read
+                    if block_ends[candidate] <= slot:
+                        seq = candidate
+            live = slot < total_blocks
+            seq = fx.min(seq + 1, batch - 1)
+            first_block = fx.Int32(0)
+            if seq > 0:
+                first_block = block_ends[seq - 1]
+            query0 = cu[seq]
+            seq_queries = cu[seq + 1] - query0
+            first = (slot - first_block) * query_block
+            row = query0 + first
+            valid = fx.min(fx.min(seq_queries - first, num_tokens - row), query_block)
+            valid = live.select(fx.max(valid, 0), 0)
+            ctx = fx.max(lengths[seq] - seq_queries + first + valid, 0)
+            query_map[slot * 4] = fx.min(fx.max(row, 0), last_row)
+            query_map[slot * 4 + 1] = seq
+            query_map[slot * 4 + 2] = valid
+            query_map[slot * 4 + 3] = fx.Int32(0)
+            contexts[slot] = live.select(ctx, 0)
+
+    @flyc.jit
+    def launch(
+        cu_seqlens: fx.Pointer,
+        lengths: fx.Pointer,
+        query_map: fx.Pointer,
+        contexts: fx.Pointer,
+        batch: fx.Int32,
+        capacity: fx.Int32,
+        num_tokens: fx.Int32,
+        stream: fx.Stream,
+    ):
+        query_block_map_kernel(
+            cu_seqlens, lengths, query_map, contexts, batch, capacity, num_tokens
+        ).launch(grid=(1, 1, 1), block=(threads, 1, 1), stream=stream)
+
+    return launch
+
+
+def build_query_block_map(
+    cu_seqlens_q, seqused_k, num_tokens, query_block, query_map, contexts
+):
+    """Fill ``query_map`` [capacity, 4] and ``contexts`` [capacity] on the GPU."""
+    batch = seqused_k.numel()
+    max_batch = 1 << (batch - 1).bit_length()
+    launch = compile_query_block_map(max_batch, 1024, query_block)
+    _run_compiled(
+        launch,
+        ptr_arg(cu_seqlens_q, fx.Int32),
+        ptr_arg(seqused_k, fx.Int32),
+        ptr_arg(query_map, fx.Int32),
+        ptr_arg(contexts, fx.Int32),
+        batch,
+        query_map.shape[0],
+        num_tokens,
+        torch.cuda.current_stream(seqused_k.device),
+    )
+
+
 @dataclass(frozen=True)
 class PADecodePlan:
     """Reusable GPU metadata; refresh it whenever context lengths change.

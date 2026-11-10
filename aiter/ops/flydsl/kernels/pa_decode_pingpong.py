@@ -183,8 +183,19 @@ def compile_pa_decode_pingpong(
     stages=None,
     pair_ctas=0,
     varlen=False,
+    window=0,
+    sink_dtype=None,
+    seq_query_length=0,
 ):
     """``pair_ctas`` > 0 gives each CTA two adjacent work slots.
+
+    ``window`` > 0 (keys a query sees, its own included) builds a launch with
+    one CTA per sequence and KV head and no plan: it reads each sequence's
+    context from an int32 array in place of the work info and writes
+    normalized output, folding in ``sink_dtype`` ("f32", "bf16", "f16" or
+    None) per-head sink logits. Uniform window launches with
+    ``seq_query_length`` (a multiple of ``query_length``) queries per sequence
+    run each sequence as that many over ``query_length`` CTAs.
 
     ``varlen`` reads an int32 [num_seqs, 4] query map of (first query row,
     block-table row, valid queries, unused) per work-info sequence; queries at
@@ -196,15 +207,19 @@ def compile_pa_decode_pingpong(
     pair_ctas = int(os.environ.get("PP_PAIR", pair_ctas))
     pair_tasks = pair_ctas > 0
     nocompute = int(os.environ.get("PP_NOCOMPUTE", "0"))
-    dma_aux = int(os.environ.get("PP_AUX", "2"))
+    # Windows' overlapping KV is reused across CTAs, so it stays cacheable.
+    dma_aux = int(os.environ.get("PP_AUX", "0" if window else "2"))
+    # Direct window output is written once: stream it past the reused KV.
+    OAUX = int(os.environ.get("PP_OAUX", "2")) if window else 0
     M, R, CH = pingpong_layout(query_length)
     SLOT_TOKENS = 16 * CH
     S = TILE // SLOT_TOKENS
     NWAVES = R * S
     # Staggered prefill: two groups of one wave per SIMD, alternating tiles.
     stagger = int(os.environ.get("PP_STAGGER", "1")) if (NWAVES == 8 and S == 1) else 0
-    # Four 40 KiB D192/V128 stages fill gfx950's 160 KiB LDS.
-    stages = stages or (4 if stagger else 3)
+    # Four 40 KiB D192/V128 stages fill gfx950's 160 KiB LDS; a window's few
+    # tiles gain nothing from a deeper ring, which the stagger still needs.
+    stages = stages or (4 if stagger else 2 if window else 3)
     pin = int(os.environ.get("PP_PIN", "2"))
     ysched = int(os.environ.get("PP_YSCHED", "8"))
     grp_mod = int(os.environ.get("PP_GRP", "0"))
@@ -221,6 +236,7 @@ def compile_pa_decode_pingpong(
         if (stagger and M == 2 and CH == 4 and value_dim in (128, 256))
         else 0
     )
+    mf32 = 0 if window else mf32
     lsum = 0 if mf32 else lsum
     yahead = int(os.environ.get("PP_YAHEAD", "4")) if mf32 else 0
     # K operands an opus-style LDS segment preloads; the rest load in QK.
@@ -268,6 +284,10 @@ def compile_pa_decode_pingpong(
         VSEG,
         VSPLIT,
         ANCHOR,
+        window,
+        sink_dtype,
+        seq_query_length,
+        OAUX,
     )
     if key in _CACHE:
         return _CACHE[key]
@@ -337,6 +357,16 @@ def compile_pa_decode_pingpong(
         v_swizzle = lambda t: (t & 7) << 1
     if varlen:
         kernel_name += "_varlen"
+    if window:
+        kernel_name += f"_sw{window}" + (f"_sink{sink_dtype}" if sink_dtype else "")
+    SPLIT = max(seq_query_length // query_length, 1) if window and not varlen else 1
+    if SPLIT > 1:
+        kernel_name += f"_qs{SPLIT}"
+    if OAUX:
+        kernel_name += f"_o{OAUX}"
+    SINK_T = {"f32": fx.Float32, "bf16": fx.BFloat16, "f16": fx.Float16, None: None}[
+        sink_dtype
+    ]
 
     @flyc.jit
     def _task(
@@ -357,12 +387,16 @@ def compile_pa_decode_pingpong(
         context: fx.Int32,
         slot: fx.Int32,
         work_capacity: fx.Int32,
+        out_ptr: fx.Pointer,
+        sinks_ptr: fx.Pointer,
+        num_kv_heads: fx.Int32,
     ):
         lds = PaDecodeLds(_LdsTraits, SharedStorage)
         lds.allocate()
         kv_h = fx.Int32(gpu.block_id("y"))
-        # Uniform, so the per-tile DMA address math stays on the SALU.
-        n_kv = _uni(gpu.grid_dim.y)
+        # Uniform, so the per-tile DMA address math stays on the SALU. The
+        # window launch passes it: grid_dim is a dependent dispatch-packet load.
+        n_kv = _uni(num_kv_heads) if const_expr(window) else _uni(gpu.grid_dim.y)
         tid = fx.Int32(gpu.thread_id("x"))
         warp = fx.Int32(fx.rocdl.readfirstlane(T.i32, tid // WAVE))
         lane = tid % WAVE
@@ -393,7 +427,7 @@ def compile_pa_decode_pingpong(
             valid = _uni(fx.Int32(qmap[2]))
         else:
             first_row = seq * QLEN
-            table_seq = seq
+            table_seq = seq // SPLIT if const_expr(SPLIT > 1) else seq
             valid = QLEN
 
         # Q: B operand of QK, lane (g, l16) holds head l16, dims 32kk + 8g.
@@ -453,6 +487,12 @@ def compile_pa_decode_pingpong(
         unmasked = (unmasked > 0).select(unmasked, 0) // TILE
         t_split = (unmasked < t_end).select(unmasked, t_end)
         t_split = (t_split > t_begin).select(t_split, t_begin)
+        if const_expr(window):
+            # From the tile of the first query's first visible key, all masked.
+            first_key = context - valid - (window - 1)
+            t_begin = (first_key > 0).select(first_key, 0) // TILE
+            t_end = ctx_tiles
+            t_split = t_begin
         if const_expr(mf32 == 2):
             # The last tile's lookahead QK reads a stale stage: mask it whole.
             t_last = t_end * TILE - 1
@@ -739,9 +779,11 @@ def compile_pa_decode_pingpong(
                     for i in range_constexpr(4):
                         v = fx.Float32(s_flat[m * CH + c][i])
                         if const_expr(masked):
-                            v = (fx.Int32(c * 16 + i) <= limit[m] - lane_tok).select(
-                                v, neg_inf
-                            )
+                            rel = limit[m] - lane_tok
+                            keep = fx.Int32(c * 16 + i) <= rel
+                            if const_expr(window):
+                                keep = keep & (fx.Int32(c * 16 + i) > rel - window)
+                            v = keep.select(v, neg_inf)
                         vals.append(v)
                 mx = vals[0]
                 for v in vals[1:]:
@@ -1721,6 +1763,16 @@ def compile_pa_decode_pingpong(
                 _uni64(buf_base_i64(pout_ptr) + fx.Int64(partial) * (ROWS * DV * 2)),
                 num_records_bytes=ROWS * DV * 2,
             )
+            if const_expr(window):
+                # The sequence's valid query rows of out; padded rows drop.
+                row_bytes = n_kv * (GQA * DV * 2)
+                pout_rs = create_buffer_resource_from_addr(
+                    _uni64(
+                        buf_base_i64(out_ptr)
+                        + fx.Int64(first_row) * fx.Int64(row_bytes)
+                    ),
+                    num_records_bytes=fx.Int64(_uni(valid * row_bytes)),
+                )
             pmax_rs = create_buffer_resource_from_addr(
                 _uni64(buf_base_i64(pmax_ptr) + fx.Int64(partial) * (ROWS * 4)),
                 num_records_bytes=ROWS * 4,
@@ -1746,14 +1798,30 @@ def compile_pa_decode_pingpong(
                 mm = ms[0]
                 for v in ms[1:]:
                     mm = fx.maxnumf(mm, v)
+                if const_expr(SINK_T is not None):
+                    # The sink is one more zero-value logit of the row.
+                    sink = fx.Float32(
+                        fx.ptr_load(
+                            fx.add_offset(
+                                fx.recast_iter(SINK_T, sinks_ptr), kv_h * GQA + l16
+                            ),
+                            result_type=fx.Vector.make_type(1, SINK_T),
+                        )[0]
+                    ) * fx.Float32(LOG2E)
+                    mm = fx.maxnumf(mm, sink)
                 safe = (mm > neg_inf).select(mm, zero)
                 ws = [fx.Float32(fx.exp2(v - safe, fastmath="fast")) for v in ms]
                 lt = ls[0] * ws[0]
                 for j in range_constexpr(1, S):
                     lt = lt + ls[j] * ws[j]
+                if const_expr(SINK_T is not None):
+                    lt = lt + fx.Float32(fx.exp2(sink - safe, fastmath="fast"))
                 inv = (lt > zero).select(fx.Float32(rcp_f32(lt)), zero)
                 wb = [fx.full(4, w * inv, fx.Float32) for w in ws]
                 row = queries[m] * GQA + l16
+                if const_expr(window):
+                    # Row of query q, head h in out [tokens, KV heads * GQA, DV].
+                    row = (queries[m] * n_kv + kv_h) * GQA + l16
                 for nb in range_constexpr(NB):
                     o = o_fin[m][nb] * wb[0]
                     for j in range_constexpr(1, S):
@@ -1768,22 +1836,23 @@ def compile_pa_decode_pingpong(
                         pout_rs,
                         fx.Int32((row * DV + nb * 16 + g * 4) * 2).ir_value(),
                         soff,
+                        aux=_aux(OAUX),
+                    )
+                if const_expr(not window):
+                    mlir_rocdl.raw_ptr_buffer_store(
+                        fx.Float32(mm * fx.Float32(1.0 / LOG2E)).ir_value(),
+                        pmax_rs,
+                        fx.Int32(row * 4).ir_value(),
+                        soff,
                         aux=_aux(0),
                     )
-                mlir_rocdl.raw_ptr_buffer_store(
-                    fx.Float32(mm * fx.Float32(1.0 / LOG2E)).ir_value(),
-                    pmax_rs,
-                    fx.Int32(row * 4).ir_value(),
-                    soff,
-                    aux=_aux(0),
-                )
-                mlir_rocdl.raw_ptr_buffer_store(
-                    fx.Float32(lt).ir_value(),
-                    psum_rs,
-                    fx.Int32(row * 4).ir_value(),
-                    soff,
-                    aux=_aux(0),
-                )
+                    mlir_rocdl.raw_ptr_buffer_store(
+                        fx.Float32(lt).ir_value(),
+                        psum_rs,
+                        fx.Int32(row * 4).ir_value(),
+                        soff,
+                        aux=_aux(0),
+                    )
 
         def store32():
             partial = kv_h * work_capacity + slot
@@ -1894,6 +1963,9 @@ def compile_pa_decode_pingpong(
                 fx.Int32(task[3]),
                 slot,
                 work_capacity,
+                pout_ptr,
+                pout_ptr,
+                fx.Int32(0),
             )
 
         def empty_partial(slot):
@@ -1968,6 +2040,9 @@ def compile_pa_decode_pingpong(
                         is_first.select(fx.Int32(ta[3]), fx.Int32(tb[3])),
                         is_first.select(first, second),
                         work_capacity,
+                        pout_ptr,
+                        pout_ptr,
+                        fx.Int32(0),
                     )
             if fuse:
                 empty_partial(second)
@@ -2041,6 +2116,113 @@ def compile_pa_decode_pingpong(
                 stream=stream,
             )
 
+    @flyc.kernel(name=kernel_name, known_block_size=(NWAVES * WAVE, 1, 1))
+    def pa_decode_pingpong_window_kernel(
+        out_ptr: fx.Pointer,
+        query_ptr: fx.Pointer,
+        key_cache_ptr: fx.Pointer,
+        value_cache_ptr: fx.Pointer,
+        block_tables_ptr: fx.Pointer,
+        max_blocks_per_seq: fx.Int32,
+        stride_q_row: fx.Int32,
+        stride_q_head: fx.Int32,
+        contexts_ptr: fx.Pointer,
+        sinks_ptr: fx.Pointer,
+        query_map_ptr: fx.Pointer,
+        num_kv_heads: fx.Int32,
+    ):
+        seq = fx.Int32(gpu.block_id("x"))
+        context = _uni(
+            fx.Int32(
+                fx.ptr_load(
+                    fx.add_offset(
+                        fx.recast_iter(fx.Int32, contexts_ptr),
+                        seq // SPLIT if const_expr(SPLIT > 1) else seq,
+                    ),
+                    result_type=fx.Vector.make_type(1, fx.Int32),
+                )[0]
+            )
+        )
+        if const_expr(SPLIT > 1):
+            # Query block j of a sequence ends SPLIT - 1 - j blocks early.
+            context = context - (SPLIT - 1 - seq % SPLIT) * QLEN
+        # Unguarded, so the loads overlap: an empty pseudo-sequence runs no
+        # tiles and its zero-record output resource drops the stores.
+        _task(
+            out_ptr,
+            out_ptr,
+            out_ptr,
+            query_ptr,
+            key_cache_ptr,
+            value_cache_ptr,
+            block_tables_ptr,
+            query_map_ptr,
+            max_blocks_per_seq,
+            stride_q_row,
+            stride_q_head,
+            seq,
+            fx.Int32(0),
+            fx.Int32(0),
+            context,
+            fx.Int32(0),
+            fx.Int32(0),
+            out_ptr,
+            sinks_ptr,
+            num_kv_heads,
+        )
+
+    @flyc.jit
+    def pa_decode_pingpong_window_launch(
+        out: fx.Pointer,
+        query: fx.Pointer,
+        key_cache: fx.Pointer,
+        value_cache: fx.Pointer,
+        block_tables: fx.Pointer,
+        max_blocks_per_seq: fx.Int32,
+        stride_q_row: fx.Int32,
+        stride_q_head: fx.Int32,
+        contexts: fx.Pointer,
+        sinks: fx.Pointer,
+        query_map: fx.Pointer,
+        num_seqs: fx.Int32,
+        num_kv_heads: fx.Int32,
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
+    ):
+        _ = kernel_name
+        with CompilationContext.compile_hints({"fastmath": "contract"}):
+            pa_decode_pingpong_window_kernel(
+                out,
+                query,
+                key_cache,
+                value_cache,
+                block_tables,
+                max_blocks_per_seq,
+                stride_q_row,
+                stride_q_head,
+                contexts,
+                sinks,
+                query_map,
+                num_kv_heads,
+                **(
+                    {
+                        "value_attrs": {
+                            "llvm.target_features": ir.Attribute.parse(
+                                '#llvm.target_features<["-packed-fp32-ops"]>'
+                            )
+                        }
+                    }
+                    if nopk
+                    else {}
+                ),
+            ).launch(
+                grid=(num_seqs, num_kv_heads, 1),
+                block=(NWAVES * WAVE, 1, 1),
+                stream=stream,
+            )
+
+    if window:
+        pa_decode_pingpong_launch = pa_decode_pingpong_window_launch
+        pa_decode_pingpong_kernel = pa_decode_pingpong_window_kernel
     if NWAVES == 8:
         pa_decode_pingpong_launch.compile_hints["waves_per_eu"] = 2
     if const_expr(nopk):

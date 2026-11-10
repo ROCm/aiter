@@ -8,8 +8,10 @@ Validated route: BF16 paged attention on gfx950 with the linear
 geometry (Q/K 192, V/output 128, 16 query heads per KV head), page sizes 64 and
 128 and causal full attention. A uniform query length of 1 to 8 tokens per
 sequence runs through ``pa_decode``. Other query lengths (prefill and mixed
-batches, without sinks) split each sequence's queries into blocks of 8 that
-run as pseudo-sequences of the same kernels. ``unified_attention_flydsl``
+batches, without sinks) split each sequence's queries into blocks of 16 that
+run as pseudo-sequences of the same kernels. Causal sliding windows, with or
+without sinks, take any query lengths: one CTA per query block and KV head
+covers its window and writes ``out`` directly. ``unified_attention_flydsl``
 returns ``None`` for anything else; ``flydsl_decline_reason`` names the first
 unsupported property.
 
@@ -41,8 +43,22 @@ _QUERY_BLOCK = int(os.environ.get("PP_VL_QB", "16"))
 _MAX_PSEUDO_SEQS = 40000
 
 
+def _sliding_window(window_size) -> int | None:
+    """Keys a query sees including its own (0: all), as Triton's 1 + left; None if unsupported."""
+    if window_size is None:
+        return 0
+    left, right = (int(x) for x in window_size)
+    if left < -1 or right not in (-1, 0):
+        return None
+    return left + 1
+
+
 def _env_enabled() -> bool:
     return os.environ.get("AITER_UNIFIED_ATTN_FLYDSL", "1") != "0"
+
+
+def _swa_enabled() -> bool:
+    return os.environ.get("AITER_UNIFIED_ATTN_FLYDSL_SWA", "1") != "0"
 
 
 def _varlen_enabled() -> bool:
@@ -143,7 +159,8 @@ def _route(
     shuffled_kv_cache,
     skip_reduce,
 ) -> tuple[str | None, str | None]:
-    """("uniform" or "varlen", None), or (None, reason)."""
+    """(route, None) or (None, reason); routes "window" and "window_varlen"
+    are the sliding-window variants of "uniform" and "varlen"."""
     reason = _common_decline(
         q,
         k,
@@ -171,15 +188,22 @@ def _route(
     num_tokens = q.shape[0]
     num_seqs = seqused_k.numel()
     query_length = int(max_seqlen_q)
-    if 1 <= query_length <= _MAX_QUERY_LENGTH and num_tokens == num_seqs * query_length:
-        return "uniform", None
+    uniform = (
+        1 <= query_length <= _MAX_QUERY_LENGTH and num_tokens == num_seqs * query_length
+    )
+    windowed = bool(_sliding_window(window_size))
+    if uniform:
+        return ("window" if windowed else "uniform"), None
     if not _varlen_enabled():
         return None, (
             "non-uniform or > 8 query lengths are disabled by "
             "AITER_UNIFIED_ATTN_FLYDSL_VARLEN=0"
         )
-    if sinks is not None:
-        return None, "sinks require a uniform query length of 1..8"
+    if sinks is not None and not windowed:
+        return (
+            None,
+            "sinks without a sliding window require a uniform query length of 1..8",
+        )
     if (
         cu_seqlens_q is None
         or cu_seqlens_q.dtype != torch.int32
@@ -192,7 +216,7 @@ def _route(
         return None, f"requires max_seqlen_q >= 1, got {query_length}"
     if _pseudo_capacity(num_tokens, num_seqs) > _MAX_PSEUDO_SEQS:
         return None, f"{num_tokens} query tokens exceed the varlen planner"
-    return "varlen", None
+    return ("window_varlen" if windowed else "varlen"), None
 
 
 def _common_decline(
@@ -242,8 +266,11 @@ def _common_decline(
         return "skip_reduce is not supported"
     if not causal:
         return "requires causal attention"
-    if window_size is not None and tuple(window_size) != (-1, -1):
-        return f"requires full attention, got window_size={tuple(window_size)}"
+    window = _sliding_window(window_size)
+    if window is None:
+        return f"requires a causal left window, got window_size={tuple(window_size)}"
+    if window and not _swa_enabled():
+        return "sliding windows are disabled by AITER_UNIFIED_ATTN_FLYDSL_SWA=0"
     if q.dim() != 3 or out.dim() != 3:
         return "q and out must be [tokens, heads, dim]"
     num_tokens, num_q_heads, head_dim = q.shape
@@ -521,6 +548,120 @@ def _unified_attention_varlen(
     return out
 
 
+_SINK_DTYPES = {torch.float32: "f32", torch.bfloat16: "bf16", torch.float16: "f16"}
+
+
+def _unified_attention_window(
+    q,
+    k,
+    v,
+    out,
+    cu_seqlens_q,
+    seqused_k,
+    query_length,
+    softmax_scale,
+    block_table,
+    window,
+    sinks,
+    explicit,
+):
+    """One CTA per (sequence, KV head) over its window; writes out directly.
+
+    ``query_length`` 1..8 takes uniform rows; None splits ``cu_seqlens_q`` into
+    pseudo-sequences.
+    """
+    import flydsl.expr as fx
+
+    from .kernels.pa_decode_pingpong import compile_pa_decode_pingpong
+    from .kernels.pa_decode_plan import build_query_block_map
+    from .kernels.tensor_shim import _run_compiled, ptr_arg
+
+    num_tokens = q.shape[0]
+    num_seqs = seqused_k.numel()
+    num_kv_heads = k.shape[2]
+    group = q.shape[1] // num_kv_heads
+    dev = q.device
+    with torch.cuda.device(dev):
+        num_cu = torch.cuda.get_device_properties(dev).multi_processor_count
+        cta_queries = query_length
+        if query_length is None:
+            pseudo = _pseudo_capacity(num_tokens, num_seqs)
+            need = {
+                "query_map": (pseudo * 4, torch.int32),
+                "context_lengths": (pseudo, torch.int32),
+            }
+            workspace = _workspace(
+                q,
+                "window_varlen",
+                need,
+                f"{num_seqs} sequences, {num_tokens} query tokens",
+                explicit,
+            )
+            if workspace is None:
+                return None
+            if torch.cuda.is_current_stream_capturing():
+                workspace["captured"] = True
+            query_map = workspace["query_map"][: pseudo * 4].view(pseudo, 4)
+            contexts = workspace["context_lengths"][:pseudo]
+            build_query_block_map(
+                cu_seqlens_q, seqused_k, num_tokens, _QUERY_BLOCK, query_map, contexts
+            )
+            grid_seqs = pseudo
+        else:
+            # A CTA's fixed latency dwarfs a window's few tiles: spread each
+            # sequence's queries over CTAs while they fit the CUs.
+            cta_queries = int(os.environ.get("PP_WIN_Q", "0")) or next(
+                d
+                for d in range(1, query_length + 1)
+                if query_length % d == 0
+                and (
+                    num_seqs * num_kv_heads * (query_length // d) <= num_cu
+                    or d == query_length
+                )
+            )
+            query_map = seqused_k
+            contexts = seqused_k
+            grid_seqs = num_seqs * (query_length // cta_queries)
+        compiled = compile_pa_decode_pingpong(
+            head_dim=_HEAD_DIM,
+            value_dim=_VALUE_DIM,
+            query_group_size=group,
+            query_length=_QUERY_BLOCK if query_length is None else cta_queries,
+            block_size=k.shape[1],
+            softmax_scale=float(softmax_scale),
+            varlen=query_length is None,
+            window=window,
+            sink_dtype=None if sinks is None else _SINK_DTYPES[sinks.dtype],
+            seq_query_length=query_length or 0,
+        )
+        sink_arg = ptr_arg(contexts, fx.Int32)
+        if sinks is not None:
+            sink_arg = ptr_arg(
+                sinks,
+                {"f32": fx.Float32, "bf16": fx.BFloat16, "f16": fx.Float16}[
+                    _SINK_DTYPES[sinks.dtype]
+                ],
+            )
+        _run_compiled(
+            compiled["launch"],
+            ptr_arg(out, fx.BFloat16),
+            ptr_arg(q, fx.BFloat16),
+            ptr_arg(k, fx.BFloat16),
+            ptr_arg(v, fx.BFloat16),
+            ptr_arg(block_table, fx.Int32),
+            int(block_table.shape[1]),
+            int(q.stride(0)),
+            int(q.stride(1)),
+            ptr_arg(contexts, fx.Int32),
+            sink_arg,
+            ptr_arg(query_map, fx.Int32),
+            grid_seqs,
+            num_kv_heads,
+            torch.cuda.current_stream(dev),
+        )
+    return out
+
+
 def unified_attention_flydsl(
     q,
     k,
@@ -583,6 +724,21 @@ def unified_attention_flydsl(
     )
     if route is None:
         return None
+    if route in ("window", "window_varlen"):
+        return _unified_attention_window(
+            q,
+            k,
+            v,
+            out,
+            cu_seqlens_q,
+            seqused_k,
+            int(max_seqlen_q) if route == "window" else None,
+            softmax_scale,
+            block_table,
+            min(_sliding_window(window_size), 1 << 30),
+            sinks,
+            explicit,
+        )
     if route == "varlen":
         return _unified_attention_varlen(
             q,
@@ -602,6 +758,7 @@ def unified_attention_flydsl(
     num_kv_heads = k.shape[2]
     query_length = int(max_seqlen_q)
     group = q.shape[1] // num_kv_heads
+    sliding_window = _sliding_window(window_size)
     with torch.cuda.device(q.device):
         num_cu = torch.cuda.get_device_properties(q.device).multi_processor_count
         capacity = _plan_capacity(num_seqs, num_kv_heads, num_cu)
@@ -628,10 +785,17 @@ def unified_attention_flydsl(
             reduce_info=workspace["reduce_info"][: num_seqs * 2].view(num_seqs, 2),
             num_kv_heads=num_kv_heads,
             max_partitions=num_cu,
+            sliding_window=sliding_window,
             query_length=query_length,
         )
         # Every call records the refresh, so captured graphs follow new lengths.
-        plan_pa_decode(seqused_k, num_kv_heads, query_length=query_length, plan=plan)
+        plan_pa_decode(
+            seqused_k,
+            num_kv_heads,
+            sliding_window=sliding_window,
+            query_length=query_length,
+            plan=plan,
+        )
         pa_decode(
             out,
             q,
@@ -642,6 +806,7 @@ def unified_attention_flydsl(
             float(softmax_scale),
             query_length,
             sinks=sinks,
+            sliding_window=sliding_window,
             work_plan=plan,
             max_context_length=int(max_seqlen_k),
             exp_sums=workspace["exp_sums"][:scalars].view(shape),
