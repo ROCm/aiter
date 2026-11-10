@@ -20,6 +20,8 @@ self-hosted-runner:
     - linux-aiter-mi35x-8
     - linux-aiter-mi355-1
     - linux-aiter-mi355-8
+    - radeon-r9700
+    - xsj-dispatch
     - box308
 
 config-variables: null
