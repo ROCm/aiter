@@ -20,8 +20,6 @@ from typing import TYPE_CHECKING, Any, ClassVar
 
 import pandas as pd
 import torch
-import torch.nn.functional as F
-from einops import rearrange
 
 import aiter
 from aiter import (
@@ -43,10 +41,14 @@ from aiter.fused_moe import (
     fused_topk,
     moe_sorting,
     swiglu_limit_tag,
+    torch_dynamic_mxfp8_quant,
     torch_moe,
+    torch_moe_2stages,
+    torch_moe_blockscale,
     torch_moe_stage1,
     torch_moe_stage2,
 )
+from aiter.fused_moe_bf16_asm import torch_moe_tkw1
 from aiter.fused_moe_registry import make_fused_moe_impl_kernel_name
 from aiter.int4_utils import (
     convert_int8_to_uint32_int4,
@@ -261,34 +263,6 @@ def _manifest_flat_by_kernel(df: pd.DataFrame) -> dict:
         return {}
     return dict(
         zip(df["knl_name"], df["flat"].fillna(AsmMoeMode.SORTED.value).astype(int))
-    )
-
-
-def torch_dynamic_mxfp8_quant(x: torch.Tensor):
-    """MXFP8 quantization (e4m3fn + e8m0 block scale, block=32).
-
-    Same numerics as ``aiter/bench_stage2_a8w4.py`` for a8w4 activations.
-    """
-    BLOCK = 32
-    orig_shape = x.shape
-    x_f32 = x.reshape(-1, x.shape[-1] // BLOCK, BLOCK).float()
-
-    amax, _ = torch.max(torch.abs(x_f32), dim=-1)
-    amax_i32 = amax.view(torch.int32)
-    amax_rounded = (amax_i32 + 0x200000) & 0xFF800000
-    exp_field = (amax_rounded >> 23) & 0xFF
-
-    e8m0_biased = torch.clamp(exp_field - 8, min=0)
-    quant_exp = 254 - e8m0_biased
-    quant_scale = (quant_exp << 23).view(torch.float32)
-
-    scaled = x_f32 * quant_scale.unsqueeze(-1)
-    fp8_vals = scaled.to(torch.float8_e4m3fn)
-    fp8_bytes = fp8_vals.view(torch.uint8)
-
-    e8m0_bytes = e8m0_biased.to(torch.uint8).view(dtypes.fp8_e8m0)
-    return fp8_bytes.view(*orig_shape), e8m0_bytes.view(
-        *orig_shape[:-1], orig_shape[-1] // BLOCK
     )
 
 
@@ -2618,245 +2592,9 @@ class FmoeTuner(TunerCommon):
             activation,
         )
 
-    @staticmethod
-    def torch_moe_tkw1(
-        hidden_states,
-        w1,
-        w2,
-        topk_weight,
-        topk_ids,
-        # following for int8 quant
-        fc1_scale=None,  # [expert(local_expert:EP), inter_dim, 1]
-        fc2_scale=None,  # [expert(local_expert:EP), model_dim, 1]
-        fc1_smooth_scale=None,  # [expert(local_expert:EP), 1, model_dim]
-        fc2_smooth_scale=None,  # [expert(local_expert:EP), 1, inter_dim]
-        expert_mask=None,
-        activation=ActivationType.Silu,
-    ):
-        computeType = dtypes.fp32
-        dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(computeType)
-        w1 = w1.to(computeType)
-        w2 = w2.to(computeType)
-        B, D = hidden_states.shape
-        topk = topk_weight.shape[1]
-        if expert_mask is not None:
-            local_expert_hash = expert_mask.cumsum(0, dtype=dtypes.i32) - 1
-            local_expert_hash[expert_mask == 0] = -1
-            topk_ids = local_expert_hash[topk_ids]
-
-        hidden_states = hidden_states.view(B, -1, D).repeat(1, topk, 1)
-        out = torch.zeros(
-            (B, topk, D),
-            dtype=computeType,
-            device=hidden_states.device,
-        )
-
-        inter_dim = w2.shape[2]
-        if w2.shape[2] * 2 == w1.shape[1]:
-            # g1u1(w1 include gate and up)
-            moeType = "g1u1"
-        else:
-            # g1u0(w1 only include gate)
-            moeType = "g1u0"
-
-        if fc1_scale is not None:
-            # gose to quant D_w8a8/w8a8
-            expert = w1.shape[0]
-            w2D = w2.shape[-1]
-            w1 = (w1.view(-1, D) * fc1_scale.view(-1, 1)).view(expert, -1, D)
-            w2 = (w2.view(-1, w2D) * fc2_scale.view(-1, 1)).view(expert, -1, w2D)
-
-        if fc1_smooth_scale is not None:
-            expert = fc1_smooth_scale.shape[0]
-            fc1_smooth_scale = fc1_smooth_scale.view(expert, -1)
-            fc2_smooth_scale = fc2_smooth_scale.view(expert, -1)
-
-        for E_id in range(w1.shape[0]):
-            mask = topk_ids == E_id
-            if mask.sum():
-                sub_tokens = hidden_states[mask]
-                if fc1_smooth_scale is not None:
-                    sub_tokens = sub_tokens * (fc1_smooth_scale[E_id])
-
-                act_input = sub_tokens @ (w1[E_id].transpose(0, 1))
-                if moeType == "g1u1":
-                    gate, up = act_input.split([inter_dim, inter_dim], dim=-1)
-                    gate = gate * (topk_weight.view(B, -1, 1)[mask])
-                    up = up * (topk_weight.view(B, -1, 1)[mask])
-                    if activation == ActivationType.Gelu:
-                        act_out = F.gelu(gate) * up
-                    else:
-                        act_out = F.silu(gate) * up
-                else:
-                    if activation == ActivationType.Gelu:
-                        act_out = F.gelu(act_input)
-                    else:
-                        act_out = F.silu(act_input)
-                if fc2_smooth_scale is not None:
-                    act_out = act_out * (fc2_smooth_scale[E_id])
-                act_out, act_out_scale = aiter.pertoken_quant(
-                    act_out, quant_dtype=dtypes.fp8, dtypeMax=None
-                )
-                out[mask] = (
-                    act_out.to(computeType)
-                    @ (w2[E_id].transpose(0, 1))
-                    * act_out_scale.view(-1, 1)
-                )
-
-        return out.sum(dim=1).to(dtype)
-
-    @staticmethod
-    def torch_moe_2stages(
-        hidden_states,
-        w1,  # E, inter_dim*2, model_dim
-        w2,  # E, model_dim, inter_dim
-        topk_weight,
-        topk_ids,
-        a1_scale=None,
-        w1_scale=None,
-        w2_scale=None,
-        dtype=dtypes.fp16,
-        activation=ActivationType.Silu,
-        quant_type=QuantType.No,
-        doweight_stage1=False,
-        swiglu_limit=None,
-    ):
-        ref1 = torch_moe_stage1(
-            hidden_states,
-            w1,  # E, inter_dim*2, model_dim
-            w2,  # E, model_dim, inter_dim
-            topk_weight,
-            topk_ids,
-            dtype=dtype,
-            activation=activation,
-            quant_type=quant_type,
-            a1_scale=a1_scale,
-            w1_scale=w1_scale,
-            doweight=doweight_stage1,
-            situ_beta=DEFAULT_SITUV2_BETA,
-            situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
-            swiglu_limit=swiglu_limit,
-        )
-        AQDType = hidden_states.dtype
-
-        if quant_type == aiter.QuantType.per_1x128:
-            a2_qt, a2_scale = aiter.pertoken_quant(
-                ref1.view(hidden_states.shape[0], -1, 128), quant_dtype=AQDType
-            )
-        elif quant_type == QuantType.per_1x32:
-            # per_1x32 stage-2 activation quant depends on the activation scheme,
-            # which is encoded by the (already-quantized) stage-1 input dtype:
-            #   bf16/fp16 -> a16w4 (activations not quantized)
-            #   fp8       -> a8w4  (MX-FP8 block quant)
-            #   fp4x2     -> a4w4  (MX-FP4 block quant)
-            # get_torch_quant(per_1x32) is fp4-only, so dispatch explicitly.
-            if AQDType in (dtypes.bf16, dtypes.fp16):
-                a2_qt, a2_scale = ref1.to(AQDType), None
-            elif AQDType == dtypes.fp8:
-                a2_qt, a2_scale = torch_dynamic_mxfp8_quant(ref1)
-            else:
-                a2_qt, a2_scale = aiter.get_torch_quant(quant_type)(
-                    ref1, quant_dtype=AQDType
-                )
-        else:
-            torch_quant = aiter.get_torch_quant(quant_type)
-            a2_qt, a2_scale = torch_quant(ref1, quant_dtype=AQDType)
-        a2_qt = a2_qt.view(ref1.shape[0], ref1.shape[1], -1)
-
-        ref2 = torch_moe_stage2(
-            a2_qt,
-            w1,  # E, inter_dim*2, model_dim
-            w2,  # E, model_dim, inter_dim
-            topk_weight,
-            topk_ids,
-            dtype=dtype,
-            quant_type=quant_type,
-            a2_scale=a2_scale,
-            w2_scale=w2_scale,
-            doweight=not doweight_stage1,
-        )
-        return ref2
-
-    @staticmethod
-    def torch_moe_blockscale(
-        hidden_states,
-        w1,  # [expert, inter_dim*2, model_dim]
-        w2,  # [expert, model_dim, inter_dim]
-        topk_weight,
-        topk_ids,
-        # following for quant
-        a_scale=None,
-        # [expert, inter_dim/blk_m, model_dim/blk_k]
-        fc1_scale=None,
-        # [expert, model_dim/blk_m, inter_dim/blk_k]
-        fc2_scale=None,
-        expert_mask=None,
-        scale_blks=(128, 128),
-        dtype=dtypes.bf16,
-    ):
-        computeType = dtypes.fp32
-        hidden_states = hidden_states.to(computeType)
-        w1 = w1.to(computeType)
-        w2 = w2.to(computeType)
-        token_num, topk = topk_ids.shape
-        expert, model_dim, inter_dim = w2.shape
-        B, D = hidden_states.shape
-        topk = topk_weight.shape[1]
-        if expert_mask is not None:
-            local_expert_hash = expert_mask.cumsum(0, dtype=dtypes.i32) - 1
-            local_expert_hash[expert_mask == 0] = -1
-            topk_ids = local_expert_hash[topk_ids]
-
-        blk_n, blk_k = scale_blks
-        if a_scale is not None:
-            hidden_states = hidden_states.view(
-                token_num, -1, blk_k
-            ) * a_scale.unsqueeze(-1)
-            hidden_states = hidden_states.view(token_num, -1)
-
-        hidden_states = hidden_states.view(token_num, 1, model_dim).repeat(1, topk, 1)
-        out = torch.zeros(
-            (B, topk, D),
-            dtype=computeType,
-            device=hidden_states.device,
-        )
-        if w2.shape[2] * 2 == w1.shape[1]:
-            moeType = "g1u1"
-        else:
-            moeType = "g1u0"
-
-        nblk_n = inter_dim // blk_n
-        nblk_k = model_dim // blk_k
-        if fc1_scale is not None:
-            fc1_scale = rearrange(
-                fc1_scale.view(-1, 1)
-                .repeat(1, blk_n * blk_k)
-                .view(expert, -1, nblk_k, blk_n, blk_k),
-                "e num_blk_n num_blk_k blk_n blk_k -> e (num_blk_n blk_n) (num_blk_k blk_k)",
-            )
-            fc2_scale = rearrange(
-                fc2_scale.view(-1, 1)
-                .repeat(1, blk_n * blk_k)
-                .view(expert, nblk_k, nblk_n, blk_k, blk_n),
-                "e num_blk_n num_blk_k blk_n blk_k -> e (num_blk_n blk_n) (num_blk_k blk_k)",
-            )
-            w1 = w1 * fc1_scale
-            w2 = w2 * fc2_scale
-
-        for E_id in range(w1.shape[0]):
-            mask = topk_ids == E_id
-            if mask.sum():
-                sub_tokens = hidden_states[mask]
-                act_input = sub_tokens @ (w1[E_id].transpose(0, 1))
-                if moeType == "g1u1":
-                    gate, up = act_input.split([inter_dim, inter_dim], dim=-1)
-                    act_out = F.silu(gate) * up
-                else:
-                    act_out = F.gelu(act_input)
-                out[mask] = act_out @ (w2[E_id].transpose(0, 1))
-
-        return (out * topk_weight.view(B, -1, 1)).sum(dim=1).to(dtype)
+    torch_moe_tkw1 = staticmethod(torch_moe_tkw1)
+    torch_moe_2stages = staticmethod(torch_moe_2stages)
+    torch_moe_blockscale = staticmethod(torch_moe_blockscale)
 
     def calculate(self, results, bpes=(1, 1, 2)):
         key, stage, _kernelName, _block_m, us, _err = results
