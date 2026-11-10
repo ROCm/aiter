@@ -4,7 +4,6 @@
 
 import os
 import random
-import subprocess
 import sys
 from types import SimpleNamespace
 
@@ -20,6 +19,7 @@ from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.shuffle import shuffle_scale_batched, shuffle_weight
 from aiter.ops.triton.utils.types import e4m3_dtype
 from aiter.test_common import checkAllclose
+from op_tests.gpu_fault_subprocess import run_in_subprocess
 from op_tests.triton_tests.quant.test_quant_mxfp4 import (
     torch_dynamic_mxfp4_quant,
 )
@@ -1374,15 +1374,7 @@ def test_triton_unified_attn_block_table_before_unmapped_page(
         "with torch.inference_mode():\n"
         f"    run({seq_lens!r}, {block_size!r}, {sliding_window!r})\n"
     )
-    env = dict(os.environ, HSA_DISABLE_COREDUMP_ON_EXCEPTION="1")
-    result = subprocess.run(
-        [sys.executable, "-c", child],
-        capture_output=True,
-        text=True,
-        timeout=600,
-        env=env,
-        check=False,
-    )
+    result = run_in_subprocess(child, timeout=600)
     assert "memory access fault" not in result.stderr.lower(), (
         "unified attention read past the end of the block table "
         f"(rc={result.returncode}):\n{result.stderr[-2048:]}"
