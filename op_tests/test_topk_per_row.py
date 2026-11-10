@@ -21,6 +21,7 @@ from aiter.ops.flydsl.kernels.tensor_shim import wave_size_of
 from aiter.ops.flydsl.kernels.topk import (
     topk_per_row_decode_adaptive as adaptive_kernel,
 )
+from aiter.ops.flydsl.kernels.topk.topk_launch import _launcher_on
 from aiter.ops.flydsl.topk import topk_per_row as flydsl_decode_host
 from aiter.ops.flydsl.topk.topk_per_row import _FLYDSL_TOPK_ONE_BLOCK_ARCHES
 from aiter.ops.topk import _FLYDSL_TOPK_DECODE_GATES
@@ -885,6 +886,39 @@ def test_decode_cu_num_lowers_never_raises():
     print("[decode_cu_num_lowers_never_raises] PASS")
 
 
+def test_decode_adaptive_two_gpus():
+    """One shape on GPU 0, then GPU 1, then GPU 0 again: each GPU launches a build
+    loaded on itself, not the one the first call loaded."""
+    gpus = [d for d in range(torch.cuda.device_count()) if wave_size_of(d) == 64]
+    if len(gpus) < 2:
+        print("[decode_adaptive_two_gpus] SKIP: needs two wave64 GPUs")
+        return
+    rows, width, top_k = 4, 65536, 2048
+    for dev in (gpus[0], gpus[1], gpus[0]):
+        with torch.cuda.device(dev):
+            torch.manual_seed(dev)
+            logits = torch.randn(rows, width, device="cuda")
+            seq_lens = torch.full((rows,), width, dtype=torch.int32, device="cuda")
+            out = torch.full((rows, top_k), -7, dtype=torch.int32, device="cuda")
+            flydsl_decode_host._decode_with_backend(
+                logits,
+                1,
+                seq_lens,
+                out,
+                rows,
+                width,
+                1,
+                top_k,
+                True,
+                None,
+                topk.BACKEND_ADAPTIVE,
+                width,
+            )
+            torch.cuda.synchronize()
+            assert torch.equal(out.long(), stable_reference(logits, top_k)), dev
+    print("[decode_adaptive_two_gpus] PASS")
+
+
 def test_decode_no_bound_skips_gate():
     """Without `max_row_len`, or with one below 1, the FlyDSL entry runs the
     single-launch kernel without asking the gate; with one it asks."""
@@ -1578,9 +1612,12 @@ def test_adaptive_scratch_two_streams(card):
 
 def test_adaptive_plan(card):
     """The cached plan holds what `decode_adaptive_config` and the kernel factory
-    give for the shape, on this card's CU count and on others."""
+    give for the shape, on this card's CU count and on others, with a launcher of
+    its own per GPU. The further GPU is an id nothing is launched on."""
     plan = flydsl_decode_host._adaptive_plan
     plan.cache_clear()
+    dev = torch.cuda.current_device()
+    other = dev + 4096
     cells = itertools.product(
         sorted({card[1], 80, 256, 304}),
         (1, 2, 3, 4, 7, 8, 16, 31, 32, 33, 64, 128, 256, 512),
@@ -1594,11 +1631,16 @@ def test_adaptive_plan(card):
         cfg = adaptive_kernel.decode_adaptive_config(
             rows, seq, k, ordered=ordered, cu_count=cu
         )
-        got = plan(rows, seq, k, ordered, cu, packed)
+        got = plan(rows, seq, k, ordered, cu, packed, dev)
         cell = f"cu={cu} rows={rows} seq={seq} k={k} ordered={ordered} packed={packed}"
-        assert got[0] is adaptive_kernel.create_topk_per_row_decode_adaptive_kernel(
+        exe = adaptive_kernel.create_topk_per_row_decode_adaptive_kernel(
             top_k=k, packed_rows=packed, **cfg.kw
-        ), cell
+        )
+        assert got[0] is _launcher_on(exe, dev), cell
+        on_other = plan(rows, seq, k, ordered, cu, packed, other)
+        assert on_other[0] is _launcher_on(exe, other), cell
+        assert on_other[0] is not got[0], cell
+        assert on_other[1:] == got[1:], cell
         assert got[1] == cfg.scratch_slots, cell
         assert got[2] == (
             cfg.grid,
@@ -1607,7 +1649,7 @@ def test_adaptive_plan(card):
             cfg.short_max,
             cfg.compact_min,
         ), cell
-        assert plan(rows, seq, k, ordered, cu, packed) is got, cell
+        assert plan(rows, seq, k, ordered, cu, packed, dev) is got, cell
         n += 1
     print(f"[adaptive_plan] PASS: {n} shapes")
 
@@ -2714,6 +2756,7 @@ def run_adaptive():
     test_decode_bound_gate()
     test_decode_mixed_node()
     test_decode_cu_num_lowers_never_raises()
+    test_decode_adaptive_two_gpus()
     test_decode_no_bound_skips_gate()
     test_decode_bound_below_one()
     card = (get_gfx_runtime(), get_cu_num_device(torch.cuda.current_device()))

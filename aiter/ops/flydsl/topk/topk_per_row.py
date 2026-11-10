@@ -25,7 +25,7 @@ from ..kernels.topk.radix_topk_one_block import (
     _MAX_ROW_ELEMENTS,
     build_radix_topk_one_block_module,
 )
-from ..kernels.topk.topk_launch import run_topk_launcher
+from ..kernels.topk.topk_launch import _launcher_on, run_topk_launcher
 from ..kernels.topk.topk_per_row_decode import (
     clear_topk_per_row_decode_workspace_cache as _clear_split_workspace_cache,
 )
@@ -458,16 +458,26 @@ def is_flydsl_top_k_per_row_decode_supported(
 
 @lru_cache(maxsize=256)
 def _adaptive_plan(
-    rows: int, seq: int, k: int, ordered: bool, cu_count: int, packed: bool
+    rows: int,
+    seq: int,
+    k: int,
+    ordered: bool,
+    cu_count: int,
+    packed: bool,
+    device: int,
 ) -> tuple:
-    """The adaptive launcher, its scratch slots and its launch scalars (grid, parts,
-    parts_magic, short_max, compact_min) for one shape, so a call computes none of it.
+    """The adaptive launcher on GPU `device`, its scratch slots and its launch scalars
+    (grid, parts, parts_magic, short_max, compact_min) for one shape, so a call
+    computes none of it.
     """
     cfg = _adaptive.decode_adaptive_config(
         rows, seq, k, ordered=ordered, cu_count=cu_count
     )
-    launcher = _adaptive.create_topk_per_row_decode_adaptive_kernel(
-        top_k=k, packed_rows=packed, **cfg.kw
+    launcher = _launcher_on(
+        _adaptive.create_topk_per_row_decode_adaptive_kernel(
+            top_k=k, packed_rows=packed, **cfg.kw
+        ),
+        device,
     )
     launch = (cfg.grid, cfg.parts, cfg.parts_magic, cfg.short_max, cfg.compact_min)
     return launcher, cfg.scratch_slots, launch
@@ -505,9 +515,16 @@ def _run_adaptive(
         cfg_width = width
     packed = row_starts is not None
     # The gate's own count, so the band it admitted and the grid built here
-    # describe the same card.
+    # describe the same card; the launcher is the current GPU's, where FlyDSL
+    # loads its build.
     launcher, scratch_slots, launch = _adaptive_plan(
-        rows, cfg_width, k, stable, get_cu_num_device(logits.device.index), packed
+        rows,
+        cfg_width,
+        k,
+        stable,
+        get_cu_num_device(logits.device.index),
+        packed,
+        torch._C._cuda_getDevice(),
     )
     device, stream_id = logits.device, stream.cuda_stream
     capture = _adaptive_capture(device, stream_id)
