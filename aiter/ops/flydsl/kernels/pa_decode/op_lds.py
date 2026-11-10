@@ -143,10 +143,15 @@ class PaDecodeQueryLoader:
 
     def _q_early(self):
         # MXFP4: Q ahead of the K/V bursts, so its staging does not wait for them
-        # (a padded row would read past the query).
-        return self.traits.MTP4_FUSED or (
-            self.traits.kv_dtype == MXFP4_KV_DTYPE
-            and self.traits.CTA_ROWS % MFMA_MNK == 0
+        # (a padded row would read past the query). gfx942 clamps padded rows
+        # to the last real one instead; staging zeroes them.
+        return (
+            self.traits.MTP4_FUSED
+            or self.traits.GFX942_Q_EARLY
+            or (
+                self.traits.kv_dtype == MXFP4_KV_DTYPE
+                and self.traits.CTA_ROWS % MFMA_MNK == 0
+            )
         )
 
     def prefetch(self):
@@ -156,6 +161,10 @@ class PaDecodeQueryLoader:
             q_units_prefetched = []
             for m in range_constexpr(self.traits.M_TILES):
                 flat_idx = m * MFMA_MNK + self.ctx.qh_local
+                if const_expr((m + 1) * MFMA_MNK > self.traits.CTA_ROWS):
+                    flat_idx = (flat_idx < self.traits.CTA_ROWS).select(
+                        flat_idx, fx.Int32(self.traits.CTA_ROWS - 1)
+                    )
                 qi = flat_idx // self.traits.query_group_size
                 gs_head = flat_idx - qi * self.traits.query_group_size
                 q_units_prefetched.append(self.load_row(qi, gs_head))
@@ -249,7 +258,15 @@ class PaDecodeQueryLoader:
                 )
                 self.stage_row(m, q_row_off, q_units)
             elif flat_idx < self.traits.CTA_ROWS:
-                self.stage_row(m, q_row_off, self.load_row(qi, gs_head))
+                self.stage_row(
+                    m,
+                    q_row_off,
+                    (
+                        q_units_prefetched[m]
+                        if const_expr(self.traits.GFX942_Q_EARLY)
+                        else self.load_row(qi, gs_head)
+                    ),
+                )
             else:
                 if const_expr(self.traits.kv_dtype == fx.BFloat16):
                     for u in range_constexpr(self.traits.N_QLOADS):

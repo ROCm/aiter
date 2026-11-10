@@ -487,6 +487,7 @@ class PaDecodeTraits:
     PAGE16_VPIPE: bool
     STREAM_KV: bool
     WAVES_PER_EU_2: bool
+    GFX942_Q_EARLY: bool
     REUSE_KV_PAGES: bool
     SCALES_BEFORE_CURRENT_V: bool
     M1_SCALE_BEFORE_MASK: bool
@@ -840,6 +841,12 @@ class PaDecodeTraits:
             PAGE16_VPIPE=PAGE16_VPIPE,
             STREAM_KV=STREAM_KV,
             WAVES_PER_EU_2=WAVES_PER_EU_2,
+            # gfx942 issues Q loads before the first K tile's page and K loads,
+            # so Q staging does not wait behind them on the in-order vmcnt
+            # chain. Streamed kernels start with K pieces and gain nothing.
+            GFX942_Q_EARLY=(
+                not is_gfx950 and kv_dtype != MXFP4_KV_DTYPE and not STREAM_KV
+            ),
             REUSE_KV_PAGES=REUSE_KV_PAGES,
             SCALES_BEFORE_CURRENT_V=SCALES_BEFORE_CURRENT_V,
             M1_SCALE_BEFORE_MASK=M1_SCALE_BEFORE_MASK,
