@@ -10,6 +10,7 @@ import flydsl.expr as fx
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
 
+from .dpp_utils import dpp_xor_f32
 from .tensor_shim import (
     _FX_ELEM,
     AITER_FLYDSL_KERNARG_PRELOAD,
@@ -18,7 +19,6 @@ from .tensor_shim import (
     buf_copy_load,
     ptr_buf_tensor,
 )
-from .dpp_utils import dpp_xor_f32
 from .utils import rcp_f32, udiv_const, urem_const
 
 WAVE = 64
