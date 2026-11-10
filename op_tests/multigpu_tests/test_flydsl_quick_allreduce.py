@@ -253,9 +253,8 @@ PINNED_CODEC_CASES = (
     ),
 )
 
-# The mesh's pinned INT5/INT6 floors, ~1.5 dB under what each delivers at
-# TP4/TP8 (gfx950: INT5 24.8-25.1 dB, INT6 30.8-31.1 dB), so a wider codec
-# that decodes at INT4 quality fails.
+# The mesh's pinned INT5/INT6 floors, so a wider codec that decodes at INT4
+# quality fails.
 MESH_PINNED_SQNR_MIN_DB = {"int5": 23.0, "int6": 29.0}
 
 # (tp, algorithm, tokens, hidden, super_tile, block) on the lossless
