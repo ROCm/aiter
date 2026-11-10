@@ -411,10 +411,11 @@ def test_pa_prefill_sparse_extend_only(T, H, D, prefix_len, extend_len):
     torch.testing.assert_close(out, ref, atol=5e-3, rtol=5e-3)
 
 
-# H=32 takes the single-pass kernel, H=64 mla_gluon. T=16384 with 512 slots
-# per row gives an 8 GiB pool, so KV offsets need 64 bits.
+# H=32 and 64 take the single-pass kernel (H=64 as two launches), H=16
+# mla_gluon. T=16384 with 512 slots per row gives an 8 GiB pool, so KV offsets
+# need 64 bits.
 @pytest.mark.parametrize("T", [1024, 16384])
-@pytest.mark.parametrize("H", [32, 64])
+@pytest.mark.parametrize("H", [16, 32, 64])
 @pytest.mark.parametrize("D", [512])
 @pytest.mark.parametrize("prefix_len", [255, 512])
 def test_pa_prefill_sparse_gfx950(T, H, D, prefix_len):
@@ -566,16 +567,20 @@ def test_pa_prefill_sparse_single_source(H, dtype, with_sink):
     torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
 
 
-# gfx950 single-pass kernel (H=32): partial last tiles, short rows, and empty
-# rows, which must write zeros into the NaN-filled out.
+# gfx950 single-pass kernel: partial last tiles, short rows, and empty rows,
+# which must write zeros into the NaN-filled out. At T=48 only the sink-free
+# H=32 call stays on mla_gluon; it would assert at H=64 and add the sink once
+# per key split.
 @pytest.mark.parametrize("with_sink", [True, False])
-def test_pa_prefill_sparse_gfx950_single_pass(with_sink):
+@pytest.mark.parametrize("H", [32, 64])
+@pytest.mark.parametrize("T", [300, 48])
+def test_pa_prefill_sparse_gfx950_single_pass(T, H, with_sink):
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
     if DEVICE_ARCH != "gfx950":
         pytest.skip("covers the gfx950 single-pass branch")
 
-    T, H, D, max_len, num_kv, dev = 300, 32, 512, 640, 4096, "cuda"
+    D, max_len, num_kv, dev = 512, 640, 4096, "cuda"
     torch.manual_seed(0)
     q = torch.randn(T, H, D, dtype=torch.bfloat16, device=dev)
     kv = torch.randn(num_kv, D, dtype=torch.bfloat16, device=dev)

@@ -15,7 +15,7 @@ over one pool.
 ``pa_prefill_sparse`` — a single entry that dispatches on arch:
 
     gfx1250 -> gluon ``_pa_prefill_sparse``           (two sources, native)
-    gfx950  -> gluon ``_pa_prefill_sparse``           (single source, H=32, D=512, bf16)
+    gfx950  -> gluon ``_pa_prefill_sparse``           (single source, H=32 or 64, D=512, bf16)
                else gluon wrapper ``mla_gluon``       (single source)
     else    -> triton ``_sparse_attn_prefill_kernel`` (single source)
 """
@@ -86,10 +86,10 @@ def pa_prefill_sparse(
     """Sparse prefill attention over two KV sources with sink.
 
     Dispatches on arch: gfx1250 -> gluon (two sources), gfx950 -> a single-pass
-    gluon kernel for bf16 q and KV with H=32 and D=512 and at least the
-    config's MIN_TOKENS query rows, else `mla_gluon`; otherwise the Triton
-    kernel. Only gfx1250 reads a second KV source; the other two serve the
-    prefix source alone and reject any extend source.
+    gluon kernel for bf16 q and KV with H=32 or 64 and D=512 (at H=32 without
+    a sink, from the config's MIN_TOKENS query rows), else `mla_gluon`;
+    otherwise the Triton kernel. Only gfx1250 reads a second KV source; the
+    other two serve the prefix source alone and reject any extend source.
 
     Meant for prefill-sized calls. The grid is one program per query token with
     no split over the KV slots, so a call with only a few query rows (a decode
@@ -237,7 +237,7 @@ def pa_prefill_sparse(
             kv_indices_extend,
             kv_indptr_extend,
         )
-        if _use_single_pass(q, unified_kv, has_invalid):
+        if _use_single_pass(q, unified_kv, has_invalid, attn_sink):
             _single_pass_prefill(
                 q,
                 unified_kv,
@@ -360,22 +360,51 @@ def _single_pass_config() -> dict:
     return load_config_json(f"{cfg_dir}/DEFAULT.json")["_pa_prefill_sparse"]
 
 
-def _use_single_pass(
+# The kernel computes 32 heads per program, so H=64 runs it twice, once per
+# half of the heads: one 64-head program measured slower than two 32-head
+# launches.
+_LAUNCH_HEADS = 32
+_SINGLE_PASS_HEADS = (32, 64)
+
+
+def _single_pass_unsupported(
     q: torch.Tensor, unified_kv: torch.Tensor, has_invalid: bool | None
+) -> str | None:
+    """Why the gfx950 single-pass kernel cannot serve the call, or None."""
+    _, H, D = q.shape
+    if H not in _SINGLE_PASS_HEADS or D != 512:
+        return f"needs H in {_SINGLE_PASS_HEADS} and D=512, got H={H} D={D}"
+    if q.dtype != torch.bfloat16 or unified_kv.dtype != torch.bfloat16:
+        return f"needs bf16 q and unified_kv, got {q.dtype} and {unified_kv.dtype}"
+    if unified_kv.dim() != 2 or unified_kv.shape[1] != D:
+        return f"needs a [total_pages, {D}] unified_kv, got {tuple(unified_kv.shape)}"
+    if q.stride(2) != 1 or unified_kv.stride(1) != 1:
+        return (
+            f"needs unit inner strides, got q {q.stride(2)} "
+            f"and unified_kv {unified_kv.stride(1)}"
+        )
+    if has_invalid is True:
+        return "reads valid slots only: has_invalid must not be True"
+    return None
+
+
+def _use_single_pass(
+    q: torch.Tensor,
+    unified_kv: torch.Tensor,
+    has_invalid: bool | None,
+    attn_sink: torch.Tensor | None,
 ) -> bool:
-    """Whether the gfx950 single-pass kernel serves the call, else `mla_gluon`."""
-    T, H, D = q.shape
-    return (
-        H == 32
-        and D == 512
-        and q.dtype == torch.bfloat16
-        and unified_kv.dtype == torch.bfloat16
-        and unified_kv.dim() == 2
-        and unified_kv.shape[1] == D
-        and q.stride(2) == 1
-        and unified_kv.stride(1) == 1
-        and has_invalid is not True
-        and T >= _single_pass_config()["MIN_TOKENS"]
+    """Whether the gfx950 single-pass kernel takes the call, else `mla_gluon`.
+
+    `mla_gluon` keeps the sink-free H=32 calls below MIN_TOKENS rows, where it
+    splits each row's keys over the GPU. The kernel takes the other calls it
+    serves: at H=64 `mla_gluon` asserts unless T is a multiple of 64 and gets
+    rows with few keys wrong, and with more than one key split it adds the
+    sink once per split.
+    """
+    T, H, _ = q.shape
+    return _single_pass_unsupported(q, unified_kv, has_invalid) is None and (
+        H != 32 or attn_sink is not None or T >= _single_pass_config()["MIN_TOKENS"]
     )
 
 
@@ -394,30 +423,34 @@ def _single_pass_prefill(
     softmax_scale: float,
     out: torch.Tensor,
 ) -> None:
-    """Launch the gfx950 single-pass kernel, one program per query row."""
+    """Launch the gfx950 single-pass kernel: one program per query row, once
+    per _LAUNCH_HEADS heads."""
     T, H, _ = q.shape
     cfg = _single_pass_config()
     _LOGGER.info("PA_PREFILL_SPARSE gfx950 single-pass T=%d H=%d", T, H)
     if attn_sink is not None:
         attn_sink = attn_sink.to(torch.float32).contiguous()
-    _pa_prefill_sparse_gfx950[(T,)](
-        q,
-        unified_kv,
-        kv_indices,
-        kv_indptr,
-        attn_sink,
-        out,
-        q.stride(0),
-        q.stride(1),
-        unified_kv.stride(0),
-        out.stride(0),
-        out.stride(1),
-        _qk_scale(float(softmax_scale)),
-        H=H,
-        BLOCK_K=cfg["BLOCK_K"],
-        HAS_SINK=attn_sink is not None,
-        num_warps=cfg["num_warps"],
-    )
+    for h0 in range(0, H, _LAUNCH_HEADS):
+        heads = slice(h0, h0 + _LAUNCH_HEADS)
+        q_h, out_h = q[:, heads], out[:, heads]
+        _pa_prefill_sparse_gfx950[(T,)](
+            q_h,
+            unified_kv,
+            kv_indices,
+            kv_indptr,
+            attn_sink[heads] if attn_sink is not None else None,
+            out_h,
+            q_h.stride(0),
+            q_h.stride(1),
+            unified_kv.stride(0),
+            out_h.stride(0),
+            out_h.stride(1),
+            _qk_scale(float(softmax_scale)),
+            H=_LAUNCH_HEADS,
+            BLOCK_K=cfg["BLOCK_K"],
+            HAS_SINK=attn_sink is not None,
+            num_warps=cfg["num_warps"],
+        )
 
 
 # ---------------------------------------------------------------------------
