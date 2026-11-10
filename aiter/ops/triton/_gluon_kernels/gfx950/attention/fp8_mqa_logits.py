@@ -891,7 +891,9 @@ _gluon_fp8_mqa_logits_kernel_repr = make_kernel_repr(
 )
 
 
-# Bounds and split count only; their divisibility does not change the generated code.
+# These move with the batch, and their divisibility does not change the generated
+# code, so specializing only recompiled the kernel while serving. A gl.int32 equal
+# to 1 is not folded either.
 @gluon.jit(
     repr=_gluon_fp8_mqa_logits_kernel_repr,
     do_not_specialize=["seq_len", "seq_len_kv", "num_kv_splits"],
