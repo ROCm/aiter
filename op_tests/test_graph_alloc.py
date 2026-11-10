@@ -13,12 +13,16 @@ Run:
     python3 -m pytest op_tests/test_graph_alloc.py -v
 """
 
+import subprocess
+import sys
+
 import pytest
 import torch
 
 from aiter.utility.graph_alloc import (
     ROUTES_INSIDE_CAPTURE,
     _persistent_pool,
+    capture_scoped_cache,
     persistent_alloc,
 )
 
@@ -81,6 +85,7 @@ def test_every_cached_scratch_comes_from_the_private_pool():
     from aiter.ops.flydsl.gemm_a16w16_gfx1250 import _split_k_counters
     from aiter.ops.flydsl.gemm_kernels import _get_preshuffle_split_buffers
     from aiter.ops.flydsl.kernels.gemm_a16w16_gfx950 import get_split_k_buffers
+    from aiter.ops.flydsl.mxscale_preshuffle_kernels import _fused_splitk_buffers
     from aiter.ops.gemm_op_a8w8 import get_zero_bias_buf_keyed
     from aiter.ops.gemm_op_a16w16 import _get_semaphore_workspace_keyed
     from aiter.ops.topk import _get_topk_mb_workspace_keyed
@@ -90,8 +95,9 @@ def test_every_cached_scratch_comes_from_the_private_pool():
     sid = s.cuda_stream
     sites = {
         "preshuffle_split_k": _get_preshuffle_split_buffers(dev, s),
-        "a16w16_gfx950": get_split_k_buffers(s, dev),
+        "a16w16_gfx950": get_split_k_buffers(s, dev, 1),
         "a16w16_gfx1250": _split_k_counters(dev, s),
+        "mxscale_fused_split_k": _fused_splitk_buffers(dev, sid, 2, 16, 256, 4),
         "a16w16_asm": _get_semaphore_workspace_keyed(dev, sid),
         "a8w8_zero_bias": get_zero_bias_buf_keyed(dev, sid, 64),
         "topk_workspace": _get_topk_mb_workspace_keyed(dev, sid, 4096),
@@ -113,3 +119,212 @@ def test_every_cached_scratch_comes_from_the_private_pool():
         if pool_of(t) != want
     }
     assert not wrong, f"not allocated from the private pool {want}: {wrong}"
+
+
+@pytest.mark.skipif(
+    not ROUTES_INSIDE_CAPTURE,
+    reason=f"torch {torch.__version__} ignores use_mem_pool inside a capture",
+)
+def test_capture_scoped_cache_keeps_capture_built_buffers_private():
+    """A buffer first built inside a capture is zeroed by a node of that graph,
+    so no other graph or eager caller may receive it."""
+    device = torch.device("cuda:0")
+
+    @capture_scoped_cache
+    def zeros(key):
+        with persistent_alloc(device):
+            return torch.zeros(256, dtype=torch.int64, device=device)
+
+    stream = torch.cuda.Stream(device=device)
+    seen = []
+    for _ in range(2):
+        with torch.cuda.graph(torch.cuda.CUDAGraph(), stream=stream):
+            first = zeros("a")
+            assert zeros("a") is first, "one buffer per capture"
+            seen.append(first)
+    assert seen[0] is not seen[1], "captures must not share capture-built buffers"
+    eager = zeros("a")
+    assert all(eager is not b for b in seen), "eager must not get a capture buffer"
+    with torch.cuda.graph(torch.cuda.CUDAGraph(), stream=stream):
+        assert zeros("a") is eager, "eagerly built buffers are shared as before"
+        eager.sum()  # keep the graph non-empty
+
+
+@pytest.mark.skipif(
+    not ROUTES_INSIDE_CAPTURE or torch.cuda.device_count() < 2,
+    reason="needs torch 2.10+ and two GPUs",
+)
+def test_capture_scoped_cache_checks_the_target_device_not_the_current_one():
+    """A builder for cuda:1 called while cuda:0 is current must see cuda:1's
+    capture, since its zero fill is recorded on cuda:1's capturing stream."""
+    target = torch.device("cuda:1")
+
+    @capture_scoped_cache
+    def zeros(device):
+        with persistent_alloc(device):
+            return torch.zeros(256, dtype=torch.int64, device=device)
+
+    with torch.cuda.device(target), torch.cuda.graph(torch.cuda.CUDAGraph()):
+        with torch.cuda.device(0):
+            captured = zeros(target)
+        captured.sum()
+    assert zeros(target) is not captured, "eager got the capture-built buffer"
+
+
+# Mirrors vLLM's DeepSeek-V4.1 CSA attention on ROCm: multi-stream overlap runs
+# only inside graph capture, so the indexer weights_proj GEMM (bf16 [M, 5120] x
+# [5120, 32], split-K 8) first runs on an aux stream mid-capture, at each capture
+# size. Runs in a subprocess: on failure the GEMM spins forever, and only a
+# process kill gets the GPU back.
+_SPLIT_K_FIRST_USE_IN_CAPTURE = """
+import torch
+from aiter.ops.flydsl.gemm_kernels import flydsl_hgemm
+from aiter.test_common import checkAllclose
+from aiter.utility.graph_alloc import persistent_alloc
+
+dev = torch.device("cuda:0")
+cfg = dict(block_m=32, block_n=32, block_k=128, stages=5, split_k=8,
+           m_waves=2, n_waves=2, k_waves=1, group_m=0, policy="ft")
+w = torch.randn(32, 5120, dtype=torch.bfloat16, device=dev)
+sizes = (1024, 512)  # captured largest first, as vLLM does
+xs = {m: torch.randn(m, 5120, dtype=torch.bfloat16, device=dev) for m in sizes}
+flydsl_hgemm(xs[sizes[0]], w, **cfg)  # eager warmup: default stream only
+torch.cuda.synchronize()
+
+capture, aux = torch.cuda.Stream(dev), torch.cuda.Stream(dev)
+# Freed memory is recycled without clearing, as on a GPU that ran something
+# before: make the aux stream's next semaphore allocation start dirty.
+with torch.cuda.stream(aux), persistent_alloc(dev):
+    torch.full((1 << 16,), 7, dtype=torch.int64, device=dev)
+torch.cuda.synchronize()
+
+graphs, outs = {}, {}
+for m in sizes:
+    g = torch.cuda.CUDAGraph()
+    fork, join = torch.cuda.Event(), torch.cuda.Event()
+    with torch.cuda.graph(g, stream=capture):
+        fork.record()
+        with torch.cuda.stream(aux):
+            fork.wait()
+            outs[m] = flydsl_hgemm(xs[m], w, **cfg)
+            join.record()
+        join.wait()
+    graphs[m] = g
+graphs[sizes[1]].replay()  # before the graph that recorded the zero fill
+graphs[sizes[0]].replay()
+torch.cuda.synchronize()
+# Tolerances of test_flydsl_hgemm._atol_rtol for bf16, K=5120, split_k=8.
+atol, rtol = 2e-1 * (5120 / 8192) ** 0.5 * 8, 2e-1
+for m in sizes:
+    ref = (xs[m].float() @ w.float().t()).to(torch.bfloat16)
+    err = checkAllclose(ref.float(), outs[m].float(), rtol=rtol, atol=atol, printLog=False)
+    assert err == 0, (m, err)
+print("OK")
+"""
+
+
+@pytest.mark.skipif(
+    not ROUTES_INSIDE_CAPTURE,
+    reason=f"torch {torch.__version__} ignores use_mem_pool inside a capture",
+)
+def test_split_k_gemm_whose_semaphores_are_first_used_inside_a_capture():
+    from aiter.jit.utils.chip_info import get_gfx
+
+    if get_gfx() != "gfx950":
+        pytest.skip("FlyDSL a16w16 split-K kernel is gfx950-only")
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", _SPLIT_K_FIRST_USE_IN_CAPTURE],
+            capture_output=True,
+            text=True,
+            timeout=300,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        pytest.fail("split-K GEMM hung on semaphores never zeroed outside a graph")
+    assert proc.returncode == 0 and "OK" in proc.stdout, proc.stderr[-2000:]
+
+
+@pytest.mark.skipif(
+    not ROUTES_INSIDE_CAPTURE,
+    reason=f"torch {torch.__version__} ignores use_mem_pool inside a capture",
+)
+def test_fused_split_k_gemm_whose_counters_are_first_used_inside_a_capture():
+    """The gfx950 mxfp8 fused split-K (_fsk) GEMM reduces in the last block to
+    arrive at each tile's counter. Two captures of one shape fork it onto an aux
+    stream, and a graph sharing their pool leaves 7s where the first capture's
+    counters land. Shared counters never reach split_k - 1 in the graph without
+    the zero fill, so its output tiles are never written. Nothing spins, so this
+    runs in-process."""
+    from aiter import dtypes
+    from aiter.jit.utils.chip_info import get_gfx
+    from aiter.ops.flydsl.mxscale_preshuffle_kernels import run_gemm_a8w8_mxfp8_gfx950
+    from aiter.ops.quant import per_group_quant_hip
+    from aiter.ops.shuffle import shuffle_weight
+    from aiter.test_common import checkAllclose
+
+    if get_gfx() != "gfx950":
+        pytest.skip("FlyDSL mxscale preshuffle GEMM is gfx950-only")
+    dev = torch.device("cuda:0")
+    m, n, k = 16, 2304, 6144  # a dsv4 mxfp8 row tuned to the kernel below
+    kernel_name = "flydsl_mxpsh_16x64x512_F8_F8_B16_w0_x0_sk6_fsk"
+    w = (torch.randn(n, k, device=dev) * 0.02).to(dtypes.fp8)
+    w_scale = torch.randint(122, 127, (n, k // 32), dtype=torch.uint8, device=dev)
+    w_scale = w_scale.view(dtypes.fp8_e8m0)
+    wq = shuffle_weight(w, layout=(16, 16))
+
+    def gemm(xq, x_scale):
+        out = torch.empty(m, n, dtype=torch.bfloat16, device=dev)
+        return run_gemm_a8w8_mxfp8_gfx950(xq, wq, x_scale, w_scale, out, kernel_name)
+
+    inputs = [
+        per_group_quant_hip(
+            torch.randn(m, k, dtype=torch.bfloat16, device=dev),
+            quant_dtype=dtypes.fp8,
+            group_size=32,
+            scale_type=dtypes.fp8_e8m0,
+        )
+        for _ in range(2)
+    ]
+    gemm(*inputs[0])  # eager warmup: default stream only
+    torch.cuda.synchronize()
+
+    capture, aux = torch.cuda.Stream(dev), torch.cuda.Stream(dev)
+    pool = torch.cuda.graph_pool_handle()
+
+    def capture_on_aux(fn):
+        graph = torch.cuda.CUDAGraph()
+        fork, join = torch.cuda.Event(), torch.cuda.Event()
+        with torch.cuda.graph(graph, stream=capture, pool=pool):
+            fork.record()
+            with torch.cuda.stream(aux):
+                fork.wait()
+                result = fn()
+                join.record()
+            join.wait()
+        return graph, result
+
+    def fill_and_free():
+        # Frees an aux-stream block of the shared pool, keeping nothing alive,
+        # so the next capture's scratch is carved from memory each replay of
+        # this graph fills with 7s.
+        torch.full((1 << 18,), 7, dtype=torch.int32, device=dev).sum()
+
+    dirty, _ = capture_on_aux(fill_and_free)
+    graphs, outs = zip(*(capture_on_aux(lambda x=x: gemm(*x)) for x in inputs))
+    for out in outs:
+        out.zero_()
+    dirty.replay()
+    for graph in reversed(graphs):  # the graph that recorded the zero fill last
+        graph.replay()
+    torch.cuda.synchronize()
+
+    def ref(xq, x_scale):
+        a_scale = torch.exp2(x_scale.view(torch.uint8).float() - 127)
+        a = (xq.float().view(m, k // 32, 32) * a_scale[..., None]).view(m, k)
+        b_scale = torch.exp2(w_scale.view(torch.uint8).float() - 127)
+        return a @ (w.float() * b_scale.repeat_interleave(32, 1)).T
+
+    for i, (x, out) in enumerate(zip(inputs, outs)):
+        err = checkAllclose(ref(*x), out.float(), msg=f"graph {i}: ", printLog=False)
+        assert err == 0, (i, err)
