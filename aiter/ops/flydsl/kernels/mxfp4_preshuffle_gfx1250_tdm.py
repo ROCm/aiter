@@ -57,7 +57,6 @@ def is_fx_set_register_available():
     return callable(getattr(fx, "set_register", None))
 
 
-TDM_DESCRIPTOR_VERSION = 1
 IGLP_PARAMS = {
     "a8w4": {
         "default": {"mma_group": 10, "mma_first_group": 10, "ds_first_n": 0},
@@ -325,52 +324,6 @@ def build_gemm_a8w4_tdm_task(
     sched_mma_group = iglp_params["mma_group"]
     sched_first_group = iglp_params["mma_first_group"]
     sched_ds_first = iglp_params["ds_first_n"]
-    cache_tag = (
-        K,
-        tile_m,
-        tile_n,
-        tile_k,
-        m_warp,
-        n_warp,
-        out_is_f16,
-        num_buffers,
-        a_is_fp4,
-        a_preshuffled,
-        n_experts,
-        stage1_act,
-        has_bias,
-        TDM_DESCRIPTOR_VERSION,
-        stage1_quant_out,
-        quant_wmma_rep,
-        cluster_n,
-        cluster_m,
-        DISABLE_CLUSTER_SYNC,
-        next_stage_on,
-        num_waves_per_tensor_tdm,
-        tdm_as_in_prologue,
-        tdm_b_th,
-        enable_ep_scatter,
-        ep_arena_handle,
-        ep_combine_input_offset,
-        ep_slot_stride_bytes,
-        ep_destination_stride,
-        ep_world_size,
-        sched_mma_group,
-        sched_first_group,
-        sched_ds_first,
-        SUPPORT_EXPLICIT_VGPR_PARTITION,
-        planar_lds_on,
-        interleaved_lds_load_on,
-        row_major_ascale,
-        a_row_stride_bytes,
-        a_scale_row_stride_bytes,
-        ep_quant_bits,
-        persistent_workers,
-        rolled_drain,
-        k_waves,
-        m_align,
-    )
-    _ = cache_tag
     if enable_ep_scatter:
         if stage1_act != 0:
             raise ValueError("enable_ep_scatter is gemm2-only (stage1_act must be 0)")
