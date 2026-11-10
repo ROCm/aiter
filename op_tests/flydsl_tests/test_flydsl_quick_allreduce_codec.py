@@ -14,10 +14,11 @@ Two properties are load-bearing:
   dequantizer produces. Relocation cannot change a value, so any disagreement
   about where the 2-bit plane or the scale word lives shows up here -- and
   nowhere else, since both sides of the real kernel would be wrong together.
-* **The analytic error bound.** E4M3 carries 3 mantissa bits, so the decoded
-  extremum is within 1/16 of the true one; on top of that a value can miss by
-  half a step, and one near the extreme can land a whole code short. That gives
-  ``|err| <= |ext| * (1/16 + 1.05/bias)`` with no free parameters.
+* **The analytic error bound.** The E5M2 scale carries 2 mantissa bits, so the
+  decoded extremum is within 1/8 of the true one (INT6 rounds the scale up, so
+  it never clips, at a step up to 1/4 coarser); on top of that a value can
+  miss by half a step, and one near the extreme can land a whole code short.
+  That gives ``|err| <= |ext| * (1/8 + 1.05/bias)`` with no free parameters.
 
 Both are also checked at every workgroup width the codec supports, since the
 plane and scale offsets scale with it and block 64 pads its scale region.
@@ -26,6 +27,7 @@ plane and scale offsets scale with it and block 64 pads its scale region.
 from __future__ import annotations
 
 import functools
+import math
 import os
 import sys
 
@@ -234,15 +236,15 @@ def codec_roundtrip(
     return out
 
 
-# A quantization group is one E4M3 scale's worth of values: PAIR=2 threads x 8
+# A quantization group is one scale byte's worth of values: PAIR=2 threads x 8
 # values per atom. Thread t owns elements [8t, 8t+8) of an atom row and pairs
 # with its xor-1 neighbour, so groups are contiguous 16-element runs -- and an
 # atom row is 2048 elements, a multiple of 16, so a flat reshape lines up.
 GROUP_ELEMS = 16
 
-# Half-ulp of a 3-bit mantissa: the decoded extremum is within this fraction of
-# the true one.
-E4M3_REL_SLACK = 1.0 / 16.0
+# Half-ulp of the scale's 2-bit mantissa: the decoded extremum is within this
+# fraction of the true one.
+SCALE_REL_SLACK = 1.0 / 8.0
 
 CODEC_NAMES = ("int4", "int6")
 
@@ -268,11 +270,11 @@ def _signed_extremum(g: torch.Tensor) -> torch.Tensor:
 def _err_bound(bias: int) -> float:
     """Largest ``|y-x| / |ext|`` the codec may produce, from its definition.
 
-    ``1/16`` for the E4M3 scale, ``0.5/bias`` for rounding, and up to another
+    ``1/8`` for the E5M2 scale, ``0.5/bias`` for rounding, and up to another
     ``0.5/bias`` because the positive end of the range stops one code short of
     the negative end. Rounded up to ``1.05/bias`` for fp16 arithmetic.
     """
-    return E4M3_REL_SLACK + 1.05 / bias
+    return SCALE_REL_SLACK + 1.05 / bias
 
 
 @pytest.mark.parametrize("block", SUPPORTED_BLOCKS)
@@ -315,7 +317,7 @@ def test_reconstruction_stays_in_range(codec_name):
     xg, yg = _groups(x), _groups(y)
     ext = _signed_extremum(xg).abs().clamp_min(1e-20)
     worst = float((yg.abs().max(-1).values / ext).max())
-    assert worst <= 1.0 + E4M3_REL_SLACK + 1e-3, f"max |y|/|ext| {worst:.4f}"
+    assert worst <= 1.0 + SCALE_REL_SLACK + 1e-3, f"max |y|/|ext| {worst:.4f}"
 
 
 @pytest.mark.parametrize("codec_name", CODEC_NAMES)
@@ -349,7 +351,7 @@ def test_int6_codec_is_more_accurate_than_int4():
 
 @pytest.mark.parametrize("codec_name", CODEC_NAMES)
 def test_degenerate_groups_stay_finite(codec_name):
-    """Zero and sub-2^-7 groups drive the encode reciprocal to its ceiling.
+    """Zero and sub-floor groups drive the encode reciprocal to its ceiling.
 
     ``1/d`` is materialised as fp16, so without the clamp in ``_codec_quant`` a
     zero-extremum group reaches the codec as Inf and ``0 * Inf`` poisons the
@@ -365,10 +367,9 @@ def test_degenerate_groups_stay_finite(codec_name):
     assert bool((zeros == 0).all()), "an all-zero group did not stay zero"
 
 
-# The largest representable group-extremum magnitude, and where the exponent
-# field pins to its minimum instead of shrinking further.
-E4M3_MAX = 480.0
-E4M3_FLOOR = 2.0**-7
+# fp16's largest finite value: the kernels saturate to it on load, so it is the
+# largest group extremum the scale ever sees.
+FP16_MAX = 65504.0
 
 
 def _spike_group(ext_value: float, fill: float = 0.02) -> torch.Tensor:
@@ -383,56 +384,69 @@ def _spike_group(ext_value: float, fill: float = 0.02) -> torch.Tensor:
 
 
 @pytest.mark.parametrize("codec_name", CODEC_NAMES)
-@pytest.mark.parametrize("ext", (256.0, 400.0, 479.0, 490.0))
-def test_extremum_near_e4m3_ceiling_saturates(codec_name, ext):
-    """Right up to the ceiling, the extremum clamps to E4M3_MAX and stays close to true."""
-    decoded = float(codec_roundtrip(_spike_group(ext), codec_name)[0])
-    assert decoded <= E4M3_MAX + 1.0, decoded
-    assert decoded >= min(ext, E4M3_MAX) * 0.9, decoded
+@pytest.mark.parametrize(
+    "ext", (256.0, 479.0, 490.0, 512.0, 2048.0, 16384.0, 60000.0, -2048.0)
+)
+def test_large_extremum_does_not_clip(codec_name, ext):
+    """An extremum above E4M3's old ceiling of 480 must come back, not clip.
 
-
-@pytest.mark.parametrize("codec_name", CODEC_NAMES)
-def test_extremum_past_e4m3_ceiling_saturates_monotonically(codec_name):
-    """Past the ceiling the codec clips; it never wraps to a smaller value.
-
-    Saturating the exponent field alone is not enough: with the mantissa left
-    at whatever the input produced, 512 used to encode as 256, so an outlier
-    decoded *smaller* than the ceiling it passed and the whole group's scale
-    collapsed with it. The encoder pins the mantissa to its maximum on
-    overflow too, so every extremum at or above the ceiling lands on the same
-    value.
+    The E4M3 scale clipped every group above 480 to about 480, and the ring,
+    which requantizes its running sum at every hop, clipped sums of a few
+    values near 300. E5M2 reaches ``1.75 * 2**19``, beyond fp16, so the only
+    error left is the scale's rounding.
     """
-    at_ceiling = float(codec_roundtrip(_spike_group(480.0), codec_name)[0])
-    assert at_ceiling == pytest.approx(E4M3_MAX, abs=1.0)
-    for ext in (500.0, 512.0, 1024.0, 1.0e6):
-        decoded = float(codec_roundtrip(_spike_group(ext), codec_name)[0])
-        assert decoded == pytest.approx(at_ceiling, abs=1.0), (
-            f"{ext} decoded to {decoded}, not the ceiling's {at_ceiling} -- "
-            "the overflow clamp has regressed to saturating the exponent alone"
-        )
+    decoded = float(codec_roundtrip(_spike_group(ext), codec_name)[0])
+    bound = _err_bound(CODECS[codec_name].bias)
+    assert (
+        abs(decoded - ext) <= abs(ext) * bound
+    ), f"{ext} decoded to {decoded}: off by more than {bound:.3f} relative"
 
 
 @pytest.mark.parametrize("codec_name", CODEC_NAMES)
-def test_extremum_below_e4m3_floor_survives_instead_of_zeroing(codec_name):
-    """A sub-floor extremum rounds coarsely; it does not lose the whole group.
+def test_extremum_past_fp16_stays_finite(codec_name):
+    """Past fp16's range the input saturates on load; the output stays finite.
+
+    The bf16 output can hold the scale's rounding of 65504 (65536), so the
+    decoded value is checked against fp16's maximum with the codec's bound.
+    """
+    bound = _err_bound(CODECS[codec_name].bias)
+    for ext in (FP16_MAX, 1.0e6):
+        decoded = float(codec_roundtrip(_spike_group(ext), codec_name)[0])
+        assert math.isfinite(decoded), decoded
+        assert abs(decoded - FP16_MAX) <= FP16_MAX * bound, decoded
+
+
+@pytest.mark.parametrize("codec_name", CODEC_NAMES)
+@pytest.mark.parametrize("ext", (1e-3, 1e-4))
+def test_small_extremum_survives_instead_of_zeroing(codec_name, ext):
+    """A small extremum keeps its value; it does not lose the whole group.
 
     ``0x00`` is the byte reserved for exact zero. A positive extremum small
     enough to encode there used to collide with that sentinel, so the decoder
-    read a scale of 0 and every value in the group came back as 0 -- at 1e-3,
-    which is nowhere near the edge of either bf16 or fp16. The encoder now
-    bumps such a value to ``0x01``, the smallest non-zero magnitude.
-
-    Far enough below the floor it does still underflow to zero, but that is
-    the format running out of exponent rather than a sentinel collision.
+    read a scale of 0 and every value in the group came back as 0. The encoder
+    bumps such a value to ``0x01``, the smallest non-zero magnitude. 1e-4 is
+    below E4M3's old floor of ``2**-7`` and below this codec's scale floor
+    (``2**-12`` for INT4, ``2**-10`` for INT6), so it is quantized against the
+    floor scale and still lands within a step.
     """
-    decoded = codec_roundtrip(_spike_group(1e-3, fill=0.0), codec_name)
+    decoded = codec_roundtrip(_spike_group(ext, fill=0.0), codec_name)
     assert torch.isfinite(decoded.float()).all()
     assert float(decoded[0]) == pytest.approx(
-        1e-3, rel=0.2
-    ), f"expected the sub-floor extremum to survive; got {float(decoded[0])}"
+        ext, rel=0.2
+    ), f"expected the small extremum to survive; got {float(decoded[0])}"
     # Exact zero still encodes as exact zero -- the bump must not perturb it.
     zeros = codec_roundtrip(_spike_group(0.0, fill=0.0), codec_name)
     assert float(zeros.float().abs().max()) == 0.0
+
+
+def test_scale_floor_keeps_the_encode_factor_in_fp16():
+    """``1 / (scale * |dec_step|)`` is splat to fp16, so the floor must keep it finite."""
+    for name in CODEC_NAMES:
+        c = CODECS[name]
+        smallest = 2.0 ** (c.scale_min_e5 - 12)
+        assert 1.0 / (smallest * abs(c.dec_step)) <= FP16_MAX, name
+    assert CODECS["int4"].scale_min_e5 == 0
+    assert CODECS["int6"].scale_min_e5 == 2
 
 
 # fp16 is the passthrough wire format used to test the reduce-scatter/
@@ -499,10 +513,10 @@ def _resolve(algorithm, world_size, rs=None, ag=None):
 
 @pytest.mark.parametrize(
     "world_size,expected",
-    ((2, ("int4", "int4")), (4, ("int4", "int4")), (8, ("int6", "int4"))),
+    ((2, ("int4", "int4")), (4, ("int6", "int4")), (8, ("int6", "int4"))),
 )
-def test_ring_codec_defaults_widen_only_at_tp8(world_size, expected):
-    """TP8 is the only world size where INT4 misses the floor.
+def test_ring_codec_defaults_widen_from_tp4(world_size, expected):
+    """From TP4 an all-INT4 ring misses the floor (17.9 dB at TP4 with E5M2).
 
     Production dispatch passes ``None`` for both laps precisely to land here --
     see ``_FLY_REGIMES`` in ``quick_all_reduce.py``.
