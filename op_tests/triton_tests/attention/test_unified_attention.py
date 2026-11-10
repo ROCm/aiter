@@ -15,11 +15,11 @@ from aiter.ops.triton.attention.unified_attention import (
     unified_attention,
 )
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.shuffle import shuffle_scale_batched, shuffle_weight
+from aiter.ops.triton.utils.types import e4m3_dtype
 from aiter.ops.triton.utils.unified_attention_utils import (
     get_unified_attention_config,
 )
-from aiter.ops.triton.utils.shuffle import shuffle_scale_batched, shuffle_weight
-from aiter.ops.triton.utils.types import e4m3_dtype
 from aiter.test_common import checkAllclose
 from op_tests.triton_tests.quant.test_quant_mxfp4 import (
     torch_dynamic_mxfp4_quant,
@@ -1602,6 +1602,7 @@ def test_unified_attn_attn_work_gfx1250(seq_lens, with_hint: bool) -> None:
     )
     assert not output.isnan().any()
     torch.testing.assert_close(output, ref_output, atol=1.5e-2, rtol=1e-2)
+
 
 def test_gfx1250_ua2d_register_store_gate() -> None:
     """The config flag is the register-store switch. Check it on any machine.
