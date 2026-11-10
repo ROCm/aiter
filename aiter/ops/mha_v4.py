@@ -1574,9 +1574,11 @@ def mha_v4_packed(
                 f"multiple of {kv_tile} for q={q_format.name} k={k_format.name} "
                 f"v={v_format.name} at {q_tile}x{kv_tile}"
             )
+        # Compared as an int, not via AttentionScaleMode(...): torch 2.10's Dynamo graph-breaks
+        # on constructing an enum from a value.
         if (
             kv_tile == 64
-            and AttentionScaleMode(k_scale_mode) == AttentionScaleMode.E8M0_PER_1X32
+            and k_scale_mode == AttentionScaleMode.E8M0_PER_1X32
             and (_is_fp8_format(k_format) or k_format == AttentionFormat.MXFP4)
         ):
             launch_args = (
