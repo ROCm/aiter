@@ -30,9 +30,11 @@ from aiter.test_mha_common import (
     quantize_fp8_per_bh,
 )
 from op_tests.triton_tests.attention.mha_test_utils import (
+    make_varlen_fp8_inputs,
     pad_rearrange_dropout_mask,
     skip_if_gluon_unsupported,
     skip_if_triton_padded_head_miscompiled,
+    varlen_fp8_reference,
 )
 
 
@@ -249,65 +251,26 @@ def test_mha_varlen_fp8_gluon(
 ):
     skip_if_gluon_unsupported("gluon")
 
-    torch.manual_seed(20)
-    torch.cuda.empty_cache()
-    q = torch.randn((BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
-    k = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
-    v = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
-    query_padding_mask = generate_random_padding_mask(
-        SEQLEN_Q, BATCH, "cuda", mode="random"
+    x = make_varlen_fp8_inputs(
+        BATCH, SEQLEN_Q, SEQLEN_K, NUM_Q_HEADS, NUM_K_HEADS, HEAD_SZ, dtype
     )
-    key_padding_mask = generate_random_padding_mask(
-        SEQLEN_K, BATCH, "cuda", mode="random"
-    )
-    (
-        q_unpad,
-        k_unpad,
-        v_unpad,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        max_seqlen_q,
-        max_seqlen_k,
-        q,
-        k,
-        v,
-        output_pad_fn,
-        _,
-        _,
-    ) = generate_qkv(q, k, v, query_padding_mask, key_padding_mask, kvpacked=False)
-
-    # generate_qkv returns grad-tracking tensors; detach so the quantization below
-    # doesn't build an autograd graph for this forward-only kernel.
-    fp8_dtype = get_fp8_e4m3_dtype()
-    q_fp8, q_descale = quantize_fp8_per_bh(q_unpad.detach(), fp8_dtype, cu_seqlens_q)
-    k_fp8, k_descale = quantize_fp8_per_bh(k_unpad.detach(), fp8_dtype, cu_seqlens_k)
-    v_fp8, v_descale = quantize_fp8_per_bh(v_unpad.detach(), fp8_dtype, cu_seqlens_k)
-
     gluon_out = flash_attn_varlen_func(
-        q_fp8,
-        k_fp8,
-        v_fp8,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        max_seqlen_q,
-        max_seqlen_k,
+        x.q_fp8,
+        x.k_fp8,
+        x.v_fp8,
+        x.cu_seqlens_q,
+        x.cu_seqlens_k,
+        x.max_seqlen_q,
+        x.max_seqlen_k,
         causal=CAUSAL,
         backend="gluon",
-        q_descale=q_descale,
-        k_descale=k_descale,
-        v_descale=v_descale,
+        q_descale=x.q_descale,
+        k_descale=x.k_descale,
+        v_descale=x.v_descale,
     )
-    gluon_out = output_pad_fn(gluon_out)
+    gluon_out = x.output_pad_fn(gluon_out)
 
-    torch_out, _, _ = attention_ref(
-        q,
-        k,
-        v,
-        query_padding_mask=query_padding_mask,
-        key_padding_mask=key_padding_mask,
-        causal=CAUSAL,
-    )
-
+    torch_out = varlen_fp8_reference(x, CAUSAL)
     _fp8_assert_close(gluon_out, torch_out.to(gluon_out.dtype))
 
 
@@ -1597,45 +1560,12 @@ def test_mha_varlen_fp8_large_head(CAUSAL: bool, dtype=torch.bfloat16):
     if get_arch() != "gfx942":
         pytest.skip("fp8_large_head is only defined for gfx942")
 
-    BATCH, SEQLEN_Q, SEQLEN_K = 2, 512, 1024
-    NUM_Q_HEADS, NUM_K_HEADS, HEAD_SZ = 8, 2, 256
-
-    torch.manual_seed(20)
-    torch.cuda.empty_cache()
-    q = torch.randn((BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
-    k = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
-    v = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
-    query_padding_mask = generate_random_padding_mask(
-        SEQLEN_Q, BATCH, "cuda", mode="random"
-    )
-    key_padding_mask = generate_random_padding_mask(
-        SEQLEN_K, BATCH, "cuda", mode="random"
-    )
-    (
-        q_unpad,
-        k_unpad,
-        v_unpad,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        max_seqlen_q,
-        max_seqlen_k,
-        q,
-        k,
-        v,
-        output_pad_fn,
-        _,
-        _,
-    ) = generate_qkv(q, k, v, query_padding_mask, key_padding_mask, kvpacked=False)
-
-    fp8_dtype = get_fp8_e4m3_dtype()
-    q_fp8, q_descale = quantize_fp8_per_bh(q_unpad.detach(), fp8_dtype, cu_seqlens_q)
-    k_fp8, k_descale = quantize_fp8_per_bh(k_unpad.detach(), fp8_dtype, cu_seqlens_k)
-    v_fp8, v_descale = quantize_fp8_per_bh(v_unpad.detach(), fp8_dtype, cu_seqlens_k)
-
+    HEAD_SZ = 256
+    x = make_varlen_fp8_inputs(2, 512, 1024, 8, 2, HEAD_SZ, dtype)
     triton_out, _, _, _, _ = _flash_attn_forward(
-        q_fp8,
-        k_fp8,
-        v_fp8,
+        x.q_fp8,
+        x.k_fp8,
+        x.v_fp8,
         0.0,
         HEAD_SZ**-0.5,
         CAUSAL,
@@ -1645,23 +1575,15 @@ def test_mha_varlen_fp8_large_head(CAUSAL: bool, dtype=torch.bfloat16):
         None,
         False,
         False,
-        max_seqlen_q,
-        max_seqlen_k,
-        cu_seqlens_q=cu_seqlens_q,
-        cu_seqlens_k=cu_seqlens_k,
-        descale_q=q_descale,
-        descale_k=k_descale,
-        descale_v=v_descale,
+        x.max_seqlen_q,
+        x.max_seqlen_k,
+        cu_seqlens_q=x.cu_seqlens_q,
+        cu_seqlens_k=x.cu_seqlens_k,
+        descale_q=x.q_descale,
+        descale_k=x.k_descale,
+        descale_v=x.v_descale,
     )
-    triton_out = output_pad_fn(triton_out)
+    triton_out = x.output_pad_fn(triton_out)
 
-    torch_out, _, _ = attention_ref(
-        q,
-        k,
-        v,
-        query_padding_mask=query_padding_mask,
-        key_padding_mask=key_padding_mask,
-        causal=CAUSAL,
-    )
-
+    torch_out = varlen_fp8_reference(x, CAUSAL)
     _fp8_assert_close(triton_out, torch_out.to(triton_out.dtype))
