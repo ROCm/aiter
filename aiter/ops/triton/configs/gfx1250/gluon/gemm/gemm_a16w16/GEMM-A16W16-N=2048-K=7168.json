@@ -43,11 +43,11 @@
         "BLOCK_M": 128,
         "BLOCK_N": 128,
         "BLOCK_K": 256,
-        "NUM_BUFFERS": 6,
+        "NUM_BUFFERS": 4,
         "num_warps": 4,
         "kernel_type": "bandwidth_bound",
         "waves_per_eu": 1,
-        "num_ctas": 16,
+        "num_ctas": 8,
         "GROUP_SIZE_M": 0,
         "B2B_WMMA": 0,
         "TDM_STORE": 0

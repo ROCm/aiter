@@ -33,6 +33,11 @@ _gemm_a16w16_compute_bound_repr = make_kernel_repr(
 # asserts log2PadIntervalDwords <= 8).
 _MAX_PAD_INTERVAL_DWORDS = 256
 
+# An M-major A tile is read with ds_load_tr16_b128 down its rows. A pad at least
+# every LDS line (256 B) keeps those reads conflict-free; when a row is shorter
+# than a line, padding every row only costs LDS.
+_LDS_LINE_BYTES = 256
+
 
 def _pad_interval(extent, elem_bits):
     """Largest encodable pad interval, in elements, not exceeding `extent`."""
@@ -54,7 +59,8 @@ def create_shared_layouts(
 
     For a workgroup cluster, BLOCK_M/BLOCK_N are cluster-wide, cga_a/cga_b are the CTA bases of
     the A ([M, K]) and B ([K, N]) operand layouts, and each pad interval is bounded by the
-    per-CTA extent of the inner dimension.
+    per-CTA extent of the inner dimension, except that an M-major A pads at most once per
+    LDS line (see _LDS_LINE_BYTES).
     """
     if elem_bits_b is None:
         elem_bits_b = elem_bits
@@ -70,7 +76,7 @@ def create_shared_layouts(
         )
     else:
         SHARED_LAYOUT_A: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-            [[_pad_interval(cta_m, elem_bits), 8]],
+            [[_pad_interval(max(cta_m, _LDS_LINE_BYTES * 8 // elem_bits), elem_bits), 8]],
             [BLOCK_K, BLOCK_M],
             [1, 0],
             swap(cga_a),
