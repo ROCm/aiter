@@ -5,6 +5,7 @@
 
 import flydsl.expr as fx
 from flydsl._mlir import ir
+from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import T
 
@@ -112,7 +113,10 @@ class PaDecodeGemm:
         words = []
         for i in range_constexpr(n // 4):
             b = i * 4
-            lo = fx.rocdl.cvt_pk_fp8_f32(T.i32, vf32[b], vf32[b + 1], 0, False)
+            # The second conversion writes the high half, so on gfx950 the
+            # first one's old word is undef rather than a zeroed register.
+            old = llvm.mlir_undef(T.i32) if const_expr(self.traits.IS_GFX950) else 0
+            lo = fx.rocdl.cvt_pk_fp8_f32(T.i32, vf32[b], vf32[b + 1], old, False)
             words.append(
                 fx.rocdl.cvt_pk_fp8_f32(T.i32, vf32[b + 2], vf32[b + 3], lo, True)
             )
