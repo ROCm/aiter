@@ -142,13 +142,25 @@ W13_TILE = (256, 256)
 W2_TILE = (512, 128)
 
 
-def enabled() -> bool:
-    """``AITER_MOE_LOC=1`` on gfx1250."""
-    if os.environ.get("AITER_MOE_LOC", "0").strip() != "1":
-        return False
+def mode() -> int:
+    """``AITER_MOE_LOC`` on gfx1250, 0 on every other arch.
+
+    1 IOD-local B + domain-parity persistent schedule, 2 the remote-only
+    control, 3 placed B on the stock schedule.
+    """
+    m = os.environ.get("AITER_MOE_LOC", "0").strip() or "0"
+    if m not in ("0", "1", "2", "3"):
+        raise ValueError(f"AITER_MOE_LOC must be 0, 1, 2 or 3, got {m!r}")
+    if m == "0":
+        return 0
     from aiter.jit.utils.chip_info import get_gfx
 
-    return get_gfx() == "gfx1250"
+    return int(m) if get_gfx() == "gfx1250" else 0
+
+
+def enabled() -> bool:
+    """``AITER_MOE_LOC=1`` on gfx1250."""
+    return mode() == 1
 
 
 def _register(weight, scale, experts_cnt, tile):

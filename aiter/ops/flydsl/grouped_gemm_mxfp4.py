@@ -253,12 +253,11 @@ def flydsl_grouped_gemm_a8w4_masked(
         )
     waves_per_tensor_tdm = _select_num_waves_per_tensor_tdm(waves_per_tensor_tdm)
     # AITER_MOE_LOC (GEMM1 / GEMM2 weights placed by moe_shuffle_weight_iod at
-    # load time): 1 IOD-local B + domain-parity persistent schedule, 2 the
-    # remote-only control, 3 placed B on the stock schedule.
-    iod_loc = int(os.environ.get("AITER_MOE_LOC", "0"))
+    # load time, gfx1250 only): see iod_locality.mode.
+    from .iod_locality import mode as iod_mode
+
+    iod_loc = iod_mode()
     b_placed = loc_sched = 0
-    if iod_loc not in (0, 1, 2, 3):
-        raise ValueError("AITER_MOE_LOC must be 0, 1, 2 or 3")
     placed = None
     if (
         iod_loc

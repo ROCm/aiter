@@ -1847,11 +1847,9 @@ def grouped_gemm_gfx1250_a8w4(
         # A W2 placed by moe_shuffle_weight_iod serves its layout tiling and the
         # one with tile_n halved (four waves, 1 x 4); GEMM2 keeps the tuned
         # tile_n2 when it is one of them, so every token count reads the local copy.
-        if w2_scale is not None and os.environ.get("AITER_MOE_LOC", "0").strip() in (
-            "1",
-            "2",
-            "3",
-        ):
+        from .iod_locality import mode as iod_mode
+
+        if w2_scale is not None and iod_mode():
             from .iod_locality import placed_tile
 
             tile2 = placed_tile(w2, w2_scale)

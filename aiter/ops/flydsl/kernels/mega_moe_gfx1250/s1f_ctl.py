@@ -666,7 +666,9 @@ class _Stage1Fusion:
         # AITER_MOE_LOC=1 with W1 placed by moe_shuffle_weight_iod at load
         # time: the per-XCC queues hand each XCC its IOD's n-tiles.
         placed = None
-        if os.environ.get("AITER_MOE_LOC", "0").strip() == "1":
+        from aiter.ops.flydsl.iod_locality import enabled as iod_enabled
+
+        if iod_enabled():
             from aiter.ops.flydsl.iod_locality import W13_TILE, lookup
 
             placed, ratio = lookup(w, w_scales, N, K, *W13_TILE)
