@@ -2,16 +2,16 @@ from typing import Literal
 
 import torch
 
-from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.bwd import (
+from aiter.ops.triton._triton_kernels.attention.dao_ai.bwd import (
     attention_backward_triton_impl,
 )
-from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.fwd_decode import (
+from aiter.ops.triton._triton_kernels.attention.dao_ai.fwd_decode import (
     attention_forward_decode_triton_impl,
 )
-from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.fwd_prefill import (
+from aiter.ops.triton._triton_kernels.attention.dao_ai.fwd_prefill import (
     attention_forward_prefill_triton_impl,
 )
-from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import (
+from aiter.ops.triton._triton_kernels.attention.dao_ai.utils import (
     BWD_MODE,
     DEBUG,
     PHILOX_OFFSET,
@@ -521,7 +521,6 @@ def bwd(
 
     # V3 backward doesn't have dropout or alibi slopes
     dropout_p = 0.0
-    philox_seed, philox_offset = None, None
     alibi_slopes = None
 
     # Call implementation
@@ -549,8 +548,7 @@ def bwd(
         seqused_q=seqused_q,
         seqused_k=seqused_k,
         dropout_p=dropout_p,
-        philox_seed=philox_seed,
-        philox_offset=philox_offset,
+        rng_state=None,
         use_exp2=USE_EXP2,
         mode=BWD_MODE,
         window_size_left=window_size_left,
