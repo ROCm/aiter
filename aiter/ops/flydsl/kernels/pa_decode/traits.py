@@ -411,7 +411,8 @@ class PaDecodeSchedule:
             or (TUNED_SCALAR and block_size == 128 and TOTAL_ROWS <= MFMA_MNK)
             # gfx942: issuing a single M-tile's V loads at the tile start hides
             # them behind QK and softmax (FP8 to D256, BF16 page16 D128). FP8
-            # per-tensor page128 vectorized V only gains on busy grids.
+            # per-tensor page128 vectorized V only gains on busy grids, FP8
+            # per-token D256 page64 only on small ones.
             or (
                 "gfx94" in arch
                 and M_TILES == 1
@@ -424,6 +425,12 @@ class PaDecodeSchedule:
                             or per_token_kv
                             or block_size != 128
                             or not trans_v
+                        )
+                        and not (
+                            gfx942_busy
+                            and per_token_kv
+                            and head_dim > 128
+                            and block_size == 64
                         )
                     )
                     or (
