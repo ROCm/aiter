@@ -7,21 +7,24 @@ main, while ``op_tests/flydsl_tests`` is not part of the sharded op-test plan.
 Its data generator and tolerance check are the a8w4 op test's.
 """
 
+import pytest
 import torch
 
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from op_tests.flydsl_tests.test_flydsl_moe import (
-    _SKIP_GFX950_FLYDSL,
     _check_close,
     _generate_a8w4_gui_data,
     _stage1_tile_k,
 )
 
 
-@_SKIP_GFX950_FLYDSL
 def test_flydsl_moe_xcd_swizzle_uneven_grid():
     """xcd_swizzle on a 2 x 18 grid in both stages: 36 workgroups, not a multiple
     of the 8 XCDs. Every sorted block holds a routed row, so a tile the remap
     skips leaves NaN in stage 1 and a tile it runs twice doubles a stage-2 sum."""
+    # The running GPU, not GPU_ARCHS: get_gfx() takes the last GPU_ARCHS entry.
+    if get_gfx_runtime() != "gfx950":
+        pytest.skip("gfx950 FlyDSL required")
     from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage1, flydsl_moe_stage2
 
     token, model_dim, inter_dim, E, topk, block_m = 9, 512, 256, 32, 2, 32
