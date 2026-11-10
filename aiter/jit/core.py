@@ -1576,6 +1576,17 @@ def build_module(
         flags_cc += flags_extra_cc
         flags_hip += flags_extra_hip
         archs = validate_and_update_archs()
+        # GPU_ARCHS may name a sibling of the running GPU (e.g. gfx1250 on an
+        # MI450 A0 that reports gfx1250-strict). _needs_arch_rebuild() rebuilds
+        # for the running arch, so the build must target it too, or the
+        # rebuilt .so still lacks its code and fails to load.
+        if "native" not in archs:
+            try:
+                runtime_arch = get_gfx_runtime()
+            except Exception:  # noqa: BLE001 -- no GPU visible: keep GPU_ARCHS
+                runtime_arch = None
+            if runtime_arch and runtime_arch not in archs:
+                archs = archs + [runtime_arch]
         flags_hip += [f"--offload-arch={arch}" for arch in archs]
         flags_hip = sorted(set(flags_hip))  # remove same flags
         flags_hip = [el for el in flags_hip if hip_flag_checker(el)]
