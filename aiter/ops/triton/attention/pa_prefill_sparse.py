@@ -86,8 +86,7 @@ def pa_prefill_sparse(
     """Sparse prefill attention over two KV sources with sink.
 
     Dispatches on arch: gfx1250 -> gluon (two sources), gfx950 -> a single-pass
-    gluon kernel for bf16 q and KV with H=32 or 64 and D=512 (at H=32 without
-    a sink, from the config's MIN_TOKENS query rows), else `mla_gluon`;
+    gluon kernel for bf16 q and KV with H=32 or 64 and D=512, else `mla_gluon`;
     otherwise the Triton kernel. Only gfx1250 reads a second KV source; the
     other two serve the prefix source alone and reject any extend source.
 
@@ -237,7 +236,11 @@ def pa_prefill_sparse(
             kv_indices_extend,
             kv_indptr_extend,
         )
-        if _use_single_pass(q, unified_kv, has_invalid, attn_sink):
+        # The single-pass kernel takes every call it serves, at any T:
+        # `mla_gluon` adds the sink once per key split, leaves rows without
+        # keys unwritten when it runs one split, and at H=64 asserts unless T
+        # is a multiple of 64 and gets rows with few keys wrong.
+        if _single_pass_unsupported(q, unified_kv, has_invalid) is None:
             _single_pass_prefill(
                 q,
                 unified_kv,
@@ -352,7 +355,7 @@ _LOG2E = 1.44269504089
 
 @functools.lru_cache
 def _single_pass_config() -> dict:
-    """Launch config of the gfx950 single-pass kernel, with its MIN_TOKENS bound.
+    """Launch config of the gfx950 single-pass kernel.
 
     Returns the cached dict: do not change it.
     """
@@ -386,26 +389,6 @@ def _single_pass_unsupported(
     if has_invalid is True:
         return "reads valid slots only: has_invalid must not be True"
     return None
-
-
-def _use_single_pass(
-    q: torch.Tensor,
-    unified_kv: torch.Tensor,
-    has_invalid: bool | None,
-    attn_sink: torch.Tensor | None,
-) -> bool:
-    """Whether the gfx950 single-pass kernel takes the call, else `mla_gluon`.
-
-    `mla_gluon` keeps the sink-free H=32 calls below MIN_TOKENS rows, where it
-    splits each row's keys over the GPU. The kernel takes the other calls it
-    serves: at H=64 `mla_gluon` asserts unless T is a multiple of 64 and gets
-    rows with few keys wrong, and with more than one key split it adds the
-    sink once per split.
-    """
-    T, H, _ = q.shape
-    return _single_pass_unsupported(q, unified_kv, has_invalid) is None and (
-        H != 32 or attn_sink is not None or T >= _single_pass_config()["MIN_TOKENS"]
-    )
 
 
 @functools.lru_cache(maxsize=64)
