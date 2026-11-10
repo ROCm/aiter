@@ -76,7 +76,11 @@ def selector_mismatches(source: str, arity: dict[str, int]) -> list[str]:
     return problems
 
 
-_FOUR = {"demo.norm": {"signature": "a:positional, b:positional, c:positional, d:positional, -> Tensor"}}
+_FOUR = {
+    "demo.norm": {
+        "signature": "a:positional, b:positional, c:positional, d:positional, -> Tensor"
+    }
+}
 
 _GOOD = """
 def _select_norm(args):
@@ -125,4 +129,6 @@ def test_the_committed_baseline_still_parses_the_way_the_check_assumes():
     baseline = json.loads(BASELINE.read_text())
     for op, contract in baseline.items():
         assert "signature" in contract, f"{op}: baseline entry has no signature"
-        assert contract_arity({op: contract})[op] > 0, f"{op}: parsed as zero parameters"
+        assert (
+            contract_arity({op: contract})[op] > 0
+        ), f"{op}: parsed as zero parameters"
