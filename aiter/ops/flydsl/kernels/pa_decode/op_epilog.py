@@ -49,10 +49,15 @@ class PaDecodeEpilogue:
 
     def _emit(self, o_norm, sub, global_row):
         if const_expr(self.traits.DIRECT):
-            # One task per row: the output has the query's strides (query_length 1).
-            head = self.ctx.kv_h * self.traits.query_group_size + global_row
+            # One task per row: the output has the query's row/head strides,
+            # query positions flattened into rows.
+            query_pos = global_row // self.traits.query_group_size
+            head = self.ctx.kv_h * self.traits.query_group_size + (
+                global_row - query_pos * self.traits.query_group_size
+            )
             offset = (
-                self.ctx.seq * self.ctx.stride_q_row
+                (self.ctx.seq * self.traits.query_length + query_pos)
+                * self.ctx.stride_q_row
                 + head * self.ctx.stride_q_head
                 + sub * self.traits.OP_ELEMS
             )
@@ -105,14 +110,15 @@ class PaDecodeEpilogue:
                 if row < self.traits.CTA_ROWS:
                     self._emit(o_norm, sub, global_row)
 
-            if self.ctx.warp == 0 and self.ctx.rgroup == 0:
-                base = self.ctx.partial_slot * self.traits.TOTAL_ROWS + global_row
-                if row < self.traits.CTA_ROWS:
-                    # The shared reducer expects maxima in natural-log units.
-                    pmax[base] = o_final[self.traits.m_slot(m)] * fx.Float32(
-                        1.0 / LOG2E
-                    )
-                    psum[base] = l_row
+            if const_expr(not self.traits.DIRECT):  # noqa: SIM102
+                if self.ctx.warp == 0 and self.ctx.rgroup == 0:
+                    base = self.ctx.partial_slot * self.traits.TOTAL_ROWS + global_row
+                    if row < self.traits.CTA_ROWS:
+                        # The shared reducer expects maxima in natural-log units.
+                        pmax[base] = o_final[self.traits.m_slot(m)] * fx.Float32(
+                            1.0 / LOG2E
+                        )
+                        psum[base] = l_row
 
     @flyc.jit
     def store_mxfp4(self, o_final):

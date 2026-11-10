@@ -204,7 +204,10 @@ def compile_pa_decode_tile(
 
     ``direct_output`` (gfx950, MXFP4): no plan -- ``work_info`` is the int32 context
     lengths -- one task per sequence, the output written directly with the query's
-    row/head strides (an empty row is zero-filled).
+    row/head strides (an empty row is zero-filled). FP8/BF16 on gfx950 accept it
+    with a one-partition plan (capacity equal to the batch): ``pmax`` carries the
+    plan's ``reduce_info``, slot s runs packed task s and zero-fills sequence s
+    when it owns no task, and ``pout`` is the output.
     ``work_capacity`` is a positive host integer matching the work plan.
     Positive ``sliding_window`` includes the query token.
     Plans cover the MTP window union; scores are masked per query row.
@@ -268,8 +271,12 @@ def compile_pa_decode_tile(
         raise NotImplementedError(f"PA decode does not support {architecture}")
     if cluster_merge:
         raise NotImplementedError("cluster_merge requires gfx1250")
-    if direct_output and kv_dtype != "mxfp4":
-        raise NotImplementedError("direct_output requires gfx1250 or MXFP4")
+    if direct_output and not (
+        kv_dtype == "mxfp4" or (architecture == "gfx950" and num_partitions == 1)
+    ):
+        raise NotImplementedError(
+            "direct_output requires gfx1250, MXFP4 or a one-partition gfx950 plan"
+        )
     schedule = PaDecodeSchedule.select(
         head_dim=head_dim,
         query_group_size=query_group_size,
@@ -411,6 +418,37 @@ def compile_pa_decode_tile(
                 context,
             )
 
+        def _zero_rows(seq):
+            """Zero this CTA's query rows of ``seq`` in the final output."""
+            tid = fx.Int32(gpu.thread_id("x"))
+            row_units = traits.head_dim // 8
+            kv_query = fx.Int32(gpu.block_id("y"))
+            kv_h = kv_query // traits.query_splits
+            first_row = (
+                (kv_query % traits.query_splits)
+                * traits.QUERIES_PER_CTA
+                * traits.query_group_size
+            )
+            out = fx.recast_iter(traits.Q_DTYPE, pout_ptr)
+            for it in range_constexpr(
+                -(-traits.CTA_ROWS * row_units // traits.BLOCK_THREADS)
+            ):
+                unit = tid + it * traits.BLOCK_THREADS
+                if unit < traits.CTA_ROWS * row_units:
+                    row = first_row + unit // row_units
+                    query_pos = row // traits.query_group_size
+                    head = kv_h * traits.query_group_size + (
+                        row - query_pos * traits.query_group_size
+                    )
+                    offset = (
+                        (seq * traits.query_length + query_pos) * stride_q_row
+                        + head * stride_q_head
+                        + unit % row_units * 8
+                    )
+                    fx.ptr_store(
+                        fx.full(8, 0.0, traits.Q_DTYPE), fx.add_offset(out, offset)
+                    )
+
         # Skip cleared padding records: no scratch writes or Q loads.
         # This CTA-uniform guard keeps every task barrier convergent.
         if const_expr(traits.batch_first_plan_grid):
@@ -421,7 +459,24 @@ def compile_pa_decode_tile(
         else:
             slot = fx.Int32(gpu.block_id("x"))
         work = fx.recast_iter(fx.Int32, work_info_ptr)
-        if const_expr(traits.DIRECT):
+        if const_expr(traits.DIRECT and not traits.MXFP4):
+            # One-partition plan, capacity == batch: slot s runs packed task s
+            # (any sequence's) and zeroes sequence s when it owns no task, as
+            # the reducer would; pmax carries reduce_info. Both loads issue
+            # together.
+            task = fx.ptr_load(
+                fx.add_offset(work, slot * 4),
+                result_type=fx.Vector.make_type(4, fx.Int32),
+            )
+            info = fx.recast_iter(fx.Int32, pmax_ptr)
+            count = fx.Int32(fx.ptr_load(fx.add_offset(info, slot * 2 + 1)))
+            start = fx.Int32(task[1])
+            end = fx.Int32(task[2])
+            if start < end:
+                _run_task(fx.Int32(task[0]), start, end, fx.Int32(task[3]))
+            if count == 0:
+                _zero_rows(slot)
+        elif const_expr(traits.DIRECT):
             # One task per sequence, no plan: ``work_info`` is the context lengths.
             context = fx.Int32(fx.ptr_load(fx.add_offset(work, slot)))
             # Page ids past the staged window come from the block table.

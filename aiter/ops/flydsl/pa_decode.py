@@ -494,9 +494,9 @@ def pa_decode(
     the device CU count for the gfx950 head-256 pipe shapes and twice that
     otherwise; ``tune=True`` forces a search during preparation.
     Decode and graph replay use the explicit plan without accessing autotune. Set its
-    partition cap with ``plan_pa_decode(max_partitions=...)``. On gfx1250, when
-    sinks are absent and query/output strides match, a cap of one writes output
-    directly. So do plans with one task slot per sequence (capacity equal to
+    partition cap with ``plan_pa_decode(max_partitions=...)``. On gfx950 and
+    gfx1250, when sinks are absent and query/output strides match, a cap of one
+    writes output directly, without the reducer. On gfx1250, so do plans with one task slot per sequence (capacity equal to
     the batch, at most 8 partitions per sequence, head_dim <= 512): sequences
     that still own several tasks merge them in the tile kernel using the plan's
     arrival counters when partial scratch is eight-byte aligned. Otherwise,
@@ -961,7 +961,14 @@ def pa_decode(
     # CTA. That merge costs two device-scope round trips (sparse decode 64
     # rows: 17.7 us vs 10.3 us for tile plus reducer), so wider plans merge
     # within workgroup clusters instead.
+    # gfx950 one-partition plans (capacity == batch) store final rows from
+    # the tile kernel too, without the reducer launch.
     direct_output = (
+        arch == "gfx950"
+        and num_partitions == 1
+        and sinks is None
+        and output.stride() == query.stride()
+    ) or (
         arch in ("gfx1250", "gfx1250-strict")
         and sinks is None
         and output.stride() == query.stride()
