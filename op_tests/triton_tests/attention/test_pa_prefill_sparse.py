@@ -411,7 +411,7 @@ def test_pa_prefill_sparse_extend_only(T, H, D, prefix_len, extend_len):
     torch.testing.assert_close(out, ref, atol=5e-3, rtol=5e-3)
 
 
-# H=32 and 64 take the single-pass kernel (H=64 as two launches), H=16
+# H=32 and 64 take the single-pass kernel (H=64 as two head groups), H=16
 # mla_gluon. T=16384 with 512 slots per row gives an 8 GiB pool, so KV offsets
 # need 64 bits.
 @pytest.mark.parametrize("T", [1024, 16384])
