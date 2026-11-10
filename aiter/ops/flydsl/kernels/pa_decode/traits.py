@@ -686,13 +686,24 @@ class PaDecodeTraits:
         )
         # Multi-M-tile FP8 D128 needs 260-272 VGPRs, one wave per SIMD; capped
         # at 256 it spills about ten and runs two, which pays on busy grids.
+        # A streamed single M-tile with a 512-byte K row (BF16 D256) fits 256
+        # without spilling.
         WAVES_PER_EU_2 = (
             not is_gfx950
-            and kv_dtype in FP8_KV_DTYPES
-            and head_dim == 128
-            and M_TILES > 1
             and gfx942_busy
-            and not STREAM_KV
+            and (
+                (
+                    kv_dtype in FP8_KV_DTYPES
+                    and head_dim == 128
+                    and M_TILES > 1
+                    and not STREAM_KV
+                )
+                or (
+                    STREAM_KV
+                    and M_TILES == 1
+                    and 512 <= kv_row_bytes < STREAM_KV_MTILES_ROW_BYTES
+                )
+            )
         )
         REUSE_KV_PAGES = PER_TOKEN_M1 or (D256_PIPE and per_token_kv)
         SCALES_BEFORE_CURRENT_V = (
