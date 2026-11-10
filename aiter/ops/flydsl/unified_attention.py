@@ -39,6 +39,8 @@ _MAX_QUERY_LENGTH = 8
 _MAX_BATCH = 4096
 # Queries per varlen pseudo-sequence.
 _QUERY_BLOCK = int(os.environ.get("PP_VL_QB", "16"))
+# Queries per windowed varlen block: the kernel's two-CTAs-per-CU layout.
+_WINDOW_QUERY_BLOCK = int(os.environ.get("PP_WIN_QB", "8"))
 # Varlen pseudo-sequences the planner's LDS holds on gfx950 (160 KiB).
 _MAX_PSEUDO_SEQS = 40000
 
@@ -65,9 +67,9 @@ def _varlen_enabled() -> bool:
     return os.environ.get("AITER_UNIFIED_ATTN_FLYDSL_VARLEN", "1") != "0"
 
 
-def _pseudo_capacity(num_tokens, num_seqs):
-    # Sequence i has ceil(q_i / 8) <= q_i / 8 + 7 / 8 query blocks.
-    return -(-num_tokens // _QUERY_BLOCK) + num_seqs
+def _pseudo_capacity(num_tokens, num_seqs, block=_QUERY_BLOCK):
+    # Sequence i has ceil(q_i / b) <= q_i / b + (b - 1) / b query blocks.
+    return -(-num_tokens // block) + num_seqs
 
 
 def _arch() -> str | None:
@@ -214,7 +216,7 @@ def _route(
         return None, "cu_seqlens_q must be a contiguous int32 [num_seqs + 1] tensor"
     if query_length < 1:
         return None, f"requires max_seqlen_q >= 1, got {query_length}"
-    if _pseudo_capacity(num_tokens, num_seqs) > _MAX_PSEUDO_SEQS:
+    if not windowed and _pseudo_capacity(num_tokens, num_seqs) > _MAX_PSEUDO_SEQS:
         return None, f"{num_tokens} query tokens exceed the varlen planner"
     return ("window_varlen" if windowed else "varlen"), None
 
@@ -585,7 +587,7 @@ def _unified_attention_window(
         num_cu = torch.cuda.get_device_properties(dev).multi_processor_count
         cta_queries = query_length
         if query_length is None:
-            pseudo = _pseudo_capacity(num_tokens, num_seqs)
+            pseudo = _pseudo_capacity(num_tokens, num_seqs, _WINDOW_QUERY_BLOCK)
             need = {
                 "query_map": (pseudo * 4, torch.int32),
                 "context_lengths": (pseudo, torch.int32),
@@ -604,7 +606,12 @@ def _unified_attention_window(
             query_map = workspace["query_map"][: pseudo * 4].view(pseudo, 4)
             contexts = workspace["context_lengths"][:pseudo]
             build_query_block_map(
-                cu_seqlens_q, seqused_k, num_tokens, _QUERY_BLOCK, query_map, contexts
+                cu_seqlens_q,
+                seqused_k,
+                num_tokens,
+                _WINDOW_QUERY_BLOCK,
+                query_map,
+                contexts,
             )
             grid_seqs = pseudo
         else:
@@ -626,7 +633,7 @@ def _unified_attention_window(
             head_dim=_HEAD_DIM,
             value_dim=_VALUE_DIM,
             query_group_size=group,
-            query_length=_QUERY_BLOCK if query_length is None else cta_queries,
+            query_length=_WINDOW_QUERY_BLOCK if query_length is None else cta_queries,
             block_size=k.shape[1],
             softmax_scale=float(softmax_scale),
             varlen=query_length is None,

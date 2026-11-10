@@ -212,6 +212,10 @@ def compile_pa_decode_pingpong(
     # Direct window output is written once: stream it past the reused KV.
     OAUX = int(os.environ.get("PP_OAUX", "2")) if window else 0
     M, R, CH = pingpong_layout(query_length)
+    if window and varlen and query_length == 8 and not os.environ.get("PP_LAYOUT"):
+        # Four waves on two 40 KiB stages fit two CTAs per CU, so one CTA's Q
+        # load and output store overlap the other's tiles.
+        M, R, CH = 2, 4, 4
     SLOT_TOKENS = 16 * CH
     S = TILE // SLOT_TOKENS
     NWAVES = R * S
@@ -226,8 +230,14 @@ def compile_pa_decode_pingpong(
     nopk = int(os.environ.get("PP_NOPK", "1"))
     xissue = int(os.environ.get("PP_XISSUE", "1")) if stages >= 4 else 0
     unroll = int(os.environ.get("PP_UNROLL", "0"))
-    fuse = int(os.environ.get("PP_FUSE", "1")) if (NWAVES == 4 and S == 1) else 0
+    fuse = (
+        int(os.environ.get("PP_FUSE", "0" if window else "1"))
+        if (NWAVES == 4 and S == 1)
+        else 0
+    )
     fsched = int(os.environ.get("PP_FSCHED", "2")) if fuse else 0
+    # Both overlap a stage's DMA with reads of the stage before it.
+    assert stages >= 3 or not (stagger or fuse), "a 2-stage ring races these schedules"
     lsum = int(os.environ.get("PP_LSUM", "0")) if (CH > 1 and (stagger or fuse)) else 0
     # 32x32x16 MFMAs on the staggered prefill: lane (n, h) owns row n of the
     # wave's 32 rows; the V transpose reads need DV in {128, 256}.
