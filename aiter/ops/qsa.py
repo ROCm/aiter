@@ -10,11 +10,10 @@ modules directly.
 
 import functools
 from collections.abc import Sequence
-from dataclasses import replace as _dc_replace
 
 import torch
 
-from aiter.ops.qsa_index_scorer import dispatch as _D
+from aiter.ops.qsa_index_scorer import native as _N
 from aiter.ops.topk import top_k_per_row_prefill
 from aiter.ops.triton.attention.qsa import (
     FP4_GROUP,
@@ -28,6 +27,7 @@ from aiter.ops.triton.attention.qsa import (
 from aiter.ops.triton.attention.qsa import (
     qsa_paged_mqa_logits as _triton_qsa_paged_mqa_logits,
 )
+from aiter.plugin import route as _route
 
 try:
     from aiter.ops.flydsl.kernels.mqa_logits.qsa_flydsl_layout import (
@@ -49,32 +49,22 @@ except ImportError:
     _HAS_FLYDSL_PREFILL = False
 
 DEFAULT_LOGITS_WORKSPACE_BYTES = 128 * 1024 * 1024
-DEFAULT_LOGITS_WORKSPACE_BYTES = 128 * 1024 * 1024
 
 # ---------------------------------------------------------------------------
-# qsa_paged_mqa_logits: neutral op (contract v1) + fused-path policy
+# qsa_paged_mqa_logits: routed op (contract v1) + its native implementation
 # ---------------------------------------------------------------------------
-# Route-ready: the op is routed through aiter.plugin when that interface exists
-# (provider stack #7465/#7484); until then the decorator is a no-op.
-try:
-    from aiter.plugin import route as _route
-except ImportError:  # aiter.plugin not in this tree yet
+# The op is routed through aiter.plugin: an enabled out-of-tree provider may serve
+# a call (aiter.plugin.configure(source=..., enable=[...]) is the only way to enable
+# one); a decline, no provider, nothing enabled or AITER_PLUGINS=0 runs the native
+# implementation below. Tuned implementations (e.g. a fused FlyDSL gfx1250 scorer)
+# live in providers, not here.
+OP_NAME = "qsa_paged_mqa_logits"
+OP_CONTRACT_VERSION = 1
 
-    def _route(*, op: str, version: int = 1, supersedes=None):
-        def wrap(func):
-            func.__aiter_route__ = (op, version)
-            return func
-
-        return wrap
-
-    ROUTED = False
-else:
-    ROUTED = True
-
-OP_NAME = _D.OP_NAME
-OP_CONTRACT_VERSION = _D.OP_CONTRACT_VERSION
-API_VERSION = _D.API_VERSION
-Decision = _D.Decision
+#: labels of the native implementations (``native_route``)
+NATIVE_TRITON = "native.triton.v1"
+NATIVE_FLYDSL_PAGE16 = "native.flydsl_page16.v1"
+NATIVE_TORCH = _N.NATIVE_VID
 
 
 def _on_gpu(t) -> bool:
@@ -157,12 +147,12 @@ def _existing_route(
     if _flydsl_page16(
         q, compressed_k_cache, page_table, allow_flydsl, compressed_k_scale
     ):
-        return _D.VID_FLYDSL_PAGE16
+        return NATIVE_FLYDSL_PAGE16
     dt = compressed_k_cache.dtype
     if dt == torch.uint8 or (FP8_MAX is not None and dt == FP8_DTYPE):
-        return _D.VID_TRITON if compressed_k_scale is not None else None
+        return NATIVE_TRITON if compressed_k_scale is not None else None
     if dt.is_floating_point and dt.itemsize > 1:
-        return _D.VID_TRITON
+        return NATIVE_TRITON
     return None
 
 
@@ -278,131 +268,19 @@ def qsa_paged_mqa_logits(
     heads / head_dim) take the stacked decode scorer, as ATOM's own scorer does by
     default; ``True`` / ``False`` are honoured as given.
 
-    Implementation (a dispatch decision, per call class, decided once on the host):
-    the fused FlyDSL gfx1250 kernels when a profile is active (:func:`configure`,
-    ``$AITER_QSA_PROFILE``; kill switch ``$AITER_QSA_FUSED=0``) and covers the class;
-    else aiter's existing native kernels (FlyDSL page-16 prefill with ``allow_flydsl``,
-    Triton); else a pure-torch implementation (e.g. CPU tensors). Default: no profile,
-    i.e. the existing native dispatch. :func:`explain` names the path of a call.
+    Routed (``aiter.plugin``, op ``qsa_paged_mqa_logits`` v1): an enabled provider
+    may serve the call; otherwise the native implementation runs -- aiter's existing
+    kernels (the FlyDSL page-16 prefill scorer for large ``allow_flydsl`` batches on
+    gfx9, else Triton: bf16 / fp16 / fp32, fp8 E4M3 + fp32 scale, MXFP4), and a pure
+    torch implementation for valid calls they cannot take (e.g. CPU tensors).
+    :func:`native_route` names the native implementation of a call.
 
     Raises ``ValueError`` only for calls that violate the contract.
     """
-    if _D._ACTIVE is None and isinstance(q, torch.Tensor):
-        try:
-            route = _existing_route(
-                q, compressed_k_cache, page_table, allow_flydsl, compressed_k_scale
-            )
-        except Exception:  # noqa: BLE001 -- the dispatch core decides
-            route = None
-        if route is not None:  # default (fused off): exactly the existing dispatch
-            return _existing_native(
-                q,
-                compressed_k_cache,
-                page_table,
-                token_to_request,
-                query_positions,
-                context_lens,
-                compress_ratio,
-                score_divisor,
-                max_columns,
-                row_starts,
-                allow_flydsl,
-                compressed_k_scale,
-                stacked_decode,
-                logits,
-                visible_groups,
-            )
-    return _D.call(
-        _existing_native,
-        _existing_route,
-        q,
-        compressed_k_cache,
-        page_table,
-        token_to_request,
-        query_positions,
-        context_lens,
-        compress_ratio,
-        score_divisor,
-        max_columns,
-        row_starts,
-        allow_flydsl,
-        compressed_k_scale,
-        stacked_decode,
-        logits,
-        visible_groups,
-    )
-
-
-def configure(*, profile: str | None, source: str) -> None:
-    """Enable the fused ``qsa_paged_mqa_logits`` path with a named profile (``None``:
-    off, the default). Process-global, idempotent; ``source`` names the caller (e.g.
-    ``"atom:<config>"``). ``$AITER_QSA_PROFILE`` (operator) overrides ``profile``
-    (``off`` disables); ``$AITER_QSA_FUSED=0`` is the kill switch. Call before model
-    load / warm-up / graph capture."""
-    _D.configure(profile=profile, source=source)
-
-
-def prewarm(
-    *,
-    page_sizes,
-    cache_dtypes,
-    pos_dtypes=(torch.int64,),
-    compressed_k_cache: torch.Tensor | None = None,
-    compressed_k_scale: torch.Tensor | None = None,
-    device=None,
-) -> list[str]:
-    """Load (AOT cache hit) or compile the fused variants the active profile can select
-    for these index caches: ``page_sizes`` (4 / 8 / 16), ``cache_dtypes`` (``"bf16"`` /
-    ``"fp8"`` or torch dtypes), ``pos_dtypes``; a bound ``compressed_k_cache`` (+ scale)
-    narrows to what it can select. Returns the warmed variant tags (``[]`` when the
-    fused path is off). Call after KV allocation, before graph capture."""
-    return _D.prewarm(
-        page_sizes=page_sizes,
-        cache_dtypes=cache_dtypes,
-        pos_dtypes=pos_dtypes,
-        compressed_k_cache=compressed_k_cache,
-        compressed_k_scale=compressed_k_scale,
-        device=device,
-    )
-
-
-def explain(
-    q,
-    compressed_k_cache,
-    page_table,
-    token_to_request,
-    query_positions,
-    context_lens,
-    compress_ratio=4,
-    score_divisor=None,
-    max_columns=None,
-    row_starts=None,
-    allow_flydsl=False,
-    compressed_k_scale=None,
-    stacked_decode=None,
-    *,
-    logits=None,
-    visible_groups=None,
-) -> Decision:
-    """``Decision(path, reason, vid, ...)`` for this call's class without running it
-    (``path`` in ``fused`` / ``native-triton`` / ``native-torch``; ``invalid`` for a
-    contract violation). Decides and caches the class like the first call would. A
-    ``native.triton.v1`` decision's ``detail`` ends with the ``stacked_decode`` hint
-    passed to Triton (``stacked_decode=auto:True`` / ``auto:False`` / ``True`` /
-    ``False``)."""
-    d = None
-    if _D._ACTIVE is None and isinstance(q, torch.Tensor):
-        try:
-            vid = _existing_route(
-                q, compressed_k_cache, page_table, allow_flydsl, compressed_k_scale
-            )
-        except Exception:  # noqa: BLE001
-            vid = None
-        if vid is not None:
-            reason = "kill_switch" if _D._ORIGIN.startswith("kill") else "disabled"
-            d = Decision(_D.PATH_NATIVE_TRITON, reason, vid, _D._ORIGIN)
-    if d is None:
-        d = _explain_decide(
+    if native_route(
+        q, compressed_k_cache, page_table, allow_flydsl, compressed_k_scale
+    ) != (NATIVE_TORCH):
+        return _existing_native(
             q,
             compressed_k_cache,
             page_table,
@@ -419,35 +297,40 @@ def explain(
             logits,
             visible_groups,
         )
-    if d.path == _D.PATH_NATIVE_TRITON and d.vid == _D.VID_TRITON:
-        if stacked_decode is None:
-            try:
-                auto = _stacked_decode_auto(q, compressed_k_cache, page_table)
-                hint = f"auto:{auto}"
-            except Exception:  # noqa: BLE001
-                hint = "auto:?"
-        else:
-            hint = str(bool(stacked_decode))
-        detail = (
-            f"{d.detail}; stacked_decode={hint}"
-            if d.detail
-            else f"stacked_decode={hint}"
-        )
-        d = _dc_replace(d, detail=detail)
-    return d
+    return _N.qsa_paged_mqa_logits_native(
+        q,
+        compressed_k_cache,
+        page_table,
+        token_to_request,
+        query_positions,
+        context_lens,
+        compress_ratio,
+        score_divisor,
+        max_columns,
+        row_starts,
+        allow_flydsl,
+        compressed_k_scale,
+        logits=logits,
+        visible_groups=visible_groups,
+    )
 
 
-def _explain_decide(*args) -> Decision:
-    return _D.explain(_existing_native, _existing_route, *args)
-
-
-def status() -> dict:
-    """Fused-path state: enabled, profile (+ origin: configure source / env / kill
-    switch), kernel and profile sha256, op / API versions, decided classes per path,
-    route (``aiter.plugin`` or shim)."""
-    out = _D.status()
-    out["routed"] = ROUTED
-    return out
+def native_route(
+    q, compressed_k_cache, page_table, allow_flydsl=False, compressed_k_scale=None
+) -> str:
+    """Which native implementation serves a call when no provider does:
+    ``native.flydsl_page16.v1`` / ``native.triton.v1`` (aiter's existing kernels) or
+    ``native.torch.v1`` (pure torch: CPU tensors and calls the kernels cannot take).
+    Host-only; reads tensor metadata only."""
+    route = None
+    if isinstance(q, torch.Tensor):
+        try:
+            route = _existing_route(
+                q, compressed_k_cache, page_table, allow_flydsl, compressed_k_scale
+            )
+        except Exception:  # noqa: BLE001 -- not a call the existing kernels take
+            route = None
+    return NATIVE_TORCH if route is None else route
 
 
 def qsa_select_paged_tokens(
@@ -577,10 +460,9 @@ __all__ = [
     "FP4_GROUP",
     "FP8_DTYPE",
     "FP8_MAX",
-    "Decision",
-    "configure",
-    "explain",
-    "prewarm",
+    "OP_CONTRACT_VERSION",
+    "OP_NAME",
+    "native_route",
     "qsa_cache_row_layout",
     "qsa_expand_block_indices",
     "qsa_paged_mqa_logits",
@@ -588,5 +470,4 @@ __all__ = [
     "qsa_sparse_paged_gqa",
     "qsa_sparse_prefill",
     "qsa_store_quantized_rows",
-    "status",
 ]

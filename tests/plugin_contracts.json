@@ -20,6 +20,13 @@
   "supersedes": [],
   "version": 1
  },
+ "qsa_paged_mqa_logits": {
+  "fingerprint": "543c36e43c589ce2",
+  "signature": "q:positional:torch.Tensor, compressed_k_cache:positional:torch.Tensor, page_table:positional:torch.Tensor, token_to_request:positional:torch.Tensor, query_positions:positional:torch.Tensor, context_lens:positional:torch.Tensor, compress_ratio:positional:int=4, score_divisor:positional:float | None=None, max_columns:positional:int | None=None, row_starts:positional:torch.Tensor | None=None, allow_flydsl:positional:bool=False, compressed_k_scale:positional:torch.Tensor | None=None, stacked_decode:positional:bool | None=None, logits:keyword-only:torch.Tensor | None=None, visible_groups:keyword-only:torch.Tensor | None=None, -> tuple[torch.Tensor, torch.Tensor]",
+  "source": "aiter/ops/qsa.py",
+  "supersedes": [],
+  "version": 1
+ },
  "rmsnorm": {
   "fingerprint": "86344aea2f2c16a8",
   "signature": "input:positional, weight:positional, epsilon:positional, use_model_sensitive_rmsnorm:positional, -> Tensor",

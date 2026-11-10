@@ -2,8 +2,8 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Native (pure torch) implementation of ``qsa_paged_mqa_logits`` -- contract v1.
 
-Serves every valid call the fused FlyDSL path does not cover (no profile, uncovered
-shape, other arch, page size, ``score_divisor`` ...). Semantics are those of ATOM's
+Serves the valid calls aiter's existing kernels (Triton, FlyDSL page-16 prefill) cannot
+take (e.g. CPU tensors) when no provider serves them. Semantics are those of ATOM's
 scorer and of the frozen golden::
 
     visible[t]   = clamp(min((pos[t] + 1) // ratio, ctx[req(t)] // ratio), min=0)
@@ -17,7 +17,7 @@ scorer and of the frozen golden::
 
 Design (graph-capture safe from a prepared plan):
 
-* :class:`NativePlan` is built once per call class (``api.decide``) and owns a
+* :class:`NativePlan` is built per call (:func:`qsa_paged_mqa_logits_native`) and owns a
   workspace sized for one tile of ``tile_rows x tile_cols`` (bounded by
   :data:`TILE_ELEMS`, independent of the problem size). The tile loop is static
   (rows / columns are part of the class key).
@@ -32,7 +32,8 @@ Numerics: fp32 throughout; per tile the head sum is accumulated in head order
 (``relu(h0) + relu(h1) + ...``) and divided once, as the golden. The dot products
 are batched GEMMs (``bmm``), so the accumulation order inside a dot product differs
 from the golden's GEMM; agreement is well inside the contract tolerance
-(``rtol = atol = 1e-4``, measured on CPU in ``op_tests/test_qsa_index_scorer_cpu.py``).
+(``rtol = atol = 1e-4``, measured on CPU in
+``op_tests/test_qsa_paged_mqa_logits_route_cpu.py``).
 """
 
 from __future__ import annotations
