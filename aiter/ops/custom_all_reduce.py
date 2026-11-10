@@ -36,6 +36,17 @@ def all_reduce(
 
 
 @compile_ops("module_custom_all_reduce", develop=True)
+def all_reduce_residual(
+    _fa: int,
+    inp: torch.Tensor,
+    out: torch.Tensor,
+    residual: torch.Tensor,
+    reg_inp_ptr: int,
+    reg_inp_bytes: int,
+) -> None: ...
+
+
+@compile_ops("module_custom_all_reduce", develop=True)
 def reduce_scatter(
     _fa: int,
     inp: torch.Tensor,
@@ -93,6 +104,8 @@ def fused_allreduce_rmsnorm(
     reg_bytes: int,
     use_1stage: bool,
     gemma_norm: bool = False,
+    num_norm_rows: int = -1,
+    skip_residual: bool = False,
 ) -> None: ...
 
 
@@ -165,6 +178,7 @@ def fused_allreduce_rmsnorm_mxfp4_quant(
     use_1stage: bool,
     bf16_out_ptr: int = 0,
     gemma_norm: bool = False,
+    hadamard_rotate: bool = False,
 ) -> None: ...
 
 
@@ -208,6 +222,29 @@ def dispose(_fa: int) -> None: ...
 
 @compile_ops("module_custom_all_reduce", develop=True)
 def meta_size() -> int: ...
+
+
+@compile_ops("module_custom_all_reduce", develop=True)
+def lamportBufferSize(world_size: int) -> int: ...
+
+
+@compile_ops("module_custom_all_reduce", develop=True)
+def initLamport(
+    _fa: int,
+    self_ptr: int,
+    ipc_handle_ptrs: list[int],
+    offsets: list[int],
+) -> None: ...
+
+
+@compile_ops("module_custom_all_reduce", develop=True)
+def lamportKernel(_fa: int, numel: int) -> int: ...
+
+
+@compile_ops("module_custom_all_reduce", develop=True)
+def lamportAllReduce(
+    _fa: int, inp: torch.Tensor, out: torch.Tensor, kernel: int
+) -> None: ...
 
 
 @compile_ops("module_custom_all_reduce", develop=True)
@@ -409,6 +446,18 @@ def get_graph_buffer_ptrs_gfx1250(_fa: int, ptrs_out: int) -> None: ...
 
 @compile_ops(GFX1250_MD_NAME, fc_name="register_graph_buffers", develop=True)
 def register_graph_buffers_gfx1250(_fa: int, ptrs_per_rank: list[int]) -> None: ...
+
+
+@compile_ops(GFX1250_MD_NAME, fc_name="get_graph_buffer_ipc_meta", develop=True)
+def get_graph_buffer_ipc_meta_gfx1250(
+    _fa: int, handle_out: int, offset_out: int
+) -> None: ...
+
+
+@compile_ops(GFX1250_MD_NAME, fc_name="register_graph_buffers_ipc", develop=True)
+def register_graph_buffers_gfx1250_ipc(
+    _fa: int, handle_ptrs: list[int], offset_ptrs: list[int]
+) -> None: ...
 
 
 @compile_ops(GFX1250_MD_NAME, fc_name="start_sync_latency", develop=True)

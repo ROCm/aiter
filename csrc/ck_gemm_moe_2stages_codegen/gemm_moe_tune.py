@@ -9,9 +9,14 @@ import re
 import sys
 import tempfile
 from argparse import ArgumentTypeError
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
+from dataclasses import dataclass
 from decimal import Decimal
+from multiprocessing.connection import wait as wait_for_connections
+from multiprocessing.reduction import ForkingPickler
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import pandas as pd
 import torch
@@ -28,6 +33,7 @@ from aiter import (
     dtypes,
 )
 from aiter.fused_moe import (
+    AsmMoeMode,
     _mxfp4_a4w4_stage1_fw,
     _mxfp4_a4w4_stage2_fw,
     asm_stage1,
@@ -52,27 +58,36 @@ from aiter.jit.core import (
     AITER_ROOT_DIR,
     get_asm_dir,
 )
-from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime, gfx_from_cu_num
+from aiter.jit.utils.chip_info import get_gfx, gfx_from_cu_num
 from aiter.ops.flydsl.moe_common import (
     DEFAULT_SITUV2_BETA,
     DEFAULT_SITUV2_LINEAR_BETA,
     get_flydsl_activation_name,
+    resolve_swiglu_limit,
 )
 from aiter.ops.flydsl.moe_kernels import (
+    _run_moe_reduction,
     flydsl_moe_stage1,
     flydsl_moe_stage2,
     get_flydsl_stage1_kernels,
+    get_flydsl_stage1_kernels_a16w16,
     get_flydsl_stage1_kernels_int4_bf16,
     get_flydsl_stage2_kernels,
+    get_flydsl_stage2_kernels_a16w16,
     get_flydsl_stage2_kernels_int4_bf16,
     get_flydsl_stage2_v2_kernels,
     runtime_swiglu_limit,
 )
 from aiter.ops.flydsl.mxfp4_kname import (
+    _is_mxfp4_kname,
     _parse_mxfp4_g1_kname,
     parse_g2_kname_any,
 )
-from aiter.ops.quant import per_1x32_f8_scale_f8_quant, per_1x32_i4_quant
+from aiter.ops.quant import (
+    per_1x32_f8_scale_f8_quant,
+    per_1x32_i4_quant,
+    per_1x32_mx_quant_hip,
+)
 from aiter.ops.shuffle import (
     pack_int8_to_packed_int4,
     shuffle_scale,
@@ -85,7 +100,17 @@ from aiter.utility import fp4_utils
 from aiter.utility.base_tuner import TunerCommon
 from aiter.utility.dtypes import str2ActivationType, str2Dtype
 from aiter.utility.fp4_utils import moe_mxfp4_sort
-from aiter.utility.mp_tuner import mp_tuner
+from aiter.utility.mp_tuner import _is_accelerator_error, mp_tuner
+from csrc.ck_gemm_moe_2stages_codegen.mxfp4_staged_search import (
+    DEFAULT_SCREEN_TOPK,
+    AccumulationMode,
+    GEMM2ScreeningKey,
+    PipelinePairKey,
+    build_staged_candidate_plan,
+    reference_consumer_order,
+    screening_shortlist,
+    select_reference_producer,
+)
 from csrc.ck_gemm_moe_2stages_codegen.mxfp4_v2_tune_utils import (
     build_v2_inputs as _v2_build_inputs,
 )
@@ -95,6 +120,11 @@ from csrc.ck_gemm_moe_2stages_codegen.mxfp4_v2_tune_utils import (
 from csrc.ck_gemm_moe_2stages_codegen.mxfp4_v2_tune_utils import (
     populate_v2_intermediate_from_ref as _v2_populate_stage2,
 )
+
+if TYPE_CHECKING:
+    from types import SimpleNamespace
+
+    from csrc.ck_gemm_moe_2stages_codegen.mxfp4_staged_search import StagedSearchPlan
 from csrc.ck_gemm_moe_2stages_codegen.mxfp4_v2_tune_utils import (
     v2_stage1_sorted_ref as _v2_stage1_ref,
 )
@@ -221,15 +251,12 @@ def _dump_prefilter_candidates(profile_df, args, stage_tag):
 
 
 def _manifest_flat_by_kernel(df: pd.DataFrame) -> dict:
-    """Map ``knl_name`` -> 0/1 when the manifest has a ``flat`` column.
-
-    If the column is absent, every kernel is treated as non-FLAT (equivalent
-    to all zeros). Only manifests that include FLAT 1-stage asm variants need
-    the column.
-    """
+    """Map names to ASM mode: 0 sorted, 1 no_sort, 2 emsort, 3 post_reduce."""
     if "flat" not in df.columns:
         return {}
-    return dict(zip(df["knl_name"], df["flat"].fillna(0).astype(int)))
+    return dict(
+        zip(df["knl_name"], df["flat"].fillna(AsmMoeMode.SORTED.value).astype(int))
+    )
 
 
 def torch_dynamic_mxfp8_quant(x: torch.Tensor):
@@ -317,6 +344,17 @@ def _parse_fast_scan_iters(value):
     return value
 
 
+def _mxfp4_search_mode(args):
+    """The MXFP4 search mode: an omitted one is staged, or prune under --fast-scan.
+
+    prune is internal only; the CLI accepts full and staged.
+    """
+    mode = getattr(args, "mxfp4_search_mode", None)
+    if mode:
+        return mode
+    return "prune" if getattr(args, "fast_scan", False) else "staged"
+
+
 def _normalized_latency_difference(latency, fastest_latency):
     if fastest_latency > 0:
         return (latency - fastest_latency) / fastest_latency
@@ -392,6 +430,66 @@ def _select_mxfp4_finalist(candidates, timing_gate=MXFP4_FINAL_GLOBAL_TIMING_GAT
             candidate["kernelName2"],
         ),
     )
+
+
+def _numeric_column(frame, name, default=float("nan")):
+    if name not in frame.columns:
+        return pd.Series(default, index=frame.index, dtype="float64")
+    return pd.to_numeric(frame[name], errors="coerce")
+
+
+def _frame_keeping_watts(columns, results):
+    """Build the tuned frame without dropping a power measurement.
+
+    ``DataFrame(..., columns=self.columns)`` keeps only the latency schema.
+    Grouped and MXFP4 winners carry ``watts`` on the dict, and dropping it
+    made the following stamp publish ``select=power`` with a null reading.
+    """
+    kept = list(columns)
+    if (
+        results
+        and isinstance(results[0], dict)
+        and "watts" in results[0]
+        and "watts" not in kept
+    ):
+        kept.append("watts")
+    return pd.DataFrame(results, columns=kept)
+
+
+def rank_moe_pairs(profile_df, policy):
+    """Rank paired MoE candidates with the tune's selection policy.
+
+    The pair cost is the policy's stage energy ``us1*watts1 + us2*watts2``
+    (stage 2 contributes only when it actually ran); its mean watts feed the
+    same frame order every tuner uses. ``rank`` 1 is the winner.
+
+    Latency mode returns the frame unchanged, so the ``-o2`` profile keeps
+    main's columns and row order.
+    """
+    if not policy.measures_power:
+        return profile_df
+    frame = profile_df.copy()
+    us1 = _numeric_column(frame, "us1")
+    us2 = _numeric_column(frame, "us2", default=0.0).fillna(0.0)
+    watts1 = _numeric_column(frame, "watts1")
+    watts2 = _numeric_column(frame, "watts2")
+    energy = [
+        policy.pair_energy(a, b, c, d)
+        for a, b, c, d in zip(us1, watts1, us2, watts2, strict=True)
+    ]
+    frame["energy"] = pd.Series(energy, index=frame.index).round(1)
+    us = _numeric_column(frame, "us")
+    if us.isna().all() and "us1" in frame.columns:
+        us = us1
+        frame["us"] = us
+    mean_watts = frame["energy"] / us.replace(0, pd.NA)
+    frame["watts"] = mean_watts.round(3)
+    if "tflops" in frame.columns:
+        tflops = pd.to_numeric(frame["tflops"], errors="coerce")
+        frame["tflops_per_w"] = (tflops / mean_watts).round(6)
+    frame = policy.sort_frame(frame).reset_index(drop=True)
+    frame.insert(0, "rank", range(1, len(frame) + 1))
+    return frame
 
 
 def _select_mxfp4_accuracy_promotion(candidates, performance_finalists):
@@ -585,11 +683,14 @@ _GEN_DATA_1STAGE_KEYS = [
     "fc1_smooth_scale",  # 16
     "fc2_smooth_scale",  # 17
     "a1_scale_t",  # 18
+    "w1_scale_shuffled",  # 19
+    "w2_scale_shuffled",  # 20
 ]
 
 
 class FmoeTuner(TunerCommon):
     SUPPORTS_FAST_SCAN = False
+    SUPPORTS_POWER_SELECT = True
 
     ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
         **TunerCommon.ARG_DEFAULTS,
@@ -633,9 +734,17 @@ class FmoeTuner(TunerCommon):
         )
         self.parser.add_argument(
             "--mxfp4-search-mode",
-            choices=("prune", "full"),
-            help="GEMM1 search mode: prune by M_est (default) or search all legal "
-            "variants (full); requires --mxfp4-flydsl.",
+            choices=("full", "staged"),
+            help="screen the M_est-pruned stages (staged, the default; shapes with "
+            "M_est < 4 validate every pruned pair unscreened) or exhaust all legal "
+            "variants (full). Omitted with --fast-scan, every M_est-pruned pair is "
+            "scanned. Requires --mxfp4-flydsl.",
+        )
+        self.parser.add_argument(
+            "--mxfp4-screen-topk",
+            type=int,
+            help="positive screening top-K per stage context (default 2); "
+            "staged search only; unused for M_est < 4; distinct from routing top-k.",
         )
 
     def parse_args(self) -> argparse.Namespace:
@@ -644,16 +753,31 @@ class FmoeTuner(TunerCommon):
             self.parser.error("--fast-scan requires --mxfp4-flydsl")
         if not hasattr(args, "fast_scan"):
             args.fast_scan = False
-        # None distinguishes an omitted mode from an explicit prune request.
-        if args.mxfp4_search_mode is not None and (
-            not args.mxfp4_flydsl
-            or args.grouped_gemm
-            or not isinstance(self, Mxfp4FlydslTuner)
-        ):
+        mxfp4_port = (
+            args.mxfp4_flydsl
+            and not args.grouped_gemm
+            and isinstance(self, Mxfp4FlydslTuner)
+        )
+        # None distinguishes an omitted mode from an explicit one.
+        if args.mxfp4_search_mode is not None and not mxfp4_port:
             self.parser.error(
                 "--mxfp4-search-mode requires --mxfp4-flydsl without --grouped-gemm"
             )
-        args.mxfp4_search_mode = args.mxfp4_search_mode or "prune"
+        if args.mxfp4_screen_topk is not None:
+            if args.mxfp4_screen_topk <= 0:
+                self.parser.error("--mxfp4-screen-topk must be a positive integer")
+            if not mxfp4_port or _mxfp4_search_mode(args) != "staged":
+                self.parser.error(
+                    "--mxfp4-screen-topk requires --mxfp4-flydsl staged search "
+                    "(no --fast-scan, no --mxfp4-search-mode full)"
+                )
+        if args.fast_scan and args.mxfp4_search_mode == "staged":
+            self.parser.error(
+                "--fast-scan applies to pruned or full search, not "
+                "--mxfp4-search-mode staged"
+            )
+        args.mxfp4_search_mode = _mxfp4_search_mode(args)
+        args.mxfp4_screen_topk = args.mxfp4_screen_topk or 2
         return args
 
     def _require_supported_fast_scan(self, args):
@@ -1634,14 +1758,24 @@ class FmoeTuner(TunerCommon):
         kernel_name="",
         topk=2,
         dtype=dtypes.bf16,
+        flat: AsmMoeMode | int = AsmMoeMode.SORTED,
     ):
-        moe_buf = torch.zeros(
-            (a1.shape[0], a1.shape[1]),
+        post_reduce = AsmMoeMode(flat) is AsmMoeMode.POST_REDUCE
+        token_num, model_dim = hidden_states.shape
+        moe_buf = (torch.empty if post_reduce else torch.zeros)(
+            (token_num, model_dim) if post_reduce else (a1.shape[0], a1.shape[1]),
             dtype=dtype,
-            device="cuda",
+            device=a1.device,
         )
+        if post_reduce:
+            partials = torch.empty(
+                (token_num, topk, model_dim), dtype=dtype, device=a1.device
+            )
+            producer_output = partials.view(token_num, -1)
+        else:
+            producer_output = moe_buf
         aiter.fmoe_g1u1(
-            moe_buf,
+            producer_output,
             a1,
             w1,
             w2,
@@ -1657,6 +1791,10 @@ class FmoeTuner(TunerCommon):
             fc2_smooth_scale=fc2_smooth_scale,
             activation=activation,
         )
+        if post_reduce:
+            _run_moe_reduction(
+                partials, moe_buf, token_num, topk, model_dim, streaming_loads=True
+            )
         return moe_buf
 
     @staticmethod
@@ -2142,9 +2280,14 @@ class FmoeTuner(TunerCommon):
                 q_type == QuantType.per_1x32
                 and q_dtype_a in (dtypes.bf16, dtypes.fp16)
                 and q_dtype_w in (dtypes.fp4x2, dtypes.i4x2)
+            ) or (
+                q_type == QuantType.No
+                and q_dtype_a == dtypes.bf16
+                and q_dtype_w == dtypes.bf16
             ):
-                # a16w-mix (mxfp4 a16w4 / int4 a16wi4): the abf16 stage2 consumes the
-                # bf16 intermediate directly -- no inter-stage activation quant
+                # a16w-mix (mxfp4 a16w4 / int4 a16wi4 / bf16 a16w16): the abf16
+                # stage2 consumes the bf16 intermediate directly -- no inter-stage
+                # activation quant
                 # (a2_scale=None). The kernel wants it in SORTED [max_sorted, inter]
                 # layout; build that once here (untimed) so run_flydsl_stage2_out stays
                 # kernel-only. Without this a16wi4 falls through to the generic
@@ -2310,6 +2453,8 @@ class FmoeTuner(TunerCommon):
         )
         fc1_smooth_scale = None
         fc2_smooth_scale = None
+        w1_scale_shuffled = None
+        w2_scale_shuffled = None
         if q_type == QuantType.per_1x32:
             a1_scale = moe_mxfp4_sort(
                 a1_scale,
@@ -2320,6 +2465,11 @@ class FmoeTuner(TunerCommon):
             )
             w1_scale = w1_scale.view(expert, -1)
             w2_scale = w2_scale.view(expert, -1)
+            if q_dtype_a == q_dtype_w == dtypes.fp4x2:
+                w1_qt_shffle = shuffle_weight(w1_qt, layout=(16, 16))
+                w2_qt_shffle = shuffle_weight(w2_qt, layout=(16, 16))
+                w1_scale_shuffled = fp4_utils.e8m0_shuffle(_data["w1_scale"])
+                w2_scale_shuffled = fp4_utils.e8m0_shuffle(_data["w2_scale"])
 
         return {
             "input": input,
@@ -2341,6 +2491,8 @@ class FmoeTuner(TunerCommon):
             "fc1_smooth_scale": fc1_smooth_scale,
             "fc2_smooth_scale": fc2_smooth_scale,
             "a1_scale_t": a1_scale_t,
+            "w1_scale_shuffled": w1_scale_shuffled,
+            "w2_scale_shuffled": w2_scale_shuffled,
         }
 
     @staticmethod
@@ -2960,21 +3112,42 @@ class FmoeTuner(TunerCommon):
         if asm_1stage_csv_path and os.path.exists(asm_1stage_csv_path):
             _df = pd.read_csv(asm_1stage_csv_path)
             asm_1stage_flat = _manifest_flat_by_kernel(_df)
-        fmoe_func = FmoeTuner.get_1stage_fmoe_func(
-            q_type, q_dtype_a, act_type, use_g1u1, doweight_stage1
+        fmoe_func = (
+            FmoeTuner.get_1stage_fmoe_func(
+                q_type, q_dtype_a, act_type, use_g1u1, doweight_stage1
+            )
+            if q_type != QuantType.per_1x32
+            else None
         )
-        if fmoe_func is None:
+        if fmoe_func is None and q_type != QuantType.per_1x32:
             return task_1stage
         for tile_m, tile_n, smf in asm_kernels_1stage:
             if inter_dim % tile_n != 0 or smf != 0:
                 continue
 
             for el in asm_kernels_1stage.get((tile_m, tile_n, 0), []):
-                # Per-kernel ``flat`` in asm manifest (FLAT == raw topk, no host sort).
-                flat_flag = int(asm_1stage_flat.get(el, 0))
-                if flat_flag:
+                # Only no_sort/emsort consume raw topk. Post-reduce candidates
+                # time the sorted-input producer and its reduction together.
+                flat_flag = int(asm_1stage_flat.get(el, AsmMoeMode.SORTED))
+                asm_mode = AsmMoeMode(flat_flag)
+                if asm_mode is AsmMoeMode.POST_REDUCE:
+                    if (
+                        q_type != QuantType.per_1x32
+                        or q_dtype_a != dtypes.fp4x2
+                        or q_dtype_w != dtypes.fp4x2
+                        or dtype != dtypes.bf16
+                        or inter_dim != tile_n
+                    ):
+                        continue
+                    candidate_func = FmoeTuner.run_1stage_fmoe_g1u1
+                    _data_idx = [0, 1, 2, 3, 4, 5, 6, 7, 9, 19, 20, 17]
+                elif fmoe_func is None:
+                    continue
+                elif not asm_mode.requires_host_sort:
+                    candidate_func = fmoe_func
                     _data_idx = [0, 1, 2, 3, 15, 14, 15, 15, 18, 10, 11, 17]
                 else:
+                    candidate_func = fmoe_func
                     _data_idx = [0, 1, 2, 3, 4, 5, 6, 7, 18, 10, 11, 17]
                 _data_names = [_GEN_DATA_1STAGE_KEYS[i] for i in _data_idx]
                 task_1stage.append(
@@ -2995,7 +3168,7 @@ class FmoeTuner(TunerCommon):
                             use_g1u1,
                             tile_m,
                         ),
-                        fmoe_func,
+                        candidate_func,
                         (
                             _data_names,
                             q_type,
@@ -3005,7 +3178,11 @@ class FmoeTuner(TunerCommon):
                             topk,
                             dtype,
                         ),
-                        {},
+                        (
+                            {"flat": asm_mode}
+                            if asm_mode is AsmMoeMode.POST_REDUCE
+                            else {}
+                        ),
                         (
                             FmoeTuner.torch_moe_blockscale
                             if q_type == QuantType.per_1x128
@@ -3035,7 +3212,11 @@ class FmoeTuner(TunerCommon):
                                     "w2_qt",
                                     "topk_weights",
                                     "topk_ids",
-                                    "a1_scale",
+                                    (
+                                        "a1_scale_t"
+                                        if asm_mode is AsmMoeMode.POST_REDUCE
+                                        else "a1_scale"
+                                    ),
                                     "w1_scale",
                                     "w2_scale",
                                 ],
@@ -3074,9 +3255,12 @@ class FmoeTuner(TunerCommon):
                 if inter_dim % tile_n != 0 or smf != 0:
                     continue
                 for el in xbf16_kernels.get((tile_m, tile_n, 0), []):
-                    # xbf16: internal quant; FLAT kernels (manifest flat=1) take raw topk.
-                    flat_flag = int(xbf16_flat.get(el, 0))
-                    if flat_flag:
+                    # xbf16: internal quant; only no_sort/emsort take raw topk.
+                    flat_flag = int(xbf16_flat.get(el, AsmMoeMode.SORTED))
+                    asm_mode = AsmMoeMode(flat_flag)
+                    if asm_mode is AsmMoeMode.POST_REDUCE:
+                        continue
+                    if not asm_mode.requires_host_sort:
                         _data_idx = [0, 0, 2, 3, 15, 14, 15, 15, 18, 10, 11, 17]
                     else:
                         _data_idx = [0, 0, 2, 3, 4, 5, 6, 7, 18, 10, 11, 17]
@@ -3680,9 +3864,21 @@ class FmoeTuner(TunerCommon):
             doweight_stage1,
         ) = info
 
-        if q_type != QuantType.per_1x32 or q_dtype_w not in (
-            dtypes.fp4x2,
-            dtypes.fp8,
+        # a16w16: bf16 A x bf16 W on the a16w-mix port, the kernel the runtime
+        # selects for BF16 QuantType.No when swiglu_limit is active.
+        # Arch list matches fused_moe._A16WMIX_BF16_ARCHS: the port's
+        # non-gfx942 path is gfx950 MFMA; gfx90a does not compile.
+        is_a16w16 = (
+            q_type == QuantType.No
+            and dtype == dtypes.bf16
+            and q_dtype_a == dtypes.bf16
+            and q_dtype_w == dtypes.bf16
+            and act_type in (ActivationType.Silu, ActivationType.Swiglu)
+            and not doweight_stage1
+            and str(_gfx) in ("gfx942", "gfx950")
+        )
+        if not is_a16w16 and (
+            q_type != QuantType.per_1x32 or q_dtype_w not in (dtypes.fp4x2, dtypes.fp8)
         ):
             return tasks_flydsl
 
@@ -3700,12 +3896,26 @@ class FmoeTuner(TunerCommon):
         b_dtype_str = "fp8" if q_dtype_w == dtypes.fp8 else "fp4"
         out_dtype_str = "bf16" if dtype == dtypes.bf16 else "f16"
 
-        flydsl_s1_kernels = get_flydsl_stage1_kernels(
-            a_dtype_str, b_dtype_str, out_dtype_str
-        )
-        flydsl_s2_kernels = get_flydsl_stage2_kernels(
-            a_dtype_str, b_dtype_str, out_dtype_str
-        )
+        if is_a16w16:
+            b_dtype_str = "bf16"
+            # The a16w-mix port has no f16 output. AOT replay
+            # (aiter.aot.flydsl.moe._caller_inputs) only has a QuantType.No
+            # bf16×bf16 recipe; f16 names would break PREBUILD_KERNELS=1.
+            out_dtype_str = "bf16"
+            # The runtime wrapper passes waves_per_eu=None for registry entries
+            # without the key; run_flydsl_stage1_out would otherwise time wpe=3.
+            flydsl_s1_kernels = {
+                k: {**v, "waves_per_eu": None}
+                for k, v in get_flydsl_stage1_kernels_a16w16(out_dtype_str).items()
+            }
+            flydsl_s2_kernels = get_flydsl_stage2_kernels_a16w16(out_dtype_str)
+        else:
+            flydsl_s1_kernels = get_flydsl_stage1_kernels(
+                a_dtype_str, b_dtype_str, out_dtype_str
+            )
+            flydsl_s2_kernels = get_flydsl_stage2_kernels(
+                a_dtype_str, b_dtype_str, out_dtype_str
+            )
 
         for blockM in blockMs:
             # 16 included: a16w4/a8w4 emit t16 names, s1_tile_m drops the rest.
@@ -5210,8 +5420,13 @@ class FmoeTuner(TunerCommon):
             # TUNE_ONLY: comma-list subset gate to isolate sources, e.g.
             #   TUNE_ONLY=flydsl  -> only gen_flydsl_2stages_task
             #   TUNE_ONLY=opus    -> only gen_opus_2stages_task
-            # unset = flydslv2; empty = all (subject to OPUS_ONLY / OPUS_SKIP_CKTILE).
-            tune_only = os.environ.get("TUNE_ONLY", "flydslv2")
+            # unset = flydslv2 if available, otherwise all (OPUS_ONLY applies);
+            # empty = all (subject to OPUS_ONLY / OPUS_SKIP_CKTILE).
+            tune_only = os.environ.get("TUNE_ONLY")
+            v2_tasks = None
+            if tune_only is None:
+                v2_tasks = self.gen_flydsl_v2_2stages_task(info, blockMs)
+                tune_only = "flydslv2" if v2_tasks else ""
             _tune_only = {s for s in tune_only.split(",") if s}
 
             def _want(name, _opus_only=_opus_only, _tune_only=_tune_only):
@@ -5228,7 +5443,11 @@ class FmoeTuner(TunerCommon):
             if _want("flydsl"):
                 tasks_ck.extend(self.gen_flydsl_2stages_task(info, blockMs))
             if _want("flydslv2"):
-                tasks_ck.extend(self.gen_flydsl_v2_2stages_task(info, blockMs))
+                tasks_ck.extend(
+                    v2_tasks
+                    if v2_tasks is not None
+                    else self.gen_flydsl_v2_2stages_task(info, blockMs)
+                )
             if _want("flydsli4"):
                 tasks_ck.extend(self.gen_flydsl_i4_2stages_task(info, blockMs))
             if _want("opus"):
@@ -5268,7 +5487,9 @@ class FmoeTuner(TunerCommon):
         in_data.append((len(all_tasks), ()))
         rets = []
         if len(all_tasks) > 0:
-            ### shape_grouped should be False as multiple stages
+            ### shape_grouped should be False as multiple stages.
+            # fast_mode here means "return every candidate"; it is the only
+            # timing pass, so it picks the winner.
             rets = mp_tuner(
                 all_tasks,
                 in_data,
@@ -5277,6 +5498,8 @@ class FmoeTuner(TunerCommon):
                 False,
                 timeout=args.timeout,
                 verbose=args.verbose,
+                policy=self.policy_for(args),
+                final_timing=True,
             )
 
         # Identify failed cases
@@ -5331,8 +5554,8 @@ class FmoeTuner(TunerCommon):
             resultdf["xbf16"] = 0
         resultdf["xbf16"] = resultdf["xbf16"].fillna(0).astype(int)
         if "flat" not in resultdf.columns:
-            resultdf["flat"] = 0
-        resultdf["flat"] = resultdf["flat"].fillna(0).astype(int)
+            resultdf["flat"] = AsmMoeMode.SORTED.value
+        resultdf["flat"] = resultdf["flat"].fillna(AsmMoeMode.SORTED.value).astype(int)
         if "nt" not in resultdf.columns:
             resultdf["nt"] = 0
         resultdf["nt"] = resultdf["nt"].fillna(0).astype(int)
@@ -5370,10 +5593,20 @@ class FmoeTuner(TunerCommon):
         bests = []
         from collections import defaultdict
 
+        policy = self.policy_for(args)
+        if not getattr(args, "profile_file", ""):
+            ranked_file = policy.profile_file(self.get_out_file(args.tune_file))
+            if ranked_file:
+                args.profile_file = ranked_file
+                print(f"power ranking will be written to {args.profile_file}")
+
         ##group results by info[0](key)
         grouped_rets = defaultdict(list)
-        for info, us, max_err_ratio in results:
-            grouped_rets[tuple(info[0])].append((info[1:], us, max_err_ratio))
+        for el in results:
+            info, us, max_err_ratio = el
+            grouped_rets[tuple(info[0])].append(
+                (info[1:], us, max_err_ratio, getattr(el, "watts", float("nan")))
+            )
         grouped_results = grouped_rets.items()
         for key, rets in grouped_results:
             us_qs_cache = {}
@@ -5396,11 +5629,11 @@ class FmoeTuner(TunerCommon):
             import re
 
             profileDF = []
-            for tail, us, err in rets:
+            for tail, us, err, watts in rets:
                 stage = tail[0]
                 kernelName = tail[1]
                 block_m = tail[2]
-                flat_flag = int(tail[3]) if len(tail) > 3 else 0
+                flat_flag = int(tail[3]) if len(tail) > 3 else AsmMoeMode.SORTED.value
                 v2_flag = int(tail[4]) if len(tail) > 4 else 0
                 nt_flag = int(tail[5]) if len(tail) > 5 else 0
                 tflops, bw = self.calculate((key, stage, kernelName, block_m, us, err))
@@ -5436,6 +5669,7 @@ class FmoeTuner(TunerCommon):
                         flat_flag,
                         v2_flag,
                         nt_flag,
+                        watts,
                     ]
                 )
 
@@ -5455,8 +5689,13 @@ class FmoeTuner(TunerCommon):
                     "flat",
                     "v2",
                     "nt",
+                    "watts",
                 ],
             )
+            # Stage watts are a power-tune column; the latency profile files
+            # keep main's schema.
+            if not policy.measures_power:
+                profileDF = profileDF.drop(columns="watts")
             prorfiles.append(profileDF)
 
             dump_tag = _candidate_dump_tag(
@@ -5494,6 +5733,17 @@ class FmoeTuner(TunerCommon):
                 & (profileDF["us"] != -1)
                 & (profileDF["err"] <= args.errRatio)
             ]
+            # a16w16 stage1 writes a SORTED intermediate that only the a16w16
+            # stage2 reads, and CK stage2 cannot read it; both share BF16
+            # QuantType.No keys, so dedup and pair them on separate sides.
+            profileDF["a16w16"] = (
+                profileDF["kernelName"]
+                .astype(str)
+                .str.startswith(
+                    ("flydsl_moe1_abf16_wbf16_", "flydsl_moe2_abf16_wbf16_")
+                )
+                .astype(int)
+            )
             # Dedup fused (_fp4/_fp8) and non-fused stage1 separately: the fairness
             # penalty below is applied only to non-fused, so dedup must not drop the
             # fused kernel by raw us before that penalty runs. Keep v2 and non-v2
@@ -5501,13 +5751,11 @@ class FmoeTuner(TunerCommon):
             profileDF["_is_fused"] = (
                 profileDF["kernelName"].astype(str).str.endswith(("_fp4", "_fp8"))
             )
-            profileDF = (
-                profileDF.sort_values("us")
-                .drop_duplicates(
-                    ["stage", "block_m", "flat", "nt", "v2", "_is_fused"], keep="first"
-                )
-                .drop(columns=["_is_fused"])
-            )
+            profileDF = policy.sort_frame(profileDF)
+            profileDF = profileDF.drop_duplicates(
+                ["stage", "block_m", "flat", "nt", "v2", "a16w16", "_is_fused"],
+                keep="first",
+            ).drop(columns=["_is_fused"])
             stage1_profileDF = profileDF[profileDF["stage"] == "stage1"].drop(
                 columns=["stage", "flat"]
             )
@@ -5519,6 +5767,7 @@ class FmoeTuner(TunerCommon):
                     "us": "us1",
                     "tflops": "tflops1",
                     "bw": "bw1",
+                    "watts": "watts1",
                 }
             )
             stage1_profileDF = self._pair_nt_agnostic(stage1_profileDF, "kernelName1")
@@ -5532,6 +5781,7 @@ class FmoeTuner(TunerCommon):
                     "us": "us2",
                     "tflops": "tflops2",
                     "bw": "bw2",
+                    "watts": "watts2",
                 }
             )
             stage2_profileDF = self._pair_nt_agnostic(stage2_profileDF, "kernelName2")
@@ -5556,6 +5806,7 @@ class FmoeTuner(TunerCommon):
                     "us": "us1",
                     "tflops": "tflops1",
                     "bw": "bw1",
+                    "watts": "watts1",
                 }
             )
             empty_1stage_profileDF = pd.DataFrame(index=asm_1stage_profileDF.index)
@@ -5565,6 +5816,8 @@ class FmoeTuner(TunerCommon):
             empty_1stage_profileDF["us2"] = 0
             empty_1stage_profileDF["tflops2"] = 0
             empty_1stage_profileDF["bw2"] = 0
+            if "watts1" in asm_1stage_profileDF.columns:
+                empty_1stage_profileDF["watts2"] = float("nan")
             asm_1stage_profileDF = pd.concat(
                 [asm_1stage_profileDF, empty_1stage_profileDF], axis=1
             )
@@ -5594,13 +5847,16 @@ class FmoeTuner(TunerCommon):
                     "block_m",
                     "nt",
                     "v2",
+                    "a16w16",
                 ],
                 how="inner",
             )
             profileDF["run_1stage"] = 0
             profileDF["xbf16"] = 0
-            profileDF["flat"] = 0
-            profileDF = pd.concat([profileDF, asm_1stage_profileDF], axis=0)
+            profileDF["flat"] = AsmMoeMode.SORTED.value
+            profileDF = pd.concat(
+                [profileDF, asm_1stage_profileDF], axis=0, ignore_index=True
+            )
             if len(profileDF) == 0:
                 print(
                     f"no valid candidate found for {key}, please check the time or errRatio in all result file running with --profile_file"
@@ -5694,7 +5950,11 @@ class FmoeTuner(TunerCommon):
                     # v2 pairs also fuse fp4-quant+sort into gemm1 -> skip.
                     is_fp4 = profileDF["kernelName1"].astype(str).str.endswith("_fp4")
                     is_v2 = profileDF["v2"].astype(int) == 1
-                    add_qs = ~is_fp4 & ~is_v2
+                    add_qs = (
+                        ~is_fp4
+                        & ~is_v2
+                        & (profileDF["flat"] != AsmMoeMode.POST_REDUCE.value)
+                    )
                     profileDF.loc[add_qs, "us1"] = (
                         profileDF.loc[add_qs, "us1"]
                         + profileDF.loc[add_qs, "us_quant_sort"]
@@ -5751,9 +6011,17 @@ class FmoeTuner(TunerCommon):
                     profileDF.loc[non_xbf16, "us1"] + us_quant
                 )
 
-            # moe_sorting fairness: nonzero flat sorts internally (flat=1 one-token
-            # grid, flat=2 EMSORT). Add the host sort cost to flat=0 rows only.
-            has_flat = "flat" in profileDF.columns and (profileDF["flat"] != 0).any()
+            # Only no_sort/emsort avoid the host sort; post_reduce is sorted input.
+            host_sort_modes = [
+                mode.value for mode in AsmMoeMode if mode.requires_host_sort
+            ]
+            raw_route_modes = [
+                mode.value for mode in AsmMoeMode if not mode.requires_host_sort
+            ]
+            has_flat = (
+                "flat" in profileDF.columns
+                and profileDF["flat"].isin(raw_route_modes).any()
+            )
             if has_flat:
                 from aiter.fused_moe import moe_sorting
                 from aiter.test_common import run_perftest
@@ -5783,7 +6051,7 @@ class FmoeTuner(TunerCommon):
                         us_sort_cache[bm] = 0.0
                 print(f"  moe_sorting benchmark per block_m: {us_sort_cache}")
                 profileDF["us_moe_sort"] = profileDF["block_m"].map(us_sort_cache)
-                non_flat = profileDF["flat"] == 0
+                non_flat = profileDF["flat"].isin(host_sort_modes)
                 profileDF.loc[non_flat, "us1"] = (
                     profileDF.loc[non_flat, "us1"]
                     + profileDF.loc[non_flat, "us_moe_sort"]
@@ -5801,8 +6069,8 @@ class FmoeTuner(TunerCommon):
             # (additive fairness + idxmin) stays exactly as it was.
             if has_flat:
                 try:
-                    flat_mask = profileDF["flat"] != 0
-                    nf_mask = profileDF["flat"] == 0
+                    flat_mask = profileDF["flat"].isin(raw_route_modes)
+                    nf_mask = profileDF["flat"].isin(host_sort_modes)
                     if not (flat_mask.any() and nf_mask.any()):
                         raise RuntimeError("missing FLAT or non-FLAT class")
                     # Rank candidates by us1+us2 (us2 is 0 for 1-stage rows,
@@ -5904,7 +6172,7 @@ class FmoeTuner(TunerCommon):
                             model_dim,
                             dtype,
                             1,
-                            flat=True,
+                            flat=AsmMoeMode.NO_SORT,
                         )
                         aiter.fmoe_fp8_blockscale_g1u1(
                             mbuf,
@@ -5977,11 +6245,21 @@ class FmoeTuner(TunerCommon):
                         f"(bm={nf_block_m}) us={us_nf_e2e}",
                         flush=True,
                     )
+                    flat_e2e = {"us": us_flat_e2e}
+                    nf_e2e = {"us": us_nf_e2e}
+                    policy.record(flat_e2e, "watts", _flat_seq, kernel_us=us_flat_e2e)
+                    policy.record(nf_e2e, "watts", _nf_seq, kernel_us=us_nf_e2e)
+                    if "watts" in flat_e2e:
+                        print(
+                            f"  e2e power: FLAT{policy.watt_text(flat_e2e['watts'])}; "
+                            f"non-FLAT{policy.watt_text(nf_e2e['watts'])}",
+                            flush=True,
+                        )
                     # Asymmetric override: only drop FLAT when non-FLAT truly
-                    # wins by a non-noise margin. Otherwise leave profileDF
-                    # untouched and let additive-fairness idxmin decide.
-                    margin_us = 0.5
-                    if us_flat_e2e > us_nf_e2e + margin_us:
+                    # wins (by a non-noise margin for latency). Otherwise leave
+                    # profileDF untouched and let additive-fairness idxmin decide.
+                    drop_flat = policy.beats(flat_e2e, nf_e2e, latency_margin_us=0.5)
+                    if drop_flat:
                         dropped = int(flat_mask.sum())
                         profileDF = profileDF[~flat_mask].copy()
                         print(
@@ -6008,6 +6286,8 @@ class FmoeTuner(TunerCommon):
             # dump already carries internal columns like stage/flat/ksplit.)
             if "v2" in profileDF.columns:
                 profileDF = profileDF.drop(columns=["v2"])
+            if "a16w16" in profileDF.columns:
+                profileDF = profileDF.drop(columns=["a16w16"])
             profileDF["us"] = round(profileDF["us1"] + profileDF["us2"], 4)
             results = profileDF.apply(
                 lambda row: self.calculate(
@@ -6028,17 +6308,44 @@ class FmoeTuner(TunerCommon):
             profileDF.drop(["tflops1", "tflops2", "bw1", "bw2"], axis=1, inplace=True)
             profileDF["err1"] = profileDF["err1"].apply(lambda x: f"{x:.1%}")
             profileDF["err2"] = profileDF["err2"].apply(lambda x: f"{x:.1%}")
+            ranked = rank_moe_pairs(profileDF, policy)
             if args.profile_file != "":
                 if os.path.exists(args.profile_file):
                     old_df = pd.read_csv(args.profile_file)
                 else:
                     old_df = pd.DataFrame(columns=self.columns)
-                tmpprofileDF = pd.concat([old_df, profileDF], ignore_index=True)
+                tmpprofileDF = pd.concat([old_df, ranked], ignore_index=True)
                 tmpprofileDF.to_csv(args.profile_file, index=False)
-            best_one = profileDF.loc[profileDF["us"].idxmin()].copy()
+            # The first preferred row: lowest us in latency mode (same as
+            # idxmin), lowest energy in power mode.
+            best_one = policy.sort_frame(ranked).iloc[0].copy()
+            latency_one = ranked.loc[
+                pd.to_numeric(ranked["us"], errors="coerce").idxmin()
+            ]
+            energy_text = (
+                f", rank={best_one.get('rank', 1)} energy={best_one['energy']} "
+                f"tflops_per_w={best_one.get('tflops_per_w', float('nan'))}"
+                if "energy" in ranked.columns
+                else ""
+            )
             print(
                 f"Tuning result for {key} is {best_one['block_m'], best_one['kernelName1'], best_one['kernelName2'], best_one['err1'], best_one['err2'], best_one['run_1stage']} {best_one['us']} us, {best_one['tflops']} TFLOPS, {best_one['bw']} GB/s"
+                + energy_text
             )
+            if "energy" in ranked.columns:
+                for _, cand in ranked.head(5).iterrows():
+                    print(
+                        f"  rank {int(cand['rank'])}: energy={cand['energy']} "
+                        f"us={cand['us']} W={cand.get('watts', float('nan'))} "
+                        f"{cand['kernelName1']} / {cand['kernelName2']}"
+                    )
+            if policy.measures_power and best_one.name != latency_one.name:
+                print(
+                    f"Latency winner differs: block_m={latency_one['block_m']} "
+                    f"{latency_one['kernelName1']} / {latency_one['kernelName2']} "
+                    f"{latency_one['us']} us, "
+                    f"tflops_per_w={latency_one.get('tflops_per_w', float('nan'))}"
+                )
             best_one["act_type"] = str(best_one["act_type"])
             best_one["q_type"] = str(best_one["q_type"])
             best_one["dtype"] = str(best_one["dtype"])
@@ -6071,7 +6378,7 @@ class FmoeTuner(TunerCommon):
                 )
             else:
                 self.tunedf = None
-            self.untunedf["gfx"] = get_gfx_runtime()
+            self.untunedf["gfx"] = self.get_gfx()
             self.untunedf["cu_num"] = self.get_cu_num()
             # Migrate a legacy tuned file that predates the gfx column so the
             # untuned-vs-tuned dedup below (which now includes gfx) doesn't fail.
@@ -6091,12 +6398,15 @@ class FmoeTuner(TunerCommon):
                     if col in self.untunedf.columns and col in self.tunedf.columns
                 ]
                 if len(dedup_cols) == len(self.keys):
-                    mask = (
-                        self.untunedf[dedup_cols]
-                        .apply(tuple, axis=1)
-                        .isin(self.tunedf[dedup_cols].apply(tuple, axis=1))
-                    )
+                    mask = self._already_tuned_mask(dedup_cols)
                     self.untunedf = self.untunedf[~mask]
+
+    def _already_tuned_mask(self, dedup_cols: "list[str]") -> "pd.Series":
+        return (
+            self.untunedf[dedup_cols]
+            .apply(tuple, axis=1)
+            .isin(self.tunedf[dedup_cols].apply(tuple, axis=1))
+        )
 
     def e2e_tune(self, args):
         """
@@ -6520,7 +6830,9 @@ class GroupedFmoeTuner(FmoeTuner):
             _, us = run_perftest(
                 _call, num_warmup=int(args.warmup), num_iters=int(args.iters)
             )
-            return round(float(us), 4)
+            us = round(float(us), 4)
+            self.policy_for(args).record(candidate, "watts", _call, kernel_us=us)
+            return us
         finally:
             if old_config is None:
                 os.environ.pop("AITER_CONFIG_GROUPED_FMOE", None)
@@ -6543,6 +6855,7 @@ class GroupedFmoeTuner(FmoeTuner):
     def tune(self, untunedf, tunedf, args):
         self._require_supported_fast_scan(args)
         del tunedf
+        policy = self.policy_for(args)
         # Refuse an output file that the write-back cannot keep blank-free
         # before timing anything.
         self._write_layout(self.get_out_file(args.tune_file))
@@ -6554,12 +6867,14 @@ class GroupedFmoeTuner(FmoeTuner):
                 try:
                     us = self._run_candidate(row, candidate, args)
                     candidate["us"] = us
+                    watt_text = policy.watt_text(candidate.get("watts"))
                     print(
                         f"[grouped] token={row['token']} inter={row['inter_dim']} "
-                        f"qa={row['q_dtype_a']} tile_m={candidate['tile_m']} us={us}",
+                        f"qa={row['q_dtype_a']} tile_m={candidate['tile_m']} "
+                        f"us={us}{watt_text}",
                         flush=True,
                     )
-                    if best is None or us < float(best["us"]):
+                    if policy.beats(best, candidate):
                         best = candidate
                 except Exception as exc:  # noqa: BLE001
                     failures.append(f"tile_m={candidate['tile_m']}: {exc}")
@@ -6579,7 +6894,7 @@ class GroupedFmoeTuner(FmoeTuner):
 
     def post_process(self, results, args, topk=-1, fast_mode=False):
         del args, topk, fast_mode
-        return pd.DataFrame(results, columns=self.columns)
+        return _frame_keeping_watts(self.columns, results)
 
     # What grouped_moe_gfx1250 (and the AOT parser, for split_k*) reads a blank
     # cell as: the value of another column of the same row, or a constant.
@@ -6712,11 +7027,13 @@ class Mxfp4FlydslTuner(FmoeTuner):
     """Tune the FlyDSL mxfp4 a4w4 *port* (flydsl_mxmoe_g{1,2}_a4w4_*) as one coupled
     unit.
 
-    By default, prune GEMM1 using M_est = ceil(token * topk / expert). This
-    reduces candidate evaluation work and is expected to shorten tuning wall
-    time; the actual speedup has not been measured. Kernel performance and
-    winner retention on unseen shapes require separate validation. Use
-    --mxfp4-search-mode full to enumerate all statically supported GEMM1 variants.
+    By default, prune GEMM1 using M_est = ceil(token * topk / expert) and screen
+    the pruned stages (staged search); with --fast-scan and no explicit mode,
+    every pruned pair is scanned instead. Pruning reduces candidate evaluation
+    work and is expected to shorten tuning wall time; the actual speedup has not
+    been measured. Kernel performance and winner retention on unseen shapes
+    require separate validation. Use --mxfp4-search-mode full to enumerate all
+    statically supported GEMM1 variants.
     """
 
     SUPPORTS_FAST_SCAN = True
@@ -6730,7 +7047,9 @@ class Mxfp4FlydslTuner(FmoeTuner):
             help="Scan every candidate with lightweight timing. Candidates are "
             "accuracy-checked and scored by summed active GPU-kernel time; "
             "inaccurate candidates are skipped, and only the fastest valid "
-            "candidates are retimed with --fast-scan-final-iters.",
+            "candidates are retimed with --fast-scan-final-iters. "
+            "--select power retimes every accurate candidate and ranks them "
+            "by package energy instead of that latency shortlist.",
         )
         self.parser.add_argument(
             "--fast-scan-warmup-accuracy-checks",
@@ -6762,6 +7081,232 @@ class Mxfp4FlydslTuner(FmoeTuner):
             "--fast-scan-final-iters (default: 5). One additional non-duplicate "
             "accuracy candidate is promoted when available.",
         )
+        for action in self.parser._actions:
+            if action.dest == "timeout":
+                action.help = (
+                    "best-effort per-operation SIGALRM timeout in seconds (default 1800); "
+                    "needs control to return to Python. No parent or shape hard deadline; "
+                    "a still-live permanent hang may wait indefinitely."
+                )
+
+    input_metadata: ClassVar[tuple[str, ...]] = ("gate_mode",)
+    PROFILE_HELP: ClassVar[str] = (
+        "ordinary fMoE profiling output; the dedicated --mxfp4-flydsl tuner "
+        "does not write stage-ranking or full-pair profile artifacts"
+    )
+
+    @staticmethod
+    def _capture_configuration() -> "dict[str, float | None]":
+        limit, _source = resolve_swiglu_limit()
+        return {"swiglu_limit": limit}
+
+    def _invocation_configuration(
+        self, args: "argparse.Namespace | SimpleNamespace | None" = None
+    ) -> "dict[str, float | None]":
+        # Callers keep these variables unchanged for the whole run.
+        if args is not None and hasattr(args, "mxfp4_configuration"):
+            self._configuration = args.mxfp4_configuration
+        elif args is not None or not hasattr(self, "_configuration"):
+            self._configuration = self._capture_configuration()
+        if args is not None:
+            args.mxfp4_configuration = self._configuration
+        return self._configuration
+
+    def _require_distinct_input_output(
+        self, args: "argparse.Namespace | SimpleNamespace"
+    ) -> "None":
+        input_file = args.untune_file
+        output_file = self.get_out_file(args.tune_file)
+        same_file = os.path.realpath(input_file) == os.path.realpath(output_file)
+        if not same_file and os.path.exists(input_file) and os.path.exists(output_file):
+            same_file = os.path.samefile(input_file, output_file)
+        if same_file:
+            self.parser.error(
+                "--mxfp4-flydsl requires different input and output files "
+                "(-i/--untune_file and -o/--tune_file)"
+            )
+
+    def parse_args(self) -> "argparse.Namespace":
+        args = super().parse_args()
+        self._require_distinct_input_output(args)
+        self._configuration = self._capture_configuration()
+        args.mxfp4_configuration = self._configuration
+        return args
+
+    def pre_process(self, args: "argparse.Namespace | SimpleNamespace") -> "None":
+        self._require_distinct_input_output(args)
+        self._invocation_configuration(args)
+        return super().pre_process(args)
+
+    def _unsupported_row_reason(
+        self, row: "Mapping[str, object] | pd.Series"
+    ) -> "str | None":
+        for field, expected in (
+            ("dtype", dtypes.bf16),
+            ("q_dtype_a", dtypes.fp4x2),
+            ("q_dtype_w", dtypes.fp4x2),
+            ("q_type", QuantType.per_1x32),
+        ):
+            if str(row.get(field)) != str(expected):
+                return f"{field} must be {expected}, got {row.get(field)!r}"
+        for field, allowed in (
+            ("use_g1u1", ("1", "1.0", "true")),
+            ("doweight_stage1", ("0", "0.0", "false")),
+        ):
+            if str(row.get(field)).lower() not in allowed:
+                return f"{field} must be {allowed[0]}, got {row.get(field)!r}"
+        activation = str(row.get("act_type")).rsplit(".", 1)[-1].lower()
+        if activation not in ("silu", "situv2", "swiglu"):
+            return f"unsupported act_type: {row.get('act_type')!r}"
+        if (
+            activation == "situv2"
+            and self._invocation_configuration()["swiglu_limit"] is not None
+        ):
+            return "MXMOE cannot apply a configured swiglu_limit to Situv2"
+        gate = row.get("gate_mode", "separated")
+        if pd.isna(gate) or str(gate).strip() == "":
+            gate = "separated"
+        if str(gate).rsplit(".", 1)[-1].lower() != "separated":
+            return f"gate_mode must be separated, got {gate!r}"
+        for field in ("token", "model_dim", "inter_dim", "expert", "topk"):
+            try:
+                value = int(row.get(field, 0))
+                if value > 0 and value == float(row[field]):
+                    continue
+            except (TypeError, ValueError, OverflowError):
+                pass
+            return f"{field} must be a positive integer, got {row.get(field)!r}"
+        if int(row["topk"]) > int(row["expert"]):
+            return "topk must not exceed expert count"
+        return None
+
+    @staticmethod
+    def _names_kernel(tunedf: "pd.DataFrame") -> "pd.Series":
+        """Rows naming a kernel are live configs, even without a timing."""
+        names = [c for c in ("kernelName1", "kernelName2") if c in tunedf]
+        kernels = tunedf[names].fillna("").astype(str)
+        return kernels.apply(lambda c: c.str.strip().ne("")).any(axis=1)
+
+    def _drop_superseded_rows(
+        self, tunedf: "pd.DataFrame", dedup_keys: "list[str]"
+    ) -> "pd.DataFrame":
+        """Drop only rows the runtime can never load.
+
+        get_cfg_2stages uses the first row per key, and a later one only as an
+        activation fallback, which skips MXFP4 and CK 2-stage kernels. A row
+        without a kernel is dropped when a configured row has its key, since the
+        runtime would otherwise serve whichever of the two comes first.
+        """
+        del dedup_keys
+        configured = self._names_kernel(tunedf)
+        keys = tunedf.loc[configured, self.keys].astype(str)
+        later = keys.duplicated(keep="first").reindex(tunedf.index, fill_value=False)
+        configured_keys = set(keys.itertuples(index=False, name=None))
+        placeholder = ~configured & pd.Series(
+            [
+                key in configured_keys
+                for key in tunedf[self.keys]
+                .astype(str)
+                .itertuples(index=False, name=None)
+            ],
+            index=tunedf.index,
+            dtype=bool,
+        )
+        kernel1 = tunedf.get("kernelName1", pd.Series("", index=tunedf.index))
+        kernel2 = tunedf.get("kernelName2", pd.Series("", index=tunedf.index))
+        no_fallback = (
+            kernel1.fillna("").astype(str).str.contains("moe_ck2stages")
+            | kernel1.map(_is_mxfp4_kname)
+            | kernel2.map(_is_mxfp4_kname)
+        )
+        return tunedf[~(later & no_fallback) & ~placeholder]
+
+    def _already_tuned_mask(self, dedup_cols: "list[str]") -> "pd.Series":
+        configured = self.tunedf[self._names_kernel(self.tunedf)]
+        mask = (
+            self.untunedf[dedup_cols]
+            .apply(tuple, axis=1)
+            .isin(configured[dedup_cols].apply(tuple, axis=1))
+        )
+        unsupported = self.untunedf.apply(
+            lambda row: self._unsupported_row_reason(row) is not None, axis=1
+        )
+        return mask & ~unsupported
+
+    @staticmethod
+    def _runtime_device_identity(gpu: "int") -> "tuple[str, int]":
+        properties = torch.cuda.get_device_properties(gpu)
+        arch = str(properties.gcnArchName).split(":", 1)[0].lower()
+        cu = int(properties.multi_processor_count)
+        if arch != "gfx950":
+            raise ValueError(f"MXFP4 tuning GPU{gpu} must be gfx950, got {arch}")
+        return arch, cu
+
+    def get_gfx(self) -> "str":
+        # Single-slot pruned and full runs use the current GPU.
+        return (
+            str(
+                torch.cuda.get_device_properties(
+                    torch.cuda.current_device()
+                ).gcnArchName
+            )
+            .split(":", 1)[0]
+            .lower()
+        )
+
+    def get_cu_num(self) -> "int":
+        return int(
+            torch.cuda.get_device_properties(
+                torch.cuda.current_device()
+            ).multi_processor_count
+        )
+
+    def _preflight_devices(
+        self, mp_num: "int", ngpu: "int", *, staged: "bool" = False
+    ) -> "list[tuple[str, int]]":
+        if ngpu < 1:
+            raise ValueError("MXFP4 tuning requires a visible runtime GPU")
+        selected = (
+            [torch.cuda.current_device()]
+            if mp_num == 1 and not staged
+            else range(mp_num)
+        )
+        return [self._runtime_device_identity(gpu) for gpu in selected]
+
+    def _summary_shape_keys(self) -> "list[str]":
+        # Rows may run on any scheduled GPU; output keeps that GPU's gfx/CU.
+        return [key for key in self.keys if key not in ("gfx", "cu_num")]
+
+    def _normalize_tuned_csv(self, tunedf: "pd.DataFrame") -> "pd.DataFrame":
+        tunedf = super()._normalize_tuned_csv(tunedf)
+        # Runtime ignores only flydsl_fallback rows; every other tag is live.
+        if "_tag" in tunedf:
+            tags = tunedf["_tag"].fillna("").astype(str).str.strip()
+            tunedf = tunedf[tags.ne("flydsl_fallback")]
+        for column in self.columns:
+            if column not in tunedf:
+                tunedf[column] = "" if column.startswith("kernelName") else 0
+        for column in (
+            "block_m",
+            "ksplit",
+            "us1",
+            "us2",
+            "run_1stage",
+            "xbf16",
+            "flat",
+            "tflops",
+            "bw",
+            "nt",
+        ):
+            if column in tunedf:
+                tunedf[column] = pd.to_numeric(tunedf[column], errors="coerce").fillna(
+                    0
+                )
+        tunedf = tunedf.drop(columns=list(self.input_metadata), errors="ignore")
+        # Keep columns owned by other rows of shared files (nt, _tag, ...).
+        return tunedf[
+            self.columns + [column for column in tunedf if column not in self.columns]
+        ]
 
     ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
         **FmoeTuner.ARG_DEFAULTS,
@@ -6787,19 +7332,25 @@ class Mxfp4FlydslTuner(FmoeTuner):
         k_wave=1,
         xcd_swizzle=0,
         num_waves=4,
+        a_dtype="fp4",
+        out_dtype="fp4",
     ):
-        # flydsl_mxmoe_g1_a4w4_<BM>x<BN>x<BK>[_f16in][_hpf][_nt]
+        # flydsl_mxmoe_g1_a{4,8}w4_<BM>x<BN>x<BK>[_f16in][_hpf][_nt][_fp8out]
         #   [_situv2|_swiglu][_kw<n>][_xcd<n>][_w2];
         # token order must match _parse_mxfp4_g1_kname in mxfp4_kname.py.
+        # The tuner only enumerates A4W4; A8W4 names serve the coupled tests.
         if prefetch_hidden and not inline_quant:
             raise ValueError("hidden prefetch requires inline quantization")
-        name = f"flydsl_mxmoe_g1_a4w4_{bm}x{bn}x{bk}"
+        a_bits = 8 if a_dtype == "fp8" else 4
+        name = f"flydsl_mxmoe_g1_a{a_bits}w4_{bm}x{bn}x{bk}"
         if inline_quant:
             name += "_f16in"
         if prefetch_hidden:
             name += "_hpf"
         if use_nt:
             name += "_nt"
+        if out_dtype == "fp8":
+            name += "_fp8out"
         if act == "situv2":
             name += "_situv2"
         elif act == "swiglu":
@@ -6822,6 +7373,15 @@ class Mxfp4FlydslTuner(FmoeTuner):
     _G1_K_WAVE = (1, 2, 4)
     _G1_NUM_WAVES = (4, 2)
 
+    # Below this M_est, staged search validates every pruned pair, unscreened.
+    _STAGED_SMALL_BATCH_M_EST = 4
+
+    @staticmethod
+    def _m_est(row: dict[str, Any]) -> int:
+        """Estimated tokens per expert: ceil(token * topk / expert)."""
+        ne = int(row["expert"])
+        return (int(row["token"]) * int(row["topk"]) + ne - 1) // ne
+
     @staticmethod
     def _g1_matches_m_est(g1: dict[str, Any], m_est: int) -> bool:
         """Apply M_est allowlists; require an explicit rule for each BM family."""
@@ -6839,7 +7399,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
             return m_est >= 64
         raise ValueError(
             f"Missing GEMM1 pruning rule for BM{bm}; add an M_est pruning rule "
-            "for this BM in Mxfp4FlydslTuner._g1_matches_m_est before using prune mode."
+            "for this BM in Mxfp4FlydslTuner._g1_matches_m_est before pruning by M_est."
         )
 
     def _g1_variants(
@@ -6896,7 +7456,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
                                 )
         if full_search:
             return out
-        m_est = (int(row["token"]) * topk + ne - 1) // ne
+        m_est = self._m_est(row)
         kept = [g1 for g1 in out if self._g1_matches_m_est(g1, m_est)]
         if len(kept) < len(out):
             # Name the shape in full: under --mp the workers' stdout interleaves,
@@ -6957,7 +7517,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
                 "us": 0,
                 "run_1stage": 0,
                 "xbf16": 0,
-                "flat": 0,
+                "flat": AsmMoeMode.SORTED.value,
                 "tflops": 0,
                 "bw": 0,
             }
@@ -6991,8 +7551,16 @@ class Mxfp4FlydslTuner(FmoeTuner):
                 cands.append(self._candidate_row(row, bm, kn1, kn2v))
         return cands
 
+    def _staged_candidate_plan(self, row: "dict[str, object]") -> "StagedSearchPlan":
+        reason = self._unsupported_row_reason(row)
+        if reason is not None:
+            raise ValueError(reason)
+        return build_staged_candidate_plan(
+            row, self._candidate_rows(row, full_search=False)
+        )
+
     @staticmethod
-    def _prepare_case(token, model_dim, inter_dim, expert, topk, dtype):
+    def _prepare_case(token, model_dim, inter_dim, expert, topk, dtype, a_dtype="fp4"):
         data = FmoeTuner.generate_data(
             token,
             model_dim,
@@ -7000,22 +7568,33 @@ class Mxfp4FlydslTuner(FmoeTuner):
             expert,
             topk,
             dtype,
-            dtypes.fp4x2,
+            dtypes.fp8 if a_dtype == "fp8" else dtypes.fp4x2,
             dtypes.fp4x2,
             QuantType.per_1x32,
             True,
             16,
             device="cuda",
         )
+        if a_dtype == "fp8":
+            # generate_data keeps BF16 A for the production reference; the
+            # coupled A8W4 pair is compared against actual MXFP8 A instead.
+            data["a1_qt"], data["a1_scale"] = per_1x32_mx_quant_hip(
+                data["input"],
+                quant_dtype=dtypes.fp8,
+                scale_type=dtypes.fp8_e8m0,
+                shuffle=False,
+            )
         # True a4w4 runs the SEPARATED gate/up layout (gemm1 interleave=False),
-        # so prepare weights/scales with is_guinterleave=False. The interleaved
-        # a16w4/a8w4 layout (is_guinterleave=True) fed to the separated port
-        # produces garbage. w2 (down-proj, no gate/up) is layout-invariant.
+        # so prepare weights/scales with is_guinterleave=False; a8w4 runs the
+        # interleaved layout (is_guinterleave=True). Feeding either layout to
+        # the other port produces garbage. w2 (down-proj, no gate/up) is
+        # layout-invariant.
+        interleave = a_dtype == "fp8"
         data["w1_a16"] = shuffle_weight(
-            data["w1_qt"], (16, 16), is_guinterleave=False, gate_up=True
+            data["w1_qt"], (16, 16), is_guinterleave=interleave, gate_up=True
         )
         data["w1s_a16"] = shuffle_scale(
-            data["w1_scale"], expert, is_guinterleave=False, gate_up=True
+            data["w1_scale"], expert, is_guinterleave=interleave, gate_up=True
         )
         data["w2_a16"] = shuffle_weight(
             data["w2_qt"], (16, 16), is_guinterleave=False, gate_up=False
@@ -7024,6 +7603,17 @@ class Mxfp4FlydslTuner(FmoeTuner):
             data["w2_scale"], expert, is_guinterleave=False, gate_up=False
         )
         return data
+
+    # Every data entry _port_e2e reads; timing rotates exactly these tensors.
+    _PORT_E2E_INPUTS: ClassVar[tuple[str, ...]] = (
+        "input",
+        "w1_a16",
+        "w2_a16",
+        "w1s_a16",
+        "w2s_a16",
+        "topk_ids",
+        "topk_weights",
+    )
 
     @staticmethod
     def _port_e2e(data, kn1, kn2, topk, ne, h, dtype, swiglu_limit=None):
@@ -7056,10 +7646,15 @@ class Mxfp4FlydslTuner(FmoeTuner):
         stage1_input = data["input"]
         stage1_scale = None
         # Keep the tuner aligned with the production fused_moe_2stages pipeline:
-        # BM16 quantizes inline; the other A4W4 variants consume the fused Opus
-        # prequant output.
+        # BM16 quantizes inline; the other variants consume the fused Opus
+        # prequant output in their GEMM1 activation precision.
         if BM != 16:
-            stage1_input, stage1_scale = aiter.fused_dynamic_mxfp4_quant_moe_sort(
+            quant = (
+                aiter.fused_dynamic_mxfp8_quant_moe_sort
+                if p1["a_dtype"] == "fp8"
+                else aiter.fused_dynamic_mxfp4_quant_moe_sort
+            )
+            stage1_input, stage1_scale = quant(
                 input=data["input"],
                 sorted_ids=sti,
                 num_valid_ids=nvi,
@@ -7082,6 +7677,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
             a1_scale=stage1_scale,
             w1_scale=data["w1s_a16"],
             kernelName1=kn1,
+            interleave=p1["a_dtype"] == "fp8",
             m_indices=m_indices,
             moe_buf=moe_buf,
             # _torch_ref runs SiTUv2 at run_torch_moe_stage1's default betas, so
@@ -7106,6 +7702,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
             a2_scale=inter_s,
             block_m=BM,
             sorted_weights=sw,
+            topk_weights=data["topk_weights"],
             kernelName2=kn2,
             reverse_sorted=reverse_sorted,
         )
@@ -7149,7 +7746,10 @@ class Mxfp4FlydslTuner(FmoeTuner):
         reference=None,
         num_warmup=None,
         num_iters=None,
+        final_timing=True,
     ):
+        """Time one pair. ``final_timing`` is False for a coarse screening pass,
+        whose time does not pick the winner."""
         from aiter.test_common import run_perftest
 
         ne, h, e = int(row["expert"]), int(row["model_dim"]), int(row["inter_dim"])
@@ -7161,8 +7761,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
             "swiglu": ActivationType.Swiglu,
             "silu": ActivationType.Silu,
         }[self._row_act(row)]
-        limit_env = os.environ.get("AITER_MXFP4_TUNE_SWIGLU_LIMIT")
-        swiglu_limit = None if limit_env in (None, "") else float(limit_env)
+        swiglu_limit = self._invocation_configuration(args)["swiglu_limit"]
         fast_scan = bool(getattr(args, "fast_scan", False))
         # Never let a finalist retime erase a larger error already observed for
         # this candidate during the coarse pass. `_err` holds the exact ratio;
@@ -7238,15 +7837,30 @@ class Mxfp4FlydslTuner(FmoeTuner):
             ):
                 raise RuntimeError(f"cosine err_ratio {err} > {args.errRatio}")
             timed_warmup = requested_warmup
+        # run_perftest rotates deep copies of its arguments, sized from the
+        # positional tensors; anything a closure captures is never copied.
+        inputs = self._PORT_E2E_INPUTS
+
+        def timed_pipeline(*tensors):
+            return self._port_e2e(
+                dict(zip(inputs, tensors)),
+                kn1,
+                kn2,
+                topk,
+                ne,
+                h,
+                dtype,
+                swiglu_limit=swiglu_limit,
+            )
+
         timed_out, us = run_perftest(
-            lambda: self._port_e2e(
-                data, kn1, kn2, topk, ne, h, dtype, swiglu_limit=swiglu_limit
-            ),
+            timed_pipeline,
+            *(data[key] for key in inputs),
             num_warmup=timed_warmup,
             num_iters=measured_iters,
-            # The MXFP4 funnel owns warm-up explicitly, and its closure has no
-            # rotating arguments. Count every requested profiler sample and skip
-            # the generic memory-probe launch.
+            # The fast-scan funnel owns warm-up explicitly: count every requested
+            # profiler sample, keep one input set and skip the memory-probe launch.
+            # Other modes rotate the inputs so each iteration reads cold data.
             profile_warm_iters=0 if fast_scan else 1,
             num_rotate_args=1 if fast_scan else 0,
         )
@@ -7259,6 +7873,17 @@ class Mxfp4FlydslTuner(FmoeTuner):
         if previously_observed_errors:
             err = max(float(err), *previously_observed_errors)
         us = round(float(us), 4)
+        if not math.isfinite(us) or us <= 0:
+            raise RuntimeError(f"invalid MXFP4 validation time {us}")
+        if final_timing:
+            self.policy_for(args).record(
+                candidate,
+                "watts",
+                lambda: self._port_e2e(
+                    data, kn1, kn2, topk, ne, h, dtype, swiglu_limit=swiglu_limit
+                ),
+                kernel_us=us,
+            )
         # The pair is timed as one unit, so the fused-MoE estimate in calculate()
         # is the right roofline for it. Untuned rows keep dtypes as strings, while
         # calculate() looks bpe up by torch dtype.
@@ -7282,8 +7907,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
         )
         return us
 
-    @staticmethod
-    def _precompile_candidates(row, candidates):
+    def _precompile_candidates(self, row, candidates):
         """Populate the shared FlyDSL cache before GPU validation and timing.
 
         Compile-only workers use CPU dummy tensors, so they neither duplicate
@@ -7306,12 +7930,12 @@ class Mxfp4FlydslTuner(FmoeTuner):
             # SiLU, 7.0 for SwiGLU). Runtime launches pass the tuned clamp
             # instead, so without this the cache misses and the scan JITs
             # during scoring.
-            limit_env = os.environ.get("AITER_MXFP4_TUNE_SWIGLU_LIMIT")
-            if limit_env not in (None, ""):
+            swiglu_limit = self._invocation_configuration()["swiglu_limit"]
+            if swiglu_limit is not None:
                 for job in jobs:
                     if job["stage"] == 1:
                         job["swiglu_limit"] = runtime_swiglu_limit(
-                            float(limit_env), job["act"]
+                            swiglu_limit, job["act"]
                         )
             worker_count = get_max_workers(len(jobs))
             batches = [jobs[index::worker_count] for index in range(worker_count)]
@@ -7347,6 +7971,587 @@ class Mxfp4FlydslTuner(FmoeTuner):
             )
             return 0, 0
 
+    def _screening_limit(self) -> "float | None":
+        return self._invocation_configuration()["swiglu_limit"]
+
+    def _prepare_screening_case(
+        self, row: dict[str, Any], block_m: int, atomic: bool
+    ) -> tuple[dict[str, Any], tuple[torch.Tensor, ...]]:
+        ne, h, e = int(row["expert"]), int(row["model_dim"]), int(row["inter_dim"])
+        token, topk = int(row["token"]), int(row["topk"])
+        data = self._prepare_case(token, h, e, ne, topk, dtypes.bf16)
+        sorting = moe_sorting(
+            data["topk_ids"],
+            data["topk_weights"],
+            ne,
+            h,
+            dtypes.bf16,
+            block_size=block_m,
+            accumulate=atomic,
+            output_aux="opus",
+        )
+        return data, sorting
+
+    @staticmethod
+    def _prepare_gemm1_screening(
+        data: dict[str, Any],
+        sorting: tuple[torch.Tensor, ...],
+        kn1: str,
+        topk: int,
+        swiglu_limit: float | None = None,
+    ) -> tuple[
+        Callable[..., None], tuple[torch.Tensor, ...], torch.Tensor, torch.Tensor
+    ]:
+        """Return (launch, tensors, inter_q, inter_s); time launch(*tensors)."""
+        from aiter.ops.flydsl.mxfp4_gemm1_kernels import flydsl_mxfp4_gemm1
+
+        cfg = _parse_mxfp4_g1_kname(kn1)
+        bm = cfg["BM"]
+        sti, sw, sei, nvi, moe_buf, m_indices, _reverse_sorted = sorting
+        stage1_input, stage1_scale = data["input"], None
+        if bm == 16:
+            if stage1_input.dtype != dtypes.bf16:
+                raise ValueError("GEMM1 BM16 inline quantization requires BF16 input")
+        else:
+            stage1_input, stage1_scale = aiter.fused_dynamic_mxfp4_quant_moe_sort(
+                input=stage1_input,
+                sorted_ids=sti,
+                num_valid_ids=nvi,
+                token_num=stage1_input.shape[0],
+                topk=topk,
+                block_size=bm,
+                sorted_weights=sw,
+                num_experts_upper_bound=data["w1_a16"].shape[0],
+            )
+            if stage1_input.dtype != dtypes.fp4x2 or stage1_scale is None:
+                raise ValueError(
+                    f"GEMM1 BM{bm} requires fused-prequantized FP4 input and scales"
+                )
+        situ_beta = DEFAULT_SITUV2_BETA if cfg["act"] == "situv2" else 1.0
+        situ_linear_beta = DEFAULT_SITUV2_LINEAR_BETA if cfg["act"] == "situv2" else 1.0
+        # Run the wrapper once untimed to allocate buffers; time the kernel only.
+        inter_q, inter_s = _mxfp4_a4w4_stage1_fw(
+            stage1_input,
+            data["w1_a16"],
+            data["w2_a16"],
+            sti,
+            sei,
+            nvi,
+            None,
+            topk,
+            block_m=bm,
+            a1_scale=stage1_scale,
+            w1_scale=data["w1s_a16"],
+            kernelName1=kn1,
+            m_indices=m_indices,
+            moe_buf=moe_buf,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
+            swiglu_limit=runtime_swiglu_limit(swiglu_limit, cfg["act"]),
+        )
+        placeholder = torch.empty(0, device=stage1_input.device, dtype=torch.uint8)
+        # Every tensor the kernel touches, so run_perftest can rotate them.
+        tensor_args = {
+            "a_quant": placeholder if bm == 16 else stage1_input,
+            "a_scale_sorted_shuffled": placeholder if bm == 16 else stage1_scale,
+            "w1_u8": data["w1_a16"].view(torch.uint8),
+            "w1_scale_u8": data["w1s_a16"].view(torch.uint8),
+            "sorted_expert_ids": sei,
+            "cumsum_tensor": nvi,
+            "m_indices": m_indices,
+            "inter_sorted_quant": inter_q,
+            "inter_sorted_shuffled_scale": inter_s,
+            "hidden_states": stage1_input,
+        }
+        names = tuple(tensor_args)
+        kernel = functools.partial(
+            flydsl_mxfp4_gemm1,
+            n_tokens=stage1_input.shape[0],
+            NE=data["w1_a16"].shape[0],
+            D_HIDDEN=data["w2_a16"].shape[1],
+            D_INTER=data["w1_a16"].shape[1] // 2,
+            topk=topk,
+            BM=bm,
+            BN=cfg["BN"],
+            BK=cfg["BK"],
+            use_nt=cfg["use_nt"],
+            inline_quant=cfg["inline_quant"],
+            prefetch_hidden=cfg["prefetch_hidden"],
+            xcd_swizzle=cfg["xcd_swizzle"],
+            num_waves=cfg["num_waves"],
+            k_wave=cfg["k_wave"],
+            interleave=False,
+            a_dtype=cfg["a_dtype"],
+            out_dtype=cfg["out_dtype"],
+            native_scale_layout=bm == 16,
+            act=cfg["act"],
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
+            swiglu_limit=runtime_swiglu_limit(swiglu_limit, cfg["act"]),
+        )
+
+        def launch(*tensors: torch.Tensor) -> None:
+            return kernel(**dict(zip(names, tensors)))
+
+        return launch, tuple(tensor_args.values()), inter_q, inter_s
+
+    def _screen_gemm1(self, row: dict[str, Any], kn1: str, args: Any) -> float:
+        from aiter.test_common import run_perftest
+
+        data, sorting = self._prepare_screening_case(
+            row, _parse_mxfp4_g1_kname(kn1)["BM"], False
+        )
+        launch, tensors, _inter_q, _inter_s = self._prepare_gemm1_screening(
+            data, sorting, kn1, int(row["topk"]), self._screening_limit()
+        )
+        _, us = run_perftest(
+            launch, *tensors, num_warmup=int(args.warmup), num_iters=int(args.iters)
+        )
+        return float(us)
+
+    @staticmethod
+    def _gemm2_screening_call(
+        data: dict[str, Any],
+        sorting: tuple[torch.Tensor, ...],
+        inter_q: torch.Tensor,
+        inter_s: torch.Tensor,
+        kn2: str,
+        topk: int,
+    ) -> tuple[Callable[..., torch.Tensor], tuple[torch.Tensor, ...]]:
+        """Return (launch, tensors); time launch(*tensors) so inputs rotate.
+
+        w1 stays bound: the stage2 wrapper reads only its shape.
+        """
+        cfg = parse_g2_kname_any(kn2)
+        sti, sw, sei, nvi, moe_buf, _m_indices, reverse_sorted = sorting
+        out = moe_buf if moe_buf.numel() else torch.empty_like(data["input"])
+        w1 = data["w1_a16"]
+
+        def launch(
+            inter_q: torch.Tensor,
+            inter_s: torch.Tensor,
+            w2: torch.Tensor,
+            w2_scale: torch.Tensor,
+            sti: torch.Tensor,
+            sw: torch.Tensor,
+            sei: torch.Tensor,
+            nvi: torch.Tensor,
+            out: torch.Tensor,
+            topk_weights: torch.Tensor,
+            reverse_sorted: torch.Tensor,
+        ) -> torch.Tensor:
+            # Atomic output accumulates, so clear it every iteration.
+            if cfg["atomic"]:
+                out.zero_()
+            return _mxfp4_a4w4_stage2_fw(
+                inter_q,
+                w1,
+                w2,
+                sti,
+                sei,
+                nvi,
+                out,
+                topk,
+                w2_scale=w2_scale,
+                a2_scale=inter_s,
+                block_m=cfg["BM"],
+                sorted_weights=sw,
+                topk_weights=topk_weights,
+                kernelName2=kn2,
+                reverse_sorted=reverse_sorted,
+            )
+
+        tensors = (
+            inter_q,
+            inter_s,
+            data["w2_a16"],
+            data["w2s_a16"],
+            sti,
+            sw,
+            sei,
+            nvi,
+            out,
+            data["topk_weights"],
+            reverse_sorted,
+        )
+        return launch, tensors
+
+    def _screen_gemm2(
+        self, row: dict[str, Any], kn1: str, kn2: str, args: Any
+    ) -> float:
+        from aiter.test_common import run_perftest
+
+        cfg = parse_g2_kname_any(kn2)
+        data, sorting = self._prepare_screening_case(row, cfg["BM"], cfg["atomic"])
+        # Run the reference producer once, untimed, for this candidate only.
+        _producer, _producer_tensors, inter_q, inter_s = self._prepare_gemm1_screening(
+            data, sorting, kn1, int(row["topk"]), self._screening_limit()
+        )
+        launch, tensors = self._gemm2_screening_call(
+            data, sorting, inter_q, inter_s, kn2, int(row["topk"])
+        )
+        _, us = run_perftest(
+            launch, *tensors, num_warmup=int(args.warmup), num_iters=int(args.iters)
+        )
+        return float(us)
+
+    @staticmethod
+    def _check_reference_output(
+        ref: torch.Tensor, out: torch.Tensor, err_ratio: float, label: str
+    ) -> bool:
+        err = cosine_diff_compare(ref, out, msg=label)
+        if err is None or not math.isfinite(float(err)) or float(err) > err_ratio:
+            raise RuntimeError(f"cosine err_ratio {err} > {err_ratio}")
+        return True
+
+    def _check_reference_consumer(
+        self, row: dict[str, Any], kn2: str, args: Any
+    ) -> bool:
+        cfg = parse_g2_kname_any(kn2)
+        data, sorting = self._prepare_screening_case(row, cfg["BM"], True)
+        token, topk = int(row["token"]), int(row["topk"])
+        activation = {
+            "silu": ActivationType.Silu,
+            "swiglu": ActivationType.Swiglu,
+            "situv2": ActivationType.Situv2,
+        }[self._row_act(row)]
+        ref1 = FmoeTuner.run_torch_moe_stage1(
+            data["a1_qt"],
+            data["w1_qt"],
+            data["w2_qt"],
+            data["topk_weights"],
+            data["topk_ids"],
+            data["a1_scale"],
+            data["w1_scale"],
+            dtype=dtypes.bf16,
+            activation=activation,
+            quant_type=QuantType.per_1x32,
+            doweight_stage1=False,
+            topk=topk,
+            swiglu_limit=self._screening_limit(),
+        )
+        sti, _sw, _sei, nvi, *_rest = sorting
+        intermediate = {
+            "sti": sti,
+            "cumsum": nvi,
+            "max_sorted": sti.shape[0],
+            "n": int(nvi[0].item()),
+        }
+        # Build the GEMM2 input from the Torch reference, not a GEMM1 kernel.
+        _v2_populate_stage2(
+            {"ref1": ref1, "adtype": "fp4"}, intermediate, token, topk, cfg["BM"]
+        )
+        launch, tensors = self._gemm2_screening_call(
+            data, sorting, intermediate["isq"], intermediate["iss"], kn2, topk
+        )
+        out = launch(*tensors)
+        ref = FmoeTuner.run_torch_moe_stage2(
+            ref1,
+            data["w1_qt"],
+            data["w2_qt"],
+            data["topk_weights"],
+            data["topk_ids"],
+            a2_scale=None,
+            w2_scale=data["w2_scale"],
+            dtype=dtypes.bf16,
+            quant_type=QuantType.per_1x32,
+            doweight_stage1=False,
+        )
+        return self._check_reference_output(
+            ref, out, float(args.errRatio), f"reference consumer[{kn2}]"
+        )
+
+    def _check_reference_pair(
+        self, row: dict[str, Any], kn1: str, kn2: str, args: Any
+    ) -> bool:
+        ne, h, e = int(row["expert"]), int(row["model_dim"]), int(row["inter_dim"])
+        token, topk = int(row["token"]), int(row["topk"])
+        activation = {
+            "silu": ActivationType.Silu,
+            "swiglu": ActivationType.Swiglu,
+            "situv2": ActivationType.Situv2,
+        }[self._row_act(row)]
+        data = self._prepare_case(token, h, e, ne, topk, dtypes.bf16)
+        out = self._port_e2e(
+            data,
+            kn1,
+            kn2,
+            topk,
+            ne,
+            h,
+            dtypes.bf16,
+            swiglu_limit=self._screening_limit(),
+        )
+        ref = self._torch_ref(
+            data, topk, dtypes.bf16, activation, swiglu_limit=self._screening_limit()
+        )
+        return self._check_reference_output(
+            ref, out, float(args.errRatio), f"reference pair[{kn1}+{kn2}]"
+        )
+
+    @contextmanager
+    def _staged_timeout(self, timeout: int) -> Iterator[None]:
+        """Apply one best-effort staged-operation timeout."""
+        import signal
+
+        if timeout <= 0:
+            yield
+            return
+
+        previous_handler = signal.getsignal(signal.SIGALRM)
+        if previous_handler is None:
+            print(
+                "[mxfp4-staged] --timeout disabled because the existing SIGALRM "
+                "handler cannot be restored; a stalled operation may wait "
+                "indefinitely",
+                flush=True,
+            )
+            yield
+            return
+
+        class _StagedOperationTimeout(Exception):
+            pass
+
+        def _on_alarm(signum: int, frame: Any) -> None:
+            raise _StagedOperationTimeout(f"exceeded {timeout}s timeout")
+
+        previous_timer = signal.getitimer(signal.ITIMER_REAL)
+        try:
+            signal.signal(signal.SIGALRM, _on_alarm)
+        except ValueError:
+            print(
+                "[mxfp4-staged] --timeout disabled because SIGALRM cannot be "
+                "installed outside the main thread; a stalled operation may "
+                "wait indefinitely",
+                flush=True,
+            )
+            yield
+            return
+        try:
+            signal.setitimer(signal.ITIMER_REAL, timeout)
+            yield
+        finally:
+            try:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+            finally:
+                signal.signal(signal.SIGALRM, previous_handler)
+                signal.setitimer(signal.ITIMER_REAL, *previous_timer)
+
+    def _screen_candidate(
+        self, launch: Callable[[], float], label: str, timeout: int
+    ) -> float:
+        try:
+            with self._staged_timeout(timeout):
+                us = launch()
+                if not math.isfinite(us) or us <= 0:
+                    raise ValueError(f"non-positive or non-finite screening time: {us}")
+                print(f"[mxfp4-staged] {label} screening us={us}", flush=True)
+                return us
+        except Exception as exc:
+            if _is_accelerator_error(exc):
+                raise
+            print(f"[mxfp4-staged] {label} screening failed: {exc}", flush=True)
+            return self.INVALID_TIME
+
+    def _staged_shortlists(
+        self, row: dict[str, Any], plan: "StagedSearchPlan", args: Any, timeout: int
+    ) -> tuple[dict[Any, Any], dict[Any, Any]]:
+        """Screen GEMM1/GEMM2 per group and return their top-K shortlists."""
+        screen_topk = getattr(args, "mxfp4_screen_topk", DEFAULT_SCREEN_TOPK)
+        gemm2_groups = {group.key: group for group in plan.gemm2_groups}
+        producers = {}
+        for group in plan.gemm1_groups:
+            atomic_group = gemm2_groups.get(
+                GEMM2ScreeningKey(group.key.block_m, AccumulationMode.ATOMIC)
+            )
+            if atomic_group is None:
+                continue
+            consumers = reference_consumer_order(atomic_group.candidates)
+            if not consumers:
+                continue
+            consumer = None
+            for reference in consumers:
+                try:
+                    with self._staged_timeout(timeout):
+                        if self._check_reference_consumer(
+                            row, reference.identity.kernel_name, args
+                        ):
+                            consumer = reference.identity.kernel_name
+                            break
+                        raise RuntimeError(
+                            "reference consumer returned an incorrect output"
+                        )
+                except Exception as exc:
+                    if _is_accelerator_error(exc):
+                        raise
+                    print(
+                        f"[mxfp4-staged] reference consumer "
+                        f"{reference.identity.kernel_name} failed: {exc}",
+                        flush=True,
+                    )
+            if consumer is None:
+                continue
+            preferred = select_reference_producer(group.candidates)
+            producer_order = (preferred,) + tuple(
+                candidate for candidate in group.candidates if candidate != preferred
+            )
+            for reference in producer_order:
+                producer = reference.identity.kernel_name
+                try:
+                    with self._staged_timeout(timeout):
+                        if self._check_reference_pair(row, producer, consumer, args):
+                            producers[group.key.block_m] = producer
+                            break
+                        raise RuntimeError(
+                            "reference producer returned an incorrect output"
+                        )
+                except Exception as exc:
+                    if _is_accelerator_error(exc):
+                        raise
+                    print(
+                        f"[mxfp4-staged] reference producer {producer} failed: {exc}",
+                        flush=True,
+                    )
+
+        gemm1_shortlists = {
+            group.key: screening_shortlist(
+                (
+                    (
+                        candidate,
+                        self._screen_candidate(
+                            functools.partial(
+                                self._screen_gemm1,
+                                row,
+                                candidate.identity.kernel_name,
+                                args,
+                            ),
+                            f"GEMM1 {candidate.identity.kernel_name}",
+                            timeout,
+                        ),
+                    )
+                    for candidate in group.candidates
+                ),
+                screen_topk,
+            )
+            for group in plan.gemm1_groups
+            if group.key.block_m in producers
+        }
+        gemm2_shortlists = {
+            group.key: screening_shortlist(
+                (
+                    (
+                        candidate,
+                        self._screen_candidate(
+                            functools.partial(
+                                self._screen_gemm2,
+                                row,
+                                producers[group.key.block_m],
+                                candidate.identity.kernel_name,
+                                args,
+                            ),
+                            f"GEMM2 {candidate.identity.kernel_name}",
+                            timeout,
+                        ),
+                    )
+                    for candidate in group.candidates
+                ),
+                screen_topk,
+            )
+            for group in plan.gemm2_groups
+            if group.key.block_m in producers
+        }
+        return gemm1_shortlists, gemm2_shortlists
+
+    def _tune_staged_shape(
+        self, row: dict[str, Any], args: Any, timeout: int
+    ) -> dict[str, Any]:
+        plan = self._staged_candidate_plan(row)
+        if not plan.pairs:
+            return _mxfp4_failed_row(self.keys, row, "no pipeline-pair candidates")
+        policy = self.policy_for(args)
+        m_est = self._m_est(row)
+        small_batch = m_est < self._STAGED_SMALL_BATCH_M_EST
+        if small_batch:
+            # Isolated stage time does not predict pipeline time at this scale,
+            # so time every pruned pair end to end.
+            print(
+                f"[mxfp4-staged] small batch M_est={m_est}: validating all "
+                f"{len(plan.pairs)} pruned pairs without screening",
+                flush=True,
+            )
+            gemm1_shortlists, gemm2_shortlists = {}, {}
+        else:
+            gemm1_shortlists, gemm2_shortlists = self._staged_shortlists(
+                row, plan, args, timeout
+            )
+        best = None
+        evaluated_pairs: dict[PipelinePairKey, tuple[float, str | None]] = {}
+        for group in plan.pipeline_groups:
+            gemm1 = {
+                candidate.identity
+                for candidate in gemm1_shortlists.get(group.gemm1_screening_key, ())
+            }
+            gemm2 = {
+                candidate.identity
+                for candidate in gemm2_shortlists.get(group.gemm2_screening_key, ())
+            }
+            shortlisted = tuple(
+                pair
+                for pair in group.pairs
+                if pair.key.gemm1 in gemm1 and pair.key.gemm2 in gemm2
+            )
+            if not shortlisted and not small_batch:
+                print(
+                    f"[mxfp4-staged] exhaustive fallback BM{group.key.block_m} "
+                    f"{group.key.accumulation_mode.value}: no usable reference/shortlist",
+                    flush=True,
+                )
+            group_best = None
+            for pairs in (shortlisted, group.pairs):
+                for pair in pairs:
+                    if pair.key in evaluated_pairs:
+                        continue
+                    candidate = dict(pair.candidate_row)
+                    try:
+                        with self._staged_timeout(timeout):
+                            us = float(self._run_candidate(row, candidate, args))
+                            failure = (
+                                None
+                                if math.isfinite(us) and us > 0
+                                else f"non-positive or non-finite validation time: {us}"
+                            )
+                    except Exception as exc:
+                        if _is_accelerator_error(exc):
+                            raise
+                        us, failure = self.INVALID_TIME, str(exc)
+                    # Cache results, not exceptions (tracebacks hold tensors).
+                    evaluated_pairs[pair.key] = (us, failure)
+                    print(
+                        f"[mxfp4-staged] {candidate['kernelName1']} + "
+                        f"{candidate['kernelName2']} "
+                        + (
+                            f"validation failed: {failure}"
+                            if failure is not None
+                            else f"us={us}"
+                            + (
+                                policy.watt_text(candidate["watts"])
+                                if "watts" in candidate
+                                else ""
+                            )
+                        ),
+                        flush=True,
+                    )
+                    if failure is None and policy.beats(group_best, candidate):
+                        group_best = candidate
+                # Stop after a shortlist winner; fallback runs the whole group.
+                if group_best is not None:
+                    break
+            if group_best is not None and policy.beats(best, group_best):
+                best = group_best
+        if best is None:
+            return _mxfp4_failed_row(self.keys, row, "FAILED: no valid staged pair")
+        return best
+
     def _tune_one_shape(self, row, args):
         """Sweep all (g1, g2) candidates for one shape; return the best row dict.
 
@@ -7358,7 +8563,15 @@ class Mxfp4FlydslTuner(FmoeTuner):
         """
         import signal
 
+        self._invocation_configuration(args)
+        reason = self._unsupported_row_reason(row)
+        if reason is not None:
+            print(f"[mxfp4-port] unsupported shape: {reason}", flush=True)
+            return _mxfp4_failed_row(self.keys, row, f"UNSUPPORTED: {reason}")
+
         timeout = int(getattr(args, "timeout", 0) or 0)
+        if _mxfp4_search_mode(args) == "staged":
+            return self._tune_staged_shape(row, args, timeout)
 
         class _CandidateTimeout(Exception):
             pass
@@ -7373,9 +8586,10 @@ class Mxfp4FlydslTuner(FmoeTuner):
                 timeout = 0  # not on the main thread; cannot arm SIGALRM
 
         candidates = self._candidate_rows(
-            row, full_search=getattr(args, "mxfp4_search_mode", "prune") == "full"
+            row, full_search=_mxfp4_search_mode(args) == "full"
         )
         fast_scan = bool(getattr(args, "fast_scan", False))
+        policy = self.policy_for(args)
         best, failures, successful = None, [], []
 
         # Candidate kernels for one shape consume the same immutable inputs and
@@ -7398,8 +8612,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
                 "swiglu": ActivationType.Swiglu,
                 "silu": ActivationType.Silu,
             }[self._row_act(row)]
-            limit_env = os.environ.get("AITER_MXFP4_TUNE_SWIGLU_LIMIT")
-            swiglu_limit = None if limit_env in (None, "") else float(limit_env)
+            swiglu_limit = self._invocation_configuration(args)["swiglu_limit"]
             # Build the expensive torch reference once per shape. Every coarse
             # warm-up and every final measured output is checked against it.
             # Apply the same swiglu clamp _run_candidate applies per candidate:
@@ -7428,13 +8641,20 @@ class Mxfp4FlydslTuner(FmoeTuner):
                     reference=scan_reference,
                     num_warmup=accuracy_checks if fast_scan else None,
                     num_iters=scan_iters if fast_scan else None,
+                    final_timing=not fast_scan,
                 )
+                watt_text = (
+                    policy.watt_text(candidate["watts"]) if "watts" in candidate else ""
+                )
+                if not math.isfinite(float(us)) or us <= 0:
+                    raise RuntimeError(f"invalid MXFP4 validation time {us}")
                 print(
                     f"[mxfp4-port] token={row['token']} inter={row['inter_dim']} "
-                    f"{candidate['kernelName1']} + {candidate['kernelName2']} us={us}",
+                    f"{candidate['kernelName1']} + {candidate['kernelName2']} "
+                    f"us={us}{watt_text}",
                     flush=True,
                 )
-                if best is None or us < float(best["us"]):
+                if policy.beats(best, candidate):
                     best = candidate
                 if fast_scan:
                     successful.append(candidate)
@@ -7453,7 +8673,16 @@ class Mxfp4FlydslTuner(FmoeTuner):
                 if timeout > 0:
                     signal.alarm(0)
         if fast_scan and successful:
-            finalist_count = max(1, int(getattr(args, "fast_scan_finalists", 5)))
+            shortlist = max(1, int(getattr(args, "fast_scan_finalists", 5)))
+            # A power winner can sit outside the latency shortlist, same as
+            # the hipBLASLt accurate pass timing every heuristic.
+            finalist_count = policy.accurate_count(shortlist, len(successful))
+            if finalist_count != min(shortlist, len(successful)):
+                print(
+                    f"[mxfp4-port] select={policy.name}: retiming all "
+                    f"{finalist_count} accurate candidates",
+                    flush=True,
+                )
             finalist_iters = _parse_fast_scan_iters(
                 getattr(args, "fast_scan_final_iters", 100)
             )
@@ -7513,10 +8742,13 @@ class Mxfp4FlydslTuner(FmoeTuner):
                         num_warmup=0,
                         num_iters=finalist_iters,
                     )
+                    if not math.isfinite(float(us)) or us <= 0:
+                        raise RuntimeError(f"invalid MXFP4 validation time {us}")
+                    watt_text = policy.watt_text(candidate.get("watts"))
                     print(
                         f"[mxfp4-port] finalist token={row['token']} "
                         f"{candidate['kernelName1']} + "
-                        f"{candidate['kernelName2']} us={us}",
+                        f"{candidate['kernelName2']} us={us}{watt_text}",
                         flush=True,
                     )
                     retimed.append(candidate)
@@ -7540,10 +8772,10 @@ class Mxfp4FlydslTuner(FmoeTuner):
                         signal.alarm(0)
             if retimed:
                 fastest_us = min(float(candidate["us"]) for candidate in retimed)
-                best = _select_mxfp4_finalist(retimed)
+                best = policy.best(retimed, latency_choice=_select_mxfp4_finalist)
                 ranked_finalists = [best] + sorted(
                     (candidate for candidate in retimed if candidate is not best),
-                    key=lambda candidate: float(candidate["us"]),
+                    key=policy.rank_of,
                 )
                 for rank, candidate in enumerate(ranked_finalists, start=1):
                     latency_us = float(candidate["us"])
@@ -7551,12 +8783,13 @@ class Mxfp4FlydslTuner(FmoeTuner):
                     normalized_difference = _normalized_latency_difference(
                         latency_us, fastest_us
                     )
+                    watt_text = policy.watt_text(candidate.get("watts"))
                     print(
                         f"[mxfp4-port] finalist-summary rank={rank} "
                         f"selected={int(candidate is best)} "
                         f"inside_global_gate="
                         f"{int(normalized_difference <= MXFP4_FINAL_GLOBAL_TIMING_GATE)} "
-                        f"us={latency_us:.4f} "
+                        f"us={latency_us:.4f}{watt_text} "
                         f"normalized_diff={normalized_difference:.6f} "
                         f"cosine_error={accuracy_error:.6f} "
                         f"similarity_pct={(1.0 - accuracy_error) * 100:.4f} "
@@ -7565,7 +8798,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
                         flush=True,
                     )
         if best is None:
-            best = candidates[0]
+            best = candidates[0] if candidates else self._candidate_row(row, 0, "", "")
             best["us"] = self.INVALID_TIME
             best["kernelName1"] = ("FAILED: " + "; ".join(failures))[:240]
             print(
@@ -7577,16 +8810,30 @@ class Mxfp4FlydslTuner(FmoeTuner):
 
     def tune(self, untunedf, tunedf, args):
         del tunedf
+        if getattr(args, "fast_scan", False) and _mxfp4_search_mode(args) == "staged":
+            raise ValueError(
+                "--fast-scan applies to pruned or full search, not "
+                "--mxfp4-search-mode staged"
+            )
+        self._invocation_configuration(args)
         rows = [row.to_dict() for _, row in untunedf.iterrows()]
 
-        mp_num = int(getattr(args, "mp", 1) or 1)
-        try:
-            ngpu = torch.cuda.device_count()
-        except Exception:  # noqa: BLE001
-            ngpu = 1
-        mp_num = max(1, min(mp_num, ngpu, len(rows)))
+        if not rows:
+            return []
 
-        if mp_num <= 1:
+        mp_num = int(getattr(args, "mp", 1) or 1)
+        ngpu = torch.cuda.device_count()
+        mp_num = max(1, min(mp_num, ngpu, len(rows)))
+        staged = _mxfp4_search_mode(args) == "staged"
+        identities = (
+            self._preflight_devices(mp_num, ngpu, staged=True)
+            if staged
+            else self._preflight_devices(mp_num, ngpu)
+        )
+
+        if mp_num <= 1 and not staged:
+            for row in rows:
+                row["gfx"], row["cu_num"] = identities[0]
             return [self._tune_one_shape(row, args) for row in rows]
 
         # One fresh process per shape (memory fully released between shapes),
@@ -7598,7 +8845,11 @@ class Mxfp4FlydslTuner(FmoeTuner):
         )
         ctx = _mp.get_context("spawn")
         payloads = [(self.keys, row, args, None) for row in rows]
-        results = _run_shapes_isolated(payloads, mp_num, ctx)
+        results = (
+            _run_staged_shapes_isolated(payloads, mp_num, ctx)
+            if staged
+            else _run_shapes_isolated(payloads, mp_num, ctx)
+        )
         # A None means the shape's process died mid-shape (e.g. a C++ abort()).
         # Report it as a failed shape rather than dropping it, so the run
         # finishes and the failure shows up in the summary.
@@ -7613,28 +8864,20 @@ class Mxfp4FlydslTuner(FmoeTuner):
 
     def post_process(self, results, args, topk=-1, fast_mode=False):
         del args, topk, fast_mode
-        return pd.DataFrame(results, columns=self.columns)
+        return _frame_keeping_watts(self.columns, results)
 
     def result_to_csv(self, results, file, concat=False):
         del concat
         old_tunedf = self.get_tuned_gemm_list(file, self.columns)
-        for col in self.columns:
-            if col not in old_tunedf.columns:
-                if col == "gfx" and "cu_num" in old_tunedf.columns:
-                    old_tunedf[col] = old_tunedf["cu_num"].map(gfx_from_cu_num)
-                else:
-                    old_tunedf[col] = ""
-        valid = results[
-            (results["us"] != self.INVALID_TIME) & (results["us"] != self.INF_TIME)
-        ]
-        invalid = results[
-            (results["us"] == self.INVALID_TIME) | (results["us"] == self.INF_TIME)
-        ]
-        resultdf = self.update_tunedf(old_tunedf, valid)
-        self.success = pd.concat([self.success, valid], ignore_index=True)
+        times = pd.to_numeric(results["us"], errors="coerce")
+        valid = results[(times > 0) & (times < self.INF_TIME)]
+        invalid = results[~results.index.isin(valid.index)]
         self.failed = pd.concat([self.failed, invalid], ignore_index=True)
-        resultdf = resultdf.astype(str).drop_duplicates(subset=self.keys, keep="last")
-        resultdf.to_csv(file, index=False)
+        resultdf = self._normalize_tuned_csv(self.update_tunedf(old_tunedf, valid))
+        # The updated row is the first per key; drop rows it made unreachable.
+        self._drop_superseded_rows(resultdf, self.keys).to_csv(file, index=False)
+        # Count winners only once saved; unsaved shapes report as untuned.
+        self.success = pd.concat([self.success, valid], ignore_index=True)
 
 
 def _mxfp4_tune_shape_worker(payload):
@@ -7646,6 +8889,7 @@ def _mxfp4_tune_shape_worker(payload):
         torch.cuda.set_device(gpu)
         tuner = Mxfp4FlydslTuner.__new__(Mxfp4FlydslTuner)
         tuner.keys = keys
+        row["gfx"], row["cu_num"] = tuner._runtime_device_identity(gpu)
         print(
             f"[mxfp4-port] shape token={row['token']} inter={row['inter_dim']} "
             f"expert={row['expert']} topk={row['topk']} -> GPU{gpu}",
@@ -7672,6 +8916,158 @@ def _mxfp4_shape_proc(payload, out_q, idx):
     """Child entry point: post the shape's result so the parent can tell a
     finished shape apart from a worker that died mid-shape."""
     out_q.put((idx, _mxfp4_tune_shape_worker(payload)))
+
+
+def _mxfp4_staged_shape_proc(
+    payload: tuple[Any, dict[str, Any], Any, int | None], result_tx: Any
+) -> None:
+    """Send one staged shape result through its worker-private Pipe."""
+    try:
+        result_tx.send(_mxfp4_tune_shape_worker(payload))
+    finally:
+        result_tx.close()
+
+
+@dataclass
+class _StagedShapeSlot:
+    proc: Any
+    gpu: int
+    result_rx: Any
+    result_received: bool = False
+    result: dict[str, Any] | None = None
+
+
+def _run_staged_shapes_isolated(
+    payloads: list[tuple[Any, dict[str, Any], Any, int | None]],
+    mp_num: int,
+    ctx: Any,
+    entry: Callable[..., None] = _mxfp4_staged_shape_proc,
+) -> list[dict[str, Any] | None]:
+    """Run each staged shape in a fresh worker with a private result Pipe.
+
+    A GPU is reused only after its worker exits. There is no parent deadline.
+    """
+    results: list[dict[str, Any] | None] = [None] * len(payloads)
+    running: dict[int, _StagedShapeSlot] = {}
+    cleanup_slots: list[_StagedShapeSlot] = []
+    free_gpus = list(range(mp_num))
+    done: set[int] = set()
+    next_payload = 0
+
+    def _receive_result(slot: _StagedShapeSlot) -> None:
+        receive_failed = False
+        try:
+            try:
+                payload = slot.result_rx.recv_bytes()
+            except EOFError:
+                return
+            slot.result = ForkingPickler.loads(payload)
+            slot.result_received = True
+        except BaseException:
+            receive_failed = True
+            raise
+        finally:
+            try:
+                slot.result_rx.close()
+            except BaseException:
+                if not receive_failed:
+                    raise
+
+    try:
+        while len(done) < len(payloads):
+            while next_payload < len(payloads) and free_gpus:
+                gpu = free_gpus.pop(0)
+                keys, row, args, _ = payloads[next_payload]
+                result_rx, result_tx = ctx.Pipe(duplex=False)
+                start_failed = False
+                try:
+                    proc = ctx.Process(
+                        target=entry,
+                        args=((keys, row, args, gpu), result_tx),
+                        daemon=True,
+                    )
+                    slot = _StagedShapeSlot(proc, gpu, result_rx)
+                    cleanup_slots.append(slot)
+                    proc.start()
+                except BaseException:
+                    start_failed = True
+                    try:
+                        result_rx.close()
+                    except BaseException:  # noqa: BLE001,S110
+                        pass
+                    raise
+                finally:
+                    try:
+                        result_tx.close()
+                    except BaseException:
+                        if not start_failed:
+                            raise
+                running[next_payload] = slot
+                next_payload += 1
+
+            waitables = []
+            for slot in running.values():
+                if not slot.result_rx.closed:
+                    waitables.append(slot.result_rx)
+                waitables.append(slot.proc.sentinel)
+            ready = wait_for_connections(waitables)
+
+            for slot in running.values():
+                if not slot.result_rx.closed and slot.result_rx in ready:
+                    _receive_result(slot)
+
+            for idx, slot in list(running.items()):
+                if slot.proc.sentinel not in ready:
+                    continue
+                if not slot.result_rx.closed:
+                    _receive_result(slot)
+                slot.proc.join()
+                exitcode = slot.proc.exitcode
+                if slot.result_received and exitcode == 0:
+                    results[idx] = slot.result
+                else:
+                    print(
+                        f"[mxfp4-port] worker for shape {idx} failed "
+                        f"(exitcode={exitcode}, result_received={slot.result_received})",
+                        flush=True,
+                    )
+                slot.proc.close()
+                cleanup_slots.remove(slot)
+                running.pop(idx)
+                free_gpus.append(slot.gpu)
+                done.add(idx)
+    finally:
+        # Best-effort cleanup of unfinished workers; never mask a raised error.
+        for slot in cleanup_slots:
+            try:
+                if slot.proc.is_alive():
+                    slot.proc.terminate()
+            except BaseException:  # noqa: BLE001,S110
+                pass
+        # Kill workers that survived terminate().
+        for slot in cleanup_slots:
+            try:
+                if slot.proc.is_alive():
+                    slot.proc.kill()
+            except BaseException:  # noqa: BLE001,S110
+                pass
+        for slot in cleanup_slots:
+            try:
+                if slot.proc.pid is not None:
+                    slot.proc.join()
+            except BaseException:  # noqa: BLE001,S110
+                pass
+            try:
+                if not slot.result_rx.closed:
+                    slot.result_rx.close()
+            except BaseException:  # noqa: BLE001,S110
+                pass
+            try:
+                slot.proc.close()
+            except BaseException:  # noqa: BLE001,S110
+                pass
+
+    return results
 
 
 def _run_shapes_isolated(payloads, mp_num, ctx, entry=_mxfp4_shape_proc):
@@ -7766,7 +9162,7 @@ if __name__ == "__main__":
         "us",
         "run_1stage",
         "xbf16",
-        # 1 if FLAT 1stage (manifest flat); else 0.
+        # Serialized AsmMoeMode value from the manifest.
         "flat",
         "tflops",
         "bw",

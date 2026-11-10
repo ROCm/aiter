@@ -557,6 +557,14 @@ namespace py = pybind11;
           py::arg("open_fp8_quant"),                                                 \
           py::arg("reg_inp_ptr"),                                                    \
           py::arg("reg_inp_bytes"));                                                 \
+    m.def("all_reduce_residual",                                                     \
+          &aiter::all_reduce_residual,                                               \
+          py::arg("_fa"),                                                            \
+          py::arg("inp"),                                                            \
+          py::arg("out"),                                                            \
+          py::arg("residual"),                                                       \
+          py::arg("reg_inp_ptr"),                                                    \
+          py::arg("reg_inp_bytes"));                                                 \
     m.def("reduce_scatter",                                                          \
           &aiter::reduce_scatter,                                                    \
           py::arg("_fa"),                                                            \
@@ -602,7 +610,9 @@ namespace py = pybind11;
           py::arg("reg_ptr"),                                                        \
           py::arg("reg_bytes"),                                                      \
           py::arg("use_1stage"),                                                     \
-          py::arg("gemma_norm") = false);                                            \
+          py::arg("gemma_norm")    = false,                                          \
+          py::arg("num_norm_rows") = static_cast<int64_t>(-1),                       \
+          py::arg("skip_residual") = false);                                         \
     m.def("fused_allreduce_rmsnorm_pad",                                             \
           &aiter::fused_allreduce_rmsnorm_pad,                                       \
           py::arg("_fa"),                                                            \
@@ -661,8 +671,9 @@ namespace py = pybind11;
           py::arg("reg_ptr"),                                                        \
           py::arg("reg_bytes"),                                                      \
           py::arg("use_1stage"),                                                     \
-          py::arg("bf16_out_ptr") = static_cast<int64_t>(0),                         \
-          py::arg("gemma_norm")   = false);                                          \
+          py::arg("bf16_out_ptr")    = static_cast<int64_t>(0),                      \
+          py::arg("gemma_norm")      = false,                                        \
+          py::arg("hadamard_rotate") = false);                                       \
     m.def("fused_qknorm_allreduce",                                                  \
           &aiter::fused_qknorm_allreduce,                                            \
           py::arg("_fa"),                                                            \
@@ -693,6 +704,20 @@ namespace py = pybind11;
           py::arg("reg_bytes"));                                                     \
     m.def("dispose", &aiter::dispose, py::arg("_fa"));                               \
     m.def("meta_size", &aiter::meta_size);                                           \
+    m.def("lamportBufferSize", &aiter::lamportBufferSize, py::arg("world_size"));    \
+    m.def("initLamport",                                                             \
+          &aiter::initLamport,                                                       \
+          py::arg("_fa"),                                                            \
+          py::arg("self_ptr"),                                                       \
+          py::arg("ipc_handle_ptrs"),                                                \
+          py::arg("offsets"));                                                       \
+    m.def("lamportKernel", &aiter::lamportKernel, py::arg("_fa"), py::arg("numel")); \
+    m.def("lamportAllReduce",                                                        \
+          &aiter::lamportAllReduce,                                                  \
+          py::arg("_fa"),                                                            \
+          py::arg("inp"),                                                            \
+          py::arg("out"),                                                            \
+          py::arg("kernel"));                                                        \
     m.def("register_input_buffer",                                                   \
           &aiter::register_input_buffer,                                             \
           py::arg("_fa"),                                                            \
@@ -1530,46 +1555,47 @@ namespace py = pybind11;
           py::arg("num_experts"),                      \
           py::arg("num_local_tokens") = std::nullopt);
 
-#define PA_MQA_LOGITS_MXFP4_PYBIND                       \
-    m.def("pa_mqa_logits_mxfp4_build_tiles",             \
-          &pa_mqa_logits_mxfp4_build_tiles,              \
-          py::arg("cu_seq_q"),                           \
-          py::arg("cu_tiles"),                           \
-          py::arg("total_q"),                            \
-          py::arg("max_tiles"),                          \
-          py::arg("q_per_block"));                       \
-    m.def("pa_mqa_logits_mxfp4_build_sched",             \
-          &pa_mqa_logits_mxfp4_build_sched,              \
-          py::arg("cu_tiles"),                           \
-          py::arg("local_starts"),                       \
-          py::arg("local_ends"),                         \
-          py::arg("row_to_batch"),                       \
+#define MQA_LOGITS_MXFP4_PYBIND                          \
+    m.def("mqa_logits_mxfp4_instances",                  \
+          &mqa_logits_mxfp4_instances,                   \
+          py::arg("device_id"),                          \
+          py::arg("out"));                               \
+    m.def("mqa_logits_mxfp4_build_schedule",             \
+          &mqa_logits_mxfp4_build_schedule,              \
+          py::arg("query_start_loc"),                    \
+          py::arg("row_ends"),                           \
+          py::arg("cu_groups"),                          \
           py::arg("cta_info"),                           \
-          py::arg("num_tiles"),                          \
-          py::arg("num_rows"),                           \
+          py::arg("instance"),                           \
           py::arg("num_ctas"),                           \
-          py::arg("cta_resident"),                       \
-          py::arg("block_k"),                            \
-          py::arg("q_per_block"));                       \
-    m.def("pa_mqa_logits_mxfp4_fwd_sched",               \
-          &pa_mqa_logits_mxfp4_fwd_sched,                \
+          py::arg("cta_resident"));                      \
+    m.def("mqa_logits_mxfp4_launch",                     \
+          &mqa_logits_mxfp4_launch,                      \
           py::arg("q"),                                  \
           py::arg("q_scale"),                            \
           py::arg("kv_cache"),                           \
           py::arg("kv_scale"),                           \
-          py::arg("block_tables"),                       \
           py::arg("weights"),                            \
-          py::arg("local_starts"),                       \
-          py::arg("local_ends"),                         \
+          py::arg("block_tables"),                       \
+          py::arg("query_start_loc"),                    \
+          py::arg("row_ends"),                           \
           py::arg("cta_info"),                           \
           py::arg("out"),                                \
-          py::arg("num_rows"),                           \
-          py::arg("num_ctas"),                           \
+          py::arg("out_offsets"),                        \
+          py::arg("kv_bytes"),                           \
+          py::arg("rows"),                               \
+          py::arg("num_seqs"),                           \
+          py::arg("bt_stride"),                          \
+          py::arg("out_stride"),                         \
+          py::arg("instance"),                           \
+          py::arg("schedule_mode"),                      \
           py::arg("weight_scale"),                       \
-          py::arg("kv_block_size"),                      \
-          py::arg("max_seq_len"),                        \
-          py::arg("q_per_block"),                        \
-          py::arg("block_k"));
+          py::arg("tpb_shift"),                          \
+          py::arg("cta_target"),                         \
+          py::arg("prefill_parts"),                      \
+          py::arg("grid"),                               \
+          py::arg("device"),                             \
+          py::arg("stream"));
 
 #define FMHA_FWD_BF16_OPUS_PYBIND                   \
     m.def("fmha_fwd_bf16_opus_fwd",                 \
@@ -1674,7 +1700,8 @@ namespace py = pybind11;
           py::arg("shuffle_scale")   = true,                             \
           py::arg("num_rows")        = std::nullopt,                     \
           py::arg("num_rows_factor") = 1,                                \
-          py::arg("scale_layout_m32k4") = false);                        \
+          py::arg("scale_layout_m32k4") = false,                         \
+          py::arg("hadamard_rotate") = false);                           \
     m.def("dynamic_per_group_scaled_quant_fp4",                          \
           &aiter::dynamic_per_group_scaled_quant_fp4,                    \
           py::arg("out"),                                                \
@@ -1798,7 +1825,7 @@ namespace py = pybind11;
           py::arg("positions"),                                                              \
           py::arg("rope_dim"),                                                               \
           py::arg("group_size")    = 32,                                                     \
-          py::arg("shuffle_scale") = true,                                                   \
+          py::arg("scale_layout") = "none",                                                   \
           py::arg("do_rotate_act") = true,                                                   \
           py::arg("round_rope")    = false);                                                 \
     m.def("rope_rotate_activation",                                                          \
@@ -2107,7 +2134,8 @@ namespace py = pybind11;
           py::arg("rotary_dim") = 0,                                   \
           py::arg("v_norm")     = false,                              \
           py::arg("q_out_fp8")  = py::none(),                          \
-          py::arg("per_tensor_q_scale") = py::none());                 \
+          py::arg("per_tensor_q_scale") = py::none(),                  \
+          py::arg("k_out_unquantized") = py::none());                  \
     m.def("fused_qk_norm_rope_cache_block_quant_shuffle",              \
           &aiter::fused_qk_norm_rope_cache_block_quant_shuffle,        \
           py::arg("qkv"),                                              \
@@ -2859,7 +2887,8 @@ namespace py = pybind11;
           py::arg("D_HIDDEN"),                \
           py::arg("D_INTER"),                 \
           py::arg("MB"),                      \
-          py::arg("prologue"));               \
+          py::arg("prologue"),                \
+          py::arg("num_local_tokens") = std::nullopt); \
     m.def("mxfp4_moe_quant",                  \
           &mxfp4_moe_quant_kernel,            \
           py::arg("a_input"),                 \

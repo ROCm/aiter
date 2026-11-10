@@ -22,12 +22,13 @@ from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a16w4 import (
 from aiter.ops.triton.moe.moe_routing.routing import RoutingData
 from aiter.ops.triton.moe.reduce import reduce_grouped
 from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.device_info import get_num_xcds
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.moe_config_utils import get_moe_dispatch
 
 _LOGGER = AiterTritonLogger()
 
-_GLUON_SUPPORTED_ARCHS = ("gfx1250", "gfx950")
+_GLUON_SUPPORTED_ARCHS = ("gfx1250", "gfx1250-strict", "gfx950")
 
 
 @lru_cache(maxsize=1)
@@ -93,7 +94,7 @@ def allocate_output(
 def get_kernel_config_triton(m, n, k, routing_data):
     block_m = routing_data.block_m
     group_m = 4
-    num_xcds = 8
+    num_xcds = get_num_xcds()
     xcd_swizzle = num_xcds
     w_cache_modifier = ".cg" if block_m <= 32 else None
     split_k = 1
@@ -171,7 +172,7 @@ def get_kernel_config_triton(m, n, k, routing_data):
 def get_kernel_config_gluon_gfx950_pipelined(m, n, k, routing_data):
     block_m = routing_data.block_m
     group_m = 4
-    num_xcds = 8
+    num_xcds = get_num_xcds()
     xcd_swizzle = num_xcds
     w_cache_modifier = ".cg" if block_m <= 32 else None
     num_stages = 2
@@ -235,7 +236,7 @@ def get_kernel_config_gluon_gfx950_pipelined(m, n, k, routing_data):
 def get_kernel_config_gluon_gfx950(m, n, k, routing_data):
     block_m = routing_data.block_m
     group_m = 4
-    num_xcds = 8
+    num_xcds = get_num_xcds()
     xcd_swizzle = num_xcds
     w_cache_modifier = ".cg" if block_m <= 32 else None
     num_stages = 1
@@ -403,7 +404,7 @@ def moe_gemm_a16w4(
         "gluon",
     ), f"Unknown backend '{backend}', must be 'triton' or 'gluon'"
 
-    if get_arch() == "gfx1250":
+    if get_arch() in ("gfx1250", "gfx1250-strict"):
         assert swizzle_mx_scale in (
             None,
             "GFX1250_SCALE",
@@ -443,7 +444,7 @@ def moe_gemm_a16w4(
     if backend == "gluon":
         use_pipelined_gluon = False
 
-        if get_arch() == "gfx1250":
+        if get_arch() in ("gfx1250", "gfx1250-strict"):
             config = get_kernel_config_gluon_gfx1250(M, N, K, routing_data)
         elif get_arch() == "gfx950":
             # Currently on gfx950, gluon kernels requires that swizzling is enabled
@@ -529,7 +530,7 @@ def moe_gemm_a16w4(
 
     # launch kernel
     if backend == "gluon":
-        if get_arch() == "gfx1250":
+        if get_arch() in ("gfx1250", "gfx1250-strict"):
             _moe_gemm_a16w4_gluon[(grid,)](
                 y,
                 y.stride(0),
