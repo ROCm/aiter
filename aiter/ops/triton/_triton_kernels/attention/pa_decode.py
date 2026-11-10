@@ -10,7 +10,6 @@ from aiter.ops.triton.utils.config_utils import (
     resolve_config_dir,
     select_leq_config,
 )
-from aiter.ops.triton.utils.device_info import get_num_sms
 
 # This code is derived from sglang and FLASHNN projects
 # https://github.com/AlibabaPAI/FLASHNN/blob/main/flashnn/triton_kernels/paged_attn.py
@@ -21,19 +20,9 @@ def _load_config() -> dict:
     return load_config_json(f"{cfg_dir}/DEFAULT.json", required=False) or {}
 
 
-def _load_cu_overrides() -> dict:
-    """Keys of `PA-DECODE-CU=<n>.json` that replace DEFAULT.json keys on an n-CU part."""
-    cfg_dir = resolve_config_dir("attention", "PA-DECODE", backend="triton")
-    path = f"{cfg_dir}/PA-DECODE-CU={get_num_sms()}.json"
-    return load_config_json(path, required=False) or {}
-
-
 def _get_dispatch_config(kv_dtype: str) -> dict | None:
     """v1/v2 dispatch rule for a KV-cache dtype, or None if this arch has none."""
-    rule = _load_config().get("dispatch", {}).get(kv_dtype)
-    if rule is None:
-        return None
-    return {**rule, **_load_cu_overrides().get("dispatch", {}).get(kv_dtype, {})}
+    return _load_config().get("dispatch", {}).get(kv_dtype)
 
 
 def _get_launch_config(kernel: str, kv_blk_sz: int) -> dict | None:
@@ -41,7 +30,6 @@ def _get_launch_config(kernel: str, kv_blk_sz: int) -> dict | None:
     table = _load_config().get("launch", {}).get(kernel)
     if table is None:
         return None
-    table = {**table, **_load_cu_overrides().get("launch", {}).get(kernel, {})}
     return select_leq_config(table, kv_blk_sz, prefix="BLK_LEQ_")
 
 

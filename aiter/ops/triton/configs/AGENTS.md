@@ -272,13 +272,9 @@ an arch that runs the GQA decode kernel needs the `v1_w_dot` entry.
 
 - A `split_*` key is optional. Without `split_target_programs` the kernel does
   not split.
-- A part with another CU count can have its own file next to `DEFAULT.json`:
-  `PA-DECODE-CU=<n>.json`. `<n>` is `get_num_sms()`. The file lists only the
-  keys that differ, under `dispatch.<dtype>` and `launch.<kernel>`. A key in
-  `dispatch.<dtype>` replaces the key of `DEFAULT.json`. A key in
-  `launch.<kernel>` (`BLK_LEQ_<x>` or `any`) replaces the whole entry. It must
-  not add a key that `DEFAULT.json` does not have. The loader merges such a key
-  anyway, and only the test rejects it.
+- A part with another CU count has its own tree, `gfx1250/96cu/` for a 96-CU
+  part (see [CU trees](#cu-trees)). The tree is read whole, so it repeats every
+  key of the plain `DEFAULT.json` and changes only the ones that differ.
 - Do not set `num_stages` to 3 or more on gfx1250. It can hang the GPU.
 - Keep `num_stages` at 1 in the gfx1250 PA decode `launch` table. A value of 2
   gave a GPU memory fault in the page-16 GQA kernels on a 96-CU (DPX) part.
