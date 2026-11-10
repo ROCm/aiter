@@ -291,6 +291,11 @@ class PaDecodeQueryLoader:
                 )
                 for qkr in range_constexpr(4 if self.traits.is_bf16_kv else 2):
                     q_ops_all.append(chunk[qkr])
+            for _pad in range_constexpr(
+                self.traits.QKHE_LOOP * (4 if self.traits.is_bf16_kv else 2),
+                self.traits.N_SUBCHUNKS,
+            ):
+                q_ops_all.append(fx.Int64(0))
         return q_ops_all
 
     def _load_operands_mxfp4(self):
@@ -700,6 +705,11 @@ class PaDecodeKVLoader:
             if const_expr(self.traits.block_size == 16):
                 # Overlap page16 gathers.
                 fx.rocdl.sched_barrier(fx.rocdl.mask_vmem_rd)
+        for _pad in range_constexpr(
+            self.traits.QKHE_LOOP * (4 if self.traits.is_bf16_kv else 2),
+            self.traits.N_SUBCHUNKS,
+        ):
+            ops.append(fx.Int64(0))
         return ops  # N_SUBCHUNKS i64 operands
 
     # ---- MXFP4 K/V: packed E2M1 data + E8M0 scales (per 32 dims), loaded raw one tile
@@ -885,12 +895,12 @@ class PaDecodeKVLoader:
                         self.ctx.n_kv
                         * (
                             self.traits.STEPS_PER_PAGE
-                            * self.traits.head_dim
+                            * self.traits.value_dim
                             * self.traits.KV_VECTOR_WIDTH
                         ),
                         (
                             (self.ctx.kv_h * self.traits.STEPS_PER_PAGE + page_step)
-                            * self.traits.head_dim
+                            * self.traits.value_dim
                             + head_element
                         )
                         * self.traits.KV_VECTOR_WIDTH,
@@ -898,8 +908,9 @@ class PaDecodeKVLoader:
                 else:
                     base = self.kv_address(
                         phys_row[sub],
-                        self.ctx.n_kv * (self.traits.head_dim * self.traits.block_size),
-                        (self.ctx.kv_h * self.traits.head_dim + head_element)
+                        self.ctx.n_kv
+                        * (self.traits.value_dim * self.traits.block_size),
+                        (self.ctx.kv_h * self.traits.value_dim + head_element)
                         * self.traits.block_size
                         + page_step * 16,
                     )
@@ -907,7 +918,7 @@ class PaDecodeKVLoader:
                 if const_expr(self.traits.block_size == 16):
                     fx.rocdl.sched_barrier(fx.rocdl.mask_vmem_rd)
                 ops.extend([w[0], w[1]])
-        if const_expr(self.traits.head_dim == 64):
+        if const_expr(self.traits.value_dim == 64):
             fx.rocdl.sched_vmem(len(ops) // 2)
         return ops  # NVOPS i64, the 64-token contiguous run for this head
 
