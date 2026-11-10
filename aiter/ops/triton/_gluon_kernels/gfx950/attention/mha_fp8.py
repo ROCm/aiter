@@ -10,6 +10,7 @@ from triton.language.extra.libdevice import fast_dividef
 from aiter.ops.triton._gluon_kernels.gfx950.attention.mha import (
     _kv_async_copy_layouts,
     _make_kv_shared_layouts,
+    _make_load_layout,
     _stride,
 )
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
@@ -42,24 +43,6 @@ LOG2_FP8_MAX = gl.constexpr(8.807354922057604)
 @gluon.jit
 def fast_maximum(a, b):
     return gl.maximum(a, b, propagate_nan=tl.PropagateNan.ALL)
-
-
-@gluon.constexpr_function
-def blocked_load_layout(head_dim, load_vec, num_warps, transposed, lanes=64):
-    warp_elems = lanes * load_vec
-    if transposed:
-        return gl.BlockedLayout(
-            [load_vec, 1],
-            [head_dim // load_vec, warp_elems // head_dim],
-            [1, num_warps],
-            [0, 1],
-        )
-    return gl.BlockedLayout(
-        [1, load_vec],
-        [warp_elems // head_dim, head_dim // load_vec],
-        [num_warps, 1],
-        [1, 0],
-    )
 
 
 @gluon.jit
@@ -367,10 +350,8 @@ def _mha_varlen_fwd_fp8(
     DOT_LAYOUT_P: gl.constexpr = gl.DotOperandLayout(0, MFMA_LAYOUT, k_width=4)
     DOT_LAYOUT_V: gl.constexpr = gl.DotOperandLayout(1, MFMA_LAYOUT, k_width=4)
 
-    LOAD_LAYOUT_Q: gl.constexpr = blocked_load_layout(
-        HEAD_DIM_NOPE, 16, num_warps, False
-    )
-    LOAD_LAYOUT_Q_PE: gl.constexpr = blocked_load_layout(
+    LOAD_LAYOUT_Q: gl.constexpr = _make_load_layout(HEAD_DIM_NOPE, 16, num_warps, False)
+    LOAD_LAYOUT_Q_PE: gl.constexpr = _make_load_layout(
         HEAD_DIM_PE, 16, num_warps, False
     )
     ASYNC_LAYOUT_K: gl.constexpr = _kv_async_copy_layouts(
@@ -382,7 +363,7 @@ def _mha_varlen_fwd_fp8(
     ASYNC_LAYOUT_V: gl.constexpr = _kv_async_copy_layouts(
         HEAD_DIM_V, BLOCK_N, num_warps, 8, 16
     )[1]
-    STORE_LAYOUT_O: gl.constexpr = blocked_load_layout(HEAD_DIM_V, 8, num_warps, False)
+    STORE_LAYOUT_O: gl.constexpr = _make_load_layout(HEAD_DIM_V, 8, num_warps, False)
 
     SHARED_LAYOUT_K: gl.constexpr = _make_kv_shared_layouts(HEAD_DIM_NOPE, BLOCK_N, 8)[
         0

@@ -242,8 +242,12 @@ def mha_varlen_fwd(
     Args:
         q, k: [T, H, d_qk] float8_e4m3fn. v: [T, H, d_v] float8_e4m3fn. The last dim is contiguous.
         cu_seqlens_q, cu_seqlens_k: [batch + 1] int32 cumulative sequence lengths.
-        max_seqlen_q, max_seqlen_k: largest sequence lengths in the batch.
-        q_descale, k_descale, v_descale: one-element fp32 tensors, the per-tensor dequant scales.
+        max_seqlen_q, max_seqlen_k: largest sequence lengths in the batch. They set the launch
+            size. The wrapper does not compare them with cu_seqlens, because that needs a device
+            sync. If a value is less than the real maximum, the rows after it are not written,
+            or are wrong when the keys are split.
+        q_descale, k_descale, v_descale: one-element fp32 tensors on the device of q, the
+            per-tensor dequant scales.
         softmax_scale: defaults to 1 / sqrt(d_qk).
         causal: apply the causal mask.
         return_lse: also return the log-sum-exp.
@@ -283,6 +287,17 @@ def mha_varlen_fwd(
             cu.dtype == torch.int32 and cu.is_contiguous() and cu.device == q.device
         ), "cu_seqlens_q and cu_seqlens_k must be contiguous int32 on the device of q"
     assert cu_seqlens_k.numel() == cu_seqlens_q.numel(), "cu_seqlens sizes differ"
+    assert (
+        0 <= max_seqlen_q <= Tq and 0 <= max_seqlen_k <= Tk
+    ), f"max_seqlen_q {max_seqlen_q} and max_seqlen_k {max_seqlen_k} must be in [0, {Tq}] and [0, {Tk}]"
+    for name, t in (
+        ("q_descale", q_descale),
+        ("k_descale", k_descale),
+        ("v_descale", v_descale),
+    ):
+        assert (
+            t.dtype == torch.float32 and t.numel() == 1 and t.device == q.device
+        ), f"{name} must be a one-element float32 tensor on {q.device}, got {list(t.shape)} {t.dtype} on {t.device}"
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(DQK)
     cfg = dict(config) if config is not None else _get_varlen_config(causal)
@@ -316,6 +331,8 @@ def mha_varlen_fwd(
     ), "k and v rows and heads must be 16-byte aligned"
     assert kv_async_copy_ok(DV, D_PE, BLOCK_N, num_warps, 8, kv_align)
     ctas = triton.cdiv(int(max_seqlen_q), BLOCK_M) * H * batch
+    if ctas == 0:
+        return (out, lse) if return_lse else out
     # Short queries over a long context leave most CUs idle: split the keys until the launch has about
     # target_ctas programs, with at least 4 key blocks per split. The partials are merged below.
     num_splits = 1
