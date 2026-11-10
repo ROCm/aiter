@@ -1157,8 +1157,6 @@ def _grouped_a8w4_tdm_moe(
     # FHMoE (see fhmoe_shared_weights): the last expert's tiles read fp8 weights.
     sh1 = sh2 = {}
     if shared is not None:
-        if _is_fp4:
-            raise ValueError("an fp8 shared expert needs fp8 activations (a8w4)")
         sw1, sw2, sw1s, sw2s = shared
         sh1 = {"shared_w": sw1, "shared_w_scales": sw1s, "shared_rows": token_num}
         sh2 = {"shared_w": sw2, "shared_w_scales": sw2s, "shared_rows": token_num}

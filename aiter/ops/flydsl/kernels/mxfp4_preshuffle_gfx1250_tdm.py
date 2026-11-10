@@ -182,8 +182,8 @@ def launch_gemm_a8w4_tdm(
     ``shared_b`` (FHMoE): the last expert is a shared expert whose B is fp8
     (MXFP8) at ``arg_shared_b``, in the routed weight preshuffle, with its e8m0
     scales in the routed B-scale layout at ``arg_shared_scale_b``. Its tiles run
-    an fp8-B specialization of the tile body; every other tile runs the routed
-    body. ``shared_mode`` sets how a shared tile runs: 0 at full tile_n; 1 as
+    an fp8-B specialization of the tile body on the routed activations (fp4 or
+    fp8, one 16x16x128 scaled WMMA); every other tile runs the routed body. ``shared_mode`` sets how a shared tile runs: 0 at full tile_n; 1 as
     two tile_n / 2 passes in one workgroup; 2 as two tile_n / 2 workgroups, the
     second in extra blocks ahead of the routed grid (``shared_rows``: the
     shared expert's rows, which sizes them). Modes 1 and 2 keep the B stage and
@@ -220,7 +220,6 @@ def launch_gemm_a8w4_tdm(
             enable_ep_scatter and ep_quant_bits
         ), "persistent EP scatter requires an unquantized combine wire"
     if shared_b:
-        assert not a_is_fp4, "an fp8 shared expert needs fp8 activations (a8w4)"
         assert not (
             has_bias or enable_ep_scatter or persistent_workers
         ), "the fp8 shared expert supports no bias, EP scatter or persistent workers"
@@ -667,6 +666,10 @@ def launch_gemm_a8w4_tdm(
             """One tile. SHB: the FHMoE shared expert's fp8-B specialization; at
             SH_SPLIT 2 it covers N half ``half`` of the tile."""
             tile_n = TILE_N // SH_SPLIT if SHB else TILE_N
+            # a4w4 routed tiles use the 32x16x128 fp4 WMMA; an fp8 shared tile
+            # uses the 16x16x128 scaled WMMA with fp8 B and the routed A type.
+            MMA16 = SHB or not a_is_fp4
+            WMMA_N = 16 if MMA16 else 32
             warp_tile_n = tile_n // n_warp
             wmma_n_rep = warp_tile_n // WMMA_N
             n_acc = wmma_m_rep * wmma_n_rep
@@ -1240,7 +1243,7 @@ def launch_gemm_a8w4_tdm(
 
             wmma_atoms = (
                 []
-                if a_is_fp4
+                if not MMA16
                 else [
                     [
                         fx.make_mma_atom(
@@ -1293,9 +1296,9 @@ def launch_gemm_a8w4_tdm(
                     for wn_raw in range_constexpr(wmma_n_rep):
                         wn = (wmma_n_rep - 1 - wn_raw) if (wm % 2 == 1) else wn_raw
                         idx = wm * wmma_n_rep + wn
-                        scale_a = sb_k[wn if a_is_fp4 else wn // 2]
+                        scale_a = sb_k[wn // 2 if MMA16 else wn]
                         scale_b = sa_k[wm // 2]
-                        if const_expr(a_is_fp4):
+                        if const_expr(not MMA16):
                             wt_value = wt[wn].load()
                             act_value = act[i].load()
                             c_frags[idx].store(

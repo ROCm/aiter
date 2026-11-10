@@ -1162,9 +1162,18 @@ def fused_moe(
             unsupported.append("stage2_scatter")
         if quant_type_a is not None:
             unsupported.append("quant_type_a")
-        fhmoe_quant_dtype_a = (
-            dtypes.fp8 if GateMode(gate_mode) == GateMode.INTERLEAVE else dtypes.fp4x2
-        )
+        if get_gfx() == "gfx1250":
+            # The routed experts keep their activation dtype (MXFP4 by default);
+            # the fp8 shared expert reads the same activations.
+            fhmoe_quant_dtype_a = (
+                quant_dtype_a if quant_dtype_a is not None else dtypes.fp4x2
+            )
+        else:
+            fhmoe_quant_dtype_a = (
+                dtypes.fp8
+                if GateMode(gate_mode) == GateMode.INTERLEAVE
+                else dtypes.fp4x2
+            )
         if quant_dtype_a is not None and quant_dtype_a != fhmoe_quant_dtype_a:
             unsupported.append("quant_dtype_a")
         if quant_dtype_a2 is not None:
