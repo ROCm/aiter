@@ -1161,6 +1161,29 @@ def _grouped_a8w4_tdm_moe(
         sh1 = {"shared_w": sw1, "shared_w_scales": sw1s, "shared_rows": token_num}
         sh2 = {"shared_w": sw2, "shared_w_scales": sw2s, "shared_rows": token_num}
         persistent_workers = persistent_workers2 = 0
+        if os.environ.get("AITER_FHMOE_SHARED_ACT", "bf16") == "bf16":
+            # The shared expert on bf16 activations: its stage-1 A is this
+            # call's hidden rows in the shared segment's row order (the shared
+            # route is the last top-k column), its stage-1 SiLU output a bf16
+            # side buffer that stage 2 reads.
+            if topids_to_rows is None or int(tile_m2) != int(tile_m):
+                raise NotImplementedError(
+                    "FHMoE bf16 shared activations need the TP row map and "
+                    "equal stage tile_m"
+                )
+            rows_sh = (int(token_num) + int(tile_m) - 1) // int(tile_m) * int(tile_m)
+            sh_row0 = (psum[E - 2 : E - 1].long() + tile_m - 1) // tile_m * tile_m
+            idx = topids_to_rows[:, -1].long() - sh_row0
+            idx = torch.where((idx >= 0) & (idx < rows_sh), idx, rows_sh)
+            x_sh = torch.zeros(
+                (rows_sh + 1, model_dim), dtype=torch.bfloat16, device=device
+            )
+            x_sh.index_copy_(0, idx, hidden_states.reshape(-1, model_dim))
+            act_sh = torch.empty(
+                (rows_sh + 1, inter_dim), dtype=torch.bfloat16, device=device
+            )
+            sh1 = dict(sh1, shared_a=x_sh, shared_c=act_sh)
+            sh2 = dict(sh2, shared_a=act_sh)
 
     if _fuse_quant:
         # Pre-allocate MX payload + preshuffled e8m0 scale for gemm1 output.

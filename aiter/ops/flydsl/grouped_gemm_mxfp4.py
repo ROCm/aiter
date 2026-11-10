@@ -152,6 +152,8 @@ def flydsl_grouped_gemm_a8w4_masked(
     shared_w=None,
     shared_w_scales=None,
     shared_rows=0,
+    shared_a=None,
+    shared_c=None,
 ):
     """Launch a contiguous-M grouped GEMM, optionally with persistent workers.
 
@@ -163,6 +165,9 @@ def flydsl_grouped_gemm_a8w4_masked(
     scales in the routed B-scale layout (see
     ``grouped_moe_gfx1250.fhmoe_shared_weights``). ``shared_rows``: its row
     count (the token count), which sizes the grid for its second N halves.
+    ``shared_a`` (bf16 [rows, K]) makes the shared tiles read bf16 activations
+    in the shared segment's row order; ``shared_c`` (bf16 [rows, N / 2]) takes
+    their stage-1 activation (see the kernel's ``shared_a16``).
     """
     launch_gemm_a8w4_tdm = _launch_gemm_a8w4_tdm()
 
@@ -286,5 +291,8 @@ def flydsl_grouped_gemm_a8w4_masked(
         ).view(torch.int32),
         shared_mode=int(os.environ.get("AITER_FHMOE_SHARED_MODE", "2")),
         shared_rows=int(shared_rows),
+        shared_a16=int(shared_a is not None),
+        arg_shared_a=ptr_arg(a if shared_a is None else shared_a),
+        arg_shared_c=ptr_arg(a if shared_c is None else shared_c),
     )
     return out

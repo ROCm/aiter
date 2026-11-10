@@ -176,6 +176,9 @@ def launch_gemm_a8w4_tdm(
     arg_shared_scale_b: fx.Tensor = None,
     shared_mode: Constexpr[int] = 2,
     shared_rows: fx.Int32 = 0,
+    shared_a16: Constexpr[int] = 0,
+    arg_shared_a: fx.Pointer = None,
+    arg_shared_c: fx.Pointer = None,
 ):
     """Launch the grouped contiguous-M a8w4 MoE GEMM for gfx1250.
 
@@ -188,6 +191,13 @@ def launch_gemm_a8w4_tdm(
     second in extra blocks ahead of the routed grid (``shared_rows``: the
     shared expert's rows, which sizes them). Modes 1 and 2 keep the B stage and
     the B registers of a routed tile.
+
+    ``shared_a16``: the shared tiles read bf16 activations instead of the routed
+    ones: ``arg_shared_a`` [rows, K] bf16 in the shared segment's row order (row
+    = sorted row - the segment start), no A scales; their fp8 B is converted to
+    bf16 for bf16 WMMAs. With ``stage1_act`` the shared rows' activation is
+    written in bf16 to ``arg_shared_c`` [rows, N / 2] (same row order) instead
+    of ``arg_c``, for the stage-2 call's ``arg_shared_a``.
 
     ``cluster_m`` and ``cluster_n`` explicitly select the physical workgroup
     cluster. Peers along N share A, while expert-compatible peers along M can
@@ -219,6 +229,7 @@ def launch_gemm_a8w4_tdm(
         assert not (
             enable_ep_scatter and ep_quant_bits
         ), "persistent EP scatter requires an unquantized combine wire"
+    assert not shared_a16 or shared_b, "shared_a16 needs shared_b"
     if shared_b:
         assert not (
             has_bias or enable_ep_scatter or persistent_workers
@@ -268,7 +279,9 @@ def launch_gemm_a8w4_tdm(
         _sh_half % (32 * n_warp) == 0
         and (_sh_half // 32) % max(2, num_waves_per_tensor_tdm) == 0
         and (
-            not (stage1_quant_out and stage1_act) or (_sh_half // n_warp // 16) % 4 == 0
+            not (stage1_quant_out and stage1_act)
+            or shared_a16
+            or (_sh_half // n_warp // 16) % 4 == 0
         )
     )
     SH_SPLIT = (
@@ -325,6 +338,7 @@ def launch_gemm_a8w4_tdm(
         shared_b,
         SH_SPLIT,
         SH_GRID,
+        shared_a16,
     )
     _ = cache_tag
     if enable_ep_scatter:
@@ -378,6 +392,18 @@ def launch_gemm_a8w4_tdm(
     A_LDS_ROW = A_ROW_B + LDS_PAD_A
     B_LDS_ROW = PACK_TK * 16
     STAGE_A = ceildiv(tile_m * A_LDS_ROW, 16) * 16
+    # shared_a16: a shared tile's A stage is bf16 rows (tile_k * 2 bytes plus a pad).
+    A_LDS_ROW_SH = tile_k * 2 + LDS_PAD_A
+    STAGE_A = (
+        max(STAGE_A, ceildiv(tile_m * A_LDS_ROW_SH, 16) * 16) if shared_a16 else STAGE_A
+    )
+    ACT_NDW_RT, A_ROW_B_RT, A_LDS_ROW_RT, A_KSTEP_RT = (
+        ACT_NDW,
+        A_ROW_B,
+        A_LDS_ROW,
+        A_KSTEP,
+    )
+    STAGE1_QUANT_OUT_RT = stage1_quant_out
     STAGE_B = ceildiv((tile_n // 16) * B_LDS_ROW, 16) * 16
     # FHMoE: the shared expert's fp8 B has the routed preshuffle, 16-row groups
     # of tile_k bytes a row. At SH_SPLIT 2 its B stage is the routed one.
@@ -500,7 +526,9 @@ def launch_gemm_a8w4_tdm(
     _persistent = f"_pw{persistent_workers}" if persistent_workers else ""
     _drain = "_rolleddrain" if rolled_drain else ""
     _shared = (
-        "_shfp8" + ("" if SH_SPLIT == 1 else ("_ngrid" if SH_GRID else "_n2pass"))
+        "_shfp8"
+        + ("" if SH_SPLIT == 1 else ("_ngrid" if SH_GRID else "_n2pass"))
+        + ("_a16" if shared_a16 else "")
         if shared_b
         else ""
     )
@@ -545,6 +573,8 @@ def launch_gemm_a8w4_tdm(
         # FHMoE shared weights: last, so no other argument moves.
         arg_shared_b: fx.Pointer,
         arg_shared_scale_b: fx.Pointer,
+        arg_shared_a: fx.Pointer,
+        arg_shared_c: fx.Pointer,
         task_id: task_index_type,
         schedule_rows: task_index_type,
     ):
@@ -670,6 +700,13 @@ def launch_gemm_a8w4_tdm(
             # uses the 16x16x128 scaled WMMA with fp8 B and the routed A type.
             MMA16 = SHB or not a_is_fp4
             WMMA_N = 16 if MMA16 else 32
+            # shared_a16: bf16 A rows, no A scales, fp8 B converted to bf16.
+            SH16 = bool(SHB and shared_a16)
+            ACT_NDW = 32 if SH16 else ACT_NDW_RT
+            A_ROW_B = tile_k * 2 if SH16 else A_ROW_B_RT
+            A_LDS_ROW = A_LDS_ROW_SH if SH16 else A_LDS_ROW_RT
+            A_KSTEP = 256 if SH16 else A_KSTEP_RT
+            stage1_quant_out = 0 if SH16 else STAGE1_QUANT_OUT_RT
             warp_tile_n = tile_n // n_warp
             wmma_n_rep = warp_tile_n // WMMA_N
             n_acc = wmma_m_rep * wmma_n_rep
@@ -684,12 +721,22 @@ def launch_gemm_a8w4_tdm(
             # Compact dest rows arrive on the dispatch wire's padded pitch, so the A
             # row stride is not K bytes and the scale row stride is not K/128 dwords.
             A_GROW = a_row_stride_bytes if a_row_stride_bytes else A_KROW
+            A_GROW = K * 2 if SH16 else A_GROW
+            # A bf16 shared tile's rows count from the shared segment's start.
+            sh_row0_64 = (
+                fx.Int64(((tile_map[n_experts - 2] + tile_m - 1) // tile_m) * tile_m)
+                if SH16
+                else None
+            )
             # row-major: scale dwords per M row
             SA_GROW = (
                 a_scale_row_stride_bytes // 4 if a_scale_row_stride_bytes else K // 128
             )
 
             c_outer_off, c_inner_off, c_stride = blk_m64, blk_n64, i32_n
+            c_outer_off = (
+                (blk_m64 - sh_row0_64) if (SH16 and stage1_act) else c_outer_off
+            )
             SB_OUTER_STRIDE = K4
             sb_batch_off = eb64 * (N_SUPERS * K4)
             # Per-expert A-data OOB: bound to the owning expert's valid-row
@@ -773,7 +820,7 @@ def launch_gemm_a8w4_tdm(
                     gt, [outer, None], strides=[stride, None], num_warps=num_waves
                 )
 
-            gA_base = fx.recast_iter(fx.Int8, arg_a)
+            gA_base = fx.recast_iter(fx.Int8, arg_shared_a if SH16 else arg_a)
             gB_base = fx.recast_iter(fx.Int8, arg_shared_b if SHB else arg_b)
             gSA_base = fx.recast_iter(fx.Int32, arg_scale_a)
             gSB_base = fx.recast_iter(
@@ -805,7 +852,7 @@ def launch_gemm_a8w4_tdm(
                 _ep_lsa0 = fx.Int64(ep_win.lsa_ptr(fx.Int32(0), 0))
                 _ep_lsa1 = fx.Int64(ep_win.lsa_ptr(fx.Int32(1), 0))
             b_outer_row = eb64 * B_BATCH_ROWS + blk_n64 // 16
-            a_off0 = blk_m64 * A_GROW
+            a_off0 = (blk_m64 - sh_row0_64) * A_GROW if SH16 else blk_m64 * A_GROW
             # FHMoE shared expert: one fp8 B, 16-row groups of K * 16 bytes.
             b_off0 = (blk_n64 // 16) * (K * 16) if SHB else b_outer_row * Kp16
             sb_off0 = (blk_n64 // 32) * SB_OUTER_STRIDE + (0 if SHB else sb_batch_off)
@@ -1122,7 +1169,7 @@ def launch_gemm_a8w4_tdm(
 
             # Split each region's offset into a lane-varying base, which keepalive
             # can pin, and a compile-time part that folds into ds_load's offset:.
-            lds_a_lane_off = (wmb + lane16) * A_LDS_ROW + kgrp * 16
+            lds_a_lane_off = (wmb + lane16) * A_LDS_ROW + kgrp * (32 if SH16 else 16)
             lds_b_lane_off = (
                 (wnb // 16) * (B_LDS_ROW_SH if SHB else B_LDS_ROW)
                 + kgrp * 256
@@ -1139,7 +1186,7 @@ def launch_gemm_a8w4_tdm(
             # One full-wave load covers both 16-column halves of an N32 scale
             # super-row. WMMA opsel_a selects lane 0:15 or 16:31 for each wn.
             assert warp_tile_n % 32 == 0, "load_sb split requires a 32-aligned wnb"
-            lds_sb_lane_off = ((wnb // 32) * SC_INNER + lane) * 4
+            lds_sb_lane_off = ((wnb // 32) * SC_INNER + (lane16 if SH16 else lane)) * 4
 
             LdsAddr = namedtuple("LdsAddr", "a b sa sb")
 
@@ -1175,6 +1222,23 @@ def launch_gemm_a8w4_tdm(
 
             def load_a(base, wm, ksl):
                 off = wm * 16 * A_LDS_ROW + ksl * A_KSTEP
+                if const_expr(SH16):
+                    # bf16 rows: a lane's 16 elements of each K32 group j (two b128
+                    # at K = 32j + 16 * kgrp), the K order the converted B uses.
+                    v = [
+                        Vec(lds_load_b128(base, fx.Int32(off + 64 * j + 16 * q)))
+                        for j in range_constexpr(4)
+                        for q in range_constexpr(2)
+                    ]
+                    p = [
+                        v[2 * i].shuffle(v[2 * i + 1], list(range(8)))
+                        for i in range_constexpr(4)
+                    ]
+                    p = [
+                        p[0].shuffle(p[1], list(range(16))),
+                        p[2].shuffle(p[3], list(range(16))),
+                    ]
+                    return p[0].shuffle(p[1], list(range(32)))
                 if const_expr(a_is_fp4):
                     return Vec(lds_load_b128(base, fx.Int32(off))).shuffle(
                         Vec(lds_load_b128(base, fx.Int32(off + 32))), list(range(8))
@@ -1241,6 +1305,27 @@ def launch_gemm_a8w4_tdm(
                 off = (sn * SC_INNER + ksl * 32) * 4
                 return lds_load_b32(base, fx.Int32(off))[0]
 
+            def load_sb_row(base, wn, ksl):
+                # bf16 shared tile: the lane's own B row (of wn's 16 in a 32-row
+                # scale super-row), the four K32 e8m0 of this k128 in one dword.
+                off = ((wn // 2) * SC_INNER + ksl * 32 + (wn % 2) * 16) * 4
+                return lds_load_b32(base, fx.Int32(off))[0]
+
+            def fp8_to_bf16(dwords, e8m0):
+                # 8 fp8 (two dwords) -> 8 bf16 times 2^(e8m0 - 127): an unscaled
+                # cvt and an exact power-of-two multiply (both fit bf16 exactly).
+                from flydsl.expr.rocdl import cvt_scale_pk8_f32_fp8
+
+                unscaled = cvt_scale_pk8_f32_fp8(
+                    T.vec(8, T.f32),
+                    Vec.from_elements(dwords, fx.Int32).ir_value(),
+                    fx.Int32(127).ir_value(),
+                    0,
+                )
+                return (Vec(unscaled) * (e8m0 << 23).bitcast(fx.Float32)).truncf(
+                    T.vec(8, T.bf16)
+                )
+
             wmma_atoms = (
                 []
                 if not MMA16
@@ -1288,7 +1373,8 @@ def launch_gemm_a8w4_tdm(
             # REUSE fence; the prefetch reads interleave evenly over the rest. Narrow
             # tiles can have n_acc as low as the tail itself, so clamp it to keep at
             # least one group for the interleaved part.
-            FENCE_COVER_MMA = min(8, max(0, n_acc - MMA_GROUP))
+            N_MMA = n_acc * (4 if SH16 else 1)
+            FENCE_COVER_MMA = min(8, max(0, N_MMA - MMA_GROUP))
 
             def mma_rows(wm_list, act, wt, sa_k, sb_k):
                 for i in range_constexpr(len(wm_list)):
@@ -1296,9 +1382,31 @@ def launch_gemm_a8w4_tdm(
                     for wn_raw in range_constexpr(wmma_n_rep):
                         wn = (wmma_n_rep - 1 - wn_raw) if (wm % 2 == 1) else wn_raw
                         idx = wm * wmma_n_rep + wn
-                        scale_a = sb_k[wn // 2 if MMA16 else wn]
+                        scale_a = sb_k[wn if SH16 else (wn // 2 if MMA16 else wn)]
                         scale_b = sa_k[wm // 2]
-                        if const_expr(not MMA16):
+                        if const_expr(SH16):
+                            wdw = Vec(wt[wn].load())
+                            adw = Vec(act[i].load())
+                            acc = c_frags[idx].load().ir_value()
+                            for j in range_constexpr(4):
+                                e8m0 = (fx.Int32(scale_a) >> (8 * j)) & 0xFF
+                                lo = fp8_to_bf16([wdw[4 * j], wdw[4 * j + 1]], e8m0)
+                                hi = fp8_to_bf16([wdw[4 * j + 2], wdw[4 * j + 3]], e8m0)
+                                w16 = lo.shuffle(hi, list(range(16)))
+                                a16 = Vec.from_elements(
+                                    [adw[8 * j + e] for e in range_constexpr(8)],
+                                    fx.Int32,
+                                ).bitcast(fx.BFloat16)
+                                acc = rocdl.wmma_f32_16x16x32_bf16(
+                                    T.vec(8, T.f32),
+                                    _raw(w16),
+                                    _raw(a16),
+                                    _raw(acc),
+                                    reuseA=False,
+                                    reuseB=False,
+                                ).result
+                            c_frags[idx].store(acc)
+                        elif const_expr(not MMA16):
                             wt_value = wt[wn].load()
                             act_value = act[i].load()
                             c_frags[idx].store(
@@ -1324,14 +1432,15 @@ def launch_gemm_a8w4_tdm(
                                 scale_b=scale_b,
                             )
 
-            DS_A = 2 if a_is_fp4 else 4
+            DS_A = 8 if SH16 else (2 if a_is_fp4 else 4)
             DS_B = 4 if SHB else 2
             sb_pairs = output_n_rep // 2
             sa_pairs = (wmma_m_rep + 1) // 2
-            BS_DS = wmma_n_rep * DS_B + sb_pairs + sa_pairs
+            SB_LOADS = wmma_n_rep if SH16 else sb_pairs
+            BS_DS = wmma_n_rep * DS_B + SB_LOADS + sa_pairs
             STATE_DS = wmma_m_rep * DS_A + BS_DS
 
-            SA_WIDTH, SB_WIDTH = max(2, sa_pairs), max(2, sb_pairs)
+            SA_WIDTH, SB_WIDTH = max(2, sa_pairs), max(2, SB_LOADS)
             RmemSlot = namedtuple("RmemSlot", "a b sa sb")
 
             def make_rmem_slot(slot_idx):
@@ -1376,15 +1485,22 @@ def launch_gemm_a8w4_tdm(
                 """Load one k128 from precomputed LDS bases into ``slot``."""
                 if const_expr(not interleaved_lds_load):
                     # Preserve the legacy instruction order for a clean A/B test.
-                    sb_v = [
-                        load_sb(lds_addr.sb, sn, ksl)
-                        for sn in range_constexpr(sb_pairs)
-                    ]
+                    sb_v = (
+                        [
+                            load_sb_row(lds_addr.sb, wn, ksl)
+                            for wn in range_constexpr(wmma_n_rep)
+                        ]
+                        if SH16
+                        else [
+                            load_sb(lds_addr.sb, sn, ksl)
+                            for sn in range_constexpr(sb_pairs)
+                        ]
+                    )
                     sa_v = [
                         load_sa(lds_addr.sa, sm, ksl, kt)
                         for sm in range_constexpr(sa_pairs)
                     ]
-                    slot.sb.store(Vec.from_elements(sb_v + sb_v[: SB_WIDTH - sb_pairs]))
+                    slot.sb.store(Vec.from_elements(sb_v + sb_v[: SB_WIDTH - SB_LOADS]))
                     slot.sa.store(Vec.from_elements(sa_v + sa_v[: SA_WIDTH - sa_pairs]))
                     for wm in range_constexpr(wmma_m_rep):
                         slot.a[wm].store(load_a(lds_addr.a, wm, ksl))
@@ -1398,13 +1514,17 @@ def launch_gemm_a8w4_tdm(
                     # runtime branch even when the A/B repetition counts differ.
                     sa_v = []
                     sb_v = []
-                    for i in range_constexpr(max(sa_pairs, sb_pairs)):
+                    for i in range_constexpr(max(sa_pairs, SB_LOADS)):
                         if const_expr(i < sa_pairs):
                             sa_v.append(load_sa(lds_addr.sa, i, ksl, kt))
-                        if const_expr(i < sb_pairs):
-                            sb_v.append(load_sb(lds_addr.sb, i, ksl))
+                        if const_expr(i < SB_LOADS):
+                            sb_v.append(
+                                load_sb_row(lds_addr.sb, i, ksl)
+                                if SH16
+                                else load_sb(lds_addr.sb, i, ksl)
+                            )
                     slot.sa.store(Vec.from_elements(sa_v + sa_v[: SA_WIDTH - sa_pairs]))
-                    slot.sb.store(Vec.from_elements(sb_v + sb_v[: SB_WIDTH - sb_pairs]))
+                    slot.sb.store(Vec.from_elements(sb_v + sb_v[: SB_WIDTH - SB_LOADS]))
                     for i in range_constexpr(max(wmma_m_rep, wmma_n_rep)):
                         if const_expr(i < wmma_m_rep):
                             slot.a[i].store(load_a(lds_addr.a, i, ksl))
@@ -1494,8 +1614,8 @@ def launch_gemm_a8w4_tdm(
                         rocdl.sched_dsrd(STATE_DS if not rmem_preloaded else 0)
                     # Keep one normal group for the LDS/TDM scheduling slots. Small
                     # tiles can have no more MFMAs than the requested fence tail.
-                    tail_mfma = min(tail_mfma, max(0, n_acc - MMA_GROUP))
-                    mma_total = n_acc - tail_mfma
+                    tail_mfma = min(tail_mfma, max(0, N_MMA - MMA_GROUP))
+                    mma_total = N_MMA - tail_mfma
                     # K256 needs grouping to limit VGPR-bank switches without
                     # turning the complete A/B/scale prefetch into long LDS bursts.
                     mma_group = min(MMA_GROUP, mma_total) if KWS > 1 else 1
@@ -2424,7 +2544,18 @@ def launch_gemm_a8w4_tdm(
                         c_iter = fx.recast_iter(fx.Int8, arg_c)
                     else:
                         oc_store = oc
-                        c_iter = fx.recast_iter(oc, arg_c)
+                        c_iter = (
+                            fx.recast_iter(
+                                fx.PointerType.get(
+                                    elem_ty=oc.ir_type,
+                                    address_space=fx.AddressSpace.Global,
+                                    alignment=16,
+                                ),
+                                arg_shared_c,
+                            )
+                            if (SH16 and stage1_act)
+                            else fx.recast_iter(oc, arg_c)
+                        )
                     c_off_rt = c_outer_off * fx.Int64(out_stride) + out_col_off
                     if const_expr(STORE_PAD == 0):
                         gtC = tensor_view(
@@ -2499,6 +2630,8 @@ def launch_gemm_a8w4_tdm(
         f32_situ_linear_beta: fx.Float32,
         arg_shared_b: fx.Pointer,
         arg_shared_scale_b: fx.Pointer,
+        arg_shared_a: fx.Pointer,
+        arg_shared_c: fx.Pointer,
     ):
         def run_task(task_id, rows):
             # i32_m remains the allocation capacity: the scale buffer's
@@ -2520,6 +2653,8 @@ def launch_gemm_a8w4_tdm(
                 f32_situ_linear_beta,
                 arg_shared_b,
                 arg_shared_scale_b,
+                arg_shared_a,
+                arg_shared_c,
                 task_id,
                 rows,
             )
@@ -2565,6 +2700,8 @@ def launch_gemm_a8w4_tdm(
         # FHMoE shared weights; without them, unused copies of the routed ones.
         arg_shared_b if shared_b else arg_b,
         fx.get_iter(arg_shared_scale_b if shared_b else arg_scale_b),
+        arg_shared_a if shared_a16 else arg_a,
+        arg_shared_c if shared_a16 else arg_a,
     )
     sh_blocks = ceildiv(shared_rows, tile_m) * n_tiles if SH_GRID else 0
     grid = (
