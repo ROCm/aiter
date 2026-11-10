@@ -410,12 +410,15 @@ class PaDecodeKVLoader:
                 self.traits.KV_VECTOR_WIDTH,
                 self.traits.KV_EXTENT,
             )
-        self._v_load_vector = self._make_raw_flat_loader(
-            self.ctx.value_cache_ptr,
-            self.traits.KV_DTYPE,
-            self.traits.KV_VECTOR_WIDTH,
-            self.traits.KV_EXTENT,
-        )
+        if const_expr(self.traits.FP8_DECODE_NT_V):
+            self._v_load_vector = self._make_nt_k_loader(self.ctx.value_cache_ptr)
+        else:
+            self._v_load_vector = self._make_raw_flat_loader(
+                self.ctx.value_cache_ptr,
+                self.traits.KV_DTYPE,
+                self.traits.KV_VECTOR_WIDTH,
+                self.traits.KV_EXTENT,
+            )
 
     def kv_address(self, phys, page_elems, rest):
         if const_expr(self.traits.BUFFER_KV):

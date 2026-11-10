@@ -445,6 +445,7 @@ class PaDecodeTraits:
     FP8_MTP4_PAGES_AHEAD: bool
     BF16_MTP_FUSED: bool
     BF16_DECODE_NT_KV: bool
+    FP8_DECODE_NT_V: bool
     DECODE_Q_EARLY: bool
     FP8_SCALES_AFTER_Q: bool
     FP8_LOOP_SCALES_LATE: bool
@@ -666,6 +667,18 @@ class PaDecodeTraits:
             and sliding_window == 0
             and not BUFFER_KV
         )
+        # gfx950 FP8 single-M-tile page-128 decode reads every V byte once:
+        # stream V nontemporally. K stays cached: streaming it too slowed the
+        # short single-tile tasks, and on page 16 streaming fights the V pipe.
+        FP8_DECODE_NT_V = (
+            is_gfx950
+            and kv_dtype == "fp8"
+            and head_dim == 128
+            and block_size == 128
+            and M_TILES == 1
+            and sliding_window == 0
+            and not BUFFER_KV
+        )
         # gfx950 single-M-tile decode (BF16, or FP8 with a full 16-row tile)
         # issues Q ahead of the page ids and stages it while K is in flight.
         DECODE_Q_EARLY = BF16_DECODE_NT_KV or (
@@ -880,6 +893,7 @@ class PaDecodeTraits:
             FP8_MTP4_PAGES_AHEAD=FP8_MTP4_PAGES_AHEAD,
             BF16_MTP_FUSED=BF16_MTP_FUSED,
             BF16_DECODE_NT_KV=BF16_DECODE_NT_KV,
+            FP8_DECODE_NT_V=FP8_DECODE_NT_V,
             DECODE_Q_EARLY=DECODE_Q_EARLY,
             FP8_SCALES_AFTER_Q=FP8_SCALES_AFTER_Q,
             FP8_LOOP_SCALES_LATE=FP8_LOOP_SCALES_LATE,
