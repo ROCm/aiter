@@ -404,7 +404,9 @@ def test_fused_moe_mxfp4(token, model_dim, inter_dim, E, topk):
         ret[f"{name} us"] = us
         ret[f"{name} TFLOPS"] = flops / us / 1e6
         ret[f"{name} TB/s"] = nbytes / us / 1e6
-        ret[f"{name} err"] = _err(ref, out, f"{name}: token={token}")
+        err = _err(ref, out, f"{name}: token={token}")
+        assert err <= _ERR_MAX, f"{name}, token={token}: mismatch ratio {err:.3%}"
+        ret[f"{name} err"] = err
     return ret
 
 
