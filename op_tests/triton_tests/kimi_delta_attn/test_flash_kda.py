@@ -1206,7 +1206,8 @@ def test_cu_seqlens_cpu_issues_no_sync():
         _flash_kda._build_metadata.cache_clear()  # take the upload path
         chunk_kimi_delta_attn(**host_kw)
         _flash_kda._build_metadata.cache_clear()
-        with pytest.raises(RuntimeError, match="synchronizing CUDA operation"):
+        # ROCm builds of PyTorch say "HIP" (2.10) or "CUDA" (2.13) here.
+        with pytest.raises(RuntimeError, match=r"synchronizing (CUDA|HIP) operation"):
             chunk_kimi_delta_attn(**dev_kw)
     finally:
         torch.cuda.set_sync_debug_mode(saved)
