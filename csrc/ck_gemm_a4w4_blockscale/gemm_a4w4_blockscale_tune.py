@@ -99,6 +99,35 @@ def run_gemm_a4w4_blockscale_asm(
     return res[:m]
 
 
+def run_gemm_a4w4_blockscale_flydsl(
+    x,
+    weight_shuffle,
+    x_scale,
+    w_scale,
+    out,
+    workspace,
+    tile_n,
+    k_waves,
+    num_buffers,
+    split_k,
+):
+    from aiter.ops.flydsl.decode_gemm_mxfp4 import flydsl_decode_gemm_mxfp4
+
+    m = x.shape[0]
+    return flydsl_decode_gemm_mxfp4(
+        x,
+        weight_shuffle,
+        x_scale,
+        w_scale,
+        out[:m],
+        tile_n=tile_n,
+        k_waves=k_waves,
+        num_buffers=num_buffers,
+        split_k=split_k,
+        workspace=workspace,
+    )
+
+
 def generate_data(m, n, k, seed, device="cuda", dtype=dtypes.bf16):
     torch.manual_seed(seed)
     quant_func = aiter.get_triton_quant(aiter.QuantType.per_1x32)
@@ -183,6 +212,18 @@ def run_gemm_preshuffle(x, w, x_scale, w_scale, out, kernel_name):
     if result is None:
         raise ValueError(f"Unlaunchable A4W4 tune candidate: {kernel_name}")
     return result
+
+
+def generate_flydsl_data(m, n, k, seed, device="cuda"):
+    data = generate_data(m, n, k, seed, device=device)
+    # Keep split-K allocation out of the timed runner and rotate scratch with operands.
+    for split_k in (1, 2, 4, 8):
+        data[f"workspace_{split_k}"] = (
+            None
+            if split_k == 1
+            else torch.empty((split_k, m, n), dtype=torch.float32, device=device)
+        )
+    return data
 
 
 class GemmA4W4BlockScaleTuner(GemmCommonTuner):
@@ -281,6 +322,76 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
         if kernelId is None or kernelId < 0 or kernelId not in kernels_list:
             return None
         return kernels_list[kernelId].name
+
+    def get_flydsl_decode_tasks(self, info_keys, seed, args):
+        from aiter.jit.utils.chip_info import get_gfx_runtime
+
+        _gfx, _cu_num, M, N, K = info_keys
+        if get_gfx_runtime() != "gfx950" or not 1 <= M <= 16 or K % 64:
+            return []
+        from aiter.ops.flydsl.decode_gemm_mxfp4 import (
+            DECODE_GEMM_MXFP4_LDS_LIMIT,
+            decode_gemm_mxfp4_lds_bytes,
+            flydsl_decode_name,
+        )
+
+        gemm_keys = ["x", "w_shuffle", "x_scales_shuffle", "w_scales_shuffle", "out_ck"]
+        ref_keys = ["x", "w", "x_scales", "w_scales"]
+        tasks = []
+        for tile_n, k_waves in ((32, 2), (64, 1)):
+            if N % tile_n:
+                continue
+            for num_buffers in (2, 4, 6, 8, 12):
+                # Like CK/asm, partitions beyond 1 are opt-in via -k/--splitK.
+                for split_k in (1, 2, 4, 8) if args.splitK else (1,):
+                    # The kernel clamps depth = min(num_buffers, group_tiles), so
+                    # candidates past the first saturating one are duplicates.
+                    k_tiles = (((K + 255) // 256) + split_k - 1) // split_k
+                    group_tiles = (k_tiles + k_waves - 1) // k_waves
+                    if num_buffers > group_tiles and any(
+                        nb >= group_tiles for nb in (2, 4, 6, 8, 12) if nb < num_buffers
+                    ):
+                        continue
+                    try:
+                        lds_bytes = decode_gemm_mxfp4_lds_bytes(
+                            M, K, tile_n, k_waves, split_k
+                        )
+                    except ValueError:
+                        continue
+                    if lds_bytes > DECODE_GEMM_MXFP4_LDS_LIMIT:
+                        continue
+                    name = flydsl_decode_name(tile_n, k_waves, num_buffers, split_k)
+                    tasks.append(
+                        (
+                            # splitK column is log2(partitions), as for CK/asm:
+                            # 0 = no split. The kernel name carries the count.
+                            (info_keys, -1, split_k.bit_length() - 1, name),
+                            generate_flydsl_data,
+                            (M, N, K, seed),
+                            run_gemm_a4w4_blockscale_flydsl,
+                            (
+                                gemm_keys + [f"workspace_{split_k}"],
+                                tile_n,
+                                k_waves,
+                                num_buffers,
+                                split_k,
+                            ),
+                            {
+                                "num_warmup": args.warmup,
+                                "num_iters": args.iters,
+                            },
+                            run_torch,
+                            (ref_keys, dtypes.bf16),
+                            {},
+                            None,
+                            1e-2,
+                            0.01,
+                            None,
+                            None,
+                            ("out_ck",),
+                        )
+                    )
+        return tasks
 
     def tune(
         self,
@@ -455,7 +566,16 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
                     )
                 )
                 total_kernel_nums += 1
-            tasks_in_data.append((total_kernel_nums, ()))
+            if "flydsl" in backends:
+                flydsl_tasks = self.get_flydsl_decode_tasks(
+                    (gfx, cu_num, M, N, K), seed, args
+                )
+                task.extend(flydsl_tasks)
+                total_kernel_nums += len(flydsl_tasks)
+            # A shape with no task (e.g. FlyDSL-only on an unsupported shape)
+            # makes no group; mp_tuner asserts group count == bookkeeping count.
+            if total_kernel_nums:
+                tasks_in_data.append((total_kernel_nums, ()))
 
         ret = []
         if task:
