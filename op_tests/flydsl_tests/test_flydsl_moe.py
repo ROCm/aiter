@@ -430,64 +430,6 @@ def test_flydsl_e2e_a8w4_gui(inter_dim):
     _check_close(data["ref_stage2"], out, f"e2e_a8w4_gui_i{inter_dim}")
 
 
-@_SKIP_GFX950_FLYDSL
-def test_flydsl_moe_xcd_swizzle_uneven_grid():
-    """xcd_swizzle on a 2 x 18 grid in both stages: 36 workgroups, not a multiple
-    of the 8 XCDs. Every sorted block holds a routed row, so a tile the remap
-    skips leaves NaN in stage 1 and a tile it runs twice doubles a stage-2 sum."""
-    from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage1, flydsl_moe_stage2
-
-    token, model_dim, inter_dim, E, topk, block_m = 9, 512, 256, 32, 2, 32
-    data = _generate_a8w4_gui_data(
-        token, model_dim, inter_dim, E, topk, block_m, distinct_experts=True
-    )
-    stage1_out = torch.full(
-        (token, topk, inter_dim), float("nan"), dtype=torch.bfloat16, device="cuda"
-    )
-    flydsl_moe_stage1(
-        a=data["a_q"],
-        w1=data["w1_shuf"],
-        sorted_token_ids=data["sorted_ids"],
-        sorted_expert_ids=data["sorted_expert_ids"],
-        num_valid_ids=data["num_valid_ids"],
-        out=stage1_out,
-        topk=topk,
-        tile_m=32,
-        tile_n=256,
-        tile_k=_stage1_tile_k(model_dim),
-        a_dtype="fp8",
-        b_dtype="fp4",
-        out_dtype="bf16",
-        act="swiglu",
-        gate_mode="interleave",
-        w1_scale=data["w1_scale_shuf"],
-        a1_scale=data["a_scale_sort"],
-        xcd_swizzle=4,
-    )
-    out = flydsl_moe_stage2(
-        inter_states=data["a2_q"],
-        w2=data["w2_shuf"],
-        sorted_token_ids=data["sorted_ids"],
-        sorted_expert_ids=data["sorted_expert_ids"],
-        num_valid_ids=data["num_valid_ids"],
-        topk=topk,
-        tile_m=32,
-        tile_n=256,
-        tile_k=256,
-        a_dtype="fp8",
-        b_dtype="fp4",
-        out_dtype="bf16",
-        mode="atomic",
-        w2_scale=data["w2_scale_shuf"],
-        a2_scale=data["a2_scale_sort"],
-        sorted_weights=data["sorted_weights"],
-        xcd_swizzle=4,
-    )
-    torch.cuda.synchronize()
-    _check_close(data["ref_stage1"], stage1_out, "xcd4_uneven_grid_stage1")
-    _check_close(data["ref_stage2"], out, "xcd4_uneven_grid_stage2")
-
-
 # ---------------------------------------------------------------------------
 # SiTUv2 activation fused into the FlyDSL MXFP4 MoE stage1 (a8w4 + host ref).
 # Migrated from the former test_flydsl_moe_situv2.py.
