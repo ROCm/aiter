@@ -20,7 +20,7 @@ The host classes are in `aiter/ops/flydsl/`:
 |---|---|
 | `one_shot_allreduce.py` | `OneShotAllReduce`, the host class for the one-shot kernel. |
 | `quick_allreduce.py` | `FlyQuickAllReduce`, the host class for the mesh and the ring. |
-| `allreduce_policy.py` | The limits, the payload-size boundaries between the three kernels, and the tuning ladders. |
+| `allreduce_policy.py` | The limits, the payload-size boundaries between the three kernels, the payload window of the INT4 sequence-parallel collectives, and the tuning ladders. |
 | `allreduce_host_shared.py` | IPC inbox setup, link detection and other host helpers. |
 
 ## Kernels
@@ -71,6 +71,31 @@ modes, and the all-reduce sizes that the ladder gives the same `super_tile=1`
 engine, share that engine's colors and inbox slots, so calls on independent
 streams need an event dependency; one order for all launches holds for every
 ladder.
+
+A sequence-parallel caller that also has an exact collective for the same layout
+does not call these modes itself. `aiter/dist/device_communicators/sp_collectives.py`
+chooses, by payload size:
+
+- `create_sp_collectives(quick)` is a collective (every rank calls it, outside
+  graph capture). The ranks compare their windows first. It returns a
+  `SequenceParallelCollectives`, or `None` if FlyDSL is unavailable, a rank has
+  no window in `SP_INT4_WINDOWS`, the windows differ, or `compile_sp` fails, in
+  which case every rank gets `None`.
+- `reduce_scatter(inp)` and `all_gather(inp)` return a tensor when the bytes of
+  the full tensor (the reduce-scatter input, the all-gather output) are inside
+  the window, and `None` otherwise, for another dtype or rank, for a padded
+  tensor of 4 GiB or more, or (reduce-scatter) when `T` does not divide by the
+  group size. `None` means the caller continues with its exact collective. The
+  decision depends on the shape, dtype, window and platform only, so every rank
+  decides alike.
+- The router pads each rank's block with zero rows to a whole number of 32 KiB
+  tiles (for hidden 2560: a multiple of 16, 8 or 4 rows at TP 2, 4 or 8),
+  copies a misaligned or non-contiguous input, and returns the unpadded
+  result. The window does not count the padding, so a block of a few rows is
+  never served because its padding fills whole tiles.
+
+`SP_INT4_WINDOWS` has one row: gfx950, xGMI, TP2, from 8 MiB up. There is no
+environment override.
 
 ### Ring
 
@@ -143,6 +168,10 @@ levels:
    maximum of `None` means no upper limit. A missing or empty window disables
    the algorithm. A payload that is in no window goes to `cross_device_reduce`
    or RCCL. `FamilyPolicy.select()` gives the algorithm for a payload size.
+
+   The sequence-parallel INT4 collectives have their own table,
+   `SP_INT4_WINDOWS`, with one `Window` for each arch, link type and world
+   size (see the mesh section above).
 
    The mesh and the ring run only with the INT4 quantization regime, and their
    windows do not overlap. The one-shot is exact and runs in both modes. With quantization on, the mesh/ring takes those payloads first.
@@ -261,6 +290,13 @@ option selects what a test does:
 `op_tests/multigpu_tests/test_flydsl_quick_reduce_scatter_all_gather.py` checks
 and times `reduce_scatter` and `all_gather`. It takes `--tp` and `-s` but no
 `--scenario`.
+
+`op_tests/multigpu_tests/test_flydsl_sp_collectives.py` checks the router on 2
+GPUs (the factory and the platform window, payloads below the window, CUDA graph
+replay) and on 4 (a router built over an engine, with a window that admits every
+size): accuracy against the exact result, bit identity with the engine on an
+input padded by the test, and zero padding rows. It takes `--tp`.
+`tests/test_sp_collectives.py` checks the routing and padding rules on the CPU.
 
 A test fails if the arch is not supported, or if a world size that you name
 with `--tp` needs more GPUs than the node has. The default sweep skips the world
