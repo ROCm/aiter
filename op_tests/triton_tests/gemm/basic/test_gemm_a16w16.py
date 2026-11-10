@@ -68,6 +68,9 @@ def get_x_vals():
     x_vals += [(2**i, 2880, 4096) for i in range(5, 9)]  # output projection
     x_vals += [(2**i, 128, 2880) for i in range(5, 9)]  # Router GEMM
     x_vals += [(v, 106496, 16384) for v in (256, 4096)]  # LL3 405B FC1
+    # Qwen3-Next router (N=512) and GDN in_proj_ba at TP2 (N=32): the tuned M,
+    # an unaligned M and the first M that falls back to DEFAULT.json
+    x_vals += [(m, n, 2048) for n in (512, 32) for m in (1, 4, 8, 16, 32, 37, 64, 65)]
     return x_vals
 
 
