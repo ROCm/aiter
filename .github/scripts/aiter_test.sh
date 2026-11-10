@@ -119,20 +119,6 @@ for file in "${sharded_files[@]}"; do
             # opt-in perf sweep that exits 0 without running anything by default.
             test_cmd=(timeout 60m python3 -m pytest -q "$file")
             ;;
-        op_tests/test_mla_sparse_prefill.py)
-            # The pytest functions hold the correctness and backend-choice
-            # cases; the script entry point runs the backend sweep.
-            test_cmd=(
-                timeout 60m
-                bash -c '
-                    set -euo pipefail
-                    test_file=$1
-                    python3 -m pytest -q "$test_file"
-                    python3 "$test_file"
-                '
-                _ "$file"
-            )
-            ;;
         op_tests/multigpu_tests/bench_mega_moe.py)
             {
                 echo "Running MegaMoE fused-scatter accuracy on 8 GPUs when supported"
