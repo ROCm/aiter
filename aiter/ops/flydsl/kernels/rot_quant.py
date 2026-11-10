@@ -387,8 +387,10 @@ def flydsl_rot_quant_moe_sort(
         raise ValueError(f"x has {M} rows, expected token_num={token_num}")
     # The fused kernel quantizes a token once per route, so past this much work
     # one rotation pass plus mxfp4_moe_sort_fwd is faster (MI350X, E=128,
-    # topk=8, K=2048-7168).
-    if M * topk * K > 1 << 21:
+    # topk 4 and 8, K=2048-7168, every rotation size). When K // 32 is not a
+    # multiple of 4 that path also pads the scales (#7646), and the crossover
+    # moves about 8x higher (K=2880).
+    if M * topk * K > (1 << 24 if (K // MX_GROUP) % 4 else 1 << 21):
         from aiter.ops.quant import mxfp4_moe_sort_fwd
 
         xq, xs = flydsl_rot_quant(x, rotation_size=rotation_size)
