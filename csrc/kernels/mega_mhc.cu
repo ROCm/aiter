@@ -281,7 +281,8 @@ template <int H,
           int STAGE_COLS  = 0,
           int GROUPS      = 1,
           int THREADS     = 256,
-          bool INTERLEAVE = false>
+          bool INTERLEAVE = false,
+          int KEPT        = 0>
 __device__ __forceinline__ void finish_last_split(float (&total)[TILE_M][SLOTS],
                                                   float (&reduction)[4][TILE_M][SLOTS],
                                                   unsigned int& last,
@@ -307,7 +308,8 @@ __device__ __forceinline__ void finish_last_split(float (&total)[TILE_M][SLOTS],
                                                   float norm_eps,
                                                   int sinkhorn_repeat,
                                                   int hidden_arg,
-                                                  bf16* staged = nullptr)
+                                                  bf16* staged       = nullptr,
+                                                  const bf16x8* kept = nullptr)
 {
     const int hidden     = H ? H : hidden_arg;
     const int split_k    = SPLIT ? SPLIT : split_arg;
@@ -515,15 +517,15 @@ __device__ __forceinline__ void finish_last_split(float (&total)[TILE_M][SLOTS],
         const int ncol     = (lane % 8) * 8 + (GROUPS == 2 ? 0 : (wid / 2) * 64);
         constexpr int STEP = GROUPS == 2 ? 64 : 128;
         auto normalize     = [&]<bool FROM_LDS>() {
-            constexpr int first = FROM_LDS ? 0 : STAGE_COLS / GROUPS;
-            constexpr int end   = FROM_LDS ? STAGE_COLS / GROUPS : hidden / GROUPS;
+            constexpr int first      = FROM_LDS ? 0 : STAGE_COLS / GROUPS;
+            constexpr int end        = FROM_LDS ? STAGE_COLS / GROUPS : hidden / GROUPS;
+            constexpr int kept_begin = hidden / GROUPS - KEPT * STEP;
 #pragma unroll
             for(int m = 0; m < TILE_M / 16; ++m)
             {
                 const int r      = nrow + m * 16;
                 const float rstd = total[min(r, tile_rows - 1)][25];
-                for(int k = first; k < end; k += 4 * STEP)
-                {
+                auto batch       = [&](int k) {
                     bf16x8 x[4], w[4];
 #pragma unroll
                     for(int u = 0; u < 4; ++u)
@@ -537,6 +539,8 @@ __device__ __forceinline__ void finish_last_split(float (&total)[TILE_M][SLOTS],
                             const int sw = ((p / 8) ^ ((r & 7) ^ ((r & 1) << 2))) * 8 + (p & 7);
                             x[u] = *reinterpret_cast<const bf16x8*>(staged + r * STAGE_COLS + sw);
                         }
+                        else if(KEPT > 0 && k + u * STEP >= kept_begin)
+                            x[u] = kept[(k + u * STEP - kept_begin) / STEP];
                         else
                             x[u] = load_vector_nbytes<bf16, 8, 16, 1>(g_norm, r * hidden + col);
                         w[u] = load_vector_nbytes<bf16, 8, 16>(g_weight, col);
@@ -557,7 +561,17 @@ __device__ __forceinline__ void finish_last_split(float (&total)[TILE_M][SLOTS],
                             g_norm, out, r * hidden + col);
                         quant.store(out, r * hidden + col);
                     }
+                };
+                // Constant indices keep the register-resident columns in VGPRs.
+                if constexpr(!FROM_LDS && KEPT > 0)
+                {
+#pragma unroll
+                    for(int k = first; k < end; k += 4 * STEP)
+                        batch(k);
                 }
+                else
+                    for(int k = first; k < end; k += 4 * STEP)
+                        batch(k);
             }
         };
         normalize.template operator()<true>();
@@ -1505,7 +1519,16 @@ __device__ __forceinline__ void large_tiles(const bf16* residual,
     constexpr bool INTERLEAVE = PINGPONG && GROUPS == 2;
     auto kcol = [&](int ki) { return INTERLEAVE ? 2 * ki + group * STEP : begin + ki; };
     // Prefetches past the last k-step fall outside every buffer.
-    auto kload   = [&](int ki) { return ki < hidden_part ? kcol(ki) : 1 << 20; };
+    auto kload = [&](int ki) { return ki < hidden_part ? kcol(ki) : 1 << 20; };
+    // Staged tiles run one workgroup per CU, so registers past 256 (AGPRs) are
+    // free. Keep each lane's last KEPT unstaged collapse vectors there for the
+    // RMSNorm pass instead of a layer_input round trip; the pass reads them
+    // back with the main loop's row and column ownership.
+    constexpr int UNSTAGED   = (hidden_part - STAGED / GROUPS) / STEP;
+    constexpr int KEPT       = INTERLEAVE && STAGED > 0 ? (UNSTAGED < 20 ? UNSTAGED : 20) : 0;
+    constexpr int KEEP_BEGIN = hidden_part - KEPT * STEP;
+    static_assert(KEPT == 0 || (KEPT % 2 == 0 && NC * MT == WAVES_PER_GROUP));
+    bf16x8 kept[KEPT ? KEPT : 1];
     using Fn     = bf16x8[STREAMS_PER_WAVE][NC][3];
     auto load_fn = [&](Fn& fn, int k) {
 #pragma unroll
@@ -1527,6 +1550,7 @@ __device__ __forceinline__ void large_tiles(const bf16* residual,
     auto step = [&](int ki, const Tile& current, Fn& fn) __attribute__((always_inline))
     {
         const int k = kcol(ki);
+        bf16x8 kept_value{};
         bf16x8 r[STREAMS_PER_WAVE][NC * MT];
 #pragma unroll
         for(int s = 0; s < STREAMS_PER_WAVE; ++s)
@@ -1654,9 +1678,10 @@ __device__ __forceinline__ void large_tiles(const bf16* residual,
                     const int col = group * (STAGED / GROUPS) + ki + ((c % NC) / 2) * 64 + k_lane;
                     *reinterpret_cast<bf16x8*>(&collapse_lds[tr][lds_col(tr, col)]) = collapsed;
                 }
-                else
+                else if(ki < KEEP_BEGIN)
                     store_vector_nbytes<bf16, bf16, 8, 16>(
                         g_norm, collapsed, tr * hidden + k + ((c % NC) / 2) * 64 + k_lane);
+                kept_value = collapsed;
             }
         }
         if constexpr(EIGHT_WAVE_POST)
@@ -1728,6 +1753,7 @@ __device__ __forceinline__ void large_tiles(const bf16* residual,
             __syncthreads();
         if constexpr(STREAMS_PER_WAVE == 4)
             __builtin_amdgcn_wave_barrier();
+        return kept_value;
     };
     // Rotating one prefetched tile through register copies would make those
     // copies wait on the loads just issued, and on the preceding residual
@@ -1737,17 +1763,38 @@ __device__ __forceinline__ void large_tiles(const bf16* residual,
         static_assert(hidden_part % (2 * STEP) == 0);
         Tile a = load_tile(kload(0)), b;
         Fn fa, fb;
-#pragma unroll 1
-        for(int ki = 0; ki < hidden_part; ki += 2 * STEP)
-        {
+        auto two_steps = [&](int ki, bf16x8(&x)[2]) {
             load_fn(fa, kcol(ki));
             __builtin_amdgcn_sched_barrier(0);
-            b = load_tile(kload(ki + STEP));
-            step(ki, a, fa);
+            b    = load_tile(kload(ki + STEP));
+            x[0] = step(ki, a, fa);
             load_fn(fb, kcol(ki + STEP));
             __builtin_amdgcn_sched_barrier(0);
-            a = load_tile(kload(ki + 2 * STEP));
-            step(ki + STEP, b, fb);
+            a    = load_tile(kload(ki + 2 * STEP));
+            x[1] = step(ki + STEP, b, fb);
+        };
+#pragma unroll 1
+        for(int ki = 0; ki < KEEP_BEGIN; ki += 2 * STEP)
+        {
+            bf16x8 x[2];
+            two_steps(ki, x);
+        }
+        // Shift instead of unrolling: one step body per kept vector would
+        // crowd the instruction cache. Past 20 vectors the shifts cost more
+        // than the round trip they save (H=7168).
+        if constexpr(KEPT > 0)
+        {
+#pragma unroll 1
+            for(int ki = KEEP_BEGIN; ki < hidden_part; ki += 2 * STEP)
+            {
+                bf16x8 x[2];
+                two_steps(ki, x);
+#pragma unroll
+                for(int i = 0; i + 2 < KEPT; ++i)
+                    kept[i] = kept[i + 2];
+                kept[KEPT - 2] = x[0];
+                kept[KEPT - 1] = x[1];
+            }
         }
     }
     else
@@ -1816,7 +1863,7 @@ __device__ __forceinline__ void large_tiles(const bf16* residual,
                 v += local_reduction[w][i / SLOTS][i % SLOTS];
         total[i / SLOTS][i % SLOTS] = v;
     }
-    finish_last_split<H, VARIANT, MXFP8, 1, BM, STAGED, GROUPS, THREADS, INTERLEAVE>(
+    finish_last_split<H, VARIANT, MXFP8, 1, BM, STAGED, GROUPS, THREADS, INTERLEAVE, KEPT>(
         total,
         reduction,
         last,
@@ -1842,7 +1889,8 @@ __device__ __forceinline__ void large_tiles(const bf16* residual,
         norm_eps,
         20,
         hidden_arg,
-        &collapse_lds[0][0]);
+        &collapse_lds[0][0],
+        kept);
 #endif
 }
 
