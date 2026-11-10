@@ -1,19 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""FlyDSL Mamba-2 SSD chunked forward kernels (RDNA WMMA, wave32).
+"""FlyDSL Mamba-2 SSD chunked kernels (RDNA WMMA, wave32).
 
-The chunked forward is split into three kernels:
-
-* ``chunk_cumsum``  -- per-chunk cumulative log2 decay ``LOG2E * cumsum(a*dt)``,
-  written token-contiguous (``[b, h, t]``) so later kernels read it with
-  wave-uniform loads, plus ``dt`` in the same layout.
-* ``fwd_pass_state`` -- sequential walk over chunks carrying the
-  ``[head_size, state_size]`` state in WMMA accumulators; stores each chunk's
-  entry state (narrowed, the operand ``compute_out`` consumes) and the fp32
-  final state.
-* ``compute_out``   -- fuses the carried-state term ``exp2(d_t) * C h^T``, the
-  masked intra-chunk term ``(C B^T * L) (dt x)`` and the ``D x`` skip without
-  materialising the ``[chunk, chunk]`` interaction matrix.
+* ``chunk_cumsum``   -- per-chunk log2 decay cumsum and dt, as ``[b, h, t]``.
+* ``fwd_pass_state`` -- serial walk over chunks carrying the state in WMMA
+  accumulators; stores each chunk's entry state and the final state. The
+  backward reuses it for the reverse state-gradient walk.
+* ``compute_out``    -- fuses the carried-state term ``exp2(d_t) * C h^T``, the
+  masked intra-chunk term ``(C B^T * L) (dt x)`` and ``D x`` without
+  materialising the ``[chunk, chunk]`` matrix.
 
 All matmuls are RDNA ``16x16x16`` bf16 WMMA (wave32, v8 f32 accumulator).
 ``_WmmaLayout`` holds the per-generation lane contract:
@@ -464,15 +459,10 @@ def build_compute_out(
 ):
     """One block per (chunk, p-tile, batch*head); wave w owns token rows 16w..16w+15.
 
-    The block first stages the chunk's x tile (transposed) and its decay / dt
-    into LDS with coalesced 128-bit loads, so the waves' source-tile loops read
-    the strided x operand from LDS instead of gathering it from memory. B, C and
-    the chunk-entry state rows are contiguous and stay 128-bit global reads
-    (staging B too costs more occupancy than it saves).
-
-    Tiles are numbered heads-fastest. ``persistent`` launches a fixed grid whose
-    blocks stride over the tiles; otherwise
-    each block takes one tile.
+    Only the strided x tile (transposed) and decay / dt are staged in LDS; B, C
+    and the state rows are contiguous 128-bit global reads (staging B costs more
+    occupancy than it saves). ``persistent`` launches a fixed grid that strides
+    over the heads-fastest tiles.
     """
     H, G, P, N, L = num_heads, num_groups, head_size, state_size, chunk_size
     HPG = H // G

@@ -31,6 +31,7 @@ except ImportError:
 torch.set_default_device("cuda")
 # Mismatching elements allowed per output, as in the other FlyDSL op tests.
 _TOL_ERR_RATIO = 1e-3
+_TERM_TOL = 2**-6  # ~4 bf16 ulps of an element's summed |terms|
 
 
 def _ref_decay_cumsum(a, dt, chunk_size):
@@ -136,9 +137,8 @@ def test_mamba2_chunk_forward(
         ),
     }
     if chunk_simple_gla is not None:
-        # Mamba-2 SSD == simple GLA with q=C, k=B, v=dt*x, g=a*dt, scale=1, state [N, P].
-        # Head expansion and v/g prep are hoisted out of the timed call, so only
-        # fla's kernels (plus the D*x skip) are measured.
+        # Mamba-2 SSD == simple GLA with q=C, k=B, v=dt*x, g=a*dt, state [N, P];
+        # the input prep is hoisted so only fla's kernels are timed.
         q_f = c.repeat_interleave(H // G, dim=2).contiguous()
         k_f = b.repeat_interleave(H // G, dim=2).contiguous()
         v_f = (x.float() * dt.float()[..., None]).to(dtype)
@@ -170,27 +170,30 @@ def test_mamba2_chunk_forward(
         + 2 * B * H * P * N * 4  # init / final state
     )
 
-    # bf16 operands round at the scale of the largest output terms, and those
-    # errors survive cancellation into small outputs, so allow one bf16 ulp of
-    # the output's magnitude on top of the base atol.
-    out_atol = 2e-2 + _bf16_ulp(ref_out.abs().max().item())
+    # bf16 rounding scales with each element's summed |terms|, not its value, so
+    # errors are measured relative to that (the reference run on |inputs|).
+    out_scale, state_scale = run_torch(
+        x.abs(), a, b.abs(), c.abs(), d.abs(), dt, init_state.abs(), L
+    )
+    out_scale = out_scale.float().clamp_min(1e-6)
+    state_scale = state_scale.clamp_min(1e-6)
 
     ret = {"gfx": get_gfx_runtime()}
     for name, fn in candidates.items():
         (out, state), us = run_perftest(fn)
         err = checkAllclose(
-            ref_out.to(dtypes.fp32),
-            out.to(dtypes.fp32),
-            rtol=2e-2,
-            atol=out_atol,
+            ref_out.float() / out_scale,
+            out.float() / out_scale,
+            rtol=0,
+            atol=_TERM_TOL,
             tol_err_ratio=_TOL_ERR_RATIO,
             msg=f"{name}: out",
         )
         state_err = checkAllclose(
-            ref_state,
-            state.to(dtypes.fp32),
-            rtol=1e-2,
-            atol=1e-2,
+            ref_state / state_scale,
+            state.float() / state_scale,
+            rtol=0,
+            atol=_TERM_TOL,
             tol_err_ratio=_TOL_ERR_RATIO,
             msg=f"{name}: final_state",
         )

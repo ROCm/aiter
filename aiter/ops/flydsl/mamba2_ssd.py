@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Mamba-2 SSD chunked forward (FlyDSL).
+"""Mamba-2 SSD chunked forward and backward (FlyDSL).
 
 Contract::
 
@@ -88,20 +88,22 @@ def default_config(head_size, state_size, chunk_size):
     return {**state, **list(_out_configs(head_size, state_size, chunk_size))[-1]}
 
 
+# Compiled handles are per device (``_run_compiled`` caches one per launcher),
+# so every factory takes the device index as its first cache key.
 @functools.cache
-def _cumsum(H, L):
+def _cumsum(device, H, L):
     return build_chunk_cumsum(H, L, _CUMSUM_BLOCK_H)
 
 
 @functools.cache
-def _state(H, G, P, N, L, rm, rn, ks, backward=False, state_f32=False):
+def _state(device, H, G, P, N, L, rm, rn, ks, backward=False, state_f32=False):
     return build_fwd_pass_state(
         get_gfx_runtime(), H, G, P, N, L, rm, rn, ks, backward, state_f32
     )
 
 
 @functools.cache
-def _out(H, G, P, N, L, rp, ku, persistent):
+def _out(device, H, G, P, N, L, rp, ku, persistent):
     return build_compute_out(get_gfx_runtime(), H, G, P, N, L, rp, ku, persistent)
 
 
@@ -136,11 +138,12 @@ def _tuned_config(name, key, configs, launch, config):
     return _tuned[name, key]
 
 
+_MAX_BUFFER_BYTES = 2**31
 # compute_out runs one wave per 16 tokens of a chunk.
 MAX_CHUNK_SIZE = MAX_THREADS // WAVE * TILE
 
 
-def _check_inputs(x, a, b, c, d, dt, init_state, chunk_size):
+def _check_inputs(x, a, b, c, d, dt, init_state, chunk_size, state_bytes=2):
     """Reject inputs the kernels would index out of bounds; see the contract."""
     gfx = get_gfx_runtime()
     if gfx not in SUPPORTED_GFX:
@@ -177,6 +180,23 @@ def _check_inputs(x, a, b, c, d, dt, init_state, chunk_size):
     for t in (a, b, c, d, dt, init_state):
         if t.device != x.device:
             raise ValueError("all inputs must be on x's device")
+    # Buffer descriptors use 32-bit byte offsets over the whole buffer.
+    hidden_bytes = (
+        batch_size
+        * num_heads
+        * (num_tokens // chunk_size)
+        * head_size
+        * state_size
+        * state_bytes
+    )
+    largest = max(
+        x.nbytes, b.nbytes, batch_size * num_heads * num_tokens * 4, hidden_bytes
+    )
+    if largest >= _MAX_BUFFER_BYTES:
+        raise ValueError(
+            f"a {largest}-byte buffer exceeds the {_MAX_BUFFER_BYTES}-byte limit of "
+            "32-bit buffer offsets; split the batch or the heads"
+        )
 
 
 def _chunk_cumsum(a, dt, chunk_size, stream):
@@ -185,7 +205,7 @@ def _chunk_cumsum(a, dt, chunk_size, stream):
     decay_bht = dt.new_empty(batch_size, num_heads, num_tokens, dtype=torch.float32)
     dt_bht = torch.empty_like(decay_bht)
     _run_compiled(
-        _cumsum(num_heads, chunk_size),
+        _cumsum(dt.device.index, num_heads, chunk_size),
         a,
         dt,
         decay_bht,
@@ -226,6 +246,7 @@ def _fwd_pass_state(
     def launch(cfg):
         _run_compiled(
             _state(
+                x.device.index,
                 num_heads,
                 num_groups,
                 head_size,
@@ -269,6 +290,7 @@ def _compute_out(x, b, c, d, dt_bht, decay_bht, hiddens, chunk_size, stream, con
             num_programs //= 16 * cfg["rp"]
         _run_compiled(
             _out(
+                x.device.index,
                 num_heads,
                 num_groups,
                 head_size,
@@ -304,6 +326,8 @@ def mamba2_chunk_forward_flydsl(
     """Return the output and fp32 final state; chunk-entry states are kept in
     c.dtype."""
     _check_inputs(x, a, b, c, d, dt, init_state, chunk_size)
+    if x.shape[1] == 0:  # nothing to scan: the state passes through
+        return torch.empty_like(x), init_state.float().clone()
     head_size, state_size = x.shape[3], b.shape[3]
     if config is not None:
         config = {**default_config(head_size, state_size, chunk_size), **config}
@@ -400,15 +424,27 @@ def mamba2_chunk_backward_flydsl(
     The chunk states (fp32) and the state gradients (the forward recurrence run
     in reverse) come from the FlyDSL pass_state kernel.
     """
-    _check_inputs(x, a, b, c, d, dt, init_state, chunk_size)
+    _check_inputs(x, a, b, c, d, dt, init_state, chunk_size, state_bytes=4)
     if (
         dout.shape != x.shape
         or dout.dtype != torch.bfloat16
         or not dout.is_contiguous()
+        or dout.device != x.device
     ):
-        raise ValueError("dout must be contiguous bf16 shaped like x")
+        raise ValueError("dout must be contiguous bf16 shaped like x, on x's device")
     if dfinal_state.shape != init_state.shape or dfinal_state.device != x.device:
         raise ValueError("dfinal_state must be shaped like init_state, on x's device")
+    if x.shape[1] == 0:  # no tokens: only the state gradient passes through
+        z = torch.zeros_like
+        return (
+            z(x),
+            z(a, dtype=torch.float32),
+            z(b),
+            z(c),
+            z(d, dtype=torch.float32),
+            z(dt),
+            dfinal_state.float().clone(),
+        )
     head_size, state_size = x.shape[3], b.shape[3]
     if config is not None:
         config = {**default_config(head_size, state_size, chunk_size), **config}
