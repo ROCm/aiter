@@ -3,33 +3,7 @@
 
 """FlyDSL -- high-performance GPU kernels implemented using FlyDSL."""
 
-import os
 from importlib import import_module
-
-
-def _pin_flydsl_target_arch():
-    """Make FlyDSL compile for the GPU's real ISA (e.g. gfx1250-strict on MI450 A0).
-
-    flydsl.runtime.device.get_rocm_arch() prefers HSA_OVERRIDE_GFX_VERSION over
-    the hardware, so an image exporting HSA_OVERRIDE_GFX_VERSION=12.5.0 makes
-    FlyDSL emit gfx1250 (B0) code objects on A0. FLYDSL_GPU_ARCH takes priority
-    over the override; a user-set value is left alone.
-    """
-    if os.environ.get("FLYDSL_GPU_ARCH"):
-        return
-    try:
-        from aiter.jit.utils.chip_info import get_gfx_runtime  # rocminfo, no HIP init
-
-        arch = get_gfx_runtime()
-    except Exception:  # noqa: BLE001 -- no GPU: keep FlyDSL's own detection
-        return
-    # Only the A0 case; every other GPU (and any deliberate
-    # HSA_OVERRIDE_GFX_VERSION) keeps FlyDSL's own detection unchanged.
-    if arch == "gfx1250-strict":
-        os.environ["FLYDSL_GPU_ARCH"] = arch
-
-
-_pin_flydsl_target_arch()
 
 import flydsl as _flydsl
 from packaging.version import Version

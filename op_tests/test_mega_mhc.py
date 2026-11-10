@@ -448,7 +448,7 @@ def main():
     if not torch.cuda.is_available():
         parser.error("Mega-MHC requires a GPU")
     arch = get_gfx_runtime()
-    if arch not in ("gfx950", "gfx942", "gfx1250", "gfx1250-strict"):
+    if arch not in ("gfx950", "gfx942", "gfx1250"):
         parser.error("Mega-MHC requires gfx950, gfx942 or gfx1250")
     if "mxfp8" in args.out_dtype and arch not in ("gfx950", "gfx1250"):
         parser.error("Mega-MHC mxfp8 requires gfx950 or gfx1250")

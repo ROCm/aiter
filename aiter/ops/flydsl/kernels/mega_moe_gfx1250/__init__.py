@@ -4,32 +4,6 @@
 """gfx1250 MegaMoE with a single lazy public entry point."""
 
 import importlib
-import os
-
-
-def _pin_mori_jit_arch():
-    """Make mori's JIT target the GPU's real ISA (e.g. gfx1250-strict on MI450 A0).
-
-    mori.jit.config.detect_gpu_arch() runs `rocm_agent_enumerator` without
-    `-name`, which reports the base ISA (gfx1250) on A0, so the EP dispatch
-    kernel was built for gfx1250 and hipModuleLoad rejected it there ("device
-    kernel image is invalid"). A single arch in MORI_GPU_ARCHS overrides that
-    detection; a user-set value is left alone.
-    """
-    if os.environ.get("MORI_GPU_ARCHS"):
-        return
-    try:
-        from aiter.jit.utils.chip_info import get_gfx_runtime  # rocminfo, no HIP init
-
-        arch = get_gfx_runtime()
-    except Exception:  # noqa: BLE001 -- no GPU: leave mori's own detection
-        return
-    # Only the A0 case; every other GPU keeps mori's own detection unchanged.
-    if arch == "gfx1250-strict":
-        os.environ["MORI_GPU_ARCHS"] = arch
-
-
-_pin_mori_jit_arch()
 
 __all__ = [
     "CombineKind",

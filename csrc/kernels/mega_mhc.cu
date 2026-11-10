@@ -2632,8 +2632,7 @@ void mega_mhc_bf16(aiter_tensor_t& residual_out,
 #if AITER_MHC_GFX1250
     {
         const HipDeviceGuard guard(residual.device_id);
-        const std::string gpu_arch = get_gpu_arch();
-        if(gpu_arch == "gfx1250" || gpu_arch == "gfx1250-strict")
+        if(get_gpu_arch() == "gfx1250")
         {
             mega_mhc_gfx1250(residual_out,
                              post_out,

@@ -11,7 +11,6 @@ import torch
 from torch import Tensor
 
 from ..jit.core import compile_ops
-from ..jit.utils.build_targets import base_gfx_arch
 from ..jit.utils.chip_info import get_gfx_runtime
 
 __all__ = ["MegaMHCWorkspace", "mega_mhc", "mega_mhc_shuffle_fn", "prepare_mega_mhc"]
@@ -283,7 +282,7 @@ def _prepare_scratch(device, tokens, hidden, split_k=None, *, reuse_scratch=True
     ):
         raise ValueError("unsupported T or H")
     with torch.cuda.device(device):
-        arch = base_gfx_arch(get_gfx_runtime())
+        arch = get_gfx_runtime()
         if arch not in ("gfx950", "gfx942", "gfx1250"):
             raise RuntimeError(
                 f"mega_mhc requires gfx950, gfx942 or gfx1250, got {arch}"
@@ -500,7 +499,7 @@ def mega_mhc(
             )
         residual_out = residual
     with torch.cuda.device(device):
-        arch = base_gfx_arch(get_gfx_runtime())
+        arch = get_gfx_runtime()
         if out_dtype == "mxfp8" and arch not in ("gfx950", "gfx1250"):
             raise RuntimeError("Mega-MHC mxfp8 requires gfx950 or gfx1250")
         if out_dtype == "mxfp8" and arch == "gfx1250" and h % 128:

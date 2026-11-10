@@ -24,9 +24,7 @@ from aiter.benchmark_data_init import (
 from aiter.ops.opus._arch import _detect_arch, _device_arch_and_cu
 from aiter.ops.opus.launch_plan import _get_cached_a16w16_launch_plan
 
-_arch_ok, _detected_gfx = _detect_arch(
-    {"gfx950", "gfx942", "gfx1250", "gfx1250-strict"}
-)
+_arch_ok, _detected_gfx = _detect_arch({"gfx950", "gfx942", "gfx1250"})
 
 from aiter.ops.opus import opus_bmm, opus_gemm
 from aiter.test_common import checkAllclose, run_perftest
