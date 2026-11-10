@@ -3,7 +3,7 @@ import math
 
 import triton
 
-from aiter.ops.triton.gemm.basic.gemm_a16w16x3 import gemm_a16w16x3
+from aiter.ops.triton.gemm.basic.gemm_a16w32 import gemm_a16w32
 from op_tests.op_benchmarks.triton.utils.argparse import (
     add_argparse_ff,
     get_do_bench_graph_kwargs,
@@ -19,13 +19,13 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
 from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
     RotatingBufferBench,
 )
-from op_tests.triton_tests.gemm.basic.test_gemm_a16w16x3 import (
-    generate_gemm_a16w16x3_inputs,
+from op_tests.triton_tests.gemm.basic.test_gemm_a16w32 import (
+    generate_gemm_a16w32_inputs,
 )
 
 
 def bench_gemm_fn(bencher: RotatingBufferBench, M: int, N: int, K: int, metric: str):
-    _p_gen = functools.partial(generate_gemm_a16w16x3_inputs, M, N, K, output=True)
+    _p_gen = functools.partial(generate_gemm_a16w32_inputs, M, N, K, output=True)
     _out_vals_keys = ["x", "w", "w_bf16x3", "y"]
     rot_bufs = bencher.build_pool([_p_gen], [_out_vals_keys])
 
@@ -37,7 +37,7 @@ def bench_gemm_fn(bencher: RotatingBufferBench, M: int, N: int, K: int, metric: 
     mem_write = (M * N) * rot_bufs[0]["y"].element_size()
     mem = mem_read + mem_write
 
-    ms = bencher.bench(gemm_a16w16x3)
+    ms = bencher.bench(gemm_a16w32)
 
     if metric == "time":
         return ms
@@ -69,7 +69,7 @@ def run_benchmark(args, defaults):
 
 
 def parse_args(args=None):
-    parser = get_parser(kernel_name="A16W16X3 GEMM (bf16x3 fp32-weight GEMM)")
+    parser = get_parser(kernel_name="A16W32 GEMM (bf16 activations, fp32 weights)")
     parser = add_argparse_ff(parser)
     return get_ff_args(parser, args=args)
 

@@ -5,9 +5,9 @@ import torch
 import triton
 
 from aiter.jit.utils.torch_guard import torch_compile_guard
-from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a16w16x3 import (
-    _gemm_a16w16x3_fma_kernel,
-    _gemm_a16w16x3_kernel,
+from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a16w32 import (
+    _gemm_a16w32_bf16x3_kernel,
+    _gemm_a16w32_fma_kernel,
     _get_config,
 )
 from aiter.ops.triton.utils.common_utils import deserialize_str, serialize_dict
@@ -57,7 +57,7 @@ def _split_counters(device: torch.device, stream_id: int) -> torch.Tensor:
         return torch.zeros(_SPLIT_COUNTERS, dtype=torch.int32, device=device)
 
 
-def gemm_a16w16x3_fake_tensor(
+def gemm_a16w32_fake_tensor(
     x: torch.Tensor,
     w: torch.Tensor,
     w_bf16x3: torch.Tensor,
@@ -75,7 +75,7 @@ def _gemm_fma(x, w, y, config):
     M, K = x.shape
     N = w.shape[0]
     grid = (triton.cdiv(M, config["BLOCK_SIZE_M"]) * N,)
-    _gemm_a16w16x3_fma_kernel[grid](
+    _gemm_a16w32_fma_kernel[grid](
         x,
         w,
         y,
@@ -114,7 +114,7 @@ def _gemm_bf16x3(x, w_bf16x3, y, config):
         counters = _split_counters(x.device, stream_id)
 
     grid = (num_tiles * config["NUM_KSPLIT"],)
-    _gemm_a16w16x3_kernel[grid](
+    _gemm_a16w32_bf16x3_kernel[grid](
         x,
         w_bf16x3,
         y,
@@ -135,8 +135,8 @@ def _gemm_bf16x3(x, w_bf16x3, y, config):
     )
 
 
-@torch_compile_guard(gen_fake=gemm_a16w16x3_fake_tensor)
-def gemm_a16w16x3_(
+@torch_compile_guard(gen_fake=gemm_a16w32_fake_tensor)
+def gemm_a16w32_(
     x: torch.Tensor,
     w: torch.Tensor,
     w_bf16x3: torch.Tensor,
@@ -176,9 +176,7 @@ def gemm_a16w16x3_(
     time. With torch < 2.10, run one eager split-K call on a stream before a graph
     capture on that stream.
     """
-    _LOGGER.info(
-        "GEMM_A16W16X3: x.shape=%s, w.shape=%s", tuple(x.shape), tuple(w.shape)
-    )
+    _LOGGER.info("GEMM_A16W32: x.shape=%s, w.shape=%s", tuple(x.shape), tuple(w.shape))
     assert x.dtype == torch.bfloat16 and x.dim() == 2, "bf16 (M, K) x"
     assert w.dtype == torch.float32 and w.dim() == 2, "fp32 (N, K) w"
     assert w_bf16x3.dtype == torch.bfloat16, "bf16 w_bf16x3"
@@ -206,7 +204,7 @@ def gemm_a16w16x3_(
     return y
 
 
-def gemm_a16w16x3(
+def gemm_a16w32(
     x: torch.Tensor,
     w: torch.Tensor,
     w_bf16x3: torch.Tensor,
@@ -216,8 +214,8 @@ def gemm_a16w16x3(
     """
     Computes Y = X @ W^T in fp32 for a bf16 X and an fp32 weight W.
 
-    See ``gemm_a16w16x3_`` for the arguments. Here ``config`` is a dict. The
+    See ``gemm_a16w32_`` for the arguments. Here ``config`` is a dict. The
     wrapper serializes it, so that torch.compile can trace the op.
     """
     config_hashable = serialize_dict(config) if config else None
-    return gemm_a16w16x3_(x, w, w_bf16x3, y, config_hashable)
+    return gemm_a16w32_(x, w, w_bf16x3, y, config_hashable)

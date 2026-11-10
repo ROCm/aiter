@@ -11,8 +11,8 @@ from aiter.ops.triton._triton_kernels.common.pid_preprocessing import (
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 
-_gemm_a16w16x3_repr = make_kernel_repr(
-    "_gemm_a16w16x3_kernel",
+_gemm_a16w32_bf16x3_repr = make_kernel_repr(
+    "_gemm_a16w32_bf16x3_kernel",
     [
         "BLOCK_SIZE_M",
         "BLOCK_SIZE_N",
@@ -36,8 +36,8 @@ _gemm_a16w16x3_repr = make_kernel_repr(
         * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
 )
-@triton.jit(repr=_gemm_a16w16x3_repr)
-def _gemm_a16w16x3_kernel(
+@triton.jit(repr=_gemm_a16w32_bf16x3_repr)
+def _gemm_a16w32_bf16x3_kernel(
     a_ptr,
     b_ptr,
     c_ptr,
@@ -164,15 +164,15 @@ def _gemm_a16w16x3_kernel(
             tl.atomic_xchg(cnt_ptr + tile_id, 0, sem="relaxed", scope="gpu")
 
 
-_gemm_a16w16x3_fma_repr = make_kernel_repr(
-    "_gemm_a16w16x3_fma_kernel",
+_gemm_a16w32_fma_repr = make_kernel_repr(
+    "_gemm_a16w32_fma_kernel",
     ["K", "BLOCK_SIZE_M", "BLOCK_SIZE_K", "cache_modifier", "EVEN_K"],
 )
 
 
 @triton.heuristics({"EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0})
-@triton.jit(repr=_gemm_a16w16x3_fma_repr)
-def _gemm_a16w16x3_fma_kernel(
+@triton.jit(repr=_gemm_a16w32_fma_repr)
+def _gemm_a16w32_fma_kernel(
     a_ptr,
     w_ptr,
     c_ptr,
@@ -232,4 +232,4 @@ def _gemm_a16w16x3_fma_kernel(
 
 
 def _get_config(M: int, N: int, K: int, backend: str = "triton"):
-    return get_gemm_config("GEMM-A16W16X3", M, N, K, backend=backend)
+    return get_gemm_config("GEMM-A16W32", M, N, K, backend=backend)

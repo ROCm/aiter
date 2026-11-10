@@ -432,16 +432,16 @@ def gemm_a16w16_atomic(shape, backend):
     return call, (x, w, y), None
 
 
-@kernel("GEMM-A16W16X3", bits=(16, 48), backend_kwarg=False)
-def gemm_a16w16x3(shape, backend):
-    from aiter.ops.triton.gemm.basic.gemm_a16w16x3 import gemm_a16w16x3 as gemm
-    from op_tests.triton_tests.gemm.basic.test_gemm_a16w16x3 import (
-        generate_gemm_a16w16x3_inputs,
+@kernel("GEMM-A16W32", bits=(16, 48), backend_kwarg=False)
+def gemm_a16w32(shape, backend):
+    from aiter.ops.triton.gemm.basic.gemm_a16w32 import gemm_a16w32 as gemm
+    from op_tests.triton_tests.gemm.basic.test_gemm_a16w32 import (
+        generate_gemm_a16w32_inputs,
     )
 
     M, N, K = shape["M"], shape["N"], shape["K"]
     # the bf16x3 kernel keeps three bf16 weight tiles in LDS, hence bits=(16, 48)
-    x, w, w_bf16x3, y = generate_gemm_a16w16x3_inputs(M, N, K, output=True)
+    x, w, w_bf16x3, y = generate_gemm_a16w32_inputs(M, N, K, output=True)
 
     def call(config, x, w, w_bf16x3, y):
         return gemm(x, w, w_bf16x3, y=y, config=config)
