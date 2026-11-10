@@ -124,13 +124,6 @@ def gemm_a16w16_streamk_kernel_(
             layout=SHARED_LAYOUT_B,
         )
 
-    a_buffer = gl.allocate_shared_memory(
-        a_desc.dtype, shape=[NUM_BUFFERS] + a_desc.block_shape, layout=a_desc.layout
-    )
-    b_buffer = gl.allocate_shared_memory(
-        b_desc.dtype, shape=[NUM_BUFFERS] + b_desc.block_shape, layout=b_desc.layout
-    )
-
     # Trip-count hint, so the backend can drop the guard of the steady loop. The host sets the
     # gate: K can give only one K tile, and NUM_BUFFERS has a floor of 2, so the steady loop is
     # then empty. Without the gate this states 0 > 0, and that UB miscompiles the whole kernel:
@@ -146,18 +139,18 @@ def gemm_a16w16_streamk_kernel_(
         else c_ptr.type.element_ty
     )
 
-    # Stage C over the dead B ring: one reinterpret, one full-tile store, no extra LDS. Only the B
-    # ring works, because the store needs an N-oriented padding interval and the A ring pads on K.
+    # Stage C through LDS and write it with one TDM store. compute_tile allocates the A and B
+    # rings and this stage itself, so all three live for one tile only and the shared-memory
+    # allocator puts the C stage on top of the dead rings. It therefore costs no extra LDS:
+    # at per-CTA 256x256 with BLOCK_K 128 the kernel reserves 278496 bytes either way, while
+    # A + B + C unoverlapped would need 393216 against a 327680 cap.
+    #
+    # The padding interval must equal the innermost block extent of the descriptor, which is
+    # the per-CTA N. A dedicated stage can always meet that, so the store no longer depends on
+    # the B layout or on BLOCK_K.
     _C_ELEM: gl.constexpr = c_ptr.type.element_ty.primitive_bitwidth // 8
     _C_PAD_N: gl.constexpr = BLOCK_N // CTAS_N
-    _B_RING_PC: gl.constexpr = NUM_BUFFERS * BLOCK_K * _C_PAD_N * 2
-    _C_TILE_PC: gl.constexpr = (BLOCK_M // CTAS_M) * _C_PAD_N * _C_ELEM
-    C_ALIAS_B: gl.constexpr = (
-        (not TRANSPOSE_B)
-        and _C_ELEM == 2
-        and _C_PAD_N <= 256
-        and _C_TILE_PC <= _B_RING_PC
-    )
+    C_ALIAS_B: gl.constexpr = _C_ELEM == 2 and _C_PAD_N <= 256
     # Built in every case so the tile helper always has the names. It is used only when
     # C_ALIAS_B is on; otherwise the helper takes the masked store path.
     SHARED_LAYOUT_C: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
@@ -183,8 +176,6 @@ def gemm_a16w16_streamk_kernel_(
             a_desc,
             b_desc,
             c_desc,
-            a_buffer,
-            b_buffer,
             c_ptr,
             pid_m * BLOCK_M,
             pid_n * BLOCK_N,
@@ -216,13 +207,8 @@ def gemm_a16w16_streamk_kernel_(
         SUB_N: gl.constexpr = BLOCK_N // SPLIT_N
         SPLITS: gl.constexpr = SPLIT_M * SPLIT_N
         _CR_PAD_N: gl.constexpr = SUB_N // CTAS_N
-        C_ALIAS_R: gl.constexpr = (
-            (not TRANSPOSE_B)
-            and _C_ELEM == 2
-            and _CR_PAD_N <= 256
-            and (SUB_M // CTAS_M) * _CR_PAD_N * _C_ELEM
-            <= NUM_BUFFERS * BLOCK_K * _CR_PAD_N * 2
-        )
+        # The remainder stages C the same way, on its own sub-tile layout.
+        C_ALIAS_R: gl.constexpr = _C_ELEM == 2 and _CR_PAD_N <= 256
         SHARED_REM_C: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
             [[_CR_PAD_N, 16]], [SUB_M, SUB_N], [1, 0], WMMA_REM.cga_layout
         )
@@ -256,16 +242,6 @@ def gemm_a16w16_streamk_kernel_(
             block_shape=(SUB_M, SUB_N),
             layout=SHARED_REM_C,
         )
-        ar_buffer = gl.allocate_shared_memory(
-            ar_desc.dtype,
-            shape=[NUM_BUFFERS] + ar_desc.block_shape,
-            layout=ar_desc.layout,
-        )
-        br_buffer = gl.allocate_shared_memory(
-            br_desc.dtype,
-            shape=[NUM_BUFFERS] + br_desc.block_shape,
-            layout=br_desc.layout,
-        )
         for sub_idx in range(pid, STREAMK_TILES * SPLITS, NUM_SMS):
             tile_idx = num_tiles - STREAMK_TILES + sub_idx // SPLITS
             sub = sub_idx % SPLITS
@@ -276,8 +252,6 @@ def gemm_a16w16_streamk_kernel_(
                 ar_desc,
                 br_desc,
                 cr_desc,
-                ar_buffer,
-                br_buffer,
                 c_ptr,
                 pid_m * BLOCK_M + (sub // SPLIT_N) * SUB_M,
                 pid_n * BLOCK_N + (sub % SPLIT_N) * SUB_N,

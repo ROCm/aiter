@@ -153,8 +153,6 @@ def compute_tile(
     a_desc,
     b_desc,
     c_desc,
-    a_buffer,
-    b_buffer,
     c_ptr,
     off_m,
     off_n,
@@ -183,6 +181,16 @@ def compute_tile(
     Phase 1 and the StreamK remainder both call this. They differ only in the tile size and the
     layouts, which arrive as constexprs.
     """
+    # Allocate the rings here, not before the persistent tile loop. Every tile refills the
+    # pipeline below, so the ring contents are never carried between tiles and a per-tile live
+    # range is correct. It is also what lets the allocator place the C stage on the dead rings:
+    # a ring allocated outside the loop is live in every iteration and interferes with C.
+    a_buffer = gl.allocate_shared_memory(
+        a_desc.dtype, shape=[NUM_BUFFERS] + a_desc.block_shape, layout=a_desc.layout
+    )
+    b_buffer = gl.allocate_shared_memory(
+        b_desc.dtype, shape=[NUM_BUFFERS] + b_desc.block_shape, layout=b_desc.layout
+    )
     producer = 0
     consumer = 0
     acc = gl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_DTYPE, layout=WMMA)
@@ -268,10 +276,10 @@ def compute_tile(
             )
 
     if C_ALIAS:
-        c_stage = b_buffer.reinterpret(
+        c_stage = gl.allocate_shared_memory(
             c_ptr.type.element_ty, [BLOCK_M, BLOCK_N], SHARED_C
         )
-        gl.barrier()  # every wmma read of the B ring must retire before the overwrite
+        gl.barrier()  # every wmma read of a ring must retire before the C stage reuses it
         c_stage.store(acc.to(c_ptr.type.element_ty))
         gl.barrier()  # the LDS writes must be visible to the TDM engine
         gl.amd.cdna5.tdm.async_store(c_desc, [off_m, off_n], c_stage)
