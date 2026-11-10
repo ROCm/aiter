@@ -479,6 +479,12 @@
       "num_stages": 2,
       "waves_per_eu": 1
     },
+    "D_GEQ_256.G_EQ_4.Q_EQ_5.SHUF.DT_fp8_fp8.BS_LEQ_64": {
+      "BLOCK_M": 32,
+      "num_warps": 1,
+      "num_stages": 2,
+      "waves_per_eu": 1
+    },
     "D_GEQ_256.G_EQ_4.Q_EQ_5.SHUF.DT_fp8_nvfp4_fp8": {
       "BLOCK_M": 32,
       "num_warps": 1,
