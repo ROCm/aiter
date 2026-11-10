@@ -408,6 +408,29 @@ class HostPlanTests(unittest.TestCase):
         param = _param(self.ns, case, static=True)
         self.ns["_assert_host_path"]("2d_block_rows8_static", param)
 
+    def test_gfx1250_assertion_requires_the_explicit_config_in_the_param(self):
+        check = script._assert_host_path_gfx1250
+        ok = SimpleNamespace(
+            tile=script._KH8["tile"],
+            block_rows=script._KH8["block_rows"],
+            splitk=1,
+            dyn_hw=True,
+        )
+        for case in script.CI_KW_CASES:
+            if case in ("2d_splitk2", "2d_tile_256x96"):
+                continue
+            with self.subTest(case=case):
+                self.assertIn("block_rows=8", check(case, ok))
+                with self.assertRaises(AssertionError):
+                    check(case, SimpleNamespace(**{**vars(ok), "block_rows": 2}))
+        check("2d_tile_256x96", ok)
+        check("2d_splitk2", SimpleNamespace(**{**vars(ok), "splitk": 2}))
+        with self.assertRaises(AssertionError):
+            check("2d_splitk2", ok)
+        check("2d_block_rows8_static", SimpleNamespace(**{**vars(ok), "dyn_hw": False}))
+        with self.assertRaises(AssertionError):
+            check("2d_block_rows8_static", ok)
+
     def test_spy_observes_real_param_and_restores_compiler_without_cache_changes(self):
         case = next(c for c in script.KW_CASES if c[0] == "2d_splitk2")
         param = _param(self.ns, case)
@@ -420,7 +443,7 @@ class HostPlanTests(unittest.TestCase):
         backend = SimpleNamespace(compile_conv3d_implicit=compiler, cache={"old": 1})
         with patch.object(script, "conv_kernels", backend, create=True), patch.object(
             script, "_assert_host_path", self.ns["_assert_host_path"]
-        ):
+        ), patch.object(script, "get_gfx", lambda: "gfx950", create=True):
             with script._capture_host_path(case[0]) as notes:
                 self.assertEqual(backend.compile_conv3d_implicit(param), "compiled")
             self.assertIn("use_splitk=True", notes[0])
@@ -443,7 +466,9 @@ class HostPlanTests(unittest.TestCase):
             backend.compile_conv3d_implicit,
         )
         hit = ((192, 96, 4, 1), 1, 1, 1)
-        with patch.object(script, "conv_kernels", backend, create=True):
+        with patch.object(script, "conv_kernels", backend, create=True), patch.object(
+            script, "get_gfx", lambda: "gfx950", create=True
+        ):
             with script._capture_tuned_path(True) as notes:
                 backend._log_tuned_lookup({}, ("gfx950", 256), (), hit)
                 backend.compile_conv3d_implicit(SimpleNamespace(tile=hit[0]))
