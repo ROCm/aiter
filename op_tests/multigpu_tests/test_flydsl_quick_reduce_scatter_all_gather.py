@@ -52,7 +52,21 @@ the rounding order of the sum shows) and all zeros:
 * all-reduce, reduce-scatter and all-gather alternate on one engine in every
   ordered pair, with each rank slowed in turn, and every output equals the
   isolated result of its call bit for bit: once on a one-rung ST=1 engine at a
-  small grid cap (several tiles per block), once on the shipping ladder.
+  small grid cap (several tiles per block), once on the shipping ladder;
+* a slow reader (TP2, first, in pools that end after ``SLOW_READER_TIMEOUT_S``):
+  a copy of the kernel source with one edit, which must match once, makes rank 1
+  sleep between its data wait and its reads in every round of the single-phase
+  loop. Built under its own FlyDSL cache (which must hold its kernels
+  afterwards), it runs back-to-back reduce-scatters and all-gathers of two
+  alternating inputs on the cap-64 engine, each into its own output buffer with
+  no sync in between. Every output equals the isolated output of its input bit
+  for bit, the isolated outputs equal those of the unpatched kernel, and a
+  stalled launch takes at least ``_STALL_MIN_EXTRA_US`` longer than an unpatched
+  one, so a hook that stopped stalling fails the test instead of passing it. A
+  launch that reuses an inbox slot before every reader has left it shows as a
+  mismatch, a hang as the pool's timeout. It runs before the other phases so
+  that such a defect is reported by its outputs before a phase that can hang on
+  it is reached.
 
 ``rows * hidden * 2`` must be a whole number of 32 KiB tiles and ``rows`` a
 multiple of the world size; the default hidden 2560 needs rows % 32 == 0.
@@ -65,10 +79,15 @@ skipped, and a named size that cannot run is an error.
 from __future__ import annotations
 
 import argparse
+import glob
+import hashlib
+import importlib.util
 import itertools
 import os
 import re
 import sys
+import tempfile
+import time
 import types
 from contextlib import ExitStack, closing
 from functools import partial
@@ -159,6 +178,19 @@ _AR_ROW_CANDIDATES = (16384, 1024, 32)
 _DRAG_STEPS = 200
 _OPS = ("ar", "rs", "ag")
 _OP_METHODS = {"ar": "allreduce", "rs": "reduce_scatter", "ag": "all_gather"}
+# Slow-reader test: the copy of the kernel makes this rank sleep (this many
+# s_sleep(127), about 3 us each) between its data wait and its reads, in every
+# round of the single-phase loop. Rows of the full tensor: the cap-64 engine
+# gives each block several tiles. Back-to-back launches per mode; a stalled
+# launch must take at least _STALL_MIN_EXTRA_US longer than an unstalled one,
+# or the hook did not take effect. The pools of this test end after this many
+# seconds, a hang included.
+_STALL_RANK = 1
+_STALL_ITERS = 40
+_STALL_ROWS = 512
+_STALL_LAUNCHES = 256
+_STALL_MIN_EXTRA_US = 50.0
+SLOW_READER_TIMEOUT_S = 600.0
 
 
 def _make_inp(
@@ -1052,15 +1084,233 @@ def _assert_preflight(ranks, *, world_size) -> None:
         raise AssertionError("; ".join(fails))
 
 
-def _run_pool(world_size, worker, **kwds):
-    """Run *worker* on every rank of a fresh spawn pool; its results by rank."""
+# The kernel text the stall hook goes between: the data wait of the single-phase
+# loop (the first all-gather-phase wait, followed by the mode switch).
+_STALL_ANCHOR = (
+    "                _wait_release(PHASE_ALL_GATHER, color)\n"
+    "                if const_expr(mode == MODE_RS):\n"
+)
+
+
+def _slow_reader_source(src: str) -> str:
+    """*src*, the kernel source, with one edit: rank ``_STALL_RANK`` sleeps between
+    the data wait of the single-phase loop and its reads. The anchor must occur
+    once, so a kernel edit that moves or repeats it fails here instead of testing
+    nothing."""
+    found = src.count(_STALL_ANCHOR)
+    if found != 1:
+        raise AssertionError(f"the stall hook's anchor occurs {found} times, want 1")
+    wait, switch = _STALL_ANCHOR.splitlines(keepends=True)
+    hook = (
+        f"                if const_expr(self_rank == {_STALL_RANK}):\n"
+        f"                    for _ in range_constexpr({_STALL_ITERS}):\n"
+        "                        rocdl.s_sleep(127)\n"
+    )
+    return src.replace(_STALL_ANCHOR, wait + hook + switch)
+
+
+def _load_stall_kernel(directory: str):
+    """The kernel module of this tree, loaded from a copy of its source in
+    *directory* with the stall hook, under another module name; the module the
+    engines normally build from stays as it is. FlyDSL reads the source file of
+    the factory while it builds, so the copy must stay until the last build."""
+    from aiter.ops.flydsl.kernels.comm import quick_allreduce_int4 as kern
+
+    with open(kern.__file__) as f:
+        src = _slow_reader_source(f.read())
+    path = os.path.join(directory, "quick_allreduce_int4_slow_reader.py")
+    with open(path, "w") as f:
+        f.write(src)
+    name = f"{kern.__package__}.quick_allreduce_int4_slow_reader"
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _digest(t: torch.Tensor) -> str:
+    return hashlib.sha256(_bits(t).cpu().numpy().tobytes()).hexdigest()
+
+
+def _own_cache_entries(cache: str) -> int | None:
+    """How many compiled kernels FlyDSL wrote to the directory *cache*, or
+    ``None`` when its disk cache is off (nothing can be served stale then)."""
+    from flydsl.utils import env as flydsl_env
+
+    if not flydsl_env.runtime.enable_cache:
+        return None
+    return len(glob.glob(os.path.join(cache, "*", "*.pkl")))
+
+
+def _slow_reader_burst(fly, op: str, rank: int, tp: int, device) -> dict:
+    """Isolated outputs of two inputs, then ``_STALL_LAUNCHES`` launches of *op*
+    back to back, alternating between the inputs, each into its own output
+    buffer, with no host sync until the last. Returns the digests of the
+    isolated outputs, how many launches differ from the isolated output of their
+    input, the time per launch and how many isolated outputs are not finite."""
+    import torch.distributed as dist
+
+    n_in, n_out = _op_rows(op, _STALL_ROWS, tp)
+    call = getattr(fly, _OP_METHODS[op])
+    ins = [
+        _make_inp(
+            n_in, _REFUSE_HIDDEN, rank=rank, salt=7 + k, fill="normal", device=device
+        )
+        for k in range(2)
+    ]
+    isolated = []
+    for inp in ins:
+        out = torch.empty((n_out, _REFUSE_HIDDEN), dtype=torch.bfloat16, device=device)
+        dist.barrier()
+        call(inp, out)
+        torch.cuda.synchronize()
+        isolated.append(out)
+    outs = [
+        torch.empty((n_out, _REFUSE_HIDDEN), dtype=torch.bfloat16, device=device)
+        for _ in range(_STALL_LAUNCHES)
+    ]
+    dist.barrier()
+    torch.cuda.synchronize()
+    start = time.perf_counter()
+    for i, out in enumerate(outs):
+        call(ins[i % 2], out)
+    torch.cuda.synchronize()
+    us = (time.perf_counter() - start) / _STALL_LAUNCHES * 1e6
+    return {
+        "digests": [_digest(t) for t in isolated],
+        "mismatches": sum(
+            not torch.equal(_bits(out), _bits(isolated[i % 2]))
+            for i, out in enumerate(outs)
+        ),
+        "us": us,
+        "nonfinite": _nonfinite(*isolated),
+    }
+
+
+def _run_rank_slow_reader(rank: int, tp: int, init_method: str, variant: str) -> dict:
+    """One rank of the slow-reader test: back-to-back reduce-scatters and
+    all-gathers on a one-rung cap-64 engine (several tiles per block). *variant*
+    ``"reference"`` builds the shipped kernel, ``"stall"`` the copy with the hook,
+    under its own FlyDSL cache, for the whole life of the engine (the single-phase
+    builds are made on first use)."""
+    import torch.distributed as dist
+
+    from aiter.ops.flydsl import QuickAllReduceInt4
+
+    host = importlib.import_module("aiter.ops.flydsl.quick_allreduce_int4")
+    device, gloo = _init_rank(rank, tp, init_method)
+    res = {"own_cache_entries": None}
+    try:
+        with ExitStack() as stack:
+            if variant == "stall":
+                directory = stack.enter_context(
+                    tempfile.TemporaryDirectory(prefix="flydsl_slow_reader_")
+                )
+                cache = os.path.join(directory, "cache")
+                os.environ["FLYDSL_RUNTIME_CACHE_DIR"] = cache
+                stack.enter_context(
+                    mock.patch.object(
+                        host,
+                        "make_quick_allreduce_int4_kernel",
+                        _load_stall_kernel(directory).make_quick_allreduce_int4_kernel,
+                    )
+                )
+            fly = stack.enter_context(
+                closing(
+                    QuickAllReduceInt4(
+                        group=gloo,
+                        device=device,
+                        rank=rank,
+                        world_size=tp,
+                        ladder=_sp_ladder(_PINNED_CAP),
+                    )
+                )
+            )
+            fly.compile_sp(
+                _zeros_rows(_STALL_ROWS, device=device),
+                _zeros_rows(_STALL_ROWS // tp, device=device),
+            )
+            if variant == "stall":
+                res["own_cache_entries"] = _own_cache_entries(cache)
+            dist.barrier()
+            for op in ("rs", "ag"):
+                res[op] = _slow_reader_burst(fly, op, rank, tp, device)
+                torch.cuda.empty_cache()
+            dist.barrier()
+    finally:
+        dist.destroy_process_group()
+    return res
+
+
+def _check_slow_reader(tps) -> None:
+    """The slow-reader test, when TP2 is among the world sizes *tps* (the hook
+    delays rank 1 of two; ``--tp`` names what runs, so it is not run otherwise)."""
+    if 2 not in tps:
+        return
+    ranks = {
+        variant: _run_pool(
+            2, _run_rank_slow_reader, timeout=SLOW_READER_TIMEOUT_S, variant=variant
+        )
+        for variant in ("reference", "stall")
+    }
+    _assert_slow_reader(ranks["reference"], ranks["stall"], world_size=2)
+
+
+def _assert_slow_reader(reference, stall, *, world_size) -> None:
+    fails = []
+    for rank in range(world_size):
+        for op in ("rs", "ag"):
+            where = f"slow reader tp={world_size} rank {rank} {op}"
+            ref, got = reference[rank][op], stall[rank][op]
+            for name, res in (("unpatched", ref), ("stalled", got)):
+                if res["mismatches"]:
+                    fails.append(
+                        f"{where}: {name}: {res['mismatches']} of {_STALL_LAUNCHES} "
+                        "launches differ from the isolated output of their input"
+                    )
+                if res["nonfinite"]:
+                    fails.append(
+                        f"{where}: {name}: {res['nonfinite']} isolated outputs are "
+                        "not finite"
+                    )
+            if got["digests"] != ref["digests"]:
+                fails.append(
+                    f"{where}: the isolated outputs of the stalled kernel differ "
+                    "from the unpatched kernel's"
+                )
+    for rank in range(world_size):
+        if stall[rank]["own_cache_entries"] == 0:
+            fails.append(
+                f"slow reader tp={world_size} rank {rank}: the stalled build wrote "
+                "nothing to its own FlyDSL cache, so it was not built under it"
+            )
+    for op in ("rs", "ag"):
+        base = max(reference[rank][op]["us"] for rank in range(world_size))
+        slow = min(stall[rank][op]["us"] for rank in range(world_size))
+        if slow < base + _STALL_MIN_EXTRA_US:
+            fails.append(
+                f"slow reader tp={world_size} {op}: a stalled launch takes {slow:.1f} "
+                f"us, an unpatched one {base:.1f} us: less than {_STALL_MIN_EXTRA_US} "
+                "us apart, so the stall did not take effect"
+            )
+    if fails:
+        raise AssertionError("; ".join(fails))
+
+
+def _run_pool(world_size, worker, *, timeout=None, **kwds):
+    """Run *worker* on every rank of a fresh spawn pool; its results by rank.
+    The pool ends after ``FLYDSL_QR_TIMEOUT`` seconds (default 3600), or after
+    *timeout* if that is shorter."""
     if world_size not in SUPPORTED_WORLDS:
         raise ValueError(f"unsupported world_size={world_size}")
     n_gpu = torch.cuda.device_count()
     if n_gpu < world_size:
         raise RuntimeError(f"QuickAllReduceInt4 needs {world_size} GPUs, have {n_gpu}")
     init_method = get_distributed_init_method(get_ip(), get_open_port())
-    timeout = float(os.environ.get("FLYDSL_QR_TIMEOUT", "3600"))
+    limit = float(os.environ.get("FLYDSL_QR_TIMEOUT", "3600"))
+    if timeout is not None:
+        limit = min(limit, timeout)
     # A local spawn context: the ranks need spawn (CUDA), the process need not
     # have its global start method changed for it.
     pool = get_context("spawn").Pool(processes=world_size)
@@ -1077,7 +1327,7 @@ def _run_pool(world_size, worker, **kwds):
             )
             for rank in range(world_size)
         ]
-        ranks = [fut.get(timeout=timeout) for fut in results]
+        ranks = [fut.get(timeout=limit) for fut in results]
     except Exception:
         pool.terminate()
         raise
@@ -1277,6 +1527,9 @@ def main():
         supported=SUPPORTED_WORLDS,
     )
     _check_residency_stub()
+    # First: a defect of the slot-reuse handshake is reported here, by its
+    # outputs, before a phase that can hang on it is reached.
+    _check_slow_reader(tps)
     for tp in tps:
         for grid_cap in (args.grid_cap, 64):
             ranks = _spawn(
