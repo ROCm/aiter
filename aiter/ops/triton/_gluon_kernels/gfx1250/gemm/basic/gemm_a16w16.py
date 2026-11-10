@@ -875,10 +875,7 @@ def _gemm_a16w16_compute_bound_kernel(
         "REGISTER_STORE must be 0, 1 or 2",
     )
     if REGISTER_STORE == 2:
-        # Register store, coalesced: convert the tile to STORE_LAYOUT (16-byte vectors along N; the layout
-        # conversion's LDS round trip is ordinary ds_store/barrier/ds_load), then buffer stores. The TDM store of an
-        # LDS-staged tile (REGISTER_STORE == 0) is the gfx1250 B1 pattern: tensor_store_from_lds can read LDS before
-        # the waves' ds_stores are visible to it, and no documented wait or fence closes that window.
+        # Register store, coalesced: convert the tile to STORE_LAYOUT (16-byte vectors along N), then buffer stores.
         _store_tile_from_registers(
             c_ptr,
             gl.convert_layout(accumulator.to(c_ptr.type.element_ty), STORE_LAYOUT),

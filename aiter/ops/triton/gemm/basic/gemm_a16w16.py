@@ -447,7 +447,7 @@ def gemm_a16w16_(
 
         grid = (triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N), 1)
 
-        # compute_bound's epilogue (the gfx1250 TDM-store race, B1), picked by the config entry's "REGISTER_STORE":
+        # compute_bound's epilogue, picked by the config entry's "REGISTER_STORE":
         # 0 = the LDS-staged TDM store (default: entries without the key are unchanged), 1 = register store from the
         # WMMA layout, 2 = coalesced register store (convert_layout, 16-byte buffer stores). For A/B only,
         # AITER_GFX1250_A16W16_STORE overrides the entry's value for this (non-persistent gluon compute_bound)
