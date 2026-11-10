@@ -125,11 +125,16 @@ class _Algorithm:
     # of the fused add+RMSNorm, *mesh* where it has no tuned row; ``None`` for
     # a schedule without one.
     norm_ladder: Callable[..., tuple[TwoShotRung, ...]] | None = None
-    # Trailing ``Int64`` kernel arguments before the grid size: the fused
-    # RMSNorm's residual, residual_out, weight, MXFP4 out and scale pointers,
-    # then its ``Float32`` epsilon. Plain launches pass zeros. A schedule
-    # without the fused RMSNorm has none of them.
+    # Trailing ``Int64`` kernel arguments before the float arguments: the
+    # fused RMSNorm's residual, residual_out, weight, MXFP4 out and scale,
+    # then the boundary's stream, new_stream, pre-weight, alpha and beta.
+    # Plain launches pass zeros. A schedule without the fused RMSNorm has
+    # none of them.
     norm_ptr_args: int = 0
+    # ``Float32`` arguments after those pointers and before the grid size.
+    # The mesh passes the RMSNorm epsilon and the boundary's pre epsilon,
+    # gain centers and scalar alpha. Plain launches pass zeros.
+    norm_float_args: int = 0
     # Whether the kernel takes the shared ``divisor`` as its last argument.
     has_divisor: bool = False
 
@@ -163,7 +168,11 @@ def _build_mesh(
     )
 
 
-NORM_PTR_ARGS = 5
+# residual, residual_out, weight, mxfp4, mxfp4_scale, then the boundary's
+# stream, new_stream, pre_weight, alpha and beta.
+NORM_PTR_ARGS = 10
+# norm_eps, pre_eps, post_gain, pre_gain, alpha_scalar.
+NORM_FLOAT_ARGS = 5
 
 ALGORITHMS = {
     "mesh": _Algorithm(
@@ -175,6 +184,7 @@ ALGORITHMS = {
         st_ladder=mesh_st_ladder,
         norm_ladder=mesh_norm_ladder,
         norm_ptr_args=NORM_PTR_ARGS,
+        norm_float_args=NORM_FLOAT_ARGS,
         has_divisor=True,
     ),
     "ring": _Algorithm(
@@ -374,6 +384,8 @@ class QuickAllReduceInt4:
         self._norm_by_atoms = {}
         self._norm_build_kw = {}
         self._norm_launch = {}
+        self._boundary_launch = {}
+        self._boundary_ready = set()
         # Row widths whose fused builds are all compiled and loaded.
         self._rmsnorm_hidden = set()
         try:
@@ -575,6 +587,7 @@ class QuickAllReduceInt4:
         num_tiles,
         norm_ptrs=None,
         norm_eps: float = 0.0,
+        norm_floats=None,
         divisor: float = DEFAULT_DIVISOR,
     ):
         if stream is None:
@@ -590,7 +603,7 @@ class QuickAllReduceInt4:
             Int64(int(eng._gpu_peer_ptrs)),
             Int64(int(eng._colors)),
             *(Int64(p) for p in self._norm_ptrs(norm_ptrs)),
-            *((Float32(norm_eps),) if self._algo.norm_ptr_args else ()),
+            *(Float32(v) for v in self._norm_floats(norm_eps, norm_floats)),
             Int32(self._grid_x(num_tiles, eng.super_tile, eng.grid)),
             *((Float32(divisor),) if self._algo.has_divisor else ()),
             stream,
@@ -600,7 +613,19 @@ class QuickAllReduceInt4:
         """*norm_ptrs* padded with zeros to what this algorithm's kernel takes."""
         n = self._algo.norm_ptr_args
         norm_ptrs = tuple(norm_ptrs or ())
+        if len(norm_ptrs) > n:
+            raise ValueError(f"norm_ptrs has {len(norm_ptrs)} values; kernel takes {n}")
         return norm_ptrs + (0,) * (n - len(norm_ptrs))
+
+    def _norm_floats(self, norm_eps, norm_floats) -> tuple[float, ...]:
+        """Epsilon first, then *norm_floats*, padded to the kernel's float args."""
+        n = self._algo.norm_float_args
+        if n == 0:
+            return ()
+        vals = (float(norm_eps),) + tuple(float(v) for v in (norm_floats or ()))
+        if len(vals) > n:
+            raise ValueError(f"norm floats has {len(vals)} values; kernel takes {n}")
+        return vals + (0.0,) * (n - len(vals))
 
     def _launch_eng(
         self,
@@ -613,6 +638,7 @@ class QuickAllReduceInt4:
         launch=None,
         norm_ptrs=None,
         norm_eps: float = 0.0,
+        norm_floats=None,
         divisor: float = DEFAULT_DIVISOR,
     ) -> None:
         num_tiles = max(1, (live_bytes + eng.tile_bytes - 1) // eng.tile_bytes)
@@ -625,6 +651,7 @@ class QuickAllReduceInt4:
             num_tiles=num_tiles,
             norm_ptrs=norm_ptrs,
             norm_eps=norm_eps,
+            norm_floats=norm_floats,
             divisor=divisor,
         )
         # A launch may still be using the raw HIP allocations when Python drops
@@ -695,6 +722,117 @@ class QuickAllReduceInt4:
             if (tile_atoms := tile_atoms_for(hidden, self.world_size, b)) is not None
         ]
         return bool(limits) and int(nbytes) <= min(limits)
+
+    def supports_boundary(self, hidden: int, nbytes: int) -> bool:
+        """Whether the two-norm boundary epilogue can take this payload.
+
+        The fp32 residual stream is twice the bf16 payload, and its byte
+        offsets share the signed 32-bit ``soffset`` limit.
+        """
+        nbytes = int(nbytes)
+        return nbytes > 0 and self.supports_rmsnorm(int(hidden), nbytes * 2)
+
+    @staticmethod
+    def _boundary_flags(
+        hidden,
+        *,
+        post_has_weight,
+        pre_has_weight,
+        post_input_scale,
+        pre_input_scale,
+        gate_stream,
+        per_channel,
+    ) -> tuple:
+        return (
+            int(hidden),
+            bool(post_has_weight),
+            bool(pre_has_weight),
+            bool(post_input_scale),
+            bool(pre_input_scale),
+            bool(gate_stream),
+            bool(per_channel),
+        )
+
+    def boundary_launch(self, cfg, hidden: int, **flags):
+        """Boundary epilogue for engine *cfg*. Shares that engine's inbox."""
+        key = (cfg,) + self._boundary_flags(hidden, **flags)
+        launch = self._boundary_launch.get(key)
+        if launch is None:
+            launch = self._algo.build(
+                **self._norm_build_kw[self._tile_atoms(hidden)][cfg],
+                norm_hidden=int(hidden),
+                norm_boundary=True,
+                boundary_post_has_weight=key[2],
+                boundary_pre_has_weight=key[3],
+                boundary_post_input_scale=key[4],
+                boundary_pre_input_scale=key[5],
+                boundary_gate_stream=key[6],
+                boundary_per_channel=key[7],
+            )["launch"]
+            self._boundary_launch[key] = launch
+        return launch
+
+    def compile_boundary(
+        self,
+        hidden: int,
+        *,
+        post_has_weight: bool,
+        pre_has_weight: bool,
+        post_input_scale: bool,
+        pre_input_scale: bool,
+        gate_stream: bool,
+        per_channel: bool,
+    ) -> None:
+        """JIT and load the boundary build for this hidden size and these flags.
+
+        Collective the first time, outside CUDA graph capture. An eager
+        ``allreduce_norm_residual_norm`` calls it.
+        """
+        flags = self._boundary_flags(
+            hidden,
+            post_has_weight=post_has_weight,
+            pre_has_weight=pre_has_weight,
+            post_input_scale=post_input_scale,
+            pre_input_scale=pre_input_scale,
+            gate_stream=gate_stream,
+            per_channel=per_channel,
+        )
+        if flags in self._boundary_ready:
+            return
+        self._check_norm_schedule()
+        if not self.supports_boundary(flags[0], flags[0] * 2):
+            raise ValueError(
+                "norm/residual/norm boundary needs a row width the fused "
+                f"RMSNorm can hold, got hidden={flags[0]}"
+            )
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "QuickAllReduceInt4: the norm/residual/norm boundary at "
+                f"hidden={flags[0]} is not prepared, and preparing it compiles "
+                "kernels, which cannot run under CUDA graph capture"
+            )
+        self._build_norm_engines(flags[0])
+        self._norm_cfg(flags[0] * 2, flags[0])
+        kw = {
+            "post_has_weight": flags[1],
+            "pre_has_weight": flags[2],
+            "post_input_scale": flags[3],
+            "pre_input_scale": flags[4],
+            "gate_stream": flags[5],
+            "per_channel": flags[6],
+        }
+        with torch.cuda.device(self._device_index):
+            for cfg, eng in self._norm_by_atoms[self._tile_atoms(flags[0])].items():
+                if tile_atoms_for(flags[0], self.world_size, cfg[1]) is None:
+                    continue
+                launch = self.boundary_launch(cfg, flags[0], **kw)
+                args = self._launch_args(eng, 0, 0, None, live_bytes=0, num_tiles=0)
+                preload_launcher(launch, *args)
+        self._boundary_ready.add(flags)
+
+    def boundary_prepared(self, hidden: int, **flags) -> bool:
+        """Whether ``compile_boundary`` has already loaded this build."""
+        return self._boundary_flags(hidden, **flags) in self._boundary_ready
 
     @staticmethod
     def mxfp4_scale_shape(rows: int, hidden: int) -> tuple[int, int]:
@@ -1016,6 +1154,190 @@ class QuickAllReduceInt4:
                 int(weight.data_ptr()),
                 *mxfp4_ptrs,
             ),
+        )
+
+    def allreduce_norm_residual_norm(
+        self,
+        inp,
+        residual_stream,
+        post_weight,
+        pre_weight,
+        post_eps: float,
+        pre_eps: float,
+        out,
+        new_stream,
+        *,
+        alpha,
+        beta,
+        post_gain_center: float = 0.0,
+        pre_gain_center: float = 0.0,
+        post_input_scale: bool = False,
+        pre_input_scale: bool = False,
+        stream=None,
+        divisor: float = DEFAULT_DIVISOR,
+    ) -> None:
+        """INT4 all-reduce fused with a two-norm residual boundary.
+
+        The post-norm consumes the bf16 values a plain ``allreduce`` would
+        have stored, kept in registers: the reduced branch is never written
+        to memory. In fp32::
+
+            new_stream = alpha * residual_stream + beta * post_norm(reduced)
+            out = pre_norm(new_stream)
+
+        ``alpha`` is an fp32 tensor shaped like ``beta``, or a Python float.
+        ``beta`` is fp32 with one element or ``hidden`` elements. A weight is
+        bf16 of ``hidden`` elements, or ``None``. ``post_input_scale`` applies
+        the post weight before the post-norm variance, and likewise for the
+        pre-norm. Hidden is a width ``supports_boundary`` accepts.
+
+        Args:
+            inp: this rank's bf16 partial, ``rows x hidden``.
+            residual_stream: fp32 stream, same number of elements as ``inp``.
+            post_weight, pre_weight: bf16 norm weights, or ``None``.
+            post_eps, pre_eps: the two RMSNorm epsilons.
+            out: bf16 pre-norm output, same size as ``inp``, not overlapping
+                ``inp`` or ``residual_stream``.
+            new_stream: fp32 blend output, same size as ``residual_stream``,
+                not overlapping it, ``inp`` or ``out``.
+            alpha, beta: the blend coefficients.
+            post_gain_center, pre_gain_center: added to each weight in fp32.
+            post_input_scale, pre_input_scale: weight-before-variance.
+            stream: ``None`` uses the current PyTorch stream on this device.
+            divisor: the same divisor ``allreduce`` would use. The default
+                matches ``allreduce``.
+        """
+        divisor = _check_divisor(divisor)
+        self._check_divisor_supported(divisor)
+        live_bytes = check_payload(
+            inp, out, device_index=self._device_index, owner="QuickAllReduceInt4"
+        )
+        hidden = int(inp.shape[-1])
+        if int(inp.numel()) % hidden != 0:
+            raise ValueError("numel must be a multiple of hidden")
+        if not self.supports_boundary(hidden, live_bytes):
+            raise ValueError(
+                "norm/residual/norm boundary supports the fused RMSNorm row "
+                f"widths and payloads whose fp32 stream fits the soffset, got "
+                f"hidden={hidden}, {live_bytes} bytes"
+            )
+        stream_bytes = live_bytes * 2
+
+        def _fp32(name, tensor, nbytes):
+            if (
+                not isinstance(tensor, torch.Tensor)
+                or tensor.dtype != torch.float32
+                or tensor.numel() * tensor.element_size() != nbytes
+            ):
+                raise ValueError(f"{name} must be fp32 with {nbytes} bytes")
+            if not tensor.is_cuda or tensor.device.index != self._device_index:
+                raise ValueError(f"{name} must be on cuda:{self._device_index}")
+            if not tensor.is_contiguous() or int(tensor.data_ptr()) % 16 != 0:
+                raise ValueError(f"{name} must be contiguous and 16-byte aligned")
+
+        _fp32("residual_stream", residual_stream, stream_bytes)
+        _fp32("new_stream", new_stream, stream_bytes)
+        for name, weight, gain, input_scale in (
+            ("post_weight", post_weight, post_gain_center, post_input_scale),
+            ("pre_weight", pre_weight, pre_gain_center, pre_input_scale),
+        ):
+            if weight is None:
+                if gain != 0.0 or input_scale:
+                    raise ValueError(f"{name} is required for a gain or input scale")
+                continue
+            if (
+                not isinstance(weight, torch.Tensor)
+                or weight.dtype != torch.bfloat16
+                or tuple(weight.shape) != (hidden,)
+            ):
+                raise ValueError(f"{name} must be bf16 of shape ({hidden},)")
+            if not weight.is_cuda or weight.device.index != self._device_index:
+                raise ValueError(f"{name} must be on cuda:{self._device_index}")
+            if not weight.is_contiguous() or int(weight.data_ptr()) % 16 != 0:
+                raise ValueError(f"{name} must be contiguous and 16-byte aligned")
+        if not isinstance(beta, torch.Tensor) or beta.dtype != torch.float32:
+            raise ValueError("beta must be an fp32 tensor")
+        if beta.numel() not in (1, hidden) or not beta.is_contiguous():
+            raise ValueError(f"beta must be contiguous with 1 or {hidden} elements")
+        if not beta.is_cuda or beta.device.index != self._device_index:
+            raise ValueError(f"beta must be on cuda:{self._device_index}")
+        gate_stream = isinstance(alpha, torch.Tensor)
+        if gate_stream:
+            if alpha.dtype != torch.float32 or tuple(alpha.shape) != tuple(beta.shape):
+                raise ValueError("alpha must be an fp32 tensor shaped like beta")
+            if not alpha.is_contiguous() or not alpha.is_cuda:
+                raise ValueError("alpha must be a contiguous CUDA tensor")
+            if alpha.device.index != self._device_index:
+                raise ValueError(f"alpha must be on cuda:{self._device_index}")
+            alpha_scalar = 0.0
+            alpha_ptr = int(alpha.data_ptr())
+        else:
+            alpha_scalar = float(alpha)
+            alpha_ptr = 0
+
+        def _span(tensor, nbytes):
+            return int(tensor.data_ptr()), int(tensor.data_ptr()) + nbytes
+
+        def _hit(a, a_bytes, b, b_bytes):
+            a0, a1 = _span(a, a_bytes)
+            b0, b1 = _span(b, b_bytes)
+            return max(a0, b0) < min(a1, b1)
+
+        if _hit(out, live_bytes, inp, live_bytes) or _hit(
+            out, live_bytes, residual_stream, stream_bytes
+        ):
+            raise ValueError("out must not overlap inp or residual_stream")
+        if (
+            _hit(new_stream, stream_bytes, residual_stream, stream_bytes)
+            or _hit(new_stream, stream_bytes, inp, live_bytes)
+            or _hit(new_stream, stream_bytes, out, live_bytes)
+        ):
+            raise ValueError("new_stream must not overlap residual_stream, inp or out")
+
+        flags = {
+            "post_has_weight": post_weight is not None,
+            "pre_has_weight": pre_weight is not None,
+            "post_input_scale": bool(post_input_scale),
+            "pre_input_scale": bool(pre_input_scale),
+            "gate_stream": gate_stream,
+            "per_channel": beta.numel() > 1,
+        }
+        self.compile_boundary(hidden, **flags)
+        cfg, _num_tiles = self._norm_cfg(live_bytes, hidden)
+        eng = self._norm_by_atoms[self._tile_atoms(hidden)][cfg]
+        launch = self.boundary_launch(cfg, hidden, **flags)
+        if torch.cuda.is_current_stream_capturing() and not launcher_loaded(launch):
+            raise RuntimeError(
+                f"QuickAllReduceInt4: boundary build {kernel_symbol(launch)} is "
+                "not loaded, and loading it cannot run under CUDA graph capture"
+            )
+        self._launch_eng(
+            eng,
+            inp,
+            out,
+            stream,
+            live_bytes=live_bytes,
+            launch=launch,
+            norm_eps=float(post_eps),
+            norm_floats=(
+                float(pre_eps),
+                float(post_gain_center),
+                float(pre_gain_center),
+                float(alpha_scalar),
+            ),
+            norm_ptrs=(
+                0,
+                0,
+                0 if post_weight is None else int(post_weight.data_ptr()),
+                0,
+                0,
+                int(residual_stream.data_ptr()),
+                int(new_stream.data_ptr()),
+                0 if pre_weight is None else int(pre_weight.data_ptr()),
+                alpha_ptr,
+                int(beta.data_ptr()),
+            ),
+            divisor=divisor,
         )
 
     def close(self):

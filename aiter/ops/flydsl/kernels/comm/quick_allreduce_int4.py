@@ -269,6 +269,13 @@ def make_quick_allreduce_int4_kernel(
     gemma_norm: bool = False,
     norm_latency: bool = False,
     norm_mxfp4: bool = False,
+    norm_boundary: bool = False,
+    boundary_post_has_weight: bool = True,
+    boundary_pre_has_weight: bool = True,
+    boundary_post_input_scale: bool = False,
+    boundary_pre_input_scale: bool = False,
+    boundary_gate_stream: bool = True,
+    boundary_per_channel: bool = True,
     tile_atoms: int | None = None,
 ):
     """Build the mesh all-reduce kernel.
@@ -294,16 +301,41 @@ def make_quick_allreduce_int4_kernel(
     for latency: two workgroups per CU instead of the persistent-grid
     residency, so the host may only launch it with
     ``num_tiles <= latency_max_tiles(cu)``.
+
+    ``norm_boundary`` replaces that epilogue with the two-norm residual
+    boundary. After the same INT4 dequant and bf16 rounding a plain
+    all-reduce would store, it computes ``new_stream = alpha * stream +
+    beta * post_norm(reduced)`` and ``out = pre_norm(new_stream)`` and does
+    not keep the reduced branch. ``norm_eps`` is the post-norm epsilon;
+    ``pre_eps``, the gain centers and ``alpha_scalar`` are the extra float
+    arguments. Weights and coefficients are the extra pointers.
     """
     fuse_norm = norm_hidden is not None
     if norm_latency and (not fuse_norm or super_tile != 1 or block != BLOCK):
         raise ValueError("norm_latency needs norm_hidden, super_tile=1 and block=BLOCK")
     if norm_mxfp4 and not fuse_norm:
         raise ValueError("norm_mxfp4 needs norm_hidden")
+    if norm_boundary and not fuse_norm:
+        raise ValueError("norm_boundary needs norm_hidden")
+    if norm_boundary and (norm_mxfp4 or gemma_norm or norm_latency):
+        raise ValueError(
+            "norm_boundary does not combine with gemma_norm, norm_mxfp4 or norm_latency"
+        )
+    if norm_boundary and boundary_post_input_scale and not boundary_post_has_weight:
+        raise ValueError("boundary_post_input_scale needs a post weight")
+    if norm_boundary and boundary_pre_input_scale and not boundary_pre_has_weight:
+        raise ValueError("boundary_pre_input_scale needs a pre weight")
     if fuse_norm and codec != "int4":
         raise ValueError(f"fused RMSNorm needs codec='int4', got {codec!r}")
     NORM_LATENCY = bool(norm_latency)
     NORM_MXFP4 = bool(norm_mxfp4)
+    NORM_BOUNDARY = bool(norm_boundary)
+    POST_HAS_WEIGHT = bool(boundary_post_has_weight)
+    PRE_HAS_WEIGHT = bool(boundary_pre_has_weight)
+    POST_INPUT_SCALE = bool(boundary_post_input_scale)
+    PRE_INPUT_SCALE = bool(boundary_pre_input_scale)
+    GATE_STREAM = bool(boundary_gate_stream)
+    PER_CHANNEL = bool(boundary_per_channel)
     if world_size not in SUPPORTED_WORLDS:
         raise ValueError(
             f"world_size must be one of {SUPPORTED_WORLDS}, got {world_size}"
@@ -391,7 +423,11 @@ def make_quick_allreduce_int4_kernel(
     # One fp32 partial sum of squares per (wave, row) for the fused RMSNorm.
     norm_red_f32 = (block // WAVE) * tile_atoms
     if fuse_norm:
-        PackStorage = make_pack_norm_storage(pack_i32, norm_red_f32)
+        # The boundary parks the post-norm and pre-norm partial sums at once.
+        red_words = norm_red_f32 * (2 if NORM_BOUNDARY else 1)
+        PackStorage = make_pack_norm_storage(pack_i32, red_words)
+        if NORM_BOUNDARY:
+            lds_bytes += norm_red_f32 * 4
         ATOMS_PER_ROW = (int(norm_hidden) * 2) // (block * 16)
         ROWS_PER_TILE = tile_atoms // ATOMS_PER_ROW
         SCALE_N = mxfp4_scale_shape(1, norm_hidden)[1]
@@ -435,7 +471,16 @@ def make_quick_allreduce_int4_kernel(
         weight_ptr: Int64,
         mxfp4_ptr: Int64,
         mxfp4_scale_ptr: Int64,
+        stream_ptr: Int64,
+        new_stream_ptr: Int64,
+        pre_weight_ptr: Int64,
+        alpha_ptr: Int64,
+        beta_ptr: Int64,
         norm_eps: Float32,
+        pre_eps: Float32,
+        post_gain: Float32,
+        pre_gain: Float32,
+        alpha_scalar: Float32,
         n_blocks: Int32,
         divisor: Float32 = Float32(DEFAULT_DIVISOR),  # noqa: B008
     ):
@@ -492,21 +537,44 @@ def make_quick_allreduce_int4_kernel(
             encode=_atom_f16_to_bf16,
         )
         _load_color, _store_color = _color_io(colors_ptr, bid)
-        if const_expr(fuse_norm):
+        if const_expr(fuse_norm and not NORM_BOUNDARY):
             res_rsrc = buffer_ops.create_buffer_resource_from_addr(
                 residual_ptr, num_records_bytes=nbytes
             )
             res_out_rsrc = buffer_ops.create_buffer_resource_from_addr(
                 residual_out_ptr, num_records_bytes=nbytes
             )
+        if const_expr(fuse_norm):
             out_rsrc = buffer_ops.create_buffer_resource_from_addr(
                 out_ptr, num_records_bytes=nbytes
             )
+            red_ptr = lds.red.ptr
+            lane_i32 = tid * 4
+        if const_expr(fuse_norm and (not NORM_BOUNDARY or POST_HAS_WEIGHT)):
             weight_rsrc = buffer_ops.create_buffer_resource_from_addr(
                 weight_ptr, num_records_bytes=int(norm_hidden) * 2
             )
-            red_ptr = lds.red.ptr
-            lane_i32 = tid * 4
+        if const_expr(NORM_BOUNDARY):
+            stream_bytes = nbytes * fx.Int64(2)
+            stream_rsrc = buffer_ops.create_buffer_resource_from_addr(
+                stream_ptr, num_records_bytes=stream_bytes
+            )
+            new_stream_rsrc = buffer_ops.create_buffer_resource_from_addr(
+                new_stream_ptr, num_records_bytes=stream_bytes
+            )
+            red_pre_ptr = red_ptr + fx.Int32(norm_red_f32)
+            if const_expr(PRE_HAS_WEIGHT):
+                pre_weight_rsrc = buffer_ops.create_buffer_resource_from_addr(
+                    pre_weight_ptr, num_records_bytes=int(norm_hidden) * 2
+                )
+            coeff_bytes = int(norm_hidden) * 4 if PER_CHANNEL else 4
+            if const_expr(GATE_STREAM):
+                alpha_rsrc = buffer_ops.create_buffer_resource_from_addr(
+                    alpha_ptr, num_records_bytes=coeff_bytes
+                )
+            beta_rsrc = buffer_ops.create_buffer_resource_from_addr(
+                beta_ptr, num_records_bytes=coeff_bytes
+            )
         if const_expr(NORM_MXFP4):
             mxfp4_rsrc = buffer_ops.create_buffer_resource_from_addr(
                 mxfp4_ptr, num_records_bytes=nbytes // 4
@@ -785,8 +853,193 @@ def make_quick_allreduce_int4_kernel(
             # The next tile's partials reuse ``red``.
             gpu.barrier()
 
+        def _fp32_soff(tile, atom):
+            # Same elements as the bf16 atom, at four bytes each.
+            return _atom_soff(tile, atom) * fx.Int32(2)
+
+        def _load_f32x8(rsrc, col_bytes, live_soff):
+            lane8 = tid * fx.Int32(8)
+            mask = fx.Int64(live_soff) < nbytes
+            lo = fx.Vector(
+                buffer_ops.buffer_load(
+                    rsrc,
+                    lane8,
+                    vec_width=4,
+                    dtype=T.i32,
+                    mask=mask,
+                    soffset_bytes=col_bytes,
+                )
+            ).bitcast(fx.Float32)
+            hi = fx.Vector(
+                buffer_ops.buffer_load(
+                    rsrc,
+                    lane8 + fx.Int32(4),
+                    vec_width=4,
+                    dtype=T.i32,
+                    mask=mask,
+                    soffset_bytes=col_bytes,
+                )
+            ).bitcast(fx.Float32)
+            return fx.Vector.from_elements(
+                [lo[0], lo[1], lo[2], lo[3], hi[0], hi[1], hi[2], hi[3]],
+                fx.Float32,
+            )
+
+        def _store_f32x8(rsrc, col_bytes, live_soff, vec):
+            lane8 = tid * fx.Int32(8)
+            mask = fx.Int64(live_soff) < nbytes
+            lo = fx.Vector.from_elements(
+                [vec[0], vec[1], vec[2], vec[3]], fx.Float32
+            ).bitcast(fx.Int32)
+            hi = fx.Vector.from_elements(
+                [vec[4], vec[5], vec[6], vec[7]], fx.Float32
+            ).bitcast(fx.Int32)
+            buffer_ops.buffer_store(lo, rsrc, lane8, mask=mask, soffset_bytes=col_bytes)
+            buffer_ops.buffer_store(
+                hi, rsrc, lane8 + fx.Int32(4), mask=mask, soffset_bytes=col_bytes
+            )
+
+        def _bf16_weight8(rsrc, atom, gain):
+            w = (
+                fx.Vector(
+                    buffer_ops.buffer_load(
+                        rsrc,
+                        lane_i32,
+                        vec_width=4,
+                        dtype=T.i32,
+                        soffset_bytes=(atom % ATOMS_PER_ROW) * block * 16,
+                    )
+                )
+                .bitcast(fx.BFloat16)
+                .to(fx.Float32)
+            )
+            return w + fx.full(8, gain, fx.Float32)
+
+        def _coeff8(rsrc, atom):
+            if const_expr(PER_CHANNEL):
+                return _load_f32x8(
+                    rsrc,
+                    fx.Int32((atom % ATOMS_PER_ROW) * block * 32),
+                    fx.Int32(0),
+                )
+            bits = buffer_ops.buffer_load(rsrc, fx.Int32(0), vec_width=1, dtype=T.i32)
+            return fx.full(8, fx.Int32(bits).bitcast(fx.Float32), fx.Float32)
+
+        def _park_sum(sq, row, base):
+            for off in range_constexpr(6):
+                sq = sq + sq.shuffle_xor(1 << (5 - off), WAVE)
+            if lane == 0:
+                fx.ptr_store(sq, base + (wave * fx.Int32(tile_atoms) + fx.Int32(row)))
+            return fx.Float32(0.0)
+
+        def _row_rstd(row, base, eps):
+            total = fx.Float32(fx.ptr_load(base + row))
+            for w in range_constexpr(1, block // WAVE):
+                total = total + fx.Float32(fx.ptr_load(base + (w * tile_atoms + row)))
+            return fmath.rsqrt(total * fx.Float32(INV_HIDDEN) + eps)
+
+        def _boundary_branch_atoms(tile, sub, own):
+            """The reduced tile as bf16 atoms, rounded as the plain store rounds.
+
+            Peers' atoms are decoded from their all-gather packets. Our own
+            chunk is *own* (ST=1, still in registers), or was stored to
+            ``out`` by the reduce-scatter loop (ST=8) and is read back.
+            """
+            xbs = []
+            for atom in range_constexpr(tile_atoms):
+                src, k = atom // rank_atoms, atom % rank_atoms
+                if const_expr(src != self_rank):
+                    words, scale = _recv_quantized(
+                        PHASE_ALL_GATHER, fx.Int32(src), sub, k
+                    )
+                    xbs.append(
+                        _atom_f16_to_bf16(
+                            _codec_dequant(c, words, _ag_scale(scale), tid)
+                        )
+                    )
+                elif const_expr(own is not None):
+                    xbs.append(_atom_f16_to_bf16(own[k]))
+                else:
+                    xbs.append(_load_atom_bf16(out_rsrc, _atom_soff(tile, atom)))
+            return xbs
+
+        def _boundary_store_tile(tile, sub, own):
+            """Two-norm residual boundary over one reduced tile.
+
+            The reduced branch stays in registers as the bf16 values the plain
+            all-reduce would store; it is never written. The post-norm sums
+            are reduced per tile, then each row is blended and pre-normed with
+            its fp32 ``new_stream`` held in registers, so ``new_stream`` is
+            written once and not read back.
+            """
+            xbs = _boundary_branch_atoms(tile, sub, own)
+
+            sq = fx.Float32(0.0)
+            for atom in range_constexpr(tile_atoms):
+                x = fx.Vector(xbs[atom]).bitcast(fx.BFloat16).to(fx.Float32)
+                if const_expr(POST_HAS_WEIGHT and POST_INPUT_SCALE):
+                    x = x * _bf16_weight8(weight_rsrc, atom, post_gain)
+                sq = sq + (x * x).reduce(ReductionOp.ADD)
+                if const_expr((atom + 1) % ATOMS_PER_ROW == 0):
+                    sq = _park_sum(sq, atom // ATOMS_PER_ROW, red_ptr)
+            gpu.barrier()
+
+            for row in range_constexpr(ROWS_PER_TILE):
+                rstd = _row_rstd(row, red_ptr, norm_eps)
+                streams = []
+                pre_sq = fx.Float32(0.0)
+                for j in range_constexpr(ATOMS_PER_ROW):
+                    atom = row * ATOMS_PER_ROW + j
+                    soff = _atom_soff(tile, atom)
+                    x = fx.Vector(xbs[atom]).bitcast(fx.BFloat16).to(fx.Float32)
+                    if const_expr(POST_HAS_WEIGHT):
+                        post_w = _bf16_weight8(weight_rsrc, atom, post_gain)
+                        if const_expr(POST_INPUT_SCALE):
+                            x = x * post_w
+                    y = x * fx.full(8, rstd, fx.Float32)
+                    if const_expr(POST_HAS_WEIGHT and not POST_INPUT_SCALE):
+                        y = y * post_w
+                    stream = _load_f32x8(stream_rsrc, _fp32_soff(tile, atom), soff)
+                    if const_expr(GATE_STREAM):
+                        alpha = _coeff8(alpha_rsrc, atom)
+                    else:
+                        alpha = fx.full(8, alpha_scalar, fx.Float32)
+                    beta = _coeff8(beta_rsrc, atom)
+                    new_stream = alpha * stream + beta * y
+                    _store_f32x8(
+                        new_stream_rsrc, _fp32_soff(tile, atom), soff, new_stream
+                    )
+                    streams.append(new_stream)
+                    z = new_stream
+                    if const_expr(PRE_HAS_WEIGHT and PRE_INPUT_SCALE):
+                        z = z * _bf16_weight8(pre_weight_rsrc, atom, pre_gain)
+                    pre_sq = pre_sq + (z * z).reduce(ReductionOp.ADD)
+                _park_sum(pre_sq, row, red_pre_ptr)
+                gpu.barrier()
+
+                pre_rstd = _row_rstd(row, red_pre_ptr, pre_eps)
+                for j in range_constexpr(ATOMS_PER_ROW):
+                    atom = row * ATOMS_PER_ROW + j
+                    z = streams[j]
+                    if const_expr(PRE_HAS_WEIGHT):
+                        pre_w = _bf16_weight8(pre_weight_rsrc, atom, pre_gain)
+                        if const_expr(PRE_INPUT_SCALE):
+                            z = z * pre_w
+                    z = z * fx.full(8, pre_rstd, fx.Float32)
+                    if const_expr(PRE_HAS_WEIGHT and not PRE_INPUT_SCALE):
+                        z = z * pre_w
+                    _store_atom_bf16(
+                        out_rsrc,
+                        _atom_soff(tile, atom),
+                        z.to(fx.BFloat16).bitcast(fx.Int32),
+                    )
+            # The next tile's partials reuse ``red``.
+            gpu.barrier()
+
         def _epilogue(tile, sub, res_pref=None, own=None):
-            if const_expr(fuse_norm):
+            if const_expr(NORM_BOUNDARY):
+                _boundary_store_tile(tile, sub, own)
+            elif const_expr(fuse_norm):
                 _norm_store_tile_atoms(tile, sub, res_pref, own)
             else:
                 _store_tile_atoms(tile, _recv_all_gather(sub, own))
@@ -1142,7 +1395,16 @@ def make_quick_allreduce_int4_kernel(
         weight_ptr: Int64,
         mxfp4_ptr: Int64,
         mxfp4_scale_ptr: Int64,
+        stream_ptr: Int64,
+        new_stream_ptr: Int64,
+        pre_weight_ptr: Int64,
+        alpha_ptr: Int64,
+        beta_ptr: Int64,
         norm_eps: Float32,
+        pre_eps: Float32,
+        post_gain: Float32,
+        pre_gain: Float32,
+        alpha_scalar: Float32,
         grid_x: Int32,
         divisor: Float32 = DEFAULT_DIVISOR,
         stream: Stream = Stream(None),  # noqa: B008
@@ -1160,7 +1422,16 @@ def make_quick_allreduce_int4_kernel(
             weight_ptr,
             mxfp4_ptr,
             mxfp4_scale_ptr,
+            stream_ptr,
+            new_stream_ptr,
+            pre_weight_ptr,
+            alpha_ptr,
+            beta_ptr,
             norm_eps,
+            pre_eps,
+            post_gain,
+            pre_gain,
+            alpha_scalar,
             grid_x,
             divisor,
             value_attrs=value_attrs,
@@ -1174,7 +1445,21 @@ def make_quick_allreduce_int4_kernel(
     tag += f"_{inbox_memory}_{codec}_b{block}"
     if tile_atoms != DEFAULT_ATOMS:
         tag += f"_a{tile_atoms}"
-    if fuse_norm:
+    if NORM_BOUNDARY:
+        flag_tag = "".join(
+            letter
+            for letter, enabled in (
+                ("W", POST_HAS_WEIGHT),
+                ("w", PRE_HAS_WEIGHT),
+                ("S", POST_INPUT_SCALE),
+                ("s", PRE_INPUT_SCALE),
+                ("G", GATE_STREAM),
+                ("C", PER_CHANNEL),
+            )
+            if enabled
+        )
+        tag += f"_bdry{norm_hidden}_{flag_tag or 'x'}"
+    elif fuse_norm:
         tag += f"_rms{norm_hidden}{'g' if gemma_norm else ''}"
         tag += f"{'_lat' if NORM_LATENCY else ''}{'_mxfp4' if NORM_MXFP4 else ''}"
     launch_quick_allreduce_int4.func.__name__ = f"launch_quick_allreduce_int4_{tag}"
