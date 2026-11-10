@@ -32,6 +32,7 @@ class TestMXFP4TuningConfig(unittest.TestCase):
         self.env.start()
         self.addCleanup(self.env.stop)
         os.environ.pop("AITER_CONFIG_GEMM_A4W4", None)
+        os.environ.pop("AITER_SELECT", None)
         self.temp = patch.object(tempfile, "tempdir", str(self.root))
         self.temp.start()
         self.addCleanup(self.temp.stop)
@@ -44,6 +45,135 @@ class TestMXFP4TuningConfig(unittest.TestCase):
     def rows(self):
         with open(self.api.get_mxfp4_config_file(), newline="") as stream:
             return list(csv.DictReader(stream))
+
+    def default_rows(self):
+        names = (
+            "dsv3",
+            "gemma4_31b",
+            "kimik3",
+            "narrow_n",
+            "q3vl",
+            "qwen38_27b",
+            "qwen38_2p4t",
+        )
+        paths = [self.api._CONFIG_DIR / "a4w4_blockscale_tuned_gemm.csv"]
+        paths.extend(
+            self.api._CONFIG_DIR
+            / "model_configs"
+            / f"{name}_a4w4_blockscale_tuned_gemm.csv"
+            for name in names
+        )
+        rows = {}
+        for path in paths:
+            with path.open(newline="") as stream:
+                for row in csv.DictReader(stream):
+                    key = (
+                        row["gfx"],
+                        *(int(row[k]) for k in ("cu_num", "M", "N", "K")),
+                    )
+                    self.assertNotIn(
+                        key, rows, f"ambiguous legacy default key in {path}"
+                    )
+                    rows[key] = (row["kernelName"], int(row["splitK"]))
+        return rows
+
+    def selected_rows(self):
+        return {
+            (r["gfx"], *(int(r[k]) for k in ("cu_num", "M", "N", "K"))): (
+                r["kernelName"],
+                int(r["splitK"]),
+            )
+            for r in self.rows()
+        }
+
+    def power_fixture(self):
+        stock = self.table(
+            "stock.csv",
+            "gfx950,256,32,64,128,stock,0,10\n" "gfx950,256,64,64,128,uncovered,0,10\n",
+        )
+        manifest = self.root / "defaults.json"
+        manifest.write_text('["stock.csv"]')
+        self.api._CONFIG_DIR = self.root
+        self.api._DEFAULT_FILE = manifest
+        power_dir = self.root / "power_configs"
+        power_dir.mkdir()
+        power = power_dir / "example_a4w4_blockscale_tuned_gemm.csv"
+        power.write_text(
+            "gfx,cu_num,M,N,K,kernelName,splitK,us,select\n"
+            "gfx950,256,32,64,128,power,0,12,power\n"
+            "gfx950,256,64,64,128,ignore-latency,0,1,latency\n"
+        )
+        return stock, power
+
+    def test_power_overlay_keeps_uncovered_latency_rows_without_rewriting(self):
+        stock, power = self.power_fixture()
+        before = {path: path.read_bytes() for path in (stock, power)}
+        os.environ["AITER_SELECT"] = "power_efficiency"
+        rows = self.selected_rows()
+        self.assertEqual(rows[("gfx950", 256, 32, 64, 128)], ("power", 0))
+        self.assertEqual(rows[("gfx950", 256, 64, 64, 128)], ("uncovered", 0))
+        self.assertEqual({path: path.read_bytes() for path in before}, before)
+        self.assertIn(str(power.resolve()), self.api.mxfp4_tuning_sources())
+
+    def test_explicit_environment_table_bypasses_power_overlay(self):
+        stock, _ = self.power_fixture()
+        os.environ["AITER_SELECT"] = "power"
+        os.environ["AITER_CONFIG_GEMM_A4W4"] = str(stock)
+        self.assertEqual(self.rows()[0]["kernelName"], "stock")
+        self.assertEqual(self.api.mxfp4_tuning_sources(), (str(stock.resolve()),))
+
+    def test_power_policy_stays_frozen_after_first_lookup(self):
+        self.power_fixture()
+        os.environ["AITER_SELECT"] = "power"
+        self.api.configure_mxfp4_tuning()
+        fingerprint = self.api.mxfp4_tuning_fingerprint()
+        self.assertEqual(self.rows()[0]["kernelName"], "power")
+        os.environ["AITER_SELECT"] = "latency"
+        self.assertEqual(self.api.mxfp4_tuning_fingerprint(), fingerprint)
+        with self.assertRaisesRegex(RuntimeError, "already resolved"):
+            self.api.configure_mxfp4_tuning()
+
+    def test_conflicting_power_tables_are_rejected_without_rewriting(self):
+        _, power = self.power_fixture()
+        other = power.with_name("other_a4w4_blockscale_tuned_gemm.csv")
+        other.write_text(
+            power.read_text().replace(",power,0,12,power", ",different,0,9,power")
+        )
+        before = {path: path.read_bytes() for path in (power, other)}
+        os.environ["AITER_SELECT"] = "power"
+        with self.assertRaisesRegex(ValueError, "conflicting power"):
+            self.rows()
+        self.assertEqual({path: path.read_bytes() for path in before}, before)
+
+    def test_default_preserves_all_preexisting_model_selections(self):
+        expected = self.default_rows()
+        self.assertEqual(self.selected_rows(), expected)
+
+    def test_profiles_preserve_unrelated_default_selections(self):
+        expected = self.default_rows()
+        for profile in self.api.available_mxfp4_profiles():
+            with self.subTest(profile=profile):
+                sources = self.api.resolve_mxfp4_tuning_sources(profile=profile)
+                model_keys = set()
+                for path in self.api._profile_sources(profile):
+                    with path.open(newline="") as stream:
+                        for row in csv.DictReader(stream):
+                            model_keys.add(
+                                (
+                                    row["gfx"],
+                                    *(int(row[k]) for k in ("cu_num", "M", "N", "K")),
+                                )
+                            )
+                payload = self.api._merged_csv(sources).decode()
+                actual = {
+                    (r["gfx"], *(int(r[k]) for k in ("cu_num", "M", "N", "K"))): (
+                        r["kernelName"],
+                        int(r["splitK"]),
+                    )
+                    for r in csv.DictReader(io.StringIO(payload))
+                }
+                for key in expected.keys() - model_keys:
+                    self.assertEqual(actual.get(key), expected[key], key)
 
     def test_profiles_keep_case_specific_kernel_choices(self):
         expected = {"llama31_8b": "128x512E", "qwen3_8b": "256x256E"}
@@ -61,11 +191,8 @@ class TestMXFP4TuningConfig(unittest.TestCase):
     def test_profile_row_counts_include_default_without_collisions(self):
         self.api.configure_mxfp4_tuning(profile="qwen3_fsdp")
         rows = self.rows()
-        # Profiles are opt-in: unrelated model tables must not be merged.
-        stock = self.api._CONFIG_DIR / "a4w4_blockscale_tuned_gemm.csv"
-        with open(stock, newline="") as stream:
-            stock_rows = len(list(csv.DictReader(stream)))
-        self.assertEqual(len(rows), stock_rows + 8 + 13)
+        # The small profile overrides one existing Qwen3 VL row.
+        self.assertEqual(len(rows), len(self.default_rows()) + 8 + 13 - 1)
         key = lambda r: tuple(r[k] for k in ("gfx", "cu_num", "M", "N", "K"))
         self.assertEqual(len(rows), len({key(r) for r in rows}))
         ck = next(
@@ -77,10 +204,8 @@ class TestMXFP4TuningConfig(unittest.TestCase):
         sources = self.api.resolve_mxfp4_tuning_sources(profile="qwen3_8b")
         self.assertEqual(
             {Path(source).name for source in sources},
-            {
-                "qwen3_8b_a4w4_blockscale_tuned_gemm.csv",
-                "a4w4_blockscale_tuned_gemm.csv",
-            },
+            {"qwen3_8b_a4w4_blockscale_tuned_gemm.csv"}
+            | {Path(path).name for path in self.api._default_sources()},
         )
 
     def test_first_source_wins_without_editing_source_tables(self):
@@ -221,8 +346,9 @@ class TestMXFP4TuningConfig(unittest.TestCase):
             with contextlib.redirect_stdout(buffer):
                 self.api.main()
             self.assertEqual(
-                len(buffer.getvalue().splitlines()), 2
-            )  # model table + stock
+                len(buffer.getvalue().splitlines()),
+                len(self.api.mxfp4_tuning_sources()),
+            )
         finally:
             sys.argv = argv
 

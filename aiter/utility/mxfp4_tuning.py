@@ -14,6 +14,7 @@ import argparse
 import csv
 import functools
 import hashlib
+import importlib.util
 import io
 import json
 import os
@@ -23,6 +24,7 @@ from pathlib import Path
 
 _CONFIG_DIR = Path(__file__).resolve().parents[1] / "configs"
 _PROFILE_FILE = _CONFIG_DIR / "mxfp4_profiles.json"
+_DEFAULT_FILE = _CONFIG_DIR / "mxfp4_default_sources.json"
 _MODEL_DIR = _CONFIG_DIR / "model_configs"
 _ENV = "AITER_CONFIG_GEMM_A4W4"
 _KEYS = ("gfx", "cu_num", "M", "N", "K")
@@ -32,7 +34,53 @@ _frozen_sources = None
 _resolved_file = None
 _frozen_fingerprint = None
 _effective_fingerprint = None
+_configured_power_sources = None
+_frozen_power_sources = None
 _lock = threading.RLock()
+
+
+@functools.lru_cache(maxsize=1)
+def _power_helpers():
+    # Load the shared stdlib policy without bootstrapping the aiter package.
+    spec = importlib.util.spec_from_file_location(
+        "_mxfp4_power_policy", Path(__file__).with_name("tune_result.py")
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _power_sources():
+    if os.environ.get(_ENV) or not _power_helpers().power_selection_enabled():
+        return ()
+    return tuple(
+        str(p.resolve())
+        for p in sorted(
+            (_CONFIG_DIR / _power_helpers().POWER_CONFIG_DIRNAME).glob(
+                "*a4w4_blockscale_tuned_gemm*.csv"
+            )
+        )
+        if p.is_file() and "untuned" not in p.name
+    )
+
+
+def _power_policy(sources):
+    if sources == _frozen_sources:
+        return _frozen_power_sources
+    if sources == _configured_sources:
+        return _configured_power_sources
+    return _power_sources()
+
+
+def _reset_mxfp4_tuning_for_tuner():
+    """Private tuner hook for sequential baseline/candidate measurements."""
+    global _configured_sources, _frozen_sources, _resolved_file
+    global _frozen_fingerprint, _effective_fingerprint
+    global _configured_power_sources, _frozen_power_sources
+    with _lock:
+        _configured_sources = _frozen_sources = _resolved_file = None
+        _frozen_fingerprint = _effective_fingerprint = None
+        _configured_power_sources = _frozen_power_sources = None
 
 
 def _locked(function):
@@ -61,8 +109,9 @@ def _profile_sources(profile):
 
 
 def _default_sources():
-    # Model tables are opt-in: only the stock global table backs a profile.
-    return [_CONFIG_DIR / "a4w4_blockscale_tuned_gemm.csv"]
+    # Keep existing tuned coverage; new model tables require explicit selection.
+    with _DEFAULT_FILE.open(encoding="utf-8") as stream:
+        return [_CONFIG_DIR / name for name in json.load(stream)]
 
 
 def resolve_mxfp4_tuning_sources(profile=None, tuned_config=None, merge_default=True):
@@ -75,7 +124,8 @@ def resolve_mxfp4_tuning_sources(profile=None, tuned_config=None, merge_default=
     if override:
         paths = [Path(path) for path in override.split(os.pathsep) if path]
     else:
-        paths = _profile_sources(profile) if profile is not None else []
+        paths = [Path(path) for path in _power_sources()]
+        paths.extend(_profile_sources(profile) if profile is not None else [])
         if tuned_config is not None:
             inputs = (
                 [tuned_config]
@@ -124,16 +174,20 @@ def configure_mxfp4_tuning(profile=None, tuned_config=None, merge_default=True):
     an identical configuration is safe; source content changes after lookup are
     rejected rather than silently disagreeing with cached kernel choices.
     """
-    global _configured_sources
+    global _configured_sources, _configured_power_sources
     sources = resolve_mxfp4_tuning_sources(profile, tuned_config, merge_default)
     fingerprint = _fingerprint(sources)
+    power_sources = _power_sources()
     if _frozen_sources is not None and (
-        sources != _frozen_sources or fingerprint != _frozen_fingerprint
+        sources != _frozen_sources
+        or fingerprint != _frozen_fingerprint
+        or power_sources != _frozen_power_sources
     ):
         raise RuntimeError(
             "A4W4 tuning is already resolved; configure it before the first GEMM"
         )
     _configured_sources = sources
+    _configured_power_sources = power_sources
     return {
         "sources": sources,
         "fingerprint": fingerprint,
@@ -144,6 +198,8 @@ def configure_mxfp4_tuning(profile=None, tuned_config=None, merge_default=True):
 def _merged_csv(sources, contents=None):
     columns = []
     selected = {}
+    power_sources = _power_policy(sources)
+    power_rows = {}
     if contents is None:
         contents = tuple(Path(source).read_bytes() for source in sources)
     for source, content in zip(sources, contents):
@@ -157,6 +213,14 @@ def _merged_csv(sources, contents=None):
                     columns.append(column)
             local = {}
             for row in reader:
+                if (
+                    source in power_sources
+                    and _power_helpers().row_select_mode(
+                        row.get(_power_helpers().SELECT_COLUMN)
+                    )
+                    != "power"
+                ):
+                    continue
                 if None in row:
                     raise ValueError(f"{source}: malformed tuning row")
                 if not row.get("gfx"):
@@ -176,6 +240,10 @@ def _merged_csv(sources, contents=None):
                     raise ValueError(f"{source}: invalid kernelName or splitK")
                 if key in local and local[key] != row:
                     raise ValueError(f"{source}: conflicting rows for {key}")
+                if source in power_sources:
+                    if key in power_rows and power_rows[key] != row:
+                        raise ValueError(f"{source}: conflicting power rows for {key}")
+                    power_rows[key] = row
                 local[key] = row
                 selected.setdefault(key, row)
     stream = io.StringIO(newline="")
@@ -193,6 +261,7 @@ def get_mxfp4_config_file():
     jobs or profiles from overwriting one shared `/tmp` merge result.
     """
     global _frozen_sources, _frozen_fingerprint, _resolved_file, _effective_fingerprint
+    global _frozen_power_sources
     if _resolved_file is not None:
         return _resolved_file
     sources = mxfp4_tuning_sources()
@@ -211,6 +280,7 @@ def get_mxfp4_config_file():
         finally:
             if os.path.exists(temporary):
                 os.unlink(temporary)
+    _frozen_power_sources = _power_policy(sources)
     _frozen_sources = sources
     _frozen_fingerprint = fingerprint
     _effective_fingerprint = hashlib.sha256(payload).hexdigest()
