@@ -78,10 +78,13 @@ def _shape_ncdhw(x, ndhwc):
     return n, c, d, h, w
 
 
-def _to_ndhwc(x, in_ndhwc):
+def _to_ndhwc(x, in_ndhwc, stream=None):
     if in_ndhwc:
         return x.contiguous()
-    return x.permute(0, 2, 3, 4, 1).contiguous()
+    # Tiled FlyDSL transpose; it falls back to torch where C % 8 != 0.
+    from aiter.ops.flydsl.conv_kernels import _ncdhw_to_ndhwc
+
+    return _ncdhw_to_ndhwc(x, stream)
 
 
 def _host_pad_ndhwc(x_ndhwc, pad_lo, pad_hi, mode):
@@ -444,7 +447,7 @@ def run_conv3d_gfx1250(
     ):
         x_ndhwc = _fold_hw_ncdhw(x, kh, kw, pad_lo[1], pad_lo[2], stream)
     if x_ndhwc is None:
-        x_ndhwc = _to_ndhwc(x, in_ndhwc)
+        x_ndhwc = _to_ndhwc(x, in_ndhwc, stream)
         x_ndhwc = _host_pad_ndhwc(x_ndhwc, pad_lo, pad_hi, torch_pad_mode)
         if fold_hw:
             x_ndhwc = _fold_hw_ndhwc(x_ndhwc, kh, kw)
