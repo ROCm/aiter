@@ -204,6 +204,18 @@ using bf16          = opus::bf16_t;
 using bf16x8        = opus::vector_t<bf16, 8>;
 using f32x4         = opus::vector_t<float, 4>;
 
+// On gfx950, a packed FP32 op whose low half reads src1's high dword sees zero
+// there in lanes 48..63 while another wave on the same SIMD runs MFMA. Without
+// post, split-tail and body blocks share CUs, so keep their collapse scalar.
+template <bool SCALAR>
+__device__ __forceinline__ float collapse_fma(float x, float w, float acc)
+{
+    acc = fmaf(x, w, acc);
+    if constexpr(SCALAR)
+        asm("" : "+v"(acc));
+    return acc;
+}
+
 __device__ __forceinline__ float sum_k_lanes(float x)
 {
     x += __shfl_xor(x, 16, 64);
@@ -1665,9 +1677,10 @@ __device__ __forceinline__ void large_tiles(const bf16* residual,
                         v = 0;
 #pragma unroll
                         for(int h = 0; h < 4; ++h)
-                            v = fmaf(static_cast<float>(new_regs[h][e]),
-                                     pre[c % 2 + (c / NC) * 2][h],
-                                     v);
+                            v = collapse_fma<(VARIANT == 12 && !HAS_POST)>(
+                                static_cast<float>(new_regs[h][e]),
+                                pre[c % 2 + (c / NC) * 2][h],
+                                v);
                     }
                     collapsed[e] = opus::fp32_to_bf16(v);
                 }
@@ -2101,7 +2114,8 @@ __device__ __forceinline__ void generic_tiles(bf16* residual_out,
                         v = 0;
 #pragma unroll
                         for(int h = 0; h < 4; ++h)
-                            v = fmaf(static_cast<float>(new_regs[h][e]), pre[h], v);
+                            v = collapse_fma<(VARIANT == 12 && !HAS_POST)>(
+                                static_cast<float>(new_regs[h][e]), pre[h], v);
                     }
                     collapsed[e] = opus::fp32_to_bf16(v);
                 }
@@ -2551,7 +2565,7 @@ void launch_mega_mhc(aiter_tensor_t& residual_out,
                 : KERNEL_SPLIT(POST) > 1 ? ((blocks + 7) / 8) * 8 * KERNEL_SPLIT(POST) \
                                          : (t + ROWS - 1) / ROWS),                     \
            (launch_threads<H, VARIANT, POST, STREAMS>),                                \
-           POST ? 0 : tail_lds_reserve,                                                \
+           0,                                                                          \
            stream>>>(static_cast<const bf16*>(residual.data_ptr()),                    \
                      static_cast<const bf16*>(sublayer_out.data_ptr()),                \
                      static_cast<const float*>(post_mix.data_ptr()),                   \
@@ -2589,10 +2603,6 @@ void launch_mega_mhc(aiter_tensor_t& residual_out,
     constexpr int no_post_stage = H == 4096 ? 3072 : 4096;
     const bool stage_large      = blocks <= 256 || full_round(blocks);
     const bool use_m32          = t >= 8192 && full_round((t + 31) / 32);
-    // Without post, keep one tail-variant block per CU: a block running the
-    // split tail beside a body block intermittently corrupted that body's
-    // collapse.
-    constexpr int tail_lds_reserve = VARIANT == 12 ? 80 * 1024 : 0;
 #define DISPATCH(POST, IDENTITY)                          \
     if constexpr(VARIANT == 11 && POST)                   \
     {                                                     \
