@@ -306,7 +306,11 @@ class PaDecodeSchedule:
                     if query_length % 2 == 0 and 2 * split_workgroups <= (
                         4 * num_compute_units
                         if sliding_window > 0
-                        else num_compute_units
+                        else (
+                            2 * num_compute_units
+                            if head_dim <= 64
+                            else num_compute_units
+                        )
                     ):
                         query_splits = 2
                 elif query_length % 4 == 0 and (
