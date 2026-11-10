@@ -21,6 +21,7 @@ import torch
 
 from aiter import ActivationType
 
+from ..tensor_shim import _run_compiled, ptr_arg
 from .arena import _align_up
 
 _log = logging.getLogger("aiter")
@@ -547,7 +548,7 @@ class _Stage1Fusion:
             )
             if id(launch) not in seen:
                 seen.add(id(launch))
-                launch(*launch_args(psum, send, runs, tsrc, 0))
+                _run_compiled(launch, *launch_args(psum, send, runs, tsrc, 0))
         torch.cuda.synchronize()
         d.res.arena._communicator.barrier()
 
@@ -596,8 +597,6 @@ class _Stage1Fusion:
         **_unused,
     ):
         """GEMM1 launch stand-in: runs this layer's dispatch and GEMM1."""
-        from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
-
         step = self.step
         if step is None:
             raise RuntimeError("AITER_MEGA_S1F: stage-1 hook called without a step")
@@ -683,8 +682,9 @@ class _Stage1Fusion:
             quant_wmma_rep=int(quant_wmma_rep),
             block_runs=block_runs,
         )
-        launch(
+        _run_compiled(
+            launch,
             *launch_args(
                 m_tile_map, bufs["send_list"], bufs["runs"], bufs["tile_src"], tokens
-            )
+            ),
         )

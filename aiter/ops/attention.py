@@ -576,14 +576,32 @@ def _attention_ps_reduce_asm(
     max_seqlen_q: int,
     final_output: torch.Tensor,
     final_lse: torch.Tensor | None = None,
+    merge_waves: int = 0,
 ) -> None:
     """Merge compatible PS-mode split-attention outputs and LSE on gfx950.
 
-    Partial output/LSE must be contiguous FP32 tensors with compatible int32
-    reduction maps on the output device. Output is BF16/FP16 [queries, heads,
+    Partial output and partial LSE must be contiguous FP32 tensors, with
+    compatible int32 reduction maps on the output device.
+    Output is BF16/FP16 [queries, heads,
     128]; optional final LSE is FP32. The producer must follow the same partial
     layout and LSE convention. No paged-KV or causal-mask inputs are consumed.
+    merge_waves is 0 for the existing heuristic, or 1/8 for an explicit choice.
     """
+
+
+def _pa_ps_reduce_waves(batch_size: int, kv_pages: int, num_cu: int) -> int:
+    """Estimate Q4/GQA16/page16 reduction work from packed, used KV pages.
+
+    This is not a live split count. Callers with padded kv_indices should pass
+    an explicit reduce_waves value. Metadata buffer capacity is not consulted.
+    """
+    if num_cu != 256 or not 1 <= batch_size <= 8:
+        return 0
+    output_rows = batch_size * 4 * 16
+    if output_rows < num_cu:
+        return 0
+    context_threshold = 32768 if output_rows <= num_cu else 65536
+    return 8 if kv_pages * 16 >= batch_size * context_threshold else 0
 
 
 def pa_persistent_fwd(
@@ -608,16 +626,39 @@ def pa_persistent_fwd(
     mask: int = 0,
     quant_type: QuantType = QuantType.per_Token,
     high_precision: int = 1,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    reduce_waves: int = 0,
+    return_lse: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Run persistent attention and merge only materialized partial outputs.
 
     Work records with partial index -1 write directly to output. Their final
     LSE is undefined and must not be read; the forward kernel does not produce it.
     Empty reduction maps skip the reducer; preallocated GPU maps are handled on
     device without reading metadata back to the host.
+    reduce_waves selects the gfx950/page16/D128 ASM reducer: 0 applies a static
+    PA workload heuristic, while 1/8 explicitly overrides it. The Q4/GQA16
+    policy expects packed kv_indices containing only used pages. Other paths
+    retain the original heuristic. No tuning or device-to-host readback occurs.
+    return_lse=False skips final LSE allocation and computation and returns None
+    for the second result. The default preserves the existing LSE output.
+    Split work always uses FP32 partials and FP32 LSE. Metadata partial=-1
+    selects direct output in Q's dtype without materializing a partial or LSE.
     """
     device = Q.device
     total_s, nhead, v_head_dim = output.shape
+    if reduce_waves not in (0, 1, 8):
+        raise ValueError("reduce_waves must be 0, 1, or 8")
+    use_asm_reduce = (
+        K.shape[3] == 16
+        and v_head_dim == 128
+        and output.dtype in (dtypes.bf16, dtypes.fp16)
+        and reduce_final_map is not None
+        and get_gfx_runtime() == "gfx950"
+    )
+    if reduce_waves and not use_asm_reduce:
+        raise ValueError(
+            "explicit reduce_waves requires the gfx950/page16/D128 ASM reducer"
+        )
     if softmax_scale is None:
         softmax_scale = 1.0 / (v_head_dim**0.5)
     logits = torch.empty(
@@ -630,7 +671,11 @@ def pa_persistent_fwd(
         dtype=dtypes.fp32,
         device=device,
     )
-    final_lse = torch.empty((total_s, nhead), dtype=dtypes.fp32, device=device)
+    final_lse = (
+        torch.empty((total_s, nhead), dtype=dtypes.fp32, device=device)
+        if return_lse
+        else None
+    )
 
     pa_ps_fwd_asm(
         Q,
@@ -656,15 +701,26 @@ def pa_persistent_fwd(
     if reduce_partial_map.numel() == 0 or reduce_indptr.numel() == 1:
         return logits, final_lse
 
-    reduce_fn = pa_reduce_v1
+    batch_size = qo_indptr.numel() - 1
     if (
-        K.shape[3] == 16
-        and v_head_dim == 128
-        and output.dtype in (dtypes.bf16, dtypes.fp16)
-        and reduce_final_map is not None
-        and get_gfx_runtime() == "gfx950"
+        use_asm_reduce
+        and reduce_waves == 0
+        and max_qlen == 4
+        and total_s == batch_size * 4
+        and nhead == 16
+        and K.shape[1] == 1
+        and K.dtype == dtypes.fp8
+        and V.dtype == dtypes.fp8
+        and quant_type == QuantType.per_Token
+        and mask == 1
     ):
-        reduce_fn = _attention_ps_reduce_asm
+        reduce_waves = _pa_ps_reduce_waves(
+            batch_size,
+            kv_indices.numel(),
+            torch.cuda.get_device_properties(device).multi_processor_count,
+        )
+    reduce_fn = _attention_ps_reduce_asm if use_asm_reduce else pa_reduce_v1
+    reduce_args = (reduce_waves,) if use_asm_reduce else ()
     reduce_fn(
         logits,
         splitLse,
@@ -674,6 +730,7 @@ def pa_persistent_fwd(
         max_qlen,
         output,
         final_lse,
+        *reduce_args,
     )
 
     return logits, final_lse
@@ -983,7 +1040,6 @@ def get_pa_metadata_info_v1(batch_size: int, num_head_k: int = 1):
     gpu = torch.cuda.current_device()
     device_properties = torch.cuda.get_device_properties(gpu)
     cu_num = device_properties.multi_processor_count
-
     tile_cnt = batch_size
     max_work = (tile_cnt + cu_num - 1) * num_head_k
     max_split_tiles = min(batch_size + cu_num - 1, (cu_num - 1) * 2)
@@ -1035,13 +1091,24 @@ def get_pa_metadata_v1(
         num_heads_per_head_k: Equals to num_heads_q // num_heads_k.
         num_heads_k: num_heads_k.
         is_causal: Whether causal mask is enabled.
+        Work records use partial_qo_loc=-1 for direct output and nonnegative
+        indexes for split output. The metadata does not encode buffer dtype.
+        For block_size=16, KV split granularity is overridden internally: page16 uses
+        256-token tiles when fast_mode=True on 256-CU gfx950, causal Q4/GQA16,
+        one KV head, 1-64 requests, max_seqlen_qo=uni_seqlen_qo=4 and the full
+        CU worker budget. Other page16 configurations retain page-granularity
+        planning. Other page sizes use the supplied kv_granularity unchanged,
+        including the original page1024 path when kv_granularity=1024.
+        Tile-aligned splits can change rounding, so attention need not be
+        bit-exact to the original page16 plan.
         Options: Detailed settings for spliting. All of them are optional.
-            kv_granularity: default=16. The granularity on kv sequence length when cutting batch.
+            kv_granularity: default=16. KV split granularity in tokens; overridden for page16 as above.
             max_seqlen_qo: default=-1. Used to check lds usage and save time. value less than 1 means unknown.
             uni_seqlen_qo: default=-1. Sequence length of qo is uniform across batches. value less than 1 means the
                            length is not fixed.
-            fast_mode: default=True. Uses parallel generation for dense, single-Q-tile inputs
-                       with page size 16 (block_size=kv_granularity=16), up to 32768 requests and
+            fast_mode: default=True. In addition to the automatic tile path above, uses parallel
+                       generation for dense, single-Q-tile inputs
+                       with page size 16, up to 32768 requests and
                        the full CU worker budget. False, other page sizes or configurations, or
                        buffers without the extra scratch space (see get_pa_metadata_info_v1) use
                        the serial generator with identical metadata. Valid inputs require consistent

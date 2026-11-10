@@ -5,7 +5,7 @@ Replaces Step 3's self-applied prose checklist. Emits only the matching rules so
 the model reads ~12 instead of all of them.  Conservative: when a type cannot be decided
 structurally it is INCLUDED, never dropped.
 """
-import ast, difflib, re, sys, pathlib, collections
+import ast, difflib, json, re, sys, pathlib, collections
 from collections import OrderedDict
 
 TIER = ("aiter/jit/core.py", "aiter/__init__.py", "aiter/fused_moe.py",
@@ -2492,6 +2492,223 @@ def audit_card(card_text, verdicts_text, diagnostic_text, answers_text, diff_tex
     return findings, problems
 
 
+# ---------------------------------------------------------------- design routing
+
+# The reviewability bar: a human still reads a PR of this size in one pass, and past it a
+# review degrades from reading to sampling. 1000 lines / 15 files, from vLLM's review data.
+SIZE_BAR_LINES = 1000
+SIZE_BAR_FILES = 15
+
+DESIGN_CARD = re.compile(r"^Design \(advisory\):\s*(.*)$", re.M)
+HUMAN_CARD = re.compile(r"^Human:\s*(.*)$", re.M)
+SIZE_CARD = re.compile(r"^Size:\s*(.*)$", re.M)
+DESIGN_TXT = re.compile(r"^DESIGN:\s*(.*)$", re.M)
+HUMAN_TXT = re.compile(r"^HUMAN:\s*(.*)$", re.M)
+RECOMMEND = re.compile(r"^recommend\s+(.+?)\s+review\s+(.+)$", re.I)
+# `--` (design.txt's house style, like refutations.txt) and the em-dash the card's header
+# block uses everywhere else (Validation/Perf) must both read: a worker following the card
+# template to the letter wrote `NONE — <reason>` and the gate reded DESIGN-DISAGREES on a
+# card that said exactly what design.txt said.
+DASH = r"(?:--|—|–)"
+NONE_REASON = re.compile(r"^NONE\s+" + DASH + r"\s*(.*)$", re.I)
+NA_REASON = re.compile(r"^N/A\s+" + DASH + r"\s*(.*)$", re.I)
+
+
+def size_stats(meta):
+    """(lines, files) this PR changes, from the same metadata the PR page shows."""
+    files = meta.get("files") or []
+    try:
+        lines = sum(int(f.get("additions") or 0) + int(f.get("deletions") or 0)
+                    for f in files)
+    except (TypeError, ValueError):
+        lines = 0
+    return lines, len(files)
+
+
+def _author_ids(meta):
+    """(login, name) of the PR author, however `gh pr view --json author` spelled it."""
+    a = meta.get("author") or {}
+    if isinstance(a, dict):
+        return (a.get("login") or "").strip(), (a.get("name") or "").strip()
+    return str(a).strip(), ""
+
+
+def _person_on_roster(person, reviewers_text):
+    """Is the recommended person one of the people who worked on these paths?
+
+    A roster line carries a handle, a name or an email; the recommendation may spell any
+    of them. Every token of the recommendation must appear in one roster line -- `Guanbao
+    Yu` matches `Guanbao Yu (git-log, ...)`, and so does the email on that same line.
+    """
+    toks = [t.lower() for t in person.split() if len(t) >= 3]
+    pl = person.lower().strip(" .@-")
+    if not toks and not pl:
+        return False
+    for ln in (reviewers_text or "").splitlines():
+        s = ln.strip()
+        if not s or s.startswith("#"):
+            continue
+        ll = s.lower()
+        if pl and pl in ll:
+            return True
+        if toks and all(t in ll for t in toks):
+            return True
+    return False
+
+
+def _names_pr_token(q, diff_text, title):
+    """Does the routed question name something from this PR?
+
+    A question about nothing in the diff routes a judgment about some other PR.
+    """
+    hay = (diff_text or "") + "\n" + (title or "")
+    return any(w in hay for w in re.findall(r"[A-Za-z_][\w./-]{3,}", q))
+
+
+def audit_design(design_text, card_text, reviewers_text, meta, diff_text):
+    """Step 7.8: the design judgment is routed, not made. Check the routing happened.
+
+    What is checkable, and only this: the two lines exist in design.txt and on the card;
+    the Size line states the PR's real size against the reviewability bar; a recommended
+    person is on the roster of people who have worked on these paths and is not the PR's
+    own author; a PR over the bar carries a split. Whether the decision itself is right is
+    not checkable here -- that is what the routed human is for, and the card names them.
+    """
+    problems = []
+    title = meta.get("title") or ""
+    lines_n, files_n = size_stats(meta)
+    over = lines_n > SIZE_BAR_LINES or files_n > SIZE_BAR_FILES
+    roster_empty = not any(
+        l.strip() and not l.lstrip().startswith("#")
+        for l in (reviewers_text or "").splitlines())
+
+    d_txt = DESIGN_TXT.search(design_text or "")
+    h_txt = HUMAN_TXT.search(design_text or "")
+    if not (design_text or "").strip():
+        problems.append(("DESIGN MISSING", "design.txt",
+                         "Step 7.8 writes its two lines there before the card; not writing "
+                         "them was the cheapest way past this gate"))
+    else:
+        if d_txt is None:
+            problems.append(("UNANSWERED", "design.txt",
+                             "no `DESIGN:` line -- the decision, or `NONE -- <the existing "
+                             "pattern this change sits inside>`"))
+        if h_txt is None:
+            problems.append(("UNANSWERED", "design.txt",
+                             "no `HUMAN:` line -- `recommend <person> review <question>`, "
+                             "or `N/A -- <reason>` when the design is NONE"))
+
+    d_card = DESIGN_CARD.search(card_text or "")
+    h_card = HUMAN_CARD.search(card_text or "")
+    s_card = SIZE_CARD.search(card_text or "")
+    if d_card is None:
+        problems.append(("UNREPORTED-DESIGN", "card",
+                         "no `Design (advisory):` line -- the routed human reads the card, "
+                         "not design.txt"))
+    if h_card is None:
+        problems.append(("UNREPORTED-DESIGN", "card",
+                         "no `Human:` line -- a review that routed a judgment and one that "
+                         "did not are different objects, and a reader cannot tell them "
+                         "apart unless it is written down"))
+    if s_card is None:
+        problems.append(("UNREPORTED-SIZE", "card",
+                         "no `Size:` line -- the reader's only signal for whether this PR "
+                         "still fits in one human pass"))
+    else:
+        m = re.match(r"(\d+)\s*lines? / (\d+)\s*files?\b(.*)", s_card.group(1).strip())
+        if not m:
+            problems.append(("MALFORMED", s_card.group(1)[:60],
+                             "expected `Size: <n> lines / <m> files`"))
+        else:
+            if (int(m.group(1)), int(m.group(2))) != (lines_n, files_n):
+                problems.append(("SIZE-MISMATCH", s_card.group(1)[:60],
+                                 f"the PR changes {lines_n} lines / {files_n} files"))
+            says_over = "over the review bar" in s_card.group(1).lower()
+            if over and not says_over:
+                problems.append(("BAR-UNMARKED", s_card.group(1)[:60],
+                                 f"{lines_n} lines / {files_n} files is over the review bar "
+                                 f"({SIZE_BAR_LINES}/{SIZE_BAR_FILES}) and the line must say so"))
+            if not over and says_over:
+                problems.append(("BAR-OVERSTATED", s_card.group(1)[:60],
+                                 f"{lines_n} lines / {files_n} files is within the bar"))
+
+    # NONE-ness must agree between the work record and the card, and a NONE needs its reason.
+    d_none = NONE_REASON.match(d_txt.group(1).strip()) if d_txt else None
+    c_none = NONE_REASON.match(d_card.group(1).strip()) if d_card else None
+    if d_txt and d_card and bool(d_none) != bool(c_none):
+        problems.append(("DESIGN-DISAGREES", (c_none or d_card).group(1)[:60],
+                         "design.txt and the card disagree on whether there is a design "
+                         "decision at all"))
+    for label, m in (("design.txt", d_none), ("card", c_none)):
+        if m and len(m.group(1).strip()) < 15:
+            problems.append(("NO-SUBSTANCE", f"{label}: {m.group(1)[:50]}",
+                             "`NONE -- <reason>` names the existing pattern this change "
+                             "sits inside; a bare NONE is a skipped step"))
+    if d_txt and not d_none and len(d_txt.group(1).strip()) < 15:
+        problems.append(("NO-SUBSTANCE", f"design.txt: {d_txt.group(1)[:50]}",
+                         "a one-word decision is a category, not a decision -- name what "
+                         "was decided"))
+
+    # A real decision routes; a NONE design does not.
+    if h_card and d_card:
+        na = NA_REASON.match(h_card.group(1).strip())
+        if c_none:
+            if not na:
+                problems.append(("UNROUTED-NONE", h_card.group(1)[:60],
+                                 "a NONE design takes `Human: N/A -- <reason>`, not a routing"))
+        elif na:
+            if not roster_empty:
+                problems.append(("UNROUTED-DESIGN", h_card.group(1)[:60],
+                                 "reviewers.txt has people who worked on these paths -- "
+                                 "route the decision, or record the design as NONE with its reason"))
+            elif len(na.group(1).strip()) < 15:
+                problems.append(("NO-SUBSTANCE", na.group(1)[:50],
+                                 "say why nobody could be routed"))
+        else:
+            login, _name = _author_ids(meta)
+            m = RECOMMEND.match(h_card.group(1).strip())
+            if not m:
+                problems.append(("MALFORMED", h_card.group(1)[:60],
+                                 "expected `Human: recommend <person> review <question>`"))
+            else:
+                person, question = m.group(1).strip(), m.group(2).strip()
+                if login and login.lower() in person.lower():
+                    problems.append(("SELF-ROUTED", person,
+                                     f"the PR author ({login}) is not the independent judge "
+                                     "of their own design decision"))
+                if not _person_on_roster(person, reviewers_text):
+                    problems.append(("OFF-ROSTER", person,
+                                     "not in reviewers.txt -- pick someone who has actually "
+                                     "worked on these paths, or `N/A -- <reason>` if the "
+                                     "roster is empty"))
+                if len(question) < 20:
+                    problems.append(("NO-SUBSTANCE", question[:50],
+                                     "the routed question names the decision only they can answer"))
+                elif not _names_pr_token(question, diff_text, title):
+                    problems.append(("UNANCHORED", question[:60],
+                                     "names nothing from this PR -- a question about nothing "
+                                     "in the diff routes a judgment about some other PR"))
+
+    # Over the bar, the split is not a judgment to weigh -- the bar already decided it. The
+    # design line must carry SPLIT and its seams; the worker's only judgment is where the
+    # seams fall. ghstack makes a stacked split cheap, so the recommendation is actionable
+    # rather than a complaint.
+    if over and d_card:
+        if c_none:
+            problems.append(("UNSPLIT", c_none.group(1)[:60],
+                             f"{lines_n} lines / {files_n} files is over the review bar "
+                             f"({SIZE_BAR_LINES}/{SIZE_BAR_FILES}) -- the split is not a "
+                             "judgment to weigh over the bar: `SPLIT -- <the natural seams>`, "
+                             "not NONE"))
+        else:
+            rest = d_card.group(1).strip()
+            if not rest.upper().startswith("SPLIT") or len(rest) < 25:
+                problems.append(("UNSPLIT", rest[:60],
+                                 "over the review bar -- `SPLIT -- <the natural seams>`; "
+                                 "ghstack makes a stacked split cheap"))
+    return problems
+
+
 
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else ""
@@ -2500,7 +2717,7 @@ if __name__ == "__main__":
                         "twins", "citest", "perfclaims",
                         "structabi", "commentonly", "card", "corefiles",
                         "kerneltest", "siblings", "guards", "refutations",
-                        "independent"):
+                        "independent", "design"):
         print("usage: triage.py rules <diff> [title]\n"
               "       triage.py evidence <diff> <head-file>...\n"
               "       triage.py symbols <diff> <merge-target-root>\n"
@@ -2523,6 +2740,7 @@ if __name__ == "__main__":
               "       triage.py guards <diff>\n"
               "       triage.py refutations <refutations.txt> <diff> <card.md>\n"
               "       triage.py independent <independent.txt> <card.md>\n"
+              "       triage.py design <design.txt> <card.md> <reviewers.txt> <pr_meta.json> [diff]\n"
               "       triage.py card <card.md> <verdicts> <diagnostic> <answers> <diff> [late_findings]", file=sys.stderr)
         raise SystemExit(2)
 
@@ -2538,6 +2756,45 @@ if __name__ == "__main__":
         print("\n".join(out))
         sys.exit(0 if out[0].startswith(("INDEPENDENTLY REFUTED",
                                          "INDEPENDENT REFUTATION:")) else 1)
+    if mode == "design":
+        # Fail closed on the inputs, like corefiles: a missing design.txt is a Step 7.8
+        # that did not run, and a missing card is one that was never written.
+        d_path = pathlib.Path(sys.argv[2]) if len(sys.argv) > 2 else None
+        if d_path is None or not d_path.is_file():
+            print("DESIGN MISSING: %s. Step 7.8 writes design.txt before the card; not "
+                  "writing it was the cheapest way past this gate"
+                  % d_path, file=sys.stderr)
+            raise SystemExit(1)
+        card_path = pathlib.Path(sys.argv[3]) if len(sys.argv) > 3 else None
+        if card_path is None or not card_path.is_file():
+            print("CARD MISSING: %s. Write the card first; this gate checks it against "
+                  "the design routing and cannot do that without it" % card_path,
+                  file=sys.stderr)
+            raise SystemExit(1)
+        reviewers = pathlib.Path(sys.argv[4]).read_text(errors="replace") \
+            if len(sys.argv) > 4 and pathlib.Path(sys.argv[4]).is_file() else ""
+        meta = {}
+        if len(sys.argv) > 5 and pathlib.Path(sys.argv[5]).is_file():
+            try:
+                meta = json.loads(pathlib.Path(sys.argv[5]).read_text(errors="replace"))
+            except ValueError:
+                meta = {}
+        diff_text = pathlib.Path(sys.argv[6]).read_text(errors="replace") \
+            if len(sys.argv) > 6 and pathlib.Path(sys.argv[6]).is_file() else ""
+        problems = audit_design(d_path.read_text(errors="replace"),
+                                card_path.read_text(errors="replace"),
+                                reviewers, meta, diff_text)
+        for kind, what, why in problems:
+            print(f"{kind}: {what}")
+            print(f"  {why}")
+        if problems:
+            print(f"DESIGN ROUTING INCOMPLETE: {len(problems)} problem(s)", file=sys.stderr)
+            raise SystemExit(1)
+        lines_n, files_n = size_stats(meta)
+        print(f"DESIGN ROUTED: size {lines_n} lines / {files_n} files"
+              + (" -- over the review bar" if lines_n > SIZE_BAR_LINES
+                 or files_n > SIZE_BAR_FILES else ""))
+        raise SystemExit(0)
     if mode == "refutations":
         # A missing card is not an empty card. Both this gate and `independent` decide
         # "did every reported finding get attacked" by counting the findings ON the card;
