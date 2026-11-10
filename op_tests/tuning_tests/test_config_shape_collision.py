@@ -369,9 +369,14 @@ class TestConfigShapeCollision(unittest.TestCase):
         """Lookups skip flydsl_fallback rows and serve every other row whatever
         its _tag, so two live rows for one shape collide even when their labels
         differ: here a label against the 0 the merge fills into a table without
-        the column. A fallback row may sit beside the live one."""
+        the column. A fallback row may sit beside the live one. The lookup
+        compares the label exactly, so a padded "flydsl_fallback " is live."""
         model = "gfx,cu_num,M,N,K,us\ngfx950,256,1,64,128,20.0\n"
-        for tag, collides in (("fused_expert", True), ("flydsl_fallback", False)):
+        for tag, collides in (
+            ("fused_expert", True),
+            ("flydsl_fallback", False),
+            ("flydsl_fallback ", True),
+        ):
             with self.subTest(tag=tag):
                 err, _, _, _ = self._merge_synthetic(
                     f"gfx,cu_num,M,N,K,us,_tag\ngfx950,256,1,64,128,10.0,{tag}\n",
@@ -381,6 +386,22 @@ class TestConfigShapeCollision(unittest.TestCase):
                     self.assertIn("duplicate shape", (err or "").lower())
                 else:
                     self.assertIsNone(err, err)
+
+    def test_merge_refuses_power_row_against_latency_row_with_another_tag(self):
+        """A power row and a latency row for one shape are never ranked against
+        each other, whatever their labels: the merge names the conflict and keeps
+        both sources as they are. Grouped by label, the two rows would fall into
+        separate groups and the slower one would be deleted from its source."""
+        canonical = (
+            "gfx,cu_num,M,N,K,us,select,_tag\n"
+            "gfx950,256,1,64,128,10.0,power,fused_expert\n"
+        )
+        model = "gfx,cu_num,M,N,K,us\ngfx950,256,1,64,128,20.0\n"
+        err, _, canonical_after, model_after = self._merge_synthetic(canonical, model)
+        self.assertIn("a power-tuned row and a latency row share a shape", err or "")
+        self.assertIn("No config file was rewritten", err or "")
+        self.assertEqual(canonical_after, canonical)
+        self.assertEqual(model_after, model)
 
     def test_dedup_keeps_lowest_us_despite_unparseable_cell(self):
         """A written us that is not a number, here nan on an unrelated row, must
