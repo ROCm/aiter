@@ -225,8 +225,9 @@ __device__ __host__ constexpr int row_offset(int r)
 template <class C>
 constexpr int res_slot_rows = C::RES_SHUF ? BM + 4 : BM;
 
-// Multi-arch builds also parse this file for other device targets. Keep
-// gfx1250-only intrinsics out of those passes and the host pass.
+// Every Mega-MHC module compiles this file for all of its build targets, and
+// the host dispatch selects it at run time. Keep gfx1250-only intrinsics out
+// of the other device passes and the host pass.
 #if defined(__gfx1250__)
 // MXFP8 output of the normalized rows. Codes are [T][H] E4M3. By default E8M0
 // scales use the gfx1250 MXFP8 GEMM A-scale layout (m32k4, the bytes of
