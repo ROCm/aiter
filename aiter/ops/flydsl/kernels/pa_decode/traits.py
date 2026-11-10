@@ -867,7 +867,6 @@ class PaDecodeTraits:
             is_gfx950
             and (DIRECT or _num_partitions == 1)
             and SPARSE_GRID
-            and not MXFP4
             # The head-256 pipe's waves leave no room for a second group.
             and not D256_PIPE
             and not per_token_kv
@@ -892,6 +891,10 @@ class PaDecodeTraits:
                 )
 
         GROUP_LDS_BYTES = (total_bytes + 15) // 16 * 16
+        # MXFP4 stages V and page ids per group: both copies must fit.
+        DUAL_GROUP = DUAL_GROUP and (
+            not MXFP4 or 2 * GROUP_LDS_BYTES <= MXFP4_LDS_LIMIT_BYTES
+        )
         CTA_THREADS = BLOCK_THREADS * (2 if DUAL_GROUP else 1)
         return cls(
             cache_key=cache_key,

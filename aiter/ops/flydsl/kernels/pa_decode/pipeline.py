@@ -356,7 +356,13 @@ class PaDecodePipeline:
         self.softmax.init_mask()
         self.ctx.init_causal_offsets()
         o_final = self.mainloop(k_pf0, v_page_pf0, q_ops_all, pages1)
-        if const_expr(self.traits.MXFP4):
+        if const_expr(self.traits.MXFP4 and self.traits.DUAL_GROUP):
+            # Lane-wise (O, max, sum) merge, then group 0's four-wave merge;
+            # its barrier passes once group 1's waves have ended.
+            o_final = self.merge_groups(o_final)
+            if self.ctx.group == 0:
+                self.epilogue.store_mxfp4(o_final)
+        elif const_expr(self.traits.MXFP4):
             self.epilogue.store_mxfp4(o_final)
         elif const_expr(self.traits.DUAL_GROUP):
             o_final = self.merge_groups(o_final)
@@ -418,6 +424,10 @@ class PaDecodePipeline:
             )
         merged[t.m_slot(0)] = m
         merged[t.l_slot(0)] = o_final[t.l_slot(0)] * a0 + fx.Float32(ml[1]) * a1
+        if const_expr(t.MXFP4):
+            # The MXFP4 store merges its waves through LDS that overlaps the
+            # merge slots: every lane reads its slot first.
+            gpu.barrier()
         return merged
 
     def fp8_mtp4_prefetch(self):
