@@ -6,7 +6,7 @@
 // Layout: q/k/v/out are **packed [token, head, dim]** (batch folded into the
 // token axis).  Per-batch sequence boundaries are described by cumulative
 // length arrays cu_seqlens_q / cu_seqlens_k (int32, length batch+1, no
-// padding).  D64 / D128 need densely packed q/k/v/out; D192x128 takes token /
+// padding).  D64 / D128 need densely packed q/k/v/out; D192x128 and D256 take token /
 // head strides, so its q/k/v/out may be views with a contiguous last dim.
 //
 //   q   : (total_q, nheads,   hdim_q)
@@ -57,7 +57,8 @@ struct FmhaFwdVarlenKernelArgs
 static_assert(sizeof(FmhaFwdVarlenKernelArgs) == 0x58,
               "fmha_fwd_with_sink_varlen_asm: FmhaFwdVarlenKernelArgs must be 88B packed");
 
-// D192x128: the block above plus byte strides (120 B, the full s2..s31 preload).
+// D192x128 and D256: the block above plus byte strides (120 B, the full s2..s31
+// preload).
 #pragma pack(push, 1)
 struct FmhaFwdVarlenStrideKernelArgs
 {
@@ -76,6 +77,33 @@ static_assert(sizeof(FmhaFwdVarlenStrideKernelArgs) == 0x78,
               "fmha_fwd_with_sink_varlen_asm: FmhaFwdVarlenStrideKernelArgs must be 120B packed");
 
 // ---- helpers ---------------------------------------------------------------
+
+// D256 launch options (s_opt), from host-side sizes only (cu_seqlens is not read).
+// bit0 reverse_kv: with double_q, the second Q tile walks K/V backwards.  bit1 double_q: a
+// workgroup runs Q tiles g and tiles-1-g.  bit2 remap_xy: x indexes heads, so the workgroups
+// launched together read the K/V of every kv head.
+//   remap_xy while that K/V is small: kv heads x mean kv length <= 2^17 rows.
+//   causal: double_q + reverse_kv; non-causal: double_q only with remap_xy.
+// The same rule is in asm_fmha_fwd_with_sink.cu.
+static int select_opt_hd256(long batch, long total_k, int kv_head_num, bool is_causal)
+{
+    const bool remap = (long)kv_head_num * (total_k / (batch > 0 ? batch : 1)) <= (1L << 17);
+    if (is_causal)
+        return 0x3 | (remap ? 0x4 : 0);
+    return remap ? 0x6 : 0;
+}
+
+// D256 launch width along the Q tiles.  Without remap_xy, x is the Q tile and workgroups go
+// to the XCCs round-robin by linear id, so with an even width the working tiles of the shorter
+// sequences land on a few XCCs.  The width is made odd unless the lengths are known equal
+// (q has exactly max_seqlen_q x batch rows); the extra column exits at once, since the kernel
+// exits by each sequence's own tile count.
+static int launch_width_hd256(int gdx, int max_seqlen_q, long total_q, int batch, int opt)
+{
+    if ((opt & 0x4) || gdx % 2 || (long)max_seqlen_q * batch == total_q)
+        return gdx;
+    return gdx + 1;
+}
 
 // Kernel selection: (dtype, hdim_q, hdim_v, mask).  mask = is_causal: the csv
 // registers both mask=0 (non-causal, _rxy[_sink]_pfnr source) and mask=1
@@ -106,8 +134,9 @@ static std::string get_heuristic_kernel_fmha_fwd_bf16_varlen(const std::string& 
     return "";
 }
 
-// The kernel steps the KV loop by 128 * token stride as a sign-extended 32-bit
-// value, hence token stride < 2^24 B.
+// Token stride < 2^24 B: D192x128 steps the KV loop by 128 * token stride as a
+// sign-extended 32-bit value; D256 forms 32-bit offsets of up to 256 rows (KV
+// prefetch) and 128 rows (the Q tile step).
 static void check_strided_thd(const aiter_tensor_t* t, const char* name)
 {
     const int64_t esz = (int64_t)t->element_size();
@@ -197,12 +226,18 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     AITER_CHECK((int)v->size(0) == total_k,     "fmha_fwd_with_sink_varlen_asm: v total_k mismatch with k");
     AITER_CHECK((int)v->size(1) == kv_head_num, "fmha_fwd_with_sink_varlen_asm: v head_num mismatch with k");
     AITER_CHECK(q_head_num % kv_head_num == 0,  "fmha_fwd_with_sink_varlen_asm: q_head_num must be a multiple of kv_head_num");
+    const bool hd192x128 = (qk_head_dim == 192 && v_head_dim == 128);
+    const bool hd256     = (qk_head_dim == 256 && v_head_dim == 256);
     const bool hd_supported =
         (v_head_dim == qk_head_dim && (qk_head_dim == 64 || qk_head_dim == 128)) ||
-        (qk_head_dim == 192 && v_head_dim == 128);
+        hd192x128 || hd256;
     AITER_CHECK(hd_supported,
                 "fmha_fwd_with_sink_varlen_asm: supported (qk_head_dim, v_head_dim) are "
-                "(64,64), (128,128), (192,128); got (", qk_head_dim, ",", v_head_dim, ")");
+                "(64,64), (128,128), (192,128), (256,256); got (", qk_head_dim, ",",
+                v_head_dim, ")");
+    AITER_CHECK(!(hd256 && sink),
+                "fmha_fwd_with_sink_varlen_asm: the D256 kernels take no sink (built with "
+                "ENABLE_SINK=0)");
 
     AITER_CHECK(out->dim() == 3 &&
                 (int)out->size(0) == total_q && (int)out->size(1) == q_head_num &&
@@ -218,7 +253,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     AITER_CHECK(lse->is_contiguous(),
                 "fmha_fwd_with_sink_varlen_asm: lse must be contiguous");
 
-    const bool strided = (qk_head_dim == 192 && v_head_dim == 128);
+    const bool strided = hd192x128 || hd256;
     if (strided)
     {
         check_strided_thd(q, "q");
@@ -252,7 +287,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     const int gqa       = q_head_num / kv_head_num;
     const int mask_flag = is_causal ? 1 : 0;
 
-    // ---- kernel args (88 B packed; D192x128 appends byte strides) ----------
+    // ---- kernel args (88 B packed; D192x128 / D256 append byte strides) ----
     FmhaFwdVarlenKernelArgs args;
     memset(&args, 0, sizeof(args));
     args.d_addr     = out->data_ptr();
@@ -265,11 +300,14 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     args.scalar     = softmax_scale;
     args.gqa        = gqa;
     args.q_head_num = q_head_num;
-    // s_opt: bit0 reverse_kv | bit1 double_q | bit2 remap_xy.
-    // 7 = 0b111 -> all three on.  Must match how the shipped VARLEN .co was
-    // built (REMAP_XY=1 in particular, since we swap gdx/gdy at launch).
-    const bool hd192_non_causal = (qk_head_dim == 192 && mask_flag == 0);
-    args.opt        = hd192_non_causal ? 0x4 : 0x7;
+    // s_opt: bit0 reverse_kv | bit1 double_q | bit2 remap_xy (gdx/gdy are swapped
+    // at launch when set).  D64 / D128 / D192x128 causal: 7 = 0b111, all three on.
+    // D192x128 non-causal: one Q tile per workgroup (no double_q).  D256: chosen per
+    // call (select_opt_hd256); the launch below follows it.
+    if (hd256)
+        args.opt    = select_opt_hd256(batch, total_k, kv_head_num, is_causal != 0);
+    else
+        args.opt    = (hd192x128 && mask_flag == 0) ? 0x4 : 0x7;
     args.lse        = return_lse ? 1 : 0;
     args.max_q_len  = max_seqlen_q;
     args.sink_addr  = sink ? sink->data_ptr() : nullptr;
@@ -312,24 +350,28 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     // ---- launch ------------------------------------------------------------
     // Dispatch along max_q_len (double_q halves the tile count via tg_div); z is
     // the batch index.  The kernel early-exits q-tiles that fall beyond a batch's
-    // actual seqlen using cu_seqlens_q.  All shipped VARLEN kernels use ts_qo=128,
-    // wv_tg=4 (block=128) and remap_xy=1; tg_div follows the double_q bit set
-    // above, so D192x128 non-causal launches the full tile count.
+    // actual seqlen using cu_seqlens_q.  All shipped VARLEN kernels use ts_qo=128
+    // and wv_tg=4 (block=128); tg_div and the x/y swap follow the double_q and
+    // remap_xy bits set above.
     const int sub_Q        = 128;   // ts_qo
     const int wv_tg        = 4;
     const int bdx          = (wv_tg == 4) ? 128 : 256;
     const bool double_q    = (args.opt & 0x2) != 0;  // bit1 of s_opt
     const int  tg_div      = double_q ? 2 : 1;
     const int  q_tile_count = (max_seqlen_q + sub_Q - 1) / sub_Q;
-    const int  gdx          = (q_tile_count + tg_div - 1) / tg_div;
+    int        gdx          = (q_tile_count + tg_div - 1) / tg_div;
+    if (hd256)
+        gdx = launch_width_hd256(gdx, max_seqlen_q, total_q, batch, args.opt);
     const int gdy          = q_head_num;
     const int gdz          = batch;
 
-    // remap_xy=1: swap gdx<->gdy at launch so bid.x indexes heads, bid.y Q-tiles.
+    // remap_xy (s_opt bit2): swap gdx<->gdy at launch so bid.x indexes heads, bid.y
+    // Q-tiles.
+    const bool remap = (args.opt & 0x4) != 0;
     impl_ptr->launch_kernel({kargs,
                              &arg_size,
-                             gdy,   // launch_gdx = head count  (swapped)
-                             gdx,   // launch_gdy = Q-tile count (swapped)
+                             remap ? gdy : gdx,
+                             remap ? gdx : gdy,
                              gdz,
                              bdx,
                              1,
