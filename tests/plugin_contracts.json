@@ -1,4 +1,11 @@
 {
+ "fused_qk_norm_rope_cache_quant_shuffle": {
+  "fingerprint": "a1743044716f524f",
+  "signature": "q:positional:Tensor, k:positional:Tensor, v:positional:Tensor, num_heads_q:positional:int, num_heads_k:positional:int, num_heads_v:positional:int, head_dim:positional:int, eps:positional:float, qw:positional:Tensor, kw:positional:Tensor, cos_sin_cache:positional:Tensor, is_neox_style:positional:bool, pos_ids:positional:Tensor, k_cache:positional:Tensor, v_cache:positional:Tensor, slot_mapping:positional:Tensor, kv_cache_dtype:positional:str, k_scale:positional:Tensor, v_scale:positional:Tensor, -> None",
+  "source": "aiter/ops/fused_qk_norm_rope_cache_quant.py",
+  "supersedes": [],
+  "version": 1
+ },
  "gemm_a8w8_blockscale": {
   "fingerprint": "47ec95c460883544",
   "signature": "XQ:positional:Tensor, WQ:positional:Tensor, x_scale:positional:Tensor, w_scale:positional:Tensor, dtype:positional:torch.dtype=dtypes.bf16, isBpreshuffled:positional:bool=False, split_k:positional:int | None=None, -> torch.Tensor",

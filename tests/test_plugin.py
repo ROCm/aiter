@@ -604,6 +604,62 @@ def test_no_dataclass_field_has_a_default_python_3_11_would_reject():
     )
 
 
+def test_a_contract_that_returns_nothing_still_routes(monkeypatch):
+    """Some ops deliver through mutation and return None. Dispatch must not
+    read that as failure.
+
+    `fused_qk_norm_rope_cache_quant_shuffle` is the first routed contract shaped
+    this way: it writes q, k and the KV cache in place and returns nothing. A
+    dispatch that treated a falsy return as "the provider declined" would fall
+    back to native after the provider had already written -- running the work
+    twice, the second time over the first one's output.
+
+    Nothing in dispatch inspects the return value, and this is the test that
+    says so rather than leaving it to be rediscovered.
+    """
+
+    native_calls = []
+
+    @plugin.route(op="test.in_place", version=1)
+    def in_place(destination, source) -> None:
+        native_calls.append("native")
+
+    provider_calls = []
+
+    class Serving:
+        name = "mutprov"
+        api_versions: ClassVar[set] = {plugin.API_VERSION}
+        op_versions: ClassVar[dict] = {"test.in_place": {1}}
+
+        def select(self, op, args, kwargs):
+            def run(destination, source):
+                provider_calls.append("provider")
+                destination.append(source)  # the whole result, in place
+
+            return plugin.KernelCandidate(
+                provider="mutprov",
+                kernel_id="k",
+                artifact_digest="sha256:abc",
+                run=run,
+            )
+
+    monkeypatch.setattr(
+        plugin, "_entry_points", lambda: (_EntryPoint("mutprov", Serving()),)
+    )
+    plugin.configure(enable=("mutprov",), source="test")
+
+    destination = []
+    assert in_place(destination, "written") is None
+    assert destination == ["written"], "the provider's in-place write was lost"
+    assert provider_calls == ["provider"]
+    assert native_calls == [], (
+        "a None return was treated as a decline and the op ran natively as "
+        "well -- the work would be done twice, the second over the first's "
+        "output"
+    )
+    assert plugin.last_decision().route == "provider"
+
+
 def test_routing_one_op_name_twice_is_an_error():
     _route_add([])
     with pytest.raises(ValueError, match="already routed"):
