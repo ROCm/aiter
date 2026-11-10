@@ -574,7 +574,8 @@ def pa_decode(
     into separate query CTAs. Q/K and V/output
     head dimensions must match.
     ALiBi and externally quantized queries are unsupported. ``softmax_scale``
-    must be finite and positive.
+    must be finite and positive, and so must FP8 ``key_scale``/``value_scale``
+    values: host scalars are checked, device tensors are not read back.
 
     MTP lengths include the query tokens and use dense causal masking.
     Independently selected sparse queries need separate table rows and
@@ -998,6 +999,10 @@ def pa_decode(
         if scale is None:
             return torch.ones(1, dtype=torch.float32, device=dev)
         if not isinstance(scale, torch.Tensor):
+            # Per-tensor scores are masked before the scale is applied, which
+            # needs a positive scale. Device tensors are not read back (no sync).
+            if not (math.isfinite(float(scale)) and float(scale) > 0):
+                raise ValueError(f"{name} must be finite and positive, got {scale}")
             return torch.tensor([float(scale)], dtype=torch.float32, device=dev)
         if scale.numel() == 1:
             return scale.reshape(1)
