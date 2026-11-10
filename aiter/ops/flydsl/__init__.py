@@ -30,6 +30,11 @@ if _base_version < _MIN_FLYDSL_VERSION:
     )
 
 _LAZY_IMPORTS = {
+    "hc_seam": (".hc_seam", "hc_seam"),
+    "hc_seam_prepare_weights": (".hc_seam", "hc_seam_prepare_weights"),
+    "hc_seam_prepared": (".hc_seam", "hc_seam_prepared"),
+    "HcSeamPreparedWeights": (".hc_seam", "HcSeamPreparedWeights"),
+    "hc_gated_combine": (".hc_seam", "hc_gated_combine"),
     "FP8_MQA_LOGITS_DEFAULT_VARIANT": (
         ".fp8_mqa_logits_kernels",
         "DEFAULT_VARIANT",
@@ -199,6 +204,7 @@ __all__ = [
     "DenseGemmConfig",
     "Fp4MqaPlan",
     "GateMode",
+    "HcSeamPreparedWeights",
     "OneShotAllReduce",
     "PreshuffledA16WFP4Weight",
     "QuickAllReduceInt4",
@@ -231,6 +237,10 @@ __all__ = [
     "gather_kv_b_proj_flydsl",
     "gather_kv_b_proj_flydsl_fp8_supported",
     "gather_kv_b_proj_flydsl_supported",
+    "hc_gated_combine",
+    "hc_seam",
+    "hc_seam_prepare_weights",
+    "hc_seam_prepared",
     "make_fp4_mqa_plan",
     "minimax_m3_index_score_alloc",
     "minimax_m3_index_score_flydsl",

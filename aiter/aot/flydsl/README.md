@@ -12,6 +12,7 @@ compiles them up front so the runtime JIT path hits the cache.
 | `conv.py` | conv3d implicit-GEMM kernels and the NCDHW->NDHWC pre-transpose, by replaying `flydsl_conv_implicit` |
 | `chunk_gdn_h.py` | chunk-gdn-h opt (K5) kernels, by replaying `chunk_gated_delta_rule_fwd_h_flydsl_opt` |
 | `gdn_fused_prefill.py` | gfx950 single-kernel GDN prefill, by replaying `gdn_fused_prefill_fwd` per head shape in `DEFAULT_SHAPES` |
+| `hc_seam.py` | gfx950 hyper-connection seam (`hc_seam_prepared`, `hc_gated_combine`), every default-dispatch kernel over combine, next gate and M |
 | `mega_moe.py` | MegaMoE A8W4 and A4W4 bundles of every deployment profile, by preloading `MegaMoEV2` itself (see below) |
 | `fmha_fp8.py` | gfx950 FP8 flash-attention forward, by replaying `flydsl_flash_attn_fp8_func` per head shape in `DEFAULT_SHAPES` |
 | `pa_decode_plan.py` | PA decode planner, every batch bucket, block size and window mode up to each arch's LDS limit, by replaying `plan_pa_decode` (see below) |
@@ -111,7 +112,7 @@ variant of the profile's bundle plan.
   `python -m aiter.aot.flydsl.mega_moe` and `setup.py` start it that way. It
   is skipped when `GPU_ARCHS` names targets without gfx950.
 
-### How `gemm.py`, `conv.py`, `chunk_gdn_h.py`, `gdn_fused_prefill.py` and `fmha_fp8.py` work
+### How `gemm.py`, `conv.py`, `chunk_gdn_h.py`, `gdn_fused_prefill.py`, `hc_seam.py` and `fmha_fp8.py` work
 
 They follow `moe.py`: none restates launch logic. Each turns a tuned row (or,
 for `gdn_fused_prefill.py` and `fmha_fp8.py`, a configured head shape) into
@@ -148,6 +149,14 @@ and launches them; every FlyDSL launch is compiled into the cache instead.
 - `gdn_fused_prefill.py` replays each head shape with and without
   `track_state` and `has_initial_state` (compile-time flags), over batch
   sizes from 1 sequence up, bisected where the wrapper's BV rule switches.
+- `hc_seam.py` replays `hc_seam_prepared` with default arguments (no knob
+  overrides) for combine and next gate in {0, 1} over `DEFAULT_ROWS`: one M
+  per selector range of `tuned.py` (skinny M <= 3, the deferred range up to
+  128 with its K1/K2 edges at 32, 64 and 96, the four-launch range above) and
+  the first M after each padded-extent change, since the four-launch reduce
+  kernel is keyed by the padded extent. It adds one `hc_gated_combine` job.
+  Every job is tagged gfx950, and BF16 norm weights and the test's eps are the
+  only variants covered.
 - `fmha_fp8.py` replays a grid of batch sizes and sequence lengths per head
   shape, bisecting between grid points where the wrapper switches kernels.
   Between grid points of the batch and query length the wrapper can still
@@ -221,6 +230,9 @@ python -m aiter.aot.flydsl.chunk_gdn_h
 # single-kernel GDN prefill (DEFAULT_SHAPES, or ad hoc H:Hg)
 python -m aiter.aot.flydsl.gdn_fused_prefill
 python -m aiter.aot.flydsl.gdn_fused_prefill --shape 48:16
+
+# hyper-connection seam (gfx950)
+python -m aiter.aot.flydsl.hc_seam
 
 # MegaMoE profile bundles (all token buckets and all eight ranks)
 python -m aiter.aot.flydsl.mega_moe

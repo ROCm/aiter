@@ -438,6 +438,7 @@ AOT_MODULES = (
     "aiter.aot.flydsl.conv",
     "aiter.aot.flydsl.chunk_gdn_h",
     "aiter.aot.flydsl.gdn_fused_prefill",
+    "aiter.aot.flydsl.hc_seam",
     "aiter.aot.flydsl.fmha_fp8",
     "aiter.aot.flydsl.pa_decode_plan",
 )
