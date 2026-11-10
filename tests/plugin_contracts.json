@@ -13,6 +13,20 @@
   "supersedes": [],
   "version": 1
  },
+ "inverse_rope_group_quant": {
+  "fingerprint": "6db72b366b6a355f",
+  "signature": "o:positional:Tensor, positions:positional:Tensor, cos_cache:positional:Tensor, sin_cache:positional:Tensor, num_groups:positional:int, quant_group_size:positional:int=128, scale_layout:positional:str='row', x_fp8:positional:Tensor | None=None, x_scale:positional:Tensor | None=None, -> tuple[Tensor, Tensor]",
+  "source": "aiter/ops/inverse_rope_group_quant.py",
+  "supersedes": [],
+  "version": 1
+ },
+ "mla_decode_fwd_v4_nm": {
+  "fingerprint": "da501459c91a356a",
+  "signature": "q:positional, qrope:positional, kv_buffer:positional, kvrope:positional, output:positional, qo_indptr:positional, kv_indptr:positional, kv_page_indices:positional, max_seqlen_q:positional, sink:keyword-only, split_indptr:keyword-only=None, sm_scale:keyword-only=None, out_16_nosplit:keyword-only=0, num_kv_splits:keyword-only=None, logits:keyword-only=None, attn_lse:keyword-only=None, kv_last_page_lens:keyword-only=None",
+  "source": "aiter/mla.py",
+  "supersedes": [],
+  "version": 1
+ },
  "mla_sparse_prefill_v41": {
   "fingerprint": "63be8e18a2184035",
   "signature": "q:positional:torch.Tensor, q_scale:positional:torch.Tensor, unified_kv:positional:torch.Tensor, unified_kv_scale:positional:torch.Tensor, kv_indices_prefix:positional:torch.Tensor, kv_indptr_prefix:positional:torch.Tensor, kv:positional:torch.Tensor, kv_scale:positional:torch.Tensor, kv_indices_extend:positional:torch.Tensor, kv_indptr_extend:positional:torch.Tensor, attn_sink:positional:torch.Tensor | None, softmax_scale:positional:float, out:positional:torch.Tensor | None=None, num_kv_splits:positional:int | None=None, backend:positional:str | None=None, -> torch.Tensor",
