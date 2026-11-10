@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""MoE top-k combine + reduce-scatter over 4 GPUs in one kernel (push mode).
+"""MoE top-k combine + reduce-scatter over 2, 4 or 8 GPUs in one kernel (push mode).
 
 A rank adds the top-k rows of a token with an fp32 fma chain and rounds once to bf16,
 as mxfp4_moe_scatter_reduce does. It writes the row into the inbox of the owner rank.
-The owner adds the 4 ranks in rank order in fp32 and rounds once to bf16. A row flag
+The owner adds the ranks in rank order in fp32 and rounds once to bf16. A row flag
 holds the launch colour, so the flags are never cleared. Each wait has a time limit.
 A wait that times out writes an error record into the buffer of each rank."""
 
@@ -14,7 +14,6 @@ from triton.experimental.gluon import language as gl
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
-_WORLD: gl.constexpr = gl.constexpr(4)
 _SITE_DONE: gl.constexpr = gl.constexpr(1)
 _SITE_FLAG: gl.constexpr = gl.constexpr(2)
 
@@ -201,25 +200,28 @@ def _store32_cons():
     return "=v,=&s,v,v,v,~{memory},~{vcc},~{scc}"
 
 
-# The error record [1, rank, colour, site] into 4 buffers, system scope: the high pair
+# The error record [1, rank, colour, site] into n buffers, system scope: the high pair
 # first, then the low pair, which holds the word that the waiters read.
 @gluon.constexpr_function
-def _errec_asm():
+def _errec_asm(n):
     return "\n".join(
         [
             "v_cmp_ne_u32 vcc, 0, $2",
             "s_and_saveexec_b64 $1, vcc",
             "s_cbranch_execz .Ler${:uid}",
         ]
-        + [f"global_store_dwordx2 ${3 + b}, $7, off offset:8 sc0 sc1" for b in range(4)]
-        + [f"global_store_dwordx2 ${3 + b}, $8, off sc0 sc1" for b in range(4)]
+        + [
+            f"global_store_dwordx2 ${3 + b}, ${3 + n}, off offset:8 sc0 sc1"
+            for b in range(n)
+        ]
+        + [f"global_store_dwordx2 ${3 + b}, ${4 + n}, off sc0 sc1" for b in range(n)]
         + [".Ler${:uid}:", "s_mov_b64 exec, $1", "v_mov_b32 $0, 0"]
     )
 
 
 @gluon.constexpr_function
-def _errec_cons():
-    return "=v,=&s,v,v,v,v,v,v,v,~{memory},~{vcc},~{scc}"
+def _errec_cons(n):
+    return ",".join(["=v", "=&s"] + ["v"] * (n + 3) + ["~{memory}", "~{vcc}", "~{scc}"])
 
 
 @gluon.jit
@@ -249,6 +251,39 @@ def _cmask(c: gl.constexpr, D: gl.constexpr, W: gl.constexpr, cond):
 
 
 @gluon.jit
+def _in_part(ptr, part, DP: gl.constexpr, PARTS: gl.constexpr):
+    """The start of the column part of this CTA in a row at ptr."""
+    if PARTS == 1:
+        return ptr
+    else:
+        return ptr + part * DP
+
+
+@gluon.jit
+def _flag_ptr(base, slot, r, part, RMAX: gl.constexpr, PARTS: gl.constexpr):
+    """The flag of (inbox slot, row r, column part)."""
+    if PARTS == 1:
+        return base + slot * RMAX + r
+    else:
+        return base + (slot * RMAX + r) * PARTS + part
+
+
+@gluon.jit
+def _to_peers(tid, bufs, WORLD: gl.constexpr):
+    """bufs[tid + 1] in lane tid, for the lanes tid < WORLD - 1."""
+    if WORLD == 2:
+        return bufs[1] + gl.zeros_like(tid)
+    else:
+        lanes = ()
+        for k in gl.static_range(WORLD - 2):
+            lanes = lanes + (tid == k,)
+        dst = bufs[WORLD - 1]
+        for k in gl.static_range(WORLD - 2):
+            dst = gl.where(lanes[WORLD - 3 - k], bufs[WORLD - 2 - k], dst)
+        return dst
+
+
+@gluon.jit
 def _drain():
     """The vector memory operations of this wave are complete (vmcnt 0)."""
     gl.inline_asm_elementwise(
@@ -270,25 +305,20 @@ def _store32_sys(addr, value, active):
 
 
 @gluon.jit
-def _fail_record(own, pr1, pr2, pr3, rank, colour, site: gl.constexpr, active):
+def _fail_record(bufs, rank, colour, site: gl.constexpr, active):
     """Writes [1, rank, colour, site] to the error record of each rank."""
     lo = (rank.to(gl.int64) << 32) | 1
     hi = (gl.full(active.shape, site, gl.int64, active.type.layout) << 32) | colour.to(
         gl.uint32
     ).to(gl.int64)
     lo = gl.full(active.shape, 0, gl.int64, active.type.layout) + lo
+    args = (active.to(gl.int32),)
+    for b in gl.static_range(len(bufs)):
+        args = args + (bufs[b].to(gl.pointer_type(gl.int64)),)
     gl.inline_asm_elementwise(
-        _errec_asm(),
-        _errec_cons(),
-        [
-            active.to(gl.int32),
-            own.to(gl.pointer_type(gl.int64)),
-            pr1.to(gl.pointer_type(gl.int64)),
-            pr2.to(gl.pointer_type(gl.int64)),
-            pr3.to(gl.pointer_type(gl.int64)),
-            hi,
-            lo,
-        ],
+        _errec_asm(len(bufs)),
+        _errec_cons(len(bufs)),
+        args + (hi, lo),
         (gl.int32, gl.int64),
         False,
         1,
@@ -322,14 +352,17 @@ def _row_loads(
     valids,
     max_sorted,
     m,
+    part,
     D: gl.constexpr,
+    DP: gl.constexpr,
+    PARTS: gl.constexpr,
     W: gl.constexpr,
     TOPK: gl.constexpr,
 ):
     """For each token of toks: the TOPK sorted positions and weights (scalar loads)
     and the dwords of each intermediate row of this thread (no load when not valid).
     Returns (positions, weights, rows) in (token, k) order."""
-    NCH: gl.constexpr = _n_chunks(D, W * 64)
+    NCH: gl.constexpr = _n_chunks(DP, W * 64)
     NB: gl.constexpr = len(toks)
     bases = ()
     for b in gl.static_range(NB):
@@ -350,11 +383,13 @@ def _row_loads(
         pc = gl.where(ok, p, 0)
         offs = offs + (pc * 4,)
         v = valids[q // TOPK] & ok
-        row = inter + pc.to(gl.int64) * D
+        row = _in_part(inter + pc.to(gl.int64) * D, part, DP, PARTS)
         x = ()
         for c in gl.static_range(NCH):
             x = x + (
-                gl.amd.cdna4.buffer_load(row, _cols(c, D, W), mask=_cmask(c, D, W, v)),
+                gl.amd.cdna4.buffer_load(
+                    row, _cols(c, DP, W), mask=_cmask(c, DP, W, v)
+                ),
             )
         xs = xs + (x,)
     wbits = gl.inline_asm_elementwise(
@@ -378,13 +413,13 @@ def _combine(
     xs,
     q0: gl.constexpr,
     max_sorted,
-    D: gl.constexpr,
+    DP: gl.constexpr,
     W: gl.constexpr,
     TOPK: gl.constexpr,
 ):
     """acc = fma(x_k, w_k, acc) from acc = 0 for the valid k in order, then bf16
     pairs, as the loop of mxfp4_moe_scatter_reduce. Returns one tensor a chunk."""
-    NCH: gl.constexpr = _n_chunks(D, W * 64)
+    NCH: gl.constexpr = _n_chunks(DP, W * 64)
     out = ()
     for c in gl.static_range(NCH):
         alo = gl.zeros_like(xs[q0][c]).to(gl.float32)
@@ -403,41 +438,33 @@ def _combine(
 def _poll_flags(
     own,
     r,
+    part,
     want,
     err_addr,
     ticks,
     active,
     F0: gl.constexpr,
     RMAX: gl.constexpr,
+    PARTS: gl.constexpr,
+    WORLD: gl.constexpr,
     W: gl.constexpr,
 ):
-    """When active: waits until the 3 peer flags of owner row r hold want. Returns
-    failed: 0 ok, 1 timed out, 2 an error record was seen."""
+    """When active: waits until the WORLD - 1 peer flags of owner row r hold want.
+    Returns failed: 0 ok, 1 timed out, 2 an error record was seen."""
     tid = _thread_ids(W)
     z = gl.zeros_like(tid)
-    f = own + F0 + r + z
+    if PARTS == 1:
+        f = own + F0 + r + z
+    else:
+        f = own + F0 + r * PARTS + part + z
+    args = (active.to(gl.int32), f)
+    for s in gl.static_range(1, WORLD - 1):
+        args = args + (f + s * (RMAX * PARTS),)
     out = gl.inline_asm_elementwise(
-        _poll_asm(3),
-        _poll_cons(3),
-        [
-            active.to(gl.int32),
-            f,
-            f + RMAX,
-            f + 2 * RMAX,
-            err_addr + z,
-            want + z,
-            ticks + z.to(gl.int64),
-        ],
-        (
-            gl.int32,
-            gl.int32,
-            gl.int32,
-            gl.int32,
-            gl.int32,
-            gl.int64,
-            gl.int64,
-            gl.int64,
-        ),
+        _poll_asm(WORLD - 1),
+        _poll_cons(WORLD - 1),
+        args + (err_addr + z, want + z, ticks + z.to(gl.int64)),
+        (gl.int32,) * (WORLD + 1) + (gl.int64, gl.int64, gl.int64),
         False,
         1,
     )
@@ -458,14 +485,12 @@ def _iteration(
     rev,
     sw,
     out,
-    own,
-    pr1,
-    pr2,
-    pr3,
+    bufs,
     cur,
     ii,
     n_it,
-    bid,
+    rb,
+    part,
     m,
     rows,
     max_sorted,
@@ -474,9 +499,12 @@ def _iteration(
     colour,
     wait_ticks,
     D: gl.constexpr,
+    DP: gl.constexpr,
+    PARTS: gl.constexpr,
     W: gl.constexpr,
     TOPK: gl.constexpr,
-    BLOCKS: gl.constexpr,
+    WORLD: gl.constexpr,
+    NR: gl.constexpr,
     RMAX: gl.constexpr,
     F0: gl.constexpr,
     I0: gl.constexpr,
@@ -486,104 +514,104 @@ def _iteration(
     j = ii - LAG, waits for the flags of row j, publishes the flags of row ii - 1,
     loads the inbox rows of row j, pushes row ii, and reduces row j into out.
     Returns the loads for step ii + 1."""
-    NCH: gl.constexpr = _n_chunks(D, W * 64)
-    NPK: gl.constexpr = (_WORLD - 1) * TOPK
+    NCH: gl.constexpr = _n_chunks(DP, W * 64)
+    NPK: gl.constexpr = (WORLD - 1) * TOPK
+    own = bufs[0]
     tid = _thread_ids(W)
-    rn = bid + (ii + 1) * BLOCKS
+    rn = rb + (ii + 1) * NR
     vn = (ii + 1) < n_it
     j = ii - LAG
     vred = (j >= 0) & (j < n_it)
-    rr = gl.where(vred, bid + j * BLOCKS, bid)
+    rr = gl.where(vred, rb + j * NR, rb)
     t_red = rank * rows + rr
     tok = vred & (t_red < m)
-    t1 = ((rank + 1) % _WORLD) * rows + rn
-    t2 = ((rank + 2) % _WORLD) * rows + rn
-    t3 = ((rank + 3) % _WORLD) * rows + rn
+    toks = ()
+    for d in gl.static_range(1, WORLD):
+        toks = toks + (((rank + d) % WORLD) * rows + rn,)
+    valids = ()
+    for d in gl.static_range(WORLD - 1):
+        valids = valids + (vn & (toks[d] < m),)
     ps, ws, xs = _row_loads(
         inter,
         rev,
         sw,
-        (t1, t2, t3, t_red),
-        (vn & (t1 < m), vn & (t2 < m), vn & (t3 < m), tok),
+        toks + (t_red,),
+        valids + (tok,),
         max_sorted,
         m,
+        part,
         D,
+        DP,
+        PARTS,
         W,
         TOPK,
     )
-    # Wait for the 3 peer rows of row j.
-    failed = _poll_flags(own, rr, want, own, wait_ticks, tok, F0, RMAX, W)
-    _fail_record(
-        own,
-        pr1,
-        pr2,
-        pr3,
-        rank,
-        colour,
-        _SITE_FLAG,
-        ((tid % 64) == 0) & (failed == 1),
+    # Wait for the peer rows of row j.
+    failed = _poll_flags(
+        own, rr, part, want, own, wait_ticks, tok, F0, RMAX, PARTS, WORLD, W
     )
-    # All waves drained the pushes of row ii - 1: publish its flags to the 3 peers.
+    _fail_record(bufs, rank, colour, _SITE_FLAG, ((tid % 64) == 0) & (failed == 1))
+    # All waves drained the pushes of row ii - 1: publish its flags to the peers.
     jp = ii - 1
     vp = (jp >= 0) & (jp < n_it)
     _drain_barrier_if(vp)
-    rp = bid + jp * BLOCKS
+    rp = rb + jp * NR
     d = tid + 1
-    o = (rank + d) % _WORLD
-    dst = gl.where(tid == 0, pr1, gl.where(tid == 1, pr2, pr3))
-    fa = dst + F0 + (_WORLD - 1 - d) * RMAX + rp
+    o = (rank + d) % WORLD
+    dst = _to_peers(tid, bufs, WORLD)
+    fa = _flag_ptr(dst + F0, WORLD - 1 - d, rp, part, RMAX, PARTS)
     _store32_sys(
         fa,
         want + gl.zeros_like(tid),
-        (tid < _WORLD - 1) & (o * rows + rp < m) & vp,
+        (tid < WORLD - 1) & (o * rows + rp < m) & vp,
     )
     # The inbox rows of row j, by source rank (no load for the own rank).
     ins = ()
-    for src in gl.static_range(_WORLD):
-        sl = (src - rank - 1 + _WORLD) % _WORLD
+    for src in gl.static_range(WORLD):
+        sl = (src - rank - 1 + WORLD) % WORLD
         slc = gl.where(src == rank, 0, sl)
-        base = own + I0 + (slc * RMAX + rr).to(gl.int64) * D
+        base = _in_part(own + I0 + (slc * RMAX + rr).to(gl.int64) * D, part, DP, PARTS)
         v = tok & (src != rank)
         x = ()
         for c in gl.static_range(NCH):
             x = x + (
-                gl.amd.cdna4.buffer_load(base, _cols(c, D, W), mask=_cmask(c, D, W, v)),
+                gl.amd.cdna4.buffer_load(
+                    base, _cols(c, DP, W), mask=_cmask(c, DP, W, v)
+                ),
             )
         ins = ins + (x,)
     # Push row ii from the loads of the previous step.
     cps, cws, cxs = cur
-    r_push = bid + ii * BLOCKS
+    r_push = rb + ii * NR
     vpush = ii < n_it
-    for d in gl.static_range(1, _WORLD):
-        tp_ = ((rank + d) % _WORLD) * rows + r_push
-        pk = _combine(cps, cws, cxs, (d - 1) * TOPK, max_sorted, D, W, TOPK)
-        if d == 1:
-            dst = pr1
-        elif d == 2:
-            dst = pr2
-        else:
-            dst = pr3
-        base = dst + I0 + ((_WORLD - 1 - d) * RMAX + r_push).to(gl.int64) * D
+    for d in gl.static_range(1, WORLD):
+        tp_ = ((rank + d) % WORLD) * rows + r_push
+        pk = _combine(cps, cws, cxs, (d - 1) * TOPK, max_sorted, DP, W, TOPK)
+        base = bufs[d] + I0 + ((WORLD - 1 - d) * RMAX + r_push).to(gl.int64) * D
+        base = _in_part(base, part, DP, PARTS)
         for c in gl.static_range(NCH):
             gl.amd.cdna4.buffer_store(
-                pk[c], base, _cols(c, D, W), mask=_cmask(c, D, W, vpush & (tp_ < m))
+                pk[c],
+                base,
+                _cols(c, DP, W),
+                mask=_cmask(c, DP, W, vpush & (tp_ < m)),
             )
     # Reduce row j: the own row (bf16) and the inbox rows, in rank order.
-    own_pk = _combine(ps, ws, xs, NPK, max_sorted, D, W, TOPK)
-    obase = out + rr.to(gl.int64) * D
+    own_pk = _combine(ps, ws, xs, NPK, max_sorted, DP, W, TOPK)
+    obase = _in_part(out + rr.to(gl.int64) * D, part, DP, PARTS)
     for c in gl.static_range(NCH):
         olo = _bf_lo(own_pk[c])
         ohi = _bf_hi(own_pk[c])
         alo = gl.where(rank == 0, olo, _bf_lo(ins[0][c]))
         ahi = gl.where(rank == 0, ohi, _bf_hi(ins[0][c]))
-        for src in gl.static_range(1, _WORLD):
+        for src in gl.static_range(1, WORLD):
             alo = alo + gl.where(rank == src, olo, _bf_lo(ins[src][c]))
             ahi = ahi + gl.where(rank == src, ohi, _bf_hi(ins[src][c]))
         val = gl.where(tok, _pack_bf16(alo, ahi), 0)
         gl.amd.cdna4.buffer_store(
-            val, obase, _cols(c, D, W), mask=_cmask(c, D, W, vred)
+            val, obase, _cols(c, DP, W), mask=_cmask(c, DP, W, vred)
         )
-    # The push rows of step ii + 1: the tokens of the 3 peers.
+    # The push rows of step ii + 1: the tokens of the peers.
     nps = ()
     nws = ()
     nxs = ()
@@ -594,8 +622,17 @@ def _iteration(
     return nps, nws, nxs
 
 
+@gluon.jit
+def _row_slot(bid, PARTS: gl.constexpr):
+    if PARTS == 1:
+        return bid
+    else:
+        return bid // PARTS
+
+
 _moe_combine_reduce_scatter_repr = make_kernel_repr(
-    "_moe_combine_reduce_scatter_kernel", ["HIDDEN", "TOPK", "BLOCKS", "LAG"]
+    "_moe_combine_reduce_scatter_kernel",
+    ["HIDDEN", "TOPK", "WORLD", "PARTS", "BLOCKS", "LAG"],
 )
 
 
@@ -617,6 +654,8 @@ def _moe_combine_reduce_scatter_kernel(
     rank,
     HIDDEN: gl.constexpr,
     TOPK: gl.constexpr,
+    WORLD: gl.constexpr,
+    PARTS: gl.constexpr,
     BLOCKS: gl.constexpr,
     RMAX: gl.constexpr,
     FLAG0: gl.constexpr,
@@ -628,46 +667,47 @@ def _moe_combine_reduce_scatter_kernel(
 
     inter: [max_sorted, HIDDEN] bf16 as int32. rev: [m * TOPK] int32 sorted positions.
     sw: fp32 weight of each sorted position. out: [rows, HIDDEN] bf16 as int32.
-    colors: [BLOCKS] int32 launch colours. peers: the buffer addresses of ranks
-    rank, rank + 1, rank + 2 and rank + 3. FLAG0, DONE0 and INBOX0 are byte offsets
-    in a buffer. CTA b walks the owner rows b, b + BLOCKS, ..."""
+    colors: [BLOCKS] int32 launch colours. peers: the WORLD buffer addresses of ranks
+    rank, rank + 1, ... FLAG0, DONE0 and INBOX0 are byte offsets in a buffer.
+    PARTS CTAs share a row, one column part each. Row slot s walks the owner rows
+    s, s + BLOCKS / PARTS, ..."""
     W: gl.constexpr = gl.num_warps()
     D: gl.constexpr = HIDDEN // 2
+    DP: gl.constexpr = D // PARTS
+    NR: gl.constexpr = BLOCKS // PARTS
     F0: gl.constexpr = FLAG0 // 4
     DN0: gl.constexpr = DONE0 // 4
     I0: gl.constexpr = INBOX0 // 4
-    NDONE: gl.constexpr = (_WORLD - 1) * BLOCKS
+    NDONE: gl.constexpr = (WORLD - 1) * BLOCKS
     NQ: gl.constexpr = (NDONE + W * 64 - 1) // (W * 64)
     gl.static_assert(HIDDEN % 8 == 0, "HIDDEN must be a multiple of 8")
+    gl.static_assert(D % PARTS == 0 and BLOCKS % PARTS == 0, "PARTS must divide both")
     gl.static_assert(LAG >= 2, "LAG must be 2 or more")
     gl.static_assert(NQ <= 4, "the done words must be 4 or less a thread")
-    own = gl.multiple_of(peers[0].to(gl.pointer_type(gl.int32)), 16)
-    pr1 = gl.multiple_of(peers[1].to(gl.pointer_type(gl.int32)), 16)
-    pr2 = gl.multiple_of(peers[2].to(gl.pointer_type(gl.int32)), 16)
-    pr3 = gl.multiple_of(peers[3].to(gl.pointer_type(gl.int32)), 16)
+    gl.static_assert(len(peers) == WORLD, "one buffer for each rank")
+    bufs = ()
+    for d in gl.static_range(WORLD):
+        bufs = bufs + (gl.multiple_of(peers[d].to(gl.pointer_type(gl.int32)), 16),)
+    own = bufs[0]
     bid = gl.program_id(0)
+    rb = _row_slot(bid, PARTS)
+    part = bid % PARTS
     tid = _thread_ids(W)
     colour = gl.load(colors + bid)
     want = colour + 1
     wait_ticks = wait_us.to(gl.int64) * 100  # s_memrealtime is 100 MHz
-    n_it = gl.where(bid < rows, (rows - bid + (BLOCKS - 1)) // BLOCKS, 0)
+    n_it = gl.where(rb < rows, (rows - rb + (NR - 1)) // NR, 0)
     # Load the first push row, then wait until the previous launch is done.
-    rn = bid
-    t1 = ((rank + 1) % _WORLD) * rows + rn
-    t2 = ((rank + 2) % _WORLD) * rows + rn
-    t3 = ((rank + 3) % _WORLD) * rows + rn
+    rn = rb
+    toks = ()
+    for d in gl.static_range(1, WORLD):
+        toks = toks + (((rank + d) % WORLD) * rows + rn,)
     v0 = n_it > 0
+    valids = ()
+    for d in gl.static_range(WORLD - 1):
+        valids = valids + (v0 & (toks[d] < m),)
     cur = _row_loads(
-        inter,
-        rev,
-        sw,
-        (t1, t2, t3),
-        (v0 & (t1 < m), v0 & (t2 < m), v0 & (t3 < m)),
-        max_sorted,
-        m,
-        D,
-        W,
-        TOPK,
+        inter, rev, sw, toks, valids, max_sorted, m, part, D, DP, PARTS, W, TOPK
     )
     if n_it > 0:
         # The inbox has one buffer: each CTA of each peer owner must have read it.
@@ -675,7 +715,7 @@ def _moe_combine_reduce_scatter_kernel(
         addrs = ()
         for q in gl.static_range(NQ):
             i = (q * W * 64 + tid) % NDONE
-            o = (rank + 1 + i // BLOCKS) % _WORLD
+            o = (rank + 1 + i // BLOCKS) % WORLD
             addrs = addrs + (own + DN0 + o * BLOCKS + i % BLOCKS,)
         z = gl.zeros_like(tid)
         res = gl.inline_asm_elementwise(
@@ -686,16 +726,7 @@ def _moe_combine_reduce_scatter_kernel(
             False,
             1,
         )
-        _fail_record(
-            own,
-            pr1,
-            pr2,
-            pr3,
-            rank,
-            colour,
-            _SITE_DONE,
-            ((tid % 64) == 0) & (res[0] == 1),
-        )
+        _fail_record(bufs, rank, colour, _SITE_DONE, ((tid % 64) == 0) & (res[0] == 1))
         gl.barrier()
     total = n_it + LAG
     # Steps in pairs: the loads alternate between 2 register sets, so the back edge
@@ -707,14 +738,12 @@ def _moe_combine_reduce_scatter_kernel(
             rev,
             sw,
             out,
-            own,
-            pr1,
-            pr2,
-            pr3,
+            bufs,
             cur,
             ii,
             n_it,
-            bid,
+            rb,
+            part,
             m,
             rows,
             max_sorted,
@@ -723,9 +752,12 @@ def _moe_combine_reduce_scatter_kernel(
             colour,
             wait_ticks,
             D,
+            DP,
+            PARTS,
             W,
             TOPK,
-            BLOCKS,
+            WORLD,
+            NR,
             RMAX,
             F0,
             I0,
@@ -736,14 +768,12 @@ def _moe_combine_reduce_scatter_kernel(
             rev,
             sw,
             out,
-            own,
-            pr1,
-            pr2,
-            pr3,
+            bufs,
             cur,
             ii + 1,
             n_it,
-            bid,
+            rb,
+            part,
             m,
             rows,
             max_sorted,
@@ -752,9 +782,12 @@ def _moe_combine_reduce_scatter_kernel(
             colour,
             wait_ticks,
             D,
+            DP,
+            PARTS,
             W,
             TOPK,
-            BLOCKS,
+            WORLD,
+            NR,
             RMAX,
             F0,
             I0,
@@ -763,9 +796,9 @@ def _moe_combine_reduce_scatter_kernel(
     # Done: this CTA read its inbox rows. Tell each peer and advance the colour.
     _drain()
     gl.barrier()
-    dst = gl.where(tid == 0, pr1, gl.where(tid == 1, pr2, pr3))
+    dst = _to_peers(tid, bufs, WORLD)
     _store32_sys(
-        dst + DN0 + rank * BLOCKS + bid, want + gl.zeros_like(tid), tid < _WORLD - 1
+        dst + DN0 + rank * BLOCKS + bid, want + gl.zeros_like(tid), tid < WORLD - 1
     )
     gl.store(
         colors + bid + gl.zeros_like(tid), want + gl.zeros_like(tid), mask=tid == 0

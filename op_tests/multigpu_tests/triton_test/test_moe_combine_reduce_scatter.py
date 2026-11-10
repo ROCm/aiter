@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import argparse
 import multiprocessing as mp
 
 import pytest
@@ -20,10 +21,10 @@ from aiter.ops.triton.comms.fused.moe_combine_reduce_scatter import (
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.test_common import ensure_spawn_method
 
-WORLD_SIZE = 4
+WORLD_SIZES = [2, 4, 8]
 BLOCK_M = 128
-# (hidden, topk, experts, token counts). A count that is not a multiple of 4 gives
-# padding rows. With 1 or 3 tokens, some ranks own no token.
+# (hidden, topk, experts, token counts). A count that is not a multiple of the world
+# size gives padding rows. With few tokens, some ranks own no token.
 SHAPES = [
     (6144, 4, 128, [1, 3, 1000, 2343, 4096, 5857, 8192, 14394, 16383]),
     (3072, 4, 128, [7, 2343, 4096]),
@@ -32,8 +33,8 @@ SHAPES = [
 STAGE2_KERNEL = "flydsl_moe2_layout_afp4_wfp4_bf16_t128x256x256_scatter_sbm128"
 STAGE2_INTER = 768
 
-SKIP = torch.cuda.device_count() < WORLD_SIZE or arch_info.get_arch() != "gfx950"
-pytestmark = pytest.mark.skipif(SKIP, reason="needs 4 gfx950 GPUs")
+SKIP = arch_info.get_arch() != "gfx950"
+pytestmark = pytest.mark.skipif(SKIP, reason="needs gfx950")
 
 
 def _routing(tokens, topk, experts, hidden, seed, device, group):
@@ -63,14 +64,18 @@ def _routing(tokens, topk, experts, hidden, seed, device, group):
     return sort
 
 
-def _reference(combined, tokens, rank, group):
+def _reference(combined, tokens, group):
     """The rows of this rank of the fp32 sum of the combined rows in rank order."""
-    rows = -(-tokens // WORLD_SIZE)
-    padded = F.pad(combined, (0, 0, 0, rows * WORLD_SIZE - tokens)).contiguous()
+    world = dist.get_world_size(group)
+    rows = -(-tokens // world)
+    padded = F.pad(combined, (0, 0, 0, rows * world - tokens)).contiguous()
     parts = torch.empty_like(padded)
     dist.all_to_all_single(parts, padded, group=group)
-    parts = parts.view(WORLD_SIZE, rows, -1).float()
-    return (parts[0] + parts[1] + parts[2] + parts[3]).to(torch.bfloat16)
+    parts = parts.view(world, rows, -1).float()
+    total = parts[0]
+    for src in range(1, world):
+        total = total + parts[src]
+    return total.to(torch.bfloat16)
 
 
 def _combine(inter, rev, sw, tokens, topk, experts, hidden):
@@ -94,7 +99,7 @@ def _bad(out, ref):
 
 def _run(inter, rev, sw, tokens, comm):
     """The fused op on a poisoned output (0xFFFF), so each row must be written."""
-    rows = -(-tokens // WORLD_SIZE)
+    rows = -(-tokens // comm.world)
     out = torch.full((rows, comm.hidden), -1, dtype=torch.int16, device=inter.device)
     return fused_moe_combine_reduce_scatter(
         inter, rev, sw, tokens, comm, out=out.view(torch.bfloat16)
@@ -122,10 +127,7 @@ def _check_shape(rank, device, tp, hidden, topk, experts, token_counts, failures
             ]
             refs = [
                 _reference(
-                    _combine(x, rev, sw, tokens, topk, experts, hidden),
-                    tokens,
-                    rank,
-                    group,
+                    _combine(x, rev, sw, tokens, topk, experts, hidden), tokens, group
                 )
                 for x in inters
             ]
@@ -136,7 +138,8 @@ def _check_shape(rank, device, tp, hidden, topk, experts, token_counts, failures
             for j, (out, ref) in enumerate(zip(outs, refs)):
                 if _bad(out, ref):
                     failures.append(
-                        f"rank {rank} hidden {hidden} topk {topk} tokens {tokens} "
+                        f"world {comm.world} rank {rank} hidden {hidden} topk {topk} "
+                        f"tokens {tokens} "
                         f"launch {j}: {_bad(out, ref)} values differ"
                     )
             if tokens == 2343:
@@ -221,7 +224,7 @@ def _check_stage2(rank, device, tp, failures):
         )
         return out
 
-    ref = _reference(stage2(None), tokens, rank, tp.device_group)
+    ref = _reference(stage2(None), tokens, tp.device_group)
     items = {}
     untouched = stage2(items)
     if bool((untouched.view(torch.int16) != -1).any()):
@@ -251,8 +254,8 @@ def _check_stage2(rank, device, tp, failures):
 
 
 def _check_timeout(rank, device, tp, failures):
-    """Rank 3 skips a launch. The other ranks must stop at the time limit and write
-    the error record of each rank. After reset, a launch is correct again."""
+    """The last rank skips a launch. The other ranks must stop at the time limit and
+    write the error record of each rank. After reset, a launch is correct again."""
     hidden, topk, experts, tokens = 6144, 4, 128, 4096
     group = tp.device_group
     sort = _routing(tokens, topk, experts, hidden, 9, device, group)
@@ -262,13 +265,13 @@ def _check_timeout(rank, device, tp, failures):
         (sw.numel(), hidden), generator=gen, dtype=torch.bfloat16, device=device
     )
     ref = _reference(
-        _combine(inter, rev, sw, tokens, topk, experts, hidden), tokens, rank, group
+        _combine(inter, rev, sw, tokens, topk, experts, hidden), tokens, group
     )
     comm = MoeCombineReduceScatter(tp.cpu_group, tokens, hidden, topk, timeout_s=0.05)
     try:
         torch.cuda.synchronize()
         dist.barrier(group=tp.cpu_group)
-        if rank != 3:
+        if rank != comm.world - 1:
             _run(inter, rev, sw, tokens, comm)
         torch.cuda.synchronize()
         dist.barrier(group=tp.cpu_group)  # the other ranks stopped
@@ -283,10 +286,10 @@ def _check_timeout(rank, device, tp, failures):
         comm.close()
 
 
-def _worker(rank, init_method):
+def _worker(rank, world_size, init_method):
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
-    aiter.init_dist_env(WORLD_SIZE, rank, distributed_init_method=init_method)
+    aiter.init_dist_env(world_size, rank, distributed_init_method=init_method)
     tp = get_tp_group()
     failures = []
     try:
@@ -301,19 +304,34 @@ def _worker(rank, init_method):
         aiter.destroy_dist_env()
 
 
-def test_moe_combine_reduce_scatter():
+@pytest.mark.parametrize("world_size", WORLD_SIZES)
+def test_moe_combine_reduce_scatter(world_size):
+    if torch.cuda.device_count() < world_size:
+        pytest.skip(f"needs {world_size} GPUs")
     ensure_spawn_method()
     init_method = get_distributed_init_method(get_ip(), get_open_port())
-    with mp.Pool(processes=WORLD_SIZE) as pool:
+    with mp.Pool(processes=world_size) as pool:
         results = [
-            pool.apply_async(_worker, (rank, init_method)) for rank in range(WORLD_SIZE)
+            pool.apply_async(_worker, (rank, world_size, init_method))
+            for rank in range(world_size)
         ]
         failures = [f for r in results for f in r.get(timeout=1800)]
     assert not failures, "\n".join(failures)
 
 
 if __name__ == "__main__":  # CI runs the multi-GPU tests as scripts
-    if SKIP:
-        logger.warning("test_moe_combine_reduce_scatter skipped: needs 4 gfx950 GPUs")
-    else:
-        test_moe_combine_reduce_scatter()
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "-t",
+        "--world-size",
+        type=int,
+        nargs="+",
+        default=[w for w in WORLD_SIZES if w <= torch.cuda.device_count()],
+        choices=WORLD_SIZES,
+    )
+    args = parser.parse_args()
+    if SKIP or not args.world_size:
+        logger.warning("test_moe_combine_reduce_scatter skipped: needs gfx950 GPUs")
+    for world_size in [] if SKIP else args.world_size:
+        test_moe_combine_reduce_scatter(world_size)
+        logger.info("test_moe_combine_reduce_scatter: world size %d passed", world_size)
