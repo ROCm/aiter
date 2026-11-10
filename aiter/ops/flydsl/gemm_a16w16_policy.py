@@ -11,6 +11,7 @@ import torch
 from aiter.jit.utils.chip_info import get_gfx, get_lds_capacity_bytes
 
 from .gemm_a16w16_band import band_stream_config
+from .gemm_a16w16_projection import projection_config
 from .kernels.gemm_a16w16_gfx950 import (
     GEMM_A16W16_DTYPE_BF16,
     GEMM_A16W16_DTYPE_FP16,
@@ -332,6 +333,10 @@ def get_flydsl_a16w16_configs(
     band_configs = []
     if dtype == out_dtype == torch.bfloat16 and not has_bias:
         config = band_stream_config(m, n, k)
+        if config is not None and device_props.multi_processor_count == 256:
+            band_configs.append(config)
+    if dtype == out_dtype == torch.bfloat16 and not has_bias:
+        config = projection_config(m, n, k)
         if config is not None and device_props.multi_processor_count == 256:
             band_configs.append(config)
     return valid_configs + memory_configs + skinny_configs + band_configs

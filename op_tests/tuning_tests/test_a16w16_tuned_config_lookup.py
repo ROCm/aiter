@@ -217,6 +217,73 @@ class TestGfx950FlydslMemoryCandidates(unittest.TestCase):
             self.assertEqual({key: parsed[key] for key in config}, config)
 
 
+class TestProjectionFlydslCandidates(unittest.TestCase):
+    def test_projection_does_not_serve_padded_m(self):
+        from aiter.ops.flydsl.gemm_a16w16_projection import projection_config
+        from aiter.ops.flydsl.gemm_kernels import flydsl_hgemm_kernel_name
+
+        config = projection_config(256, 4480, 7168)
+        name = flydsl_hgemm_kernel_name(
+            dtype=torch.bfloat16,
+            out_dtype=torch.bfloat16,
+            config=config,
+            has_bias=False,
+            target_gfx="gfx950",
+        )
+        row = {"libtype": "flydsl", "solidx": 0, "kernelName": name}
+        key = ("gfx950", 256, 256, 4480, 7168, False, BF16, BF16, False, False)
+        with (
+            mock.patch.object(tuned, "get_GEMM_A16W16_config_", lambda: {key: row}),
+            mock.patch.object(tuned, "get_padded_m", lambda *args: 256),
+        ):
+            self.assertIsNone(
+                tuned.get_GEMM_A16W16_tuned_config(
+                    255, 4480, 7168, False, BF16, BF16, gfx="gfx950", cu_num=256
+                )
+            )
+            self.assertEqual(
+                tuned.get_GEMM_A16W16_tuned_config(
+                    256, 4480, 7168, False, BF16, BF16, gfx="gfx950", cu_num=256
+                ),
+                row,
+            )
+
+    def test_projection_roundtrip_and_dispatch(self):
+        from aiter.ops.flydsl.gemm_a16w16_projection import projection_config
+        import aiter.ops.flydsl.gemm_kernels as kernels
+
+        for n, k in ((3584, 7168), (7168, 3584), (4480, 7168)):
+            config = projection_config(256, n, k)
+            name = kernels.flydsl_hgemm_kernel_name(
+                dtype=torch.bfloat16,
+                out_dtype=torch.bfloat16,
+                config=config,
+                has_bias=False,
+                target_gfx="gfx950",
+            )
+            params = kernels.get_flydsl_hgemm_kernel_params(name)
+            self.assertEqual({key: params[key] for key in config}, config)
+            for invalid in (
+                name.replace("_bias0_", "_bias1_"),
+                name.replace("_w2x2x1_", "_w2x2x2_").replace("_w4x1x1_", "_w4x1x2_"),
+                name.replace("gfx950", "gfx942"),
+                name.replace("_gm0_", "_gm4_"),
+            ):
+                self.assertIsNone(kernels.get_flydsl_hgemm_kernel_params(invalid))
+            a = torch.empty(256, k, dtype=torch.bfloat16)
+            b = torch.empty(n, k, dtype=torch.bfloat16)
+            out = torch.empty(256, n, dtype=torch.bfloat16)
+            with mock.patch.object(kernels, "flydsl_hgemm", return_value=out) as launch:
+                actual = tuned.flydsl_gemm(
+                    a, b, 0, otype=torch.bfloat16, out=out, config={"kernelName": name}
+                )
+            self.assertIs(actual, out)
+            self.assertEqual(launch.call_args.kwargs["policy"], "pr")
+            self.assertIs(launch.call_args.kwargs["out"], out)
+        for shape in ((128, 3584, 7168), (257, 4480, 7168), (256, 3584, 7169)):
+            self.assertIsNone(projection_config(*shape))
+
+
 class TestLegacyFlydslHgemmConfigs(unittest.TestCase):
     """Every persisted legacy name must keep its defaults and launch fields."""
 

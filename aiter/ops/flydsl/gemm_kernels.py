@@ -17,6 +17,7 @@ from aiter.jit.utils.chip_info import get_gfx
 from aiter.utility.graph_alloc import capture_scoped_cache, persistent_alloc
 
 from .gemm_a16w16_band import band_stream_name_supported, gemm_a16w16_band
+from .gemm_a16w16_projection import gemm_a16w16_projection, projection_name_supported
 from .gemm_a16w16_gfx1250 import gemm_a16w16 as gemm_a16w16_gfx1250
 from .kernels.gemm_a16w16_gfx950 import (
     SPLIT_K_SEMAPHORE_MAX_LEN,
@@ -43,7 +44,7 @@ _HGEMM_KERNEL_RE = re.compile(
     r"x(?P<stages>\d+)_ks(?P<split_k>\d+)_"
     r"w(?P<m_waves>\d+)x(?P<n_waves>\d+)x(?P<k_waves>\d+)_"
     r"bias(?P<has_bias>[01])_ktail(?P<has_k_tail>[01])_"
-    r"gm(?P<group_m>\d+)(?:_stg(?P<k_stagger>\d+))?(?P<b_non_temporal>_bnt)?_p(?P<policy>ft|ht|hti|sk|bs)_"
+    r"gm(?P<group_m>\d+)(?:_stg(?P<k_stagger>\d+))?(?P<b_non_temporal>_bnt)?_p(?P<policy>ft|ht|hti|sk|bs|pr)_"
     r"(?P<target_gfx>gfx[0-9a-z]+(?:-[0-9a-z]+)*)$"
 )
 
@@ -83,7 +84,7 @@ def flydsl_hgemm_kernel_name(
             f"Unsupported output dtype {out_dtype_name} for input {dtype_name}"
         )
 
-    if config.get("policy") in (SKINNY_POLICY, "bs"):
+    if config.get("policy") in (SKINNY_POLICY, "bs", "pr"):
         policy = config["policy"]
     else:
         policy = "ht" if config["use_half_tile_interleaved"] else "ft"
@@ -102,8 +103,8 @@ def flydsl_hgemm_kernel_name(
         f"bias{int(has_bias)}_ktail0_gm{config['group_m']}{stagger_suffix}{memory_suffix}_p{policy}_"
         f"{gfx}"
     )
-    if policy == "bs" and get_flydsl_hgemm_kernel_params(name) is None:
-        raise ValueError("unsupported band-stream kernel configuration")
+    if policy in ("bs", "pr") and get_flydsl_hgemm_kernel_params(name) is None:
+        raise ValueError(f"unsupported {policy} kernel configuration")
     return name
 
 
@@ -159,6 +160,8 @@ def get_flydsl_hgemm_kernel_params(name: str) -> dict | None:
 
     if policy == "bs" and not band_stream_name_supported(params):
         return None
+    if policy == "pr" and not projection_name_supported(params):
+        return None
     return params
 
 
@@ -207,6 +210,9 @@ def flydsl_hgemm(
     ``b_non_temporal`` streams B's async loads with the non-temporal cache
     hint. It is independent of k_stagger; tune both, since shared B can
     benefit from caching. Both options default off.
+    ``policy="pr"`` selects the validated M=256 BF16 projection catalog.
+    It uses static LDS rings, FP32 split-K partials and a deterministic reduce.
+    Unsupported shapes/configurations raise instead of silently falling back.
     ``policy="bs"`` selects the BF16 band-stream decode kernel for the
     validated 256-CU gfx950 M/N/K and configuration catalog. It requires
     no bias, split_k=1 and BF16 output. As on the legacy FT path, strided
@@ -214,7 +220,7 @@ def flydsl_hgemm(
     rather than silently selecting a different kernel.
     """
 
-    if policy not in ("ft", "ht", "hti", SKINNY_POLICY, "bs"):
+    if policy not in ("ft", "ht", "hti", SKINNY_POLICY, "bs", "pr"):
         raise ValueError(f"Unsupported FlyDSL HGEMM policy: {policy!r}")
     launch_stream = (
         torch.cuda.current_stream(device=a.device) if stream is None else stream
@@ -225,7 +231,7 @@ def flydsl_hgemm(
     gfx = get_gfx()
     _validate_k_stagger(k_stagger, gfx, policy)
     _validate_b_non_temporal(b_non_temporal, gfx, policy)
-    if policy == "bs":
+    if policy in ("bs", "pr"):
         # A tuned row can serve strided inputs too. Preserve the legacy
         # public HGEMM normalization; only the device kernel requires
         # contiguous A/B. Copies must precede its launch on the same stream.
@@ -234,7 +240,8 @@ def flydsl_hgemm(
                 a = a.contiguous()
             if not b.is_contiguous():
                 b = b.contiguous()
-        return gemm_a16w16_band(
+        launcher = gemm_a16w16_projection if policy == "pr" else gemm_a16w16_band
+        return launcher(
             a,
             b,
             out,

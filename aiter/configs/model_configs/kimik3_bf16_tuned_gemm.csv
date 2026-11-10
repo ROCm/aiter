@@ -248,7 +248,7 @@ gfx950,256,128,7168,3584,False,torch.bfloat16,torch.bfloat16,False,False,flydsl,
 gfx950,256,128,7168,4224,False,torch.bfloat16,torch.bfloat16,False,False,flydsl,2378,1,17.418,flydsl_hgemm_abf16_wbf16_bf16_t64x64x64x6_ks1_w4x2x1_bias0_ktail0_gm0_pft_gfx950,0.0,445.0,3644.02
 gfx950,256,256,7168,768,False,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,8.9502,auto,0.0,314.92,1684.13
 gfx950,256,256,7168,1536,False,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,13.5351,auto,0.0,416.48,1956.14
-gfx950,256,256,7168,3584,False,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,26.3955,auto,0.0,498.32,2155.11
+gfx950,256,256,7168,3584,False,torch.bfloat16,torch.bfloat16,False,False,flydsl,1278,1,16.5637,flydsl_hgemm_abf16_wbf16_bf16_t64x128x64x4_ks1_w2x2x1_bias0_ktail0_gm0_stg4_ppr_gfx950,0.0,794.11,3434.33
 gfx950,256,256,7168,4224,False,torch.bfloat16,torch.bfloat16,False,False,flydsl,2009,1,30.0604,flydsl_hgemm_abf16_wbf16_bf16_t96x64x64x4_ks1_w2x2x1_bias0_ktail0_gm0_pft_gfx950,0.0,515.7,2208.49
 gfx950,256,512,7168,768,False,torch.bfloat16,torch.bfloat16,False,False,flydsl,47,1,12.1933,flydsl_hgemm_abf16_wbf16_bf16_t128x128x64x3_ks1_w4x2x1_bias0_ktail0_gm0_pft_gfx950,0.0,462.31,1569.43
 gfx950,256,512,7168,1536,False,torch.bfloat16,torch.bfloat16,False,False,flydsl,49,1,18.727,flydsl_hgemm_abf16_wbf16_bf16_t128x128x64x3_ks1_w4x2x1_bias0_ktail0_gm0_pft_gfx950,0.0,602.03,1651.79
@@ -778,7 +778,7 @@ gfx950,256,32,3584,7168,False,torch.bfloat16,torch.bfloat16,False,False,flydsl,1
 gfx950,256,48,3584,7168,False,torch.bfloat16,torch.bfloat16,False,False,flydsl,2209,4,14.8417,flydsl_hgemm_abf16_wbf16_bf16_t48x64x128x4_ks4_w1x4x1_bias0_ktail0_gm0_pft_gfx950,0.0134,166.17,3531.43
 gfx950,256,64,3584,7168,False,torch.bfloat16,torch.bfloat16,False,False,flydsl,4011,4,16.2341,flydsl_hgemm_abf16_wbf16_bf16_t64x64x64x8_ks4_w4x2x1_bias0_ktail0_gm0_pft_gfx950,0.0139,202.56,3249.73
 gfx950,256,128,3584,7168,False,torch.bfloat16,torch.bfloat16,False,False,flydsl,3787,4,21.8623,flydsl_hgemm_abf16_wbf16_bf16_t64x64x64x4_ks4_w2x2x1_bias0_ktail0_gm0_pft_gfx950,0.0135,300.82,2476.08
-gfx950,256,256,3584,7168,False,torch.bfloat16,torch.bfloat16,False,False,flydsl,2117,4,32.1975,flydsl_hgemm_abf16_wbf16_bf16_t64x128x64x3_ks4_w1x2x2_bias0_ktail0_gm0_pft_gfx950,0.0216,408.52,1766.76
+gfx950,256,256,3584,7168,False,torch.bfloat16,torch.bfloat16,False,False,flydsl,493,2,20.1181,flydsl_hgemm_abf16_wbf16_bf16_t128x64x64x4_ks2_w2x2x1_bias0_ktail0_gm0_stg1_ppr_gfx950,0.0,653.80,2827.56
 gfx950,256,512,3584,7168,False,torch.bfloat16,torch.bfloat16,False,False,flydsl,2285,1,46.8774,flydsl_hgemm_abf16_wbf16_bf16_t96x96x64x5_ks1_w2x2x1_bias0_ktail0_gm0_pft_gfx950,0.0,561.18,1330.92
 gfx950,256,1024,3584,7168,False,torch.bfloat16,torch.bfloat16,False,False,flydsl,48,1,67.0905,flydsl_hgemm_abf16_wbf16_bf16_t128x128x64x4_ks1_w4x2x1_bias0_ktail0_gm0_pft_gfx950,0.0,784.21,1094.05
 gfx950,256,2048,3584,7168,False,torch.bfloat16,torch.bfloat16,False,False,opus,93,0,107.9749,opus_gemm_mono_tile_512x128x256x64_2x4_16x16x32_0x0x0_nooob,0.0,974.55,883.73
@@ -988,3 +988,4 @@ gfx1250,256,4096,7168,35840,False,torch.bfloat16,torch.bfloat16,False,False,opus
 gfx1250,256,8192,7168,35840,False,torch.bfloat16,torch.bfloat16,False,False,opus,716,0,1909.6372,opus_gemm_gfx1250_4wave_wlr_co_128x256x256x64_4x1_16x16x32_0x0x0_w2x2_c4x4_p4_v1024w1,0.0,2204.12,638.05
 gfx1250,256,16384,7168,35840,False,torch.bfloat16,torch.bfloat16,False,False,opus,716,0,3759.4041,opus_gemm_gfx1250_4wave_wlr_co_128x256x256x64_4x1_16x16x32_0x0x0_w2x2_c4x4_p4_v1024w1,0.0,2239.22,511.54
 gfx1250,256,32768,7168,35840,False,torch.bfloat16,torch.bfloat16,False,False,opus,716,0,7395.8911,opus_gemm_gfx1250_4wave_wlr_co_128x256x256x64_4x1_16x16x32_0x0x0_w2x2_c4x4_p4_v1024w1,0.0,2276.44,450.57
+gfx950,256,256,4480,7168,False,torch.bfloat16,torch.bfloat16,False,False,flydsl,532,2,22.3531,flydsl_hgemm_abf16_wbf16_bf16_t128x80x128x3_ks2_w4x1x1_bias0_ktail0_gm0_stg1_ppr_gfx950,0.0,735.54,3140.02
