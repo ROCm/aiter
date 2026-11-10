@@ -360,6 +360,9 @@ def build_gemm_a8w4_tdm_task(
     n_acc = wmma_m_rep * wmma_n_rep
     is_prefill = tile_m == tile_n == tile_k == 256
     USE_EXPLICIT_VGPR_PARTITION = bool(is_prefill and callable(sched_vgpr))
+    # Only fixed high-VGPR placement needs the relaxed occupancy target.
+    # Attach it per kernel; a launcher-wide hint also changes ordinary tiles.
+    kernel_attrs = {"rocdl.waves_per_eu": "1"} if USE_EXPLICIT_VGPR_PARTITION else {}
     hyper_params = HYPER_PARAMS["a4w4" if a_is_fp4 else "a8w4"][
         "prefill" if is_prefill else "default"
     ]
@@ -1439,18 +1442,20 @@ def build_gemm_a8w4_tdm_task(
                     cf.store(zero)
                     initial_value = _raw(cf.load())
                     constraints = f"={{V[{start}:{end}]}},0"
+                    cf.store(
+                        llvm_dialect.InlineAsmOp(
+                            res=T.vec(WMMA_VECTOR_DWORDS, T.f32),
+                            operands_=[initial_value],
+                            asm_string="",
+                            constraints=constraints,
+                            has_side_effects=True,
+                            is_align_stack=False,
+                        ).res
+                    )
                 else:
-                    initial_value, constraints = zero, "=v,0"
-                cf.store(
-                    llvm_dialect.InlineAsmOp(
-                        res=T.vec(WMMA_VECTOR_DWORDS, T.f32),
-                        operands_=[initial_value],
-                        asm_string="",
-                        constraints=constraints,
-                        has_side_effects=True,
-                        is_align_stack=False,
-                    ).res
-                )
+                    # Leave ordinary accumulators unconstrained; only the
+                    # explicit partition needs pinned early materialization.
+                    cf.store(zero)
             rocdl.sched_barrier(0)
 
         front_wm = (wmma_m_rep + 1) // 2
@@ -2881,6 +2886,7 @@ def build_gemm_a8w4_tdm_task(
                 workgroup_barrier()
 
     layout = {
+        "kernel_attrs": kernel_attrs,
         "arena": ARENA_B,
         "pitch": PITCH,
         "prologue_stages": _pro_stages,
@@ -2970,7 +2976,7 @@ def launch_gemm_a8w4_tdm(
        check -- so the callers that choose cluster_n enforce it
        (batched_gemm_mxfp4._pick_cluster_n and its assert).
     """
-    gemm_task, block, _kname, cluster_m, _ = build_gemm_a8w4_tdm_task(
+    gemm_task, block, _kname, cluster_m, layout = build_gemm_a8w4_tdm_task(
         K=K,
         tile_m=tile_m,
         tile_n=tile_n,
@@ -3103,7 +3109,10 @@ def launch_gemm_a8w4_tdm(
         # cluster never forms and the TDM loads silently fall back to per-load.
         launch_kernel(
             *launch_args,
-            value_attrs={"rocdl.cluster_dims": f"{cluster_n},{cluster_m},1"},
+            value_attrs={
+                **layout["kernel_attrs"],
+                "rocdl.cluster_dims": f"{cluster_n},{cluster_m},1",
+            },
         ).launch(
             grid=grid,
             block=(block, 1, 1),
@@ -3111,7 +3120,7 @@ def launch_gemm_a8w4_tdm(
             cluster=(cluster_n, cluster_m, 1),
         )
     else:
-        launch_kernel(*launch_args).launch(
+        launch_kernel(*launch_args, value_attrs=layout["kernel_attrs"]).launch(
             grid=grid, block=(block, 1, 1), stream=stream
         )
 
@@ -3121,5 +3130,3 @@ launch_gemm_a8w4_tdm.compile_hints["llvm_options"] = {
     "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
     "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
 }
-# Non-prefill kernels also need the full VGPR budget to avoid spilling.
-launch_gemm_a8w4_tdm.compile_hints["waves_per_eu"] = 1
