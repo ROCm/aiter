@@ -780,7 +780,23 @@ def _tune_kimi_k3(config: MegaMoEConfig, ctx: _TuningContext) -> MegaMoEConfig:
 
 
 def _tune_kimi_k26(config: MegaMoEConfig, ctx: _TuningContext) -> MegaMoEConfig:
-    """Kimi-K2.6 (48 experts per rank, 7168x2048, top-8): the base config."""
+    """Kimi-K2.6 (48 experts per rank, 7168x2048, top-8) A8W4: the base config, except
+    the 16K / 32K buckets of the large-MTPR class (above the large-input path's 8192
+    tokens a rank), whose Stage2 runs the deep pipeline with a wider skew cohort."""
+    if (
+        ctx.a_dtype == ACTIVATION_FP8
+        and ctx.mtpr_class == MAX_MTPR_CLASS
+        and ctx.bucket in (16384, 32768)
+    ):
+        config = _replace_config(
+            config,
+            stage2={
+                "persist_cu": 224,
+                "skew_cu": 224,
+                "b2stage": True,
+                "deep_a_pipeline": True,
+            },
+        )
     return config
 
 
