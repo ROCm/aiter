@@ -490,6 +490,7 @@ class PaDecodeTraits:
     BLOCK_THREADS: int
     IS_GFX950: bool
     DUAL_GROUP: bool
+    STAGE_PAGES: int
     GROUP_LDS_BYTES: int
     CTA_THREADS: int
     K_SLOT: int
@@ -879,8 +880,16 @@ class PaDecodeTraits:
             and not MTP4_FUSED
         )
         # Page ids for the task's tiles, one i32 each, staged before the loop.
+        # Dual MXFP4 groups stage only their own (alternate) tiles' ids, so
+        # each copy of the layout holds half of them.
+        STAGE_PAGES = stage_page_capacity
+        if DUAL_GROUP and MXFP4 and stage_page_capacity:
+            pages_per_tile = KV_COMPUTE_BLOCK // block_size
+            STAGE_PAGES = (
+                -(-(stage_page_capacity // pages_per_tile) // 2) * pages_per_tile
+            )
         sPages_off = total_bytes
-        total_bytes += stage_page_capacity * 4
+        total_bytes += STAGE_PAGES * 4
         # Wave-private bf16 V staging for MXFP4; also holds the wave's O at the end.
         sMxfp4VBf16_off = (total_bytes + 15) // 16 * 16
         if MXFP4:
@@ -901,6 +910,7 @@ class PaDecodeTraits:
             cache_key=cache_key,
             IS_GFX950=is_gfx950,
             DUAL_GROUP=DUAL_GROUP,
+            STAGE_PAGES=STAGE_PAGES,
             GROUP_LDS_BYTES=GROUP_LDS_BYTES,
             CTA_THREADS=CTA_THREADS,
             head_dim=head_dim,

@@ -849,12 +849,15 @@ class PaDecodeKVLoader:
         """The two page ids of tile ``tt`` (wave-uniform): the pair staged in LDS, or
         the block table past the staged window (``max_context_length`` below the
         context). ``tt`` is not before ``part_start``."""
-        first = tt * (self.traits.TILE_TOK // self.traits.block_size)
-        rel = first - self.ctx.part_start * (
-            self.traits.TILE_TOK // self.traits.block_size
-        )
+        ppt = self.traits.TILE_TOK // self.traits.block_size
+        first = tt * ppt
+        if const_expr(self.traits.DUAL_GROUP):
+            # A dual group stages only its own tiles: part_start, + 2, ...
+            rel = ((tt - self.ctx.part_start) >> 1) * ppt
+        else:
+            rel = first - self.ctx.part_start * ppt
         # The LDS read stays in bounds whatever rel is; past the window it is replaced.
-        cap = self.traits.stage_page_capacity
+        cap = self.traits.STAGE_PAGES
         ids = self.lds.load(
             self.traits.sPages_off + fx.min(rel, cap - 2) * 4, fx.Int32, 2
         )
@@ -1110,13 +1113,36 @@ class PaDecodeKVLoader:
         """Stage this task's page ids in LDS so the tile loop never reads the table."""
         traits = self.traits
         ppt = traits.TILE_TOK // traits.block_size
-        first_page = self.ctx.part_start * ppt
-        n_part_pages = (self.ctx.part_end - self.ctx.part_start) * ppt
-        rounds = traits.stage_page_capacity // traits.BLOCK_THREADS
-        for r in range_constexpr(rounds):
+        if const_expr(traits.DUAL_GROUP):
+            self.stage_group_page_ids()
+        else:
+            first_page = self.ctx.part_start * ppt
+            n_part_pages = (self.ctx.part_end - self.ctx.part_start) * ppt
+            rounds = traits.stage_page_capacity // traits.BLOCK_THREADS
+            for r in range_constexpr(rounds):
+                idx = self.ctx.tid + r * traits.BLOCK_THREADS
+                if idx < n_part_pages:
+                    pg = first_page + idx
+                    raw = fx.Int32(
+                        self.bt_scalar[self.ctx.seq * self.ctx.max_blocks_per_seq + pg]
+                    )
+                    val = (pg < self.ctx.num_pages).select(raw, fx.Int32(0))
+                    self.lds.store(
+                        traits.sPages_off + idx * 4,
+                        fx.Int32,
+                        fx.Vector.from_elements([val], dtype=fx.Int32),
+                    )
+
+    @flyc.jit
+    def stage_group_page_ids(self):
+        """Dual groups: stage the ids of tiles part_start + 2j, each tile's contiguous."""
+        traits = self.traits
+        ppt = traits.TILE_TOK // traits.block_size
+        n_group_pages = self.ctx.dual_iters * ppt
+        for r in range_constexpr(-(-traits.STAGE_PAGES // traits.BLOCK_THREADS)):
             idx = self.ctx.tid + r * traits.BLOCK_THREADS
-            if idx < n_part_pages:
-                pg = first_page + idx
+            if (idx < n_group_pages) & (idx < traits.STAGE_PAGES):
+                pg = (self.ctx.part_start + (idx // ppt) * 2) * ppt + idx % ppt
                 raw = fx.Int32(
                     self.bt_scalar[self.ctx.seq * self.ctx.max_blocks_per_seq + pg]
                 )
