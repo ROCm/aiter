@@ -2402,7 +2402,9 @@ def test_pa_decode_softmax_scale_rejected(softmax_scale, device, monkeypatch):
 
     monkeypatch.setattr(pa, "compile_pa_decode_tile", unexpected_compile)
     query = torch.zeros((1, 8, 256), dtype=torch.bfloat16, device=device)
-    cache = torch.zeros((2, 64, 1, 256), dtype=dtypes.fp8, device=device)
+    # Packed caches pass layout validation on every arch; NHD is gfx950-only.
+    key = torch.zeros((2, 1, 16, 64, 16), dtype=dtypes.fp8, device=device)
+    value = torch.zeros((2, 1, 4, 256, 16), dtype=dtypes.fp8, device=device)
     context = torch.tensor([64], dtype=torch.int32, device=device)
     table = torch.zeros((1, 1), dtype=torch.int32, device=device)
     scale = torch.ones(1, dtype=torch.float32, device=device)
@@ -2415,8 +2417,8 @@ def test_pa_decode_softmax_scale_rejected(softmax_scale, device, monkeypatch):
             pa.pa_decode(
                 torch.empty_like(query),
                 query,
-                cache,
-                cache,
+                key,
+                value,
                 context,
                 table,
                 softmax,
