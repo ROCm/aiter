@@ -9,15 +9,14 @@ import triton.language as tl
 from triton.experimental import gluon
 from triton.language.core import _aggregate as aggregate
 
-from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-from aiter.ops.triton.utils.common_utils import strip_annotate
-from aiter.ops.triton.utils.types import e4m3_dtype
-
 # tdm.async_gather with whichever signature this Triton has (see unified_attention_2d.py)
 from aiter.ops.triton._gluon_kernels.gfx1250.attention.unified_attention_2d import (
     _tdm_gather,
 )
+from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.utils.common_utils import strip_annotate
+from aiter.ops.triton.utils.types import e4m3_dtype
 
 # from triton._C.libtriton.gluon_ir import make_cga_layout
 
@@ -2492,7 +2491,6 @@ def _unified_attention_gluon_kernel_3d(
                 S = pgm.apply_causal_mask_tile(S, j)
             S = S * qk_factor
         if need_addtional_mask:
-            seq_mask = seq_offset < pgm.context_len + pgm.query_pos_qk + 1
             S = pgm.apply_addtional_mask_qk(
                 S, seq_offset, alibi_slope, qq_bias_row_ptrs
             )

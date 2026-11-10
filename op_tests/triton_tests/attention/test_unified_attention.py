@@ -647,6 +647,9 @@ def test_triton_unified_attn(
     # shuffling only supported for gfx1250 gluon kernels
     if shuffled_kv_cache and not use_gluon_2d:
         pytest.skip("skip shuffled_kv_cache, 2d gluon not available")
+    # shuffle_kv_cache only defines the bf16 and fp8 layouts
+    if shuffled_kv_cache and kv_dtype == torch.float16:
+        pytest.skip("skip shuffled_kv_cache, fp16 shuffled layout not supported")
     query_lens = [x[0] for x in seq_lens]
     kv_lens_list = [x[1] for x in seq_lens]
     (

@@ -1,17 +1,17 @@
 # The kernels in this file are adapted from vLLM:
 # https://github.com/vllm-project/vllm/blob/main/vllm/attention/ops/triton_unified_attention.py
+import os
 from typing import NamedTuple
 
-import os
 import torch
 import triton
 
 from aiter.ops.triton._triton_kernels.attention.unified_attention import (
     attention_output_gate_rows,
-    unified_attention_3d_split_rebalance_kernel,
     kernel_unified_attention_2d,
     kernel_unified_attention_3d,
     reduce_segments,
+    unified_attention_3d_split_rebalance_kernel,
 )
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import get_arch
 from aiter.ops.triton.utils._triton import arch_info

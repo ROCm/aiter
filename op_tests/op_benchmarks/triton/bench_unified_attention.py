@@ -54,7 +54,7 @@ def nvfp4_quant_shuffle_cache(cache, scale_preshuffle):
     preshuffled in scale_preshuffle-row groups (that helper's shuffle_scale_batched uses 128, so pages of 128)."""
     from op_tests.triton_tests.attention import test_unified_attention as T
 
-    num_blocks, block_size, num_kv_heads, head_size = cache.shape
+    _num_blocks, block_size, num_kv_heads, head_size = cache.shape
     x = cache.view(-1, block_size, num_kv_heads, head_size).permute(0, 2, 1, 3)
     data, scales = torch_dynamic_mxfp4_quant(x, is_nvfp4=True)
     scale_k = head_size // 16
