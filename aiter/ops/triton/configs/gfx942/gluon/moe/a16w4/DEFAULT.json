@@ -38,5 +38,17 @@
         "block_n": 128,
         "block_k": 128,
         "num_warps": 4
+    },
+    "bm16_n7168_k256": {
+        "block_n": 128,
+        "block_k": 256,
+        "num_warps": 8,
+        "w_cache_modifier": ".cg"
+    },
+    "bm16_n6144_k384": {
+        "block_n": 128,
+        "block_k": 128,
+        "num_warps": 8,
+        "waves_per_eu": 4
     }
 }

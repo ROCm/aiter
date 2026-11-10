@@ -342,11 +342,14 @@ def get_kernel_config_gluon_gfx942(m, n, k, routing_data):
     # Swept entries ship in configs/gfx942/gluon/moe/a16w4/DEFAULT.json, keyed like the
     # Triton table (block_m is the dispatch key, fixed by routing, not a tunable); the
     # heuristic below generalises them to unkeyed shapes.
+    waves_per_eu = 0
     tuned = get_moe_dispatch("A16W4", "gfx942", "gluon").get(f"bm{block_m}_n{n}_k{k}")
     if tuned is not None and k % tuned["block_k"] == 0:
         block_n = tuned["block_n"]
         block_k = tuned["block_k"]
         num_warps = tuned["num_warps"]
+        waves_per_eu = tuned.get("waves_per_eu", 0)
+        w_cache_modifier = tuned.get("w_cache_modifier", None)
     elif block_m <= 32:
         block_n = 128
         block_k = 512 if gateup_decode else block_k_decode
@@ -380,7 +383,7 @@ def get_kernel_config_gluon_gfx942(m, n, k, routing_data):
         "xcd_swizzle": xcd_swizzle,
         "w_cache_modifier": w_cache_modifier,
         "split_k": split_k,
-        "waves_per_eu": 0,
+        "waves_per_eu": waves_per_eu,
         "matrix_instr_nonkdim": 16,
         "kpack": 1,
     }
