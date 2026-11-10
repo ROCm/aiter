@@ -15,10 +15,19 @@ default-deny, and only a framework calling `configure()` turns anything on. A
 provider wheel arriving as somebody's transitive dependency cannot change which
 kernels run.
 
-**No op is routed on `main` today.** The interface is complete and tested, but
-the first ops to pass through it arrive in #7484. Until that merges, a provider
-can be written, installed, enabled and inspected — and every call still goes
-native, because there is nothing to intercept yet.
+**Five ops are routed today**, and `tests/plugin_contracts.json` is the list
+that cannot drift from what dispatch actually hands you:
+
+| op | version |
+|---|---|
+| `rmsnorm` | 2 |
+| `rmsnorm_with_add` | 1 |
+| `pertoken_quant` | 1 |
+| `gemm_a8w8_blockscale` | 1 |
+| `gemm_a8w8_blockscale_bpreshuffle` | 1 |
+
+If your op is not in that file it is not routed — there is nothing to serve,
+and `plugin.status()['routed_ops']` says the same at runtime.
 
 ## The smallest provider that works
 
@@ -80,10 +89,11 @@ environment variable.
   call. `None` is the supported way to say no.
 - **Be pure.** `explain()` calls `select()` without running anything, so a
   `select()` with side effects makes the dry run a lie.
-- **Take the contract exactly.** Nothing on `main` checks this yet — your `run`
-  is called with the contract's arguments whatever its own signature says. An
-  arity check arrives in #7484; until then a mismatch is silent. See *Bind to
-  the contract* below for what that looks like in practice.
+- **Take the contract exactly.** AITER checks your `run` against the contract's
+  arity before handing it the call, and refuses the candidate with
+  `reason="contract-mismatch"` if it does not fit. That check compares argument
+  counts, not meaning — see *Bind to the contract* below for why that
+  distinction matters.
 - **Once `run()` starts, errors propagate.** AITER does not fall back mid-flight:
   retrying could repeat side effects or hide a broken kernel behind a correct
   result.
@@ -133,16 +143,15 @@ interface.
 flag *inside* that contract and also a separate public function of its own.
 Seven arguments were about to reach a six-argument kernel.
 
-That one was caught, by the arity check #7484 adds (`reason="contract-mismatch"`,
-the provider named in the log), and nothing was corrupted. Two things follow,
-and the second matters more:
+That one was caught by the arity check — `reason="contract-mismatch"`, the
+provider named in the log — and nothing was corrupted. But do not read that as
+a safety net:
 
-- **on `main` today there is no such check.** The same mistake runs.
-- **even with it, arity is not meaning.** Two contracts with the same number of
-  parameters and different semantics pass it. `mla_sparse_prefill_v4` and
-  `_v41` both take 15 arguments, and their second parameter is `q_rope` in one
-  and `q_scale` in the other — a kernel bound to the wrong one reads a scale
-  tensor as a RoPE component, silently, with every gate green.
+**arity is not meaning.** Two contracts with the same number of parameters and
+different semantics pass the check. `mla_sparse_prefill_v4` and `_v41` both take
+15 arguments, and their second parameter is `q_rope` in one and `q_scale` in the
+other. A kernel bound to the wrong one reads a scale tensor as a RoPE component
+— silently, with every gate green.
 
 One op name, one contract, one `run`. Nothing downstream can recover a
 contract bound wrong.
@@ -168,6 +177,34 @@ missing one.
 **Declining is not failing.** A provider that cannot serve a dtype, a shape or
 an arch should return `None` every time, cheaply. `explain()` will show the
 decline and `decision_counts()` will count it; neither is an error state.
+
+## Telling AITER what a kernel costs
+
+`KernelCandidate` takes an optional `latency_us`: how long **this kernel takes
+for this call**, in microseconds. Omitting it is the default and stays
+supported — AITER records `None` and nothing else changes.
+
+```python
+plugin.KernelCandidate(..., latency_us=12.4, run=my_kernel)
+plugin.last_decision().latency_us    # 12.4, recorded unchanged
+```
+
+Three rules, and the first is the one that is easy to get wrong:
+
+- **it describes the call in hand, not a past measurement.** AITER labels what
+  it records with the conditions of the call the candidate was offered for. A
+  number measured on some other shape arrives wearing conditions it was never
+  measured under — worse than no number, because it looks sourced.
+- **no number is better than an extrapolated one.** With nothing for the shape
+  in front of you, omit the field. `0`, a negative, `inf` and `nan` are refused
+  at construction: each looks like data and carries none.
+- **it never influences routing.** Preference is the enable list, which names
+  an owner for that decision. A number a provider picks for itself must not be
+  able to outrank it.
+
+If what you have is offline validation timing — a ratio against a baseline, on
+shapes your own harness picked — that is not this field. Put a reference to the
+evidence in `qualification` instead, and leave `latency_us` unset.
 
 ## Versions
 
