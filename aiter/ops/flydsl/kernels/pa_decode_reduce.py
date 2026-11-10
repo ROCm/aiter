@@ -572,9 +572,14 @@ def compile_pa_decode_ps_reduce(
                 )
 
             def _reduce_lds():
-                storage = fx.SharedAllocator().allocate(SharedStorage).peek()
-                weights = storage.weights
-                partials = _partials(storage)
+                # gfx950 dual CTAs allocate LDS once, up front.
+                lds = (
+                    storage
+                    if fx.const_expr(architecture == "gfx950")
+                    else fx.SharedAllocator().allocate(SharedStorage).peek()
+                )
+                weights = lds.weights
+                partials = _partials(lds)
                 _publish_weights(weights)
 
                 def _sum(rung, unit):
@@ -607,9 +612,16 @@ def compile_pa_decode_ps_reduce(
                         _store(ladder_acc, unit)
             else:
                 # gfx950's LDS path otherwise loads partials only after the
-                # weight barrier, a second serial round trip.
+                # weight barrier, a second serial round trip. A group holds its
+                # whole rung in registers until then, so a single group of up
+                # to 256 partitions keeps the old order: its rung would raise
+                # the kernel to one wave per SIMD for every partition count.
                 if fx.const_expr(
-                    architecture in ("gfx1250", "gfx1250-strict", "gfx950")
+                    architecture in ("gfx1250", "gfx1250-strict")
+                    or (
+                        architecture == "gfx950"
+                        and per_group <= 2 * DUAL_REGISTER_PARTITIONS
+                    )
                 ):
                     lds_acc = _top_first(lds_rungs, _reduce_lds_rung, unit, groups)
                 else:
