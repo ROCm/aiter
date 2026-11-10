@@ -262,18 +262,6 @@ def _kcache_touch(addr_table, num_dwords):
     fx.rocdl.s_waitcnt(lgkmcnt=0)
 
 
-def _kcache_touch_tables(addr_tables):
-    """_kcache_touch of the first 64-byte line of each table, all loads
-    issued before the single wait (one scalar-cache round trip)."""
-    vals = []
-    for addr_table in addr_tables:
-        table = ptr_buf_tensor(addr_table, fx.Int32)
-        for dw in (0, 15):
-            vals.append(fx.Int32(buf_scalar_load(table, fx.Int32(dw))))
-    _keep_alive(vals)
-    fx.rocdl.s_waitcnt(lgkmcnt=0)
-
-
 def _store_i32_sys_relaxed(addr_i64, offset, val):
     """System-scope MONOTONIC i32 store at ``addr_i64 + offset*4``.
 
@@ -3916,22 +3904,10 @@ def _compile_fast_mega_moe_prepare(
                 count_scratch=count_scratch,
                 prepare_blocks=prepare_blocks,
             )
-            # Scalar-cache warm-up of the dispatch table and the peer
-            # tables (count push / count done / plan ready) in the
-            # shadow of the ticket round trip.
+            # Scalar-cache warm-up of the dispatch table in the shadow of
+            # the ticket round trip.
             if (tid >> fx.Int32(6)) == fx.Int32(num_waves - 1):
                 _kcache_touch(addr_disp, DISPATCH_TABLE_SIZE * 2)
-            if (tid >> fx.Int32(6)) == fx.Int32(num_waves - 2):
-                _kcache_touch_tables(
-                    [
-                        disp_ptr(p2p_slot)
-                        for p2p_slot in (
-                            DispatchSlot.P2P_COUNT_MATRIX,
-                            DispatchSlot.P2P_COUNT_DONE,
-                            DispatchSlot.P2P_PLAN_READY,
-                        )
-                    ]
-                )
         if const_expr(pre_ticket):
             # Decode fused path: every role is self-contained (the owner
             # counts, plans and publishes alone; quant CTAs only stride their
