@@ -6,9 +6,8 @@ import functools
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir.dialects import llvm  # llvm.fake.use: no fx wrapper (_keep_alive)
-from flydsl.expr import arith, const_expr, range_constexpr, rocdl
-from flydsl.expr import math as fmath
+from flydsl._mlir.dialects import llvm  # llvm.intr.fake.use: no fx wrapper
+from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import ReductionOp, T
 from flydsl.expr.typing import Vector as Vec
 from flydsl.runtime.device import get_rocm_arch
@@ -79,7 +78,7 @@ def _emit_mx_fp8_quad_chunk(raw, chunk, lane, out_buf8):
     12 of the row (the caller stores it from that lane).
     """
     values = fx.Vector(raw).bitcast(fx.BFloat16).to(fx.Float32)
-    local_max = fx.Float32(1e-10).maximumf(fmath.absf(values).reduce(ReductionOp.MAX))
+    local_max = fx.Float32(1e-10).maximumf(fx.math.absf(values).reduce(ReductionOp.MAX))
     local_max = local_max.maximumf(dpp_xor_f32(local_max, 1))
     local_max = local_max.maximumf(dpp_xor_f32(local_max, 2))
     working = (
@@ -94,10 +93,10 @@ def _emit_mx_fp8_quad_chunk(raw, chunk, lane, out_buf8):
     words = []
     for word in range_constexpr(2):
         base = word * 4
-        packed = rocdl.cvt_pk_fp8_f32(
+        packed = fx.rocdl.cvt_pk_fp8_f32(
             T.i32, scaled[base], scaled[base + 1], fx.Int32(0), 0
         )
-        packed = rocdl.cvt_pk_fp8_f32(
+        packed = fx.rocdl.cvt_pk_fp8_f32(
             T.i32, scaled[base + 2], scaled[base + 3], packed, 1
         )
         words.append(packed)
@@ -138,7 +137,7 @@ def _mx_fp8_quad_convert(raw, chunk, out_buf8):
     a quad hold the same value).
     """
     values = fx.Vector(raw).bitcast(fx.BFloat16).to(fx.Float32)
-    local_max = fx.Float32(1e-10).maximumf(fmath.absf(values).reduce(ReductionOp.MAX))
+    local_max = fx.Float32(1e-10).maximumf(fx.math.absf(values).reduce(ReductionOp.MAX))
     local_max = local_max.maximumf(dpp_xor_f32(local_max, 1))
     local_max = local_max.maximumf(dpp_xor_f32(local_max, 2))
     working = (
@@ -153,10 +152,10 @@ def _mx_fp8_quad_convert(raw, chunk, out_buf8):
     words = []
     for word in range_constexpr(2):
         base = word * 4
-        packed = rocdl.cvt_pk_fp8_f32(
+        packed = fx.rocdl.cvt_pk_fp8_f32(
             T.i32, scaled[base], scaled[base + 1], fx.Int32(0), 0
         )
-        packed = rocdl.cvt_pk_fp8_f32(
+        packed = fx.rocdl.cvt_pk_fp8_f32(
             T.i32, scaled[base + 2], scaled[base + 3], packed, 1
         )
         words.append(packed)
@@ -202,13 +201,16 @@ def _sload_table_i64(addr_table, index):
 
 
 def _store_i32_monotonic(addr_i64, offset, val, syncscope):
-    """Monotonic i32 store at ``addr_i64 + offset*4`` in ``syncscope``."""
-    off = arith.unwrap(offset)
+    """Monotonic i32 store at ``addr_i64 + offset*4`` in ``syncscope``.
+
+    ``offset`` is an fx integer; an i32 offset is zero-extended.
+    """
+    off = offset.ir_value()
     off64 = fx.Uint64(fx.Uint32(off)) if off.type == T.i32 else fx.Int64(off)
     addr = fx.Int64(addr_i64) + fx.Int64(off64) * 4
     ptr_type = fx.PointerType.get(fx.Int32.ir_type, fx.AddressSpace.Global, 4)
     fx.generic_store(
-        fx.inttoptr(ptr_type, fx.Int64(addr)),
+        fx.inttoptr(ptr_type, addr),
         fx.Int32(val),
         memory_order=fx.AtomicOrdering.Monotonic,
         syncscope=syncscope,
@@ -235,15 +237,16 @@ def _store_i32_agent_relaxed(addr_i64, offset, val):
 # on a cold scalar-cache line.  One helper warp touches every 64-byte line of
 # the table while the owner is idle in its prologue barrier, so the later
 # per-phase loads hit.
-# The loads have no real consumer, so each result is pinned with
-# llvm.fake.use (no fx wrapper; emits no instruction, same idiom as
-# mla_gfx1250 keep_alive) and the warp waits for them with lgkmcnt(0).
+# s_buffer_load is readnone, so a load with no consumer is deleted.  Each
+# result is pinned with llvm.intr.fake.use, which emits no instruction
+# (FlyDSL 0.5.0 has no fx wrapper for it), and the warp waits for the loads
+# with lgkmcnt(0).
 
 
 def _keep_alive(vals):
-    """Keep each SSA value live up to here (llvm.fake.use)."""
+    """Keep each fx value live up to here (llvm.intr.fake.use, no ISA)."""
     for v in vals:
-        llvm.call_intrinsic(None, "llvm.fake.use", [v], [], [])
+        llvm.intr_fake_use([v.ir_value()])
 
 
 def _kcache_touch(addr_table, num_dwords):
@@ -254,9 +257,7 @@ def _kcache_touch(addr_table, num_dwords):
     offsets = list(range(0, num_dwords, 16))
     if offsets[-1] != num_dwords - 1:
         offsets.append(num_dwords - 1)
-    vals = [
-        arith.unwrap(fx.Int32(buf_scalar_load(table, fx.Int32(dw)))) for dw in offsets
-    ]
+    vals = [fx.Int32(buf_scalar_load(table, fx.Int32(dw))) for dw in offsets]
     _keep_alive(vals)
     fx.rocdl.s_waitcnt(lgkmcnt=0)
 
@@ -268,7 +269,7 @@ def _kcache_touch_tables(addr_tables):
     for addr_table in addr_tables:
         table = ptr_buf_tensor(addr_table, fx.Int32)
         for dw in (0, 15):
-            vals.append(arith.unwrap(fx.Int32(buf_scalar_load(table, fx.Int32(dw)))))
+            vals.append(fx.Int32(buf_scalar_load(table, fx.Int32(dw))))
     _keep_alive(vals)
     fx.rocdl.s_waitcnt(lgkmcnt=0)
 
@@ -421,12 +422,6 @@ def _configure_payload_geometry_fast(
         )
 
 
-# Flattened tile metadata (lane = tile) + dwordx4 SRCMAP padding.
-# Tagged (LL-style) histogram exchange: every pushed count carries the launch
-# tag, so each consumer polls exactly the words it needs instead of waiting
-# on a COUNT_DONE counter plus a system release/acquire pair.
-
-
 _GATE_EPOCH_MASK = 0x3FFFFFFF
 _GATE_PARITY_SHIFT = 30
 
@@ -526,6 +521,9 @@ def _init_sections_ready_merged(
         _wst(tile_expected, tile_index, expected_arrivals, wt_owner=wt_owner)
 
 
+# Tagged (LL-style) histogram exchange: every pushed count carries the launch
+# tag, so each consumer polls exactly the words it needs instead of waiting
+# on a COUNT_DONE counter plus a system release/acquire pair.
 @flyc.jit
 def _ll_dest_issue(
     addr_count_matrix,
@@ -651,21 +649,6 @@ def _ll_dest_finish(
     return normal_count, normal_prefix, group_count, group_prefix, tile_m, packed
 
 
-# Decode (tile_m == 32) destination warps:
-#  T: one-pass top-2 DPP reduction for the next-launch fanout pair, and
-#     power-of-two tile rounding (sort_block_m is 32/64/128) instead of a
-#     runtime integer division by the destination's tile_m.
-#  F: a warp with two destinations issues the second destination's words
-#     only after the first one's words all carried the current tag, so they
-#     are read fresh while the first destination is computed/stored (the
-#     up-front copies predate the peers' push and every stale word cost one
-#     serial re-poll queued behind the first destination's stores).
-
-
-# Warp 0 (planner) issues its own-destination words with one meta load
-# (tagged group counts + current pair word) + npes per-lane count loads.
-
-
 @flyc.jit
 def _ll_own_issue(
     addr_count_matrix,
@@ -677,7 +660,6 @@ def _ll_own_issue(
     rank,
     npes,
     epr,
-    total_experts,
     total_segments,
 ):
     """_ll_dest_issue for the planner's own rank, lane = expert layout.
@@ -887,6 +869,15 @@ def _derive_offsets_pairs_ll(
     addr_pair_config = dp(DispatchSlot.FANOUT_PAIR_CONFIG)
     addr_count_matrix = dp(DispatchSlot.COUNT_MATRIX)
     addr_count_done = dp(DispatchSlot.COUNT_DONE)
+    # Decode (tile_m == 32) only:
+    # fresh2: a warp with two destinations issues the second destination's
+    #   words only after the first one's words all carried the current tag,
+    #   so they are read fresh while the first destination is computed and
+    #   stored (up-front copies predate the peers' push; every stale word
+    #   costs a serial re-poll behind the first destination's stores).
+    # top2: one-pass top-2 DPP reduction for the next-launch fanout pair and
+    #   power-of-two tile rounding (sort_block_m is 32/64/128) instead of a
+    #   runtime division by the destination's tile_m.
     fresh2 = decode
     top2 = decode
 
@@ -1069,7 +1060,6 @@ def _store_expert_metadata_vec(
 
 @flyc.jit
 def _plan_meta_warp(
-    count_matrix,
     addr_pair_config,
     addr_sorted_expert,
     addr_tile_row_base,
@@ -1160,10 +1150,9 @@ def _plan_meta_warp(
     group_input_base = fx.Int32(
         fx.rocdl.readlane(T.i32, group_row_base, canonical_expert)
     )
-    store_meta = _store_expert_metadata_vec
     if valid_expert:
         if group_member:
-            store_meta(
+            _store_expert_metadata_vec(
                 addr_sorted_expert,
                 addr_tile_row_base,
                 addr_tile_input_base,
@@ -1178,7 +1167,7 @@ def _plan_meta_warp(
                 invalid_source=fz_npes * fz_mtpr,
                 wt_owner=wt_owner,
             )
-        store_meta(
+        _store_expert_metadata_vec(
             addr_sorted_expert,
             addr_tile_row_base,
             addr_tile_input_base,
@@ -1289,11 +1278,10 @@ def _wave_sum_uniform_i32(value, lane):
     return fx.Int32(fx.rocdl.readlane(T.i32, incl, 63))
 
 
-# fmt: off
 @flyc.jit
 def _emit_plan(
     *, num_waves, fz_npes, fz_epr, fz_k, fz_mtpr, fz_rank, fz_tile_m, fz_total_experts, addr_disp,
-    i32_cur_tok, addr_in_idx, parity, expected,
+    parity, expected,
     dispatch_blocks, group_blocks, group_done_slot, group_phase_base, payload_chunk_rows, tile_state_stride,
     fused_scratch=None,
     defer_plan_ready=False,
@@ -1303,7 +1291,6 @@ def _emit_plan(
     groups_self_prefix=False,
     wt_owner,
 ):
-# fmt: on
     """Build a destination-owned compact plan in one producer-only CTA."""
     def dp(i):
         return _sload_table_i64(addr_disp, int(i))
@@ -1345,7 +1332,6 @@ def _emit_plan(
     addr_pair_config = dp(DispatchSlot.FANOUT_PAIR_CONFIG)
     local_hist = ptr_buf_tensor(a_lh, fx.Int32)
     block_hist = ptr_buf_tensor(a_block_hist, fx.Int32)
-    count_matrix = ptr_buf_tensor(a_bc, fx.Int32)
     pair_base = ptr_buf_tensor(a_pair_base, fx.Int32)
     count_done_table = ptr_buf_tensor(p_cd, fx.Int64)
     plan_ready_table = ptr_buf_tensor(p_plan_ready, fx.Int64)
@@ -1468,12 +1454,9 @@ def _emit_plan(
 
     # Warp 0 plans local experts after all source matrices arrive.
     if warp == fx.Int32(0):
-      if const_expr(True):
-
         num_valid_buffer = ptr_buf_tensor(a_nv, fx.Int32)
         row_carry = fx.Int32(0)
         max_expert_tiles = fx.Int32(0)
-        own_issued = None
         # The current pair word rides in the same wave load as the
         # tagged group counts (lane npes+1), so warp 0 issues ALL of its
         # count words at once instead of a dependent pair load + full
@@ -1487,7 +1470,6 @@ def _emit_plan(
             rank=fz_rank,
             npes=fz_npes,
             epr=fz_epr,
-            total_experts=fz_total_experts,
             total_segments=count_stride,
         )
         if const_expr(early_fill is not None):
@@ -1620,7 +1602,7 @@ def _emit_plan(
                 write_block=not groups_self_prefix,
                 wt_owner=wt_owner,
             )
-      if const_expr((not early_prefix) and (not split_prefix)):  # noqa: SIM102 - preserve DSL staging
+      if const_expr((not early_prefix) and (not split_prefix)):  # noqa: SIM102
         if warp == fx.Int32(1):
           # Global-segment exclusive prefix, segment-strided: lane l owns
           # segments r*64 + l, so every BLOCK_HIST row access is one coalesced
@@ -1687,7 +1669,6 @@ def _emit_plan(
       # warp 0's local plan instead of waiting for it at a CTA barrier.
       if warp == fx.Int32(2):
           _plan_meta_warp(
-              count_matrix,
               addr_pair_config,
               a_se,
               a_trb,
@@ -1800,9 +1781,6 @@ def _emit_plan(
                 if lane == fx.Int32(0):
                     _store_i32_sys_relaxed(a_pair_ready, parity, expected)
 
-    # Next-launch fanout pairs are consumed only after this kernel retires,
-    # so derive them off the critical path, one warp per destination.
-
 
 @flyc.jit
 def _load_pair_table_lane(addr_pair_config, parity, lane, *, fz_npes):
@@ -1826,7 +1804,7 @@ def _classify_regs_batch(
     i32_cur_tok,
     *, fz_npes, fz_k, fz_epr, fz_total_experts, route_group_shift, packed_topk6_metadata,
 ):
-    """Branch-free _fused_count_batch for EP layouts with epr <= 64, topk <= 8.
+    """Branch-free route classification of one 8-token batch (epr <= 64, topk <= 8).
 
     ``peers[s]`` already holds this lane's token's top-k slot ``s`` (loaded
     directly, so the 8-lane ds_bpermute exchange is gone) and ``pair_vals``
@@ -1857,7 +1835,6 @@ def _classify_regs_batch(
     dest_base = destination * fx.Int32(fz_epr)
     global_a = dest_base + pair_a
     global_b = dest_base + pair_b
-    member_slots = fx.Int32(0)
     has_a = pair_enabled & (peers[0] == global_a)
     has_b = pair_enabled & (peers[0] == global_b)
     member_slots = (has_a | has_b).select(fx.Int32(1), fx.Int32(0))
@@ -2296,7 +2273,7 @@ def _tok_prefetch(
 
 def _emit_fused_count_tok(
     *, num_waves, fz_npes, fz_k, fz_epr, fz_total_experts, addr_disp, i32_cur_tok,
-    addr_in_idx, parity, count_scratch, prefetch_batches=1,
+    addr_in_idx, parity, count_scratch,
     prepare_blocks=1, prefetched=None,
 ):
     """Token-per-lane fused count; returns the first-pass packed segments."""
@@ -2440,7 +2417,7 @@ def _emit_fused_fill_tok(
     )
     count_segments = fz_total_experts + fz_npes
     packed_topk6 = fz_k <= 6 and count_segments <= 512
-    split, groups, slots_per_wave, lane, group, sub, token_off = _tok_lane_geometry(  # noqa: RUF059
+    split, groups, slots_per_wave, _, _, sub, token_off = _tok_lane_geometry(
         num_waves, prepare_blocks, fz_k
     )
     pass_tokens = groups * 64
@@ -2748,7 +2725,6 @@ def _group_base_round(before_lds, total_lds, lane, rnd, *, count_segments):
         fx.ptr_store(base, before_lds + fx.Int64(seg))
 
 
-# fmt: off
 @flyc.jit
 def _emit_group(
     *, num_waves, fz_npes, fz_k, fz_epr, fz_total_experts, addr_disp, i32_cur_tok, addr_in_idx,
@@ -2760,7 +2736,6 @@ def _emit_group(
     fz_mtpr=1 << 30,
     prefix_lds=None,
 ):
-# fmt: on
     """Count and group disjoint route spans across payload producer CTAs."""
     def dp(i):
         return _sload_table_i64(addr_disp, int(i))
@@ -2792,7 +2767,6 @@ def _emit_group(
             )
         )
 
-    tid = fx.thread_idx.x
     if const_expr(addr_expected is not None):
         # Issued here, consumed only by the PAIR_READY wait: the load's
         # latency hides behind the counting phase.
@@ -3460,19 +3434,10 @@ def _compile_fast_mega_moe_prepare(
     fused_p1 = (
         prepare_blocks <= _FUSED_MAX_P
     )
-    fused_defer = npes == 8 and epr <= 64
-    # Route batches (num_waves * 64 / 8 tokens each) whose index loads are
-    # issued up front; the compile bucket covers about 64 tokens per P.
-    fused_prefetch = max(1, prepare_blocks)
-    # Token-per-lane fused count/fill for every fused bucket.
-    fused_tok = fused_p1
-    tok_extra = _TOK_DUMMY_SEGS if fused_tok else 0
+    tok_extra = _TOK_DUMMY_SEGS if fused_p1 else 0
     # Decode (tile_m 32): epoch loads + count prefetch issued before the
     # ticket atomic (see kernel()).
-    pre_ticket = (
-        fused_tok and tile_m == 32
-    )
-    no_ticket = pre_ticket
+    pre_ticket = fused_p1 and tile_m == 32
     # Owner publishes with write-through stores and fence-free flags.
     wt_owner = (prepare_blocks <= _WT_MAX_FUSED_P) if fused_p1 else True
 
@@ -3565,7 +3530,7 @@ def _compile_fast_mega_moe_prepare(
                         DispatchSlot.P2P_PLAN_READY,
                     )
                 ])
-        if const_expr(no_ticket):
+        if const_expr(pre_ticket):
             # Decode fused path: every role is self-contained (the owner
             # counts, plans and publishes alone; quant CTAs only stride their
             # own slots; nothing waits on another CTA of this launch, and the
@@ -3687,7 +3652,7 @@ def _compile_fast_mega_moe_prepare(
                         buf_copy_store(
                             quant_out8, total_chunks, oob_pair, fx.Int32, unit_elems=2
                         )
-                        rocdl.sched_barrier(0)
+                        fx.rocdl.sched_barrier(0)
                     raws = []
                     for u in range_constexpr(_QUANT_CHUNKS_IN_FLIGHT):
                         if const_expr(u >= K):
@@ -3702,9 +3667,9 @@ def _compile_fast_mega_moe_prepare(
                                 unit_elems=4,
                             )
                         )
-                        rocdl.sched_barrier(0)
+                        fx.rocdl.sched_barrier(0)
                     quant_scale32[total_chunks >> fx.Int32(4)] = fx.Int32(0)
-                    rocdl.sched_barrier(0)
+                    fx.rocdl.sched_barrier(0)
                     j = fx.Int32(0)
                     g = fx.Int32(0)
                     while cur_ok:
@@ -3712,7 +3677,7 @@ def _compile_fast_mega_moe_prepare(
                         need_grab = j1 >= n_mine
                         cbase = cur * fx.Int32(blk_chunks) + tid
                         sel = fx.Int32(0)
-                        if const_expr(quant_steal):  # noqa: SIM102 - preserve DSL staging
+                        if const_expr(quant_steal):  # noqa: SIM102
                             if (tid == fx.Int32(0)) & need_grab:
                                 g = fx.Int32(
                                     comm_ops.atomic_add_agent(steal_addr_v, fx.Int32(1))
@@ -3723,7 +3688,7 @@ def _compile_fast_mega_moe_prepare(
                             )
                             sw = _row_scale_word(e8, tid)
                             sel = (lane16 == fx.Int32(u)).select(sw, sel)
-                            rocdl.sched_barrier(0)
+                            fx.rocdl.sched_barrier(0)
                         nxt = quant_slot + j1 * fx.Int32(quant_blocks)
                         nxt_ok = j1 < n_mine
                         if const_expr(quant_steal):
@@ -3749,7 +3714,7 @@ def _compile_fast_mega_moe_prepare(
                                     unit_elems=4,
                                 )
                             )
-                            rocdl.sched_barrier(0)
+                            fx.rocdl.sched_barrier(0)
                         for u in range_constexpr(K, _QUANT_CHUNKS_IN_FLIGHT):
                             e8 = _mx_fp8_quad_convert(
                                 raws[u], cbase + fx.Int32(u * block_threads), quant_out8
@@ -3764,7 +3729,7 @@ def _compile_fast_mega_moe_prepare(
                                     unit_elems=4,
                                 )
                             )
-                            rocdl.sched_barrier(0)
+                            fx.rocdl.sched_barrier(0)
                         quant_scale32[cur * fx.Int32(blk_chunks // 16) + scale_off] = sel
                         raws = new_raws
                         cur = nxt
@@ -3834,7 +3799,7 @@ def _compile_fast_mega_moe_prepare(
                         expected0 = comm_ops.load_i32_system(addr_expected, fx.Int32(0))
                         expected1 = comm_ops.load_i32_system(addr_expected, fx.Int32(1))
                     tok_pre = pre_tok
-                    if const_expr(fused_tok and not pre_ticket):
+                    if const_expr(not pre_ticket):
                         tok_pre = _tok_prefetch(
                             num_waves=num_waves,
                             fz_npes=npes,
@@ -3876,7 +3841,7 @@ def _compile_fast_mega_moe_prepare(
                       if tid == fx.Int32(0):
                           fx.ptr_store(parity_lane, bcast_scratch)
                           fx.ptr_store(expected_lane, bcast_scratch + fx.Int64(1))
-                    if const_expr(not pre_ticket):  # noqa: SIM102 - preserve DSL staging
+                    if const_expr(not pre_ticket):  # noqa: SIM102
                         if (tid >> fx.Int32(6)) == fx.Int32(num_waves - 1):
                             _kcache_touch(addr_disp, DISPATCH_TABLE_SIZE * 2)
                     fx.barrier()
@@ -3893,7 +3858,6 @@ def _compile_fast_mega_moe_prepare(
                         addr_in_idx=addr_in_idx,
                         parity=parity,
                         count_scratch=count_scratch,
-                        prefetch_batches=fused_prefetch,
                         prepare_blocks=prepare_blocks,
                         prefetched=tok_pre,
                     )
@@ -3932,8 +3896,6 @@ def _compile_fast_mega_moe_prepare(
                         fz_tile_m=tile_m,
                         fz_total_experts=total_experts,
                         addr_disp=addr_disp,
-                        i32_cur_tok=i32_cur_tok,
-                        addr_in_idx=addr_in_idx,
                         parity=parity,
                         expected=expected,
                         dispatch_blocks=dispatch_blocks,
@@ -3943,7 +3905,7 @@ def _compile_fast_mega_moe_prepare(
                         payload_chunk_rows=chunk_rows,
                         tile_state_stride=tile_state_stride,
                         fused_scratch=count_scratch,
-                        defer_plan_ready=fused_defer,
+                        defer_plan_ready=True,
                         early_fill=_early_fill,
                         prefix_scratch=prefix_scratch,
                         wt_owner=wt_owner,
@@ -4074,8 +4036,6 @@ def _compile_fast_mega_moe_prepare(
                         fz_tile_m=tile_m,
                         fz_total_experts=total_experts,
                         addr_disp=addr_disp,
-                        i32_cur_tok=i32_cur_tok,
-                        addr_in_idx=addr_in_idx,
                         parity=parity,
                         expected=expected,
                         dispatch_blocks=dispatch_blocks,
