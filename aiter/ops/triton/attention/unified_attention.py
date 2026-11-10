@@ -960,7 +960,17 @@ def is_reduce_split_rebalance_gluon_available(
     )
 
 
+def _reject_nvfp4_kv_on_triton(params: _UAParams):
+    # The Triton kernels have no NVFP4 decode: a packed uint8 cache would be cast, not dequantized.
+    if params.kv_cache_dtype == torch.uint8 or params.v_cache_dtype == torch.uint8:
+        raise NotImplementedError(
+            "an NVFP4 (uint8) KV cache runs only on the gfx1250 Gluon kernels, which do not support "
+            "softcap, ALiBi slopes or qq_bias; this call would fall back to the Triton kernels"
+        )
+
+
 def _unified_attention_2d_triton(params: _UAParams):
+    _reject_nvfp4_kv_on_triton(params)
     if params.shuffled_kv_cache and (
         params.q_dtype == e4m3_dtype and params.kv_cache_dtype == e4m3_dtype
     ):
@@ -1046,6 +1056,7 @@ def _unified_attention_3d_triton(
     NUM_SEGMENTS,
     TILE_SIZE,
 ):
+    _reject_nvfp4_kv_on_triton(params)
     config = get_unified_attention_config("attn_3d", params, backend="triton")
     config["BLOCK_M"] = max(
         config["BLOCK_M"], triton.next_power_of_2(params.num_queries_per_kv)

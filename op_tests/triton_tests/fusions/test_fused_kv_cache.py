@@ -1103,7 +1103,7 @@ def _assert_nvfp4_cache_equal_up_to_ties(got, ref, x_full):
     x = x_full.permute(0, 2, 1, 3).float().reshape(nb, kh, bs, D // 16, 16)
     scale = x.abs().amax(dim=-1, keepdim=True) / 6.0
     qx = (x * (1.0 / scale)).reshape(nb, kh, bs, D)[diff].abs()
-    mags = torch.tensor(_E2M1_MAGNITUDES, device=got.device)
+    mags = torch.tensor(_E2M1_MAGNITUDES, dtype=torch.float32, device=got.device)
     gm, rm = mags[gn[diff] & 7], mags[rn[diff] & 7]
     assert torch.equal(gn[diff] & 8, rn[diff] & 8), "NVFP4 sign differs"
     lo, hi = torch.minimum(gm, rm), torch.maximum(gm, rm)

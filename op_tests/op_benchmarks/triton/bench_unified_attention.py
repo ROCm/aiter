@@ -6,6 +6,7 @@ import torch
 import triton
 
 from aiter.ops.triton.attention.unified_attention import unified_attention
+from aiter.ops.triton.utils.shuffle import shuffle_scale_batched
 from aiter.ops.triton.utils.types import e4m3_dtype
 from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.triton_tests.attention.test_unified_attention import (
@@ -51,21 +52,16 @@ def nvfp4_quant_dequant(tensor):
 
 def nvfp4_quant_shuffle_cache(cache, scale_preshuffle):
     """One NVFP4 cache in the kernels' shuffled layout, as dynamic_nvfp4_quant_kv_cache builds it, with the scales
-    preshuffled in scale_preshuffle-row groups (that helper's shuffle_scale_batched uses 128, so pages of 128)."""
+    preshuffled in scale_preshuffle-row groups (dynamic_nvfp4_quant_kv_cache uses 128, so pages of 128)."""
     from op_tests.triton_tests.attention import test_unified_attention as T
 
     _num_blocks, block_size, num_kv_heads, head_size = cache.shape
     x = cache.view(-1, block_size, num_kv_heads, head_size).permute(0, 2, 1, 3)
     data, scales = torch_dynamic_mxfp4_quant(x, is_nvfp4=True)
     scale_k = head_size // 16
-    skw = min(16, 1 << (scale_k - 1).bit_length()) if scale_k >= 4 else scale_k
-    P = scale_preshuffle
-    scales = (
-        scales.view(-1, block_size // P, 4, P // 4, scale_k // skw, skw)
-        .permute(0, 1, 4, 3, 2, 5)
-        .contiguous()
-        .view(-1, num_kv_heads, block_size * scale_k)
-    )
+    scales = shuffle_scale_batched(
+        scales.view(-1, block_size, scale_k), preshuffle_factor=scale_preshuffle
+    ).view(-1, num_kv_heads, block_size * scale_k)
     data = T.shuffle_weight(data, arch="gfx950").view(-1, num_kv_heads, block_size * head_size // 2)
     return (
         torch.cat([data.view(torch.uint8), scales.view(torch.uint8)], dim=-1)
