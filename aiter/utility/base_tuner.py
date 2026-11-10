@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
+import math
 import os
 import shutil
 import sys
@@ -783,9 +784,7 @@ class TunerCommon:
             filtered_time = [
                 (info_ex, round(us, 4), max_err_ratio, watts)
                 for info_ex, us, max_err_ratio, watts in sorted_time
-                if max_err_ratio <= tol_err_ratio
-                and us != self.INVALID_TIME
-                and us != self.INF_TIME
+                if max_err_ratio <= tol_err_ratio and math.isfinite(us) and us > 0
             ]
             if len(filtered_time) == 0:
                 logger.error(
@@ -1902,7 +1901,7 @@ class GemmCommonTuner(TunerCommon):
         ### bpes: (inbpe, w_bpe, outbpe)
         ### gemm flops,bw
         info, time, _err_ratio = results
-        if time == -1:
+        if not math.isfinite(time) or time <= 0:
             return 0, 0
         if len(info[0]) >= 5:  # gfx-aware key: (gfx, cu_num, m, n, k, ...)
             _gfx, _cu_num, m, n, k, *_rest = info[0]

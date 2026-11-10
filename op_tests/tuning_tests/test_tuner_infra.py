@@ -229,6 +229,24 @@ class TestCalculate(unittest.TestCase):
 class TestPostProcess(unittest.TestCase):
     """Tests for post_process -- especially the topk selection logic."""
 
+    def test_nonpositive_and_nonfinite_times_cannot_win(self):
+        tuner = _StubTuner.get()
+        args = argparse.Namespace(profile_file="", verbose=False, errRatio=0.05)
+        key = (TEST_GFX, 304, 16, 128, 6144)
+        for invalid in (0.0, -2.0, float("nan"), float("inf"), -float("inf")):
+            with self.subTest(invalid=invalid):
+                rets = [
+                    ((key, 0, 1, "bad"), invalid, 0.0),
+                    ((key, 1, 1, "good"), 9.0, 0.0),
+                ]
+                result = tuner.post_process(rets, args, topk=1)
+                self.assertEqual(result.iloc[0]["kernelName"], "good")
+                self.assertEqual(float(result.iloc[0]["us"]), 9.0)
+                self.assertEqual(tuner.calculate(rets[0]), (0, 0))
+        only_bad = [((key, 0, 1, "bad"), 0.0, 0.0)]
+        result = tuner.post_process(only_bad, args, topk=1)
+        self.assertEqual(float(result.iloc[0]["us"]), tuner.INVALID_TIME)
+
     def _make_args(self, err_ratio=0.05, profile_file=""):
         args = argparse.Namespace()
         args.errRatio = err_ratio

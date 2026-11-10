@@ -82,3 +82,91 @@ The device tests cover BF16/FP16, NT/NN weights, padded input/output strides,
 masked M/N, small M, group swizzle, bias rounding, cluster split-K (1/2/3/9),
 non-default streams, graph replay with changed inputs, and tuned-name dispatch.
 Device cases require gfx1250; the catalog tests do not launch GPU kernels.
+
+## MiniMax M3 normal-TDM retune (2026-11-10)
+
+This continuation focuses on **normal TDM and cluster split-K**, not HTI.
+The original TDM kernel, candidate catalog and rounding contract above are
+unchanged. The standard tuner now also builds FlyDSL candidates using the
+actual FP16/BF16 input dtype, rather than hard-coding BF16.
+
+All **122 existing gfx1250/256-CU BF16 rows** in
+`minimax_m3_eagle_bf16_tuned_gemm.csv` were considered. This was a restricted
+family sweep, not an exhaustive/all-backend retune: normal TDM only;
+M tiles 16/64/128/256, N tiles 32/64/128/256, K tiles 128/256,
+stages 2/3/4 and wave layouts 1x2/2x2/4x4 in the combinations selected by the
+command below and the unchanged source pruner. Legal cluster factors were
+1,2,3,4,6,8,9.
+
+- 5679 standard-tuner candidates, all with positive final latency and
+  passing the unchanged accuracy gate.
+- Standard `--compare --update_improved` initially accepted 35 rows.
+- Independent same-GPU production runs in before/after/after/before order
+  retained only 24 rows with >=3% latency improvement in **both** comparisons.
+- Only those 24 existing rows were updated; the other 98 gfx1250 rows and all
+  163 other-architecture rows remain byte-for-byte unchanged.
+- 21 updates use cluster split-K; three are non-split TDM at long K.
+- Updated-row latency reduction: median 11.35%, range 3.92–36.91%, versus the
+  previous production configs on the same GPU. This is not whole-model speedup.
+
+Representative production latencies (mean of the two independent runs, us):
+
+| M,N,K | split-K | previous config | normal TDM | reduction |
+|---|---:|---:|---:|---:|
+| 16,2304,6144 | 8 | 10.635 | 6.710 | 36.91% |
+| 512,2304,6144 | 6 | 25.125 | 20.275 | 19.30% |
+| 128,6144,18432 | 9 | 51.800 | 38.315 | 26.03% |
+| 256,6144,18432 | 8 | 79.140 | 58.845 | 25.64% |
+| 128,9216,6144 | 6 | 29.395 | 23.220 | 21.01% |
+| 8192,6144,18432 | 1 | 1150.925 | 939.650 | 18.36% |
+
+For the 21 cluster updates, production controls with the **same tile, waves
+and stages**, changing only split-K to 1, were 1.59–3.84x slower (median 1.89x).
+This supports the benefit of the complete K-parallel cluster reduction path;
+it does not isolate the cost/benefit of `cluster_barrier` alone. Split partials
+still round to input dtype, unlike a single FP32 sum. Winning `err_ratio`
+values are 0–0.0142, below the unchanged 0.05 standard fraction threshold.
+There is no tolerance relaxation or bitwise-equality claim.
+
+A real tuning issue was also fixed: `post_process` accepted zero/non-finite
+latencies as winners. It now requires finite positive time; invalid samples
+remain available in raw profiles, with zero derived throughput metrics.
+The fix has a regression test and does not change the timing method.
+
+### Reproduction and verification
+
+Start from an unmodified copy of the existing model table for the baseline;
+use another full copy for the compare-gated output. Select only its 122
+gfx1250/256-CU rows as the input. No new production model table is required.
+
+    export ROCBLAS_USE_HIPBLASLT=0 PYTORCH_BLAS_PREFER_HIPBLASLT=0
+    export AITER_CONFIG_GEMM_BF16=/absolute/path/to/baseline.csv
+    python -m csrc.gemm_a16w16.gemm_a16w16_tune \
+      --input_file all_gfx1250.csv --tuned_file gated.csv \
+      --all --libtype flydsl --flydsl-policies tdm \
+      --flydsl-kernel-filter 't(?:16x(?:32|64|128)x256x[234]|64x(?:32|64|128)x256x[23]|128x128x128x2|256x256x128x2)_.*_w(?:1x2|2x2|4x4)x1_' \
+      --splitK --mp 4 --shape_grouped --batch 12 --timeout 1800 \
+      --compare --update_improved --min_improvement_pct 3 \
+      --profile_file profile.csv --verbose
+
+The optional policy/name filters restrict only the standard candidate list;
+the default catalog, reference, tolerances, timing and CSV selection remain
+AITER's. Use `--run_config <csv>` for the repeated production checks.
+
+The final updated table passed standard production validation for all 122
+gfx1250 rows. The first attempt aborted in a BLAS reference kernel near an
+unchanged wide-N row; the successful retry explicitly selected
+`torch.backends.cuda.preferred_blas_library("cublas")` (rocBLAS on ROCm),
+in addition to the environment above, before invoking the same tuner module.
+This is an SDK workaround, not a change to the reference mathematics or
+evidence that the library fault is fixed.
+
+38 related tests passed, including normal BF16/FP16 device cases, tuned lookup,
+standard half task creation, invalid-time rejection and compare logic.
+No FP16 model rows were added by this BF16-table retune.
+
+Local audit artifacts (not another shipped tuner/table) are in
+`temp/minimax_normal/`: `tune_all.sh`, `all_profile.csv`,
+`all_compare.txt`, `verified_improvements.csv`, `final_updates.csv`,
+`same_tile_sk1.log`, `final_model_run_config_rocblas.log`,
+and `normal_results.json`.

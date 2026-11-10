@@ -12,6 +12,7 @@ hipblaslt is opt-in via --with-hipblaslt (imports from gradlib).
 import argparse
 import functools
 import os
+import re
 import sys
 from functools import lru_cache
 from typing import Any, ClassVar
@@ -325,27 +326,28 @@ def run_flydsl_gemm_bf16(
 
 
 @lru_cache(maxsize=1)
-def get_flydsl_bf16_catalog(
+def get_flydsl_a16w16_catalog(
     m: int,
     n: int,
     k: int,
+    in_dtype: torch.dtype,
     out_dtype: torch.dtype,
     has_bias: bool,
 ):
     if flydsl_hgemm_kernel_name is None:
         return []
-    fused_bias = bool(has_bias and out_dtype == torch.bfloat16)
+    fused_bias = bool(has_bias and out_dtype == in_dtype)
     configs = get_flydsl_a16w16_configs(
         m,
         n,
         k,
-        torch.bfloat16,
+        in_dtype,
         out_dtype,
         fused_bias,
     )
     kernels = {
         flydsl_hgemm_kernel_name(
-            dtype=torch.bfloat16,
+            dtype=in_dtype,
             out_dtype=out_dtype,
             config=config,
             has_bias=fused_bias,
@@ -356,7 +358,7 @@ def get_flydsl_bf16_catalog(
         (idx, name, dict(kernels[name])) for idx, name in enumerate(sorted(kernels))
     ]
     logger.info(
-        f"FlyDSL bf16 catalog size for M={m}, N={n}, K={k}: {len(catalog)} kernels"
+        f"FlyDSL {in_dtype} catalog size for M={m}, N={n}, K={k}: {len(catalog)} kernels"
     )
     return catalog
 
@@ -467,6 +469,19 @@ class GemmA16W16Tuner(GemmCommonTuner):
             required=False,
             help="choose libtype to tune: all, asm, hipblaslt, triton, flydsl, torch, skinny, opus. "
             "hipblaslt requires --with-hipblaslt.",
+        )
+        self.parser.add_argument(
+            "--flydsl-policies",
+            nargs="+",
+            choices=["ft", "ht", "sk", "tdm"],
+            default=None,
+            help="Optional policy filter within the standard FlyDSL catalog",
+        )
+        self.parser.add_argument(
+            "--flydsl-kernel-filter",
+            type=re.compile,
+            default=None,
+            help="Optional regex restricting FlyDSL kernel names (reference/timing unchanged)",
         )
         self.parser.add_argument(
             "--with-hipblaslt",
@@ -741,13 +756,25 @@ class GemmA16W16Tuner(GemmCommonTuner):
     def _get_flydsl_tasks(
         self, info_keys, has_bias, indtype, outdtype, scaleAB, is_shuffle, run_kwargs
     ):
-        if scaleAB or is_shuffle or indtype != dtypes.bf16:
+        if scaleAB or is_shuffle or indtype not in (dtypes.bf16, dtypes.fp16):
             return []
         M, N, K = (int(info_keys[2]), int(info_keys[3]), int(info_keys[4]))
         rtol, atol = _default_tol(outdtype)
-        flydsl_catalog = get_flydsl_bf16_catalog(M, N, K, outdtype, has_bias)
+        flydsl_catalog = get_flydsl_a16w16_catalog(M, N, K, indtype, outdtype, has_bias)
         tasks = []
         for solidx, kernel_name, config in flydsl_catalog:
+            policies = getattr(self, "flydsl_policies", None)
+            if (
+                policies
+                and config.get(
+                    "policy", "ht" if config["use_half_tile_interleaved"] else "ft"
+                )
+                not in policies
+            ):
+                continue
+            kernel_filter = getattr(self, "flydsl_kernel_filter", None)
+            if kernel_filter and not kernel_filter.search(kernel_name):
+                continue
             info = (
                 info_keys,
                 solidx,
@@ -928,6 +955,8 @@ class GemmA16W16Tuner(GemmCommonTuner):
 
     def tune(self, untunedf, tunedf, args):
         libtype = args.libtype
+        self.flydsl_policies = getattr(args, "flydsl_policies", None)
+        self.flydsl_kernel_filter = getattr(args, "flydsl_kernel_filter", None)
         with_hipblaslt = getattr(args, "with_hipblaslt", False)
         gfx = self.get_gfx()
         cu_num = self.get_cu_num()

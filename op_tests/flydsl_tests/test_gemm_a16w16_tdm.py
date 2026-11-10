@@ -55,6 +55,62 @@ class TestTdmCatalog(unittest.TestCase):
         )
         self.assertIsNone(get_flydsl_hgemm_kernel_params(name))
 
+    def test_standard_tuner_accepts_half_and_keeps_dtype(self):
+        from unittest import mock
+
+        import csrc.gemm_a16w16.gemm_a16w16_tune as tuning
+
+        cfg = {
+            "block_m": 16,
+            "block_n": 64,
+            "block_k": 256,
+            "stages": 2,
+            "split_k": 4,
+            "m_waves": 1,
+            "n_waves": 2,
+            "k_waves": 1,
+            "group_m": 0,
+            "policy": "tdm",
+            "use_half_tile_interleaved": False,
+        }
+        tuner = object.__new__(tuning.GemmA16W16Tuner)
+        for dtype in (torch.float16, torch.bfloat16):
+            info = (
+                "gfx1250",
+                256,
+                16,
+                128,
+                6144,
+                False,
+                str(dtype),
+                str(dtype),
+                False,
+                False,
+            )
+            with mock.patch.object(
+                tuning,
+                "get_flydsl_a16w16_catalog",
+                return_value=[(0, "tdm_candidate", cfg)],
+            ) as catalog:
+                tasks = tuner._get_flydsl_tasks(
+                    info, False, dtype, dtype, False, False, {}
+                )
+                self.assertEqual(len(tasks), 1)
+                self.assertEqual(catalog.call_args.args[3], dtype)
+                self.assertEqual(tasks[0][2][3], dtype)
+                self.assertIs(tasks[0][6], tuning.get_gemm_ref)
+                tuner.flydsl_policies = ["ft"]
+                self.assertEqual(
+                    tuner._get_flydsl_tasks(
+                        info, False, dtype, dtype, False, False, {}
+                    ),
+                    [],
+                )
+                tuner.flydsl_policies = None
+            self.assertEqual(
+                tuner._get_flydsl_tasks(info, False, dtype, dtype, True, False, {}), []
+            )
+
     def test_validation_rejects_bad_tiles(self):
         cfg = {
             "m": 128,
