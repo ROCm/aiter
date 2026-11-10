@@ -124,20 +124,24 @@ def _profiles(s: str, w: int, r: int) -> list[str]:
     return list(dict.fromkeys(ps))
 
 
-def cells(slices, rows=ROWS, ks=KS, stables=(0, 1), widths=None):
-    """Every cell of `slices`, filtered by the other arguments."""
+def cells(slices, rows=None, ks=KS, stables=(0, 1), widths=None):
+    """Every cell of `slices`, filtered by the other arguments; `None` filters nothing."""
     for s in slices:
         if s == "B":
             for stable in stables:
                 for r, w, p in _B_UNSTABLE:
                     if stable and p == "u512":
                         continue  # #6329's stable table drops it
-                    if (widths is None or w in widths) and 2048 in ks:
+                    if (
+                        (widths is None or w in widths)
+                        and (rows is None or r in rows)
+                        and 2048 in ks
+                    ):
                         yield Cell("B", w, r, 2048, stable, p)
             continue
         ws = DIAG_WIDTHS if s == "A1" else PADDED_WIDTHS
         for w in ws if widths is None else [w for w in ws if w in widths]:
-            for r in rows:
+            for r in ROWS if rows is None else rows:
                 for p in _profiles(s, w, r):
                     for k in ks:
                         for stable in stables:
@@ -417,7 +421,7 @@ def run_cell(
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--slice", nargs="+", default=["A1", "A2", "A3", "A4", "B"])
-    ap.add_argument("--rows", type=int, nargs="+", default=list(ROWS))
+    ap.add_argument("--rows", type=int, nargs="+", default=None)
     ap.add_argument("--k", type=int, nargs="+", default=list(KS))
     ap.add_argument("--stable", type=int, nargs="+", default=[0, 1], choices=(0, 1))
     ap.add_argument("--widths", type=int, nargs="+", default=None)
