@@ -564,7 +564,7 @@ def _opus_sparse_prefill_v41(
 # ---------------------------------------------------------------------------
 
 # backend=None keeps calls with fewer query rows on opus: the single-pass kernel
-# runs one program per query row, while opus splits each row's keys.
+# runs one program per query row and 32 heads, while opus splits each row's keys.
 _TRITON_MIN_ROWS = 64
 
 
