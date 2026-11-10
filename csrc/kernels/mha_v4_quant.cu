@@ -839,6 +839,184 @@ __global__ __launch_bounds__(256) void quantize_v_mxfp6_fp6_p_kernel(
         out[groups * 24 + group_idx] = 0;
 }
 
+// K-mean gate, pass 1: one (batch*head, chunk) block sums its rows of the strided sample into
+// HEAD_DIM per-channel sums plus one sum of squares. Fixed-order reductions keep it deterministic.
+template <typename DTYPE_I, int kDim, int kVec>
+__global__
+    __launch_bounds__(256) void k_smooth_mean_moments_kernel(float* __restrict__ partial,
+                                                             DTYPE_I const* __restrict__ input,
+                                                             const int64_t stride_b,
+                                                             const int64_t stride_s,
+                                                             const int64_t stride_h,
+                                                             const int32_t heads,
+                                                             const int32_t rows,
+                                                             const int32_t row_step,
+                                                             const int32_t chunk_rows)
+{
+    constexpr int32_t kLanes       = kDim / kVec;
+    constexpr int32_t kRowsPerPass = 256 / kLanes;
+    constexpr int32_t kWaves       = 256 / WARP_SIZE;
+    using vec_t                    = opus::vector_t<DTYPE_I, kVec>;
+    __shared__ float sums[kRowsPerPass][kDim];
+    __shared__ float squares[kWaves];
+
+    const int32_t bh    = blockIdx.x;
+    const int32_t lane  = threadIdx.x % kLanes;
+    const int32_t sub   = threadIdx.x / kLanes;
+    DTYPE_I const* base = input + (bh / heads) * stride_b + (bh % heads) * stride_h + lane * kVec;
+    float sum[kVec]     = {};
+    float sq            = 0.0f;
+    const int32_t first = blockIdx.y * chunk_rows;
+    const int32_t last  = first + chunk_rows < rows ? first + chunk_rows : rows;
+    for(int32_t r = first + sub; r < last; r += kRowsPerPass)
+    {
+        const vec_t v =
+            *reinterpret_cast<const vec_t*>(base + static_cast<int64_t>(r) * row_step * stride_s);
+#pragma unroll
+        for(int i = 0; i < kVec; i++)
+        {
+            const float x = static_cast<float>(v[i]);
+            sum[i] += x;
+            sq += x * x;
+        }
+    }
+#pragma unroll
+    for(int i = 0; i < kVec; i++)
+        sums[sub][lane * kVec + i] = sum[i];
+#pragma unroll
+    for(int32_t width = WARP_SIZE / 2; width > 0; width /= 2)
+        sq += __shfl_xor(sq, width);
+    if(threadIdx.x % WARP_SIZE == 0)
+        squares[threadIdx.x / WARP_SIZE] = sq;
+    __syncthreads();
+
+    float* out = partial + (static_cast<int64_t>(bh) * gridDim.y + blockIdx.y) * (kDim + 1);
+    for(int32_t c = threadIdx.x; c < kDim; c += 256)
+    {
+        float total = 0.0f;
+#pragma unroll
+        for(int32_t r = 0; r < kRowsPerPass; r++)
+            total += sums[r][c];
+        out[c] = total;
+    }
+    if(threadIdx.x == 0)
+    {
+        float total = 0.0f;
+#pragma unroll
+        for(int32_t i = 0; i < kWaves; i++)
+            total += squares[i];
+        out[kDim] = total;
+    }
+}
+
+// K-mean gate, pass 2: one block per (batch, head) folds the chunks and keeps the mean only where
+// its squared norm exceeds min_common_sq times the mean squared row norm.
+template <int kDim>
+__global__ __launch_bounds__(256) void k_smooth_mean_gate_kernel(float* __restrict__ mean,
+                                                                 float const* __restrict__ partial,
+                                                                 const int32_t chunks,
+                                                                 const int32_t rows,
+                                                                 const float min_common_sq)
+{
+    static_assert(kDim <= 256, "one thread per channel");
+    __shared__ float norm[256];
+    __shared__ float row_sq[256];
+    __shared__ bool gate;
+    float const* p = partial + static_cast<int64_t>(blockIdx.x) * chunks * (kDim + 1);
+    float value    = 0.0f;
+    float local    = 0.0f;
+    if(threadIdx.x < kDim)
+    {
+        float total = 0.0f;
+#pragma unroll 8
+        for(int32_t chunk = 0; chunk < chunks; chunk++)
+            total += p[chunk * (kDim + 1) + threadIdx.x];
+        value = total / rows;
+        local = value * value;
+    }
+    norm[threadIdx.x] = local;
+    float squares     = 0.0f;
+    for(int32_t chunk = threadIdx.x; chunk < chunks; chunk += 256)
+        squares += p[chunk * (kDim + 1) + kDim];
+    row_sq[threadIdx.x] = squares;
+    __syncthreads();
+    if(threadIdx.x < WARP_SIZE)
+    {
+        // Each lane folds a fixed stride of both arrays, then a fixed-order butterfly.
+        float mean_sq = 0.0f;
+        float sq      = 0.0f;
+        for(int32_t i = threadIdx.x; i < 256; i += WARP_SIZE)
+        {
+            mean_sq += norm[i];
+            sq += row_sq[i];
+        }
+#pragma unroll
+        for(int32_t width = WARP_SIZE / 2; width > 0; width /= 2)
+        {
+            mean_sq += __shfl_xor(mean_sq, width);
+            sq += __shfl_xor(sq, width);
+        }
+        if(threadIdx.x == 0)
+            gate = mean_sq > min_common_sq * (sq / rows);
+    }
+    __syncthreads();
+    if(threadIdx.x < kDim)
+        mean[static_cast<int64_t>(blockIdx.x) * kDim + threadIdx.x] = gate ? value : 0.0f;
+}
+
+template <typename DTYPE_I, int kDim, int kVec>
+void launch_k_smooth_mean(aiter_tensor_t& out,
+                          aiter_tensor_t& partial,
+                          const aiter_tensor_t& input,
+                          const int32_t rows,
+                          const int32_t row_step,
+                          const float min_common_sq,
+                          const hipStream_t stream)
+{
+    const int32_t heads      = static_cast<int32_t>(input.size(2));
+    const int32_t bh         = static_cast<int32_t>(partial.size(0));
+    const int32_t chunks     = static_cast<int32_t>(partial.size(1));
+    const int32_t chunk_rows = (rows + chunks - 1) / chunks;
+    k_smooth_mean_moments_kernel<DTYPE_I, kDim, kVec><<<dim3(bh, chunks), dim3(256), 0, stream>>>(
+        reinterpret_cast<float*>(partial.data_ptr()),
+        reinterpret_cast<DTYPE_I const*>(input.data_ptr()),
+        input.stride(0),
+        input.stride(1),
+        input.stride(2),
+        heads,
+        rows,
+        row_step,
+        chunk_rows);
+    k_smooth_mean_gate_kernel<kDim>
+        <<<dim3(bh), dim3(256), 0, stream>>>(reinterpret_cast<float*>(out.data_ptr()),
+                                             reinterpret_cast<float const*>(partial.data_ptr()),
+                                             chunks,
+                                             rows,
+                                             min_common_sq);
+}
+
+template <typename DTYPE_I, int kDim>
+void launch_k_smooth_mean_dim(aiter_tensor_t& out,
+                              aiter_tensor_t& partial,
+                              const aiter_tensor_t& input,
+                              const int32_t rows,
+                              const int32_t row_step,
+                              const float min_common_sq,
+                              const hipStream_t stream)
+{
+    // 16-byte row loads need 16-byte aligned rows; a misaligned view falls back to scalar loads.
+    constexpr int kVec = 16 / sizeof(DTYPE_I);
+    const bool aligned = reinterpret_cast<uintptr_t>(input.data_ptr()) % 16 == 0 &&
+                         input.stride(0) % kVec == 0 && input.stride(1) % kVec == 0 &&
+                         input.stride(2) % kVec == 0;
+    if(aligned)
+        launch_k_smooth_mean<DTYPE_I, kDim, kVec>(
+            out, partial, input, rows, row_step, min_common_sq, stream);
+    else
+        launch_k_smooth_mean<DTYPE_I, kDim, 1>(
+            out, partial, input, rows, row_step, min_common_sq, stream);
+}
+
 template <int bytes_per_row, AiterDtype out_type = AITER_DTYPE_u8>
 void check_inputs(aiter_tensor_t& out,
                   aiter_tensor_t& scale,
@@ -1255,6 +1433,57 @@ void quantize_v_mxfp4(aiter_tensor_t& out,
                       int64_t head_split)
 {
     quantize_v_mxfp4_impl<false>(out, scale, input, head_split);
+}
+
+void k_smooth_mean(aiter_tensor_t& out,
+                   aiter_tensor_t& partial,
+                   const aiter_tensor_t& input,
+                   int64_t sample_rows,
+                   double min_common)
+{
+    AITER_CHECK(get_gpu_arch() == "gfx942" || get_gpu_arch() == "gfx950",
+                "MHA v4 K smoothing requires gfx942 or gfx950");
+    AITER_CHECK(input.is_gpu(), "input must be on a GPU");
+    AITER_CHECK(input.dim() == 4 && input.stride(3) == 1,
+                "input must be BSHD with a contiguous last dimension");
+    AITER_CHECK(input.dtype() == AITER_DTYPE_fp16 || input.dtype() == AITER_DTYPE_bf16,
+                "input must be fp16 or bf16");
+    const int64_t batch    = input.size(0);
+    const int64_t sequence = input.size(1);
+    const int64_t heads    = input.size(2);
+    const int64_t dim      = input.size(3);
+    AITER_CHECK(dim == 64 || dim == 128 || dim == 256, "head dimension must be 64, 128 or 256");
+    AITER_CHECK(out.dtype() == AITER_DTYPE_fp32 && out.is_contiguous() && out.dim() == 3 &&
+                    out.size(0) == batch && out.size(1) == heads && out.size(2) == dim,
+                "out must be a contiguous fp32 (batch, heads, dim) tensor");
+    AITER_CHECK(partial.dtype() == AITER_DTYPE_fp32 && partial.is_contiguous() &&
+                    partial.dim() == 3 && partial.size(0) == batch * heads &&
+                    partial.size(1) >= 1 && partial.size(2) == dim + 1,
+                "partial must be a contiguous fp32 (batch * heads, chunks, dim + 1) tensor");
+    AITER_CHECK(out.device_id == input.device_id && partial.device_id == input.device_id,
+                "input, out and partial must be on the same device");
+    AITER_CHECK(sample_rows > 0, "sample_rows must be positive");
+    AITER_CHECK(sequence > 0 && sequence <= INT32_MAX, "sequence must be in [1, 2^31)");
+    if(batch * heads == 0)
+        return;
+    const int32_t row_step    = static_cast<int32_t>(std::max<int64_t>(1, sequence / sample_rows));
+    const int32_t rows        = static_cast<int32_t>((sequence + row_step - 1) / row_step);
+    const float min_common_sq = static_cast<float>(min_common * min_common);
+
+    HipDeviceGuard device_guard(input.device_id);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
+    AITER_DISPATCH_FLOATING16_TYPES_rmTorch(input.dtype(), "k_smooth_mean", [&] {
+        using DTYPE_I = typename aiter::hip2opus<scalar_t>::type;
+        if(dim == 64)
+            launch_k_smooth_mean_dim<DTYPE_I, 64>(
+                out, partial, input, rows, row_step, min_common_sq, stream);
+        else if(dim == 128)
+            launch_k_smooth_mean_dim<DTYPE_I, 128>(
+                out, partial, input, rows, row_step, min_common_sq, stream);
+        else
+            launch_k_smooth_mean_dim<DTYPE_I, 256>(
+                out, partial, input, rows, row_step, min_common_sq, stream);
+    });
 }
 
 } // namespace torch_itfs

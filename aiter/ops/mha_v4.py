@@ -27,6 +27,7 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.mha_v4_quant import (
     MHA_V4_HD256,
     MHA_V4_LOG2E,
+    k_smooth_mean,
     mha_v4_q_multiplier,
     mxfp4_k_view,
     mxfp4_v_view,
@@ -2271,13 +2272,10 @@ def _k_mean(k: Tensor, kind: _RawRecipeKind) -> Optional[Tensor]:  # noqa: UP045
     """
     if kind in (_RawRecipeKind.BF16, _RawRecipeKind.BF16_FP8):
         return None
-    stride = max(1, k.shape[1] // _K_SMOOTH_SAMPLE_ROWS)
-    sample = k[:, ::stride].float()
-    mean = sample.mean(dim=1)
-    # Compared squared to keep the whole gate to a handful of tiny kernels; it is launch-bound.
-    row_sq = sample.pow(2).sum(dim=-1).mean(dim=1)
-    gate = mean.pow(2).sum(dim=-1) > _K_SMOOTH_MIN_COMMON**2 * row_sq
-    return (mean * gate.unsqueeze(-1)).contiguous()
+    # CPU operands are rejected after the remaining argument checks; let those run first.
+    if not k.is_cuda:
+        return None
+    return k_smooth_mean(k, _K_SMOOTH_SAMPLE_ROWS, _K_SMOOTH_MIN_COMMON)
 
 
 def _restore_k_mean_in_lse(

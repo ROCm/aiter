@@ -64,5 +64,15 @@ void quantize_v_mxfp4(aiter_tensor_t& out,
                       const aiter_tensor_t& input,
                       int64_t head_split = 1);
 
+// Gated per-(batch, head, channel) mean of BSHD K over every max(1, S / sample_rows)-th row, into
+// fp32 `out` (batch, heads, dim): the mean where its squared norm exceeds min_common^2 times the
+// mean squared row norm, zeros elsewhere. `partial` (batch * heads, chunks, dim + 1) fp32 is the
+// workspace; its chunk count sets the parallelism.
+void k_smooth_mean(aiter_tensor_t& out,
+                   aiter_tensor_t& partial,
+                   const aiter_tensor_t& input,
+                   int64_t sample_rows,
+                   double min_common);
+
 } // namespace torch_itfs
 } // namespace aiter
