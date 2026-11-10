@@ -798,6 +798,27 @@ class TestGlm53TunedArtifact(unittest.TestCase):
         )
 
 
+class TestFlydslV2Stage1Candidates(unittest.TestCase):
+    def test_skips_k_waves_that_do_not_divide_k(self):
+        """At model_dim 2560, k_wave 4 leaves 640 of K per wave, which tile_k 256
+        does not divide, and compile_mixed_moe_gemm1 raises on the candidate
+        after dispatch. k_wave 2 leaves 1280, which it divides."""
+        from aiter import ActivationType, QuantType, dtypes
+        from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
+
+        tuner = gemm_moe_tune.FmoeTuner.__new__(gemm_moe_tune.FmoeTuner)
+        shape = ("gfx950", 256, 1, 2560, 640, 513, 11, ActivationType.Silu)
+        quant = (dtypes.bf16, dtypes.fp4x2, dtypes.fp4x2, QuantType.per_1x32, 1, 0)
+        tile_k_256 = [
+            task[0][2]
+            for task in tuner.gen_flydsl_v2_2stages_task(shape + quant, [32])
+            if task[0][1] == "stage1" and "x256_" in task[0][2]
+        ]
+
+        self.assertEqual([name for name in tile_k_256 if "_kw4" in name], [])
+        self.assertTrue(any("_kw2" in name for name in tile_k_256))
+
+
 class TestParallelMxfp4Precompile(unittest.TestCase):
     def test_uses_forkserver_pool_and_reports_failed_cache_jobs(self):
         from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
