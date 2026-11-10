@@ -575,9 +575,12 @@ class AITER_CONFIG:
         if "select" in dup_rows.columns and "aiter" in sys.modules:
             from aiter.utility.power_configs import power_merge_conflict
 
-            # Group by the tag as the check above does, not by its label.
+            # Group on the keys as the check above compared them: numeric cells
+            # as numbers, the tag as fallback or live. Rows it took for one
+            # shape must not fall into separate groups on 256 against 256.0 or
+            # on a label.
             conflict = power_merge_conflict(
-                dup_rows.assign(_tag=comparable["_tag"]) if has_tag else dup_rows,
+                dup_rows.assign(**{key: comparable[key] for key in dedup_keys}),
                 dedup_keys,
             )
         if conflict:

@@ -387,21 +387,33 @@ class TestConfigShapeCollision(unittest.TestCase):
                 else:
                     self.assertIsNone(err, err)
 
-    def test_merge_refuses_power_row_against_latency_row_with_another_tag(self):
+    def test_merge_refuses_power_row_against_latency_row_keyed_differently(self):
         """A power row and a latency row for one shape are never ranked against
-        each other, whatever their labels: the merge names the conflict and keeps
-        both sources as they are. Grouped by label, the two rows would fall into
-        separate groups and the slower one would be deleted from its source."""
-        canonical = (
+        each other, however the two tables write the key: the merge names the
+        conflict and keeps both sources as they are. Grouped on the raw cells, the
+        rows would fall into separate groups on a label or on 256 against 256.0,
+        and the slower one would be deleted from its source."""
+        tagged = (
             "gfx,cu_num,M,N,K,us,select,_tag\n"
             "gfx950,256,1,64,128,10.0,power,fused_expert\n"
         )
-        model = "gfx,cu_num,M,N,K,us\ngfx950,256,1,64,128,20.0\n"
-        err, _, canonical_after, model_after = self._merge_synthetic(canonical, model)
-        self.assertIn("a power-tuned row and a latency row share a shape", err or "")
-        self.assertIn("No config file was rewritten", err or "")
-        self.assertEqual(canonical_after, canonical)
-        self.assertEqual(model_after, model)
+        untagged = "gfx,cu_num,M,N,K,us,select\ngfx950,256,1,64,128,10.0,power\n"
+        for case, canonical, latency_cu in (
+            ("another tag", tagged, "256"),
+            ("another tag and spelling", tagged, "256.0"),
+            ("another spelling", untagged, "256.0"),
+        ):
+            with self.subTest(case=case):
+                model = f"gfx,cu_num,M,N,K,us\ngfx950,{latency_cu},1,64,128,20.0\n"
+                err, _, canonical_after, model_after = self._merge_synthetic(
+                    canonical, model
+                )
+                self.assertIn(
+                    "a power-tuned row and a latency row share a shape", err or ""
+                )
+                self.assertIn("No config file was rewritten", err or "")
+                self.assertEqual(canonical_after, canonical)
+                self.assertEqual(model_after, model)
 
     def test_dedup_keeps_lowest_us_despite_unparseable_cell(self):
         """A written us that is not a number, here nan on an unrelated row, must
