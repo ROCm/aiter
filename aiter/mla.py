@@ -31,6 +31,7 @@ from aiter.ops.attention import (
     _MlaHeadPlanKind,
     mla_ps64_qh128_fp8_asm_fwd,
 )
+from aiter.plugin import route as _route
 
 _FLYDSL_MLA_REDUCE_TARGET_GFX = ("gfx942", "gfx950")
 _FLYDSL_MLA_REDUCE_TARGET_H = 16
@@ -2298,6 +2299,7 @@ def mla_prefill_reduce(
 # DSv4 MLA -- additive entry point. Does NOT touch any existing
 #   gqa_ratio=64, sub_Q=64, page_size=1, q_dtype=fp8, kv_dtype=fp8
 # ---------------------------------------------------------------------------
+@_route(op="mla_decode_fwd_v4_nm", version=1)
 def mla_decode_fwd_v4_nm(
     q,  # [total_query_len, num_heads, head_size]   FP8 packed Q+e8m0
     qrope,  # [total_query_len, num_heads, kv_rotary]   BF16
