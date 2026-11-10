@@ -240,8 +240,12 @@ def _reshape_and_cache_k4v8_kernel(
             v_scale = tl.load(v_scale_ptr)
         else:
             v_scale = 1
-        k = tl.load(k_ptr + pid_t * k_stride_t + pid_hk * k_stride_h + d_offs * k_stride_d)
-        v = tl.load(v_ptr + pid_t * v_stride_t + pid_hk * v_stride_h + d_offs * v_stride_d)
+        k = tl.load(
+            k_ptr + pid_t * k_stride_t + pid_hk * k_stride_h + d_offs * k_stride_d
+        )
+        v = tl.load(
+            v_ptr + pid_t * v_stride_t + pid_hk * v_stride_h + d_offs * v_stride_d
+        )
         k = k * (1 / k_scale)
         v = v * (1 / v_scale)
         _store_kv_cache_kernel(

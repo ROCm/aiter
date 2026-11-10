@@ -958,13 +958,20 @@ def reshape_and_cache_k4v8(
     )
     t_cache, kh_cache, block_size, d_cache = key_cache.shape
     t_cache_v, kh_cache_v, slot_chunk_v, d_v, x_size = value_cache.shape
-    assert x_size == 16 // value_cache.element_size() and slot_chunk_v * x_size == block_size
-    assert t_cache == t_cache_v and kh == kh_cache == kh_cache_v and d_v == d
-    assert d >= 64 and d == triton.next_power_of_2(d), f"head size {d} must be a power of 2 >= 64"
-    assert d_cache == d // 2 + d // 16, f"key_cache last dim {d_cache} != {d // 2 + d // 16}"
-    assert block_size >= 64 and (block_size <= 128 or block_size % 128 == 0), (
-        f"NVFP4 KV cache needs block_size 64, 128 or a multiple of 128, got {block_size}"
+    assert (
+        x_size == 16 // value_cache.element_size()
+        and slot_chunk_v * x_size == block_size
     )
+    assert t_cache == t_cache_v and kh == kh_cache == kh_cache_v and d_v == d
+    assert d >= 64 and d == triton.next_power_of_2(
+        d
+    ), f"head size {d} must be a power of 2 >= 64"
+    assert (
+        d_cache == d // 2 + d // 16
+    ), f"key_cache last dim {d_cache} != {d // 2 + d // 16}"
+    assert block_size >= 64 and (
+        block_size <= 128 or block_size % 128 == 0
+    ), f"NVFP4 KV cache needs block_size 64, 128 or a multiple of 128, got {block_size}"
     assert key_cache.stride(3) == 1, "key_cache's last dim must be contiguous"
     (t_slot,) = slot_mapping.shape
     assert t <= t_slot, f"{t=} tokens but {t_slot=} slots"
@@ -1000,7 +1007,9 @@ def reshape_and_cache_k4v8(
         BLOCK_D=d,
         BLOCK_SIZE=block_size,
         X_SIZE=x_size,
-        SCALE_K_WIDTH=min(16, triton.next_power_of_2(scale_k)) if scale_k >= 4 else scale_k,
+        SCALE_K_WIDTH=(
+            min(16, triton.next_power_of_2(scale_k)) if scale_k >= 4 else scale_k
+        ),
         SCALE_PRESHUFFLE=min(128, block_size),
         HAVE_K_SCALE=k_scale is not None,
         HAVE_V_SCALE=v_scale is not None,

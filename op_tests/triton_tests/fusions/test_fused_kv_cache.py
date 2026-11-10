@@ -1373,7 +1373,6 @@ def test_k4v8_cache_write_unified_attention(block_size, QH, KH):
     torch.testing.assert_close(out.float(), ref.float(), atol=1.5e-1, rtol=1.5e-1)
 
 
-
 @pytest.mark.parametrize("scenario", ["decode", "prefill"])
 @pytest.mark.parametrize("block_size", [64, 128])
 @pytest.mark.parametrize("D", [128, 256])
@@ -1407,8 +1406,12 @@ def test_reshape_and_cache_k4v8(scenario, block_size, D, KH, packed):
     # 1) the same bytes as the fused rope + cache write: re-writing its rows from its own
     #    roped K into its output caches must leave every byte as it is
     key_cache, value_cache = r["key_cache"].clone(), r["value_cache"].clone()
-    reshape_and_cache_k4v8(k_in, v_in, key_cache, value_cache, slot_mapping, k_scale, v_scale)
-    assert torch.equal(key_cache, r["key_cache"]), "K cache differs from fused_qk_rope_reshape_and_cache"
+    reshape_and_cache_k4v8(
+        k_in, v_in, key_cache, value_cache, slot_mapping, k_scale, v_scale
+    )
+    assert torch.equal(
+        key_cache, r["key_cache"]
+    ), "K cache differs from fused_qk_rope_reshape_and_cache"
     assert torch.equal(
         value_cache.view(torch.uint8), r["value_cache"].view(torch.uint8)
     ), "V cache differs from fused_qk_rope_reshape_and_cache"
@@ -1416,13 +1419,17 @@ def test_reshape_and_cache_k4v8(scenario, block_size, D, KH, packed):
     # 2) into fresh random caches, against the torch reference builders over the whole cache
     #    (written rows match, nothing else touched)
     torch.manual_seed(11)
-    old_k = torch.randn((num_blocks, block_size, KH, D), dtype=torch.bfloat16, device="cuda")
+    old_k = torch.randn(
+        (num_blocks, block_size, KH, D), dtype=torch.bfloat16, device="cuda"
+    )
     old_v = torch.randn(
         (num_blocks, block_size, KH, D), dtype=torch.bfloat16, device="cuda"
     ).to(e4m3_dtype)
     key_cache = _k4v8_ref_k_cache(old_k)
     value_cache = shuffle_kv_cache(old_v, old_v)[1]
-    reshape_and_cache_k4v8(k_in, v_in, key_cache, value_cache, slot_mapping, k_scale, v_scale)
+    reshape_and_cache_k4v8(
+        k_in, v_in, key_cache, value_cache, slot_mapping, k_scale, v_scale
+    )
     valid = slot_mapping >= 0
     slot_t, slot_b = slot_mapping[valid] // block_size, slot_mapping[valid] % block_size
     k_full = old_k.clone()
@@ -1433,6 +1440,8 @@ def test_reshape_and_cache_k4v8(scenario, block_size, D, KH, packed):
     assert torch.equal(
         value_cache.view(torch.uint8), ref_value_cache.view(torch.uint8)
     ), "FP8 V cache differs from the reference"
-    n_ties = _assert_nvfp4_cache_equal_up_to_ties(key_cache, _k4v8_ref_k_cache(k_full), k_full)
+    n_ties = _assert_nvfp4_cache_equal_up_to_ties(
+        key_cache, _k4v8_ref_k_cache(k_full), k_full
+    )
     n_written = int(valid.sum()) * KH * D
     assert n_ties <= n_written // 100, f"{n_ties} tie flips of {n_written} K values"

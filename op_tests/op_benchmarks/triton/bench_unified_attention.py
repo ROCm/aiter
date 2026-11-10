@@ -46,13 +46,16 @@ def nvfp4_quant_dequant(tensor):
     """NVFP4 (e2m1 values, one e4m3 scale per 16 along the last dim) round trip: the values a kernel reading
     the NVFP4 tensor sees, for the reference."""
     shape = tensor.shape
-    packed, scales = torch_dynamic_mxfp4_quant(tensor.reshape(-1, shape[-1]), is_nvfp4=True)
+    packed, scales = torch_dynamic_mxfp4_quant(
+        tensor.reshape(-1, shape[-1]), is_nvfp4=True
+    )
     return torch_dequant_nvfp4(packed, scales, out_dtype=torch.float32).reshape(shape)
 
 
 def nvfp4_quant_shuffle_cache(cache, scale_preshuffle):
     """One NVFP4 cache in the kernels' shuffled layout, as dynamic_nvfp4_quant_kv_cache builds it, with the scales
-    preshuffled in scale_preshuffle-row groups (dynamic_nvfp4_quant_kv_cache uses 128, so pages of 128)."""
+    preshuffled in scale_preshuffle-row groups (dynamic_nvfp4_quant_kv_cache uses 128, so pages of 128).
+    """
     from op_tests.triton_tests.attention import test_unified_attention as T
 
     _num_blocks, block_size, num_kv_heads, head_size = cache.shape
@@ -62,7 +65,9 @@ def nvfp4_quant_shuffle_cache(cache, scale_preshuffle):
     scales = shuffle_scale_batched(
         scales.view(-1, block_size, scale_k), preshuffle_factor=scale_preshuffle
     ).view(-1, num_kv_heads, block_size * scale_k)
-    data = T.shuffle_weight(data, arch="gfx950").view(-1, num_kv_heads, block_size * head_size // 2)
+    data = T.shuffle_weight(data, arch="gfx950").view(
+        -1, num_kv_heads, block_size * head_size // 2
+    )
     return (
         torch.cat([data.view(torch.uint8), scales.view(torch.uint8)], dim=-1)
         .contiguous()
@@ -84,9 +89,13 @@ def nvfp4_quant_kv_cache_chunked(key_cache, value_cache, blocks_per_chunk=16384)
                 )
             else:
                 # 64-token pages (A8K4V8's K): scales preshuffled per page
-                kq = vq = nvfp4_quant_shuffle_cache(c[b0 : b0 + blocks_per_chunk], c.shape[1])
+                kq = vq = nvfp4_quant_shuffle_cache(
+                    c[b0 : b0 + blocks_per_chunk], c.shape[1]
+                )
             if out is None:
-                out = torch.empty((num_blocks,) + kq.shape[1:], dtype=kq.dtype, device=kq.device)
+                out = torch.empty(
+                    (num_blocks,) + kq.shape[1:], dtype=kq.dtype, device=kq.device
+                )
             out[b0 : b0 + kq.shape[0]] = kq
             del kq, vq
         outs.append(out)
@@ -440,11 +449,23 @@ def run_benchmark(custom, args):
         if args.test:
             fn()
             if any_nvfp4:
-                ref_q, ref_k, ref_v = inputs["query_ref"], inputs["key_ref"], inputs["value_ref"]
+                ref_q, ref_k, ref_v = (
+                    inputs["query_ref"],
+                    inputs["key_ref"],
+                    inputs["value_ref"],
+                )
             else:
                 ref_q = inputs["q_fp8"] if args.fp8 else inputs["query"]
-                ref_k = inputs["k_fp8"] if (args.fp8 or args.fp8_kv) else inputs["key_cache"]
-                ref_v = inputs["v_fp8"] if (args.fp8 or args.fp8_kv) else inputs["value_cache"]
+                ref_k = (
+                    inputs["k_fp8"]
+                    if (args.fp8 or args.fp8_kv)
+                    else inputs["key_cache"]
+                )
+                ref_v = (
+                    inputs["v_fp8"]
+                    if (args.fp8 or args.fp8_kv)
+                    else inputs["value_cache"]
+                )
             ref_output = ref_paged_attn(
                 query=ref_q,
                 key_cache=ref_k,
@@ -508,14 +529,24 @@ def run_benchmark(custom, args):
         total_q = cu_query_lens[-1].item()
         # NVFP4: half a byte per value plus one e4m3 scale per 16 values
         nvfp4_bytes = lambda d: d // 2 + d // 16
-        q_bytes = total_q * HQ * (
-            nvfp4_bytes(D_HEAD) if args.nvfp4 else D_HEAD * q_tensor.element_size()
+        q_bytes = (
+            total_q
+            * HQ
+            * (nvfp4_bytes(D_HEAD) if args.nvfp4 else D_HEAD * q_tensor.element_size())
         )
-        k_bytes = total_k * HK * (
-            nvfp4_bytes(D_HEAD) if any_nvfp4 else D_HEAD * k_tensor.element_size()
+        k_bytes = (
+            total_k
+            * HK
+            * (nvfp4_bytes(D_HEAD) if any_nvfp4 else D_HEAD * k_tensor.element_size())
         )
-        v_bytes = total_k * HK * (
-            nvfp4_bytes(D_HEAD_V) if any_nvfp4 and not args.k4v8 else D_HEAD_V * v_tensor.element_size()
+        v_bytes = (
+            total_k
+            * HK
+            * (
+                nvfp4_bytes(D_HEAD_V)
+                if any_nvfp4 and not args.k4v8
+                else D_HEAD_V * v_tensor.element_size()
+            )
         )
         o_bytes = total_q * HQ * D_HEAD_V * inputs["output"].element_size()
         mem = q_bytes + k_bytes + v_bytes + o_bytes
@@ -661,14 +692,20 @@ def main(args: list[str] | None = None) -> None:
             "-fp8 already quantizes K/V; -fp8_kv is redundant. Use one or the other."
         )
     if args.fp8_pv and not (args.nvfp4 or args.nvfp4_kv):
-        raise ValueError("-fp8_pv applies to an NVFP4 KV cache only (-nvfp4 / -nvfp4_kv).")
+        raise ValueError(
+            "-fp8_pv applies to an NVFP4 KV cache only (-nvfp4 / -nvfp4_kv)."
+        )
     if args.k4v8:
         if args.nvfp4 or args.nvfp4_kv or args.fp8_pv:
-            raise ValueError("-k4v8 is its own KV format; drop -nvfp4 / -nvfp4_kv / -fp8_pv.")
+            raise ValueError(
+                "-k4v8 is its own KV format; drop -nvfp4 / -nvfp4_kv / -fp8_pv."
+            )
         args.nvfp4_kv = True
     if args.nvfp4 or args.nvfp4_kv:
         if args.nvfp4 and args.nvfp4_kv:
-            raise ValueError("-nvfp4 already quantizes K/V; use one of -nvfp4 / -nvfp4_kv.")
+            raise ValueError(
+                "-nvfp4 already quantizes K/V; use one of -nvfp4 / -nvfp4_kv."
+            )
         if args.fp8_kv:
             raise ValueError("-fp8_kv conflicts with NVFP4 K/V.")
         if args.block_size != 128 and not (args.k4v8 and args.block_size == 64):

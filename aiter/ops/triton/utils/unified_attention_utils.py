@@ -137,7 +137,9 @@ def _candidates(axis: str, value, parts: set) -> list[str]:
     if kind == "enum":
         q, kv = value[:2]
         # a V cache dtype unlike K's (A8K4V8) tries its own DT_q_k_v first
-        own = [f"{axis}_{q}_{kv}_{value[2]}"] if len(value) > 2 and value[2] != kv else []
+        own = (
+            [f"{axis}_{q}_{kv}_{value[2]}"] if len(value) > 2 and value[2] != kv else []
+        )
         return own + [f"{axis}_{q}_{kv}", f"{axis}_{q}_any", f"{axis}_any_{kv}", "any"]
     if kind == "opt_num" and not value:
         return ["any"]

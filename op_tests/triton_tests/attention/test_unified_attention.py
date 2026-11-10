@@ -1609,6 +1609,8 @@ def test_unified_attn_attn_work_gfx1250(seq_lens, with_hint: bool) -> None:
     )
     assert not output.isnan().any()
     torch.testing.assert_close(output, ref_output, atol=1.5e-2, rtol=1e-2)
+
+
 @pytest.mark.parametrize("path", ["2d", "3d", "auto"])
 @pytest.mark.parametrize("block_size", [64, 128])
 @pytest.mark.parametrize("head_size", [128, 256])
@@ -1632,7 +1634,8 @@ def test_triton_unified_attn_k4v8(
 ) -> None:
     """A8K4V8 on gfx1250: fp8 Q, NVFP4 K (e2m1 values, one e4m3 scale per 16, shuffled; scales preshuffled per
     min(128, page) rows) and fp8 V (shuffled), through the 2D and 3D kernels. The reference reads the dequantized
-    K and the fp8 V with its descale; P is fp8 in the PV WMMA, as for A8W8, so the bound is on the relative L2."""
+    K and the fp8 V with its descale; P is fp8 in the PV WMMA, as for A8W8, so the bound is on the relative L2.
+    """
     if DEVICE_ARCH != "gfx1250":
         pytest.skip("A8K4V8 runs on the gfx1250 Gluon kernels")
     from op_tests.op_benchmarks.triton import bench_unified_attention as bench
@@ -1644,7 +1647,10 @@ def test_triton_unified_attn_k4v8(
             lambda params, backend="triton": path == "2d",
         )
     torch.manual_seed(0)
-    num_blocks = len(seq_lens) * max((k + block_size - 1) // block_size for _, k in seq_lens) + 16
+    num_blocks = (
+        len(seq_lens) * max((k + block_size - 1) // block_size for _, k in seq_lens)
+        + 16
+    )
     inp = bench.make_inputs(
         seq_lens=seq_lens,
         num_heads=num_heads,
@@ -1791,7 +1797,8 @@ def _sigmoid_mul_ref(plain, gate):
 
 _K4V8_GATE_MTP_VERIFY = [(4, 1328), (4, 523), (4, 37), (4, 20011), (4, 8192)] * 3
 _K4V8_GATE_DECODE = [(1, 1328), (1, 523), (1, 9000)] * 4
-_K4V8_GATE_PREFILL = [(478, 478), (600, 3600), (1500, 1500)]  # with and without a prefix
+# prefill, with and without a prefix
+_K4V8_GATE_PREFILL = [(478, 478), (600, 3600), (1500, 1500)]
 
 
 @pytest.mark.parametrize("path", ["2d", "3d", "auto"])
@@ -1821,7 +1828,8 @@ def test_unified_attn_output_gate_k4v8(
     select=False: the gate inside the kernels -- the gfx1250 2D kernel's epilogue (forced
     here at any context) and the 3D reduce_segments.
     select=True: only each sequence's last row (as the MTP drafter keeps), which the 2D
-    kernel never fuses, so it runs the output epilogue; on the cu_seqlens_q search path."""
+    kernel never fuses, so it runs the output epilogue; on the cu_seqlens_q search path.
+    """
     if DEVICE_ARCH != "gfx1250":
         pytest.skip("A8K4V8 runs on the gfx1250 Gluon kernels")
     module = sys.modules[unified_attention.__module__]
@@ -1959,7 +1967,8 @@ def test_unified_attn_split_rebalance_reduce_k4v8(
     block_size, head_size, num_heads = 128, 256, (16, 2)
     # make_inputs draws page ids from len(seq_lens) x the longest sequence's pages
     num_blocks = (
-        len(seq_lens) * max((k + block_size - 1) // block_size for _, k in seq_lens) + 16
+        len(seq_lens) * max((k + block_size - 1) // block_size for _, k in seq_lens)
+        + 16
     )
     inp = bench.make_inputs(
         seq_lens=seq_lens,
@@ -2086,7 +2095,8 @@ def test_unified_attn_split_rebalance_reduce_configs_k4v8(
     block_size, head_size, num_heads = 128, 256, (16, 2)
     # make_inputs draws page ids from len(seq_lens) x the longest sequence's pages
     num_blocks = (
-        len(seq_lens) * max((k + block_size - 1) // block_size for _, k in seq_lens) + 16
+        len(seq_lens) * max((k + block_size - 1) // block_size for _, k in seq_lens)
+        + 16
     )
     inp = bench.make_inputs(
         seq_lens=seq_lens,

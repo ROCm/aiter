@@ -164,7 +164,9 @@ class AttentionConfig:
         # KV_CACHE_DTYPE is the K cache's; V_CACHE_DTYPE the V cache's (A8K4V8: nvfp4 K, fp8 V)
         self.KV_CACHE_DTYPE = gl.constexpr(KV_CACHE_DTYPE)
         V_CACHE_DTYPE = V_CACHE_DTYPE or KV_CACHE_DTYPE
-        assert V_CACHE_DTYPE == KV_CACHE_DTYPE or (KV_CACHE_DTYPE == "nvfp4" and V_CACHE_DTYPE == "fp8")
+        assert V_CACHE_DTYPE == KV_CACHE_DTYPE or (
+            KV_CACHE_DTYPE == "nvfp4" and V_CACHE_DTYPE == "fp8"
+        )
         self.V_CACHE_DTYPE = gl.constexpr(V_CACHE_DTYPE)
         # NVFP4 scales are preshuffled in groups of this many page rows (128, or the page when shorter)
         self.SCALE_PRESHUFFLE = gl.constexpr(min(128, BLOCK_SIZE))
@@ -418,7 +420,13 @@ class AttentionConfig:
                         [0, 2**v, 0]
                         for v in range(log2_num_warps, log2_num_head_broadcast_chunk)
                     ],
-                    lane_bases=[[0, 0, 1], [0, 0, 2], [0, 0, 4], [0, 0, 8], [32 if self.FP8_PV else 16, 0, 0]],
+                    lane_bases=[
+                        [0, 0, 1],
+                        [0, 0, 2],
+                        [0, 0, 4],
+                        [0, 0, 8],
+                        [32 if self.FP8_PV else 16, 0, 0],
+                    ],
                     warp_bases=[[0, 2**v, 0] for v in range(log2_num_warps)],
                     block_bases=[],
                     shape=[
@@ -1473,7 +1481,9 @@ class AttentionProgram:
                 layout=gl.SliceLayout(0, self.cfg.QK_WMMA_UNPACKED_LAYOUT),
             )[None, :]
         )
-        return gl.where(tile_offset < self.context_len + self.query_pos_qk + 1, S, float("-inf"))
+        return gl.where(
+            tile_offset < self.context_len + self.query_pos_qk + 1, S, float("-inf")
+        )
 
     @gluon.jit
     def apply_softcap(self, S):
@@ -2512,7 +2522,9 @@ def _unified_attention_gluon_kernel_3d(
                     scales_dtype=e4m3_dtype,
                 )
             else:
-                v = pgm.tdm_shared_load_v(wait_count=K_OPS + V_OPS + 1, buffer_id=buffer_id)
+                v = pgm.tdm_shared_load_v(
+                    wait_count=K_OPS + V_OPS + 1, buffer_id=buffer_id
+                )
                 v_scales = pgm.tdm_shared_load_v_scales(
                     wait_count=K_OPS + V_OPS, buffer_id=buffer_id
                 ).to(e4m3_dtype, bitcast=True)

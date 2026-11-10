@@ -892,7 +892,10 @@ def is_2d_gluon_available(params: _UAParams, backend: str):
                     and (
                         params.block_size == 128
                         # A8K4V8 (fp8 V) also runs 64-token pages
-                        or (params.block_size == 64 and params.v_cache_dtype != torch.uint8)
+                        or (
+                            params.block_size == 64
+                            and params.v_cache_dtype != torch.uint8
+                        )
                     )
                 )
             )
@@ -1480,7 +1483,8 @@ def _unified_attention_3d_gfx1250(
         # experiment knob: NVFP4 KV + BF16 PV processed in 2 head-dim halves
         HEAD_SIZE_SPLIT=(
             int(os.environ.get("AITER_UA_FP4_HEAD_SPLIT", "1"))
-            if params.v_cache_dtype == torch.uint8 and not params.force_fp8_pv_on_fp4_kv_cache
+            if params.v_cache_dtype == torch.uint8
+            and not params.force_fp8_pv_on_fp4_kv_cache
             else 1
         ),
         WARP_SIZE=WARP_SIZE,
