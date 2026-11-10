@@ -415,8 +415,8 @@ def compile_pa_decode_tile(
         ),
     ) + ("_dual" if traits.DUAL_GROUP else "")
 
-    @flyc.kernel(name=kernel_name, known_block_size=(traits.CTA_THREADS, 1, 1))
-    def pa_decode_tile_kernel(
+    @flyc.jit
+    def _pa_decode_tile_body(
         pmax_ptr: fx.Pointer,
         psum_ptr: fx.Pointer,
         pout_ptr: fx.Pointer,
@@ -541,6 +541,129 @@ def compile_pa_decode_tile(
             if start < end:
                 _run_task(fx.Int32(task[0]), start, end, fx.Int32(task[3]))
 
+    if architecture == "gfx950":
+        # Lead with what the task prologue reads first, so it fits the 14
+        # dwords that preload into user SGPRs: the task record, the page ids,
+        # Q, and pmax (reduce_info on one-partition plans). K/V and scale
+        # pointers are first used after the page ids arrive.
+        @flyc.kernel(name=kernel_name, known_block_size=(traits.CTA_THREADS, 1, 1))
+        def pa_decode_tile_kernel(
+            work_info_ptr: fx.Pointer,
+            block_tables_ptr: fx.Pointer,
+            query_ptr: fx.Pointer,
+            max_blocks_per_seq: fx.Int32,
+            num_sequences: fx.Int32,
+            stride_q_row: fx.Int32,
+            stride_q_head: fx.Int32,
+            pmax_ptr: fx.Pointer,
+            key_cache_ptr: fx.Pointer,
+            value_cache_ptr: fx.Pointer,
+            key_scale_ptr: fx.Pointer,
+            value_scale_ptr: fx.Pointer,
+            stride_ks_block: fx.Int32,
+            stride_ks_head: fx.Int32,
+            psum_ptr: fx.Pointer,
+            pout_ptr: fx.Pointer,
+        ):
+            _pa_decode_tile_body(
+                pmax_ptr,
+                psum_ptr,
+                pout_ptr,
+                query_ptr,
+                key_cache_ptr,
+                value_cache_ptr,
+                block_tables_ptr,
+                key_scale_ptr,
+                value_scale_ptr,
+                max_blocks_per_seq,
+                stride_ks_block,
+                stride_ks_head,
+                stride_q_row,
+                stride_q_head,
+                work_info_ptr,
+                num_sequences,
+            )
+
+        def _tile_args(
+            pmax,
+            psum,
+            pout,
+            query,
+            key_cache,
+            value_cache,
+            block_tables,
+            key_scale,
+            value_scale,
+            max_blocks_per_seq,
+            stride_ks_block,
+            stride_ks_head,
+            stride_q_row,
+            stride_q_head,
+            work_info,
+            num_seqs,
+        ):
+            return (
+                work_info,
+                block_tables,
+                query,
+                max_blocks_per_seq,
+                num_seqs,
+                stride_q_row,
+                stride_q_head,
+                pmax,
+                key_cache,
+                value_cache,
+                key_scale,
+                value_scale,
+                stride_ks_block,
+                stride_ks_head,
+                psum,
+                pout,
+            )
+
+    else:
+
+        @flyc.kernel(name=kernel_name, known_block_size=(traits.CTA_THREADS, 1, 1))
+        def pa_decode_tile_kernel(
+            pmax_ptr: fx.Pointer,
+            psum_ptr: fx.Pointer,
+            pout_ptr: fx.Pointer,
+            query_ptr: fx.Pointer,
+            key_cache_ptr: fx.Pointer,
+            value_cache_ptr: fx.Pointer,
+            block_tables_ptr: fx.Pointer,
+            key_scale_ptr: fx.Pointer,
+            value_scale_ptr: fx.Pointer,
+            max_blocks_per_seq: fx.Int32,
+            stride_ks_block: fx.Int32,
+            stride_ks_head: fx.Int32,
+            stride_q_row: fx.Int32,
+            stride_q_head: fx.Int32,
+            work_info_ptr: fx.Pointer,
+            num_sequences: fx.Int32,
+        ):
+            _pa_decode_tile_body(
+                pmax_ptr,
+                psum_ptr,
+                pout_ptr,
+                query_ptr,
+                key_cache_ptr,
+                value_cache_ptr,
+                block_tables_ptr,
+                key_scale_ptr,
+                value_scale_ptr,
+                max_blocks_per_seq,
+                stride_ks_block,
+                stride_ks_head,
+                stride_q_row,
+                stride_q_head,
+                work_info_ptr,
+                num_sequences,
+            )
+
+        def _tile_args(*args):
+            return args
+
     @flyc.jit
     def pa_decode_tile_launch(
         pmax: fx.Pointer,
@@ -566,34 +689,33 @@ def compile_pa_decode_tile(
         # Ambient contract permits FMAs; explicit per-op fastmath still wins.
         with CompilationContext.compile_hints({"fastmath": "contract"}):
             pa_decode_tile_kernel(
-                pmax,
-                psum,
-                pout,
-                query,
-                key_cache,
-                value_cache,
-                block_tables,
-                key_scale,
-                value_scale,
-                max_blocks_per_seq,
-                stride_ks_block,
-                stride_ks_head,
-                stride_q_row,
-                stride_q_head,
-                work_info,
-                num_seqs,
+                *_tile_args(
+                    pmax,
+                    psum,
+                    pout,
+                    query,
+                    key_cache,
+                    value_cache,
+                    block_tables,
+                    key_scale,
+                    value_scale,
+                    max_blocks_per_seq,
+                    stride_ks_block,
+                    stride_ks_head,
+                    stride_q_row,
+                    stride_q_head,
+                    work_info,
+                    num_seqs,
+                )
             ).launch(
                 grid=(work_capacity, num_kv_heads * traits.query_splits, 1),
                 block=(traits.CTA_THREADS, 1, 1),
                 stream=stream,
             )
 
-    if architecture == "gfx950" and (traits.kv_dtype == fx.BFloat16):
-        # The leading arguments preload into the free user SGPRs (the first
-        # seven pointers on gfx950), so the task skips a kernarg round trip.
-        # The count covers only the tile kernel's own leading arguments.
-        # Scaled caches stay unpreloaded: their scale pointers sit just past
-        # the preloaded prefix, and loading them alone costs another trip.
+    if architecture == "gfx950":
+        # The leading arguments preload into the free user SGPRs (14 dwords on
+        # gfx950), so the task skips a kernarg round trip.
         pa_decode_tile_launch.compile_hints["llvm_options"] = {
             "amdgpu-kernarg-preload": True,
             "amdgpu-kernarg-preload-count": 16,
