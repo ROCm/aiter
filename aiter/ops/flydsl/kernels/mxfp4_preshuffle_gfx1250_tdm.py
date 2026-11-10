@@ -33,7 +33,12 @@ from .mega_moe_gfx1250.tdm_gather_shim import (
     make_tensor_gather_descriptor,
     tensor_store_gather,
 )
-from .mega_moe_gfx1250.types import COMBINE_SCALE_BLOCK
+from .mega_moe_gfx1250.types import (
+    COMBINE_CHUNK,
+    COMBINE_SCALE_BLOCK,
+    COMBINE_SCALE_LINE,
+    combine_chunk_bytes,
+)
 from .quant_utils import (
     emit_amax_e8m0_native_scale,
     emit_cvt_scalef32_pk8_fp4_bf16,
@@ -52,7 +57,6 @@ def is_fx_set_register_available():
     return callable(getattr(fx, "set_register", None))
 
 
-TDM_DESCRIPTOR_VERSION = 1
 IGLP_PARAMS = {
     "a8w4": {
         "default": {"mma_group": 10, "mma_first_group": 10, "ds_first_n": 0},
@@ -103,15 +107,14 @@ SUPPORT_EXPLICIT_VGPR_PARTITION = bool(
     EXPLICIT_VGPR_PARTITION and is_fx_set_register_available()
 )
 
-# MXFP8 combine wire format (``ep_quant_bits``): a slot holds two planes, N
-# payload bytes followed by N/32 e8m0 scale bytes. The block is 32 elements,
-# fixed rather than tied to tile_n so the wire does not drift with the GEMM
-# tuning table.
+# MX combine wire format (``ep_quant_bits``): see mega_moe_gfx1250/types.py.
+# The block is 32 elements, fixed rather than tied to tile_n so the wire does
+# not drift with the GEMM tuning table.
 #
-# Both plane bases stay cache-line aligned -- N is a multiple of 128 and the slot
-# stride is a power of two -- and that must not slip: an earlier 272-byte chunk
-# pitch started every row mid-line and cost 123us/layer at 16k tokens/rank
-# despite moving 41% fewer bytes.
+# Every remote write must cover whole cache lines, and that must not slip: an
+# earlier 272-byte chunk pitch started every row mid-line and cost 123us/layer
+# at 16k tokens/rank despite moving 41% fewer bytes, and writing a tile row's
+# 8 scale bytes into a shared scale plane cost up to 7% end to end.
 EP_SCALE_BLOCK = COMBINE_SCALE_BLOCK
 # GEMM2 has no activation, so one acc holds 8 f32 -> 2 wn subtiles per lane give
 # 16 values, and the two kgrp halves merge into the full 32-element MX block.
@@ -131,8 +134,8 @@ def _pack_bytes_i32(byte_vals):
 
 
 # The staging loop emits one e8m0 per WN_PER_MX_BLOCK_EP subtiles of 16 columns
-# and the wire reads one per EP_SCALE_BLOCK columns; drift and the scale plane
-# silently describes the wrong columns.
+# and the wire reads one per EP_SCALE_BLOCK columns; drift and the scales
+# silently describe the wrong columns.
 assert WN_PER_MX_BLOCK_EP * 16 == EP_SCALE_BLOCK
 
 
@@ -321,52 +324,6 @@ def build_gemm_a8w4_tdm_task(
     sched_mma_group = iglp_params["mma_group"]
     sched_first_group = iglp_params["mma_first_group"]
     sched_ds_first = iglp_params["ds_first_n"]
-    cache_tag = (
-        K,
-        tile_m,
-        tile_n,
-        tile_k,
-        m_warp,
-        n_warp,
-        out_is_f16,
-        num_buffers,
-        a_is_fp4,
-        a_preshuffled,
-        n_experts,
-        stage1_act,
-        has_bias,
-        TDM_DESCRIPTOR_VERSION,
-        stage1_quant_out,
-        quant_wmma_rep,
-        cluster_n,
-        cluster_m,
-        DISABLE_CLUSTER_SYNC,
-        next_stage_on,
-        num_waves_per_tensor_tdm,
-        tdm_as_in_prologue,
-        tdm_b_th,
-        enable_ep_scatter,
-        ep_arena_handle,
-        ep_combine_input_offset,
-        ep_slot_stride_bytes,
-        ep_destination_stride,
-        ep_world_size,
-        sched_mma_group,
-        sched_first_group,
-        sched_ds_first,
-        SUPPORT_EXPLICIT_VGPR_PARTITION,
-        planar_lds_on,
-        interleaved_lds_load_on,
-        row_major_ascale,
-        a_row_stride_bytes,
-        a_scale_row_stride_bytes,
-        ep_quant_bits,
-        persistent_workers,
-        rolled_drain,
-        k_waves,
-        m_align,
-    )
-    _ = cache_tag
     if enable_ep_scatter:
         if stage1_act != 0:
             raise ValueError("enable_ep_scatter is gemm2-only (stage1_act must be 0)")
@@ -377,14 +334,14 @@ def build_gemm_a8w4_tdm_task(
     if ep_quant_bits:
         if not enable_ep_scatter:
             raise ValueError("ep_quant_bits requires enable_ep_scatter")
-        # A tile row must hold whole scale blocks, else its slice of the scale
-        # plane is not a whole number of bytes. 256 rather than EP_SCALE_BLOCK so
-        # each plane's slice also starts on a cache line: on the fp4 wire the
-        # payload row is tile_n/2 bytes, so only a multiple of 256 keeps that a
-        # multiple of 128. The tuning table only emits tile_n2 in {256, 512}, but
-        # env overrides (*_N2) bypass it.
-        if tile_n % 256 != 0:
-            raise ValueError(f"ep_quant_bits requires tile_n % 256 == 0, got {tile_n}")
+        # A tile row must be whole wire chunks, and a warp's columns must sit in
+        # one chunk for the staging offsets. The tuning table only emits tile_n2
+        # in {256, 512}, but env overrides (*_N2) bypass it.
+        if tile_n % COMBINE_CHUNK or COMBINE_CHUNK % (tile_n // n_warp):
+            raise ValueError(
+                f"ep_quant_bits requires tile_n and warp tiles aligned to "
+                f"{COMBINE_CHUNK} columns, got tile_n={tile_n}, n_warp={n_warp}"
+            )
         if (tile_n // n_warp // 16) % WN_PER_MX_BLOCK_EP != 0:
             raise ValueError(
                 "ep_quant_bits requires wmma_n_rep % "
@@ -470,21 +427,22 @@ def build_gemm_a8w4_tdm_task(
     # multiple of 32B.  Consecutive rows then rotate by four banks and spread a
     # wave32 b128 write uniformly to its intrinsic two-bank-cycle floor.
     # Ternaries, not if/else: @flyc.jit does not let branch-local names escape.
-    # Quantized rows are payload bytes, not bf16 elements, and their scale plane
-    # is staged in a second region sitting right behind the payload one.
+    # Quantized rows are wire bytes, scale lines included, staged exactly as the
+    # scatter sends them.
     def _lds_pitch(nbytes):
         p = ((nbytes + 15) // 16) * 16
         return p + (16 if p % 32 == 0 else 0)
 
-    C_ROW_BYTES = tile_n * ep_quant_bits // 8 if ep_quant_bits else tile_n * 2
-    EP_SCALE_ROW_BYTES = tile_n // EP_SCALE_BLOCK
+    EP_CHUNK_BYTES = combine_chunk_bytes(ep_quant_bits)
+    EP_CHUNK_PAYLOAD_BYTES = COMBINE_CHUNK * ep_quant_bits // 8
+    C_ROW_BYTES = (
+        tile_n // COMBINE_CHUNK * EP_CHUNK_BYTES if ep_quant_bits else tile_n * 2
+    )
     _lds_row_bytes = _lds_pitch(C_ROW_BYTES)
-    _lds_scale_row_bytes = _lds_pitch(EP_SCALE_ROW_BYTES) if ep_quant_bits else 0
-    _ep_scale_lds_off = tile_m * _lds_row_bytes
     c_lds_pad_elems = (_lds_row_bytes - C_ROW_BYTES) // 2 if enable_ep_scatter else 0
     store_pad = c_lds_pad_elems if enable_ep_scatter else 16
     C_STORE_B = (
-        ((_ep_scale_lds_off + tile_m * _lds_scale_row_bytes + 127) // 128) * 128
+        ((tile_m * _lds_row_bytes + 127) // 128) * 128
         if ep_quant_bits
         else ((tile_m * (tile_n + store_pad) * 2 + 127) // 128) * 128
     )
@@ -2305,7 +2263,11 @@ def build_gemm_a8w4_tdm_task(
                     for wm in range_constexpr(wmma_m_rep):
                         row_rel = wmb + wm * 16 + lane16
                         _wf = _wf_rows[wm]
-                        _row_byte = row_rel * _lds_row_bytes
+                        # Past the scale lines of the chunks before this warp's.
+                        _row_byte = (
+                            row_rel * _lds_row_bytes
+                            + wnb // COMBINE_CHUNK * COMBINE_SCALE_LINE
+                        )
                         _e8m0_blks = []
                         for mx_blk in range_constexpr(_n_mx_blks):
                             _vals = []
@@ -2364,15 +2326,17 @@ def build_gemm_a8w4_tdm_task(
                                         ),
                                     )
                         # Both kgrp lanes hold the same block scales; one stores.
-                        # This row's e8m0 bytes are contiguous -- block b sits at
-                        # wnb/32 + b -- so they go out as whole dwords instead of
-                        # one masked byte store per block. Each warp owns
-                        # warp_tile_n/32 bytes starting at a multiple of that, so
-                        # a dword store stays inside this warp's own run.
+                        # This warp's e8m0 bytes are contiguous in its chunk's
+                        # scale line -- block b sits at (wnb % 256)/32 + b -- so
+                        # they go out as whole dwords instead of one masked byte
+                        # store per block. Each warp owns warp_tile_n/32 bytes
+                        # starting at a multiple of that, so a dword store stays
+                        # inside this warp's own run.
                         _sc_byte = (
-                            row_rel * _lds_scale_row_bytes
-                            + wnb // EP_SCALE_BLOCK
-                            + _ep_scale_lds_off
+                            row_rel * _lds_row_bytes
+                            + wnb // COMBINE_CHUNK * EP_CHUNK_BYTES
+                            + EP_CHUNK_PAYLOAD_BYTES
+                            + wnb % COMBINE_CHUNK // EP_SCALE_BLOCK
                         )
                         if _is_kgrp0:
                             if const_expr(_e8m0_pack_dwords):
@@ -2461,8 +2425,7 @@ def build_gemm_a8w4_tdm_task(
                 # pe*K + slot over the single base lsa_ptr(0, off). perRankSize is
                 # measured in-kernel from the lsa_ptr stride. Each wave issues the
                 # gather-stores for its row groups, 8 rows per instruction.
-                # Quantized rows are addressed in bytes, so a 4-bit element just
-                # halves the row length; the scale plane rides a second store.
+                # Quantized rows are addressed in bytes, scale lines included.
                 elem_bytes = 1 if ep_quant_bits else 2
                 _row_elems = C_ROW_BYTES if ep_quant_bits else STORE_N
                 _lds_row_elems = _lds_row_bytes if ep_quant_bits else STORE_PITCH
@@ -2492,14 +2455,8 @@ def build_gemm_a8w4_tdm_task(
                     (_lds_row_elems, 1),
                 )
                 if const_expr(ep_quant_bits):
-                    # Byte column of this tile in the payload plane: one byte per
-                    # element on the fp8 wire, half that on fp4.
-                    _elem_div = 8 // ep_quant_bits
-                    _gboff = blk_n64 // _elem_div
-                    # The scale plane starts one payload plane into the slot; blk_n
-                    # is a multiple of tile_n, itself a multiple of the scale block,
-                    # so the tile's scale run starts whole.
-                    _gboff_s = n64 // _elem_div + blk_n64 // EP_SCALE_BLOCK
+                    # The tile's first chunk in the slot.
+                    _gboff = blk_n64 // COMBINE_CHUNK * EP_CHUNK_BYTES
                 else:
                     _gboff = blk_n * elem_bytes
                 _passes = scatter_passes
@@ -2552,27 +2509,6 @@ def build_gemm_a8w4_tdm_task(
                         global_byte_offset=_gboff,
                     )
                     tensor_store_gather(desc)
-                    if const_expr(ep_quant_bits):
-                        # Same rows and slot stride as the payload store; only the
-                        # plane base and the row width differ.
-                        desc_s = make_tensor_gather_descriptor(
-                            _comb_view,
-                            _lds_c,
-                            row_indices,
-                            row_width=_lds_scale_row_bytes,
-                            tensor_dim0=EP_SCALE_ROW_BYTES,
-                            tensor_dim1=_oob.ir_value(),
-                            stride=_stride_elems,
-                            elem_bytes=1,
-                            index_size=32,
-                            lds_byte_offset=fx.index_cast(
-                                T.index,
-                                fx.Int32(_ep_scale_lds_off)
-                                + base_row * fx.Int32(_lds_scale_row_bytes),
-                            ),
-                            global_byte_offset=_gboff_s,
-                        )
-                        tensor_store_gather(desc_s)
 
                 # Let every wave issue its own groups directly. This avoids
                 # cloning every descriptor behind a wave-selection branch.
