@@ -55,7 +55,7 @@ def compose_mha_fwd_variant_suffix_and_filter(
 
     filt = (
         "*"
-        + f"{dtype}*"
+        + f"_{dtype}*"
         + ("_logits*" if logits_positive else "_nlogits*")
         + ("_bias*" if has_bias else ("_alibi*" if has_alibi else "_nbias*"))
         + ("_mask*" if use_mask else "_nmask*")
