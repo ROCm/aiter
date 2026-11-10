@@ -1,4 +1,18 @@
 {
+ "batched_gemm_a8w8_mxscale": {
+  "fingerprint": "e7294cd3de718c0c",
+  "signature": "x:positional:Tensor, wo_a:positional:Tensor, x_scale:positional:Tensor, w_scale:positional:Tensor, dtype:positional:torch.dtype=dtypes.bf16, -> Tensor",
+  "source": "aiter/ops/batched_gemm_op_a8w8.py",
+  "supersedes": [],
+  "version": 1
+ },
+ "batched_gemm_a8w8_mxscale_bpreshuffle": {
+  "fingerprint": "e7294cd3de718c0c",
+  "signature": "x:positional:Tensor, wo_a:positional:Tensor, x_scale:positional:Tensor, w_scale:positional:Tensor, dtype:positional:torch.dtype=dtypes.bf16, -> Tensor",
+  "source": "aiter/ops/batched_gemm_op_a8w8.py",
+  "supersedes": [],
+  "version": 1
+ },
  "gemm_a8w8_blockscale": {
   "fingerprint": "47ec95c460883544",
   "signature": "XQ:positional:Tensor, WQ:positional:Tensor, x_scale:positional:Tensor, w_scale:positional:Tensor, dtype:positional:torch.dtype=dtypes.bf16, isBpreshuffled:positional:bool=False, split_k:positional:int | None=None, -> torch.Tensor",

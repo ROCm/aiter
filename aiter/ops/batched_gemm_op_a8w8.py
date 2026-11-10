@@ -17,6 +17,7 @@ from ..jit.core import (
 from ..jit.utils.chip_info import get_cu_num
 from ..jit.utils.chip_info import get_gfx_runtime as get_gfx
 from ..jit.utils.torch_guard import torch_compile_guard
+from ..plugin import route as _route
 from ..utility import dtypes
 from .gemm_op_common import mxscale_bmm_groups_of_block, mxscale_w_scale_block
 from .opus.policy import (
@@ -304,6 +305,7 @@ def _batched_gemm_a8w8_mxscale_fake(
 
 
 @torch_compile_guard(mutates_args=[], gen_fake=_batched_gemm_a8w8_mxscale_fake)
+@_route(op="batched_gemm_a8w8_mxscale", version=1)
 def batched_gemm_a8w8_mxscale(
     x: Tensor,
     wo_a: Tensor,
@@ -443,6 +445,7 @@ def _batched_gemm_a8w8_mxscale_bpreshuffle_impl(
 
 
 @torch_compile_guard(mutates_args=[], gen_fake=_batched_gemm_a8w8_mxscale_fake)
+@_route(op="batched_gemm_a8w8_mxscale_bpreshuffle", version=1)
 def batched_gemm_a8w8_mxscale_bpreshuffle(
     x: Tensor,
     wo_a: Tensor,
