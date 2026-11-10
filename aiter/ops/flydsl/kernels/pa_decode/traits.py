@@ -299,16 +299,18 @@ class PaDecodeSchedule:
                 # from L2). Split FP8 (to D128; D256 measured 0.93-1.05x) into
                 # single-M-tile CTAs while about three fit per CU, else in two
                 # while two fit; BF16 Q/P tiles twice the size split in two
-                # only while one fits per CU.
+                # only while one fits per CU. A sliding window bounds each
+                # task to a few tiles, so windowed MTP splits on busier grids:
+                # FP8 always into single M-tiles, BF16 while four fit per CU.
                 if kv_dtype == fx.BFloat16:
-                    if (
-                        query_length % 2 == 0
-                        and 2 * split_workgroups <= num_compute_units
+                    if query_length % 2 == 0 and 2 * split_workgroups <= (
+                        4 * num_compute_units
+                        if sliding_window > 0
+                        else num_compute_units
                     ):
                         query_splits = 2
-                elif (
-                    query_length % 4 == 0
-                    and 4 * split_workgroups <= 3 * num_compute_units
+                elif query_length % 4 == 0 and (
+                    sliding_window > 0 or 4 * split_workgroups <= 3 * num_compute_units
                 ):
                     query_splits = 4
                 elif query_length % 2 == 0 and split_workgroups <= num_compute_units:
