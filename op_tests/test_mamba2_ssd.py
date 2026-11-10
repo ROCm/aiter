@@ -11,7 +11,7 @@ import torch.nn.functional as F
 
 import aiter
 from aiter import dtypes
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.flydsl.mamba2_ssd import SUPPORTED_GFX, mamba2_chunk_forward_flydsl
 from aiter.test_common import (
     benchmark,
@@ -25,6 +25,8 @@ except ImportError:
     chunk_simple_gla = None
 
 torch.set_default_device("cuda")
+# Mismatching elements allowed per output, as in the other FlyDSL op tests.
+_TOL_ERR_RATIO = 1e-3
 
 
 def _ref_decay_cumsum(a, dt, chunk_size):
@@ -165,7 +167,7 @@ def test_mamba2_chunk_forward(
     # the output's magnitude on top of the base atol.
     out_atol = 2e-2 + _bf16_ulp(ref_out.abs().max().item())
 
-    ret = {"gfx": get_gfx()}
+    ret = {"gfx": get_gfx_runtime()}
     for name, fn in candidates.items():
         (out, state), us = run_perftest(fn)
         err = checkAllclose(
@@ -173,15 +175,20 @@ def test_mamba2_chunk_forward(
             out.to(dtypes.fp32),
             rtol=2e-2,
             atol=out_atol,
+            tol_err_ratio=_TOL_ERR_RATIO,
             msg=f"{name}: out",
         )
-        checkAllclose(
+        state_err = checkAllclose(
             ref_state,
             state.to(dtypes.fp32),
             rtol=1e-2,
             atol=1e-2,
+            tol_err_ratio=_TOL_ERR_RATIO,
             msg=f"{name}: final_state",
         )
+        if name == "flydsl":  # the optional fla baseline is reported, not gated
+            assert err <= _TOL_ERR_RATIO, f"out mismatch ratio {err:.3e}"
+            assert state_err <= _TOL_ERR_RATIO, f"state mismatch ratio {state_err:.3e}"
         ret[f"{name} us"] = us
         ret[f"{name} TFLOPS"] = flops / us / 1e6
         ret[f"{name} TB/s"] = nbytes / us / 1e6
@@ -190,9 +197,10 @@ def test_mamba2_chunk_forward(
 
 
 def main():
-    if get_gfx() not in SUPPORTED_GFX:
+    if get_gfx_runtime() not in SUPPORTED_GFX:
         aiter.logger.warning(
-            "mamba2_chunk_forward (FlyDSL) unsupported on %s; skipping", get_gfx()
+            "mamba2_chunk_forward (FlyDSL) unsupported on %s; skipping",
+            get_gfx_runtime(),
         )
         return
 

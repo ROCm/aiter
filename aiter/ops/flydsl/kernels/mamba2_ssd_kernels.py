@@ -45,6 +45,18 @@ from aiter.ops.flydsl.kernels.tensor_shim import buf_copy_load, ptr_buf_tensor
 
 WAVE = 32
 TILE = 16  # WMMA M = N = K
+MAX_THREADS = 1024  # per workgroup; compute_out runs one wave per 16 chunk tokens
+
+
+def fwd_pass_state_lds_bytes(rm, rn, ks):
+    """LDS of one fwd_pass_state block: transposed x / B slabs, weights, scale."""
+    sl = TILE * ks
+    return (TILE * rm + TILE * rn) * (sl + 8) * 2 + sl * 4 + 4
+
+
+def compute_out_lds_bytes(chunk_size, rp):
+    """LDS of one compute_out block: transposed x tile, decay and dt."""
+    return TILE * rp * (chunk_size + 8) * 2 + 2 * chunk_size * 4
 
 
 @dataclass(frozen=True)
@@ -220,6 +232,7 @@ def build_fwd_pass_state(
     W_OFF = B_OFF + BN * XS * 2
     SCALE_OFF = W_OFF + SL * 4
     LDS_TOTAL = SCALE_OFF + 4
+    assert LDS_TOTAL == fwd_pass_state_lds_bytes(rm, rn, ks)
 
     @fx.struct
     class SharedStorage:
@@ -444,6 +457,8 @@ def build_compute_out(
     DEC_OFF = X_OFF + BP * XS * 2
     DT_OFF = DEC_OFF + L * 4
     LDS_TOTAL = DT_OFF + L * 4
+    assert LDS_TOTAL == compute_out_lds_bytes(L, rp)
+    assert THREADS <= MAX_THREADS
 
     @fx.struct
     class SharedStorage:

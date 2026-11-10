@@ -21,13 +21,22 @@ import torch
 from flydsl.autotune import do_bench
 
 from aiter import logger
-from aiter.jit.utils.chip_info import get_cu_num, get_gfx
+from aiter.jit.utils.chip_info import (
+    get_cu_num,
+    get_gfx_runtime,
+    get_lds_capacity_bytes,
+)
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
 from .kernels.mamba2_ssd_kernels import (
+    MAX_THREADS,
+    TILE,
+    WAVE,
     build_chunk_cumsum,
     build_compute_out,
     build_fwd_pass_state,
+    compute_out_lds_bytes,
+    fwd_pass_state_lds_bytes,
 )
 
 # RDNA3 / RDNA3.5 and RDNA4: wave32 bf16 16x16x16 WMMA (see ``wmma_layout``).
@@ -49,27 +58,33 @@ _tuned = {}
 
 
 def _state_configs(P, N, L):
+    lds = get_lds_capacity_bytes(get_gfx_runtime())
     for rm, rn, ks in itertools.product(_TILE_REPEATS, _TILE_REPEATS, _TILE_REPEATS):
-        if P % (16 * rm) == 0 and N % (16 * rn) == 0 and L % (16 * ks) == 0:
-            yield {"rm": rm, "rn": rn, "ks": ks}
+        if P % (16 * rm) or N % (16 * rn) or L % (16 * ks):
+            continue
+        if fwd_pass_state_lds_bytes(rm, rn, ks) > lds:
+            continue
+        yield {"rm": rm, "rn": rn, "ks": ks}
 
 
-def _out_configs(P, N):
+def _out_configs(P, N, L):
     # Plain grid, or persistent at 1-2 blocks per CU;
     # the state-tile K loop runs 4 tiles per trip or fully unrolled.
+    lds = get_lds_capacity_bytes(get_gfx_runtime())
     nk = N // 16
     kus = sorted({nk} | ({4} if nk % 4 == 0 else set()))
     for rp, ku, (persistent, occupancy) in itertools.product(
         _TILE_REPEATS, kus, ((False, 0), (True, 1), (True, 2))
     ):
-        if P % (16 * rp) == 0:
-            yield {"rp": rp, "ku": ku, "persistent": persistent, "occupancy": occupancy}
+        if P % (16 * rp) or compute_out_lds_bytes(L, rp) > lds:
+            continue
+        yield {"rp": rp, "ku": ku, "persistent": persistent, "occupancy": occupancy}
 
 
 def default_config(head_size, state_size, chunk_size):
-    """Untuned fallback: widest tiles that divide the head and state sizes."""
+    """Untuned fallback: widest tiles that divide the sizes and fit in LDS."""
     state = list(_state_configs(head_size, state_size, chunk_size))[-1]
-    return {**state, **list(_out_configs(head_size, state_size))[-1]}
+    return {**state, **list(_out_configs(head_size, state_size, chunk_size))[-1]}
 
 
 @functools.cache
@@ -79,12 +94,12 @@ def _cumsum(H, L):
 
 @functools.cache
 def _state(H, G, P, N, L, rm, rn, ks):
-    return build_fwd_pass_state(get_gfx(), H, G, P, N, L, rm, rn, ks)
+    return build_fwd_pass_state(get_gfx_runtime(), H, G, P, N, L, rm, rn, ks)
 
 
 @functools.cache
 def _out(H, G, P, N, L, rp, ku, persistent):
-    return build_compute_out(get_gfx(), H, G, P, N, L, rp, ku, persistent)
+    return build_compute_out(get_gfx_runtime(), H, G, P, N, L, rp, ku, persistent)
 
 
 def _tuning_key(*args):
@@ -109,7 +124,7 @@ def _tuned_config(name, key, configs, launch, config):
         timed = []
         for cfg in configs:
             launch(cfg)  # compile outside the timed region
-            timed.append((do_bench(lambda: launch(cfg)), cfg))
+            timed.append((do_bench(lambda cfg=cfg: launch(cfg)), cfg))
         ms, best = min(timed, key=lambda t: t[0])
         logger.info(
             f"mamba2 {name}: {best} ({ms * 1e3:.1f} us, best of {len(timed)} configs)"
@@ -118,9 +133,47 @@ def _tuned_config(name, key, configs, launch, config):
     return _tuned[name, key]
 
 
-def _validate_chunk_size(num_tokens, chunk_size):
-    if chunk_size <= 0 or num_tokens % chunk_size != 0:
-        raise ValueError("num_tokens must be divisible by a positive chunk_size")
+# compute_out runs one wave per 16 tokens of a chunk.
+MAX_CHUNK_SIZE = MAX_THREADS // WAVE * TILE
+
+
+def _check_inputs(x, a, b, c, d, dt, init_state, chunk_size):
+    """Reject inputs the kernels would index out of bounds; see the contract."""
+    gfx = get_gfx_runtime()
+    if gfx not in SUPPORTED_GFX:
+        raise RuntimeError(f"mamba2 FlyDSL kernels support {SUPPORTED_GFX}; got {gfx}")
+    if x.dim() != 4 or b.dim() != 4:
+        raise ValueError(f"x and b must be 4-D, got {x.dim()}-D and {b.dim()}-D")
+    batch_size, num_tokens, num_heads, head_size = x.shape
+    num_groups, state_size = b.shape[2], b.shape[3]
+    expected = {
+        "b": (batch_size, num_tokens, num_groups, state_size),
+        "c": (batch_size, num_tokens, num_groups, state_size),
+        "dt": (batch_size, num_tokens, num_heads),
+        "a": (num_heads,),
+        "d": (num_heads,),
+        "init_state": (batch_size, num_heads, head_size, state_size),
+    }
+    given = {"b": b, "c": c, "dt": dt, "a": a, "d": d, "init_state": init_state}
+    for name, shape in expected.items():
+        if tuple(given[name].shape) != shape:
+            raise ValueError(
+                f"{name} must have shape {shape}, got {tuple(given[name].shape)}"
+            )
+    if not 0 < chunk_size <= MAX_CHUNK_SIZE or num_tokens % chunk_size:
+        raise ValueError(
+            f"chunk_size must be in (0, {MAX_CHUNK_SIZE}] and divide num_tokens"
+        )
+    if chunk_size % 16 or head_size % 16 or state_size % 16:
+        raise ValueError("chunk_size, head_size and state_size must be multiples of 16")
+    if num_heads % num_groups:
+        raise ValueError("num_heads must be a multiple of num_groups")
+    for t in (x, b, c, dt):
+        if t.dtype != torch.bfloat16 or not t.is_contiguous():
+            raise ValueError("x, b, c, dt must be contiguous bf16")
+    for t in (a, b, c, d, dt, init_state):
+        if t.device != x.device:
+            raise ValueError("all inputs must be on x's device")
 
 
 def _chunk_cumsum(a, dt, chunk_size, stream):
@@ -217,7 +270,7 @@ def _compute_out(x, b, c, d, dt_bht, decay_bht, hiddens, chunk_size, stream, con
             stream,
         )
 
-    configs = list(_out_configs(head_size, state_size))
+    configs = list(_out_configs(head_size, state_size, chunk_size))
     key = _tuning_key(x, b, chunk_size)
     launch(_tuned_config("compute_out", key, configs, launch, config))
     return out
@@ -228,19 +281,8 @@ def mamba2_chunk_forward_flydsl(
 ):
     """Return the output and fp32 final state; chunk-entry states are kept in
     c.dtype."""
-    if get_gfx() not in SUPPORTED_GFX:
-        raise RuntimeError(
-            f"mamba2_chunk_forward_flydsl supports {SUPPORTED_GFX}; got {get_gfx()}"
-        )
-    _validate_chunk_size(x.shape[1], chunk_size)
+    _check_inputs(x, a, b, c, d, dt, init_state, chunk_size)
     head_size, state_size = x.shape[3], b.shape[3]
-    if chunk_size % 16 or head_size % 16 or state_size % 16:
-        raise ValueError("chunk_size, head_size and state_size must be multiples of 16")
-    if x.shape[2] % b.shape[2]:
-        raise ValueError("num_heads must be a multiple of num_groups")
-    for t in (x, b, c, dt):
-        if t.dtype != torch.bfloat16 or not t.is_contiguous():
-            raise ValueError("x, b, c, dt must be contiguous bf16")
     if config is not None:
         config = {**default_config(head_size, state_size, chunk_size), **config}
 
