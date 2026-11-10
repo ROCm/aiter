@@ -155,8 +155,9 @@ class Eligibility:
     """Which candidates the A16W16 tuner would offer for (M, N, K), bf16 in and out, no bias.
 
     FlyDSL: the tuner's config pruner and parameter checks in closed form over the fixed
-    list; ASM: _get_asm_tasks' alignment, split-K, subK and grid rules; Opus: the tuner's
-    per-kernel helpers; skinny: is_skinny_default_shape; torch and Triton: always.
+    list; ASM: _get_asm_tasks' alignment, split-K, subK and grid rules plus the launch's
+    N % tileN; Opus: the tuner's per-kernel helpers, limited to the compiled kids; skinny:
+    is_skinny_default_shape; torch and Triton: always.
     """
 
     def __init__(self, cands, cu_num, props, is_skinny):
@@ -299,7 +300,8 @@ class Eligibility:
                 else:
                     lo = hi = 1
                 grid_ok = ks == 1 or _ceil_div(n, tile_n) * _ceil_div(m, tile_m) <= self.asm_grid
-                out[i] = lo <= ks <= hi and k / ks >= subk and grid_ok
+                # The launch rejects N % tileN != 0; the tuner checks only N % 64.
+                out[i] = lo <= ks <= hi and k / ks >= subk and grid_ok and n % tile_n == 0
         tm = self.opus_tm
         if self.opus:
             kids = tm.candidate_kids_for_shape(m, n, k, False, self.cu)
@@ -335,10 +337,11 @@ def _opus_built_kids():
     """Kids compiled into the installed Opus module: the subset-compile sidecar when its
     receipt matches the .so, else the arch's default compile floor (always built). A tuned
     row's kid is compiled because the build reads the tuned CSVs; a selector pick is not."""
+    from opus_gemm_common import _opus_sidecar_path, default_compiled_kids_for_arch
+
     from aiter.jit import core
     from aiter.jit.utils.chip_info import get_gfx
     from aiter.jit.utils.jit_cache import compiled_kids_are_current
-    from opus_gemm_common import _opus_sidecar_path, default_compiled_kids_for_arch
 
     sidecar = _opus_sidecar_path()
     artifact = os.path.join(core.get_user_jit_dir(), "module_deepgemm_opus.so")
@@ -453,8 +456,8 @@ class PickCache:
 
     The first line stamps what a pick depends on; a file with another stamp is emptied."""
 
-    COLS = ["gfx", "cu_num", "M", "N", "K", "dtype", "otype", "pick", "rank", "eligible",
-            "timed", "check", "timer", "timed_us"]
+    COLS = ("gfx", "cu_num", "M", "N", "K", "dtype", "otype", "pick", "rank", "eligible",
+            "timed", "check", "timer", "timed_us")
 
     def __init__(self, path, stamp):
         self.path, self.rows = path, {}
