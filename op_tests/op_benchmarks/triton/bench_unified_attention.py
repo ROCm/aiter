@@ -86,13 +86,9 @@ def make_inputs(
     )
 
     max_num_blocks_per_seq = (max_kv_len + block_size - 1) // block_size
-    block_tables = torch.randint(
-        0,
-        num_blocks,
-        (num_seqs, max_num_blocks_per_seq),
-        dtype=torch.int32,
-        device="cuda",
-    )
+    block_tables = torch.randperm(
+        num_seqs * max_num_blocks_per_seq, dtype=torch.int32, device="cuda"
+    ).reshape(num_seqs, max_num_blocks_per_seq)
     cu_query_lens = torch.tensor(
         [0] + query_lens,
         dtype=torch.int32,
@@ -254,10 +250,7 @@ def run_benchmark(custom, args):
 
         block_size = args.block_size if args.block_size else 512
         max_num_blocks_per_seq = (seqlens_k.max().item() + block_size - 1) // block_size
-        min_required_blocks = BATCH * max_num_blocks_per_seq
-        num_blocks = (
-            args.num_blocks if args.num_blocks else max(min_required_blocks * 4, 2048)
-        )
+        num_blocks = max(BATCH * max_num_blocks_per_seq, 2048)
 
         inputs = make_inputs(
             seq_lens=list(zip(seqlens_q.tolist(), seqlens_k.tolist())),
@@ -314,8 +307,14 @@ def run_benchmark(custom, args):
                 v_descale=inputs["v_descale"],
                 output_scale=inputs["out_scale"],
                 shuffled_kv_cache=args.shuffled_kv_cache,
+                equal_seqlen_q=args.equal_seqlen_q,
                 backend=args.backend,
             )
+
+        if args.equal_seqlen_q:
+            assert (
+                seqlens_q == seqlens_q[0]
+            ).all(), "-equal_seqlen_q needs equal query lengths"
 
         ms = triton.testing.do_bench_cudagraph(fn)
 
@@ -433,9 +432,6 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("-d", type=int, default=0, help="Q/K head size")
     parser.add_argument("-dv", type=int, default=0, help="V head size (defaults to -d)")
-    parser.add_argument(
-        "-num_blocks", type=int, default=0, help="KV cache blocks (0=auto)"
-    )
     parser.add_argument("-block_size", type=int, default=0, help="KV cache block size")
     parser.add_argument(
         "-test",
@@ -448,6 +444,13 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         default=False,
         help="Use equal sequence lengths (no varlen); default is random varlen",
+    )
+    parser.add_argument(
+        "-equal_seqlen_q",
+        action="store_true",
+        default=False,
+        help="Tell unified_attention every seq has the same query length "
+        "(spec-decode verify); needs -equal_seqlens",
     )
     parser.add_argument(
         "-fp8",

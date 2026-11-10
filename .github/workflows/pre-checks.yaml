@@ -25,6 +25,28 @@ jobs:
         if: github.ref == 'refs/heads/main'
         run: echo "Skipping dependency check on main branch, considered success."
 
+  plugin-interface:
+    name: Kernel Provider Interface
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Set up Python environment
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip3 install pytest==8.3.4
+      - name: Run the kernel provider interface tests
+        # RFC #7240 asks for CPU-only handshake validation among the checks
+        # that block every AITER PR. These run here, on a hosted runner,
+        # without a ROCm build and without queueing for a GPU: aiter.plugin
+        # imports nothing but the standard library, and tests/conftest.py
+        # loads it directly when the full package is not built. That property
+        # is what makes this gate possible, so this job is also what protects
+        # it -- a third-party import in aiter/plugin turns this red.
+        run: python3 -m pytest -q tests/test_plugin.py tests/test_plugin_contracts.py tests/test_plugin_discovery.py tests/test_plugin_overhead.py
+
   black:
     name: Check Code Style with Black
     runs-on: ubuntu-latest
