@@ -10,7 +10,7 @@ introduced it) and the tensors' dtypes carry the precision, so a new precision o
 layout is a new dtype case, not a new entry.
 
 * :func:`mla_sparse_prefill`     -- unscaled rows (bf16/fp16): triton on gfx950 for
-  sink-free bf16 calls with H == 32, one source and enough query rows, else opus.
+  sink-free bf16 calls with H == 32 or 64, one source and enough query rows, else opus.
 * :func:`mla_sparse_prefill_v4`  -- v4: NoPE with its E8M0 scales in the row, plus bf16
   RoPE (NoPE fp8): asm on gfx1250 with H == 128 (opus if it declines), else opus.
 * :func:`mla_sparse_prefill_v41` -- v4.1: rows with separate ``[*, 16]`` E8M0 scales
@@ -22,6 +22,7 @@ a bad argument raises ValueError.
 """
 
 import functools
+import importlib
 import math
 from typing import NamedTuple
 
@@ -561,19 +562,26 @@ def _opus_sparse_prefill_v41(
 # triton (gfx950)
 # ---------------------------------------------------------------------------
 
-# The head count of pa_prefill_sparse's gfx950 single-pass kernel.
-_TRITON_HEADS = 32
+
+@functools.cache
+def _pa_prefill_sparse_module():
+    """pa_prefill_sparse's module, or the ImportError that kept it from loading
+    (its gluon kernels need a Triton with gluon), logged once."""
+    try:
+        return importlib.import_module(
+            ".triton.attention.pa_prefill_sparse", __package__
+        )
+    except ImportError as e:
+        logger.info(f"mla_sparse_prefill: the triton backend is unavailable: {e}")
+        return e
 
 
 def _triton_unsupported(q, unified_kv, kv_indices_extend, out, num_kv_splits):
-    """Why the triton backend cannot serve the call, or None."""
+    """Why the triton backend cannot serve the call, or None: its own contract,
+    then what pa_prefill_sparse's single-pass kernel serves."""
     gfx = get_gfx_runtime()
     if gfx != "gfx950":
         return f"serves gfx950 only, got {gfx}"
-    if q.dtype != torch.bfloat16 or unified_kv.dtype != torch.bfloat16:
-        return f"needs bf16 q and unified_kv, got {q.dtype} and {unified_kv.dtype}"
-    if q.size(1) != _TRITON_HEADS or q.size(2) != 512:
-        return f"needs H={_TRITON_HEADS} and D=512, got H={q.size(1)} D={q.size(2)}"
     if kv_indices_extend.numel():
         return "reads unified_kv only: kv_indices_extend must be empty"
     if num_kv_splits not in (None, 1):
@@ -582,19 +590,21 @@ def _triton_unsupported(q, unified_kv, kv_indices_extend, out, num_kv_splits):
         out.shape != q.shape or out.dtype != q.dtype or not out.is_contiguous()
     ):
         return "needs out None or contiguous with q's shape and dtype"
-    return None
+    pa = _pa_prefill_sparse_module()
+    if isinstance(pa, ImportError):
+        return f"cannot import pa_prefill_sparse: {pa}"
+    return pa._single_pass_unsupported(q, unified_kv, has_invalid=False)
 
 
 def _use_triton(q, unified_kv, kv_indices_extend, attn_sink, out, num_kv_splits):
-    """backend=None takes triton where the single-pass kernel serves a call
-    without a sink: H=32 and at least the kernel's MIN_TOKENS query rows."""
-    if attn_sink is not None or _triton_unsupported(
-        q, unified_kv, kv_indices_extend, out, num_kv_splits
-    ):
-        return False
-    from .triton.attention.pa_prefill_sparse import _use_single_pass
-
-    return _use_single_pass(q, unified_kv, has_invalid=False)
+    """backend=None takes triton for a call it serves without a sink and with at
+    least the single-pass kernel's MIN_TOKENS query rows."""
+    return (
+        attn_sink is None
+        and _triton_unsupported(q, unified_kv, kv_indices_extend, out, num_kv_splits)
+        is None
+        and q.size(0) >= _pa_prefill_sparse_module()._single_pass_config()["MIN_TOKENS"]
+    )
 
 
 @functools.cache
@@ -616,10 +626,8 @@ def _triton_sparse_prefill(
     reason = _triton_unsupported(q, unified_kv, kv_indices_extend, out, num_kv_splits)
     if reason is not None:
         raise RuntimeError(f"the triton backend {reason}")
-    from .triton.attention.pa_prefill_sparse import pa_prefill_sparse
-
     _log_triton()
-    return pa_prefill_sparse(
+    return _pa_prefill_sparse_module().pa_prefill_sparse(
         q,
         unified_kv,
         kv_indices_prefix,
@@ -701,9 +709,12 @@ def mla_sparse_prefill(
         token, head and key counts.
       backend:           ``"opus"``, ``"triton"`` or ``None``. ``"triton"`` is
         :func:`aiter.ops.triton.attention.pa_prefill_sparse.pa_prefill_sparse`
-        on gfx950: bf16, H = 32, an empty ``kv_indices_extend``, no split-K and
-        ``out`` ``None`` or contiguous. ``None`` takes it for such calls without
-        a sink and with enough query rows for its single-pass kernel, else opus.
+        on gfx950: bf16, H = 32 or 64, a 2-D ``unified_kv``, unit inner strides
+        on ``q`` and ``unified_kv``, an empty ``kv_indices_extend``, no split-K
+        and ``out`` ``None`` or contiguous; other calls raise RuntimeError.
+        ``None`` takes it for such calls without a sink and with enough query
+        rows for its single-pass kernel, else opus, which it also takes where
+        ``pa_prefill_sparse`` cannot be imported.
 
     Returns:
       ``out``.
