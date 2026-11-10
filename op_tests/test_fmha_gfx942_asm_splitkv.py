@@ -126,7 +126,20 @@ def _case(sq, sk, hq):
     return q, k, v, scale, ref_out, ref_lse
 
 
-def _v3_fwd(q, k, v, cu_q, cu_k, scale, num_splits, return_lse, out=None, causal=False):
+def _v3_fwd(
+    q,
+    k,
+    v,
+    cu_q,
+    cu_k,
+    scale,
+    num_splits,
+    return_lse,
+    out=None,
+    causal=False,
+    cu_q_padded=None,
+    cu_k_padded=None,
+):
     """Full fmha_v3_varlen_fwd entry: caller args reach the impl, including out=."""
     if out is None:
         out = torch.empty(q.shape[0], q.shape[1], HD_V, dtype=q.dtype, device=q.device)
@@ -151,6 +164,8 @@ def _v3_fwd(q, k, v, cu_q, cu_k, scale, num_splits, return_lse, out=None, causal
         1,
         out=out,
         num_splits=num_splits,
+        cu_seqlens_q_padded=cu_q_padded,
+        cu_seqlens_k_padded=cu_k_padded,
     )
 
 
@@ -421,6 +436,39 @@ def _check_non_lse():
     )
 
 
+def _check_empty_logical_k_with_nonempty_buffer():
+    sq, sk_buffer, hq, num_splits = 129, 8192, 4, 3
+    q, k, v, cu_q, _, scale = _inputs(sq, sk_buffer, hq)
+    cu_k = torch.tensor([0, 0], dtype=torch.int32)
+    ref_out, ref_lse = run_torch(q, k[:0], v[:0], scale)
+    out, lse, _, _ = _v3_fwd(q, k, v, cu_q, cu_k, scale, num_splits, True)
+    assert torch.equal(out, ref_out), "empty logical K must produce zero output"
+    assert torch.equal(lse, ref_lse), "empty logical K must produce +inf LSE"
+
+
+def _check_forced_split_padded_cu_seqlens_rejected():
+    q, k, v, cu_q, cu_k, scale = _inputs(129, 2048, 4)
+    for cu_q_padded, cu_k_padded in ((cu_q, None), (None, cu_k)):
+        try:
+            _v3_fwd(
+                q,
+                k,
+                v,
+                cu_q,
+                cu_k,
+                scale,
+                3,
+                False,
+                cu_q_padded=cu_q_padded,
+                cu_k_padded=cu_k_padded,
+            )
+        except RuntimeError as err:
+            if "incompatible with this input" not in str(err):
+                raise
+        else:
+            raise AssertionError("forced split with padded cu_seqlens should raise")
+
+
 def _check_ragged_cu_seqlens_k():
     """Host splits on buffer length; kernel clamps to cu_seqlens_k.
 
@@ -533,6 +581,8 @@ def main():
     _check_forced_split_writes_out()
     _check_forced_split_causal_rejected()
     _check_non_lse()
+    _check_empty_logical_k_with_nonempty_buffer()
+    _check_forced_split_padded_cu_seqlens_rejected()
     _check_ragged_cu_seqlens_k()
     _check_compile_outputs()
     _check_cuda_graph()

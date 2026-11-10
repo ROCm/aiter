@@ -39,6 +39,7 @@ __global__ __launch_bounds__(kCombineBlock) void fmha_fwd_v3_splitkv_combine_ker
     const int64_t lse_index     = static_cast<int64_t>(head) * seqlen_q + token;
 
     float weights[NumSplits];
+    int all_empty = 0;
     if(lane == 0)
     {
         float lse_max = partial_lse[lse_index];
@@ -46,30 +47,49 @@ __global__ __launch_bounds__(kCombineBlock) void fmha_fwd_v3_splitkv_combine_ker
         for(int split = 1; split < NumSplits; ++split)
             lse_max = fmaxf(lse_max, partial_lse[split * lse_plane + lse_index]);
 
-        float denominator = 0.0f;
-#pragma unroll
-        for(int split = 0; split < NumSplits; ++split)
+        all_empty = lse_max == -INFINITY;
+        if(all_empty)
         {
-            weights[split] = expf(partial_lse[split * lse_plane + lse_index] - lse_max);
-            denominator += weights[split];
+            if(lse_out != nullptr)
+                lse_out[lse_index] = INFINITY;
         }
-        denominator         = fmaxf(denominator, 1.0e-20f);
-        const float inverse = 1.0f / denominator;
+        else
+        {
+            float denominator = 0.0f;
 #pragma unroll
-        for(int split = 0; split < NumSplits; ++split)
-            weights[split] *= inverse;
+            for(int split = 0; split < NumSplits; ++split)
+            {
+                weights[split] =
+                    expf(partial_lse[split * lse_plane + lse_index] - lse_max);
+                denominator += weights[split];
+            }
+            denominator         = fmaxf(denominator, 1.0e-20f);
+            const float inverse = 1.0f / denominator;
+#pragma unroll
+            for(int split = 0; split < NumSplits; ++split)
+                weights[split] *= inverse;
 
-        if(lse_out != nullptr)
-            lse_out[lse_index] = lse_max + logf(denominator);
+            if(lse_out != nullptr)
+                lse_out[lse_index] = lse_max + logf(denominator);
+        }
+    }
+
+    all_empty = __shfl(all_empty, 0);
+
+    const int64_t partial_index = static_cast<int64_t>(row) * kValueDim;
+    const int64_t out_index     = static_cast<int64_t>(token) * out_token_stride +
+                              static_cast<int64_t>(head) * out_head_stride;
+    if(all_empty)
+    {
+        for(int value = lane; value < kValueDim; value += kWaveSize)
+            out[out_index + value] = hip_bfloat16(0.0f);
+        return;
     }
 
 #pragma unroll
     for(int split = 0; split < NumSplits; ++split)
         weights[split] = __shfl(weights[split], 0);
 
-    const int64_t partial_index = static_cast<int64_t>(row) * kValueDim;
-    const int64_t out_index     = static_cast<int64_t>(token) * out_token_stride +
-                              static_cast<int64_t>(head) * out_head_stride;
     for(int value = lane; value < kValueDim; value += kWaveSize)
     {
         float result = 0.0f;
