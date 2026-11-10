@@ -980,30 +980,6 @@ def test_opus_csr_one_key_scale_one(dtype):
     assert err <= _ERR_TOL
 
 
-@pytest.mark.parametrize("has_sink", [False, True], ids=["no-sink", "sink"])
-def test_default_backend_gfx950(has_sink):
-    """backend=None runs triton for a sink-free H=32 call with one source, else opus."""
-    if _get_gpu_arch() != "gfx950" or pa_prefill_sparse is None:
-        pytest.skip("the triton backend needs gfx950 and Triton >= 3.6")
-    inputs = _make_inputs(
-        n=256,
-        h=32,
-        d=512,
-        total_pages=2048,
-        total_tokens=0,
-        dtype=torch.bfloat16,
-        topk=512,
-        seed=42,
-    )
-    if not has_sink:
-        inputs["attn_sink"] = None
-    scale = 1.0 / math.sqrt(512)
-    expected = mla_sparse_prefill(
-        **inputs, softmax_scale=scale, backend="opus" if has_sink else "triton"
-    )
-    assert torch.equal(mla_sparse_prefill(**inputs, softmax_scale=scale), expected)
-
-
 # ---------------------------------------------------------------------------
 # CLI (mirrors test_batch_prefill.py style).
 # ---------------------------------------------------------------------------

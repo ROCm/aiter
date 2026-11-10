@@ -592,8 +592,10 @@ def _use_triton(q, unified_kv, kv_indices_extend, attn_sink, out, num_kv_splits)
         q, unified_kv, kv_indices_extend, out, num_kv_splits
     ):
         return False
-    from .triton.attention.pa_prefill_sparse import _use_single_pass
-
+    try:
+        from .triton.attention.pa_prefill_sparse import _use_single_pass
+    except ImportError:  # its gluon kernels need Triton >= 3.6
+        return False
     return _use_single_pass(q, unified_kv, has_invalid=False)
 
 
@@ -616,8 +618,19 @@ def _triton_sparse_prefill(
     reason = _triton_unsupported(q, unified_kv, kv_indices_extend, out, num_kv_splits)
     if reason is not None:
         raise RuntimeError(f"the triton backend {reason}")
-    from .triton.attention.pa_prefill_sparse import pa_prefill_sparse
+    from .triton.attention.pa_prefill_sparse import (
+        _single_pass_config,
+        _use_single_pass,
+        pa_prefill_sparse,
+    )
 
+    if not _use_single_pass(q, unified_kv, has_invalid=False):
+        # Else pa_prefill_sparse would hand the call to mla_gluon, which is not
+        # the kernel this backend names.
+        raise RuntimeError(
+            "the triton backend needs unit inner strides and at least "
+            f"{_single_pass_config()['MIN_TOKENS']} query rows"
+        )
     _log_triton()
     return pa_prefill_sparse(
         q,
@@ -701,9 +714,10 @@ def mla_sparse_prefill(
         token, head and key counts.
       backend:           ``"opus"``, ``"triton"`` or ``None``. ``"triton"`` is
         :func:`aiter.ops.triton.attention.pa_prefill_sparse.pa_prefill_sparse`
-        on gfx950: bf16, H = 32, an empty ``kv_indices_extend``, no split-K and
-        ``out`` ``None`` or contiguous. ``None`` takes it for such calls without
-        a sink and with enough query rows for its single-pass kernel, else opus.
+        on gfx950: bf16, H = 32, an empty ``kv_indices_extend``, no split-K,
+        ``out`` ``None`` or contiguous, unit inner strides and at least its
+        single-pass kernel's ``MIN_TOKENS`` query rows (else it raises).
+        ``None`` takes it for such calls without a sink, else opus.
 
     Returns:
       ``out``.
