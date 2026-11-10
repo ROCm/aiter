@@ -63,7 +63,6 @@ from flydsl.expr import const_expr, gpu, range_constexpr
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
 
-from .pa_decode import implementation_cache_tag
 from .pa_decode.context import PaDecodeContext
 from .pa_decode.op_merge import (
     CLUSTER_PARTITIONS,
@@ -302,7 +301,6 @@ def compile_pa_decode_tile(
     traits = PaDecodeTraits.create(schedule)
     # As in fmha_gfx950, expose scalar specialization data to FlyDSL's closure
     # cache walker: it cannot inspect the fields of a captured traits object.
-    _pa_decode_cache_tag = (traits.cache_key, implementation_cache_tag())
 
     @fx.struct
     class SharedStorage:
@@ -331,7 +329,6 @@ def compile_pa_decode_tile(
         planned_end: fx.Int32,
         planned_context: fx.Int32,
     ):
-        _ = _pa_decode_cache_tag
         ctx = PaDecodeContext(
             traits,
             SharedStorage,
@@ -478,7 +475,6 @@ def compile_pa_decode_tile(
         work_capacity: fx.Int32,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
-        _ = _pa_decode_cache_tag
         # Ambient contract permits FMAs; explicit per-op fastmath still wins.
         with CompilationContext.compile_hints({"fastmath": "contract"}):
             pa_decode_tile_kernel(
@@ -594,7 +590,6 @@ def compile_gfx1250_pa_decode(
         )
     if t in _GFX1250_PA_DECODE_CACHE:
         return _GFX1250_PA_DECODE_CACHE[t]
-    tag = ("gfx1250", tuple(t.__dict__.values()), implementation_cache_tag())
 
     @fx.struct
     class SharedStorage:
@@ -643,7 +638,6 @@ def compile_gfx1250_pa_decode(
         output: fx.Pointer,
         counters: fx.Pointer,
     ):
-        _ = tag
 
         def zero_output(seq, dst):
             # Empty sequences have no attention mass; clear this CTA's rows.
@@ -787,7 +781,6 @@ def compile_gfx1250_pa_decode(
         counters: fx.Pointer,
         stream: fx.Stream,
     ):
-        _ = tag
         grid_x = capacity
         if const_expr(t.direct_output):
             grid_x = sequences
