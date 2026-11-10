@@ -15,6 +15,7 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 
 from ..jit.core import compile_ops
 from ..jit.utils.chip_info import get_cu_num, get_gfx
+from ..plugin import route as _route
 from ..utility import dtypes, fp4_utils
 from ..utility import mx_types as _mx_types
 from ..utility.mx_types import (
@@ -61,6 +62,7 @@ def get_dtype_max(dtype):
     return dtypeMax
 
 
+@_route(op="pertoken_quant", version=1)
 def pertoken_quant(
     x,
     scale=None,
@@ -850,6 +852,10 @@ def dynamic_per_group_scaled_quant(
     scale-load swizzle when ``group_size == 32``, and a plain transpose
     (``(rows, scaleN) -> (scaleN, rows)`` byte layout) for other group
     sizes.
+
+    For MXFP8 (fp8 output, e8m0 scales), NaN elements stay NaN and do not
+    affect the scale. A group holding an Inf gets scale 2^127 (0xFE): its Inf
+    becomes an FP8 NaN and its finite elements are scaled as usual.
 
     Only ``group_size`` in {32, 64, 128} is supported.
 

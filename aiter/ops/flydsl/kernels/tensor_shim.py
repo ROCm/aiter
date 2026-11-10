@@ -387,6 +387,56 @@ def get_dtype_str(dtype):
         return "bf16"
 
 
+# torch dtype -> FlyDSL element type. float4_e2m1fn_x2 is a byte of two E2M1 values,
+# as Float4E2M1FNx2; dtypes the installed torch or FlyDSL lacks are skipped.
+_TORCH_TO_FX_DTYPE = {
+    torch.float64: fx.Float64,
+    torch.float32: fx.Float32,
+    torch.float16: fx.Float16,
+    torch.bfloat16: fx.BFloat16,
+    torch.bool: fx.Boolean,
+    torch.int8: fx.Int8,
+    torch.uint8: fx.Uint8,
+    torch.int16: fx.Int16,
+    torch.int32: fx.Int32,
+    torch.int64: fx.Int64,
+}
+for _torch_name, _fx_name in (
+    ("float8_e4m3fn", "Float8E4M3FN"),
+    ("float8_e4m3fnuz", "Float8E4M3FNUZ"),
+    ("float8_e5m2", "Float8E5M2"),
+    ("float8_e5m2fnuz", "Float8E5M2FNUZ"),
+    ("float8_e8m0fnu", "Float8E8M0FNU"),
+    ("float4_e2m1fn_x2", "Float4E2M1FNx2"),
+):
+    if hasattr(torch, _torch_name) and hasattr(fx, _fx_name):
+        _TORCH_TO_FX_DTYPE[getattr(torch, _torch_name)] = getattr(fx, _fx_name)
+del _torch_name, _fx_name
+_FX_TO_TORCH_DTYPE = {v: k for k, v in _TORCH_TO_FX_DTYPE.items()}
+
+
+def torch_to_fx_dtype(dtype):
+    """FlyDSL element type of a torch dtype.
+
+    Raises TypeError if ``dtype`` is not a ``torch.dtype`` and ValueError if
+    FlyDSL has no element type for it.
+    """
+    if not isinstance(dtype, torch.dtype):
+        raise TypeError(f"expected a torch.dtype, got {dtype!r}")
+    try:
+        return _TORCH_TO_FX_DTYPE[dtype]
+    except KeyError:
+        raise ValueError(f"no FlyDSL element type for {dtype}") from None
+
+
+def fx_to_torch_dtype(dtype):
+    """torch dtype of a FlyDSL element type, the inverse of ``torch_to_fx_dtype``."""
+    try:
+        return _FX_TO_TORCH_DTYPE[dtype]
+    except KeyError:
+        raise ValueError(f"no torch dtype for {dtype}") from None
+
+
 class TensorView:
     def __init__(self, dtype, shape, stride, base_offset, load_impl, store_impl):
         self.dtype = dtype
