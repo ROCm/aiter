@@ -1,0 +1,7 @@
+{
+    "any": {
+        "BLOCKS": 256,
+        "LAG": 2,
+        "num_warps": 16
+    }
+}
