@@ -104,7 +104,7 @@ class Case:
 )
 @pytest.mark.parametrize("causal", [False, True])
 def test_mha_mxfp8(b, hq, hk, sq, sk, d, causal, device="cuda"):
-    if get_arch() != "gfx1250":
+    if get_arch() not in ("gfx1250", "gfx1250-strict"):
         pytest.skip("Only supported on gfx1250")
     if causal and sq > sk:
         pytest.skip("Causal requires seqlen_k >= seqlen_q")

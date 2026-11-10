@@ -192,13 +192,13 @@ def test_op(
     device="cuda",
 ):
 
-    if get_arch() != "gfx950" and get_arch() != "gfx1250":
+    if get_arch() not in ("gfx950", "gfx1250", "gfx1250-strict"):
         pytest.skip("Kernel not supported on this GPU.")
 
-    if backend == "gluon" and get_arch() != "gfx1250":
+    if backend == "gluon" and get_arch() not in ("gfx1250", "gfx1250-strict"):
         pytest.skip(f"Gluon backend requires gfx1250, got {get_arch()}.")
 
-    if preshuffled and get_arch() != "gfx1250":
+    if preshuffled and get_arch() not in ("gfx1250", "gfx1250-strict"):
         pytest.skip("Preshuffled weights are only supported on gfx1250.")
 
     if preshuffled and backend == "triton":
@@ -210,7 +210,7 @@ def test_op(
             f"got k//2={k // 2}, N={n}."
         )
 
-    if get_arch() == "gfx1250" and backend == "gluon":
+    if get_arch() in ("gfx1250", "gfx1250-strict") and backend == "gluon":
         # temporary
         if do_gather and m > 1024 and act_dtype_str == "mxfloat8_e4m3fn":
             pytest.skip("do_gather (TDM async_gather) is not supported on gfx1250.")
@@ -233,7 +233,7 @@ def test_op(
             )
         # gfx1250 uses the n32k4 layout (scale kwidth 4), so K only needs
         # K//32 divisible by 4; gfx950 still needs 8.
-        if get_arch() == "gfx1250" and (n % 32 != 0 or k % (32 * 4) != 0):
+        if get_arch() in ("gfx1250", "gfx1250-strict") and (n % 32 != 0 or k % (32 * 4) != 0):
             pytest.skip(
                 f"Shape {m}x{n}x{k} is not supported for scale swizzling on gfx1250."
             )
@@ -274,7 +274,7 @@ def test_op(
     if preshuffled:
         w_tri = preshuffle_moe_weight(w_tri)
     if hbm_swizzling:
-        if get_arch() == "gfx1250":
+        if get_arch() in ("gfx1250", "gfx1250-strict"):
             swizzle_mx_scale = "GFX1250_SCALE"
             w_scale_tri = preshuffle_moe_wscale(w_scale_tri)
         else:

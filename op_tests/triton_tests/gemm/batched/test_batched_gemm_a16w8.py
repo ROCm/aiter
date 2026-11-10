@@ -9,7 +9,7 @@ from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.types import get_fp8_dtypes
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or arch_info.get_arch() != "gfx1250",
+    not torch.cuda.is_available() or arch_info.get_arch() not in ("gfx1250", "gfx1250-strict"),
     reason="batched_gemm_a16w8 is a gfx1250 gluon kernel",
 )
 

@@ -104,7 +104,7 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    if get_gfx() not in ("gfx950", "gfx1250"):
+    if get_gfx() not in ("gfx950", "gfx1250", "gfx1250-strict"):
         print(f"skip: gfx950 / gfx1250 only, got {get_gfx()}")
     else:
         df = pd.DataFrame([test_gemm(*mnk) for mnk in args.mnk or tuned_shapes()])

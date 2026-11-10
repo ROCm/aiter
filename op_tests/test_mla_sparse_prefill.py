@@ -92,7 +92,7 @@ def _get_gpu_arch() -> str | None:
     return None
 
 
-_SUPPORTED_ARCHS = ("gfx950", "gfx1250")
+_SUPPORTED_ARCHS = ("gfx950", "gfx1250", "gfx1250-strict")
 
 
 def _skip_if_unsupported(d: int) -> bool:
