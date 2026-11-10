@@ -200,6 +200,12 @@ def test_gemm_a8w8_blockscale_guards():
         except exc:
             continue
         raise AssertionError(f"expected {exc.__name__} from gemm_a8w8_blockscale")
+    try:
+        gemm_a8w8_blockscale(x, w_fly, x_scale, w_scale, tile_n=192, n_warp=4)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("expected ValueError for warp_tile_n not dividing 128")
 
 
 def summarize(name, rows):

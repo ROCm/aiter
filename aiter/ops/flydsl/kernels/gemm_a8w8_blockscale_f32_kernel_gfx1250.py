@@ -6,8 +6,8 @@ import flydsl.expr as fx
 from flydsl.compiler.protocol import dsl_size_of
 from flydsl.expr import const_expr, gpu, idx2crd, range_constexpr, rocdl, tdm_ops
 from flydsl.expr.typing import T
+from flydsl.runtime.device import check_smem_capacity
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
-from flydsl.utils.smem_allocator import check_smem_capacity
 
 from aiter.ops.flydsl.kernels import communication_ops_utils as comm_ops
 
@@ -65,7 +65,10 @@ def compile_gemm_a8w8_blockscale(
     _req(out_dtype in ("bf16", "fp16", "f32"), f"bad out_dtype {out_dtype!r}")
     _req(2 <= num_buffers <= 8, f"num_buffers must be in [2, 8], got {num_buffers}")
     _req(split_k >= 1, f"split_k must be >= 1, got {split_k}")
-    _req(warp_tile_n <= scale_block_n, f"warp_tile_n {warp_tile_n} > {scale_block_n}")
+    _req(
+        scale_block_n % warp_tile_n == 0,
+        f"warp_tile_n ({warp_tile_n}) must divide scale_block_n ({scale_block_n})",
+    )
     _req_multiples(
         (
             ("tile_m", tile_m, WMMA_M),
