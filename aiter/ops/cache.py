@@ -119,8 +119,8 @@ def indexer_k_quant_and_cache(
 ) -> None: ...
 
 
-@compile_ops("module_cache", develop=True)
-def indexer_qk_rope_quant_and_cache(
+@compile_ops("module_cache", fc_name="indexer_qk_rope_quant_and_cache", develop=True)
+def _indexer_qk_rope_quant_and_cache_hip(
     q: Tensor,
     q_out: Tensor,  # fp8 [T, H, head_dim] | fp4 u8 [T, H, head_dim // 2]
     weights: Tensor,
@@ -148,6 +148,98 @@ def indexer_qk_rope_quant_and_cache(
     q_scale_out: Tensor | None = None,  # u8 [T, k_tiles, 4, 16, round_up(H // 16, 4)]
     kv_cache_scale: Tensor | None = None,  # u8 [num_blocks, k_tiles, 4, kv_block_size]
 ) -> None: ...
+
+
+def indexer_qk_rope_quant_and_cache(
+    q: Tensor,
+    q_out: Tensor,
+    weights: Tensor,
+    weights_out: Tensor,
+    k: Tensor,
+    kv_cache: Tensor,
+    slot_mapping: Tensor,
+    norm_weight: Tensor,
+    norm_bias: Tensor,
+    positions: Tensor | None,
+    cos_cache: Tensor | None,
+    sin_cache: Tensor | None,
+    epsilon: float,
+    quant_block_size: int,
+    scale_fmt: str,
+    weights_scale: float,
+    preshuffle: bool = False,
+    is_neox: bool = True,
+    compute_all_q_rope: bool = False,
+    q_scale_out: Tensor | None = None,
+    kv_cache_scale: Tensor | None = None,
+    *,
+    scale_layout: str = "flydsl",
+    rope_dim: int = 64,
+) -> None:
+    """Normalize K, apply RoPE, quantize Q/K, and write the index cache.
+
+    The default preserves the HIP FP8/FlyDSL FP4 contract. For OPUS FP4,
+    use scale_layout='opus', D=128, H=32/64 and rope_dim=0 or 64.
+    Both scale outputs are required. The caller owns all output buffers.
+    Negative slots skip K. With compute_all_q_rope=True, all Q rows are written.
+    FP4 head weights stay unscaled. Return None.
+    """
+    if scale_layout == "opus":
+        if q_scale_out is None or kv_cache_scale is None:
+            raise ValueError("OPUS FP4 requires Q and K scale buffers")
+        if quant_block_size != 32 or scale_fmt != "ue8m0" or preshuffle:
+            raise ValueError("OPUS FP4 requires group32, ue8m0 and preshuffle=False")
+        from aiter.ops.triton.fusions.indexer_qk_quant_and_cache_fp4 import (
+            indexer_qk_quant_and_cache_fp4,
+        )
+
+        return indexer_qk_quant_and_cache_fp4(
+            q,
+            q_out,
+            weights,
+            weights_out,
+            k,
+            kv_cache,
+            slot_mapping,
+            norm_weight,
+            norm_bias,
+            positions,
+            cos_cache,
+            sin_cache,
+            epsilon,
+            q_scale_out,
+            kv_cache_scale,
+            rope_dim=rope_dim,
+            is_neox=is_neox,
+            compute_all_q_rope=compute_all_q_rope,
+        )
+    if scale_layout != "flydsl" or rope_dim != 64:
+        raise ValueError(
+            "The legacy indexer writer requires scale_layout='flydsl', RoPE64"
+        )
+    return _indexer_qk_rope_quant_and_cache_hip(
+        q,
+        q_out,
+        weights,
+        weights_out,
+        k,
+        kv_cache,
+        slot_mapping,
+        norm_weight,
+        norm_bias,
+        positions,
+        cos_cache,
+        sin_cache,
+        epsilon,
+        quant_block_size,
+        scale_fmt,
+        weights_scale,
+        preshuffle,
+        is_neox,
+        compute_all_q_rope,
+        q_scale_out,
+        kv_cache_scale,
+    )
 
 
 @compile_ops("module_cache", develop=True)
