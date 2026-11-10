@@ -277,10 +277,11 @@ template <int H,
           int VARIANT,
           bool MXFP8,
           int SPLIT,
-          int TILE_M     = BM,
-          int STAGE_COLS = 0,
-          int GROUPS     = 1,
-          int THREADS    = 256>
+          int TILE_M      = BM,
+          int STAGE_COLS  = 0,
+          int GROUPS      = 1,
+          int THREADS     = 256,
+          bool INTERLEAVE = false>
 __device__ __forceinline__ void finish_last_split(float (&total)[TILE_M][SLOTS],
                                                   float (&reduction)[4][TILE_M][SLOTS],
                                                   unsigned int& last,
@@ -527,7 +528,9 @@ __device__ __forceinline__ void finish_last_split(float (&total)[TILE_M][SLOTS],
 #pragma unroll
                     for(int u = 0; u < 4; ++u)
                     {
-                        const int col = ngroup * (hidden / GROUPS) + k + u * STEP + ncol;
+                        const int col = INTERLEAVE
+                                            ? 2 * (k + u * STEP) + ngroup * STEP + ncol
+                                            : ngroup * (hidden / GROUPS) + k + u * STEP + ncol;
                         if constexpr(FROM_LDS)
                         {
                             const int p  = ngroup * (STAGE_COLS / GROUPS) + k + u * STEP + ncol;
@@ -542,7 +545,9 @@ __device__ __forceinline__ void finish_last_split(float (&total)[TILE_M][SLOTS],
 #pragma unroll
                     for(int u = 0; u < 4; ++u)
                     {
-                        const int col = ngroup * (hidden / GROUPS) + k + u * STEP + ncol;
+                        const int col = INTERLEAVE
+                                            ? 2 * (k + u * STEP) + ngroup * STEP + ncol
+                                            : ngroup * (hidden / GROUPS) + k + u * STEP + ncol;
                         bf16x8 out;
 #pragma unroll
                         for(int e = 0; e < 8; ++e)
@@ -1492,16 +1497,17 @@ __device__ __forceinline__ void large_tiles(const bf16* residual,
         __builtin_amdgcn_sched_barrier(0);
         return tile;
     };
-    // Keep only the current residual tile at eight waves. Chunk zero of fn
-    // overlaps its load; chunk one is loaded at its MFMA to stay within VGPRs.
-    Tile current{};
-    if constexpr(!EIGHT_WAVE_POST)
-        current = load_tile(begin);
-#pragma unroll(HAS_POST ? 1 : 2)
-    for(int ki = 0; ki < hidden_part; ki += NC * BK)
-    {
-        const int k = begin + ki;
-        bf16x8 fn[STREAMS_PER_WAVE][NC][3];
+    constexpr int STEP = NC * BK;
+    // Four-wave post tiles alternate two tile and fn buffers (PINGPONG below).
+    // Their two groups also alternate STEP-column chunks, so each k-step reads
+    // and writes 2 * STEP contiguous columns per row and stream.
+    constexpr bool PINGPONG   = HAS_POST && !EIGHT_WAVE_POST;
+    constexpr bool INTERLEAVE = PINGPONG && GROUPS == 2;
+    auto kcol = [&](int ki) { return INTERLEAVE ? 2 * ki + group * STEP : begin + ki; };
+    // Prefetches past the last k-step fall outside every buffer.
+    auto kload   = [&](int ki) { return ki < hidden_part ? kcol(ki) : 1 << 20; };
+    using Fn     = bf16x8[STREAMS_PER_WAVE][NC][3];
+    auto load_fn = [&](Fn& fn, int k) {
 #pragma unroll
         for(int s = 0; s < STREAMS_PER_WAVE; ++s)
 #pragma unroll
@@ -1515,12 +1521,12 @@ __device__ __forceinline__ void large_tiles(const bf16* residual,
                         8;
                     fn[s][c][op] = load_vector_nbytes<bf16, 8, 16>(g_fn, off);
                 }
-        __builtin_amdgcn_sched_barrier(0);
-        Tile next{};
-        if constexpr(EIGHT_WAVE_POST)
-            current = load_tile(k);
-        else if(ki + NC * BK < hidden_part)
-            next = load_tile(k + NC * BK);
+    };
+    // One k-step: post-mix, residual store, collapse and projection of the
+    // STEP columns at ki.
+    auto step = [&](int ki, const Tile& current, Fn& fn) __attribute__((always_inline))
+    {
+        const int k = kcol(ki);
         bf16x8 r[STREAMS_PER_WAVE][NC * MT];
 #pragma unroll
         for(int s = 0; s < STREAMS_PER_WAVE; ++s)
@@ -1722,8 +1728,51 @@ __device__ __forceinline__ void large_tiles(const bf16* residual,
             __syncthreads();
         if constexpr(STREAMS_PER_WAVE == 4)
             __builtin_amdgcn_wave_barrier();
+    };
+    // Rotating one prefetched tile through register copies would make those
+    // copies wait on the loads just issued, and on the preceding residual
+    // stores, since vmcnt retires in order.
+    if constexpr(PINGPONG)
+    {
+        static_assert(hidden_part % (2 * STEP) == 0);
+        Tile a = load_tile(kload(0)), b;
+        Fn fa, fb;
+#pragma unroll 1
+        for(int ki = 0; ki < hidden_part; ki += 2 * STEP)
+        {
+            load_fn(fa, kcol(ki));
+            __builtin_amdgcn_sched_barrier(0);
+            b = load_tile(kload(ki + STEP));
+            step(ki, a, fa);
+            load_fn(fb, kcol(ki + STEP));
+            __builtin_amdgcn_sched_barrier(0);
+            a = load_tile(kload(ki + 2 * STEP));
+            step(ki + STEP, b, fb);
+        }
+    }
+    else
+    {
+        // Keep only the current residual tile at eight waves. Chunk zero of fn
+        // overlaps its load; chunk one is loaded at its MFMA to stay within VGPRs.
+        Tile current{};
         if constexpr(!EIGHT_WAVE_POST)
-            current = next;
+            current = load_tile(begin);
+#pragma unroll(HAS_POST ? 1 : 2)
+        for(int ki = 0; ki < hidden_part; ki += STEP)
+        {
+            const int k = begin + ki;
+            Fn fn;
+            load_fn(fn, k);
+            __builtin_amdgcn_sched_barrier(0);
+            Tile next{};
+            if constexpr(EIGHT_WAVE_POST)
+                current = load_tile(k);
+            else if(ki + STEP < hidden_part)
+                next = load_tile(k + STEP);
+            step(ki, current, fn);
+            if constexpr(!EIGHT_WAVE_POST)
+                current = next;
+        }
     }
 #pragma unroll
     for(int m = 0; m < MT; ++m)
@@ -1767,32 +1816,33 @@ __device__ __forceinline__ void large_tiles(const bf16* residual,
                 v += local_reduction[w][i / SLOTS][i % SLOTS];
         total[i / SLOTS][i % SLOTS] = v;
     }
-    finish_last_split<H, VARIANT, MXFP8, 1, BM, STAGED, GROUPS, THREADS>(total,
-                                                                         reduction,
-                                                                         last,
-                                                                         1,
-                                                                         tokens,
-                                                                         token_block,
-                                                                         tile_rows,
-                                                                         partials,
-                                                                         counters,
-                                                                         layer_input,
-                                                                         quant_out,
-                                                                         quant_scale,
-                                                                         norm_weight,
-                                                                         hc_scale,
-                                                                         hc_base,
-                                                                         next_pre,
-                                                                         post_out,
-                                                                         comb_out,
-                                                                         rms_eps,
-                                                                         pre_eps,
-                                                                         sinkhorn_eps,
-                                                                         post_mult,
-                                                                         norm_eps,
-                                                                         20,
-                                                                         hidden_arg,
-                                                                         &collapse_lds[0][0]);
+    finish_last_split<H, VARIANT, MXFP8, 1, BM, STAGED, GROUPS, THREADS, INTERLEAVE>(
+        total,
+        reduction,
+        last,
+        1,
+        tokens,
+        token_block,
+        tile_rows,
+        partials,
+        counters,
+        layer_input,
+        quant_out,
+        quant_scale,
+        norm_weight,
+        hc_scale,
+        hc_base,
+        next_pre,
+        post_out,
+        comb_out,
+        rms_eps,
+        pre_eps,
+        sinkhorn_eps,
+        post_mult,
+        norm_eps,
+        20,
+        hidden_arg,
+        &collapse_lds[0][0]);
 #endif
 }
 
