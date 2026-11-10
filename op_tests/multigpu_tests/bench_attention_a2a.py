@@ -1,33 +1,49 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 
-"""Latency benchmark: fused attention A2A vs RCCL all_to_all_4d (+ MHA V4 packers).
+"""Latency benchmark: fused attention A2A hops vs RCCL plus the canonical packers.
 
 Run from the repo root on an idle node (one process per GPU, spawned here):
 
     python3 op_tests/multigpu_tests/bench_attention_a2a.py -w 8 \
         --shapes wan2.2 ticket --recipes all
+    python3 op_tests/multigpu_tests/bench_attention_a2a.py -w 8 --hop output \
+        --shapes wan2.2
 
-Each recipe times the fused AttentionA2AIntraNodeOp trio (Q, K, V submit_role)
-against the yunchang-style all_to_all_4D in-hop reproduction over RCCL; packed
-recipes add the exact MHA V4 packers after the exchange. Medians are taken per
-role and per trio, and the slowest rank is reported. Before any timing, the
-fused output is compared bit-exactly with the baseline; a mismatch skips timing.
+Input hop (default): each recipe times the fused AttentionA2AIntraNodeOp trio
+(Q, K, V submit_role) against the yunchang-style all_to_all_4D in-hop
+reproduction over RCCL; packed recipes add the exact MHA V4 packers after the
+exchange. Medians are taken per role and per trio, and the slowest rank is
+reported.
+
+Output hop (--hop output): each codec times AttentionOutputA2AIntraNodeOp against
+the work it replaces, the inverse Ulysses all-to-all of the BF16 MHA output over
+RCCL followed by the consuming GEMM's activation quantizer on the destination.
+For e4m3_external_scale that quantizer is aiter's HIP per-tensor quantizer, and
+the candidate also pays the caller's scale policy (per-destination amax and a
+world-size MAX all-reduce). Rows report min, median and max, each the max across
+ranks.
+
+Before any timing, the fused output is compared bit-exactly with the baseline;
+a mismatch skips timing. For e4m3_external_scale the comparison is against
+TorchAO's per-tensor quantization (divide, clamp, cast), which the op reproduces
+and which rounds a few values differently from the timed HIP quantizer.
 
 This script has its own timer instead of run_perftest because a row must (a)
 rotate through several distinct inputs so no iteration re-reads a warm cache,
 and (b) report the max across ranks, since a collective finishes at the speed
 of its slowest participant. run_perftest does neither.
 
-Baseline provenance: every packer is a public aiter.ops.mha_v4_quant op except
-MXFP4 V. The public DEFAULT-layout MXFP4 V packer was removed, so that baseline
-uses the private HIP producer (_mxfp4_v_buffers + _quantize_v_mxfp4_hip), the
-same path test_attention_a2a.py references.
+Baseline provenance: every input-hop packer is a public aiter.ops.mha_v4_quant
+op except MXFP4 V. The public DEFAULT-layout MXFP4 V packer was removed, so that
+baseline uses the private HIP producer (_mxfp4_v_buffers + _quantize_v_mxfp4_hip),
+the same path test_attention_a2a.py references.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import functools
 import math
 import os
@@ -43,6 +59,13 @@ _SHAPES = {
     "wan2.2": (1, 9419, 40, 128),
     "ticket": (1, 14867, 24, 128),
 }
+# Output-hop shapes: (global sequence, total heads, head dim) of the MHA output.
+_OUTPUT_SHAPES = {
+    "wan2.2": (75776, 40, 128),
+    "small": (8192, 16, 128),
+}
+_OUTPUT_CODECS = ("e4m3", "e4m3_external_scale", "mxfp4", "mxfp6")
+_GFX950_OUTPUT_CODECS = {"e4m3_external_scale", "mxfp4", "mxfp6"}
 _ROTATIONS = 4  # distinct input sets cycled per iteration to defeat cache reuse
 _BF16_BYTES = 2
 
@@ -424,7 +447,9 @@ def _render(records, shapes, world, arch, args, elapsed_s):
     return "\n".join(lines)
 
 
-def _worker(rank, world, args):
+@contextlib.contextmanager
+def _distributed_rank(rank, world, master_port):
+    """Process group, gloo CPU group and MoRI for one spawned rank."""
     os.environ.setdefault("MORI_SHMEM_HEAP_SIZE", "12G")
 
     import mori.shmem as ms
@@ -433,21 +458,36 @@ def _worker(rank, world, args):
 
     torch.cuda.set_device(rank)
     device = torch.device("cuda", rank)
-    from aiter.ops.flydsl.attention_a2a_intranode import AttentionA2AIntraNodeOp
-
     dist.init_process_group(
         "cpu:gloo,cuda:nccl",
-        init_method=f"tcp://127.0.0.1:{args.master_port}",
+        init_method=f"tcp://127.0.0.1:{master_port}",
         rank=rank,
         world_size=world,
         device_id=device,
     )
-    records = []
-    start = time.perf_counter()
     try:
         cpu_group = dist.new_group(backend="gloo")
         torch._C._distributed_c10d._register_process_group("mori", cpu_group)
         ms.shmem_torch_process_group_init("mori")
+        yield device, cpu_group
+    finally:
+        # Skip finalize while an exception unwinds: a peer may be mid-collective.
+        if sys.exc_info()[0] is None:
+            try:
+                ms.shmem_finalize()
+            finally:
+                dist.destroy_process_group()
+
+
+def _worker(rank, world, args):
+    import torch
+    import torch.distributed as dist
+
+    from aiter.ops.flydsl.attention_a2a_intranode import AttentionA2AIntraNodeOp
+
+    with _distributed_rank(rank, world, args.master_port) as (device, cpu_group):
+        records = []
+        start = time.perf_counter()
         for shape_name in args.shapes:
             requested = _SHAPES[shape_name]
             shape = _local_shape(requested, world)
@@ -499,13 +539,217 @@ def _worker(rank, world, args):
             with open(output, "w", encoding="utf-8") as handle:
                 handle.write(report + "\n")
             print(f"Wrote {output}", flush=True)
-    finally:
-        # Skip finalize while an exception unwinds: a peer may be mid-collective.
-        if sys.exc_info()[0] is None:
-            try:
-                ms.shmem_finalize()
-            finally:
-                dist.destroy_process_group()
+
+
+def _output_quantizer(codec):
+    """Destination quantizer the output hop replaces: matrix -> (payload, scale)."""
+    import torch
+
+    import aiter
+
+    if codec == "e4m3":
+        quantize = aiter.get_hip_quant(aiter.QuantType.per_1x128)
+        return lambda matrix: quantize(matrix, quant_dtype=aiter.dtypes.fp8)
+    if codec == "e4m3_external_scale":
+        return lambda matrix: aiter.per_tensor_quant_hip(
+            matrix, quant_dtype=aiter.dtypes.fp8
+        )
+    if codec == "mxfp4":
+        quantize = aiter.get_hip_quant(aiter.QuantType.per_1x32)
+        return lambda matrix: quantize(
+            matrix, quant_dtype=aiter.dtypes.fp4x2, shuffle=True
+        )
+    from aiter.ops.gemm_op_a6w6 import mxfp6_gemm_pack_size, quant_mxfp6_gemm_out
+
+    # The packer leaves layout padding untouched, so its persistent buffers start
+    # zeroed like the op's symmetric storage.
+    buffers = {}
+
+    def mxfp6(matrix):
+        if matrix.shape not in buffers:
+            payload_size, scale_size = mxfp6_gemm_pack_size(*matrix.shape)
+            buffers[matrix.shape] = (
+                torch.zeros(payload_size, dtype=torch.uint8, device=matrix.device),
+                torch.zeros(scale_size, dtype=torch.uint8, device=matrix.device),
+            )
+        return quant_mxfp6_gemm_out(matrix, *buffers[matrix.shape])
+
+    return mxfp6
+
+
+def _inverse_a2a(value, world, group):
+    """Source BSHD [1, S_global, H_local, D] -> destination matrix [S_local, H * D]."""
+    import torch
+    import torch.distributed as dist
+
+    _, sequence, heads_local, head_dim = value.shape
+    send = value.view(world, sequence // world, heads_local, head_dim)
+    received = torch.empty_like(send)
+    dist.all_to_all_single(received, send, group=group)
+    return received.permute(1, 0, 2, 3).reshape(
+        sequence // world, world * heads_local * head_dim
+    )
+
+
+def _time_stats(run, warmup, iterations, group):
+    """Min, median and max microseconds of run(index), each the max across ranks."""
+    import torch
+    import torch.distributed as dist
+
+    for index in range(warmup):
+        run(index)
+    torch.cuda.synchronize()
+    dist.barrier(group)
+    events = []
+    for index in range(iterations):
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        run(index)
+        end.record()
+        events.append((start, end))
+    torch.cuda.synchronize()
+    samples = [s.elapsed_time(e) * 1000.0 for s, e in events]
+    stats = torch.tensor(
+        [min(samples), statistics.median(samples), max(samples)], dtype=torch.float64
+    )
+    dist.all_reduce(stats, op=dist.ReduceOp.MAX, group=group)
+    return tuple(stats.tolist())
+
+
+def _run_output_codec(codec, shape_name, inputs, args, ctx):
+    import torch
+    import torch.distributed as dist
+
+    world, rank = ctx["world"], ctx["rank"]
+    fp8_dtype, fp8_max = ctx["fp8_dtype"], ctx["fp8_max"]
+    quantize = _output_quantizer(codec)
+    op = ctx["op_cls"](
+        rank=rank,
+        world_size=world,
+        shape=tuple(inputs[0].shape),
+        codec=codec,
+        block_num=args.blocks,
+    )
+
+    def destination_scales(value):
+        amax = value.view(world, -1).abs().amax(dim=1).float()
+        dist.all_reduce(amax, op=dist.ReduceOp.MAX)
+        return amax.clamp(min=1e-12) / fp8_max
+
+    def baseline(index):
+        return quantize(_inverse_a2a(inputs[index % _ROTATIONS], world, None))
+
+    def candidate(index):
+        value = inputs[index % _ROTATIONS]
+        if codec == "e4m3_external_scale":
+            return op(value, destination_scales=destination_scales(value))
+        return op(value)
+
+    result = candidate(0)
+    if codec == "e4m3_external_scale":
+        matrix = _inverse_a2a(inputs[0], world, None)
+        scale = destination_scales(inputs[0])[rank]
+        expected = (matrix.float() / scale).clamp(-fp8_max, fp8_max).to(fp8_dtype)
+    else:
+        expected = baseline(0)[0]
+    torch.cuda.synchronize()
+    exact = torch.equal(
+        result.payload.view(torch.uint8).flatten(),
+        expected.view(torch.uint8).flatten(),
+    )
+    verdict = torch.tensor([int(exact)], dtype=torch.int32)
+    dist.all_reduce(verdict, op=dist.ReduceOp.MIN, group=ctx["cpu_group"])
+    record = {"shape": shape_name, "codec": codec, "exact": bool(verdict.item())}
+    if not record["exact"]:
+        return record
+    record["baseline us"] = _time_stats(baseline, args.warmup, args.iterations, None)
+    record["candidate us"] = _time_stats(candidate, args.warmup, args.iterations, None)
+    record["speedup"] = record["baseline us"][1] / record["candidate us"][1]
+    return record
+
+
+def _render_output(records, world, arch, args, elapsed_s):
+    lines = [
+        (
+            f"# Attention-output A2A: world={world}, arch={arch}, "
+            f"rotations={_ROTATIONS}, warmup={args.warmup}, iters={args.iterations}, "
+            f"{elapsed_s:.0f} s"
+        ),
+        "",
+        (
+            "Times are min / median / max us, each the max across ranks; speedup is "
+            "the ratio of medians."
+        ),
+        "",
+        "| shape | codec | exact | RCCL + quant (us) | output A2A (us) | speedup |",
+        "| --- | --- | --- | --- | --- | --- |",
+    ]
+    for r in records:
+        if not r["exact"]:
+            lines.append(f"| {r['shape']} | {r['codec']} | no | - | - | - |")
+            continue
+        baseline = " / ".join(f"{us:.1f}" for us in r["baseline us"])
+        candidate = " / ".join(f"{us:.1f}" for us in r["candidate us"])
+        lines.append(
+            f"| {r['shape']} | {r['codec']} | yes | {baseline} | {candidate} "
+            f"| {r['speedup']:.2f}x |"
+        )
+    return "\n".join(lines)
+
+
+def _output_worker(rank, world, args):
+    import torch
+
+    from aiter.ops.flydsl.attention_output_a2a_intranode import (
+        AttentionOutputA2AIntraNodeOp,
+    )
+
+    with _distributed_rank(rank, world, args.master_port) as (device, cpu_group):
+        start = time.perf_counter()
+        gfx = get_gfx_runtime()
+        ctx = {
+            "world": world,
+            "rank": rank,
+            "cpu_group": cpu_group,
+            "op_cls": functools.partial(AttentionOutputA2AIntraNodeOp, group=cpu_group),
+            "fp8_dtype": (
+                torch.float8_e4m3fnuz if gfx == "gfx942" else torch.float8_e4m3fn
+            ),
+            "fp8_max": 240.0 if gfx == "gfx942" else 448.0,
+        }
+        records = []
+        for shape_name in args.shapes:
+            sequence, heads, head_dim = _OUTPUT_SHAPES[shape_name]
+            if heads % world or sequence % world:
+                raise ValueError(f"{shape_name} does not divide world={world}")
+            inputs = []
+            for rotation in range(_ROTATIONS):
+                torch.manual_seed(1000 * rotation + rank)
+                inputs.append(
+                    torch.randn(
+                        1,
+                        sequence,
+                        heads // world,
+                        head_dim,
+                        dtype=torch.bfloat16,
+                        device=device,
+                    )
+                )
+            for codec in args.codecs:
+                if codec in _GFX950_OUTPUT_CODECS and gfx != "gfx950":
+                    continue
+                records.append(_run_output_codec(codec, shape_name, inputs, args, ctx))
+            del inputs
+        if rank == 0:
+            report = _render_output(
+                records, world, gfx, args, time.perf_counter() - start
+            )
+            print(report, flush=True)
+            output = f"/tmp/bench_attention_output_a2a_w{world}.md"
+            with open(output, "w", encoding="utf-8") as handle:
+                handle.write(report + "\n")
+            print(f"Wrote {output}", flush=True)
 
 
 def main():
@@ -515,10 +759,35 @@ def main():
         "-w", "--world-size", type=int, required=True, choices=(2, 4, 8)
     )
     parser.add_argument(
-        "--shapes", choices=tuple(_SHAPES), nargs="+", default=list(_SHAPES)
+        "--hop",
+        choices=("input", "output"),
+        default="input",
+        help="Ulysses hop to time",
     )
     parser.add_argument(
-        "--recipes", choices=["all", *names], nargs="+", default=["all"]
+        "--shapes",
+        nargs="+",
+        help=(
+            f"input hop: {', '.join(_SHAPES)} (default all); "
+            f"output hop: {', '.join(_OUTPUT_SHAPES)} (default wan2.2)"
+        ),
+    )
+    parser.add_argument(
+        "--recipes",
+        choices=["all", *names],
+        nargs="+",
+        default=["all"],
+        help="input-hop recipes",
+    )
+    parser.add_argument(
+        "--codecs",
+        choices=_OUTPUT_CODECS,
+        nargs="+",
+        default=list(_OUTPUT_CODECS),
+        help="output-hop codecs",
+    )
+    parser.add_argument(
+        "--blocks", type=int, default=128, help="output-hop workgroups per launch"
     )
     parser.add_argument("--master-port", type=int, default=29517)
     parser.add_argument("--warmup", type=int, default=3)
@@ -526,6 +795,14 @@ def main():
     args = parser.parse_args()
     if args.warmup < 0 or args.iterations <= 0:
         parser.error("--warmup must be nonnegative and --iterations positive")
+    shapes = _SHAPES if args.hop == "input" else _OUTPUT_SHAPES
+    if args.shapes is None:
+        args.shapes = list(_SHAPES) if args.hop == "input" else ["wan2.2"]
+    unknown = [name for name in args.shapes if name not in shapes]
+    if unknown:
+        parser.error(
+            f"unknown {args.hop}-hop shapes {unknown}; choose from {list(shapes)}"
+        )
     selected = names if "all" in args.recipes else args.recipes
     args.recipes = [r for r in _RECIPES if r.name in selected]
 
@@ -535,18 +812,23 @@ def main():
     if not torch.cuda.is_available():
         print("SKIP: attention A2A requires ROCm GPUs")
         return 0
-    # Workers initialize distributed and MoRI before the op rejects gfx942's packed MX
-    # recipes, so gate here rather than failing inside the spawned processes.
+    # Workers initialize distributed and MoRI before the ops reject an unsupported
+    # arch, so gate here rather than failing inside the spawned processes.
     gfx = get_gfx_runtime()
-    if gfx != "gfx950":
-        print(f"SKIP: attention A2A benchmark requires gfx950, found {gfx}")
+    supported = ("gfx950",) if args.hop == "input" else ("gfx942", "gfx950")
+    if gfx not in supported:
+        print(
+            f"SKIP: attention A2A {args.hop}-hop benchmark requires "
+            f"{' or '.join(supported)}, found {gfx}"
+        )
         return 0
     if torch.cuda.device_count() < args.world_size:
         print(
             f"SKIP: world={args.world_size}, only {torch.cuda.device_count()} HIP devices visible"
         )
         return 0
-    mp.spawn(_worker, args=(args.world_size, args), nprocs=args.world_size, join=True)
+    worker = _worker if args.hop == "input" else _output_worker
+    mp.spawn(worker, args=(args.world_size, args), nprocs=args.world_size, join=True)
     return 0
 
 

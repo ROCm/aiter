@@ -5,7 +5,9 @@
 
 from __future__ import annotations
 
+import math
 import operator
+import os
 from typing import NamedTuple
 
 import flydsl.expr as fx
@@ -14,7 +16,6 @@ import torch
 from flydsl.expr.typing import Stream
 from mori.shmem import mori_shmem_create_tensor
 
-from .communication_ops_host_utils import build_p2p_table
 from .kernels.attention_a2a_intranode_kernel import make_attention_a2a_reuse_jit
 from .kernels.attention_output_a2a_intranode_kernel import (
     make_attention_output_a2a_jit,
@@ -44,10 +45,24 @@ class PackedAttentionOutputResult(NamedTuple):
     scale: torch.Tensor
 
 
+def _require_raw_buffer_extent(role, extent):
+    if extent > _MAX_RAW_BUFFER_BYTES:
+        raise ValueError(f"{role} extent {extent} exceeds raw-buffer limit")
+
+
 def _checked_p2p_table(tensor, rank, world_size, device):
-    table = build_p2p_table(tensor, rank, world_size, device)
-    values = table.cpu().tolist()
-    missing = [peer for peer, pointer in enumerate(values) if pointer == 0]
+    """P2P pointers to ``tensor`` on every peer, and the peers that have none.
+
+    Missing peers are returned rather than raised, so that every rank can report
+    them together instead of one rank leaving its peers in the next collective.
+    """
+    pointers = [
+        ms.shmem_ptr_p2p(tensor.data_ptr(), rank, peer) for peer in range(world_size)
+    ]
+    missing = [peer for peer, pointer in enumerate(pointers) if not pointer]
+    table = torch.tensor(
+        [pointer or 0 for pointer in pointers], dtype=torch.int64, device=device
+    )
     return table, missing
 
 
@@ -58,16 +73,39 @@ class AttentionOutputA2AIntraNodeOp:
     rank receives its ``S_global / world_size`` rows for all heads, in the
     activation layout consumed by the following output projection:
 
-    - ``e4m3``: BSHD payload with one FP32 descale per 128-wide head vector.
+    - ``e4m3``: BSHD payload with one FP32 descale per 128-wide head vector,
+      byte-identical to aiter's per_1x128 quantizer, also for NaN and infinite
+      inputs.
     - ``e4m3_external_scale``: BSHD payload quantized with a caller-provided
-      FP32 descale per destination rank. The op applies no scaling policy and
-      performs no reduction: ``payload = clamp(x / destination_scales[dst])``,
-      and the result scale is ``destination_scales[rank]``.
+      FP32 descale per destination rank, as TorchAO's dynamic per-tensor
+      activation quantization does: ``payload = clamp(x / destination_scales[dst])``
+      cast to FP8, and the result scale is ``destination_scales[rank]``. A NaN
+      input becomes an FP8 NaN, though not always with TorchAO's sign bit. It
+      is not aiter's static_per_tensor_quant, which multiplies by the hardware
+      reciprocal of the scale and so rounds a few values differently.
     - ``mxfp4``: E2M1 payload with E8M0 per-1x32 scales in the A4W4 layout.
     - ``mxfp6``: packed payload and scales in the A6W6/A6W4 layout.
 
+    ``e4m3_external_scale`` applies no scaling policy and performs no reduction,
+    and it checks only the dtype, shape, device and contiguity of
+    ``destination_scales``. The caller must supply positive finite descales that
+    are identical on every source rank for a given destination, since that
+    destination dequantizes every received head shard with one scale. They must
+    be ready on the launch stream and stay unchanged until the consuming GEMM
+    has read the result.
+
     ``group`` is mandatory and must contain exactly the MoRI participants.
-    Construction checks rank agreement before allocating symmetric buffers.
+    Construction checks that every rank agrees on the configuration and on the
+    offsets of every symmetric buffer before any exchange.
+
+    All calls must use one stream: the reuse gate takes reaching a call on that
+    stream as proof that the consumers of the parity it reuses have finished. A
+    call on a different stream raises; construct a new op or join the streams.
+    ``destination_scales``, and ``input`` when ``stream`` is passed, are recorded
+    on the launch stream, so the caching allocator does not reuse them early.
+
+    Debug: AITER_A2A_SPIN_TIMEOUT_ITERS=N (default 0, off) makes each device
+    wait loop trap after N polls instead of hanging; part of the cache key.
     """
 
     def __init__(
@@ -81,6 +119,7 @@ class AttentionOutputA2AIntraNodeOp:
         block_num=_DEFAULT_BLOCK_NUM,
         warp_num_per_block=_DEFAULT_WARP_NUM_PER_BLOCK,
     ):
+        spin_timeout_iters = int(os.environ.get("AITER_A2A_SPIN_TIMEOUT_ITERS", "0"))
         if group is None:
             raise ValueError("group is required for cross-rank configuration checks")
         codec = codec.strip().lower()
@@ -124,9 +163,10 @@ class AttentionOutputA2AIntraNodeOp:
             raise RuntimeError(
                 f"attention output A2A requires gfx942 or gfx950, got {arch}"
             )
-        self.fp8_fnuz = arch == "gfx942"
         if codec in {"e4m3_external_scale", "mxfp4", "mxfp6"} and arch != "gfx950":
             raise RuntimeError(f"{codec} attention output requires gfx950")
+        self.arch = arch
+        self.fp8_fnuz = arch == "gfx942"
         self.codec = codec
         self.rank = rank
         self.world_size = world_size
@@ -147,14 +187,14 @@ class AttentionOutputA2AIntraNodeOp:
         rows = self.seq_local
         features = self.heads_total * shape[3]
         if codec in {"e4m3", "e4m3_external_scale"}:
-            payload_size = math_prod(self.output_shape)
+            payload_size = math.prod(self.output_shape)
             scale_dtype = torch.float32
             result_payload_shape = self.output_shape
             if codec == "e4m3_external_scale":
                 scale_size = 1
                 result_scale_shape = (1, 1)
             else:
-                scale_size = math_prod(self.scale_shape)
+                scale_size = math.prod(self.scale_shape)
                 result_scale_shape = self.scale_shape
         elif codec == "mxfp4":
             padded_rows = (rows + 255) // 256 * 256
@@ -171,11 +211,18 @@ class AttentionOutputA2AIntraNodeOp:
             scale_dtype = torch.uint8
             result_payload_shape = (payload_size,)
             result_scale_shape = (scale_size,)
-        if payload_size > _MAX_RAW_BUFFER_BYTES:
-            raise ValueError(f"payload extent {payload_size} exceeds raw-buffer limit")
-        scale_extent = scale_size * torch.empty((), dtype=scale_dtype).element_size()
-        if scale_extent > _MAX_RAW_BUFFER_BYTES:
-            raise ValueError(f"scale extent {scale_extent} exceeds raw-buffer limit")
+        _require_raw_buffer_extent("payload", payload_size)
+        _require_raw_buffer_extent(
+            "scale", scale_size * torch.empty((), dtype=scale_dtype).element_size()
+        )
+        self._canonical_pack = codec in {"mxfp4", "mxfp6"}
+        if not self._canonical_pack:
+            # Only the E4M3 push kernel reads the input through a raw buffer; the
+            # MX codecs hand it to HIP packers.
+            _require_raw_buffer_extent(
+                "input",
+                math.prod(shape) * torch.empty((), dtype=self.dtype).element_size(),
+            )
 
         if rank != ms.shmem_mype() or world_size != ms.shmem_npes():
             raise ValueError(
@@ -190,6 +237,7 @@ class AttentionOutputA2AIntraNodeOp:
             warp_num_per_block,
             world_size,
             codec,
+            spin_timeout_iters,
         )
         configs = [None] * world_size
         torch.distributed.all_gather_object(configs, config, group=group)
@@ -213,7 +261,6 @@ class AttentionOutputA2AIntraNodeOp:
                 self.payload_storage_sets, self.scale_storage_sets
             )
         )
-        self._canonical_pack = codec in {"mxfp4", "mxfp6"}
         self._pack_per_destination = False
         self._local_payload_segment_size = None
         self._local_scale_segment_size = None
@@ -278,6 +325,10 @@ class AttentionOutputA2AIntraNodeOp:
                 for _ in range(2)
             )
             self._pack_local = quant_mxfp6_gemm_out
+        for local in self.local_payload_sets + self.local_scale_sets:
+            _require_raw_buffer_extent(
+                "local pack", local.numel() * local.element_size()
+            )
         self.xdb_mem = mori_shmem_create_tensor((world_size,), torch.int64)
         self.reuse_mem_sets = tuple(
             mori_shmem_create_tensor((world_size,), torch.int64) for _ in range(2)
@@ -333,28 +384,48 @@ class AttentionOutputA2AIntraNodeOp:
         torch.distributed.all_gather_object(missing_by_rank, missing, group=group)
         if any(peer_missing for peer_missing in missing_by_rank):
             raise RuntimeError(f"MoRI P2P pointers unavailable: {missing_by_rank}")
+        # shmem_ptr_p2p translates by the offset from the local heap base, so
+        # divergent allocation order would silently address the wrong buffer.
+        symmetric = [("payload", tensor) for tensor in self.payload_storage_sets]
+        symmetric += [("scale", tensor) for tensor in self.scale_storage_sets]
+        symmetric += [("completion", self.xdb_mem)]
+        symmetric += [("reuse", tensor) for tensor in self.reuse_mem_sets]
+        base = symmetric[0][1].data_ptr()
+        offsets = [(name, tensor.data_ptr() - base) for name, tensor in symmetric]
+        offsets_by_rank = [None] * world_size
+        torch.distributed.all_gather_object(offsets_by_rank, offsets, group=group)
+        for index, (name, _) in enumerate(offsets):
+            if any(
+                peer[index] != offsets_by_rank[0][index] for peer in offsets_by_rank
+            ):
+                raise ValueError(
+                    f"symmetric buffer {index} ({name}) offset differs across ranks: "
+                    f"{[peer[index][1] for peer in offsets_by_rank]}"
+                )
         ms.shmem_barrier_all()
 
-        self._reuse_launch = make_attention_a2a_reuse_jit(rank=rank, npes=world_size)
+        self._reuse_launch = make_attention_a2a_reuse_jit(
+            rank=rank, npes=world_size, spin_timeout_iters=spin_timeout_iters
+        )
         launch_factory = (
             make_attention_output_packed_copy_jit
             if self._canonical_pack
             else make_attention_output_a2a_jit
         )
-        launch_kwargs = {
-            "rank": rank,
-            "npes": world_size,
-            "seq_local": self.seq_local,
-            "heads_local": self.heads_local,
-            "head_dim": shape[3],
-            "block_num": block_num,
-            "warp_num_per_block": warp_num_per_block,
-            "codec": codec,
-        }
-        if not self._canonical_pack:
-            launch_kwargs["fp8_fnuz"] = self.fp8_fnuz
-        self._launch = launch_factory(**launch_kwargs)
+        self._launch = launch_factory(
+            rank=rank,
+            npes=world_size,
+            seq_local=self.seq_local,
+            heads_local=self.heads_local,
+            head_dim=shape[3],
+            block_num=block_num,
+            warp_num_per_block=warp_num_per_block,
+            arch=arch,
+            codec=codec,
+            spin_timeout_iters=spin_timeout_iters,
+        )
         self._epoch = 0
+        self._stream = None
 
     def __call__(self, input, stream=None, destination_scales=None):
         if input.dtype != self.dtype or tuple(input.shape) != self.shape:
@@ -367,6 +438,11 @@ class AttentionOutputA2AIntraNodeOp:
         torch_stream = torch.cuda.current_stream() if stream is None else stream
         if input.device != self.device or torch_stream.device != self.device:
             raise ValueError("input and stream must use the owning device")
+        if self._stream is not None and self._stream != torch_stream.cuda_stream:
+            raise ValueError(
+                "all calls must use one stream; cross-stream use requires "
+                "constructing a new op or joining the streams"
+            )
         if self.codec == "e4m3_external_scale":
             if (
                 destination_scales is None
@@ -379,9 +455,13 @@ class AttentionOutputA2AIntraNodeOp:
                     "e4m3_external_scale requires contiguous FP32 destination_scales "
                     f"with shape ({self.world_size},) on {self.device}"
                 )
-            destination_scales.record_stream(torch_stream)
         elif destination_scales is not None:
             raise ValueError(f"{self.codec} does not accept destination_scales")
+        self._stream = torch_stream.cuda_stream
+        if stream is not None:
+            input.record_stream(torch_stream)
+        if destination_scales is not None:
+            destination_scales.record_stream(torch_stream)
 
         parity = self._epoch % 2
         stream = Stream(torch_stream)
@@ -457,10 +537,3 @@ class AttentionOutputA2AIntraNodeOp:
                 scale=destination_scales[self.rank : self.rank + 1].view(1, 1)
             )
         return self.results[parity]
-
-
-def math_prod(shape):
-    result = 1
-    for dim in shape:
-        result *= dim
-    return result

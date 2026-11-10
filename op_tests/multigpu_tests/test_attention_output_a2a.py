@@ -5,8 +5,9 @@
 
 One row per (world_size, codec, rows, heads). Each row checks payloads and scales
 against the canonical quantizer applied after an RCCL inverse all-to-all, checks
-the consuming GEMM output bit for bit, exercises double-buffer lifetime and a
-delayed rank, and then times the exchange with run_perftest.
+the consuming GEMM output bit for bit, exercises double-buffer lifetime, a delayed
+rank and a slow reader against the parity reuse gate, and then times the exchange
+with run_perftest.
 """
 
 from __future__ import annotations
@@ -24,7 +25,7 @@ import torch
 import torch.distributed as dist
 
 import aiter
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.test_common import benchmark, run_perftest
 
 SUPPORTED_GFX = ["gfx942", "gfx950"]
@@ -86,6 +87,25 @@ def _exact(actual, expected, label):
         raise AssertionError(f"{label}: {mismatches} differing bytes")
 
 
+def _exact_up_to_nan_sign(actual, expected, label, is_nan):
+    """Bitwise equality, except that a NaN may carry either sign bit."""
+    nan = is_nan(actual)
+    if (
+        actual.shape != expected.shape
+        or not torch.equal(nan, is_nan(expected))
+        or not torch.equal(actual[~nan], expected[~nan])
+    ):
+        raise AssertionError(f"{label}: differs beyond the sign of NaN")
+
+
+def _is_fp8_e4m3fn_nan(raw):
+    return (raw.view(torch.uint8) & 0x7F) == 0x7F
+
+
+def _is_bf16_nan(raw):
+    return (raw.view(torch.int16) & 0x7FFF) > 0x7F80
+
+
 def _delay_current_stream():
     if hasattr(torch.cuda, "_sleep"):
         torch.cuda._sleep(100_000_000)
@@ -107,6 +127,13 @@ def _corner_input(shape):
     value[:, 1, 0, ::2] = tiny
     value[:, 1, 0, 1::2] = -tiny
     value[:, 2, 0, 0] = torch.finfo(torch.bfloat16).max
+    # Non-finite values among finite ones: a NaN in one head vector, and an
+    # infinity of each sign in another.
+    value[:, 3, 0] = torch.linspace(-0.5, 0.5, HEAD_DIM, device=_CTX.device)
+    value[:, 3, 0, 5] = float("nan")
+    value[:, 4, 0] = torch.linspace(0.25, -0.25, HEAD_DIM, device=_CTX.device)
+    value[:, 4, 0, 9] = float("inf")
+    value[:, 4, 0, 70] = float("-inf")
     return value
 
 
@@ -123,8 +150,12 @@ def _inverse_a2a(value):
 
 
 def _destination_scales(value):
-    """One E4M3 descale per destination rank: global amax over its rows / FP8_MAX."""
-    amax = value.view(_CTX.world_size, -1).abs().amax(dim=1).float()
+    """One E4M3 descale per destination rank: global amax over its rows / FP8_MAX.
+
+    Non-finite values do not contribute, since the op requires finite descales.
+    """
+    finite = torch.where(value.isfinite(), value, 0)
+    amax = finite.view(_CTX.world_size, -1).abs().amax(dim=1).float()
     dist.all_reduce(amax, op=dist.ReduceOp.MAX)
     return amax.clamp(min=1e-12) / _CTX.fp8_max
 
@@ -134,6 +165,8 @@ def _reference(codec, matrix, scale):
         quantize = aiter.get_hip_quant(aiter.QuantType.per_1x128)
         return quantize(matrix, quant_dtype=aiter.dtypes.fp8)
     if codec == "e4m3_external_scale":
+        # TorchAO's dynamic per-tensor activation quantization
+        # (_quantize_affine_float8), which the projection consuming this codec runs.
         payload = (matrix.float() / scale).clamp(-_CTX.fp8_max, _CTX.fp8_max)
         return payload.to(_CTX.fp8_dtype), scale.view(1, 1)
     if codec == "mxfp4":
@@ -241,8 +274,22 @@ class _Case:
         self.features = heads * HEAD_DIM
         self.shape = (1, rows * world_size, heads // world_size, HEAD_DIM)
         # Unused MXFP4 scale padding beyond the last valid row tile is not part of
-        # the A4W4 contract, so tails compare payload and GEMM output only.
-        self.compare_scales = codec != "mxfp4" or rows % 256 == 0
+        # the A4W4 contract, so tails compare the scales of real rows only, at
+        # their offsets in the shuffled layout (aiter::mx_scale_shuffle_idx).
+        self.valid_scale_index = None
+        if codec == "mxfp4" and rows % 256:
+            groups = self.features // 32
+            padded_groups = (groups + 7) // 8 * 8
+            row = torch.arange(rows, device=_CTX.device).view(-1, 1)
+            group = torch.arange(groups, device=_CTX.device).view(1, -1)
+            self.valid_scale_index = (
+                (row // 32 * padded_groups) * 32
+                + (group // 8) * 256
+                + (group % 4) * 64
+                + (row % 16) * 4
+                + (group % 8) // 4 * 2
+                + (row % 32) // 16
+            ).flatten()
         self.op = AttentionOutputA2AIntraNodeOp(
             rank=_CTX.rank,
             world_size=world_size,
@@ -269,12 +316,37 @@ class _Case:
 
     def check(self, result, expected, label):
         actual = _operands(result, self.codec, self.rows, self.features)
-        _exact(actual[0], expected[0], f"{label} payload")
-        if self.compare_scales:
+        # The E4M3 conversion writes a NaN with its sign bit set where TorchAO's
+        # cast clears it; both are NaN, so only that bit may differ.
+        nan_sign_free = self.codec == "e4m3_external_scale"
+        if nan_sign_free:
+            _exact_up_to_nan_sign(
+                actual[0].view(torch.uint8),
+                expected[0].view(torch.uint8),
+                f"{label} payload",
+                _is_fp8_e4m3fn_nan,
+            )
+        else:
+            _exact(actual[0], expected[0], f"{label} payload")
+        if self.valid_scale_index is None:
             _exact(actual[1], expected[1], f"{label} scale")
+        else:
+            index = self.valid_scale_index
+            _exact(
+                actual[1].view(torch.uint8).flatten()[index],
+                expected[1].view(torch.uint8).flatten()[index],
+                f"{label} scale",
+            )
         for name, gemm in self.consumers.items():
             # Bitwise: the BF16-maximum corner overflows to inf/NaN, and NaN != NaN.
-            if not torch.equal(
+            if nan_sign_free:
+                _exact_up_to_nan_sign(
+                    gemm(actual).view(torch.int16),
+                    gemm(expected).view(torch.int16),
+                    f"{label} {name} GEMM output",
+                    _is_bf16_nan,
+                )
+            elif not torch.equal(
                 gemm(actual).view(torch.int16), gemm(expected).view(torch.int16)
             ):
                 raise AssertionError(f"{label} {name} GEMM output differs")
@@ -325,6 +397,38 @@ def _check_case(case):
         "delayed rank",
         lambda: case.check(result, delayed_expected, "delayed"),
     )
+    _check_reuse_gate(case)
+
+
+def _check_reuse_gate(case):
+    """A reader of result N that is still running holds peers off at call N+2.
+
+    Result N stays valid across call N+1, so rank 0 reads it after that call, on the
+    op's stream and behind a delay, while its peers go straight on to call N+2. No
+    host synchronization separates them: only the parity reuse gate keeps the peers'
+    writes for call N+2 out of the buffers rank 0 is still reading.
+    """
+    values = [_random_input(case.shape, salt=salt) for salt in (6, 7, 8)]
+    scales = [case.scales_for(value) for value in values]
+    expected = case.expected(values[0], scales[0])
+    torch.cuda.synchronize()
+    dist.barrier(group=_CTX.cpu_group)
+    first = case.run(values[0], scales[0])
+    case.run(values[1], scales[1])
+    snapshot = None
+    if _CTX.rank == 0:
+        _delay_current_stream()
+        snapshot = SimpleNamespace(
+            payload=first.payload.clone(), scale=first.scale.clone()
+        )
+    case.run(values[2], scales[2])
+    torch.cuda.synchronize()
+
+    def slow_reader():
+        if snapshot is not None:
+            case.check(snapshot, expected, "slow reader")
+
+    _agree("slow reader", slow_reader)
 
 
 def _check_negative_construction():
@@ -384,6 +488,12 @@ def _check_negative_construction():
         lambda: e4m3(value[:, : 32 * world_size]),
         "expected contiguous",
     )
+    e4m3(value)
+    torch.cuda.synchronize()
+    side_stream = torch.cuda.Stream(device=_CTX.device)
+    _expect_all_ranks_raise(
+        "stream change", lambda: e4m3(value, stream=side_stream), "one stream"
+    )
     if _CTX.gfx == "gfx950":
         external = op(codec="e4m3_external_scale")
         _expect_all_ranks_raise(
@@ -430,7 +540,7 @@ def _run_rank(rank, world_size, port, codecs, rows_list, heads_list, blocks):
         cpu_group = dist.new_group(backend="gloo")
         torch._C._distributed_c10d._register_process_group("mori", cpu_group)
         ms.shmem_torch_process_group_init("mori")
-        gfx = get_gfx()
+        gfx = get_gfx_runtime()
         _CTX.rank, _CTX.world_size, _CTX.device, _CTX.gfx = (
             rank,
             world_size,
@@ -505,7 +615,8 @@ def main():
         type=int,
         nargs="*",
         default=[256, 1184],
-        help="destination rows per rank (1184 exercises non-256-row tails)",
+        help="destination rows per rank (1184 is not a multiple of 256, so it "
+        "exercises the row-tile tails)",
     )
     parser.add_argument(
         "--heads",
@@ -516,7 +627,7 @@ def main():
     )
     parser.add_argument("--blocks", type=int, default=128, help="workgroups per launch")
     args = parser.parse_args()
-    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
+    if not torch.cuda.is_available() or get_gfx_runtime() not in SUPPORTED_GFX:
         aiter.logger.warning("attention output A2A needs gfx942 or gfx950; skipping")
         return 0
     rows, checks = [], 0
