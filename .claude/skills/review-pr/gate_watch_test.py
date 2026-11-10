@@ -50,6 +50,10 @@ def drive(mod, scn):
         def _get(self, path):
             u = urllib.parse.urlparse(path)
             q = urllib.parse.parse_qs(u.query)
+            if u.path.endswith("/jobs"):
+                run_id = int(u.path.split("/runs/")[1].split("/")[0])
+                run = next((r for r in scn["queued"] if r["id"] == run_id), {})
+                return {"jobs": run.get("jobs", [])}
             if not u.path.endswith("/runs"):
                 raise AssertionError("unexpected GET %s" % path)
             if "/workflows/aiter-review-bot.yml/" not in u.path:
@@ -112,6 +116,18 @@ CASES = [
           "did not name the stuck run: %s" % r["lines"]),
      ]),
 
+    # A queued run is ambiguous: past its gate, a request waits for the single box and reads
+    # `queued` too. That wait is the box's queue -- the in-run watchdog's territory -- and
+    # paging about it would send someone to a healthy, busy box.
+    ("stays quiet about a request past its gate and waiting for the box",
+     {"queued": [dict(run_at(1, 35),
+                      jobs=[{"name": "gate", "status": "completed", "conclusion": "success"}])],
+      "now": NOW},
+     lambda r: [
+         (r["rc"] == 0, "paged about a request merely waiting for the box"),
+         (not r["errors"], "paged about a request merely waiting for the box: %s" % r["errors"]),
+     ]),
+
     # Exactly once per stuck request is the whole design: the window is one poll wide, so a run
     # an earlier poll already paged must not page again on every poll after it.
     ("pages once per stuck request, not once per poll",
@@ -170,6 +186,9 @@ MUTANTS = [
     ("the stuck threshold",
      "STUCK_MINUTES = 30", "STUCK_MINUTES = 3000",
      "pages when a request has sat queued past the threshold"),
+    ("the gate-job discriminator",
+     'if gate is not None and gate["status"] == "completed":', "if False:",
+     "stays quiet about a request past its gate and waiting for the box"),
     ("the one-poll page window",
      "WINDOW_MINUTES = 15", "WINDOW_MINUTES = 90",
      "stays quiet about a run an earlier poll already paged"),
