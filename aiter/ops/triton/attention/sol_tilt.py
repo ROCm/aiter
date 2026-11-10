@@ -13,6 +13,7 @@ sol_tilt_planes builds them for any recipe, encoded in its own K and V formats.
 
 from __future__ import annotations
 
+import functools
 import math
 from typing import NamedTuple
 
@@ -31,6 +32,14 @@ from aiter.ops.triton._triton_kernels.attention.sol_tilt import (
     _sol_tilt_unit_kernel,
     _sol_tilt_valu_kernel,
 )
+from aiter.ops.triton.utils.config_utils import (
+    load_config_json,
+    resolve_config_dir,
+    select_leq_config,
+)
+from aiter.ops.triton.utils.logger import AiterTritonLogger
+
+logger = AiterTritonLogger()
 
 # The FP8 row's score units per nat at unit softmax scale.
 _TILT_LOGIT_UNIT = math.log2(math.e) * 128.0 / 65535.0
@@ -41,6 +50,42 @@ _TILT_B_HEADROOM = 400.0 / 448.0
 # The widest KV tile any Sol row reads K scales in, whole tiles at a time, so every plane's scale
 # rows run zeroed to a multiple of this: E8M0 0 is 2^-127, while stray bytes reach inf.
 _TILT_SCALE_ROW_TILE = 128
+# Triton's default launch, for an arch without a measured SOL_TILT_FACTOR file.
+_FACTOR_FALLBACK = (4, 0)
+
+
+@functools.cache
+def _factor_schedules() -> dict | None:
+    """This device's SOL_TILT_FACTOR file, or None where none is published."""
+    path = f"{resolve_config_dir('attention', 'SOL_TILT_FACTOR')}/DEFAULT.json"
+    schedules = load_config_json(path, required=False)
+    if schedules is None:
+        logger.warning(
+            "No tuned sol_tilt factor schedule in '%s'; using fallback %s",
+            path,
+            _FACTOR_FALLBACK,
+        )
+    return schedules
+
+
+@torch.compiler.assume_constant_result
+def _factor_launch(to_bf16: bool, kv_tile: int) -> tuple[int, int]:
+    """(num_warps, waves_per_eu) of the factor kernel.
+
+    The schedule is keyed by the kernel's path ("fp8" for FP8 K and V, else "bf16", which int8 K
+    also takes), then bucketed by KV tile. The gfx950 values were measured on MI355X at Wan 2.2
+    720p, hd128, 5 and 40 heads and ranks 1 to 4: one warp beats the old 4 warps and 2 waves per
+    EU by 24-39% on the FP8 path and by 35-40% on the bf16 path at a 64 KV tile; at a 128 KV tile
+    the bf16 path wants two warps (9-20% faster), where one warp is up to 30% slower.
+
+    Marked constant so torch.compile reads the file eagerly rather than tracing the read.
+    """
+    schedules = _factor_schedules()
+    key = "bf16" if to_bf16 else "fp8"
+    if schedules is None or key not in schedules:
+        return _FACTOR_FALLBACK
+    entry = select_leq_config(schedules[key], kv_tile, prefix="BLOCK_N_LEQ_")
+    return entry["num_warps"], entry.get("waves_per_eu", 0)
 
 
 def _backed_scale_copy(scale: torch.Tensor) -> torch.Tensor:
@@ -440,6 +485,8 @@ def _tilt_factors(
     if full:
         gain = block_gain if block_gain is not None else planes_a
         gain_strides = block_gain.stride() if block_gain is not None else (0, 0, 0)
+        to_bf16 = not (k.dtype == v.dtype == torch.float8_e4m3fn)
+        num_warps, waves_per_eu = _factor_launch(to_bf16, kv_tile)
         _sol_tilt_factor_kernel[(full, heads, batch)](
             k,
             v,
@@ -459,14 +506,14 @@ def _tilt_factors(
             *gain_strides,
             *planes_a.stride()[:4],
             HAS_GAIN=block_gain is not None,
-            TO_BF16=not (k.dtype == v.dtype == torch.float8_e4m3fn),
+            TO_BF16=to_bf16,
             RANK=rank,
             WIDTH=max(16, triton.next_power_of_2(rank)),
             ITERS=power_iters,
             BLOCK_N=kv_tile,
             HEAD_DIM=d,
-            num_warps=4,
-            waves_per_eu=2,
+            num_warps=num_warps,
+            waves_per_eu=waves_per_eu,
         )
     return planes_a, planes_b, peaks
 
