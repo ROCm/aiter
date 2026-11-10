@@ -1,0 +1,39 @@
+# The one watcher outside the runs it watches. When GitHub-hosted runners starve, a review
+# request sits at run-level `queued` with no job started -- no gate, no review, no watchdog,
+# no report -- because every guard that could speak lives inside the very run that cannot
+# start. This poll is the only thing alive at that moment, and it pages by failing its own
+# job: a failed scheduled run notifies the workflow author, with no write permissions and no
+# bot token anywhere in this file.
+#
+# The page window is one poll wide (see gate_watch.py's WINDOW_MINUTES): the cron interval and
+# the window must stay equal, and check_prompts.py asserts that they do.
+name: review-bot gate watch
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+
+# A poll that hangs must not stack up behind itself; the newest poll has the freshest view.
+concurrency:
+  group: gate-watch
+  cancel-in-progress: true
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Watch for review requests starved of a hosted runner
+        run: python3 .claude/skills/review-pr/gate_watch.py
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OWNER_OVERRIDE: ${{ vars.AITER_RUNNER_OWNER }}
