@@ -1108,7 +1108,7 @@ def derive(files, title="", raw_diff=""):
     if re.search(r"cuda\.Stream|stream=|wait_stream", add):
         hit("async-stream", "G1 G1b")
     if any("flydsl" in p.lower() for p in paths):
-        hit("flydsl", "D10 D10b D12 C5")
+        hit("flydsl", "D10 D10b D12 D13 D14 C5")
     # KERNEL_PY lists the triton and gluon paths and stops there, so a FlyDSL kernel was a
     # kernel to `flydsl` (D10, D10b -- compile-result handling) and to nothing else: 95 of
     # 600 open PRs edit aiter/ops/flydsl/kernels/*.py and derive neither kernel family, so
@@ -1117,7 +1117,7 @@ def derive(files, title="", raw_diff=""):
     # `tl.load`/`tl.store` without a mask, and there is no tl in FlyDSL.
     if any("aiter/ops/flydsl/kernels/" in p and p.endswith(".py") and (f["add"] or f["del"])
            for p, f in files.items()):
-        hit("flydsl-kernel", "A1 A4 B8 D1 D8 D12 P6 C5")
+        hit("flydsl-kernel", "A1 A4 B8 D1 D8 D12 D13 D14 P6 C5")
     if any(d in p for p in paths for d in DOWNSTREAM):
         hit("downstream-op", "E4 E5 A2")   # A2 is the same shared-path condition
     if any("codegen" in p or p.startswith("csrc/cpp_itfs/") or p.endswith("Makefile")
@@ -1226,9 +1226,10 @@ UNREACHABLE_BY_DESIGN = {
     "D11": "evidence-backed: triage.py structabi writes struct_abi.txt in Step 1b",
 }
 
-ALL_RULES = ("A1 A2 A3 A4 B1 B2 B3 B4 B5 B6 B7 C1 C2 C3 C4 C5 D1 D1b D2 D3 D4 D5 D6 D7 D8 "
-             "D10 D10b E1 E2 E3 E4 E5 F1 G1 G1b P1 P2 P3 P4 P5 P6 HK1 HK2 HK3 "
-             "T1 T2 T3 T4 T5 T6 T8 D11 HK12 HK12b HK20 STEP4")
+ALL_RULES = ("A1 A2 A3 A4 B1 B2 B3 B4 B5 B6 B7 B8 C1 C2 C3 C4 C5 D1 D1b D2 D3 D4 D5 D6 D7 "
+             "D8 D10 D10b D13 D14 E1 E2 E3 E4 E5 F1 G1 G1b P1 P2 P3 P4 P5 P6 HK1 HK2 HK3 "
+             "T1 T2 T3 T4 T5 T6 T8 D11 D12 HK12 HK12b HK20 HK10 HK11 HK4 HK5 HK6 HK7 HK8 "
+             "HK9 STEP4")
 
 GUARD_NOISE = frozenset("""not is None True False and or in if else self len int float
 str bool tuple list dict set all any isinstance type return raise sizeof static_assert
