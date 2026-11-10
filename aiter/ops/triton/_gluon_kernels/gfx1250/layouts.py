@@ -43,7 +43,12 @@ def plan_warps(BM, BN, num_warps):
         elif can_n:
             wpcN *= 2
         else:
-            break
+            # Both dimensions hold one WMMA sub-tile. Replicate the remaining
+            # warps along M. The layout must carry num_warps warps: a layout
+            # with fewer is rejected ("Layout has 2 warps per CTA, but the
+            # context requires 4"), which made 16x16, 16x32 and 32x16 per-CTA
+            # tiles fail to compile at num_warps=4.
+            wpcM *= 2
     return [wpcM, wpcN]
 
 
