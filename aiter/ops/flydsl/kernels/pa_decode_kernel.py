@@ -522,6 +522,8 @@ def compile_pa_decode_tile(
                 stream=stream,
             )
 
+    if traits.WAVES_PER_EU_2:
+        pa_decode_tile_launch.compile_hints["waves_per_eu"] = 2
     compiled = {
         "launch": pa_decode_tile_launch,
         "kernel": pa_decode_tile_kernel,

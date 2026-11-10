@@ -30,8 +30,8 @@ BF16_LDS_LIMIT_BYTES = 64 * 1024
 MXFP4_LDS_LIMIT_BYTES = 160 * 1024
 PAGE_ID_STAGE_LIMIT = 4096  # i32 page ids, 16 KiB of LDS.
 # gfx942 K/V streaming (PaDecodeTraits.STREAM_KV): lane K-row bytes from which
-# one or several M-tiles stream, head groups per K load piece, K pieces and V
-# head chunks in flight.
+# a single M-tile streams on busy grids and from which every tile streams, head
+# groups per K load piece, K pieces and V head chunks in flight.
 STREAM_KV_ROW_BYTES = 384
 STREAM_KV_MTILES_ROW_BYTES = 1024
 STREAM_K_GROUPS = 4
@@ -403,6 +403,11 @@ class PaDecodeSchedule:
                 or (single_tile_plan and split_workgroups <= 2 * num_compute_units)
             )
         )
+        # gfx942: more CTAs than CUs hold work, so occupancy outweighs a
+        # single CTA's latency (see STREAM_KV and WAVES_PER_EU_2).
+        gfx942_busy = (
+            "gfx94" in arch and split_workgroups * query_splits > num_compute_units
+        )
         cache_key = (
             head_dim,
             query_group_size,
@@ -423,6 +428,7 @@ class PaDecodeSchedule:
             kv_dtype,
             bool(mask_unowned_kv),
             direct_output,
+            gfx942_busy,
             D256_PIPE,
             stage_pages,
         )
@@ -480,6 +486,7 @@ class PaDecodeTraits:
     BUFFER_KV: bool
     PAGE16_VPIPE: bool
     STREAM_KV: bool
+    WAVES_PER_EU_2: bool
     REUSE_KV_PAGES: bool
     SCALES_BEFORE_CURRENT_V: bool
     M1_SCALE_BEFORE_MASK: bool
@@ -563,6 +570,7 @@ class PaDecodeTraits:
             kv_dtype,
             mask_unowned_kv,
             DIRECT,
+            gfx942_busy,
             D256_PIPE,
             stage_page_capacity,
         ) = cache_key
@@ -646,15 +654,33 @@ class PaDecodeTraits:
         TUNE_PAGE128 = block_size == 128 and (PER_TOKEN_M1 or TUNED_SCALAR)
         PAGE16_VPIPE = prefetch_v and block_size == 16
         # gfx942 spills a whole next-tile K prefetch plus the tile's V gather
-        # once a lane's K row reaches STREAM_KV_ROW_BYTES; stream K and V per
-        # chunk instead. MTP M-tiles share each streamed chunk.
+        # once a lane's K row reaches STREAM_KV_MTILES_ROW_BYTES; stream K and
+        # V per chunk instead. MTP M-tiles share each streamed chunk. From
+        # STREAM_KV_ROW_BYTES a single M-tile no longer spills but runs at one
+        # wave per SIMD; streaming trades its K prefetch for occupancy, which
+        # only pays when more CTAs than CUs hold work.
+        kv_row_bytes = head_dim * QP_ELEM_BYTES
         STREAM_KV = (
             not is_gfx950
             and kv_dtype != MXFP4_KV_DTYPE
             and not MTP4_FUSED
             and not prefetch_v
-            and head_dim * QP_ELEM_BYTES
-            >= (STREAM_KV_ROW_BYTES if M_TILES == 1 else STREAM_KV_MTILES_ROW_BYTES)
+            and (
+                kv_row_bytes >= STREAM_KV_MTILES_ROW_BYTES
+                or (
+                    M_TILES == 1 and gfx942_busy and kv_row_bytes >= STREAM_KV_ROW_BYTES
+                )
+            )
+        )
+        # Multi-M-tile FP8 D128 needs 260-272 VGPRs, one wave per SIMD; capped
+        # at 256 it spills about ten and runs two, which pays on busy grids.
+        WAVES_PER_EU_2 = (
+            not is_gfx950
+            and kv_dtype in FP8_KV_DTYPES
+            and head_dim == 128
+            and M_TILES > 1
+            and gfx942_busy
+            and not STREAM_KV
         )
         REUSE_KV_PAGES = PER_TOKEN_M1 or (D256_PIPE and per_token_kv)
         SCALES_BEFORE_CURRENT_V = (
@@ -813,6 +839,7 @@ class PaDecodeTraits:
             BUFFER_KV=BUFFER_KV,
             PAGE16_VPIPE=PAGE16_VPIPE,
             STREAM_KV=STREAM_KV,
+            WAVES_PER_EU_2=WAVES_PER_EU_2,
             REUSE_KV_PAGES=REUSE_KV_PAGES,
             SCALES_BEFORE_CURRENT_V=SCALES_BEFORE_CURRENT_V,
             M1_SCALE_BEFORE_MASK=M1_SCALE_BEFORE_MASK,
