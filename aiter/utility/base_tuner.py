@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
+import math
 import os
 import shutil
 import sys
@@ -779,13 +780,18 @@ class TunerCommon:
 
         for info_key, time_list in grouped_results:
             tol_err_ratio = args.errRatio
-            sorted_time = sorted(time_list, key=lambda x: policy.rank(x[1], x[3]))
+            # Drop invalid candidates before sorting: a NaN timing makes every
+            # comparison False, so sorting first leaves the list out of order.
+            valid_time = [
+                (info_ex, us, max_err_ratio, watts)
+                for info_ex, us, max_err_ratio, watts in time_list
+                if max_err_ratio <= tol_err_ratio and math.isfinite(us) and us > 0
+            ]
             filtered_time = [
                 (info_ex, round(us, 4), max_err_ratio, watts)
-                for info_ex, us, max_err_ratio, watts in sorted_time
-                if max_err_ratio <= tol_err_ratio
-                and us != self.INVALID_TIME
-                and us != self.INF_TIME
+                for info_ex, us, max_err_ratio, watts in sorted(
+                    valid_time, key=lambda x: policy.rank(x[1], x[3])
+                )
             ]
             if len(filtered_time) == 0:
                 logger.error(
@@ -803,7 +809,7 @@ class TunerCommon:
             if not best_config:
                 logger.info(f"No kernel can be used for {info_key}")
                 best_config = [
-                    TuneResult((info_key, *sorted_time[0][0]), self.INVALID_TIME, 1.0)
+                    TuneResult((info_key, *time_list[0][0]), self.INVALID_TIME, 1.0)
                 ]
             bestConfigs.extend(best_config)
         resultdf = policy.attach_columns(self.result_to_df(bestConfigs), bestConfigs)
@@ -1902,7 +1908,7 @@ class GemmCommonTuner(TunerCommon):
         ### bpes: (inbpe, w_bpe, outbpe)
         ### gemm flops,bw
         info, time, _err_ratio = results
-        if time == -1:
+        if not math.isfinite(time) or time <= 0:
             return 0, 0
         if len(info[0]) >= 5:  # gfx-aware key: (gfx, cu_num, m, n, k, ...)
             _gfx, _cu_num, m, n, k, *_rest = info[0]
@@ -1961,29 +1967,23 @@ class GemmCommonTuner(TunerCommon):
     def result_to_csv(self, resultdf, file, concat=False):
         """post process of tuning results"""
         old_df = self.get_tuned_gemm_list(file)
+        numeric_us = pd.to_numeric(resultdf["us"], errors="coerce")
+        valid_time = numeric_us.gt(0) & numeric_us.map(math.isfinite)
         self.failed = pd.concat(
             [
                 self.failed,
-                resultdf[
-                    (resultdf["us"] == self.INVALID_TIME)
-                    | (resultdf["us"] == self.INF_TIME)
-                ],
+                resultdf[~valid_time],
             ],
             ignore_index=True,
         )
         self.success = pd.concat(
             [
                 self.success,
-                resultdf[
-                    (resultdf["us"] != self.INVALID_TIME)
-                    & (resultdf["us"] != self.INF_TIME)
-                ],
+                resultdf[valid_time],
             ],
             ignore_index=True,
         )
-        update_tunedf = resultdf[
-            (resultdf["us"] != self.INVALID_TIME) & (resultdf["us"] != self.INF_TIME)
-        ]  # self.success
+        update_tunedf = resultdf[valid_time]  # self.success
         if not concat:
             resultdf = self.update_tunedf(old_df, update_tunedf)
         else:
