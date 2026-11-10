@@ -188,6 +188,14 @@ print("every selector matches its contract")
 It reads the selector table, not a list you maintain by hand, so a contract
 that grows a parameter fails here on the next run rather than at a customer.
 
+**This is not just advice.** The same check runs in-tree as
+`tests/test_plugin_selector_arity.py`, with fixtures proving it catches a
+selector short by one. Verified against a real port: AKLR's four selectors pass
+against the committed baseline, and shortening one of them to six parameters —
+exactly the arity of the *other* GEMM contract, the mistake most likely to slip
+through — is reported as
+`gemm_a8w8_blockscale: contract takes 7, _select_gemm unpacks 6`.
+
 **Then ask the interface, not the kernel:**
 
 ```python
