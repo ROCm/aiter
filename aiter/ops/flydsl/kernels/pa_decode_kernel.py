@@ -512,6 +512,19 @@ def compile_pa_decode_tile(
                 stream=stream,
             )
 
+    if architecture == "gfx950" and traits.is_bf16_kv:
+        # The leading arguments preload into the free user SGPRs (the first
+        # seven pointers on gfx950), so the task skips a kernarg round trip.
+        # The count covers only the tile kernel's own leading arguments.
+        # Scaled caches stay unpreloaded: their scale pointers sit just past
+        # the preloaded prefix, and loading them alone costs another trip.
+        pa_decode_tile_launch.compile_hints["llvm_options"] = {
+            "amdgpu-kernarg-preload": True,
+            "amdgpu-kernarg-preload-count": 16,
+        }
+    if traits.FP8_MTP4_LEAN:
+        # Two CTAs per CU: hold the allocator to 256 registers per wave.
+        pa_decode_tile_launch.compile_hints["waves_per_eu"] = 2
     compiled = {
         "launch": pa_decode_tile_launch,
         "kernel": pa_decode_tile_kernel,
