@@ -6,7 +6,8 @@
 //   gfx950  -- v4: kernels compiled from opus/gfx950/mla_v4_prefill_*.hpp;
 //              v4.1: 16mx1_16nx4 compiled from opus/gfx950/mla_v41_prefill_a8w{8,4}_16mx1_16nx4.hpp,
 //              16mx4_64nx1 prebuilt code objects in hsa/gfx950/mla_opus/.
-//   gfx1250 -- v4 and v4.1 (a8w8): prebuilt code objects in hsa/gfx1250/mla_opus/.
+//   gfx1250 -- v4 and v4.1 (a8w8): prebuilt code objects in hsa/gfx1250/mla_opus/, built by
+//              opus/build_co.sh from opus/gfx1250/*.cu.
 
 #include "aiter_tensor.h"
 
@@ -513,6 +514,20 @@ int gfx1250_pick_cluster_y(int num_h_blocks)
     return 1;
 }
 
+// Heads per workgroup of the tile for H heads of N tokens: one narrower while N * H <=
+// kGfx1250NarrowHeadsPerCu * CUs (half for bf16 at H <= 32). _opus_split_fit mirrors it.
+constexpr int kGfx1250NarrowHeadsPerCu = 32;
+int gfx1250_pick_tile(int H, int N, bool bf16)
+{
+    if(H <= kGfx1250Heads16mx1)
+        return kGfx1250Heads16mx1;
+    const int64_t limit = int64_t(kGfx1250NarrowHeadsPerCu) * get_num_cu_func();
+    const int64_t nh    = int64_t(N) * H;
+    if(H <= kGfx1250Heads32mx1)
+        return nh <= (bf16 ? limit / 2 : limit) ? kGfx1250Heads16mx1 : kGfx1250Heads32mx1;
+    return nh <= limit ? kGfx1250Heads32mx1 : kGfx1250Heads16mx4;
+}
+
 // Launches `<name>[_split]_kernel` of `co` over grid (N, grid_y, num_splits).
 template <class Kargs>
 void gfx1250_launch(const std::string& name,
@@ -578,11 +593,13 @@ void gfx1250_dispatch(const char* co_16mx1,
         std::string s(co);
         return s.substr(s.rfind('/') + 1, s.size() - s.rfind('/') - 4);
     };
-    const int H = kargs.H;
-    if(H <= kGfx1250Heads16mx1)
+    const int H     = kargs.H;
+    const bool bf16 = std::is_same_v<Kargs, opus_mla_v4_prefill_kargs>;
+    const int tile  = gfx1250_pick_tile(H, kargs.N, bf16);
+    if(tile == kGfx1250Heads16mx1)
         return gfx1250_launch(
             stem(co_16mx1), co_16mx1, kargs, split, ceil_div(H, kGfx1250Heads16mx1), 1, stream);
-    if(H <= kGfx1250Heads32mx1)
+    if(tile == kGfx1250Heads32mx1)
         return gfx1250_launch(
             stem(co_32mx1), co_32mx1, kargs, split, ceil_div(H, kGfx1250Heads32mx1), 1, stream);
     const int num_h_blocks = ceil_div(H, kGfx1250Heads16mx4);
