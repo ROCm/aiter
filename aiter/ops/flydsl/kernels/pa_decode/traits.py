@@ -695,10 +695,14 @@ class PaDecodeTraits:
             is_gfx950
             and kv_dtype == "fp8"
             and head_dim == 128
-            and block_size == 128
             and M_TILES == 1
-            and CTA_ROWS == MFMA_MNK
             and sliding_window == 0
+            and (
+                (block_size == 128 and CTA_ROWS == MFMA_MNK)
+                # Scalar page 16 also covers partial tiles: padded rows load
+                # the last real row and are never staged.
+                or (block_size == 16 and not per_token_kv)
+            )
         )
         # gfx950 per-token FP8 page128 tiles that load Q early stage the
         # first tile's scales after Q, so Q quantizes while K is in flight.

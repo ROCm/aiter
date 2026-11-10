@@ -166,6 +166,10 @@ class PaDecodeQueryLoader:
             q_units_prefetched = []
             for m in range_constexpr(self.traits.M_TILES):
                 flat_idx = m * MFMA_MNK + self.ctx.qh_local
+                if const_expr((m + 1) * MFMA_MNK > self.traits.CTA_ROWS):
+                    # Keep padded rows' loads inside the query.
+                    last = fx.Int32(self.traits.CTA_ROWS - 1)
+                    flat_idx = (flat_idx < last).select(flat_idx, last)
                 qi = flat_idx // self.traits.query_group_size
                 gs_head = flat_idx - qi * self.traits.query_group_size
                 q_units_prefetched.append(self.load_row(qi, gs_head))
@@ -316,7 +320,15 @@ class PaDecodeQueryLoader:
                 )
                 self.stage_row(m, q_row_off, q_units)
             elif flat_idx < self.traits.CTA_ROWS:
-                self.stage_row(m, q_row_off, self.load_row(qi, gs_head))
+                self.stage_row(
+                    m,
+                    q_row_off,
+                    (
+                        q_units_prefetched[m]
+                        if const_expr(self._q_early())
+                        else self.load_row(qi, gs_head)
+                    ),
+                )
             else:
                 if const_expr(self.traits.is_bf16_kv):
                     for u in range_constexpr(self.traits.N_QLOADS):
