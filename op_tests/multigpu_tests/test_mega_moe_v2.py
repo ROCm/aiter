@@ -984,6 +984,11 @@ def _run_skewed_route_switch(moe, x, weights, ids, rounds, seed, rank, world):
     """
     if moe._large_m is None:
         raise AssertionError("skewed route switch requires the large-M path")
+    if world < 5:
+        # A source rank saturating five destinations needs at least five ranks.
+        if rank == 0:
+            print(f"[LARGE-M-ROUTE-SWITCH] SKIP world={world} < 5", flush=True)
+        return
     tokens = x.shape[0]
     local_experts = moe.experts // world
     _fwd(moe, x, weights, ids)

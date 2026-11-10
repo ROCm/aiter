@@ -104,8 +104,8 @@ variant of the profile's bundle plan.
   EP4, a8w4), `preload_aot_bundles()` also loads the small-input kernel of
   every token bucket of each reachable small-input capacity (256 and 512),
   and, for an MTPR in `large_m_mtprs_for()` of the layout (1024..16384 on
-  both), the large-input persistent kernel. The default build covers the EP4
-  profile at the MTPRs of ATOM's instances (`V41_FLASH_MTPRS`: 128, 8192,
+  EP8, 8192 and 16384 on EP4), the large-input persistent kernel. The
+  default build covers the EP4 profile at the MTPRs of ATOM's instances (`V41_FLASH_MTPRS`: 128, 8192,
   16384; the large-input kernel at 8192 and 16384); one MTPR of it alone:
   `python -m aiter.aot.flydsl.mega_moe --world-size 4 --model-dim 5120
   --inter-dim 2304 --experts-per-rank 96 --mtpr 8192 --quant a8w4`.
