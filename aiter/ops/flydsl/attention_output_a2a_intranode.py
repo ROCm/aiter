@@ -20,6 +20,7 @@ from .kernels.attention_a2a_intranode_kernel import make_attention_a2a_reuse_jit
 from .kernels.attention_output_a2a_intranode_kernel import (
     make_attention_output_a2a_jit,
     make_attention_output_packed_copy_jit,
+    mxfp6_pack_extents,
 )
 from .kernels.tensor_shim import _run_compiled
 
@@ -83,8 +84,12 @@ class AttentionOutputA2AIntraNodeOp:
       input becomes an FP8 NaN, though not always with TorchAO's sign bit. It
       is not aiter's static_per_tensor_quant, which multiplies by the hardware
       reciprocal of the scale and so rounds a few values differently.
-    - ``mxfp4``: E2M1 payload with E8M0 per-1x32 scales in the A4W4 layout.
-    - ``mxfp6``: packed payload and scales in the A6W6/A6W4 layout.
+    - ``mxfp4``: the A4W4 activation layout of aiter's per_1x32 quantizer: a
+      row-major E2M1 payload and E8M0 per-1x32 scales shuffled by
+      ``aiter::mx_scale_shuffle_idx``. It is not the H32-rotated FP4 operand that
+      A6W4 uses for weights, which has the same dtype and shape.
+    - ``mxfp6``: the activation tiles of the A6W6 packer
+      (``quant_mxfp6_gemm_out``), which the A6W6 and A6W4 GEMMs both read.
 
     ``e4m3_external_scale`` applies no scaling policy and performs no reduction,
     and it checks only the dtype, shape, device and contiguity of
@@ -96,7 +101,9 @@ class AttentionOutputA2AIntraNodeOp:
 
     ``group`` is mandatory and must contain exactly the MoRI participants.
     Construction checks that every rank agrees on the configuration and on the
-    offsets of every symmetric buffer before any exchange.
+    offsets of every symmetric buffer before any exchange. For ``mxfp6`` the copy
+    takes its tile geometry from the A6W6 packer, and construction checks that
+    the packer's pack sizes match the tiles the copy addresses.
 
     All calls must use one stream: the reuse gate takes reaching a call on that
     stream as proof that the consumers of the parity it reuses have finished. A
@@ -211,6 +218,30 @@ class AttentionOutputA2AIntraNodeOp:
             scale_dtype = torch.uint8
             result_payload_shape = (payload_size,)
             result_scale_shape = (scale_size,)
+            pack_per_destination = rows % 256 != 0
+            segments = world_size if pack_per_destination else 1
+            segment_payload_size, segment_scale_size = mxfp6_gemm_pack_size(
+                rows if pack_per_destination else shape[1], self.heads_local * shape[3]
+            )
+            # The packed copy addresses whole A6W6 tiles with the packer's tile
+            # geometry; refuse a packer whose pack sizes disagree with it.
+            extents = (
+                segment_payload_size * segments,
+                segment_scale_size * segments,
+                payload_size,
+                scale_size,
+            )
+            expected = mxfp6_pack_extents(
+                seq_local=rows,
+                heads_local=self.heads_local,
+                head_dim=shape[3],
+                npes=world_size,
+            )
+            if extents != expected:
+                raise ValueError(
+                    f"A6W6 pack extents {extents} differ from the packed copy's tile "
+                    f"layout {expected}"
+                )
         _require_raw_buffer_extent("payload", payload_size)
         _require_raw_buffer_extent(
             "scale", scale_size * torch.empty((), dtype=scale_dtype).element_size()
@@ -292,18 +323,9 @@ class AttentionOutputA2AIntraNodeOp:
             )
             self._pack_local = dynamic_per_group_scaled_quant
         elif self._canonical_pack and codec == "mxfp6":
-            from aiter.ops.gemm_op_a6w6 import (
-                mxfp6_gemm_pack_size,
-                quant_mxfp6_gemm_out,
-            )
+            from aiter.ops.gemm_op_a6w6 import quant_mxfp6_gemm_out
 
-            local_features = self.heads_local * shape[3]
-            self._pack_per_destination = self.seq_local % 256 != 0
-            pack_rows = self.seq_local if self._pack_per_destination else shape[1]
-            segment_payload_size, segment_scale_size = mxfp6_gemm_pack_size(
-                pack_rows, local_features
-            )
-            segments = world_size if self._pack_per_destination else 1
+            self._pack_per_destination = pack_per_destination
             local_payload_size = segment_payload_size * segments
             local_scale_size = segment_scale_size * segments
             self._local_payload_segment_size = segment_payload_size

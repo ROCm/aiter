@@ -19,6 +19,7 @@ import os
 import socket
 from multiprocessing import freeze_support, get_context
 from types import SimpleNamespace
+from unittest import mock
 
 import pandas as pd
 import torch
@@ -506,6 +507,20 @@ def _check_negative_construction():
             ),
             "destination_scales",
         )
+        import aiter.ops.gemm_op_a6w6 as a6w6
+
+        packer_size = a6w6.mxfp6_gemm_pack_size
+
+        def grown_size(rows, features):
+            payload, scale = packer_size(rows, features)
+            return payload, scale + 1024
+
+        with mock.patch.object(a6w6, "mxfp6_gemm_pack_size", grown_size):
+            _expect_all_ranks_raise(
+                "A6W6 pack size the copy does not address",
+                lambda: op(codec="mxfp6"),
+                "A6W6 pack extents",
+            )
     torch.cuda.synchronize()
     dist.barrier(group=_CTX.cpu_group)
 

@@ -21,11 +21,8 @@ _ROWS_PER_WAVE = 4
 _LANES_PER_ROW = 16
 _VALUES_PER_LANE = 8
 _MX_GROUP_SIZE = 32
-_MX_TILE_ROWS = 256
-_MX_K_TILE = 128
-_MX_K_GUARD_TILES = 2
-_MX_SCALE_TILE_BYTES = 1024
-_MXFP6_TILE_BYTES = 24576
+# The per_1x32 quantizer pads the rows of a shuffled A4W4 scale tensor to this.
+_A4W4_SCALE_ROW_TILE = 256
 # Must equal aiter::kAmaxFloor (csrc/include/quant_amax_floor.h), the value the
 # per_1x128 quantizer starts every group amax from.
 _AMAX_FLOOR = 1e-10
@@ -41,6 +38,32 @@ def _check_compile_target(arch):
         raise RuntimeError(
             f"FlyDSL compiles for {target}, but the attention output A2A runs on {arch}"
         )
+
+
+def mxfp6_pack_extents(*, seq_local, heads_local, head_dim, npes):
+    """Byte extents of the source and destination A6W6 packs the packed copy addresses.
+
+    Returns (source payload, source scale, destination payload, destination scale).
+    The tile geometry comes from the A6W6 packer, which owns the layout, so callers can
+    check these against mxfp6_gemm_pack_size.
+    """
+    from aiter.ops.gemm_op_a6w6 import (
+        _K_TILE,
+        _PACKED_TILE_BYTES,
+        _PADK,
+        _SCALE_TILE_BYTES,
+        _TILE,
+    )
+
+    row_tiles = _ceil(seq_local, _TILE) // _TILE
+    local_nk_pad = heads_local * head_dim // _K_TILE + _PADK
+    global_nk_pad = heads_local * npes * head_dim // _K_TILE + _PADK
+    return (
+        npes * row_tiles * local_nk_pad * _PACKED_TILE_BYTES,
+        npes * row_tiles * local_nk_pad * _SCALE_TILE_BYTES,
+        row_tiles * global_nk_pad * _PACKED_TILE_BYTES,
+        row_tiles * global_nk_pad * _SCALE_TILE_BYTES,
+    )
 
 
 def _a4w4_scale_index(row, group, padded_columns):
@@ -264,16 +287,27 @@ def make_attention_output_packed_copy_kernel(
     global_warps = block_num * warp_num_per_block
     peer_warps = global_warps // npes
     if codec == "mxfp6":
-        row_tiles = _ceil(seq_local, _MX_TILE_ROWS) // _MX_TILE_ROWS
-        local_k_tiles = local_k // _MX_K_TILE
-        local_nk_pad = local_k_tiles + _MX_K_GUARD_TILES
-        global_nk_pad = global_k // _MX_K_TILE + _MX_K_GUARD_TILES
-        source_row_tiles = _ceil(seq_local, _MX_TILE_ROWS) // _MX_TILE_ROWS * npes
-        source_payload_bytes = source_row_tiles * local_nk_pad * _MXFP6_TILE_BYTES
-        source_scale_bytes = source_row_tiles * local_nk_pad * _MX_SCALE_TILE_BYTES
-        output_payload_bytes = row_tiles * global_nk_pad * _MXFP6_TILE_BYTES
-        output_scale_bytes = row_tiles * global_nk_pad * _MX_SCALE_TILE_BYTES
-        tile_chunks = (_MXFP6_TILE_BYTES // 16, _MX_SCALE_TILE_BYTES // 16)
+        from aiter.ops.gemm_op_a6w6 import (
+            _K_TILE,
+            _PACKED_TILE_BYTES,
+            _PADK,
+            _SCALE_TILE_BYTES,
+            _TILE,
+        )
+
+        row_tiles = _ceil(seq_local, _TILE) // _TILE
+        local_k_tiles = local_k // _K_TILE
+        local_nk_pad = local_k_tiles + _PADK
+        global_nk_pad = global_k // _K_TILE + _PADK
+        (
+            source_payload_bytes,
+            source_scale_bytes,
+            output_payload_bytes,
+            output_scale_bytes,
+        ) = mxfp6_pack_extents(
+            seq_local=seq_local, heads_local=heads_local, head_dim=head_dim, npes=npes
+        )
+        tile_chunks = (_PACKED_TILE_BYTES // 16, _SCALE_TILE_BYTES // 16)
     else:
         local_payload_row_bytes = local_k // 2
         global_payload_row_bytes = global_k // 2
@@ -284,7 +318,7 @@ def make_attention_output_packed_copy_kernel(
         source_scale_bytes = seq_local * npes * local_scale_columns
         output_payload_bytes = seq_local * global_payload_row_bytes
         output_scale_bytes = (
-            _ceil(seq_local, _MX_TILE_ROWS) * global_scale_columns_padded
+            _ceil(seq_local, _A4W4_SCALE_ROW_TILE) * global_scale_columns_padded
         )
 
     shared_storage = fx.struct(
