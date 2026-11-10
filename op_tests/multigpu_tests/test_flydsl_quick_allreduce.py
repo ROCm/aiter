@@ -184,6 +184,7 @@ from aiter.ops.flydsl.kernels.comm.quick_allreduce_mesh import (
 )
 from aiter.ops.flydsl.kernels.comm.transport import (
     ATOMS,
+    has_release_fence,
 )
 from aiter.ops.flydsl.quick_allreduce import (
     _resolve_inbox_flags,
@@ -2592,9 +2593,11 @@ def test_quick_allreduce_rmsnorm_shipped(tp, algorithm):
         mxfp4=True,
     )
     # The super-tile a payload reaches depends on the host: whether publishes
-    # batch (inbox type and link) and the resident-clamped grid (CU count).
+    # batch (inbox type) and the resident-clamped grid (CU count). The fused
+    # engine batches only behind a release fence -- not ``batches_publishes``,
+    # whose PCIe-ring clause is the plain engine's alone.
     link = fly_policy.detect_link()
-    batched = batches_publishes(_resolve_inbox_flags("auto", tp)[1], algorithm, link)
+    batched = has_release_fence(_resolve_inbox_flags("auto", tp, link)[1])
     cu_count = int(torch.cuda.get_device_properties(0).multi_processor_count)
     fails, rows_all = [], []
     for *case, c in walk:
