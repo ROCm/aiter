@@ -54,6 +54,9 @@ _STREAM_VARIANTS = (
     "gfx1250_split4",
     "gfx1250_split2",
     "gfx1250_large",
+    "gfx1250_split5",
+    "gfx1250_split10",
+    "gfx1250_split14",
 )
 
 _DISTRIBUTED_VARIANTS = frozenset(
@@ -74,6 +77,9 @@ _DISTRIBUTED_VARIANTS = frozenset(
         "gfx1250_split8",
         "gfx1250_split4",
         "gfx1250_split2",
+        "gfx1250_split5",
+        "gfx1250_split10",
+        "gfx1250_split14",
     )
 )
 
@@ -83,6 +89,15 @@ _TAGGED_VARIANTS = _DISTRIBUTED_VARIANTS | {"gfx1250_large"}
 
 # Largest split first; each token tile and split gets its own CU.
 _GFX1250_SPLITS = (32, 16, 8, 4, 2)
+
+# On 256 CUs, (split, most token tiles) per hidden size from a gfx1250 sweep
+# of all split counts that divide H / 32. Splits 10 and 14 fill up to 240 and
+# 252 CUs where 16 or 8 would leave a third idle; clusters of 5 (three per
+# 16-WGP shader engine) hold up to 48 tiles.
+_GFX1250_SPLIT_TABLE = {
+    5120: ((32, 8), (10, 24), (8, 32), (5, 48), (4, 64), (2, 128)),
+    7168: ((32, 8), (14, 18), (8, 32), (4, 64), (2, 128)),
+}
 
 
 def _select_stream_variant(tokens, hidden=5120):
@@ -110,10 +125,16 @@ def _select_stream_variant(tokens, hidden=5120):
     return "large", 1
 
 
-def _select_gfx1250_variant(tokens, cu):
+def _select_gfx1250_variant(tokens, cu, hidden=5120):
     if tokens == 0:
         return "generic", 1
     blocks = (tokens + 15) // 16
+    table = _GFX1250_SPLIT_TABLE.get(hidden) if cu == 256 else None
+    if table is not None:
+        for split, most in table:
+            if blocks <= most:
+                return f"gfx1250_split{split}", split
+        return "gfx1250_large", 1
     for split in _GFX1250_SPLITS:
         if blocks * split <= cu:
             return f"gfx1250_split{split}", split
@@ -306,7 +327,7 @@ def _prepare_scratch(device, tokens, hidden, split_k=None, *, reuse_scratch=True
         if arch == "gfx950" and hidden in _STREAM_HIDDEN_SIZES:
             variant, selected_split = _select_stream_variant(tokens, hidden)
         elif arch == "gfx1250" and hidden in _STREAM_HIDDEN_SIZES:
-            variant, selected_split = _select_gfx1250_variant(tokens, cu)
+            variant, selected_split = _select_gfx1250_variant(tokens, cu, hidden)
         else:
             variant = "generic"
             selected_split = max(
