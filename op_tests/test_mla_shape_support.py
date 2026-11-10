@@ -724,6 +724,31 @@ def test_replanned_deep_copy_keeps_its_mode_for_the_next_copy(
     assert _mla_planned_cp_round_robin(wmd) is first
 
 
+def test_planned_cp_mode_does_not_follow_an_offset_slice(monkeypatch):
+    # A view finds its base's record only at the base's own address: an offset
+    # slice such as workspace[2:4] is another buffer, with no record until it is
+    # planned itself.
+    monkeypatch.setattr(attention, "_get_mla_metadata_v1_impl", lambda *a, **k: None)
+    workspace = torch.zeros(4, dtype=torch.uint64)
+    idx = torch.zeros(3, dtype=torch.int32)
+
+    def plan(work_metadata_ptrs, cprr):
+        aiter.get_mla_metadata_v1(
+            *(idx, idx, idx, 96, 1, False, work_metadata_ptrs, *(idx,) * 5),
+            is_cp_round_robin=cprr,
+        )
+
+    plan(workspace, True)
+    assert _mla_planned_cp_round_robin(workspace) is True
+    assert _mla_planned_cp_round_robin(workspace[:2]) is True
+    assert _mla_planned_cp_round_robin(workspace[2:4]) is None
+    assert _mla_planned_cp_round_robin(workspace[2:4][:1]) is None
+    plan(workspace[2:4], False)
+    assert _mla_planned_cp_round_robin(workspace[2:4]) is False
+    assert _mla_planned_cp_round_robin(workspace) is True
+    assert _mla_planned_cp_round_robin(workspace[:2]) is True
+
+
 def _cp_changes_head_fold(n, msq):
     plain, cprr = (
         get_mla_decode_shape_support(n, msq, dtypes.fp8, dtypes.fp8, **_cp(rr))

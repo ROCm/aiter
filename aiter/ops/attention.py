@@ -2578,7 +2578,9 @@ class _MlaPlannedCp:
     One cell per buffer, kept on its storage (keyed by data pointer, so views
     share it) and on the planned tensor (so copy.deepcopy snapshots it, and a
     view of the snapshot finds it on its base). A clone or copy_ into another
-    buffer has none: its mode reads as unknown (None).
+    buffer has none: its mode reads as unknown (None). A copy_ into a buffer that
+    was planned keeps that buffer's own record, which no longer describes the
+    copied contents; plan the destination with get_mla_metadata_v1 instead.
     """
 
     def __init__(self) -> None:
@@ -2595,12 +2597,15 @@ def _mla_planned_cp_cell(
     cells = getattr(storage, _MLA_PLANNED_CP_ATTR, None)
     cell = None if cells is None else cells.get(work_metadata_ptrs.data_ptr())
     if not create:
+        cell = cell or getattr(work_metadata_ptrs, _MLA_PLANNED_CP_ATTR, None)
+        if cell is not None:
+            return cell
+        # A view of a planned base is the same buffer only at the same address:
+        # an offset slice such as workspace[2:4] is another buffer.
         base = work_metadata_ptrs._base
-        return (
-            cell
-            or getattr(work_metadata_ptrs, _MLA_PLANNED_CP_ATTR, None)
-            or getattr(base, _MLA_PLANNED_CP_ATTR, None)
-        )
+        if base is not None and base.data_ptr() == work_metadata_ptrs.data_ptr():
+            return getattr(base, _MLA_PLANNED_CP_ATTR, None)
+        return None
     if cells is None:
         cells = {}
         setattr(storage, _MLA_PLANNED_CP_ATTR, cells)
