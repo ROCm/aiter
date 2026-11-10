@@ -796,8 +796,14 @@ class FmoeTuner(TunerCommon):
                 weight.view(E, -1), quant_dtype=quant_dtype
             )
         elif qType == QuantType.per_1x128:
+            # 128x128 blocks, scales [E, ceil(dim1 / 128), ceil(dim2 / 128)] as in
+            # checkpoints; zero padding lets partial edge blocks keep their own scale.
+            blocks1, blocks2 = -(-dim1 // 128), -(-dim2 // 128)
             weight_qt = (
-                weight.view(E, dim1 // 128, 128, dim2 // 128, 128)
+                torch.nn.functional.pad(
+                    weight, (0, blocks2 * 128 - dim2, 0, blocks1 * 128 - dim1)
+                )
+                .view(E, blocks1, 128, blocks2, 128)
                 .permute(0, 1, 3, 2, 4)
                 .contiguous()
                 .view(E, -1, 128 * 128)
@@ -805,13 +811,13 @@ class FmoeTuner(TunerCommon):
             weight_qt, weight_scale = aiter.pertoken_quant(
                 weight_qt, quant_dtype=quant_dtype
             )
-            weight_qt = weight_qt.view(E, -1)
             weight_qt = (
-                weight_qt.view(E, dim1 // 128, dim2 // 128, 128, 128)
+                weight_qt.view(E, blocks1, blocks2, 128, 128)
                 .permute(0, 1, 3, 2, 4)
+                .reshape(E, blocks1 * 128, blocks2 * 128)[:, :dim1, :dim2]
                 .contiguous()
-                .view(E, dim1, dim2)
             )
+            weight_scale = weight_scale.view(E, blocks1, blocks2)
         elif (
             qType == aiter.QuantType.per_Tensor and quant_dtype == torch.int4
         ):  # int4 w quant
@@ -2834,8 +2840,10 @@ class FmoeTuner(TunerCommon):
         AQDType = hidden_states.dtype
 
         if quant_type == aiter.QuantType.per_1x128:
+            # Groups of 128 along each route, 64 when inter_dim ends in a half block.
+            group = 128 if ref1.shape[-1] % 128 == 0 else 64
             a2_qt, a2_scale = aiter.pertoken_quant(
-                ref1.view(hidden_states.shape[0], -1, 128), quant_dtype=AQDType
+                ref1.view(ref1.shape[0], ref1.shape[1], -1, group), quant_dtype=AQDType
             )
         elif quant_type == QuantType.per_1x32:
             # per_1x32 stage-2 activation quant depends on the activation scheme,
@@ -4986,6 +4994,12 @@ class FmoeTuner(TunerCommon):
             doweight_stage1 = bool(row["doweight_stage1"])
             limit_env = os.environ.get("AITER_MXFP4_TUNE_SWIGLU_LIMIT")
             swiglu_limit = None if limit_env in (None, "") else float(limit_env)
+            if act_type == ActivationType.SwigluStep and swiglu_limit is None:
+                # Tuned rows carry no limit. 7.0 is the swiglu_limit of Step-5 and
+                # Step-3.5, the SwigluStep models; the env var overrides it. Only
+                # tuning and --run_config use this default: fused_moe callers
+                # (vLLM) pass the model's swiglu_limit.
+                swiglu_limit = 7.0
             # fused_moe overrides the activation quant dtype at runtime for
             # per_1x32 fp4-weight MoE (gate_mode defaults to SEPARATED, which
             # run_config does not override): Silu -> fp4, Swiglu -> bf16/fp4 by M.
@@ -5201,34 +5215,38 @@ class FmoeTuner(TunerCommon):
                     torch_quant = aiter.get_torch_quant(q_type)
                     a1_qt, a1_scale = torch_quant(hidden, quant_dtype=eff_q_dtype_a)
 
-                out, us = run_perftest(
-                    target_fused_moe,
-                    hidden,
-                    w1_qt_fmoe,
-                    w2_qt_fmoe,
-                    topk_weights,
-                    topk_ids,
-                    activation=act_type,
-                    quant_type=q_type,
-                    doweight_stage1=doweight_stage1,
+                moe_kwargs = {
+                    "activation": act_type,
+                    "quant_type": q_type,
+                    "doweight_stage1": doweight_stage1,
                     # The torch reference runs SiTUv2 with the model's betas;
                     # fused_moe defaults to 1.0. Without this every Situv2 shape
                     # reports logits_diff ~0.14 (out_norm/ref_norm ~0.61)
                     # regardless of which kernel it dispatched.
-                    beta=(
+                    "beta": (
                         DEFAULT_SITUV2_BETA
                         if act_type == ActivationType.Situv2
                         else None
                     ),
-                    linear_beta=(
+                    "linear_beta": (
                         DEFAULT_SITUV2_LINEAR_BETA
                         if act_type == ActivationType.Situv2
                         else None
                     ),
-                    swiglu_limit=swiglu_limit,
-                    w1_scale=w1_scale_fmoe,
-                    w2_scale=w2_scale_fmoe,
-                    dtype=dtype,
+                    "swiglu_limit": swiglu_limit,
+                    "w1_scale": w1_scale_fmoe,
+                    "w2_scale": w2_scale_fmoe,
+                    "dtype": dtype,
+                }
+                moe_args = (hidden, w1_qt_fmoe, w2_qt_fmoe, topk_weights, topk_ids)
+                if q_type == QuantType.per_1x128:
+                    # FlyDSL expands block scales once and keeps the result on the
+                    # scale tensors; do it before run_perftest copies them.
+                    target_fused_moe(*moe_args, **moe_kwargs)
+                out, us = run_perftest(
+                    target_fused_moe,
+                    *moe_args,
+                    **moe_kwargs,
                     num_warmup=args.warmup,
                     num_iters=args.iters,
                 )
@@ -6418,6 +6436,7 @@ class FmoeTuner(TunerCommon):
         from aiter.ops.flydsl.fused_moe_gfx942 import (
             Config,
             _Problem,
+            block_scale_groups,
             get_tune_space,
             run_flydsl_moe_gfx942,
         )
@@ -6495,25 +6514,41 @@ class FmoeTuner(TunerCommon):
         YELLOW = "\033[1;33m"
         RED = "\033[0;31m"
         END = "\033[0m"
+        quant_names = {
+            str(QuantType.No): "no",
+            str(QuantType.per_Token): "ptpc",
+            str(QuantType.per_Tensor): "per_tensor",
+            str(QuantType.per_1x128): "block",
+            str(QuantType.per_128x128): "block",
+        }
+
+        def problem(row):
+            quant_type = quant_names.get(row["q_type"], "")
+            scale_k1, scale_k2 = (
+                block_scale_groups(int(row["inter_dim"]))
+                if quant_type == "block"
+                else (0, 0)
+            )
+            return _Problem(
+                batch=int(row["token"]),
+                experts=int(row["expert"]),
+                gateup_dim=int(row["inter_dim"]) * 2,
+                hidden_dim=int(row["model_dim"]),
+                model_dim=int(row["model_dim"]),
+                inter_dim=int(row["inter_dim"]),
+                topk=int(row["topk"]),
+                quant_type=quant_type,
+                scale_k1=scale_k1,
+                scale_k2=scale_k2,
+            )
+
         for config_string in get_tune_space():
             config = Config.from_string(config_string)
             eligible_indices = [
                 position
                 for position, (_, row) in enumerate(self.untunedf.iterrows())
                 if not bool(row["doweight_stage1"])
-                and config.unsupported_reason(
-                    _Problem(
-                        batch=int(row["token"]),
-                        experts=int(row["expert"]),
-                        gateup_dim=int(row["inter_dim"]) * 2,
-                        hidden_dim=int(row["model_dim"]),
-                        model_dim=int(row["model_dim"]),
-                        inter_dim=int(row["inter_dim"]),
-                        topk=int(row["topk"]),
-                        quant_type=("no" if row["q_type"] == str(QuantType.No) else ""),
-                    )
-                )
-                is None
+                and config.unsupported_reason(problem(row)) is None
             ]
             if not eligible_indices:
                 continue

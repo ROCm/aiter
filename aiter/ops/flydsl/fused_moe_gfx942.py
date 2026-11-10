@@ -26,15 +26,63 @@ _ACTIVATIONS = {
     ActivationType.SwigluStep: "swiglustep",
 }
 
-# Block-scaled FP8: weight scales per (output row, K group) in [E, K // scale_k, N]
-# FP32, activations dynamically quantized per (token, K group) for prefill.
+# Block-scaled FP8 takes FP32 scales [E, ceil(N / b), ceil(K / b)] per weight,
+# b in {128, 64} per dim: checkpoint 128x128 blocks, or the 64x64 blocks vLLM
+# refines them to when a TP shard starts mid-block. The kernels read one scale
+# per (output row, K group) in [E, K // scale_k, N], and prefill quantizes
+# activations per (token, K group).
 _BLOCK_QUANT_TYPES = (QuantType.per_1x128, QuantType.per_128x128)
+# A dim of at most 64 is one block either way and expands the same; it reads as 128.
+_BLOCK_SIZES = (128, 64)
+
+
+def _blocks(n, block):
+    return -(-n // block)
+
+
+def _scale_blocks(scale, experts, rows, k):
+    """(block_n, block_k) of FP32 scales [experts, ceil(rows / block_n),
+    ceil(k / block_k)] with supported block sizes, else None."""
+    if (
+        scale is None
+        or scale.dtype != torch.float32
+        or scale.dim() != 3
+        or scale.shape[0] != experts
+    ):
+        return None
+    sizes = tuple(
+        next((b for b in _BLOCK_SIZES if _blocks(dim, b) == count), None)
+        for count, dim in ((scale.shape[1], rows), (scale.shape[2], k))
+    )
+    return None if None in sizes else sizes
+
+
+def _accepted_shape(experts, rows, k):
+    dims = ("|".join(str(_blocks(d, b)) for b in _BLOCK_SIZES) for d in (rows, k))
+    return f"[{experts}, {', '.join(dims)}]"
+
+
+def _describe(scale):
+    if scale is None:
+        return "None"
+    return f"{scale.dtype} {list(scale.shape)}"
+
+
+def block_scale_groups(inter_dim, w2_block_k=128):
+    """K groups (Gate/Up, Down) of the kernel scale layout.
+
+    Gate/Up uses 64 so one group fits every K tile and every scale block. The
+    prefill Down reads one group per K core, 128 wide unless inter_dim ends in
+    a half block. Groups never straddle w2 scale blocks, so 64-wide blocks get
+    64-wide Down groups; with inter_dim % 128 == 0 that leaves only decode.
+    """
+    return 64, min(128 if inter_dim % 128 == 0 else 64, w2_block_k)
 
 
 def flydsl_block_weight_scale(block_scale, rows, k, scale_k, block_n=128, block_k=128):
-    """Expand checkpoint block scales [E, ceil(rows/block_n), ceil(k/block_k)] to the
-    FlyDSL block layout [E, k // scale_k, rows]. Values are copied, never requantized,
-    so the scale_k groups must not straddle checkpoint K blocks."""
+    """Expand block scales [E, ceil(rows/block_n), ceil(k/block_k)] to the
+    FlyDSL kernel layout [E, k // scale_k, rows]. Values are copied, never
+    requantized, so the scale_k groups must not straddle checkpoint K blocks."""
     if block_k % scale_k != 0 or k % scale_k != 0:
         raise ValueError(
             f"scale_k={scale_k} must divide both block_k={block_k} and k={k}"
@@ -44,6 +92,30 @@ def flydsl_block_weight_scale(block_scale, rows, k, scale_k, block_n=128, block_
         :, :, : k // scale_k
     ]
     return expanded.transpose(1, 2).contiguous()
+
+
+# Expanding takes 0.1-0.2 ms per layer at Step-5 shapes (longer than a decode
+# MoE), so the kernel-layout copy is kept on the scale tensor itself: it is freed
+# with the tensor and follows copies of it. Like preshuffled weights, scales are
+# treated as constant once used; replace the tensor rather than update it in place.
+_KERNEL_SCALES_ATTR = "_flydsl_kernel_scales"
+
+
+def _kernel_block_scale(block_scale, rows, k, scale_k):
+    block_n, block_k = _scale_blocks(block_scale, block_scale.shape[0], rows, k)
+    cache = getattr(block_scale, _KERNEL_SCALES_ATTR, None)
+    key = (rows, k, scale_k, block_n, block_k)
+    if cache is not None and key in cache:
+        return cache[key]
+    scale = flydsl_block_weight_scale(block_scale, rows, k, scale_k, block_n, block_k)
+    # A capture records the expansion without running it, so the result is not
+    # reusable outside the graph. A warmup call before capture fills the cache.
+    if not torch.cuda.is_current_stream_capturing():
+        if cache is None:
+            cache = {}
+            setattr(block_scale, _KERNEL_SCALES_ATTR, cache)
+        cache[key] = scale
+    return scale
 
 
 @dataclass
@@ -142,7 +214,10 @@ class Config:
             if 64 % problem.scale_k1 != 0:
                 return "block-scaled Gate/Up scale group must divide the 64-wide K tile"
             if problem.scale_k2 != (128 if problem.inter_dim % 128 == 0 else 64):
-                return "block-scaled Down needs one scale group per 1x4_64x256 K core"
+                return (
+                    "block-scaled Down needs one scale group per 1x4_64x256 K core; "
+                    "64-wide w2 scale blocks need inter_dim % 128 != 0"
+                )
         if self.use_prefill and problem.quant_type == "no":
             if self.BLOCK_K not in (64, 128):
                 return "BF16 prefill requires Gate/Up BLOCK_K=64 or 128"
@@ -202,26 +277,22 @@ class _Problem:
         assert gateup_dim == 2 * inter_dim
         scale_k1 = scale_k2 = 0
         if quant_type in _BLOCK_QUANT_TYPES:
-            if (
-                w1_scale is None
-                or w2_scale is None
-                or w1_scale.dtype != torch.float32
-                or w2_scale.dtype != torch.float32
-                or w1_scale.dim() != 3
-                or w2_scale.dim() != 3
-                or tuple(w1_scale.shape[::2]) != (experts, gateup_dim)
-                or tuple(w2_scale.shape[::2]) != (experts, model_dim)
-                or hidden_dim % w1_scale.shape[1] != 0
-                or inter_dim % w2_scale.shape[1] != 0
-            ):
+            w1_blocks = _scale_blocks(w1_scale, experts, gateup_dim, hidden_dim)
+            w2_blocks = _scale_blocks(w2_scale, experts, model_dim, inter_dim)
+            if w1_blocks is None or w2_blocks is None:
                 raise ValueError(
-                    "block-scaled FP8 needs FP32 scales w1 [E, K1 // g1, 2 * inter_dim] "
-                    "and w2 [E, inter_dim // g2, model_dim] (see flydsl_block_weight_scale)"
+                    "block-scaled FP8 needs FP32 [E, ceil(N / b), ceil(K / b)] "
+                    f"block scales, b in {{128, 64}}: w1 "
+                    f"{_accepted_shape(experts, gateup_dim, hidden_dim)} and w2 "
+                    f"{_accepted_shape(experts, model_dim, inter_dim)}, got "
+                    f"{_describe(w1_scale)} and {_describe(w2_scale)}"
                 )
-            scale_k1 = hidden_dim // w1_scale.shape[1]
-            scale_k2 = inter_dim // w2_scale.shape[1]
-            if scale_k1 not in (64, 128) or scale_k2 not in (64, 128):
-                raise ValueError(f"unsupported scale groups {scale_k1=} {scale_k2=}")
+            if hidden_dim % 64 != 0 or inter_dim % 64 != 0:
+                raise ValueError(
+                    f"block-scaled FP8 needs K dims divisible by 64, got "
+                    f"{hidden_dim=} {inter_dim=}"
+                )
+            scale_k1, scale_k2 = block_scale_groups(inter_dim, w2_blocks[1])
         return cls(
             batch=int(hidden_states.shape[0]),
             experts=experts,
@@ -722,6 +793,15 @@ def run_flydsl_moe_gfx942(
     config_string: str,
     swiglu_limit: float | None = None,
 ) -> torch.Tensor:
+    """Whole MoE (sort, Gate/Up, activation, Down, reduction) with FlyDSL on gfx942.
+
+    Block-scaled FP8 (per_128x128 or per_1x128) takes FP32 block scales
+    w1_scale [E, ceil(2 * inter_dim / b), ceil(model_dim / b)] and
+    w2_scale [E, ceil(model_dim / b), ceil(inter_dim / b)], b in {128, 64} per dim
+    (64 when vLLM refines checkpoint blocks for a TP shard). They are expanded
+    to the kernel layout once per scale tensor and cached; call once outside CUDA
+    graph capture (any warmup does) so the captured graph reads the cached copy.
+    """
     if num_local_tokens is not None:
         raise NotImplementedError(
             "gfx942 FlyDSL whole-graph backend does not support num_local_tokens"
@@ -779,6 +859,13 @@ def run_flydsl_moe_gfx942(
         raise RuntimeError(
             f"Unsupported gfx942 FlyDSL MoE config {config_string!r}: "
             f"{unsupported_reason}"
+        )
+    if problem.quant_type == "block":
+        w1_scale = _kernel_block_scale(
+            w1_scale, problem.gateup_dim, problem.hidden_dim, problem.scale_k1
+        )
+        w2_scale = _kernel_block_scale(
+            w2_scale, problem.model_dim, problem.inter_dim, problem.scale_k2
         )
     if config.use_prefill:
         return _run_prefill(

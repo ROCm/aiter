@@ -6075,6 +6075,14 @@ def situv2(
     return situ_gate * up_scaled
 
 
+def _dequant_block_128x128(w, scale):
+    """FP32 weights [E, N, K] times block scales [E, ceil(N / 128), ceil(K / 128)]."""
+    experts, n, k = w.shape
+    scale = scale.view(experts, -(-n // 128), -(-k // 128))
+    scale = scale.repeat_interleave(128, dim=1).repeat_interleave(128, dim=2)
+    return w * scale[:, :n, :k]
+
+
 def torch_moe_stage1(
     hidden_states,
     w1,  # E, inter_dim*2, model_dim
@@ -6131,13 +6139,7 @@ def torch_moe_stage1(
         hidden_states = hidden_states * a1_scale
     # per_128x128
     elif quant_type in [QuantType.per_128x128, QuantType.per_1x128]:
-        w1_shape = w1.shape
-        w1 = w1.view(
-            w1.shape[0], w1.shape[1] // 128, 128, w1.shape[2] // 128, 128
-        ) * w1_scale.view(
-            w1_scale.shape[0], w1.shape[1] // 128, 1, w1.shape[2] // 128, 1
-        )
-        w1 = w1.view(w1_shape)
+        w1 = _dequant_block_128x128(w1, w1_scale)
 
         a1_scale = a1_scale.view(hidden_states.shape[0], -1, 1)
         a1_scale = a1_scale.repeat(
@@ -6284,17 +6286,12 @@ def torch_moe_stage2(
         hidden_states = hidden_states * a2_scale.view(a2_scale.shape[0], -1, 1)
         w2 = w2 * w2_scale.view(w2_scale.shape[0], -1, 1)
     elif quant_type in [QuantType.per_128x128, QuantType.per_1x128]:
+        # One activation scale per (route, K group); groups are 128 wide unless
+        # inter_dim ends in a half block.
         a2_scale = a2_scale.view(hidden_states.shape[0], topk, -1, 1)
-        a2_scale = a2_scale.repeat(1, 1, 1, 128).view(hidden_states.shape[0], topk, -1)
-        hidden_states = hidden_states * a2_scale
-
-        w2_shape = w2.shape
-        w2 = w2.view(
-            w2.shape[0], w2.shape[1] // 128, 128, w2.shape[2] // 128, 128
-        ) * w2_scale.view(
-            w2_scale.shape[0], w2.shape[1] // 128, 1, w2.shape[2] // 128, 1
-        )
-        w2 = w2.view(w2_shape)
+        a2_scale = a2_scale.repeat(1, 1, 1, inter_dim // a2_scale.shape[2])
+        hidden_states = hidden_states * a2_scale.view(hidden_states.shape)
+        w2 = _dequant_block_128x128(w2, w2_scale)
     elif (
         quant_type == QuantType.per_1x32
         and w2_scale is not None
