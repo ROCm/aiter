@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import re
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -505,7 +507,15 @@ def _run_streamk(
         persistent_partials=persistent_partials,
     )
     assert not torch.isnan(out).any(), "the Stream-K kernel left elements unwritten"
-    torch.testing.assert_close(out, F.linear(x, w, bias=b), atol=1e-1, rtol=1e-2)
+    if config and config.get("STREAMK_PARTIALS") == "16bit":
+        # A 16-bit partial is rounded relative to itself, not to the sum: partials of
+        # about sqrt(K) (randn inputs) that cancel leave their rounding on a small
+        # output. 2e-2 sqrt(K) is about twice the worst case, still far below a wrong
+        # or missing partial (about sqrt(K / n)).
+        atol = 2e-2 * K**0.5
+        torch.testing.assert_close(out, F.linear(x, w, bias=b), atol=atol, rtol=1e-2)
+    else:
+        torch.testing.assert_close(out, F.linear(x, w, bias=b), atol=1e-1, rtol=1e-2)
 
 
 # Shapes in units of a 128x128 tile with K = 512 (four K-pairs), sized for 256 CUs:
@@ -752,6 +762,206 @@ def test_gemm_a16_w16_gluon_streamk_persistent_partials(case, persistent_partial
     big = {"BLOCK_M": 256, "BLOCK_N": 256, "BLOCK_K": 64}
     for shape, cfg in [((M, N, K), config), ((4352, 4096, 512), big)] * 2:
         _run_streamk(*shape, cfg, persistent_partials=persistent_partials)
+
+
+_P16_CASES = [
+    "owner",
+    "rs",
+    "l2",
+    "two_tile",
+    "spread",
+    "compact_owner",
+    "compact_rs",
+    "compact_l2",
+    "ragged_rs",
+    "ragged_n_owner",
+    "kres_gt_rs",
+]
+
+
+@pytest.mark.parametrize("case", _P16_CASES)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("bias", [False, True])
+def test_gemm_a16_w16_gluon_streamk_16bit_partials(case, dtype, bias):
+    """Every policy and ending that stores partials, with 16-bit partials."""
+    (M, N, K), plan = _STREAMK_CASES[case]
+    config = {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64, **plan}
+    _run_streamk(
+        M, N, K, dict(config, STREAMK_PARTIALS="16bit"), dtype=dtype, bias=bias
+    )
+
+
+@pytest.mark.parametrize(
+    "tile",
+    [
+        (256, 256, 64),  # quadrants of 16 blocks, paired 32 columns apart
+        (256, 128, 64),
+        (128, 64, 64),  # one block wide: paired 32 rows apart
+        (256, 64, 64),
+        (64, 64, 64),  # one block: tl with tr, bl with br
+        (64, 64, 128),
+    ],
+)
+@pytest.mark.parametrize("fixup, tail_split_k", [("owner", 4), ("rs", 2), ("rs", 8)])
+@pytest.mark.parametrize("ragged", [False, True])
+def test_gemm_a16_w16_gluon_streamk_16bit_partials_tiles(
+    tile, fixup, tail_split_k, ragged
+):
+    """16-bit partials at every pairing of blocks, on a shape with a tail of 16 tiles
+    after one wave (256 CUs)."""
+    bm, bn, bk = tile
+    M, N, K = 17 * bm, 16 * bn, 16 * bk
+    if ragged:
+        M, N, K = M - bm // 8, N - bn // 8, K - 16
+    config = {"BLOCK_M": bm, "BLOCK_N": bn, "BLOCK_K": bk, "GROUP_SIZE_M": 4}
+    config.update(
+        _streamk_plan("one_tile", fixup, tail_split_k), STREAMK_PARTIALS="16bit"
+    )
+    _run_streamk(M, N, K, config, bias=True)
+
+
+def test_gemm_a16_w16_gluon_streamk_16bit_partials_config():
+    """16-bit partials: only plans that store partials take them, a tile-only config
+    keeps them only when the default plan stores partials, kernelNames round-trip,
+    and the tuner adds them only when asked."""
+    M, N, K = 2176, 2048, 4096
+    _skip_unsupported_gluon("gluon", "streamk", M, N, K)
+    from aiter.ops.triton._gluon_kernels.gfx950.gemm.basic.gemm_a16w16_streamk import (
+        StreamKConfig,
+        complete_config,
+        kernel_name,
+        parse_kernel_name,
+        tuning_candidates,
+    )
+
+    tile = {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_SIZE_M": 4}
+    for policy in ("dp", "dp_sub"):
+        with pytest.raises(ValueError, match="stores no partials"):
+            StreamKConfig.from_dict(
+                {**tile, **_streamk_plan(policy), "STREAMK_PARTIALS": "16bit"}
+            )
+    with pytest.raises(ValueError, match="STREAMK_PARTIALS"):
+        StreamKConfig.from_dict(
+            {**tile, **_streamk_plan("dp"), "STREAMK_PARTIALS": "bf16"}
+        )
+    config = {
+        **tile,
+        **_streamk_plan("one_tile", "rs", 8, "l2"),
+        "STREAMK_PARTIALS": "16bit",
+    }
+    name = kernel_name(config)
+    assert name == "gluon_streamk_128x128x64_g4_one_tile_rs_k8_l2_p16"
+    assert parse_kernel_name(name) == config
+    assert kernel_name({**config, "STREAMK_PARTIALS": "fp32"}) == name[: -len("_p16")]
+    # The default plan at 256 CUs: a K split at K = 8192 (a tail of 16), dp_sub at 512.
+    split = complete_config(
+        {**tile, "STREAMK_PARTIALS": "16bit"}, 2176, 2048, 8192, 256
+    )
+    assert split["STREAMK_POLICY"] == "one_tile"
+    assert split["STREAMK_PARTIALS"] == "16bit"
+    sub = complete_config({**tile, "STREAMK_PARTIALS": "16bit"}, 2176, 2048, 512, 256)
+    assert sub["STREAMK_POLICY"] == "dp_sub" and sub["STREAMK_PARTIALS"] == "fp32"
+
+    plain = [kernel_name(c) for c in tuning_candidates(M, N, K)]
+    both = [kernel_name(c) for c in tuning_candidates(M, N, K, partials_16bit=True)]
+    assert not any(n.endswith("_p16") for n in plain)
+    assert set(plain) < set(both) and len(set(both)) == len(both)
+    extra = [n for n in both if n not in plain]
+    assert extra and all(n.endswith("_p16") for n in extra)
+    assert all(parse_kernel_name(n)["STREAMK_POLICY"] != "dp" for n in extra)
+
+
+def test_gemm_a16_w16_gluon_streamk_reduce_scatter_trip():
+    """A reduce-scatter trip reads at most the tile's tail_split_k partials, and a
+    reader's slice is a whole number of groups."""
+    from aiter.ops.triton._gluon_kernels.gfx950.gemm.basic.gemm_a16w16_streamk import (
+        TileSpec,
+        reduce_scatter_config,
+    )
+
+    for bm, bn in ((64, 64), (128, 64), (128, 128), (256, 256)):
+        tile = TileSpec(bm, bn, 64)
+        for k in (2, 3, 4, 6, 8, 16):
+            for p16 in (False, True):
+                rs = reduce_scatter_config(tile, k, p16=p16)
+                assert rs.partials_per_trip <= k, (tile, k, p16, rs)
+                assert (tile.blocks // rs.readers) % rs.blocks_per_group == 0
+    # 64x64 at k = 4: 4 fp32 readers of one block, each partial one load, so one trip
+    # of 4 loads rather than 16 with 12 masked off.
+    assert reduce_scatter_config(TileSpec(64, 64, 64), 4).partials_per_trip == 4
+
+
+def test_gemm_a16_w16_gluon_streamk_16bit_partials_tuned_gemm():
+    """tuned_gemm runs a tuned 16-bit-partials row."""
+    M, N, K = 2176, 2048, 512
+    _skip_unsupported_gluon("gluon", "streamk", M, N, K)
+    from aiter.tuned_gemm import gluon_gemm
+
+    x, w, _, out_dtype, _ = generate_gemm_a16w16_inputs(
+        M, N, K, torch.bfloat16, output=False
+    )
+    name = "gluon_streamk_128x128x64_g4_one_tile_rs_k4_wt_p16"
+    out = gluon_gemm(x, w, 0, None, out_dtype, config={"kernelName": name})
+    torch.testing.assert_close(out, F.linear(x, w), atol=2e-2 * K**0.5, rtol=1e-2)
+
+
+def _streamk_compiled(M, N, K, config, **run_kwargs):
+    """The one Stream-K kernel compiled for a config (run through _run_streamk)."""
+    from aiter.ops.triton._gluon_kernels.gfx950.gemm.basic.gemm_a16w16_streamk import (
+        _gemm_a16w16_streamk_kernel,
+    )
+
+    _gemm_a16w16_streamk_kernel.device_caches.clear()  # inspect this compile only
+    _run_streamk(M, N, K, config, **run_kwargs)
+    compiled = [
+        kernel
+        for entry in _gemm_a16w16_streamk_kernel.device_caches.values()
+        for kernel in entry[0].values()
+    ]
+    assert len(compiled) == 1
+    return compiled[0]
+
+
+def _streamk_memory_ops(M, N, K, config):
+    """The narrow (below 16-byte) buffer / global accesses in the compiled Stream-K
+    kernel for a config."""
+    ops = re.findall(
+        r"^\s*((?:buffer|global)_(?:load|store)_\w+)",
+        _streamk_compiled(M, N, K, config).asm["amdgcn"],
+        re.M,
+    )
+    return [op for op in ops if not op.endswith(("x4", "b128"))]
+
+
+@pytest.mark.parametrize("tile", [(256, 256, 64), (128, 64, 64), (64, 64, 64)])
+@pytest.mark.parametrize("fixup", ["owner", "rs"])
+@pytest.mark.parametrize("n_less", [0, 8])
+def test_gemm_a16_w16_gluon_streamk_16bit_partials_width(tile, fixup, n_less):
+    """16-bit partials are stored and read 16 bytes per lane: the 16-bit build has
+    no more narrow accesses than the fp32 build of the same plan. An N of 8 mod 16
+    (n_less 8), whose row stride the launch cannot prove 16-byte aligned, stores C no
+    narrower than 16 bytes either."""
+    bm, bn, bk = tile
+    M, N, K = 17 * bm, 16 * bn - n_less, 16 * bk
+    config = {"BLOCK_M": bm, "BLOCK_N": bn, "BLOCK_K": bk, "GROUP_SIZE_M": 4}
+    config.update(_streamk_plan("one_tile", fixup, 4))
+    fp32 = _streamk_memory_ops(M, N, K, config)
+    p16 = _streamk_memory_ops(M, N, K, dict(config, STREAMK_PARTIALS="16bit"))
+    assert len(p16) <= len(fp32), (fp32, p16)
+    assert not any(op.endswith("_short") for op in fp32 + p16), (fp32, p16)
+
+
+@pytest.mark.parametrize(
+    "dtype, ir_type", [(torch.float16, "f16"), (torch.bfloat16, "bf16")]
+)
+def test_gemm_a16_w16_gluon_streamk_16bit_partials_dtype(dtype, ir_type):
+    """16-bit partials take C's type: fp16 partials for an fp16 GEMM, not bf16."""
+    M, N, K = 17 * 128, 16 * 128, 512
+    config = {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_SIZE_M": 4}
+    config.update(_streamk_plan("one_tile", "owner", 4), STREAMK_PARTIALS="16bit")
+    kernel = _streamk_compiled(M, N, K, config, dtype=dtype, bias=True)
+    p_type = re.search(r"%p_ptr: !tt\.ptr<(\w+)>", kernel.asm["ttgir"])
+    assert p_type is not None and p_type.group(1) == ir_type, p_type
 
 
 @pytest.mark.parametrize("tile", [(256, 256, 64), (64, 64, 64)])

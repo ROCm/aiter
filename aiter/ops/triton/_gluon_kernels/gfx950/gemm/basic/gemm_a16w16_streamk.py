@@ -68,7 +68,7 @@ persistent loop, each tile's epilogue prefetching the program's next tile.
 STREAMK_FIXUP, how one_tile's TAIL_SPLIT_K partial sums are combined (spread and
 two_tile always use the owner).
 
-    "owner"  the program with a tile's first pairs owns it; the others store fp32
+    "owner"  the program with a tile's first pairs owns it; the others store their
              partials and raise a flag; the owner adds them one after another:
                  p1, p2, p3 --partial--> p0 --> C tile
              Fewest bytes, but n - 1 serial reads: suits small TAIL_SPLIT_K.
@@ -89,6 +89,12 @@ STREAMK_EXCHANGE, where partials and flags travel.
 
 TAIL_SPLIT_K, programs per tail tile, each running an even share of its K-pairs: an
 integer 2 <= TAIL_SPLIT_K <= min(P // S, k) for one_tile, None for the other policies.
+
+STREAMK_PARTIALS (optional, default "fp32"): "16bit" stores the partials in C's type
+(bf16 or fp16), half the bytes; they are still summed in fp32. The extra rounding
+raises the RMS error 1.2-1.5 times over fp32 partials (the largest error up to about
+2 times). Only the policies that store partials (one_tile, two_tile, spread) take it;
+the default plan stays fp32.
 
 dp_sub's sub-tile (TAIL_BLOCK_M x TAIL_BLOCK_N, sides in 64, 128, 256 dividing the
 tile's) is derived from the shape at launch, so a tuned dp_sub follows M: the largest
@@ -411,7 +417,14 @@ def _gemm_a16w16_streamk_kernel(
     (BLOCK_N / TAIL_BLOCK_N) sub-tiles (tail_unit_coords), and one program runs each
     sub-tile over its whole K, with no partials. TAIL_EVEN_M / TAIL_EVEN_N are
     EVEN_M / EVEN_N at the sub-tile's size.
+
+    P is fp32, or typed like C for 16-bit partials (is_16bit_partial), stored in pairs
+    of blocks (pair_layout); their sums stay fp32.
     """
+    gl.static_assert(
+        p_ptr.dtype.element_ty == gl.float32
+        or p_ptr.dtype.element_ty == c_ptr.dtype.element_ty
+    )
     start = gl.program_id(axis=0)
     num_tiles_m = gl.cdiv(M, BLOCK_M)
     num_tiles_n = gl.cdiv(N, BLOCK_N)
@@ -422,7 +435,10 @@ def _gemm_a16w16_streamk_kernel(
     # Every layout follows the tile: the shared layouts come from the dot-operand
     # layouts and the global-load layouts from the shared layouts.
     mfmaLayout: gl.constexpr = gl.amd.AMDMFMALayout(
-        version=4, instr_shape=[16, 16, 32], transposed=True, warps_per_cta=[2, 2]
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=MFMA_WARPS_MN,
     )
     dotOpLayoutA: gl.constexpr = gl.DotOperandLayout(
         operand_index=0, parent=mfmaLayout, k_width=8
@@ -827,13 +843,15 @@ def _gemm_a16w16_streamk_kernel(
         # The wt reduce-scatter reads with RS_R = TAIL_SPLIT_K + RS_E programs when RS_E
         # idle programs join each tile (rs_readers); otherwise with its own.
         RS_ALL: gl.constexpr = REDUCE_SCATTER and not L2
+        # 16-bit readers read whole pairs of blocks.
+        RS_MAX: gl.constexpr = NBLK // 2 if is_16bit_partial(p_ptr) else NBLK
         if RS_ALL and RS_E > 0:
-            gl.static_assert(RS_R == TAIL_SPLIT_K + RS_E and RS_R <= NBLK)
+            gl.static_assert(RS_R == TAIL_SPLIT_K + RS_E and RS_R <= RS_MAX)
         else:
-            gl.static_assert(RS_R > 0 and RS_R <= TAIL_SPLIT_K)
+            RS_OWN: gl.constexpr = min(pow2_floor(TAIL_SPLIT_K), RS_MAX)
             gl.static_assert(
-                2 * RS_R > TAIL_SPLIT_K or RS_R == NBLK,
-                "RS_R does not match TAIL_SPLIT_K",
+                RS_R == RS_OWN,
+                "RS_R is not the tile's own readers (reduce_scatter_config)",
             )
         gl.static_assert((RS_R & (RS_R - 1)) == 0)
         gl.static_assert(RS_NB == 1 or RS_NB * RS_R <= NBLK)
@@ -2072,13 +2090,25 @@ def l2_tile_barrier(
 # One 32x32 MFMA accumulator block (a register vector over 4 warps): each warp holds
 # one 16x16 MFMA output, in which lane l holds row l % 16, columns 4 (l // 16) .. + 3.
 # Its elements are stored [warp][lane][4 registers].
+# The MFMA layout's warps (rows, columns). The partials' 32x32 block (MFMA_BLOCK_DIM)
+# is the 2 x 2 warps' 16x16 outputs, so every partial map assumes [2, 2].
+MFMA_WARPS_MN = gl.constexpr([2, 2])
+assert MFMA_WARPS_MN.value == [2, 2], "the partial maps assume 2 x 2 MFMA warps"
 MFMA_DIM = gl.constexpr(16)  # rows and columns of one warp's MFMA output
 MFMA_BLOCK_DIM = gl.constexpr(2 * MFMA_DIM.value)  # 32, the 2 x 2 warps' outputs
 MFMA_LANE_ELEMS = gl.constexpr(4)  # registers 0-3 of a lane, 4 adjacent columns
+WAVE_LANES = gl.constexpr(64)  # lanes of a warp (wave64)
 # 64, the 4 columns of 16 lanes
 MFMA_GROUP_ELEMS = gl.constexpr(MFMA_DIM.value * MFMA_LANE_ELEMS.value)
-MFMA_WARP_ELEMS = gl.constexpr(64 * MFMA_LANE_ELEMS.value)  # 256, a 16x16 output
+# 256, a 16x16 output
+MFMA_WARP_ELEMS = gl.constexpr(WAVE_LANES.value * MFMA_LANE_ELEMS.value)
 MFMA_BLOCK_ELEMS = gl.constexpr(4 * MFMA_WARP_ELEMS.value)  # 1024, the 32x32 block
+# 8, the 4-column groups across a block
+BLOCK_GROUPS = gl.constexpr(MFMA_BLOCK_DIM.value // MFMA_LANE_ELEMS.value)
+# A pair of 32x32 blocks of 16-bit partials (pair_layout): 2048 elements, a lane's
+# 4 registers of each block, 8 elements.
+PAIR_ELEMS = gl.constexpr(2 * MFMA_BLOCK_ELEMS.value)
+PAIR_LANE_ELEMS = gl.constexpr(2 * MFMA_LANE_ELEMS.value)
 
 
 @gluon.jit
@@ -2209,9 +2239,193 @@ def lane_contiguous_offsets(
     return f[:, None] + g[None, :]
 
 
+# 16-bit partials (P typed like C, bf16 or fp16) are stored in pairs of 32x32 blocks,
+# so a lane still writes 16 bytes: its 4 registers of each block, [pair][4 warps][64
+# lanes][8 elements]. A quadrant of two or more blocks pairs its register vectors 2p
+# and 2p + 1 (32 columns apart, or 32 rows when it is one block wide); the 64x64
+# tile's one-block quadrants pair across the tile, tl with tr and bl with br. Every
+# view below only renames registers: the partials stay in the MFMA layout's registers.
+
+
+@constexpr_function
+def is_16bit_partial(p_ptr):
+    """True if the partials P points to are 16-bit (stored in pairs of blocks)."""
+    return p_ptr.dtype.element_ty.primitive_bitwidth == 16
+
+
+@constexpr_function
+def pair_layout(pairs):
+    """The MFMA layout of a 16-bit partial viewed as (pairs, 32, 8, 8) (to_pairs): a
+    block row, its 4-column group and a lane's 8 registers, 4 columns of each block
+    of the pair; the pairs in registers."""
+    reg = [[0, 0, 0, 1], [0, 0, 0, 2], [0, 0, 0, 4]]
+    reg += [[1 << i, 0, 0, 0] for i in range(pairs.bit_length() - 1)]
+    return gl.DistributedLinearLayout(
+        reg_bases=reg,
+        lane_bases=[
+            [0, 1, 0, 0],
+            [0, 2, 0, 0],
+            [0, 4, 0, 0],
+            [0, 8, 0, 0],
+            [0, 0, 1, 0],
+            [0, 0, 2, 0],
+        ],
+        warp_bases=[[0, 0, 4, 0], [0, 16, 0, 0]],
+        block_bases=[],
+        shape=[
+            pairs,
+            MFMA_BLOCK_DIM.value,
+            BLOCK_GROUPS.value,
+            PAIR_LANE_ELEMS.value,
+        ],
+    )
+
+
+@gluon.jit
+def pair_offsets(PAIRS: gl.constexpr, layout: gl.constexpr):
+    """Element offsets of PAIRS pairs of the 16-bit map, (PAIRS, 32, 8, 8) in layout:
+    element (p, r, g, e) is at 2048 p + 8 (64 warp + lane) + e, with lane = r % 16 +
+    16 (g % 4) and warp = g // 4 + 2 (r // 16), the MFMA layout's lane and warp."""
+    p = gl.arange(
+        0, PAIRS, gl.SliceLayout(1, gl.SliceLayout(2, gl.SliceLayout(3, layout)))
+    )
+    r = gl.arange(
+        0,
+        MFMA_BLOCK_DIM,
+        gl.SliceLayout(0, gl.SliceLayout(2, gl.SliceLayout(3, layout))),
+    )
+    g = gl.arange(
+        0, BLOCK_GROUPS, gl.SliceLayout(0, gl.SliceLayout(1, gl.SliceLayout(3, layout)))
+    )
+    e = gl.arange(
+        0,
+        PAIR_LANE_ELEMS,
+        gl.SliceLayout(0, gl.SliceLayout(1, gl.SliceLayout(2, layout))),
+    )
+    p = p[:, None, None, None]
+    r = r[None, :, None, None]
+    g = g[None, None, :, None]
+    e = e[None, None, None, :]
+    GROUPS: gl.constexpr = MFMA_DIM // MFMA_LANE_ELEMS
+    lane = (r % MFMA_DIM) + MFMA_DIM * (g % GROUPS)
+    warp = g // GROUPS + MFMA_WARPS_MN[1] * (r // MFMA_DIM)
+    return p * PAIR_ELEMS + (warp * WAVE_LANES + lane) * PAIR_LANE_ELEMS + e
+
+
+@gluon.jit
+def to_pairs(x, HALF_M: gl.constexpr, HALF_N: gl.constexpr):
+    """A quadrant of two or more blocks, (HALF_M, HALF_N) in the MFMA layout ->
+    (VQ / 2, 32, 8, 8) in pair_layout."""
+    VM: gl.constexpr = HALF_M // MFMA_BLOCK_DIM
+    VN: gl.constexpr = HALF_N // MFMA_BLOCK_DIM
+    VP: gl.constexpr = VM * VN // 2
+    y = gl.permute(
+        gl.reshape(x, [VM, MFMA_BLOCK_DIM, VN, BLOCK_GROUPS, MFMA_LANE_ELEMS]),
+        [0, 2, 1, 3, 4],
+    )
+    y = gl.permute(
+        gl.reshape(y, [VP, 2, MFMA_BLOCK_DIM, BLOCK_GROUPS, MFMA_LANE_ELEMS]),
+        [0, 2, 3, 1, 4],
+    )
+    return gl.convert_layout(
+        gl.reshape(y, [VP, MFMA_BLOCK_DIM, BLOCK_GROUPS, PAIR_LANE_ELEMS]),
+        pair_layout(VP),
+        assert_trivial=True,
+    )
+
+
+@gluon.jit
+def from_pairs(y, HALF_M: gl.constexpr, HALF_N: gl.constexpr, mfmaLayout: gl.constexpr):
+    """The inverse of to_pairs."""
+    VM: gl.constexpr = HALF_M // MFMA_BLOCK_DIM
+    VN: gl.constexpr = HALF_N // MFMA_BLOCK_DIM
+    VP: gl.constexpr = VM * VN // 2
+    x = gl.permute(
+        gl.reshape(y, [VP, MFMA_BLOCK_DIM, BLOCK_GROUPS, 2, MFMA_LANE_ELEMS]),
+        [0, 3, 1, 2, 4],
+    )
+    x = gl.permute(
+        gl.reshape(x, [VM, VN, MFMA_BLOCK_DIM, BLOCK_GROUPS, MFMA_LANE_ELEMS]),
+        [0, 2, 1, 3, 4],
+    )
+    return gl.convert_layout(
+        gl.reshape(x, [HALF_M, HALF_N]), mfmaLayout, assert_trivial=True
+    )
+
+
+@gluon.jit
+def join_pair(a, b):
+    """Two one-block quadrants (32x32, MFMA layout) -> one pair, (1, 32, 8, 8)."""
+    y = gl.permute(
+        gl.reshape(gl.join(a, b), [MFMA_BLOCK_DIM, BLOCK_GROUPS, MFMA_LANE_ELEMS, 2]),
+        [0, 1, 3, 2],
+    )
+    return gl.convert_layout(
+        gl.reshape(y, [1, MFMA_BLOCK_DIM, BLOCK_GROUPS, PAIR_LANE_ELEMS]),
+        pair_layout(1),
+        assert_trivial=True,
+    )
+
+
+@gluon.jit
+def split_pair(y, mfmaLayout: gl.constexpr):
+    """The inverse of join_pair."""
+    x = gl.reshape(
+        gl.permute(
+            gl.reshape(y, [MFMA_BLOCK_DIM, BLOCK_GROUPS, 2, MFMA_LANE_ELEMS]),
+            [0, 1, 3, 2],
+        ),
+        [MFMA_BLOCK_DIM, MFMA_BLOCK_DIM, 2],
+    )
+    a, b = gl.split(x)
+    return (
+        gl.convert_layout(a, mfmaLayout, assert_trivial=True),
+        gl.convert_layout(b, mfmaLayout, assert_trivial=True),
+    )
+
+
+@gluon.jit
+def partial_map(
+    p_ptr, HALF_M: gl.constexpr, HALF_N: gl.constexpr, mfmaLayout: gl.constexpr
+):
+    """The offsets of a part of a slot, a quadrant (a pair of quadrants at 64x64 with
+    16-bit partials), and zeros in the layout the owner sums its peers' parts in."""
+    if is_16bit_partial(p_ptr):
+        VP: gl.constexpr = max(HALF_M * HALF_N // PAIR_ELEMS, 1)
+        offsets = pair_offsets(VP, pair_layout(VP))
+        zeros = gl.zeros(
+            (VP, MFMA_BLOCK_DIM, BLOCK_GROUPS, PAIR_LANE_ELEMS),
+            gl.float32,
+            pair_layout(VP),
+        )
+    else:
+        offsets = lane_contiguous_offsets(HALF_M, HALF_N, mfmaLayout)
+        zeros = gl.zeros((HALF_M, HALF_N), gl.float32, mfmaLayout)
+    return offsets, zeros
+
+
+@gluon.jit
+def from_partials(
+    sums, p_ptr, HALF_M: gl.constexpr, HALF_N: gl.constexpr, mfmaLayout: gl.constexpr
+):
+    """peer_sums' parts as quadrants in the MFMA layout (fp32: unchanged)."""
+    s0, s1, s2, s3 = sums
+    if is_16bit_partial(p_ptr):
+        if HALF_M * HALF_N == MFMA_BLOCK_ELEMS:
+            tl, tr = split_pair(s0, mfmaLayout)
+            bl, br = split_pair(s1, mfmaLayout)
+            s0, s1, s2, s3 = tl, bl, tr, br
+        else:
+            s0 = from_pairs(s0, HALF_M, HALF_N, mfmaLayout)
+            s1 = from_pairs(s1, HALF_M, HALF_N, mfmaLayout)
+            s2 = from_pairs(s2, HALF_M, HALF_N, mfmaLayout)
+            s3 = from_pairs(s3, HALF_M, HALF_N, mfmaLayout)
+    return s0, s1, s2, s3
+
+
 @gluon.jit
 def store_partial(
-    acc,
+    accs,
     q: gl.constexpr,
     p_ptr,
     rank,
@@ -2221,15 +2435,27 @@ def store_partial(
     CACHE: gl.constexpr = ".wt",
 ):
     """Quadrant q of a partial to slot P[rank]: write-through, or the default policy
-    for the l2 exchange."""
+    for the l2 exchange. 16-bit at 64x64: quadrant q < 2 (tl, bl) stores one pair with
+    the quadrant to its right (q + 2: tr, br); the calls for q = 2 and 3 store
+    nothing."""
     QUAD: gl.constexpr = HALF_M * HALF_N
     SLOT: gl.constexpr = 4 * QUAD
-    gl.amd.cdna3.buffer_store(
-        stored_value=acc,
-        ptr=p_ptr + rank.to(gl.int64) * SLOT + q * QUAD,
-        offsets=p_offsets,
-        cache=CACHE,
-    )
+    P_TYPE: gl.constexpr = p_ptr.dtype.element_ty
+    slot = p_ptr + rank.to(gl.int64) * SLOT
+    if not is_16bit_partial(p_ptr):
+        gl.amd.cdna3.buffer_store(
+            stored_value=accs[q], ptr=slot + q * QUAD, offsets=p_offsets, cache=CACHE
+        )
+    elif QUAD > MFMA_BLOCK_ELEMS:
+        part = to_pairs(accs[q].to(P_TYPE), HALF_M, HALF_N)
+        gl.amd.cdna3.buffer_store(
+            stored_value=part, ptr=slot + q * QUAD, offsets=p_offsets, cache=CACHE
+        )
+    elif q < 2:
+        part = join_pair(accs[q].to(P_TYPE), accs[q + 2].to(P_TYPE))
+        gl.amd.cdna3.buffer_store(
+            stored_value=part, ptr=slot + q * (2 * QUAD), offsets=p_offsets, cache=CACHE
+        )
 
 
 @gluon.jit
@@ -2303,39 +2529,45 @@ def peer_sums(
       n_peers masked off, so that several peers' batches can be in flight at once.
     - Otherwise a run-time loop, each batch's loads written before its adds: written
       load, add, load, add, the scheduler reuses one quadrant's registers for the next
-      and waits for each load in turn."""
+      and waits for each load in turn.
+    16-bit at 64x64 reads parts of two quadrants (partial_map): NQ = 4 is two parts,
+    s0 and s1 (from_partials splits them)."""
     QUAD: gl.constexpr = HALF_M * HALF_N
     SLOT: gl.constexpr = 4 * QUAD
+    PAIR_Q: gl.constexpr = is_16bit_partial(p_ptr) and QUAD == MFMA_BLOCK_ELEMS
+    gl.static_assert(not PAIR_Q or (q0 == 0 and NQ == 4))
+    PART: gl.constexpr = 2 * QUAD if PAIR_Q else QUAD
+    NP: gl.constexpr = 2 if PAIR_Q else NQ
     s0, s1, s2, s3 = z, z, z, z
     if MAX_PEERS > 0:
         for j in gl.static_range(MAX_PEERS):
             peer = (rank + PEER_STEP * (1 + j)).to(gl.int64)
             live = j < n_peers
             s0 += gl.amd.cdna3.buffer_load(
-                ptr=p_ptr + peer * SLOT + q0 * QUAD,
+                ptr=p_ptr + peer * SLOT + q0 * PART,
                 offsets=p_offsets,
                 mask=live,
                 other=0.0,
                 cache=".cv",
             ).to(gl.float32)
-            if NQ > 1:
+            if NP > 1:
                 s1 += gl.amd.cdna3.buffer_load(
-                    ptr=p_ptr + peer * SLOT + (q0 + 1) * QUAD,
+                    ptr=p_ptr + peer * SLOT + (q0 + 1) * PART,
                     offsets=p_offsets,
                     mask=live,
                     other=0.0,
                     cache=".cv",
                 ).to(gl.float32)
-            if NQ > 2:
+            if NP > 2:
                 s2 += gl.amd.cdna3.buffer_load(
-                    ptr=p_ptr + peer * SLOT + (q0 + 2) * QUAD,
+                    ptr=p_ptr + peer * SLOT + (q0 + 2) * PART,
                     offsets=p_offsets,
                     mask=live,
                     other=0.0,
                     cache=".cv",
                 ).to(gl.float32)
                 s3 += gl.amd.cdna3.buffer_load(
-                    ptr=p_ptr + peer * SLOT + (q0 + 3) * QUAD,
+                    ptr=p_ptr + peer * SLOT + (q0 + 3) * PART,
                     offsets=p_offsets,
                     mask=live,
                     other=0.0,
@@ -2345,13 +2577,13 @@ def peer_sums(
         for j in range(n_peers):
             peer = (rank + PEER_STEP * (1 + j)).to(gl.int64)
             x0 = gl.amd.cdna3.buffer_load(
-                ptr=p_ptr + peer * SLOT + q0 * QUAD, offsets=p_offsets, cache=".cv"
+                ptr=p_ptr + peer * SLOT + q0 * PART, offsets=p_offsets, cache=".cv"
             ).to(gl.float32)
-            if NQ == 1:
+            if NP == 1:
                 s0 += x0
-            elif NQ == 2:
+            elif NP == 2:
                 x1 = gl.amd.cdna3.buffer_load(
-                    ptr=p_ptr + peer * SLOT + (q0 + 1) * QUAD,
+                    ptr=p_ptr + peer * SLOT + (q0 + 1) * PART,
                     offsets=p_offsets,
                     cache=".cv",
                 ).to(gl.float32)
@@ -2359,17 +2591,17 @@ def peer_sums(
                 s1 += x1
             else:
                 x1 = gl.amd.cdna3.buffer_load(
-                    ptr=p_ptr + peer * SLOT + (q0 + 1) * QUAD,
+                    ptr=p_ptr + peer * SLOT + (q0 + 1) * PART,
                     offsets=p_offsets,
                     cache=".cv",
                 ).to(gl.float32)
                 x2 = gl.amd.cdna3.buffer_load(
-                    ptr=p_ptr + peer * SLOT + (q0 + 2) * QUAD,
+                    ptr=p_ptr + peer * SLOT + (q0 + 2) * PART,
                     offsets=p_offsets,
                     cache=".cv",
                 ).to(gl.float32)
                 x3 = gl.amd.cdna3.buffer_load(
-                    ptr=p_ptr + peer * SLOT + (q0 + 3) * QUAD,
+                    ptr=p_ptr + peer * SLOT + (q0 + 3) * PART,
                     offsets=p_offsets,
                     cache=".cv",
                 ).to(gl.float32)
@@ -2431,16 +2663,15 @@ def owner_ending(
     # above 8 programs per tile) a contributor stores each quadrant just before its
     # batch: storing all four first is about 1% slower on two-tile there.
     STORE_EACH: gl.constexpr = QPB == 1 and MAX_PEERS == 0
-    p_offsets = lane_contiguous_offsets(HALF_M, HALF_N, mfmaLayout)
-    z = gl.zeros((HALF_M, HALF_N), gl.float32, mfmaLayout)
+    p_offsets, z = partial_map(p_ptr, HALF_M, HALF_N, mfmaLayout)
     if not STORE_EACH:
         if is_partial != 0:
             for q in gl.static_range(4):
-                store_partial(accs[q], q, p_ptr, rank, p_offsets, HALF_M, HALF_N)
+                store_partial(accs, q, p_ptr, rank, p_offsets, HALF_M, HALF_N)
     for q0 in gl.static_range(0, 4, QPB):
         if STORE_EACH:
             if is_partial != 0:
-                store_partial(accs[q0], q0, p_ptr, rank, p_offsets, HALF_M, HALF_N)
+                store_partial(accs, q0, p_ptr, rank, p_offsets, HALF_M, HALF_N)
         sums = peer_sums(
             p_ptr,
             rank,
@@ -2454,6 +2685,7 @@ def owner_ending(
             HALF_N,
             MAX_PEERS,
         )
+        sums = from_partials(sums, p_ptr, HALF_M, HALF_N, mfmaLayout)
         if is_partial == 0:
             for i in gl.static_range(QPB):
                 owner_store(
@@ -2557,13 +2789,27 @@ def reduce_scatter_slice(
     - 1], adds the bias and stores them to C. NB blocks (NB <= VQ, so a group stays in
     one quadrant) at a time, U partials of a group per trip, so NB U loads per lane are
     in flight. Each group is reshaped to its 2-D band and stored along C's rows, 16
-    bytes per lane (8 for a single 32x32 block)."""
+    bytes per lane (8 for a single 32x32 block).
+
+    16-bit partials are read in whole pairs (NB even, readers <= NBLK / 2), NB / 2
+    16-byte loads per lane per partial.
+
+    Each reader's NBLK / readers blocks are a whole number of groups
+    (reduce_scatter_config), so every group lies inside [blk_lo, blk_hi)."""
     HALF_M: gl.constexpr = BLOCK_M // 2
     HALF_N: gl.constexpr = BLOCK_N // 2
     VN: gl.constexpr = HALF_N // 32
     VQ: gl.constexpr = VN * (HALF_M // 32)
     NBLK: gl.constexpr = 4 * VQ
-    gl.static_assert(NB <= VQ, "a reduce-scatter group must stay inside one quadrant")
+    P16: gl.constexpr = is_16bit_partial(p_ptr)
+    PAIR_Q: gl.constexpr = P16 and VQ == 1
+    gl.static_assert(
+        NB <= VQ or (PAIR_Q and NB == 2),
+        "a reduce-scatter group must stay inside one quadrant",
+    )
+    gl.static_assert(not P16 or NB % 2 == 0)
+    # The band a group covers: PAIR_Q's is tile row p, two quadrants across.
+    VNB: gl.constexpr = 2 if PAIR_Q else VN
     SLOT: gl.constexpr = BLOCK_M * BLOCK_N
     blk_lo = (NBLK * j) // readers
     blk_hi = (NBLK * (j + 1)) // readers
@@ -2572,67 +2818,119 @@ def reduce_scatter_slice(
     # contiguous bytes. Columns first, lanes 0-3 hit 4 lines 256 bytes apart and the L1
     # stalls on tag conflicts (reads take twice as long).
     L3: gl.constexpr = gl.BlockedLayout([1, 1, 4], [1, 16, 4], [1, 2, 2], [1, 2, 0])
-    i = gl.arange(0, NB, gl.SliceLayout(1, gl.SliceLayout(2, L3)))[:, None, None]
-    r = gl.arange(0, 32, gl.SliceLayout(0, gl.SliceLayout(2, L3)))[None, :, None]
-    c = gl.arange(0, 32, gl.SliceLayout(0, gl.SliceLayout(1, L3)))[None, None, :]
-    # in_block_row(r) + in_block_col(c) (the two add: lane_contiguous_offsets) for rows
-    # and columns 0-31, written without the modulo on bit 16 (the helpers' form costs
-    # instructions here).
-    GROUPS: gl.constexpr = MFMA_DIM // MFMA_LANE_ELEMS
-    in_blk = (
-        (r % MFMA_DIM) * MFMA_LANE_ELEMS
-        + (r // MFMA_DIM) * (2 * MFMA_WARP_ELEMS)
-        + c
-        + (c // MFMA_LANE_ELEMS % GROUPS) * (MFMA_GROUP_ELEMS - MFMA_LANE_ELEMS)
-        + (c // MFMA_DIM) * (MFMA_WARP_ELEMS - MFMA_DIM)
-    )
     cb = gl.arange(0, 32, gl.SliceLayout(0, gl.SliceLayout(1, L3)))[None, :]
     ib = gl.arange(0, NB, gl.SliceLayout(1, gl.SliceLayout(1, L3)))[:, None]
-    # The band: min(NB, VN) blocks across, the rest down.
-    ROWS: gl.constexpr = 32 * (NB // min(NB, VN))
-    COLS: gl.constexpr = 32 * min(NB, VN)
+    if P16:
+        # The pairs in the same lane order, a lane's 8 elements the last dimension.
+        L4: gl.constexpr = gl.BlockedLayout(
+            [1, 1, 1, PAIR_LANE_ELEMS], [1, 16, 4, 1], [1, 2, 2, 1], [3, 1, 2, 0]
+        )
+        ip = gl.arange(
+            0, NB // 2, gl.SliceLayout(1, gl.SliceLayout(2, gl.SliceLayout(3, L4)))
+        )
+        ip = ip[:, None, None, None]
+        in_pair = pair_offsets(NB // 2, L4)
+    else:
+        i = gl.arange(0, NB, gl.SliceLayout(1, gl.SliceLayout(2, L3)))[:, None, None]
+        r = gl.arange(0, 32, gl.SliceLayout(0, gl.SliceLayout(2, L3)))[None, :, None]
+        c = gl.arange(0, 32, gl.SliceLayout(0, gl.SliceLayout(1, L3)))[None, None, :]
+        # in_block_row(r) + in_block_col(c) (the two add: lane_contiguous_offsets) for
+        # rows and columns 0-31, written without the modulo on bit 16 (the helpers'
+        # form costs instructions here).
+        GROUPS: gl.constexpr = MFMA_DIM // MFMA_LANE_ELEMS
+        in_blk = (
+            (r % MFMA_DIM) * MFMA_LANE_ELEMS
+            + (r // MFMA_DIM) * (2 * MFMA_WARP_ELEMS)
+            + c
+            + (c // MFMA_LANE_ELEMS % GROUPS) * (MFMA_GROUP_ELEMS - MFMA_LANE_ELEMS)
+            + (c // MFMA_DIM) * (MFMA_WARP_ELEMS - MFMA_DIM)
+        )
+    # The band: min(NB, VNB) blocks across, the rest down.
+    ROWS: gl.constexpr = 32 * (NB // min(NB, VNB))
+    COLS: gl.constexpr = 32 * min(NB, VNB)
     SL: gl.constexpr = coalesced_store_layout(
         ROWS, COLS, out_dtype.primitive_bitwidth // 8, gl.num_warps()
     )
     for g in range(blk_lo, blk_hi, NB):
-        blk = g + i
-        valid = blk < blk_hi
-        p_off = blk * MFMA_BLOCK_ELEMS + in_blk
-        s = gl.zeros((NB, 32, 32), gl.float32, L3)
-        for p0 in range(0, n, U):
-            for u in gl.static_range(U):
-                slot = p_ptr + (b + p0 + u).to(gl.int64) * SLOT
-                s += gl.amd.cdna3.buffer_load(
-                    ptr=slot,
-                    offsets=p_off,
-                    mask=valid & (p0 + u < n),
-                    other=0.0,
-                    cache=LOAD_CACHE,
-                ).to(gl.float32)
+        if P16:
+            valid = g + 2 * ip < blk_hi
+            p_off = (g // 2) * PAIR_ELEMS + in_pair
+            s4 = gl.zeros(
+                (NB // 2, MFMA_BLOCK_DIM, BLOCK_GROUPS, PAIR_LANE_ELEMS), gl.float32, L4
+            )
+            for p0 in range(0, n, U):
+                for u in gl.static_range(U):
+                    slot = p_ptr + (b + p0 + u).to(gl.int64) * SLOT
+                    s4 += gl.amd.cdna3.buffer_load(
+                        ptr=slot,
+                        offsets=p_off,
+                        mask=valid & (p0 + u < n),
+                        other=0.0,
+                        cache=LOAD_CACHE,
+                    ).to(gl.float32)
+            s = gl.permute(
+                gl.reshape(
+                    s4, [NB // 2, MFMA_BLOCK_DIM, BLOCK_GROUPS, 2, MFMA_LANE_ELEMS]
+                ),
+                [0, 3, 1, 2, 4],
+            )
+            s = gl.convert_layout(
+                gl.reshape(s, [NB, MFMA_BLOCK_DIM, MFMA_BLOCK_DIM]),
+                L3,
+                assert_trivial=True,
+            )
+        else:
+            blk = g + i
+            valid = blk < blk_hi
+            p_off = blk * MFMA_BLOCK_ELEMS + in_blk
+            s = gl.zeros((NB, 32, 32), gl.float32, L3)
+            for p0 in range(0, n, U):
+                for u in gl.static_range(U):
+                    slot = p_ptr + (b + p0 + u).to(gl.int64) * SLOT
+                    s += gl.amd.cdna3.buffer_load(
+                        ptr=slot,
+                        offsets=p_off,
+                        mask=valid & (p0 + u < n),
+                        other=0.0,
+                        cache=LOAD_CACHE,
+                    ).to(gl.float32)
+        if PAIR_Q:
+            g_band = g // 2
+            blk_b = g_band + 2 * ib
+        else:
+            g_band = g
+            blk_b = g + ib
         if ADD_BIAS:
             # Block q VQ + v: quadrant q (tl, bl, tr, br); register vector v's bits are
             # the column blocks, then the row blocks.
-            qb = (g + ib) // VQ
-            vb = (g + ib) % VQ
+            qb = blk_b // VQ
+            vb = blk_b % VQ
             col_b = (qb // 2) * HALF_N + block_col(vb, VN) + cb
-            bias_mask = (g + ib) < blk_hi
-            if not EVEN_N:
-                bias_mask = bias_mask & (col_b < n_left)
-            bias = gl.amd.cdna3.buffer_load(
-                ptr=bias_ptr + pid_n * BLOCK_N, offsets=col_b, mask=bias_mask, other=0.0
-            )
+            if EVEN_N:
+                bias = gl.amd.cdna3.buffer_load(
+                    ptr=bias_ptr + pid_n * BLOCK_N, offsets=col_b
+                )
+            else:
+                bias = gl.amd.cdna3.buffer_load(
+                    ptr=bias_ptr + pid_n * BLOCK_N,
+                    offsets=col_b,
+                    mask=col_b < n_left,
+                    other=0.0,
+                )
             s = s + bias.to(gl.float32)[:, None, :]
-        cs = gl.convert_layout(to_band(s.to(out_dtype), NB, VN), SL)
-        trow, tcol = band_pos(g, SL, ROWS, COLS, HALF_M, HALF_N)
+        cs = gl.convert_layout(to_band(s.to(out_dtype), NB, VNB), SL)
+        trow, tcol = band_pos(g_band, SL, ROWS, COLS, HALF_M, HALF_N)
+        # C's row stride is a multiple of 8 (the wrapper checks), which the launch only
+        # proves when it is one of 16: without the hint an N of 8 mod 16 stores 2
+        # bytes at a time.
+        c_off = gl.multiple_of(trow * stride_cm, [8, 1]) + tcol * stride_cn
         if EVEN_M and EVEN_N:
-            gl.amd.cdna3.buffer_store(
-                stored_value=cs, ptr=c_tile, offsets=trow * stride_cm + tcol * stride_cn
-            )
+            gl.amd.cdna3.buffer_store(stored_value=cs, ptr=c_tile, offsets=c_off)
         else:
             gl.amd.cdna3.buffer_store(
                 stored_value=cs,
                 ptr=c_tile,
-                offsets=trow * stride_cm + tcol * stride_cn,
+                offsets=c_off,
                 mask=(trow < m_left) & (tcol < n_left),
             )
 
@@ -2680,11 +2978,11 @@ def rs_ending(
     HALF_M: gl.constexpr = BLOCK_M // 2
     HALF_N: gl.constexpr = BLOCK_N // 2
     is_split = gl.to_tensor(n_tile > 1).to(gl.int32)
-    p_offsets = lane_contiguous_offsets(HALF_M, HALF_N, mfmaLayout)
+    p_offsets = partial_map(p_ptr, HALF_M, HALF_N, mfmaLayout)[0]
     z = gl.zeros((HALF_M, HALF_N), gl.float32, mfmaLayout)
     for q in gl.static_range(4):
         if is_split != 0:
-            store_partial(accs[q], q, p_ptr, rank, p_offsets, HALF_M, HALF_N)
+            store_partial(accs, q, p_ptr, rank, p_offsets, HALF_M, HALF_N)
         if is_split == 0:
             owner_store(
                 accs[q],
@@ -2841,11 +3139,11 @@ def l2_rs_ending(
     HALF_M: gl.constexpr = BLOCK_M // 2
     HALF_N: gl.constexpr = BLOCK_N // 2
     is_split = gl.to_tensor(n_tile > 1).to(gl.int32)
-    p_offsets = lane_contiguous_offsets(HALF_M, HALF_N, mfmaLayout)
+    p_offsets = partial_map(p_ptr, HALF_M, HALF_N, mfmaLayout)[0]
     z = gl.zeros((HALF_M, HALF_N), gl.float32, mfmaLayout)
     for q in gl.static_range(4):
         if is_split != 0:
-            store_partial(accs[q], q, p_ptr, rank, p_offsets, HALF_M, HALF_N, "")
+            store_partial(accs, q, p_ptr, rank, p_offsets, HALF_M, HALF_N, "")
         if is_split == 0:
             owner_store(
                 accs[q],
@@ -3211,6 +3509,9 @@ BLOCK_K_SIDES = (64, 128)
 STREAMK_POLICIES = ("dp", "dp_sub", "one_tile", "two_tile", "spread")
 STREAMK_FIXUPS = ("owner", "rs")
 STREAMK_EXCHANGES = ("wt", "l2")
+STREAMK_PARTIALS = ("fp32", "16bit")
+# Policies that store partials, so take STREAMK_PARTIALS "16bit".
+PARTIAL_POLICIES = ("one_tile", "two_tile", "spread")
 CONFIG_KEYS = {
     "BLOCK_M": "block_m",
     "BLOCK_N": "block_n",
@@ -3220,7 +3521,10 @@ CONFIG_KEYS = {
     "STREAMK_FIXUP": "fixup",
     "TAIL_SPLIT_K": "tail_split_k",
     "STREAMK_EXCHANGE": "exchange",
+    "STREAMK_PARTIALS": "partials",
 }
+# Keys a complete config may leave out (StreamKConfig's defaults).
+OPTIONAL_KEYS = ("STREAMK_PARTIALS",)
 MAX_TILE_ELEMS = max(TILE_SIDES) ** 2
 
 
@@ -3266,6 +3570,7 @@ class StreamKConfig:
     fixup: str
     tail_split_k: int | None
     exchange: str
+    partials: str = "fp32"
 
     def __post_init__(self):
         TileSpec(self.block_m, self.block_n, self.block_k)
@@ -3288,6 +3593,10 @@ class StreamKConfig:
             raise ValueError(f"{self.policy} requires the owner fixup")
         if self.exchange == "l2" and (self.policy, self.fixup) != ("one_tile", "rs"):
             raise ValueError("the l2 exchange requires one_tile with rs")
+        if self.partials not in STREAMK_PARTIALS:
+            raise ValueError(f"invalid STREAMK_PARTIALS {self.partials!r}")
+        if self.partials == "16bit" and self.policy not in PARTIAL_POLICIES:
+            raise ValueError(f"{self.policy} stores no partials; it takes fp32")
 
     @property
     def tile(self):
@@ -3295,7 +3604,7 @@ class StreamKConfig:
 
     @classmethod
     def from_dict(cls, values):
-        """Parse a config dict with exactly the CONFIG_KEYS."""
+        """Parse a config dict with the CONFIG_KEYS (OPTIONAL_KEYS may be absent)."""
         if isinstance(values, cls):
             return values
         if not isinstance(values, Mapping):
@@ -3303,7 +3612,7 @@ class StreamKConfig:
         unknown = sorted(set(values) - set(CONFIG_KEYS))
         if unknown:
             raise ValueError(f"unknown Stream-K config keys {unknown}")
-        missing = sorted(set(CONFIG_KEYS) - set(values))
+        missing = sorted(set(CONFIG_KEYS) - set(values) - set(OPTIONAL_KEYS))
         if missing:
             raise ValueError(f"incomplete Stream-K config; missing {missing}")
         return cls(**{CONFIG_KEYS[key]: value for key, value in values.items()})
@@ -3320,24 +3629,45 @@ class ReduceScatterConfig:
     barrier_stride: int = 0
 
 
+@constexpr_function
 def pow2_floor(x):
     return 1 << (x.bit_length() - 1)
 
 
-def reduce_scatter_config(tile, tail_split_k, loads_in_flight=16, readers=None):
-    """The tile's own power-of-two readers (at most its 32x32 blocks), or
-    ``readers``, and the slice's blocks per group and partials per trip."""
+def max_readers(tile, p16=False):
+    """The most reduce-scatter readers of a tile: one per 32x32 block, or per pair of
+    blocks with 16-bit partials (a reader reads whole pairs)."""
+    return tile.blocks // 2 if p16 else tile.blocks
+
+
+def reduce_scatter_config(
+    tile, tail_split_k, loads_in_flight=16, readers=None, p16=False
+):
+    """The tile's own power-of-two readers (at most max_readers), or ``readers``, and
+    the slice's blocks per group and partials per trip, so that up to loads_in_flight
+    16-byte loads per lane are in flight: a block of fp32 is one, a pair of 16-bit
+    blocks one. A trip takes at most the tile's tail_split_k partials, as more would
+    only be masked-off loads."""
     if readers is None:
-        readers = min(pow2_floor(tail_split_k), tile.blocks)
+        readers = min(pow2_floor(tail_split_k), max_readers(tile, p16))
     nb = max(1, min(tile.blocks // readers, loads_in_flight, tile.quadrant_blocks))
+    if p16:
+        nb = max(nb, 2)
+    # reduce_scatter_slice's groups never cross a reader's slice.
+    assert (tile.blocks // readers) % nb == 0, (tile, readers, nb)
+    loads_per_partial = nb // 2 if p16 else nb
     return ReduceScatterConfig(
         readers=readers,
         blocks_per_group=nb,
-        partials_per_trip=max(loads_in_flight // nb, 1),
+        partials_per_trip=min(
+            max(loads_in_flight // loads_per_partial, 1), tail_split_k
+        ),
     )
 
 
-def rs_readers(tile, tail_tiles, tail_split_k, num_programs, loads_in_flight=16):
+def rs_readers(
+    tile, tail_tiles, tail_split_k, num_programs, loads_in_flight=16, p16=False
+):
     """The one-tile write-through reduce-scatter with every resident program reading:
     R = max(min(blocks, pow2_floor(P / S)), own readers) readers per tile, so
     R S <= P; when R > tail_split_k the extra = R - tail_split_k idle programs per tile
@@ -3345,10 +3675,10 @@ def rs_readers(tile, tail_tiles, tail_split_k, num_programs, loads_in_flight=16)
     fits: packed, the idle readers' polling slows the producers' arrivals on the
     shared line. With extra = 0 this is the own-readers rule with only the barrier
     slots moved."""
-    own = reduce_scatter_config(tile, tail_split_k, loads_in_flight).readers
+    own = reduce_scatter_config(tile, tail_split_k, loads_in_flight, p16=p16).readers
     per_tile = num_programs // tail_tiles
-    readers = max(min(tile.blocks, pow2_floor(per_tile)), own)
-    rs = reduce_scatter_config(tile, tail_split_k, loads_in_flight, readers)
+    readers = max(min(max_readers(tile, p16), pow2_floor(per_tile)), own)
+    rs = reduce_scatter_config(tile, tail_split_k, loads_in_flight, readers, p16)
     return ReduceScatterConfig(
         readers=readers,
         blocks_per_group=rs.blocks_per_group,
@@ -3485,7 +3815,8 @@ def streamk_plan(M, N, K, tile, num_programs, plan=None):
 def complete_config(config, M, N, K, num_programs):
     """The complete config dict: one that names only the tile (BLOCK_M, BLOCK_N,
     BLOCK_K, optionally GROUP_SIZE_M) gets GROUP_SIZE_M 4 and the default plan;
-    the plan keys are all given (and kept) or all absent."""
+    the plan keys are all given (and kept) or all absent. STREAMK_PARTIALS "16bit"
+    with the default plan applies only when that plan stores partials."""
     if isinstance(config, StreamKConfig):
         return config
     if not isinstance(config, Mapping):
@@ -3512,6 +3843,8 @@ def complete_config(config, M, N, K, num_programs):
             TAIL_SPLIT_K=tail_split_k,
             STREAMK_EXCHANGE="wt",
         )
+        if policy not in PARTIAL_POLICIES and "STREAMK_PARTIALS" in full:
+            full["STREAMK_PARTIALS"] = "fp32"
     return full
 
 
@@ -3593,11 +3926,12 @@ def _launch_constants(M, N, K, config, num_programs, num_xcds):
         tail_split_k = 1
         streamk_programs = 0
 
+    p16 = config.partials == "16bit"
     if config.policy == "one_tile" and config.fixup == "rs" and not l2:
-        rs = rs_readers(tile, tail_tiles, tail_split_k, num_programs)
+        rs = rs_readers(tile, tail_tiles, tail_split_k, num_programs, p16=p16)
     else:
         rs = reduce_scatter_config(
-            tile, tail_split_k if config.policy == "one_tile" else 1
+            tile, tail_split_k if config.policy == "one_tile" else 1, p16=p16
         )
     # The L2 split gives every XCD ceil(S / NUM_XCDS) tiles' programs (pid p runs
     # on XCD p % NUM_XCDS), so its grid is a whole number of those per XCD. The wt
@@ -3608,9 +3942,7 @@ def _launch_constants(M, N, K, config, num_programs, num_xcds):
         else streamk_programs + tail_tiles * rs.extra
     )
     compact = (
-        tail_tiles > 0
-        and tail_tiles == total_tiles
-        and working_grid < num_programs
+        tail_tiles > 0 and tail_tiles == total_tiles and working_grid < num_programs
     )
     # Data-parallel launches have no Stream-K phase to keep resident, so a grid of
     # fewer tiles than programs launches only the programs with a tile.
@@ -3636,6 +3968,7 @@ def _launch_constants(M, N, K, config, num_programs, num_xcds):
         "RS_R": rs.readers,
         "RS_E": rs.extra,
         "BAR_STRIDE": rs.barrier_stride,
+        "PARTIALS_16BIT": p16,
     }
 
 
@@ -3682,7 +4015,7 @@ def fit_tuned_config(config, M, N, K):
     lookup may have been tuned for another tile count)."""
     if unsupported_reason(M, N, K, config=config) is None:
         return config
-    return {key: config[key] for key in TILE_KEYS if key in config}
+    return {key: config[key] for key in TILE_KEYS + OPTIONAL_KEYS if key in config}
 
 
 # ---------------------------------------------------------------------------------
@@ -3723,11 +4056,12 @@ def _plans():
         yield "one_tile", "rs", n, "l2"
 
 
-def tuning_candidates(M, N, K):
+def tuning_candidates(M, N, K, partials_16bit=False):
     """The complete configs the tuner times for a shape: every TUNING_TILES tile at
     the default GROUP_SIZE_M (streamk_defaults) with every plan that fits it (and the default
-    plan's pick), one per distinct launch. M, N and K may be numpy integers (a
-    tuner's pandas rows)."""
+    plan's pick), one per distinct launch; with ``partials_16bit``, also each plan
+    that stores partials with STREAMK_PARTIALS "16bit". M, N and K may be numpy
+    integers (a tuner's pandas rows)."""
     M, N, K = int(M), int(N), int(K)
     num_programs, num_xcds = streamk_topology()
     candidates, seen = [], set()
@@ -3740,6 +4074,12 @@ def tuning_candidates(M, N, K):
         }
         configs = [complete_config(tile, M, N, K, num_programs)]
         configs += [dict(tile, **dict(zip(PLAN_KEYS, plan))) for plan in _plans()]
+        if partials_16bit:
+            configs += [
+                dict(c, STREAMK_PARTIALS="16bit")
+                for c in configs
+                if c["STREAMK_POLICY"] in PARTIAL_POLICIES
+            ]
         for config in configs:
             if unsupported_reason(M, N, K, config=config) is not None:
                 continue
@@ -3760,19 +4100,23 @@ KERNEL_NAME_PREFIX = "gluon_streamk_"
 _KERNEL_NAME = re.compile(
     r"^gluon_streamk_(?P<bm>\d+)x(?P<bn>\d+)x(?P<bk>\d+)_g(?P<g>\d+)_"
     r"(?:(?P<whole>dp|dp_sub|two_tile|spread)"
-    r"|one_tile_(?P<fixup>owner|rs)_k(?P<k>\d+)_(?P<exchange>wt|l2))$"
+    r"|one_tile_(?P<fixup>owner|rs)_k(?P<k>\d+)_(?P<exchange>wt|l2))"
+    r"(?P<p16>_p16)?$"
 )
 
 
 def kernel_name(config):
     """The kernelName of a tuned row running a complete ``config``, e.g.
     gluon_streamk_256x256x64_g4_one_tile_rs_k8_wt or gluon_streamk_256x256x64_g4_dp
-    (policies other than one_tile take the owner fixup and the wt exchange)."""
+    (policies other than one_tile take the owner fixup and the wt exchange); 16-bit
+    partials add _p16."""
     c = StreamKConfig.from_dict(config)
     name = f"{KERNEL_NAME_PREFIX}{c.block_m}x{c.block_n}x{c.block_k}_g{c.group_size_m}_"
     if c.policy != "one_tile":
-        return name + c.policy
-    return name + f"one_tile_{c.fixup}_k{c.tail_split_k}_{c.exchange}"
+        name += c.policy
+    else:
+        name += f"one_tile_{c.fixup}_k{c.tail_split_k}_{c.exchange}"
+    return name + ("_p16" if c.partials == "16bit" else "")
 
 
 def parse_kernel_name(name):
@@ -3791,6 +4135,8 @@ def parse_kernel_name(name):
     else:
         plan = ("one_tile", m["fixup"], int(m["k"]), m["exchange"])
     config.update(zip(PLAN_KEYS, plan))
+    if m["p16"]:
+        config["STREAMK_PARTIALS"] = "16bit"
     return config
 
 

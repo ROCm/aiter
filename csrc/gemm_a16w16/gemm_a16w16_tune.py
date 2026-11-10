@@ -477,6 +477,14 @@ class GemmA16W16Tuner(GemmCommonTuner):
             help="Include hipblaslt in tuning (disabled by default). "
             "hipblaslt tuning is also available standalone via gradlib/gradlib/gemm_tuner.py.",
         )
+        self.parser.add_argument(
+            "--gluon_16bit_partials",
+            action="store_true",
+            default=False,
+            help="Also time the gfx950 gluon Stream-K plans with 16-bit partials in "
+            "the output's type (half the partial bytes; 1.2-1.5x the RMS error of "
+            "fp32 partials).",
+        )
 
     def _clear_op_caches(self):
         from aiter.tuned_gemm import get_GEMM_A16W16_config, get_GEMM_A16W16_config_
@@ -863,7 +871,13 @@ class GemmA16W16Tuner(GemmCommonTuner):
         ]
         if outdtype == indtype:
             kernelNames += [
-                streamk.kernel_name(c) for c in streamk.tuning_candidates(M, N, K)
+                streamk.kernel_name(c)
+                for c in streamk.tuning_candidates(
+                    M,
+                    N,
+                    K,
+                    partials_16bit=getattr(self, "gluon_16bit_partials", False),
+                )
             ]
         tasks = []
         for solidx, kernelName in enumerate(kernelNames, start=1):
@@ -977,6 +991,7 @@ class GemmA16W16Tuner(GemmCommonTuner):
     def tune(self, untunedf, tunedf, args):
         libtype = args.libtype
         with_hipblaslt = getattr(args, "with_hipblaslt", False)
+        self.gluon_16bit_partials = getattr(args, "gluon_16bit_partials", False)
         gfx = self.get_gfx()
         cu_num = self.get_cu_num()
         run_kwargs = {"num_warmup": 10, "num_iters": 101}
