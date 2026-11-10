@@ -560,6 +560,29 @@ def test_q_abs_max_compiles_fullgraph_and_matches_eager(kind):
     )
 
 
+def test_rotated_q_abs_max_first_called_in_a_graph_capture():
+    """A capture records its kernels without running them, so the calls made before the graph
+    first replays must not read anything that the capture was to make."""
+    kwargs, real = make_q_abs_max_inputs("rotated", q_tile=64)
+    graph = torch.cuda.CUDAGraph()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
+        captured = sol_q_abs_max(**kwargs)
+    torch.cuda.current_stream().wait_stream(stream)
+    eager = sol_q_abs_max(**kwargs)
+    compiled = _compiled(sol_q_abs_max)(**kwargs)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    pad = -real.shape[1] % 64
+    padded = torch.nn.functional.pad(real.abs(), (0, 0, 0, 0, 0, pad))
+    want = padded.unflatten(1, (-1, 64)).amax(dim=2).to(torch.bfloat16)
+    torch.testing.assert_close(eager[0], want, rtol=2**-7, atol=0)
+    _assert_same(eager, compiled, "compiled", tails=False)
+    _assert_same(eager, captured, "captured", tails=False)
+
+
 def make_jensen_inputs(
     kind,
     *,
@@ -909,6 +932,46 @@ def test_tilt_rejects_v_not_shaped_as_k(path, v_shape):
                 sol_q_abs_max(q),
                 mean,
                 mean,
+                0.125,
+                2,
+                kv_tile,
+                k_format="e4m3",
+                v_format="e4m3",
+            )
+
+
+@pytest.mark.parametrize("path", ["factors", "planes"])
+@pytest.mark.parametrize(
+    "kv_tile, k_blocks, v_blocks",
+    [(64, 2, 2), (128, 4, 4), (128, 2, 1)],
+    ids=["pooled_at_128_for_64", "pooled_at_64_for_128", "short_mean_v"],
+)
+def test_tilt_rejects_pooled_blocks_of_another_kv_tile(
+    path, kv_tile, k_blocks, v_blocks
+):
+    """The factor kernel writes one plane row per full kv_tile block of K, and the pack kernel
+    reads mean_v over mean_k's blocks, so pooled K/V of any other block count are refused before
+    the planes are allocated."""
+    k = torch.randn((1, 256, 1, 128), dtype=torch.float32, device="cuda").to(FP8)
+    v = torch.randn((1, 256, 1, 128), dtype=torch.float32, device="cuda").to(FP8)
+    q = torch.randn((1, 512, 1, 128), dtype=torch.float32, device="cuda").to(FP8)
+
+    def pooled(blocks):
+        rows = torch.zeros((1, blocks, 1, 128), dtype=torch.float32, device="cuda")
+        return rows.to(FP8)
+
+    mean_k, mean_v = pooled(k_blocks), pooled(v_blocks)
+    one = torch.ones(1, dtype=torch.float32, device="cuda")
+    with pytest.raises(ValueError, match="pooled at another kv_tile"):
+        if path == "factors":
+            sol_tilt_factors(q, k, v, one, one, one, mean_k, mean_v, 0.125, 2, kv_tile)
+        else:
+            sol_tilt_planes(
+                k,
+                v,
+                sol_q_abs_max(q),
+                mean_k,
+                mean_v,
                 0.125,
                 2,
                 kv_tile,

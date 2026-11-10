@@ -26,7 +26,6 @@ _sol_q_tile_absmax_kernel_repr = make_kernel_repr(
 def _sol_q_tile_absmax_kernel(
     q_ptr,
     scale_ptr,
-    rot_ptr,
     out_ptr,
     seqlen,
     rot_gain,
@@ -47,7 +46,7 @@ def _sol_q_tile_absmax_kernel(
     """max |q| per (tile, head, dim), stored in out_ptr's dtype.
 
     HAS_SCALE dequantizes by an E8M0 byte per 32 dims first; ROTATE takes |q R| for R = rot_gain
-    times the +-1 matrix at rot_ptr instead of |q|.
+    times the MX packers' hd128 Hadamard matrix, H[i, j] = (-1)^popcount(i & j), instead of |q|.
     """
     rot_gain = tl.cast(rot_gain, tl.float32)
     t = tl.program_id(0)
@@ -65,7 +64,12 @@ def _sol_q_tile_absmax_kernel(
         mask=live,
     )
     if ROTATE:
-        signs = tl.load(rot_ptr + cols[:, None] * HEAD_DIM + cols[None, :])
+        tl.static_assert(HEAD_DIM <= 256)
+        parity = cols[:, None] & cols[None, :]
+        parity ^= parity >> 4
+        parity ^= parity >> 2
+        parity ^= parity >> 1
+        signs = (1 - 2 * (parity & 1)).to(tl.bfloat16)
         x = tl.dot(tl.where(live, x, 0.0).to(signs.dtype), signs) * rot_gain
     else:
         x = x.to(tl.float32)

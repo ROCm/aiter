@@ -117,25 +117,20 @@ def _check_unit_stride(name: str, x: torch.Tensor) -> None:
         raise ValueError(f"{name} needs a unit-stride head dim")
 
 
-_ROTATION_SIGNS: dict[torch.device, torch.Tensor] = {}
+def _pooled_blocks(seqlen_k: int, kv_tile: int, **pooled: torch.Tensor | None) -> int:
+    """K's block count at kv_tile, which every pooled row tensor given must have.
 
-
-def _rotation_signs(device: torch.device) -> torch.Tensor:
-    """The +-1 matrix of the MX packers' hd128 Hadamard rotation, which is it times 128**-0.5."""
-    signs = _ROTATION_SIGNS.get(device)
-    if signs is None:
-        from aiter.ops.mha_v4_quant import rotate_activation_hd128
-
-        eye = (
-            torch.eye(128, dtype=torch.bfloat16, device=device)
-            .view(1, 128, 1, 128)
-            .contiguous()
-        )
-        rows = torch.empty_like(eye)
-        rotate_activation_hd128(rows, eye)
-        signs = rows.view(128, 128).sign().contiguous()
-        _ROTATION_SIGNS[device] = signs
-    return signs
+    The factor kernel writes one plane row per full block of K and the pack kernel reads mean_v
+    over mean_k's blocks, both unmasked, so any other count is refused before they allocate.
+    """
+    blocks = -(-seqlen_k // kv_tile)
+    for name, x in pooled.items():
+        if x is not None and x.shape[1] != blocks:
+            raise ValueError(
+                f"{name} has {x.shape[1]} blocks, but K's {seqlen_k} rows make {blocks} of "
+                f"kv_tile {kv_tile}: it was pooled at another kv_tile"
+            )
+    return blocks
 
 
 def sol_q_abs_max(
@@ -170,7 +165,6 @@ def sol_q_abs_max(
     _sol_q_tile_absmax_kernel[(tiles, heads, batch)](
         q,
         scale,
-        _rotation_signs(q.device) if rotate else out,
         out,
         seqlen,
         d**-0.5,
@@ -401,7 +395,7 @@ def sol_tilt_factors(
         raise ValueError(
             f"the tilt needs one K/V head per query head, got {q.shape[2]}/{k.shape[2]}"
         )
-    blocks = mean_k.shape[1]
+    blocks = _pooled_blocks(k.shape[1], kv_tile, mean_k=mean_k, mean_v=mean_v)
     fmax = torch.finfo(k.dtype).max
     dev = k.device
     q_head_max = (q_abs_max if q_abs_max is not None else sol_q_abs_max(q))[1]
@@ -696,7 +690,14 @@ def sol_tilt_planes(
             "a packed format needs the pooled BF16 rows sol_prepare packed"
         )
     dev = k.device
-    blocks = mean_k.shape[1]
+    blocks = _pooled_blocks(
+        k.shape[1],
+        kv_tile,
+        mean_k=mean_k,
+        mean_v=mean_v,
+        mean_k_pooled=mean_k_pooled,
+        mean_v_pooled=mean_v_pooled,
+    )
     full = k.shape[1] // kv_tile
     planes_a, planes_b, peaks = _tilt_factors(
         k, v, q_abs_max[1], rank, kv_tile, blocks, power_iters, block_gain
