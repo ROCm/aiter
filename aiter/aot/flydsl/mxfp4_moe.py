@@ -73,6 +73,7 @@ def _job_key(job: dict) -> tuple:
             job.get("g2_spart"),
             job.get("g2_bf16_lds"),
             bool(job.get("use_valid_token_count", False) and job["epilog"] == "atomic"),
+            bool(job.get("g2_scatter_lds_pairs", False)),
         )
     if job["stage"] == 1:
         return (
@@ -304,6 +305,10 @@ def parse_csv(
                                 "use_valid_token_count": use_valid_token_count,
                                 "g2_spart": v2_g2["spart"],
                                 "g2_bf16_lds": v2_g2["bf16_lds"],
+                                # Runtime uses the stock epilogue for bias or fp4 out.
+                                "g2_scatter_lds_pairs": v2_g2["scatter_lds_pairs"]
+                                and effective_out_dtype == "bf16"
+                                and not enable_bias,
                             }
                         )
             elif _is_mxfp4_kname(kn2):
@@ -517,6 +522,7 @@ def _compile_v2_stage2(job):
         out_scale=target_scale,
         g2_spart=job.get("g2_spart"),
         g2_bf16_lds=job.get("g2_bf16_lds"),
+        g2_scatter_lds_pairs=job.get("g2_scatter_lds_pairs", False),
         bias=bias if job.get("enable_bias", False) else None,
         use_valid_token_count=bool(
             job.get("use_valid_token_count", False) and job["epilog"] == "atomic"

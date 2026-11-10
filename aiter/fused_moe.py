@@ -3593,6 +3593,9 @@ def _flydsl_v2_stage2_wrapper(
         is_ep=expert_mask is not None,
         out_scale=target_scale,
         use_valid_token_count=use_valid_token_count,
+        g2_scatter_lds_pairs=cfg["scatter_lds_pairs"]
+        and not _s2_fp4_scatter
+        and bias2 is None,
     )
     if _s2_fp4_scatter:
         aiter.mxfp4_moe_scatter_reduce_q(
