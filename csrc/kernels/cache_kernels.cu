@@ -2522,9 +2522,15 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
 // fused_qk_rope_concat_and_cache_mla instead (runtime block_size/entry_stride,
 // entry = [nope | pe], or [pe | nope] when !NOPE_FIRST; q_out rows likewise).
 // An output whose type equals the input's is stored unscaled, as kAuto.
+//
+// LAT selects the latency-floor form one head per block has always used --
+// direct Q loads, the padded-token return deferred past them, the cos/sin row
+// in the buffer offset -- so that the per-entry layout can also run it at two
+// heads per block for mid-size launches.
 template <typename scalar_t, typename cache_t, typename query_t, int KV_LORA, int PE_DIM,
           int PAGE_SIZE, bool IS_NEOX, bool NOPE_FIRST, int VEC, int HPT,
-          bool COMPUTE_ALL_Q_ROPE = false, bool K_EARLY = (HPT <= 2)>
+          bool COMPUTE_ALL_Q_ROPE = false, bool K_EARLY = (HPT <= 2),
+          bool LAT = (HPT == 1)>
 __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
     const scalar_t* __restrict__ q_nope,    // [T, H, KV_LORA]
     const scalar_t* __restrict__ q_pe,      // [T, H, PE_DIM]
@@ -2538,6 +2544,14 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
     const scalar_t* __restrict__ sin_cache, // [max_pos, PE_DIM/2]
     const float* __restrict__ q_scale,
     const float* __restrict__ k_scale,
+    // Right behind the pointers so that they are among the preloaded kernel
+    // arguments: every block derives its token from them before its first
+    // load, and loaded from the kernarg segment they cost a scalar round trip
+    // ahead of positions[token].
+    const int num_tokens,
+    const uint32_t tok_magic, // blockIdx.x / num_tokens, see mla_rope_fast_div
+    const int tok_shift,
+    const int max_position,
     const int num_heads,
     const int64_t q_nope_stride_0, const int64_t q_nope_stride_1,
     const int64_t q_pe_stride_0,   const int64_t q_pe_stride_1,
@@ -2547,12 +2561,8 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
     const int64_t cos_stride0,
     const int64_t sin_stride0,
     const int64_t block_stride,
-    const int max_position,
     const int64_t entry_stride = 0,
     const int block_size = PAGE_SIZE,
-    const int num_tokens = 0,
-    const uint32_t tok_magic = 0, // blockIdx.x / num_tokens, see mla_rope_fast_div
-    const int tok_shift = 0,
     const uint32_t bs_magic = 0, // slot / block_size
     const int bs_shift = 0)
 {
@@ -2592,6 +2602,7 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
     // tall grid dispatches slower (T=1 H=16: 3.34 us as 1 x 16, 3.22 as
     // 16 x 1), and the divide by T is a host-built magic multiply, kept off
     // the front of every block's address chain.
+    static_assert(LAT == (HPT == 1) || PAGE_SIZE == 0);
     int64_t token_idx;
     int     head_base;
     if constexpr(PAGE_SIZE == 0)
@@ -2616,7 +2627,7 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
     // slower there, so that path returns up front as before.
     const int64_t slot_idx = slot_mapping[token_idx];
     // compute_all_q_rope (DCP) keeps a padded token's Q; only K is skipped.
-    if constexpr(HPT > 1)
+    if constexpr(!LAT)
     {
         if(slot_idx < 0 && !compute_all_q_rope)
             return; // uniform across the block (same token)
@@ -2632,6 +2643,15 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
     // a padded token has already returned, and a per-row descriptor keeps the
     // row offset scalar (~2% at H=128 T=1536).
     int64_t pos = positions[token_idx];
+#if defined(__HIP_DEVICE_COMPILE__)
+    // One scalar round trip for everything the Q addresses need: the
+    // compiler otherwise issued the stride kernargs after waiting on
+    // positions[token], a second trip in front of every Q load.
+    if constexpr(LAT && PAGE_SIZE == 0)
+        asm volatile("" ::"s"(pos), "s"(slot_idx), "s"(q_nope_stride_0), "s"(q_nope_stride_1),
+                     "s"(q_pe_stride_0), "s"(q_pe_stride_1), "s"(q_out_stride_0),
+                     "s"(q_out_stride_1), "s"(cos_stride0), "s"(sin_stride0));
+#endif
     // Clamp pos into the cos/sin cache. Padded tokens can carry stale positions.
     // Per-entry callers may pass a short cache, like a NoPE model's one identity row.
     if(PAGE_SIZE == 0 || compute_all_q_rope)
@@ -2639,7 +2659,7 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
     const scalar_t* cos_base = cos_cache;
     const scalar_t* sin_base = sin_cache;
     int cos_row = 0, sin_row = 0, cos_end = HALF, sin_end = HALF;
-    if constexpr(HPT == 1)
+    if constexpr(LAT)
     {
         cos_row = static_cast<int>(pos * cos_stride0);
         sin_row = static_cast<int>(pos * sin_stride0);
@@ -2847,7 +2867,7 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
     // across stores and waves, and GL2 sent 3.6x the write requests and 1.8x
     // the reads to memory (H=128 T=4096 68.3 -> 59.8 us, T=1536 26.4 -> 24.7
     // us).
-    if constexpr(((AITER_MLA_SEG_TDM_HPT_MASK >> HPT) & 1) != 0)
+    if constexpr(!LAT && ((AITER_MLA_SEG_TDM_HPT_MASK >> HPT) & 1) != 0)
     {
         if(PAGE_SIZE == 0 && HPT == 8 && q_out_stride_1 == KV_LORA + PE_DIM)
         {
@@ -3100,7 +3120,7 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
         // by an out-of-bounds offset: a return here is a branch the compiler
         // may sink the nope load past, which ATT showed it doing.
         const bool q_live =
-            HPT > 1 || slot_idx >= 0 || compute_all_q_rope; // uniform over the block
+            !LAT || slot_idx >= 0 || compute_all_q_rope; // uniform over the block
 #pragma unroll
         for(int k = 0; k < HPT; ++k)
         {
@@ -5432,18 +5452,24 @@ static size_t mla_rope_tdm_lds_bytes(int hpt, size_t elem_size)
     return size_t(2) * (hpt * 256 + std::min(hpt, 4) * 64) * elem_size;
 }
 
-// Heads per block and K_EARLY on the flat head-group-major grid of the
-// per-entry layout, fit on gfx1250 (H=16/32/128, T=1..4096) against the
-// (token, head) rows per CU: one head with K early up to 32, two with K
-// early up to 48, two up to 80, four up to 160, eight beyond.
-static int mla_rope_entry_heads_per_block(int64_t num_tokens, int num_heads, bool& k_early)
+// Heads per block, K_EARLY and the latency-path (LAT) variant on the flat
+// head-group-major grid of the per-entry layout, fit on gfx1250 (H=16/32/128,
+// T=1..4096) against the (token, head) rows per CU: one head with K early
+// below 12, two on the latency path with K early up to 32, two with K early
+// up to 48, two up to 80, four up to 160, eight beyond. Between 12 and 32 the
+// latency path's second head per block beats one head (CUDA graph, H=24
+// T=128 2.03 -> 1.88 us, T=160 2.22 -> 1.99 us, H=128 T=32 2.21 -> 1.92 us);
+// below 12 it is 1-4% slower.
+static int mla_rope_entry_heads_per_block(int64_t num_tokens, int num_heads, bool& k_early,
+                                          bool& lat)
 {
     const int64_t per_cu = num_tokens * num_heads / get_num_cu_func();
-    int hpt              = per_cu <= 48 ? (per_cu <= 32 ? 1 : 2) : per_cu <= 80 ? 2
+    int hpt              = per_cu <= 48 ? (per_cu < 12 ? 1 : 2) : per_cu <= 80 ? 2
                          : per_cu <= 160 ? 4 : 8;
     while(num_heads % hpt != 0)
         hpt >>= 1;
     k_early = hpt == 1 || per_cu <= 48;
+    lat     = hpt == 1 || per_cu <= 32;
     return hpt;
 }
 
@@ -5482,9 +5508,9 @@ static void launch_mla_rope_hpt(const MlaRopeHptArgs& a, hipStream_t stream)
     else
     {
         constexpr int KV_LORA = 512, PE_DIM = 64, VEC = 8;
-        bool k_early;
-        const int hpt         = mla_rope_entry_heads_per_block(a.num_tokens, a.num_heads, k_early);
-        const size_t lds      = mla_rope_tdm_lds_bytes(hpt, sizeof(scalar_t));
+        bool k_early, lat;
+        const int hpt    = mla_rope_entry_heads_per_block(a.num_tokens, a.num_heads, k_early, lat);
+        const size_t lds = lat ? 0 : mla_rope_tdm_lds_bytes(hpt, sizeof(scalar_t));
         uint32_t tok_magic;
         int tok_shift;
         mla_rope_fast_div(static_cast<uint32_t>(a.num_tokens), tok_magic, tok_shift);
@@ -5493,40 +5519,42 @@ static void launch_mla_rope_hpt(const MlaRopeHptArgs& a, hipStream_t stream)
         mla_rope_fast_div(static_cast<uint32_t>(a.block_size), bs_magic, bs_shift);
         const dim3 grid(static_cast<unsigned>(int64_t(a.num_heads / hpt) * a.num_tokens));
         const dim3 block(KV_LORA / VEC);
-#define LAUNCH_MLA_ROPE_HPT_C(NEOX, NF, HPT_, CAQR, KE)                                        \
+#define LAUNCH_MLA_ROPE_HPT_C(NEOX, NF, HPT_, CAQR, KE, LAT_)                                  \
     aiter::fused_qk_rope_concat_and_cache_mla_seg_kernel<scalar_t, cache_t, query_t, KV_LORA,  \
                                                          PE_DIM, 0, NEOX, NF, VEC, HPT_, CAQR, \
-                                                         KE>                                   \
+                                                         KE, LAT_>                             \
         <<<grid, block, lds, stream>>>(                                                        \
             static_cast<const scalar_t*>(a.q_nope), static_cast<const scalar_t*>(a.q_pe),      \
             static_cast<const scalar_t*>(a.kv_c), static_cast<const scalar_t*>(a.k_pe),        \
             static_cast<cache_t*>(a.kv_cache), static_cast<query_t*>(a.q_out),                 \
             a.slot_mapping, a.positions, static_cast<const scalar_t*>(a.cos_cache),            \
-            static_cast<const scalar_t*>(a.sin_cache), a.q_scale, a.k_scale, a.num_heads,      \
-            a.q_nope_stride_0, a.q_nope_stride_1, a.q_pe_stride_0, a.q_pe_stride_1,            \
-            a.q_out_stride_0, a.q_out_stride_1, a.kv_c_stride, a.k_pe_stride, a.cos_stride0,   \
-            a.sin_stride0, a.block_stride, a.max_position, a.entry_stride, a.block_size,       \
-            a.num_tokens, tok_magic, tok_shift, bs_magic, bs_shift)
-#define LAUNCH_MLA_ROPE_HPT(NEOX, NF, HPT_, KE)                  \
-    do                                                           \
-    {                                                            \
-        if(a.compute_all_q_rope)                                 \
-            LAUNCH_MLA_ROPE_HPT_C(NEOX, NF, HPT_, true, KE);     \
-        else                                                     \
-            LAUNCH_MLA_ROPE_HPT_C(NEOX, NF, HPT_, false, KE);    \
+            static_cast<const scalar_t*>(a.sin_cache), a.q_scale, a.k_scale, a.num_tokens,     \
+            tok_magic, tok_shift, a.max_position, a.num_heads, a.q_nope_stride_0,              \
+            a.q_nope_stride_1, a.q_pe_stride_0, a.q_pe_stride_1, a.q_out_stride_0,             \
+            a.q_out_stride_1, a.kv_c_stride, a.k_pe_stride, a.cos_stride0, a.sin_stride0,      \
+            a.block_stride, a.entry_stride, a.block_size, bs_magic, bs_shift)
+#define LAUNCH_MLA_ROPE_HPT(NEOX, NF, HPT_, KE, LAT_)                  \
+    do                                                                 \
+    {                                                                  \
+        if(a.compute_all_q_rope)                                       \
+            LAUNCH_MLA_ROPE_HPT_C(NEOX, NF, HPT_, true, KE, LAT_);     \
+        else                                                           \
+            LAUNCH_MLA_ROPE_HPT_C(NEOX, NF, HPT_, false, KE, LAT_);    \
     } while(0)
 #define LAUNCH_MLA_ROPE_HPT_H(NEOX, NF)                                  \
     switch(hpt)                                                          \
     {                                                                    \
-    case 8: LAUNCH_MLA_ROPE_HPT(NEOX, NF, 8, false); break;              \
-    case 4: LAUNCH_MLA_ROPE_HPT(NEOX, NF, 4, false); break;              \
+    case 8: LAUNCH_MLA_ROPE_HPT(NEOX, NF, 8, false, false); break;       \
+    case 4: LAUNCH_MLA_ROPE_HPT(NEOX, NF, 4, false, false); break;       \
     case 2:                                                              \
-        if(k_early)                                                      \
-            LAUNCH_MLA_ROPE_HPT(NEOX, NF, 2, true);                      \
+        if(lat)                                                          \
+            LAUNCH_MLA_ROPE_HPT(NEOX, NF, 2, true, true);                \
+        else if(k_early)                                                 \
+            LAUNCH_MLA_ROPE_HPT(NEOX, NF, 2, true, false);               \
         else                                                             \
-            LAUNCH_MLA_ROPE_HPT(NEOX, NF, 2, false);                     \
+            LAUNCH_MLA_ROPE_HPT(NEOX, NF, 2, false, false);              \
         break;                                                           \
-    default: LAUNCH_MLA_ROPE_HPT(NEOX, NF, 1, true); break;              \
+    default: LAUNCH_MLA_ROPE_HPT(NEOX, NF, 1, true, true); break;        \
     }
         if(a.is_neox && a.is_nope_first)
             LAUNCH_MLA_ROPE_HPT_H(true, true)
@@ -5944,13 +5972,14 @@ void fused_qk_rope_concat_and_cache_mla_seg(
             reinterpret_cast<SCALAR_T*>(sin_cache.data_ptr()),                            \
             reinterpret_cast<float*>(q_scale.data_ptr()),                                 \
             reinterpret_cast<float*>(k_scale.data_ptr()),                                 \
+            0, 0, 0, max_position,                                                        \
             num_heads,                                                                    \
             q_nope_stride_0, q_nope_stride_1,                                             \
             q_pe_stride_0, q_pe_stride_1,                                                 \
             q_out_stride_0, q_out_stride_1,                                               \
             kv_c_stride, k_pe_stride,                                                     \
             cos_stride0, sin_stride0,                                                     \
-            block_stride, max_position);
+            block_stride);
 
 #define LAUNCH_MLA_NORM_ROPE_HPT(SCALAR_T, NEOX)                                          \
     switch(hpt)                                                                           \
