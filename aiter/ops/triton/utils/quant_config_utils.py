@@ -43,4 +43,8 @@ def get_quant_config(config_name: str, **values) -> dict:
     """
     cfg_dir = resolve_config_dir("quant", config_name, backend="gluon")
     tuned = load_config_json(f"{cfg_dir}/DEFAULT.json")
+    if "any" in tuned and not any("." in key for key in tuned):
+        # An untuned table (e.g. configs/gfx1250-strict) holds only a generic
+        # "any" entry and no composite bucket keys to derive axes from.
+        return dict(tuned["any"])
     return select_leq_config(tuned, axes=table_axes(tuned), **values)
