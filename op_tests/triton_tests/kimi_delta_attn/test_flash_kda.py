@@ -1166,7 +1166,7 @@ def test_paged_cache_rejected_on_default_pipeline():
 
 def _cu_seqlens_pair(lens):
     """``cu_seqlens`` on the device and the same values on the host."""
-    host = torch.tensor([0, *lens], dtype=torch.int32).cumsum(0).int()
+    host = torch.tensor([0, *lens], dtype=torch.int32, device="cpu").cumsum(0).int()
     return host.to(device), host
 
 
@@ -1179,7 +1179,10 @@ def test_cu_seqlens_cpu_issues_no_sync():
     """
     lens, H = [100, 0, 257, 33], 4
     args = make_inputs(1, sum(lens), H)
-    h0 = torch.randn(len(lens), H, K_DIM, K_DIM, device=device) * 0.1
+    h0 = (
+        torch.randn(len(lens), H, K_DIM, K_DIM, device=device, dtype=torch.float32)
+        * 0.1
+    )
 
     def fresh(with_host):
         # New tensors each time, so no identity cache can answer.
@@ -1218,16 +1221,34 @@ def test_cu_seqlens_cpu_issues_no_sync():
     assert torch.equal(host_kw["state_cache"], dev_kw["state_cache"])
 
 
+def _expected_chunk_indices(lens, chunk_size):
+    """``prepare_chunk_indices``' rows from the sequence lengths, by repeat_interleave
+    rather than by its loop."""
+    counts = torch.tensor([-(-n // chunk_size) for n in lens], device="cpu")
+    seq = torch.repeat_interleave(torch.arange(len(lens), device="cpu"), counts)
+    chunk = (
+        torch.arange(seq.numel(), device="cpu")
+        - (torch.cumsum(counts, 0) - counts)[seq]
+    )
+    return torch.stack([seq, chunk], 1).int()
+
+
 def test_prepare_chunk_indices_numbers_empty_sequences():
     """A chunk's sequence id indexes cu_seqlens, so an empty sequence still counts."""
     lens, chunk_size = [0, 100, 0, 0, 257, 33], 64
-    counts = torch.tensor([-(-n // chunk_size) for n in lens])
-    seq = torch.repeat_interleave(torch.arange(len(lens)), counts)
-    chunk = torch.arange(seq.numel()) - (torch.cumsum(counts, 0) - counts)[seq]
     cu_seqlens, _ = _cu_seqlens_pair(lens)
     got = prepare_chunk_indices(cu_seqlens, chunk_size)
     assert got.dtype == cu_seqlens.dtype and got.device == cu_seqlens.device
-    assert torch.equal(got.cpu(), torch.stack([seq, chunk], 1).int())
+    assert torch.equal(got.cpu(), _expected_chunk_indices(lens, chunk_size))
+
+
+def test_prepare_chunk_indices_keeps_a_cpu_tensor_on_the_cpu():
+    """A CPU cu_seqlens gives a CPU table: there is no stream to upload on."""
+    lens, chunk_size = [0, 100, 0, 257, 33], 64
+    _, host = _cu_seqlens_pair(lens)
+    got = prepare_chunk_indices(host, chunk_size)
+    assert got.dtype == host.dtype and got.device == host.device
+    assert torch.equal(got, _expected_chunk_indices(lens, chunk_size))
 
 
 # The metadata uploads are cached on the sequence bounds and shared across
@@ -1289,7 +1310,7 @@ def _prepare_flash(lens, n):
     H = 4
     args = make_inputs(1, sum(lens), H)
     cu_seqlens, cu_seqlens_cpu = _cu_seqlens_pair(lens)
-    h0 = torch.zeros(len(lens), H, K_DIM, K_DIM, device=device)
+    h0 = torch.zeros(len(lens), H, K_DIM, K_DIM, device=device, dtype=torch.float32)
     has_initial_state = torch.zeros(len(lens), device=device, dtype=torch.bool)
 
     def launcher():
@@ -1409,7 +1430,7 @@ def test_second_stream_hit_does_not_wait_for_later_work(route, stream_pair):
     # do not run alongside each other here and this test cannot tell.
     control = torch.cuda.Event()
     with torch.cuda.stream(b):
-        torch.ones(1, device=device).add_(1)
+        torch.ones(1, device=device, dtype=torch.float32).add_(1)
         control.record(b)
     control.synchronize()
     if backlog_done.query():
@@ -1460,7 +1481,8 @@ def test_metadata_cache_miss_during_capture_raises(route):
         pytest.raises(RuntimeError, match="cannot be built during graph capture"),
         torch.cuda.graph(graph),
     ):
-        torch.ones(1, device=device).add_(1)  # a node, so the capture can end
+        # A node, so the capture can end.
+        torch.ones(1, device=device, dtype=torch.float32).add_(1)
         launch_miss()
     assert not torch.cuda.is_current_stream_capturing()
     got = launch_after()

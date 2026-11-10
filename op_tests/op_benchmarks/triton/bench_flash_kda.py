@@ -253,8 +253,10 @@ def run_benchmark(args):
 
     lens = args.varlen
     if lens:
-        if len(lens) < 2 or lens[-1] <= 128:
-            raise SystemExit("--varlen needs 2+ lengths, the last above 128")
+        if len(lens) < 2 or min(lens) < 0 or lens[-1] <= 128:
+            raise SystemExit(
+                "--varlen needs 2+ lengths, none negative, the last above 128"
+            )
         params = inspect.signature(flash_kda_fwd).parameters
         if args.seqlens == "host" and "cu_seqlens_cpu" not in params:
             raise SystemExit("--seqlens host: this flash_kda_fwd has no cu_seqlens_cpu")
@@ -263,7 +265,7 @@ def run_benchmark(args):
         # than the 64 the metadata caches hold, so every call misses, as in serving.
         cu_sets = []
         for d in range(1, 129):
-            cu = torch.tensor([0, *lens]).cumsum(0).int()
+            cu = torch.tensor([0, *lens], device="cpu").cumsum(0).int()
             cu[-2] += d
             cu_sets.append(cu.pin_memory())
 

@@ -79,14 +79,16 @@ def prepare_chunk_indices(
         [sequence_id, chunk_idx_in_seq], with ``cu_seqlens``' dtype and device.
         An empty sequence has no rows and keeps its place in the numbering.
 
-    Cached on the bounds, so the layers of a forward pass share one upload even
-    when each passes a new tensor.
+    On the device, cached on the bounds, so the layers of a forward pass share one
+    upload even when each passes a new tensor. A CPU ``cu_seqlens`` gets a CPU
+    table, built directly: there is no stream to upload on.
     """
+    seqs = seq_bounds(cu_seqlens, cu_seqlens_cpu)
+    if cu_seqlens.device.type == "cpu":
+        pairs = chunk_index_pairs(seqs, chunk_size)
+        return torch.tensor(pairs, dtype=cu_seqlens.dtype, device="cpu").view(-1, 2)
     indices, ticket = _chunk_indices_from_bounds(
-        seq_bounds(cu_seqlens, cu_seqlens_cpu),
-        chunk_size,
-        cu_seqlens.dtype,
-        cu_seqlens.device,
+        seqs, chunk_size, cu_seqlens.dtype, cu_seqlens.device
     )
     wait_for_upload(ticket, indices)
     return indices
