@@ -84,6 +84,18 @@ def _get_flydsl_moe_kernels():
     return moe_kernels
 
 
+def _get_triton_a16w16_moe():
+    from aiter.ops.triton.moe import fused_moe_a16w16
+
+    return fused_moe_a16w16
+
+
+def _is_triton_a16w16_kname(kname) -> bool:
+    return isinstance(kname, str) and kname.startswith(
+        ("triton_moe1_a16w16_", "triton_moe2_a16w16_")
+    )
+
+
 BLOCK_SIZE_M = 32
 
 _USE_CK_MOE_SORTING = os.environ.get("AITER_USE_CK_MOE_SORTING", "0") == "1"
@@ -2862,6 +2874,63 @@ def _flydsl_stage2_wrapper(
     )
 
 
+def _triton_a16w16_stage1_wrapper(
+    hidden_states,
+    w1,
+    w2,
+    sorted_token_ids,
+    sorted_expert_ids,
+    num_valid_ids,
+    out,
+    topk,
+    kernelName="",
+    block_m=None,
+    sorted_weights=None,
+    **_kwargs,
+):
+    if sorted_weights is not None:
+        raise ValueError("Triton a16w16 MoE stage1 does not apply route weights")
+    return _get_triton_a16w16_moe().fused_moe_a16w16_stage1(
+        hidden_states,
+        w1,
+        sorted_token_ids,
+        sorted_expert_ids,
+        num_valid_ids,
+        out,
+        topk,
+        int(block_m),
+        kernelName,
+    )
+
+
+def _triton_a16w16_stage2_wrapper(
+    inter_states,
+    w1,
+    w2,
+    sorted_token_ids,
+    sorted_expert_ids,
+    num_valid_ids,
+    out,
+    topk,
+    kernelName="",
+    block_m=None,
+    sorted_weights=None,
+    **_kwargs,
+):
+    return _get_triton_a16w16_moe().fused_moe_a16w16_stage2(
+        inter_states,
+        w2,
+        sorted_token_ids,
+        sorted_expert_ids,
+        sorted_weights,
+        num_valid_ids,
+        out,
+        topk,
+        int(block_m),
+        kernelName,
+    )
+
+
 def _empty_bf16(device):
     return torch.empty((0,), dtype=dtypes.bf16, device=device)
 
@@ -4843,6 +4912,56 @@ def get_2stage_cfgs(
             flat=cfg_flat,
             **route_bucket_metadata,
         )
+    is_triton1 = _is_triton_a16w16_kname(kernelName1)
+    is_triton2 = _is_triton_a16w16_kname(kernelName2)
+    if is_triton1 or is_triton2:
+        # The Triton stages read and write the unsorted [token, topk, inter]
+        # intermediate, so either one pairs with the CK 2-stage instance the
+        # tuner ranks next to it; FlyDSL a16w16 stages use a sorted one.
+        partner = kernelName2 if is_triton1 else kernelName1
+        if not (is_triton1 and is_triton2) and "ck2stages" not in str(partner):
+            raise ValueError(
+                "Triton a16w16 MoE stages pair with Triton or CK 2-stage kernels, "
+                f"got {kernelName1=}, {kernelName2=}"
+            )
+        if not (
+            q_type == QuantType.No
+            and dtype in (dtypes.bf16, dtypes.fp16)
+            and q_dtype_w == dtype
+            and activation == ActivationType.Silu
+            and use_g1u1
+            and not doweight_stage1
+        ):
+            raise ValueError(
+                f"Triton a16w16 MoE supports unquantized Silu g1u1 only, got {keys}"
+            )
+        if is_triton1:
+            stage1_func = functools.partial(
+                _triton_a16w16_stage1_wrapper, kernelName=kernelName1
+            )
+        else:
+            stage1_func = functools.partial(
+                ck_moe_stage1,
+                kernelName=kernelName1,
+                activation=activation,
+                quant_type=q_type,
+                dtype=dtype,
+                splitk=0,
+                use_non_temporal_load=use_non_temporal_load,
+            )
+        if is_triton2:
+            stage2_func = functools.partial(
+                _triton_a16w16_stage2_wrapper, kernelName=kernelName2
+            )
+        else:
+            stage2_func = functools.partial(
+                aiter.ck_moe_stage2_fwd,
+                kernelName=kernelName2,
+                activation=activation,
+                quant_type=q_type,
+                use_non_temporal_load=use_non_temporal_load,
+            )
+        return MOEMetadata(stage1_func, stage2_func, block_m, 0, False)
     is_flydsl1 = isinstance(kernelName1, str) and kernelName1.startswith("flydsl_")
     is_flydsl2 = isinstance(kernelName2, str) and kernelName2.startswith("flydsl_")
     is_flydsl2_layout = isinstance(kernelName2, str) and kernelName2.startswith(
