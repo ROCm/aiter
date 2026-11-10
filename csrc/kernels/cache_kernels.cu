@@ -2526,7 +2526,7 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
 // LAT selects the latency-floor form one head per block has always used --
 // direct Q loads, the padded-token return deferred past them, the cos/sin row
 // in the buffer offset -- so that the per-entry layout can also run it at two
-// heads per block for mid-size launches.
+// or four heads per block for mid-size launches.
 template <typename scalar_t, typename cache_t, typename query_t, int KV_LORA, int PE_DIM,
           int PAGE_SIZE, bool IS_NEOX, bool NOPE_FIRST, int VEC, int HPT,
           bool COMPUTE_ALL_Q_ROPE = false, bool K_EARLY = (HPT <= 2),
@@ -5452,24 +5452,26 @@ static size_t mla_rope_tdm_lds_bytes(int hpt, size_t elem_size)
     return size_t(2) * (hpt * 256 + std::min(hpt, 4) * 64) * elem_size;
 }
 
-// Heads per block, K_EARLY and the latency-path (LAT) variant on the flat
-// head-group-major grid of the per-entry layout, fit on gfx1250 (H=16/32/128,
-// T=1..4096) against the (token, head) rows per CU: one head with K early
-// below 12, two on the latency path with K early up to 32, two with K early
-// up to 48, two up to 80, four up to 160, eight beyond. Between 12 and 32 the
-// latency path's second head per block beats one head (CUDA graph, H=24
-// T=128 2.03 -> 1.88 us, T=160 2.22 -> 1.99 us, H=128 T=32 2.21 -> 1.92 us);
-// below 12 it is 1-4% slower.
-static int mla_rope_entry_heads_per_block(int64_t num_tokens, int num_heads, bool& k_early,
-                                          bool& lat)
+// Heads per block and the latency-path (LAT, always with K early) variant on
+// the flat head-group-major grid of the per-entry layout, fit on gfx1250
+// (H=16/24/32/48/96/128, T=1..4096) against the (token, head) rows per CU:
+// one head below 12, two on the latency path below 18, four on the latency
+// path up to 128, eight on the TDM path beyond; one head is always LAT.
+// Between 12 and 18 the latency path's second head per block beats one head
+// (CUDA graph, H=24 T=128 2.03 -> 1.88 us, T=160 2.22 -> 1.99 us); below 12
+// it is 1-4% slower. From 18 to 128 four heads on the latency path beat both
+// two heads and the TDM path, which stages Q through LDS with fewer loads in
+// flight (H=24 T=512 3.66 -> 3.16 us, T=768 4.82 -> 4.36 us, H=96 T=128
+// 3.53 -> 3.19 us, H=16 T=768 3.70 -> 3.24 us); past 128 eight heads on the
+// TDM path win by 4-9% (H=24 T=1664 7.82 -> 7.61 us, H=96 T=416 7.64 -> 7.43
+// us).
+static int mla_rope_entry_heads_per_block(int64_t num_tokens, int num_heads, bool& lat)
 {
     const int64_t per_cu = num_tokens * num_heads / get_num_cu_func();
-    int hpt              = per_cu <= 48 ? (per_cu < 12 ? 1 : 2) : per_cu <= 80 ? 2
-                         : per_cu <= 160 ? 4 : 8;
+    int hpt = per_cu < 12 ? 1 : per_cu < 18 ? 2 : per_cu <= 128 ? 4 : 8;
     while(num_heads % hpt != 0)
         hpt >>= 1;
-    k_early = hpt == 1 || per_cu <= 48;
-    lat     = hpt == 1 || per_cu <= 32;
+    lat = hpt == 1 || per_cu <= 128;
     return hpt;
 }
 
@@ -5508,8 +5510,8 @@ static void launch_mla_rope_hpt(const MlaRopeHptArgs& a, hipStream_t stream)
     else
     {
         constexpr int KV_LORA = 512, PE_DIM = 64, VEC = 8;
-        bool k_early, lat;
-        const int hpt    = mla_rope_entry_heads_per_block(a.num_tokens, a.num_heads, k_early, lat);
+        bool lat;
+        const int hpt    = mla_rope_entry_heads_per_block(a.num_tokens, a.num_heads, lat);
         const size_t lds = lat ? 0 : mla_rope_tdm_lds_bytes(hpt, sizeof(scalar_t));
         uint32_t tok_magic;
         int tok_shift;
@@ -5545,12 +5547,15 @@ static void launch_mla_rope_hpt(const MlaRopeHptArgs& a, hipStream_t stream)
     switch(hpt)                                                          \
     {                                                                    \
     case 8: LAUNCH_MLA_ROPE_HPT(NEOX, NF, 8, false, false); break;       \
-    case 4: LAUNCH_MLA_ROPE_HPT(NEOX, NF, 4, false, false); break;       \
+    case 4:                                                              \
+        if(lat)                                                          \
+            LAUNCH_MLA_ROPE_HPT(NEOX, NF, 4, true, true);                \
+        else                                                             \
+            LAUNCH_MLA_ROPE_HPT(NEOX, NF, 4, false, false);              \
+        break;                                                           \
     case 2:                                                              \
         if(lat)                                                          \
             LAUNCH_MLA_ROPE_HPT(NEOX, NF, 2, true, true);                \
-        else if(k_early)                                                 \
-            LAUNCH_MLA_ROPE_HPT(NEOX, NF, 2, true, false);               \
         else                                                             \
             LAUNCH_MLA_ROPE_HPT(NEOX, NF, 2, false, false);              \
         break;                                                           \
