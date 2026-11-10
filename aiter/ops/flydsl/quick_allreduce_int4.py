@@ -323,6 +323,22 @@ class QuickAllReduceInt4:
     on every rank is not enough when the calls sit on independent streams; a
     switch of stream needs an event dependency (``wait_event`` /
     ``wait_stream``).
+
+    Every method that takes ``stream`` (``allreduce``, ``allreduce_rmsnorm``,
+    ``allreduce_rmsnorm_mxfp4``, ``reduce_scatter``, ``all_gather``) follows
+    these call rules:
+
+    * ``stream=None`` uses the current PyTorch stream on this device.
+    * A call only enqueues work. Every tensor it takes must stay allocated
+      until that work has finished, and for a call captured in a CUDA graph
+      until the graph's last replay; ``out`` is not valid, and ``inp`` must
+      not be modified, before then. A tensor that another stream produces or
+      consumes needs an event dependency, as with any kernel.
+    * ``inp`` and ``out`` must be torch tensors, bf16, on this rank's CUDA
+      device, contiguous and 16-byte aligned (``check_tensors``), and must not
+      overlap. Their sizes are checked per method: ``check_payload`` for the
+      all-reduce and the fused RMSNorm, ``_check_sp_payload`` for the
+      single-phase modes.
     """
 
     def __init__(
@@ -1306,11 +1322,14 @@ class QuickAllReduceInt4:
         Every partial, this rank's own included, goes through the INT4 codec,
         so a row's value does not depend on which rank owns it (the all-reduce
         adds its own share exactly). Shares the inbox slots and colors with the
-        all-reduce launches that go through the same engine; every rank must issue the same sequence of launches and
-        sizes, and every launch and graph replay on this communicator must run
-        in one serialized device order (see the class docstring). Needs the
-        mesh algorithm, the uncached inbox and a ``super_tile=1`` engine at the
-        default block.
+        all-reduce launches that go through the same engine; every rank must
+        issue the same sequence of launches and sizes, and every launch and
+        graph replay on this communicator must run in one serialized device
+        order (see the class docstring, which also has the call rules:
+        ``stream``, the lifetime of ``inp`` and ``out``, the tensor checks).
+        Needs the mesh algorithm, the uncached inbox, a ``super_tile=1``
+        engine at the default block and the INT4 codec (the build refuses the
+        fp16 wire codec).
 
         Until ``compile_sp`` has passed on every rank, the first eager call
         runs it with these tensors, which makes that call a collective (every
@@ -1325,8 +1344,10 @@ class QuickAllReduceInt4:
         ``inp`` is this rank's bf16 ``[T / world_size, H]`` block and ``out``
         the ``[T, H]`` concatenation of every rank's block, in rank order. This
         rank's own block is round-tripped through the codec too, so every rank
-        holds bitwise-equal output. Same size, sequence, ordering and
-        ``compile_sp`` rules as ``reduce_scatter``.
+        holds bitwise-equal output. Same size, sequence, ordering, engine,
+        codec and ``compile_sp`` rules as ``reduce_scatter``, and the call
+        rules of the class docstring (``stream``, tensor lifetime, tensor
+        checks).
         """
         self._run_sp(MODE_AG, inp, out, stream)
 
