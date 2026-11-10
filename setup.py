@@ -271,12 +271,13 @@ def get_exclude_ops():
 
     for module in all_modules:
         if PREBUILD_KERNELS == 1:
-            # Exclude tune modules; for MHA keep only fmha_v3 fwd variants
+            # Exclude tune modules; for MHA keep only fmha_v3 fwd and opus fwd
             if "_tune" in module:
                 exclude_ops.append(module)
             if "mha" in module and module not in [
                 "module_fmha_v3_fwd",
                 "module_fmha_v3_varlen_fwd",
+                "module_fmha_fwd_bf16_opus",
             ]:
                 exclude_ops.append(module)
         elif PREBUILD_KERNELS == 2:
@@ -350,6 +351,11 @@ if PREBUILD_KERNELS != 0:
                 "mha_varlen_fwd_bf16_nlogits_nbias_mask_lse_ndropout_skip_nqscale",
                 "mha_varlen_fwd_bf16_nlogits_nbias_nmask_lse_ndropout_skip_nqscale",
                 "mha_varlen_fwd_bf16_nlogits_nbias_nmask_nlse_ndropout_nskip_nqscale",
+                "mha_varlen_fwd_bf16_nlogits_nbias_mask_lse_ndropout_nskip_nqscale",
+                "mha_varlen_fwd_fp16_nlogits_nbias_mask_nlse_ndropout_skip_nqscale",
+                "mha_varlen_fwd_fp16_nlogits_nbias_mask_nlse_ndropout_nskip_nqscale",
+                "mha_varlen_fwd_fp16_nlogits_nbias_nmask_nlse_ndropout_nskip_nqscale",
+                "mha_varlen_fwd_fp8bf16_nlogits_nbias_nmask_nlse_ndropout_nskip_pertensor",
             ]
             variants = get_mha_varlen_prebuild_variants_by_names(req_md_names, ck_dir)
             base_args = core.get_args_of_build("module_mha_varlen_fwd")
