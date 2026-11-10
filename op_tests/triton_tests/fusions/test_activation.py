@@ -193,6 +193,24 @@ def test_act_mul_and_fp8_group_quant_dtype_and_group_size(
     _check_act_mul_and_fp8_group_quant(M, N, "silu", dtype, group_size)
 
 
+@pytest.mark.parametrize("M", [1, 129, 4097])
+@pytest.mark.parametrize("N", FP8_GROUP_QUANT_N)
+def test_act_mul_and_fp8_group_quant_matches_one_group_launch(
+    monkeypatch, M: int, N: int
+):
+    """The tuned launch returns the same bits as one group for each program."""
+    torch.manual_seed(0)
+    x = torch.randn((M, N), dtype=torch.bfloat16, device="cuda")
+    tuned_q, tuned_s = act_mul_and_fp8_group_quant(x, "silu", group_size=128)
+    monkeypatch.setattr(
+        activation_ops, "_get_act_mul_and_fp8_group_quant_config", lambda M: None
+    )
+    ref_q, ref_s = act_mul_and_fp8_group_quant(x, "silu", group_size=128)
+
+    assert torch.equal(tuned_q.view(torch.uint8), ref_q.view(torch.uint8))
+    assert torch.equal(tuned_s, ref_s)
+
+
 class _LaunchRecorder:
     """Record the launch keyword arguments. It does not launch the kernel."""
 
