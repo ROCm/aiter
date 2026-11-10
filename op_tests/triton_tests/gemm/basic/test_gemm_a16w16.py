@@ -203,6 +203,27 @@ def test_gemm_a16_w16_layout(M: int, N: int, K: int, layout, backend, kernel_typ
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
 
 
+# gfx1250 tuned Gluon buckets of the DeepSeek-V4.1 router GEMM (N=384, K=5120):
+# each bucket's config must fit in LDS for every operand layout, including the
+# lowest M of the bucket.
+@pytest.mark.parametrize("M", [545, 576, 641, 672, 737, 768])
+@pytest.mark.parametrize("layout", ["TN", "TT", "NN", "NT"])
+def test_gemm_a16_w16_router_buckets_layout(M: int, layout):
+    if not is_gluon_supported():
+        pytest.skip("Gluon not supported on this architecture")
+
+    N, K = 384, 5120
+    x, w, _, out_dtype, y = generate_gemm_a16w16_inputs(
+        M, N, K, torch.bfloat16, layout=layout, output=False
+    )
+
+    torch_out = F.linear(x, w, bias=None)
+
+    gluon_out = gemm_a16w16(x, w, None, out_dtype, y, backend="gluon")
+
+    torch.testing.assert_close(gluon_out, torch_out, atol=1e-1, rtol=1e-1)
+
+
 @pytest.mark.parametrize("M, N, K", get_x_vals())
 @pytest.mark.parametrize("output", [True, False])
 def test_gemm_a16_w16_atomic(M: int, N: int, K: int, output):
