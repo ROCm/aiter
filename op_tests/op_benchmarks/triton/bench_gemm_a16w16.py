@@ -270,7 +270,7 @@ def parse_args(args: list[str] | None = None):
         type=str,
         default=None,
         help="With --kernel-type streamk: a tuned kernelName "
-        "(e.g. gluon_streamk_256x256x64_g4_one_tile_rs_n8_wt) or a tile such as "
+        "(e.g. gluon_streamk_256x256x64_g4_one_tile_rs_k8_wt) or a tile such as "
         "128x256x64 (the default plan). Default: 256x256x64 with the default plan.",
     )
     return get_ff_args(parser, args=args)

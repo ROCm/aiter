@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Gluon BF16/FP16 GEMM for gfx950: persistent data-parallel tiles and a Stream-K tail.
+"""Gluon BF16/FP16 GEMM for gfx950: persistent data-parallel tiles and a Stream-K or
+sub-tiled tail.
 
 ``y = x @ w.T (+ bias)`` with x (M, K) and w (N, K) both K-contiguous, y (M, N) row-major.
 
@@ -30,7 +31,7 @@ not); the plan is either given too (a tuned config) or left to the default plan
 below. The launcher derives only shape- and topology-dependent constants::
 
     {"BLOCK_M": 256, "BLOCK_N": 256, "BLOCK_K": 64, "GROUP_SIZE_M": 4,
-     "STREAMK_POLICY": "one_tile", "STREAMK_FIXUP": "rs", "SPLIT_N": 8,
+     "STREAMK_POLICY": "one_tile", "STREAMK_FIXUP": "rs", "TAIL_SPLIT_K": 8,
      "STREAMK_EXCHANGE": "wt"}
     {"BLOCK_M": 256, "BLOCK_N": 256, "BLOCK_K": 64}       # default plan, GROUP_SIZE_M 4
 
@@ -46,8 +47,13 @@ persistent loop, each tile's epilogue prefetching the program's next tile.
     "dp"        every tile whole on one program (T = 10, S = 2):
                     wave 0  [t0][t1][t2][t3][t4][t5][t6][t7]
                     wave 1  [t8][t9] .   .   .   .   .   .     6 programs idle
-    "one_tile"  each tail tile's pairs cut evenly over SPLIT_N programs
-                (T = 10, S = 2, SPLIT_N = 4, S * SPLIT_N = 8 programs):
+    "dp_sub"    after at least one full wave, each tail tile cut into Q sub-tiles,
+                each whole on one program, no partials (subtile_tail picks them;
+                T = 10, S = 2, 128x256 tiles, 128x128 sub-tiles, Q = 2):
+                    wave 0  as dp
+                    tail    t8: [t8.0][t8.1]   t9: [t9.0][t9.1]      4 programs
+    "one_tile"  each tail tile's pairs cut evenly over TAIL_SPLIT_K programs
+                (T = 10, S = 2, TAIL_SPLIT_K = 4, S * TAIL_SPLIT_K = 8 programs):
                     wave 0  as dp
                     tail    t8: [AA][AA][AA][AA]   t9: [BB][BB][BB][BB]
     "spread"    S > P / 2 only: the tail's S * k pairs laid end to end and cut
@@ -59,38 +65,47 @@ persistent loop, each tile's epilogue prefetching the program's next tile.
     programs all start at pair 0 and share A and B in L2, and each publishes its
     partial before it waits for the tile it owns.
 
-STREAMK_FIXUP, how one_tile's SPLIT_N partial sums are combined (spread and
+STREAMK_FIXUP, how one_tile's TAIL_SPLIT_K partial sums are combined (spread and
 two_tile always use the owner).
 
     "owner"  the program with a tile's first pairs owns it; the others store fp32
              partials and raise a flag; the owner adds them one after another:
                  p1, p2, p3 --partial--> p0 --> C tile
-             Fewest bytes, but n - 1 serial reads: suits small SPLIT_N.
+             Fewest bytes, but n - 1 serial reads: suits small TAIL_SPLIT_K.
     "rs"     reduce-scatter: every program stores its partial, all meet at the
              tile's barrier, then program i sums slice i of every partial:
                  p0 p1 p2 p3 store | barrier | C tile: [ p0 | p1 | p2 | p3 ]
              Programs the tail leaves idle read slices too: R = max(min(blocks,
              pow2_floor(P / S)), own readers) per tile, with each tile's barrier
              in its own cache line. The ending costs about the same at any
-             SPLIT_N: suits large SPLIT_N.
+             TAIL_SPLIT_K: suits large TAIL_SPLIT_K.
 
 STREAMK_EXCHANGE, where partials and flags travel.
 
     "wt"  written through to memory; no placement constraint.
     "l2"  one_tile with rs only: all of a tile's programs on one XCD, partials and
-          flags kept in its L2. Needs SPLIT_N <= (P / NUM_XCDS) / ceil(S / NUM_XCDS).
+          flags kept in its L2. Needs
+          TAIL_SPLIT_K <= (P / NUM_XCDS) / ceil(S / NUM_XCDS).
 
-SPLIT_N, programs per tail tile: an integer 2 <= SPLIT_N <= min(P // S, k) for
-one_tile, None for the other policies.
+TAIL_SPLIT_K, programs per tail tile, each running an even share of its K-pairs: an
+integer 2 <= TAIL_SPLIT_K <= min(P // S, k) for one_tile, None for the other policies.
+
+dp_sub's sub-tile (TAIL_BLOCK_M x TAIL_BLOCK_N, sides in 64, 128, 256 dividing the
+tile's) is derived from the shape at launch, so a tuned dp_sub follows M: the largest
+Q = (BLOCK_M / TAIL_BLOCK_M) (BLOCK_N / TAIL_BLOCK_N) with S Q <= P, then the most
+square sub-tile (subtile_tail). The full waves keep BLOCK_M x BLOCK_N; the tail runs
+its own sub-tile pipeline in the same LDS. It trades the tile's MFMA efficiency for
+no fixup: suits a tail of at most half a wave and short K.
 
 GROUP_SIZE_M, rows of tiles walked together by the persistent loop's swizzle.
 
 Default plan. A config may name only the tile (BLOCK_M, BLOCK_N, BLOCK_K, and
 optionally GROUP_SIZE_M, default 4); streamk_plan then supplies STREAMK_POLICY,
-STREAMK_FIXUP and SPLIT_N, with the "wt" exchange. With m = P // S programs per
+STREAMK_FIXUP and TAIL_SPLIT_K, with the "wt" exchange. With m = P // S programs per
 tail tile, pairs = ceil(K / (2 BLOCK_K)) K-pairs per tile and cap = min(m, pairs):
 
     dp              if S == 0 or cap < 2
+    dp_sub          if T > P, S <= P / 2 and K <= SUBTILE_MAX_K (4096)
     owner           if m <= 3:  n = sqrt(pairs / 1.5),    dp if pairs < 10
     reduce-scatter  otherwise:  n = sqrt(pairs * m / 6),  dp if pairs * (1 - 1/n) < 6
 
@@ -98,12 +113,12 @@ n is clamped to cap and rounded to the nearest of OWNER_SPLITS / RS_SPLITS. The
 reduce-scatter's n balances each program's MAC (pairs / n) against the partials all
 S n programs store and read at once; the owner reads its n - 1 partials one after
 another, so its n grows only with sqrt(pairs). The same constants (STREAMK_PLAN)
-hold for every tile spec, below one wave and after it. They, OWNER_SPLITS,
-RS_SPLITS, DEFAULT_TILE and the default GROUP_SIZE_M live in
+hold for every tile spec, below one wave and after it. They, SUBTILE_MAX_K,
+OWNER_SPLITS, RS_SPLITS, DEFAULT_TILE and the default GROUP_SIZE_M live in
 configs/gfx950/gluon/gemm/gemm_a16w16_streamk/DEFAULT.json (streamk_defaults).
 
 Tile order. The persistent tiles are the first T - S tile ids, with the XCD remap
-and GROUP_SIZE_M swizzle applied over those ids alone, and the Stream-K tiles are the
+and GROUP_SIZE_M swizzle applied over those ids alone, and the tail tiles are the
 last S ids, which keeps the tail's mapping separate from the persistent one. The
 last persistent trip prefetches the program's first Stream-K pair, which is never
 slower than discarding it.
@@ -272,6 +287,41 @@ def vpid_tile_coords(
     return group_m_tile_coords(tile, M, N, BM, BN, GROUP_SIZE_M)
 
 
+@gluon.jit
+def tail_unit_coords(
+    v,
+    M,
+    N,
+    BM: gl.constexpr,
+    BN: gl.constexpr,
+    TBM: gl.constexpr,
+    TBN: gl.constexpr,
+    GROUP_SIZE_M: gl.constexpr,
+):
+    """(m, n) in the TBM x TBN grid of unit v, sub-tile v % Q of tile v // Q, whose
+    Q = (BM / TBM) (BN / TBN) sub-tiles are numbered row-major. Tail unit u is
+    v = total_full_tiles Q + u; with TBM, TBN = BM, BN a unit is the whole tile.
+
+    BM x BN = 256x256, TBM x TBN = 128x64 (Q = 8), v = 8 tile + q:
+
+        +----+----+----+----+
+        | q0 | q1 | q2 | q3 |      m = 2 pid_m + q // 4
+        +----+----+----+----+      n = 4 pid_n + q % 4
+        | q4 | q5 | q6 | q7 |
+        +----+----+----+----+
+    """
+    if TBM == BM and TBN == BN:
+        m, n = group_m_tile_coords(v, M, N, BM, BN, GROUP_SIZE_M)
+    else:
+        QM: gl.constexpr = BM // TBM
+        QN: gl.constexpr = BN // TBN
+        q = v % (QM * QN)
+        pid_m, pid_n = group_m_tile_coords(v // (QM * QN), M, N, BM, BN, GROUP_SIZE_M)
+        m = pid_m * QM + q // QN
+        n = pid_n * QN + q % QN
+    return m, n
+
+
 _gemm_a16w16_streamk_repr = make_kernel_repr(
     "_gemm_a16w16_streamk_kernel",
     [
@@ -279,8 +329,8 @@ _gemm_a16w16_streamk_repr = make_kernel_repr(
         "BLOCK_N",
         "BLOCK_K",
         "GROUP_SIZE_M",
-        "STREAMK_TILES",
-        "SPLIT_N",
+        "TAIL_TILES",
+        "TAIL_SPLIT_K",
         "REDUCE_SCATTER",
         "END_TO_END",
         "L2",
@@ -316,8 +366,8 @@ def _gemm_a16w16_streamk_kernel(
     EVEN_M: gl.constexpr,
     EVEN_N: gl.constexpr,
     EVEN_K: gl.constexpr,
-    STREAMK_TILES: gl.constexpr,
-    SPLIT_N: gl.constexpr,
+    TAIL_TILES: gl.constexpr,
+    TAIL_SPLIT_K: gl.constexpr,
     REDUCE_SCATTER: gl.constexpr,
     RS_NB: gl.constexpr,
     RS_U: gl.constexpr,
@@ -329,13 +379,17 @@ def _gemm_a16w16_streamk_kernel(
     OWNER_QPB: gl.constexpr = 1,
     RS_E: gl.constexpr = 0,
     BAR_STRIDE: gl.constexpr = 0,
+    TAIL_BLOCK_M: gl.constexpr = 0,
+    TAIL_BLOCK_N: gl.constexpr = 0,
+    TAIL_EVEN_M: gl.constexpr = True,
+    TAIL_EVEN_N: gl.constexpr = True,
 ):
     """
-    Persistent full tiles followed by a uniform or end-to-end Stream-K tail, on a
+    Persistent full tiles followed by a uniform or end-to-end tail, on a
     tile sliced in both M and N (4 quadrant accumulators, K loop unrolled by 2,
     pre-computed load offsets, XCD-aware PID remapping + GROUP_SIZE_M swizzling):
 
-    1. A persistent loop over the first total_full_tiles = total_tiles - STREAMK_TILES
+    1. A persistent loop over the first total_full_tiles = total_tiles - TAIL_TILES
        tile ids, XCD-remapped over those ids alone: each tile's epilogue prefetches
        the first K-step pair of the program's next tile. The last trip's epilogue
        prefetches the first pair of the program's first Stream-K segment, which then
@@ -343,16 +397,26 @@ def _gemm_a16w16_streamk_kernel(
        on an even K the idle program's target is in bounds and never read). Without a
        Stream-K tail it loads the last pair of tile total_full_tiles - 1, which is
        discarded.
-    2. A Stream-K tail over the last STREAMK_TILES tile ids, split in units of a
-       K-step pair, whose partials are combined by an owner or a reduce-scatter
-       ending. Every program of the Stream-K phase must be resident at once: the
-       endings wait on each other.
+    2. A tail over the last TAIL_TILES tile ids. Stream-K splits each tile in units
+       of a K-step pair, whose partials are combined by an owner or a reduce-scatter
+       ending; every program of the Stream-K phase must be resident at once, as the
+       endings wait on each other. dp_sub instead runs each tile's sub-tiles whole,
+       one per program (TAIL_BLOCK_M / TAIL_BLOCK_N).
+
+    TAIL_SPLIT_K: the uniform tail's programs per tile, each running an even share of
+    its K-pairs (1 on the end-to-end tail, whose split is not per tile).
+
+    TAIL_BLOCK_M / TAIL_BLOCK_N (0: BLOCK_M / BLOCK_N): dp_sub's sub-tile. The
+    uniform tail cuts each tail tile into Q = (BLOCK_M / TAIL_BLOCK_M)
+    (BLOCK_N / TAIL_BLOCK_N) sub-tiles (tail_unit_coords), and one program runs each
+    sub-tile over its whole K, with no partials. TAIL_EVEN_M / TAIL_EVEN_N are
+    EVEN_M / EVEN_N at the sub-tile's size.
     """
     start = gl.program_id(axis=0)
     num_tiles_m = gl.cdiv(M, BLOCK_M)
     num_tiles_n = gl.cdiv(N, BLOCK_N)
     total_tiles = num_tiles_m * num_tiles_n
-    total_full_tiles = total_tiles - STREAMK_TILES
+    total_full_tiles = total_tiles - TAIL_TILES
     strides = (stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn)
 
     # Every layout follows the tile: the shared layouts come from the dot-operand
@@ -428,7 +492,15 @@ def _gemm_a16w16_streamk_kernel(
 
     gl.assume(iterMax > 3)
     PAIRS_PER_TILE: gl.constexpr = K_PAD // (2 * BLOCK_K)
-    SK_PREFETCH: gl.constexpr = HAS_FULL and STREAMK_TILES > 0
+    TBM: gl.constexpr = BLOCK_M if TAIL_BLOCK_M == 0 else TAIL_BLOCK_M
+    TBN: gl.constexpr = BLOCK_N if TAIL_BLOCK_N == 0 else TAIL_BLOCK_N
+    SUBTILE: gl.constexpr = TBM != BLOCK_M or TBN != BLOCK_N
+    gl.static_assert(BLOCK_M % TBM == 0 and BLOCK_N % TBN == 0)
+    gl.static_assert(not SUBTILE or not (END_TO_END or L2 or REDUCE_SCATTER))
+    # The last persistent trip's prefetch fills the full tile's buffers and layouts.
+    # Prefetching the sub-tile instead measured +0.4-0.65% (1-2% at short K) for
+    # about 80% more instructions and 15% more compile time: left as a future option.
+    SK_PREFETCH: gl.constexpr = HAS_FULL and TAIL_TILES > 0 and not SUBTILE
 
     # Persistent phase. Pair zero is already in flight on entry to each tile;
     # its epilogue prefetches pair zero of the next virtual tile.
@@ -439,9 +511,9 @@ def _gemm_a16w16_streamk_kernel(
         if SK_PREFETCH:
             sk_has, sk_tile, sk_k0 = streamk_first_segment(
                 total_full_tiles,
-                STREAMK_TILES,
+                TAIL_TILES,
                 PAIRS_PER_TILE,
-                SPLIT_N,
+                TAIL_SPLIT_K,
                 END_TO_END,
                 L2,
                 NUM_PROGRAMS,
@@ -560,10 +632,10 @@ def _gemm_a16w16_streamk_kernel(
         a_top = 0
         b_left = 0
 
-    if END_TO_END and STREAMK_TILES > 0:
+    if END_TO_END and TAIL_TILES > 0:
         # Two-tile and spread always use the full resident grid.
         rank, sk_pair_start, seg_end = e2e_pair_range(
-            STREAMK_TILES, PAIRS_PER_TILE, NUM_PROGRAMS, NUM_XCDS
+            TAIL_TILES, PAIRS_PER_TILE, NUM_PROGRAMS, NUM_XCDS
         )
         # Segments run last to first: each program starts at k-step 0 of its last
         # tile, so an XCD's programs stay in step and share A / B in L2 (forward
@@ -575,7 +647,7 @@ def _gemm_a16w16_streamk_kernel(
                 seg_end,
                 sk_pair_start,
                 rank,
-                STREAMK_TILES,
+                TAIL_TILES,
                 PAIRS_PER_TILE,
                 NUM_PROGRAMS,
             )
@@ -634,7 +706,7 @@ def _gemm_a16w16_streamk_kernel(
                 seg_end,
                 sk_pair_start,
                 rank,
-                STREAMK_TILES,
+                TAIL_TILES,
                 PAIRS_PER_TILE,
                 NUM_PROGRAMS,
             )
@@ -685,21 +757,83 @@ def _gemm_a16w16_streamk_kernel(
                 0,
             )
             seg_end = seg_start
-    elif STREAMK_TILES > 0:
-        # Uniform tile-aligned split: every tile has exactly SPLIT_N programs.
-        WORKING: gl.constexpr = STREAMK_TILES * SPLIT_N
-        NBLK: gl.constexpr = BLOCK_M * BLOCK_N // 1024
-        gl.static_assert(SPLIT_N <= PAIRS_PER_TILE)
-        # The wt reduce-scatter reads with RS_R = SPLIT_N + RS_E programs when RS_E
+    elif TAIL_TILES > 0:
+        # Uniform tile-aligned split: every unit (a tile, or each of its Q sub-tiles)
+        # has exactly TAIL_SPLIT_K programs.
+        Q: gl.constexpr = (BLOCK_M // TBM) * (BLOCK_N // TBN)
+        UNITS: gl.constexpr = TAIL_TILES * Q
+        WORKING: gl.constexpr = UNITS * TAIL_SPLIT_K
+        NBLK: gl.constexpr = BLOCK_M * BLOCK_N // MFMA_BLOCK_ELEMS
+        gl.static_assert(TAIL_SPLIT_K <= PAIRS_PER_TILE)
+        # A ragged edge can leave sub-tiles wholly outside C: their programs skip
+        # them, and no other unit waits on them.
+        SKIP_OUT: gl.constexpr = SUBTILE and not (EVEN_M and EVEN_N)
+        if SUBTILE:
+            # The tail's own pipeline at TBM x TBN. Its buffers reuse the persistent
+            # phase's LDS, so every wave's last reads and copies there must be done.
+            if HAS_FULL:
+                drain_and_barrier()
+            tailSharedA: gl.constexpr = (
+                ttgl_cdna4.compute_efficient_padded_shared_layout(
+                    dotOpLayoutA, [TBM // 2, BLOCK_K], a_ptr.dtype.element_ty
+                )
+            )
+            tailSharedB: gl.constexpr = (
+                ttgl_cdna4.compute_efficient_padded_shared_layout(
+                    dotOpLayoutB, [BLOCK_K, TBN // 2], b_ptr.dtype.element_ty
+                )
+            )
+            tailLoadA: gl.constexpr = compute_gload_layout(
+                tailSharedA, 8, gl.num_warps()
+            )
+            tailLoadB: gl.constexpr = compute_gload_layout(
+                tailSharedB, 8, gl.num_warps()
+            )
+            tail_smem = (
+                gl.allocate_shared_memory(
+                    a_ptr.dtype.element_ty, [nBuffers, TBM // 2, BLOCK_K], tailSharedA
+                ),
+                gl.allocate_shared_memory(
+                    a_ptr.dtype.element_ty, [nBuffers, TBM // 2, BLOCK_K], tailSharedA
+                ),
+                gl.allocate_shared_memory(
+                    b_ptr.dtype.element_ty, [nBuffers, BLOCK_K, TBN // 2], tailSharedB
+                ),
+                gl.allocate_shared_memory(
+                    b_ptr.dtype.element_ty, [nBuffers, BLOCK_K, TBN // 2], tailSharedB
+                ),
+            )
+            tail_am = gl.arange(0, TBM // 2, gl.SliceLayout(1, tailLoadA))
+            tail_ak = gl.arange(0, BLOCK_K, gl.SliceLayout(0, tailLoadA))
+            tail_bn = gl.arange(0, TBN // 2, gl.SliceLayout(0, tailLoadB))
+            tail_bk = gl.arange(0, BLOCK_K, gl.SliceLayout(1, tailLoadB))
+            tail_kofs = (
+                gl.multiple_of(tail_am * stride_am, 8)[:, None]
+                + tail_ak[None, :] * stride_ak,
+                TBM // 2 * stride_am,
+                tail_bk[:, None] * stride_bk
+                + gl.multiple_of(tail_bn * stride_bn, 8)[None, :],
+                TBN // 2 * stride_bn,
+            )
+            UNIT_EVEN_M: gl.constexpr = TAIL_EVEN_M
+            UNIT_EVEN_N: gl.constexpr = TAIL_EVEN_N
+        else:
+            tailLoadA: gl.constexpr = gLoadLayoutA
+            tailLoadB: gl.constexpr = gLoadLayoutB
+            tail_smem = smem
+            tail_kofs = kofs
+            UNIT_EVEN_M: gl.constexpr = EVEN_M
+            UNIT_EVEN_N: gl.constexpr = EVEN_N
+        # The wt reduce-scatter reads with RS_R = TAIL_SPLIT_K + RS_E programs when RS_E
         # idle programs join each tile (rs_readers); otherwise with its own.
         RS_ALL: gl.constexpr = REDUCE_SCATTER and not L2
         if RS_ALL and RS_E > 0:
-            gl.static_assert(RS_R == SPLIT_N + RS_E and RS_R <= NBLK)
+            gl.static_assert(RS_R == TAIL_SPLIT_K + RS_E and RS_R <= NBLK)
         else:
-            gl.static_assert(RS_R > 0 and RS_R <= SPLIT_N)
+            gl.static_assert(RS_R > 0 and RS_R <= TAIL_SPLIT_K)
             gl.static_assert(
-                2 * RS_R > SPLIT_N or RS_R == NBLK,
-                "RS_R does not match SPLIT_N",
+                2 * RS_R > TAIL_SPLIT_K or RS_R == NBLK,
+                "RS_R does not match TAIL_SPLIT_K",
             )
         gl.static_assert((RS_R & (RS_R - 1)) == 0)
         gl.static_assert(RS_NB == 1 or RS_NB * RS_R <= NBLK)
@@ -709,10 +843,10 @@ def _gemm_a16w16_streamk_kernel(
             rank = xcd_blocked_rank(L2_GRID, NUM_XCDS)
             t, j, n_tile = xcd_local_chunk_of(
                 rank,
-                STREAMK_TILES,
+                TAIL_TILES,
                 L2_GRID // NUM_XCDS,
                 NUM_XCDS,
-                SPLIT_N,
+                TAIL_SPLIT_K,
             )
             active = n_tile > 0
         else:
@@ -723,17 +857,22 @@ def _gemm_a16w16_streamk_kernel(
             else:
                 rank = xcd_blocked_rank(WORKING, NUM_XCDS, IDLE=True)
             active = rank < WORKING
-            t = rank // SPLIT_N
-            j = rank % SPLIT_N
-            n_tile = SPLIT_N
+            t = rank // TAIL_SPLIT_K
+            j = rank % TAIL_SPLIT_K
+            n_tile = TAIL_SPLIT_K
+        if SKIP_OUT:
+            um, un = tail_unit_coords(
+                total_full_tiles * Q + t, M, N, BLOCK_M, BLOCK_N, TBM, TBN, GROUP_SIZE_M
+            )
+            active = active & (um * TBM < M) & (un * TBN < N)
         if active:
             is_partial = (j != 0).to(gl.int32)
-            n_peers = (SPLIT_N - 1) * (1 - is_partial)
-            OWNER_MAX_PEERS: gl.constexpr = SPLIT_N - 1 if SPLIT_N <= 8 else 0
+            n_peers = (TAIL_SPLIT_K - 1) * (1 - is_partial)
+            OWNER_MAX_PEERS: gl.constexpr = TAIL_SPLIT_K - 1 if TAIL_SPLIT_K <= 8 else 0
             quadrant_segment(
-                total_full_tiles + t,
-                even_split_start(j, PAIRS_PER_TILE, SPLIT_N) * 2,
-                even_split_size(j, PAIRS_PER_TILE, SPLIT_N),
+                total_full_tiles * Q + t,
+                even_split_start(j, PAIRS_PER_TILE, TAIL_SPLIT_K) * 2,
+                even_split_size(j, PAIRS_PER_TILE, TAIL_SPLIT_K),
                 is_partial,
                 n_peers,
                 rank,
@@ -747,13 +886,13 @@ def _gemm_a16w16_streamk_kernel(
                 p_ptr,
                 locks_ptr,
                 sync_ptr,
-                smem,
-                kofs,
+                tail_smem,
+                tail_kofs,
                 strides,
                 M,
                 N,
-                BLOCK_M,
-                BLOCK_N,
+                TBM,
+                TBN,
                 BLOCK_K,
                 GROUP_SIZE_M,
                 ADD_BIAS,
@@ -765,10 +904,10 @@ def _gemm_a16w16_streamk_kernel(
                 NUM_PROGRAMS,
                 NUM_XCDS,
                 mfmaLayout,
-                gLoadLayoutA,
-                gLoadLayoutB,
-                EVEN_M,
-                EVEN_N,
+                tailLoadA,
+                tailLoadB,
+                UNIT_EVEN_M,
+                UNIT_EVEN_N,
                 EVEN_K,
                 K_PAD,
                 K_RES,
@@ -780,17 +919,19 @@ def _gemm_a16w16_streamk_kernel(
                 b_left,
                 RS_E,
                 BAR_STRIDE,
+                TILE_M=BLOCK_M,
+                TILE_N=BLOCK_N,
             )
         if RS_ALL and RS_E > 0:
             # Programs without a segment (hardware pids from WORKING) read too.
             e = gl.program_id(axis=0) - WORKING
-            if (e >= 0) & (e < STREAMK_TILES * RS_E):
+            if (e >= 0) & (e < TAIL_TILES * RS_E):
                 # The last trip's prefetch (unmasked on an even K) may still be in
                 # flight into the LDS the slice's layout conversions use.
                 gl.amd.cdna4.async_copy.wait_group(0)
                 rs_extra_reader(
                     e // RS_E,
-                    SPLIT_N + e % RS_E,
+                    TAIL_SPLIT_K + e % RS_E,
                     total_full_tiles,
                     p_ptr,
                     bias_ptr,
@@ -803,7 +944,7 @@ def _gemm_a16w16_streamk_kernel(
                     BLOCK_M,
                     BLOCK_N,
                     GROUP_SIZE_M,
-                    SPLIT_N,
+                    TAIL_SPLIT_K,
                     RS_R,
                     RS_E,
                     RS_NB,
@@ -1644,9 +1785,9 @@ def xcd_blocked_rank(
 @gluon.jit
 def streamk_first_segment(
     total_full_tiles,
-    STREAMK_TILES: gl.constexpr,
+    TAIL_TILES: gl.constexpr,
     PAIRS_PER_TILE: gl.constexpr,
-    SPLIT_N: gl.constexpr,
+    TAIL_SPLIT_K: gl.constexpr,
     END_TO_END: gl.constexpr,
     L2: gl.constexpr,
     NUM_PROGRAMS: gl.constexpr,
@@ -1658,13 +1799,13 @@ def streamk_first_segment(
     pair 0 is loaded from the physical last pair (see quadrant_segment)."""
     if END_TO_END:
         rank, sk_pair_start, sk_pair_end = e2e_pair_range(
-            STREAMK_TILES, PAIRS_PER_TILE, NUM_PROGRAMS, NUM_XCDS
+            TAIL_TILES, PAIRS_PER_TILE, NUM_PROGRAMS, NUM_XCDS
         )
         sk_t, _, k0, _, _ = e2e_segment_ending_at(
             sk_pair_end,
             sk_pair_start,
             rank,
-            STREAMK_TILES,
+            TAIL_TILES,
             PAIRS_PER_TILE,
             NUM_PROGRAMS,
         )
@@ -1673,15 +1814,15 @@ def streamk_first_segment(
         if L2:
             rank = xcd_blocked_rank(NUM_PROGRAMS, NUM_XCDS)
             sk_t, j, n_tile = xcd_local_chunk_of(
-                rank, STREAMK_TILES, NUM_PROGRAMS // NUM_XCDS, NUM_XCDS, SPLIT_N
+                rank, TAIL_TILES, NUM_PROGRAMS // NUM_XCDS, NUM_XCDS, TAIL_SPLIT_K
             )
             has = (n_tile > 0).to(gl.int32)
         else:
-            rank = xcd_blocked_rank(STREAMK_TILES * SPLIT_N, NUM_XCDS, IDLE=True)
-            has = (rank < STREAMK_TILES * SPLIT_N).to(gl.int32)
-            sk_t = rank // SPLIT_N
-            j = rank % SPLIT_N
-        k0 = even_split_start(j, PAIRS_PER_TILE, SPLIT_N) * 2 * has
+            rank = xcd_blocked_rank(TAIL_TILES * TAIL_SPLIT_K, NUM_XCDS, IDLE=True)
+            has = (rank < TAIL_TILES * TAIL_SPLIT_K).to(gl.int32)
+            sk_t = rank // TAIL_SPLIT_K
+            j = rank % TAIL_SPLIT_K
+        k0 = even_split_start(j, PAIRS_PER_TILE, TAIL_SPLIT_K) * 2 * has
         sk_t = sk_t * has
     return has, total_full_tiles + sk_t, k0
 
@@ -1692,20 +1833,20 @@ def xcd_local_chunk_of(
     S: gl.constexpr,
     PROGS_PER_XCD: gl.constexpr,
     NUM_XCDS: gl.constexpr,
-    SPLIT_N: gl.constexpr,
+    TAIL_SPLIT_K: gl.constexpr,
 ):
     """(tile, chunk, programs on the tile) of the program with this rank in the
     XCD-local split (l2), with 0 programs if it idles. XCD x = rank // PROGS_PER_XCD
     owns part x of an even split of the S Stream-K tiles over the XCDs; its local
-    program l works on its tile l // SPLIT_N as chunk l % SPLIT_N, so a tile's SPLIT_N
-    programs are on one XCD. The host checks
-    ceil(S / NUM_XCDS) * SPLIT_N <= PROGS_PER_XCD."""
+    program l works on its tile l // TAIL_SPLIT_K as chunk l % TAIL_SPLIT_K, so a
+    tile's TAIL_SPLIT_K programs are on one XCD. The host checks
+    ceil(S / NUM_XCDS) * TAIL_SPLIT_K <= PROGS_PER_XCD."""
     x = rank // PROGS_PER_XCD
     local = rank % PROGS_PER_XCD
-    tl = local // SPLIT_N
+    tl = local // TAIL_SPLIT_K
     t = even_split_start(x, S, NUM_XCDS) + tl
-    n_tile = SPLIT_N * (tl < even_split_size(x, S, NUM_XCDS)).to(gl.int32)
-    return t, local % SPLIT_N, n_tile
+    n_tile = TAIL_SPLIT_K * (tl < even_split_size(x, S, NUM_XCDS)).to(gl.int32)
+    return t, local % TAIL_SPLIT_K, n_tile
 
 
 @gluon.jit
@@ -1724,7 +1865,7 @@ def e2e_rank_of_pair(i, L: gl.constexpr, R: gl.constexpr):
 
 @gluon.jit
 def e2e_pair_range(
-    STREAMK_TILES: gl.constexpr,
+    TAIL_TILES: gl.constexpr,
     PAIRS_PER_TILE: gl.constexpr,
     NUM_PROGRAMS: gl.constexpr,
     NUM_XCDS: gl.constexpr,
@@ -1732,7 +1873,7 @@ def e2e_pair_range(
     """End-to-end split: (rank, sk_pair_start, sk_pair_end) of this program, whose range
     [sk_pair_start, sk_pair_end) of the Stream-K tiles' pairs is part rank of an even
     split over the full grid (XCD-blocked ranks)."""
-    SK_PAIRS: gl.constexpr = STREAMK_TILES * PAIRS_PER_TILE
+    SK_PAIRS: gl.constexpr = TAIL_TILES * PAIRS_PER_TILE
     gl.static_assert(NUM_PROGRAMS <= SK_PAIRS)
     rank = xcd_blocked_rank(NUM_PROGRAMS, NUM_XCDS)
     sk_pair_start = even_split_start(rank, SK_PAIRS, NUM_PROGRAMS)
@@ -1745,7 +1886,7 @@ def e2e_segment_ending_at(
     seg_end,
     sk_pair_start,
     rank,
-    STREAMK_TILES: gl.constexpr,
+    TAIL_TILES: gl.constexpr,
     PAIRS_PER_TILE: gl.constexpr,
     NUM_PROGRAMS: gl.constexpr,
 ):
@@ -1754,7 +1895,7 @@ def e2e_segment_ending_at(
     pair seg_end. It covers pairs [seg_start, seg_end) of Stream-K tile t, from logical
     K-step k0. is_owner: it holds the tile's last pair and collects the tile. n_peers:
     the programs holding the tile's earlier pairs (0 unless is_owner)."""
-    SK_PAIRS: gl.constexpr = STREAMK_TILES * PAIRS_PER_TILE
+    SK_PAIRS: gl.constexpr = TAIL_TILES * PAIRS_PER_TILE
     L: gl.constexpr = SK_PAIRS // NUM_PROGRAMS
     R: gl.constexpr = SK_PAIRS % NUM_PROGRAMS
     t = (seg_end - 1) // PAIRS_PER_TILE
@@ -2377,7 +2518,7 @@ def band_pos(
 ):
     """Tile rows and columns of the band of the aligned blocks g0 .. g0 + G - 1."""
     VN: gl.constexpr = HALF_N // 32
-    VQ: gl.constexpr = HALF_M * HALF_N // 1024
+    VQ: gl.constexpr = HALF_M * HALF_N // MFMA_BLOCK_ELEMS
     r = gl.arange(0, ROWS, gl.SliceLayout(1, layout))[:, None]
     c = gl.arange(0, COLS, gl.SliceLayout(0, layout))[None, :]
     q = g0 // VQ
@@ -2615,7 +2756,7 @@ def rs_extra_reader(
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
     GROUP_SIZE_M: gl.constexpr,
-    SPLIT_N: gl.constexpr,
+    TAIL_SPLIT_K: gl.constexpr,
     R: gl.constexpr,
     E: gl.constexpr,
     NB: gl.constexpr,
@@ -2625,11 +2766,11 @@ def rs_extra_reader(
     EVEN_N: gl.constexpr,
     BAR_STRIDE: gl.constexpr,
 ):
-    """An idle program as reader jr (SPLIT_N <= jr < R) of Stream-K tile t (rs_ending
-    with RS_E > 0). It arrives on the tile's barrier at once: a waiter that only polled
-    could read the generation after the last arrival had bumped it and spin forever.
-    Then it waits for the producers and reduces its slice."""
-    tile_barrier(sync_ptr, t * BAR_STRIDE, SPLIT_N + E, True)
+    """An idle program as reader jr (TAIL_SPLIT_K <= jr < R) of Stream-K tile t
+    (rs_ending with RS_E > 0). It arrives on the tile's barrier at once: a waiter that
+    only polled could read the generation after the last arrival had bumped it and spin
+    forever. Then it waits for the producers and reduces its slice."""
+    tile_barrier(sync_ptr, t * BAR_STRIDE, TAIL_SPLIT_K + E, True)
     pid_m, pid_n = group_m_tile_coords(
         total_full_tiles + t, M, N, BLOCK_M, BLOCK_N, GROUP_SIZE_M
     )
@@ -2644,9 +2785,9 @@ def rs_extra_reader(
         p_ptr,
         bias_ptr,
         c_tile,
-        t * SPLIT_N,
+        t * TAIL_SPLIT_K,
         jr,
-        SPLIT_N,
+        TAIL_SPLIT_K,
         R,
         pid_n,
         stride_cm,
@@ -2808,12 +2949,15 @@ def quadrant_segment(
     b_left_in=None,
     RS_E: gl.constexpr = 0,
     BAR_STRIDE: gl.constexpr = 0,
+    TILE_M: gl.constexpr = 0,
+    TILE_N: gl.constexpr = 0,
 ):
     """K-steps [k0, k0 + 2 n_pairs) of tile tile_id (n_pairs >= 1), from its own
     prologue, then the segment's ending: XCD-local reduce-scatter (l2_rs_ending, L2),
     reduce-scatter (rs_ending) or the owner ending (owner_ending). rank is the
     program's workspace slot, j its chunk (role 0 owns the tile), n_tile / r_tile the
-    tile's programs and readers.
+    tile's programs and readers. With TILE_M, TILE_N given, tile_id is a tail unit,
+    a BLOCK_M x BLOCK_N (sub-)tile of a TILE_M x TILE_N tile (tail_unit_coords).
 
     Pair p of a tile (K-steps 2p, 2p + 1) is at columns 2 BLOCK_K (p - 1) for p >= 1,
     and pair 0 is the last pair, at K_PAD - 2 BLOCK_K, loaded on a ragged K with the
@@ -2837,7 +2981,14 @@ def quadrant_segment(
     dotOpLayoutB: gl.constexpr = gl.DotOperandLayout(
         operand_index=1, parent=mfmaLayout, k_width=8
     )
-    pid_m, pid_n = group_m_tile_coords(tile_id, M, N, BLOCK_M, BLOCK_N, GROUP_SIZE_M)
+    if TILE_M == 0:
+        pid_m, pid_n = group_m_tile_coords(
+            tile_id, M, N, BLOCK_M, BLOCK_N, GROUP_SIZE_M
+        )
+    else:
+        pid_m, pid_n = tail_unit_coords(
+            tile_id, M, N, TILE_M, TILE_N, BLOCK_M, BLOCK_N, GROUP_SIZE_M
+        )
     m_left = M - pid_m * BLOCK_M
     n_left = gl.multiple_of(N - pid_n * BLOCK_N, 8)
 
@@ -3057,7 +3208,7 @@ def schedule_hint():
 
 TILE_SIDES = (64, 128, 256)
 BLOCK_K_SIDES = (64, 128)
-STREAMK_POLICIES = ("dp", "one_tile", "two_tile", "spread")
+STREAMK_POLICIES = ("dp", "dp_sub", "one_tile", "two_tile", "spread")
 STREAMK_FIXUPS = ("owner", "rs")
 STREAMK_EXCHANGES = ("wt", "l2")
 CONFIG_KEYS = {
@@ -3067,7 +3218,7 @@ CONFIG_KEYS = {
     "GROUP_SIZE_M": "group_size_m",
     "STREAMK_POLICY": "policy",
     "STREAMK_FIXUP": "fixup",
-    "SPLIT_N": "split_n",
+    "TAIL_SPLIT_K": "tail_split_k",
     "STREAMK_EXCHANGE": "exchange",
 }
 MAX_TILE_ELEMS = max(TILE_SIDES) ** 2
@@ -3113,7 +3264,7 @@ class StreamKConfig:
     group_size_m: int
     policy: str
     fixup: str
-    split_n: int | None
+    tail_split_k: int | None
     exchange: str
 
     def __post_init__(self):
@@ -3127,10 +3278,12 @@ class StreamKConfig:
         if self.exchange not in STREAMK_EXCHANGES:
             raise ValueError(f"invalid STREAMK_EXCHANGE {self.exchange!r}")
         if self.policy == "one_tile":
-            if type(self.split_n) is not int or self.split_n < 2:
-                raise ValueError("one_tile requires an integer SPLIT_N of at least 2")
-        elif self.split_n is not None:
-            raise ValueError(f"{self.policy} takes SPLIT_N=None")
+            if type(self.tail_split_k) is not int or self.tail_split_k < 2:
+                raise ValueError(
+                    "one_tile requires an integer TAIL_SPLIT_K of at least 2"
+                )
+        elif self.tail_split_k is not None:
+            raise ValueError(f"{self.policy} takes TAIL_SPLIT_K=None")
         if self.policy != "one_tile" and self.fixup != "owner":
             raise ValueError(f"{self.policy} requires the owner fixup")
         if self.exchange == "l2" and (self.policy, self.fixup) != ("one_tile", "rs"):
@@ -3162,7 +3315,7 @@ class ReduceScatterConfig:
     blocks_per_group: int
     partials_per_trip: int
     # Idle programs per tile that read too, and the tile barrier's slot stride
-    # (0: slot t split_n).
+    # (0: slot t tail_split_k).
     extra: int = 0
     barrier_stride: int = 0
 
@@ -3171,11 +3324,11 @@ def pow2_floor(x):
     return 1 << (x.bit_length() - 1)
 
 
-def reduce_scatter_config(tile, split_n, loads_in_flight=16, readers=None):
+def reduce_scatter_config(tile, tail_split_k, loads_in_flight=16, readers=None):
     """The tile's own power-of-two readers (at most its 32x32 blocks), or
     ``readers``, and the slice's blocks per group and partials per trip."""
     if readers is None:
-        readers = min(pow2_floor(split_n), tile.blocks)
+        readers = min(pow2_floor(tail_split_k), tile.blocks)
     nb = max(1, min(tile.blocks // readers, loads_in_flight, tile.quadrant_blocks))
     return ReduceScatterConfig(
         readers=readers,
@@ -3184,24 +3337,24 @@ def reduce_scatter_config(tile, split_n, loads_in_flight=16, readers=None):
     )
 
 
-def rs_readers(tile, streamk_tiles, split_n, num_programs, loads_in_flight=16):
+def rs_readers(tile, tail_tiles, tail_split_k, num_programs, loads_in_flight=16):
     """The one-tile write-through reduce-scatter with every resident program reading:
     R = max(min(blocks, pow2_floor(P / S)), own readers) readers per tile, so
-    R S <= P; when R > split_n the extra = R - split_n idle programs per tile join.
-    Each tile's barrier gets its own 128-byte line (16 slots of 2 words) where it
+    R S <= P; when R > tail_split_k the extra = R - tail_split_k idle programs per tile
+    join. Each tile's barrier gets its own 128-byte line (16 slots of 2 words) where it
     fits: packed, the idle readers' polling slows the producers' arrivals on the
     shared line. With extra = 0 this is the own-readers rule with only the barrier
     slots moved."""
-    own = reduce_scatter_config(tile, split_n, loads_in_flight).readers
-    per_tile = num_programs // streamk_tiles
+    own = reduce_scatter_config(tile, tail_split_k, loads_in_flight).readers
+    per_tile = num_programs // tail_tiles
     readers = max(min(tile.blocks, pow2_floor(per_tile)), own)
-    rs = reduce_scatter_config(tile, split_n, loads_in_flight, readers)
+    rs = reduce_scatter_config(tile, tail_split_k, loads_in_flight, readers)
     return ReduceScatterConfig(
         readers=readers,
         blocks_per_group=rs.blocks_per_group,
         partials_per_trip=rs.partials_per_trip,
-        extra=readers - min(split_n, readers),
-        barrier_stride=max(split_n, min(16, per_tile)),
+        extra=readers - min(tail_split_k, readers),
+        barrier_stride=max(tail_split_k, min(16, per_tile)),
     )
 
 
@@ -3229,7 +3382,7 @@ def k_pad(K, block_k):
 
 
 TILE_KEYS = ("BLOCK_M", "BLOCK_N", "BLOCK_K", "GROUP_SIZE_M")
-PLAN_KEYS = ("STREAMK_POLICY", "STREAMK_FIXUP", "SPLIT_N", "STREAMK_EXCHANGE")
+PLAN_KEYS = ("STREAMK_POLICY", "STREAMK_FIXUP", "TAIL_SPLIT_K", "STREAMK_EXCHANGE")
 
 
 @functools.cache
@@ -3246,7 +3399,8 @@ def streamk_defaults():
                    the reduce-scatter's split scales; pairs_ow, the fewest K-pairs per
                    tile worth an owner split; gain, the fewest K-pairs of the tail's
                    time a reduce-scatter split must save
-    OWNER_SPLITS,  the SPLIT_N values the default plan rounds to and the tuner
+    SUBTILE_MAX_K  the longest K at which the default plan takes dp_sub
+    OWNER_SPLITS,  the TAIL_SPLIT_K values the default plan rounds to and the tuner
     RS_SPLITS      times, for the owner and reduce-scatter endings
     """
     cfg_dir = resolve_config_dir("gemm", "GEMM-A16W16-STREAMK", backend="gluon")
@@ -3258,9 +3412,45 @@ def _nearest_split(n, splits, cap):
     return min(ok, key=lambda s: (abs(math.log(min(n, cap) / s)), s)) if ok else None
 
 
+def subtile_tail(M, N, tile, num_programs):
+    """dp_sub's (TAIL_BLOCK_M, TAIL_BLOCK_N) for a shape at a tile (BLOCK_M, BLOCK_N,
+    ...), or None when it has none (no full wave, no leftover, or S > P / 2): the
+    largest Q with S Q <= P, then the most square sub-tile, then the least padding,
+    then the smaller TAIL_BLOCK_M."""
+    bm, bn = tile[0], tile[1]
+    total_tiles = triton.cdiv(M, bm) * triton.cdiv(N, bn)
+    leftover = total_tiles % num_programs
+    if total_tiles < num_programs or leftover == 0:
+        return None
+    subtiles = [
+        (tm, tn)
+        for tm in TILE_SIDES
+        for tn in TILE_SIDES
+        if bm % tm == 0 and bn % tn == 0 and (tm, tn) != (bm, bn)
+    ]
+    fits = [
+        s for s in subtiles if leftover * (bm // s[0]) * (bn // s[1]) <= num_programs
+    ]
+    if not fits:
+        return None
+    return min(
+        fits,
+        key=lambda s: (
+            # The most sub-tiles per tail tile (fits keeps S Q <= P).
+            -(bm // s[0]) * (bn // s[1]),
+            # The most square sub-tile.
+            abs(math.log2(s[0] / s[1])),
+            # The least padded area of C, the work in sub-tiles past its edge.
+            triton.cdiv(M, s[0]) * s[0] * triton.cdiv(N, s[1]) * s[1],
+            # The smaller TAIL_BLOCK_M.
+            s[0],
+        ),
+    )
+
+
 def streamk_plan(M, N, K, tile, num_programs, plan=None):
-    """(STREAMK_POLICY, STREAMK_FIXUP, SPLIT_N) of the default plan for a shape at a
-    tile (BLOCK_M, BLOCK_N, BLOCK_K); see the module docstring. ``plan`` overrides
+    """(STREAMK_POLICY, STREAMK_FIXUP, TAIL_SPLIT_K) of the default plan for a shape at
+    a tile (BLOCK_M, BLOCK_N, BLOCK_K); see the module docstring. ``plan`` overrides
     STREAMK_PLAN from streamk_defaults()."""
     defaults = streamk_defaults()
     if plan is None:
@@ -3271,6 +3461,8 @@ def streamk_plan(M, N, K, tile, num_programs, plan=None):
     leftover = total_tiles % num_programs
     if leftover == 0:
         return "dp", "owner", None
+    if K <= defaults["SUBTILE_MAX_K"] and subtile_tail(M, N, tile, num_programs):
+        return "dp_sub", "owner", None
     per_tile = num_programs // leftover
     cap = min(per_tile, pairs)
     if cap < 2:
@@ -3313,11 +3505,11 @@ def complete_config(config, M, N, K, num_programs):
                 f"the config must name the tile ({', '.join(TILE_KEYS[:3])})"
             )
         TileSpec(*tile)
-        policy, fixup, split_n = streamk_plan(M, N, K, tile, num_programs)
+        policy, fixup, tail_split_k = streamk_plan(M, N, K, tile, num_programs)
         full.update(
             STREAMK_POLICY=policy,
             STREAMK_FIXUP=fixup,
-            SPLIT_N=split_n,
+            TAIL_SPLIT_K=tail_split_k,
             STREAMK_EXCHANGE="wt",
         )
     return full
@@ -3335,13 +3527,20 @@ def _launch_constants(M, N, K, config, num_programs, num_xcds):
     pairs = k_pad(K, tile.block_k) // (2 * tile.block_k)
     leftover = total_tiles % num_programs
 
-    streamk_tiles = 0 if config.policy == "dp" else leftover
+    tail = (0, 0)
+    if config.policy == "dp_sub":
+        tail = subtile_tail(M, N, (tile.block_m, tile.block_n), num_programs)
+        if tail is None:
+            raise ValueError(
+                "dp_sub requires a full wave and at most half a wave of leftover tiles"
+            )
+    tail_tiles = 0 if config.policy == "dp" else leftover
     if config.policy == "two_tile":
         if leftover == 0 or total_tiles < num_programs:
             raise ValueError(
                 "two_tile requires a partial wave after at least one full wave"
             )
-        streamk_tiles += num_programs
+        tail_tiles += num_programs
     if config.policy in ("one_tile", "spread") and leftover == 0:
         raise ValueError(f"{config.policy} requires leftover tiles")
     if config.policy == "spread" and 2 * leftover <= num_programs:
@@ -3354,74 +3553,80 @@ def _launch_constants(M, N, K, config, num_programs, num_xcds):
     l2 = config.exchange == "l2"
     per_xcd_tiles = 0
     if config.policy == "one_tile":
-        split_n = config.split_n
-        split_cap = min(num_programs // streamk_tiles, pairs)
-        if split_cap < 2:
+        tail_split_k = config.tail_split_k
+        tail_split_cap = min(num_programs // tail_tiles, pairs)
+        if tail_split_cap < 2:
             raise ValueError(
                 "shape leaves fewer than two programs/pairs per Stream-K tile"
             )
-        if split_n > split_cap:
+        if tail_split_k > tail_split_cap:
             raise ValueError(
-                f"split_n={split_n} exceeds this shape's maximum {split_cap}"
+                f"tail_split_k={tail_split_k} exceeds this shape's maximum "
+                f"{tail_split_cap}"
             )
-        streamk_programs = streamk_tiles * split_n
+        streamk_programs = tail_tiles * tail_split_k
         if l2:
-            per_xcd_tiles = triton.cdiv(streamk_tiles, num_xcds)
+            per_xcd_tiles = triton.cdiv(tail_tiles, num_xcds)
             xcd_max = max(
                 1,
                 min(
-                    split_n,
+                    tail_split_k,
                     pairs,
                     (num_programs // num_xcds) // per_xcd_tiles,
                 ),
             )
-            if xcd_max != split_n:
+            if xcd_max != tail_split_k:
                 raise ValueError(
-                    f"split_n={split_n} cannot be placed within one XCD; "
+                    f"tail_split_k={tail_split_k} cannot be placed within one XCD; "
                     f"maximum is {xcd_max}"
                 )
     elif end_to_end:
-        split_n = 1
+        tail_split_k = 1
         streamk_programs = num_programs
-        if streamk_tiles * pairs < streamk_programs:
+        if tail_tiles * pairs < streamk_programs:
             raise ValueError(
                 f"{config.policy} has fewer pair units than "
                 f"the {num_programs} programs"
             )
     else:
-        split_n = 1
+        # dp_sub's sub-tiles (S Q <= P, subtile_tail) store no partials.
+        tail_split_k = 1
         streamk_programs = 0
 
     if config.policy == "one_tile" and config.fixup == "rs" and not l2:
-        rs = rs_readers(tile, streamk_tiles, split_n, num_programs)
+        rs = rs_readers(tile, tail_tiles, tail_split_k, num_programs)
     else:
-        rs = reduce_scatter_config(tile, split_n if config.policy == "one_tile" else 1)
+        rs = reduce_scatter_config(
+            tile, tail_split_k if config.policy == "one_tile" else 1
+        )
     # The L2 split gives every XCD ceil(S / NUM_XCDS) tiles' programs (pid p runs
     # on XCD p % NUM_XCDS), so its grid is a whole number of those per XCD. The wt
     # reduce-scatter also launches its S extra idle readers per tile.
     working_grid = (
-        num_xcds * per_xcd_tiles * split_n
+        num_xcds * per_xcd_tiles * tail_split_k
         if per_xcd_tiles
-        else streamk_programs + streamk_tiles * rs.extra
+        else streamk_programs + tail_tiles * rs.extra
     )
     compact = (
-        streamk_tiles > 0
-        and streamk_tiles == total_tiles
+        tail_tiles > 0
+        and tail_tiles == total_tiles
         and working_grid < num_programs
     )
     # Data-parallel launches have no Stream-K phase to keep resident, so a grid of
     # fewer tiles than programs launches only the programs with a tile.
     if compact:
         grid = working_grid
-    elif streamk_tiles == 0:
+    elif tail_tiles == 0:
         grid = min(num_programs, total_tiles)
     else:
         grid = num_programs
     return config, {
         "TOTAL_TILES": total_tiles,
-        "STREAMK_TILES": streamk_tiles,
+        "TAIL_TILES": tail_tiles,
+        "TAIL_BLOCK_M": tail[0],
+        "TAIL_BLOCK_N": tail[1],
         "STREAMK_PROGRAMS": streamk_programs,
-        "RESOLVED_SPLIT_N": split_n,
+        "RESOLVED_TAIL_SPLIT_K": tail_split_k,
         "END_TO_END": end_to_end,
         "L2": l2,
         "COMPACT": compact,
@@ -3504,9 +3709,10 @@ TUNING_TILES = (
 
 
 def _plans():
-    """Every (STREAMK_POLICY, STREAMK_FIXUP, SPLIT_N, STREAMK_EXCHANGE) worth timing;
-    which of them fit a shape is left to _launch_constants."""
+    """Every (STREAMK_POLICY, STREAMK_FIXUP, TAIL_SPLIT_K, STREAMK_EXCHANGE) worth
+    timing; which of them fit a shape is left to _launch_constants."""
     yield "dp", "owner", None, "wt"
+    yield "dp_sub", "owner", None, "wt"
     yield "two_tile", "owner", None, "wt"
     yield "spread", "owner", None, "wt"
     defaults = streamk_defaults()
@@ -3553,20 +3759,20 @@ def tuning_candidates(M, N, K):
 KERNEL_NAME_PREFIX = "gluon_streamk_"
 _KERNEL_NAME = re.compile(
     r"^gluon_streamk_(?P<bm>\d+)x(?P<bn>\d+)x(?P<bk>\d+)_g(?P<g>\d+)_"
-    r"(?:(?P<whole>dp|two_tile|spread)"
-    r"|one_tile_(?P<fixup>owner|rs)_n(?P<n>\d+)_(?P<exchange>wt|l2))$"
+    r"(?:(?P<whole>dp|dp_sub|two_tile|spread)"
+    r"|one_tile_(?P<fixup>owner|rs)_k(?P<k>\d+)_(?P<exchange>wt|l2))$"
 )
 
 
 def kernel_name(config):
     """The kernelName of a tuned row running a complete ``config``, e.g.
-    gluon_streamk_256x256x64_g4_one_tile_rs_n8_wt or gluon_streamk_256x256x64_g4_dp
+    gluon_streamk_256x256x64_g4_one_tile_rs_k8_wt or gluon_streamk_256x256x64_g4_dp
     (policies other than one_tile take the owner fixup and the wt exchange)."""
     c = StreamKConfig.from_dict(config)
     name = f"{KERNEL_NAME_PREFIX}{c.block_m}x{c.block_n}x{c.block_k}_g{c.group_size_m}_"
     if c.policy != "one_tile":
         return name + c.policy
-    return name + f"one_tile_{c.fixup}_n{c.split_n}_{c.exchange}"
+    return name + f"one_tile_{c.fixup}_k{c.tail_split_k}_{c.exchange}"
 
 
 def parse_kernel_name(name):
@@ -3583,7 +3789,7 @@ def parse_kernel_name(name):
     if m["whole"]:
         plan = (m["whole"], "owner", None, "wt")
     else:
-        plan = ("one_tile", m["fixup"], int(m["n"]), m["exchange"])
+        plan = ("one_tile", m["fixup"], int(m["k"]), m["exchange"])
     config.update(zip(PLAN_KEYS, plan))
     return config
 

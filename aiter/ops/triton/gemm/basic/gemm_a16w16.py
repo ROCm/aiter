@@ -216,7 +216,7 @@ def _gemm_a16w16_gfx950_streamk(x, w, y, bias, config, persistent_partials=True)
         sk, x.device, num_programs, num_xcds, tile, launch, persistent_partials
     )
     owner_qpb = min(4, 16 // max(1, tile.block_m * tile.block_n // 4096))
-    total_full_tiles = launch["TOTAL_TILES"] - launch["STREAMK_TILES"]
+    total_full_tiles = launch["TOTAL_TILES"] - launch["TAIL_TILES"]
     has_full = total_full_tiles > 0
     # The persistent prologue loads program_id's first tile unclamped.
     assert not has_full or launch["GRID"] <= total_full_tiles
@@ -247,8 +247,8 @@ def _gemm_a16w16_gfx950_streamk(x, w, y, bias, config, persistent_partials=True)
         EVEN_M=even_m,
         EVEN_N=even_n,
         EVEN_K=even_k,
-        STREAMK_TILES=launch["STREAMK_TILES"],
-        SPLIT_N=launch["RESOLVED_SPLIT_N"],
+        TAIL_TILES=launch["TAIL_TILES"],
+        TAIL_SPLIT_K=launch["RESOLVED_TAIL_SPLIT_K"],
         REDUCE_SCATTER=config.fixup == "rs",
         RS_NB=launch["RS_NB"],
         RS_U=launch["RS_U"],
@@ -260,6 +260,10 @@ def _gemm_a16w16_gfx950_streamk(x, w, y, bias, config, persistent_partials=True)
         OWNER_QPB=owner_qpb,
         RS_E=launch["RS_E"],
         BAR_STRIDE=launch["BAR_STRIDE"],
+        TAIL_BLOCK_M=launch["TAIL_BLOCK_M"],
+        TAIL_BLOCK_N=launch["TAIL_BLOCK_N"],
+        TAIL_EVEN_M=not launch["TAIL_BLOCK_M"] or M % launch["TAIL_BLOCK_M"] == 0,
+        TAIL_EVEN_N=not launch["TAIL_BLOCK_N"] or N % launch["TAIL_BLOCK_N"] == 0,
         num_warps=sk.NUM_WARPS,
         schedule_hint=sk.schedule_hint(),
     )
@@ -293,7 +297,7 @@ def gemm_a16w16_(
     ``kernel_type="streamk"`` runs the gfx950 gluon Stream-K kernel with the
     whole ``config``: the tile (BLOCK_M, BLOCK_N, BLOCK_K; 256x256x64 when absent)
     and optionally GROUP_SIZE_M and the Stream-K plan (STREAMK_POLICY,
-    STREAMK_FIXUP, SPLIT_N, STREAMK_EXCHANGE; the kernel's default plan when
+    STREAMK_FIXUP, TAIL_SPLIT_K, STREAMK_EXCHANGE; the kernel's default plan when
     absent). It writes x's dtype; N a multiple of 8 and K of 16.
 
     Args:
@@ -856,7 +860,7 @@ def gemm_a16w16(
     ``kernel_type="streamk"`` runs the gfx950 gluon Stream-K kernel with the
     whole ``config``: the tile (BLOCK_M, BLOCK_N, BLOCK_K; 256x256x64 when absent)
     and optionally GROUP_SIZE_M and the Stream-K plan (STREAMK_POLICY,
-    STREAMK_FIXUP, SPLIT_N, STREAMK_EXCHANGE; the kernel's default plan when
+    STREAMK_FIXUP, TAIL_SPLIT_K, STREAMK_EXCHANGE; the kernel's default plan when
     absent). It writes x's dtype; N a multiple of 8 and K of 16.
     See ``gemm_a16w16_`` for the full argument description; ``config`` is a dict
     here and is serialized before dispatch so the op is torch.compile-traceable.

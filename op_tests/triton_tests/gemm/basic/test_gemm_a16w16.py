@@ -465,11 +465,11 @@ def test_gemm_a16_w16_gluon_tuned_gemm(kernel_name):
     torch.testing.assert_close(out, F.linear(x, w), atol=1e-1, rtol=1e-2)
 
 
-def _streamk_plan(policy, fixup="owner", split_n=None, exchange="wt"):
+def _streamk_plan(policy, fixup="owner", tail_split_k=None, exchange="wt"):
     return {
         "STREAMK_POLICY": policy,
         "STREAMK_FIXUP": fixup,
-        "SPLIT_N": split_n,
+        "TAIL_SPLIT_K": tail_split_k,
         "STREAMK_EXCHANGE": exchange,
     }
 
@@ -531,6 +531,12 @@ _STREAMK_CASES = {
     "ragged_wave_dp": ((368, 1392, 496), _streamk_plan("dp")),
     # K_RES > BLOCK_K: the last pair's first K-step is masked too.
     "kres_gt_rs": ((2176, 2048, 432), _streamk_plan("one_tile", "rs", 4)),
+    # Sub-tile tail: a tail of 16 cut into 64x64 sub-tiles (Q = 4), a tail of 96 into
+    # 64x128 (Q = 2), and a ragged tail row whose lower 64x64 sub-tiles are wholly
+    # outside C.
+    "dp_sub": ((2176, 2048, 512), _streamk_plan("dp_sub")),
+    "dp_sub_q2": ((2816, 2048, 512), _streamk_plan("dp_sub")),
+    "ragged_dp_sub": ((2096, 2032, 496), _streamk_plan("dp_sub")),
 }
 
 
@@ -538,7 +544,7 @@ _STREAMK_CASES = {
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("bias", [False, True])
 def test_gemm_a16_w16_gluon_streamk(case, dtype, bias):
-    """Every Stream-K policy and ending (dp, one_tile with the owner and the
+    """Every Stream-K policy and ending (dp, dp_sub, one_tile with the owner and the
     reduce-scatter over wt and l2, two_tile, spread, the default plan), below one
     wave and after it, on aligned and ragged shapes."""
     (M, N, K), plan = _STREAMK_CASES[case]
@@ -600,8 +606,8 @@ def test_gemm_a16_w16_gluon_streamk_candidates():
     "kernel_name",
     [
         "gluon_streamk_256x256x64_g4_dp",
-        "gluon_streamk_128x128x64_g4_one_tile_owner_n2_wt",
-        "gluon_streamk_128x128x64_g4_one_tile_rs_n2_l2",
+        "gluon_streamk_128x128x64_g4_one_tile_owner_k2_wt",
+        "gluon_streamk_128x128x64_g4_one_tile_rs_k2_l2",
     ],
 )
 def test_gemm_a16_w16_gluon_streamk_tuned_gemm(kernel_name):
@@ -614,6 +620,78 @@ def test_gemm_a16_w16_gluon_streamk_tuned_gemm(kernel_name):
         M, N, K, torch.bfloat16, output=False
     )
     out = gluon_gemm(x, w, 0, None, out_dtype, config={"kernelName": kernel_name})
+    torch.testing.assert_close(out, F.linear(x, w), atol=1e-1, rtol=1e-2)
+
+
+@pytest.mark.parametrize(
+    "tile, tiles, tail",
+    [
+        ((256, 256), 260, (64, 64)),  # S = 4: Q = 16
+        ((256, 256), 288, (64, 128)),  # S = 32: Q = 8, the smaller TAIL_BLOCK_M
+        ((256, 256), 320, (128, 128)),  # S = 64: Q = 4, square
+        ((256, 256), 384, (128, 256)),  # S = 128: Q = 2
+        ((128, 256), 352, (128, 128)),  # S = 96: Q = 2, square over 64x256
+        ((256, 256), 388, None),  # S = 132: more than half a wave
+        ((256, 256), 512, None),  # no leftover
+        ((256, 256), 100, None),  # no full wave
+        ((64, 64), 260, None),  # no smaller sub-tile
+    ],
+)
+def test_gemm_a16_w16_gluon_streamk_subtile_tail(tile, tiles, tail):
+    """subtile_tail: the largest Q with S Q <= P, then the most square sub-tile,
+    then the least padding, then the smaller TAIL_BLOCK_M (P = 256, four rows of
+    tiles)."""
+    from aiter.ops.triton._gluon_kernels.gfx950.gemm.basic.gemm_a16w16_streamk import (
+        subtile_tail,
+    )
+
+    bm, bn = tile
+    M, N = 4 * bm, tiles // 4 * bn
+    assert subtile_tail(M, N, (bm, bn, 64), 256) == tail
+
+
+@pytest.mark.parametrize(
+    "K, plan",
+    [
+        (512, "dp_sub"),
+        (4096, "dp_sub"),
+        (4160, "one_tile"),  # past SUBTILE_MAX_K: a K split
+    ],
+)
+def test_gemm_a16_w16_gluon_streamk_default_plan_subtile(K, plan):
+    """The default plan takes dp_sub after a full wave with at most half a wave left
+    and K <= SUBTILE_MAX_K (P = 256, 256x256 tiles, a tail of 32)."""
+    from aiter.ops.triton._gluon_kernels.gfx950.gemm.basic.gemm_a16w16_streamk import (
+        streamk_plan,
+    )
+
+    assert streamk_plan(1024, 72 * 256, K, (256, 256, 64), 256)[0] == plan
+    # More than half a wave left: no sub-tile tail at any K.
+    assert streamk_plan(1024, 112 * 256, 512, (256, 256, 64), 256)[0] != "dp_sub"
+
+
+@pytest.mark.parametrize("M", [2176, 2816])
+def test_gemm_a16_w16_gluon_streamk_dp_sub_follows_m(M):
+    """A tuned dp_sub row derives its sub-tile from the actual M (tails of 16 and 96
+    128x128 tiles on 256 CUs), and its kernelName round-trips."""
+    N, K = 2048, 512
+    _skip_unsupported_gluon("gluon", "streamk", M, N, K)
+    from aiter.ops.triton._gluon_kernels.gfx950.gemm.basic.gemm_a16w16_streamk import (
+        kernel_name,
+        tuning_candidates,
+    )
+    from aiter.tuned_gemm import gluon_gemm, parse_gluon_kernel_name
+
+    name = "gluon_streamk_128x128x64_g4_dp_sub"
+    subs = [c for c in tuning_candidates(M, N, K) if c["STREAMK_POLICY"] == "dp_sub"]
+    if not subs:
+        pytest.skip("no sub-tile tail on this CU count")
+    assert name in [kernel_name(c) for c in subs]
+    assert parse_gluon_kernel_name(name)[1]["STREAMK_POLICY"] == "dp_sub"
+    x, w, _, out_dtype, _ = generate_gemm_a16w16_inputs(
+        M, N, K, torch.bfloat16, output=False
+    )
+    out = gluon_gemm(x, w, 0, None, out_dtype, config={"kernelName": name})
     torch.testing.assert_close(out, F.linear(x, w), atol=1e-1, rtol=1e-2)
 
 
@@ -642,10 +720,12 @@ def test_gemm_a16_w16_gluon_streamk_fit_tuned_config():
     "kernel_name, M, N",
     [
         # Tuned at M = 2176 (a tail of 16 tiles); M = 2048 leaves none.
-        ("gluon_streamk_128x128x64_g4_one_tile_owner_n4_wt", 2048, 2048),
-        ("gluon_streamk_128x128x64_g4_one_tile_rs_n4_l2", 2048, 2048),
+        ("gluon_streamk_128x128x64_g4_one_tile_owner_k4_wt", 2048, 2048),
+        ("gluon_streamk_128x128x64_g4_one_tile_rs_k4_l2", 2048, 2048),
         # Tuned at M = 2048 (a tail of 192); M = 2560 leaves 48, too few for spread.
         ("gluon_streamk_128x128x64_g4_spread", 2560, 3584),
+        # Tuned at M = 2176 (a tail of 16); M = 2048 leaves none for a sub-tile tail.
+        ("gluon_streamk_128x128x64_g4_dp_sub", 2048, 2048),
     ],
 )
 def test_gemm_a16_w16_gluon_streamk_tuned_gemm_other_m(kernel_name, M, N):
