@@ -47,6 +47,8 @@ from aiter.ops.flydsl.moe_common import (
     DEFAULT_SITUV2_BETA,
     DEFAULT_SITUV2_LINEAR_BETA,
     GateMode,
+    _flydsl_stage2_fp8_enabled,
+    _mxfp4_intermediate_enabled,
     get_flydsl_activation_name,
 )
 from aiter.ops.flydsl.mxfp4_kname import (
@@ -3401,15 +3403,6 @@ def _mxfp4_scale_u8(scale):
     if scale is not None and scale.element_size() == 1 and scale.dtype != torch.uint8:
         return scale.view(torch.uint8)
     return scale
-
-
-def _flydsl_stage2_fp8_enabled():
-    return os.environ.get("AITER_FLYDSL_STAGE2_FP8", "0") == "1"
-
-
-def _mxfp4_intermediate_enabled():
-    # Lossy before-sum 4-bit quant of the scatter intermediate (ok for gsm8k, degrades other evals).
-    return os.environ.get("AITER_MXFP4_INTERMEDIATE", "0") == "1"
 
 
 def _opus_stage2_fp8_enabled():
