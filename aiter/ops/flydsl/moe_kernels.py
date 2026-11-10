@@ -628,6 +628,103 @@ def get_flydsl_stage2_kernels_int4_bf16(out_dtype: str) -> dict[str, dict]:
     return kernels
 
 
+def get_flydsl_stage1_kernels_a16w16(out_dtype: str) -> dict[str, dict]:
+    """Return {kernelName: params} for a16w16 (bf16 A x bf16 W) stage1 configs.
+
+    Same tile / k_wave constraints as a16wi4: the shared a16w-mix port has no
+    grid split-K. Names look like ``flydsl_moe1_abf16_wbf16_bf16_t32x128x128``.
+
+    The port writes ``T.bf16`` (stage1 intermediate and gemm2 pointer). An
+    ``f16`` name would compile the same kernel and store bf16 bits into an
+    fp16 buffer, so only ``out_dtype=="bf16"`` emits names. Tuner and AOT
+    replay (``aiter.aot.flydsl.moe._caller_inputs``) use these bf16 names.
+    """
+    if out_dtype != "bf16":
+        return {}
+    kernels = {}
+    a_dtype = "bf16"
+    b_dtype = "bf16"
+    tile_ks = [128, 256]
+    tile_ms = [16, 32, 64, 128]
+    tile_ns = [16, 32, 64, 128]
+
+    def _emit(tm, tn, tk, *, kw=1, bnt=2):
+        name = flydsl_kernel_name(1, a_dtype, b_dtype, out_dtype, tm, tn, tk)
+        if bnt != 2:
+            name += f"_bnt{bnt}"
+        if kw != 1:
+            name += f"_kw{kw}"
+        kernels[name] = {
+            "stage": 1,
+            "a_dtype": a_dtype,
+            "b_dtype": b_dtype,
+            "out_dtype": out_dtype,
+            "tile_m": tm,
+            "tile_n": tn,
+            "tile_k": tk,
+            "MPerBlock": tm,
+            "b_nt": bnt,
+            "k_wave": kw,
+            "gate_mode": "separated",
+        }
+
+    for tm in tile_ms:
+        for tn in tile_ns:
+            for tk in tile_ks:
+                for kw in (1, 2, 4):
+                    num_n_waves = 4 // kw
+                    if tn % num_n_waves or (tn // num_n_waves) % 16:
+                        continue
+                    if kw > 1 and 4 * tn > tk:
+                        continue
+                    if _gemm1_lds_bytes(tm, tn, tk, kw) > _MAX_LDS_BYTES:
+                        continue
+                    for bnt in (0, 2):
+                        _emit(tm, tn, tk, kw=kw, bnt=bnt)
+    return kernels
+
+
+def get_flydsl_stage2_kernels_a16w16(out_dtype: str) -> dict[str, dict]:
+    """Return {kernelName: params} for a16w16 (bf16 A x bf16 W) stage2 configs.
+
+    Names look like ``flydsl_moe2_abf16_wbf16_bf16_t32x128x128_atomic``.
+    ``f16`` is rejected: gemm2 stores through a ``T.bf16`` pointer.
+    """
+    if out_dtype != "bf16":
+        return {}
+    kernels = {}
+    a_dtype = "bf16"
+    b_dtype = "bf16"
+    tile_ks = [128, 256]
+    tile_ms = [16, 32, 64, 128]
+    tile_ns = [128]
+    # bf16 stage2 has no reduce epilogue (int4 only). A "reduce" name still
+    # atomic-scatters into an unzeroed buffer. See ROCm/aiter#6724.
+    modes = ["atomic"]
+
+    for tm in tile_ms:
+        for tn in tile_ns:
+            for tk in tile_ks:
+                for mode in modes:
+                    base_name = flydsl_kernel_name(
+                        2, a_dtype, b_dtype, out_dtype, tm, tn, tk, mode
+                    )
+                    kernels[base_name] = {
+                        "stage": 2,
+                        "a_dtype": a_dtype,
+                        "b_dtype": b_dtype,
+                        "out_dtype": out_dtype,
+                        "tile_m": tm,
+                        "tile_n": tn,
+                        "tile_k": tk,
+                        "mode": mode,
+                        "MPerBlock": tm,
+                        "b_nt": 0,
+                        "gate_mode": "separated",
+                    }
+    return kernels
+
+
 def _register_all_configs():
     """Pre-populate _KERNEL_PARAMS with all supported configs at import time."""
     for a in ("fp8", "fp4", "fp16", "bf16"):
@@ -643,6 +740,10 @@ def _register_all_configs():
     for out in ("bf16", "f16"):
         _KERNEL_PARAMS.update(get_flydsl_stage1_kernels_int4_bf16(out))
         _KERNEL_PARAMS.update(get_flydsl_stage2_kernels_int4_bf16(out))
+    # a16w16: bf16 output only. Do not copy the a16w4/a16wi4 f16 loop —
+    # compile_flydsl_moe_stage{1,2} never pass out_dtype into the a16w-mix port.
+    _KERNEL_PARAMS.update(get_flydsl_stage1_kernels_a16w16("bf16"))
+    _KERNEL_PARAMS.update(get_flydsl_stage2_kernels_a16w16("bf16"))
 
 
 _register_all_configs()
@@ -674,15 +775,20 @@ def compile_flydsl_moe_stage1(
     xcd_swizzle: int = 0,
     k_wave: int = 1,
     v2_output_layout: bool = False,
+    activation_bf16: bool = False,
 ):
     """Compile stage1 kernel (cached via underlying lru_cache)."""
-    # a16w-mix (bf16 A x {fp4 mxfp4, int4} W): build the ported gemm1
+    if activation_bf16 and act != "silu_clamped":
+        raise ValueError("activation_bf16 requires silu_clamped")
+    if act == "silu_clamped" and not (a_dtype == "bf16" and b_dtype in ("fp4", "int4")):
+        raise ValueError("silu_clamped requires bf16 A and fp4 or int4 W")
+    # a16w-mix (bf16 A x {fp4 mxfp4, int4, bf16} W): build the ported gemm1
     # (moe_2stage_a16wmix), consuming the standard GGUU W1+scale layout
     # (w_layout="standard"), matching main. a16wi4 shares this compile entry so AOT
     # builds the same kernel the runtime early-return launches; its W1 is the
     # OLD-kernel int4 prep (pack_int8_to_packed_int4(shuffle_weight(w,(16,16)))) +
     # (E,G//2,N,2) bf16 scale.
-    if a_dtype == "bf16" and b_dtype in ("fp4", "int4"):
+    if a_dtype == "bf16" and b_dtype in ("fp4", "int4", "bf16"):
         from flydsl.runtime.device import get_rocm_arch
 
         from .kernels.moe_2stage_a16wmix.gemm1 import compile_gemm1_a16w4_port
@@ -702,6 +808,7 @@ def compile_flydsl_moe_stage1(
             w_dtype=b_dtype,
             w_layout="standard",
             k_wave=k_wave,
+            activation_bf16=activation_bf16,
             # The kernel derives its gfx942 fallbacks (K=16 MFMA split, bf16 pack,
             # fp4 byte-LUT decode, LDS staging) from this arch string.
             rocm_arch=str(get_rocm_arch()),
@@ -769,10 +876,10 @@ def compile_flydsl_moe_stage2(
     use_global_a: bool = True,
 ):
     """Compile stage2 kernel (cached via underlying lru_cache)."""
-    # a16w-mix (bf16 A x {fp4 mxfp4, int4} W) down-proj: build the ported gemm2
+    # a16w-mix (bf16 A x {fp4 mxfp4, int4, bf16} W) down-proj: build the ported gemm2
     # (moe_2stage_a16wmix); its gate_up=False W2+scale layout matches the standard
     # shuffle_weight/e8m0 (a16wi4: pack_int8_to_packed_int4(shuffle_weight) + bf16 scale).
-    if a_dtype == "bf16" and b_dtype in ("fp4", "int4"):
+    if a_dtype == "bf16" and b_dtype in ("fp4", "int4", "bf16"):
         from flydsl.runtime.device import get_rocm_arch
 
         from .kernels.moe_2stage_a16wmix.gemm2 import compile_gemm2_a16w4_port
@@ -855,6 +962,10 @@ def runtime_swiglu_limit(swiglu_limit: float | None, act: str) -> float:
       - silu:   clamps only when a positive limit is configured, else +inf
                 (matches the reference's ``if swiglu_limit:`` truthiness).
     """
+    if act == "silu_clamped":
+        if swiglu_limit is None or not float(swiglu_limit) > 0.0:
+            raise ValueError("silu_clamped requires swiglu_limit > 0")
+        return float(swiglu_limit)
     if act == "swiglu":
         return float(swiglu_limit) if swiglu_limit else 7.0
     return float(swiglu_limit) if swiglu_limit else float("inf")
@@ -1058,6 +1169,8 @@ def _run_moe_reduction(
     topk_weights=None,
     fp8_scale_blk=None,
     fp8_pitch_align=None,
+    *,
+    streaming_loads=False,
 ):
     """Topk reduction epilogue for stage2 reduce mode."""
     use_mask = expert_mask is not None
@@ -1133,6 +1246,7 @@ def _run_moe_reduction(
         use_weight=use_weight,
         scale_blk=fp8_scale_blk if is_fp8 else None,
         pitch_align=fp8_pitch_align if is_fp8 else None,
+        streaming_loads=streaming_loads,
     )
     _run_compiled(
         reduce_exe,
@@ -1487,6 +1601,7 @@ def _flydsl_moe_stage1_impl(
     swiglu_limit: float | None = None,
     k_wave: int = 1,
     v2_output_layout: bool = False,
+    activation_bf16: bool = False,
     _compile_kernel=compile_flydsl_moe_stage1,
     _build_mx_args=_s1_args_fp4,
 ):
@@ -1513,6 +1628,14 @@ def _flydsl_moe_stage1_impl(
         Basic:                      out
         fuse_quant:                 (out, out_scale_sorted)
     """
+    if activation_bf16 and act != "silu_clamped":
+        raise ValueError("activation_bf16 requires silu_clamped")
+    if act == "silu_clamped":
+        if not (a_dtype == "bf16" and b_dtype in ("fp4", "int4")):
+            raise ValueError("silu_clamped requires bf16 A and fp4 or int4 W")
+        if out_dtype != "bf16" or bias is not None:
+            raise ValueError("silu_clamped requires bf16 output and no bias")
+        runtime_swiglu_limit(swiglu_limit, act)
     if k_batch_intra_block is not None:
         k_batch = k_batch_intra_block
 
@@ -1542,16 +1665,17 @@ def _flydsl_moe_stage1_impl(
     _v2_output_layout = _fuse_any_quant and not _is_splitk and v2_output_layout
 
     dev = a.device
-    # a16w-mix ported gemm1: bf16 A x {mxfp4 (a16w4), int4 (a16wi4)} W -> bf16 sorted
-    # intermediate, threaded to stage2 unchanged. Tiles from the CSV kernelName. Both
-    # w_dtypes consume the standard (GGUU) N-major preshuffle; a16wi4 W1 is the
+    # a16w-mix ported gemm1: bf16 A x {mxfp4 (a16w4), int4 (a16wi4), bf16 (a16w16)}
+    # W -> bf16 sorted intermediate, threaded to stage2 unchanged. Tiles from the
+    # CSV kernelName. fp4/int4 consume the standard (GGUU) N-major preshuffle;
+    # a16w16 is raw bf16 shuffle_weight (16,16) with no scale. a16wi4 W1 is the
     # OLD-kernel int4 prep (pack_int8_to_packed_int4(shuffle_weight(w,(16,16)))) +
     # (E,G//2,N,2) bf16 scale.
     # wpe=1 (a no-_w name) must map to None: waves_per_eu=1 is a real occupancy cap.
     _g1_waves_per_eu = (
         waves_per_eu if (waves_per_eu is not None and int(waves_per_eu) > 1) else None
     )
-    _is_a16w_port = a_dtype == "bf16" and b_dtype in ("fp4", "int4")
+    _is_a16w_port = a_dtype == "bf16" and b_dtype in ("fp4", "int4", "bf16")
     if _is_a16w_port:
         from aiter.ops.flydsl.kernels.moe_2stage_a16wmix import flydsl_a16w4_gemm1
 
@@ -1593,6 +1717,7 @@ def _flydsl_moe_stage1_impl(
             swiglu_limit=runtime_swiglu_limit(swiglu_limit, _act),
             w_dtype=b_dtype,
             w_layout="standard",
+            activation_bf16=activation_bf16,
         )
         return inter_sorted
     # The gate/up (N) axis tile must divide inter_dim; for non-256-aligned
@@ -1951,6 +2076,7 @@ def flydsl_moe_stage1(
     swiglu_limit: float | None = None,
     k_wave: int = 1,
     v2_output_layout: bool = False,
+    activation_bf16: bool = False,
 ):
     """Fused gate+up GEMM (MOE stage1).
 
@@ -2008,6 +2134,7 @@ def flydsl_moe_stage1(
         swiglu_limit=swiglu_limit,
         k_wave=k_wave,
         v2_output_layout=v2_output_layout,
+        activation_bf16=activation_bf16,
     )
 
 
@@ -2043,15 +2170,17 @@ def _flydsl_moe_stage2_impl(
     return_per_slot: bool = False,
     expert_mask: torch.Tensor | None = None,
     topk_ids: torch.Tensor | None = None,
+    use_valid_token_count: bool = False,
     _compile_kernel=compile_flydsl_moe_stage2,
     _build_mx_args=_s2_args_fp4,
 ) -> torch.Tensor:
     """Run stage2 with injectable compiler and launch-argument builders."""
 
-    if a_dtype == "bf16" and b_dtype in ("fp4", "int4"):
-        # a16w-mix down-proj (a16w4 mxfp4 / a16wi4 int4). Default atomic-scatters
-        # into the caller's moe_sorting-zeroed `out`. Explicit mode=reduce writes
-        # unique [M*topk,H] rows then moe_reduce for both weight formats. Tiles
+    if a_dtype == "bf16" and b_dtype in ("fp4", "int4", "bf16"):
+        # a16w-mix down-proj (a16w4 mxfp4 / a16wi4 int4 / a16w16 bf16). Default
+        # atomic-scatters into the caller's moe_sorting-zeroed `out`. Explicit
+        # mode=reduce writes unique [M*topk,H] rows then moe_reduce for fp4 and
+        # int4. bf16 stage2 has no reduce epilogue, so it stays atomic. Tiles
         # come from the kernelName (like
         # a4w4/a8w4). a16wi4 W2 uses the OLD-kernel int4 layout
         # (pack_int8_to_packed_int4(shuffle_weight(w,(16,16)))) + (E,G//2,N,2) bf16 scale.
@@ -2082,7 +2211,7 @@ def _flydsl_moe_stage2_impl(
         )
         _epilog = "atomic"
         gemm2_out = out
-        if mode == "reduce":
+        if mode == "reduce" and b_dtype != "bf16":
             _epilog = "reduce"
             gemm2_out = torch.empty(
                 (M_logical * int(topk), model_dim),
@@ -2118,6 +2247,7 @@ def _flydsl_moe_stage2_impl(
             xcd_swizzle=xcd_swizzle,
             w_dtype=b_dtype,
             epilog=_epilog,
+            use_valid_token_count=use_valid_token_count,
         )
         if _epilog == "reduce":
             _run_moe_reduction(
@@ -2369,6 +2499,7 @@ def flydsl_moe_stage2(
     return_per_slot: bool = False,
     expert_mask: torch.Tensor | None = None,
     topk_ids: torch.Tensor | None = None,
+    use_valid_token_count: bool = False,
 ) -> torch.Tensor:
     """Down-projection GEMM (MOE stage2). Supports atomic/reduce modes.
 
@@ -2390,6 +2521,9 @@ def flydsl_moe_stage2(
         post-GEMM reduction fuses the EP validity gather
         ``valid = expert_mask[topk_ids[t, k]] != 0`` and only sums valid
         slots. expert_mask is [num_experts] i32, topk_ids is [token_num, topk] i32.
+
+    use_valid_token_count: atomic a16w-mix only; bound scatter rows by
+        num_valid_ids[1] (the sort's real token count) when out is padded.
     """
     return _flydsl_moe_stage2_impl(
         inter_states=inter_states,
@@ -2422,6 +2556,7 @@ def flydsl_moe_stage2(
         return_per_slot=return_per_slot,
         expert_mask=expert_mask,
         topk_ids=topk_ids,
+        use_valid_token_count=use_valid_token_count,
     )
 
 
@@ -2675,6 +2810,7 @@ def flydsl_moe_topids_to_rows(
             current_stream_arg(),
         )
     else:
+        from aiter.jit.utils.build_targets import is_gfx1250_family
         from aiter.jit.utils.chip_info import get_gfx_runtime
         from aiter.ops.flydsl.kernels.moe_route_maps import (
             MAX_TP_ROUTE_BUCKETS,
@@ -2684,7 +2820,7 @@ def flydsl_moe_topids_to_rows(
         # Keep small calls and wave64 paths unchanged. Wider expert sets
         # require more routes to amortize their per-workgroup histogram sweeps.
         use_lds = (
-            get_gfx_runtime() == "gfx1250"
+            is_gfx1250_family(get_gfx_runtime())
             and 0 < int(E) <= MAX_TP_ROUTE_BUCKETS
             and numel >= tp_route_min_routes(int(E))
         )
