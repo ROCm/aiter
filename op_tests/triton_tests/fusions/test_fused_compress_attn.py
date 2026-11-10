@@ -9,7 +9,8 @@ from aiter.ops.triton.fusions.fused_compress_attn import fused_compress_attn_fp4
 from aiter.ops.triton.utils._triton import arch_info
 
 pytestmark = pytest.mark.skipif(
-    arch_info.get_arch() not in ("gfx1250", "gfx1250-strict"), reason="gfx1250 Gluon kernel"
+    arch_info.get_arch() not in ("gfx1250", "gfx1250-strict"),
+    reason="gfx1250 Gluon kernel",
 )
 
 HEAD_DIM = 128

@@ -233,7 +233,9 @@ def test_op(
             )
         # gfx1250 uses the n32k4 layout (scale kwidth 4), so K only needs
         # K//32 divisible by 4; gfx950 still needs 8.
-        if get_arch() in ("gfx1250", "gfx1250-strict") and (n % 32 != 0 or k % (32 * 4) != 0):
+        if get_arch() in ("gfx1250", "gfx1250-strict") and (
+            n % 32 != 0 or k % (32 * 4) != 0
+        ):
             pytest.skip(
                 f"Shape {m}x{n}x{k} is not supported for scale swizzling on gfx1250."
             )

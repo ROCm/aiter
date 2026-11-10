@@ -31,8 +31,7 @@ def _pin_flydsl_target_arch():
 
 _pin_flydsl_target_arch()
 
-import flydsl as _flydsl  # noqa: E402
-
+import flydsl as _flydsl
 from packaging.version import Version
 
 from aiter.fused_moe_registry import register_fused_moe_impl

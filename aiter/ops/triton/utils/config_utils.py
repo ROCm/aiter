@@ -153,7 +153,7 @@ def get_config_cu_num() -> int | None:
     return _CU_NUM
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def _tuned_tree_arch(dev: str, family: str) -> str:
     """The arch whose config tree a kernel running on ``dev`` reads for ``family``.
 

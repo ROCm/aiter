@@ -976,7 +976,8 @@ def _check_qh128_case(case):
 
 @pytest.mark.skipif(
     not torch.cuda.is_available()
-    or torch.cuda.get_device_properties(0).gcnArchName.split(":")[0] not in ("gfx1250", "gfx1250-strict"),
+    or torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
+    not in ("gfx1250", "gfx1250-strict"),
     reason="requires gfx1250",
 )
 class TestMlaQh128:
@@ -1187,7 +1188,8 @@ def _run_atom_shuffled(args, **overrides):
 
 @pytest.mark.skipif(
     not torch.cuda.is_available()
-    or torch.cuda.get_device_properties(0).gcnArchName.split(":")[0] not in ("gfx1250", "gfx1250-strict"),
+    or torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
+    not in ("gfx1250", "gfx1250-strict"),
     reason="requires gfx1250",
 )
 class TestMlaV3Unified:
@@ -1701,7 +1703,8 @@ def _check_qh64_bigraw(offset, splits, ctx_len, q_len=1, *, kv_csr_layout="page"
 
 @pytest.mark.skipif(
     not torch.cuda.is_available()
-    or torch.cuda.get_device_properties(0).gcnArchName.split(":")[0] not in ("gfx1250", "gfx1250-strict"),
+    or torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
+    not in ("gfx1250", "gfx1250-strict"),
     reason="requires gfx1250",
 )
 class TestMlaQh64Shuffled:
@@ -1994,7 +1997,8 @@ def _run_qh64_gluon_case(case, *, out=None):
 
 @pytest.mark.skipif(
     not torch.cuda.is_available()
-    or torch.cuda.get_device_properties(0).gcnArchName.split(":")[0] not in ("gfx1250", "gfx1250-strict"),
+    or torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
+    not in ("gfx1250", "gfx1250-strict"),
     reason="requires gfx1250",
 )
 class TestMlaQh64ShuffledCausal:
@@ -2313,7 +2317,8 @@ def _qh64_page_inputs(case):
 
 @pytest.mark.skipif(
     not torch.cuda.is_available()
-    or torch.cuda.get_device_properties(0).gcnArchName.split(":")[0] not in ("gfx1250", "gfx1250-strict"),
+    or torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
+    not in ("gfx1250", "gfx1250-strict"),
     reason="requires gfx1250",
 )
 class TestMlaQh64PageMetadata:
@@ -2474,7 +2479,8 @@ def _check_qh64_token_case(case, *, token_csr=None, return_lse=True):
 
 @pytest.mark.skipif(
     not torch.cuda.is_available()
-    or torch.cuda.get_device_properties(0).gcnArchName.split(":")[0] not in ("gfx1250", "gfx1250-strict"),
+    or torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
+    not in ("gfx1250", "gfx1250-strict"),
     reason="requires gfx1250",
 )
 class TestMlaQh64TokenCsr:

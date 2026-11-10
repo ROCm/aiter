@@ -34,7 +34,9 @@ def all_reduce_init(group, max_bytes):
         _should_use_vmm,
     )
 
-    assert get_arch() in ("gfx1250", "gfx1250-strict") and dist.get_world_size(group) == 4
+    assert (
+        get_arch() in ("gfx1250", "gfx1250-strict") and dist.get_world_size(group) == 4
+    )
     assert not _should_use_vmm(True), "needs ROCm 7.14 or later for hipIpc"
     # A chunk of 64 lines of 16 bytes and 2 call counters for each 512 bytes of x.
     chunks = triton.cdiv(max_bytes, 8 * _LINES)

@@ -73,7 +73,10 @@ def fused_compress_attn_fp4(
 
     Limits: gfx1250 only.
     """
-    assert arch_info.get_arch() in ("gfx1250", "gfx1250-strict"), "this kernel is for the gfx1250 family only"
+    assert arch_info.get_arch() in (
+        "gfx1250",
+        "gfx1250-strict",
+    ), "this kernel is for the gfx1250 family only"
     assert kv_in.shape[1] == 2 * HEAD_DIM and cos.shape[1] == ROPE_DIM // 2
     assert ape.shape[0] == RATIO
     # The kernel reads both inputs with one stride and 16-byte loads.
