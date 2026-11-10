@@ -18,6 +18,7 @@ from .tensor_shim import (
     buf_copy_load,
     ptr_buf_tensor,
 )
+from .dpp_utils import dpp_xor_f32
 from .utils import rcp_f32, udiv_const, urem_const
 
 WAVE = 64
@@ -346,14 +347,19 @@ def compile_pa_decode_ps_reduce(
             part_max = live.select(fx.Float32(max_logits[offset]), neg_inf)
             return part_sum, part_max
 
+        def _xor_lane(value, offset):
+            # gfx950: DPP reaches lanes within 16 without the LDS crossbar
+            # round trip of ds_swizzle; wider offsets keep the shuffle.
+            if fx.const_expr(architecture == "gfx950" and offset <= 8):
+                return fx.Float32(dpp_xor_f32(value, offset))
+            return value.shuffle_xor(fx.Int32(offset), c_wave)
+
         def _softmax_weights(sums, maxes, offsets):
             lane_max = maxes[0]
             for part_max in maxes[1:]:
                 lane_max = lane_max.maximumf(part_max)
             for offset in offsets:
-                lane_max = lane_max.maximumf(
-                    lane_max.shuffle_xor(fx.Int32(offset), c_wave)
-                )
+                lane_max = lane_max.maximumf(_xor_lane(lane_max, offset))
             if fx.const_expr(use_sinks):
                 lane_max = lane_max.maximumf(sink_value)
             safe_max = (lane_max > neg_inf).select(lane_max, zero_f)
@@ -368,10 +374,7 @@ def compile_pa_decode_ps_reduce(
                 exp_sum = exp_sum + value
             for offset in offsets:
                 exp_sum = fx.Float32(
-                    exp_sum.addf(
-                        exp_sum.shuffle_xor(fx.Int32(offset), c_wave),
-                        fastmath="fast",
-                    )
+                    exp_sum.addf(_xor_lane(exp_sum, offset), fastmath="fast")
                 )
             if fx.const_expr(use_sinks):
                 # +inf sinks have unit mass at the shared max and suppress KV;
