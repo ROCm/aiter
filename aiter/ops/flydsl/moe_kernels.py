@@ -3575,7 +3575,13 @@ def flydsl_moe_fused_quant_preshuffle(
 
         if quant_mode != "fp4":
             raise ValueError("A-preshuffled payload requires MXFP4")
-        validate_apre_k(feat_dim)
+        if topids_to_rows is not None:
+            # The route scatter uses K1024 slices; grouped quant uses K128 tiles.
+            validate_apre_k(feat_dim)
+        elif feat_dim <= 0 or feat_dim % 128:
+            raise ValueError(
+                "A-preshuffled payload requires positive K divisible by 128"
+            )
     rows_per_tile = wmma_rep * 16
     assert (
         max_m % rows_per_tile == 0
