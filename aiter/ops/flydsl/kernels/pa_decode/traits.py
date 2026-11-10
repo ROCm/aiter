@@ -454,6 +454,8 @@ class PaDecodeTraits:
     QK_AGROUP: int
     BUFFER_KV: bool
     PAGE16_VPIPE: bool
+    PAGE16_PAGES_FIRST: bool
+    PAGE16_EARLY_K: bool
     REUSE_KV_PAGES: bool
     SCALES_BEFORE_CURRENT_V: bool
     M1_SCALE_BEFORE_MASK: bool
@@ -709,6 +711,19 @@ class PaDecodeTraits:
         QK_AGROUP = 2
         TUNE_PAGE128 = block_size == 128 and (PER_TOKEN_M1 or TUNED_SCALAR)
         PAGE16_VPIPE = prefetch_v and block_size == 16
+        # gfx950 scalar-scale page-16 pipes load the next tile's page ids
+        # ahead of the current V: staging them then waits on vmcnt without
+        # draining V, which stays in flight through the softmax.
+        PAGE16_PAGES_FIRST = (
+            is_gfx950
+            and PAGE16_VPIPE
+            and not per_token_kv
+            and not D256_PIPE
+            and not single_tile_plan
+        )
+        # FP8 also issues the next K from those ids right after QK instead of
+        # after the P barrier. BF16's next K is twice the registers and slower.
+        PAGE16_EARLY_K = PAGE16_PAGES_FIRST and not is_bf16_kv
         REUSE_KV_PAGES = PER_TOKEN_M1 or (D256_PIPE and per_token_kv)
         # gfx950 per-token FP8 B>=2 decode loops (their tiles always have a
         # next tile) store the next tile's scales after PV, so the scale vmcnt
@@ -902,6 +917,8 @@ class PaDecodeTraits:
             QK_AGROUP=QK_AGROUP,
             BUFFER_KV=BUFFER_KV,
             PAGE16_VPIPE=PAGE16_VPIPE,
+            PAGE16_PAGES_FIRST=PAGE16_PAGES_FIRST,
+            PAGE16_EARLY_K=PAGE16_EARLY_K,
             REUSE_KV_PAGES=REUSE_KV_PAGES,
             SCALES_BEFORE_CURRENT_V=SCALES_BEFORE_CURRENT_V,
             M1_SCALE_BEFORE_MASK=M1_SCALE_BEFORE_MASK,

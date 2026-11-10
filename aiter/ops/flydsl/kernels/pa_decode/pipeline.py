@@ -475,6 +475,11 @@ class PaDecodePipeline:
         if const_expr(self.traits.per_token_kv):
             scale_bounds = self.softmax.scale_mask(tile_valid, window_left)
 
+        # Next page ids go ahead of this tile's V (PAGE16_PAGES_FIRST). Past
+        # the task they read masked ids, which only the guarded staging sees.
+        pages_ahead = None
+        if const_expr(self.traits.PAGE16_PAGES_FIRST and has_next):
+            pages_ahead = self.kv.load_tile_pages(tt1)
         # Independent V loads overlap QK/softmax and are shared across M-tiles.
         v_vh_shared = None
         if const_expr(self.traits.MTP4_PREFETCH_V):
@@ -540,6 +545,7 @@ class PaDecodePipeline:
             q_scale_vec,
             mask_tail,
             has_next,
+            pages_ahead,
         )
 
     @flyc.jit
@@ -901,6 +907,7 @@ class PaDecodePipeline:
         q_scale_vec,
         mask_tail,
         has_next=True,
+        pages_ahead=None,
     ):
         """Overlap QK, page/scale prefetch and PV for up to two padded query tiles.
 
@@ -958,6 +965,10 @@ class PaDecodePipeline:
                     )
                 if const_expr(not self.traits.PAGE16_VPIPE):
                     k_next = self.kv.load_k_from_pages(phys_vec1)
+            elif const_expr(pages_ahead is not None):
+                self.kv.stage_v_pages(pages_ahead)
+                if const_expr(self.traits.PAGE16_EARLY_K):
+                    k_next = self.kv.load_k_from_pages(pages_ahead)
             else:
                 k_next, phys_vec1 = self.kv.load_k(tt1)
                 self.kv.fetch_v_pages(tt1)
@@ -1016,7 +1027,9 @@ class PaDecodePipeline:
             m_new.append(m_new_m)
             corr_reg.append(corr_m)
         gpu.barrier()
-        if const_expr(self.traits.PAGE16_VPIPE):  # noqa: SIM102
+        if const_expr(
+            self.traits.PAGE16_VPIPE and not self.traits.PAGE16_EARLY_K
+        ):  # noqa: SIM102
             # Next K can now overlap P reads/PV.
             if const_expr(has_next and not self.traits.single_tile_plan) and (
                 tt1 < self.ctx.part_end

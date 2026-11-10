@@ -568,7 +568,8 @@ class PaDecodeKVLoader:
                 phys_vec,
             )
 
-    def fetch_v_pages(self, tt_i32):
+    def load_tile_pages(self, tt_i32):
+        """This wave's page ids of tile ``tt_i32``, without staging them."""
         base_page = (
             tt_i32 * self.traits.TILE_TOK // self.traits.block_size
         )  # tile start is page-aligned
@@ -577,11 +578,14 @@ class PaDecodeKVLoader:
             + (self.ctx.warp * self.traits.TOK_PER_WARP) // self.traits.block_size,
             self.traits.PAGES_PER_CHUNK,
         )
-        fetched_vec = (
+        return (
             fx.Vector.from_elements([fetched], dtype=fx.Int32)
             if const_expr(self.traits.PAGES_PER_CHUNK == 1)
             else fx.Vector(fetched)
         )
+
+    def fetch_v_pages(self, tt_i32):
+        fetched_vec = self.load_tile_pages(tt_i32)
         self.stage_v_pages(fetched_vec)
         return fetched_vec
 
