@@ -58,7 +58,13 @@ def _compare(name, outs, ref_residual, ref_out, group):
     except AssertionError as e:
         failures.append(f"{name}: out: {e}")
     if len(outs) == 4:
-        step = outs[3].repeat_interleave(128, dim=1)
+        groups = outs[3].shape[1]  # 1 for the per-token quant
+        amax = ref_out.abs().unflatten(1, (groups, -1)).amax(-1)
+        try:
+            torch.testing.assert_close(outs[3], amax / 448, rtol=1e-5, atol=0)
+        except AssertionError as e:
+            failures.append(f"{name}: scale: {e}")
+        step = outs[3].repeat_interleave(HIDDEN // groups, dim=1)
         error = (outs[2].float() * step - ref_out).abs()
         # e4m3 has 3 mantissa bits. Its smallest step is 2^-9 of the scale.
         if not bool((error <= 2.0**-4 * ref_out.abs() + 2.0**-9 * step).all()):
@@ -92,12 +98,21 @@ def _worker(rank, init_method):
             name = f"rank {rank} call {i} at the counter wrap"
             failures += _compare(name, outs, *ref, tp.device_group)
 
-        for quant in (False, True):
+        for quant, per_token in ((False, False), (True, False), (True, True)):
             for tokens, (x, residual, weight, *ref) in zip(TOKENS, cases):
                 outs = all_reduce_rmsnorm_quant(
-                    x, residual, weight, EPS, True, quant, group, inboxes, calls
+                    x,
+                    residual,
+                    weight,
+                    EPS,
+                    True,
+                    quant,
+                    group,
+                    inboxes,
+                    calls,
+                    per_token,
                 )
-                name = f"rank {rank} tokens {tokens} quant {quant}"
+                name = f"rank {rank} tokens {tokens} quant {quant} {per_token}"
                 failures += _compare(name, outs, *ref, tp.device_group)
 
             # All token counts in one HIP graph, replayed 10 times.
@@ -105,14 +120,14 @@ def _worker(rank, init_method):
             with torch.cuda.graph(graph):
                 outs = [
                     all_reduce_rmsnorm_quant(
-                        x, r, w, EPS, True, quant, group, inboxes, calls
+                        x, r, w, EPS, True, quant, group, inboxes, calls, per_token
                     )
                     for x, r, w, _, _ in cases
                 ]
             for _ in range(10):
                 graph.replay()
             for tokens, o, (_, _, _, *ref) in zip(TOKENS, outs, cases):
-                name = f"rank {rank} graph tokens {tokens} quant {quant}"
+                name = f"rank {rank} graph tokens {tokens} quant {quant} {per_token}"
                 failures += _compare(name, o, *ref, tp.device_group)
         if calls[-1].item():
             failures.append(f"rank {rank}: {calls[-1].item()} polls timed out")

@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Gluon all-reduce + add + RMSNorm against RCCL + add_rmsnorm, CAR + add_rmsnorm
-and the aiter fused CAR on 4 gfx1250 GPUs. The time is the slowest rank, in a HIP
-graph."""
+and the aiter fused CAR on 4 gfx1250 GPUs. gluon_fp8_token has the per-token quant.
+The time is the slowest rank, in a HIP graph."""
 
 import multiprocessing as mp
 
@@ -39,7 +39,7 @@ TOKENS = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048]
 
 def benchmark(args, rank, device, tp, inboxes, calls):
     ca = tp.device_communicator.ca_comm
-    providers = ["gluon", "gluon_fp8", "rccl"]
+    providers = ["gluon", "gluon_fp8", "gluon_fp8_token", "rccl"]
     if ca is not None and not ca.disabled:
         providers += ["car", "car_fused"]
     config = triton.testing.Benchmark(
@@ -79,6 +79,9 @@ def benchmark(args, rank, device, tp, inboxes, calls):
             ),
             "gluon_fp8": lambda x, res: all_reduce_rmsnorm_quant(
                 x, res, weight, EPS, True, True, group, inboxes, calls
+            ),
+            "gluon_fp8_token": lambda x, res: all_reduce_rmsnorm_quant(
+                x, res, weight, EPS, True, True, group, inboxes, calls, True
             ),
             "rccl": rccl,
             "car": car,

@@ -126,15 +126,13 @@ def _receive(
     return a0 + b0 + c0 + d0, a1 + b1 + c1 + d1, a2 + b2 + c2 + d2
 
 
-_all_reduce_repr = make_kernel_repr("_all_reduce_kernel", ["RANK", "LINES", "QUANT"])
+_all_reduce_repr = make_kernel_repr("_all_reduce_kernel", ["RANK", "LINES"])
 
 
 @gluon.jit(repr=_all_reduce_repr, do_not_specialize=["n", "programs"])
 def _all_reduce_kernel(
     x,
     y,
-    q,
-    scale,
     inboxes,
     calls,
     err,
@@ -144,14 +142,11 @@ def _all_reduce_kernel(
     LINES: gl.constexpr,
     SLOT: gl.constexpr,
     MAXIT: gl.constexpr,
-    QUANT: gl.constexpr,
 ):
     """y = the sum of the n values of x over the 4 ranks. Programs 0 to C-1 send the C
     chunks, one each: a load after a remote store waits for its ack. Programs C to
     C+P-1 receive chunks p, p + P, ... (P = programs). The GPU starts programs in
-    order, so a waiting receiver cannot block a sender. With QUANT, the rows of x
-    have 2 LINES values, so chunk c is rows 3c to 3c + 2, and q and scale get the
-    fp8 per-token quant of y."""
+    order, so a waiting receiver cannot block a sender."""
     WORDS: gl.constexpr = gl.BlockedLayout([1, 2], [32, 1], [gl.num_warps(), 1], [1, 0])
     LINE: gl.constexpr = gl.BlockedLayout([1, 4], [32, 1], [gl.num_warps(), 1], [1, 0])
     num_chunks = gl.cdiv(n, 6 * LINES)
@@ -192,14 +187,3 @@ def _all_reduce_kernel(
             gl.amd.cdna5.buffer_store(s0, y, value, mask=first < n)
             gl.amd.cdna5.buffer_store(s1, y, value + 2 * LINES, mask=ok1)
             gl.amd.cdna5.buffer_store(s2, y, value + 4 * LINES, mask=ok2)
-            if QUANT:  # unit u has column u of rows 3c, 3c + 1 and 3c + 2
-                for r in gl.static_range(3):
-                    row = 3 * c + r
-                    if row * 2 * LINES < n:  # the last chunk can have empty rows
-                        s = (s0, s1, s2)[r].to(gl.float32)
-                        # 448 is the fp8 maximum. A row of zeros gets q = 0.
-                        row_max = gl.max(gl.max(gl.abs(s), axis=1), axis=0)
-                        row_scale = gl.maximum(row_max, 1e-10) / 448
-                        sq = (s / row_scale).to(gl.float8e4nv)
-                        gl.amd.cdna5.buffer_store(sq, q, value + 2 * r * LINES)
-                        gl.store(scale + row, row_scale)

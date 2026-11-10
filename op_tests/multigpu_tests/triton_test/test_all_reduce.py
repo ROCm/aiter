@@ -28,9 +28,6 @@ HIDDEN = 2048
 NUMELS = [t * HIDDEN for t in (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048)]
 NUMELS += [3 * HIDDEN + 8, 600 * HIDDEN + 8]
 MIXED = [8, 1, 2048, 2, 64, 4, 512, 8, 16, 1024, 32, 128, 256, 1, 8]
-# Token counts of the quant for each row size. A chunk is 3 rows: 1, 2 and 7 tokens
-# give a partial last chunk, and 8192 tokens of 128 make receivers take 2 chunks.
-QUANT_TOKENS = {128: [1, 2, 3, 7, 8192], 2048: [1, 2, 4, 5, 64, 2048], 8192: [1, 3, 64]}
 
 SKIP = torch.cuda.device_count() < WORLD_SIZE or arch_info.get_arch() != "gfx1250"
 pytestmark = pytest.mark.skipif(SKIP, reason="needs 4 gfx1250 GPUs")
@@ -131,30 +128,6 @@ def _worker(rank, init_method):
                 failures.append(f"rank {rank}: full-partial-full step {step} is wrong")
             if step == 1 and _stale_tail(rank, group, inboxes, calls, 2**30 - 1):
                 failures.append(f"rank {rank}: the tail of chunk 3 kept an old call")
-
-        # The quant calls move 3 rows a chunk: inboxes of their own for each row size.
-        for hidden, tokens in QUANT_TOKENS.items():
-            qinboxes, qcalls = all_reduce_init(group, 2 * hidden * max(tokens))
-            for t in tokens:
-                x, ref = _inputs(t * hidden, t, rank, device)
-                x, ref = x.view(t, hidden), ref.view(t, hidden)
-                x[-1], ref[-1] = 0, 0  # a row of zeros gets q = 0
-                y, q, scale = all_reduce(x, group, qinboxes, qcalls, quant=True)
-                amax = ref.float().abs().amax(-1, keepdim=True)
-                # A tensor divisor: a GPU division by a number multiplies by 1 / 448.
-                ref_scale = amax.clamp(min=1e-10) / torch.full_like(amax, 448.0)
-                ref_q = (ref.float() / ref_scale).to(torch.float8_e4m3fn)
-                bad_q = q.view(torch.uint8) != ref_q.view(torch.uint8)
-                if _bad(y, ref) or not torch.equal(scale, ref_scale) or bad_q.any():
-                    failures.append(f"rank {rank} hidden {hidden} tokens {t}: wrong")
-            try:  # a plain call on these inboxes must stop before it starts
-                all_reduce(x, group, qinboxes, qcalls)
-                failures.append(f"rank {rank}: a plain call ran on quant inboxes")
-            except AssertionError:
-                pass
-            if qcalls[-1].item():
-                failures.append(f"rank {rank}: {qcalls[-1].item()} polls timed out")
-            all_reduce_free(group, qinboxes)
         if calls[-1].item():
             failures.append(f"rank {rank}: {calls[-1].item()} polls timed out")
         return failures
