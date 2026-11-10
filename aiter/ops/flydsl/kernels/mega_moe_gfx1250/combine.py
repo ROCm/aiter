@@ -43,14 +43,12 @@ from aiter.ops.flydsl.kernels.gemm_common_gfx1250 import (
 from .config import (
     _WAVE_SIZE as WAVE,
 )
+from .types import COMBINE_CHUNK, combine_chunk_bytes
 from .types import COMBINE_SCALE_BLOCK as SCALE_BLOCK
 
-# The reduce's slicing granularity along hidden; chunks_per_iter of these make
-# one TDM row. Not a wire structure -- both planes are flat and a chunk is just
-# an index into them. 256 is the smallest size that keeps a chunk's payload a
-# whole cache line on every wire (fp4 128B, fp8 256B, bf16 512B) and its scale
-# slice a whole dword, which the dword-rounded e8m0 read in reduce_tile needs.
-CHUNK_ELEMS = 256
+# The reduce's slicing granularity along hidden, which is the MX wire's chunk;
+# chunks_per_iter of these make one TDM row.
+CHUNK_ELEMS = COMBINE_CHUNK
 # Elements each lane reduces per round. On the MXFP8 wire 16 fp8 sit inside one
 # 32-element MX block, so a round needs exactly one scale byte.
 LANE_BYTES = 16
@@ -129,6 +127,11 @@ def _make_combine_fused_sync(
 COMBINE_LDS_BUDGET = 160 * 1024
 
 
+def _chunk_bytes(quant_bits):
+    """Wire bytes of one chunk: MX payload and scale line, or bf16."""
+    return combine_chunk_bytes(quant_bits) if quant_bits else CHUNK_ELEMS * 2
+
+
 def combine_reduce_lds_bytes(
     *, experts_per_token, quant_bits, tokens_per_block, chunks_per_iter
 ):
@@ -137,9 +140,7 @@ def combine_reduce_lds_bytes(
     Duplicates the accounting in ``_make_combine_fused_reduce``; keep the two in
     step.
     """
-    chunk_bytes = CHUNK_ELEMS * quant_bits // 8 if quant_bits else CHUNK_ELEMS * 2
-    if quant_bits:
-        chunk_bytes += CHUNK_ELEMS // SCALE_BLOCK
+    chunk_bytes = _chunk_bytes(quant_bits)
     in_tile = tokens_per_block * experts_per_token * chunks_per_iter * chunk_bytes
     out_tile = tokens_per_block * chunks_per_iter * CHUNK_ELEMS * 2
     return 2 * (in_tile + out_tile)
@@ -172,16 +173,12 @@ def _make_combine_fused_reduce(
     peers. One TDM load therefore brings ``T*topk`` slot rows into LDS, and the
     summed bf16 result goes back out through a second TDM store.
 
-    ``quant_bits`` picks the wire. An MX slot is two planes, so a trip issues two
-    loads into two LDS regions; a lane's 16 elements sit inside a single
-    32-element MX block, so it needs exactly one scale byte per expert -- one
-    b128 of payload on the fp8 wire, one b64 on fp4. A bf16 wire has no scale
-    plane, so there is one load, the row is just the hidden slice, and the
-    lane's 16 elements are two b128 loads instead of one plus a scale dword.
-
-    On an MX wire ``chunks_per_iter`` wants to cover as much of the hidden dim as
-    it can: the scale plane contributes only C*8 bytes to a row, and anything
-    under a cache line makes the second load fetch lines it mostly discards.
+    ``quant_bits`` picks the wire (see types.py). Either way a trip is one load:
+    an MX chunk carries its scales right behind its payload. A lane's 16
+    elements sit inside a single 32-element MX block, so it needs exactly one
+    scale byte per expert -- one b128 of payload on the fp8 wire, one b64 on
+    fp4. A bf16 lane's 16 elements are two b128 loads instead of one plus a
+    scale dword.
     """
     topk = experts_per_token
     lanes = warp_num_per_block * WAVE
@@ -196,17 +193,16 @@ def _make_combine_fused_reduce(
             f"chunks_per_iter={C_CHK} must divide hidden chunks ({n_chunks})"
         )
 
-    # Elements a lane owns per round, and the wire bytes those take up. The two
-    # planes stage as two LDS regions, all the payload rows and then all the
-    # scale rows, so each stays a plain strided 2D region one TDM can fill.
+    # Elements a lane owns per round, and the wire bytes those take up.
     ELEMS_PER_LANE = LANE_BYTES
-    IN_CHUNK_BYTES = CHUNK_ELEMS * quant_bits // 8 if quant_bits else CHUNK_ELEMS * 2
+    CHUNK_PAYLOAD_BYTES = CHUNK_ELEMS * quant_bits // 8
+    IN_CHUNK_BYTES = _chunk_bytes(quant_bits)
     IN_ROWS = T_TOK * topk
     P_ROW_BYTES = C_CHK * IN_CHUNK_BYTES
-    S_ROW_BYTES = C_CHK * (CHUNK_ELEMS // SCALE_BLOCK) if quant_bits else 0
-    IN_SCALE_OFF = IN_ROWS * P_ROW_BYTES
+    IN_TILE = (IN_ROWS, P_ROW_BYTES)
     OUT_ROW_ELEMS = C_CHK * CHUNK_ELEMS
     OUT_ROW_BYTES = OUT_ROW_ELEMS * 2
+    OUT_TILE = (T_TOK, OUT_ROW_ELEMS)
     # Lane slots per iteration; one slot is ELEMS_PER_LANE elements of one token.
     SLOTS = T_TOK * OUT_ROW_ELEMS // ELEMS_PER_LANE
     SLOTS_PER_TOK = OUT_ROW_ELEMS // ELEMS_PER_LANE
@@ -232,7 +228,7 @@ def _make_combine_fused_reduce(
     # the measured sweet spot; a third tile a side does not fit the budget below.
     IN_BUFS = 2
     OUT_BUFS = 2
-    IN_TILE_BYTES = IN_ROWS * (P_ROW_BYTES + S_ROW_BYTES)
+    IN_TILE_BYTES = IN_ROWS * P_ROW_BYTES
     OUT_TILE_BYTES = T_TOK * OUT_ROW_BYTES
     LDS_BYTES = IN_BUFS * IN_TILE_BYTES + OUT_BUFS * OUT_TILE_BYTES
     if LDS_BYTES > COMBINE_LDS_BUDGET:
@@ -243,11 +239,11 @@ def _make_combine_fused_reduce(
 
     slot_stride = slot_stride_nbytes
     iters_per_tok = n_chunks // C_CHK
-    # A trip issues one load per plane and then one store, so the wait that
-    # hands this trip its input tile must leave the prefetch's loads and the
-    # previous trip's store in flight. This rests on TDM ops retiring in issue
-    # order, so that a count names an exact prefix of the issue stream.
-    WAIT_N = (2 if quant_bits else 1) + 1
+    # A trip issues one load and then one store, so the wait that hands this
+    # trip its input tile must leave the prefetch's load and the previous trip's
+    # store in flight. This rests on TDM ops retiring in issue order, so that a
+    # count names an exact prefix of the issue stream.
+    WAIT_N = 2
 
     def _dequant_pk8(packed, e8m0_i32):
         """Native gfx1250 ``v_cvt_scale_pk8_f32_{fp8,fp4}``: 8 MX values -> 8 f32.
@@ -348,22 +344,15 @@ def _make_combine_fused_reduce(
         def lds_in_view(s):
             return lds_view(
                 fx.recast_iter(p8_shared, in_buf_ptr(s)),
-                (IN_ROWS, P_ROW_BYTES),
-                (P_ROW_BYTES, 1),
-            )
-
-        def lds_scale_view(s):
-            return lds_view(
-                fx.recast_iter(p8_shared, in_buf_ptr(s) + IN_SCALE_OFF),
-                (IN_ROWS, S_ROW_BYTES),
-                (S_ROW_BYTES, 1),
+                (IN_TILE, 1),
+                ((P_ROW_BYTES, 1), IN_ROWS * P_ROW_BYTES),
             )
 
         def lds_out_view(s):
             return lds_view(
                 fx.recast_iter(p16_shared, out_buf_ptr(s)),
-                (T_TOK, OUT_ROW_ELEMS),
-                (OUT_ROW_ELEMS, 1),
+                (OUT_TILE, 1),
+                ((OUT_ROW_ELEMS, 1), T_TOK * OUT_ROW_ELEMS),
             )
 
         # Lane -> (token, chunk, element) decode, constant across iterations.
@@ -382,13 +371,16 @@ def _make_combine_fused_reduce(
         total_work = n_groups * iters_per_tok
         last_work = total_work - 1
 
+        # Wave id is loop-invariant; read it once instead of per tile.
+        wave = fx.rocdl.wave_id()
+
         def tile_origin(work):
             grp = work // iters_per_tok
             it = work % iters_per_tok
             return grp * T_TOK, it * C_CHK
 
         def issue_load(work, buf, live):
-            """-- global -> LDS: T*topk slot rows, one copy per wire plane --
+            """-- global -> LDS: T*topk slot rows in one copy --
 
             ``live`` false means the work item does not exist -- the prefetch on
             a block's last trip, or the literal ``False`` used to pad the
@@ -396,9 +388,6 @@ def _make_combine_fused_reduce(
             contribute the same amount to tensorcnt for the wait below to be a
             constant, but it shrinks to a single row so it costs nothing. Its
             index is pinned in range too, so the address stays valid.
-
-            The prologue's pad is the exception: it is one copy whatever the
-            wire, which is what makes ``WAIT_N`` uniform from trip 0 on.
             """
             work = (work > last_work).select(last_work, work)
             tok0, q0 = tile_origin(work)
@@ -415,32 +404,24 @@ def _make_combine_fused_reduce(
             slot_off = fx.Int64(tok0) * fx.Int64(topk * slot_stride)
             g_off = slot_off + fx.Int64(q0) * fx.Int64(IN_CHUNK_BYTES)
             gt_in = global_view(
-                inp_iter, g_off, (IN_ROWS, P_ROW_BYTES), (slot_stride, 1)
+                inp_iter, g_off, (row_oob, P_ROW_BYTES), (slot_stride, 1)
             )
-            atom_in = fx.rocdl.make_tdm_atom(
+            atom_in, coord_in = fx.rocdl.cdna5.make_tiled_tdm_atom(
+                fx.rocdl.TensorLoad(),
                 gt_in,
-                [row_oob, None],
-                strides=[slot_stride, None],
+                fx.make_layout(IN_TILE, (P_ROW_BYTES, 1)),
+                IN_TILE,
                 num_warps=warp_num_per_block,
             )
-            fx.copy(atom_in, gt_in, lds_in_view(buf))
-            if quant_bits and live is not False:
-                # The scale plane starts one payload plane into the slot.
-                g_off_s = (
-                    slot_off
-                    + fx.Int64(hidden_dim * quant_bits // 8)
-                    + fx.Int64(q0) * fx.Int64(CHUNK_ELEMS // SCALE_BLOCK)
-                )
-                gt_sc = global_view(
-                    inp_iter, g_off_s, (IN_ROWS, S_ROW_BYTES), (slot_stride, 1)
-                )
-                atom_sc = fx.rocdl.make_tdm_atom(
-                    gt_sc,
-                    [row_oob, None],
-                    strides=[slot_stride, None],
-                    num_warps=warp_num_per_block,
-                )
-                fx.copy(atom_sc, gt_sc, lds_scale_view(buf))
+            blk_in = fx.zipped_divide(coord_in, IN_TILE)[None, (0, None)]
+            tIs, tIg = fx.rocdl.cdna5.tdm_partition(
+                atom_in,
+                wave,
+                fx.make_layout(warp_num_per_block, 1),
+                lds_in_view(buf),
+                blk_in,
+            )
+            fx.copy(atom_in, tIg[None, 0], tIs[None, 0])
 
         def reduce_tile(buf):
             """-- dequantize and sum the topk slots out of LDS --"""
@@ -455,23 +436,19 @@ def _make_combine_fused_reduce(
                     base_in = chunk_off + (
                         lane_elem[r] if quant_bits == 8 else lane_elem[r] // 2
                     )
-                    # The lane's MX block scale, over in the scale region; read
-                    # as a dword and shifted out so the byte stays unsigned. The
-                    # region base and both row terms are dword multiples, so
-                    # rounding the byte index down is all the alignment needed.
+                    # The lane's MX block scale, right behind its chunk's
+                    # payload; read as a dword and shifted out so the byte stays
+                    # unsigned. The chunk and its payload are dword multiples,
+                    # so rounding the byte index down is all the alignment
+                    # needed.
                     sc_i = lane_elem[r] // SCALE_BLOCK
-                    sc_dw = (
-                        IN_SCALE_OFF
-                        + lane_tok[r] * (topk * S_ROW_BYTES)
-                        + lane_chunk[r] * (CHUNK_ELEMS // SCALE_BLOCK)
-                        + (sc_i // 4) * 4
-                    )
+                    sc_dw = chunk_off + CHUNK_PAYLOAD_BYTES + (sc_i // 4) * 4
                     sc_sh = (sc_i % 4) * 8
                     for k_slot in range_constexpr(topk):
                         payload = lds_load_payload(
                             in_idx, base_in + k_slot * P_ROW_BYTES
                         )
-                        dw = lds_load_b32(in_idx, sc_dw + k_slot * S_ROW_BYTES)[0]
+                        dw = lds_load_b32(in_idx, sc_dw + k_slot * P_ROW_BYTES)[0]
                         e8m0 = (dw >> sc_sh) & 0xFF
                         for j in range_constexpr(2):
                             accs[j] = accs[j] + _dequant_pk8(
@@ -483,8 +460,8 @@ def _make_combine_fused_reduce(
                                 e8m0,
                             )
                 else:
-                    # No scale plane, so the lane's 16 elements are a plain
-                    # 32-byte run: one b128 per accumulator.
+                    # No scales, so the lane's 16 elements are a plain 32-byte
+                    # run: one b128 per accumulator.
                     base_in = chunk_off + lane_elem[r] * 2
                     for k_slot in range_constexpr(topk):
                         row_b = k_slot * P_ROW_BYTES
@@ -510,17 +487,29 @@ def _make_combine_fused_reduce(
             out_off = fx.Int64(tok0) * fx.Int64(hidden_dim) + fx.Int64(q0) * fx.Int64(
                 CHUNK_ELEMS
             )
-            gt_out = global_view(
-                out_iter, out_off, (T_TOK, OUT_ROW_ELEMS), (hidden_dim, 1)
-            )
             _toks_left = cur_rank_num_token - tok0
-            atom_out = fx.rocdl.make_tdm_atom(
+            gt_out = global_view(
+                out_iter,
+                out_off,
+                ((_toks_left > T_TOK).select(T_TOK, _toks_left), OUT_ROW_ELEMS),
+                (hidden_dim, 1),
+            )
+            atom_out, coord_out = fx.rocdl.cdna5.make_tiled_tdm_atom(
+                fx.rocdl.TensorStore(),
                 gt_out,
-                [(_toks_left > T_TOK).select(T_TOK, _toks_left), None],
-                strides=[hidden_dim, None],
+                fx.make_layout(OUT_TILE, (OUT_ROW_ELEMS, 1)),
+                OUT_TILE,
                 num_warps=warp_num_per_block,
             )
-            fx.copy(atom_out, lds_out_view(buf), gt_out)
+            blk_out = fx.zipped_divide(coord_out, OUT_TILE)[None, (0, None)]
+            tOs, tOg = fx.rocdl.cdna5.tdm_partition(
+                atom_out,
+                wave,
+                fx.make_layout(warp_num_per_block, 1),
+                lds_out_view(buf),
+                blk_out,
+            )
+            fx.copy(atom_out, tOs[None, 0], tOg[None, 0])
 
         # Prime buffer 0. bid < block_num, so work // block_num is the trip count
         # and its parity picks the buffer -- trip 0 reads what this load writes.
