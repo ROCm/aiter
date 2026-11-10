@@ -37,6 +37,7 @@ def exact_sigmoid_biased_topk(
         routed_scaling_factor,
         N_EXPERTS=num_experts,
         TOPK=topk,
+        TOPK_PAD=triton.next_power_of_2(topk),
         BLOCK_N=triton.next_power_of_2(num_experts),
         NEED_RENORM=need_renorm,
         HAS_NUM_VALID_ROWS=num_valid_rows is not None,
