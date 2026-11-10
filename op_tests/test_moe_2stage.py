@@ -2659,7 +2659,6 @@ def run_blockscale_limit_cases():
     )
 
 
-
 def test_swiglu_oai_flat_dispatch():
     """MiniMax-M3 TP4 a16w4 decode (6144/768/129/top-5): tokens 1/2/4 -> asm
     16x32, 8 -> asm 16x128 (SwiGLU OAI FLAT), 16 -> FlyDSL 2-stage. The asm
