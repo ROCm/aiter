@@ -121,6 +121,7 @@ class DispatchSlot(IntEnum):
     READY_TILE_TAIL = 46
     P2P_READY_TILE_TAIL = 47
     TILE_EXPECTED_SHARED = 48
+    PAYLOAD_CLAIM = 49
 
 
 DISPATCH_TABLE_SIZE = max(DispatchSlot) + 1
@@ -620,12 +621,17 @@ def emit_dispatch_payload(
     *, num_waves, fz_epr, fz_k, fz_mtpr, fz_rank, fz_total_experts, fz_nbytes, fz_n_i32, fz_safe_end_i32,
     fz_scale_n_i32, fz_enable_scales, addr_disp, addr_in_tok, addr_in_wts, addr_in_sc, dispatch_blocks,
     producer_slot, parity, expected, producers_per_destination, chunks_per_destination, payload_chunk_rows,
+    claim_dynamic=False, addr_claim=0, lds_claim=0, batch_copy=0, one_fence=False,
 ):
 # fmt: on
     """Produce independently publishable expert payloads from a compact plan.
 
     Each (expert, chunk of payload_chunk_rows source rows) is one task; a chunk publishes the destination tiles
     it completes, and the last chunk of an expert publishes the expert.
+
+    ``claim_dynamic``: tasks are claimed from a per-destination counter instead of a static stride.
+    ``batch_copy``: rows a wave reads before it writes any of them (0: one row at a time).
+    ``one_fence``: the release of the tile publication also covers the chunk and expert counters.
     """
     rdisp = AddrBuffer(addr_disp)
 
@@ -663,14 +669,18 @@ def emit_dispatch_payload(
     row_stride = fx.Int32(num_waves)
 
     def _publish_task(destination, local_expert, ge):
-        comm_ops.fence_system_release()
+        if const_expr(not one_fence):
+            comm_ops.fence_system_release()
         ready_remote = load_at(AddrBuffer(p_payload_ready), destination, fx.Int64, 1)
         ready_index = parity * fx.Int32(fz_epr) + local_expert
         comm_ops.atomic_add_system(ready_remote + fx.Int64(ready_index) * fx.Int64(4), fx.Int32(1))
         store_at(fx.Int32(0), r_lh, ge)
 
     def _finish_task(destination, local_expert, ge, num_chunks):
-        comm_ops.fence_system_release()
+        # one_fence: _publish_tile_range released this task's last payload store system-wide, and every
+        # earlier chunk of the expert did the same before it counted into PAYLOAD_CHUNK_DONE.
+        if const_expr(not one_fence):
+            comm_ops.fence_system_release()
         completed = fx.Int32(
             comm_ops.atomic_add_agent(a_chunk_done + fx.Int64(ge) * fx.Int64(4), fx.Int32(1))
         )
@@ -696,7 +706,8 @@ def emit_dispatch_payload(
         remote_ready_rows = load_at(AddrBuffer(p_payload_ready_rows), producer_destination, fx.Int64, 1)
         destination_ready_rows = load_at(AddrBuffer(remote_ready_rows), fx.Int32(0), fx.Int32, 1)
     fx.barrier()
-    for task_index in range(task0, task_limit, task_stride):
+
+    def _run_task(task_index):
         chunk_id = task_index // fx.Int32(fz_epr)
         rotated_expert = task_index - chunk_id * fx.Int32(fz_epr)
         rotation = (chunk_id * fx.Int32(17)) % fx.Int32(fz_epr)
@@ -728,7 +739,64 @@ def emit_dispatch_payload(
         token_remote = load_at(AddrBuffer(p_rx), destination, fx.Int64, 1)
         if const_expr(fz_enable_scales):
             scale_remote_rsrc = AddrBuffer(load_at(AddrBuffer(p_sc), destination, fx.Int64, 1))
-        for row in range(row_begin + row0, row_end, row_stride):
+        if const_expr(batch_copy):
+            # gfx9's vmcnt counts loads and stores alike, so every wait for a load also drains the wave's
+            # outstanding remote stores: issue all loads of batch_copy rows, wait once, then all their stores.
+            assert fz_n_i32 % 256 == 0 and (not fz_enable_scales or fz_scale_n_i32 % 4 == 0)
+            batch_rows = int(batch_copy)
+            lane_offset = lane * fx.Int32(4)
+            group_rows = row_stride * fx.Int32(64)
+            if const_expr(fz_enable_scales):
+                scale_valid = lane_offset < fx.Int32(fz_scale_n_i32)
+                scale_offset = scale_valid.select(lane_offset, fx.Int32(0))
+            for group in range(row_begin + row0, row_end, group_rows):
+                my_row = group + lane * row_stride
+                safe_row = (my_row < row_end).select(my_row, group)
+                wk_vec = load_at(r_pair, source_base + safe_row, fx.Int32, 1)
+                group_count = (row_end - group + row_stride - fx.Int32(1)) // row_stride
+                group_count = (group_count < fx.Int32(64)).select(group_count, fx.Int32(64))
+                for j in range(fx.Int32(0), group_count, batch_rows):
+                    rows = []
+                    for r in range_constexpr(batch_rows):
+                        index = j + fx.Int32(r)
+                        row_valid = index < group_count
+                        wk = fx.Int32(fx.rocdl.readlane(T.i32, wk_vec, row_valid.select(index, j)))
+                        source_token = wk // fx.Int32(fz_k)
+                        weight = load_at(r_wts, wk, fx.Float32, 1)
+                        source_rsrc = AddrBuffer(addr_in_tok + fx.Int64(source_token) * fx.Int64(fz_nbytes))
+                        values = []
+                        for c in range_constexpr(fz_n_i32 // 256):
+                            values.append(load_at(source_rsrc, lane_offset + fx.Int32(c * 256), fx.Int32, 4))
+                        scale = None
+                        if const_expr(fz_enable_scales):
+                            scale = load_at(
+                                AddrBuffer(addr_in_sc), source_token * fx.Int32(fz_scale_n_i32) + scale_offset,
+                                fx.Int32, 4,
+                            )
+                        rows.append((row_valid, wk, source_token, weight, values, scale, group + index * row_stride))
+                    for r in range_constexpr(batch_rows):
+                        row_valid, wk, source_token, weight, values, scale, row = rows[r]
+                        if row_valid:
+                            destination_row = destination_base + row
+                            destination_rsrc = AddrBuffer(
+                                token_remote + fx.Int64(destination_row) * fx.Int64(fz_nbytes))
+                            for c in range_constexpr(fz_n_i32 // 256):
+                                store_at(values[c], destination_rsrc, lane_offset + fx.Int32(c * 256))
+                            if const_expr(fz_enable_scales):  # noqa: SIM102
+                                if scale_valid:
+                                    store_at(scale, scale_remote_rsrc,
+                                             destination_row * fx.Int32(fz_scale_n_i32) + scale_offset)
+                            if lane == fx.Int32(0):
+                                topk_slot = wk % fx.Int32(fz_k)
+                                source_encoding = (
+                                    (fx.Int32(fz_rank * fz_mtpr) + source_token) | (topk_slot << fx.Int32(24)))
+                                weight_bits = fx.Vector.from_elements([weight], fx.Float32).bitcast(fx.Int32)[0]
+                                store_at(weight_bits, wts_remote_rsrc, destination_row)
+                                store_at(source_encoding, srcmap_remote_rsrc, destination_row)
+        plain_end = row_end
+        if const_expr(batch_copy):
+            plain_end = row_begin
+        for row in range(row_begin + row0, plain_end, row_stride):
             wk_lane = fx.Int32(0)
             if lane == fx.Int32(0):
                 wk_lane = load_at(r_pair, source_base + row, fx.Int32, 1)
@@ -786,6 +854,24 @@ def emit_dispatch_payload(
                 )
                 _finish_task(destination, local_expert, ge, num_chunks)
             fx.barrier()
+
+    if const_expr(claim_dynamic):
+        claim_slot = lds_typed_ptr(fx.Int32(lds_claim), T.i32)
+        claim_addr = fx.Int64(addr_claim) + fx.Int64(producer_destination) * fx.Int64(64)
+        claim_active = fx.Int32(1) == fx.Int32(1)
+        while claim_active:
+            fx.barrier()
+            if tid == fx.Int32(0):
+                task = fx.Int32(comm_ops.atomic_add_agent(claim_addr, fx.Int32(1)))
+                fx.ptr_store((task < task_limit).select(task, fx.Int32(-1)), claim_slot)
+            fx.barrier()
+            task_b = fx.Int32(fx.ptr_load(claim_slot, result_type=T.i32))
+            if task_b >= fx.Int32(0):
+                _run_task(task_b)
+            claim_active = task_b >= fx.Int32(0)
+    else:
+        for task_index in range(task0, task_limit, task_stride):
+            _run_task(task_index)
 
 
 _BUFFER_OFFSET_ABI_BYTES = 1 << 31
@@ -1179,6 +1265,9 @@ _SC0_CACHE = 1
 # enough to narrow the per-CTA drain tail; the kernel takes them only when the received rows warrant it.
 # Keyed by (model_dim, inter_dim): Kimi-K2.6's shorter GEMM2 K and top-8 rows favour chunks of 2.
 LARGE_M_G2_CHUNK = {(V4_MODEL_DIM, V4_INTER_DIM): 3, (K26_MODEL_DIM, K26_INTER_DIM): 2}
+# Payload dispatch options: rows are copied in batches (batch_copy) with one release per task (one_fence), and
+# helper CTAs move payload before they join GEMM1.
+LARGE_M_DISPATCH = {"helper_blocks": 8, "batch_copy": 1, "one_fence": True}
 
 
 def large_m_kernel_specs(
@@ -1250,6 +1339,7 @@ def compile_mega_moe_stage1(
     async_a_copy: bool = False, use_tile_resource: bool = True,
     waves_per_eu_hint: int = 2, num_cu: int = 256, num_dispatch_cu: int = 32, b_nt: int = -1,
     work_shards: int = 4, payload_chunk_rows: int = 384, swiglu_limit: float = 0.0, fused_g2_chunk: int = 1,
+    helper_blocks: int = 0, batch_copy: int = 0, one_fence: bool = False,
 ):
     # fused_stage2 / fused_combine are hashable (key, value) specs and part of the compile key.
     arch = get_gfx_runtime()
@@ -1271,10 +1361,17 @@ def compile_mega_moe_stage1(
     assert dispatch_blocks % fuse_npes == 0, "num_dispatch_cu must be divisible by fuse_npes"
     assert payload_chunk_rows > 0 and payload_chunk_rows % sort_block_m == 0
     planner_blocks = 1
+    # Helpers are payload-only producers, one destination each, that join GEMM1 once their destination's
+    # payload tasks are all claimed; with them the producers also claim tasks from a per-destination counter.
+    helper_blocks = int(helper_blocks)
+    payload_dynamic = helper_blocks > 0
+    assert helper_blocks % fuse_npes == 0, "helper_blocks must be divisible by fuse_npes"
+    assert not payload_dynamic or dispatch_blocks > 32, "dynamic payload claiming needs num_dispatch_cu > 32"
+    batch_copy = int(batch_copy)
     # Keep the fused grid on an exact CU multiple instead of appending control/producer CTAs as a tail.
-    grid_x = num_cu * grid_mult - planner_blocks - dispatch_blocks
+    grid_x = num_cu * grid_mult - planner_blocks - dispatch_blocks - helper_blocks
     assert grid_x > 0, "consumer grid must remain positive"
-    launch_grid_x = planner_blocks + dispatch_blocks + grid_x
+    launch_grid_x = planner_blocks + dispatch_blocks + helper_blocks + grid_x
     assert launch_grid_x <= num_cu * 33 + 1
     M_REPEAT = sort_block_m // 16
     NUM_ACC_N = n_per_wave // 16
@@ -1373,6 +1470,9 @@ def compile_mega_moe_stage1(
         f"aa{int(async_a_copy)}"
         f"_tr{int(use_tile_resource)}wpe{waves_per_eu_hint}_bnt{b_cache_modifier}_ws{WORK_SHARDS}"
         f"_pc{payload_chunk_rows}"
+        f"{f'_h{helper_blocks}' if helper_blocks else ''}"
+        f"{f'_bc{batch_copy}' if batch_copy else ''}"
+        f"{'_1f' if one_fence else ''}"
         f"{swiglu_suffix}"
         f"_s2bm{S2_BM}bn{S2_BN}nw{S2_NW}c{G2_CHUNK}_{S2_KEY}_combu{C_U}"
     )
@@ -1462,6 +1562,13 @@ def compile_mega_moe_stage1(
         owner = ticket == fx.Int32(0)
         producer = (ticket > fx.Int32(0)) & (ticket <= fx.Int32(dispatch_blocks))
         producer_slot = ticket - fx.Int32(1)
+        if const_expr(payload_dynamic):
+            a_payload_claim = _disp_ptr(DispatchSlot.PAYLOAD_CLAIM)
+            # A free LDS word (the ticket holds pool offset 0) broadcasts each claimed task to the CTA.
+            claim_lds = fx.Int32(fx.ptrtoint(lds.pool.ptr)) + fx.Int32(64)
+        else:
+            a_payload_claim = fx.Int64(0)
+            claim_lds = fx.Int32(0)
 
         if owner:
             next_parity_lane = fx.Int32(0)
@@ -1499,6 +1606,10 @@ def compile_mega_moe_stage1(
                     _buffer_store(work_head_rsrc, fx.Int32(shard * 16), fx.Int32(0), fx.Int32)
                 _buffer_store(_make_buffer_from_addr(a_work_tail, fx.Int32), fx.Int32(0), fx.Int32(0), fx.Int32)
                 _buffer_store(_make_buffer_from_addr(a_group_done, fx.Int32), fx.Int32(0), fx.Int32(0), fx.Int32)
+                if const_expr(payload_dynamic):
+                    claim_rsrc = _make_buffer_from_addr(a_payload_claim, fx.Int32)
+                    for destination in range_constexpr(fz_npes):
+                        _buffer_store(claim_rsrc, fx.Int32(destination * 16), fx.Int32(0), fx.Int32)
             # Rank-local G1 completion entries and G2 claim heads restart every launch; they are
             # cleared before the gate so no CTA of this launch can observe stale values.
             ctr_rsrc = _make_buffer_from_addr(addr_mtile_ctr, fx.Int32)
@@ -1579,9 +1690,42 @@ def compile_mega_moe_stage1(
                     producer_slot=producer_slot, parity=payload_parity, expected=payload_expected,
                     producers_per_destination=producers_per_destination, payload_chunk_rows=payload_chunk_rows,
                     chunks_per_destination=chunks_per_destination,
+                    claim_dynamic=payload_dynamic, addr_claim=a_payload_claim, lds_claim=claim_lds,
+                    batch_copy=batch_copy, one_fence=one_fence,
                 )
         addr_tile_ready = _disp_ptr(DispatchSlot.TILE_READY)
         addr_tile_expected = _disp_ptr(DispatchSlot.TILE_EXPECTED)
+        if const_expr(helper_blocks > 0):
+            helper = (ticket > fx.Int32(dispatch_blocks)) & (ticket <= fx.Int32(dispatch_blocks + helper_blocks))
+            if helper:
+                helper_destination = (ticket - fx.Int32(1 + dispatch_blocks)) % fx.Int32(fz_npes)
+                if tid == fx.Int32(0):
+                    pair_order_ready = _disp_ptr(DispatchSlot.PAIR_ORDER_READY)
+                    comm_ops.wait_i32_until_equals(
+                        pair_order_ready + fx.Int64(payload_parity) * fx.Int64(4), payload_expected)
+                    helper_plan_ready = _disp_ptr(DispatchSlot.PLAN_READY)
+                    comm_ops.wait_i32_until_equals(
+                        helper_plan_ready
+                        + fx.Int64(payload_parity * fx.Int32(fz_npes) + fx.Int32(fz_rank)) * fx.Int64(4),
+                        payload_expected)
+                    comm_ops.fence_system_acquire()
+                fx.barrier()
+                helper_chunks = _buffer_load(
+                    _make_buffer_from_addr(a_payload_chunks_per_destination, fx.Int32),
+                    helper_destination, fx.Int32,
+                )
+                emit_dispatch_payload(
+                    num_waves=NUM_WAVES, fz_epr=fz_epr, fz_k=fz_k, fz_mtpr=fz_mtpr, fz_rank=fz_rank,
+                    fz_total_experts=fz_total_experts, fz_nbytes=fz_nbytes, fz_n_i32=fz_n_i32,
+                    fz_safe_end_i32=fz_safe_end_i32, fz_scale_n_i32=fz_scale_n_i32,
+                    fz_enable_scales=fz_enable_scales, addr_disp=addr_disp, addr_in_tok=addr_in_tok,
+                    addr_in_wts=addr_in_wts, addr_in_sc=addr_in_sc, dispatch_blocks=dispatch_blocks,
+                    producer_slot=helper_destination, parity=payload_parity, expected=payload_expected,
+                    producers_per_destination=fx.Int32(1), payload_chunk_rows=payload_chunk_rows,
+                    chunks_per_destination=helper_chunks,
+                    claim_dynamic=True, addr_claim=a_payload_claim, lds_claim=claim_lds,
+                    batch_copy=batch_copy, one_fence=one_fence,
+                )
         wave_id = fx.thread_idx.x // 64
 
         w_rsrc = _make_buffer(w, fx.Int32, 4)
@@ -1938,7 +2082,7 @@ def run_mega_moe_stage1(out, x, w, scale_x, scale_w, sorted_token_ids, expert_id
     fused_combine_args, sort_block_m=32, tile_n=256, tile_k=256, num_waves=4, grid_mult=4, pipe_weights=True,
     mfma_amajor=False, swizzle_a=True, async_a_copy=False, num_dispatch_cu=32,
     use_tile_resource=True, waves_per_eu_hint=2, b_nt=-1, work_shards=4, payload_chunk_rows=384,
-    swiglu_limit=0.0, fused_g2_chunk=1, preload=False):
+    swiglu_limit=0.0, fused_g2_chunk=1, preload=False, helper_blocks=0, batch_copy=0, one_fence=False):
     if len(fused_args) != 14:
         raise ValueError("fused Stage2 needs (mtile_ctr, 13 Stage2 runtime addresses)")
     mtile_ctr, s2_args = fused_args[0], tuple(fused_args[1:])
@@ -1955,6 +2099,7 @@ def run_mega_moe_stage1(out, x, w, scale_x, scale_w, sorted_token_ids, expert_id
         waves_per_eu_hint=waves_per_eu_hint, num_cu=num_cu, num_dispatch_cu=num_dispatch_cu,
         b_nt=b_nt, work_shards=int(work_shards), payload_chunk_rows=payload_chunk_rows,
         swiglu_limit=swiglu_limit, fused_g2_chunk=int(fused_g2_chunk),
+        helper_blocks=int(helper_blocks), batch_copy=int(batch_copy), one_fence=bool(one_fence),
     )
     # preload: compile and load without dispatching (AOT bundles).
     (_preload_compiled if preload else _run_compiled)(
@@ -2106,6 +2251,7 @@ class LargeMRuntime:
             "payload_blocks_per_destination": torch.zeros(self.world_size, dtype=torch.int32, device=self.dev),
             "payload_chunks_per_destination": torch.zeros(self.world_size, dtype=torch.int32, device=self.dev),
             "group_done": torch.zeros(self.world_size, dtype=torch.int32, device=self.dev),
+            "payload_claim": torch.zeros(self.world_size * 16, dtype=torch.int32, device=self.dev),
         }
         workspace["bigcnt"] = op._sym((self.world_size * self.epr,), torch.int32)
         workspace["count_done"] = op._sym((2 * self.world_size,), torch.int32)
@@ -2191,6 +2337,7 @@ class LargeMRuntime:
         table[DispatchSlot.PAYLOAD_CHUNKS_PER_DESTINATION] = workspace[
             "payload_chunks_per_destination"
         ].data_ptr()
+        table[DispatchSlot.PAYLOAD_CLAIM] = workspace["payload_claim"].data_ptr()
         return torch.tensor(table, dtype=torch.int64, device=self.dev)
 
     def select_layer_state(self, layer_slot: int) -> None:
@@ -2386,6 +2533,7 @@ class LargeMRuntime:
             "fused_combine": c_spec,
             "fused_combine_args": c_args,
             "fused_g2_chunk": LARGE_M_G2_CHUNK[(self.model_dim, self.inter_dim)],
+            **LARGE_M_DISPATCH,
         }
         return s1, kw
 

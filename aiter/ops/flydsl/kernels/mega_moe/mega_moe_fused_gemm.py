@@ -190,7 +190,9 @@ def _large_config(
         tile_n=512 if inter_dim >= 2048 else 256,
         num_waves=8,
         grid_mult=1,
-        num_dispatch_cu=_scale_dispatch_cu(96, experts_per_rank),
+        # Payload helper CTAs (mega_moe_large_m.LARGE_M_DISPATCH) share the dispatch, so fewer
+        # producers leave more CTAs to GEMM1.
+        num_dispatch_cu=_scale_dispatch_cu(48, experts_per_rank),
         mfma_amajor=True,
         async_a_copy=True,
         use_tile_resource=True,
