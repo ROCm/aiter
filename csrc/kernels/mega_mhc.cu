@@ -46,7 +46,7 @@ inline constexpr Options options[] = {
     {4, 4, 2, 4, 0, 0, 4, false},     //  9 mid1024
     {2, 2, 2, 2, 0, 0, 4, false},     // 10 mid2048
     {1, 4, 1, 4, 0, 0, 4, true},      // 11 large
-    {1, 4, 1, 4, 4160, 0, 4, true},   // 12 tail (large + generic K=32)
+    {1, 4, 1, 4, 0, 0, 4, true},      // 12 tail (large + generic K=32)
     {0, 2, 1, 2, 0, 0, 4, false},     // 13 generic (runtime K)
 };
 
@@ -1512,11 +1512,11 @@ __device__ __forceinline__ void large_tiles(const bf16* residual,
         return tile;
     };
     constexpr int STEP = NC * BK;
-    // Four-wave post tiles alternate two tile and fn buffers (PINGPONG below).
-    // Their two groups also alternate STEP-column chunks, so each k-step reads
-    // and writes 2 * STEP contiguous columns per row and stream.
-    constexpr bool PINGPONG   = HAS_POST && !EIGHT_WAVE_POST;
-    constexpr bool INTERLEAVE = PINGPONG && GROUPS == 2;
+    // Four-wave tiles alternate two tile and fn buffers (PINGPONG below). Post
+    // tiles with two groups also alternate STEP-column chunks, so each k-step
+    // reads and writes 2 * STEP contiguous columns per row and stream.
+    constexpr bool PINGPONG   = !EIGHT_WAVE_POST;
+    constexpr bool INTERLEAVE = HAS_POST && PINGPONG && GROUPS == 2;
     auto kcol = [&](int ki) { return INTERLEAVE ? 2 * ki + group * STEP : begin + ki; };
     // Prefetches past the last k-step fall outside every buffer.
     auto kload = [&](int ki) { return ki < hidden_part ? kcol(ki) : 1 << 20; };
@@ -1921,13 +1921,14 @@ __device__ __forceinline__ void generic_tiles(bf16* residual_out,
                                               float sinkhorn_eps,
                                               float post_mult,
                                               float norm_eps,
-                                              int sinkhorn_repeat)
+                                              int sinkhorn_repeat,
+                                              int first_block = 0)
 {
 #if defined(__gfx950__) || defined(__gfx942__)
     constexpr int THREADS = 256;
     const int hidden      = H ? H : hidden_arg;
     const int split_k     = FIXED_SPLIT ? FIXED_SPLIT : split_arg;
-    const int bid         = VARIANT == 12 && HAS_POST ? blockIdx.x - 256 : blockIdx.x;
+    const int bid         = blockIdx.x - first_block;
     const int token_block = split_k > 1 ? (bid / 8 / split_k) * 8 + bid % 8 : bid;
     if(token_block * BM >= tokens)
         return;
@@ -2331,122 +2332,33 @@ __global__ __launch_bounds__((launch_threads<H, VARIANT, HAS_POST, POST_STREAMS>
     }
     else
     {
-        if constexpr(HAS_POST)
-        {
-            // The first CU round handles the body; separate blocks cover the
-            // tail as CUs become available. All blocks still use one launch.
-            if(blockIdx.x < 256)
-            {
-                large_tiles<H, VARIANT, MXFP8, 16, 2560, HAS_POST, IDENTITY_PRE, 4>(residual,
-                                                                                    sublayer,
-                                                                                    post_mix,
-                                                                                    comb_mix,
-                                                                                    pre_mix,
-                                                                                    fn_packed,
-                                                                                    4096,
-                                                                                    1,
-                                                                                    residual_out,
-                                                                                    post_out,
-                                                                                    comb_out,
-                                                                                    layer_input,
-                                                                                    quant_out,
-                                                                                    quant_scale,
-                                                                                    next_pre,
-                                                                                    hc_scale,
-                                                                                    hc_base,
-                                                                                    norm_weight,
-                                                                                    partials,
-                                                                                    counters,
-                                                                                    H,
-                                                                                    rms_eps,
-                                                                                    pre_eps,
-                                                                                    sinkhorn_eps,
-                                                                                    post_mult,
-                                                                                    norm_eps,
-                                                                                    20);
-            }
-            else
-            {
-                generic_tiles<H, VARIANT, MXFP8, 32, HAS_POST, IDENTITY_PRE>(
-                    residual_out + 4096LL * 4 * H,
-                    post_out + 4096LL * 4,
-                    comb_out + 4096LL * 16,
-                    layer_input + 4096LL * H,
-                    quant_out + (MXFP8 ? 4096LL * H : 0),
-                    quant_scale + (MXFP8 ? 4096LL * (H / 32) : 0),
-                    next_pre + 4096LL * 4,
-                    residual + 4096LL * 4 * H,
-                    fn_packed,
-                    hc_scale,
-                    hc_base,
-                    IDENTITY_PRE ? pre_mix : pre_mix + 4096LL * 4,
-                    HAS_POST ? sublayer + 4096LL * H : sublayer,
-                    HAS_POST ? post_mix + 4096LL * 4 : post_mix,
-                    HAS_POST ? comb_mix + 4096LL * 16 : comb_mix,
-                    norm_weight,
-                    partials,
-                    counters,
-                    64,
-                    H,
-                    32,
-                    rms_eps,
-                    pre_eps,
-                    sinkhorn_eps,
-                    post_mult,
-                    norm_eps,
-                    20);
-            }
-        }
-        else
-        {
-            large_tiles<H, VARIANT, MXFP8, 16, 0, HAS_POST, IDENTITY_PRE>(residual,
-                                                                          sublayer,
-                                                                          post_mix,
-                                                                          comb_mix,
-                                                                          pre_mix,
-                                                                          fn_packed,
-                                                                          4096,
-                                                                          1,
-                                                                          residual_out,
-                                                                          post_out,
-                                                                          comb_out,
-                                                                          layer_input,
-                                                                          quant_out,
-                                                                          quant_scale,
-                                                                          next_pre,
-                                                                          hc_scale,
-                                                                          hc_base,
-                                                                          norm_weight,
-                                                                          partials,
-                                                                          counters,
-                                                                          H,
-                                                                          rms_eps,
-                                                                          pre_eps,
-                                                                          sinkhorn_eps,
-                                                                          post_mult,
-                                                                          norm_eps,
-                                                                          20);
-            __syncthreads();
+        // Whole CU rounds of 16-row tiles form the body. The one to eight
+        // remaining tiles are split 32 ways over H instead of taking a sparse
+        // extra round.
+        const int body       = tokens / 4096 * 4096;
+        const int body_tiles = body / 16;
+        const int64_t b      = body;
+        auto tail            = [&](int first_block) {
             generic_tiles<H, VARIANT, MXFP8, 32, HAS_POST, IDENTITY_PRE>(
-                residual_out + 4096LL * 4 * H,
-                post_out + 4096LL * 4,
-                comb_out + 4096LL * 16,
-                layer_input + 4096LL * H,
-                quant_out + (MXFP8 ? 4096LL * H : 0),
-                quant_scale + (MXFP8 ? 4096LL * (H / 32) : 0),
-                next_pre + 4096LL * 4,
-                residual + 4096LL * 4 * H,
+                residual_out + b * 4 * H,
+                post_out + b * 4,
+                comb_out + b * 16,
+                layer_input + b * H,
+                quant_out + (MXFP8 ? b * H : 0),
+                quant_scale + (MXFP8 ? b * (H / 32) : 0),
+                next_pre + b * 4,
+                residual + b * 4 * H,
                 fn_packed,
                 hc_scale,
                 hc_base,
-                IDENTITY_PRE ? pre_mix : pre_mix + 4096LL * 4,
-                HAS_POST ? sublayer + 4096LL * H : sublayer,
-                HAS_POST ? post_mix + 4096LL * 4 : post_mix,
-                HAS_POST ? comb_mix + 4096LL * 16 : comb_mix,
+                IDENTITY_PRE ? pre_mix : pre_mix + b * 4,
+                HAS_POST ? sublayer + b * H : sublayer,
+                HAS_POST ? post_mix + b * 4 : post_mix,
+                HAS_POST ? comb_mix + b * 16 : comb_mix,
                 norm_weight,
                 partials,
                 counters,
-                64,
+                tokens - body,
                 H,
                 32,
                 rms_eps,
@@ -2454,7 +2366,50 @@ __global__ __launch_bounds__((launch_threads<H, VARIANT, HAS_POST, POST_STREAMS>
                 sinkhorn_eps,
                 post_mult,
                 norm_eps,
+                20,
+                first_block);
+        };
+        constexpr int BODY_STAGE = HAS_POST ? LARGE_STAGE : 0;
+        if(!HAS_POST || static_cast<int>(blockIdx.x) < body_tiles)
+            large_tiles<H, VARIANT, MXFP8, 16, BODY_STAGE, HAS_POST, IDENTITY_PRE, POST_STREAMS>(
+                residual,
+                sublayer,
+                post_mix,
+                comb_mix,
+                pre_mix,
+                fn_packed,
+                body,
+                1,
+                residual_out,
+                post_out,
+                comb_out,
+                layer_input,
+                quant_out,
+                quant_scale,
+                next_pre,
+                hc_scale,
+                hc_base,
+                norm_weight,
+                partials,
+                counters,
+                H,
+                rms_eps,
+                pre_eps,
+                sinkhorn_eps,
+                post_mult,
+                norm_eps,
                 20);
+        // With post, separate blocks cover the tail as CUs become available.
+        // Without post, the first CU round also covers the tail.
+        if constexpr(HAS_POST)
+        {
+            if(static_cast<int>(blockIdx.x) >= body_tiles)
+                tail(body_tiles);
+        }
+        else if(blockIdx.x < 256)
+        {
+            __syncthreads();
+            tail(0);
         }
     }
 #endif
@@ -2582,7 +2537,8 @@ void launch_mega_mhc(aiter_tensor_t& residual_out,
             AITER_CHECK(t <= StreamTuning::decode_rows, "token count exceeds decode tile");
     }
     if constexpr(VARIANT == 12)
-        AITER_CHECK(t == 4160, "two-phase tail requires T=4160");
+        AITER_CHECK(blocks > 256 && blocks % 256 >= 1 && blocks % 256 <= 8,
+                    "split tail requires 1..8 tiles past whole CU rounds");
     if(t == 0)
         return;
     const hipStream_t stream = getCurrentHIPStream();
@@ -2591,11 +2547,11 @@ void launch_mega_mhc(aiter_tensor_t& residual_out,
     (KernelTuning<H, VARIANT, POST>::distributed ? KernelTuning<H, VARIANT, POST>::split : split_k)
 #define LAUNCH(POST, IDENTITY, ROWS, STAGE, STREAMS)                                   \
     mega_mhc_kernel<H, VARIANT, MXFP8, POST, IDENTITY, ROWS, STAGE, STREAMS>           \
-        <<<dim3(VARIANT == 12            ? (POST ? 512 : 256)                          \
+        <<<dim3(VARIANT == 12            ? blocks / 256 * 256 + (POST ? 256 : 0)       \
                 : KERNEL_SPLIT(POST) > 1 ? ((blocks + 7) / 8) * 8 * KERNEL_SPLIT(POST) \
                                          : (t + ROWS - 1) / ROWS),                     \
            (launch_threads<H, VARIANT, POST, STREAMS>),                                \
-           0,                                                                          \
+           POST ? 0 : tail_lds_reserve,                                                \
            stream>>>(static_cast<const bf16*>(residual.data_ptr()),                    \
                      static_cast<const bf16*>(sublayer_out.data_ptr()),                \
                      static_cast<const float*>(post_mix.data_ptr()),                   \
@@ -2623,9 +2579,9 @@ void launch_mega_mhc(aiter_tensor_t& residual_out,
                      hc_post_mult,                                                     \
                      norm_eps,                                                         \
                      sinkhorn_repeat)
-    // Tuned for gfx950's 256 CUs. A sparse final CU round loses more to
-    // scheduling than M/weight reuse or LDS staging saves. All token counts
-    // remain dynamic; require at least 15/16 of the final round to be full.
+    // Tuned for gfx950's 256 CUs. Without post, a sparse final CU round loses
+    // more to scheduling than M/weight reuse or LDS staging saves. All token
+    // counts remain dynamic; require at least 15/16 of the final round to be full.
     const auto full_round = [](int workgroups) {
         const int tail = workgroups % 256;
         return tail == 0 || tail >= 240;
@@ -2633,33 +2589,37 @@ void launch_mega_mhc(aiter_tensor_t& residual_out,
     constexpr int no_post_stage = H == 4096 ? 3072 : 4096;
     const bool stage_large      = blocks <= 256 || full_round(blocks);
     const bool use_m32          = t >= 8192 && full_round((t + 31) / 32);
-#define DISPATCH(POST, IDENTITY)                              \
-    if constexpr(VARIANT == 11)                               \
-    {                                                         \
-        if(!POST && use_m32)                                  \
-        {                                                     \
-            LAUNCH(POST, IDENTITY, (POST ? 16 : 32), 0, 2);   \
-        }                                                     \
-        else if(stage_large)                                  \
-        {                                                     \
-            if constexpr(POST)                                \
-            {                                                 \
-                if(blocks <= 256)                             \
-                    LAUNCH(POST, IDENTITY, 16, 3584, 4);      \
-                else                                          \
-                    LAUNCH(POST, IDENTITY, 16, 3584, 2);      \
-            }                                                 \
-            else                                              \
-                LAUNCH(POST, IDENTITY, 16, no_post_stage, 2); \
-        }                                                     \
-        else                                                  \
-        {                                                     \
-            LAUNCH(POST, IDENTITY, 16, 0, 2);                 \
-        }                                                     \
-    }                                                         \
-    else                                                      \
-    {                                                         \
-        LAUNCH(POST, IDENTITY, 16, 0, 2);                     \
+    // Without post, keep one tail-variant block per CU: a block running the
+    // split tail beside a body block intermittently corrupted that body's
+    // collapse.
+    constexpr int tail_lds_reserve = VARIANT == 12 ? 80 * 1024 : 0;
+#define DISPATCH(POST, IDENTITY)                          \
+    if constexpr(VARIANT == 11 && POST)                   \
+    {                                                     \
+        if(blocks <= 256)                                 \
+            LAUNCH(POST, IDENTITY, 16, 3584, 4);          \
+        else                                              \
+            LAUNCH(POST, IDENTITY, 16, 3584, 2);          \
+    }                                                     \
+    else if constexpr(VARIANT == 11)                      \
+    {                                                     \
+        if(use_m32)                                       \
+            LAUNCH(POST, IDENTITY, 32, 0, 2);             \
+        else if(stage_large)                              \
+            LAUNCH(POST, IDENTITY, 16, no_post_stage, 2); \
+        else                                              \
+            LAUNCH(POST, IDENTITY, 16, 0, 2);             \
+    }                                                     \
+    else if constexpr(VARIANT == 12 && POST)              \
+    {                                                     \
+        if(blocks < 512)                                  \
+            LAUNCH(POST, IDENTITY, 16, 2560, 4);          \
+        else                                              \
+            LAUNCH(POST, IDENTITY, 16, 2560, 2);          \
+    }                                                     \
+    else                                                  \
+    {                                                     \
+        LAUNCH(POST, IDENTITY, 16, 0, 2);                 \
     }
     if(has_post)
     {
