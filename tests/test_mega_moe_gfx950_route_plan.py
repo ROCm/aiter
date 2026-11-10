@@ -136,10 +136,10 @@ def test_route_exclusions():
 def test_large_m_capacities_per_layout():
     shape = dict(world_size=8, model_dim=7168, inter_dim=3072)
     assert large_m_mtprs_for(**shape) == LARGE_M_MTPRS
-    # EP4 V4.1-Flash: the same capacities, all with the tune measured at 8192.
-    assert large_m_mtprs_for(world_size=4, model_dim=5120, inter_dim=2304) == LARGE_M_MTPRS
+    # EP4 V4.1-Flash: 8192 and 16384 (it faults at 1024..4096), both with the tune measured at 8192.
+    assert large_m_mtprs_for(world_size=4, model_dim=5120, inter_dim=2304) == (8192, 16384)
     tuned = _knob_table(select_fused_config(8192, 8192, **V41_FLASH_EP4_SHAPE))
-    for mtpr in LARGE_M_MTPRS:
+    for mtpr in large_m_mtprs_for(world_size=4, model_dim=5120, inter_dim=2304):
         for tokens in (0, 1, LARGE_M_MIN_TOKENS, mtpr):
             assert _knob_table(select_fused_config(tokens, mtpr, **V41_FLASH_EP4_SHAPE)) == tuned, (mtpr, tokens)
     with pytest.raises(ValueError):
@@ -148,7 +148,7 @@ def test_large_m_capacities_per_layout():
 
 @pytest.mark.parametrize("mtpr", MTPRS)
 def test_ep4_route_for_every_max_tokens(mtpr):
-    """EP4 V4.1-Flash: small-input up to 512 rows a rank, large-input from 513 at every large capacity."""
+    """EP4 V4.1-Flash: small-input up to 512 rows a rank, large-input from 513 at its large capacities."""
     plan = build_mega_moe_bundle_plan(
         mtpr,
         experts_per_rank=96,
@@ -158,7 +158,7 @@ def test_ep4_route_for_every_max_tokens(mtpr):
         small_m_mtprs=DEFAULT_SMALL_M_MTPRS,
         large_m=mtpr in large_m_mtprs_for(world_size=4, model_dim=5120, inter_dim=2304),
     )
-    assert plan.large_m == (mtpr in LARGE_M_MTPRS)
+    assert plan.large_m == (mtpr in (8192, 16384))
     for max_tokens in sorted({0, 1, 256, 257, 512, 513, 768, 1024, mtpr - 1, mtpr}):
         if not 0 <= max_tokens <= mtpr:
             continue

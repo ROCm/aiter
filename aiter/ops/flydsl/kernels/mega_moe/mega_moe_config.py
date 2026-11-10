@@ -82,6 +82,9 @@ DEFAULT_SMALL_M_MTPRS = (256, 512)
 # uniform tokens) and its source-indexed payload needs 1.75 GiB per GPU where
 # the large-input route-major payload needs 10.5 GiB.
 LARGE_M_MTPRS = (1024, 2048, 4096, 8192, 16384)
+# EP4 DeepSeek-V4.1-Flash takes its large-input tune at 8192 and 16384 only: on gfx950 the kernel faults
+# (illegal memory access) at 1024, 2048 and 4096.
+V41_FLASH_EP4_LARGE_M_MTPRS = (8192, 16384)
 # The fused kernels have no 2-token variant: 2 tokens take the 1-token config.
 FUSED_TOKEN_BUCKETS = tuple(b for b in TOKEN_BUCKETS if b != 2)
 # Below this many rows per rank the staged (or small-input) path is faster than
@@ -456,9 +459,11 @@ def fused_layout_supported(
 def large_m_mtprs_for(*, world_size: int, model_dim: int, inter_dim: int) -> tuple[int, ...]:
     """Instance capacities the large-input kernel is built for on a FUSED_LAYOUTS layout.
 
-    Every fused layout takes LARGE_M_MTPRS: each layout's large-input config is one tune at every capacity
-    (its knobs follow a launch's rows, not the capacity; see _tune_v41_flash_ep4_large).
+    EP8 DeepSeek-V4-Pro takes LARGE_M_MTPRS; EP4 DeepSeek-V4.1-Flash takes V41_FLASH_EP4_LARGE_M_MTPRS, the
+    capacities its one tune was measured at (see _tune_v41_flash_ep4_large).
     """
+    if (world_size, model_dim, inter_dim) == (4, 5120, 2304):
+        return V41_FLASH_EP4_LARGE_M_MTPRS
     return LARGE_M_MTPRS
 
 
@@ -1525,10 +1530,11 @@ def _tune_v41_flash_ep4_small(config: MegaMoEConfig, bucket: int) -> MegaMoEConf
 def _tune_v41_flash_ep4_large(config: MegaMoEConfig) -> MegaMoEConfig:
     """EP4 DeepSeek-V4.1-Flash large-input kernel (96 experts per rank), measured on gfx950 at MTPR 8192.
 
-    It serves every capacity in LARGE_M_MTPRS unchanged: the thresholds below are rows a rank of the launch
+    It serves 8192 and 16384 (V41_FLASH_EP4_LARGE_M_MTPRS) unchanged: the thresholds below are rows a rank of the launch
     (payload_small_tokens, presend_rows, the early_p_mid bound) and the payload geometry is sized by the plan, so a
     launch of N rows runs the same schedule at any capacity >= N. The capacity only sizes buffers (pair-order
     buckets, row stamps, P2P rows), all inside the 32-bit buffer offsets up to 16384 (LargeMRuntime checks them).
+    At 1024, 2048 and 4096 the kernel faults with an illegal memory access on gfx950, so those stay staged.
     """
     # One payload producer per destination leaves its ~16 MB a ~750 us copy at 2048 tokens a rank;
     # 12 split the destination's experts (-24%). XCD-affine GEMM2 claims share each W2 slab in one
