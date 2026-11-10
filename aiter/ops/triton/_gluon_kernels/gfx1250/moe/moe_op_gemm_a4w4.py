@@ -2228,21 +2228,19 @@ def _moe_gemm_a4w4_decode(
             [1, 8], [32 // OUT_TPW_N, OUT_TPW_N], [gl.num_warps(), 1], [1, 0]
         )
         out = gl.convert_layout(out, OUT_LAYOUT)
-        Y += start_m.to(index_type) * stride_y_m
-        offs_y_m = block_id * BLOCK_M + gl.arange(
-            0, BLOCK_M, layout=gl.SliceLayout(1, OUT_LAYOUT)
-        )
-        offs_y_n = pid_n * OUT_BLOCK_N + gl.arange(
-            0, OUT_BLOCK_N, layout=gl.SliceLayout(0, OUT_LAYOUT)
-        )
-        mask_y = (offs_y_m < M)[:, None] & (offs_y_n < yN)[None, :]
-        # Widen before the stride multiply. offs * stride is an int32 product
-        # otherwise, so a tile past 2**31 elements wraps and stores before Y
-        # even though start_m was already cast to index_type.
-        gl.store(
-            Y
-            + offs_y_m.to(index_type)[:, None] * stride_y_m
-            + offs_y_n.to(index_type)[None, :] * stride_y_n,
+        # buffer_store offsets are int32, so move the base to the tile start in
+        # index_type first; only the tile-local offsets go through int32.
+        tile_m = block_id * BLOCK_M
+        tile_n = pid_n * OUT_BLOCK_N
+        Y += (start_m + tile_m).to(index_type) * stride_y_m + tile_n.to(
+            index_type
+        ) * stride_y_n
+        offs_y_m = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, OUT_LAYOUT))
+        offs_y_n = gl.arange(0, OUT_BLOCK_N, layout=gl.SliceLayout(0, OUT_LAYOUT))
+        mask_y = (offs_y_m < M - tile_m)[:, None] & (offs_y_n < yN - tile_n)[None, :]
+        gl.amd.gfx1250.buffer_store(
             out,
+            Y,
+            offs_y_m[:, None] * stride_y_m + offs_y_n[None, :] * stride_y_n,
             mask=mask_y,
         )
