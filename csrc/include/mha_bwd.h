@@ -167,7 +167,7 @@ struct mha_bwd_args
 
 struct __attribute__((packed)) fmha_bwd_dqdkdv_args
 {
-    void* ptr_dq; // 0x00: dq or dq_acc
+    void* ptr_dq; // 0x00: dq or dq_acc; the gfx942 hdim_q 192 kernels write dq with q's strides
     p2 _p0;
     void* ptr_dk; // 0x10
     p2 _p1;
@@ -190,6 +190,7 @@ struct __attribute__((packed)) fmha_bwd_dqdkdv_args
     float log2e; // 0xa0
     p3 _p10;
     unsigned int seqlen_q; // 0xb0: s_seq_len_q
+                           //       group mode, gfx942 hdim_q 192 kernels: max_seqlen_q
     p3 _p11;
     unsigned int Ts; // 0xc0: s_Seqs_k*sub_K
     p3 _p12;
@@ -210,6 +211,7 @@ struct __attribute__((packed)) fmha_bwd_dqdkdv_args
     unsigned int Seqs_dk; // 0x140: s_Seqs_dk
     p3 _p20;
     unsigned int seqlen_k; // 0x150: batch mode
+                           //        group mode, gfx942 hdim_q 192 kernels: max_seqlen_k
     p3 _p21;
     unsigned int head_dim_q; // 0x160: batch&group mode for headdim padding
     p3 _p22;
@@ -263,30 +265,11 @@ struct __attribute__((packed)) fmha_bwd_dqdkdv_args
     p3 _p42;
     int mask_y; // 0x2b0
     p3 _p43;
-    // 0x2c0 - 0x2d0 are gfx1250 only; the other archs' kernels end at 0x2c0, except the gfx942
-    // hdim_q 192 kernels, which skip to 0x2e0.
+    // Everything from here on is gfx1250 only; the other archs' kernels end at 0x2c0.
     unsigned int nsplit; // 0x2c0: deterministic only, number of private dq_acc planes
     p3 _p44;
     unsigned int split_stride; // 0x2d0: deterministic only, bytes between dq_acc planes
     p3 _p45;
-    // Read only by the gfx942 hdim_q 192 kernels, which write dq directly and run dK/dV and dQ
-    // workgroups (n_kb + n_qb ranks per (head, batch)) in one dispatch.
-    unsigned int Hs_dq; // 0x2e0: dq head stride in bytes
-    p3 _p46;
-    unsigned int Seqs_dq; // 0x2f0: dq row stride in bytes
-    p3 _p47;
-    unsigned int n_kb; // 0x300: dK/dV workgroups per (head, batch): ceil(max_seqlen_k / 128)
-    p3 _p48;
-    unsigned int n_qb; // 0x310: dQ workgroups per (head, batch): ceil(max_seqlen_q / 128)
-    p3 _p49;
-    // 0x320: grid layout, 0: (nhead_q, batch, rank), 1: (rank, nhead_q, batch),
-    // 2: (nhead_q, rank, batch)
-    unsigned int dispatch_order;
-    p3 _p50;
-    unsigned int BAs_dq; // 0x330: batch mode, dq batch stride in bytes
-    p3 _p51;
-    unsigned int BAs_lsed; // 0x340: batch mode, lse / d batch stride in bytes
-    p3 _p52;
 };
 
 struct __attribute__((packed)) fmha_bwd_odo_args

@@ -283,9 +283,14 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     // gfx942 hdim_q 192 (hdim_v 192 or 128): the hd192 / hd192_128 pssk kernels take precedence
     // over the a32 psskddv ones, which keep hdim_q in (128, 192).  They run dK/dV workgroups
     // (4 GEMMs, 128 keys each) and dQ workgroups (3 GEMMs, 128 queries each) in one dispatch and
-    // write dq / dk / dv once, so they are a16 rows without dq_acc or post kernel; they compute
-    // no d_sink.
-    const bool hd192 = arch_id == "gfx942" && a.hdim_q == 192;
+    // write dq / dk / dv once, so they are a16 rows without dq_acc or post kernel.  They write
+    // dq with q's strides and take lse / d as [b, h, s] in batch mode; other hdim_q 192 calls
+    // keep the requested kernels (psskddv for a32 at hdim_v 192).
+    const bool hd192 = arch_id == "gfx942" && a.hdim_q == 192 && a.stride_dq == a.stride_q &&
+                       a.nhead_stride_dq == a.nhead_stride_q &&
+                       (a.is_group_mode || a.batch == 1 ||
+                        (a.batch_stride_dq == a.batch_stride_q &&
+                         a.batch_stride_lsed == a.nhead_q * a.nhead_stride_lsed));
     if(hd192)
     {
         a.v3_atomic_fp32 = false;
@@ -410,6 +415,11 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
                                                                          post_cfgs);
 
     if((pre_kernel == "") || (dqdkdv_kernel == ""))
+    {
+        return -1;
+    }
+    // The gfx942 a16 hdim_q 192 rows are the pssk kernels only, which compute no d_sink.
+    if(arch_id == "gfx942" && a.hdim_q == 192 && !a.v3_atomic_fp32 && !hd192)
     {
         return -1;
     }
@@ -712,20 +722,10 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
 #endif
     }
 
-    if(hd192)
-    {
-        dqdkdv_args.Hs_dq    = a.nhead_stride_dq * 2;
-        dqdkdv_args.Seqs_dq  = a.stride_dq * 2;
-        dqdkdv_args.BAs_dq   = a.batch_stride_dq * 2;
-        dqdkdv_args.BAs_lsed = a.batch_stride_lsed * 4;
-        dqdkdv_args.n_kb     = (a.max_seqlen_k + ts_kv - 1) / ts_kv;
-        dqdkdv_args.n_qb     = (a.max_seqlen_q + ts_kv - 1) / ts_kv;
-        // Rank-major order hands the longest jobs out first.  Once one batch alone fills the GPU,
-        // batch-major order keeps the running workgroups on a few sequences whose Q / K / V / dO
-        // stay in L2 / MALL instead of streaming every sequence from HBM at once.
-        const int ranks = dqdkdv_args.n_kb + dqdkdv_args.n_qb;
-        dqdkdv_args.dispatch_order =
-            (a.batch > 1 && 4 * a.nhead_q * ranks >= 5 * get_num_cu_func()) ? 2 : 0;
+    if(hd192 && a.is_group_mode)
+    { // the hdim_q 192 kernels size their job lists from seqlen_q / seqlen_k
+        dqdkdv_args.seqlen_q = a.max_seqlen_q;
+        dqdkdv_args.seqlen_k = a.max_seqlen_k;
     }
 
     auto dqdkdv_kernel_launch = [&]() {
@@ -748,12 +748,19 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
             gdx = (gdx + 1) / 2;
         }
         if(hd192)
-        { // n_kb + n_qb ranks per (head, batch): (nhead_q, batch, ranks), or batch-major
-          // (nhead_q, ranks, batch)
-            const int ranks = dqdkdv_args.n_kb + dqdkdv_args.n_qb;
-            gdx             = a.nhead_q;
-            gdy             = dqdkdv_args.dispatch_order == 2 ? ranks : a.batch;
-            gdz             = dqdkdv_args.dispatch_order == 2 ? a.batch : ranks;
+        { // ceil(max_seqlen_k / 128) dK/dV + ceil(max_seqlen_q / 128) dQ ranks per (head, batch).
+          // Rank-major (nhead_q, batch, ranks) hands the longest jobs out first.  Once one batch
+          // alone fills the GPU, batch-major (nhead_q * ranks, batch, 1) keeps the running
+          // workgroups on a few sequences whose Q / K / V / dO stay in L2 / MALL.  The kernel
+          // reads either as head = x % nhead_q, rank = z + x / nhead_q (fp32, exact below 2^22).
+            const int ranks =
+                (a.max_seqlen_k + ts_kv - 1) / ts_kv + (a.max_seqlen_q + ts_kv - 1) / ts_kv;
+            const bool batch_major = a.batch > 1 &&
+                                     4 * a.nhead_q * ranks >= 5 * get_num_cu_func() &&
+                                     a.nhead_q * ranks < (1 << 22);
+            gdx = batch_major ? a.nhead_q * ranks : a.nhead_q;
+            gdy = a.batch;
+            gdz = batch_major ? 1 : ranks;
         }
 
         impl_ptr_dqdkdv->launch_kernel(

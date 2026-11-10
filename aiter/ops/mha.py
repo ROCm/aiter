@@ -2835,8 +2835,11 @@ def _flash_attn_backward(
         deterministic,
         is_v3_atomic_fp32,
     )
-    # the gfx942 hd192 / hd192_128 pssk kernels compute no d_sink
+    # the gfx942 hd192 / hd192_128 pssk kernels compute no d_sink and write dq with q's strides
+    # (fmha_v3_bwd allocates a missing dq like q); 192 / 128 has no other asm kernel
+    dq_like_q = q.is_contiguous() if dq is None else dq.stride() == q.stride()
     can_impl_fmha_v3_bwd_ &= q.shape[-1] != 192 or (sink is None and d_sink is None)
+    can_impl_fmha_v3_bwd_ &= (q.shape[-1], v.shape[-1]) != (192, 128) or dq_like_q
 
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
@@ -3713,8 +3716,11 @@ def _flash_attn_varlen_backward(
         # ret &= dbias is None
         ret &= dropout_p == 0.0
         ret &= deterministic == False
-        # 192 / 128 runs the hd192_128 pssk kernels; the hdim_q 192 ones compute no d_sink
+        # 192 / 128 runs the hd192_128 pssk kernels, which write dq with q's strides
+        # (fmha_v3_varlen_bwd allocates a missing dq like q); the hdim_q 192 ones compute no d_sink
         ret &= hdim_q == hdim_v or (hdim_q, hdim_v) == (192, 128)
+        dq_like_q = q.is_contiguous() if dq is None else dq.stride() == q.stride()
+        ret &= (hdim_q, hdim_v) != (192, 128) or dq_like_q
         ret &= hdim_q != 192 or (sink is None and d_sink is None)
         ret &= nhead_q % nhead_k == 0
         ret &= hdim_q >= 64 and hdim_q <= 192 and hdim_q % 8 == 0
