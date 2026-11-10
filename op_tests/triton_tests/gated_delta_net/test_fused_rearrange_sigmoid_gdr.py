@@ -271,15 +271,41 @@ def test_fused_rearrange_sigmoid_gdr_kda():
     torch.testing.assert_close(h_tr[-1].float(), h_ref[0], rtol=1e-2, atol=1e-2)
 
 
+def _replay_schedule(n_seq: int, max_t: int) -> list[tuple[list[int], list[int]]]:
+    """Per-step ``(tokens per sequence, num_accepted_tokens)`` lists.
+
+    Each step's accepted counts refer to the previous step's tokens. Over the
+    steps, every sequence slot replays every case ``(T, accepted)`` with
+    ``1 <= accepted <= T <= max_t``: no replay (``accepted == 1``), every
+    partial replay, and the full accept (``accepted == T``). A batch gets
+    different cases per sequence, so accept counts are mixed within a step.
+    """
+    cases = [(t, acc) for t in range(1, max_t + 1) for acc in range(1, t + 1)]
+    steps, acc = [], [1] * n_seq
+    for step in range(len(cases) + 1):
+        cur = [cases[(step + i) % len(cases)] for i in range(n_seq)]
+        steps.append(([t for t, _ in cur], acc))
+        acc = [a for _, a in cur]
+    return steps
+
+
 @cuda_ok
 @pytest.mark.parametrize("N", [1, 3, 16])
 @pytest.mark.parametrize("max_t", [2, 8])
 def test_fused_rearrange_sigmoid_gdr_defer_spec_state(N: int, max_t: int):
-    # Each step accepts a random number of the previous step's tokens. Equal
-    # outputs in each step show that the replay gives the correct start state.
+    # Every sequence replays every (T, accepted) case of _replay_schedule.
+    # Equal outputs in each step show that the replay gives the correct start
+    # state.
     device = "cuda"
     H, HV, K, V, dtype = 2, 6, 128, 128, torch.bfloat16
     key_dim, value_dim = H * K, HV * V
+    schedule = _replay_schedule(N, max_t)
+    all_cases = {(t, acc) for t in range(1, max_t + 1) for acc in range(1, t + 1)}
+    for i in range(N):
+        replayed = {
+            (schedule[s][0][i], schedule[s + 1][1][i]) for s in range(len(schedule) - 1)
+        }
+        assert replayed == all_cases
     torch.manual_seed(0)
     A_log = torch.randn(HV, device=device, dtype=torch.float32) * 0.5
     dt_bias = torch.randn(HV, device=device, dtype=torch.float32)
@@ -288,14 +314,7 @@ def test_fused_rearrange_sigmoid_gdr_defer_spec_state(N: int, max_t: int):
     )
     state_defer = state_ref.clone()
     idx = 1 + torch.randperm(N * max_t, device=device).view(N, max_t).int()
-    prev_t = None
-    for _ in range(6):
-        t_list = torch.randint(1, max_t + 1, (N,)).tolist()
-        if prev_t is None:
-            acc = [1] * N
-        else:
-            acc = [int(torch.randint(1, t + 1, (1,))) for t in prev_t]
-        prev_t = t_list
+    for t_list, acc in schedule:
         num_tokens = sum(t_list)
         cu = torch.tensor([0] + t_list, device=device).cumsum(0).int()
         # A slice of a wider buffer, as the spec rows of a packed projection.
