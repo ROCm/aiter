@@ -894,6 +894,10 @@ def test_triton_unified_attn_3d_padded_query_rows_deterministic(
         ([(8, 8704)], (16, 2), 128, 2048),
         ([(8, 582), (1, 582)], (16, 2), 64, 512),
         ([(1, 8704)] * 4, (16, 2), 16, 2048),
+        # 192 programs: 1.5 per CU on 128 CUs, split only by the 128cu cap
+        ([(1, 4100)] * 96, (16, 2), 64, 2048),
+        # q=2 verify: the 128cu tree gives this batch more segments
+        ([(2, 4100)] * 32, (16, 2), 64, 2048),
         ([(128, 1100)], (32, 32), 64, 1024),
         ([(17, 1100)], (32, 32), 64, 1024),
     ],
