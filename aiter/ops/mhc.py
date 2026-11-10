@@ -1504,6 +1504,57 @@ def mhc_fused_post_pre_delayed(
     post_mix = torch.empty(m, hc_mult, 1, dtype=dtypes.fp32, device=device)
     comb_mix = torch.empty(m, hc_mult, hc_mult, dtype=dtypes.fp32, device=device)
     next_pre_mix = torch.empty(m, hc_mult, dtype=dtypes.fp32, device=device)
+    _mhc_seam_asm_launch(
+        residual_out,
+        layer_input,
+        post_mix,
+        comb_mix,
+        next_pre_mix,
+        residual,
+        sublayer_out,
+        post_2d,
+        comb_3d,
+        pre_2d,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+    )
+    return residual_out, post_mix, comb_mix, layer_input, next_pre_mix
+
+
+def _mhc_seam_asm_launch(
+    residual_out: Tensor,
+    layer_input: Tensor,
+    post_mix: Tensor,
+    comb_mix: Tensor,
+    next_pre_mix: Tensor,
+    residual: Tensor,
+    sublayer_out: Tensor,
+    post_2d: Tensor,
+    comb_3d: Tensor,
+    pre_2d: Optional[Tensor],  # noqa: UP045
+    fn: Tensor,
+    hc_scale: Tensor,
+    hc_base: Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+) -> None:
+    """Launch the gfx942 ASM seam kernels into preallocated outputs.
+
+    Callers check support (mhc_fused_post_pre_delayed_asm_supported) and that all
+    tensors are contiguous on one device: post_2d (T, 4), comb_3d (T, 4, 4), pre_2d
+    (T, 4) or None for the identity gate, outputs as mhc_fused_post_pre_delayed.
+    """
+    m, hc_mult, hidden_size = residual.shape
+    device = residual.device
     gate_args = (
         hc_scale,
         hc_base,
@@ -1512,9 +1563,8 @@ def mhc_fused_post_pre_delayed(
         hc_sinkhorn_eps,
         hc_post_mult_value,
         sinkhorn_repeat,
-        hc_hidden_size,
+        hc_mult * hidden_size,
     )
-
     for t0 in range(0, m, MHC_SEAM_MAX_T_PER_LAUNCH):
         t1 = min(m, t0 + MHC_SEAM_MAX_T_PER_LAUNCH)
         n = t1 - t0
@@ -1537,5 +1587,3 @@ def mhc_fused_post_pre_delayed(
         else:
             mhc_seam_fused_asm(*seam_out, *seam_in, fn, 0, n >= MHC_SEAM_STORE_NT_MIN_T)
         mhc_seam_gates_asm(*gates_out, part, *gate_args)
-
-    return residual_out, post_mix, comb_mix, layer_input, next_pre_mix

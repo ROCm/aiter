@@ -417,8 +417,15 @@ def mega_mhc(
     capture stream with sufficient scratch capacity before graph capture.
     Calls and graphs sharing that scratch must execute serially. The read-only
     pack can be shared across streams after the loading stream has finished.
-    Pass an explicit workspace to own private scratch instead. Raw FP32 fn is
-    not accepted; w_preshuffle_bf16 must be True, with or without a workspace.
+    Pass an explicit workspace to own private scratch instead.
+
+    w_preshuffle_bf16=False takes the raw FP32 fn (24, 4*H) instead. On gfx942
+    with H=5120, post-mix and BF16 output it runs the ASM seam kernels
+    (aiter.mhc_fused_post_pre_delayed) and aiter.rms_norm, writing into
+    residual_out; workspace is unused there. The norm then rounds the layer
+    input to BF16 before RMSNorm, so it can differ by one BF16 ulp. Elsewhere
+    fn is packed with mega_mhc_shuffle_fn on every call before the HIP kernel;
+    pack once and pass w_preshuffle_bf16=True to avoid that cost.
     H=5120/7168 on gfx950 and gfx1250 uses stream dispatch for Sinkhorn=20;
     other positive repeat counts use the generic stream kernel with the same
     pack.
@@ -448,7 +455,6 @@ def mega_mhc(
     resS[k // 32][stream][token][k % 32] in the same (T, 4, H) shape.
     sublayer_out and the layer input stay plain.
     """
-    assert w_preshuffle_bf16, "mega_mhc requires w_preshuffle_bf16=True"
     if not residual.is_cuda or residual.ndim != 3 or residual.shape[1] != 4:
         raise ValueError("residual must be a GPU (T, 4, H) tensor")
     t, _, h = residual.shape
@@ -456,7 +462,10 @@ def mega_mhc(
     if out_dtype not in ("bf16", "mxfp8"):
         raise ValueError("out_dtype must be 'bf16' or 'mxfp8'")
     _require_tensor(residual, "residual", (t, 4, h), torch.bfloat16, device)
-    _require_tensor(fn, "fn", (h // 32, 4, 3, 4, 16, 4), torch.int32, device)
+    if w_preshuffle_bf16:
+        _require_tensor(fn, "fn", (h // 32, 4, 3, 4, 16, 4), torch.int32, device)
+    else:
+        _require_tensor(fn, "fn", (24, 4 * h), torch.float32, device)
     _require_tensor(hc_scale, "hc_scale", (3,), torch.float32, device)
     _require_tensor(hc_base, "hc_base", (24,), torch.float32, device)
     _require_tensor(norm_weight, "norm_weight", (h,), torch.bfloat16, device)
@@ -506,6 +515,33 @@ def mega_mhc(
             raise ValueError("Mega-MHC mxfp8 on gfx1250 requires H divisible by 128")
         if res_preshuffle and arch != "gfx1250":
             raise RuntimeError("Mega-MHC res_preshuffle requires gfx1250")
+        if not w_preshuffle_bf16:
+            from .mhc import mhc_fused_post_pre_delayed_asm_supported
+
+            if (
+                has_post
+                and out_dtype == "bf16"
+                and mhc_fused_post_pre_delayed_asm_supported(h, 4, arch)
+            ):
+                return _mega_mhc_asm(
+                    residual,
+                    fn,
+                    hc_scale,
+                    hc_base,
+                    rms_eps,
+                    hc_pre_eps,
+                    hc_sinkhorn_eps,
+                    hc_post_mult_value,
+                    sinkhorn_repeat,
+                    pre_mix,
+                    sublayer_out,
+                    post_layer_mix,
+                    comb_res_mix,
+                    norm_weight,
+                    norm_eps,
+                    residual_out,
+                )
+            fn = mega_mhc_shuffle_fn(fn)
         if workspace is None:
             scratch = _prepare_scratch(device, t, h)
         else:
@@ -576,3 +612,58 @@ def mega_mhc(
             scale_row_major,
         )
     return residual_out, post_out, comb_out, layer_input, next_pre
+
+
+def _mega_mhc_asm(
+    residual,
+    fn,
+    hc_scale,
+    hc_base,
+    rms_eps,
+    hc_pre_eps,
+    hc_sinkhorn_eps,
+    hc_post_mult_value,
+    sinkhorn_repeat,
+    pre_mix,
+    sublayer_out,
+    post_layer_mix,
+    comb_res_mix,
+    norm_weight,
+    norm_eps,
+    residual_out,
+):
+    """gfx942 H=5120 path of mega_mhc: ASM seam kernels, then aiter.rms_norm."""
+    from .mhc import _mhc_seam_asm_launch
+    from .rmsnorm import rms_norm
+
+    t, _, h = residual.shape
+    device = residual.device
+    post_out = torch.empty((t, 4, 1), device=device, dtype=torch.float32)
+    comb_out = torch.empty((t, 4, 4), device=device, dtype=torch.float32)
+    next_pre = torch.empty((t, 4), device=device, dtype=torch.float32)
+    if not t:
+        norm = torch.empty((0, h), device=device, dtype=torch.bfloat16)
+        return residual_out, post_out, comb_out, norm, next_pre
+    layer_input = torch.empty((t, h), device=device, dtype=torch.bfloat16)
+    _mhc_seam_asm_launch(
+        residual_out,
+        layer_input,
+        post_out,
+        comb_out,
+        next_pre,
+        residual,
+        sublayer_out,
+        post_layer_mix.view(t, 4),
+        comb_res_mix,
+        pre_mix,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+    )
+    norm = rms_norm(layer_input, norm_weight, norm_eps)
+    return residual_out, post_out, comb_out, norm, next_pre
