@@ -175,8 +175,8 @@ def _auto_num_splits(
     rows_per_block: int,
     block_kv: int,
     device_index: int,
-    pol: _SplitPolicy | None = None,
     blocks_per_cu: int | None = None,
+    pol: _SplitPolicy | None = None,
 ) -> int:
     """KV-column splits (grid.y) to fill the device when the row grid is small.
 
@@ -191,7 +191,7 @@ def _auto_num_splits(
     the compiled kernel (its register and LDS use), not only on the device.
     """
     pol = pol or _split_policy()
-    grid_x = -(-seq_len // rows_per_block)
+    grid_x = (seq_len + rows_per_block - 1) // rows_per_block
     if grid_x == 0 or seq_len_kv < pol.min_seq_len_kv:
         return 1
     max_splits = max(1, (seq_len_kv // block_kv) // pol.min_tiles_per_split)
@@ -300,8 +300,7 @@ def _mk_lds942_builder(rpw, wpb, bkv):
 # own rows' Q and weights in registers, so they fit 3 waves/SIMD.
 _VARIANT_COMPILE_HINTS = {}
 
-# gfx942 LDS variants handle a short last block in-kernel, so the host does not
-# pad seq_len for them, and they use _LDS942_SPLIT_POLICY.
+# The gfx942 LDS variants; the launcher gives them _LDS942_SPLIT_POLICY.
 _LDS942_VARIANTS = set()
 
 if _ARCH == "gfx942":
@@ -702,31 +701,11 @@ def flydsl_fp8_mqa_logits(
         clean_logits=bool(clean_logits),
     )
 
-    # Most kernels require seq_len padded to a multiple of the rows a block
-    # owns, so every block owns exactly that many. Padded rows get empty windows
-    # (start == end == 0) so the kernel writes nothing for them; the output is
-    # sliced back to the original seq_len after the launch. The gfx942 LDS
-    # variants handle a short last block in-kernel and skip the copies.
-    lds942 = variant in _LDS942_VARIANTS
-    if lds942:
-        seq_len_padded = seq_len
-    else:
-        seq_len_padded = (
-            (seq_len + _ROWS_PER_BLOCK - 1) // _ROWS_PER_BLOCK
-        ) * _ROWS_PER_BLOCK
-    if seq_len_padded != seq_len:
-        pad = seq_len_padded - seq_len
-        Q = torch.cat([Q, Q.new_zeros((pad, num_heads, head_size))], dim=0)
-        weights = torch.cat([weights, weights.new_zeros((pad, num_heads))], dim=0)
-        cu_starts = torch.cat([cu_starts, cu_starts.new_zeros(pad)], dim=0)
-        cu_ends = torch.cat([cu_ends, cu_ends.new_zeros(pad)], dim=0)
-
-    # No torch.full even when clean_logits: the kernel now writes -inf itself,
-    # at exactly the out-of-window positions it would otherwise skip.
+    # No torch.full even when clean_logits: the kernel writes -inf itself.
     aligned_size = 256
     seq_len_kv_aligned = (seq_len_kv + aligned_size - 1) // aligned_size * aligned_size
     logits = torch.empty(
-        (seq_len_padded, seq_len_kv_aligned),
+        (seq_len, seq_len_kv_aligned),
         dtype=torch.float32,
         device=Q.device,
     )[:, :seq_len_kv]
@@ -735,24 +714,26 @@ def flydsl_fp8_mqa_logits(
         stream = torch.cuda.current_stream()
 
     tensors = (Q, KV, kv_scales, weights, cu_starts, cu_ends, logits)
-    scalars = (int(seq_len_padded), int(seq_len_kv), int(logits.stride(0)))
+    scalars = (int(seq_len), int(seq_len_kv), int(logits.stride(0)))
+
+    # The gfx942 LDS variants (registered only on gfx942) use their own split
+    # policy; every other variant keeps the per-arch _split_policy().
+    split_pol = _LDS942_SPLIT_POLICY if variant in _LDS942_VARIANTS else None
 
     with torch.cuda.device(Q.device.index):
-        split_pol = _LDS942_SPLIT_POLICY if lds942 else None
         blocks_per_cu = None
-        effective_pol = split_pol or _split_policy()
-        if effective_pol.block_overhead_tiles is not None:
+        if (split_pol or _split_policy()).block_overhead_tiles is not None:
             blocks_per_cu = _max_blocks_per_cu(
                 launcher, (*tensors, *scalars, 1, stream)
             )
         num_splits = _auto_num_splits(
-            seq_len_padded,
+            seq_len,
             seq_len_kv,
             _ROWS_PER_BLOCK,
             _BKV,
             Q.device.index,
-            split_pol,
             blocks_per_cu,
+            pol=split_pol,
         )
         _run_compiled(launcher, *tensors, *scalars, int(num_splits), stream)
 

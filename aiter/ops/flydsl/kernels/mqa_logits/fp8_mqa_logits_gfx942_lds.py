@@ -23,12 +23,41 @@ from .fp8_mqa_logits import (
     _MFMA16,
     MfmaAtom,
     _emit_row_neg_inf_fill,
-    _fn_to_fnuz_i64,
     _load_row_weights,
     _make_weight_copy,
 )
 
 Vec = fx.Vector
+
+
+def _fn_to_fnuz_i64(raw_i64):
+    """Map FN byte 0x80 (neg-zero) -> 0x00 in 8 packed fp8 bytes.
+
+    Same transform as the closure inside ``_build_kernel_mfma_r_w``; kept local
+    so the shared direct-load builder (used by gfx950) is left untouched.
+    """
+
+    def _fix_i32(src):
+        """Zero every 0x80 byte of one dword of 4 packed fp8 bytes.
+
+        ``>>`` on a signed Int32 is arithmetic, but the ``& 0xFF`` immediately
+        after keeps only the byte being examined, so this matches a logical
+        shift.
+        """
+        result = fx.Int32(0)
+        for byte_idx in range_constexpr(4):
+            shift = fx.Int32(byte_idx * 8)
+            byte_val = (src >> shift) & fx.Int32(0xFF)
+            cleaned = (byte_val == fx.Int32(0x80)).select(fx.Int32(0), byte_val)
+            result = result | (cleaned << shift)
+        return result
+
+    # The widen/narrow steps stay unsigned: they move a bit pattern, so a
+    # sign-extending ext would corrupt the high dword.
+    raw = fx.Uint64(raw_i64)
+    lo_64 = fx.Int64(fx.Uint32(_fix_i32(fx.Int32(raw))))
+    hi_64 = fx.Int64(fx.Uint32(_fix_i32(fx.Int32(raw >> 32)))) << fx.Int64(32)
+    return (lo_64 | hi_64).ir_value()
 
 
 def _emit_col_partial(mfma, mma, gemm_kw, a_row, b_pack, w_row, f32_0):

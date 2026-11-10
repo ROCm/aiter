@@ -68,12 +68,13 @@ REF_IMPL = (
 
 try:
     from aiter.ops.flydsl import flydsl_fp8_mqa_logits
+    from aiter.ops.flydsl import fp8_mqa_logits_kernels as _fly_mod
     from aiter.ops.flydsl.fp8_mqa_logits_kernels import (
         _auto_variant,
         _resolve_variant,
     )
 except ImportError:
-    flydsl_fp8_mqa_logits = _auto_variant = _resolve_variant = None
+    flydsl_fp8_mqa_logits = _auto_variant = _resolve_variant = _fly_mod = None
 
 # Bench timing knobs, set from argv in main(), read by _time_us.
 BENCH_WARMUP = 10
@@ -449,6 +450,57 @@ def verify_lds_variant(s_q, s_k, num_heads):
             f"resolved {variant}, expected {expected} "
             f"[s_q={s_q} s_k={s_k} nh={num_heads}]"
         )
+    return {"gfx": get_gfx(), "variant": variant, "status": "ok"}
+
+
+_LAUNCHER_CONTRACT_SHAPES = [(1, 4096), (7, 20007), (1023, 1023), (8191, 40959)]
+
+
+@benchmark()
+def verify_launcher_contract(s_q, s_k, num_heads):
+    """Host-side launcher contract on the current arch. Launches nothing.
+
+    Every variant gets the real seq_len and unpadded inputs (each kernel masks a
+    short last block itself), with no host-side cat/zeros copies.
+    """
+    fp8 = DTYPE_MAP[_DEFAULT_KV_DTYPES[0]]
+    captured, copies = [], []
+    real_run, real_bpc = _fly_mod._run_compiled, _fly_mod._max_blocks_per_cu
+    real_cat, real_nz = torch.cat, torch.Tensor.new_zeros
+
+    def _count(fn):
+        def wrapped(*a, **k):
+            copies.append(fn.__name__)
+            return fn(*a, **k)
+
+        return wrapped
+
+    _fly_mod._run_compiled = lambda launcher, *args: captured.append(args)
+    _fly_mod._max_blocks_per_cu = lambda launcher, args: 1
+    torch.cat, torch.Tensor.new_zeros = _count(real_cat), _count(real_nz)
+    try:
+        dev = "meta"
+        out = flydsl_fp8_mqa_logits(
+            torch.empty((s_q, num_heads, 128), dtype=fp8, device=dev),
+            torch.empty((s_k, 128), dtype=fp8, device=dev),
+            torch.empty((s_k,), dtype=torch.float32, device=dev),
+            torch.empty((s_q, num_heads), dtype=torch.float32, device=dev),
+            torch.empty((s_q,), dtype=torch.int32, device=dev),
+            torch.empty((s_q,), dtype=torch.int32, device=dev),
+        )
+    finally:
+        _fly_mod._run_compiled, _fly_mod._max_blocks_per_cu = real_run, real_bpc
+        torch.cat, torch.Tensor.new_zeros = real_cat, real_nz
+    (args,) = captured
+    tensors, seq_len_arg = args[:7], args[7]
+    rows_dims = [tensors[i].shape[0] for i in (0, 3, 4, 5, 6)]
+    variant = _resolve_variant(None, s_q, s_k, num_heads)
+    if copies or seq_len_arg != s_q or any(d != s_q for d in rows_dims):
+        raise AssertionError(
+            f"{variant}: host copies {copies}, seq_len arg {seq_len_arg}, row dims "
+            f"{rows_dims} [s_q={s_q} s_k={s_k} nh={num_heads}]"
+        )
+    assert tuple(out.shape) == (s_q, s_k)
     return {"gfx": get_gfx(), "variant": variant, "status": "ok"}
 
 
@@ -961,6 +1013,26 @@ def main():
     elif "verify" in scenarios:
         aiter.logger.warning(
             "%s: skipping the auto_variant pins, which are gfx942-only", get_gfx()
+        )
+
+    if "verify" in scenarios:
+        rows = []
+        for (s_q, s_k), nh in itertools.product(
+            _LAUNCHER_CONTRACT_SHAPES, args.num_heads
+        ):
+            pin = {"s_q": s_q, "s_k": s_k, "num_heads": nh}
+            try:
+                rows.append(verify_launcher_contract(**pin))
+            except NotImplementedError:
+                continue  # no variant for this num_heads on this arch
+            except AssertionError as exc:
+                aiter.logger.error("FAILED launcher_contract case: %s", exc)
+                failures.append(("launcher_contract", str(pin), exc))
+                rows.append({**pin, "gfx": get_gfx(), "status": "FAIL"})
+        total += len(rows)
+        aiter.logger.info(
+            "fp8_mqa_logits launcher_contract summary (markdown):\n%s",
+            pd.DataFrame(rows).to_markdown(index=False),
         )
 
     for scenario in scenarios:
