@@ -396,16 +396,36 @@ def flydsl_hgemm(
     )
 
 
+def _byte_ranges(tensor: torch.Tensor) -> list[tuple[int, int]]:
+    """The byte ranges a decode operand occupies.
+
+    A packed tensor is one range. A rank-2 tensor with a unit column stride
+    and a row stride above its width (A, a column slice of a wider
+    activation) is one range per row, so the gaps between rows stay free.
+    """
+    begin = tensor.data_ptr()
+    size = tensor.element_size()
+    if tensor.dim() == 2 and tensor.shape[0] > 1:
+        rows, cols = tensor.shape
+        row_stride = tensor.stride(0)
+        if tensor.stride(1) == 1 and row_stride > cols:
+            return [
+                (
+                    begin + row * row_stride * size,
+                    begin + (row * row_stride + cols) * size,
+                )
+                for row in range(rows)
+            ]
+    return [(begin, begin + tensor.numel() * size)]
+
+
 def _overlaps(lhs: torch.Tensor, rhs: torch.Tensor) -> bool:
-    """Check if two tensors overlap in memory."""
-
-    def _storage_range(tensor: torch.Tensor) -> tuple[int, int]:
-        begin = tensor.data_ptr()
-        return begin, begin + tensor.numel() * tensor.element_size()
-
-    lhs_begin, lhs_end = _storage_range(lhs)
-    rhs_begin, rhs_end = _storage_range(rhs)
-    return lhs_begin < rhs_end and rhs_begin < lhs_end
+    """Check if two tensors overlap in memory, row by row for a strided A."""
+    return any(
+        lhs_begin < rhs_end and rhs_begin < lhs_end
+        for lhs_begin, lhs_end in _byte_ranges(lhs)
+        for rhs_begin, rhs_end in _byte_ranges(rhs)
+    )
 
 
 def validate_gemm_decode_tensors(

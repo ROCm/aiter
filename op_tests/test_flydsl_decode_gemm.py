@@ -380,6 +380,35 @@ def check_strided_activation() -> None:
             ), f"tgemm.mm M={m} ({n},{k}): {name} A differs from packed A"
 
 
+def check_strided_activation_overlap() -> None:
+    """C on a strided A's later row is rejected; C in the gap between rows is not.
+
+    A's footprint is one range per row, not ``numel() * element_size()`` from
+    its start, so an output placed on row 1 must be caught, and an output that
+    fits entirely between the rows must still be accepted.
+    """
+    m, k, n = 2, 128, 64
+    row_stride = 4 * k
+    a, b = _inputs(m, n, k)
+    config = _wave_config(m, k)
+    buffer = torch.zeros(row_stride + m * n + k, device="cuda", dtype=torch.bfloat16)
+    view = buffer.as_strided((m, k), (row_stride, 1))
+    view.copy_(a)
+
+    on_row1 = buffer.as_strided((m, n), (n, 1), storage_offset=row_stride)
+    try:
+        gemm_decode_bf16(view, b, on_row1, config)
+    except ValueError as error:
+        assert "overlap" in str(error), error
+    else:
+        raise AssertionError("C on the strided A's second row was not rejected")
+
+    in_gap = buffer.as_strided((m, n), (n, 1), storage_offset=k)
+    gemm_decode_bf16(view, b, in_gap, config)
+    torch.cuda.synchronize()
+    _assert_output(in_gap, run_torch(a, b))
+
+
 CORRECTNESS_CASES = (
     check_wave_no_bias,
     check_wave_bias_and_odd_tails,
@@ -388,6 +417,7 @@ CORRECTNESS_CASES = (
     check_block_mfma_persistent_n,
     check_tuned_rows_dispatch,
     check_strided_activation,
+    check_strided_activation_overlap,
 )
 
 
