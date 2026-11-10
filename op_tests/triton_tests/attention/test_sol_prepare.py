@@ -51,14 +51,16 @@ def _operands(batch, seqlen_q, seqlen_k, nhead_q, nhead_kv, d=128, seed=0):
     near-uniform proxy, which would let a broken threshold still look plausible.
     """
     torch.manual_seed(seed)
-    walk = torch.randn(batch, seqlen_k, nhead_kv, d, device="cuda") / (seqlen_k**0.5)
+    walk = torch.randn(
+        batch, seqlen_k, nhead_kv, d, dtype=torch.float32, device="cuda"
+    ) / (seqlen_k**0.5)
     traj = walk.cumsum(dim=1)
     traj = traj / traj.norm(dim=-1, keepdim=True).clamp(min=1e-6)
     amp = 2.0 * (d**0.5)
 
-    q = torch.randn(batch, seqlen_q, nhead_q, d, device="cuda")
-    k = torch.randn(batch, seqlen_k, nhead_kv, d, device="cuda")
-    v = torch.randn(batch, seqlen_k, nhead_kv, d, device="cuda")
+    q = torch.randn(batch, seqlen_q, nhead_q, d, dtype=torch.float32, device="cuda")
+    k = torch.randn(batch, seqlen_k, nhead_kv, d, dtype=torch.float32, device="cuda")
+    v = torch.randn(batch, seqlen_k, nhead_kv, d, dtype=torch.float32, device="cuda")
     q_traj = (
         torch.nn.functional.interpolate(
             traj.permute(0, 2, 3, 1).reshape(batch * nhead_kv, d, seqlen_k),
@@ -460,7 +462,15 @@ def test_a_supplied_mask_replaces_routing_and_leaves_pooling_alone(
 
     torch.manual_seed(7)
     supplied = (
-        torch.rand(batch, nhead_q, num_q_tiles, num_kv_blocks, device="cuda") > 0.5
+        torch.rand(
+            batch,
+            nhead_q,
+            num_q_tiles,
+            num_kv_blocks,
+            dtype=torch.float32,
+            device="cuda",
+        )
+        > 0.5
     )
     prep = sol_prepare(q, k, v, block_attn_mask=supplied)
 
@@ -507,14 +517,14 @@ def test_a_supplied_mask_and_beta_are_exclusive():
 
 
 @pytest.mark.parametrize(
-    "mask, message",
+    "shape, dtype, message",
     [
-        (torch.zeros(1, 2, 1, 2, dtype=torch.bool), "block_attn_mask must be"),
-        (torch.zeros(1, 2, 2, 3, dtype=torch.bool), "block_attn_mask must be"),
-        (torch.zeros(1, 2, 2, 2, dtype=torch.uint8), "must be bool"),
+        ((1, 2, 1, 2), torch.bool, "block_attn_mask must be"),
+        ((1, 2, 2, 3), torch.bool, "block_attn_mask must be"),
+        ((1, 2, 2, 2), torch.uint8, "must be bool"),
     ],
 )
-def test_a_supplied_mask_is_shape_and_dtype_checked(mask, message):
+def test_a_supplied_mask_is_shape_and_dtype_checked(shape, dtype, message):
     """A wrongly shaped selection would reshape into the bitmap without complaint.
 
     num_work_items * num_kv_blocks is the only thing the packing arithmetic needs, so a mask that
@@ -522,14 +532,15 @@ def test_a_supplied_mask_is_shape_and_dtype_checked(mask, message):
     to the right total and scramble which block each bit refers to.
     """
     q, k, v = _operands(1, 512, 2 * SOL_ATTN_TS_KV, 2, 2)
+    mask = torch.zeros(shape, dtype=dtype, device="cuda")
     with pytest.raises(ValueError, match=message):
-        sol_prepare(q, k, v, block_attn_mask=mask.cuda())
+        sol_prepare(q, k, v, block_attn_mask=mask)
 
 
 def test_a_supplied_mask_stays_fullgraph_traceable():
     """The supplied-mask branch must not cost the traceability the routed path is built around."""
     q, k, v = _operands(1, 512, 4 * SOL_ATTN_TS_KV, 2, 2)
-    mask = torch.rand(1, 2, 2, 4, device="cuda") > 0.5
+    mask = torch.rand(1, 2, 2, 4, dtype=torch.float32, device="cuda") > 0.5
 
     eager = sol_prepare(q, k, v, block_attn_mask=mask)
     compiled = torch.compile(sol_prepare, fullgraph=True, dynamic=False)(
@@ -619,7 +630,7 @@ def test_error_router_takes_a_device_scale():
         v,
         BETA,
         router="error",
-        routing_scale=torch.tensor([ROUTING_SCALE], device="cuda"),
+        routing_scale=torch.tensor([ROUTING_SCALE], dtype=torch.float32, device="cuda"),
     )
     assert torch.equal(as_float["block_attn_mask"], as_tensor["block_attn_mask"])
 
@@ -821,7 +832,7 @@ def test_pooled_scales_run_zeroed_to_a_whole_scale_tile(seqlen_k, kv_tile, compi
 
 def test_error_router_compiles_fullgraph_and_matches_eager():
     q, k, v = _operands(1, 9419, 9419, 5, 5)
-    scale = torch.tensor([ROUTING_SCALE], device="cuda")
+    scale = torch.tensor([ROUTING_SCALE], dtype=torch.float32, device="cuda")
     kwargs = {"k_variance": True, "router": "error", "routing_scale": scale}
     eager = sol_prepare(q, k, v, BETA, **kwargs)
     compiled = torch.compile(sol_prepare, fullgraph=True, dynamic=False)(
