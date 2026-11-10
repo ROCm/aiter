@@ -33,6 +33,170 @@ def device(monkeypatch):
 
 
 @pytest.mark.parametrize(
+    "batch,max_parts,budget,window,query_length,max_batch_size,bucket",
+    [
+        (1, 1, 1, 0, 1, None, 1),
+        (6, 7, 160, 257, 4, None, 8),
+        (63, 7, 160, 0, 1, None, 64),
+        (65, 7, 512, 1, 4, None, 128),
+        (257, None, 4096, 8193, 4, None, 512),
+        (4096, None, 8192, 0, 1, None, 4096),
+        (1, 1, 1, 0, 1, 1, 1),
+        (65, None, None, 0, 1, 100, 128),
+        (100, None, None, 0, 1, 100, 128),
+        (4097, None, None, 0, 1, 5000, 8192),
+        pytest.param(None, None, None, 0, 1, None, None, id="lds-limit"),
+    ],
+)
+def test_pa_decode_plan(
+    device,
+    monkeypatch,
+    batch,
+    max_parts,
+    budget,
+    window,
+    query_length,
+    max_batch_size,
+    bucket,
+):
+    """Packed tasks cover visible tiles, refresh in graphs and reuse batch buckets."""
+    from aiter.ops.flydsl.kernels import pa_decode_plan as planner
+
+    properties = torch.cuda.get_device_properties(device)
+    lds_limit = batch is None
+    if lds_limit:
+        lds_bytes = getattr(properties, "shared_memory_per_block", None)
+        if lds_bytes is None:
+            lds_bytes = planner.get_lds_capacity_bytes(properties.gcnArchName)
+        batch = bucket = (lds_bytes - planner._PLAN_SCAN_LDS_BYTES) // 16 * 4
+        max_batch_size = batch + 1
+
+    compile_plan = planner.compile_pa_decode_plan
+    calls = []
+
+    def spy_compile(*args):
+        launch = compile_plan(*args)
+        calls.append((args, launch))
+        return launch
+
+    monkeypatch.setattr(planner, "compile_pa_decode_plan", spy_compile)
+
+    def check(plan, lengths):
+        window, query_length = plan.sliding_window, plan.query_length
+        info = plan.reduce_info.cpu().tolist()
+        work = plan.work_info.cpu().tolist()
+        ranges = [
+            (
+                max(max(ctx, 0) - query_length + 1 - window, 0) // 256 if window else 0,
+                (max(ctx, 0) + 255) // 256,
+            )
+            for ctx in lengths
+        ]
+        total_tiles = max(sum(last - first for first, last in ranges), 1)
+        remaining = plan.capacity - sum(last > first for first, last in ranges)
+        cursor = prefix_tiles = 0
+        for seq, (ctx, (start, count), (first, last)) in enumerate(
+            zip(lengths, info, ranges)
+        ):
+            assert start == cursor
+            tiles = last - first
+            # Verify that the runtime capacity supplies the task budget used
+            # to distribute slots by cumulative visible tile count.
+            extra = (prefix_tiles + tiles) * remaining // total_tiles
+            extra -= prefix_tiles * remaining // total_tiles
+            assert count == min(int(tiles > 0) + extra, tiles, plan.max_partitions)
+            tile = first
+            for record in work[start : start + count]:
+                row, begin, end, original_length = record
+                assert row == seq and original_length == ctx
+                assert begin == tile and begin < end <= last
+                tile = end
+            assert tile == last
+            cursor += count
+            prefix_tiles += tiles
+        assert cursor <= plan.capacity
+        assert all(record == [0, 0, 0, 0] for record in work[cursor:])
+
+    pattern = (-1, 0, 1, 255, 256, 257, 65537, 2**31 - 1)
+    lengths = [pattern[i % len(pattern)] for i in range(batch)]
+    context = torch.tensor(lengths, dtype=torch.int32, device=device)
+    plan = planner.plan_pa_decode(
+        context,
+        2,
+        max_partitions=max_parts,
+        max_batch_size=max_batch_size,
+        workgroup_budget=budget,
+        sliding_window=window,
+        query_length=query_length,
+    )
+    check(plan, lengths)
+    config, launch = calls[-1]
+    assert config[0] == bucket
+    if max_batch_size is not None:
+        assert plan.max_batch_size == max_batch_size
+    pointers = (plan.work_info.data_ptr(), plan.reduce_info.data_ptr())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        refreshed = planner.plan_pa_decode(
+            context, 2, sliding_window=window, query_length=query_length, plan=plan
+        )
+    assert refreshed is plan
+    # All-empty replay must erase old active records, then mixed lengths must
+    # rebuild them using the same buffers without stale padding or readback.
+    for values in ([0] * batch, list(reversed(lengths))):
+        context.copy_(torch.tensor(values, dtype=torch.int32, device=device))
+        graph.replay()
+        check(plan, values)
+        assert (plan.work_info.data_ptr(), plan.reduce_info.data_ptr()) == pointers
+
+    if bucket > 1:
+        # Change every runtime value inside the same batch/block-size bucket
+        # and window mode.
+        if batch < min(bucket, plan.max_batch_size):
+            other_batch = batch + 1
+        else:
+            other_batch = batch - 1
+        # Move the capacity by one slot within the block size.
+        threads = planner._block_threads(plan.capacity)
+        other_capacity = plan.capacity - 1
+        if (
+            other_capacity < other_batch
+            or planner._block_threads(other_capacity) != threads
+        ):
+            other_capacity = plan.capacity + 1
+        # The smallest partition cap that admits it, so long rows reach the cap.
+        other_parts = max(2, -(-other_capacity // other_batch))
+        assert other_parts != plan.max_partitions
+        other_window = window + 256 if window else 0
+        values = [pattern[i % len(pattern)] for i in range(other_batch)]
+        other_context = torch.tensor(values, dtype=torch.int32, device=device)
+        other_plan = planner.plan_pa_decode(
+            other_context,
+            2,
+            max_partitions=other_parts,
+            max_batch_size=plan.max_batch_size,
+            workgroup_budget=2 * other_capacity,
+            sliding_window=other_window,
+            query_length=query_length + 1,
+        )
+        assert other_plan.capacity == other_capacity
+        check(other_plan, values)
+        other_config, other_launch = calls[-1]
+        assert other_config == config
+        assert other_launch is launch
+
+    if max_batch_size is not None:
+        invalid_batch = batch + 1 if lds_limit else max_batch_size + 1
+        message = "exceeds planner LDS capacity" if lds_limit else "supports batches"
+        with pytest.raises(ValueError, match=message):
+            planner.plan_pa_decode(
+                torch.zeros(invalid_batch, dtype=torch.int32, device=device),
+                2,
+                max_batch_size=max_batch_size,
+            )
+
+
+@pytest.mark.parametrize(
     "head_size,dtype,with_sinks",
     [
         (128, torch.bfloat16, False),
@@ -1223,14 +1387,24 @@ _MXFP4_INVALID_CASES = [
 ]
 # name -> (arch FlyDSL reports, kv_dtype, query_dtype) of a PaDecodeSchedule.select call.
 _SELECT_INVALID = {
-    "mxfp4-on-gfx942": ("gfx942", "mxfp4", "bf16"),
-    "fp8-query-fp8-kv": ("gfx950", "fp8", "fp8"),
-    "fp8-query-bf16-kv": ("gfx950", "bf16", "fp8"),
+    "mxfp4-on-gfx942": ("gfx942", dtypes.fp4x2, torch.bfloat16),
+    "fp8-query-fp8-kv": ("gfx950", torch.float8_e4m3fn, torch.float8_e4m3fn),
+    "fp8-query-bf16-kv": ("gfx950", torch.bfloat16, torch.float8_e4m3fn),
+    "fnuz-kv-on-gfx950": ("gfx950", torch.float8_e4m3fnuz, torch.bfloat16),
+    "string-kv": ("gfx950", "fp8", torch.bfloat16),
+    "unmapped-kv": ("gfx950", torch.complex64, torch.bfloat16),
 }
 _SELECT_INVALID_CASES = [
     ("mxfp4-on-gfx942", ValueError, "MXFP4 PA decode requires gfx950"),
     ("fp8-query-fp8-kv", ValueError, "An FP8 query needs MXFP4 KV"),
     ("fp8-query-bf16-kv", ValueError, "BF16 KV requires a BF16 query"),
+    (
+        "fnuz-kv-on-gfx950",
+        ValueError,
+        r"FP8 KV on gfx950 must be torch\.float8_e4m3fn, got torch\.float8_e4m3fnuz",
+    ),
+    ("string-kv", TypeError, "PA KV dtype must be a torch.dtype, got 'fp8'"),
+    ("unmapped-kv", ValueError, r"Unsupported PA KV dtype torch\.complex64"),
 ]
 
 
