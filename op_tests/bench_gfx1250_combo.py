@@ -42,6 +42,12 @@ Run from the aiter repo root so `op_tests/` siblings import cleanly:
     python op_tests/bench_gfx1250_combo.py --dsv4 --ops mori_ep   # MORI EPv2 dispatch/combine
     python op_tests/bench_gfx1250_combo.py --dsv4 --ops mega_moe  # base + Mega, 4 GPUs
 
+    # DeepSeek-R1 MLPerf operators, one rank of TP4 + DP attention + EP4.
+    python op_tests/bench_gfx1250_combo.py --dsr1                 # all DSR1 ops
+    python op_tests/bench_gfx1250_combo.py --dsr1 --ops moe       # MoE FC1/FC2 (a4w4, shared expert fused)
+    python op_tests/bench_gfx1250_combo.py --dsr1 --ops mla_decode   # MLA decode (QH128 page64 kv-shuffled fp8)
+    python op_tests/bench_gfx1250_combo.py --dsr1 --ops mla_prefill  # MLA prefill (varlen FMHA D192x128)
+
 Environment
 -----------
 
@@ -73,6 +79,9 @@ same thing to every op:
     score_qk_fp4    16, 128, 512, a subset of score_qk's tiers. The axis is
                     the decode batch (sequences) of its MTP 1 and MTP 4 cases;
                     its prefill cases are fixed; see _SCORE_QK_FP4_TOKENS.
+    --dsr1 moe,     1..16384 per-GPU decode batch, plus 1536, the recipe's
+    mla_decode      max_num_seqs; see _DSR1_BATCH.
+    mla_prefill     1024..16384 tokens per step; see _DSR1_MLA_PREFILL_TOKENS.
 
 With the variable unset, the child-UT ops (score_qk, a8w8_blockscale) pass no
 shape flag at all, so each UT sweeps the range its owner maintains. The
@@ -239,6 +248,18 @@ above). Unset, each op runs its own default -- the ops do not share a supported
 range, so those defaults differ and each says why at its constant. Set, it
 applies to every op that sweeps tokens, and the file does not argue with it.
 
+The ``--dsr1`` suite takes its shapes from the DeepSeek-R1 MLPerf Offline
+recipe (TP4 + DP attention + EP4, MegaMoE fp4 dispatch, ATOM_MLA_KV_SHUFFLED=1)
+and reports one rank:
+
+    moe          65 experts (64 routed + the fused shared expert), top-9,
+                 hidden 7168, inter 2048, a4w4. Every token routes to the
+                 shared expert; the other 8 follow the UT's routing.
+    mla_decode   test_mla_decode_pagesize64.test_mla at -n 128,1: Q fp8
+                 [batch, 128, 576], page64 kv-shuffled fp8 KV, 1K..16K context.
+    mla_prefill  test_fmha_fwd_with_sink_varlen_asm's perf case: causal,
+                 128 heads, qk 192 / v 128, bf16, 1024-token sequences.
+
 ``a16w16`` is not one of them: it uses the DSv4 shape grid below and lets the
 global tuned GEMM table select the backend for every shape. A missing row uses
 the dispatcher's normal fallback instead of forcing a backend here.
@@ -271,6 +292,7 @@ import argparse
 import contextlib
 import itertools
 import json
+import re
 import subprocess
 import sys
 import tempfile
@@ -584,6 +606,8 @@ _MOE_KEEP = [
     "inter_dim",
     "E",
     "topk",
+    "shared",
+    "active_E",
     "pass",
     "gemm1_us",
     "gemm1 TFLOPS",
@@ -604,6 +628,68 @@ _MOE_CONFIG = {
     "activation": "silu",  # ActivationType.Silu
     "use_bias": False,
 }
+# DeepSeek-R1 MLPerf decode batch per GPU. 1536 is the recipe's max_num_seqs
+# and largest captured graph, where steady-state decode sits.
+_DSR1_BATCH = _tokens(
+    (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 1536, 2048, 4096, 8192, 16384)
+)
+# 256 routed experts over EP4, plus the shared expert ATOM fuses in as one more
+# expert (ATOM_FUSE_SHARED_EXPERT=1) that every token selects.
+_DSR1_MOE_CONFIG = {
+    "experts": 65,
+    "shared_experts": 1,
+    "tokens": _DSR1_BATCH,
+    "topk": 9,
+    "model_dim": 7168,
+    "inter_dim": 2048,
+    "activation": "silu",
+    "use_bias": False,
+}
+# MLPerf DSR1 averages 804 input / 4043 output tokens.
+_DSR1_MLA_DECODE_CTX = (1024, 2048, 4096, 8192, 16384)
+# Cases past this many KV tokens are skipped: the UT keeps bf16 staging and an
+# fp32 reference copy of the whole cache, which stops fitting one GPU, and the
+# recipe's KV pool is far smaller anyway.
+_DSR1_MLA_DECODE_MAX_KV_TOKENS = 16384 * 1024
+# One prefill step, up to the recipe's max_num_batched_tokens (12288) and one
+# tier past it, packed as 1024-token sequences.
+_DSR1_MLA_PREFILL_TOKENS = _tokens((1024, 2048, 4096, 8192, 12288, 16384))
+_DSR1_MLA_PREFILL_SEQ_LEN = 1024
+_MLA_DECODE_KEEP = [
+    "batch",
+    "ctx_len",
+    "nhead",
+    "kv_layout",
+    "init",
+    "asm us",
+    "asm TFLOPS",
+    "asm TB/s",
+    "asm err",
+    "kernel",
+]
+_MLA_PREFILL_KEEP = [
+    "tokens",
+    "num_seqs",
+    "hdim_q",
+    "hdim_v",
+    "hq",
+    "hk",
+    "is_causal",
+    "init",
+    "asm us",
+    "asm TFLOPS",
+    "asm TB/s",
+    "public us",
+    "public TFLOPS",
+    "public TB/s",
+    "flydsl us",
+    "flydsl TFLOPS",
+    "flydsl TB/s",
+    "asm kernel",
+    "public kernel",
+    "flydsl kernel",
+    "kernel_trace_error",
+]
 _GEMM_KEEP = [
     "workload",
     "intype",
@@ -1263,21 +1349,52 @@ def run_mha(args):
     _print_table("mha (bf16)", rows, keep=_MHA_KEEP)
 
 
+@contextlib.contextmanager
+def _pinned_shared_experts(shared, active):
+    """Route every token to the last ``shared`` experts, as a fused shared
+    expert is, and the rest of its top-k over the routed experts the way the
+    UT would. The number of experts that receive rows lands in ``active[0]``."""
+    make_score = moe_mod._make_routing_score
+
+    def score(tokens, experts, topk):
+        routed = make_score(tokens, experts - shared, topk - shared)
+        pinned = routed.new_full((tokens, shared), float(routed.max()) + 1.0)
+        full = torch.cat([routed, pinned], dim=1)
+        active[0] = full.topk(topk, dim=1).indices.unique().numel()
+        return full
+
+    moe_mod._make_routing_score = score
+    try:
+        yield
+    finally:
+        moe_mod._make_routing_score = make_score
+
+
 def run_moe(args):
-    cfg = _MOE_CONFIG
+    cfg = _DSR1_MOE_CONFIG if args.suite == "dsr1" else _MOE_CONFIG
+    shared = cfg.get("shared_experts", 0)
     activation = moe_mod.ActivationType.Silu
     rows = []
-    data_formats = ["a8w4"] if args.suite == "dsv4" else _MOE_DATA_FORMATS
+    data_formats = {"dsv4": ["a8w4"], "dsr1": ["a4w4"]}.get(
+        args.suite, _MOE_DATA_FORMATS
+    )
     init_pairs = _init_pairs(args, defaults=(("uniform", "auto"),))
     for tokens, fmt, (data_init, scale_init) in itertools.product(
         cfg["tokens"], data_formats, init_pairs
     ):
         label = (
             f"moe/fmt={fmt}/tokens={tokens}/experts={cfg['experts']}/"
-            f"topk={cfg['topk']}/hd={cfg['model_dim']}/id={cfg['inter_dim']}/"
-            f"data={data_init}/scale={scale_init}/seed={args.seed}"
+            f"topk={cfg['topk']}/shared={shared}/hd={cfg['model_dim']}/"
+            f"id={cfg['inter_dim']}/data={data_init}/scale={scale_init}/"
+            f"seed={args.seed}"
         )
-        with _smi_case(label), _capture() as box:
+        active = [None]
+        routing = (
+            _pinned_shared_experts(shared, active)
+            if shared
+            else contextlib.nullcontext()
+        )
+        with _smi_case(label), _capture() as box, routing:
             moe_mod.set_data_format(fmt)
             metrics = moe_mod.run_moe(
                 fmt,
@@ -1305,6 +1422,8 @@ def run_moe(args):
                 "inter_dim": cfg["inter_dim"],
                 "E": cfg["experts"],
                 "topk": cfg["topk"],
+                "shared": shared or None,
+                "active_E": active[0],
                 "data_init": data_init,
                 "scale_init": scale_init,
                 "seed": args.seed,
@@ -2262,6 +2381,160 @@ def run_mla_v4_prefill(args):
         )
 
 
+def _randn_or_const_inits(args, op):
+    """Map --data-init onto the randn/const0.25 initializers attention UTs take."""
+    _unused_scale_init(args, op)
+    if args.data_init is None:
+        return ["randn"]
+    init_map = {"norm": "randn", "constant": "const0.25"}
+    unsupported = [dist for dist in args.data_init if dist not in init_map]
+    if unsupported:
+        raise ValueError(
+            f"{op} only exposes randn and const0.25 initialization; "
+            f"cannot map --data-init {' '.join(unsupported)}"
+        )
+    return [init_map[dist] for dist in args.data_init]
+
+
+def _import_quietly(op, table, module):
+    """Import a UT module, or report the op as failed and return None."""
+    try:
+        with _silence():
+            return __import__(module)
+    except Exception as exc:  # noqa: BLE001 - report an op-local import failure
+        reason = f"{type(exc).__name__}: {exc}"
+        _print_table(table, [{"err_msg": reason}])
+        _note_failure(op, reason)
+        return None
+
+
+def _first_line(exc):
+    return str(exc).splitlines()[0] if str(exc) else type(exc).__name__
+
+
+def _short_kernel(name):
+    """Drop a templated kernel's argument list, keeping the functor it wraps."""
+    name = name.removeprefix("void ")
+    if "<" not in name:
+        return name
+    inner = re.search(r"::(\w+_kernel_cuda)\b", name)
+    return f"{name.split('<', 1)[0]}<{inner.group(1) if inner else '...'}>"
+
+
+def _attach_backend_kernels(row, backends, profiles):
+    """One kernel column per timed backend, in the order the UT timed them.
+
+    The UT runs one profiled perftest per backend it reports, so the profiler
+    blocks map onto its "<backend> us" columns one to one.
+    """
+    timed = [name for name in backends if f"{name} us" in row]
+    if len(profiles) != len(timed):
+        row["kernel_trace_error"] = (
+            f"{len(profiles)} profiler blocks for {len(timed)} timed backends"
+        )
+        return
+    for name, kernels in zip(timed, profiles):
+        row[f"{name} kernel"] = " + ".join(_short_kernel(k) for k in kernels)
+
+
+@contextlib.contextmanager
+def _fp32_kv_once(mod):
+    """Upcast the reference KV once per case instead of once per sequence.
+
+    _ref_mla_mi400 calls kv_buffer_ref.float() inside its per-sequence loop, a
+    copy of the whole cache each time, which at the large batches never ends.
+    .float() on an fp32 tensor returns it as is, so the result is unchanged.
+    """
+    ref = mod._ref_mla_mi400
+
+    def once(case, q_ref, kv_buffer_ref, *args, **kwargs):
+        return ref(case, q_ref, kv_buffer_ref.float(), *args, **kwargs)
+
+    mod._ref_mla_mi400 = once
+    try:
+        yield
+    finally:
+        mod._ref_mla_mi400 = ref
+
+
+def run_mla_decode(args):
+    """DSR1 MLA decode: the QH128 page64 kv-shuffled fp8 asm kernel that
+    mla_decode_fwd runs for ATOM_MLA_KV_SHUFFLED=1, one query per sequence."""
+    table = "mla decode (DSR1, QH128 page64 kv-shuffled, fp8)"
+    inits = _randn_or_const_inits(args, "mla_decode")
+    mod = _import_quietly("mla_decode", table, "test_mla_decode_pagesize64")
+    if mod is None:
+        return
+    fp8 = mod.dtypes.fp8
+    rows = []
+    with _silence(), torch.device("cuda"), _fp32_kv_once(mod):
+        for batch, ctx, init in itertools.product(
+            _DSR1_BATCH, _DSR1_MLA_DECODE_CTX, inits
+        ):
+            if batch * ctx > _DSR1_MLA_DECODE_MAX_KV_TOKENS:
+                continue
+            row = {"batch": batch, "ctx_len": ctx, "nhead": 128, "init": init}
+            box = []
+            try:
+                with _smi_case(
+                    f"mla_decode/batch={batch}/ctx={ctx}/nhead=128/init={init}"
+                ), _capture() as box:
+                    row.update(
+                        mod.test_mla(
+                            batch, ctx, 128, 1, 1, 1, fp8, fp8, init, "kv_shuffled"
+                        )
+                    )
+            except (RuntimeError, AssertionError, ValueError) as exc:
+                row["err_msg"] = _first_line(exc)
+            # The UT labels its one candidate by arch ("mi400"); it is the asm kernel.
+            for key in [k for k in row if k.startswith("mi400 ")]:
+                row["asm " + key.removeprefix("mi400 ")] = row.pop(key)
+            if box:
+                _attach_kernel_profiles(
+                    {"rows": [row]}, _profile_kernel_blocks(box[0].splitlines())
+                )
+            rows.append(row)
+            torch.cuda.empty_cache()
+    _print_table(table, rows, keep=_MLA_DECODE_KEEP)
+
+
+def run_mla_prefill(args):
+    """DSR1 MLA prefill: causal varlen FMHA, 128 heads, qk 192 / v 128, timed
+    as the ASM kernel, the public flash_attn_varlen_func route, and FlyDSL."""
+    table = "mla prefill (DSR1, varlen FMHA D192x128, bf16, causal)"
+    inits = _randn_or_const_inits(args, "mla_prefill")
+    mod = _import_quietly("mla_prefill", table, "test_fmha_fwd_with_sink_varlen_asm")
+    if mod is None:
+        return
+    seq = _DSR1_MLA_PREFILL_SEQ_LEN
+    rows = []
+    with _silence(), torch.device("cuda"):
+        for tokens, init in itertools.product(_DSR1_MLA_PREFILL_TOKENS, inits):
+            seqlens = [seq] * (tokens // seq) + ([tokens % seq] if tokens % seq else [])
+            row = {"tokens": tokens, "num_seqs": len(seqlens)}
+            box = []
+            try:
+                with _smi_case(
+                    f"mla_prefill/tokens={tokens}/seq={seq}/init={init}"
+                ), _capture() as box:
+                    row.update(
+                        mod.test_fmha_fwd_with_sink_varlen_asm_perf(
+                            192, 128, 128, 128, seqlens, True, init
+                        )
+                    )
+            except (RuntimeError, AssertionError, ValueError) as exc:
+                row["err_msg"] = _first_line(exc)
+            if box:
+                _attach_backend_kernels(
+                    row,
+                    ("asm", "public", "flydsl"),
+                    _profile_kernel_blocks(box[0].splitlines()),
+                )
+            rows.append(row)
+            torch.cuda.empty_cache()
+    _print_table(table, rows, keep=_MLA_PREFILL_KEEP)
+
+
 OPS = {
     "mha": run_mha,
     "moe": run_moe,
@@ -2278,6 +2551,8 @@ OPS = {
     "score_qk_fp4": run_score_qk_fp4,
     "mori_ep": run_mori_ep,
     "mega_moe": run_mega_moe,
+    "mla_decode": run_mla_decode,
+    "mla_prefill": run_mla_prefill,
 }
 # "gemm" (f4gemm a4w4) stays out: two back-to-back cases differing only in
 # outtype (bf16 -> fp8) abort with HSA_STATUS_ERROR_MEMORY_FAULT, while each
@@ -2361,6 +2636,7 @@ DSV4_OPS = [
     "score_qk",
     "score_qk_fp4",
 ]
+DSR1_OPS = ["moe", "mla_decode", "mla_prefill"]
 
 
 def main():
@@ -2394,6 +2670,14 @@ def main():
         help=(
             "run the DeepSeek-V4 fixed-shape suite "
             f"(default ops: {', '.join(DSV4_OPS)})"
+        ),
+    )
+    suite.add_argument(
+        "--dsr1",
+        action="store_true",
+        help=(
+            "run the DeepSeek-R1 MLPerf fixed-shape suite "
+            f"(default ops: {', '.join(DSR1_OPS)})"
         ),
     )
     p.add_argument(
@@ -2519,8 +2803,8 @@ def main():
         smi_output_path = None
         os.environ.pop("AITER_SMI_MONITOR", None)
 
-    args.suite = "dsv4" if args.dsv4 else "perf"
-    default_ops = DSV4_OPS if args.dsv4 else PERF_OPS
+    args.suite = "dsv4" if args.dsv4 else "dsr1" if args.dsr1 else "perf"
+    default_ops = {"dsv4": DSV4_OPS, "dsr1": DSR1_OPS}.get(args.suite, PERF_OPS)
     # --ops selects from every op, not just the suite's defaults: an op pulled
     # out of the defaults because it is broken on this arch still has to be
     # runnable by name to check whether a newer image fixed it. argparse already
