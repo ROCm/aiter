@@ -288,6 +288,31 @@ class PaDecodeSchedule:
                 and 2 * split_workgroups <= num_compute_units
             ):
                 query_splits = 2
+            elif (
+                "gfx94" in arch
+                and kv_dtype != MXFP4_KV_DTYPE
+                and query_length * query_group_size > MFMA_MNK
+                and (kv_dtype == fx.BFloat16 or head_dim <= 128)
+            ):
+                # gfx942 MTP tiles with idle CUs: per-CTA latency dominates,
+                # so split the query positions over more CTAs (re-reading K/V
+                # from L2). Split FP8 (to D128; D256 measured 0.93-1.05x) into
+                # single-M-tile CTAs while about three fit per CU, else in two
+                # while two fit; BF16 Q/P tiles twice the size split in two
+                # only while one fits per CU.
+                if kv_dtype == fx.BFloat16:
+                    if (
+                        query_length % 2 == 0
+                        and 2 * split_workgroups <= num_compute_units
+                    ):
+                        query_splits = 2
+                elif (
+                    query_length % 4 == 0
+                    and 4 * split_workgroups <= 3 * num_compute_units
+                ):
+                    query_splits = 4
+                elif query_length % 2 == 0 and split_workgroups <= num_compute_units:
+                    query_splits = 2
             if kv_dtype == fx.BFloat16:
                 # Native BF16 doubles Q's LDS footprint. Select the smallest
                 # split that fits, keeping the packed reducer rows unchanged.
