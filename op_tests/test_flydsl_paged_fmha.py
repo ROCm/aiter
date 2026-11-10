@@ -348,9 +348,56 @@ def test_lse_buffer_validation():
             run_case(case, return_lse=True, lse=buffer)
     with pytest.raises(ValueError, match="lse requires return_lse=True"):
         run_case(case, lse=torch.empty(shape, device="cuda"))
-    # The same caller-owned buffer succeeds when it satisfies the contract.
-    _, lse = run_case(case, return_lse=True, lse=torch.empty(shape, device="cuda"))
-    check_lse(lse, reference(case, return_lse=True)[1])
+    # Disjoint output/LSE slices may share an allocation, even across dtypes.
+    output_bytes = case.out.numel() * case.out.element_size()
+    storage = torch.empty(
+        output_bytes + case.hq * case.q.shape[0] * 4, dtype=torch.uint8, device="cuda"
+    )
+    output = storage[:output_bytes].view(torch.bfloat16).view_as(case.out)
+    buffer = storage[output_bytes:].view(torch.float32).view(shape)
+    actual, lse = run_case(case, out=output, return_lse=True, lse=buffer)
+    assert actual is output and lse is buffer
+    expected, expected_lse = reference(case, return_lse=True)
+    check_accuracy(case, actual, expected)
+    check_lse(lse, expected_lse)
+
+
+@gfx950
+@pytest.mark.parametrize(
+    "destination,source,empty_kv",
+    [("out", "q", False), ("lse", "k", False), ("lse", "out", True)],
+)
+def test_output_storage_overlap(destination, source, empty_kv, monkeypatch):
+    case = make_case(
+        1,
+        "linear3d",
+        128,
+        128,
+        qlens=(1,),
+        klens=(0 if empty_kv else 1,),
+        heads=(1, 1),
+    )
+    original = getattr(case, source)
+    source_bytes = original.numel() * original.element_size()
+    shape = case.out.shape if destination == "out" else (case.hq, case.q.shape[0])
+    dtype = torch.bfloat16 if destination == "out" else torch.float32
+    destination_bytes = math.prod(shape) * torch.empty((), dtype=dtype).element_size()
+    storage = torch.empty(
+        max(source_bytes, destination_bytes + 4), dtype=torch.uint8, device="cuda"
+    )
+    view = storage[:source_bytes].view(original.dtype).view_as(original)
+    view.copy_(original)
+    setattr(case, source, view)
+    overlapping = storage[4 : 4 + destination_bytes].view(dtype).view(shape)
+    original_bytes = storage.clone()
+
+    def unexpected_build(*args, **kwargs):
+        pytest.fail("overlapping buffers reached kernel compilation")
+
+    monkeypatch.setattr(paged, "_build", unexpected_build)
+    with pytest.raises(ValueError, match="must not overlap"):
+        run_case(case, return_lse=True, **{destination: overlapping})
+    assert torch.equal(storage, original_bytes)
 
 
 @gfx950

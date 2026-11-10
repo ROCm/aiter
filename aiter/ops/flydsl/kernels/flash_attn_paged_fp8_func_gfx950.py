@@ -11,6 +11,7 @@ from numbers import Integral, Real
 import torch
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.ops.flydsl.fmha_kernels import _storage_overlaps
 from aiter.ops.flydsl.kernels.flash_attn_func_fp8_gfx950 import (
     _is_valid_softmax_scale,
 )
@@ -159,6 +160,7 @@ def flydsl_flash_attn_paged_fp8_func(
     The output is contiguous BF16 and may be preallocated by the caller.
     With ``return_lse=True``, return ``(out, lse)`` where LSE is contiguous
     FP32 ``[Hq,total_q]`` in natural-log units; ``lse`` may be preallocated.
+    Output and LSE must not overlap each other or any input tensor.
     Fully masked rows have zero output and LSE ``-inf``.
     """
     if not all(torch.is_tensor(tensor) for tensor in (q, k, v)):
@@ -295,6 +297,32 @@ def flydsl_flash_attn_paged_fp8_func(
         raise ValueError("lse must be contiguous FP32 [Hq,total_q] on Q's device")
     if any(tensor is not None and tensor.requires_grad for tensor in (out, lse)):
         raise NotImplementedError("paged FP8 output buffers must not require gradients")
+
+    alias_inputs = (
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        metadata,
+        page_indices,
+        kv_last_page_lens if has_last else None,
+        q_descale,
+        k_descale,
+        v_descale,
+    )
+    for name, buffer in (("out", out), ("lse", lse)):
+        if buffer is None or buffer.numel() == 0:
+            continue
+        if any(
+            tensor is not None
+            and tensor.numel() > 0
+            and _storage_overlaps(buffer, tensor)
+            for tensor in alias_inputs
+        ):
+            raise ValueError(
+                f"paged FP8 {name} must not overlap input or output storage"
+            )
+        alias_inputs += (buffer,)
 
     with torch.cuda.device(q.device):
         launch_stream = (

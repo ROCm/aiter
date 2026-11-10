@@ -597,7 +597,8 @@ def flydsl_flash_attn_paged_prefill_func(
     ``return_lse=True``. LSE is FP32 ``[Hq, total_q]`` in natural-log units;
     fully masked rows have zero output and LSE ``-inf``. Both buffers may
     be preallocated and must be contiguous on Q's device. ``lse`` requires
-    ``return_lse=True``. Launches use the current stream unless supplied.
+    ``return_lse=True``. They must not overlap each other or any input tensor.
+    Launches use the current stream unless supplied.
 
     This is an explicit inference-only API: unsupported hardware, dtypes,
     layouts or noncausal requests raise rather than falling back. Local
