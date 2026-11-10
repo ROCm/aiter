@@ -292,9 +292,13 @@ def test_mamba2_chunk_backward(
                     g.to(dtypes.fp32),
                     rtol=rtol,
                     atol=atol,
+                    tol_err_ratio=_TOL_ERR_RATIO,
                     msg=f"{name}: {gname}",
                 )
             )
+        if name == "flydsl":  # the optional fla baseline is reported, not gated
+            bad = {n: e for n, e in zip(names, errs) if e > _TOL_ERR_RATIO}
+            assert not bad, f"grad mismatch ratios {bad}"
         ret[f"{name} us"] = us
         ret[f"{name} err"] = max(errs)
     return ret
