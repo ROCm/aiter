@@ -1131,9 +1131,9 @@ class PaDecodePipeline:
             m_new.append(m_new_m)
             corr_reg.append(corr_m)
         gpu.barrier()
-        if const_expr(
+        if const_expr(  # noqa: SIM102
             self.traits.PAGE16_VPIPE and not self.traits.PAGE16_EARLY_K
-        ):  # noqa: SIM102
+        ):
             # Next K can now overlap P reads/PV.
             if const_expr(has_next and not self.traits.single_tile_plan) and (
                 tt1 < self.ctx.part_end
