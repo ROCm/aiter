@@ -1716,12 +1716,20 @@ class FmoeTuner(TunerCommon):
         device="cuda",
     ):
         torch.manual_seed(0)
-        input = torch.randn((token, model_dim), dtype=dtype) / 10
+        input = torch.randn((token, model_dim), dtype=dtype, device=device) / 10
         if use_g1u1:
-            w1 = torch.randn((expert, inter_dim * 2, model_dim), dtype=dtype) / 10
+            w1 = (
+                torch.randn(
+                    (expert, inter_dim * 2, model_dim), dtype=dtype, device=device
+                )
+                / 10
+            )
         else:
-            w1 = torch.randn((expert, inter_dim, model_dim), dtype=dtype) / 10
-        w2 = torch.randn((expert, model_dim, inter_dim), dtype=dtype)
+            w1 = (
+                torch.randn((expert, inter_dim, model_dim), dtype=dtype, device=device)
+                / 10
+            )
+        w2 = torch.randn((expert, model_dim, inter_dim), dtype=dtype, device=device)
         w1_qt, w1_scale = FmoeTuner.weight_quant(w1, q_type, quant_dtype=q_dtype_w)
         w2_qt, w2_scale = FmoeTuner.weight_quant(w2, q_type, quant_dtype=q_dtype_w)
         if q_dtype_w is not dtypes.fp4x2:
@@ -1731,7 +1739,7 @@ class FmoeTuner(TunerCommon):
             w1_qt = w1_qt.view(w1.shape[0], w1.shape[1], w1.shape[2] // 2)
             w2_qt = w2_qt.view(w2.shape[0], w2.shape[1], w2.shape[2] // 2)
         if TUNE_MOE_EXPERT_BALANCE:
-            score = torch.zeros((token, expert), dtype=dtype)
+            score = torch.zeros((token, expert), dtype=dtype, device=device)
             start_col = 0
             end_col = topk
             for token_id in range(token):
@@ -1742,7 +1750,7 @@ class FmoeTuner(TunerCommon):
             routing_seed = os.environ.get("TUNE_MOE_ROUTING_SEED")
             if routing_seed is not None:
                 torch.manual_seed(int(routing_seed))
-            score = torch.randn((token, expert), dtype=dtype)
+            score = torch.randn((token, expert), dtype=dtype, device=device)
         topk_weights, topk_ids = fused_topk(input, score, topk, True)
         if q_type == QuantType.per_1x128:
             a1_qt, a1_scale = aiter.pertoken_quant(
@@ -1865,11 +1873,13 @@ class FmoeTuner(TunerCommon):
             out1 = torch.zeros(
                 (token + (token * ratio + 127) // 128, topk, inter_dim),
                 dtype=a1_qt.dtype,
+                device=device,
             )
         else:
             out1 = torch.empty(
                 (token, topk, inter_dim),
                 dtype=dtype,
+                device=device,
             )
         a1_scale_t = a1_scale
         if q_type == QuantType.per_1x128:
@@ -2532,6 +2542,7 @@ class FmoeTuner(TunerCommon):
             out1 = torch.zeros(
                 (token + (token * ratio + 127) // 128, topk, inter_dim),
                 dtype=a1_qt.dtype,
+                device=a1_qt.device,
             )
             ref1_asm = torch.zeros_like(out1)
             ref1_asm[:token] = a2_qt
@@ -2544,6 +2555,7 @@ class FmoeTuner(TunerCommon):
             out1 = torch.empty(
                 (token, topk, inter_dim),
                 dtype=dtype,
+                device=a1_qt.device,
             )
             return ref1
 
