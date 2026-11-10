@@ -4,7 +4,14 @@
 import pytest
 import torch
 
+import aiter.ops.triton.gemm.basic.gemm_a16w16x3 as x3_op
 from aiter.ops.triton.gemm.basic.gemm_a16w16x3 import gemm_a16w16x3, split_bf16x3
+from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.utility.graph_alloc import ROUTES_INSIDE_CAPTURE, capture_scoped_cache
+
+pytestmark = pytest.mark.skipif(
+    "gfx950" not in get_arch(), reason="gemm_a16w16x3 has configs for gfx950 only"
+)
 
 
 def generate_gemm_a16w16x3_inputs(M, N, K, output=True, seed=0):
@@ -43,6 +50,14 @@ def test_gemm_a16w16x3(M, N, K):
     _check(out, x, weight)
 
 
+@pytest.mark.parametrize("M", [1, 64])
+@pytest.mark.parametrize("K", [96, 128])
+def test_gemm_a16w16x3_small_k_without_split_k(M, K):
+    # For a K this small, compute_splitk_params sets NUM_KSPLIT to 1.
+    x, weight, w, y = generate_gemm_a16w16x3_inputs(M, 128, K)
+    _check(gemm_a16w16x3(x, w, y=y), x, weight)
+
+
 @pytest.mark.parametrize("M", [1, 31, 512])
 def test_gemm_a16w16x3_allocates_y_and_takes_strided_x(M):
     N, K = 128, 6144
@@ -66,6 +81,33 @@ def test_gemm_a16w16x3_repeats_bitwise(M):
         _check(gemm_a16w16x3(x, w, y=y), x, weight)
     again = gemm_a16w16x3(x0, w0, y=torch.empty_like(y0))
     assert torch.equal(again, first)
+
+
+@pytest.mark.skipif(
+    not ROUTES_INSIDE_CAPTURE, reason="needs torch >= 2.10 to allocate in a capture"
+)
+@pytest.mark.parametrize("M", [1, 64])
+def test_gemm_a16w16x3_first_split_k_use_inside_capture(M, monkeypatch):
+    # A fresh counter cache makes the first split-K call happen inside the capture.
+    torch.cuda.synchronize()
+    fresh = capture_scoped_cache(x3_op._split_counters.__wrapped__)
+    monkeypatch.setattr(x3_op, "_split_counters", fresh)
+    N, K = 128, 6144
+    x, _, w, y = generate_gemm_a16w16x3_inputs(M, N, K)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        gemm_a16w16x3(x, w, y=y)
+    for seed in (1, 2):
+        x_new, weight_new, w_new, _ = generate_gemm_a16w16x3_inputs(
+            M, N, K, output=False, seed=seed
+        )
+        x.copy_(x_new)
+        w.copy_(w_new)
+        graph.replay()
+        torch.cuda.synchronize()
+        _check(y, x, weight_new)
+    # An eager call after the capture must not use the counters of the graph.
+    _check(gemm_a16w16x3(x, w), x, weight_new)
 
 
 def test_gemm_a16w16x3_more_accurate_than_bf16_weight():

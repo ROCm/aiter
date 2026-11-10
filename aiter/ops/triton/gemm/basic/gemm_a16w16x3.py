@@ -13,12 +13,12 @@ from aiter.ops.triton.utils.common_utils import deserialize_str, serialize_dict
 from aiter.ops.triton.utils.device_info import get_num_xcds
 from aiter.ops.triton.utils.gemm_config_utils import compute_splitk_params
 from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.utility.graph_alloc import capture_scoped_cache, persistent_alloc
 
 _LOGGER = AiterTritonLogger()
 
-# Split-K arrival counters, one buffer for each (device, stream). The kernel resets
-# each counter that it uses, so a buffer is all zeros between launches.
-_TILE_COUNTERS = {}
+# One split-K arrival counter for each output tile.
+_SPLIT_COUNTERS = 1 << 16
 
 
 def split_bf16x3(weight: torch.Tensor) -> torch.Tensor:
@@ -49,13 +49,11 @@ def split_bf16x3(weight: torch.Tensor) -> torch.Tensor:
     return torch.stack(terms).contiguous()
 
 
-def _tile_counters(device: torch.device, num_tiles: int) -> torch.Tensor:
-    key = (device.index, torch.cuda.current_stream(device).cuda_stream)
-    counters = _TILE_COUNTERS.get(key)
-    if counters is None or counters.numel() < num_tiles:
-        counters = torch.zeros(max(num_tiles, 1024), dtype=torch.int32, device=device)
-        _TILE_COUNTERS[key] = counters
-    return counters
+@capture_scoped_cache
+def _split_counters(device: torch.device, stream_id: int) -> torch.Tensor:
+    # Zeroed counters for each (device, stream). The kernel resets the ones it uses.
+    with persistent_alloc(device):
+        return torch.zeros(_SPLIT_COUNTERS, dtype=torch.int32, device=device)
 
 
 def gemm_a16w16x3_fake_tensor(
@@ -96,8 +94,10 @@ def gemm_a16w16x3_(
     Returns:
         y (torch.Tensor): FP32 output with shape (M, N).
 
-    Limits: x and w must be bf16 and y fp32. Split-K launches use counters of the
-    current stream, so a captured graph must not run on two streams at the same time.
+    Limits: x and w must be bf16 and y fp32. Configs exist for gfx950 only.
+    Split-K launches use counters of the current stream, so a captured graph must
+    not run on two streams at the same time. With torch < 2.10, run one eager
+    split-K call on a stream before a graph capture on that stream.
     """
     _LOGGER.info(
         "GEMM_A16W16X3: x.shape=%s, w.shape=%s", tuple(x.shape), tuple(w.shape)
@@ -122,13 +122,14 @@ def gemm_a16w16x3_(
     num_tiles = triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(
         N, config["BLOCK_SIZE_N"]
     )
-    counters = _tile_counters(x.device, num_tiles)
+    workspace, counters = None, None
     if config["NUM_KSPLIT"] > 1:
+        assert num_tiles <= _SPLIT_COUNTERS, "too many output tiles for split-K"
         workspace = torch.empty(
             (config["NUM_KSPLIT"], M, N), dtype=torch.float32, device=x.device
         )
-    else:
-        workspace = y
+        stream_id = torch.cuda.current_stream(x.device).cuda_stream
+        counters = _split_counters(x.device, stream_id)
 
     grid = (num_tiles * config["NUM_KSPLIT"],)
     _gemm_a16w16x3_kernel[grid](
@@ -160,5 +161,11 @@ def gemm_a16w16x3(
     y: torch.Tensor | None = None,
     config: dict | None = None,
 ) -> torch.Tensor:
+    """
+    Computes Y = X @ W^T in fp32 for an fp32 weight W held as three bf16 terms.
+
+    See ``gemm_a16w16x3_`` for the arguments. Here ``config`` is a dict. The
+    wrapper serializes it, so that torch.compile can trace the op.
+    """
     config_hashable = serialize_dict(config) if config else None
     return gemm_a16w16x3_(x, w, y, config_hashable)
