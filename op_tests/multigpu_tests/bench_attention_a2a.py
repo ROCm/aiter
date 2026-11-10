@@ -390,7 +390,8 @@ def _render(records, shapes, world, arch, args, elapsed_s):
     lines = [
         (
             f"world={world}; GPU arch={arch}; link={args.link}; "
-            f"inbox={args.resolved_inbox}; rotations={_ROTATIONS}; "
+            f"inbox={args.resolved_inbox}; fg_release={args.fg_release}; "
+            f"rotations={_ROTATIONS}; "
             f"warmup={args.warmup}; iters={args.iterations}"
         )
     ]
@@ -509,7 +510,10 @@ def _worker(rank, world, args):
                 all_records, args.shapes, world, arch, args, time.perf_counter() - start
             )
             print(report, flush=True)
-            output = f"/tmp/bench_attention_a2a_w{world}.md"
+            output = (
+                f"/tmp/bench_attention_a2a_w{world}_{args.resolved_inbox}"
+                f"_{args.fg_release}.md"
+            )
             with open(output, "w", encoding="utf-8") as handle:
                 handle.write(report + "\n")
             print(f"Wrote {output}", flush=True)
@@ -586,6 +590,13 @@ def main():
         )
         return 0
     args.link, args.resolved_inbox = _resolve_inbox(args.inbox_memory, args.world_size)
+    # Reported only: the op reads AITER_A2A_FG_RELEASE itself, and only for a
+    # fine-grained inbox.
+    args.fg_release = (
+        os.environ.get("AITER_A2A_FG_RELEASE", "last_wg")
+        if args.resolved_inbox == "finegrained"
+        else "none"
+    )
     mp.spawn(_worker, args=(args.world_size, args), nprocs=args.world_size, join=True)
     return 0
 
