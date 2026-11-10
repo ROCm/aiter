@@ -37,6 +37,10 @@ Taking GEMM kernel in Llama-70B model for example, `aiter/configs/model_configs/
   Then refer to the steps in [CK gemm a4w4 blockscale tune](https://github.com/ROCm/aiter/tree/main/csrc/ck_gemm_a4w4_blockscale) for kernel performance tuning. 
 
 
+## Known deliberately-untuned shapes
+
+- **GLM-5.x gfx942 TP8 decode, 257 experts / top-9, M = 1 and 2:** `a8w8_blockscale_tuned_fmoe_glm5_1.csv` has no row here on purpose ([#7044](https://github.com/ROCm/aiter/pull/7044)). The ASM 1-stage kernels win eagerly but are 1.95-2.3x slower under graph replay. `a8w8_blockscale_untuned_fmoe_glm5.csv` still carries the shape, so re-tuning must compare under replay before restoring a row.
+
 ## Model List
 The model list we have summarized including:
 - [Llama3.3-70B](https://huggingface.co/meta-llama/Llama-3.3-70B-Instruct)
