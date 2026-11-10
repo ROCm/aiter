@@ -172,9 +172,15 @@ def _configure_payload_geometry(
             for chunk in range_constexpr((fz_epr + 63) // 64):
                 local_expert = lane + fx.Int32(chunk * 64)
                 valid = local_expert < fx.Int32(fz_epr)
-                ge = fx.Int32(destination * fz_epr) + valid.select(local_expert, fx.Int32(0))
-                source_count = valid.select(load_at(local_hist, ge, fx.Int32, 1), fx.Int32(0))
-                max_source_count = (source_count > max_source_count).select(source_count, max_source_count)
+                ge = fx.Int32(destination * fz_epr) + valid.select(
+                    local_expert, fx.Int32(0)
+                )
+                source_count = valid.select(
+                    load_at(local_hist, ge, fx.Int32, 1), fx.Int32(0)
+                )
+                max_source_count = (source_count > max_source_count).select(
+                    source_count, max_source_count
+                )
                 rows = rows + source_count
         else:
             for local_expert in range(lane, fz_epr, 64):
@@ -218,7 +224,9 @@ def _configure_payload_geometry(
                     min_blocks = (total_rows <= fx.Int32(payload_small[1])).select(
                         fx.Int32(payload_small[0]), min_blocks
                     )
-                active_blocks = (active_blocks > min_blocks).select(active_blocks, min_blocks)
+                active_blocks = (active_blocks > min_blocks).select(
+                    active_blocks, min_blocks
+                )
             active_blocks = (active_blocks < max_blocks).select(
                 active_blocks, max_blocks
             )
@@ -369,9 +377,32 @@ def _spin_tagged_counts(a_bc, indices, tag):
 
 @flyc.jit
 def _plan_expert_slice(
-    a_bc, p_mb, a_se, a_trb, a_sm, a_nv, a_max_expert_tiles, a_ready_tail, a_tile_ready, a_tile_expected,
-    a_tile_expected_shared, a_expert_tile_end, lane, wave, *, num_waves, fz_npes, fz_epr, fz_mtpr, fz_rank,
-    fz_tile_m, payload_chunk_rows, g2_skip_bm=0, hoist_loads=False, count_tag=None, g2_fold_mark=0,
+    a_bc,
+    p_mb,
+    a_se,
+    a_trb,
+    a_sm,
+    a_nv,
+    a_max_expert_tiles,
+    a_ready_tail,
+    a_tile_ready,
+    a_tile_expected,
+    a_tile_expected_shared,
+    a_expert_tile_end,
+    lane,
+    wave,
+    *,
+    num_waves,
+    fz_npes,
+    fz_epr,
+    fz_mtpr,
+    fz_rank,
+    fz_tile_m,
+    payload_chunk_rows,
+    g2_skip_bm=0,
+    hoist_loads=False,
+    count_tag=None,
+    g2_fold_mark=0,
 ):
     """emit_dispatch_plan's per-expert plan for wave `wave`'s slice of the local experts.
 
@@ -392,11 +423,17 @@ def _plan_expert_slice(
         for expert_chunk in range_constexpr((fz_epr + 63) // 64):
             chunk_expert = fx.Int32(expert_chunk * 64) + lane
             safe = (chunk_expert < fx.Int32(fz_epr)).select(chunk_expert, fx.Int32(0))
-            tag_index += [fx.Int32(source * fz_epr) + safe for source in range_constexpr(fz_npes)]
+            tag_index += [
+                fx.Int32(source * fz_epr) + safe for source in range_constexpr(fz_npes)
+            ]
         slice_expert = slice_begin + lane
-        slice_safe = ((lane < fx.Int32(slice_experts)) & (slice_expert < fx.Int32(fz_epr))).select(
-            slice_expert, fx.Int32(0))
-        tag_index += [fx.Int32(source * fz_epr) + slice_safe for source in range_constexpr(fz_npes)]
+        slice_safe = (
+            (lane < fx.Int32(slice_experts)) & (slice_expert < fx.Int32(fz_epr))
+        ).select(slice_expert, fx.Int32(0))
+        tag_index += [
+            fx.Int32(source * fz_epr) + slice_safe
+            for source in range_constexpr(fz_npes)
+        ]
         tagged = _spin_tagged_counts(a_bc, tag_index, count_tag)
 
     def _expert_counts(local_expert, valid_expert, words=None):
@@ -405,7 +442,9 @@ def _plan_expert_slice(
         total_count = fx.Int32(0)
         for source in range_constexpr(fz_npes):
             if const_expr(words is None):
-                source_count = load_at(r_bc, fx.Int32(source * fz_epr) + safe_expert, fx.Int32, 1)
+                source_count = load_at(
+                    r_bc, fx.Int32(source * fz_epr) + safe_expert, fx.Int32, 1
+                )
             else:
                 source_count = words[source]
             source_count = valid_expert.select(source_count, fx.Int32(0))
@@ -418,26 +457,42 @@ def _plan_expert_slice(
         # memory round trip instead of three.
         slice_expert = slice_begin + lane
         slice_counts = _expert_counts(
-            slice_expert, (lane < fx.Int32(slice_experts)) & (slice_expert < fx.Int32(fz_epr)),
-            None if count_tag is None else tagged[-fz_npes:])
-        remote_bases = [load_at(AddrBuffer(p_mb), fx.Int32(source), fx.Int64, 1) for source in range(fz_npes)]
+            slice_expert,
+            (lane < fx.Int32(slice_experts)) & (slice_expert < fx.Int32(fz_epr)),
+            None if count_tag is None else tagged[-fz_npes:],
+        )
+        remote_bases = [
+            load_at(AddrBuffer(p_mb), fx.Int32(source), fx.Int64, 1)
+            for source in range(fz_npes)
+        ]
     row_carry = fx.Int32(0)
     row_total = fx.Int32(0)
     max_expert_tiles = fx.Int32(0)
     for expert_chunk in range_constexpr((fz_epr + 63) // 64):
         local_expert = fx.Int32(expert_chunk * 64) + lane
         valid_expert = local_expert < fx.Int32(fz_epr)
-        _, total_count = _expert_counts(local_expert, valid_expert,
-            None if count_tag is None else tagged[expert_chunk * fz_npes:(expert_chunk + 1) * fz_npes])
+        _, total_count = _expert_counts(
+            local_expert,
+            valid_expert,
+            (
+                None
+                if count_tag is None
+                else tagged[expert_chunk * fz_npes : (expert_chunk + 1) * fz_npes]
+            ),
+        )
         num_tiles = (total_count + fx.Int32(fz_tile_m - 1)) // tile_m
         padded_rows = num_tiles * tile_m
         before = (local_expert < slice_begin).select(padded_rows, fx.Int32(0))
-        row_carry = row_carry + fx.Int32(fx.rocdl.readlane(T.i32, _wave_inclusive_scan_i32(before, lane), 63))
+        row_carry = row_carry + fx.Int32(
+            fx.rocdl.readlane(T.i32, _wave_inclusive_scan_i32(before, lane), 63)
+        )
         row_total = row_total + fx.Int32(
             fx.rocdl.readlane(T.i32, _wave_inclusive_scan_i32(padded_rows, lane), 63)
         )
         chunk_max = _wave_reduce_max_i32(num_tiles, lane)
-        max_expert_tiles = (chunk_max > max_expert_tiles).select(chunk_max, max_expert_tiles)
+        max_expert_tiles = (chunk_max > max_expert_tiles).select(
+            chunk_max, max_expert_tiles
+        )
 
     local_expert = slice_begin + lane
     valid_expert = (lane < fx.Int32(slice_experts)) & (local_expert < fx.Int32(fz_epr))
@@ -447,7 +502,9 @@ def _plan_expert_slice(
         source_counts, total_count = _expert_counts(local_expert, valid_expert)
     num_tiles = (total_count + fx.Int32(fz_tile_m - 1)) // tile_m
     padded_rows = num_tiles * tile_m
-    local_row_base = row_carry + _wave_inclusive_scan_i32(padded_rows, lane) - padded_rows
+    local_row_base = (
+        row_carry + _wave_inclusive_scan_i32(padded_rows, lane) - padded_rows
+    )
     ge = fx.Int32(fz_rank * fz_epr) + local_expert
     sender_prefix = fx.Int32(0)
     for source in range_constexpr(fz_npes):
@@ -455,7 +512,9 @@ def _plan_expert_slice(
             if const_expr(hoist_loads):
                 remote_my_base = remote_bases[source]
             else:
-                remote_my_base = load_at(AddrBuffer(p_mb), fx.Int32(source), fx.Int64, 1)
+                remote_my_base = load_at(
+                    AddrBuffer(p_mb), fx.Int32(source), fx.Int64, 1
+                )
             store_at(local_row_base + sender_prefix, AddrBuffer(remote_my_base), ge)
         sender_prefix = sender_prefix + source_counts[source]
 
@@ -471,17 +530,29 @@ def _plan_expert_slice(
             sender_prefix = fx.Int32(0)
             for source in range_constexpr(fz_npes):
                 source_count = source_counts[source]
-                starts_inside = (source_count > fx.Int32(0)) & (sender_prefix > tile_lo) & (sender_prefix < tile_hi)
-                expected_chunks = expected_chunks + starts_inside.select(fx.Int32(1), fx.Int32(0))
+                starts_inside = (
+                    (source_count > fx.Int32(0))
+                    & (sender_prefix > tile_lo)
+                    & (sender_prefix < tile_hi)
+                )
+                expected_chunks = expected_chunks + starts_inside.select(
+                    fx.Int32(1), fx.Int32(0)
+                )
                 # Chunk starts sender_prefix + k * chunk for 1 <= k <= last_k, counted strictly inside the tile.
-                last_k = (source_count > fx.Int32(0)).select((source_count - fx.Int32(1)) // chunk, fx.Int32(0))
+                last_k = (source_count > fx.Int32(0)).select(
+                    (source_count - fx.Int32(1)) // chunk, fx.Int32(0)
+                )
                 below = tile_lo - sender_prefix
-                first_k = (below >= fx.Int32(0)).select(below // chunk + fx.Int32(1), fx.Int32(1))
+                first_k = (below >= fx.Int32(0)).select(
+                    below // chunk + fx.Int32(1), fx.Int32(1)
+                )
                 above = tile_hi - fx.Int32(1) - sender_prefix
                 top_k = (above >= fx.Int32(0)).select(above // chunk, fx.Int32(-1))
                 top_k = (top_k < last_k).select(top_k, last_k)
                 inside = top_k - first_k + fx.Int32(1)
-                expected_chunks = expected_chunks + (inside > fx.Int32(0)).select(inside, fx.Int32(0))
+                expected_chunks = expected_chunks + (inside > fx.Int32(0)).select(
+                    inside, fx.Int32(0)
+                )
                 sender_prefix = sender_prefix + source_count
             tile_index = base_tile + tile
             store_at(fx.Int32(0), AddrBuffer(a_tile_ready), tile_index)
@@ -489,7 +560,11 @@ def _plan_expert_slice(
             store_at(expected_chunks, AddrBuffer(a_tile_expected_shared), tile_index)
             store_at(ge, AddrBuffer(a_se), tile_index)
             store_at(tile_lo + local_row_base, AddrBuffer(a_trb), tile_index)
-        store_at((local_row_base + padded_rows) // tile_m, AddrBuffer(a_expert_tile_end), local_expert)
+        store_at(
+            (local_row_base + padded_rows) // tile_m,
+            AddrBuffer(a_expert_tile_end),
+            local_expert,
+        )
         if const_expr(g2_skip_bm > 0):
             # GEMM2 skips an m-block whose first srcmap row is padding before its payload lands, so the first
             # row of every real m-block must not keep a padding entry of an earlier launch: mark it real now
@@ -499,7 +574,11 @@ def _plan_expert_slice(
                 if const_expr(g2_fold_mark > 0):
                     # GEMM2 folds an m-block whose row g2_fold_mark is padding into its expert's previous one.
                     if real_row + fx.Int32(g2_fold_mark) < total_count:
-                        store_at(fx.Int32(0), AddrBuffer(a_sm), local_row_base + real_row + fx.Int32(g2_fold_mark))
+                        store_at(
+                            fx.Int32(0),
+                            AddrBuffer(a_sm),
+                            local_row_base + real_row + fx.Int32(g2_fold_mark),
+                        )
     # The whole wave writes each expert's padding srcmap rows (fewer than tile_m, contiguous): the expert's own
     # lane storing them one by one, up to tile_m - 1 stores, was the longest part of the plan.
     pad_end = valid_expert.select(local_row_base + padded_rows, fx.Int32(0))
@@ -509,12 +588,18 @@ def _plan_expert_slice(
         e_rows = fx.Int32(fx.rocdl.readlane(T.i32, pad_rows, slot))
         for r0 in range_constexpr(0, fz_tile_m, 64):
             if lane + fx.Int32(r0) < e_rows:
-                store_at(fx.Int32(fz_npes * fz_mtpr), AddrBuffer(a_sm), e_end - e_rows + lane + fx.Int32(r0))
+                store_at(
+                    fx.Int32(fz_npes * fz_mtpr),
+                    AddrBuffer(a_sm),
+                    e_end - e_rows + lane + fx.Int32(r0),
+                )
 
     if (wave == fx.Int32(0)) & (lane == fx.Int32(0)):
         store_at(row_total, AddrBuffer(a_nv), fx.Int32(0))
         store_at(max_expert_tiles, AddrBuffer(a_max_expert_tiles), fx.Int32(0))
-        ready_order = (max_expert_tiles * fx.Int32(8 * fz_tile_m) >= row_total).select(fx.Int32(1), fx.Int32(0))
+        ready_order = (max_expert_tiles * fx.Int32(8 * fz_tile_m) >= row_total).select(
+            fx.Int32(1), fx.Int32(0)
+        )
         store_at(fx.Int32(0), AddrBuffer(a_ready_tail), fx.Int32(0))
         store_at(ready_order, AddrBuffer(a_ready_tail), fx.Int32(1))
 
@@ -3012,7 +3097,9 @@ class LargeMRuntime:
         )
 
     @classmethod
-    def ends_all_ranks(cls, *, world_size, model_dim, inter_dim, experts, topk, max_tok_per_rank):
+    def ends_all_ranks(
+        cls, *, world_size, model_dim, inter_dim, experts, topk, max_tok_per_rank
+    ):
         """Whether every launch ends only once every rank finished its GEMM2 (the combine's generation barrier).
 
         With comb_tok_wait a rank's combine waits only for its own tokens' rows, so it can leave, and start its next
@@ -3021,8 +3108,12 @@ class LargeMRuntime:
         """
         # The large-input config is the same for every token count.
         return not select_fused_config(
-            1, max_tok_per_rank, world_size=world_size, experts_per_rank=experts // world_size,
-            model_dim=model_dim, inter_dim=inter_dim,
+            1,
+            max_tok_per_rank,
+            world_size=world_size,
+            experts_per_rank=experts // world_size,
+            model_dim=model_dim,
+            inter_dim=inter_dim,
         ).fused_stage2.comb_tok_wait
 
     # fmt: off

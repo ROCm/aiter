@@ -268,11 +268,23 @@ def prefetch_direct_fixed_slot_route(
         topk_slot = wk - source_token * fx.Int32(fz_k)
         duplicate = topk_slot < fx.Int32(0)
         for j in range_constexpr(fz_k - 1):
-            ej = load_at(AddrBuffer(addr_in_idx), source_token * fx.Int32(fz_k) + fx.Int32(j), fx.Int32, 1)
-            same = (ej >= fx.Int32(0)) & (ej < fx.Int32(fz_total_experts)) & (ej // fx.Int32(fz_epr) == destination)
+            ej = load_at(
+                AddrBuffer(addr_in_idx),
+                source_token * fx.Int32(fz_k) + fx.Int32(j),
+                fx.Int32,
+                1,
+            )
+            same = (
+                (ej >= fx.Int32(0))
+                & (ej < fx.Int32(fz_total_experts))
+                & (ej // fx.Int32(fz_epr) == destination)
+            )
             duplicate = duplicate | ((fx.Int32(j) < topk_slot) & same)
-        extra = {"duplicate": duplicate, "token_rows": dp(DispatchSlot.TOKEN_ROWS),
-                 "token_scales": dp(DispatchSlot.TOKEN_SCALES)}
+        extra = {
+            "duplicate": duplicate,
+            "token_rows": dp(DispatchSlot.TOKEN_ROWS),
+            "token_scales": dp(DispatchSlot.TOKEN_SCALES),
+        }
     return {
         **extra,
         "tables": tables,
@@ -1627,15 +1639,21 @@ class SmallMRuntime:
             compact=cls.GM_COMPACT,
         )
         config = select_fused_config(
-            1, max_tok_per_rank, world_size=world_size, experts_per_rank=experts // world_size,
-            model_dim=model_dim, inter_dim=inter_dim,
+            1,
+            max_tok_per_rank,
+            world_size=world_size,
+            experts_per_rank=experts // world_size,
+            model_dim=model_dim,
+            inter_dim=inter_dim,
         )
         if config.fused_stage1.dedup_rows:
             rows += world_size * max_tok_per_rank
         return nvm, rows, row_bytes, scale_n_i32
 
     @classmethod
-    def ends_all_ranks(cls, *, world_size, model_dim, inter_dim, experts, topk, max_tok_per_rank):
+    def ends_all_ranks(
+        cls, *, world_size, model_dim, inter_dim, experts, topk, max_tok_per_rank
+    ):
         """Whether every launch ends only once every peer's grid finished (its combine waits for every peer's flag).
 
         A tok_done bucket's combine takes each token once its own rows are counted, so a rank can leave, and start
@@ -1644,8 +1662,12 @@ class SmallMRuntime:
         """
         return not any(
             select_fused_config(
-                bucket, max_tok_per_rank, world_size=world_size, experts_per_rank=experts // world_size,
-                model_dim=model_dim, inter_dim=inter_dim,
+                bucket,
+                max_tok_per_rank,
+                world_size=world_size,
+                experts_per_rank=experts // world_size,
+                model_dim=model_dim,
+                inter_dim=inter_dim,
             ).fused_stage1.tok_done
             for bucket in FUSED_TOKEN_BUCKETS
             if bucket <= max_tok_per_rank

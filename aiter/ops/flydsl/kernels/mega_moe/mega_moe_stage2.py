@@ -112,9 +112,12 @@ def _fp8_quant_1x32(vals, lane, group_lane=None, leader_gate=None):
 
 def _fp8_scale_e8m0(local_max, qmax_inv_bits=0x3B124925):
     """Branch-free _fp8_scale_for_leader: the E8M0 scale of a block whose absolute max is local_max
-    (the smallest power of two with local_max / scale <= qmax; qmax_inv_bits = f32 bits of 1 / qmax, 448 default)."""
+    (the smallest power of two with local_max / scale <= qmax; qmax_inv_bits = f32 bits of 1 / qmax, 448 default).
+    """
     max_bits = local_max.bitcast(fx.Int32)
-    working_bits = (local_max * fx.Int32(qmax_inv_bits).bitcast(fx.Float32)).bitcast(fx.Int32)
+    working_bits = (local_max * fx.Int32(qmax_inv_bits).bitcast(fx.Float32)).bitcast(
+        fx.Int32
+    )
     mantissa = working_bits & fx.Int32(0x7FFFFF)
     biased_exp = (working_bits >> fx.Int32(23)) & fx.Int32(0xFF)
     e8m0 = (mantissa != fx.Int32(0)).select(biased_exp + fx.Int32(1), biased_exp)
@@ -141,9 +144,21 @@ def _fp8_quant_1x32_lean(vals, route_i8=False):
         for w in range_constexpr(2):
             word = fx.Int32(0)
             for b in range_constexpr(4):
-                word = fx.Int32(llvm.call_intrinsic(T.i32, "llvm.amdgcn.cvt.pk.u8.f32",
-                    [(vals[4 * w + b] * inv_scale + fx.Float32(128.0)).ir_value(), fx.Int32(b).ir_value(),
-                     word.ir_value()], [], []))
+                word = fx.Int32(
+                    llvm.call_intrinsic(
+                        T.i32,
+                        "llvm.amdgcn.cvt.pk.u8.f32",
+                        [
+                            (
+                                vals[4 * w + b] * inv_scale + fx.Float32(128.0)
+                            ).ir_value(),
+                            fx.Int32(b).ir_value(),
+                            word.ir_value(),
+                        ],
+                        [],
+                        [],
+                    )
+                )
             words.append(word)
         return e8m0, fx.Vector.from_elements(words, fx.Int32)
     block_scale = (e8m0 << fx.Int32(23)).bitcast(fx.Float32)
@@ -163,7 +178,10 @@ def _fp8_quant_1x32_lean(vals, route_i8=False):
             packed_lo = packed
         else:
             packed_hi = packed
-    words = [fx.Vector(packed_lo).bitcast(fx.Int32)[0], fx.Vector(packed_hi).bitcast(fx.Int32)[0]]
+    words = [
+        fx.Vector(packed_lo).bitcast(fx.Int32)[0],
+        fx.Vector(packed_hi).bitcast(fx.Int32)[0],
+    ]
     return e8m0, fx.Vector.from_elements(words, fx.Int32)
 
 

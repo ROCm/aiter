@@ -872,7 +872,10 @@ def _run_layer_slot_stress(moe, x, weights, ids, slots, cycles, rank, rtol):
     # tuned layout (EP4 V4.1-Flash: FP8 combine rows, BF16 head tokens) sums in another order, so it
     # is held to rtol, far below the error of a stale binding (layer B doubles W2).
     config = moe._large_m._select_config(tokens)
-    exact = config.fused_stage1 == FusedStage1Knobs() and config.fused_stage2 == FusedStage2Knobs()
+    exact = (
+        config.fused_stage1 == FusedStage1Knobs()
+        and config.fused_stage2 == FusedStage2Knobs()
+    )
     checked_slots = {0, 1, slots - 1}
     checked = 0
 

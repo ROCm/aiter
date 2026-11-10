@@ -309,7 +309,9 @@ class ATileLoader:
                         source_byte = self._chunks[source_index][1]
                         source_row = source_byte // fx.Int32(self._row_bytes)
                     if const_expr(self._group_chunks):
-                        row_byte = self._dma_rows[round_base // self._total_threads]  # noqa: B023
+                        row_byte = self._dma_rows[
+                            round_base // self._total_threads
+                        ]  # noqa: B023
                     else:
                         row_byte = source_row * fx.Int32(self._row_bytes)
                     src_byte = row_byte + koff + logical_chunk * fx.Int32(16)
@@ -418,7 +420,9 @@ class AS2RLoader:
         )
         lo = Vec(llvm.extractvalue(v4, pair, [0])).bitcast(fx.Int64)
         hi = Vec(llvm.extractvalue(v4, pair, [1])).bitcast(fx.Int64)
-        return Vec.from_elements([lo[0], lo[1], hi[0], hi[1]], fx.Int64).bitcast(fx.Int32)
+        return Vec.from_elements([lo[0], lo[1], hi[0], hi[1]], fx.Int64).bitcast(
+            fx.Int32
+        )
 
 
 class BWeightLoader:
@@ -527,7 +531,14 @@ class AScaleLoader:
         if self._indexed_input:
             assert row_map_rsrc is not None
 
-    def stage(self, lds_ascale, tile_row_base_i32, row_map=None, valid_rows_i32=None, srcs=None):
+    def stage(
+        self,
+        lds_ascale,
+        tile_row_base_i32,
+        row_map=None,
+        valid_rows_i32=None,
+        srcs=None,
+    ):
         """Copy this tile's E8M0 scale block from global memory to LDS.
 
         ``row_map`` / ``srcs`` as ``ATileLoader.for_tile`` (``row_map["scale_token"]``:
@@ -553,14 +564,24 @@ class AScaleLoader:
                 # lane (j % 4) * 16 + r % 16, byte (r // 16) % 2 + 2 * ((j // 4) % 2) of group r // 32's word.
                 row = lin // fx.Int32(row_chunks)
                 c = lin - row * fx.Int32(row_chunks)
-                byte_base = ((c * fx.Int32(2 * self._n_groups) + (row >> fx.Int32(5))) * fx.Int32(256)
-                    + (row & fx.Int32(15)) * fx.Int32(4) + ((row >> fx.Int32(4)) & fx.Int32(1)))
+                byte_base = (
+                    (c * fx.Int32(2 * self._n_groups) + (row >> fx.Int32(5)))
+                    * fx.Int32(256)
+                    + (row & fx.Int32(15)) * fx.Int32(4)
+                    + ((row >> fx.Int32(4)) & fx.Int32(1))
+                )
                 i8_ptr = fx.recast_iter(fx.Int8, lds_ascale.ptr)
                 vb = Vec(v).bitcast(fx.Int8)
                 for j in range_constexpr(16):
-                    imm = (j // 8) * self._n_groups * 256 + (j % 4) * 64 + ((j // 4) % 2) * 2
-                    fx.make_view(fx.add_offset(i8_ptr, byte_base + fx.Int32(imm)), fx.make_layout(1, 1)).store(
-                        Vec.from_elements([vb[j]], fx.Int8))
+                    imm = (
+                        (j // 8) * self._n_groups * 256
+                        + (j % 4) * 64
+                        + ((j // 4) % 2) * 2
+                    )
+                    fx.make_view(
+                        fx.add_offset(i8_ptr, byte_base + fx.Int32(imm)),
+                        fx.make_layout(1, 1),
+                    ).store(Vec.from_elements([vb[j]], fx.Int8))
             else:
                 dst = fx.make_view(
                     fx.add_offset(fx.recast_iter(fx.Int32, lds_ascale.ptr), lin * 4),
@@ -568,7 +589,9 @@ class AScaleLoader:
                 )
                 fragment = fx.make_rmem_tensor(4, fx.Int32)
                 fragment.store(v)
-                fx.copy(fx.make_copy_atom(fx.UniversalCopy128b(), fx.Int32), fragment, dst)
+                fx.copy(
+                    fx.make_copy_atom(fx.UniversalCopy128b(), fx.Int32), fragment, dst
+                )
 
         if const_expr(row_map is not None):
             assert not self._indexed_input
@@ -586,7 +609,12 @@ class AScaleLoader:
                     real = (srcs[i] & fx.Int32(0xFFFFFF)) < fx.Int32(row_map["rows"])
                 else:
                     real = row < valid_rows_i32
-                copy_mapped(lin, real.select(row_group, fx.Int32(0)) + lin - row * fx.Int32(row_chunks))
+                copy_mapped(
+                    lin,
+                    real.select(row_group, fx.Int32(0))
+                    + lin
+                    - row * fx.Int32(row_chunks),
+                )
         elif const_expr(self._indexed_input):
             groups_per_row = self._n_scale // 16
             # indexed_slots scales with sort_block_m and the 16-lane subgroup
@@ -637,9 +665,13 @@ class AScaleLoader:
         row_chunks = self._n_scale // 16
         assert self._n_scale % 16 == 0
         out = []
-        for c in range_constexpr(0, self._sort_block_m * row_chunks, self._total_threads):
+        for c in range_constexpr(
+            0, self._sort_block_m * row_chunks, self._total_threads
+        ):
             row = (fx.Int32(c) + fx.Int32(self._tx)) // fx.Int32(row_chunks)
-            row = (row < fx.Int32(self._sort_block_m)).select(row, fx.Int32(self._sort_block_m - 1))
+            row = (row < fx.Int32(self._sort_block_m)).select(
+                row, fx.Int32(self._sort_block_m - 1)
+            )
             out.append(_buffer_load(srcmap_rsrc, tile_row_base_i32 + row, fx.Int32))
         return out
 
@@ -652,7 +684,10 @@ class AScaleLoader:
             i32_ptr = fx.recast_iter(fx.Int32, lds_ascale.ptr)
             base = kstep_i32 * fx.Int32(self._n_groups * 64) + fx.Int32(self._lane)
             for g in range_constexpr(self._n_groups):
-                v = fx.make_view(fx.add_offset(i32_ptr, base + fx.Int32(g * 64)), fx.make_layout(1, 1)).load()
+                v = fx.make_view(
+                    fx.add_offset(i32_ptr, base + fx.Int32(g * 64)),
+                    fx.make_layout(1, 1),
+                ).load()
                 out.append(Vec(v, dtype=fx.Int32)[0])
             return out
         for g in range_constexpr(self._n_groups):

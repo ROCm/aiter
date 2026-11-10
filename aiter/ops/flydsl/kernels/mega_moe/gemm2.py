@@ -159,7 +159,10 @@ def issue_a_load_lds_dt(
         )
         tile_row = lds_row + a_lane_row
         voffset = (lane_col ^ mask) + tile_row * K_BYTES
-        off = fx.Int32(slot * ((BM if slot_rows is None else slot_rows) * KH_TILE_A)) + lds_row * KH_TILE_A
+        off = (
+            fx.Int32(slot * ((BM if slot_rows is None else slot_rows) * KH_TILE_A))
+            + lds_row * KH_TILE_A
+        )
         v_e = (voffset + kt * KH_TILE_A) // 4  # per-lane i32-elem index
         fx.copy(
             atom, src[v_e, None], lds_dma_dst(base_i32, off, elem_ty=T.i32, align=16)
