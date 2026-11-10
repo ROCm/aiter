@@ -1022,6 +1022,137 @@ def test_triton_unified_attn_sw_split_no_sinks(seq_lens, num_heads, block_size):
 
 
 @pytest.mark.parametrize(
+    "head_size, num_heads, query_len",
+    [(128, (8, 1), 1), (256, (32, 2), 1), (128, (8, 8), 32)],
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, e4m3_dtype])
+@pytest.mark.parametrize("use_sinks", [False, True])
+@torch.inference_mode()
+def test_triton_unified_attn_window_decode_split(
+    head_size, num_heads, query_len, dtype, use_sinks, monkeypatch
+):
+    """Sliding-window decode (q=1) at head 128 and 256, and a 32-token query
+    at head 128 with one query head per KV head, bf16 and fp8.
+
+    These heads are outside test_triton_unified_attn_3d, which is head 64, and
+    the 32-token query is past the 16-token bound the window split had before.
+    The batch is one that the gfx950 gluon config splits into several
+    segments. The test records what the launch site receives and checks that
+    before comparing the output, so it cannot drift from the dispatch.
+    """
+    if DEVICE_ARCH != "gfx950" or not _is_gluon_available():
+        pytest.skip("gfx950 gluon window decode")
+
+    sliding_window = 2048
+    seq_lens = [(query_len, 8192)] * 8
+    block_size = 16
+    query_lens = [q for q, _ in seq_lens]
+    kv_lens = [kv for _, kv in seq_lens]
+    (
+        query,
+        key_cache,
+        value_cache,
+        launched_k,
+        launched_v,
+        sinks,
+        output,
+        cu_query_lens,
+        kv_lens_t,
+        max_query_len,
+        max_kv_len,
+        scale,
+        window_size,
+        block_tables,
+        _maybe_quant_query,
+        _query_scales,
+        q_descale,
+        k_descale,
+        v_descale,
+        _output_scale,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        num_blocks=len(seq_lens) * ((max(kv_lens) + block_size - 1) // block_size),
+        block_size=block_size,
+        head_size=head_size,
+        num_heads=num_heads,
+        sliding_window=sliding_window,
+        q_dtype=dtype,
+        kv_dtype=dtype,
+        out_dtype=torch.bfloat16,
+    )
+    sinks = sinks if use_sinks else None
+
+    # the one launch site of the gfx950 gluon kernel, for both grids
+    module = sys.modules[unified_attention.__module__]
+    launches = []
+    real_launch = module._unified_attention_gfx950
+
+    def record_launch(params, *args, **kwargs):
+        launches.append(
+            {
+                "all_decode": params.all_decode,
+                "sliding_window": params.sliding_window,
+                "num_segments": kwargs.get("NUM_SEGMENTS", 1),
+            }
+        )
+        return real_launch(params, *args, **kwargs)
+
+    monkeypatch.setattr(module, "_unified_attention_gfx950", record_launch)
+
+    unified_attention(
+        q=query,
+        k=launched_k,
+        v=launched_v,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens_t,
+        max_seqlen_q=max_query_len,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window_size,
+        block_table=block_tables,
+        softcap=0,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        sinks=sinks,
+    )
+    # one gluon launch, split into several segments, with the window set
+    assert len(launches) == 1, launches
+    assert launches[0]["all_decode"] == (query_len == 1), launches
+    assert launches[0]["sliding_window"] == sliding_window, launches
+    assert launches[0]["num_segments"] > 1, launches
+    ref = ref_paged_attn(
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        query_lens=query_lens,
+        kv_lens=kv_lens,
+        block_tables=block_tables,
+        scale=scale,
+        out_dtype=torch.bfloat16,
+        sliding_window=sliding_window,
+        sinks=sinks,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+    )
+    atol, rtol = (1.5e-2, 1e-2) if dtype == torch.bfloat16 else (1.5e-1, 1.5e-1)
+    assert (
+        checkAllclose(
+            output,
+            ref,
+            atol=atol,
+            rtol=rtol,
+            tol_err_ratio=0.01,
+            msg=f"window head {head_size} q={query_len} {dtype} sinks={use_sinks}",
+        )
+        <= 0.01
+    )
+
+
+@pytest.mark.parametrize(
     "seq_lens",
     [
         [(1, 1328)],
