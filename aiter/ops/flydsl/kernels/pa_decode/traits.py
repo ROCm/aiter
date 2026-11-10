@@ -691,17 +691,36 @@ class PaDecodeTraits:
         )
         # gfx950 single-M-tile decode (BF16, or FP8 with a full 16-row tile)
         # issues Q ahead of the page ids and stages it while K is in flight.
-        DECODE_Q_EARLY = BF16_DECODE_NT_KV or (
-            is_gfx950
-            and kv_dtype == "fp8"
-            and head_dim == 128
-            and M_TILES == 1
-            and sliding_window == 0
-            and (
-                (block_size == 128 and CTA_ROWS == MFMA_MNK)
-                # Scalar page 16 also covers partial tiles: padded rows load
-                # the last real row and are never staged.
-                or (block_size == 16 and not per_token_kv)
+        DECODE_Q_EARLY = (
+            BF16_DECODE_NT_KV
+            or (
+                is_gfx950
+                and kv_dtype == "fp8"
+                and head_dim == 128
+                and M_TILES == 1
+                and sliding_window == 0
+                and (
+                    (block_size == 128 and CTA_ROWS == MFMA_MNK)
+                    # Scalar page 16 also covers partial tiles: padded rows
+                    # load the last real row and are never staged.
+                    or (block_size == 16 and not per_token_kv)
+                )
+            )
+            # The scalar head-256 pipe and BF16 page 16 take the same early Q.
+            # (Per-token head-256 orders its scale loads ahead of K instead.)
+            or (
+                is_gfx950
+                and D256_PIPE
+                and not per_token_kv
+                and M_TILES == 1
+                and sliding_window == 0
+            )
+            or (
+                is_gfx950
+                and is_bf16_kv
+                and block_size == 16
+                and M_TILES == 1
+                and sliding_window == 0
             )
         )
         # gfx950 per-token FP8 page128 tiles that load Q early stage the
