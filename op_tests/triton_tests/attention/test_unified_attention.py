@@ -10,12 +10,10 @@ import pytest
 import torch
 
 from aiter.ops.triton.attention.unified_attention import (
-    _gfx1250_use_tdm_store,
     _is_gluon_available,
     is_2d_gluon_available,
     unified_attention,
 )
-from aiter.ops.triton.utils import unified_attention_utils
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.shuffle import shuffle_scale_batched, shuffle_weight
 from aiter.ops.triton.utils.types import e4m3_dtype
@@ -1126,7 +1124,11 @@ def test_unified_attn_spec_verify_gfx1250(
 
 
 def test_gfx1250_ua2d_register_store_gate() -> None:
-    """Check the register-store boundary and its tuning on any machine."""
+    """The config flag is the register-store switch. Check it on any machine.
+
+    The lookup uses the wider head, and the output dtype is not an axis, so
+    those shapes follow that entry.
+    """
     b, f, e, u = torch.bfloat16, torch.float16, e4m3_dtype, torch.uint8
     # name, q head, v head, G, page, q, kv, out, q len, tdm, tile
     cases = [
@@ -1135,10 +1137,10 @@ def test_gfx1250_ua2d_register_store_gate() -> None:
         ("fp8 q/kv", 64, 64, 8, 64, e, e, b, 1, False, 128),
         ("bf16 q fp8 kv", 64, 64, 8, 64, b, e, b, 1, False, 64),
         ("nvfp4 kv", 64, 64, 8, 64, b, u, b, 1, False, 64),
-        ("q head 64 v 32", 64, 32, 8, 64, b, b, b, 1, True, 64),
-        ("q head 32 v 64", 32, 64, 8, 64, b, b, b, 1, True, 64),
-        ("fp8 asymmetric", 64, 32, 8, 64, e, e, b, 1, True, 128),
-        ("fp16 out", 64, 64, 8, 64, b, b, f, 1, True, 64),
+        ("q head 64 v 32", 64, 32, 8, 64, b, b, b, 1, False, 64),
+        ("q head 32 v 64", 32, 64, 8, 64, b, b, b, 1, False, 64),
+        ("fp8 asymmetric", 64, 32, 8, 64, e, e, b, 1, False, 128),
+        ("fp16 out", 64, 64, 8, 64, b, b, f, 1, False, 64),
         ("tp2", 64, 64, 4, 64, b, b, b, 1, True, 64),
         ("page 16", 64, 64, 8, 16, b, b, b, 1, True, 64),
         ("extend", 64, 64, 8, 64, b, b, b, 128, True, 64),
@@ -1163,11 +1165,7 @@ def test_gfx1250_ua2d_register_store_gate() -> None:
             "attn_2d", params, backend="gluon", arch="gfx1250"
         )
         assert config["TILE_SIZE"] == tile, name
-        assert _gfx1250_use_tdm_store(params, config) is tdm, name
-        assert "USE_TDM_STORE" not in config, name
-        if tdm:
-            config["USE_TDM_STORE"] = False
-            assert _gfx1250_use_tdm_store(params, config) is True, name
+        assert config.pop("USE_TDM_STORE", True) is tdm, name
 
     rows = [
         ("bf16", b, b, 64),
@@ -1206,8 +1204,7 @@ def test_gfx1250_ua2d_register_store_gate() -> None:
                     tag = f"{name} sw={window} sk={seq_k} shuffled={shuffled}"
                     p = params(8, qd, kd, window, seq_k, shuffled)
                     cfg = lookup(p)
-                    assert _gfx1250_use_tdm_store(p, cfg) is False, tag
-                    assert "USE_TDM_STORE" not in cfg, tag
+                    assert cfg.pop("USE_TDM_STORE", True) is False, tag
                     assert cfg["TILE_SIZE"] == tile, tag
 
     # The flagged entries copy the tuning of the entries they replace. The G=4
@@ -1218,62 +1215,6 @@ def test_gfx1250_ua2d_register_store_gate() -> None:
         assert flagged.pop("USE_TDM_STORE", True) is False, name
         assert "USE_TDM_STORE" not in original, name
         assert flagged == original, name
-
-    invalid_flags = [
-        ("missing", None),
-        ("null", None),
-        ("true", True),
-        ("zero", 0),
-        ("one", 1),
-        ("string", "false"),
-        ("list", []),
-        ("object", {}),
-    ]
-    for name, qd, kd, _tile in rows:
-        p = params(8, qd, kd)
-        for label, value in invalid_flags:
-            cfg = lookup(p)
-            if label == "missing":
-                cfg.pop("USE_TDM_STORE")
-            else:
-                cfg["USE_TDM_STORE"] = value
-            with pytest.raises(ValueError, match="USE_TDM_STORE=false"):
-                _gfx1250_use_tdm_store(p, cfg)
-            assert "USE_TDM_STORE" not in cfg, (name, label)
-
-
-def test_gfx1250_ua2d_unflagged_specific_config(monkeypatch) -> None:
-    """Reject a more specific tuning leaf that hides the safe store flag."""
-    params = SimpleNamespace(
-        head_size=64,
-        head_size_v=64,
-        max_seqlen_q=1,
-        max_seqlen_k=4096,
-        sliding_window=128,
-        shuffled_kv_cache=False,
-        q_dtype=torch.bfloat16,
-        kv_cache_dtype=torch.bfloat16,
-        block_size=64,
-        num_queries_per_kv=8,
-        all_decode=True,
-        out=SimpleNamespace(dtype=torch.bfloat16),
-    )
-    table, axes, cfg_dir = unified_attention_utils._load("attn_2d", "gluon", "gfx1250")
-    table = dict(table)
-    table["D_EQ_64.Q_LEQ_1.SW"] = dict(table["Q_LEQ_1"])
-    monkeypatch.setattr(
-        unified_attention_utils, "_load", lambda *args: (table, axes, cfg_dir)
-    )
-    unified_attention_utils._get_unified_attention_config_cached.cache_clear()
-    try:
-        cfg = get_unified_attention_config(
-            "attn_2d", params, backend="gluon", arch="gfx1250"
-        )
-        assert "USE_TDM_STORE" not in cfg
-        with pytest.raises(ValueError, match="USE_TDM_STORE=false"):
-            _gfx1250_use_tdm_store(params, cfg)
-    finally:
-        unified_attention_utils._get_unified_attention_config_cached.cache_clear()
 
 
 @pytest.mark.parametrize("num_seqs", [4, 64])

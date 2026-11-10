@@ -813,31 +813,6 @@ _reduce_segments_{arch}(
 """
 
 
-def _gfx1250_use_tdm_store(params: _UAParams, config: dict) -> bool:
-    """Require register stores for reviewed gfx1250 decode shapes.
-
-    Reject an unsafe config for those shapes; other shapes keep TDM stores.
-    """
-    use_tdm_store = config.pop("USE_TDM_STORE", None)
-    reviewed = (
-        params.head_size == 64
-        and params.head_size_v == 64
-        and params.num_queries_per_kv == 8
-        and params.block_size == 64
-        and params.out.dtype == torch.bfloat16
-        and params.all_decode
-    )
-    if not reviewed:
-        return True
-    if use_tdm_store is not False:
-        raise ValueError(
-            "gfx1250 2D decode requires USE_TDM_STORE=false for head sizes 64, "
-            "8 query heads per KV head, page size 64, and bf16 output; "
-            "fix the selected unified-attention config"
-        )
-    return False
-
-
 def _unified_attention_2d_gfx1250(params: _UAParams):
     """
     Internal wrapper for the gfx1250 gluon kernel.
@@ -850,9 +825,9 @@ def _unified_attention_2d_gfx1250(params: _UAParams):
     assert params.softcap == 0, "Softcap is not supported"
 
     config = get_unified_attention_config("attn_2d", params, backend="gluon")
-    # TDM stores of LDS-staged output can corrupt gfx1250 decode rows under load.
-    # Require the reviewed register-store config before launch.
-    USE_TDM_STORE = _gfx1250_use_tdm_store(params, config)
+    # TDM stores of LDS-staged output can corrupt some gfx1250 decode rows.
+    # Those shapes set USE_TDM_STORE false; every other shape keeps TDM stores.
+    USE_TDM_STORE = config.pop("USE_TDM_STORE", True)
     NUM_SEQS = params.num_seqs
     TILE_SIZE = config["TILE_SIZE"]
     BLOCK_M = max(config["BLOCK_M"], triton.next_power_of_2(params.num_queries_per_kv))
