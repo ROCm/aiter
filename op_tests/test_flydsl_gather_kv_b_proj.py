@@ -25,7 +25,7 @@ import torch
 
 import aiter
 from aiter import dtypes
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
 from aiter.ops.flydsl.gather_kv_b_proj import (
     gather_kv_b_proj_flydsl,
     gather_kv_b_proj_flydsl_fp8_supported,
@@ -120,7 +120,7 @@ _SKIP_GFX1250 = pytest.mark.skipif(
     reason="gfx1250 FlyDSL required",
 )
 _SKIP_FP8_OUT = pytest.mark.skipif(
-    get_gfx() not in ("gfx950", "gfx1250"),
+    get_gfx_runtime() not in ("gfx950", "gfx1250"),
     reason="gfx950 or gfx1250 FlyDSL required",
 )
 
