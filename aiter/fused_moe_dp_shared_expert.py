@@ -13,7 +13,7 @@ from aiter import ActivationType, QuantType, dtypes, logger
 
 # from aiter import get_torch_quant as get_quant
 from aiter import get_hip_quant as get_quant
-from aiter.fused_moe import moe_sorting
+from aiter.fused_moe import get_block_size_M, moe_sorting
 from aiter.jit.core import (
     AITER_CSRC_DIR,
     AITER_ROOT_DIR,
@@ -307,23 +307,6 @@ def fused_moe_1stage(
             activation=activation,
         )
     return moe_buf
-
-
-@functools.lru_cache(maxsize=1024)
-def get_block_size_M(token, topk, expert, inter_dim):
-    cu_num = get_cu_num()
-    tileN = 128
-    tgN = (inter_dim + tileN - 1) // tileN
-    support_list = [32, 64, 128]
-
-    tmp = []
-    for el in support_list:
-        max_num_tokens = token * topk + expert * el - topk
-        tg_num = tgN * (max_num_tokens + el - 1) // el
-        rnd = (tg_num + cu_num - 1) // cu_num
-        empty = cu_num - tg_num % cu_num
-        tmp.append((rnd, empty, el))
-    return min(tmp, key=lambda x: x[:2])[-1]
 
 
 cfg_2stages = None
