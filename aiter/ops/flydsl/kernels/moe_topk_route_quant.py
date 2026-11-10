@@ -226,6 +226,7 @@ def build_moe_topk_route_quant_module(
     renormalize: bool = True,
     max_rows: int = MAX_ROWS,
     local: bool = False,
+    shared: bool = False,
 ):
     """JIT launcher ``(logits, hidden, num_valid_rows, topk_weights, topk_ids,
     topids_to_rows, masked_m, psum, payload, scale, exchange, token_num,
@@ -238,6 +239,16 @@ def build_moe_topk_route_quant_module(
     each cluster splits the top-k of all rows over its workgroups, exchanges the
     ids (cluster 0 through ``topk_ids``, cluster c > 0 through row c - 1 of
     ``exchange``) and quantizes its share of the tokens.
+
+    ``shared`` (FHMoE): one shared expert after the ``experts`` routed ones. Its
+    gate logit is column ``experts`` of ``logits``. Every row also gets route
+    ``topk``: id ``experts`` (on padding rows too, as the prefilled shared
+    column has it), weight ``sigmoid(logit)`` (0 on padding rows) and grouped
+    row ``start + token``: the shared segment follows the routed experts'
+    tile-aligned segments and holds every row of the batch in token order.
+    ``masked_m`` / ``psum`` get the shared entry last. The shared rows are not
+    quantized: the FHMoE GEMM reads the shared expert's activations from
+    ``hidden``.
     """
     if experts != 256:
         raise NotImplementedError(
@@ -249,6 +260,10 @@ def build_moe_topk_route_quant_module(
         raise NotImplementedError("fused top-k/route/quant renormalizes only")
     if not 1 <= topk <= min(LANES_PER_ROW, 16):
         raise NotImplementedError(f"topk {topk} unsupported")
+    # Routes a row: the routed top-k, then the shared expert's.
+    n_out = topk + int(shared)
+    if n_out > LANES_PER_ROW:
+        raise NotImplementedError(f"{n_out} routes a row exceed a top-k wave")
     if align_m & (align_m - 1) or align_m <= 0:
         raise ValueError(f"align_m {align_m} must be a power of two")
     L = _quant_layout(feat_dim, quant_mode, wmma_rep)
@@ -267,7 +282,7 @@ def build_moe_topk_route_quant_module(
     if -(-max_rows // CLUSTER) * LANES_PER_ROW > BLOCK_THREADS:
         raise ValueError(f"max_rows {max_rows} needs more top-k lanes than a block")
     # Routes each thread reads back from the exchange.
-    ids_per_thread = -(-max_rows * topk // BLOCK_THREADS)
+    ids_per_thread = -(-max_rows * n_out // BLOCK_THREADS)
     tasks_per_wave = 1
     vals_per_lane = experts // LANES_PER_ROW  # 8
     words = -(-max_rows // 32)  # bitmask dwords per expert
@@ -292,15 +307,16 @@ def build_moe_topk_route_quant_module(
 
     @fx.struct
     class _Storage:
-        ids: fx.Array[fx.Int32, max_rows * topk, 16]
+        ids: fx.Array[fx.Int32, max_rows * n_out, 16]
         bits: fx.Array[fx.Int32, experts * words, 16]
-        starts: fx.Array[fx.Int32, experts, 16]
+        starts: fx.Array[fx.Int32, experts + int(shared), 16]
         counts: fx.Array[fx.Int32, experts, 16]
         scale: fx.Array[fx.Int32, scale_lds, 16]
 
     module_name = (
         f"moe_topk_route_quant_e{experts}_k{topk}_fd{feat_dim}_r{wmma_rep}"
         f"_a{align_m}_{quant_mode}_{L.native_tag}_rn_mr{max_rows}{'_local' if local else f'_cl{CLUSTER}'}"
+        f"{'_sh' if shared else ''}"
     )
 
     @flyc.kernel(name=module_name, known_block_size=[BLOCK_THREADS, 1, 1])
@@ -370,12 +386,12 @@ def build_moe_topk_route_quant_module(
         xchg_addr = (cl_id == fx.Uint32(0)).select(
             fx.Int64(ptrtoint(topk_ids)),
             fx.Int64(ptrtoint(exchange))
-            + fx.Int64(cl_id - fx.Uint32(1)) * fx.Int64(n_tok * fx.Uint32(topk * 4)),
+            + fx.Int64(cl_id - fx.Uint32(1)) * fx.Int64(n_tok * fx.Uint32(n_out * 4)),
         )
         # Bounded to the batch's routes: the read-back below loads whole
         # `ids_per_thread` strides, and the reads past the batch return 0.
         xchg_rsrc = buffer_ops.create_buffer_resource_from_addr(
-            xchg_addr, num_records_bytes=fx.Int32(n_tok * fx.Uint32(topk * 4))
+            xchg_addr, num_records_bytes=fx.Int32(n_tok * fx.Uint32(n_out * 4))
         )
 
         lds = fx.SharedAllocator().allocate(_Storage).peek()
@@ -479,6 +495,17 @@ def build_moe_topk_route_quant_module(
             ).bitcast(fx.Int32)
             for h in range_constexpr(vals_per_lane // 8)
         ]
+        if const_expr(shared):
+            # The shared gate logit (column `experts`): the dword of columns
+            # experts - 1 and experts, which ends inside the row.
+            sh_dw = fx.Vector(
+                buffer_ops.buffer_load(
+                    logits_rsrc,
+                    (fx.Int32(row) * row_bytes + fx.Int32((experts - 1) * 2)) >> c1_i32,
+                    vec_width=2,
+                    dtype=T.i16,
+                )
+            ).bitcast(fx.Int32)
 
         # Clear the per-expert token bitmask and counts (made visible by the
         # cluster barrier's workgroup barrier).
@@ -551,23 +578,32 @@ def build_moe_topk_route_quant_module(
                 my_e = is_k.select(top_e[k], my_e)
                 my_n = is_k.select(numer[k], my_n)
             my_w = nz.select(my_n * scale, my_n)
-            route = fx.Int32(row) * fx.Int32(topk) + fx.Int32(g)
+            route = fx.Int32(row) * fx.Int32(n_out) + fx.Int32(g)
             out_e = is_pad.select(fx.Int32(-1), my_e)
-            if g < fx.Uint32(topk):
+            out_w = is_pad.select(c0_f32, my_w)
+            if const_expr(shared):
+                # Lane `topk`: the shared route, weight the sigmoid gate
+                # (1 / (1 + expf(-logit)), as topk_softmax scores it).
+                is_sh = g == fx.Uint32(topk)
+                x_sh = (fx.Uint32(sh_dw[0]) & c_hi16).bitcast(fx.Float32)
+                sig = fx.Float32(1.0) / (fx.Float32(1.0) + fx.exp(c0_f32 - x_sh))
+                out_e = is_sh.select(fx.Int32(experts), out_e)
+                out_w = is_sh.select(is_pad.select(c0_f32, sig), out_w)
+            if g < fx.Uint32(n_out):
                 if const_expr(local):
                     if (row >= q_base) & (row < q_end):
-                        ptr_buf_tensor(topk_weights, fx.Float32)[route] = is_pad.select(
-                            c0_f32, my_w
-                        )
+                        ptr_buf_tensor(topk_weights, fx.Float32)[route] = out_w
                         ptr_buf_tensor(topk_ids)[route] = out_e
                     lds_ids[route] = out_e
-                    if not is_pad:
-                        _set_token_bit(lds_bits, lds_counts, my_e, row, words)
+                    if const_expr(shared):
+                        if (out_e >= c0_i32) & (out_e < fx.Int32(experts)):
+                            _set_token_bit(lds_bits, lds_counts, my_e, row, words)
+                    else:
+                        if not is_pad:
+                            _set_token_bit(lds_bits, lds_counts, my_e, row, words)
                 else:
                     if cl_id == fx.Uint32(0):
-                        ptr_buf_tensor(topk_weights, fx.Float32)[route] = is_pad.select(
-                            c0_f32, my_w
-                        )
+                        ptr_buf_tensor(topk_weights, fx.Float32)[route] = out_w
                     buffer_ops.buffer_store(
                         out_e, xchg_rsrc, route, cache_modifier=_CPOL_SCOPE_DEV
                     )
@@ -685,7 +721,7 @@ def build_moe_topk_route_quant_module(
             # Phase 2: every route of the batch into the per-expert bitmask.
             # All the read-backs are issued before the quant pass, which runs
             # under their latency.
-            n_routes = n_tok * fx.Uint32(topk)
+            n_routes = n_tok * fx.Uint32(n_out)
             back = []
             for j in range_constexpr(ids_per_thread):
                 idx = tid + fx.Uint32(j * BLOCK_THREADS)
@@ -734,10 +770,16 @@ def build_moe_topk_route_quant_module(
             for idx, e in back:
                 if idx < n_routes:
                     lds_ids[idx] = e
-                    if e >= c0_i32:
-                        _set_token_bit(
-                            lds_bits, lds_counts, e, idx // fx.Uint32(topk), words
-                        )
+                    if const_expr(shared):
+                        if (e >= c0_i32) & (e < fx.Int32(experts)):
+                            _set_token_bit(
+                                lds_bits, lds_counts, e, idx // fx.Uint32(n_out), words
+                            )
+                    else:
+                        if e >= c0_i32:
+                            _set_token_bit(
+                                lds_bits, lds_counts, e, idx // fx.Uint32(topk), words
+                            )
             gpu.barrier()
 
         # Phase 3 (wave 0): per-expert counts and the tile-aligned exclusive
@@ -766,6 +808,17 @@ def build_moe_topk_route_quant_module(
                 if is_writer:
                     ptr_buf_tensor(masked_m)[e0 + fx.Int32(i)] = cnts[i]
                     ptr_buf_tensor(psum)[e0 + fx.Int32(i)] = start + cnts[i]
+            if const_expr(shared):
+                # The shared segment after every routed one: all the rows of
+                # the batch, in token order.
+                start_sh = fx.Int32(rocdl.readlane(i32, lane_incl, wave_size - 1))
+                if lane == fx.Uint32(0):
+                    lds_starts[fx.Int32(experts)] = start_sh
+                    if is_writer:
+                        ptr_buf_tensor(masked_m)[fx.Int32(experts)] = fx.Int32(n_tok)
+                        ptr_buf_tensor(psum)[fx.Int32(experts)] = start_sh + fx.Int32(
+                            n_tok
+                        )
         gpu.barrier()
 
         # Phase 4: quantize this workgroup's tokens into their grouped rows.
@@ -773,10 +826,10 @@ def build_moe_topk_route_quant_module(
         # Every route row of the wave's tasks at once, one lane a route (lane
         # i * topk + k: task i, route k), then broadcast with readlane. Done a
         # route at a time, each row is a chain of dependent LDS round trips.
-        if const_expr(tasks_per_wave * topk > wave_size):
+        if const_expr(tasks_per_wave * n_out > wave_size):
             raise NotImplementedError("a wave's task routes must fit one wave")
-        l_task = lane // fx.Uint32(topk)
-        l_k = lane - l_task * fx.Uint32(topk)
+        l_task = lane // fx.Uint32(n_out)
+        l_k = lane - l_task * fx.Uint32(n_out)
         l_live = fx.Boolean(False)
         l_token = fx.Uint32(0)
         l_writes = fx.Boolean(False)
@@ -786,9 +839,11 @@ def build_moe_topk_route_quant_module(
             l_live = is_i.select(live_i, l_live)
             l_token = is_i.select(token_i, l_token)
             l_writes = is_i.select(live_i & (k_group_i == fx.Uint32(0)), l_writes)
-        l_route = fx.Int32(l_token) * fx.Int32(topk) + fx.Int32(l_k)
+        l_route = fx.Int32(l_token) * fx.Int32(n_out) + fx.Int32(l_k)
         l_e = fx.Int32(lds_ids[l_live.select(l_route, c0_i32)])
         l_valid = l_live & (l_token < n_valid) & (l_e >= c0_i32)
+        if const_expr(shared):
+            l_valid = l_valid & (l_e < fx.Int32(experts))
         l_base = l_valid.select(l_e, c0_i32) * fx.Int32(words)
         l_word = l_token >> fx.Uint32(5)
         l_below = (c1_i32 << fx.Int32(l_token & fx.Uint32(31))) - c1_i32
@@ -804,6 +859,10 @@ def build_moe_topk_route_quant_module(
             lds_starts[l_valid.select(l_e, c0_i32)] + l_slot,
             fx.Int32(DROPPED_ROUTE_ROW),
         )
+        if const_expr(shared):
+            l_row = (l_live & (l_e == fx.Int32(experts))).select(
+                fx.Int32(lds_starts[fx.Int32(experts)]) + fx.Int32(l_token), l_row
+            )
         if l_writes:
             rows_t[l_route] = l_row
 
@@ -812,7 +871,7 @@ def build_moe_topk_route_quant_module(
             qc, results = quant[i]
             if live & (token < n_valid):
                 rows = [
-                    fx.Uint32(rocdl.readlane(i32, l_row, i * topk + k))
+                    fx.Uint32(rocdl.readlane(i32, l_row, i * n_out + k))
                     for k in range_constexpr(topk)
                 ]
                 scales = [

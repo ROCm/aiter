@@ -820,23 +820,32 @@ def _grouped_a8w4_tdm_moe(
         _deferred = _take_deferred_topk(topk_ids, topk_weight)
         if _deferred is not None:
             _quant_mode_early = "fp4" if data_format == "fp4" else "fp8"
+            # FHMoE on bf16 shared activations: the fused kernels route the
+            # shared expert (the deferral's shared column) in token order and
+            # leave its rows unquantized, as its tiles read hidden_states.
+            _dsh = int(_deferred.num_shared)
+            _fused_sh = _dsh == 1
+            _fused_topk = int(topk) - _dsh
             _fusable = (
                 not _compact
                 and a1_scale is None
                 and hidden_states.dim() == 2
                 and int(E) == _deferred.gating_output.shape[1]
                 and _same_count(_deferred.num_valid_rows, num_local_tokens)
+                and _fused_sh == _sh_bf16
+                and (shared is None or _sh_bf16)
             )
             if _fusable and fused_topk_route_quant_supported(
                 _deferred.gating_output,
                 hidden_states,
-                topk,
+                _fused_topk,
                 _deferred.renormalize,
+                shared=_fused_sh,
             ):
                 _prepared_a1 = fused_topk_route_quant(
                     _deferred.gating_output,
                     hidden_states,
-                    topk,
+                    _fused_topk,
                     align_m=_align_m,
                     contiguous_m=contiguous_m,
                     wmma_rep=wmma_rep,
@@ -844,6 +853,7 @@ def _grouped_a8w4_tdm_moe(
                     num_valid_rows=_deferred.num_valid_rows,
                     topk_weights=topk_weight,
                     topk_ids=topk_ids,
+                    shared=_fused_sh,
                 )
             elif (
                 _fusable
@@ -851,8 +861,9 @@ def _grouped_a8w4_tdm_moe(
                 and fused_topk_route_quant_prefill_supported(
                     _deferred.gating_output,
                     hidden_states,
-                    topk,
+                    _fused_topk,
                     _deferred.renormalize,
+                    shared=_fused_sh,
                 )
             ):
                 # Prefill sizes: the same outputs from two launches in place of
@@ -860,13 +871,14 @@ def _grouped_a8w4_tdm_moe(
                 _prepared_a1 = fused_topk_route_quant_prefill(
                     _deferred.gating_output,
                     hidden_states,
-                    topk,
+                    _fused_topk,
                     align_m=_align_m,
                     contiguous_m=contiguous_m,
                     wmma_rep=wmma_rep,
                     num_valid_rows=_deferred.num_valid_rows,
                     topk_weights=topk_weight,
                     topk_ids=topk_ids,
+                    shared=_fused_sh,
                 )
             else:
                 _deferred.resolve()
@@ -1177,7 +1189,6 @@ def _grouped_a8w4_tdm_moe(
             # buffer in token order, which stage 2 reads.
             if (
                 topids_to_rows is None
-                or _prepared_a1 is not None
                 or int(tile_m2) != int(tile_m)
                 or hidden_states.dtype != torch.bfloat16
             ):
@@ -2103,31 +2114,52 @@ class _DeferredTopk:
 
     __slots__ = (
         "gating_output",
+        "num_shared",
         "num_valid_rows",
         "renormalize",
         "topk_ids",
         "topk_weights",
     )
 
-    def __init__(self, topk_weights, topk_ids, gating_output, renormalize, nvr):
+    def __init__(
+        self, topk_weights, topk_ids, gating_output, renormalize, nvr, num_shared=0
+    ):
         self.topk_weights = topk_weights
         self.topk_ids = topk_ids
         self.gating_output = gating_output
         self.renormalize = renormalize
         self.num_valid_rows = nvr
+        self.num_shared = num_shared
 
     def resolve(self):
         from aiter import topk_softmax
 
-        token_expert_indices = torch.empty_like(self.topk_ids)
+        ids = self.topk_ids
+        if self.num_shared:
+            # The shared columns: ids after the routed experts, weights the
+            # sigmoid of their logits (topk_softmax scores them).
+            n_routed = ids.shape[1] - self.num_shared
+            n_experts = self.gating_output.shape[1] - self.num_shared
+            ids[:, n_routed:].copy_(
+                torch.arange(
+                    n_experts,
+                    n_experts + self.num_shared,
+                    dtype=ids.dtype,
+                    device=ids.device,
+                ).expand(ids.shape[0], -1)
+            )
+            ids = ids[:, :n_routed]
+        token_expert_indices = torch.empty(
+            ids.shape, dtype=ids.dtype, device=ids.device
+        )
         topk_softmax(
             self.topk_weights,
-            self.topk_ids,
+            ids,
             token_expert_indices,
             self.gating_output,
             self.renormalize,
-            0,
-            "",
+            self.num_shared,
+            "sigmoid" if self.num_shared else "",
             self.num_valid_rows,
         )
 
@@ -2141,10 +2173,16 @@ def defer_topk_softmax(
     gating_output: torch.Tensor,
     renormalize: bool,
     num_valid_rows: torch.Tensor | None = None,
+    num_fused_shared_experts: int = 0,
 ) -> None:
     """Leave ``topk_softmax(topk_weights, topk_ids, gating_output,
     renormalize, num_valid_rows=...)`` to the next ``fused_moe`` on these
     buffers.
+
+    ``num_fused_shared_experts=1`` (FHMoE): ``gating_output`` ends in the
+    shared expert's gate logit and the buffers in its column (id after the
+    routed experts, weight the sigmoid of the logit), as ``topk_softmax`` with
+    one fused shared expert and sigmoid scoring fills them.
 
     On gfx1250 the TP grouped path then computes the top-k, the routing and the
     activation quant in one launch (``fused_topk_route_quant``) when it can,
@@ -2154,8 +2192,15 @@ def defer_topk_softmax(
     deferral replaces the previous one only after filling its buffers.
     """
     resolve_deferred_topk()
+    if num_fused_shared_experts not in (0, 1):
+        raise NotImplementedError("one fused shared expert at most")
     _deferred_topk_state.pending = _DeferredTopk(
-        topk_weights, topk_ids, gating_output, renormalize, num_valid_rows
+        topk_weights,
+        topk_ids,
+        gating_output,
+        renormalize,
+        num_valid_rows,
+        num_fused_shared_experts,
     )
 
 
@@ -2255,6 +2300,7 @@ def _get_compiled_topk_route_quant(
     quant_mode: str,
     local: bool,
     max_rows: int,
+    shared: bool = False,
 ):
     from aiter.ops.flydsl.kernels.moe_topk_route_quant import (
         build_moe_topk_route_quant_module,
@@ -2269,6 +2315,7 @@ def _get_compiled_topk_route_quant(
         quant_mode=quant_mode,
         max_rows=max_rows,
         local=local,
+        shared=shared,
     )
 
 
@@ -2277,16 +2324,18 @@ def fused_topk_route_quant_supported(
     hidden_states: torch.Tensor,
     topk: int,
     renormalize: bool,
+    shared: bool = False,
 ) -> bool:
     """Whether ``fused_topk_route_quant`` serves this call (gfx1250, bf16, 256
-    routed experts, renormalized top-k, at most ``MAX_ROWS`` rows)."""
+    routed experts, renormalized top-k, at most ``MAX_ROWS`` rows; ``shared``:
+    the logits end in one shared expert's gate column)."""
     from aiter.ops.flydsl.kernels.moe_topk_route_quant import MAX_ROWS
 
     return (
         renormalize
         and 1 <= topk <= 16
         and gating_output.dim() == 2
-        and gating_output.shape[1] == 256
+        and gating_output.shape[1] == 256 + int(shared)
         and gating_output.dtype == torch.bfloat16
         and gating_output.stride(1) == 1
         and hidden_states.dim() == 2
@@ -2311,9 +2360,16 @@ def fused_topk_route_quant(
     num_valid_rows: torch.Tensor | None = None,
     topk_weights: torch.Tensor | None = None,
     topk_ids: torch.Tensor | None = None,
+    shared: bool = False,
 ):
     """One launch for ``topk_softmax(renormalize)`` + ``fused_route_psum_remap``
     + ``flydsl_moe_fused_quant_preshuffle(topids_to_rows=...)`` at small M.
+
+    ``shared`` (FHMoE): ``gating_output`` ends in one shared expert's gate
+    column and ``topk`` counts the routed experts only. The outputs get the
+    shared route last (id and weight as ``topk_softmax`` with one sigmoid-scored
+    shared expert writes them), its grouped rows in token order after the
+    routed experts, its ``masked_m`` / ``psum`` entry last and no quant.
 
     ``gating_output`` is (M, 256) bf16 with unit column stride (any row stride,
     e.g. the routed columns of a router GEMM that also emits a shared-expert
@@ -2325,16 +2381,17 @@ def fused_topk_route_quant(
     """
     device = hidden_states.device
     token_num, feat_dim = hidden_states.shape
-    experts = int(gating_output.shape[1])
+    experts = int(gating_output.shape[1]) - int(shared)
+    n_out = int(topk) + int(shared)
     if topk_weights is None:
         topk_weights = torch.empty(
-            (token_num, topk), dtype=torch.float32, device=device
+            (token_num, n_out), dtype=torch.float32, device=device
         )
     if topk_ids is None:
-        topk_ids = torch.empty((token_num, topk), dtype=torch.int32, device=device)
-    topids_to_rows = torch.empty(token_num * topk, dtype=torch.int32, device=device)
-    masked_m = torch.empty(experts, dtype=torch.int32, device=device)
-    psum = torch.empty(experts, dtype=torch.int32, device=device)
+        topk_ids = torch.empty((token_num, n_out), dtype=torch.int32, device=device)
+    topids_to_rows = torch.empty(token_num * n_out, dtype=torch.int32, device=device)
+    masked_m = torch.empty(experts + int(shared), dtype=torch.int32, device=device)
+    psum = torch.empty(experts + int(shared), dtype=torch.int32, device=device)
     payload_bytes = feat_dim if quant_mode == "fp8" else feat_dim // 2
     payload = torch.empty(
         (1, contiguous_m, payload_bytes), dtype=torch.uint8, device=device
@@ -2368,7 +2425,7 @@ def fused_topk_route_quant(
         # Clusters past the first publish their ids here (the first uses
         # topk_ids); only a cluster's own workgroups ever read its row.
         exchange = torch.empty(
-            (clusters - 1, token_num * topk), dtype=torch.int32, device=device
+            (clusters - 1, token_num * n_out), dtype=torch.int32, device=device
         )
         # The scale cluster's per-token e8m0 rows (a dword per 4 MX blocks).
         scale_exchange = torch.empty(
@@ -2383,6 +2440,7 @@ def fused_topk_route_quant(
         quant_mode,
         local,
         topk_route_quant_max_rows(token_num, local),
+        bool(shared),
     )
     launch(
         ptr_arg(gating_output),
@@ -2406,7 +2464,7 @@ def fused_topk_route_quant(
         topk_weights,
         topk_ids,
         masked_m,
-        topids_to_rows.view(token_num, topk),
+        topids_to_rows.view(token_num, n_out),
         psum,
         payload,
         scale,
@@ -2423,6 +2481,7 @@ def _get_compiled_topk_route_quant_prefill(
     slots: int,
     waves: int,
     quant_mode: str,
+    shared: bool = False,
 ):
     from aiter.ops.flydsl.kernels.moe_topk_route_quant_prefill import (
         build_moe_topk_route_quant_prefill_module,
@@ -2436,6 +2495,7 @@ def _get_compiled_topk_route_quant_prefill(
         slots=slots,
         waves=waves,
         quant_mode=quant_mode,
+        shared=shared,
     )
 
 
@@ -2505,6 +2565,7 @@ def fused_topk_route_quant_prefill_supported(
     hidden_states: torch.Tensor,
     topk: int,
     renormalize: bool,
+    shared: bool = False,
 ) -> bool:
     """Whether ``fused_topk_route_quant_prefill`` serves this call: the decode
     kernel's operand rules, more than its ``MAX_ROWS`` rows and at most
@@ -2519,7 +2580,7 @@ def fused_topk_route_quant_prefill_supported(
         renormalize
         and 1 <= topk <= 16
         and gating_output.dim() == 2
-        and gating_output.shape[1] == 256
+        and gating_output.shape[1] == 256 + int(shared)
         and gating_output.dtype == torch.bfloat16
         and gating_output.stride(1) == 1
         and hidden_states.dim() == 2
@@ -2551,6 +2612,7 @@ def fused_topk_route_quant_prefill(
     num_valid_rows: torch.Tensor | None = None,
     topk_weights: torch.Tensor | None = None,
     topk_ids: torch.Tensor | None = None,
+    shared: bool = False,
 ):
     """Two launches for the prefill front end of the grouped MoE, in place of
     eight: ``topk_softmax(renormalize)`` + the route/psum/remap + the
@@ -2559,24 +2621,26 @@ def fused_topk_route_quant_prefill(
     layout (``moe_scatter_preshuffle_scale``'s pass, bounded by psum). Same
     returns and layouts as ``fused_topk_route_quant`` (rows inside an expert in
     another order). fp4 only (the a8w4 / fp4 MoE's activation format).
+    ``shared`` as for ``fused_topk_route_quant``.
     """
     if quant_mode != "fp4":
         raise NotImplementedError("the prefill route/quant writes MXFP4 only")
     device = hidden_states.device
     token_num, feat_dim = hidden_states.shape
-    experts = int(gating_output.shape[1])
+    experts = int(gating_output.shape[1]) - int(shared)
+    n_out = int(topk) + int(shared)
     from aiter.ops.flydsl.kernels.moe_topk_route_quant_prefill import COUNT_BITS
 
     assert token_num * topk < (1 << COUNT_BITS), "status words count 20-bit routes"
     if topk_weights is None:
         topk_weights = torch.empty(
-            (token_num, topk), dtype=torch.float32, device=device
+            (token_num, n_out), dtype=torch.float32, device=device
         )
     if topk_ids is None:
-        topk_ids = torch.empty((token_num, topk), dtype=torch.int32, device=device)
-    topids_to_rows = torch.empty(token_num * topk, dtype=torch.int32, device=device)
-    masked_m = torch.empty(experts, dtype=torch.int32, device=device)
-    psum = torch.empty(experts, dtype=torch.int32, device=device)
+        topk_ids = torch.empty((token_num, n_out), dtype=torch.int32, device=device)
+    topids_to_rows = torch.empty(token_num * n_out, dtype=torch.int32, device=device)
+    masked_m = torch.empty(experts + int(shared), dtype=torch.int32, device=device)
+    psum = torch.empty(experts + int(shared), dtype=torch.int32, device=device)
     payload_bytes = feat_dim if quant_mode == "fp8" else feat_dim // 2
     payload = torch.empty(
         (1, contiguous_m, payload_bytes), dtype=torch.uint8, device=device
@@ -2592,7 +2656,14 @@ def fused_topk_route_quant_prefill(
         nvr = num_valid_rows.reshape(-1)[:1].to(dtype=torch.int32)
     grid, tpw, slots, waves = _prefill_geometry(token_num, device)
     _get_compiled_topk_route_quant_prefill(
-        experts, int(topk), int(feat_dim), int(align_m), slots, waves, quant_mode
+        experts,
+        int(topk),
+        int(feat_dim),
+        int(align_m),
+        slots,
+        waves,
+        quant_mode,
+        bool(shared),
     )(
         ptr_arg(gating_output),
         ptr_arg(hidden_states),
@@ -2622,6 +2693,7 @@ def fused_topk_route_quant_prefill(
         ptr_arg(compact),
         ptr_arg(scale),
         ptr_arg(row_to_token),
+        # The last routed expert's end (the shared rows have no MX scales).
         ptr_arg(psum[experts - 1 :]),
         int(contiguous_m) // (int(wmma_rep) * 16),
         stream=torch.cuda.current_stream(),
@@ -2630,7 +2702,7 @@ def fused_topk_route_quant_prefill(
         topk_weights,
         topk_ids,
         masked_m,
-        topids_to_rows.view(token_num, topk),
+        topids_to_rows.view(token_num, n_out),
         psum,
         payload,
         scale,

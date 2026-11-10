@@ -138,6 +138,7 @@ def build_moe_topk_route_quant_prefill_module(
     slots: int,
     waves: int = 32,
     quant_mode: str = "fp4",
+    shared: bool = False,
 ):
     """JIT launcher ``(logits, hidden, num_valid_rows, topk_weights, topk_ids,
     topids_to_rows, masked_m, psum, payload, compact_scale, row_to_token,
@@ -147,6 +148,16 @@ def build_moe_topk_route_quant_prefill_module(
     token_num`` and ``grid_wgs`` at most the workgroups the GPU holds at once
     (one a CU). ``compact_scale`` (token-major e8m0) and ``row_to_token`` feed
     ``build_moe_prefill_scale_preshuffle_module``.
+
+    ``shared`` (FHMoE): one shared expert after the ``experts`` routed ones. Its
+    gate logit is column ``experts`` of ``logits``. Every row also gets route
+    ``topk``: id ``experts`` (on padding rows too, as the prefilled shared
+    column has it), weight ``sigmoid(logit)`` (0 on padding rows) and grouped
+    row ``start + token``: the shared segment follows the routed experts'
+    tile-aligned segments and holds every row of the batch in token order.
+    ``masked_m`` / ``psum`` get the shared entry last. The shared rows are not
+    quantized (no payload, no compact e8m0 row, no ``row_to_token``): the
+    FHMoE GEMM reads the shared expert's activations from ``hidden``.
     """
     if experts != 256:
         raise NotImplementedError(
@@ -154,6 +165,10 @@ def build_moe_topk_route_quant_prefill_module(
         )
     if not 1 <= topk <= min(LANES_PER_ROW, 16):
         raise NotImplementedError(f"topk {topk} unsupported")
+    # Routes a row: the routed top-k, then the shared expert's.
+    n_out = topk + int(shared)
+    if n_out > LANES_PER_ROW:
+        raise NotImplementedError(f"{n_out} routes a row exceed a top-k wave")
     if align_m <= 0 or align_m & (align_m - 1):
         raise ValueError(f"align_m {align_m} must be a power of two")
     if not 1 <= slots <= MAX_SLOTS:
@@ -194,6 +209,7 @@ def build_moe_topk_route_quant_prefill_module(
     module_name = (
         f"moe_topk_route_quant_prefill_e{experts}_k{topk}_fd{feat_dim}"
         f"_a{align_m}_s{slots}_w{waves}_{quant_mode}_{L.native_tag}"
+        f"{'_sh' if shared else ''}"
     )
 
     @flyc.kernel(name=module_name, known_block_size=[block, 1, 1])
@@ -328,6 +344,20 @@ def build_moe_topk_route_quant_prefill_module(
                     )
                 ).bitcast(fx.Int32)
             )
+        sh_dw = []
+        if const_expr(shared):
+            # Each slot's shared gate logit (column `experts`): the dword of
+            # columns experts - 1 and experts, which ends inside the row.
+            for i in range_constexpr(slots):
+                r_eff = (rows[i] < t_end).select(rows[i], fx.Uint32(0))
+                off = fx.Int32(r_eff) * row_bytes_l + fx.Int32((experts - 1) * 2)
+                sh_dw.append(
+                    fx.Vector(
+                        buffer_ops.buffer_load(
+                            logits_rsrc, off >> c1_i32, vec_width=2, dtype=T.i16
+                        )
+                    ).bitcast(fx.Int32)
+                )
 
         if tid < fx.Uint32(experts):
             lds_cnt[tid] = c0_i32
@@ -385,10 +415,20 @@ def build_moe_topk_route_quant_prefill_module(
                 e_g = is_k.select(top_e[k], e_g)
                 n_g = is_k.select(numer[k], n_g)
             w_g = nz.select(n_g * scale, n_g)
-            route = fx.Int32(row) * fx.Int32(topk) + fx.Int32(g)
+            route = fx.Int32(row) * fx.Int32(n_out) + fx.Int32(g)
             if (row < t_end) & is_route:
                 w_t[route] = live.select(w_g, c0_f32)
                 ids_t[route] = live.select(e_g, fx.Int32(-1))
+            if const_expr(shared):
+                # Lane `topk`: the shared route, weight the sigmoid gate
+                # (1 / (1 + expf(-logit)), as topk_softmax scores it).
+                if (row < t_end) & (g == fx.Uint32(topk)):
+                    x_sh = (fx.Uint32(sh_dw[i][0]) & c_hi16).bitcast(fx.Float32)
+                    sig = fx.Float32(1.0) / (
+                        fx.Float32(1.0) + fx.exp(c0_f32 - x_sh)
+                    )
+                    w_t[route] = live.select(sig, c0_f32)
+                    ids_t[route] = fx.Int32(experts)
             ls = c0_i32
             if live & is_route:
                 ls = fx.Int32(
@@ -537,6 +577,17 @@ def build_moe_topk_route_quant_prefill_module(
                 if is_writer:
                     ptr_buf_tensor(masked_m)[e0 + fx.Int32(q)] = cnts[q]
                     ptr_buf_tensor(psum)[e0 + fx.Int32(q)] = start + cnts[q]
+            if const_expr(shared):
+                # The shared segment after every routed one: all the rows of
+                # the batch, in token order.
+                start_sh = fx.Int32(rocdl.readlane(i32, lane_incl, wave_size - 1))
+                if lane == fx.Uint32(0):
+                    lds_misc[1] = start_sh
+                    if is_writer:
+                        ptr_buf_tensor(masked_m)[fx.Int32(experts)] = fx.Int32(n_tok)
+                        ptr_buf_tensor(psum)[fx.Int32(experts)] = start_sh + fx.Int32(
+                            n_tok
+                        )
         _lds_barrier()
 
         # ---- C: the maps and every route's payload ----------------------
@@ -553,7 +604,12 @@ def build_moe_topk_route_quant_prefill_module(
                 fx.Int32(DROPPED_ROUTE_ROW),
             )
             if (row < t_end) & is_route:
-                rows_t[fx.Int32(row) * fx.Int32(topk) + fx.Int32(g)] = l_row
+                rows_t[fx.Int32(row) * fx.Int32(n_out) + fx.Int32(g)] = l_row
+            if const_expr(shared):
+                if (row < t_end) & (g == fx.Uint32(topk)):
+                    rows_t[fx.Int32(row) * fx.Int32(n_out) + fx.Int32(g)] = fx.Int32(
+                        lds_misc[1]
+                    ) + fx.Int32(row)
             if l_valid:
                 r2t_t[l_row] = fx.Int32(row)
             # From the registers, a grouped row at a time (whole 1 KB runs).
