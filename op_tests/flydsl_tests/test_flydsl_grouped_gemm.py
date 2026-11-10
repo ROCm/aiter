@@ -369,12 +369,14 @@ def _run_grouped_via_fused_moe(
     data_init: str = "uniform",
     scale_init: str = "auto",
     num_valid_tokens: int | None = None,
+    routing_stats: dict[str, int] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, float | None, dict | None]:
     """Build mxfp4 weights + routing, dispatch through ``fused_moe``.
 
     ``num_valid_tokens``: rows at or past it are padding, routed as the router
     leaves them under ``num_valid_rows`` (expert -1, weight 0) and passed as
     ``num_local_tokens``. The reference covers the real rows and is 0 past them.
+    ``routing_stats`` records the actual active expert count after all timing.
 
     Stage1 weights are always laid out GUGU (gate/up row-interleaved) paired
     with ``GateMode.INTERLEAVE``, which is the only layout the TDM grouped
@@ -578,6 +580,8 @@ def _run_grouped_via_fused_moe(
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,
     ).to(out.dtype)
+    if routing_stats is not None:
+        routing_stats["active_experts"] = _active_expert_count(topk_id)
     return out, ref, us, kernel_us
 
 
@@ -601,9 +605,14 @@ def _logits_diff(actual: torch.Tensor, expected: torch.Tensor) -> float:
     return float(((x - y) ** 2).sum() / denom)
 
 
+def _active_expert_count(topk_ids: torch.Tensor) -> int:
+    """Count distinct routed experts, excluding dropped/padded routes (-1)."""
+    return topk_ids[topk_ids >= 0].unique().numel()
+
+
 def _gemm_work_metrics(
     *,
-    experts: int,
+    active_experts: int,
     tokens: int,
     topk: int,
     model_dim: int,
@@ -613,8 +622,10 @@ def _gemm_work_metrics(
     """Return conventional GEMM FLOPs and effective fused-MoE bytes.
 
     The byte model matches the grouped-MoE tuner: logical quantized inputs and
-    weights, their E8M0 block scales, and BF16 outputs. GEMM1 counts the
-    post-activation output, whose width is ``inter_dim``; GEMM2 counts its
+    weights, their E8M0 block scales, and logical BF16 outputs. Weight payloads
+    and scales are counted once per actually routed expert, not per allocated
+    expert. GEMM1 counts the post-activation output, whose width is
+    ``inter_dim``; GEMM2 counts its
     per-route output before gather-reduce. The model excludes routing,
     quantization, bias, and other fused-MoE auxiliary traffic, so the reported
     bandwidth is effective bandwidth rather than measured HBM traffic.
@@ -630,16 +641,16 @@ def _gemm_work_metrics(
         routed_rows * model_dim * input_bytes
         + routed_rows * model_dim // SCALE_BLOCK
         + routed_rows * inter_dim * output_bytes
-        + experts * model_dim * stage1_n * weight_bytes
-        + experts * model_dim * stage1_n // SCALE_BLOCK
+        + active_experts * model_dim * stage1_n * weight_bytes
+        + active_experts * model_dim * stage1_n // SCALE_BLOCK
     )
     gemm2_flops = tokens * topk * model_dim * inter_dim * 2
     gemm2_bytes = (
         tokens * topk * inter_dim * input_bytes
         + routed_rows * inter_dim // SCALE_BLOCK
         + routed_rows * model_dim * output_bytes
-        + experts * inter_dim * model_dim * weight_bytes
-        + experts * inter_dim * model_dim // SCALE_BLOCK
+        + active_experts * inter_dim * model_dim * weight_bytes
+        + active_experts * inter_dim * model_dim // SCALE_BLOCK
     )
     return {
         "gemm1": (gemm1_flops, gemm1_bytes),
@@ -661,6 +672,34 @@ def _rates(
 # ---------------------------------------------------------------------------
 # Pytest correctness suite
 # ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "ids, expected",
+    [([[0, 1], [1, 0]], 2), ([[7, 7], [-1, 2]], 2), ([[-1, -1]], 0)],
+)
+def test_active_expert_count(ids, expected):
+    assert _active_expert_count(torch.tensor(ids, device="cpu")) == expected
+
+
+@pytest.mark.parametrize("data_format", ["a4w4", "a8w4"])
+def test_gemm_work_metrics_active_weights(data_format):
+    shape = dict(
+        tokens=1, topk=8, model_dim=7168, inter_dim=2048, data_format=data_format
+    )
+    active = _gemm_work_metrics(active_experts=8, **shape)
+    allocated = _gemm_work_metrics(active_experts=64, **shape)
+    for name, weight_elements in (
+        ("gemm1", 7168 * 4096),
+        ("gemm2", 2048 * 7168),
+    ):
+        assert active[name][0] == allocated[name][0]
+        assert allocated[name][1] - active[name][1] == 56 * (
+            weight_elements // 2 + weight_elements // SCALE_BLOCK
+        )
+        tflops, bw = _rates(active[name], 10.0)
+        assert tflops == active[name][0] / 10.0 / 1e6
+        assert bw == active[name][1] / 10.0 / 1e3
+
+
 def run_moe(
     data_format: str,
     *,
@@ -705,6 +744,7 @@ def run_moe(
 
     # --- grouped FlyDSL vs PyTorch fp32 ref (graph path if bench, else eager) ---
     run_only = run_only_env() if check_aot_cache else nullcontext()
+    routing_stats = {}
     with run_only:
         out, ref, us, kernel_us = _run_grouped_via_fused_moe(
             experts=experts,
@@ -727,6 +767,7 @@ def run_moe(
             iters=iters,
             data_init=data_init,
             scale_init=scale_init,
+            routing_stats=routing_stats,
         )
     mode = "kernel" if kernel_bench else ("graph" if bench else "eager")
     ld = _logits_diff(out, ref)
@@ -741,7 +782,18 @@ def run_moe(
         assert (
             passed
         ), f"grouped {tag} {mode} vs ref logits_diff={ld:.4e} > {LOGITS_DIFF_TOL}"
+    work = _gemm_work_metrics(
+        active_experts=routing_stats["active_experts"],
+        tokens=tokens,
+        topk=topk,
+        model_dim=model_dim,
+        inter_dim=inter_dim,
+        data_format=data_format,
+    )
     metrics = {
+        "active_experts": routing_stats["active_experts"],
+        "gemm1_bytes": work["gemm1"][1],
+        "gemm2_bytes": work["gemm2"][1],
         "logits_diff": ld,
         "rel_l2": rel,
         "passed": passed,
@@ -751,14 +803,6 @@ def run_moe(
 
     # --- perf (bench only): timed end-to-end inside _run_grouped_via_fused_moe ---
     if bench:
-        work = _gemm_work_metrics(
-            experts=experts,
-            tokens=tokens,
-            topk=topk,
-            model_dim=model_dim,
-            inter_dim=inter_dim,
-            data_format=data_format,
-        )
         tflops, bandwidth = _rates(work["total"], us)
         if tflops is None:
             logger.warning("[bench %s] timing unavailable: %r us", tag, us)
@@ -778,14 +822,6 @@ def run_moe(
         kernel_us = kernel_us or {}
         g1 = kernel_us.get("gemm1")
         g2 = kernel_us.get("gemm2")
-        work = _gemm_work_metrics(
-            experts=experts,
-            tokens=tokens,
-            topk=topk,
-            model_dim=model_dim,
-            inter_dim=inter_dim,
-            data_format=data_format,
-        )
         if g1 is None and g2 is None:
             print(
                 f"[kernel-bench {tag}] no grouped kernels captured "
@@ -1455,6 +1491,7 @@ def _run_csv_file(args, csv_path: str) -> None:
                     "seed": args.seed,
                     "logits_diff": metrics["logits_diff"],
                     "rel_l2": metrics["rel_l2"],
+                    "active_experts": metrics["active_experts"],
                     "pass": metrics["passed"],
                     "error": None,
                     "us": metrics.get("us"),
@@ -1671,6 +1708,9 @@ def main() -> None:
                     "topk": args.topk,
                     "model_dim": args.model_dim,
                     "inter_dim": args.inter_dim,
+                    "active_experts": metrics["active_experts"],
+                    "gemm1_bytes": metrics["gemm1_bytes"],
+                    "gemm2_bytes": metrics["gemm2_bytes"],
                     "logits_diff": metrics["logits_diff"],
                     "rel_l2": metrics["rel_l2"],
                     "pass": metrics["passed"],
