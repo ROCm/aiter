@@ -21,6 +21,7 @@ import torch
 
 from aiter import ActivationType
 
+from ..tensor_shim import _run_compiled, ptr_arg
 from .arena import _align_up
 
 _log = logging.getLogger("aiter")
@@ -552,8 +553,6 @@ class _Stage1Fusion:
         # Calling the @flyc.jit launcher rebuilds its cache key on every launch
         # (~110 us/layer of host time in eager prefill). Its tensor arguments
         # are layout-dynamic, so only their dtype and rank pick the artifact.
-        from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
-
         spec = tuple((a.dtype, a.dim()) for a in args if isinstance(a, torch.Tensor))
         _run_compiled(launch, *args, specialization_key=spec)
 
@@ -639,8 +638,6 @@ class _Stage1Fusion:
         **_unused,
     ):
         """GEMM1 launch stand-in: runs this layer's dispatch and GEMM1."""
-        from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
-
         step = self.step
         if step is None:
             raise RuntimeError("AITER_MEGA_S1F: stage-1 hook called without a step")
