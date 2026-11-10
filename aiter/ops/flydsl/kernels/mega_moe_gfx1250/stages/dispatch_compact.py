@@ -63,68 +63,82 @@ def _compact_gemm_align_m(
     tile disagree.
     """
 
-    def _env(name: str) -> int | None:
-        v = os.environ.get(name)
-        if v is None or v == "":
-            return None
-        return int(v)
+    tile_m, tile_m2, _ = _compact_gemm_tiles(config, recv_bound)
+    return max(tile_m, tile_m2)
 
-    ov_m = _env("AITER_TDM_TILE_M")
-    ov_m2 = _env("AITER_TDM_TILE_M2")
-    if ov_m is not None or ov_m2 is not None:
-        tile_m = 64 if ov_m is None else ov_m
-        tile_m2 = tile_m if ov_m2 is None else ov_m2
-        align = max(int(tile_m), int(tile_m2))
-        seen = getattr(_compact_gemm_align_m, "_override_logged", None)
-        if seen is None:
-            seen = set()
-            _compact_gemm_align_m._override_logged = seen
-        sig = (ov_m, ov_m2, align)
-        if sig not in seen:
-            seen.add(sig)
-            logger.info(
-                "compact align overridden by AITER_TDM_TILE_M=%s "
-                "AITER_TDM_TILE_M2=%s -> %d (CSV lookup skipped)",
-                ov_m,
-                ov_m2,
-                align,
-            )
-        return align
 
+def _env_int(name: str) -> int | None:
+    v = os.environ.get(name)
+    if v is None or v == "":
+        return None
+    return int(v)
+
+
+def _compact_gemm_tiles(
+    config: "MegaMoEConfig", recv_bound: int | None = None
+) -> tuple[int, int, int]:
+    """``(tile_m, tile_m2, m_warp2)`` fused_moe resolves for this recv bound,
+    before it clamps both tiles to the plan alignment.
+
+    Same precedence as ``grouped_gemm_gfx1250_a8w4``: the grouped-GEMM CSV row
+    for ``_get_padded_m(recv_bound)`` (64 / 64 / 1 when it misses), then
+    ``AITER_TDM_TILE_M{,2}`` and ``AITER_TDM_M_WARP{,2}``, the stage-2 value
+    following the stage-1 one when only that is set. The stage-1 kernel's
+    verdict and its launcher key are computed from this, so it has to name the
+    tiles GEMM1 later receives; the GEMM1 hook rejects a launch where it does not.
+    """
     from aiter.ops.flydsl.grouped_moe_gfx1250 import (
         _as_int,
         _find_grouped_config,
         _get_padded_m,
     )
 
-    if config.dispatch_wire == "fp4":
-        q_dtype_a = dtypes.fp4x2
-    elif config.dispatch_wire == "fp8":
-        q_dtype_a = dtypes.fp8
-    else:
-        return 64
-
-    row = _find_grouped_config(
-        token_num=_get_padded_m(
-            config.max_recv if recv_bound is None else int(recv_bound)
-        ),
-        model_dim=config.hidden_dim,
-        inter_dim=config.geometry.inter_dim,
-        experts=config.experts_per_rank,
-        topk=-1,
-        activation=config.recipe.compute.activation,
-        dtype=dtypes.bf16,
-        q_dtype_a=q_dtype_a,
-        q_dtype_w=dtypes.fp4x2,
-        quant_type=config.recipe.compute.quant_type,
-        ep_fused=True,
-    )
-    tile_m = 64
-    tile_m2 = 64
+    row = None
+    if config.dispatch_wire in ("fp4", "fp8"):
+        row = _find_grouped_config(
+            token_num=_get_padded_m(
+                config.max_recv if recv_bound is None else int(recv_bound)
+            ),
+            model_dim=config.hidden_dim,
+            inter_dim=config.geometry.inter_dim,
+            experts=config.experts_per_rank,
+            topk=-1,
+            activation=config.recipe.compute.activation,
+            dtype=dtypes.bf16,
+            q_dtype_a=dtypes.fp4x2 if config.dispatch_wire == "fp4" else dtypes.fp8,
+            q_dtype_w=dtypes.fp4x2,
+            quant_type=config.recipe.compute.quant_type,
+            ep_fused=True,
+        )
+    tile_m, m_warp = 64, 1
+    tile_m2 = m_warp2 = None
     if row is not None:
         tile_m = _as_int(row.get("tile_m"), tile_m) or tile_m
         tile_m2 = _as_int(row.get("tile_m2"), tile_m) or tile_m
-    return max(int(tile_m), int(tile_m2))
+        m_warp = _as_int(row.get("m_warp"), m_warp) or m_warp
+        m_warp2 = _as_int(row.get("m_warp2"), m_warp) or m_warp
+    ov_m, ov_m2 = _env_int("AITER_TDM_TILE_M"), _env_int("AITER_TDM_TILE_M2")
+    if ov_m is not None or ov_m2 is not None:
+        tile_m = tile_m if ov_m is None else ov_m
+        tile_m2 = tile_m if ov_m2 is None else ov_m2
+        sig = (ov_m, ov_m2, tile_m, tile_m2)
+        if sig not in _OVERRIDE_LOGGED:
+            _OVERRIDE_LOGGED.add(sig)
+            logger.info(
+                "compact tiles overridden by AITER_TDM_TILE_M=%s "
+                "AITER_TDM_TILE_M2=%s -> %d / %d",
+                *sig,
+            )
+    ov_mw, ov_mw2 = _env_int("AITER_TDM_M_WARP"), _env_int("AITER_TDM_M_WARP2")
+    if ov_mw is not None or ov_mw2 is not None:
+        m_warp = m_warp if ov_mw is None else ov_mw
+        m_warp2 = m_warp if ov_mw2 is None else ov_mw2
+    tile_m2 = tile_m if tile_m2 is None else tile_m2
+    m_warp2 = m_warp if m_warp2 is None else m_warp2
+    return int(tile_m), int(tile_m2), int(m_warp2)
+
+
+_OVERRIDE_LOGGED: set = set()
 
 
 # The widest compact tile a grouped-GEMM CSV row names; bounds the compact
@@ -181,6 +195,10 @@ class _CompactStep:
     recv_bound: int  # the CSV token bucket
     align_m: int  # per-expert row alignment the plan writes
     rows: int  # row upper bound, bounding the GEMM grid
+    # GEMM1's tile_m and GEMM2's WMMA M-repeat once fused_moe clamps them to
+    # align_m; 0 when not resolved (the arena-capacity placeholder step).
+    g1_tile_m: int = 0
+    quant_wmma_rep: int = 0
 
 
 class _CompactDispatch(_Dispatch):
@@ -665,18 +683,26 @@ class _CompactDispatch(_Dispatch):
 
         config, geo = self.config, self.compact
         bound = max(1, min(int(recv_bound), config.max_recv))
-        align_m = _compact_gemm_align_m(config, recv_bound=bound)
+        tile_m, tile_m2, m_warp2 = _compact_gemm_tiles(config, recv_bound=bound)
         # The arena holds rows for the capacity tile, and the CSV tiles are not
         # monotonic in the token bucket, so a smaller bound can still name a
         # wider tile. Clamping keeps every step inside the allocated rows.
-        align_m = min(int(align_m), geo.tile_m)
+        align_m = min(max(tile_m, tile_m2), geo.tile_m)
         rows = compact_row_capacity(
             max_recv=bound,
             topk=config.topk,
             experts_per_rank=config.experts_per_rank,
             tile_m=align_m,
         )
-        return _CompactStep(recv_bound=bound, align_m=align_m, rows=min(rows, geo.cap))
+        # fused_moe clamps both GEMM tiles to the plan alignment.
+        tile_m2 = min(tile_m2, align_m)
+        return _CompactStep(
+            recv_bound=bound,
+            align_m=align_m,
+            rows=min(rows, geo.cap),
+            g1_tile_m=min(tile_m, align_m),
+            quant_wmma_rep=max(1, tile_m2 // max(1, m_warp2) // 16),
+        )
 
     def _precompile_s1f_plans(self) -> None:
         """Compile every stage-1 plan variant before serving.
@@ -703,6 +729,8 @@ class _CompactDispatch(_Dispatch):
         for b in bounds:
             st = self._step_for(b)
             steps.setdefault(int(st.align_m), st)
+            if not self.fusion.step_reasons(st):
+                self.fusion.launch_keys.add((int(st.align_m), int(st.quant_wmma_rep)))
         max_tok = min(int(config.max_tokens_per_rank), limit)
         widths = {}
         for tok in range(1, max_tok + 1):

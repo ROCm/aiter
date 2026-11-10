@@ -371,8 +371,6 @@ class MegaMoEGfx1250:
                 # reduce. The next forward launches its plan in stream order.
                 next_topk_ids = None
                 hook = disp.fusion.gemm1
-            elif disp.fusion.should_probe():
-                hook = disp.fusion.probe
             step_kw = {"begin_step": False, "s1f": s1f}
         batch = ep.dispatch(
             hidden_states,
