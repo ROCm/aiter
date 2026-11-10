@@ -374,7 +374,7 @@ def test_mla_decode_fwd(
     ):
         pytest.skip("gfx1201 runs the BF16 non-shuffled KV cache path only")
     if block_size == 16 and DEVICE_ARCH != "gfx1201":
-        pytest.skip("block_size 16 is the RDNA vLLM page size")
+        pytest.skip("block_size 16 is tested on gfx1201 only")
 
     if kv_dtype == torch.uint8:
         if DEVICE_ARCH not in ("gfx1250",):
