@@ -51,16 +51,35 @@ from .tensor_shim import (
 )
 
 
+def _sched_vgpr_fn():
+    """FlyDSL 0.4.2+ exposes sched_vgpr under rocdl.experimental."""
+    return getattr(getattr(rocdl, "experimental", None), "sched_vgpr", None)
+
+
+def is_sched_vgpr_available():
+    """Return whether this FlyDSL build exposes experimental sched_vgpr.
+
+    Set ``AITER_FLYDSL_DISABLE_SCHED_VGPR=1`` to force the non-``sched_vgpr``
+    path on a build that still ships the API (A/B measurement only).
+    """
+    if os.environ.get("AITER_FLYDSL_DISABLE_SCHED_VGPR", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+    ):
+        return False
+    return callable(_sched_vgpr_fn())
+
+
 def is_explicit_vgpr_partition_available():
     """Return whether this FlyDSL build supports explicit register placement."""
-    return callable(getattr(rocdl, "sched_vgpr", None)) or callable(
-        getattr(fx, "set_register", None)
-    )
+    return is_sched_vgpr_available() or callable(getattr(fx, "set_register", None))
 
 
 def _pin_rmem_vgpr(storage, start):
     """Use SSA scheduling on new FlyDSL and allocation placement on old builds."""
-    if callable(getattr(rocdl, "sched_vgpr", None)):
+    sched_vgpr = _sched_vgpr_fn()
+    if callable(sched_vgpr):
         # Keep the adapter in this helper's source so edits to its accessors
         # participate in the launcher's recursive JIT dependency cache key.
         class ScheduledVgprTensor:
@@ -70,7 +89,7 @@ def _pin_rmem_vgpr(storage, start):
 
             def load(self):
                 # sched_vgpr returns a new SSA value; consumers must use it.
-                return Vec(rocdl.sched_vgpr(_raw(self.storage.load()), self.start))
+                return Vec(sched_vgpr(_raw(self.storage.load()), self.start))
 
             def store(self, value):
                 # Schedule each promoted SSA read. Pinning both sides of a
@@ -389,13 +408,13 @@ def launch_gemm_a8w4_tdm(
                           and not tdm_as_in_prologue and K % tile_k == 0)
     M_ROW_STEP = 32 if interleaved_m_rows else 16
     new_auto_stage1 = bool(interleaved_m_rows and not explicit_vgpr_partition
-                          and callable(getattr(rocdl, "sched_vgpr", None)))
+                          and is_sched_vgpr_available())
     narrow_stage1_row_skip = bool(a_is_fp4 and a_preshuffled
                                  and not persistent_workers and not enable_ep_scatter
                                  and stage1_act and stage1_quant_out
                                  and (tile_m, tile_n, tile_k, m_warp, n_warp, num_buffers)
                                      == (64, 256, 256, 1, 4, 3)
-                                 and callable(getattr(rocdl, "sched_vgpr", None)))
+                                 and is_sched_vgpr_available())
     fp4_prefill = use_spec_prefill_opt and cluster_m > 1
     quant_gemm1_prefill = fp4_prefill and stage1_act == 1 and bool(stage1_quant_out)
     reuse_lds_stage_base = fp4_prefill and bool(planar_lds_on)
@@ -1265,7 +1284,7 @@ def launch_gemm_a8w4_tdm(
                     if const_expr(new_auto_stage1):
                         # Pin only the live DS addresses; A/B/C still use the
                         # automatic allocator. Consume the returned SSA value.
-                        value = fx.Int32(rocdl.sched_vgpr(
+                        value = fx.Int32(_sched_vgpr_fn()(
                             _raw(fx.Int32(value)), 32 + address_slot * 4 + component
                         ))
                     values.append(value)
@@ -1383,7 +1402,7 @@ def launch_gemm_a8w4_tdm(
                 # keeps zero materialization from sinking past the wait.
                 zero = fx.constant_vector(0.0, T.vec(WMMA_VECTOR_DWORDS, T.f32))
                 if const_expr(explicit_vgpr_partition
-                              and callable(getattr(rocdl, "sched_vgpr", None))):
+                              and is_sched_vgpr_available()):
                     # Generic inline-asm "v" constrains the result to Lo256.
                     # SSA scheduling cannot widen that class to the pinned C
                     # range. Keep the scheduling barriers and pin C at reads.
@@ -1451,7 +1470,7 @@ def launch_gemm_a8w4_tdm(
                             scale_b=scale_b,
                         )
                         if const_expr(explicit_vgpr_partition
-                                      and callable(getattr(rocdl, "sched_vgpr", None))):
+                                      and is_sched_vgpr_available()):
                             # fx.gemm writes rmem directly, so bind its promoted
                             # result before the next MMA or the epilogue reads it.
                             c_frags[idx].store(c_frags[idx].load())
@@ -2894,7 +2913,7 @@ launch_gemm_a8w4_tdm.compile_hints["llvm_options"] = {
 if SUPPORT_EXPLICIT_VGPR_PARTITION:
     launch_gemm_a8w4_tdm.compile_hints["waves_per_eu"] = 1
     # New FlyDSL rejects maxnreg; waves_per_eu is the supported occupancy hint.
-    if not callable(getattr(rocdl, "sched_vgpr", None)):
+    if not is_sched_vgpr_available():
         launch_gemm_a8w4_tdm.compile_hints["maxnreg"] = 1024
 
 
@@ -2914,6 +2933,6 @@ def get_gemm_a8w4_tdm_register_launcher(explicit_vgpr_partition):
     )
     if explicit_vgpr_partition:
         launcher.compile_hints["waves_per_eu"] = 1
-        if not callable(getattr(rocdl, "sched_vgpr", None)):
+        if not is_sched_vgpr_available():
             launcher.compile_hints["maxnreg"] = 1024
     return launcher

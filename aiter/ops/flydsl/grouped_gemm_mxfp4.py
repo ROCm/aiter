@@ -174,12 +174,11 @@ def flydsl_grouped_gemm_a8w4_masked(
             "preshuffled MXFP4 quant output requires N divisible by 256 "
             "and tile_n divisible by 64"
         )
-    from flydsl.expr import rocdl
-
     from .kernels.mxfp4_preshuffle_gfx1250_tdm import (
         SUPPORT_EXPLICIT_VGPR_PARTITION,
         get_gemm_a8w4_tdm_register_launcher,
         is_explicit_vgpr_partition_available,
+        is_sched_vgpr_available,
         launch_gemm_a8w4_tdm,
     )
 
@@ -310,7 +309,7 @@ def flydsl_grouped_gemm_a8w4_masked(
             and (tile_m, tile_n, tile_k, m_warp, n_warp, num_buffers)
                 == (256, 256, 256, 2, 2, 4)
             and cluster_m == 1
-            and callable(getattr(rocdl, "sched_vgpr", None))):
+            and is_sched_vgpr_available()):
         # The new allocator's automatic layout is slower for this output tile.
         # Use its explicit SSA placement under either global register policy.
         explicit_vgpr_partition = 1
