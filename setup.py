@@ -24,7 +24,7 @@ this_dir = os.path.dirname(os.path.abspath(__file__))
 OPT_COMPILER_CONFIG = os.path.join(this_dir, "aiter", "jit", "optCompilerConfig.json")
 PACKAGE_NAME = "amd-aiter"
 
-FLYDSL_VERSION = "flydsl==0.4.2"
+FLYDSL_VERSION = "flydsl==0.5.0"
 
 BUILD_TARGET = os.environ.get("BUILD_TARGET", "auto")
 PREBUILD_KERNELS = int(os.environ.get("PREBUILD_KERNELS", "0"))
@@ -250,15 +250,16 @@ def prepare_packaging():
 # develop runs leave an existing one alone.
 STAGED_AITER_META = False
 if METADATA_ONLY:
-    # Metadata needs no package data, so aiter_meta/ is not staged for it.
+    # Metadata needs no package data, so aiter_meta/ is not staged for it, and
+    # its top-level name is all it records, so sub-packages are not listed.
     packages = ["aiter"]
 elif is_develop_mode():
-    packages = ["aiter"]
+    packages = ["aiter", "aiter.plugin"]
     write_install_mode()
 else:
     prepare_packaging()
     STAGED_AITER_META = True
-    packages = ["aiter_meta", "aiter"]
+    packages = ["aiter_meta", "aiter", "aiter.plugin"]
 
 
 # Defer heavy imports until build time
