@@ -53,11 +53,11 @@
         "BLOCK_M": 64,
         "BLOCK_N": 32,
         "BLOCK_K": 256,
-        "NUM_BUFFERS": 6,
+        "NUM_BUFFERS": 4,
         "num_warps": 8,
         "kernel_type": "bandwidth_bound",
         "NUM_KSPLIT": 4,
-        "waves_per_eu": 2
+        "waves_per_eu": 1
     },
     "M_LEQ_128": {
         "BLOCK_M": 64,
