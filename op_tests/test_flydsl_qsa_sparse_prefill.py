@@ -86,7 +86,7 @@ import triton.language as tl
 
 import aiter
 from aiter import dtypes
-from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.flydsl import qsa_sparse_prefill as flydsl_prefill
 from aiter.ops.flydsl.kernels.qsa import sparse_prefill_common
 from aiter.ops.qsa import qsa_sparse_prefill
@@ -918,7 +918,7 @@ def test_qsa_sparse_attention(case, heads):
     flops = 4 * heads * HEAD_DIM * int((indices >= 0).sum().item())
     nbytes = 2 * q.nbytes + k.nbytes + v.nbytes + indices.nbytes
     ret = {
-        "gfx": get_gfx(),
+        "gfx": get_gfx_runtime(),
         "rows": rows,
         "kv_tokens": kv_tokens,
         "kv_heads": kv_heads,
@@ -1007,7 +1007,7 @@ def rejected_off_gfx950(label, *args, **kwargs):
     except ValueError as error:
         message = str(error)
     assert "gfx950 only" in message, f"{label}: strided K/V gave {message!r}"
-    return {"gfx": get_gfx(), "rejected off gfx950": True}
+    return {"gfx": get_gfx_runtime(), "rejected off gfx950": True}
 
 
 def released(pointer):
@@ -1059,7 +1059,7 @@ def test_qsa_graph_replay(case, heads):
         )
 
     errors = [replay(second, "replay")]
-    ret = {"gfx": get_gfx(), "rows": q.shape[0], "growth": growth}
+    ret = {"gfx": get_gfx_runtime(), "rows": q.shape[0], "growth": growth}
     check_union(ret, captured, f"{case} H{heads} replay")
     arena = flydsl_prefill._arenas[(q.device, stream.cuda_stream)]
     generation, scratch = arena.generation, [b.data_ptr() for b in arena.buffers]
@@ -1154,7 +1154,7 @@ def test_qsa_kv_slots(case, heads):
     kv_bytes = slots.numel() * pool_k.stride(0) * pool_k.element_size()
     nbytes = 2 * q.nbytes + 2 * kv_bytes + indices.nbytes + slots.nbytes
     ret = {
-        "gfx": get_gfx(),
+        "gfx": get_gfx_runtime(),
         "rows": q.shape[0],
         "kv_tokens": slots.numel(),
         "kv_heads": kv_heads,
@@ -1267,7 +1267,7 @@ def test_qsa_strided_kv(case, heads):
     nbytes += indices.nbytes + (0 if slots is None else slots.nbytes)
     span = ((pool_rows - 1) * strided_k.stride(0) + kv_heads * HEAD_DIM) * 2
     ret = {
-        "gfx": get_gfx(),
+        "gfx": get_gfx_runtime(),
         "rows": q.shape[0],
         "kv_tokens": rows.numel(),
         "kv_heads": kv_heads,
@@ -1342,7 +1342,7 @@ def test_qsa_span_limit(case, heads):
         rejected = "byte span" in message and ("kv_slots" in message) == slotted
     assert rejected, f"{case} H{heads}: a {span}-byte span was accepted"
     return {
-        "gfx": get_gfx(),
+        "gfx": get_gfx_runtime(),
         "kv_tokens": tokens,
         "kv_slots": slotted,
         "span bytes": span,
@@ -1380,7 +1380,7 @@ def test_qsa_stride_rejected(case, heads):
     strides = f"K/V {k.stride()}/{v.stride()}, Q {q.stride()}"
     assert rejected, f"{case} H{heads}: {strides} gave {message!r}"
     return {
-        "gfx": get_gfx(),
+        "gfx": get_gfx_runtime(),
         "kv_tokens": tokens,
         "k strides": k_strides,
         "v strides": v_strides,
@@ -1434,7 +1434,7 @@ def test_qsa_max_stride(case, heads):
         )
     ref = run_torch(q, k, v, indices, query_lens, prefix_lens, SCALE)
     ret = {
-        "gfx": get_gfx(),
+        "gfx": get_gfx_runtime(),
         "rows": rows,
         "row stride": stride,
         "K span GiB": strided_k.untyped_storage().nbytes() / 2**30,
@@ -1481,7 +1481,7 @@ def test_qsa_route(case, heads):
     q, k, v, indices = make_inputs(layout, heads, generator)
     ref = run_torch(q, k, v, indices, query_lens, prefix_lens, SCALE)
     label = f"{case} H{heads}"
-    ret = {"gfx": get_gfx(), "rows": q.shape[0], "route": route}
+    ret = {"gfx": get_gfx_runtime(), "rows": q.shape[0], "route": route}
     with platform_entry(FORCED_ROUTES[route]):
         out = qsa_sparse_prefill(
             q,
@@ -1531,9 +1531,9 @@ def kv_bytes(case):
 
 
 def main():
-    if get_gfx() not in SUPPORTED_GFX:
+    if get_gfx_runtime() not in SUPPORTED_GFX:
         aiter.logger.warning(
-            "qsa_sparse_prefill unsupported on %s; skipping", get_gfx()
+            "qsa_sparse_prefill unsupported on %s; skipping", get_gfx_runtime()
         )
         return
 
