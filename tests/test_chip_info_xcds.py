@@ -287,3 +287,12 @@ def test_windows_library_names_search_the_rocm_home(monkeypatch, tmp_path):
 
     rocm_home._find_rocm_home = lambda: None
     assert hip_runtime._library_names() == ("amdhip64.dll",)
+
+
+def test_cdna4_xcd_count_accepts_whole_xcd_topologies():
+    assert [chip_info.get_cdna4_num_xcds(cu) for cu in (96, 128, 160, 256)] == [
+        3,
+        4,
+        5,
+        8,
+    ]
