@@ -91,9 +91,12 @@ def _kernel_names(tasks):
 class TestFmoeTuneDispatch(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        from aiter.tuning.moe.backends import asm_stage1, common
         from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
 
         cls.gemm_moe_tune = gemm_moe_tune
+        cls.backends_common = common
+        cls.backend_asm_stage1 = asm_stage1
 
     def setUp(self):
         m = self.gemm_moe_tune
@@ -531,7 +534,9 @@ class TestFmoeTuneDispatch(unittest.TestCase):
         )
 
         def names(patterns):
-            with mock.patch.object(m, "_TUNE_EXCLUDE_KERNEL_PATTERNS", patterns):
+            with mock.patch.object(
+                self.backends_common, "_TUNE_EXCLUDE_KERNEL_PATTERNS", patterns
+            ):
                 tasks = self.tuner.gen_2stages_task(info, BLOCK_MS)
             return {
                 stage: sorted(t[0][2] for t in tasks if t[0][1] == stage)
@@ -588,15 +593,20 @@ class TestFmoeTuneDispatch(unittest.TestCase):
                 self.assertEqual(skipped, [])
 
     @contextlib.contextmanager
-    def asm_gfx950(self):
-        """ASM kernel lists come from the running GPU's arch; pin gfx950's."""
-        m = self.gemm_moe_tune
+    def asm_gfx950(self, module, *, pin_gfx):
+        """ASM kernel lists come from the running GPU's arch; pin gfx950's in
+        the module whose generator runs. pin_gfx for generators that call
+        get_gfx() as well as get_asm_dir()."""
         asm_dir = str(REPO_ROOT / "hsa" / "gfx950")
-        with (
-            mock.patch.object(m, "get_gfx", return_value="gfx950"),
-            mock.patch.object(m, "get_asm_dir", return_value=asm_dir),
-            contextlib.redirect_stdout(io.StringIO()),
-        ):
+        with contextlib.ExitStack() as stack:
+            if pin_gfx:
+                stack.enter_context(
+                    mock.patch.object(module, "get_gfx", return_value="gfx950")
+                )
+            stack.enter_context(
+                mock.patch.object(module, "get_asm_dir", return_value=asm_dir)
+            )
+            stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
             yield
 
     def test_asm_stage1_reads_the_int8_list_and_honours_exclusion(self):
@@ -614,8 +624,10 @@ class TestFmoeTuneDispatch(unittest.TestCase):
 
         def names(patterns):
             with (
-                self.asm_gfx950(),
-                mock.patch.object(m, "_TUNE_EXCLUDE_KERNEL_PATTERNS", patterns),
+                self.asm_gfx950(self.backend_asm_stage1, pin_gfx=False),
+                mock.patch.object(
+                    self.backends_common, "_TUNE_EXCLUDE_KERNEL_PATTERNS", patterns
+                ),
             ):
                 tasks = self.tuner.gen_2stages_asm1_task(info, BLOCK_MS)
             return {t[0][2] for t in tasks}
@@ -634,7 +646,7 @@ class TestFmoeTuneDispatch(unittest.TestCase):
         post_reduce = m.AsmMoeMode.POST_REDUCE.value
 
         def tags(**overrides):
-            with self.asm_gfx950():
+            with self.asm_gfx950(m, pin_gfx=True):
                 tasks = self.tuner.gen_1stage_asm_task(
                     self.info(model_dim=7168, **overrides)
                 )
