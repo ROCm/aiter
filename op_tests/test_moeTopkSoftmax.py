@@ -1054,6 +1054,7 @@ for token in (1, 32, 160, 2048):
         (768, 8, None),
         (896, 16, None),
         (896, 16, dtypes.fp32),
+        (896, 17, dtypes.fp32),
         (1024, 16, None),
     ):
         ret = test_biased_grouped_topk(
@@ -1104,7 +1105,7 @@ stable_cases = [
     (1, 256, 8, dtypes.bf16, "softmax", True, "all_nan", False),
     (1, 256, 8, dtypes.bf16, "biased", True, "all_zero_sigmoid", False),
     (1, 256, 8, dtypes.bf16, "sigmoid", False, "all_zero_sigmoid", False),
-    # wave32 multi-wave register path: E = 128 * waves, topk <= 16.
+    # wave32 multi-wave register path: E = 128 * waves, topk <= 17.
     (1, 896, 16, dtypes.bf16, "biased", True, "random", False),  # Kimi-K3 router
     (160, 896, 16, dtypes.bf16, "biased", True, "random", True),
     (64, 896, 1, dtypes.bf16, "biased", True, "random", False),
@@ -1118,6 +1119,13 @@ stable_cases = [
     (1, 896, 16, dtypes.bf16, "biased", True, "one_finite", False),
     (1, 896, 16, dtypes.bf16, "biased", True, "all_nan", False),
     (1, 896, 16, dtypes.bf16, "biased", True, "all_zero_sigmoid", False),
+    # topk 17: HERD's top-(K + 1) for K = 16.
+    (160, 896, 17, dtypes.bf16, "biased", True, "random", True),
+    (64, 896, 17, dtypes.bf16, "biased", True, "forty_way_tie", False),
+    (1, 896, 17, dtypes.bf16, "biased", True, "sixteen_way_tie", False),
+    (1, 896, 17, dtypes.bf16, "biased", True, "one_finite", False),
+    (1, 896, 17, dtypes.bf16, "biased", True, "all_nan", False),
+    (1, 896, 17, dtypes.bf16, "biased", True, "all_zero_sigmoid", False),
 ]
 df = pd.DataFrame([test_grouped_topk_stable(*case) for case in stable_cases])
 aiter.logger.info(
@@ -1143,6 +1151,7 @@ df = pd.DataFrame(
         )
         for token, expert, topk, pattern, strided_input in (
             (160, 896, 16, "random", True),
+            (160, 896, 17, "random", True),
             (64, 1024, 9, "random", True),
             (64, 896, 16, "forty_way_tie", False),
             (1, 896, 16, "one_finite", False),
