@@ -48,7 +48,7 @@ _k1_prepare_repr = make_kernel_repr(
 )
 
 
-@gluon.jit(repr=_k1_prepare_repr)
+@gluon.jit(repr=_k1_prepare_repr, do_not_specialize=["T", "NT", "TOTAL_TILES"])
 def k1_prepare_gluon(
     q,
     k,

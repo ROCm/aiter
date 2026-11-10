@@ -1215,6 +1215,110 @@ def test_cu_seqlens_cpu_issues_no_sync():
     assert torch.equal(host_kw["state_cache"], dev_kw["state_cache"])
 
 
+def _flash_kda_launchers():
+    """The fast launcher of each FlashKDA kernel that this arch can route to."""
+    modules = [_flash_kda]
+    if _flash_kda._GLUON_ARCH_OK:
+        modules += [
+            importlib.import_module(
+                f"aiter.ops.triton._gluon_kernels.{_flash_kda.DEVICE_ARCH}"
+                f".kimi_delta_attn.{name}"
+            )
+            for name in ("flash_kda_k1", "flash_kda_k2")
+        ]
+    return [
+        obj
+        for module in modules
+        for obj in vars(module).values()
+        if isinstance(obj, _fast_launch._FastLaunch)
+    ]
+
+
+@contextlib.contextmanager
+def _record_compiles():
+    """Collect ``(kernel, constexprs)`` for each FlashKDA variant built in the block.
+
+    Triton makes an integer argument of 1 a constant. Such an argument is left
+    out, so a step value of 1 and any other value count as one variant.
+    """
+    launchers = _flash_kda_launchers()
+    jits = {id(launcher._jit): launcher._jit for launcher in launchers}.values()
+    device_id = torch.cuda.current_device()
+    for launcher in launchers:
+        # A variant that an earlier test built would hide a second one built here.
+        launcher.clear()
+        launcher._jit.device_caches[device_id][0].clear()
+    seen = []
+    yield seen
+    for jit in jits:
+        params = jit.params
+        for kernel in jit.device_caches[device_id][0].values():
+            constexprs = sorted(
+                (params[path[0]].name, repr(value))
+                for path, value in kernel.src.constants.items()
+                if params[path[0]].is_constexpr or value is None
+            )
+            seen.append((jit.__name__, tuple(constexprs)))
+
+
+# Prefill lengths, in tokens, of successive serving steps. With segments of two
+# 32-token chunks, they give 1 to 9 segments, steps of one tile, and token and
+# tile counts that do and do not divide by 16.
+_SERVING_STEPS = (
+    [20],
+    [64],
+    [40, 17],
+    [100, 28],
+    [128],
+    [130, 70],
+    [256],
+    [250, 6],
+    [200, 120, 16],
+    [256, 200],
+    [256, 256],
+    [500, 12],
+)
+
+
+@pytest.mark.parametrize("gluon", [False, True])
+def test_serving_steps_compile_each_variant_once(gluon, monkeypatch):
+    """The token counts, segment count and state-index offset of a step must not
+    compile a kernel again with the same constexprs. A compile during serving
+    stalls the server."""
+    if gluon and not _flash_kda._gluon_k2_usable(FLASH_KDA_CHUNK, K_DIM, K_DIM):
+        pytest.skip("this arch or tile shape never routes K2 to Gluon")
+    monkeypatch.setenv("CHUNK_DELTA_ATTN_FLASH_KDA_SEG", "2")
+    H = 4
+    with _route(k1=gluon, k2=gluon), _record_compiles() as seen:
+        for step, lens in enumerate(_SERVING_STEPS):
+            n = len(lens)
+            args = make_inputs(1, sum(lens), H, seed=step)
+            zeros = torch.zeros(n, H, K_DIM, K_DIM, device=device, dtype=torch.float32)
+            cache, indices, _storage = _paged_pool(n, H, zeros)
+            # The prefill rows of a step that also has decodes start past a
+            # 16-byte boundary.
+            skew = step % 4
+            slots = torch.empty(skew + n, device=device, dtype=torch.int32)[skew:]
+            slots.copy_(indices)
+            has_initial = torch.zeros(skew + n, device=device, dtype=torch.bool)[skew:]
+            has_initial[::2] = True
+            chunk_kimi_delta_attn(
+                **_kimi_kwargs(
+                    *args,
+                    cu_seqlens=_cu_seqlens_pair(lens)[0],
+                    out=torch.empty_like(args[2]),
+                    state_cache=cache,
+                    state_indices=slots,
+                    has_initial_state=has_initial,
+                )
+            )
+    names = {name for name, _ in seen}
+    k2 = {"k2_ab_fused_gluon", "k2_c_gluon"} if gluon else {"_flash_kda_segment_kernel"}
+    assert k2 <= names, f"the steps did not reach {sorted(k2 - names)}"
+    repeats = sorted({name for name, consts in seen if seen.count((name, consts)) > 1})
+    assert not repeats, f"compiled again with the same constexprs: {repeats}"
+
+
 def test_prepare_chunk_indices_numbers_empty_sequences():
     """A chunk's sequence id indexes cu_seqlens, so an empty sequence still counts."""
     lens, chunk_size = [0, 100, 0, 0, 257, 33], 64

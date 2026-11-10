@@ -156,7 +156,7 @@ _K1_FALLBACK_CONFIG = triton.Config({}, num_warps=2, num_stages=1)
     key=["H", "K", "C"],
     **autotune_cache_kwargs,
 )
-@triton.jit(do_not_specialize=["T"])
+@triton.jit(do_not_specialize=["T", "NT", "TOTAL_TILES"])
 def _flash_kda_prepare_kernel(
     q,
     k,
@@ -434,7 +434,10 @@ def _seg_occupancy_class(num_segs: int) -> int:
         ),
     }
 )
-@triton.jit
+@triton.jit(
+    do_not_specialize=["TOTAL_TILES", "NUM_SEGS_CLASS"],
+    do_not_specialize_on_alignment=["state_indices", "has_initial_state"],
+)
 def _flash_kda_segment_kernel(
     ws_kd,
     ws_qd,
@@ -665,7 +668,7 @@ def _flash_kda_segment_kernel(
         "PAGED_CACHE": lambda args: args["state_cache"] is not None,
     }
 )
-@triton.jit
+@triton.jit(do_not_specialize_on_alignment=["state_indices", "has_initial_state"])
 def _flash_kda_seg_scan_kernel(
     A_seg,
     b_seg,
@@ -772,7 +775,7 @@ def _seg_scan_clamp(s, s0, s_end):
         "PAGED_CACHE": lambda args: args["state_cache"] is not None,
     }
 )
-@triton.jit
+@triton.jit(do_not_specialize_on_alignment=["state_indices", "has_initial_state"])
 def _flash_kda_seg_scan_prefetch_kernel(
     A_seg,
     b_seg,
@@ -1106,11 +1109,11 @@ def _build_metadata(
 
     Returns ``(chunk_indices, desc, seq_seg_off, num_segs, max_segs_per_seq,
     stream)``. ``chunk_indices`` is ``prepare_chunk_indices``' ``[NT, 2]`` table.
-    ``desc`` is a ``[6, num_segs]`` int32 tensor holding, per segment: the
-    global chunk index it starts at (indexing the K1 workspace), its chunk
-    count, its first and one-past-last token, its sequence, and whether it ends
-    that sequence. All three share one buffer and one non-blocking upload, made
-    on ``stream`` (see ``wait_for_upload``).
+    ``desc`` is a ``[6, num_segs]`` int32 view with 16-byte aligned rows. It holds,
+    per segment: the global chunk index it starts at (indexing the K1
+    workspace), its chunk count, its first and one-past-last token, its
+    sequence, and whether it ends that sequence. All three share one buffer and
+    one non-blocking upload, made on ``stream`` (see ``wait_for_upload``).
 
     Cached on the sequence bounds, so the layers of a forward pass share the
     Python loop and the upload.
@@ -1134,14 +1137,16 @@ def _build_metadata(
         g_chunk += nch
 
     num_segs = len(chunk_base)
+    # The kernels take each row of desc as its own pointer, so every row starts
+    # on a 16-byte boundary.
+    seg_stride = _align4(num_segs)
     pairs = chunk_index_pairs(seqs, C)
     desc_at = _align4(len(pairs))
-    off_at = desc_at + _align4(6 * num_segs)
+    off_at = desc_at + 6 * seg_stride
     buf = [0] * (off_at + len(seq_seg_off))
     buf[: len(pairs)] = pairs
-    buf[desc_at : desc_at + 6 * num_segs] = (
-        chunk_base + nchunks + tok_base + tok_end + seq_id + is_last
-    )
+    for r, row in enumerate((chunk_base, nchunks, tok_base, tok_end, seq_id, is_last)):
+        buf[desc_at + r * seg_stride : desc_at + r * seg_stride + num_segs] = row
     buf[off_at:] = seq_seg_off
     dev_buf, stream = upload_ints(buf, torch.int32, device)
 
@@ -1150,7 +1155,7 @@ def _build_metadata(
     )
     return (
         dev_buf[: len(pairs)].view(-1, 2),
-        dev_buf[desc_at : desc_at + 6 * num_segs].view(6, num_segs),
+        dev_buf[desc_at:off_at].view(6, seg_stride)[:, :num_segs],
         dev_buf[off_at:],
         num_segs,
         max_per_seq,
