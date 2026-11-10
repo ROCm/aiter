@@ -878,6 +878,38 @@ class PaDecodeKVLoader:
 
         return fx.Vector.from_elements(flat, dtype=fx.Int64)
 
+    def warp_pages_raw(self, tt_i32):
+        """Issue the block-table load of this warp's pages of tile ``tt_i32``.
+
+        Returns them unpinned, so no wait is placed at the load;
+        ``pin_warp_pages`` applies the context bound where they are used.
+        """
+        first = (
+            tt_i32 * KV_COMPUTE_BLOCK // self.traits.block_size
+            + (self.ctx.warp * self.traits.TOK_PER_WARP) // self.traits.block_size
+        )
+        element_offset = self.ctx.seq * self.ctx.max_blocks_per_seq + first
+        if const_expr(self.traits.PAGES_PER_CHUNK == 1):
+            return first, fx.Vector.from_elements(
+                [fx.Int32(self.bt_scalar[element_offset])], dtype=fx.Int32
+            )
+        bt_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Int32)
+        frag = fx.make_fragment_like(fx.slice(self.bt_buf, (0, None)))
+        fx.copy(bt_copy_atom, fx.slice(self.bt_buf, (element_offset, None)), frag)
+        return first, fx.Vector(fx.memref_load_vec(frag))
+
+    def pin_warp_pages(self, raw):
+        first, loaded = raw
+        return fx.Vector.from_elements(
+            [
+                (first + i < self.ctx.num_pages).select(
+                    fx.Int32(loaded[i]), fx.Int32(0)
+                )
+                for i in range_constexpr(self.traits.PAGES_PER_CHUNK)
+            ],
+            dtype=fx.Int32,
+        )
+
     def load_k(self, tt_i32):
         base_page = (
             tt_i32 * KV_COMPUTE_BLOCK // self.traits.block_size

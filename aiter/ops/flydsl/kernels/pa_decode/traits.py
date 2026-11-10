@@ -488,6 +488,7 @@ class PaDecodeTraits:
     STREAM_KV: bool
     WAVES_PER_EU_2: bool
     GFX942_Q_EARLY: bool
+    PAGES_EARLY: bool
     REUSE_KV_PAGES: bool
     SCALES_BEFORE_CURRENT_V: bool
     M1_SCALE_BEFORE_MASK: bool
@@ -844,6 +845,28 @@ class PaDecodeTraits:
             # gfx942 issues Q loads before the first K tile's page and K loads,
             # so Q staging does not wait behind them on the in-order vmcnt
             # chain. Streamed kernels start with K pieces and gain nothing.
+            # gfx942 tiles that load V at the tile start (V prefetch, MTP
+            # M-tiles) issue the next tile's page-table read before those V
+            # loads: FP8 per-tensor single M-tiles and MTP except BF16 with
+            # two M-tiles, which measured slower.
+            PAGES_EARLY=(
+                not is_gfx950
+                and kv_dtype != MXFP4_KV_DTYPE
+                and not D256_PIPE
+                and not single_tile_plan
+                and not STREAM_KV
+                and not MTP4_FUSED
+                and (
+                    (
+                        prefetch_v
+                        and M_TILES == 1
+                        and kv_dtype in FP8_KV_DTYPES
+                        and not per_token_kv
+                    )
+                    or M_TILES > 2
+                    or (M_TILES == 2 and kv_dtype in FP8_KV_DTYPES)
+                )
+            ),
             GFX942_Q_EARLY=(
                 not is_gfx950 and kv_dtype != MXFP4_KV_DTYPE and not STREAM_KV
             ),

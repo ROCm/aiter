@@ -156,6 +156,12 @@ class PaDecodePipeline:
         if const_expr(self.traits.per_token_kv):
             scale_bounds = self.softmax.scale_mask(tile_valid, window_left)
 
+        # The next tile's page ids lead this tile's V loads on the in-order
+        # vmcnt chain, so waiting for them does not also wait for V.
+        pages_early = None
+        if const_expr(self.traits.PAGES_EARLY):
+            pages_early = self.kv.warp_pages_raw(tt1)
+            fx.rocdl.sched_barrier(0)
         # Independent V loads overlap QK/softmax and are shared across M-tiles.
         v_vh_shared = None
         if const_expr(self.traits.MTP4_PREFETCH_V):
@@ -218,6 +224,7 @@ class PaDecodePipeline:
                 q_scale_vec,
                 q_ops_all,
                 mask_tail,
+                pages_early,
             )
         if const_expr(self.traits.kv_dtype == MXFP4_KV_DTYPE):
             # Masks tail scores/V by tile_valid at runtime, so it ignores mask_tail.
@@ -237,6 +244,7 @@ class PaDecodePipeline:
             q_ops_all,
             q_scale_vec,
             mask_tail,
+            pages_early,
         )
 
     @flyc.jit
@@ -254,6 +262,7 @@ class PaDecodePipeline:
         q_scale_vec,
         q_ops_all,
         mask_tail,
+        pages_early=None,
     ):
         """Publish all query maxima together, then consume shared K/V per query."""
         next_state = [None, None]
@@ -301,6 +310,14 @@ class PaDecodePipeline:
                 # Defer K until P packing releases saved score registers.
                 phys_vec1 = self.kv.fetch_v_pages(tt1)
                 self.kv.stage_scales(phys_vec1, self.kv.scale_buffer_offset(tt1), tt1)
+            elif const_expr(self.traits.PAGES_EARLY):
+                phys_vec1 = self.kv.pin_warp_pages(pages_early)
+                k_next = self.kv.load_k_from_pages(phys_vec1)
+                self.kv.stage_v_pages(phys_vec1)
+                if const_expr(self.traits.per_token_kv):
+                    self.kv.stage_scales(
+                        phys_vec1, self.kv.scale_buffer_offset(tt1), tt1
+                    )
             else:
                 k_next, phys_vec1 = self.kv.load_k(tt1)
                 self.kv.fetch_v_pages(tt1)
@@ -676,6 +693,7 @@ class PaDecodePipeline:
         q_ops_all,
         q_scale_vec,
         mask_tail,
+        pages_early=None,
     ):
         """Overlap QK, page/scale prefetch and PV for up to two padded query tiles.
 
@@ -716,7 +734,16 @@ class PaDecodePipeline:
             const_expr(not self.traits.single_tile_plan and not self.traits.STREAM_KV)
             and tt1 < self.ctx.part_end
         ):
-            if const_expr(self.traits.REUSE_KV_PAGES):
+            if const_expr(self.traits.PAGES_EARLY):
+                phys_vec1 = self.kv.pin_warp_pages(pages_early)
+                self.kv.stage_v_pages(phys_vec1)
+                if const_expr(self.traits.per_token_kv):
+                    self.kv.stage_scales(
+                        phys_vec1, self.kv.scale_buffer_offset(tt1), tt1
+                    )
+                if const_expr(not self.traits.PAGE16_VPIPE):
+                    k_next = self.kv.load_k_from_pages(phys_vec1)
+            elif const_expr(self.traits.REUSE_KV_PAGES):
                 # Stage scales before K so scale waits cannot drain K;
                 # page16 defers K until the P barrier.
                 phys_vec1 = self.kv.fetch_v_pages(tt1)
