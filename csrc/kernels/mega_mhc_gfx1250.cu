@@ -159,6 +159,14 @@ struct Variant<H, 18, true>
 {
     using type = Config<H, 2, 8, 32, 2, H / 2, DISTRIBUTED, true, split_cluster<2>>;
 };
+// Split counts that divide one hidden size only, selected by Python where they
+// fill more CUs than the neighbouring powers of two: 5 and 10 for H = 5120
+// (32 and 16 K blocks per split), 14 for H = 7168 (16 K blocks).
+template <int H, int S, bool SHUF>
+using OddSplit = std::conditional_t<
+    SHUF,
+    Config<H, S, 8, 32, 2, H / S, DISTRIBUTED, true, split_cluster<S>>,
+    Config<H, S, 8, (H / S) % 64 ? 32 : 64, 1, H / S, DISTRIBUTED, false, split_cluster<S>>>;
 template <int H, bool SHUF>
 struct Variant<H, 19, SHUF>
 {
@@ -170,7 +178,8 @@ using Tail =
     std::conditional_t<SHUF,
                        Config<H, S, SHUF_WAVES, 32, 1, H / S, DISTRIBUTED, true>,
                        Config<H, S, 8, (H / S) % 64 ? 32 : 64, S == 2 ? 2 : 1, H / S, DISTRIBUTED>>;
-constexpr int GENERIC_VARIANT = 13, LARGE_VARIANT = 19;
+constexpr int GENERIC_VARIANT = 13, LARGE_VARIANT = 19, SPLIT5_VARIANT = 20,
+              SPLIT10_VARIANT = 21, SPLIT14_VARIANT = 22;
 
 __device__ __forceinline__ bf16x16 concat(bf16x8 a, bf16x8 b)
 {
@@ -1933,6 +1942,27 @@ void mega_mhc_gfx1250(aiter_tensor_t& residual_out,
             case 16: run.template operator()<typename Variant<H, 16, SHUF>::type>(); return;
             case 17: run.template operator()<typename Variant<H, 17, SHUF>::type>(); return;
             case 18: run.template operator()<typename Variant<H, 18, SHUF>::type>(); return;
+            case SPLIT5_VARIANT:
+                if constexpr(H % (5 * 64) == 0)
+                {
+                    run.template operator()<OddSplit<H, 5, SHUF>>();
+                    return;
+                }
+                break;
+            case SPLIT10_VARIANT:
+                if constexpr(H % (10 * 64) == 0)
+                {
+                    run.template operator()<OddSplit<H, 10, SHUF>>();
+                    return;
+                }
+                break;
+            case SPLIT14_VARIANT:
+                if constexpr(H % (14 * 32) == 0)
+                {
+                    run.template operator()<OddSplit<H, 14, SHUF>>();
+                    return;
+                }
+                break;
             case LARGE_VARIANT: {
                 // A partial final round of token tiles runs as split tiles.
                 using L          = typename Variant<H, LARGE_VARIANT, SHUF>::type;
