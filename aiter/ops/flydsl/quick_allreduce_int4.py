@@ -11,7 +11,7 @@ they are named for the topology of each lap instead:
 * ``"ring"`` 2(N-1) single-destination hops.
 
 Super-tile ST∈{1,8} on the mesh, ST∈{1,8,16,32} on the ring. INT4 nibble or
-INT6 bit-plane pair, both with group-16 E5M2 scales. Payload HBM is bf16.
+INT6 bit-plane pair, both with per-slice E4M3/E5M2 group scales. Payload HBM is bf16.
 
 The kernel configuration comes from a tuning ladder of ``TwoShotRung``, keyed
 on ``(arch, link, world_size)`` in ``allreduce_policy``.
@@ -83,14 +83,9 @@ from .kernels.tensor_shim import _run_compiled
 
 logger = logging.getLogger("aiter")
 
-# The sum is restored in fp16 before the bf16 store, by scaling each group's
-# dequant step (group scale * 1/bias) by the divisor. With the E5M2 group
-# scale every fp16 extremum fits at divisor 1, so the divisor is opt-in and the
-# scale range no longer sets these bounds. The smallest step is 2**-15 (INT4
-# and INT6 alike, see Codec.scale_min_e5); at DIVISOR_MIN it is restored as
-# 2**-19, an fp16 subnormal that still holds the 2-bit mantissa exactly
-# (subnormal spacing 2**-24). Inputs are divided by the divisor before the
-# first pack, so restored values keep the input's magnitude at DIVISOR_MAX.
+# Divide in fp32 before narrowing to fp16, and restore in fp32 before the
+# bf16 store. The opt-in divisor extends the range to 65504 * divisor; these
+# bounds limit the loss of small values in the fp16 intermediate.
 DIVISOR_MIN = 2.0**-4
 DIVISOR_MAX = 128.0
 
@@ -184,6 +179,7 @@ ALGORITHMS = {
         rs_codecs=RS_CODECS,
         ag_codecs=AG_CODECS,
         st_ladder=ring_st_ladder,
+        has_divisor=True,
     ),
 }
 DEFAULT_ALGORITHM = "mesh"
@@ -198,9 +194,8 @@ def _resolve_codecs(algo, world_size, rs_codec, ag_codec):
     lap defaults to INT6: an explicit ``rs_codec="int4"`` there is a real
     downgrade, not a restatement of the default.
 
-    A codec the selected schedule cannot build raises. The per-N *default*
-    silently narrows to what the schedule supports -- the mesh has no INT6
-    path, so the ring's INT6 reduce-scatter default does not leak into it.
+    A codec the selected schedule cannot build raises. The mesh defaults to
+    INT4 on both laps; only the ring widens its reduce-scatter default.
 
     The mesh has one wire format for both laps, so there ``rs_codec`` and
     ``ag_codec`` follow each other: give either one and the other takes the
@@ -209,7 +204,9 @@ def _resolve_codecs(algo, world_size, rs_codec, ag_codec):
     if algo.name == "mesh" and (rs_codec is None) != (ag_codec is None):
         rs_codec = ag_codec = rs_codec if rs_codec is not None else ag_codec
 
-    rs_default = "int6" if world_size >= RS_INT6_MIN_WORLD else "int4"
+    rs_default = (
+        "int6" if algo.name == "ring" and world_size >= RS_INT6_MIN_WORLD else "int4"
+    )
 
     # The all-gather lap forwards bytes verbatim and so contributes exactly one
     # quantization. It is the dominant error term if the RS lap is INT6.
@@ -223,7 +220,6 @@ def _resolve_codecs(algo, world_size, rs_codec, ag_codec):
                     f"algorithm={algo.name!r}, got {requested!r}"
                 )
             return requested
-        # The default is a property of the world size, not of the schedule.
         if default not in supported:
             default = supported[0]
         return default
@@ -1055,13 +1051,14 @@ class QuickAllReduceInt4:
         return int(nbytes) >= self.min_bytes
 
     def _check_divisor_supported(self, divisor: float) -> None:
-        """A divisor other than 1 needs the mesh schedule's INT4 wire format."""
+        """A divisor other than 1 needs a quantized wire format."""
         if divisor != DEFAULT_DIVISOR and (
-            not self._algo.has_divisor or "int4" not in (self.rs_codec, self.ag_codec)
+            not self._algo.has_divisor
+            or not any(c in ("int4", "int6") for c in (self.rs_codec, self.ag_codec))
         ):
             raise ValueError(
-                "QuickAllReduceInt4 divisor is only supported by the mesh "
-                f"algorithm with the int4 codec, got algorithm={self.algorithm!r}, "
+                "QuickAllReduceInt4 divisor needs an INT4 or INT6 codec, "
+                f"got algorithm={self.algorithm!r}, "
                 f"rs_codec={self.rs_codec!r}, ag_codec={self.ag_codec!r}"
             )
 
@@ -1070,11 +1067,11 @@ class QuickAllReduceInt4:
 
         ``stream=None`` uses the current PyTorch stream on this device.
         ``divisor`` defaults to 1, which keeps the previous INT4 result.
-        Loaded values are divided by it before the first pack, and the
-        finished sum is multiplied by it once. Every rank must pass the same
+        Loaded bf16 values are divided by it in fp32 before narrowing to fp16,
+        and the finished sum is restored in fp32 before the bf16 store, so
+        magnitudes up to ``65504 * divisor`` survive. Every rank must pass the same
         divisor; this is not checked, and a mismatch silently gives each rank
-        a different result. Only the mesh schedule with the INT4 codec takes
-        a divisor other than 1.
+        a different result. Both mesh and ring support it with INT4 or INT6.
         """
         divisor = _check_divisor(divisor)
         self._check_divisor_supported(divisor)

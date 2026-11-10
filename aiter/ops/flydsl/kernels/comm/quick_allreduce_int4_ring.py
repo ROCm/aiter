@@ -30,7 +30,7 @@ This is used in testing.
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
-from flydsl.expr.typing import Int32, Int64, Stream, T
+from flydsl.expr.typing import Float32, Int32, Int64, Stream, T
 
 from .allreduce_shared import (
     _CM_SC0,
@@ -61,9 +61,11 @@ from .allreduce_shared import (
 from .quick_allreduce_codec import (
     GROUP,
     SCALE_CODEC_TAG,
+    SCALE_COLOR_MASK,
     SUPPORTED_BLOCKS,
-    _atom_bf16_to_f16,
-    _atom_f16_to_bf16,
+    ScaleMetadata,
+    _atom_bf16_to_f16_scaled,
+    _atom_f16_to_f32_scaled,
     _clamp_fp16_overflow,
     _codec_dequant,
     _codec_load,
@@ -171,6 +173,7 @@ def make_quick_allreduce_ring_kernel(
     # fastest by construction, which is the "peer" (PCIe-favourable) answer.
 
     rank_atoms = ATOMS // world_size
+    metadata = ScaleMetadata(1, super_tile, rank_atoms, block)
     steps = ring_steps(world_size)
     n_ops = 2 * world_size - 1  # ops are 1-based; op k reads slot k-2, writes k-1
     nxt = (rank + 1) % world_size
@@ -189,7 +192,7 @@ def make_quick_allreduce_ring_kernel(
     # Per-step geometry.
     payload_i32 = [rank_atoms * c.rank_tile_i32 for c in step_codec]
     release_i32_off = [super_tile * p for p in payload_i32]
-    wire_tile_i32 = [r + 16 for r in release_i32_off]  # + one 64 B handshake sector
+    wire_tile_i32 = [r + metadata.release_i32 for r in release_i32_off]
     step_base_i32, _acc = [], 0
     for w in wire_tile_i32:
         step_base_i32.append(_acc)
@@ -207,8 +210,8 @@ def make_quick_allreduce_ring_kernel(
     # one destination only. At TP8 with INT6, this is 1664 B.
     pack_row_i32 = max(rs.rank_tile_i32, ag.rank_tile_i32)
     pack_i32 = rank_atoms * pack_row_i32
-    lds_bytes = pack_i32 * 4
-    PackStorage = make_pack_storage(pack_i32)
+    lds_bytes = (pack_i32 + metadata.lds_i32 + metadata.release_i32) * 4
+    PackStorage = make_pack_storage(pack_i32, metadata.lds_i32, metadata.release_i32)
 
     def _chunk_of(k: int) -> int:
         """Which chunk op *k* carries, following the standard ring schedule.
@@ -231,6 +234,7 @@ def make_quick_allreduce_ring_kernel(
         peer_ptrs: Int64,
         colors_ptr: Int64,
         n_blocks: Int32,
+        divisor: Float32,
     ):
         _clamp_fp16_overflow()
         tid = fx.Int32(gpu.thread_id("x"))
@@ -246,6 +250,10 @@ def make_quick_allreduce_ring_kernel(
         # One allocation, one view per codec.
         lds = fx.SharedAllocator().allocate(PackStorage).peek()
         smem_ptr = lds.pack.ptr
+        _stage_format, _format_word, _decode_format = metadata.bind(lds.formats, tid)
+        received = lds.received.view(
+            fx.make_layout((1, metadata.release_i32), (metadata.release_i32, 1))
+        )
         pack_views = {
             c.name: lds.pack.view(
                 fx.make_layout((rank_atoms, c.rank_tile_i32), (c.rank_tile_i32, 1))
@@ -259,6 +267,15 @@ def make_quick_allreduce_ring_kernel(
         next_base = peers[nxt]
         inbox = _buffer_ptr(_to_sgpr_i64(self_base), T.i32, 4, inbox_bytes)
 
+        inv_div = fx.full(8, fx.Float32(1.0) / divisor, fx.Float32)
+        div = fx.full(8, divisor, fx.Float32)
+
+        def _decode_input(atom):
+            return _atom_bf16_to_f16_scaled(atom, inv_div)
+
+        def _encode_output(atom):
+            return _atom_f16_to_f32_scaled(atom, div).to(fx.BFloat16).bitcast(fx.Int32)
+
         _load_atom, _store_atom = _payload_io(
             inp_ptr,
             out_ptr,
@@ -267,8 +284,8 @@ def make_quick_allreduce_ring_kernel(
             ATOMS,
             block,
             tid,
-            decode=_atom_bf16_to_f16,
-            encode=_atom_f16_to_bf16,
+            decode=_decode_input,
+            encode=_encode_output,
         )
         _load_color, _store_color = _color_io(colors_ptr, bid)
 
@@ -294,7 +311,7 @@ def make_quick_allreduce_ring_kernel(
         def _store_chunk_atom(tile, chunk, j, value):
             _store_atom(tile, chunk * rank_atoms + j, value)
 
-        def _lds_write_packet(codec, j, words, scale_word, is_leader):
+        def _lds_write_packet(codec, j, words, scale_word, is_leader, sub, is_e5):
             """Stage one packet of *codec* into the row this hop will send."""
             pack = pack_views[codec.name]
             row = fx.Int32(j)
@@ -308,6 +325,7 @@ def make_quick_allreduce_ring_kernel(
                         pack,
                         (row, fx.Int32(codec.scale_i32_off) + scale_slot),
                     )
+            _stage_format(fx.Int32(0), sub, j, is_e5)
 
         def _recv_raw(codec, step, sub, j):
             """This rank's inbox slot for *step*, exactly as the predecessor wrote it.
@@ -324,8 +342,14 @@ def make_quick_allreduce_ring_kernel(
 
             return _codec_load(codec, _get, tid, scale_slot)
 
-        def _scale_of(codec, word):
-            return _scale_from_word(codec, word, pair_in_slot)
+        def _format_of(sub, j):
+            def _get(slot):
+                return fx.Int32(fx.memref_load(received, (fx.Int32(0), slot)))
+
+            return _decode_format(_get, sub, j)
+
+        def _scale_of(codec, word, is_e5):
+            return _scale_from_word(codec, word, pair_in_slot, is_e5)
 
         def _fanout_to_next(step, sub):
             """Push the staged rank-tiles from LDS into the successor's inbox.
@@ -380,18 +404,26 @@ def make_quick_allreduce_ring_kernel(
             gpu.barrier()
             if const_expr(release_scope is not None):
                 _release_inbox(release_scope)
-            if tid < fx.Int32(FLAG_LANES):
-                elem = (
-                    _slot_i32(step, fx.Int32(0))
-                    + fx.Int32(release_i32_off[step])
-                    + tid * fx.Int32(FLAG_I32_PER_LANE)
-                )
-                _store_flag_peer(next_base + _i32_to_bytes(elem), color, flag_policy)
+            for sector in range_constexpr(metadata.release_i32 // 16 - 1, -1, -1):
+                if tid < fx.Int32(FLAG_LANES):
+                    slot = fx.Int32(sector * 16) + tid * fx.Int32(FLAG_I32_PER_LANE)
+                    elem = (
+                        _slot_i32(step, fx.Int32(0))
+                        + fx.Int32(release_i32_off[step])
+                        + slot
+                    )
+                    _store_flag_peer(
+                        next_base + _i32_to_bytes(elem),
+                        _format_word(fx.Int32(0), slot, color),
+                        flag_policy,
+                        _format_word(fx.Int32(0), slot + fx.Int32(1), color),
+                    )
 
         def _wait(step, color):
             """Spin until the predecessor has coloured *step*'s slot in our inbox.
 
-            There is only one source, so only one thread spins. The poll
+            One lane polls each metadata word's epoch so a torn release
+            sector cannot expose stale format bits. The poll
             must bypass the caches (``_load_flag`` is ``sc0
             sc1``): a load answered from a stale line would spin forever, which
             is a hang rather than a slowdown.
@@ -409,20 +441,21 @@ def make_quick_allreduce_ring_kernel(
             value LLVM cannot prove uniform, sourcing all four descriptor
             dwords from VGPRs and serializing the wave around them.
             """
-            if tid == fx.Int32(0):
+            if tid < fx.Int32(metadata.release_i32):
                 flag = self_base + _i32_to_bytes(
-                    _slot_i32(step, fx.Int32(0)) + fx.Int32(release_i32_off[step])
+                    _slot_i32(step, fx.Int32(0)) + fx.Int32(release_i32_off[step]) + tid
                 )
                 # `sc0 sc1`, so each retry is fetched past L1 and L2 and no
                 # fence is needed in the loop; the acquire below orders the
                 # payload reads after it, once, after the join.
                 current = _load_flag(flag)
-                while current != color:
+                while (current & fx.Int32(SCALE_COLOR_MASK)) != color:
                     current = _load_flag(flag)
+                fx.memref_store(current, received, (fx.Int32(0), tid))
             gpu.barrier()
             # Unconditional, *after* the join, and not just inside the spin.
-            # Only `tid == 0` spins, so an acquire inside the loop would cover
-            # one lane of one wave and leave the rest of the workgroup reading
+            # Only metadata polling lanes spin, so an acquire inside the loop
+            # would leave the rest of the workgroup reading
             # the payload unordered after it -- and would be skipped entirely
             # in the common case where the flag is already set on the first
             # read.
@@ -464,18 +497,24 @@ def make_quick_allreduce_ring_kernel(
                 # Pipeline fill: nothing to receive, push our own contribution.
                 atoms = _load_chunk_atoms(tile, chunk)
                 for j in range_constexpr(rank_atoms):
-                    words, word, leader = _codec_quant(c_out, atoms[j], lane, tid)
-                    _lds_write_packet(c_out, j, words, word, leader)
+                    words, word, leader, is_e5 = _codec_quant(
+                        c_out, atoms[j], lane, tid
+                    )
+                    _lds_write_packet(c_out, j, words, word, leader, sub, is_e5)
             elif const_expr(k < world_size):
                 # Reduce-scatter: add our contribution to the running partial.
                 atoms = _load_chunk_atoms(tile, chunk)
                 for j in range_constexpr(rank_atoms):
                     words_in, word_in = _recv_raw(c_in, k - 2, sub, j)
                     acc = _codec_dequant(
-                        c_in, words_in, _scale_of(c_in, word_in), tid, atoms[j]
+                        c_in,
+                        words_in,
+                        _scale_of(c_in, word_in, _format_of(sub, j)),
+                        tid,
+                        atoms[j],
                     )
-                    words, word, leader = _codec_quant(c_out, acc, lane, tid)
-                    _lds_write_packet(c_out, j, words, word, leader)
+                    words, word, leader, is_e5 = _codec_quant(c_out, acc, lane, tid)
+                    _lds_write_packet(c_out, j, words, word, leader, sub, is_e5)
             elif const_expr(k == world_size):
                 # Last reduce, and the seam: c_in is the reduce-scatter codec,
                 # c_out the all-gather one. Every rank has now contributed, so
@@ -487,15 +526,21 @@ def make_quick_allreduce_ring_kernel(
                 for j in range_constexpr(rank_atoms):
                     words_in, word_in = _recv_raw(c_in, k - 2, sub, j)
                     acc = _codec_dequant(
-                        c_in, words_in, _scale_of(c_in, word_in), tid, atoms[j]
+                        c_in,
+                        words_in,
+                        _scale_of(c_in, word_in, _format_of(sub, j)),
+                        tid,
+                        atoms[j],
                     )
-                    words, word, leader = _codec_quant(c_out, acc, lane, tid)
-                    _lds_write_packet(c_out, j, words, word, leader)
+                    words, word, leader, is_e5 = _codec_quant(c_out, acc, lane, tid)
+                    _lds_write_packet(c_out, j, words, word, leader, sub, is_e5)
                     _store_chunk_atom(
                         tile,
                         chunk,
                         j,
-                        _codec_dequant(c_out, words, _scale_of(c_out, word), tid),
+                        _codec_dequant(
+                            c_out, words, _scale_of(c_out, word, is_e5), tid
+                        ),
                     )
             elif const_expr(k < n_ops):
                 # All-gather: the chunk is already final, so decode it for our
@@ -504,13 +549,18 @@ def make_quick_allreduce_ring_kernel(
                 # additional error -- and it is why c_in is c_out here.
                 for j in range_constexpr(rank_atoms):
                     words_in, word_in = _recv_raw(c_in, k - 2, sub, j)
+                    is_e5 = _format_of(sub, j)
                     _store_chunk_atom(
                         tile,
                         chunk,
                         j,
-                        _codec_dequant(c_in, words_in, _scale_of(c_in, word_in), tid),
+                        _codec_dequant(
+                            c_in, words_in, _scale_of(c_in, word_in, is_e5), tid
+                        ),
                     )
-                    _lds_write_packet(c_out, j, words_in, word_in, is_leader)
+                    _lds_write_packet(
+                        c_out, j, words_in, word_in, is_leader, sub, is_e5
+                    )
             else:
                 # Final op: the last chunk arrives and stops here.
                 for j in range_constexpr(rank_atoms):
@@ -519,7 +569,12 @@ def make_quick_allreduce_ring_kernel(
                         tile,
                         chunk,
                         j,
-                        _codec_dequant(c_in, words_in, _scale_of(c_in, word_in), tid),
+                        _codec_dequant(
+                            c_in,
+                            words_in,
+                            _scale_of(c_in, word_in, _format_of(sub, j)),
+                            tid,
+                        ),
                     )
 
         def _ring_group(i, n_this, color):
@@ -566,13 +621,13 @@ def make_quick_allreduce_ring_kernel(
         # whole super-tile, and striding by the cap would silently leave every
         # tile above n_blocks unprocessed.
         n_block_tiles = (num_tiles - bid + n_blocks - fx.Int32(1)) // n_blocks
-        color = _load_color()
+        color = _load_color() & fx.Int32(SCALE_COLOR_MASK)
         st_i = fx.Int32(super_tile)
         for i in range(fx.Int32(0), n_block_tiles, st_i):
             remain = n_block_tiles - i
             n_this = (remain < st_i).select(remain, st_i)
             _ring_group(i, n_this, color)
-            color = color + fx.Int32(1)
+            color = (color + fx.Int32(1)) & fx.Int32(SCALE_COLOR_MASK)
             if color == fx.Int32(0):  # 0 is the unset sentinel
                 color = fx.Int32(1)
         if tid == 0:
@@ -591,6 +646,7 @@ def make_quick_allreduce_ring_kernel(
         peer_ptrs: Int64,
         colors_ptr: Int64,
         grid_x: Int32,
+        divisor: Float32 = 1.0,
         stream: Stream = Stream(None),  # noqa: B008
     ):
         quick_allreduce_int4_ring(
@@ -602,6 +658,7 @@ def make_quick_allreduce_ring_kernel(
             peer_ptrs,
             colors_ptr,
             grid_x,
+            divisor,
             value_attrs={"rocdl.flat_work_group_size": flat_wg},
         ).launch(
             grid=(grid_x, 1, 1),
