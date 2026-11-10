@@ -5,8 +5,9 @@
 
 This is deliberately not a generic GEMM entry point. It gathers page-size-1
 cache rows directly into the projection pipeline's padded LDS layout, multiplies
-the 512-wide FP8 latent by a ptpc-preshuffled FP8 weight, and writes BF16
-128-wide K-nope, 64-wide RoPE, and 128-wide V head slices.
+the 512-wide FP8 latent by a ptpc-preshuffled FP8 weight, and writes BF16 (or
+FP8 with caller descales) 128-wide K-nope, 64-wide RoPE, and 128-wide V head
+slices.
 """
 
 import flydsl.compiler as flyc
@@ -49,6 +50,19 @@ _N_WARP = 2
 _NUM_BUFFERS = 4
 
 
+def _pack_fp8x8(v):
+    """Eight fp32 values as saturated E4M3 bytes; NaN stays NaN."""
+    v = v.maximumf(fx.full(8, -448.0, fx.Float32)).minimumf(
+        fx.full(8, 448.0, fx.Float32)
+    )
+    words = []
+    for i in (0, 4):
+        lo = rocdl.cvt_pk_fp8_f32(T.i32, v[i], v[i + 1], fx.Int32(0), False)
+        hi = rocdl.cvt_pk_fp8_f32(T.i32, v[i + 2], v[i + 3], lo, True)
+        words.append(fx.full(1, fx.Int32(hi), fx.Int32))
+    return words[0].shuffle(words[1], [0, 1]).bitcast(fx.Int8)
+
+
 @flyc.jit
 def launch_gather_kv_b_proj_8wave_gfx1250(
     arg_k: fx.Pointer,
@@ -58,6 +72,8 @@ def launch_gather_kv_b_proj_8wave_gfx1250(
     arg_b: fx.Pointer,
     arg_scale_a: fx.Pointer,
     arg_scale_b: fx.Pointer,
+    arg_k_out_scale: fx.Pointer,
+    arg_v_out_scale: fx.Pointer,
     i32_num_blocks: fx.Int32,
     i32_m: fx.Int32,
     f32_scale_a: fx.Float32,
@@ -65,6 +81,7 @@ def launch_gather_kv_b_proj_8wave_gfx1250(
     n_heads: Constexpr[int] = 96,
     scale_a_is_ptr: Constexpr[int] = 1,
     cluster_n: Constexpr[int] = 1,
+    output_fp8: Constexpr[int] = 0,
 ):
     tile_m, tile_n, tile_k = _TILE_M, _TILE_N, _TILE_K
     m_warp, n_warp = _M_WARP, _N_WARP
@@ -102,7 +119,10 @@ def launch_gather_kv_b_proj_8wave_gfx1250(
     AB_PITCH = ((STAGE_A + STAGE_B + 1023) // 1024) * 1024
     PITCH = AB_PITCH
     out_cls = fx.BFloat16
+    out_bytes = 1 if output_fp8 else 2
     C_LDS_ROW = tile_n + 8
+    # Staged C row in bytes; FP8 pads to 16 B so the copy-out stays 16 B vectors.
+    C_ROW_B = tile_n + 16 if output_fp8 else C_LDS_ROW * 2
     C_STORE_B = (tile_m * C_LDS_ROW * 2 + 127) // 128 * 128
     ROPE_LDS_PAD = 0
     ROPE_LDS_ROW = _ROPE_WIDTH + ROPE_LDS_PAD
@@ -122,6 +142,7 @@ def launch_gather_kv_b_proj_8wave_gfx1250(
         f"_t{tile_m}x{tile_n}x{tile_k}"
         f"_mw{m_warp}_nw{n_warp}_nb{num_buffers}_h{n_heads}_tdmgather"
         + (f"_cn{cluster_n}" if use_cluster else "")
+        + ("_fp8" if output_fp8 else "")
     )
 
     @flyc.kernel(name=kernel_name, known_block_size=[block, 1, 1])
@@ -133,6 +154,8 @@ def launch_gather_kv_b_proj_8wave_gfx1250(
         arg_b: fx.Pointer,
         arg_scale_a: fx.Pointer,
         arg_scale_b: fx.Pointer,
+        arg_k_out_scale: fx.Pointer,
+        arg_v_out_scale: fx.Pointer,
         i32_num_blocks: fx.Int32,
         i32_m: fx.Int32,
         f32_scale_a: fx.Float32,
@@ -521,19 +544,31 @@ def launch_gather_kv_b_proj_8wave_gfx1250(
         rocdl.sched_barrier(0)
 
         accs = epilogue_apply_ptpc_scale(scale_regs, activation_scale)
+        if const_expr(output_fp8):
+            # Same contract as gfx950: out = saturate_e4m3(x * fp32(1 / descale)).
+            inv_k, inv_v = (
+                1.0 / ptr_buf_tensor(p, fx.Float32, n=1, num_records_bytes=4)[0]
+                for p in (arg_k_out_scale, arg_v_out_scale)
+            )
+            # wave_n 0 holds the head's K-nope columns, wave_n 1 its V columns.
+            inv = fx.full(8, fx.Float32((wave_n == 0).select(inv_k, inv_v)), fx.Float32)
         for wm in range_constexpr(wmma_m_rep):
             row_rel = wmb + wm * 16 + lane16
             for wn in range_constexpr(wmma_n_rep):
                 col_rel = wnb + wn * 16 + kgrp * 8
-                h = accs[wm * wmma_n_rep + wn].to(out_cls)
-                fx.ptr_store(
-                    h.bitcast(fx.Int8),
-                    base_ptr + (row_rel * C_LDS_ROW + col_rel) * 2,
+                acc = accs[wm * wmma_n_rep + wn]
+                h = (
+                    _pack_fp8x8(acc * inv)
+                    if const_expr(output_fp8)
+                    else acc.to(out_cls).bitcast(fx.Int8)
                 )
+                fx.ptr_store(h, base_ptr + row_rel * C_ROW_B + col_rel * out_bytes)
         pipeline_fence(outstanding=0, use_cluster=use_cluster)
 
         head = bid_y
         lds_base = _bidx(base_ptr)
+        if const_expr(output_fp8):
+            activation_scale = fx.Float32(activation_scale * inv_k)
         rope_scale = fx.full(8, activation_scale, fx.Float32)
         rope_lanes_per_row = _ROPE_WIDTH // 8
         rope_rows_per_wave = WAVE // rope_lanes_per_row
@@ -557,26 +592,38 @@ def launch_gather_kv_b_proj_8wave_gfx1250(
                         0,
                     )
                 )
-                packed = (values * rope_scale).to(fx.BFloat16)
+                values = values * rope_scale
+                packed = (
+                    _pack_fp8x8(values)
+                    if const_expr(output_fp8)
+                    else values.to(fx.BFloat16).bitcast(fx.Int8)
+                )
                 if rope_row < mn_oob:
                     rope_out_row = fx.Int64(blk_m + rope_row)
                     rope_offset = (
                         rope_out_row * fx.Int64(ldk)
                         + fx.Int64(head * 192 + 128 + rope_col)
-                    ) * 2
-                    fx.ptr_store(packed.bitcast(fx.Int8), gK_base + rope_offset)
-        vectors_per_row = 128 // 8
+                    ) * out_bytes
+                    fx.ptr_store(packed, gK_base + rope_offset)
+        vec_elems = 16 // out_bytes
+        vectors_per_row = 128 // vec_elems
         vectors_per_thread = tile_m * vectors_per_row // block
         for copy_i in range(vectors_per_thread):
             vector_idx = tid + copy_i * block
             row = vector_idx // vectors_per_row
-            col = (vector_idx % vectors_per_row) * 8
+            col = (vector_idx % vectors_per_row) * vec_elems
             if row < mn_oob:
-                k_vec = Vec(lds_load_b128(lds_base, (row * C_LDS_ROW + col) * 2))
-                v_vec = Vec(lds_load_b128(lds_base, (row * C_LDS_ROW + 128 + col) * 2))
+                k_vec = Vec(lds_load_b128(lds_base, row * C_ROW_B + col * out_bytes))
+                v_vec = Vec(
+                    lds_load_b128(lds_base, row * C_ROW_B + (128 + col) * out_bytes)
+                )
                 out_row = fx.Int64(blk_m + row)
-                k_offset = (out_row * fx.Int64(ldk) + fx.Int64(head * 192 + col)) * 2
-                v_offset = (out_row * fx.Int64(ldv) + fx.Int64(head * 128 + col)) * 2
+                k_offset = (
+                    out_row * fx.Int64(ldk) + fx.Int64(head * 192 + col)
+                ) * out_bytes
+                v_offset = (
+                    out_row * fx.Int64(ldv) + fx.Int64(head * 128 + col)
+                ) * out_bytes
                 fx.ptr_store(k_vec.bitcast(fx.Int8), gK_base + k_offset)
                 fx.ptr_store(v_vec.bitcast(fx.Int8), gV_base + v_offset)
 
@@ -590,6 +637,8 @@ def launch_gather_kv_b_proj_8wave_gfx1250(
             arg_b,
             arg_scale_a,
             arg_scale_b,
+            arg_k_out_scale,
+            arg_v_out_scale,
             i32_num_blocks,
             i32_m,
             f32_scale_a,
@@ -609,6 +658,8 @@ def launch_gather_kv_b_proj_8wave_gfx1250(
             arg_b,
             arg_scale_a,
             arg_scale_b,
+            arg_k_out_scale,
+            arg_v_out_scale,
             i32_num_blocks,
             i32_m,
             f32_scale_a,
