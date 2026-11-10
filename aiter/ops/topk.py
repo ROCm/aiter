@@ -83,8 +83,10 @@ def _can_use_gfx1250_exact_sigmoid_topk(
     return get_gfx_runtime() in ("gfx1250", "gfx1250-strict")
 
 
-# E = 128 * waves for biased_grouped_topk_hip's wave32 multi-wave kernel.
+# E = 128 * waves and the topk bound of biased_grouped_topk_hip's wave32
+# multi-wave kernel.
 _GFX1250_REG_MW_EXPERTS = {512, 768, 896, 1024}
+_GFX1250_REG_MW_MAX_TOPK = 17
 
 
 def _gfx1250_reg_mw_fits(
@@ -97,7 +99,7 @@ def _gfx1250_reg_mw_fits(
     multi-wave kernel of biased_grouped_topk_hip, which beats the Triton one."""
     return (
         gating_output.shape[1] in _GFX1250_REG_MW_EXPERTS
-        and topk_ids.shape[1] <= 16
+        and topk_ids.shape[1] <= _GFX1250_REG_MW_MAX_TOPK
         # Rows and bias are read as 4-element vectors.
         and gating_output.stride(0) % 4 == 0
         and gating_output.data_ptr() % (4 * gating_output.element_size()) == 0

@@ -1273,6 +1273,10 @@ __device__ __forceinline__ void wave32_rank_desc_dpp2(const uint64_t (&key)[2], 
     }
 }
 
+// Top-16 routing plus the extra candidate of HERD's top-(K + 1). The
+// renormalization reads this many lanes on every row.
+constexpr int kTopKRegMwMaxTopK = 17;
+
 template <typename DTYPE_I, int kWaves, typename DTYPE_B = DTYPE_I>
 __global__ __launch_bounds__(kWaves * 32) void topk_reg_mw_kernel(
     const DTYPE_I* __restrict__ gating_output,   // [num_tokens, kWaves * 128]
@@ -1498,7 +1502,7 @@ __global__ __launch_bounds__(kWaves * 32) void topk_reg_mw_kernel(
                 [&](auto j) { tie[j.value] = fhi[j.value] == hmax ? flo[j.value] : 0u; });
             const uint32_t lmax            = wave_umax(umax_tree<kWaves * 4>(tie));
             const bool has_valid_candidate = hmax != 0;
-            // topk <= 16, so an unused ID in [0, 31] always exists.
+            // At most topk - 1 IDs are taken, fewer than 32, so [0, 31] holds an unused one.
             const uint32_t unused        = ~selected_low_mask;
             const uint32_t unused_from_k = unused & (~0u << k);
             const int filler  = __builtin_ctz(unused_from_k != 0 ? unused_from_k : unused);
@@ -1516,15 +1520,15 @@ __global__ __launch_bounds__(kWaves * 32) void topk_reg_mw_kernel(
     if(need_renorm)
     {
         // Preserve the legacy serial renormalization order. Unrolled to the
-        // host's topk <= 16 bound so the readlanes issue ahead of the adds;
-        // past topk the sum adds +0, which leaves a non-negative total as is.
+        // host's topk bound so the readlanes issue ahead of the adds; past
+        // topk the sum adds +0, which leaves a non-negative total as is.
         // The per-lane +0 seed (w is a finite sigmoid or 0) keeps the adds on
         // the VALU: a scalar add of a readlane result stalls ~29 cycles a
         // step on gfx1250, a vector add ~6.
         const int wm = __builtin_bit_cast(int, lane < topk ? w : 0.0f);
         float total  = w * 0.0f;
 #pragma unroll
-        for(int i = 0; i < 16; ++i)
+        for(int i = 0; i < kTopKRegMwMaxTopK; ++i)
             total += __builtin_bit_cast(float, __builtin_amdgcn_readlane(wm, i));
         w = total > 0.0f ? w * (routed_scaling_factor / total) : 0.0f;
     }
@@ -2666,14 +2670,13 @@ void biased_grouped_topk(const aiter_tensor_t& gating_output,   // [num_tokens, 
 
     // wave32 without a group filter, E = 128 * waves: a row per workgroup,
     // four experts per lane, read as naturally aligned four-element vectors
-    // from the BF16 logits and the BF16 or FP32 bias. The kernel's
-    // renormalization and fallback assume topk <= 16.
+    // from the BF16 logits and the BF16 or FP32 bias.
     const int mw_waves      = num_experts / 128;
     const bool mw_bias_fp32 = correction_bias.dtype() == AITER_DTYPE_fp32;
     if(get_warp_size_func() == 32 && topk_grp == num_expert_group &&
        num_experts == 128 * mw_waves &&
        (mw_waves == 4 || mw_waves == 6 || mw_waves == 7 || mw_waves == 8) && topk >= 1 &&
-       topk <= 16 && gating_output.dtype() == AITER_DTYPE_bf16 &&
+       topk <= aiter::kTopKRegMwMaxTopK && gating_output.dtype() == AITER_DTYPE_bf16 &&
        (mw_bias_fp32 || correction_bias.dtype() == AITER_DTYPE_bf16) && stride_gating % 4 == 0 &&
        reinterpret_cast<uintptr_t>(gating_output.data_ptr()) % 8 == 0 &&
        reinterpret_cast<uintptr_t>(correction_bias.data_ptr()) % (mw_bias_fp32 ? 16 : 8) == 0)
