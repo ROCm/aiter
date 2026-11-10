@@ -26,13 +26,12 @@ from op_tests.triton_tests.gemm.basic.test_gemm_a16w16x3 import (
 
 def bench_gemm_fn(bencher: RotatingBufferBench, M: int, N: int, K: int, metric: str):
     _p_gen = functools.partial(generate_gemm_a16w16x3_inputs, M, N, K, output=True)
-    # (x, weight, w, y): the kernel takes the bf16 terms w, not the fp32 weight
-    _out_vals_keys = ["x", "_", "w", "y"]
+    _out_vals_keys = ["x", "w", "w_bf16x3", "y"]
     rot_bufs = bencher.build_pool([_p_gen], [_out_vals_keys])
 
-    # three bf16 MFMA dots for each output, one for each weight term
-    flops = 3 * 2.0 * M * N * K
-    mem_read = (M * K) * rot_bufs[0]["x"].element_size() + 3 * (N * K) * rot_bufs[0][
+    flops = 2.0 * M * N * K
+    # the fp32 weight size: the FMA kernel reads it, the bf16x3 kernel reads 1.5x
+    mem_read = (M * K) * rot_bufs[0]["x"].element_size() + (N * K) * rot_bufs[0][
         "w"
     ].element_size()
     mem_write = (M * N) * rot_bufs[0]["y"].element_size()

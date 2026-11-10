@@ -440,13 +440,25 @@ def gemm_a16w16x3(shape, backend):
     )
 
     M, N, K = shape["M"], shape["N"], shape["K"]
-    # the kernel keeps three bf16 weight tiles in LDS, hence bits=(16, 48)
-    x, _, w, y = generate_gemm_a16w16x3_inputs(M, N, K, output=True)
+    # the bf16x3 kernel keeps three bf16 weight tiles in LDS, hence bits=(16, 48)
+    x, w, w_bf16x3, y = generate_gemm_a16w16x3_inputs(M, N, K, output=True)
 
-    def call(config, x, w, y):
-        return gemm(x, w, y=y, config=config)
+    def call(config, x, w, w_bf16x3, y):
+        return gemm(x, w, w_bf16x3, y=y, config=config)
 
-    return call, (x, w, y), None
+    def should_skip(config):
+        if config.get("kernel_type") != "bandwidth_bound":
+            return False
+        # The fp32 FMA kernel computes one row of W in each program (BLOCK_SIZE_N 1,
+        # below SEARCH_SPACE), with no split-K and no tile swizzle. The sweep times
+        # the bf16x3 tiles against the installed FMA config.
+        return (
+            config["BLOCK_SIZE_N"] != 1
+            or config.get("NUM_KSPLIT", 1) != 1
+            or config.get("GROUP_SIZE_M", 1) != 1
+        )
+
+    return call, (x, w, w_bf16x3, y), should_skip
 
 
 @kernel("GEMM-A16W16-gated", backend_kwarg=False, bounds=(64, 128, 256, 512, 2048))

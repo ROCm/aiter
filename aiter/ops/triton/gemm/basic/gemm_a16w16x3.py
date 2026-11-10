@@ -6,6 +6,7 @@ import triton
 
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a16w16x3 import (
+    _gemm_a16w16x3_fma_kernel,
     _gemm_a16w16x3_kernel,
     _get_config,
 )
@@ -59,66 +60,47 @@ def _split_counters(device: torch.device, stream_id: int) -> torch.Tensor:
 def gemm_a16w16x3_fake_tensor(
     x: torch.Tensor,
     w: torch.Tensor,
+    w_bf16x3: torch.Tensor,
     y: torch.Tensor | None = None,
     config: str | None = None,
 ) -> torch.Tensor:
     if y is None:
         return torch.empty(
-            (x.shape[0], w.shape[1]), dtype=torch.float32, device=x.device
+            (x.shape[0], w.shape[0]), dtype=torch.float32, device=x.device
         )
     return y
 
 
-@torch_compile_guard(gen_fake=gemm_a16w16x3_fake_tensor)
-def gemm_a16w16x3_(
-    x: torch.Tensor,
-    w: torch.Tensor,
-    y: torch.Tensor | None = None,
-    config: str | None = None,
-) -> torch.Tensor:
-    """
-    Computes Y = X @ W^T in fp32 for an fp32 weight W held as three bf16 terms.
-
-    One launch adds the three terms in one fp32 accumulator, with bf16 MFMA. The
-    result matches an fp32 GEMM of the bf16 X and the fp32 weight up to fp32 rounding.
-    It does not depend on the order in which split-K workgroups finish.
-
-    Args:
-        x (torch.Tensor): BF16 input with shape (M, K).
-        w (torch.Tensor): BF16 weight terms with shape (3, N, K), from split_bf16x3().
-        y (Optional[torch.Tensor]): Pre-allocated FP32 output with shape (M, N).
-        config (Optional[str]): Kernel tuning parameters (BLOCK_SIZE_M, BLOCK_SIZE_N,
-            BLOCK_SIZE_K, GROUP_SIZE_M, NUM_KSPLIT, cache_modifier, num_warps,
-            num_stages, waves_per_eu, matrix_instr_nonkdim).
-
-    Returns:
-        y (torch.Tensor): FP32 output with shape (M, N).
-
-    Limits: x and w must be bf16 and y fp32. Configs exist for gfx950 only.
-    Split-K launches use counters of the current stream, so a captured graph must
-    not run on two streams at the same time. With torch < 2.10, run one eager
-    split-K call on a stream before a graph capture on that stream.
-    """
-    _LOGGER.info(
-        "GEMM_A16W16X3: x.shape=%s, w.shape=%s", tuple(x.shape), tuple(w.shape)
-    )
-    assert x.dtype == torch.bfloat16 and w.dtype == torch.bfloat16, "bf16 x and w"
-    assert w.dim() == 3 and w.shape[0] == 3, "w must be (3, N, K)"
-    assert x.dim() == 2 and x.shape[1] == w.shape[2], "x must be (M, K)"
-
+def _gemm_fma(x, w, y, config):
     M, K = x.shape
-    N = w.shape[1]
+    N = w.shape[0]
+    grid = (triton.cdiv(M, config["BLOCK_SIZE_M"]) * N,)
+    _gemm_a16w16x3_fma_kernel[grid](
+        x,
+        w,
+        y,
+        M,
+        N,
+        K,
+        x.stride(0),
+        x.stride(1),
+        w.stride(0),
+        w.stride(1),
+        y.stride(0),
+        y.stride(1),
+        BLOCK_SIZE_M=config["BLOCK_SIZE_M"],
+        BLOCK_SIZE_K=config["BLOCK_SIZE_K"],
+        cache_modifier=config["cache_modifier"],
+        num_warps=config["num_warps"],
+        num_stages=config["num_stages"],
+        waves_per_eu=config["waves_per_eu"],
+    )
 
-    if config is None:
-        config, _ = _get_config(M, N, K)
-    else:
-        config = deserialize_str(config)
+
+def _gemm_bf16x3(x, w_bf16x3, y, config):
+    M, K = x.shape
+    N = w_bf16x3.shape[1]
     compute_splitk_params(config, K)
-
-    if y is None:
-        y = torch.empty((M, N), dtype=torch.float32, device=x.device)
-    assert y.dtype == torch.float32 and y.shape == (M, N), "fp32 (M, N) y"
-
     num_tiles = triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(
         N, config["BLOCK_SIZE_N"]
     )
@@ -134,7 +116,7 @@ def gemm_a16w16x3_(
     grid = (num_tiles * config["NUM_KSPLIT"],)
     _gemm_a16w16x3_kernel[grid](
         x,
-        w,
+        w_bf16x3,
         y,
         workspace,
         counters,
@@ -143,29 +125,99 @@ def gemm_a16w16x3_(
         K,
         x.stride(0),
         x.stride(1),
-        w.stride(0),
-        w.stride(1),
-        w.stride(2),
+        w_bf16x3.stride(0),
+        w_bf16x3.stride(1),
+        w_bf16x3.stride(2),
         y.stride(0),
         y.stride(1),
         **config,
         NUM_XCDS=get_num_xcds(),
     )
 
+
+@torch_compile_guard(gen_fake=gemm_a16w16x3_fake_tensor)
+def gemm_a16w16x3_(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    w_bf16x3: torch.Tensor,
+    y: torch.Tensor | None = None,
+    config: str | None = None,
+) -> torch.Tensor:
+    """
+    Computes Y = X @ W^T in fp32 for a bf16 X and an fp32 weight W.
+
+    The config of each M bucket selects one of two kernels with ``kernel_type``:
+
+    - ``"bandwidth_bound"`` (small M): fp32 FMA on W, one row of W in each
+      program (``BLOCK_SIZE_N`` is 1). It reads 4 bytes for each weight value.
+    - ``"compute_bound"``: bf16 MFMA on the three bf16 terms of W. Each K step
+      loads the X tile one time and adds the three dots into one fp32
+      accumulator. Split-K is in the kernel. The last split of a tile adds the
+      partials in split order.
+
+    Both kernels match an fp32 GEMM of X and W up to fp32 rounding. The result
+    does not depend on the order in which workgroups finish.
+
+    Args:
+        x (torch.Tensor): BF16 input with shape (M, K).
+        w (torch.Tensor): FP32 weight with shape (N, K).
+        w_bf16x3 (torch.Tensor): BF16 terms of w with shape (3, N, K), from
+            split_bf16x3(w).
+        y (Optional[torch.Tensor]): Pre-allocated FP32 output with shape (M, N).
+        config (Optional[str]): Kernel tuning parameters (kernel_type, BLOCK_SIZE_M,
+            BLOCK_SIZE_N, BLOCK_SIZE_K, GROUP_SIZE_M, NUM_KSPLIT, cache_modifier,
+            num_warps, num_stages, waves_per_eu, matrix_instr_nonkdim).
+
+    Returns:
+        y (torch.Tensor): FP32 output with shape (M, N).
+
+    Limits: configs exist for gfx950 only. Split-K launches use counters of the
+    current stream, so a captured graph must not run on two streams at the same
+    time. With torch < 2.10, run one eager split-K call on a stream before a graph
+    capture on that stream.
+    """
+    _LOGGER.info(
+        "GEMM_A16W16X3: x.shape=%s, w.shape=%s", tuple(x.shape), tuple(w.shape)
+    )
+    assert x.dtype == torch.bfloat16 and x.dim() == 2, "bf16 (M, K) x"
+    assert w.dtype == torch.float32 and w.dim() == 2, "fp32 (N, K) w"
+    assert w_bf16x3.dtype == torch.bfloat16, "bf16 w_bf16x3"
+    assert w_bf16x3.shape == (3, *w.shape), "w_bf16x3 must be (3, N, K)"
+    assert x.shape[1] == w.shape[1], "x and w must have the same K"
+
+    M, K = x.shape
+    N = w.shape[0]
+
+    if config is None:
+        config, _ = _get_config(M, N, K)
+    else:
+        config = deserialize_str(config)
+    kernel_type = config.pop("kernel_type", "compute_bound")
+    assert kernel_type in ("bandwidth_bound", "compute_bound"), kernel_type
+
+    if y is None:
+        y = torch.empty((M, N), dtype=torch.float32, device=x.device)
+    assert y.dtype == torch.float32 and y.shape == (M, N), "fp32 (M, N) y"
+
+    if kernel_type == "bandwidth_bound":
+        _gemm_fma(x, w, y, config)
+    else:
+        _gemm_bf16x3(x, w_bf16x3, y, config)
     return y
 
 
 def gemm_a16w16x3(
     x: torch.Tensor,
     w: torch.Tensor,
+    w_bf16x3: torch.Tensor,
     y: torch.Tensor | None = None,
     config: dict | None = None,
 ) -> torch.Tensor:
     """
-    Computes Y = X @ W^T in fp32 for an fp32 weight W held as three bf16 terms.
+    Computes Y = X @ W^T in fp32 for a bf16 X and an fp32 weight W.
 
     See ``gemm_a16w16x3_`` for the arguments. Here ``config`` is a dict. The
     wrapper serializes it, so that torch.compile can trace the op.
     """
     config_hashable = serialize_dict(config) if config else None
-    return gemm_a16w16x3_(x, w, y, config_hashable)
+    return gemm_a16w16x3_(x, w, w_bf16x3, y, config_hashable)

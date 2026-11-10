@@ -164,5 +164,72 @@ def _gemm_a16w16x3_kernel(
             tl.atomic_xchg(cnt_ptr + tile_id, 0, sem="relaxed", scope="gpu")
 
 
+_gemm_a16w16x3_fma_repr = make_kernel_repr(
+    "_gemm_a16w16x3_fma_kernel",
+    ["K", "BLOCK_SIZE_M", "BLOCK_SIZE_K", "cache_modifier", "EVEN_K"],
+)
+
+
+@triton.heuristics({"EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0})
+@triton.jit(repr=_gemm_a16w16x3_fma_repr)
+def _gemm_a16w16x3_fma_kernel(
+    a_ptr,
+    w_ptr,
+    c_ptr,
+    M,
+    N,
+    K: tl.constexpr,
+    stride_am,
+    stride_ak,
+    stride_wn,
+    stride_wk,
+    stride_cm,
+    stride_cn,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    cache_modifier: tl.constexpr,
+    EVEN_K: tl.constexpr,
+):
+    """C (fp32) = A @ W^T with fp32 FMA, for A (M, K) bf16 and W (N, K) fp32.
+
+    For a small M. Each program computes BLOCK_SIZE_M rows of C for one row of W,
+    so it reads that row of W one time. It keeps one fp32 sum for each (row of A,
+    lane of K) and adds them at the end, in a fixed order. K is a compile-time
+    value, so the compiler knows the trip count of the K loop.
+    """
+    tl.assume(stride_am > 0)
+    tl.assume(stride_ak > 0)
+    tl.assume(stride_wn > 0)
+    tl.assume(stride_wk > 0)
+    tl.assume(stride_cm > 0)
+    tl.assume(stride_cn > 0)
+
+    pid = tl.program_id(axis=0)
+    pid_m = pid // N
+    pid_n = pid % N
+
+    offs_m = pid_m.to(tl.int64) * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    m_mask = offs_m < M
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    w_ptrs = w_ptr + pid_n.to(tl.int64) * stride_wn + offs_k * stride_wk
+
+    partial = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_K), dtype=tl.float32)
+    for k in range(0, K, BLOCK_SIZE_K):
+        if EVEN_K:
+            a = tl.load(a_ptrs, mask=m_mask[:, None], other=0.0)
+            w = tl.load(w_ptrs, cache_modifier=cache_modifier)
+        else:
+            k_mask = offs_k < K - k
+            a = tl.load(a_ptrs, mask=m_mask[:, None] & k_mask[None, :], other=0.0)
+            w = tl.load(w_ptrs, mask=k_mask, other=0.0)
+        partial += a.to(tl.float32) * w[None, :]
+        a_ptrs += BLOCK_SIZE_K * stride_ak
+        w_ptrs += BLOCK_SIZE_K * stride_wk
+
+    c = tl.sum(partial, axis=1)
+    tl.store(c_ptr + offs_m * stride_cm + pid_n * stride_cn, c, mask=m_mask)
+
+
 def _get_config(M: int, N: int, K: int, backend: str = "triton"):
     return get_gemm_config("GEMM-A16W16X3", M, N, K, backend=backend)
