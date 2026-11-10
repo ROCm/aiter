@@ -110,15 +110,21 @@ def _gfx1250_device() -> torch.device:
 
 @pytest.fixture(scope="module")
 def _gfx950_device() -> torch.device:
+    import aiter
+    from aiter.jit.core import get_user_jit_dir
+
     arch = _runtime_arch()
     if arch != GFX950:
         pytest.skip(f"requires gfx950 hardware, got {arch!r}")
     device = torch.device("cuda", torch.cuda.current_device())
     # Request these exact COs for fresh caches. Build in a subprocess because
     # importing the tuner binds its registry to the current device architecture.
+    # Match the parent package and JIT directory when CI installs a wheel.
+    aiter_package_root = str(Path(aiter.__file__).resolve().parents[1])
     opus_dir = str(Path(__file__).resolve().parents[1] / "csrc" / "opus_gemm")
     build = """
 import sys
+sys.path.insert(0, sys.argv[3])
 sys.path.insert(0, sys.argv[1])
 from opus_gemm_tune import _ensure_kids_compiled
 _ensure_kids_compiled((0, 20, 3547), family="a8w8_blockscale_bpreshuffle",
@@ -131,8 +137,10 @@ _ensure_kids_compiled((0, 20, 3547), family="a8w8_blockscale_bpreshuffle",
             build,
             opus_dir,
             str(torch.cuda.get_device_properties(device).multi_processor_count),
+            aiter_package_root,
         ],
         check=True,
+        env={**os.environ, "AITER_JIT_DIR": get_user_jit_dir()},
     )
     return device
 
