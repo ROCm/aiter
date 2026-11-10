@@ -23,6 +23,7 @@ def get_fp8_dtypes():
         "gfx1200",
         "gfx1201",
         "gfx1250",
+        "gfx1250-strict",
     ):
         e5m2_dtype = torch.float8_e5m2
         e4m3_dtype = torch.float8_e4m3fn
