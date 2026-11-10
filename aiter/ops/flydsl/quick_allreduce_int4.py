@@ -329,11 +329,12 @@ class QuickAllReduceInt4:
     these call rules:
 
     * ``stream=None`` uses the current PyTorch stream on this device.
-    * A call only enqueues work. Every tensor it takes must stay allocated
-      until that work has finished, and for a call captured in a CUDA graph
-      until the graph's last replay; ``out`` is not valid, and ``inp`` must
-      not be modified, before then. A tensor that another stream produces or
-      consumes needs an event dependency, as with any kernel.
+    * The call returns once its work is enqueued on the stream. Every tensor
+      it takes must stay allocated until that work has finished, and for a
+      call captured in a CUDA graph until the graph's last replay; ``out`` is
+      not valid, and ``inp`` must not be modified, before then. A tensor that
+      another stream produces or consumes needs an event dependency, as with
+      any kernel.
     * ``inp`` and ``out`` must be torch tensors, bf16, on this rank's CUDA
       device, contiguous and 16-byte aligned (``check_tensors``), and must not
       overlap. Their sizes are checked per method: ``check_payload`` for the
@@ -1325,11 +1326,10 @@ class QuickAllReduceInt4:
         all-reduce launches that go through the same engine; every rank must
         issue the same sequence of launches and sizes, and every launch and
         graph replay on this communicator must run in one serialized device
-        order (see the class docstring, which also has the call rules:
-        ``stream``, the lifetime of ``inp`` and ``out``, the tensor checks).
-        Needs the mesh algorithm, the uncached inbox, a ``super_tile=1``
-        engine at the default block and the INT4 codec (the build refuses the
-        fp16 wire codec).
+        order (see the class docstring, which also has the call rules). Needs
+        the mesh algorithm, the uncached inbox, a ``super_tile=1`` engine at
+        the default block and the INT4 codec (the build refuses the fp16 wire
+        codec).
 
         Until ``compile_sp`` has passed on every rank, the first eager call
         runs it with these tensors, which makes that call a collective (every
@@ -1346,8 +1346,7 @@ class QuickAllReduceInt4:
         rank's own block is round-tripped through the codec too, so every rank
         holds bitwise-equal output. Same size, sequence, ordering, engine,
         codec and ``compile_sp`` rules as ``reduce_scatter``, and the call
-        rules of the class docstring (``stream``, tensor lifetime, tensor
-        checks).
+        rules of the class docstring.
         """
         self._run_sp(MODE_AG, inp, out, stream)
 
