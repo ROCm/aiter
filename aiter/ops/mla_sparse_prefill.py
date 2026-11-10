@@ -10,7 +10,8 @@ introduced it) and the tensors' dtypes carry the precision, so a new precision o
 layout is a new dtype case, not a new entry.
 
 * :func:`mla_sparse_prefill`     -- unscaled rows (bf16/fp16): triton on gfx950 for
-  sink-free bf16 calls with H == 32 or 64, one source and enough query rows, else opus.
+  sink-free bf16 calls with H == 32 or 64, one source and at least 64 query rows,
+  else opus.
 * :func:`mla_sparse_prefill_v4`  -- v4: NoPE with its E8M0 scales in the row, plus bf16
   RoPE (NoPE fp8): asm on gfx1250 with H == 128 (opus if it declines), else opus.
 * :func:`mla_sparse_prefill_v41` -- v4.1: rows with separate ``[*, 16]`` E8M0 scales
@@ -562,6 +563,10 @@ def _opus_sparse_prefill_v41(
 # triton (gfx950)
 # ---------------------------------------------------------------------------
 
+# backend=None keeps calls with fewer query rows on opus: the single-pass kernel
+# runs one program per query row, while opus splits each row's keys.
+_TRITON_MIN_ROWS = 64
+
 
 @functools.cache
 def _pa_prefill_sparse_module():
@@ -598,12 +603,12 @@ def _triton_unsupported(q, unified_kv, kv_indices_extend, out, num_kv_splits):
 
 def _use_triton(q, unified_kv, kv_indices_extend, attn_sink, out, num_kv_splits):
     """backend=None takes triton for a call it serves without a sink and with at
-    least the single-pass kernel's MIN_TOKENS query rows."""
+    least _TRITON_MIN_ROWS query rows."""
     return (
         attn_sink is None
+        and q.size(0) >= _TRITON_MIN_ROWS
         and _triton_unsupported(q, unified_kv, kv_indices_extend, out, num_kv_splits)
         is None
-        and q.size(0) >= _pa_prefill_sparse_module()._single_pass_config()["MIN_TOKENS"]
     )
 
 
@@ -712,9 +717,9 @@ def mla_sparse_prefill(
         on gfx950: bf16, H = 32 or 64, a 2-D ``unified_kv``, unit inner strides
         on ``q`` and ``unified_kv``, an empty ``kv_indices_extend``, no split-K
         and ``out`` ``None`` or contiguous; other calls raise RuntimeError.
-        ``None`` takes it for such calls without a sink and with enough query
-        rows for its single-pass kernel, else opus, which it also takes where
-        ``pa_prefill_sparse`` cannot be imported.
+        ``None`` takes it for such calls without a sink and with at least 64
+        query rows, else opus, which it also takes where ``pa_prefill_sparse``
+        cannot be imported.
 
     Returns:
       ``out``.
