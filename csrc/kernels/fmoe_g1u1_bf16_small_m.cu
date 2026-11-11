@@ -353,6 +353,15 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     AITER_CHECK(act_workspace->dtype() == AITER_DTYPE_bf16,
                 __func__,
                 " act_workspace must be bf16");
+    AITER_CHECK(out->is_contiguous(), __func__, " out must be contiguous");
+    AITER_CHECK(input->is_contiguous(), __func__, " input must be contiguous");
+    AITER_CHECK(gate->is_contiguous(), __func__, " gate must be contiguous");
+    AITER_CHECK(down->is_contiguous(), __func__, " down must be contiguous");
+    AITER_CHECK(topk_ids->is_contiguous(), __func__, " topk_ids must be contiguous");
+    AITER_CHECK(topk_weights->is_contiguous(), __func__, " topk_weights must be contiguous");
+    AITER_CHECK(act_workspace->is_contiguous(),
+                __func__,
+                " act_workspace must be contiguous");
 
     int token_cnt = input->size(0);
     int model_dim = input->size(1);

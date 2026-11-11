@@ -91,6 +91,17 @@ def _case_as_gate_kwargs(case):
     return _make_gate_kwargs(*case)
 
 
+def _strided_same_shape_view(tensor):
+    base_shape = list(tensor.shape)
+    base_shape[-1] *= 2
+    base = torch.empty(base_shape, dtype=tensor.dtype, device=tensor.device)
+    view = base[..., ::2]
+    view.copy_(tensor)
+    assert view.shape == tensor.shape
+    assert not view.is_contiguous()
+    return view
+
+
 @pytest.mark.parametrize("token", [1, 2, 3, 4, 8, 16])
 @pytest.mark.parametrize("inter_dim", [128, 256])
 @pytest.mark.parametrize(
@@ -169,6 +180,57 @@ def test_bf16_g1u1_small_m_direct_output_buffer():
         )
         == 0
     )
+
+
+@pytest.mark.parametrize(
+    "strided_arg",
+    [
+        "out",
+        "input",
+        "gate",
+        "down",
+        "topk_ids",
+        "topk_weights",
+        "act_workspace",
+    ],
+)
+def test_bf16_g1u1_small_m_raw_entrypoint_rejects_strided_tensors(strided_arg):
+    hidden_states, w1, w2, topk_weights, topk_ids = _make_case()
+    topk = topk_ids.shape[1]
+    out = torch.empty(
+        (hidden_states.shape[0], w2.shape[1]),
+        dtype=dtypes.bf16,
+        device="cuda",
+    )
+    act_workspace = torch.empty(
+        (hidden_states.shape[0] * topk, w2.shape[2]),
+        dtype=dtypes.bf16,
+        device="cuda",
+    )
+    args = {
+        "out": out,
+        "input": hidden_states,
+        "gate": w1,
+        "down": w2,
+        "topk_ids": topk_ids,
+        "topk_weights": topk_weights,
+        "act_workspace": act_workspace,
+    }
+    args[strided_arg] = _strided_same_shape_view(args[strided_arg])
+
+    with pytest.raises(RuntimeError, match=f"{strided_arg} must be contiguous"):
+        aiter.fmoe_g1u1_bf16_small_m(
+            args["out"],
+            args["input"],
+            args["gate"],
+            args["down"],
+            args["topk_ids"],
+            args["topk_weights"],
+            args["act_workspace"],
+            topk,
+            False,
+            False,
+        )
 
 
 def test_bf16_g1u1_small_m_direct_gate_rejects_unsupported_integration():
