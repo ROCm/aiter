@@ -25,7 +25,7 @@ from op_tests.triton_tests.quant.test_quant_mxfp4 import (
 )
 
 DEVICE_ARCH = arch_info.get_arch()
-IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250",)
+IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250", "gfx1250-strict")
 
 
 def shuffle_kv_cache(
@@ -433,6 +433,7 @@ def test_triton_unified_attn_3d(
     if DEVICE_ARCH not in (
         "gfx950",
         "gfx1250",
+        "gfx1250-strict",
     ):
         # gfx1250 -> Gluon
         # gfx950 -> Gluon
@@ -441,7 +442,7 @@ def test_triton_unified_attn_3d(
     if force_fp8_pv and kv_dtype != torch.uint8:
         pytest.skip("force_fp8_pv_on_fp4_kv_cache only applies to an NVFP4 KV cache")
     if kv_dtype == torch.uint8:
-        if DEVICE_ARCH not in ("gfx1250",):
+        if DEVICE_ARCH not in ("gfx1250", "gfx1250-strict"):
             pytest.skip(f"NVFP4 KV cache requires {DEVICE_ARCH}")
         if not shuffled_kv_cache:
             pytest.skip("NVFP4 KV cache requires shuffled KV cache")
@@ -770,7 +771,7 @@ def test_triton_unified_attn(
 def test_triton_unified_attn_qq_bias_padded_query_rows(
     num_heads: tuple[int, int], query_len: int, kv_len: int
 ) -> None:
-    if DEVICE_ARCH == "gfx1250":
+    if DEVICE_ARCH in ("gfx1250", "gfx1250-strict"):
         pytest.skip("gfx1250 Gluon kernel does not mask padded qq_bias rows")
     seq_lens = [(query_len, kv_len)] * 2
     (
@@ -1338,7 +1339,7 @@ def test_unified_attn_spec_verify_gfx1250(
     split-KV kernel, where query rows of one block have different causal horizons
     so a split segment can be partly or wholly past a row's horizon, and the 2D
     kernel with a BLOCK_M sized to the query rows."""
-    if DEVICE_ARCH != "gfx1250":
+    if DEVICE_ARCH not in ("gfx1250", "gfx1250-strict"):
         pytest.skip("gfx1250 Gluon kernels")
     if path != "auto":
         monkeypatch.setattr(

@@ -27,7 +27,7 @@ _TORCH_ACTIVATIONS = {
 def _check_backend(backend):
     """Run only the backend the card actually uses: gluon on gfx1250, triton
     everywhere else, so gfx1250 skips the triton cases and vice versa."""
-    on_gfx1250 = get_arch() in ("gfx1250",)
+    on_gfx1250 = get_arch() in ("gfx1250", "gfx1250-strict")
     if backend == "gluon" and not on_gfx1250:
         pytest.skip("gluon backend requires gfx1250")
     if backend == "triton" and on_gfx1250:

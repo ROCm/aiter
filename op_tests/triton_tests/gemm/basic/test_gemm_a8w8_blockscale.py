@@ -158,9 +158,9 @@ def test_gemm(dtype, M, N, K, layout, output, backend, shuffle):
 
     if backend == "gluon":
         if shuffle:
-            if DEVICE_ARCH not in ("gfx1250"):
+            if DEVICE_ARCH not in ("gfx1250", "gfx1250-strict"):
                 pytest.skip("Gluon + shuffle implementation requires gfx1250.")
-        elif DEVICE_ARCH not in ("gfx950", "gfx1250"):
+        elif DEVICE_ARCH not in ("gfx950", "gfx1250", "gfx1250-strict"):
             pytest.skip("Gluon implementation requires gfx950 or gfx1250.")
 
     if shuffle and (N % 16 > 0 or K % 32 > 0):

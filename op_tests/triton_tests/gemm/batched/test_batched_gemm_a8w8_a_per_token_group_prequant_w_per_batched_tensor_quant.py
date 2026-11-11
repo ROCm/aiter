@@ -116,7 +116,7 @@ def run_triton(
 
 
 def skip_if_gluon_unavailable(backend):
-    if backend == "gluon" and arch_info.get_arch() != "gfx1250":
+    if backend == "gluon" and arch_info.get_arch() not in ("gfx1250", "gfx1250-strict"):
         pytest.skip("gluon backend is gfx1250-only")
 
 
